@@ -48,3 +48,202 @@ def test_models_without_a_reasoning_ladder_are_untouched():
     assert cfg_mod.background_default_effort({}, "no-such-model") is None
     assert cfg_mod.background_default_effort({}, None) is None
     assert cfg_mod.background_default_effort({}, "claude-haiku-5-5") in ("low", None)
+
+
+def _agent_config(*, name: str = "claude-sonnet-5-5", background: str | None = "claude-haiku-5-5"):
+    from ptc_agent.config.agent import AgentConfig, LLMConfig
+    from ptc_agent.config.core import (
+        DaytonaConfig,
+        FilesystemConfig,
+        LoggingConfig,
+        MCPConfig,
+        SandboxConfig,
+        SecurityConfig,
+    )
+
+    return AgentConfig(
+        llm=LLMConfig(name=name, background=background),
+        security=SecurityConfig(),
+        logging=LoggingConfig(),
+        sandbox=SandboxConfig(daytona=DaytonaConfig(api_key="test-key")),
+        mcp=MCPConfig(),
+        filesystem=FilesystemConfig(),
+    )
+
+
+def _client_effort(client) -> str | None:
+    if getattr(client, "output_config", None):
+        return client.output_config.get("effort")
+    if getattr(client, "reasoning", None):
+        return client.reasoning.get("effort")
+    return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("background_model", "env_key"),
+    [
+        ("claude-haiku-5-5", "ANTHROPIC_API_KEY"),
+        ("gpt-6.2-sol", "OPENAI_API_KEY"),
+    ],
+)
+async def test_llm_service_system_background_slot_builds_low_effort_client(
+    monkeypatch: pytest.MonkeyPatch, background_model: str, env_key: str
+):
+    from src.llms import api_call as api_call_mod
+    from src.server.services.llm import service as service_mod
+
+    monkeypatch.setenv(env_key, "sk-test-system")
+    captured: list = []
+
+    async def _fake_api_call(llm, *args, **kwargs):
+        captured.append(llm)
+        return "ok"
+
+    spy = create_autospec(api_call_mod.make_api_call, side_effect=_fake_api_call)
+    monkeypatch.setattr(service_mod, "make_api_call", spy)
+
+    svc = service_mod.LLMService(agent_config=_agent_config(background=background_model))
+    assert await svc.complete(user_id=None, user_prompt="extract") == "ok"
+    assert len(captured) == 1
+    client = captured[0]
+    assert _client_effort(client) == "low"
+    assert client.metadata.get("reasoning_effort") == "low"
+
+
+@pytest.mark.asyncio
+async def test_llm_service_system_path_preserves_explicit_effort_model_and_primary_slot(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from src.llms import api_call as api_call_mod
+    from src.server.services.llm import service as service_mod
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-system")
+    captured: list = []
+
+    async def _fake_api_call(llm, *args, **kwargs):
+        captured.append(llm)
+        return "ok"
+
+    spy = create_autospec(api_call_mod.make_api_call, side_effect=_fake_api_call)
+    monkeypatch.setattr(service_mod, "make_api_call", spy)
+
+    svc = service_mod.LLMService(agent_config=_agent_config(background="claude-haiku-5-5"))
+
+    # 1) Explicit reasoning_effort is preserved.
+    await svc.complete(user_id=None, user_prompt="extract", reasoning_effort="high")
+    assert _client_effort(captured[-1]) == "high"
+    assert captured[-1].metadata.get("reasoning_effort") == "high"
+
+    # 2) Explicit request_model keeps model default (medium), not low.
+    await svc.complete(user_id=None, user_prompt="extract", request_model="claude-sonnet-5-5")
+    assert _client_effort(captured[-1]) == "medium"
+    assert captured[-1].metadata.get("reasoning_effort") == "medium"
+
+    # 3) Primary slot keeps model default (medium), not low.
+    await svc.complete(user_id=None, user_prompt="extract", slot="primary")
+    assert _client_effort(captured[-1]) == "medium"
+    assert captured[-1].metadata.get("reasoning_effort") == "medium"
+
+
+@pytest.mark.asyncio
+async def test_llm_service_system_background_slot_leaves_ladderless_model_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from src.llms import api_call as api_call_mod
+    from src.server.services.llm import service as service_mod
+
+    monkeypatch.setenv("XAI_API_KEY", "sk-test-xai")
+    captured: list = []
+
+    async def _fake_api_call(llm, *args, **kwargs):
+        captured.append(llm)
+        return "ok"
+
+    spy = create_autospec(api_call_mod.make_api_call, side_effect=_fake_api_call)
+    monkeypatch.setattr(service_mod, "make_api_call", spy)
+
+    svc = service_mod.LLMService(agent_config=_agent_config(background="grok-build"))
+    await svc.complete(user_id=None, user_prompt="extract")
+    assert len(captured) == 1
+    assert captured[0].metadata.get("reasoning_effort") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "background", "env_key"),
+    [
+        ("claude-sonnet-5-5", "claude-haiku-5-5", "ANTHROPIC_API_KEY"),
+        ("claude-sonnet-5-5", None, "ANTHROPIC_API_KEY"),
+        ("claude-sonnet-5-5", "gpt-6.2-sol", "OPENAI_API_KEY"),
+    ],
+)
+async def test_insight_research_platform_path_builds_low_effort_client(
+    monkeypatch: pytest.MonkeyPatch, name: str, background: str | None, env_key: str
+):
+    from langchain_core.messages import AIMessage
+
+    from ptc_agent.agent import insight_graph as insight_graph_mod
+    from src.server.app import setup as setup_mod
+    from src.server.services.insight_service import _research
+
+    monkeypatch.setenv(env_key, "sk-test-system")
+    base_cfg = _agent_config(name=name, background=background)
+    monkeypatch.setattr(setup_mod, "agent_config", base_cfg)
+
+    built_clients: list = []
+
+    class _FakeGraph:
+        async def ainvoke(self, state, config):
+            return {"messages": [AIMessage(content="brief")]}
+
+    def _capture_graph(cfg):
+        built_clients.append(insight_graph_mod.background_client(cfg))
+        return _FakeGraph()
+
+    graph_spy = create_autospec(insight_graph_mod.build_insight_graph, side_effect=_capture_graph)
+    monkeypatch.setattr(insight_graph_mod, "build_insight_graph", graph_spy)
+
+    assert await _research("prompt", user_id=None, insight_type="pre_market") == "brief"
+    assert len(built_clients) == 1
+    client = built_clients[0]
+    assert _client_effort(client) == "low"
+    assert client.metadata.get("reasoning_effort") == "low"
+    # Shared setup.agent_config must not be mutated in place.
+    assert base_cfg.llm_client is None
+
+
+@pytest.mark.asyncio
+async def test_insight_research_platform_path_preserves_prebuilt_client_effort(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from langchain_core.messages import AIMessage
+
+    from ptc_agent.agent import insight_graph as insight_graph_mod
+    from src.llms.llm import create_llm
+    from src.server.app import setup as setup_mod
+    from src.server.services.insight_service import _research
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-system")
+    base_cfg = _agent_config(background="claude-haiku-5-5")
+    explicit_client = create_llm("claude-haiku-5-5", api_key="sk-test-system", reasoning_effort="high")
+    base_cfg.llm_client = explicit_client
+    monkeypatch.setattr(setup_mod, "agent_config", base_cfg)
+
+    built_clients: list = []
+
+    class _FakeGraph:
+        async def ainvoke(self, state, config):
+            return {"messages": [AIMessage(content="brief")]}
+
+    def _capture_graph(cfg):
+        built_clients.append(insight_graph_mod.background_client(cfg))
+        return _FakeGraph()
+
+    graph_spy = create_autospec(insight_graph_mod.build_insight_graph, side_effect=_capture_graph)
+    monkeypatch.setattr(insight_graph_mod, "build_insight_graph", graph_spy)
+
+    assert await _research("prompt", user_id=None, insight_type="pre_market") == "brief"
+    assert built_clients == [explicit_client]
+    assert _client_effort(built_clients[0]) == "high"
+    assert built_clients[0].metadata.get("reasoning_effort") == "high"

@@ -39,7 +39,8 @@ from pydantic import BaseModel
 from ptc_agent.config.agent import CredentialSource
 from src.llms.api_call import make_api_call
 from src.llms.llm import create_llm
-from .config import resolve_llm_config, slot_model
+# DALTON-HOOK(background-effort-low): default system Background-slot calls to low effort.
+from .config import background_default_effort, resolve_llm_config, slot_model
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -80,7 +81,14 @@ class LLMService:
             # and makes a DB lookup via ``get_model_preference``; skipping it
             # keeps system callers DB-free.
             model_name = request_model or slot_model(self._agent_config.llm, slot)
-            llm = create_llm(model_name, reasoning_effort=reasoning_effort)
+            # DALTON-HOOK(background-effort-low): system Background-slot calls with no
+            # model or effort named default to low on models with a reasoning ladder.
+            effort = (
+                background_default_effort({}, model_name)
+                if slot == "background" and request_model is None and reasoning_effort is None
+                else reasoning_effort
+            )
+            llm = create_llm(model_name, reasoning_effort=effort)
         else:
             resolved_config = await resolve_llm_config(
                 base_config=self._agent_config,

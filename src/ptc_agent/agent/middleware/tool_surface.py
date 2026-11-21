@@ -401,27 +401,28 @@ def _prepare(
     if not stored and not wanted:
         return _Prepared(_with_messages(request, messages), None, None, bridged=False)
 
-    epoch = _epoch(messages)
-    if not stored or (slot.get("epoch") != epoch and not holds_bound_thinking(messages)):
-        declared = wire.render(stored, wanted)
-    else:
-        declared = stored
-        epoch = slot.get("epoch")
-
     # DALTON-HOOK(team-memory-toggle): a pre-deploy OFF thread's stored surface
-    # omits `conversation_search`. Keep it out of `wanted` while Team Memory
-    # stays OFF so `diff()` never injects `additional_tools` / `tool_addition`;
+    # omits `conversation_search`. Filter it out of `wanted` before rebuilding
+    # `declared` (e.g. after compaction) so neither `wire.render()` nor
+    # `wire.diff()` re-adds `conversation_search` while Team Memory stays OFF;
     # once enabled (or on a fresh surface), it enters normally.
     if (
         conversation_search_enabled is False
         and stored
-        and not wire.has_tool(declared, messages, request.model, "conversation_search")
+        and not wire.has_tool(stored, messages, request.model, "conversation_search")
     ):
         wanted = [
             entry
             for entry in wanted
             if wire.tool_name(entry) != "conversation_search"
         ]
+
+    epoch = _epoch(messages)
+    if not stored or (slot.get("epoch") != epoch and not holds_bound_thinking(messages)):
+        declared = wire.render(stored, wanted)
+    else:
+        declared = stored
+        epoch = slot.get("epoch")
 
     # A compaction request summarizes what was sent, so it carries the array
     # and nothing new, and records nothing.
