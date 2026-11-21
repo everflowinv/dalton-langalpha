@@ -22,7 +22,8 @@ import type { AccountPolicy } from '@/types/api';
 import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(dalton-setup): omit Claude Code recommendation and gate skip on live Dalton team-model availability
 import { isDaltonBuild } from '@/config/brand';
-import { RowButton } from '../answers/parts';
+import { FlowFailure } from '@/components/modelAccess/parts';
+import { RowButton, StepLoadFailed } from '../answers/parts';
 import { useDaltonTeamModels } from '../answers/useTeamModels';
 // DALTON-HOOK(team-credentials): team-shared credentials hint & PM disconnect guard
 import { isDaltonAuth } from '@/config/daltonAuth';
@@ -260,6 +261,13 @@ export default function MethodStep() {
     }
   }, [invitationCode, queryClient, navigate, t]);
 
+  // DALTON-HOOK(dalton-setup): show load-failure notice with retry when reading team models fails under team sharing;
+  // keep provider connection entries visible for admins so they can still connect another provider
+  const teamUnread = isDaltonBuild && team.shared && team.unread;
+  if (teamUnread && !team.canManage) {
+    return <StepLoadFailed onRetry={team.retry} />;
+  }
+
   return (
     <div>
       <WizardStepHeader
@@ -268,6 +276,15 @@ export default function MethodStep() {
         helper={canSkip ? t('setup.addMoreProviders') : t('setup.methodSubtitle')}
       />
       <div className="flex flex-col gap-4 sm:gap-6">
+      {/* DALTON-HOOK(dalton-setup): inline load-failure notice with retry for admins while preserving connect entries */}
+      {teamUnread && team.canManage && (
+        <div data-testid="setup-load-failed">
+          <FlowFailure
+            title={t('setup.answers.loadFailed')}
+            action={<RowButton onClick={team.retry}>{t('setup.answers.tryAgain')}</RowButton>}
+          />
+        </div>
+      )}
       {/* DALTON-HOOK(team-credentials): team-shared credentials hint */}
       {isDaltonAuth && isTeamShared && !teamManagedByAdmin && (
         <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>

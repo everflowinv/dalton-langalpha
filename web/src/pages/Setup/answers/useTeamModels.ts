@@ -10,7 +10,11 @@ import { useAllModels, type UseAllModelsResult } from '@/hooks/useAllModels';
 import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
 import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { queryKeys } from '@/lib/queryKeys';
-import { collectRejectedProviders, REJECTED_CREDENTIAL_REASONS } from './daltonTeamModelsCheck';
+import {
+  bumpDaltonTeamModelsRetry,
+  collectRejectedProviders,
+  REJECTED_CREDENTIAL_REASONS,
+} from './daltonTeamModelsCheck';
 import { useDaltonTeamModelsAvailable } from './useTeamModelsAvailable';
 
 const STALE_MS = 10 * 60_000;
@@ -88,17 +92,47 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
   );
 
   const retry = useCallback(() => {
+    bumpDaltonTeamModelsRetry(queryClient);
     void Promise.all([
       queryClient.invalidateQueries({ queryKey: queryKeys.dalton.credentialsStatus(userId) }),
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all }),
       queryClient.invalidateQueries({ queryKey: queryKeys.user.apiKeys() }),
       queryClient.invalidateQueries({ queryKey: queryKeys.oauth.all }),
-      queryClient.invalidateQueries({ queryKey: queryKeys.providerModels.all }),
       queryClient.invalidateQueries({ queryKey: queryKeys.user.preferences() }),
-    ]).then(() =>
-      queryClient.refetchQueries({ queryKey: [...queryKeys.dalton.all, 'team-models-available'] }),
-    );
-  }, [queryClient, userId]);
+    ]).then(async () => {
+      const credsStatus = useSharedQuery
+        ? queryClient.getQueryData<{ enabled?: boolean }>(queryKeys.dalton.credentialsStatus(userId))
+        : null;
+      if (useSharedQuery && credsStatus?.enabled) {
+        await queryClient.refetchQueries({ queryKey: [...queryKeys.dalton.all, 'team-models-available'] });
+        return;
+      }
+      // Personal credentials (sharing off / status unread) or local fallback path:
+      // cancel any in-flight normal provider list request and force-refresh with `?refresh=1`.
+      await Promise.allSettled(
+        listedProviders.map(async (provider) => {
+          const whole = queryKeys.providerModels.available(provider, '');
+          await queryClient.cancelQueries({ queryKey: whole, exact: true });
+          let forcedRan = false;
+          await queryClient.fetchQuery({
+            queryKey: whole,
+            queryFn: ({ signal }) => {
+              forcedRan = true;
+              return getProviderAvailableModels(provider, { refresh: true, signal });
+            },
+            staleTime: 0,
+            retry: false,
+          });
+          if (forcedRan) {
+            queryClient.removeQueries({
+              queryKey: queryKeys.providerModels.availableFor(provider),
+              predicate: (q) => q.queryKey.at(-1) !== whole.at(-1),
+            });
+          }
+        }),
+      );
+    });
+  }, [queryClient, userId, useSharedQuery, listedProviders]);
 
   if (useSharedQuery) {
     return {

@@ -59,9 +59,9 @@ export function resolveDaltonSetupCandidates(available: Iterable<string>): strin
 
 /**
  * Narrow provider model groups to the resolved `DALTON_SETUP_CANDIDATES` in
- * their exact fixed order (preserving provider grouping). Falls back to
- * `groups` untouched when none of the curated candidates is available (e.g.
- * BYOK-only setups without team OAuth lines).
+ * their exact fixed order (preserving provider grouping). Returns `{}` when
+ * none of the curated candidates is available (never falls back to uncurated
+ * models).
  */
 export function filterDaltonCuratedModels(
   groups: Record<string, ProviderModelsData>,
@@ -75,7 +75,7 @@ export function filterDaltonCuratedModels(
     }
   }
   const curated = resolveDaltonSetupCandidates(ownerOf.keys());
-  if (curated.length === 0) return groups;
+  if (curated.length === 0) return {};
   const out: Record<string, ProviderModelsData> = {};
   for (const m of curated) {
     const provider = ownerOf.get(m);
@@ -193,7 +193,7 @@ export function filterDaltonProviderModels(
   return out;
 }
 
-/** True when at least one Dalton-allowed model is available in the catalog. */
+/** True when at least one curated Dalton setup candidate (or any model in non-Dalton mode) is available in the catalog. */
 export function hasAvailableDaltonModels(
   groups: Record<string, ProviderModelsData>,
   metadata: Record<string, DaltonModelMeta | undefined>,
@@ -202,5 +202,9 @@ export function hasAvailableDaltonModels(
   rejectedProviders?: ReadonlySet<string>,
 ): boolean {
   const filtered = filterDaltonProviderModels(groups, metadata, payers, dalton, rejectedProviders);
-  return Object.values(filtered).some((data) => (data.models?.length ?? 0) > 0);
+  if (!dalton) {
+    return Object.values(filtered).some((data) => (data.models?.length ?? 0) > 0);
+  }
+  const available = Object.values(filtered).flatMap((data) => data.models ?? []);
+  return resolveDaltonSetupCandidates(available).length > 0;
 }

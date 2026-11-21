@@ -535,3 +535,4 @@ tests/unit/dalton/test_d042_automation_reasoning_effort.py
 tests/unit/dalton/test_automation_reasoning_effort.py
 tests/unit/dalton/test_automation_effort_inheritance.py
 tests/unit/dalton/test_backfill_opus_automation_effort.py
+web/src/pages/Setup/answers/__tests__/daltonTeamModelsCheck.test.ts

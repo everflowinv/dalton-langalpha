@@ -9,35 +9,54 @@
  * day's Background pick, so the server keeps resolving them from the current model
  * per turn (`compaction_name`/`fetch_name` in `src/ptc_agent/config/agent.py`).
  */
+import { useSyncExternalStore } from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { fireEvent, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor } from '@testing-library/react';
 import { renderWithProviders } from '@/test/utils';
 
-const h = vi.hoisted(() => ({
-  mutateAsync: vi.fn(async (_payload: unknown) => ({})),
-  preferences: null as Record<string, unknown> | null,
-  /** Whether the preferences read has come back. */
-  loaded: true,
-  /** Whether it is still in flight; not loaded and not loading is a failed read. */
-  loading: false,
-  systemDefaults: null as { default_model: string } | null,
-  models: {
-    anthropic: { models: ['claude-big', 'claude-small'] },
-    openai: { models: ['gpt-sol', 'gpt-terra'] },
-  } as Record<string, { models: string[] }>,
-  /** What the slots list; null lists every model. */
-  slotModels: null as Record<string, { models: string[] }> | null,
-}));
+const h = vi.hoisted(() => {
+  const listeners = new Set<() => void>();
+  let version = 0;
+  return {
+    mutateAsync: vi.fn(async (_payload: unknown) => ({})),
+    preferences: null as Record<string, unknown> | null,
+    /** Whether the preferences read has come back. */
+    loaded: true,
+    /** Whether it is still in flight; not loaded and not loading is a failed read. */
+    loading: false,
+    // DALTON-HOOK(dalton-setup): allow testing non-Dalton background auto-pick while useAllModels().isLoading is true
+    modelsLoading: false,
+    subscribe: (cb: () => void) => {
+      listeners.add(cb);
+      return () => { listeners.delete(cb); };
+    },
+    getVersion: () => version,
+    notify: () => {
+      version += 1;
+      for (const cb of listeners) cb();
+    },
+    systemDefaults: null as { default_model: string } | null,
+    models: {
+      anthropic: { models: ['claude-big', 'claude-small'] },
+      openai: { models: ['gpt-sol', 'gpt-terra'] },
+    } as Record<string, { models: string[] }>,
+    /** What the slots list; null lists every model. */
+    slotModels: null as Record<string, { models: string[] }> | null,
+  };
+});
 
 vi.mock('@/hooks/useAllModels', () => ({
-  useAllModels: () => ({
-    models: h.models,
-    slotModels: h.slotModels ?? h.models,
-    metadata: {},
-    payers: {},
-    systemDefaults: h.systemDefaults,
-    isLoading: false,
-  }),
+  useAllModels: () => {
+    useSyncExternalStore(h.subscribe, h.getVersion);
+    return {
+      models: h.models,
+      slotModels: h.slotModels ?? h.models,
+      metadata: {},
+      payers: {},
+      systemDefaults: h.systemDefaults,
+      isLoading: h.modelsLoading,
+    };
+  },
 }));
 vi.mock('@/hooks/usePreferences', () => ({
   usePreferences: () => ({ preferences: h.loaded ? h.preferences : null, isLoaded: h.loaded, isLoading: h.loading }),
@@ -77,6 +96,8 @@ beforeEach(() => {
   h.systemDefaults = null;
   h.loaded = true;
   h.loading = false;
+  // DALTON-HOOK(dalton-setup): reset modelsLoading state between tests
+  h.modelsLoading = false;
 });
 
 describe('DefaultsStep first-run primary', () => {
@@ -243,6 +264,28 @@ describe('DefaultsStep before the preferences arrive', () => {
     } finally {
       h.models = { anthropic: { models: ['claude-big', 'claude-small'] }, openai: { models: ['gpt-sol', 'gpt-terra'] } };
       h.slotModels = null;
+    }
+  });
+
+  // DALTON-HOOK(dalton-setup): verify non-Dalton Background auto-pick stays identical to upstream while isLoading is true
+  it('auto-picks Background beside a saved primary while catalog is still loading in non-Dalton builds', () => {
+    h.modelsLoading = true;
+    h.preferences = { model_preference: { preferred_model: 'claude-big' } };
+    renderWithProviders(<DefaultsStep />);
+
+    // Upstream fills Background during render even before isLoading settles, and
+    // keeps that pick once loading finishes even if a different candidate moves first.
+    h.modelsLoading = false;
+    h.models = {
+      anthropic: { models: ['claude-big', 'claude-fast', 'claude-small'] },
+      openai: { models: ['gpt-sol', 'gpt-terra'] },
+    };
+    try {
+      act(() => h.notify());
+      expect(background().value).toBe('claude-small');
+    } finally {
+      h.models = { anthropic: { models: ['claude-big', 'claude-small'] }, openai: { models: ['gpt-sol', 'gpt-terra'] } };
+      h.modelsLoading = false;
     }
   });
 });
