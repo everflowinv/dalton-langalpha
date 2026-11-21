@@ -966,6 +966,104 @@ async def test_scheduler_host_run_does_not_inject_etf_outbox_when_notify_disable
     assert finalize_params["outbox_payload"] is None
 
 
+@pytest.mark.asyncio
+async def test_scheduler_host_run_reads_bridge_outbox_and_queues_notification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host run's outbox reaches notify like a container run's (weekly-token-usage, 2026-11-21)."""
+    import src.dalton.data_jobs.scheduler as scheduler_mod
+    from src.dalton.data_jobs.host_runner import HostRunOutcome
+    from tests.unit.dalton.test_data_jobs import _make_autospec_db
+
+    host_client = create_autospec(DataTaskHostBridgeClient, instance=True)
+    host_client.run_host_task.return_value = HostRunOutcome(
+        ok=True,
+        status_code=200,
+        exit_code=0,
+        exit_confirmed=True,
+        log_tail=json.dumps({"ok": True}),
+    )
+    monkeypatch.setattr(
+        scheduler_mod,
+        "start_claimed_host_run",
+        create_autospec(scheduler_mod.start_claimed_host_run, return_value=True),
+    )
+    monkeypatch.setattr(
+        scheduler_mod,
+        "check_scheduler_lock",
+        create_autospec(scheduler_mod.check_scheduler_lock, return_value=None),
+    )
+    monkeypatch.setattr(
+        scheduler_mod,
+        "freeze_task_run_artifacts",
+        create_autospec(scheduler_mod.freeze_task_run_artifacts, return_value=None),
+    )
+
+    import src.dalton.monitors.service as monitor_service_mod
+
+    monkeypatch.setattr(
+        monitor_service_mod,
+        "maybe_publish_data_job_monitor",
+        create_autospec(monitor_service_mod.maybe_publish_data_job_monitor, return_value=None),
+    )
+
+    lock_conn, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(6)])
+    conn, state = _make_autospec_db(
+        [
+            {"rowcount": 1},  # finalize UPDATE dalton_data_task_runs
+            {"rowcount": 1, "fetchone": {"consecutive_failures": 0}},  # UPDATE defs
+            {"rowcount": 1},  # UPDATE slot idle
+        ]
+    )
+    now = datetime(2026, 11, 21, 4, 0, tzinfo=timezone.utc)
+    path_map = build_path_map(host_var_dir=tmp_path / "h", backend_var_dir=tmp_path / "b")
+    run_id = str(uuid4())
+    card = {
+        "schema": "2.0",
+        "header": {"title": {"tag": "plain_text", "content": "Weekly token usage"}},
+        "body": {"elements": [{"tag": "markdown", "content": "周度 token 用量"}]},
+    }
+    run_dir = path_map.backend_run_artifacts_dir(run_id)
+    run_dir.mkdir(parents=True)
+    (run_dir / "outbox.json").write_text(
+        json.dumps({"feishu_cards": [{"card": card, "images": []}]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    claimed = ClaimedTaskRun(
+        run_id=run_id,
+        job_key="weekly-token-usage",
+        generation=1,
+        runner="host",
+        command_argv=["bash", "skills/model-usage-cost/scripts/run.sh"],
+        workdir=DATA_COPY_CWD,
+        timeout_seconds=900,
+        no_output_timeout_seconds=600,
+        required_secrets=[],
+        cos_mode="skip",
+        notify_enabled=True,
+        scheduled_slot_utc=now,
+        deadline_utc=now + timedelta(minutes=15),
+        timezone="Asia/Hong_Kong",
+        host_mode="run",
+    )
+
+    committed, _ = await execute_claimed_host_run(
+        conn,
+        lock_conn=lock_conn,
+        host_client=host_client,
+        claimed=claimed,
+        path_map=path_map,
+    )
+    assert committed is True
+    finalize_params = state["executed"][0][1]
+    assert finalize_params.get("failure_reason") is None, finalize_params.get("failure_reason")
+    assert finalize_params["terminal_status"] == "succeeded"
+    assert finalize_params["outbox_payload"] is not None
+    assert "周度 token 用量" in str(finalize_params["outbox_payload"])
+    assert finalize_params["notify_status"] == "pending_dispatch"
+
+
 def test_kweb_overlay_skill_md_recommends_deploy_no_upload() -> None:
     skill_md = (
         REPO_ROOT
