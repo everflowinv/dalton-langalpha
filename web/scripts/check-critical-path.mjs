@@ -43,7 +43,12 @@ const EXPECTED = ['index', 'rolldown-runtime', 'vendor-react']
 // measured 527.2 kB in the production build (zh-CN catalog, Supabase auth); raised to 530.
 // Upstream moved its own ceiling 505 -> 533 by sync7 (bf56add19); the Dalton figure is
 // re-measured on the sync7 production build before release.
-const MAX_EAGER_KB = 560
+// 2026-11-21: #435 (external-user onboarding) made the app-shell onboarding route
+// (useOnboardingRoute -> useSetupFacts) read the Dalton team-models check, which pulls
+// useAllModels and the Dalton model filters into the entry: measured 557.2 kB before #435
+// and 564.7 kB after (index +7.2 kB, zh-CN catalog +0.3 kB), production build, zh-CN,
+// Supabase auth. Raised to 568; moving that check off the entry path is a follow-up.
+const MAX_EAGER_KB = 568
 
 const outDir = process.argv[2] || 'dist'
 const indexPath = join(outDir, 'index.html')
