@@ -1654,6 +1654,7 @@ async def test_custom_shadowed_model_and_forbidden_role_model_never_selected(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     import src.dalton.llm.model_prefs as model_prefs_mod
+    import src.dalton.settings as settings_mod
 
     _enable_team_mode(monkeypatch)
     _install_db(
@@ -1671,25 +1672,25 @@ async def test_custom_shadowed_model_and_forbidden_role_model_never_selected(
     _install_read_access(monkeypatch, web_readable={WS_2})
 
     # Case A: caller defines a custom_model with the same name as assist_model
-    # plus a custom_provider; model resolution via assist.py/model_prefs.py must
-    # drop the shadowed model and use the unshadowed system fallback instead.
+    # plus personal dalton_assist_model; dedup ignores user preferences and
+    # still uses the deployment default from dalton.yaml.
     async def _prefs_shadow_primary(uid: str) -> dict[str, Any]:
-        if uid == USER_CALLER:
-            return {
-                "model_preference": {
-                    "custom_providers": [
-                        {"name": "attacker-proxy", "parent_provider": "openai"}
-                    ],
-                    "custom_models": [
-                        {
-                            "name": "gemini-4-hydrogen-low-oauth",
-                            "model_id": "evil-intercept",
-                            "provider": "attacker-proxy",
-                        }
-                    ],
-                }
+        return {
+            "model_preference": {
+                "dalton_assist_model": "moonshot-kimi-k2.5",
+                "dalton_assist_fallback_models": ["gpt-6.2-sol-oauth"],
+                "custom_providers": [
+                    {"name": "attacker-proxy", "parent_provider": "openai"}
+                ],
+                "custom_models": [
+                    {
+                        "name": "gemini-4-hydrogen-low-oauth",
+                        "model_id": "evil-intercept",
+                        "provider": "attacker-proxy",
+                    }
+                ],
             }
-        return {"model_preference": {}}
+        }
 
     monkeypatch.setattr(
         model_prefs_mod,
@@ -1707,25 +1708,26 @@ async def test_custom_shadowed_model_and_forbidden_role_model_never_selected(
     match = await find_existing_company_workspace(USER_CALLER, "Anthropic")
     assert match is not None
     assert len(calls) == 1
-    assert calls[0]["request_model"] == "deepseek-flash"
+    assert calls[0]["request_model"] == "gemini-4-hydrogen-low-oauth"
 
-    # Case B: caller shadows BOTH assist_model and assist_fallback_model -> fail open without calling LLM.
-    async def _prefs_shadow_both(uid: str) -> dict[str, Any]:
-        if uid == USER_CALLER:
-            return {
-                "model_preference": {
-                    "custom_models": [
-                        {"name": "gemini-4-hydrogen-low-oauth", "model_id": "m1", "provider": "openai"},
-                        {"name": "deepseek-flash", "model_id": "m2", "provider": "openai"},
-                    ]
-                }
-            }
-        return {"model_preference": {}}
-
+    # Case B: deployment dalton.yaml has neither assist_model nor fallback -> fail open without calling LLM.
+    base_cfg = settings_mod.get_dalton_settings()
+    empty_models_cfg = base_cfg.model_copy(
+        update={
+            "models": base_cfg.models.model_copy(
+                update={"assist_model": "", "assist_fallback_model": []}
+            )
+        }
+    )
     monkeypatch.setattr(
         model_prefs_mod,
-        "get_user_preferences",
-        create_autospec(model_prefs_mod._DEFAULT_GET_USER_PREFERENCES, side_effect=_prefs_shadow_both),
+        "get_dalton_settings",
+        create_autospec(model_prefs_mod.get_dalton_settings, return_value=empty_models_cfg),
+    )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_assist_fallback_models",
+        create_autospec(model_prefs_mod.get_assist_fallback_models, return_value=[]),
     )
     calls.clear()
     with caplog.at_level(logging.WARNING):
@@ -1734,13 +1736,26 @@ async def test_custom_shadowed_model_and_forbidden_role_model_never_selected(
     assert "RuntimeError" in caplog.text
 
     # Case C: forbidden contributor fallback model is rejected by RolePolicyError -> fail open.
-    async def _prefs_empty(_uid: str) -> dict[str, Any]:
-        return {"model_preference": {}}
-
-    monkeypatch.setattr(
-        model_prefs_mod,
-        "get_user_preferences",
-        create_autospec(model_prefs_mod._DEFAULT_GET_USER_PREFERENCES, side_effect=_prefs_empty),
+    monkeypatch.undo()
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="Anthropic",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            )
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_2})
+    calls.clear()
+    _install_llm(
+        monkeypatch,
+        lambda **_kw: _ok_result([{"id": "c1", "confidence": "high", "reason": "dup"}]),
+        captured_calls=calls,
     )
     monkeypatch.setenv("DALTON_ASSIST_FALLBACK_MODEL", "gemini-3-contributor-oauth")
     caplog.clear()
@@ -1861,21 +1876,27 @@ async def test_concurrent_same_name_dedup_two_users_isolated_with_budget_and_usa
     )
     _install_read_access(monkeypatch, web_readable={WS_2, WS_1})
 
-    # Shadow primary so both users resolve to the cash model `deepseek-flash`,
+    # Configure deployment assist model as cash model `deepseek-flash`,
     # exercising budget admission + journal usage recording under real `dalton_complete`.
-    async def _prefs_cash(uid: str) -> dict[str, Any]:
-        return {
-            "model_preference": {
-                "custom_models": [
-                    {"name": "gemini-4-hydrogen-low-oauth", "model_id": "x", "provider": "openai"}
-                ]
-            }
-        }
+    import src.dalton.settings as settings_mod
 
+    base_cfg = settings_mod.get_dalton_settings()
+    cash_cfg = base_cfg.model_copy(
+        update={
+            "models": base_cfg.models.model_copy(
+                update={"assist_model": "deepseek-flash", "assist_fallback_model": []}
+            )
+        }
+    )
     monkeypatch.setattr(
         model_prefs_mod,
-        "get_user_preferences",
-        create_autospec(model_prefs_mod._DEFAULT_GET_USER_PREFERENCES, side_effect=_prefs_cash),
+        "get_dalton_settings",
+        create_autospec(model_prefs_mod.get_dalton_settings, return_value=cash_cfg),
+    )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_assist_fallback_models",
+        create_autospec(model_prefs_mod.get_assist_fallback_models, return_value=[]),
     )
 
     journal_rows: dict[str, dict[str, Any]] = {}
@@ -2932,7 +2953,6 @@ async def test_primary_9s_deadline_checked_at_send_time_and_pref_read_within_15s
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import src.dalton.llm.complete as complete_mod
-    import src.dalton.llm.model_prefs as model_prefs_mod
     from src.server.services.llm.service import LLMService
 
     _enable_team_mode(monkeypatch)
@@ -2950,19 +2970,20 @@ async def test_primary_9s_deadline_checked_at_send_time_and_pref_read_within_15s
     )
     _install_read_access(monkeypatch, web_readable={WS_2})
 
-    # Case A: model preference reading hangs past total 15s (patched to 0.05s) ->
+    # Case A: model resolution hangs past total 15s (patched to 0.05s) ->
     # dedup times out around 0.05s without invoking dalton_complete.
     monkeypatch.setattr(dedup_mod, "DEDUP_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(dedup_mod, "DEDUP_PRIMARY_MODEL_TIMEOUT_SECONDS", 0.03)
+    real_resolve_assist = dedup_mod.resolve_assist_model
 
-    async def _slow_prefs(_uid: str) -> dict[str, Any]:
+    async def _slow_resolve_assist(**_kw: Any) -> str:
         await asyncio.sleep(0.30)
-        return {"model_preference": {}}
+        return "gemini-4-hydrogen-low-oauth"
 
     monkeypatch.setattr(
-        model_prefs_mod,
-        "get_user_preferences",
-        create_autospec(model_prefs_mod._DEFAULT_GET_USER_PREFERENCES, side_effect=_slow_prefs),
+        dedup_mod,
+        "resolve_assist_model",
+        create_autospec(real_resolve_assist, side_effect=_slow_resolve_assist),
     )
     llm_spy = _install_llm(monkeypatch, _ok_result([]))
     t0 = asyncio.get_running_loop().time()
@@ -2975,13 +2996,10 @@ async def test_primary_9s_deadline_checked_at_send_time_and_pref_read_within_15s
     # while total 15s deadline (patched to 0.6s) still has room.
     # Primary MUST NOT send to llm_service.complete at send time (raises DeadlineBeforeSendError),
     # while fallback model sends and succeeds!
-    async def _fast_prefs(_uid: str) -> dict[str, Any]:
-        return {"model_preference": {}}
-
     monkeypatch.setattr(
-        model_prefs_mod,
-        "get_user_preferences",
-        create_autospec(model_prefs_mod._DEFAULT_GET_USER_PREFERENCES, side_effect=_fast_prefs),
+        dedup_mod,
+        "resolve_assist_model",
+        create_autospec(real_resolve_assist, return_value="gemini-4-hydrogen-low-oauth"),
     )
     monkeypatch.setattr(dedup_mod, "DEDUP_PRIMARY_MODEL_TIMEOUT_SECONDS", 0.04)
     monkeypatch.setattr(dedup_mod, "DEDUP_TIMEOUT_SECONDS", 0.60)
@@ -3414,3 +3432,701 @@ async def test_cos_allow_duplicate_company_logs_only_after_approval(
         dedup_spy.assert_awaited_once()
         hitl_spy.assert_not_called()
         assert json.loads(rej_cmd.update["messages"][0].content)["code"] == "company_workspace_exists"
+
+
+# ---------------------------------------------------------------------------
+# Round 7 tests: deployment-only model resolution, external platform fallback
+# prohibition, GLM Coding Plan deployment key, probe is_external, debug log
+# parse-error redaction, empty credential holder on deployment key calls.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_personal_assist_model_preferences_do_not_affect_dedup_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.dalton.llm.model_prefs as model_prefs_mod
+    import src.dalton.settings as settings_mod
+
+    _enable_team_mode(monkeypatch)
+    monkeypatch.setenv("DALTON_PM_USER_IDS", USER_RICHARD)
+    settings_mod.get_dalton_config.cache_clear()
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="Anthropic",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            )
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_2})
+
+    # Both caller and team credential holder configure personal dalton_assist_model
+    # and dalton_assist_fallback_models pointing to another provider (moonshot / gpt).
+    user_prefs_spy = create_autospec(
+        model_prefs_mod._DEFAULT_GET_USER_PREFERENCES,
+        return_value={
+            "model_preference": {
+                "dalton_assist_model": "moonshot-kimi-k2.5",
+                "dalton_assist_fallback_models": ["gpt-6.2-sol-oauth"],
+            }
+        },
+    )
+    monkeypatch.setattr(model_prefs_mod, "get_user_preferences", user_prefs_spy)
+
+    seen_models: list[str] = []
+
+    def _fail_primary_then_match(**kwargs: Any) -> DaltonCompleteResult:
+        model = str(kwargs["request_model"])
+        seen_models.append(model)
+        if model == "gemini-4-hydrogen-low-oauth":
+            return DaltonCompleteResult(ok=False, status="failed", error_kind="pre_send")
+        return _ok_result([{"id": "c1", "confidence": "high", "reason": "same"}])
+
+    _install_llm(monkeypatch, _fail_primary_then_match)
+
+    match = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert match is not None
+    assert match.workspace_id == WS_2
+    assert seen_models == ["gemini-4-hydrogen-low-oauth", "deepseek-flash"]
+    user_prefs_spy.assert_not_awaited()
+    settings_mod.get_dalton_config.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_external_caller_without_own_credentials_skips_llm_and_never_uses_platform_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ptc_agent.config as ptc_cfg_mod
+    from ptc_agent.config.agent import LLMConfig
+    import src.dalton.credentials as cred_mod
+    import src.dalton.llm.complete as complete_mod
+    import src.dalton.llm.model_prefs as model_prefs_mod
+    import src.dalton.settings as settings_mod
+    import src.server.database.api_keys as api_keys_db
+    import src.server.database.oauth_tokens as oauth_tokens_db
+    import src.server.database.user as user_db
+    import src.server.services.features as features_mod
+    import src.server.services.llm.service as llm_svc_mod
+    import src.server.services.user_skills as user_skills_mod
+
+    _enable_team_mode(monkeypatch)
+    monkeypatch.setenv("DALTON_PM_USER_IDS", USER_RICHARD)
+    # Deployment platform keys ARE set in env, and team holder has OAuth tokens!
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-platform-deepseek-secret")
+    monkeypatch.setenv("ZAI_CN_CODING_API_KEY", "sk-platform-zai-coding-secret")
+    settings_mod.get_dalton_config.cache_clear()
+
+    base_cfg = settings_mod.get_dalton_settings()
+    coding_and_deepseek_cfg = base_cfg.model_copy(
+        update={
+            "models": base_cfg.models.model_copy(
+                update={
+                    "assist_model": "gemini-4-hydrogen-low-oauth",
+                    "assist_fallback_model": ["glm-5.3-flash-plan", "deepseek-flash"],
+                }
+            )
+        }
+    )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_dalton_settings",
+        create_autospec(model_prefs_mod.get_dalton_settings, return_value=coding_and_deepseek_cfg),
+    )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_assist_fallback_models",
+        create_autospec(
+            model_prefs_mod.get_assist_fallback_models,
+            return_value=["glm-5.3-flash-plan", "deepseek-flash"],
+        ),
+    )
+
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_4,
+                name="MyNVDA",
+                owner_id=USER_EXTERNAL,
+                owner_name="ExtUser",
+                owner_email=EMAIL_EXTERNAL,
+            )
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_4})
+
+    fake_cfg = create_autospec(ptc_cfg_mod.AgentConfig, instance=True)
+    fake_cfg.llm = LLMConfig(name="gemini-4-hydrogen-low-oauth", background="deepseek-flash")
+    monkeypatch.setattr(
+        ptc_cfg_mod,
+        "load_from_files",
+        create_autospec(ptc_cfg_mod.load_from_files, return_value=fake_cfg),
+    )
+    prefs_stub = create_autospec(
+        model_prefs_mod._DEFAULT_GET_USER_PREFERENCES,
+        return_value={"model_preference": {}},
+    )
+    monkeypatch.setattr(model_prefs_mod, "get_user_preferences", prefs_stub)
+    monkeypatch.setattr(user_db, "get_user_preferences", prefs_stub)
+    monkeypatch.setattr(
+        user_skills_mod,
+        "load_user_skill_bundle",
+        create_autospec(
+            user_skills_mod.load_user_skill_bundle,
+            return_value=user_skills_mod.EMPTY_USER_SKILL_BUNDLE,
+        ),
+    )
+    monkeypatch.setattr(
+        features_mod,
+        "effective_flags_for_user",
+        create_autospec(features_mod.effective_flags_for_user, return_value={}),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "_check_cash_budget_admission",
+        create_autospec(complete_mod._check_cash_budget_admission, return_value=(True, None, None)),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "inspect_journal_state",
+        create_autospec(complete_mod.inspect_journal_state, return_value=("proceed", None)),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "claim_journal_invocation",
+        create_autospec(complete_mod.claim_journal_invocation, return_value=("claimed", {"attempt": 1})),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "complete_journal_failed",
+        create_autospec(complete_mod.complete_journal_failed, return_value={}),
+    )
+
+    async def _get_tokens(uid: str, provider: str, *, conn: Any = None) -> dict[str, Any] | None:
+        resolved = cred_mod.credential_user_id(uid)
+        if resolved == USER_RICHARD:
+            return {
+                "access_token": "holder-token",
+                "refresh_token": "holder-refresh",
+                "account_id": "acct-holder",
+                "email": EMAIL_RICHARD,
+                "plan_type": "pro",
+                "expires_at": NOW + timedelta(hours=2),
+            }
+        return None
+
+    monkeypatch.setattr(
+        oauth_tokens_db,
+        "get_oauth_tokens",
+        create_autospec(oauth_tokens_db.get_oauth_tokens, side_effect=_get_tokens),
+    )
+    import src.server.services.oauth_health as oauth_health_mod
+
+    monkeypatch.setattr(oauth_health_mod, "get_oauth_tokens", oauth_tokens_db.get_oauth_tokens)
+    monkeypatch.setattr(
+        api_keys_db,
+        "get_byok_config_for_provider",
+        create_autospec(api_keys_db.get_byok_config_for_provider, return_value=None),
+    )
+    monkeypatch.setattr(
+        api_keys_db,
+        "get_byok_configs_for_providers",
+        create_autospec(api_keys_db.get_byok_configs_for_providers, return_value={}),
+    )
+
+    api_call_spy = create_autospec(llm_svc_mod.make_api_call)
+    monkeypatch.setattr(llm_svc_mod, "make_api_call", api_call_spy)
+
+    # 1. External caller has no OAuth and no BYOK -> must NOT use DEEPSEEK_API_KEY,
+    # ZAI_CN_CODING_API_KEY, or team OAuth; skips LLM and allows creation.
+    assert await find_existing_company_workspace(USER_EXTERNAL, "NVIDIA") is None
+    api_call_spy.assert_not_awaited()
+
+    # 2. Direct LLMService.complete check: disable_platform_fallback=True blocks both
+    # user_id=None, eager PLATFORM (glm-5.3-flash-plan), and lazy NONE (deepseek-flash),
+    # while default disable_platform_fallback=False still permits platform fallback.
+    from src.llms.llm import MissingProviderKeyError
+
+    svc = llm_svc_mod.LLMService(agent_config=fake_cfg)
+    with pytest.raises(MissingProviderKeyError):
+        await svc.complete(
+            user_id=None,
+            user_prompt="hi",
+            request_model="deepseek-flash",
+            disable_platform_fallback=True,
+        )
+    with pytest.raises(MissingProviderKeyError):
+        await svc.complete(
+            user_id=USER_EXTERNAL,
+            user_prompt="hi",
+            request_model="glm-5.3-flash-plan",
+            disable_platform_fallback=True,
+        )
+    with pytest.raises(MissingProviderKeyError):
+        await svc.complete(
+            user_id=USER_EXTERNAL,
+            user_prompt="hi",
+            request_model="deepseek-flash",
+            disable_platform_fallback=True,
+        )
+    api_call_spy.assert_not_awaited()
+
+    api_call_spy.return_value = ("ok", {"input_tokens": 1, "output_tokens": 1})
+    default_res = await svc.complete(
+        user_id=USER_EXTERNAL,
+        user_prompt="hi",
+        request_model="deepseek-flash",
+        return_token_usage=True,
+    )
+    assert default_res == ("ok", {"input_tokens": 1, "output_tokens": 1})
+    api_call_spy.assert_awaited_once()
+    settings_mod.get_dalton_config.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_glm_coding_plan_works_with_deployment_key_when_sharing_off_and_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ptc_agent.config as ptc_cfg_mod
+    from ptc_agent.config.agent import LLMConfig
+    import src.dalton.llm.complete as complete_mod
+    import src.dalton.llm.model_prefs as model_prefs_mod
+    import src.dalton.settings as settings_mod
+    import src.server.services.llm.service as llm_svc_mod
+
+    _enable_team_mode(monkeypatch)
+    assert complete_mod.model_requires_user_oauth("glm-5.3-flash-plan") is False
+    assert complete_mod.model_requires_user_oauth("gemini-4-hydrogen-low-oauth") is True
+
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="Anthropic",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            )
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_2})
+
+    fake_cfg = create_autospec(ptc_cfg_mod.AgentConfig, instance=True)
+    fake_cfg.llm = LLMConfig(name="glm-5.3-flash-plan", background="glm-5.3-flash-plan")
+    monkeypatch.setattr(
+        ptc_cfg_mod,
+        "load_from_files",
+        create_autospec(ptc_cfg_mod.load_from_files, return_value=fake_cfg),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "inspect_journal_state",
+        create_autospec(complete_mod.inspect_journal_state, return_value=("proceed", None)),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "claim_journal_invocation",
+        create_autospec(complete_mod.claim_journal_invocation, return_value=("claimed", {"attempt": 1})),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "complete_journal_done",
+        create_autospec(complete_mod.complete_journal_done, return_value={}),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "complete_journal_failed",
+        create_autospec(complete_mod.complete_journal_failed, return_value={}),
+    )
+
+    seen_clients: list[Any] = []
+
+    async def _fake_api_call(llm: Any, **_kw: Any) -> tuple[DedupLlmResult, dict[str, Any]]:
+        seen_clients.append(llm)
+        return (
+            DedupLlmResult(matches=[DedupMatchItem(id="c1", confidence="high", reason="same")]),
+            {"input_tokens": 30, "output_tokens": 10},
+        )
+
+    monkeypatch.setattr(
+        llm_svc_mod,
+        "make_api_call",
+        create_autospec(llm_svc_mod.make_api_call, side_effect=_fake_api_call),
+    )
+
+    # Configure deployment assist model as glm-5.3-flash-plan (coding_plan subscription).
+    orig_load_cfg = settings_mod._load_base_dalton_config
+    base_cfg = orig_load_cfg()
+    off_coding_cfg = base_cfg.model_copy(
+        update={
+            "enabled": True,
+            "credentials": settings_mod.DaltonCredentialsConfig(sharing="off"),
+            "models": base_cfg.models.model_copy(
+                update={"assist_model": "glm-5.3-flash-plan", "assist_fallback_model": []}
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        settings_mod,
+        "_load_base_dalton_config",
+        create_autospec(orig_load_cfg, return_value=off_coding_cfg),
+    )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_dalton_settings",
+        create_autospec(model_prefs_mod.get_dalton_settings, return_value=off_coding_cfg),
+    )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_assist_fallback_models",
+        create_autospec(model_prefs_mod.get_assist_fallback_models, return_value=[]),
+    )
+    settings_mod.get_dalton_config.cache_clear()
+    monkeypatch.setenv("ZAI_CN_CODING_API_KEY", "sk-zai-coding-deploy-key")
+
+    # 1. With sharing=off and valid ZAI_CN_CODING_API_KEY, glm-5.3-flash-plan succeeds!
+    match_off = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert match_off is not None
+    assert match_off.workspace_id == WS_2
+    assert len(seen_clients) == 1
+    api_key_obj = getattr(seen_clients[0], "anthropic_api_key", None) or getattr(
+        seen_clients[0], "api_key", None
+    )
+    secret_val = (
+        api_key_obj.get_secret_value()
+        if hasattr(api_key_obj, "get_secret_value")
+        else str(api_key_obj)
+    )
+    assert secret_val == "sk-zai-coding-deploy-key"
+
+    # 2. With sharing=team, glm-5.3-flash-plan also works via deployment key.
+    team_coding_cfg = off_coding_cfg.model_copy(
+        update={"credentials": settings_mod.DaltonCredentialsConfig(sharing="team")}
+    )
+    monkeypatch.setenv("DALTON_PM_USER_IDS", USER_RICHARD)
+    monkeypatch.setattr(
+        settings_mod,
+        "_load_base_dalton_config",
+        create_autospec(orig_load_cfg, return_value=team_coding_cfg),
+    )
+    settings_mod.get_dalton_config.cache_clear()
+    seen_clients.clear()
+
+    match_team = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert match_team is not None
+    assert match_team.workspace_id == WS_2
+    assert len(seen_clients) == 1
+    settings_mod.get_dalton_config.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_probe_script_passes_is_external_for_external_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.dalton.ops.probe_workspace_dedup as probe_mod
+    import src.server.database.pool as pool_mod
+
+    _enable_team_mode(monkeypatch)
+    fake_pool = create_autospec(pool_mod.get_or_create_pool(), instance=True)
+    fake_pool.open.return_value = None
+    fake_pool.close.return_value = None
+    monkeypatch.setattr(pool_mod, "get_or_create_pool", lambda: fake_pool)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_4,
+                name="ExtNVDA",
+                owner_id=USER_EXTERNAL,
+                owner_name="ExtUser",
+                owner_email=EMAIL_EXTERNAL,
+            ),
+            _ws_row(
+                ws_id=WS_2,
+                name="TeamNVDA",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            ),
+        ],
+    )
+    monkeypatch.setattr(pool_mod, "get_db_connection", dedup_mod.get_db_connection)
+    _install_read_access(monkeypatch, web_readable={WS_4, WS_2})
+
+    calls: list[dict[str, Any]] = []
+    _install_llm(
+        monkeypatch,
+        lambda **_kw: _ok_result([]),
+        captured_calls=calls,
+    )
+    judge_spy = create_autospec(
+        dedup_mod._judge_candidates_with_llm,
+        wraps=dedup_mod._judge_candidates_with_llm,
+    )
+    monkeypatch.setattr(dedup_mod, "_judge_candidates_with_llm", judge_spy)
+
+    # External member -> is_external=True, and dalton_complete receives external isolation flags.
+    ext_report = await probe_mod.probe_names(["NVDA"], user_id=USER_EXTERNAL)
+    assert ext_report["caller_tier"] == "external"
+    assert judge_spy.call_args.kwargs["is_external"] is True
+    assert len(calls) == 1
+    assert calls[0]["is_byok"] is True
+    assert calls[0]["disable_team_credentials"] is True
+    assert calls[0]["disable_platform_fallback"] is True
+
+    # Internal member -> is_external=False.
+    calls.clear()
+    judge_spy.reset_mock()
+    int_report = await probe_mod.probe_names(["NVDA"], user_id=USER_CALLER)
+    assert int_report["caller_tier"] == "internal"
+    assert judge_spy.call_args.kwargs["is_external"] is False
+    assert calls[0]["disable_team_credentials"] is False
+    assert calls[0]["disable_platform_fallback"] is False
+
+
+@pytest.mark.asyncio
+async def test_dedup_parse_retry_exhaustion_debug_log_omits_candidate_names(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from langchain_core.language_models import BaseChatModel
+    from langchain_core.messages import AIMessage
+    from langchain_core.runnables import Runnable
+    import ptc_agent.config as ptc_cfg_mod
+    from ptc_agent.config.agent import LLMConfig
+    import src.dalton.llm.complete as complete_mod
+    import src.dalton.llm.model_prefs as model_prefs_mod
+    import src.dalton.settings as settings_mod
+    import src.llms.api_call as api_call_mod
+    import src.server.services.llm.service as llm_svc_mod
+
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="SecretCandidateCorp",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            )
+        ],
+    )
+
+    base_cfg = settings_mod.get_dalton_settings()
+    one_model_cfg = base_cfg.model_copy(
+        update={
+            "models": base_cfg.models.model_copy(
+                update={"assist_model": "deepseek-flash", "assist_fallback_model": []}
+            )
+        }
+    )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_dalton_settings",
+        create_autospec(model_prefs_mod.get_dalton_settings, return_value=one_model_cfg),
+    )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_assist_fallback_models",
+        create_autospec(model_prefs_mod.get_assist_fallback_models, return_value=[]),
+    )
+
+    fake_cfg = create_autospec(ptc_cfg_mod.AgentConfig, instance=True)
+    fake_cfg.llm = LLMConfig(name="deepseek-flash", background="deepseek-flash")
+    monkeypatch.setattr(
+        ptc_cfg_mod,
+        "load_from_files",
+        create_autospec(ptc_cfg_mod.load_from_files, return_value=fake_cfg),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "_check_cash_budget_admission",
+        create_autospec(complete_mod._check_cash_budget_admission, return_value=(True, None, None)),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "inspect_journal_state",
+        create_autospec(complete_mod.inspect_journal_state, return_value=("proceed", None)),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "claim_journal_invocation",
+        create_autospec(complete_mod.claim_journal_invocation, return_value=("claimed", {"attempt": 1})),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "complete_journal_failed",
+        create_autospec(complete_mod.complete_journal_failed, return_value={}),
+    )
+
+    structured_runnable = create_autospec(Runnable, instance=True)
+    structured_runnable.ainvoke.side_effect = RuntimeError("force manual parse fallback")
+
+    fake_llm = create_autospec(BaseChatModel, instance=True)
+    fake_llm.with_structured_output.return_value = structured_runnable
+    # Returns JSON missing required `confidence`, so Pydantic ValidationError embeds `SecretCandidateCorp`.
+    fake_llm.ainvoke.return_value = AIMessage(
+        content='{"matches": [{"id": "c1", "reason": "SecretCandidateCorp"}]}'
+    )
+
+    monkeypatch.setattr(
+        llm_svc_mod,
+        "create_llm",
+        create_autospec(llm_svc_mod.create_llm, return_value=fake_llm),
+    )
+    monkeypatch.setattr(api_call_mod.asyncio, "sleep", create_autospec(asyncio.sleep, return_value=None))
+
+    # 1. During dedup with DEBUG logging enabled, SecretCandidateCorp MUST NOT appear in logs.
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        res = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert res is None
+    assert "SecretCandidateCorp" not in caplog.text
+    assert "Failed to parse response after 5 attempts. Last error: ValidationError" in caplog.text
+
+    # 2. Outside dedup, normal callers keep standard api_call debug logging unchanged.
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(ValueError, match="SecretCandidateCorp"):
+            await api_call_mod.make_api_call(
+                fake_llm,
+                system_prompt="sys",
+                user_prompt="usr",
+                response_schema=DedupLlmResult,
+                max_parsing_retries=1,
+            )
+    assert "SecretCandidateCorp" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_deployment_key_journal_leaves_credential_holder_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import psycopg
+    import ptc_agent.config as ptc_cfg_mod
+    from ptc_agent.config.agent import LLMConfig
+    import src.dalton.database.llm_journal as journal_db
+    import src.dalton.llm.complete as complete_mod
+    import src.dalton.llm.model_prefs as model_prefs_mod
+    import src.dalton.settings as settings_mod
+    import src.server.services.llm.service as llm_svc_mod
+
+    _enable_team_mode(monkeypatch)
+    monkeypatch.setenv("DALTON_PM_USER_IDS", USER_RICHARD)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-platform-deepseek")
+    settings_mod.get_dalton_config.cache_clear()
+
+    base_cfg = settings_mod.get_dalton_settings()
+    deepseek_cfg = base_cfg.model_copy(
+        update={
+            "models": base_cfg.models.model_copy(
+                update={"assist_model": "deepseek-flash", "assist_fallback_model": []}
+            )
+        }
+    )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_dalton_settings",
+        create_autospec(model_prefs_mod.get_dalton_settings, return_value=deepseek_cfg),
+    )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_assist_fallback_models",
+        create_autospec(model_prefs_mod.get_assist_fallback_models, return_value=[]),
+    )
+
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="Anthropic",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            )
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_2})
+
+    # Spy on real `claim_journal_invocation` and `complete_journal_done` backed by an autospec cursor.
+    executed_journal: list[tuple[str, Any]] = []
+    j_cur = create_autospec(psycopg.AsyncCursor, instance=True)
+    j_cur.__aenter__.return_value = j_cur
+    j_cur.__aexit__.return_value = None
+
+    async def _j_execute(sql: str, params: Any = None) -> None:
+        executed_journal.append((sql, params))
+
+    j_cur.execute.side_effect = _j_execute
+    j_cur.fetchone.side_effect = [
+        {"invocation_id": "lj1:test", "user_id": USER_CALLER, "state": "pending", "attempt": 1},
+        {"invocation_id": "lj1:test", "user_id": USER_CALLER, "state": "done", "usage": {}},
+    ]
+    j_conn = create_autospec(psycopg.AsyncConnection, instance=True)
+    j_conn.cursor.return_value = j_cur
+
+    @asynccontextmanager
+    async def _j_tx():
+        yield
+
+    j_conn.transaction.side_effect = _j_tx
+
+    @asynccontextmanager
+    async def _get_j_conn(_c: Any = None):
+        yield j_conn
+
+    monkeypatch.setattr(journal_db, "get_db_connection", _get_j_conn)
+    monkeypatch.setattr(
+        complete_mod,
+        "_check_cash_budget_admission",
+        create_autospec(complete_mod._check_cash_budget_admission, return_value=(True, None, None)),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "inspect_journal_state",
+        create_autospec(complete_mod.inspect_journal_state, return_value=("proceed", None)),
+    )
+
+    fake_cfg = create_autospec(ptc_cfg_mod.AgentConfig, instance=True)
+    fake_cfg.llm = LLMConfig(name="deepseek-flash", background="deepseek-flash")
+    monkeypatch.setattr(
+        ptc_cfg_mod,
+        "load_from_files",
+        create_autospec(ptc_cfg_mod.load_from_files, return_value=fake_cfg),
+    )
+    monkeypatch.setattr(
+        llm_svc_mod,
+        "make_api_call",
+        create_autospec(
+            llm_svc_mod.make_api_call,
+            return_value=(
+                DedupLlmResult(matches=[DedupMatchItem(id="c1", confidence="high", reason="same")]),
+                {"input_tokens": 25, "output_tokens": 8},
+            ),
+        ),
+    )
+
+    match = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert match is not None
+    assert match.workspace_id == WS_2
+    assert len(executed_journal) == 2
+
+    claim_sql, claim_params = executed_journal[0]
+    done_sql, done_params = executed_journal[1]
+    assert "usage" not in claim_sql
+    assert USER_RICHARD not in repr(claim_params)
+    assert "COALESCE(usage" not in done_sql
+    assert "usage = %s::jsonb" in done_sql
+    done_usage = json.loads(done_params[1])
+    assert "credential_user_id" not in done_usage
+    assert done_usage["input_tokens"] == 25
+    settings_mod.get_dalton_config.cache_clear()

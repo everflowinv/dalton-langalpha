@@ -64,6 +64,8 @@ class LLMService:
         reasoning_effort: str | None = None,
         disable_tracing: bool = True,
         return_token_usage: bool = False,
+        # DALTON-HOOK(workspace-dedup): opt-in guard to forbid falling back to deployment/platform keys.
+        disable_platform_fallback: bool = False,
     ) -> Any:
         """Run a single-shot LLM call.
 
@@ -73,6 +75,11 @@ class LLMService:
             - ``return_token_usage=True`` → ``(response, token_usage_dict)`` tuple.
         """
         if user_id is None:
+            # DALTON-HOOK(workspace-dedup): refuse system/platform path when platform fallback is disabled.
+            if disable_platform_fallback:
+                from src.llms.llm import MissingProviderKeyError
+
+                raise MissingProviderKeyError("Platform key fallback is disabled when user_id is None")
             # Scheduled task / system warmup — no BYOK/OAuth lookup, use
             # platform default. ``resolve_llm_config`` is typed ``user_id: str``
             # and makes a DB lookup via ``get_model_preference``; skipping it
@@ -92,14 +99,17 @@ class LLMService:
             )
             llm = resolved_config.llm_client
             effective_model = slot_model(resolved_config.llm, slot)
-            if llm is None:
-                # No BYOK / OAuth configured and no reasoning override — fall
-                # back to a platform-keyed client on the resolved model name.
-                llm = create_llm(effective_model, reasoning_effort=reasoning_effort)
             if resolved_config.credential_source not in (
                 CredentialSource.OAUTH,
                 CredentialSource.BYOK,
             ):
+                # DALTON-HOOK(workspace-dedup): refuse both lazy NONE and eager PLATFORM clients when disabled.
+                if disable_platform_fallback:
+                    from src.llms.llm import MissingProviderKeyError
+
+                    raise MissingProviderKeyError(
+                        f"Platform key fallback is disabled for model '{effective_model}'"
+                    )
                 self._logger.info(
                     "llm_service.platform_key_fallback",
                     extra={
@@ -109,6 +119,10 @@ class LLMService:
                         "credential_source": str(resolved_config.credential_source),
                     },
                 )
+            if llm is None:
+                # No BYOK / OAuth configured and no reasoning override — fall
+                # back to a platform-keyed client on the resolved model name.
+                llm = create_llm(effective_model, reasoning_effort=reasoning_effort)
 
         # DALTON-HOOK(oauth-refresh-direct): this is the server-side one-shot
         # path (titles, extractions, probes via LLMService) — no resilience

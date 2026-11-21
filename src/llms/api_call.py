@@ -2,6 +2,8 @@ from typing import Any, Dict, Optional, Type, Union, Tuple
 from pydantic import BaseModel
 import asyncio
 import contextlib
+# DALTON-HOOK(workspace-dedup): ContextVar for redacting raw parse errors in debug logs during dedup calls.
+from contextvars import ContextVar
 import logging
 import json
 from .token_counter import extract_token_usage
@@ -12,6 +14,22 @@ from .content_utils import (
 
 # Configure logging for token usage
 logger = logging.getLogger(__name__)
+
+# DALTON-HOOK(workspace-dedup): opt-in context manager that suppresses raw parse error text in debug logs/exceptions.
+_REDACT_PARSE_ERROR_LOGS: ContextVar[bool] = ContextVar(
+    "dalton_redact_parse_error_logs",
+    default=False,
+)
+
+
+@contextlib.contextmanager
+def redact_parse_error_logs():
+    """Within this context, log only the exception class name when parsing retries exhaust."""
+    token = _REDACT_PARSE_ERROR_LOGS.set(True)
+    try:
+        yield
+    finally:
+        _REDACT_PARSE_ERROR_LOGS.reset(token)
 
 
 def create_messages(system_prompt: str, user_prompt: str) -> list:
@@ -236,7 +254,11 @@ async def make_api_call(
                 total_token_info['per_call_usages'] = per_call_usages
             total_token_info['parsing_failed'] = True
 
-            error_msg = f"Failed to parse response after {retry_count} attempts. Last error: {last_error}"
+            # DALTON-HOOK(workspace-dedup): redact raw parse error details when caller requests log redaction.
+            if _REDACT_PARSE_ERROR_LOGS.get():
+                error_msg = f"Failed to parse response after {retry_count} attempts. Last error: {type(last_error).__name__}"
+            else:
+                error_msg = f"Failed to parse response after {retry_count} attempts. Last error: {last_error}"
             logger.debug(error_msg)  # Changed from error to debug to reduce console noise
 
             # If return_token_usage is True, we still need to return something

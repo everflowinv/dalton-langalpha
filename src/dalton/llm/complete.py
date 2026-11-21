@@ -132,6 +132,27 @@ def resolve_model_billing_and_provider(model_key: str) -> tuple[str, str]:
     return "platform", _resolve_provider_for_model(key, "platform")
 
 
+def model_requires_user_oauth(model_key: str) -> bool:
+    """Return True only when ``model_key`` requires a user OAuth or setup token.
+
+    Coding-plan subscription models (e.g. ``glm-5.3-flash-plan``) have
+    ``billing="subscription"`` / ``billing_type="oauth"`` for notional pricing,
+    yet run on API keys (deployment env key or BYOK) rather than user OAuth
+    tokens, so they must NOT be gated as requiring a ``credential_user_id``.
+    """
+    key = (model_key or "").strip()
+    if not key:
+        return False
+    from src.llms.claude_code import is_claude_code_model
+    from src.llms.llm import LLM as LLMFactory
+    from src.server.services.llm.clients import subscription_route
+
+    if is_claude_code_model(key):
+        return True
+    mc = LLMFactory.get_model_config()
+    return subscription_route(key, mc, custom_entry=None) is not None
+
+
 def compute_invocation_id_and_hash(
     *,
     scope_ref: str,
@@ -642,6 +663,7 @@ async def dalton_complete(
     user_id: str,
     credential_user_id: Any = _UNSET,
     disable_team_credentials: bool = False,
+    disable_platform_fallback: bool = False,
     record_provider_events: bool = True,
     user_prompt: str = "",
     system_prompt: str | None = None,
@@ -677,42 +699,53 @@ async def dalton_complete(
     ``LLMService.complete``; ``None`` enforces deployment env/platform credentials
     only) from ``user_id`` (used for budget admission and journal accounting).
     ``disable_team_credentials`` explicitly disables team credential sharing for
-    this invocation. ``record_provider_events=False`` suppresses writing raw error
-    text to ``dalton_provider_events`` and ``dalton_llm_journal.error_text``.
+    this invocation. ``disable_platform_fallback`` forwards to
+    ``LLMService.complete`` to forbid deployment/platform key fallback.
+    ``record_provider_events=False`` suppresses writing raw error text to
+    ``dalton_provider_events``, ``dalton_llm_journal.error_text``, and parse
+    retry debug logs.
     """
+    from src.llms.api_call import redact_parse_error_logs
+
     with (
         disable_team_credential_sharing()
         if disable_team_credentials
         else nullcontext()
     ):
-        return await _dalton_complete_impl(
-            llm_service=llm_service,
-            user_id=user_id,
-            credential_user_id=credential_user_id,
-            record_provider_events=record_provider_events,
-            user_prompt=user_prompt,
-            system_prompt=system_prompt,
-            scope_ref=scope_ref,
-            purpose=purpose,
-            request_model=request_model,
-            model=model,
-            response_schema=response_schema,
-            slot=slot,
-            reasoning_effort=reasoning_effort,
-            is_byok=is_byok,
-            timeout_s=timeout_s,
-            stale_after_s=stale_after_s,
-            resend_indeterminate=resend_indeterminate,
-            resend_max_attempts=resend_max_attempts,
-            invocation_id=invocation_id,
-            workspace_id=workspace_id,
-            thread_id=thread_id,
-            raise_on_error=raise_on_error,
-            disable_tracing=disable_tracing,
-            persist_raw=persist_raw,
-            skip_journal=skip_journal,
-            deadline=deadline,
-        )
+        with (
+            redact_parse_error_logs()
+            if not record_provider_events
+            else nullcontext()
+        ):
+            return await _dalton_complete_impl(
+                llm_service=llm_service,
+                user_id=user_id,
+                credential_user_id=credential_user_id,
+                disable_platform_fallback=disable_platform_fallback,
+                record_provider_events=record_provider_events,
+                user_prompt=user_prompt,
+                system_prompt=system_prompt,
+                scope_ref=scope_ref,
+                purpose=purpose,
+                request_model=request_model,
+                model=model,
+                response_schema=response_schema,
+                slot=slot,
+                reasoning_effort=reasoning_effort,
+                is_byok=is_byok,
+                timeout_s=timeout_s,
+                stale_after_s=stale_after_s,
+                resend_indeterminate=resend_indeterminate,
+                resend_max_attempts=resend_max_attempts,
+                invocation_id=invocation_id,
+                workspace_id=workspace_id,
+                thread_id=thread_id,
+                raise_on_error=raise_on_error,
+                disable_tracing=disable_tracing,
+                persist_raw=persist_raw,
+                skip_journal=skip_journal,
+                deadline=deadline,
+            )
 
 
 async def _dalton_complete_impl(
@@ -720,6 +753,7 @@ async def _dalton_complete_impl(
     *,
     user_id: str,
     credential_user_id: Any = _UNSET,
+    disable_platform_fallback: bool = False,
     record_provider_events: bool = True,
     user_prompt: str = "",
     system_prompt: str | None = None,
@@ -974,6 +1008,7 @@ async def _dalton_complete_impl(
             stale_after_s=stale_after_s,
             resend_indeterminate=resend_indeterminate,
             resend_max_attempts=resend_max_attempts,
+            **({"stamp_credential_holder": False} if llm_user_id is None else {}),
         )
     )
     attempt = int(claimed_row.get("attempt") or 1)
@@ -1042,7 +1077,7 @@ async def _dalton_complete_impl(
     cash_dec: Decimal | None = None
     notional_dec: Decimal | None = None
     try:
-        if billing_type == "oauth" and not llm_user_id:
+        if not llm_user_id and model_requires_user_oauth(effective_model):
             raise ValueError("OAuth model requires a credential user")
 
         if llm_service is None:
@@ -1076,6 +1111,7 @@ async def _dalton_complete_impl(
                 reasoning_effort=reasoning_effort,
                 disable_tracing=disable_tracing,
                 return_token_usage=True,
+                **({"disable_platform_fallback": True} if disable_platform_fallback else {}),
             ),
             timeout=send_timeout_s,
         )
@@ -1108,6 +1144,7 @@ async def _dalton_complete_impl(
                 notional_usd=notional_dec,
                 provider=provider,
                 billing_type=billing_type,
+                **({"stamp_credential_holder": False} if llm_user_id is None else {}),
             )
 
         return DaltonCompleteResult(

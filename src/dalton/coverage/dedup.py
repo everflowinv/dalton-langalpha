@@ -60,12 +60,16 @@ from src.dalton.llm.assist import (
     resolve_assist_model,
 )
 import src.dalton.llm.complete as complete_mod
-from src.dalton.llm.complete import dalton_complete, resolve_model_billing_and_provider
+from src.dalton.llm.complete import (
+    dalton_complete,
+    model_requires_user_oauth,
+)
 from src.dalton.settings import (
     is_coverage_units_enabled,
     is_dalton_supabase_auth_enabled,
 )
 import src.dalton.sharing as sharing_mod
+from src.llms.api_call import redact_parse_error_logs
 from src.server.database.home_workspace import HOME_STAND_IN_KEY, is_reserved_row
 from src.server.database.pool import get_db_connection
 from src.server.database.workspace_names import WorkspaceNameInvalid, workspace_name_key
@@ -885,16 +889,16 @@ def _build_batch_user_prompt(raw_name: str, batch: list[_CandidateEntry]) -> str
     )
 
 
-async def _resolve_dedup_models(user_id: str) -> list[str]:
-    """Resolve assist primary and fallback models via ``assist.py`` / ``model_prefs.py``.
+async def _resolve_dedup_models() -> list[str]:
+    """Resolve assist primary and fallback models strictly from deployment config.
 
-    Uses ``resolve_assist_model`` and ``resolve_assist_fallback_models`` (which
-    delegate to ``dalton_model_pref``) so caller ``custom_models`` shadowing and
-    ``is_forbidden_for_roles`` (L21) checks are enforced.
+    Ignores per-user preferences (caller or team credential holder) so
+    ``dalton_assist_model`` / ``custom_models`` cannot redirect candidate lists,
+    while preserving ``is_forbidden_for_roles`` (L21) checks.
     """
-    primary = await resolve_assist_model(role="assist", user_id=user_id)
+    primary = await resolve_assist_model(role="assist", deployment_only=True)
     fallbacks = await resolve_assist_fallback_models(
-        role="assist_fallback", user_id=user_id
+        role="assist_fallback", deployment_only=True
     )
     models: list[str] = []
     for m in (primary, *fallbacks):
@@ -1028,11 +1032,12 @@ async def _run_batch_with_fallback(
         if is_external:
             call_kwargs["is_byok"] = True
             call_kwargs["disable_team_credentials"] = True
+            call_kwargs["disable_platform_fallback"] = True
         else:
-            billing_type, _provider = resolve_model_billing_and_provider(model_name)
             call_kwargs["is_byok"] = False
             call_kwargs["disable_team_credentials"] = False
-            if billing_type == "oauth":
+            call_kwargs["disable_platform_fallback"] = False
+            if model_requires_user_oauth(model_name):
                 call_kwargs["credential_user_id"] = get_team_credential_holder_id()
             else:
                 call_kwargs["credential_user_id"] = None
@@ -1043,11 +1048,12 @@ async def _run_batch_with_fallback(
                 if is_external
                 else nullcontext()
             ):
-                call_task = spawn_protected(
-                    complete_fn(**call_kwargs),
-                    name=f"workspace-dedup-{model_name}",
-                    log_failure=False,
-                )
+                with redact_parse_error_logs():
+                    call_task = spawn_protected(
+                        complete_fn(**call_kwargs),
+                        name=f"workspace-dedup-{model_name}",
+                        log_failure=False,
+                    )
             _done_calls, pending_calls = await asyncio.wait(
                 {call_task}, timeout=model_timeout
             )
@@ -1102,11 +1108,10 @@ async def _judge_candidates_with_llm(
     remaining_pref = deadline - time.monotonic()
     if remaining_pref <= 0:
         raise TimeoutError("Workspace dedup LLM deadline exceeded")
-    with disable_team_credential_sharing() if is_external else nullcontext():
-        models = await asyncio.wait_for(
-            _resolve_dedup_models(uid),
-            timeout=remaining_pref,
-        )
+    models = await asyncio.wait_for(
+        _resolve_dedup_models(),
+        timeout=remaining_pref,
+    )
     if not models:
         raise RuntimeError("No assist model configured for workspace dedup")
 

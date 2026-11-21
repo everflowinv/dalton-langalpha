@@ -77,7 +77,7 @@ async def probe_names(
     await pool.open()
     try:
         caller_tier = await _resolve_caller_tier(eff_uid)
-        models = await _resolve_dedup_models(eff_uid)
+        models = await _resolve_dedup_models()
         results: list[dict[str, Any]] = []
         candidate_lines_sample: list[str] | None = None
 
@@ -139,6 +139,7 @@ async def probe_names(
                 raw_name=cleaned_name,
                 entries=entries,
                 stats=stats,
+                is_external=(caller_tier == "external"),
                 skip_journal=True,
             )
 
