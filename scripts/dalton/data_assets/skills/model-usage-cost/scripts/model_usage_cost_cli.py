@@ -3,6 +3,7 @@
 import argparse
 import collections
 import datetime as dt
+from decimal import Decimal
 import json
 import math
 import os
@@ -307,6 +308,45 @@ def reference_cost_of(prices, provider, model, v, meta=None, ts=None):
     return usd, ref.get('model'), entry.get('note')
 
 
+def _allocate_micro_usd(target_usd, items):
+    """Allocate a 6-decimal rounded USD total across priced sub-buckets via largest remainder.
+
+    ``items`` is a list of ``(key, raw_usd_float, total_tokens)`` tuples. Returns a
+    dict ``key -> float`` (6-decimal rounded) whose micro-USD sum strictly equals
+    ``round(target_usd * 1_000_000)``.
+    """
+    if not items:
+        return {}
+    target_micro = int(round(Decimal(str(target_usd)) * Decimal('1000000')))
+    prepared = []
+    floors = {}
+    for key, raw_usd, tokens in items:
+        raw_micro = Decimal(str(raw_usd)) * Decimal('1000000')
+        if raw_micro < 0:
+            raw_micro = Decimal(0)
+        fl = int(raw_micro)
+        floors[key] = fl
+        prepared.append((key, raw_micro, int(tokens)))
+    diff = target_micro - sum(floors.values())
+    if diff > 0:
+        order = sorted(prepared, key=lambda it: (-(it[1] - floors[it[0]]), -it[1], -it[2], it[0]))
+        for idx in range(diff):
+            floors[order[idx % len(order)][0]] += 1
+    elif diff < 0:
+        need = -diff
+        while need > 0:
+            pos = [it for it in prepared if floors[it[0]] > 0]
+            if not pos:
+                break
+            order = sorted(pos, key=lambda it: ((it[1] - floors[it[0]]), it[1], it[2], it[0]))
+            for it in order:
+                if need <= 0:
+                    break
+                floors[it[0]] -= 1
+                need -= 1
+    return {k: round(v / 1_000_000, 6) for k, v in floors.items()}
+
+
 def window_result(records, now, days, prices, top=0, by_model=False):
     cut = now - days * 86400
     groups = {}
@@ -368,19 +408,24 @@ def window_result(records, now, days, prices, top=0, by_model=False):
                 has_reference_cost=False,
                 reference_model=None,
                 price_note=None,
+                _efforts={},
             ),
         )
         b['source'].add(r['source'])
         b['records'] += 1
         rec_calls = int(meta.get('calls', 1))
+        rec_runs = int(meta.get('runs', 0))
         b['calls'] += rec_calls
         total_calls += rec_calls
-        b['runs'] += int(meta.get('runs', 0))
+        b['runs'] += rec_runs
         b['provider_reported_cost_records'] += is_reported
         b['units'][meta.get('unit', 'unknown')] += 1
         for i in range(4):
             b['v'][i] += v[i]
             total[i] += v[i]
+        ref_usd = None
+        ref_model = None
+        ref_note = None
         if c is None:
             b['unpriced_tokens'] += sum(v)
             unpriced_tokens += sum(v)
@@ -401,10 +446,57 @@ def window_result(records, now, days, prices, top=0, by_model=False):
             estimates += 1
         units[meta.get('unit', 'unknown')] += 1
 
+        # Preserve per-effort display breakdown inside local Antigravity rows
+        # without splitting the row or changing legacy row/total rounding.
+        rec_effort = meta.get('effort') or None
+        if not is_dalton and (
+            rec_effort is not None
+            or provider == 'antigravity-cli-gateway'
+            or 'agy' in str(r['source']).lower()
+        ):
+            eb_key = rec_effort if rec_effort else 'unknown'
+            eb = b['_efforts'].setdefault(
+                eb_key,
+                dict(
+                    effort=eb_key,
+                    records=0,
+                    calls=0,
+                    runs=0,
+                    v=[0] * 4,
+                    cost_usd=0.0,
+                    has_cost=False,
+                    unpriced_tokens=0,
+                    no_public_price=False,
+                    reference_cost_usd=0.0,
+                    has_reference_cost=False,
+                    reference_model=None,
+                    price_note=None,
+                ),
+            )
+            eb['records'] += 1
+            eb['calls'] += rec_calls
+            eb['runs'] += rec_runs
+            for i in range(4):
+                eb['v'][i] += v[i]
+            if c is None:
+                eb['unpriced_tokens'] += sum(v)
+                if is_no_public:
+                    eb['no_public_price'] = True
+                    if ref_usd is not None:
+                        eb['reference_cost_usd'] += ref_usd
+                        eb['has_reference_cost'] = True
+                        eb['reference_model'] = ref_model
+                    if ref_note:
+                        eb['price_note'] = ref_note
+            else:
+                eb['cost_usd'] += c
+                eb['has_cost'] = True
+
     rows = []
     for b in groups.values():
         v = b.pop('v')
         has_ref = b.pop('has_reference_cost')
+        raw_efforts = b.pop('_efforts')
         b['source'] = '|'.join(sorted(b['source']))
         b.update(dict(zip(('fresh', 'cache_write', 'cache_read', 'output'), v)))
         b['tokens'] = sum(v)
@@ -418,6 +510,48 @@ def window_result(records, now, days, prices, top=0, by_model=False):
         else:
             b['cost_basis'] = 'current-catalog-estimate'
         b['estimated_split'] = b['estimated_split_records'] > 0
+        if raw_efforts:
+            priced_items = []
+            ref_items = []
+            for eb_key, eb in raw_efforts.items():
+                eb_tokens = sum(eb['v'])
+                if eb['has_cost'] and eb['unpriced_tokens'] != eb_tokens:
+                    priced_items.append((eb_key, eb['cost_usd'], eb_tokens))
+                if eb['has_reference_cost']:
+                    ref_items.append((eb_key, eb['reference_cost_usd'], eb_tokens))
+            alloc_costs = (
+                _allocate_micro_usd(b['cost_usd'], priced_items)
+                if b['cost_usd'] is not None and priced_items
+                else {}
+            )
+            alloc_refs = (
+                _allocate_micro_usd(b['reference_cost_usd'], ref_items)
+                if b['reference_cost_usd'] is not None and ref_items
+                else {}
+            )
+            effort_breakdown = {}
+            for eb_key, eb in raw_efforts.items():
+                ev = eb['v']
+                eb_tokens = sum(ev)
+                effort_breakdown[eb_key] = dict(
+                    effort=eb_key,
+                    records=eb['records'],
+                    calls=eb['calls'],
+                    runs=eb['runs'],
+                    fresh=ev[0],
+                    cache_write=ev[1],
+                    cache_read=ev[2],
+                    output=ev[3],
+                    total_tokens=eb_tokens,
+                    prompt_tokens=ev[0] + ev[1] + ev[2],
+                    cost_usd=alloc_costs.get(eb_key),
+                    unpriced_tokens=eb['unpriced_tokens'],
+                    no_public_price=eb['no_public_price'],
+                    reference_cost_usd=alloc_refs.get(eb_key),
+                    reference_model=eb['reference_model'],
+                    price_note=eb['price_note'],
+                )
+            b['effort_breakdown'] = effort_breakdown
         rows.append(b)
 
     rows.sort(key=lambda r: (-(r['cost_usd'] if r['cost_usd'] is not None else -1), -r['tokens']))
@@ -566,11 +700,17 @@ def command(args):
             records, held = sources.reconcile(e)
             records = [r for r in records if e.since <= r['ts'] < e.until]
             held = [r for r in held if e.since <= r['ts'] < e.until]
+            antigravity_series = (
+                e.antigravity_series
+                if isinstance(e.antigravity_series, list) and e.antigravity_series
+                else sources.load_antigravity_series_catalog()
+            )
             out = {
                 'ok': True,
                 'version': VERSION,
                 'generated_at': dt.datetime.fromtimestamp(e.until, sources.UTC).isoformat(),
                 'price_catalog': catalog_meta,
+                'antigravity_series': antigravity_series,
                 'dalton_prod': e.dalton_prod or {'ok': False, 'error': 'not queried', 'models': 0, 'runs': 0, 'calls': 0},
                 'windows': [window_result(records, e.until, w, prices, args.top, args.by_model) for w in windows],
                 'coverage': {

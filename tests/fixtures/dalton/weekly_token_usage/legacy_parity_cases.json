@@ -1,0 +1,2118 @@
+{
+  "case1_5k_plus_3cr": {
+    "snapshot": {
+      "ok": true,
+      "version": "3.1.0",
+      "generated_at": "2026-11-21T04:00:00+00:00",
+      "price_catalog": {
+        "generated": "2026-11-14",
+        "currency": "USD",
+        "unit": "per_1m_tokens",
+        "note": "Dalton 自有价格表（美元 / 百万 token）。effective_from 为空表示一直有效；同一模型多条时取统计时点适用的最新一条；input 为 null 表示无公开价。",
+        "effective_notes": [
+          "gemini-4-argon (2026-12-01 起): Google 推出价结束，12-01 起涨为 4/20 美元",
+          "gemini-4-carbon (2026-12-01 起): Google 推出价结束，12-01 起涨为 4/20 美元"
+        ]
+      },
+      "antigravity_series": [
+        {
+          "series_id": "antigravity-oauth:gemini-4-argon",
+          "series_prefix": "gemini-4-argon",
+          "provider": "antigravity-oauth",
+          "display_name": "Gemini 4 Argon",
+          "qualified_display_name": "Gemini 4 Argon (Antigravity)",
+          "default_effort": "high",
+          "default_model": "gemini-4-argon-high-oauth",
+          "efforts": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "variants": {
+            "low": "gemini-4-argon-low-oauth",
+            "medium": "gemini-4-argon-medium-oauth",
+            "high": "gemini-4-argon-high-oauth"
+          }
+        },
+        {
+          "series_id": "antigravity-oauth:gemini-4-carbon",
+          "series_prefix": "gemini-4-carbon",
+          "provider": "antigravity-oauth",
+          "display_name": "Gemini 4 Carbon",
+          "qualified_display_name": "Gemini 4 Carbon (Antigravity)",
+          "default_effort": "medium",
+          "default_model": "gemini-4-carbon-medium-oauth",
+          "efforts": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "variants": {
+            "low": "gemini-4-carbon-low-oauth",
+            "medium": "gemini-4-carbon-medium-oauth",
+            "high": "gemini-4-carbon-high-oauth"
+          }
+        },
+        {
+          "series_id": "antigravity-oauth:gemini-4-hydrogen",
+          "series_prefix": "gemini-4-hydrogen",
+          "provider": "antigravity-oauth",
+          "display_name": "Gemini 4 Hydrogen",
+          "qualified_display_name": "Gemini 4 Hydrogen (Antigravity)",
+          "default_effort": "high",
+          "default_model": "gemini-4-hydrogen-high-oauth",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "variants": {
+            "low": "gemini-4-hydrogen-low-oauth",
+            "medium": "gemini-4-hydrogen-medium-oauth",
+            "high": "gemini-4-hydrogen-high-oauth",
+            "xhigh": "gemini-4-hydrogen-xhigh-oauth"
+          }
+        },
+        {
+          "series_id": "antigravity-oauth:gemini-4-neon",
+          "series_prefix": "gemini-4-neon",
+          "provider": "antigravity-oauth",
+          "display_name": "Gemini 4 Neon",
+          "qualified_display_name": "Gemini 4 Neon (Antigravity)",
+          "default_effort": "high",
+          "default_model": "gemini-4-neon-high-oauth",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "variants": {
+            "low": "gemini-4-neon-low-oauth",
+            "medium": "gemini-4-neon-medium-oauth",
+            "high": "gemini-4-neon-high-oauth",
+            "xhigh": "gemini-4-neon-xhigh-oauth"
+          }
+        },
+        {
+          "series_id": "antigravity-oauth:claude-opus-5-5",
+          "series_prefix": "claude-opus-5-5",
+          "provider": "antigravity-oauth",
+          "display_name": "Claude Opus 5.5",
+          "qualified_display_name": "Claude Opus 5.5 (Antigravity)",
+          "default_effort": "medium",
+          "default_model": "claude-opus-5-5-medium-oauth",
+          "efforts": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "variants": {
+            "low": "claude-opus-5-5-low-oauth",
+            "medium": "claude-opus-5-5-medium-oauth",
+            "high": "claude-opus-5-5-high-oauth"
+          }
+        },
+        {
+          "series_id": "antigravity-oauth:claude-sonnet-5-5",
+          "series_prefix": "claude-sonnet-5-5",
+          "provider": "antigravity-oauth",
+          "display_name": "Claude Sonnet 5.5",
+          "qualified_display_name": "Claude Sonnet 5.5 (Antigravity)",
+          "default_effort": "medium",
+          "default_model": "claude-sonnet-5-5-medium-oauth",
+          "efforts": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "variants": {
+            "low": "claude-sonnet-5-5-low-oauth",
+            "medium": "claude-sonnet-5-5-medium-oauth",
+            "high": "claude-sonnet-5-5-high-oauth"
+          }
+        },
+        {
+          "series_id": "antigravity-oauth:gpt-oss-120b",
+          "series_prefix": "gpt-oss-120b",
+          "provider": "antigravity-oauth",
+          "display_name": "GPT-OSS 120B",
+          "qualified_display_name": "GPT-OSS 120B (Antigravity)",
+          "default_effort": "medium",
+          "default_model": "gpt-oss-120b-medium-oauth",
+          "efforts": [
+            "medium"
+          ],
+          "variants": {
+            "medium": "gpt-oss-120b-medium-oauth"
+          }
+        }
+      ],
+      "dalton_prod": {
+        "ok": true,
+        "error": null,
+        "runs": 1,
+        "calls": 1,
+        "models": 1
+      },
+      "collector_status": {
+        "ok": true,
+        "fresh": true
+      },
+      "windows": [
+        {
+          "days": 7,
+          "from": "2026-11-14T04:00:00+00:00",
+          "to": "2026-11-21T04:00:00+00:00",
+          "rows": [
+            {
+              "source": "agy-cli(含网关)",
+              "provider": "antigravity-cli-gateway",
+              "model": "gemini-4-neon",
+              "dalton_prod": false,
+              "records": 1,
+              "calls": 1,
+              "runs": 0,
+              "cost_usd": 0.015,
+              "unpriced_tokens": 0,
+              "estimated_split_records": 0,
+              "provider_reported_cost_records": 0,
+              "units": {
+                "model-response": 1
+              },
+              "no_public_price": false,
+              "reference_cost_usd": null,
+              "reference_model": null,
+              "price_note": null,
+              "fresh": 5000,
+              "cache_write": 0,
+              "cache_read": 3,
+              "output": 0,
+              "tokens": 5003,
+              "priced_cost_usd": 0.015,
+              "cost_basis": "current-catalog-estimate",
+              "estimated_split": false,
+              "effort_breakdown": {
+                "high": {
+                  "effort": "high",
+                  "records": 1,
+                  "calls": 1,
+                  "runs": 0,
+                  "fresh": 5000,
+                  "cache_write": 0,
+                  "cache_read": 3,
+                  "output": 0,
+                  "total_tokens": 5003,
+                  "prompt_tokens": 5003,
+                  "cost_usd": 0.015,
+                  "unpriced_tokens": 0,
+                  "no_public_price": false,
+                  "reference_cost_usd": null,
+                  "reference_model": null,
+                  "price_note": null
+                }
+              }
+            },
+            {
+              "source": "Dalton 生产（订阅）",
+              "provider": "google",
+              "model": "gemini-4-neon-high-oauth",
+              "dalton_prod": true,
+              "records": 1,
+              "calls": 1,
+              "runs": 1,
+              "cost_usd": 0.015,
+              "unpriced_tokens": 0,
+              "estimated_split_records": 0,
+              "provider_reported_cost_records": 0,
+              "units": {
+                "model-invocation": 1
+              },
+              "no_public_price": false,
+              "reference_cost_usd": null,
+              "reference_model": null,
+              "price_note": null,
+              "fresh": 5000,
+              "cache_write": 0,
+              "cache_read": 3,
+              "output": 0,
+              "tokens": 5003,
+              "priced_cost_usd": 0.015,
+              "cost_basis": "current-catalog-estimate",
+              "estimated_split": false
+            }
+          ],
+          "row_count": 2,
+          "totals": {
+            "fresh": 10000,
+            "cache_write": 0,
+            "cache_read": 6,
+            "output": 0,
+            "tokens": 10006,
+            "records": 2,
+            "calls": 2,
+            "units": {
+              "model-response": 1,
+              "model-invocation": 1
+            },
+            "priced_cost_usd": 0.030001,
+            "unpriced_tokens": 0,
+            "estimated_split_records": 0,
+            "cost_complete": true,
+            "cost_basis": "current-catalog-estimate",
+            "request_start_time_records": 0,
+            "tier_context_unknown_records": 0,
+            "provider_reported_cost_records": 0
+          }
+        }
+      ],
+      "coverage": {
+        "status": "local-observations-only",
+        "issues": {},
+        "stats": {},
+        "unresolved_aggregate_records": 0,
+        "unresolved_aggregate_tokens_not_additive": 0
+      },
+      "notes": []
+    },
+    "legacy_json": {
+      "days": 7,
+      "from_iso": "2026-11-14T04:00:00+00:00",
+      "to_iso": "2026-11-21T04:00:00+00:00",
+      "total_tokens": 10006,
+      "total_fresh": 10000,
+      "total_cw": 0,
+      "total_cr": 6,
+      "total_out": 0,
+      "total_prompt": 10006,
+      "total_records": 2,
+      "total_calls": 2,
+      "total_cost": 0.03,
+      "unpriced_tokens": 0,
+      "unpriced_models": [],
+      "local_stats": {
+        "fresh": 5000,
+        "cache_write": 0,
+        "cache_read": 3,
+        "output": 0,
+        "tokens": 5003,
+        "prompt": 5003,
+        "cost": 0.015,
+        "unpriced_tokens": 0,
+        "records": 1,
+        "calls": 1,
+        "models": 1,
+        "cache_hit_rate": 0.059964021587047764
+      },
+      "dalton_stats": {
+        "fresh": 5000,
+        "cache_write": 0,
+        "cache_read": 3,
+        "output": 0,
+        "tokens": 5003,
+        "prompt": 5003,
+        "cost": 0.015,
+        "unpriced_tokens": 0,
+        "records": 1,
+        "calls": 1,
+        "models": 1,
+        "cache_hit_rate": 0.059964021587047764,
+        "runs": 1,
+        "api_calls": 1
+      },
+      "dalton_prod": {
+        "ok": true,
+        "error": null,
+        "runs": 1,
+        "calls": 1,
+        "models": 1
+      },
+      "collector_status": {
+        "present": true,
+        "ok": true,
+        "stale": false,
+        "age_minutes": 0,
+        "error": null,
+        "warning": null
+      },
+      "price_catalog": {
+        "generated": "2026-11-14",
+        "currency": "USD",
+        "unit": "per_1m_tokens",
+        "note": "Dalton 自有价格表（美元 / 百万 token）。effective_from 为空表示一直有效；同一模型多条时取统计时点适用的最新一条；input 为 null 表示无公开价。",
+        "effective_notes": [
+          "gemini-4-argon (2026-12-01 起): Google 推出价结束，12-01 起涨为 4/20 美元",
+          "gemini-4-carbon (2026-12-01 起): Google 推出价结束，12-01 起涨为 4/20 美元"
+        ]
+      },
+      "estimated_split_records": 0,
+      "time_estimated_records": 0,
+      "tier_context_unknown_records": 0,
+      "provider_reported_cost_records": 0,
+      "cache_hit_rate": 0.059964021587047764,
+      "prov_list": [
+        {
+          "provider": "Google",
+          "cost": 0.03,
+          "cost_pct": 100.0,
+          "tokens": 10006,
+          "tokens_pct": 100.0,
+          "calls": 2,
+          "unpriced_tokens": 0
+        }
+      ],
+      "top10": [
+        {
+          "norm_provider": "Google",
+          "model": "gemini-4-neon",
+          "providers": [
+            "antigravity-cli-gateway"
+          ],
+          "sources": [
+            "agy-cli(含网关)"
+          ],
+          "records": 1,
+          "calls": 1,
+          "runs": 0,
+          "fresh": 5000,
+          "cache_write": 0,
+          "cache_read": 3,
+          "output": 0,
+          "total_tokens": 5003,
+          "prompt_tokens": 5003,
+          "cost_usd": 0.015,
+          "unpriced_tokens": 0,
+          "estimated_split_records": 0,
+          "units": {
+            "model-response": 1
+          },
+          "no_public_price": false,
+          "reference_cost_usd": null,
+          "reference_model": null,
+          "price_note": null,
+          "provider": "antigravity-cli-gateway",
+          "source": "agy-cli(含网关)",
+          "rank": 1,
+          "token_pct": 50.0,
+          "cost_pct": 50.0
+        },
+        {
+          "norm_provider": "Google",
+          "model": "gemini-4-neon-high-oauth",
+          "providers": [
+            "google"
+          ],
+          "sources": [
+            "Dalton 生产（订阅）"
+          ],
+          "records": 1,
+          "calls": 1,
+          "runs": 1,
+          "fresh": 5000,
+          "cache_write": 0,
+          "cache_read": 3,
+          "output": 0,
+          "total_tokens": 5003,
+          "prompt_tokens": 5003,
+          "cost_usd": 0.015,
+          "unpriced_tokens": 0,
+          "estimated_split_records": 0,
+          "units": {
+            "model-invocation": 1
+          },
+          "no_public_price": false,
+          "reference_cost_usd": null,
+          "reference_model": null,
+          "price_note": null,
+          "provider": "google",
+          "source": "Dalton 生产（订阅）",
+          "rank": 2,
+          "token_pct": 50.0,
+          "cost_pct": 50.0
+        }
+      ],
+      "tail": [],
+      "tail_tokens": 0,
+      "tail_cost": 0,
+      "tail_calls": 0,
+      "coverage": {
+        "status": "local-observations-only",
+        "issues": {},
+        "stats": {},
+        "unresolved_aggregate_records": 0,
+        "unresolved_aggregate_tokens_not_additive": 0
+      },
+      "notes": [],
+      "version": "3.1.0",
+      "revision": false
+    },
+    "legacy_card_overview": "过去 7 天总览：\n· **本机命令行工具**：**5.0K** Tokens ｜ **$0.01** ｜ 1 条计量记录\n· **Dalton 生产**：**5.0K** Tokens ｜ **$0.01** ｜ 1 次运行 / 1 次调用\n· **合计**：**10.0K** Tokens ｜ 已定价参考成本 **$0.03**\n\n**用量构成**\n· **Prompt 缓存读取占比**: **0.1%**（按 Token 加权）\n· **输入构成 (Prompt)**: **10.0K** （缓存读取 6 ｜ 新增 10.0K ｜ 写入 0）\n· **输出（含正文与推理）**: **0**"
+  },
+  "case2_single_5k": {
+    "snapshot": {
+      "ok": true,
+      "version": "3.1.0",
+      "generated_at": "2026-11-21T04:00:00+00:00",
+      "price_catalog": {
+        "generated": "2026-11-14",
+        "currency": "USD",
+        "unit": "per_1m_tokens",
+        "note": "Dalton 自有价格表（美元 / 百万 token）。effective_from 为空表示一直有效；同一模型多条时取统计时点适用的最新一条；input 为 null 表示无公开价。",
+        "effective_notes": [
+          "gemini-4-argon (2026-12-01 起): Google 推出价结束，12-01 起涨为 4/20 美元",
+          "gemini-4-carbon (2026-12-01 起): Google 推出价结束，12-01 起涨为 4/20 美元"
+        ]
+      },
+      "antigravity_series": [
+        {
+          "series_id": "antigravity-oauth:gemini-4-argon",
+          "series_prefix": "gemini-4-argon",
+          "provider": "antigravity-oauth",
+          "display_name": "Gemini 4 Argon",
+          "qualified_display_name": "Gemini 4 Argon (Antigravity)",
+          "default_effort": "high",
+          "default_model": "gemini-4-argon-high-oauth",
+          "efforts": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "variants": {
+            "low": "gemini-4-argon-low-oauth",
+            "medium": "gemini-4-argon-medium-oauth",
+            "high": "gemini-4-argon-high-oauth"
+          }
+        },
+        {
+          "series_id": "antigravity-oauth:gemini-4-carbon",
+          "series_prefix": "gemini-4-carbon",
+          "provider": "antigravity-oauth",
+          "display_name": "Gemini 4 Carbon",
+          "qualified_display_name": "Gemini 4 Carbon (Antigravity)",
+          "default_effort": "medium",
+          "default_model": "gemini-4-carbon-medium-oauth",
+          "efforts": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "variants": {
+            "low": "gemini-4-carbon-low-oauth",
+            "medium": "gemini-4-carbon-medium-oauth",
+            "high": "gemini-4-carbon-high-oauth"
+          }
+        },
+        {
+          "series_id": "antigravity-oauth:gemini-4-hydrogen",
+          "series_prefix": "gemini-4-hydrogen",
+          "provider": "antigravity-oauth",
+          "display_name": "Gemini 4 Hydrogen",
+          "qualified_display_name": "Gemini 4 Hydrogen (Antigravity)",
+          "default_effort": "high",
+          "default_model": "gemini-4-hydrogen-high-oauth",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "variants": {
+            "low": "gemini-4-hydrogen-low-oauth",
+            "medium": "gemini-4-hydrogen-medium-oauth",
+            "high": "gemini-4-hydrogen-high-oauth",
+            "xhigh": "gemini-4-hydrogen-xhigh-oauth"
+          }
+        },
+        {
+          "series_id": "antigravity-oauth:gemini-4-neon",
+          "series_prefix": "gemini-4-neon",
+          "provider": "antigravity-oauth",
+          "display_name": "Gemini 4 Neon",
+          "qualified_display_name": "Gemini 4 Neon (Antigravity)",
+          "default_effort": "high",
+          "default_model": "gemini-4-neon-high-oauth",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "variants": {
+            "low": "gemini-4-neon-low-oauth",
+            "medium": "gemini-4-neon-medium-oauth",
+            "high": "gemini-4-neon-high-oauth",
+            "xhigh": "gemini-4-neon-xhigh-oauth"
+          }
+        },
+        {
+          "series_id": "antigravity-oauth:claude-opus-5-5",
+          "series_prefix": "claude-opus-5-5",
+          "provider": "antigravity-oauth",
+          "display_name": "Claude Opus 5.5",
+          "qualified_display_name": "Claude Opus 5.5 (Antigravity)",
+          "default_effort": "medium",
+          "default_model": "claude-opus-5-5-medium-oauth",
+          "efforts": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "variants": {
+            "low": "claude-opus-5-5-low-oauth",
+            "medium": "claude-opus-5-5-medium-oauth",
+            "high": "claude-opus-5-5-high-oauth"
+          }
+        },
+        {
+          "series_id": "antigravity-oauth:claude-sonnet-5-5",
+          "series_prefix": "claude-sonnet-5-5",
+          "provider": "antigravity-oauth",
+          "display_name": "Claude Sonnet 5.5",
+          "qualified_display_name": "Claude Sonnet 5.5 (Antigravity)",
+          "default_effort": "medium",
+          "default_model": "claude-sonnet-5-5-medium-oauth",
+          "efforts": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "variants": {
+            "low": "claude-sonnet-5-5-low-oauth",
+            "medium": "claude-sonnet-5-5-medium-oauth",
+            "high": "claude-sonnet-5-5-high-oauth"
+          }
+        },
+        {
+          "series_id": "antigravity-oauth:gpt-oss-120b",
+          "series_prefix": "gpt-oss-120b",
+          "provider": "antigravity-oauth",
+          "display_name": "GPT-OSS 120B",
+          "qualified_display_name": "GPT-OSS 120B (Antigravity)",
+          "default_effort": "medium",
+          "default_model": "gpt-oss-120b-medium-oauth",
+          "efforts": [
+            "medium"
+          ],
+          "variants": {
+            "medium": "gpt-oss-120b-medium-oauth"
+          }
+        }
+      ],
+      "dalton_prod": {
+        "ok": true,
+        "error": null,
+        "runs": 1,
+        "calls": 1,
+        "models": 1
+      },
+      "collector_status": {
+        "ok": true,
+        "fresh": true
+      },
+      "windows": [
+        {
+          "days": 7,
+          "from": "2026-11-14T04:00:00+00:00",
+          "to": "2026-11-21T04:00:00+00:00",
+          "rows": [
+            {
+              "source": "Dalton 生产（订阅）",
+              "provider": "google",
+              "model": "gemini-4-neon-high-oauth",
+              "dalton_prod": true,
+              "records": 1,
+              "calls": 1,
+              "runs": 1,
+              "cost_usd": 0.015,
+              "unpriced_tokens": 0,
+              "estimated_split_records": 0,
+              "provider_reported_cost_records": 0,
+              "units": {
+                "model-invocation": 1
+              },
+              "no_public_price": false,
+              "reference_cost_usd": null,
+              "reference_model": null,
+              "price_note": null,
+              "fresh": 5000,
+              "cache_write": 0,
+              "cache_read": 0,
+              "output": 0,
+              "tokens": 5000,
+              "priced_cost_usd": 0.015,
+              "cost_basis": "current-catalog-estimate",
+              "estimated_split": false
+            }
+          ],
+          "row_count": 1,
+          "totals": {
+            "fresh": 5000,
+            "cache_write": 0,
+            "cache_read": 0,
+            "output": 0,
+            "tokens": 5000,
+            "records": 1,
+            "calls": 1,
+            "units": {
+              "model-invocation": 1
+            },
+            "priced_cost_usd": 0.015,
+            "unpriced_tokens": 0,
+            "estimated_split_records": 0,
+            "cost_complete": true,
+            "cost_basis": "current-catalog-estimate",
+            "request_start_time_records": 0,
+            "tier_context_unknown_records": 0,
+            "provider_reported_cost_records": 0
+          }
+        }
+      ],
+      "coverage": {
+        "status": "local-observations-only",
+        "issues": {},
+        "stats": {},
+        "unresolved_aggregate_records": 0,
+        "unresolved_aggregate_tokens_not_additive": 0
+      },
+      "notes": []
+    },
+    "legacy_json": {
+      "days": 7,
+      "from_iso": "2026-11-14T04:00:00+00:00",
+      "to_iso": "2026-11-21T04:00:00+00:00",
+      "total_tokens": 5000,
+      "total_fresh": 5000,
+      "total_cw": 0,
+      "total_cr": 0,
+      "total_out": 0,
+      "total_prompt": 5000,
+      "total_records": 1,
+      "total_calls": 1,
+      "total_cost": 0.015,
+      "unpriced_tokens": 0,
+      "unpriced_models": [],
+      "local_stats": {
+        "fresh": 0,
+        "cache_write": 0,
+        "cache_read": 0,
+        "output": 0,
+        "tokens": 0,
+        "prompt": 0,
+        "cost": 0,
+        "unpriced_tokens": 0,
+        "records": 0,
+        "calls": 0,
+        "models": 0,
+        "cache_hit_rate": 0.0
+      },
+      "dalton_stats": {
+        "fresh": 5000,
+        "cache_write": 0,
+        "cache_read": 0,
+        "output": 0,
+        "tokens": 5000,
+        "prompt": 5000,
+        "cost": 0.015,
+        "unpriced_tokens": 0,
+        "records": 1,
+        "calls": 1,
+        "models": 1,
+        "cache_hit_rate": 0.0,
+        "runs": 1,
+        "api_calls": 1
+      },
+      "dalton_prod": {
+        "ok": true,
+        "error": null,
+        "runs": 1,
+        "calls": 1,
+        "models": 1
+      },
+      "collector_status": {
+        "present": true,
+        "ok": true,
+        "stale": false,
+        "age_minutes": 0,
+        "error": null,
+        "warning": null
+      },
+      "price_catalog": {
+        "generated": "2026-11-14",
+        "currency": "USD",
+        "unit": "per_1m_tokens",
+        "note": "Dalton 自有价格表（美元 / 百万 token）。effective_from 为空表示一直有效；同一模型多条时取统计时点适用的最新一条；input 为 null 表示无公开价。",
+        "effective_notes": [
+          "gemini-4-argon (2026-12-01 起): Google 推出价结束，12-01 起涨为 4/20 美元",
+          "gemini-4-carbon (2026-12-01 起): Google 推出价结束，12-01 起涨为 4/20 美元"
+        ]
+      },
+      "estimated_split_records": 0,
+      "time_estimated_records": 0,
+      "tier_context_unknown_records": 0,
+      "provider_reported_cost_records": 0,
+      "cache_hit_rate": 0.0,
+      "prov_list": [
+        {
+          "provider": "Google",
+          "cost": 0.015,
+          "cost_pct": 100.0,
+          "tokens": 5000,
+          "tokens_pct": 100.0,
+          "calls": 1,
+          "unpriced_tokens": 0
+        }
+      ],
+      "top10": [
+        {
+          "norm_provider": "Google",
+          "model": "gemini-4-neon-high-oauth",
+          "providers": [
+            "google"
+          ],
+          "sources": [
+            "Dalton 生产（订阅）"
+          ],
+          "records": 1,
+          "calls": 1,
+          "runs": 1,
+          "fresh": 5000,
+          "cache_write": 0,
+          "cache_read": 0,
+          "output": 0,
+          "total_tokens": 5000,
+          "prompt_tokens": 5000,
+          "cost_usd": 0.015,
+          "unpriced_tokens": 0,
+          "estimated_split_records": 0,
+          "units": {
+            "model-invocation": 1
+          },
+          "no_public_price": false,
+          "reference_cost_usd": null,
+          "reference_model": null,
+          "price_note": null,
+          "provider": "google",
+          "source": "Dalton 生产（订阅）",
+          "rank": 1,
+          "token_pct": 100.0,
+          "cost_pct": 100.0
+        }
+      ],
+      "tail": [],
+      "tail_tokens": 0,
+      "tail_cost": 0,
+      "tail_calls": 0,
+      "coverage": {
+        "status": "local-observations-only",
+        "issues": {},
+        "stats": {},
+        "unresolved_aggregate_records": 0,
+        "unresolved_aggregate_tokens_not_additive": 0
+      },
+      "notes": [],
+      "version": "3.1.0",
+      "revision": false
+    },
+    "legacy_card_overview": "过去 7 天总览：\n· **本机命令行工具**：**0** Tokens ｜ **$0.00** ｜ 0 条计量记录\n· **Dalton 生产**：**5.0K** Tokens ｜ **$0.01** ｜ 1 次运行 / 1 次调用\n· **合计**：**5.0K** Tokens ｜ 已定价参考成本 **$0.01**\n\n**用量构成**\n· **Prompt 缓存读取占比**: **0.0%**（按 Token 加权）\n· **输入构成 (Prompt)**: **5.0K** （缓存读取 0 ｜ 新增 5.0K ｜ 写入 0）\n· **输出（含正文与推理）**: **0**"
+  },
+  "case3_full_multisource": {
+    "snapshot": {
+      "ok": true,
+      "version": "3.1.0",
+      "generated_at": "2026-11-21T04:00:00+00:00",
+      "price_catalog": {
+        "generated": "2026-11-14",
+        "currency": "USD",
+        "unit": "per_1m_tokens",
+        "note": "Dalton 自有价格表（美元 / 百万 token）。effective_from 为空表示一直有效；同一模型多条时取统计时点适用的最新一条；input 为 null 表示无公开价。",
+        "effective_notes": [
+          "gemini-4-argon (2026-12-01 起): Google 推出价结束，12-01 起涨为 4/20 美元",
+          "gemini-4-carbon (2026-12-01 起): Google 推出价结束，12-01 起涨为 4/20 美元"
+        ]
+      },
+      "antigravity_series": [
+        {
+          "series_id": "antigravity-oauth:gemini-4-argon",
+          "series_prefix": "gemini-4-argon",
+          "provider": "antigravity-oauth",
+          "display_name": "Gemini 4 Argon",
+          "qualified_display_name": "Gemini 4 Argon (Antigravity)",
+          "default_effort": "high",
+          "default_model": "gemini-4-argon-high-oauth",
+          "efforts": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "variants": {
+            "low": "gemini-4-argon-low-oauth",
+            "medium": "gemini-4-argon-medium-oauth",
+            "high": "gemini-4-argon-high-oauth"
+          }
+        },
+        {
+          "series_id": "antigravity-oauth:gemini-4-carbon",
+          "series_prefix": "gemini-4-carbon",
+          "provider": "antigravity-oauth",
+          "display_name": "Gemini 4 Carbon",
+          "qualified_display_name": "Gemini 4 Carbon (Antigravity)",
+          "default_effort": "medium",
+          "default_model": "gemini-4-carbon-medium-oauth",
+          "efforts": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "variants": {
+            "low": "gemini-4-carbon-low-oauth",
+            "medium": "gemini-4-carbon-medium-oauth",
+            "high": "gemini-4-carbon-high-oauth"
+          }
+        },
+        {
+          "series_id": "antigravity-oauth:gemini-4-hydrogen",
+          "series_prefix": "gemini-4-hydrogen",
+          "provider": "antigravity-oauth",
+          "display_name": "Gemini 4 Hydrogen",
+          "qualified_display_name": "Gemini 4 Hydrogen (Antigravity)",
+          "default_effort": "high",
+          "default_model": "gemini-4-hydrogen-high-oauth",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "variants": {
+            "low": "gemini-4-hydrogen-low-oauth",
+            "medium": "gemini-4-hydrogen-medium-oauth",
+            "high": "gemini-4-hydrogen-high-oauth",
+            "xhigh": "gemini-4-hydrogen-xhigh-oauth"
+          }
+        },
+        {
+          "series_id": "antigravity-oauth:gemini-4-neon",
+          "series_prefix": "gemini-4-neon",
+          "provider": "antigravity-oauth",
+          "display_name": "Gemini 4 Neon",
+          "qualified_display_name": "Gemini 4 Neon (Antigravity)",
+          "default_effort": "high",
+          "default_model": "gemini-4-neon-high-oauth",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "variants": {
+            "low": "gemini-4-neon-low-oauth",
+            "medium": "gemini-4-neon-medium-oauth",
+            "high": "gemini-4-neon-high-oauth",
+            "xhigh": "gemini-4-neon-xhigh-oauth"
+          }
+        },
+        {
+          "series_id": "antigravity-oauth:claude-opus-5-5",
+          "series_prefix": "claude-opus-5-5",
+          "provider": "antigravity-oauth",
+          "display_name": "Claude Opus 5.5",
+          "qualified_display_name": "Claude Opus 5.5 (Antigravity)",
+          "default_effort": "medium",
+          "default_model": "claude-opus-5-5-medium-oauth",
+          "efforts": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "variants": {
+            "low": "claude-opus-5-5-low-oauth",
+            "medium": "claude-opus-5-5-medium-oauth",
+            "high": "claude-opus-5-5-high-oauth"
+          }
+        },
+        {
+          "series_id": "antigravity-oauth:claude-sonnet-5-5",
+          "series_prefix": "claude-sonnet-5-5",
+          "provider": "antigravity-oauth",
+          "display_name": "Claude Sonnet 5.5",
+          "qualified_display_name": "Claude Sonnet 5.5 (Antigravity)",
+          "default_effort": "medium",
+          "default_model": "claude-sonnet-5-5-medium-oauth",
+          "efforts": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "variants": {
+            "low": "claude-sonnet-5-5-low-oauth",
+            "medium": "claude-sonnet-5-5-medium-oauth",
+            "high": "claude-sonnet-5-5-high-oauth"
+          }
+        },
+        {
+          "series_id": "antigravity-oauth:gpt-oss-120b",
+          "series_prefix": "gpt-oss-120b",
+          "provider": "antigravity-oauth",
+          "display_name": "GPT-OSS 120B",
+          "qualified_display_name": "GPT-OSS 120B (Antigravity)",
+          "default_effort": "medium",
+          "default_model": "gpt-oss-120b-medium-oauth",
+          "efforts": [
+            "medium"
+          ],
+          "variants": {
+            "medium": "gpt-oss-120b-medium-oauth"
+          }
+        }
+      ],
+      "dalton_prod": {
+        "ok": true,
+        "error": null,
+        "runs": 129,
+        "calls": 455,
+        "models": 8
+      },
+      "collector_status": {
+        "ok": true,
+        "fresh": true
+      },
+      "windows": [
+        {
+          "days": 7,
+          "from": "2026-11-14T04:00:00+00:00",
+          "to": "2026-11-21T04:00:00+00:00",
+          "rows": [
+            {
+              "source": "Dalton 生产（订阅）",
+              "provider": "claude-cli-gateway",
+              "model": "claude-opus-5-5-oauth",
+              "dalton_prod": true,
+              "records": 1,
+              "calls": 300,
+              "runs": 80,
+              "cost_usd": 11.2,
+              "unpriced_tokens": 0,
+              "estimated_split_records": 0,
+              "provider_reported_cost_records": 0,
+              "units": {
+                "model-invocation": 1
+              },
+              "no_public_price": false,
+              "reference_cost_usd": null,
+              "reference_model": null,
+              "price_note": null,
+              "fresh": 1500000,
+              "cache_write": 0,
+              "cache_read": 6000000,
+              "output": 200000,
+              "tokens": 7700000,
+              "priced_cost_usd": 11.2,
+              "cost_basis": "current-catalog-estimate",
+              "estimated_split": false
+            },
+            {
+              "source": "Dalton 生产（订阅）",
+              "provider": "claude-cli-gateway",
+              "model": "claude-opus-5-5-high-oauth",
+              "dalton_prod": true,
+              "records": 1,
+              "calls": 60,
+              "runs": 18,
+              "cost_usd": 2.24,
+              "unpriced_tokens": 0,
+              "estimated_split_records": 0,
+              "provider_reported_cost_records": 0,
+              "units": {
+                "model-invocation": 1
+              },
+              "no_public_price": false,
+              "reference_cost_usd": null,
+              "reference_model": null,
+              "price_note": null,
+              "fresh": 300000,
+              "cache_write": 0,
+              "cache_read": 700000,
+              "output": 45000,
+              "tokens": 1045000,
+              "priced_cost_usd": 2.24,
+              "cost_basis": "current-catalog-estimate",
+              "estimated_split": false
+            },
+            {
+              "source": "Dalton 生产（订阅）",
+              "provider": "claude-cli-gateway",
+              "model": "claude-opus-5-5-medium-oauth",
+              "dalton_prod": true,
+              "records": 1,
+              "calls": 40,
+              "runs": 12,
+              "cost_usd": 1.5,
+              "unpriced_tokens": 0,
+              "estimated_split_records": 0,
+              "provider_reported_cost_records": 0,
+              "units": {
+                "model-invocation": 1
+              },
+              "no_public_price": false,
+              "reference_cost_usd": null,
+              "reference_model": null,
+              "price_note": null,
+              "fresh": 200000,
+              "cache_write": 0,
+              "cache_read": 500000,
+              "output": 30000,
+              "tokens": 730000,
+              "priced_cost_usd": 1.5,
+              "cost_basis": "current-catalog-estimate",
+              "estimated_split": false
+            },
+            {
+              "source": "claude-code(手动)",
+              "provider": "anthropic",
+              "model": "claude-opus-5-5",
+              "dalton_prod": false,
+              "records": 1,
+              "calls": 1,
+              "runs": 0,
+              "cost_usd": 0.76,
+              "unpriced_tokens": 0,
+              "estimated_split_records": 1,
+              "provider_reported_cost_records": 0,
+              "units": {
+                "model-response": 1
+              },
+              "no_public_price": false,
+              "reference_cost_usd": null,
+              "reference_model": null,
+              "price_note": null,
+              "fresh": 80000,
+              "cache_write": 10000,
+              "cache_read": 300000,
+              "output": 15000,
+              "tokens": 405000,
+              "priced_cost_usd": 0.76,
+              "cost_basis": "current-catalog-estimate",
+              "estimated_split": true
+            },
+            {
+              "source": "Dalton 生产（订阅）",
+              "provider": "claude-cli-gateway",
+              "model": "claude-opus-5-5-low-oauth",
+              "dalton_prod": true,
+              "records": 1,
+              "calls": 20,
+              "runs": 6,
+              "cost_usd": 0.74,
+              "unpriced_tokens": 0,
+              "estimated_split_records": 0,
+              "provider_reported_cost_records": 0,
+              "units": {
+                "model-invocation": 1
+              },
+              "no_public_price": false,
+              "reference_cost_usd": null,
+              "reference_model": null,
+              "price_note": null,
+              "fresh": 100000,
+              "cache_write": 0,
+              "cache_read": 200000,
+              "output": 15000,
+              "tokens": 315000,
+              "priced_cost_usd": 0.74,
+              "cost_basis": "current-catalog-estimate",
+              "estimated_split": false
+            },
+            {
+              "source": "openclaw",
+              "provider": "openai",
+              "model": "gpt-6.1-sol",
+              "dalton_prod": false,
+              "records": 1,
+              "calls": 1,
+              "runs": 0,
+              "cost_usd": 0.36,
+              "unpriced_tokens": 0,
+              "estimated_split_records": 0,
+              "provider_reported_cost_records": 0,
+              "units": {
+                "agent-run": 1
+              },
+              "no_public_price": false,
+              "reference_cost_usd": null,
+              "reference_model": null,
+              "price_note": null,
+              "fresh": 120000,
+              "cache_write": 0,
+              "cache_read": 200000,
+              "output": 10000,
+              "tokens": 330000,
+              "priced_cost_usd": 0.36,
+              "cost_basis": "current-catalog-estimate",
+              "estimated_split": false
+            },
+            {
+              "source": "agy-cli(含网关)",
+              "provider": "antigravity-cli-gateway",
+              "model": "gemini-4-argon",
+              "dalton_prod": false,
+              "records": 1,
+              "calls": 1,
+              "runs": 0,
+              "cost_usd": 0.305,
+              "unpriced_tokens": 0,
+              "estimated_split_records": 0,
+              "provider_reported_cost_records": 0,
+              "units": {
+                "model-response": 1
+              },
+              "no_public_price": false,
+              "reference_cost_usd": null,
+              "reference_model": null,
+              "price_note": null,
+              "fresh": 100000,
+              "cache_write": 0,
+              "cache_read": 50000,
+              "output": 10000,
+              "tokens": 160000,
+              "priced_cost_usd": 0.305,
+              "cost_basis": "current-catalog-estimate",
+              "estimated_split": false,
+              "effort_breakdown": {
+                "unknown": {
+                  "effort": "unknown",
+                  "records": 1,
+                  "calls": 1,
+                  "runs": 0,
+                  "fresh": 100000,
+                  "cache_write": 0,
+                  "cache_read": 50000,
+                  "output": 10000,
+                  "total_tokens": 160000,
+                  "prompt_tokens": 150000,
+                  "cost_usd": 0.305,
+                  "unpriced_tokens": 0,
+                  "no_public_price": false,
+                  "reference_cost_usd": null,
+                  "reference_model": null,
+                  "price_note": null
+                }
+              }
+            },
+            {
+              "source": "grok-cli",
+              "provider": "xai",
+              "model": "grok-custom-reported",
+              "dalton_prod": false,
+              "records": 1,
+              "calls": 1,
+              "runs": 0,
+              "cost_usd": 0.123456,
+              "unpriced_tokens": 0,
+              "estimated_split_records": 0,
+              "provider_reported_cost_records": 1,
+              "units": {
+                "agent-run": 1
+              },
+              "no_public_price": false,
+              "reference_cost_usd": null,
+              "reference_model": null,
+              "price_note": null,
+              "fresh": 50000,
+              "cache_write": 0,
+              "cache_read": 0,
+              "output": 5000,
+              "tokens": 55000,
+              "priced_cost_usd": 0.123456,
+              "cost_basis": "provider-reported",
+              "estimated_split": false
+            },
+            {
+              "source": "Dalton 生产（订阅）",
+              "provider": "google",
+              "model": "gemini-4-neon-high-oauth",
+              "dalton_prod": true,
+              "records": 1,
+              "calls": 10,
+              "runs": 4,
+              "cost_usd": 0.075,
+              "unpriced_tokens": 0,
+              "estimated_split_records": 0,
+              "provider_reported_cost_records": 0,
+              "units": {
+                "model-invocation": 1
+              },
+              "no_public_price": false,
+              "reference_cost_usd": null,
+              "reference_model": null,
+              "price_note": null,
+              "fresh": 25000,
+              "cache_write": 0,
+              "cache_read": 0,
+              "output": 0,
+              "tokens": 25000,
+              "priced_cost_usd": 0.075,
+              "cost_basis": "current-catalog-estimate",
+              "estimated_split": false
+            },
+            {
+              "source": "Dalton 生产（订阅）",
+              "provider": "google",
+              "model": "gemini-4-neon-medium-oauth",
+              "dalton_prod": true,
+              "records": 1,
+              "calls": 8,
+              "runs": 3,
+              "cost_usd": 0.06,
+              "unpriced_tokens": 0,
+              "estimated_split_records": 0,
+              "provider_reported_cost_records": 0,
+              "units": {
+                "model-invocation": 1
+              },
+              "no_public_price": false,
+              "reference_cost_usd": null,
+              "reference_model": null,
+              "price_note": null,
+              "fresh": 20000,
+              "cache_write": 0,
+              "cache_read": 0,
+              "output": 0,
+              "tokens": 20000,
+              "priced_cost_usd": 0.06,
+              "cost_basis": "current-catalog-estimate",
+              "estimated_split": false
+            },
+            {
+              "source": "Dalton 生产（订阅）",
+              "provider": "google",
+              "model": "gemini-4-neon-low-oauth",
+              "dalton_prod": true,
+              "records": 1,
+              "calls": 5,
+              "runs": 2,
+              "cost_usd": 0.03,
+              "unpriced_tokens": 0,
+              "estimated_split_records": 0,
+              "provider_reported_cost_records": 0,
+              "units": {
+                "model-invocation": 1
+              },
+              "no_public_price": false,
+              "reference_cost_usd": null,
+              "reference_model": null,
+              "price_note": null,
+              "fresh": 10000,
+              "cache_write": 0,
+              "cache_read": 0,
+              "output": 0,
+              "tokens": 10000,
+              "priced_cost_usd": 0.03,
+              "cost_basis": "current-catalog-estimate",
+              "estimated_split": false
+            },
+            {
+              "source": "agy-cli(含网关)",
+              "provider": "antigravity-cli-gateway",
+              "model": "gemini-4-neon",
+              "dalton_prod": false,
+              "records": 3,
+              "calls": 3,
+              "runs": 0,
+              "cost_usd": 0.009003,
+              "unpriced_tokens": 0,
+              "estimated_split_records": 0,
+              "provider_reported_cost_records": 0,
+              "units": {
+                "model-response": 3
+              },
+              "no_public_price": false,
+              "reference_cost_usd": null,
+              "reference_model": null,
+              "price_note": null,
+              "fresh": 0,
+              "cache_write": 0,
+              "cache_read": 60020,
+              "output": 0,
+              "tokens": 60020,
+              "priced_cost_usd": 0.009003,
+              "cost_basis": "current-catalog-estimate",
+              "estimated_split": false,
+              "effort_breakdown": {
+                "high": {
+                  "effort": "high",
+                  "records": 1,
+                  "calls": 1,
+                  "runs": 0,
+                  "fresh": 0,
+                  "cache_write": 0,
+                  "cache_read": 10,
+                  "output": 0,
+                  "total_tokens": 10,
+                  "prompt_tokens": 10,
+                  "cost_usd": 2e-06,
+                  "unpriced_tokens": 0,
+                  "no_public_price": false,
+                  "reference_cost_usd": null,
+                  "reference_model": null,
+                  "price_note": null
+                },
+                "low": {
+                  "effort": "low",
+                  "records": 1,
+                  "calls": 1,
+                  "runs": 0,
+                  "fresh": 0,
+                  "cache_write": 0,
+                  "cache_read": 60000,
+                  "output": 0,
+                  "total_tokens": 60000,
+                  "prompt_tokens": 60000,
+                  "cost_usd": 0.009,
+                  "unpriced_tokens": 0,
+                  "no_public_price": false,
+                  "reference_cost_usd": null,
+                  "reference_model": null,
+                  "price_note": null
+                },
+                "medium": {
+                  "effort": "medium",
+                  "records": 1,
+                  "calls": 1,
+                  "runs": 0,
+                  "fresh": 0,
+                  "cache_write": 0,
+                  "cache_read": 10,
+                  "output": 0,
+                  "total_tokens": 10,
+                  "prompt_tokens": 10,
+                  "cost_usd": 1e-06,
+                  "unpriced_tokens": 0,
+                  "no_public_price": false,
+                  "reference_cost_usd": null,
+                  "reference_model": null,
+                  "price_note": null
+                }
+              }
+            },
+            {
+              "source": "muse-cli(手动)",
+              "provider": "muse-cli-gateway",
+              "model": "muse-wonder-full-1.0",
+              "dalton_prod": false,
+              "records": 1,
+              "calls": 1,
+              "runs": 0,
+              "cost_usd": null,
+              "unpriced_tokens": 160000,
+              "estimated_split_records": 0,
+              "provider_reported_cost_records": 0,
+              "units": {
+                "model-response": 1
+              },
+              "no_public_price": true,
+              "reference_cost_usd": 0.61,
+              "reference_model": "muse-wonder-1.0",
+              "price_note": "无公开按 token 价格（只随 Muse Code 订阅提供）",
+              "fresh": 100000,
+              "cache_write": 0,
+              "cache_read": 50000,
+              "output": 10000,
+              "tokens": 160000,
+              "priced_cost_usd": 0.0,
+              "cost_basis": "unpriced",
+              "estimated_split": false
+            },
+            {
+              "source": "Dalton 生产（订阅）",
+              "provider": "openai",
+              "model": "gpt-oss-120b-medium-oauth",
+              "dalton_prod": true,
+              "records": 1,
+              "calls": 12,
+              "runs": 4,
+              "cost_usd": null,
+              "unpriced_tokens": 65000,
+              "estimated_split_records": 0,
+              "provider_reported_cost_records": 0,
+              "units": {
+                "model-invocation": 1
+              },
+              "no_public_price": false,
+              "reference_cost_usd": null,
+              "reference_model": null,
+              "price_note": null,
+              "fresh": 50000,
+              "cache_write": 0,
+              "cache_read": 10000,
+              "output": 5000,
+              "tokens": 65000,
+              "priced_cost_usd": 0.0,
+              "cost_basis": "unpriced",
+              "estimated_split": false
+            }
+          ],
+          "row_count": 14,
+          "totals": {
+            "fresh": 2655000,
+            "cache_write": 10000,
+            "cache_read": 8070020,
+            "output": 345000,
+            "tokens": 11080020,
+            "records": 16,
+            "calls": 463,
+            "units": {
+              "model-response": 6,
+              "agent-run": 2,
+              "model-invocation": 8
+            },
+            "priced_cost_usd": 17.402459,
+            "unpriced_tokens": 225000,
+            "estimated_split_records": 1,
+            "cost_complete": false,
+            "cost_basis": "current-catalog-estimate",
+            "request_start_time_records": 1,
+            "tier_context_unknown_records": 1,
+            "provider_reported_cost_records": 1
+          }
+        }
+      ],
+      "coverage": {
+        "status": "local-observations-only",
+        "issues": {},
+        "stats": {},
+        "unresolved_aggregate_records": 0,
+        "unresolved_aggregate_tokens_not_additive": 0
+      },
+      "notes": []
+    },
+    "legacy_json": {
+      "days": 7,
+      "from_iso": "2026-11-14T04:00:00+00:00",
+      "to_iso": "2026-11-21T04:00:00+00:00",
+      "total_tokens": 11080020,
+      "total_fresh": 2655000,
+      "total_cw": 10000,
+      "total_cr": 8070020,
+      "total_out": 345000,
+      "total_prompt": 10735020,
+      "total_records": 16,
+      "total_calls": 463,
+      "total_cost": 17.402459,
+      "unpriced_tokens": 225000,
+      "unpriced_models": [
+        {
+          "model": "muse-wonder-full-1.0",
+          "norm_provider": "Meta",
+          "source": "muse-cli(手动)",
+          "tokens": 160000,
+          "unpriced_tokens": 160000,
+          "cost_usd": null,
+          "reference_cost_usd": 0.61,
+          "reference_model": "muse-wonder-1.0",
+          "price_note": "无公开按 token 价格（只随 Muse Code 订阅提供）"
+        },
+        {
+          "model": "gpt-oss-120b-medium-oauth",
+          "norm_provider": "OpenAI",
+          "source": "Dalton 生产（订阅）",
+          "tokens": 65000,
+          "unpriced_tokens": 65000,
+          "cost_usd": null,
+          "reference_cost_usd": null,
+          "reference_model": null,
+          "price_note": null
+        }
+      ],
+      "local_stats": {
+        "fresh": 450000,
+        "cache_write": 10000,
+        "cache_read": 660020,
+        "output": 50000,
+        "tokens": 1170020,
+        "prompt": 1120020,
+        "cost": 1.557459,
+        "unpriced_tokens": 160000,
+        "records": 8,
+        "calls": 8,
+        "models": 6,
+        "cache_hit_rate": 58.92930483384225
+      },
+      "dalton_stats": {
+        "fresh": 2205000,
+        "cache_write": 0,
+        "cache_read": 7410000,
+        "output": 295000,
+        "tokens": 9910000,
+        "prompt": 9615000,
+        "cost": 15.844999999999999,
+        "unpriced_tokens": 65000,
+        "records": 8,
+        "calls": 455,
+        "models": 8,
+        "cache_hit_rate": 77.06708268330733,
+        "runs": 129,
+        "api_calls": 455
+      },
+      "dalton_prod": {
+        "ok": true,
+        "error": null,
+        "runs": 129,
+        "calls": 455,
+        "models": 8
+      },
+      "collector_status": {
+        "present": true,
+        "ok": true,
+        "stale": false,
+        "age_minutes": 0,
+        "error": null,
+        "warning": null
+      },
+      "price_catalog": {
+        "generated": "2026-11-14",
+        "currency": "USD",
+        "unit": "per_1m_tokens",
+        "note": "Dalton 自有价格表（美元 / 百万 token）。effective_from 为空表示一直有效；同一模型多条时取统计时点适用的最新一条；input 为 null 表示无公开价。",
+        "effective_notes": [
+          "gemini-4-argon (2026-12-01 起): Google 推出价结束，12-01 起涨为 4/20 美元",
+          "gemini-4-carbon (2026-12-01 起): Google 推出价结束，12-01 起涨为 4/20 美元"
+        ]
+      },
+      "estimated_split_records": 1,
+      "time_estimated_records": 1,
+      "tier_context_unknown_records": 1,
+      "provider_reported_cost_records": 1,
+      "cache_hit_rate": 75.17470857064076,
+      "prov_list": [
+        {
+          "provider": "Anthropic",
+          "cost": 16.439999999999998,
+          "cost_pct": 94.46940803020996,
+          "tokens": 10195000,
+          "tokens_pct": 92.01246929157168,
+          "calls": 421,
+          "unpriced_tokens": 0
+        },
+        {
+          "provider": "Google",
+          "cost": 0.47900299999999996,
+          "cost_pct": 2.7525018159789942,
+          "tokens": 275020,
+          "tokens_pct": 2.482125483528008,
+          "calls": 27,
+          "unpriced_tokens": 0
+        },
+        {
+          "provider": "OpenAI",
+          "cost": 0.36,
+          "cost_pct": 2.0686731685447444,
+          "tokens": 395000,
+          "tokens_pct": 3.5649755144846305,
+          "calls": 13,
+          "unpriced_tokens": 65000
+        },
+        {
+          "provider": "xAI",
+          "cost": 0.123456,
+          "cost_pct": 0.7094169852662775,
+          "tokens": 55000,
+          "tokens_pct": 0.4963889956877334,
+          "calls": 1,
+          "unpriced_tokens": 0
+        },
+        {
+          "provider": "Meta",
+          "cost": 0.0,
+          "cost_pct": 0.0,
+          "tokens": 160000,
+          "tokens_pct": 1.4440407147279517,
+          "calls": 1,
+          "unpriced_tokens": 160000
+        }
+      ],
+      "top10": [
+        {
+          "norm_provider": "Anthropic",
+          "model": "claude-opus-5-5-oauth",
+          "providers": [
+            "claude-cli-gateway"
+          ],
+          "sources": [
+            "Dalton 生产（订阅）"
+          ],
+          "records": 1,
+          "calls": 300,
+          "runs": 80,
+          "fresh": 1500000,
+          "cache_write": 0,
+          "cache_read": 6000000,
+          "output": 200000,
+          "total_tokens": 7700000,
+          "prompt_tokens": 7500000,
+          "cost_usd": 11.2,
+          "unpriced_tokens": 0,
+          "estimated_split_records": 0,
+          "units": {
+            "model-invocation": 1
+          },
+          "no_public_price": false,
+          "reference_cost_usd": null,
+          "reference_model": null,
+          "price_note": null,
+          "provider": "claude-cli-gateway",
+          "source": "Dalton 生产（订阅）",
+          "rank": 1,
+          "token_pct": 69.49445939628268,
+          "cost_pct": 64.35872079916982
+        },
+        {
+          "norm_provider": "Anthropic",
+          "model": "claude-opus-5-5-high-oauth",
+          "providers": [
+            "claude-cli-gateway"
+          ],
+          "sources": [
+            "Dalton 生产（订阅）"
+          ],
+          "records": 1,
+          "calls": 60,
+          "runs": 18,
+          "fresh": 300000,
+          "cache_write": 0,
+          "cache_read": 700000,
+          "output": 45000,
+          "total_tokens": 1045000,
+          "prompt_tokens": 1000000,
+          "cost_usd": 2.24,
+          "unpriced_tokens": 0,
+          "estimated_split_records": 0,
+          "units": {
+            "model-invocation": 1
+          },
+          "no_public_price": false,
+          "reference_cost_usd": null,
+          "reference_model": null,
+          "price_note": null,
+          "provider": "claude-cli-gateway",
+          "source": "Dalton 生产（订阅）",
+          "rank": 2,
+          "token_pct": 9.431390918066935,
+          "cost_pct": 12.871744159833964
+        },
+        {
+          "norm_provider": "Anthropic",
+          "model": "claude-opus-5-5-medium-oauth",
+          "providers": [
+            "claude-cli-gateway"
+          ],
+          "sources": [
+            "Dalton 生产（订阅）"
+          ],
+          "records": 1,
+          "calls": 40,
+          "runs": 12,
+          "fresh": 200000,
+          "cache_write": 0,
+          "cache_read": 500000,
+          "output": 30000,
+          "total_tokens": 730000,
+          "prompt_tokens": 700000,
+          "cost_usd": 1.5,
+          "unpriced_tokens": 0,
+          "estimated_split_records": 0,
+          "units": {
+            "model-invocation": 1
+          },
+          "no_public_price": false,
+          "reference_cost_usd": null,
+          "reference_model": null,
+          "price_note": null,
+          "provider": "claude-cli-gateway",
+          "source": "Dalton 生产（订阅）",
+          "rank": 3,
+          "token_pct": 6.588435760946281,
+          "cost_pct": 8.6194715356031
+        },
+        {
+          "norm_provider": "Anthropic",
+          "model": "claude-opus-5-5",
+          "providers": [
+            "anthropic"
+          ],
+          "sources": [
+            "claude-code(手动)"
+          ],
+          "records": 1,
+          "calls": 1,
+          "runs": 0,
+          "fresh": 80000,
+          "cache_write": 10000,
+          "cache_read": 300000,
+          "output": 15000,
+          "total_tokens": 405000,
+          "prompt_tokens": 390000,
+          "cost_usd": 0.76,
+          "unpriced_tokens": 0,
+          "estimated_split_records": 1,
+          "units": {
+            "model-response": 1
+          },
+          "no_public_price": false,
+          "reference_cost_usd": null,
+          "reference_model": null,
+          "price_note": null,
+          "provider": "anthropic",
+          "source": "claude-code(手动)",
+          "rank": 4,
+          "token_pct": 3.655228059155128,
+          "cost_pct": 4.367198911372237
+        },
+        {
+          "norm_provider": "OpenAI",
+          "model": "gpt-6.1-sol",
+          "providers": [
+            "openai"
+          ],
+          "sources": [
+            "openclaw"
+          ],
+          "records": 1,
+          "calls": 1,
+          "runs": 0,
+          "fresh": 120000,
+          "cache_write": 0,
+          "cache_read": 200000,
+          "output": 10000,
+          "total_tokens": 330000,
+          "prompt_tokens": 320000,
+          "cost_usd": 0.36,
+          "unpriced_tokens": 0,
+          "estimated_split_records": 0,
+          "units": {
+            "agent-run": 1
+          },
+          "no_public_price": false,
+          "reference_cost_usd": null,
+          "reference_model": null,
+          "price_note": null,
+          "provider": "openai",
+          "source": "openclaw",
+          "rank": 5,
+          "token_pct": 2.9783339741264006,
+          "cost_pct": 2.0686731685447444
+        },
+        {
+          "norm_provider": "Anthropic",
+          "model": "claude-opus-5-5-low-oauth",
+          "providers": [
+            "claude-cli-gateway"
+          ],
+          "sources": [
+            "Dalton 生产（订阅）"
+          ],
+          "records": 1,
+          "calls": 20,
+          "runs": 6,
+          "fresh": 100000,
+          "cache_write": 0,
+          "cache_read": 200000,
+          "output": 15000,
+          "total_tokens": 315000,
+          "prompt_tokens": 300000,
+          "cost_usd": 0.74,
+          "unpriced_tokens": 0,
+          "estimated_split_records": 0,
+          "units": {
+            "model-invocation": 1
+          },
+          "no_public_price": false,
+          "reference_cost_usd": null,
+          "reference_model": null,
+          "price_note": null,
+          "provider": "claude-cli-gateway",
+          "source": "Dalton 生产（订阅）",
+          "rank": 6,
+          "token_pct": 2.842955157120655,
+          "cost_pct": 4.252272624230863
+        },
+        {
+          "norm_provider": "Google",
+          "model": "gemini-4-argon",
+          "providers": [
+            "antigravity-cli-gateway"
+          ],
+          "sources": [
+            "agy-cli(含网关)"
+          ],
+          "records": 1,
+          "calls": 1,
+          "runs": 0,
+          "fresh": 100000,
+          "cache_write": 0,
+          "cache_read": 50000,
+          "output": 10000,
+          "total_tokens": 160000,
+          "prompt_tokens": 150000,
+          "cost_usd": 0.305,
+          "unpriced_tokens": 0,
+          "estimated_split_records": 0,
+          "units": {
+            "model-response": 1
+          },
+          "no_public_price": false,
+          "reference_cost_usd": null,
+          "reference_model": null,
+          "price_note": null,
+          "provider": "antigravity-cli-gateway",
+          "source": "agy-cli(含网关)",
+          "rank": 7,
+          "token_pct": 1.4440407147279517,
+          "cost_pct": 1.7526258789059637
+        },
+        {
+          "norm_provider": "Meta",
+          "model": "muse-wonder-full-1.0",
+          "providers": [
+            "muse-cli-gateway"
+          ],
+          "sources": [
+            "muse-cli(手动)"
+          ],
+          "records": 1,
+          "calls": 1,
+          "runs": 0,
+          "fresh": 100000,
+          "cache_write": 0,
+          "cache_read": 50000,
+          "output": 10000,
+          "total_tokens": 160000,
+          "prompt_tokens": 150000,
+          "cost_usd": null,
+          "unpriced_tokens": 160000,
+          "estimated_split_records": 0,
+          "units": {
+            "model-response": 1
+          },
+          "no_public_price": true,
+          "reference_cost_usd": 0.61,
+          "reference_model": "muse-wonder-1.0",
+          "price_note": "无公开按 token 价格（只随 Muse Code 订阅提供）",
+          "provider": "muse-cli-gateway",
+          "source": "muse-cli(手动)",
+          "rank": 8,
+          "token_pct": 1.4440407147279517,
+          "cost_pct": 0.0
+        },
+        {
+          "norm_provider": "OpenAI",
+          "model": "gpt-oss-120b-medium-oauth",
+          "providers": [
+            "openai"
+          ],
+          "sources": [
+            "Dalton 生产（订阅）"
+          ],
+          "records": 1,
+          "calls": 12,
+          "runs": 4,
+          "fresh": 50000,
+          "cache_write": 0,
+          "cache_read": 10000,
+          "output": 5000,
+          "total_tokens": 65000,
+          "prompt_tokens": 60000,
+          "cost_usd": null,
+          "unpriced_tokens": 65000,
+          "estimated_split_records": 0,
+          "units": {
+            "model-invocation": 1
+          },
+          "no_public_price": false,
+          "reference_cost_usd": null,
+          "reference_model": null,
+          "price_note": null,
+          "provider": "openai",
+          "source": "Dalton 生产（订阅）",
+          "rank": 9,
+          "token_pct": 0.5866415403582304,
+          "cost_pct": 0.0
+        },
+        {
+          "norm_provider": "Google",
+          "model": "gemini-4-neon",
+          "providers": [
+            "antigravity-cli-gateway"
+          ],
+          "sources": [
+            "agy-cli(含网关)"
+          ],
+          "records": 3,
+          "calls": 3,
+          "runs": 0,
+          "fresh": 0,
+          "cache_write": 0,
+          "cache_read": 60020,
+          "output": 0,
+          "total_tokens": 60020,
+          "prompt_tokens": 60020,
+          "cost_usd": 0.009003,
+          "unpriced_tokens": 0,
+          "estimated_split_records": 0,
+          "units": {
+            "model-response": 3
+          },
+          "no_public_price": false,
+          "reference_cost_usd": null,
+          "reference_model": null,
+          "price_note": null,
+          "provider": "antigravity-cli-gateway",
+          "source": "agy-cli(含网关)",
+          "rank": 10,
+          "token_pct": 0.5416957731123229,
+          "cost_pct": 0.05173406815668981
+        }
+      ],
+      "tail": [
+        {
+          "norm_provider": "xAI",
+          "model": "grok-custom-reported",
+          "providers": [
+            "xai"
+          ],
+          "sources": [
+            "grok-cli"
+          ],
+          "records": 1,
+          "calls": 1,
+          "runs": 0,
+          "fresh": 50000,
+          "cache_write": 0,
+          "cache_read": 0,
+          "output": 5000,
+          "total_tokens": 55000,
+          "prompt_tokens": 50000,
+          "cost_usd": 0.123456,
+          "unpriced_tokens": 0,
+          "estimated_split_records": 0,
+          "units": {
+            "agent-run": 1
+          },
+          "no_public_price": false,
+          "reference_cost_usd": null,
+          "reference_model": null,
+          "price_note": null,
+          "provider": "xai",
+          "source": "grok-cli"
+        },
+        {
+          "norm_provider": "Google",
+          "model": "gemini-4-neon-high-oauth",
+          "providers": [
+            "google"
+          ],
+          "sources": [
+            "Dalton 生产（订阅）"
+          ],
+          "records": 1,
+          "calls": 10,
+          "runs": 4,
+          "fresh": 25000,
+          "cache_write": 0,
+          "cache_read": 0,
+          "output": 0,
+          "total_tokens": 25000,
+          "prompt_tokens": 25000,
+          "cost_usd": 0.075,
+          "unpriced_tokens": 0,
+          "estimated_split_records": 0,
+          "units": {
+            "model-invocation": 1
+          },
+          "no_public_price": false,
+          "reference_cost_usd": null,
+          "reference_model": null,
+          "price_note": null,
+          "provider": "google",
+          "source": "Dalton 生产（订阅）"
+        },
+        {
+          "norm_provider": "Google",
+          "model": "gemini-4-neon-medium-oauth",
+          "providers": [
+            "google"
+          ],
+          "sources": [
+            "Dalton 生产（订阅）"
+          ],
+          "records": 1,
+          "calls": 8,
+          "runs": 3,
+          "fresh": 20000,
+          "cache_write": 0,
+          "cache_read": 0,
+          "output": 0,
+          "total_tokens": 20000,
+          "prompt_tokens": 20000,
+          "cost_usd": 0.06,
+          "unpriced_tokens": 0,
+          "estimated_split_records": 0,
+          "units": {
+            "model-invocation": 1
+          },
+          "no_public_price": false,
+          "reference_cost_usd": null,
+          "reference_model": null,
+          "price_note": null,
+          "provider": "google",
+          "source": "Dalton 生产（订阅）"
+        },
+        {
+          "norm_provider": "Google",
+          "model": "gemini-4-neon-low-oauth",
+          "providers": [
+            "google"
+          ],
+          "sources": [
+            "Dalton 生产（订阅）"
+          ],
+          "records": 1,
+          "calls": 5,
+          "runs": 2,
+          "fresh": 10000,
+          "cache_write": 0,
+          "cache_read": 0,
+          "output": 0,
+          "total_tokens": 10000,
+          "prompt_tokens": 10000,
+          "cost_usd": 0.03,
+          "unpriced_tokens": 0,
+          "estimated_split_records": 0,
+          "units": {
+            "model-invocation": 1
+          },
+          "no_public_price": false,
+          "reference_cost_usd": null,
+          "reference_model": null,
+          "price_note": null,
+          "provider": "google",
+          "source": "Dalton 生产（订阅）"
+        }
+      ],
+      "tail_tokens": 110000,
+      "tail_cost": 0.288456,
+      "tail_calls": 24,
+      "coverage": {
+        "status": "local-observations-only",
+        "issues": {},
+        "stats": {},
+        "unresolved_aggregate_records": 0,
+        "unresolved_aggregate_tokens_not_additive": 0
+      },
+      "notes": [],
+      "version": "3.1.0",
+      "revision": false
+    },
+    "legacy_card_overview": "过去 7 天总览：\n· **本机命令行工具**：**1.2M** Tokens ｜ **$1.56**，含 160.0K 无公开价 ｜ 8 条计量记录\n· **Dalton 生产**：**9.9M** Tokens ｜ **$15.84**，含 65.0K 无公开价 ｜ 129 次运行 / 455 次调用\n· **合计**：**11.1M** Tokens ｜ 已定价参考成本 **$17.40**\n\n**用量构成**\n· **Prompt 缓存读取占比**: **75.2%**（按 Token 加权）\n· **输入构成 (Prompt)**: **10.7M** （缓存读取 8.1M ｜ 新增 2.7M ｜ 写入 10.0K）\n· **输出（含正文与推理）**: **345.0K**\n· **无公开价用量**: **225.0K** Tokens，已计入总用量，不计入总成本。"
+  }
+}

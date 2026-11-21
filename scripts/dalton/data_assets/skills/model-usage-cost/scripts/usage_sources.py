@@ -5,15 +5,18 @@ Raw observations are persisted BEFORE reconciliation, so later evidence can repl
 fallback without counting both. Unknown/overlapping aggregates stay outside totals.
 """
 import collections
+import copy
 import datetime as dt
 import glob
 import gzip
 import hashlib
+import importlib.util
 import json
 import math
 import os
 from pathlib import Path
 import sqlite3
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,6 +25,9 @@ UTC = dt.timezone.utc
 FIELDS = ('fresh', 'cw', 'cr', 'out')
 DALTON_PROD_CHANNEL = 'Dalton 生产（订阅）'
 DEFAULT_AGY_ENUM_NAMES_FILE = Path(__file__).resolve().parent.parent / 'references' / 'agy_enum_names.json'
+DEFAULT_ANTIGRAVITY_SERIES_FILE = Path(__file__).resolve().parent.parent / 'references' / 'antigravity_series.json'
+USAGE_SOURCES_SERIES_API_VERSION = 2
+_FALLBACK_REASONING_LEVELS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
 OPENCLAW_SOURCE_KINDS = frozenset({
     'rollout-openclaw',
     'trajectory-db',
@@ -130,6 +136,7 @@ class Evidence:
         self.inventory = {}
         self.missing_sources = {}
         self.dalton_prod = None
+        self.antigravity_series = None
 
     def issue(self, code, detail=''):
         self.issues[code] += 1
@@ -451,7 +458,9 @@ def scan_agy(e):
             # A conversation store created but never initialised has no tables; skip it, do not fail the whole scan.
             if not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='steps'").fetchone():
                 e.issue('agy_db_no_steps_table', conv); continue
-            models=__import__('usage_v3').agy_models(c, e)
+            v3 = __import__('usage_v3')
+            models = v3.agy_models(c, e)
+            efforts = v3.agy_model_efforts(c)
             for idx, raw in c.execute('SELECT idx,metadata FROM steps WHERE metadata IS NOT NULL'):
                 try:
                     d = wire(raw)
@@ -467,8 +476,16 @@ def scan_agy(e):
                     if (thinking or response_out) and usage[3] != thinking + response_out:
                         e.issue('agy_output_partition_mismatch', conv)
                     names=models.get(model_enum,set()); model=next(iter(names)) if len(names)==1 else 'agy-enum-%s'%model_enum
-                    e.put('agy', mid, ts, 'antigravity-cli-gateway', model, 'agy-cli(含网关)', usage,
-                          conversation=conv, step=idx, enum=model_enum, thinking=thinking, unit='model-response', model_basis='gen-metadata' if len(names)==1 else 'enum', time_basis='completion')
+                    enum_effs=efforts.get(model_enum,set())
+                    effort=next(iter(enum_effs)) if len(names)==1 and len(enum_effs)==1 else None
+                    meta_kwargs = dict(
+                        conversation=conv, step=idx, enum=model_enum, thinking=thinking,
+                        unit='model-response', model_basis='gen-metadata' if len(names)==1 else 'enum',
+                        time_basis='completion',
+                    )
+                    if effort:
+                        meta_kwargs['effort'] = effort
+                    e.put('agy', mid, ts, 'antigravity-cli-gateway', model, 'agy-cli(含网关)', usage, **meta_kwargs)
                 except (ValueError, TypeError, UnicodeError) as error:
                     e.issue('agy_schema_error', '%s:%s %s' % (conv, idx, error))
         finally: c.close()
@@ -612,6 +629,9 @@ def scan_dalton_prod(e, *, window_days=None, window_since=None, window_until=Non
         )
 
     totals = payload.get('totals') or {}
+    series_payload = payload.get('antigravity_series')
+    if isinstance(series_payload, list) and series_payload:
+        e.antigravity_series = [item for item in series_payload if isinstance(item, dict)]
     e.dalton_prod = {
         'ok': True,
         'error': None,
@@ -659,6 +679,147 @@ def summed(rows):
 VARIANT_SUFFIXES = frozenset({'-b', '-d'})
 
 
+def load_antigravity_series_module():
+    """Load the zero-dependency ``antigravity_series`` module from skill scripts or repo ``src/``."""
+    cached = sys.modules.get('antigravity_series')
+    if cached is not None and hasattr(cached, 'parse_antigravity_series'):
+        return cached
+    local_mod = Path(__file__).resolve().with_name('antigravity_series.py')
+    candidates = [local_mod]
+    for parent in Path(__file__).resolve().parents:
+        candidates.append(parent / 'src' / 'dalton' / 'llm' / 'antigravity_series.py')
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        spec = importlib.util.spec_from_file_location('antigravity_series', candidate)
+        if spec is None or spec.loader is None:
+            continue
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules['antigravity_series'] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    return None
+
+
+def _deep_merge_overlay_dict(target, patch):
+    for k, v in patch.items():
+        if isinstance(v, dict) and isinstance(target.get(k), dict):
+            _deep_merge_overlay_dict(target[k], v)
+        else:
+            target[k] = copy.deepcopy(v)
+
+
+def build_antigravity_series_from_overlays(overlay_paths, *, dalton_yaml_path=None, ag_mod=None):
+    """Build the Antigravity series catalog from overlay JSON files, matching backend ``overlay.py``.
+
+    Merges ``models`` and ``model_overrides`` in order, then drops top-level ``retired``
+    entries across all overlays before calling ``build_antigravity_series_catalog``.
+    """
+    mod = ag_mod if ag_mod is not None else load_antigravity_series_module()
+    if mod is None or not hasattr(mod, 'build_antigravity_series_catalog'):
+        return []
+    merged_models = {}
+    retired_keys = []
+    for ov_path in overlay_paths:
+        p = Path(ov_path)
+        if not p.is_file():
+            continue
+        try:
+            raw = json.loads(p.read_text(encoding='utf-8'))
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        for key, entry in (raw.get('models') or {}).items():
+            if key not in merged_models and isinstance(entry, dict):
+                merged_models[key] = copy.deepcopy(entry)
+        for key, patch in (raw.get('model_overrides') or {}).items():
+            if isinstance(patch, dict) and isinstance(merged_models.get(key), dict):
+                _deep_merge_overlay_dict(merged_models[key], patch)
+        for item in raw.get('retired') or []:
+            if isinstance(item, dict):
+                rkey = str(item.get('key') or '').strip()
+                if rkey:
+                    retired_keys.append(rkey)
+            elif isinstance(item, str) and item.strip():
+                retired_keys.append(item.strip())
+    for rkey in retired_keys:
+        merged_models.pop(rkey, None)
+    yaml_path = Path(dalton_yaml_path) if dalton_yaml_path is not None else None
+    return mod.build_antigravity_series_catalog(
+        merged_models,
+        dalton_yaml_path=yaml_path if (yaml_path and yaml_path.is_file()) else None,
+    )
+
+
+def _build_antigravity_series_from_repo_overlays(ag_mod=None):
+    repo_root = None
+    for parent in Path(__file__).resolve().parents:
+        if (parent / 'src' / 'dalton' / 'llm' / 'native_overlay.json').is_file():
+            repo_root = parent
+            break
+    if repo_root is None:
+        return []
+    return build_antigravity_series_from_overlays(
+        (
+            repo_root / 'src' / 'dalton' / 'llm' / 'native_overlay.json',
+            repo_root / 'var' / 'dalton' / 'catalog' / 'native_sync_overlay.json',
+        ),
+        dalton_yaml_path=repo_root / 'src' / 'dalton' / 'dalton.yaml',
+        ag_mod=ag_mod,
+    )
+
+
+def load_antigravity_series_catalog(path=None):
+    """Load the Antigravity series catalog from synced JSON or repo overlays."""
+    raw_path = path or (os.environ.get('DALTON_ANTIGRAVITY_SERIES_FILE') or '').strip()
+    target = Path(raw_path).expanduser() if raw_path else DEFAULT_ANTIGRAVITY_SERIES_FILE
+    if target.is_file():
+        data = json.loads(target.read_text(encoding='utf-8'))
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict) and isinstance(data.get('antigravity_series'), list):
+            return [item for item in data['antigravity_series'] if isinstance(item, dict)]
+        raise ValueError('antigravity_series.json must contain a JSON list or {"antigravity_series": [...]}')
+    return _build_antigravity_series_from_repo_overlays()
+
+
+def _parse_antigravity_key(key):
+    mod = load_antigravity_series_module()
+    if mod is not None and hasattr(mod, 'parse_antigravity_series'):
+        return mod.parse_antigravity_series(key)
+    if not isinstance(key, str) or not key.endswith('-oauth'):
+        return None
+    stem = key[:-len('-oauth')]
+    if not stem:
+        return None
+    for effort in _FALLBACK_REASONING_LEVELS:
+        suffix = f'-{effort}'
+        if stem.endswith(suffix) and len(stem) > len(suffix):
+            return stem[:-len(suffix)], effort
+    return stem, None
+
+
+def extract_antigravity_effort(model_name):
+    """Extract a standard reasoning effort suffix from an Antigravity model name."""
+    if not isinstance(model_name, str):
+        return None
+    text = model_name.strip()
+    if not text or text.startswith('agy-enum-'):
+        return None
+    candidate = text if text.endswith('-oauth') else f'{text}-oauth'
+    parsed = _parse_antigravity_key(candidate)
+    if parsed is not None and parsed[1] is not None:
+        return parsed[1]
+    stem = text[:-len('-oauth')] if text.endswith('-oauth') else text
+    for vsuf in VARIANT_SUFFIXES:
+        if stem.endswith(vsuf) and len(stem) > len(vsuf):
+            parsed2 = _parse_antigravity_key(f'{stem[:-len(vsuf)]}-oauth')
+            if parsed2 is not None and parsed2[1] is not None:
+                return parsed2[1]
+    return None
+
+
 def base_model(m):
     if isinstance(m,str) and m.startswith(('gemini-','claude-','gpt-oss-')):
         for suffix in ('-low','-medium','-high','-xhigh','-max'):
@@ -696,15 +857,20 @@ def reconcile(e):
             e.stats['claude_gateway_message_reconciled']+=len(partial)
             if summed(partial)==tuple(g['v']):
                 active[g['id']]['meta']['billing_parts']=[list(r['v']) for r in partial]
-    enum_models=collections.defaultdict(set); used_agy=set(); mapped_gw={}
+    enum_models=collections.defaultdict(set); enum_efforts=collections.defaultdict(set); used_agy=set(); mapped_gw={}; pending_gw_efforts={}
     for rows in agy.values():
         for r in rows:
             if not r['model'].startswith('agy-enum-'):
+                if not r['meta'].get('effort'):
+                    eff = extract_antigravity_effort(r['model'])
+                    if eff:
+                        r['meta']['effort'] = eff
                 norm = normalize_variant_model(r['model'])
                 if norm != r['model']:
                     r['model'] = norm
                     e.stats['agy_variant_label_merged'] += 1
                 enum_models[r['meta']['enum']].add(r['model'])
+                enum_efforts[r['meta']['enum']].add(r['meta'].get('effort'))
     for g in gateways:
         if g['provider']!='antigravity-cli-gateway': continue
         lo,hi = g['meta'].get('start'),g['ts']; candidates=[]
@@ -721,9 +887,14 @@ def reconcile(e):
             mapped_gw[g['id']]=subset
             g['meta']['replaced_by']=[r['id'] for r in subset]
             e.stats['agy_gateway_reconciled']+=1
+            gw_effort = extract_antigravity_effort(g['model'])
+            gw_base = normalize_variant_model(g['model'])
             for r in subset:
                 active[r['id']]['source']='openclaw'
-                if r['model'].startswith('agy-enum-'):enum_models[r['meta']['enum']].add(normalize_variant_model(g['model']))
+                if gw_effort and not active[r['id']]['meta'].get('effort'):
+                    pending_gw_efforts[r['id']] = (gw_base, gw_effort)
+                if r['model'].startswith('agy-enum-'):
+                    enum_models[r['meta']['enum']].add(gw_base)
         else:
             # A gateway request whose DB evidence overlaps in time but cannot be
             # reconciled must not be added on top of those DB observations.
@@ -738,13 +909,32 @@ def reconcile(e):
             enum_raw=r['meta'].get('enum')
             enum_key=str(enum_raw if enum_raw is not None else r['model'][len('agy-enum-'):])
             models=enum_models.get(enum_raw,set())
-            if len(models)==1: r['model']=normalize_variant_model(next(iter(models)))
+            if len(models)==1:
+                r['model']=normalize_variant_model(next(iter(models)))
+                if not r['meta'].get('effort'):
+                    effs=enum_efforts.get(enum_raw,set())
+                    if len(effs)==1:
+                        only_eff=next(iter(effs))
+                        if only_eff:
+                            r['meta']['effort']=only_eff
             elif enum_names.get(enum_key):
                 r['model']=normalize_variant_model(enum_names[enum_key])
                 r['meta']['model_basis']='agy-enum-names'
                 e.stats['agy_enum_map_resolved']+=1
             else: e.issue('agy_model_unresolved',r['model'])
-        elif r['kind']=='gateway': r['model']=normalize_variant_model(r['model'])
+        elif r['kind']=='gateway':
+            if r['provider'] == 'antigravity-cli-gateway' and not r['meta'].get('effort'):
+                eff = extract_antigravity_effort(r['model'])
+                if eff:
+                    r['meta']['effort'] = eff
+            r['model']=normalize_variant_model(r['model'])
+    # Copy gateway effort only after final model/series is resolved; never copy across conflicting or unknown series.
+    for rid, (gw_base, gw_effort) in pending_gw_efforts.items():
+        r = active.get(rid)
+        if r is None or r['meta'].get('effort') or r['model'].startswith('agy-enum-'):
+            continue
+        if normalize_variant_model(r['model']) == gw_base:
+            r['meta']['effort'] = gw_effort
     # Gateway response UUID embeds the logged short request UUID. Match identity
     # plus completion-time neighborhood; never match token sizes alone.
     message_covered=set()
