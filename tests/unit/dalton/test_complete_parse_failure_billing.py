@@ -3961,6 +3961,19 @@ async def test_fallback_validation_error_without_usage_stays_unknown_and_blocks_
     assert assist_mod._is_safe_to_fallback(res) is False
 
 
+def test_validation_error_echoing_http_400_text_is_not_classified_unbilled() -> None:
+    """A pydantic ValidationError repeats the offending response value in its message; text such
+    as "HTTP 400" inside that value must not make a possibly billed call count as unbilled."""
+    from pydantic import ValidationError
+
+    try:
+        _VerdictSchema.model_validate({"verdict": ["HTTP 400 status_code=400 error code: 400"]})
+    except ValidationError as ve:
+        err = ve
+    assert "http 400" in str(err).lower()
+    assert api_call_mod._is_unbilled_sdk_error(err) is False
+
+
 def test_api_call_billing_additions_all_have_dalton_hook_within_25_lines() -> None:
     """Round 5 Item 3 (Codex Medium):
     Every billing-added region in upstream `src/llms/api_call.py` (including `_track_upstream_call`

@@ -1,5 +1,6 @@
 from typing import Any, Callable, Dict, Optional, Type, Union, Tuple
 from pydantic import BaseModel
+from pydantic import ValidationError as PydanticValidationError
 import asyncio
 import contextlib
 # DALTON-HOOK(workspace-dedup): ContextVar for redacting raw parse errors in debug logs during dedup calls.
@@ -347,6 +348,10 @@ def _is_unbilled_sdk_error(exc: BaseException) -> bool:
     cls_name = exc.__class__.__name__
     if cls_name in ("MissingProviderKeyError", "ProviderDisabledError", "ValueError"):
         return True
+    # DALTON-HOOK(complete-parse-failure-billing): a pydantic ValidationError echoes response field
+    # values in its text, so it never matches the text markers below and stays unknown usage.
+    if isinstance(exc, PydanticValidationError):
+        return False
     # DALTON-HOOK(complete-parse-failure-billing): match pre-send/billing/4xx text markers when no status_code is set.
     msg_lower = str(exc).lower()
     if any(
