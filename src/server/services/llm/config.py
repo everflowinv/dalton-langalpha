@@ -682,6 +682,14 @@ async def resolve_llm_config(
     metadata): nobody would see the ``model_removed`` CTA, so its own saved
     model is read like a role and nothing is scrubbed.
     """
+    # DALTON-HOOK(background-effort-low): a call that runs the Background model slot
+    # (slot "background", no model named: titles, memo metadata, insights) and names no
+    # level runs at low, whatever the model's own or the account's default (user
+    # decision 2026-11-21). A caller that names its model (Dalton assist: number audit,
+    # language review, dedup) or a level keeps its own; a model without "low" is clamped
+    # down to its lowest level where the client is built.
+    if slot == "background" and request_model is None and reasoning_effort is None:
+        reasoning_effort = "low"
     reads: asyncio.Task | None = None
     try:
         # Free with nothing configured. Own keys the policy denies are not
