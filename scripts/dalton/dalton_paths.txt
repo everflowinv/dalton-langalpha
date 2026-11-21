@@ -528,3 +528,4 @@ web/src/hooks/__tests__/useOnboardingRoute.dalton.test.tsx
 web/src/pages/Setup/answers/__tests__/daltonSetup.test.ts
 web/src/pages/Setup/answers/daltonTeamModelsCheck.ts
 web/src/pages/Setup/answers/useTeamModelsAvailable.ts
+web/src/pages/Setup/answers/__tests__/daltonTeamModelsCheck.test.ts
