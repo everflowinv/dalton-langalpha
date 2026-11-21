@@ -96,6 +96,10 @@ class LLMService:
             )
             llm = resolved_config.llm_client
             effective_model = slot_model(resolved_config.llm, slot)
+            if llm is None:
+                # No BYOK / OAuth configured and no reasoning override — fall
+                # back to a platform-keyed client on the resolved model name.
+                llm = create_llm(effective_model, reasoning_effort=reasoning_effort)
             if resolved_config.credential_source not in (
                 CredentialSource.OAUTH,
                 CredentialSource.BYOK,
@@ -109,10 +113,6 @@ class LLMService:
                         "credential_source": str(resolved_config.credential_source),
                     },
                 )
-            if llm is None:
-                # No BYOK / OAuth configured and no reasoning override — fall
-                # back to a platform-keyed client on the resolved model name.
-                llm = create_llm(effective_model, reasoning_effort=reasoning_effort)
 
         # DALTON-HOOK(oauth-refresh-direct): this is the server-side one-shot
         # path (titles, extractions, probes via LLMService) — no resilience
