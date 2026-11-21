@@ -135,6 +135,7 @@ export function ModelsPanel() {
   // ask about the threads on the old default before it writes. ModelTierConfig
   // stays a plain controlled pair because Setup shares it, and a first-run
   // pick has no threads to ask about.
+  // DALTON-HOOK(antigravity-series): format primary/general labels with effort and background slot with pure series name
   const label = useCallback(
     (model: string) => (
       formatAntigravityVariantLabel(model, {
@@ -147,12 +148,27 @@ export function ModelsPanel() {
     ),
     [seriesCatalog, rawMetadata, customModels, t, modelMetadata],
   );
+  const backgroundLabel = useCallback(
+    (model: string) => (
+      formatAntigravityVariantLabel(model, {
+        seriesCatalog,
+        rawMetadata,
+        customModels,
+      }) ?? modelLabel(model, modelMetadata)
+    ),
+    [seriesCatalog, rawMetadata, customModels, modelMetadata],
+  );
+  // DALTON-HOOK(antigravity-series): route background slot through pure-series formatter in default-change prompts
+  const slotLabel = useCallback(
+    (model: string, slot?: ModelSlot) => (slot === 'background' ? backgroundLabel(model) : label(model)),
+    [backgroundLabel, label],
+  );
   const {
     question: defaultQuestion,
     draft: draftDefaults,
     request: requestDefault,
     clear: clearDefault,
-  } = useDefaultModelChange(label);
+  } = useDefaultModelChange(slotLabel);
 
   const [mode, setMode] = useState<ModelsMode>(readStoredMode);
   const isAdvanced = mode === 'advanced';
@@ -232,9 +248,10 @@ export function ModelsPanel() {
   // on its primary one.
   const deploymentPrimary = hookSystemDefaults?.default_model || undefined;
   const deploymentBackground = hookSystemDefaults?.background_model || deploymentPrimary;
+  // DALTON-HOOK(antigravity-series): print Auto background model without effort suffix
   const autoModels = {
     primary: deploymentPrimary && label(deploymentPrimary),
-    background: deploymentBackground && label(deploymentBackground),
+    background: deploymentBackground && backgroundLabel(deploymentBackground),
   };
   const defaultModelScope = readDefaultModelScope(prefsData);
 
@@ -406,7 +423,7 @@ export function ModelsPanel() {
         {/* Default + Background model selectors. Routing lives in its own group
             below in Advanced, so the component's own drawer stays closed. */}
         <SettingsCardBody id={SETTINGS.defaultModels.anchor}>
-          {/* DALTON-HOOK(antigravity-series): pass seriesCatalog & missingLabel to ModelTierConfig */}
+          {/* DALTON-HOOK(antigravity-series): pass seriesCatalog, missingLabel & pure-series backgroundMissingLabel to ModelTierConfig */}
           <ModelTierConfig
             models={visibleModels}
             backgroundModels={slotModels}
@@ -421,6 +438,7 @@ export function ModelsPanel() {
             rawMetadata={rawMetadata}
             customModels={customModels}
             missingLabel={label}
+            backgroundMissingLabel={backgroundLabel}
           />
           <ClaudeCodeDefaultHeld className="mt-3" />
           {defaultQuestion && <DefaultModelScopeChoice className="mt-4" {...defaultQuestion} />}

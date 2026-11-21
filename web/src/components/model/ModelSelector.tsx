@@ -11,6 +11,7 @@ import {
   buildSelectableAntigravitySeries,
   indexSelectableSeries,
   inspectSavedAntigravityModel,
+  resolveLowEffortVariantKey,
   type AntigravitySeriesCatalog,
 } from "@/lib/antigravitySeries"
 import { effortLabelFor, effortOptions } from "@/lib/modelTuning"
@@ -57,8 +58,10 @@ export interface ModelSelectorProps {
   seriesCatalog?: AntigravitySeriesCatalog
   rawMetadata?: Record<string, ModelMetadataEntry>
   customModels?: readonly CustomModelEntry[]
-  /** Hide the companion effort selector (used in Setup onboarding). */
+  /** Hide the companion effort selector (used in Setup onboarding and Background slot). */
   hideEffortPicker?: boolean
+  /** Pick the series' `low` (or lowest) variant instead of its default effort (used for Background slot). */
+  preferLowEffort?: boolean
 }
 
 export function ModelSelector({
@@ -79,11 +82,12 @@ export function ModelSelector({
   nameOf,
   allowEmpty = false,
   heldBy,
-  // DALTON-HOOK(antigravity-series): optional series catalog and hideEffortPicker props
+  // DALTON-HOOK(antigravity-series): optional series catalog, hideEffortPicker, and preferLowEffort props
   seriesCatalog,
   rawMetadata,
   customModels,
   hideEffortPicker = false,
+  preferLowEffort = false,
 }: ModelSelectorProps) {
   const { t } = useTranslation()
   const payerLabel = usePayerLabel()
@@ -148,9 +152,12 @@ export function ModelSelector({
         if (seenSeries.has(sid)) continue
         seenSeries.add(sid)
         const sel = selectableById[sid]
+        const defaultPickKey = preferLowEffort
+          ? (resolveLowEffortVariantKey(sel) ?? sel?.defaultVariantKey ?? m)
+          : (sel?.defaultVariantKey ?? m)
         const optionValue = selectedHit?.series.series_id === sid && rawModelList.includes(value)
           ? value
-          : (sel?.defaultVariantKey ?? m)
+          : defaultPickKey
         options.push({ value: optionValue, label: hit.displayName })
       }
       const lockedOptions: Array<{ value: string; label: string }> = []
@@ -175,7 +182,7 @@ export function ModelSelector({
         lockedOptions,
       }
     })
-  }, [filteredModels, disabledModels, seriesOpts, selectableById, selectedHit, value, name])
+  }, [filteredModels, disabledModels, seriesOpts, selectableById, selectedHit, value, name, preferLowEffort])
 
   const listed =
     !value ||

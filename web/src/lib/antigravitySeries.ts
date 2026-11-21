@@ -175,6 +175,18 @@ export function indexSelectableSeries(
 }
 
 /**
+ * Resolve the variant key for a fixed-low slot (e.g. Background model):
+ * prefers the `'low'` tier when selectable, otherwise falls back to the
+ * series' lowest available tier.
+ */
+export function resolveLowEffortVariantKey(
+  series: SelectableAntigravitySeries | undefined,
+): string | undefined {
+  if (!series || series.efforts.length === 0) return undefined;
+  return series.variants.low ?? series.variants[series.efforts[0]];
+}
+
+/**
  * Format an unshadowed built-in Antigravity variant as `"Series"` or
  * `"Series · Effort"`; returns `null` when the key is not an unshadowed
  * built-in Antigravity variant.

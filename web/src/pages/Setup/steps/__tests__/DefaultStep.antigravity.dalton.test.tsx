@@ -204,4 +204,39 @@ describe('DefaultStep Antigravity series onboarding', () => {
       background_follows: null,
     });
   });
+
+  it('picking Hydrogen in the onboarding Background dropdown saves gemini-4-hydrogen-low-oauth with no effort picker or "Low" label', async () => {
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={['/setup/default']}>
+          <Routes>
+            <Route path="/setup/default" element={<DefaultStep />} />
+            <Route path="*" element={<div />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: /Customize/i }));
+    const bgSelect = screen.getByLabelText(/Background model/i) as HTMLSelectElement;
+
+    // Switch away to Neon then pick Hydrogen so Hydrogen uses its fixed-low option value
+    await userEvent.selectOptions(bgSelect, 'gemini-4-neon-low-oauth');
+    const hydrogenOption = [...bgSelect.options].find((o) => o.textContent === 'Gemini 4 Hydrogen');
+    expect(hydrogenOption).toBeDefined();
+    expect(hydrogenOption?.value).toBe('gemini-4-hydrogen-low-oauth');
+    await userEvent.selectOptions(bgSelect, 'gemini-4-hydrogen-low-oauth');
+
+    expect(screen.queryByLabelText(/thinking effort|reasoning effort|effort/i)).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/\bLow\b/);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1));
+
+    const savedArg = (h.mutateAsync.mock.calls[0] as unknown as [{ model_preference: Record<string, unknown> }])[0];
+    expect(savedArg.model_preference).toMatchObject({
+      preferred_background_model: 'gemini-4-hydrogen-low-oauth',
+      background_follows: null,
+    });
+  });
 });

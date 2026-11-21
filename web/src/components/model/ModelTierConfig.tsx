@@ -11,8 +11,9 @@ import type { CustomModelEntry, ProviderModelsData } from "./types"
 import type { Payer } from "@/lib/modelPayer"
 import { isClaudeCodeModel } from "@/lib/claudeCode"
 import type { ModelMetadataEntry } from "@/hooks/useFilteredModels"
-// DALTON-HOOK(antigravity-series): forward seriesCatalog & missingLabel to ModelSelector slots
-import type { AntigravitySeriesCatalog } from "@/lib/antigravitySeries"
+// DALTON-HOOK(antigravity-series): forward seriesCatalog & series-only background formatting to ModelSelector slots
+import { formatAntigravityVariantLabel, type AntigravitySeriesCatalog } from "@/lib/antigravitySeries"
+import { modelLabel } from "@/lib/modelLabel"
 
 export interface ModelTierConfigProps {
   /** Available models grouped by provider */
@@ -46,6 +47,7 @@ export interface ModelTierConfigProps {
   rawMetadata?: Record<string, ModelMetadataEntry>
   customModels?: readonly CustomModelEntry[]
   missingLabel?: (value: string) => string
+  backgroundMissingLabel?: (value: string) => string
 }
 
 // ---------------------------------------------------------------------------
@@ -68,10 +70,21 @@ export function ModelTierConfig({
   rawMetadata,
   customModels,
   missingLabel,
+  backgroundMissingLabel,
 }: ModelTierConfigProps) {
   const { t } = useTranslation()
   const [explainerOpen, setExplainerOpen] = useState(true)
   const copy = useModelSlotCopy()
+  // DALTON-HOOK(antigravity-series): background slot prints pure Antigravity series name without effort suffix
+  const resolvedBackgroundMissingLabel = backgroundMissingLabel
+    ?? (seriesCatalog
+      ? (m: string) =>
+          formatAntigravityVariantLabel(m, {
+            seriesCatalog,
+            rawMetadata: rawMetadata ?? metadata,
+            customModels,
+          }) ?? missingLabel?.(m) ?? modelLabel(m, metadata)
+      : missingLabel)
   const autoLabel = (model: string | undefined) =>
     model ? t("settings.autoModel", { model }) : undefined
   const primaryAuto = autoLabel(auto?.primary)
@@ -202,11 +215,13 @@ export function ModelTierConfig({
         required={!auto}
         payers={payers}
         metadata={metadata}
-        missingLabel={missingLabel}
-        // DALTON-HOOK(antigravity-series): pass seriesCatalog, rawMetadata, and customModels to slot selectors
+        // DALTON-HOOK(antigravity-series): background slot hides effort picker, prints series name only, and picks -low (or lowest)
+        missingLabel={resolvedBackgroundMissingLabel}
         seriesCatalog={seriesCatalog}
         rawMetadata={rawMetadata}
         customModels={customModels}
+        hideEffortPicker
+        preferLowEffort
       />
 
     </div>

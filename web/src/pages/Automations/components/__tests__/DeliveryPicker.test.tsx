@@ -14,6 +14,7 @@ import AutomationInlineForm, { type FormSubmission } from '../AutomationInlineFo
 import MoreOptions from '../MoreOptions';
 
 // DALTON-HOOK(automation-model): mock useAllModels for per-automation model selector tests
+// DALTON-HOOK(antigravity-series): allow optional seriesCatalog & customModels on useAllModels mock
 const allModelsMock = vi.hoisted(() => ({
   current: {
     models: {} as Record<string, ProviderModelsData>,
@@ -24,6 +25,17 @@ const allModelsMock = vi.hoisted(() => ({
     isLoading: false,
     rawApiResponse: {} as unknown,
     isLoaded: true,
+  } as {
+    models: Record<string, ProviderModelsData>;
+    lockedModels: Record<string, ProviderModelsData>;
+    keylessModels: Set<string>;
+    metadata: Record<string, ModelMetadataEntry>;
+    payers: Record<string, 'byok' | 'oauth' | 'credits'>;
+    isLoading: boolean;
+    rawApiResponse: unknown;
+    isLoaded: boolean;
+    seriesCatalog?: import('@/lib/antigravitySeries').AntigravitySeriesCatalog;
+    customModels?: import('@/components/model/types').CustomModelEntry[];
   },
 }));
 
@@ -60,6 +72,7 @@ vi.mock('../../utils/api', async (importOriginal) => ({
 afterEach(() => {
   vi.clearAllMocks();
   // DALTON-HOOK(automation-model): reset model catalog mock between tests
+  // DALTON-HOOK(antigravity-series): reset seriesCatalog and customModels between tests
   apiKeysMock.current = { apiKeys: {} };
   providersMock.current = { statusError: false };
   allModelsMock.current = {
@@ -71,6 +84,8 @@ afterEach(() => {
     isLoading: false,
     rawApiResponse: {} as unknown,
     isLoaded: true,
+    seriesCatalog: undefined,
+    customModels: [],
   };
 });
 
@@ -891,6 +906,105 @@ describe('model selection in MoreOptions and AutomationInlineForm', () => {
     expect(submissions[0]).toMatchObject({
       kind: 'edit',
       payload: { llm_model: null },
+    });
+  });
+
+  // DALTON-HOOK(antigravity-series): MoreOptions formats saved Antigravity variants as "Series · Effort" and collapses dropdown with effort selector
+  it('displays "Gemini 4 Neon · Medium" for a fixed Antigravity automation, collapses series + effort picker, and preserves the ID on save', async () => {
+    const { buildSeriesCatalog } = await import('@/lib/antigravitySeries');
+    const neonMeta: Record<string, ModelMetadataEntry> = {
+      'gemini-4-neon-low-oauth': { display_name: 'Gemini 4 Neon (Low)', provider: 'antigravity-oauth' },
+      'gemini-4-neon-medium-oauth': { display_name: 'Gemini 4 Neon (Medium)', provider: 'antigravity-oauth' },
+      'gemini-4-neon-high-oauth': { display_name: 'Gemini 4 Neon (High)', provider: 'antigravity-oauth' },
+    };
+    const seriesCatalog = buildSeriesCatalog([
+      {
+        series_id: 'antigravity-oauth:gemini-4-neon',
+        series_prefix: 'gemini-4-neon',
+        provider: 'antigravity-oauth',
+        display_name: 'Gemini 4 Neon',
+        qualified_display_name: 'Gemini 4 Neon (Antigravity)',
+        default_effort: 'high',
+        default_model: 'gemini-4-neon-high-oauth',
+        efforts: ['low', 'medium', 'high'],
+        variants: {
+          low: 'gemini-4-neon-low-oauth',
+          medium: 'gemini-4-neon-medium-oauth',
+          high: 'gemini-4-neon-high-oauth',
+        },
+      },
+    ]);
+    allModelsMock.current = {
+      models: {
+        'antigravity-oauth': {
+          display_name: 'Google Antigravity',
+          models: [
+            'gemini-4-neon-low-oauth',
+            'gemini-4-neon-medium-oauth',
+            'gemini-4-neon-high-oauth',
+          ],
+        },
+      },
+      lockedModels: {},
+      keylessModels: new Set(),
+      metadata: neonMeta,
+      payers: {},
+      isLoading: false,
+      rawApiResponse: { model_metadata: neonMeta },
+      isLoaded: true,
+      seriesCatalog,
+      customModels: [],
+    };
+    serve();
+
+    // DALTON-HOOK(antigravity-series): assert folded summary and untouched save preserve fixed Antigravity ID
+    const savedNeon: Automation = { ...SAVED_AUTOMATION, llm_model: 'gemini-4-neon-medium-oauth' };
+    const initial = automationToFormState(savedNeon, 'America/New_York', 'home-1');
+    const submissions: FormSubmission[] = [];
+    const onSubmit = vi.fn((sub: FormSubmission) => {
+      submissions.push(sub);
+    });
+
+    renderWithProviders(
+      <AutomationInlineForm
+        initialValues={initial}
+        original={savedNeon}
+        onSubmit={onSubmit}
+        onCancel={vi.fn()}
+        loading={false}
+      />,
+    );
+
+    // Folded summary shows "Gemini 4 Neon · Medium"
+    expect(screen.getByText(/Gemini 4 Neon · Medium/)).toBeInTheDocument();
+
+    // Saving without changing the model does not alter llm_model
+    fireEvent.change(screen.getByLabelText(label('common.name')), { target: { value: 'Brief v2' } });
+    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect(submissions[0].kind).toBe('edit');
+    expect(submissions[0].payload).not.toHaveProperty('llm_model');
+
+    // DALTON-HOOK(antigravity-series): verify collapsed series dropdown + companion effort select in MoreOptions
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(label('automation.moreOptions')) }));
+    const modelSelect = screen.getByLabelText(label('automation.detailModel')) as HTMLSelectElement;
+    expect(modelSelect.value).toBe('gemini-4-neon-medium-oauth');
+    expect([...modelSelect.options].map((o) => o.textContent)).toEqual([
+      label('automation.defaultModelOption'),
+      'Gemini 4 Neon',
+    ]);
+    const effortSelect = screen.getByLabelText(
+      `${label('automation.detailModel')} ${label('chat.modelSelector.reasoningEffort')}`,
+    ) as HTMLSelectElement;
+    expect(effortSelect.value).toBe('medium');
+
+    // Switching effort writes the suffixed variant ID
+    fireEvent.change(effortSelect, { target: { value: 'high' } });
+    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(2));
+    expect(submissions[1]).toMatchObject({
+      kind: 'edit',
+      payload: { llm_model: 'gemini-4-neon-high-oauth' },
     });
   });
 });

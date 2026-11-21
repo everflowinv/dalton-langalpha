@@ -8,6 +8,7 @@ import {
   buildSeriesCatalog,
   formatAntigravityVariantLabel,
   inspectSavedAntigravityModel,
+  resolveLowEffortVariantKey,
   sameAntigravitySeries,
 } from '../antigravitySeries';
 
@@ -154,5 +155,19 @@ describe('antigravitySeries helpers', () => {
     // Neon defaults to high; high is shadowed -> steps down to medium
     expect(selectable[0].defaultEffort).toBe('medium');
     expect(selectable[0].defaultVariantKey).toBe('gemini-4-neon-medium-oauth');
+    expect(resolveLowEffortVariantKey(selectable[0])).toBe('gemini-4-neon-low-oauth');
+  });
+
+  it('resolves fixed-low variant key preferring low and falling back to lowest available tier', () => {
+    const poolWithoutLow: Record<string, ProviderModelsData> = {
+      [ANTIGRAVITY_PROVIDER]: {
+        display_name: 'Google Antigravity',
+        models: ['gemini-4-carbon-medium-oauth', 'gemini-4-carbon-high-oauth'],
+      },
+    };
+    const [carbon] = buildSelectableAntigravitySeries(catalog, poolWithoutLow, {
+      rawMetadata: RAW_METADATA,
+    });
+    expect(resolveLowEffortVariantKey(carbon)).toBe('gemini-4-carbon-medium-oauth');
   });
 });

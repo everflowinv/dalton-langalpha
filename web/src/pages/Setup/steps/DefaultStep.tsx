@@ -473,7 +473,7 @@ function DefaultForm({
                 >
                   <div className="flex flex-col gap-6 pt-4">
                     {/* DALTON-HOOK(dalton-setup): pass Dalton-filtered slot models, payers, and Auto option */}
-                    {/* DALTON-HOOK(antigravity-series): never render effort pickers on onboarding step */}
+                    {/* DALTON-HOOK(antigravity-series): never render effort pickers on onboarding step; background picks -low */}
                     <ModelSelector
                       label={copy.background.label}
                       description={copy.background.description}
@@ -489,6 +489,7 @@ function DefaultForm({
                       rawMetadata={rawMetadata}
                       customModels={customModels}
                       hideEffortPicker
+                      preferLowEffort
                     />
                     <ModelSelector
                       label={t('settings.modelTuning.fetchModel')}

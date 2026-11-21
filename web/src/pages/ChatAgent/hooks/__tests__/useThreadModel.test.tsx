@@ -1130,5 +1130,85 @@ describe('useThreadModel', () => {
       expect(mocks.updateThread).not.toHaveBeenCalled();
       expect(result.current.sendModel).toBe('gemini-4-neon-low-oauth');
     });
+
+    // DALTON-HOOK(antigravity-series): preserve loading-time pick and flush via PATCH once confirmed personal
+    it('preserves a pick made while shared workspace list is loading, flushes PATCH once confirmed personal, and uses it on the next message', async () => {
+      mocks.seriesCatalog = NEON_CATALOG;
+      mocks.rawMetadata = NEON_RAW_META;
+      mocks.catalogModelNames = new Set([
+        'gemini-4-neon-low-oauth',
+        'gemini-4-neon-medium-oauth',
+        'gemini-4-neon-high-oauth',
+      ]);
+      mocks.sharedEntry = undefined;
+      mocks.updateThread.mockResolvedValueOnce({
+        thread_id: THREAD,
+        llm_model: 'gemini-4-neon-high-oauth',
+        reasoning_effort: null,
+      });
+
+      const cached = {
+        thread_id: THREAD,
+        llm_model: 'gemini-4-neon-medium-oauth',
+        reasoning_effort: 'high',
+      } as unknown as Thread;
+      const { result, rerender, queryClient } = setup({ workspaceId: 'ws-personal' }, cached);
+
+      act(() => {
+        void result.current.pickModel('gemini-4-neon-high-oauth');
+      });
+
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+      expect(result.current.model).toBe('gemini-4-neon-high-oauth');
+      expect(result.current.sendModel).toBe('gemini-4-neon-high-oauth');
+
+      // Shared workspace list finishes loading and confirms personal workspace (null)
+      mocks.sharedEntry = null;
+      rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-personal' });
+
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledTimes(1));
+      expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, {
+        llm_model: 'gemini-4-neon-high-oauth',
+        reasoning_effort: null,
+      });
+      expect(cachedModel(queryClient)).toBe('gemini-4-neon-high-oauth');
+      expect(result.current.model).toBe('gemini-4-neon-high-oauth');
+      expect(result.current.sendModel).toBe('gemini-4-neon-high-oauth');
+    });
+
+    // DALTON-HOOK(antigravity-series): keep loading-time pick on send-with-message path once confirmed shared
+    it('keeps a loading-time pick on the send-with-message path without PATCH once confirmed shared workspace', async () => {
+      mocks.seriesCatalog = NEON_CATALOG;
+      mocks.rawMetadata = NEON_RAW_META;
+      mocks.catalogModelNames = new Set([
+        'gemini-4-neon-low-oauth',
+        'gemini-4-neon-medium-oauth',
+        'gemini-4-neon-high-oauth',
+      ]);
+      mocks.sharedEntry = undefined;
+
+      const { result, rerender } = setup(
+        { workspaceId: 'ws-shared' },
+        row('gemini-4-neon-medium-oauth'),
+      );
+
+      act(() => {
+        void result.current.pickModel('gemini-4-neon-low-oauth');
+      });
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+
+      mocks.sharedEntry = { workspace: { workspace_id: 'ws-shared' } };
+      rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-shared' });
+
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+      expect(result.current.model).toBe('gemini-4-neon-low-oauth');
+      expect(result.current.sendModel).toBe('gemini-4-neon-low-oauth');
+
+      // DALTON-HOOK(antigravity-series): turn end on confirmed shared workspace keeps sendModel on the local pick
+      rerender({ threadId: THREAD, isLoading: true, workspaceId: 'ws-shared' });
+      rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-shared' });
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+      expect(result.current.sendModel).toBe('gemini-4-neon-low-oauth');
+    });
   });
 });

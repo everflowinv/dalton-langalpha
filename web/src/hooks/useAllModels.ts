@@ -17,10 +17,12 @@ import { CLAUDE_CODE_CONNECTION, isClaudeCodeModel } from '@/lib/claudeCode';
 import { useClaudeCodeStatus } from './useClaudeCode';
 import { useAccount } from './useAccount';
 import { allows, modelRefusedBy, restrictsModels, RULE, withoutRefusedModels } from '@/lib/accountRules';
-// DALTON-HOOK(antigravity-series): build separated seriesCatalog (saved echo) & selectableSeries (current pool)
+// DALTON-HOOK(antigravity-series): build separated seriesCatalog (saved echo) & selectableSeries (current pool) in Dalton builds only
+import { isDaltonBuild } from '@/config/brand';
 import {
   buildSelectableAntigravitySeries,
   buildSeriesCatalog,
+  EMPTY_ANTIGRAVITY_SERIES_CATALOG,
   type AntigravitySeriesCatalog,
   type SelectableAntigravitySeries,
 } from '@/lib/antigravitySeries';
@@ -399,10 +401,13 @@ export function useAllModels(): UseAllModelsResult {
     )));
   }, [payers, policy, visible]);
 
-  // DALTON-HOOK(antigravity-series): separate unfiltered seriesCatalog (saved echo) from pool-filtered selectableSeries
+  // DALTON-HOOK(antigravity-series): enable series catalog & collapsing only in Dalton builds
+  const enableAntigravitySeries = isDaltonBuild;
   const seriesCatalog = useMemo(
-    () => buildSeriesCatalog(modelsData?.antigravity_series),
-    [modelsData?.antigravity_series],
+    () => (enableAntigravitySeries
+      ? buildSeriesCatalog(modelsData?.antigravity_series)
+      : EMPTY_ANTIGRAVITY_SERIES_CATALOG),
+    [enableAntigravitySeries, modelsData?.antigravity_series],
   );
   const rawMetadata = modelsData?.model_metadata ?? null;
   const selectableSeries = useMemo(
