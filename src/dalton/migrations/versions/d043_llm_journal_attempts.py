@@ -1,4 +1,4 @@
-"""Dalton d042: per-attempt LLM journal billing ledger (`dalton_llm_journal_attempts`).
+"""Dalton d043: per-attempt LLM journal billing ledger (`dalton_llm_journal_attempts`).
 
 Records each individual attempt of a `dalton_llm_journal` invocation keyed by
 `(invocation_id, attempt)` with its own `occurred_at`, `usage`, `cash_usd`,
@@ -12,8 +12,8 @@ This enables:
 - preserving unknown-usage records from earlier timed-out/stream-cut attempts
   even after a subsequent resend succeeds.
 
-Revision ID: d042
-Revises: d041
+Revision ID: d043
+Revises: d042
 Create Date: 2026-11-21
 """
 
@@ -23,8 +23,8 @@ from typing import Sequence, Union
 
 from alembic import op
 
-revision: str = "d042"
-down_revision: Union[str, None] = "d041"
+revision: str = "d043"
+down_revision: Union[str, None] = "d042"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

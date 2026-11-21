@@ -1753,13 +1753,13 @@ async def test_deployment_credential_resend_preserves_prior_usage_and_strips_cre
     assert store.attempts[(res2.invocation_id, 2)]["usage"]["input_tokens"] == 14_000
 
 
-def test_d042_migration_revision_upgrade_and_downgrade(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify Dalton migration d042 chains off d041, creates/backfills `dalton_llm_journal_attempts`,
+def test_d043_migration_revision_upgrade_and_downgrade(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify Dalton migration d043 chains off d042, creates/backfills `dalton_llm_journal_attempts`,
     and cleanly drops the table on downgrade."""
-    from src.dalton.migrations.versions import d042_llm_journal_attempts as d042
+    from src.dalton.migrations.versions import d043_llm_journal_attempts as d042
 
-    assert d042.revision == "d042"
-    assert d042.down_revision == "d041"
+    assert d042.revision == "d043"
+    assert d042.down_revision == "d042"
 
     executed_up: list[str] = []
     executed_down: list[str] = []
