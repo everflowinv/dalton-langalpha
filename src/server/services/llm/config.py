@@ -650,6 +650,22 @@ async def check_model_available(
     return is_custom or is_custom_provider
 
 
+# DALTON-HOOK(background-effort-low): "low" for a Background-slot model that declares a
+# reasoning ladder and has no level set by the user; None otherwise (model default applies).
+def background_default_effort(model_pref: dict, model: str | None) -> str | None:
+    from src.llms.llm import LLM
+    from src.llms.model_spec import canonical_reasoning_efforts, reasoning_block
+    from src.llms.preferences import resolve_tuning
+
+    if not model or resolve_tuning(model_pref, model).reasoning_effort:
+        return None
+    info = LLM.get_model_config().get_model_config(model)
+    if not info:
+        return None
+    efforts = canonical_reasoning_efforts(reasoning_block(info).get("efforts"))
+    return "low" if len(efforts) > 1 else None
+
+
 async def resolve_llm_config(
     base_config,
     user_id: str,
@@ -859,6 +875,14 @@ async def resolve_llm_config(
     # one runs a different model and a level only means something against the
     # ladder of the model that will honor it. An unsupported level degrades in
     # ``LLM.__init__``, the one place that sees both the request and the ladder.
+    # DALTON-HOOK(background-effort-low): a call that runs the Background model slot
+    # (slot "background", no model named: titles, memo metadata, insights) and names no
+    # level thinks at low instead of the model's own default (user decision 2026-11-21).
+    # A level the caller passes, or one the user set for this model or account-wide in
+    # Settings, still wins; callers that name their model (Dalton assist: number audit,
+    # language review, dedup) keep their own; models with no reasoning ladder are untouched.
+    if slot == "background" and request_model is None and reasoning_effort is None:
+        reasoning_effort = background_default_effort(model_pref, selection.effective_model)
     await resolve_clients(
         config, user_id, selection.effective_model, model_pref, roles,
         is_byok=is_byok, thread_id=thread_id,
