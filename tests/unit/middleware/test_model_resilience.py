@@ -1753,7 +1753,11 @@ class TestFallbackIdentity:
             "src.llms.llm.LLM.get_model_config",
             lambda: SimpleNamespace(
                 get_model_config=manifest.get,
-                get_provider_info=lambda route: {"sdk": "anthropic"} if route == "anthropic" else {},
+                get_provider_info=lambda route: (
+                    {"sdk": "anthropic", "reasoning_binds_prefix": True}
+                    if route == "anthropic"
+                    else {}
+                ),
             ),
         )
 
