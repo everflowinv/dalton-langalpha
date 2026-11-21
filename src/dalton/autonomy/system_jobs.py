@@ -442,6 +442,9 @@ async def _build_company_job_entry(
     *,
     allow_registry_fallback: bool = False,
     viewer_user_id: str | None = None,
+    owner_rows_by_uid: dict[str, list[dict[str, Any]]] | None = None,
+    fetched_foreign_owners: set[str] | None = None,
+    deferred_summaries: list[tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]] | None = None,
 ) -> dict[str, Any] | None:
     """Build a ``company`` scope system job entry by reusing ``tracking.get_tracking_status``."""
     from src.dalton.autonomy.tracking import resolve_workspace_tracking_owner
@@ -519,11 +522,22 @@ async def _build_company_job_entry(
         return {"_units_unavailable": True} if identity_unavailable else None
     mapped_status = _TRACKING_STATUS_TO_JOB_STATUS.get(raw_status, "partial")
 
-    owner_rows = (
-        automation_rows
-        if task_owner == str(user_id or "").strip()
-        else await list_all_user_automations(task_owner, name_prefix="dalton-")
-    )
+    caller_uid = str(user_id or "").strip()
+    defer_summary = False
+    if task_owner == caller_uid:
+        owner_rows = automation_rows
+    elif owner_rows_by_uid is not None and task_owner in owner_rows_by_uid:
+        owner_rows = owner_rows_by_uid[task_owner]
+        defer_summary = deferred_summaries is not None and (
+            fetched_foreign_owners is not None and task_owner in fetched_foreign_owners
+        )
+    else:
+        owner_rows = await list_all_user_automations(task_owner, name_prefix="dalton-")
+        if owner_rows_by_uid is not None:
+            owner_rows_by_uid[task_owner] = owner_rows
+        if fetched_foreign_owners is not None:
+            fetched_foreign_owners.add(task_owner)
+            defer_summary = deferred_summaries is not None
     prefix = f"dalton-{ticker.lower()}-"
     company_rows = [
         r
@@ -532,20 +546,29 @@ async def _build_company_job_entry(
         and str(r.get("name") or "").strip().lower().startswith(prefix)
         and (not r.get("workspace_id") or str(r.get("workspace_id")) == str(workspace_id))
     ]
+    if task_owner != caller_uid and not defer_summary and company_rows:
+        from src.dalton.services.execution_delivery_status import (
+            enrich_automations_with_delivery_summary,
+        )
+
+        await enrich_automations_with_delivery_summary(company_rows)
     can_manage = (
         is_pm_user(caller_id) or caller_id == task_owner
         if active_unit is not None
         else True
     )
-    last_run_at, last_result, next_run_at = _summarize_company_runs(company_rows)
-    if next_run_at is None:
-        task_nexts = [
-            str(t["next_run_at"])
-            for t in (tracking.get("tasks") or [])
-            if isinstance(t, dict) and t.get("status") == "active" and t.get("next_run_at")
-        ]
-        if task_nexts:
-            next_run_at = min(task_nexts)
+    if defer_summary:
+        last_run_at, last_result, next_run_at = None, None, None
+    else:
+        last_run_at, last_result, next_run_at = _summarize_company_runs(company_rows)
+        if next_run_at is None:
+            task_nexts = [
+                str(t["next_run_at"])
+                for t in (tracking.get("tasks") or [])
+                if isinstance(t, dict) and t.get("status") == "active" and t.get("next_run_at")
+            ]
+            if task_nexts:
+                next_run_at = min(task_nexts)
 
     entry: dict[str, Any] = {
         "key": f"company:{ticker}",
@@ -572,6 +595,8 @@ async def _build_company_job_entry(
         "active_tasks": tracking.get("active_tasks") or [],
         "tasks": tracking.get("tasks") or [],
     }
+    if defer_summary and deferred_summaries is not None:
+        deferred_summaries.append((entry, company_rows, tracking))
     if identity_unavailable or tracking.get("identity_unavailable"):
         entry["_units_unavailable"] = True
     return entry
@@ -818,6 +843,13 @@ def _summarize_data_task_run(
     failure_reason = str(run_row.get("failure_reason") or "").strip()
     exit_code = run_row.get("exit_code")
     if st == "succeeded":
+        from src.dalton.services.execution_delivery_status import (
+            format_execution_delivery_note,
+        )
+
+        delivery_note = format_execution_delivery_note(run_row, lang="zh")
+        if delivery_note:
+            return ts_str, delivery_note, st
         return ts_str, "成功", st
     if st == "queued":
         return ts_str, "排队中", st
@@ -1025,6 +1057,7 @@ async def _fetch_data_system_jobs() -> list[dict[str, Any]]:
                     """
                     SELECT DISTINCT ON (job_key)
                         run_id, job_key, status, exit_code, failure_reason,
+                        notify_status,
                         scheduled_slot_utc, started_at, completed_at, created_at
                     FROM dalton_data_task_runs
                     ORDER BY job_key, COALESCE(completed_at, started_at, created_at) DESC
@@ -1034,6 +1067,15 @@ async def _fetch_data_system_jobs() -> list[dict[str, Any]]:
                 for r_row in run_rows or []:
                     if isinstance(r_row, Mapping) and r_row.get("job_key"):
                         runs_by_key[str(r_row["job_key"])] = dict(r_row)
+
+            if runs_by_key:
+                from src.dalton.services.execution_delivery_status import (
+                    enrich_executions_with_delivery_summary,
+                )
+
+                await enrich_executions_with_delivery_summary(
+                    list(runs_by_key.values()), conn=conn
+                )
 
             pm_routes_by_key = await _read_pm_data_notify_routes_map(conn=conn)
     except Exception as exc:
@@ -1118,6 +1160,7 @@ async def _fetch_single_data_system_job(
                 """
                 SELECT
                     run_id, job_key, status, exit_code, failure_reason,
+                    notify_status,
                     scheduled_slot_utc, started_at, completed_at, created_at
                 FROM dalton_data_task_runs
                 WHERE job_key = %s
@@ -1129,6 +1172,11 @@ async def _fetch_single_data_system_job(
             fetched_run = await cur.fetchone()
             if isinstance(fetched_run, Mapping):
                 latest_run = dict(fetched_run)
+                from src.dalton.services.execution_delivery_status import (
+                    enrich_executions_with_delivery_summary,
+                )
+
+                await enrich_executions_with_delivery_summary([latest_run], conn=c)
 
         if pm_routes is None:
             row_routes = _data_task_routes_for_read(def_row, None)
@@ -1748,6 +1796,12 @@ async def list_system_jobs(user_id: str) -> dict[str, Any]:
             if r_name not in by_name:
                 by_name[r_name] = r
 
+    owner_rows_by_uid: dict[str, list[dict[str, Any]]] = {uid: rows}
+    fetched_foreign_owners: set[str] = set()
+    deferred_company_summaries: list[
+        tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]
+    ] = []
+
     company_ws_ids = await _discover_company_workspaces(uid, rows)
     company_jobs: list[dict[str, Any]] = []
     seen_tickers: set[str] = set()
@@ -1759,6 +1813,9 @@ async def list_system_jobs(user_id: str) -> dict[str, Any]:
             rows,
             allow_registry_fallback=True,
             viewer_user_id=uid,
+            owner_rows_by_uid=owner_rows_by_uid,
+            fetched_foreign_owners=fetched_foreign_owners,
+            deferred_summaries=deferred_company_summaries,
         )
         if not entry:
             continue
@@ -1793,7 +1850,7 @@ async def list_system_jobs(user_id: str) -> dict[str, Any]:
         units_unavailable = True
     if sector_unavailable:
         units_unavailable = True
-    sector_jobs: list[dict[str, Any]] = []
+    pending_sector_items: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
     for s_unit in sector_units:
         s_ws = str(s_unit.get("workspace_id") or "").strip()
         if not s_ws:
@@ -1829,12 +1886,40 @@ async def list_system_jobs(user_id: str) -> dict[str, Any]:
             continue
         if str(s_tracking.get("subject_kind") or "") != "sector":
             continue
-        s_owner_rows = (
-            rows
-            if s_owner == uid
-            else await list_all_user_automations(s_owner, name_prefix="dalton-")
+        if s_owner not in owner_rows_by_uid:
+            owner_rows_by_uid[s_owner] = await list_all_user_automations(
+                s_owner, name_prefix="dalton-"
+            )
+            fetched_foreign_owners.add(s_owner)
+        pending_sector_items.append((s_unit, s_owner, s_tracking))
+
+    if fetched_foreign_owners:
+        foreign_rows: list[dict[str, Any]] = []
+        for owner_uid in sorted(fetched_foreign_owners):
+            foreign_rows.extend(owner_rows_by_uid.get(owner_uid, []))
+        if foreign_rows:
+            await enrich_automations_with_delivery_summary(foreign_rows)
+
+    for entry, company_rows, tracking in deferred_company_summaries:
+        last_run_at, last_result, next_run_at = _summarize_company_runs(company_rows)
+        if next_run_at is None:
+            task_nexts = [
+                str(t["next_run_at"])
+                for t in (tracking.get("tasks") or [])
+                if isinstance(t, dict) and t.get("status") == "active" and t.get("next_run_at")
+            ]
+            if task_nexts:
+                next_run_at = min(task_nexts)
+        entry["last_run_at"] = last_run_at
+        entry["last_result"] = last_result
+        entry["next_run_at"] = next_run_at
+
+    sector_jobs: list[dict[str, Any]] = [
+        _build_sector_job_entry(
+            uid, s_unit, owner_rows_by_uid.get(s_owner, []), s_tracking
         )
-        sector_jobs.append(_build_sector_job_entry(uid, s_unit, s_owner_rows, s_tracking))
+        for s_unit, s_owner, s_tracking in pending_sector_items
+    ]
 
     ops_jobs = await _fetch_ops_jobs()
 
@@ -2606,6 +2691,11 @@ async def toggle_system_job(
                 viewer_user_id=effective_viewer,
             )
     rows_after = await list_all_user_automations(uid, name_prefix="dalton-")
+    from src.dalton.services.execution_delivery_status import (
+        enrich_automations_with_delivery_summary,
+    )
+
+    await enrich_automations_with_delivery_summary(rows_after)
     entry = await _build_company_job_entry(
         uid,
         ws_id,

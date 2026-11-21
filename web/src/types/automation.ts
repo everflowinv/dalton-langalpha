@@ -67,6 +67,8 @@ export interface DeliveryAttempt {
   name?: string | null;
   via?: DeliveryVia | null;
   error?: string | null;
+  // DALTON-HOOK(execution-delivery-status): persisted sender retry decision for failed attempts
+  retrying?: boolean | null;
 }
 
 // DALTON-HOOK(execution-delivery-status): structured delivery summary attached by backend

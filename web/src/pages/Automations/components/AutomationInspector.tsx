@@ -1,7 +1,7 @@
 // DALTON-HOOK(company-automations): company inspector adds rollback, history, and recycle actions.
 import React, { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AlertCircle, ArrowUpRight, EyeOff, Pause, Pencil, Play, RotateCcw, Trash2, Undo2, Zap } from 'lucide-react';
+import { AlertCircle, ArrowUpRight, Clock, EyeOff, Pause, Pencil, Play, RotateCcw, Trash2, Undo2, Zap } from 'lucide-react'; // DALTON-HOOK(execution-delivery-status)
 import { HeaderButton, ListSkeleton } from '@/components/mcp/McpPrimitives';
 import { useLocale } from '@/hooks/useLocale';
 import { useModelName } from '@/hooks/useModelName';
@@ -25,7 +25,10 @@ import {
   deliveryEntryName,
   deliveryMethodName,
   deliveryNames,
-  formatDeliveryFailureReason, // DALTON-HOOK(execution-delivery-status)
+  deliveryOutcome, // DALTON-HOOK(execution-delivery-status)
+  deliveryTargetName,
+  formatDeliveryFailureReason,
+  matchAttemptForTarget,
 } from '../utils/delivery';
 import { distanceLabel } from '../utils/price';
 import { scheduleSentence } from '../utils/schedule';
@@ -122,18 +125,31 @@ export default function AutomationInspector({
       ? { id: a.automation_id, expectedConfigVersion }
       : a.automation_id;
   const last = a.last_execution;
-  // The opened run is looked for on the list row and in the history this
-  // pane loads. There is no reading one run by its id, so one older than
+  // DALTON-HOOK(execution-delivery-status): prefer the polled execution record by id so detail card and history table share the freshest state
+  const polledForLast = last
+    ? executions.find((e) => e.automation_execution_id === last.automation_execution_id) ?? null
+    : null;
+  const latestRun = polledForLast
+    ? {
+        ...last,
+        ...polledForLast,
+        dismissed_at: polledForLast.dismissed_at ?? last?.dismissed_at ?? null,
+      }
+    : last;
+  // The opened run is looked for in the polled history first, then on the
+  // list row. There is no reading one run by its id, so one older than
   // that history is not fetched: the newest stands in, and says so.
   const opened = runId
-    ? runId === last?.automation_execution_id
-      ? last
-      : executions.find((e) => e.automation_execution_id === runId) ?? null
+    ? executions.find((e) => e.automation_execution_id === runId) ??
+      (runId === last?.automation_execution_id ? last : null)
     : null;
   const placing = !!runId && !opened && loading;
   const runMissing = !!runId && !opened && !loading;
-  const shownRun = opened ?? last;
-  const isLatest = shownRun === last;
+  const shownRun = opened ?? latestRun;
+  const isLatest =
+    shownRun != null &&
+    latestRun != null &&
+    shownRun.automation_execution_id === latestRun.automation_execution_id;
 
   // A run opened from the history below brings its report into view.
   const reportRef = useRef<HTMLElement>(null);
@@ -439,22 +455,50 @@ function RunHistory({
             // Only a failure's label takes the glyph's color: amber marks
             // liveness on the glyph and never tints words.
             const attempts = e.delivery_result ?? [];
-            // DALTON-HOOK(execution-delivery-status): localize attempt errors and fall back to delivery_summary when delivery_result is absent
-            const attemptErrors = attempts.flatMap((d) => {
-              if (d.success || !d.error) return [];
-              const localized = formatDeliveryFailureReason(null, d.error, t) ?? d.error;
-              return [t('automation.deliveryNamedProblem', { name: deliveryAttemptName(d, t, names), message: localized })];
-            });
-            const summaryError =
-              attemptErrors.length === 0 &&
-              deliverySummary &&
-              (deliverySummary.status === 'failed' || deliverySummary.status === 'partial_failed')
-                ? formatDeliveryFailureReason(deliverySummary.failure_code, deliverySummary.failure_reason, t)
+            // DALTON-HOOK(execution-delivery-status): prefer authoritative delivery_summary targets & failure reasons over raw delivery_result
+            const explicitSummary = e.delivery_summary ?? null;
+            const summaryTargets = explicitSummary?.targets ?? [];
+            const useSummaryTargets = explicitSummary != null && summaryTargets.length > 0;
+            const targetErrors = useSummaryTargets
+              ? summaryTargets.flatMap((tgt) => {
+                  if (tgt.status !== 'failed') return [];
+                  const matched = matchAttemptForTarget(tgt, attempts);
+                  const reason = formatDeliveryFailureReason(tgt.error_code, tgt.error_message, t) ?? tgt.error_message;
+                  if (!reason) return [];
+                  return [
+                    t('automation.deliveryNamedProblem', {
+                      name: deliveryTargetName(tgt, t, names, matched),
+                      message: reason,
+                    }),
+                  ];
+                })
+              : explicitSummary != null
+                ? explicitSummary.status === 'failed' || explicitSummary.status === 'partial_failed'
+                  ? (() => {
+                      const reason = formatDeliveryFailureReason(
+                        explicitSummary.failure_code,
+                        explicitSummary.failure_reason,
+                        t,
+                      );
+                      return reason ? [reason] : [];
+                    })()
+                  : []
+                : attempts.flatMap((d) => {
+                    if (deliveryOutcome(d) !== 'failed' || !d.error) return [];
+                    const localized = formatDeliveryFailureReason(null, d.error, t) ?? d.error;
+                    return [t('automation.deliveryNamedProblem', { name: deliveryAttemptName(d, t, names), message: localized })];
+                  });
+            // DALTON-HOOK(execution-delivery-status): fall back to top-level summary error when target rows lack specific reasons
+            const summaryFallbackError =
+              useSummaryTargets &&
+              targetErrors.length === 0 &&
+              (explicitSummary.status === 'failed' || explicitSummary.status === 'partial_failed')
+                ? formatDeliveryFailureReason(explicitSummary.failure_code, explicitSummary.failure_reason, t)
                 : null;
             const errors = [
               ...(ui.danger && e.error_message ? [e.error_message] : []),
-              ...attemptErrors,
-              ...(summaryError ? [summaryError] : []),
+              ...targetErrors,
+              ...(summaryFallbackError ? [summaryFallbackError] : []),
             ];
             const deliverySummaryLabelKey =
               deliverySummary?.status === 'failed'
@@ -489,25 +533,70 @@ function RunHistory({
                   </td>
                   <td className="automation-mono">{showDuration ? formatDuration(e.started_at, e.completed_at, t) : ''}</td>
                   <td className="automation-history-delivery">
-                    {/* DALTON-HOOK(execution-delivery-status): render delivery_summary status when delivery_result is absent */}
-                    {attempts.length > 0
-                      ? attempts.map((d, i) => (
-                          <span key={`${d.method}|${d.address ?? ''}|${i}`} className="automation-history-attempt">
-                            {!d.success && (
-                              <AlertCircle className="h-3 w-3 shrink-0" style={{ color: 'var(--color-icon-danger)' }} aria-label={t('automation.runFailed')} />
+                    {/* DALTON-HOOK(execution-delivery-status): render per-target delivery_summary status when available */}
+                    {useSummaryTargets
+                      ? summaryTargets.map((tgt, i) => {
+                          const matched = matchAttemptForTarget(tgt, attempts);
+                          const displayName = deliveryTargetName(tgt, t, names, matched);
+                          const labelText =
+                            tgt.status === 'sent'
+                              ? matched && matched.success
+                                ? isLegacyAttempt(matched)
+                                  ? deliveryMethodName(matched.method, t)
+                                  : deliveryAttemptLabel(matched, t, names)
+                                : t('automation.deliveredVia', { method: displayName })
+                              : tgt.status === 'retrying'
+                                ? t('automation.deliveryRetryingVia', { method: displayName })
+                                : t('automation.deliveryFailedVia', { method: displayName });
+                          return (
+                            <span key={`${tgt.channel ?? ''}|${tgt.target ?? ''}|${i}`} className="automation-history-attempt">
+                              {tgt.status === 'failed' && (
+                                <AlertCircle className="h-3 w-3 shrink-0" style={{ color: 'var(--color-icon-danger)' }} aria-label={t('automation.runFailed')} />
+                              )}
+                              {tgt.status === 'retrying' && (
+                                <Clock className="h-3 w-3 shrink-0" style={{ color: 'var(--color-accent-primary)' }} aria-label={t('automation.deliveryStatusRetrying')} />
+                              )}
+                              {labelText}
+                            </span>
+                          );
+                        })
+                      : explicitSummary != null
+                        ? deliverySummaryLabelKey && (
+                            <span className="automation-history-attempt">
+                              {(explicitSummary.status === 'failed' || explicitSummary.status === 'partial_failed') && (
+                                <AlertCircle className="h-3 w-3 shrink-0" style={{ color: 'var(--color-icon-danger)' }} aria-label={t('automation.deliveryStatusFailed')} />
+                              )}
+                              {explicitSummary.status === 'retrying' && (
+                                <Clock className="h-3 w-3 shrink-0" style={{ color: 'var(--color-accent-primary)' }} aria-label={t('automation.deliveryStatusRetrying')} />
+                              )}
+                              {t(deliverySummaryLabelKey)}
+                            </span>
+                          )
+                        : attempts.length > 0
+                          ? attempts.map((d, i) => {
+                              // DALTON-HOOK(execution-delivery-status): distinguish retrying from failed on raw delivery_result attempts
+                              const outcome = deliveryOutcome(d);
+                              return (
+                                <span key={`${d.method}|${d.address ?? ''}|${i}`} className="automation-history-attempt">
+                                  {outcome === 'failed' && (
+                                    <AlertCircle className="h-3 w-3 shrink-0" style={{ color: 'var(--color-icon-danger)' }} aria-label={t('automation.runFailed')} />
+                                  )}
+                                  {outcome === 'retrying' && (
+                                    <Clock className="h-3 w-3 shrink-0" style={{ color: 'var(--color-accent-primary)' }} aria-label={t('automation.deliveryStatusRetrying')} />
+                                  )}
+                                  {/* Where it landed and how; an older run says only which app. */}
+                                  {isLegacyAttempt(d) ? deliveryMethodName(d.method, t) : deliveryAttemptLabel(d, t, names)}
+                                </span>
+                              );
+                            })
+                          : deliverySummaryLabelKey && (
+                              <span className="automation-history-attempt">
+                                {(deliverySummary?.status === 'failed' || deliverySummary?.status === 'partial_failed') && (
+                                  <AlertCircle className="h-3 w-3 shrink-0" style={{ color: 'var(--color-icon-danger)' }} aria-label={t('automation.deliveryStatusFailed')} />
+                                )}
+                                {t(deliverySummaryLabelKey)}
+                              </span>
                             )}
-                            {/* Where it landed and how; an older run says only which app. */}
-                            {isLegacyAttempt(d) ? deliveryMethodName(d.method, t) : deliveryAttemptLabel(d, t, names)}
-                          </span>
-                        ))
-                      : deliverySummaryLabelKey && (
-                          <span className="automation-history-attempt">
-                            {(deliverySummary?.status === 'failed' || deliverySummary?.status === 'partial_failed') && (
-                              <AlertCircle className="h-3 w-3 shrink-0" style={{ color: 'var(--color-icon-danger)' }} aria-label={t('automation.deliveryStatusFailed')} />
-                            )}
-                            {t(deliverySummaryLabelKey)}
-                          </span>
-                        )}
                   </td>
                   <td className="text-right">
                     {e.conversation_thread_id && (

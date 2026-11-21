@@ -331,22 +331,28 @@ def _thread_line(thread: dict[str, Any], home_id: str, zone: Zone) -> str:
 def _run_line(run: dict[str, Any], zone: Zone) -> str:
     name = _one_line(run.get("automation_name"), _TITLE_CHARS) or "Untitled"
     status = str(run["status"])
-    said = (
-        _one_line(run.get("excerpt"), _EXCERPT_CHARS)
-        if status == "completed"
-        else _RUN_FAILURE.get(str(run.get("failure_reason")))
-        or _one_line(run.get("error_message"), _EXCERPT_CHARS)
-    )
     # DALTON-HOOK(execution-delivery-status): surface terminal/partial/retrying delivery state on completed runs
     status_label = _RUN_STATUS.get(status, status)
+    delivery_label: str | None = None
+    raw_excerpt = run.get("excerpt")
     if status == "completed":
         from src.dalton.services.execution_delivery_status import (
             format_execution_delivery_note,
+            strip_synced_delivery_excerpt_suffix,
         )
 
         delivery_label = format_execution_delivery_note(run, lang="en")
         if delivery_label:
             status_label = _one_line(delivery_label, _EXCERPT_CHARS) or status_label
+            raw_excerpt = strip_synced_delivery_excerpt_suffix(
+                str(raw_excerpt) if raw_excerpt is not None else None
+            )
+    said = (
+        _one_line(raw_excerpt, _EXCERPT_CHARS)
+        if status == "completed"
+        else _RUN_FAILURE.get(str(run.get("failure_reason")))
+        or _one_line(run.get("error_message"), _EXCERPT_CHARS)
+    )
     line = (
         f"- {run['completed_at'].astimezone(zone):%H:%M} {name}, "
         f"{status_label}{f': {said}' if said else ''}"

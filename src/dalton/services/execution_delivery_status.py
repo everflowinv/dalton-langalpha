@@ -15,7 +15,7 @@ import asyncio
 import logging
 import re
 from collections.abc import Mapping, MutableMapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from psycopg.rows import dict_row
@@ -32,11 +32,21 @@ from src.server.database.pool import get_db_connection
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_DELIVERY_ATTEMPTS = 3
+DEFAULT_RETRY_LOOKBACK_HOURS = 24
 DELIVERY_SETTLE_SECONDS = 180
 
-_UNCONFIRMED_PREFIX = "Delivery couldn't be confirmed."
 _FAILURE_ALERT_SOURCE = "automation_report_failure_alert"
+_NON_RETRIED_NOTIFY_SOURCES = frozenset(
+    {
+        "notify_test",
+        "report_delivery_admin_notice",
+        "report_delivery_missing_profile_notice",
+    }
+)
 _SYNCED_UNDELIVERED_RE = re.compile(r"已生成但未送达[（(]([^）)]+)[）)]")
+_SYNCED_EXCERPT_SUFFIX_RE = re.compile(
+    r"(?:(?:\s*\n+\s*|\s+)投递状态：已生成但未送达(?:[（(][^）)]*[）)])?|\A\s*投递状态：已生成但未送达(?:[（(][^）)]*[）)])?)\s*\Z"
+)
 _CARD_ELEMENT_LIMIT_RE = re.compile(
     r"(?:element\s+card\s+limit|exceeds\s+\d+\s+element\s+card\s+limit)",
     re.IGNORECASE,
@@ -45,8 +55,20 @@ _CARD_BYTE_LIMIT_RE = re.compile(
     r"(?:byte\s+card\s+limit|exceeds\s+\d+\s+byte\s+card\s+limit|30720|card\s+too\s+large)",
     re.IGNORECASE,
 )
+_FEISHU_OPEN_ID_RE = re.compile(r"^ou_[A-Za-z0-9_-]+$")
+_FEISHU_CHAT_ID_RE = re.compile(r"^oc_[A-Za-z0-9_-]+$")
+_DISCORD_SNOWFLAKE_RE = re.compile(r"^[0-9]{5,32}$")
 
 CARD_ELEMENT_LIMIT_ERROR_CODE = "card_element_limit_exceeded"
+
+_CARD_LIMIT_UPGRADEABLE_CODES = frozenset(
+    {
+        "",
+        "not_allowed",
+        CARD_LIMIT_EXCEEDED_ERROR_CODE,
+        CARD_ELEMENT_LIMIT_ERROR_CODE,
+    }
+)
 
 _ERROR_REASON_ZH: dict[str, str] = {
     CARD_LIMIT_EXCEEDED_ERROR_CODE: "卡片超过 30 KB 上限",
@@ -54,6 +76,12 @@ _ERROR_REASON_ZH: dict[str, str] = {
     "attempts_exhausted": "多次重试后仍投递失败",
     "target_failed": "目标通道投递失败",
     "delivery_failed": "目标通道投递失败",
+    "delivery_uncertain": "投递状态未确认",
+    "delivery_unconfirmed": "投递状态未确认",
+    "unknown": "投递状态未确认",
+    "in_flight": "投递状态未确认",
+    "partial": "投递状态未确认",
+    "gateway_restarted": "投递状态未确认",
     "feishu_cards_not_supported": "卡片包含不支持的图片或格式",
     "images_not_supported": "卡片包含不支持的图片或格式",
     "image_placeholder_not_supported": "卡片包含不支持的图片或格式",
@@ -77,6 +105,12 @@ _ERROR_REASON_EN: dict[str, str] = {
     "attempts_exhausted": "Delivery failed after retries",
     "target_failed": "Target channel delivery failed",
     "delivery_failed": "Target channel delivery failed",
+    "delivery_uncertain": "Delivery could not be confirmed",
+    "delivery_unconfirmed": "Delivery could not be confirmed",
+    "unknown": "Delivery could not be confirmed",
+    "in_flight": "Delivery could not be confirmed",
+    "partial": "Delivery could not be confirmed",
+    "gateway_restarted": "Delivery could not be confirmed",
     "feishu_cards_not_supported": "Card contains unsupported images or format",
     "images_not_supported": "Card contains unsupported images or format",
     "image_placeholder_not_supported": "Card contains unsupported images or format",
@@ -95,6 +129,14 @@ _ERROR_REASON_EN: dict[str, str] = {
 }
 
 
+def strip_synced_delivery_excerpt_suffix(excerpt: str | None) -> str | None:
+    """Strip the fallback ``投递状态：已生成但未送达（...）`` suffix appended to ``result_excerpt``."""
+    if not isinstance(excerpt, str):
+        return None
+    cleaned = _SYNCED_EXCERPT_SUFFIX_RE.sub("", excerpt).strip()
+    return cleaned or None
+
+
 def normalize_delivery_error_code(
     error_code: str | None,
     error_message: str | None = None,
@@ -109,10 +151,11 @@ def normalize_delivery_error_code(
             code = matched.group(1).strip()
 
     code_l = code.lower()
-    if _CARD_ELEMENT_LIMIT_RE.search(msg):
-        return CARD_ELEMENT_LIMIT_ERROR_CODE
-    if is_card_limit_not_allowed(code_l, msg) or _CARD_BYTE_LIMIT_RE.search(msg):
-        return CARD_LIMIT_EXCEEDED_ERROR_CODE
+    if code_l in _CARD_LIMIT_UPGRADEABLE_CODES:
+        if _CARD_ELEMENT_LIMIT_RE.search(msg):
+            return CARD_ELEMENT_LIMIT_ERROR_CODE
+        if is_card_limit_not_allowed(code_l, msg) or _CARD_BYTE_LIMIT_RE.search(msg):
+            return CARD_LIMIT_EXCEEDED_ERROR_CODE
     if code_l in _ERROR_REASON_ZH:
         return code_l
     if code:
@@ -180,6 +223,27 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _within_retry_window(
+    row: Mapping[str, Any],
+    *,
+    completed_at: Any = None,
+    now: datetime | None = None,
+    lookback_hours: int = DEFAULT_RETRY_LOOKBACK_HOURS,
+) -> bool:
+    """Return True if a notify row is still inside ``retry_failed_notify_deliveries``'s lookback window."""
+    anchor = (
+        _parse_datetime(row.get("created_at"))
+        or _parse_datetime(row.get("updated_at"))
+        or _parse_datetime(completed_at)
+    )
+    if anchor is None:
+        return True
+    ref = now or datetime.now(UTC)
+    if ref.tzinfo is None:
+        ref = ref.replace(tzinfo=UTC)
+    return (ref - anchor) < timedelta(hours=max(1, int(lookback_hours)))
+
+
 def _is_failure_alert_row(row: Mapping[str, Any]) -> bool:
     payload = row.get("payload_json")
     return (
@@ -188,12 +252,54 @@ def _is_failure_alert_row(row: Mapping[str, Any]) -> bool:
     )
 
 
+def _notify_row_source(row: Mapping[str, Any]) -> str:
+    payload = row.get("payload_json")
+    if isinstance(payload, Mapping):
+        return str(payload.get("source") or "").strip().lower()
+    return ""
+
+
+def _summarize_script_notify_status(
+    notify_status: Any,
+) -> dict[str, Any] | None:
+    """Fallback summary for company scripts when no target delivery rows exist yet."""
+    ns = str(notify_status or "").strip().lower()
+    if ns == "pending_dispatch":
+        return {
+            "status": "retrying",
+            "total_targets": 0,
+            "sent_count": 0,
+            "failed_count": 0,
+            "retrying_count": 0,
+            "failure_code": None,
+            "failure_reason": None,
+            "failure_reasons": [],
+            "targets": [],
+        }
+    if ns == "failed":
+        reason_zh = humanize_delivery_error("delivery_failed", lang="zh")
+        return {
+            "status": "failed",
+            "total_targets": 0,
+            "sent_count": 0,
+            "failed_count": 0,
+            "retrying_count": 0,
+            "failure_code": "delivery_failed",
+            "failure_reason": reason_zh,
+            "failure_reasons": [reason_zh] if reason_zh else [],
+            "targets": [],
+        }
+    return None
+
+
 def summarize_execution_delivery(
     *,
     notify_rows: Sequence[Mapping[str, Any]] = (),
     delivery_result: Sequence[Mapping[str, Any]] | None = None,
     completed_at: Any = None,
+    notify_status: Any = None,
     max_attempts: int = DEFAULT_MAX_DELIVERY_ATTEMPTS,
+    retry_lookback_hours: int = DEFAULT_RETRY_LOOKBACK_HOURS,
     now: datetime | None = None,
 ) -> dict[str, Any] | None:
     """Compute canonical delivery status summary for one execution.
@@ -224,31 +330,57 @@ def summarize_execution_delivery(
             raw_code or ch_err_code or None,
             ch_err_msg or None,
         )
+        source = _notify_row_source(raw)
+        within_window = _within_retry_window(
+            raw,
+            completed_at=completed_at,
+            now=now,
+            lookback_hours=retry_lookback_hours,
+        )
+        source_retried = source not in _NON_RETRIED_NOTIFY_SOURCES
 
         if st == "sent":
             target_status = "sent"
             reason_zh = None
         elif st == "pending":
-            target_status = "retrying"
-            reason_zh = None
-        elif st == "failed":
-            if raw_code_l in UNCERTAIN_NOTIFY_ERROR_CODES:
+            can_retry_pending = (
+                within_window
+                and source_retried
+                and (
+                    raw_code_l in UNCERTAIN_NOTIFY_ERROR_CODES
+                    or source != "automation_report"
+                    or attempt < bounded_max
+                )
+            )
+            if can_retry_pending:
                 target_status = "retrying"
                 reason_zh = None
-            elif (
-                eff_code in NON_RETRYABLE_TERMINAL_ERROR_CODES
-                or eff_code == CARD_ELEMENT_LIMIT_ERROR_CODE
-                or attempt >= bounded_max
-            ):
+            else:
+                target_status = "failed"
+                eff_code = eff_code or raw_code_l or "delivery_uncertain"
+                reason_zh = humanize_delivery_error(
+                    eff_code,
+                    ch_err_msg or None,
+                    lang="zh",
+                )
+        elif st == "failed":
+            can_retry_failed = (
+                within_window
+                and source_retried
+                and attempt < bounded_max
+                and eff_code not in NON_RETRYABLE_TERMINAL_ERROR_CODES
+                and eff_code != CARD_ELEMENT_LIMIT_ERROR_CODE
+            )
+            if can_retry_failed:
+                target_status = "retrying"
+                reason_zh = None
+            else:
                 target_status = "failed"
                 reason_zh = humanize_delivery_error(
                     eff_code or raw_code or ch_err_code or None,
                     ch_err_msg or None,
                     lang="zh",
                 )
-            else:
-                target_status = "retrying"
-                reason_zh = None
         else:
             continue
 
@@ -288,14 +420,17 @@ def summarize_execution_delivery(
             reason_zh = None
         else:
             explicit_status = str(raw.get("status") or "").strip().lower()
-            is_retrying = (
-                explicit_status in ("pending", "retrying")
-                or raw.get("retrying") is True
-                or (
-                    raw_err.startswith(_UNCONFIRMED_PREFIX)
-                    and _within_settle_window(completed_at, now)
+            raw_retrying = raw.get("retrying")
+            if raw_retrying is False:
+                is_retrying = False
+            elif raw_retrying is True or explicit_status in ("pending", "retrying"):
+                is_retrying = (
+                    True
+                    if completed_at is None
+                    else _within_settle_window(completed_at, now)
                 )
-            )
+            else:
+                is_retrying = False
             if is_retrying:
                 target_status = "retrying"
                 eff_code = None
@@ -323,7 +458,7 @@ def summarize_execution_delivery(
         )
 
     if not targets:
-        return None
+        return _summarize_script_notify_status(notify_status)
 
     sent_count = sum(1 for item in targets if item["status"] == "sent")
     failed_items = [item for item in targets if item["status"] == "failed"]
@@ -366,19 +501,127 @@ def summarize_execution_delivery(
     }
 
 
+def _parse_normalized_target(
+    raw_target: str | None,
+    fallback_channel: str | None = None,
+) -> tuple[str, str, str] | None:
+    """Normalize a notify target or channel ``target_address`` to ``(platform, kind, ident)``."""
+    cleaned = str(raw_target or "").strip()
+    if not cleaned:
+        return None
+    parts = cleaned.split(":")
+    if len(parts) == 1:
+        platform = str(fallback_channel or "").strip().lower()
+        if not platform:
+            return None
+        ident = parts[0].strip()
+        if not ident:
+            return None
+        if ident == "@me":
+            return (platform, "dm", "@me")
+        if platform == "feishu" and _FEISHU_OPEN_ID_RE.match(ident):
+            return ("feishu", "dm", ident)
+        if platform == "feishu" and _FEISHU_CHAT_ID_RE.match(ident):
+            return ("feishu", "group", ident)
+        if platform == "discord" and _DISCORD_SNOWFLAKE_RE.match(ident):
+            return ("discord", "group", ident)
+        return (platform, "raw", ident)
+
+    platform = parts[0].strip().lower()
+    if not platform:
+        return None
+    if len(parts) == 2:
+        second = parts[1].strip()
+        if not second:
+            return None
+        if second == "@me":
+            return (platform, "dm", "@me")
+        if platform == "feishu" and _FEISHU_OPEN_ID_RE.match(second):
+            return ("feishu", "dm", second)
+        if platform == "feishu" and _FEISHU_CHAT_ID_RE.match(second):
+            return ("feishu", "group", second)
+        if platform == "discord" and _DISCORD_SNOWFLAKE_RE.match(second):
+            return ("discord", "group", second)
+        return (platform, "raw", second)
+
+    subkind = parts[1].strip().lower()
+    ident = ":".join(parts[2:]).strip()
+    if not ident:
+        return None
+    if subkind == "user":
+        return (platform, "dm", ident)
+    if subkind in ("chat", "channel", "group"):
+        return (platform, "group", ident)
+    return (platform, "raw", ":".join(parts[1:]).strip())
+
+
+def _channel_row_matches_target(
+    notify_targets: list[tuple[str, str, str]],
+    ch_row: Mapping[str, Any],
+    *,
+    reconcile_recipient_id: str | None = None,
+) -> bool:
+    ch_plat = str(ch_row.get("platform") or "").strip().lower() or None
+    ch_parsed = _parse_normalized_target(ch_row.get("target_address"), ch_plat)
+    if ch_parsed is None or not notify_targets:
+        return False
+
+    c_plat, c_kind, c_ident = ch_parsed
+    dkey = str(ch_row.get("delivery_key") or "").strip()
+    dkey_parts = set(dkey.split(":")) if dkey else set()
+
+    for n_plat, n_kind, n_ident in notify_targets:
+        if n_plat != c_plat:
+            continue
+        if (n_kind, n_ident) == (c_kind, c_ident):
+            return True
+        if n_kind == "dm" and c_kind == "dm" and (n_ident == "@me" or c_ident == "@me"):
+            expected_recipient = (
+                reconcile_recipient_id
+                or (n_ident if n_ident != "@me" else None)
+                or (c_ident if c_ident != "@me" else None)
+            )
+            if expected_recipient and dkey_parts:
+                # If delivery_key embeds a specific recipient id, require it to match
+                # so two DMs on the same platform never borrow each other's error.
+                key_recipients = {
+                    part
+                    for part in dkey_parts
+                    if _FEISHU_OPEN_ID_RE.match(part) or _DISCORD_SNOWFLAKE_RE.match(part)
+                }
+                if key_recipients and expected_recipient not in key_recipients:
+                    continue
+            return True
+    return False
+
+
 def _match_channel_error(
     notify_row: Mapping[str, Any],
     channel_rows_by_run: Mapping[str, list[Mapping[str, Any]]],
 ) -> tuple[str | None, str | None]:
     delivery_id = str(notify_row.get("delivery_id") or "").strip().lower()
     exec_id = str(notify_row.get("execution_id") or "").strip().lower()
-    channel = str(notify_row.get("channel") or "").strip().lower()
+    channel = str(notify_row.get("channel") or "").strip().lower() or None
     payload = notify_row.get("payload_json")
     reconcile_keys: set[str] = set()
+    reconcile_canonical_target: str | None = None
+    reconcile_recipient_id: str | None = None
     if isinstance(payload, Mapping):
         raw_keys = payload.get("reconcile_delivery_keys")
         if isinstance(raw_keys, list):
             reconcile_keys = {str(k).strip() for k in raw_keys if str(k or "").strip()}
+        raw_canon = str(payload.get("reconcile_canonical_target") or "").strip()
+        if raw_canon:
+            reconcile_canonical_target = raw_canon
+        raw_recipient = str(payload.get("reconcile_recipient_id") or "").strip()
+        if raw_recipient:
+            reconcile_recipient_id = raw_recipient
+
+    notify_targets: list[tuple[str, str, str]] = []
+    for raw_t in (reconcile_canonical_target, notify_row.get("target")):
+        parsed = _parse_normalized_target(raw_t, channel)
+        if parsed is not None and parsed not in notify_targets:
+            notify_targets.append(parsed)
 
     candidates: list[Mapping[str, Any]] = []
     if delivery_id and delivery_id in channel_rows_by_run:
@@ -386,11 +629,14 @@ def _match_channel_error(
     if exec_id and exec_id in channel_rows_by_run:
         for ch_row in channel_rows_by_run[exec_id]:
             dkey = str(ch_row.get("delivery_key") or "").strip()
-            plat = str(ch_row.get("platform") or "").strip().lower()
             if reconcile_keys:
                 if dkey in reconcile_keys:
                     candidates.append(ch_row)
-            elif not channel or plat == channel:
+            elif _channel_row_matches_target(
+                notify_targets,
+                ch_row,
+                reconcile_recipient_id=reconcile_recipient_id,
+            ):
                 candidates.append(ch_row)
 
     for ch_row in candidates:
@@ -431,7 +677,9 @@ async def load_execution_notify_rows(
                    status,
                    attempt_count,
                    error_code,
-                   payload_json
+                   payload_json,
+                   created_at,
+                   updated_at
             FROM dalton_notify_deliveries
             WHERE execution_id = ANY(%s)
               AND COALESCE(payload_json->>'source', '') <> 'automation_report_failure_alert'
@@ -520,6 +768,7 @@ async def enrich_executions_with_delivery_summary(
     executions: Sequence[Any],
     *,
     max_attempts: int = DEFAULT_MAX_DELIVERY_ATTEMPTS,
+    retry_lookback_hours: int = DEFAULT_RETRY_LOOKBACK_HOURS,
     conn: Any = None,
     now: datetime | None = None,
 ) -> None:
@@ -529,14 +778,14 @@ async def enrich_executions_with_delivery_summary(
 
     exec_ids: list[str] = []
     for item in executions:
-        raw_id = _get_field(item, "automation_execution_id")
+        raw_id = _get_field(item, "automation_execution_id") or _get_field(item, "run_id")
         if raw_id is not None:
             clean = str(raw_id).strip().lower()
             if clean:
                 exec_ids.append(clean)
 
     notify_by_exec: dict[str, list[dict[str, Any]]] = {}
-    if exec_ids and (conn is not None or is_dalton_enabled()):
+    if exec_ids and is_dalton_enabled():
         try:
             notify_by_exec = await load_execution_notify_rows(exec_ids, conn=conn)
         except asyncio.CancelledError:
@@ -549,13 +798,15 @@ async def enrich_executions_with_delivery_summary(
             )
 
     for item in executions:
-        raw_id = _get_field(item, "automation_execution_id")
+        raw_id = _get_field(item, "automation_execution_id") or _get_field(item, "run_id")
         eid = str(raw_id).strip().lower() if raw_id is not None else ""
         summary = summarize_execution_delivery(
             notify_rows=notify_by_exec.get(eid, ()),
             delivery_result=_get_field(item, "delivery_result"),
             completed_at=_get_field(item, "completed_at"),
+            notify_status=_get_field(item, "notify_status"),
             max_attempts=max_attempts,
+            retry_lookback_hours=retry_lookback_hours,
             now=now,
         )
         _set_delivery_summary(item, summary)
@@ -565,6 +816,7 @@ async def enrich_automations_with_delivery_summary(
     automations: Sequence[Any],
     *,
     max_attempts: int = DEFAULT_MAX_DELIVERY_ATTEMPTS,
+    retry_lookback_hours: int = DEFAULT_RETRY_LOOKBACK_HOURS,
     conn: Any = None,
     now: datetime | None = None,
 ) -> None:
@@ -578,6 +830,7 @@ async def enrich_automations_with_delivery_summary(
         await enrich_executions_with_delivery_summary(
             executions,
             max_attempts=max_attempts,
+            retry_lookback_hours=retry_lookback_hours,
             conn=conn,
             now=now,
         )
@@ -588,7 +841,7 @@ def resolve_execution_delivery_summary(
     *,
     now: datetime | None = None,
 ) -> dict[str, Any] | None:
-    """Read an existing ``delivery_summary`` or derive one from ``delivery_result``."""
+    """Read an existing ``delivery_summary`` or derive one from ``delivery_result`` / ``notify_status``."""
     existing = _get_field(exec_row, "delivery_summary")
     if isinstance(existing, Mapping):
         return dict(existing)
@@ -597,6 +850,7 @@ def resolve_execution_delivery_summary(
     return summarize_execution_delivery(
         delivery_result=_get_field(exec_row, "delivery_result"),
         completed_at=_get_field(exec_row, "completed_at"),
+        notify_status=_get_field(exec_row, "notify_status"),
         now=now,
     )
 

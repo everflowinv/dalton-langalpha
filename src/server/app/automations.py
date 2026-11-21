@@ -524,6 +524,7 @@ async def get_automation(
         raise_not_found("Automation")
     company_resp = AutomationResponse.model_validate(scrub_company_agent_row(company_row))
     apply_company_notify_representation(company_resp, company_row)
+    # DALTON-HOOK(execution-delivery-status): attach delivery_summary to company agent detail last_execution
     await enrich_automations_with_delivery_summary([company_resp])
     return company_resp
 

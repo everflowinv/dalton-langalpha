@@ -9,7 +9,8 @@ import type {
   ExecutionDeliverySummary,
 } from '@/types/automation';
 import * as api from '../utils/api';
-import { isDeliverySettling } from '../utils/polling';
+import { resolveExecutionDelivery } from '../utils/delivery';
+import { DELIVERY_SETTLE_MS, isDeliverySettling } from '../utils/polling';
 import { describeRun } from '../utils/status';
 import Automations from '../Automations';
 
@@ -197,7 +198,28 @@ describe('describeRun & polling across all five delivery states', () => {
 
     expect(describeRun(RUN_RETRYING).ui.labelKey).toBe('automation.runCompletedDelivering');
     expect(describeRun(RUN_RETRYING).ui.danger).toBeFalsy();
-    expect(isDeliverySettling(RUN_RETRYING, false)).toBe(true);
+    const retryingAt = Date.parse(RUN_RETRYING.completed_at!);
+    expect(isDeliverySettling(RUN_RETRYING, false, retryingAt + 30_000)).toBe(true);
+    // Carbon High #2: retrying stops fast 5s polling once settle window expires
+    expect(isDeliverySettling(RUN_RETRYING, false, retryingAt + DELIVERY_SETTLE_MS + 1_000)).toBe(false);
+
+    // Codex Med #3: persisted retrying=false is immediately failed even with unconfirmed text prefix
+    const refusedRun: AutomationExecution = {
+      ...makeExecution('run-refused-404', 20, null),
+      delivery_result: [
+        {
+          method: 'slack:T1/C1',
+          address: 'slack:T1/C1',
+          name: '#desk',
+          success: false,
+          retrying: false,
+          error: "Delivery couldn't be confirmed. The messaging service has no record of this run.",
+        },
+      ],
+    };
+    const refusedAt = Date.parse(refusedRun.completed_at!);
+    expect(resolveExecutionDelivery(refusedRun, refusedAt + 10_000)?.status).toBe('failed');
+    expect(isDeliverySettling(refusedRun, true, refusedAt + 10_000)).toBe(false);
 
     expect(describeRun(RUN_NO_DELIVERY).ui.labelKey).toBe('automation.runCompleted');
     expect(describeRun(RUN_NO_DELIVERY).deliveryStatus).toBeNull();
@@ -294,5 +316,153 @@ describe('execution history list and detail in English (en-US)', () => {
     const deliveredEntry = screen.getByText('Excerpt run-delivered').closest('article')!;
     expect(deliveredEntry).not.toHaveTextContent('Delivery failed');
     expect(deliveredEntry).not.toHaveTextContent('Delivering');
+  });
+});
+
+describe('round-2 review regressions in inspector history and detail', () => {
+  it('prefers delivery_summary targets & reasons over mirrored not_allowed delivery_result and omits error icon on retrying targets', async () => {
+    await i18n.changeLanguage('zh-CN');
+    const mirroredFailed: AutomationExecution = {
+      ...makeExecution('782f546a', 19, {
+        status: 'failed',
+        total_targets: 1,
+        sent_count: 0,
+        failed_count: 1,
+        retrying_count: 0,
+        failure_code: 'card_limit_exceeded',
+        failure_reason: '卡片超过 30 KB 上限',
+        targets: [
+          {
+            target: 'feishu:chat:oc_market_pm',
+            channel: 'feishu',
+            name: '投研大群',
+            status: 'failed',
+            error_code: 'card_limit_exceeded',
+            error_message: '卡片超过 30 KB 上限',
+          },
+        ],
+      }),
+      excerpt: '晚报已生成\n\n投递状态：已生成但未送达（not_allowed）',
+      delivery_result: [
+        {
+          method: 'feishu',
+          address: 'feishu:chat:oc_market_pm',
+          success: false,
+          error: '已生成但未送达（not_allowed）',
+        },
+      ],
+    };
+
+    const retryingWithFalseAttempt: AutomationExecution = {
+      ...makeExecution('run-retrying-multi', 18, {
+        status: 'retrying',
+        total_targets: 2,
+        sent_count: 1,
+        failed_count: 0,
+        retrying_count: 1,
+        failure_code: null,
+        failure_reason: null,
+        targets: [
+          {
+            target: 'feishu:user:ou_ok',
+            channel: 'feishu',
+            name: 'Richard',
+            status: 'sent',
+          },
+          {
+            target: 'feishu:chat:oc_retry',
+            channel: 'feishu',
+            name: '交易群',
+            status: 'retrying',
+          },
+        ],
+      }),
+      delivery_result: [
+        { method: 'feishu', address: 'feishu:user:ou_ok', name: 'Richard', success: true },
+        {
+          method: 'feishu',
+          address: 'feishu:chat:oc_retry',
+          name: '交易群',
+          success: false,
+          retrying: true,
+          error: "Delivery couldn't be confirmed. Gateway timeout.",
+        },
+      ],
+    };
+
+    const auto = { ...AUTOMATION, last_execution: mirroredFailed };
+    vi.mocked(api.listAutomations).mockResolvedValue({ data: { automations: [auto], total: 1 } } as never);
+    vi.mocked(api.listExecutions).mockResolvedValue({
+      data: { executions: [mirroredFailed, retryingWithFalseAttempt], has_more: false },
+    } as never);
+    vi.mocked(api.listRecentRuns).mockResolvedValue({ data: { executions: [], has_more: false } } as never);
+    vi.mocked(api.getDeliveryOptions).mockResolvedValue({ data: { enabled: false, apps: {}, workspace_id: 'ws-1' } } as never);
+    renderWithProviders(<Automations />, { route: '/automations?id=auto-market-pm' });
+
+    const heading = await screen.findByRole('heading', { level: 2, name: '市场晚报' });
+    const pane = heading.closest('article')!;
+    const table = await within(pane).findByRole('table');
+
+    // Carbon Med #6: detail RunReport strips fallback synced suffix from excerpt
+    const reportCard = pane.querySelector('.automation-report') as HTMLElement;
+    expect(reportCard).toHaveTextContent('晚报已生成');
+    expect(reportCard).toHaveTextContent('投递失败：卡片超过 30 KB 上限');
+    expect(reportCard).not.toHaveTextContent('已生成但未送达');
+    expect(reportCard).not.toHaveTextContent('not_allowed');
+
+    // Carbon High #1 / Codex Med #4: history table shows 30 KB reason from delivery_summary, NOT 投递被拒绝
+    const failedRow = within(table).getByRole('button', { name: /19/ }).closest('tr')!;
+    const failedErrRow = failedRow.nextElementSibling as HTMLElement;
+    expect(failedRow).toHaveClass('has-error');
+    expect(failedErrRow).toHaveTextContent('投研大群：卡片超过 30 KB 上限');
+    expect(failedErrRow).not.toHaveTextContent('投递被拒绝');
+
+    // Codex Med #4: retrying target has NO failure icon and NO error row even though delivery_result has success: false
+    const retryingRow = within(table).getByRole('button', { name: /18/ }).closest('tr')!;
+    expect(retryingRow).toHaveTextContent('已完成 · 投递中');
+    expect(retryingRow).toHaveTextContent('交易群 投递中');
+    expect(retryingRow).not.toHaveClass('has-error');
+    expect(within(retryingRow).queryByLabelText('失败')).not.toBeInTheDocument();
+    expect(within(retryingRow).getByLabelText('投递中')).toBeInTheDocument();
+  });
+
+  it('keeps detail card in sync with polled execution history by execution id when last_execution is stale', async () => {
+    await i18n.changeLanguage('zh-CN');
+    const staleLast = makeExecution('exec-same-id', 20, {
+      status: 'retrying',
+      total_targets: 1,
+      sent_count: 0,
+      failed_count: 0,
+      retrying_count: 1,
+      failure_code: null,
+      failure_reason: null,
+    });
+    const polledTerminal = makeExecution('exec-same-id', 20, {
+      status: 'failed',
+      total_targets: 1,
+      sent_count: 0,
+      failed_count: 1,
+      retrying_count: 0,
+      failure_code: 'card_limit_exceeded',
+      failure_reason: '卡片超过 30 KB 上限',
+    });
+
+    const auto = { ...AUTOMATION, last_execution: staleLast };
+    vi.mocked(api.listAutomations).mockResolvedValue({ data: { automations: [auto], total: 1 } } as never);
+    vi.mocked(api.listExecutions).mockResolvedValue({
+      data: { executions: [polledTerminal], has_more: false },
+    } as never);
+    vi.mocked(api.listRecentRuns).mockResolvedValue({ data: { executions: [], has_more: false } } as never);
+    vi.mocked(api.getDeliveryOptions).mockResolvedValue({ data: { enabled: false, apps: {}, workspace_id: 'ws-1' } } as never);
+    renderWithProviders(<Automations />, { route: '/automations?id=auto-market-pm' });
+
+    const heading = await screen.findByRole('heading', { level: 2, name: '市场晚报' });
+    const pane = heading.closest('article')!;
+    await within(pane).findByRole('table');
+
+    const reportCard = pane.querySelector('.automation-report') as HTMLElement;
+    expect(reportCard).toHaveTextContent('已完成 · 投递失败');
+    expect(reportCard).toHaveTextContent('投递失败：卡片超过 30 KB 上限');
+    expect(reportCard).not.toHaveTextContent('已完成 · 投递中');
   });
 });

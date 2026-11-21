@@ -5,7 +5,7 @@ import { HeaderButton } from '@/components/mcp/McpPrimitives';
 import { ErrorLink } from '@/components/ui/error-banner';
 import type { AutomationExecution } from '@/types/automation';
 import type { PageLinkSpec } from '@/utils/rateLimitError';
-import { formatDeliveryFailureReason } from '../utils/delivery'; // DALTON-HOOK(execution-delivery-status)
+import { formatDeliveryFailureReason, stripSyncedDeliveryExcerptSuffix } from '../utils/delivery'; // DALTON-HOOK(execution-delivery-status)
 import type { RunView } from '../utils/status';
 import { StatusGlyph } from './StatusMark';
 import './RunReport.css';
@@ -65,13 +65,18 @@ export function RunReport({ run, view, meta, layout, busy, onSkip, onOpenThread,
             })
         : null;
   const deliveryRetrying = delivery?.status === 'retrying';
+  // DALTON-HOOK(execution-delivery-status): strip fallback synced-undelivered suffix from excerpt when structured delivery status is shown
+  const displayExcerpt =
+    delivery && (delivery.status === 'failed' || delivery.status === 'partial_failed' || delivery.status === 'retrying')
+      ? stripSyncedDeliveryExcerptSuffix(run.excerpt)
+      : run.excerpt;
   return (
     <>
       <div className="automation-mono automation-run-meta">
         {classes.glyph && <StatusGlyph ui={view.ui} size={12} />}
         <span>{meta.join(' · ')}</span>
       </div>
-      {run.excerpt && <p className={classes.excerpt}>{run.excerpt}</p>}
+      {displayExcerpt && <p className={classes.excerpt}>{displayExcerpt}</p>}
       {view.ui.danger && run.error_message && <p className="automation-mono automation-run-error">{run.error_message}</p>}
       {/* DALTON-HOOK(execution-delivery-status): render delivery failure reason or retrying note */}
       {deliveryErrorLine && <p className="automation-mono automation-run-error">{deliveryErrorLine}</p>}

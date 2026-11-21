@@ -32,6 +32,9 @@ from src.tools.secretary import activity
 from src.tools.thread_status import listing as ts_listing
 from src.tools.thread_status import tool as ts_tool
 
+_ORIG_GET_DB_CONNECTION = eds.get_db_connection
+_ORIG_IS_DALTON_ENABLED = eds.is_dalton_enabled
+
 
 def _utc(hour: int, minute: int = 0) -> datetime:
     return datetime(2026, 11, 20, hour, minute, tzinfo=UTC)
@@ -77,8 +80,16 @@ def _mock_db_connection(
     async def _conn_cm(_conn: Any = None):
         yield conn
 
-    monkeypatch.setattr(eds, "get_db_connection", _conn_cm)
-    monkeypatch.setattr(eds, "is_dalton_enabled", lambda: True)
+    monkeypatch.setattr(
+        eds,
+        "get_db_connection",
+        create_autospec(_ORIG_GET_DB_CONNECTION, side_effect=_conn_cm),
+    )
+    monkeypatch.setattr(
+        eds,
+        "is_dalton_enabled",
+        create_autospec(_ORIG_IS_DALTON_ENABLED, return_value=True),
+    )
     return executed_sql
 
 
@@ -242,7 +253,7 @@ def test_summarize_delivery_retrying() -> None:
     assert retrying_pending["sent_count"] == 1
     assert retrying_pending["retrying_count"] == 1
 
-    # Upstream unconfirmed delivery_result within 3-minute settle window -> retrying.
+    # Upstream delivery_result with persisted retrying=True within settle window -> retrying.
     now = _utc(13, 15)
     retrying_upstream = eds.summarize_execution_delivery(
         delivery_result=[
@@ -251,6 +262,7 @@ def test_summarize_delivery_retrying() -> None:
                 "address": "slack:T1/C1",
                 "name": "#desk",
                 "success": False,
+                "retrying": True,
                 "error": "Delivery couldn't be confirmed. Gateway timeout.",
             }
         ],
@@ -592,12 +604,12 @@ async def test_thread_status_and_file_state_surface_delivery_status(
     detail = ts_listing.automation_detail(row, now, "/automations")
     assert "Last run: finished · delivery failed (Card exceeds 30 KB limit)" in detail
 
-    # LiveFS file rendering keeps status="completed" and exposes delivery_status + reason
+    # LiveFS file rendering keeps status="completed" and exposes delivery_status + English reason
     rendered = await auto_file.rendered_files("user-richard")
     assert "market-pm.json" in rendered
     assert '"status": "completed"' in rendered["market-pm.json"][0]
     assert '"delivery_status": "failed"' in rendered["market-pm.json"][0]
-    assert '"delivery_failure_reason": "卡片超过 30 KB 上限"' in rendered["market-pm.json"][0]
+    assert '"delivery_failure_reason": "Card exceeds 30 KB limit"' in rendered["market-pm.json"][0]
 
 
 @pytest.mark.asyncio
@@ -657,3 +669,547 @@ async def test_runs_page_enriches_delivery_summary_without_changing_status(
     assert run.delivery_summary.status == "failed"
     assert run.delivery_summary.failure_code == "card_limit_exceeded"
     assert run.delivery_summary.failure_reason == "卡片超过 30 KB 上限"
+
+
+# ---------------------------------------------------------------------------
+# 4. Round-2 review regression tests (high & medium findings)
+# ---------------------------------------------------------------------------
+
+
+def test_expired_notify_row_past_24h_retry_window_is_terminal_failed() -> None:
+    """Codex High #1 / Carbon High #2: rows outside 24h retry scan cutoff are terminal failed."""
+    now = _utc(15, 0)
+    expired_at = now - timedelta(hours=25)
+    recent_at = now - timedelta(hours=2)
+
+    expired_failed = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "exec-expired-failed",
+                "channel": "feishu",
+                "target": "feishu:user:ou_richard",
+                "status": "failed",
+                "attempt_count": 1,
+                "error_code": "target_failed",
+                "created_at": expired_at,
+                "updated_at": expired_at,
+                "payload_json": {"source": "automation_completion"},
+            }
+        ],
+        now=now,
+    )
+    assert expired_failed is not None
+    assert expired_failed["status"] == "failed"
+    assert expired_failed["retrying_count"] == 0
+    assert expired_failed["failed_count"] == 1
+    assert expired_failed["failure_code"] == "target_failed"
+
+    expired_uncertain = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "exec-expired-pending",
+                "channel": "feishu",
+                "target": "feishu:user:ou_richard",
+                "status": "pending",
+                "attempt_count": 1,
+                "error_code": "delivery_uncertain",
+                "created_at": expired_at,
+                "updated_at": expired_at,
+                "payload_json": {"source": "automation_report"},
+            }
+        ],
+        now=now,
+    )
+    assert expired_uncertain is not None
+    assert expired_uncertain["status"] == "failed"
+    assert expired_uncertain["failure_code"] == "delivery_uncertain"
+    assert expired_uncertain["failure_reason"] == "投递状态未确认"
+    assert (
+        eds.humanize_delivery_error(
+            expired_uncertain["failure_code"],
+            expired_uncertain["failure_reason"],
+            lang="en",
+        )
+        == "Delivery could not be confirmed"
+    )
+
+    still_recent = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "exec-recent",
+                "channel": "feishu",
+                "target": "feishu:user:ou_richard",
+                "status": "failed",
+                "attempt_count": 1,
+                "error_code": "target_failed",
+                "created_at": recent_at,
+                "updated_at": recent_at,
+                "payload_json": {"source": "automation_completion"},
+            }
+        ],
+        now=now,
+    )
+    assert still_recent is not None
+    assert still_recent["status"] == "retrying"
+
+
+@pytest.mark.asyncio
+async def test_same_channel_multi_target_does_not_leak_channel_error_across_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex High #2 / Carbon Med #3: errors never bleed between two Feishu targets."""
+    now = _utc(15, 0)
+    exec_id = str(uuid4())
+    _mock_db_connection(
+        monkeypatch,
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": exec_id,
+                "channel": "feishu",
+                "target": "feishu:user:ou_retry_user",
+                "status": "failed",
+                "attempt_count": 1,
+                "error_code": "connecterror",
+                "created_at": now - timedelta(minutes=2),
+                "updated_at": now - timedelta(minutes=2),
+                "payload_json": {"source": "automation_report"},
+            },
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": exec_id,
+                "channel": "feishu",
+                "target": "feishu:chat:oc_large_group",
+                "status": "failed",
+                "attempt_count": 3,
+                "error_code": "not_allowed",
+                "created_at": now - timedelta(minutes=2),
+                "updated_at": now - timedelta(minutes=2),
+                "payload_json": {"source": "automation_report"},
+            },
+        ],
+        channel_rows=[
+            {
+                "delivery_key": f"data_task:{exec_id}:feishu:oc_large_group:item:0",
+                "run_id": exec_id,
+                "platform": "feishu",
+                "target_address": "feishu:oc_large_group",
+                "status": "failed",
+                "error_code": "not_allowed",
+                "error_message": "Feishu card payload 35221 bytes exceeds 30720 byte card limit",
+            }
+        ],
+    )
+
+    executions = [
+        {"automation_execution_id": exec_id, "status": "completed", "delivery_result": None}
+    ]
+    await eds.enrich_executions_with_delivery_summary(executions, now=now)
+    summary = executions[0]["delivery_summary"]
+    assert summary is not None
+    assert summary["status"] == "retrying"
+    assert summary["retrying_count"] == 1
+    assert summary["failed_count"] == 1
+
+    by_target = {t["target"]: t for t in summary["targets"]}
+    assert by_target["feishu:user:ou_retry_user"]["status"] == "retrying"
+    assert by_target["feishu:user:ou_retry_user"]["error_code"] is None
+    assert by_target["feishu:chat:oc_large_group"]["status"] == "failed"
+    assert by_target["feishu:chat:oc_large_group"]["error_code"] == "card_limit_exceeded"
+    assert by_target["feishu:chat:oc_large_group"]["error_message"] == "卡片超过 30 KB 上限"
+
+
+@pytest.mark.asyncio
+async def test_gateway_401_404_finish_persists_retry_false_and_is_immediately_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex Med #3: 401/404 finish returns retry=False, persisted so it never shows retrying."""
+    from src.server.services import automation_delivery, automation_settlement
+    from src.tools.messaging import tools as messaging
+
+    recorded_batches: list[list[dict[str, Any]]] = []
+
+    async def _capture_record(execution_id: str, delivery_result: list[dict[str, Any]]) -> None:
+        _ = execution_id
+        recorded_batches.append(delivery_result)
+
+    monkeypatch.setattr(
+        automation_settlement,
+        "_record_delivery",
+        create_autospec(automation_settlement._record_delivery, side_effect=_capture_record),
+    )
+
+    automation = {
+        "automation_id": str(uuid4()),
+        "user_id": "user-1",
+        "delivery_config": {"methods": ["slack:T1/C1"]},
+    }
+    delivery = automation_delivery.Delivery(
+        id="exec-404",
+        targets=[
+            automation_delivery.Target(
+                entry="slack:T1/C1", address="slack:T1/C1", name="#desk", ok=True
+            )
+        ],
+    )
+
+    orig_gateway_request = messaging.gateway_request
+    for reply in (
+        messaging.GatewayError("Refused credentials.", delivered_unknown=False, status=401),
+        messaging.GatewayAnswer(404, {"detail": "Not Found"}, ""),
+    ):
+        recorded_batches.clear()
+        if isinstance(reply, Exception):
+            ask_mock = create_autospec(orig_gateway_request, side_effect=reply)
+        else:
+            ask_mock = create_autospec(orig_gateway_request, return_value=reply)
+        monkeypatch.setattr(messaging, "gateway_request", ask_mock)
+
+        await automation_settlement._finish_here(
+            automation, "exec-404", "thread-1", delivery, "completed", "Done."
+        )
+        assert len(recorded_batches) == 1
+        persisted = recorded_batches[0]
+        assert persisted[0]["success"] is False
+        assert persisted[0]["retrying"] is False
+        assert persisted[0]["error"].startswith("Delivery couldn't be confirmed.")
+
+        now = _utc(15, 0)
+        summary = eds.summarize_execution_delivery(
+            delivery_result=persisted,
+            completed_at=now - timedelta(seconds=10),
+            now=now,
+        )
+        assert summary is not None
+        assert summary["status"] == "failed"
+        assert summary["retrying_count"] == 0
+        assert summary["failed_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_script_notify_status_fallback_without_target_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex Med #6: script history reads notify_status when no target rows exist, preserving skipped."""
+    _mock_db_connection(monkeypatch, notify_rows=[])
+
+    runs = [
+        {"run_id": str(uuid4()), "status": "succeeded", "notify_status": "pending_dispatch"},
+        {"run_id": str(uuid4()), "status": "succeeded", "notify_status": "failed"},
+        {"run_id": str(uuid4()), "status": "succeeded", "notify_status": "skipped"},
+        {"run_id": str(uuid4()), "status": "succeeded", "notify_status": "preview_only"},
+    ]
+    await eds.enrich_executions_with_delivery_summary(runs)
+
+    assert runs[0]["delivery_summary"] is not None
+    assert runs[0]["delivery_summary"]["status"] == "retrying"
+    assert eds.format_execution_delivery_note(runs[0], lang="zh") == "已完成 · 投递中"
+
+    assert runs[1]["delivery_summary"] is not None
+    assert runs[1]["delivery_summary"]["status"] == "failed"
+    assert runs[1]["delivery_summary"]["failure_code"] == "delivery_failed"
+    assert eds.format_execution_delivery_note(runs[1], lang="zh") == "已完成 · 投递失败（目标通道投递失败）"
+
+    assert runs[2]["delivery_summary"] is None
+    assert eds.format_execution_delivery_note(runs[2], lang="zh") is None
+    assert runs[3]["delivery_summary"] is None
+
+
+@pytest.mark.asyncio
+async def test_automation_file_fetch_enriches_delivery_summary_in_english(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex Med #7 / Carbon Med #4 & #6: AutomationFile.fetch enriches single reads & strips synced suffix."""
+    exec_id = "782f546a-1111-4222-8333-444455556666"
+    auto_id = str(uuid4())
+    _mock_db_connection(
+        monkeypatch,
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": exec_id,
+                "channel": "feishu",
+                "target": "feishu:chat:oc_market_pm",
+                "status": "failed",
+                "attempt_count": 3,
+                "error_code": "not_allowed",
+                "payload_json": {"source": "automation_report"},
+            }
+        ],
+        channel_rows=[
+            {
+                "delivery_key": f"data_task:{exec_id}:feishu:oc_market_pm:item:0",
+                "run_id": exec_id,
+                "platform": "feishu",
+                "target_address": "feishu:oc_market_pm",
+                "status": "failed",
+                "error_code": "not_allowed",
+                "error_message": "Feishu card payload 35221 bytes exceeds 30720 byte card limit",
+            }
+        ],
+    )
+
+    row = {
+        "automation_id": auto_id,
+        "user_id": "user-richard",
+        "name": "市场晚报",
+        "file_name": "market-pm.json",
+        "status": "active",
+        "trigger_type": "cron",
+        "cron_expression": "0 13 * * 1-5",
+        "timezone": "UTC",
+        "instruction": "Generate market close digest",
+        "workspace_id": None,
+        "thread_strategy": "continue",
+        "conversation_thread_id": None,
+        "max_failures": 3,
+        "delivery_config": {"methods": []},
+        "next_run_at": _utc(18, 0),
+        "last_execution": {
+            "automation_execution_id": exec_id,
+            "automation_id": auto_id,
+            "status": "completed",
+            "completed_at": _utc(13, 13),
+            "started_at": _utc(13, 10),
+            "scheduled_at": _utc(13, 10),
+            "excerpt": "市场晚报已生成\n\n投递状态：已生成但未送达（not_allowed）",
+            "delivery_result": [
+                {
+                    "method": "feishu",
+                    "address": "feishu:chat:oc_market_pm",
+                    "success": False,
+                    "error": "已生成但未送达（not_allowed）",
+                }
+            ],
+        },
+    }
+
+    monkeypatch.setattr(
+        auto_db,
+        "get_automation_file",
+        create_autospec(auto_db.get_automation_file, return_value=row),
+    )
+
+    f = auto_file.AutomationFile("market-pm.json")
+    fetched = await f.fetch("user-richard")
+    assert fetched is not None
+    rendered = f.render(fetched)
+    assert rendered is not None
+    content, _version = rendered
+    assert '"status": "completed"' in content
+    assert '"delivery_status": "failed"' in content
+    assert '"delivery_failure_reason": "Card exceeds 30 KB limit"' in content
+    assert '"excerpt": "市场晚报已生成"' in content
+    assert "已生成但未送达" not in content
+
+
+@pytest.mark.asyncio
+async def test_system_jobs_data_task_and_cross_owner_sector_batch_enrichment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex Med #7 / Carbon Med #5: data tasks & cross-owner sector units get batch delivery enrichment."""
+    from src.dalton import sharing
+
+    # 1. Data task run summary surfaces delivery failure / pending_dispatch instead of plain "成功"
+    failed_data_run = {
+        "run_id": str(uuid4()),
+        "status": "succeeded",
+        "completed_at": _utc(13, 13),
+        "notify_status": "failed",
+    }
+    _mock_db_connection(monkeypatch, notify_rows=[])
+    await eds.enrich_executions_with_delivery_summary([failed_data_run])
+    _, label_failed, raw_st = system_jobs._summarize_data_task_run(failed_data_run)
+    assert raw_st == "succeeded"
+    assert label_failed == "已完成 · 投递失败（目标通道投递失败）"
+
+    pending_data_run = {
+        "run_id": str(uuid4()),
+        "status": "succeeded",
+        "completed_at": _utc(13, 14),
+        "notify_status": "pending_dispatch",
+    }
+    await eds.enrich_executions_with_delivery_summary([pending_data_run])
+    _, label_pending, _ = system_jobs._summarize_data_task_run(pending_data_run)
+    assert label_pending == "已完成 · 投递中"
+
+    # 2. list_system_jobs batch-enriches cross-owner sector units (single batch call for foreign owners)
+    exec_s1 = str(uuid4())
+    exec_s2 = str(uuid4())
+    ws_s1 = str(uuid4())
+    ws_s2 = str(uuid4())
+
+    enrich_calls: list[int] = []
+    real_enrich = eds.enrich_automations_with_delivery_summary
+
+    async def _counting_enrich(automations: Any, **kwargs: Any) -> None:
+        enrich_calls.append(len(automations))
+        await real_enrich(automations, **kwargs)
+
+    _mock_db_connection(
+        monkeypatch,
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": exec_s1,
+                "channel": "feishu",
+                "target": "feishu:chat:oc_sector_1",
+                "status": "failed",
+                "attempt_count": 3,
+                "error_code": "card_limit_exceeded",
+                "payload_json": {"source": "automation_report"},
+            },
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": exec_s2,
+                "channel": "feishu",
+                "target": "feishu:chat:oc_sector_2",
+                "status": "failed",
+                "attempt_count": 1,
+                "error_code": "target_failed",
+                "created_at": datetime.now(UTC) - timedelta(minutes=5),
+                "payload_json": {"source": "automation_report"},
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        eds,
+        "enrich_automations_with_delivery_summary",
+        create_autospec(eds.enrich_automations_with_delivery_summary, side_effect=_counting_enrich),
+    )
+
+    foreign_rows_by_owner = {
+        "analyst-a": [
+            {
+                "automation_id": str(uuid4()),
+                "name": "dalton-sector-semi-watch",
+                "workspace_id": ws_s1,
+                "status": "active",
+                "last_execution": {
+                    "automation_execution_id": exec_s1,
+                    "status": "completed",
+                    "completed_at": _utc(13, 13),
+                    "excerpt": "半导体周报已生成",
+                    "delivery_result": None,
+                },
+            }
+        ],
+        "analyst-b": [
+            {
+                "automation_id": str(uuid4()),
+                "name": "dalton-sector-ai-watch",
+                "workspace_id": ws_s2,
+                "status": "active",
+                "last_execution": {
+                    "automation_execution_id": exec_s2,
+                    "status": "completed",
+                    "completed_at": _utc(13, 14),
+                    "excerpt": "AI 行业周报已生成",
+                    "delivery_result": None,
+                },
+            }
+        ],
+    }
+
+    async def _list_all(user_id: str, **_kwargs: Any) -> list[dict[str, Any]]:
+        return list(foreign_rows_by_owner.get(user_id, []))
+
+    monkeypatch.setattr(
+        system_jobs,
+        "list_all_user_automations",
+        create_autospec(system_jobs.list_all_user_automations, side_effect=_list_all),
+    )
+    monkeypatch.setattr(
+        system_jobs,
+        "is_pm_user",
+        create_autospec(system_jobs.is_pm_user, return_value=True),
+    )
+    monkeypatch.setattr(
+        system_jobs,
+        "get_user_tier",
+        create_autospec(system_jobs.get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        system_jobs,
+        "_discover_company_workspaces",
+        create_autospec(system_jobs._discover_company_workspaces, return_value=[]),
+    )
+    monkeypatch.setattr(
+        system_jobs,
+        "_discover_sector_units",
+        create_autospec(
+            system_jobs._discover_sector_units,
+            return_value=[
+                {"slug": "semi", "name": "半导体", "workspace_id": ws_s1, "lead_analyst_user_id": "analyst-a"},
+                {"slug": "ai", "name": "AI", "workspace_id": ws_s2, "lead_analyst_user_id": "analyst-b"},
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        sharing,
+        "require_workspace_access",
+        create_autospec(sharing.require_workspace_access, return_value={"user_id": "analyst-a"}),
+    )
+    monkeypatch.setattr(
+        system_jobs,
+        "get_tracking_status",
+        create_autospec(
+            system_jobs.get_tracking_status,
+            return_value={"subject_kind": "sector", "status": "enabled", "tasks": []},
+        ),
+    )
+    monkeypatch.setattr(
+        system_jobs,
+        "_fetch_ops_jobs",
+        create_autospec(system_jobs._fetch_ops_jobs, return_value=[]),
+    )
+    monkeypatch.setattr(
+        system_jobs,
+        "_fetch_data_system_jobs",
+        create_autospec(system_jobs._fetch_data_system_jobs, return_value=[]),
+    )
+
+    result = await system_jobs.list_system_jobs("pm-user")
+    sector_by_key = {item["key"]: item for item in result["groups"]["sector"]}
+    assert sector_by_key["sector:semi"]["last_result"] == "已完成 · 投递失败（卡片超过 30 KB 上限）"
+    assert sector_by_key["sector:ai"]["last_result"] == "已完成 · 投递中"
+    # 1 call for caller's own rows + 1 single batch call for BOTH foreign owners (no N+1)
+    assert len(enrich_calls) == 2
+    assert enrich_calls[1] == 2
+
+
+def test_activity_strips_synced_undelivered_excerpt_suffix() -> None:
+    """Carbon Med #6: <activity> strips fallback synced suffix so model doesn't see contradictory not_allowed."""
+    zone = ZoneInfo("Asia/Shanghai")
+    rendered = activity.render_activity(
+        workspaces=[],
+        workspace_total=0,
+        threads=[],
+        runs=[
+            {
+                "automation_name": "市场晚报",
+                "status": "completed",
+                "excerpt": "晚报已生成\n\n投递状态：已生成但未送达（not_allowed）",
+                "completed_at": _utc(5, 13),
+                "delivery_summary": {
+                    "status": "failed",
+                    "total_targets": 1,
+                    "sent_count": 0,
+                    "failed_count": 1,
+                    "retrying_count": 0,
+                    "failure_code": "card_limit_exceeded",
+                    "failure_reason": "卡片超过 30 KB 上限",
+                },
+            }
+        ],
+        holdings=[],
+        home_id="home-1",
+        zone=zone,
+        today=date(2026, 11, 20),
+    )
+    assert "- 13:13 市场晚报, finished · delivery failed (Card exceeds 30 KB limit): 晚报已生成" in rendered
+    assert "not_allowed" not in rendered
+    assert "已生成但未送达" not in rendered

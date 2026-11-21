@@ -104,12 +104,13 @@ export function deliveryAttemptName(attempt: DeliveryAttempt, t: TFunction, name
   return deliveryMethodName(attempt.method, t);
 }
 
-export type DeliveryOutcome = 'sent' | 'fallback' | 'notice' | 'failed';
+// DALTON-HOOK(execution-delivery-status): include retrying outcome for in-progress delivery attempts
+export type DeliveryOutcome = 'sent' | 'fallback' | 'notice' | 'failed' | 'retrying';
 
 /** How a delivery went: the agent sent it (or, for an older run, it was
- *  posted), its final answer was posted for it, a notice went, or it failed. */
+ *  posted), its final answer was posted for it, a notice went, it is retrying, or it failed. */
 export function deliveryOutcome(attempt: DeliveryAttempt): DeliveryOutcome {
-  if (!attempt.success) return 'failed';
+  if (!attempt.success) return attempt.retrying === true ? 'retrying' : 'failed';
   if (attempt.via === 'fallback') return 'fallback';
   if (attempt.via === 'notice') return 'notice';
   return 'sent';
@@ -120,6 +121,7 @@ const OUTCOME_KEY: Record<DeliveryOutcome, string> = {
   fallback: 'automation.deliveredFallbackVia',
   notice: 'automation.deliveredNoticeVia',
   failed: 'automation.deliveryFailedVia',
+  retrying: 'automation.deliveryRetryingVia',
 };
 
 /** One delivery as a phrase: "sent to #demo", "#demo delivery failed". */
@@ -173,11 +175,19 @@ export function deliveryDefaultError(err: unknown, t: TFunction): string {
 }
 
 // DALTON-HOOK(execution-delivery-status): normalize and localize execution delivery outcomes & failure reasons
-const UNCONFIRMED_DELIVERY_PREFIX = "Delivery couldn't be confirmed.";
 const DELIVERY_SETTLE_WINDOW_MS = 3 * 60_000;
 const SYNCED_UNDELIVERED_RE = /已生成但未送达[（(]([^）)]+)[）)]/;
+const SYNCED_EXCERPT_SUFFIX_RE =
+  /(?:(?:\s*\n+\s*|\s+)投递状态：已生成但未送达(?:[（(][^）)]*[）)])?|^\s*投递状态：已生成但未送达(?:[（(][^）)]*[）)])?)\s*$/;
 const CARD_ELEMENT_LIMIT_RE = /(?:element\s+card\s+limit|exceeds\s+\d+\s+element\s+card\s+limit)/i;
 const CARD_BYTE_LIMIT_RE = /(?:byte\s+card\s+limit|exceeds\s+\d+\s+byte\s+card\s+limit|30720|card\s+too\s+large)/i;
+
+const CARD_LIMIT_UPGRADEABLE_CODES = new Set([
+  '',
+  'not_allowed',
+  'card_limit_exceeded',
+  'card_element_limit_exceeded',
+]);
 
 const DELIVERY_REASON_KEY: Record<string, string> = {
   card_limit_exceeded: 'automation.deliveryReasonCardLimit',
@@ -185,6 +195,12 @@ const DELIVERY_REASON_KEY: Record<string, string> = {
   attempts_exhausted: 'automation.deliveryReasonAttemptsExhausted',
   target_failed: 'automation.deliveryReasonTargetFailed',
   delivery_failed: 'automation.deliveryReasonTargetFailed',
+  delivery_uncertain: 'automation.deliveryReasonUnconfirmed',
+  delivery_unconfirmed: 'automation.deliveryReasonUnconfirmed',
+  unknown: 'automation.deliveryReasonUnconfirmed',
+  in_flight: 'automation.deliveryReasonUnconfirmed',
+  partial: 'automation.deliveryReasonUnconfirmed',
+  gateway_restarted: 'automation.deliveryReasonUnconfirmed',
   feishu_cards_not_supported: 'automation.deliveryReasonUnsupportedMedia',
   images_not_supported: 'automation.deliveryReasonUnsupportedMedia',
   image_placeholder_not_supported: 'automation.deliveryReasonUnsupportedMedia',
@@ -202,6 +218,12 @@ const DELIVERY_REASON_KEY: Record<string, string> = {
   not_allowed: 'automation.deliveryReasonNotAllowed',
 };
 
+export function stripSyncedDeliveryExcerptSuffix(excerpt: string | null | undefined): string | null {
+  if (typeof excerpt !== 'string') return null;
+  const cleaned = excerpt.replace(SYNCED_EXCERPT_SUFFIX_RE, '').trim();
+  return cleaned || null;
+}
+
 export function detectDeliveryErrorCode(
   code: string | null | undefined,
   message?: string | null,
@@ -213,8 +235,10 @@ export function detectDeliveryErrorCode(
     if (matched?.[1]) rawCode = matched[1].trim();
   }
   const lower = rawCode.toLowerCase();
-  if (CARD_ELEMENT_LIMIT_RE.test(rawMsg)) return 'card_element_limit_exceeded';
-  if (lower === 'card_limit_exceeded' || CARD_BYTE_LIMIT_RE.test(rawMsg)) return 'card_limit_exceeded';
+  if (CARD_LIMIT_UPGRADEABLE_CODES.has(lower)) {
+    if (CARD_ELEMENT_LIMIT_RE.test(rawMsg)) return 'card_element_limit_exceeded';
+    if (lower === 'card_limit_exceeded' || CARD_BYTE_LIMIT_RE.test(rawMsg)) return 'card_limit_exceeded';
+  }
   if (lower && lower in DELIVERY_REASON_KEY) return lower;
   return lower || null;
 }
@@ -241,6 +265,45 @@ export function formatDeliveryFailureReason(
   return detected;
 }
 
+/** Match a backend delivery_summary target back to a delivery_result attempt for chat name / via enrichment. */
+export function matchAttemptForTarget(
+  target: ExecutionDeliveryTarget,
+  attempts: readonly DeliveryAttempt[],
+): DeliveryAttempt | null {
+  const tAddr = (target.target ?? '').trim();
+  const tChan = (target.channel ?? '').trim().toLowerCase();
+  if (tAddr) {
+    const byAddress = attempts.find((a) => (a.address ?? '').trim() === tAddr || a.method.trim() === tAddr);
+    if (byAddress) return byAddress;
+  }
+  if (tChan) {
+    const byChannel = attempts.filter(
+      (a) => a.method.split(':', 1)[0]?.toLowerCase() === tChan,
+    );
+    if (byChannel.length === 1) return byChannel[0];
+  }
+  return null;
+}
+
+/** Display name for a delivery_summary target in history rows and error lines. */
+export function deliveryTargetName(
+  target: ExecutionDeliveryTarget,
+  t: TFunction,
+  names?: DeliveryNames,
+  matchedAttempt?: DeliveryAttempt | null,
+): string {
+  if (target.name) return target.name;
+  if (matchedAttempt?.name) return matchedAttempt.name;
+  const addr = (target.target ?? '').trim();
+  if (addr && namesChat(addr)) {
+    const known = names?.get(addr);
+    if (known) return known;
+  }
+  if (matchedAttempt) return deliveryAttemptName(matchedAttempt, t, names);
+  const fallbackKey = addr || (target.channel ?? '').trim();
+  return fallbackKey ? deliveryMethodName(fallbackKey, t) : t('automation.delivery');
+}
+
 export function resolveExecutionDelivery(
   run: Pick<AutomationExecution, 'delivery_summary' | 'delivery_result' | 'completed_at'>,
   now = Date.now(),
@@ -250,7 +313,7 @@ export function resolveExecutionDelivery(
   if (!attempts || attempts.length === 0) return null;
 
   const withinSettle =
-    !!run.completed_at &&
+    !run.completed_at ||
     (() => {
       const elapsed = now - Date.parse(run.completed_at);
       return elapsed >= 0 && elapsed < DELIVERY_SETTLE_WINDOW_MS;
@@ -275,7 +338,7 @@ export function resolveExecutionDelivery(
       continue;
     }
     const err = (attempt.error ?? '').trim();
-    if (err.startsWith(UNCONFIRMED_DELIVERY_PREFIX) && withinSettle) {
+    if (attempt.retrying === true && withinSettle) {
       retryingCount += 1;
       targets.push({
         target: attempt.address ?? attempt.method,
