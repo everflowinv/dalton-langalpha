@@ -90,8 +90,12 @@ _LEGACY_TEAM_MEMORY_OFF_TEXT = (
 _LEGACY_TEAM_MEMORY_ON_TEXT = (
     "团队记忆已开启。现在可以按工具说明使用 `conversation_search` 检索团队历史。"
 )
-TEAM_MEMORY_OFF_TEXT = f"{TEAM_MEMORY_OFF_MARKER} {_LEGACY_TEAM_MEMORY_OFF_TEXT}"
-TEAM_MEMORY_ON_TEXT = f"{TEAM_MEMORY_ON_MARKER} {_LEGACY_TEAM_MEMORY_ON_TEXT}"
+TEAM_MEMORY_OFF_TEXT = (
+    f"{TEAM_MEMORY_OFF_MARKER} 团队记忆已关闭。当前不可检索团队记忆，请勿调用 `conversation_search`。"
+)
+TEAM_MEMORY_ON_TEXT = (
+    f"{TEAM_MEMORY_ON_MARKER} 团队记忆已开启。当前可按工具说明调用 `conversation_search` 检索团队记忆。"
+)
 _SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>\s*(.*?)\s*</system-reminder>", re.DOTALL)
 
 #: Row kind of the scratchpad notes reminder (``compaction/notes.py``), which

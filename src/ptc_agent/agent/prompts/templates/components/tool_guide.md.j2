@@ -21,7 +21,7 @@ Routing:
 {# DALTON-HOOK(market-regime) #}
 {# DALTON-HOOK(team-memory-toggle) #}
 - 研究服务（{% if tool_summary and not thread_id %}`MCP Tools (via Python)`{% else %}`<mcp-servers>`{% endif %}，经一次简短 `ExecuteCode`）提供卖方、专家、管理层原话和内部笔记，是解释“发生了什么、为什么”时的主要证据，与网页搜索互补。
-- {# DALTON-HOOK(prompt-compaction) #}先确定回答所需的关键事实与解释，选择直接相关的来源相互核对；出现会影响结论的冲突或缺失时再补查。说“证据不足/无法确定”之前，对照下方数据地图，看是否还有会改变结论的直接相关来源没查{% if conversation_search_enabled %}；`conversation_search` 团队记忆开启时可用；当前是否开启以对话中的运行时说明为准——开启时回答某家公司或主题，先用 `conversation_search` 查团队以前的观点、假设和决定，并在答案里说明与之前看法相比有什么变化{% endif %}；问到大盘、仓位、过热或超卖时，先读 `market-regime`（`macro(route="market-regime", operation="snapshot")`）。篇幅简短只限制回复长度，不减少应查的来源。
+- {# DALTON-HOOK(prompt-compaction) #}先确定回答所需的关键事实与解释，选择直接相关的来源相互核对；出现会影响结论的冲突或缺失时再补查。说“证据不足/无法确定”之前，对照下方数据地图，看是否还有会改变结论的直接相关来源没查{% if conversation_search_enabled %}；`conversation_search` 仅在团队记忆开启时可用；当前是否开启以对话中的运行时说明为准——开启时回答某家公司或主题，先用 `conversation_search` 查团队以前的观点、假设和决定，并在答案里说明与之前看法相比有什么变化{% endif %}；问到大盘、仓位、过热或超卖时，先读 `market-regime`（`macro(route="market-regime", operation="snapshot")`）。篇幅简短只限制回复长度，不减少应查的来源。
 - Need to compute, compare, model, or chart → MCP (via Python)
 - File, search, shell{% if web_enabled %}, or web{% endif %} operations → Core
 {% if crawl_enabled %}

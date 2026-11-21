@@ -20,7 +20,7 @@ EXTERNAL_CONVERSATION_SEARCH_FORBIDDEN_MESSAGE = (
     "外部成员不能检索团队对话归档；搜索自己的对话请用全局搜索。"
 )
 TEAM_MEMORY_DISABLED_MESSAGE = (
-    "团队记忆已关闭，禁止检索团队对话归档；请勿调用 conversation_search。"
+    "团队记忆已关闭，当前不可检索团队记忆；请勿调用 `conversation_search`。"
 )
 
 
@@ -71,7 +71,7 @@ def create_conversation_tools(*, role: str | None = None) -> list[BaseTool]:
         *,
         config: RunnableConfig,
     ) -> str:
-        """Use when asked about any company, topic, or sector to check the team's prior views, model assumptions, decisions, and open todos, or when verbatim quotes and OpenClaw provenance are needed, and only while team memory is on (follow the current team-memory notice in the conversation; when it says off, do not call this tool).
+        """Use when asked about any company, topic, or sector to check the team's prior views, model assumptions, decisions, and open todos, or when verbatim quotes and OpenClaw provenance are needed. Available only when Team Memory (团队记忆) is on (follow the runtime notice in the conversation; do not call this tool when it is off).
         Admins and internal members only: external members are refused outright (tell the user to use global search on their own conversations instead of retrying).
         Covers `source_type=conversation` discussion cards only, not external filings or research documents; `limit` is capped at 50.
         若消息是上传的转写、转发或引文材料，卡片另附 `viewpoint_author`（观点作者，无法唯一定位时为 `"未识别"`）与 `uploaded_by`（上传该材料的成员）。引用观点时归属给 `viewpoint_author`，不要归属给 `uploaded_by`。只有附件、正文没有多人说话人结构时，作者仍是发送者，并额外带 `uploaded_by`。

@@ -89,7 +89,7 @@ def _apply_search_api_filter(
 
 
 _TEAM_MEMORY_PRINCIPLE_CLAUSE = (
-    "；`conversation_search` 团队记忆开启时可用；当前是否开启以对话中的运行时说明为准"
+    "；`conversation_search` 仅在团队记忆开启时可用；当前是否开启以对话中的运行时说明为准"
     "——开启时问到公司或主题，先用 `conversation_search` 查团队以前的观点、假设和决定，"
     "并在答案里说明与之前看法相比有什么变化"
 )
@@ -249,7 +249,7 @@ def _format_conversation_stats_line(
 ) -> str:
     """Format `dalton_conversation_cards` statistics into a compact summary line."""
     if not isinstance(conversation_stats, Mapping):
-        return "归档统计：未统计（团队记忆开启时，可用 `conversation_search` 查 fact/estimate/model_assumption/opinion/question/decision/todo 卡片）。"
+        return "归档统计：未统计（仅在团队记忆开启时可用 `conversation_search` 查 fact/estimate/model_assumption/opinion/question/decision/todo 卡片）。"
 
     total = int(conversation_stats.get("total_cards") or 0)
     min_date = str(conversation_stats.get("min_date") or "").strip()
