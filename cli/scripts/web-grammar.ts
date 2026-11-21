@@ -43,6 +43,7 @@ ${grammar}
 /** The options every command takes, which may also come before its words. */
 export const LA_GLOBAL_FLAGS: FlagSpecs = ${JSON.stringify(parseOnly(GLOBAL), null, 2)};
 
+// DALTON-HOOK(workspace-dedup): annotate generated LA_COMMANDS table when workspaces create flags change
 export const LA_COMMANDS: readonly CommandSpec[] = [
 ${commands.join("\n")}
 ];

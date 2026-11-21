@@ -1430,9 +1430,12 @@ async def register_coverage_unit_endpoint(
     body: CoverageUnitRegisterRequest,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
-    _require_coverage_units_enabled()
-    uid = await _require_coverage_team_member(user_id)
-    from src.dalton.coverage.units import register_coverage_unit
+    from src.dalton.coverage.units import (
+        authorize_coverage_unit_registration,
+        register_coverage_unit,
+    )
+
+    uid = await authorize_coverage_unit_registration(user_id)
 
     try:
         kwargs: dict[str, Any] = {

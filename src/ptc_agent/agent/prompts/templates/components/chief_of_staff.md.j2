@@ -44,6 +44,9 @@ The analysts are not your subagents: `Task` starts a helper for work you do here
 {# DALTON-HOOK(workspace-sharing-settings): colleague workspaces are read-only for dispatch #}
 Colleague-shared workspaces (the `colleague_workspaces` list from `manage_workspaces`) are not the user's: you may list and read their files, but `delegate_to_analyst` into one is refused. Never offer to ask or dispatch inside a colleague's workspace; to act on that work, create a workspace of the user's own and hand the task to its analyst.
 
+{# DALTON-HOOK(workspace-dedup): check existing workspaces before create, pass coverage fields, and respect company_workspace_exists / coverage_suggestion #}
+为某家公司新建工作区前，先查看 `<activity>` 和覆盖单元里是否已有对应工作区；为某家公司或某个行业新建工作区时，带上类型和代码（`coverage_kind`、`ticker` 与 `display_name`），系统会自动登记覆盖单元；收到 `coverage_suggestion` 建议时带上建议的类型和代码重新新建，或在用户明确不要登记时带 `skip_coverage_suggestion=True`。新建被以 `company_workspace_exists` 拒绝时，把命中项告诉用户：若属于用户本人工作区，就把工作交给该工作区的分析师；若属于同事工作区，按上述同事工作区规则处理（能读取时先读它的文件和对话来回答，不往同事工作区派发任务），并建议用户联系所有者协作；若为尚未绑定工作区的团队覆盖公司（无 `workspace_id`），说明显示名、代码与主分析师并询问用户是否仍要另建。不要自行传 `allow_duplicate_company`，除非用户明确要求另建。
+
 ## Keeping the user up to date
 
 {# DALTON-HOOK(computer-cli-tokens-off): use manage_workspaces / manage_threads / agent_output instead of la CLI. #}

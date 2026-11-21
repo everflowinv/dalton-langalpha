@@ -286,6 +286,8 @@ async def byok_key(
     *,
     _pref_cache: dict | None = None,
     _byok_cache: dict | None = None,
+    # DALTON-HOOK(workspace-dedup): ignore user custom_providers when resolving built-in catalog models.
+    ignore_custom_models: bool = False,
 ) -> OwnKeyRoute | None:
     """The user's stored key that would serve ``model_name``, and where its
     calls go, or None when no key does. Whether keys are switched on is the
@@ -300,6 +302,8 @@ async def byok_key(
       a custom model entry synthesized on that provider's key.
     """
     if source == ModelSource.UNKNOWN:
+        if ignore_custom_models:
+            return None
         entry = await _custom_provider_model(user_id, model_name, _pref_cache=_pref_cache)
         if entry is None:
             return None
@@ -334,6 +338,8 @@ async def resolve_byok_llm_client(
     cache_key: str | None = None,
     _byok_cache: dict | None = None,
     service_tier: str | None = None,
+    # DALTON-HOOK(workspace-dedup): ignore user custom_models/custom_providers when resolving built-in catalog models.
+    ignore_custom_models: bool = False,
 ):
     """
     If BYOK is active, build an LLM client for ``model_name`` on the key
@@ -355,12 +361,22 @@ async def resolve_byok_llm_client(
     from src.llms.llm import LLM as LLMFactory, create_llm, create_llm_from_custom
 
     mc = LLMFactory.get_model_config()
+    # DALTON-HOOK(workspace-dedup): forward ignore_custom_models to classify_model and byok_key
     source, config_entry = await user_models.classify_model(
-        user_id, model_name, _pref_cache=_pref_cache,
+        user_id,
+        model_name,
+        _pref_cache=_pref_cache,
+        **({"ignore_custom_models": True} if ignore_custom_models else {}),
     )
     route = await byok_key(
-        user_id, model_name, source, config_entry, mc,
-        _pref_cache=_pref_cache, _byok_cache=_byok_cache,
+        user_id,
+        model_name,
+        source,
+        config_entry,
+        mc,
+        _pref_cache=_pref_cache,
+        _byok_cache=_byok_cache,
+        **({"ignore_custom_models": True} if ignore_custom_models else {}),
     )
     if route is None:
         if source == ModelSource.CUSTOM:
@@ -566,6 +582,8 @@ async def resolve_model_client(
     policy: Policy | None = None,
     _pref_cache=None,
     _byok_cache=None,
+    # DALTON-HOOK(workspace-dedup): ignore user custom_models/custom_providers so built-in catalog entries win.
+    ignore_custom_models: bool = False,
 ) -> ResolvedClient:
     """Resolve a client for ``model_name`` and report which credential built it.
 
@@ -589,7 +607,12 @@ async def resolve_model_client(
     """
     if policy is None:
         policy = await require_policy(user_id)
-    source, entry = await user_models.classify_model(user_id, model_name, _pref_cache=_pref_cache)
+    source, entry = await user_models.classify_model(
+        user_id,
+        model_name,
+        _pref_cache=_pref_cache,
+        **({"ignore_custom_models": True} if ignore_custom_models else {}),
+    )
     custom_entry = entry if source == ModelSource.CUSTOM else None
 
     if source == ModelSource.SYSTEM and is_claude_code_model(model_name):
@@ -616,10 +639,12 @@ async def resolve_model_client(
             raise_model_denied(policy, OWN_SUBSCRIPTIONS, model_name)
 
     if policy.byok(is_byok):
+        # DALTON-HOOK(workspace-dedup): forward ignore_custom_models to resolve_byok_llm_client
         client = await resolve_byok_llm_client(
             user_id, model_name, is_byok, reasoning_effort,
             _pref_cache=_pref_cache, cache_key=cache_key, _byok_cache=_byok_cache,
             service_tier=service_tier,
+            **({"ignore_custom_models": True} if ignore_custom_models else {}),
         )
         if client:
             return ResolvedClient(client, source, CredentialSource.BYOK)
@@ -654,6 +679,8 @@ async def credential_route(
     policy: Policy | None = None,
     _pref_cache: dict | None = None,
     _byok_cache: dict | None = None,
+    # DALTON-HOOK(workspace-dedup): ignore user custom_models/custom_providers when resolving built-in catalog models.
+    ignore_custom_models: bool = False,
 ) -> Route:
     """Which credential a turn on ``model_name`` runs on, building no client.
 
@@ -669,7 +696,12 @@ async def credential_route(
     if policy is None:
         policy = await require_policy(user_id)
     mc = LLMFactory.get_model_config()
-    source, entry = await user_models.classify_model(user_id, model_name, _pref_cache=_pref_cache)
+    source, entry = await user_models.classify_model(
+        user_id,
+        model_name,
+        _pref_cache=_pref_cache,
+        **({"ignore_custom_models": True} if ignore_custom_models else {}),
+    )
     custom = source == ModelSource.CUSTOM
     if source == ModelSource.SYSTEM and is_claude_code_model(model_name):
         return ClaudeCodeRoute(entry) if policy.allows(OWN_SUBSCRIPTIONS) else NoRoute()
@@ -678,6 +710,8 @@ async def credential_route(
     if policy.byok(is_byok) and (route := await byok_key(
         user_id, model_name, source, entry, mc,
         _pref_cache=_pref_cache, _byok_cache=_byok_cache,
+        # DALTON-HOOK(workspace-dedup): forward ignore_custom_models to byok_key
+        **({"ignore_custom_models": True} if ignore_custom_models else {}),
     )):
         return route
     if source == ModelSource.SYSTEM:
@@ -772,6 +806,8 @@ def role_registry(config, model_pref, turn_model: str | None = None) -> list[LLM
 async def _prefetch_byok_cache(
     user_id: str, config, effective_model: str, model_pref: dict,
     roles: list[LLMRole],
+    # DALTON-HOOK(workspace-dedup): ignore user custom_models/custom_providers when resolving built-in catalog models.
+    ignore_custom_models: bool = False,
 ) -> dict[str, dict | None]:
     """Best-effort batch BYOK prefetch → tri-state cache for ``walk_byok_candidates``.
 
@@ -792,7 +828,12 @@ async def _prefetch_byok_cache(
         candidate_models += list(config.llm.fallback or [])
         all_slugs: set[str] = set()
         for m in candidate_models:
-            src_, cfg = await user_models.classify_model(user_id, m, _pref_cache=model_pref)
+            src_, cfg = await user_models.classify_model(
+                user_id,
+                m,
+                _pref_cache=model_pref,
+                **({"ignore_custom_models": True} if ignore_custom_models else {}),
+            )
             # SYSTEM (models.json) and CUSTOM (user config) both carry a
             # "provider" slug; UNKNOWN carries nothing.
             prov = cfg.get("provider") if src_ != ModelSource.UNKNOWN else None
@@ -839,6 +880,8 @@ async def _resolve_role_clients(
     # DALTON-HOOK(subagent-model-pin): keep policy optional for legacy callers and unit tests
     byok_cache: dict, *, is_byok: bool, cache_key: str | None, policy: Policy | None = None,
     main_model: str | None = None,
+    # DALTON-HOOK(workspace-dedup): ignore user custom_models/custom_providers when resolving built-in catalog models.
+    ignore_custom_models: bool = False,
 ) -> None:
     """Resolve compaction/fetch/subagent role clients onto ``config`` in place.
 
@@ -876,6 +919,8 @@ async def _resolve_role_clients(
                 allow_platform_fallback=platform_ok,
                 reasoning_effort=effort, policy=policy,
                 _pref_cache=model_pref, _byok_cache=byok_cache,
+                # DALTON-HOOK(workspace-dedup): forward ignore_custom_models to resolve_model_client
+                **({"ignore_custom_models": True} if ignore_custom_models else {}),
             )
         except Exception:
             logger.warning(
@@ -894,6 +939,8 @@ async def _resolve_role_clients(
                 service_tier=role.service_tier,
                 reasoning_effort=role.reasoning_effort, policy=policy,
                 _pref_cache=model_pref, _byok_cache=byok_cache,
+                # DALTON-HOOK(workspace-dedup): forward ignore_custom_models to resolve_model_client
+                **({"ignore_custom_models": True} if ignore_custom_models else {}),
             )
         except Exception:
             logger.error(
@@ -992,6 +1039,8 @@ async def _resolve_fallback_clients(
     # DALTON-HOOK(llm-overlay): keep policy optional for legacy callers and unit tests
     *, is_byok: bool, cache_key: str | None, policy: Policy | None = None,
     reasoning_effort: str | None = None, fast_mode: bool | None = None,
+    # DALTON-HOOK(workspace-dedup): ignore user custom_models/custom_providers when resolving built-in catalog models.
+    ignore_custom_models: bool = False,
 ) -> None:
     """Resolve ``config.llm.fallback`` names into client instances in place.
 
@@ -1029,6 +1078,8 @@ async def _resolve_fallback_clients(
                 service_tier=_tier_for(tuning.fast_mode),
                 reasoning_effort=tuning.reasoning_effort, policy=policy,
                 _pref_cache=model_pref, _byok_cache=byok_cache,
+                # DALTON-HOOK(workspace-dedup): forward ignore_custom_models to resolve_model_client
+                **({"ignore_custom_models": True} if ignore_custom_models else {}),
             )
         except Exception:
             logger.error(
@@ -1090,6 +1141,8 @@ async def _resolve_fallback_clients(
 async def _stamp_credential_payer(
     config, user_id: str, model_name: str, *, is_byok: bool, model_pref: dict, byok_cache: dict,
     policy: Policy,
+    # DALTON-HOOK(workspace-dedup): ignore user custom_models/custom_providers when resolving built-in catalog models.
+    ignore_custom_models: bool = False,
 ) -> None:
     """Record who the main model's credential bills, for a failed turn to name.
 
@@ -1109,6 +1162,7 @@ async def _stamp_credential_payer(
         route = await credential_route(
             user_id, model_name, is_byok=is_byok, policy=policy,
             _pref_cache=model_pref, _byok_cache=byok_cache,
+            **({"ignore_custom_models": True} if ignore_custom_models else {}),
         )
         named = route_payer(route, LLMFactory.get_model_config())
         if named is not None and (own or named.payer == "local"):
@@ -1123,6 +1177,8 @@ async def resolve_clients(
     subagent_roles: list[LLMRole], *, is_byok: bool, thread_id: str | None,
     reasoning_effort: str | None, fast_mode: bool | None, user_defined: bool,
     policy: Policy,
+    # DALTON-HOOK(workspace-dedup): ignore user custom_models/custom_providers when resolving built-in catalog models.
+    ignore_custom_models: bool = False,
 ) -> None:
     """Build every client this turn can reach, tuned and stamped as it is built.
 
@@ -1148,7 +1204,15 @@ async def resolve_clients(
 
     # STEP 0 — best-effort batch BYOK prefetch (pure perf; see helper docstring).
     byok_cache: dict[str, dict | None] = (
-        await _prefetch_byok_cache(user_id, config, effective_model, model_pref, roles)
+        await _prefetch_byok_cache(
+            user_id,
+            config,
+            effective_model,
+            model_pref,
+            roles,
+            # DALTON-HOOK(workspace-dedup): forward ignore_custom_models to _prefetch_byok_cache
+            **({"ignore_custom_models": True} if ignore_custom_models else {}),
+        )
         if is_byok
         else {}
     )
@@ -1166,6 +1230,8 @@ async def resolve_clients(
         allow_platform_fallback=bool(main_tuning.reasoning_effort),
         policy=policy,
         _pref_cache=model_pref, _byok_cache=byok_cache,
+        # DALTON-HOOK(workspace-dedup): forward ignore_custom_models to resolve_model_client
+        **({"ignore_custom_models": True} if ignore_custom_models else {}),
     )
     # Always store credential_source (even NONE) — single source of truth
     # downstream (credit gate, materialization gate, billing signal).
@@ -1173,6 +1239,8 @@ async def resolve_clients(
     await _stamp_credential_payer(
         config, user_id, effective_model, is_byok=is_byok,
         model_pref=model_pref, byok_cache=byok_cache, policy=policy,
+        # DALTON-HOOK(workspace-dedup): forward ignore_custom_models to _stamp_credential_payer
+        **({"ignore_custom_models": True} if ignore_custom_models else {}),
     )
     if main.client is not None:
         _stamp(config, main.client, config.prompt_guidance)
@@ -1196,10 +1264,14 @@ async def resolve_clients(
             config, user_id, roles, model_pref, byok_cache,
             is_byok=is_byok, cache_key=thread_id, policy=policy,
             main_model=None if is_claude_code_model(effective_model) else effective_model,
+            # DALTON-HOOK(workspace-dedup): forward ignore_custom_models to _resolve_role_clients
+            **({"ignore_custom_models": True} if ignore_custom_models else {}),
         ),
         _resolve_fallback_clients(
             config, user_id, model_pref, byok_cache,
             is_byok=is_byok, cache_key=thread_id, policy=policy,
             reasoning_effort=reasoning_effort, fast_mode=fast_mode,
+            # DALTON-HOOK(workspace-dedup): forward ignore_custom_models to _resolve_fallback_clients
+            **({"ignore_custom_models": True} if ignore_custom_models else {}),
         ),
     )

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from contextvars import ContextVar
 from typing import Any
 
 from fastapi import HTTPException
@@ -54,6 +55,13 @@ DEFAULT_WEB_ACCESS: str = "hidden"
 EXTERNAL_OWNED_ADMIN_WRITE_FORBIDDEN_DETAIL = "外部成员的工作区仅管理员可查看（只读）"
 
 COLLEAGUE_ACCESS_REVOKED_CODE = "colleague_access_revoked"
+
+# Dedup sets this around `require_workspace_access` after already verifying the
+# caller is internal/admin, so a transient `get_user_tier` lookup failure
+# default ('external') surfaces as 503 instead of a silent 404.
+_raise_on_caller_tier_external: ContextVar[bool] = ContextVar(
+    "_raise_on_caller_tier_external", default=False
+)
 
 
 class ColleagueAccessRevokedError(PermissionError):
@@ -882,6 +890,11 @@ async def require_workspace_access(
     # or owner-tier failure can leak a colleague workspace's existence.
     caller_tier = await get_user_tier(uid)
     if caller_tier == "external":
+        if _raise_on_caller_tier_external.get():
+            raise HTTPException(
+                status_code=503,
+                detail="Caller tier verification unavailable",
+            )
         raise HTTPException(status_code=404, detail="Workspace not found")
     if caller_tier == "company":
         raise HTTPException(status_code=403, detail="Forbidden")

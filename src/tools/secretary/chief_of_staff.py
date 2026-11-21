@@ -63,6 +63,13 @@ async def chief_of_staff_workspaces(
     content: str | None = None,
     dest_path: str | None = None,
     dest_workspace_id: str | None = None,
+    # DALTON-HOOK(workspace-dedup): override duplicate company workspace check only after explicit user confirmation
+    allow_duplicate_company: bool = False,
+    # DALTON-HOOK(workspace-dedup): optional coverage unit auto-registration fields for "create"
+    coverage_kind: str | None = None,
+    ticker: str | None = None,
+    display_name: str | None = None,
+    skip_coverage_suggestion: bool = False,
     tool_call_id: Annotated[str, InjectedToolCallId] = "",
 ) -> Command:
     """List the user's and colleagues' shared workspaces, create or delete the user's own workspace, or list/read/copy/write files in a workspace.
@@ -89,6 +96,11 @@ async def chief_of_staff_workspaces(
         content: Full UTF-8 text to write; required for "write_file" (requires "rw" access).
         dest_path: Where "copy_file" lands the file, relative to the destination's folder; default shared/<filename>.
         dest_workspace_id: Destination for "copy_file" other than Home; must be one of the user's own workspaces.
+        allow_duplicate_company: Only for "create" when the user explicitly confirms creating another workspace after a `company_workspace_exists` refusal; default False.
+        coverage_kind: Optional for "create": "company", "sector", or "none" (default "none"). When "company" or "sector", automatically registers and binds a team coverage unit to the new workspace (internal/admin members only).
+        ticker: Optional stock ticker for "create" when `coverage_kind="company"` (e.g. "NVDA", "0700.HK"; leave empty for unlisted companies or sectors).
+        display_name: Optional company or sector display name for "create" when `coverage_kind` is "company" or "sector"; defaults to `name`.
+        skip_coverage_suggestion: Only for "create" when retrying after a `coverage_suggestion` response and the user explicitly declines registering a coverage unit; default False.
 
     Returns:
         One short row per workspace, with its id and its folder (dir_name); with more
@@ -97,9 +109,11 @@ async def chief_of_staff_workspaces(
         workspaces, each with its owner and access level. For "create" the new id with
         `folder_path` and `folder_ready` (before copying or cleaning into a new
         workspace, confirm `folder_path` exists and is non-empty — until `folder_ready`
-        is true the folder is not on the machine yet); file paths/content for file
-        actions; for "copy_file" the destination path, its absolute `folder_path`, and
-        the size.
+        is true the folder is not on the machine yet), plus `coverage_unit` (or
+        `coverage_unit_warning` / `coverage_unit_warning_detail`) when coverage
+        registration ran; file paths/content
+        for file actions; for "copy_file" the destination path, its absolute
+        `folder_path`, and the size.
         (DALTON-HOOK(workspace-folder-ready): the create result's folder fields.)
     """
     user_id = config.get("configurable", {}).get("user_id")
@@ -111,6 +125,12 @@ async def chief_of_staff_workspaces(
         return await workspaces_create(
             user_id, name, description, tool_call_id,
             preapproved=preapproved(state, tool_call_id),
+            # DALTON-HOOK(workspace-dedup): pass explicit duplicate override and coverage registration fields
+            allow_duplicate_company=allow_duplicate_company,
+            coverage_kind=coverage_kind,
+            ticker=ticker,
+            display_name=display_name,
+            skip_coverage_suggestion=skip_coverage_suggestion,
         )
     if action == "delete":
         return await _workspaces_delete(user_id, workspace_id, tool_call_id)
