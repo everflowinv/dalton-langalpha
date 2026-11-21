@@ -20,6 +20,7 @@ from ptc_agent.core.sandbox.browser_runtime.protocol import (
     StreamQualityName,
 )
 from ptc_agent.core.sandbox.providers import provider_class
+from src.config.features import is_feature_enabled_system  # DALTON-HOOK(browser-kill-switch)
 from src.server.services.browser_view import ask_runtime
 
 logger = logging.getLogger(__name__)
@@ -78,7 +79,12 @@ async def keep(
     fail, and this sandbox object never hears of it, so it is judged by the
     save: any later one is handed again, even one back to what it handed.
     """
-    if sandbox is None or not provider_class(kind).browser_use:
+    # DALTON-HOOK(browser-kill-switch): skip quality sync when features.browser is off.
+    if (
+        sandbox is None
+        or not is_feature_enabled_system("browser")
+        or not provider_class(kind).browser_use
+    ):
         return
     handed = (quality, revision)
     if getattr(sandbox, _HANDED, _NEVER) == handed:
@@ -104,6 +110,9 @@ async def apply_now(computer: dict[str, Any]) -> None:
     read again and put there if it moved: whichever change finishes last
     leaves the machine on the stored one.
     """
+    # DALTON-HOOK(browser-kill-switch): skip quality sync when features.browser is off.
+    if not is_feature_enabled_system("browser"):
+        return
     from src.server.database.computer import get_computer
 
     for _ in range(_RECONCILE_TRIES):
@@ -121,8 +130,10 @@ async def _apply(computer: dict[str, Any]) -> bool:
     from ptc_agent.core.sandbox.runtime import RuntimeState
     from src.server.services.data_token_sweep import running_sandbox
 
+    # DALTON-HOOK(browser-kill-switch): skip quality sync when features.browser is off.
     if (
-        not provider_class(computer["kind"]).browser_use
+        not is_feature_enabled_system("browser")
+        or not provider_class(computer["kind"]).browser_use
         or not computer.get("provider_ref")
         or computer.get("status") != "running"
     ):

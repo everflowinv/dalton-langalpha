@@ -276,7 +276,13 @@ def _internal_package_uploads(
     gates it cannot be handed different sets.
     """
     livefs = provider is None or provider.mounts_livefs
-    browser = provider is None or provider.browser_use
+    # DALTON-HOOK(browser-kill-switch): when deployment disables features.browser,
+    # skip uploading browser_runtime and the agent-browser PATH wrapper.
+    from src.config.features import is_feature_enabled_system
+
+    browser = (
+        provider is None or provider.browser_use
+    ) and is_feature_enabled_system("browser")
     src_init = src_dir / "__init__.py"
     if not src_init.exists():
         return []

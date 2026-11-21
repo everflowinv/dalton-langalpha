@@ -1268,11 +1268,17 @@ async def set_computer_browser_quality(
     A browser keeps the quality it started with, since changing it restarts the
     browser and loses its pages, so the choice reaches the next one it opens.
     """
+    from src.config.features import is_feature_enabled_system
     from src.server.services import browser_quality
 
     async with _computer_action_errors("set the live view quality for", computer_id):
         computer = await _owned_computer(computer_id, x_user_id)
-        if not provider_class(computer["kind"]).browser_use:
+        # DALTON-HOOK(browser-kill-switch): refuse browser-quality changes when
+        # features.browser is disabled for the deployment.
+        if (
+            not is_feature_enabled_system("browser")
+            or not provider_class(computer["kind"]).browser_use
+        ):
             raise HTTPException(status_code=409, detail="This computer has no browser.")
         if not await set_computer_settings(
             computer_id, x_user_id, browser_quality.saved(request.quality)

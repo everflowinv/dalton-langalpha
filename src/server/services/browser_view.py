@@ -23,6 +23,7 @@ from ptc_agent.core.sandbox.browser_runtime.protocol import (
 )
 from ptc_agent.core.sandbox.providers import provider_class
 from ptc_agent.core.sandbox.runtime import RuntimeState
+from src.config.features import is_feature_enabled_system  # DALTON-HOOK(browser-kill-switch)
 from src.server.database.computer import get_computer_for_workspace
 from src.server.services.preview_base import preview_base
 from src.server.services.preview_capabilities import proxied, publish
@@ -68,6 +69,9 @@ async def browser_available(workspace_id: str) -> bool:
     """Whether *workspace_id*'s kind of computer has a browser at all, read off
     its row so a computer that never has one is not reached for. A workspace not
     yet on a computer is placed on the deployment's own kind when it starts."""
+    # DALTON-HOOK(browser-kill-switch): treat browser as unavailable when features.browser is off.
+    if not is_feature_enabled_system("browser"):
+        return False
     computer = await get_computer_for_workspace(workspace_id)
     return computer is None or provider_class(computer["kind"]).browser_use
 

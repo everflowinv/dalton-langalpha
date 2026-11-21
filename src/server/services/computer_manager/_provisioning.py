@@ -52,6 +52,7 @@ from src.server.services.persistence.file import (
     RestoreIdentityLost,
 )
 from src.server.services.persistence.sync_result import BackupIncomplete
+from src.config.features import is_feature_enabled_system  # DALTON-HOOK(browser-kill-switch)
 from src.server.services import browser_quality
 from src.server.services.computer_usage.events import note_start_path
 from src.server.services.computer_usage.causes import computer_cause
@@ -336,6 +337,9 @@ class ProvisioningMixin:
         """Hand the machine its owner's live view quality once its runtime has
         synced, since the runtime is what takes it. Only the first acquire on a
         sandbox writes, or one whose row says it changed."""
+        # DALTON-HOOK(browser-kill-switch): skip quality sync when features.browser is off.
+        if not is_feature_enabled_system("browser"):
+            return
         await browser_quality.keep(
             sandbox,
             kind=binding.kind,

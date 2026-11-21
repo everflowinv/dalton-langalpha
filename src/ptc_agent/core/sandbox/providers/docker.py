@@ -1044,10 +1044,16 @@ class DockerProvider(SandboxProvider):
                 tar.add(dockerfile_path, arcname=dockerfile_basename)
             build_tar.seek(0)
 
+            from src.config.features import is_feature_enabled_system
+
+            # DALTON-HOOK(browser-kill-switch): match upstream default (install
+            # agent-browser) unless deployment disables features.browser.
+            install_browser = "1" if is_feature_enabled_system("browser") else "0"
             async for log_line in client.images.build(
                 fileobj=build_tar,
                 path_dockerfile=dockerfile_basename,
                 tag=image_tag,
+                buildargs={"INSTALL_AGENT_BROWSER": install_browser},
                 rm=True,
                 stream=True,
                 encoding="identity",

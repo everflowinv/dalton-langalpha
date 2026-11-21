@@ -513,7 +513,10 @@ export function useRightPanel({
   }, [isColleague, isMobile, landInFilePanel, filePanelWorkspaceId, leaveFiles, setFilePanelWorkspaceId, applyPanelWidth, pushPanelHistory, workspaceId, resolveAndSetPreview]);
 
   const { viewFor: browserViewFor, handleBrowserUse, openInBrowser } = useChatBrowser({
-    workspaceId, threadId: threadId ?? null, computer, shared, browserOn, isMobile, panelOpen: rightPanelType === 'file',
+    workspaceId, threadId: threadId ?? null, computer, shared,
+    // DALTON-HOOK(workspace-sharing-settings): do not auto-open the Browser tab or offer openInBrowser in colleague views
+    browserOn: browserOn && !isColleague,
+    isMobile, panelOpen: rightPanelType === 'file',
     filePanelWorkspaceId, setFilePanelWorkspaceId, askPanel, land: landInFilePanel, leave: leaveFiles,
   });
 

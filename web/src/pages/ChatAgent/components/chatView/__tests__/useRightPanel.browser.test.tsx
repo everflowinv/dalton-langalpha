@@ -33,6 +33,8 @@ function open({
   shared = false,
   isMobile = false,
   browserOn = true,
+  // DALTON-HOOK(workspace-sharing-settings): allow colleague-view regression cases
+  isColleague = false,
 } = {}) {
   const { result } = renderHook(() => useRightPanel({
     isMobile,
@@ -46,6 +48,7 @@ function open({
     computer,
     shared,
     browserOn,
+    isColleague,
   }), { wrapper: ({ children }) => <MemoryRouter>{children}</MemoryRouter> });
   setFilePanelWorkspaceId.mockClear();
   return result;
@@ -126,6 +129,19 @@ describe('the agent using the browser', () => {
     act(() => result.current.handleBrowserUse(use()));
     expect(poke).toHaveBeenCalled();
   });
+
+  // DALTON-HOOK(workspace-sharing-settings): suppress auto-opening Browser tab in colleague views
+  it('brings no Browser tab up on tool events in a colleague view even when browserOn is enabled', () => {
+    const closed = open({ computer: null, shared: true, browserOn: true, isColleague: true });
+    act(() => closed.current.handleBrowserUse(use('agent-browser open example.com')));
+    expect(closed.current.rightPanelType).not.toBe('file');
+    expect(closed.current.panelTarget).toBeNull();
+
+    const opened = open({ computer: null, shared: true, browserOn: true, isColleague: true });
+    act(() => opened.current.handleToggleFilePanel());
+    act(() => opened.current.handleBrowserUse(use('agent-browser snapshot')));
+    expect(opened.current.panelTarget).toBeNull();
+  });
 });
 
 describe('a link opened in the agent browser', () => {
@@ -151,6 +167,11 @@ describe('a link opened in the agent browser', () => {
 
   it('is offered to a member of a shared workspace, whose computer always has one', () => {
     expect(open({ computer: null, shared: true }).current.linkActions.openInBrowser).toBeTypeOf('function');
+  });
+
+  // DALTON-HOOK(workspace-sharing-settings): suppress openInBrowser link action in colleague views
+  it('is withheld in a colleague view even when the workspace is shared and browserOn is enabled', () => {
+    expect(open({ computer: null, shared: true, browserOn: true, isColleague: true }).current.linkActions.openInBrowser).toBeNull();
   });
 
   it('keeps one view per workspace for the life of the chat', () => {
