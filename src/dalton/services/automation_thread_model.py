@@ -120,21 +120,28 @@ def _delivery_execution_id(request: Any) -> str | None:
     return None
 
 
-async def _get_execution_by_id(execution_id: str) -> dict[str, Any] | None:
-    async with get_db_connection() as conn:
+async def _get_execution_by_id(
+    execution_id: str,
+    *,
+    conn: Any = None,
+) -> dict[str, Any] | None:
+    sql = """
+        SELECT e.automation_execution_id, e.automation_id, e.status,
+               e.conversation_thread_id, e.started_at, e.created_at,
+               a.user_id, a.thread_strategy
+        FROM automation_executions e
+        JOIN automations a ON a.automation_id = e.automation_id
+        WHERE e.automation_execution_id = %s::uuid
+        LIMIT 1
+    """
+    if conn is not None:
         async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                SELECT e.automation_execution_id, e.automation_id, e.status,
-                       e.conversation_thread_id, e.started_at, e.created_at,
-                       a.user_id
-                FROM automation_executions e
-                JOIN automations a ON a.automation_id = e.automation_id
-                WHERE e.automation_execution_id = %s::uuid
-                LIMIT 1
-                """,
-                (execution_id,),
-            )
+            await cur.execute(sql, (execution_id,))
+            row = await cur.fetchone()
+            return dict(row) if row else None
+    async with get_db_connection() as own_conn:
+        async with own_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(sql, (execution_id,))
             row = await cur.fetchone()
             return dict(row) if row else None
 
@@ -756,3 +763,185 @@ async def resolve_turn_config_with_automation_inheritance(
             fall_back=from_service,
             resolve=resolve,
         )
+
+
+def _extract_eligible_execution_and_model(
+    *,
+    request: Any,
+    effective_model: str | None,
+    run_metadata: Mapping[str, Any] | None = None,
+    from_server: bool = False,
+    is_shared: bool = False,
+    turn_index: int | None = None,
+) -> tuple[str, str] | None:
+    """Validate common automation turn preconditions and return ``(exec_id, model)``."""
+    if not from_server or is_shared:
+        return None
+    if turn_index is None or isinstance(turn_index, bool) or turn_index != 0:
+        return None
+    if getattr(request, "query_type", None) in NOTIFICATION_QUERY_TYPES:
+        return None
+    if getattr(request, "retry_of_run_id", None):
+        return None
+    exec_id = (
+        run_metadata.get("automation_execution_id")
+        if isinstance(run_metadata, Mapping)
+        else None
+    )
+    if exec_id is None or isinstance(exec_id, bool) or not str(exec_id).strip():
+        return None
+    if isinstance(run_metadata, Mapping) and run_metadata.get("subscription_fallback"):
+        return None
+    if isinstance(effective_model, str) and effective_model.strip():
+        return str(exec_id).strip(), effective_model.strip()
+    return None
+
+
+def resolve_automation_thread_model_to_remember(
+    *,
+    request: Any,
+    effective_model: str | None,
+    run_metadata: Mapping[str, Any] | None = None,
+    from_server: bool = False,
+    is_shared: bool = False,
+    turn_index: int | None = None,
+    thread_strategy: str | None = None,
+) -> str | None:
+    """Return the model to persist onto ``conversation_threads.llm_model``, or ``None``.
+
+    Persists only on the first turn (``turn_index == 0``) of an executor-started
+    automation run (requiring non-empty ``run_metadata["automation_execution_id"]``;
+    ``origin.type == "automation"`` alone is insufficient) whose automation uses
+    ``thread_strategy == "new"`` in a non-shared workspace. Automations that reuse a
+    pinned thread (``thread_strategy == "continue"``, including a pre-created empty
+    thread) and subsequent turns are skipped so threads meant to follow the account
+    default stay NULL. Turns that triggered ``automation-subscription-fallback``
+    (``run_metadata["subscription_fallback"]``) also persist nothing.
+    """
+    extracted = _extract_eligible_execution_and_model(
+        request=request,
+        effective_model=effective_model,
+        run_metadata=run_metadata,
+        from_server=from_server,
+        is_shared=is_shared,
+        turn_index=turn_index,
+    )
+    if extracted is None:
+        return None
+    strategy = thread_strategy
+    if strategy is None and isinstance(run_metadata, Mapping):
+        raw_strategy = run_metadata.get("thread_strategy")
+        if isinstance(raw_strategy, str):
+            strategy = raw_strategy
+    if not isinstance(strategy, str) or strategy.strip().lower() != "new":
+        return None
+    return extracted[1]
+
+
+async def remember_thread_llm_model_if_unset(
+    conversation_thread_id: str,
+    llm_model: str,
+    *,
+    conn: Any = None,
+) -> bool:
+    """Persist ``llm_model`` onto ``conversation_threads.llm_model`` only while NULL.
+
+    Uses ``WHERE llm_model IS NULL`` so any model set manually by the user
+    (via web UI or ``switch_thread_model``) or by an earlier turn is preserved.
+    Leaves ``updated_at`` untouched.
+    """
+    thread_id = str(conversation_thread_id or "").strip()
+    model = str(llm_model or "").strip()
+    if not thread_id or not model:
+        return False
+    sql = """
+        UPDATE conversation_threads
+        SET llm_model = %s
+        WHERE conversation_thread_id = %s
+          AND llm_model IS NULL
+    """
+    if conn is not None:
+        async with conn.cursor() as cur:
+            await cur.execute(sql, (model, thread_id))
+            return cur.rowcount > 0
+    async with get_db_connection() as own_conn:
+        async with own_conn.cursor() as cur:
+            await cur.execute(sql, (model, thread_id))
+            return cur.rowcount > 0
+
+
+async def remember_automation_thread_model(
+    *,
+    thread_id: str,
+    request: Any,
+    effective_model: str | None,
+    run_metadata: Mapping[str, Any] | None = None,
+    from_server: bool = False,
+    is_shared: bool = False,
+    turn_index: int | None = None,
+    thread_strategy: str | None = None,
+    conn: Any = None,
+) -> bool:
+    """Remember a ``thread_strategy='new'`` automation turn's model when NULL."""
+    extracted = _extract_eligible_execution_and_model(
+        request=request,
+        effective_model=effective_model,
+        run_metadata=run_metadata,
+        from_server=from_server,
+        is_shared=is_shared,
+        turn_index=turn_index,
+    )
+    if extracted is None:
+        return False
+    exec_id, _ = extracted
+    resolved_strategy = thread_strategy
+    if resolved_strategy is None and isinstance(run_metadata, Mapping):
+        raw_strategy = run_metadata.get("thread_strategy")
+        if isinstance(raw_strategy, str):
+            resolved_strategy = raw_strategy
+    if resolved_strategy is None:
+        norm_exec_id = normalize_uuid(exec_id)
+        if norm_exec_id is None:
+            return False
+        try:
+            exec_row = (
+                await _get_execution_by_id(norm_exec_id, conn=conn)
+                if conn is not None
+                else await _get_execution_by_id(norm_exec_id)
+            )
+        except Exception:
+            logger.warning(
+                f"[AUTOMATION_THREAD_MODEL] Failed reading thread_strategy for execution_id={norm_exec_id} thread={thread_id}",
+                exc_info=True,
+            )
+            return False
+        if not exec_row:
+            return False
+        raw_db_strategy = exec_row.get("thread_strategy")
+        resolved_strategy = str(raw_db_strategy) if isinstance(raw_db_strategy, str) else ""
+    model = resolve_automation_thread_model_to_remember(
+        request=request,
+        effective_model=effective_model,
+        run_metadata=run_metadata,
+        from_server=from_server,
+        is_shared=is_shared,
+        turn_index=turn_index,
+        thread_strategy=resolved_strategy,
+    )
+    if not model:
+        return False
+    try:
+        updated = await remember_thread_llm_model_if_unset(
+            thread_id, model, conn=conn
+        )
+        if updated:
+            logger.info(
+                f"[AUTOMATION_THREAD_MODEL] Remembered model {model!r} on thread={thread_id}"
+            )
+        return updated
+    except Exception:
+        logger.warning(
+            f"[AUTOMATION_THREAD_MODEL] Failed persisting model {model!r} onto thread={thread_id}",
+            exc_info=True,
+        )
+        return False

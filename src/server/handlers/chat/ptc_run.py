@@ -792,6 +792,20 @@ async def astream_ptc_workflow(
             yield DISPATCH_STARTED_MARKER
 
         await keep_named_model(thread_id, named_model)
+        # DALTON-HOOK(automation-thread-model): persist automation turn's model onto conversation_threads on turn 0 when llm_model IS NULL and thread_strategy == 'new' (skipping fallback turns)
+        from src.dalton.services.automation_thread_model import (
+            remember_automation_thread_model,
+        )
+
+        await remember_automation_thread_model(
+            thread_id=thread_id,
+            request=request,
+            effective_model=effective_model,
+            run_metadata=run_metadata,
+            from_server=from_server,
+            is_shared=identity.shared,
+            turn_index=run_handle.turn_index,
+        )
 
         # =====================================================================
         # Token and Tool Tracking
