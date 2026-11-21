@@ -19,6 +19,54 @@ from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
 
+_REPORTED_TOKEN_KEYS: tuple[str, ...] = (
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cached_tokens",
+    "cache_5m_tokens",
+    "cache_1h_tokens",
+)
+
+
+def has_reported_token_usage(usage: Any) -> bool:
+    """Return True when ``usage`` carries positive provider-reported token counts."""
+    if not isinstance(usage, Mapping):
+        return False
+    raw_calls = usage.get("per_call_usages")
+    if isinstance(raw_calls, list):
+        for item in raw_calls:
+            if isinstance(item, Mapping):
+                for key in _REPORTED_TOKEN_KEYS:
+                    val = item.get(key)
+                    if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
+                        return True
+    for key in _REPORTED_TOKEN_KEYS:
+        val = usage.get(key)
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
+            return True
+    return False
+
+
+def is_unknown_usage_journal_row(row: Mapping[str, Any]) -> bool:
+    """Return True when a journal row ended ``indeterminate`` without complete provider usage
+    (e.g. timeout, 5xx, stream cut, or crash before usage was reported)."""
+    if not isinstance(row, Mapping) or str(row.get("state") or "") != "indeterminate":
+        return False
+    usage = row.get("usage")
+    if isinstance(usage, Mapping) and usage.get("usage_known") is False:
+        return True
+    if has_reported_token_usage(usage):
+        return False
+    try:
+        if Decimal(str(row.get("cash_usd") or "0")) > Decimal("0"):
+            return False
+        if Decimal(str(row.get("notional_usd") or "0")) > Decimal("0"):
+            return False
+    except Exception:
+        pass
+    return True
+
 
 def _is_stale(claimed_at: Any, stale_after_s: int, now_utc: datetime | None = None) -> bool:
     if not isinstance(claimed_at, datetime):
@@ -432,8 +480,8 @@ async def complete_journal_done(
                     completed_at = NOW(),
                     response = %s::jsonb,
                     usage = {usage_clause},
-                    cash_usd = %s,
-                    notional_usd = %s,
+                    cash_usd = COALESCE(cash_usd, 0) + %s,
+                    notional_usd = COALESCE(notional_usd, 0) + %s,
                     provider = COALESCE(%s, provider),
                     billing_type = COALESCE(%s, billing_type),
                     error_kind = NULL,
@@ -509,8 +557,10 @@ async def complete_journal_failed(
     error_kind: str,
     error_text: str | BaseException | None,
     state: str = "failed",
+    usage: dict[str, Any] | None = None,
     cash_usd: Decimal | None = None,
     notional_usd: Decimal | None = None,
+    stamp_credential_holder: bool = True,
     conn: Any = None,
 ) -> dict[str, Any] | None:
     """Transition a journal row to `state='failed'` or `state='indeterminate'`.
@@ -520,22 +570,38 @@ async def complete_journal_failed(
     itself a pending→indeterminate transition); a stale worker returning after
     a newer attempt took over finds no matching row, logs a warning, and
     returns None instead of clobbering the newer attempt's state.
+
+    Accumulates ``cash_usd`` / ``notional_usd`` onto any prior attempt's billed
+    totals so retries on the same ``invocation_id`` neither lose nor double-count
+    completed upstream provider charges.
     """
     if state not in ("failed", "indeterminate"):
         state = "indeterminate"
     safe_err = sanitize_error_text(error_text, max_len=300)
 
+    usage_sql = ""
+    usage_params: tuple[Any, ...] = ()
+    if usage is not None:
+        usage_json = json.dumps(usage, ensure_ascii=False, default=str)
+        usage_clause = (
+            "COALESCE(usage, '{}'::jsonb) || %s::jsonb"
+            if (stamp_credential_holder and is_team_credential_sharing_enabled())
+            else "%s::jsonb"
+        )
+        usage_sql = f",\n                    usage = {usage_clause}"
+        usage_params = (usage_json,)
+
     async def _do_update(c: Any) -> dict[str, Any] | None:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
+                f"""
                 UPDATE dalton_llm_journal
                 SET state = %s,
                     completed_at = NOW(),
                     error_kind = %s,
                     error_text = %s,
-                    cash_usd = COALESCE(%s, cash_usd),
-                    notional_usd = COALESCE(%s, notional_usd)
+                    cash_usd = COALESCE(cash_usd, 0) + COALESCE(%s, 0),
+                    notional_usd = COALESCE(notional_usd, 0) + COALESCE(%s, 0){usage_sql}
                 -- Only the attempt that claimed the row writes it back. A stale
                 -- mark (pending -> indeterminate) keeps the attempt number, so
                 -- that attempt may still settle it -- a long call past the stale
@@ -545,7 +611,16 @@ async def complete_journal_failed(
                   AND state IN ('pending', 'indeterminate')
                 RETURNING *
                 """,
-                (state, error_kind, safe_err, cash_usd, notional_usd, invocation_id, int(attempt)),
+                (
+                    state,
+                    error_kind,
+                    safe_err,
+                    cash_usd,
+                    notional_usd,
+                    *usage_params,
+                    invocation_id,
+                    int(attempt),
+                ),
             )
             row = await cur.fetchone()
             if row is None:

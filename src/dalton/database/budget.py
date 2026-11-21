@@ -516,7 +516,7 @@ async def fetch_journal_cash_today(
     day_end_utc: datetime,
     user_id: str | None = None,
 ) -> Decimal:
-    """Sum `cash_usd` from `dalton_llm_journal` for today where `state IN ('done', 'indeterminate')` (P0N.6 §5, P0N.7, P0H §5 B2).
+    """Sum `cash_usd` from `dalton_llm_journal` for today where `state IN ('done', 'indeterminate')` or `cash_usd > 0` (P0N.6 §5, P0N.7, P0H §5 B2).
 
     Fails closed by logging ERROR and re-raising on DB query failure.
     """
@@ -525,7 +525,7 @@ async def fetch_journal_cash_today(
         FROM dalton_llm_journal
         WHERE created_at >= %s
           AND created_at < %s
-          AND state IN ('done', 'indeterminate')
+          AND (state IN ('done', 'indeterminate') OR cash_usd > 0)
           AND (%s::text IS NULL OR user_id = %s OR user_id IS NULL)
     """
     params = (day_start_utc, day_end_utc, user_id, user_id)
@@ -606,7 +606,7 @@ async def fetch_scoped_task_spend(
                 """
                 SELECT COALESCE(SUM(cash_usd), 0) AS journal_scoped_usd
                 FROM dalton_llm_journal
-                WHERE state IN ('done', 'indeterminate')
+                WHERE (state IN ('done', 'indeterminate') OR cash_usd > 0)
                   AND (%s::text IS NULL OR user_id = %s OR user_id IS NULL)
                   AND scope_ref LIKE %s
                 """,

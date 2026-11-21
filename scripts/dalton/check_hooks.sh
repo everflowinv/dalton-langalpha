@@ -460,6 +460,8 @@ ALLOWED_HOOKS=(
   "browser-kill-switch"
   # Background-slot calls default to low reasoning effort (src/server/services/llm/config.py).
   "background-effort-low"
+  # Bill completed upstream provider usage even when structured-output parsing fails or a later retry aborts (src/llms/api_call.py).
+  "complete-parse-failure-billing"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

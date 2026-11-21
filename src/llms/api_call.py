@@ -32,6 +32,63 @@ def redact_parse_error_logs():
         _REDACT_PARSE_ERROR_LOGS.reset(token)
 
 
+# DALTON-HOOK(complete-parse-failure-billing): carry accumulated provider usage on exhausted
+# structured-output parse errors and expose an opt-in per-call usage collector so callers can
+# bill completed upstream calls even when parsing fails or a later retry times out/aborts.
+class StructuredOutputParseError(ValueError):
+    """Raised when structured-output parsing exhausts retries; carries accumulated provider usage."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        token_usage: Optional[Dict[str, Any]] = None,
+        retry_attempts: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.token_usage: Dict[str, Any] = dict(token_usage) if isinstance(token_usage, dict) else {}
+        self.retry_attempts = int(retry_attempts)
+        self.parsing_failed = True
+
+
+_USAGE_ACCUMULATOR: ContextVar[Optional[list[Dict[str, Any]]]] = ContextVar(
+    "dalton_api_call_usage_accumulator",
+    default=None,
+)
+_REPORTED_TOKEN_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cached_tokens",
+    "cache_5m_tokens",
+    "cache_1h_tokens",
+)
+
+
+@contextlib.contextmanager
+def collect_api_call_usage():
+    """Collect per-call provider token usage dicts emitted by ``make_api_call`` within this context."""
+    bucket: list[Dict[str, Any]] = []
+    token = _USAGE_ACCUMULATOR.set(bucket)
+    try:
+        yield bucket
+    finally:
+        _USAGE_ACCUMULATOR.reset(token)
+
+
+def _record_collected_usage(token_info: Any) -> None:
+    bucket = _USAGE_ACCUMULATOR.get()
+    if bucket is None or not isinstance(token_info, dict):
+        return
+    numeric = {
+        k: v
+        for k, v in token_info.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
+    if any(numeric.get(k, 0) > 0 for k in _REPORTED_TOKEN_KEYS):
+        bucket.append(numeric)
+
+
 def create_messages(system_prompt: str, user_prompt: str) -> list:
     """Create a list of messages for LLM invocation.
 
@@ -117,6 +174,8 @@ async def make_api_call(
 
             # Extract token usage (silent by default)
             token_info = extract_token_usage(response)
+            # DALTON-HOOK(complete-parse-failure-billing): record completed upstream call usage.
+            _record_collected_usage(token_info)
 
             if return_token_usage:
                 return content, token_info
@@ -141,6 +200,8 @@ async def make_api_call(
                 raw_response = response_with_raw['raw']
                 if raw_response is not None:
                     token_info = extract_token_usage(raw_response)
+                    # DALTON-HOOK(complete-parse-failure-billing): record native raw call usage even if parsed is None.
+                    _record_collected_usage(token_info)
                     if token_info:
                         raw_token_info = {
                             k: v
@@ -184,6 +245,8 @@ async def make_api_call(
                     # DALTON-HOOK(notional-pricing): accumulate scalar token counts and
                     # append each real response's usage to `per_call_usages`.
                     token_info = extract_token_usage(response)
+                    # DALTON-HOOK(complete-parse-failure-billing): record each fallback call's usage as it arrives.
+                    _record_collected_usage(token_info)
                     if token_info:
                         call_usage: Dict[str, Any] = {}
                         for key, value in token_info.items():
@@ -246,6 +309,18 @@ async def make_api_call(
                         )
                         await asyncio.sleep(0.5 * retry_count)  # Exponential backoff
                         continue
+                except Exception as retry_exc:
+                    # DALTON-HOOK(complete-parse-failure-billing): preserve usage from earlier
+                    # completed calls if a subsequent retry aborts with timeout/5xx/stream cut.
+                    if per_call_usages and getattr(retry_exc, "token_usage", None) is None:
+                        partial_usage = dict(total_token_info)
+                        partial_usage["retry_attempts"] = retry_count
+                        partial_usage["per_call_usages"] = [dict(cu) for cu in per_call_usages]
+                        try:
+                            setattr(retry_exc, "token_usage", partial_usage)
+                        except Exception:
+                            pass
+                    raise
 
             # All retries failed, raise the last error with context
             # DALTON-HOOK(notional-pricing): retain per_call_usages on exhausted parsing retries.
@@ -261,11 +336,20 @@ async def make_api_call(
                 error_msg = f"Failed to parse response after {retry_count} attempts. Last error: {last_error}"
             logger.debug(error_msg)  # Changed from error to debug to reduce console noise
 
-            # If return_token_usage is True, we still need to return something
+            # DALTON-HOOK(complete-parse-failure-billing): raise StructuredOutputParseError (ValueError
+            # subclass) carrying `token_usage` so journal billing records all completed upstream calls.
             if return_token_usage:
-                raise ValueError(error_msg + f" | Token usage: {total_token_info}")
+                raise StructuredOutputParseError(
+                    error_msg + f" | Token usage: {total_token_info}",
+                    token_usage=total_token_info,
+                    retry_attempts=retry_count,
+                )
             else:
-                raise ValueError(error_msg)
+                raise StructuredOutputParseError(
+                    error_msg,
+                    token_usage=total_token_info,
+                    retry_attempts=retry_count,
+                )
     
 
 async def parse_structured_output(llm: object, text: str, schema_class: Optional[Type[BaseModel]] = None) -> Union[BaseModel, Dict[str, Any]]:
