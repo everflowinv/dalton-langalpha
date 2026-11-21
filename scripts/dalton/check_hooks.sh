@@ -443,6 +443,9 @@ ALLOWED_HOOKS=(
   # Agent-triggered current-thread model switch (switch_thread_model Dalton tool
   # and extracted switch_thread_model service shared with PATCH /threads/{id}).
   "agent-switch-model"
+  # Preserve server-written dalton_historical_duplicate_of marker in
+  # SERVER_OWNED_CONFIG_KEYS across whole-config replacements (workspace.py).
+  "historical-duplicate-marker"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
