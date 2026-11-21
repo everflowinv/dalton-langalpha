@@ -35,6 +35,9 @@ HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
     ("llm/antigravity_series.py", "gemini-4-hydrogen"): "User-confirmed series default effort table (single config point)",
     ("llm/antigravity_series.py", "gemini-4-argon"): "User-confirmed series default effort table (single config point)",
     ("llm/antigravity_series.py", "gemini-4-carbon"): "User-confirmed series default effort table (single config point)",
+    ("llm/antigravity_series.py", "gemini-"): "Google vendor prefix for Antigravity vendor-level quota cooldown pooling",
+    ("llm/antigravity_series.py", "claude-"): "Anthropic vendor prefix for Antigravity vendor-level quota cooldown pooling",
+    ("llm/antigravity_series.py", "gpt-"): "OpenAI vendor prefix for Antigravity vendor-level quota cooldown pooling",
     ("tools/ai_finance_signals_tools.py", "gemini-embedding-2"): (
         "Validates the migrated signal store's fixed 768-dimensional embedding format; "
         "does not select the conversation model."

@@ -1003,13 +1003,17 @@ def _make_antigravity_client(
     account_id: str = "acct-google-1",
     credential_id: str = "cred-google-1",
     custom_entry: dict | None = None,
-    billing_type: str | None = None,
+    billing_type: str | None = "oauth",
 ) -> _FakeModel:
     from src.dalton.llm.oauth_refresh import OAuthRebuildSpec, tag_oauth_client
 
     client = _FakeModel(model_name)
     if billing_type is not None:
-        client.metadata = {"billing_type": billing_type, "pricing_provider": provider}
+        client.metadata = {
+            "billing_type": billing_type,
+            "pricing_provider": provider,
+            "manifest_model": model_name,
+        }
     tag_oauth_client(
         client,
         OAuthRebuildSpec(
@@ -1024,7 +1028,10 @@ def _make_antigravity_client(
     return client
 
 
-def _make_memory_redis_cache(store: dict[str, dict]):
+def _make_memory_redis_cache(
+    store: dict[str, dict],
+    ttl_calls: list[tuple[str, int | None]] | None = None,
+):
     from unittest.mock import create_autospec
 
     from src.utils.cache.redis_cache import RedisCacheClient
@@ -1035,7 +1042,8 @@ def _make_memory_redis_cache(store: dict[str, dict]):
         return store.get(key)
 
     async def fake_set(key: str, value: dict, ttl=None):
-        _ = ttl
+        if ttl_calls is not None:
+            ttl_calls.append((key, ttl))
         store[key] = value
         return True
 
@@ -1045,15 +1053,17 @@ def _make_memory_redis_cache(store: dict[str, dict]):
 
 
 @pytest.mark.asyncio
-async def test_antigravity_series_cooldown_shared_across_efforts_and_isolated_by_series_and_account(
+async def test_antigravity_vendor_cooldown_shared_with_oauth_billing_and_isolated_by_vendor_and_account(
     no_sleep, events, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Built-in Antigravity variants in one series share a `:series:` cooldown key;
-    different series and different Google accounts (cred_id) remain isolated."""
+    """With realistic billing_type='oauth', OAuth calls do not auto-fallback; exhausting one
+    Antigravity model immediately cools down all models of the same upstream vendor on that
+    account (0 upstream requests) while leaving other vendors and other Google accounts unaffected."""
     from langchain.agents.middleware.types import ModelResponse
     from langchain_core.messages import AIMessage
 
     from ptc_agent.agent.middleware.model_resilience import (
+        RESILIENCE_TRACE_ATTR,
         check_oauth_quota_cooldown,
         quota_redis_key,
     )
@@ -1069,11 +1079,20 @@ async def test_antigravity_series_cooldown_shared_across_efforts_and_isolated_by
     neon_medium = _make_antigravity_client(
         "gemini-4-neon-medium-oauth", user_id="u1", credential_id="cred-a"
     )
-    neon_low = _make_antigravity_client(
-        "gemini-4-neon-low-oauth", user_id="u1", credential_id="cred-a"
-    )
     hydrogen_high = _make_antigravity_client(
         "gemini-4-hydrogen-high-oauth", user_id="u1", credential_id="cred-a"
+    )
+    argon_low = _make_antigravity_client(
+        "gemini-4-argon-low-oauth", user_id="u1", credential_id="cred-a"
+    )
+    claude_opus = _make_antigravity_client(
+        "claude-opus-5-5-high-oauth", user_id="u1", credential_id="cred-a"
+    )
+    claude_sonnet = _make_antigravity_client(
+        "claude-sonnet-5-5-low-oauth", user_id="u1", credential_id="cred-a"
+    )
+    gpt_oss = _make_antigravity_client(
+        "gpt-oss-120b-medium-oauth", user_id="u1", credential_id="cred-a"
     )
     neon_other_acct = _make_antigravity_client(
         "gemini-4-neon-medium-oauth",
@@ -1082,57 +1101,117 @@ async def test_antigravity_series_cooldown_shared_across_efforts_and_isolated_by
         credential_id="cred-b",
     )
 
-    # Disjoint `:series:` key format shared across same-series variants
-    key_high = quota_redis_key("gemini-4-neon-high-oauth", neon_high)
-    key_med = quota_redis_key("gemini-4-neon-medium-oauth", neon_medium)
-    key_hydro = quota_redis_key("gemini-4-hydrogen-high-oauth", hydrogen_high)
-    key_other_acct = quota_redis_key("gemini-4-neon-medium-oauth", neon_other_acct)
-    assert key_high == "dalton:quota_exhausted:u1:antigravity-oauth:series:gemini-4-neon:cred-a"
-    assert key_med == key_high
-    assert key_hydro == "dalton:quota_exhausted:u1:antigravity-oauth:series:gemini-4-hydrogen:cred-a"
-    assert key_other_acct == "dalton:quota_exhausted:u1:antigravity-oauth:series:gemini-4-neon:cred-b"
-
-    # Exhaust neon-high -> same-series neon-medium & neon-low are skipped straight to hydrogen-high
-    mw = _make_middleware(
-        neon_high,
-        [
-            ("gemini-4-neon-medium-oauth", neon_medium),
-            ("gemini-4-neon-low-oauth", neon_low),
-            ("gemini-4-hydrogen-high-oauth", hydrogen_high),
-        ],
+    # Disjoint `:vendor:` keys grouped by upstream vendor (google / anthropic / openai)
+    google_key = "dalton:quota_exhausted:u1:antigravity-oauth:vendor:google:cred-a"
+    anthropic_key = "dalton:quota_exhausted:u1:antigravity-oauth:vendor:anthropic:cred-a"
+    openai_key = "dalton:quota_exhausted:u1:antigravity-oauth:vendor:openai:cred-a"
+    assert quota_redis_key("gemini-4-neon-high-oauth", neon_high) == google_key
+    assert quota_redis_key("gemini-4-neon-medium-oauth", neon_medium) == google_key
+    assert quota_redis_key("gemini-4-hydrogen-high-oauth", hydrogen_high) == google_key
+    assert quota_redis_key("gemini-4-argon-low-oauth", argon_low) == google_key
+    assert quota_redis_key("claude-opus-5-5-high-oauth", claude_opus) == anthropic_key
+    assert quota_redis_key("claude-sonnet-5-5-low-oauth", claude_sonnet) == anthropic_key
+    assert quota_redis_key("gpt-oss-120b-medium-oauth", gpt_oss) == openai_key
+    assert (
+        quota_redis_key("gemini-4-neon-medium-oauth", neon_other_acct)
+        == "dalton:quota_exhausted:u1:antigravity-oauth:vendor:google:cred-b"
     )
-    calls: list[str] = []
 
-    async def handler(req):
-        calls.append(req.model.model)
-        if req.model is neon_high:
-            raise _refusal(ANTIGRAVITY_LONG_RESET_429, 429)
-        return ModelResponse(result=[AIMessage(f"answered:{req.model.model}")])
+    # Call 1: Neon High (billing_type="oauth") exhausts Google pool; OAuth does not fallback
+    # even when fallbacks are passed, and records exactly 1 attempt (no duplicate attempts=0).
+    mw_neon = _make_middleware(
+        neon_high,
+        [("claude-opus-5-5-high-oauth", claude_opus)],
+    )
+    calls_neon: list[str] = []
 
-    res = await mw.awrap_model_call(_FakeRequest(neon_high), handler)
-    assert res.result[0].content == "answered:gemini-4-hydrogen-high-oauth"
-    assert calls == ["gemini-4-neon-high-oauth", "gemini-4-hydrogen-high-oauth"]
-    assert key_high in store
+    async def neon_handler(req):
+        calls_neon.append(req.model.model)
+        raise _refusal(ANTIGRAVITY_LONG_RESET_429, 429)
 
-    # Pre-dispatch check on sibling tier also hits the shared series cooldown
-    msg = await check_oauth_quota_cooldown(neon_medium)
-    assert msg is not None and "gemini-4-neon-medium-oauth 的订阅额度已用完" in msg
-    assert await check_oauth_quota_cooldown(hydrogen_high) is None
+    with pytest.raises(Exception, match="Individual quota reached") as first_err:
+        await mw_neon.awrap_model_call(_FakeRequest(neon_high), neon_handler)
+    assert calls_neon == ["gemini-4-neon-high-oauth"]
+    assert google_key in store
+    first_trace = getattr(first_err.value, RESILIENCE_TRACE_ATTR, None)
+    assert first_trace is not None
+    assert len(first_trace["attempted_models"]) == 1
+    assert first_trace["attempted_models"][0]["model"] == "gemini-4-neon-high-oauth"
+    assert first_trace["attempted_models"][0]["attempts"] == 1
+
+    # Same-vendor models (Hydrogen / Neon Medium) on fresh worker immediately fail with quota
+    # exhaustion without dialing upstream.
+    for sibling in (hydrogen_high, neon_medium, argon_low):
+        mw_sib = _make_middleware(sibling, [("claude-opus-5-5-high-oauth", claude_opus)])
+        sib_calls: list[str] = []
+
+        async def sib_handler(req):
+            sib_calls.append(req.model.model)
+            raise AssertionError("Same-vendor cooled model must not dial upstream")
+
+        with pytest.raises(Exception, match=f"{sibling.model} 的订阅额度已用完") as sib_err:
+            await mw_sib.awrap_model_call(_FakeRequest(sibling), sib_handler)
+        assert sib_calls == []
+        assert getattr(sib_err.value, "status_code", None) == 429
+        assert "HKT" in str(sib_err.value)
+        sib_trace = getattr(sib_err.value, RESILIENCE_TRACE_ATTR, None)
+        assert sib_trace is not None
+        assert sib_trace["model"] == sibling.model
+        assert sib_trace["attempted_models"][0]["attempts"] == 0
+        assert sib_trace["attempted_models"][0]["status_code"] == 429
+
+    # Pre-dispatch check also shares vendor cooldown across all Gemini models, not other vendors/accounts
+    msg = await check_oauth_quota_cooldown(hydrogen_high)
+    assert msg is not None and "gemini-4-hydrogen-high-oauth 的订阅额度已用完" in msg
+    assert await check_oauth_quota_cooldown(claude_opus) is None
+    assert await check_oauth_quota_cooldown(gpt_oss) is None
     assert await check_oauth_quota_cooldown(neon_other_acct) is None
 
-    # Fresh middleware on same account + same series (neon-medium) skips directly to fallback
-    mw_sibling = _make_middleware(neon_medium, [("gemini-4-hydrogen-high-oauth", hydrogen_high)])
-    sibling_calls: list[str] = []
+    # Different vendors on the SAME account (Anthropic Claude & OpenAI GPT-OSS) succeed
+    for other_vendor in (claude_opus, gpt_oss):
+        mw_other = _make_middleware(other_vendor, [])
+        other_calls: list[str] = []
 
-    async def sibling_handler(req):
-        sibling_calls.append(req.model.model)
-        return ModelResponse(result=[AIMessage("ok")])
+        async def other_handler(req):
+            other_calls.append(req.model.model)
+            return ModelResponse(result=[AIMessage(f"ok:{req.model.model}")])
 
-    await mw_sibling.awrap_model_call(_FakeRequest(neon_medium), sibling_handler)
-    assert sibling_calls == ["gemini-4-hydrogen-high-oauth"]
+        res = await mw_other.awrap_model_call(_FakeRequest(other_vendor), other_handler)
+        assert res.result[0].content == f"ok:{other_vendor.model}"
+        assert other_calls == [other_vendor.model]
 
-    # Different Google account (cred-b) is isolated and still runs neon-medium
-    mw_acct_b = _make_middleware(neon_other_acct, [("gemini-4-hydrogen-high-oauth", hydrogen_high)])
+    # Exhausting Claude Opus cools down Claude Sonnet (same anthropic vendor), not GPT-OSS
+    mw_opus = _make_middleware(claude_opus, [])
+
+    async def opus_429(req):
+        raise _refusal(ANTIGRAVITY_LONG_RESET_429, 429)
+
+    with pytest.raises(Exception, match="Individual quota reached"):
+        await mw_opus.awrap_model_call(_FakeRequest(claude_opus), opus_429)
+    assert anthropic_key in store
+
+    mw_sonnet = _make_middleware(claude_sonnet, [])
+    sonnet_calls: list[str] = []
+
+    async def sonnet_handler(req):
+        sonnet_calls.append(req.model.model)
+        raise AssertionError("Claude Sonnet should share anthropic vendor cooldown")
+
+    with pytest.raises(Exception, match="claude-sonnet-5-5-low-oauth 的订阅额度已用完"):
+        await mw_sonnet.awrap_model_call(_FakeRequest(claude_sonnet), sonnet_handler)
+    assert sonnet_calls == []
+
+    # GPT-OSS (openai vendor) remains unaffected
+    mw_gpt = _make_middleware(gpt_oss, [])
+
+    async def gpt_handler(req):
+        return ModelResponse(result=[AIMessage("gpt-ok")])
+
+    gpt_res = await mw_gpt.awrap_model_call(_FakeRequest(gpt_oss), gpt_handler)
+    assert gpt_res.result[0].content == "gpt-ok"
+
+    # Different Google account (cred-b) is isolated and still runs Neon Medium
+    mw_acct_b = _make_middleware(neon_other_acct, [])
     acct_b_calls: list[str] = []
 
     async def acct_b_handler(req):
@@ -1145,10 +1224,193 @@ async def test_antigravity_series_cooldown_shared_across_efforts_and_isolated_by
 
 
 @pytest.mark.asyncio
-async def test_antigravity_series_cooldown_team_sharing_and_custom_same_name_isolation(
+async def test_all_skipped_cooldown_classified_as_upstream_429_not_internal_error(
     no_sleep, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Under credentials.sharing == 'team', all members share the holder's series cooldown;
+    """When all candidates are skipped on cooldown (e.g. fresh worker reading Redis),
+    the raised error carries RESILIENCE_TRACE_ATTR with current primary model, 429 status,
+    HKT reset time, and attempts=0 so stream_errors classifies it as upstream, not internal."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from ptc_agent.config.agent import CredentialPayer
+    from src.server.services.runs.stream_errors import (
+        error_event_data,
+        failure_kind,
+        failure_kind_metadata,
+        model_call_failure,
+    )
+
+    fixed_now = datetime(2026, 11, 21, 5, 0, tzinfo=timezone.utc).timestamp()
+    expires_at = datetime(2026, 11, 21, 8, 30, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr("ptc_agent.agent.middleware.model_resilience.time.time", lambda: fixed_now)
+    monkeypatch.setattr("src.dalton.credentials.get_team_credential_holder_id", lambda: None)
+
+    google_key = "dalton:quota_exhausted:u1:antigravity-oauth:vendor:google:cred-a"
+    # Even a Redis payload without status_code/message must preserve 429 + reset time + model
+    store: dict[str, dict] = {
+        google_key: {
+            "expires_at": expires_at,
+            "model": "gemini-4-neon-high-oauth",
+        }
+    }
+    cache = _make_memory_redis_cache(store)
+    monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: cache)
+
+    hydrogen = _make_antigravity_client(
+        "gemini-4-hydrogen-high-oauth", user_id="u1", credential_id="cred-a"
+    )
+    mw = _make_middleware(hydrogen, [])
+
+    async def should_not_dial(req):
+        raise AssertionError("Should not dial upstream when vendor is cooled")
+
+    with pytest.raises(Exception) as caught:
+        await mw.awrap_model_call(_FakeRequest(hydrogen), should_not_dial)
+
+    exc = caught.value
+    oauth_cfg = SimpleNamespace(
+        credential_source="oauth",
+        credential_payer=CredentialPayer(payer="subscription", account="Google Antigravity"),
+    )
+    assert getattr(exc, "status_code", None) == 429
+    assert "gemini-4-hydrogen-high-oauth" in str(exc)
+    assert "2026-11-21 16:30 HKT" in str(exc)
+
+    assert failure_kind(exc) == {
+        "kind": "upstream",
+        "status_code": 429,
+        "provider_module": None,
+    }
+    assert failure_kind_metadata(exc) == {"error_kind": "upstream"}
+    assert model_call_failure(exc, oauth_cfg) == {
+        "error_status_code": 429,
+        "error_credential_owned": True,
+    }
+
+    frame = error_event_data("thread-1", str(exc), exc=exc, config=oauth_cfg)
+    assert frame["error_kind"] == "upstream"
+    assert frame["status_code"] == 429
+    assert frame["model"] == "gemini-4-hydrogen-high-oauth"
+    assert frame["payer"] == "subscription"
+    assert "2026-11-21 16:30 HKT" in frame["error"]
+    assert len(frame["attempted_models"]) == 1
+    assert frame["attempted_models"][0]["model"] == "gemini-4-hydrogen-high-oauth"
+    assert frame["attempted_models"][0]["status_code"] == 429
+    assert frame["attempted_models"][0]["attempts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_legacy_single_model_redis_key_migrates_with_remaining_ttl(
+    no_sleep, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Upgrade transition: when the new vendor/model key is absent, reading cooldown
+    checks the legacy single-model key for the same credential holder & account, migrates
+    still-valid entries to the new key preserving remaining TTL, and ignores expired ones."""
+    from ptc_agent.agent.middleware.model_resilience import check_oauth_quota_cooldown
+
+    fake_now = 1_800_000_000.0
+    monkeypatch.setattr("ptc_agent.agent.middleware.model_resilience.time.time", lambda: fake_now)
+    monkeypatch.setattr("src.dalton.credentials.get_team_credential_holder_id", lambda: None)
+
+    ttl_calls: list[tuple[str, int | None]] = []
+    legacy_google_key = "dalton:quota_exhausted:u1:antigravity-oauth:gemini-4-neon-high-oauth:cred-1"
+    new_google_key = "dalton:quota_exhausted:u1:antigravity-oauth:vendor:google:cred-1"
+    legacy_claude_key = "dalton:quota_exhausted:u1:claude-oauth:claude-opus-5-5-oauth:cred-c"
+    new_claude_key = "dalton:quota_exhausted:u1:claude-oauth:model:claude-opus-5-5-oauth:cred-c"
+    legacy_codex_key = "dalton:quota_exhausted:u1:codex-oauth:gpt-6.2-sol-oauth:cred-x"
+    new_codex_key = "dalton:quota_exhausted:u1:codex-oauth:model:gpt-6.2-sol-oauth:cred-x"
+    expired_legacy_key = "dalton:quota_exhausted:u2:antigravity-oauth:gemini-4-neon-high-oauth:cred-2"
+    expired_new_key = "dalton:quota_exhausted:u2:antigravity-oauth:vendor:google:cred-2"
+
+    store: dict[str, dict] = {
+        legacy_google_key: {
+            "expires_at": fake_now + 1234.2,
+            "message": ANTIGRAVITY_LONG_RESET_429,
+            "status_code": 429,
+            "model": "gemini-4-neon-high-oauth",
+        },
+        legacy_claude_key: {
+            "expires_at": fake_now + 600.0,
+            "message": "quota exhausted",
+            "status_code": 429,
+            "model": "claude-opus-5-5-oauth",
+        },
+        legacy_codex_key: {
+            "expires_at": fake_now + 900.0,
+            "message": "quota exhausted",
+            "status_code": 429,
+            "model": "gpt-6.2-sol-oauth",
+        },
+        expired_legacy_key: {
+            "expires_at": fake_now - 5.0,
+            "message": "stale",
+            "status_code": 429,
+            "model": "gemini-4-neon-high-oauth",
+        },
+    }
+    cache = _make_memory_redis_cache(store, ttl_calls=ttl_calls)
+    monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: cache)
+
+    # 1. Antigravity async read migrates legacy key -> `:vendor:google` with remaining TTL (1235s)
+    neon_high = _make_antigravity_client(
+        "gemini-4-neon-high-oauth", user_id="u1", credential_id="cred-1"
+    )
+    hydrogen = _make_antigravity_client(
+        "gemini-4-hydrogen-high-oauth", user_id="u1", credential_id="cred-1"
+    )
+    mw_neon = _make_middleware(neon_high, [])
+
+    async def neon_should_not_run(req):
+        raise AssertionError("Legacy key should have cooled down neon_high")
+
+    with pytest.raises(Exception, match="gemini-4-neon-high-oauth 的订阅额度已用完"):
+        await mw_neon.awrap_model_call(_FakeRequest(neon_high), neon_should_not_run)
+    assert new_google_key in store
+    assert (new_google_key, 1235) in ttl_calls
+
+    # Migrated vendor key now immediately cools down sibling Gemini model (Hydrogen)
+    mw_hydro = _make_middleware(hydrogen, [])
+    assert await mw_hydro._aquota_skipped("gemini-4-hydrogen-high-oauth", hydrogen) is True
+
+    # 2. Non-Antigravity provider migrates legacy key -> `:model:` in pre-dispatch check
+    claude_client = _make_antigravity_client(
+        "claude-opus-5-5-oauth",
+        user_id="u1",
+        provider="claude-oauth",
+        credential_id="cred-c",
+    )
+    msg = await check_oauth_quota_cooldown(claude_client)
+    assert msg is not None and "claude-opus-5-5-oauth 的订阅额度已用完" in msg
+    assert new_claude_key in store
+    assert (new_claude_key, 600) in ttl_calls
+
+    # 3. Sync `_quota_skipped` also reads legacy key and migrates to new key with remaining TTL
+    codex_client = _make_antigravity_client(
+        "gpt-6.2-sol-oauth",
+        user_id="u1",
+        provider="codex-oauth",
+        credential_id="cred-x",
+    )
+    mw_codex = _make_middleware(codex_client, [])
+    assert mw_codex._quota_skipped("gpt-6.2-sol-oauth", codex_client) is True
+    assert new_codex_key in store
+    assert (new_codex_key, 900) in ttl_calls
+
+    # 4. Expired legacy key is ignored and never migrated
+    expired_client = _make_antigravity_client(
+        "gemini-4-neon-high-oauth", user_id="u2", credential_id="cred-2"
+    )
+    mw_exp = _make_middleware(expired_client, [])
+    assert await mw_exp._aquota_skipped("gemini-4-neon-high-oauth", expired_client) is False
+    assert expired_new_key not in store
+
+
+@pytest.mark.asyncio
+async def test_antigravity_vendor_cooldown_team_sharing_and_custom_same_name_isolation(
+    no_sleep, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under credentials.sharing == 'team', all members share the holder's vendor cooldown;
     user-defined custom models with the same name stay in `:model:` and are unaffected."""
     from langchain.agents.middleware.types import ModelResponse
     from langchain_core.messages import AIMessage
@@ -1163,8 +1425,8 @@ async def test_antigravity_series_cooldown_team_sharing_and_custom_same_name_iso
     alice_neon_high = _make_antigravity_client(
         "gemini-4-neon-high-oauth", user_id="alice", credential_id="shared-cred"
     )
-    bob_neon_medium = _make_antigravity_client(
-        "gemini-4-neon-medium-oauth", user_id="bob", credential_id="shared-cred"
+    bob_carbon_high = _make_antigravity_client(
+        "gemini-4-carbon-high-oauth", user_id="bob", credential_id="shared-cred"
     )
     bob_custom_neon_high = _make_antigravity_client(
         "gemini-4-neon-high-oauth",
@@ -1176,52 +1438,47 @@ async def test_antigravity_series_cooldown_team_sharing_and_custom_same_name_iso
             "model_id": "gemini-4-neon-high",
         },
     )
-    literal_series_name = _make_antigravity_client(
-        "gemini-4-neon-series", user_id="bob", credential_id="shared-cred"
+    literal_vendor_name = _make_antigravity_client(
+        "google", user_id="bob", credential_id="shared-cred"
     )
-    spare = _FakeModel("spare-model")
 
-    assert (
-        quota_redis_key("gemini-4-neon-high-oauth", alice_neon_high)
-        == "dalton:quota_exhausted:pm-holder:antigravity-oauth:series:gemini-4-neon:shared-cred"
+    expected_vendor_key = (
+        "dalton:quota_exhausted:pm-holder:antigravity-oauth:vendor:google:shared-cred"
     )
-    assert (
-        quota_redis_key("gemini-4-neon-medium-oauth", bob_neon_medium)
-        == "dalton:quota_exhausted:pm-holder:antigravity-oauth:series:gemini-4-neon:shared-cred"
-    )
+    assert quota_redis_key("gemini-4-neon-high-oauth", alice_neon_high) == expected_vendor_key
+    assert quota_redis_key("gemini-4-carbon-high-oauth", bob_carbon_high) == expected_vendor_key
     assert (
         quota_redis_key("gemini-4-neon-high-oauth", bob_custom_neon_high)
         == "dalton:quota_exhausted:pm-holder:antigravity-oauth:model:gemini-4-neon-high-oauth:shared-cred"
     )
     assert (
-        quota_redis_key("gemini-4-neon-series", literal_series_name)
-        == "dalton:quota_exhausted:pm-holder:antigravity-oauth:model:gemini-4-neon-series:shared-cred"
+        quota_redis_key("google", literal_vendor_name)
+        == "dalton:quota_exhausted:pm-holder:antigravity-oauth:model:google:shared-cred"
     )
 
-    # Alice exhausts Neon High -> shared holder series key written
-    mw_alice = _make_middleware(alice_neon_high, [(spare.model, spare)])
+    # Alice exhausts Neon High -> shared holder vendor key written
+    mw_alice = _make_middleware(alice_neon_high, [])
 
     async def alice_handler(req):
-        if req.model is alice_neon_high:
-            raise _refusal(ANTIGRAVITY_LONG_RESET_429, 429)
-        return ModelResponse(result=[AIMessage("alice-fallback")])
+        raise _refusal(ANTIGRAVITY_LONG_RESET_429, 429)
 
-    res_a = await mw_alice.awrap_model_call(_FakeRequest(alice_neon_high), alice_handler)
-    assert res_a.result[0].content == "alice-fallback"
+    with pytest.raises(Exception, match="Individual quota reached"):
+        await mw_alice.awrap_model_call(_FakeRequest(alice_neon_high), alice_handler)
 
-    # Bob calling built-in Neon Medium hits the shared team series cooldown and skips straight to spare
-    mw_bob = _make_middleware(bob_neon_medium, [(spare.model, spare)])
+    # Bob calling built-in Carbon High hits the shared team vendor cooldown (0 upstream requests)
+    mw_bob = _make_middleware(bob_carbon_high, [])
     bob_calls: list[str] = []
 
     async def bob_handler(req):
         bob_calls.append(req.model.model)
-        return ModelResponse(result=[AIMessage("bob-ok")])
+        raise AssertionError("Shared team vendor cooldown should prevent dialing upstream")
 
-    await mw_bob.awrap_model_call(_FakeRequest(bob_neon_medium), bob_handler)
-    assert bob_calls == ["spare-model"]
+    with pytest.raises(Exception, match="gemini-4-carbon-high-oauth 的订阅额度已用完"):
+        await mw_bob.awrap_model_call(_FakeRequest(bob_carbon_high), bob_handler)
+    assert bob_calls == []
 
-    # Bob's custom model with the same name is NOT affected by the built-in series cooldown
-    mw_custom = _make_middleware(bob_custom_neon_high, [(spare.model, spare)])
+    # Bob's custom model with the same name is NOT affected by the built-in vendor cooldown
+    mw_custom = _make_middleware(bob_custom_neon_high, [])
     custom_calls: list[str] = []
 
     async def custom_handler(req):
@@ -1238,20 +1495,20 @@ async def test_antigravity_series_cooldown_team_sharing_and_custom_same_name_iso
     monkeypatch.setattr("src.dalton.credentials.get_team_credential_holder_id", lambda: None)
     assert (
         quota_redis_key("gemini-4-neon-high-oauth", alice_neon_high)
-        == "dalton:quota_exhausted:alice:antigravity-oauth:series:gemini-4-neon:shared-cred"
+        == "dalton:quota_exhausted:alice:antigravity-oauth:vendor:google:shared-cred"
     )
     assert (
-        quota_redis_key("gemini-4-neon-medium-oauth", bob_neon_medium)
-        == "dalton:quota_exhausted:bob:antigravity-oauth:series:gemini-4-neon:shared-cred"
+        quota_redis_key("gemini-4-carbon-high-oauth", bob_carbon_high)
+        == "dalton:quota_exhausted:bob:antigravity-oauth:vendor:google:shared-cred"
     )
 
 
 @pytest.mark.asyncio
-async def test_antigravity_series_cooldown_works_locally_when_redis_unavailable(
+async def test_antigravity_vendor_cooldown_works_locally_when_redis_unavailable(
     no_sleep, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """When Redis raises on get/set, local `_quota_exhausted` still shares cooldown
-    across same-series variants via `_quota_scope_key` and keeps other series/accounts/customs separate."""
+    across same-vendor models via `_quota_scope_key` and keeps other vendors/accounts/customs separate."""
     from unittest.mock import create_autospec
 
     from langchain.agents.middleware.types import ModelResponse
@@ -1268,8 +1525,8 @@ async def test_antigravity_series_cooldown_works_locally_when_redis_unavailable(
     neon_high = _make_antigravity_client(
         "gemini-4-neon-high-oauth", user_id="u-local", credential_id="cred-1"
     )
-    neon_medium = _make_antigravity_client(
-        "gemini-4-neon-medium-oauth", user_id="u-local", credential_id="cred-1"
+    hydrogen_high = _make_antigravity_client(
+        "gemini-4-hydrogen-high-oauth", user_id="u-local", credential_id="cred-1"
     )
     neon_custom = _make_antigravity_client(
         "gemini-4-neon-medium-oauth",
@@ -1277,17 +1534,14 @@ async def test_antigravity_series_cooldown_works_locally_when_redis_unavailable(
         credential_id="cred-1",
         custom_entry={"name": "gemini-4-neon-medium-oauth", "provider": "antigravity-oauth"},
     )
-    hydrogen_high = _make_antigravity_client(
-        "gemini-4-hydrogen-high-oauth", user_id="u-local", credential_id="cred-1"
+    claude_opus = _make_antigravity_client(
+        "claude-opus-5-5-high-oauth", user_id="u-local", credential_id="cred-1"
+    )
+    neon_other_acct = _make_antigravity_client(
+        "gemini-4-neon-medium-oauth", user_id="u-local", credential_id="cred-2"
     )
 
-    mw = _make_middleware(
-        neon_high,
-        [
-            ("gemini-4-neon-medium-oauth", neon_medium),
-            ("gemini-4-hydrogen-high-oauth", hydrogen_high),
-        ],
-    )
+    mw = _make_middleware(neon_high, [])
     calls: list[str] = []
 
     async def handler(req):
@@ -1296,14 +1550,21 @@ async def test_antigravity_series_cooldown_works_locally_when_redis_unavailable(
             raise _refusal(ANTIGRAVITY_LONG_RESET_429, 429)
         return ModelResponse(result=[AIMessage("ok")])
 
-    # Even with broken Redis, neon-high benches the series locally so neon-medium is skipped immediately
-    await mw.awrap_model_call(_FakeRequest(neon_high), handler)
-    assert calls == ["gemini-4-neon-high-oauth", "gemini-4-hydrogen-high-oauth"]
+    # Even with broken Redis, neon-high benches the `google` vendor locally
+    with pytest.raises(Exception, match="Individual quota reached"):
+        await mw.awrap_model_call(_FakeRequest(neon_high), handler)
+    assert calls == ["gemini-4-neon-high-oauth"]
 
-    # Local-only checks on same middleware instance
-    assert await mw._aquota_skipped("gemini-4-neon-medium-oauth", neon_medium) is True
-    assert await mw._aquota_skipped("gemini-4-hydrogen-high-oauth", hydrogen_high) is False
+    # Same-vendor Hydrogen on the same middleware instance is skipped locally (0 upstream calls)
+    with pytest.raises(Exception, match="gemini-4-hydrogen-high-oauth 的订阅额度已用完"):
+        await mw.awrap_model_call(_FakeRequest(hydrogen_high), handler)
+    assert calls == ["gemini-4-neon-high-oauth"]
+
+    # Different vendor, custom same-name model, and different account remain unaffected locally
+    assert await mw._aquota_skipped("gemini-4-hydrogen-high-oauth", hydrogen_high) is True
+    assert await mw._aquota_skipped("claude-opus-5-5-high-oauth", claude_opus) is False
     assert await mw._aquota_skipped("gemini-4-neon-medium-oauth", neon_custom) is False
+    assert await mw._aquota_skipped("gemini-4-neon-medium-oauth", neon_other_acct) is False
 
 
 @pytest.mark.asyncio
@@ -1311,7 +1572,8 @@ async def test_notify_bench_switch_and_raise_run_exhausted_use_effective_candida
     no_sleep, events, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`_notify_bench_switch` and `_raise_run_exhausted` resolve each candidate's
-    effective client (`request.model` when `cand_client is None`, else `cand_client`)."""
+    effective client (`request.model` when `cand_client is None`, else `cand_client`),
+    and `_notify_bench_switch` stops at the first skipped candidate so fallback notices dedupe."""
     from langchain.agents.middleware.types import ModelResponse
     from langchain_core.messages import AIMessage
 
@@ -1320,21 +1582,30 @@ async def test_notify_bench_switch_and_raise_run_exhausted_use_effective_candida
     monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: cache)
     monkeypatch.setattr("src.dalton.credentials.get_team_credential_holder_id", lambda: None)
 
-    # Middleware primary is Hydrogen, while a subagent/shared call runs with request.model = Neon Medium.
+    # Unstamped clients (billing_type=None) so the fallback chain runs for _notify_bench_switch tests.
     mw_primary = _make_antigravity_client(
-        "gemini-4-hydrogen-high-oauth", user_id="u1", credential_id="cred-main"
+        "claude-opus-5-5-high-oauth",
+        user_id="u1",
+        credential_id="cred-main",
+        billing_type=None,
     )
     neon_high = _make_antigravity_client(
-        "gemini-4-neon-high-oauth", user_id="u1", credential_id="cred-sub"
+        "gemini-4-neon-high-oauth",
+        user_id="u1",
+        credential_id="cred-sub",
+        billing_type=None,
     )
     neon_medium = _make_antigravity_client(
-        "gemini-4-neon-medium-oauth", user_id="u1", credential_id="cred-sub"
+        "gemini-4-neon-medium-oauth",
+        user_id="u1",
+        credential_id="cred-sub",
+        billing_type=None,
     )
     spare = _FakeModel("spare-model")
 
     mw = _make_middleware(mw_primary, [(spare.model, spare)])
 
-    # Bench Neon series on cred-sub via neon_high
+    # Bench Google vendor on cred-sub via neon_high
     neon_err = _refusal(ANTIGRAVITY_LONG_RESET_429, 429)
     await mw._aremember_quota_exhausted("gemini-4-neon-high-oauth", 3600.0, neon_err, neon_high)
 
@@ -1355,8 +1626,30 @@ async def test_notify_bench_switch_and_raise_run_exhausted_use_effective_candida
     assert switches[0]["from_is_primary"] is True
     assert switches[0]["status_code"] == 429
 
-    # 2. Non-primary benched fallback in `_notify_bench_switch` must use cand_client (neon_medium),
-    # not fall back to mw.primary_client (hydrogen / cred-main).
+    # 2. Same-vendor fallback right after primary: `_notify_bench_switch` stops at the first
+    # skipped candidate (primary) so Call 2 does NOT overwrite from_model or emit a duplicate notice.
+    events.clear()
+    mw_chain = _make_middleware(
+        neon_high,
+        [("gemini-4-neon-medium-oauth", neon_medium), ("spare-model", spare)],
+    )
+    store.clear()
+
+    async def chain_handler(req):
+        if req.model is neon_high:
+            raise _refusal(ANTIGRAVITY_LONG_RESET_429, 429)
+        return ModelResponse(result=[AIMessage("chain-ok")])
+
+    await mw_chain.awrap_model_call(_FakeRequest(neon_high), chain_handler)
+    await mw_chain.awrap_model_call(_FakeRequest(neon_high), chain_handler)
+    chain_switches = [e["props"] for e in events if e.get("name") == "model_fallback"]
+    assert len(chain_switches) == 1
+    assert chain_switches[0]["from_model"] == "gemini-4-neon-high-oauth"
+    assert chain_switches[0]["to_model"] == "spare-model"
+    assert chain_switches[0]["from_is_primary"] is True
+
+    # 3. Non-primary benched fallback in `_notify_bench_switch` must use cand_client (neon_medium),
+    # not fall back to mw.primary_client (claude / cred-main).
     events.clear()
     mw._quota_notified.clear()
     other_primary = _FakeModel("other-primary")
@@ -1372,37 +1665,43 @@ async def test_notify_bench_switch_and_raise_run_exhausted_use_effective_candida
     assert fb_switches[0]["to_model"] == "spare-model"
     assert fb_switches[0]["from_is_primary"] is False
 
-    # 3. `_raise_run_exhausted` when primary (cand_client=None -> request.model=neon_medium) is benched
-    # and spare fails with 400 -> raises Neon's remembered 429 with attempt trace!
+    # 4. `_raise_run_exhausted` when primary (cand_client=None -> request.model=neon_medium) is benched
+    # and spare fails with 400 -> raises Neon Medium's 429 refusal with attempt trace!
     async def failing_spare_handler(req):
         raise _refusal("Error code: 400 - spare failed", 400)
 
-    with pytest.raises(Exception, match="Individual quota reached") as caught:
+    with pytest.raises(Exception, match="gemini-4-neon-medium-oauth 的订阅额度已用完") as caught:
         await mw.awrap_model_call(_FakeRequest(neon_medium), failing_spare_handler)
     trace = getattr(caught.value, "__model_resilience__", None)
     assert trace is not None
     assert trace["model"] == "gemini-4-neon-medium-oauth"
     assert trace["attempted_models"][0]["model"] == "gemini-4-neon-medium-oauth"
     assert trace["attempted_models"][0]["attempts"] == 0
+    assert trace["attempted_models"][0]["status_code"] == 429
     assert trace["attempted_models"][1]["model"] == "spare-model"
 
-    # 4. `_raise_run_exhausted` when ALL candidates are benched (empty records) -> raises request.model's refusal
-    # even though mw.primary_client has a different refusal in `_quota_exhausted`!
-    hydro_err = _refusal("Hydrogen 429 refusal", 429)
+    # 5. `_raise_run_exhausted` when ALL candidates are benched (empty records) -> raises request.model's
+    # cooldown refusal with trace even though mw.primary_client has a different refusal in `_quota_exhausted`!
+    claude_err = _refusal("Anthropic 429 refusal", 429)
     await mw._aremember_quota_exhausted(
-        "gemini-4-hydrogen-high-oauth", 3600.0, hydro_err, mw_primary
+        "claude-opus-5-5-high-oauth", 3600.0, claude_err, mw_primary
     )
     mw_all_benched = _make_middleware(mw_primary, [])
     mw_all_benched._quota_exhausted = dict(mw._quota_exhausted)
-    with pytest.raises(Exception, match="Individual quota reached"):
+    with pytest.raises(Exception, match="gemini-4-neon-medium-oauth 的订阅额度已用完") as all_caught:
         await mw_all_benched.awrap_model_call(_FakeRequest(neon_medium), ok_spare_handler)
+    all_trace = getattr(all_caught.value, "__model_resilience__", None)
+    assert all_trace is not None
+    assert all_trace["model"] == "gemini-4-neon-medium-oauth"
+    assert all_trace["attempted_models"][0]["attempts"] == 0
+    assert all_trace["attempted_models"][0]["status_code"] == 429
 
 
 @pytest.mark.asyncio
 async def test_401_oauth_rebuild_preserves_original_suffixed_model_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Series cooldown never alters OAuthRebuildSpec.model_name; 401 refresh rebuilds the exact tier."""
+    """Vendor cooldown never alters OAuthRebuildSpec.model_name; 401 refresh rebuilds the exact tier."""
     from unittest.mock import create_autospec
 
     from ptc_agent.agent.middleware.model_resilience import quota_redis_key
@@ -1436,7 +1735,7 @@ async def test_401_oauth_rebuild_preserves_original_suffixed_model_name(
 
     assert (
         quota_redis_key("gemini-4-neon-high-oauth", client)
-        == "dalton:quota_exhausted:u1:antigravity-oauth:series:gemini-4-neon:cred-1"
+        == "dalton:quota_exhausted:u1:antigravity-oauth:vendor:google:cred-1"
     )
     spec = oauth_rebuild_spec(client)
     assert spec is not None and spec.model_name == "gemini-4-neon-high-oauth"

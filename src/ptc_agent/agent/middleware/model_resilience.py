@@ -92,17 +92,23 @@ _QUOTA_EXHAUSTED_REDIS_PREFIX = "dalton:quota_exhausted"
 _HKT = ZoneInfo("Asia/Hong_Kong")
 
 
-def quota_redis_key(  # DALTON-HOOK(quota-exhaustion)
+def _quota_redis_keys(  # DALTON-HOOK(antigravity-series)
     name: str,
     client: Any,
     *,
     user_id: str | None = None,
-) -> str | None:
-    """Coordination key scoped by credential owner, provider, model, and subscription account."""
+) -> tuple[str | None, str | None]:
+    """Return ``(new_key, legacy_key)`` for quota cooldown coordination.
+
+    ``new_key`` uses the disjoint ``:vendor:{vendor}`` (built-in Antigravity)
+    or ``:model:{model_id}`` namespace. ``legacy_key`` is the pre-upgrade
+    single-model key without the scope-kind segment, consulted on a miss of
+    ``new_key`` during rolling upgrades.
+    """
     if client is None:
-        return None
+        return None, None
     from src.dalton.credentials import credential_user_id
-    from src.dalton.llm.antigravity_series import quota_cooldown_target  # DALTON-HOOK(antigravity-series)
+    from src.dalton.llm.antigravity_series import quota_cooldown_target
     from src.dalton.llm.oauth_refresh import oauth_rebuild_spec
 
     spec = oauth_rebuild_spec(client)
@@ -137,7 +143,7 @@ def quota_redis_key(  # DALTON-HOOK(quota-exhaustion)
             raw_user = "platform"
 
     if not raw_user or not provider or not model_id:
-        return None
+        return None, None
     if raw_user != "platform":
         try:
             cred_user = credential_user_id(str(raw_user))
@@ -146,13 +152,66 @@ def quota_redis_key(  # DALTON-HOOK(quota-exhaustion)
     else:
         cred_user = "platform"
     if not cred_user:
-        return None
-    # DALTON-HOOK(antigravity-series): built-in antigravity-oauth variants share
-    # a disjoint `:series:{prefix}` namespace; other providers and custom models
-    # use `:model:{model_id}`.
+        return None, None
     scope_kind, target = quota_cooldown_target(provider, model_id, is_custom=is_custom)
-    base = f"{_QUOTA_EXHAUSTED_REDIS_PREFIX}:{cred_user}:{provider}:{scope_kind}:{target}"
-    return f"{base}:{cred_id}" if cred_id else base
+    suffix = f":{cred_id}" if cred_id else ""
+    new_key = f"{_QUOTA_EXHAUSTED_REDIS_PREFIX}:{cred_user}:{provider}:{scope_kind}:{target}{suffix}"
+    legacy_key = f"{_QUOTA_EXHAUSTED_REDIS_PREFIX}:{cred_user}:{provider}:{model_id}{suffix}"
+    return new_key, legacy_key
+
+
+def quota_redis_key(  # DALTON-HOOK(quota-exhaustion)
+    name: str,
+    client: Any,
+    *,
+    user_id: str | None = None,
+) -> str | None:
+    """Coordination key scoped by credential owner, provider, vendor/model, and subscription account."""
+    # DALTON-HOOK(antigravity-series): built-in antigravity-oauth models share
+    # `:vendor:{vendor}`; other providers and custom models use `:model:{model_id}`.
+    new_key, _ = _quota_redis_keys(name, client, user_id=user_id)
+    return new_key
+
+
+def _remaining_quota_ttl_seconds(data: Any) -> int | None:  # DALTON-HOOK(antigravity-series)
+    """Return remaining whole-second TTL for a valid Redis cooldown payload, else ``None``."""
+    if not isinstance(data, dict):
+        return None
+    expires_at = data.get("expires_at")
+    if isinstance(expires_at, (int, float)):
+        remaining = float(expires_at) - time.time()
+        if remaining <= 0:
+            return None
+        return max(1, math.ceil(remaining))
+    return DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS
+
+
+async def _read_quota_redis_async(  # DALTON-HOOK(antigravity-series)
+    new_key: str, legacy_key: str | None
+) -> dict[str, Any] | None:
+    """Read ``new_key`` from Redis; on miss, read ``legacy_key`` and migrate remaining TTL."""
+    from src.utils.cache.redis_cache import get_cache_client
+
+    cache = get_cache_client()
+    data = await cache.get(new_key)
+    if _remaining_quota_ttl_seconds(data) is not None:
+        return data
+    if not legacy_key or legacy_key == new_key:
+        return None
+    legacy_data = await cache.get(legacy_key)
+    remaining_ttl = _remaining_quota_ttl_seconds(legacy_data)
+    if remaining_ttl is None:
+        return None
+    try:
+        await cache.set(new_key, legacy_data, ttl=remaining_ttl)
+    except Exception as err:
+        logger.debug(
+            "[ModelResilience] Failed to migrate legacy quota key to new key",
+            legacy_key=legacy_key,
+            new_key=new_key,
+            error=str(err),
+        )
+    return legacy_data
 
 
 def format_quota_cooldown_message(  # DALTON-HOOK(quota-exhaustion)
@@ -197,13 +256,12 @@ async def check_oauth_quota_cooldown(  # DALTON-HOOK(quota-exhaustion)
         or client_label(client)
         or ""
     )
-    redis_key = quota_redis_key(label, client, user_id=user_id)
+    # DALTON-HOOK(antigravity-series): read new vendor/model key with legacy-key migration fallback.
+    redis_key, legacy_key = _quota_redis_keys(label, client, user_id=user_id)
     if redis_key is None:
         return None
     try:
-        from src.utils.cache.redis_cache import get_cache_client
-
-        data = await get_cache_client().get(redis_key)
+        data = await _read_quota_redis_async(redis_key, legacy_key)
     except Exception as err:
         logger.debug(
             "[ModelResilience] Redis pre-dispatch quota read unavailable, failing open",
@@ -221,11 +279,19 @@ async def check_oauth_quota_cooldown(  # DALTON-HOOK(quota-exhaustion)
 
 
 class _RemoteQuotaExhaustedError(RuntimeError):  # DALTON-HOOK(quota-exhaustion)
-    """Refusal placeholder reconstructed from Redis cross-worker quota state."""
+    """Refusal placeholder reconstructed from Redis or shared cooldown state."""
 
-    def __init__(self, message: str, status_code: int | None = None) -> None:
+    # DALTON-HOOK(antigravity-series): preserve expires_at so benched refusals surface reset time.
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        *,
+        expires_at: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.expires_at = expires_at
 
 #: The ``response_metadata`` key naming the fallback that wrote an answer. Its
 #: usage counts that model's tokens, so compaction measures nothing for the
@@ -728,44 +794,80 @@ class ModelResilienceMiddleware(AgentMiddleware):
     def _hands_up(self, exc: Exception) -> bool:
         return self.compacts_overflow and is_context_overflow(exc)
 
+    def _build_benched_refusal(  # DALTON-HOOK(antigravity-series)
+        self, primary_name: str, remembered: tuple[float, Exception]
+    ) -> tuple[Exception, int | None]:
+        """Build the refusal raised when ``primary_name`` was skipped on cooldown.
+
+        Timed quota cooldowns (HTTP 429 or Redis-reconstructed entries) construct
+        a fresh refusal naming ``primary_name`` with HTTP status (default 429)
+        and HKT recovery time so ``stream_errors`` classifies it as upstream
+        with ``attempts=0`` rather than an internal error.
+        """
+        refills_at_mono, orig_exc = remembered
+        status = extract_status_code(orig_exc)
+        if isinstance(orig_exc, _RemoteQuotaExhaustedError):
+            eff_status = status if isinstance(status, int) else 429
+            expires_at = orig_exc.expires_at
+            if expires_at is None and math.isfinite(refills_at_mono):
+                expires_at = time.time() + max(0.0, refills_at_mono - time.monotonic())
+            if eff_status == 402:
+                msg = str(orig_exc)
+            else:
+                msg = format_quota_cooldown_message(primary_name, expires_at)
+            return _RemoteQuotaExhaustedError(msg, eff_status, expires_at=expires_at), eff_status
+        if status == 429 and math.isfinite(refills_at_mono):
+            expires_at = time.time() + max(0.0, refills_at_mono - time.monotonic())
+            msg = format_quota_cooldown_message(primary_name, expires_at)
+            return _RemoteQuotaExhaustedError(msg, 429, expires_at=expires_at), 429
+        return orig_exc, status
+
     def _raise_run_exhausted(  # DALTON-HOOK(quota-exhaustion)
         self,
         records: list[_AttemptRecord],
         candidates: list[tuple[str, Any | None]],
         request: ModelRequest,
+        *,
+        primary_skipped: bool | None = None,
     ) -> NoReturn:
         """The total-exhaustion raise, quota-aware.
 
-        Every candidate benched leaves no attempt to trace — the refusal
-        itself surfaces (the primary's when it is among them), never an
-        empty-record crash. And when the primary sits this call out on a
-        bench while the remaining candidates failed, the error the user sees
-        is the primary's remembered refusal — the model they configured —
-        with the fallback attempts riding along in the trace, not the last
-        fallback's failure dressed up as the primary's.
+        Every candidate benched leaves no attempt to trace — construct an
+        ``attempts=0`` record for the current request's primary so the raised
+        exception carries ``RESILIENCE_TRACE_ATTR`` and its HTTP status instead
+        of surfacing as an unclassified internal error. And when the primary
+        sits this call out on a bench while remaining candidates failed, prepend
+        its zero-attempt refusal without duplicating a primary that actually
+        ran this call.
         """
         # DALTON-HOOK(antigravity-series): resolve primary cooldown via effective
-        # candidate client (falling back to request.model when cand_client is None).
+        # candidate client, attach attempts=0 trace when all skipped, and avoid
+        # duplicating primary when it ran and failed on this call.
         if not records and self._quota_exhausted and candidates:
             primary_name, primary_client = candidates[0]
             eff_primary = request.model if primary_client is None else primary_client
             primary_scope = self._quota_scope_key(primary_name, eff_primary)
             remembered = self._quota_exhausted.get(primary_scope)
-            raise (remembered if remembered is not None
-                   else next(iter(self._quota_exhausted.values())))[1]
+            if remembered is None:
+                remembered = next(iter(self._quota_exhausted.values()))
+            refusal, status = self._build_benched_refusal(primary_name, remembered)
+            primary = _AttemptRecord(primary_name, refusal, status, 0)
+            return self._raise_exhausted([primary])
         if records and candidates:
             primary_name, primary_client = candidates[0]
-            eff_primary = request.model if primary_client is None else primary_client
-            primary_scope = self._quota_scope_key(primary_name, eff_primary)
-            benched = self._quota_exhausted.get(primary_scope)
-            if benched is not None and self._quota_skipped(primary_name, eff_primary):
-                primary = _AttemptRecord(
-                    primary_name,
-                    benched[1],
-                    extract_status_code(benched[1]),
-                    0,
-                )
-                return self._raise_exhausted([primary, *records])
+            was_skipped = (
+                primary_skipped
+                if primary_skipped is not None
+                else not any(r.model == primary_name for r in records)
+            )
+            if was_skipped:
+                eff_primary = request.model if primary_client is None else primary_client
+                primary_scope = self._quota_scope_key(primary_name, eff_primary)
+                benched = self._quota_exhausted.get(primary_scope)
+                if benched is not None and self._quota_skipped(primary_name, eff_primary):
+                    refusal, status = self._build_benched_refusal(primary_name, benched)
+                    primary = _AttemptRecord(primary_name, refusal, status, 0)
+                    return self._raise_exhausted([primary, *records])
         return self._raise_exhausted(records)
 
     def _raise_overflow(self, records: list[_AttemptRecord], exc: Exception) -> NoReturn:
@@ -848,16 +950,17 @@ class ModelResilienceMiddleware(AgentMiddleware):
             return False
         expires_at = data.get("expires_at")
         if isinstance(expires_at, (int, float)):
-            remaining = float(expires_at) - time.time()
+            exp_ts = float(expires_at)
+            remaining = exp_ts - time.time()
         else:
             remaining = float(DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS)
+            exp_ts = time.time() + remaining
         if remaining <= 0:
             return False
-        status_code = data.get("status_code")
-        msg = str(data.get("message") or f"Quota exhausted for {name}")
-        refusal = _RemoteQuotaExhaustedError(
-            msg, status_code if isinstance(status_code, int) else None
-        )
+        raw_status = data.get("status_code")
+        status_code = raw_status if isinstance(raw_status, int) else 429
+        msg = str(data.get("message") or format_quota_cooldown_message(name, exp_ts))
+        refusal = _RemoteQuotaExhaustedError(msg, status_code, expires_at=exp_ts)
         self._quota_exhausted[scope_key] = (time.monotonic() + remaining, refusal)
         return True
 
@@ -931,6 +1034,36 @@ class ModelResilienceMiddleware(AgentMiddleware):
             return
         self._run_sync_cache_call(lambda: cache.set(redis_key, payload, ttl=ttl_s))
 
+    def _read_quota_redis_sync(  # DALTON-HOOK(antigravity-series)
+        self, new_key: str, legacy_key: str | None
+    ) -> dict[str, Any] | None:
+        """Sync twin of ``_read_quota_redis_async`` with legacy-key read-through migration."""
+        data = self._sync_redis_get(new_key)
+        if _remaining_quota_ttl_seconds(data) is not None:
+            return data
+        if not legacy_key or legacy_key == new_key:
+            return None
+        legacy_data = self._sync_redis_get(legacy_key)
+        remaining_ttl = _remaining_quota_ttl_seconds(legacy_data)
+        if remaining_ttl is None:
+            return None
+        try:
+            self._sync_redis_set(new_key, legacy_data, remaining_ttl)
+        except Exception as err:
+            logger.debug(
+                "[ModelResilience] Failed to migrate legacy quota key (sync)",
+                legacy_key=legacy_key,
+                new_key=new_key,
+                error=str(err),
+            )
+        return legacy_data
+
+    def _quota_redis_keys(  # DALTON-HOOK(antigravity-series)
+        self, name: str, client: Any = None
+    ) -> tuple[str | None, str | None]:
+        target = self._current_client(self.primary_client if client is None else client)
+        return _quota_redis_keys(name, target, user_id=self.user_id)
+
     def _quota_skipped(  # DALTON-HOOK(antigravity-series)
         self, name: str, client: Any = None
     ) -> bool:
@@ -938,11 +1071,11 @@ class ModelResilienceMiddleware(AgentMiddleware):
         scope_key = self._quota_scope_key(name, client)
         if self._local_quota_skipped(scope_key):
             return True
-        redis_key = self._quota_redis_key(name, client)
+        redis_key, legacy_key = self._quota_redis_keys(name, client)
         if redis_key is None:
             return False
         try:
-            data = self._sync_redis_get(redis_key)
+            data = self._read_quota_redis_sync(redis_key, legacy_key)
         except Exception as err:
             logger.debug(
                 "[ModelResilience] Redis sync quota read unavailable, using local state",
@@ -955,9 +1088,9 @@ class ModelResilienceMiddleware(AgentMiddleware):
     def _quota_redis_key(  # DALTON-HOOK(quota-exhaustion)
         self, name: str, client: Any = None
     ) -> str | None:
-        """Coordination key scoped by credential owner, provider, model, and subscription account."""
-        target = self._current_client(self.primary_client if client is None else client)
-        return quota_redis_key(name, target, user_id=self.user_id)
+        """Coordination key scoped by credential owner, provider, vendor/model, and subscription account."""
+        new_key, _ = self._quota_redis_keys(name, client)
+        return new_key
 
     def _quota_scope_key(  # DALTON-HOOK(antigravity-series)
         self, name: str, client: Any = None
@@ -973,13 +1106,11 @@ class ModelResilienceMiddleware(AgentMiddleware):
         scope_key = self._quota_scope_key(name, client)
         if self._local_quota_skipped(scope_key):
             return True
-        redis_key = self._quota_redis_key(name, client)
+        redis_key, legacy_key = self._quota_redis_keys(name, client)
         if redis_key is None:
             return False
         try:
-            from src.utils.cache.redis_cache import get_cache_client
-
-            data = await get_cache_client().get(redis_key)
+            data = await _read_quota_redis_async(redis_key, legacy_key)
         except Exception as err:
             logger.debug(
                 "[ModelResilience] Redis quota read unavailable, using local state",
@@ -1117,6 +1248,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
             if self._quota_skipped(name, eff_client):
                 benched_name = name
                 benched_eff_client = eff_client
+                break
         if benched_name is None:
             return
         benched_scope = self._quota_scope_key(benched_name, benched_eff_client)
@@ -1330,14 +1462,18 @@ class ModelResilienceMiddleware(AgentMiddleware):
         overflow: Exception | None = None
 
         tried_any = False
+        primary_skipped = False
         for index, (name, client) in enumerate(candidates):
             # DALTON-HOOK(quota-exhaustion): a candidate this run already
             # judged out of quota is not re-asked — the refusal that benched
             # it answers identically until the account is topped up. A call
             # that therefore starts on a fallback announces the switch once,
             # exactly as a failure-driven switch does.
+            # DALTON-HOOK(antigravity-series): record whether primary was skipped on this call.
             cand_client = request.model if client is None else client
             if self._quota_skipped(name, cand_client):
+                if index == 0:
+                    primary_skipped = True
                 continue
             if not tried_any:
                 tried_any = True
@@ -1402,8 +1538,10 @@ class ModelResilienceMiddleware(AgentMiddleware):
             self._raise_overflow(records, overflow)
         # DALTON-HOOK(quota-exhaustion): the quota-aware total-exhaustion
         # raise — see ``_raise_run_exhausted``.
-        # DALTON-HOOK(antigravity-series): forward request so primary scope uses request.model.
-        return self._raise_run_exhausted(records, candidates, request)
+        # DALTON-HOOK(antigravity-series): forward request and primary_skipped flag.
+        return self._raise_run_exhausted(
+            records, candidates, request, primary_skipped=primary_skipped
+        )
 
     async def awrap_model_call(
         self,
@@ -1419,14 +1557,18 @@ class ModelResilienceMiddleware(AgentMiddleware):
         overflow: Exception | None = None
 
         tried_any = False
+        primary_skipped = False
         for index, (name, client) in enumerate(candidates):
             # DALTON-HOOK(quota-exhaustion): a candidate this run (or another worker
             # sharing the credential in Redis) already judged out of quota is not
             # re-asked — the refusal that benched it answers identically until the
             # account is topped up. A call that therefore starts on a fallback
             # announces the switch once, exactly as a failure-driven switch does.
+            # DALTON-HOOK(antigravity-series): record whether primary was skipped on this call.
             cand_client = request.model if client is None else client
             if await self._aquota_skipped(name, cand_client):
+                if index == 0:
+                    primary_skipped = True
                 continue
             if not tried_any:
                 tried_any = True
@@ -1511,5 +1653,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
             self._raise_overflow(records, overflow)
         # DALTON-HOOK(quota-exhaustion): the quota-aware total-exhaustion
         # raise — see ``_raise_run_exhausted``.
-        # DALTON-HOOK(antigravity-series): forward request so primary scope uses request.model.
-        return self._raise_run_exhausted(records, candidates, request)
+        # DALTON-HOOK(antigravity-series): forward request and primary_skipped flag.
+        return self._raise_run_exhausted(
+            records, candidates, request, primary_skipped=primary_skipped
+        )
