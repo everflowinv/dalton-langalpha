@@ -168,19 +168,9 @@ class _Wire(abc.ABC):
     ) -> ModelRequest:
         ...
 
-    # DALTON-HOOK(team-memory-toggle): inspect wire tool names without triggering diff()
+    # DALTON-HOOK(team-memory-toggle): inspect stored wire declarations without diff()
     @abc.abstractmethod
     def tool_name(self, entry: dict[str, Any]) -> str | None:
-        ...
-
-    @abc.abstractmethod
-    def has_tool(
-        self,
-        declared: list[dict[str, Any]],
-        messages: list[Any],
-        model: Any,
-        name: str,
-    ) -> bool:
         ...
 
 
@@ -238,13 +228,9 @@ class _AnthropicWire(_Wire):
             tools=_with_marker(declared, marker), messages=messages, model_settings=settings
         )
 
+    # DALTON-HOOK(team-memory-toggle): inspect Anthropic wire tool declaration name
     def tool_name(self, entry):
         return entry.get("name")
-
-    # DALTON-HOOK(team-memory-toggle): check whether a wire already offers a tool
-    def has_tool(self, declared, messages, model, name):
-        offered, _ = _known(declared, messages, model)
-        return name in offered
 
 
 class _OpenAIWire(_Wire):
@@ -266,24 +252,17 @@ class _OpenAIWire(_Wire):
     def render(self, stored, wanted):
         return wanted
 
-    # DALTON-HOOK(team-memory-toggle): shared current-tools scan for diff() and has_tool()
-    def _current_tools(
-        self, declared: list[dict[str, Any]], messages: list[Any]
-    ) -> dict[str | None, dict[str, Any]]:
+    def diff(self, declared, wanted, messages, model):
+        """An ``additional_tools`` item for every tool in *wanted* the model
+        lacks or holds under another definition. A tool *wanted* lacks is not
+        stated, since no item takes one away: it is left out of what the
+        model is offered, so a call to it is refused (``_refusal``)."""
         current = {tool.get("name"): tool for tool in map(_as_responses_tool, declared)}
         for message in messages:
             if is_tool_change_message(message):
                 for block in message.content:
                     for tool in block.get("tools") or ():
                         current[tool.get("name")] = tool
-        return current
-
-    def diff(self, declared, wanted, messages, model):
-        """An ``additional_tools`` item for every tool in *wanted* the model
-        lacks or holds under another definition. A tool *wanted* lacks is not
-        stated, since no item takes one away: it is left out of what the
-        model is offered, so a call to it is refused (``_refusal``)."""
-        current = self._current_tools(declared, messages)
         given = [_as_responses_tool(definition) for definition in wanted]
         added = [tool for tool in given if tool.get("name") not in current]
         changed = [
@@ -305,9 +284,6 @@ class _OpenAIWire(_Wire):
     # DALTON-HOOK(team-memory-toggle): inspect OpenAI wire tool names without mutating state
     def tool_name(self, entry):
         return _as_responses_tool(entry).get("name")
-
-    def has_tool(self, declared, messages, model, name):
-        return name in self._current_tools(declared, messages)
 
 
 _ANTHROPIC = _AnthropicWire()
@@ -401,27 +377,33 @@ def _prepare(
     if not stored and not wanted:
         return _Prepared(_with_messages(request, messages), None, None, bridged=False)
 
-    epoch = _epoch(messages)
-    if not stored or (slot.get("epoch") != epoch and not holds_bound_thinking(messages)):
-        declared = wire.render(stored, wanted)
-    else:
-        declared = stored
-        epoch = slot.get("epoch")
-
     # DALTON-HOOK(team-memory-toggle): a pre-deploy OFF thread's stored surface
-    # omits `conversation_search`. Keep it out of `wanted` while Team Memory
-    # stays OFF so `diff()` never injects `additional_tools` / `tool_addition`;
-    # once enabled (or on a fresh surface), it enters normally.
+    # omits `conversation_search` (or leaves it deferred). Check only the stored
+    # top-level declarations — never message or compaction tool-change replays —
+    # so while Team Memory is OFF, neither `wire.render()` nor `wire.diff()`
+    # re-adds `conversation_search` to top-level `tools` or `offered`. Once
+    # enabled (or on a fresh surface), it enters normally.
     if (
         conversation_search_enabled is False
         and stored
-        and not wire.has_tool(declared, messages, request.model, "conversation_search")
+        and not any(
+            wire.tool_name(entry) == "conversation_search"
+            and not entry.get("defer_loading")
+            for entry in stored
+        )
     ):
         wanted = [
             entry
             for entry in wanted
             if wire.tool_name(entry) != "conversation_search"
         ]
+
+    epoch = _epoch(messages)
+    if not stored or (slot.get("epoch") != epoch and not holds_bound_thinking(messages)):
+        declared = wire.render(stored, wanted)
+    else:
+        declared = stored
+        epoch = slot.get("epoch")
 
     # A compaction request summarizes what was sent, so it carries the array
     # and nothing new, and records nothing.

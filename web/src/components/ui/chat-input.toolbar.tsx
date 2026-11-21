@@ -240,22 +240,28 @@ export function useToolbarItems({
  * `props` must keep its identity while nothing in it changes: the item's
  * identity re-measures the toolbar.
  */
+// DALTON-HOOK(antigravity-series): keep effort toolbar item visible when showing read-only stored effort for a multi-level series
 export function useEffortToolbarItem(props: EffortMenuProps, phone: boolean): ToolbarItem {
-  return useMemo<ToolbarItem>(() => ({
-    id: 'effort',
-    group: 'tuning',
-    slot: 'right',
-    visible: hasTuningMenu(props.reasoningEfforts, props.isCodexModel),
-    inline: ({ measureOnly }) => (measureOnly
-      ? (
-        <ModelTriggerMeasure
-          pill="effort"
-          effortLabel={props.effortLabel}
-          reasoningEfforts={props.reasoningEfforts}
-          isCodexModel={props.isCodexModel}
-        />
-      )
-      : <ChatInputEffortMenu {...props} />),
-    menu: () => (phone ? <EffortMenuSection {...props} /> : <EffortSubmenu {...props} />),
-  }), [props, phone]);
+  return useMemo<ToolbarItem>(() => {
+    const hasMenu = hasTuningMenu(props.reasoningEfforts, props.isCodexModel);
+    const readOnly = Boolean(props.readOnlyEffort && props.effortLabel && !hasMenu);
+    return {
+      id: 'effort',
+      group: 'tuning',
+      slot: 'right',
+      visible: hasMenu || readOnly,
+      inline: ({ measureOnly }) => (measureOnly
+        ? (
+          <ModelTriggerMeasure
+            pill="effort"
+            effortLabel={props.effortLabel}
+            reasoningEfforts={props.reasoningEfforts}
+            isCodexModel={props.isCodexModel}
+            readOnly={readOnly}
+          />
+        )
+        : <ChatInputEffortMenu {...props} />),
+      menu: () => (phone ? <EffortMenuSection {...props} /> : <EffortSubmenu {...props} />),
+    };
+  }, [props, phone]);
 }

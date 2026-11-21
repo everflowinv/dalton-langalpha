@@ -187,6 +187,27 @@ export function resolveLowEffortVariantKey(
 }
 
 /**
+ * Return the variant keys of `series` that are currently in `favorites` and
+ * still resolve to this built-in series via `inspectSavedAntigravityModel`
+ * (excluding any key shadowed by a same-name custom model or non-Antigravity
+ * metadata entry).
+ */
+export function favoriteAntigravitySeriesVariants(
+  series: AntigravitySeriesEntry,
+  favorites: ReadonlySet<string> | readonly string[],
+  options: InspectAntigravityOptions,
+): string[] {
+  const hasFav = Array.isArray(favorites)
+    ? (k: string) => favorites.includes(k)
+    : (k: string) => (favorites as ReadonlySet<string>).has(k);
+  return Object.values(series.variants).filter((variantKey) => {
+    if (!hasFav(variantKey)) return false;
+    const match = inspectSavedAntigravityModel(variantKey, options);
+    return match !== null && match.series.series_id === series.series_id;
+  });
+}
+
+/**
  * Format an unshadowed built-in Antigravity variant as `"Series"` or
  * `"Series · Effort"`; returns `null` when the key is not an unshadowed
  * built-in Antigravity variant.

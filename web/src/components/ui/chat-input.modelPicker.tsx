@@ -29,6 +29,7 @@ import { PayerBadge } from '@/components/model/PayerBadge';
 // DALTON-HOOK(antigravity-series): collapse Antigravity variants into one row across tabs, search, favorites, recent
 import type { CustomModelEntry } from '@/components/model/types';
 import {
+  favoriteAntigravitySeriesVariants,
   indexSelectableSeries,
   inspectSavedAntigravityModel,
   type AntigravitySeriesCatalog,
@@ -195,7 +196,8 @@ function collapseToRows({
       : sel
         ? sel.defaultVariantKey
         : m;
-    const favVariants = Object.values(hit.series.variants).filter((v) => favoriteSet.has(v));
+    // DALTON-HOOK(antigravity-series): exclude same-name custom models when aggregating/removing series favorites
+    const favVariants = favoriteAntigravitySeriesVariants(hit.series, favoriteSet, seriesOpts);
     const isFav = favVariants.length > 0;
     rows.push({
       rowKey: pickKey,

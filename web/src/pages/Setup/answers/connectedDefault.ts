@@ -15,6 +15,9 @@ import { listedFor } from '@/lib/connectionModels';
 import { useProviderCatalog } from '@/hooks/useProviderCatalog';
 import type { ConnectionOf } from '@/lib/providerCatalog';
 import type { CustomModelEntry } from '@/components/model/types';
+// DALTON-HOOK(dalton-setup): never auto-save a default outside the 5 curated candidates in Dalton
+import { isDaltonBuild } from '@/config/brand';
+import { resolveDaltonSetupCandidates } from '@/config/daltonSetup';
 import { strongestModel, type RatedMetadata } from './defaultChoices';
 
 /** The model a provider just connected starts on, the one the default step
@@ -32,6 +35,10 @@ export function connectedModel(
 ): string | null {
   const offered = listedFor(provider, models, metadata, customModels, connectionOf);
   if (provider === CLAUDE_CODE) return claudeCodeStartModel(offered, metadata, accountDefault);
+  // DALTON-HOOK(dalton-setup): restrict auto-saved connected default to the 5 curated candidates
+  if (isDaltonBuild) {
+    return resolveDaltonSetupCandidates(offered)[0] ?? null;
+  }
   return strongestModel(offered, metadata)?.model ?? offered[0] ?? null;
 }
 

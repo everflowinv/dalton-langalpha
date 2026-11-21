@@ -8,9 +8,16 @@
  * deployment's own models), then the default model.
  */
 import type { OnboardingModels, OnboardingProgress, OnboardingRunsOn, OnboardingSetupStep } from '@/api/onboarding';
-// DALTON-HOOK(dalton-setup): Dalton builds never require the Claude Code model step
+// DALTON-HOOK(dalton-setup): Dalton builds never require the Claude Code model step and only advance from /setup/model on curated-candidate subscriptions
 import { isDaltonBuild } from '@/config/brand';
 import { WELCOME_PATH } from '@/pages/Onboarding/welcome/paths';
+
+/** Providers whose OAuth subscription can supply at least one model in `DALTON_SETUP_CANDIDATES`. */
+export const DALTON_CURATED_PROVIDERS: ReadonlySet<string> = new Set([
+  'antigravity-oauth',
+  'claude-oauth',
+  'codex-oauth',
+]);
 
 export type ModelsAnswer = OnboardingModels;
 export type RunsOnAnswer = OnboardingRunsOn;
