@@ -550,6 +550,9 @@ async def test_a_held_run_tells_its_agent_where_to_send():
         },
     }
     assert args["run_metadata"] == {
+        # DALTON-HOOK(automation-effort): the run records the task's own thinking level.
+        "automation_reasoning_effort": None,
+        "automation_reasoning_effort_configured": True,
         "automation_execution_id": _EXEC,
         "automation_id": "auto-1",
         **automation_delivery.run_metadata(_HELD),
@@ -589,7 +592,13 @@ async def test_a_run_the_messaging_service_did_not_take_runs_as_before():
     assert args["request"].additional_context is None
     # DALTON-HOOK(dalton-tools): Tools receive the server execution identity.
     assert args["extra_configurable"] == {"automation_execution_id": _EXEC}
-    assert args["run_metadata"] == {"automation_execution_id": _EXEC, "automation_id": "auto-1"}
+    assert args["run_metadata"] == {
+        "automation_execution_id": _EXEC,
+        "automation_id": "auto-1",
+        # DALTON-HOOK(automation-effort): the run records the task's own thinking level.
+        "automation_reasoning_effort": None,
+        "automation_reasoning_effort_configured": True,
+    }
     fx.started.assert_awaited_once()
 
 
@@ -606,6 +615,9 @@ async def test_a_start_the_service_did_not_take_leaves_the_run_to_the_webhook():
     assert args["extra_configurable"] == {"automation_execution_id": _EXEC}
     assert automation_delivery.DELIVERY_KEY not in args["extra_configurable"]
     assert args["run_metadata"] == {
+        # DALTON-HOOK(automation-effort): the run records the task's own thinking level.
+        "automation_reasoning_effort": None,
+        "automation_reasoning_effort_configured": True,
         "automation_execution_id": _EXEC,
         "automation_id": "auto-1",
         **automation_delivery.run_metadata(_LEFT),
@@ -780,6 +792,9 @@ async def test_a_wait_that_outlasts_a_delivery_change_runs_with_the_new_one():
         t.as_dict() for t in _RESTARTED.targets
     ]
     assert args["run_metadata"] == {
+        # DALTON-HOOK(automation-effort): the run records the task's own thinking level.
+        "automation_reasoning_effort": None,
+        "automation_reasoning_effort_configured": True,
         "automation_execution_id": _EXEC,
         "automation_id": "auto-1",
         **automation_delivery.run_metadata(_RESTARTED),
