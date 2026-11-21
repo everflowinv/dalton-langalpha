@@ -39,6 +39,11 @@ export default defineConfig({
   define: monacoVersionDefine(import.meta.dirname),
   test: {
     globals: true,
+    // DALTON-HOOK(brand-name): default brand env vars to empty so local web/.env Dalton overrides never break upstream tests
+    env: {
+      VITE_BRAND_NAME: '',
+      VITE_BRAND_MARK: '',
+    },
     // A vm worker keeps every file's module graph until its heap reaches this,
     // then restarts. The default is total memory / workers, which on a 16 GB,
     // 4-CPU CI runner lets three workers grow toward all 16 GB. At 1 GB a

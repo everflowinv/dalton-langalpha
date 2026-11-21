@@ -1,6 +1,8 @@
 import { useEffect, useId, useState } from 'react';
 import type { OnboardingSetupOn } from '@/api/onboarding';
-import { useNavigate } from 'react-router';
+import { Navigate, useNavigate } from 'react-router';
+// DALTON-HOOK(dalton-setup): Mac handoff is disabled in Dalton builds
+import { isDaltonBuild } from '@/config/brand';
 import { useTranslation } from 'react-i18next';
 import { ExternalLink, Laptop } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -34,6 +36,8 @@ const POLL_MS = 3000;
  */
 export default function MacHandoffStep() {
   const { user } = useUser();
+  // DALTON-HOOK(dalton-setup): redirect Mac handoff step out in Dalton builds
+  if (isDaltonBuild) return <Navigate to="/setup" replace />;
   return <MacHandoff key={user?.user_id ?? ''} />;
 }
 

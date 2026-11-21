@@ -17,6 +17,9 @@ import { useSetupFacts } from './answers/useSetupFacts';
 
 import { isPlatformMode } from '@/config/hostMode';
 import { ONBOARDING_USE_URL } from '@/config/supportLinks';
+// DALTON-HOOK(dalton-setup): gate Mac & Claude Code setup routes in Dalton builds
+import { isDaltonBuild } from '@/config/brand';
+import { useIsPresent } from '@/lib/framer';
 import React from 'react';
 
 const MethodStep = React.lazy(() => import('./steps/MethodStep'));
@@ -82,6 +85,9 @@ const PAGES: readonly SetupPage[] = [
   { path: 'default', element: <DefaultStep />, rail: 'answers', step: 'default' },
 ];
 
+// DALTON-HOOK(dalton-setup): Mac & Claude Code routes disabled under Dalton builds
+const DALTON_DISABLED_PATHS = new Set(['mac', 'this-mac', 'continue', 'claude-code']);
+
 const pageOf = (pathname: string): SetupPage | null => {
   const path = pathname.replace(/^\/setup\/?/, '').replace(/\/$/, '');
   return PAGES.find((p) => p.path === path) ?? null;
@@ -92,7 +98,10 @@ const pageOf = (pathname: string): SetupPage | null => {
  * (`setupStartTarget`), on any surface.
  */
 function SetupStart() {
+  // DALTON-HOOK(dalton-setup): never re-trigger Navigate while exiting AnimatePresence frame
+  const present = useIsPresent();
   const route = useOnboardingRoute();
+  if (!present) return null;
   if (route.kind === 'loading') return <StepLoading />;
   const target = setupStartTarget(route);
   if (target?.kind === 'platform') return ONBOARDING_USE_URL ? <ExternalRedirect to={ONBOARDING_USE_URL} /> : null;
@@ -186,7 +195,14 @@ export default function SetupWizard() {
         {held ? <StepLoadFailed onRetry={retryFacts} /> : (
           <Suspense fallback={<StepLoading />}>
             <Routes location={location}>
-              {PAGES.map((p) => <Route key={p.path} path={p.path} element={p.element} />)}
+              {/* DALTON-HOOK(dalton-setup): redirect Mac & Claude Code routes away in Dalton builds */}
+              {PAGES.map((p) => (
+                <Route
+                  key={p.path}
+                  path={p.path}
+                  element={isDaltonBuild && DALTON_DISABLED_PATHS.has(p.path) ? <Navigate to="/setup" replace /> : p.element}
+                />
+              ))}
               <Route index element={<SetupStart />} />
               <Route path="*" element={<Navigate to="/setup" replace />} />
             </Routes>

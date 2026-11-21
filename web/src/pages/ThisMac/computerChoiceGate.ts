@@ -13,6 +13,8 @@
  */
 import { canAddThisMac } from '@/lib/desktop';
 import { useStorageUser, userLocalStorage } from '@/lib/userStorage';
+// DALTON-HOOK(dalton-setup): Dalton builds never show the desktop Mac first-run prompt
+import { isDaltonBuild } from '@/config/brand';
 
 const ASKED_HERE_KEY = 'thisMacFirstRun.asked';
 
@@ -29,5 +31,7 @@ export function markAskedOnThisMac(): void {
 /** Whether the first run is still to be shown to the signed-in user on this Mac. */
 export function useComputerChoiceUnasked(): boolean {
   const asked = askedOnThisMac(useStorageUser());
+  // DALTON-HOOK(dalton-setup): disable ThisMac first-run gate under Dalton builds
+  if (isDaltonBuild) return false;
   return canAddThisMac() && !asked;
 }

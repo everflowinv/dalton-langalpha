@@ -1,6 +1,8 @@
 import { useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAllModels } from '@/hooks/useAllModels';
+// DALTON-HOOK(dalton-setup): optional Dalton filtering for legacy /setup/models picker
+import { isDaltonAllowedModel } from '@/config/daltonSetup';
 import { useModels } from '@/hooks/useModels';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useReadStoredPreferences } from '@/hooks/useStoredPreferences';
@@ -44,14 +46,17 @@ export function useModelPicker({
   provider,
   modelsFrom,
   justConnected = false,
+  dalton = false,
 }: {
   provider: string;
   modelsFrom?: string;
   justConnected?: boolean;
+  // DALTON-HOOK(dalton-setup): exclude Claude Code & credits models when called from Dalton setup
+  dalton?: boolean;
 }) {
   const { t } = useTranslation();
   const source = modelsFrom ?? provider;
-  const { metadata, isLoading: modelsLoading } = useAllModels();
+  const { metadata, payers, isLoading: modelsLoading } = useAllModels();
   const { models: modelsData } = useModels();
   const { providers: configured, configuredSet } = useConfiguredProviders();
   const { entryFor, connectionOf } = useProviderCatalog();
@@ -79,6 +84,11 @@ export function useModelPicker({
   // provider and keeps its tuning, so it is ready to use, not the user's own.
   const manifestMeta = modelsData?.model_metadata ?? NO_MODELS;
   const keyCandidates = modelsData?.key_candidates;
+  // DALTON-HOOK(dalton-setup): disallow Claude Code & credits models in Dalton setup picker
+  const daltonAllowed = useCallback(
+    (m: string) => !dalton || isDaltonAllowedModel(metadata[m] ?? manifestMeta[m], payers?.[m]),
+    [dalton, metadata, manifestMeta, payers],
+  );
   /** A manifest model this connection runs as it is, needing no entry of its own. */
   const native = useCallback(
     (m: string) => runsNatively(m, provider, manifestMeta, keyCandidates),
@@ -118,19 +128,23 @@ export function useModelPicker({
     // list's word for it is not this connection's to act on.
     const confirmed = (listOk ? list!.ready.filter((m) => metadata[m] && !takenElsewhere(m, provider, allCustom, connectionOf)) : builtIn)
       .filter((m) => planIncludes(metadata[m], plan));
-    return [...confirmed, ...savedTuned.filter((m) => !confirmed.includes(m))];
-  }, [listOk, list, builtIn, metadata, provider, allCustom, savedTuned, plan, connectionOf]);
+    // DALTON-HOOK(dalton-setup): exclude disallowed models from ready list
+    return [...confirmed, ...savedTuned.filter((m) => !confirmed.includes(m))].filter(daltonAllowed);
+  }, [listOk, list, builtIn, metadata, provider, allCustom, savedTuned, plan, connectionOf, daltonAllowed]);
   const missing = listOk ? list!.missing : [];
 
   const listed = useMemo<ListedModel[]>(() => {
-    if (isLocal) return (local.data ?? []).map((m) => ({ id: m.id, display_name: m.name }));
-    return list?.others ?? [];
-  }, [isLocal, local.data, list]);
+    const raw = isLocal ? (local.data ?? []).map((m) => ({ id: m.id, display_name: m.name })) : (list?.others ?? []);
+    return raw.filter((m) => daltonAllowed(m.id));
+  }, [isLocal, local.data, list, daltonAllowed]);
   // A gateway's catalog tunes the models it describes (OpenCode Go), so they
   // are listed as ready to use; the untuned rest stay behind Show all.
   const described = useMemo(() => listed.filter((m) => m.described), [listed]);
   const others = useMemo(() => listed.filter((m) => !m.described), [listed]);
-  const results = searchFirst && debounced && searched.data?.provider === provider ? searched.data.others : others;
+  const results = useMemo(() => {
+    const raw = searchFirst && debounced && searched.data?.provider === provider ? searched.data.others : others;
+    return raw.filter((m) => daltonAllowed(m.id));
+  }, [searchFirst, debounced, searched.data, provider, others, daltonAllowed]);
 
   // Models put on the user's own list this visit and not saved yet: added by
   // hand, or ticked from the untuned rest or a search. They stay under the
@@ -184,8 +198,8 @@ export function useModelPicker({
   // A described model shows checked in its own list, not again as the user's.
   const yours = useMemo(() => {
     const listedReady = new Set(readyRows.map((r) => r.name));
-    return [...new Set([...savedCustomNames, ...added.keys()])].filter((m) => !listedReady.has(m));
-  }, [savedCustomNames, added, readyRows]);
+    return [...new Set([...savedCustomNames, ...added.keys()])].filter((m) => !listedReady.has(m) && daltonAllowed(m));
+  }, [savedCustomNames, added, readyRows, daltonAllowed]);
   /** Every name this view decides about: what is saved under this provider,
    *  and its own manifest models. Picks outside it belong to other providers,
    *  a coding plan's brand models among them until picked here. */
@@ -202,20 +216,25 @@ export function useModelPicker({
   const [picked, setPicked] = useState<Set<string> | null>(null);
   // Loaded, not present: a new user has no preferences row yet (a 404 read as null).
   const inputsReady = !modelsLoading && prefsLoaded && listSettled && (!isLocal || !local.isLoading);
+  // DALTON-HOOK(dalton-setup): never seed or retain disallowed models in selection
   const seed = useMemo(() => seedPicks({
-    candidates: [...ready, ...savedCustomNames, ...seededListed],
+    candidates: [...ready, ...savedCustomNames.filter(daltonAllowed), ...seededListed],
     savedNames: savedCustomNames,
     starred: existingStarred,
     native,
     justConnected,
-  }), [ready, savedCustomNames, seededListed, existingStarred, native, justConnected]);
-  const selected = picked ?? seed;
+  }), [ready, savedCustomNames, seededListed, existingStarred, native, justConnected, daltonAllowed]);
+  const selected = useMemo(
+    () => new Set([...(picked ?? seed)].filter(daltonAllowed)),
+    [picked, seed, daltonAllowed],
+  );
   const initialized = picked !== null || inputsReady;
   const setSelected = (update: (prev: Set<string>) => Set<string>) => setPicked((prev) => update(prev ?? seed));
 
   /** Picks or unpicks a model by name. An untuned listed model picked joins
    *  the user's own. */
   const toggle = (name: string) => {
+    if (!daltonAllowed(name)) return;
     const e = unsaved.find((u) => u.name === name);
     if (e && !selected.has(name) && !added.has(name) && !readyRows.some((r) => r.name === name)) {
       setAdded((prev) => new Map(prev).set(name, e));
@@ -232,6 +251,8 @@ export function useModelPicker({
   const selectAllReady = () => setSelected((prev) => new Set([...prev, ...readyRows.map((r) => r.name)]));
 
   const addManual = (e: CustomModelEntry) => {
+    // DALTON-HOOK(dalton-setup): reject disallowed models on manual add
+    if (!daltonAllowed(e.name) || !daltonAllowed(e.model_id)) return;
     setAdded((prev) => new Map(prev).set(e.name, e));
     setSelected((prev) => new Set(prev).add(e.name));
   };

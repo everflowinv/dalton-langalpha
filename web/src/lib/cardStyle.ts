@@ -1,8 +1,6 @@
 /**
- * How the app is drawn: Balanced (the upstream default, which leaves each
- * component as it draws itself), Soft, or Terminal. A Dalton build with nothing
- * stored shows Terminal (`defaultCardStyle`); a stored or account choice wins.
- * Terminal is the data cards' own
+ * How the app is drawn: Balanced (the default, which leaves each component as it
+ * draws itself), Soft, or Terminal. Terminal is the data cards' own
  * stylesheets, and the other two take marks away from them
  * (charts/termCardStyles.css); the rest of the app reads the style as
  * variables (styles/cardStyle.css, which declares every style's values).
@@ -16,7 +14,6 @@
  */
 
 import { useSyncExternalStore } from 'react';
-import { isDaltonBuild } from '../config/brand'; // DALTON-HOOK(brand-name): default Dalton builds to original terminal card style
 import { safeLocalStorage } from './utils';
 
 export const CARD_STYLES = ['soft', 'balanced', 'terminal'] as const;
@@ -46,11 +43,11 @@ function readStored(): CardStyle | null {
   return carried;
 }
 
-// DALTON-HOOK(brand-name): Dalton builds default to 'terminal' (the pre-#617
-// card stylesheet). A style this browser already stored, or one the account
-// saved, is applied before this fallback.
+// DALTON-HOOK(brand-name): Dalton builds use the upstream default, Balanced
+// (user decision 2026-11-21; they used to default to Terminal). A style this
+// browser already stored, or one the account saved, is applied before this fallback.
 export function defaultCardStyle(): CardStyle {
-  return isDaltonBuild ? 'terminal' : 'balanced';
+  return 'balanced';
 }
 
 // Read on first use rather than at import, so a module that only imports this

@@ -12,7 +12,7 @@
   "retry": "重试",
   "continueAnyway": "仍然继续",
   "setupTitle": "设置这台 Mac",
-  "setupHelper": "Agent 会在这台 Mac 上的一个文件夹里工作。LangAlpha 会弹出窗口请你确认，macOS 也可能请你允许它在后台运行。",
+  "setupHelper": "Agent 会在这台 Mac 上的一个文件夹里工作。{{brand}} 会弹出窗口请你确认，macOS 也可能请你允许它在后台运行。",
   "backupNotice": "开启备份后，每个工作区的文件都会在服务器上保留一份副本，这台 Mac 不在线时也能打开，丢失的文件夹也能恢复。Home 位于你的默认计算机上，所以默认计算机需要开启备份。",
   "backupOffCloud": "不开启备份，这台 Mac 就不能成为默认计算机，Home 会继续留在云端。",
   "backupOffMachine": "不开启备份，这台 Mac 就不能成为默认计算机，Home 会继续留在 {{name}} 上。",

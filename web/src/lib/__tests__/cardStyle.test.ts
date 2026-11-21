@@ -18,13 +18,13 @@ describe('card style', () => {
     expect(getCardStyle()).toBe('balanced');
   });
 
-  // DALTON-HOOK(brand-name): verify Dalton build defaults to 'terminal' when cardStyle is unset
-  it('defaults to Terminal in a Dalton build when nothing is stored', async () => {
+  // DALTON-HOOK(brand-name): verify Dalton build defaults to 'balanced' when cardStyle is unset
+  it('defaults to Balanced in a Dalton build when nothing is stored', async () => {
     vi.stubEnv('VITE_BRAND_MARK', 'everflow');
     vi.resetModules();
     const { getCardStyle: getDaltonCardStyle, setCardStyle: setDaltonCardStyle } =
       await import('../cardStyle');
-    expect(getDaltonCardStyle()).toBe('terminal');
+    expect(getDaltonCardStyle()).toBe('balanced');
     // A stored choice wins over the Dalton default. 'quiet' was renamed to
     // 'balanced' by the whole-app styles; 'soft' is a current non-default.
     setDaltonCardStyle('soft');

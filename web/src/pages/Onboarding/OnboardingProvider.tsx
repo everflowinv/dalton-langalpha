@@ -365,7 +365,8 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     limit: 1,
     enabled: listShown && !stamped('createWorkspace'),
   });
-  const thisMac = useThisMacTask(listShown && !stamped('remoteControl'));
+  // DALTON-HOOK(onboarding-tasks): skip thisMac probe in Dalton builds
+  const thisMac = useThisMacTask(!isDaltonBuild && listShown && !stamped('remoteControl'));
   const signals: Record<DoneSignal, boolean> = {
     hasWorkspace: (workspacesData?.workspaces?.length ?? 0) > 0,
     onboardingCompleted,

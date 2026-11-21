@@ -14,8 +14,10 @@ import { FallbackModelsPicker } from '@/components/model/FallbackModelsPicker';
 import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
 import { getModelDisplayName } from '@/components/ui/chat-input.helpers';
 import { isPlatformMode } from '@/config/hostMode';
+// DALTON-HOOK(dalton-setup): Dalton build defaults & credits/Claude Code filtering
+import { isDaltonBuild } from '@/config/brand';
+import { filterDaltonPayers, filterDaltonProviderModels, isDaltonAllowedModel } from '@/config/daltonSetup';
 import { isDesktopShell } from '@/lib/desktop';
-import { useAllModels } from '@/hooks/useAllModels';
 import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
 import { homeWorkspaceQuery } from '@/hooks/useHomeWorkspace';
 import { useProviderCatalog } from '@/hooks/useProviderCatalog';
@@ -29,8 +31,9 @@ import { BACKGROUND_AUTO, backgroundDefaultChoice, modelPrefs, splitPreferenceWr
 import { SetupFooter } from '../SetupFooter';
 import { useAnswerFlow } from '../answers/flow';
 import { defaultChoices, type DefaultChoices } from '../answers/defaultChoices';
-import { AnswersStrip, PickCard, StepError, StepLoadFailed, StepLoading } from '../answers/parts';
-import { SETUP_STEP_PATHS } from '../answers/setupSteps';
+import { AnswersStrip, PickCard, RowButton, StepError, StepLoadFailed, StepLoading } from '../answers/parts';
+import { effectiveModelsAnswer, SETUP_STEP_PATHS, type ModelsAnswer } from '../answers/setupSteps';
+import { useDaltonTeamModels, type DaltonTeamModelsState } from '../answers/useTeamModels';
 import { ProgressList, ProgressStep } from '../answers/ProgressSteps';
 
 /**
@@ -45,7 +48,9 @@ import { ProgressList, ProgressStep } from '../answers/ProgressSteps';
 export default function DefaultStep() {
   const flow = useAnswerFlow('default');
   const { user } = useUser();
-  const all = useAllModels();
+  // DALTON-HOOK(dalton-setup): share the unified Dalton team-model availability read
+  const team = useDaltonTeamModels();
+  const all = team.all;
   const { models, slotModels, payers, metadata, customModels, systemDefaults, isLoading } = all;
   const { connectionOf } = useProviderCatalog();
   const { preferences, isLoaded, unread, retry } = usePreferences();
@@ -54,7 +59,7 @@ export default function DefaultStep() {
   const behind = stepBehind(flow);
   // Once shown, the form stays: a later refetch flipping a read back to
   // loading would otherwise unmount it, and with it a setup under way.
-  const ready = !flow.isLoading && !isLoading && !all.unread && isLoaded && !behind;
+  const ready = !flow.isLoading && !isLoading && !all.unread && !(isDaltonBuild && team.isLoading) && isLoaded && !behind;
   const [shown, setShown] = useState(false);
   if (ready && !shown) setShown(true);
 
@@ -62,17 +67,28 @@ export default function DefaultStep() {
     if (behind) return <Navigate to={SETUP_STEP_PATHS[behind]} replace />;
     if (unread) return <StepLoadFailed onRetry={retry} />;
     // An unread catalog offers no model, and Continue would finish on none.
-    if (all.unread) return <StepLoadFailed onRetry={flow.retryFacts} />;
+    if (all.unread) return <StepLoadFailed onRetry={isDaltonBuild && team.shared ? team.retry : flow.retryFacts} />;
     return <StepLoading />;
   }
   if (!flow.answers) return <Navigate to="/setup" replace />;
 
   const saved = modelPrefs(preferences);
+  // DALTON-HOOK(dalton-setup): exclude Claude Code / credits models and payers, and treat legacy answers as team models when available
+  const effectiveModels = effectiveModelsAnswer(flow.answers.models, team.available);
+  const visiblePayers = filterDaltonPayers(payers, isDaltonBuild);
+  const visibleModels = filterDaltonProviderModels(models, metadata, payers, isDaltonBuild);
+  const visibleSlotModels = filterDaltonProviderModels(slotModels, metadata, payers, isDaltonBuild);
+  const rawSystemDefault = systemDefaults?.default_model ?? null;
+  const rawSystemBackground = systemDefaults?.background_model ?? null;
+  const allowedSystemDefault = rawSystemDefault && (!isDaltonBuild || isDaltonAllowedModel(metadata[rawSystemDefault], payers[rawSystemDefault]))
+    ? rawSystemDefault : null;
+  const allowedSystemBackground = rawSystemBackground && (!isDaltonBuild || isDaltonAllowedModel(metadata[rawSystemBackground], payers[rawSystemBackground]))
+    ? rawSystemBackground : null;
   const choices = defaultChoices({
-    models: flow.answers.models,
-    offered: models,
-    slotModels: Object.values(slotModels).flatMap((p) => p.models ?? []),
-    payers,
+    models: effectiveModels,
+    offered: visibleModels,
+    slotModels: Object.values(visibleSlotModels).flatMap((p) => p.models ?? []),
+    payers: visiblePayers,
     // Not a connection the account's rules keep off, which no turn runs on.
     ownProviders: providers.filter((p) => p.masked_key !== SERVER_KEY && p.state !== 'needs_reauth'
       && (p.access_type === 'oauth' ? allows(policy, RULE.ownSubscriptions)
@@ -80,14 +96,26 @@ export default function DefaultStep() {
     metadata,
     customModels,
     connectionOf,
-    systemDefault: systemDefaults?.default_model ?? null,
-    systemBackground: systemDefaults?.background_model ?? null,
+    systemDefault: allowedSystemDefault,
+    systemBackground: allowedSystemBackground,
     preferred: saved.preferred_model ?? null,
+    // DALTON-HOOK(dalton-setup): pass dalton build flag and team state into DefaultForm
+    dalton: isDaltonBuild,
   });
   // Mounted once the preferences are read, so the picks are seeded from what
   // is saved and never from an unread row; keyed by the account, whose drafts
   // and setup under way they are.
-  return <DefaultForm key={user?.user_id ?? ''} flow={flow} choices={choices} saved={saved} all={all} />;
+  return (
+    <DefaultForm
+      key={user?.user_id ?? ''}
+      flow={flow}
+      choices={choices}
+      saved={saved}
+      all={all}
+      team={team}
+      effectiveModels={effectiveModels}
+    />
+  );
 }
 
 type Flow = ReturnType<typeof useAnswerFlow>;
@@ -104,10 +132,27 @@ const HOME_WAIT_MS = 8_000;
 type SetupPhase = (typeof SETTING_UP)[number] | 'done';
 type Saved = ReturnType<typeof modelPrefs>;
 
-function DefaultForm({ flow, choices, saved, all }: { flow: Flow; choices: DefaultChoices; saved: Saved; all: ReturnType<typeof useAllModels> }) {
+function DefaultForm({
+  flow,
+  choices,
+  saved,
+  all,
+  team,
+  effectiveModels,
+}: {
+  flow: Flow;
+  choices: DefaultChoices;
+  saved: Saved;
+  all: DaltonTeamModelsState['all'];
+  team: DaltonTeamModelsState;
+  effectiveModels: ModelsAnswer;
+}) {
   const { t } = useTranslation();
   const copy = useModelSlotCopy();
   const { slotModels, payers, metadata, systemDefaults, cannotRun } = all;
+  // DALTON-HOOK(dalton-setup): exclude Claude Code / credits models and payers in Dalton builds
+  const visiblePayers = filterDaltonPayers(payers, isDaltonBuild);
+  const visibleSlotModels = filterDaltonProviderModels(slotModels, metadata, payers, isDaltonBuild);
   const update = useUpdatePreferences();
   const headingId = useId();
   const groupName = useId();
@@ -115,14 +160,19 @@ function DefaultForm({ flow, choices, saved, all }: { flow: Flow; choices: Defau
   const [primaryPick, setPrimary] = useState(choices.initial);
   // Background as Settings holds it: a model, or Auto (the deployment's, which
   // `background_follows` keeps beside a saved primary).
-  const systemBackground = systemDefaults?.background_model ?? null;
+  // DALTON-HOOK(dalton-setup): disallow Auto background when deployment background requires credits or Claude Code
+  const rawSystemBackground = systemDefaults?.background_model ?? null;
+  const systemBackground = rawSystemBackground && (!isDaltonBuild || isDaltonAllowedModel(metadata[rawSystemBackground], payers[rawSystemBackground]))
+    ? rawSystemBackground : null;
   const recommendedBackground = recommended.background ?? (systemBackground ? BACKGROUND_AUTO : '');
   // A saved Background confirmed not to run any more (retired, or a plan
   // that lost it) starts on the recommended one instead; one only unlisted
   // while a read failed or loads is kept.
   const [seededBackground] = useState(() => {
     const kept = backgroundDefaultChoice(saved);
-    const runs = kept === BACKGROUND_AUTO || !cannotRun(kept);
+    const runs = kept === BACKGROUND_AUTO
+      ? (!isDaltonBuild || !!systemBackground)
+      : (!cannotRun(kept) && (!isDaltonBuild || isDaltonAllowedModel(metadata[kept], payers[kept])));
     return (runs && kept) || recommendedBackground;
   });
   const [backgroundPick, setBackground] = useState(seededBackground);
@@ -132,11 +182,19 @@ function DefaultForm({ flow, choices, saved, all }: { flow: Flow; choices: Defau
   // the form opened on keeps the rule it opened with: it goes only once it
   // is confirmed not to run.
   const settled = !all.isLoading && !all.unread;
-  const backgroundOffered = Object.values(slotModels).flatMap((p) => p.models ?? []);
+  const backgroundOffered = Object.values(visibleSlotModels).flatMap((p) => p.models ?? []);
   const primary = settled && (!primaryPick || !choices.list.includes(primaryPick)) ? recommended.primary : primaryPick;
-  const background = backgroundPick && backgroundPick !== BACKGROUND_AUTO && (cannotRun(backgroundPick)
-    || (settled && backgroundPick !== seededBackground && !backgroundOffered.includes(backgroundPick)))
-    ? recommendedBackground : backgroundPick;
+  // DALTON-HOOK(dalton-setup): reject credits/Claude Code background models including Auto
+  const backgroundDisallowed = isDaltonBuild && (
+    backgroundPick === BACKGROUND_AUTO
+      ? !systemBackground
+      : !isDaltonAllowedModel(metadata[backgroundPick], payers[backgroundPick])
+  );
+  const background = backgroundPick && (
+    backgroundDisallowed
+    || (backgroundPick !== BACKGROUND_AUTO && (cannotRun(backgroundPick)
+      || (settled && backgroundPick !== seededBackground && !backgroundOffered.includes(backgroundPick))))
+  ) ? recommendedBackground : backgroundPick;
   // Routing seeded from what is saved, else what the deployment runs, and
   // written only when changed here: an unset one keeps following the
   // deployment.
@@ -150,7 +208,11 @@ function DefaultForm({ flow, choices, saved, all }: { flow: Flow; choices: Defau
   const [fallbackModels, setFallbackModels] = useState<string[]>(routing.fallbacks);
   // A routing draft a refetch took away is not written, as the picks above;
   // one saved before keeps its rule and goes only once confirmed not to run.
-  const routes = (m: string, saved: boolean) => !cannotRun(m) && (saved || !settled || backgroundOffered.includes(m));
+  // DALTON-HOOK(dalton-setup): exclude credits/Claude Code models from routing drafts
+  const routes = (m: string, saved: boolean) =>
+    !cannotRun(m)
+    && (!isDaltonBuild || isDaltonAllowedModel(metadata[m], payers[m]))
+    && (saved || !settled || backgroundOffered.includes(m));
   const fetchDraft = !fetchModel || routes(fetchModel, false) ? fetchModel : routing.fetch;
   const compactionDraft = !compactionModel || routes(compactionModel, false) ? compactionModel : routing.compaction;
   const fallbackDraft = fallbackModels.filter((m) => routes(m, routing.fallbacks.includes(m)));
@@ -192,10 +254,13 @@ function DefaultForm({ flow, choices, saved, all }: { flow: Flow; choices: Defau
   const target = flow.tokenTarget;
   // Setup finished, or taken by the other surface, is no longer this form's
   // to save; a key or plan answer saves no setup without a model of its own.
+  // DALTON-HOOK(dalton-setup): mac_pending falls back to browser and empty model pools cannot complete setup
   const setupOn = flow.progress?.setup_on ?? null;
-  const held = !!flow.progress?.setup_completed_at || (setupOn !== null && setupOn !== (isDesktopShell() ? 'app' : 'browser'))
-    || (!primary && flow.answers?.models === 'subscription_or_key');
-  const where = flow.answers?.models !== 'claude_code' || !isPlatformMode ? null
+  const effectiveSetupOn = isDaltonBuild && setupOn === 'mac_pending' ? 'browser' : setupOn;
+  const held = !!flow.progress?.setup_completed_at
+    || (effectiveSetupOn !== null && effectiveSetupOn !== (isDesktopShell() ? 'app' : 'browser'))
+    || (!primary && (isDaltonBuild || effectiveModels === 'subscription_or_key'));
+  const where = effectiveModels !== 'claude_code' || !isPlatformMode ? null
     : target?.kind === 'computer'
       ? t('setup.answers.default.claudeCodeOn', { name: target.name })
       : t('setup.answers.default.claudeCodeOnCloud');
@@ -203,6 +268,7 @@ function DefaultForm({ flow, choices, saved, all }: { flow: Flow; choices: Defau
   // Every step checks the form is still up: leaving setup mid-way (Back,
   // Exit) ends the run, and no later write or navigation lands for it.
   const setUp = async () => {
+    if (!primary && isDaltonBuild) return;
     void import('@/pages/Onboarding/welcome/Welcome');
     setPhase('models');
     if (primary) {
@@ -286,7 +352,20 @@ function DefaultForm({ flow, choices, saved, all }: { flow: Flow; choices: Defau
       {flow.first && flow.answers && <AnswersStrip answers={flow.answers} />}
       <WizardStepHeader titleId={headingId} title={t('setup.answers.default.title')} helper={t('setup.answers.default.lead')} />
       {choices.list.length === 0 ? (
-        <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>{t('setup.answers.default.none')}</p>
+        /* DALTON-HOOK(dalton-setup): prompt to contact admin & retry when team sharing has no available models */
+        isDaltonBuild && team.shared ? (
+          <div
+            data-testid="setup-default-team-models-empty"
+            className="shell-box flex items-center justify-between gap-3 px-4 py-3"
+          >
+            <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
+              {t('setup.answers.default.teamModelsEmpty')}
+            </p>
+            <RowButton onClick={team.retry}>{t('setup.answers.tryAgain')}</RowButton>
+          </div>
+        ) : (
+          <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>{t('setup.answers.default.none')}</p>
+        )
       ) : (
         <div className="flex flex-col gap-6">
           {recommended.primary && (
@@ -349,7 +428,8 @@ function DefaultForm({ flow, choices, saved, all }: { flow: Flow; choices: Defau
                   <Ratings meta={metadata[m]} />
                   {m === primary && where && <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{where}</span>}
                 </span>
-                <PayerBadge payer={payers[m]} />
+                {/* DALTON-HOOK(dalton-setup): hide credits payer badges under Dalton */}
+                <PayerBadge payer={visiblePayers[m]} />
               </PickCard>
             ))}
           </div>
@@ -374,16 +454,17 @@ function DefaultForm({ flow, choices, saved, all }: { flow: Flow; choices: Defau
                   transition={TWEEN.quick}
                 >
                   <div className="flex flex-col gap-6 pt-4">
+                    {/* DALTON-HOOK(dalton-setup): pass Dalton-filtered slot models, payers, and Auto option */}
                     <ModelSelector
                       label={copy.background.label}
                       description={copy.background.description}
                       value={background}
                       onChange={setBackground}
-                      models={slotModels}
+                      models={visibleSlotModels}
                       missingLabel={name}
                       placeholder={copy.background.placeholder}
                       autoOption={deploymentBackground ? { value: BACKGROUND_AUTO, label: deploymentBackground } : undefined}
-                      payers={payers}
+                      payers={visiblePayers}
                       metadata={metadata}
                     />
                     <ModelSelector
@@ -391,9 +472,9 @@ function DefaultForm({ flow, choices, saved, all }: { flow: Flow; choices: Defau
                       description={t('settings.modelTuning.fetchModelDesc')}
                       value={fetchModel}
                       onChange={setFetchModel}
-                      models={slotModels}
+                      models={visibleSlotModels}
                       placeholder={copy.defaultsToBackground}
-                      payers={payers}
+                      payers={visiblePayers}
                       metadata={metadata}
                     />
                     <ModelSelector
@@ -401,17 +482,18 @@ function DefaultForm({ flow, choices, saved, all }: { flow: Flow; choices: Defau
                       description={t('settings.modelTuning.compactionModelDesc')}
                       value={compactionModel}
                       onChange={setCompactionModel}
-                      models={slotModels}
+                      models={visibleSlotModels}
                       placeholder={copy.defaultsToConversation}
-                      payers={payers}
+                      payers={visiblePayers}
                       metadata={metadata}
                     />
+                    {/* DALTON-HOOK(dalton-setup): pass Dalton-filtered slot models and payers to FallbackModelsPicker */}
                     <FallbackModelsPicker
                       selected={fallbackModels}
                       onChange={setFallbackModels}
-                      models={slotModels}
+                      models={visibleSlotModels}
                       metadata={metadata}
-                      payers={payers}
+                      payers={visiblePayers}
                     />
                   </div>
                 </motion.div>
