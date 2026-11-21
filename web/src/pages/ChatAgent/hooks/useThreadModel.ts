@@ -7,8 +7,8 @@ import type { SubscriptionProvider } from '@/api/oauth';
 import type { Thread } from '@/types/api';
 import { useAllModels } from '@/hooks/useAllModels';
 import { useLapsedSignIn } from '@/hooks/useLapsedSignIn';
-// DALTON-HOOK(antigravity-series): inspect series membership & avoid 403 PATCH on shared/unresolved workspaces
-import { useSharedWorkspaces } from '@/hooks/useSharedWorkspaces';
+// DALTON-HOOK(antigravity-series): inspect series membership & resolve thread write permissions before issuing PATCH
+import { useThreadWriteAccess } from '@/lib/dalton/useThreadWriteAccess';
 import {
   formatAntigravityVariantLabel,
   inspectSavedAntigravityModel,
@@ -98,24 +98,25 @@ export function useThreadModel({
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const { catalogModelNames, metadata, customModels, rawApiResponse, seriesCatalog } = useAllModels();
-  // DALTON-HOOK(antigravity-series): distinguish confirmed personal vs shared vs loading/failed shared-list read so picks never 403
-  const sharedWorkspaces = useSharedWorkspaces();
-  const hasSharedList = sharedWorkspaces.data !== undefined;
-  const isSharedUnresolved = Boolean(workspaceId) && sharedWorkspaces.enabled && !hasSharedList;
-  const isSharedError = isSharedUnresolved && sharedWorkspaces.isError;
-  const isSharedWorkspace = Boolean(workspaceId)
-    && sharedWorkspaces.enabled
-    && Boolean(sharedWorkspaces.data?.workspaces.some((e) => e.workspace.workspace_id === workspaceId));
-  const isSharedOrUnresolved = isSharedUnresolved || isSharedWorkspace;
   const rawMetadata = rawApiResponse?.model_metadata ?? metadata;
   const defaultModel = useDefaultModel();
   const lapsedOf = useLapsedSignIn();
   const liveThreadId = threadId && threadId !== '__default__' ? threadId : null;
 
-  const { data: thread } = useQuery({
+  const { data: thread, isError: threadError } = useQuery({
     ...threadDetailQuery(liveThreadId ?? ''),
     enabled: !!liveThreadId,
   });
+  // DALTON-HOOK(antigravity-series): distinguish confirmed writable vs shared/foreign vs unresolved permissions (including pending feature flags & Dalton team sharing) so picks never 403
+  const writeAccess = useThreadWriteAccess({
+    workspaceId,
+    liveThreadId,
+    thread,
+    threadError,
+  });
+  const isSharedUnresolved = writeAccess.status === 'unresolved';
+  const isSharedWorkspace = writeAccess.status === 'shared';
+  const isSharedOrUnresolved = isSharedUnresolved || isSharedWorkspace;
   // A thread whose row has not been read (still loading, or the read failed)
   // seeds no model rather than the default: the composer names what it shows,
   // and the send would store the default over the model the thread holds.
@@ -200,15 +201,19 @@ export function useThreadModel({
     setManualPick(null);
   }
 
-  // DALTON-HOOK(antigravity-series): once thread detail confirms a local pick on a shared/errored workspace, stop overriding later detail updates
+  // DALTON-HOOK(antigravity-series): once thread detail confirms a deferred or shared local pick, clear both deferredSharedPick and manualPick so later detail updates from another tab take effect
   if (
-    isSharedError
-    && nextDeferredSharedPick !== null
+    nextDeferredSharedPick !== null
     && liveThreadId
     && thread?.llm_model === nextDeferredSharedPick.picked
   ) {
+    const confirmedPick = nextDeferredSharedPick.picked;
     nextDeferredSharedPick = null;
     setDeferredSharedPick(null);
+    if (nextManualPick === confirmedPick) {
+      nextManualPick = null;
+      setManualPick(null);
+    }
   }
 
   if (

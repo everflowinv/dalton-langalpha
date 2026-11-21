@@ -479,12 +479,22 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const threadTuning = useThreadTuning({ threadId, workspaceId: threadWorkspaceId });
   const { toSend: tuningToSend, clearLocalEffort } = threadTuning;
   const { seriesCatalog, customModels, metadata: modelMetadata, rawApiResponse } = useAllModels();
+  // DALTON-HOOK(antigravity-series): clear local effort on Antigravity pick, restoring previous effort if the model switch fails without clobbering newer updates
   const handlePickThreadModel = useCallback((nextModel: string) => {
     const rawMeta = rawApiResponse?.model_metadata ?? modelMetadata;
-    if (inspectSavedAntigravityModel(nextModel, { seriesCatalog, rawMetadata: rawMeta, customModels })) {
-      clearLocalEffort();
-    }
-    return pickThreadModel(nextModel);
+    const restoreEffort = inspectSavedAntigravityModel(nextModel, { seriesCatalog, rawMetadata: rawMeta, customModels })
+      ? clearLocalEffort()
+      : null;
+    return pickThreadModel(nextModel).then(
+      (saved) => {
+        if (!saved) restoreEffort?.();
+        return saved;
+      },
+      (err: unknown) => {
+        restoreEffort?.();
+        throw err;
+      },
+    );
   }, [clearLocalEffort, customModels, modelMetadata, pickThreadModel, rawApiResponse, seriesCatalog]);
 
   // MarketView has no floating cards layer, so subagent rows resolve through

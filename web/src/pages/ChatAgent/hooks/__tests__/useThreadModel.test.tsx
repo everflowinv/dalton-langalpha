@@ -1457,5 +1457,57 @@ describe('useThreadModel', () => {
       expect(result.current.sendModel).toBe('gemini-4-neon-high-oauth');
       expect(mocks.updateThread).not.toHaveBeenCalled();
     });
+
+    // DALTON-HOOK(antigravity-series): B2 follow-up — clearing both deferredSharedPick and manualPick when detail confirms a pick while shared list is still loading
+    it('clears deferredSharedPick and manualPick when detail confirms a pick while shared list is still loading so another tab update takes effect', async () => {
+      mocks.seriesCatalog = NEON_CATALOG;
+      mocks.rawMetadata = NEON_RAW_META;
+      mocks.catalogModelNames = new Set([
+        'model-default',
+        'gemini-4-neon-low-oauth',
+        'gemini-4-neon-medium-oauth',
+        'gemini-4-neon-high-oauth',
+      ]);
+      // Shared workspace list is still loading (not errored).
+      mocks.sharedEntry = undefined;
+      mocks.sharedError = false;
+
+      const { result, rerender, queryClient } = setup(
+        { workspaceId: 'ws-shared' },
+        row('gemini-4-neon-medium-oauth'),
+      );
+
+      // Tab A picks High before the shared list resolves.
+      act(() => {
+        void result.current.pickModel('gemini-4-neon-high-oauth');
+      });
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+      expect(result.current.model).toBe('gemini-4-neon-high-oauth');
+      expect(result.current.sendModel).toBe('gemini-4-neon-high-oauth');
+
+      // Tab A sends High and detail confirms High while the shared list is still loading.
+      rerender({ threadId: THREAD, isLoading: true, workspaceId: 'ws-shared' });
+      mocks.server = row('gemini-4-neon-high-oauth');
+      rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-shared' });
+      await waitFor(() => expect(cachedModel(queryClient)).toBe('gemini-4-neon-high-oauth'));
+      expect(result.current.model).toBe('gemini-4-neon-high-oauth');
+      expect(result.current.sendModel).toBeNull();
+
+      // Tab B later saves Low; detail updates to Low and Tab A follows it.
+      act(() => {
+        queryClient.setQueryData(queryKeys.threads.detail(THREAD), row('gemini-4-neon-low-oauth'));
+      });
+      await waitFor(() => expect(result.current.model).toBe('gemini-4-neon-low-oauth'));
+      expect(result.current.sendModel).toBeNull();
+
+      // DALTON-HOOK(antigravity-series): shared list finally confirms shared — old High pick must stay cleared and not overwrite Low
+      mocks.sharedEntry = { workspace: { workspace_id: 'ws-shared' } };
+      rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-shared' });
+      await act(async () => {});
+
+      expect(result.current.model).toBe('gemini-4-neon-low-oauth');
+      expect(result.current.sendModel).toBeNull();
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+    });
   });
 });
