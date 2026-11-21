@@ -109,6 +109,9 @@ is_credential_relpath() {
 
 LAUNCHER_REL="state/sentiment-dashboard/cos-venv/bin/python"
 ASSETS_DIR="${SCRIPT_DIR}/data_assets"
+ANTIGRAVITY_SERIES_MODULE_SRC="${REPO_ROOT}/src/dalton/llm/antigravity_series.py"
+ANTIGRAVITY_SERIES_MODULE_REL="skills/model-usage-cost/scripts/antigravity_series.py"
+ANTIGRAVITY_SERIES_JSON_REL="skills/model-usage-cost/references/antigravity_series.json"
 
 ASSET_FILES=()
 if [[ -d "${ASSETS_DIR}" ]]; then
@@ -130,6 +133,10 @@ if [[ "${MODE}" == "dry-run" ]]; then
     fi
     echo "[seed_openclaw_data] DRY-RUN asset: ${ASSETS_DIR}/${rel_asset} -> ${TARGET_DIR}/${rel_asset}"
   done
+  if [[ -f "${ANTIGRAVITY_SERIES_MODULE_SRC}" ]]; then
+    echo "[seed_openclaw_data] DRY-RUN asset: ${ANTIGRAVITY_SERIES_MODULE_SRC} -> ${TARGET_DIR}/${ANTIGRAVITY_SERIES_MODULE_REL}"
+    echo "[seed_openclaw_data] DRY-RUN export: ${TARGET_DIR}/${ANTIGRAVITY_SERIES_JSON_REL}"
+  fi
   echo "[seed_openclaw_data] DRY-RUN ensure dir: ${TARGET_DIR}/state/a-share-volume-watch"
   echo "[seed_openclaw_data] DRY-RUN launcher: ${TARGET_DIR}/${LAUNCHER_REL} executes /app/.venv/bin/python"
   exit 0
@@ -151,7 +158,61 @@ for rel_asset in "${ASSET_FILES[@]}"; do
 done
 
 LAUNCHER_TMP=""
-trap '[[ -z "${LAUNCHER_TMP}" ]] || rm -f "${LAUNCHER_TMP}"' EXIT
+SERIES_JSON_TMP=""
+cleanup_tmps() {
+  [[ -z "${LAUNCHER_TMP}" ]] || rm -f "${LAUNCHER_TMP}"
+  [[ -z "${SERIES_JSON_TMP}" ]] || rm -f "${SERIES_JSON_TMP}"
+}
+trap cleanup_tmps EXIT
+
+if [[ -f "${ANTIGRAVITY_SERIES_MODULE_SRC}" ]]; then
+  mkdir -p "$(dirname "${TARGET_DIR}/${ANTIGRAVITY_SERIES_MODULE_REL}")"
+  cp -p "${ANTIGRAVITY_SERIES_MODULE_SRC}" "${TARGET_DIR}/${ANTIGRAVITY_SERIES_MODULE_REL}"
+  echo "[seed_openclaw_data] Applied asset: ${ANTIGRAVITY_SERIES_MODULE_SRC} -> ${TARGET_DIR}/${ANTIGRAVITY_SERIES_MODULE_REL}"
+
+  SERIES_PYTHON="python3"
+  if [[ -x "${REPO_ROOT}/.venv/bin/python" ]]; then
+    SERIES_PYTHON="${REPO_ROOT}/.venv/bin/python"
+  fi
+  mkdir -p "$(dirname "${TARGET_DIR}/${ANTIGRAVITY_SERIES_JSON_REL}")"
+  SERIES_JSON_TMP="$(mktemp "${TARGET_DIR}/${ANTIGRAVITY_SERIES_JSON_REL}.XXXXXX")"
+  "${SERIES_PYTHON}" - "${REPO_ROOT}" "${ASSETS_DIR}/skills/model-usage-cost/scripts" "${ANTIGRAVITY_SERIES_MODULE_SRC}" "${SERIES_JSON_TMP}" <<'PYEOF'
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+repo_root = Path(sys.argv[1])
+skill_scripts_dir = Path(sys.argv[2])
+module_path = Path(sys.argv[3])
+out_path = Path(sys.argv[4])
+
+sys.path.insert(0, str(skill_scripts_dir))
+import usage_sources  # noqa: E402
+
+spec = importlib.util.spec_from_file_location("antigravity_series", module_path)
+if spec is None or spec.loader is None:
+    raise RuntimeError(f"Unable to load {module_path}")
+ag_mod = importlib.util.module_from_spec(spec)
+sys.modules["antigravity_series"] = ag_mod
+spec.loader.exec_module(ag_mod)
+
+series = usage_sources.build_antigravity_series_from_overlays(
+    (
+        repo_root / "src" / "dalton" / "llm" / "native_overlay.json",
+        repo_root / "var" / "dalton" / "catalog" / "native_sync_overlay.json",
+    ),
+    dalton_yaml_path=repo_root / "src" / "dalton" / "dalton.yaml",
+    ag_mod=ag_mod,
+)
+out_path.write_text(json.dumps(series, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PYEOF
+  chmod 644 "${SERIES_JSON_TMP}"
+  mv -f "${SERIES_JSON_TMP}" "${TARGET_DIR}/${ANTIGRAVITY_SERIES_JSON_REL}"
+  SERIES_JSON_TMP=""
+  echo "[seed_openclaw_data] Exported catalog: ${TARGET_DIR}/${ANTIGRAVITY_SERIES_JSON_REL}"
+fi
+
 mkdir -p "$(dirname "${TARGET_DIR}/${LAUNCHER_REL}")"
 LAUNCHER_TMP="$(mktemp "${TARGET_DIR}/${LAUNCHER_REL}.XXXXXX")"
 cat > "${LAUNCHER_TMP}" <<'EOF'
