@@ -25,7 +25,7 @@ import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(dalton-setup): check live Dalton team-model availability off the entry bundle and normalize legacy answers
 import { isDaltonBuild } from '@/config/brand';
 import { useDaltonTeamModelsAvailable } from './useTeamModelsAvailable';
-import { effectiveModelsAnswer, nextSetupPath, nextSetupStep, readAnswers, setupRail, type SetupFacts } from './setupSteps';
+import { DALTON_CURATED_PROVIDERS, effectiveModelsAnswer, nextSetupPath, nextSetupStep, readAnswers, setupRail, type SetupFacts } from './setupSteps';
 
 /** A machine the user brought (SSH, this Mac through Remote control) that is
  *  still there to run tasks. */
@@ -94,8 +94,9 @@ export function useSetupFacts({ refetchInterval = false }: { refetchInterval?: n
   // A connection that runs a turn, as the model filters count one: a
   // subscription signed in, a key only while BYOK is on where it can be off,
   // either only while the account's rules allow it.
-  // DALTON-HOOK(dalton-setup): providers, policy, and team availability already read above
+  // DALTON-HOOK(dalton-setup): in Dalton, only subscriptions that can supply the 5 curated candidates satisfy the model step
   const providerConnected = providers.some((p) => p.masked_key !== SERVER_KEY
+    && (!isDaltonBuild || DALTON_CURATED_PROVIDERS.has(p.provider))
     && (p.access_type === 'oauth'
       ? allows(policy, RULE.ownSubscriptions) && p.state === 'connected'
       : allows(policy, RULE.ownApiKeys) && (!isPlatformMode || byokEnabled)));

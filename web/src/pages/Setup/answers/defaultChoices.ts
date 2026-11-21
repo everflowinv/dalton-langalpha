@@ -281,24 +281,31 @@ export function defaultChoices(input: DefaultChoicesInput): DefaultChoices {
   }
   pool = collapsedPool;
 
-  // DALTON-HOOK(dalton-setup): Dalton /setup/default shows the fixed 5 curated candidates in order when available
-  const curated = input.dalton ? resolveDaltonSetupCandidates(rawPool) : [];
-  const primaryPool = curated.length > 0 ? curated : pool;
+  // DALTON-HOOK(dalton-setup): Dalton /setup/default shows only the fixed 5 curated candidates in order (never falls back to uncurated models)
+  const curated = input.dalton ? resolveDaltonSetupCandidates(rawPool) : null;
 
   // DALTON-HOOK(antigravity-series): preserve saved suffixed variant while keeping 1 card per series
-  const recommended = recommend(input, primaryPool, pool, effectiveAnswer);
-  // Connecting saved the model it starts on, which is the recommended one; a
-  // default saved on an earlier run of setup is kept (including legacy suffixed
-  // Antigravity variants belonging to an available series).
   const sameAs = (a: string, b: string | null) => a === b || sameAntigravitySeries(a, b, seriesOpts);
   const canKeepPreferred = input.models !== 'langalpha_models' || !!input.dalton;
-  if (curated.length > 0) {
+  if (curated !== null) {
+    if (curated.length === 0) {
+      return {
+        list: [],
+        initial: null,
+        recommended: { primary: null, primaryWhy: null, background: null, backgroundWhy: null },
+      };
+    }
+    const recommended = recommend(input, curated, pool, effectiveAnswer);
     const saved = canKeepPreferred && input.preferred && rawPool.includes(input.preferred)
-      && primaryPool.some((m) => sameAs(m, input.preferred))
+      && curated.some((m) => sameAs(m, input.preferred))
       ? input.preferred : null;
     const initial = saved ?? recommended.primary;
     return { list: curated, initial, recommended };
   }
+  const recommended = recommend(input, pool, pool, effectiveAnswer);
+  // Connecting saved the model it starts on, which is the recommended one; a
+  // default saved on an earlier run of setup is kept (including legacy suffixed
+  // Antigravity variants belonging to an available series).
   const saved = canKeepPreferred && input.preferred && rawPool.includes(input.preferred)
     ? input.preferred : null;
   const initial = saved ?? recommended.primary;

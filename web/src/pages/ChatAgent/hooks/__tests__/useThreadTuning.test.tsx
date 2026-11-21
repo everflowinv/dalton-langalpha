@@ -12,12 +12,22 @@ import { act, waitFor } from '@testing-library/react';
 import { renderHookWithProviders, createTestQueryClient } from '@/test/utils';
 import { queryKeys } from '@/lib/queryKeys';
 import type { Thread } from '@/types/api';
+import type { updateThread as updateThreadApi } from '../../utils/api';
 import { useThreadTuning } from '../useThreadTuning';
 
 const mocks = vi.hoisted(() => ({
   getThread: vi.fn(),
-  updateThread: vi.fn(),
+  updateThread: vi.fn<typeof updateThreadApi>(),
   toast: vi.fn(),
+  // DALTON-HOOK(antigravity-series): configurable Dalton build & shared-list/features/user state for deferral/flush & non-Dalton parity tests
+  isDaltonBuild: false,
+  sharedEnabled: false,
+  sharedWorkspaces: undefined as Array<{ workspace: { workspace_id: string } }> | undefined,
+  sharedError: false,
+  featuresMode: 'default' as 'default' | 'loading' | 'error' | 'resolved',
+  featuresData: [] as Array<{ key: string; enabled: boolean }>,
+  currentUser: null as { user_id: string; organization?: { id: string; name: string } | null } | null,
+  userError: false,
 }));
 
 vi.mock('../../utils/api', () => ({
@@ -28,6 +38,53 @@ vi.mock('../../utils/api', () => ({
 vi.mock('@/components/ui/use-toast', () => ({
   toast: mocks.toast,
 }));
+
+// DALTON-HOOK(antigravity-series): mock brand build flag and shared workspaces query for tuning write-permission tests
+vi.mock('@/config/brand', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/config/brand')>()),
+  get isDaltonBuild() {
+    return mocks.isDaltonBuild;
+  },
+}));
+
+vi.mock('@/hooks/useSharedWorkspaces', () => ({
+  useSharedWorkspaces: () => ({
+    enabled: mocks.sharedEnabled,
+    data: mocks.sharedWorkspaces !== undefined ? { workspaces: mocks.sharedWorkspaces } : undefined,
+    isLoading: mocks.sharedEnabled && mocks.sharedWorkspaces === undefined && !mocks.sharedError,
+    isError: mocks.sharedError,
+  }),
+}));
+
+// DALTON-HOOK(antigravity-series): mock features and user queries to verify unresolved deferral on first-read failure/loading
+vi.mock('@/api/features', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/api/features')>();
+  return {
+    ...actual,
+    getFeatures: () => {
+      if (mocks.featuresMode === 'loading') return new Promise(() => {});
+      if (mocks.featuresMode === 'error') return Promise.reject(new Error('features 500'));
+      if (mocks.featuresMode === 'resolved') return Promise.resolve(mocks.featuresData);
+      return actual.getFeatures();
+    },
+  };
+});
+
+vi.mock('@/hooks/useUser', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/hooks/useUser')>();
+  return {
+    ...actual,
+    useUser: (opts?: { enabled?: boolean }) => {
+      if (mocks.featuresMode === 'default') return actual.useUser(opts);
+      return {
+        user: mocks.currentUser,
+        isLoading: Boolean(opts?.enabled) && mocks.currentUser === null && !mocks.userError,
+        isError: mocks.userError,
+        refetch: vi.fn(),
+      };
+    },
+  };
+});
 
 const THREAD = 'thread-1';
 
@@ -51,6 +108,15 @@ describe('useThreadTuning', () => {
     mocks.getThread.mockReset();
     mocks.updateThread.mockReset();
     mocks.toast.mockReset();
+    // DALTON-HOOK(antigravity-series): reset Dalton build and shared-workspaces/features/user defaults between tests
+    mocks.isDaltonBuild = false;
+    mocks.sharedEnabled = false;
+    mocks.sharedWorkspaces = undefined;
+    mocks.sharedError = false;
+    mocks.featuresMode = 'default';
+    mocks.featuresData = [];
+    mocks.currentUser = null;
+    mocks.userError = false;
   });
 
   describe('the value it reads', () => {
@@ -172,6 +238,134 @@ describe('useThreadTuning', () => {
       queryClient.setQueryData(queryKeys.threads.detail('thread-2'), row({}, 'thread-2'));
       rerender({ threadId: 'thread-2' });
       expect(result.current.tuning.reasoningEffort).toBeNull();
+    });
+  });
+
+  // DALTON-HOOK(antigravity-series): shared-list failure recovery flush on personal threads (Dalton build) & upstream parity on non-Dalton builds
+  describe('shared-workspace deferral and recovery (Dalton build vs non-Dalton build)', () => {
+    it('flushes effort and fast-mode PATCHes once a failed shared-list read recovers and confirms a personal workspace, persisting on reopen', async () => {
+      mocks.isDaltonBuild = true;
+      mocks.sharedEnabled = true;
+      mocks.sharedWorkspaces = undefined;
+      mocks.sharedError = true;
+
+      let serverRow = row({ reasoning_effort: 'low', fast_mode: false });
+      mocks.updateThread.mockImplementation(async (_id, updates) => {
+        serverRow = { ...serverRow, ...updates } as Thread;
+        return serverRow;
+      });
+
+      const { result, rerender, unmount } = setup({ workspaceId: 'ws-personal' }, serverRow);
+
+      await act(async () => {
+        await result.current.setReasoningEffort('high');
+        await result.current.setFastMode(true);
+      });
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+      expect(result.current.tuning).toEqual({ reasoningEffort: 'high', fastMode: true });
+
+      // DALTON-HOOK(antigravity-series): shared list recovers and confirms ws-personal is personal -> flush deferred PATCHes
+      mocks.sharedWorkspaces = [];
+      mocks.sharedError = false;
+      rerender({ threadId: THREAD, workspaceId: 'ws-personal' });
+
+      await waitFor(() => {
+        expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, { reasoning_effort: 'high' });
+        expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, { fast_mode: true });
+      });
+      expect(mocks.updateThread).toHaveBeenCalledTimes(2);
+      unmount();
+
+      // Reopen the thread with a fresh QueryClient reading the persisted server row.
+      mocks.getThread.mockResolvedValue(serverRow);
+      const reopened = renderHookWithProviders(
+        () => useThreadTuning({ threadId: THREAD, workspaceId: 'ws-personal' }),
+        { queryClient: createTestQueryClient() },
+      );
+      await waitFor(() => {
+        expect(reopened.result.current.tuning).toEqual({ reasoningEffort: 'high', fastMode: true });
+      });
+    });
+
+    // DALTON-HOOK(antigravity-series): non-Dalton builds must keep exact origin/dalton/main behavior — shared threads skip PATCH, personal threads PATCH immediately even when shared list fails
+    it('keeps origin/dalton/main behavior on non-Dalton builds: skips PATCH on shared threads and PATCHes personal threads immediately when list fails', async () => {
+      mocks.isDaltonBuild = false;
+      mocks.sharedEnabled = true;
+
+      // Confirmed shared workspace -> skips PATCH (matches origin/dalton/main useSharedEntry).
+      mocks.sharedWorkspaces = [{ workspace: { workspace_id: 'ws-shared' } }];
+      mocks.sharedError = false;
+      const sharedView = setup(
+        { workspaceId: 'ws-shared' },
+        row({ reasoning_effort: 'low', fast_mode: false }),
+      );
+      await act(async () => {
+        await sharedView.result.current.setReasoningEffort('high');
+      });
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+      expect(sharedView.result.current.tuning.reasoningEffort).toBe('high');
+      sharedView.unmount();
+
+      // Personal thread when shared list read fails -> immediate PATCH (matches origin/dalton/main).
+      mocks.sharedWorkspaces = undefined;
+      mocks.sharedError = true;
+
+      mocks.updateThread
+        .mockResolvedValueOnce(row({ reasoning_effort: 'high', fast_mode: false }))
+        .mockResolvedValueOnce(row({ reasoning_effort: 'high', fast_mode: true }));
+
+      const { result } = setup(
+        { workspaceId: 'ws-personal' },
+        row({ reasoning_effort: 'low', fast_mode: false }),
+      );
+
+      await act(async () => {
+        await result.current.setReasoningEffort('high');
+        await result.current.setFastMode(true);
+      });
+
+      expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, { reasoning_effort: 'high' });
+      expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, { fast_mode: true });
+      expect(mocks.updateThread).toHaveBeenCalledTimes(2);
+      expect(result.current.tuning).toEqual({ reasoningEffort: 'high', fastMode: true });
+    });
+
+    // DALTON-HOOK(antigravity-series): Carbon #1 — thread.shared skips PATCH immediately and /features or /users/me failure defers PATCH in Dalton builds
+    it('skips PATCH on thread.shared and defers PATCH when /features or /users/me fails in Dalton builds', async () => {
+      mocks.isDaltonBuild = true;
+      mocks.sharedEnabled = false;
+      mocks.featuresMode = 'error';
+
+      const sharedRow = {
+        ...row({ reasoning_effort: 'low', fast_mode: false }),
+        shared: { started_by: { user_id: 'u-1', name: 'Alice' } },
+      } as unknown as Thread;
+      const sharedView = setup({ workspaceId: 'ws-shared' }, sharedRow);
+
+      await act(async () => {
+        await sharedView.result.current.setReasoningEffort('high');
+      });
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+      expect(sharedView.result.current.tuning.reasoningEffort).toBe('high');
+      sharedView.unmount();
+
+      // /features returns shared_workspaces:true while /users/me fails -> must defer PATCH until resolved.
+      mocks.featuresMode = 'resolved';
+      mocks.featuresData = [{ key: 'shared_workspaces', enabled: true }];
+      mocks.currentUser = null;
+      mocks.userError = true;
+
+      const userFailedView = setup(
+        { workspaceId: 'ws-personal' },
+        row({ reasoning_effort: 'low', fast_mode: false }),
+      );
+      await waitFor(() => expect(userFailedView.queryClient.getQueryData(queryKeys.features.list())).toBeDefined());
+
+      await act(async () => {
+        await userFailedView.result.current.setReasoningEffort('high');
+      });
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+      expect(userFailedView.result.current.tuning.reasoningEffort).toBe('high');
     });
   });
 });

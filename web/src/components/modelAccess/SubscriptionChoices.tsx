@@ -29,6 +29,8 @@ export function SubscriptionChoices({
   claudeCode,
   claudeSignIn = true,
   signIns = true,
+  // DALTON-HOOK(dalton-setup): allow callers (e.g. Dalton ModelStep) to restrict sign-ins to curated-candidate providers
+  allowedSignIns,
 }: {
   planGroups: readonly ProviderGroup[];
   configured: ReadonlySet<string>;
@@ -37,12 +39,15 @@ export function SubscriptionChoices({
   claudeCode?: ClaudeCodeChoice;
   claudeSignIn?: boolean;
   signIns?: boolean;
+  allowedSignIns?: ReadonlySet<string>;
 }) {
   const { t } = useTranslation();
   const { data: claude, isError: claudeUnread } = useOAuthStatus('claude-oauth');
   const signInLifecycle = claude?.lifecycle ?? 'active';
-  const offered = (provider: SubscriptionProvider) => provider !== 'claude-oauth'
-    || (claudeSignIn && (configured.has(provider) || claudeUnread || (!!claude && claude.can_sign_in !== false)));
+  const offered = (provider: SubscriptionProvider) =>
+    (!allowedSignIns || allowedSignIns.has(provider))
+    && (provider !== 'claude-oauth'
+      || (claudeSignIn && (configured.has(provider) || claudeUnread || (!!claude && claude.can_sign_in !== false))));
   return (
     <div className="flex flex-col gap-3">
       {signIns && (

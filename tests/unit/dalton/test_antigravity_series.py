@@ -25,6 +25,7 @@ from src.dalton.llm.antigravity_series import (
     build_antigravity_series_catalog,
     format_series_display_name,
     parse_antigravity_series,
+    quota_cooldown_target,
     resolve_series_default_effort,
 )
 from src.llms.llm import LLM
@@ -228,3 +229,77 @@ async def test_models_endpoint_exposes_antigravity_series_and_keeps_legacy_keys(
     assert "gemini-4-neon-high-oauth" in body["model_metadata"]
     assert "gemini-4-neon-medium-oauth" in body["model_metadata"]
     assert agent_cfg_mod.COMPACTION_PROFILES is not None
+
+
+class TestQuotaCooldownTarget:
+    def test_builtin_antigravity_models_map_to_vendor_pools(self):
+        mc = LLM.get_model_config()
+        # All built-in Gemini series/tiers share the `google` vendor pool
+        for key in (
+            "gemini-4-neon-low-oauth",
+            "gemini-4-neon-medium-oauth",
+            "gemini-4-neon-high-oauth",
+            "gemini-4-neon-xhigh-oauth",
+            "gemini-4-hydrogen-high-oauth",
+            "gemini-4-argon-low-oauth",
+            "gemini-4-carbon-medium-oauth",
+            "gemini-2.5-pro-oauth",
+        ):
+            assert quota_cooldown_target("antigravity-oauth", key, model_config=mc) == (
+                "vendor",
+                "google",
+            )
+        # Built-in Antigravity Claude models share the `anthropic` vendor pool
+        for key in (
+            "claude-opus-5-5-low-oauth",
+            "claude-opus-5-5-high-oauth",
+            "claude-sonnet-5-5-medium-oauth",
+        ):
+            assert quota_cooldown_target("antigravity-oauth", key, model_config=mc) == (
+                "vendor",
+                "anthropic",
+            )
+        # Built-in Antigravity GPT-OSS maps to the `openai` vendor pool
+        assert quota_cooldown_target(
+            "antigravity-oauth", "gpt-oss-120b-medium-oauth", model_config=mc
+        ) == ("vendor", "openai")
+
+    def test_unknown_prefix_custom_same_name_and_other_providers_stay_model_scoped(self):
+        mc = LLM.get_model_config()
+        # Built-in Antigravity model with an unmapped vendor prefix falls back to per-model
+        synthetic = {
+            "llama-4-medium-oauth": {
+                "provider": "antigravity-oauth",
+                "model_id": "llama-4-medium",
+            }
+        }
+        assert quota_cooldown_target(
+            "antigravity-oauth", "llama-4-medium-oauth", model_config=synthetic
+        ) == ("model", "llama-4-medium-oauth")
+        # User custom model shadowing a built-in Antigravity name stays per-model
+        assert quota_cooldown_target(
+            "antigravity-oauth",
+            "gemini-4-neon-high-oauth",
+            is_custom=True,
+            model_config=mc,
+        ) == ("model", "gemini-4-neon-high-oauth")
+        # Unknown model name not in built-in catalog stays per-model
+        assert quota_cooldown_target(
+            "antigravity-oauth",
+            "google-vendor-custom",
+            is_custom=False,
+            model_config=mc,
+        ) == ("model", "google-vendor-custom")
+        assert quota_cooldown_target(
+            "antigravity-oauth",
+            "custom-user-model-high-oauth",
+            is_custom=False,
+            model_config=mc,
+        ) == ("model", "custom-user-model-high-oauth")
+        # Non-Antigravity providers stay per-model
+        assert quota_cooldown_target(
+            "claude-oauth", "claude-opus-5-5-oauth", model_config=mc
+        ) == ("model", "claude-opus-5-5-oauth")
+        assert quota_cooldown_target(
+            "gemini", "gemini-4-neon", model_config=mc
+        ) == ("model", "gemini-4-neon")

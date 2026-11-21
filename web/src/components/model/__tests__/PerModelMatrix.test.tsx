@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react'; // DALTON-HOOK(antigravity-series)
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { describe, it, expect, vi } from 'vitest';
 import { PerModelMatrix } from '../PerModelMatrix';
@@ -245,11 +245,36 @@ describe('PerModelMatrix Antigravity series', () => {
     // Unreachable saved neon-medium row still displays as "Gemini 4 Neon · Medium"
     expect(screen.getByText('Gemini 4 Neon · Medium')).toBeTruthy();
 
-    // "+ Add a model" collapses Carbon's 3 variants into 1 option with default_effort (medium)
+    // "+ Add a model" collapses Carbon's 3 variants into 1 series option and lets the user choose an explicit effort before adding
     const addSelect = screen.getByLabelText('Add a model') as HTMLSelectElement;
     expect([...addSelect.options].map((o) => ({ text: o.textContent, value: o.value }))).toEqual([
       { text: '+ Add a model', value: '' },
-      { text: 'Gemini 4 Carbon', value: 'gemini-4-carbon-medium-oauth' },
+      { text: 'Gemini 4 Carbon', value: 'series:antigravity-oauth:gemini-4-carbon' },
     ]);
+
+    // DALTON-HOOK(antigravity-series): B4 — selecting a series shows its effort picker and adds the explicitly chosen tier
+    fireEvent.change(addSelect, { target: { value: 'series:antigravity-oauth:gemini-4-carbon' } });
+    const effortSelect = screen.getByLabelText('Gemini 4 Carbon Effort') as HTMLSelectElement;
+    expect(effortSelect.value).toBe('medium');
+    expect([...effortSelect.options].map((o) => ({ text: o.textContent, value: o.value }))).toEqual([
+      { text: 'Low', value: 'low' },
+      { text: 'Medium (Default)', value: 'medium' },
+      { text: 'High', value: 'high' },
+    ]);
+
+    // Pick High directly and add it to the table
+    fireEvent.change(effortSelect, { target: { value: 'high' } });
+    fireEvent.click(screen.getByRole('button', { name: '+ Add' }));
+
+    expect(screen.getByText('Gemini 4 Carbon · High')).toBeTruthy();
+    expect(screen.queryByText('Gemini 4 Carbon · Medium')).toBeNull();
+    expect(screen.queryByLabelText('Gemini 4 Carbon Effort')).toBeNull();
+
+    // Remaining addable tiers for Carbon are now Low and Medium (High is already in the table)
+    fireEvent.change(screen.getByLabelText('Add a model'), {
+      target: { value: 'series:antigravity-oauth:gemini-4-carbon' },
+    });
+    const remainingEffortSelect = screen.getByLabelText('Gemini 4 Carbon Effort') as HTMLSelectElement;
+    expect([...remainingEffortSelect.options].map((o) => o.value)).toEqual(['low', 'medium']);
   });
 });

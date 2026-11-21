@@ -75,7 +75,7 @@ function useDaltonTeamModelsAvailableImpl(
   });
 
   if (!active) return INERT;
-  if (creds.isLoading) return { ...INERT, isLoading: true };
+  if (creds.isPending) return { ...INERT, isLoading: true };
   if (!shared) return INERT;
   if (providersLoading || (ready && isPending)) return { ...INERT, shared: true, isLoading: true };
   if (isError && data === undefined) return { ...INERT, shared: true, unread: true };

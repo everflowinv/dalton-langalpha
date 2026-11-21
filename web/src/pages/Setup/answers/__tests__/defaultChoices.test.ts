@@ -280,7 +280,8 @@ describe('defaultChoices Antigravity series collapsing', () => {
     expect(choices.list).toEqual(['gemini-4-neon-high-oauth']);
   });
 
-  it('collapses Antigravity variants to one representative per series when no curated candidate is available', () => {
+  // DALTON-HOOK(dalton-setup): Dalton returns empty choices when none of the 5 curated candidates is available; non-Dalton still collapses series
+  it('collapses Antigravity variants to one representative per series in non-Dalton mode and returns empty in Dalton mode when no curated candidate is available', () => {
     const nonCuratedOffered = {
       'antigravity-oauth': {
         models: [
@@ -291,7 +292,17 @@ describe('defaultChoices Antigravity series collapsing', () => {
         ],
       },
     };
-    const choices = defaultChoices(input({
+    const nonDalton = defaultChoices(input({
+      dalton: false,
+      offered: nonCuratedOffered,
+      slotModels: nonCuratedOffered['antigravity-oauth'].models,
+      ownProviders: ['antigravity-oauth'],
+      metadata: antigravityMeta,
+      seriesCatalog,
+    }));
+    expect(nonDalton.list).toEqual(['gemini-4-neon-medium-oauth', 'gemini-4-hydrogen-high-oauth']);
+
+    const dalton = defaultChoices(input({
       dalton: true,
       offered: nonCuratedOffered,
       slotModels: nonCuratedOffered['antigravity-oauth'].models,
@@ -299,8 +310,8 @@ describe('defaultChoices Antigravity series collapsing', () => {
       metadata: antigravityMeta,
       seriesCatalog,
     }));
-
-    expect(choices.list).toEqual(['gemini-4-neon-medium-oauth', 'gemini-4-hydrogen-high-oauth']);
-    expect(choices.recommended.background).toBe('gemini-4-hydrogen-low-oauth');
+    expect(dalton.list).toEqual([]);
+    expect(dalton.initial).toBeNull();
+    expect(dalton.recommended.primary).toBeNull();
   });
 });

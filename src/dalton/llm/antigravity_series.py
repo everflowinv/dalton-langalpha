@@ -10,9 +10,18 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 ANTIGRAVITY_PROVIDER = "antigravity-oauth"
+
+# Single source of truth for Antigravity upstream vendor quota pools
+# (user decision 2026-11-21: models from the same vendor under one Antigravity
+# account share one cooldown pool; other prefixes fall back to per-model keys).
+ANTIGRAVITY_VENDOR_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("gemini-", "google"),
+    ("claude-", "anthropic"),
+    ("gpt-", "openai"),
+)
 
 # Single source of truth for per-series default reasoning effort across backend & UI
 # (served to frontend via GET /api/v1/models).
@@ -238,3 +247,48 @@ def build_antigravity_series_catalog(
         )
         result.append(entry.to_dict())
     return result
+
+
+def quota_cooldown_target(
+    provider: str,
+    model_name: str,
+    *,
+    is_custom: bool = False,
+    model_config: Any = None,
+) -> tuple[Literal["vendor", "model"], str]:
+    """Return ``("vendor", vendor)`` for built-in Antigravity models, else ``("model", model_name)``.
+
+    Under one Antigravity OAuth account, built-in models from the same upstream
+    vendor share one quota pool (Google Gemini, Anthropic Claude, OpenAI GPT).
+    Unknown prefixes, user-defined custom models (including custom entries that
+    shadow a built-in name), and all other providers remain scoped per model.
+    """
+    if provider != ANTIGRAVITY_PROVIDER or is_custom or not model_name:
+        return ("model", model_name)
+
+    llm_cfg = _extract_llm_config(model_config)
+    if llm_cfg is None:
+        try:
+            from src.llms.llm import LLM
+
+            llm_cfg = _extract_llm_config(LLM.get_model_config())
+        except Exception:
+            llm_cfg = None
+    if llm_cfg is None:
+        return ("model", model_name)
+
+    entry = llm_cfg.get(model_name)
+    if not isinstance(entry, Mapping) or entry.get("provider") != ANTIGRAVITY_PROVIDER:
+        return ("model", model_name)
+
+    raw_model_id = entry.get("model_id")
+    probe_id = (
+        raw_model_id.lower()
+        if isinstance(raw_model_id, str) and raw_model_id
+        else model_name.lower()
+    )
+    for prefix, vendor in ANTIGRAVITY_VENDOR_PREFIXES:
+        if probe_id.startswith(prefix):
+            return ("vendor", vendor)
+
+    return ("model", model_name)
