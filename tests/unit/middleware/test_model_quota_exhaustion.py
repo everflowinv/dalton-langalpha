@@ -1636,6 +1636,273 @@ async def test_codex_relative_resets_in_seconds_freezes_absolute_until_across_ti
 
 
 @pytest.mark.asyncio
+async def test_gemini_per_minute_quota_phrase_429_stays_rate_limited_on_first_and_cooldown(
+    no_sleep, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 429 containing both `exceeded your current quota` and a per-minute metric
+    (`generate_content_requests_per_minute`) classifies as `rate_limited` on the
+    initial call AND throughout local and Redis cooldown (never promoted to `plan_limit`)."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from ptc_agent.config.agent import CredentialPayer
+    from src.server.services.runs.stream_errors import error_event_data
+
+    fixed_now = datetime(2026, 11, 21, 5, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr("ptc_agent.agent.middleware.model_resilience.time.time", lambda: fixed_now)
+    monkeypatch.setattr("src.dalton.credentials.get_team_credential_holder_id", lambda: None)
+
+    store: dict[str, dict] = {}
+    cache = _make_memory_redis_cache(store)
+    monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: cache)
+
+    client = _make_antigravity_client(
+        "gemini-4-neon-high-oauth", user_id="u-rpm", credential_id="cred-rpm"
+    )
+    oauth_cfg = SimpleNamespace(
+        credential_source="oauth",
+        credential_payer=CredentialPayer(payer="subscription", account="Google Antigravity"),
+    )
+
+    rpm_err = _refusal(
+        "429 Too Many Requests. You exceeded your current quota. "
+        "Quota exceeded for metric: generate_content_requests_per_minute, limit: 15",
+        429,
+    )
+    mw_a = _make_middleware(client, [])
+
+    async def rpm_handler(req):
+        raise rpm_err
+
+    # 1. Initial call classifies as `rate_limited`
+    with pytest.raises(Exception) as first_exc:
+        await mw_a.awrap_model_call(_FakeRequest(client), rpm_handler)
+    first_frame = error_event_data(
+        "thread-rpm", str(first_exc.value), exc=first_exc.value, config=oauth_cfg
+    )
+    assert first_frame["reason"] == "rate_limited"
+    assert "plan_limit" not in first_frame
+
+    async def should_not_dial(req):
+        raise AssertionError("Cooled model must not dial upstream")
+
+    # 2. Local cooldown keeps `rate_limited`
+    with pytest.raises(Exception) as local_exc:
+        await mw_a.awrap_model_call(_FakeRequest(client), should_not_dial)
+    local_frame = error_event_data(
+        "thread-rpm", str(local_exc.value), exc=local_exc.value, config=oauth_cfg
+    )
+    assert local_frame["reason"] == "rate_limited"
+    assert "plan_limit" not in local_frame
+    assert local_frame["hints"] == ["rate_limited", "try_another_model"]
+    assert local_frame["attempted_models"][0]["attempts"] == 0
+
+    # 3. Cross-worker Redis cooldown keeps `rate_limited`
+    mw_b = _make_middleware(client, [])
+    with pytest.raises(Exception) as remote_exc:
+        await mw_b.awrap_model_call(_FakeRequest(client), should_not_dial)
+    remote_frame = error_event_data(
+        "thread-rpm", str(remote_exc.value), exc=remote_exc.value, config=oauth_cfg
+    )
+    assert remote_frame["reason"] == "rate_limited"
+    assert "plan_limit" not in remote_frame
+    assert remote_frame["hints"] == ["rate_limited", "try_another_model"]
+    assert remote_frame["attempted_models"][0]["attempts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_cooldown_message_respects_recorded_rate_limited_reason(
+    no_sleep, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`check_oauth_quota_cooldown` formats its pre-dispatch refusal from the stored
+    `refusal.reason`: a `rate_limited` Retry-After cooldown reports rate limiting,
+    never '订阅额度已用完'."""
+    from datetime import datetime, timezone
+
+    import httpx
+    import openai
+
+    from ptc_agent.agent.middleware.model_resilience import check_oauth_quota_cooldown
+
+    fixed_now = datetime(2026, 11, 21, 5, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr("ptc_agent.agent.middleware.model_resilience.time.time", lambda: fixed_now)
+    monkeypatch.setattr("src.dalton.credentials.get_team_credential_holder_id", lambda: None)
+
+    store: dict[str, dict] = {}
+    cache = _make_memory_redis_cache(store)
+    monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: cache)
+
+    client = _make_antigravity_client(
+        "gemini-4-neon-high-oauth", user_id="u-predisp", credential_id="cred-predisp"
+    )
+    body = {"error": {"type": "rate_limit_error", "message": "Rate limit exceeded"}}
+    req_http = httpx.Request("POST", "https://example.invalid/v1/generate")
+    rl_err = openai.RateLimitError(
+        "Error code: 429 - Rate limit exceeded",
+        response=httpx.Response(429, request=req_http, json=body, headers={"Retry-After": "120"}),
+        body=body,
+    )
+
+    mw = _make_middleware(client, [])
+
+    async def rl_handler(req):
+        raise rl_err
+
+    with pytest.raises(openai.RateLimitError):
+        await mw.awrap_model_call(_FakeRequest(client), rl_handler)
+
+    msg = await check_oauth_quota_cooldown(client)
+    assert msg is not None
+    assert "请求频率限制" in msg
+    assert "订阅额度已用完" not in msg
+    assert "2026-11-21 13:02 HKT" in msg
+
+
+@pytest.mark.asyncio
+async def test_codex_resets_in_seconds_only_writes_local_and_redis_cooldown_with_shared_until(
+    no_sleep, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When Codex `usage_limit_reached` provides ONLY `resets_in_seconds` (no `resets_at`,
+    no `Retry-After`) exceeding retry budget, it writes both local and Redis cooldown records
+    with an absolute UTC reset timestamp shared across the initial card (even if Redis set
+    takes 2s) and subsequent skipped calls."""
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    from unittest.mock import create_autospec
+
+    import httpx
+    import openai
+
+    from ptc_agent.config.agent import CredentialPayer
+    from src.llms import provider_errors as pe_mod
+    from src.server.services.runs.stream_errors import error_event_data
+    from src.utils.cache.redis_cache import RedisCacheClient
+
+    t0_dt = datetime(2026, 11, 21, 5, 0, 0, tzinfo=timezone.utc)
+    clock = {"dt": t0_dt, "mono": 1000.0}
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["dt"] if tz is not None else clock["dt"].replace(tzinfo=None)
+
+    monkeypatch.setattr(pe_mod, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(
+        "ptc_agent.agent.middleware.model_resilience.time.time",
+        lambda: clock["dt"].timestamp(),
+    )
+    monkeypatch.setattr(
+        "ptc_agent.agent.middleware.model_resilience.time.monotonic",
+        lambda: clock["mono"],
+    )
+    monkeypatch.setattr("src.dalton.credentials.get_team_credential_holder_id", lambda: None)
+
+    store: dict[str, dict] = {}
+    ttl_calls: list[tuple[str, int | None]] = []
+    cache = create_autospec(RedisCacheClient, instance=True)
+
+    async def slow_set(key: str, value: dict, ttl=None):
+        # Simulate a 2-second Redis write to prove Call 1's card still uses T0's frozen reset
+        clock["dt"] = clock["dt"] + timedelta(seconds=2)
+        clock["mono"] += 2.0
+        ttl_calls.append((key, ttl))
+        store[key] = value
+        return True
+
+    async def fake_get(key: str):
+        return store.get(key)
+
+    cache.get.side_effect = fake_get
+    cache.set.side_effect = slow_set
+    monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: cache)
+
+    codex_client = _make_antigravity_client(
+        "gpt-6.2-sol-oauth",
+        user_id="u-codex-only",
+        provider="codex-oauth",
+        credential_id="cred-codex-only",
+    )
+    codex_cfg = SimpleNamespace(
+        credential_source="oauth",
+        credential_payer=CredentialPayer(payer="subscription", account="ChatGPT"),
+    )
+
+    # No `resets_at`, no `Retry-After` header — ONLY `resets_in_seconds`
+    body = {
+        "error": {
+            "type": "usage_limit_reached",
+            "message": "The usage limit has been reached",
+            "plan_type": "plus",
+            "limit_window_minutes": 300,
+            "resets_in_seconds": 2625,
+        }
+    }
+    req_http = httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses")
+    codex_err = openai.RateLimitError(
+        "Error code: 429",
+        response=httpx.Response(429, request=req_http, json=body),
+        body=body,
+    )
+
+    expected_until = (t0_dt + timedelta(seconds=2625)).isoformat()
+    expected_key = (
+        "dalton:quota_exhausted:u-codex-only:codex-oauth:model:gpt-6.2-sol-oauth:cred-codex-only"
+    )
+
+    mw_a = _make_middleware(codex_client, [])
+    calls: list[str] = []
+
+    async def codex_429(req):
+        calls.append(req.model.model)
+        raise codex_err
+
+    # 1. Initial call benches locally & writes Redis, and Call 1's card shares T0's frozen until
+    with pytest.raises(openai.RateLimitError) as first_exc:
+        await mw_a.awrap_model_call(_FakeRequest(codex_client), codex_429)
+    assert calls == ["gpt-6.2-sol-oauth"]
+    assert expected_key in store
+    assert (expected_key, 2625) in ttl_calls
+    first_frame = error_event_data(
+        "thread-codex-only", str(first_exc.value), exc=first_exc.value, config=codex_cfg
+    )
+    assert first_frame["plan_limit"] == {
+        "plan": "ChatGPT Plus",
+        "window": "five_hour",
+        "until": expected_until,
+    }
+
+    # 2. Subsequent calls on same instance AND fresh worker skip upstream with identical `until`
+    clock["dt"] = t0_dt + timedelta(seconds=30)
+    clock["mono"] += 28.0
+
+    async def should_not_dial(req):
+        raise AssertionError("Cooled Codex model must not dial upstream")
+
+    with pytest.raises(Exception) as local_exc:
+        await mw_a.awrap_model_call(_FakeRequest(codex_client), should_not_dial)
+    local_frame = error_event_data(
+        "thread-codex-only", str(local_exc.value), exc=local_exc.value, config=codex_cfg
+    )
+    assert local_frame["plan_limit"] == {
+        "plan": "ChatGPT Plus",
+        "window": "five_hour",
+        "until": expected_until,
+    }
+
+    mw_b = _make_middleware(codex_client, [])
+    with pytest.raises(Exception) as remote_exc:
+        await mw_b.awrap_model_call(_FakeRequest(codex_client), should_not_dial)
+    remote_frame = error_event_data(
+        "thread-codex-only", str(remote_exc.value), exc=remote_exc.value, config=codex_cfg
+    )
+    assert remote_frame["plan_limit"] == {
+        "plan": "ChatGPT Plus",
+        "window": "five_hour",
+        "until": expected_until,
+    }
+
+
+@pytest.mark.asyncio
 async def test_antigravity_vendor_cooldown_team_sharing_and_custom_same_name_isolation(
     no_sleep, monkeypatch: pytest.MonkeyPatch
 ) -> None:
