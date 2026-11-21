@@ -19,6 +19,7 @@ import { suggestBackgroundModel } from './suggestBackgroundModel';
 import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
 // DALTON-HOOK(dalton-setup): Dalton build defaults, unified team-model availability, and credits/Claude Code filtering
 import { isDaltonBuild } from '@/config/brand';
+import { modelLabel } from '@/lib/modelLabel';
 import {
   DALTON_BACKGROUND_MODEL,
   DALTON_BACKGROUND_SERIES,
@@ -79,15 +80,21 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
   const [backgroundModel, setBackgroundModel] = useState<string>(
     () => modelPref.preferred_background_model ?? '',
   );
+  // DALTON-HOOK(dalton-setup): snapshot saved advanced routing models so Continue preserves untouched fields in Dalton builds
+  const [initialAdvanced] = useState(() => ({
+    compactionModel: modelPref.compaction_model ?? '',
+    fetchModel: modelPref.fetch_model ?? '',
+    fallbackModels: modelPref.fallback_models ?? [],
+  }));
   const [advancedModels, setAdvancedModels] = useState<{
     compactionModel: string;
     fetchModel: string;
     fallbackModels: string[];
-  }>({
-    compactionModel: modelPref.compaction_model ?? '',
-    fetchModel: modelPref.fetch_model ?? '',
-    fallbackModels: modelPref.fallback_models ?? [],
-  });
+  }>(() => ({
+    compactionModel: initialAdvanced.compactionModel,
+    fetchModel: initialAdvanced.fetchModel,
+    fallbackModels: initialAdvanced.fallbackModels,
+  }));
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -172,21 +179,41 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
       // resolves a blank fetch model from the Background model, and a
       // blank compaction model from the conversation's own, at turn time, so a
       // later change in Settings keeps following it.
-      // DALTON-HOOK(dalton-setup): drop unavailable/uncurated advanced routing models before saving under Dalton
-      const validSlot = (m: string) => (isDaltonBuild ? (curatedSlotFillable.includes(m) ? m : null) : (m || null));
-      const compaction = validSlot(advancedModels.compactionModel);
-      const fetchModel = validSlot(advancedModels.fetchModel);
-      const fallbacks = isDaltonBuild
-        ? advancedModels.fallbackModels.filter((m) => curatedSlotFillable.includes(m))
-        : advancedModels.fallbackModels;
+      if (isDaltonBuild) {
+        // DALTON-HOOK(dalton-setup): preserve untouched saved advanced routing models in Dalton; only write changed fields
+        const sameList = (a: readonly string[], b: readonly string[]) =>
+          a.length === b.length && a.every((m, i) => m === b[i]);
+        const changedSlot = (next: string, initial: string): string | null | undefined =>
+          next === initial ? undefined : (!next ? null : curatedSlotFillable.includes(next) ? next : undefined);
+        const compaction = changedSlot(advancedModels.compactionModel, initialAdvanced.compactionModel);
+        const fetchModel = changedSlot(advancedModels.fetchModel, initialAdvanced.fetchModel);
+        const fallbacks = sameList(advancedModels.fallbackModels, initialAdvanced.fallbackModels)
+          ? undefined
+          : advancedModels.fallbackModels.filter((m) =>
+              initialAdvanced.fallbackModels.includes(m)
+                ? fillable.includes(m)
+                : curatedSlotFillable.includes(m),
+            );
 
-      await updatePreferences.mutateAsync(splitPreferenceWrite({
-        preferred_model: primaryModel,
-        preferred_background_model: backgroundModel,
-        compaction_model: compaction,
-        fetch_model: fetchModel,
-        fallback_models: fallbacks,
-      }));
+        await updatePreferences.mutateAsync(splitPreferenceWrite({
+          preferred_model: primaryModel,
+          preferred_background_model: backgroundModel,
+          ...(compaction !== undefined ? { compaction_model: compaction } : {}),
+          ...(fetchModel !== undefined ? { fetch_model: fetchModel } : {}),
+          ...(fallbacks !== undefined && !sameList(fallbacks, initialAdvanced.fallbackModels)
+            ? { fallback_models: fallbacks }
+            : {}),
+        }));
+      } else {
+        // DALTON-HOOK(dalton-setup): preserve upstream unconditional advanced-field write in non-Dalton builds
+        await updatePreferences.mutateAsync(splitPreferenceWrite({
+          preferred_model: primaryModel,
+          preferred_background_model: backgroundModel,
+          compaction_model: advancedModels.compactionModel || null,
+          fetch_model: advancedModels.fetchModel || null,
+          fallback_models: advancedModels.fallbackModels,
+        }));
+      }
 
       navigate('/setup/ready');
     } catch (e: unknown) {
@@ -195,7 +222,7 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
     } finally {
       setSaving(false);
     }
-  }, [canContinue, primaryModel, backgroundModel, advancedModels, curatedSlotFillable, updatePreferences, navigate, t]);
+  }, [canContinue, primaryModel, backgroundModel, initialAdvanced, advancedModels, fillable, curatedSlotFillable, updatePreferences, navigate, t]);
 
   // ---------------------------------------------------------------------------
   // Render
@@ -304,6 +331,7 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
                   value={advancedModels.fetchModel}
                   onChange={(v) => handleAdvancedChange({ fetchModel: v })}
                   models={curatedSlotModels}
+                  missingLabel={isDaltonBuild ? (m) => modelLabel(m, metadata) : undefined}
                   placeholder={copy.defaultsToBackground}
                   payers={visiblePayers}
                   metadata={metadata}
@@ -314,6 +342,7 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
                   value={advancedModels.compactionModel}
                   onChange={(v) => handleAdvancedChange({ compactionModel: v })}
                   models={curatedSlotModels}
+                  missingLabel={isDaltonBuild ? (m) => modelLabel(m, metadata) : undefined}
                   placeholder={copy.defaultsToConversation}
                   payers={visiblePayers}
                   metadata={metadata}

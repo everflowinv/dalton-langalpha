@@ -734,6 +734,88 @@ describe('Dalton SetupWizard external & internal member flows', () => {
     });
   });
 
+  it('DefaultsStep preserves untouched uncurated advanced models on Continue and only writes fields changed on this page', async () => {
+    const user = userEvent.setup();
+    h.preferences = {
+      model_preference: {
+        preferred_model: 'gemini-4-neon-high-oauth',
+        preferred_background_model: 'gemini-4-hydrogen-low-oauth',
+        fetch_model: 'gemini-4-argon-high-oauth',
+        compaction_model: 'gemini-4-hydrogen-low-oauth',
+        fallback_models: ['gemini-4-argon-high-oauth', 'gemini-4-hydrogen-low-oauth'],
+      },
+    };
+    renderWithQuery(<DefaultsStep />);
+
+    // 1) Never opening Advanced: Continue writes only primary + background, preserving all saved advanced fields
+    await user.click(screen.getByRole('button', { name: 'Continue' }));
+    await waitFor(() => {
+      expect(h.updatePreferences).toHaveBeenCalledWith({
+        model_preference: {
+          preferred_model: 'gemini-4-neon-high-oauth',
+          preferred_background_model: 'gemini-4-hydrogen-low-oauth',
+        },
+      });
+    });
+
+    // 2) Opening Advanced: new optgroup options stay restricted to the curated 5, while saved values remain selected
+    h.updatePreferences.mockClear();
+    await user.click(screen.getByRole('button', { name: 'Advanced' }));
+    const fetchSelect = screen.getByLabelText('Web fetch model') as HTMLSelectElement;
+    const compactionSelect = screen.getByLabelText('Compaction model') as HTMLSelectElement;
+    expect(fetchSelect.value).toBe('gemini-4-argon-high-oauth');
+    expect(compactionSelect.value).toBe('gemini-4-hydrogen-low-oauth');
+    const fetchGroupOptions = [...fetchSelect.querySelectorAll('optgroup option')].map(
+      (o) => (o as HTMLOptionElement).value,
+    );
+    expect(fetchGroupOptions).toEqual([
+      'gemini-4-neon-high-oauth',
+      'gemini-4-carbon-medium-oauth',
+      'claude-opus-5-5-oauth',
+      'gpt-6.2-astra-oauth',
+      'gpt-6.2-sol-oauth',
+    ]);
+
+    // Edit only fetch_model and add one curated fallback; leave compaction_model untouched
+    await user.selectOptions(fetchSelect, 'gpt-6.2-sol-oauth');
+    await user.click(screen.getByRole('button', { name: /\+ Add/i }));
+    await user.click(screen.getByRole('button', { name: /GPT-6\.2 Astra/i }));
+    await user.click(screen.getByRole('button', { name: 'Continue' }));
+    await waitFor(() => {
+      expect(h.updatePreferences).toHaveBeenCalledWith({
+        model_preference: {
+          preferred_model: 'gemini-4-neon-high-oauth',
+          preferred_background_model: 'gemini-4-hydrogen-low-oauth',
+          fetch_model: 'gpt-6.2-sol-oauth',
+          fallback_models: [
+            'gemini-4-argon-high-oauth',
+            'gemini-4-hydrogen-low-oauth',
+            'gpt-6.2-astra-oauth',
+          ],
+        },
+      });
+    });
+
+    // 3) Explicitly clearing fetch_model to placeholder writes fetch_model: null while compaction_model stays untouched
+    h.updatePreferences.mockClear();
+    await user.selectOptions(fetchSelect, '');
+    await user.click(screen.getByRole('button', { name: 'Continue' }));
+    await waitFor(() => {
+      expect(h.updatePreferences).toHaveBeenCalledWith({
+        model_preference: {
+          preferred_model: 'gemini-4-neon-high-oauth',
+          preferred_background_model: 'gemini-4-hydrogen-low-oauth',
+          fetch_model: null,
+          fallback_models: [
+            'gemini-4-argon-high-oauth',
+            'gemini-4-hydrogen-low-oauth',
+            'gpt-6.2-astra-oauth',
+          ],
+        },
+      });
+    });
+  });
+
   it('DoneStep displays team-configured provider label and no Mac/ClaudeCode/credits/trading links', () => {
     h.preferences = {
       preferred_model: 'gemini-4-neon-high-oauth',

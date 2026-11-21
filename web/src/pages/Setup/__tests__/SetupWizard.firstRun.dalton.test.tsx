@@ -1377,4 +1377,30 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
       }),
     });
   }, 15_000);
+
+  it('(DefaultsStep-advanced) legacy /setup/defaults preserves saved uncurated advanced settings on Continue and only writes changed fields', async () => {
+    const user = userEvent.setup();
+    server.state.preferences = {
+      model_preference: {
+        preferred_model: 'gemini-4-neon-high-oauth',
+        preferred_background_model: 'gemini-4-hydrogen-low-oauth',
+        fetch_model: 'gemini-4-argon-high-oauth',
+        compaction_model: 'gemini-4-hydrogen-low-oauth',
+        fallback_models: ['gemini-4-argon-high-oauth'],
+      },
+    };
+
+    renderRealWizardApp('/setup/defaults');
+    const bgSelect = await screen.findByLabelText(/Background model/i, {}, { timeout: 5000 }) as HTMLSelectElement;
+    await waitFor(() => expect(bgSelect.value).toBe('gemini-4-hydrogen-low-oauth'), { timeout: 5000 });
+
+    await user.click(screen.getByRole('button', { name: 'Continue' }));
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/setup/ready'), { timeout: 5000 });
+    expect(server.lastPreferencesPut).toEqual({
+      model_preference: {
+        preferred_model: 'gemini-4-neon-high-oauth',
+        preferred_background_model: 'gemini-4-hydrogen-low-oauth',
+      },
+    });
+  }, 15_000);
 });
