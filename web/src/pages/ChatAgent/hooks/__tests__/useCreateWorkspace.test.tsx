@@ -158,4 +158,58 @@ describe('useCreateWorkspace', () => {
     });
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.dalton.coverageUnits() });
   });
+
+  // DALTON-HOOK(workspace-dedup): coverage_suggestion does not invalidate computers and forwards skipCoverageSuggestion
+  it('parses coverage_suggestion without invalidating computers and forwards skipCoverageSuggestion', async () => {
+    const { coverageSuggestionOf } = await import('../useCreateWorkspace');
+    const suggestionRefusal = Object.assign(new Error('Request failed with status code 409'), {
+      response: {
+        status: 409,
+        data: {
+          detail: {
+            code: 'coverage_suggestion',
+            message: '「Nvidia」识别为公司（代码 NVDA）',
+            suggestion: {
+              coverage_kind: 'company',
+              ticker: 'NVDA',
+              display_name: 'NVIDIA Corporation',
+            },
+          },
+        },
+      },
+    });
+    expect(coverageSuggestionOf(suggestionRefusal)).toEqual({
+      message: '「Nvidia」识别为公司（代码 NVDA）',
+      suggestion: {
+        coverage_kind: 'company',
+        ticker: 'NVDA',
+        display_name: 'NVIDIA Corporation',
+      },
+    });
+
+    (createWorkspace as Mock).mockRejectedValueOnce(suggestionRefusal);
+    const { result, queryClient } = renderHookWithProviders(() => useCreateWorkspace());
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
+
+    await expect(result.current({ name: 'Nvidia', description: '' })).rejects.toBe(suggestionRefusal);
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: queryKeys.computers.lists() });
+
+    const created = { workspace_id: 'ws-nvda-skip', name: 'Nvidia' };
+    (createWorkspace as Mock).mockResolvedValueOnce(created);
+    const out = await result.current({
+      name: 'Nvidia',
+      description: '',
+      skipCoverageSuggestion: true,
+    });
+    expect(out).toBe(created);
+    expect(createWorkspace).toHaveBeenLastCalledWith(
+      'Nvidia',
+      '',
+      {},
+      undefined,
+      undefined,
+      undefined,
+      true,
+    );
+  });
 });

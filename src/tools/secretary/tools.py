@@ -285,6 +285,7 @@ async def workspaces_create(
     coverage_kind: str | None = None,
     ticker: str | None = None,
     display_name: str | None = None,
+    skip_coverage_suggestion: bool = False,
 ) -> Command:
     """Create a new workspace, once the user confirms unless ``preapproved``.
 
@@ -300,6 +301,10 @@ async def workspaces_create(
     # --- DALTON-HOOK(workspace-dedup): begin ---
     from src.dalton.coverage.dedup import find_existing_company_workspace
 
+    wants_coverage = bool(
+        coverage_kind
+        and str(coverage_kind).strip().lower() not in ("", "none", "other")
+    )
     if not allow_duplicate_company:
         dup = None
         try:
@@ -311,7 +316,7 @@ async def workspaces_create(
                 "Company workspace dedup check failed (%s); proceeding",
                 type(exc).__name__,
             )
-        if dup is not None:
+        if dup is not None and dup.matches:
             extra_fields: dict[str, Any] = {}
             suggestion = dup.suggestion_payload()
             if suggestion is not None:
@@ -323,6 +328,33 @@ async def workspaces_create(
                 message=dup.message,
                 matches=dup.matches_payload(),
                 **extra_fields,
+            )
+        if (
+            dup is not None
+            and dup.suggestion is not None
+            and not wants_coverage
+            and not skip_coverage_suggestion
+        ):
+            suggestion = dup.suggestion_payload()
+            kind_label = (
+                "公司" if dup.suggestion.coverage_kind == "company" else "行业"
+            )
+            ticker_note = (
+                f"（代码 {dup.suggestion.ticker}）"
+                if dup.suggestion.ticker
+                else ""
+            )
+            msg = (
+                f"「{name}」识别为{kind_label}{ticker_note}，"
+                "请按 suggestion 带上 coverage_kind / ticker / display_name 重新新建以自动登记覆盖单元，"
+                "或在用户明确不要登记时传 skip_coverage_suggestion=True。"
+            )
+            return error_command(
+                msg,
+                tool_call_id,
+                code="coverage_suggestion",
+                message=msg,
+                suggestion=suggestion,
             )
     # --- DALTON-HOOK(workspace-dedup): end ---
 
@@ -359,7 +391,7 @@ async def workspaces_create(
             dup_for_log = await find_existing_company_workspace(
                 user_id, name, channel="cos"
             )
-            if dup_for_log is not None:
+            if dup_for_log is not None and dup_for_log.matches:
                 matched_ids = list(
                     dup_for_log.matched_workspace_ids
                     or [
@@ -400,10 +432,10 @@ async def workspaces_create(
             "workspace_name": workspace["name"],
         }
         # --- DALTON-HOOK(workspace-dedup): begin ---
-        if coverage_kind and str(coverage_kind).strip().lower() not in ("", "none", "other"):
+        if wants_coverage:
             from src.dalton.coverage.units import auto_register_workspace_coverage_unit
 
-            unit_row, unit_warning = await auto_register_workspace_coverage_unit(
+            unit_row, unit_warning, unit_warning_detail = await auto_register_workspace_coverage_unit(
                 user_id,
                 workspace_id=str(workspace["workspace_id"]),
                 workspace_name=str(workspace.get("name") or name),
@@ -415,6 +447,8 @@ async def workspaces_create(
                 result["coverage_unit"] = unit_row
             if unit_warning is not None:
                 result["coverage_unit_warning"] = unit_warning
+            if unit_warning_detail is not None:
+                result["coverage_unit_warning_detail"] = unit_warning_detail
         # --- DALTON-HOOK(workspace-dedup): end ---
         # --- DALTON-HOOK(workspace-folder-ready): begin ---
         # The folder is only built at the machine's next acquire, so say where

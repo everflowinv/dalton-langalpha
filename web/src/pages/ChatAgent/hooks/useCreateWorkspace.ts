@@ -27,13 +27,19 @@ export interface NewWorkspace {
   coverageKind?: CoverageUnitKindChoice;
   ticker?: string;
   displayName?: string;
+  skipCoverageSuggestion?: boolean;
 }
 
-// DALTON-HOOK(workspace-dedup): structured payload extracted from 409 company_workspace_exists
+// DALTON-HOOK(workspace-dedup): structured payload extracted from 409 company_workspace_exists or coverage_suggestion
 export interface CompanyWorkspaceExistsInfo {
   message: string;
   matches: DuplicateWorkspaceMatch[];
   suggestion?: DedupCoverageSuggestion;
+}
+
+export interface CoverageSuggestionInfo {
+  message: string;
+  suggestion: DedupCoverageSuggestion;
 }
 
 function parseSuggestion(raw: unknown): DedupCoverageSuggestion | undefined {
@@ -85,25 +91,39 @@ export function companyWorkspaceExistsOf(err: unknown): CompanyWorkspaceExistsIn
   return suggestion ? { message, matches, suggestion } : { message, matches };
 }
 
+export function coverageSuggestionOf(err: unknown): CoverageSuggestionInfo | null {
+  const detail = apiErrorCoded(err, 'coverage_suggestion');
+  if (!detail) return null;
+  const suggestion = parseSuggestion(detail.suggestion);
+  if (!suggestion) return null;
+  const message = typeof detail.message === 'string' && detail.message ? detail.message : '';
+  return { message, suggestion };
+}
+
 export function useCreateWorkspace(): (data: NewWorkspace) => Promise<Workspace> {
   const queryClient = useQueryClient();
   return useCallback(
-    async ({ name, description, computerId, allowDuplicateCompany, coverageKind, ticker, displayName }: NewWorkspace) => {
+    async ({ name, description, computerId, allowDuplicateCompany, coverageKind, ticker, displayName, skipCoverageSuggestion }: NewWorkspace) => {
       let created: Workspace;
       try {
         const hasCoverage = coverageKind === 'company' || coverageKind === 'sector';
-        created = hasCoverage
-          ? await createWorkspace(name, description, {}, computerId, allowDuplicateCompany, {
+        const covArg = hasCoverage
+          ? {
               kind: coverageKind,
               ticker,
               displayName,
-            })
-          : allowDuplicateCompany
-            ? await createWorkspace(name, description, {}, computerId, true)
-            : await createWorkspace(name, description, {}, computerId);
+            }
+          : undefined;
+        created = skipCoverageSuggestion
+          ? await createWorkspace(name, description, {}, computerId, allowDuplicateCompany, covArg, true)
+          : hasCoverage
+            ? await createWorkspace(name, description, {}, computerId, allowDuplicateCompany, covArg)
+            : allowDuplicateCompany
+              ? await createWorkspace(name, description, {}, computerId, true)
+              : await createWorkspace(name, description, {}, computerId);
       } catch (err) {
-        // DALTON-HOOK(workspace-dedup): company_workspace_exists is a workspace dedup prompt, not a stale computer refusal.
-        if (!companyWorkspaceExistsOf(err)) {
+        // DALTON-HOOK(workspace-dedup): company_workspace_exists / coverage_suggestion are interactive prompts, not stale computer refusals.
+        if (!companyWorkspaceExistsOf(err) && !coverageSuggestionOf(err)) {
           // A refusal for a computer still being prepared means the list the
           // form chose from is behind, so the computers re-read.
           void queryClient.invalidateQueries({ queryKey: queryKeys.computers.lists() });

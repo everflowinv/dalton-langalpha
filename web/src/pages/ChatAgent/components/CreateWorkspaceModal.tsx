@@ -17,12 +17,17 @@ import { useOpenComputers } from '../hooks/useOpenComputers';
 import { ComputerRefusal, type ComputerRefusalKind } from './ComputerRefusal';
 import { createWorkspaceDenialMessage, denialMessage } from '../utils/denialMessage';
 import { clampWorkspaceName } from '../utils/workspaceName';
-// DALTON-HOOK(workspace-dedup): duplicate company workspace check helper, coverage fields & notice card
+// DALTON-HOOK(workspace-dedup): duplicate company workspace check helper, coverage fields & notice cards
+import { useDaltonCoverageUnits } from '@/lib/dalton/coverage';
+import { CoverageSuggestionNotice } from './dalton/CoverageSuggestionNotice';
 import { CoverageUnitFields } from './dalton/CoverageUnitFields';
+import { formatCoverageUnitWarning } from './dalton/coverageWarningMessage';
 import { DuplicateCompanyNotice } from './dalton/DuplicateCompanyNotice';
 import {
   companyWorkspaceExistsOf,
+  coverageSuggestionOf,
   type CompanyWorkspaceExistsInfo,
+  type CoverageSuggestionInfo,
   type NewWorkspace,
 } from '../hooks/useCreateWorkspace';
 import { useComputers } from '../hooks/useComputers';
@@ -45,8 +50,9 @@ type FileUploadStatus = 'pending' | 'uploading' | 'done' | 'failed';
 /** Why the form can't go on: in words, or for want of a computer Home can live on. */
 type FormRefusal =
   | { kind: 'message'; message: string }
-  // DALTON-HOOK(workspace-dedup): non-fatal duplicate company workspace notice bound to requestedName
+  // DALTON-HOOK(workspace-dedup): non-fatal duplicate company workspace & coverage suggestion notices bound to requestedName
   | ({ kind: 'companyExists'; requestedName: string } & CompanyWorkspaceExistsInfo)
+  | ({ kind: 'coverageSuggestion'; requestedName: string } & CoverageSuggestionInfo)
   | Exclude<ComputerRefusalKind, { kind: 'onlyComputer' }>;
 
 /**
@@ -73,7 +79,9 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
 
   // Form state
   const [name, setName] = useState('');
-  // DALTON-HOOK(workspace-dedup): track latest typed name & coverage unit fields / prefill state
+  // DALTON-HOOK(workspace-dedup): track latest typed name & coverage unit fields / prefill state (gated by coverage_units & internal tier)
+  const { data: coverageUnitsData, isError: coverageUnitsError } = useDaltonCoverageUnits(isOpen);
+  const coverageUnitsEnabled = !coverageUnitsError && coverageUnitsData?.enabled === true;
   const latestNameRef = useRef('');
   const [coverageKind, setCoverageKind] = useState<CoverageUnitKindChoice>('none');
   const [coverageTicker, setCoverageTicker] = useState('');
@@ -219,8 +227,12 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
     setCreationStep(failed ? 'error' : 'done');
   };
 
-  // DALTON-HOOK(workspace-dedup): support optional allowDuplicateCompany and lock override to the 409'd name
-  const submitCreate = async (allowDuplicateCompany = false, overrideName?: string) => {
+  // DALTON-HOOK(workspace-dedup): support optional allowDuplicateCompany / skipCoverageSuggestion and lock override to the 409'd name
+  const submitCreate = async (
+    allowDuplicateCompany = false,
+    overrideName?: string,
+    skipCoverageSuggestion = false,
+  ) => {
     const submittedName = (overrideName ?? name).trim();
     if (!submittedName || submitting || preparingTarget) {
       if (!submittedName) setRefusal({ kind: 'message', message: t('workspace.workspaceNameRequired') });
@@ -239,8 +251,9 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
         description: description.trim(),
         ...(choosesComputer && target ? { computerId: target.computer_id } : {}),
         ...(allowDuplicateCompany ? { allowDuplicateCompany: true } : {}),
-        // DALTON-HOOK(workspace-dedup): attach coverage registration fields when company or sector is selected
-        ...(coverageKind !== 'none'
+        ...(skipCoverageSuggestion ? { skipCoverageSuggestion: true } : {}),
+        // DALTON-HOOK(workspace-dedup): attach coverage registration fields when company or sector is selected (unless user chose skip or gated off)
+        ...(!skipCoverageSuggestion && coverageUnitsEnabled && coverageKind !== 'none'
           ? {
               coverageKind,
               ...(coverageKind === 'company' && trimmedTicker ? { ticker: trimmedTicker } : {}),
@@ -253,8 +266,9 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
       // the sentence is the quota service's, relayed as it arrived.
       setSubmitting(false);
       const backupOff = needsBackupOf(err);
-      // DALTON-HOOK(workspace-dedup): parse 409 company_workspace_exists before generic denial copy and prefill coverage fields
+      // DALTON-HOOK(workspace-dedup): parse 409 company_workspace_exists / coverage_suggestion before generic denial copy and prefill coverage fields
       const companyExists = companyWorkspaceExistsOf(err);
+      const coverageSuggestion = coverageSuggestionOf(err);
       if (isNeedsComputer(err)) setRefusal({ kind: 'needsComputer' });
       else if (backupOff) setRefusal({ kind: 'needsBackup', ...backupOff });
       else if (companyExists) {
@@ -273,15 +287,35 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
             setCoveragePrefilled(true);
           }
         }
+      } else if (coverageSuggestion) {
+        if (latestNameRef.current.trim() === submittedName) {
+          setRefusal({
+            kind: 'coverageSuggestion',
+            requestedName: submittedName,
+            ...coverageSuggestion,
+          });
+          const suggestion = coverageSuggestion.suggestion;
+          if (
+            (suggestion.coverage_kind === 'company' || suggestion.coverage_kind === 'sector') &&
+            !coverageUserEditedRef.current &&
+            coverageKind === 'none'
+          ) {
+            setCoverageKind(suggestion.coverage_kind);
+            setCoverageTicker(suggestion.coverage_kind === 'company' ? (suggestion.ticker ?? '') : '');
+            setCoverageDisplayName(suggestion.display_name ?? '');
+            setCoveragePrefilled(true);
+          }
+        }
       } else setRefusal({ kind: 'message', message: createWorkspaceDenialMessage(err, t) });
       return;
     }
 
     // DALTON-HOOK(workspace-dedup): show non-fatal hint when workspace succeeded but coverage registration did not
-    if (workspace.coverage_unit_warning) {
+    const coverageWarning = formatCoverageUnitWarning(t, workspace);
+    if (coverageWarning) {
       toast({
         title: t('workspace.coverage.registrationWarningTitle', 'Workspace created, coverage unit not registered'),
-        description: workspace.coverage_unit_warning,
+        description: coverageWarning,
       });
     }
 
@@ -474,9 +508,9 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
               onChange={(e) => {
                 const nextName = clampWorkspaceName(e.target.value);
                 setName(nextName);
-                // DALTON-HOOK(workspace-dedup): keep tracked name current, clear dedup refusal & unedited prefill on edit
+                // DALTON-HOOK(workspace-dedup): keep tracked name current, clear dedup/suggestion refusal & unedited prefill on edit
                 latestNameRef.current = nextName;
-                if (refusal?.kind === 'companyExists') setRefusal(null);
+                if (refusal?.kind === 'companyExists' || refusal?.kind === 'coverageSuggestion') setRefusal(null);
                 if (coveragePrefilled && !coverageUserEditedRef.current) {
                   setCoverageKind('none');
                   setCoverageTicker('');
@@ -495,29 +529,31 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
             />
           </div>
 
-          {/* DALTON-HOOK(workspace-dedup): workspace coverage type, ticker, and display name fields */}
-          <CoverageUnitFields
-            coverageKind={coverageKind}
-            ticker={coverageTicker}
-            displayName={coverageDisplayName}
-            prefilled={coveragePrefilled}
-            disabled={submitting}
-            onChangeKind={(next) => {
-              coverageUserEditedRef.current = true;
-              setCoveragePrefilled(false);
-              setCoverageKind(next);
-            }}
-            onChangeTicker={(next) => {
-              coverageUserEditedRef.current = true;
-              setCoveragePrefilled(false);
-              setCoverageTicker(next);
-            }}
-            onChangeDisplayName={(next) => {
-              coverageUserEditedRef.current = true;
-              setCoveragePrefilled(false);
-              setCoverageDisplayName(next);
-            }}
-          />
+          {/* DALTON-HOOK(workspace-dedup): workspace coverage type, ticker, and display name fields (hidden when disabled or external member) */}
+          {coverageUnitsEnabled && (
+            <CoverageUnitFields
+              coverageKind={coverageKind}
+              ticker={coverageTicker}
+              displayName={coverageDisplayName}
+              prefilled={coveragePrefilled}
+              disabled={submitting}
+              onChangeKind={(next) => {
+                coverageUserEditedRef.current = true;
+                setCoveragePrefilled(false);
+                setCoverageKind(next);
+              }}
+              onChangeTicker={(next) => {
+                coverageUserEditedRef.current = true;
+                setCoveragePrefilled(false);
+                setCoverageTicker(next);
+              }}
+              onChangeDisplayName={(next) => {
+                coverageUserEditedRef.current = true;
+                setCoveragePrefilled(false);
+                setCoverageDisplayName(next);
+              }}
+            />
+          )}
 
           <div className="cwm-field">
             <label className="cwm-label">
@@ -625,7 +661,7 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
 
           {/* Error */}
           {refusal?.kind === 'message' && <div className="cwm-error">{refusal.message}</div>}
-          {/* DALTON-HOOK(workspace-dedup): duplicate company workspace notice card */}
+          {/* DALTON-HOOK(workspace-dedup): duplicate company workspace & coverage suggestion notice cards */}
           {refusal?.kind === 'companyExists' && (
             <DuplicateCompanyNotice
               requestedName={refusal.requestedName}
@@ -635,7 +671,17 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
               onCreateAnyway={(requested) => void submitCreate(true, requested)}
             />
           )}
-          {refusal && refusal.kind !== 'message' && refusal.kind !== 'companyExists' && (
+          {refusal?.kind === 'coverageSuggestion' && (
+            <CoverageSuggestionNotice
+              requestedName={refusal.requestedName}
+              suggestion={refusal.suggestion}
+              currentCoverageKind={coverageKind}
+              disabled={submitting || !!preparingTarget}
+              onRegisterAndCreate={(requested) => void submitCreate(false, requested, false)}
+              onCreateWithoutRegistering={(requested) => void submitCreate(false, requested, true)}
+            />
+          )}
+          {refusal && refusal.kind !== 'message' && refusal.kind !== 'companyExists' && refusal.kind !== 'coverageSuggestion' && (
             <ComputerRefusal
               refusal={refusal}
               message={refusal.kind === 'needsComputer'

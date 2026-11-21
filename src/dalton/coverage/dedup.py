@@ -202,32 +202,36 @@ class DuplicateMatch:
     suggestion: DedupCoverageSuggestion | None = None
 
     @property
-    def primary(self) -> DuplicateWorkspaceCandidate:
-        return self.matches[0]
+    def primary(self) -> DuplicateWorkspaceCandidate | None:
+        return self.matches[0] if self.matches else None
+
+    @property
+    def has_matches(self) -> bool:
+        return bool(self.matches)
 
     @property
     def workspace_id(self) -> str | None:
-        return self.matches[0].workspace_id if self.matches[0].can_read else None
+        return self.matches[0].workspace_id if (self.matches and self.matches[0].can_read) else None
 
     @property
     def workspace_name(self) -> str | None:
-        return self.matches[0].workspace_name
+        return self.matches[0].workspace_name if self.matches else None
 
     @property
     def owner_name(self) -> str | None:
-        return self.matches[0].owner_name
+        return self.matches[0].owner_name if self.matches else None
 
     @property
     def lead_analyst_name(self) -> str | None:
-        return self.matches[0].lead_analyst_name if self.matches[0].can_read else None
+        return self.matches[0].lead_analyst_name if (self.matches and self.matches[0].can_read) else None
 
     @property
     def ticker(self) -> str | None:
-        return self.matches[0].ticker if self.matches[0].can_read else None
+        return self.matches[0].ticker if (self.matches and self.matches[0].can_read) else None
 
     @property
     def can_read(self) -> bool:
-        return self.matches[0].can_read
+        return self.matches[0].can_read if self.matches else False
 
     def matches_payload(self) -> list[dict[str, Any]]:
         return [m.to_dict() for m in self.matches]
@@ -1127,6 +1131,7 @@ async def _run_batch_with_fallback(
             "raise_on_error": False,
             "skip_journal": skip_journal,
             "record_provider_events": False,
+            "ignore_custom_models": True,
         }
         if is_external:
             call_kwargs["is_byok"] = True
@@ -1534,6 +1539,61 @@ async def _refresh_live_hits(
     return deduped
 
 
+async def _resolve_live_hit_candidate(
+    uid: str,
+    entry: _CandidateEntry,
+    fresh_ws: dict[str, Any] | None,
+    *,
+    channel: str,
+    conn: Any = None,
+) -> tuple[DuplicateWorkspaceCandidate, str | None]:
+    """Resolve readability and build ``(DuplicateWorkspaceCandidate, ws_id)`` for one live hit."""
+    if entry.unbound_unit and fresh_ws is None:
+        return (
+            DuplicateWorkspaceCandidate(
+                workspace_name=None,
+                owner_name=None,
+                can_read=True,
+                workspace_id=None,
+                lead_analyst_name=entry.lead_analyst_name,
+                ticker=entry.ticker,
+                display_name=entry.unit_display_name or entry.ticker,
+                unbound_unit=True,
+            ),
+            None,
+        )
+
+    ws_id = str((fresh_ws or {}).get("workspace_id") or entry.ws_id or "").strip()
+    ws_name = str((fresh_ws or {}).get("name") or entry.workspace_name or "").strip()
+    owner_name = str(
+        (fresh_ws or {}).get("owner_name")
+        or entry.owner_name
+        or entry.lead_analyst_name
+        or "Teammate"
+    ).strip()
+    ws_row = fresh_ws or entry.ws_row or {}
+    can_read = False
+    if uid and ws_id:
+        can_read = await _check_workspace_readable(
+            ws_id,
+            uid,
+            channel=channel,
+            workspace=ws_row,
+            conn=conn,
+        )
+    return (
+        DuplicateWorkspaceCandidate(
+            workspace_name=ws_name,
+            owner_name=owner_name,
+            can_read=can_read,
+            workspace_id=ws_id if can_read else None,
+            lead_analyst_name=entry.lead_analyst_name if can_read else None,
+            ticker=entry.ticker if can_read else None,
+        ),
+        ws_id or None,
+    )
+
+
 async def _find_matches(
     uid: str,
     raw_name: str,
@@ -1563,62 +1623,58 @@ async def _find_matches(
         suggestion_out=suggestion_out,
     )
     if not hits:
+        if suggestion_out:
+            return DuplicateMatch(
+                company=raw_name,
+                message="",
+                matches=(),
+                matched_workspace_ids=(),
+                suggestion=suggestion_out[0],
+            )
         return None
 
     # Re-verify live workspace/unit status and bindings after LLM return, release DB
     # connection before permission checks, and truncate to MAX_DUPLICATE_MATCHES after refresh.
-    live_hits = (await _refresh_live_hits(hits, conn=conn))[:MAX_DUPLICATE_MATCHES]
-    if not live_hits:
+    all_live_hits = await _refresh_live_hits(hits, conn=conn)
+    if not all_live_hits:
+        if suggestion_out:
+            return DuplicateMatch(
+                company=raw_name,
+                message="",
+                matches=(),
+                matched_workspace_ids=(),
+                suggestion=suggestion_out[0],
+            )
         return None
+    live_hits = all_live_hits[:MAX_DUPLICATE_MATCHES]
 
     resolved: list[DuplicateWorkspaceCandidate] = []
     matched_ids: list[str] = []
     for entry, fresh_ws, _conf, _reason in live_hits:
-        if entry.unbound_unit and fresh_ws is None:
-            resolved.append(
-                DuplicateWorkspaceCandidate(
-                    workspace_name=None,
-                    owner_name=None,
-                    can_read=True,
-                    workspace_id=None,
-                    lead_analyst_name=entry.lead_analyst_name,
-                    ticker=entry.ticker,
-                    display_name=entry.unit_display_name or entry.ticker,
-                    unbound_unit=True,
-                )
-            )
-            continue
-
-        ws_id = str((fresh_ws or {}).get("workspace_id") or entry.ws_id or "").strip()
-        ws_name = str((fresh_ws or {}).get("name") or entry.workspace_name or "").strip()
-        owner_name = str(
-            (fresh_ws or {}).get("owner_name")
-            or entry.owner_name
-            or entry.lead_analyst_name
-            or "Teammate"
-        ).strip()
-        ws_row = fresh_ws or entry.ws_row or {}
+        cand, ws_id = await _resolve_live_hit_candidate(
+            uid,
+            entry,
+            fresh_ws,
+            channel=channel,
+            conn=conn,
+        )
         if ws_id:
             matched_ids.append(ws_id)
-        can_read = False
-        if uid and ws_id:
-            can_read = await _check_workspace_readable(
-                ws_id,
+        resolved.append(cand)
+
+    all_hits_readable = all(item.can_read for item in resolved)
+    if all_hits_readable and suggestion_out and len(all_live_hits) > MAX_DUPLICATE_MATCHES:
+        for entry, fresh_ws, _conf, _reason in all_live_hits[MAX_DUPLICATE_MATCHES:]:
+            extra_cand, _ = await _resolve_live_hit_candidate(
                 uid,
+                entry,
+                fresh_ws,
                 channel=channel,
-                workspace=ws_row,
                 conn=conn,
             )
-        resolved.append(
-            DuplicateWorkspaceCandidate(
-                workspace_name=ws_name,
-                owner_name=owner_name,
-                can_read=can_read,
-                workspace_id=ws_id if can_read else None,
-                lead_analyst_name=entry.lead_analyst_name if can_read else None,
-                ticker=entry.ticker if can_read else None,
-            )
-        )
+            if not extra_cand.can_read:
+                all_hits_readable = False
+                break
 
     message = _format_duplicate_message(raw_name, resolved[0])
     return DuplicateMatch(
@@ -1626,7 +1682,7 @@ async def _find_matches(
         message=message,
         matches=tuple(resolved),
         matched_workspace_ids=tuple(matched_ids),
-        suggestion=suggestion_out[0] if suggestion_out else None,
+        suggestion=suggestion_out[0] if (suggestion_out and all_hits_readable) else None,
     )
 
 

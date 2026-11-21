@@ -1845,7 +1845,34 @@
       "sectorNameLabel": "行业名",
       "sectorNamePlaceholder": "如 人工智能基础设施（留空则使用工作区名称）",
       "prefilledHint": "已根据查重结果预填，创建前可修改。",
-      "registrationWarningTitle": "工作区已创建，覆盖单元未登记"
+      "tickerLengthHint": "最多 {{max}} 个字符",
+      "tickerLengthExceeded": "最多 {{max}} 个字符（当前 {{count}} 个）— 新建工作区仍会成功，但不会自动登记覆盖单元。",
+      "displayNameLengthHint": "最多 {{max}} 个字符",
+      "displayNameLengthExceeded": "最多 {{max}} 个字符（当前 {{count}} 个）— 新建工作区仍会成功，但不会自动登记覆盖单元。",
+      "registrationWarningTitle": "工作区已创建，覆盖单元未登记",
+      "warnings": {
+        "ticker_conflict": "股票代码 {{ticker}} 已被其他覆盖单元登记，工作区已创建但未自动登记覆盖单元。",
+        "ticker_conflict_no_ticker": "该股票代码已被其他覆盖单元登记，工作区已创建但未自动登记覆盖单元。",
+        "slug_conflict": "同名覆盖单元已被登记，工作区已创建但未自动登记覆盖单元。",
+        "workspace_conflict": "该工作区已绑定其他覆盖单元。",
+        "invalid_ticker": "股票代码格式无效，工作区已创建但未自动登记覆盖单元。",
+        "sector_ticker_refused": "行业覆盖单元不能填写股票代码，工作区已创建但未自动登记覆盖单元。",
+        "ticker_too_long": "股票代码长度不能超过 {{max_length}} 个字符，工作区已创建但未自动登记覆盖单元。",
+        "display_name_too_long": "覆盖名称长度不能超过 {{max_length}} 个字符，工作区已创建但未自动登记覆盖单元。",
+        "token_not_allowed": "当前访问令牌无权登记团队覆盖单元，工作区已创建但未自动登记。",
+        "external_member_forbidden": "外部成员无权登记团队覆盖单元，工作区已创建但未自动登记。",
+        "authentication_required": "未验证用户身份，工作区已创建但未自动登记覆盖单元。",
+        "feature_disabled": "覆盖单元功能未开启，工作区已创建但未登记覆盖单元。",
+        "unsupported_kind": "不支持的覆盖类型 {{kind}}，工作区已创建但未登记覆盖单元。",
+        "registration_failed": "覆盖单元自动登记失败，工作区已创建但未绑定覆盖单元，可在覆盖管理中手动登记。"
+      }
+    },
+    "coverageSuggestion": {
+      "companyWithTicker": "「{{name}}」识别为公司（{{ticker}}）。请确认上方预填的覆盖字段，并选择是否在新建时自动登记覆盖单元。",
+      "company": "「{{name}}」识别为公司。请确认上方预填的覆盖字段，并选择是否在新建时自动登记覆盖单元。",
+      "sector": "「{{name}}」识别为行业。请确认上方预填的覆盖字段，并选择是否在新建时自动登记覆盖单元。",
+      "registerAndCreate": "登记并新建",
+      "createWithoutRegistering": "直接新建（不登记）"
     },
     "duplicateCompany": {
       "summaryReadableWithLead": "「{{company}}」已有工作区「{{workspace}}」（所有者 {{owner}}，主分析师 {{lead}}），请直接在那里继续。确实要另建，请确认后重试。",

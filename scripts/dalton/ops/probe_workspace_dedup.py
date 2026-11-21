@@ -52,14 +52,16 @@ async def probe_names(
     """Run read-only candidate collection + real LLM dedup judgment for ``names``."""
     from src.dalton.coverage.dedup import (
         DEDUP_BATCH_SIZE,
+        MAX_DUPLICATE_MATCHES,
         DuplicateWorkspaceCandidate,
-        _check_workspace_readable,
         _collect_candidates,
         _format_candidate_line,
         _format_duplicate_message,
         _judge_candidates_with_llm,
+        _refresh_live_hits,
         _resolve_caller_tier,
         _resolve_dedup_models,
+        _resolve_live_hit_candidate,
     )
     from src.dalton.settings import (
         get_dalton_config,
@@ -143,35 +145,16 @@ async def probe_names(
                 skip_journal=True,
             )
 
+            live_hits = (await _refresh_live_hits(hits))[:MAX_DUPLICATE_MATCHES]
             match_records: list[dict[str, Any]] = []
             resolved_candidates: list[DuplicateWorkspaceCandidate] = []
-            for entry, conf, reason in hits:
-                if entry.unbound_unit:
-                    cand = DuplicateWorkspaceCandidate(
-                        workspace_name=None,
-                        owner_name=None,
-                        can_read=True,
-                        workspace_id=None,
-                        lead_analyst_name=entry.lead_analyst_name,
-                        ticker=entry.ticker,
-                        display_name=entry.unit_display_name or entry.ticker,
-                        unbound_unit=True,
-                    )
-                else:
-                    can_read = await _check_workspace_readable(
-                        entry.ws_id or "",
-                        eff_uid,
-                        channel=channel,
-                        workspace=entry.ws_row or {},
-                    )
-                    cand = DuplicateWorkspaceCandidate(
-                        workspace_name=entry.workspace_name,
-                        owner_name=entry.owner_name,
-                        can_read=can_read,
-                        workspace_id=entry.ws_id if can_read else None,
-                        lead_analyst_name=entry.lead_analyst_name if can_read else None,
-                        ticker=entry.ticker if can_read else None,
-                    )
+            for entry, fresh_ws, conf, reason in live_hits:
+                cand, _ws_id = await _resolve_live_hit_candidate(
+                    eff_uid,
+                    entry,
+                    fresh_ws,
+                    channel=channel,
+                )
                 resolved_candidates.append(cand)
                 match_records.append(
                     {

@@ -46,6 +46,7 @@ export async function createWorkspace(
     ticker?: string;
     displayName?: string;
   },
+  skipCoverageSuggestion?: boolean,
 ): Promise<Workspace> {
   const covKind = coverage?.kind;
   const body: WorkspaceCreate = {
@@ -54,6 +55,7 @@ export async function createWorkspace(
     config,
     ...(computerId ? { computer_id: computerId } : {}),
     ...(allowDuplicateCompany ? { allow_duplicate_company: true } : {}),
+    ...(skipCoverageSuggestion ? { skip_coverage_suggestion: true } : {}),
     ...(covKind && covKind !== 'none'
       ? {
           coverage_kind: covKind,

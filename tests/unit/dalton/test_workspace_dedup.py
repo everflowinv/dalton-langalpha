@@ -4879,4 +4879,867 @@ async def test_external_member_never_registers_coverage_unit(
     assert cos_payload["workspace_id"] == WS_5
     assert "coverage_unit" not in cos_payload
     assert "外部成员" in (cos_payload.get("coverage_unit_warning") or "")
+    assert cos_payload.get("coverage_unit_warning_detail") == {
+        "code": "external_member_forbidden",
+        "params": {},
+    }
     reg_spy.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Round 9 tests (requirements 1-7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_suggestion_withheld_when_any_hit_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R9 #1: If any matched workspace/unit is unreadable, suggestion MUST be None."""
+    from src.server.app.workspaces import router
+
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_1,
+                name="NVDA Readable",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            ),
+            _ws_row(
+                ws_id=WS_2,
+                name="NVDA Private",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            ),
+        ],
+    )
+    # Only WS_1 is readable; WS_2 is unreadable.
+    _install_read_access(monkeypatch, web_readable={WS_1})
+    _install_llm(
+        monkeypatch,
+        lambda **_kw: _ok_result(
+            DedupLlmResult(
+                matches=[
+                    DedupMatchItem(id="c1", confidence="high", reason="same"),
+                    DedupMatchItem(id="c2", confidence="high", reason="same"),
+                ],
+                suggested_kind="company",
+                suggested_confidence="high",
+                suggested_ticker="NVDA",
+                suggested_display_name="NVIDIA Corporation",
+            )
+        ),
+    )
+
+    dup = await find_existing_company_workspace(USER_CALLER, "Nvidia")
+    assert dup is not None
+    assert len(dup.matches) == 2
+    by_name = {m.workspace_name: m for m in dup.matches}
+    assert by_name["NVDA Readable"].can_read is True
+    assert by_name["NVDA Private"].can_read is False
+    assert dup.suggestion is None
+    assert dup.suggestion_payload() is None
+
+    app = create_test_app(router)
+    dedup_mock = create_autospec(_REAL_FIND_DEDUP, return_value=dup)
+    with (
+        patch("src.dalton.coverage.dedup.find_existing_company_workspace", dedup_mock),
+        patch(
+            "src.server.services.platform_client.platform_gating_active",
+            return_value=False,
+        ),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.post("/api/v1/workspaces", json={"name": "Nvidia"})
+    assert resp.status_code == 409
+    assert "suggestion" not in resp.json()["detail"]
+
+    # When all hits are readable, suggestion IS returned.
+    _install_read_access(monkeypatch, web_readable={WS_1, WS_2})
+    dup_readable = await find_existing_company_workspace(USER_CALLER, "Nvidia")
+    assert dup_readable is not None
+    assert dup_readable.suggestion_payload() == {
+        "coverage_kind": "company",
+        "ticker": "NVDA",
+        "display_name": "NVIDIA Corporation",
+    }
+
+    # Even if >3 hits occur and the 4th (truncated) hit is unreadable, suggestion is withheld.
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(ws_id=WS_1, name="NVDA 1", owner_id=USER_RICHARD, owner_name="R", owner_email=EMAIL_RICHARD, last_activity_at=NOW),
+            _ws_row(ws_id=WS_2, name="NVDA 2", owner_id=USER_RICHARD, owner_name="R", owner_email=EMAIL_RICHARD, last_activity_at=NOW - timedelta(hours=1)),
+            _ws_row(ws_id=WS_3, name="NVDA 3", owner_id=USER_RICHARD, owner_name="R", owner_email=EMAIL_RICHARD, last_activity_at=NOW - timedelta(hours=2)),
+            _ws_row(ws_id=WS_4, name="NVDA 4 Private", owner_id=USER_CY, owner_name="CY", owner_email=EMAIL_CY, last_activity_at=NOW - timedelta(hours=3)),
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_1, WS_2, WS_3})
+    _install_llm(
+        monkeypatch,
+        lambda **_kw: _ok_result(
+            DedupLlmResult(
+                matches=[
+                    DedupMatchItem(id="c1", confidence="high", reason="same"),
+                    DedupMatchItem(id="c2", confidence="high", reason="same"),
+                    DedupMatchItem(id="c3", confidence="high", reason="same"),
+                    DedupMatchItem(id="c4", confidence="high", reason="same"),
+                ],
+                suggested_kind="company",
+                suggested_confidence="high",
+                suggested_ticker="NVDA",
+                suggested_display_name="NVIDIA Corporation",
+            )
+        ),
+    )
+    # Bypass per-batch cap in _parse_llm_payload by testing with >3 live hits across 2 batches:
+    # simulate 4 hits via _judge_candidates_with_llm returning 4 entries.
+    with patch.object(
+        dedup_mod,
+        "_judge_candidates_with_llm",
+        create_autospec(
+            dedup_mod._judge_candidates_with_llm,
+            side_effect=lambda **kw: (
+                kw["suggestion_out"].append(
+                    dedup_mod.DedupCoverageSuggestion(
+                        coverage_kind="company",
+                        ticker="NVDA",
+                        display_name="NVIDIA Corporation",
+                    )
+                ),
+                [(e, "high", "same") for e in kw["entries"]],
+            )[1],
+        ),
+    ):
+        dup_four = await find_existing_company_workspace(USER_CALLER, "Nvidia")
+    assert dup_four is not None
+    assert len(dup_four.matches) == 3
+    assert dup_four.suggestion is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_write_only_pat_cannot_auto_register_coverage_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R9 #2: A PAT with only workspace:write is refused by POST /coverage/units and skips auto-register."""
+    import src.dalton.access_tiers as access_tiers_mod
+    import src.dalton.coverage.units as cu_svc
+    from src.dalton.app import dalton_router
+    from src.server.app.workspaces import router as ws_router
+    from src.server.auth import pats
+    from src.server.dependencies.principal import Principal, get_principal
+
+    _enable_team_mode(monkeypatch)
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "is_internal_or_admin",
+        create_autospec(access_tiers_mod.is_internal_or_admin, return_value=True),
+    )
+    reg_spy = create_autospec(cu_svc.register_coverage_unit)
+    monkeypatch.setattr(cu_svc, "register_coverage_unit", reg_spy)
+
+    # 1. Same workspace:write PAT is rejected by POST /api/v1/dalton/coverage/units (real auth).
+    import src.dalton.auth as dalton_auth_mod
+
+    monkeypatch.setattr(
+        dalton_auth_mod,
+        "_ensure_dalton_auth_ready",
+        create_autospec(dalton_auth_mod._ensure_dalton_auth_ready, return_value=None),
+    )
+    monkeypatch.setattr(
+        pats,
+        "is_pat",
+        create_autospec(pats.is_pat, side_effect=lambda tok: tok.startswith("la_pat_")),
+    )
+    monkeypatch.setattr(
+        pats,
+        "verify_pat",
+        create_autospec(
+            pats.verify_pat,
+            return_value=pats.PatPrincipal(USER_CALLER, ("workspace:write",)),
+        ),
+    )
+    monkeypatch.setattr(
+        "src.server.dependencies.principal.admit_caller",
+        create_autospec(
+            __import__("src.server.utils.api", fromlist=["admit_caller"]).admit_caller,
+            return_value=None,
+        ),
+    )
+    monkeypatch.setattr(
+        "src.server.dependencies.principal.note_caller",
+        create_autospec(
+            __import__("src.server.utils.api", fromlist=["note_caller"]).note_caller,
+            return_value=None,
+        ),
+    )
+    monkeypatch.setattr(
+        "src.server.dependencies.principal.refuse_holder_credential",
+        create_autospec(
+            __import__("src.server.utils.api", fromlist=["refuse_holder_credential"]).refuse_holder_credential,
+            return_value=None,
+        ),
+    )
+
+    real_dalton_app = create_test_app(dalton_router)
+    real_dalton_app.dependency_overrides.clear()
+    async with AsyncClient(
+        transport=ASGITransport(app=real_dalton_app), base_url="http://test"
+    ) as client:
+        cu_resp = await client.post(
+            "/api/v1/dalton/coverage/units",
+            headers={"Authorization": "Bearer la_pat_only_ws_write"},
+            json={"kind": "company", "slug": "nvda", "ticker": "NVDA", "display_name": "NVIDIA"},
+        )
+    assert cu_resp.status_code in (401, 403)
+    reg_spy.assert_not_awaited()
+
+    # 2. Same workspace:write PAT creates workspace (201) via POST /api/v1/workspaces,
+    #    does NOT register coverage unit, and returns structured token_not_allowed warning.
+    app = create_test_app(ws_router)
+    app.dependency_overrides[get_principal] = lambda: Principal(
+        user_id=USER_CALLER, auth="pat", scopes=("workspace:write",)
+    )
+    mgr = create_autospec(WorkspaceManager, instance=True)
+    mgr.create_workspace.return_value = {
+        "workspace_id": WS_5,
+        "user_id": USER_CALLER,
+        "name": "Nvidia",
+        "description": None,
+        "sandbox_id": None,
+        "computer_id": None,
+        "status": "creating",
+        "created_at": NOW,
+        "updated_at": NOW,
+        "config": {},
+    }
+    dedup_mock = create_autospec(_REAL_FIND_DEDUP, return_value=None)
+    with (
+        patch("src.dalton.coverage.dedup.find_existing_company_workspace", dedup_mock),
+        patch(
+            "src.server.app.workspaces.WorkspaceManager.get_instance",
+            create_autospec(WorkspaceManager.get_instance, return_value=mgr),
+        ),
+        patch(
+            "src.server.services.platform_client.platform_gating_active",
+            return_value=False,
+        ),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            ws_resp = await client.post(
+                "/api/v1/workspaces",
+                json={
+                    "name": "Nvidia",
+                    "coverage_kind": "company",
+                    "ticker": "NVDA",
+                },
+            )
+    assert ws_resp.status_code == 201
+    body = ws_resp.json()
+    assert body["workspace_id"] == WS_5
+    assert body["coverage_unit"] is None
+    assert body["coverage_unit_warning_detail"] == {
+        "code": "token_not_allowed",
+        "params": {},
+    }
+    assert "令牌" in (body["coverage_unit_warning"] or "")
+    reg_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dedup_ignores_holder_and_external_custom_models_with_same_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R9 #3: Dedup passes ignore_custom_models=True and resolves built-in provider even if holder shadows model name."""
+    from ptc_agent.config.agent import CredentialSource, LLMConfig
+    from src.llms.llm import LLM as LLMFactory
+    from src.server.services.llm import clients as llm_clients
+    from src.server.services.llm import config as llm_config
+    from src.server.services.llm import user_models as user_models_mod
+    from src.server.services.llm.service import LLMService
+    from src.server.services.policy import Policy
+
+    # 1. Verify dedup passes ignore_custom_models=True to dalton_complete.
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="NVDA Research",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            )
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_2})
+    captured_calls: list[dict[str, Any]] = []
+    _install_llm(
+        monkeypatch,
+        lambda **_kw: _ok_result(DedupLlmResult(matches=[])),
+        captured_calls=captured_calls,
+    )
+    await find_existing_company_workspace(USER_CALLER, "SomeRandomTopic")
+    assert len(captured_calls) >= 1
+    assert captured_calls[0].get("ignore_custom_models") is True
+
+    # 2. Verify client resolution with holder having a same-named custom_models entry
+    #    pointing to a custom provider uses built-in catalog when ignore_custom_models=True,
+    #    while default (ignore_custom_models=False) still uses the custom entry.
+    mc = LLMFactory.get_model_config()
+    builtin_model = next(
+        name
+        for name in ("gpt-6.1-terra", "gpt-6.2-astra", "claude-sonnet-4-6")
+        if mc.get_model_config(name)
+    )
+    builtin_provider = mc.get_model_config(builtin_model)["provider"]
+    holder_pref = {
+        "custom_models": [
+            {
+                "name": builtin_model,
+                "model_id": "hijacked-model",
+                "provider": "my-custom-gw",
+            }
+        ],
+        "custom_providers": [
+            {
+                "name": "my-custom-gw",
+                "parent_provider": "openai",
+                "use_response_api": False,
+            }
+        ],
+    }
+
+    monkeypatch.setattr(
+        user_models_mod,
+        "get_model_preference",
+        create_autospec(user_models_mod.get_model_preference, return_value=holder_pref),
+    )
+    monkeypatch.setattr(
+        llm_clients,
+        "require_policy",
+        create_autospec(llm_clients.require_policy, return_value=Policy()),
+    )
+    monkeypatch.setattr(
+        llm_config,
+        "require_policy",
+        create_autospec(llm_config.require_policy, return_value=Policy()),
+    )
+    monkeypatch.setattr(
+        llm_config,
+        "load_user_context",
+        create_autospec(llm_config.load_user_context, return_value=None),
+    )
+    monkeypatch.setattr(
+        llm_config,
+        "gate_capabilities",
+        create_autospec(llm_config.gate_capabilities, return_value=None),
+    )
+    monkeypatch.setattr(
+        "src.server.services.platform_client.platform_gating_active",
+        lambda: False,
+    )
+
+    seen_byok_providers: list[str] = []
+
+    async def _fake_walk(user_id: str, provider: str, mc_arg: Any, **_kw: Any):
+        seen_byok_providers.append(provider)
+        return ({"api_key": "sk-test"}, provider)
+
+    monkeypatch.setattr(
+        llm_clients,
+        "walk_byok_candidates",
+        create_autospec(llm_clients.walk_byok_candidates, side_effect=_fake_walk),
+    )
+    monkeypatch.setattr(
+        llm_clients,
+        "stored_key",
+        create_autospec(llm_clients.stored_key, return_value={"api_key": "sk-custom"}),
+    )
+    monkeypatch.setattr(
+        llm_clients,
+        "resolve_oauth_llm_client",
+        create_autospec(llm_clients.resolve_oauth_llm_client, return_value=None),
+    )
+    monkeypatch.setattr(
+        "src.server.database.api_keys.get_byok_configs_for_providers",
+        create_autospec(
+            __import__("src.server.database.api_keys", fromlist=["get_byok_configs_for_providers"]).get_byok_configs_for_providers,
+            return_value={},
+        ),
+    )
+
+    from langchain_core.language_models.chat_models import BaseChatModel
+
+    fake_client = create_autospec(BaseChatModel, instance=True)
+    fake_client.metadata = {}
+    fake_client.model_copy.return_value = fake_client
+    create_llm_spy = create_autospec(
+        __import__("src.llms.llm", fromlist=["create_llm"]).create_llm,
+        return_value=fake_client,
+    )
+    create_custom_spy = create_autospec(
+        __import__("src.llms.llm", fromlist=["create_llm_from_custom"]).create_llm_from_custom,
+        return_value=fake_client,
+    )
+    monkeypatch.setattr("src.llms.llm.create_llm", create_llm_spy)
+    monkeypatch.setattr("src.llms.llm.create_llm_from_custom", create_custom_spy)
+
+    # Direct resolve_model_client with ignore_custom_models=True -> built-in provider, not custom!
+    rc_ignored = await llm_clients.resolve_model_client(
+        "holder-uid",
+        builtin_model,
+        is_byok=True,
+        ignore_custom_models=True,
+    )
+    assert rc_ignored.model_source == user_models_mod.ModelSource.SYSTEM
+    assert rc_ignored.credential_source == CredentialSource.BYOK
+    assert seen_byok_providers[-1] == builtin_provider
+    create_custom_spy.assert_not_called()
+    assert create_llm_spy.call_count == 1
+
+    # Through LLMService.complete(..., ignore_custom_models=True) -> also uses built-in catalog!
+    from ptc_agent.config import load_from_files
+
+    agent_cfg = (await load_from_files()).model_copy(
+        update={"llm": LLMConfig(name=builtin_model, background=builtin_model)}
+    )
+    svc = LLMService(agent_config=agent_cfg)
+    monkeypatch.setattr(
+        "src.server.services.llm.service.make_api_call",
+        create_autospec(
+            __import__("src.llms.api_call", fromlist=["make_api_call"]).make_api_call,
+            return_value=("ok", {}),
+        ),
+    )
+    await svc.complete(
+        user_id="holder-uid",
+        user_prompt="hi",
+        request_model=builtin_model,
+        is_byok=True,
+        ignore_custom_models=True,
+    )
+    assert seen_byok_providers[-1] == builtin_provider
+    create_custom_spy.assert_not_called()
+
+    # Default (ignore_custom_models=False) still respects holder's custom model!
+    rc_default = await llm_clients.resolve_model_client(
+        "holder-uid",
+        builtin_model,
+        is_byok=True,
+    )
+    assert rc_default.model_source == user_models_mod.ModelSource.CUSTOM
+    assert create_custom_spy.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_coverage_suggestion_confirmation_when_no_hits_web_and_cos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R9 #4: No duplicate hits + high-confidence suggestion triggers confirmation when Type is Other."""
+    import src.dalton.access_tiers as access_tiers_mod
+    import src.dalton.coverage.units as cu_svc
+    import src.tools.secretary.tools as sec_tools
+    from src.server.app.workspaces import router
+
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_1,
+                name="Apple Research",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            )
+        ],
+    )
+    _install_llm(
+        monkeypatch,
+        lambda **_kw: _ok_result(
+            DedupLlmResult(
+                matches=[],
+                suggested_kind="company",
+                suggested_confidence="high",
+                suggested_ticker="NVDA",
+                suggested_display_name="NVIDIA Corporation",
+            )
+        ),
+    )
+
+    dup = await find_existing_company_workspace(USER_CALLER, "Nvidia")
+    assert dup is not None
+    assert dup.matches == ()
+    assert not dup.has_matches
+    assert dup.suggestion_payload() == {
+        "coverage_kind": "company",
+        "ticker": "NVDA",
+        "display_name": "NVIDIA Corporation",
+    }
+
+    # REST: coverage_kind omitted / "none" -> 409 coverage_suggestion without creating workspace.
+    app = create_test_app(router)
+    mgr = create_autospec(WorkspaceManager, instance=True)
+    mgr.create_workspace.return_value = {
+        "workspace_id": WS_5,
+        "user_id": "test-user-123",
+        "name": "Nvidia",
+        "description": None,
+        "sandbox_id": None,
+        "computer_id": None,
+        "status": "creating",
+        "created_at": NOW,
+        "updated_at": NOW,
+        "config": {},
+    }
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "is_internal_or_admin",
+        create_autospec(access_tiers_mod.is_internal_or_admin, return_value=True),
+    )
+    reg_mock = create_autospec(
+        cu_svc.register_coverage_unit,
+        return_value={
+            "unit_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            "kind": "company",
+            "ticker": "NVDA",
+            "workspace_id": WS_5,
+            "lead_analyst_user_id": "test-user-123",
+        },
+    )
+    monkeypatch.setattr(cu_svc, "register_coverage_unit", reg_mock)
+
+    dedup_mock = create_autospec(_REAL_FIND_DEDUP, return_value=dup)
+    with (
+        patch("src.dalton.coverage.dedup.find_existing_company_workspace", dedup_mock),
+        patch(
+            "src.server.app.workspaces.WorkspaceManager.get_instance",
+            create_autospec(WorkspaceManager.get_instance, return_value=mgr),
+        ),
+        patch(
+            "src.server.services.platform_client.platform_gating_active",
+            return_value=False,
+        ),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp_suggest = await client.post("/api/v1/workspaces", json={"name": "Nvidia"})
+            assert resp_suggest.status_code == 409
+            assert resp_suggest.json()["detail"]["code"] == "coverage_suggestion"
+            assert resp_suggest.json()["detail"]["suggestion"] == {
+                "coverage_kind": "company",
+                "ticker": "NVDA",
+                "display_name": "NVIDIA Corporation",
+            }
+            mgr.create_workspace.assert_not_awaited()
+
+            # Retry with skip_coverage_suggestion=True -> 201 without registering.
+            resp_skip = await client.post(
+                "/api/v1/workspaces",
+                json={"name": "Nvidia", "skip_coverage_suggestion": True},
+            )
+            assert resp_skip.status_code == 201
+            assert resp_skip.json()["coverage_unit"] is None
+            reg_mock.assert_not_awaited()
+
+            # Submitting directly with coverage_kind="company" -> 201 without prompting again.
+            resp_direct = await client.post(
+                "/api/v1/workspaces",
+                json={"name": "Nvidia", "coverage_kind": "company", "ticker": "NVDA"},
+            )
+            assert resp_direct.status_code == 201
+            assert resp_direct.json()["coverage_unit"]["ticker"] == "NVDA"
+            reg_mock.assert_awaited_once()
+
+    # CoS prompt mentions coverage_suggestion & skip_coverage_suggestion, and tool returns coverage_suggestion.
+    prompt = get_loader().get_system_prompt(
+        current_time="2026-11-21 12:00 ET",
+        subagent_summary="",
+        role="chief_of_staff",
+    )
+    assert "coverage_suggestion" in prompt
+    assert "skip_coverage_suggestion" in prompt
+
+    hitl_spy = create_autospec(hitl_confirm, return_value=(True, "ok"))
+    monkeypatch.setattr(sec_tools, "hitl_confirm", hitl_spy)
+    monkeypatch.setattr(
+        sec_tools,
+        "duplicate_workspace",
+        create_autospec(sec_tools.duplicate_workspace, return_value=(None, True)),
+    )
+    mgr.resolve_binding.return_value = None
+    reg_mock.reset_mock()
+    with (
+        patch("src.dalton.coverage.dedup.find_existing_company_workspace", dedup_mock),
+        patch(
+            "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+            create_autospec(WorkspaceManager.get_instance, return_value=mgr),
+        ),
+    ):
+        cos_suggest = await chief_of_staff_workspaces.ainvoke(
+            {
+                "name": "manage_workspaces",
+                "args": {"action": "create", "name": "Nvidia", "state": {}},
+                "id": "call-cos-suggest",
+                "type": "tool_call",
+            },
+            config={"configurable": {"user_id": USER_CALLER}},
+        )
+        cos_payload = json.loads(cos_suggest.update["messages"][0].content)
+        assert cos_payload["success"] is False
+        assert cos_payload["code"] == "coverage_suggestion"
+        assert cos_payload["suggestion"]["ticker"] == "NVDA"
+        hitl_spy.assert_not_called()
+
+        cos_skip = await chief_of_staff_workspaces.ainvoke(
+            {
+                "name": "manage_workspaces",
+                "args": {
+                    "action": "create",
+                    "name": "Nvidia",
+                    "skip_coverage_suggestion": True,
+                    "state": {},
+                },
+                "id": "call-cos-skip",
+                "type": "tool_call",
+            },
+            config={"configurable": {"user_id": USER_CALLER}},
+        )
+        cos_skip_payload = json.loads(cos_skip.update["messages"][0].content)
+        assert cos_skip_payload["success"] is True
+        reg_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_overlong_ticker_or_display_name_creates_workspace_with_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R9 #5 & #7: Overlong ticker/display_name does not 422; workspace creates (201) with structured warning."""
+    import src.dalton.access_tiers as access_tiers_mod
+    import src.dalton.coverage.units as cu_svc
+    from src.server.app.workspaces import router
+
+    _enable_team_mode(monkeypatch)
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "is_internal_or_admin",
+        create_autospec(access_tiers_mod.is_internal_or_admin, return_value=True),
+    )
+    reg_spy = create_autospec(cu_svc.register_coverage_unit)
+    monkeypatch.setattr(cu_svc, "register_coverage_unit", reg_spy)
+
+    app = create_test_app(router)
+    mgr = create_autospec(WorkspaceManager, instance=True)
+    mgr.create_workspace.return_value = {
+        "workspace_id": WS_5,
+        "user_id": "test-user-123",
+        "name": "LongCo",
+        "description": None,
+        "sandbox_id": None,
+        "computer_id": None,
+        "status": "creating",
+        "created_at": NOW,
+        "updated_at": NOW,
+        "config": {},
+    }
+    dedup_mock = create_autospec(_REAL_FIND_DEDUP, return_value=None)
+    with (
+        patch("src.dalton.coverage.dedup.find_existing_company_workspace", dedup_mock),
+        patch(
+            "src.server.app.workspaces.WorkspaceManager.get_instance",
+            create_autospec(WorkspaceManager.get_instance, return_value=mgr),
+        ),
+        patch(
+            "src.server.services.platform_client.platform_gating_active",
+            return_value=False,
+        ),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp_ticker = await client.post(
+                "/api/v1/workspaces",
+                json={
+                    "name": "LongCo",
+                    "coverage_kind": "company",
+                    "ticker": "A" * 33,
+                },
+            )
+            assert resp_ticker.status_code == 201
+            body_ticker = resp_ticker.json()
+            assert body_ticker["coverage_unit"] is None
+            assert body_ticker["coverage_unit_warning_detail"] == {
+                "code": "ticker_too_long",
+                "params": {"max_length": 32},
+            }
+
+            resp_name = await client.post(
+                "/api/v1/workspaces",
+                json={
+                    "name": "LongCo",
+                    "coverage_kind": "sector",
+                    "display_name": "B" * 121,
+                },
+            )
+            assert resp_name.status_code == 201
+            body_name = resp_name.json()
+            assert body_name["coverage_unit"] is None
+            assert body_name["coverage_unit_warning_detail"] == {
+                "code": "display_name_too_long",
+                "params": {"max_length": 120},
+            }
+    reg_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_probe_script_refreshes_drops_stale_and_caps_at_three(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R9 #6: probe_workspace_dedup.py refreshes live hits, drops deleted/stale hits, and caps at 3."""
+    from scripts.dalton.ops.probe_workspace_dedup import probe_names
+
+    _enable_team_mode(monkeypatch)
+    ws_deleted = "66666666-6666-4666-8666-666666666666"
+    initial_ws = [
+        _ws_row(ws_id=WS_1, name="Co 1", owner_id=USER_RICHARD, owner_name="R", owner_email=EMAIL_RICHARD, last_activity_at=NOW),
+        _ws_row(ws_id=ws_deleted, name="Co Deleted", owner_id=USER_RICHARD, owner_name="R", owner_email=EMAIL_RICHARD, last_activity_at=NOW - timedelta(minutes=1)),
+        _ws_row(ws_id=WS_2, name="Co 2", owner_id=USER_RICHARD, owner_name="R", owner_email=EMAIL_RICHARD, last_activity_at=NOW - timedelta(minutes=2)),
+        _ws_row(ws_id=WS_3, name="Co 3", owner_id=USER_RICHARD, owner_name="R", owner_email=EMAIL_RICHARD, last_activity_at=NOW - timedelta(minutes=3)),
+        _ws_row(ws_id=WS_4, name="Co 4", owner_id=USER_RICHARD, owner_name="R", owner_email=EMAIL_RICHARD, last_activity_at=NOW - timedelta(minutes=4)),
+    ]
+    # Second query (live refresh) sees ws_deleted as status='deleted'.
+    refreshed_ws = [
+        initial_ws[0],
+        {**initial_ws[1], "status": "deleted"},
+        initial_ws[2],
+        initial_ws[3],
+        initial_ws[4],
+    ]
+    _install_db(
+        monkeypatch,
+        ws_rows_sequence=[initial_ws, refreshed_ws],
+    )
+    _install_read_access(
+        monkeypatch,
+        web_readable={WS_1, WS_2, WS_3, WS_4},
+    )
+
+    class _DummyPool:
+        closed = False
+
+        async def open(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "src.server.database.pool.get_or_create_pool",
+        lambda: _DummyPool(),
+    )
+    monkeypatch.setattr(
+        "src.server.database.pool.get_db_connection",
+        dedup_mod.get_db_connection,
+    )
+
+    async def _fake_judge(**kw: Any) -> list[tuple[Any, str, str]]:
+        return [(e, "high", "same") for e in kw["entries"]]
+
+    monkeypatch.setattr(
+        dedup_mod,
+        "_judge_candidates_with_llm",
+        create_autospec(dedup_mod._judge_candidates_with_llm, side_effect=_fake_judge),
+    )
+
+    report = await probe_names(["Co"], user_id=USER_CALLER, channel="web")
+    matches = report["results"][0]["matches"]
+    assert len(matches) == 3
+    returned_ids = [m["candidate"]["workspace_id"] for m in matches]
+    assert ws_deleted not in returned_ids
+    assert returned_ids == [WS_1, WS_2, WS_3]
+
+
+@pytest.mark.asyncio
+async def test_auto_register_warning_returns_structured_code_and_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R9 #7: Auto-registration failure populates structured coverage_unit_warning_detail {code, params}."""
+    import src.dalton.access_tiers as access_tiers_mod
+    import src.dalton.coverage.units as cu_svc
+    from src.dalton.database.coverage_units import CoverageUnitConflictError
+    from src.server.app.workspaces import router
+
+    _enable_team_mode(monkeypatch)
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "is_internal_or_admin",
+        create_autospec(access_tiers_mod.is_internal_or_admin, return_value=True),
+    )
+    monkeypatch.setattr(
+        cu_svc,
+        "register_coverage_unit",
+        create_autospec(
+            cu_svc.register_coverage_unit,
+            side_effect=CoverageUnitConflictError(
+                "coverage unit ticker already registered for an active company",
+                conflict={"unit_id": "existing-u", "lead_analyst_user_id": USER_RICHARD},
+            ),
+        ),
+    )
+
+    app = create_test_app(router)
+    mgr = create_autospec(WorkspaceManager, instance=True)
+    mgr.create_workspace.return_value = {
+        "workspace_id": WS_5,
+        "user_id": "test-user-123",
+        "name": "NVDA-2",
+        "description": None,
+        "sandbox_id": None,
+        "computer_id": None,
+        "status": "creating",
+        "created_at": NOW,
+        "updated_at": NOW,
+        "config": {},
+    }
+    dedup_mock = create_autospec(_REAL_FIND_DEDUP, return_value=None)
+    with (
+        patch("src.dalton.coverage.dedup.find_existing_company_workspace", dedup_mock),
+        patch(
+            "src.server.app.workspaces.WorkspaceManager.get_instance",
+            create_autospec(WorkspaceManager.get_instance, return_value=mgr),
+        ),
+        patch(
+            "src.server.services.platform_client.platform_gating_active",
+            return_value=False,
+        ),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.post(
+                "/api/v1/workspaces",
+                json={
+                    "name": "NVDA-2",
+                    "allow_duplicate_company": True,
+                    "coverage_kind": "company",
+                    "ticker": "nvda",
+                },
+            )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["coverage_unit_warning_detail"] == {
+        "code": "ticker_conflict",
+        "params": {"ticker": "NVDA"},
+    }

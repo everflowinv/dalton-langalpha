@@ -21,6 +21,9 @@ const INPUT_STYLE: React.CSSProperties = {
   color: 'var(--color-text-primary)',
 };
 
+const MAX_TICKER_LEN = 32;
+const MAX_DISPLAY_NAME_LEN = 120;
+
 export function CoverageUnitFields({
   coverageKind,
   ticker,
@@ -35,6 +38,8 @@ export function CoverageUnitFields({
   const typeLabelId = useId();
   const tickerId = useId();
   const displayNameId = useId();
+  const tickerTooLong = ticker.trim().length > MAX_TICKER_LEN;
+  const displayNameTooLong = displayName.trim().length > MAX_DISPLAY_NAME_LEN;
 
   return (
     <>
@@ -83,6 +88,15 @@ export function CoverageUnitFields({
               className="w-full"
               style={INPUT_STYLE}
             />
+            <div className="cwm-field-hint" style={tickerTooLong ? { color: 'var(--color-danger, #ef4444)' } : undefined}>
+              {tickerTooLong
+                ? t(
+                    'workspace.coverage.tickerLengthExceeded',
+                    'Max {{max}} characters (currently {{count}}) — workspace will be created without registering.',
+                    { max: MAX_TICKER_LEN, count: ticker.trim().length },
+                  )
+                : t('workspace.coverage.tickerLengthHint', 'Max {{max}} characters', { max: MAX_TICKER_LEN })}
+            </div>
           </div>
           <div className="cwm-field">
             <label className="cwm-label" htmlFor={displayNameId}>
@@ -102,6 +116,15 @@ export function CoverageUnitFields({
               className="w-full"
               style={INPUT_STYLE}
             />
+            <div className="cwm-field-hint" style={displayNameTooLong ? { color: 'var(--color-danger, #ef4444)' } : undefined}>
+              {displayNameTooLong
+                ? t(
+                    'workspace.coverage.displayNameLengthExceeded',
+                    'Max {{max}} characters (currently {{count}}) — workspace will be created without registering.',
+                    { max: MAX_DISPLAY_NAME_LEN, count: displayName.trim().length },
+                  )
+                : t('workspace.coverage.displayNameLengthHint', 'Max {{max}} characters', { max: MAX_DISPLAY_NAME_LEN })}
+            </div>
           </div>
         </>
       )}
@@ -125,6 +148,15 @@ export function CoverageUnitFields({
             className="w-full"
             style={INPUT_STYLE}
           />
+          <div className="cwm-field-hint" style={displayNameTooLong ? { color: 'var(--color-danger, #ef4444)' } : undefined}>
+            {displayNameTooLong
+              ? t(
+                  'workspace.coverage.displayNameLengthExceeded',
+                  'Max {{max}} characters (currently {{count}}) — workspace will be created without registering.',
+                  { max: MAX_DISPLAY_NAME_LEN, count: displayName.trim().length },
+                )
+              : t('workspace.coverage.displayNameLengthHint', 'Max {{max}} characters', { max: MAX_DISPLAY_NAME_LEN })}
+          </div>
         </div>
       )}
     </>

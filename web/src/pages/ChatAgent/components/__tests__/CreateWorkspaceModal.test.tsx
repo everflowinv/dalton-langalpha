@@ -27,12 +27,17 @@ vi.mock('../../utils/api', () => ({
     (err as { message?: string })?.message ?? 'Request failed',
 }));
 
-// DALTON-HOOK(workspace-dedup): mock toast for coverage registration warning
+// DALTON-HOOK(workspace-dedup): mock toast and useDaltonCoverageUnits gate for coverage registration UX
 vi.mock('@/components/ui/use-toast', () => ({
   toast: vi.fn(),
 }));
+vi.mock('@/lib/dalton/coverage', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/dalton/coverage')>()),
+  useDaltonCoverageUnits: vi.fn(),
+}));
 
 import { toast } from '@/components/ui/use-toast';
+import { useDaltonCoverageUnits } from '@/lib/dalton/coverage';
 import { getComputerProviders, getComputers, startWorkspace, uploadWorkspaceFile } from '../../utils/api';
 import { openComputersPanel } from '../../hooks/computerPanelStore';
 import CreateWorkspaceModal from '../CreateWorkspaceModal';
@@ -85,6 +90,11 @@ beforeEach(() => {
   vi.mocked(startWorkspace).mockResolvedValue({ workspace_id: LIVE_CREATED.workspace_id, status: 'running' });
   mockGetComputers.mockResolvedValue({ computers: [PRIMARY], total: 1 });
   mockProviders.mockResolvedValue({ providers: [{ kind: 'daytona', is_default: true, allowed: null }] });
+  // DALTON-HOOK(workspace-dedup): default to coverage units enabled for internal team member
+  vi.mocked(useDaltonCoverageUnits).mockReturnValue({
+    data: { enabled: true, units: [], unclassified: [] },
+    isError: false,
+  } as unknown as ReturnType<typeof useDaltonCoverageUnits>);
 });
 
 /** The route the page is on, for a way out that leaves it. */
@@ -750,5 +760,188 @@ describe('CreateWorkspaceModal, duplicate company workspace', () => {
     } finally {
       await i18n.changeLanguage('en-US');
     }
+  });
+
+  // DALTON-HOOK(workspace-dedup): 409 coverage_suggestion confirmation when Type is Other (Register & Create vs Create without registering)
+  it('prompts on 409 coverage_suggestion with prefilled fields and supports Register & Create or Create without registering', async () => {
+    const user = userEvent.setup();
+    const suggestionErr = Object.assign(new Error('Request failed with status code 409'), {
+      response: {
+        status: 409,
+        data: {
+          detail: {
+            code: 'coverage_suggestion',
+            message: '「Nvidia」识别为公司（代码 NVDA）',
+            suggestion: {
+              coverage_kind: 'company',
+              ticker: 'NVDA',
+              display_name: 'NVIDIA Corporation',
+            },
+          },
+        },
+      },
+    });
+
+    // 1. Register & Create path (allows editing prefilled fields before confirming)
+    const onCreateRegister = vi
+      .fn()
+      .mockRejectedValueOnce(suggestionErr)
+      .mockResolvedValueOnce(LIVE_CREATED);
+    const first = setup(onCreateRegister);
+
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'Nvidia');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    const card = await screen.findByRole('alert');
+    expect(card).toHaveTextContent('"Nvidia" looks like a company (NVDA).');
+    expect(screen.getByRole('button', { name: 'Company' })).toHaveAttribute('aria-pressed', 'true');
+    const tickerInput = screen.getByLabelText(/ticker/i) as HTMLInputElement;
+    expect(tickerInput.value).toBe('NVDA');
+    await user.clear(tickerInput);
+    await user.type(tickerInput, 'NVDA.US');
+    await user.click(within(card).getByRole('button', { name: 'Register & Create' }));
+
+    await waitFor(() =>
+      expect(onCreateRegister).toHaveBeenLastCalledWith({
+        name: 'Nvidia',
+        description: '',
+        coverageKind: 'company',
+        ticker: 'NVDA.US',
+        displayName: 'NVIDIA Corporation',
+      }),
+    );
+    await waitFor(() => expect(first.onComplete).toHaveBeenCalledWith(LIVE_CREATED));
+
+    // 2. Create without registering path (submits skipCoverageSuggestion: true and omits coverage fields)
+    const { unmount } = renderWithProviders(<></>);
+    unmount();
+    vi.clearAllMocks();
+    mockGetComputers.mockResolvedValue({ computers: [PRIMARY], total: 1 });
+    const onCreateSkip = vi
+      .fn()
+      .mockRejectedValueOnce(suggestionErr)
+      .mockResolvedValueOnce(LIVE_CREATED);
+    const second = setup(onCreateSkip);
+
+    const nameInputs = screen.getAllByPlaceholderText(/enter workspace name/i);
+    await user.type(nameInputs[nameInputs.length - 1], 'Nvidia');
+    const createBtns = screen.getAllByRole('button', { name: /^create$/i });
+    await user.click(createBtns[createBtns.length - 1]);
+
+    const alerts = await screen.findAllByRole('alert');
+    const latestCard = alerts[alerts.length - 1];
+    await user.click(within(latestCard).getByRole('button', { name: 'Create without registering' }));
+
+    await waitFor(() =>
+      expect(onCreateSkip).toHaveBeenLastCalledWith({
+        name: 'Nvidia',
+        description: '',
+        skipCoverageSuggestion: true,
+      }),
+    );
+    await waitFor(() => expect(second.onComplete).toHaveBeenCalledWith(LIVE_CREATED));
+  });
+
+  // DALTON-HOOK(workspace-dedup): length hints on ticker/display_name without blocking submission, and bilingual structured warning rendering
+  it('shows length hints without blocking long ticker submit, and renders structured coverage warnings in English and Chinese', async () => {
+    const user = userEvent.setup();
+    const longTicker = 'A'.repeat(33);
+    const onCreateEn = vi.fn().mockResolvedValue({
+      ...LIVE_CREATED,
+      coverage_unit_warning: '服务端中文文案不应在英文界面显示',
+      coverage_unit_warning_detail: {
+        code: 'ticker_too_long',
+        params: { max_length: 32 },
+      },
+    });
+    setup(onCreateEn);
+
+    await user.click(screen.getByRole('button', { name: 'Company' }));
+    expect(screen.getByText('Max 32 characters')).toBeInTheDocument();
+    expect(screen.getByText('Max 120 characters')).toBeInTheDocument();
+
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'LongCo');
+    await user.type(screen.getByLabelText(/ticker/i), longTicker);
+    expect(screen.getByText(/Max 32 characters \(currently 33\)/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+    await waitFor(() =>
+      expect(onCreateEn).toHaveBeenCalledWith({
+        name: 'LongCo',
+        description: '',
+        coverageKind: 'company',
+        ticker: longTicker,
+      }),
+    );
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Workspace created, coverage unit not registered',
+        description:
+          'Ticker cannot exceed 32 characters. The workspace was created without auto-registering a coverage unit.',
+      }),
+    );
+
+    // Chinese locale renders Chinese copy from structured code + params
+    const { default: i18n } = await import('@/i18n');
+    await i18n.changeLanguage('zh-CN');
+    try {
+      vi.clearAllMocks();
+      mockGetComputers.mockResolvedValue({ computers: [PRIMARY], total: 1 });
+      const onCreateZh = vi.fn().mockResolvedValue({
+        ...LIVE_CREATED,
+        coverage_unit_warning: 'fallback',
+        coverage_unit_warning_detail: {
+          code: 'ticker_conflict',
+          params: { ticker: 'NVDA' },
+        },
+      });
+      setup(onCreateZh);
+      const nameInputs = screen.getAllByPlaceholderText('输入工作区名称');
+      await user.type(nameInputs[nameInputs.length - 1], 'Nvidia');
+      const createBtns = screen.getAllByRole('button', { name: '创建' });
+      await user.click(createBtns[createBtns.length - 1]);
+
+      await waitFor(() =>
+        expect(toast).toHaveBeenCalledWith(
+          expect.objectContaining({
+            title: '工作区已创建，覆盖单元未登记',
+            description:
+              '股票代码 NVDA 已被其他覆盖单元登记，工作区已创建但未自动登记覆盖单元。',
+          }),
+        ),
+      );
+    } finally {
+      await i18n.changeLanguage('en-US');
+    }
+  });
+
+  // DALTON-HOOK(workspace-dedup): hides coverage fields for external members (isError) or when coverage_units disabled
+  it('hides coverage unit fields when coverage units are disabled or caller is external (isError)', async () => {
+    const user = userEvent.setup();
+    vi.mocked(useDaltonCoverageUnits).mockReturnValue({
+      data: { enabled: false, units: [], unclassified: [] },
+      isError: false,
+    } as unknown as ReturnType<typeof useDaltonCoverageUnits>);
+    const onCreateDisabled = vi.fn().mockResolvedValue(LIVE_CREATED);
+    setup(onCreateDisabled);
+
+    expect(screen.queryByRole('button', { name: 'Company' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Sector' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Other' })).not.toBeInTheDocument();
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'My Research');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+    await waitFor(() =>
+      expect(onCreateDisabled).toHaveBeenCalledWith({
+        name: 'My Research',
+        description: '',
+      }),
+    );
+
+    vi.mocked(useDaltonCoverageUnits).mockReturnValue({
+      data: undefined,
+      isError: true,
+    } as unknown as ReturnType<typeof useDaltonCoverageUnits>);
+    setup(vi.fn());
+    expect(screen.queryAllByRole('button', { name: 'Company' })).toHaveLength(0);
   });
 });

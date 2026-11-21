@@ -469,22 +469,125 @@ def _slugify_for_unit(raw: str, *, kind: str) -> str:
     return candidate
 
 
-def _format_auto_register_failure(exc: ValueError, *, ticker: str | None) -> str:
+AUTO_REGISTER_MAX_TICKER_LEN = 32
+AUTO_REGISTER_MAX_DISPLAY_NAME_LEN = 120
+
+
+async def authorize_coverage_unit_registration(caller: Any) -> str:
+    """Enforce the shared coverage-unit write gate for ``POST /coverage/units`` and workspace auto-registration.
+
+    Requires:
+    1. Dalton mode and ``coverage_units`` enabled (else HTTP 404);
+    2. First-party session or service identity (refuses scoped PAT / OAuth / computer tokens);
+    3. Non-empty user ID (else HTTP 401);
+    4. Internal or admin team member via ``is_internal_or_admin`` (else HTTP 403).
+    """
+    from fastapi import HTTPException
+    from src.dalton.access_tiers import is_internal_or_admin
+    from src.dalton.settings import get_dalton_settings, is_coverage_units_enabled
+    from src.server.dependencies.principal import Principal
+
+    if not get_dalton_settings().enabled or not is_coverage_units_enabled():
+        raise HTTPException(status_code=404, detail="coverage units disabled")
+    if isinstance(caller, Principal):
+        if not caller.unlimited:
+            raise HTTPException(
+                status_code=403,
+                detail="Scoped tokens cannot register team coverage units; use a first-party session.",
+            )
+        uid = str(caller.user_id or "").strip()
+    else:
+        uid = str(caller or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not await is_internal_or_admin(uid):
+        raise HTTPException(
+            status_code=403,
+            detail="Only internal or admin team members can access coverage units.",
+        )
+    return uid
+
+
+def _build_auto_register_warning(
+    code: str,
+    params: dict[str, Any] | None = None,
+    *,
+    fallback_exc: BaseException | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Build ``(human_fallback_message, {code, params})`` for auto-registration failures."""
+    clean_params: dict[str, Any] = dict(params or {})
+    detail: dict[str, Any] = {"code": code, "params": clean_params}
+    if code == "unsupported_kind":
+        kind_val = clean_params.get("kind", "")
+        return (
+            f"不支持的覆盖类型 {kind_val!r}，工作区已创建但未登记覆盖单元。",
+            detail,
+        )
+    if code == "feature_disabled":
+        return "覆盖单元功能未开启，工作区已创建但未登记覆盖单元。", detail
+    if code == "token_not_allowed":
+        return "当前访问令牌无权登记团队覆盖单元，工作区已创建但未自动登记。", detail
+    if code == "authentication_required":
+        return "未验证用户身份，工作区已创建但未自动登记覆盖单元。", detail
+    if code == "external_member_forbidden":
+        return "外部成员无权登记团队覆盖单元，工作区已创建但未自动登记。", detail
+    if code == "ticker_too_long":
+        max_len = clean_params.get("max_length", AUTO_REGISTER_MAX_TICKER_LEN)
+        return (
+            f"股票代码长度不能超过 {max_len} 个字符，工作区已创建但未自动登记覆盖单元。",
+            detail,
+        )
+    if code == "display_name_too_long":
+        max_len = clean_params.get("max_length", AUTO_REGISTER_MAX_DISPLAY_NAME_LEN)
+        return (
+            f"覆盖名称长度不能超过 {max_len} 个字符，工作区已创建但未自动登记覆盖单元。",
+            detail,
+        )
+    if code == "ticker_conflict":
+        ticker = clean_params.get("ticker")
+        t_label = f" {ticker}" if ticker else ""
+        return (
+            f"股票代码{t_label} 已被其他覆盖单元登记，工作区已创建但未自动登记覆盖单元。",
+            detail,
+        )
+    if code == "slug_conflict":
+        return "同名覆盖单元已被登记，工作区已创建但未自动登记覆盖单元。", detail
+    if code == "workspace_conflict":
+        return "该工作区已绑定其他覆盖单元。", detail
+    if code == "invalid_ticker":
+        return (
+            f"股票代码格式无效，工作区已创建但未自动登记覆盖单元"
+            f"{f'（{fallback_exc}）' if fallback_exc else ''}。",
+            detail,
+        )
+    if code == "sector_ticker_refused":
+        return "行业覆盖单元不能填写股票代码，工作区已创建但未自动登记覆盖单元。", detail
+    return (
+        f"覆盖单元自动登记未成功，工作区已创建但未绑定覆盖单元"
+        f"{f'（{fallback_exc}）' if fallback_exc else '，可在覆盖管理中手动登记'}。",
+        detail,
+    )
+
+
+def _format_auto_register_failure(
+    exc: ValueError, *, ticker: str | None
+) -> tuple[str, dict[str, Any]]:
     from src.dalton.coverage.unit_errors import classify_coverage_unit_error
 
     code, _ = classify_coverage_unit_error(exc)
     if code == "ticker_conflict":
-        t_label = f" {ticker}" if ticker else ""
-        return f"股票代码{t_label} 已被其他覆盖单元登记，工作区已创建但未自动登记覆盖单元。"
+        params = {"ticker": ticker} if ticker else {}
+        return _build_auto_register_warning("ticker_conflict", params, fallback_exc=exc)
     if code == "slug_conflict":
-        return "同名覆盖单元已被登记，工作区已创建但未自动登记覆盖单元。"
+        return _build_auto_register_warning("slug_conflict", fallback_exc=exc)
     if code == "workspace_conflict":
-        return "该工作区已绑定其他覆盖单元。"
+        return _build_auto_register_warning("workspace_conflict", fallback_exc=exc)
     if code == "invalid_ticker":
-        return f"股票代码格式无效，工作区已创建但未自动登记覆盖单元（{exc}）。"
+        params = {"ticker": ticker} if ticker else {}
+        return _build_auto_register_warning("invalid_ticker", params, fallback_exc=exc)
     if code == "sector_ticker_refused":
-        return "行业覆盖单元不能填写股票代码，工作区已创建但未自动登记覆盖单元。"
-    return f"覆盖单元自动登记未成功，工作区已创建但未绑定覆盖单元（{exc}）。"
+        return _build_auto_register_warning("sector_ticker_refused", fallback_exc=exc)
+    return _build_auto_register_warning("registration_failed", fallback_exc=exc)
 
 
 async def auto_register_workspace_coverage_unit(
@@ -495,33 +598,58 @@ async def auto_register_workspace_coverage_unit(
     coverage_kind: str | None,
     ticker: str | None = None,
     display_name: str | None = None,
+    principal: Any = None,
     conn: Any = None,
-) -> tuple[dict[str, Any] | None, str | None]:
+) -> tuple[dict[str, Any] | None, str | None, dict[str, Any] | None]:
     """Auto-register and bind a coverage unit after workspace creation.
 
-    Returns ``(unit_row, warning_message)``. Failures never raise or roll back
-    the newly created workspace: external members are refused without calling
-    ``register_coverage_unit``, and validation/conflict errors return a
-    non-fatal hint in ``warning_message``.
+    Returns ``(unit_row, warning_message, warning_detail)``. Enforces the same
+    authorization gate as ``POST /api/v1/dalton/coverage/units`` via
+    ``authorize_coverage_unit_registration``. Failures never raise or roll back
+    the newly created workspace: unauthorized callers, invalid/overlong fields,
+    and conflict errors return a non-fatal hint in ``warning_message`` +
+    structured ``warning_detail`` ``{"code": ..., "params": ...}``.
     """
+    from fastapi import HTTPException
+
     raw_kind = str(coverage_kind or "").strip().lower()
     if raw_kind in ("", "none", "other"):
-        return None, None
+        return None, None, None
     if raw_kind not in VALID_UNIT_KINDS:
-        return None, f"不支持的覆盖类型 {coverage_kind!r}，工作区已创建但未登记覆盖单元。"
+        msg, detail = _build_auto_register_warning(
+            "unsupported_kind", {"kind": str(coverage_kind)}
+        )
+        return None, msg, detail
 
-    from src.dalton.access_tiers import is_internal_or_admin
-    from src.dalton.settings import get_dalton_settings, is_coverage_units_enabled
-
-    if not get_dalton_settings().enabled or not is_coverage_units_enabled():
-        return None, "覆盖单元功能未开启，工作区已创建但未登记覆盖单元。"
-
-    uid = str(user_id or "").strip()
-    if not uid or not await is_internal_or_admin(uid):
-        return None, "外部成员无权登记团队覆盖单元，工作区已创建但未自动登记。"
+    try:
+        uid = await authorize_coverage_unit_registration(
+            principal if principal is not None else user_id
+        )
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            msg, detail = _build_auto_register_warning("feature_disabled")
+        elif exc.status_code == 401:
+            msg, detail = _build_auto_register_warning("authentication_required")
+        elif "Scoped tokens" in str(exc.detail):
+            msg, detail = _build_auto_register_warning("token_not_allowed")
+        else:
+            msg, detail = _build_auto_register_warning("external_member_forbidden")
+        return None, msg, detail
 
     eff_display_name = str(display_name or "").strip() or str(workspace_name or "").strip()
     eff_ticker = str(ticker or "").strip() or None
+
+    if eff_ticker and len(eff_ticker) > AUTO_REGISTER_MAX_TICKER_LEN:
+        msg, detail = _build_auto_register_warning(
+            "ticker_too_long", {"max_length": AUTO_REGISTER_MAX_TICKER_LEN}
+        )
+        return None, msg, detail
+    if len(eff_display_name) > AUTO_REGISTER_MAX_DISPLAY_NAME_LEN:
+        msg, detail = _build_auto_register_warning(
+            "display_name_too_long",
+            {"max_length": AUTO_REGISTER_MAX_DISPLAY_NAME_LEN},
+        )
+        return None, msg, detail
 
     try:
         if raw_kind == "company" and eff_ticker:
@@ -544,18 +672,20 @@ async def auto_register_workspace_coverage_unit(
             k: (v.isoformat() if hasattr(v, "isoformat") else (str(v) if isinstance(v, uuid.UUID) else v))
             for k, v in row.items()
         }
-        return serializable, None
+        return serializable, None, None
     except ValueError as exc:
         logger.info(
             "Workspace %s created without coverage unit registration (%s)",
             workspace_id,
             type(exc).__name__,
         )
-        return None, _format_auto_register_failure(exc, ticker=eff_ticker)
+        msg, detail = _format_auto_register_failure(exc, ticker=eff_ticker)
+        return None, msg, detail
     except Exception as exc:
         logger.warning(
             "Unexpected error auto-registering coverage unit for workspace %s (%s)",
             workspace_id,
             type(exc).__name__,
         )
-        return None, "覆盖单元自动登记失败，工作区已创建但未绑定覆盖单元，可在覆盖管理中手动登记。"
+        msg, detail = _build_auto_register_warning("registration_failed")
+        return None, msg, detail

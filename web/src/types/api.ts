@@ -199,7 +199,13 @@ export interface Workspace {
   // DALTON-HOOK(workspace-dedup): coverage unit auto-registration outcome on create
   coverage_unit?: Record<string, unknown> | null;
   coverage_unit_warning?: string | null;
+  coverage_unit_warning_detail?: CoverageUnitWarningDetail | null;
   [key: string]: unknown;
+}
+
+export interface CoverageUnitWarningDetail {
+  code: string;
+  params?: Record<string, string | number>;
 }
 
 export interface WorkspacesResponse {
@@ -228,6 +234,7 @@ export interface WorkspaceCreate {
   coverage_kind?: CoverageUnitKindChoice;
   ticker?: string;
   display_name?: string;
+  skip_coverage_suggestion?: boolean;
 }
 
 // DALTON-HOOK(workspace-dedup): matched existing company workspace or unbound coverage unit from 409 company_workspace_exists

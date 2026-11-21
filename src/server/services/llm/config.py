@@ -665,6 +665,8 @@ async def resolve_llm_config(
     identity: TurnIdentity | None = None,
     user_facing: bool = True,
     role: AgentRole = "analyst",
+    # DALTON-HOOK(workspace-dedup): ignore user custom models/providers so built-in catalog entries win.
+    ignore_custom_models: bool = False,
 ):
     """Resolve the final LLM config for one turn: which model runs, how it is
     tuned, what it is allowed to reach, and every client it can call.
@@ -694,8 +696,18 @@ async def resolve_llm_config(
         # One copy up front. Everything below mutates the request's own config, so
         # nothing has to reason about whether it is still aliased to the caller's.
         config = base_config.model_copy(deep=True)
+        # DALTON-HOOK(workspace-dedup): when ignore_custom_models=True, strip user custom_models and custom_providers so built-in catalog entries win.
+        raw_pref = await user_models.get_model_preference(user_id)
+        if ignore_custom_models and (
+            raw_pref.get("custom_models") or raw_pref.get("custom_providers")
+        ):
+            raw_pref = {
+                k: v
+                for k, v in raw_pref.items()
+                if k not in ("custom_models", "custom_providers")
+            }
         # Every role below, the clients and the subagent pins read this view.
-        saved_pref = builtins_only(policy, await user_models.get_model_preference(user_id))
+        saved_pref = builtins_only(policy, raw_pref)
 
         # A role or fallback saved as a model this manifest lacks resolves as if
         # never set: without this a platform user's role reaches the name-based
@@ -854,6 +866,8 @@ async def resolve_llm_config(
         fast_mode=fast_mode,
         user_defined=user_defined,
         policy=policy,
+        # DALTON-HOOK(workspace-dedup): forward ignore_custom_models only when requested.
+        **({"ignore_custom_models": True} if ignore_custom_models else {}),
     )
     # DALTON-HOOK(subagent-model-pin): only inspect subagents compiled for this
     # turn's role on the primary slot.

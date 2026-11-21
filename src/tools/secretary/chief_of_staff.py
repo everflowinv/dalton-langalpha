@@ -69,6 +69,7 @@ async def chief_of_staff_workspaces(
     coverage_kind: str | None = None,
     ticker: str | None = None,
     display_name: str | None = None,
+    skip_coverage_suggestion: bool = False,
     tool_call_id: Annotated[str, InjectedToolCallId] = "",
 ) -> Command:
     """List the user's and colleagues' shared workspaces, create or delete the user's own workspace, or list/read/copy/write files in a workspace.
@@ -99,6 +100,7 @@ async def chief_of_staff_workspaces(
         coverage_kind: Optional for "create": "company", "sector", or "none" (default "none"). When "company" or "sector", automatically registers and binds a team coverage unit to the new workspace (internal/admin members only).
         ticker: Optional stock ticker for "create" when `coverage_kind="company"` (e.g. "NVDA", "0700.HK"; leave empty for unlisted companies or sectors).
         display_name: Optional company or sector display name for "create" when `coverage_kind` is "company" or "sector"; defaults to `name`.
+        skip_coverage_suggestion: Only for "create" when retrying after a `coverage_suggestion` response and the user explicitly declines registering a coverage unit; default False.
 
     Returns:
         One short row per workspace, with its id and its folder (dir_name); with more
@@ -108,7 +110,8 @@ async def chief_of_staff_workspaces(
         `folder_path` and `folder_ready` (before copying or cleaning into a new
         workspace, confirm `folder_path` exists and is non-empty — until `folder_ready`
         is true the folder is not on the machine yet), plus `coverage_unit` (or
-        `coverage_unit_warning`) when coverage registration ran; file paths/content
+        `coverage_unit_warning` / `coverage_unit_warning_detail`) when coverage
+        registration ran; file paths/content
         for file actions; for "copy_file" the destination path, its absolute
         `folder_path`, and the size.
         (DALTON-HOOK(workspace-folder-ready): the create result's folder fields.)
@@ -127,6 +130,7 @@ async def chief_of_staff_workspaces(
             coverage_kind=coverage_kind,
             ticker=ticker,
             display_name=display_name,
+            skip_coverage_suggestion=skip_coverage_suggestion,
         )
     if action == "delete":
         return await _workspaces_delete(user_id, workspace_id, tool_call_id)

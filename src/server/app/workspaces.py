@@ -217,6 +217,7 @@ def workspace_response(workspace: dict) -> WorkspaceResponse:
         # DALTON-HOOK(workspace-dedup): pass optional coverage unit registration outcome on create.
         coverage_unit=workspace.get("coverage_unit"),
         coverage_unit_warning=workspace.get("coverage_unit_warning"),
+        coverage_unit_warning_detail=workspace.get("coverage_unit_warning_detail"),
     )
 
 
@@ -256,13 +257,14 @@ async def create_workspace(
         # --- DALTON-HOOK(workspace-dedup): begin ---
         from src.dalton.coverage.dedup import find_existing_company_workspace
 
+        wants_coverage = bool(request.coverage_kind and request.coverage_kind != "none")
         if request.allow_duplicate_company:
             matched_ids: list[str] = []
             try:
                 dup_for_log = await find_existing_company_workspace(
                     x_user_id, request.name, channel="web"
                 )
-                if dup_for_log is not None:
+                if dup_for_log is not None and dup_for_log.matches:
                     matched_ids = list(
                         dup_for_log.matched_workspace_ids
                         or [
@@ -290,7 +292,7 @@ async def create_workspace(
                     "Company workspace dedup check failed (%s); proceeding",
                     type(exc).__name__,
                 )
-            if dup is not None:
+            if dup is not None and dup.matches:
                 detail: dict[str, Any] = {
                     "code": "company_workspace_exists",
                     "message": dup.message,
@@ -302,6 +304,29 @@ async def create_workspace(
                 raise HTTPException(
                     status_code=409,
                     detail=detail,
+                )
+            if (
+                dup is not None
+                and dup.suggestion is not None
+                and not wants_coverage
+                and not request.skip_coverage_suggestion
+            ):
+                suggestion = dup.suggestion_payload()
+                kind_label = (
+                    "公司" if dup.suggestion.coverage_kind == "company" else "行业"
+                )
+                ticker_note = (
+                    f"（代码 {dup.suggestion.ticker}）"
+                    if dup.suggestion.ticker
+                    else ""
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "coverage_suggestion",
+                        "message": f"「{request.name}」识别为{kind_label}{ticker_note}，是否自动登记覆盖单元并创建工作区？",
+                        "suggestion": suggestion,
+                    },
                 )
         # --- DALTON-HOOK(workspace-dedup): end ---
         manager = WorkspaceManager.get_instance()
@@ -315,23 +340,30 @@ async def create_workspace(
             )
 
         # --- DALTON-HOOK(workspace-dedup): begin ---
-        if request.coverage_kind and request.coverage_kind != "none":
+        if wants_coverage:
             from src.dalton.coverage.units import auto_register_workspace_coverage_unit
 
-            unit_row, unit_warning = await auto_register_workspace_coverage_unit(
+            unit_row, unit_warning, unit_warning_detail = await auto_register_workspace_coverage_unit(
                 x_user_id,
                 workspace_id=str(workspace["workspace_id"]),
                 workspace_name=str(workspace.get("name") or request.name),
                 coverage_kind=request.coverage_kind,
                 ticker=request.ticker,
                 display_name=request.display_name,
+                principal=principal,
             )
-            if unit_row is not None or unit_warning is not None:
+            if (
+                unit_row is not None
+                or unit_warning is not None
+                or unit_warning_detail is not None
+            ):
                 workspace = dict(workspace)
                 if unit_row is not None:
                     workspace["coverage_unit"] = unit_row
                 if unit_warning is not None:
                     workspace["coverage_unit_warning"] = unit_warning
+                if unit_warning_detail is not None:
+                    workspace["coverage_unit_warning_detail"] = unit_warning_detail
         # --- DALTON-HOOK(workspace-dedup): end ---
 
         logger.info(

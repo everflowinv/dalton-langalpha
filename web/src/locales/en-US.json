@@ -1800,7 +1800,34 @@
       "sectorNameLabel": "Sector Name",
       "sectorNamePlaceholder": "e.g. AI Infrastructure (defaults to workspace name)",
       "prefilledHint": "Pre-filled from workspace check — you can edit these before creating.",
-      "registrationWarningTitle": "Workspace created, coverage unit not registered"
+      "tickerLengthHint": "Max {{max}} characters",
+      "tickerLengthExceeded": "Max {{max}} characters (currently {{count}}) — workspace will be created without registering.",
+      "displayNameLengthHint": "Max {{max}} characters",
+      "displayNameLengthExceeded": "Max {{max}} characters (currently {{count}}) — workspace will be created without registering.",
+      "registrationWarningTitle": "Workspace created, coverage unit not registered",
+      "warnings": {
+        "ticker_conflict": "Ticker {{ticker}} is already registered to another coverage unit. The workspace was created without auto-registering a coverage unit.",
+        "ticker_conflict_no_ticker": "This ticker is already registered to another coverage unit. The workspace was created without auto-registering a coverage unit.",
+        "slug_conflict": "A coverage unit with the same name is already registered. The workspace was created without auto-registering a coverage unit.",
+        "workspace_conflict": "This workspace is already bound to another coverage unit.",
+        "invalid_ticker": "Invalid ticker format. The workspace was created without auto-registering a coverage unit.",
+        "sector_ticker_refused": "Sector coverage units cannot carry a ticker. The workspace was created without auto-registering a coverage unit.",
+        "ticker_too_long": "Ticker cannot exceed {{max_length}} characters. The workspace was created without auto-registering a coverage unit.",
+        "display_name_too_long": "Display name cannot exceed {{max_length}} characters. The workspace was created without auto-registering a coverage unit.",
+        "token_not_allowed": "This access token cannot register team coverage units. The workspace was created without auto-registering a coverage unit.",
+        "external_member_forbidden": "External members cannot register team coverage units. The workspace was created without auto-registering a coverage unit.",
+        "authentication_required": "Authentication could not be verified. The workspace was created without auto-registering a coverage unit.",
+        "feature_disabled": "Coverage units are disabled. The workspace was created without registering a coverage unit.",
+        "unsupported_kind": "Unsupported coverage type \"{{kind}}\". The workspace was created without registering a coverage unit.",
+        "registration_failed": "Could not auto-register the coverage unit. The workspace was created and you can register it manually in Coverage Management."
+      }
+    },
+    "coverageSuggestion": {
+      "companyWithTicker": "\"{{name}}\" looks like a company ({{ticker}}). Review the pre-filled coverage fields above and choose whether to register a coverage unit when creating.",
+      "company": "\"{{name}}\" looks like a company. Review the pre-filled coverage fields above and choose whether to register a coverage unit when creating.",
+      "sector": "\"{{name}}\" looks like a sector. Review the pre-filled coverage fields above and choose whether to register a coverage unit when creating.",
+      "registerAndCreate": "Register & Create",
+      "createWithoutRegistering": "Create without registering"
     },
     "duplicateCompany": {
       "summaryReadableWithLead": "{{company}} already has a workspace \"{{workspace}}\" (owner: {{owner}}, lead: {{lead}}). Continue there, or confirm to create another.",
