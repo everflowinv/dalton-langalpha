@@ -440,6 +440,9 @@ ALLOWED_HOOKS=(
   # on ToolMessage JSON parse and recursively replace non-finite floats with None
   # across request payloads (antigravity/client.py).
   "antigravity-json-nan"
+  # Preserve server-written dalton_historical_duplicate_of marker in
+  # SERVER_OWNED_CONFIG_KEYS across whole-config replacements (workspace.py).
+  "historical-duplicate-marker"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
