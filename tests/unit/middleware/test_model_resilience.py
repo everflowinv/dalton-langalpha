@@ -192,6 +192,25 @@ class TestRetryBehavior:
         assert fallbacks[0]["status_code"] == 404
 
     @pytest.mark.asyncio
+    async def test_a_fallback_attempt_is_marked_for_the_middleware_inside(self, events):
+        """What the primary's reasoning is bound to stays put while a fallback answers."""
+        from ptc_agent.agent.middleware.model_resilience import answering_as_fallback
+
+        client = _FakeModel("primary-model")
+        mw = _make_middleware(client, fallbacks=[("fallback-a", _FakeModel("fallback-a"))])
+        seen = []
+
+        async def handler(req):
+            seen.append((req.model is client, answering_as_fallback()))
+            if req.model is client:
+                raise _status_error("Error code: 404 - model not found", status=404)
+            return ModelResponse(result=[AIMessage("ok")])
+
+        await mw.awrap_model_call(_FakeRequest(client), handler)
+        assert seen == [(True, False), (False, True)]
+        assert answering_as_fallback() is False
+
+    @pytest.mark.asyncio
     async def test_an_answer_a_fallback_wrote_names_it(self, events):
         client = _FakeModel("primary-model")
         fallback_client = _FakeModel("fallback-a")
@@ -1734,7 +1753,11 @@ class TestFallbackIdentity:
             "src.llms.llm.LLM.get_model_config",
             lambda: SimpleNamespace(
                 get_model_config=manifest.get,
-                get_provider_info=lambda route: {"sdk": "anthropic"} if route == "anthropic" else {},
+                get_provider_info=lambda route: (
+                    {"sdk": "anthropic", "reasoning_binds_prefix": True}
+                    if route == "anthropic"
+                    else {}
+                ),
             ),
         )
 
@@ -1902,4 +1925,63 @@ class TestFallbackIdentity:
         assert "[Fallback call]" not in seen_texts[0]
         assert "fallback model fallback-sync" in seen_texts[1]
         assert "is primary-sync." in seen_texts[1]
+    @pytest.mark.asyncio
+    async def test_prefix_binding_non_claude_fallback_gets_no_identity_note(
+        self, events, monkeypatch
+    ):
+        """GPT-6.2 binds its reasoning to the prefix too (upstream #844), so a
+        fallback to it must leave the system message byte for byte: no
+        ``[Fallback call]`` note that would unbind its reasoning or land in
+        the stored pin."""
+        from types import SimpleNamespace
+
+        from langchain.agents.middleware.types import ModelRequest
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        from ptc_agent.agent.middleware import thinking_binding
+
+        manifest = {
+            "glm-primary": {"display_name": "GLM Primary"},
+            "gpt-6.2-sol": {"display_name": "GPT-6.2 Sol"},
+        }
+        monkeypatch.setattr(
+            "src.llms.llm.LLM.get_model_config",
+            lambda: SimpleNamespace(get_model_config=manifest.get, get_provider_info=lambda route: {}),
+        )
+        primary = _FakeModel("glm-primary")
+        primary.metadata = {"manifest_model": "glm-primary"}
+        fallback = _FakeModel("gpt-6.2-sol")
+        fallback.metadata = {"manifest_model": "gpt-6.2-sol"}
+        monkeypatch.setattr(
+            thinking_binding, "binds_reasoning", lambda model: model is fallback
+        )
+        mw = ModelResilienceMiddleware(
+            primary_name="glm-primary",
+            primary_client=primary,
+            fallbacks=[("gpt-6.2-sol", fallback)],
+            max_retries=0,
+            initial_delay=0.0,
+            jitter=False,
+        )
+        seen_texts: list[str] = []
+
+        async def handler(req: ModelRequest) -> ModelResponse:
+            seen_texts.append(self._system_text(req))
+            if req.model is primary:
+                raise _status_error("forbidden", status=403)
+            return ModelResponse(result=[AIMessage("sol ok", id="a-sol")])
+
+        request = ModelRequest(
+            model=primary,
+            messages=[HumanMessage("q1")],
+            system_message=SystemMessage(content="Build system prompt."),
+            state={"messages": []},
+        )
+        await mw.awrap_model_call(request, handler)
+
+        assert len(seen_texts) == 2
+        assert seen_texts[1] == "Build system prompt."
+        assert "[Fallback call]" not in seen_texts[1]
+
+
 # --- DALTON-HOOK(model-fallback-identity): end ---

@@ -47,7 +47,6 @@ ROUTES = (API, OAUTH)
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 API_BETA = (
     "thinking-binding-controls-2026-08-01,"
-    "mid-conversation-system-clear-at-2026-08-21,"
     "compact-2026-09-04"
 )
 OAUTH_BETA = (

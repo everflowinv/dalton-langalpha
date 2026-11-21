@@ -43,7 +43,6 @@ from ptc_agent.agent.middleware.compaction.middleware import CompactionMiddlewar
 from ptc_agent.agent.middleware.compaction import middleware as mw_module
 from ptc_agent.agent.middleware.compaction.rebuild import TurnStartRebuilds
 from ptc_agent.agent.middleware.runtime_context import tail as tail_module
-from ptc_agent.agent.middleware.runtime_context.carrier import Carrier
 from ptc_agent.agent.middleware.runtime_context.frozen_prompt import SystemPinMiddleware
 from ptc_agent.agent.middleware.runtime_context.tail import RowCarrierMiddleware
 from ptc_agent.agent.middleware.reasoning_compat import ReasoningCompatibilityMiddleware
@@ -85,7 +84,7 @@ def run_workflow(workflow: str, params: Any = None, description: str = None, res
 def _quiet(monkeypatch):
     monkeypatch.setattr(mw_module, "get_stream_writer", lambda: lambda payload: None)
     # Rows ride a user-role reminder on the routes Dalton deploys.
-    monkeypatch.setattr(tail_module, "resolve_carrier", lambda model: Carrier("reminder"))
+    monkeypatch.setattr(tail_module, "resolve_carrier", lambda model: "reminder")
     # cl100k_base fetches its BPE file on first use; the blocked sockets of
     # the unit suite refuse that on a cold cache.
     from types import SimpleNamespace
