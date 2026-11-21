@@ -1779,7 +1779,7 @@ def test_gemini_4_hydrogen_catalog_xhigh_request_and_estimated_notional_price(mo
         assert entry["provider"] == "antigravity-oauth"
         assert entry["model_id"] == model_id
         assert entry["context"] == 1_048_576
-        assert entry["parameters"]["max_output_tokens"] == 65536
+        assert entry["parameters"]["max_output_tokens"] == 262144
         assert entry["reasoning"] == {
             "efforts": [effort],
             "default": effort,
@@ -1878,7 +1878,7 @@ def test_gemini_4_neon_overlay_generally_available_and_notional_pricing(monkeypa
         assert entry["visible"] is True
         assert entry["prompt_guidance"] == "lean"
         assert entry["context"] == 1_048_576
-        assert entry["parameters"] == {"include_thoughts": True, "max_output_tokens": 65536}
+        assert entry["parameters"] == {"include_thoughts": True, "max_output_tokens": 262144}
         assert entry["reasoning"] == {
             "efforts": [effort],
             "default": effort,
