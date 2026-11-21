@@ -507,3 +507,5 @@ tests/unit/tools/secretary/test_threads_stop.py
 tests/unit/tools/secretary/test_workspaces_create_conflict.py
 web/src/pages/ChatAgent/components/__tests__/ChatView.attachmentCount.test.tsx
 web/src/pages/MarketView/__tests__/MarketView.screenshotCap.test.tsx
+# Agent-triggered current-thread model switch handler-tier handoff orchestrator.
+src/server/handlers/thread_model_handoff.py

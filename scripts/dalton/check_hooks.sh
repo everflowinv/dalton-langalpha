@@ -440,6 +440,9 @@ ALLOWED_HOOKS=(
   # on ToolMessage JSON parse and recursively replace non-finite floats with None
   # across request payloads (antigravity/client.py).
   "antigravity-json-nan"
+  # Agent-triggered current-thread model switch (switch_thread_model Dalton tool
+  # and extracted switch_thread_model service shared with PATCH /threads/{id}).
+  "agent-switch-model"
   # Preserve server-written dalton_historical_duplicate_of marker in
   # SERVER_OWNED_CONFIG_KEYS across whole-config replacements (workspace.py).
   "historical-duplicate-marker"

@@ -128,13 +128,18 @@ export function useThreadModel({
   // are both unread seed the same null, and the pick would ride to the next
   // send there. A thread being created by its first send is not a move.
   const [heldThreadId, setHeldThreadId] = useState(liveThreadId);
+  // DALTON-HOOK(agent-switch-model): only include llm_model in send requests when the user manually picked a model on this page
+  const [manualPick, setManualPick] = useState<string | null>(null);
   let nextPending = pending;
+  let nextManualPick = manualPick;
 
   if (heldThreadId !== liveThreadId) {
     if (heldThreadId) {
       nextPending = null;
       createdHereRef.current = false;
       setPending(null);
+      nextManualPick = null;
+      setManualPick(null);
     } else if (liveThreadId) {
       createdHereRef.current = true;
     }
@@ -149,6 +154,11 @@ export function useThreadModel({
   pendingRef.current = nextPending;
 
   const [model, setModel] = useSeededModel(nextPending ?? seed);
+
+  if (nextManualPick !== null && nextPending === null && seed !== nextManualPick) {
+    nextManualPick = null;
+    setManualPick(null);
+  }
 
   if (heldThreadId !== liveThreadId) {
     setHeldThreadId(liveThreadId);
@@ -188,6 +198,7 @@ export function useThreadModel({
         createdHereRef.current = false;
       }
       setPending((current) => (current === value ? null : current));
+      setManualPick((current) => (current === value ? null : current));
       setModel((current) => (current === value ? restoredModel : current));
       setOffered(null);
     },
@@ -228,6 +239,8 @@ export function useThreadModel({
     // DALTON-HOOK(ui-model-pick): record the pick as pending until confirmed.
     pendingRef.current = picked;
     setPending(picked);
+    // DALTON-HOOK(agent-switch-model): mark as manually picked for the upcoming send
+    setManualPick(picked);
     setModel(picked);
     const dismissedForThread = !!liveThreadId
       && userSessionStorage.getItem(OFFER_DISMISSED_PREFIX + liveThreadId) !== null;
@@ -297,11 +310,16 @@ export function useThreadModel({
     const ended = wasLoadingRef.current && !isLoading;
     wasLoadingRef.current = isLoading;
     if (!ended || !liveThreadId) return;
-    // DALTON-HOOK(ui-model-pick): the reread's own result decides the pick;
-    // a turn ending while another field saves defers the check to that save.
     const id = liveThreadId;
     const key = queryKeys.threads.detail(id);
     const saving = queryClient.isMutating({ mutationKey: threadFieldMutationKey(id) }) > 0;
+    const modelSaving = queryClient.isMutating({ mutationKey: threadFieldMutationKey(id, 'llm_model') }) > 0;
+    // DALTON-HOOK(agent-switch-model): clear manual pick when turn ends only if no PATCH for llm_model is in flight
+    if (!modelSaving) {
+      setManualPick(null);
+    }
+    // DALTON-HOOK(ui-model-pick): the reread's own result decides the pick;
+    // a turn ending while another field saves defers the check to that save.
     const invalidated = queryClient.invalidateQueries({
       queryKey: key,
       ...(saving ? { refetchType: 'none' as const } : {}),
@@ -356,7 +374,10 @@ export function useThreadModel({
     ? { model: defaultModel, fallback: startsOn }
     : null;
 
-  const sendModel = thread && seed !== own && model === seed ? null : model;
+  // DALTON-HOOK(agent-switch-model): existing threads omit llm_model unless the user manually picked on this page
+  const sendModel = !liveThreadId
+    ? model
+    : (nextManualPick !== null && nextManualPick === model ? model : null);
 
   // DALTON-HOOK(colleague-dispatch): expose thread detail record so ChatView can inspect thread_user_id / dispatched_by
   return { model, sendModel, retired, lapsed, offer, heldDefault, pickModel, dismissOffer, thread };

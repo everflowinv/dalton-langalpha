@@ -462,10 +462,18 @@ class RunCoordinator:
             # session must not stay pinned while nothing owns the run — and
             # tail writers may still be live, so the session is discarded
             # (closed), never clean-released out from under them.
-            self._teardown_guard(handle, tail_drain=None, discard=True)
+            # DALTON-HOOK(agent-switch-model): suppress deferred handoff on failed finalize and trigger on terminal apply
+            self._teardown_guard(
+                handle, tail_drain=None, discard=True, run_pending_handoff=False
+            )
             raise
+        had_guard = handle.guard is not None
         handle.finalized = True
-        self._teardown_guard(handle, tail_drain=tail_drain)
+        self._teardown_guard(
+            handle,
+            tail_drain=tail_drain,
+            run_pending_handoff=result.applied,
+        )
 
         if result.applied:
             if post_commit is not None:
@@ -478,6 +486,16 @@ class RunCoordinator:
                         exc_info=True,
                     )
             self.post_finalize_tail(handle.thread_id, result.run)
+            # DALTON-HOOK(agent-switch-model): guardless finalizes also trigger deferred model handoff after terminal commit
+            if not had_guard:
+                from src.server.services.llm.thread_model import (
+                    run_pending_model_handoff_best_effort,
+                )
+
+                spawn_protected(
+                    run_pending_model_handoff_best_effort(handle.thread_id),
+                    f"model-handoff-{handle.run_id[:8]}",
+                )
         return result
 
     async def fail_open_run(
@@ -562,6 +580,15 @@ class RunCoordinator:
         )
         if result.applied:
             self.post_finalize_tail(thread_id, result.run)
+            # DALTON-HOOK(agent-switch-model): detached finalizes also trigger deferred model handoff after terminal commit
+            from src.server.services.llm.thread_model import (
+                run_pending_model_handoff_best_effort,
+            )
+
+            spawn_protected(
+                run_pending_model_handoff_best_effort(thread_id),
+                f"model-handoff-{run_id[:8]}",
+            )
         final_status = (result.run or {}).get("status")
         if final_status:
             from src.server.services.runs.executor import (
@@ -703,6 +730,8 @@ class RunCoordinator:
         *,
         tail_drain: Optional[Callable[[], Awaitable[None]]],
         discard: bool = False,
+        # DALTON-HOOK(agent-switch-model): run deferred model handoff after guard release when terminal commit applied
+        run_pending_handoff: bool = False,
     ) -> None:
         """Detached, exactly-once guard teardown: drop N(root) now so the
         thread's next turn can start, hold the session through the tail
@@ -733,6 +762,13 @@ class RunCoordinator:
                         )
             finally:
                 await guard.release(discard=must_discard)
+            # DALTON-HOOK(agent-switch-model): run deferred model-switch handoff only after guard.release drops shared T(thread)
+            if run_pending_handoff:
+                from src.server.services.llm.thread_model import (
+                    run_pending_model_handoff_best_effort,
+                )
+
+                await run_pending_model_handoff_best_effort(handle.thread_id)
 
         spawn_protected(_run(), f"writer-guard-teardown-{handle.run_id[:8]}")
 

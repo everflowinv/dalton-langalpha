@@ -424,6 +424,8 @@ class PriorThread(NamedTuple):
     # stamped nothing in the checkpoint, so compaction's cold-cache estimate
     # reads this as well.
     last_run_settled_at: Optional[datetime] = None
+    # DALTON-HOOK(agent-switch-model): pending mid-turn model switch marker for pre-run fallback handoff
+    pending_model_handoff: Optional[dict[str, Any]] = None
 
 
 #: Attempts a notification's surface passes over. An automation's run states
@@ -490,6 +492,9 @@ async def _read_prior_thread(
         # A naive stamp would raise against the envelope's aware clock.
         last_turn_at = stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
 
+    # DALTON-HOOK(agent-switch-model): read pending model handoff marker from thread metadata
+    from src.server.services.llm.thread_model import extract_pending_model_handoff
+
     ran_on = ((voiced or {}).get("metadata") or {}).get(SURFACE_META)
     attempt_platform = ran_on.get("platform") if isinstance(ran_on, dict) else None
     return PriorThread(
@@ -500,6 +505,7 @@ async def _read_prior_thread(
             else None
         ),
         last_run_settled_at=run_settled_at(clock),
+        pending_model_handoff=extract_pending_model_handoff(row),
     )
 
 
@@ -1061,6 +1067,8 @@ def build_graph_config(
     langsmith_metadata.update(turn_origin)
 
     configurable: dict = {
+        # DALTON-HOOK(agent-switch-model): the model this turn runs on, read by switch_thread_model as the hand-off source
+        "dalton_turn_model": effective_model,
         "thread_id": thread_id,
         "user_id": user_id,
         "workspace_id": workspace_id,
