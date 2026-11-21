@@ -172,7 +172,7 @@
       ],
       "parameters": {
         "include_thoughts": true,
-        "max_output_tokens": 65536
+        "max_output_tokens": 262144
       },
       "reasoning": {
         "efforts": [
@@ -197,7 +197,7 @@
       ],
       "parameters": {
         "include_thoughts": true,
-        "max_output_tokens": 65536
+        "max_output_tokens": 262144
       },
       "reasoning": {
         "efforts": [
@@ -222,7 +222,7 @@
       ],
       "parameters": {
         "include_thoughts": true,
-        "max_output_tokens": 65536
+        "max_output_tokens": 262144
       },
       "reasoning": {
         "efforts": [
@@ -247,7 +247,7 @@
       ],
       "parameters": {
         "include_thoughts": true,
-        "max_output_tokens": 65536
+        "max_output_tokens": 262144
       },
       "reasoning": {
         "efforts": [
@@ -272,7 +272,7 @@
       ],
       "parameters": {
         "include_thoughts": true,
-        "max_output_tokens": 65536
+        "max_output_tokens": 262144
       },
       "reasoning": {
         "efforts": [
@@ -297,7 +297,7 @@
       ],
       "parameters": {
         "include_thoughts": true,
-        "max_output_tokens": 65536
+        "max_output_tokens": 262144
       },
       "reasoning": {
         "efforts": [
@@ -322,7 +322,7 @@
       ],
       "parameters": {
         "include_thoughts": true,
-        "max_output_tokens": 65536
+        "max_output_tokens": 262144
       },
       "reasoning": {
         "efforts": [
@@ -857,7 +857,7 @@
       ],
       "parameters": {
         "include_thoughts": true,
-        "max_output_tokens": 65536
+        "max_output_tokens": 262144
       },
       "reasoning": {
         "efforts": [
