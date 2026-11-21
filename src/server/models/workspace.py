@@ -64,6 +64,28 @@ class WorkspaceCreate(BaseModel):
             "primary computer when absent"
         ),
     )
+    # DALTON-HOOK(workspace-dedup): allow overriding company workspace dedup check when user confirms.
+    allow_duplicate_company: bool = Field(
+        False,
+        description="Skip company workspace deduplication check after user confirmation",
+    )
+    # DALTON-HOOK(workspace-dedup): optional coverage unit auto-registration fields on workspace create (validated at registration so create is never blocked with 422).
+    coverage_kind: Optional[str] = Field(
+        None,
+        description="Optional coverage unit kind to register and bind on creation: company, sector, or none",
+    )
+    ticker: Optional[str] = Field(
+        None,
+        description="Optional stock ticker when coverage_kind is 'company' (leave empty if unlisted)",
+    )
+    display_name: Optional[str] = Field(
+        None,
+        description="Optional company or sector display name for coverage unit registration",
+    )
+    skip_coverage_suggestion: bool = Field(
+        False,
+        description="Skip coverage unit registration suggestion confirmation when creating with coverage_kind='none'",
+    )
 
 
 class WorkspaceUpdate(BaseModel):
@@ -252,6 +274,19 @@ class WorkspaceResponse(BaseModel):
     colleague_dispatch_enabled: Optional[bool] = Field(
         None,
         description="Whether colleague workspace task dispatch and chat messaging are enabled",
+    )
+    # DALTON-HOOK(workspace-dedup): coverage unit auto-registration outcome and non-fatal warning on create.
+    coverage_unit: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Registered coverage unit row when auto-registered on creation",
+    )
+    coverage_unit_warning: Optional[str] = Field(
+        None,
+        description="Non-fatal notice when coverage unit auto-registration failed or was skipped",
+    )
+    coverage_unit_warning_detail: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Structured code and params when coverage unit auto-registration failed or was skipped",
     )
 
     model_config = ConfigDict(from_attributes=True)

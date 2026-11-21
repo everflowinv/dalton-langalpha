@@ -80,6 +80,9 @@ vi.mock('@/hooks/useTeamCredentials', () => ({
     canManage: true,
     isPm: false,
     canInvite: false,
+    callerTier: null,
+    callerTierPending: false,
+    callerTierError: false,
   }),
 }));
 
@@ -96,13 +99,13 @@ vi.mock('@/hooks/useFeatures', async (importOriginal) => ({
 
 vi.mock('@/hooks/useClaudeCode', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/hooks/useClaudeCode')>()),
-  useClaudeCodeSetup: () => ({
+  useClaudeCodeSetup: (): ReturnType<typeof import('@/hooks/useClaudeCode').useClaudeCodeSetup> => ({
     setup: {
       state: 'no_computer',
+      on: false,
       computers: [],
-      offered: true,
-      enabled: false,
-      hosted: { available: false, reason: null, mode: 'stored' },
+      saved_token_runs: false,
+      cloud: false,
     },
     isLoading: false,
     unread: false,
@@ -113,7 +116,13 @@ vi.mock('@/hooks/useClaudeCode', async (importOriginal) => ({
 
 vi.mock('@/hooks/useClaudeCodeCustody', () => ({
   useClaudeCodeCustody: () => ({
-    custody: { offered: true, mode: 'stored', token: null, computers: [] },
+    custody: {
+      mode: 'stored' as const,
+      offered: ['stored' as const],
+      blocked: false,
+      runs_on: null,
+      refusal: null,
+    },
     choose: vi.fn(),
     choosing: null,
     isLoading: false,
@@ -142,7 +151,7 @@ vi.mock('@/hooks/useProviderCatalog', () => ({
 }));
 
 vi.mock('@/hooks/usePreferences', () => ({
-  usePreferences: () => ({ preferences: {}, isLoading: false, unread: false, retry: vi.fn() }),
+  usePreferences: () => ({ preferences: {}, isLoaded: true, isLoading: false, unread: false, retry: vi.fn() }),
 }));
 
 vi.mock('@/hooks/useUpdatePreferences', () => ({
@@ -150,7 +159,7 @@ vi.mock('@/hooks/useUpdatePreferences', () => ({
 }));
 
 vi.mock('@/hooks/useAllModels', () => ({
-  useAllModels: () => ({
+  useAllModels: (): import('@/hooks/useAllModels').UseAllModelsResult => ({
     models: {
       'codex-oauth': { models: ['gpt-5'] },
       'claude-code': { models: ['cc-opus'] },
@@ -160,7 +169,16 @@ vi.mock('@/hooks/useAllModels', () => ({
       'codex-oauth': { models: ['gpt-5'] },
       anthropic: { models: ['claude-sonnet'] },
     },
+    rawModels: {
+      'codex-oauth': { models: ['gpt-5'] },
+      'claude-code': { models: ['cc-opus'] },
+      anthropic: { models: ['claude-sonnet'] },
+    },
     payers: { 'gpt-5': 'credits', 'cc-opus': 'subscription:claude-code' },
+    keylessModels: new Set(),
+    lockedModels: {},
+    offPlanModels: new Set(),
+    platform: null,
     metadata: {
       'gpt-5': { display_name: 'GPT 5', intelligence: 5, speed: 3 },
       'cc-opus': {
@@ -174,11 +192,19 @@ vi.mock('@/hooks/useAllModels', () => ({
       'claude-sonnet': { display_name: 'Claude Sonnet', intelligence: 4, speed: 4 },
     },
     customModels: [],
+    validModelNames: new Set(['gpt-5', 'cc-opus', 'claude-sonnet']),
+    catalogModelNames: new Set(['gpt-5', 'cc-opus', 'claude-sonnet']),
     cannotRun: () => false,
-    systemDefaults: { default: 'claude-sonnet', background: 'gpt-5' },
+    systemDefaults: { default_model: 'claude-sonnet', background_model: 'gpt-5' },
+    compactionProfiles: null,
+    searchProviders: null,
+    rawApiResponse: null,
     isLoading: false,
     unread: false,
-    retry: vi.fn(),
+    listedProviders: [],
+    seriesCatalog: { series: [], bySeriesId: {}, bySeriesPrefix: {}, byVariantKey: {} },
+    selectableSeries: [],
+    selectableSlotSeries: [],
   }),
 }));
 

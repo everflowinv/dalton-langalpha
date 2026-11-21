@@ -827,6 +827,9 @@ def build_overlay_entries(
         if upstream_id in _known_cash_model_ids():
             meta["notional_ref"] = upstream_id
         meta_out[key] = meta
+    from src.dalton.llm.overlay import inherit_antigravity_gemini_ratings
+
+    inherit_antigravity_gemini_ratings(models_out, source_catalog=llm_config)
     return models_out, meta_out
 
 

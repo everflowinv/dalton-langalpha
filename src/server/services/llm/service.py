@@ -64,6 +64,8 @@ class LLMService:
         reasoning_effort: str | None = None,
         disable_tracing: bool = True,
         return_token_usage: bool = False,
+        # DALTON-HOOK(workspace-dedup): opt-in guard to ignore user custom models/providers and use built-in catalog entries only.
+        ignore_custom_models: bool = False,
     ) -> Any:
         """Run a single-shot LLM call.
 
@@ -89,6 +91,8 @@ class LLMService:
                 reasoning_effort=reasoning_effort,
                 fast_mode=None,
                 user_facing=False,
+                # DALTON-HOOK(workspace-dedup): forward ignore_custom_models only when requested.
+                **({"ignore_custom_models": True} if ignore_custom_models else {}),
             )
             llm = resolved_config.llm_client
             effective_model = slot_model(resolved_config.llm, slot)

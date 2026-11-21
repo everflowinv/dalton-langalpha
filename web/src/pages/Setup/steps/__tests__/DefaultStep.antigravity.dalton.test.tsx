@@ -9,8 +9,8 @@ import { buildSelectableAntigravitySeries, buildSeriesCatalog } from '@/lib/anti
 const h = vi.hoisted(() => {
   const seriesCatalogList: AntigravitySeriesEntry[] = [
     {
-      series_id: 'gemini-4-neon',
-      series_prefix: 'gemini-4-neon-',
+      series_id: 'antigravity-oauth:gemini-4-neon',
+      series_prefix: 'gemini-4-neon',
       display_name: 'Gemini 4 Neon',
       qualified_display_name: 'Gemini 4 Neon (Antigravity)',
       provider: 'antigravity-oauth',
@@ -25,8 +25,22 @@ const h = vi.hoisted(() => {
       },
     },
     {
-      series_id: 'gemini-4-hydrogen',
-      series_prefix: 'gemini-4-hydrogen-',
+      series_id: 'antigravity-oauth:gemini-4-carbon',
+      series_prefix: 'gemini-4-carbon',
+      display_name: 'Gemini 4 Carbon',
+      qualified_display_name: 'Gemini 4 Carbon (Antigravity)',
+      provider: 'antigravity-oauth',
+      default_effort: 'high',
+      default_model: 'gemini-4-carbon-high-oauth',
+      efforts: ['medium', 'high'],
+      variants: {
+        medium: 'gemini-4-carbon-medium-oauth',
+        high: 'gemini-4-carbon-high-oauth',
+      },
+    },
+    {
+      series_id: 'antigravity-oauth:gemini-4-hydrogen',
+      series_prefix: 'gemini-4-hydrogen',
       display_name: 'Gemini 4 Hydrogen',
       qualified_display_name: 'Gemini 4 Hydrogen (Antigravity)',
       provider: 'antigravity-oauth',
@@ -39,24 +53,46 @@ const h = vi.hoisted(() => {
         high: 'gemini-4-hydrogen-high-oauth',
       },
     },
+    {
+      series_id: 'antigravity-oauth:claude-opus-5-5',
+      series_prefix: 'claude-opus-5-5',
+      display_name: 'Claude Opus 5.5',
+      qualified_display_name: 'Claude Opus 5.5 (Antigravity)',
+      provider: 'antigravity-oauth',
+      default_effort: 'high',
+      default_model: 'claude-opus-5-5-high-oauth',
+      efforts: ['medium', 'high'],
+      variants: {
+        medium: 'claude-opus-5-5-medium-oauth',
+        high: 'claude-opus-5-5-high-oauth',
+      },
+    },
   ];
   const antigravityModels = [
     'gemini-4-neon-low-oauth',
     'gemini-4-neon-medium-oauth',
     'gemini-4-neon-high-oauth',
     'gemini-4-neon-xhigh-oauth',
+    'gemini-4-carbon-medium-oauth',
+    'gemini-4-carbon-high-oauth',
     'gemini-4-hydrogen-low-oauth',
     'gemini-4-hydrogen-medium-oauth',
     'gemini-4-hydrogen-high-oauth',
+    'claude-opus-5-5-medium-oauth',
+    'claude-opus-5-5-high-oauth',
   ];
   const metadata = {
     'gemini-4-neon-low-oauth': { display_name: 'Gemini 4 Neon (Low)', provider: 'antigravity-oauth', intelligence: 5, speed: 3, reasoning_efforts: ['low'] },
     'gemini-4-neon-medium-oauth': { display_name: 'Gemini 4 Neon (Medium)', provider: 'antigravity-oauth', intelligence: 5, speed: 3, reasoning_efforts: ['medium'] },
     'gemini-4-neon-high-oauth': { display_name: 'Gemini 4 Neon (High)', provider: 'antigravity-oauth', intelligence: 5, speed: 3, reasoning_efforts: ['high'] },
     'gemini-4-neon-xhigh-oauth': { display_name: 'Gemini 4 Neon (XHigh)', provider: 'antigravity-oauth', intelligence: 5, speed: 2, reasoning_efforts: ['xhigh'] },
+    'gemini-4-carbon-medium-oauth': { display_name: 'Gemini 4 Carbon (Medium)', provider: 'antigravity-oauth', intelligence: 5, speed: 3, reasoning_efforts: ['medium'] },
+    'gemini-4-carbon-high-oauth': { display_name: 'Gemini 4 Carbon (High)', provider: 'antigravity-oauth', intelligence: 5, speed: 3, reasoning_efforts: ['high'] },
     'gemini-4-hydrogen-low-oauth': { display_name: 'Gemini 4 Hydrogen (Low)', provider: 'antigravity-oauth', intelligence: 4, speed: 5, reasoning_efforts: ['low'] },
     'gemini-4-hydrogen-medium-oauth': { display_name: 'Gemini 4 Hydrogen (Medium)', provider: 'antigravity-oauth', intelligence: 4, speed: 5, reasoning_efforts: ['medium'] },
     'gemini-4-hydrogen-high-oauth': { display_name: 'Gemini 4 Hydrogen (High)', provider: 'antigravity-oauth', intelligence: 4, speed: 5, reasoning_efforts: ['high'] },
+    'claude-opus-5-5-medium-oauth': { display_name: 'Claude Opus 5.5 (Medium)', provider: 'antigravity-oauth', intelligence: 5, speed: 3, reasoning_efforts: ['medium'] },
+    'claude-opus-5-5-high-oauth': { display_name: 'Claude Opus 5.5 (High)', provider: 'antigravity-oauth', intelligence: 5, speed: 3, reasoning_efforts: ['high'] },
   };
   return {
     seriesCatalogList,
@@ -166,7 +202,7 @@ describe('DefaultStep Antigravity series onboarding', () => {
     client.clear();
   });
 
-  it('shows pure Gemini 4 Neon / Hydrogen series names with zero effort pickers and saves high default IDs', async () => {
+  it('shows pure curated series names with zero effort pickers and saves neon-high + hydrogen-low', async () => {
     render(
       <QueryClientProvider client={client}>
         <MemoryRouter initialEntries={['/setup/default']}>
@@ -178,13 +214,21 @@ describe('DefaultStep Antigravity series onboarding', () => {
       </QueryClientProvider>,
     );
 
-    const radios = screen.getAllByRole('radio');
-    expect(radios).toHaveLength(2);
+    const radios = screen.getAllByRole('radio') as HTMLInputElement[];
+    expect(radios.map((r) => r.value)).toEqual([
+      'gemini-4-neon-high-oauth',
+      'gemini-4-carbon-medium-oauth',
+      'claude-opus-5-5-medium-oauth',
+    ]);
     expect(screen.getAllByText('Gemini 4 Neon').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('Gemini 4 Carbon').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('Claude Opus 5.5').length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText('Gemini 4 Hydrogen').length).toBeGreaterThanOrEqual(1);
 
     // Zero effort suffixes or effort controls on onboarding.
     expect(screen.queryByText(/Gemini 4 Neon \(/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Gemini 4 Carbon \(/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Claude Opus 5\.5 \(/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Gemini 4 Hydrogen \(/)).not.toBeInTheDocument();
     expect(screen.queryByLabelText(/thinking effort|reasoning effort/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/Thinking effort|Reasoning effort/i)).not.toBeInTheDocument();
@@ -200,7 +244,7 @@ describe('DefaultStep Antigravity series onboarding', () => {
     const savedArg = (h.mutateAsync.mock.calls[0] as unknown as [{ model_preference: Record<string, unknown> }])[0];
     expect(savedArg.model_preference).toMatchObject({
       preferred_model: 'gemini-4-neon-high-oauth',
-      preferred_background_model: 'gemini-4-hydrogen-high-oauth',
+      preferred_background_model: 'gemini-4-hydrogen-low-oauth',
       background_follows: null,
     });
   });

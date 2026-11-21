@@ -20,8 +20,10 @@ import { SUBSCRIPTIONS } from '@/api/oauth';
 import type { AccessType } from '@/components/model/types';
 import type { AccountPolicy } from '@/types/api';
 import { isPlatformMode } from '@/config/hostMode';
-// DALTON-HOOK(dalton-setup): omit Claude Code recommendation from OAuth method copy in Dalton
+// DALTON-HOOK(dalton-setup): omit Claude Code recommendation and gate skip on live Dalton team-model availability
 import { isDaltonBuild } from '@/config/brand';
+import { RowButton } from '../answers/parts';
+import { useDaltonTeamModels } from '../answers/useTeamModels';
 // DALTON-HOOK(team-credentials): team-shared credentials hint & PM disconnect guard
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { TEAM_SHARED_CREDENTIALS_HINT, useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(team-credentials)
@@ -174,6 +176,8 @@ export default function MethodStep() {
   const { providers: configuredProviders, hasAny: hasConfigured } = useConfiguredProviders();
   // DALTON-HOOK(team-credentials): team-shared credentials status
   const { isShared: isTeamShared, canDisconnect, canManage } = useTeamCredentials();
+  // DALTON-HOOK(dalton-setup): check live Dalton team-model availability via useDaltonTeamModels
+  const team = useDaltonTeamModels();
   const allowDisconnect = !isDaltonAuth || canDisconnect;
   // DALTON-HOOK(team-credentials): a non-PM member cannot write the shared
   // credentials, so the method rows lead only to read-only notes for them.
@@ -182,7 +186,9 @@ export default function MethodStep() {
   const [localRedeemed, setLocalRedeemed] = useState(false);
   const hasPlatformAccess = (user?.access_tier ?? -1) >= 0 || localRedeemed;
   // Wait for user data before using hasPlatformAccess to avoid flicker
-  const canSkip = hasConfigured || teamManagedByAdmin || (!userLoading && hasPlatformAccess);
+  // DALTON-HOOK(dalton-setup): do not let non-admin members skip to /setup/defaults while team models are unavailable
+  const teamModelsBlocked = isDaltonBuild && teamManagedByAdmin && !team.available;
+  const canSkip = !teamModelsBlocked && (hasConfigured || teamManagedByAdmin || (!userLoading && hasPlatformAccess));
   const [removing, setRemoving] = useState<ConfiguredProvider | null>(null);
 
   const headingId = useId();
@@ -272,6 +278,18 @@ export default function MethodStep() {
         <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
           {t('modelAccess.teamManagedByAdmin')}
         </p>
+      )}
+      {/* DALTON-HOOK(dalton-setup): prompt to contact admin & retry when team sharing has no available models */}
+      {isDaltonBuild && team.empty && !team.canManage && (
+        <div
+          data-testid="setup-method-team-models-empty"
+          className="shell-box flex items-center justify-between gap-3 px-4 py-3"
+        >
+          <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
+            {t('setup.answers.default.teamModelsEmpty')}
+          </p>
+          <RowButton onClick={team.retry}>{t('setup.answers.tryAgain')}</RowButton>
+        </div>
       )}
       {/* Configured providers banner (visible when looping back) */}
       {hasConfigured && (

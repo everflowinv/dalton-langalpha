@@ -105,7 +105,9 @@
         ],
         "default": "low",
         "write": "parameters.thinking_level"
-      }
+      },
+      "intelligence": 5,
+      "speed": 3
     },
     "gemini-4-carbon-medium-oauth": {
       "prompt_guidance": "lean",
@@ -130,7 +132,9 @@
         ],
         "default": "medium",
         "write": "parameters.thinking_level"
-      }
+      },
+      "intelligence": 5,
+      "speed": 3
     },
     "gemini-4-carbon-high-oauth": {
       "prompt_guidance": "lean",
@@ -155,7 +159,9 @@
         ],
         "default": "high",
         "write": "parameters.thinking_level"
-      }
+      },
+      "intelligence": 5,
+      "speed": 3
     },
     "gemini-4-hydrogen-low-oauth": {
       "prompt_guidance": "lean",
@@ -180,7 +186,9 @@
         ],
         "default": "low",
         "write": "parameters.thinking_level"
-      }
+      },
+      "intelligence": 4,
+      "speed": 5
     },
     "gemini-4-hydrogen-medium-oauth": {
       "prompt_guidance": "lean",
@@ -205,7 +213,9 @@
         ],
         "default": "medium",
         "write": "parameters.thinking_level"
-      }
+      },
+      "intelligence": 4,
+      "speed": 5
     },
     "gemini-4-hydrogen-high-oauth": {
       "prompt_guidance": "lean",
@@ -230,7 +240,9 @@
         ],
         "default": "high",
         "write": "parameters.thinking_level"
-      }
+      },
+      "intelligence": 4,
+      "speed": 5
     },
     "gemini-4-hydrogen-xhigh-oauth": {
       "prompt_guidance": "lean",
@@ -255,7 +267,9 @@
         ],
         "default": "xhigh",
         "write": "parameters.thinking_level"
-      }
+      },
+      "intelligence": 4,
+      "speed": 5
     },
     "gemini-4-neon-low-oauth": {
       "prompt_guidance": "lean",
@@ -280,7 +294,9 @@
         ],
         "default": "low",
         "write": "parameters.thinking_level"
-      }
+      },
+      "intelligence": 5,
+      "speed": 4
     },
     "gemini-4-neon-medium-oauth": {
       "prompt_guidance": "lean",
@@ -305,7 +321,9 @@
         ],
         "default": "medium",
         "write": "parameters.thinking_level"
-      }
+      },
+      "intelligence": 5,
+      "speed": 4
     },
     "gemini-4-neon-high-oauth": {
       "prompt_guidance": "lean",
@@ -330,7 +348,9 @@
         ],
         "default": "high",
         "write": "parameters.thinking_level"
-      }
+      },
+      "intelligence": 5,
+      "speed": 4
     },
     "gemini-2.5-pro-oauth": {
       "prompt_guidance": "lean",
@@ -865,7 +885,9 @@
         ],
         "default": "xhigh",
         "write": "parameters.thinking_level"
-      }
+      },
+      "intelligence": 5,
+      "speed": 4
     }
   },
   "model_overrides": {

@@ -532,6 +532,49 @@ def test_native_catalog_build_entries_antigravity_family_templates(monkeypatch):
     assert meta_out["gpt-oss-140b-medium-oauth"]["family"] == "openai-gpt"
 
 
+def test_native_catalog_build_entries_antigravity_gemini_inherits_direct_ratings(monkeypatch):
+    """Newly generated antigravity-oauth Gemini overlay entries inherit ratings from direct Gemini manifest entries."""
+    from src.llms.llm import LLM
+
+    LLM._model_config = None
+    llm_config = LLM.get_model_config().llm_config or {}
+    meta_map = load_dalton_meta()
+
+    added = [
+        {
+            "provider": "antigravity-oauth",
+            "upstream_id": "gemini-4-neon-minimal",
+            "display_name": "Gemini 4 Neon Minimal",
+            "suggested_key": "gemini-4-neon-minimal-oauth",
+            "conflict": False,
+            "context": 1048576,
+            "max_output": 262144,
+            "supports_reasoning_effort": None,
+            "reasoning_efforts": None,
+        },
+        {
+            "provider": "codex-oauth",
+            "upstream_id": "gpt-6.9-sol",
+            "display_name": "GPT-6.9 Sol",
+            "suggested_key": "gpt-6.9-sol-oauth",
+            "conflict": False,
+            "context": 1050000,
+            "max_output": None,
+            "supports_reasoning_effort": None,
+            "reasoning_efforts": ["low", "high"],
+            "reasoning_default": "high",
+        },
+    ]
+    models_out, _ = build_overlay_entries(added, llm_config, meta_map)
+
+    neon_min = models_out["gemini-4-neon-minimal-oauth"]
+    assert neon_min["intelligence"] == 5
+    assert neon_min["speed"] == 4
+    codex_entry = models_out["gpt-6.9-sol-oauth"]
+    assert "intelligence" not in codex_entry
+    assert "speed" not in codex_entry
+
+
 def test_native_catalog_build_entries_write_xai_capability_fields(monkeypatch):
     from src.llms.llm import LLM
 

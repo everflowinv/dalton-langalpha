@@ -10,7 +10,7 @@ import type { Payer } from '@/lib/modelPayer';
 import { listedFor } from '@/lib/connectionModels';
 import type { ConnectionOf } from '@/lib/providerCatalog';
 import type { CustomModelEntry } from '@/components/model/types';
-// DALTON-HOOK(dalton-setup): Dalton recommended models and Claude Code / credits filtering
+// DALTON-HOOK(dalton-setup): Dalton recommended models, curated setup candidates, and Claude Code / credits filtering
 // DALTON-HOOK(antigravity-series): series-level collapsing & recommendation resolution for onboarding
 import {
   DALTON_BACKGROUND_MODEL,
@@ -19,6 +19,7 @@ import {
   DALTON_DEFAULT_SERIES,
   isDaltonAllowedModel,
   resolveDaltonSeriesDefaultModel,
+  resolveDaltonSetupCandidates,
 } from '@/config/daltonSetup';
 import {
   inspectSavedAntigravityModel,
@@ -145,14 +146,15 @@ const RULES: Record<ModelsAnswer, {
         ? { primary: input.systemDefault, primaryWhy: 'deployment' } : strongestPick(input, pool);
     },
     background: (input, pool, primary) => {
-      // DALTON-HOOK(dalton-setup): prefer Hydrogen series default for background in Dalton deployments
-      // DALTON-HOOK(antigravity-series): resolve Hydrogen default variant via antigravity_series
+      // DALTON-HOOK(dalton-setup): prefer Hydrogen low variant for background in Dalton deployments
+      // DALTON-HOOK(antigravity-series): resolve Hydrogen -low variant via antigravity_series
       if (input.dalton) {
         const allowedSlots = input.slotModels.filter((m) => daltonAllowed(input, m));
         const daltonBg = resolveDaltonSeriesDefaultModel(DALTON_BACKGROUND_SERIES, allowedSlots, {
           seriesCatalog: input.seriesCatalog,
           selectableSeries: input.selectableSeries,
           fallbackModel: DALTON_BACKGROUND_MODEL,
+          preferLowEffort: true,
         });
         if (daltonBg) {
           return { background: daltonBg, backgroundWhy: 'daltonRecommended' };
@@ -201,6 +203,7 @@ const RULES: Record<ModelsAnswer, {
             seriesCatalog: input.seriesCatalog,
             selectableSeries: input.selectableSeries,
             fallbackModel: DALTON_BACKGROUND_MODEL,
+            preferLowEffort: true,
           })
         : null;
       return daltonBg
@@ -210,10 +213,15 @@ const RULES: Record<ModelsAnswer, {
   },
 };
 
-function recommend(input: DefaultChoicesInput, pool: string[], effectiveAnswer: ModelsAnswer): RecommendedSetup {
+function recommend(
+  input: DefaultChoicesInput,
+  primaryPool: string[],
+  backgroundPool: string[],
+  effectiveAnswer: ModelsAnswer,
+): RecommendedSetup {
   const rule = RULES[effectiveAnswer];
-  const primary = rule.primary(input, pool);
-  return { ...primary, ...rule.background(input, pool, primary.primary) };
+  const primary = rule.primary(input, primaryPool);
+  return { ...primary, ...rule.background(input, backgroundPool, primary.primary) };
 }
 
 export function defaultChoices(input: DefaultChoicesInput): DefaultChoices {
@@ -273,16 +281,27 @@ export function defaultChoices(input: DefaultChoicesInput): DefaultChoices {
   }
   pool = collapsedPool;
 
+  // DALTON-HOOK(dalton-setup): Dalton /setup/default shows the fixed 5 curated candidates in order when available
+  const curated = input.dalton ? resolveDaltonSetupCandidates(rawPool) : [];
+  const primaryPool = curated.length > 0 ? curated : pool;
+
   // DALTON-HOOK(antigravity-series): preserve saved suffixed variant while keeping 1 card per series
-  const recommended = recommend(input, pool, effectiveAnswer);
+  const recommended = recommend(input, primaryPool, pool, effectiveAnswer);
   // Connecting saved the model it starts on, which is the recommended one; a
   // default saved on an earlier run of setup is kept (including legacy suffixed
   // Antigravity variants belonging to an available series).
+  const sameAs = (a: string, b: string | null) => a === b || sameAntigravitySeries(a, b, seriesOpts);
   const canKeepPreferred = input.models !== 'langalpha_models' || !!input.dalton;
+  if (curated.length > 0) {
+    const saved = canKeepPreferred && input.preferred && rawPool.includes(input.preferred)
+      && primaryPool.some((m) => sameAs(m, input.preferred))
+      ? input.preferred : null;
+    const initial = saved ?? recommended.primary;
+    return { list: curated, initial, recommended };
+  }
   const saved = canKeepPreferred && input.preferred && rawPool.includes(input.preferred)
     ? input.preferred : null;
   const initial = saved ?? recommended.primary;
-  const sameAs = (a: string, b: string | null) => a === b || sameAntigravitySeries(a, b, seriesOpts);
   const rest = pool.filter((m) => !sameAs(m, initial) && !sameAs(m, recommended.primary));
   const head = [initial, recommended.primary].filter((m, i, all): m is string => (
     !!m && all.findIndex((other) => sameAs(m, other)) === i

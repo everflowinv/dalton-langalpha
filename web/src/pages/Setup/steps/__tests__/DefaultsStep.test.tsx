@@ -215,4 +215,34 @@ describe('DefaultsStep before the preferences arrive', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('Failed to load model settings');
     expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
   });
+
+  // DALTON-HOOK(dalton-setup): verify non-Dalton builds preserve upstream behavior when catalog is empty/unread
+  it('keeps Continue enabled with two saved defaults when catalog read returns empty in non-Dalton builds', async () => {
+    h.models = {};
+    h.slotModels = {};
+    h.preferences = {
+      model_preference: {
+        preferred_model: 'claude-small',
+        preferred_background_model: 'gpt-terra',
+      },
+    };
+    try {
+      renderWithProviders(<DefaultsStep />);
+      const continueBtn = screen.getByRole('button', { name: 'Continue' });
+      expect(continueBtn).toBeEnabled();
+      fireEvent.click(continueBtn);
+      await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledWith({
+        model_preference: {
+          preferred_model: 'claude-small',
+          preferred_background_model: 'gpt-terra',
+          compaction_model: null,
+          fetch_model: null,
+          fallback_models: [],
+        },
+      }));
+    } finally {
+      h.models = { anthropic: { models: ['claude-big', 'claude-small'] }, openai: { models: ['gpt-sol', 'gpt-terra'] } };
+      h.slotModels = null;
+    }
+  });
 });

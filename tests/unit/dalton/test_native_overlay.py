@@ -1648,8 +1648,8 @@ def test_gemini_4_carbon_client_request_and_introductory_notional_price(monkeypa
         surfaced = catalog[key]
         assert surfaced.get("display_name") == display_name
         assert surfaced["context"] == 1_048_576
-        assert "speed" not in surfaced
-        assert "intelligence" not in surfaced
+        assert surfaced["intelligence"] == 5
+        assert surfaced["speed"] == 3
         assert family_of(key) == "google-gemini"
         assert is_text_only(key) is False
 
@@ -2086,5 +2086,75 @@ def test_gemini_4_overlay_models_default_to_expansive_compaction_and_user_pref_o
         assert compaction_profile_for(entry) == "expansive", key
         assert mc.get_compaction_profile(key) == "expansive", key
         assert resolve_tuning({"compaction_profile": "moderate"}, key).compaction_profile == "moderate"
+
+
+def test_antigravity_gemini_ratings_inherited_in_overlay_and_catalog(monkeypatch):
+    """Antigravity Gemini entries carry intelligence & speed inherited from their direct Gemini manifest entries."""
+    monkeypatch.setattr(LLM, "_model_config", None)
+    mc = LLM.get_model_config()
+    catalog = mc.get_model_metadata()
+    overlay_models = (load_overlay_data(NATIVE_OVERLAY_PATH) or {}).get("models") or {}
+
+    expected_by_prefix = {
+        "gemini-4-neon-": (5, 4),
+        "gemini-4-carbon-": (5, 3),
+        "gemini-4-hydrogen-": (4, 5),
+    }
+    for prefix, (exp_int, exp_spd) in expected_by_prefix.items():
+        matched = [
+            k
+            for k, v in overlay_models.items()
+            if isinstance(v, dict)
+            and v.get("provider") == "antigravity-oauth"
+            and k.startswith(prefix)
+        ]
+        assert matched, f"Expected Antigravity entries for {prefix}"
+        for key in matched:
+            assert overlay_models[key]["intelligence"] == exp_int, key
+            assert overlay_models[key]["speed"] == exp_spd, key
+            assert catalog[key]["intelligence"] == exp_int, key
+            assert catalog[key]["speed"] == exp_spd, key
+
+    # Existing explicit Argon ratings remain preserved
+    assert overlay_models["gemini-4-argon-low-oauth"]["intelligence"] == 5
+    assert overlay_models["gemini-4-argon-low-oauth"]["speed"] == 3
+    assert overlay_models["gemini-4-argon-high-oauth"]["speed"] == 2
+
+
+def test_inherit_antigravity_gemini_ratings_leaves_non_antigravity_unchanged():
+    """Rating inheritance fills missing ratings on antigravity-oauth Gemini entries only."""
+    from src.dalton.llm.overlay import inherit_antigravity_gemini_ratings
+
+    catalog: dict[str, Any] = {
+        "gemini-4-neon": {"provider": "gemini", "model_id": "gemini-4-neon", "intelligence": 5, "speed": 4},
+        "gemini-4-argon": {"provider": "gemini", "model_id": "gemini-4-argon", "intelligence": 5, "speed": 3},
+        "gemini-4-neon-high-oauth": {"provider": "antigravity-oauth", "model_id": "gemini-4-neon-high"},
+        "gemini-4-argon-high-oauth": {
+            "provider": "antigravity-oauth",
+            "model_id": "gemini-4-argon-high",
+            "intelligence": 5,
+            "speed": 2,
+        },
+        # Non-Antigravity and non-Gemini entries must remain untouched
+        "gemini-4-neon-custom": {"provider": "openrouter", "model_id": "gemini-4-neon-high"},
+        "muse-ember-1.0-oauth": {"provider": "muse-oauth", "model_id": "muse-ember-1.0"},
+        "gpt-6.2-astra-oauth": {"provider": "codex-oauth", "model_id": "gpt-6.2-astra"},
+    }
+
+    updated = inherit_antigravity_gemini_ratings(catalog)
+    assert updated == 1
+    assert catalog["gemini-4-neon-high-oauth"]["intelligence"] == 5
+    assert catalog["gemini-4-neon-high-oauth"]["speed"] == 4
+    # Explicit speed=2 on argon-high is NOT overwritten by direct speed=3
+    assert catalog["gemini-4-argon-high-oauth"]["intelligence"] == 5
+    assert catalog["gemini-4-argon-high-oauth"]["speed"] == 2
+    # Non-Antigravity entries remain untouched
+    assert "intelligence" not in catalog["gemini-4-neon-custom"]
+    assert "speed" not in catalog["gemini-4-neon-custom"]
+    assert "intelligence" not in catalog["muse-ember-1.0-oauth"]
+    assert "speed" not in catalog["muse-ember-1.0-oauth"]
+    assert "intelligence" not in catalog["gpt-6.2-astra-oauth"]
+    assert "speed" not in catalog["gpt-6.2-astra-oauth"]
+
 
 

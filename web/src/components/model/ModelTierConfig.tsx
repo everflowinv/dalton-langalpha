@@ -48,6 +48,7 @@ export interface ModelTierConfigProps {
   customModels?: readonly CustomModelEntry[]
   missingLabel?: (value: string) => string
   backgroundMissingLabel?: (value: string) => string
+  hideEffortPicker?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +72,7 @@ export function ModelTierConfig({
   customModels,
   missingLabel,
   backgroundMissingLabel,
+  hideEffortPicker = false,
 }: ModelTierConfigProps) {
   const { t } = useTranslation()
   const [explainerOpen, setExplainerOpen] = useState(true)
@@ -196,6 +198,7 @@ export function ModelTierConfig({
         seriesCatalog={seriesCatalog}
         rawMetadata={rawMetadata}
         customModels={customModels}
+        hideEffortPicker={hideEffortPicker}
       />
 
       {/* Background model selector */}

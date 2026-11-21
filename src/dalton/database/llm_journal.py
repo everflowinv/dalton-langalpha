@@ -219,6 +219,7 @@ async def claim_journal_invocation(
     stale_after_s: int = 900,
     resend_indeterminate: bool = False,
     resend_max_attempts: int | None = None,
+    stamp_credential_holder: bool = True,
     conn: Any = None,
 ) -> tuple[str, dict[str, Any]]:
     """Atomically claim or evaluate an invocation in `dalton_llm_journal` (P0N.7 §3).
@@ -230,11 +231,11 @@ async def claim_journal_invocation(
     - `'indeterminate'`: prior attempt crashed/timed out; do not resend unless `resend_indeterminate=True` and the attempt cap (`resend_max_attempts`) is not reached
     - `'conflict'`: `invocation_id` exists with a mismatched `request_hash`
     """
-    # DALTON-HOOK(team-credentials): keep user_id as caller and stamp credential_user_id in usage JSONB only when sharing is enabled
+    # DALTON-HOOK(team-credentials): keep user_id as caller and stamp credential_user_id in usage JSONB only when sharing is enabled and not deployment-keyed
     sharing_enabled = is_team_credential_sharing_enabled()
     initial_usage = (
         {"credential_user_id": credential_user_id(str(user_id))}
-        if sharing_enabled and user_id
+        if stamp_credential_holder and sharing_enabled and user_id
         else None
     )
 
@@ -357,8 +358,9 @@ async def claim_journal_invocation(
                 return "indeterminate", existing
 
             # Either state == 'failed', response was pruned on 'done', or resend_indeterminate=True
+            usage_reset_sql = ", usage = NULL" if not stamp_credential_holder else ""
             await cur.execute(
-                """
+                f"""
                 UPDATE dalton_llm_journal
                 SET state = 'pending',
                     attempt = attempt + 1,
@@ -368,7 +370,7 @@ async def claim_journal_invocation(
                     error_text = NULL,
                     model_key = %s,
                     provider = COALESCE(%s, provider),
-                    billing_type = COALESCE(%s, billing_type)
+                    billing_type = COALESCE(%s, billing_type){usage_reset_sql}
                 WHERE invocation_id = %s
                 RETURNING *
                 """,
@@ -398,6 +400,7 @@ async def complete_journal_done(
     notional_usd: Decimal = Decimal("0"),
     provider: str | None = None,
     billing_type: str | None = None,
+    stamp_credential_holder: bool = True,
     conn: Any = None,
 ) -> dict[str, Any] | None:
     """Transition a journal row to `state='done'` with response (or NULL when `persist_raw=False`), usage, and costs.
@@ -416,7 +419,7 @@ async def complete_journal_done(
 
     usage_clause = (
         "COALESCE(usage, '{}'::jsonb) || %s::jsonb"
-        if is_team_credential_sharing_enabled()
+        if (stamp_credential_holder and is_team_credential_sharing_enabled())
         else "%s::jsonb"
     )
 
