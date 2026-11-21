@@ -1266,6 +1266,11 @@ async def put_dalton_automation_endpoint(
 
     raw_body_dict = body.model_dump(exclude_none=True)
     spec = body.entry or body.spec or body.model_dump(exclude={"workspace_id", "entry", "spec"}, exclude_none=True)
+    if isinstance(spec, dict):
+        extra_fields = body.model_extra or {}
+        for nullable_key in ("llm_model", "reasoning_effort"):
+            if nullable_key in extra_fields and extra_fields[nullable_key] is None and nullable_key not in spec:
+                spec = {**spec, nullable_key: None}
     if (
         isinstance(spec, dict)
         and "automation_id" in raw_body_dict
@@ -1294,6 +1299,7 @@ async def put_dalton_automation_endpoint(
         await _verify_workspace_access(ws_str, user_id)
         resolved_ws_id = ws_str
     from src.dalton.services.report_delivery import ReportDeliveryError
+    from src.server.services.automations.lifecycle import AutomationRefusal
 
     try:
         return await schedule_dalton_automation_helper(
@@ -1303,6 +1309,10 @@ async def put_dalton_automation_endpoint(
             workspace_id=resolved_ws_id,
             via_rest=True,
         )
+    except AutomationRefusal as exc:
+        if exc.field == "reasoning_effort":
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     except ReportDeliveryError as exc:
         from src.server.app.automations import _report_delivery_http_error
 

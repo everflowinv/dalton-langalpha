@@ -73,6 +73,7 @@ _SNAPSHOT_COLUMNS = (
     "instruction",
     "workspace_id",
     "llm_model",
+    "reasoning_effort",
     "additional_context",
     "thread_strategy",
     "conversation_thread_id",
@@ -245,9 +246,15 @@ def _uuid_or_none(value: Any, field_name: str) -> UUID | None:
         ) from exc
 
 
-def _require_complete_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+def _require_complete_snapshot(
+    snapshot: Mapping[str, Any],
+    *,
+    custom_models: set[str] | frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     missing = [
-        name for name in ALLOWED_AUTOMATION_SNAPSHOT_FIELDS if name not in snapshot
+        name
+        for name in ALLOWED_AUTOMATION_SNAPSHOT_FIELDS
+        if name != "reasoning_effort" and name not in snapshot
     ]
     if missing:
         raise HTTPException(
@@ -267,6 +274,27 @@ def _require_complete_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
             detail="Rollback snapshot trigger_type is invalid",
         )
     copied = dict(snapshot)
+    raw_effort = copied.get("reasoning_effort")
+    if raw_effort is not None:
+        from src.llms.reasoning import REASONING_LEVELS
+
+        if not isinstance(raw_effort, str) or raw_effort not in REASONING_LEVELS:
+            raise HTTPException(
+                status_code=409,
+                detail="Rollback snapshot reasoning_effort is invalid",
+            )
+    snap_model = copied.get("llm_model")
+    if isinstance(snap_model, str) and snap_model and snap_model not in custom_models:
+        from src.dalton.llm.antigravity_series import ANTIGRAVITY_PROVIDER
+        from src.llms.llm import LLM as LLMFactory
+
+        try:
+            entry = LLMFactory.get_model_config().get_model_config(snap_model)
+        except Exception:
+            entry = None
+        if isinstance(entry, Mapping) and entry.get("provider") == ANTIGRAVITY_PROVIDER:
+            raw_effort = None
+    copied["reasoning_effort"] = raw_effort
     if not isinstance(copied.get("trigger_config"), Mapping):
         raise HTTPException(
             status_code=409,
@@ -386,6 +414,7 @@ def _base_fields(row: Mapping[str, Any]) -> dict[str, Any]:
         "instruction": row.get("instruction") or "",
         "workspace_id": _uuid_or_none(row.get("workspace_id"), "workspace_id"),
         "llm_model": row.get("llm_model"),
+        "reasoning_effort": row.get("reasoning_effort"),
         "additional_context": additional if isinstance(additional, (dict, list)) else None,
         "thread_strategy": row.get("thread_strategy") or "new",
         "conversation_thread_id": _uuid_or_none(
@@ -1011,7 +1040,15 @@ async def rollback_automation(
                     status_code=409,
                     detail="Rollback target snapshot is missing",
                 )
-            snapshot = _require_complete_snapshot(raw_snapshot)
+            pref_bag = (
+                prefs.get("model_preference")
+                if isinstance(prefs, Mapping) and isinstance(prefs.get("model_preference"), Mapping)
+                else None
+            )
+            from src.llms.preferences import custom_model_names
+
+            snap_custom = custom_model_names(dict(pref_bag)) if pref_bag else frozenset()
+            snapshot = _require_complete_snapshot(raw_snapshot, custom_models=snap_custom)
             if str(row.get("scope") or "") == "company":
                 snapshot["delivery_config"] = {}
             trigger = str(snapshot["trigger_type"])
@@ -1116,6 +1153,7 @@ async def rollback_automation(
                         "workspace_id",
                     ),
                     "llm_model": snapshot.get("llm_model"),
+                    "reasoning_effort": snapshot.get("reasoning_effort"),
                     "additional_context": (
                         snapshot.get("additional_context")
                         if isinstance(snapshot.get("additional_context"), (dict, list))

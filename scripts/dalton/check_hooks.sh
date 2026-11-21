@@ -464,6 +464,9 @@ ALLOWED_HOOKS=(
   # include executions when either the automation's workspace or the thread's
   # workspace belongs to computer_id (excluding Home), without duplicating rows.
   "history-computer-scope"
+  # Per-automation reasoning_effort field (d042), shared write/snapshot/file paths,
+  # executor/continuation/wakeup/fallback inheritance, and MoreOptions effort selector.
+  "automation-effort"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

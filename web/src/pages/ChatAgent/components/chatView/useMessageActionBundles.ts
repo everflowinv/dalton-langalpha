@@ -103,7 +103,12 @@ export function useMessageActionBundles(src: MessageActionSources): {
     src.onEditMessage(id, content, src.chatInputRef.current?.getModelOptions?.()));
   const stableRegenerate = useStableHandler((id: string) =>
     src.onRegenerate(id, src.chatInputRef.current?.getModelOptions?.()));
-  const stableRetry = useStableHandler(() => src.onRetry(src.chatInputRef.current?.getModelOptions?.()));
+  // DALTON-HOOK(automation-effort): read retry options without auto-sending saved composer reasoningEffort
+  const stableRetry = useStableHandler(() =>
+    src.onRetry(
+      src.chatInputRef.current?.getRetryModelOptions?.()
+      ?? src.chatInputRef.current?.getModelOptions?.(),
+    ));
   const editDrafts = src.editDrafts;
   // Feedback handlers close over the stored ratings, so their raw identity
   // churns on every load/submit; wrap them or a single thumbs click would

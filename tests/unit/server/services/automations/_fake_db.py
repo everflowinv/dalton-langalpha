@@ -25,13 +25,13 @@ from src.server.database import automation as automation_db
 # nullable column, and a JSON column ignores None.
 _PLAIN = {
     "name", "description", "cron_expression", "timezone", "instruction", "workspace_id",
-    "llm_model", "thread_strategy", "conversation_thread_id", "status",
+    "llm_model", "reasoning_effort", "thread_strategy", "conversation_thread_id", "status",  # DALTON-HOOK(automation-effort)
     "max_failures", "failure_count", "disable_reason", "next_run_at", "last_run_at",
     "scope", "updated_by",  # DALTON-HOOK(company-automations)
 }
 _NULLABLE = {
     "next_run_at", "last_run_at", "conversation_thread_id", "disable_reason",
-    "description", "llm_model", "updated_by",  # DALTON-HOOK(company-automations)
+    "description", "llm_model", "reasoning_effort", "updated_by",  # DALTON-HOOK(company-automations) DALTON-HOOK(automation-effort)
 }
 _JSON = {"trigger_config", "additional_context", "delivery_config", "metadata"}
 _UUID_COLUMNS = {"workspace_id", "conversation_thread_id"}
@@ -195,6 +195,7 @@ class FakeAutomationsDb:
         next_run_at: Any = None,
         workspace_id: str | None = None,
         llm_model: str | None = None,
+        reasoning_effort: str | None = None,  # DALTON-HOOK(automation-effort)
         additional_context: list[dict[str, Any]] | None = None,
         thread_strategy: str = "new",
         conversation_thread_id: str | None = None,
@@ -235,6 +236,7 @@ class FakeAutomationsDb:
             "thread_strategy": thread_strategy,
             "conversation_thread_id": _uuid(conversation_thread_id),
             "llm_model": llm_model,
+            "reasoning_effort": reasoning_effort,  # DALTON-HOOK(automation-effort)
             "additional_context": additional_context,
             "delivery_config": delivery_config or {},
             "metadata": metadata or {},

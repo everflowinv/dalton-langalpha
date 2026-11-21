@@ -36,6 +36,8 @@ export interface FormState {
   place: string;
   // DALTON-HOOK(automation-model): per-automation model selection
   llm_model: string | null;
+  // DALTON-HOOK(automation-effort): per-automation reasoning effort override
+  reasoning_effort: string | null;
   instruction: string;
   thread_strategy: Automation['thread_strategy'];
   max_failures: number;
@@ -64,6 +66,8 @@ export const INITIAL_FORM: FormState = {
   place: '',
   // DALTON-HOOK(automation-model): default to account default model (null)
   llm_model: null,
+  // DALTON-HOOK(automation-effort): default to unset (null)
+  reasoning_effort: null,
   instruction: '',
   thread_strategy: 'continue',
   max_failures: 3,
@@ -96,6 +100,8 @@ export function automationToFormState(automation: Automation, timezone = deviceT
     place: runsInHome(automation, homeId) ? ALL_WORKSPACES : automation.workspace_id ?? '',
     // DALTON-HOOK(automation-model): backfill saved llm_model
     llm_model: automation.llm_model ?? null,
+    // DALTON-HOOK(automation-effort): backfill saved reasoning_effort
+    reasoning_effort: automation.reasoning_effort ?? null,
     instruction: automation.instruction,
     thread_strategy: automation.thread_strategy,
     max_failures: automation.max_failures,
@@ -249,12 +255,23 @@ function triggerPayload(form: FormState): Trigger {
   }
 }
 
-export function formStateToPayload(form: FormState, workspaceId: string): AutomationPayload {
+export function formStateToPayload(
+  form: FormState,
+  workspaceId: string,
+  // DALTON-HOOK(automation-effort): distinguish omitted vs explicit null reasoning_effort on create
+  options?: { explicitNullEffort?: boolean },
+): AutomationPayload {
   return {
     ...settingsPayload(form, workspaceId),
     ...(form.description ? { description: form.description } : {}),
     // DALTON-HOOK(automation-model): include llm_model when selected
     ...(form.llm_model ? { llm_model: form.llm_model } : {}),
+    // DALTON-HOOK(automation-effort): include reasoning_effort when set or explicitly cleared to follow default
+    ...(form.reasoning_effort
+      ? { reasoning_effort: form.reasoning_effort }
+      : options?.explicitNullEffort
+        ? { reasoning_effort: null }
+        : {}),
     trigger_type: form.trigger_type,
     timezone: form.timezone,
     ...triggerPayload(form),
@@ -313,6 +330,8 @@ export function formStateToUpdatePayload(
     description: form.description,
     // DALTON-HOOK(automation-model): send llm_model only when changed (null clears override)
     ...(form.llm_model !== initial.llm_model ? { llm_model: form.llm_model } : {}),
+    // DALTON-HOOK(automation-effort): send reasoning_effort only when changed (null clears override)
+    ...(form.reasoning_effort !== initial.reasoning_effort ? { reasoning_effort: form.reasoning_effort } : {}),
   };
   if (!TRIGGER_FIELDS[form.trigger_type].some((k) => form[k] !== initial[k])) return payload;
   const trigger = triggerPayload(form);
