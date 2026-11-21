@@ -2589,6 +2589,22 @@ async def execute_claimed_host_run(
         task_tz = timezone.utc
     reference_date = slot_dt.astimezone(task_tz).date()
 
+    # The bridge leaves the redacted outbox at `.dalton-runs/<run_id>/outbox.json`,
+    # as a container run does; without reading it here every scheduled host run
+    # finalized with no payload, so notify_status was always `skipped` and a host
+    # task with notify_enabled (weekly-token-usage, 2026-11-21) never sent its card.
+    metadata_error: SafeFsError | None = None
+    try:
+        outbox_payload, frozen_manifest = read_run_artifacts(
+            claimed.run_id,
+            path_map=paths,
+            strict=True,
+        )
+    except SafeFsError as meta_exc:
+        metadata_error = meta_exc
+        outbox_payload = None
+        frozen_manifest = None
+
     evaluation = evaluate_task_run(
         TaskEvaluationContext(
             job_key=claimed.job_key,
@@ -2602,6 +2618,17 @@ async def execute_claimed_host_run(
             reference_date=reference_date,
         )
     )
+    if metadata_error is not None:
+        evaluation = TaskEvaluationResult(
+            ok=False,
+            status="failed",
+            failure_reason=f"invalid_run_metadata:{metadata_error.code}",
+            warnings=list(evaluation.warnings),
+            details={
+                **evaluation.details,
+                "metadata_error_code": metadata_error.code,
+            },
+        )
     container_like_outcome = ContainerInspectionOutcome(
         container_id=f"host:{claimed.run_id}",
         running=False,
@@ -2617,6 +2644,8 @@ async def execute_claimed_host_run(
         container_id=None,
         outcome=container_like_outcome,
         evaluation=evaluation,
+        outbox_payload=outbox_payload,
+        frozen_manifest=frozen_manifest,
         path_map=paths,
     )
 
