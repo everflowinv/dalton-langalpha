@@ -4,18 +4,32 @@ import { useTranslation } from 'react-i18next';
 import { X, Upload, FileText, CheckCircle2, Circle, AlertCircle } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
 import { buttonSlot } from '@/components/ui/button-class';
+// DALTON-HOOK(workspace-dedup): non-fatal toast when coverage unit auto-registration fails
+import { toast } from '@/components/ui/use-toast';
 import { Input } from '../../../components/ui/input';
 import { Select } from '@/components/ui/select';
 import { useLocale } from '@/hooks/useLocale';
 import { formatBytes } from '@/lib/format';
-import type { Computer, Workspace } from '@/types/api';
+import type { Computer, CoverageUnitKindChoice, Workspace } from '@/types/api';
 import { startWorkspace, uploadWorkspaceFile } from '../utils/api';
 import { isNeedsComputer, needsBackupOf } from '../utils/needsComputer';
 import { useOpenComputers } from '../hooks/useOpenComputers';
 import { ComputerRefusal, type ComputerRefusalKind } from './ComputerRefusal';
 import { createWorkspaceDenialMessage, denialMessage } from '../utils/denialMessage';
 import { clampWorkspaceName } from '../utils/workspaceName';
-import type { NewWorkspace } from '../hooks/useCreateWorkspace';
+// DALTON-HOOK(workspace-dedup): duplicate company workspace check helper, coverage fields & notice cards
+import { useDaltonCoverageUnits } from '@/lib/dalton/coverage';
+import { CoverageSuggestionNotice } from './dalton/CoverageSuggestionNotice';
+import { CoverageUnitFields } from './dalton/CoverageUnitFields';
+import { formatCoverageUnitWarning } from './dalton/coverageWarningMessage';
+import { DuplicateCompanyNotice } from './dalton/DuplicateCompanyNotice';
+import {
+  companyWorkspaceExistsOf,
+  coverageSuggestionOf,
+  type CompanyWorkspaceExistsInfo,
+  type CoverageSuggestionInfo,
+  type NewWorkspace,
+} from '../hooks/useCreateWorkspace';
 import { useComputers } from '../hooks/useComputers';
 import { useComputerSource } from '../hooks/useComputerSource';
 import { isComputerPreparing, liveComputers, takesWorkspaces } from '../utils/computerStatus';
@@ -34,7 +48,12 @@ type CreationStep = 'uploading' | 'done' | 'error';
 type FileUploadStatus = 'pending' | 'uploading' | 'done' | 'failed';
 
 /** Why the form can't go on: in words, or for want of a computer Home can live on. */
-type FormRefusal = { kind: 'message'; message: string } | Exclude<ComputerRefusalKind, { kind: 'onlyComputer' }>;
+type FormRefusal =
+  | { kind: 'message'; message: string }
+  // DALTON-HOOK(workspace-dedup): non-fatal duplicate company workspace & coverage suggestion notices bound to requestedName
+  | ({ kind: 'companyExists'; requestedName: string } & CompanyWorkspaceExistsInfo)
+  | ({ kind: 'coverageSuggestion'; requestedName: string } & CoverageSuggestionInfo)
+  | Exclude<ComputerRefusalKind, { kind: 'onlyComputer' }>;
 
 /**
  * CreateWorkspaceModal.
@@ -60,6 +79,20 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
 
   // Form state
   const [name, setName] = useState('');
+  // DALTON-HOOK(workspace-dedup): track latest typed name & coverage unit fields / prefill state (gated by coverage_units & internal tier)
+  const { data: coverageUnitsData, isError: coverageUnitsError } = useDaltonCoverageUnits(isOpen);
+  const coverageUnitsEnabled = !coverageUnitsError && coverageUnitsData?.enabled === true;
+  const coverageUnitsEnabledRef = useRef(coverageUnitsEnabled);
+  coverageUnitsEnabledRef.current = coverageUnitsEnabled;
+  const latestNameRef = useRef('');
+  const [coverageKind, setCoverageKind] = useState<CoverageUnitKindChoice>('none');
+  const coverageKindRef = useRef(coverageKind);
+  coverageKindRef.current = coverageKind;
+  const [coverageTicker, setCoverageTicker] = useState('');
+  const [coverageDisplayName, setCoverageDisplayName] = useState('');
+  const [coveragePrefilled, setCoveragePrefilled] = useState(false);
+  const coverageUserEditedRef = useRef(false);
+  const skipCoverageRegistrationRef = useRef(false);
   const [description, setDescription] = useState('');
   const [queuedFiles, setQueuedFiles] = useState<File[]>([]);
   // Why the form can't go on: in words, or for want of a computer (none is
@@ -199,11 +232,61 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
     setCreationStep(failed ? 'error' : 'done');
   };
 
-  const handleSubmit = async (e: React.FormEvent | Event) => {
-    e.preventDefault();
-    if (!name.trim() || submitting || preparingTarget) {
-      if (!name.trim()) setRefusal({ kind: 'message', message: t('workspace.workspaceNameRequired') });
+  // DALTON-HOOK(workspace-dedup): reset sticky skip-registration choice if modal closes externally
+  useEffect(() => {
+    if (!isOpen) {
+      skipCoverageRegistrationRef.current = false;
+    }
+  }, [isOpen]);
+
+  // DALTON-HOOK(workspace-dedup): apply suggestion prefill once coverage eligibility is enabled (handles query finishing after submit/409)
+  const applySuggestionPrefill = useCallback(
+    (suggestion: { coverage_kind?: string; ticker?: string | null; display_name?: string | null } | undefined) => {
+      if (
+        !coverageUnitsEnabledRef.current ||
+        !suggestion ||
+        (suggestion.coverage_kind !== 'company' && suggestion.coverage_kind !== 'sector') ||
+        skipCoverageRegistrationRef.current ||
+        coverageUserEditedRef.current ||
+        coverageKindRef.current !== 'none'
+      ) {
+        return;
+      }
+      setCoverageKind(suggestion.coverage_kind);
+      setCoverageTicker(suggestion.coverage_kind === 'company' ? (suggestion.ticker ?? '') : '');
+      setCoverageDisplayName(suggestion.display_name ?? '');
+      setCoveragePrefilled(true);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!coverageUnitsEnabled || !refusal) return;
+    if (refusal.kind !== 'coverageSuggestion' && refusal.kind !== 'companyExists') return;
+    if (latestNameRef.current.trim() !== refusal.requestedName) return;
+    applySuggestionPrefill(refusal.suggestion);
+  }, [coverageUnitsEnabled, refusal, applySuggestionPrefill]);
+
+  // DALTON-HOOK(workspace-dedup): support optional allowDuplicateCompany / skipCoverageSuggestion and lock override to the 409'd name
+  const submitCreate = async (
+    allowDuplicateCompany = false,
+    overrideName?: string,
+    skipCoverageSuggestion = false,
+  ) => {
+    const submittedName = (overrideName ?? name).trim();
+    if (!submittedName || submitting || preparingTarget) {
+      if (!submittedName) setRefusal({ kind: 'message', message: t('workspace.workspaceNameRequired') });
       return;
+    }
+
+    const effectiveSkipCoverage = skipCoverageSuggestion || skipCoverageRegistrationRef.current;
+    if (skipCoverageSuggestion) {
+      skipCoverageRegistrationRef.current = true;
+      setCoverageKind('none');
+      setCoverageTicker('');
+      setCoverageDisplayName('');
+      setCoveragePrefilled(false);
+      coverageUserEditedRef.current = false;
     }
 
     setSubmitting(true);
@@ -211,20 +294,58 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
 
     let workspace: Workspace;
     try {
+      const trimmedTicker = coverageTicker.trim();
+      const trimmedDisplay = coverageDisplayName.trim();
       workspace = await onCreate({
-        name: name.trim(),
+        name: submittedName,
         description: description.trim(),
         ...(choosesComputer && target ? { computerId: target.computer_id } : {}),
+        ...(allowDuplicateCompany ? { allowDuplicateCompany: true } : {}),
+        ...(effectiveSkipCoverage ? { skipCoverageSuggestion: true } : {}),
+        // DALTON-HOOK(workspace-dedup): attach coverage registration fields when company or sector is selected (unless user chose skip or gated off)
+        ...(!effectiveSkipCoverage && coverageUnitsEnabledRef.current && coverageKind !== 'none'
+          ? {
+              coverageKind,
+              ...(coverageKind === 'company' && trimmedTicker ? { ticker: trimmedTicker } : {}),
+              ...(trimmedDisplay ? { displayName: trimmedDisplay } : {}),
+            }
+          : {}),
       });
     } catch (err: unknown) {
       // A refusal keeps the user on the form with their input intact. On a 429
       // the sentence is the quota service's, relayed as it arrived.
       setSubmitting(false);
       const backupOff = needsBackupOf(err);
+      // DALTON-HOOK(workspace-dedup): parse 409 company_workspace_exists / coverage_suggestion before generic denial copy and prefill coverage fields
+      const companyExists = companyWorkspaceExistsOf(err);
+      const coverageSuggestion = coverageSuggestionOf(err);
       if (isNeedsComputer(err)) setRefusal({ kind: 'needsComputer' });
       else if (backupOff) setRefusal({ kind: 'needsBackup', ...backupOff });
-      else setRefusal({ kind: 'message', message: createWorkspaceDenialMessage(err, t) });
+      else if (companyExists) {
+        if (latestNameRef.current.trim() === submittedName) {
+          setRefusal({ kind: 'companyExists', requestedName: submittedName, ...companyExists });
+          applySuggestionPrefill(companyExists.suggestion);
+        }
+      } else if (coverageSuggestion) {
+        if (latestNameRef.current.trim() === submittedName) {
+          setRefusal({
+            kind: 'coverageSuggestion',
+            requestedName: submittedName,
+            ...coverageSuggestion,
+          });
+          applySuggestionPrefill(coverageSuggestion.suggestion);
+        }
+      } else setRefusal({ kind: 'message', message: createWorkspaceDenialMessage(err, t) });
       return;
+    }
+
+    // DALTON-HOOK(workspace-dedup): show non-fatal hint when workspace succeeded but coverage registration did not
+    const coverageWarning = formatCoverageUnitWarning(t, workspace);
+    if (coverageWarning) {
+      toast({
+        title: t('workspace.coverage.registrationWarningTitle', 'Workspace created, coverage unit not registered'),
+        description: coverageWarning,
+      });
     }
 
     setCreatedWorkspace(workspace);
@@ -242,6 +363,12 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
     await runUploads(workspace);
   };
 
+  // DALTON-HOOK(workspace-dedup): default form submit runs company dedup check
+  const handleSubmit = async (e: React.FormEvent | Event) => {
+    e.preventDefault();
+    await submitCreate(false);
+  };
+
   // ---- Retry (after an upload failure) ----
 
   const handleRetry = () => {
@@ -252,6 +379,14 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
 
   const resetAndClose = () => {
     setName('');
+    // DALTON-HOOK(workspace-dedup): clear tracked name ref & coverage fields when resetting modal
+    latestNameRef.current = '';
+    setCoverageKind('none');
+    setCoverageTicker('');
+    setCoverageDisplayName('');
+    setCoveragePrefilled(false);
+    coverageUserEditedRef.current = false;
+    skipCoverageRegistrationRef.current = false;
     setDescription('');
     setQueuedFiles([]);
     setRefusal(null);
@@ -400,7 +535,22 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
             <Input
               type="text"
               value={name}
-              onChange={(e) => setName(clampWorkspaceName(e.target.value))}
+              onChange={(e) => {
+                const nextName = clampWorkspaceName(e.target.value);
+                setName(nextName);
+                // DALTON-HOOK(workspace-dedup): keep tracked name current, clear dedup/suggestion refusal, skip choice & unedited prefill on edit
+                latestNameRef.current = nextName;
+                if (nextName !== name) {
+                  skipCoverageRegistrationRef.current = false;
+                }
+                if (refusal?.kind === 'companyExists' || refusal?.kind === 'coverageSuggestion') setRefusal(null);
+                if (coveragePrefilled && !coverageUserEditedRef.current) {
+                  setCoverageKind('none');
+                  setCoverageTicker('');
+                  setCoverageDisplayName('');
+                  setCoveragePrefilled(false);
+                }
+              }}
               placeholder={t('workspace.enterWorkspaceName')}
               className="w-full"
               style={{
@@ -411,6 +561,33 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
               autoFocus
             />
           </div>
+
+          {/* DALTON-HOOK(workspace-dedup): workspace coverage type, ticker, and display name fields (hidden when disabled or external member) */}
+          {coverageUnitsEnabled && (
+            <CoverageUnitFields
+              coverageKind={coverageKind}
+              ticker={coverageTicker}
+              displayName={coverageDisplayName}
+              prefilled={coveragePrefilled}
+              disabled={submitting}
+              onChangeKind={(next) => {
+                coverageUserEditedRef.current = true;
+                if (next !== 'none') skipCoverageRegistrationRef.current = false;
+                setCoveragePrefilled(false);
+                setCoverageKind(next);
+              }}
+              onChangeTicker={(next) => {
+                coverageUserEditedRef.current = true;
+                setCoveragePrefilled(false);
+                setCoverageTicker(next);
+              }}
+              onChangeDisplayName={(next) => {
+                coverageUserEditedRef.current = true;
+                setCoveragePrefilled(false);
+                setCoverageDisplayName(next);
+              }}
+            />
+          )}
 
           <div className="cwm-field">
             <label className="cwm-label">
@@ -518,7 +695,30 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
 
           {/* Error */}
           {refusal?.kind === 'message' && <div className="cwm-error">{refusal.message}</div>}
-          {refusal && refusal.kind !== 'message' && (
+          {/* DALTON-HOOK(workspace-dedup): duplicate company workspace & coverage suggestion notice cards */}
+          {refusal?.kind === 'companyExists' && (
+            <DuplicateCompanyNotice
+              requestedName={refusal.requestedName}
+              matches={refusal.matches}
+              disabled={submitting || !!preparingTarget}
+              onCloseModal={resetAndClose}
+              onCreateAnyway={(requested) =>
+                void submitCreate(true, requested, skipCoverageRegistrationRef.current)
+              }
+            />
+          )}
+          {refusal?.kind === 'coverageSuggestion' && (
+            <CoverageSuggestionNotice
+              requestedName={refusal.requestedName}
+              suggestion={refusal.suggestion}
+              currentCoverageKind={coverageKind}
+              registrable={coverageUnitsEnabled}
+              disabled={submitting || !!preparingTarget}
+              onRegisterAndCreate={(requested) => void submitCreate(false, requested, false)}
+              onCreateWithoutRegistering={(requested) => void submitCreate(false, requested, true)}
+            />
+          )}
+          {refusal && refusal.kind !== 'message' && refusal.kind !== 'companyExists' && refusal.kind !== 'coverageSuggestion' && (
             <ComputerRefusal
               refusal={refusal}
               message={refusal.kind === 'needsComputer'

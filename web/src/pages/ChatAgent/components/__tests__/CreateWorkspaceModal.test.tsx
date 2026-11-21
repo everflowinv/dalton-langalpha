@@ -27,6 +27,17 @@ vi.mock('../../utils/api', () => ({
     (err as { message?: string })?.message ?? 'Request failed',
 }));
 
+// DALTON-HOOK(workspace-dedup): mock toast and useDaltonCoverageUnits gate for coverage registration UX
+vi.mock('@/components/ui/use-toast', () => ({
+  toast: vi.fn(),
+}));
+vi.mock('@/lib/dalton/coverage', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/dalton/coverage')>()),
+  useDaltonCoverageUnits: vi.fn(),
+}));
+
+import { toast } from '@/components/ui/use-toast';
+import { useDaltonCoverageUnits } from '@/lib/dalton/coverage';
 import { getComputerProviders, getComputers, startWorkspace, uploadWorkspaceFile } from '../../utils/api';
 import { openComputersPanel } from '../../hooks/computerPanelStore';
 import CreateWorkspaceModal from '../CreateWorkspaceModal';
@@ -79,6 +90,11 @@ beforeEach(() => {
   vi.mocked(startWorkspace).mockResolvedValue({ workspace_id: LIVE_CREATED.workspace_id, status: 'running' });
   mockGetComputers.mockResolvedValue({ computers: [PRIMARY], total: 1 });
   mockProviders.mockResolvedValue({ providers: [{ kind: 'daytona', is_default: true, allowed: null }] });
+  // DALTON-HOOK(workspace-dedup): default to coverage units enabled for internal team member
+  vi.mocked(useDaltonCoverageUnits).mockReturnValue({
+    data: { enabled: true, units: [], unclassified: [] },
+    isError: false,
+  } as unknown as ReturnType<typeof useDaltonCoverageUnits>);
 });
 
 /** The route the page is on, for a way out that leaves it. */
@@ -469,5 +485,805 @@ describe('CreateWorkspaceModal, a computer still being prepared', () => {
     await user.click(within(card).getByRole('button', { name: 'Open Office Mac' }));
     expect(onClose).toHaveBeenCalled();
     expect(openComputersPanel).toHaveBeenCalledWith({ view: 'details', computerId: SECOND_ID });
+  });
+});
+
+// DALTON-HOOK(workspace-dedup): duplicate company workspace refusal UX (open readable, ask owner, i18n, name-change reset, create anyway)
+describe('CreateWorkspaceModal, duplicate company workspace', () => {
+  it('offers "Open this workspace" for readable matches using i18n copy and navigates there on click', async () => {
+    const user = userEvent.setup();
+    const existingId = '99999999-9999-4999-8999-999999999999';
+    const onCreate = vi.fn().mockRejectedValue(
+      Object.assign(new Error('Request failed with status code 409'), {
+        response: {
+          status: 409,
+          data: {
+            detail: {
+              code: 'company_workspace_exists',
+              message: '服务端中文提示不应直接展示',
+              matches: [
+                {
+                  workspace_id: existingId,
+                  workspace_name: 'ANT',
+                  owner_name: 'Richard',
+                  lead_analyst_name: 'Richard',
+                  ticker: 'ANT',
+                  can_read: true,
+                },
+              ],
+            },
+          },
+        },
+      }),
+    );
+    const { onClose, onComplete } = setup(onCreate);
+
+    await user.type(screen.getByPlaceholderText(/name/i), 'Anthropic');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    const card = await screen.findByRole('alert');
+    expect(card).toHaveTextContent('Anthropic already has a workspace "ANT"');
+    expect(card).toHaveTextContent('Richard');
+    expect(card).not.toHaveTextContent('服务端中文提示不应直接展示');
+    expect(onComplete).not.toHaveBeenCalled();
+
+    await user.click(within(card).getByRole('button', { name: 'Open this workspace' }));
+    expect(onClose).toHaveBeenCalled();
+    expect(screen.getByTestId('path')).toHaveTextContent(`/chat/${existingId}`);
+  });
+
+  it('shows share notice for unreadable matches, clears on edit, and resubmits the 409 name on "Create anyway"', async () => {
+    const user = userEvent.setup();
+    const onCreate = vi
+      .fn()
+      .mockRejectedValueOnce(
+        Object.assign(new Error('Request failed with status code 409'), {
+          response: {
+            status: 409,
+            data: {
+              detail: {
+                code: 'company_workspace_exists',
+                message: '服务端中文提示不应直接展示',
+                matches: [
+                  {
+                    workspace_name: 'Anthropic',
+                    owner_name: 'CY',
+                    can_read: false,
+                  },
+                ],
+              },
+            },
+          },
+        }),
+      )
+      .mockResolvedValueOnce(LIVE_CREATED);
+    const { onComplete } = setup(onCreate);
+
+    const input = screen.getByPlaceholderText(/name/i);
+    await user.type(input, 'Anthropic');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    const card = await screen.findByRole('alert');
+    expect(card).toHaveTextContent('Anthropic already has a workspace "Anthropic" (owner: CY)');
+    expect(card).toHaveTextContent('Ask the owner to share access');
+    expect(card).not.toHaveTextContent('服务端中文提示不应直接展示');
+    expect(within(card).queryByRole('button', { name: 'Open this workspace' })).not.toBeInTheDocument();
+
+    await user.click(within(card).getByRole('button', { name: 'Create anyway' }));
+    await waitFor(() =>
+      expect(onCreate).toHaveBeenLastCalledWith({
+        name: 'Anthropic',
+        description: '',
+        allowDuplicateCompany: true,
+      }),
+    );
+    await waitFor(() => expect(onComplete).toHaveBeenCalledWith(LIVE_CREATED));
+  });
+
+  it('clears the duplicate notice when the user edits the name, and ignores stale in-flight 409s', async () => {
+    const user = userEvent.setup();
+    let rejectFirst!: (err: unknown) => void;
+    const firstPending = new Promise<typeof LIVE_CREATED>((_resolve, reject) => {
+      rejectFirst = reject;
+    });
+    const onCreate = vi
+      .fn()
+      .mockReturnValueOnce(firstPending)
+      .mockRejectedValueOnce(
+        Object.assign(new Error('Request failed with status code 409'), {
+          response: {
+            status: 409,
+            data: {
+              detail: {
+                code: 'company_workspace_exists',
+                message: 'dup',
+                matches: [{ workspace_name: 'NVDA', owner_name: 'Richard', can_read: false }],
+              },
+            },
+          },
+        }),
+      );
+    setup(onCreate);
+
+    const input = screen.getByPlaceholderText(/name/i);
+    await user.type(input, 'Anthropic');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    // Edit the name while the "Anthropic" request is still in flight.
+    await user.clear(input);
+    await user.type(input, 'NVDA');
+
+    await act(async () => {
+      rejectFirst(
+        Object.assign(new Error('Request failed with status code 409'), {
+          response: {
+            status: 409,
+            data: {
+              detail: {
+                code: 'company_workspace_exists',
+                message: 'stale',
+                matches: [{ workspace_name: 'ANT', owner_name: 'Richard', can_read: false }],
+              },
+            },
+          },
+        }),
+      );
+    });
+
+    // Stale 409 for "Anthropic" must not render while input holds "NVDA".
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+    // Now submit "NVDA" and verify the 409 notice renders, then clears on edit.
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+    const card = await screen.findByRole('alert');
+    expect(card).toHaveTextContent('NVDA already has a workspace "NVDA"');
+
+    await user.type(input, ' Corp');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('submits coverageKind/ticker/displayName when Company is selected and defaults to Other', async () => {
+    const user = userEvent.setup();
+    const onCreate = vi.fn().mockResolvedValue(LIVE_CREATED);
+    const { onComplete } = setup(onCreate);
+
+    // Default selection is "Other" -> no ticker/displayName fields rendered.
+    const otherBtn = screen.getByRole('button', { name: 'Other' });
+    expect(otherBtn).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.queryByLabelText(/ticker/i)).not.toBeInTheDocument();
+
+    // Select Company, fill ticker and company name, and submit.
+    await user.click(screen.getByRole('button', { name: 'Company' }));
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'Nvidia');
+    await user.type(screen.getByLabelText(/ticker/i), 'NVDA');
+    await user.type(screen.getByLabelText(/company name/i), 'NVIDIA Corporation');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    await waitFor(() =>
+      expect(onCreate).toHaveBeenCalledWith({
+        name: 'Nvidia',
+        description: '',
+        coverageKind: 'company',
+        ticker: 'NVDA',
+        displayName: 'NVIDIA Corporation',
+      }),
+    );
+    await waitFor(() => expect(onComplete).toHaveBeenCalledWith(LIVE_CREATED));
+  });
+
+  it('prefills Type, Ticker, and Company Name from 409 suggestion and lets user edit before Create anyway', async () => {
+    const user = userEvent.setup();
+    const onCreate = vi
+      .fn()
+      .mockRejectedValueOnce(
+        Object.assign(new Error('Request failed with status code 409'), {
+          response: {
+            status: 409,
+            data: {
+              detail: {
+                code: 'company_workspace_exists',
+                message: 'dup',
+                matches: [{ workspace_name: 'NVDA', owner_name: 'Richard', can_read: true }],
+                suggestion: {
+                  coverage_kind: 'company',
+                  ticker: 'NVDA',
+                  display_name: 'NVIDIA Corporation',
+                },
+              },
+            },
+          },
+        }),
+      )
+      .mockResolvedValueOnce({
+        ...LIVE_CREATED,
+        coverage_unit_warning: '股票代码 NVDA.US 已被其他覆盖单元登记，工作区已创建但未自动登记覆盖单元。',
+      });
+    const { onComplete } = setup(onCreate);
+
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'Nvidia');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    const card = await screen.findByRole('alert');
+    expect(screen.getByRole('button', { name: 'Company' })).toHaveAttribute('aria-pressed', 'true');
+    const tickerInput = screen.getByLabelText(/ticker/i) as HTMLInputElement;
+    const companyInput = screen.getByLabelText(/company name/i) as HTMLInputElement;
+    expect(tickerInput.value).toBe('NVDA');
+    expect(companyInput.value).toBe('NVIDIA Corporation');
+
+    // User can edit the prefilled ticker before clicking Create anyway.
+    await user.clear(tickerInput);
+    await user.type(tickerInput, 'NVDA.US');
+    await user.click(within(card).getByRole('button', { name: 'Create anyway' }));
+
+    await waitFor(() =>
+      expect(onCreate).toHaveBeenLastCalledWith({
+        name: 'Nvidia',
+        description: '',
+        allowDuplicateCompany: true,
+        coverageKind: 'company',
+        ticker: 'NVDA.US',
+        displayName: 'NVIDIA Corporation',
+      }),
+    );
+    await waitFor(() => expect(onComplete).toHaveBeenCalled());
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Workspace created, coverage unit not registered',
+        description: '股票代码 NVDA.US 已被其他覆盖单元登记，工作区已创建但未自动登记覆盖单元。',
+      }),
+    );
+  });
+
+  it('supports Sector type and Chinese i18n labels', async () => {
+    const user = userEvent.setup();
+    const { default: i18n } = await import('@/i18n');
+    await i18n.changeLanguage('zh-CN');
+    try {
+      const onCreate = vi.fn().mockResolvedValue(LIVE_CREATED);
+      setup(onCreate);
+
+      expect(screen.getByRole('button', { name: '其他' })).toHaveAttribute('aria-pressed', 'true');
+      await user.click(screen.getByRole('button', { name: '行业' }));
+      expect(screen.queryByLabelText(/股票代码/)).not.toBeInTheDocument();
+      await user.type(screen.getByPlaceholderText('输入工作区名称'), '半导体');
+      await user.type(screen.getByLabelText(/行业名/), '半导体行业');
+      await user.click(screen.getByRole('button', { name: '创建' }));
+
+      await waitFor(() =>
+        expect(onCreate).toHaveBeenCalledWith({
+          name: '半导体',
+          description: '',
+          coverageKind: 'sector',
+          displayName: '半导体行业',
+        }),
+      );
+    } finally {
+      await i18n.changeLanguage('en-US');
+    }
+  });
+
+  // DALTON-HOOK(workspace-dedup): 409 coverage_suggestion confirmation when Type is Other (Register & Create vs Create without registering)
+  it('prompts on 409 coverage_suggestion with prefilled fields and supports Register & Create or Create without registering', async () => {
+    const user = userEvent.setup();
+    const suggestionErr = Object.assign(new Error('Request failed with status code 409'), {
+      response: {
+        status: 409,
+        data: {
+          detail: {
+            code: 'coverage_suggestion',
+            message: '「Nvidia」识别为公司（代码 NVDA）',
+            suggestion: {
+              coverage_kind: 'company',
+              ticker: 'NVDA',
+              display_name: 'NVIDIA Corporation',
+            },
+          },
+        },
+      },
+    });
+
+    // 1. Register & Create path (allows editing prefilled fields before confirming)
+    const onCreateRegister = vi
+      .fn()
+      .mockRejectedValueOnce(suggestionErr)
+      .mockResolvedValueOnce(LIVE_CREATED);
+    const first = setup(onCreateRegister);
+
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'Nvidia');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    const card = await screen.findByRole('alert');
+    expect(card).toHaveTextContent('"Nvidia" looks like a company (NVDA).');
+    expect(screen.getByRole('button', { name: 'Company' })).toHaveAttribute('aria-pressed', 'true');
+    const tickerInput = screen.getByLabelText(/ticker/i) as HTMLInputElement;
+    expect(tickerInput.value).toBe('NVDA');
+    await user.clear(tickerInput);
+    await user.type(tickerInput, 'NVDA.US');
+    await user.click(within(card).getByRole('button', { name: 'Register & Create' }));
+
+    await waitFor(() =>
+      expect(onCreateRegister).toHaveBeenLastCalledWith({
+        name: 'Nvidia',
+        description: '',
+        coverageKind: 'company',
+        ticker: 'NVDA.US',
+        displayName: 'NVIDIA Corporation',
+      }),
+    );
+    await waitFor(() => expect(first.onComplete).toHaveBeenCalledWith(LIVE_CREATED));
+
+    // 2. Create without registering path (submits skipCoverageSuggestion: true and omits coverage fields)
+    const { unmount } = renderWithProviders(<></>);
+    unmount();
+    vi.clearAllMocks();
+    mockGetComputers.mockResolvedValue({ computers: [PRIMARY], total: 1 });
+    const onCreateSkip = vi
+      .fn()
+      .mockRejectedValueOnce(suggestionErr)
+      .mockResolvedValueOnce(LIVE_CREATED);
+    const second = setup(onCreateSkip);
+
+    const nameInputs = screen.getAllByPlaceholderText(/enter workspace name/i);
+    await user.type(nameInputs[nameInputs.length - 1], 'Nvidia');
+    const createBtns = screen.getAllByRole('button', { name: /^create$/i });
+    await user.click(createBtns[createBtns.length - 1]);
+
+    const alerts = await screen.findAllByRole('alert');
+    const latestCard = alerts[alerts.length - 1];
+    await user.click(within(latestCard).getByRole('button', { name: 'Create without registering' }));
+
+    await waitFor(() =>
+      expect(onCreateSkip).toHaveBeenLastCalledWith({
+        name: 'Nvidia',
+        description: '',
+        skipCoverageSuggestion: true,
+      }),
+    );
+    await waitFor(() => expect(second.onComplete).toHaveBeenCalledWith(LIVE_CREATED));
+  });
+
+  // DALTON-HOOK(workspace-dedup): length hints on ticker/display_name without blocking submission, and bilingual structured warning rendering
+  it('shows length hints without blocking long ticker submit, and renders structured coverage warnings in English and Chinese', async () => {
+    const user = userEvent.setup();
+    const longTicker = 'A'.repeat(33);
+    const onCreateEn = vi.fn().mockResolvedValue({
+      ...LIVE_CREATED,
+      coverage_unit_warning: '服务端中文文案不应在英文界面显示',
+      coverage_unit_warning_detail: {
+        code: 'ticker_too_long',
+        params: { max_length: 32 },
+      },
+    });
+    setup(onCreateEn);
+
+    await user.click(screen.getByRole('button', { name: 'Company' }));
+    expect(screen.getByText('Max 32 characters')).toBeInTheDocument();
+    expect(screen.getByText('Max 120 characters')).toBeInTheDocument();
+
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'LongCo');
+    await user.type(screen.getByLabelText(/ticker/i), longTicker);
+    expect(screen.getByText(/Max 32 characters \(currently 33\)/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+    await waitFor(() =>
+      expect(onCreateEn).toHaveBeenCalledWith({
+        name: 'LongCo',
+        description: '',
+        coverageKind: 'company',
+        ticker: longTicker,
+      }),
+    );
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Workspace created, coverage unit not registered',
+        description:
+          'Ticker cannot exceed 32 characters. The workspace was created without auto-registering a coverage unit.',
+      }),
+    );
+
+    // Chinese locale renders Chinese copy from structured code + params
+    const { default: i18n } = await import('@/i18n');
+    await i18n.changeLanguage('zh-CN');
+    try {
+      vi.clearAllMocks();
+      mockGetComputers.mockResolvedValue({ computers: [PRIMARY], total: 1 });
+      const onCreateZh = vi.fn().mockResolvedValue({
+        ...LIVE_CREATED,
+        coverage_unit_warning: 'fallback',
+        coverage_unit_warning_detail: {
+          code: 'ticker_conflict',
+          params: { ticker: 'NVDA' },
+        },
+      });
+      setup(onCreateZh);
+      const nameInputs = screen.getAllByPlaceholderText('输入工作区名称');
+      await user.type(nameInputs[nameInputs.length - 1], 'Nvidia');
+      const createBtns = screen.getAllByRole('button', { name: '创建' });
+      await user.click(createBtns[createBtns.length - 1]);
+
+      await waitFor(() =>
+        expect(toast).toHaveBeenCalledWith(
+          expect.objectContaining({
+            title: '工作区已创建，覆盖单元未登记',
+            description:
+              '股票代码 NVDA 已被其他覆盖单元登记，工作区已创建但未自动登记覆盖单元。',
+          }),
+        ),
+      );
+    } finally {
+      await i18n.changeLanguage('en-US');
+    }
+  });
+
+  // DALTON-HOOK(workspace-dedup): hides coverage fields when coverage_units disabled, loading, or caller is external / company tier (isError)
+  it('hides coverage unit fields when coverage units are disabled, loading, or caller is external / company tier (isError)', async () => {
+    const user = userEvent.setup();
+    vi.mocked(useDaltonCoverageUnits).mockReturnValue({
+      data: { enabled: false },
+      isError: false,
+    } as unknown as ReturnType<typeof useDaltonCoverageUnits>);
+    const onCreateDisabled = vi.fn().mockResolvedValue(LIVE_CREATED);
+    const first = renderWithProviders(
+      <CreateWorkspaceModal isOpen onClose={vi.fn()} onCreate={onCreateDisabled} />,
+    );
+
+    expect(screen.queryByRole('button', { name: 'Company' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Sector' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Other' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/ticker/i)).not.toBeInTheDocument();
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'My Research');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+    await waitFor(() =>
+      expect(onCreateDisabled).toHaveBeenCalledWith({
+        name: 'My Research',
+        description: '',
+      }),
+    );
+    first.unmount();
+
+    // 403 error (external member or company tier) or 404 (Dalton disabled)
+    vi.mocked(useDaltonCoverageUnits).mockReturnValue({
+      data: undefined,
+      isError: true,
+    } as unknown as ReturnType<typeof useDaltonCoverageUnits>);
+    const onCreateForbidden = vi.fn().mockResolvedValue(LIVE_CREATED);
+    const second = renderWithProviders(
+      <CreateWorkspaceModal isOpen onClose={vi.fn()} onCreate={onCreateForbidden} />,
+    );
+    expect(screen.queryByRole('button', { name: 'Company' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Sector' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Other' })).not.toBeInTheDocument();
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'External Ws');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+    await waitFor(() =>
+      expect(onCreateForbidden).toHaveBeenCalledWith({
+        name: 'External Ws',
+        description: '',
+      }),
+    );
+    second.unmount();
+
+    // Loading state before GET /coverage/units resolves also keeps fields hidden
+    vi.mocked(useDaltonCoverageUnits).mockReturnValue({
+      data: undefined,
+      isError: false,
+    } as unknown as ReturnType<typeof useDaltonCoverageUnits>);
+    renderWithProviders(
+      <CreateWorkspaceModal isOpen onClose={vi.fn()} onCreate={vi.fn()} />,
+    );
+    expect(screen.queryByRole('button', { name: 'Company' })).not.toBeInTheDocument();
+  });
+
+  // DALTON-HOOK(workspace-dedup): 409 coverage_suggestion when eligibility query failed (shows create without registering, never generic error)
+  it('shows coverage suggestion with Create without registering when eligibility query fails', async () => {
+    const user = userEvent.setup();
+    vi.mocked(useDaltonCoverageUnits).mockReturnValue({
+      data: undefined,
+      isError: true,
+    } as unknown as ReturnType<typeof useDaltonCoverageUnits>);
+
+    const suggestionErr = Object.assign(new Error('Request failed with status code 409'), {
+      response: {
+        status: 409,
+        data: {
+          detail: {
+            code: 'coverage_suggestion',
+            message: '「Nvidia」识别为公司（代码 NVDA）',
+            suggestion: {
+              coverage_kind: 'company',
+              ticker: 'NVDA',
+              display_name: 'NVIDIA Corporation',
+            },
+          },
+        },
+      },
+    });
+    const onCreate = vi
+      .fn()
+      .mockRejectedValueOnce(suggestionErr)
+      .mockResolvedValueOnce(LIVE_CREATED);
+    const { onComplete } = setup(onCreate);
+
+    expect(screen.queryByRole('button', { name: 'Company' })).not.toBeInTheDocument();
+
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'Nvidia');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    const card = await screen.findByRole('alert');
+    expect(card).toHaveTextContent('"Nvidia" looks like a company (NVDA).');
+    expect(within(card).queryByRole('button', { name: 'Register & Create' })).not.toBeInTheDocument();
+    await user.click(within(card).getByRole('button', { name: 'Create without registering' }));
+
+    await waitFor(() =>
+      expect(onCreate).toHaveBeenLastCalledWith({
+        name: 'Nvidia',
+        description: '',
+        skipCoverageSuggestion: true,
+      }),
+    );
+    await waitFor(() => expect(onComplete).toHaveBeenCalledWith(LIVE_CREATED));
+  });
+
+  // DALTON-HOOK(workspace-dedup): eligibility query completing after submit starts or after 409 arrives still shows notice and prefills
+  it('handles coverage_suggestion when eligibility query finishes after submit starts or after 409 arrives', async () => {
+    const user = userEvent.setup();
+    const suggestionErr = Object.assign(new Error('Request failed with status code 409'), {
+      response: {
+        status: 409,
+        data: {
+          detail: {
+            code: 'coverage_suggestion',
+            message: '「Nvidia」识别为公司（代码 NVDA）',
+            suggestion: {
+              coverage_kind: 'company',
+              ticker: 'NVDA',
+              display_name: 'NVIDIA Corporation',
+            },
+          },
+        },
+      },
+    });
+
+    // Order A: query is still loading when submit starts, resolves { enabled: true } while onCreate is in-flight
+    let queryState: ReturnType<typeof useDaltonCoverageUnits> = {
+      data: undefined,
+      isError: false,
+    } as unknown as ReturnType<typeof useDaltonCoverageUnits>;
+    vi.mocked(useDaltonCoverageUnits).mockImplementation(() => queryState);
+
+    let rejectFirst!: (err: unknown) => void;
+    const pendingCreate = new Promise<typeof LIVE_CREATED>((_resolve, reject) => {
+      rejectFirst = reject;
+    });
+    const onCreateOrderA = vi
+      .fn()
+      .mockReturnValueOnce(pendingCreate)
+      .mockResolvedValueOnce(LIVE_CREATED);
+    const onCompleteA = vi.fn();
+    const viewA = renderWithProviders(
+      <CreateWorkspaceModal isOpen onClose={vi.fn()} onCreate={onCreateOrderA} onComplete={onCompleteA} />,
+    );
+
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'Nvidia');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    // Query resolves while submit is still in flight
+    queryState = {
+      data: { enabled: true, units: [], unclassified: [] },
+      isError: false,
+    } as unknown as ReturnType<typeof useDaltonCoverageUnits>;
+    viewA.rerender(
+      <CreateWorkspaceModal isOpen onClose={vi.fn()} onCreate={onCreateOrderA} onComplete={onCompleteA} />,
+    );
+
+    await act(async () => {
+      rejectFirst(suggestionErr);
+    });
+
+    const cardA = await screen.findByRole('alert');
+    expect(cardA).toHaveTextContent('"Nvidia" looks like a company (NVDA).');
+    expect(screen.getByRole('button', { name: 'Company' })).toHaveAttribute('aria-pressed', 'true');
+    expect((screen.getByLabelText(/ticker/i) as HTMLInputElement).value).toBe('NVDA');
+    expect((screen.getByLabelText(/company name/i) as HTMLInputElement).value).toBe('NVIDIA Corporation');
+
+    await user.click(within(cardA).getByRole('button', { name: 'Register & Create' }));
+    await waitFor(() =>
+      expect(onCreateOrderA).toHaveBeenLastCalledWith({
+        name: 'Nvidia',
+        description: '',
+        coverageKind: 'company',
+        ticker: 'NVDA',
+        displayName: 'NVIDIA Corporation',
+      }),
+    );
+    await waitFor(() => expect(onCompleteA).toHaveBeenCalledWith(LIVE_CREATED));
+    viewA.unmount();
+
+    // Order B: 409 coverage_suggestion arrives BEFORE query finishes; query then resolves { enabled: true }
+    queryState = {
+      data: undefined,
+      isError: false,
+    } as unknown as ReturnType<typeof useDaltonCoverageUnits>;
+    const onCreateOrderB = vi
+      .fn()
+      .mockRejectedValueOnce(suggestionErr)
+      .mockResolvedValueOnce(LIVE_CREATED);
+    const onCompleteB = vi.fn();
+    const viewB = renderWithProviders(
+      <CreateWorkspaceModal isOpen onClose={vi.fn()} onCreate={onCreateOrderB} onComplete={onCompleteB} />,
+    );
+
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'Nvidia');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    const cardBInitial = await screen.findByRole('alert');
+    expect(cardBInitial).toHaveTextContent('"Nvidia" looks like a company (NVDA).');
+    expect(within(cardBInitial).getByRole('button', { name: 'Create without registering' })).toBeInTheDocument();
+    expect(within(cardBInitial).queryByRole('button', { name: 'Register & Create' })).not.toBeInTheDocument();
+
+    // Now eligibility query resolves after the 409 response
+    queryState = {
+      data: { enabled: true, units: [], unclassified: [] },
+      isError: false,
+    } as unknown as ReturnType<typeof useDaltonCoverageUnits>;
+    viewB.rerender(
+      <CreateWorkspaceModal isOpen onClose={vi.fn()} onCreate={onCreateOrderB} onComplete={onCompleteB} />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Company' })).toHaveAttribute('aria-pressed', 'true'),
+    );
+    expect((screen.getByLabelText(/ticker/i) as HTMLInputElement).value).toBe('NVDA');
+    expect((screen.getByLabelText(/company name/i) as HTMLInputElement).value).toBe('NVIDIA Corporation');
+
+    const cardBAfter = screen.getByRole('alert');
+    await user.click(within(cardBAfter).getByRole('button', { name: 'Register & Create' }));
+    await waitFor(() =>
+      expect(onCreateOrderB).toHaveBeenLastCalledWith({
+        name: 'Nvidia',
+        description: '',
+        coverageKind: 'company',
+        ticker: 'NVDA',
+        displayName: 'NVIDIA Corporation',
+      }),
+    );
+    await waitFor(() => expect(onCompleteB).toHaveBeenCalledWith(LIVE_CREATED));
+  });
+
+  // DALTON-HOOK(workspace-dedup): preserve skip-registration choice across coverage_suggestion -> company_workspace_exists -> Create anyway, and reset on name edit or modal close
+  it('preserves skip-registration choice across coverage_suggestion then company_workspace_exists and resets on name change or close', async () => {
+    const user = userEvent.setup();
+    const suggestionErr = Object.assign(new Error('Request failed with status code 409'), {
+      response: {
+        status: 409,
+        data: {
+          detail: {
+            code: 'coverage_suggestion',
+            message: '「Nvidia」识别为公司（代码 NVDA）',
+            suggestion: {
+              coverage_kind: 'company',
+              ticker: 'NVDA',
+              display_name: 'NVIDIA Corporation',
+            },
+          },
+        },
+      },
+    });
+    const duplicateErr = Object.assign(new Error('Request failed with status code 409'), {
+      response: {
+        status: 409,
+        data: {
+          detail: {
+            code: 'company_workspace_exists',
+            message: 'dup',
+            matches: [{ workspace_name: 'NVDA', owner_name: 'Richard', can_read: false }],
+            suggestion: {
+              coverage_kind: 'company',
+              ticker: 'NVDA',
+              display_name: 'NVIDIA Corporation',
+            },
+          },
+        },
+      },
+    });
+
+    // 1. coverage_suggestion -> Create without registering -> company_workspace_exists -> Create anyway
+    const onCreate = vi
+      .fn()
+      .mockRejectedValueOnce(suggestionErr)
+      .mockRejectedValueOnce(duplicateErr)
+      .mockResolvedValueOnce(LIVE_CREATED);
+    const { onComplete } = setup(onCreate);
+
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'Nvidia');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    const suggestionCard = await screen.findByRole('alert');
+    expect(screen.getByRole('button', { name: 'Company' })).toHaveAttribute('aria-pressed', 'true');
+    expect((screen.getByLabelText(/ticker/i) as HTMLInputElement).value).toBe('NVDA');
+
+    await user.click(within(suggestionCard).getByRole('button', { name: 'Create without registering' }));
+
+    const duplicateCard = await screen.findByRole('alert');
+    expect(duplicateCard).toHaveTextContent('Nvidia already has a workspace "NVDA"');
+    expect(screen.getByRole('button', { name: 'Other' })).toHaveAttribute('aria-pressed', 'true');
+
+    await user.click(within(duplicateCard).getByRole('button', { name: 'Create anyway' }));
+
+    await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(3));
+    const finalPayload = onCreate.mock.calls[2][0];
+    expect(finalPayload).toEqual({
+      name: 'Nvidia',
+      description: '',
+      allowDuplicateCompany: true,
+      skipCoverageSuggestion: true,
+    });
+    expect(finalPayload).not.toHaveProperty('coverageKind');
+    expect(finalPayload).not.toHaveProperty('ticker');
+    expect(finalPayload).not.toHaveProperty('displayName');
+    await waitFor(() => expect(onComplete).toHaveBeenCalledWith(LIVE_CREATED));
+
+    // 2. Editing the name after choosing "Create without registering" resets the skip choice
+    const onCreateAfterRename = vi
+      .fn()
+      .mockRejectedValueOnce(suggestionErr)
+      .mockRejectedValueOnce(duplicateErr)
+      .mockResolvedValueOnce(LIVE_CREATED);
+    const viewRename = renderWithProviders(
+      <CreateWorkspaceModal isOpen onClose={vi.fn()} onCreate={onCreateAfterRename} />,
+    );
+    const renameInput = within(viewRename.container).getByPlaceholderText(/enter workspace name/i);
+    await user.type(renameInput, 'Nvidia');
+    await user.click(within(viewRename.container).getByRole('button', { name: /^create$/i }));
+    const suggestionCard2 = await within(viewRename.container).findByRole('alert');
+    await user.click(within(suggestionCard2).getByRole('button', { name: 'Create without registering' }));
+    await within(viewRename.container).findByText(/Nvidia already has a workspace/);
+
+    await user.clear(renameInput);
+    await user.type(renameInput, 'AMD');
+    await user.click(within(viewRename.container).getByRole('button', { name: /^create$/i }));
+    await waitFor(() =>
+      expect(onCreateAfterRename).toHaveBeenLastCalledWith({
+        name: 'AMD',
+        description: '',
+      }),
+    );
+    viewRename.unmount();
+
+    // 3. Closing and reopening the modal resets the skip choice
+    const onCreateAfterClose = vi
+      .fn()
+      .mockRejectedValueOnce(suggestionErr)
+      .mockRejectedValueOnce(duplicateErr)
+      .mockResolvedValueOnce(LIVE_CREATED);
+    const onCloseSpy = vi.fn();
+    const viewClose = renderWithProviders(
+      <CreateWorkspaceModal isOpen onClose={onCloseSpy} onCreate={onCreateAfterClose} />,
+    );
+    const closeInput = within(viewClose.container).getByPlaceholderText(/enter workspace name/i);
+    await user.type(closeInput, 'Nvidia');
+    await user.click(within(viewClose.container).getByRole('button', { name: /^create$/i }));
+    const suggestionCard3 = await within(viewClose.container).findByRole('alert');
+    await user.click(within(suggestionCard3).getByRole('button', { name: 'Create without registering' }));
+    await within(viewClose.container).findByText(/Nvidia already has a workspace/);
+
+    await user.click(within(viewClose.container).getByRole('button', { name: /^cancel$/i }));
+    expect(onCloseSpy).toHaveBeenCalledOnce();
+    viewClose.rerender(
+      <CreateWorkspaceModal isOpen={false} onClose={onCloseSpy} onCreate={onCreateAfterClose} />,
+    );
+    viewClose.rerender(
+      <CreateWorkspaceModal isOpen onClose={onCloseSpy} onCreate={onCreateAfterClose} />,
+    );
+
+    await user.type(within(viewClose.container).getByPlaceholderText(/enter workspace name/i), 'Nvidia');
+    await user.click(within(viewClose.container).getByRole('button', { name: /^create$/i }));
+    await waitFor(() =>
+      expect(onCreateAfterClose).toHaveBeenLastCalledWith({
+        name: 'Nvidia',
+        description: '',
+      }),
+    );
+    viewClose.unmount();
   });
 });

@@ -23,7 +23,7 @@ import jsonschema
 
 from src.dalton.database.provider_events import sanitize_error_text
 from src.dalton.llm.complete import dalton_complete
-from src.dalton.llm.model_prefs import dalton_model_pref
+from src.dalton.llm.model_prefs import dalton_model_default, dalton_model_pref
 
 logger = logging.getLogger(__name__)
 
@@ -75,12 +75,14 @@ async def resolve_assist_model(
     explicit_model: str | None = None,
     *,
     user_id: str | None = None,
+    deployment_only: bool = False,
 ) -> str:
-    """Resolve model key for `role` (default `'assist'`) via `dalton_model_pref`.
+    """Resolve model key for `role` (default `'assist'`) via `dalton_model_pref` or `dalton.yaml`.
 
     Priority:
     1. `explicit_model` if provided
-    2. `dalton_model_pref(user_id, <pref_key>)` (user -> team PM holder -> `dalton.yaml` default:
+    2. If `deployment_only=True`: `dalton_model_default(<pref_key>)` (`dalton.yaml` only, ignoring user/holder prefs)
+    3. Otherwise `dalton_model_pref(user_id, <pref_key>)` (user -> team PM holder -> `dalton.yaml` default:
        - `assist` -> `dalton_assist_model` (default `models.assist_model`)
        - `extract` / `conversation_extract` -> `dalton_extract_model` (default `conversations.extractor_model`)
        - `audit` -> `dalton_audit_model` (default `publish.audit_model`))
@@ -97,7 +99,11 @@ async def resolve_assist_model(
         pref_key = "dalton_extract_model"
     else:
         pref_key = "dalton_assist_model"
-    val = await dalton_model_pref(user_id, pref_key)
+    val = (
+        dalton_model_default(pref_key)
+        if deployment_only
+        else await dalton_model_pref(user_id, pref_key)
+    )
     if isinstance(val, str) and val.strip():
         return _validate_assist_candidate(role, val)
     return ""
@@ -107,14 +113,19 @@ async def resolve_assist_fallback_models(
     role: str = "assist_fallback",
     *,
     user_id: str | None = None,
+    deployment_only: bool = False,
 ) -> list[str]:
-    """Resolve fallback model list for `assist_json` via `dalton_model_pref` (P0J.J2)."""
+    """Resolve fallback model list for `assist_json` via `dalton_model_pref` or `dalton.yaml` (P0J.J2)."""
     pref_key = (
         "dalton_audit_fallback_models"
         if role in ("audit", "audit_fallback")
         else "dalton_assist_fallback_models"
     )
-    raw = await dalton_model_pref(user_id, pref_key)
+    raw = (
+        dalton_model_default(pref_key)
+        if deployment_only
+        else await dalton_model_pref(user_id, pref_key)
+    )
     items = raw if isinstance(raw, list) else ([raw] if isinstance(raw, str) else [])
     return [
         _validate_assist_candidate(role, str(m))
