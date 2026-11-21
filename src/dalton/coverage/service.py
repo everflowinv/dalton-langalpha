@@ -7,7 +7,8 @@ import concurrent.futures
 import copy
 import logging
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from src.dalton.access_tiers import get_user_tier as get_identity_tier
 from src.dalton.company_identity import is_company_system_user
 from src.dalton.coverage.models import (
     DEDICATED_COMPANY_KEYS,
+    _ensure_json_obj,
     build_coverage_doc,
     company_to_row,
     dump_coverage_yaml,
@@ -27,6 +29,7 @@ from src.dalton.coverage.models import (
     make_new_company_dict,
     normalize_source,
     normalize_tier,
+    preserve_row_internal_extra,
     row_to_company,
     validate_earnings_calendar_ledger,
 )
@@ -171,6 +174,9 @@ async def get_user_coverage(
         raise
 
     companies = [row_to_company(r) for r in rows]
+    units_unavailable = await _overlay_canonical_unit_workspaces(
+        uid, companies, raw_rows=rows, conn=conn
+    )
     latest_ts: str | None = None
     for r in rows:
         u_at = r.get("updated_at")
@@ -183,7 +189,510 @@ async def get_user_coverage(
                 latest_ts = u_at
 
     as_of = latest_ts[:10] if latest_ts and len(latest_ts) >= 10 else date.today().isoformat()
-    return build_coverage_doc(companies, as_of=as_of, generated_at=latest_ts)
+    doc = build_coverage_doc(companies, as_of=as_of, generated_at=latest_ts)
+    if units_unavailable:
+        doc["units_unavailable"] = True
+    return doc
+
+
+@asynccontextmanager
+async def _isolated_tx_step(conn: Any) -> AsyncIterator[None]:
+    """Run a degradable query inside a SAVEPOINT so catching an error preserves the outer tx."""
+    tx_fn = getattr(conn, "transaction", None) if conn is not None else None
+    if callable(tx_fn):
+        async with tx_fn():
+            yield
+        return
+    yield
+
+
+async def _caller_can_read_workspace(
+    workspace_id: str,
+    user_id: str,
+    *,
+    conn: Any = None,
+) -> bool | None:
+    """Return True if readable, False if denied/not-found, None if lookup failed."""
+    wid = str(workspace_id or "").strip()
+    uid = str(user_id or "").strip()
+    if not wid or not uid:
+        return False
+    from fastapi import HTTPException
+    from src.dalton.sharing import require_workspace_access
+
+    try:
+        async with _isolated_tx_step(conn):
+            await require_workspace_access(
+                wid, uid, channel="web", need="read", conn=conn
+            )
+        return True
+    except HTTPException as exc:
+        from src.dalton.sharing import OwnerTierUnavailable
+
+        if isinstance(exc, OwnerTierUnavailable):
+            # A 404 to HTTP clients, but for a binding already on record a failed
+            # lookup of the owner's tier, not a confirmed denial.
+            return None
+        if exc.status_code in (403, 404):
+            return False
+        logger.warning(
+            "[DALTON_COVERAGE] workspace read check failed (HTTP %s) for ws=%s user=%s: %s",
+            exc.status_code,
+            wid,
+            uid,
+            exc.detail,
+        )
+        return None
+    except Exception as exc:
+        if _is_pool_not_open_error(exc):
+            return None
+        logger.warning(
+            "[DALTON_COVERAGE] workspace read check failed for ws=%s user=%s: %s",
+            wid,
+            uid,
+            exc,
+        )
+        return None
+
+
+def _clear_comp_workspace(comp: dict[str, Any]) -> None:
+    ws_obj = (
+        dict(comp["workspace"])
+        if isinstance(comp.get("workspace"), Mapping)
+        else {"name": comp.get("ticker")}
+    )
+    ws_obj["status"] = "none"
+    ws_obj.pop("workspace_id", None)
+    comp["workspace"] = ws_obj
+
+
+async def _overlay_canonical_unit_workspaces(
+    user_id: str,
+    companies: list[dict[str, Any]],
+    *,
+    raw_rows: Sequence[Mapping[str, Any]] | None = None,
+    conn: Any = None,
+) -> bool:
+    """Attach canonical ``workspace_id`` only for the lead analyst with current Web read access.
+
+    When ``coverage_units`` is disabled, performs zero registry/permission queries
+    and preserves persisted rows verbatim. When enabled, isolates queries in a
+    SAVEPOINT, preserves ``workspace_id`` if a permission lookup itself errors,
+    and returns True if any coverage-unit or access lookup degraded.
+    """
+    from src.dalton.coverage.identity import normalize_ticker_key
+    from src.dalton.database import coverage_units as cu_db
+    from src.dalton.settings import is_coverage_units_enabled
+
+    if not companies or not is_coverage_units_enabled():
+        return False
+
+    synced_meta_by_ticker: dict[str, tuple[str, str, bool, str]] = {}
+    for r in raw_rows or ():
+        t = str(r.get("ticker") or "").strip().upper()
+        extra = _ensure_json_obj(r.get("extra"), {})
+        if isinstance(extra, Mapping):
+            suid = str(extra.get("_synced_unit_id") or "").strip()
+            sws = str(extra.get("_synced_workspace_id") or "").strip()
+            swrote = (
+                bool(extra.get("_synced_ws_written"))
+                if "_synced_ws_written" in extra
+                else bool(suid)
+            )
+            smanual = str(extra.get("_manual_workspace_id") or "").strip()
+            if t and (suid or sws or smanual):
+                synced_meta_by_ticker[t] = (suid, sws, swrote, smanual)
+
+    unit_by_key: dict[str, dict[str, Any]] = {}
+    unit_by_ws: dict[str, dict[str, Any]] = {}
+    registry_unavailable = False
+    units_unavailable = False
+    try:
+        async with _isolated_tx_step(conn):
+            units = await cu_db.list_active_company_units_with_ticker(conn=conn)
+    except Exception as exc:
+        logger.warning(
+            "[DALTON_COVERAGE] coverage unit registry unavailable for personal overlay (%s): %s",
+            user_id,
+            exc,
+        )
+        units = []
+        registry_unavailable = True
+        units_unavailable = True
+    for u in units:
+        key = normalize_ticker_key(u.get("ticker"))
+        if key:
+            unit_by_key[key] = u
+        u_ws = str(u.get("workspace_id") or "").strip()
+        if u_ws:
+            unit_by_ws[u_ws] = u
+
+    for comp in companies:
+        t_up = str(comp.get("ticker") or "").strip().upper()
+        key = normalize_ticker_key(t_up)
+        unit = unit_by_key.get(key) if key else None
+        ws_obj = (
+            dict(comp["workspace"])
+            if isinstance(comp.get("workspace"), Mapping)
+            else None
+        )
+        persisted_ws = (
+            str(ws_obj.get("workspace_id") or "").strip() if ws_obj is not None else ""
+        )
+        synced_uid, synced_ws, synced_wrote, manual_ws = synced_meta_by_ticker.get(
+            t_up, ("", "", False, "")
+        )
+        is_manual_row = bool(persisted_ws and manual_ws and persisted_ws == manual_ws)
+
+        async def _check_read(ws_id_target: str) -> bool | None:
+            nonlocal units_unavailable
+            res = await _caller_can_read_workspace(ws_id_target, user_id, conn=conn)
+            if res is None:
+                units_unavailable = True
+            return res
+
+        if unit is not None:
+            lead_uid = str(
+                unit.get("lead_analyst_user_id") or unit.get("owner_user_id") or ""
+            ).strip()
+            canon_ws = str(unit.get("workspace_id") or "").strip()
+            unit_id = str(unit.get("unit_id") or "").strip()
+            synced_matches_row = bool(
+                synced_uid
+                and synced_wrote
+                and not is_manual_row
+                and synced_uid == unit_id
+                and (not synced_ws or persisted_ws == synced_ws)
+            )
+            if canon_ws and lead_uid == user_id:
+                canon_read = await _check_read(canon_ws)
+                if canon_read is True:
+                    out_ws = dict(ws_obj or {"name": comp.get("ticker")})
+                    out_ws["status"] = "active"
+                    out_ws["workspace_id"] = canon_ws
+                    comp["workspace"] = out_ws
+                elif canon_read is None:
+                    # Read check failed: keep manual/persisted binding intact; do not silently strip.
+                    pass
+                elif is_manual_row:
+                    if persisted_ws == canon_ws:
+                        _clear_comp_workspace(comp)
+                    else:
+                        persisted_read = await _check_read(persisted_ws)
+                        if persisted_read is False:
+                            _clear_comp_workspace(comp)
+                elif not persisted_ws or persisted_ws == canon_ws or synced_matches_row:
+                    _clear_comp_workspace(comp)
+                else:
+                    persisted_read = await _check_read(persisted_ws)
+                    if persisted_read is False:
+                        _clear_comp_workspace(comp)
+            elif persisted_ws:
+                ws_unit = unit_by_ws.get(persisted_ws)
+                ws_unit_lead = (
+                    str(
+                        ws_unit.get("lead_analyst_user_id")
+                        or ws_unit.get("owner_user_id")
+                        or ""
+                    ).strip()
+                    if ws_unit is not None
+                    else ""
+                )
+                if (
+                    persisted_ws == canon_ws
+                    or (ws_unit is not None and ws_unit_lead != user_id)
+                    or (
+                        not is_manual_row
+                        and (
+                            synced_matches_row
+                            or (
+                                synced_uid
+                                and synced_wrote
+                                and (not synced_ws or persisted_ws == synced_ws)
+                            )
+                        )
+                    )
+                ):
+                    _clear_comp_workspace(comp)
+                else:
+                    persisted_read = await _check_read(persisted_ws)
+                    if persisted_read is False:
+                        _clear_comp_workspace(comp)
+        elif persisted_ws:
+            ws_unit = unit_by_ws.get(persisted_ws)
+            ws_unit_lead = (
+                str(
+                    ws_unit.get("lead_analyst_user_id")
+                    or ws_unit.get("owner_user_id")
+                    or ""
+                ).strip()
+                if ws_unit is not None
+                else ""
+            )
+            if (ws_unit is not None and ws_unit_lead != user_id) or (
+                not registry_unavailable
+                and not is_manual_row
+                and synced_uid
+                and synced_wrote
+                and (not synced_ws or persisted_ws == synced_ws)
+            ):
+                _clear_comp_workspace(comp)
+            else:
+                persisted_read = await _check_read(persisted_ws)
+                if persisted_read is False:
+                    _clear_comp_workspace(comp)
+    return units_unavailable
+
+
+async def sync_lead_analyst_personal_coverage(
+    unit: Mapping[str, Any],
+    *,
+    conn: Any = None,
+    acquire_lock: bool = True,
+) -> dict[str, Any] | None:
+    """Idempotently upsert a bound listed company unit into its lead analyst's ``dalton_coverage``.
+
+    Preserves existing ``tier`` and any personal ``workspace_id`` already set by
+    the user (recording the unit sync only in ``_synced_unit_id`` /
+    ``_synced_workspace_id``), defaults new rows to ``'core'`` with market
+    inferred via ``normalize_ticker_key``, and attaches canonical ``workspace_id``
+    when the row has no manual workspace (§6 Decision 2 / G6).
+    """
+    if (
+        str(unit.get("kind") or "") != "company"
+        or str(unit.get("status") or "") != "active"
+    ):
+        return None
+    lead_uid = str(
+        unit.get("lead_analyst_user_id") or unit.get("owner_user_id") or ""
+    ).strip()
+    ticker = str(unit.get("ticker") or "").strip().upper()
+    ws_id = str(unit.get("workspace_id") or "").strip()
+    unit_id = str(unit.get("unit_id") or "").strip()
+    if not lead_uid or not ticker or not ws_id or not _can_reach_coverage_db(conn):
+        return None
+
+    from src.dalton.coverage.identity import infer_ticker_market, normalize_ticker_key
+
+    display_name = str(unit.get("display_name") or "").strip() or ticker
+    target_key = normalize_ticker_key(ticker)
+    resolved_market = infer_ticker_market(target_key or ticker)
+
+    async def _run_in_tx(c: Any) -> dict[str, Any] | None:
+        if acquire_lock:
+            await coverage_db.acquire_coverage_advisory_lock(c, lead_uid)
+        existing_rows = await coverage_db.list_coverage_rows(lead_uid, conn=c)
+        existing: dict[str, Any] | None = None
+        for r in existing_rows:
+            r_ticker = str(r.get("ticker") or "").strip().upper()
+            if r_ticker == ticker or (
+                target_key is not None and normalize_ticker_key(r_ticker) == target_key
+            ):
+                existing = r
+                break
+
+        if existing is not None:
+            raw_extra = _ensure_json_obj(existing.get("extra"), {})
+            raw_ws = (
+                raw_extra.get("workspace")
+                if isinstance(raw_extra, Mapping) and isinstance(raw_extra.get("workspace"), Mapping)
+                else {}
+            )
+            existing_ws_id = str(raw_ws.get("workspace_id") or "").strip()
+            existing_synced_uid = str(raw_extra.get("_synced_unit_id") or "").strip() if isinstance(raw_extra, Mapping) else ""
+            existing_synced_ws = str(raw_extra.get("_synced_workspace_id") or "").strip() if isinstance(raw_extra, Mapping) else ""
+            existing_manual_ws = str(raw_extra.get("_manual_workspace_id") or "").strip() if isinstance(raw_extra, Mapping) else ""
+            wrote_flag_present = isinstance(raw_extra, Mapping) and "_synced_ws_written" in raw_extra
+            prev_synced_wrote = (
+                bool(raw_extra.get("_synced_ws_written"))
+                if wrote_flag_present
+                else bool(existing_synced_uid and (not existing_synced_ws or existing_ws_id == existing_synced_ws))
+            )
+
+            comp = row_to_company(existing)
+            preserve_row_internal_extra(comp, existing)
+            # Keep user's own workspace association untouched (even if its UUID
+            # happens to equal canon_ws); mark manual associations explicitly so
+            # subsequent clear_unit_from_personal_coverage leaves them intact.
+            has_manual_ws = bool(
+                existing_ws_id
+                and (
+                    (existing_manual_ws and existing_ws_id == existing_manual_ws)
+                    or not prev_synced_wrote
+                    or (existing_synced_ws and existing_ws_id != existing_synced_ws)
+                )
+            )
+            if has_manual_ws:
+                comp["_manual_workspace_id"] = existing_ws_id
+                comp["_synced_ws_written"] = False
+            else:
+                ws_meta = (
+                    dict(comp["workspace"])
+                    if isinstance(comp.get("workspace"), Mapping)
+                    else {"name": display_name}
+                )
+                ws_meta["name"] = ws_meta.get("name") or display_name
+                ws_meta["status"] = "active"
+                ws_meta["workspace_id"] = ws_id
+                comp["workspace"] = ws_meta
+                comp.pop("_manual_workspace_id", None)
+                comp["_synced_ws_written"] = True
+            if unit_id:
+                comp["_synced_unit_id"] = unit_id
+            comp["_synced_workspace_id"] = ws_id
+            row_to_write = company_to_row(
+                comp,
+                user_id=lead_uid,
+                source=str(existing.get("source") or "ui"),
+                group_id=existing.get("group_id"),
+                group_ids=extract_row_group_ids(existing),
+                group_stale_ids=extract_row_stale_group_ids(existing),
+            )
+        else:
+            extra_fields: dict[str, Any] = {
+                "workspace": {
+                    "name": display_name,
+                    "status": "active",
+                    "workspace_id": ws_id,
+                },
+                "_synced_workspace_id": ws_id,
+                "_synced_ws_written": True,
+            }
+            if unit_id:
+                extra_fields["_synced_unit_id"] = unit_id
+            comp = make_new_company_dict(
+                ticker,
+                name=display_name,
+                tier="core",
+                market=resolved_market,
+                has_active_workspace=True,
+                extra_fields=extra_fields,
+            )
+            row_to_write = company_to_row(comp, user_id=lead_uid, source="ui")
+
+        _, upserted = await coverage_db.upsert_coverage_rows(
+            lead_uid, [row_to_write], conn=c
+        )
+        return upserted[0] if upserted else None
+
+    try:
+        if conn is not None:
+            result = await _run_in_tx(conn)
+        else:
+            async with coverage_db.get_db_connection() as db_conn:
+                async with db_conn.transaction():
+                    result = await _run_in_tx(db_conn)
+    except Exception as exc:
+        if _is_pool_not_open_error(exc):
+            return None
+        raise
+
+    invalidate_user_aliases_cache(lead_uid)
+    return result
+
+
+async def clear_unit_from_personal_coverage(
+    unit: Mapping[str, Any],
+    *,
+    conn: Any = None,
+    acquire_lock: bool = True,
+) -> dict[str, Any] | None:
+    """Clear only this unit's synced canonical ``workspace_id`` from ``lead_analyst_user_id``'s personal row."""
+    if str(unit.get("kind") or "") != "company":
+        return None
+    lead_uid = str(
+        unit.get("lead_analyst_user_id") or unit.get("owner_user_id") or ""
+    ).strip()
+    ticker = str(unit.get("ticker") or "").strip().upper()
+    ws_id = str(unit.get("workspace_id") or "").strip()
+    unit_id = str(unit.get("unit_id") or "").strip()
+    if not lead_uid or not ticker or not unit_id or not _can_reach_coverage_db(conn):
+        return None
+
+    from src.dalton.coverage.identity import normalize_ticker_key
+
+    target_key = normalize_ticker_key(ticker)
+
+    async def _run_in_tx(c: Any) -> dict[str, Any] | None:
+        if acquire_lock:
+            await coverage_db.acquire_coverage_advisory_lock(c, lead_uid)
+        existing_rows = await coverage_db.list_coverage_rows(lead_uid, conn=c)
+        existing: dict[str, Any] | None = None
+        for r in existing_rows:
+            r_ticker = str(r.get("ticker") or "").strip().upper()
+            if r_ticker == ticker or (
+                target_key is not None and normalize_ticker_key(r_ticker) == target_key
+            ):
+                existing = r
+                break
+        if existing is None:
+            return None
+
+        raw_extra = _ensure_json_obj(existing.get("extra"), {})
+        if not isinstance(raw_extra, Mapping):
+            raw_extra = {}
+        raw_ws = raw_extra.get("workspace") if isinstance(raw_extra.get("workspace"), Mapping) else {}
+        row_ws_id = str(raw_ws.get("workspace_id") or "").strip()
+        synced_uid = str(raw_extra.get("_synced_unit_id") or "").strip()
+        synced_ws = str(raw_extra.get("_synced_workspace_id") or "").strip()
+        manual_ws = str(raw_extra.get("_manual_workspace_id") or "").strip()
+        # Never clear manual personal workspace associations solely on matching workspace_id.
+        if synced_uid != unit_id:
+            return None
+
+        wrote_flag_present = "_synced_ws_written" in raw_extra
+        synced_ws_written = (
+            bool(raw_extra.get("_synced_ws_written"))
+            if wrote_flag_present
+            else bool(
+                not manual_ws
+                and (
+                    not synced_ws
+                    or row_ws_id == synced_ws
+                    or (ws_id and row_ws_id == ws_id)
+                )
+            )
+        )
+        is_manual_row = bool(manual_ws and row_ws_id == manual_ws)
+
+        comp = row_to_company(existing)
+        preserve_row_internal_extra(comp, existing)
+        for internal_key in ("_synced_unit_id", "_synced_workspace_id", "_synced_ws_written"):
+            comp.pop(internal_key, None)
+        if (
+            synced_ws_written
+            and not is_manual_row
+            and (not synced_ws or row_ws_id == synced_ws or (ws_id and not synced_ws and row_ws_id == ws_id))
+        ):
+            _clear_comp_workspace(comp)
+        row_to_write = company_to_row(
+            comp,
+            user_id=lead_uid,
+            source=str(existing.get("source") or "ui"),
+            group_id=existing.get("group_id"),
+            group_ids=extract_row_group_ids(existing),
+            group_stale_ids=extract_row_stale_group_ids(existing),
+        )
+        _, upserted = await coverage_db.upsert_coverage_rows(
+            lead_uid, [row_to_write], conn=c
+        )
+        return upserted[0] if upserted else None
+
+    try:
+        if conn is not None:
+            result = await _run_in_tx(conn)
+        else:
+            async with coverage_db.get_db_connection() as db_conn:
+                async with db_conn.transaction():
+                    result = await _run_in_tx(db_conn)
+    except Exception as exc:
+        if _is_pool_not_open_error(exc):
+            return None
+        raise
+
+    if result is not None:
+        invalidate_user_aliases_cache(lead_uid)
+    return result
 
 
 def _coverage_updated_iso(row: Mapping[str, Any], *, timespec: str = "auto") -> str:
@@ -479,6 +988,7 @@ def get_user_aliases_sync(
 async def render_coverage_yaml(user_id: str, *, conn: Any = None) -> str:
     """Render `coverage.yaml` YAML string for `user_id` from `dalton_coverage`."""
     doc = await get_user_coverage(user_id, conn=conn)
+    doc.pop("units_unavailable", None)
     return dump_coverage_yaml(doc)
 
 
@@ -1065,6 +1575,11 @@ async def list_user_coverage_summary(user_id: str) -> dict[str, Any]:
             "group_stale": len(stale_gids) > 0,
         }
         companies.append(comp_with_meta)
+
+    units_unavailable = await _overlay_canonical_unit_workspaces(
+        uid, companies, raw_rows=rows
+    )
+    for comp_with_meta in companies:
         if comp_with_meta["tier"] == "core":
             core_list.append(comp_with_meta)
         else:
@@ -1097,7 +1612,7 @@ async def list_user_coverage_summary(user_id: str) -> dict[str, Any]:
                     )
             upcoming_earnings.sort(key=lambda x: (str(x.get("date") or ""), str(x.get("ticker") or "")))
 
-    return {
+    summary_out: dict[str, Any] = {
         "ok": True,
         "user_id": uid,
         "counts": {
@@ -1120,6 +1635,9 @@ async def list_user_coverage_summary(user_id: str) -> dict[str, Any]:
             else (mirror_row or {}).get("published_at")
         ),
     }
+    if units_unavailable:
+        summary_out["units_unavailable"] = True
+    return summary_out
 
 
 def _build_upsert_rows_from_existing(
@@ -1140,6 +1658,7 @@ def _build_upsert_rows_from_existing(
         existing = existing_rows.get(sym)
         if existing is not None:
             comp = row_to_company(existing)
+            preserve_row_internal_extra(comp, existing)
             prev_gids = [
                 g
                 for g in extract_row_group_ids(existing)
@@ -1296,8 +1815,11 @@ async def add_user_coverage_tickers(
 
     home_synced = await sync_user_coverage_to_home(uid) if sync_home else False
     added_companies = [row_to_company(r) for r in upserted]
+    units_unavailable = await _overlay_canonical_unit_workspaces(
+        uid, added_companies, raw_rows=upserted, conn=conn
+    )
 
-    return {
+    add_out: dict[str, Any] = {
         "ok": True,
         "added": added_companies,
         "added_tickers": [c["ticker"] for c in added_companies],
@@ -1307,6 +1829,9 @@ async def add_user_coverage_tickers(
         "automation_created": automation_res.get("action") == "created",
         "home_synced": home_synced,
     }
+    if units_unavailable:
+        add_out["units_unavailable"] = True
+    return add_out
 
 
 async def remove_user_coverage_tickers(
@@ -1865,7 +2390,7 @@ async def add_coverage_group(
         automation_res = await ensure_user_earnings_calendar_automation(uid)
     home_synced = await sync_user_coverage_to_home(uid)
 
-    return {
+    group_out: dict[str, Any] = {
         "ok": True,
         "group": group_row,
         "resolved_count": len(prevalidated),
@@ -1876,6 +2401,9 @@ async def add_coverage_group(
         "automation_created": automation_res.get("action") == "created",
         "home_synced": home_synced,
     }
+    if add_res.get("units_unavailable"):
+        group_out["units_unavailable"] = True
+    return group_out
 
 
 async def remove_coverage_group(
@@ -1970,8 +2498,9 @@ async def resolve_coverage_group(
                 and gid in extract_row_stale_group_ids(r)
             ]
 
+            add_res: dict[str, Any] = {}
             if tickers_needing_membership:
-                await add_user_coverage_tickers(
+                add_res = await add_user_coverage_tickers(
                     uid,
                     tickers_needing_membership,
                     tier=default_tier,
@@ -2004,7 +2533,7 @@ async def resolve_coverage_group(
         await ensure_user_earnings_calendar_automation(uid)
     home_synced = await sync_user_coverage_to_home(uid) if sync_home else False
 
-    return {
+    resolve_out: dict[str, Any] = {
         "ok": True,
         "group": updated_group or group_row,
         "matched_tickers": list(matched_by_ticker.keys()),
@@ -2014,6 +2543,9 @@ async def resolve_coverage_group(
         "rejected": rejected_tickers,
         "home_synced": home_synced,
     }
+    if add_res.get("units_unavailable"):
+        resolve_out["units_unavailable"] = True
+    return resolve_out
 
 
 def _is_group_due_for_refresh(

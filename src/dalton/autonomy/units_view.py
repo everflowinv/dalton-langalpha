@@ -10,19 +10,56 @@ so the three surfaces cannot drift on who sees what.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+import inspect
 import logging
 from datetime import datetime
 from typing import Any
 
 from psycopg.rows import dict_row
 
+from src.dalton.coverage.identity import is_historical_duplicate_workspace
 from src.dalton.database.coverage_units import (
+    _require_ws_write,
+    compute_unit_action_flags,
     get_coverage_unit,
     load_active_units_by_workspace,
 )
+from src.dalton.invites import is_invite_pm
+from src.dalton.settings import is_dalton_supabase_auth_enabled
+from src.server.database.home_workspace import is_reserved_row
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def _repeatable_read_conn(conn: Any = None, *, get_conn: Any = None):
+    """Open or reuse a connection running in REPEATABLE READ when backed by a real tx."""
+    if conn is not None:
+        yield conn
+        return
+    conn_factory = get_conn or get_db_connection
+    async with conn_factory() as owned:
+        tx_fn = getattr(owned, "transaction", None)
+        if callable(tx_fn):
+            async with tx_fn():
+                async with owned.cursor() as iso_cur:
+                    await iso_cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                yield owned
+        else:
+            yield owned
+
+
+@asynccontextmanager
+async def _savepoint(conn: Any):
+    """Wrap degradable reads inside REPEATABLE READ so SQL errors roll back locally."""
+    tx_fn = getattr(conn, "transaction", None)
+    if callable(tx_fn):
+        async with tx_fn():
+            yield
+    else:
+        yield
 
 
 async def load_dalton_automations_by_user(
@@ -70,32 +107,64 @@ async def load_dalton_automations_by_user(
     return autos_by_user
 
 
-async def load_colleague_workspace_access(
+async def _load_colleague_workspace_state(
     user_id: str | None,
-) -> dict[str, tuple[bool, bool]]:
-    """Map each colleague-visible workspace to ``(web_readable, cos_rw)``.
-
-    Reuses ``list_team_workspaces`` exactly as the board does: a workspace
-    absent from the map is invisible (never listed), a present one carries
-    its sharing decision. Hidden workspaces never appear, so a unit whose
-    workspace is missing from this map must not surface either.
-    """
+    *,
+    conn: Any = None,
+) -> tuple[
+    dict[str, tuple[bool, bool]],
+    dict[str, str],
+    list[dict[str, Any]],
+]:
+    """Load colleague-visible workspaces: ``(access_map, web_level_map, flat_rows)``."""
     colleague_access: dict[str, tuple[bool, bool]] = {}
+    web_levels: dict[str, str] = {}
+    flat_rows: list[dict[str, Any]] = []
     if user_id is None:
-        return colleague_access
+        return colleague_access, web_levels, flat_rows
     try:
         from src.dalton.sharing import list_team_workspaces
 
-        for member in await list_team_workspaces(user_id):
+        team_kw: dict[str, Any] = {}
+        if conn is not None and "conn" in inspect.signature(list_team_workspaces).parameters:
+            team_kw["conn"] = conn
+        for member in await list_team_workspaces(user_id, **team_kw):
+            member_uid = str(member.get("user_id") or "").strip()
+            member_name = member.get("display_name") or member.get("name")
+            member_email = member.get("email")
             for cws in member.get("workspaces") or []:
                 ws_id_c = str(cws.get("workspace_id") or "")
-                if ws_id_c:
-                    colleague_access[ws_id_c] = (
-                        str(cws.get("web_access") or "hidden") != "hidden",
-                        str(cws.get("cos_access") or "hidden") == "rw",
-                    )
+                if not ws_id_c:
+                    continue
+                web_acc = str(cws.get("web_access") or "hidden").strip().lower()
+                cos_acc = str(cws.get("cos_access") or "hidden").strip().lower()
+                colleague_access[ws_id_c] = (
+                    web_acc != "hidden",
+                    cos_acc == "rw",
+                )
+                web_levels[ws_id_c] = web_acc
+                flat_rows.append(
+                    {
+                        **dict(cws),
+                        "workspace_id": ws_id_c,
+                        "owner_user_id": str(cws.get("user_id") or member_uid),
+                        "owner_name": cws.get("owner_name") or member_name,
+                        "owner_email": cws.get("owner_email") or member_email,
+                        "web_access": web_acc,
+                    }
+                )
     except Exception as exc:
         logger.warning("[DALTON_UNITS_VIEW] team workspace lookup failed: %s", exc)
+    return colleague_access, web_levels, flat_rows
+
+
+async def load_colleague_workspace_access(
+    user_id: str | None,
+    *,
+    conn: Any = None,
+) -> dict[str, tuple[bool, bool]]:
+    """Map each colleague-visible workspace to ``(web_readable, cos_rw)``."""
+    colleague_access, _, _ = await _load_colleague_workspace_state(user_id, conn=conn)
     return colleague_access
 
 
@@ -106,19 +175,19 @@ def member_workspace_visible(
 ) -> bool:
     """A member's company workspace id is only output when the viewer may read it.
 
-    Same owner, or present in ``list_team_workspaces``' visible result;
-    otherwise only ``workspace_created`` and the name survive — member
-    resolution never bypasses a colleague workspace's visibility filter.
+    Readability follows the BOUND WORKSPACE's actual permissions (``workspaces.user_id == uid``
+    or visible in ``list_team_workspaces``), never the unit's ``owner_user_id``.
     """
     if company_row is None:
         return False
     if user_id is None:
         return True
-    if str(company_row.get("owner_user_id") or "") == str(user_id):
+    ws_id = str(company_row.get("workspace_id") or "").strip()
+    if not ws_id:
+        return False
+    if str(company_row.get("workspace_owner_id") or "") == str(user_id):
         return True
-    return colleague_access.get(
-        str(company_row.get("workspace_id") or ""), (False, False)
-    )[0]
+    return colleague_access.get(ws_id, (False, False))[0]
 
 
 def render_sector_member(
@@ -163,10 +232,13 @@ async def _load_company_bindings(
     if company_unit_ids:
         await ucur.execute(
             """
-            SELECT unit_id::text AS unit_id, status, owner_user_id,
-                   workspace_id::text AS workspace_id
-            FROM dalton_coverage_units
-            WHERE unit_id = ANY(%s::uuid[])
+            SELECT u.unit_id::text AS unit_id, u.status, u.owner_user_id,
+                   COALESCE(u.lead_analyst_user_id, u.owner_user_id) AS lead_analyst_user_id,
+                   u.workspace_id::text AS workspace_id,
+                   w.user_id AS workspace_owner_id
+            FROM dalton_coverage_units u
+            LEFT JOIN workspaces w ON w.workspace_id = u.workspace_id AND w.status <> 'deleted'
+            WHERE u.unit_id = ANY(%s::uuid[])
             """,
             (company_unit_ids,),
         )
@@ -180,53 +252,164 @@ async def _load_company_bindings(
     return company_ws_by_unit
 
 
+def _compute_unit_action_flags(
+    *,
+    user_id: str | None,
+    lead_uid: str,
+    created_by_uid: str = "",
+    ws_id: str | None,
+    ws_active: bool = False,
+    ws_owner: str,
+    readable: bool,
+    web_level: str,
+    is_pm: bool,
+    supabase_auth_enabled: bool | None = None,
+    actor_has_ws_write: bool | None = None,
+) -> dict[str, bool]:
+    supabase_auth = (
+        is_dalton_supabase_auth_enabled()
+        if supabase_auth_enabled is None
+        else bool(supabase_auth_enabled)
+    )
+    if actor_has_ws_write is None:
+        has_ws_write = bool(
+            ws_id
+            and ws_active
+            and user_id
+            and (
+                ws_owner == user_id
+                or (supabase_auth and readable and web_level == "rw")
+            )
+        )
+    else:
+        has_ws_write = bool(actor_has_ws_write)
+    return compute_unit_action_flags(
+        actor_user_id=user_id,
+        lead_analyst_user_id=lead_uid,
+        created_by_user_id=created_by_uid,
+        workspace_id=ws_id,
+        workspace_active=ws_active,
+        workspace_owner_id=ws_owner,
+        actor_has_ws_write=has_ws_write,
+        is_pm=is_pm,
+        supabase_auth_enabled=supabase_auth,
+    )
+
+
+async def _batch_readable_workspaces(
+    cur: Any,
+    conn: Any,
+    uid: str,
+    candidate_ws_ids: set[str],
+    colleague_access: dict[str, tuple[bool, bool]],
+    *,
+    own_readable_ws: str | None = None,
+) -> set[str]:
+    """Return subset of ``candidate_ws_ids`` the caller currently holds Web read access to."""
+    readable: set[str] = {
+        wid for wid, acc in colleague_access.items() if acc[0]
+    }
+    if own_readable_ws:
+        readable.add(own_readable_ws)
+    to_check = sorted(wid for wid in candidate_ws_ids if wid and wid not in readable)
+    if not to_check:
+        return readable
+    try:
+        from fastapi import HTTPException
+        from src.dalton.sharing import require_workspace_access
+
+        await cur.execute(
+            """
+            SELECT workspace_id::text AS workspace_id, user_id, status
+            FROM workspaces
+            WHERE workspace_id = ANY(%s::uuid[]) AND status <> 'deleted'
+            """,
+            (to_check,),
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+        for ws in rows:
+            wid = str(ws.get("workspace_id") or "")
+            if not wid:
+                continue
+            try:
+                await require_workspace_access(
+                    ws, uid, channel="web", need="read", workspace=ws, conn=conn
+                )
+                readable.add(wid)
+            except HTTPException:
+                pass
+    except Exception as exc:
+        logger.warning("[DALTON_UNITS_VIEW] workspace read check failed: %s", exc)
+    return readable
+
+
 async def build_units_view(
     user_id: str | None,
     autos_by_user: dict[str, list[dict[str, Any]]],
+    *,
+    conn: Any = None,
 ) -> list[dict[str, Any]]:
     """The cross-owner coverage-unit list (P2 board ``units``).
 
-    Own active units first; colleague units enter only through workspaces
-    ``list_team_workspaces`` reports visible — a hidden workspace's unit
-    never appears, so presence itself already means readable-or-delegatable.
-    Raises on query failure; callers decide to degrade.
+    Reads colleague permissions, unit bindings, sector members, and company
+    bindings under a single REPEATABLE READ snapshot so concurrent rebinds cannot
+    expose new workspace members under stale workspace permissions.
     """
     from src.dalton.database.sector_members import fetch_members_for_sectors
 
-    colleague_access = await load_colleague_workspace_access(user_id)
+    supabase_auth = is_dalton_supabase_auth_enabled()
+    is_pm = is_invite_pm(user_id) if user_id is not None else False
+    eff_pm = is_pm and supabase_auth
+    own_auto_ws = {
+        str(a.get("workspace_id") or "")
+        for a in autos_by_user.get(str(user_id or ""), [])
+        if a.get("workspace_id")
+    }
     out: list[dict[str, Any]] = []
-    async with get_db_connection() as uconn:
+    async with _repeatable_read_conn(conn) as uconn:
+        colleague_access, web_levels, _ = await _load_colleague_workspace_state(
+            user_id, conn=uconn
+        )
         async with uconn.cursor(row_factory=dict_row) as ucur:
-            # 参数出现在 IS NULL 这种无类型上下文里时必须显式转型
-            # （board codex r1 #1）：默认适配器发 unknown 类型，Postgres
-            # 推断不出 $1，整个 units 视图会被吞成空。
             await ucur.execute(
                 """
-                SELECT unit_id::text AS unit_id, kind, owner_user_id, slug,
-                       display_name, workspace_id::text AS workspace_id, ticker
-                FROM dalton_coverage_units
-                WHERE status = 'active'
-                  AND (%s::text IS NULL OR owner_user_id = %s)
-                ORDER BY kind, slug
+                SELECT u.unit_id::text AS unit_id, u.kind, u.owner_user_id,
+                       COALESCE(u.created_by_user_id, u.owner_user_id) AS created_by_user_id,
+                       COALESCE(u.lead_analyst_user_id, u.owner_user_id) AS lead_analyst_user_id,
+                       u.slug, u.display_name, u.workspace_id::text AS workspace_id,
+                       u.ticker, w.user_id AS workspace_owner_id, w.status AS workspace_status,
+                       w.config AS workspace_config
+                FROM dalton_coverage_units u
+                LEFT JOIN workspaces w ON w.workspace_id = u.workspace_id
+                WHERE u.status = 'active'
+                  AND (
+                      %s::text IS NULL
+                      OR COALESCE(u.lead_analyst_user_id, u.owner_user_id) = %s
+                      OR u.created_by_user_id = %s
+                      OR u.owner_user_id = %s
+                  )
+                ORDER BY u.kind, u.slug
                 """,
-                (user_id, user_id),
+                (user_id, user_id, user_id, user_id),
             )
             unit_rows = [dict(r) for r in await ucur.fetchall()]
 
-            # 同事的单元只经由可见工作区进入（不泄漏隐藏工作区的存在），
-            # 可见性判断全部复用 sharing 的既有结果。
-            if colleague_access:
+            if user_id is not None:
                 await ucur.execute(
                     """
-                    SELECT unit_id::text AS unit_id, kind, owner_user_id, slug,
-                           display_name, workspace_id::text AS workspace_id, ticker
-                    FROM dalton_coverage_units
-                    WHERE status = 'active'
-                      AND workspace_id = ANY(%s::uuid[])
-                      AND (%s::text IS NULL OR owner_user_id <> %s)
-                    ORDER BY kind, slug
+                    SELECT u.unit_id::text AS unit_id, u.kind, u.owner_user_id,
+                           COALESCE(u.created_by_user_id, u.owner_user_id) AS created_by_user_id,
+                           COALESCE(u.lead_analyst_user_id, u.owner_user_id) AS lead_analyst_user_id,
+                           u.slug, u.display_name, u.workspace_id::text AS workspace_id,
+                           u.ticker, w.user_id AS workspace_owner_id, w.status AS workspace_status,
+                           w.config AS workspace_config
+                    FROM dalton_coverage_units u
+                    JOIN workspaces w ON w.workspace_id = u.workspace_id AND w.status <> 'deleted'
+                    WHERE u.status = 'active'
+                      AND (u.workspace_id = ANY(%s::uuid[]) OR w.user_id = %s)
+                    ORDER BY u.kind, u.slug
                     """,
-                    (list(colleague_access), user_id, user_id),
+                    (list(colleague_access), user_id),
                 )
                 existing_ids = {u["unit_id"] for u in unit_rows}
                 unit_rows.extend(
@@ -246,78 +429,123 @@ async def build_units_view(
                 ).append(dict(mr))
             company_ws_by_unit = await _load_company_bindings(ucur, member_rows)
 
-    own_auto_ws = {
-        str(a.get("workspace_id") or "")
-        for a in autos_by_user.get(str(user_id or ""), [])
-        if a.get("workspace_id")
-    }
-    for u in unit_rows:
-        u_id = str(u.get("unit_id"))
-        owner = str(u.get("owner_user_id") or "")
-        ws_id = str(u.get("workspace_id") or "") or None
-        is_own = user_id is not None and owner == str(user_id)
-        if is_own:
-            readable = True
-            # 未绑定工作区的单元没有可委派的对象。
-            delegatable = ws_id is not None
-            auto_tracked = bool(ws_id and ws_id in own_auto_ws)
-        elif user_id is None:
-            readable = True
-            delegatable = False
-            auto_tracked = False
-        else:
-            access = colleague_access.get(ws_id or "")
-            if access is None:
-                continue
-            readable = access[0]
-            delegatable = access[1]
-            auto_tracked = False
-        entry: dict[str, Any] = {
-            "unit_id": u_id,
-            "kind": u.get("kind"),
-            "slug": u.get("slug"),
-            "display_name": u.get("display_name"),
-            "owner_user_id": owner,
-            "workspace_id": ws_id,
-            "readable": readable,
-            "delegatable": delegatable,
-            "auto_tracked": auto_tracked,
-        }
-        if u.get("kind") == "company":
-            entry["ticker"] = u.get("ticker")
-        else:
-            members_out: list[dict[str, Any]] = []
-            for m in members_by_sector.get(u_id, []):
-                company_row = company_ws_by_unit.get(
-                    str(m.get("company_unit_id") or "")
-                )
-                members_out.append(
-                    render_sector_member(
-                        m,
-                        company_row,
-                        member_workspace_visible(company_row, user_id, colleague_access),
+        for u in unit_rows:
+            u_id = str(u.get("unit_id"))
+            owner = str(u.get("owner_user_id") or "")
+            created_by_uid = str(u.get("created_by_user_id") or owner)
+            lead_uid = str(u.get("lead_analyst_user_id") or owner)
+            ws_id = str(u.get("workspace_id") or "") or None
+            ws_status = str(u.get("workspace_status") or "")
+            raw_ws_owner = str(u.get("workspace_owner_id") or "")
+            ws_active = bool(ws_id and raw_ws_owner and ws_status != "deleted")
+            ws_owner = raw_ws_owner if ws_active else ""
+            web_level = "hidden"
+
+            if user_id is None:
+                readable = True
+                delegatable = False
+                auto_tracked = False
+                redacted_ws_id = ws_id
+            elif ws_id is None:
+                is_lead = lead_uid == str(user_id)
+                if not is_lead and not eff_pm:
+                    continue
+                readable = is_lead
+                delegatable = False
+                auto_tracked = False
+                redacted_ws_id = None
+            else:
+                if ws_active and ws_owner == str(user_id):
+                    readable = True
+                    delegatable = True
+                    web_level = "rw"
+                    redacted_ws_id = ws_id
+                elif ws_active and ws_id in colleague_access and colleague_access[ws_id][0]:
+                    readable = True
+                    delegatable = colleague_access[ws_id][1]
+                    web_level = web_levels.get(ws_id, "ro")
+                    redacted_ws_id = ws_id
+                else:
+                    can_see_unreadable = (
+                        lead_uid == str(user_id)
+                        or eff_pm
+                        or (not ws_active and created_by_uid == str(user_id))
                     )
+                    if not can_see_unreadable:
+                        continue
+                    readable = False
+                    delegatable = False
+                    redacted_ws_id = None
+                auto_tracked = bool(
+                    readable and redacted_ws_id and redacted_ws_id in own_auto_ws
                 )
-            entry["members"] = members_out
-        out.append(entry)
+
+            flags = _compute_unit_action_flags(
+                user_id=user_id,
+                lead_uid=lead_uid,
+                created_by_uid=created_by_uid,
+                ws_id=ws_id,
+                ws_active=ws_active,
+                ws_owner=ws_owner,
+                readable=readable,
+                web_level=web_level,
+                is_pm=is_pm,
+                supabase_auth_enabled=supabase_auth,
+            )
+
+            entry: dict[str, Any] = {
+                "unit_id": u_id,
+                "kind": u.get("kind"),
+                "slug": u.get("slug"),
+                "display_name": u.get("display_name"),
+                "owner_user_id": owner,
+                "created_by_user_id": created_by_uid,
+                "lead_analyst_user_id": lead_uid,
+                "bound": bool(ws_id),
+                "workspace_id": redacted_ws_id,
+                "readable": readable,
+                "delegatable": delegatable,
+                "auto_tracked": auto_tracked,
+                "workspace_share_rw": (ws_id is None or web_level == "rw"),
+                **flags,
+            }
+            if ws_id is not None and not readable:
+                from src.dalton.coverage.units import clear_unreadable_unit_identity
+
+                clear_unreadable_unit_identity(entry)
+            if readable and redacted_ws_id and ws_owner:
+                entry["workspace_owner_id"] = ws_owner
+            if u.get("kind") == "company":
+                entry["ticker"] = u.get("ticker")
+            elif not readable:
+                # Never leak doc-derived members/scope/reason/valid_until without Web read access.
+                entry["members"] = []
+            else:
+                members_out: list[dict[str, Any]] = []
+                for m in members_by_sector.get(u_id, []):
+                    company_row = company_ws_by_unit.get(
+                        str(m.get("company_unit_id") or "")
+                    )
+                    members_out.append(
+                        render_sector_member(
+                            m,
+                            company_row,
+                            member_workspace_visible(company_row, user_id, colleague_access),
+                        )
+                    )
+                entry["members"] = members_out
+            out.append(entry)
     return out
 
 
 async def list_unclassified_workspaces(user_id: str) -> list[dict[str, Any]]:
-    """The caller's non-deleted workspaces bound to no active unit and not Home.
-
-    These are the "未分类工作区" entry of the coverage view: workspaces the
-    coverage map does not explain yet. Registration happens through the
-    agent-side tools, never from this read path.
-    """
-    from src.server.database.home_workspace import is_home_row
-
+    """The caller's non-deleted workspaces bound to no active unit, not reserved (Home/stand-in), and not duplicate."""
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
                 SELECT workspace_id::text AS workspace_id, user_id, name,
-                       description, updated_at, status
+                       description, updated_at, status, config
                 FROM workspaces
                 WHERE status <> 'deleted' AND user_id = %s
                 ORDER BY name ASC
@@ -331,7 +559,13 @@ async def list_unclassified_workspaces(user_id: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for ws in ws_rows:
         ws_id = str(ws["workspace_id"])
-        if is_home_row(ws):
+        if (
+            is_reserved_row(ws)
+            or bool(ws.get("is_home"))
+            or str(ws.get("status") or "") == "unbound"
+        ):
+            continue
+        if is_historical_duplicate_workspace(ws):
             continue
         if ws_id in units_by_ws:
             continue
@@ -346,6 +580,55 @@ async def list_unclassified_workspaces(user_id: str) -> list[dict[str, Any]]:
                     if isinstance(updated, datetime)
                     else (str(updated) if updated else None)
                 ),
+            }
+        )
+    return out
+
+
+async def list_bindable_workspaces(user_id: str) -> list[dict[str, Any]]:
+    """Workspaces the caller can write on web (own U colleague ``web_access='rw'``), unbound and non-duplicate."""
+    own_unbound = await list_unclassified_workspaces(user_id)
+    out: list[dict[str, Any]] = [
+        {
+            **ws,
+            "owner_user_id": user_id,
+            "owner_name": None,
+            "owner_email": None,
+            "is_own": True,
+        }
+        for ws in own_unbound
+    ]
+    _, _, colleague_rows = await _load_colleague_workspace_state(user_id)
+    # _load_colleague_workspace_state / sharing.py (load_accessible_workspaces_for_user)
+    # already filters out reserved Home/stand-in workspaces from colleague rows.
+    rw_colleague = [
+        cws
+        for cws in colleague_rows
+        if cws.get("web_access") == "rw"
+        and not bool(cws.get("is_historical_duplicate"))
+        and str(cws.get("status") or "") not in ("deleted", "unbound")
+        and not bool(cws.get("is_home"))
+    ]
+    if not rw_colleague:
+        return out
+
+    bound_map = await load_active_units_by_workspace(
+        [str(cws["workspace_id"]) for cws in rw_colleague]
+    )
+    for cws in rw_colleague:
+        ws_id = str(cws["workspace_id"])
+        if ws_id in bound_map:
+            continue
+        out.append(
+            {
+                "workspace_id": ws_id,
+                "name": cws.get("name"),
+                "description": cws.get("description"),
+                "updated_at": cws.get("updated_at"),
+                "owner_user_id": cws.get("owner_user_id"),
+                "owner_name": cws.get("owner_name"),
+                "owner_email": cws.get("owner_email"),
+                "is_own": False,
             }
         )
     return out
@@ -568,12 +851,7 @@ async def _latest_valid_docs(
 
 
 async def build_units_listing(user_id: str) -> dict[str, Any]:
-    """One-call coverage listing for the HTTP API: units + unclassified workspaces.
-
-    A failed automations preload degrades to "no auto-tracked units" (same as
-    the board) instead of failing the whole listing — the map stays readable
-    even when the scheduler's table is briefly unavailable.
-    """
+    """One-call coverage listing for the HTTP API: units + unclassified + bindable workspaces."""
     uid = str(user_id or "").strip()
     autos_by_user: dict[str, list[dict[str, Any]]] = {}
     try:
@@ -584,7 +862,13 @@ async def build_units_listing(user_id: str) -> dict[str, Any]:
         logger.warning("[DALTON_UNITS_VIEW] automations preload failed: %s", exc)
     units = await build_units_view(uid, autos_by_user)
     unclassified = await list_unclassified_workspaces(uid)
-    return {"enabled": True, "units": units, "unclassified": unclassified}
+    bindable_workspaces = await list_bindable_workspaces(uid)
+    return {
+        "enabled": True,
+        "units": units,
+        "unclassified": unclassified,
+        "bindable_workspaces": bindable_workspaces,
+    }
 
 
 class UnitNotFound(LookupError):
@@ -594,11 +878,9 @@ class UnitNotFound(LookupError):
 async def build_unit_detail(user_id: str, unit_id: str) -> dict[str, Any]:
     """One coverage unit's read-only detail (P4 coverage view).
 
-    Visibility follows the list view exactly: own units are readable, a
-    colleague's unit exists only through a workspace ``list_team_workspaces``
-    reports; anything else raises :class:`UnitNotFound` so the router can 404
-    without leaking existence. The cross-unit ledger is owner-only by design
-    (d026), so its sections appear only on the caller's own sector.
+    Bound workspace readability strictly follows ``workspaces.user_id == uid`` or
+    ``colleague_access[ws_id][0]`` (never ``unit.owner_user_id``). Unreadable bound
+    units raise :class:`UnitNotFound` (404) before reading any workspace documents.
     """
     from src.dalton.database.sector_members import (
         fetch_members_for_sectors,
@@ -606,139 +888,211 @@ async def build_unit_detail(user_id: str, unit_id: str) -> dict[str, Any]:
     )
 
     uid = str(user_id or "").strip()
-    unit = await get_coverage_unit(unit_id)
-    if unit is None or str(unit.get("status") or "") != "active":
-        raise UnitNotFound(f"coverage unit {unit_id} not found")
-    ws_id = str(unit.get("workspace_id") or "") or None
-    owner = str(unit.get("owner_user_id") or "")
-    is_own = owner == uid
+    supabase_auth = is_dalton_supabase_auth_enabled()
+    is_pm = is_invite_pm(uid)
+    eff_pm = is_pm and supabase_auth
 
-    colleague_access = await load_colleague_workspace_access(uid)
-    if is_own:
-        readable = True
-        delegatable = ws_id is not None
-    else:
-        access = colleague_access.get(ws_id or "")
-        if access is None:
+    async with _repeatable_read_conn() as snap_conn:
+        unit = await get_coverage_unit(unit_id, conn=snap_conn)
+        if unit is None or str(unit.get("status") or "") != "active":
             raise UnitNotFound(f"coverage unit {unit_id} not found")
-        readable = access[0]
-        delegatable = access[1]
+        ws_id = str(unit.get("workspace_id") or "") or None
+        owner = str(unit.get("owner_user_id") or "")
+        created_by_uid = str(unit.get("created_by_user_id") or owner)
+        lead_uid = str(unit.get("lead_analyst_user_id") or owner)
+        is_lead = lead_uid == uid
 
-    auto_tracked = False
-    if is_own and ws_id:
-        try:
-            async with get_db_connection() as conn:
-                async with conn.cursor(row_factory=dict_row) as cur:
+        colleague_access, web_levels, _ = await _load_colleague_workspace_state(
+            uid, conn=snap_conn
+        )
+        ws_owner = ""
+        ws_active = False
+        web_level = "hidden"
+        actor_has_ws_write = False
+        ws_row: dict[str, Any] | None = None
+        async with snap_conn.cursor(row_factory=dict_row) as cur:
+            if ws_id is None:
+                if not is_lead and not eff_pm:
+                    raise UnitNotFound(f"coverage unit {unit_id} not found")
+                readable = True
+                delegatable = False
+            else:
+                await cur.execute(
+                    """
+                    SELECT workspace_id::text AS workspace_id, user_id, status, config
+                    FROM workspaces
+                    WHERE workspace_id = %s::uuid
+                    """,
+                    (ws_id,),
+                )
+                fetched = await cur.fetchone()
+                ws_row = dict(fetched) if fetched else None
+                if ws_row is not None and str(ws_row.get("status") or "") != "deleted":
+                    ws_owner = str(ws_row.get("user_id") or "")
+                    ws_active = bool(ws_owner)
+                if ws_active and ws_owner == uid:
+                    readable = True
+                    delegatable = True
+                    web_level = "rw"
+                    actor_has_ws_write = True
+                elif ws_active and ws_id in colleague_access and colleague_access[ws_id][0]:
+                    readable = True
+                    delegatable = colleague_access[ws_id][1]
+                    web_level = web_levels.get(ws_id, "ro")
+                else:
+                    raise UnitNotFound(f"coverage unit {unit_id} not found")
+                if not actor_has_ws_write and ws_row is not None and ws_active:
+                    try:
+                        await _require_ws_write(ws_row, uid, is_pm=False, conn=snap_conn)
+                        actor_has_ws_write = True
+                    except ValueError:
+                        actor_has_ws_write = False
+
+            auto_tracked = False
+            if ws_id and readable:
+                try:
                     autos = await load_dalton_automations_by_user(cur, uid)
-            auto_tracked = ws_id in {
-                str(a.get("workspace_id") or "")
-                for a in autos.get(uid, [])
-                if a.get("workspace_id")
+                    auto_tracked = ws_id in {
+                        str(a.get("workspace_id") or "")
+                        for a in autos.get(uid, [])
+                        if a.get("workspace_id")
+                    }
+                except Exception as exc:
+                    logger.warning("[DALTON_UNITS_VIEW] automations preload failed: %s", exc)
+
+            flags = _compute_unit_action_flags(
+                user_id=uid,
+                lead_uid=lead_uid,
+                created_by_uid=created_by_uid,
+                ws_id=ws_id,
+                ws_active=ws_active,
+                ws_owner=ws_owner,
+                readable=readable,
+                web_level=web_level,
+                is_pm=is_pm,
+                supabase_auth_enabled=supabase_auth,
+                actor_has_ws_write=actor_has_ws_write,
+            )
+            entry: dict[str, Any] = {
+                "unit_id": str(unit.get("unit_id")),
+                "kind": unit.get("kind"),
+                "slug": unit.get("slug"),
+                "display_name": unit.get("display_name"),
+                "owner_user_id": owner,
+                "created_by_user_id": created_by_uid,
+                "lead_analyst_user_id": lead_uid,
+                "bound": bool(ws_id),
+                "workspace_id": ws_id,
+                "readable": readable,
+                "delegatable": delegatable,
+                "auto_tracked": auto_tracked,
+                "workspace_share_rw": (ws_id is None or web_level == "rw"),
+                **flags,
             }
-        except Exception as exc:
-            logger.warning("[DALTON_UNITS_VIEW] automations preload failed: %s", exc)
+            if ws_id is not None and not readable:
+                from src.dalton.coverage.units import clear_unreadable_unit_identity
 
-    entry: dict[str, Any] = {
-        "unit_id": str(unit.get("unit_id")),
-        "kind": unit.get("kind"),
-        "slug": unit.get("slug"),
-        "display_name": unit.get("display_name"),
-        "owner_user_id": owner,
-        "workspace_id": ws_id,
-        "readable": readable,
-        "delegatable": delegatable,
-        "auto_tracked": auto_tracked,
-    }
-    if str(unit.get("kind")) == "company":
-        entry["ticker"] = unit.get("ticker")
+                clear_unreadable_unit_identity(entry)
+            if ws_id and ws_owner:
+                entry["workspace_owner_id"] = ws_owner
+            if str(unit.get("kind")) == "company":
+                entry["ticker"] = unit.get("ticker")
 
-    docs: dict[str, dict[str, Any]] = {}
-    if ws_id:
-        async with get_db_connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
+            docs: dict[str, dict[str, Any]] = {}
+            if ws_id:
                 docs = await _latest_valid_docs(
                     cur, ws_id, ("sector", "thesis", "drivers", "agenda", "company")
                 )
 
-    if str(unit.get("kind")) == "sector":
-        members: list[dict[str, Any]] = []
-        async with get_db_connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
+            if str(unit.get("kind")) == "sector":
+                members: list[dict[str, Any]] = []
                 member_rows = await fetch_members_for_sectors(cur, [entry["unit_id"]])
                 company_ws_by_unit = await _load_company_bindings(cur, member_rows)
-        for m in member_rows:
-            company_row = company_ws_by_unit.get(str(m.get("company_unit_id") or ""))
-            members.append(
-                render_sector_member(
-                    m,
-                    company_row,
-                    member_workspace_visible(company_row, uid, colleague_access),
-                )
-            )
-
-        evidence_gaps: list[dict[str, Any]] = []
-        ledger_gaps: list[dict[str, Any]] = []
-        pending_total = 0
-        if is_own:
-            from src.dalton.database.cross_unit_requests import list_pending_for_sector
-
-            # 先按行业和待处理状态过滤、再 LIMIT（codex p4 r1 #2）：读全局
-            # 最新 200 条再在 Python 里筛，会把本行业的旧 gap 挤出窗口。
-            # total 让前端能提示"仅显示前 N 条"。未归入证据缺口的 pending
-            # 行都算 ledger 侧，保证 total 与展示条数可比。
-            try:
-                pending_rows, pending_total = await list_pending_for_sector(
-                    uid, entry["unit_id"], ws_id, limit=50
-                )
-            except Exception as exc:
-                logger.warning("[DALTON_UNITS_VIEW] ledger read failed: %s", exc)
-                pending_rows = []
-            for r in pending_rows:
-                if (
-                    str(r.get("kind") or "") == "research_request"
-                    and str(r.get("status") or "") in ("open", "dispatched")
-                ):
-                    evidence_gaps.append(
-                        {
-                            "request_id": r.get("request_id"),
-                            "question": r.get("question"),
-                            "evidence_needed": r.get("evidence_needed") or [],
-                            "completion_condition": r.get("completion_condition"),
-                            "target_workspace_id": r.get("target_workspace_id"),
-                            "status": r.get("status"),
-                            "created_at": _iso_or_none(r.get("created_at")),
-                        }
-                    )
-                else:
-                    ledger_gaps.append(
-                        {
-                            "request_id": r.get("request_id"),
-                            "kind": r.get("kind"),
-                            "question": r.get("question"),
-                            "target_workspace_id": r.get("target_workspace_id"),
-                            "status": r.get("status"),
-                            "created_at": _iso_or_none(r.get("created_at")),
-                            "updated_at": _iso_or_none(r.get("updated_at")),
-                        }
+                for m in member_rows:
+                    company_row = company_ws_by_unit.get(str(m.get("company_unit_id") or ""))
+                    members.append(
+                        render_sector_member(
+                            m,
+                            company_row,
+                            member_workspace_visible(company_row, uid, colleague_access),
+                        )
                     )
 
-        entry["sector"] = {
-            "docs": _summarize_sector_docs(docs) if ws_id else None,
-            "agenda_todos": (
-                _extract_agenda_todos(docs.get("agenda")) if ws_id else None
-            ),
-            "members": members,
-            "evidence_gaps": evidence_gaps,
-            "ledger_gaps": ledger_gaps,
-            "pending_total": pending_total,
-        }
-        return entry
+                evidence_gaps: list[dict[str, Any]] = []
+                ledger_gaps: list[dict[str, Any]] = []
+                pending_total = 0
+                if is_lead:
+                    from src.dalton.database.cross_unit_requests import list_pending_for_sector
 
-    # company unit: related sectors (reverse lookup) + pending re-review items
-    sectors_out: list[dict[str, Any]] = []
-    async with get_db_connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
-            member_rows = await list_members_for_company(entry["unit_id"])
+                    try:
+                        pending_rows, pending_total = await list_pending_for_sector(
+                            uid, entry["unit_id"], ws_id, limit=50, conn=snap_conn
+                        )
+                    except Exception as exc:
+                        logger.warning("[DALTON_UNITS_VIEW] ledger read failed: %s", exc)
+                        pending_rows = []
+                    candidate_targets = {
+                        str(r.get("target_workspace_id") or "").strip()
+                        for r in pending_rows
+                        if str(r.get("target_workspace_id") or "").strip()
+                    }
+                    readable_targets = await _batch_readable_workspaces(
+                        cur,
+                        snap_conn,
+                        uid,
+                        candidate_targets,
+                        colleague_access,
+                        own_readable_ws=ws_id,
+                    )
+                    for r in pending_rows:
+                        raw_target_ws = str(r.get("target_workspace_id") or "").strip() or None
+                        safe_target_ws = (
+                            raw_target_ws
+                            if raw_target_ws and raw_target_ws in readable_targets
+                            else None
+                        )
+                        if (
+                            str(r.get("kind") or "") == "research_request"
+                            and str(r.get("status") or "") in ("open", "dispatched")
+                        ):
+                            evidence_gaps.append(
+                                {
+                                    "request_id": r.get("request_id"),
+                                    "question": r.get("question"),
+                                    "evidence_needed": r.get("evidence_needed") or [],
+                                    "completion_condition": r.get("completion_condition"),
+                                    "target_workspace_id": safe_target_ws,
+                                    "status": r.get("status"),
+                                    "created_at": _iso_or_none(r.get("created_at")),
+                                }
+                            )
+                        else:
+                            ledger_gaps.append(
+                                {
+                                    "request_id": r.get("request_id"),
+                                    "kind": r.get("kind"),
+                                    "question": r.get("question"),
+                                    "target_workspace_id": safe_target_ws,
+                                    "status": r.get("status"),
+                                    "created_at": _iso_or_none(r.get("created_at")),
+                                    "updated_at": _iso_or_none(r.get("updated_at")),
+                                }
+                            )
+
+                entry["sector"] = {
+                    "docs": _summarize_sector_docs(docs) if ws_id else None,
+                    "agenda_todos": (
+                        _extract_agenda_todos(docs.get("agenda")) if ws_id else None
+                    ),
+                    "members": members,
+                    "evidence_gaps": evidence_gaps,
+                    "ledger_gaps": ledger_gaps,
+                    "pending_total": pending_total,
+                }
+                return entry
+
+            sectors_out: list[dict[str, Any]] = []
+            member_rows = await list_members_for_company(entry["unit_id"], conn=snap_conn)
             sector_unit_ids = sorted(
                 {
                     str(m.get("sector_unit_id"))
@@ -750,10 +1104,13 @@ async def build_unit_detail(user_id: str, unit_id: str) -> dict[str, Any]:
             if sector_unit_ids:
                 await cur.execute(
                     """
-                    SELECT unit_id::text AS unit_id, kind, owner_user_id, slug,
-                           display_name, workspace_id::text AS workspace_id, status
-                    FROM dalton_coverage_units
-                    WHERE unit_id = ANY(%s::uuid[])
+                    SELECT u.unit_id::text AS unit_id, u.kind, u.owner_user_id,
+                           COALESCE(u.lead_analyst_user_id, u.owner_user_id) AS lead_analyst_user_id,
+                           u.slug, u.display_name, u.workspace_id::text AS workspace_id,
+                           u.status, w.user_id AS workspace_owner_id
+                    FROM dalton_coverage_units u
+                    LEFT JOIN workspaces w ON w.workspace_id = u.workspace_id AND w.status <> 'deleted'
+                    WHERE u.unit_id = ANY(%s::uuid[])
                     """,
                     (sector_unit_ids,),
                 )
@@ -761,44 +1118,70 @@ async def build_unit_detail(user_id: str, unit_id: str) -> dict[str, Any]:
                     str(r["unit_id"]): dict(r) for r in await cur.fetchall()
                 }
 
-    for m in member_rows:
-        s_unit = sector_units.get(str(m.get("sector_unit_id") or ""))
-        if s_unit is None or str(s_unit.get("status") or "") != "active":
-            continue
-        s_owner = str(s_unit.get("owner_user_id") or "")
-        s_ws = str(s_unit.get("workspace_id") or "") or None
-        if s_owner == uid:
-            s_readable, s_delegatable = True, s_ws is not None
-        else:
-            s_access = colleague_access.get(s_ws or "")
-            if s_access is None:
-                # 同事的隐藏工作区不进入关联列表（与列表视图同一规则）
-                continue
-            s_readable, s_delegatable = s_access
-        sectors_out.append(
-            {
-                "unit_id": str(s_unit.get("unit_id")),
-                "slug": s_unit.get("slug"),
-                "display_name": s_unit.get("display_name"),
-                "member_id": m.get("member_id"),
-                "scope": m.get("scope") or "",
-                "valid_until": (
-                    m["valid_until"].isoformat() if m.get("valid_until") else None
-                ),
-                "readable": s_readable,
-                "delegatable": s_delegatable,
-                "workspace_id": s_ws if s_readable else None,
-            }
-        )
+            for m in member_rows:
+                s_unit = sector_units.get(str(m.get("sector_unit_id") or ""))
+                if s_unit is None or str(s_unit.get("status") or "") != "active":
+                    continue
+                s_ws_owner = str(s_unit.get("workspace_owner_id") or "")
+                s_ws = str(s_unit.get("workspace_id") or "") or None
+                if s_ws is not None and s_ws_owner == uid:
+                    s_readable, s_delegatable = True, True
+                else:
+                    s_access = colleague_access.get(s_ws or "")
+                    if s_access is None or not s_access[0]:
+                        continue
+                    s_readable, s_delegatable = s_access
+                sectors_out.append(
+                    {
+                        "unit_id": str(s_unit.get("unit_id")),
+                        "slug": s_unit.get("slug"),
+                        "display_name": s_unit.get("display_name"),
+                        "member_id": m.get("member_id"),
+                        "scope": m.get("scope") or "",
+                        "valid_until": (
+                            m["valid_until"].isoformat() if m.get("valid_until") else None
+                        ),
+                        "readable": s_readable,
+                        "delegatable": s_delegatable,
+                        "workspace_id": s_ws if s_readable else None,
+                    }
+                )
 
-    entry["company"] = {
-        "docs": ({"thesis": _summarize_thesis(docs.get("thesis"))} if ws_id else None),
-        "sectors": sectors_out,
-        "re_review": (
-            _extract_re_review_questions(docs.get("agenda")) if ws_id else []
-        ),
-    }
-    return entry
+            re_review_items = _extract_re_review_questions(docs.get("agenda")) if ws_id else []
+            ref_ws_candidates: set[str] = set()
+            for item in re_review_items:
+                ref = item.get("source_ref")
+                if isinstance(ref, dict):
+                    src_ws = str(ref.get("workspace_id") or "").strip()
+                    if src_ws:
+                        ref_ws_candidates.add(src_ws)
+            readable_ref_ws = (
+                await _batch_readable_workspaces(
+                    cur,
+                    snap_conn,
+                    uid,
+                    ref_ws_candidates,
+                    colleague_access,
+                    own_readable_ws=ws_id,
+                )
+                if ref_ws_candidates
+                else set()
+            )
+            for item in re_review_items:
+                ref = item.get("source_ref")
+                if isinstance(ref, dict):
+                    src_ws = str(ref.get("workspace_id") or "").strip()
+                    if not src_ws or src_ws not in readable_ref_ws:
+                        item.pop("source_ref", None)
+                else:
+                    item.pop("source_ref", None)
+
+            entry["company"] = {
+                "docs": ({"thesis": _summarize_thesis(docs.get("thesis"))} if ws_id else None),
+                "sectors": sectors_out,
+                "re_review": re_review_items,
+            }
+            return entry
 
 
 def _iso_or_none(value: Any) -> str | None:

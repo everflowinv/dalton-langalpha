@@ -1149,3 +1149,101 @@ async def test_pure_dalton_listing_poll_still_evaluates_market_targets(
     assert targets_spy.await_args.args[0] == ("NVDA", MarketType.STOCK)
     assert targets_spy.await_args.args[1] == 95.5
     assert targets_spy.await_args.args[2] == _ms(fri_intraday)
+
+
+@pytest.mark.asyncio
+async def test_price_trigger_unbound_executing_not_skipped_and_bound_nonlead_rearms_out_of_executing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 4 Item 6:
+    1) Unbound workspace standard move-up in status='executing' starts cleanly (not rejected by a.status <> 'active').
+    2) Bound unit non-lead move-up in status='executing' skips execution AND resets automations.status out of 'executing'.
+    """
+    from contextlib import asynccontextmanager
+    from datetime import datetime, timezone
+
+    from src.dalton import settings as dalton_settings
+    from src.server.database import automation_executions as exec_db
+
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+    seen_sql: list[str] = []
+    state = {"mode": "unbound", "exec_status": "pending", "auto_status": "executing"}
+
+    class _Cur:
+        def __init__(self):
+            self._row = None
+            self._rows = []
+
+        async def execute(self, sql, params=None):
+            q = " ".join(str(sql).split())
+            seen_sql.append(q)
+            if "AND NOT (" in q and "UPDATE automation_executions e" in q:
+                # Simulate managed candidate: fast path returns None so managed path runs
+                self._row = None
+            elif "SELECT a.workspace_id" in q:
+                self._row = {"workspace_id": "ws-1", "is_managed_candidate": True}
+            elif "FROM dalton_coverage_units" in q and "FOR SHARE" in q:
+                self._rows = (
+                    []
+                    if state["mode"] == "unbound"
+                    else [{"unit_id": "u-1", "updated_at": datetime.now(timezone.utc)}]
+                )
+                self._row = self._rows[0] if self._rows else None
+            elif "WITH target AS" in q:
+                assert "a.status NOT IN ('active', 'executing')" in q
+                assert "restored AS" in q
+                assert "AND a.status = 'executing'" in q
+                if state["mode"] == "unbound":
+                    state["exec_status"] = "running"
+                    self._row = {
+                        "conversation_thread_id": None,
+                        "conversation_response_id": None,
+                        "scheduled_at": datetime.now(timezone.utc),
+                        "wait_reason": None,
+                        "awaits_computer": False,
+                        "checked_computer_id": None,
+                        "coverage_unit_id": None,
+                        "coverage_unit_version": None,
+                        "ws_changed": False,
+                    }
+                else:
+                    state["exec_status"] = "skipped"
+                    state["auto_status"] = "paused"
+                    self._row = None
+
+        async def fetchone(self):
+            return self._row
+
+        async def fetchall(self):
+            return self._rows
+
+    class _Conn:
+        @asynccontextmanager
+        async def transaction(self):
+            yield self
+
+        @asynccontextmanager
+        async def cursor(self, **_kw):
+            yield _Cur()
+
+    @asynccontextmanager
+    async def _pool_conn(c=None):
+        yield _Conn()
+
+    monkeypatch.setattr(exec_db, "get_db_connection", _pool_conn)
+    started_unbound = await exec_db.begin_execution_if_not_deleted(
+        "exec-move-unbound", started_at=datetime.now(timezone.utc)
+    )
+    assert started_unbound is not None
+    assert state["exec_status"] == "running"
+    assert state["auto_status"] == "executing"
+
+    state["mode"] = "bound_nonlead"
+    state["exec_status"] = "pending"
+    state["auto_status"] = "executing"
+    started_nonlead = await exec_db.begin_execution_if_not_deleted(
+        "exec-move-nonlead", started_at=datetime.now(timezone.utc)
+    )
+    assert started_nonlead is None
+    assert state["exec_status"] == "skipped"
+    assert state["auto_status"] != "executing"

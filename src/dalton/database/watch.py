@@ -488,6 +488,7 @@ async def claim_signals_woken(
     execution_id: str,
     *,
     workspace_id: Optional[str] = None,
+    conn: Any = None,
 ) -> list[dict[str, Any]]:
     """Atomically claim unwoken signals (or re-claim signals already owned by ``execution_id``)."""
     ws_uuid = _require_scoped_ws_uuid(workspace_id)
@@ -497,8 +498,9 @@ async def claim_signals_woken(
     sig_uuids = [u for s in signal_ids if (u := _try_uuid(s)) is not None]
     if not sig_uuids:
         return []
-    async with get_db_connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
+    conn_ctx = get_db_connection(conn) if conn is not None else get_db_connection()
+    async with conn_ctx as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
                 UPDATE dalton_signals

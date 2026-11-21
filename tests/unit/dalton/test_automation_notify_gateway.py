@@ -1027,3 +1027,121 @@ async def test_reconcile_updates_a_sent_row_once_under_concurrency(
     assert state.outer["status"] == "sent"
     assert state.outer["error_code"] is None
     assert state.outer["attempt_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_phase1_c5_gateway_eligibility_rejects_group_or_transferred_lead_and_keeps_dm_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C5 gateway plan: active unit managed delivery rejects group chat / non-lead / unreadable ws
+    and suppresses group chat targets during eligibility evaluation."""
+    from unittest.mock import create_autospec
+    from src.dalton import settings as dalton_settings
+    from src.dalton import sharing as dalton_sharing
+    from src.dalton.database import automation_notifications as notif_db
+    from src.dalton.database import coverage_units as cu_db
+    from src.dalton.notify import dispatch as dispatch_mod
+
+    ws_id = "11111111-1111-1111-1111-111111111111"
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+    unit_mock = create_autospec(
+        cu_db.get_active_unit_by_workspace,
+        return_value={
+            "unit_id": "u-unit-1",
+            "workspace_id": ws_id,
+            "owner_user_id": "u-owner",
+            "lead_analyst_user_id": "u-lead",
+            "status": "active",
+            "kind": "company",
+        },
+    )
+    monkeypatch.setattr(cu_db, "get_active_unit_by_workspace", unit_mock)
+    monkeypatch.setattr(
+        dalton_sharing,
+        "require_workspace_access",
+        create_autospec(dalton_sharing.require_workspace_access, return_value={"workspace_id": ws_id}),
+    )
+
+    row_dm = {
+        "delivery_id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+        "execution_id": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+        "automation_id": "",
+        "user_id": "u-lead",
+        "channel": "feishu",
+        "target": "feishu:user:ou_lead",
+    }
+    payload = {
+        "source": "automation_completion",
+        "transport": "gateway",
+        "automation_name": "dalton-nvda-earn-fy26q3-t0",
+        "category": "earnings_t0",
+        "workspace_id": ws_id,
+        "coverage_unit_id": "u-unit-1",
+    }
+    ok_dm, reason_dm = await notif_db._eligibility(
+        row_dm,
+        payload,
+        "feishu:user:ou_lead",
+        cur=None,
+        resolve_enabled_fn=create_autospec(dispatch_mod.resolve_dalton_notify_enabled, return_value=True),
+        resolve_overrides_fn=create_autospec(dispatch_mod.resolve_dalton_notify_overrides, return_value={}),
+        resolve_targets_fn=create_autospec(
+            dispatch_mod.resolve_dalton_notify_targets,
+            return_value=["feishu:user:ou_lead"],
+        ),
+        resolve_routes_fn=create_autospec(
+            dispatch_mod.resolve_dalton_notify_routes,
+            return_value={"earnings_t0": ["feishu:user:ou_lead", "feishu:chat:oc_group"]},
+        ),
+        is_admin_fn=create_autospec(dispatch_mod._default_notify_admin, return_value=True),
+    )
+    assert (ok_dm, reason_dm) == (True, None)
+
+    # Group target blocked on active unit managed task even if user is admin
+    ok_grp, reason_grp = await notif_db._eligibility(
+        {**row_dm, "target": "feishu:chat:oc_group"},
+        payload,
+        "feishu:chat:oc_group",
+        cur=None,
+        resolve_enabled_fn=create_autospec(dispatch_mod.resolve_dalton_notify_enabled, return_value=True),
+        resolve_overrides_fn=create_autospec(dispatch_mod.resolve_dalton_notify_overrides, return_value={}),
+        resolve_targets_fn=create_autospec(
+            dispatch_mod.resolve_dalton_notify_targets,
+            return_value=["feishu:user:ou_lead"],
+        ),
+        resolve_routes_fn=create_autospec(
+            dispatch_mod.resolve_dalton_notify_routes,
+            return_value={"earnings_t0": ["feishu:user:ou_lead", "feishu:chat:oc_group"]},
+        ),
+        is_admin_fn=create_autospec(dispatch_mod._default_notify_admin, return_value=True),
+    )
+    assert (ok_grp, reason_grp) == (False, "unit_managed_dm_only")
+
+    # Non-lead user rejected with not_unit_lead_analyst
+    ok_old, reason_old = await notif_db._eligibility(
+        {**row_dm, "user_id": "u-old-lead"},
+        payload,
+        "feishu:user:ou_lead",
+        cur=None,
+        resolve_enabled_fn=create_autospec(dispatch_mod.resolve_dalton_notify_enabled, return_value=True),
+        resolve_overrides_fn=create_autospec(dispatch_mod.resolve_dalton_notify_overrides, return_value={}),
+        resolve_targets_fn=create_autospec(dispatch_mod.resolve_dalton_notify_targets, return_value=["feishu:user:ou_lead"]),
+        resolve_routes_fn=create_autospec(dispatch_mod.resolve_dalton_notify_routes, return_value={}),
+        is_admin_fn=create_autospec(dispatch_mod._default_notify_admin, return_value=True),
+    )
+    assert (ok_old, reason_old) == (False, "not_unit_lead_analyst")
+
+    # Unbound / archived unit skips stale row
+    unit_mock.return_value = None
+    ok_unbound, reason_unbound = await notif_db._eligibility(
+        row_dm,
+        payload,
+        "feishu:user:ou_lead",
+        cur=None,
+        resolve_enabled_fn=create_autospec(dispatch_mod.resolve_dalton_notify_enabled, return_value=True),
+        resolve_overrides_fn=create_autospec(dispatch_mod.resolve_dalton_notify_overrides, return_value={}),
+        resolve_targets_fn=create_autospec(dispatch_mod.resolve_dalton_notify_targets, return_value=["feishu:user:ou_lead"]),
+        resolve_routes_fn=create_autospec(dispatch_mod.resolve_dalton_notify_routes, return_value={}),
+        is_admin_fn=create_autospec(dispatch_mod._default_notify_admin, return_value=True),
+    )
+    assert (ok_unbound, reason_unbound) == (False, "unit_unbound_or_archived")

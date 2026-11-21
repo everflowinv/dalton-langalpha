@@ -450,6 +450,11 @@ class TestTeamWorkspacesEndpoint:
         members = resp["members"]
         assert len(members) == 1
         assert [w["workspace_id"] for w in members[0]["workspaces"]] == ["ws-shared-ro"]
+        assert "is_historical_duplicate" not in members[0]["workspaces"][0]
+
+        monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "true")
+        resp_on = await dalton_router.list_team_workspaces_endpoint(user_id="u-chao")
+        assert resp_on["members"][0]["workspaces"][0]["is_historical_duplicate"] is False
 
 
 class TestReadEndpointsAllowColleagues:
@@ -2906,3 +2911,130 @@ class TestSkillsOwnerIdentityReads:
             assert call.args[0] == "u-richard"
         fetch_mock.assert_awaited_once()
         assert fetch_mock.await_args.args[0] == "u-richard"
+
+
+class TestAccessTierInternalGate:
+    """External invited users never pass is_internal_or_admin."""
+
+    @pytest.mark.asyncio
+    async def test_invited_external_user_rejected_by_real_is_internal_or_admin(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton import access_tiers as tiers_mod
+        from src.server.database import user as user_db
+
+        monkeypatch.setattr(
+            tiers_mod, "get_dalton_allowed_emails", lambda: frozenset({"internal@firm.com"})
+        )
+        monkeypatch.setattr(tiers_mod, "is_invite_pm", lambda uid: False)
+        monkeypatch.setattr(tiers_mod, "is_company_system_user", lambda uid: False)
+
+        async def _fake_get_user(uid: str) -> dict[str, Any] | None:
+            if uid == "u-external":
+                return {"user_id": uid, "email": "ext@guest.com"}
+            return {"user_id": uid, "email": "internal@firm.com"}
+
+        monkeypatch.setattr(
+            user_db,
+            "get_user",
+            create_autospec(user_db.get_user, side_effect=_fake_get_user),
+        )
+
+        assert await tiers_mod.is_internal_or_admin("u-external") is False
+        assert await tiers_mod.is_internal_or_admin("u-internal") is True
+
+
+@pytest.mark.asyncio
+async def test_phase1_c4_dalton_watch_event_and_apply_update_support_web_write_and_g3(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C4 & G3: dalton_watch_event -> knowledge_service.apply_update accepts channel='web', need='write'
+    when Dalton auth is enabled (even when cos='ro'), and fails closed 403 when auth is disabled."""
+    import json
+    from unittest.mock import create_autospec
+    from fastapi import HTTPException
+    from src.dalton import settings as dalton_settings
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.knowledge import service as knowledge_service
+    from src.dalton.tools import director_tools as dt_mod
+
+    ws_id = "11111111-1111-1111-1111-111111111111"
+    vwa_calls: list[tuple[str, str, str, str]] = []
+
+    async def _vwa(wid, uid, *, need="read", channel="cos", conn=None):
+        vwa_calls.append((str(wid), str(uid), str(need), str(channel)))
+        if channel == "cos" and need == "write":
+            raise HTTPException(status_code=403, detail="cos read-only")
+        if channel == "web" and need == "write":
+            return {"workspace_id": str(wid), "user_id": "owner-b"}
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    monkeypatch.setattr(
+        dt_mod,
+        "verify_workspace_access",
+        create_autospec(dt_mod.verify_workspace_access, side_effect=_vwa),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_version",
+        create_autospec(db_knowledge.latest_version, return_value=None),
+    )
+    captured_channels: list[str] = []
+
+    async def _fake_apply(**kwargs):
+        captured_channels.append(str(kwargs.get("access_channel", "cos")))
+        return {"ok": True, "version": 1}
+
+    orig_apply_update = knowledge_service.apply_update
+    monkeypatch.setattr(
+        knowledge_service,
+        "apply_update",
+        create_autospec(knowledge_service.apply_update, side_effect=_fake_apply),
+    )
+
+    tools = {t.name: t for t in dt_mod.build_director_tools(role="chief_of_staff")}
+    watch_tool = tools["dalton_watch_event"]
+    payload = {
+        "workspace_id": ws_id,
+        "type": "earnings",
+        "date": "2026-11-25",
+        "date_status": "estimated",
+        "note": "FY26Q3 earnings",
+        "source": "https://ir.example.com",
+    }
+    cfg = {"configurable": {"user_id": "colleague-a", "thread_id": "t-cos"}}
+
+    # G3: auth disabled -> no web fallback, fails closed 403
+    monkeypatch.setattr(dalton_settings, "is_dalton_supabase_auth_enabled", lambda: False)
+    with pytest.raises(HTTPException) as exc_off:
+        await watch_tool.ainvoke(payload, config=cfg)
+    assert exc_off.value.status_code == 403
+
+    # Auth enabled: falls back to channel='web', need='write' and forwards access_channel='web'
+    vwa_calls.clear()
+    monkeypatch.setattr(dalton_settings, "is_dalton_supabase_auth_enabled", lambda: True)
+    res = json.loads(await watch_tool.ainvoke(payload, config=cfg))
+    assert res["ok"] is True
+    assert captured_channels == ["web"]
+    assert ("11111111-1111-1111-1111-111111111111", "colleague-a", "write", "web") in vwa_calls
+
+    # knowledge_service.apply_update itself verifies access_channel when called with access_channel='web'
+    ks_vwa = create_autospec(knowledge_service.verify_workspace_access, return_value={"workspace_id": ws_id})
+    monkeypatch.setattr(knowledge_service, "verify_workspace_access", ks_vwa)
+    monkeypatch.setattr(
+        knowledge_service,
+        "resolve_workspace_profile",
+        create_autospec(knowledge_service.resolve_workspace_profile, return_value="company"),
+    )
+    await orig_apply_update(
+        user_id="colleague-a",
+        workspace_id=ws_id,
+        doc_key="agenda",
+        ops=[{"op": "create", "value": {"watch": {"events": []}}}],
+        reason="dry",
+        base_version=None,
+        dry_run=True,
+        access_channel="web",
+    )
+    assert ks_vwa.await_args.kwargs["channel"] == "web"
+    assert ks_vwa.await_args.kwargs["need"] == "write"

@@ -776,3 +776,1501 @@ async def test_thread_maintenance_summarize_uses_workspace_owner_for_session_and
     assert len(graph_kwargs_captured) == 1
     assert graph_kwargs_captured[0]["user_id"] == "u-caller-a"
     assert graph_kwargs_captured[0]["workspace_owner_id"] == "u-owner-b"
+
+
+@pytest.mark.asyncio
+async def test_phase1_c3_cross_user_automations_backend_read_only_and_unit_file_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C3 Option 2: cross-user shared workspaces disable AutomationsBackend direct writes
+    and direct AutomationFile commits refuse managed tasks by non-lead users."""
+    from unittest.mock import create_autospec
+    from ptc_agent.agent.backends.automations import AutomationsBackend
+    from ptc_agent.agent.backends.db_json_route import UserDataValidationError
+    from ptc_agent.agent.backends.langgraph_store import ReadOnlyStoreError
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from ptc_agent.agent.filesystem_routes import IdentityGates, build_filesystem_backend
+    from src.dalton import settings as dalton_settings
+    from src.dalton.database import coverage_units as cu_db
+    from src.server.models.automation import AutomationCreate
+    from src.server.services.automations import file as auto_file
+
+    sb = create_autospec(SandboxBackend, instance=True)
+    sb.computer_root = "/ws"
+    sb.normalize_path.side_effect = lambda p: p
+
+    # Cross-user colleague session: AutomationsBackend keeps owner _user_id but refuses writes
+    composite, _baseline = build_filesystem_backend(
+        backend=sb,
+        gates=IdentityGates(
+            user_memory=False,
+            workspace_memory=False,
+            memo=False,
+            user_data=True,
+            workflow=False,
+            workflow_fs=False,
+            workflow_tool=False,
+            channels=False,
+        ),
+        store=object(),
+        user_id="u-caller-a",
+        workspace_owner_id="u-owner-b",
+        workspace_id="11111111-1111-1111-1111-111111111111",
+    )
+    auto_route = next(
+        r for r in getattr(composite, "_routes", []) if isinstance(r, AutomationsBackend)
+    )
+    assert auto_route._user_id == "u-owner-b"
+    assert auto_route.is_writable("/ws/.agents/user/automations/dalton-nvda-watch.json") is False
+    assert auto_route.is_writable("/ws/.agents/user/automations") is False
+
+    with pytest.raises(UserDataValidationError, match="dalton_schedule_automation"):
+        await auto_route.awrite_text(
+            "/ws/.agents/user/automations/dalton-nvda-watch.json",
+            "{}",
+        )
+
+    with pytest.raises(ReadOnlyStoreError, match="dalton_schedule_automation"):
+        await auto_route.adelete_versioned("/ws/.agents/user/automations/dalton-nvda-watch.json")
+    with pytest.raises(ReadOnlyStoreError, match="dalton_schedule_automation"):
+        await auto_route.arename_versioned(
+            "/ws/.agents/user/automations/a.json",
+            "/ws/.agents/user/automations/b.json",
+        )
+    with pytest.raises(UserDataValidationError, match="dalton_schedule_automation"):
+        await auto_route.awrite_versioned(
+            "/ws/.agents/user/automations/dalton-nvda-watch.json", "{}", None
+        )
+
+    # AutomationFile.commit blocks direct file writes for managed unit tasks for ALL users (owner & lead)
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(
+        cu_db,
+        "get_active_unit_by_workspace",
+        create_autospec(
+            cu_db.get_active_unit_by_workspace,
+            return_value={
+                "unit_id": "uuuuuuuu-uuuu-uuuu-uuuu-uuuuuuuuuuuu",
+                "workspace_id": "11111111-1111-1111-1111-111111111111",
+                "owner_user_id": "u-owner-b",
+                "lead_analyst_user_id": "u-lead-c",
+                "status": "active",
+                "kind": "company",
+                "ticker": "NVDA",
+            },
+        ),
+    )
+    f = auto_file.AutomationFile("dalton-nvda-watch.json")
+    managed_plan = auto_file.FilePlan(
+        create=auto_file._Create(
+            data=AutomationCreate(
+                name="dalton-nvda-watch",
+                trigger_type="cron",
+                cron_expression="0 9 * * *",
+                instruction="watch",
+                workspace_id="11111111-1111-1111-1111-111111111111",
+                metadata={"dalton_kind": "company_watch", "ticker": "NVDA"},
+            ),
+            pause=False,
+        )
+    )
+    for caller_uid in ("u-owner-b", "u-lead-c"):
+        with pytest.raises(ReadOnlyStoreError, match="dalton_schedule_automation"):
+            await f.commit(caller_uid, managed_plan, conn=object())
+
+    # Item 13: personal dalton-* task without unit_id/ticker metadata is NOT blocked on create
+    personal_plan = auto_file.FilePlan(
+        create=auto_file._Create(
+            data=AutomationCreate(
+                name="dalton-nvda-watch",
+                trigger_type="cron",
+                cron_expression="0 9 * * *",
+                instruction="personal note",
+                workspace_id="11111111-1111-1111-1111-111111111111",
+            ),
+            pause=False,
+        )
+    )
+    await f._check_plan_not_managed_unit(personal_plan, conn=object())
+
+
+@pytest.mark.asyncio
+async def test_round4_item7_file_prelock_runs_before_file_lock_in_save_delete_rename(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 4 Item 7: _save, adelete_versioned, arename_versioned acquire unit FOR SHARE BEFORE file.lock."""
+    from contextlib import asynccontextmanager
+    from unittest.mock import create_autospec
+
+    from ptc_agent.agent.backends.automations import AutomationsBackend
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from ptc_agent.core.sandbox.livefs_mount import CallContext
+    from src.dalton import settings as dalton_settings
+    from src.dalton.database import coverage_units as cu_db
+    from src.server.database import automation as auto_db
+    from src.server.services.automations import file as auto_file
+
+    ws_old = "11111111-1111-1111-1111-111111111111"
+    ws_new = "22222222-2222-2222-2222-222222222222"
+    events: list[tuple[str, str | None]] = []
+
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+
+    async def _fake_get_unit(ws_id, conn=None, for_share=False):
+        events.append(("UNIT_FOR_SHARE" if for_share else "UNIT_READ", str(ws_id)))
+        return None
+
+    async def _fake_lock_user(uid, conn=None):
+        events.append(("USER_LOCK", str(uid)))
+
+    existing_row = {
+        "automation_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "user_id": "owner-a",
+        "name": "brief",
+        "file_name": "brief.json",
+        "trigger_type": "cron",
+        "cron_expression": "0 9 * * *",
+        "timezone": "UTC",
+        "instruction": "hello",
+        "workspace_id": ws_old,
+        "thread_strategy": "new",
+        "status": "active",
+        "max_failures": 3,
+        "delivery_config": {"methods": []},
+        "metadata": {},
+    }
+
+    managed_row = {
+        **existing_row,
+        "name": "dalton-nvda-watch",
+        "file_name": "dalton-nvda-watch.json",
+        "metadata": {"dalton_kind": "company_watch", "ticker": "NVDA", "unit_id": "u-nvda"},
+    }
+
+    async def _fake_fetch(uid, fn, conn=None, lock=False):
+        if fn == "dalton-nvda-watch.json":
+            return dict(managed_row)
+        return dict(existing_row) if fn == "brief.json" else None
+
+    async def _fake_delete(aid, uid, **_kw):
+        return True
+
+    async def _fake_rename(aid, uid, to, **_kw):
+        return True
+
+    class _TxConn:
+        @asynccontextmanager
+        async def transaction(self):
+            yield self
+
+    monkeypatch.setattr(cu_db, "get_active_unit_by_workspace", _fake_get_unit)
+    monkeypatch.setattr(auto_db, "lock_user_automations", _fake_lock_user)
+    monkeypatch.setattr(auto_db, "get_automation_file", _fake_fetch)
+    monkeypatch.setattr(auto_db, "delete_automation", _fake_delete)
+    monkeypatch.setattr(auto_db, "rename_automation_file", _fake_rename)
+
+    @asynccontextmanager
+    async def _backend_tx():
+        yield _TxConn()
+
+    sb = create_autospec(SandboxBackend, instance=True)
+    sb.normalize_path.side_effect = lambda p: p
+    backend = AutomationsBackend(
+        user_id="owner-a",
+        call=CallContext(workspace_id=ws_old),
+        sandbox_backend=sb,
+        root_prefix="/ws/.agents/user/automations",
+    )
+    monkeypatch.setattr(backend, "_transaction", _backend_tx)
+    monkeypatch.setattr(auto_file, "get_home_workspace_id", lambda _uid: "99999999-9999-9999-9999-999999999999")
+
+    # Ordinary file skips unit FOR SHARE queries during delete/rename; unit-managed file locks unit BEFORE USER_LOCK
+    await backend.adelete_versioned("/ws/.agents/user/automations/brief.json")
+    assert events == [("USER_LOCK", "owner-a")]
+
+    events.clear()
+    await backend.adelete_versioned("/ws/.agents/user/automations/dalton-nvda-watch.json")
+    assert events[:2] == [("UNIT_FOR_SHARE", ws_old), ("USER_LOCK", "owner-a")]
+
+    events.clear()
+    await backend.arename_versioned(
+        "/ws/.agents/user/automations/dalton-nvda-watch.json",
+        "/ws/.agents/user/automations/dalton-nvda-watch-renamed.json",
+    )
+    assert events[:2] == [("UNIT_FOR_SHARE", ws_old), ("USER_LOCK", "owner-a")]
+
+    events.clear()
+    # Save changing workspace_id on a unit-managed file locks BOTH units in sorted order BEFORE USER_LOCK
+    import json
+
+    rendered_text, _ = auto_file._render(managed_row)
+    doc_payload = json.loads(rendered_text)
+    doc_payload["workspace_id"] = ws_new
+    # Force an early return after file.lock by returning existing version mismatch so test checks lock order cleanly
+    with pytest.raises(Exception):
+        await backend._save(
+            "dalton-nvda-watch.json",
+            json.dumps(doc_payload),
+            "stale-version",
+            served=rendered_text,
+            may_delete=True,
+        )
+    assert events[:3] == [
+        ("UNIT_FOR_SHARE", ws_old),
+        ("UNIT_FOR_SHARE", ws_new),
+        ("USER_LOCK", "owner-a"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_round4_item8_item13_item14_execution_entry_and_preflight_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 4 Items 8, 13, 14 on begin_execution_if_not_deleted and _conclude_preflight."""
+    from contextlib import asynccontextmanager
+    from datetime import datetime, timezone
+    from unittest.mock import create_autospec
+
+    from src.dalton import settings as dalton_settings
+    from src.dalton.autonomy import preflight as preflight_mod
+    from src.dalton.database import watch as watch_db
+    from src.server.database import automation_executions as exec_db
+
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(dalton_settings, "is_dalton_supabase_auth_enabled", lambda: True)
+
+    # Item 14: ordinary non-managed task executes ONLY 1 SQL statement (no probe / no unit lock)
+    ordinary_queries: list[str] = []
+
+    class _OrdCur:
+        async def execute(self, sql, params=None):
+            ordinary_queries.append(" ".join(str(sql).split()))
+
+        async def fetchone(self):
+            return {
+                "conversation_thread_id": None,
+                "conversation_response_id": None,
+                "scheduled_at": datetime.now(timezone.utc),
+                "wait_reason": None,
+                "awaits_computer": False,
+                "checked_computer_id": None,
+                "coverage_unit_id": None,
+                "coverage_unit_version": None,
+            }
+
+    class _OrdConn:
+        @asynccontextmanager
+        async def transaction(self):
+            yield self
+
+        @asynccontextmanager
+        async def cursor(self, **_kw):
+            yield _OrdCur()
+
+    @asynccontextmanager
+    async def _ord_pool(c=None):
+        yield _OrdConn()
+
+    monkeypatch.setattr(exec_db, "get_db_connection", _ord_pool)
+    ord_res = await exec_db.begin_execution_if_not_deleted(
+        "exec-ordinary", started_at=datetime.now(timezone.utc)
+    )
+    assert ord_res is not None
+    assert len(ordinary_queries) == 1
+    assert "dalton_coverage_units" not in ordinary_queries[0]
+
+    # Item 8a & 13: workspace_id drifts concurrently on first attempt -> retries & locks new unit;
+    # also target CTE uses managed_unit_pred (no name-only fallback)
+    attempt_state = {"probes": 0, "locked_ws": []}
+
+    class _DriftCur:
+        def __init__(self):
+            self._r = None
+            self._rows = []
+
+        async def execute(self, sql, params=None):
+            q = " ".join(str(sql).split())
+            if "AND NOT (" in q and "UPDATE automation_executions e" in q:
+                self._r = None
+            elif "SELECT a.workspace_id" in q:
+                attempt_state["probes"] += 1
+                self._r = {
+                    "workspace_id": "ws-old" if attempt_state["probes"] == 1 else "ws-new",
+                    "is_managed_candidate": True,
+                }
+            elif "FROM dalton_coverage_units" in q and "FOR SHARE" in q:
+                attempt_state["locked_ws"].append(params[0])
+                self._rows = [{"unit_id": "u-new", "updated_at": datetime.now(timezone.utc)}]
+                self._r = self._rows[0]
+            elif "WITH target AS" in q:
+                assert "(a.workspace_id IS DISTINCT FROM %s::uuid) AS ws_changed" in q
+                if attempt_state["probes"] == 1:
+                    self._r = {"ws_changed": True}
+                else:
+                    self._r = {
+                        "conversation_thread_id": None,
+                        "conversation_response_id": None,
+                        "scheduled_at": datetime.now(timezone.utc),
+                        "wait_reason": None,
+                        "awaits_computer": False,
+                        "checked_computer_id": None,
+                        "coverage_unit_id": "u-new",
+                        "coverage_unit_version": None,
+                        "ws_changed": False,
+                    }
+
+        async def fetchone(self):
+            return self._r
+
+        async def fetchall(self):
+            return self._rows
+
+    class _DriftConn:
+        @asynccontextmanager
+        async def transaction(self):
+            yield self
+
+        @asynccontextmanager
+        async def cursor(self, **_kw):
+            yield _DriftCur()
+
+    @asynccontextmanager
+    async def _drift_pool(c=None):
+        yield _DriftConn()
+
+    monkeypatch.setattr(exec_db, "get_db_connection", _drift_pool)
+    drift_res = await exec_db.begin_execution_if_not_deleted(
+        "exec-drift", started_at=datetime.now(timezone.utc)
+    )
+    assert drift_res is not None
+    assert attempt_state["locked_ws"] == ["ws-old", "ws-new"]
+    assert drift_res["coverage_unit_id"] == "u-new"
+
+    # Item 8b: preflight _conclude_preflight checks locked auto_row.workspace_id != workspace_id -> skips without claiming
+    claim_mock = create_autospec(watch_db.claim_signals_woken, return_value=[])
+    monkeypatch.setattr(watch_db, "claim_signals_woken", claim_mock)
+    monkeypatch.setattr(
+        watch_db, "list_unwoken_signals", create_autospec(watch_db.list_unwoken_signals, return_value=[])
+    )
+    monkeypatch.setattr(
+        watch_db,
+        "upsert_signal",
+        create_autospec(watch_db.upsert_signal, return_value=({"signal_id": "sig-drift"}, True)),
+    )
+    monkeypatch.setattr(watch_db, "upsert_watch_state", lambda *_a, **_kw: _noop_async())
+
+    async def _noop_async():
+        return None
+
+    class _PreDriftConn:
+        @asynccontextmanager
+        async def transaction(self):
+            yield self
+
+        @asynccontextmanager
+        async def cursor(self, **_kw):
+            class _PCur:
+                async def execute(self_c, sql, _p=None):
+                    s = " ".join(str(sql).split())
+                    if "FROM dalton_coverage_units" in s and "FOR SHARE" in s:
+                        self_c._r = None
+                    elif "FROM automations" in s and "FOR SHARE" in s:
+                        self_c._r = {
+                            "automation_id": "11111111-1111-1111-1111-111111111111",
+                            "user_id": "u-owner",
+                            "workspace_id": "ws-moved",
+                            "status": "executing",
+                            "deleted_at": None,
+                            "name": "dalton-nvda-move-up",
+                            "metadata": {"dalton_kind": "price_move", "ticker": "NVDA"},
+                        }
+
+                async def fetchone(self_c):
+                    return getattr(self_c, "_r", None)
+
+            yield _PCur()
+
+    @asynccontextmanager
+    async def _pre_conn(c=None):
+        yield _PreDriftConn()
+
+    monkeypatch.setattr("src.server.database.pool.get_db_connection", _pre_conn)
+    from src.dalton.database import coverage_units as cu_db
+
+    monkeypatch.setattr(cu_db, "get_db_connection", _pre_conn)
+    res_ws_drift = await preflight_mod._conclude_preflight(
+        emitted=[preflight_mod.ProbeSignal(probe="sec", signal_key="k1", priority="P0", summary="s")],
+        state={},
+        persist=True,
+        workspace_id="ws-orig",
+        ticker="NVDA",
+        automation_id="11111111-1111-1111-1111-111111111111",
+        execution_id="exec-pre-drift",
+        name="dalton-nvda-move-up",
+        user_id="u-owner",
+        agenda_doc_override={},
+        watch_state_override=None,
+        group_refresh_summary=None,
+        load_saved_signals=False,
+    )
+    assert res_ws_drift.should_wake is False
+    assert res_ws_drift.reason == "workspace_changed"
+    claim_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_round4_item9_schedule_db_metadata_and_pm_target_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 4 Item 9:
+    1) Non-lead colleague omitting ticker cannot resume/modify a unit-managed automation carrying DB metadata.
+    2) PM operating on bound unit workspace resolves target task owner to unit's lead_analyst_user_id.
+    """
+    from contextlib import asynccontextmanager
+    from unittest.mock import create_autospec
+
+    from src.dalton import settings as dalton_settings
+    from src.dalton.autonomy import schedule as sched_mod
+    from src.dalton.database import coverage_units as cu_db
+    from src.server.database import automation as auto_db
+
+    ws_id = "11111111-1111-1111-1111-111111111111"
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(dalton_settings, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr(
+        sched_mod,
+        "get_dalton_settings",
+        lambda: type("S", (), {"pm_user_ids": ["pm-1"], "autonomy": type("A", (), {"timezone": "Asia/Shanghai"})()})(),
+    )
+    monkeypatch.setattr(
+        "src.dalton.autonomy.system_jobs.is_pm_user",
+        lambda uid: str(uid) == "pm-1",
+    )
+    monkeypatch.setattr(
+        "src.dalton.access_tiers.classify_owner_tier",
+        lambda _uid: _async_ret("internal"),
+    )
+    monkeypatch.setattr(
+        sched_mod,
+        "verify_workspace_access",
+        create_autospec(
+            sched_mod.verify_workspace_access,
+            return_value={"workspace_id": ws_id, "user_id": "owner-b", "is_home": False},
+        ),
+    )
+    monkeypatch.setattr(
+        cu_db,
+        "get_active_unit_by_workspace",
+        create_autospec(
+            cu_db.get_active_unit_by_workspace,
+            return_value={
+                "unit_id": "u-nvda",
+                "workspace_id": ws_id,
+                "owner_user_id": "owner-b",
+                "lead_analyst_user_id": "lead-a",
+                "status": "active",
+                "kind": "company",
+                "ticker": "NVDA",
+            },
+        ),
+    )
+
+    db_row = {
+        "automation_id": "auto-nvda-1",
+        "user_id": "colleague-c",
+        "name": "dalton-nvda-watch",
+        "workspace_id": ws_id,
+        "status": "paused",
+        "metadata": {"dalton_kind": "company_watch", "ticker": "NVDA"},
+        "scope": "research_tracking",
+    }
+    lead_row = {**db_row, "user_id": "lead-a"}
+
+    @asynccontextmanager
+    async def _lock(_uid, conn=None):
+        yield object()
+
+    monkeypatch.setattr(sched_mod, "user_automations_lock", _lock)
+    monkeypatch.setattr(
+        sched_mod,
+        "list_all_user_automations",
+        create_autospec(
+            sched_mod.list_all_user_automations,
+            side_effect=lambda uid, **_kw: [lead_row] if uid == "lead-a" else [db_row],
+        ),
+    )
+
+    # Non-lead colleague omitting ticker cannot resume DB-managed task
+    denied = await sched_mod.schedule_dalton_automation_helper(
+        "dalton-nvda-watch",
+        {"action": "resume"},
+        user_id="colleague-c",
+        workspace_id=ws_id,
+        role="chief_of_staff",
+        action="resume",
+    )
+    assert denied["ok"] is False
+    assert denied["error"] == "not_unit_lead_analyst"
+
+    # PM omitting ticker resolves DB row under lead-a and updates as lead-a (actor = pm-1)
+    updated_calls: list[tuple[str, str]] = []
+
+    async def _fake_update(aid, uid, **_kw):
+        updated_calls.append((str(aid), str(uid)))
+        return {**lead_row, "status": "active"}
+
+    monkeypatch.setattr(
+        auto_db,
+        "update_automation",
+        create_autospec(auto_db.update_automation, side_effect=_fake_update),
+    )
+    res_pm = await sched_mod.schedule_dalton_automation_helper(
+        "dalton-nvda-watch",
+        {"action": "resume"},
+        user_id="pm-1",
+        workspace_id=ws_id,
+        role="chief_of_staff",
+        action="resume",
+    )
+    assert res_pm["ok"] is True
+    assert updated_calls == [("auto-nvda-1", "lead-a")]
+
+
+@pytest.mark.asyncio
+async def test_round5_pm_resume_recomputes_next_run_and_refuses_concurrent_unbind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 5 Item 6:
+    1) PM resume writes recalculated next_run_at and strips stale handoff_paused_reason.
+    2) PM resume when locked re-read finds unit is None (unbound concurrently) refuses without writing.
+    """
+    from contextlib import asynccontextmanager
+    from datetime import datetime, timezone
+    from unittest.mock import create_autospec
+    from src.dalton import access_tiers as access_tiers_mod
+    from src.dalton import invites as invites_mod
+    from src.dalton import settings as dalton_settings
+    from src.dalton.autonomy import schedule as sched_mod
+    from src.dalton.database import coverage_units as cu_db
+    from src.server.database import automation as auto_db
+
+    ws_id = "22222222-2222-2222-2222-222222222222"
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(dalton_settings, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr(
+        sched_mod,
+        "get_dalton_settings",
+        lambda: type("S", (), {"pm_user_ids": ["pm-1"], "autonomy": type("A", (), {"timezone": "Asia/Shanghai"})()})(),
+    )
+    monkeypatch.setattr("src.dalton.autonomy.system_jobs.is_pm_user", lambda uid: uid == "pm-1")
+    monkeypatch.setattr(invites_mod, "is_invite_pm", lambda uid: uid == "pm-1")
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "classify_owner_tier",
+        create_autospec(access_tiers_mod.classify_owner_tier, return_value="internal"),
+    )
+
+    unit_row = {
+        "unit_id": "u-nvda",
+        "workspace_id": ws_id,
+        "owner_user_id": "owner-b",
+        "lead_analyst_user_id": "lead-a",
+        "status": "active",
+        "kind": "company",
+        "ticker": "NVDA",
+    }
+    lead_cron_row = {
+        "automation_id": "auto-nvda-cron",
+        "user_id": "lead-a",
+        "name": "dalton-nvda-watch",
+        "workspace_id": ws_id,
+        "status": "paused",
+        "trigger_type": "cron",
+        "cron_expression": "0 9 * * *",
+        "timezone": "UTC",
+        "next_run_at": None,
+        "metadata": {
+            "dalton_kind": "company_watch",
+            "ticker": "NVDA",
+            "handoff_paused_reason": "unit_unbound",
+        },
+        "scope": "research_tracking",
+    }
+    monkeypatch.setattr(
+        sched_mod,
+        "verify_workspace_access",
+        create_autospec(
+            sched_mod.verify_workspace_access,
+            return_value={"workspace_id": ws_id, "user_id": "owner-b"},
+        ),
+    )
+    orig_get_active_unit = cu_db.get_active_unit_by_workspace
+    monkeypatch.setattr(
+        cu_db,
+        "get_active_unit_by_workspace",
+        create_autospec(orig_get_active_unit, return_value=unit_row),
+    )
+    monkeypatch.setattr(
+        sched_mod,
+        "list_all_user_automations",
+        create_autospec(
+            sched_mod.list_all_user_automations,
+            side_effect=lambda uid, **_kw: [lead_cron_row] if uid == "lead-a" else [],
+        ),
+    )
+
+    @asynccontextmanager
+    async def _lock(_uid, conn=None):
+        yield object()
+
+    monkeypatch.setattr(sched_mod, "user_automations_lock", _lock)
+    update_spy = create_autospec(
+        auto_db.update_automation,
+        side_effect=lambda aid, uid, **kw: {**lead_cron_row, **kw},
+    )
+    monkeypatch.setattr(auto_db, "update_automation", update_spy)
+
+    res = await sched_mod.schedule_dalton_automation_helper(
+        "dalton-nvda-watch",
+        {"action": "resume"},
+        user_id="pm-1",
+        workspace_id=ws_id,
+        role="chief_of_staff",
+        action="resume",
+    )
+    assert res["ok"] is True
+    assert update_spy.await_count == 1
+    write_kw = update_spy.await_args.kwargs
+    assert write_kw["status"] == "active"
+    assert isinstance(write_kw["next_run_at"], datetime)
+    assert write_kw["next_run_at"] > datetime.now(timezone.utc)
+    assert write_kw["failure_count"] == 0
+    assert write_kw["disable_reason"] is None
+    assert "handoff_paused_reason" not in write_kw["metadata"]
+
+    # Concurrent unbind between pre-lock probe and locked re-read returns unit_unbound and skips write
+    update_spy.reset_mock()
+    monkeypatch.setattr(
+        cu_db,
+        "get_active_unit_by_workspace",
+        create_autospec(
+            orig_get_active_unit,
+            side_effect=[unit_row, None],
+        ),
+    )
+    refused = await sched_mod.schedule_dalton_automation_helper(
+        "dalton-nvda-watch",
+        {"action": "resume"},
+        user_id="pm-1",
+        workspace_id=ws_id,
+        role="chief_of_staff",
+        action="resume",
+    )
+    assert refused["ok"] is False
+    assert refused["error"] == "unit_unbound"
+    update_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_round4_item10_report_authorize_blocks_post_handoff_and_group_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 4 Item 10: authorize_saved_report_target and _authorize_failure_alert_row skip after handoff/group."""
+    from unittest.mock import create_autospec
+
+    from src.dalton import settings as dalton_settings
+    from src.dalton.database import automation_reports as ar_db
+    from src.dalton.notify import dispatch as notify_dispatch
+
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+
+    exec_id = "11111111-1111-1111-1111-111111111111"
+    auto_id = "22222222-2222-2222-2222-222222222222"
+    ws_id = "33333333-3333-3333-3333-333333333333"
+    report_payload = {
+        "source": "automation_report",
+        "version": 1,
+        "profile": "market-digest-am",
+        "report_run_id": "run-1",
+        "content_kind": "text",
+        "content_sha256": "abc123",
+        "text": "report body",
+        "first_execution_id": exec_id,
+        "owner_user_id": "old-lead",
+        "automation_id": auto_id,
+        "target_snapshot": ["feishu:user:ou_1"],
+        "failure_target_snapshot": ["discord:user:123456789"],
+        "expected_item_count": 1,
+        "coverage_unit_id": "unit-1",
+        "coverage_unit_version": "2026-11-20T12:00:00+00:00",
+    }
+    report_row = {
+        "delivery_id": "d-1",
+        "execution_id": exec_id,
+        "automation_id": auto_id,
+        "user_id": "old-lead",
+        "channel": "feishu",
+        "target": "feishu:user:ou_1",
+        "status": "pending",
+        "error_code": None,
+        "attempt_count": 0,
+        "payload_json": report_payload,
+    }
+    alert_row = {
+        "delivery_id": "d-2",
+        "execution_id": exec_id,
+        "automation_id": auto_id,
+        "user_id": "old-lead",
+        "channel": "discord",
+        "target": "discord:user:123456789",
+        "status": "pending",
+        "error_code": None,
+        "attempt_count": 0,
+        "payload_json": {
+            "source": "automation_report_failure_alert",
+            "version": 1,
+            "profile": "market-digest-am",
+            "content_kind": "failure_text",
+            "content_sha256": "def456",
+            "failure_text": "alert body",
+            "first_execution_id": exec_id,
+            "original_execution_id": exec_id,
+            "original_content_sha256": "abc123",
+            "original_report_run_id": "run-1",
+            "report_run_id": "run-1",
+            "owner_user_id": "old-lead",
+            "automation_id": auto_id,
+            "target_snapshot": ["discord:user:123456789"],
+            "expected_item_count": 1,
+        },
+    }
+
+    monkeypatch.setattr(
+        ar_db,
+        "_lock_after_reconcile_advisories",
+        create_autospec(ar_db._lock_after_reconcile_advisories, return_value=[report_row]),
+    )
+    monkeypatch.setattr(
+        notify_dispatch,
+        "_resolve_unit_managed_notify_gate",
+        create_autospec(
+            notify_dispatch._resolve_unit_managed_notify_gate,
+            return_value=(False, "not_unit_lead_analyst", "unit-1", False),
+        ),
+    )
+
+    class _Cur:
+        async def execute(self, sql, _p=None):
+            s = " ".join(str(sql).split())
+            if "FROM automations" in s:
+                self._r = {
+                    "automation_id": auto_id,
+                    "user_id": "old-lead",
+                    "workspace_id": ws_id,
+                    "name": "dalton-nvda-watch",
+                    "metadata": {
+                        "dalton_kind": "company_watch",
+                        "ticker": "NVDA",
+                        "report_profile": {
+                            "profile": "market-digest-am",
+                            "report_targets": ["feishu:user:ou_1"],
+                            "failure_targets": ["discord:user:123456789"],
+                        },
+                    },
+                }
+
+        async def fetchone(self):
+            return getattr(self, "_r", None)
+
+    res_report = await ar_db.authorize_saved_report_target(
+        _Cur(),
+        object(),
+        execution_id=exec_id,
+        target="feishu:user:ou_1",
+    )
+    assert res_report["allowed"] is False
+    assert res_report["deny_status"] == "skipped"
+    assert res_report["deny_code"] == "not_unit_lead_analyst"
+
+    res_alert = await ar_db._authorize_failure_alert_row(
+        _Cur(),
+        object(),
+        execution_id=exec_id,
+        target="discord:user:123456789",
+        row=alert_row,
+        report_rows=[report_row],
+    )
+    assert res_alert["allowed"] is False
+    assert res_alert["deny_status"] == "skipped"
+    assert res_alert["deny_code"] == "not_unit_lead_analyst"
+
+
+@pytest.mark.asyncio
+async def test_round6_item1_item2_schedule_helper_pause_resume_lifecycle_and_replaced_by_tracker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 6 Items 1 & 2: schedule helper reuses lifecycle pause/resume rules and refuses replaced_by_tracker."""
+    from contextlib import asynccontextmanager
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import create_autospec
+
+    from src.dalton import settings as dalton_settings
+    from src.dalton.autonomy import schedule as sched_mod
+    from src.dalton.database import coverage_units as cu_db
+    from src.server.database import automation as auto_db
+
+    ws_id = "22222222-2222-2222-2222-222222222222"
+    future_once = datetime(2035, 6, 1, 9, 0, tzinfo=timezone.utc)
+    past_once = datetime.now(timezone.utc) - timedelta(hours=2)
+
+    rows_by_id: dict[str, dict[str, Any]] = {
+        "auto-once-future": {
+            "automation_id": "auto-once-future",
+            "user_id": "owner-a",
+            "name": "dalton-nvda-once",
+            "workspace_id": ws_id,
+            "status": "active",
+            "trigger_type": "once",
+            "cron_expression": None,
+            "timezone": "UTC",
+            "next_run_at": future_once,
+            "metadata": {"dalton_kind": "earnings_t0", "handoff_paused_reason": "unit_unbound"},
+        },
+        "auto-once-expired": {
+            "automation_id": "auto-once-expired",
+            "user_id": "owner-a",
+            "name": "dalton-nvda-once-expired",
+            "workspace_id": ws_id,
+            "status": "paused",
+            "trigger_type": "once",
+            "cron_expression": None,
+            "timezone": "UTC",
+            "next_run_at": past_once,
+            "metadata": {"dalton_kind": "earnings_t0"},
+        },
+        "auto-once-none": {
+            "automation_id": "auto-once-none",
+            "user_id": "owner-a",
+            "name": "dalton-nvda-once-none",
+            "workspace_id": ws_id,
+            "status": "paused",
+            "trigger_type": "once",
+            "cron_expression": None,
+            "timezone": "UTC",
+            "next_run_at": None,
+            "metadata": {"dalton_kind": "earnings_t0"},
+        },
+        "auto-completed": {
+            "automation_id": "auto-completed",
+            "user_id": "owner-a",
+            "name": "dalton-nvda-done",
+            "workspace_id": ws_id,
+            "status": "completed",
+            "trigger_type": "once",
+            "cron_expression": None,
+            "timezone": "UTC",
+            "next_run_at": past_once,
+            "metadata": {"dalton_kind": "earnings_t0"},
+        },
+        "auto-replaced": {
+            "automation_id": "auto-replaced",
+            "user_id": "owner-a",
+            "name": "dalton-nvda-delta",
+            "workspace_id": ws_id,
+            "status": "paused",
+            "trigger_type": "cron",
+            "cron_expression": "0 9 * * *",
+            "timezone": "UTC",
+            "next_run_at": None,
+            "metadata": {"dalton_kind": "company_watch", "replaced_by_tracker": True},
+        },
+    }
+
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: False)
+    monkeypatch.setattr(dalton_settings, "is_dalton_supabase_auth_enabled", lambda: False)
+    monkeypatch.setattr(
+        sched_mod,
+        "verify_workspace_access",
+        create_autospec(sched_mod.verify_workspace_access, return_value={"workspace_id": ws_id, "user_id": "owner-a"}),
+    )
+    monkeypatch.setattr(cu_db, "get_active_unit_by_workspace", create_autospec(cu_db.get_active_unit_by_workspace, return_value=None))
+    monkeypatch.setattr(
+        sched_mod,
+        "list_all_user_automations",
+        create_autospec(sched_mod.list_all_user_automations, side_effect=lambda _uid, **_kw: list(rows_by_id.values())),
+    )
+
+    @asynccontextmanager
+    async def _lock(_uid, conn=None):
+        yield object()
+
+    monkeypatch.setattr(sched_mod, "user_automations_lock", _lock)
+
+    async def _fake_update(aid, uid, **kw):
+        row = dict(rows_by_id[aid])
+        row.update({k: v for k, v in kw.items() if k in ("status", "next_run_at", "failure_count", "disable_reason", "metadata")})
+        rows_by_id[aid] = row
+        return row
+
+    update_spy = create_autospec(auto_db.update_automation, side_effect=_fake_update)
+    monkeypatch.setattr(auto_db, "update_automation", update_spy)
+
+    # 1. Pause once preserves next_run_at (pause_update_fields does not wipe next_run_at)
+    paused = await sched_mod.schedule_dalton_automation_helper(
+        "dalton-nvda-once",
+        {"action": "pause"},
+        user_id="owner-a",
+        workspace_id=ws_id,
+        action="pause",
+    )
+    assert paused["ok"] is True
+    assert update_spy.await_args.kwargs["status"] == "paused"
+    assert "next_run_at" not in update_spy.await_args.kwargs
+    assert rows_by_id["auto-once-future"]["next_run_at"] == future_once
+
+    # 2. Resume paused once keeps original future_once unchanged and cleans handoff_paused_reason
+    update_spy.reset_mock()
+    resumed = await sched_mod.schedule_dalton_automation_helper(
+        "dalton-nvda-once",
+        {"action": "resume"},
+        user_id="owner-a",
+        workspace_id=ws_id,
+        action="resume",
+    )
+    assert resumed["ok"] is True
+    assert update_spy.await_args.kwargs["status"] == "active"
+    assert update_spy.await_args.kwargs["next_run_at"] == future_once
+    assert "handoff_paused_reason" not in update_spy.await_args.kwargs["metadata"]
+
+    # 3. Resume expired once & next_run_at=None once refused without writing DB
+    for name in ("dalton-nvda-once-expired", "dalton-nvda-once-none"):
+        update_spy.reset_mock()
+        err = await sched_mod.schedule_dalton_automation_helper(
+            name,
+            {"action": "resume"},
+            user_id="owner-a",
+            workspace_id=ws_id,
+            action="resume",
+        )
+        assert err["ok"] is False
+        assert err["error"]
+        update_spy.assert_not_awaited()
+
+    # 4. Resume completed refused via generic lifecycle path without writing DB
+    update_spy.reset_mock()
+    err_done = await sched_mod.schedule_dalton_automation_helper(
+        "dalton-nvda-done",
+        {"action": "resume"},
+        user_id="owner-a",
+        workspace_id=ws_id,
+        action="resume",
+    )
+    assert err_done["ok"] is False
+    update_spy.assert_not_awaited()
+
+    # 5. Resume replaced_by_tracker refused with generic wording and without writing DB
+    update_spy.reset_mock()
+    err_rep = await sched_mod.schedule_dalton_automation_helper(
+        "dalton-nvda-delta",
+        {"action": "resume"},
+        user_id="owner-a",
+        workspace_id=ws_id,
+        action="resume",
+    )
+    assert err_rep["ok"] is False
+    assert "多空跟踪替代" in err_rep["error"]
+    update_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_round7_item1_item2_window_execution_entry_and_notify_reject_stale_unit_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 7 Items 1 & 2: between Stage 1 commit and Stage 2 pause, execution entry and
+    notify gate reject managed automations whose metadata.unit_id points to an unbound/archived/rebound unit."""
+    from contextlib import asynccontextmanager
+    from datetime import datetime, timezone
+    from unittest.mock import create_autospec
+
+    from src.dalton import settings as dalton_settings
+    from src.dalton.database import coverage_units as cu_db
+    from src.dalton.notify import dispatch as dispatch_mod
+    from src.server.database import automation_executions as exec_db
+
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(dalton_settings, "is_dalton_supabase_auth_enabled", lambda: True)
+
+    unit_id = "11111111-1111-4111-8111-111111111111"
+    ws_id = "22222222-2222-4222-8222-222222222222"
+    queries: list[tuple[str, Any]] = []
+
+    class _WindowCur:
+        def __init__(self):
+            self._r = None
+            self._rows = []
+
+        async def execute(self, sql, params=None):
+            q = " ".join(str(sql).split())
+            queries.append((q, params))
+            if "AND NOT (" in q and "UPDATE automation_executions e" in q:
+                self._r = None
+            elif "SELECT a.workspace_id" in q:
+                self._r = {
+                    "workspace_id": ws_id,
+                    "meta_unit_id": unit_id,
+                    "is_managed_candidate": True,
+                }
+            elif "FROM dalton_coverage_units" in q and "FOR SHARE" in q:
+                self._rows = [{"unit_id": unit_id, "updated_at": datetime.now(timezone.utc)}]
+                self._r = self._rows[0]
+            elif "WITH target AS" in q:
+                assert "u_ref.unit_id::text" in q
+                assert "u_ref.workspace_id IS DISTINCT FROM a.workspace_id" in q
+                self._r = None
+
+        async def fetchone(self):
+            return self._r
+
+        async def fetchall(self):
+            return self._rows
+
+    class _WindowConn:
+        @asynccontextmanager
+        async def transaction(self):
+            yield self
+
+        @asynccontextmanager
+        async def cursor(self, **_kw):
+            yield _WindowCur()
+
+    @asynccontextmanager
+    async def _window_pool(c=None):
+        yield _WindowConn()
+
+    monkeypatch.setattr(exec_db, "get_db_connection", _window_pool)
+    res = await exec_db.begin_execution_if_not_deleted(
+        "exec-window-1", started_at=datetime.now(timezone.utc)
+    )
+    assert res is None
+    assert any("FOR SHARE" in q and p == (ws_id, unit_id) for q, p in queries)
+
+    # Notify gate without stamped_unit_id also blocks Stage 1 -> Stage 2 window via metadata.unit_id
+    monkeypatch.setattr(
+        cu_db,
+        "get_active_unit_by_workspace",
+        create_autospec(cu_db.get_active_unit_by_workspace, return_value=None),
+    )
+    monkeypatch.setattr(
+        cu_db,
+        "get_coverage_unit",
+        create_autospec(
+            cu_db.get_coverage_unit,
+            return_value={"unit_id": unit_id, "workspace_id": None, "status": "active"},
+        ),
+    )
+    gate_ok, gate_reason, _, _ = await dispatch_mod._resolve_unit_managed_notify_gate(
+        "lead-a",
+        ws_id,
+        {
+            "automation_id": "auto-1",
+            "user_id": "lead-a",
+            "name": "dalton-nvda-watch",
+            "workspace_id": ws_id,
+            "metadata": {"dalton_kind": "company_watch", "ticker": "NVDA", "unit_id": unit_id},
+        },
+    )
+    assert (gate_ok, gate_reason) == (False, "unit_unbound_or_archived")
+
+
+@pytest.mark.asyncio
+async def test_round7_item3_item4_upsert_blocks_replaced_delta_and_schedule_rechecks_under_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 7 Items 3 & 4: upsert refuses replaced_by_tracker deltas identically to resume,
+    and pause/resume re-verify locked_row via apply_locked_{pause,resume}_schedule."""
+    from contextlib import asynccontextmanager
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import create_autospec
+
+    from src.dalton import settings as dalton_settings
+    from src.dalton.app import router as dalton_router
+    from src.dalton.autonomy import schedule as sched_mod
+    from src.dalton.database import coverage_units as cu_db
+    from src.dalton.services.company_automations import get_current_history_context
+    from src.server.database import automation as auto_db
+
+    ws_id = "22222222-2222-2222-2222-222222222222"
+    future_once = datetime(2035, 6, 1, 9, 0, tzinfo=timezone.utc)
+    past_once = datetime.now(timezone.utc) - timedelta(minutes=5)
+
+    rows_by_name: dict[str, dict[str, Any]] = {
+        "dalton-nvda-delta": {
+            "automation_id": "auto-replaced",
+            "user_id": "owner-a",
+            "name": "dalton-nvda-delta",
+            "workspace_id": ws_id,
+            "status": "paused",
+            "trigger_type": "cron",
+            "cron_expression": "0 9 * * *",
+            "timezone": "UTC",
+            "next_run_at": None,
+            "metadata": {"dalton_kind": "weekly_delta", "ticker": "NVDA", "replaced_by_tracker": "tracker-1"},
+        },
+        "dalton-nvda-earn-q1-t0": {
+            "automation_id": "auto-once",
+            "user_id": "owner-a",
+            "name": "dalton-nvda-earn-q1-t0",
+            "workspace_id": ws_id,
+            "status": "active",
+            "trigger_type": "once",
+            "cron_expression": None,
+            "timezone": "UTC",
+            "next_run_at": future_once,
+            "metadata": {"dalton_kind": "earnings_t0", "ticker": "NVDA"},
+        },
+    }
+
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: False)
+    monkeypatch.setattr(dalton_settings, "is_dalton_supabase_auth_enabled", lambda: False)
+    monkeypatch.setattr(
+        sched_mod,
+        "verify_workspace_access",
+        create_autospec(sched_mod.verify_workspace_access, return_value={"workspace_id": ws_id, "user_id": "owner-a"}),
+    )
+    monkeypatch.setattr(cu_db, "get_active_unit_by_workspace", create_autospec(cu_db.get_active_unit_by_workspace, return_value=None))
+    monkeypatch.setattr(
+        sched_mod,
+        "list_all_user_automations",
+        create_autospec(sched_mod.list_all_user_automations, side_effect=lambda _uid, **_kw: list(rows_by_name.values())),
+    )
+
+    @asynccontextmanager
+    async def _lock(_uid, conn=None):
+        yield object()
+
+    monkeypatch.setattr(sched_mod, "user_automations_lock", _lock)
+
+    locked_override: dict[str, Any] | None = None
+
+    async def _fake_update(aid, uid, conn=None, **kw):
+        target = dict(locked_override) if locked_override is not None else dict(next(r for r in rows_by_name.values() if r["automation_id"] == aid))
+        ctx = get_current_history_context()
+        eff = dict(kw)
+        if ctx is not None and ctx.locked_row_reconciler is not None:
+            await ctx.locked_row_reconciler(target, eff, conn)
+        target.update(eff)
+        return target
+
+    update_spy = create_autospec(auto_db.update_automation, side_effect=_fake_update)
+    monkeypatch.setattr(auto_db, "update_automation", update_spy)
+
+    # Item 3: upsert (schedule helper & REST PUT) on replaced_by_tracker delta returns resume refusal without writing
+    upsert_err = await sched_mod.schedule_dalton_automation_helper(
+        "dalton-nvda-delta",
+        {"status": "active", "cron_expression": "0 10 * * 1-5", "instruction": "revive"},
+        user_id="owner-a",
+        workspace_id=ws_id,
+        action="upsert",
+    )
+    assert upsert_err["ok"] is False
+    assert "多空跟踪替代" in upsert_err["error"]
+    update_spy.assert_not_awaited()
+
+    monkeypatch.setattr(
+        dalton_router,
+        "_verify_workspace_access",
+        create_autospec(dalton_router._verify_workspace_access, return_value={"workspace_id": ws_id, "user_id": "owner-a"}),
+    )
+    monkeypatch.setattr(dalton_settings, "is_dalton_enabled", lambda: True)
+    rest_err = await dalton_router.put_dalton_automation_endpoint(
+        name="dalton-nvda-delta",
+        body=dalton_router.DaltonAutomationWriteRequest(
+            workspace_id=ws_id,
+            spec={"status": "active", "cron_expression": "0 10 * * 1-5"},
+        ),
+        user_id="owner-a",
+    )
+    assert rest_err["ok"] is False
+    assert rest_err["error"] == upsert_err["error"]
+    update_spy.assert_not_awaited()
+
+    # Item 4a: pre-read sees active, but locked_row became completed -> locked reconciler refuses pause
+    locked_override = {**rows_by_name["dalton-nvda-earn-q1-t0"], "status": "completed", "next_run_at": None}
+    pause_raced = await sched_mod.schedule_dalton_automation_helper(
+        "dalton-nvda-earn-q1-t0",
+        {"action": "pause"},
+        user_id="owner-a",
+        workspace_id=ws_id,
+        action="pause",
+    )
+    assert pause_raced["ok"] is False
+    assert "completed" in pause_raced["error"]
+
+    # Item 4b: pre-read sees paused with future once, but locked_row time expired while waiting -> resume refuses
+    rows_by_name["dalton-nvda-earn-q1-t0"]["status"] = "paused"
+    locked_override = {**rows_by_name["dalton-nvda-earn-q1-t0"], "next_run_at": past_once}
+    resume_raced = await sched_mod.schedule_dalton_automation_helper(
+        "dalton-nvda-earn-q1-t0",
+        {"action": "resume"},
+        user_id="owner-a",
+        workspace_id=ws_id,
+        action="resume",
+    )
+    assert resume_raced["ok"] is False
+    assert "passed" in resume_raced["error"]
+
+
+@pytest.mark.asyncio
+async def test_round9_item3_kept_guards_and_replaced_by_tracker_protection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 9 Item 3 kept protections (without two-phase stage cleanup window):
+    - new company watch specs stamp unit_id
+    - create_execution_for_live_parent acquires FOR SHARE on unit lookups and refuses mismatched/archived unit_id
+    - AutomationFile / lifecycle / schedule refuse non-lead or direct edits on active unit automations
+    - schedule upsert & PUT protect replaced_by_tracker (add/mutate/None preservation) via lifecycle helper
+    """
+    from contextlib import asynccontextmanager
+    from datetime import datetime, timezone
+    from unittest.mock import create_autospec
+
+    from fastapi import HTTPException
+    from ptc_agent.agent.backends.db_json_route import ReadOnlyStoreError
+    from src.dalton import settings as dalton_settings
+    from src.dalton.app import router as dalton_router
+    from src.dalton.autonomy import schedule as sched_mod
+    from src.dalton.coverage import units as units_mod
+    from src.dalton.database import coverage_units as cu_db
+    from src.server.database import automation as auto_db
+    from src.server.database import automation_executions as exec_db
+    from src.server.services.automations import file as auto_file
+
+    ws_old = "11111111-1111-4111-8111-111111111111"
+    unit_id = "22222222-2222-4222-8222-222222222222"
+
+    # 1. build_company_watch_specs stamps unit_id on all 4 standard specs when provided
+    stamped_specs = sched_mod.build_company_watch_specs(
+        ticker="NVDA", workspace_id=ws_old, unit_id=unit_id
+    )
+    assert len(stamped_specs) == 4
+    assert all(sp["metadata"].get("unit_id") == unit_id for sp in stamped_specs)
+
+    # 3. Active bound unit guards (file write, lifecycle write, create_execution_for_live_parent FOR SHARE)
+    archived_unit = {
+        "unit_id": unit_id,
+        "kind": "company",
+        "owner_user_id": "lead-a",
+        "lead_analyst_user_id": "lead-a",
+        "workspace_id": None,
+        "ticker": "NVDA",
+        "ticker_key": "NVDA",
+        "status": "archived",
+    }
+    active_unit = {
+        **archived_unit,
+        "workspace_id": ws_old,
+        "status": "active",
+    }
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(
+        cu_db,
+        "get_active_unit_by_workspace",
+        create_autospec(cu_db.get_active_unit_by_workspace, return_value=active_unit),
+    )
+    monkeypatch.setattr(
+        cu_db,
+        "get_coverage_unit",
+        create_autospec(cu_db.get_coverage_unit, return_value=archived_unit),
+    )
+
+    f = auto_file.AutomationFile("dalton-nvda-move-up.json")
+    with pytest.raises(ReadOnlyStoreError, match="managed coverage unit"):
+        await f._assert_not_managed_unit_file_edit(
+            workspace_id=ws_old,
+            name="dalton-nvda-move-up",
+            metadata={"dalton_kind": "price_move", "ticker": "NVDA"},
+            conn=object(),
+        )
+
+    with pytest.raises(HTTPException) as exc_lc:
+        await units_mod.lock_and_assert_managed_unit_write_allowed(
+            owner_user_id="non-lead",
+            workspace_id=ws_old,
+            name="dalton-nvda-move-up",
+            metadata={"dalton_kind": "price_move", "ticker": "NVDA"},
+            conn=object(),
+        )
+    assert exc_lc.value.status_code == 403
+
+    # create_execution_for_live_parent acquires FOR SHARE on unit lookups and refuses stale/archived meta_unit_id
+    stamped_row = {
+        "automation_id": "auto-stamped-nvda",
+        "user_id": "lead-a",
+        "name": "dalton-nvda-move-up",
+        "trigger_type": "price",
+        "workspace_id": ws_old,
+        "status": "active",
+        "metadata": {"dalton_kind": "price_move", "ticker": "NVDA", "unit_id": unit_id},
+        "scope": "research_tracking",
+    }
+    cu_db.get_active_unit_by_workspace.return_value = None
+
+    class _LiveCur:
+        def __init__(self):
+            self._r = None
+
+        async def execute(self, sql, params=None):
+            q = " ".join(str(sql).split())
+            if "SELECT workspace_id," in q:
+                self._r = {"workspace_id": ws_old, "meta_unit_id": unit_id}
+            elif "FOR UPDATE" in q:
+                self._r = {**stamped_row, "deleted_at": None}
+
+        async def fetchone(self):
+            return self._r
+
+    class _LiveConn:
+        @asynccontextmanager
+        async def transaction(self):
+            yield self
+
+        @asynccontextmanager
+        async def cursor(self, **_kw):
+            yield _LiveCur()
+
+    @asynccontextmanager
+    async def _live_pool(_c=None):
+        yield _LiveConn()
+
+    monkeypatch.setattr(exec_db, "get_db_connection", _live_pool)
+    cu_db.get_coverage_unit.reset_mock()
+    with pytest.raises(HTTPException) as exc_live:
+        await exec_db.create_execution_for_live_parent(
+            "auto-stamped-nvda",
+            "lead-a",
+            datetime.now(timezone.utc),
+            "srv-1",
+        )
+    assert exc_live.value.status_code == 403
+    cu_db.get_coverage_unit.assert_awaited()
+    assert cu_db.get_coverage_unit.await_args.kwargs.get("for_share") is True
+
+    # 4. schedule upsert & REST PUT protect replaced_by_tracker (add, mutate, and preserve None)
+    @asynccontextmanager
+    async def _ordered_lock(_uid, conn=None):
+        yield object()
+
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: False)
+    monkeypatch.setattr(
+        sched_mod,
+        "verify_workspace_access",
+        create_autospec(
+            sched_mod.verify_workspace_access,
+            return_value={"workspace_id": ws_old, "user_id": "owner-a", "is_home": False},
+        ),
+    )
+    monkeypatch.setattr(
+        "src.server.database.home_workspace.get_home_workspace_id",
+        lambda _uid: "99999999-9999-4999-8999-999999999999",
+    )
+    from src.dalton.database import company_automations as comp_auto_db
+
+    monkeypatch.setattr(
+        comp_auto_db,
+        "resolve_automation_scope_for_write",
+        create_autospec(comp_auto_db.resolve_automation_scope_for_write, return_value="research_tracking"),
+    )
+    monkeypatch.setattr(sched_mod, "user_automations_lock", _ordered_lock)
+    plain_row = {
+        "automation_id": "auto-plain-1",
+        "user_id": "owner-a",
+        "name": "dalton-custom-delta",
+        "workspace_id": ws_old,
+        "status": "active",
+        "trigger_type": "cron",
+        "cron_expression": "0 9 * * *",
+        "timezone": "UTC",
+        "instruction": "v1",
+        "metadata": {"note": "v1"},
+        "scope": "personal",
+    }
+    null_marked_row = {
+        **plain_row,
+        "automation_id": "auto-null-rbt",
+        "name": "dalton-custom-null-rbt",
+        "metadata": {"note": "v1", "replaced_by_tracker": None},
+    }
+    written_metas: list[Any] = []
+
+    async def _cap_update(aid, uid, **kw):
+        written_metas.append(kw.get("metadata"))
+        return {**null_marked_row, "metadata": kw.get("metadata") or null_marked_row["metadata"]}
+
+    monkeypatch.setattr(
+        sched_mod,
+        "list_all_user_automations",
+        create_autospec(sched_mod.list_all_user_automations, return_value=[plain_row, null_marked_row]),
+    )
+    monkeypatch.setattr(
+        auto_db,
+        "update_automation",
+        create_autospec(auto_db.update_automation, side_effect=_cap_update),
+    )
+    create_spy = create_autospec(auto_db.create_automation, return_value={"automation_id": "new-1"})
+    monkeypatch.setattr(auto_db, "create_automation", create_spy)
+
+    # 4a. Adding replaced_by_tracker on create or ordinary update refused (helper & REST 403)
+    res_add_create = await sched_mod.schedule_dalton_automation_helper(
+        "dalton-new-task",
+        {"cron": "0 9 * * *", "instruction": "hi", "metadata": {"replaced_by_tracker": "t1"}},
+        user_id="owner-a",
+        workspace_id=ws_old,
+        action="upsert",
+    )
+    assert res_add_create["ok"] is False and res_add_create["error"] == "forbidden_replaced_by_tracker"
+    res_add_update = await sched_mod.schedule_dalton_automation_helper(
+        "dalton-custom-delta",
+        {"instruction": "v2", "metadata": {"replaced_by_tracker": None}},
+        user_id="owner-a",
+        workspace_id=ws_old,
+        action="upsert",
+    )
+    assert res_add_update["ok"] is False and res_add_update["error"] == "forbidden_replaced_by_tracker"
+
+    # 4b. Updating existing row carrying replaced_by_tracker=None preserves the key with None value
+    res_ok_none = await sched_mod.schedule_dalton_automation_helper(
+        "dalton-custom-null-rbt",
+        {"instruction": "v2", "metadata": {"note": "v2"}},
+        user_id="owner-a",
+        workspace_id=ws_old,
+        action="upsert",
+    )
+    assert res_ok_none["ok"] is True
+    assert written_metas[-1]["note"] == "v2"
+    assert "replaced_by_tracker" in written_metas[-1] and written_metas[-1]["replaced_by_tracker"] is None
+
+    # 4c. Mutating replaced_by_tracker=None -> "t1" refused via REST PUT with 403
+    monkeypatch.setattr(
+        dalton_router,
+        "_verify_workspace_access",
+        create_autospec(
+            dalton_router._verify_workspace_access,
+            return_value={"workspace_id": ws_old, "user_id": "owner-a"},
+        ),
+    )
+    monkeypatch.setattr(dalton_settings, "is_dalton_enabled", lambda: True)
+    with pytest.raises(HTTPException) as exc_put_rbt:
+        await dalton_router.put_dalton_automation_endpoint(
+            name="dalton-custom-null-rbt",
+            body=dalton_router.DaltonAutomationWriteRequest(
+                workspace_id=ws_old,
+                spec={"instruction": "v3", "metadata": {"replaced_by_tracker": "t1"}},
+            ),
+            user_id="owner-a",
+        )
+    assert exc_put_rbt.value.status_code == 403
+    create_spy.assert_not_awaited()
+
+
+async def _async_ret(val):
+    return val

@@ -31,21 +31,32 @@ documented historical order, not because any row can still carry it.
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from src.dalton.settings import is_coverage_units_enabled
 
+logger = logging.getLogger(__name__)
+
 KIND_COMPANY = "company"
 KIND_SECTOR = "sector"
 KIND_HOME = "home"
 KIND_UNCLASSIFIED = "unclassified"
 
+
+class CoverageIdentityUnavailableError(RuntimeError):
+    """Coverage unit registry lookup failed when resolving workspace identity."""
+
+    code = "coverage_identity_unavailable"
+
 SOURCE_REGISTERED = "registered_unit"
 SOURCE_COMPAT = "compat"
 SOURCE_HOME = "home"
 SOURCE_UNCLASSIFIED = "unclassified"
+SOURCE_HISTORICAL_DUPLICATE = "historical_duplicate"
 
 TICKER_SOURCE_UNIT = "unit"
 TICKER_SOURCE_METADATA = "workspace_metadata"
@@ -55,8 +66,11 @@ TICKER_SOURCE_WORKSPACE_NAME = "workspace_name"
 TICKER_SOURCE_AUTOMATION = "automation"
 
 # Ticker shapes accepted everywhere (tracking's historical convention):
-# 1-10 alnum chars plus an optional 1-4 letter market suffix (.HK, .SS, ...).
-_CLEAN_TICKER_RE = re.compile(r"^[A-Za-z0-9]{1,10}(?:\.[A-Za-z]{1,4})?$")
+# 1-10 alnum chars plus an optional 1-4 letter market suffix (.HK, .SS, ...)
+# or (only when coverage_units.enabled is on) a single-character share class (-B, -A).
+_BASE_CLEAN_TICKER_RE = re.compile(r"^[A-Za-z0-9]{1,10}(?:\.[A-Za-z]{1,4})?$")
+_CLEAN_TICKER_RE = re.compile(r"^[A-Za-z0-9]{1,10}(?:\.[A-Za-z]{1,4}|-[A-Za-z])?$")
+_US_SHARE_CLASS_RE = re.compile(r"^([A-Z0-9]{1,10})-([A-Z])$")
 # Sector automations (`dalton-sector-…`, P3) must never yield a ticker here —
 # including a slug like `earn-ai` whose task name would otherwise satisfy the
 # `earn-*` suffix and read the literal "sector" out as one. The lookahead
@@ -65,6 +79,63 @@ _CLEAN_TICKER_RE = re.compile(r"^[A-Za-z0-9]{1,10}(?:\.[A-Za-z]{1,4})?$")
 _TICKER_FROM_AUTO_NAME_RE = re.compile(
     r"^dalton-(?!sector-)([a-z0-9.]+)-(?:watch|delta|move-up|move-down|earn-.*)$"
 )
+
+
+def normalize_ticker_key(ticker: str | None) -> str | None:
+    """Canonical comparison/uniqueness key for a company ticker across markets.
+
+    - CN A-shares: ``DDDDDD.{SS|SZ|BJ}`` (``.SH`` folded to ``.SS``)
+    - HK stocks: 5-digit zero-padded digits (``700``, ``0700.HK`` -> ``00700``)
+    - US & other markets: stripped uppercase with single-char share-class ``-``
+      folded to ``.`` (``BRK-B`` -> ``BRK.B``) while the display ``ticker``
+      column keeps the original market notation.
+    """
+    cleaned = str(ticker or "").strip().upper()
+    if not cleaned:
+        return None
+    from src.dalton.autonomy.probes.cnhk import (
+        classify_cnhk_ticker,
+        normalize_cn_ticker,
+        normalize_hk_ticker,
+    )
+
+    kind, _ = classify_cnhk_ticker(cleaned)
+    if kind == "cn":
+        return normalize_cn_ticker(cleaned)
+    if kind == "hk":
+        return normalize_hk_ticker(cleaned)
+    return _US_SHARE_CLASS_RE.sub(r"\1.\2", cleaned)
+
+
+def infer_ticker_market(ticker: str | None) -> str:
+    """Infer market ('CN', 'HK', or 'US') consistent with ``normalize_ticker_key``."""
+    key = normalize_ticker_key(ticker)
+    if not key:
+        return "US"
+    from src.dalton.autonomy.probes.cnhk import classify_cnhk_ticker
+
+    kind, _ = classify_cnhk_ticker(key)
+    if kind == "cn":
+        return "CN"
+    if kind == "hk":
+        return "HK"
+    return "US"
+
+
+def is_historical_duplicate_workspace(workspace: Mapping[str, Any] | None) -> bool:
+    """Return True when ``workspace.config`` marks it as a historical duplicate."""
+    if not isinstance(workspace, Mapping):
+        return False
+    cfg = workspace.get("config")
+    if isinstance(cfg, str):
+        try:
+            cfg = json.loads(cfg)
+        except Exception:
+            cfg = None
+    if not isinstance(cfg, Mapping):
+        return False
+    marker = cfg.get("dalton_historical_duplicate_of")
+    return bool(isinstance(marker, str) and marker.strip())
 
 
 def _extract_ticker_from_text(raw: str | None) -> str | None:
@@ -79,7 +150,8 @@ def _extract_ticker_from_text(raw: str | None) -> str | None:
     cleaned = str(raw or "").strip()
     if not cleaned or cleaned.lower() == "home" or "_" in cleaned:
         return None
-    if _CLEAN_TICKER_RE.match(cleaned):
+    pattern = _CLEAN_TICKER_RE if is_coverage_units_enabled() else _BASE_CLEAN_TICKER_RE
+    if pattern.match(cleaned):
         return cleaned.upper()
     return None
 
@@ -281,7 +353,17 @@ async def resolve_workspace_coverage_identity(
         if unit is None and registered_units is None:
             from src.dalton.database import coverage_units as cu_db
 
-            unit = await cu_db.get_active_unit_by_workspace(ws_id, conn=conn)
+            try:
+                unit = await cu_db.get_active_unit_by_workspace(ws_id, conn=conn)
+            except Exception as exc:
+                logger.warning(
+                    "[dalton.coverage] coverage unit registry query failed for workspace %s: %s",
+                    ws_id,
+                    exc,
+                )
+                raise CoverageIdentityUnavailableError(
+                    "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。"
+                ) from exc
         if unit is not None:
             kind = str(unit.get("kind") or "").strip().lower()
             if kind == KIND_SECTOR:

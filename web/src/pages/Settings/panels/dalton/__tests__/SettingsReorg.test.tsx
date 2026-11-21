@@ -96,6 +96,7 @@ vi.mock('@/lib/dalton/coverage', () => ({
   useDaltonCoverageUnitDetail: () => ({ data: undefined, isLoading: false, isError: false }),
   splitCoverageUnits: () => ({ sectors: [], standaloneCompanies: [] }),
   coverageUnitErrorCode: () => null,
+  coverageUnitBlockingAutomations: () => null,
 }));
 
 vi.mock('@/hooks/useWorkspaces', () => ({

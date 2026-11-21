@@ -34,10 +34,12 @@ from src.server.database.conversation import forget_workspace_exists
 from src.server.database.home_stand_in import stand_in_on
 from src.server.database.home_workspace import is_home_row, is_reserved_row
 from src.server.database.workspace import (
+    ACTIVE_COVERAGE_UNIT_DELETE_REFUSAL,  # DALTON-HOOK(coverage-units)
     ACTIVE_WORK_DELETE_REFUSAL,
     MOVING_DELETE_REFUSAL,
     PUBLISHED_REPORTS_DELETE_REFUSAL,  # DALTON-HOOK(workspace-delete-guard)
     SERVER_OWNED_CONFIG_KEYS,
+    WorkspaceBoundToCoverageUnitError,  # DALTON-HOOK(coverage-units)
     WorkspaceBusyError,
     WorkspaceHasPublishedReportsError,  # DALTON-HOOK(workspace-delete-guard)
     WorkspaceMovingError,
@@ -87,6 +89,13 @@ async def _has_published_reports(workspace_id: str) -> bool:
     from src.dalton.database.publications import has_published_reports
 
     return await has_published_reports(workspace_id)
+
+
+async def _has_active_coverage_unit(workspace_id: str) -> bool:
+    # DALTON-HOOK(coverage-units): pre-check before end_workspace_commands.
+    from src.dalton.database.coverage_units import has_active_coverage_unit
+
+    return await has_active_coverage_unit(workspace_id)
 
 
 class RemovedComputer(NamedTuple):
@@ -507,6 +516,14 @@ class WorkspaceManager(ComputerManager):
             # a computer's removal — is refused the same way.
             if await _has_published_reports(workspace_id):
                 raise WorkspaceHasPublishedReportsError()
+            # DALTON-HOOK(coverage-units): refuse before end_workspace_commands so a
+            # bound workspace's background commands are not stopped for a refused delete.
+            from src.dalton.settings import is_coverage_units_enabled
+
+            if is_coverage_units_enabled() and await _has_active_coverage_unit(
+                workspace_id
+            ):
+                raise WorkspaceBoundToCoverageUnitError()
             # Before the last backup holds the folder, which would fail the
             # move instead; the delete's own transaction checks again.
             if await workspace_is_moving(workspace_id):
@@ -640,6 +657,15 @@ class WorkspaceManager(ComputerManager):
                 return Retirement.BUSY
             if await _has_published_reports(workspace_id):
                 return Retirement.PUBLISHED_REPORTS
+            # DALTON-HOOK(coverage-units): refuse batch removal up front if any
+            # workspace on the computer holds an active coverage unit binding so
+            # no earlier unbound workspace gets deleted first.
+            from src.dalton.settings import is_coverage_units_enabled
+
+            if is_coverage_units_enabled() and await _has_active_coverage_unit(
+                workspace_id
+            ):
+                return Retirement.ACTIVE_COVERAGE_UNIT
         stand_in = await stand_in_on(computer)
         if stand_in is not None and stand_in.owed:
             return Retirement.HANDBACK_OWED
@@ -698,10 +724,20 @@ class WorkspaceManager(ComputerManager):
                 raise ComputerRemovalRefused(
                     Retirement.PUBLISHED_REPORTS, deleted=deleted
                 ) from None
+            # DALTON-HOOK(coverage-units): bound unit refusal mid-batch answers
+            # active_coverage_unit rather than collapsing into generic busy.
+            except WorkspaceBoundToCoverageUnitError:
+                raise ComputerRemovalRefused(
+                    Retirement.ACTIVE_COVERAGE_UNIT, deleted=deleted
+                ) from None
             except WorkspaceBusyError as e:
                 if str(e) == PUBLISHED_REPORTS_DELETE_REFUSAL:
                     raise ComputerRemovalRefused(
                         Retirement.PUBLISHED_REPORTS, deleted=deleted
+                    ) from None
+                if str(e) == ACTIVE_COVERAGE_UNIT_DELETE_REFUSAL:
+                    raise ComputerRemovalRefused(
+                        Retirement.ACTIVE_COVERAGE_UNIT, deleted=deleted
                     ) from None
                 # A move or a run that started since the check above.
                 raise ComputerRemovalRefused(Retirement.BUSY, deleted=deleted) from None

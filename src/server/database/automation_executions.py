@@ -4,7 +4,7 @@ import logging
 import math
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Optional, Sequence
 from uuid import uuid4
 
@@ -281,26 +281,278 @@ async def begin_execution_if_not_deleted(
     """Move a pending execution to running only while its automation is live.
 
     DALTON-HOOK(company-automations): a soft-deleted automation does not start.
+    DALTON-HOOK(coverage-units): serialize execution entry against unit handoff with FOR SHARE on unit row,
+    require active status and lead match, and stamp coverage_unit_id/coverage_unit_version.
     The shared ``transition_execution`` helper is left unchanged.
     """
+    from src.dalton.autonomy.classification import (
+        managed_unit_automation_for_unit_sql_predicate,
+        managed_unit_automation_sql_predicate,
+        sql_trim_scope_text,
+    )
+    from src.dalton.settings import is_coverage_units_enabled
+
     async with get_db_connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                UPDATE automation_executions e
-                SET status = 'running', started_at = %s
-                FROM automations a
-                WHERE e.automation_execution_id = %s
-                  AND e.status = 'pending'
-                  AND a.automation_id = e.automation_id
-                  AND a.deleted_at IS NULL
-                RETURNING e.conversation_thread_id, e.conversation_response_id,
-                          e.scheduled_at, e.wait_reason, e.awaits_computer, e.checked_computer_id
-                """,
-                (started_at, execution_id),
-            )
-            row = await cur.fetchone()
-            return dict(row) if row else None
+        if not is_coverage_units_enabled():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    UPDATE automation_executions e
+                    SET status = 'running', started_at = %s
+                    FROM automations a
+                    WHERE e.automation_execution_id = %s
+                      AND e.status = 'pending'
+                      AND a.automation_id = e.automation_id
+                      AND a.deleted_at IS NULL
+                    RETURNING e.conversation_thread_id, e.conversation_response_id,
+                              e.scheduled_at, e.wait_reason, e.awaits_computer, e.checked_computer_id
+                    """,
+                    (started_at, execution_id),
+                )
+                row = await cur.fetchone()
+                return dict(row) if row else None
+
+        managed_base_pred = managed_unit_automation_sql_predicate("a")
+        managed_unit_pred = managed_unit_automation_for_unit_sql_predicate("a", "u")
+        unit_lead_expr = (
+            "COALESCE(NULLIF("
+            + sql_trim_scope_text("u.lead_analyst_user_id")
+            + ", ''), "
+            + sql_trim_scope_text("u.owner_user_id")
+            + ")"
+        )
+        auto_owner_expr = sql_trim_scope_text("a.user_id")
+
+        class _WsChangedRetry(Exception):
+            pass
+
+        for _attempt in range(3):
+            try:
+                async with conn.transaction():
+                    async with conn.cursor(row_factory=dict_row) as cur:
+                        if _attempt == 0:
+                            # Fast path for ordinary (non-managed) tasks: 1 SQL query, zero probe/unit locks.
+                            await cur.execute(
+                                f"""
+                                UPDATE automation_executions e
+                                SET status = 'running', started_at = %s
+                                FROM automations a
+                                WHERE e.automation_execution_id = %s
+                                  AND e.status = 'pending'
+                                  AND a.automation_id = e.automation_id
+                                  AND a.deleted_at IS NULL
+                                  AND NOT ({managed_base_pred})
+                                RETURNING e.conversation_thread_id, e.conversation_response_id,
+                                          e.scheduled_at, e.wait_reason, e.awaits_computer, e.checked_computer_id,
+                                          NULL::text AS coverage_unit_id, NULL::timestamptz AS coverage_unit_version
+                                """,
+                                (started_at, execution_id),
+                            )
+                            fast_row = await cur.fetchone()
+                            if fast_row is not None:
+                                return dict(fast_row)
+
+                        # Managed-task candidate path: probe current workspace_id, lock its active coverage
+                        # unit FOR SHARE BEFORE locking automation_executions FOR UPDATE, and verify under
+                        # the execution lock that workspace_id did not change concurrently.
+                        # If ws_changed occurs, raising _WsChangedRetry rolls back this attempt's transaction,
+                        # releasing both the old unit FOR SHARE lock and FOR UPDATE OF e before retrying.
+                        await cur.execute(
+                            f"""
+                            SELECT a.workspace_id,
+                                   CASE
+                                       WHEN jsonb_typeof(a.metadata) = 'object'
+                                        AND NULLIF(BTRIM(COALESCE(a.metadata->>'unit_id', '')), '') ~* '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'
+                                       THEN BTRIM(a.metadata->>'unit_id')
+                                       ELSE NULL
+                                   END AS meta_unit_id,
+                                   ({managed_base_pred}) AS is_managed_candidate
+                            FROM automation_executions e
+                            JOIN automations a ON a.automation_id = e.automation_id
+                            WHERE e.automation_execution_id = %s
+                              AND e.status = 'pending'
+                              AND a.deleted_at IS NULL
+                            """,
+                            (execution_id,),
+                        )
+                        ws_probe = await cur.fetchone()
+                        if ws_probe is None:
+                            return None
+                        if not ws_probe.get("is_managed_candidate", True):
+                            return None
+                        probe_ws_id = ws_probe.get("workspace_id")
+                        probe_meta_unit_id = ws_probe.get("meta_unit_id")
+                        if probe_ws_id is not None and probe_meta_unit_id is not None:
+                            await cur.execute(
+                                """
+                                SELECT unit_id, updated_at
+                                FROM dalton_coverage_units
+                                WHERE (workspace_id = %s::uuid AND LOWER(BTRIM(status)) = 'active')
+                                   OR unit_id = %s::uuid
+                                ORDER BY unit_id
+                                FOR SHARE
+                                """,
+                                (probe_ws_id, probe_meta_unit_id),
+                            )
+                            await cur.fetchall()
+                        elif probe_ws_id is not None:
+                            await cur.execute(
+                                """
+                                SELECT unit_id, updated_at
+                                FROM dalton_coverage_units
+                                WHERE workspace_id = %s::uuid
+                                  AND LOWER(BTRIM(status)) = 'active'
+                                ORDER BY unit_id
+                                FOR SHARE
+                                """,
+                                (probe_ws_id,),
+                            )
+                            await cur.fetchall()
+                        elif probe_meta_unit_id is not None:
+                            await cur.execute(
+                                """
+                                SELECT unit_id, updated_at
+                                FROM dalton_coverage_units
+                                WHERE unit_id = %s::uuid
+                                FOR SHARE
+                                """,
+                                (probe_meta_unit_id,),
+                            )
+                            await cur.fetchall()
+
+                        stale_unit_ref_pred = f"""
+                            EXISTS (
+                                SELECT 1
+                                FROM dalton_coverage_units u_ref
+                                WHERE {managed_base_pred}
+                                  AND jsonb_typeof(a.metadata) = 'object'
+                                  AND NULLIF(BTRIM(COALESCE(a.metadata->>'unit_id', '')), '') ~* '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'
+                                  AND BTRIM(a.metadata->>'unit_id') = u_ref.unit_id::text
+                                  AND (
+                                      LOWER(BTRIM(u_ref.status)) <> 'active'
+                                      OR u_ref.workspace_id IS DISTINCT FROM a.workspace_id
+                                      OR COALESCE(NULLIF({sql_trim_scope_text("u_ref.lead_analyst_user_id")}, ''), {sql_trim_scope_text("u_ref.owner_user_id")}) <> {auto_owner_expr}
+                                  )
+                            )
+                        """
+                        await cur.execute(
+                            f"""
+                            WITH target AS (
+                                SELECT e.automation_execution_id,
+                                       a.automation_id,
+                                       (a.workspace_id IS DISTINCT FROM %s::uuid) AS ws_changed,
+                                       (
+                                           EXISTS (
+                                               SELECT 1
+                                               FROM dalton_coverage_units u
+                                               WHERE a.workspace_id IS NOT NULL
+                                                 AND u.workspace_id = a.workspace_id
+                                                 AND LOWER(BTRIM(u.status)) = 'active'
+                                                 AND {managed_unit_pred}
+                                                 AND {unit_lead_expr} <> {auto_owner_expr}
+                                           )
+                                           OR ({stale_unit_ref_pred})
+                                       ) AS lead_mismatch,
+                                       (
+                                           EXISTS (
+                                               SELECT 1
+                                               FROM dalton_coverage_units u
+                                               WHERE a.workspace_id IS NOT NULL
+                                                 AND u.workspace_id = a.workspace_id
+                                                 AND LOWER(BTRIM(u.status)) = 'active'
+                                                 AND {managed_unit_pred}
+                                                 AND (a.status NOT IN ('active', 'executing') OR {unit_lead_expr} <> {auto_owner_expr})
+                                           )
+                                           OR ({stale_unit_ref_pred})
+                                       ) AS reject_handoff,
+                                       (
+                                           SELECT u.unit_id
+                                           FROM dalton_coverage_units u
+                                           WHERE a.workspace_id IS NOT NULL
+                                             AND u.workspace_id = a.workspace_id
+                                             AND LOWER(BTRIM(u.status)) = 'active'
+                                             AND {managed_unit_pred}
+                                             AND {unit_lead_expr} = {auto_owner_expr}
+                                           LIMIT 1
+                                       ) AS stamp_unit_id,
+                                       (
+                                           SELECT u.updated_at
+                                           FROM dalton_coverage_units u
+                                           WHERE a.workspace_id IS NOT NULL
+                                             AND u.workspace_id = a.workspace_id
+                                             AND LOWER(BTRIM(u.status)) = 'active'
+                                             AND {managed_unit_pred}
+                                             AND {unit_lead_expr} = {auto_owner_expr}
+                                           LIMIT 1
+                                       ) AS stamp_unit_version
+                                FROM automation_executions e
+                                JOIN automations a ON a.automation_id = e.automation_id
+                                WHERE e.automation_execution_id = %s
+                                  AND e.status = 'pending'
+                                  AND a.deleted_at IS NULL
+                                FOR UPDATE OF e
+                            ),
+                            skipped AS (
+                                UPDATE automation_executions e
+                                SET status = 'skipped',
+                                    skip_reason = COALESCE(NULLIF(e.skip_reason, ''), 'unit_handoff'),
+                                    completed_at = %s,
+                                    error_message = 'Skipped: managed unit automation is inactive or owner is no longer active lead analyst'
+                                FROM target t
+                                WHERE e.automation_execution_id = t.automation_execution_id
+                                  AND NOT t.ws_changed
+                                  AND t.reject_handoff
+                                RETURNING e.automation_id
+                            ),
+                            restored AS (
+                                UPDATE automations a
+                                SET status = CASE WHEN t.lead_mismatch THEN 'paused' ELSE 'active' END,
+                                    next_run_at = CASE WHEN t.lead_mismatch THEN NULL ELSE a.next_run_at END
+                                FROM target t
+                                WHERE a.automation_id = t.automation_id
+                                  AND NOT t.ws_changed
+                                  AND t.reject_handoff
+                                  AND a.status = 'executing'
+                                RETURNING a.automation_id
+                            ),
+                            started AS (
+                                UPDATE automation_executions e
+                                SET status = 'running',
+                                    started_at = %s,
+                                    coverage_unit_id = t.stamp_unit_id,
+                                    coverage_unit_version = t.stamp_unit_version
+                                FROM target t
+                                WHERE e.automation_execution_id = t.automation_execution_id
+                                  AND NOT t.ws_changed
+                                  AND NOT t.reject_handoff
+                                RETURNING e.conversation_thread_id, e.conversation_response_id,
+                                          e.scheduled_at, e.wait_reason, e.awaits_computer, e.checked_computer_id,
+                                          e.coverage_unit_id, e.coverage_unit_version
+                            )
+                            SELECT s.conversation_thread_id, s.conversation_response_id,
+                                   s.scheduled_at, s.wait_reason, s.awaits_computer, s.checked_computer_id,
+                                   s.coverage_unit_id, s.coverage_unit_version,
+                                   FALSE AS ws_changed
+                            FROM started s
+                            UNION ALL
+                            SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                                   TRUE AS ws_changed
+                            FROM target t
+                            WHERE t.ws_changed
+                            """,
+                            (probe_ws_id, execution_id, started_at, started_at),
+                        )
+                        row = await cur.fetchone()
+                        if row and row.get("ws_changed"):
+                            raise _WsChangedRetry()
+                        if not row:
+                            return None
+                        result = dict(row)
+                        result.pop("ws_changed", None)
+                        return result
+            except _WsChangedRetry:
+                continue
+        return None
 
 
 # How long a one-shot whose firing was put off waits to come due again.
@@ -461,7 +713,8 @@ async def settle_execution(
                     quiet += f" AND {_PARKED.format(e='automation_executions')}"
                 await cur.execute(f"""
                     SELECT status, created_at, delivery,
-                           conversation_thread_id, conversation_response_id
+                           conversation_thread_id, conversation_response_id,
+                           coverage_unit_id, coverage_unit_version
                     FROM automation_executions
                     WHERE automation_execution_id = %s::uuid AND automation_id = %s::uuid
                       {quiet}
@@ -582,6 +835,8 @@ async def settle_execution(
                     **row,
                     "settled_from": prior["status"],
                     "delivery": prior["delivery"],
+                    "coverage_unit_id": prior.get("coverage_unit_id"),
+                    "coverage_unit_version": prior.get("coverage_unit_version"),
                     "previous_failure_reason": (
                         previous["failure_reason"] if previous else None
                     ),
@@ -1358,6 +1613,10 @@ async def skip_unstarted_executions_of_deleted_parents() -> int:
 _TRIGGERABLE_STATUSES = ("active", "paused", "completed")
 
 
+class _WorkspaceDriftRetry(Exception):
+    """Internal retry signal when automation.workspace_id drifted before FOR UPDATE."""
+
+
 async def create_execution_for_live_parent(
     automation_id: str,
     user_id: str,
@@ -1372,39 +1631,220 @@ async def create_execution_for_live_parent(
     first leaves no pending execution. Raises ``ValueError`` with the same
     texts ``trigger_automation`` used when the read and the insert were separate.
     """
+    # DALTON-HOOK(coverage-units): enforce unit FOR SHARE lock & lead check on immediate trigger
+    from uuid import UUID as _ExecUUID
+    from fastapi import HTTPException
+    from src.dalton.autonomy.classification import (
+        is_managed_unit_automation,
+        is_managed_unit_automation_for_unit,
+    )
+    from src.dalton.database.coverage_units import (
+        get_active_unit_by_workspace,
+        get_coverage_unit,
+    )
+    from src.dalton.settings import is_coverage_units_enabled
+
+    units_on = is_coverage_units_enabled()
     execution_id = str(uuid4())
     async with get_db_connection() as conn:
-        async with conn.transaction():
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    f"""
-                    SELECT {AUTOMATION_COLUMNS}
-                    FROM automations
-                    WHERE automation_id = %s AND user_id = %s
-                    FOR UPDATE
-                    """,
-                    (automation_id, user_id),
-                )
-                parent = await cur.fetchone()
-                if parent is None or parent.get("deleted_at") is not None:
-                    raise ValueError("Automation not found")
-                parent_row = dict(parent)
-                if parent_row.get("status") not in _TRIGGERABLE_STATUSES:
-                    raise ValueError(
-                        f"Cannot trigger automation in '{parent_row.get('status')}' status"
-                    )
-                await cur.execute(
-                    """
-                    INSERT INTO automation_executions (
-                        automation_execution_id, automation_id,
-                        status, scheduled_at, server_id, created_at,
-                        heartbeat_at, checked_computer_id
-                    )
-                    VALUES (%s, %s, 'pending', %s, %s, NOW(), NOW(), %s)
-                    """,
-                    (execution_id, automation_id, scheduled_at, server_id, checked_computer_id),
-                )
-    return execution_id, parent_row
+        for _attempt in range(3):
+            try:
+                async with conn.transaction():
+                    unit_row: dict[str, Any] | None = None
+                    meta_unit_row: dict[str, Any] | None = None
+                    probe_ws_id = ""
+                    probe_meta_unit_id = ""
+                    async with conn.cursor(row_factory=dict_row) as cur:
+                        if units_on:
+                            await cur.execute(
+                                """
+                                SELECT workspace_id,
+                                       CASE
+                                           WHEN jsonb_typeof(metadata) = 'object'
+                                            AND NULLIF(BTRIM(COALESCE(metadata->>'unit_id', '')), '') ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                                           THEN BTRIM(metadata->>'unit_id')
+                                           ELSE NULL
+                                       END AS meta_unit_id
+                                FROM automations
+                                WHERE automation_id = %s AND user_id = %s
+                                """,
+                                (automation_id, user_id),
+                            )
+                            ws_probe = await cur.fetchone()
+                            probe_ws_id = (
+                                str(ws_probe["workspace_id"])
+                                if ws_probe and ws_probe.get("workspace_id") is not None
+                                else ""
+                            )
+                            probe_meta_unit_id = (
+                                str(ws_probe["meta_unit_id"])
+                                if ws_probe and ws_probe.get("meta_unit_id") is not None
+                                else ""
+                            )
+                            if probe_ws_id:
+                                unit_row = await get_active_unit_by_workspace(
+                                    probe_ws_id, conn=conn, for_share=True
+                                )
+                            if probe_meta_unit_id:
+                                meta_unit_row = await get_coverage_unit(
+                                    probe_meta_unit_id, conn=conn, for_share=True
+                                )
+                        await cur.execute(
+                            f"""
+                            SELECT {AUTOMATION_COLUMNS}
+                            FROM automations
+                            WHERE automation_id = %s AND user_id = %s
+                            FOR UPDATE
+                            """,
+                            (automation_id, user_id),
+                        )
+                        parent = await cur.fetchone()
+                        if parent is None or parent.get("deleted_at") is not None:
+                            raise ValueError("Automation not found")
+                        parent_row = dict(parent)
+                        if parent_row.get("status") not in _TRIGGERABLE_STATUSES:
+                            raise ValueError(
+                                f"Cannot trigger automation in '{parent_row.get('status')}' status"
+                            )
+                        if units_on:
+                            parent_ws = (
+                                str(parent_row["workspace_id"])
+                                if parent_row.get("workspace_id") is not None
+                                else ""
+                            )
+                            parent_meta = parent_row.get("metadata")
+                            parent_meta_unit_id = ""
+                            if isinstance(parent_meta, dict) and parent_meta.get("unit_id"):
+                                try:
+                                    parent_meta_unit_id = str(
+                                        _ExecUUID(str(parent_meta.get("unit_id")).strip())
+                                    )
+                                except (ValueError, TypeError, AttributeError):
+                                    parent_meta_unit_id = ""
+                            if parent_ws != probe_ws_id or parent_meta_unit_id != probe_meta_unit_id:
+                                # Workspace or unit_id changed before automations FOR UPDATE; roll back and retry under unified FOR SHARE lock order.
+                                raise _WorkspaceDriftRetry()
+                            if (
+                                parent_meta_unit_id
+                                and is_managed_unit_automation(parent_row)
+                            ):
+                                if meta_unit_row is None:
+                                    meta_unit_row = await get_coverage_unit(
+                                        parent_meta_unit_id, conn=conn, for_share=True
+                                    )
+                                if meta_unit_row is not None:
+                                    meta_status = str(meta_unit_row.get("status") or "").strip().lower()
+                                    meta_ws = str(meta_unit_row.get("workspace_id") or "").strip().lower()
+                                    meta_lead = str(
+                                        meta_unit_row.get("lead_analyst_user_id")
+                                        or meta_unit_row.get("owner_user_id")
+                                        or ""
+                                    ).strip()
+                                    owner_uid = str(parent_row.get("user_id") or "").strip()
+                                    if (
+                                        meta_status != "active"
+                                        or meta_ws != parent_ws.lower()
+                                        or (meta_lead and owner_uid != meta_lead)
+                                    ):
+                                        raise HTTPException(
+                                            status_code=403,
+                                            detail="受管自动任务关联的覆盖单元已解绑、改绑或归档，拒绝触发。",
+                                        )
+                            if (
+                                parent_ws
+                                and unit_row is not None
+                                and is_managed_unit_automation_for_unit(
+                                    parent_row, unit=unit_row
+                                )
+                            ):
+                                lead_uid = str(
+                                    unit_row.get("lead_analyst_user_id")
+                                    or unit_row.get("owner_user_id")
+                                    or ""
+                                ).strip()
+                                owner_uid = str(parent_row.get("user_id") or "").strip()
+                                if lead_uid and owner_uid != lead_uid:
+                                    raise HTTPException(
+                                        status_code=403,
+                                        detail=(
+                                            f"受管自动任务仅可由当前主分析师（{lead_uid}）运行，"
+                                            "当前持有者已不再担任该单元主分析师。"
+                                        ),
+                                    )
+                        # DALTON-HOOK(coverage-units): stamp actual write time so concurrent pause cutoffs never mis-skip live-parent inserts
+                        await cur.execute(
+                            """
+                            INSERT INTO automation_executions (
+                                automation_execution_id, automation_id,
+                                status, scheduled_at, server_id, created_at,
+                                heartbeat_at, checked_computer_id
+                            )
+                            VALUES (%s, %s, 'pending', %s, %s, clock_timestamp(), NOW(), %s)
+                            """,
+                            (execution_id, automation_id, scheduled_at, server_id, checked_computer_id),
+                        )
+                        return execution_id, parent_row
+            except _WorkspaceDriftRetry:
+                continue
+        raise HTTPException(
+            status_code=409,
+            detail="Automation workspace changed concurrently; please retry trigger.",
+        )
+
+
+async def get_db_now(*, conn: Any = None) -> datetime:
+    """Return current database timestamp (`clock_timestamp()`) inside caller's transaction."""
+    async with get_db_connection(conn) as active_conn:
+        async with active_conn.cursor() as cur:
+            await cur.execute("SELECT clock_timestamp() AS db_now")
+            row = await cur.fetchone()
+    if isinstance(row, Mapping):
+        for val in row.values():
+            if isinstance(val, datetime):
+                return val
+    elif isinstance(row, (tuple, list)) and row and isinstance(row[0], datetime):
+        return row[0]
+    return datetime.now(timezone.utc)
+
+
+async def skip_unstarted_executions_for_automations(
+    automation_ids: list[str] | tuple[str, ...],
+    *,
+    reason: str = "unit_handoff",
+    error_message: str = "Skipped unstarted managed unit execution due to coverage unit handoff.",
+    created_at_lte: datetime | None = None,
+    conn: Any = None,
+) -> int:
+    """Mark pending/waiting executions for ``automation_ids`` as ``skipped`` inside caller's transaction."""
+    clean_ids = [str(aid).strip() for aid in automation_ids if str(aid or "").strip()]
+    if not clean_ids:
+        return 0
+    clean_reason = str(reason or "unit_handoff").strip() or "unit_handoff"
+    cutoff_clause = "\n                  AND created_at <= %s" if created_at_lte is not None else ""
+    params: list[Any] = [clean_reason, error_message, clean_ids]
+    if created_at_lte is not None:
+        params.append(created_at_lte)
+
+    async def _run(active_conn: Any) -> int:
+        async with active_conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                UPDATE automation_executions
+                SET status = 'skipped',
+                    skip_reason = COALESCE(NULLIF(skip_reason, ''), %s),
+                    error_message = COALESCE(NULLIF(error_message, ''), %s),
+                    completed_at = COALESCE(completed_at, NOW())
+                WHERE automation_id = ANY(%s::uuid[])
+                  AND status IN ('pending', 'waiting'){cutoff_clause}
+                """,
+                tuple(params),
+            )
+            return int(getattr(cur, "rowcount", 0) or 0)
+
+    if conn is not None:
+        return await _run(conn)
+    async with get_db_connection() as new_conn, new_conn.transaction():
+        return await _run(new_conn)
 
 
 async def create_execution(

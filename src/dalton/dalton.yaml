@@ -31,11 +31,10 @@ artifact_publishing:
 problem_reports:
   enabled: false
 
-# 覆盖单元登记表（d023，行业层 P0）。默认关闭：关闭时工作区覆盖身份只走兼容
-# 规则（公司知识文档 → 隐式公司；Home → 无单元；其余 → 未分类），不读
-# dalton_coverage_units 表；打开后，绑定到工作区的 active 单元优先于兼容规则。
+# 覆盖单元登记表（d023/d041）：关闭时工作区覆盖身份仅走兼容规则；
+# 默认开启，注册到工作区的 active 单元优先于兼容规则，并通过 d041 保持团队唯一。
 coverage_units:
-  enabled: false
+  enabled: true
 
 # OC-1 确定性数据任务层（d029）。默认关闭：关闭时不启动调度循环、不建任何容器。
 data_jobs:

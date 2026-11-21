@@ -31,8 +31,12 @@ import src.dalton.database.cross_unit_requests as cur_db
 import src.dalton.database.sector_members as sm_db
 import src.dalton.settings as settings_mod
 from src.dalton.app import dalton_router
+from src.dalton.access_tiers import is_internal_or_admin as _ORIG_IS_INTERNAL_OR_ADMIN
 from src.server.database.home_workspace import get_home_workspace_id
 from src.server.utils.api import get_current_user_id
+
+_ORIG_UNITS_VIEW_GET_DB_CONN = units_view_mod.get_db_connection
+_ORIG_CUR_GET_DB_CONN = cur_db.get_db_connection
 
 USER = "user-1"
 COLLEAGUE = "user-2"
@@ -59,6 +63,9 @@ def _sector_unit_row(**overrides: Any) -> dict[str, Any]:
         "status": "active",
     }
     row.update(overrides)
+    row.setdefault("lead_analyst_user_id", row["owner_user_id"])
+    if row.get("workspace_id") and "workspace_owner_id" not in row:
+        row["workspace_owner_id"] = row["owner_user_id"]
     return row
 
 
@@ -74,6 +81,9 @@ def _company_unit_row(**overrides: Any) -> dict[str, Any]:
         "status": "active",
     }
     row.update(overrides)
+    row.setdefault("lead_analyst_user_id", row["owner_user_id"])
+    if row.get("workspace_id") and "workspace_owner_id" not in row:
+        row["workspace_owner_id"] = row["owner_user_id"]
     return row
 
 
@@ -299,7 +309,17 @@ def _make_cursor(
                     .split("FROM workspaces", 1)[0]
                     .split(",")
                 ]
-                return [{k: r.get(k) for k in cols} for r in ws_rows]
+                rows_src = ws_rows
+                if "WHERE workspace_id = %s::uuid" in sql and p:
+                    rows_src = [r for r in ws_rows if str(r.get("workspace_id") or "") == str(p[0])]
+                elif "status <> 'deleted' AND user_id = %s" in sql and p:
+                    rows_src = [
+                        r
+                        for r in ws_rows
+                        if str(r.get("user_id") or "") == str(p[0])
+                        and str(r.get("status") or "active") != "deleted"
+                    ]
+                return [{k: r.get(k) for k in cols} for r in rows_src]
             if "FROM automations" in sql:
                 if p and "user_id = %s" in sql:
                     return [
@@ -348,30 +368,43 @@ def _make_cursor(
                 limit = int(p[3]) if len(p) >= 4 else 50
                 return rows[:limit]
             if "FROM dalton_coverage_units" in sql:
+                ws_by_id = {
+                    str(w.get("workspace_id") or ""): w
+                    for w in ws_rows
+                    if w.get("workspace_id") and w.get("status") != "deleted"
+                }
+                enriched_units = []
+                for r in unit_rows:
+                    item = dict(r)
+                    ws_id_u = str(item.get("workspace_id") or "")
+                    if ws_id_u and "workspace_owner_id" not in item:
+                        ws_match = ws_by_id.get(ws_id_u)
+                        item["workspace_owner_id"] = (
+                            ws_match.get("user_id") if ws_match is not None else item.get("owner_user_id")
+                        )
+                    item.setdefault("lead_analyst_user_id", item.get("owner_user_id"))
+                    enriched_units.append(item)
                 if "unit_id = ANY" in sql:
                     ids = {str(u) for u in (p[0] if p else [])}
-                    return [r for r in unit_rows if str(r.get("unit_id")) in ids]
+                    return [r for r in enriched_units if str(r.get("unit_id")) in ids]
                 if "workspace_id = ANY" in sql:
                     ws_ids = {str(u) for u in (p[0] if p else [])}
-                    rows = [
-                        r for r in unit_rows if str(r.get("workspace_id")) in ws_ids
+                    return [
+                        r for r in enriched_units if str(r.get("workspace_id")) in ws_ids
                     ]
-                    if len(p) >= 3 and p[2] is not None:
-                        rows = [
-                            r
-                            for r in rows
-                            if str(r.get("owner_user_id")) != str(p[2])
-                        ]
-                    return rows
                 if len(p) >= 2 and p[1] is not None:
                     owner = str(p[1])
                     return [
                         r
-                        for r in unit_rows
-                        if str(r.get("owner_user_id")) == owner
+                        for r in enriched_units
+                        if (
+                            str(r.get("lead_analyst_user_id") or r.get("owner_user_id")) == owner
+                            or str(r.get("created_by_user_id") or r.get("owner_user_id")) == owner
+                            or str(r.get("owner_user_id")) == owner
+                        )
                         and str(r.get("status")) == "active"
                     ]
-                return list(unit_rows)
+                return enriched_units
             return []
 
         async def fetchall(self) -> list[dict[str, Any]]:
@@ -382,6 +415,14 @@ def _make_cursor(
             return rows[0] if rows else None
 
     return _Cur(), executed
+
+
+class _NullTx:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *args: Any) -> None:
+        return None
 
 
 class _Lease:
@@ -395,6 +436,11 @@ class _Lease:
         if self._returned:
             raise RuntimeError("connection already returned to the pool")
         return self._cur
+
+    def transaction(self) -> _NullTx:
+        if self._returned:
+            raise RuntimeError("connection already returned to the pool")
+        return _NullTx()
 
     async def __aenter__(self) -> "_Lease":
         return self
@@ -411,9 +457,19 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     return TestClient(app, raise_server_exceptions=False)
 
 
-def _install_flag(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
+def _install_flag(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool, *, internal: bool = True
+) -> None:
+    import src.dalton.access_tiers as access_tiers_mod
+
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "true" if enabled else "false")
     monkeypatch.setattr(
         settings_mod, "is_coverage_units_enabled", lambda f=enabled: f
+    )
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "is_internal_or_admin",
+        create_autospec(_ORIG_IS_INTERNAL_OR_ADMIN, return_value=internal),
     )
 
 
@@ -473,13 +529,16 @@ def _install_db(
             ],
         ),
     )
+    def _lease_cur_conn(conn: Any = None) -> _Lease:
+        return _Lease(cur)
+
     monkeypatch.setattr(
         cur_db,
         "get_db_connection",
-        lambda *a, **kw: _Lease(cur),
+        create_autospec(_ORIG_CUR_GET_DB_CONN, side_effect=_lease_cur_conn),
     )
 
-    async def _fake_team(uid: str) -> list[dict[str, Any]]:
+    async def _fake_team(uid: str, *, conn: Any = None) -> list[dict[str, Any]]:
         return team_workspaces or []
 
     import src.dalton.sharing as sharing_mod
@@ -733,7 +792,11 @@ def test_sector_detail_docs_agenda_members_ledger(
         },
     ]
     cur, executed = _make_cursor(
-        unit_rows=unit_rows, ws_rows=[], auto_rows=[], kv_rows=kv_rows, ledger_rows=ledger
+        unit_rows=unit_rows,
+        ws_rows=[{"workspace_id": WS_SECTOR, "user_id": USER, "status": "active"}],
+        auto_rows=[],
+        kv_rows=kv_rows,
+        ledger_rows=ledger,
     )
     _install_db(
         monkeypatch,
@@ -789,7 +852,14 @@ def test_sector_detail_colleague_ledger_not_exposed(
         display_name="Digital Ads",
         workspace_id=COLLEAGUE_VISIBLE_WS,
     )
-    cur, _ = _make_cursor(unit_rows=[colleague_sector], ws_rows=[], auto_rows=[], kv_rows=[])
+    cur, _ = _make_cursor(
+        unit_rows=[colleague_sector],
+        ws_rows=[
+            {"workspace_id": COLLEAGUE_VISIBLE_WS, "user_id": COLLEAGUE, "status": "active"}
+        ],
+        auto_rows=[],
+        kv_rows=[],
+    )
     _install_db(
         monkeypatch,
         cur,
@@ -877,7 +947,11 @@ def test_ledger_filters_by_sector_before_limit(
         for i in range(60)
     )
     cur, _ = _make_cursor(
-        unit_rows=unit_rows, ws_rows=[], auto_rows=[], kv_rows=[], ledger_rows=ledger
+        unit_rows=unit_rows,
+        ws_rows=[{"workspace_id": WS_SECTOR, "user_id": USER, "status": "active"}],
+        auto_rows=[],
+        kv_rows=[],
+        ledger_rows=ledger,
     )
     _install_db(
         monkeypatch,
@@ -903,13 +977,25 @@ def test_ledger_filters_by_sector_before_limit(
         r for r in ledger if not str(r.get("question", "")).startswith("本行业较新")
     ]
     cur2, _ = _make_cursor(
-        unit_rows=unit_rows, ws_rows=[], auto_rows=[], kv_rows=[],
+        unit_rows=unit_rows,
+        ws_rows=[{"workspace_id": WS_SECTOR, "user_id": USER, "status": "active"}],
+        auto_rows=[],
+        kv_rows=[],
         ledger_rows=ledger_without_recent,
     )
+    def _lease_cur2_conn(conn: Any = None) -> _Lease:
+        return _Lease(cur2)
+
     monkeypatch.setattr(
-        units_view_mod, "get_db_connection", lambda *a, **kw: _Lease(cur2)
+        units_view_mod,
+        "get_db_connection",
+        create_autospec(_ORIG_UNITS_VIEW_GET_DB_CONN, side_effect=_lease_cur2_conn),
     )
-    monkeypatch.setattr(cur_db, "get_db_connection", lambda *a, **kw: _Lease(cur2))
+    monkeypatch.setattr(
+        cur_db,
+        "get_db_connection",
+        create_autospec(_ORIG_CUR_GET_DB_CONN, side_effect=_lease_cur2_conn),
+    )
     body2 = client.get(f"/api/v1/dalton/coverage/units/{UNIT_SECTOR}").json()
     sector2 = body2["sector"]
     assert sector2["pending_total"] == 1
@@ -997,7 +1083,7 @@ def test_agenda_todos_keep_waiting_pm(
 
     cur, _ = _make_cursor(
         unit_rows=[_sector_unit_row()],
-        ws_rows=[],
+        ws_rows=[{"workspace_id": WS_SECTOR, "user_id": USER, "status": "active"}],
         auto_rows=[],
         kv_rows=[{**agenda, "ws": WS_SECTOR}],
     )
@@ -1031,7 +1117,7 @@ def test_drivers_summary_reads_leading_indicators(
 
     cur, _ = _make_cursor(
         unit_rows=[_sector_unit_row()],
-        ws_rows=[],
+        ws_rows=[{"workspace_id": WS_SECTOR, "user_id": USER, "status": "active"}],
         auto_rows=[],
         kv_rows=[{**drivers, "ws": WS_SECTOR}],
     )
@@ -1116,7 +1202,10 @@ def test_company_detail_related_sectors_and_re_review(
     ]
     cur, _ = _make_cursor(
         unit_rows=[_sector_unit_row(), _company_unit_row()],
-        ws_rows=[],
+        ws_rows=[
+            {"workspace_id": WS_SECTOR, "user_id": USER, "status": "active"},
+            {"workspace_id": WS_COMPANY, "user_id": USER, "status": "active"},
+        ],
         auto_rows=[],
         kv_rows=kv_rows,
     )
@@ -1160,7 +1249,10 @@ def test_company_detail_skips_hidden_colleague_sector(
         workspace_id=COLLEAGUE_HIDDEN_WS,
     )
     cur, _ = _make_cursor(
-        unit_rows=[_company_unit_row(), hidden_sector], ws_rows=[], auto_rows=[], kv_rows=[]
+        unit_rows=[_company_unit_row(), hidden_sector],
+        ws_rows=[{"workspace_id": WS_COMPANY, "user_id": USER, "status": "active"}],
+        auto_rows=[],
+        kv_rows=[],
     )
     _install_db(
         monkeypatch,
@@ -1222,3 +1314,606 @@ def test_units_view_sql_rules_no_like_no_untyped_null() -> None:
     # IS NULL 上下文与 uuid 比较都显式转型（生产 psycopg 参数类型的教训）
     assert "%s::text IS NULL" in text
     assert "%s::uuid" in text
+
+
+def test_read_isolation_for_unit_owner_without_workspace_access(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C8: unit.owner_user_id == viewer without workspace read access returns redacted workspace_id and 404 detail."""
+    _install_flag(monkeypatch, True)
+    revoked = _company_unit_row(
+        unit_id=UNIT_COMPANY,
+        owner_user_id=USER,
+        lead_analyst_user_id=USER,
+        workspace_id=COLLEAGUE_HIDDEN_WS,
+        workspace_owner_id=COLLEAGUE,
+    )
+    kv_rows = [{**_thesis_doc(version_no=5), "ws": COLLEAGUE_HIDDEN_WS}]
+    cur, _ = _make_cursor(
+        unit_rows=[revoked],
+        ws_rows=[{"workspace_id": COLLEAGUE_HIDDEN_WS, "user_id": COLLEAGUE, "status": "active"}],
+        auto_rows=[],
+        kv_rows=kv_rows,
+    )
+    _install_db(
+        monkeypatch,
+        cur,
+        units_by_ws={COLLEAGUE_HIDDEN_WS: revoked},
+        unit_by_id={UNIT_COMPANY: revoked},
+        member_rows=[],
+        team_workspaces=[],
+    )
+
+    resp_list = client.get("/api/v1/dalton/coverage/units")
+    assert resp_list.status_code == 200
+    items = resp_list.json()["units"]
+    assert len(items) == 1
+    assert items[0]["readable"] is False
+    assert items[0]["delegatable"] is False
+    assert items[0]["workspace_id"] is None
+    assert "workspace_owner_id" not in items[0]
+
+    resp_detail = client.get(f"/api/v1/dalton/coverage/units/{UNIT_COMPANY}")
+    assert resp_detail.status_code == 404
+
+
+def test_unclassified_and_bindable_workspaces_exclude_historical_duplicates(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C7: historical duplicates are excluded; colleague rw workspace appears in bindable_workspaces."""
+    _install_flag(monkeypatch, True)
+    colleague_rw_ws = "abababab-abab-abab-abab-abababababab"
+    colleague_ro_ws = "cdcdcdcd-cdcd-cdcd-cdcd-cdcdcdcdcdcd"
+    colleague_dup_ws = "efefefef-efef-efef-efef-efefefefefef"
+    ws_rows = [
+        {
+            "workspace_id": WS_EXTRA,
+            "user_id": USER,
+            "name": "Own Normal",
+            "description": "",
+            "updated_at": None,
+            "status": "active",
+            "config": {},
+        },
+        {
+            "workspace_id": "12121212-1212-1212-1212-121212121212",
+            "user_id": USER,
+            "name": "Own Dup",
+            "description": "",
+            "updated_at": None,
+            "status": "active",
+            "config": {"dalton_historical_duplicate_of": WS_COMPANY},
+        },
+    ]
+    cur, _ = _make_cursor(unit_rows=[], ws_rows=ws_rows, auto_rows=[], kv_rows=[])
+    _install_db(
+        monkeypatch,
+        cur,
+        units_by_ws={},
+        unit_by_id={},
+        member_rows=[],
+        team_workspaces=[
+            {
+                "user_id": COLLEAGUE,
+                "display_name": "Bob",
+                "email": "bob@firm.com",
+                "workspaces": [
+                    {
+                        "workspace_id": colleague_rw_ws,
+                        "name": "Colleague RW",
+                        "web_access": "rw",
+                        "cos_access": "rw",
+                        "status": "active",
+                        "is_historical_duplicate": False,
+                    },
+                    {
+                        "workspace_id": colleague_ro_ws,
+                        "name": "Colleague RO",
+                        "web_access": "ro",
+                        "cos_access": "ro",
+                        "status": "active",
+                        "is_historical_duplicate": False,
+                    },
+                    {
+                        "workspace_id": colleague_dup_ws,
+                        "name": "Colleague RW Dup",
+                        "web_access": "rw",
+                        "cos_access": "rw",
+                        "status": "active",
+                        "is_historical_duplicate": True,
+                    },
+                ],
+            }
+        ],
+    )
+
+    body = client.get("/api/v1/dalton/coverage/units").json()
+    assert [w["workspace_id"] for w in body["unclassified"]] == [WS_EXTRA]
+    bindable_ids = {w["workspace_id"] for w in body["bindable_workspaces"]}
+    assert bindable_ids == {WS_EXTRA, colleague_rw_ws}
+    colleague_entry = next(
+        w for w in body["bindable_workspaces"] if w["workspace_id"] == colleague_rw_ws
+    )
+    assert colleague_entry["is_own"] is False
+    assert colleague_entry["owner_name"] == "Bob"
+
+
+def test_p4_external_user_403_on_list_detail_and_board(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C8: non-autouse per-test gate restores 403 verification for list, detail, and /coverage/board."""
+    _install_flag(monkeypatch, True, internal=False)
+    assert client.get("/api/v1/dalton/coverage/units").status_code == 403
+    assert client.get(f"/api/v1/dalton/coverage/units/{UNIT_SECTOR}").status_code == 403
+    assert client.get("/api/v1/dalton/coverage/board").status_code == 403
+
+
+def test_unreadable_sector_omits_members_and_detail_redacts_unreadable_gap_targets(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 2: unreadable sector in list returns members=[]; readable sector detail redacts unreadable target_workspace_id."""
+    _install_flag(monkeypatch, True, internal=True)
+    hidden_sector = _sector_unit_row(
+        unit_id="55555555-5555-5555-5555-555555555555",
+        owner_user_id=USER,
+        lead_analyst_user_id=USER,
+        workspace_id=COLLEAGUE_HIDDEN_WS,
+        workspace_owner_id=COLLEAGUE,
+    )
+    readable_sector = _sector_unit_row(unit_id=UNIT_SECTOR, workspace_id=WS_SECTOR)
+    ledger = [
+        {
+            "request_id": "77777777-7777-7777-7777-777777777701",
+            "owner_user_id": USER,
+            "kind": "research_request",
+            "sector_unit_id": UNIT_SECTOR,
+            "question": "Own readable gap",
+            "evidence_needed": [],
+            "completion_condition": "done",
+            "target_workspace_id": WS_COMPANY,
+            "status": "open",
+            "created_at": "2026-10-10T00:00:00+00:00",
+            "updated_at": "2026-10-10T00:00:00+00:00",
+        },
+        {
+            "request_id": "77777777-7777-7777-7777-777777777702",
+            "owner_user_id": USER,
+            "kind": "linkage_retry",
+            "sector_unit_id": UNIT_SECTOR,
+            "question": "Hidden target gap",
+            "target_workspace_id": COLLEAGUE_HIDDEN_WS,
+            "status": "gap",
+            "created_at": "2026-10-11T00:00:00+00:00",
+            "updated_at": "2026-10-11T00:00:00+00:00",
+        },
+    ]
+    hidden_member = [
+        {
+            "sector_unit_id": "55555555-5555-5555-5555-555555555555",
+            "member_id": "M-SECRET",
+            "member_name": "Secret Company",
+            "ticker": "SCRT",
+            "company_unit_id": None,
+            "workspace_created": False,
+            "scope": "Sensitive thesis scope",
+            "reason": "Sensitive reason",
+            "valid_until": "2027-01-01",
+            "position": 0,
+            "synced_version_no": 1,
+        }
+    ]
+    cur, _ = _make_cursor(
+        unit_rows=[hidden_sector, readable_sector],
+        ws_rows=[
+            {"workspace_id": WS_SECTOR, "user_id": USER, "status": "active"},
+            {"workspace_id": WS_COMPANY, "user_id": USER, "status": "active"},
+        ],
+        auto_rows=[],
+        kv_rows=[],
+        ledger_rows=ledger,
+    )
+    _install_db(
+        monkeypatch,
+        cur,
+        units_by_ws={WS_SECTOR: readable_sector, COLLEAGUE_HIDDEN_WS: hidden_sector},
+        unit_by_id={
+            "55555555-5555-5555-5555-555555555555": hidden_sector,
+            UNIT_SECTOR: readable_sector,
+        },
+        member_rows=hidden_member,
+        ledger_rows=ledger,
+    )
+
+    resp_list = client.get("/api/v1/dalton/coverage/units")
+    assert resp_list.status_code == 200
+    by_id = {u["unit_id"]: u for u in resp_list.json()["units"]}
+    assert by_id["55555555-5555-5555-5555-555555555555"]["readable"] is False
+    assert by_id["55555555-5555-5555-5555-555555555555"]["workspace_id"] is None
+    assert by_id["55555555-5555-5555-5555-555555555555"]["members"] == []
+
+    resp_detail = client.get(f"/api/v1/dalton/coverage/units/{UNIT_SECTOR}")
+    assert resp_detail.status_code == 200
+    sector_detail = resp_detail.json()["sector"]
+    assert sector_detail["evidence_gaps"][0]["target_workspace_id"] == WS_COMPANY
+    assert sector_detail["ledger_gaps"][0]["target_workspace_id"] is None
+
+
+def test_company_re_review_redacts_unreadable_source_ref_and_repeatable_read_and_flags(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Items 1, 2, 11: redact unreadable source_ref on company.re_review, run REPEATABLE READ snapshots, and match action flags to closed-auth/deleted-ws auth rules."""
+    import asyncio
+    import src.dalton.invites as invites_mod
+    from src.dalton.invites import is_invite_pm as orig_is_pm
+    from src.dalton.settings import is_dalton_supabase_auth_enabled as orig_sb_auth
+
+    _install_flag(monkeypatch, True, internal=True)
+    monkeypatch.setattr(invites_mod, "is_invite_pm", create_autospec(orig_is_pm, return_value=True))
+    monkeypatch.setattr(settings_mod, "is_dalton_supabase_auth_enabled", create_autospec(orig_sb_auth, return_value=True))
+    monkeypatch.setattr(units_view_mod, "is_dalton_supabase_auth_enabled", create_autospec(orig_sb_auth, return_value=True))
+    monkeypatch.setattr(units_view_mod, "is_invite_pm", create_autospec(orig_is_pm, return_value=True))
+
+    agenda_with_two_sources = {
+        "doc_key": "agenda",
+        "version_no": 4,
+        "content": {
+            "open_questions": [
+                {
+                    "id": "Q-VISIBLE",
+                    "question": "Check readable sector assumption",
+                    "value": "high",
+                    "urgency": "now",
+                    "origin": "sector",
+                    "status": "open",
+                    "source_ref": {
+                        "workspace_id": WS_SECTOR,
+                        "doc_key": "thesis",
+                        "version_no": 3,
+                        "entry_id": "P1",
+                        "relation": "assumes",
+                    },
+                },
+                {
+                    "id": "Q-HIDDEN",
+                    "question": "Check hidden sector assumption",
+                    "value": "medium",
+                    "urgency": "this_week",
+                    "origin": "sector",
+                    "status": "open",
+                    "source_ref": {
+                        "workspace_id": COLLEAGUE_HIDDEN_WS,
+                        "doc_key": "thesis",
+                        "version_no": 7,
+                        "entry_id": "P2",
+                        "relation": "assumes",
+                    },
+                },
+            ]
+        },
+    }
+    company_unit = _company_unit_row(unit_id=UNIT_COMPANY, workspace_id=WS_COMPANY)
+    deleted_ws_id = "aaaaaaaa-0000-0000-0000-000000000001"
+    orphan_unit = _company_unit_row(
+        unit_id="bbbbbbbb-0000-0000-0000-000000000002",
+        owner_user_id=COLLEAGUE,
+        created_by_user_id=USER,
+        lead_analyst_user_id=COLLEAGUE,
+        slug="orphan-co",
+        ticker="ORPH",
+        workspace_id=deleted_ws_id,
+        workspace_owner_id=None,
+    )
+    pm_colleague_rw = _company_unit_row(
+        unit_id="cccccccc-0000-0000-0000-000000000003",
+        owner_user_id=COLLEAGUE,
+        created_by_user_id=COLLEAGUE,
+        lead_analyst_user_id=USER,
+        slug="colleague-co",
+        ticker="CLG",
+        workspace_id=COLLEAGUE_VISIBLE_WS,
+        workspace_owner_id=COLLEAGUE,
+    )
+    cur, executed = _make_cursor(
+        unit_rows=[company_unit, orphan_unit, pm_colleague_rw],
+        ws_rows=[
+            {"workspace_id": WS_COMPANY, "user_id": USER, "status": "active"},
+            {"workspace_id": WS_SECTOR, "user_id": USER, "status": "active"},
+            {"workspace_id": COLLEAGUE_VISIBLE_WS, "user_id": COLLEAGUE, "status": "active"},
+        ],
+        auto_rows=[],
+        kv_rows=[{**agenda_with_two_sources, "ws": WS_COMPANY}],
+    )
+    _install_db(
+        monkeypatch,
+        cur,
+        units_by_ws={WS_COMPANY: company_unit},
+        unit_by_id={UNIT_COMPANY: company_unit},
+        member_rows=[],
+        company_members=[],
+        team_workspaces=[],
+    )
+
+    # Item 1 & Item 2: company detail runs REPEATABLE READ and strips unreadable source_ref
+    resp_detail = client.get(f"/api/v1/dalton/coverage/units/{UNIT_COMPANY}")
+    assert resp_detail.status_code == 200
+    re_reviews = {q["id"]: q for q in resp_detail.json()["company"]["re_review"]}
+    assert re_reviews["Q-VISIBLE"]["source_ref"]["workspace_id"] == WS_SECTOR
+    assert "source_ref" not in re_reviews["Q-HIDDEN"]
+    assert re_reviews["Q-HIDDEN"]["question"] == "Check hidden sector assumption"
+    iso_idx = executed.index("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+    cu_idx = next(i for i, s in enumerate(executed) if "dalton_knowledge_versions" in s)
+    assert iso_idx < cu_idx
+
+    # Phase 1: bound orphan unit refuses rebind (can_bind=False), while creator still recovers can_unbind/can_archive
+    executed.clear()
+    monkeypatch.setattr(units_view_mod, "is_invite_pm", create_autospec(orig_is_pm, return_value=False))
+    resp_list = client.get("/api/v1/dalton/coverage/units")
+    assert resp_list.status_code == 200
+    list_iso_idx = executed.index("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+    list_cu_idx = next(i for i, s in enumerate(executed) if "FROM dalton_coverage_units" in s)
+    assert list_iso_idx < list_cu_idx
+    units_by_id = {u["unit_id"]: u for u in resp_list.json()["units"]}
+    orphan_entry = units_by_id[orphan_unit["unit_id"]]
+    assert orphan_entry["can_bind"] is False
+    assert orphan_entry["can_unbind"] is True
+    assert orphan_entry["can_archive"] is True
+
+    # Item 11 (closed Supabase auth): non-owner PM must get ALL False action flags on colleague unit
+    monkeypatch.setattr(units_view_mod, "is_invite_pm", create_autospec(orig_is_pm, return_value=True))
+    monkeypatch.setattr(
+        units_view_mod,
+        "is_dalton_supabase_auth_enabled",
+        create_autospec(orig_sb_auth, return_value=False),
+    )
+    items_closed = asyncio.run(
+        units_view_mod.build_units_view(USER, {})
+    )
+    closed_by_id = {u["unit_id"]: u for u in items_closed}
+    colleague_entry = closed_by_id[pm_colleague_rw["unit_id"]]
+    assert colleague_entry["can_bind"] is False
+    assert colleague_entry["can_unbind"] is False
+    assert colleague_entry["can_archive"] is False
+
+
+def test_list_unclassified_and_bindable_exclude_home_stand_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 4 Item 6: list_unclassified_workspaces and list_bindable_workspaces omit home_stand_in rows."""
+    import asyncio
+    from src.dalton.autonomy import units_view as units_view_mod
+    import src.dalton.sharing as sharing_mod
+
+    _install_flag(monkeypatch, True)
+
+    ws_normal = "10000000-0000-0000-0000-000000000001"
+    ws_stand_in = "10000000-0000-0000-0000-000000000002"
+    ws_coll_rw = "10000000-0000-0000-0000-000000000003"
+
+    cur, _ = _make_cursor(
+        ws_rows=[
+            {"workspace_id": ws_normal, "user_id": USER, "name": "Research A", "description": None, "updated_at": None, "status": "stopped", "config": {}},
+            {"workspace_id": ws_stand_in, "user_id": USER, "name": "Home Stand-In", "description": None, "updated_at": None, "status": "stopped", "config": {"home_stand_in": True}},
+        ],
+    )
+
+    def _lease_conn(conn: Any = None) -> _Lease:
+        return _Lease(cur)
+
+    monkeypatch.setattr(
+        units_view_mod,
+        "get_db_connection",
+        create_autospec(units_view_mod.get_db_connection, side_effect=_lease_conn),
+    )
+    monkeypatch.setattr(
+        units_view_mod,
+        "load_active_units_by_workspace",
+        create_autospec(units_view_mod.load_active_units_by_workspace, return_value={}),
+    )
+
+    async def _team_ws(uid: str, *, conn: Any = None) -> list[dict[str, Any]]:
+        # Upstream sharing.py (`list_team_workspaces`) omits reserved home_stand_in
+        # rows before constructing the stripped colleague workspace dicts.
+        return [
+            {
+                "user_id": "u-colleague",
+                "display_name": "Alice",
+                "email": "alice@firm.com",
+                "workspaces": [
+                    {
+                        "workspace_id": ws_coll_rw,
+                        "name": "Colleague Research",
+                        "web_access": "rw",
+                        "status": "stopped",
+                        "is_home": False,
+                        "is_historical_duplicate": False,
+                    },
+                ],
+            }
+        ]
+
+    monkeypatch.setattr(sharing_mod, "list_team_workspaces", create_autospec(sharing_mod.list_team_workspaces, side_effect=_team_ws))
+    monkeypatch.setattr(units_view_mod, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr(units_view_mod, "is_invite_pm", lambda uid: False)
+
+    unclassified = asyncio.run(units_view_mod.list_unclassified_workspaces(USER))
+    assert [w["workspace_id"] for w in unclassified] == [ws_normal]
+
+    bindable = asyncio.run(units_view_mod.list_bindable_workspaces(USER))
+    assert [w["workspace_id"] for w in bindable] == [ws_normal, ws_coll_rw]
+
+
+@pytest.mark.asyncio
+async def test_unreadable_unit_sets_bound_flag_and_hides_workspace_id(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 8: even for PM, unreadable unit sets bound=True while workspace_id is redacted to None."""
+    from src.dalton import invites as invites_mod
+
+    _install_flag(monkeypatch, True, internal=True)
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    monkeypatch.setenv("DALTON_PM_USER_IDS", USER)
+    monkeypatch.setattr(settings_mod, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr(units_view_mod, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr(units_view_mod, "is_invite_pm", lambda uid: str(uid) == USER)
+    monkeypatch.setattr(invites_mod, "is_invite_pm", lambda uid: str(uid) == USER)
+    hidden_ws = "88888888-8888-4888-8888-888888888888"
+    hidden_unit = {
+        "unit_id": "u-pm-hidden",
+        "kind": "sector",
+        "slug": "hidden-sector",
+        "display_name": "Hidden Sector",
+        "owner_user_id": USER,
+        "created_by_user_id": USER,
+        "lead_analyst_user_id": "colleague-a",
+        "workspace_id": hidden_ws,
+        "workspace_owner_id": "colleague-a",
+        "workspace_status": "stopped",
+        "status": "active",
+    }
+    cur, _ = _make_cursor(unit_rows=[hidden_unit])
+    _install_db(monkeypatch, cur, unit_by_id={}, team_workspaces=[])
+
+    resp = client.get("/api/v1/dalton/coverage/units")
+    assert resp.status_code == 200
+    u = next(item for item in resp.json()["units"] if item["unit_id"] == "u-pm-hidden")
+    assert u["bound"] is True
+    assert u["workspace_id"] is None
+    assert u["readable"] is False
+    assert hidden_ws not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_board_savepoint_isolates_coverage_unit_failure_inside_repeatable_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 4: load_active_units_by_workspace failure inside REPEATABLE READ runs inside a savepoint
+    so outer knowledge/company queries still succeed."""
+    import src.dalton.autonomy.board as board_mod
+    from tests.unit.dalton.test_sector_p2 import _board_cursor, _install_board as _p2_install_board
+
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "1")
+    ws_comp = "12121212-1212-4212-8212-121212121212"
+    ws_rows = [
+        {
+            "workspace_id": ws_comp,
+            "user_id": USER,
+            "name": "NVDA",
+            "description": "",
+            "status": "running",
+            "updated_at": None,
+            "config": {},
+        }
+    ]
+    kv_rows = [
+        {
+            "workspace_id": ws_comp,
+            "doc_key": "company",
+            "version_no": 1,
+            "content": {"ticker": "NVDA"},
+            "created_at": None,
+        }
+    ]
+    cur, _ = _board_cursor(ws_rows, kv_rows)
+    _p2_install_board(monkeypatch, cur)
+
+    savepoint_entries = 0
+
+    class _TxCheckingLease:
+        def __init__(self, c: Any) -> None:
+            self._cur = c
+            self._returned = False
+            self._failed_outer = False
+
+        def cursor(self, *args: Any, **kwargs: Any) -> Any:
+            if self._returned:
+                raise RuntimeError("returned")
+            if self._failed_outer:
+                raise RuntimeError("InFailedSqlTransaction")
+            return self._cur
+
+        def transaction(self):
+            class _Sp:
+                async def __aenter__(self_sp):
+                    nonlocal savepoint_entries
+                    savepoint_entries += 1
+                    return self_sp
+
+                async def __aexit__(self_sp, exc_type, exc, tb):
+                    # Savepoint catches error without poisoning outer tx
+                    return False
+
+            return _Sp()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            self._returned = True
+
+    monkeypatch.setattr(board_mod, "get_db_connection", lambda: _TxCheckingLease(cur))
+    monkeypatch.setattr(
+        board_mod,
+        "load_active_units_by_workspace",
+        create_autospec(
+            board_mod.load_active_units_by_workspace,
+            side_effect=RuntimeError("boom inside coverage query"),
+        ),
+    )
+
+    board = await board_mod.build_coverage_board(user_id=USER)
+    # Savepoint entered for outer REPEATABLE READ + degradable inner reads; company still surfaced!
+    assert savepoint_entries >= 2
+    assert [c["ticker"] for c in board["companies"]] == ["NVDA"]
+
+
+@pytest.mark.asyncio
+async def test_unit_detail_and_list_clear_all_unreadable_identity_fields_consistently(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 7 Item 3: both list and detail clear workspace_id, owner_user_id,
+    lead_analyst_user_id, and created_by_user_id for an unreadable bound unit."""
+    from src.dalton import invites as invites_mod
+
+    _install_flag(monkeypatch, True, internal=True)
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    monkeypatch.setenv("DALTON_PM_USER_IDS", USER)
+    monkeypatch.setattr(settings_mod, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr(units_view_mod, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr(units_view_mod, "is_invite_pm", lambda uid: str(uid) == USER)
+    monkeypatch.setattr(invites_mod, "is_invite_pm", lambda uid: str(uid) == USER)
+    hidden_ws = "88888888-8888-4888-8888-888888888888"
+    secret_lead = "u-secret-lead"
+    secret_creator = "u-secret-creator"
+    hidden_unit = {
+        "unit_id": "u-hidden-all-ids",
+        "kind": "sector",
+        "slug": "hidden-sector-ids",
+        "display_name": "Hidden Sector",
+        "owner_user_id": USER,
+        "created_by_user_id": secret_creator,
+        "lead_analyst_user_id": secret_lead,
+        "workspace_id": hidden_ws,
+        "workspace_owner_id": secret_lead,
+        "workspace_status": "stopped",
+        "status": "active",
+    }
+    cur, _ = _make_cursor(unit_rows=[hidden_unit])
+    _install_db(monkeypatch, cur, unit_by_id={"u-hidden-all-ids": hidden_unit}, team_workspaces=[])
+
+    list_resp = client.get("/api/v1/dalton/coverage/units")
+    assert list_resp.status_code == 200
+    u_list = next(item for item in list_resp.json()["units"] if item["unit_id"] == "u-hidden-all-ids")
+    assert u_list["bound"] is True
+    assert u_list["readable"] is False
+    for field in ("workspace_id", "owner_user_id", "lead_analyst_user_id", "created_by_user_id"):
+        assert u_list[field] is None
+    for secret in (hidden_ws, secret_lead, secret_creator):
+        assert secret not in list_resp.text
+
+    # C8: unreadable bound unit detail stays 404 and leaks no secrets
+    detail_resp = client.get("/api/v1/dalton/coverage/units/u-hidden-all-ids")
+    assert detail_resp.status_code == 404
+    for secret in (hidden_ws, secret_lead, secret_creator):
+        assert secret not in detail_resp.text

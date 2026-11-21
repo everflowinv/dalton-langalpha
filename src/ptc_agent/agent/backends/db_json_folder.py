@@ -112,6 +112,10 @@ class DbJsonFolderRoute(DbJsonRoute):
         async with lock_for_namespace(self._namespace()):
             with self._refusals(filename):
                 async with self._transaction() as conn:
+                    # DALTON-HOOK(coverage-units): prelock unit FOR SHARE before file.lock on delete
+                    prelock = getattr(file, "prelock_units", None)
+                    if prelock is not None:
+                        await prelock(user_id, conn)
                     await file.lock(user_id, conn)
                     rows = await file.fetch(user_id, conn)
                     rendered = file.render(rows)
@@ -159,6 +163,10 @@ class DbJsonFolderRoute(DbJsonRoute):
         async with lock_for_namespace(self._namespace()):
             with self._refusals(filename):
                 async with self._transaction() as conn:
+                    # DALTON-HOOK(coverage-units): prelock unit FOR SHARE before file.lock on rename
+                    prelock = getattr(file, "prelock_units", None)
+                    if prelock is not None:
+                        await prelock(user_id, conn)
                     await file.lock(user_id, conn)
                     there = self.file_named(target)
                     if there.render(await there.fetch(user_id, conn)) is not None:

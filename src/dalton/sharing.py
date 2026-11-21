@@ -21,6 +21,7 @@ from psycopg.rows import dict_row
 from src.dalton.access_tiers import classify_owner_tier, get_user_tier
 from src.dalton.auth import _verified_token_identity
 from src.dalton.company_identity import is_company_system_user
+from src.dalton.coverage.identity import is_historical_duplicate_workspace
 from src.dalton.invites import (
     get_team_member_emails,
     is_invite_pm,
@@ -35,7 +36,7 @@ from src.dalton.settings import (
 from src.server.database import conversation as conv_db
 from src.server.database import user as user_db
 from src.server.database import workspace as ws_db
-from src.server.database.home_workspace import is_home_row
+from src.server.database.home_workspace import is_home_row, is_reserved_row
 from src.server.database.pool import get_db_connection
 from src.server.utils import api as auth_api
 
@@ -65,6 +66,17 @@ class ColleagueAccessRevokedError(PermissionError):
         super().__init__(message)
         self.code = COLLEAGUE_ACCESS_REVOKED_CODE
         self.message = message
+
+
+
+class OwnerTierUnavailable(HTTPException):
+    """404 to the caller, like any hidden workspace, when the owner's tier cannot be read.
+
+    A distinct type so an internal caller holding a binding on record (personal coverage)
+    can tell a failed lookup from a confirmed denial; HTTP clients still see a plain 404."""
+
+    def __init__(self) -> None:
+        super().__init__(status_code=404, detail="Workspace not found")
 
 
 def _classify_owner_row_tier(owner_id: str | None, owner_email: Any) -> str:
@@ -388,6 +400,7 @@ async def upsert_user_cos_sharing(
                     FROM workspaces
                     WHERE user_id = %s
                       AND status != 'deleted'
+                    ORDER BY created_at, workspace_id
                     FOR UPDATE
                     """,
                     (cleaned_uid,),
@@ -827,7 +840,11 @@ async def require_workspace_access(
         if not ws_id_str or ws_id_str.lower() == "home":
             raise HTTPException(status_code=403, detail="Forbidden")
         try:
-            ws = await ws_db.get_workspace(ws_id_str)
+            ws = (
+                await ws_db.get_workspace(ws_id_str, conn=conn)
+                if conn is not None
+                else await ws_db.get_workspace(ws_id_str)
+            )
         except HTTPException:
             raise
         except Exception as exc:
@@ -871,7 +888,7 @@ async def require_workspace_access(
 
     owner_tier = await classify_owner_tier(owner_id)
     if owner_tier == "unknown":
-        raise HTTPException(status_code=404, detail="Workspace not found")
+        raise OwnerTierUnavailable()
     if owner_tier == "company":
         raise HTTPException(status_code=403, detail="Forbidden")
     if owner_tier == "external":
@@ -2059,7 +2076,8 @@ async def verify_server_tail_turn(
 resolve_verified_tail_turn = verify_server_tail_turn
 
 
-async def list_team_workspaces(current_user_id: str) -> list[dict[str, Any]]:
+# DALTON-HOOK(coverage-units): accept optional snapshot connection for REPEATABLE READ readers.
+async def list_team_workspaces(current_user_id: str, *, conn: Any = None) -> list[dict[str, Any]]:
     """Return colleagues' visible web workspaces grouped by user, excluding caller's own, Home, and hidden workspaces."""
     if not is_dalton_supabase_auth_enabled():
         return []
@@ -2072,8 +2090,8 @@ async def list_team_workspaces(current_user_id: str) -> list[dict[str, Any]]:
     allowed_emails = sorted(await get_team_member_emails())
 
     dispatch_enabled = is_colleague_dispatch_enabled()
-    async with get_db_connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
+    async with get_db_connection(conn) as owned_conn:
+        async with owned_conn.cursor(row_factory=dict_row) as cur:
             if dispatch_enabled:
                 await cur.execute(
                     """
@@ -2083,6 +2101,7 @@ async def list_team_workspaces(current_user_id: str) -> list[dict[str, Any]]:
                         w.name,
                         w.description,
                         w.status,
+                        w.config,
                         w.created_at,
                         w.updated_at,
                         w.last_activity_at,
@@ -2124,6 +2143,7 @@ async def list_team_workspaces(current_user_id: str) -> list[dict[str, Any]]:
                         w.name,
                         w.description,
                         w.status,
+                        w.config,
                         w.created_at,
                         w.updated_at,
                         w.last_activity_at,
@@ -2158,7 +2178,7 @@ async def list_team_workspaces(current_user_id: str) -> list[dict[str, Any]]:
     default_cos = "rw" if dispatch_enabled else DEFAULT_COS_ACCESS
     owner_tiers: dict[str, str] = {}
     for row in rows:
-        if is_home_row(row) or bool(row.get("is_home")):
+        if is_reserved_row(row) or bool(row.get("is_home")):
             continue
         owner_uid = str(row["user_id"])
         owner_tier = owner_tiers.get(owner_uid)
@@ -2205,36 +2225,39 @@ async def list_team_workspaces(current_user_id: str) -> list[dict[str, Any]]:
         updated_at = row.get("updated_at")
         last_activity_at = row.get("last_activity_at")
         created_at = row.get("created_at")
-        member["workspaces"].append(
-            {
-                "workspace_id": str(row["workspace_id"]),
-                "user_id": owner_uid,
-                "owner_name": owner_display,
-                "owner_email": owner_email,
-                "name": row.get("name") or "Workspace",
-                "description": row.get("description"),
-                "status": row.get("status") or "stopped",
-                "is_home": False,
-                "web_access": web_access,
-                "cos_access": cos_access,
-                "access": web_access,
-                "updated_at": (
-                    updated_at.isoformat()
-                    if hasattr(updated_at, "isoformat")
-                    else updated_at
-                ),
-                "last_activity_at": (
-                    last_activity_at.isoformat()
-                    if hasattr(last_activity_at, "isoformat")
-                    else last_activity_at
-                ),
-                "created_at": (
-                    created_at.isoformat()
-                    if hasattr(created_at, "isoformat")
-                    else created_at
-                ),
-            }
-        )
+        from src.dalton.settings import is_coverage_units_enabled
+
+        ws_entry: dict[str, Any] = {
+            "workspace_id": str(row["workspace_id"]),
+            "user_id": owner_uid,
+            "owner_name": owner_display,
+            "owner_email": owner_email,
+            "name": row.get("name") or "Workspace",
+            "description": row.get("description"),
+            "status": row.get("status") or "stopped",
+            "is_home": False,
+            "web_access": web_access,
+            "cos_access": cos_access,
+            "access": web_access,
+            "updated_at": (
+                updated_at.isoformat()
+                if hasattr(updated_at, "isoformat")
+                else updated_at
+            ),
+            "last_activity_at": (
+                last_activity_at.isoformat()
+                if hasattr(last_activity_at, "isoformat")
+                else last_activity_at
+            ),
+            "created_at": (
+                created_at.isoformat()
+                if hasattr(created_at, "isoformat")
+                else created_at
+            ),
+        }
+        if is_coverage_units_enabled():
+            ws_entry["is_historical_duplicate"] = is_historical_duplicate_workspace(row)
+        member["workspaces"].append(ws_entry)
 
     return list(grouped.values())
 
@@ -2269,6 +2292,7 @@ async def list_colleague_cos_workspaces(
                         w.name,
                         w.description,
                         w.status,
+                        w.config,
                         w.created_at,
                         w.updated_at,
                         w.last_activity_at,
@@ -2309,6 +2333,7 @@ async def list_colleague_cos_workspaces(
                         w.name,
                         w.description,
                         w.status,
+                        w.config,
                         w.created_at,
                         w.updated_at,
                         w.last_activity_at,
@@ -2345,7 +2370,7 @@ async def list_colleague_cos_workspaces(
     default_cos = "rw" if dispatch_enabled else DEFAULT_COS_ACCESS
     owner_tiers: dict[str, str] = {}
     for row in rows:
-        if is_home_row(row) or bool(row.get("is_home")):
+        if is_reserved_row(row) or bool(row.get("is_home")):
             continue
         owner_uid = str(row["user_id"])
         owner_tier = owner_tiers.get(owner_uid)

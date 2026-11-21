@@ -47,6 +47,12 @@ DEFAULT_TIER_MEANINGS: dict[str, str] = {
 
 
 def infer_market(ticker: str) -> str:
+    from src.dalton.settings import is_coverage_units_enabled
+
+    if is_coverage_units_enabled():
+        from src.dalton.coverage.identity import infer_ticker_market
+
+        return infer_ticker_market(ticker)
     sym = str(ticker or "").strip().upper()
     if sym.endswith(".HK"):
         return "HK"
@@ -220,6 +226,24 @@ def company_to_row(
         "source": src,
         "group_id": eff_group_id,
     }
+
+
+INTERNAL_COVERAGE_SYNC_KEYS: tuple[str, ...] = (
+    "_synced_unit_id",
+    "_synced_workspace_id",
+    "_synced_ws_written",
+    "_manual_workspace_id",
+)
+
+
+def preserve_row_internal_extra(comp: dict[str, Any], row: Mapping[str, Any]) -> None:
+    """Copy unit-sync and manual-link internal markers from ``row['extra']`` back onto ``comp``."""
+    raw_extra = _ensure_json_obj(row.get("extra"), {})
+    if not isinstance(raw_extra, Mapping):
+        return
+    for key in INTERNAL_COVERAGE_SYNC_KEYS:
+        if key in raw_extra and key not in comp:
+            comp[key] = raw_extra[key]
 
 
 def row_to_company(row: Mapping[str, Any]) -> dict[str, Any]:

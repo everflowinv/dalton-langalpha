@@ -147,45 +147,55 @@ def _firing(turns, *, runs=None, busy=(), fresh=None, is_byok=(False,), away=())
         announce=AsyncMock(),
         astream=MagicMock(side_effect=astream),
     )
-    with (
-        patch(f"{_MOD}.auto_db", new=db),
-        patch(f"{_MOD}.exec_db", new=db),
-        patch(f"{_WAIT}.exec_db", new=db),
-        patch("src.server.services.automation_settlement.auto_db", new=db),
-        patch("src.server.services.automation_settlement.exec_db", new=db),
-        patch(
-            "src.dalton.database.automation_recycle.automation_is_soft_deleted",
-            new=create_autospec(automation_is_soft_deleted, return_value=False),
-        ),
-        patch("src.server.database.api_keys.is_byok_active", new=fx.byok),
-        patch("src.server.database.oauth_tokens.has_any_oauth_token", new=AsyncMock(return_value=False)),
-        patch(f"{_MOD}.enforce_credit_limit", new=fx.credit),
-        patch(
-            "src.server.database.workspace.get_workspace",
-            new=AsyncMock(
-                return_value={"workspace_id": _HOME, "user_id": _USER, "status": "running"}
+    from contextlib import ExitStack
+
+    # More managers than one `with` statement may nest (CPython's static block limit).
+    with ExitStack() as stack:
+        for ctx in (
+            patch(f"{_MOD}.auto_db", new=db),
+            patch(f"{_MOD}.exec_db", new=db),
+            patch(f"{_WAIT}.exec_db", new=db),
+            patch("src.server.services.automation_settlement.auto_db", new=db),
+            patch("src.server.services.automation_settlement.exec_db", new=db),
+            patch(
+                "src.dalton.database.automation_recycle.automation_is_soft_deleted",
+                new=create_autospec(automation_is_soft_deleted, return_value=False),
             ),
-        ),
-        patch(
-            "src.server.services.workspace_manager.WorkspaceManager.get_instance",
-            return_value=MagicMock(ensure_home_bound=AsyncMock()),
-        ),
-        patch(
-            "src.server.services.ssh_computers.computer_away",
-            new=AsyncMock(side_effect=lambda *_, **__: next(away_answers, None)),
-        ),
-        patch(f"{_MOD}.WebhookClient", return_value=MagicMock(fire_event=fx.started)),
-        patch(
-            "src.server.services.automation_settlement.WebhookClient",
-            return_value=MagicMock(fire_event=fx.settled_webhook),
-        ),
-        patch(f"{_MOD}.publish_automation_wait", new=fx.announce),
-        patch("src.server.services.automation_settlement.publish_automation_wait", new=AsyncMock()),
-        patch(f"{_MOD}._thread_busy", new=AsyncMock(side_effect=lambda _: next(busy_answers, False))),
-        patch(f"{_MOD}._WAIT_POLL_SECONDS", new=0),
-        patch("src.server.database.runs.lifecycle.get_run", new=AsyncMock(side_effect=get_run)),
-        patch("src.server.handlers.chat.astream_ptc_workflow", new=fx.astream),
-    ):
+            patch("src.server.database.api_keys.is_byok_active", new=fx.byok),
+            patch("src.server.database.oauth_tokens.has_any_oauth_token", new=AsyncMock(return_value=False)),
+            patch(f"{_MOD}.enforce_credit_limit", new=fx.credit),
+            patch(
+                "src.server.database.workspace.get_workspace",
+                new=AsyncMock(
+                    return_value={"workspace_id": _HOME, "user_id": _USER, "status": "running"}
+                ),
+            ),
+            # DALTON-HOOK(coverage-units): the post-wait re-verification reads the thread's owner and workspace.
+            patch(
+                "src.server.database.conversation.get_thread_auth_meta",
+                new=AsyncMock(return_value={"workspace_id": _HOME, "user_id": _USER}),
+            ),
+            patch(
+                "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+                return_value=MagicMock(ensure_home_bound=AsyncMock()),
+            ),
+            patch(
+                "src.server.services.ssh_computers.computer_away",
+                new=AsyncMock(side_effect=lambda *_, **__: next(away_answers, None)),
+            ),
+            patch(f"{_MOD}.WebhookClient", return_value=MagicMock(fire_event=fx.started)),
+            patch(
+                "src.server.services.automation_settlement.WebhookClient",
+                return_value=MagicMock(fire_event=fx.settled_webhook),
+            ),
+            patch(f"{_MOD}.publish_automation_wait", new=fx.announce),
+            patch("src.server.services.automation_settlement.publish_automation_wait", new=AsyncMock()),
+            patch(f"{_MOD}._thread_busy", new=AsyncMock(side_effect=lambda _: next(busy_answers, False))),
+            patch(f"{_MOD}._WAIT_POLL_SECONDS", new=0),
+            patch("src.server.database.runs.lifecycle.get_run", new=AsyncMock(side_effect=get_run)),
+            patch("src.server.handlers.chat.astream_ptc_workflow", new=fx.astream),
+        ):
+            stack.enter_context(ctx)
         yield fx
 
 

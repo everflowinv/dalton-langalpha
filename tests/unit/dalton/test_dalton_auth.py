@@ -1929,10 +1929,20 @@ class TestDaltonAuthRound6WriteIsolation:
         assert res_timeout.reason == "workspace_access_timeout"
 
         # 4. AutomationExecutor._stored_workspace and _resolve_thread reject foreign workspace before thread creation
+        from src.dalton import sharing as sharing_mod
+
         monkeypatch.setenv("HOST_MODE", "oss")
         monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
         mock_get_ws.side_effect = None
         mock_get_ws.return_value = {"workspace_id": ws_bob, "user_id": "user-bob"}
+        monkeypatch.setattr(
+            sharing_mod,
+            "require_workspace_access",
+            create_autospec(
+                sharing_mod.require_workspace_access,
+                side_effect=HTTPException(status_code=403, detail="Forbidden"),
+            ),
+        )
         mock_create_thread = create_autospec(conv_db.create_thread)
         monkeypatch.setattr(conv_db, "create_thread", mock_create_thread)
 

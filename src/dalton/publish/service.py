@@ -1446,11 +1446,27 @@ async def _run_publish_state_machine(
     if is_coverage_units_enabled():
         from src.dalton.coverage.identity import resolve_workspace_coverage_identity
 
-        pub_identity = await resolve_workspace_coverage_identity(
-            ws_row,
-            company_content=company_doc if isinstance(company_doc, dict) and company_doc else None,
-            thesis_content=thesis_doc if isinstance(thesis_doc, dict) else None,
-        )
+        try:
+            pub_identity = await resolve_workspace_coverage_identity(
+                ws_row,
+                company_content=company_doc if isinstance(company_doc, dict) and company_doc else None,
+                thesis_content=thesis_doc if isinstance(thesis_doc, dict) else None,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[dalton.publish] coverage identity resolution failed for %s: %s",
+                workspace_id,
+                exc,
+            )
+            return {
+                "ok": False,
+                "status": "coverage_identity_unavailable",
+                "error": "coverage_identity_unavailable",
+                "message": (
+                    f"工作区 {workspace_id} 的覆盖身份暂时无法解析（覆盖登记表查询失败），"
+                    "已拒绝发起发布；请稍后重试。"
+                ),
+            }
         if pub_identity.is_sector:
             unit = pub_identity.unit or {}
             sector_label = (

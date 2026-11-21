@@ -653,3 +653,200 @@ class TestHomeStandInIsNotATarget:
 
         assert (exc.value.status_code, exc.value.field) == (404, "workspace_id")
         mock_auto_db.update_automation.assert_not_called()
+
+
+class TestPhase1Row6WebWriteAndDeliveryWorkspace:
+    """§3.2 Row 6 & G3: non-Home workspace_id and _delivery_workspace accept web write
+    when Dalton auth is enabled, fail closed when disabled, while pinned threads stay owner-only."""
+
+    @pytest.mark.asyncio
+    async def test_require_target_ownership_and_delivery_workspace_gate(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from uuid import UUID
+        from unittest.mock import create_autospec
+        from fastapi import HTTPException
+        from src.dalton import settings as dalton_settings
+        from src.dalton import sharing as dalton_sharing
+        from src.server.app import automations as app_automations
+        from src.server.services.automations import lifecycle as lc_mod
+
+        ws_row = {"workspace_id": WORKSPACE_ID, "user_id": OTHER}
+        orig_lc_get_ws = lc_mod.get_workspace
+        monkeypatch.setattr(
+            lc_mod,
+            "get_workspace",
+            create_autospec(orig_lc_get_ws, return_value=ws_row),
+        )
+        monkeypatch.setattr(
+            app_automations,
+            "get_workspace",
+            create_autospec(orig_lc_get_ws, return_value=ws_row),
+        )
+
+        # G3 / Item 15: auth disabled OR coverage_units disabled -> fails closed with 403
+        monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: False)
+        monkeypatch.setattr(dalton_settings, "is_dalton_supabase_auth_enabled", lambda: False)
+        with pytest.raises(TargetRefused) as exc_off:
+            await lc_mod.require_target_ownership(OWNER, WORKSPACE_ID, None)
+        assert (exc_off.value.status_code, exc_off.value.field) == (403, "workspace_id")
+
+        with pytest.raises(HTTPException) as exc_del_off:
+            await app_automations._delivery_workspace(OWNER, UUID(WORKSPACE_ID))
+        assert exc_del_off.value.status_code == 403
+
+        monkeypatch.setattr(dalton_settings, "is_dalton_supabase_auth_enabled", lambda: True)
+        with pytest.raises(TargetRefused) as exc_units_off:
+            await lc_mod.require_target_ownership(OWNER, WORKSPACE_ID, None)
+        assert (exc_units_off.value.status_code, exc_units_off.value.field) == (403, "workspace_id")
+        with pytest.raises(HTTPException) as exc_del_units_off:
+            await app_automations._delivery_workspace(OWNER, UUID(WORKSPACE_ID))
+        assert exc_del_units_off.value.status_code == 403
+
+        # Both coverage_units + auth enabled & web write allowed: passes for workspace, still rejects foreign thread
+        monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+        monkeypatch.setattr(dalton_settings, "is_dalton_supabase_auth_enabled", lambda: True)
+        req_mock = create_autospec(dalton_sharing.require_workspace_access, return_value=ws_row)
+        monkeypatch.setattr(dalton_sharing, "require_workspace_access", req_mock)
+
+        await lc_mod.require_target_ownership(OWNER, WORKSPACE_ID, None)
+        assert req_mock.await_args.kwargs["channel"] == "web"
+        assert req_mock.await_args.kwargs["need"] == "write"
+
+        del_ws = await app_automations._delivery_workspace(OWNER, UUID(WORKSPACE_ID))
+        assert del_ws == WORKSPACE_ID
+
+        # Pinned thread ownership remains strictly thread.user_id == caller
+        monkeypatch.setattr(
+            lc_mod,
+            "require_thread_owner",
+            create_autospec(
+                lc_mod.require_thread_owner,
+                side_effect=HTTPException(status_code=403, detail="Thread belongs to another user"),
+            ),
+        )
+        with pytest.raises(TargetRefused) as exc_thread:
+            await lc_mod.require_target_ownership(OWNER, WORKSPACE_ID, THREAD_ID)
+        assert (exc_thread.value.status_code, exc_thread.value.field) == (
+            403,
+            "conversation_thread_id",
+        )
+
+        # ColleagueAccessRevokedError wraps cleanly
+        req_mock.side_effect = dalton_sharing.ColleagueAccessRevokedError("revoked")
+        with pytest.raises(TargetRefused) as exc_rev:
+            await lc_mod.require_target_ownership(OWNER, WORKSPACE_ID, None)
+        assert exc_rev.value.status_code == 403
+        with pytest.raises(HTTPException) as exc_del_rev:
+            await app_automations._delivery_workspace(OWNER, UUID(WORKSPACE_ID))
+        assert exc_del_rev.value.status_code == 403
+
+
+class TestItem9And17ManagedUnitLockAndLeadInTx:
+    """Items 9 & 17: create/update/resume/restore/trigger lock unit FOR SHARE inside write tx and reject non-lead."""
+
+    @pytest.mark.asyncio
+    async def test_trigger_and_lifecycle_managed_unit_reject_non_lead_before_write_in_tx_order(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from contextlib import asynccontextmanager
+        from fastapi import HTTPException
+        from psycopg import AsyncCursor
+        from src.dalton import settings as dalton_settings
+        from src.dalton.database import coverage_units as cu_db
+        from src.server.database import automation_executions as exec_db
+
+        monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+        monkeypatch.setattr(dalton_settings, "is_dalton_supabase_auth_enabled", lambda: True)
+
+        events: list[str] = []
+        inserts: list[str] = []
+
+        class _TxConn:
+            @asynccontextmanager
+            async def transaction(self):
+                events.append("BEGIN")
+                yield self
+                events.append("COMMIT")
+
+            @asynccontextmanager
+            async def cursor(self, **_kw):
+                cur = create_autospec(AsyncCursor, instance=True)
+
+                async def _exec(sql, params=None):
+                    s = " ".join(str(sql).split())
+                    if "FROM automations" in s and "FOR UPDATE" in s:
+                        events.append("LOCK_AUTOMATIONS_FOR_UPDATE")
+                        cur.fetchone.return_value = {
+                            "automation_id": AUTOMATION_ID,
+                            "user_id": OWNER,
+                            "workspace_id": WORKSPACE_ID,
+                            "name": "dalton-nvda-watch",
+                            "metadata": {"dalton_kind": "company_watch", "ticker": "NVDA"},
+                            "status": "active",
+                            "deleted_at": None,
+                        }
+                    elif "FROM automations" in s:
+                        cur.fetchone.return_value = {"workspace_id": WORKSPACE_ID}
+                    elif "FROM dalton_coverage_units" in s:
+                        events.append(
+                            "LOCK_UNIT_FOR_SHARE" if "FOR SHARE" in s else "READ_UNIT"
+                        )
+                        cur.fetchone.return_value = {
+                            "unit_id": "u-unit-1",
+                            "workspace_id": WORKSPACE_ID,
+                            "owner_user_id": OWNER,
+                            "lead_analyst_user_id": OTHER,
+                            "status": "active",
+                            "kind": "company",
+                            "ticker": "NVDA",
+                        }
+                    elif "INSERT INTO automation_executions" in s:
+                        inserts.append(s)
+                        events.append("INSERT_EXECUTION")
+
+                cur.execute.side_effect = _exec
+                yield cur
+
+        tx_conn = _TxConn()
+
+        @asynccontextmanager
+        async def _get_conn(c=None):
+            yield c if c is not None else tx_conn
+
+        monkeypatch.setattr(exec_db, "get_db_connection", _get_conn)
+        monkeypatch.setattr(cu_db, "get_db_connection", _get_conn)
+
+        with pytest.raises(HTTPException) as exc_trig:
+            await exec_db.create_execution_for_live_parent(
+                AUTOMATION_ID, OWNER, __import__("datetime").datetime.now(__import__("datetime").timezone.utc), "srv-1"
+            )
+        assert exc_trig.value.status_code == 403
+        # Rejects before inserting pending execution, and acquires unit FOR SHARE before automations FOR UPDATE
+        assert inserts == []
+        assert events.index("LOCK_UNIT_FOR_SHARE") < events.index("LOCK_AUTOMATIONS_FOR_UPDATE")
+
+        # Also test create_automation rejects non-lead managed task inside tx
+        monkeypatch.setattr(
+            "src.server.database.pool.get_db_connection",
+            _get_conn,
+        )
+        ws_row = {"workspace_id": WORKSPACE_ID, "user_id": OWNER}
+        monkeypatch.setattr(lifecycle, "get_workspace", AsyncMock(return_value=ws_row))
+        from src.dalton import sharing as dalton_sharing
+
+        monkeypatch.setattr(
+            dalton_sharing, "require_workspace_access", AsyncMock(return_value=ws_row)
+        )
+        monkeypatch.setattr(lifecycle.auto_db, "create_automation", AsyncMock())
+        with pytest.raises(TargetRefused) as exc_create:
+            await create_automation(
+                OWNER,
+                _create_data(
+                    name="dalton-nvda-watch",
+                    workspace_id=WORKSPACE_ID,
+                    metadata={"dalton_kind": "company_watch", "ticker": "NVDA"},
+                ),
+            )
+        assert exc_create.value.status_code == 403
+        lifecycle.auto_db.create_automation.assert_not_awaited()

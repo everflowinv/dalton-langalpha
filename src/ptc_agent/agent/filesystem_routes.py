@@ -229,6 +229,8 @@ def build_filesystem_backend(
     # identity at call time (e.g. via `langgraph.runtime.get_runtime()`)
     # before introducing reuse.
     # DALTON-HOOK(colleague-dispatch): computer-mounted store and user-data routes belong to workspace owner
+    # DALTON-HOOK(coverage-units): keep caller_user_id so cross-user AutomationsBackend can disable direct file writes
+    caller_user_id = user_id
     user_id = workspace_owner_id or user_id
     routes: list[Any] = list(history_routes)
     user_namespace_factory: NamespaceFactory | None = None
@@ -316,12 +318,22 @@ def build_filesystem_backend(
             routes.append(prebuilt_route)
 
     if gates.user_data:
+        cross_user_automations = bool(
+            workspace_owner_id
+            and caller_user_id
+            and str(workspace_owner_id) != str(caller_user_id)
+        )
         routes.extend(
             route(
                 user_id=user_id,
                 call=call or CallContext(),
                 sandbox_backend=backend,
                 root_prefix=f"{sandbox_root}/{route.directory}/",
+                **(
+                    {"cross_user_read_only": True}
+                    if route is AutomationsBackend and cross_user_automations
+                    else {}
+                ),
             )
             for route in USER_DATA_ROUTES
         )

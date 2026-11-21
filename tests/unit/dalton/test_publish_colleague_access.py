@@ -2320,3 +2320,60 @@ async def test_blank_request_id_is_treated_as_absent(monkeypatch: pytest.MonkeyP
         request_id=" req-1 ", backend=None,
     )
     assert machine.await_args.kwargs["request_id"] == "req-1"
+
+
+@pytest.mark.asyncio
+async def test_flag_off_company_director_status_allows_cos_ro_when_web_hidden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 7 Item 7a: with coverage_units disabled, CoS colleague with cos_access='ro'
+    and web_access='hidden' can still inspect company tracking status and company system job."""
+    import src.dalton.autonomy.system_jobs as system_jobs_mod
+    import src.dalton.tools.director_tools as dt_mod
+    from src.dalton.tools.director_tools import build_director_tools
+
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "false")
+    holder = _install_real_access_chain(monkeypatch, cos_access="ro")
+    assert holder["web_access"] == "hidden"
+    monkeypatch.setattr(
+        dt_mod,
+        "resolve_workspace_id_by_ticker",
+        create_autospec(dt_mod.resolve_workspace_id_by_ticker, return_value=None),
+    )
+    monkeypatch.setattr(
+        dt_mod,
+        "resolve_workspace_id_by_ticker_any_owner",
+        create_autospec(dt_mod.resolve_workspace_id_by_ticker_any_owner, return_value=WS_ID),
+    )
+    monkeypatch.setattr(
+        dt_mod,
+        "get_tracking_status",
+        create_autospec(
+            dt_mod.get_tracking_status,
+            return_value={"ok": True, "status": "enabled", "workspace_id": WS_ID},
+        ),
+    )
+    monkeypatch.setattr(
+        system_jobs_mod,
+        "get_system_job_status",
+        create_autospec(
+            system_jobs_mod.get_system_job_status,
+            return_value={"ok": True, "job": {"key": "company:META", "status": "active", "tasks": []}},
+        ),
+    )
+
+    tools = {t.name: t for t in build_director_tools(role="chief_of_staff")}
+    track_res = await tools["dalton_coverage_tracking"].ainvoke(
+        {"action": "status", "ticker": "META"},
+        config={"configurable": {"user_id": COLLEAGUE_USER_ID, "workspace_id": "home"}},
+    )
+    assert "enabled" in track_res
+
+    job_res = json.loads(
+        await tools["dalton_system_jobs"].ainvoke(
+            {"action": "status", "key": "company:META"},
+            config={"configurable": {"user_id": COLLEAGUE_USER_ID, "workspace_id": "home"}},
+        )
+    )
+    assert job_res["ok"] is True
+    assert job_res["job"]["key"] == "company:META"

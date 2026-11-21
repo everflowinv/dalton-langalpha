@@ -34,6 +34,9 @@ class Retirement(StrEnum):
     # DALTON-HOOK(workspace-delete-guard): a workspace with immutable published
     # reports is archived, never deleted, so a computer carrying one stays.
     PUBLISHED_REPORTS = "published_reports"
+    # DALTON-HOOK(coverage-units): a workspace bound to an active coverage unit
+    # refuses delete/computer removal until unbound or archived.
+    ACTIVE_COVERAGE_UNIT = "active_coverage_unit"
     HANDBACK_OWED = "handback_owed"
     HANDBACK_LEFT = "handback_left"
     STAND_IN = "stand_in"
@@ -62,6 +65,7 @@ _KEEPS_MACHINE = frozenset(
         Retirement.OWNERS_MACHINE,
         Retirement.HAS_WORKSPACES,
         Retirement.PUBLISHED_REPORTS,
+        Retirement.ACTIVE_COVERAGE_UNIT,  # DALTON-HOOK(coverage-units)
         Retirement.HANDBACK_OWED,
         Retirement.HANDBACK_LEFT,
         Retirement.STAND_IN,
@@ -85,6 +89,10 @@ _REMOVAL_REFUSALS: dict[Retirement, str] = {
     # DALTON-HOOK(workspace-delete-guard)
     Retirement.PUBLISHED_REPORTS: (
         "该计算机下有工作区含已发布研报，只能归档，不能删除。"
+    ),
+    # DALTON-HOOK(coverage-units)
+    Retirement.ACTIVE_COVERAGE_UNIT: (
+        "该计算机下有工作区已绑定覆盖单元，请先解绑或归档对应覆盖单元后再移除。"
     ),
     Retirement.HANDBACK_OWED: (
         "What Home's Chief of Staff wrote here while your own computer was away "

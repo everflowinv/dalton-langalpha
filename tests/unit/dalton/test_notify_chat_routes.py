@@ -3973,6 +3973,111 @@ async def test_apply_dalton_notify_preference_patch_prefetch_redo_and_conflict(
     assert exc_409.value.detail == "配置刚被其他人修改，请重试"
 
 
+@pytest.mark.asyncio
+async def test_phase1_c5_unit_managed_initial_dispatch_and_retry_dm_only_and_skip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C5: bound active unit managed task forces include_chat_targets=False (DM only) on initial
+    send, checks lead_analyst_user_id == row.user_id and workspace readable on retry, and marks
+    stale/pre-handoff deliveries as skipped."""
+    from unittest.mock import create_autospec
+    from fastapi import HTTPException
+    from src.dalton import settings as dalton_settings
+    from src.dalton import sharing as dalton_sharing
+    from src.dalton.database import coverage_units as cu_db
+    from src.dalton.notify import dispatch as dispatch_mod
 
+    ws_id = "11111111-1111-1111-1111-111111111111"
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
 
+    from datetime import datetime, timezone
 
+    unit_version = datetime(2026, 11, 20, 12, 0, 0, tzinfo=timezone.utc)
+    unit_row = {
+        "unit_id": "u-unit-1",
+        "workspace_id": ws_id,
+        "owner_user_id": "u-owner",
+        "lead_analyst_user_id": "u-lead",
+        "status": "active",
+        "kind": "company",
+        "ticker": "NVDA",
+        "updated_at": unit_version,
+    }
+    monkeypatch.setattr(
+        cu_db,
+        "get_active_unit_by_workspace",
+        create_autospec(cu_db.get_active_unit_by_workspace, return_value=unit_row),
+    )
+    req_ws_mock = create_autospec(
+        dalton_sharing.require_workspace_access,
+        return_value={"workspace_id": ws_id},
+    )
+    monkeypatch.setattr(dalton_sharing, "require_workspace_access", req_ws_mock)
+
+    auto = {
+        "automation_id": "a-earn-t0",
+        "user_id": "u-lead",
+        "name": "dalton-nvda-earn-fy26q3-t0",
+        "workspace_id": ws_id,
+        "metadata": {"dalton_kind": "earnings_t0", "ticker": "NVDA"},
+    }
+    # 1. _resolve_unit_managed_notify_gate returns force_include_chat_targets=False even for DM+group routes
+    gate_ok, gate_reason, active_uid, force_chats = await dispatch_mod._resolve_unit_managed_notify_gate(
+        "u-lead", ws_id, auto
+    )
+    assert (gate_ok, gate_reason, active_uid, force_chats) == (True, None, "u-unit-1", False)
+
+    allowed, skip_r, targets = await dispatch_mod.evaluate_user_notify_eligibility(
+        "u-lead",
+        auto,
+        include_chat_targets=force_chats,
+        resolve_enabled_fn=create_autospec(dispatch_mod.resolve_dalton_notify_enabled, return_value=True),
+        resolve_overrides_fn=create_autospec(dispatch_mod.resolve_dalton_notify_overrides, return_value={}),
+        resolve_targets_fn=create_autospec(
+            dispatch_mod.resolve_dalton_notify_targets,
+            return_value=["feishu:user:ou_lead"],
+        ),
+        resolve_routes_fn=create_autospec(
+            dispatch_mod.resolve_dalton_notify_routes,
+            return_value={"earnings_t0": ["feishu:user:ou_lead", "feishu:chat:oc_shared"]},
+        ),
+        is_admin_fn=create_autospec(dispatch_mod._default_notify_admin, return_value=True),
+    )
+    assert allowed is True and skip_r is None
+    assert targets == ["feishu:user:ou_lead"]
+
+    # 2. Retry rejects group target, wrong lead (transferred), unreadable ws, or unbound unit
+    g_ok, g_reason, _, _ = await dispatch_mod._resolve_unit_managed_notify_gate(
+        "u-lead", ws_id, auto, target="feishu:chat:oc_shared"
+    )
+    assert (g_ok, g_reason) == (False, "unit_managed_dm_only")
+
+    g_ok2, g_reason2, _, _ = await dispatch_mod._resolve_unit_managed_notify_gate(
+        "u-old-lead", ws_id, auto, target="feishu:user:ou_old"
+    )
+    assert (g_ok2, g_reason2) == (False, "not_unit_lead_analyst")
+
+    req_ws_mock.side_effect = HTTPException(status_code=403, detail="denied")
+    g_ok3, g_reason3, _, _ = await dispatch_mod._resolve_unit_managed_notify_gate(
+        "u-lead", ws_id, auto, target="feishu:user:ou_lead"
+    )
+    assert (g_ok3, g_reason3) == (False, "workspace_unreadable")
+
+    # Item 13: stamped_unit_version change rejects both initial dispatch and retry as unit_binding_changed
+    req_ws_mock.side_effect = None
+    g_ok4, g_reason4, _, g_chats4 = await dispatch_mod._resolve_unit_managed_notify_gate(
+        "u-lead",
+        ws_id,
+        auto,
+        stamped_unit_id="u-unit-1",
+        stamped_unit_version=datetime(2026, 11, 19, 12, 0, 0, tzinfo=timezone.utc),
+    )
+    assert (g_ok4, g_reason4, g_chats4) == (False, "unit_binding_changed", False)
+    g_ok5, g_reason5, _, g_chats5 = await dispatch_mod._resolve_unit_managed_notify_gate(
+        "u-lead",
+        ws_id,
+        auto,
+        stamped_unit_id="u-unit-1",
+        stamped_unit_version=unit_version,
+    )
+    assert (g_ok5, g_reason5, g_chats5) == (True, None, False)

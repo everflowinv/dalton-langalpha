@@ -21,6 +21,7 @@ from psycopg.rows import dict_row
 from src.dalton.notify.channel_transport import UNCERTAIN_NOTIFY_ERROR_CODES
 from src.dalton.notify.dispatch import (
     _default_notify_admin,
+    _resolve_unit_managed_notify_gate,
     _split_target_channel,
     dalton_kind_for_stored_category,
     evaluate_user_notify_eligibility,
@@ -340,10 +341,39 @@ async def _eligibility(
         return False, "target_removed"
 
     automation = _automation_view(row, payload)
+    gate_ws = str(payload.get("workspace_id") or "").strip()
+    auto_id_clean = str(row.get("automation_id") or "").strip()
+    if not gate_ws and cur is not None and auto_id_clean:
+        try:
+            UUID(auto_id_clean)
+        except ValueError:
+            auto_id_clean = ""
+        if auto_id_clean:
+            await cur.execute(
+                "SELECT workspace_id::text FROM automations WHERE automation_id = %s::uuid",
+                (auto_id_clean,),
+            )
+            a_ws_row = await cur.fetchone()
+            if isinstance(a_ws_row, Mapping):
+                gate_ws = str(a_ws_row.get("workspace_id") or "").strip()
+    if gate_ws and isinstance(automation, dict):
+        automation["workspace_id"] = gate_ws
+    gate_ok, gate_reason, _, gate_include_chats = await _resolve_unit_managed_notify_gate(
+        user_id,
+        gate_ws,
+        automation,
+        stamped_unit_id=str(payload.get("coverage_unit_id") or "").strip(),
+        stamped_unit_version=payload.get("coverage_unit_version"),
+        target=target,
+        conn=getattr(cur, "connection", None) if cur is not None else None,
+    )
+    if not gate_ok:
+        return False, gate_reason
     allowed, reason, _targets = await evaluate_user_notify_eligibility(
         user_id,
         automation,
         target=target,
+        include_chat_targets=gate_include_chats,
         resolve_enabled_fn=resolve_enabled_fn,
         resolve_overrides_fn=resolve_overrides_fn,
         resolve_targets_fn=resolve_targets_fn,

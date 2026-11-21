@@ -38,7 +38,14 @@ from src.dalton.autonomy.probes.cnhk import (
     normalize_cn_ticker,
     normalize_hk_ticker,
 )
-from src.dalton.coverage.identity import resolve_workspace_coverage_identity
+from src.dalton.coverage.identity import (
+    KIND_UNCLASSIFIED,
+    SOURCE_HISTORICAL_DUPLICATE,
+    WorkspaceCoverageIdentity,
+    is_historical_duplicate_workspace,
+    normalize_ticker_key,
+    resolve_workspace_coverage_identity,
+)
 from src.dalton.settings import is_coverage_units_enabled
 
 logger = logging.getLogger(__name__)
@@ -70,10 +77,9 @@ def _param_ticker(params: dict[str, Any]) -> str | None:
 
 
 def _ticker_key(ticker: str | None) -> str | None:
-    """比较用规范键，复用 cn/hk 探针的现成归一（第 2 轮审查 3）：
-    A 股统一 ``DDDDDD.{SS|SZ|BJ}``（裸 6 位码按代码段推断交易所，.SH 折成
-    .SS），港股统一 5 位数字（``700`` / ``0700.HK`` / ``00700`` 同键），其
-    余市场原样大写。"""
+    """比较用规范键：开关开启时委托共享 `normalize_ticker_key`，关闭时保持基线 CN/HK 归一。"""
+    if is_coverage_units_enabled():
+        return normalize_ticker_key(ticker)
     cleaned = str(ticker or "").strip().upper()
     if not cleaned:
         return None
@@ -174,6 +180,11 @@ async def _resolve_workspace_company(
     ws = await get_workspace(workspace_id, conn=conn)
     if ws is None:
         return None, False
+    if is_coverage_units_enabled() and is_historical_duplicate_workspace(ws):
+        return (
+            WorkspaceCoverageIdentity(KIND_UNCLASSIFIED, SOURCE_HISTORICAL_DUPLICATE),
+            False,
+        )
     ws_id = str(ws.get("workspace_id") or "").strip()
 
     units_by_ws: dict[str, dict[str, Any]] = {}
@@ -232,29 +243,63 @@ async def find_company_workspaces(
 
     from psycopg.rows import dict_row
 
-    from src.dalton.autonomy.units_view import load_dalton_automations_by_user
+    from src.dalton.autonomy.units_view import (
+        load_colleague_workspace_access,
+        load_dalton_automations_by_user,
+    )
     from src.dalton.database.coverage_units import load_active_units_by_workspace
     from src.server.database.pool import get_db_connection
+
+    units_enabled = is_coverage_units_enabled()
+    colleague_access: dict[str, tuple[bool, bool]] = {}
+    colleague_readable_ids: list[str] = []
+    if units_enabled:
+        colleague_access = await load_colleague_workspace_access(uid)
+        colleague_readable_ids = [
+            ws_id for ws_id, (web_readable, _) in colleague_access.items() if web_readable
+        ]
 
     async with get_db_connection(conn) as c:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
-                SELECT workspace_id, user_id, name, status
+                SELECT workspace_id, user_id, name, status, config
                 FROM workspaces
                 WHERE status <> 'deleted' AND user_id = %s
                 ORDER BY name ASC
                 """,
                 (uid,),
             )
-            ws_rows = [dict(r) for r in await cur.fetchall()]
+            ws_rows = [
+                {**dict(r), "delegatable": True}
+                for r in await cur.fetchall()
+                if not units_enabled or not is_historical_duplicate_workspace(r)
+            ]
+            if colleague_readable_ids:
+                own_ids = {str(r["workspace_id"]) for r in ws_rows}
+                extra_ids = [wid for wid in colleague_readable_ids if wid not in own_ids]
+                if extra_ids:
+                    await cur.execute(
+                        """
+                        SELECT workspace_id, user_id, name, status, config
+                        FROM workspaces
+                        WHERE status <> 'deleted' AND workspace_id = ANY(%s::uuid[])
+                        ORDER BY name ASC
+                        """,
+                        (extra_ids,),
+                    )
+                    for r in await cur.fetchall():
+                        if not units_enabled or not is_historical_duplicate_workspace(r):
+                            r_id = str(r["workspace_id"])
+                            can_dispatch = bool(colleague_access.get(r_id, (False, False))[1])
+                            ws_rows.append({**dict(r), "delegatable": can_dispatch})
             if not ws_rows:
                 return []
             ids = [str(r["workspace_id"]) for r in ws_rows]
 
             # 开关关闭时传空 dict（"调用方已决定：无单元"），解析器即不读注册表。
             units_by_ws: dict[str, dict[str, Any]] = {}
-            if is_coverage_units_enabled():
+            if units_enabled:
                 units_by_ws = await load_active_units_by_workspace(ids, conn=c)
 
             autos_by_user = await load_dalton_automations_by_user(cur, uid)
@@ -336,9 +381,14 @@ async def resolve_launch_company_routing(
     current_ws = str(cfg.get("workspace_id") or "").strip()
     wanted = _ticker_key(ticker)
 
+    is_historical_dup = False
     try:
         if current_ws:
             identity, is_sector = await _resolve_workspace_company(current_ws)
+            is_historical_dup = bool(
+                identity is not None
+                and identity.source == SOURCE_HISTORICAL_DUPLICATE
+            )
             if (
                 identity is not None
                 and identity.is_company
@@ -348,16 +398,11 @@ async def resolve_launch_company_routing(
                 # 当前工作区就是这家公司的工作区（哪怕属主是共享它的同事）。
                 _guard_workspace_dir(params, ticker, workspace_root)
                 return None
-        matches = [
-            ws
-            for ws in await find_company_workspaces(user_id, ticker)
-            if str(ws.get("workspace_id") or "") != current_ws
-        ]
     except CompanyRoutingRefused:
         raise
     except Exception as error:
         logger.warning(
-            "company routing lookup failed; launch proceeds unchecked "
+            "company routing current-workspace lookup failed; launch proceeds unchecked "
             "(ticker=%s, workflow=%s)",
             ticker,
             workflow,
@@ -365,9 +410,57 @@ async def resolve_launch_company_routing(
         )
         return None
 
-    if matches:
-        raise CompanyRoutingRefused(_refuse_message(ticker, matches[0]))
+    try:
+        matches = [
+            ws
+            for ws in await find_company_workspaces(user_id, ticker)
+            if str(ws.get("workspace_id") or "") != current_ws
+        ]
+    except Exception as error:
+        logger.warning(
+            "company routing lookup failed; %s (ticker=%s, workflow=%s)",
+            "refusing historical duplicate launch" if is_historical_dup else "launch proceeds unchecked",
+            ticker,
+            workflow,
+            exc_info=error,
+        )
+        if is_historical_dup:
+            raise CompanyRoutingRefused(
+                f"当前工作区是历史副本，不能直接启动 {ticker} 的公司级研究："
+                "请切换到正式工作区或新建工作区后再运行。"
+            ) from error
+        return None
+
+    executable_matches = [m for m in matches if m.get("delegatable", True)]
+    if executable_matches:
+        raise CompanyRoutingRefused(_refuse_message(ticker, executable_matches[0]))
+    readonly_matches = [m for m in matches if not m.get("delegatable", True)]
+    if is_historical_dup:
+        if readonly_matches:
+            ro_name = str(
+                readonly_matches[0].get("name")
+                or readonly_matches[0].get("workspace_id")
+                or ""
+            )
+            raise CompanyRoutingRefused(
+                f"当前工作区是历史副本，不能直接启动 {ticker} 的公司级研究："
+                f"可查看同事共享的只读工作区「{ro_name}」，或新建/切换到正式工作区后再运行。"
+            )
+        raise CompanyRoutingRefused(
+            f"当前工作区是历史副本，不能直接启动 {ticker} 的公司级研究："
+            "请切换到正式工作区或新建工作区后再运行。"
+        )
     _guard_workspace_dir(params, ticker, workspace_root)
+    if readonly_matches:
+        ro_name = str(
+            readonly_matches[0].get("name")
+            or readonly_matches[0].get("workspace_id")
+            or ""
+        )
+        return (
+            f"注意：同事共享了 {ticker} 的只读工作区「{ro_name}」（不可跨工作区委派），"
+            "本次产物仍会留在当前工作区。"
+        )
     return f"注意：{ticker} 还没有自己的工作区，本次产物会留在当前工作区。"
 
 
@@ -403,9 +496,14 @@ async def routing_hint_for_check(
     current_ws = str(workspace_id or "").strip()
     wanted = _ticker_key(ticker)
 
+    is_historical_dup = False
     try:
         if current_ws:
             identity, is_sector = await _resolve_workspace_company(current_ws)
+            is_historical_dup = bool(
+                identity is not None
+                and identity.source == SOURCE_HISTORICAL_DUPLICATE
+            )
             if (
                 identity is not None
                 and identity.is_company
@@ -413,6 +511,16 @@ async def routing_hint_for_check(
                 and _ticker_key(identity.ticker) == wanted
             ):
                 return _dir_hint(params, workspace_root)
+    except Exception as error:
+        logger.warning(
+            "company routing current-workspace lookup failed; check proceeds without routing "
+            "hint (ticker=%s)",
+            ticker,
+            exc_info=error,
+        )
+        return None
+
+    try:
         matches = [
             ws
             for ws in await find_company_workspaces(user_id, ticker)
@@ -420,20 +528,46 @@ async def routing_hint_for_check(
         ]
     except Exception as error:
         logger.warning(
-            "company routing lookup failed; check proceeds without routing "
-            "hint (ticker=%s)",
+            "company routing lookup failed; %s (ticker=%s)",
+            "returning historical duplicate hint" if is_historical_dup else "check proceeds without routing hint",
             ticker,
             exc_info=error,
         )
+        if is_historical_dup:
+            return (
+                f"路由不符：当前工作区是历史副本，不应保留 {ticker} 的公司级研究产物，"
+                "请切换到正式工作区或新建工作区后再运行。"
+            )
         return None
 
-    if matches:
-        name = str(matches[0].get("name") or matches[0].get("workspace_id") or "")
+    executable_matches = [m for m in matches if m.get("delegatable", True)]
+    if executable_matches:
+        name = str(
+            executable_matches[0].get("name")
+            or executable_matches[0].get("workspace_id")
+            or ""
+        )
         return (
             f"路由不符：本工作区不是 {ticker} 的工作区，按本工作区找文件必然缺项——"
             f"{ticker} 的研究应该在「{name}」里做。请让用户切换到那个工作区重跑，"
             "或从研究总监（Home）把任务交给那个工作区的分析师；"
             "不要用相对路径把产物写到其他工作区的目录（自动跟踪与完成核对都只认当前工作区）。"
+        )
+    if is_historical_dup:
+        readonly_matches = [m for m in matches if not m.get("delegatable", True)]
+        if readonly_matches:
+            ro_name = str(
+                readonly_matches[0].get("name")
+                or readonly_matches[0].get("workspace_id")
+                or ""
+            )
+            return (
+                f"路由不符：当前工作区是历史副本，不应保留 {ticker} 的公司级研究产物——"
+                f"同事共享了只读工作区「{ro_name}」，请切换到正式工作区或新建工作区后再运行。"
+            )
+        return (
+            f"路由不符：当前工作区是历史副本，不应保留 {ticker} 的公司级研究产物，"
+            "请切换到正式工作区或新建工作区后再运行。"
         )
     return _dir_hint(params, workspace_root)
 

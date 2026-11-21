@@ -388,7 +388,33 @@ async def _delivery_workspace(user_id: str, workspace_id: Optional[UUID]) -> Opt
     if workspace_id is None:
         return None
     workspace = await get_workspace(str(workspace_id))
-    require_workspace_owner(workspace, user_id=user_id)
+    # DALTON-HOOK(coverage-units): allow delivery workspace with web write access only when units & auth enabled
+    ws_owner = str((workspace or {}).get("user_id") or "").strip()
+    if workspace is not None and ws_owner == str(user_id):
+        require_workspace_owner(workspace, user_id=user_id)
+    else:
+        from src.dalton.settings import (
+            is_coverage_units_enabled,
+            is_dalton_supabase_auth_enabled,
+        )
+        from src.dalton.sharing import (
+            ColleagueAccessRevokedError,
+            require_workspace_access,
+        )
+
+        if is_coverage_units_enabled() and is_dalton_supabase_auth_enabled():
+            try:
+                await require_workspace_access(
+                    str(workspace_id),
+                    user_id,
+                    channel="web",
+                    need="write",
+                    workspace=workspace,
+                )
+            except ColleagueAccessRevokedError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+        else:
+            require_workspace_owner(workspace, user_id=user_id)
     return None if is_home_row(workspace) else str(workspace_id)
 
 

@@ -9,15 +9,22 @@ from zoneinfo import ZoneInfo
 
 from psycopg.rows import dict_row
 
+from src.dalton.access_tiers import is_internal_or_admin
 from src.dalton.autonomy.due import ticker_market_timezone, validation_is_due
 from src.dalton.autonomy.units_view import (
+    _repeatable_read_conn,
+    _savepoint,
     build_units_view,
+    load_colleague_workspace_access,
     load_dalton_automations_by_user,
 )
 from src.dalton.budget.service import get_budget_today
 from src.dalton.company_identity import is_company_system_user
 from src.dalton.coverage import get_company_coverage, get_user_coverage, infer_market
-from src.dalton.coverage.identity import resolve_workspace_coverage_identity
+from src.dalton.coverage.identity import (
+    is_historical_duplicate_workspace,
+    resolve_workspace_coverage_identity,
+)
 from src.dalton.database.coverage_units import load_active_units_by_workspace
 from src.dalton.settings import get_dalton_settings, is_coverage_units_enabled
 from src.server.database.pool import get_db_connection
@@ -357,19 +364,23 @@ async def build_coverage_board(
     pending_approvals: list[dict[str, Any]] = []
     pm_handoffs: list[dict[str, Any]] = []
     raw_candidates: list[dict[str, Any]] = []
-    # 行业层 P2：开关开启时看板额外给出 units（覆盖单元视图）；关闭时保持
-    # None——输出键、查询路径与 upstream 完全一致。
+    # 行业层 P2：开关开启且调用者为 internal/admin（或系统路径）时看板额外给出 units；
+    # 关闭或 external 用户时保持 None，避免绕过权限门控。
     units: list[dict[str, Any]] | None = None
-    if is_coverage_units_enabled():
+    if is_coverage_units_enabled() and (
+        user_id is None
+        or is_company_system_user(user_id)
+        or await is_internal_or_admin(user_id)
+    ):
         units = []
 
     try:
-        async with get_db_connection() as conn:
+        async with _repeatable_read_conn(get_conn=get_db_connection) as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
                 if user_id is not None:
                     await cur.execute(
                         """
-                        SELECT workspace_id, user_id, name, description, status, updated_at
+                        SELECT workspace_id, user_id, name, description, status, updated_at, config
                         FROM workspaces
                         WHERE status <> 'deleted' AND user_id = %s
                         ORDER BY name ASC
@@ -379,23 +390,83 @@ async def build_coverage_board(
                 else:
                     await cur.execute(
                         """
-                        SELECT workspace_id, user_id, name, description, status, updated_at
+                        SELECT workspace_id, user_id, name, description, status, updated_at, config
                         FROM workspaces
                         WHERE status <> 'deleted'
                         ORDER BY name ASC
                         """
                     )
-                ws_rows = await cur.fetchall()
+                units_enabled = is_coverage_units_enabled()
+                ws_rows = [
+                    r
+                    for r in await cur.fetchall()
+                    if not units_enabled or not is_historical_duplicate_workspace(r)
+                ]
+
+                if user_id is not None and units is not None:
+                    try:
+                        async with _savepoint(conn):
+                            colleague_access = await load_colleague_workspace_access(
+                                user_id, conn=conn
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "[DALTON_BOARD] colleague access lookup failed: %s", exc
+                        )
+                        colleague_access = {}
+                    readable_colleague_ws = [
+                        wid
+                        for wid, (web_readable, _) in colleague_access.items()
+                        if web_readable
+                    ]
+                    if readable_colleague_ws:
+                        try:
+                            async with _savepoint(conn):
+                                await cur.execute(
+                                    """
+                                    SELECT w.workspace_id, w.user_id, w.name, w.description,
+                                           w.status, w.updated_at, w.config
+                                    FROM dalton_coverage_units u
+                                    JOIN workspaces w ON w.workspace_id = u.workspace_id
+                                    WHERE u.status = 'active'
+                                      AND COALESCE(u.lead_analyst_user_id, u.owner_user_id) = %s
+                                      AND w.workspace_id = ANY(%s::uuid[])
+                                      AND w.status <> 'deleted'
+                                      AND w.user_id <> %s
+                                    ORDER BY w.name ASC
+                                    """,
+                                    (user_id, readable_colleague_ws, user_id),
+                                )
+                                seen_ws_ids = {str(r["workspace_id"]) for r in ws_rows}
+                                for lr in await cur.fetchall():
+                                    lws = str(lr["workspace_id"])
+                                    if (
+                                        lws not in seen_ws_ids
+                                        and (
+                                            not units_enabled
+                                            or not is_historical_duplicate_workspace(lr)
+                                        )
+                                    ):
+                                        ws_rows.append(lr)
+                                        seen_ws_ids.add(lws)
+                        except Exception as exc:
+                            logger.warning(
+                                "[DALTON_BOARD] lead colleague workspace lookup failed: %s",
+                                exc,
+                            )
+
                 user_ws_ids = {str(r["workspace_id"]) for r in ws_rows}
 
                 # 行业层 P0：开关打开时一次性取每个工作区绑定的 active 单元；
-                # 关闭时不发这条查询。
+                # 关闭时不发这条查询。放在 savepoint 内，防止 SQL 异常拖垮外层
+                # REPEATABLE READ 事务。
                 units_by_ws: dict[str, dict[str, Any]] = {}
                 if ws_rows and is_coverage_units_enabled():
                     try:
-                        units_by_ws = await load_active_units_by_workspace(
-                            [str(r["workspace_id"]) for r in ws_rows], conn=conn
-                        )
+                        async with _savepoint(conn):
+                            units_by_ws = await load_active_units_by_workspace(
+                                [str(r["workspace_id"]) for r in ws_rows], conn=conn
+                            )
                     except Exception as exc:
                         logger.warning(
                             "[DALTON_BOARD] coverage unit lookup failed: %s", exc
@@ -410,9 +481,10 @@ async def build_coverage_board(
                 autos_by_user: dict[str, list[dict[str, Any]]] = {}
                 try:
                     if ws_rows:
-                        autos_by_user = await load_dalton_automations_by_user(
-                            cur, user_id
-                        )
+                        async with _savepoint(conn):
+                            autos_by_user = await load_dalton_automations_by_user(
+                                cur, user_id
+                            )
                 except Exception as exc:
                     logger.warning(
                         "[DALTON_BOARD] dalton automation preload failed: %s", exc
@@ -535,6 +607,14 @@ async def build_coverage_board(
                             watch_state_by_ws[str(wr["workspace_id"])] = dict(wr["state"])
                 except Exception:
                     watch_state_by_ws = {}
+
+            # 行业层 P2：units 覆盖单元视图与看板其它表查询共用同一 REPEATABLE READ 快照，
+            # 在归还 conn 前完成构建。
+            if units is not None:
+                try:
+                    units.extend(await build_units_view(user_id, autos_by_user, conn=conn))
+                except Exception as exc:
+                    logger.warning("[DALTON_BOARD] units view build failed: %s", exc)
 
         kv_by_ws: dict[str, dict[str, dict[str, Any]]] = {}
         for r in kv_rows:
@@ -900,16 +980,6 @@ async def build_coverage_board(
                     ),
                 }
             )
-
-        # 行业层 P2：units 覆盖单元视图。开关关闭时本块整体不执行——
-        # 不查 dalton_coverage_units / dalton_sector_members，输出不带
-        # units 键。枚举、同事可见性与成员渲染都在 units_view（P4 抽出，
-        # 与覆盖视图的 HTTP API 共享同一实现），board 只捕获失败降级。
-        if units is not None:
-            try:
-                units.extend(await build_units_view(user_id, autos_by_user))
-            except Exception as exc:
-                logger.warning("[DALTON_BOARD] units view build failed: %s", exc)
     except Exception as e:
         logger.warning("[DALTON_BOARD] DB query fallback: %s", e)
 

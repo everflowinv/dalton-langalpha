@@ -1852,6 +1852,165 @@ class TestDeleteWorkspace:
         wm._remove_workspace_folder.assert_not_awaited()
         wm._teardown_machine.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    @cm_patch("db_get_workspace", new_callable=AsyncMock)
+    async def test_a_workspace_bound_to_active_coverage_unit_is_refused_before_commands_end(
+        self, mock_db_get, _no_active_coverage_unit, monkeypatch
+    ):
+        """DALTON-HOOK(coverage-units): refuse soft-delete before ending commands when bound to an active coverage unit."""
+        from unittest.mock import create_autospec
+        from src.server.database.workspace import (
+            ACTIVE_COVERAGE_UNIT_DELETE_REFUSAL,
+            WorkspaceBoundToCoverageUnitError,
+        )
+        from src.server.services.commands.control import end_workspace_commands
+        from src.server.services.workspace_manager import (
+            db_delete_workspace as real_db_delete_workspace,
+        )
+
+        monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "true")
+        ws_id = str(uuid.uuid4())
+        mock_db_get.return_value = _make_workspace(
+            workspace_id=ws_id, status="running", dir_name="test-ab12"
+        )
+        wm = WorkspaceManager(_make_config())
+        wm.backup_project_files = create_autospec(wm.backup_project_files)
+        _no_active_coverage_unit.return_value = True
+        end_commands = create_autospec(end_workspace_commands)
+        mock_db_delete = create_autospec(real_db_delete_workspace)
+
+        with (
+            patch(f"{_WORKSPACE_MANAGER}.db_delete_workspace", mock_db_delete),
+            patch(
+                "src.server.services.commands.control.end_workspace_commands",
+                end_commands,
+            ),
+        ):
+            with pytest.raises(
+                WorkspaceBoundToCoverageUnitError,
+                match=ACTIVE_COVERAGE_UNIT_DELETE_REFUSAL,
+            ):
+                await wm.delete_workspace(ws_id)
+
+        _no_active_coverage_unit.assert_awaited_once_with(ws_id)
+        end_commands.assert_not_awaited()
+        wm.backup_project_files.assert_not_awaited()
+        mock_db_delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @cm_patch("db_get_workspace", new_callable=AsyncMock)
+    async def test_delete_skips_coverage_unit_guard_when_flag_off(
+        self, mock_db_get, _no_active_coverage_unit, monkeypatch
+    ):
+        """DALTON-HOOK(coverage-units): when coverage units are disabled, delete does not query dalton_coverage_units."""
+        from unittest.mock import create_autospec
+        from src.server.services.commands.control import end_workspace_commands
+        from src.server.services.workspace_manager import (
+            db_delete_workspace as real_db_delete_workspace,
+        )
+
+        monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "false")
+        ws_id = str(uuid.uuid4())
+        mock_db_get.return_value = _make_workspace(
+            workspace_id=ws_id, status="running", dir_name="test-ab12"
+        )
+        wm = WorkspaceManager(_make_config())
+        wm.backup_project_files = create_autospec(wm.backup_project_files, return_value=True)
+        wm._retire_machine_if_empty = create_autospec(wm._retire_machine_if_empty, return_value=False)
+        _no_active_coverage_unit.return_value = True
+        end_commands = create_autospec(end_workspace_commands)
+        mock_db_delete = create_autospec(real_db_delete_workspace, return_value=True)
+
+        with (
+            patch(f"{_WORKSPACE_MANAGER}.db_delete_workspace", mock_db_delete),
+            patch(
+                "src.server.services.commands.control.end_workspace_commands",
+                end_commands,
+            ),
+        ):
+            assert await wm.delete_workspace(ws_id) is True
+
+        _no_active_coverage_unit.assert_not_awaited()
+        mock_db_delete.assert_awaited_once()
+        end_commands.assert_awaited_once_with(ws_id)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_bind_detected_in_db_delete_tx_refuses_and_skips_retire(
+        self, _no_active_coverage_unit
+    ):
+        """DALTON-HOOK(coverage-units): if a concurrent bind lands after pre-check, db_delete_workspace raises WorkspaceBoundToCoverageUnitError under FOR UPDATE and never retires or deletes the folder."""
+        from typing import Any
+        from unittest.mock import create_autospec
+        from src.server.database.workspace import WorkspaceBoundToCoverageUnitError
+        from src.server.database.workspace import get_workspace as real_db_get_workspace
+        from src.server.services.commands.control import end_workspace_commands
+        from src.server.services.workspace_manager import (
+            db_delete_workspace as real_db_delete_workspace,
+        )
+
+        call_order: list[str] = []
+        ws_id = str(uuid.uuid4())
+        mock_db_get = create_autospec(
+            real_db_get_workspace,
+            return_value=_make_workspace(
+                workspace_id=ws_id, status="running", dir_name="test-ab12"
+            ),
+        )
+        wm = WorkspaceManager(_make_config())
+        orig_backup = wm.backup_project_files
+
+        async def _fake_backup(
+            target_ws_id: str,
+            *,
+            computer_id: str | None = None,
+            strict: bool = False,
+            expected_sandbox_id: str | None = None,
+            session: Any = None,
+            layout: Any = None,
+            held_folder: str | None = None,
+            routine: bool = False,
+        ) -> bool:
+            call_order.append("backup")
+            return True
+
+        async def _fake_end_cmds(target_ws_id: str) -> None:
+            call_order.append("end_commands")
+
+        async def _fake_db_delete(
+            target_ws_id: str,
+            conn=None,
+            *,
+            bound_to: str | None = None,
+            keep_folder: bool = False,
+        ) -> bool:
+            call_order.append("db_delete")
+            raise WorkspaceBoundToCoverageUnitError()
+
+        wm.backup_project_files = create_autospec(orig_backup, side_effect=_fake_backup)
+        wm._retire_machine_if_empty = create_autospec(wm._retire_machine_if_empty)
+        wm._remove_workspace_folder = create_autospec(wm._remove_workspace_folder)
+        _no_active_coverage_unit.return_value = False
+        end_commands = create_autospec(end_workspace_commands, side_effect=_fake_end_cmds)
+        mock_db_delete = create_autospec(
+            real_db_delete_workspace,
+            side_effect=_fake_db_delete,
+        )
+
+        with (
+            cm_patch("db_get_workspace", new=mock_db_get),
+            patch(f"{_WORKSPACE_MANAGER}.db_delete_workspace", mock_db_delete),
+            patch(
+                "src.server.services.commands.control.end_workspace_commands",
+                end_commands,
+            ),
+        ):
+            with pytest.raises(WorkspaceBoundToCoverageUnitError):
+                await wm.delete_workspace(ws_id)
+
+        assert call_order == ["end_commands", "backup", "db_delete"]
+        wm._retire_machine_if_empty.assert_not_awaited()
+        wm._remove_workspace_folder.assert_not_awaited()
+
 
 class TestDeleteOnASharedMachine:
     """Deleting a project takes the project, never the machine under a sibling.
@@ -2323,6 +2482,65 @@ class TestRemoveComputerWithWorkspaces:
         assert refused.value.code == "published_reports"
         assert refused.value.deleted == []
         self.wm.delete_workspace.assert_not_awaited()
+        self.wm.remove_computer.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_workspace_bound_to_coverage_unit_refuses_the_whole_removal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """DALTON-HOOK(coverage-units): pre-check inspects every workspace on the
+        computer; an unbound workspace before a bound workspace is NOT deleted."""
+        from unittest.mock import create_autospec
+        from src.dalton.database import coverage_units as cu_db
+        from src.server.services.computer_errors import ComputerRemovalRefused
+
+        monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "true")
+        with (
+            patch(
+                f"{_WORKSPACE_MANAGER}._has_active_coverage_unit",
+                create_autospec(
+                    cu_db.has_active_coverage_unit,
+                    side_effect=lambda ws_id: ws_id == "ws-b",
+                ),
+            ),
+            pytest.raises(ComputerRemovalRefused) as refused,
+        ):
+            await self._remove(["ws-a", "ws-b"], on=("ws-a", "ws-b"))
+
+        assert refused.value.code == "active_coverage_unit"
+        assert refused.value.deleted == []
+        self.wm.delete_workspace.assert_not_awaited()
+        self.wm.remove_computer.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_concurrent_coverage_unit_bind_mid_batch_stops_the_rest(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """DALTON-HOOK(coverage-units): with flag enabled, pre-check runs across all
+        workspaces, then if another tx binds a later workspace after pre-check, abort."""
+        from unittest.mock import create_autospec
+        from src.dalton.database import coverage_units as cu_db
+        from src.server.database.workspace import WorkspaceBoundToCoverageUnitError
+        from src.server.services.computer_errors import ComputerRemovalRefused
+
+        monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "true")
+        precheck = create_autospec(cu_db.has_active_coverage_unit, return_value=False)
+
+        async def _delete(workspace_id: str, **_: object) -> bool:
+            if workspace_id == "ws-b":
+                raise WorkspaceBoundToCoverageUnitError()
+            return True
+
+        self.wm.delete_workspace.side_effect = _delete
+        with (
+            patch(f"{_WORKSPACE_MANAGER}._has_active_coverage_unit", precheck),
+            pytest.raises(ComputerRemovalRefused) as refused,
+        ):
+            await self._remove(["ws-a", "ws-b"], on=("ws-a", "ws-b"))
+
+        assert precheck.await_count == 2
+        assert refused.value.code == "active_coverage_unit"
+        assert refused.value.deleted == ["ws-a"]
         self.wm.remove_computer.assert_not_awaited()
 
     @pytest.mark.asyncio

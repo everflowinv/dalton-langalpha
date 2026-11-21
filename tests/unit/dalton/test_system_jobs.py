@@ -3254,6 +3254,112 @@ async def test_data_task_rollback_follows_notify_storage_mode(
     assert listed_row["notify_routes"] == ["feishu:user:ou_admin1"]
 
 
+@pytest.mark.asyncio
+async def test_phase1_c2_and_row7_system_jobs_lead_discovery_toggle_and_run_now(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§3.2 Row 7 & C2 in system_jobs:
+    - _discover_company_workspaces includes bound company units where user is lead_analyst_user_id.
+    - toggle_system_job & run_system_job_now enforce active unit lead_analyst_user_id (allowing PM actor).
+    """
+    from contextlib import asynccontextmanager
+    from unittest.mock import create_autospec
+    from psycopg import AsyncConnection, AsyncCursor
+    from src.dalton import settings as dalton_settings
+    from src.dalton.autonomy import system_jobs as sj_mod
+    from src.dalton.database import coverage_units as cu_db
+
+    ws_id = "11111111-1111-1111-1111-111111111111"
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(sj_mod, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(sj_mod, "is_pm_user", lambda uid: str(uid) == "u-pm")
+
+    unit_row = {
+        "unit_id": "u-nvda",
+        "workspace_id": ws_id,
+        "owner_user_id": "u-owner",
+        "lead_analyst_user_id": "u-lead",
+        "kind": "company",
+        "status": "active",
+        "ticker": "NVDA",
+    }
+    monkeypatch.setattr(
+        cu_db,
+        "list_coverage_units",
+        create_autospec(cu_db.list_coverage_units, return_value=[unit_row]),
+    )
+    monkeypatch.setattr(
+        cu_db,
+        "get_active_unit_by_workspace",
+        create_autospec(cu_db.get_active_unit_by_workspace, return_value=unit_row),
+    )
+
+    # Mock empty workspaces query so only lead unit discovery contributes ws_id
+    cur = create_autospec(AsyncCursor, instance=True)
+    cur.fetchall.return_value = []
+
+    @asynccontextmanager
+    async def _cursor(**_kw):
+        yield cur
+
+    conn = create_autospec(AsyncConnection, instance=True)
+    conn.cursor.side_effect = _cursor
+
+    @asynccontextmanager
+    async def _pool_conn(c=None):
+        yield conn
+
+    monkeypatch.setattr(sj_mod, "get_db_connection", _pool_conn)
+    discovered = await sj_mod._discover_company_workspaces("u-lead", [])
+    assert ws_id in discovered
+
+    # C2: non-lead owner rejected on toggle & run_now; PM allowed as actor when owner=u-lead
+    monkeypatch.setattr(
+        sj_mod,
+        "_resolve_company_workspace_id",
+        create_autospec(sj_mod._resolve_company_workspace_id, return_value=ws_id),
+    )
+    with pytest.raises(PermissionError, match="u-lead"):
+        await sj_mod.toggle_system_job("u-owner", "company:NVDA", True, actor_user_id="u-owner")
+    with pytest.raises(PermissionError, match="u-lead"):
+        await sj_mod.run_system_job_now("u-owner", "company:NVDA", actor_user_id="u-owner")
+    with pytest.raises(PermissionError, match="PM"):
+        await sj_mod.run_system_job_now("u-lead", "company:NVDA", actor_user_id="u-colleague")
+
+    monkeypatch.setattr(
+        sj_mod,
+        "get_tracking_status",
+        create_autospec(
+            sj_mod.get_tracking_status,
+            return_value={"ticker": "NVDA", "status": "active", "tasks": []},
+        ),
+    )
+    monkeypatch.setattr(
+        sj_mod,
+        "list_all_user_automations",
+        create_autospec(
+            sj_mod.list_all_user_automations,
+            return_value=[
+                {
+                    "automation_id": "a-watch",
+                    "user_id": "u-lead",
+                    "name": "dalton-nvda-watch",
+                    "workspace_id": ws_id,
+                    "status": "active",
+                }
+            ],
+        ),
+    )
+    trig_mock = create_autospec(
+        sj_mod._trigger_automation_row_async,
+        return_value={"automation_id": "a-watch", "execution_id": "exec-pm"},
+    )
+    monkeypatch.setattr(sj_mod, "_trigger_automation_row_async", trig_mock)
+    pm_res = await sj_mod.run_system_job_now("u-lead", "company:NVDA", actor_user_id="u-pm")
+    assert pm_res["ok"] is True
+    assert pm_res["execution_id"] == "exec-pm"
+
+
 
 
 

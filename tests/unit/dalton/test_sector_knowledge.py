@@ -318,6 +318,7 @@ async def test_profile_resolution_follows_registry_and_flag(
     real_lookup = cu_db.get_active_unit_by_workspace
 
     # 开关关闭：公司 profile，注册表绝不被读。
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "0")
     def _fail_read(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("flag off must never read dalton_coverage_units")
 
@@ -341,6 +342,25 @@ async def test_profile_resolution_follows_registry_and_flag(
     fake_lookup3 = create_autospec(real_lookup, return_value=None)
     monkeypatch.setattr(cu_db, "get_active_unit_by_workspace", fake_lookup3)
     assert await resolve_workspace_profile(WS) == PROFILE_COMPANY
+
+
+@pytest.mark.asyncio
+async def test_resolve_workspace_profile_propagates_undefined_table_and_registry_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 7 Item 5: registry UndefinedTable propagates (fail-closed) rather than
+    silently degrading a sector workspace to PROFILE_COMPANY."""
+    from psycopg import errors as pg_errors
+    from src.dalton.database import coverage_units as cu_db
+
+    monkeypatch.setattr(profiles_mod, "is_coverage_units_enabled", lambda: True)
+    fake_lookup = create_autospec(
+        cu_db.get_active_unit_by_workspace,
+        side_effect=pg_errors.UndefinedTable('relation "dalton_coverage_units" does not exist'),
+    )
+    monkeypatch.setattr(cu_db, "get_active_unit_by_workspace", fake_lookup)
+    with pytest.raises(pg_errors.UndefinedTable):
+        await resolve_workspace_profile(WS)
 
 
 def test_doc_gating_and_refusal_messages() -> None:
@@ -696,9 +716,10 @@ async def test_company_workspace_unchanged_and_sector_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """开关关闭（默认）：公司 profile 全链路不变，sector 被明确拒绝。"""
-    # 开关默认关闭（conftest 不设环境变量）；再加一道防线：读注册表即失败。
+    # 开关关闭：公司 profile 全链路不变，sector 被明确拒绝。
     from src.dalton.database import coverage_units as cu_db
 
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "0")
     def _fail_read(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("flag off must never read dalton_coverage_units")
 
@@ -816,8 +837,10 @@ def test_rendered_map_covers_sector_and_watched_globs() -> None:
 @pytest.mark.asyncio
 async def test_company_rendering_unchanged_with_residual_sector_row(
     knowledge_store: dict[str, list[dict[str, Any]]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """codex r1 #3：开关关闭（公司 profile）时，库里残留的 sector 行不得改变公司渲染。"""
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "0")
     # 残留 sector 行：行业单元曾绑定此工作区后归档/开关关闭。
     knowledge_store["sector"] = [
         {

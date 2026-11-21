@@ -32,7 +32,7 @@ from src.server.database import automation as auto_db
 from src.server.database import automation_executions as exec_db
 from src.server.database.pool import get_db_connection
 from src.server.database.runs import outbox as outbox_db
-from src.server.models.automation import FailureReason, SkipReason
+from src.server.models.automation import ExecutionStatus, FailureReason, SkipReason
 from src.server.services import automation_delivery
 from src.server.services.account import read_standing
 from src.server.services.automation_excerpt import RunAnswer, plain_excerpt, read_run_answer
@@ -172,6 +172,8 @@ async def settle(
     check_run_state_in_lock: Optional[Literal["terminal", "completed_idle", "timeout"]] = None,
     # DALTON-HOOK(automation-subscription-fallback): restrict pre-START signal release to executor's synchronous failure settle
     release_pre_start_signals: bool = False,
+    # DALTON-HOOK(coverage-units): allow caller to narrow/specify source statuses without relaxing policy defaults
+    from_statuses: Optional[tuple[ExecutionStatus, ...]] = None,
 ) -> bool:
     """End a firing as ``outcome``; False when it was no longer in a state
     that outcome can end, because someone else settled it first.
@@ -226,7 +228,7 @@ async def settle(
     row = await exec_db.settle_execution(
         execution_id,
         automation_id=str(automation["automation_id"]),
-        from_statuses=policy.from_statuses,
+        from_statuses=from_statuses or policy.from_statuses,
         to=policy.status,
         strike=policy.strike,
         schedule=schedule_action(policy, automation, outcome=outcome, excerpt=excerpt),  # DALTON-HOOK(precheck-outcome)
@@ -373,6 +375,7 @@ async def _after_settling(
     if not deleted and outcome is Outcome.COMPLETED:
         from src.dalton.notify.dispatch import on_automation_settled
 
+        # DALTON-HOOK(coverage-units): forward execution-entry unit stamp and version to notify dispatch
         await on_automation_settled(
             automation=automation,
             execution_id=execution_id,
@@ -380,6 +383,8 @@ async def _after_settling(
             run_id=run_id,
             workspace_id=workspace_id,
             final_text=final_text or (row.get("result_excerpt") if isinstance(row, dict) else None),
+            coverage_unit_id=row.get("coverage_unit_id") if isinstance(row, dict) else None,
+            coverage_unit_version=row.get("coverage_unit_version") if isinstance(row, dict) else None,
         )
     if row["settled_from"] == "waiting" and thread_id:
         await publish_automation_wait(

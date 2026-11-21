@@ -82,7 +82,8 @@ async def resolve_workspace_profile(
 
     Flag off → ``company`` without reading the registry at all (today's
     behavior). Flag on → the ACTIVE unit bound to the workspace decides; a
-    missing table, a missing unit or a company unit all mean ``company``.
+    missing unit or a company unit means ``company``, while registry query
+    failures propagate so profile-specific doc writes fail closed.
     """
     wid = str(workspace_id or "").strip()
     if not wid or not is_coverage_units_enabled():

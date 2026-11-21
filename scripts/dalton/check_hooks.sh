@@ -428,6 +428,8 @@ ALLOWED_HOOKS=(
   # Firecrawl budget: skip stealth re-escalation after auto and keep 402 credit-exhaustion notice.
   "firecrawl-budget"
   "chat-attachment-count"
+  # Coverage units phase 1 (d041): soft-delete mutex against active unit bind.
+  "coverage-units"
   # Automation turns (executor first turn and automation notification turns)
   # fall back to user fallback_models when the primary subscription is
   # unavailable, record the notice in execution result_excerpt/delivery, and

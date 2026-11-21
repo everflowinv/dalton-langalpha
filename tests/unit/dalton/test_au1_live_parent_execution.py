@@ -201,3 +201,23 @@ async def test_system_job_fallback_uses_the_locked_helper(monkeypatch) -> None:
     orphan.assert_not_awaited()
     scheduler.dispatch.assert_called_once()
     assert scheduler.dispatch.call_args.args[0]["automation_id"] == AUTO
+
+
+@pytest.mark.asyncio
+async def test_live_parent_insert_uses_clock_timestamp_for_created_at(monkeypatch) -> None:
+    """Round 11 Item 2: run-now inserts record real write time with clock_timestamp()."""
+    parent = {"status": "paused", "deleted_at": None, "user_id": USER, "automation_id": AUTO}
+    conn = _install(monkeypatch, parent)
+    await exec_db.create_execution_for_live_parent(
+        AUTO, USER, datetime(2026, 11, 11, tzinfo=UTC), "server-1"
+    )
+    insert_sql = conn.cursor_obj.queries[1]
+    assert "INSERT INTO automation_executions" in insert_sql
+    assert "( automation_execution_id, automation_id, status, scheduled_at, server_id, created_at, heartbeat_at, checked_computer_id )" in insert_sql
+    assert "VALUES (%s, %s, 'pending', %s, %s, clock_timestamp(), NOW(), %s)" in insert_sql
+
+    orphan_conn = _install(monkeypatch, None)
+    await exec_db.create_execution(AUTO, datetime(2026, 11, 11, tzinfo=UTC), "server-1")
+    orphan_sql = orphan_conn.cursor_obj.queries[0]
+    assert "INSERT INTO automation_executions" in orphan_sql
+    assert "clock_timestamp()" not in orphan_sql

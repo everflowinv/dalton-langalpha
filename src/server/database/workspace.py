@@ -1663,6 +1663,18 @@ class WorkspaceHasPublishedReportsError(WorkspaceBusyError):
         super().__init__(message)
 
 
+# DALTON-HOOK(coverage-units): refuse soft-deleting a workspace bound to an active coverage unit.
+ACTIVE_COVERAGE_UNIT_DELETE_REFUSAL = "该工作区已绑定覆盖单元，请先解绑或归档后再删除。"
+
+
+class WorkspaceBoundToCoverageUnitError(WorkspaceBusyError):
+    """DALTON-HOOK(coverage-units): deletion is refused because the workspace
+    holds an active coverage unit binding."""
+
+    def __init__(self, message: str = ACTIVE_COVERAGE_UNIT_DELETE_REFUSAL) -> None:
+        super().__init__(message)
+
+
 class WorkspaceMovingError(SandboxTransientError):
     """Nothing reaches a workspace's folder while it moves to another computer.
 
@@ -1924,6 +1936,16 @@ async def delete_workspace(
 
                 if await has_published_reports(workspace_id, cur=cur):
                     raise WorkspaceHasPublishedReportsError()
+                # DALTON-HOOK(coverage-units): re-checked under the workspace row
+                # lock (FOR UPDATE) so a concurrent bind cannot race soft delete
+                # when coverage units are enabled.
+                from src.dalton.database.coverage_units import has_active_coverage_unit
+                from src.dalton.settings import is_coverage_units_enabled
+
+                if is_coverage_units_enabled() and await has_active_coverage_unit(
+                    workspace_id, cur=cur
+                ):
+                    raise WorkspaceBoundToCoverageUnitError()
                 # Exactly one of the two markers, whatever the row carried in.
                 await cur.execute(
                     """

@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import UTC, datetime
 from typing import Any
 
 from psycopg.rows import dict_row
 
 from src.dalton.autonomy.schedule import (
+    _prelock_unit_workspace,
     build_company_watch_specs,
     build_sector_watch_specs,
     list_all_user_automations,
@@ -73,14 +77,87 @@ def _extract_ticker_from_text(raw: str | None) -> str | None:
     return _impl(raw)
 
 
+async def resolve_workspace_tracking_owner(
+    workspace_id: str,
+    workspace: Mapping[str, Any] | None = None,
+    *,
+    conn: Any = None,
+    unit: Mapping[str, Any] | None = None,
+) -> str:
+    """Resolve effective task owner for ``workspace_id``: ``COALESCE(unit.lead_analyst_user_id, ws.user_id)``."""
+    from src.dalton.settings import is_coverage_units_enabled
+
+    ws_id = str(workspace_id or "").strip()
+    if not ws_id:
+        return ""
+
+    if unit is not None:
+        lead_uid = str(
+            unit.get("lead_analyst_user_id")
+            or unit.get("owner_user_id")
+            or ""
+        ).strip()
+        if lead_uid:
+            return lead_uid
+    elif is_coverage_units_enabled():
+        from src.dalton.database.coverage_units import get_active_unit_by_workspace
+
+        try:
+            resolved_unit = await get_active_unit_by_workspace(ws_id, conn=conn)
+        except RuntimeError as exc:
+            if "database pool is not open" not in str(exc):
+                raise
+            resolved_unit = None
+        if resolved_unit is not None:
+            lead_uid = str(
+                resolved_unit.get("lead_analyst_user_id")
+                or resolved_unit.get("owner_user_id")
+                or ""
+            ).strip()
+            if lead_uid:
+                return lead_uid
+
+    ws_row = dict(workspace) if isinstance(workspace, Mapping) else await ws_db.get_workspace(ws_id, conn=conn)
+    return str((ws_row or {}).get("user_id") or "").strip()
+
+
 async def resolve_workspace_id_by_ticker(ticker: str, user_id: str) -> str | None:
-    """Resolve workspace_id for ``ticker`` and ``user_id`` (following ``bootstrap_watch._resolve_workspace_id``)."""
+    """Resolve workspace_id for ``ticker`` and ``user_id`` (prioritizing active units led by ``user_id``)."""
+    from src.dalton.settings import is_coverage_units_enabled
+
     t_upper = str(ticker or "").strip().upper()
     uid = str(user_id or "").strip()
     if not t_upper or not uid:
         return None
     try:
         async with get_db_connection() as conn, conn.cursor() as cur:
+            if is_coverage_units_enabled():
+                from src.dalton.database.coverage_units import normalize_ticker_key
+
+                t_key = normalize_ticker_key(t_upper) or t_upper
+                await cur.execute(
+                    """
+                        SELECT u.workspace_id::text
+                        FROM dalton_coverage_units u
+                        JOIN workspaces w ON w.workspace_id = u.workspace_id
+                        WHERE u.status = 'active'
+                          AND u.kind = 'company'
+                          AND u.workspace_id IS NOT NULL
+                          AND COALESCE(NULLIF(BTRIM(u.lead_analyst_user_id), ''), u.owner_user_id) = %s
+                          AND (
+                              UPPER(BTRIM(COALESCE(u.ticker, ''))) = %s
+                              OR UPPER(BTRIM(COALESCE(u.ticker_key, ''))) = %s
+                          )
+                          AND w.status <> 'deleted'
+                        ORDER BY u.updated_at DESC NULLS LAST, w.created_at DESC
+                        LIMIT 1
+                        """,
+                    (uid, t_upper, t_key.upper()),
+                )
+                unit_row = await cur.fetchone()
+                if unit_row and unit_row[0]:
+                    return str(unit_row[0])
+
             await cur.execute(
                 """
                     SELECT workspace_id::text
@@ -203,6 +280,8 @@ async def resolve_workspace_id_by_ticker_any_owner(
 async def _resolve_workspace_ticker(
     workspace_id: str,
     existing_rows: list[dict[str, Any]] | None = None,
+    *,
+    registered_units: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> str:
     """Resolve the uppercase company ticker for a workspace, or raise.
 
@@ -224,6 +303,7 @@ async def _resolve_workspace_ticker(
 
     identity = await resolve_workspace_coverage_identity(
         ws if ws is not None else {"workspace_id": str(workspace_id)},
+        registered_units=registered_units,
         automations=existing_rows,
     )
     if identity.is_home:
@@ -272,6 +352,24 @@ def _replaced_by_tracker(row: dict[str, Any] | None) -> str | None:
         return None
     text = raw.strip()
     return text or None
+
+
+def _is_expired_once_row(row: Mapping[str, Any]) -> bool:
+    if str(row.get("trigger_type") or "").strip().lower() != "once":
+        return False
+    when = row.get("next_run_at")
+    if when is None:
+        return True
+    if isinstance(when, str):
+        try:
+            when = datetime.fromisoformat(when.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return True
+    if not isinstance(when, datetime):
+        return False
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return when <= datetime.now(UTC)
 
 
 def _derive_status_and_details(
@@ -341,6 +439,7 @@ def _derive_status_and_details(
     ) or any(
         isinstance(r.get("metadata"), dict)
         and bool(r["metadata"].get("paused_by_user"))
+        and not _is_expired_once_row(r)
         and not (replaced_marker and str(r.get("name") or "").strip() == delta_name)
         for r in company_rows
     )
@@ -420,35 +519,140 @@ def _derive_status_and_details(
     return details
 
 
+def _merge_unit_managed_rows(
+    base_rows: list[dict[str, Any]],
+    *,
+    candidates: Sequence[Any],
+    workspace_id: str,
+    unit: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Merge unit-managed rows (earnings ticker aliases, renamed `unit_id` rows) into ``base_rows``."""
+    if unit is None:
+        return [dict(r) for r in base_rows if isinstance(r, Mapping)]
+    unit_id = str(unit.get("unit_id") or "").strip()
+    extras = _filter_unit_managed_rows(
+        candidates,
+        clean_ws=str(workspace_id or "").strip(),
+        clean_unit_id=unit_id,
+        eff_unit=unit,
+    )
+    out = [dict(r) for r in base_rows if isinstance(r, Mapping)]
+    seen_ids = {
+        str(r.get("automation_id") or "").strip()
+        for r in out
+        if r.get("automation_id")
+    }
+    seen_names = {
+        str(r.get("name") or "").strip()
+        for r in out
+        if not r.get("automation_id") and r.get("name")
+    }
+    for er in extras:
+        eid = str(er.get("automation_id") or "").strip()
+        ename = str(er.get("name") or "").strip()
+        if eid:
+            if eid in seen_ids:
+                continue
+            seen_ids.add(eid)
+        elif ename:
+            if ename in seen_names:
+                continue
+            seen_names.add(ename)
+        out.append(er)
+    return out
+
+
+async def _resolve_company_unit_for_load(
+    workspace_id: str,
+    *,
+    registered_units: Mapping[str, Mapping[str, Any]] | None,
+    unit: Mapping[str, Any] | None,
+    conn: Any,
+) -> Mapping[str, Any] | None:
+    if unit is not None:
+        return unit if str(unit.get("kind") or "").strip().lower() == "company" else None
+    ws_str = str(workspace_id or "").strip()
+    if not ws_str:
+        return None
+    if registered_units is not None:
+        cand = registered_units.get(ws_str)
+        if cand is not None and str(cand.get("kind") or "").strip().lower() == "company":
+            return cand
+        return None
+    from src.dalton.settings import is_coverage_units_enabled
+
+    if not is_coverage_units_enabled():
+        return None
+    from src.dalton.database.coverage_units import get_active_unit_by_workspace
+
+    try:
+        resolved = await get_active_unit_by_workspace(ws_str, conn=conn)
+    except RuntimeError as exc:
+        if "database pool is not open" not in str(exc):
+            raise
+        return None
+    if resolved is not None and str(resolved.get("kind") or "").strip().lower() == "company":
+        return resolved
+    return None
+
+
 async def _load_company_automations(
     user_id: str,
     workspace_id: str,
     *,
     ticker: str | None = None,
+    registered_units: Mapping[str, Mapping[str, Any]] | None = None,
+    unit: Mapping[str, Any] | None = None,
     conn: Any = None,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Resolve ``ticker`` and load all ``dalton-<ticker>-*`` automation rows for ``(user_id, workspace_id)``."""
+    """Resolve ``ticker`` and load unit-managed + ``dalton-<ticker>-*`` automation rows."""
     resolved_ticker = ticker
     if not resolved_ticker:
         try:
-            resolved_ticker = await _resolve_workspace_ticker(workspace_id)
+            resolved_ticker = await _resolve_workspace_ticker(
+                workspace_id,
+                registered_units=registered_units,
+            )
         except ValueError:
             all_rows = await list_all_user_automations(
                 user_id,
-                name_prefix="dalton-",
                 conn=conn,
             )
             resolved_ticker = await _resolve_workspace_ticker(
                 workspace_id,
                 existing_rows=all_rows,
+                registered_units=registered_units,
             )
-            return resolved_ticker, _filter_company_automations(
+            matched = _filter_company_automations(
                 all_rows,
                 workspace_id=workspace_id,
                 ticker=resolved_ticker,
             )
+            eff_unit = await _resolve_company_unit_for_load(
+                workspace_id, registered_units=registered_units, unit=unit, conn=conn
+            )
+            return resolved_ticker, _merge_unit_managed_rows(
+                matched, candidates=all_rows, workspace_id=workspace_id, unit=eff_unit
+            )
 
+    eff_unit = await _resolve_company_unit_for_load(
+        workspace_id, registered_units=registered_units, unit=unit, conn=conn
+    )
     prefix = f"dalton-{resolved_ticker.lower()}-"
+    if eff_unit is not None:
+        all_rows = await list_all_user_automations(
+            user_id,
+            conn=conn,
+        )
+        matched = _filter_company_automations(
+            all_rows,
+            workspace_id=workspace_id,
+            ticker=resolved_ticker,
+        )
+        return resolved_ticker, _merge_unit_managed_rows(
+            matched, candidates=all_rows, workspace_id=workspace_id, unit=eff_unit
+        )
+
     prefixed_rows = await list_all_user_automations(
         user_id,
         name_prefix=prefix,
@@ -490,7 +694,9 @@ async def _resolve_workspace_sector(
     unit = dict(identity.unit)
     tz_name, tz_source = await resolve_sector_due_timezone(
         workspace_id=str(workspace_id),
-        user_id=str(unit.get("owner_user_id") or ""),
+        user_id=str(
+            unit.get("lead_analyst_user_id") or unit.get("owner_user_id") or ""
+        ),
         conn=conn,
     )
     return {"unit": unit, "tz": tz_name, "tz_source": tz_source}
@@ -697,9 +903,23 @@ async def _load_sector_automations(
     user_id: str,
     unit_id: str,
     *,
+    workspace_id: str | None = None,
+    unit: Mapping[str, Any] | None = None,
     conn: Any = None,
 ) -> list[dict[str, Any]]:
-    """Load every automation row owned by this sector unit (any workspace)."""
+    """Load every automation row owned by this sector unit (including renamed `unit_id` rows)."""
+    from src.dalton.settings import is_coverage_units_enabled
+
+    if is_coverage_units_enabled() and unit is not None and str(unit_id or "").strip():
+        all_rows = await list_all_user_automations(user_id, conn=conn)
+        base = _filter_sector_automations(all_rows, unit_id=unit_id)
+        return _merge_unit_managed_rows(
+            base,
+            candidates=all_rows,
+            workspace_id=str(workspace_id or "").strip(),
+            unit=unit,
+        )
+
     rows = await list_all_user_automations(
         user_id,
         name_prefix="dalton-sector-",
@@ -789,26 +1009,160 @@ def _require_valid_sector_automation_names(slug: str) -> None:
             )
 
 
-async def get_tracking_status(user_id: str, workspace_id: str) -> dict[str, Any]:
+_SYSTEM_JOB_VIEWER_USER_ID: ContextVar[str | None] = ContextVar(
+    "_SYSTEM_JOB_VIEWER_USER_ID", default=None
+)
+
+
+@contextmanager
+def system_job_viewer_context(viewer_user_id: str | None) -> Iterator[None]:
+    """Propagate the caller user_id into tracking status derivation without changing mock signatures."""
+    cleaned = str(viewer_user_id or "").strip() or None
+    token = _SYSTEM_JOB_VIEWER_USER_ID.set(cleaned)
+    try:
+        yield
+    finally:
+        _SYSTEM_JOB_VIEWER_USER_ID.reset(token)
+
+
+async def _filter_rows_by_viewer_web_read(
+    rows: list[dict[str, Any]],
+    *,
+    current_workspace_id: str,
+    viewer_user_id: str | None,
+    check_current_workspace: bool = False,
+) -> list[dict[str, Any]]:
+    """Omit automation rows whose bound workspace lacks Web read access for the viewer."""
+    viewer = str(viewer_user_id or "").strip()
+    if not viewer:
+        return rows
+    ws_str = str(current_workspace_id or "").strip()
+    from src.dalton.sharing import require_workspace_access
+
+    cache: dict[str, bool] = {}
+    kept: list[dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        r_ws = str(r.get("workspace_id") or "").strip()
+        if not r_ws:
+            kept.append(r)
+            continue
+        if not check_current_workspace and r_ws == ws_str:
+            kept.append(r)
+            continue
+        readable = cache.get(r_ws)
+        if readable is None:
+            try:
+                await require_workspace_access(r_ws, viewer, channel="web", need="read")
+                readable = True
+            except Exception:
+                readable = False
+            cache[r_ws] = readable
+        if readable:
+            kept.append(r)
+    return kept
+
+
+async def get_tracking_status(
+    user_id: str,
+    workspace_id: str,
+    *,
+    fallback_on_registry_error: bool = False,
+    viewer_user_id: str | None = None,
+) -> dict[str, Any]:
     """Derive the company workspace tracking status (`enabled` | `disabled` | `incomplete` | `not_applicable`) from `automations`."""
+    from src.dalton.coverage.identity import CoverageIdentityUnavailableError
+
     uid = str(user_id or "").strip()
     ws_id = str(workspace_id or "").strip()
+    effective_viewer = (
+        str(viewer_user_id).strip()
+        if viewer_user_id is not None and str(viewer_user_id).strip()
+        else _SYSTEM_JOB_VIEWER_USER_ID.get()
+    )
     if not uid:
         raise ValueError("user_id is required")
     if not ws_id:
         raise ValueError("workspace_id is required")
 
+    identity_unavailable = False
     try:
         ticker, company_rows = await _load_company_automations(uid, ws_id)
+    except CoverageIdentityUnavailableError:
+        if not fallback_on_registry_error:
+            raise
+        identity_unavailable = True
+        try:
+            ticker, company_rows = await _load_company_automations(
+                uid, ws_id, registered_units={}
+            )
+        except ValueError:
+            return {
+                "ok": True,
+                "workspace_id": ws_id,
+                "ticker": "",
+                "tier": "",
+                "timezone": "America/New_York",
+                "status": "not_applicable",
+                "enabled": False,
+                "paused_by_user": False,
+                "label": "",
+                "missing_tasks": [],
+                "paused_tasks": [],
+                "active_tasks": [],
+                "tasks": [],
+                "automations": [],
+                "identity_unavailable": True,
+            }
     except ValueError:
         # 公司身份解析失败：已登记行业单元（开关打开时）给出行业跟踪状态；
         # 其余保持 not_applicable。开关关闭时 _resolve_workspace_sector 不查
         # 注册表，老工作区的行为与 P3 前一致。
-        sector = await _resolve_workspace_sector(ws_id)
+        try:
+            sector = await _resolve_workspace_sector(ws_id)
+        except CoverageIdentityUnavailableError:
+            if not fallback_on_registry_error:
+                raise
+            return {
+                "ok": True,
+                "workspace_id": ws_id,
+                "ticker": "",
+                "tier": "",
+                "timezone": "America/New_York",
+                "status": "not_applicable",
+                "enabled": False,
+                "paused_by_user": False,
+                "label": "",
+                "missing_tasks": [],
+                "paused_tasks": [],
+                "active_tasks": [],
+                "tasks": [],
+                "automations": [],
+                "identity_unavailable": True,
+            }
         if sector is not None:
+            from src.dalton.settings import is_coverage_units_enabled
+
+            if effective_viewer and is_coverage_units_enabled():
+                from src.dalton.sharing import require_workspace_access
+
+                await require_workspace_access(
+                    ws_id, effective_viewer, channel="web", need="read"
+                )
             sector_rows = await _load_sector_automations(
-                uid, str(sector["unit"].get("unit_id") or "")
+                uid,
+                str(sector["unit"].get("unit_id") or ""),
+                workspace_id=ws_id,
+                unit=sector["unit"],
             )
+            if effective_viewer and is_coverage_units_enabled():
+                sector_rows = await _filter_rows_by_viewer_web_read(
+                    sector_rows,
+                    current_workspace_id=ws_id,
+                    viewer_user_id=effective_viewer,
+                    check_current_workspace=True,
+                )
             return _derive_sector_status_and_details(
                 workspace_id=ws_id,
                 unit=sector["unit"],
@@ -832,13 +1186,28 @@ async def get_tracking_status(user_id: str, workspace_id: str) -> dict[str, Any]
             "tasks": [],
             "automations": [],
         }
+    from src.dalton.settings import is_coverage_units_enabled
+
+    if effective_viewer and is_coverage_units_enabled():
+        from src.dalton.sharing import require_workspace_access
+
+        await require_workspace_access(ws_id, effective_viewer, channel="web", need="read")
+        company_rows = await _filter_rows_by_viewer_web_read(
+            company_rows,
+            current_workspace_id=ws_id,
+            viewer_user_id=effective_viewer,
+            check_current_workspace=True,
+        )
     tier = await resolve_default_tier(ticker, user_id=uid)
-    return _derive_status_and_details(
+    payload = _derive_status_and_details(
         workspace_id=ws_id,
         ticker=ticker,
         tier=tier,
         company_rows=company_rows,
     )
+    if identity_unavailable:
+        payload["identity_unavailable"] = True
+    return payload
 
 
 async def _enable_sector_tracking(
@@ -848,6 +1217,7 @@ async def _enable_sector_tracking(
     *,
     force: bool = False,
     respect_user_pause: bool = True,
+    viewer_user_id: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
     """Idempotently create or resume a sector unit's two standard tasks (P3).
@@ -857,8 +1227,19 @@ async def _enable_sector_tracking(
     current workspace. Member companies are never touched — the specs address
     `dalton-sector-<slug>-*` names, disjoint from `dalton-<ticker>-*`.
     """
+    from src.dalton.settings import is_coverage_units_enabled
+
     uid = str(user_id or "").strip()
     ws_id = str(workspace_id or "").strip()
+    effective_viewer = (
+        str(viewer_user_id).strip()
+        if viewer_user_id is not None and str(viewer_user_id).strip()
+        else _SYSTEM_JOB_VIEWER_USER_ID.get()
+    )
+    if effective_viewer and is_coverage_units_enabled():
+        from src.dalton.sharing import require_workspace_access
+
+        await require_workspace_access(ws_id, effective_viewer, channel="web", need="read")
     unit = sector["unit"]
     slug = str(unit.get("slug") or "").strip()
     unit_id = str(unit.get("unit_id") or "").strip()
@@ -873,17 +1254,36 @@ async def _enable_sector_tracking(
             ", ".join(stale_paused),
         )
 
-    sector_rows = await _load_sector_automations(uid, unit_id, conn=conn)
+    sector_rows = await _load_sector_automations(
+        uid, unit_id, workspace_id=ws_id, unit=unit, conn=conn
+    )
+    raw_paused = any(
+        isinstance(r.get("metadata"), dict)
+        and bool(r["metadata"].get("paused_by_user"))
+        and not _is_expired_once_row(r)
+        for r in sector_rows
+    )
+    visible_sector_rows = (
+        await _filter_rows_by_viewer_web_read(
+            sector_rows,
+            current_workspace_id=ws_id,
+            viewer_user_id=effective_viewer,
+            check_current_workspace=True,
+        )
+        if effective_viewer
+        else sector_rows
+    )
     current = _derive_sector_status_and_details(
         workspace_id=ws_id,
         unit=unit,
         tz_name=sector["tz"],
         tz_source=sector["tz_source"],
-        sector_rows=sector_rows,
+        sector_rows=visible_sector_rows,
     )
-    if not force and respect_user_pause and current.get("paused_by_user"):
+    if not force and respect_user_pause and raw_paused:
         return {
             **current,
+            "paused_by_user": True,
             "skipped": True,
             "skip_reason": "paused_by_user",
         }
@@ -895,6 +1295,7 @@ async def _enable_sector_tracking(
         workspace_id=ws_id,
         timezone_name=sector["tz"],
     )
+    expected_sector_names = {str(s["name"]) for s in specs}
     outer_ctx = get_current_history_context()
     effective_actor = (
         str(outer_ctx.actor_user_id).strip()
@@ -912,12 +1313,14 @@ async def _enable_sector_tracking(
 
     for spec in specs:
         spec_copy = dict(spec)
+        s_name = str(spec_copy["name"])
+        existing_s = by_name_current.get(s_name)
+        if existing_s and _replaced_by_tracker(existing_s):
+            continue
         spec_meta = dict(spec_copy.get("metadata") or {})
         spec_meta["paused_by_user"] = None
         spec_copy["metadata"] = spec_meta
         spec_copy["status"] = "active"
-        s_name = str(spec_copy["name"])
-        existing_s = by_name_current.get(s_name)
         was_paused = bool(
             existing_s and str(existing_s.get("status") or "").strip().lower() == "paused"
         )
@@ -937,7 +1340,48 @@ async def _enable_sector_tracking(
                 conn=conn,
             )
 
-    updated_rows = await _load_sector_automations(uid, unit_id, conn=conn)
+    resume_refusals: list[dict[str, str]] = []
+    for r in sector_rows:
+        r_name = str(r.get("name") or "").strip()
+        row_ws = str(r.get("workspace_id") or "").strip()
+        if row_ws and row_ws != ws_id:
+            continue
+        if r_name in expected_sector_names or _replaced_by_tracker(r):
+            continue
+        if str(r.get("status") or "").lower() == "paused" and r.get("automation_id"):
+            resume_res = await schedule_dalton_automation_helper(
+                r_name,
+                {"action": "resume", "automation_id": str(r["automation_id"])},
+                user_id=uid,
+                workspace_id=ws_id,
+                ticker=None,
+                role="chief_of_staff",
+                action="resume",
+                actor_user_id=effective_actor,
+                conn=conn,
+            )
+            if not resume_res.get("ok"):
+                resume_refusals.append(
+                    {
+                        "automation_id": str(r["automation_id"]),
+                        "name": r_name,
+                        "error": str(resume_res.get("error") or "resume_refused"),
+                        "message": str(
+                            resume_res.get("message") or resume_res.get("error") or ""
+                        ),
+                    }
+                )
+
+    updated_rows = await _load_sector_automations(
+        uid, unit_id, workspace_id=ws_id, unit=unit, conn=conn
+    )
+    if effective_viewer:
+        updated_rows = await _filter_rows_by_viewer_web_read(
+            updated_rows,
+            current_workspace_id=ws_id,
+            viewer_user_id=effective_viewer,
+            check_current_workspace=True,
+        )
     result = _derive_sector_status_and_details(
         workspace_id=ws_id,
         unit=unit,
@@ -945,8 +1389,16 @@ async def _enable_sector_tracking(
         tz_source=sector["tz_source"],
         sector_rows=updated_rows,
     )
+    if resume_refusals:
+        result["resume_refusals"] = resume_refusals
     if stale_paused:
-        result["paused_stale_tasks"] = stale_paused
+        visible_stale = (
+            stale_paused
+            if not effective_viewer
+            else [t["name"] for t in result.get("tasks") or [] if t.get("stale_unit_binding")]
+        )
+        if visible_stale:
+            result["paused_stale_tasks"] = visible_stale
     return result
 
 
@@ -955,6 +1407,8 @@ async def _disable_sector_tracking(
     workspace_id: str,
     sector: dict[str, Any],
     *,
+    viewer_user_id: str | None = None,
+    paused_ids_out: list[str] | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
     """Pause a sector unit's tasks without deleting them — on ANY workspace.
@@ -966,14 +1420,27 @@ async def _disable_sector_tracking(
     the current workspace with ``paused_by_user = True``, mirroring the
     company disable contract. Member companies' rows are never matched.
     """
+    from src.dalton.settings import is_coverage_units_enabled
+
     uid = str(user_id or "").strip()
     ws_id = str(workspace_id or "").strip()
+    effective_viewer = (
+        str(viewer_user_id).strip()
+        if viewer_user_id is not None and str(viewer_user_id).strip()
+        else _SYSTEM_JOB_VIEWER_USER_ID.get()
+    )
+    if effective_viewer and is_coverage_units_enabled():
+        from src.dalton.sharing import require_workspace_access
+
+        await require_workspace_access(ws_id, effective_viewer, channel="web", need="read")
     unit = sector["unit"]
     slug = str(unit.get("slug") or "").strip()
     unit_id = str(unit.get("unit_id") or "").strip()
     _require_valid_sector_automation_names(slug)
 
-    sector_rows = await _load_sector_automations(uid, unit_id, conn=conn)
+    sector_rows = await _load_sector_automations(
+        uid, unit_id, workspace_id=ws_id, unit=unit, conn=conn
+    )
     by_name_current: dict[str, dict[str, Any]] = {}
     for r in sector_rows:
         if not isinstance(r, dict) or not r.get("name"):
@@ -1006,15 +1473,21 @@ async def _disable_sector_tracking(
             new_meta["paused_by_user"] = True
             if row_ws and row_ws != ws_id:
                 new_meta["stale_unit_binding"] = True
+            pause_kwargs: dict[str, Any] = {
+                "status": "paused",
+                "metadata": new_meta,
+            }
+            if str(r.get("trigger_type") or "").strip().lower() != "once":
+                pause_kwargs["next_run_at"] = None
             await auto_db.update_automation(
                 str(auto_id),
                 uid,
-                status="paused",
-                next_run_at=None,
-                metadata=new_meta,
+                **pause_kwargs,
                 **conn_kw,
             )
             paused_names.append(str(r.get("name") or auto_id))
+            if paused_ids_out is not None:
+                paused_ids_out.append(str(auto_id))
 
     specs = build_sector_watch_specs(
         unit_id=unit_id,
@@ -1049,7 +1522,16 @@ async def _disable_sector_tracking(
             )
             paused_names.append(s_name)
 
-    updated_rows = await _load_sector_automations(uid, unit_id, conn=conn)
+    updated_rows = await _load_sector_automations(
+        uid, unit_id, workspace_id=ws_id, unit=unit, conn=conn
+    )
+    if effective_viewer:
+        updated_rows = await _filter_rows_by_viewer_web_read(
+            updated_rows,
+            current_workspace_id=ws_id,
+            viewer_user_id=effective_viewer,
+            check_current_workspace=True,
+        )
     status_payload = _derive_sector_status_and_details(
         workspace_id=ws_id,
         unit=unit,
@@ -1069,119 +1551,183 @@ async def enable_tracking(
     *,
     force: bool = False,
     respect_user_pause: bool = True,
+    viewer_user_id: str | None = None,
+    conn: Any = None,
 ) -> dict[str, Any]:
     """Idempotently create or resume all 4 standard tracking tasks for a company workspace.
 
     When ``respect_user_pause=True`` and ``force=False``, skips re-enabling if any
     standard task carries ``metadata.paused_by_user == True``.
     """
+    from src.dalton.settings import is_coverage_units_enabled
+
     uid = str(user_id or "").strip()
     ws_id = str(workspace_id or "").strip()
+    effective_viewer = (
+        str(viewer_user_id).strip()
+        if viewer_user_id is not None and str(viewer_user_id).strip()
+        else _SYSTEM_JOB_VIEWER_USER_ID.get()
+    )
     if not uid:
         raise ValueError("user_id is required")
     if not ws_id:
         raise ValueError("workspace_id is required")
 
-    async with user_automations_lock(uid) as conn:
-        try:
-            ticker, company_rows = await _load_company_automations(uid, ws_id, conn=conn)
-        except ValueError:
-            sector = await _resolve_workspace_sector(ws_id, conn=conn)
-            if sector is not None:
-                return await _enable_sector_tracking(
-                    uid,
-                    ws_id,
-                    sector,
-                    force=force,
-                    respect_user_pause=respect_user_pause,
-                    conn=conn,
+    prelock_tok = (
+        _prelock_unit_workspace.set(ws_id)
+        if conn is None and is_coverage_units_enabled()
+        else None
+    )
+    try:
+        lock_ctx = (
+            user_automations_lock(uid, conn=conn)
+            if conn is not None
+            else user_automations_lock(uid)
+        )
+        async with lock_ctx as active_conn:
+            conn = active_conn
+            try:
+                ticker, company_rows = await _load_company_automations(uid, ws_id, conn=conn)
+            except ValueError:
+                sector = await _resolve_workspace_sector(ws_id, conn=conn)
+                if sector is not None:
+                    return await _enable_sector_tracking(
+                        uid,
+                        ws_id,
+                        sector,
+                        force=force,
+                        respect_user_pause=respect_user_pause,
+                        viewer_user_id=effective_viewer,
+                        conn=conn,
+                    )
+                raise
+            if effective_viewer and is_coverage_units_enabled():
+                from src.dalton.sharing import require_workspace_access
+
+                await require_workspace_access(
+                    ws_id, effective_viewer, channel="web", need="read"
                 )
-            raise
-        resolved_tier = await resolve_default_tier(ticker, tier, user_id=uid, conn=conn)
+            resolved_tier = await resolve_default_tier(ticker, tier, user_id=uid, conn=conn)
 
-        current = _derive_status_and_details(
-            workspace_id=ws_id,
-            ticker=ticker,
-            tier=resolved_tier,
-            company_rows=company_rows,
-        )
-        if not force and respect_user_pause and current.get("paused_by_user"):
-            return {
-                **current,
-                "skipped": True,
-                "skip_reason": "paused_by_user",
-            }
+            unit_id_for_specs: str | None = None
+            active_co_unit: dict[str, Any] | None = None
+            if is_coverage_units_enabled():
+                from src.dalton.database.coverage_units import get_active_unit_by_workspace
 
-        specs = build_company_watch_specs(
-            ticker=ticker,
-            workspace_id=ws_id,
-            tier=resolved_tier,
-        )
-        delta_cron, delta_tz = resolve_delta_schedule(resolved_tier)
-        expected_names = {str(s["name"]) for s in specs}
-        outer_ctx = get_current_history_context()
-        effective_actor = (
-            str(outer_ctx.actor_user_id).strip()
-            if outer_ctx is not None
-            and outer_ctx.has_explicit_actor
-            and outer_ctx.actor_user_id
-            else uid
-        )
-        by_name_company = {
-            str(r.get("name") or "").strip(): r
-            for r in company_rows
-            if isinstance(r, dict) and r.get("name")
-        }
-        delta_name = f"dalton-{str(ticker).strip().lower()}-delta"
-        # One marked row is enough. A later unmarked duplicate must not be upserted.
-        delta_replaced = any(
-            isinstance(r, dict)
-            and str(r.get("name") or "").strip() == delta_name
-            and _replaced_by_tracker(r)
-            for r in company_rows
-        )
+                active_co_unit = await get_active_unit_by_workspace(
+                    ws_id, conn=conn, for_share=True
+                )
+                if (
+                    active_co_unit is not None
+                    and str(active_co_unit.get("kind") or "").strip().lower() == "company"
+                ):
+                    unit_id_for_specs = str(active_co_unit.get("unit_id") or "").strip() or None
+                    all_unit_candidates = await list_all_user_automations(uid, conn=conn)
+                    company_rows = _merge_unit_managed_rows(
+                        company_rows,
+                        candidates=all_unit_candidates,
+                        workspace_id=ws_id,
+                        unit=active_co_unit,
+                    )
 
-        for spec in specs:
-            s_name = str(spec.get("name") or "")
-            existing_c = by_name_company.get(s_name)
-            if s_name == delta_name and delta_replaced:
-                continue
-            spec_copy = dict(spec)
-            spec_meta = dict(spec_copy.get("metadata") or {})
-            spec_meta["paused_by_user"] = None
-            spec_meta["tier"] = resolved_tier
-            if str(spec_copy.get("name") or "") == delta_name:
-                spec_copy["cron_expression"] = delta_cron
-                spec_copy["timezone"] = delta_tz
-            spec_copy["metadata"] = spec_meta
-            spec_copy["status"] = "active"
-            s_name = str(spec_copy["name"])
-            was_paused = bool(
-                existing_c and str(existing_c.get("status") or "").strip().lower() == "paused"
+            raw_current = _derive_status_and_details(
+                workspace_id=ws_id,
+                ticker=ticker,
+                tier=resolved_tier,
+                company_rows=company_rows,
             )
-            with automation_history_context(
-                actor_user_id=effective_actor,
-                action="resume" if was_paused else "update",
-                skip_if_unchanged=True,
-            ):
-                await schedule_dalton_automation_helper(
-                    s_name,
-                    spec_copy,
-                    user_id=uid,
+            if not force and respect_user_pause and raw_current.get("paused_by_user"):
+                visible_rows = (
+                    await _filter_rows_by_viewer_web_read(
+                        company_rows,
+                        current_workspace_id=ws_id,
+                        viewer_user_id=effective_viewer,
+                        check_current_workspace=True,
+                    )
+                    if effective_viewer and is_coverage_units_enabled()
+                    else company_rows
+                )
+                current = _derive_status_and_details(
                     workspace_id=ws_id,
                     ticker=ticker,
-                    role="chief_of_staff",
-                    action="upsert",
-                    conn=conn,
+                    tier=resolved_tier,
+                    company_rows=visible_rows,
                 )
+                return {
+                    **current,
+                    "skipped": True,
+                    "skip_reason": "paused_by_user",
+                }
 
-        # Also resume any paused one-shot earnings tasks (`dalton-<t>-earn-*`) when re-enabling
-        conn_kw = {"conn": conn} if conn is not None else {}
-        with automation_history_context(
-            actor_user_id=effective_actor,
-            action="resume",
-            skip_if_unchanged=True,
-        ):
+            specs = build_company_watch_specs(
+                ticker=ticker,
+                workspace_id=ws_id,
+                tier=resolved_tier,
+                unit_id=unit_id_for_specs,
+            )
+            delta_cron, delta_tz = resolve_delta_schedule(resolved_tier)
+            expected_names = {str(s["name"]) for s in specs}
+            outer_ctx = get_current_history_context()
+            effective_actor = (
+                str(outer_ctx.actor_user_id).strip()
+                if outer_ctx is not None
+                and outer_ctx.has_explicit_actor
+                and outer_ctx.actor_user_id
+                else uid
+            )
+            by_name_company = {
+                str(r.get("name") or "").strip(): r
+                for r in company_rows
+                if isinstance(r, dict) and r.get("name")
+            }
+            delta_name = f"dalton-{str(ticker).strip().lower()}-delta"
+            # One marked row is enough. A later unmarked duplicate must not be upserted.
+            delta_replaced = any(
+                isinstance(r, dict)
+                and str(r.get("name") or "").strip() == delta_name
+                and _replaced_by_tracker(r)
+                for r in company_rows
+            )
+
+            for spec in specs:
+                s_name = str(spec.get("name") or "")
+                existing_c = by_name_company.get(s_name)
+                if s_name == delta_name and delta_replaced:
+                    continue
+                if existing_c and _replaced_by_tracker(existing_c):
+                    continue
+                spec_copy = dict(spec)
+                spec_meta = dict(spec_copy.get("metadata") or {})
+                spec_meta["paused_by_user"] = None
+                spec_meta["tier"] = resolved_tier
+                if str(spec_copy.get("name") or "") == delta_name:
+                    spec_copy["cron_expression"] = delta_cron
+                    spec_copy["timezone"] = delta_tz
+                spec_copy["metadata"] = spec_meta
+                spec_copy["status"] = "active"
+                s_name = str(spec_copy["name"])
+                was_paused = bool(
+                    existing_c and str(existing_c.get("status") or "").strip().lower() == "paused"
+                )
+                with automation_history_context(
+                    actor_user_id=effective_actor,
+                    action="resume" if was_paused else "update",
+                    skip_if_unchanged=True,
+                ):
+                    await schedule_dalton_automation_helper(
+                        s_name,
+                        spec_copy,
+                        user_id=uid,
+                        workspace_id=ws_id,
+                        ticker=ticker,
+                        role="chief_of_staff",
+                        action="upsert",
+                        conn=conn,
+                    )
+
+            # Also resume paused non-standard unit-managed tasks (e.g. `dalton-brk.b-earn-*`
+            # or renamed `unit_id` tasks) via the shared schedule helper / lifecycle rules.
+            resume_refusals: list[dict[str, str]] = []
             for r in company_rows:
                 r_name = str(r.get("name") or "").strip()
                 if r_name in expected_names:
@@ -1189,133 +1735,257 @@ async def enable_tracking(
                 if _replaced_by_tracker(r):
                     continue
                 if str(r.get("status") or "").lower() == "paused" and r.get("automation_id"):
-                    cleaned_meta = dict(r.get("metadata") or {})
-                    cleaned_meta.pop("paused_by_user", None)
-                    await auto_db.update_automation(
-                        str(r["automation_id"]),
-                        uid,
-                        status="active",
-                        metadata=cleaned_meta,
-                        **conn_kw,
+                    resume_spec: dict[str, Any] = {
+                        "action": "resume",
+                        "automation_id": str(r["automation_id"]),
+                    }
+                    resume_res = await schedule_dalton_automation_helper(
+                        r_name,
+                        resume_spec,
+                        user_id=uid,
+                        workspace_id=ws_id,
+                        ticker=ticker,
+                        role="chief_of_staff",
+                        action="resume",
+                        actor_user_id=effective_actor,
+                        conn=conn,
                     )
+                    if not resume_res.get("ok"):
+                        resume_refusals.append(
+                            {
+                                "automation_id": str(r["automation_id"]),
+                                "name": r_name,
+                                "error": str(resume_res.get("error") or "resume_refused"),
+                                "message": str(
+                                    resume_res.get("message")
+                                    or resume_res.get("error")
+                                    or ""
+                                ),
+                            }
+                        )
 
-        _, updated_rows = await _load_company_automations(
-            uid, ws_id, ticker=ticker, conn=conn
-        )
-        return _derive_status_and_details(
-            workspace_id=ws_id,
-            ticker=ticker,
-            tier=resolved_tier,
-            company_rows=updated_rows,
-        )
+            _, updated_rows = await _load_company_automations(
+                uid, ws_id, ticker=ticker, unit=active_co_unit, conn=conn
+            )
+            if effective_viewer and is_coverage_units_enabled():
+                updated_rows = await _filter_rows_by_viewer_web_read(
+                    updated_rows,
+                    current_workspace_id=ws_id,
+                    viewer_user_id=effective_viewer,
+                    check_current_workspace=True,
+                )
+            payload = _derive_status_and_details(
+                workspace_id=ws_id,
+                ticker=ticker,
+                tier=resolved_tier,
+                company_rows=updated_rows,
+            )
+            if resume_refusals:
+                payload["resume_refusals"] = resume_refusals
+            return payload
+    finally:
+        if prelock_tok is not None:
+            _prelock_unit_workspace.reset(prelock_tok)
 
 
-async def disable_tracking(user_id: str, workspace_id: str) -> dict[str, Any]:
+async def disable_tracking(
+    user_id: str,
+    workspace_id: str,
+    *,
+    viewer_user_id: str | None = None,
+) -> dict[str, Any]:
     """Pause all ``dalton-<t>-*`` tasks (including ``-earn-*``) for a company workspace without deleting them.
 
     If standard tasks do not exist yet, creates them in ``paused`` state with
     ``metadata.paused_by_user = True`` so coverage completion will not auto-open tracking.
     """
+    from src.dalton.settings import is_coverage_units_enabled
+
     uid = str(user_id or "").strip()
     ws_id = str(workspace_id or "").strip()
+    effective_viewer = (
+        str(viewer_user_id).strip()
+        if viewer_user_id is not None and str(viewer_user_id).strip()
+        else _SYSTEM_JOB_VIEWER_USER_ID.get()
+    )
     if not uid:
         raise ValueError("user_id is required")
     if not ws_id:
         raise ValueError("workspace_id is required")
 
-    async with user_automations_lock(uid) as conn:
-        try:
-            ticker, company_rows = await _load_company_automations(uid, ws_id, conn=conn)
-        except ValueError:
-            sector = await _resolve_workspace_sector(ws_id, conn=conn)
-            if sector is not None:
-                return await _disable_sector_tracking(uid, ws_id, sector, conn=conn)
-            raise
-        resolved_tier = await resolve_default_tier(ticker, user_id=uid, conn=conn)
-        specs = build_company_watch_specs(
-            ticker=ticker,
-            workspace_id=ws_id,
-            tier=resolved_tier,
-        )
-        by_name = {
-            str(r.get("name") or "").strip(): r
-            for r in company_rows
-            if isinstance(r, dict) and r.get("name")
-        }
+    prelock_tok = (
+        _prelock_unit_workspace.set(ws_id)
+        if is_coverage_units_enabled()
+        else None
+    )
+    paused_ids: list[str] = []
+    pause_cutoff: datetime | None = None
+    result_payload: dict[str, Any] | None = None
+    try:
+        async with user_automations_lock(uid) as conn:
+            try:
+                ticker, company_rows = await _load_company_automations(uid, ws_id, conn=conn)
+            except ValueError:
+                sector = await _resolve_workspace_sector(ws_id, conn=conn)
+                if sector is not None:
+                    result_payload = await _disable_sector_tracking(
+                        uid,
+                        ws_id,
+                        sector,
+                        viewer_user_id=effective_viewer,
+                        paused_ids_out=paused_ids,
+                        conn=conn,
+                    )
+                else:
+                    raise
+            if result_payload is None:
+                if effective_viewer and is_coverage_units_enabled():
+                    from src.dalton.sharing import require_workspace_access
 
-        paused_names: list[str] = []
-        conn_kw = {"conn": conn} if conn is not None else {}
-        outer_ctx = get_current_history_context()
-        effective_actor = (
-            str(outer_ctx.actor_user_id).strip()
-            if outer_ctx is not None
-            and outer_ctx.has_explicit_actor
-            and outer_ctx.actor_user_id
-            else uid
-        )
-        with automation_history_context(
-            actor_user_id=effective_actor,
-            action="pause",
-            skip_if_unchanged=True,
-        ):
-            for r in company_rows:
-                auto_id = r.get("automation_id")
-                if not auto_id:
-                    continue
-                new_meta = dict(r.get("metadata") or {})
-                new_meta["paused_by_user"] = True
-                await auto_db.update_automation(
-                    str(auto_id),
-                    uid,
-                    status="paused",
-                    metadata=new_meta,
-                    **conn_kw,
+                    await require_workspace_access(
+                        ws_id, effective_viewer, channel="web", need="read"
+                    )
+                resolved_tier = await resolve_default_tier(ticker, user_id=uid, conn=conn)
+                unit_id_for_specs: str | None = None
+                active_co_unit: dict[str, Any] | None = None
+                if is_coverage_units_enabled():
+                    from src.dalton.database.coverage_units import get_active_unit_by_workspace
+
+                    active_co_unit = await get_active_unit_by_workspace(
+                        ws_id, conn=conn, for_share=True
+                    )
+                    if (
+                        active_co_unit is not None
+                        and str(active_co_unit.get("kind") or "").strip().lower() == "company"
+                    ):
+                        unit_id_for_specs = str(active_co_unit.get("unit_id") or "").strip() or None
+                        all_unit_candidates = await list_all_user_automations(uid, conn=conn)
+                        company_rows = _merge_unit_managed_rows(
+                            company_rows,
+                            candidates=all_unit_candidates,
+                            workspace_id=ws_id,
+                            unit=active_co_unit,
+                        )
+                specs = build_company_watch_specs(
+                    ticker=ticker,
+                    workspace_id=ws_id,
+                    tier=resolved_tier,
+                    unit_id=unit_id_for_specs,
                 )
-                paused_names.append(str(r.get("name") or auto_id))
+                by_name = {
+                    str(r.get("name") or "").strip(): r
+                    for r in company_rows
+                    if isinstance(r, dict) and r.get("name")
+                }
 
-        delta_cron, delta_tz = resolve_delta_schedule(resolved_tier)
-        with automation_history_context(
-            actor_user_id=effective_actor,
-            action="create",
-            skip_if_unchanged=True,
-        ):
-            for spec in specs:
-                s_name = str(spec["name"])
-                if s_name in by_name:
-                    continue
-                spec_copy = dict(spec)
-                spec_meta = dict(spec_copy.get("metadata") or {})
-                spec_meta["paused_by_user"] = True
-                spec_meta["tier"] = resolved_tier
-                if s_name.endswith("-delta"):
-                    spec_copy["cron_expression"] = delta_cron
-                    spec_copy["timezone"] = delta_tz
-                spec_copy["metadata"] = spec_meta
-                spec_copy["status"] = "paused"
-                await schedule_dalton_automation_helper(
-                    s_name,
-                    spec_copy,
-                    user_id=uid,
+                paused_names: list[str] = []
+                conn_kw = {"conn": conn} if conn is not None else {}
+                outer_ctx = get_current_history_context()
+                effective_actor = (
+                    str(outer_ctx.actor_user_id).strip()
+                    if outer_ctx is not None
+                    and outer_ctx.has_explicit_actor
+                    and outer_ctx.actor_user_id
+                    else uid
+                )
+                with automation_history_context(
+                    actor_user_id=effective_actor,
+                    action="pause",
+                    skip_if_unchanged=True,
+                ):
+                    for r in company_rows:
+                        auto_id = r.get("automation_id")
+                        if not auto_id:
+                            continue
+                        new_meta = dict(r.get("metadata") or {})
+                        new_meta["paused_by_user"] = True
+                        pause_kwargs: dict[str, Any] = {
+                            "status": "paused",
+                            "metadata": new_meta,
+                        }
+                        if str(r.get("trigger_type") or "").strip().lower() != "once":
+                            pause_kwargs["next_run_at"] = None
+                        await auto_db.update_automation(
+                            str(auto_id),
+                            uid,
+                            **pause_kwargs,
+                            **conn_kw,
+                        )
+                        paused_names.append(str(r.get("name") or auto_id))
+                        paused_ids.append(str(auto_id))
+
+                delta_cron, delta_tz = resolve_delta_schedule(resolved_tier)
+                with automation_history_context(
+                    actor_user_id=effective_actor,
+                    action="create",
+                    skip_if_unchanged=True,
+                ):
+                    for spec in specs:
+                        s_name = str(spec["name"])
+                        if s_name in by_name:
+                            continue
+                        spec_copy = dict(spec)
+                        spec_meta = dict(spec_copy.get("metadata") or {})
+                        spec_meta["paused_by_user"] = True
+                        spec_meta["tier"] = resolved_tier
+                        if s_name.endswith("-delta"):
+                            spec_copy["cron_expression"] = delta_cron
+                            spec_copy["timezone"] = delta_tz
+                        spec_copy["metadata"] = spec_meta
+                        spec_copy["status"] = "paused"
+                        await schedule_dalton_automation_helper(
+                            s_name,
+                            spec_copy,
+                            user_id=uid,
+                            workspace_id=ws_id,
+                            ticker=ticker,
+                            role="chief_of_staff",
+                            action="upsert",
+                            conn=conn,
+                        )
+                        paused_names.append(s_name)
+
+                _, updated_rows = await _load_company_automations(
+                    uid, ws_id, ticker=ticker, unit=active_co_unit, conn=conn
+                )
+                if effective_viewer and is_coverage_units_enabled():
+                    updated_rows = await _filter_rows_by_viewer_web_read(
+                        updated_rows,
+                        current_workspace_id=ws_id,
+                        viewer_user_id=effective_viewer,
+                        check_current_workspace=True,
+                    )
+                status_payload = _derive_status_and_details(
                     workspace_id=ws_id,
                     ticker=ticker,
-                    role="chief_of_staff",
-                    action="upsert",
-                    conn=conn,
+                    tier=resolved_tier,
+                    company_rows=updated_rows,
                 )
-                paused_names.append(s_name)
+                status_payload["paused_by_user"] = True
+                status_payload["paused_count"] = len(paused_names)
+                result_payload = status_payload
 
-        _, updated_rows = await _load_company_automations(
-            uid, ws_id, ticker=ticker, conn=conn
+            if paused_ids:
+                from src.server.database import automation_executions as exec_db
+
+                pause_cutoff = await exec_db.get_db_now(conn=conn)
+    finally:
+        if prelock_tok is not None:
+            _prelock_unit_workspace.reset(prelock_tok)
+
+    if paused_ids:
+        from src.server.database import automation_executions as exec_db
+
+        skipped_execs = await exec_db.skip_unstarted_executions_for_automations(
+            paused_ids,
+            reason="disabled",
+            error_message="Skipped unstarted execution because tracking was disabled.",
+            created_at_lte=pause_cutoff,
         )
-        status_payload = _derive_status_and_details(
-            workspace_id=ws_id,
-            ticker=ticker,
-            tier=resolved_tier,
-            company_rows=updated_rows,
-        )
-        status_payload["paused_by_user"] = True
-        status_payload["paused_count"] = len(paused_names)
-        return status_payload
+        if result_payload is not None and skipped_execs:
+            result_payload["skipped_executions"] = skipped_execs
+
+    return result_payload
 
 
 def _iso_or_none(val: Any) -> str | None:
@@ -1501,3 +2171,54 @@ async def set_tier_and_resync(
             resynced.append({"ticker": t, "updated": False, "reason": "resync_failed"})
     res["delta_schedule"] = resynced
     return res
+
+
+def _filter_unit_managed_rows(
+    rows: Sequence[Any],
+    *,
+    clean_ws: str,
+    clean_unit_id: str,
+    eff_unit: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    from src.dalton.autonomy.classification import is_managed_unit_automation_for_unit
+
+    return [
+        dict(r)
+        for r in rows
+        if isinstance(r, Mapping)
+        and is_managed_unit_automation_for_unit(r, unit=eff_unit)
+        and (
+            (
+                bool(clean_ws)
+                and (
+                    str(r.get("workspace_id") or "").strip() == clean_ws
+                    or (
+                        clean_unit_id
+                        and not str(r.get("workspace_id") or "").strip()
+                        and str(
+                            (
+                                (r.get("metadata") or {})
+                                if isinstance(r.get("metadata"), Mapping)
+                                else {}
+                            ).get("unit_id")
+                            or ""
+                        ).strip()
+                        == clean_unit_id
+                    )
+                )
+            )
+            or (
+                not clean_ws
+                and clean_unit_id
+                and str(
+                    (
+                        (r.get("metadata") or {})
+                        if isinstance(r.get("metadata"), Mapping)
+                        else {}
+                    ).get("unit_id")
+                    or ""
+                ).strip()
+                == clean_unit_id
+            )
+        )
+    ]

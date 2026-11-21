@@ -1143,6 +1143,7 @@ async def evaluate_user_notify_eligibility(
     automation: Mapping[str, Any] | None,
     *,
     target: str | None = None,
+    include_chat_targets: bool | None = None,
     resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] = resolve_dalton_notify_enabled,
     resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] = resolve_dalton_notify_overrides,
     resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] = resolve_dalton_notify_targets,
@@ -1192,8 +1193,11 @@ async def evaluate_user_notify_eligibility(
         _split_target_channel(t)[1] for t in targets if str(t).strip()
     ]
 
-    admin_check = is_admin_fn if is_admin_fn is not None else _default_notify_admin
-    include_chats = await admin_check(cleaned_uid)
+    if include_chat_targets is not None:
+        include_chats = bool(include_chat_targets)
+    else:
+        admin_check = is_admin_fn if is_admin_fn is not None else _default_notify_admin
+        include_chats = await admin_check(cleaned_uid)
     routed = resolve_notify_route_targets(
         automation, routes, normalized_targets, include_chat_targets=include_chats
     )
@@ -2622,8 +2626,121 @@ def _reconstruct_automation_from_delivery_row(
         reconstructed: dict[str, Any] = {"name": auto_name, "metadata": meta}
         if auto_id:
             reconstructed["automation_id"] = auto_id
+        ws_val = str(
+            row.get("automation_workspace_id") or payload.get("workspace_id") or ""
+        ).strip()
+        if ws_val:
+            reconstructed["workspace_id"] = ws_val
         return reconstructed
     return None
+
+
+def _normalize_coverage_unit_version(val: Any) -> str:
+    """Serialize unit binding timestamp/version deterministically for audit matching."""
+    from datetime import timezone as _dt_utc
+
+    if val is None:
+        return ""
+    if isinstance(val, datetime):
+        dt = val if val.tzinfo is not None else val.replace(tzinfo=_dt_utc.utc)
+        return dt.astimezone(_dt_utc.utc).isoformat()
+    return str(val).strip()
+
+
+async def _resolve_unit_managed_notify_gate(
+    user_id: str | None,
+    workspace_id: str | None,
+    automation: Mapping[str, Any] | None,
+    *,
+    stamped_unit_id: str = "",
+    stamped_unit_version: Any = None,
+    target: str | None = None,
+    conn: Any = None,
+) -> tuple[bool, str | None, str | None, bool | None]:
+    """Enforce C5 notification rules for managed tasks on active unit workspaces.
+
+    Returns ``(allowed, skip_reason, active_unit_id, force_include_chat_targets)``.
+    When an active unit is bound (or the execution was stamped under one at
+    entry), group chat targets are always suppressed and both first send and
+    retries verify current unit binding/version, lead match, and workspace
+    read access.
+    """
+    from fastapi import HTTPException
+    from src.dalton.autonomy.classification import (
+        is_managed_unit_automation,
+        is_managed_unit_automation_for_unit,
+    )
+    from src.dalton.database.coverage_units import (
+        get_active_unit_by_workspace,
+        get_coverage_unit,
+    )
+    from src.dalton.settings import is_coverage_units_enabled
+    from src.dalton.sharing import ColleagueAccessRevokedError, require_workspace_access
+
+    clean_stamped = str(stamped_unit_id or "").strip()
+    clean_stamped_version = _normalize_coverage_unit_version(stamped_unit_version)
+    if not is_coverage_units_enabled():
+        return True, None, None, None
+
+    ws_id = str(workspace_id or "").strip()
+    uid = str(user_id or "").strip()
+    meta_unit_id = ""
+    is_managed_task = bool(isinstance(automation, Mapping) and is_managed_unit_automation(automation))
+    if is_managed_task and isinstance(automation, Mapping):
+        meta_obj = automation.get("metadata")
+        if isinstance(meta_obj, Mapping):
+            raw_muid = str(meta_obj.get("unit_id") or "").strip()
+            if raw_muid:
+                try:
+                    from uuid import UUID as _NotifyUUID
+
+                    meta_unit_id = str(_NotifyUUID(raw_muid))
+                except (ValueError, TypeError, AttributeError):
+                    meta_unit_id = ""
+    if not clean_stamped and not ws_id and not meta_unit_id:
+        return True, None, None, None
+
+    unit = await get_active_unit_by_workspace(ws_id, conn=conn) if ws_id else None
+    if not clean_stamped:
+        if unit is None:
+            if meta_unit_id:
+                meta_unit = await get_coverage_unit(meta_unit_id, conn=conn)
+                if meta_unit is not None:
+                    return False, "unit_unbound_or_archived", None, False
+            return True, None, None, None
+        if meta_unit_id and str(unit.get("unit_id") or "").strip() != meta_unit_id:
+            return False, "unit_rebound", str(unit.get("unit_id") or "").strip() or None, False
+        if not is_managed_unit_automation_for_unit(automation, unit=unit):
+            return True, None, None, None
+
+    if not ws_id or unit is None:
+        return False, "unit_unbound_or_archived", None, False
+
+    active_unit_id = str(unit.get("unit_id") or "").strip() or None
+    if clean_stamped and active_unit_id != clean_stamped:
+        return False, "unit_rebound", active_unit_id, False
+
+    active_unit_version = _normalize_coverage_unit_version(unit.get("updated_at"))
+    if clean_stamped_version and active_unit_version != clean_stamped_version:
+        return False, "unit_binding_changed", active_unit_id, False
+
+    lead_uid = str(
+        unit.get("lead_analyst_user_id") or unit.get("owner_user_id") or ""
+    ).strip()
+    if lead_uid and lead_uid != uid:
+        return False, "not_unit_lead_analyst", active_unit_id, False
+
+    if target is not None:
+        _, cleaned_t = _split_target_channel(target)
+        if cleaned_t.startswith("feishu:chat:") or cleaned_t.startswith("discord:channel:"):
+            return False, "unit_managed_dm_only", active_unit_id, False
+
+    try:
+        await require_workspace_access(ws_id, uid, channel="web", need="read", conn=conn)
+    except (HTTPException, ColleagueAccessRevokedError):
+        return False, "workspace_unreadable", active_unit_id, False
+
+    return True, None, active_unit_id, False
 
 
 # DALTON-HOOK(data-jobs): look up dalton_data_task_defs.enabled / notify_enabled for retry guard
@@ -3014,6 +3131,8 @@ async def retry_failed_notify_deliveries(
                            d.payload_json,
                            a.name AS automation_name,
                            a.metadata AS automation_metadata,
+                           a.workspace_id::text AS automation_workspace_id,
+                           a.user_id AS automation_user_id,
                            -- DALTON-HOOK(data-jobs): join dalton_data_task_defs to check task/notify enabled on retry
                            dt.enabled AS data_task_enabled,
                            dt.notify_enabled AS data_task_notify_enabled
@@ -3350,10 +3469,40 @@ async def retry_failed_notify_deliveries(
                             )
                         continue
 
+                gate_ws = str(
+                    row.get("automation_workspace_id")
+                    or payload.get("workspace_id")
+                    or ""
+                ).strip()
+                gate_ok, gate_reason, _, gate_include_chats = await _resolve_unit_managed_notify_gate(
+                    user_id,
+                    gate_ws,
+                    automation_info,
+                    stamped_unit_id=str(payload.get("coverage_unit_id") or "").strip(),
+                    stamped_unit_version=payload.get("coverage_unit_version"),
+                    target=tgt,
+                )
+                if not gate_ok:
+                    await _invoke_mark_delivery(
+                        mark_delivery_fn,
+                        exec_id,
+                        ch,
+                        tgt,
+                        status="skipped",
+                        reason=gate_reason or "not_unit_lead_analyst",
+                        error_code=gate_reason or "not_unit_lead_analyst",
+                        expected_status=skip_expected_status,
+                        expected_attempt_count=attempt_count,
+                        expected_updated_at=row_updated_at,
+                        exclude_uncertain_data_task=True,
+                    )
+                    continue
+
                 allowed, skip_reason, _ = await evaluate_user_notify_eligibility(
                     user_id,
                     automation_info,
                     target=tgt,
+                    include_chat_targets=gate_include_chats,
                     resolve_enabled_fn=resolve_enabled_fn,
                     resolve_overrides_fn=resolve_overrides_fn,
                     resolve_targets_fn=resolve_targets_fn,
@@ -3843,6 +3992,12 @@ _REPORT_AUTH_SKIP_CODES = frozenset(
         "task_disabled",
         "dalton_disabled",
         "report_recovered",
+        "unit_unbound_or_archived",
+        "unit_rebound",
+        "unit_binding_changed",
+        "not_unit_lead_analyst",
+        "unit_managed_dm_only",
+        "workspace_unreadable",
     }
 )
 # The parent card is still unresolved. Leaving the notice pending lets a later
@@ -4651,6 +4806,8 @@ async def on_automation_settled(
     run_id: str | None = None,
     workspace_id: str | None = None,
     final_text: str | None = None,
+    coverage_unit_id: Any = None,
+    coverage_unit_version: Any = None,
     resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] = resolve_dalton_notify_enabled,
     resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] = resolve_dalton_notify_overrides,
     resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] = resolve_dalton_notify_targets,
@@ -4708,9 +4865,22 @@ async def on_automation_settled(
         classification = classify_automation_for_notify(automation)
 
         user_id = str(automation.get("user_id") or "").strip()
+        ws_id_notify = str(workspace_id or automation.get("workspace_id") or "").strip()
+        clean_stamped_unit_id = str(coverage_unit_id or "").strip()
+        clean_stamped_unit_version = _normalize_coverage_unit_version(coverage_unit_version)
+        gate_ok, _gate_reason, active_unit_id, gate_include_chats = await _resolve_unit_managed_notify_gate(
+            user_id,
+            ws_id_notify,
+            automation,
+            stamped_unit_id=clean_stamped_unit_id,
+            stamped_unit_version=clean_stamped_unit_version,
+        )
+        if not gate_ok:
+            return False
         allowed, _, targets = await evaluate_user_notify_eligibility(
             user_id,
             automation,
+            include_chat_targets=gate_include_chats,
             resolve_enabled_fn=resolve_enabled_fn,
             resolve_overrides_fn=resolve_overrides_fn,
             resolve_targets_fn=resolve_targets_fn,
@@ -4800,6 +4970,12 @@ async def on_automation_settled(
             "source": "automation_completion",
             "transport": "gateway" if via_gateway else "bridge",
         }
+        eff_unit_id = clean_stamped_unit_id or active_unit_id
+        if eff_unit_id:
+            payload_record["coverage_unit_id"] = eff_unit_id
+            payload_record["workspace_id"] = ws_id_notify
+            if clean_stamped_unit_version:
+                payload_record["coverage_unit_version"] = clean_stamped_unit_version
         automation_id_str = (
             str(automation.get("automation_id") or "").strip() or None
         )

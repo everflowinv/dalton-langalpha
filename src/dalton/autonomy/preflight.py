@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -508,8 +509,69 @@ async def _verify_automation_workspace_ownership(
             status_code=403,
             detail="Valid workspace_id is required for Dalton automation execution",
         )
-    await verify_workspace_access(workspace_id, user_id)
+    await _verify_automation_workspace_ownership_web_write(workspace_id, user_id)
     return _VerifiedAutomationOwnership(user_id=user_id, workspace_id=workspace_id)
+
+
+async def _verify_automation_workspace_ownership_web_write(
+    workspace_id: str,
+    user_id: str,
+) -> None:
+    from src.dalton.sharing import ColleagueAccessRevokedError
+
+    try:
+        await verify_workspace_access(
+            workspace_id,
+            user_id,
+            need="write",
+            channel="web",
+        )
+    except ColleagueAccessRevokedError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+async def _is_stale_managed_unit_lead(
+    automation: Mapping[str, Any] | None = None,
+    *,
+    name: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    workspace_id: str | None,
+    user_id: str | None,
+    unit: Mapping[str, Any] | None = None,
+) -> bool:
+    """Return True when ``automation`` is a unit-managed task whose owner is no longer the active lead."""
+    from src.dalton.autonomy.classification import is_managed_unit_automation_for_unit
+    from src.dalton.database.coverage_units import get_active_unit_by_workspace
+    from src.dalton.settings import (
+        is_coverage_units_enabled,
+        is_dalton_supabase_auth_enabled,
+    )
+
+    ws_id = str(workspace_id or "").strip()
+    uid = str(user_id or "").strip()
+    if (
+        not ws_id
+        or not uid
+        or not is_coverage_units_enabled()
+        or not is_dalton_supabase_auth_enabled()
+    ):
+        return False
+    resolved_unit = unit if unit is not None else await get_active_unit_by_workspace(ws_id)
+    if resolved_unit is None:
+        return False
+    if not is_managed_unit_automation_for_unit(
+        automation,
+        name=name,
+        metadata=metadata,
+        unit=resolved_unit,
+    ):
+        return False
+    lead_uid = str(
+        resolved_unit.get("lead_analyst_user_id")
+        or resolved_unit.get("owner_user_id")
+        or ""
+    ).strip()
+    return bool(lead_uid and lead_uid != uid)
 
 
 HOME_COVERAGE_SYNC_TIMEOUT_S = 5.0
@@ -1104,6 +1166,7 @@ async def _conclude_preflight(
     load_saved_signals: bool,
     probe_progress: Optional[dict[str, Any]] = None,
     triage_timeout_s: Optional[float] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
 ) -> PreflightResult:
     """Upsert, triage, and claim ``emitted``. This is the only claim in a preflight.
 
@@ -1321,13 +1384,166 @@ async def _conclude_preflight(
 
     # Atomically claim unwoken signals (A10): filter out any signal already claimed by a concurrent execution
     signal_ids_to_mark = [str(s["signal_id"]) for s in woke_signals if s.get("signal_id")]
+    eff_meta_for_gate = metadata if metadata is not None else ({"ticker": ticker} if ticker else None)
+    if signal_ids_to_mark and await _is_stale_managed_unit_lead(
+        name=name,
+        metadata=eff_meta_for_gate,
+        workspace_id=workspace_id,
+        user_id=user_id,
+    ):
+        logger.info(
+            "[DALTON_PREFLIGHT] skipping managed unit automation %r before claiming %d signal(s): "
+            "user %s is no longer active unit lead",
+            name,
+            len(signal_ids_to_mark),
+            user_id,
+        )
+        return PreflightResult(
+            should_wake=False,
+            decision="skip",
+            reason="not_unit_lead_analyst",
+            signals=[],
+            wake_context=None,
+        )
     if persist and signal_ids_to_mark:
+        from uuid import UUID as _UUID
+        from src.dalton.autonomy.classification import (
+            is_managed_unit_automation,
+            is_managed_unit_automation_for_unit,
+        )
+        from src.dalton.database.coverage_units import (
+            get_active_unit_by_workspace,
+            get_coverage_unit,
+        )
+        from src.dalton.settings import (
+            is_coverage_units_enabled,
+            is_dalton_supabase_auth_enabled,
+        )
+        from src.server.database.pool import get_db_connection
+
+        valid_auto_uuid: str | None = None
+        if automation_id:
+            try:
+                valid_auto_uuid = str(_UUID(str(automation_id)))
+            except ValueError:
+                valid_auto_uuid = None
+
+        use_unit_tx = (
+            is_coverage_units_enabled()
+            and is_dalton_supabase_auth_enabled()
+            and bool(workspace_id)
+            and bool(valid_auto_uuid)
+            and not is_company_system_user(user_id)
+        )
+        claim_sig = inspect.signature(watch_db.claim_signals_woken)
+        accepts_conn = "conn" in claim_sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in claim_sig.parameters.values()
+        )
         try:
-            claimed_raw = await watch_db.claim_signals_woken(
-                signal_ids_to_mark,
-                execution_id,
-                workspace_id=workspace_id,
-            )
+            if use_unit_tx:
+                from psycopg.rows import dict_row
+
+                async with get_db_connection() as tx_conn, tx_conn.transaction():
+                    unit_row = await get_active_unit_by_workspace(
+                        str(workspace_id), conn=tx_conn, for_share=True
+                    )
+                    async with tx_conn.cursor(row_factory=dict_row) as cur:
+                        await cur.execute(
+                            """
+                            SELECT automation_id, user_id, workspace_id, status, deleted_at, name, metadata
+                            FROM automations
+                            WHERE automation_id = %s::uuid
+                            FOR SHARE
+                            """,
+                            (valid_auto_uuid,),
+                        )
+                        auto_row = await cur.fetchone()
+                    if (
+                        auto_row is None
+                        or auto_row.get("deleted_at") is not None
+                        or str(auto_row.get("status") or "").strip().lower()
+                        not in ("active", "executing")
+                    ):
+                        return PreflightResult(
+                            should_wake=False,
+                            decision="skip",
+                            reason="automation_inactive_or_deleted",
+                            signals=[],
+                            wake_context=None,
+                        )
+                    locked_ws_id = str(auto_row.get("workspace_id") or "").strip()
+                    if locked_ws_id != str(workspace_id or "").strip():
+                        return PreflightResult(
+                            should_wake=False,
+                            decision="skip",
+                            reason="workspace_changed",
+                            signals=[],
+                            wake_context=None,
+                        )
+                    auto_meta = auto_row.get("metadata")
+                    raw_meta_unit_id = (
+                        str(auto_meta.get("unit_id") or "").strip()
+                        if isinstance(auto_meta, dict)
+                        else ""
+                    )
+                    valid_meta_unit_id = ""
+                    if raw_meta_unit_id and is_managed_unit_automation(auto_row):
+                        try:
+                            valid_meta_unit_id = str(_UUID(raw_meta_unit_id))
+                        except (ValueError, TypeError, AttributeError):
+                            valid_meta_unit_id = ""
+                    if valid_meta_unit_id and (
+                        unit_row is None
+                        or str(unit_row.get("unit_id") or "").strip() != valid_meta_unit_id
+                    ):
+                        meta_unit_row = await get_coverage_unit(
+                            valid_meta_unit_id, conn=tx_conn
+                        )
+                        if meta_unit_row is not None:
+                            return PreflightResult(
+                                should_wake=False,
+                                decision="skip",
+                                reason="unit_unbound_or_archived",
+                                signals=[],
+                                wake_context=None,
+                            )
+                    if unit_row is not None and is_managed_unit_automation_for_unit(
+                        auto_row, unit=unit_row
+                    ):
+                        lead_uid = str(
+                            unit_row.get("lead_analyst_user_id")
+                            or unit_row.get("owner_user_id")
+                            or ""
+                        ).strip()
+                        auto_uid = str(auto_row.get("user_id") or "").strip()
+                        if lead_uid and auto_uid != lead_uid:
+                            return PreflightResult(
+                                should_wake=False,
+                                decision="skip",
+                                reason="not_unit_lead_analyst",
+                                signals=[],
+                                wake_context=None,
+                            )
+                    if accepts_conn:
+                        claimed_raw = await watch_db.claim_signals_woken(
+                            signal_ids_to_mark,
+                            execution_id,
+                            workspace_id=workspace_id,
+                            conn=tx_conn,
+                        )
+                    else:
+                        claimed_raw = await watch_db.claim_signals_woken(
+                            signal_ids_to_mark,
+                            execution_id,
+                            workspace_id=workspace_id,
+                        )
+            else:
+                claimed_raw = await watch_db.claim_signals_woken(
+                    signal_ids_to_mark,
+                    execution_id,
+                    workspace_id=workspace_id,
+                )
             claimed_ids = {
                 str(r.get("signal_id") if isinstance(r, dict) else r)
                 for r in (claimed_raw or [])
@@ -1445,6 +1661,7 @@ def _conclude_kwargs(
     load_saved_signals: bool,
     probe_progress: Optional[dict[str, Any]] = None,
     triage_timeout_s: Optional[float] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     return {
         "emitted": emitted,
@@ -1462,6 +1679,7 @@ def _conclude_kwargs(
         "load_saved_signals": load_saved_signals,
         "probe_progress": probe_progress,
         "triage_timeout_s": triage_timeout_s,
+        "metadata": metadata,
     }
 
 
@@ -1569,6 +1787,86 @@ async def _preflight_check_inner(
         tz = ZoneInfo(settings.autonomy.timezone)
     except Exception:
         tz = timezone.utc
+
+    # Price triggers bypass _conclude_preflight; verify active coverage-unit binding
+    # and lead ownership before returning wake or running probes.
+    if workspace_id:
+        from uuid import UUID as _UUID
+
+        from src.dalton.autonomy.classification import (
+            is_managed_unit_automation,
+            is_managed_unit_automation_for_unit,
+        )
+        from src.dalton.company_identity import is_company_system_user
+        from src.dalton.settings import (
+            is_coverage_units_enabled,
+            is_dalton_supabase_auth_enabled,
+        )
+
+        is_price_trigger = automation.get("trigger_type") == "price" or kind == "price_move"
+        if (
+            is_coverage_units_enabled()
+            and is_managed_unit_automation(automation)
+            and (is_price_trigger or is_dalton_supabase_auth_enabled())
+            and not is_company_system_user(user_id)
+        ):
+            from src.dalton.database.coverage_units import (
+                get_active_unit_by_workspace,
+                get_coverage_unit,
+            )
+
+            gate_skip_reason: str | None = None
+            raw_meta = automation.get("metadata")
+            raw_muid = (
+                str(raw_meta.get("unit_id") or "").strip()
+                if isinstance(raw_meta, Mapping)
+                else ""
+            )
+            valid_muid = ""
+            if raw_muid:
+                try:
+                    valid_muid = str(_UUID(raw_muid))
+                except (ValueError, TypeError, AttributeError):
+                    valid_muid = ""
+            active_unit = await get_active_unit_by_workspace(str(workspace_id))
+            if valid_muid and (
+                active_unit is None
+                or str(active_unit.get("unit_id") or "").strip() != valid_muid
+            ):
+                if await get_coverage_unit(valid_muid) is not None:
+                    gate_skip_reason = (
+                        "unit_rebound" if active_unit is not None else "unit_unbound_or_archived"
+                    )
+            elif active_unit is not None and is_managed_unit_automation_for_unit(
+                automation, unit=active_unit
+            ):
+                lead_uid = str(
+                    active_unit.get("lead_analyst_user_id")
+                    or active_unit.get("owner_user_id")
+                    or ""
+                ).strip()
+                if lead_uid and lead_uid != str(user_id or "").strip():
+                    gate_skip_reason = "not_unit_lead_analyst"
+            if gate_skip_reason is not None:
+                if persist:
+                    try:
+                        await watch_db.insert_preflight_log(
+                            automation_id=automation_id,
+                            automation_execution_id=execution_id,
+                            workspace_id=workspace_id,
+                            decision="skip",
+                            reason=gate_skip_reason,
+                            signals=[],
+                        )
+                    except Exception as e:
+                        logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", e)
+                return PreflightResult(
+                    should_wake=False,
+                    decision="skip",
+                    reason=gate_skip_reason,
+                    signals=[],
+                    wake_context=None,
+                )
 
     # Price triggers are already event-driven by upstream price monitor
     if automation.get("trigger_type") == "price" or kind == "price_move":
@@ -1952,6 +2250,11 @@ async def _preflight_check_inner(
         group_refresh_summary=group_refresh_summary,
         load_saved_signals=(kind == "company_watch"),
         probe_progress=probe_progress,
+        metadata=(
+            automation.get("metadata")
+            if isinstance(automation.get("metadata"), Mapping)
+            else None
+        ),
     )
     if isinstance(probe_progress, dict):
         probe_progress["conclude_kwargs"] = conclude_args
@@ -2122,6 +2425,26 @@ async def preflight_check(
             should_wake=False,
             decision="skip",
             reason="workspace_access_timeout",
+            signals=[],
+            wake_context=None,
+        )
+
+    if await _is_stale_managed_unit_lead(
+        automation,
+        workspace_id=verified_ownership.workspace_id,
+        user_id=verified_ownership.user_id,
+    ):
+        logger.info(
+            "[DALTON_PREFLIGHT] skipping managed unit automation %r (execution_id=%s): "
+            "user %s is no longer active unit lead",
+            automation.get("name"),
+            execution_id,
+            verified_ownership.user_id,
+        )
+        return PreflightResult(
+            should_wake=False,
+            decision="skip",
+            reason="not_unit_lead_analyst",
             signals=[],
             wake_context=None,
         )
