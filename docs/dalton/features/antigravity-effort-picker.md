@@ -328,6 +328,7 @@ Antigravity 返回 HTTP 429 `"individual quota reached"` 时，`antigravity_quot
        - **完整保留无公开价与参考成本字段**：合并行与每个档位子项同步累加 `fresh`、`cache_write`、`cache_read`、`output`、`total_tokens`、`prompt_tokens`、`records`、`calls`、`runs`、`cost_usd`、`unpriced_tokens`、`no_public_price`、`reference_cost_usd`、`reference_model`、`price_note`，确保 `:351-365` 的 `unpriced_models` 专栏（如无公开价但带 `reference_only` 参考估算的模型）不丢失任何词元或参考金额；
        - **`effort_breakdown` 闭合与幂等合并**：按 `(*REASONING_LEVELS, "unknown")` 顺序维护 `effort_breakdown[bucket]`（无后缀记录归入 `"unknown"`）；若输入行本身已包含 `effort_breakdown`（重复传入已合并结果），直接逐桶累加已有 `effort_breakdown` 而非重复套壳，保证 `merge_rows_by_model(merge_rows_by_model(rows))` 完全幂等，且**任意合并行的 `effort_breakdown` 各桶之和恒等于该合并行的 `total_tokens`、`calls`、`cost_usd`、`unpriced_tokens` 与 `reference_cost_usd`**。
    - **卡片展示**（`token_weekly_usage_tracker.py:675-745`）：在 Top 10 与长尾列表的系列合并行下附加档位明细（例如：`· 档位明细: high 420.0K (300 次, $3.15) ｜ medium 200.0K (150 次, $1.42) ｜ 档位未知 35.0K (20 次, $0.25)`；无公开价档位显示 `无公开价` 或参考估算）。
+   - **已知限制（同名 BYOK 自定义模型覆盖）**：内部用量接口 `/api/v1/dalton/internal/usage/by-model` 保持仅按 `by_model` 模型键聚合，不区分内置模型与同名用户自定义模型；若用户用 BYOK 自定义模型覆盖了内置 Antigravity 模型键（如 `gemini-4-neon-high-oauth`），周报中该模型键的用量会按对应内置系列展示。
 
 ---
 
