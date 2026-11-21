@@ -446,6 +446,10 @@ ALLOWED_HOOKS=(
   # Preserve server-written dalton_historical_duplicate_of marker in
   # SERVER_OWNED_CONFIG_KEYS across whole-config replacements (workspace.py).
   "historical-duplicate-marker"
+  # SYNC10 (#831): deployment kill switch for the built-in browser — skips
+  # browser_runtime / agent-browser wrapper uploads, browser-quality sync &
+  # endpoint, browser_available, and default sandbox image agent-browser install.
+  "browser-kill-switch"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -997,6 +997,7 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
       onWorkspaceCreated: null,
       onFileArtifact: null,
       onPreviewUrl: null,
+      onBrowserUse: null,
       setMessages: (updater) => {
         liveMessages = typeof updater === 'function' ? updater(liveMessages) : updater;
       },
