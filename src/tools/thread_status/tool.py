@@ -617,11 +617,17 @@ class _Automations:
         if not self.r.user_id:
             return []
         rows = await automation.list_all_automations(self.r.user_id)
+        matching = [row for row in rows if self._here(row)]
+        # DALTON-HOOK(execution-delivery-status): enrich automation last_execution with delivery_summary
+        from src.dalton.services.execution_delivery_status import (
+            enrich_automations_with_delivery_summary,
+        )
+
+        await enrich_automations_with_delivery_summary(matching)
         return [
             item
-            for row in rows
-            if self._here(row)
-            and (item := listing.automation_item(row, self.r.now)) is not None
+            for row in matching
+            if (item := listing.automation_item(row, self.r.now)) is not None
         ]
 
     def claims(self, item_id: str) -> bool:
@@ -637,6 +643,12 @@ class _Automations:
         for file_name in (name, f"{name}.json"):
             row = await automation.get_automation_file(self.r.user_id, file_name)
             if row is not None and self._here(row):
+                # DALTON-HOOK(execution-delivery-status): enrich automation detail last_execution with delivery_summary
+                from src.dalton.services.execution_delivery_status import (
+                    enrich_automations_with_delivery_summary,
+                )
+
+                await enrich_automations_with_delivery_summary([row])
                 item = listing.automation_item(row, self.r.now)
                 detail = listing.automation_detail(
                     row, self.r.now, SandboxLayout.AUTOMATIONS_DIR

@@ -785,6 +785,37 @@ WaitReason = Literal["thread_busy", "computer_unreachable"]
 FailureReason = Literal["usage_limit", "claude_plan", "plan_limit", "provider_auth", "server_error", "interrupted"]
 
 
+# DALTON-HOOK(execution-delivery-status): structured per-execution delivery summary models
+ExecutionDeliveryStatus = Literal["delivered", "failed", "partial_failed", "retrying"]
+
+
+class ExecutionDeliveryTarget(BaseModel):
+    """Normalized delivery outcome for one configured target."""
+
+    target: Optional[str] = None
+    channel: Optional[str] = None
+    name: Optional[str] = None
+    status: Literal["sent", "failed", "retrying"]
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    attempt_count: int = 0
+    max_attempts: int = 3
+
+
+class ExecutionDeliverySummary(BaseModel):
+    """Aggregate delivery state for one execution without altering execution status."""
+
+    status: ExecutionDeliveryStatus
+    total_targets: int = 0
+    sent_count: int = 0
+    failed_count: int = 0
+    retrying_count: int = 0
+    failure_code: Optional[str] = None
+    failure_reason: Optional[str] = None
+    failure_reasons: List[str] = Field(default_factory=list)
+    targets: List[ExecutionDeliveryTarget] = Field(default_factory=list)
+
+
 class AutomationExecutionResponse(BaseModel):
     """One execution: a history row, and an automation's newest run."""
 
@@ -804,6 +835,8 @@ class AutomationExecutionResponse(BaseModel):
     wait_reason: Optional[str] = None
     server_id: Optional[str] = None
     delivery_result: Optional[List[Dict[str, Any]]] = None
+    # DALTON-HOOK(execution-delivery-status): aggregated delivery status across notify ledger and delivery_result
+    delivery_summary: Optional[ExecutionDeliverySummary] = None
     created_at: datetime
     # When the user took this failed run out of Needs attention.
     dismissed_at: Optional[datetime] = None
@@ -917,6 +950,8 @@ class ScriptExecutionResponse(BaseModel):
     exit_code: Optional[int] = None
     failure_reason: Optional[str] = None
     notify_status: Optional[str] = None
+    # DALTON-HOOK(execution-delivery-status): aggregated delivery summary for script runs
+    delivery_summary: Optional[ExecutionDeliverySummary] = None
     triggered_by_user_id: Optional[str] = None
     log_tail: Optional[str] = None
     trigger_source: Optional[str] = None
@@ -994,6 +1029,8 @@ class ScriptRunResponse(BaseModel):
     exit_code: Optional[int] = None
     failure_reason: Optional[str] = None
     notify_status: Optional[str] = None
+    # DALTON-HOOK(execution-delivery-status): aggregated delivery summary for script runs
+    delivery_summary: Optional[ExecutionDeliverySummary] = None
     triggered_by_user_id: Optional[str] = None
     log_tail: Optional[str] = None
     trigger_source: Optional[str] = None

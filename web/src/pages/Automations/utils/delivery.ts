@@ -1,7 +1,16 @@
 import type { TFunction } from 'i18next';
 import { isDmAddress, messagingAppName, platformOf } from '@/pages/ChatAgent/components/messaging/messageDelivery';
 import { apiErrorDetail, apiErrorStatus } from '@/api/errors';
-import type { DeliveryAttempt, DeliveryDefault, DeliveryOptions } from '@/types/automation';
+// DALTON-HOOK(execution-delivery-status): import execution delivery summary types
+import type {
+  AutomationExecution,
+  DeliveryAttempt,
+  DeliveryDefault,
+  DeliveryOptions,
+  ExecutionDeliveryStatus,
+  ExecutionDeliverySummary,
+  ExecutionDeliveryTarget,
+} from '@/types/automation';
 import { mutationErrorMessage } from './errors';
 
 const METHOD_KEY: Record<string, string> = {
@@ -95,12 +104,27 @@ export function deliveryAttemptName(attempt: DeliveryAttempt, t: TFunction, name
   return deliveryMethodName(attempt.method, t);
 }
 
-export type DeliveryOutcome = 'sent' | 'fallback' | 'notice' | 'failed';
+// DALTON-HOOK(execution-delivery-status): include retrying outcome with 3-minute settle-window fallback
+export type DeliveryOutcome = 'sent' | 'fallback' | 'notice' | 'failed' | 'retrying';
+
+function withinDeliverySettleWindow(completedAt: string | null | undefined, now = Date.now()): boolean {
+  if (!completedAt) return true;
+  const parsed = Date.parse(completedAt);
+  if (Number.isNaN(parsed)) return false;
+  const elapsed = now - parsed;
+  return elapsed >= 0 && elapsed < DELIVERY_SETTLE_WINDOW_MS;
+}
 
 /** How a delivery went: the agent sent it (or, for an older run, it was
- *  posted), its final answer was posted for it, a notice went, or it failed. */
-export function deliveryOutcome(attempt: DeliveryAttempt): DeliveryOutcome {
-  if (!attempt.success) return 'failed';
+ *  posted), its final answer was posted for it, a notice went, it is retrying, or it failed. */
+export function deliveryOutcome(
+  attempt: DeliveryAttempt,
+  completedAt?: string | null,
+  now = Date.now(),
+): DeliveryOutcome {
+  if (!attempt.success) {
+    return attempt.retrying === true && withinDeliverySettleWindow(completedAt, now) ? 'retrying' : 'failed';
+  }
   if (attempt.via === 'fallback') return 'fallback';
   if (attempt.via === 'notice') return 'notice';
   return 'sent';
@@ -111,11 +135,19 @@ const OUTCOME_KEY: Record<DeliveryOutcome, string> = {
   fallback: 'automation.deliveredFallbackVia',
   notice: 'automation.deliveredNoticeVia',
   failed: 'automation.deliveryFailedVia',
+  // DALTON-HOOK(execution-delivery-status): retrying label key & settle-window forwarding
+  retrying: 'automation.deliveryRetryingVia',
 };
 
 /** One delivery as a phrase: "sent to #demo", "#demo delivery failed". */
-export function deliveryAttemptLabel(attempt: DeliveryAttempt, t: TFunction, names?: DeliveryNames): string {
-  return t(OUTCOME_KEY[deliveryOutcome(attempt)], { method: deliveryAttemptName(attempt, t, names) });
+export function deliveryAttemptLabel(
+  attempt: DeliveryAttempt,
+  t: TFunction,
+  names?: DeliveryNames,
+  completedAt?: string | null,
+  now = Date.now(),
+): string {
+  return t(OUTCOME_KEY[deliveryOutcome(attempt, completedAt, now)], { method: deliveryAttemptName(attempt, t, names) });
 }
 
 // ── Refusals ───────────────────────────────────────────────
@@ -161,4 +193,280 @@ export function deliveryDefaultError(err: unknown, t: TFunction): string {
     : [];
   if (messages.length) return messages.join(' ');
   return mutationErrorMessage(err, t('automation.deliveryDefaultFailed'));
+}
+
+// DALTON-HOOK(execution-delivery-status): normalize and localize execution delivery outcomes & failure reasons
+const DELIVERY_SETTLE_WINDOW_MS = 3 * 60_000;
+const SYNCED_UNDELIVERED_RE = /已生成但未送达[（(]([^）)]+)[）)]/;
+const SYNCED_EXCERPT_SUFFIX_RE =
+  /(?:(?:\s*\n+\s*|\s+)投递状态：已生成但未送达(?:[（(][^）)]*[）)])?|^\s*投递状态：已生成但未送达(?:[（(][^）)]*[）)])?)\s*$/;
+const CARD_ELEMENT_LIMIT_RE = /(?:element\s+card\s+limit|exceeds\s+\d+\s+element\s+card\s+limit)/i;
+const CARD_BYTE_LIMIT_RE = /(?:byte\s+card\s+limit|exceeds\s+\d+\s+byte\s+card\s+limit|30720|card\s+too\s+large)/i;
+
+const CARD_LIMIT_UPGRADEABLE_CODES = new Set([
+  '',
+  'not_allowed',
+  'card_limit_exceeded',
+  'card_element_limit_exceeded',
+]);
+
+const DELIVERY_REASON_KEY: Record<string, string> = {
+  card_limit_exceeded: 'automation.deliveryReasonCardLimit',
+  card_element_limit_exceeded: 'automation.deliveryReasonCardElementLimit',
+  attempts_exhausted: 'automation.deliveryReasonAttemptsExhausted',
+  target_failed: 'automation.deliveryReasonTargetFailed',
+  delivery_failed: 'automation.deliveryReasonTargetFailed',
+  delivery_uncertain: 'automation.deliveryReasonUnconfirmed',
+  delivery_unconfirmed: 'automation.deliveryReasonUnconfirmed',
+  unknown: 'automation.deliveryReasonUnconfirmed',
+  in_flight: 'automation.deliveryReasonUnconfirmed',
+  partial: 'automation.deliveryReasonUnconfirmed',
+  gateway_restarted: 'automation.deliveryReasonUnconfirmed',
+  feishu_cards_not_supported: 'automation.deliveryReasonUnsupportedMedia',
+  images_not_supported: 'automation.deliveryReasonUnsupportedMedia',
+  image_placeholder_not_supported: 'automation.deliveryReasonUnsupportedMedia',
+  missing_card: 'automation.deliveryReasonEmptyContent',
+  missing_text: 'automation.deliveryReasonEmptyContent',
+  unsupported_platform: 'automation.deliveryReasonUnsupportedPlatform',
+  service_token_unconfigured: 'automation.deliveryReasonGatewayUnconfigured',
+  gateway_url_unconfigured: 'automation.deliveryReasonGatewayUnconfigured',
+  connecterror: 'automation.deliveryReasonGatewayUnavailable',
+  connecttimeout: 'automation.deliveryReasonGatewayUnavailable',
+  http_500: 'automation.deliveryReasonGatewayUnavailable',
+  http_502: 'automation.deliveryReasonGatewayUnavailable',
+  http_503: 'automation.deliveryReasonGatewayUnavailable',
+  http_504: 'automation.deliveryReasonGatewayUnavailable',
+  not_allowed: 'automation.deliveryReasonNotAllowed',
+};
+
+export function stripSyncedDeliveryExcerptSuffix(excerpt: string | null | undefined): string | null {
+  if (typeof excerpt !== 'string') return null;
+  const cleaned = excerpt.replace(SYNCED_EXCERPT_SUFFIX_RE, '').trim();
+  return cleaned || null;
+}
+
+export function detectDeliveryErrorCode(
+  code: string | null | undefined,
+  message?: string | null,
+): string | null {
+  let rawCode = (code ?? '').trim();
+  const rawMsg = (message ?? '').trim();
+  if (!rawCode && rawMsg) {
+    const matched = SYNCED_UNDELIVERED_RE.exec(rawMsg);
+    if (matched?.[1]) rawCode = matched[1].trim();
+  }
+  const lower = rawCode.toLowerCase();
+  if (CARD_LIMIT_UPGRADEABLE_CODES.has(lower)) {
+    if (CARD_ELEMENT_LIMIT_RE.test(rawMsg)) return 'card_element_limit_exceeded';
+    if (lower === 'card_limit_exceeded' || CARD_BYTE_LIMIT_RE.test(rawMsg)) return 'card_limit_exceeded';
+  }
+  if (lower && lower in DELIVERY_REASON_KEY) return lower;
+  return lower || null;
+}
+
+export function formatDeliveryFailureReason(
+  code: string | null | undefined,
+  fallback: string | null | undefined,
+  t: TFunction,
+): string | null {
+  const detected = detectDeliveryErrorCode(code, fallback);
+  if (detected && DELIVERY_REASON_KEY[detected]) {
+    return t(DELIVERY_REASON_KEY[detected]);
+  }
+  const raw = (fallback ?? '').trim();
+  if (raw) {
+    const matched = SYNCED_UNDELIVERED_RE.exec(raw);
+    if (matched?.[1]) {
+      const inner = matched[1].trim();
+      const innerKey = DELIVERY_REASON_KEY[inner.toLowerCase()];
+      return innerKey ? t(innerKey) : inner;
+    }
+    return raw;
+  }
+  return detected;
+}
+
+// DALTON-HOOK(execution-delivery-status): normalize target addresses for strict per-target attempt/name matching
+const FEISHU_OPEN_ID_RE = /^ou_[A-Za-z0-9_-]+$/;
+const FEISHU_CHAT_ID_RE = /^oc_[A-Za-z0-9_-]+$/;
+const DISCORD_SNOWFLAKE_RE = /^[0-9]{5,32}$/;
+
+/** Canonical `(platform, kind, ident)` key for matching a summary target against attempts and chat names. */
+export function normalizeDeliveryTargetKey(
+  rawTarget: string | null | undefined,
+  fallbackChannel?: string | null,
+): string | null {
+  const cleaned = (rawTarget ?? '').trim();
+  if (!cleaned) return null;
+  const parts = cleaned.split(':');
+  if (parts.length === 1) {
+    const platform = (fallbackChannel ?? '').trim().toLowerCase();
+    const ident = parts[0].trim();
+    if (!platform || !ident) return null;
+    if (ident.toLowerCase() === platform) return `${platform}:app`;
+    if (ident === '@me') return `${platform}:dm:@me`;
+    if (platform === 'feishu' && FEISHU_OPEN_ID_RE.test(ident)) return `feishu:dm:${ident}`;
+    if (platform === 'feishu' && FEISHU_CHAT_ID_RE.test(ident)) return `feishu:group:${ident}`;
+    if (platform === 'discord' && DISCORD_SNOWFLAKE_RE.test(ident)) return `discord:group:${ident}`;
+    return `${platform}:raw:${ident}`;
+  }
+  const platform = parts[0].trim().toLowerCase();
+  if (!platform) return null;
+  if (parts.length === 2) {
+    const second = parts[1].trim();
+    if (!second) return null;
+    if (second === '@me') return `${platform}:dm:@me`;
+    if (platform === 'feishu' && FEISHU_OPEN_ID_RE.test(second)) return `feishu:dm:${second}`;
+    if (platform === 'feishu' && FEISHU_CHAT_ID_RE.test(second)) return `feishu:group:${second}`;
+    if (platform === 'discord' && DISCORD_SNOWFLAKE_RE.test(second)) return `discord:group:${second}`;
+    return `${platform}:raw:${second}`;
+  }
+  const subkind = parts[1].trim().toLowerCase();
+  const ident = parts.slice(2).join(':').trim();
+  if (!ident) return null;
+  if (subkind === 'user') return `${platform}:dm:${ident}`;
+  if (subkind === 'chat' || subkind === 'channel' || subkind === 'group') return `${platform}:group:${ident}`;
+  return `${platform}:raw:${parts.slice(1).join(':').trim()}`;
+}
+
+/** Match a backend delivery_summary target back to a delivery_result attempt by exact or normalized address. */
+export function matchAttemptForTarget(
+  target: ExecutionDeliveryTarget,
+  attempts: readonly DeliveryAttempt[],
+): DeliveryAttempt | null {
+  const tAddr = (target.target ?? '').trim();
+  const tChan = (target.channel ?? '').trim().toLowerCase();
+  if (tAddr) {
+    const byExact = attempts.find((a) => (a.address ?? '').trim() === tAddr || a.method.trim() === tAddr);
+    if (byExact) return byExact;
+
+    const targetKey = normalizeDeliveryTargetKey(tAddr, tChan);
+    if (targetKey && !targetKey.endsWith(':app')) {
+      const byNormalized = attempts.find((a) => {
+        const aChan = a.method.split(':', 1)[0]?.trim().toLowerCase() ?? '';
+        const addrKey = normalizeDeliveryTargetKey(a.address, aChan);
+        if (addrKey && addrKey === targetKey) return true;
+        const methodKey = normalizeDeliveryTargetKey(a.method, aChan);
+        return methodKey === targetKey;
+      });
+      if (byNormalized) return byNormalized;
+      return null;
+    }
+  }
+  // Bare app-level target (no specific chat address): only match a bare app-level attempt on the same channel.
+  if (tChan && (!tAddr || tAddr.toLowerCase() === tChan)) {
+    const bareAttempts = attempts.filter(
+      (a) => !(a.address ?? '').trim() && a.method.trim().toLowerCase() === tChan,
+    );
+    if (bareAttempts.length === 1) return bareAttempts[0];
+  }
+  return null;
+}
+
+/** Display name for a delivery_summary target in history rows and error lines. */
+export function deliveryTargetName(
+  target: ExecutionDeliveryTarget,
+  t: TFunction,
+  names?: DeliveryNames,
+  matchedAttempt?: DeliveryAttempt | null,
+): string {
+  if (target.name) return target.name;
+  if (matchedAttempt?.name) return matchedAttempt.name;
+  const addr = (target.target ?? '').trim();
+  const chan = (target.channel ?? '').trim().toLowerCase();
+  if (addr && names) {
+    if (namesChat(addr)) {
+      const exact = names.get(addr);
+      if (exact) return exact;
+    }
+    const targetKey = normalizeDeliveryTargetKey(addr, chan);
+    if (targetKey && !targetKey.endsWith(':app')) {
+      for (const [knownAddr, knownName] of names.entries()) {
+        if (normalizeDeliveryTargetKey(knownAddr) === targetKey) return knownName;
+      }
+    }
+  }
+  if (matchedAttempt) return deliveryAttemptName(matchedAttempt, t, names);
+  const fallbackKey = addr || chan;
+  return fallbackKey ? deliveryMethodName(fallbackKey, t) : t('automation.delivery');
+}
+
+export function resolveExecutionDelivery(
+  run: Pick<AutomationExecution, 'delivery_summary' | 'delivery_result' | 'completed_at'>,
+  now = Date.now(),
+): ExecutionDeliverySummary | null {
+  if (run.delivery_summary) return run.delivery_summary;
+  const attempts = run.delivery_result;
+  if (!attempts || attempts.length === 0) return null;
+
+  const withinSettle =
+    !run.completed_at ||
+    (() => {
+      const elapsed = now - Date.parse(run.completed_at);
+      return elapsed >= 0 && elapsed < DELIVERY_SETTLE_WINDOW_MS;
+    })();
+
+  const targets: ExecutionDeliveryTarget[] = [];
+  let sentCount = 0;
+  let failedCount = 0;
+  let retryingCount = 0;
+  let firstCode: string | null = null;
+  const failureReasons: string[] = [];
+
+  for (const attempt of attempts) {
+    if (attempt.success) {
+      sentCount += 1;
+      targets.push({
+        target: attempt.address ?? attempt.method,
+        channel: attempt.method.split(':', 1)[0]?.toLowerCase() || null,
+        name: attempt.name ?? null,
+        status: 'sent',
+      });
+      continue;
+    }
+    const err = (attempt.error ?? '').trim();
+    if (attempt.retrying === true && withinSettle) {
+      retryingCount += 1;
+      targets.push({
+        target: attempt.address ?? attempt.method,
+        channel: attempt.method.split(':', 1)[0]?.toLowerCase() || null,
+        name: attempt.name ?? null,
+        status: 'retrying',
+      });
+      continue;
+    }
+    failedCount += 1;
+    const detected = detectDeliveryErrorCode(null, err);
+    if (!firstCode && detected) firstCode = detected;
+    if (err && !failureReasons.includes(err)) failureReasons.push(err);
+    targets.push({
+      target: attempt.address ?? attempt.method,
+      channel: attempt.method.split(':', 1)[0]?.toLowerCase() || null,
+      name: attempt.name ?? null,
+      status: 'failed',
+      error_code: detected,
+      error_message: err || null,
+    });
+  }
+
+  let status: ExecutionDeliveryStatus;
+  if (retryingCount > 0) status = 'retrying';
+  else if (failedCount === 0) status = 'delivered';
+  else if (sentCount > 0) status = 'partial_failed';
+  else status = 'failed';
+
+  return {
+    status,
+    total_targets: targets.length,
+    sent_count: sentCount,
+    failed_count: failedCount,
+    retrying_count: retryingCount,
+    failure_code: status === 'failed' || status === 'partial_failed' ? firstCode : null,
+    failure_reason:
+      (status === 'failed' || status === 'partial_failed') && failureReasons.length > 0
+        ? failureReasons[0]
+        : null,
+    failure_reasons: status === 'failed' || status === 'partial_failed' ? failureReasons : [],
+    targets,
+  };
 }

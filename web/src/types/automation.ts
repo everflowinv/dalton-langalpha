@@ -67,6 +67,34 @@ export interface DeliveryAttempt {
   name?: string | null;
   via?: DeliveryVia | null;
   error?: string | null;
+  // DALTON-HOOK(execution-delivery-status): persisted sender retry decision for failed attempts
+  retrying?: boolean | null;
+}
+
+// DALTON-HOOK(execution-delivery-status): structured delivery summary attached by backend
+export type ExecutionDeliveryStatus = 'delivered' | 'failed' | 'partial_failed' | 'retrying';
+
+export interface ExecutionDeliveryTarget {
+  target?: string | null;
+  channel?: string | null;
+  name?: string | null;
+  status: 'sent' | 'failed' | 'retrying';
+  error_code?: string | null;
+  error_message?: string | null;
+  attempt_count?: number;
+  max_attempts?: number;
+}
+
+export interface ExecutionDeliverySummary {
+  status: ExecutionDeliveryStatus;
+  total_targets: number;
+  sent_count: number;
+  failed_count: number;
+  retrying_count: number;
+  failure_code?: string | null;
+  failure_reason?: string | null;
+  failure_reasons?: string[];
+  targets?: ExecutionDeliveryTarget[];
 }
 
 /** A chat an app offers as a delivery target. `kind` is e.g. `dm` or `channel`. */
@@ -117,6 +145,8 @@ export interface AutomationExecution {
   wait_reason?: WaitReason | null;
   failure_reason: FailureReason | null;
   delivery_result: DeliveryAttempt[] | null;
+  // DALTON-HOOK(execution-delivery-status): aggregated delivery status across notify ledger and delivery_result
+  delivery_summary?: ExecutionDeliverySummary | null;
   created_at: string;
   /** The start of the run's final answer, as plain text, when it gave one. */
   excerpt: string | null;
@@ -275,6 +305,8 @@ export interface ScriptExecutionRead {
   exit_code: number | null;
   failure_reason: string | null;
   notify_status: string | null;
+  // DALTON-HOOK(execution-delivery-status): aggregated delivery summary for script runs
+  delivery_summary?: ExecutionDeliverySummary | null;
   triggered_by_user_id: string | null;
   log_tail: string | null;
   trigger_source: string | null;

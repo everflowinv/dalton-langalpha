@@ -338,8 +338,14 @@ async def list_company_automations(
             )
         )
     ordered = sorted(items, key=company_catalog_sort_key)
+    page_items = ordered[offset : offset + limit]
+    from src.dalton.services.execution_delivery_status import (
+        enrich_automations_with_delivery_summary,
+    )
+
+    await enrich_automations_with_delivery_summary(page_items)
     return AutomationsListResponse(
-        automations=ordered[offset : offset + limit],
+        automations=page_items,
         total=len(ordered),
     )
 
@@ -363,12 +369,18 @@ async def get_script_automation(
     runs = await company_data_db.list_latest_script_runs([job_key])
     route_map = await _legacy_routes_by_job([def_row])
     routes, source = _notify_view(def_row, route_map.get(job_key, []))
-    return _adapt_data_task_to_automation_response(
+    resp = _adapt_data_task_to_automation_response(
         def_row,
         latest_run=runs.get(job_key),
         notify_routes=routes,
         notify_source=source,
     )
+    from src.dalton.services.execution_delivery_status import (
+        enrich_automations_with_delivery_summary,
+    )
+
+    await enrich_automations_with_delivery_summary([resp])
+    return resp
 
 
 async def list_company_execution_feed(
@@ -528,6 +540,11 @@ async def _execution_page(
             executions.append(_script_run_model(row))
         else:
             executions.append(_agent_run_model(row))
+    from src.dalton.services.execution_delivery_status import (
+        enrich_executions_with_delivery_summary,
+    )
+
+    await enrich_executions_with_delivery_summary(executions)
     return AutomationRunsListResponse(executions=executions, has_more=has_more)
 
 
