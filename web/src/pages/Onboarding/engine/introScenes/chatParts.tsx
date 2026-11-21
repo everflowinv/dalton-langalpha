@@ -13,7 +13,7 @@ import {
   Paperclip,
   type LucideProps,
 } from 'lucide-react';
-import { LangAlphaMark } from '@/components/brand/LangAlphaMark';
+import { BrandMark } from '@/components/brand/BrandMark'; // DALTON-HOOK(brand-name)
 import { useLocale } from '@/hooks/useLocale';
 import { compactNumber } from '@/lib/format';
 import { cn } from '@/lib/utils';
@@ -125,7 +125,7 @@ export function HandoffSlip({
         className="flex h-4 w-4 items-center justify-center rounded-full border"
         style={{ borderColor: 'var(--color-border-default)', color: 'var(--color-text-primary)' }}
       >
-        <LangAlphaMark className="h-[8.5px] w-[8.5px]" />
+        <BrandMark className="h-[8.5px] w-[8.5px]" /> {/* DALTON-HOOK(brand-name) */}
       </span>
       <span className="min-w-0">
         <span

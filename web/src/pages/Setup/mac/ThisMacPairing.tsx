@@ -6,6 +6,7 @@
  */
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle, Check, Laptop } from 'lucide-react';
+import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { CreateRefusal } from '@/pages/ChatAgent/components/addComputer';
 import { ArtFrame } from '@/pages/ChatAgent/components/machineArt/ArtFrame';
 import { MachineArt } from '@/pages/ChatAgent/components/machineArt/MachineArt';
@@ -72,7 +73,7 @@ export function ThisMacPairingBody({ pairing, account }: { pairing: ThisMacPairi
           <Group>
             <AccessRow
               icon={<Laptop />}
-              name="LangAlpha"
+              name={BRAND_NAME} // DALTON-HOOK(brand-name)
               detail={t(`${T}.step.loginItemsPath`)}
               wrapDetail
               action={<RowButton onClick={pairing.retry}>{t(`${T}.openLoginItems`)}</RowButton>}
