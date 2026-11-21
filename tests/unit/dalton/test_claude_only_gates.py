@@ -1,8 +1,8 @@
 """Dalton's own lines never take the Claude-only request machinery (#631).
 
 The preserved-thinking work gates every Claude-only field — the fixed tools
-array with ``tool_addition``/``tool_removal`` rows, turn-scoped system
-messages, the tool-change and thinking-binding betas — on a ``ChatAnthropic``
+array with ``tool_addition``/``tool_removal`` rows, the tool-change and
+thinking-binding betas (turn-scoped system messages went upstream in #844) — on a ``ChatAnthropic``
 client pointed at the official ``api.anthropic.com`` host. Dalton's own
 providers are OpenAI-SDK or Gemini-SDK clients, and an Anthropic-compatible
 coding-plan host is not the official host, so a gate keyed on the SDK alone

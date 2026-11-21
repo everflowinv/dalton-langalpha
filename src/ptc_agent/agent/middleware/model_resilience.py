@@ -405,13 +405,16 @@ class ModelResilienceMiddleware(AgentMiddleware):
         fallback_name: str,
         fallback_client: Any,
     ) -> ModelRequest:
-        """Attach a request-only note on non-Claude fallback calls so the model
-        knows its own identity and which designated model it stands in for (named
-        directly, since not every graph renders a ``<model>`` block); Claude fallbacks stay untouched so ``SystemPinMiddleware``
-        keeps the pinned system message intact for bound thinking."""
-        from ptc_agent.agent.middleware.compaction.measure import is_claude
+        """Attach a request-only note on fallback calls so the model knows its
+        own identity and which designated model it stands in for (named
+        directly, since not every graph renders a ``<model>`` block). A
+        fallback that binds its reasoning to the prefix (Claude, GPT-6.2 on;
+        see ``binds_reasoning``) stays untouched, so ``SystemPinMiddleware``
+        keeps the pinned system message byte for byte and never stores the
+        note in the pin."""
+        from ptc_agent.agent.middleware.thinking_binding import binds_reasoning
 
-        if not hasattr(req, "system_message") or is_claude(fallback_client):
+        if not hasattr(req, "system_message") or binds_reasoning(fallback_client):
             return req
         primary_label = (
             client_label(original_request.model, self._catalog_name(original_request))
