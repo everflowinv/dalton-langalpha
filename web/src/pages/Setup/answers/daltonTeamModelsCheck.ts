@@ -31,6 +31,14 @@ import type { PlatformModelsResponse } from '@/types/platform';
 const MODELS_STALE_MS = 5 * 60_000;
 const PROVIDER_MODELS_STALE_MS = 10 * 60_000;
 
+const retryGenerationByClient = new WeakMap<QueryClient, number>();
+const refreshedProvidersByClient = new WeakMap<QueryClient, { gen: number; providers: Set<string> }>();
+
+/** Mark an explicit user retry so the next shared availability check refreshes server-cached provider lists. */
+export function bumpDaltonTeamModelsRetry(queryClient: QueryClient): void {
+  retryGenerationByClient.set(queryClient, (retryGenerationByClient.get(queryClient) ?? 0) + 1);
+}
+
 /**
  * Fallback reasons from `/api/v1/providers/{p}/available-models` where the
  * provider explicitly rejected the credential (401/403, revoked OAuth, or a
@@ -93,6 +101,8 @@ export interface CheckDaltonTeamModelsParams {
   byokEnabled: boolean;
   providersUnread: boolean;
   policy: AccountPolicy | null;
+  /** Non-zero generation bumped on explicit Retry to bypass server-cached provider lists with `?refresh=1`. */
+  retryGeneration?: number;
 }
 
 export interface DaltonTeamModelsCheckResult {
@@ -115,6 +125,7 @@ export async function checkDaltonTeamModelsAvailable({
   byokEnabled: byokSwitch,
   providersUnread,
   policy,
+  retryGeneration = retryGenerationByClient.get(queryClient) ?? 0,
 }: CheckDaltonTeamModelsParams): Promise<DaltonTeamModelsCheckResult> {
   if (providersUnread) {
     throw new Error('Configured providers could not be read');
@@ -186,15 +197,34 @@ export async function checkDaltonTeamModelsAvailable({
     .filter((p) => (p.access_type === 'oauth' ? ownSignIns && p.state === 'connected' : !isPlatformMode || byokEnabled))
     .map((p) => p.provider);
 
+  let refreshed = refreshedProvidersByClient.get(queryClient);
+  if (retryGeneration > 0 && (!refreshed || refreshed.gen !== retryGeneration)) {
+    refreshed = { gen: retryGeneration, providers: new Set<string>() };
+    refreshedProvidersByClient.set(queryClient, refreshed);
+  }
+
   const settled = await Promise.allSettled(
-    listedProviders.map((provider) =>
-      queryClient.fetchQuery<AvailableModels>({
+    listedProviders.map(async (provider) => {
+      const shouldRefresh = retryGeneration > 0 && !refreshed?.providers.has(provider);
+      const data = await queryClient.fetchQuery<AvailableModels>({
         queryKey: queryKeys.providerModels.available(provider, ''),
-        queryFn: ({ signal }) => getProviderAvailableModels(provider, { signal }),
-        staleTime: PROVIDER_MODELS_STALE_MS,
+        queryFn: ({ signal }) => getProviderAvailableModels(provider, {
+          ...(shouldRefresh ? { refresh: true } : {}),
+          signal,
+        }),
+        staleTime: shouldRefresh ? 0 : PROVIDER_MODELS_STALE_MS,
         retry: false,
-      }),
-    ),
+      });
+      if (shouldRefresh && refreshed?.gen === retryGeneration) {
+        refreshed.providers.add(provider);
+        const whole = queryKeys.providerModels.available(provider, '');
+        queryClient.removeQueries({
+          queryKey: queryKeys.providerModels.availableFor(provider),
+          predicate: (q) => q.queryKey.at(-1) !== whole.at(-1),
+        });
+      }
+      return data;
+    }),
   );
 
   const outcomes: ProviderAvailabilityOutcome[] = settled.map((entry) =>

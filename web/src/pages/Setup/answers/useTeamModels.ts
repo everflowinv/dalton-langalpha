@@ -10,7 +10,11 @@ import { useAllModels, type UseAllModelsResult } from '@/hooks/useAllModels';
 import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
 import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { queryKeys } from '@/lib/queryKeys';
-import { collectRejectedProviders, REJECTED_CREDENTIAL_REASONS } from './daltonTeamModelsCheck';
+import {
+  bumpDaltonTeamModelsRetry,
+  collectRejectedProviders,
+  REJECTED_CREDENTIAL_REASONS,
+} from './daltonTeamModelsCheck';
 import { useDaltonTeamModelsAvailable } from './useTeamModelsAvailable';
 
 const STALE_MS = 10 * 60_000;
@@ -88,17 +92,39 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
   );
 
   const retry = useCallback(() => {
+    bumpDaltonTeamModelsRetry(queryClient);
     void Promise.all([
       queryClient.invalidateQueries({ queryKey: queryKeys.dalton.credentialsStatus(userId) }),
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all }),
       queryClient.invalidateQueries({ queryKey: queryKeys.user.apiKeys() }),
       queryClient.invalidateQueries({ queryKey: queryKeys.oauth.all }),
-      queryClient.invalidateQueries({ queryKey: queryKeys.providerModels.all }),
       queryClient.invalidateQueries({ queryKey: queryKeys.user.preferences() }),
-    ]).then(() =>
-      queryClient.refetchQueries({ queryKey: [...queryKeys.dalton.all, 'team-models-available'] }),
-    );
-  }, [queryClient, userId]);
+    ]).then(async () => {
+      if (useSharedQuery) {
+        await queryClient.refetchQueries({ queryKey: [...queryKeys.dalton.all, 'team-models-available'] });
+        return;
+      }
+      // Local fallback path: refresh server-cached provider lists with `?refresh=1`.
+      await Promise.allSettled(
+        listedProviders.map((provider) =>
+          queryClient
+            .fetchQuery({
+              queryKey: queryKeys.providerModels.available(provider, ''),
+              queryFn: ({ signal }) => getProviderAvailableModels(provider, { refresh: true, signal }),
+              staleTime: 0,
+              retry: false,
+            })
+            .then(() => {
+              const whole = queryKeys.providerModels.available(provider, '');
+              queryClient.removeQueries({
+                queryKey: queryKeys.providerModels.availableFor(provider),
+                predicate: (q) => q.queryKey.at(-1) !== whole.at(-1),
+              });
+            }),
+        ),
+      );
+    });
+  }, [queryClient, userId, useSharedQuery, listedProviders]);
 
   if (useSharedQuery) {
     return {

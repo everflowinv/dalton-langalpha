@@ -21,9 +21,12 @@ import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
 import { isDaltonBuild } from '@/config/brand';
 import {
   DALTON_BACKGROUND_MODEL,
+  DALTON_BACKGROUND_SERIES,
   DALTON_DEFAULT_MODEL,
+  DALTON_DEFAULT_SERIES,
   filterDaltonPayers,
   filterDaltonProviderModels,
+  resolveDaltonSeriesDefaultModel,
 } from '@/config/daltonSetup';
 import { RowButton, StepLoadFailed } from '../answers/parts';
 import { useDaltonTeamModels } from '../answers/useTeamModels';
@@ -99,9 +102,15 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
   const primaryValid = Boolean(primaryModel) && (!isDaltonBuild || availablePrimary.includes(primaryModel));
   const backgroundValid = Boolean(backgroundModel) && (!isDaltonBuild || fillable.includes(backgroundModel));
   const catalogReady = !isLoading && (!isDaltonBuild || (!team.isLoading && !team.unread));
+  const daltonPrimaryDefault = isDaltonBuild
+    ? resolveDaltonSeriesDefaultModel(DALTON_DEFAULT_SERIES, fillable, {
+        seriesCatalog,
+        fallbackModel: DALTON_DEFAULT_MODEL,
+      })
+    : null;
   const primaryFill = !primaryValid && catalogReady && prefsLoaded
     ? (isDaltonBuild
-      ? [DALTON_DEFAULT_MODEL, systemDefaults?.default_model, ...starredModels(preferences)]
+      ? [daltonPrimaryDefault, systemDefaults?.default_model, ...starredModels(preferences)]
       : [systemDefaults?.default_model, ...starredModels(preferences)]
     ).find(
         (m): m is string => typeof m === 'string' && fillable.includes(m) && (!isDaltonBuild || availablePrimary.includes(m)),
@@ -113,17 +122,24 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
   // go with the primary, set during render so the slot never paints empty.
   // The fill is a pick like any other: it stays when the primary changes, and
   // nothing is saved before Continue.
-  // DALTON-HOOK(dalton-setup): validate catalog membership before enabling Continue in Dalton builds only
+  // DALTON-HOOK(dalton-setup): keep non-Dalton background auto-pick identical to upstream; Dalton resolves Hydrogen -low after catalog is ready
   const effectivePrimary = primaryValid ? primaryModel : (primaryFill ?? '');
-  const backgroundFill = !backgroundValid && effectivePrimary && catalogReady && prefsLoaded
-    ? (isDaltonBuild && fillable.includes(DALTON_BACKGROUND_MODEL)
-      ? DALTON_BACKGROUND_MODEL
-      : suggestBackgroundModel(visibleSlotModels, effectivePrimary))
-    : undefined;
+  const backgroundFill = isDaltonBuild
+    ? (!backgroundValid && effectivePrimary && catalogReady && prefsLoaded
+      ? (resolveDaltonSeriesDefaultModel(DALTON_BACKGROUND_SERIES, fillable, {
+          seriesCatalog,
+          fallbackModel: DALTON_BACKGROUND_MODEL,
+          preferLowEffort: true,
+        }) ?? suggestBackgroundModel(visibleSlotModels, effectivePrimary))
+      : undefined)
+    : (!backgroundModel && primaryModel && prefsLoaded
+      ? suggestBackgroundModel(visibleSlotModels, primaryModel)
+      : undefined);
   if (backgroundFill && backgroundFill !== backgroundModel) setBackgroundModel(backgroundFill);
 
+  const teamEmpty = isDaltonBuild && team.shared && (team.empty || availablePrimary.length === 0);
   const canContinue = isDaltonBuild
-    ? prefsLoaded && catalogReady && primaryValid && backgroundValid
+    ? prefsLoaded && catalogReady && !teamEmpty && primaryValid && backgroundValid
     : prefsLoaded && Boolean(primaryModel && backgroundModel);
 
   // ---------------------------------------------------------------------------
@@ -196,7 +212,6 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
   // In platform mode, models are already tier-filtered by useAllModels.
   // In OSS mode, they're filtered by configured providers.
   // Either way, `models` is the correct set to display.
-  const teamEmpty = isDaltonBuild && team.shared && (team.empty || availablePrimary.length === 0);
 
   return (
     <div>

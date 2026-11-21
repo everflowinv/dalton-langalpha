@@ -334,6 +334,25 @@ describe('useOnboardingRoute in Dalton build (lazy team-model availability)', ()
     });
   });
 
+  it('routes to /setup/model when team sharing only exposes models outside the 5 curated candidates', async () => {
+    server.state.teamOauthConnected = false;
+    server.state.userApiKeys = [
+      { provider: 'openai', display_name: 'OpenAI', has_key: true, access_type: 'api_key', masked_key: '(server)' },
+    ];
+    server.state.availableModelsByProvider = {
+      openai: { status: 'ok', ready: ['gpt-5'] },
+    };
+    const { result } = renderOnboardingRoute();
+    await waitFor(() => expect(result.current.kind).not.toBe('loading'));
+    expect(result.current).toEqual({
+      kind: 'answers',
+      next: 'model',
+      nextPath: '/setup/model',
+      owner: 'browser',
+      unpaired: false,
+    });
+  });
+
   it('stays in loading while team model catalog read is still in flight, then settles', async () => {
     let releaseModels!: () => void;
     server.state.modelsPending = new Promise<void>((resolve) => {

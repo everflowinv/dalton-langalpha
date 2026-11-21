@@ -22,7 +22,7 @@ import type { AccountPolicy } from '@/types/api';
 import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(dalton-setup): omit Claude Code recommendation and gate skip on live Dalton team-model availability
 import { isDaltonBuild } from '@/config/brand';
-import { RowButton } from '../answers/parts';
+import { RowButton, StepLoadFailed } from '../answers/parts';
 import { useDaltonTeamModels } from '../answers/useTeamModels';
 // DALTON-HOOK(team-credentials): team-shared credentials hint & PM disconnect guard
 import { isDaltonAuth } from '@/config/daltonAuth';
@@ -259,6 +259,11 @@ export default function MethodStep() {
       setRedeemingInvitation(false);
     }
   }, [invitationCode, queryClient, navigate, t]);
+
+  // DALTON-HOOK(dalton-setup): show load-failure notice with retry when reading team models fails under team sharing
+  if (isDaltonBuild && team.shared && team.unread) {
+    return <StepLoadFailed onRetry={team.retry} />;
+  }
 
   return (
     <div>

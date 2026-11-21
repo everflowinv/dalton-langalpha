@@ -649,7 +649,7 @@ describe('Dalton SetupWizard external & internal member flows', () => {
     // Customize: background dropdown selects hydrogen-low without "Low" in option text;
     // routing dropdowns list only the curated 5 in order
     await user.click(screen.getByRole('button', { name: 'Customize' }));
-    const bgSelect = screen.getByLabelText('Background model') as HTMLSelectElement;
+    const bgSelect = screen.getByLabelText(/Background model/i) as HTMLSelectElement;
     expect(bgSelect.value).toBe('gemini-4-hydrogen-low-oauth');
     const bgOption = [...bgSelect.options].find((o) => o.value === 'gemini-4-hydrogen-low-oauth');
     expect(bgOption?.textContent).toContain('Gemini 4 Hydrogen');
@@ -684,6 +684,54 @@ describe('Dalton SetupWizard external & internal member flows', () => {
     expect(selects.map((s) => s.value)).toEqual(
       expect.arrayContaining(['gemini-4-neon-high-oauth', 'gemini-4-hydrogen-low-oauth']),
     );
+  });
+
+  it('DefaultsStep keeps a saved Hydrogen High background consistent with the deduped dropdown and saves fixed-low when re-picked', async () => {
+    const user = userEvent.setup();
+    h.preferences = {
+      model_preference: {
+        preferred_model: 'gemini-4-neon-high-oauth',
+        preferred_background_model: 'gemini-4-hydrogen-high-oauth',
+      },
+    };
+    renderWithQuery(<DefaultsStep />);
+
+    const bgSelect = screen.getByLabelText(/Background model/i) as HTMLSelectElement;
+    // Dropdown is NOT blank, collapses Hydrogen to 1 option without effort suffix, and matches saved value
+    expect(bgSelect.value).toBe('gemini-4-hydrogen-high-oauth');
+    expect(bgSelect.selectedOptions[0]?.textContent).toContain('Gemini 4 Hydrogen');
+    expect(bgSelect.selectedOptions[0]?.textContent).not.toMatch(/\bHigh\b|\bLow\b/i);
+    const hydrogenOptions = [...bgSelect.options].filter((o) => o.textContent?.includes('Gemini 4 Hydrogen'));
+    expect(hydrogenOptions).toHaveLength(1);
+
+    await user.click(screen.getByRole('button', { name: 'Continue' }));
+    await waitFor(() => {
+      expect(h.updatePreferences).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model_preference: expect.objectContaining({
+            preferred_model: 'gemini-4-neon-high-oauth',
+            preferred_background_model: 'gemini-4-hydrogen-high-oauth',
+          }),
+        }),
+      );
+    });
+
+    // Switching away and re-selecting Hydrogen picks the fixed-low variant
+    h.updatePreferences.mockClear();
+    await user.selectOptions(bgSelect, 'gemini-4-neon-high-oauth');
+    const repickHydrogen = [...bgSelect.options].find((o) => o.textContent?.includes('Gemini 4 Hydrogen'));
+    expect(repickHydrogen?.value).toBe('gemini-4-hydrogen-low-oauth');
+    await user.selectOptions(bgSelect, 'gemini-4-hydrogen-low-oauth');
+    await user.click(screen.getByRole('button', { name: 'Continue' }));
+    await waitFor(() => {
+      expect(h.updatePreferences).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model_preference: expect.objectContaining({
+            preferred_background_model: 'gemini-4-hydrogen-low-oauth',
+          }),
+        }),
+      );
+    });
   });
 
   it('DoneStep displays team-configured provider label and no Mac/ClaudeCode/credits/trading links', () => {

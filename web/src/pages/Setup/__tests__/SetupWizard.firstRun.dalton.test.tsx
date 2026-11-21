@@ -24,10 +24,18 @@ interface ServerState {
     masked_key?: string | null;
   }>;
   computerProviders: Array<{ kind: string; allowed: boolean }>;
-  availableModelsByProvider: Record<string, Partial<AvailableModels> | { httpStatus: number }>;
+  availableModelsByProvider: Record<
+    string,
+    | Partial<AvailableModels>
+    | { httpStatus: number }
+    | ((opts: { refresh: boolean }) => Partial<AvailableModels> | { httpStatus: number })
+  >;
+  availableModelsCalls: Array<{ provider: string; refresh: boolean }>;
   modelsExtra: Record<string, { display_name: string; models: string[] }>;
   metadataExtra: Record<string, Record<string, unknown>>;
   credentialsStatusFailCount: number;
+  modelsFailCount: number;
+  antigravityModelsOverride: string[] | null;
 }
 
 const makeInitialState = (): ServerState => ({
@@ -54,9 +62,12 @@ const makeInitialState = (): ServerState => ({
   userApiKeys: [],
   computerProviders: [{ kind: 'docker', allowed: true }],
   availableModelsByProvider: {},
+  availableModelsCalls: [],
   modelsExtra: {},
   metadataExtra: {},
   credentialsStatusFailCount: 0,
+  modelsFailCount: 0,
+  antigravityModelsOverride: null,
 });
 
 const server = vi.hoisted(() => ({
@@ -71,7 +82,7 @@ vi.mock('@/api/client', async (importOriginal) => {
   const unexpected = (method: string, url: string): never => {
     throw new Error(`Unhandled mocked API request: ${method} ${url}`);
   };
-  const get: typeof ApiClient.get = async <T,>(url: string, _config?: RequestConfig): Promise<ApiResponse<T>> => {
+  const get: typeof ApiClient.get = async <T,>(url: string, config?: RequestConfig): Promise<ApiResponse<T>> => {
     const s = server.state;
     if (url === '/api/v1/users/me') {
       return ok({
@@ -111,11 +122,20 @@ vi.mock('@/api/client', async (importOriginal) => {
       } as T);
     }
     if (url === '/api/v1/models') {
+      if (s.modelsFailCount > 0) {
+        s.modelsFailCount -= 1;
+        throw new ApiError('Request failed with status code 500', 'ERR_BAD_RESPONSE', {
+          data: { detail: 'models read failed' },
+          status: 500,
+          statusText: 'Internal Server Error',
+          headers: {},
+        });
+      }
       return ok({
         models: {
           'antigravity-oauth': {
             display_name: 'Antigravity',
-            models: [
+            models: s.antigravityModelsOverride ?? [
               'gemini-4-neon-high-oauth',
               'gemini-4-carbon-medium-oauth',
               'gemini-4-hydrogen-low-oauth',
@@ -260,7 +280,11 @@ vi.mock('@/api/client', async (importOriginal) => {
     }
     if (url.startsWith('/api/v1/providers/') && url.endsWith('/available-models')) {
       const provider = decodeURIComponent(url.split('/')[4] ?? '');
-      const override = s.availableModelsByProvider[provider];
+      const params = config?.params as Record<string, string> | undefined;
+      const refresh = params?.refresh === '1';
+      s.availableModelsCalls.push({ provider, refresh });
+      const rawOverride = s.availableModelsByProvider[provider];
+      const override = typeof rawOverride === 'function' ? rawOverride({ refresh }) : rawOverride;
       if (override && 'httpStatus' in override && typeof override.httpStatus === 'number') {
         const status = override.httpStatus;
         throw new ApiError(
@@ -288,13 +312,13 @@ vi.mock('@/api/client', async (importOriginal) => {
         status: 'ok',
         fetched_at: null,
         ready: provider === 'antigravity-oauth'
-          ? [
+          ? (s.antigravityModelsOverride ?? [
               'gemini-4-neon-high-oauth',
               'gemini-4-carbon-medium-oauth',
               'gemini-4-hydrogen-low-oauth',
               'gemini-4-hydrogen-high-oauth',
               'claude-opus-5-5-medium-oauth',
-            ]
+            ])
           : [],
         missing: [],
         context_windows: {},
@@ -478,7 +502,7 @@ beforeAll(async () => {
     shellTarget,
     SetupWizard,
   };
-});
+}, 30_000);
 
 afterAll(async () => {
   vi.unstubAllEnvs();
@@ -675,18 +699,18 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     const user = userEvent.setup();
     server.state.teamModelsConfigured = false;
     server.state.modelsExtra = {
-      openai: { display_name: 'OpenAI', models: ['gpt-5', 'gpt-5-mini'] },
+      openai: { display_name: 'OpenAI', models: ['gpt-6.2-astra-oauth', 'gpt-6.2-sol-oauth'] },
     };
     server.state.metadataExtra = {
-      'gpt-5': { display_name: 'GPT 5 Pro', provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3 },
-      'gpt-5-mini': { display_name: 'GPT 5 Mini', provider: 'openai', access_type: 'api_key', intelligence: 3, speed: 5 },
+      'gpt-6.2-astra-oauth': { display_name: 'GPT-6.2 Astra', provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3 },
+      'gpt-6.2-sol-oauth': { display_name: 'GPT-6.2 Sol', provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3 },
     };
     server.state.userApiKeys = [
       { provider: 'openai', display_name: 'OpenAI', has_key: true, access_type: 'api_key', masked_key: 'sk-...dead' },
     ];
     // Provider explicitly refuses the key (401 -> fallback with reason='unauthorized')
     server.state.availableModelsByProvider = {
-      openai: { status: 'fallback', reason: 'unauthorized', ready: ['gpt-5', 'gpt-5-mini'] },
+      openai: { status: 'fallback', reason: 'unauthorized', ready: ['gpt-6.2-astra-oauth', 'gpt-6.2-sol-oauth'] },
     };
 
     renderRealWizardApp('/setup/use');
@@ -703,11 +727,11 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
 
     // Admin replaces the key so available-models succeeds -> Retry recovers
     server.state.availableModelsByProvider = {
-      openai: { status: 'ok', ready: ['gpt-5', 'gpt-5-mini'] },
+      openai: { status: 'ok', ready: ['gpt-6.2-astra-oauth', 'gpt-6.2-sol-oauth'] },
     };
     await user.click(screen.getByRole('button', { name: 'Try again' }));
     await waitFor(
-      () => expect(screen.getByRole('radio', { name: /GPT 5 Pro/i })).toBeChecked(),
+      () => expect(screen.getByRole('radio', { name: /GPT-6\.2 Astra/i })).toBeChecked(),
       { timeout: 5000 },
     );
     expect(screen.getByRole('button', { name: 'Continue' })).toBeEnabled();
@@ -723,7 +747,7 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     // Transient network blip (unreachable fallback) must NOT mark team models unavailable
     cleanup();
     server.state.availableModelsByProvider = {
-      openai: { status: 'fallback', reason: 'unreachable', ready: ['gpt-5', 'gpt-5-mini'] },
+      openai: { status: 'fallback', reason: 'unreachable', ready: ['gpt-6.2-astra-oauth', 'gpt-6.2-sol-oauth'] },
     };
     renderRealWizardApp('/setup/use');
     await waitFor(() => expect(screen.getByTestId('setup-use-team-models')).toBeInTheDocument(), { timeout: 5000 });
@@ -736,17 +760,17 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     // which yields providerConnected=false in useSetupFacts while team.available=true.
     server.state.teamModelsConfigured = false;
     server.state.modelsExtra = {
-      openai: { display_name: 'OpenAI', models: ['gpt-5', 'gpt-5-mini'] },
+      openai: { display_name: 'OpenAI', models: ['gpt-6.2-astra-oauth', 'gpt-6.2-sol-oauth'] },
     };
     server.state.metadataExtra = {
-      'gpt-5': { display_name: 'GPT 5 Pro', provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3 },
-      'gpt-5-mini': { display_name: 'GPT 5 Mini', provider: 'openai', access_type: 'api_key', intelligence: 3, speed: 5 },
+      'gpt-6.2-astra-oauth': { display_name: 'GPT-6.2 Astra', provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3 },
+      'gpt-6.2-sol-oauth': { display_name: 'GPT-6.2 Sol', provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3 },
     };
     server.state.userApiKeys = [
       { provider: 'openai', display_name: 'OpenAI', has_key: true, access_type: 'api_key', masked_key: '(server)' },
     ];
     server.state.availableModelsByProvider = {
-      openai: { status: 'ok', ready: ['gpt-5', 'gpt-5-mini'] },
+      openai: { status: 'ok', ready: ['gpt-6.2-astra-oauth', 'gpt-6.2-sol-oauth'] },
     };
     server.state.progress.models = 'subscription_or_key';
     server.state.progress.runs_on = 'cloud';
@@ -795,8 +819,8 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     expect(screen.getByTestId('setup-answers')).toHaveTextContent('Team models');
     expect(screen.getByTestId('setup-answers')).not.toHaveTextContent(/Subscription or API key/i);
 
-    const gptRadio = await screen.findByRole('radio', { name: /GPT 5 Pro/i }, { timeout: 5000 });
-    expect(gptRadio).toBeChecked();
+    const astraRadio = await screen.findByRole('radio', { name: /GPT-6\.2 Astra/i }, { timeout: 5000 });
+    expect(astraRadio).toBeChecked();
 
     await user.click(screen.getByRole('button', { name: 'Continue' }));
     await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/welcome'), { timeout: 5000 });
@@ -818,17 +842,17 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     server.state.teamModelsConfigured = false;
     server.state.credentialsStatusFailCount = 1;
     server.state.modelsExtra = {
-      openai: { display_name: 'OpenAI', models: ['gpt-5', 'gpt-5-mini'] },
+      openai: { display_name: 'OpenAI', models: ['gpt-6.2-astra-oauth', 'gpt-6.2-sol-oauth'] },
     };
     server.state.metadataExtra = {
-      'gpt-5': { display_name: 'GPT 5 Pro', provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3 },
-      'gpt-5-mini': { display_name: 'GPT 5 Mini', provider: 'openai', access_type: 'api_key', intelligence: 3, speed: 5 },
+      'gpt-6.2-astra-oauth': { display_name: 'GPT-6.2 Astra', provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3 },
+      'gpt-6.2-sol-oauth': { display_name: 'GPT-6.2 Sol', provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3 },
     };
     server.state.userApiKeys = [
       { provider: 'openai', display_name: 'OpenAI', has_key: true, access_type: 'api_key', masked_key: '(server)' },
     ];
     server.state.availableModelsByProvider = {
-      openai: { status: 'ok', ready: ['gpt-5', 'gpt-5-mini'] },
+      openai: { status: 'ok', ready: ['gpt-6.2-astra-oauth', 'gpt-6.2-sol-oauth'] },
     };
     server.state.progress.models = 'subscription_or_key';
     server.state.progress.runs_on = 'cloud';
@@ -839,8 +863,8 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     // First credentials/status fails -> lands on /setup/model -> retry/re-read succeeds ->
     // shared query updates routing and wizard together to /setup/default without bouncing back.
     await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/setup/default'), { timeout: 5000 });
-    const gptRadio = await screen.findByRole('radio', { name: /GPT 5 Pro/i }, { timeout: 5000 });
-    expect(gptRadio).toBeChecked();
+    const astraRadio = await screen.findByRole('radio', { name: /GPT-6\.2 Astra/i }, { timeout: 5000 });
+    expect(astraRadio).toBeChecked();
     expect(screen.getByTestId('location')).toHaveTextContent('/setup/default');
 
     await user.click(screen.getByRole('button', { name: 'Continue' }));
@@ -851,17 +875,17 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     const user = userEvent.setup();
     server.state.teamModelsConfigured = false;
     server.state.modelsExtra = {
-      openai: { display_name: 'OpenAI', models: ['gpt-5', 'gpt-5-mini'] },
+      openai: { display_name: 'OpenAI', models: ['gpt-6.2-astra-oauth', 'gpt-6.2-sol-oauth'] },
     };
     server.state.metadataExtra = {
-      'gpt-5': { display_name: 'GPT 5 Pro', provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3 },
-      'gpt-5-mini': { display_name: 'GPT 5 Mini', provider: 'openai', access_type: 'api_key', intelligence: 3, speed: 5 },
+      'gpt-6.2-astra-oauth': { display_name: 'GPT-6.2 Astra', provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3 },
+      'gpt-6.2-sol-oauth': { display_name: 'GPT-6.2 Sol', provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3 },
     };
     server.state.userApiKeys = [
       { provider: 'openai', display_name: 'OpenAI', has_key: true, access_type: 'api_key', masked_key: '(server)' },
     ];
     server.state.availableModelsByProvider = {
-      openai: { status: 'fallback', reason: 'unauthorized', ready: ['gpt-5', 'gpt-5-mini'] },
+      openai: { status: 'fallback', reason: 'unauthorized', ready: ['gpt-6.2-astra-oauth', 'gpt-6.2-sol-oauth'] },
     };
     server.state.progress.models = 'subscription_or_key';
     server.state.progress.runs_on = 'cloud';
@@ -875,13 +899,13 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     // Admin fixes the server key without changing providers list shape; Try again must
     // invalidate underlying queries and transition cleanly to /setup/default with no loop.
     server.state.availableModelsByProvider = {
-      openai: { status: 'ok', ready: ['gpt-5', 'gpt-5-mini'] },
+      openai: { status: 'ok', ready: ['gpt-6.2-astra-oauth', 'gpt-6.2-sol-oauth'] },
     };
     await user.click(screen.getByRole('button', { name: 'Try again' }));
 
     await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/setup/default'), { timeout: 5000 });
-    const gptRadio = await screen.findByRole('radio', { name: /GPT 5 Pro/i }, { timeout: 5000 });
-    expect(gptRadio).toBeChecked();
+    const astraRadio = await screen.findByRole('radio', { name: /GPT-6\.2 Astra/i }, { timeout: 5000 });
+    expect(astraRadio).toBeChecked();
     expect(screen.getByTestId('location')).toHaveTextContent('/setup/default');
   }, 15_000);
 
@@ -1044,4 +1068,147 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     expect(savedStr).not.toContain('credits-only-model');
     expect(savedStr).not.toContain('claude-code-sonnet');
   });
+
+  it('(A1) Retry on empty catalog passes refresh=1 to bypass server-cached provider lists and unlocks setup', async () => {
+    const user = userEvent.setup();
+    server.state.availableModelsByProvider = {
+      'antigravity-oauth': ({ refresh }) => (
+        refresh
+          ? {
+              status: 'ok',
+              ready: ['gemini-4-neon-high-oauth', 'gemini-4-hydrogen-low-oauth'],
+              missing: [],
+              cached: false,
+            }
+          : {
+              status: 'ok',
+              ready: [],
+              missing: [
+                'gemini-4-neon-high-oauth',
+                'gemini-4-carbon-medium-oauth',
+                'gemini-4-hydrogen-low-oauth',
+                'gemini-4-hydrogen-high-oauth',
+                'claude-opus-5-5-medium-oauth',
+              ],
+              cached: true,
+            }
+      ),
+    };
+
+    renderRealWizardApp('/setup/use');
+    expect(await screen.findByTestId('setup-use-team-models-empty', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
+    expect(server.state.availableModelsCalls.some((c) => c.provider === 'antigravity-oauth' && !c.refresh)).toBe(true);
+    expect(server.state.availableModelsCalls.some((c) => c.provider === 'antigravity-oauth' && c.refresh)).toBe(false);
+
+    await user.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(await screen.findByTestId('setup-use-team-models', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeEnabled();
+    expect(server.state.availableModelsCalls.some((c) => c.provider === 'antigravity-oauth' && c.refresh)).toBe(true);
+  }, 15_000);
+
+  it('(A3) when none of the 5 curated candidates is available, shows contact-admin + Retry for members without falling back to uncurated models while admins can still connect', async () => {
+    const user = userEvent.setup();
+    server.state.teamModelsConfigured = false;
+    server.state.modelsExtra = {
+      openai: { display_name: 'OpenAI', models: ['gpt-5', 'gpt-5-mini'] },
+    };
+    server.state.metadataExtra = {
+      'gpt-5': { display_name: 'GPT 5 Pro', provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3 },
+      'gpt-5-mini': { display_name: 'GPT 5 Mini', provider: 'openai', access_type: 'api_key', intelligence: 3, speed: 5 },
+    };
+    server.state.userApiKeys = [
+      { provider: 'openai', display_name: 'OpenAI', has_key: true, access_type: 'api_key', masked_key: '(server)' },
+    ];
+    server.state.availableModelsByProvider = {
+      openai: { status: 'ok', ready: ['gpt-5', 'gpt-5-mini'] },
+    };
+
+    // Non-admin on /setup/use -> blocked with contact-admin + Retry
+    renderRealWizardApp('/setup/use');
+    const useEmpty = await screen.findByTestId('setup-use-team-models-empty', {}, { timeout: 5000 });
+    expect(useEmpty).toHaveTextContent(/No recommended team models configured yet\. Please contact your administrator\./i);
+    expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
+
+    // Non-admin on /setup/default -> never falls back to GPT 5 Pro; shows contact-admin + Retry
+    cleanup();
+    server.state.progress.models = 'langalpha_models';
+    server.state.progress.runs_on = 'cloud';
+    renderRealWizardApp('/setup/default');
+    const defaultEmpty = await screen.findByTestId('setup-default-team-models-empty', {}, { timeout: 5000 });
+    expect(defaultEmpty).toHaveTextContent(/No recommended team models configured yet\. Please contact your administrator\./i);
+    expect(screen.queryByRole('radio', { name: /GPT 5 Pro/i })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
+
+    // Legacy /setup/defaults also blocks Continue even if uncurated models were previously saved
+    cleanup();
+    server.state.preferences = {
+      model_preference: {
+        preferred_model: 'gpt-5',
+        preferred_background_model: 'gpt-5-mini',
+      },
+    };
+    renderRealWizardApp('/setup/defaults');
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-defaults-team-models-empty')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
+    }, { timeout: 5000 });
+
+    // Admin is NOT blocked on /setup/use and can proceed to /setup/model to connect an account
+    cleanup();
+    server.state.callerTier = 'admin';
+    server.state.progress.models = null;
+    server.state.progress.runs_on = null;
+    renderRealWizardApp('/setup/use');
+    expect(screen.queryByTestId('setup-use-team-models-empty')).toBeNull();
+    const subRadio = await screen.findByRole('radio', { name: /Another subscription or an API key/i }, { timeout: 5000 });
+    await user.click(subRadio);
+    await user.click(screen.getByRole('button', { name: 'Continue' }));
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/setup/model'), { timeout: 5000 });
+    expect(await screen.findByTestId('setup-sub-api-key', {}, { timeout: 5000 })).toBeInTheDocument();
+  }, 15_000);
+
+  it('(A4) legacy /setup/method surfaces load-failure notice with Try again when reading team models fails and recovers on Retry', async () => {
+    const user = userEvent.setup();
+    server.state.modelsFailCount = 99;
+
+    renderRealWizardApp('/setup/method');
+    expect(await screen.findByTestId('setup-load-failed', {}, { timeout: 5000 })).toBeInTheDocument();
+    const retryBtn = screen.getByRole('button', { name: 'Try again' });
+
+    server.state.modelsFailCount = 0;
+    await user.click(retryBtn);
+    await waitFor(() => expect(screen.queryByTestId('setup-load-failed')).toBeNull(), { timeout: 5000 });
+    expect(await screen.findByRole('button', { name: /Skip to models/i }, { timeout: 5000 })).toBeInTheDocument();
+  }, 15_000);
+
+  it('(A5) legacy /setup/defaults normalizes a saved Hydrogen High background when only Hydrogen Low is offered and keeps dropdown/save consistent', async () => {
+    const user = userEvent.setup();
+    server.state.antigravityModelsOverride = [
+      'gemini-4-neon-high-oauth',
+      'gemini-4-hydrogen-low-oauth',
+    ];
+    server.state.preferences = {
+      model_preference: {
+        preferred_model: 'gemini-4-neon-high-oauth',
+        preferred_background_model: 'gemini-4-hydrogen-high-oauth',
+      },
+    };
+
+    renderRealWizardApp('/setup/defaults');
+    const bgSelect = await screen.findByLabelText(/Background model/i, {}, { timeout: 5000 }) as HTMLSelectElement;
+    await waitFor(() => expect(bgSelect.value).toBe('gemini-4-hydrogen-low-oauth'), { timeout: 5000 });
+    expect(bgSelect.selectedOptions[0]?.textContent).toContain('Gemini 4 Hydrogen');
+    expect(bgSelect.selectedOptions[0]?.textContent).not.toMatch(/\bLow\b/i);
+
+    await user.click(screen.getByRole('button', { name: 'Continue' }));
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/setup/ready'), { timeout: 5000 });
+    expect(server.lastPreferencesPut).toMatchObject({
+      model_preference: expect.objectContaining({
+        preferred_model: 'gemini-4-neon-high-oauth',
+        preferred_background_model: 'gemini-4-hydrogen-low-oauth',
+      }),
+    });
+  }, 15_000);
 });
