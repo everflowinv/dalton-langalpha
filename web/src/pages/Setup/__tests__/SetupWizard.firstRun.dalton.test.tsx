@@ -280,6 +280,13 @@ beforeAll(async () => {
     { useOnboardingRoute },
     { shellTarget },
     { default: SetupWizard },
+    { initI18n, default: i18n },
+    { default: enUS },
+    { default: zhCN },
+    { default: enUSIntros },
+    { default: zhCNIntros },
+    { default: enUSFirstRun },
+    { default: zhCNFirstRun },
   ] = await Promise.all([
     import('@tanstack/react-query'),
     import('react-router'),
@@ -288,6 +295,13 @@ beforeAll(async () => {
     import('@/hooks/useOnboardingRoute'),
     import('../answers/gate'),
     import('../SetupWizard'),
+    import('@/i18n'),
+    import('@/locales/en-US.json'),
+    import('@/locales/zh-CN.json'),
+    import('@/locales/intros/en-US.json'),
+    import('@/locales/intros/zh-CN.json'),
+    import('@/locales/thisMacFirstRun/en-US.json'),
+    import('@/locales/thisMacFirstRun/zh-CN.json'),
     import('../steps/UseStep'),
     import('../steps/ModelStep'),
     import('../steps/DefaultStep'),
@@ -295,6 +309,12 @@ beforeAll(async () => {
     import('../steps/ModelPickStep'),
     import('@/pages/Onboarding/welcome/Welcome'),
   ]);
+
+  await initI18n({
+    'en-US': { translation: enUS, intros: enUSIntros, thisMacFirstRun: enUSFirstRun },
+    'zh-CN': { translation: zhCN, intros: zhCNIntros, thisMacFirstRun: zhCNFirstRun },
+  });
+  await i18n.changeLanguage('en-US');
 
   Loaded = {
     QueryClient,
@@ -313,8 +333,30 @@ beforeAll(async () => {
   };
 });
 
-afterAll(() => {
+afterAll(async () => {
   vi.unstubAllEnvs();
+  vi.resetModules();
+  const [
+    { initI18n },
+    { default: enUS },
+    { default: zhCN },
+    { default: enUSIntros },
+    { default: zhCNIntros },
+    { default: enUSFirstRun },
+    { default: zhCNFirstRun },
+  ] = await Promise.all([
+    import('@/i18n'),
+    import('@/locales/en-US.json'),
+    import('@/locales/zh-CN.json'),
+    import('@/locales/intros/en-US.json'),
+    import('@/locales/intros/zh-CN.json'),
+    import('@/locales/thisMacFirstRun/en-US.json'),
+    import('@/locales/thisMacFirstRun/zh-CN.json'),
+  ]);
+  await initI18n({
+    'en-US': { translation: enUS, intros: enUSIntros, thisMacFirstRun: enUSFirstRun },
+    'zh-CN': { translation: zhCN, intros: zhCNIntros, thisMacFirstRun: zhCNFirstRun },
+  });
 });
 
 const activeClients: Array<{ clear: () => void; cancelQueries: () => Promise<void> }> = [];
@@ -396,6 +438,10 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     // Shell gate routes first-run user to /setup/use
     await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/setup/use'), { timeout: 5000 });
     expect(await screen.findByTestId('setup-use-team-models', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Set up Everflow' })).toBeInTheDocument();
+    expect(screen.queryByText(/How will you use/i)).toBeNull();
+    expect(screen.queryByText(/Two questions/i)).toBeNull();
+    expect(screen.queryByText(/Which models do you want/i)).toBeNull();
     expect(screen.queryByText(/Claude Code/i)).toBeNull();
     expect(screen.queryByText(/Another subscription or an API key/i)).toBeNull();
 

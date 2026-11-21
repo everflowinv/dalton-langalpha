@@ -12,9 +12,9 @@ import { modelPrefs } from '@/lib/modelPreferences';
 import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
 import { useWelcomeOffer } from '@/pages/Onboarding/welcome/useWelcomeOffer';
 import { readSetupReturn, returnFromSetup } from '@/lib/setupReturn';
-// DALTON-HOOK(dalton-setup): show team-configured provider label when team sharing is active
+// DALTON-HOOK(dalton-setup): show team-configured provider label only when team sharing has available models
 import { isDaltonBuild } from '@/config/brand';
-import { useTeamCredentials } from '@/hooks/useTeamCredentials';
+import { useDaltonTeamModels } from '../answers/useTeamModels';
 
 // ---------------------------------------------------------------------------
 // DoneStep — confirmation screen
@@ -28,7 +28,8 @@ export default function DoneStep() {
   const copy = useModelSlotCopy();
   const modelName = useModelName();
   const welcomeOffer = useWelcomeOffer();
-  const { isShared: teamShared } = useTeamCredentials();
+  // DALTON-HOOK(dalton-setup): check actual Dalton team-model availability rather than sharing flag alone
+  const team = useDaltonTeamModels();
   const headingId = useId();
   // A connection sends the user back the moment it works, so a return that
   // reaches this screen came another way (an invitation code, or skipping
@@ -65,11 +66,11 @@ export default function DoneStep() {
   const backgroundModel = modelPref.preferred_background_model
     ? modelName(modelPref.preferred_background_model)
     : t('setup.notSet');
-  // DALTON-HOOK(dalton-setup): team-shared models show a configured label instead of "Not configured"
-  const providerLabel = configuredProviderNames.length > 0
-    ? configuredProviderNames.join(', ')
-    : isDaltonBuild && teamShared
-      ? t('setup.teamSharedProvider')
+  // DALTON-HOOK(dalton-setup): when team sharing is active in Dalton, reflect actual available team models rather than shared API key records
+  const providerLabel = isDaltonBuild && team.shared
+    ? (team.available ? t('setup.teamSharedProvider') : t('setup.notConfigured'))
+    : configuredProviderNames.length > 0
+      ? configuredProviderNames.join(', ')
       : t('setup.notConfigured');
 
   // ---------------------------------------------------------------------------

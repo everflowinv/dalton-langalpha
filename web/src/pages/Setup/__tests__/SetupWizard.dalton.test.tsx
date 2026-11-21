@@ -29,6 +29,8 @@ const h = vi.hoisted(() => ({
   flowModels: 'langalpha_models' as 'langalpha_models' | 'subscription_or_key' | 'claude_code',
   flowRunsOn: 'cloud' as 'cloud' | 'own_computer',
   ownComputers: [] as { computer_id: string; name: string }[],
+  apiKeys: null as Record<string, unknown> | null,
+  teamHasAvailableModels: true,
 }));
 
 vi.mock('@/config/brand', () => ({
@@ -136,27 +138,31 @@ vi.mock('@/hooks/useOnboardingProgress', () => ({
 
 vi.mock('@/hooks/useAllModels', () => ({
   useAllModels: () => ({
-    models: {
-      'antigravity-oauth': {
-        display_name: 'Antigravity',
-        models: [
-          'gemini-4-neon-high-oauth',
-          'gemini-4-hydrogen-high-oauth',
-          'credits-only-model',
-          'claude-code-sonnet',
-        ],
-      },
-    },
-    slotModels: {
-      'antigravity-oauth': {
-        display_name: 'Antigravity',
-        models: [
-          'gemini-4-neon-high-oauth',
-          'gemini-4-hydrogen-high-oauth',
-          'credits-only-model',
-        ],
-      },
-    },
+    models: h.teamHasAvailableModels
+      ? {
+          'antigravity-oauth': {
+            display_name: 'Antigravity',
+            models: [
+              'gemini-4-neon-high-oauth',
+              'gemini-4-hydrogen-high-oauth',
+              'credits-only-model',
+              'claude-code-sonnet',
+            ],
+          },
+        }
+      : {},
+    slotModels: h.teamHasAvailableModels
+      ? {
+          'antigravity-oauth': {
+            display_name: 'Antigravity',
+            models: [
+              'gemini-4-neon-high-oauth',
+              'gemini-4-hydrogen-high-oauth',
+              'credits-only-model',
+            ],
+          },
+        }
+      : {},
     payers: {
       'gemini-4-neon-high-oauth': 'subscription:antigravity-oauth',
       'gemini-4-hydrogen-high-oauth': 'subscription:antigravity-oauth',
@@ -238,7 +244,7 @@ vi.mock('@/hooks/useUpdatePreferences', () => ({
 }));
 
 vi.mock('@/hooks/useApiKeys', () => ({
-  useApiKeys: () => ({ apiKeys: null }),
+  useApiKeys: () => ({ apiKeys: h.apiKeys }),
 }));
 
 vi.mock('@/hooks/useModelName', () => ({
@@ -316,6 +322,8 @@ beforeEach(() => {
   h.flowModels = 'langalpha_models';
   h.flowRunsOn = 'cloud';
   h.ownComputers = [];
+  h.apiKeys = null;
+  h.teamHasAvailableModels = true;
   vi.clearAllMocks();
 });
 
@@ -325,6 +333,10 @@ describe('Dalton SetupWizard external & internal member flows', () => {
     renderWithQuery(<UseStep />);
 
     expect(screen.getByTestId('setup-use-team-models')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /^Set up / })).toBeInTheDocument();
+    expect(screen.queryByText(/How will you use/i)).toBeNull();
+    expect(screen.queryByText(/Two questions/i)).toBeNull();
+    expect(screen.queryByText(/Which models do you want/i)).toBeNull();
     expect(screen.queryByText(/Claude Code/i)).toBeNull();
     expect(screen.queryByText(/Another subscription or an API key/i)).toBeNull();
 
@@ -346,6 +358,10 @@ describe('Dalton SetupWizard external & internal member flows', () => {
     renderWithQuery(<UseStep />);
 
     expect(screen.getByTestId('setup-use-team-models')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /^Set up / })).toBeInTheDocument();
+    expect(screen.queryByText(/How will you use/i)).toBeNull();
+    expect(screen.queryByText(/Two questions/i)).toBeNull();
+    expect(screen.queryByText(/Which models do you want/i)).toBeNull();
     expect(screen.queryByText(/Claude Code/i)).toBeNull();
     await user.click(screen.getByRole('button', { name: 'Continue' }));
 
@@ -381,7 +397,7 @@ describe('Dalton SetupWizard external & internal member flows', () => {
     renderWithQuery(
       <Routes>
         <Route path="/setup/computer" element={<ComputerStep />} />
-        <Route path="/setup/default" element={<LocationEcho />} />
+        <Route path="/setup" element={<LocationEcho />} />
       </Routes>,
       '/setup/computer',
     );
@@ -391,7 +407,7 @@ describe('Dalton SetupWizard external & internal member flows', () => {
     await user.click(screen.getByRole('button', { name: 'Continue' }));
     expect(h.updateProgress).toHaveBeenCalledWith({ runs_on: 'cloud' });
     await waitFor(() => {
-      expect(screen.getByTestId('location')).toHaveTextContent('/setup/default');
+      expect(screen.getByTestId('location')).toHaveTextContent('/setup');
     });
   });
 
@@ -505,13 +521,24 @@ describe('Dalton SetupWizard external & internal member flows', () => {
       preferred_model: 'gemini-4-neon-high-oauth',
       other_preference: { background_model: 'gemini-4-hydrogen-high-oauth' },
     };
+    h.apiKeys = { providers: [{ provider: 'openai', display_name: 'OpenAI', has_key: true }] };
     renderWithQuery(<DoneStep />);
 
     expect(screen.getByText('Team-configured models')).toBeInTheDocument();
+    expect(screen.queryByText('OpenAI')).toBeNull();
     expect(screen.queryByText(/Mac/i)).toBeNull();
     expect(screen.queryByText(/Claude Code/i)).toBeNull();
     expect(screen.queryByText(/credits/i)).toBeNull();
     expect(screen.queryByRole('button', { name: /investing profile|brokerage|trading/i })).toBeNull();
+  });
+
+  it('DoneStep displays Not configured when team sharing is active but zero Dalton models are available', () => {
+    h.apiKeys = { providers: [{ provider: 'openai', display_name: 'OpenAI', has_key: true }] };
+    h.teamHasAvailableModels = false;
+    renderWithQuery(<DoneStep />);
+
+    expect(screen.getByText('Not configured')).toBeInTheDocument();
+    expect(screen.queryByText('Team-configured models')).toBeNull();
   });
 
   it('preserves admin access to credential management in Settings while blocking non-admins', () => {

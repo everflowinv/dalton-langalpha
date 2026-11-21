@@ -126,8 +126,17 @@ function UseForm() {
 
   return (
     <div>
-      <WizardStepHeader titleId={headingId} title={t('setup.answers.use.title')} helper={t('setup.answers.use.lead')} />
-      <WizardSection title={t('setup.answers.use.modelsLabel')} titleId={modelsId} className="mt-0">
+      {/* DALTON-HOOK(dalton-setup): use declarative header & section copy when team models skip selection */}
+      <WizardStepHeader
+        titleId={headingId}
+        title={t(teamModelsOnly ? 'setup.answers.use.teamTitle' : 'setup.answers.use.title')}
+        helper={t(teamModelsOnly ? 'setup.answers.use.teamLead' : 'setup.answers.use.lead')}
+      />
+      <WizardSection
+        title={t(teamModelsOnly ? 'setup.answers.use.teamModelsLabel' : 'setup.answers.use.modelsLabel')}
+        titleId={modelsId}
+        className="mt-0"
+      >
         {teamModelsOnly ? (
           /* DALTON-HOOK(dalton-setup): team credential sharing replaces model-connect choices */
           <div

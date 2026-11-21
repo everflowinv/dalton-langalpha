@@ -11,6 +11,9 @@ import { serverTakesRemoteControl, useThisMacAvailability } from '@/pages/ChatAg
 import { useComputerProviders } from '@/pages/ChatAgent/hooks/useComputers';
 import { useComputerActions } from '@/pages/ChatAgent/hooks/useComputerActions';
 import { useHomePlacement } from '@/pages/ChatAgent/hooks/useHomePlacement';
+// DALTON-HOOK(dalton-setup): check SSH provider policy lock when Mac pairing is disabled
+import { useProviderGate } from '@/pages/ChatAgent/hooks/useProviderGate';
+import { isProviderLocked } from '@/pages/ChatAgent/components/providerUi';
 import MakePrimaryDialog from '@/pages/ChatAgent/components/MakePrimaryDialog';
 import { SetupFooter } from '../SetupFooter';
 import { useAnswerFlow } from '../answers/flow';
@@ -61,7 +64,9 @@ export default function ComputerStep() {
   // DALTON-HOOK(dalton-setup): skip Mac pairing probes and hide Mac row in Dalton builds
   const availability = useThisMacAvailability({ enabled: !isDaltonBuild && canAddThisMac(), poll: false });
   const providers = useComputerProviders({ enabled: isDaltonBuild || !inApp });
-  const sshOffered = !isDaltonBuild || !!providers.data?.providers.some((p) => p.kind === 'ssh');
+  // DALTON-HOOK(dalton-setup): align SSH availability check with UseStep policy gating
+  const gate = useProviderGate(null);
+  const sshOffered = !isDaltonBuild || !!providers.data?.providers.some((p) => p.kind === 'ssh' && !isProviderLocked(p, gate));
   const kind = isDaltonBuild ? null : macRowKind(inApp, availability, serverTakesRemoteControl(providers.data));
   const mac = kind && MAC_ROW[kind];
   const macAction = mac?.action;
@@ -78,8 +83,9 @@ export default function ComputerStep() {
 
   const continueOnCloud = () => {
     setCloudSwitchFailed(false);
+    // DALTON-HOOK(dalton-setup): route back through /setup gate rather than hardcoding /setup/default
     update({ runs_on: 'cloud' }).then(
-      () => navigate('/setup/default', { replace: true }),
+      () => navigate('/setup', { replace: true }),
       () => setCloudSwitchFailed(true),
     );
   };

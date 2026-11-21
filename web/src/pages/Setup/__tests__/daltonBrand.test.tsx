@@ -160,7 +160,7 @@ vi.mock('@/hooks/useAllModels', () => ({
       'codex-oauth': { models: ['gpt-5'] },
       anthropic: { models: ['claude-sonnet'] },
     },
-    payers: { 'gpt-5': 'credits', 'cc-opus': 'claude_code' },
+    payers: { 'gpt-5': 'credits', 'cc-opus': 'subscription:claude-code' },
     metadata: {
       'gpt-5': { display_name: 'GPT 5', intelligence: 5, speed: 3 },
       'cc-opus': {
@@ -403,6 +403,7 @@ describe('Dalton brand rendering across Setup and Onboarding', () => {
         { default: MacHandoffStep },
         { default: ThisMacStep },
         { default: ContinueStep },
+        { ThisMacFirstRunGate },
         { GettingStartedLauncher },
         { DEPLOYED_TASKS },
         { ChatAppsPromptCard },
@@ -439,6 +440,7 @@ describe('Dalton brand rendering across Setup and Onboarding', () => {
         import('../mac/MacHandoffStep'),
         import('../mac/ThisMacStep'),
         import('../mac/ContinueStep'),
+        import('@/pages/ThisMac/ThisMacFirstRunGate'),
         import('@/pages/Onboarding/engine/GettingStarted'),
         import('@/pages/Onboarding/registry'),
         import('@/pages/Onboarding/ChatAppsPromptCard'),
@@ -563,6 +565,18 @@ describe('Dalton brand rendering across Setup and Onboarding', () => {
             return renderWithProviders(<ContinueStep />);
           },
         ],
+        [
+          'ThisMacFirstRunGate (suppressed in Dalton)',
+          () => {
+            h.desktop = true;
+            h.canPairMac = true;
+            return renderWithProviders(
+              <ThisMacFirstRunGate>
+                <div>gate-children</div>
+              </ThisMacFirstRunGate>,
+            );
+          },
+        ],
       ];
 
       for (const [name, mount] of setupCases) {
@@ -570,6 +584,9 @@ describe('Dalton brand rendering across Setup and Onboarding', () => {
         assertNoUpstreamBrand(view.container, name, locale);
         if (name === 'ThisMacPairingBody (approval)') {
           expect(view.container.textContent).toContain('Everflow');
+        }
+        if (name === 'ThisMacFirstRunGate (suppressed in Dalton)') {
+          expect(view.container.textContent).toContain('gate-children');
         }
         view.unmount();
       }
