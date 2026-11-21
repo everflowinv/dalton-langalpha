@@ -376,7 +376,12 @@ def _extract_usage_from_exception(
     return exc_usage
 
 
-def _merge_attempt_usage(prior: Any, current: dict[str, Any]) -> dict[str, Any]:
+def _merge_attempt_usage(
+    prior: Any,
+    current: dict[str, Any],
+    *,
+    preserve_credential_holder: bool = True,
+) -> dict[str, Any]:
     """Combine usage from an earlier journal attempt with the current attempt's usage."""
     if not isinstance(prior, dict) or not has_reported_token_usage(prior):
         return dict(current)
@@ -408,8 +413,10 @@ def _merge_attempt_usage(prior: Any, current: dict[str, Any]) -> dict[str, Any]:
     combined_calls = prior_calls + curr_calls
     if combined_calls:
         merged["per_call_usages"] = combined_calls
-    if "credential_user_id" not in merged and prior.get("credential_user_id"):
+    if preserve_credential_holder and "credential_user_id" not in merged and prior.get("credential_user_id"):
         merged["credential_user_id"] = prior["credential_user_id"]
+    elif not preserve_credential_holder:
+        merged.pop("credential_user_id", None)
     return merged
 
 
@@ -1263,13 +1270,28 @@ async def _dalton_complete_impl(
             if not persist_response
             else (db_resp if persist_raw else _redact_response_for_journal(db_resp))
         )
+        attempt_unknown_calls = int(getattr(collected_usages, "unknown_calls", 0) or 0) + int(
+            getattr(collected_usages, "in_flight_calls", 0) or 0
+        )
+        merged_prior = attempt > 1 and has_reported_token_usage(claimed_row.get("usage"))
         journal_usage = (
-            _merge_attempt_usage(claimed_row.get("usage"), usage_dict)
-            if attempt > 1
+            _merge_attempt_usage(
+                claimed_row.get("usage"),
+                usage_dict,
+                preserve_credential_holder=(llm_user_id is not None),
+            )
+            if merged_prior
             else usage_dict
         )
 
         if not skip_journal:
+            extra_done_kwargs: dict[str, Any] = {}
+            if llm_user_id is None:
+                extra_done_kwargs["stamp_credential_holder"] = False
+            if merged_prior:
+                extra_done_kwargs["attempt_usage"] = usage_dict
+            if attempt_unknown_calls > 0:
+                extra_done_kwargs["unknown_usage_calls"] = attempt_unknown_calls
             await complete_journal_done(
                 inv_id,
                 attempt=attempt,
@@ -1279,7 +1301,7 @@ async def _dalton_complete_impl(
                 notional_usd=notional_dec,
                 provider=provider,
                 billing_type=billing_type,
-                **({"stamp_credential_holder": False} if llm_user_id is None else {}),
+                **extra_done_kwargs,
             )
 
         return DaltonCompleteResult(
@@ -1327,19 +1349,43 @@ async def _dalton_complete_impl(
                         error_kind = "parse_error"
 
         has_usage = has_reported_token_usage(usage_dict)
-        final_attempt_unknown = target_state == "indeterminate" and (
-            not has_usage or error_kind not in ("parse_error", "post_call_error")
+        sent_calls = int(getattr(collected_usages, "sent_calls", 0) or 0)
+        traced_unknown_calls = int(getattr(collected_usages, "unknown_calls", 0) or 0) + int(
+            getattr(collected_usages, "in_flight_calls", 0) or 0
         )
+        if llm_call_completed or sent_calls > 0:
+            # When `make_api_call` tracked upstream sends, only actually-sent requests
+            # whose outcome was unknown (timeout/5xx/stream cut while in flight) count
+            # as unknown usage — a timeout during retry backoff sleep before sending
+            # the next request has `traced_unknown_calls == 0`.
+            attempt_unknown_calls = traced_unknown_calls
+        else:
+            attempt_unknown_calls = (
+                1
+                if target_state == "indeterminate"
+                and (not has_usage or error_kind not in ("parse_error", "post_call_error"))
+                else 0
+            )
+        final_attempt_unknown = attempt_unknown_calls > 0
+        attempt_fail_usage: dict[str, Any] | None = None
         journal_fail_usage: dict[str, Any] | None = None
-        if target_state == "indeterminate" or has_usage:
-            journal_fail_usage = dict(usage_dict)
-            journal_fail_usage["usage_known"] = not final_attempt_unknown
-            journal_fail_usage["stream_started"] = stream_started
-            journal_fail_usage["chunks_received"] = chunks_received
-            if attempt > 1:
-                journal_fail_usage = _merge_attempt_usage(
-                    claimed_row.get("usage"), journal_fail_usage
+        merged_prior_fail = False
+        if target_state == "indeterminate" or has_usage or final_attempt_unknown:
+            attempt_fail_usage = dict(usage_dict)
+            attempt_fail_usage["usage_known"] = not final_attempt_unknown
+            attempt_fail_usage["unknown_usage_calls"] = attempt_unknown_calls
+            attempt_fail_usage["stream_started"] = stream_started
+            attempt_fail_usage["chunks_received"] = chunks_received
+            merged_prior_fail = attempt > 1 and has_reported_token_usage(claimed_row.get("usage"))
+            journal_fail_usage = (
+                _merge_attempt_usage(
+                    claimed_row.get("usage"),
+                    attempt_fail_usage,
+                    preserve_credential_holder=(llm_user_id is not None),
                 )
+                if merged_prior_fail
+                else attempt_fail_usage
+            )
 
         safe_msg = sanitize_error_text(exc, max_len=240)
         if provider == "muse-oauth" and error_kind == "auth_expired":
@@ -1348,6 +1394,14 @@ async def _dalton_complete_impl(
         err_summary = safe_msg if record_provider_events else type(exc).__name__
         if not skip_journal:
             try:
+                extra_fail_kwargs: dict[str, Any] = {
+                    "usage_known": not final_attempt_unknown,
+                    "unknown_usage_calls": attempt_unknown_calls,
+                }
+                if llm_user_id is None:
+                    extra_fail_kwargs["stamp_credential_holder"] = False
+                if merged_prior_fail:
+                    extra_fail_kwargs["attempt_usage"] = attempt_fail_usage
                 await complete_journal_failed(
                     inv_id,
                     attempt=attempt,
@@ -1357,7 +1411,7 @@ async def _dalton_complete_impl(
                     usage=journal_fail_usage,
                     cash_usd=cash_dec,
                     notional_usd=notional_dec,
-                    **({"stamp_credential_holder": False} if llm_user_id is None else {}),
+                    **extra_fail_kwargs,
                 )
             except Exception as journal_exc:
                 if record_provider_events:
@@ -1396,8 +1450,9 @@ async def _dalton_complete_impl(
             "stream_started": stream_started,
             "chunks_received": chunks_received,
         }
-        if target_state == "indeterminate":
+        if target_state == "indeterminate" or final_attempt_unknown:
             result_usage["usage_known"] = not final_attempt_unknown
+            result_usage["unknown_usage_calls"] = attempt_unknown_calls
         return _finish(
             DaltonCompleteResult(
                 ok=False,

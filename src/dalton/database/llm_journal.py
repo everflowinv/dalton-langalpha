@@ -48,24 +48,52 @@ def has_reported_token_usage(usage: Any) -> bool:
     return False
 
 
-def is_unknown_usage_journal_row(row: Mapping[str, Any]) -> bool:
-    """Return True when a journal row ended ``indeterminate`` without complete provider usage
-    (e.g. timeout, 5xx, stream cut, or crash before usage was reported)."""
-    if not isinstance(row, Mapping) or str(row.get("state") or "") != "indeterminate":
-        return False
+def count_unknown_usage_in_row(row: Mapping[str, Any]) -> int:
+    """Return the number of unbilled/unknown-usage upstream requests represented by a
+    journal or journal-attempt row (0 when every sent call reported usage or never ran)."""
+    if not isinstance(row, Mapping):
+        return 0
+    explicit_count = row.get("unknown_usage_calls")
+    if explicit_count is not None and not isinstance(explicit_count, bool):
+        try:
+            return max(0, int(explicit_count))
+        except (TypeError, ValueError):
+            pass
+    explicit_known = row.get("usage_known")
+    if isinstance(explicit_known, bool):
+        return 0 if explicit_known else 1
+
     usage = row.get("usage")
-    if isinstance(usage, Mapping) and usage.get("usage_known") is False:
-        return True
+    if isinstance(usage, Mapping):
+        u_count = usage.get("unknown_usage_calls")
+        if u_count is not None and not isinstance(u_count, bool):
+            try:
+                return max(0, int(u_count))
+            except (TypeError, ValueError):
+                pass
+        u_known = usage.get("usage_known")
+        if isinstance(u_known, bool):
+            return 0 if u_known else 1
+
+    if str(row.get("state") or "") != "indeterminate":
+        return 0
     if has_reported_token_usage(usage):
-        return False
+        return 0
     try:
         if Decimal(str(row.get("cash_usd") or "0")) > Decimal("0"):
-            return False
+            return 0
         if Decimal(str(row.get("notional_usd") or "0")) > Decimal("0"):
-            return False
+            return 0
     except Exception:
         pass
-    return True
+    return 1
+
+
+def is_unknown_usage_journal_row(row: Mapping[str, Any]) -> bool:
+    """Return True when a journal or journal-attempt row carries at least one
+    upstream request whose provider usage could not be determined (timeout, 5xx,
+    stream cut, or crash before usage was reported)."""
+    return count_unknown_usage_in_row(row) > 0
 
 
 def _is_stale(claimed_at: Any, stale_after_s: int, now_utc: datetime | None = None) -> bool:
@@ -226,12 +254,29 @@ async def inspect_journal_state(
                         return "proceed", row
                     await cur.execute(
                         """
-                        UPDATE dalton_llm_journal
-                        SET state = 'indeterminate',
-                            error_kind = COALESCE(error_kind, 'crash'),
-                            completed_at = COALESCE(completed_at, NOW())
-                        WHERE invocation_id = %s AND state = 'pending'
-                        RETURNING *
+                        WITH updated_journal AS (
+                            UPDATE dalton_llm_journal
+                            SET state = 'indeterminate',
+                                error_kind = COALESCE(error_kind, 'crash'),
+                                completed_at = COALESCE(completed_at, NOW())
+                            WHERE invocation_id = %s AND state = 'pending'
+                            RETURNING *
+                        ),
+                        recorded_crash AS (
+                            INSERT INTO dalton_llm_journal_attempts (
+                                invocation_id, attempt, user_id, scope_ref, purpose, model_key,
+                                provider, billing_type, outcome, error_kind, usage,
+                                cash_usd, notional_usd, usage_known, unknown_usage_calls, occurred_at
+                            )
+                            SELECT
+                                u.invocation_id, u.attempt, u.user_id, u.scope_ref, u.purpose, u.model_key,
+                                u.provider, u.billing_type, 'indeterminate', COALESCE(u.error_kind, 'crash'),
+                                jsonb_build_object('usage_known', false, 'unknown_usage_calls', 1),
+                                0, 0, FALSE, 1, COALESCE(u.claimed_at, NOW())
+                            FROM updated_journal u
+                            ON CONFLICT (invocation_id, attempt) DO NOTHING
+                        )
+                        SELECT * FROM updated_journal
                         """,
                         (invocation_id,),
                     )
@@ -383,12 +428,29 @@ async def claim_journal_invocation(
                 ):
                     await cur.execute(
                         """
-                        UPDATE dalton_llm_journal
-                        SET state = 'indeterminate',
-                            error_kind = COALESCE(error_kind, 'crash'),
-                            completed_at = COALESCE(completed_at, NOW())
-                        WHERE invocation_id = %s
-                        RETURNING *
+                        WITH updated_journal AS (
+                            UPDATE dalton_llm_journal
+                            SET state = 'indeterminate',
+                                error_kind = COALESCE(error_kind, 'crash'),
+                                completed_at = COALESCE(completed_at, NOW())
+                            WHERE invocation_id = %s
+                            RETURNING *
+                        ),
+                        recorded_crash AS (
+                            INSERT INTO dalton_llm_journal_attempts (
+                                invocation_id, attempt, user_id, scope_ref, purpose, model_key,
+                                provider, billing_type, outcome, error_kind, usage,
+                                cash_usd, notional_usd, usage_known, unknown_usage_calls, occurred_at
+                            )
+                            SELECT
+                                u.invocation_id, u.attempt, u.user_id, u.scope_ref, u.purpose, u.model_key,
+                                u.provider, u.billing_type, 'indeterminate', COALESCE(u.error_kind, 'crash'),
+                                jsonb_build_object('usage_known', false, 'unknown_usage_calls', 1),
+                                0, 0, FALSE, 1, COALESCE(u.claimed_at, NOW())
+                            FROM updated_journal u
+                            ON CONFLICT (invocation_id, attempt) DO NOTHING
+                        )
+                        SELECT * FROM updated_journal
                         """,
                         (invocation_id,),
                     )
@@ -405,10 +467,40 @@ async def claim_journal_invocation(
             ):
                 return "indeterminate", existing
 
-            # Either state == 'failed', response was pruned on 'done', or resend_indeterminate=True
-            usage_reset_sql = ", usage = NULL" if not stamp_credential_holder else ""
+            # Either state == 'failed', response was pruned on 'done', or resend_indeterminate=True.
+            # Preserve prior accumulated token usage while stripping only `credential_user_id`
+            # when resending under deployment credentials (`stamp_credential_holder=False`).
+            # If reclaiming a stale `'pending'` row, also record a `'crash'` placeholder for
+            # the superseded attempt so its unknown usage is preserved unless that worker
+            # returns late and upgrades its own `(invocation_id, attempt)` row.
+            usage_reset_sql = (
+                ", usage = CASE WHEN usage IS NULL THEN NULL ELSE usage - 'credential_user_id' END"
+                if not stamp_credential_holder
+                else ""
+            )
             await cur.execute(
                 f"""
+                WITH prev AS (
+                    SELECT invocation_id, attempt, user_id, scope_ref, purpose, model_key,
+                           provider, billing_type, state, claimed_at
+                    FROM dalton_llm_journal
+                    WHERE invocation_id = %s
+                ),
+                recorded_stale AS (
+                    INSERT INTO dalton_llm_journal_attempts (
+                        invocation_id, attempt, user_id, scope_ref, purpose, model_key,
+                        provider, billing_type, outcome, error_kind, usage,
+                        cash_usd, notional_usd, usage_known, unknown_usage_calls, occurred_at
+                    )
+                    SELECT
+                        p.invocation_id, p.attempt, p.user_id, p.scope_ref, p.purpose, p.model_key,
+                        p.provider, p.billing_type, 'indeterminate', 'crash',
+                        jsonb_build_object('usage_known', false, 'unknown_usage_calls', 1),
+                        0, 0, FALSE, 1, COALESCE(p.claimed_at, NOW())
+                    FROM prev p
+                    WHERE p.state = 'pending'
+                    ON CONFLICT (invocation_id, attempt) DO NOTHING
+                )
                 UPDATE dalton_llm_journal
                 SET state = 'pending',
                     attempt = attempt + 1,
@@ -422,7 +514,7 @@ async def claim_journal_invocation(
                 WHERE invocation_id = %s
                 RETURNING *
                 """,
-                (model_key, provider, billing_type, invocation_id),
+                (invocation_id, model_key, provider, billing_type, invocation_id),
             )
             reclaimed = await cur.fetchone()
             return "claimed", dict(reclaimed) if reclaimed else {
@@ -449,14 +541,20 @@ async def complete_journal_done(
     provider: str | None = None,
     billing_type: str | None = None,
     stamp_credential_holder: bool = True,
+    attempt_usage: dict[str, Any] | None = None,
+    unknown_usage_calls: int = 0,
+    occurred_at: datetime | None = None,
     conn: Any = None,
 ) -> dict[str, Any] | None:
     """Transition a journal row to `state='done'` with response (or NULL when `persist_raw=False`), usage, and costs.
 
-    R6: only the attempt that claimed the row may write it back, and only while
-    it is still `'pending'`; a stale worker returning after a newer attempt took
-    over finds no matching row, logs a warning, and returns None instead of
-    clobbering the newer attempt's state or response.
+    R6: only the attempt that claimed the row may write back the parent row's
+    `state` and `response`; a stale worker returning after a newer attempt took
+    over finds no matching parent row, logs a warning, and returns None instead
+    of clobbering the newer attempt's state or response. Regardless of takeover,
+    its own `(invocation_id, attempt)` billing record is uniquely settled in
+    `dalton_llm_journal_attempts` so completed provider charges are never lost
+    or double-counted and are attributed to that attempt's `occurred_at`.
     """
     resp_json = (
         json.dumps(response, ensure_ascii=False, default=str)
@@ -464,6 +562,10 @@ async def complete_journal_done(
         else None
     )
     usage_json = json.dumps(usage or {}, ensure_ascii=False, default=str)
+    eff_attempt_usage = attempt_usage if attempt_usage is not None else (usage or {})
+    attempt_usage_json = json.dumps(eff_attempt_usage, ensure_ascii=False, default=str)
+    eff_unknown_calls = max(0, int(unknown_usage_calls or 0))
+    eff_usage_known = eff_unknown_calls == 0
 
     usage_clause = (
         "COALESCE(usage, '{}'::jsonb) || %s::jsonb"
@@ -475,25 +577,56 @@ async def complete_journal_done(
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
-                UPDATE dalton_llm_journal
-                SET state = 'done',
-                    completed_at = NOW(),
-                    response = %s::jsonb,
-                    usage = {usage_clause},
-                    cash_usd = COALESCE(cash_usd, 0) + %s,
-                    notional_usd = COALESCE(notional_usd, 0) + %s,
-                    provider = COALESCE(%s, provider),
-                    billing_type = COALESCE(%s, billing_type),
-                    error_kind = NULL,
-                    error_text = NULL
-                -- Only the attempt that claimed the row writes it back. A stale
-                -- mark (pending -> indeterminate) keeps the attempt number, so
-                -- that attempt may still settle it -- a long call past the stale
-                -- window must not lose its result or its cost; a takeover bumps
-                -- the attempt and so shuts the older worker out.
-                WHERE invocation_id = %s AND attempt = %s
-                  AND state IN ('pending', 'indeterminate')
-                RETURNING *
+                WITH updated_journal AS (
+                    UPDATE dalton_llm_journal
+                    SET state = 'done',
+                        completed_at = NOW(),
+                        response = %s::jsonb,
+                        usage = {usage_clause},
+                        cash_usd = COALESCE(cash_usd, 0) + %s,
+                        notional_usd = COALESCE(notional_usd, 0) + %s,
+                        provider = COALESCE(%s, provider),
+                        billing_type = COALESCE(%s, billing_type),
+                        error_kind = NULL,
+                        error_text = NULL
+                    -- Only the attempt that claimed the row writes it back. A stale
+                    -- mark (pending -> indeterminate) keeps the attempt number, so
+                    -- that attempt may still settle it; a takeover bumps the attempt
+                    -- and shuts the older worker out of updating state/response while
+                    -- `recorded_attempt` below still settles its unique attempt cost.
+                    WHERE invocation_id = %s AND attempt = %s
+                      AND state IN ('pending', 'indeterminate')
+                    RETURNING *
+                ),
+                recorded_attempt AS (
+                    INSERT INTO dalton_llm_journal_attempts (
+                        invocation_id, attempt, user_id, scope_ref, purpose, model_key,
+                        provider, billing_type, outcome, error_kind, usage,
+                        cash_usd, notional_usd, usage_known, unknown_usage_calls, occurred_at
+                    )
+                    SELECT
+                        j.invocation_id, v.att, j.user_id, j.scope_ref, j.purpose, j.model_key,
+                        COALESCE(%s::text, j.provider), COALESCE(%s::text, j.billing_type),
+                        'done', NULL, %s::jsonb,
+                        %s::numeric, %s::numeric, %s::boolean, %s::int, COALESCE(%s::timestamptz, NOW())
+                    FROM dalton_llm_journal j
+                    JOIN (VALUES (%s::text, %s::int)) AS v(inv_id, att)
+                      ON j.invocation_id = v.inv_id
+                    ON CONFLICT (invocation_id, attempt) DO UPDATE
+                    SET outcome = EXCLUDED.outcome,
+                        error_kind = EXCLUDED.error_kind,
+                        usage = EXCLUDED.usage,
+                        cash_usd = EXCLUDED.cash_usd,
+                        notional_usd = EXCLUDED.notional_usd,
+                        usage_known = EXCLUDED.usage_known,
+                        unknown_usage_calls = EXCLUDED.unknown_usage_calls,
+                        occurred_at = EXCLUDED.occurred_at
+                    WHERE dalton_llm_journal_attempts.error_kind = 'crash'
+                      AND dalton_llm_journal_attempts.usage_known = FALSE
+                      AND dalton_llm_journal_attempts.cash_usd = 0
+                      AND dalton_llm_journal_attempts.notional_usd = 0
+                )
+                SELECT * FROM updated_journal
                 """,
                 (
                     resp_json,
@@ -502,6 +635,16 @@ async def complete_journal_done(
                     notional_usd,
                     provider,
                     billing_type,
+                    invocation_id,
+                    int(attempt),
+                    provider,
+                    billing_type,
+                    attempt_usage_json,
+                    cash_usd,
+                    notional_usd,
+                    eff_usage_known,
+                    eff_unknown_calls,
+                    occurred_at,
                     invocation_id,
                     int(attempt),
                 ),
@@ -561,19 +704,20 @@ async def complete_journal_failed(
     cash_usd: Decimal | None = None,
     notional_usd: Decimal | None = None,
     stamp_credential_holder: bool = True,
+    attempt_usage: dict[str, Any] | None = None,
+    usage_known: bool | None = None,
+    unknown_usage_calls: int | None = None,
+    occurred_at: datetime | None = None,
     conn: Any = None,
 ) -> dict[str, Any] | None:
     """Transition a journal row to `state='failed'` or `state='indeterminate'`.
 
-    R6: only the attempt that claimed the row may write it back, and only while
-    it is still `'pending'` (the pre-update state; writing `'indeterminate'` is
-    itself a pending→indeterminate transition); a stale worker returning after
-    a newer attempt took over finds no matching row, logs a warning, and
-    returns None instead of clobbering the newer attempt's state.
-
-    Accumulates ``cash_usd`` / ``notional_usd`` onto any prior attempt's billed
-    totals so retries on the same ``invocation_id`` neither lose nor double-count
-    completed upstream provider charges.
+    R6: only the attempt that claimed the row may write back the parent row's
+    `state`; a stale worker returning after a newer attempt took over finds no
+    matching parent row, logs a warning, and returns None instead of clobbering
+    the newer attempt's state. Regardless of takeover, its own
+    `(invocation_id, attempt)` billing/unknown-usage record is uniquely settled
+    in `dalton_llm_journal_attempts`.
     """
     if state not in ("failed", "indeterminate"):
         state = "indeterminate"
@@ -588,28 +732,91 @@ async def complete_journal_failed(
             if (stamp_credential_holder and is_team_credential_sharing_enabled())
             else "%s::jsonb"
         )
-        usage_sql = f",\n                    usage = {usage_clause}"
+        usage_sql = f",\n                        usage = {usage_clause}"
         usage_params = (usage_json,)
+
+    eff_attempt_usage = attempt_usage if attempt_usage is not None else usage
+    attempt_usage_json = (
+        json.dumps(eff_attempt_usage, ensure_ascii=False, default=str)
+        if eff_attempt_usage is not None
+        else None
+    )
+    if unknown_usage_calls is not None:
+        eff_unknown_calls = max(0, int(unknown_usage_calls))
+    elif isinstance(eff_attempt_usage, Mapping) and eff_attempt_usage.get("unknown_usage_calls") is not None:
+        eff_unknown_calls = max(0, int(eff_attempt_usage["unknown_usage_calls"]))
+    elif usage_known is False or (
+        isinstance(eff_attempt_usage, Mapping) and eff_attempt_usage.get("usage_known") is False
+    ):
+        eff_unknown_calls = 1
+    elif usage_known is True or (
+        isinstance(eff_attempt_usage, Mapping) and eff_attempt_usage.get("usage_known") is True
+    ):
+        eff_unknown_calls = 0
+    else:
+        eff_unknown_calls = (
+            1
+            if state == "indeterminate"
+            and not has_reported_token_usage(eff_attempt_usage)
+            and (cash_usd or Decimal("0")) <= Decimal("0")
+            and (notional_usd or Decimal("0")) <= Decimal("0")
+            else 0
+        )
+    if usage_known is False and eff_unknown_calls == 0:
+        eff_unknown_calls = 1
+    eff_usage_known = eff_unknown_calls == 0
 
     async def _do_update(c: Any) -> dict[str, Any] | None:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
-                UPDATE dalton_llm_journal
-                SET state = %s,
-                    completed_at = NOW(),
-                    error_kind = %s,
-                    error_text = %s,
-                    cash_usd = COALESCE(cash_usd, 0) + COALESCE(%s, 0),
-                    notional_usd = COALESCE(notional_usd, 0) + COALESCE(%s, 0){usage_sql}
-                -- Only the attempt that claimed the row writes it back. A stale
-                -- mark (pending -> indeterminate) keeps the attempt number, so
-                -- that attempt may still settle it -- a long call past the stale
-                -- window must not lose its result or its cost; a takeover bumps
-                -- the attempt and so shuts the older worker out.
-                WHERE invocation_id = %s AND attempt = %s
-                  AND state IN ('pending', 'indeterminate')
-                RETURNING *
+                WITH updated_journal AS (
+                    UPDATE dalton_llm_journal
+                    SET state = %s,
+                        completed_at = NOW(),
+                        error_kind = %s,
+                        error_text = %s,
+                        cash_usd = COALESCE(cash_usd, 0) + COALESCE(%s, 0),
+                        notional_usd = COALESCE(notional_usd, 0) + COALESCE(%s, 0){usage_sql}
+                    -- Only the attempt that claimed the row writes it back. A stale
+                    -- mark (pending -> indeterminate) keeps the attempt number, so
+                    -- that attempt may still settle it; a takeover bumps the attempt
+                    -- and shuts the older worker out of updating state while
+                    -- `recorded_attempt` below still settles its unique attempt cost.
+                    WHERE invocation_id = %s AND attempt = %s
+                      AND state IN ('pending', 'indeterminate')
+                    RETURNING *
+                ),
+                recorded_attempt AS (
+                    INSERT INTO dalton_llm_journal_attempts (
+                        invocation_id, attempt, user_id, scope_ref, purpose, model_key,
+                        provider, billing_type, outcome, error_kind, usage,
+                        cash_usd, notional_usd, usage_known, unknown_usage_calls, occurred_at
+                    )
+                    SELECT
+                        j.invocation_id, v.att, j.user_id, j.scope_ref, j.purpose, j.model_key,
+                        j.provider, j.billing_type,
+                        %s::text, %s::text, %s::jsonb,
+                        COALESCE(%s::numeric, 0), COALESCE(%s::numeric, 0),
+                        %s::boolean, %s::int, COALESCE(%s::timestamptz, NOW())
+                    FROM dalton_llm_journal j
+                    JOIN (VALUES (%s::text, %s::int)) AS v(inv_id, att)
+                      ON j.invocation_id = v.inv_id
+                    ON CONFLICT (invocation_id, attempt) DO UPDATE
+                    SET outcome = EXCLUDED.outcome,
+                        error_kind = EXCLUDED.error_kind,
+                        usage = EXCLUDED.usage,
+                        cash_usd = EXCLUDED.cash_usd,
+                        notional_usd = EXCLUDED.notional_usd,
+                        usage_known = EXCLUDED.usage_known,
+                        unknown_usage_calls = EXCLUDED.unknown_usage_calls,
+                        occurred_at = EXCLUDED.occurred_at
+                    WHERE dalton_llm_journal_attempts.error_kind = 'crash'
+                      AND dalton_llm_journal_attempts.usage_known = FALSE
+                      AND dalton_llm_journal_attempts.cash_usd = 0
+                      AND dalton_llm_journal_attempts.notional_usd = 0
+                )
+                SELECT * FROM updated_journal
                 """,
                 (
                     state,
@@ -618,6 +825,16 @@ async def complete_journal_failed(
                     cash_usd,
                     notional_usd,
                     *usage_params,
+                    invocation_id,
+                    int(attempt),
+                    state,
+                    error_kind,
+                    attempt_usage_json,
+                    cash_usd,
+                    notional_usd,
+                    eff_usage_known,
+                    eff_unknown_calls,
+                    occurred_at,
                     invocation_id,
                     int(attempt),
                 ),
@@ -649,7 +866,9 @@ async def fetch_journal_rows_in_window(
     user_id: str | None = None,
     conn: Any = None,
 ) -> list[dict[str, Any]]:
-    """Fetch journal rows created within `[day_start_utc, day_end_utc)` for budget and provider summaries.
+    """Fetch per-attempt journal rows occurring within `[day_start_utc, day_end_utc)`
+    (with legacy fallback for `dalton_llm_journal` rows without attempt records)
+    for budget, provider, and unknown-usage summaries.
 
     P0H §5 B2: Errors are logged at ERROR level and re-raised so budget reconciliation fails closed.
     """
@@ -660,14 +879,46 @@ async def fetch_journal_rows_in_window(
                 SELECT
                     invocation_id, user_id, scope_ref, purpose, model_key,
                     provider, billing_type, state, attempt, usage,
-                    cash_usd, notional_usd, error_kind, created_at, completed_at
-                FROM dalton_llm_journal
-                WHERE created_at >= %s
-                  AND created_at < %s
-                  AND (%s::text IS NULL OR user_id = %s OR user_id IS NULL)
+                    cash_usd, notional_usd, error_kind, usage_known,
+                    unknown_usage_calls, created_at, completed_at
+                FROM (
+                    SELECT
+                        a.invocation_id, a.user_id, a.scope_ref, a.purpose, a.model_key,
+                        a.provider, a.billing_type, a.outcome AS state, a.attempt, a.usage,
+                        a.cash_usd, a.notional_usd, a.error_kind, a.usage_known,
+                        a.unknown_usage_calls, a.occurred_at AS created_at, a.occurred_at AS completed_at
+                    FROM dalton_llm_journal_attempts a
+                    WHERE a.occurred_at >= %s
+                      AND a.occurred_at < %s
+                      AND (%s::text IS NULL OR a.user_id = %s OR a.user_id IS NULL)
+                    UNION ALL
+                    SELECT
+                        j.invocation_id, j.user_id, j.scope_ref, j.purpose, j.model_key,
+                        j.provider, j.billing_type, j.state, j.attempt, j.usage,
+                        j.cash_usd, j.notional_usd, j.error_kind, NULL::boolean AS usage_known,
+                        NULL::int AS unknown_usage_calls, j.created_at, j.completed_at
+                    FROM dalton_llm_journal j
+                    WHERE j.created_at >= %s
+                      AND j.created_at < %s
+                      AND (%s::text IS NULL OR j.user_id = %s OR j.user_id IS NULL)
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM dalton_llm_journal_attempts a
+                          WHERE a.invocation_id = j.invocation_id
+                      )
+                ) AS rows
                 ORDER BY created_at DESC
                 """,
-                (day_start_utc, day_end_utc, user_id, user_id),
+                (
+                    day_start_utc,
+                    day_end_utc,
+                    user_id,
+                    user_id,
+                    day_start_utc,
+                    day_end_utc,
+                    user_id,
+                    user_id,
+                ),
             )
             return [dict(r) for r in await cur.fetchall()]
 

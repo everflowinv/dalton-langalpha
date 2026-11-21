@@ -30,8 +30,8 @@ from src.dalton.database.budget import (
     verify_task_cap_scope_owner,
 )
 from src.dalton.database.llm_journal import (
+    count_unknown_usage_in_row,
     fetch_journal_rows_in_window,
-    is_unknown_usage_journal_row,
 )
 from src.dalton.llm.notional_pricing import (
     build_notional_price_index,
@@ -340,10 +340,12 @@ def compute_provider_breakdown(
             continue
         cash_val = Decimal(str(j.get("cash_usd") or "0"))
         notional_val = Decimal(str(j.get("notional_usd") or "0"))
+        unknown_cnt = count_unknown_usage_in_row(j)
         if (
             j.get("state") not in ("done", "indeterminate")
             and cash_val <= Decimal("0")
             and notional_val <= Decimal("0")
+            and unknown_cnt <= 0
         ):
             continue
         m_name = str(j.get("model_key") or "unknown")
@@ -363,8 +365,8 @@ def compute_provider_breakdown(
         )
         b = _ensure(prov)
         b["calls"] += 1
-        if is_unknown_usage_journal_row(j):
-            b["unknown_usage_calls"] += 1
+        if unknown_cnt > 0:
+            b["unknown_usage_calls"] += unknown_cnt
         if is_sub:
             b["notional_usd"] += notional_val if notional_val > Decimal("0") else cash_val
         else:
@@ -479,11 +481,13 @@ async def reconcile_and_summarize_day(
     by_provider = compute_provider_breakdown(tu_rows, journal_rows)
 
     journal_unknown_usage_rows = [
-        j for j in journal_rows if isinstance(j, dict) and is_unknown_usage_journal_row(j)
+        j for j in journal_rows if isinstance(j, dict) and count_unknown_usage_in_row(j) > 0
     ]
-    journal_unknown_usage_count = len(journal_unknown_usage_rows)
+    journal_unknown_usage_count = sum(
+        count_unknown_usage_in_row(j) for j in journal_unknown_usage_rows
+    )
     journal_unknown_usage_cash_count = sum(
-        1
+        count_unknown_usage_in_row(j)
         for j in journal_unknown_usage_rows
         if not _is_subscription_model(
             str(j.get("model_key") or "unknown"),

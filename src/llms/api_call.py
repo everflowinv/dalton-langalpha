@@ -51,7 +51,17 @@ class StructuredOutputParseError(ValueError):
         self.parsing_failed = True
 
 
-_USAGE_ACCUMULATOR: ContextVar[Optional[list[Dict[str, Any]]]] = ContextVar(
+class _ApiCallUsageBucket(list):
+    """List of collected per-call provider usage dicts with in-flight/unknown call tracking."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sent_calls: int = 0
+        self.in_flight_calls: int = 0
+        self.unknown_calls: int = 0
+
+
+_USAGE_ACCUMULATOR: ContextVar[Optional[_ApiCallUsageBucket]] = ContextVar(
     "dalton_api_call_usage_accumulator",
     default=None,
 )
@@ -68,12 +78,231 @@ _REPORTED_TOKEN_KEYS = (
 @contextlib.contextmanager
 def collect_api_call_usage():
     """Collect per-call provider token usage dicts emitted by ``make_api_call`` within this context."""
-    bucket: list[Dict[str, Any]] = []
+    bucket = _ApiCallUsageBucket()
     token = _USAGE_ACCUMULATOR.set(bucket)
     try:
         yield bucket
     finally:
         _USAGE_ACCUMULATOR.reset(token)
+
+
+def _positive_num(val: Any) -> Optional[Union[int, float]]:
+    if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
+        return val
+    return None
+
+
+def _nonneg_num(val: Any) -> Optional[Union[int, float]]:
+    if isinstance(val, (int, float)) and not isinstance(val, bool) and val >= 0:
+        return val
+    return None
+
+
+# DALTON-HOOK(complete-parse-failure-billing): normalize raw provider usage payloads attached to
+# SDK parse exceptions (e.g. OpenAI Responses/Chat Completions httpx.Response or LengthFinishReasonError).
+def _normalize_raw_provider_usage(raw: Any) -> Dict[str, Any]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        if hasattr(raw, "model_dump"):
+            try:
+                raw = raw.model_dump()
+            except Exception:
+                return {}
+        elif hasattr(raw, "to_dict"):
+            try:
+                raw = raw.to_dict()
+            except Exception:
+                return {}
+        elif hasattr(raw, "__dict__"):
+            raw = vars(raw)
+        else:
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+
+    out: Dict[str, Any] = {}
+    in_tok = _nonneg_num(raw.get("input_tokens"))
+    if in_tok is None:
+        in_tok = _nonneg_num(raw.get("prompt_tokens"))
+    if in_tok is None:
+        in_tok = _nonneg_num(raw.get("promptTokenCount"))
+
+    out_tok = _nonneg_num(raw.get("output_tokens"))
+    if out_tok is None:
+        out_tok = _nonneg_num(raw.get("completion_tokens"))
+    if out_tok is None:
+        out_tok = _nonneg_num(raw.get("candidatesTokenCount"))
+
+    tot_tok = _nonneg_num(raw.get("total_tokens"))
+    if tot_tok is None:
+        tot_tok = _nonneg_num(raw.get("totalTokenCount"))
+
+    if in_tok is not None:
+        out["input_tokens"] = in_tok
+    if out_tok is not None:
+        out["output_tokens"] = out_tok
+    if tot_tok is not None:
+        out["total_tokens"] = tot_tok
+    elif (in_tok or 0) > 0 or (out_tok or 0) > 0:
+        out["total_tokens"] = (in_tok or 0) + (out_tok or 0)
+
+    # Cached input tokens across OpenAI Responses, Chat Completions, LangChain, Anthropic, Gemini
+    cached = _positive_num(raw.get("cached_tokens"))
+    for details_key, sub_key in (
+        ("input_tokens_details", "cached_tokens"),
+        ("prompt_tokens_details", "cached_tokens"),
+        ("input_token_details", "cache_read"),
+    ):
+        if cached is not None:
+            break
+        det = raw.get(details_key)
+        if isinstance(det, dict):
+            cached = _positive_num(det.get(sub_key))
+    if cached is None:
+        cached = _positive_num(raw.get("cache_read_input_tokens"))
+    if cached is None:
+        cached = _positive_num(raw.get("cachedContentTokenCount"))
+    if cached is not None:
+        out["cached_tokens"] = cached
+
+    # Cache creation tokens (Anthropic / LangChain)
+    cache_5m = _positive_num(raw.get("cache_5m_tokens"))
+    cache_1h = _positive_num(raw.get("cache_1h_tokens"))
+    cc = raw.get("cache_creation")
+    if isinstance(cc, dict):
+        cache_5m = _positive_num(cc.get("ephemeral_5m_input_tokens")) or cache_5m
+        cache_1h = _positive_num(cc.get("ephemeral_1h_input_tokens")) or cache_1h
+    if cache_5m is None and cache_1h is None:
+        cache_5m = _positive_num(raw.get("cache_creation_input_tokens"))
+    if cache_5m is not None:
+        out["cache_5m_tokens"] = cache_5m
+    if cache_1h is not None:
+        out["cache_1h_tokens"] = cache_1h
+
+    # Reasoning & audio tokens
+    reasoning = _positive_num(raw.get("reasoning_tokens"))
+    for details_key, sub_key in (
+        ("output_tokens_details", "reasoning_tokens"),
+        ("completion_tokens_details", "reasoning_tokens"),
+        ("output_token_details", "reasoning"),
+    ):
+        if reasoning is not None:
+            break
+        det = raw.get(details_key)
+        if isinstance(det, dict):
+            reasoning = _positive_num(det.get(sub_key))
+    if reasoning is None:
+        reasoning = _positive_num(raw.get("thoughtsTokenCount"))
+    if reasoning is not None:
+        out["reasoning_tokens"] = reasoning
+
+    for details_key, sub_key, dest_key in (
+        ("prompt_tokens_details", "audio_tokens", "audio_input_tokens"),
+        ("completion_tokens_details", "audio_tokens", "audio_output_tokens"),
+    ):
+        det = raw.get(details_key)
+        if isinstance(det, dict):
+            audio_v = _positive_num(det.get(sub_key))
+            if audio_v is not None:
+                out[dest_key] = audio_v
+
+    if not any((out.get(k) or 0) > 0 for k in _REPORTED_TOKEN_KEYS):
+        return {}
+    return out
+
+
+# DALTON-HOOK(complete-parse-failure-billing): recover provider usage from SDK parse exceptions
+# before falling back to manual JSON retries.
+def _extract_usage_from_sdk_exception(exc: BaseException) -> Dict[str, Any]:
+    seen: set[int] = set()
+    queue: list[BaseException] = [exc]
+    while queue:
+        cur = queue.pop(0)
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+
+        for attr in ("token_usage", "usage"):
+            cand = _normalize_raw_provider_usage(getattr(cur, attr, None))
+            if cand:
+                return cand
+
+        completion = getattr(cur, "completion", None)
+        if completion is not None:
+            cand = _normalize_raw_provider_usage(getattr(completion, "usage", None))
+            if cand:
+                return cand
+
+        for attr in ("raw", "llm_output"):
+            obj = getattr(cur, attr, None)
+            if obj is not None:
+                cand = _normalize_raw_provider_usage(extract_token_usage(obj))
+                if cand:
+                    return cand
+
+        resp = getattr(cur, "response", None)
+        if resp is not None:
+            if hasattr(resp, "usage_metadata") or hasattr(resp, "response_metadata"):
+                cand = _normalize_raw_provider_usage(extract_token_usage(resp))
+                if cand:
+                    return cand
+            elif isinstance(resp, dict):
+                cand = _normalize_raw_provider_usage(
+                    resp.get("usage") or resp.get("usageMetadata") or resp
+                )
+                if cand:
+                    return cand
+            elif callable(getattr(resp, "json", None)):
+                status_code = getattr(resp, "status_code", None)
+                if not isinstance(status_code, int) or 200 <= status_code < 300:
+                    try:
+                        body = resp.json()
+                    except Exception:
+                        body = None
+                    if isinstance(body, dict):
+                        raw_u = body.get("usage") or body.get("usageMetadata")
+                        if raw_u is None and isinstance(body.get("response"), dict):
+                            raw_u = body["response"].get("usage")
+                        cand = _normalize_raw_provider_usage(raw_u)
+                        if cand:
+                            return cand
+
+        for nxt in (getattr(cur, "__cause__", None), getattr(cur, "__context__", None)):
+            if isinstance(nxt, BaseException) and id(nxt) not in seen:
+                queue.append(nxt)
+    return {}
+
+
+def _is_unbilled_sdk_error(exc: BaseException) -> bool:
+    """Return True for client-side/pre-billing rejections that never incur upstream charges."""
+    if isinstance(exc, (NotImplementedError, AttributeError, TypeError, KeyError)):
+        return True
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        resp = getattr(exc, "response", None)
+        status_code = getattr(resp, "status_code", None)
+    if isinstance(status_code, int) and status_code in (400, 401, 403, 404, 422, 426):
+        return True
+    cls_name = exc.__class__.__name__
+    if cls_name in ("MissingProviderKeyError", "ProviderDisabledError", "ValueError"):
+        return True
+    msg_lower = str(exc).lower()
+    if any(
+        token in msg_lower
+        for token in (
+            "missingproviderkey",
+            "providerdisabled",
+            "no model configured",
+            "not logged in",
+            "no valid oauth token",
+            "oauth_required",
+            "requires a connected",
+            "unsupported sdk",
+        )
+    ):
+        return True
+    return False
 
 
 def _record_collected_usage(token_info: Any) -> None:
@@ -87,6 +316,37 @@ def _record_collected_usage(token_info: Any) -> None:
     }
     if any(numeric.get(k, 0) > 0 for k in _REPORTED_TOKEN_KEYS):
         bucket.append(numeric)
+
+
+@contextlib.contextmanager
+def _track_upstream_call():
+    """Track an active upstream `ainvoke` call so timeouts during retry backoff sleep
+    are distinguished from timeouts during an actual in-flight provider request."""
+    bucket = _USAGE_ACCUMULATOR.get()
+    capture: Dict[str, Any] = {"usage": {}}
+    if bucket is not None:
+        bucket.sent_calls += 1
+        bucket.in_flight_calls += 1
+    try:
+        yield capture
+    except BaseException as exc:
+        extracted: Dict[str, Any] = {}
+        if isinstance(exc, Exception):
+            extracted = _extract_usage_from_sdk_exception(exc)
+        if extracted:
+            capture["usage"] = extracted
+            _record_collected_usage(extracted)
+        if bucket is not None:
+            bucket.in_flight_calls = max(0, bucket.in_flight_calls - 1)
+            if not extracted and (
+                isinstance(exc, (asyncio.CancelledError, TimeoutError))
+                or not _is_unbilled_sdk_error(exc)
+            ):
+                bucket.unknown_calls += 1
+        raise
+    else:
+        if bucket is not None:
+            bucket.in_flight_calls = max(0, bucket.in_flight_calls - 1)
 
 
 def create_messages(system_prompt: str, user_prompt: str) -> list:
@@ -169,7 +429,9 @@ async def make_api_call(
     with tracing_context(enabled=False) if disable_tracing else contextlib.nullcontext():
         # Case 1: No schema requested, return raw content
         if response_schema is None:
-            response = await llm.ainvoke(messages)
+            # DALTON-HOOK(complete-parse-failure-billing): track active upstream call for accurate unknown-usage accounting.
+            with _track_upstream_call():
+                response = await llm.ainvoke(messages)
             content = get_message_content(response)
 
             # Extract token usage (silent by default)
@@ -187,10 +449,15 @@ async def make_api_call(
         # usage dicts (`per_call_usages`) across fallback retries so threshold-priced
         # models evaluate each request's input length individually.
         raw_token_info: Dict[str, Any] = {}
+        # DALTON-HOOK(complete-parse-failure-billing): capture usage from native SDK parse exceptions
+        # (e.g. OpenAI Responses/Chat Completions returning usage on truncated structured output).
+        native_captures: list[Dict[str, Any]] = []
         try:
             # Use include_raw=True to get token usage with structured output
             client = llm.with_structured_output(response_schema, include_raw=True)
-            response_with_raw = await client.ainvoke(messages)
+            with _track_upstream_call() as native_capture:
+                native_captures.append(native_capture)
+                response_with_raw = await client.ainvoke(messages)
 
             token_info = {}
 
@@ -215,7 +482,9 @@ async def make_api_call(
             else:
                 # Fallback to direct response if include_raw didn't work
                 client = llm.with_structured_output(response_schema)
-                response = await client.ainvoke(messages)
+                with _track_upstream_call() as direct_capture:
+                    native_captures.append(direct_capture)
+                    response = await client.ainvoke(messages)
 
             if return_token_usage:
                 return response, token_info
@@ -228,17 +497,30 @@ async def make_api_call(
             last_error = None
             total_token_info = {}
             per_call_usages: list[Dict[str, Any]] = []
+            # DALTON-HOOK(complete-parse-failure-billing): carry usage recovered from native SDK
+            # parse failures into fallback totals and per_call_usages without double-counting.
+            native_sdk_usages = [
+                dict(c["usage"]) for c in native_captures if isinstance(c.get("usage"), dict) and c["usage"]
+            ]
             if raw_token_info:
                 for key, value in raw_token_info.items():
                     total_token_info[key] = total_token_info.get(key, 0) + value
                 per_call_usages.append(dict(raw_token_info))
+            elif native_sdk_usages:
+                for sdk_usage in native_sdk_usages:
+                    for key, value in sdk_usage.items():
+                        total_token_info[key] = total_token_info.get(key, 0) + value
+                    per_call_usages.append(dict(sdk_usage))
             retry_count = 0
 
             for attempt in range(max_parsing_retries):
                 retry_count = attempt + 1
+                fb_capture: Dict[str, Any] = {"usage": {}}
                 try:
                     # Get response from LLM
-                    response = await llm.ainvoke(messages)
+                    # DALTON-HOOK(complete-parse-failure-billing): track active upstream fallback call.
+                    with _track_upstream_call() as fb_capture:
+                        response = await llm.ainvoke(messages)
                     content = get_message_content(response)
 
                     # Extract and accumulate token usage
@@ -300,6 +582,12 @@ async def make_api_call(
                         raise ValueError(f"Response is not a string (attempt {retry_count}/{max_parsing_retries})")
 
                 except (json.JSONDecodeError, ValidationError, ValueError) as parse_error:
+                    # DALTON-HOOK(complete-parse-failure-billing): retain SDK-recovered usage when
+                    # `llm.ainvoke` itself raised ValidationError/ValueError on a billed response.
+                    if fb_capture.get("usage"):
+                        for key, value in fb_capture["usage"].items():
+                            total_token_info[key] = total_token_info.get(key, 0) + value
+                        per_call_usages.append(dict(fb_capture["usage"]))
                     last_error = parse_error
                     if retry_count < max_parsing_retries:
                         # Add clarification to the prompt for next attempt
@@ -312,6 +600,10 @@ async def make_api_call(
                 except Exception as retry_exc:
                     # DALTON-HOOK(complete-parse-failure-billing): preserve usage from earlier
                     # completed calls if a subsequent retry aborts with timeout/5xx/stream cut.
+                    if fb_capture.get("usage"):
+                        for key, value in fb_capture["usage"].items():
+                            total_token_info[key] = total_token_info.get(key, 0) + value
+                        per_call_usages.append(dict(fb_capture["usage"]))
                     if per_call_usages and getattr(retry_exc, "token_usage", None) is None:
                         partial_usage = dict(total_token_info)
                         partial_usage["retry_attempts"] = retry_count
