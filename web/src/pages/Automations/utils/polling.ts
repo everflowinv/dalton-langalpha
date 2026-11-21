@@ -1,4 +1,4 @@
-import type { AutomationExecution } from '@/types/automation';
+import type { AutomationExecution, ScriptExecutionRead } from '@/types/automation'; // DALTON-HOOK(execution-delivery-status)
 
 export const IDLE_POLL_MS = 30_000;
 /** A run takes seconds to minutes, and its row has to move from the loader
@@ -32,9 +32,57 @@ export function pollMs(live: boolean): number {
  * when its automation has somewhere to deliver (`awaitsRecord`).
  */
 export function isDeliverySettling(run: AutomationExecution, awaitsRecord: boolean, now = Date.now()): boolean {
+  // DALTON-HOOK(execution-delivery-status): poll while delivery_summary is retrying within settle window; stop once terminal or expired
+  if (run.delivery_summary) {
+    if (run.delivery_summary.status !== 'retrying') return false;
+    if (!run.completed_at) return false;
+    return now - Date.parse(run.completed_at) < DELIVERY_SETTLE_MS;
+  }
   if (!run.completed_at) return false;
   // NaN, from a timestamp that doesn't parse, settles nothing.
   if (!(now - Date.parse(run.completed_at) < DELIVERY_SETTLE_MS)) return false;
   const attempts = run.delivery_result;
-  return attempts ? attempts.some((d) => !d.success) : awaitsRecord;
+  return attempts ? attempts.some((d) => !d.success && d.retrying !== false) : awaitsRecord;
+}
+
+// DALTON-HOOK(execution-delivery-status): poll company script history fast while retrying, slow (30s) while unconfirmed awaiting receipt, and stop on terminal outcomes
+const UNCONFIRMED_DELIVERY_CODES = new Set([
+  'delivery_uncertain',
+  'delivery_unconfirmed',
+  'unknown',
+  'in_flight',
+  'partial',
+  'gateway_restarted',
+]);
+
+export function isScriptDeliveryPending(
+  run: Pick<ScriptExecutionRead, 'notify_status' | 'delivery_summary'> | null | undefined,
+): boolean {
+  if (!run) return false;
+  if (run.delivery_summary) {
+    return run.delivery_summary.status === 'retrying';
+  }
+  return run.notify_status === 'pending_dispatch';
+}
+
+export function isScriptDeliveryAwaitingReceipt(
+  run: Pick<ScriptExecutionRead, 'notify_status' | 'delivery_summary'> | null | undefined,
+): boolean {
+  if (!run || run.notify_status !== 'pending_dispatch' || !run.delivery_summary) return false;
+  if (run.delivery_summary.status === 'delivered' || run.delivery_summary.status === 'retrying') {
+    return false;
+  }
+  const topCode = (run.delivery_summary.failure_code ?? '').trim().toLowerCase();
+  if (topCode && UNCONFIRMED_DELIVERY_CODES.has(topCode)) return true;
+  return (run.delivery_summary.targets ?? []).some(
+    (tgt) => tgt.status === 'failed' && UNCONFIRMED_DELIVERY_CODES.has((tgt.error_code ?? '').trim().toLowerCase()),
+  );
+}
+
+export function scriptDeliveryPollMs(
+  runs: readonly Pick<ScriptExecutionRead, 'notify_status' | 'delivery_summary'>[],
+): number | false {
+  if (runs.some((run) => isScriptDeliveryPending(run))) return LIVE_POLL_MS;
+  if (runs.some((run) => isScriptDeliveryAwaitingReceipt(run))) return IDLE_POLL_MS;
+  return false;
 }

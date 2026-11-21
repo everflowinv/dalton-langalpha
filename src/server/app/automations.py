@@ -280,8 +280,13 @@ async def list_automations(
     items = [AutomationResponse.model_validate(a) for a in automations]
     # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
     from src.dalton.notify.dispatch import populate_automation_notify_state
+    # DALTON-HOOK(execution-delivery-status): attach delivery_summary to each automation's last_execution
+    from src.dalton.services.execution_delivery_status import (
+        enrich_automations_with_delivery_summary,
+    )
 
     await populate_automation_notify_state(user_id, items)
+    await enrich_automations_with_delivery_summary(items)
     return AutomationsListResponse(
         automations=items,
         total=total,
@@ -498,8 +503,13 @@ async def get_automation(
         resp = AutomationResponse.model_validate(automation)
         # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
         from src.dalton.notify.dispatch import populate_automation_notify_state
+        # DALTON-HOOK(execution-delivery-status): attach delivery_summary to detail last_execution
+        from src.dalton.services.execution_delivery_status import (
+            enrich_automations_with_delivery_summary,
+        )
 
         await populate_automation_notify_state(principal.user_id, [resp])
+        await enrich_automations_with_delivery_summary([resp])
         return resp
     from src.dalton.database import company_data_tasks as company_data_db
     from src.dalton.services.company_automations import (
@@ -507,6 +517,9 @@ async def get_automation(
         require_company_scope_read_access,
     )
     from src.dalton.services.company_task_read import scrub_company_agent_row
+    from src.dalton.services.execution_delivery_status import (
+        enrich_automations_with_delivery_summary,
+    )
 
     company_row = await company_data_db.get_company_agent_detail(str(parsed.agent_id))
     if company_row is None:
@@ -516,6 +529,8 @@ async def get_automation(
         raise_not_found("Automation")
     company_resp = AutomationResponse.model_validate(scrub_company_agent_row(company_row))
     apply_company_notify_representation(company_resp, company_row)
+    # DALTON-HOOK(execution-delivery-status): attach delivery_summary to company agent detail last_execution
+    await enrich_automations_with_delivery_summary([company_resp])
     return company_resp
 
 
@@ -1056,7 +1071,14 @@ def _parse_read_id(automation_id: str):
 async def _runs_page(user_id: str, **filters) -> AutomationRunsListResponse:
     """The feed and one automation's history: one query, one page shape."""
     executions, has_more = await exec_db.list_executions(user_id, **filters)
+    items = [AutomationRunResponse.model_validate(e) for e in executions]
+    # DALTON-HOOK(execution-delivery-status): enrich run feed and per-automation history with delivery_summary
+    from src.dalton.services.execution_delivery_status import (
+        enrich_executions_with_delivery_summary,
+    )
+
+    await enrich_executions_with_delivery_summary(items)
     return AutomationRunsListResponse(
-        executions=[AutomationRunResponse.model_validate(e) for e in executions],
+        executions=items,
         has_more=has_more,
     )

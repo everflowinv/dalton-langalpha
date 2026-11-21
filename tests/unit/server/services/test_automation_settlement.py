@@ -146,6 +146,10 @@ def _settlement(row):
         db=MagicMock(
             settle_execution=AsyncMock(side_effect=_settles(row)),
             record_delivery=AsyncMock(),
+            # DALTON-HOOK(execution-delivery-status): stub retrying flag clear helper on kept delivery_result
+            clear_delivery_retrying=create_autospec(
+                settlement_mod.exec_db.clear_delivery_retrying, return_value=None
+            ),
             # DALTON-HOOK(automation-continuation-identity): defaults for background/timeout checks
             get_execution_for_settlement=create_autospec(
                 settlement_mod.exec_db.get_execution_for_settlement, return_value=None
