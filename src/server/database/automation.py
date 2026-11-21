@@ -70,14 +70,18 @@ def not_a_server_skip(alias: str) -> str:
 def owned_execution_thread_join_sql(
     exec_alias: str, task_alias: str, thread_alias: str = "t"
 ) -> str:
-    """LEFT JOIN ``conversation_threads`` only when the thread sits in a
-    workspace owned by the automation's owner.
+    """LEFT JOIN ``conversation_threads`` only when the thread sits in a live
+    workspace that the automation's owner can read (their own workspace, or a
+    thread they own in a colleague's workspace).
 
     DALTON-HOOK(history-computer-scope): ``automation_executions.conversation_thread_id``
     has no foreign key. If a run's thread was deleted and another account
-    reused that UUID in their own workspace, treat the execution as having no
-    thread so neither its ``workspace_id`` nor computer-scope reach leaks across
-    accounts.
+    reused that UUID in their own workspace, or the thread's workspace was
+    soft-deleted, treat the execution as having no accessible thread so
+    neither its ``workspace_id`` nor computer-scope reach leaks across
+    accounts or points at a deleted workspace. A caller-owned thread in a live
+    colleague workspace remains linked so its actual ``workspace_id`` is
+    preserved even after the automation moves.
     """
     return (
         f"LEFT JOIN conversation_threads {thread_alias}\n"
@@ -85,24 +89,30 @@ def owned_execution_thread_join_sql(
         "   AND EXISTS (\n"
         "       SELECT 1 FROM workspaces thread_workspace\n"
         f"       WHERE thread_workspace.workspace_id = {thread_alias}.workspace_id\n"
-        f"         AND thread_workspace.user_id = {task_alias}.user_id\n"
+        "         AND thread_workspace.status <> 'deleted'\n"
+        "         AND (\n"
+        f"             thread_workspace.user_id = {task_alias}.user_id\n"
+        f"             OR {thread_alias}.user_id = {task_alias}.user_id\n"
+        "         )\n"
         "   )"
     )
 
 
 def target_computer_workspace_predicate_sql(ws_alias: str, owner_expr: str) -> str:
-    """SQL predicate matching caller-owned non-Home workspaces on a computer.
+    """SQL predicate matching live caller-owned non-Home workspaces on a computer.
 
     DALTON-HOOK(history-computer-scope): shared by both the split task/thread
     execution history query and the detail/list ``last_execution`` probes so
-    both narrow by target computer workspaces first and enforce workspace
-    ownership. Caller binds ``(home_id, computer_id)``.
+    both narrow by target computer workspaces first, enforce workspace
+    ownership, and exclude soft-deleted workspaces. Caller binds
+    ``(home_id, computer_id)``.
     """
     return (
         f"{ws_alias}.workspace_id <> %s::uuid"
         f" AND {ws_alias}.computer_id IS NOT NULL"
         f" AND {ws_alias}.computer_id = %s::uuid"
         f" AND {ws_alias}.user_id = {owner_expr}"
+        f" AND {ws_alias}.status <> 'deleted'"
     )
 
 

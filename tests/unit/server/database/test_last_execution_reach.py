@@ -46,10 +46,12 @@ def _assert_reached_probe(sql: str, alias: str, outer: str) -> None:
     assert "task_ws.computer_id IS NOT NULL" in window
     assert "task_ws.computer_id = %s::uuid" in window
     assert f"task_ws.user_id = {outer}.user_id" in window
+    assert "task_ws.status <> 'deleted'" in window
     assert "thread_ws.workspace_id <> %s::uuid" in window
     assert "thread_ws.computer_id IS NOT NULL" in window
     assert "thread_ws.computer_id = %s::uuid" in window
     assert f"thread_ws.user_id = {outer}.user_id" in window
+    assert "thread_ws.status <> 'deleted'" in window
     assert f"{alias}.conversation_thread_id IS NOT NULL" in window
     assert "execution_workspace" not in window
     when_block = window[window.index("WHEN") : window.index("THEN")]
@@ -208,7 +210,8 @@ def _build_sqlite_history_world() -> tuple[sqlite3.Connection, dict[str, str]]:
         CREATE TABLE workspaces (
             workspace_id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL,
-            computer_id TEXT
+            computer_id TEXT,
+            status TEXT NOT NULL DEFAULT 'running'
         );
         CREATE INDEX idx_workspaces_computer
             ON workspaces(computer_id)
@@ -231,7 +234,8 @@ def _build_sqlite_history_world() -> tuple[sqlite3.Connection, dict[str, str]]:
 
         CREATE TABLE conversation_threads (
             conversation_thread_id TEXT PRIMARY KEY,
-            workspace_id TEXT NOT NULL
+            workspace_id TEXT NOT NULL,
+            user_id TEXT
         );
         CREATE INDEX idx_conversation_threads_workspace
             ON conversation_threads(workspace_id);
@@ -957,3 +961,386 @@ def test_d042_migration_creates_and_drops_execution_thread_and_automation_worksp
     assert f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {d042.AUTOMATION_USER_WORKSPACE_INDEX}" in joined
     assert f"DROP INDEX CONCURRENTLY IF EXISTS {d042.EXECUTION_THREAD_INDEX}" in joined
     assert f"DROP INDEX CONCURRENTLY IF EXISTS {d042.AUTOMATION_USER_WORKSPACE_INDEX}" in joined
+
+
+def _run_full_last_execution_probe_sqlite(
+    sq: sqlite3.Connection, automation_id: str, user_id: str, computer_id: str
+) -> str | None:
+    """Execute the full COALESCE(u, c, n) last-execution probe in SQLite."""
+    unsettled = auto_db._reached_execution_probe(
+        "automations", "u", f"u.status IN {auto_db.UNSETTLED_STATUSES}"
+    )
+    eligible = auto_db._reached_execution_probe(
+        "automations", "c", auto_db.not_a_server_skip("c")
+    )
+    newest = auto_db._reached_execution_probe("automations", "n", "")
+    sql = (
+        f"SELECT COALESCE({unsettled}, {eligible}, {newest}) AS last_exec_id "
+        "FROM automations "
+        "WHERE automation_id = ? AND user_id = ? AND deleted_at IS NULL"
+    ).replace("::uuid", "").replace("%s", "?")
+    params = (*auto_db._last_execution_computer_params(user_id, computer_id), automation_id, user_id)
+    row = sq.execute(sql, params).fetchone()
+    return None if row is None else row["last_exec_id"]
+
+
+@pytest.mark.asyncio
+async def test_colleague_workspace_thread_preserves_original_workspace_id_after_task_move():
+    """Round 3 item 1: caller-readable thread in a live colleague workspace keeps its real workspace_id after task move."""
+    sq, ids = _build_sqlite_history_world()
+    get_conn, _, _ = _sqlite_async_db(sq)
+    colleague_thread = "t8888881-0000-4000-8000-000000000001"
+    reused_other_thread = "t8888882-0000-4000-8000-000000000002"
+    colleague_in_own_ws_thread = "t8888883-0000-4000-8000-000000000003"
+    exec_colleague_run = "e8888881-0000-4000-8000-000000000001"
+    exec_reused_other = "e8888882-0000-4000-8000-000000000002"
+    exec_colleague_in_own_ws = "e8888883-0000-4000-8000-000000000003"
+
+    try:
+        # Owner ran auto_a in colleague's live workspace (ws_other_priv, stamping t.user_id = owner),
+        # then moved auto_a back to owner's own workspace ws_a1 (on comp_a).
+        # Meanwhile, other created an unrelated thread in ws_other_priv (t.user_id = other) reusing a UUID,
+        # and also created a thread inside owner's own live workspace ws_a1 (t.user_id = other).
+        sq.executemany(
+            "INSERT INTO conversation_threads (conversation_thread_id, workspace_id, user_id) VALUES (?, ?, ?)",
+            [
+                (colleague_thread, ids["ws_other_priv"], ids["owner"]),
+                (reused_other_thread, ids["ws_other_priv"], ids["other"]),
+                (colleague_in_own_ws_thread, ids["ws_a1"], ids["other"]),
+            ],
+        )
+        sq.executemany(
+            "INSERT INTO automation_executions "
+            "(automation_execution_id, automation_id, status, conversation_thread_id, created_at) "
+            "VALUES (?, ?, 'completed', ?, ?)",
+            [
+                (exec_colleague_run, ids["auto_a"], colleague_thread, "2026-11-21T01:00:00Z"),
+                (exec_reused_other, ids["auto_a"], reused_other_thread, "2026-11-21T02:00:00Z"),
+                (exec_colleague_in_own_ws, ids["auto_a"], colleague_in_own_ws_thread, "2026-11-21T03:00:00Z"),
+            ],
+        )
+        sq.commit()
+
+        with patch("src.server.database.automation_executions.get_db_connection", new=get_conn):
+            session_rows, _ = await exec_db.list_executions(ids["owner"], limit=50)
+            comp_a_rows, _ = await exec_db.list_executions(
+                ids["owner"], computer_id=ids["comp_a"], limit=50
+            )
+            comp_other_rows, _ = await exec_db.list_executions(
+                ids["owner"], computer_id=ids["comp_other"], limit=50
+            )
+
+        session_by_id = {r["automation_execution_id"]: r for r in session_rows}
+        comp_a_by_id = {r["automation_execution_id"]: r for r in comp_a_rows}
+
+        # Caller-owned thread in live colleague workspace keeps colleague's real workspace_id (not rewritten to ws_a1).
+        assert session_by_id[exec_colleague_run]["workspace_id"] == ids["ws_other_priv"]
+        assert comp_a_by_id[exec_colleague_run]["workspace_id"] == ids["ws_other_priv"]
+        # Reused thread belonging to other in other's private workspace still falls back to task workspace ws_a1.
+        assert session_by_id[exec_reused_other]["workspace_id"] == ids["ws_a1"]
+        assert comp_a_by_id[exec_reused_other]["workspace_id"] == ids["ws_a1"]
+        # Workspace owner can read a colleague's thread in owner's own live workspace.
+        assert session_by_id[exec_colleague_in_own_ws]["workspace_id"] == ids["ws_a1"]
+        assert comp_a_by_id[exec_colleague_in_own_ws]["workspace_id"] == ids["ws_a1"]
+        # Colleague's computer never becomes reachable via owner's computer token.
+        assert comp_other_rows == []
+    finally:
+        sq.close()
+
+
+@pytest.mark.asyncio
+async def test_soft_deleted_workspace_thread_excluded_from_computer_scope_and_workspace_projection():
+    """Round 3 item 2: threads in soft-deleted workspaces are excluded from computer reach and workspace_id projection."""
+    sq, ids = _build_sqlite_history_world()
+    get_conn, _, _ = _sqlite_async_db(sq)
+    auto_moved = "a7777771-0000-4000-8000-000000000001"
+    thread_in_deleted_ws = "t7777771-0000-4000-8000-000000000001"
+    thread_in_deleted_colleague_ws = "t7777772-0000-4000-8000-000000000002"
+    exec_deleted_ws = "e7777771-0000-4000-8000-000000000001"
+    exec_deleted_colleague_ws = "e7777772-0000-4000-8000-000000000002"
+
+    try:
+        # Move auto_moved from ws_a1 (comp_a) to ws_b1 (comp_b), while comp_a still has live ws_a2.
+        sq.execute(
+            "INSERT INTO automations (automation_id, user_id, name, trigger_type, workspace_id, scope, deleted_at) "
+            "VALUES (?, ?, 'Moved Deleted WS Task', 'cron', ?, 'personal', NULL)",
+            (auto_moved, ids["owner"], ids["ws_b1"]),
+        )
+        sq.executemany(
+            "INSERT INTO conversation_threads (conversation_thread_id, workspace_id, user_id) VALUES (?, ?, ?)",
+            [
+                (thread_in_deleted_ws, ids["ws_a1"], ids["owner"]),
+                (thread_in_deleted_colleague_ws, ids["ws_other_priv"], ids["owner"]),
+            ],
+        )
+        sq.executemany(
+            "INSERT INTO automation_executions "
+            "(automation_execution_id, automation_id, status, conversation_thread_id, created_at) "
+            "VALUES (?, ?, 'completed', ?, ?)",
+            [
+                (exec_deleted_ws, auto_moved, thread_in_deleted_ws, "2026-11-21T05:00:00Z"),
+                (exec_deleted_colleague_ws, auto_moved, thread_in_deleted_colleague_ws, "2026-11-21T06:00:00Z"),
+            ],
+        )
+        # Soft-delete ws_a1 (owner's old workspace on comp_a) and ws_other_priv (colleague's workspace).
+        # comp_a still retains live workspace ws_a2.
+        sq.execute(
+            "UPDATE workspaces SET status = 'deleted' WHERE workspace_id IN (?, ?)",
+            (ids["ws_a1"], ids["ws_other_priv"]),
+        )
+        sq.commit()
+
+        with patch("src.server.database.automation_executions.get_db_connection", new=get_conn):
+            comp_a_rows, _ = await exec_db.list_executions(
+                ids["owner"], computer_id=ids["comp_a"], limit=50
+            )
+            comp_b_rows, _ = await exec_db.list_executions(
+                ids["owner"], computer_id=ids["comp_b"], limit=50
+            )
+            session_rows, _ = await exec_db.list_executions(ids["owner"], limit=50)
+
+        comp_a_ids = {r["automation_execution_id"] for r in comp_a_rows}
+        comp_b_by_id = {r["automation_execution_id"]: r for r in comp_b_rows}
+        session_by_id = {r["automation_execution_id"]: r for r in session_rows}
+
+        # Soft-deleted ws_a1 no longer brings auto_moved's execution onto comp_a.
+        assert exec_deleted_ws not in comp_a_ids
+        assert exec_deleted_colleague_ws not in comp_a_ids
+        # Live ws_a2 on comp_a still works for executions whose thread sits in ws_a2.
+        assert ids["exec_same_comp_diff_ws"] in comp_a_ids
+        # On comp_b (where auto_moved now lives), both runs appear via task-side ownership
+        # and fall back to task workspace ws_b1 (never returning deleted ws_a1 or ws_other_priv).
+        assert comp_b_by_id[exec_deleted_ws]["workspace_id"] == ids["ws_b1"]
+        assert comp_b_by_id[exec_deleted_colleague_ws]["workspace_id"] == ids["ws_b1"]
+        assert session_by_id[exec_deleted_ws]["workspace_id"] == ids["ws_b1"]
+        assert session_by_id[exec_deleted_colleague_ws]["workspace_id"] == ids["ws_b1"]
+        # Detail/list last_execution probe on comp_a ignores deleted ws_a1; comp_b picks newest via ws_b1.
+        assert _run_detail_probe_sqlite(sq, auto_moved, ids["owner"], ids["comp_a"]) is None
+        assert _run_detail_probe_sqlite(sq, auto_moved, ids["owner"], ids["comp_b"]) == exec_deleted_colleague_ws
+    finally:
+        sq.close()
+
+
+@pytest.mark.asyncio
+async def test_moved_task_dual_computer_lists_pagination_and_detail_probes():
+    """Round 3 item 3: unit-test mirror of test_moved_task_execution_reads_stay_on_the_token_computer."""
+    sq, _ = _build_sqlite_history_world()
+    get_conn, _, _ = _sqlite_async_db(sq)
+    owner = "u-move-owner"
+    other = "u-move-other"
+    home = get_home_workspace_id(owner)
+    comp_a = "a1111111-1111-4111-8111-111111111111"
+    comp_b = "b2222222-2222-4222-8222-222222222222"
+    ws_a = "a3333333-3333-4333-8333-333333333333"
+    ws_b = "b4444444-4444-4444-8444-444444444444"
+    personal_id = "c5555555-5555-4555-8555-555555555555"
+    research_id = "d6666666-6666-4666-8666-666666666666"
+    foreign_only_id = "a9999999-9999-4999-8999-999999999999"
+    other_id = "ab000000-0000-4000-8000-0000000000c2"
+    company_id = "ab000000-0000-4000-8000-0000000000c1"
+    thread_a = "e7777777-7777-4777-8777-777777777771"
+    thread_home = "e7777777-7777-4777-8777-777777777772"
+    thread_a_mid = "e7777777-7777-4777-8777-777777777773"
+    thread_b_first = "e7777777-7777-4777-8777-777777777774"
+    thread_b_second = "e7777777-7777-4777-8777-777777777775"
+    thread_research_a = "e7777777-7777-4777-8777-777777777776"
+    thread_research_b = "e7777777-7777-4777-8777-777777777777"
+    run_research_a = "f1000000-0000-4000-8000-000000000001"
+    run_a_top = "f1000000-0000-4000-8000-000000000002"
+    run_research_b = "f1000000-0000-4000-8000-000000000003"
+    run_home = "f1000000-0000-4000-8000-000000000004"
+    run_research_none = "f1000000-0000-4000-8000-000000000005"
+    run_b_first = "f1000000-0000-4000-8000-000000000006"
+    run_a_mid = "f1000000-0000-4000-8000-000000000007"
+    run_b_second = "f1000000-0000-4000-8000-000000000008"
+    run_none = "f1000000-0000-4000-8000-000000000009"
+    run_research_inflight = "f1000000-0000-4000-8000-000000000011"
+    run_personal_inflight = "f1000000-0000-4000-8000-000000000012"
+    run_foreign_done = "f1000000-0000-4000-8000-000000000013"
+    run_foreign_live = "f1000000-0000-4000-8000-000000000014"
+    run_other = "f1000000-0000-4000-8000-000000000015"
+    run_company = "f1000000-0000-4000-8000-000000000016"
+
+    try:
+        sq.execute("DELETE FROM automation_executions")
+        sq.execute("DELETE FROM conversation_threads")
+        sq.execute("DELETE FROM automations")
+        sq.execute("DELETE FROM workspaces")
+        sq.executemany(
+            "INSERT INTO workspaces (workspace_id, user_id, computer_id, status) VALUES (?, ?, ?, 'running')",
+            [
+                (home, owner, comp_b),
+                (ws_a, owner, comp_a),
+                (ws_b, owner, comp_b),
+            ],
+        )
+        # All three owner tasks moved to ws_b (comp_b).
+        sq.executemany(
+            "INSERT INTO automations (automation_id, user_id, name, trigger_type, workspace_id, scope, deleted_at) "
+            "VALUES (?, ?, ?, 'cron', ?, ?, NULL)",
+            [
+                (personal_id, owner, "Moved Personal", ws_b, "personal"),
+                (research_id, owner, "Moved Research", ws_b, "research_tracking"),
+                (foreign_only_id, owner, "Foreign Only", ws_b, "personal"),
+                (other_id, other, "Other Task", ws_b, "personal"),
+                (company_id, COMPANY_SYSTEM_USER_ID, "Company Task", ws_b, "company"),
+            ],
+        )
+        sq.executemany(
+            "INSERT INTO conversation_threads (conversation_thread_id, workspace_id, user_id) VALUES (?, ?, ?)",
+            [
+                (thread_a, ws_a, None),
+                (thread_a_mid, ws_a, None),
+                (thread_research_a, ws_a, None),
+                (thread_home, home, None),
+                (thread_b_first, ws_b, None),
+                (thread_b_second, ws_b, None),
+                (thread_research_b, ws_b, None),
+            ],
+        )
+        sq.executemany(
+            "INSERT INTO automation_executions "
+            "(automation_execution_id, automation_id, status, conversation_thread_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (run_research_a, research_id, "completed", thread_research_a, "2026-11-10T19:00:00Z"),
+                (run_research_inflight, research_id, "running", thread_research_a, "2026-11-10T18:45:00Z"),
+                (run_a_top, personal_id, "completed", thread_a, "2026-11-10T18:30:00Z"),
+                (run_research_b, research_id, "completed", thread_research_b, "2026-11-10T18:00:00Z"),
+                (run_home, personal_id, "failed", thread_home, "2026-11-10T17:30:00Z"),
+                (run_research_none, research_id, "running", None, "2026-11-10T17:00:00Z"),
+                (run_personal_inflight, personal_id, "running", thread_a, "2026-11-10T16:30:00Z"),
+                (run_b_first, personal_id, "completed", thread_b_first, "2026-11-10T16:00:00Z"),
+                (run_a_mid, personal_id, "completed", thread_a_mid, "2026-11-10T15:00:00Z"),
+                (run_b_second, personal_id, "completed", thread_b_second, "2026-11-10T14:00:00Z"),
+                (run_none, personal_id, "completed", None, "2026-11-10T13:00:00Z"),
+                (run_foreign_done, foreign_only_id, "completed", thread_a, "2026-11-10T12:00:00Z"),
+                (run_foreign_live, foreign_only_id, "running", thread_a, "2026-11-10T11:00:00Z"),
+                (run_other, other_id, "running", None, "2026-11-10T09:00:00Z"),
+                (run_company, company_id, "completed", None, "2026-11-10T08:00:00Z"),
+            ],
+        )
+        sq.commit()
+
+        comp_b_expected = [
+            run_research_a,
+            run_research_inflight,
+            run_a_top,
+            run_research_b,
+            run_home,
+            run_research_none,
+            run_personal_inflight,
+            run_b_first,
+            run_a_mid,
+            run_b_second,
+            run_none,
+            run_foreign_done,
+            run_foreign_live,
+        ]
+        comp_a_expected = [
+            run_research_a,
+            run_research_inflight,
+            run_a_top,
+            run_personal_inflight,
+            run_a_mid,
+            run_foreign_done,
+            run_foreign_live,
+        ]
+
+        async def _assert_pages(expected: list[str], **kwargs):
+            full, full_more = await exec_db.list_executions(owner, limit=20, offset=0, **kwargs)
+            assert [r["automation_execution_id"] for r in full] == expected
+            assert full_more is False
+            for idx, run_id in enumerate(expected):
+                page, has_more = await exec_db.list_executions(
+                    owner, limit=1, offset=idx, **kwargs
+                )
+                assert [r["automation_execution_id"] for r in page] == [run_id]
+                assert has_more is (idx < len(expected) - 1)
+            tail, tail_more = await exec_db.list_executions(
+                owner, limit=1, offset=len(expected), **kwargs
+            )
+            assert tail == []
+            assert tail_more is False
+
+        with patch("src.server.database.automation_executions.get_db_connection", new=get_conn):
+            # Computer B (new task host): matches all 13 runs on task side, preserves thread workspaces.
+            await _assert_pages(comp_b_expected, computer_id=comp_b)
+            await _assert_pages(
+                [
+                    run_a_top,
+                    run_home,
+                    run_personal_inflight,
+                    run_b_first,
+                    run_a_mid,
+                    run_b_second,
+                    run_none,
+                    run_foreign_done,
+                    run_foreign_live,
+                ],
+                scope="personal",
+                computer_id=comp_b,
+            )
+            await _assert_pages(
+                [run_research_a, run_research_inflight, run_research_b, run_research_none],
+                scope="research_tracking",
+                computer_id=comp_b,
+            )
+            await _assert_pages(
+                [run_a_top, run_home, run_personal_inflight, run_b_first, run_a_mid, run_b_second, run_none],
+                automation_id=personal_id,
+                computer_id=comp_b,
+            )
+            await _assert_pages(
+                [run_foreign_done, run_foreign_live],
+                automation_id=foreign_only_id,
+                computer_id=comp_b,
+            )
+            b_full, _ = await exec_db.list_executions(owner, computer_id=comp_b, limit=20)
+            b_by_id = {r["automation_execution_id"]: r for r in b_full}
+            assert b_by_id[run_a_top]["workspace_id"] == ws_a
+            assert b_by_id[run_home]["workspace_id"] == home
+            assert b_by_id[run_none]["workspace_id"] == ws_b
+
+            # Computer A (old thread host): matches only the 7 runs whose thread sits in ws_a.
+            await _assert_pages(comp_a_expected, computer_id=comp_a)
+            await _assert_pages(
+                [run_a_top, run_personal_inflight, run_a_mid, run_foreign_done, run_foreign_live],
+                scope="personal",
+                computer_id=comp_a,
+            )
+            await _assert_pages(
+                [run_research_a, run_research_inflight],
+                scope="research_tracking",
+                computer_id=comp_a,
+            )
+            await _assert_pages(
+                [run_a_top, run_personal_inflight, run_a_mid],
+                automation_id=personal_id,
+                computer_id=comp_a,
+            )
+            await _assert_pages(
+                [run_foreign_done, run_foreign_live],
+                automation_id=foreign_only_id,
+                computer_id=comp_a,
+            )
+            for hidden_thread in (thread_b_first, thread_home):
+                hidden, hidden_more = await exec_db.list_executions(
+                    owner, thread_id=hidden_thread, computer_id=comp_a, limit=20
+                )
+                assert hidden == []
+                assert hidden_more is False
+
+            # Session: sees all 13 owner runs, never other_user or company runs.
+            await _assert_pages(comp_b_expected)
+
+        # Detail last_execution probes on both computers pick each task's unsettled (running) run,
+        # never cross-account tasks.
+        for comp in (comp_b, comp_a):
+            assert _run_full_last_execution_probe_sqlite(sq, personal_id, owner, comp) == run_personal_inflight
+            assert _run_full_last_execution_probe_sqlite(sq, research_id, owner, comp) == run_research_inflight
+            assert _run_full_last_execution_probe_sqlite(sq, foreign_only_id, owner, comp) == run_foreign_live
+            assert _run_full_last_execution_probe_sqlite(sq, other_id, owner, comp) is None
+            assert _run_full_last_execution_probe_sqlite(sq, company_id, owner, comp) is None
+    finally:
+        sq.close()

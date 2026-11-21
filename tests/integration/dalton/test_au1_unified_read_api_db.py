@@ -1377,7 +1377,9 @@ async def _automation_version(
 async def test_moved_task_execution_reads_stay_on_the_token_computer(
     au1_live_pool: AsyncConnectionPool,
 ) -> None:
-    """A computer token does not read runs left on another computer after a move."""
+    """After a task moves from computer A to computer B, computer-scoped reads
+    match runs whose task workspace OR live thread workspace sits on that
+    computer (excluding Home and other accounts), deduplicated and paginated."""
     owner = "u-move-owner"
     comp_a = "a1111111-1111-4111-8111-111111111111"
     comp_b = "b2222222-2222-4222-8222-222222222222"
@@ -1441,41 +1443,30 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
     company_delivery = "COMPANY-TASK-DELIVERY"
     b_first_delivery = "B-FIRST-DELIVERY"
     b_research_delivery = "B-RESEARCH-NOTHREAD-DELIVERY"
-    banned = (
-        old_a,
-        old_a_error,
-        old_a_delivery,
-        old_home,
-        old_home_error,
-        old_home_delivery,
-        old_mid,
-        old_mid_error,
-        old_mid_delivery,
-        old_research,
-        old_research_error,
-        old_research_delivery,
-        old_research_live,
-        old_research_live_error,
-        old_research_live_delivery,
-        old_personal_live,
-        old_personal_live_error,
-        old_personal_live_delivery,
-        foreign_done,
-        foreign_done_error,
-        foreign_done_delivery,
-        foreign_live,
-        foreign_live_error,
-        foreign_live_delivery,
+    cross_account_banned = (
         other_excerpt,
         other_error,
         other_delivery,
         company_excerpt,
         company_error,
         company_delivery,
-        thread_a,
+    )
+    comp_a_banned = (
+        "B-RESEARCH-EXCERPT",
+        "B-RESEARCH-NOTHREAD",
+        b_research_delivery,
+        old_home,
+        old_home_error,
+        old_home_delivery,
+        "B-FIRST-EXCERPT",
+        b_first_delivery,
+        "B-SECOND-EXCERPT",
+        "B-NOTHREAD-EXCERPT",
         thread_home,
-        thread_a_mid,
-        thread_research_a,
+        thread_b_first,
+        thread_b_second,
+        thread_research_b,
+        *cross_account_banned,
     )
     day = datetime(2026, 11, 10, tzinfo=UTC)
     home = get_home_workspace_id(owner)
@@ -1484,21 +1475,13 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
     research_feed = f"{feed}?scope=research_tracking"
     personal_history = f"/api/v1/automations/{personal_id}/executions"
     research_history = f"/api/v1/automations/{research_id}/executions"
+    foreign_history = f"/api/v1/automations/{foreign_only_id}/executions"
     personal_detail = f"/api/v1/automations/{personal_id}"
     research_detail = f"/api/v1/automations/{research_id}"
     foreign_detail = f"/api/v1/automations/{foreign_only_id}"
     task_list = "/api/v1/automations?limit=100"
     personal_list = "/api/v1/automations?scope=personal&limit=100"
     research_list = "/api/v1/automations?scope=research_tracking&limit=100"
-    visible = [
-        run_research_b,
-        run_research_none,
-        run_b_first,
-        run_b_second,
-        run_none,
-    ]
-    personal_visible = [run_b_first, run_b_second, run_none]
-    research_visible = [run_research_b, run_research_none]
     owner_task_ids = [research_id, personal_id, foreign_only_id]
     session_order = [
         run_research_a,
@@ -1515,6 +1498,53 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
         run_foreign_done,
         run_foreign_live,
     ]
+    comp_b_visible = list(session_order)
+    comp_b_personal_feed = [
+        run_a_top,
+        run_home,
+        run_personal_inflight,
+        run_b_first,
+        run_a_mid,
+        run_b_second,
+        run_none,
+        run_foreign_done,
+        run_foreign_live,
+    ]
+    comp_b_personal_history = [
+        run_a_top,
+        run_home,
+        run_personal_inflight,
+        run_b_first,
+        run_a_mid,
+        run_b_second,
+        run_none,
+    ]
+    comp_b_research_visible = [
+        run_research_a,
+        run_research_inflight,
+        run_research_b,
+        run_research_none,
+    ]
+    comp_b_foreign_visible = [run_foreign_done, run_foreign_live]
+    comp_a_visible = [
+        run_research_a,
+        run_research_inflight,
+        run_a_top,
+        run_personal_inflight,
+        run_a_mid,
+        run_foreign_done,
+        run_foreign_live,
+    ]
+    comp_a_personal_feed = [
+        run_a_top,
+        run_personal_inflight,
+        run_a_mid,
+        run_foreign_done,
+        run_foreign_live,
+    ]
+    comp_a_personal_history = [run_a_top, run_personal_inflight, run_a_mid]
+    comp_a_research_visible = [run_research_a, run_research_inflight]
+    comp_a_foreign_visible = [run_foreign_done, run_foreign_live]
 
     async with au1_live_pool.connection() as conn:
         await _insert_user(conn, owner, "move@dalton.test")
@@ -1796,14 +1826,23 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
         assert foreign_version["workspace_id"] == ws_b
 
         holder["principal"] = _computer(comp_b, owner)
-        await _assert_execution_pages(client, feed, visible, banned)
-        await _assert_execution_pages(client, personal_feed, personal_visible, banned)
-        await _assert_execution_pages(client, research_feed, research_visible, banned)
+        # All three tasks moved to ws_b (comp_b), so comp_b matches every run
+        # of those tasks on the task side (deduplicated, ordered newest first).
+        await _assert_execution_pages(client, feed, comp_b_visible, cross_account_banned)
         await _assert_execution_pages(
-            client, personal_history, personal_visible, banned
+            client, personal_feed, comp_b_personal_feed, cross_account_banned
         )
         await _assert_execution_pages(
-            client, research_history, research_visible, banned
+            client, research_feed, comp_b_research_visible, cross_account_banned
+        )
+        await _assert_execution_pages(
+            client, personal_history, comp_b_personal_history, cross_account_banned
+        )
+        await _assert_execution_pages(
+            client, research_history, comp_b_research_visible, cross_account_banned
+        )
+        await _assert_execution_pages(
+            client, foreign_history, comp_b_foreign_visible, cross_account_banned
         )
         opened = await _expect(await client.get(_paged(feed, limit=20, offset=0)), 200)
         by_id = {item["automation_execution_id"]: item for item in opened["executions"]}
@@ -1812,124 +1851,223 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
         assert by_id[run_none]["excerpt"] == "B-NOTHREAD-EXCERPT"
         assert by_id[run_b_first]["conversation_thread_id"] == thread_b_first
         assert by_id[run_b_first]["workspace_id"] == ws_b
+        assert by_id[run_a_top]["conversation_thread_id"] == thread_a
+        assert by_id[run_a_top]["workspace_id"] == ws_a
+        assert by_id[run_home]["conversation_thread_id"] == thread_home
+        assert by_id[run_home]["workspace_id"] == home
         assert by_id[run_research_none]["conversation_thread_id"] is None
+        assert by_id[run_research_none]["workspace_id"] == ws_b
 
-        off_computer = await client.get(f"{feed}?thread_id={thread_a}")
-        assert off_computer.status_code == 403, off_computer.text
-        assert off_computer.json()["detail"]["message"] == (
-            "A computer's token reaches only what that computer holds"
+        by_thread_a = await _expect(await client.get(f"{feed}?thread_id={thread_a}"), 200)
+        assert _run_ids(by_thread_a) == [
+            run_a_top,
+            run_personal_inflight,
+            run_foreign_done,
+            run_foreign_live,
+        ]
+        _assert_secrets_absent(by_thread_a, cross_account_banned)
+        by_thread_home = await _expect(
+            await client.get(f"{feed}?thread_id={thread_home}"), 200
         )
-        home_thread = await client.get(f"{feed}?thread_id={thread_home}")
-        assert home_thread.status_code == 403, home_thread.text
-        assert home_thread.json()["detail"]["message"] == (
-            "A computer's token never reaches Home"
-        )
-        for secret in banned:
-            assert secret not in off_computer.text
-            assert secret not in home_thread.text
+        assert _run_ids(by_thread_home) == [run_home]
+        _assert_secrets_absent(by_thread_home, cross_account_banned)
 
         b_default = await _expect(await client.get(task_list), 200)
         assert _ids(b_default) == owner_task_ids
         assert b_default["total"] == len(owner_task_ids)
-        _assert_secrets_absent(b_default, banned)
+        _assert_secrets_absent(b_default, cross_account_banned)
         b_tasks = _tasks(b_default)
         _assert_last(
             b_tasks[personal_id],
-            execution_id=run_b_first,
-            excerpt="B-FIRST-EXCERPT",
-            thread_id=thread_b_first,
-            status="completed",
-            delivery_note=b_first_delivery,
+            execution_id=run_personal_inflight,
+            excerpt=old_personal_live,
+            error_message=old_personal_live_error,
+            thread_id=thread_a,
+            status="running",
+            delivery_note=old_personal_live_delivery,
         )
         _assert_last(
             b_tasks[research_id],
-            execution_id=run_research_none,
-            excerpt="B-RESEARCH-NOTHREAD",
+            execution_id=run_research_inflight,
+            excerpt=old_research_live,
+            error_message=old_research_live_error,
+            thread_id=thread_research_a,
             status="running",
-            delivery_note=b_research_delivery,
+            delivery_note=old_research_live_delivery,
         )
-        _assert_last(b_tasks[foreign_only_id], execution_id=None)
+        _assert_last(
+            b_tasks[foreign_only_id],
+            execution_id=run_foreign_live,
+            excerpt=foreign_live,
+            error_message=foreign_live_error,
+            thread_id=thread_a,
+            status="running",
+            delivery_note=foreign_live_delivery,
+        )
         b_personal = await _expect(await client.get(personal_list), 200)
         assert _ids(b_personal) == [personal_id, foreign_only_id]
-        _assert_secrets_absent(b_personal, banned)
+        _assert_secrets_absent(b_personal, cross_account_banned)
         _assert_last(
             _tasks(b_personal)[personal_id],
-            execution_id=run_b_first,
-            excerpt="B-FIRST-EXCERPT",
-            thread_id=thread_b_first,
-            status="completed",
-            delivery_note=b_first_delivery,
+            execution_id=run_personal_inflight,
+            excerpt=old_personal_live,
+            error_message=old_personal_live_error,
+            thread_id=thread_a,
+            status="running",
+            delivery_note=old_personal_live_delivery,
         )
-        _assert_last(_tasks(b_personal)[foreign_only_id], execution_id=None)
+        _assert_last(
+            _tasks(b_personal)[foreign_only_id],
+            execution_id=run_foreign_live,
+            excerpt=foreign_live,
+            error_message=foreign_live_error,
+            thread_id=thread_a,
+            status="running",
+            delivery_note=foreign_live_delivery,
+        )
         b_research = await _expect(await client.get(research_list), 200)
         assert _ids(b_research) == [research_id]
-        _assert_secrets_absent(b_research, banned)
+        _assert_secrets_absent(b_research, cross_account_banned)
         _assert_last(
             _tasks(b_research)[research_id],
-            execution_id=run_research_none,
-            excerpt="B-RESEARCH-NOTHREAD",
+            execution_id=run_research_inflight,
+            excerpt=old_research_live,
+            error_message=old_research_live_error,
+            thread_id=thread_research_a,
             status="running",
-            delivery_note=b_research_delivery,
+            delivery_note=old_research_live_delivery,
         )
         personal_body = await _expect(await client.get(personal_detail), 200)
         research_body = await _expect(await client.get(research_detail), 200)
         foreign_body = await _expect(await client.get(foreign_detail), 200)
-        _assert_secrets_absent(personal_body, banned)
-        _assert_secrets_absent(research_body, banned)
-        _assert_secrets_absent(foreign_body, banned)
+        _assert_secrets_absent(personal_body, cross_account_banned)
+        _assert_secrets_absent(research_body, cross_account_banned)
+        _assert_secrets_absent(foreign_body, cross_account_banned)
         _assert_last(
             personal_body,
-            execution_id=run_b_first,
-            excerpt="B-FIRST-EXCERPT",
-            thread_id=thread_b_first,
-            status="completed",
-            delivery_note=b_first_delivery,
+            execution_id=run_personal_inflight,
+            excerpt=old_personal_live,
+            error_message=old_personal_live_error,
+            thread_id=thread_a,
+            status="running",
+            delivery_note=old_personal_live_delivery,
         )
         _assert_last(
             research_body,
-            execution_id=run_research_none,
-            excerpt="B-RESEARCH-NOTHREAD",
+            execution_id=run_research_inflight,
+            excerpt=old_research_live,
+            error_message=old_research_live_error,
+            thread_id=thread_research_a,
             status="running",
-            delivery_note=b_research_delivery,
+            delivery_note=old_research_live_delivery,
         )
-        _assert_last(foreign_body, execution_id=None)
-        await _assert_execution_pages(
-            client,
-            f"/api/v1/automations/{foreign_only_id}/executions",
-            [],
-            banned,
+        _assert_last(
+            foreign_body,
+            execution_id=run_foreign_live,
+            excerpt=foreign_live,
+            error_message=foreign_live_error,
+            thread_id=thread_a,
+            status="running",
+            delivery_note=foreign_live_delivery,
         )
         unrelated = await client.get(f"/api/v1/automations/{other_id}")
         assert unrelated.status_code == 404, unrelated.text
-        _assert_secrets_absent(unrelated.text, banned)
+        _assert_secrets_absent(unrelated.text, cross_account_banned)
         company_hidden = await client.get(f"/api/v1/automations/{company_id}")
         assert company_hidden.status_code == 403, company_hidden.text
         assert company_hidden.json()["detail"] == "Forbidden"
-        _assert_secrets_absent(company_hidden.text, banned)
+        _assert_secrets_absent(company_hidden.text, cross_account_banned)
 
         holder["principal"] = _computer(comp_a, owner)
-        for url in (feed, personal_feed, research_feed):
-            hidden = await _expect(await client.get(_paged(url, limit=20, offset=0)), 200)
-            assert hidden == {"executions": [], "has_more": False}
-        for url in (task_list, personal_list, research_list):
+        # On comp_a, the tasks now live on ws_b (comp_b), so comp_a matches only
+        # runs whose thread still sits in ws_a (comp_a) — never ws_b, Home, or
+        # thread-less runs.
+        await _assert_execution_pages(client, feed, comp_a_visible, comp_a_banned)
+        await _assert_execution_pages(
+            client, personal_feed, comp_a_personal_feed, comp_a_banned
+        )
+        await _assert_execution_pages(
+            client, research_feed, comp_a_research_visible, comp_a_banned
+        )
+        await _assert_execution_pages(
+            client, personal_history, comp_a_personal_history, comp_a_banned
+        )
+        await _assert_execution_pages(
+            client, research_history, comp_a_research_visible, comp_a_banned
+        )
+        await _assert_execution_pages(
+            client, foreign_history, comp_a_foreign_visible, comp_a_banned
+        )
+        opened_a = await _expect(await client.get(_paged(feed, limit=20, offset=0)), 200)
+        a_by_id = {item["automation_execution_id"]: item for item in opened_a["executions"]}
+        assert a_by_id[run_a_top]["workspace_id"] == ws_a
+        assert a_by_id[run_research_a]["workspace_id"] == ws_a
+        assert a_by_id[run_foreign_done]["workspace_id"] == ws_a
+
+        a_by_thread_a = await _expect(await client.get(f"{feed}?thread_id={thread_a}"), 200)
+        assert _run_ids(a_by_thread_a) == [
+            run_a_top,
+            run_personal_inflight,
+            run_foreign_done,
+            run_foreign_live,
+        ]
+        _assert_secrets_absent(a_by_thread_a, comp_a_banned)
+        for hidden_thread in (thread_b_first, thread_home):
+            hidden_runs = await _expect(
+                await client.get(f"{feed}?thread_id={hidden_thread}"), 200
+            )
+            assert hidden_runs == {"executions": [], "has_more": False}
+
+        a_default = await _expect(await client.get(task_list), 200)
+        assert _ids(a_default) == owner_task_ids
+        assert a_default["total"] == len(owner_task_ids)
+        _assert_secrets_absent(a_default, cross_account_banned)
+        for url in (personal_list, research_list):
             hidden_tasks = await _expect(await client.get(url), 200)
             assert hidden_tasks["automations"] == []
             assert hidden_tasks["total"] == 0
-            _assert_secrets_absent(hidden_tasks, banned)
-        for url in (
-            personal_history,
-            research_history,
-            personal_detail,
-            research_detail,
-            foreign_detail,
-        ):
-            denied = await client.get(url)
-            assert denied.status_code == 403, denied.text
-            assert denied.json()["detail"]["message"] == (
-                "A computer's token reaches only what that computer holds"
-            )
-            for secret in banned:
-                assert secret not in denied.text
+            _assert_secrets_absent(hidden_tasks, comp_a_banned)
+
+        a_personal_body = await _expect(await client.get(personal_detail), 200)
+        a_research_body = await _expect(await client.get(research_detail), 200)
+        a_foreign_body = await _expect(await client.get(foreign_detail), 200)
+        _assert_secrets_absent(a_personal_body, comp_a_banned)
+        _assert_secrets_absent(a_research_body, comp_a_banned)
+        _assert_secrets_absent(a_foreign_body, comp_a_banned)
+        _assert_last(
+            a_personal_body,
+            execution_id=run_personal_inflight,
+            excerpt=old_personal_live,
+            error_message=old_personal_live_error,
+            thread_id=thread_a,
+            status="running",
+            delivery_note=old_personal_live_delivery,
+        )
+        _assert_last(
+            a_research_body,
+            execution_id=run_research_inflight,
+            excerpt=old_research_live,
+            error_message=old_research_live_error,
+            thread_id=thread_research_a,
+            status="running",
+            delivery_note=old_research_live_delivery,
+        )
+        _assert_last(
+            a_foreign_body,
+            execution_id=run_foreign_live,
+            excerpt=foreign_live,
+            error_message=foreign_live_error,
+            thread_id=thread_a,
+            status="running",
+            delivery_note=foreign_live_delivery,
+        )
+        a_unrelated = await client.get(f"/api/v1/automations/{other_id}")
+        assert a_unrelated.status_code == 404, a_unrelated.text
+        _assert_secrets_absent(a_unrelated.text, cross_account_banned)
+        a_company_hidden = await client.get(f"/api/v1/automations/{company_id}")
+        assert a_company_hidden.status_code == 403, a_company_hidden.text
+        assert a_company_hidden.json()["detail"] == "Forbidden"
+        _assert_secrets_absent(a_company_hidden.text, cross_account_banned)
 
         holder["principal"] = _session(owner)
         own = await _expect(await client.get(_paged(feed, limit=20, offset=0)), 200)

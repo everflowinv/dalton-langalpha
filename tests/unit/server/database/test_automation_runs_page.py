@@ -34,7 +34,9 @@ async def test_a_page_reads_one_row_past_itself(db, fetched, has_more):
     assert "COUNT" not in sql.upper()
     assert "execution_workspace" not in sql
     assert "matched_execution_ids" not in sql
+    assert "thread_workspace.status <> 'deleted'" in sql
     assert "thread_workspace.user_id = a.user_id" in sql
+    assert "OR t.user_id = a.user_id" in sql
     assert params[-2:] == (3, 4)
     assert sql.index("WHERE") < sql.index("LIMIT")
 
@@ -42,7 +44,7 @@ async def test_a_page_reads_one_row_past_itself(db, fetched, has_more):
 @pytest.mark.asyncio
 async def test_computer_token_filters_the_run_workspace_before_the_page(db):
     # DALTON-HOOK(company-automations): filter task and execution workspaces before pagination
-    # DALTON-HOOK(history-computer-scope): narrow by target computer workspaces via split task/thread UNION and verify thread owner
+    # DALTON-HOOK(history-computer-scope): narrow by target computer workspaces via split task/thread UNION and verify thread access
     db.fetchall.return_value = []
     home_id = get_home_workspace_id("user-1")
 
@@ -54,13 +56,17 @@ async def test_computer_token_filters_the_run_workspace_before_the_page(db):
     assert "task_ws.computer_id IS NOT NULL" in sql
     assert "task_ws.computer_id = %s::uuid" in sql
     assert "task_ws.user_id = %s" in sql
+    assert "task_ws.status <> 'deleted'" in sql
     assert "thread_ws.workspace_id <> %s::uuid" in sql
     assert "thread_ws.computer_id IS NOT NULL" in sql
     assert "thread_ws.computer_id = %s::uuid" in sql
     assert "thread_ws.user_id = %s" in sql
+    assert "thread_ws.status <> 'deleted'" in sql
     assert "UNION" in sql
     assert "e.conversation_thread_id IS NOT NULL" in sql
+    assert "thread_workspace.status <> 'deleted'" in sql
     assert "thread_workspace.user_id = a.user_id" in sql
+    assert "OR t.user_id = a.user_id" in sql
     assert "OR execution_workspace.workspace_id" not in sql
     assert sql.index("matched_execution_ids") < sql.index("paged_execution_ids")
     assert params == (
