@@ -296,30 +296,7 @@ async def workspaces_create(
     # --- DALTON-HOOK(workspace-dedup): begin ---
     from src.dalton.coverage.dedup import find_existing_company_workspace
 
-    if allow_duplicate_company:
-        matched_ids: list[str] = []
-        try:
-            dup_for_log = await find_existing_company_workspace(
-                user_id, name, channel="cos"
-            )
-            if dup_for_log is not None:
-                matched_ids = list(
-                    dup_for_log.matched_workspace_ids
-                    or [
-                        m.workspace_id
-                        for m in dup_for_log.matches
-                        if m.workspace_id
-                    ]
-                )
-        except Exception:
-            matched_ids = []
-        logger.info(
-            "Skipping company workspace dedup check (allow_duplicate_company=True, user_id=%s, name=%r, matched_workspace_ids=%s)",
-            user_id,
-            name,
-            matched_ids,
-        )
-    else:
+    if not allow_duplicate_company:
         dup = None
         try:
             dup = await find_existing_company_workspace(
@@ -365,6 +342,32 @@ async def workspaces_create(
                     "instead of creating a duplicate"
                 )
             return decline_routing_command(declined, response, tool_call_id)
+
+    # --- DALTON-HOOK(workspace-dedup): begin ---
+    if allow_duplicate_company:
+        matched_ids: list[str] = []
+        try:
+            dup_for_log = await find_existing_company_workspace(
+                user_id, name, channel="cos"
+            )
+            if dup_for_log is not None:
+                matched_ids = list(
+                    dup_for_log.matched_workspace_ids
+                    or [
+                        m.workspace_id
+                        for m in dup_for_log.matches
+                        if m.workspace_id
+                    ]
+                )
+        except Exception:
+            matched_ids = []
+        logger.info(
+            "Skipping company workspace dedup check (allow_duplicate_company=True, user_id=%s, name=%r, matched_workspace_ids=%s)",
+            user_id,
+            name,
+            matched_ids,
+        )
+    # --- DALTON-HOOK(workspace-dedup): end ---
 
     from src.server.database.workspace_names import (
         WorkspaceNameInvalid,

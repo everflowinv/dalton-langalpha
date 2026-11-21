@@ -33,13 +33,14 @@ Visibility, credentials, and authorization remain strictly deterministic in code
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 import json
 import logging
 import re
 import time
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -49,13 +50,17 @@ from pydantic import BaseModel
 
 from src.dalton.access_tiers import get_user_tier
 from src.dalton.coverage.identity import is_historical_duplicate_workspace
+from src.dalton.credentials import (
+    disable_team_credential_sharing,
+    get_team_credential_holder_id,
+)
 from src.dalton.database.coverage_units import _norm_uuid
 from src.dalton.llm.assist import (
     resolve_assist_fallback_models,
     resolve_assist_model,
 )
 import src.dalton.llm.complete as complete_mod
-from src.dalton.llm.complete import dalton_complete
+from src.dalton.llm.complete import dalton_complete, resolve_model_billing_and_provider
 from src.dalton.settings import (
     is_coverage_units_enabled,
     is_dalton_supabase_auth_enabled,
@@ -90,7 +95,7 @@ DEDUP_SYSTEM_PROMPT = (
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
 _UUID_RE = re.compile(
-    r"(?<![0-9a-fA-F])[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?![0-9a-fA-F])"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
 
 
@@ -982,6 +987,7 @@ async def _run_batch_with_fallback(
     batch: list[_CandidateEntry],
     models: list[str],
     deadline: float,
+    is_external: bool = False,
     skip_journal: bool = False,
 ) -> list[tuple[_CandidateEntry, str, str]]:
     batch_by_id = {entry.short_id: entry for entry in batch}
@@ -990,34 +996,58 @@ async def _run_batch_with_fallback(
 
     last_exc: Exception | None = None
     for idx, model_name in enumerate(models):
-        remaining = deadline - time.monotonic()
+        now = time.monotonic()
+        remaining = deadline - now
         if remaining <= 0:
             raise TimeoutError("Workspace dedup LLM deadline exceeded")
-        model_timeout = (
-            min(DEDUP_PRIMARY_MODEL_TIMEOUT_SECONDS, remaining)
+        model_deadline = (
+            min(deadline, now + DEDUP_PRIMARY_MODEL_TIMEOUT_SECONDS)
             if idx == 0
-            else remaining
+            else deadline
         )
+        model_timeout = model_deadline - now
+        if model_timeout <= 0:
+            continue
+
+        call_kwargs: dict[str, Any] = {
+            "user_id": uid,
+            "system_prompt": DEDUP_SYSTEM_PROMPT,
+            "user_prompt": user_prompt,
+            "scope_ref": f"workspace_dedup:{uid}:{uuid.uuid4().hex}",
+            "purpose": "workspace_dedup",
+            "request_model": model_name,
+            "response_schema": DedupLlmResult,
+            "slot": "background",
+            "timeout_s": model_timeout,
+            "deadline": model_deadline,
+            "persist_raw": False,
+            "raise_on_error": False,
+            "skip_journal": skip_journal,
+            "record_provider_events": False,
+        }
+        if is_external:
+            call_kwargs["is_byok"] = True
+            call_kwargs["disable_team_credentials"] = True
+        else:
+            billing_type, _provider = resolve_model_billing_and_provider(model_name)
+            call_kwargs["is_byok"] = False
+            call_kwargs["disable_team_credentials"] = False
+            if billing_type == "oauth":
+                call_kwargs["credential_user_id"] = get_team_credential_holder_id()
+            else:
+                call_kwargs["credential_user_id"] = None
+
         try:
-            call_task = spawn_protected(
-                complete_fn(
-                    user_id=uid,
-                    system_prompt=DEDUP_SYSTEM_PROMPT,
-                    user_prompt=user_prompt,
-                    scope_ref=f"workspace_dedup:{uid}:{uuid.uuid4().hex}",
-                    purpose="workspace_dedup",
-                    request_model=model_name,
-                    response_schema=DedupLlmResult,
-                    slot="background",
-                    timeout_s=model_timeout,
-                    deadline=deadline,
-                    persist_raw=False,
-                    raise_on_error=False,
-                    skip_journal=skip_journal,
-                ),
-                name=f"workspace-dedup-{model_name}",
-                log_failure=False,
-            )
+            with (
+                disable_team_credential_sharing()
+                if is_external
+                else nullcontext()
+            ):
+                call_task = spawn_protected(
+                    complete_fn(**call_kwargs),
+                    name=f"workspace-dedup-{model_name}",
+                    log_failure=False,
+                )
             _done_calls, pending_calls = await asyncio.wait(
                 {call_task}, timeout=model_timeout
             )
@@ -1062,20 +1092,32 @@ async def _judge_candidates_with_llm(
     raw_name: str,
     entries: list[_CandidateEntry],
     stats: dict[str, int] | None = None,
+    is_external: bool = False,
     skip_journal: bool = False,
 ) -> list[tuple[_CandidateEntry, str, str]]:
     """Run parallel batched LLM matching under a shared 15s deadline."""
     if not entries:
         return []
-    models = await _resolve_dedup_models(uid)
+    deadline = time.monotonic() + DEDUP_TIMEOUT_SECONDS
+    remaining_pref = deadline - time.monotonic()
+    if remaining_pref <= 0:
+        raise TimeoutError("Workspace dedup LLM deadline exceeded")
+    with disable_team_credential_sharing() if is_external else nullcontext():
+        models = await asyncio.wait_for(
+            _resolve_dedup_models(uid),
+            timeout=remaining_pref,
+        )
     if not models:
         raise RuntimeError("No assist model configured for workspace dedup")
+
+    remaining = max(0.0, deadline - time.monotonic())
+    if remaining <= 0:
+        raise TimeoutError("Workspace dedup LLM deadline exceeded")
 
     batches = [
         entries[i : i + DEDUP_BATCH_SIZE]
         for i in range(0, len(entries), DEDUP_BATCH_SIZE)
     ]
-    deadline = time.monotonic() + DEDUP_TIMEOUT_SECONDS
 
     tasks = [
         asyncio.create_task(
@@ -1085,6 +1127,7 @@ async def _judge_candidates_with_llm(
                 batch=batch,
                 models=models,
                 deadline=deadline,
+                is_external=is_external,
                 skip_journal=skip_journal,
             )
         )
@@ -1128,6 +1171,7 @@ async def _judge_candidates_with_llm(
 
     # Deduplicate by candidate identity (prefer higher confidence) and sort:
     # high before medium, then unit-backed, recent activity, original order.
+    # Truncation to MAX_DUPLICATE_MATCHES happens after _refresh_live_hits.
     best_by_key: dict[str, tuple[_CandidateEntry, str, str]] = {}
     for entry, conf, reason in all_hits:
         dedup_key = f"ws:{entry.ws_id}" if entry.ws_id else f"unit:{entry.unit_id}"
@@ -1144,7 +1188,7 @@ async def _judge_candidates_with_llm(
             item[0].order_idx,
         ),
     )
-    return ranked[:MAX_DUPLICATE_MATCHES]
+    return ranked
 
 
 async def _refresh_live_hits(
@@ -1152,41 +1196,49 @@ async def _refresh_live_hits(
     *,
     conn: Any = None,
 ) -> list[tuple[_CandidateEntry, dict[str, Any] | None, str, str]]:
-    """Re-query hit workspaces and unbound units after LLM return, releasing conn before permission checks."""
+    """Re-query hit workspaces and unit bindings after LLM return, releasing conn before permission checks."""
     if not hits:
         return []
 
-    unbound_unit_ids = sorted(
-        {entry.unit_id for entry, _, _ in hits if entry.unbound_unit and entry.unit_id}
-    )
-    ws_ids: set[str] = {
-        entry.ws_id for entry, _, _ in hits if not entry.unbound_unit and entry.ws_id
-    }
+    unit_ids = sorted({entry.unit_id for entry, _, _ in hits if entry.unit_id})
+    ws_ids: set[str] = {entry.ws_id for entry, _, _ in hits if entry.ws_id}
     unit_state_by_id: dict[str, dict[str, Any]] = {}
     live_ws_by_id: dict[str, dict[str, Any]] = {}
 
     async with get_db_connection(conn) as c:
         async with c.cursor(row_factory=dict_row) as cur:
-            if unbound_unit_ids:
-                unbound_set = set(unbound_unit_ids)
+            if unit_ids:
+                unit_set = set(unit_ids)
                 await cur.execute(
                     """
                     SELECT u.unit_id::text AS unit_id,
                            u.status,
                            u.kind,
-                           u.workspace_id::text AS workspace_id
+                           u.workspace_id::text AS workspace_id,
+                           u.display_name,
+                           u.ticker,
+                           u.owner_user_id,
+                           COALESCE(u.lead_analyst_user_id, u.owner_user_id) AS lead_analyst_user_id,
+                           ul.name AS lead_name,
+                           ul.email AS lead_email
                     FROM dalton_coverage_units u
+                    LEFT JOIN users ul ON ul.user_id = COALESCE(u.lead_analyst_user_id, u.owner_user_id)
                     WHERE u.unit_id = ANY(%s::uuid[])
                     """,
-                    (unbound_unit_ids,),
+                    (unit_ids,),
                 )
                 for row in await cur.fetchall():
                     uid_row = _norm_uuid(row.get("unit_id"))
-                    if not uid_row or uid_row not in unbound_set:
+                    if not uid_row or uid_row not in unit_set:
                         continue
-                    unit_state_by_id[uid_row] = dict(row)
-                    bound_ws = _norm_uuid(row.get("workspace_id"))
-                    if bound_ws:
+                    unit_state_by_id.setdefault(uid_row, dict(row))
+                    u_row = unit_state_by_id[uid_row]
+                    u_kind = str(u_row.get("kind") or "company").strip().lower()
+                    u_status = str(
+                        u_row.get("status") if "status" in u_row else "active"
+                    ).strip().lower()
+                    bound_ws = _norm_uuid(u_row.get("workspace_id"))
+                    if bound_ws and u_kind == "company" and u_status == "active":
                         ws_ids.add(bound_ws)
 
             if ws_ids:
@@ -1197,8 +1249,11 @@ async def _refresh_live_hits(
                            w.name,
                            w.status,
                            (w.config->'home_stand_in') = 'true'::jsonb AS is_home_stand_in,
-                           NULLIF(BTRIM(COALESCE(w.config->>'dalton_historical_duplicate_of', '')), '') IS NOT NULL AS is_historical_duplicate
+                           NULLIF(BTRIM(COALESCE(w.config->>'dalton_historical_duplicate_of', '')), '') IS NOT NULL AS is_historical_duplicate,
+                           u.name AS owner_name,
+                           u.email AS owner_email
                     FROM workspaces w
+                    LEFT JOIN users u ON u.user_id = w.user_id
                     WHERE w.workspace_id = ANY(%s::uuid[])
                     """,
                     (sorted(ws_ids),),
@@ -1217,17 +1272,30 @@ async def _refresh_live_hits(
                         row=row,
                     ):
                         continue
+                    has_owner_info = (
+                        bool(ws_owner_id)
+                        or "owner_name" in row
+                        or "owner_email" in row
+                    )
+                    owner_name = (
+                        _resolve_display_name(
+                            row.get("owner_name"), row.get("owner_email"), ws_owner_id
+                        )
+                        if has_owner_info
+                        else None
+                    )
                     live_ws_by_id[wid] = {
                         "workspace_id": wid,
                         "user_id": ws_owner_id,
                         "name": ws_name,
                         "status": ws_status,
+                        "owner_name": owner_name,
                     }
 
-    refreshed: list[tuple[_CandidateEntry, dict[str, Any] | None, str, str]] = []
+    raw_refreshed: list[tuple[_CandidateEntry, dict[str, Any] | None, str, str]] = []
     for entry, conf, reason in hits:
-        if entry.unbound_unit:
-            u_row = unit_state_by_id.get(entry.unit_id or "")
+        if entry.unit_id:
+            u_row = unit_state_by_id.get(entry.unit_id)
             if u_row is None:
                 continue
             u_kind = str(u_row.get("kind") or "company").strip().lower()
@@ -1236,14 +1304,48 @@ async def _refresh_live_hits(
             ).strip().lower()
             if u_kind != "company" or u_status != "active":
                 continue
-            newly_bound_ws = _norm_uuid(u_row.get("workspace_id"))
-            if newly_bound_ws:
-                fresh_ws = live_ws_by_id.get(newly_bound_ws)
+
+            lead_uid = str(
+                u_row.get("lead_analyst_user_id") or u_row.get("owner_user_id") or ""
+            ).strip()
+            fresh_lead = (
+                _resolve_display_name(u_row.get("lead_name"), u_row.get("lead_email"), lead_uid)
+                if ("lead_name" in u_row or "lead_email" in u_row) and lead_uid
+                else entry.lead_analyst_name
+            )
+            fresh_display = str(u_row.get("display_name") or "").strip() or entry.unit_display_name
+            fresh_ticker = str(u_row.get("ticker") or "").strip().upper() or entry.ticker
+
+            current_ws_id = _norm_uuid(u_row.get("workspace_id"))
+            if not current_ws_id:
+                updated_entry = replace(
+                    entry,
+                    ws_id=None,
+                    unbound_unit=True,
+                    workspace_name="",
+                    owner_name=None,
+                    lead_analyst_name=fresh_lead,
+                    ticker=fresh_ticker,
+                    unit_display_name=fresh_display,
+                    ws_row=None,
+                )
+                raw_refreshed.append((updated_entry, None, conf, reason))
+            else:
+                fresh_ws = live_ws_by_id.get(current_ws_id)
                 if fresh_ws is None:
                     continue
-                refreshed.append((entry, fresh_ws, conf, reason))
-            else:
-                refreshed.append((entry, None, conf, reason))
+                updated_entry = replace(
+                    entry,
+                    ws_id=current_ws_id,
+                    unbound_unit=False,
+                    workspace_name=fresh_ws["name"],
+                    owner_name=fresh_ws.get("owner_name") or entry.owner_name,
+                    lead_analyst_name=fresh_lead,
+                    ticker=fresh_ticker,
+                    unit_display_name=fresh_display,
+                    ws_row=fresh_ws,
+                )
+                raw_refreshed.append((updated_entry, fresh_ws, conf, reason))
             continue
 
         if not entry.ws_id:
@@ -1251,9 +1353,42 @@ async def _refresh_live_hits(
         fresh_ws = live_ws_by_id.get(entry.ws_id)
         if fresh_ws is None:
             continue
-        refreshed.append((entry, fresh_ws, conf, reason))
+        updated_entry = replace(
+            entry,
+            workspace_name=fresh_ws["name"],
+            owner_name=fresh_ws.get("owner_name") or entry.owner_name,
+            ws_row=fresh_ws,
+        )
+        raw_refreshed.append((updated_entry, fresh_ws, conf, reason))
 
-    return refreshed
+    # Deduplicate after refreshing bindings (e.g. a previously unbound unit bound
+    # to a workspace that was also matched in the same batch/run).
+    deduped: list[tuple[_CandidateEntry, dict[str, Any] | None, str, str]] = []
+    seen_idx: dict[str, int] = {}
+    for entry, fresh_ws, conf, reason in raw_refreshed:
+        ws_key_id = str((fresh_ws or {}).get("workspace_id") or entry.ws_id or "").strip()
+        dedup_key = (
+            f"ws:{ws_key_id}"
+            if (fresh_ws is not None and ws_key_id)
+            else f"unit:{entry.unit_id}"
+        )
+        prev_pos = seen_idx.get(dedup_key)
+        if prev_pos is None:
+            seen_idx[dedup_key] = len(deduped)
+            deduped.append((entry, fresh_ws, conf, reason))
+        else:
+            prev_entry, prev_ws, prev_conf, prev_reason = deduped[prev_pos]
+            merged_entry = replace(
+                prev_entry,
+                is_unit=prev_entry.is_unit or entry.is_unit,
+                unit_id=prev_entry.unit_id or entry.unit_id,
+                lead_analyst_name=prev_entry.lead_analyst_name or entry.lead_analyst_name,
+                ticker=prev_entry.ticker or entry.ticker,
+                unit_display_name=prev_entry.unit_display_name or entry.unit_display_name,
+            )
+            deduped[prev_pos] = (merged_entry, prev_ws, prev_conf, prev_reason)
+
+    return deduped
 
 
 async def _find_matches(
@@ -1280,13 +1415,14 @@ async def _find_matches(
         raw_name=raw_name,
         entries=entries,
         stats=stats,
+        is_external=(caller_tier == "external"),
     )
     if not hits:
         return None
 
-    # Re-verify live workspace/unit status after LLM return, then release DB
-    # connection before checking workspace read permissions.
-    live_hits = await _refresh_live_hits(hits, conn=conn)
+    # Re-verify live workspace/unit status and bindings after LLM return, release DB
+    # connection before permission checks, and truncate to MAX_DUPLICATE_MATCHES after refresh.
+    live_hits = (await _refresh_live_hits(hits, conn=conn))[:MAX_DUPLICATE_MATCHES]
     if not live_hits:
         return None
 
@@ -1310,7 +1446,12 @@ async def _find_matches(
 
         ws_id = str((fresh_ws or {}).get("workspace_id") or entry.ws_id or "").strip()
         ws_name = str((fresh_ws or {}).get("name") or entry.workspace_name or "").strip()
-        owner_name = entry.owner_name or entry.lead_analyst_name or "Teammate"
+        owner_name = str(
+            (fresh_ws or {}).get("owner_name")
+            or entry.owner_name
+            or entry.lead_analyst_name
+            or "Teammate"
+        ).strip()
         ws_row = fresh_ws or entry.ws_row or {}
         if ws_id:
             matched_ids.append(ws_id)

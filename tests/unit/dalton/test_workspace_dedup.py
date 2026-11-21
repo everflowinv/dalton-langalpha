@@ -2367,3 +2367,1050 @@ async def test_uuid_redaction_fixed_4_columns_cleanup_external_cred_error_and_pr
     assert len(report["candidates"]) == 2
     assert any("TargetCo | - | -" in ln for ln in report["candidates"])
     assert "模型凭据刷新时应用会更新凭据记录" in (probe_mod.__doc__ or "")
+
+
+# ---------------------------------------------------------------------------
+# Round 6 tests: server-side credentials only, external isolation, no error leak,
+# send-time 9s cap + 15s pref read, unit rebind/unbind refresh, refresh-then-cap,
+# boundary-free UUID redaction, CoS allow_duplicate_company post-approval logging.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_internal_caller_ignores_byok_base_url_and_uses_server_credentials_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ptc_agent.config as ptc_cfg_mod
+    from ptc_agent.config.agent import LLMConfig
+    import src.dalton.credentials as cred_mod
+    import src.dalton.llm.complete as complete_mod
+    import src.dalton.llm.model_prefs as model_prefs_mod
+    import src.dalton.settings as settings_mod
+    import src.server.database.api_keys as api_keys_db
+    import src.server.database.oauth_tokens as oauth_tokens_db
+    import src.server.database.user as user_db
+    import src.server.services.llm.service as llm_svc_mod
+    import src.server.services.oauth_health as oauth_health_mod
+    from src.server.services.oauth_protocol import TokenSet
+
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="Anthropic",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            )
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_2})
+
+    # Minimal AgentConfig & no-op journal/budget stubs for real `dalton_complete` + `LLMService.complete`.
+    fake_cfg = create_autospec(ptc_cfg_mod.AgentConfig, instance=True)
+    fake_cfg.llm = LLMConfig(name="gemini-4-hydrogen-low-oauth", background="deepseek-flash")
+    monkeypatch.setattr(
+        ptc_cfg_mod,
+        "load_from_files",
+        create_autospec(ptc_cfg_mod.load_from_files, return_value=fake_cfg),
+    )
+
+    budget_calls: list[str] = []
+    journal_claims: list[dict[str, Any]] = []
+    journal_dones: list[dict[str, Any]] = []
+
+    async def _budget_ok(uid: str, **_kw: Any) -> tuple[bool, None, None]:
+        budget_calls.append(uid)
+        return True, None, None
+
+    async def _inspect(_inv_id: str, **_kw: Any) -> tuple[str, None]:
+        return "proceed", None
+
+    async def _claim(**kwargs: Any) -> tuple[str, dict[str, Any]]:
+        journal_claims.append(dict(kwargs))
+        return "claimed", {"attempt": 1, **kwargs}
+
+    async def _done(inv_id: str, **kwargs: Any) -> dict[str, Any]:
+        journal_dones.append({"invocation_id": inv_id, **kwargs})
+        return {"invocation_id": inv_id, **kwargs}
+
+    async def _failed(inv_id: str, **kwargs: Any) -> dict[str, Any]:
+        return {"invocation_id": inv_id, **kwargs}
+
+    monkeypatch.setattr(
+        complete_mod,
+        "_check_cash_budget_admission",
+        create_autospec(complete_mod._check_cash_budget_admission, side_effect=_budget_ok),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "inspect_journal_state",
+        create_autospec(complete_mod.inspect_journal_state, side_effect=_inspect),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "claim_journal_invocation",
+        create_autospec(complete_mod.claim_journal_invocation, side_effect=_claim),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "complete_journal_done",
+        create_autospec(complete_mod.complete_journal_done, side_effect=_done),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "complete_journal_failed",
+        create_autospec(complete_mod.complete_journal_failed, side_effect=_failed),
+    )
+
+    # Case A: Team mode ON, credential sharing OFF, caller saved a custom BYOK key & base_url
+    # for `deepseek`. Primary OAuth model is skipped/rejected (no team holder), fallback
+    # `deepseek-flash` MUST use platform env key + official endpoint, NEVER caller's base_url!
+    settings_mod.get_dalton_config.cache_clear()
+    orig_load_cfg = settings_mod._load_base_dalton_config
+    base_dalton_cfg = orig_load_cfg()
+    off_cfg = base_dalton_cfg.model_copy(
+        update={
+            "enabled": True,
+            "credentials": settings_mod.DaltonCredentialsConfig(sharing="off"),
+        }
+    )
+    monkeypatch.setattr(
+        settings_mod,
+        "_load_base_dalton_config",
+        create_autospec(orig_load_cfg, return_value=off_cfg),
+    )
+    settings_mod.get_dalton_config.cache_clear()
+
+    async def _empty_prefs(_uid: str) -> dict[str, Any]:
+        return {"model_preference": {}}
+
+    prefs_stub = create_autospec(
+        model_prefs_mod._DEFAULT_GET_USER_PREFERENCES, side_effect=_empty_prefs
+    )
+    monkeypatch.setattr(model_prefs_mod, "get_user_preferences", prefs_stub)
+    monkeypatch.setattr(user_db, "get_user_preferences", prefs_stub)
+
+    byok_spy = create_autospec(
+        api_keys_db.get_byok_config_for_provider,
+        return_value={"api_key": "sk-caller-evil", "base_url": "https://evil-exfil.example/v1"},
+    )
+    monkeypatch.setattr(api_keys_db, "get_byok_config_for_provider", byok_spy)
+    monkeypatch.setattr(
+        api_keys_db,
+        "get_byok_configs_for_providers",
+        create_autospec(
+            api_keys_db.get_byok_configs_for_providers,
+            return_value={"deepseek": {"api_key": "sk-caller-evil", "base_url": "https://evil-exfil.example/v1"}},
+        ),
+    )
+
+    seen_clients: list[Any] = []
+
+    async def _fake_api_call(llm: Any, **_kw: Any) -> tuple[DedupLlmResult, dict[str, Any]]:
+        seen_clients.append(llm)
+        return (
+            DedupLlmResult(matches=[DedupMatchItem(id="c1", confidence="high", reason="same")]),
+            {"input_tokens": 50, "output_tokens": 10},
+        )
+
+    monkeypatch.setattr(
+        llm_svc_mod,
+        "make_api_call",
+        create_autospec(llm_svc_mod.make_api_call, side_effect=_fake_api_call),
+    )
+
+    # First sub-case: no DEEPSEEK_API_KEY env -> no server-side credential available -> fails open!
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    assert await find_existing_company_workspace(USER_CALLER, "Anthropic") is None
+    assert len(seen_clients) == 0
+    byok_spy.assert_not_called()
+
+    # Second sub-case: DEEPSEEK_API_KEY set in env -> uses platform key & official endpoint,
+    # NEVER caller's BYOK key or evil base_url!
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-platform-deepseek-env")
+    match = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert match is not None
+    assert match.workspace_id == WS_2
+    assert len(seen_clients) == 1
+    built_llm = seen_clients[0]
+    api_base = str(
+        getattr(built_llm, "anthropic_api_url", None)
+        or getattr(built_llm, "api_base", None)
+        or getattr(built_llm, "base_url", None)
+        or ""
+    )
+    assert "evil-exfil.example" not in api_base
+    api_key_val = getattr(built_llm, "anthropic_api_key", None) or getattr(
+        built_llm, "api_key", None
+    )
+    secret_str = api_key_val.get_secret_value() if hasattr(api_key_val, "get_secret_value") else str(api_key_val)
+    assert secret_str == "sk-platform-deepseek-env"
+    byok_spy.assert_not_called()
+    assert budget_calls == [USER_CALLER, USER_CALLER]
+    assert journal_claims[-1]["user_id"] == USER_CALLER
+
+    # Case B: Team mode ON, credential sharing ON with DALTON_PM_USER_IDS=USER_RICHARD.
+    # Primary OAuth model uses HOLDER's (USER_RICHARD) OAuth token while budget/journal stay on USER_CALLER.
+    monkeypatch.setattr(settings_mod, "_load_base_dalton_config", orig_load_cfg)
+    monkeypatch.setenv("DALTON_PM_USER_IDS", USER_RICHARD)
+    settings_mod.get_dalton_config.cache_clear()
+    assert cred_mod.get_team_credential_holder_id() == USER_RICHARD
+
+    oauth_lookup_users: list[str] = []
+
+    async def _valid_tok(uid: str, provider: str) -> TokenSet | None:
+        oauth_lookup_users.append(uid)
+        if uid == USER_RICHARD and provider == "antigravity-oauth":
+            return TokenSet(
+                access_token="holder-agy-token",
+                refresh_token="holder-agy-refresh",
+                account_id="acct-holder",
+                email=EMAIL_RICHARD,
+                plan_type="pro",
+                expires_at=NOW + timedelta(hours=2),
+            )
+        return None
+
+    monkeypatch.setattr(
+        oauth_health_mod,
+        "valid_token",
+        create_autospec(oauth_health_mod.valid_token, side_effect=_valid_tok),
+    )
+    monkeypatch.setattr(
+        oauth_tokens_db,
+        "get_oauth_tokens",
+        create_autospec(oauth_tokens_db.get_oauth_tokens, return_value=None),
+    )
+
+    seen_clients.clear()
+    journal_claims.clear()
+    journal_dones.clear()
+
+    # Load user context stubs so resolve_llm_config runs cleanly for USER_RICHARD.
+    import src.server.services.user_skills as user_skills_mod
+
+    monkeypatch.setattr(
+        user_skills_mod,
+        "load_user_skill_bundle",
+        create_autospec(
+            user_skills_mod.load_user_skill_bundle,
+            return_value=user_skills_mod.EMPTY_USER_SKILL_BUNDLE,
+        ),
+    )
+    import src.server.services.features as features_mod
+
+    monkeypatch.setattr(
+        features_mod,
+        "effective_flags_for_user",
+        create_autospec(features_mod.effective_flags_for_user, return_value={}),
+    )
+
+    match_team = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert match_team is not None
+    assert oauth_lookup_users
+    assert set(oauth_lookup_users) == {USER_RICHARD}
+    assert len(seen_clients) == 1
+    assert journal_claims[0]["user_id"] == USER_CALLER
+    assert journal_dones[0]["usage"]["credential_user_id"] == USER_RICHARD
+    settings_mod.get_dalton_config.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_external_caller_disables_team_credential_sharing_and_fails_open_without_own_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ptc_agent.config as ptc_cfg_mod
+    from ptc_agent.config.agent import LLMConfig
+    import src.dalton.credentials as cred_mod
+    import src.dalton.llm.complete as complete_mod
+    import src.dalton.llm.model_prefs as model_prefs_mod
+    import src.dalton.settings as settings_mod
+    import src.server.database.api_keys as api_keys_db
+    import src.server.database.oauth_tokens as oauth_tokens_db
+    import src.server.database.user as user_db
+    import src.server.services.features as features_mod
+    import src.server.services.llm.service as llm_svc_mod
+    import src.server.services.user_skills as user_skills_mod
+
+    _enable_team_mode(monkeypatch)
+    monkeypatch.setenv("DALTON_PM_USER_IDS", USER_RICHARD)
+    settings_mod.get_dalton_config.cache_clear()
+    assert cred_mod.is_team_credential_sharing_enabled() is True
+
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_4,
+                name="MyNVDA",
+                owner_id=USER_EXTERNAL,
+                owner_name="ExtUser",
+                owner_email=EMAIL_EXTERNAL,
+            )
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_4})
+
+    fake_cfg = create_autospec(ptc_cfg_mod.AgentConfig, instance=True)
+    fake_cfg.llm = LLMConfig(name="gemini-4-hydrogen-low-oauth", background="deepseek-flash")
+    monkeypatch.setattr(
+        ptc_cfg_mod,
+        "load_from_files",
+        create_autospec(ptc_cfg_mod.load_from_files, return_value=fake_cfg),
+    )
+
+    async def _empty_prefs(_uid: str) -> dict[str, Any]:
+        return {"model_preference": {}}
+
+    prefs_stub = create_autospec(
+        model_prefs_mod._DEFAULT_GET_USER_PREFERENCES, side_effect=_empty_prefs
+    )
+    monkeypatch.setattr(model_prefs_mod, "get_user_preferences", prefs_stub)
+    monkeypatch.setattr(user_db, "get_user_preferences", prefs_stub)
+    monkeypatch.setattr(
+        user_skills_mod,
+        "load_user_skill_bundle",
+        create_autospec(
+            user_skills_mod.load_user_skill_bundle,
+            return_value=user_skills_mod.EMPTY_USER_SKILL_BUNDLE,
+        ),
+    )
+    monkeypatch.setattr(
+        features_mod,
+        "effective_flags_for_user",
+        create_autospec(features_mod.effective_flags_for_user, return_value={}),
+    )
+
+    monkeypatch.setattr(
+        complete_mod,
+        "_check_cash_budget_admission",
+        create_autospec(complete_mod._check_cash_budget_admission, return_value=(True, None, None)),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "inspect_journal_state",
+        create_autospec(complete_mod.inspect_journal_state, return_value=("proceed", None)),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "claim_journal_invocation",
+        create_autospec(
+            complete_mod.claim_journal_invocation,
+            return_value=("claimed", {"attempt": 1}),
+        ),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "complete_journal_failed",
+        create_autospec(complete_mod.complete_journal_failed, return_value={}),
+    )
+
+    # Team holder (USER_RICHARD) has OAuth tokens in DB; external user (USER_EXTERNAL) has none.
+    seen_oauth_queries: list[tuple[str, str, bool]] = []
+
+    async def _get_tokens(uid: str, provider: str, *, conn: Any = None) -> dict[str, Any] | None:
+        resolved_uid = cred_mod.credential_user_id(uid)
+        seen_oauth_queries.append((uid, resolved_uid, cred_mod.is_team_credential_sharing_enabled()))
+        if resolved_uid == USER_RICHARD:
+            return {
+                "access_token": "holder-token",
+                "refresh_token": "holder-refresh",
+                "account_id": "acct-holder",
+                "email": EMAIL_RICHARD,
+                "plan_type": "pro",
+                "expires_at": NOW + timedelta(hours=2),
+            }
+        return None
+
+    monkeypatch.setattr(
+        oauth_tokens_db,
+        "get_oauth_tokens",
+        create_autospec(oauth_tokens_db.get_oauth_tokens, side_effect=_get_tokens),
+    )
+    import src.server.services.oauth_health as oauth_health_mod
+
+    monkeypatch.setattr(oauth_health_mod, "get_oauth_tokens", oauth_tokens_db.get_oauth_tokens)
+
+    seen_byok_queries: list[tuple[str, str]] = []
+
+    async def _get_byok(uid: str, provider: str) -> dict[str, Any] | None:
+        resolved_uid = cred_mod.credential_user_id(uid)
+        seen_byok_queries.append((uid, resolved_uid))
+        return None
+
+    monkeypatch.setattr(
+        api_keys_db,
+        "get_byok_config_for_provider",
+        create_autospec(api_keys_db.get_byok_config_for_provider, side_effect=_get_byok),
+    )
+    monkeypatch.setattr(
+        api_keys_db,
+        "get_byok_configs_for_providers",
+        create_autospec(api_keys_db.get_byok_configs_for_providers, return_value={}),
+    )
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    api_call_spy = create_autospec(llm_svc_mod.make_api_call)
+    monkeypatch.setattr(llm_svc_mod, "make_api_call", api_call_spy)
+
+    res = await find_existing_company_workspace(USER_EXTERNAL, "NVIDIA")
+    assert res is None
+    api_call_spy.assert_not_awaited()
+    assert seen_oauth_queries
+    assert all(
+        uid == USER_EXTERNAL and resolved == USER_EXTERNAL and sharing is False
+        for uid, resolved, sharing in seen_oauth_queries
+    )
+    assert all(resolved == USER_EXTERNAL for _uid, resolved in seen_byok_queries)
+    # Team credential sharing remains intact outside the external dedup call.
+    assert cred_mod.is_team_credential_sharing_enabled() is True
+    settings_mod.get_dalton_config.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_dedup_llm_error_text_never_written_to_provider_status_or_logs(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import src.dalton.database.provider_events as pe_db
+    import src.dalton.llm.complete as complete_mod
+    import src.dalton.services.provider_status as ps_mod
+    from src.server.services.llm.service import LLMService
+
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="SecretHiddenCo",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            )
+        ],
+    )
+
+    monkeypatch.setattr(
+        complete_mod,
+        "_check_cash_budget_admission",
+        create_autospec(complete_mod._check_cash_budget_admission, return_value=(True, None, None)),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "inspect_journal_state",
+        create_autospec(complete_mod.inspect_journal_state, return_value=("proceed", None)),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "claim_journal_invocation",
+        create_autospec(
+            complete_mod.claim_journal_invocation,
+            return_value=("claimed", {"attempt": 1}),
+        ),
+    )
+
+    failed_records: list[dict[str, Any]] = []
+
+    async def _record_fail(inv_id: str, **kwargs: Any) -> dict[str, Any]:
+        failed_records.append({"invocation_id": inv_id, **kwargs})
+        return {"invocation_id": inv_id, **kwargs}
+
+    monkeypatch.setattr(
+        complete_mod,
+        "complete_journal_failed",
+        create_autospec(complete_mod.complete_journal_failed, side_effect=_record_fail),
+    )
+
+    recorded_events: list[dict[str, Any]] = []
+
+    async def _rec_event(provider: str, kind: str, **kwargs: Any) -> int:
+        recorded_events.append({"provider": provider, "kind": kind, **kwargs})
+        return 1
+
+    record_event_spy = create_autospec(complete_mod.record_provider_event, side_effect=_rec_event)
+    monkeypatch.setattr(complete_mod, "record_provider_event", record_event_spy)
+    monkeypatch.setattr(pe_db, "record_provider_event", record_event_spy)
+
+    async def _list_events(prov: str | None = None, **_kw: Any) -> list[dict[str, Any]]:
+        return [ev for ev in recorded_events if prov is None or ev.get("provider") == prov]
+
+    monkeypatch.setattr(
+        ps_mod,
+        "list_recent_provider_events",
+        create_autospec(pe_db.list_recent_provider_events, side_effect=_list_events),
+    )
+    monkeypatch.setattr(
+        ps_mod,
+        "count_provider_errors_24h",
+        create_autospec(pe_db.count_provider_errors_24h, return_value={}),
+    )
+    monkeypatch.setattr(
+        ps_mod,
+        "get_last_refresh_event",
+        create_autospec(pe_db.get_last_refresh_event, return_value=None),
+    )
+    monkeypatch.setattr(
+        ps_mod,
+        "_fetch_usage_stats_24h",
+        create_autospec(ps_mod._fetch_usage_stats_24h, return_value={}),
+    )
+    monkeypatch.setattr(
+        ps_mod,
+        "explain_model_availability",
+        create_autospec(ps_mod.explain_model_availability, return_value={}),
+    )
+    import src.server.database.api_keys as api_keys_db
+    import src.server.database.oauth_tokens as oauth_tokens_db
+
+    monkeypatch.setattr(
+        api_keys_db,
+        "get_user_api_keys",
+        create_autospec(api_keys_db.get_user_api_keys, return_value={"byok_enabled": False, "keys": {}, "base_urls": {}}),
+    )
+    monkeypatch.setattr(
+        oauth_tokens_db,
+        "get_oauth_connection",
+        create_autospec(oauth_tokens_db.get_oauth_connection, return_value=None),
+    )
+
+    llm_service = create_autospec(LLMService, instance=True)
+    llm_service.complete.side_effect = ValueError("Parse error referencing SecretHiddenCo / SHC")
+
+    async def _run_real_complete(*args: Any, **kwargs: Any) -> DaltonCompleteResult:
+        kwargs["llm_service"] = llm_service
+        return await _REAL_DALTON_COMPLETE(*args, **kwargs)
+
+    monkeypatch.setattr(
+        dedup_mod,
+        "dalton_complete",
+        create_autospec(_REAL_DALTON_COMPLETE, side_effect=_run_real_complete),
+    )
+
+    # Use cash fallback model only so `LLMService.complete` is called with ValueError.
+    import src.dalton.llm.model_prefs as model_prefs_mod
+
+    async def _prefs_cash(_uid: str) -> dict[str, Any]:
+        return {
+            "model_preference": {
+                "custom_models": [
+                    {"name": "gemini-4-hydrogen-low-oauth", "model_id": "x", "provider": "openai"}
+                ]
+            }
+        }
+
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_user_preferences",
+        create_autospec(model_prefs_mod._DEFAULT_GET_USER_PREFERENCES, side_effect=_prefs_cash),
+    )
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        res = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert res is None
+    record_event_spy.assert_not_awaited()
+    assert recorded_events == []
+    assert failed_records
+    for rec in failed_records:
+        assert "SecretHiddenCo" not in str(rec.get("error_text") or "")
+        assert "SHC" not in str(rec.get("error_text") or "")
+        assert rec.get("error_text") == "ValueError"
+    assert "SecretHiddenCo" not in caplog.text
+    assert "SHC" not in caplog.text
+
+    status_payload = await ps_mod.get_providers_status(user_id=USER_CALLER)
+    for prow in status_payload["providers"]:
+        assert prow["recent_errors"] == []
+
+
+@pytest.mark.asyncio
+async def test_primary_9s_deadline_checked_at_send_time_and_pref_read_within_15s(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.dalton.llm.complete as complete_mod
+    import src.dalton.llm.model_prefs as model_prefs_mod
+    from src.server.services.llm.service import LLMService
+
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="Anthropic",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            )
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_2})
+
+    # Case A: model preference reading hangs past total 15s (patched to 0.05s) ->
+    # dedup times out around 0.05s without invoking dalton_complete.
+    monkeypatch.setattr(dedup_mod, "DEDUP_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(dedup_mod, "DEDUP_PRIMARY_MODEL_TIMEOUT_SECONDS", 0.03)
+
+    async def _slow_prefs(_uid: str) -> dict[str, Any]:
+        await asyncio.sleep(0.30)
+        return {"model_preference": {}}
+
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_user_preferences",
+        create_autospec(model_prefs_mod._DEFAULT_GET_USER_PREFERENCES, side_effect=_slow_prefs),
+    )
+    llm_spy = _install_llm(monkeypatch, _ok_result([]))
+    t0 = asyncio.get_running_loop().time()
+    assert await find_existing_company_workspace(USER_CALLER, "Anthropic") is None
+    elapsed = asyncio.get_running_loop().time() - t0
+    assert elapsed < 0.20
+    llm_spy.assert_not_awaited()
+
+    # Case B: claim_journal_invocation sleeps past primary's 9s cap (patched to 0.04s)
+    # while total 15s deadline (patched to 0.6s) still has room.
+    # Primary MUST NOT send to llm_service.complete at send time (raises DeadlineBeforeSendError),
+    # while fallback model sends and succeeds!
+    async def _fast_prefs(_uid: str) -> dict[str, Any]:
+        return {"model_preference": {}}
+
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_user_preferences",
+        create_autospec(model_prefs_mod._DEFAULT_GET_USER_PREFERENCES, side_effect=_fast_prefs),
+    )
+    monkeypatch.setattr(dedup_mod, "DEDUP_PRIMARY_MODEL_TIMEOUT_SECONDS", 0.04)
+    monkeypatch.setattr(dedup_mod, "DEDUP_TIMEOUT_SECONDS", 0.60)
+    monkeypatch.setattr(dedup_mod, "get_team_credential_holder_id", lambda: USER_RICHARD)
+
+    async def _slow_primary_claim(**kwargs: Any) -> tuple[str, dict[str, Any]]:
+        if kwargs.get("model_key") == "gemini-4-hydrogen-low-oauth":
+            await asyncio.sleep(0.08)
+        return "claimed", {"attempt": 1}
+
+    monkeypatch.setattr(
+        complete_mod,
+        "_check_cash_budget_admission",
+        create_autospec(complete_mod._check_cash_budget_admission, return_value=(True, None, None)),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "inspect_journal_state",
+        create_autospec(complete_mod.inspect_journal_state, return_value=("proceed", None)),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "claim_journal_invocation",
+        create_autospec(complete_mod.claim_journal_invocation, side_effect=_slow_primary_claim),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "complete_journal_failed",
+        create_autospec(complete_mod.complete_journal_failed, return_value={}),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "complete_journal_done",
+        create_autospec(complete_mod.complete_journal_done, return_value={}),
+    )
+
+    sent_models: list[str] = []
+    llm_service = create_autospec(LLMService, instance=True)
+
+    async def _llm_complete(**kwargs: Any) -> tuple[DedupLlmResult, dict[str, Any]]:
+        sent_models.append(str(kwargs.get("request_model") or ""))
+        return (
+            DedupLlmResult(matches=[DedupMatchItem(id="c1", confidence="high", reason="fb")]),
+            {"input_tokens": 10, "output_tokens": 5},
+        )
+
+    llm_service.complete.side_effect = _llm_complete
+
+    async def _patched_complete(*args: Any, **kwargs: Any) -> DaltonCompleteResult:
+        kwargs["llm_service"] = llm_service
+        return await _REAL_DALTON_COMPLETE(*args, **kwargs)
+
+    monkeypatch.setattr(
+        dedup_mod,
+        "dalton_complete",
+        create_autospec(_REAL_DALTON_COMPLETE, side_effect=_patched_complete),
+    )
+
+    match = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    await asyncio.sleep(0.10)
+    assert match is not None
+    assert match.workspace_id == WS_2
+    assert sent_models == ["deepseek-flash"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_unit_unbound_rebound_and_deduped_by_workspace_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    unit_id_1 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
+    unit_id_2 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2"
+
+    # Case A: initially bound unit U1 -> WS_1 is UNBOUND during LLM wait ->
+    # returns as unbound_unit=True with no workspace_id.
+    bound_u1 = {
+        **_unit_row(
+            ws_id=WS_1,
+            ws_name="ANT",
+            ticker="ANT",
+            display_name="Anthropic, PBC",
+            owner_id=USER_RICHARD,
+            owner_name="Richard",
+            owner_email=EMAIL_RICHARD,
+        ),
+        "unit_id": unit_id_1,
+        "status": "active",
+    }
+    unbound_u1 = {
+        **bound_u1,
+        "workspace_id": None,
+        "workspace_name": None,
+        "workspace_owner_id": None,
+        "workspace_status": None,
+        "owner_name": None,
+        "owner_email": None,
+    }
+    _install_db(
+        monkeypatch,
+        unit_rows_sequence=[[bound_u1], [unbound_u1]],
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_1,
+                name="ANT",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            )
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_1})
+    _install_llm(
+        monkeypatch,
+        lambda **_kw: _ok_result([{"id": "c1", "confidence": "high", "reason": "same"}]),
+    )
+    m_unbound = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert m_unbound is not None
+    assert m_unbound.workspace_id is None
+    assert m_unbound.matched_workspace_ids == ()
+    assert m_unbound.message == "「Anthropic」已登记为团队覆盖公司（主分析师 Richard），尚未绑定工作区"
+    assert m_unbound.matches_payload() == [
+        {
+            "unbound_unit": True,
+            "display_name": "Anthropic, PBC",
+            "ticker": "ANT",
+            "lead_analyst_name": "Richard",
+            "can_read": True,
+        }
+    ]
+
+    # Case B: initially bound unit U1 -> WS_1 is REBOUND to WS_2 (owned by CY) during wait ->
+    # returns WS_2 with CY as owner_name (both readable and unreadable paths).
+    rebound_u1 = {**bound_u1, "workspace_id": WS_2}
+    _install_db(
+        monkeypatch,
+        unit_rows_sequence=[[bound_u1], [rebound_u1]],
+        ws_rows_sequence=[
+            [
+                _ws_row(
+                    ws_id=WS_1,
+                    name="ANT",
+                    owner_id=USER_RICHARD,
+                    owner_name="Richard",
+                    owner_email=EMAIL_RICHARD,
+                )
+            ],
+            [
+                _ws_row(
+                    ws_id=WS_2,
+                    name="Anthropic-CY",
+                    owner_id=USER_CY,
+                    owner_name="CY",
+                    owner_email=EMAIL_CY,
+                )
+            ],
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable=set())
+    _install_llm(
+        monkeypatch,
+        lambda **_kw: _ok_result([{"id": "c1", "confidence": "high", "reason": "same"}]),
+    )
+    m_rebound = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert m_rebound is not None
+    assert m_rebound.workspace_name == "Anthropic-CY"
+    assert m_rebound.owner_name == "CY"
+    assert m_rebound.workspace_id is None
+    assert m_rebound.matched_workspace_ids == (WS_2,)
+
+    # Case C: unbound unit U2 newly bound to WS_2 during wait while WS_2 was ALSO matched ->
+    # deduplicated by workspace_id with WS_2's owner_name ("CY"), not lead_analyst_name ("Richard").
+    unbound_u2 = {
+        "unit_id": unit_id_2,
+        "kind": "company",
+        "status": "active",
+        "owner_user_id": USER_RICHARD,
+        "lead_analyst_user_id": USER_RICHARD,
+        "display_name": "Anthropic, PBC",
+        "workspace_id": None,
+        "ticker": "ANT",
+        "unit_updated_at": NOW,
+        "unit_created_at": NOW,
+        "workspace_name": None,
+        "workspace_owner_id": None,
+        "workspace_status": None,
+        "is_home_stand_in": False,
+        "is_historical_duplicate": False,
+        "owner_name": None,
+        "owner_email": None,
+        "unit_owner_email": EMAIL_RICHARD,
+        "lead_name": "Richard",
+        "lead_email": EMAIL_RICHARD,
+    }
+    bound_u2_to_ws2 = {**unbound_u2, "workspace_id": WS_2}
+    _install_db(
+        monkeypatch,
+        unit_rows_sequence=[[unbound_u2], [bound_u2_to_ws2]],
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="Anthropic-CY",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            )
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_2})
+    _install_llm(
+        monkeypatch,
+        lambda **_kw: _ok_result(
+            [
+                {"id": "c1", "confidence": "high", "reason": "unit"},
+                {"id": "c2", "confidence": "high", "reason": "ws"},
+            ]
+        ),
+    )
+    m_dedup = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert m_dedup is not None
+    assert len(m_dedup.matches) == 1
+    assert m_dedup.matches[0].workspace_id == WS_2
+    assert m_dedup.matches[0].owner_name == "CY"
+    assert m_dedup.matches[0].lead_analyst_name == "Richard"
+
+
+@pytest.mark.asyncio
+async def test_refresh_before_truncating_to_3_across_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    total = DEDUP_BATCH_SIZE + 2  # 2 batches
+    initial_ws = [
+        _ws_row(
+            ws_id=f"00000000-0000-4000-8000-{i:012d}",
+            name=f"Cand-{i}",
+            owner_id=USER_RICHARD,
+            owner_name="Richard",
+            owner_email=EMAIL_RICHARD,
+            last_activity_at=NOW - timedelta(minutes=i),
+        )
+        for i in range(1, total + 1)
+    ]
+    # Top 3 hits (Cand-1, Cand-2, Cand-3) are deleted during wait; Cand-1002 (batch 2) survives!
+    refreshed_ws = [
+        {**row, "status": "deleted"} if idx < 3 else row
+        for idx, row in enumerate(initial_ws)
+    ]
+    _install_db(monkeypatch, ws_rows_sequence=[initial_ws, refreshed_ws])
+    _install_read_access(
+        monkeypatch,
+        web_readable={r["workspace_id"] for r in initial_ws},
+    )
+
+    def _batch_llm(**kwargs: Any) -> DaltonCompleteResult:
+        prompt = kwargs["user_prompt"]
+        if "c1 |" in prompt:
+            return _ok_result(
+                [
+                    {"id": "c1", "confidence": "high", "reason": "b1-1"},
+                    {"id": "c2", "confidence": "high", "reason": "b1-2"},
+                    {"id": "c3", "confidence": "high", "reason": "b1-3"},
+                ]
+            )
+        return _ok_result(
+            [
+                {"id": f"c{DEDUP_BATCH_SIZE + 2}", "confidence": "medium", "reason": "b2-survivor"},
+            ]
+        )
+
+    _install_llm(monkeypatch, _batch_llm)
+    match = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert match is not None
+    assert [m.workspace_name for m in match.matches] == [f"Cand-{total}"]
+
+
+@pytest.mark.asyncio
+async def test_uuid_redaction_ignores_adjacent_hex_characters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    u1 = "12345678-1234-4123-8123-123456789abc"
+    u2 = "abcdefab-cdef-4abc-8abc-abcdefabcdef"
+    u3 = "99999999-aaaa-4bbb-8ccc-dddddddddddd"
+
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_1,
+                name=f"case{u1}ef",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            )
+        ],
+        doc_rows=[
+            {
+                "workspace_id": WS_1,
+                "doc_key": "company",
+                "content": {"ticker": "", "name": f"0x{u2}ff", "name_zh": ""},
+            }
+        ],
+    )
+    calls: list[dict[str, Any]] = []
+    _install_llm(
+        monkeypatch,
+        lambda **_kw: _ok_result([]),
+        captured_calls=calls,
+    )
+
+    assert await find_existing_company_workspace(USER_CALLER, f"deadbeef{u3}00") is None
+    assert len(calls) == 1
+    prompt = calls[0]["user_prompt"]
+    assert u1 not in prompt
+    assert u2 not in prompt
+    assert u3 not in prompt
+    assert "待新建工作区名称：deadbeef[id]00" in prompt
+    assert "c1 | case[id]ef | - | 0x[id]ff" in prompt
+
+
+@pytest.mark.asyncio
+async def test_cos_allow_duplicate_company_logs_only_after_approval(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import src.tools.secretary.tools as sec_tools
+
+    monkeypatch.setattr(
+        sec_tools,
+        "duplicate_workspace",
+        create_autospec(sec_tools.duplicate_workspace, return_value=(None, True)),
+    )
+
+    dedup_spy = create_autospec(
+        _REAL_FIND_DEDUP,
+        return_value=DuplicateMatch(
+            company="Anthropic",
+            message="dup",
+            matches=(
+                DuplicateWorkspaceCandidate(
+                    workspace_name="ANT",
+                    owner_name="Richard",
+                    can_read=True,
+                    workspace_id=WS_1,
+                    lead_analyst_name="Richard",
+                    ticker="ANT",
+                ),
+            ),
+            matched_workspace_ids=(WS_1,),
+        ),
+    )
+
+    mgr = create_autospec(WorkspaceManager, instance=True)
+    mgr.create_workspace.return_value = {
+        "workspace_id": WS_2,
+        "name": "Anthropic",
+        "dir_name": "Anthropic",
+    }
+
+    with (
+        patch("src.dalton.coverage.dedup.find_existing_company_workspace", dedup_spy),
+        patch(
+            "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+            create_autospec(WorkspaceManager.get_instance, return_value=mgr),
+        ),
+        patch.object(
+            sec_tools,
+            "_folder_ready_result",
+            create_autospec(sec_tools._folder_ready_result, return_value={}),
+        ),
+    ):
+        # 1. Approval declined -> dedup NOT called and skip log NOT emitted.
+        monkeypatch.setattr(
+            sec_tools,
+            "hitl_confirm",
+            create_autospec(
+                hitl_confirm,
+                return_value=(False, {"decisions": [{"type": "reject", "message": "no"}]}),
+            ),
+        )
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            declined_cmd = await workspaces_create(
+                USER_CALLER,
+                "Anthropic",
+                None,
+                "call-decline",
+                preapproved=False,
+                allow_duplicate_company=True,
+            )
+        assert "Skipping company workspace dedup check" not in caplog.text
+        dedup_spy.assert_not_awaited()
+        mgr.create_workspace.assert_not_awaited()
+        assert "declined" in json.dumps(declined_cmd.update["messages"][0].content).lower() or "cancelled" in json.dumps(declined_cmd.update["messages"][0].content).lower() or "cancel" in json.dumps(declined_cmd.update["messages"][0].content).lower() or "reject" in json.dumps(declined_cmd.update["messages"][0].content).lower() or declined_cmd.update["messages"][0].content
+
+        # 2. Approval granted -> dedup called ONCE after hitl_confirm, skip log emitted ONCE.
+        monkeypatch.setattr(
+            sec_tools,
+            "hitl_confirm",
+            create_autospec(hitl_confirm, return_value=(True, "ok")),
+        )
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            ok_cmd = await workspaces_create(
+                USER_CALLER,
+                "Anthropic",
+                None,
+                "call-approve",
+                preapproved=False,
+                allow_duplicate_company=True,
+            )
+        dedup_spy.assert_awaited_once()
+        mgr.create_workspace.assert_awaited_once()
+        assert caplog.text.count("Skipping company workspace dedup check") == 1
+        assert WS_1 in caplog.text
+        assert json.loads(ok_cmd.update["messages"][0].content)["success"] is True
+
+        # 3. allow_duplicate_company=False -> dedup still runs BEFORE hitl_confirm and rejects without card.
+        dedup_spy.reset_mock()
+        hitl_spy = create_autospec(hitl_confirm, return_value=(True, "ok"))
+        monkeypatch.setattr(sec_tools, "hitl_confirm", hitl_spy)
+        rej_cmd = await workspaces_create(
+            USER_CALLER,
+            "Anthropic",
+            None,
+            "call-reject-before-card",
+            preapproved=False,
+            allow_duplicate_company=False,
+        )
+        dedup_spy.assert_awaited_once()
+        hitl_spy.assert_not_called()
+        assert json.loads(rej_cmd.update["messages"][0].content)["code"] == "company_workspace_exists"
