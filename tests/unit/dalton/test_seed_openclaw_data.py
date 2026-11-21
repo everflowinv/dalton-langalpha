@@ -148,3 +148,48 @@ class SeedOpenClawDataTests(unittest.TestCase):
             self.assertIn("antigravity-oauth:gemini-4-neon", series_ids)
             self.assertIn("antigravity-oauth:claude-opus-5-5", series_ids)
             self.assertIn("antigravity-oauth:gpt-oss-120b", series_ids)
+
+    def test_offline_catalog_drops_top_level_retired_entries_like_backend(self):
+        import json
+        import sys
+
+        repo_root = Path(__file__).resolve().parents[3]
+        skill_scripts = repo_root / "scripts/dalton/data_assets/skills/model-usage-cost/scripts"
+        sys.path.insert(0, str(skill_scripts))
+        try:
+            import usage_sources
+        finally:
+            if sys.path and sys.path[0] == str(skill_scripts):
+                sys.path.pop(0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base_overlay = json.loads((repo_root / "src/dalton/llm/native_overlay.json").read_text(encoding="utf-8"))
+            ov1 = root / "native_overlay.json"
+            ov1.write_text(json.dumps(base_overlay), encoding="utf-8")
+            # Retire the sole variant of gpt-oss-120b and one variant (xhigh) of gemini-4-neon
+            ov2 = root / "native_sync_overlay.json"
+            ov2.write_text(
+                json.dumps({
+                    "models": {},
+                    "retired": [
+                        {"key": "gpt-oss-120b-medium-oauth", "reason": "pm-retired"},
+                        {"key": "gemini-4-neon-xhigh-oauth", "reason": "pm-retired"},
+                    ],
+                }),
+                encoding="utf-8",
+            )
+
+            offline_catalog = usage_sources.build_antigravity_series_from_overlays(
+                (ov1, ov2),
+                dalton_yaml_path=repo_root / "src/dalton/dalton.yaml",
+            )
+            by_id = {entry["series_id"]: entry for entry in offline_catalog}
+            self.assertNotIn("antigravity-oauth:gpt-oss-120b", by_id)
+            self.assertIn("antigravity-oauth:gemini-4-neon", by_id)
+            self.assertNotIn("xhigh", by_id["antigravity-oauth:gemini-4-neon"]["efforts"])
+            self.assertEqual(by_id["antigravity-oauth:gemini-4-neon"]["efforts"], ["low", "medium", "high"])
+
+            # Verify seed_openclaw_data.sh uses the exact same shared helper
+            script_text = SCRIPT.read_text(encoding="utf-8")
+            self.assertIn("build_antigravity_series_from_overlays", script_text)

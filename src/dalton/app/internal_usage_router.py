@@ -26,37 +26,82 @@ BY_MODEL_AGGREGATION_SQL = """
 WITH filtered AS (
     SELECT
         u.conversation_usage_id,
-        u.token_usage->'by_model' AS by_model
+        u.token_usage->'by_model' AS by_model,
+        u.token_usage->'per_call_costs' AS per_call_costs
     FROM conversation_usages u
     WHERE u.created_at >= %(from_dt)s
       AND u.created_at < %(to_dt)s
-      AND jsonb_typeof(u.token_usage->'by_model') = 'object'
+      AND (
+          jsonb_typeof(u.token_usage->'by_model') = 'object'
+          OR (
+              jsonb_typeof(u.token_usage->'per_call_costs') = 'array'
+              AND jsonb_array_length(u.token_usage->'per_call_costs') > 0
+          )
+      )
+),
+raw_entries AS (
+    SELECT
+        f.conversation_usage_id,
+        c->>'model_name' AS model,
+        NULLIF(BTRIM(COALESCE(c->>'pricing_provider', '')), '') AS pricing_provider,
+        1::bigint AS calls,
+        GREATEST(
+            COALESCE((c->>'input_tokens')::bigint, 0)
+            - COALESCE((c->>'cached_tokens')::bigint, 0),
+            0
+        )::bigint AS fresh_input,
+        COALESCE((c->>'cached_tokens')::bigint, 0)::bigint AS cache_read,
+        COALESCE((c->>'cache_write_tokens')::bigint, 0)::bigint AS cache_write,
+        COALESCE((c->>'output_tokens')::bigint, 0)::bigint AS output,
+        COALESCE(
+            (c->>'total_tokens')::bigint,
+            COALESCE((c->>'input_tokens')::bigint, 0) + COALESCE((c->>'output_tokens')::bigint, 0)
+        )::bigint AS total_tokens
+    FROM filtered f,
+         jsonb_array_elements(f.per_call_costs) AS c
+    WHERE jsonb_typeof(f.per_call_costs) = 'array'
+      AND jsonb_array_length(f.per_call_costs) > 0
+      AND NULLIF(BTRIM(COALESCE(c->>'model_name', '')), '') IS NOT NULL
+    UNION ALL
+    SELECT
+        f.conversation_usage_id,
+        m.key AS model,
+        NULL::text AS pricing_provider,
+        COALESCE((m.value->>'call_count')::bigint, 0)::bigint AS calls,
+        GREATEST(
+            COALESCE((m.value->>'input_tokens')::bigint, 0)
+            - COALESCE((m.value->>'cached_tokens')::bigint, 0),
+            0
+        )::bigint AS fresh_input,
+        COALESCE((m.value->>'cached_tokens')::bigint, 0)::bigint AS cache_read,
+        COALESCE((m.value->>'cache_write_tokens')::bigint, 0)::bigint AS cache_write,
+        COALESCE((m.value->>'output_tokens')::bigint, 0)::bigint AS output,
+        COALESCE((m.value->>'total_tokens')::bigint, 0)::bigint AS total_tokens
+    FROM filtered f,
+         jsonb_each(f.by_model) AS m
+    WHERE NOT (
+        jsonb_typeof(f.per_call_costs) = 'array'
+        AND jsonb_array_length(f.per_call_costs) > 0
+    )
+      AND jsonb_typeof(f.by_model) = 'object'
 ),
 per_model AS (
     SELECT
-        m.key AS model,
-        COALESCE(SUM(COALESCE((m.value->>'call_count')::bigint, 0)), 0)::bigint AS calls,
-        COALESCE(
-            SUM(
-                GREATEST(
-                    COALESCE((m.value->>'input_tokens')::bigint, 0)
-                    - COALESCE((m.value->>'cached_tokens')::bigint, 0),
-                    0
-                )
-            ),
-            0
-        )::bigint AS fresh_input,
-        COALESCE(SUM(COALESCE((m.value->>'cached_tokens')::bigint, 0)), 0)::bigint AS cache_read,
-        COALESCE(SUM(COALESCE((m.value->>'cache_write_tokens')::bigint, 0)), 0)::bigint AS cache_write,
-        COALESCE(SUM(COALESCE((m.value->>'output_tokens')::bigint, 0)), 0)::bigint AS output,
-        COALESCE(SUM(COALESCE((m.value->>'total_tokens')::bigint, 0)), 0)::bigint AS total_tokens,
-        COUNT(DISTINCT f.conversation_usage_id)::bigint AS runs
-    FROM filtered f,
-         jsonb_each(f.by_model) AS m
-    GROUP BY m.key
+        r.model,
+        r.pricing_provider,
+        COALESCE(SUM(r.calls), 0)::bigint AS calls,
+        COALESCE(SUM(r.fresh_input), 0)::bigint AS fresh_input,
+        COALESCE(SUM(r.cache_read), 0)::bigint AS cache_read,
+        COALESCE(SUM(r.cache_write), 0)::bigint AS cache_write,
+        COALESCE(SUM(r.output), 0)::bigint AS output,
+        COALESCE(SUM(r.total_tokens), 0)::bigint AS total_tokens,
+        COUNT(DISTINCT r.conversation_usage_id)::bigint AS runs
+    FROM raw_entries r
+    GROUP BY r.model, r.pricing_provider
 )
 SELECT
     pm.model,
+    pm.pricing_provider,
     pm.calls,
     pm.fresh_input,
     pm.cache_read,
@@ -66,7 +111,7 @@ SELECT
     pm.runs,
     (SELECT COUNT(DISTINCT conversation_usage_id)::bigint FROM filtered) AS total_runs
 FROM per_model pm
-ORDER BY pm.total_tokens DESC, pm.model ASC
+ORDER BY pm.total_tokens DESC, pm.model ASC, pm.pricing_provider ASC NULLS LAST
 """
 
 # Bucket by UTC calendar date so daily aggregates align with prices.json effective_from
@@ -76,39 +121,86 @@ WITH filtered AS (
     SELECT
         u.conversation_usage_id,
         ((u.created_at AT TIME ZONE 'UTC')::date)::text AS bucket_date,
-        u.token_usage->'by_model' AS by_model
+        u.token_usage->'by_model' AS by_model,
+        u.token_usage->'per_call_costs' AS per_call_costs
     FROM conversation_usages u
     WHERE u.created_at >= %(from_dt)s
       AND u.created_at < %(to_dt)s
-      AND jsonb_typeof(u.token_usage->'by_model') = 'object'
+      AND (
+          jsonb_typeof(u.token_usage->'by_model') = 'object'
+          OR (
+              jsonb_typeof(u.token_usage->'per_call_costs') = 'array'
+              AND jsonb_array_length(u.token_usage->'per_call_costs') > 0
+          )
+      )
+),
+raw_entries AS (
+    SELECT
+        f.conversation_usage_id,
+        f.bucket_date AS date,
+        c->>'model_name' AS model,
+        NULLIF(BTRIM(COALESCE(c->>'pricing_provider', '')), '') AS pricing_provider,
+        1::bigint AS calls,
+        GREATEST(
+            COALESCE((c->>'input_tokens')::bigint, 0)
+            - COALESCE((c->>'cached_tokens')::bigint, 0),
+            0
+        )::bigint AS fresh_input,
+        COALESCE((c->>'cached_tokens')::bigint, 0)::bigint AS cache_read,
+        COALESCE((c->>'cache_write_tokens')::bigint, 0)::bigint AS cache_write,
+        COALESCE((c->>'output_tokens')::bigint, 0)::bigint AS output,
+        COALESCE(
+            (c->>'total_tokens')::bigint,
+            COALESCE((c->>'input_tokens')::bigint, 0) + COALESCE((c->>'output_tokens')::bigint, 0)
+        )::bigint AS total_tokens
+    FROM filtered f,
+         jsonb_array_elements(f.per_call_costs) AS c
+    WHERE jsonb_typeof(f.per_call_costs) = 'array'
+      AND jsonb_array_length(f.per_call_costs) > 0
+      AND NULLIF(BTRIM(COALESCE(c->>'model_name', '')), '') IS NOT NULL
+    UNION ALL
+    SELECT
+        f.conversation_usage_id,
+        f.bucket_date AS date,
+        m.key AS model,
+        NULL::text AS pricing_provider,
+        COALESCE((m.value->>'call_count')::bigint, 0)::bigint AS calls,
+        GREATEST(
+            COALESCE((m.value->>'input_tokens')::bigint, 0)
+            - COALESCE((m.value->>'cached_tokens')::bigint, 0),
+            0
+        )::bigint AS fresh_input,
+        COALESCE((m.value->>'cached_tokens')::bigint, 0)::bigint AS cache_read,
+        COALESCE((m.value->>'cache_write_tokens')::bigint, 0)::bigint AS cache_write,
+        COALESCE((m.value->>'output_tokens')::bigint, 0)::bigint AS output,
+        COALESCE((m.value->>'total_tokens')::bigint, 0)::bigint AS total_tokens
+    FROM filtered f,
+         jsonb_each(f.by_model) AS m
+    WHERE NOT (
+        jsonb_typeof(f.per_call_costs) = 'array'
+        AND jsonb_array_length(f.per_call_costs) > 0
+    )
+      AND jsonb_typeof(f.by_model) = 'object'
 ),
 per_model AS (
     SELECT
-        f.bucket_date AS date,
-        m.key AS model,
-        COALESCE(SUM(COALESCE((m.value->>'call_count')::bigint, 0)), 0)::bigint AS calls,
-        COALESCE(
-            SUM(
-                GREATEST(
-                    COALESCE((m.value->>'input_tokens')::bigint, 0)
-                    - COALESCE((m.value->>'cached_tokens')::bigint, 0),
-                    0
-                )
-            ),
-            0
-        )::bigint AS fresh_input,
-        COALESCE(SUM(COALESCE((m.value->>'cached_tokens')::bigint, 0)), 0)::bigint AS cache_read,
-        COALESCE(SUM(COALESCE((m.value->>'cache_write_tokens')::bigint, 0)), 0)::bigint AS cache_write,
-        COALESCE(SUM(COALESCE((m.value->>'output_tokens')::bigint, 0)), 0)::bigint AS output,
-        COALESCE(SUM(COALESCE((m.value->>'total_tokens')::bigint, 0)), 0)::bigint AS total_tokens,
-        COUNT(DISTINCT f.conversation_usage_id)::bigint AS runs
-    FROM filtered f,
-         jsonb_each(f.by_model) AS m
-    GROUP BY f.bucket_date, m.key
+        r.date,
+        r.model,
+        r.pricing_provider,
+        COALESCE(SUM(r.calls), 0)::bigint AS calls,
+        COALESCE(SUM(r.fresh_input), 0)::bigint AS fresh_input,
+        COALESCE(SUM(r.cache_read), 0)::bigint AS cache_read,
+        COALESCE(SUM(r.cache_write), 0)::bigint AS cache_write,
+        COALESCE(SUM(r.output), 0)::bigint AS output,
+        COALESCE(SUM(r.total_tokens), 0)::bigint AS total_tokens,
+        COUNT(DISTINCT r.conversation_usage_id)::bigint AS runs
+    FROM raw_entries r
+    GROUP BY r.date, r.model, r.pricing_provider
 )
 SELECT
     pm.date,
     pm.model,
+    pm.pricing_provider,
     pm.calls,
     pm.fresh_input,
     pm.cache_read,
@@ -118,7 +210,7 @@ SELECT
     pm.runs,
     (SELECT COUNT(DISTINCT conversation_usage_id)::bigint FROM filtered) AS total_runs
 FROM per_model pm
-ORDER BY pm.date ASC, pm.total_tokens DESC, pm.model ASC
+ORDER BY pm.date ASC, pm.total_tokens DESC, pm.model ASC, pm.pricing_provider ASC NULLS LAST
 """
 
 
@@ -225,6 +317,10 @@ async def fetch_usage_by_model(
             "total_tokens": total_tokens,
             "runs": runs,
         }
+        if "pricing_provider" in row:
+            raw_pp = row.get("pricing_provider")
+            pp = str(raw_pp).strip() if isinstance(raw_pp, str) else ""
+            item["pricing_provider"] = pp or "unknown"
         if row.get("date") is not None:
             item["date"] = str(row["date"])[:10]
         models.append(item)

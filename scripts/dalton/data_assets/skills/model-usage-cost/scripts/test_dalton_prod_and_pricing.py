@@ -343,19 +343,193 @@ class TestDaltonProdAndPricing(unittest.TestCase):
 
         prices = cli.load_prices()
         w = cli.window_result(records, now, 7, prices, by_model=True)
-        # 5 distinct rows: neon(local,high), neon(local,None), argon(local,medium), opus(local,low), neon-high-oauth(dalton)
-        self.assertEqual(len(w["rows"]), 5)
+        # 4 rows: local neon stays unsplit (carrying exact effort_breakdown with high & unknown),
+        # local argon (medium), local opus (low), and dalton neon-high-oauth.
+        self.assertEqual(len(w["rows"]), 4)
         self.assertEqual(
-            {(r["dalton_prod"], r["model"], r.get("effort")) for r in w["rows"]},
+            {(r["dalton_prod"], r["model"]) for r in w["rows"]},
             {
-                (False, "gemini-4-neon", "high"),
-                (False, "gemini-4-neon", None),
-                (False, "gemini-4-argon", "medium"),
-                (False, "claude-opus-5-5", "low"),
-                (True, "gemini-4-neon-high-oauth", None),
+                (False, "gemini-4-neon"),
+                (False, "gemini-4-argon"),
+                (False, "claude-opus-5-5"),
+                (True, "gemini-4-neon-high-oauth"),
             },
         )
+        by_key = {(r["dalton_prod"], r["model"]): r for r in w["rows"]}
+        self.assertEqual(set(by_key[(False, "gemini-4-neon")]["effort_breakdown"].keys()), {"high", "unknown"})
+        self.assertEqual(set(by_key[(False, "gemini-4-argon")]["effort_breakdown"].keys()), {"medium"})
+        self.assertEqual(set(by_key[(False, "claude-opus-5-5")]["effort_breakdown"].keys()), {"low"})
         self.assertEqual(w["totals"]["tokens"], 160_000 + 220_000 + 55_000 + 110_000 + 330_000)
+
+    def test_scan_agy_reads_real_sqlite_gen_metadata_and_preserves_effort(self):
+        import sqlite3
+        from test_usage_accounting import pb
+
+        now = dt.datetime(2026, 11, 20, 12, 0, tzinfo=s.UTC).timestamp()
+
+        def make_agy_db(path, *, gen_entries, step_entries):
+            c = sqlite3.connect(path)
+            c.execute("CREATE TABLE steps(idx INTEGER, metadata BLOB)")
+            if gen_entries is not None:
+                c.execute("CREATE TABLE gen_metadata(data BLOB)")
+                for name_bytes, m_code in gen_entries:
+                    meta = pb([
+                        (19, name_bytes),
+                        (20, pb([(1, b"model_enum"), (2, f"MODEL_PLACEHOLDER_M{m_code}".encode())])),
+                    ])
+                    c.execute("INSERT INTO gen_metadata VALUES (?)", (pb([(1, meta)]),))
+            for idx, enum_id, fresh, cr, out, ts_val, resp_id in step_entries:
+                usage = pb([(1, enum_id), (2, fresh), (3, out), (5, cr), (11, resp_id)])
+                metadata = pb([(8, pb([(1, int(ts_val))])), (9, usage)])
+                c.execute("INSERT INTO steps VALUES (?, ?)", (idx, metadata))
+            c.commit()
+            c.close()
+
+        # DB 1: explicit effort suffix in gen_metadata (no gateway logs!)
+        db1 = self.tmp / "conv_neon_high.db"
+        make_agy_db(
+            db1,
+            gen_entries=[(b"gemini-4-neon-high", 420)],
+            step_entries=[(1, 1420, 100_000, 50_000, 10_000, now - 300, b"resp-neon-high")],
+        )
+        # DB 2: no effort suffix in gen_metadata -> remains unknown
+        db2 = self.tmp / "conv_argon_unsuffixed.db"
+        make_agy_db(
+            db2,
+            gen_entries=[(b"gemini-4-argon", 417)],
+            step_entries=[(1, 1417, 200_000, 0, 20_000, now - 250, b"resp-argon-nosuf")],
+        )
+        # DB 3: no gen_metadata, same enum 1420 -> inherits unambiguous 'high' from DB 1 during reconcile
+        db3 = self.tmp / "conv_enum_only.db"
+        make_agy_db(
+            db3,
+            gen_entries=None,
+            step_entries=[(1, 1420, 40_000, 10_000, 5_000, now - 200, b"resp-enum-inherit")],
+        )
+        # DB 4: ambiguous efforts for same enum 1425 -> must NOT guess effort
+        db4 = self.tmp / "conv_ambiguous.db"
+        make_agy_db(
+            db4,
+            gen_entries=[(b"gemini-4-carbon-high", 425), (b"gemini-4-carbon-medium", 425)],
+            step_entries=[(1, 1425, 30_000, 0, 5_000, now - 150, b"resp-carbon-ambig")],
+        )
+
+        roots = {k: [] for k in s.ROOTS}
+        roots["agy-db"] = [str(db1), str(db2), str(db3), str(db4)]
+        e = s.Evidence(now - 86400, now)
+        with patch.object(s, "ROOTS", roots):
+            s.scan_agy(e)
+
+        self.assertEqual(e.records["agy:resp-neon-high"]["model"], "gemini-4-neon")
+        self.assertEqual(e.records["agy:resp-neon-high"]["meta"].get("effort"), "high")
+        self.assertEqual(e.records["agy:resp-argon-nosuf"]["model"], "gemini-4-argon")
+        self.assertIsNone(e.records["agy:resp-argon-nosuf"]["meta"].get("effort"))
+        self.assertEqual(e.records["agy:resp-carbon-ambig"]["model"], "gemini-4-carbon")
+        self.assertIsNone(e.records["agy:resp-carbon-ambig"]["meta"].get("effort"))
+
+        records, held = s.reconcile(e)
+        self.assertEqual(held, [])
+        by_id = {r["id"]: r for r in records}
+        self.assertEqual(by_id["agy:resp-enum-inherit"]["model"], "gemini-4-neon")
+        self.assertEqual(by_id["agy:resp-enum-inherit"]["meta"].get("effort"), "high")
+
+        prices = cli.load_prices()
+        w = cli.window_result(records, now, 1, prices, by_model=True)
+        by_m = {r["model"]: r for r in w["rows"]}
+        self.assertEqual(list(by_m["gemini-4-neon"]["effort_breakdown"].keys()), ["high"])
+        self.assertEqual(by_m["gemini-4-neon"]["effort_breakdown"]["high"]["total_tokens"], 160_000 + 55_000)
+        self.assertEqual(list(by_m["gemini-4-argon"]["effort_breakdown"].keys()), ["unknown"])
+        self.assertEqual(list(by_m["gemini-4-carbon"]["effort_breakdown"].keys()), ["unknown"])
+
+    def test_reconcile_does_not_copy_gateway_effort_across_conflicting_series(self):
+        import sqlite3
+        from test_usage_accounting import pb, iso, write
+
+        now = dt.datetime(2026, 11, 20, 12, 0, tzinfo=s.UTC).timestamp()
+
+        # Real SQLite agy-db with Carbon (no effort suffix)
+        db_carbon = self.tmp / "conv_carbon.db"
+        c = sqlite3.connect(db_carbon)
+        c.execute("CREATE TABLE steps(idx INTEGER, metadata BLOB)")
+        c.execute("CREATE TABLE gen_metadata(data BLOB)")
+        meta = pb([(19, b"gemini-4-carbon"), (20, pb([(1, b"model_enum"), (2, b"MODEL_PLACEHOLDER_M425")]))])
+        c.execute("INSERT INTO gen_metadata VALUES (?)", (pb([(1, meta)]),))
+        usage = pb([(1, 1425), (2, 100_000), (3, 10_000), (5, 50_000), (11, b"resp-carbon-1")])
+        c.execute("INSERT INTO steps VALUES (1, ?)", (pb([(8, pb([(1, int(now - 100))])), (9, usage)]),))
+        c.commit()
+        c.close()
+
+        # Real legacy agy-gateway log WITHOUT conversationId carrying Neon high & matching token vector
+        gw_log = self.tmp / "antigravity-cli-gateway.stdout.log"
+        write(
+            gw_log,
+            [
+                {"event": "start", "request": "req-conflict", "model": "gemini-4-neon-high", "ts": iso(now - 105)},
+                {
+                    "event": "done",
+                    "request": "req-conflict",
+                    "model": "gemini-4-neon-high",
+                    "ts": iso(now - 100),
+                    "usage_raw": {
+                        "input_tokens": 100_000,
+                        "cache_write_tokens": 0,
+                        "cache_read_tokens": 50_000,
+                        "output_tokens": 10_000,
+                    },
+                },
+            ],
+            prefix="[AGYGW] ",
+        )
+
+        # Also a second DB + gateway pair on the SAME series (Carbon + carbon-medium) -> SHOULD copy medium
+        db_carbon2 = self.tmp / "conv_carbon_match.db"
+        c2 = sqlite3.connect(db_carbon2)
+        c2.execute("CREATE TABLE steps(idx INTEGER, metadata BLOB)")
+        c2.execute("CREATE TABLE gen_metadata(data BLOB)")
+        c2.execute("INSERT INTO gen_metadata VALUES (?)", (pb([(1, meta)]),))
+        usage2 = pb([(1, 1425), (2, 70_000), (3, 7_000), (5, 20_000), (11, b"resp-carbon-2")])
+        c2.execute("INSERT INTO steps VALUES (1, ?)", (pb([(8, pb([(1, int(now - 50))])), (9, usage2)]),))
+        c2.commit()
+        c2.close()
+
+        gw_log2 = self.tmp / "antigravity-cli-gateway-2.stdout.log"
+        write(
+            gw_log2,
+            [
+                {"event": "start", "request": "req-match", "model": "gemini-4-carbon-medium", "ts": iso(now - 55)},
+                {
+                    "event": "done",
+                    "request": "req-match",
+                    "model": "gemini-4-carbon-medium",
+                    "ts": iso(now - 50),
+                    "usage_raw": {
+                        "input_tokens": 70_000,
+                        "cache_write_tokens": 0,
+                        "cache_read_tokens": 20_000,
+                        "output_tokens": 7_000,
+                    },
+                },
+            ],
+            prefix="[AGYGW] ",
+        )
+
+        roots = {k: [] for k in s.ROOTS}
+        roots["agy-db"] = [str(db_carbon), str(db_carbon2)]
+        roots["agy-gateway"] = [str(gw_log), str(gw_log2)]
+        e = s.Evidence(now - 86400, now)
+        with patch.object(s, "ROOTS", roots):
+            s.scan_agy(e)
+            s.scan_gateway(e, "agy-gateway", cli.DEFAULT_SPLIT)
+
+        records, held = s.reconcile(e)
+        self.assertEqual(held, [])
+        by_id = {r["id"]: r for r in records}
+        # Conflicting series (Neon gateway -> Carbon DB): MUST NOT copy 'high'
+        self.assertEqual(by_id["agy:resp-carbon-1"]["model"], "gemini-4-carbon")
+        self.assertIsNone(by_id["agy:resp-carbon-1"]["meta"].get("effort"))
+        # Matching series (Carbon gateway -> Carbon DB): DOES copy 'medium'
+        self.assertEqual(by_id["agy:resp-carbon-2"]["model"], "gemini-4-carbon")
+        self.assertEqual(by_id["agy:resp-carbon-2"]["meta"].get("effort"), "medium")
 
     def test_summary_json_includes_antigravity_series_from_dalton_prod_or_fallback(self):
         fake_home = self.tmp / "series-home"

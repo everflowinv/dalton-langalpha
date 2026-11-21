@@ -176,16 +176,19 @@ if [[ -f "${ANTIGRAVITY_SERIES_MODULE_SRC}" ]]; then
   fi
   mkdir -p "$(dirname "${TARGET_DIR}/${ANTIGRAVITY_SERIES_JSON_REL}")"
   SERIES_JSON_TMP="$(mktemp "${TARGET_DIR}/${ANTIGRAVITY_SERIES_JSON_REL}.XXXXXX")"
-  "${SERIES_PYTHON}" - "${REPO_ROOT}" "${ANTIGRAVITY_SERIES_MODULE_SRC}" "${SERIES_JSON_TMP}" <<'PYEOF'
-import copy
+  "${SERIES_PYTHON}" - "${REPO_ROOT}" "${ASSETS_DIR}/skills/model-usage-cost/scripts" "${ANTIGRAVITY_SERIES_MODULE_SRC}" "${SERIES_JSON_TMP}" <<'PYEOF'
 import importlib.util
 import json
 import sys
 from pathlib import Path
 
 repo_root = Path(sys.argv[1])
-module_path = Path(sys.argv[2])
-out_path = Path(sys.argv[3])
+skill_scripts_dir = Path(sys.argv[2])
+module_path = Path(sys.argv[3])
+out_path = Path(sys.argv[4])
+
+sys.path.insert(0, str(skill_scripts_dir))
+import usage_sources  # noqa: E402
 
 spec = importlib.util.spec_from_file_location("antigravity_series", module_path)
 if spec is None or spec.loader is None:
@@ -194,36 +197,13 @@ ag_mod = importlib.util.module_from_spec(spec)
 sys.modules["antigravity_series"] = ag_mod
 spec.loader.exec_module(ag_mod)
 
-
-def deep_merge(target, patch):
-    for k, v in patch.items():
-        if isinstance(v, dict) and isinstance(target.get(k), dict):
-            deep_merge(target[k], v)
-        else:
-            target[k] = copy.deepcopy(v)
-
-
-merged_models = {}
-for ov_path in (
-    repo_root / "src" / "dalton" / "llm" / "native_overlay.json",
-    repo_root / "var" / "dalton" / "catalog" / "native_sync_overlay.json",
-):
-    if not ov_path.is_file():
-        continue
-    raw = json.loads(ov_path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        continue
-    for key, entry in (raw.get("models") or {}).items():
-        if key not in merged_models and isinstance(entry, dict):
-            merged_models[key] = copy.deepcopy(entry)
-    for key, patch in (raw.get("model_overrides") or {}).items():
-        if isinstance(patch, dict) and isinstance(merged_models.get(key), dict):
-            deep_merge(merged_models[key], patch)
-
-dalton_yaml = repo_root / "src" / "dalton" / "dalton.yaml"
-series = ag_mod.build_antigravity_series_catalog(
-    merged_models,
-    dalton_yaml_path=dalton_yaml if dalton_yaml.is_file() else None,
+series = usage_sources.build_antigravity_series_from_overlays(
+    (
+        repo_root / "src" / "dalton" / "llm" / "native_overlay.json",
+        repo_root / "var" / "dalton" / "catalog" / "native_sync_overlay.json",
+    ),
+    dalton_yaml_path=repo_root / "src" / "dalton" / "dalton.yaml",
+    ag_mod=ag_mod,
 )
 out_path.write_text(json.dumps(series, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PYEOF

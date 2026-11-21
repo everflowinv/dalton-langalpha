@@ -3,6 +3,7 @@
 import argparse
 import collections
 import datetime as dt
+from decimal import Decimal
 import json
 import math
 import os
@@ -272,30 +273,56 @@ def reported_cost(meta):
     return float(c) if isinstance(c, (int, float)) and not isinstance(c, bool) and math.isfinite(c) and c >= 0 else None
 
 
+def _decimal_str(val):
+    norm = val.normalize()
+    return '0' if norm == 0 else format(norm, 'f')
+
+
+def _compute_usd_decimal(rate, v):
+    return (
+        sum(
+            Decimal(int(v[i])) * Decimal(str(rate[k]))
+            for i, k in enumerate(('input', 'cacheWrite', 'cacheRead', 'output'))
+        )
+        / Decimal('1000000')
+    )
+
+
 def _compute_usd_from_rate(rate, v):
-    return sum(v[i] * rate[k] for i, k in enumerate(('input', 'cacheWrite', 'cacheRead', 'output'))) / 1e6
+    return float(_compute_usd_decimal(rate, v))
 
 
-def cost_of(prices, provider, model, v, meta=None, ts=None):
+def cost_of_decimal(prices, provider, model, v, meta=None, ts=None):
     strip_oauth = bool((meta or {}).get('strip_oauth'))
     pr = price_for(prices, provider, model, ts=ts, strip_oauth=strip_oauth)
     if pr is None:
         raw_entry = match_price_entry(prices, provider, model, ts=ts, strip_oauth=strip_oauth)
         if raw_entry is not None and raw_entry.get('public_price') is False:
             return None
-        return reported_cost(meta)
+        rep = reported_cost(meta)
+        return None if rep is None else Decimal(str(rep))
     parts = (meta or {}).get('billing_parts')
     if parts and tuple(sum(p[i] for p in parts) for i in range(4)) == tuple(v):
-        return sum(cost_of(prices, provider, model, p, {'unit': 'model-response', 'strip_oauth': strip_oauth}, ts=ts) for p in parts)
+        total = Decimal(0)
+        for p in parts:
+            part_c = cost_of_decimal(prices, provider, model, p, {'unit': 'model-response', 'strip_oauth': strip_oauth}, ts=ts)
+            if part_c is not None:
+                total += part_c
+        return total
     rate = pr
     if meta is None or meta.get('unit') == 'model-response':
         for tier in pr.get('tiers', []):
             if sum(v[:3]) >= tier['from']:
                 rate = tier
-    return _compute_usd_from_rate(rate, v)
+    return _compute_usd_decimal(rate, v)
 
 
-def reference_cost_of(prices, provider, model, v, meta=None, ts=None):
+def cost_of(prices, provider, model, v, meta=None, ts=None):
+    val = cost_of_decimal(prices, provider, model, v, meta=meta, ts=ts)
+    return None if val is None else float(val)
+
+
+def reference_cost_of_decimal(prices, provider, model, v, meta=None, ts=None):
     strip_oauth = bool((meta or {}).get('strip_oauth'))
     entry = match_price_entry(prices, provider, model, ts=ts, strip_oauth=strip_oauth)
     if not entry or entry.get('public_price') is not False:
@@ -303,8 +330,13 @@ def reference_cost_of(prices, provider, model, v, meta=None, ts=None):
     ref = entry.get('reference_only')
     if not isinstance(ref, dict):
         return None, None, entry.get('note')
-    usd = _compute_usd_from_rate(ref, v)
+    usd = _compute_usd_decimal(ref, v)
     return usd, ref.get('model'), entry.get('note')
+
+
+def reference_cost_of(prices, provider, model, v, meta=None, ts=None):
+    usd, ref_model, note = reference_cost_of_decimal(prices, provider, model, v, meta=meta, ts=ts)
+    return (None if usd is None else float(usd)), ref_model, note
 
 
 def window_result(records, now, days, prices, top=0, by_model=False):
@@ -312,7 +344,7 @@ def window_result(records, now, days, prices, top=0, by_model=False):
     groups = {}
     total = [0] * 4
     total_calls = 0
-    known_cost = 0.0
+    known_cost = Decimal(0)
     unpriced_tokens = 0
     units = collections.Counter()
     estimates = 0
@@ -330,13 +362,13 @@ def window_result(records, now, days, prices, top=0, by_model=False):
         v = r['v']
         meta = r['meta']
         strip_oauth = bool(meta.get('strip_oauth'))
-        c = cost_of(prices, provider, model, v, meta, ts=r['ts'])
+        c_dec = cost_of_decimal(prices, provider, model, v, meta, ts=r['ts'])
         if meta.get('time_basis') == 'request-start':
             time_estimates += 1
         pr = price_for(prices, provider, model, ts=r['ts'], strip_oauth=strip_oauth) or {}
         raw_entry = match_price_entry(prices, provider, model, ts=r['ts'], strip_oauth=strip_oauth)
         is_no_public = bool(raw_entry is not None and raw_entry.get('public_price') is False)
-        is_reported = not pr and not is_no_public and c is not None
+        is_reported = not pr and not is_no_public and c_dec is not None
         reported += is_reported
         if pr.get('tiers') and meta.get('unit') != 'model-response' and not meta.get('billing_parts'):
             tier_unknown += 1
@@ -346,75 +378,134 @@ def window_result(records, now, days, prices, top=0, by_model=False):
             or r['source'] == sources.DALTON_PROD_CHANNEL
             or meta.get('dalton_prod')
         )
-        effort = meta.get('effort') or None
-        key = (is_dalton if by_model else r['source'], provider, model, effort)
+        pricing_provider = meta.get('pricing_provider') or None
+        key_pp = pricing_provider if is_dalton else None
+        key = (is_dalton if by_model else r['source'], provider, model, key_pp)
         b = groups.setdefault(
             key,
             dict(
                 source=set(),
                 provider=provider,
                 model=model,
-                effort=effort,
+                pricing_provider=key_pp,
                 dalton_prod=is_dalton,
                 records=0,
                 calls=0,
                 runs=0,
                 v=[0] * 4,
-                cost_usd=0.0,
+                cost_usd=Decimal(0),
                 unpriced_tokens=0,
                 estimated_split_records=0,
                 provider_reported_cost_records=0,
                 units=collections.Counter(),
                 no_public_price=False,
-                reference_cost_usd=0.0,
+                reference_cost_usd=Decimal(0),
                 has_reference_cost=False,
                 reference_model=None,
                 price_note=None,
+                _efforts={},
             ),
         )
         b['source'].add(r['source'])
         b['records'] += 1
         rec_calls = int(meta.get('calls', 1))
+        rec_runs = int(meta.get('runs', 0))
         b['calls'] += rec_calls
         total_calls += rec_calls
-        b['runs'] += int(meta.get('runs', 0))
+        b['runs'] += rec_runs
         b['provider_reported_cost_records'] += is_reported
         b['units'][meta.get('unit', 'unknown')] += 1
         for i in range(4):
             b['v'][i] += v[i]
             total[i] += v[i]
-        if c is None:
+        ref_dec = None
+        ref_model = None
+        ref_note = None
+        if c_dec is None:
             b['unpriced_tokens'] += sum(v)
             unpriced_tokens += sum(v)
             if is_no_public:
                 b['no_public_price'] = True
-                ref_usd, ref_model, ref_note = reference_cost_of(prices, provider, model, v, meta, ts=r['ts'])
-                if ref_usd is not None:
-                    b['reference_cost_usd'] += ref_usd
+                ref_dec, ref_model, ref_note = reference_cost_of_decimal(prices, provider, model, v, meta, ts=r['ts'])
+                if ref_dec is not None:
+                    b['reference_cost_usd'] += ref_dec
                     b['has_reference_cost'] = True
                     b['reference_model'] = ref_model
                 if ref_note:
                     b['price_note'] = ref_note
         else:
-            b['cost_usd'] += c
-            known_cost += c
+            b['cost_usd'] += c_dec
+            known_cost += c_dec
         if meta.get('estimated'):
             b['estimated_split_records'] += 1
             estimates += 1
         units[meta.get('unit', 'unknown')] += 1
 
+        # Preserve exact unrounded per-effort sub-buckets inside local Antigravity rows
+        # without splitting the row or introducing per-effort rounding drift.
+        rec_effort = meta.get('effort') or None
+        if not is_dalton and (
+            rec_effort is not None
+            or provider == 'antigravity-cli-gateway'
+            or 'agy' in str(r['source']).lower()
+        ):
+            eb_key = rec_effort if rec_effort else 'unknown'
+            eb = b['_efforts'].setdefault(
+                eb_key,
+                dict(
+                    effort=eb_key,
+                    records=0,
+                    calls=0,
+                    runs=0,
+                    v=[0] * 4,
+                    cost_usd=Decimal(0),
+                    has_cost=False,
+                    unpriced_tokens=0,
+                    no_public_price=False,
+                    reference_cost_usd=Decimal(0),
+                    has_reference_cost=False,
+                    reference_model=None,
+                    price_note=None,
+                ),
+            )
+            eb['records'] += 1
+            eb['calls'] += rec_calls
+            eb['runs'] += rec_runs
+            for i in range(4):
+                eb['v'][i] += v[i]
+            if c_dec is None:
+                eb['unpriced_tokens'] += sum(v)
+                if is_no_public:
+                    eb['no_public_price'] = True
+                    if ref_dec is not None:
+                        eb['reference_cost_usd'] += ref_dec
+                        eb['has_reference_cost'] = True
+                        eb['reference_model'] = ref_model
+                    if ref_note:
+                        eb['price_note'] = ref_note
+            else:
+                eb['cost_usd'] += c_dec
+                eb['has_cost'] = True
+
     rows = []
     for b in groups.values():
         v = b.pop('v')
         has_ref = b.pop('has_reference_cost')
-        if b.get('effort') is None:
-            b.pop('effort', None)
+        raw_efforts = b.pop('_efforts')
+        if b.get('pricing_provider') is None:
+            b.pop('pricing_provider', None)
         b['source'] = '|'.join(sorted(b['source']))
         b.update(dict(zip(('fresh', 'cache_write', 'cache_read', 'output'), v)))
         b['tokens'] = sum(v)
-        b['priced_cost_usd'] = round(b['cost_usd'], 6)
+        cost_dec = b['cost_usd']
+        ref_dec_tot = b['reference_cost_usd']
+        b['priced_cost_usd'] = round(float(cost_dec), 6)
         b['cost_usd'] = None if b['unpriced_tokens'] == b['tokens'] else b['priced_cost_usd']
-        b['reference_cost_usd'] = round(b['reference_cost_usd'], 6) if has_ref else None
+        if b['cost_usd'] is not None:
+            b['cost_usd_exact'] = _decimal_str(cost_dec)
+        b['reference_cost_usd'] = round(float(ref_dec_tot), 6) if has_ref else None
+        if has_ref:
+            b['reference_cost_usd_exact'] = _decimal_str(ref_dec_tot)
         if b['cost_usd'] is None:
             b['cost_basis'] = 'unpriced'
         elif b['provider_reported_cost_records'] == b['records']:
@@ -422,6 +513,38 @@ def window_result(records, now, days, prices, top=0, by_model=False):
         else:
             b['cost_basis'] = 'current-catalog-estimate'
         b['estimated_split'] = b['estimated_split_records'] > 0
+        if raw_efforts:
+            effort_breakdown = {}
+            for eb_key, eb in raw_efforts.items():
+                ev = eb['v']
+                eb_tokens = sum(ev)
+                eb_cost_dec = eb['cost_usd']
+                eb_ref_dec = eb['reference_cost_usd']
+                eb_priced = eb['has_cost'] and eb['unpriced_tokens'] != eb_tokens
+                entry = dict(
+                    effort=eb_key,
+                    records=eb['records'],
+                    calls=eb['calls'],
+                    runs=eb['runs'],
+                    fresh=ev[0],
+                    cache_write=ev[1],
+                    cache_read=ev[2],
+                    output=ev[3],
+                    total_tokens=eb_tokens,
+                    prompt_tokens=ev[0] + ev[1] + ev[2],
+                    cost_usd=float(eb_cost_dec) if eb_priced else None,
+                    unpriced_tokens=eb['unpriced_tokens'],
+                    no_public_price=eb['no_public_price'],
+                    reference_cost_usd=float(eb_ref_dec) if eb['has_reference_cost'] else None,
+                    reference_model=eb['reference_model'],
+                    price_note=eb['price_note'],
+                )
+                if eb_priced:
+                    entry['cost_usd_exact'] = _decimal_str(eb_cost_dec)
+                if eb['has_reference_cost']:
+                    entry['reference_cost_usd_exact'] = _decimal_str(eb_ref_dec)
+                effort_breakdown[eb_key] = entry
+            b['effort_breakdown'] = effort_breakdown
         rows.append(b)
 
     rows.sort(key=lambda r: (-(r['cost_usd'] if r['cost_usd'] is not None else -1), -r['tokens']))
@@ -439,7 +562,8 @@ def window_result(records, now, days, prices, top=0, by_model=False):
             records=sum(units.values()),
             calls=total_calls,
             units=units,
-            priced_cost_usd=round(known_cost, 6),
+            priced_cost_usd=round(float(known_cost), 6),
+            priced_cost_usd_exact=_decimal_str(known_cost),
             unpriced_tokens=unpriced_tokens,
             estimated_split_records=estimates,
             cost_complete=unpriced_tokens == 0,

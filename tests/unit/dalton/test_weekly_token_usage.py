@@ -1505,3 +1505,475 @@ def test_s5_card_renders_effort_breakdown_in_top10_and_tail_including_unknown_an
     # Tail unpriced Antigravity series displays breakdown with unpriced + reference estimate
     assert "GPT-OSS 120B (Antigravity)" in card_text
     assert "无公开价，参考 $0.08" in card_text
+
+
+# ---------------------------------------------------------------------------
+# Round 2 review regression tests (Codex + Carbon findings 1-7)
+# ---------------------------------------------------------------------------
+
+
+def test_r2_gpt_oss_120b_local_agy_and_dalton_prod_merge_into_single_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding #1 (Codex #1 / Carbon #2): GPT-OSS 120B local agy + Dalton prod unify vendor & merge into 1 row."""
+    import sqlite3
+
+    monkeypatch.syspath_prepend(str(SKILL_SCRIPTS_DIR))
+    import model_usage_cost_cli as cli
+    import usage_sources
+    from test_usage_accounting import pb
+
+    tracker = _load_tracker()
+    since_ts = datetime(2026, 11, 14, 4, 0, tzinfo=timezone.utc).timestamp()
+    until_ts = datetime(2026, 11, 21, 4, 0, tzinfo=timezone.utc).timestamp()
+
+    # Real SQLite agy-db file for local GPT-OSS 120B
+    agy_db = tmp_path / "conv_gpt_oss.db"
+    c = sqlite3.connect(agy_db)
+    c.execute("CREATE TABLE steps(idx INTEGER, metadata BLOB)")
+    c.execute("CREATE TABLE gen_metadata(data BLOB)")
+    meta = pb([(19, b"gpt-oss-120b-medium"), (20, pb([(1, b"model_enum"), (2, b"MODEL_PLACEHOLDER_M499")]))])
+    c.execute("INSERT INTO gen_metadata VALUES (?)", (pb([(1, meta)]),))
+    usage = pb([(1, 1499), (2, 40_000), (3, 5_000), (5, 10_000), (11, b"resp-gptoss-1")])
+    c.execute("INSERT INTO steps VALUES (1, ?)", (pb([(8, pb([(1, int(until_ts - 600))])), (9, usage)]),))
+    c.commit()
+    c.close()
+
+    roots = {k: [] for k in usage_sources.ROOTS}
+    roots["agy-db"] = [str(agy_db)]
+    e = usage_sources.Evidence(since_ts, until_ts)
+    with patch.object(usage_sources, "ROOTS", roots):
+        usage_sources.scan_agy(e)
+
+    prod_payload = {
+        "bucket": "day",
+        "timezone": "UTC",
+        "antigravity_series": usage_sources.load_antigravity_series_catalog(),
+        "models": [
+            {
+                "date": "2026-11-19",
+                "model": "gpt-oss-120b-medium-oauth",
+                "pricing_provider": "antigravity-oauth",
+                "calls": 12,
+                "fresh_input": 80_000,
+                "cache_read": 20_000,
+                "cache_write": 0,
+                "output": 10_000,
+                "total_tokens": 110_000,
+                "runs": 4,
+            }
+        ],
+        "totals": {
+            "calls": 12,
+            "fresh_input": 80_000,
+            "cache_read": 20_000,
+            "cache_write": 0,
+            "output": 10_000,
+            "total_tokens": 110_000,
+            "runs": 4,
+        },
+    }
+    monkeypatch.setenv("DALTON_USAGE_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("DALTON_BACKEND_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "tok")
+    with patch.object(usage_sources, "fetch_dalton_prod_by_model", autospec=True, return_value=prod_payload):
+        assert usage_sources.scan_dalton_prod(e, window_days=7.0, window_since=since_ts, window_until=until_ts)
+
+    snapshot = _build_cli_snapshot(cli, usage_sources, e, until_ts, days=7)
+    snapshot["antigravity_series"] = e.antigravity_series
+    stats = tracker.process_usage_stats(snapshot)
+    all_rows = stats["top10"] + stats["tail"]
+    gpt_rows = [r for r in all_rows if r.get("series_id") == "antigravity-oauth:gpt-oss-120b"]
+    assert len(gpt_rows) == 1
+    row = gpt_rows[0]
+    assert row["model"] == "GPT-OSS 120B (Antigravity)"
+    assert row["norm_provider"] == "OpenAI"
+    assert row["total_tokens"] == 55_000 + 110_000
+    assert row["calls"] == 1 + 12
+    assert set(row["providers"]) == {"antigravity-cli-gateway", "openai"}
+    assert list(row["effort_breakdown"].keys()) == ["medium"]
+    assert row["effort_breakdown"]["medium"]["total_tokens"] == 165_000
+
+    # Re-merging a non-Gemini series row without pre-filled norm_provider still resolves Anthropic (not Google)
+    rem = tracker.merge_rows_by_model(
+        [
+            {
+                "series_id": "antigravity-oauth:claude-opus-5-5",
+                "model": "Claude Opus 5.5 (Antigravity)",
+                "provider": "antigravity-cli-gateway",
+                "source": "openclaw",
+                "records": 1,
+                "calls": 1,
+                "fresh": 1000,
+                "cache_write": 0,
+                "cache_read": 0,
+                "output": 100,
+                "cost_usd": 0.01,
+            }
+        ],
+        snapshot["antigravity_series"],
+    )
+    assert len(rem) == 1
+    assert rem[0]["norm_provider"] == "Anthropic"
+
+
+def test_r2_zero_cost_discrepancy_unrounded_efforts_and_decimal_parity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding #3 (Codex #3): zero money discrepancy across local effort split, float order, and old vs new."""
+    from decimal import Decimal
+    import os
+    import sqlite3
+    import subprocess
+
+    monkeypatch.syspath_prepend(str(SKILL_SCRIPTS_DIR))
+    import model_usage_cost_cli as cli
+    import usage_sources
+    from test_usage_accounting import pb
+
+    tracker = _load_tracker()
+    until_ts = datetime(2026, 11, 21, 4, 0, tzinfo=timezone.utc).timestamp()
+    since_ts = until_ts - 7 * 86400
+
+    # Part A: Codex counterexample 1 — 10 cache_read ($0.0000015) in high + 10 cache_read ($0.0000015) in medium
+    # + 60,000 cache_read ($0.009) in low -> exact total $0.009003 (must NOT round per effort to $0.009004).
+    def make_db(path: Path, model_bytes: bytes, m_code: int, cache_read: int, ts_val: float, resp_id: bytes) -> None:
+        c = sqlite3.connect(path)
+        c.execute("CREATE TABLE steps(idx INTEGER, metadata BLOB)")
+        c.execute("CREATE TABLE gen_metadata(data BLOB)")
+        meta = pb([(19, model_bytes), (20, pb([(1, b"model_enum"), (2, f"MODEL_PLACEHOLDER_M{m_code}".encode())]))])
+        c.execute("INSERT INTO gen_metadata VALUES (?)", (pb([(1, meta)]),))
+        usage = pb([(1, 1000 + m_code), (2, 0), (3, 0), (5, cache_read), (11, resp_id)])
+        c.execute("INSERT INTO steps VALUES (1, ?)", (pb([(8, pb([(1, int(ts_val))])), (9, usage)]),))
+        c.commit()
+        c.close()
+
+    db_hi = tmp_path / "neon_hi.db"
+    db_med = tmp_path / "neon_med.db"
+    db_lo = tmp_path / "neon_lo.db"
+    make_db(db_hi, b"gemini-4-neon-high", 420, 10, until_ts - 300, b"r-hi")
+    make_db(db_med, b"gemini-4-neon-medium", 421, 10, until_ts - 200, b"r-med")
+    make_db(db_lo, b"gemini-4-neon-low", 422, 60_000, until_ts - 100, b"r-lo")
+
+    roots = {k: [] for k in usage_sources.ROOTS}
+    roots["agy-db"] = [str(db_hi), str(db_med), str(db_lo)]
+    e = usage_sources.Evidence(since_ts, until_ts)
+    with patch.object(usage_sources, "ROOTS", roots):
+        usage_sources.scan_agy(e)
+
+    snap_a = _build_cli_snapshot(cli, usage_sources, e, until_ts, days=7)
+    snap_a["antigravity_series"] = usage_sources.load_antigravity_series_catalog()
+    assert len(snap_a["windows"][0]["rows"]) == 1
+    assert snap_a["windows"][0]["totals"]["priced_cost_usd"] == 0.009003
+    stats_a = tracker.process_usage_stats(snap_a)
+    assert stats_a["local_stats"]["cost"] == 0.009003
+    assert stats_a["total_cost"] == 0.009003
+    neon_a = stats_a["top10"][0]
+    assert neon_a["model"] == "Gemini 4 Neon"
+    assert Decimal(neon_a["cost_usd_exact"]) == Decimal("0.009003")
+    assert sum(Decimal(b["cost_usd_exact"]) for b in neon_a["effort_breakdown"].values()) == Decimal(
+        neon_a["cost_usd_exact"]
+    )
+
+    # Part B: Codex counterexample 2 — $0.075, $0.06, $0.03 in any order (and with another model interspersed)
+    # must always sum to exact Decimal('0.165') and format on card as "$0.16" (never flipping to "$0.17").
+    base_rows_b = [
+        {
+            "source": "Dalton 生产（订阅）",
+            "provider": "google",
+            "model": "gemini-4-neon-high-oauth",
+            "dalton_prod": True,
+            "records": 1,
+            "calls": 1,
+            "runs": 1,
+            "fresh": 25_000,
+            "cache_write": 0,
+            "cache_read": 0,
+            "output": 0,
+            "cost_usd": 0.075,
+        },
+        {
+            "source": "openclaw",
+            "provider": "openai",
+            "model": "gpt-6-luna",
+            "dalton_prod": False,
+            "records": 1,
+            "calls": 1,
+            "runs": 0,
+            "fresh": 1000,
+            "cache_write": 0,
+            "cache_read": 0,
+            "output": 0,
+            "cost_usd": 0.0,
+        },
+        {
+            "source": "Dalton 生产（订阅）",
+            "provider": "google",
+            "model": "gemini-4-neon-medium-oauth",
+            "dalton_prod": True,
+            "records": 1,
+            "calls": 1,
+            "runs": 1,
+            "fresh": 20_000,
+            "cache_write": 0,
+            "cache_read": 0,
+            "output": 0,
+            "cost_usd": 0.06,
+        },
+        {
+            "source": "Dalton 生产（订阅）",
+            "provider": "google",
+            "model": "gemini-4-neon-low-oauth",
+            "dalton_prod": True,
+            "records": 1,
+            "calls": 1,
+            "runs": 1,
+            "fresh": 10_000,
+            "cache_write": 0,
+            "cache_read": 0,
+            "output": 0,
+            "cost_usd": 0.03,
+        },
+    ]
+    for ordered_rows in (base_rows_b, list(reversed(base_rows_b))):
+        snap_b = {
+            "ok": True,
+            "version": "3.1.0",
+            "price_catalog": {"generated": "2026-11-14", "effective_notes": []},
+            "antigravity_series": snap_a["antigravity_series"],
+            "dalton_prod": {"ok": True, "error": None, "runs": 3, "calls": 3, "models": 3},
+            "collector_status": {"ok": True, "fresh": True},
+            "windows": [
+                {
+                    "days": 7.0,
+                    "from": "2026-11-14T04:00:00+00:00",
+                    "to": "2026-11-21T04:00:00+00:00",
+                    "row_count": len(ordered_rows),
+                    "rows": ordered_rows,
+                    "totals": {
+                        "tokens": 56_000,
+                        "records": 4,
+                        "calls": 4,
+                        "priced_cost_usd": 0.165,
+                        "unpriced_tokens": 0,
+                    },
+                }
+            ],
+        }
+        stats_b = tracker.process_usage_stats(snap_b)
+        assert Decimal(str(stats_b["total_cost"])) == Decimal("0.165")
+        assert Decimal(str(stats_b["dalton_stats"]["cost"])) == Decimal("0.165")
+        neon_b = next(r for r in stats_b["top10"] if r["model"] == "Gemini 4 Neon")
+        assert sum(Decimal(b["cost_usd_exact"]) for b in neon_b["effort_breakdown"].values()) == Decimal(
+            neon_b["cost_usd_exact"]
+        ) == Decimal("0.165")
+        card_text_b = json.dumps(tracker.build_card(stats_b), ensure_ascii=False)
+        assert "**$0.16**" in card_text_b
+        assert "**$0.17**" not in card_text_b
+
+    # Part C: Old (HEAD) vs New tracker exact parity regression on the same snapshot
+    old_src = subprocess.check_output(
+        ["git", "-C", str(REPO_ROOT), "show", "HEAD:scripts/dalton/data_assets/scripts/token_weekly_usage_tracker.py"],
+        text=True,
+    )
+    old_tracker = tmp_path / "old_tracker.py"
+    old_tracker.write_text(old_src, encoding="utf-8")
+    snap_parity = _make_realistic_series_snapshot(include_series=True)
+    snap_file = tmp_path / "parity.json"
+    snap_file.write_text(json.dumps(snap_parity, ensure_ascii=False), encoding="utf-8")
+
+    env = dict(os.environ, OPENCLAW_WORKSPACE=str(REPO_ROOT / "scripts/dalton/data_assets"))
+    old_out = json.loads(
+        subprocess.check_output(
+            [sys.executable, str(old_tracker), "--input-json", str(snap_file), "--json"],
+            text=True,
+            env=env,
+        )
+    )
+    new_out = json.loads(
+        subprocess.check_output(
+            [sys.executable, str(TRACKER_PATH), "--input-json", str(snap_file), "--json"],
+            text=True,
+            env=env,
+        )
+    )
+    for field in ("total_tokens", "total_fresh", "total_cw", "total_cr", "total_out", "total_calls", "total_records", "unpriced_tokens"):
+        assert new_out[field] == old_out[field], f"{field} mismatch"
+    assert Decimal(str(round(new_out["total_cost"], 6))) == Decimal(str(round(old_out["total_cost"], 6)))
+    assert Decimal(str(round(new_out["local_stats"]["cost"], 6))) == Decimal(str(round(old_out["local_stats"]["cost"], 6)))
+    assert Decimal(str(round(new_out["dalton_stats"]["cost"], 6))) == Decimal(str(round(old_out["dalton_stats"]["cost"], 6)))
+    for sub in ("tokens", "calls", "records", "unpriced_tokens"):
+        assert new_out["local_stats"][sub] == old_out["local_stats"][sub]
+        assert new_out["dalton_stats"][sub] == old_out["dalton_stats"][sub]
+
+
+@pytest.mark.asyncio
+async def test_r2_byok_custom_shadow_and_unknown_pricing_provider_excluded_from_series(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding #4 (Codex #4): BYOK custom model shadowing a built-in key & historical unknown rows stay unmerged."""
+    monkeypatch.syspath_prepend(str(SKILL_SCRIPTS_DIR))
+    import model_usage_cost_cli as cli
+    import usage_sources
+
+    tracker = _load_tracker()
+    from_dt = datetime(2026, 11, 14, 4, 0, tzinfo=timezone.utc)
+    to_dt = datetime(2026, 11, 21, 4, 0, tzinfo=timezone.utc)
+
+    # Simulate real Postgres rows returned by BY_MODEL_DAILY_AGGREGATION_SQL (with pricing_provider column)
+    db_rows = [
+        {
+            "date": "2026-11-18",
+            "model": "gemini-4-neon-high-oauth",
+            "pricing_provider": "antigravity-oauth",
+            "calls": 100,
+            "fresh_input": 400_000,
+            "cache_read": 100_000,
+            "cache_write": 0,
+            "output": 20_000,
+            "total_tokens": 520_000,
+            "runs": 20,
+            "total_runs": 45,
+        },
+        {
+            "date": "2026-11-18",
+            "model": "gemini-4-neon-high-oauth",
+            "pricing_provider": "my-byok-proxy",
+            "calls": 30,
+            "fresh_input": 150_000,
+            "cache_read": 0,
+            "cache_write": 0,
+            "output": 10_000,
+            "total_tokens": 160_000,
+            "runs": 15,
+            "total_runs": 45,
+        },
+        {
+            "date": "2026-11-18",
+            "model": "gemini-4-neon-medium-oauth",
+            "pricing_provider": None,
+            "calls": 20,
+            "fresh_input": 80_000,
+            "cache_read": 0,
+            "cache_write": 0,
+            "output": 5_000,
+            "total_tokens": 85_000,
+            "runs": 10,
+            "total_runs": 45,
+        },
+    ]
+    conn, captured = _make_autospec_conn(db_rows)
+    prod_payload = await fetch_usage_by_model(conn, from_dt=from_dt, to_dt=to_dt, bucket="day")
+
+    # Verify SQL extracts pricing_provider from per_call_costs with by_model fallback
+    assert "per_call_costs" in str(captured["sql"])
+    assert "pricing_provider" in str(captured["sql"])
+    assert "jsonb_each" in str(captured["sql"])
+    assert [m["pricing_provider"] for m in prod_payload["models"]] == [
+        "antigravity-oauth",
+        "my-byok-proxy",
+        "unknown",
+    ]
+
+    e = usage_sources.Evidence(from_dt.timestamp(), to_dt.timestamp())
+    monkeypatch.setenv("DALTON_USAGE_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("DALTON_BACKEND_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "tok")
+    with patch.object(usage_sources, "fetch_dalton_prod_by_model", autospec=True, return_value=prod_payload):
+        assert usage_sources.scan_dalton_prod(
+            e,
+            window_days=7.0,
+            window_since=from_dt.timestamp(),
+            window_until=to_dt.timestamp(),
+        )
+
+    snapshot = _build_cli_snapshot(cli, usage_sources, e, to_dt.timestamp(), days=7)
+    snapshot["antigravity_series"] = e.antigravity_series
+    stats = tracker.process_usage_stats(snapshot)
+    all_rows = stats["top10"] + stats["tail"]
+    by_model = {r["model"]: r for r in all_rows}
+
+    # Only the genuine antigravity-oauth row merges into "Gemini 4 Neon"
+    assert set(by_model.keys()) == {
+        "Gemini 4 Neon",
+        "gemini-4-neon-high-oauth",
+        "gemini-4-neon-medium-oauth",
+    }
+    assert by_model["Gemini 4 Neon"]["total_tokens"] == 520_000
+    assert by_model["Gemini 4 Neon"]["calls"] == 100
+    assert list(by_model["Gemini 4 Neon"]["effort_breakdown"].keys()) == ["high"]
+    # BYOK custom shadow stays independent
+    assert by_model["gemini-4-neon-high-oauth"]["total_tokens"] == 160_000
+    assert by_model["gemini-4-neon-high-oauth"]["pricing_provider"] == "my-byok-proxy"
+    assert "series_id" not in by_model["gemini-4-neon-high-oauth"]
+    # Historical unknown-origin DB row stays independent
+    assert by_model["gemini-4-neon-medium-oauth"]["total_tokens"] == 85_000
+    assert by_model["gemini-4-neon-medium-oauth"]["pricing_provider"] == "unknown"
+    assert "series_id" not in by_model["gemini-4-neon-medium-oauth"]
+    # Totals remain 100% intact
+    assert stats["total_tokens"] == 520_000 + 160_000 + 85_000
+    assert stats["total_calls"] == 150
+    # Idempotency holds for mixed built-in + BYOK rows
+    series_idx = tracker.build_series_index(snapshot["antigravity_series"])
+    assert tracker.merge_rows_by_model(all_rows, series_idx) == tracker.merge_rows_by_model(
+        tracker.merge_rows_by_model(all_rows, series_idx), series_idx
+    )
+
+
+def test_r2_tracker_ignores_stale_usage_sources_in_openclaw_workspace_and_errors_clearly_when_isolated(
+    tmp_path: Path,
+) -> None:
+    """Finding #7 (Codex #7): new tracker prefers sibling usage_sources over stale OPENCLAW_WORKSPACE and gives clear error if isolated."""
+    import os
+    import shutil
+    import subprocess
+
+    stale_ws = tmp_path / "stale_openclaw_data"
+    stale_scripts = stale_ws / "skills" / "model-usage-cost" / "scripts"
+    stale_scripts.mkdir(parents=True)
+    # Simulate an old pre-PR usage_sources.py that lacks load_antigravity_series_module
+    (stale_scripts / "usage_sources.py").write_text("# legacy usage_sources without series helpers\n", encoding="utf-8")
+    (stale_scripts / "usage_state.py").write_text(
+        "from pathlib import Path\ndef resolve_usage_state_dir(): return Path('/tmp')\n",
+        encoding="utf-8",
+    )
+
+    snap = _make_realistic_series_snapshot(include_series=True)
+    snap_path = tmp_path / "snap.json"
+    snap_path.write_text(json.dumps(snap, ensure_ascii=False), encoding="utf-8")
+
+    env = dict(os.environ)
+    env["OPENCLAW_WORKSPACE"] = str(stale_ws)
+    env["DALTON_DATA_ROOT"] = str(stale_ws)
+    env.pop("DALTON_ANTIGRAVITY_SERIES_FILE", None)
+
+    # Part A: Running new repo tracker with stale OPENCLAW_WORKSPACE MUST succeed using repo's sibling usage_sources.py
+    ok_res = subprocess.run(
+        [sys.executable, str(TRACKER_PATH), "--input-json", str(snap_path), "--json"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert ok_res.returncode == 0, ok_res.stdout + ok_res.stderr
+    parsed = json.loads(ok_res.stdout)
+    assert any(r["model"] == "Gemini 4 Neon" for r in parsed["top10"])
+
+    # Part B: Isolated copy of tracker with NO sibling scripts dir pointed at stale workspace MUST raise clear version error (not AttributeError)
+    isolated_dir = tmp_path / "isolated" / "scripts"
+    isolated_dir.mkdir(parents=True)
+    isolated_tracker = isolated_dir / "token_weekly_usage_tracker.py"
+    shutil.copy2(TRACKER_PATH, isolated_tracker)
+    err_res = subprocess.run(
+        [sys.executable, str(isolated_tracker), "--input-json", str(snap_path), "--json"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert err_res.returncode != 0
+    assert "usage_sources.py 版本不匹配" in err_res.stderr
+    assert "AttributeError" not in err_res.stderr

@@ -457,7 +457,9 @@ def scan_agy(e):
             # A conversation store created but never initialised has no tables; skip it, do not fail the whole scan.
             if not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='steps'").fetchone():
                 e.issue('agy_db_no_steps_table', conv); continue
-            models=__import__('usage_v3').agy_models(c, e)
+            v3 = __import__('usage_v3')
+            models = v3.agy_models(c, e)
+            efforts = v3.agy_model_efforts(c)
             for idx, raw in c.execute('SELECT idx,metadata FROM steps WHERE metadata IS NOT NULL'):
                 try:
                     d = wire(raw)
@@ -473,8 +475,16 @@ def scan_agy(e):
                     if (thinking or response_out) and usage[3] != thinking + response_out:
                         e.issue('agy_output_partition_mismatch', conv)
                     names=models.get(model_enum,set()); model=next(iter(names)) if len(names)==1 else 'agy-enum-%s'%model_enum
-                    e.put('agy', mid, ts, 'antigravity-cli-gateway', model, 'agy-cli(含网关)', usage,
-                          conversation=conv, step=idx, enum=model_enum, thinking=thinking, unit='model-response', model_basis='gen-metadata' if len(names)==1 else 'enum', time_basis='completion')
+                    enum_effs=efforts.get(model_enum,set())
+                    effort=next(iter(enum_effs)) if len(names)==1 and len(enum_effs)==1 else None
+                    meta_kwargs = dict(
+                        conversation=conv, step=idx, enum=model_enum, thinking=thinking,
+                        unit='model-response', model_basis='gen-metadata' if len(names)==1 else 'enum',
+                        time_basis='completion',
+                    )
+                    if effort:
+                        meta_kwargs['effort'] = effort
+                    e.put('agy', mid, ts, 'antigravity-cli-gateway', model, 'agy-cli(含网关)', usage, **meta_kwargs)
                 except (ValueError, TypeError, UnicodeError) as error:
                     e.issue('agy_schema_error', '%s:%s %s' % (conv, idx, error))
         finally: c.close()
@@ -596,10 +606,25 @@ def scan_dalton_prod(e, *, window_days=None, window_since=None, window_until=Non
         if not any(v):
             continue
         date_str = str(row.get('date') or '').strip()[:10]
+        pricing_provider = str(row.get('pricing_provider') or '').strip() or None
         ts = _dalton_bucket_timestamp(date_str, since_ts, until_ts)
-        ident = f'{window_tag}:{date_str}:{model_name}:{idx}' if date_str else f'{window_tag}:{model_name}'
+        if date_str:
+            ident = f'{window_tag}:{date_str}:{model_name}:{pricing_provider}:{idx}' if pricing_provider else f'{window_tag}:{date_str}:{model_name}:{idx}'
+        else:
+            ident = f'{window_tag}:{model_name}:{pricing_provider}:{idx}' if pricing_provider else f'{window_tag}:{model_name}'
         calls = int(row.get('calls') or 0)
         runs = int(row.get('runs') or 0)
+        put_meta = dict(
+            unit='model-invocation',
+            date=date_str or None,
+            calls=calls if calls > 0 else 1,
+            runs=runs,
+            window_days=window_days,
+            dalton_prod=True,
+            strip_oauth=True,
+        )
+        if pricing_provider is not None:
+            put_meta['pricing_provider'] = pricing_provider
         e.put(
             'dalton-prod',
             ident,
@@ -608,13 +633,7 @@ def scan_dalton_prod(e, *, window_days=None, window_since=None, window_until=Non
             model_name,
             DALTON_PROD_CHANNEL,
             v,
-            unit='model-invocation',
-            date=date_str or None,
-            calls=calls if calls > 0 else 1,
-            runs=runs,
-            window_days=window_days,
-            dalton_prod=True,
-            strip_oauth=True,
+            **put_meta,
         )
 
     totals = payload.get('totals') or {}
@@ -698,26 +717,23 @@ def _deep_merge_overlay_dict(target, patch):
             target[k] = copy.deepcopy(v)
 
 
-def _build_antigravity_series_from_repo_overlays(ag_mod=None):
+def build_antigravity_series_from_overlays(overlay_paths, *, dalton_yaml_path=None, ag_mod=None):
+    """Build the Antigravity series catalog from overlay JSON files, matching backend ``overlay.py``.
+
+    Merges ``models`` and ``model_overrides`` in order, then drops top-level ``retired``
+    entries across all overlays before calling ``build_antigravity_series_catalog``.
+    """
     mod = ag_mod if ag_mod is not None else load_antigravity_series_module()
     if mod is None or not hasattr(mod, 'build_antigravity_series_catalog'):
         return []
-    repo_root = None
-    for parent in Path(__file__).resolve().parents:
-        if (parent / 'src' / 'dalton' / 'llm' / 'native_overlay.json').is_file():
-            repo_root = parent
-            break
-    if repo_root is None:
-        return []
     merged_models = {}
-    for ov_path in (
-        repo_root / 'src' / 'dalton' / 'llm' / 'native_overlay.json',
-        repo_root / 'var' / 'dalton' / 'catalog' / 'native_sync_overlay.json',
-    ):
-        if not ov_path.is_file():
+    retired_keys = []
+    for ov_path in overlay_paths:
+        p = Path(ov_path)
+        if not p.is_file():
             continue
         try:
-            raw = json.loads(ov_path.read_text(encoding='utf-8'))
+            raw = json.loads(p.read_text(encoding='utf-8'))
         except (OSError, ValueError, TypeError):
             continue
         if not isinstance(raw, dict):
@@ -728,10 +744,37 @@ def _build_antigravity_series_from_repo_overlays(ag_mod=None):
         for key, patch in (raw.get('model_overrides') or {}).items():
             if isinstance(patch, dict) and isinstance(merged_models.get(key), dict):
                 _deep_merge_overlay_dict(merged_models[key], patch)
-    dalton_yaml = repo_root / 'src' / 'dalton' / 'dalton.yaml'
+        for item in raw.get('retired') or []:
+            if isinstance(item, dict):
+                rkey = str(item.get('key') or '').strip()
+                if rkey:
+                    retired_keys.append(rkey)
+            elif isinstance(item, str) and item.strip():
+                retired_keys.append(item.strip())
+    for rkey in retired_keys:
+        merged_models.pop(rkey, None)
+    yaml_path = Path(dalton_yaml_path) if dalton_yaml_path is not None else None
     return mod.build_antigravity_series_catalog(
         merged_models,
-        dalton_yaml_path=dalton_yaml if dalton_yaml.is_file() else None,
+        dalton_yaml_path=yaml_path if (yaml_path and yaml_path.is_file()) else None,
+    )
+
+
+def _build_antigravity_series_from_repo_overlays(ag_mod=None):
+    repo_root = None
+    for parent in Path(__file__).resolve().parents:
+        if (parent / 'src' / 'dalton' / 'llm' / 'native_overlay.json').is_file():
+            repo_root = parent
+            break
+    if repo_root is None:
+        return []
+    return build_antigravity_series_from_overlays(
+        (
+            repo_root / 'src' / 'dalton' / 'llm' / 'native_overlay.json',
+            repo_root / 'var' / 'dalton' / 'catalog' / 'native_sync_overlay.json',
+        ),
+        dalton_yaml_path=repo_root / 'src' / 'dalton' / 'dalton.yaml',
+        ag_mod=ag_mod,
     )
 
 
@@ -822,7 +865,7 @@ def reconcile(e):
             e.stats['claude_gateway_message_reconciled']+=len(partial)
             if summed(partial)==tuple(g['v']):
                 active[g['id']]['meta']['billing_parts']=[list(r['v']) for r in partial]
-    enum_models=collections.defaultdict(set); used_agy=set(); mapped_gw={}
+    enum_models=collections.defaultdict(set); enum_efforts=collections.defaultdict(set); used_agy=set(); mapped_gw={}
     for rows in agy.values():
         for r in rows:
             if not r['model'].startswith('agy-enum-'):
@@ -835,6 +878,7 @@ def reconcile(e):
                     r['model'] = norm
                     e.stats['agy_variant_label_merged'] += 1
                 enum_models[r['meta']['enum']].add(r['model'])
+                enum_efforts[r['meta']['enum']].add(r['meta'].get('effort'))
     for g in gateways:
         if g['provider']!='antigravity-cli-gateway': continue
         lo,hi = g['meta'].get('start'),g['ts']; candidates=[]
@@ -852,11 +896,18 @@ def reconcile(e):
             g['meta']['replaced_by']=[r['id'] for r in subset]
             e.stats['agy_gateway_reconciled']+=1
             gw_effort = extract_antigravity_effort(g['model'])
+            gw_base = normalize_variant_model(g['model'])
             for r in subset:
                 active[r['id']]['source']='openclaw'
-                if gw_effort and not active[r['id']]['meta'].get('effort'):
-                    active[r['id']]['meta']['effort'] = gw_effort
-                if r['model'].startswith('agy-enum-'):enum_models[r['meta']['enum']].add(normalize_variant_model(g['model']))
+                if r['model'].startswith('agy-enum-'):
+                    known_for_enum = enum_models.get(r['meta']['enum'], set())
+                    if gw_effort and not active[r['id']]['meta'].get('effort') and (not known_for_enum or known_for_enum == {gw_base}):
+                        active[r['id']]['meta']['effort'] = gw_effort
+                    enum_models[r['meta']['enum']].add(gw_base)
+                else:
+                    r_base = normalize_variant_model(r['model'])
+                    if gw_effort and not active[r['id']]['meta'].get('effort') and r_base == gw_base:
+                        active[r['id']]['meta']['effort'] = gw_effort
         else:
             # A gateway request whose DB evidence overlaps in time but cannot be
             # reconciled must not be added on top of those DB observations.
@@ -871,7 +922,14 @@ def reconcile(e):
             enum_raw=r['meta'].get('enum')
             enum_key=str(enum_raw if enum_raw is not None else r['model'][len('agy-enum-'):])
             models=enum_models.get(enum_raw,set())
-            if len(models)==1: r['model']=normalize_variant_model(next(iter(models)))
+            if len(models)==1:
+                r['model']=normalize_variant_model(next(iter(models)))
+                if not r['meta'].get('effort'):
+                    effs=enum_efforts.get(enum_raw,set())
+                    if len(effs)==1:
+                        only_eff=next(iter(effs))
+                        if only_eff:
+                            r['meta']['effort']=only_eff
             elif enum_names.get(enum_key):
                 r['model']=normalize_variant_model(enum_names[enum_key])
                 r['meta']['model_basis']='agy-enum-names'
