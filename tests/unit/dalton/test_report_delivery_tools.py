@@ -3179,40 +3179,51 @@ async def test_r5_1_audit_snapshot_reflects_post_sync_routes_on_create_and_updat
                 self._many = []
                 return
             if "INSERT INTO automations" in norm and params:
-                aid = str(params[0])
+                # Map placeholders to column names from the statement itself, so a new
+                # column (e.g. reasoning_effort) does not shift every later field.
+                cols_sql = norm.split("INSERT INTO automations (", 1)[1].split(")", 1)[0]
+                vals_sql = norm.split("VALUES (", 1)[1].rsplit(")", 1)[0]
+                cols = [c.strip() for c in cols_sql.split(",")]
+                vals = [v.strip() for v in vals_sql.split(",")]
+                by_col: dict[str, Any] = {}
+                it = iter(params)
+                for col, val in zip(cols, vals):
+                    if "%s" in val:
+                        by_col[col] = next(it)
+                aid = str(by_col["automation_id"])
                 row = {
                     "automation_id": aid,
-                    "user_id": params[1],
-                    "name": params[2],
-                    "file_name": params[3],
-                    "description": params[4],
-                    "trigger_type": params[5],
-                    "cron_expression": params[6],
-                    "timezone": params[7],
-                    "trigger_config": _unwrap(params[8]),
-                    "next_run_at": params[9],
+                    "user_id": by_col.get("user_id"),
+                    "name": by_col.get("name"),
+                    "file_name": by_col.get("file_name"),
+                    "description": by_col.get("description"),
+                    "trigger_type": by_col.get("trigger_type"),
+                    "cron_expression": by_col.get("cron_expression"),
+                    "timezone": by_col.get("timezone"),
+                    "trigger_config": _unwrap(by_col.get("trigger_config")),
+                    "next_run_at": by_col.get("next_run_at"),
                     "last_run_at": None,
-                    "instruction": params[10],
-                    "workspace_id": params[11],
-                    "llm_model": params[12],
-                    "additional_context": _unwrap(params[13]),
-                    "thread_strategy": params[14],
-                    "conversation_thread_id": params[15],
-                    "status": params[16],
-                    "max_failures": params[17],
+                    "instruction": by_col.get("instruction"),
+                    "workspace_id": by_col.get("workspace_id"),
+                    "llm_model": by_col.get("llm_model"),
+                    "additional_context": _unwrap(by_col.get("additional_context")),
+                    "thread_strategy": by_col.get("thread_strategy"),
+                    "conversation_thread_id": by_col.get("conversation_thread_id"),
+                    "status": by_col.get("status"),
+                    "max_failures": by_col.get("max_failures"),
                     "failure_count": 0,
                     "disable_reason": None,
-                    "delivery_config": _unwrap(params[18]),
-                    "metadata": _unwrap(params[19]),
-                    "scope": params[20],
+                    "delivery_config": _unwrap(by_col.get("delivery_config")),
+                    "metadata": _unwrap(by_col.get("metadata")),
+                    "scope": by_col.get("scope"),
                     "notify_enabled": True,
                     "notify_routes": [],
                     "notify_storage_mode": "legacy",
-                    "created_by": params[21],
-                    "updated_by": params[22],
-                    "config_version": params[23],
-                    "active_version": params[24],
-                    "audit_history": _unwrap(params[25]),
+                    "created_by": by_col.get("created_by"),
+                    "updated_by": by_col.get("updated_by"),
+                    "config_version": by_col.get("config_version"),
+                    "active_version": by_col.get("active_version"),
+                    "audit_history": _unwrap(by_col.get("audit_history")),
                     "deleted_at": None,
                     "deleted_by": None,
                     "created_at": now,
