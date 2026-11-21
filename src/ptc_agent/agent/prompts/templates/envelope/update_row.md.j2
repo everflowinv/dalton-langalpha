@@ -116,7 +116,8 @@
    State only, so it renders the same at both guidance levels. The standing
    rules for reading a row are static prose in the system prefix. #}
 {% if update %}
-{% if update.kind in ("turn_opened", "wakeup_cancelled", "market_watch") %}
+{# DALTON-HOOK(team-memory-toggle): team_memory_switched renders bare like wakeup_cancelled #}
+{% if update.kind in ("turn_opened", "wakeup_cancelled", "market_watch", "team_memory_switched") %}
 {{ update.text }}
 {% elif update.kind == "subagents_switched" %}
 {% if update.provenance.get("allowed") is false %}

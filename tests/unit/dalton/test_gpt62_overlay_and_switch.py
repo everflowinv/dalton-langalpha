@@ -1115,3 +1115,59 @@ async def test_switch_model_refs_updates_starred_and_hidden_lists_and_skips_on_c
         "u-starred-conflict",
         "u-hidden-cas-race",
     ]
+
+
+def test_gpt6x_context_window_and_compaction_threshold_match_upstream() -> None:
+    """GPT 6.x models inherit upstream's 1.05M context and expansive (500K) compaction profile.
+
+    272000 in providers.json is OpenAI's tiered long-context pricing threshold, not a context cap;
+    500000 is the expansive compaction token_threshold, not the context window.
+    """
+    from types import SimpleNamespace
+
+    import yaml
+
+    from src.llms.preferences import Tuning
+    from src.server.services.llm.config import apply_compaction
+
+    LLM._model_config = None
+    mc = ModelConfig()
+    providers_doc = json.loads(
+        (REPO_ROOT / "src/llms/manifest/providers.json").read_text(encoding="utf-8")
+    )
+    dalton_agent_cfg = yaml.safe_load(
+        (REPO_ROOT / "agent_config.dalton.yaml").read_text(encoding="utf-8")
+    )
+    assert dalton_agent_cfg.get("compaction") == {"cold_compact_tokens": 0}
+
+    openai_cards = {
+        item["id"]: item
+        for item in providers_doc["models"]["openai"]
+        if isinstance(item, dict) and item.get("id")
+    }
+
+    for model_id in ("gpt-6.1-terra", "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-luna"):
+        card = openai_cards[model_id]
+        assert card["context_window"] == 1_050_000
+        assert card["max_output"] == 128_000
+        assert card["pricing"]["input_tiers"][0]["max_tokens"] == 272_000
+        assert card["pricing"]["output_tiers"][0]["max_tokens"] == 272_000
+
+        for key in (model_id, f"{model_id}-oauth"):
+            entry = mc.get_model_config(key)
+            assert entry is not None, key
+            assert entry["context"] == 1_050_000, key
+            assert entry["compaction_profile"] == "expansive", key
+            assert mc.get_compaction_profile(key) == "expansive", key
+
+            cfg = SimpleNamespace(
+                compaction=SimpleNamespace(
+                    token_threshold=120_000,
+                    profile=None,
+                    native=True,
+                    cold_compact_tokens=0,
+                )
+            )
+            apply_compaction(cfg, Tuning(), entry)
+            assert cfg.compaction.profile == "expansive", key
+            assert cfg.compaction.token_threshold == 500_000, key

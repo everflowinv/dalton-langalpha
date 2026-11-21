@@ -64,3 +64,32 @@ def test_an_empty_home_notebook_is_not_seeded_as_a_workspace_index():
     chief = empty(role="chief_of_staff")
     assert "Purpose, Reusable, Open, Deliverables" not in chief
     assert "<role>" in chief
+
+
+# DALTON-HOOK(team-memory-toggle): external/company main agents and subagents never get team memory wording or archive entries
+def test_team_memory_omitted_for_subagents_and_external_company_tiers():
+    loader = get_loader()
+    for tier in ("external", "company"):
+        for role in ("analyst", "chief_of_staff"):
+            prompt = loader.get_system_prompt(**_BASE, role=role, user_tier=tier)
+            assert "<data_map>" in prompt
+            assert "conversation_search" not in prompt
+            assert "归档统计：" not in prompt
+
+    subagent_prompt = loader.get_subagent_base_prompt(
+        identity_line="You are a subagent.",
+        role_prompt="Do research.",
+        sections={"tool_guide": True},
+    )
+    assert "conversation_search" not in subagent_prompt
+    assert "归档统计：" not in subagent_prompt
+
+    tool_guide = loader.render("components/tool_guide.md.j2", tool_summary="")
+    assert "<data_map>" in tool_guide
+    assert "conversation_search" not in tool_guide
+    assert "归档统计：" not in tool_guide
+
+    for role in ("analyst", "chief_of_staff"):
+        internal_prompt = loader.get_system_prompt(**_BASE, role=role, user_tier="internal")
+        assert "conversation_search" in internal_prompt
+        assert "归档统计：" in internal_prompt

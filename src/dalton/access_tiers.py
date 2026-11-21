@@ -41,7 +41,13 @@ __all__ = [
     "classify_owner_tier",
     "get_user_tier",
     "is_internal_or_admin",
+    "is_internal_tier",
 ]
+
+
+def is_internal_tier(user_tier: str | None) -> bool:
+    """Return True when ``user_tier`` is an internal member tier (``admin`` or ``internal``)."""
+    return (user_tier or "").strip().lower() in ("admin", "internal")
 
 
 async def get_user_tier(user_id: str | None) -> UserTier:

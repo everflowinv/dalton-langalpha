@@ -89,7 +89,8 @@ def _apply_search_api_filter(
 
 
 _TEAM_MEMORY_PRINCIPLE_CLAUSE = (
-    "；问到公司或主题时，先用 `conversation_search` 查团队以前的观点、假设和决定，"
+    "；`conversation_search` 仅在团队记忆开启时可用；当前是否开启以对话中的运行时说明为准"
+    "——开启时问到公司或主题，先用 `conversation_search` 查团队以前的观点、假设和决定，"
     "并在答案里说明与之前看法相比有什么变化"
 )
 
@@ -248,7 +249,7 @@ def _format_conversation_stats_line(
 ) -> str:
     """Format `dalton_conversation_cards` statistics into a compact summary line."""
     if not isinstance(conversation_stats, Mapping):
-        return "归档统计：未统计（可直接调 `conversation_search` 查 fact/estimate/model_assumption/opinion/question/decision/todo 卡片）。"
+        return "归档统计：未统计（仅在团队记忆开启时可用 `conversation_search` 查 fact/estimate/model_assumption/opinion/question/decision/todo 卡片）。"
 
     total = int(conversation_stats.get("total_cards") or 0)
     min_date = str(conversation_stats.get("min_date") or "").strip()
@@ -308,7 +309,7 @@ def _build_data_map_lines(
 ) -> list[str]:
     lines: list[str] = [
         "## Dalton 数据地图",
-        "**下结论前先对照地图**：说“证据不足/无法确定”前，先对照本图看还有哪些相关来源没查；问到公司或主题时，先用 `conversation_search` 查团队以前的观点、假设和决定，并在答案里说明与之前看法相比有什么变化。",
+        f"**下结论前先对照地图**：说“证据不足/无法确定”前，先对照本图看还有哪些相关来源没查{_TEAM_MEMORY_PRINCIPLE_CLAUSE}。",
         "### 1. 直接工具与对话归档",
     ]
 
@@ -627,8 +628,14 @@ def resolve_prompt_data_map(*, team_memory_enabled: bool | None = None) -> str:
         if team_memory_enabled is not None:
             return _apply_team_memory_filter(current, team_memory_enabled)
         return current
+    if team_memory_enabled is None:
+        from src.dalton.settings import get_dalton_settings
+
+        effective = bool(get_dalton_settings().conversations.enabled)
+    else:
+        effective = bool(team_memory_enabled)
     return render_static_data_map_markdown(
         search_api=None,
         x_search_enabled=_configured_x_search_enabled(),
-        team_memory_enabled=bool(team_memory_enabled),
+        team_memory_enabled=effective,
     )
