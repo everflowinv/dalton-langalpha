@@ -26,6 +26,7 @@ FIELDS = ('fresh', 'cw', 'cr', 'out')
 DALTON_PROD_CHANNEL = 'Dalton 生产（订阅）'
 DEFAULT_AGY_ENUM_NAMES_FILE = Path(__file__).resolve().parent.parent / 'references' / 'agy_enum_names.json'
 DEFAULT_ANTIGRAVITY_SERIES_FILE = Path(__file__).resolve().parent.parent / 'references' / 'antigravity_series.json'
+USAGE_SOURCES_SERIES_API_VERSION = 2
 _FALLBACK_REASONING_LEVELS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
 OPENCLAW_SOURCE_KINDS = frozenset({
     'rollout-openclaw',
@@ -606,25 +607,10 @@ def scan_dalton_prod(e, *, window_days=None, window_since=None, window_until=Non
         if not any(v):
             continue
         date_str = str(row.get('date') or '').strip()[:10]
-        pricing_provider = str(row.get('pricing_provider') or '').strip() or None
         ts = _dalton_bucket_timestamp(date_str, since_ts, until_ts)
-        if date_str:
-            ident = f'{window_tag}:{date_str}:{model_name}:{pricing_provider}:{idx}' if pricing_provider else f'{window_tag}:{date_str}:{model_name}:{idx}'
-        else:
-            ident = f'{window_tag}:{model_name}:{pricing_provider}:{idx}' if pricing_provider else f'{window_tag}:{model_name}'
+        ident = f'{window_tag}:{date_str}:{model_name}:{idx}' if date_str else f'{window_tag}:{model_name}'
         calls = int(row.get('calls') or 0)
         runs = int(row.get('runs') or 0)
-        put_meta = dict(
-            unit='model-invocation',
-            date=date_str or None,
-            calls=calls if calls > 0 else 1,
-            runs=runs,
-            window_days=window_days,
-            dalton_prod=True,
-            strip_oauth=True,
-        )
-        if pricing_provider is not None:
-            put_meta['pricing_provider'] = pricing_provider
         e.put(
             'dalton-prod',
             ident,
@@ -633,7 +619,13 @@ def scan_dalton_prod(e, *, window_days=None, window_since=None, window_until=Non
             model_name,
             DALTON_PROD_CHANNEL,
             v,
-            **put_meta,
+            unit='model-invocation',
+            date=date_str or None,
+            calls=calls if calls > 0 else 1,
+            runs=runs,
+            window_days=window_days,
+            dalton_prod=True,
+            strip_oauth=True,
         )
 
     totals = payload.get('totals') or {}
@@ -865,7 +857,7 @@ def reconcile(e):
             e.stats['claude_gateway_message_reconciled']+=len(partial)
             if summed(partial)==tuple(g['v']):
                 active[g['id']]['meta']['billing_parts']=[list(r['v']) for r in partial]
-    enum_models=collections.defaultdict(set); enum_efforts=collections.defaultdict(set); used_agy=set(); mapped_gw={}
+    enum_models=collections.defaultdict(set); enum_efforts=collections.defaultdict(set); used_agy=set(); mapped_gw={}; pending_gw_efforts={}
     for rows in agy.values():
         for r in rows:
             if not r['model'].startswith('agy-enum-'):
@@ -899,15 +891,10 @@ def reconcile(e):
             gw_base = normalize_variant_model(g['model'])
             for r in subset:
                 active[r['id']]['source']='openclaw'
+                if gw_effort and not active[r['id']]['meta'].get('effort'):
+                    pending_gw_efforts[r['id']] = (gw_base, gw_effort)
                 if r['model'].startswith('agy-enum-'):
-                    known_for_enum = enum_models.get(r['meta']['enum'], set())
-                    if gw_effort and not active[r['id']]['meta'].get('effort') and (not known_for_enum or known_for_enum == {gw_base}):
-                        active[r['id']]['meta']['effort'] = gw_effort
                     enum_models[r['meta']['enum']].add(gw_base)
-                else:
-                    r_base = normalize_variant_model(r['model'])
-                    if gw_effort and not active[r['id']]['meta'].get('effort') and r_base == gw_base:
-                        active[r['id']]['meta']['effort'] = gw_effort
         else:
             # A gateway request whose DB evidence overlaps in time but cannot be
             # reconciled must not be added on top of those DB observations.
@@ -941,6 +928,13 @@ def reconcile(e):
                 if eff:
                     r['meta']['effort'] = eff
             r['model']=normalize_variant_model(r['model'])
+    # Copy gateway effort only after final model/series is resolved; never copy across conflicting or unknown series.
+    for rid, (gw_base, gw_effort) in pending_gw_efforts.items():
+        r = active.get(rid)
+        if r is None or r['meta'].get('effort') or r['model'].startswith('agy-enum-'):
+            continue
+        if normalize_variant_model(r['model']) == gw_base:
+            r['meta']['effort'] = gw_effort
     # Gateway response UUID embeds the logged short request UUID. Match identity
     # plus completion-time neighborhood; never match token sizes alone.
     message_covered=set()

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import datetime
-from decimal import Decimal
 import importlib.util
 import json
 import os
@@ -51,32 +50,32 @@ def resolve_workspace_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+REQUIRED_USAGE_SOURCES_SERIES_API_VERSION = 2
+
+
 def _sibling_skill_scripts_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "skills" / "model-usage-cost" / "scripts"
 
 
 def _skill_scripts_dir() -> Path:
-    """Resolve helper scripts dir, preferring the sibling copy matching this script's version."""
-    sibling = _sibling_skill_scripts_dir()
-    if (sibling / "usage_sources.py").is_file() and (sibling / "usage_state.py").is_file():
-        return sibling
-    workspace_dir = resolve_workspace_dir()
-    candidate = workspace_dir / "skills" / "model-usage-cost" / "scripts"
-    if (candidate / "usage_sources.py").is_file() or (candidate / "usage_state.py").is_file():
-        return candidate
-    return sibling
+    """Resolve helper scripts dir strictly from the sibling directory matching this script."""
+    return _sibling_skill_scripts_dir()
 
 
 def _load_required_usage_sources(scripts_dir: Path) -> Any:
-    """Load ``usage_sources.py`` from ``scripts_dir`` and validate required series helpers."""
+    """Load sibling ``usage_sources.py`` only and enforce exact series API version match."""
     required = (
         "load_antigravity_series_module",
         "load_antigravity_series_catalog",
+        "build_antigravity_series_from_overlays",
         "_parse_antigravity_key",
     )
     target = scripts_dir / "usage_sources.py"
     if not target.is_file():
-        raise RuntimeError(f"找不到匹配版本的 usage_sources.py：{target}")
+        raise RuntimeError(
+            f"找不到同目录匹配版本的 usage_sources.py（期望路径：{target}）；"
+            "本脚本不会回退到其他目录的旧模块，请先运行 scripts/dalton/seed_openclaw_data.sh --apply 同步技能目录，或从完整仓库目录运行。"
+        )
     existing = sys.modules.get("usage_sources")
     if existing is not None:
         existing_file = getattr(existing, "__file__", None)
@@ -96,9 +95,16 @@ def _load_required_usage_sources(scripts_dir: Path) -> Any:
         sys.modules["usage_sources"] = mod
         spec.loader.exec_module(mod)
     missing = [attr for attr in required if not hasattr(mod, attr)]
-    if missing:
+    raw_ver = getattr(mod, "USAGE_SOURCES_SERIES_API_VERSION", 0)
+    ver = int(raw_ver) if isinstance(raw_ver, int) and not isinstance(raw_ver, bool) else 0
+    if missing or ver < REQUIRED_USAGE_SOURCES_SERIES_API_VERSION:
+        details: list[str] = []
+        if ver < REQUIRED_USAGE_SOURCES_SERIES_API_VERSION:
+            details.append(f"版本为 {ver}，要求 >= {REQUIRED_USAGE_SOURCES_SERIES_API_VERSION}")
+        if missing:
+            details.append(f"缺少 {', '.join(missing)}")
         raise RuntimeError(
-            f"usage_sources.py 版本不匹配（{target} 缺少 {', '.join(missing)}）；"
+            f"usage_sources.py 版本不匹配（{target}：{'；'.join(details)}）；"
             "请先运行 scripts/dalton/seed_openclaw_data.sh --apply 同步技能目录，或从新版仓库直接运行。"
         )
     return mod
@@ -127,35 +133,6 @@ def resolve_state_dir() -> Path:
     return resolve_usage_state_dir()
 
 
-def _to_decimal(val: Any) -> Decimal | None:
-    if val is None or isinstance(val, bool):
-        return None
-    if isinstance(val, Decimal):
-        return val
-    return Decimal(str(val))
-
-
-def _decimal_str(val: Decimal) -> str:
-    norm = val.normalize()
-    return "0" if norm == 0 else format(norm, "f")
-
-
-def _row_cost_decimal(row: dict[str, Any]) -> Decimal | None:
-    if row.get("cost_usd") is None:
-        return None
-    if row.get("cost_usd_exact") is not None:
-        return _to_decimal(row["cost_usd_exact"])
-    return _to_decimal(row["cost_usd"])
-
-
-def _row_ref_cost_decimal(row: dict[str, Any]) -> Decimal | None:
-    if row.get("reference_cost_usd") is None:
-        return None
-    if row.get("reference_cost_usd_exact") is not None:
-        return _to_decimal(row["reference_cost_usd_exact"])
-    return _to_decimal(row["reference_cost_usd"])
-
-
 def format_tokens(n: int) -> str:
     """格式化 Token 数量（B/M/K）。"""
     if abs(n) >= 1_000_000_000:
@@ -167,12 +144,11 @@ def format_tokens(n: int) -> str:
     return str(n)
 
 
-def format_usd(val: float | Decimal | None) -> str:
-    """格式化美元金额（仅在最终展示时按精确十进制舍入一次）。"""
+def format_usd(val: float | None) -> str:
+    """格式化美元金额。"""
     if val is None:
         return "无公开价"
-    dec = val if isinstance(val, Decimal) else Decimal(str(val))
-    return f"${dec:,.2f}"
+    return f"${val:,.2f}"
 
 
 def normalize_provider(prov_str: str, model: str = "") -> str:
@@ -320,15 +296,6 @@ def _match_antigravity_series(
             }
         return info, None
 
-    # When the backend explicitly reports `pricing_provider`, only rows genuinely served
-    # by built-in `antigravity-oauth` may enter an Antigravity series. User BYOK custom
-    # models shadowing built-in keys (e.g. `pricing_provider="my-byok"`) and historical
-    # unknown-origin DB rows (`pricing_provider="unknown"`) MUST stay independent.
-    raw_pp = row.get("pricing_provider")
-    if isinstance(raw_pp, str) and raw_pp.strip():
-        if raw_pp.strip() != "antigravity-oauth":
-            return None, None
-
     model = str(row.get("model") or "").strip()
     if not model:
         return None, None
@@ -386,11 +353,9 @@ def _empty_effort_bucket(bucket_name: str) -> dict[str, Any]:
         "total_tokens": 0,
         "prompt_tokens": 0,
         "cost_usd": None,
-        "_cost_dec": None,
         "unpriced_tokens": 0,
         "no_public_price": False,
         "reference_cost_usd": None,
-        "_ref_cost_dec": None,
         "reference_model": None,
         "price_note": None,
     }
@@ -415,47 +380,63 @@ def _accumulate_bucket_fields(
     bucket["total_tokens"] += total_tokens
     bucket["prompt_tokens"] += prompt_tokens
     bucket["unpriced_tokens"] += unpriced_tokens
-    c_dec = _row_cost_decimal(src)
-    if c_dec is not None:
-        bucket["_cost_dec"] = (bucket["_cost_dec"] or Decimal(0)) + c_dec
+    if src.get("cost_usd") is not None:
+        bucket["cost_usd"] = (bucket["cost_usd"] or 0.0) + float(src["cost_usd"])
     if src.get("no_public_price"):
         bucket["no_public_price"] = True
-    ref_dec = _row_ref_cost_decimal(src)
-    if ref_dec is not None:
-        bucket["_ref_cost_dec"] = (bucket["_ref_cost_dec"] or Decimal(0)) + ref_dec
+    if src.get("reference_cost_usd") is not None:
+        bucket["reference_cost_usd"] = (bucket["reference_cost_usd"] or 0.0) + float(src["reference_cost_usd"])
     if src.get("reference_model") and not bucket["reference_model"]:
         bucket["reference_model"] = src["reference_model"]
     if src.get("price_note") and not bucket["price_note"]:
         bucket["price_note"] = src["price_note"]
 
 
-def _finalize_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
-    cost_dec: Decimal | None = bucket.pop("_cost_dec", None)
-    ref_dec: Decimal | None = bucket.pop("_ref_cost_dec", None)
-    if cost_dec is not None:
-        bucket["cost_usd"] = float(cost_dec)
-        bucket["cost_usd_exact"] = _decimal_str(cost_dec)
-    else:
-        bucket["cost_usd"] = None
-        bucket.pop("cost_usd_exact", None)
-    if ref_dec is not None:
-        bucket["reference_cost_usd"] = float(ref_dec)
-        bucket["reference_cost_usd_exact"] = _decimal_str(ref_dec)
-    else:
-        bucket["reference_cost_usd"] = None
-        bucket.pop("reference_cost_usd_exact", None)
-    return bucket
-
-
 def _order_effort_breakdown(breakdown: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     ordered: dict[str, dict[str, Any]] = {}
     for key in EFFORT_BUCKET_ORDER:
         if key in breakdown:
-            ordered[key] = _finalize_bucket(breakdown[key])
+            ordered[key] = breakdown[key]
     for key in sorted(breakdown):
         if key not in ordered:
-            ordered[key] = _finalize_bucket(breakdown[key])
+            ordered[key] = breakdown[key]
     return ordered
+
+
+def _legacy_merge_rows_by_model(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """原版按 `(norm_provider, model)` 合并路径，仅用于产出与旧版完全一致的合计数字。"""
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for r in rows:
+        key = (r["norm_provider"], r["model"])
+        m = merged.get(key)
+        if m is None:
+            m = merged[key] = {
+                "norm_provider": r["norm_provider"],
+                "model": r["model"],
+                "records": 0,
+                "calls": 0,
+                "runs": 0,
+                "fresh": 0,
+                "cache_write": 0,
+                "cache_read": 0,
+                "output": 0,
+                "total_tokens": 0,
+                "prompt_tokens": 0,
+                "cost_usd": None,
+                "unpriced_tokens": 0,
+                "estimated_split_records": 0,
+            }
+        m["records"] += _row_record_count(r)
+        for field in ("calls", "fresh", "cache_write", "cache_read", "output", "total_tokens", "prompt_tokens"):
+            m[field] += int(r.get(field) or 0)
+        m["runs"] += int(r.get("runs") or 0)
+        m["estimated_split_records"] += int(r.get("estimated_split_records") or 0)
+        m["unpriced_tokens"] += int(
+            r.get("unpriced_tokens", r["total_tokens"] if r.get("cost_usd") is None else 0)
+        )
+        if r.get("cost_usd") is not None:
+            m["cost_usd"] = (m["cost_usd"] or 0.0) + float(r["cost_usd"])
+    return list(merged.values())
 
 
 def merge_rows_by_model(
@@ -470,7 +451,7 @@ def merge_rows_by_model(
     else:
         resolved_index = series_index
 
-    merged: dict[tuple[str, ...], dict[str, Any]] = {}
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
     for r in rows:
         fresh = int(r.get("fresh") or 0)
         cw = int(r.get("cache_write") or 0)
@@ -486,7 +467,7 @@ def merge_rows_by_model(
         series_info, matched_effort = _match_antigravity_series(r, resolved_index)
         if series_info is not None:
             norm_provider = _series_norm_provider(series_info)
-            key: tuple[str, ...] = (norm_provider, series_info["series_id"])
+            key = (norm_provider, series_info["series_id"])
             display_model = series_info["report_display_name"]
         else:
             norm_provider = r.get("norm_provider") or normalize_provider(
@@ -512,21 +493,17 @@ def merge_rows_by_model(
                 "total_tokens": 0,
                 "prompt_tokens": 0,
                 "cost_usd": None,
-                "_cost_dec": None,
                 "unpriced_tokens": 0,
                 "estimated_split_records": 0,
                 "units": {},
                 "no_public_price": False,
                 "reference_cost_usd": None,
-                "_ref_cost_dec": None,
                 "reference_model": None,
                 "price_note": None,
             }
             if series_info is not None:
                 m["series_id"] = series_info["series_id"]
                 m["effort_breakdown"] = {}
-            elif isinstance(r.get("pricing_provider"), str) and r["pricing_provider"].strip():
-                m["pricing_provider"] = r["pricing_provider"].strip()
 
         row_providers = (
             r["providers"]
@@ -556,14 +533,12 @@ def merge_rows_by_model(
         m["prompt_tokens"] += prompt_tokens
         m["estimated_split_records"] += int(r.get("estimated_split_records") or 0)
         m["unpriced_tokens"] += unpriced_tokens
-        c_dec = _row_cost_decimal(r)
-        if c_dec is not None:
-            m["_cost_dec"] = (m["_cost_dec"] or Decimal(0)) + c_dec
+        if r.get("cost_usd") is not None:
+            m["cost_usd"] = (m["cost_usd"] or 0.0) + float(r["cost_usd"])
         if r.get("no_public_price"):
             m["no_public_price"] = True
-        ref_dec = _row_ref_cost_decimal(r)
-        if ref_dec is not None:
-            m["_ref_cost_dec"] = (m["_ref_cost_dec"] or Decimal(0)) + ref_dec
+        if r.get("reference_cost_usd") is not None:
+            m["reference_cost_usd"] = (m["reference_cost_usd"] or 0.0) + float(r["reference_cost_usd"])
         if r.get("reference_model") and not m["reference_model"]:
             m["reference_model"] = r["reference_model"]
         if r.get("price_note") and not m["price_note"]:
@@ -611,37 +586,23 @@ def merge_rows_by_model(
     for m in merged.values():
         m["provider"] = "+".join(m["providers"])
         m["source"] = "|".join(m["sources"])
-        cost_dec: Decimal | None = m.pop("_cost_dec", None)
-        ref_dec_tot: Decimal | None = m.pop("_ref_cost_dec", None)
-        if cost_dec is not None:
-            m["cost_usd"] = float(cost_dec)
-            m["cost_usd_exact"] = _decimal_str(cost_dec)
-        if ref_dec_tot is not None:
-            m["reference_cost_usd"] = float(ref_dec_tot)
-            m["reference_cost_usd_exact"] = _decimal_str(ref_dec_tot)
         if "effort_breakdown" in m:
             m["effort_breakdown"] = _order_effort_breakdown(m["effort_breakdown"])
     return list(merged.values())
 
 
 def fetch_usage_data(days: int = 7, as_of: str | None = None) -> dict[str, Any]:
-    """通过 model-usage-cost skill 获取过去 N 天的汇总数据。"""
+    """通过同目录 model-usage-cost skill 获取过去 N 天的汇总数据。"""
     sibling_dir = _sibling_skill_scripts_dir()
     cli_py = sibling_dir / "model_usage_cost_cli.py"
     run_sh = sibling_dir / "run.sh"
-    if not cli_py.is_file():
-        workspace_dir = resolve_workspace_dir()
-        skill_dir = workspace_dir / "skills" / "model-usage-cost" / "scripts"
-        if (skill_dir / "model_usage_cost_cli.py").is_file():
-            cli_py = skill_dir / "model_usage_cost_cli.py"
-            run_sh = skill_dir / "run.sh"
 
     if cli_py.is_file():
         cmd = [sys.executable, str(cli_py), "--json", "summary", "--days", str(days), "--by-model"]
     elif run_sh.is_file():
         cmd = ["bash", str(run_sh), "--json", "summary", "--days", str(days), "--by-model"]
     else:
-        raise FileNotFoundError("找不到 model-usage-cost 统计脚本")
+        raise FileNotFoundError(f"找不到同目录的 model-usage-cost 统计脚本：{sibling_dir}")
 
     if as_of:
         cmd += ["--as-of", as_of]
@@ -663,7 +624,7 @@ def _summarize_bucket(bucket_rows: list[dict[str, Any]]) -> dict[str, Any]:
     out = sum(int(r.get("output") or 0) for r in bucket_rows)
     tokens = fresh + cw + cr + out
     prompt = fresh + cw + cr
-    cost_dec = sum((c for c in (_row_cost_decimal(r) for r in bucket_rows) if c is not None), Decimal(0))
+    cost = sum(float(r["cost_usd"]) for r in bucket_rows if r.get("cost_usd") is not None)
     unpriced = sum(int(r.get("unpriced_tokens", tokens if r.get("cost_usd") is None else 0)) for r in bucket_rows)
     if not any("unpriced_tokens" in r for r in bucket_rows):
         unpriced = sum(
@@ -680,7 +641,7 @@ def _summarize_bucket(bucket_rows: list[dict[str, Any]]) -> dict[str, Any]:
         "output": out,
         "tokens": tokens,
         "prompt": prompt,
-        "cost": float(cost_dec),
+        "cost": cost,
         "unpriced_tokens": unpriced,
         "records": records,
         "calls": calls,
@@ -711,10 +672,6 @@ def process_usage_stats(raw_data: dict[str, Any]) -> dict[str, Any]:
     dalton_raw = [r for r in raw_rows if _is_dalton_prod_row(r)]
     local_bucket = _summarize_bucket(local_raw)
     dalton_bucket = _summarize_bucket(dalton_raw)
-    total_cost_dec = sum(
-        (c for c in (_row_cost_decimal(r) for r in raw_rows) if c is not None),
-        Decimal(0),
-    )
 
     dalton_prod = raw_data.get("dalton_prod")
     if dalton_prod is None:
@@ -730,21 +687,20 @@ def process_usage_stats(raw_data: dict[str, Any]) -> dict[str, Any]:
     dalton_bucket["runs"] = int(dalton_prod.get("runs") or 0)
     dalton_bucket["api_calls"] = int(dalton_prod.get("calls") or dalton_bucket["calls"])
 
-    series_index = build_series_index(resolve_antigravity_series(raw_data))
-    rows = merge_rows_by_model(raw_rows, series_index)
-    rows_by_tokens = sorted(rows, key=lambda x: -x["total_tokens"])
-
-    total_fresh = sum(r["fresh"] for r in rows)
-    total_cw = sum(r["cache_write"] for r in rows)
-    total_cr = sum(r["cache_read"] for r in rows)
-    total_out = sum(r["output"] for r in rows)
+    # 所有合计字段严格沿用旧版未按系列合并的累加路径，保证与旧版逐字段完全相等；
+    # 系列合并与档位明细仅用于展示分组，不回写合计。
+    legacy_rows = _legacy_merge_rows_by_model(raw_rows)
+    total_fresh = sum(r["fresh"] for r in legacy_rows)
+    total_cw = sum(r["cache_write"] for r in legacy_rows)
+    total_cr = sum(r["cache_read"] for r in legacy_rows)
+    total_out = sum(r["output"] for r in legacy_rows)
     total_tokens = total_fresh + total_cw + total_cr + total_out
     total_prompt = total_fresh + total_cw + total_cr
-    total_records = sum(r["records"] for r in rows)
-    total_calls = sum(r["calls"] for r in rows)
-    total_cost = float(total_cost_dec)
-    unpriced_tokens = sum(r["unpriced_tokens"] for r in rows)
-    estimated_split_records = sum(r["estimated_split_records"] for r in rows)
+    total_records = sum(r["records"] for r in legacy_rows)
+    total_calls = sum(r["calls"] for r in legacy_rows)
+    total_cost = sum((r["cost_usd"] or 0.0) for r in legacy_rows)
+    unpriced_tokens = sum(r["unpriced_tokens"] for r in legacy_rows)
+    estimated_split_records = sum(r["estimated_split_records"] for r in legacy_rows)
     cache_hit_rate = (total_cr / total_prompt * 100) if total_prompt > 0 else 0.0
 
     expected = window.get("totals")
@@ -753,31 +709,28 @@ def process_usage_stats(raw_data: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("周报聚合与计量总表不一致")
         if expected.get("calls") is not None and total_calls != int(expected["calls"]):
             raise ValueError("周报调用次数与计量总表不一致")
-        expected_cost_dec = _to_decimal(expected.get("priced_cost_usd_exact"))
-        if expected_cost_dec is None:
-            expected_cost_dec = _to_decimal(expected["priced_cost_usd"]) or Decimal(0)
-        if abs(total_cost_dec - expected_cost_dec) > Decimal("0.0001") or unpriced_tokens != expected["unpriced_tokens"]:
+        if abs(total_cost - expected["priced_cost_usd"]) > 0.0001 or unpriced_tokens != expected["unpriced_tokens"]:
             raise ValueError("周报价格聚合与计量总表不一致")
+
+    series_index = build_series_index(resolve_antigravity_series(raw_data))
+    rows = merge_rows_by_model(raw_rows, series_index)
+    rows_by_tokens = sorted(rows, key=lambda x: -x["total_tokens"])
 
     prov_rollup: dict[str, dict[str, Any]] = {}
     for r in rows:
         p_name = r["norm_provider"]
-        entry = prov_rollup.setdefault(p_name, {"cost_dec": Decimal(0), "tokens": 0, "calls": 0, "unpriced_tokens": 0})
-        r_cost = _row_cost_decimal(r)
-        if r_cost is not None:
-            entry["cost_dec"] += r_cost
+        entry = prov_rollup.setdefault(p_name, {"cost": 0.0, "tokens": 0, "calls": 0, "unpriced_tokens": 0})
+        entry["cost"] += r["cost_usd"] or 0.0
         entry["tokens"] += r["total_tokens"]
         entry["calls"] += r["calls"]
         entry["unpriced_tokens"] += r["unpriced_tokens"]
 
     prov_list = []
     for p_name, p_data in prov_rollup.items():
-        p_cost_dec: Decimal = p_data["cost_dec"]
-        p_cost = float(p_cost_dec)
         prov_list.append({
             "provider": p_name,
-            "cost": p_cost,
-            "cost_pct": (float(p_cost_dec / total_cost_dec * 100)) if total_cost_dec > 0 else 0.0,
+            "cost": p_data["cost"],
+            "cost_pct": (p_data["cost"] / total_cost * 100) if total_cost > 0 else 0.0,
             "tokens": p_data["tokens"],
             "tokens_pct": (p_data["tokens"] / total_tokens * 100) if total_tokens > 0 else 0.0,
             "calls": p_data["calls"],
@@ -789,13 +742,12 @@ def process_usage_stats(raw_data: dict[str, Any]) -> dict[str, Any]:
     for idx, r in enumerate(top10, 1):
         r["rank"] = idx
         r["token_pct"] = (r["total_tokens"] / total_tokens * 100) if total_tokens > 0 else 0.0
-        c_dec = _row_cost_decimal(r)
-        r["cost_pct"] = (float(c_dec / total_cost_dec * 100)) if (c_dec is not None and total_cost_dec > 0) else 0.0
+        c = r["cost_usd"]
+        r["cost_pct"] = (c / total_cost * 100) if (c is not None and total_cost > 0) else 0.0
 
     tail = rows_by_tokens[10:]
     tail_tokens = sum(r["total_tokens"] for r in tail)
-    tail_cost_dec = sum((c for c in (_row_cost_decimal(r) for r in tail) if c is not None), Decimal(0))
-    tail_cost = float(tail_cost_dec)
+    tail_cost = sum((r["cost_usd"] or 0.0) for r in tail)
     tail_calls = sum(r["calls"] for r in tail)
 
     unpriced_models = [
@@ -1010,15 +962,15 @@ def _format_effort_breakdown_line(effort_breakdown: dict[str, Any] | None) -> st
         label = UNKNOWN_EFFORT_LABEL if bk == UNKNOWN_EFFORT_BUCKET else bk
         tok_str = format_tokens(int(bv.get("total_tokens") or 0))
         calls = int(bv.get("calls") or 0)
-        cost_dec = _row_cost_decimal(bv)
+        cost_val = bv.get("cost_usd")
         unpriced = int(bv.get("unpriced_tokens") or 0)
-        ref_dec = _row_ref_cost_decimal(bv)
-        if cost_dec is not None:
-            cost_part = format_usd(cost_dec)
+        ref_cost = bv.get("reference_cost_usd")
+        if cost_val is not None:
+            cost_part = format_usd(float(cost_val))
             if unpriced > 0:
                 cost_part += f"，另 {format_tokens(unpriced)} 无公开价"
-        elif ref_dec is not None:
-            cost_part = f"无公开价，参考 {format_usd(ref_dec)}"
+        elif ref_cost is not None:
+            cost_part = f"无公开价，参考 {format_usd(float(ref_cost))}"
         else:
             cost_part = "无公开价"
         parts.append(f"{label} {tok_str} ({calls:,} 次, {cost_part})")

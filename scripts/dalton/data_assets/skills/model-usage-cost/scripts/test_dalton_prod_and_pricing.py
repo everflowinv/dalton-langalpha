@@ -531,6 +531,111 @@ class TestDaltonProdAndPricing(unittest.TestCase):
         self.assertEqual(by_id["agy:resp-carbon-2"]["model"], "gemini-4-carbon")
         self.assertEqual(by_id["agy:resp-carbon-2"]["meta"].get("effort"), "medium")
 
+    def test_reconcile_defers_gateway_effort_until_final_enum_resolution_rejects_cross_series(self):
+        import sqlite3
+        from test_usage_accounting import pb, iso, write
+
+        now = dt.datetime(2026, 11, 20, 12, 0, tzinfo=s.UTC).timestamp()
+
+        # Two agy-db files with NO gen_metadata referencing enum 1417 (maps to gemini-4-argon in agy_enum_names.json)
+        db1 = self.tmp / "conv_enum1417_a.db"
+        c1 = sqlite3.connect(db1)
+        c1.execute("CREATE TABLE steps(idx INTEGER, metadata BLOB)")
+        u1 = pb([(1, 1417), (2, 100_000), (3, 10_000), (5, 20_000), (11, b"resp-1417-a")])
+        c1.execute("INSERT INTO steps VALUES (1, ?)", (pb([(8, pb([(1, int(now - 200))])), (9, u1)]),))
+        c1.commit()
+        c1.close()
+
+        db2 = self.tmp / "conv_enum1417_b.db"
+        c2 = sqlite3.connect(db2)
+        c2.execute("CREATE TABLE steps(idx INTEGER, metadata BLOB)")
+        u2 = pb([(1, 1417), (2, 80_000), (3, 8_000), (5, 10_000), (11, b"resp-1417-b")])
+        c2.execute("INSERT INTO steps VALUES (1, ?)", (pb([(8, pb([(1, int(now - 100))])), (9, u2)]),))
+        c2.commit()
+        c2.close()
+
+        # Third agy-db with unknown enum 1999 (stays agy-enum-1999 when conflicting gateways exist)
+        db3 = self.tmp / "conv_enum1999_a.db"
+        c3 = sqlite3.connect(db3)
+        c3.execute("CREATE TABLE steps(idx INTEGER, metadata BLOB)")
+        u3 = pb([(1, 1999), (2, 50_000), (3, 5_000), (5, 0), (11, b"resp-1999-a")])
+        c3.execute("INSERT INTO steps VALUES (1, ?)", (pb([(8, pb([(1, int(now - 60))])), (9, u3)]),))
+        c3.commit()
+        c3.close()
+
+        db4 = self.tmp / "conv_enum1999_b.db"
+        c4 = sqlite3.connect(db4)
+        c4.execute("CREATE TABLE steps(idx INTEGER, metadata BLOB)")
+        u4 = pb([(1, 1999), (2, 60_000), (3, 6_000), (5, 0), (11, b"resp-1999-b")])
+        c4.execute("INSERT INTO steps VALUES (1, ?)", (pb([(8, pb([(1, int(now - 30))])), (9, u4)]),))
+        c4.commit()
+        c4.close()
+
+        # Legacy gateway logs WITHOUT conversationId:
+        # enum 1417 gets conflicting Neon high & Carbon medium -> agy_enum_names resolves both to gemini-4-argon
+        # enum 1999 gets conflicting Neon high & Carbon low -> stays unresolved agy-enum-1999
+        gw_log = self.tmp / "antigravity-cli-gateway.stdout.log"
+        write(
+            gw_log,
+            [
+                {"event": "start", "request": "r-a", "model": "gemini-4-neon-high", "ts": iso(now - 205)},
+                {
+                    "event": "done",
+                    "request": "r-a",
+                    "model": "gemini-4-neon-high",
+                    "ts": iso(now - 200),
+                    "usage_raw": {"input_tokens": 100_000, "cache_write_tokens": 0, "cache_read_tokens": 20_000, "output_tokens": 10_000},
+                },
+                {"event": "start", "request": "r-b", "model": "gemini-4-carbon-medium", "ts": iso(now - 105)},
+                {
+                    "event": "done",
+                    "request": "r-b",
+                    "model": "gemini-4-carbon-medium",
+                    "ts": iso(now - 100),
+                    "usage_raw": {"input_tokens": 80_000, "cache_write_tokens": 0, "cache_read_tokens": 10_000, "output_tokens": 8_000},
+                },
+                {"event": "start", "request": "r-c", "model": "gemini-4-neon-high", "ts": iso(now - 65)},
+                {
+                    "event": "done",
+                    "request": "r-c",
+                    "model": "gemini-4-neon-high",
+                    "ts": iso(now - 60),
+                    "usage_raw": {"input_tokens": 50_000, "cache_write_tokens": 0, "cache_read_tokens": 0, "output_tokens": 5_000},
+                },
+                {"event": "start", "request": "r-d", "model": "gemini-4-carbon-low", "ts": iso(now - 35)},
+                {
+                    "event": "done",
+                    "request": "r-d",
+                    "model": "gemini-4-carbon-low",
+                    "ts": iso(now - 30),
+                    "usage_raw": {"input_tokens": 60_000, "cache_write_tokens": 0, "cache_read_tokens": 0, "output_tokens": 6_000},
+                },
+            ],
+            prefix="[AGYGW] ",
+        )
+
+        roots = {k: [] for k in s.ROOTS}
+        roots["agy-db"] = [str(db1), str(db2), str(db3), str(db4)]
+        roots["agy-gateway"] = [str(gw_log)]
+        e = s.Evidence(now - 86400, now)
+        with patch.object(s, "ROOTS", roots):
+            s.scan_agy(e)
+            s.scan_gateway(e, "agy-gateway", cli.DEFAULT_SPLIT)
+
+        records, held = s.reconcile(e)
+        self.assertEqual(held, [])
+        by_id = {r["id"]: r for r in records}
+        # Argon records MUST NOT retain Neon's high or Carbon's medium
+        self.assertEqual(by_id["agy:resp-1417-a"]["model"], "gemini-4-argon")
+        self.assertIsNone(by_id["agy:resp-1417-a"]["meta"].get("effort"))
+        self.assertEqual(by_id["agy:resp-1417-b"]["model"], "gemini-4-argon")
+        self.assertIsNone(by_id["agy:resp-1417-b"]["meta"].get("effort"))
+        # Unresolved agy-enum-1999 MUST NOT retain Neon's high or Carbon's low
+        self.assertEqual(by_id["agy:resp-1999-a"]["model"], "agy-enum-1999")
+        self.assertIsNone(by_id["agy:resp-1999-a"]["meta"].get("effort"))
+        self.assertEqual(by_id["agy:resp-1999-b"]["model"], "agy-enum-1999")
+        self.assertIsNone(by_id["agy:resp-1999-b"]["meta"].get("effort"))
+
     def test_summary_json_includes_antigravity_series_from_dalton_prod_or_fallback(self):
         fake_home = self.tmp / "series-home"
         fake_home.mkdir()
