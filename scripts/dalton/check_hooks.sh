@@ -416,7 +416,9 @@ ALLOWED_HOOKS=(
   # and missing-config warnings / prompt guidance.
   "report-delivery"
   # Notification turns without an explicit model inherit the running automation
-  # execution's model in messaging.py without writing conversation_threads.llm_model.
+  # execution's model in messaging.py; automation executor turns persist their
+  # actual model onto conversation_threads.llm_model on turn 0 when NULL and
+  # thread_strategy == 'new' (skipping fallback turns).
   "automation-thread-model"
   # Codex client version comes from src/dalton/settings.py (newer than the manifest's)
   # so the ChatGPT subscription lists new models (GPT-6.2 needs >= 0.170.0).
