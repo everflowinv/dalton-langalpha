@@ -264,11 +264,11 @@ async def _company_write_allowed(principal: Principal, automation_id: str) -> bo
     return True
 
 
-async def _model_pref_for_lock() -> dict[str, Any] | None:
+async def _model_pref_for_lock(*, force: bool = False) -> dict[str, Any] | None:
     """Load the company user's model preference before the row lock, when needed."""
     from src.server.services.claude_code.hosted import checks_automations
 
-    if not checks_automations():
+    if not force and not checks_automations():
         return None
     from src.server.services.llm import user_models
 
@@ -310,6 +310,10 @@ async def update_company_agent(
             model_pref=None,
             delivery_checked=False,
         )
+    except lifecycle.AutomationRefusal as exc:
+        if exc.field == "reasoning_effort":
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        raise
     except ValidationError as exc:
         raise HTTPException(
             status_code=422,
@@ -318,7 +322,12 @@ async def update_company_agent(
     if prepared is None:
         return None
 
-    pref_for_lock = await _model_pref_for_lock()
+    needs_effort_pref = (
+        "llm_model" in prepared.update.model_fields_set
+        or "reasoning_effort" in prepared.update.model_fields_set
+        or prepared.current.get("reasoning_effort") is not None
+    )
+    pref_for_lock = await _model_pref_for_lock(force=needs_effort_pref)
 
     async def _reconcile(
         locked_row: Mapping[str, Any],
@@ -353,18 +362,23 @@ async def update_company_agent(
         locked_row_reconciler=_reconcile,
         prelocked_pref_row={},
     ):
-        if prepared.update_kwargs:
+        try:
+            if prepared.update_kwargs:
+                return await auto_db.update_automation(
+                    automation_id,
+                    COMPANY_SYSTEM_USER_ID,
+                    conn=conn,
+                    **prepared.update_kwargs,
+                )
             return await auto_db.update_automation(
                 automation_id,
                 COMPANY_SYSTEM_USER_ID,
                 conn=conn,
-                **prepared.update_kwargs,
             )
-        return await auto_db.update_automation(
-            automation_id,
-            COMPANY_SYSTEM_USER_ID,
-            conn=conn,
-        )
+        except lifecycle.AutomationRefusal as exc:
+            if exc.field == "reasoning_effort":
+                raise HTTPException(status_code=422, detail=str(exc)) from None
+            raise
 
 
 async def pause_company_agent(

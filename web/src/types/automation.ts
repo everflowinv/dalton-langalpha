@@ -143,6 +143,8 @@ export interface Automation {
   /** Where it runs: Home's id for the Chief of Staff, else that workspace's. */
   workspace_id: string | null;
   llm_model: string | null;
+  // DALTON-HOOK(automation-effort): optional per-automation reasoning effort override
+  reasoning_effort?: string | null;
 
   thread_strategy: 'new' | 'continue';
   conversation_thread_id: string | null;
@@ -185,6 +187,8 @@ export interface AutomationPayload {
   workspace_id: string;
   // DALTON-HOOK(automation-model): optional per-automation model override (null clears override)
   llm_model?: string | null;
+  // DALTON-HOOK(automation-effort): optional per-automation reasoning effort override (null clears override)
+  reasoning_effort?: string | null;
   thread_strategy: Automation['thread_strategy'];
   max_failures: number;
   delivery_config: DeliveryConfig;

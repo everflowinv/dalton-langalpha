@@ -232,6 +232,7 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
         next_run_at: datetime | None = None,
         workspace_id: str | None = None,
         llm_model: str | None = None,
+        reasoning_effort: str | None = None,
         additional_context: list[dict[str, Any]] | None = None,
         thread_strategy: str = "new",
         conversation_thread_id: str | None = None,
@@ -254,6 +255,8 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
             "next_run_at": next_run_at,
             "workspace_id": workspace_id,
             "description": description,
+            "llm_model": llm_model,
+            "reasoning_effort": reasoning_effort,
             "metadata": metadata or {},
             "scope": scope,
             "created_by": created_by or user_id,
@@ -275,6 +278,8 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
         metadata: dict[str, Any] | None = None,
         status: str | None = None,
         scope: str | None = None,
+        llm_model: str | None = None,
+        reasoning_effort: str | None = None,
     ):
         for r in store:
             if r["automation_id"] == automation_id:

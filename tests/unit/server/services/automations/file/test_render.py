@@ -34,7 +34,7 @@ class TestFile:
         shown = json.loads(content)
         assert list(shown) == [
             "name", "description", "status", "trigger_type", "cron_expression", "timezone", "instruction",
-            "workspace_id", "thread", "llm_model", "delivery", "max_failures", "state",
+            "workspace_id", "thread", "llm_model", "reasoning_effort", "delivery", "max_failures", "state",  # DALTON-HOOK(automation-effort)
         ]
         assert content == json.dumps(shown, indent=2, ensure_ascii=False) + "\n"
 

@@ -528,3 +528,10 @@ web/src/hooks/__tests__/useOnboardingRoute.dalton.test.tsx
 web/src/pages/Setup/answers/__tests__/daltonSetup.test.ts
 web/src/pages/Setup/answers/daltonTeamModelsCheck.ts
 web/src/pages/Setup/answers/useTeamModelsAvailable.ts
+# Per-automation reasoning_effort (d042), Opus backfill ops script, and unit tests
+src/dalton/migrations/versions/d042_automation_reasoning_effort.py
+scripts/dalton/ops/backfill_opus_automation_effort.py
+tests/unit/dalton/test_d042_automation_reasoning_effort.py
+tests/unit/dalton/test_automation_reasoning_effort.py
+tests/unit/dalton/test_automation_effort_inheritance.py
+tests/unit/dalton/test_backfill_opus_automation_effort.py

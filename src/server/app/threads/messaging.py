@@ -783,11 +783,13 @@ async def _handle_send_message(
         # DALTON-HOOK(dalton-auth): reuse _is_service_request result (with >=32-char check) when Dalton auth is enabled
         # DALTON-HOOK(automation-thread-model): inherit automation execution's model for server notification turns with unservable fallback
         # DALTON-HOOK(automation-subscription-fallback): forward deferred flagged subscription and capture fallback notice metadata
+        # DALTON-HOOK(automation-effort): capture inherited automation execution & effort context for continuation run_meta
         from src.dalton.services.automation_thread_model import (
             resolve_turn_config_with_automation_inheritance,
         )
 
         fallback_records: list[dict[str, object]] = []
+        automation_run_ctx: dict[str, object] = {}
         config = await resolve_turn_config_with_automation_inheritance(
             user_id=user_id,
             thread_id=thread_id,
@@ -800,6 +802,7 @@ async def _handle_send_message(
             resolve=resolve,
             flagged_subscription=flagged_subscription,
             on_fallback=fallback_records.append,
+            on_automation_context=automation_run_ctx.update,
         )
 
         # is_byok is True only when the stamped credential_source confirms the user
@@ -904,7 +907,10 @@ async def _handle_send_message(
     }
 
     # DALTON-HOOK(colleague-dispatch): pass origin_channel, tail_turn_no_new_work, and workspace_owner_id into run metadata & configurable.
+    # DALTON-HOOK(automation-effort): propagate automation_source_execution_id (not scheduler firing automation_execution_id) and two-state effort to continuation/retry run_meta
     run_meta: dict[str, object] = {}
+    if automation_run_ctx:
+        run_meta.update(automation_run_ctx)
     # DALTON-HOOK(automation-subscription-fallback): record fallback notice on run row metadata
     if fallback_records:
         run_meta["subscription_fallback"] = fallback_records[0]
