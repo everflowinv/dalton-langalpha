@@ -214,9 +214,10 @@ async def build_ptc_graph(
         fetch_user_data_counts(user_id),
         _read_workspace_naming(conversation_id),
     )
-    # DALTON-HOOK(team-memory-toggle): resolve per-turn Team Memory switch from Postgres
+    # DALTON-HOOK(team-memory-toggle): resolve per-turn Team Memory switch from Postgres; data map follows deployment/tier availability only
+    from src.dalton.access_tiers import is_internal_tier
     from src.dalton.data_map import warm_turn_data_map
-    from src.dalton.settings import is_dalton_enabled  # DALTON-HOOK(research-writing)
+    from src.dalton.settings import get_dalton_settings, is_dalton_enabled  # DALTON-HOOK(research-writing)
     from src.dalton.sharing import resolve_turn_team_memory_enabled
 
     caller_tier: str | None = None
@@ -231,13 +232,17 @@ async def build_ptc_graph(
         user_id=user_id,
         user_tier=caller_tier,
     )
+    conversations_available = bool(
+        get_dalton_settings().conversations.enabled
+        and (caller_tier is None or is_internal_tier(caller_tier))
+    )
 
     # DALTON-HOOK(data-map): warm per-turn data map from Postgres daily cache (falls back to static unprobed map)
     # DALTON-HOOK(x-search-direct): the x_search line follows x_search.enabled.
     await warm_turn_data_map(
         search_api=getattr(config, "search_api", None),
         x_search_enabled=bool(getattr(config, "x_search_enabled", False)),
-        team_memory_enabled=team_memory_enabled,
+        team_memory_enabled=conversations_available,
     )
 
     inner_agent = ptc_agent.create_agent(
@@ -412,9 +417,10 @@ async def build_ptc_graph_with_session(
 
         caller_tier = await get_user_tier(user_id)
 
-    # DALTON-HOOK(team-memory-toggle): resolve per-turn Team Memory switch from Postgres
+    # DALTON-HOOK(team-memory-toggle): resolve per-turn Team Memory switch from Postgres; data map follows deployment/tier availability only
+    from src.dalton.access_tiers import is_internal_tier
     from src.dalton.data_map import warm_turn_data_map
-    from src.dalton.settings import is_dalton_enabled  # DALTON-HOOK(research-writing)
+    from src.dalton.settings import get_dalton_settings, is_dalton_enabled  # DALTON-HOOK(research-writing)
     from src.dalton.sharing import resolve_turn_team_memory_enabled
 
     team_memory_enabled = await resolve_turn_team_memory_enabled(
@@ -423,13 +429,17 @@ async def build_ptc_graph_with_session(
         user_id=user_id,
         user_tier=caller_tier,
     )
+    conversations_available = bool(
+        get_dalton_settings().conversations.enabled
+        and (caller_tier is None or is_internal_tier(caller_tier))
+    )
 
     # DALTON-HOOK(data-map): warm per-turn data map from Postgres daily cache (falls back to static unprobed map)
     # DALTON-HOOK(x-search-direct): the x_search line follows x_search.enabled.
     await warm_turn_data_map(
         search_api=getattr(config, "search_api", None),
         x_search_enabled=bool(getattr(config, "x_search_enabled", False)),
-        team_memory_enabled=team_memory_enabled,
+        team_memory_enabled=conversations_available,
     )
 
     inner_agent = ptc_agent.create_agent(

@@ -79,11 +79,17 @@ from .turn import (
     NON_CHANGE_ROW_KINDS,
     NOTICE_ROW_KINDS,
     SUBAGENTS_ROW_KIND,
+    TEAM_MEMORY_OFF_MARKER,  # DALTON-HOOK(team-memory-toggle)
+    TEAM_MEMORY_OFF_TEXT,  # DALTON-HOOK(team-memory-toggle)
+    TEAM_MEMORY_ON_MARKER,  # DALTON-HOOK(team-memory-toggle)
+    TEAM_MEMORY_ON_TEXT,  # DALTON-HOOK(team-memory-toggle)
+    TEAM_MEMORY_ROW_KIND,  # DALTON-HOOK(team-memory-toggle)
     TURN_ROW_KIND,
     TURN_SCHEMA_VERSION,
     WAKEUP_CANCELLED_ROW_KIND,
     TimeUpToolStopMiddleware,
     TurnContextMiddleware,
+    team_memory_row_for_messages,  # DALTON-HOOK(team-memory-toggle)
 )
 from .turn_context import HomeAway, TurnContext
 
@@ -106,6 +112,11 @@ __all__ = [
     "RUNTIME_UPDATE_SOURCE",
     "STATE_BASELINE",
     "SUBAGENTS_ROW_KIND",
+    "TEAM_MEMORY_OFF_MARKER",  # DALTON-HOOK(team-memory-toggle)
+    "TEAM_MEMORY_OFF_TEXT",  # DALTON-HOOK(team-memory-toggle)
+    "TEAM_MEMORY_ON_MARKER",  # DALTON-HOOK(team-memory-toggle)
+    "TEAM_MEMORY_ON_TEXT",  # DALTON-HOOK(team-memory-toggle)
+    "TEAM_MEMORY_ROW_KIND",  # DALTON-HOOK(team-memory-toggle)
     "TURN_ROW_KIND",
     "TURN_SCHEMA_VERSION",
     "UPDATE_SCHEMA_VERSION",
@@ -151,4 +162,5 @@ __all__ = [
     "runtime_update_from_message",
     "sha256_text",
     "split_surface",
+    "team_memory_row_for_messages",  # DALTON-HOOK(team-memory-toggle)
 ]

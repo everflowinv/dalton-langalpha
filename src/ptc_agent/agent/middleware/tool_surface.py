@@ -168,6 +168,21 @@ class _Wire(abc.ABC):
     ) -> ModelRequest:
         ...
 
+    # DALTON-HOOK(team-memory-toggle): inspect wire tool names without triggering diff()
+    @abc.abstractmethod
+    def tool_name(self, entry: dict[str, Any]) -> str | None:
+        ...
+
+    @abc.abstractmethod
+    def has_tool(
+        self,
+        declared: list[dict[str, Any]],
+        messages: list[Any],
+        model: Any,
+        name: str,
+    ) -> bool:
+        ...
+
 
 class _AnthropicWire(_Wire):
     bridged = True
@@ -223,6 +238,14 @@ class _AnthropicWire(_Wire):
             tools=_with_marker(declared, marker), messages=messages, model_settings=settings
         )
 
+    def tool_name(self, entry):
+        return entry.get("name")
+
+    # DALTON-HOOK(team-memory-toggle): check whether a wire already offers a tool
+    def has_tool(self, declared, messages, model, name):
+        offered, _ = _known(declared, messages, model)
+        return name in offered
+
 
 class _OpenAIWire(_Wire):
     """The array is kept in the chat form langchain-openai converts from;
@@ -243,17 +266,24 @@ class _OpenAIWire(_Wire):
     def render(self, stored, wanted):
         return wanted
 
-    def diff(self, declared, wanted, messages, model):
-        """An ``additional_tools`` item for every tool in *wanted* the model
-        lacks or holds under another definition. A tool *wanted* lacks is not
-        stated, since no item takes one away: it is left out of what the
-        model is offered, so a call to it is refused (``_refusal``)."""
+    # DALTON-HOOK(team-memory-toggle): shared current-tools scan for diff() and has_tool()
+    def _current_tools(
+        self, declared: list[dict[str, Any]], messages: list[Any]
+    ) -> dict[str | None, dict[str, Any]]:
         current = {tool.get("name"): tool for tool in map(_as_responses_tool, declared)}
         for message in messages:
             if is_tool_change_message(message):
                 for block in message.content:
                     for tool in block.get("tools") or ():
                         current[tool.get("name")] = tool
+        return current
+
+    def diff(self, declared, wanted, messages, model):
+        """An ``additional_tools`` item for every tool in *wanted* the model
+        lacks or holds under another definition. A tool *wanted* lacks is not
+        stated, since no item takes one away: it is left out of what the
+        model is offered, so a call to it is refused (``_refusal``)."""
+        current = self._current_tools(declared, messages)
         given = [_as_responses_tool(definition) for definition in wanted]
         added = [tool for tool in given if tool.get("name") not in current]
         changed = [
@@ -271,6 +301,13 @@ class _OpenAIWire(_Wire):
 
     def dress(self, request, declared, marker, messages):
         return request.override(tools=declared, messages=messages)
+
+    # DALTON-HOOK(team-memory-toggle): inspect OpenAI wire tool names without mutating state
+    def tool_name(self, entry):
+        return _as_responses_tool(entry).get("name")
+
+    def has_tool(self, declared, messages, model, name):
+        return name in self._current_tools(declared, messages)
 
 
 _ANTHROPIC = _AnthropicWire()
@@ -301,12 +338,24 @@ class ToolSurfaceMiddleware(AgentMiddleware):
 
     state_schema = ToolSurfaceState
 
+    def __init__(
+        self,
+        *,
+        # DALTON-HOOK(team-memory-toggle): withhold conversation_search from pre-deploy OFF threads until enabled
+        conversation_search_enabled: bool | None = None,
+    ) -> None:
+        super().__init__()
+        self._conversation_search_enabled = conversation_search_enabled
+
     def wrap_model_call(
         self,
         request: ModelRequest,
         handler: Callable[[ModelRequest], ModelResponse],
     ) -> Any:
-        prepared = _prepare(request)
+        prepared = _prepare(
+            request,
+            conversation_search_enabled=self._conversation_search_enabled,
+        )
         with operator_request("system") if prepared.bridged else nullcontext():
             return _finish(handler(prepared.request), prepared)
 
@@ -315,7 +364,10 @@ class ToolSurfaceMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> Any:
-        prepared = _prepare(request)
+        prepared = _prepare(
+            request,
+            conversation_search_enabled=self._conversation_search_enabled,
+        )
         # Every change message goes through the bridge, which joins it with a
         # neighbouring row and keeps it off a place the wire refuses.
         with operator_request("system") if prepared.bridged else nullcontext():
@@ -332,7 +384,11 @@ class ToolSurfaceMiddleware(AgentMiddleware):
         return refused if refused is not None else await handler(request)
 
 
-def _prepare(request: ModelRequest) -> _Prepared:
+def _prepare(
+    request: ModelRequest,
+    *,
+    conversation_search_enabled: bool | None = None,
+) -> _Prepared:
     surface = (request.state or {}).get(TOOL_SURFACE_KEY) or {}
     wire = _wire_for(request.model)
     if wire is None:
@@ -351,6 +407,21 @@ def _prepare(request: ModelRequest) -> _Prepared:
     else:
         declared = stored
         epoch = slot.get("epoch")
+
+    # DALTON-HOOK(team-memory-toggle): a pre-deploy OFF thread's stored surface
+    # omits `conversation_search`. Keep it out of `wanted` while Team Memory
+    # stays OFF so `diff()` never injects `additional_tools` / `tool_addition`;
+    # once enabled (or on a fresh surface), it enters normally.
+    if (
+        conversation_search_enabled is False
+        and stored
+        and not wire.has_tool(declared, messages, request.model, "conversation_search")
+    ):
+        wanted = [
+            entry
+            for entry in wanted
+            if wire.tool_name(entry) != "conversation_search"
+        ]
 
     # A compaction request summarizes what was sent, so it carries the array
     # and nothing new, and records nothing.

@@ -111,7 +111,7 @@ direct_tools:
     category: memory
     title: 团队对话归档
     call: "conversation_search"
-    description: "团队过往事实、预测、假设、观点、问题、决定、待办卡片及原话，查既有看法并对比变化。"
+    description: "团队过往事实、预测、假设、观点、问题、决定、待办卡片及原话，查既有看法并对比变化(仅团队记忆开启时可用)。"
   web_search:
     category: web
     title: 全网新闻

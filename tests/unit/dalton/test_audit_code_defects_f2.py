@@ -802,6 +802,11 @@ async def test_conversation_search_annotates_uploader(monkeypatch: pytest.Monkey
     )
     monkeypatch.setattr(
         tools,
+        "resolve_turn_team_memory_enabled",
+        create_autospec(tools.resolve_turn_team_memory_enabled, return_value=True),
+    )
+    monkeypatch.setattr(
+        tools,
         "hybrid_search_conversations",
         create_autospec(tools.hybrid_search_conversations, side_effect=_search),
     )

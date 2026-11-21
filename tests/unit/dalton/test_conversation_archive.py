@@ -802,6 +802,13 @@ async def test_hybrid_search_rrf_fusion_and_conversation_search_tool(
         "get_user_tier",
         create_autospec(conv_tools_mod.get_user_tier, return_value="internal"),
     )
+    monkeypatch.setattr(
+        conv_tools_mod,
+        "resolve_turn_team_memory_enabled",
+        create_autospec(
+            conv_tools_mod.resolve_turn_team_memory_enabled, return_value=True
+        ),
+    )
 
     analyst_tools = {t.name: t for t in build_dalton_tools("analyst", team_memory_enabled=True)}
     cos_tools = {t.name: t for t in build_dalton_tools("chief_of_staff", team_memory_enabled=True)}
@@ -1745,6 +1752,13 @@ async def test_round5_flag_instead_of_reject_parsing_fixes_and_enumeration_count
         conv_tools_mod,
         "get_user_tier",
         create_autospec(conv_tools_mod.get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        conv_tools_mod,
+        "resolve_turn_team_memory_enabled",
+        create_autospec(
+            conv_tools_mod.resolve_turn_team_memory_enabled, return_value=True
+        ),
     )
     tool_fn = conv_tools_mod.create_conversation_tools()[0]
     raw_json = await tool_fn.ainvoke(

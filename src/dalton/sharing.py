@@ -19,7 +19,7 @@ from typing import Any
 from fastapi import HTTPException
 from psycopg.rows import dict_row
 
-from src.dalton.access_tiers import classify_owner_tier, get_user_tier
+from src.dalton.access_tiers import classify_owner_tier, get_user_tier, is_internal_tier
 from src.dalton.auth import _verified_token_identity
 from src.dalton.company_identity import is_company_system_user
 from src.dalton.coverage.identity import is_historical_duplicate_workspace
@@ -732,7 +732,7 @@ async def resolve_turn_team_memory_enabled(
     settings = get_dalton_settings()
     if not settings.conversations.enabled:
         return False
-    if (user_tier or "").strip().lower() == "external":
+    if user_tier is not None and not is_internal_tier(user_tier):
         return False
 
     normalized_role = (role or "").strip().lower()

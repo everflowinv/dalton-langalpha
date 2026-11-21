@@ -39,10 +39,17 @@ def build_dalton_tools(
     tools mounted (the refusal stays the second line of defense for builds
     without a resolved tier).
 
+    ``team_memory_enabled`` is kept for signature compatibility; top-level tool
+    mounting follows deployment/tier availability only so switching the user
+    toggle never changes the top-level tool list. Per-turn enforcement uses the
+    runtime notice and ``conversation_search``'s execution-time check.
+
     ``prepare_transcription`` mounts only when ``is_transcription_enabled()``
     is true (``DALTON_TRANSCRIPTION_ENABLED`` on and storage configured); with
     the master switch off the agent never sees a tool it cannot run.
     """
+    _ = team_memory_enabled
+    from src.dalton.access_tiers import is_internal_tier
     from src.dalton.services.transcriptions import is_transcription_enabled
     from src.dalton.settings import is_artifact_publishing_enabled
 
@@ -63,10 +70,12 @@ def build_dalton_tools(
     # internal/admin-only; an external member's every call would be refused at
     # run time, so the tools are not mounted for them in the first place
     # ("external" is also what a failed tier lookup resolves to — fail closed
-    # on mounting).
-    tier_mounts_conversation_search = user_tier is None or user_tier != "external"
+    # on mounting). Company-system turns keep non-conversation internal tools,
+    # while conversation_search stays restricted to internal/admin tiers.
+    tier_mounts_internal_tools = user_tier is None or user_tier != "external"
+    tier_mounts_conversation_search = user_tier is None or is_internal_tier(user_tier)
 
-    if tier_mounts_conversation_search:
+    if tier_mounts_internal_tools:
         try:
             from src.dalton.tools.notify_tools import create_notify_tools
 
@@ -184,15 +193,12 @@ def build_dalton_tools(
         if settings.autonomy.enabled:
             tools.extend(build_director_tools(role=role, filesystem_backend=filesystem_backend))
             tools.extend(build_coverage_tools(role=role))
-        if (
-            settings.conversations.enabled
-            and tier_mounts_conversation_search
-            and team_memory_enabled
-        ):
+        # DALTON-HOOK(team-memory-toggle): mount conversation_search from deployment/tier availability only (not personal toggle)
+        if settings.conversations.enabled and tier_mounts_conversation_search:
             try:
                 from src.dalton.tools.conversation_tools import create_conversation_tools
 
-                tools.extend(create_conversation_tools())
+                tools.extend(create_conversation_tools(role="chief_of_staff"))
             except Exception as e:
                 logger.debug("[DALTON_TOOLS] conversation_tools not loaded: %s", e)
         if settings.publish.enabled:
@@ -296,15 +302,12 @@ def build_dalton_tools(
     if settings.autonomy.enabled:
         tools.extend(build_director_tools(role=role, filesystem_backend=filesystem_backend))
 
-    if (
-        settings.conversations.enabled
-        and tier_mounts_conversation_search
-        and team_memory_enabled
-    ):
+    # DALTON-HOOK(team-memory-toggle): mount conversation_search from deployment/tier availability only (not personal toggle)
+    if settings.conversations.enabled and tier_mounts_conversation_search:
         try:
             from src.dalton.tools.conversation_tools import create_conversation_tools
 
-            tools.extend(create_conversation_tools())
+            tools.extend(create_conversation_tools(role=role))
         except Exception as e:
             logger.debug("[DALTON_TOOLS] conversation_tools not loaded: %s", e)
 
