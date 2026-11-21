@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useId } from 'react';
-import { useNavigate, useLocation } from 'react-router';
+import { Navigate, useNavigate, useLocation } from 'react-router';
 import { KeyRound } from 'lucide-react';
+// DALTON-HOOK(dalton-setup): filter credits and Claude Code models from legacy /setup/models
+import { isDaltonBuild } from '@/config/brand';
+import { CLAUDE_CODE } from '@/lib/claudeCode';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { WizardStepHeader } from '@/components/ui/wizard';
@@ -39,13 +42,24 @@ export default function ModelPickStep() {
 
   const { configuredSet } = useConfiguredProviders();
   const isConfigured = provider ? configuredSet.has(provider) : false;
-  const picker = useModelPicker({ provider, modelsFrom, justConnected: state.justConnected === true });
+  // DALTON-HOOK(dalton-setup): apply Dalton filter to legacy /setup/models picker
+  const picker = useModelPicker({
+    provider,
+    modelsFrom,
+    justConnected: state.justConnected === true,
+    dalton: isDaltonBuild,
+  });
   // Sent from the answers' model step, which makes a pick the default.
   const answering = state.answering === true;
 
   const handleBack = useCallback(() => {
     navigate('/setup/provider', { state: { list: state.list, answering: state.answering } });
   }, [navigate, state.list, state.answering]);
+
+  // DALTON-HOOK(dalton-setup): disallow accessing legacy /setup/models for Claude Code under Dalton
+  if (isDaltonBuild && provider === CLAUDE_CODE) {
+    return <Navigate to="/setup" replace />;
+  }
 
   const handleNext = async () => {
     if (!(await picker.save())) return;

@@ -1,6 +1,8 @@
 import { useId, useState } from 'react';
-import { useNavigate } from 'react-router';
+import { Navigate, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
+// DALTON-HOOK(dalton-setup): Claude Code is disabled in Dalton builds
+import { isDaltonBuild } from '@/config/brand';
 import { Loader } from '@/components/ui/loader';
 import { WizardStepHeader } from '@/components/ui/wizard';
 import { RemoveClaudeCodeTokenDialog } from '@/components/modelAccess/ClaudeCodeToken';
@@ -23,6 +25,12 @@ const noCover = () => {};
  * the account portal can link straight to it.
  */
 export default function ClaudeCodeStep() {
+  // DALTON-HOOK(dalton-setup): Claude Code is disabled in Dalton builds
+  if (isDaltonBuild) return <Navigate to="/setup" replace />;
+  return <ClaudeCodeStepInner />;
+}
+
+function ClaudeCodeStepInner() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const connected = useProviderConnected(false);

@@ -13,13 +13,17 @@ import { RadioChoice } from '@/components/ui/choice';
 import { Loader } from '@/components/ui/loader';
 import { FlowFailure, ROW_BUTTON } from '@/components/modelAccess/parts';
 import { isPlatformMode } from '@/config/hostMode';
+// DALTON-HOOK(dalton-setup): team-shared model tag in Dalton
+import { isDaltonBuild } from '@/config/brand';
 import { useChangeAnswers } from './flow';
 import type { SetupAnswers } from './setupSteps';
 
 /** The answers' tags, in this deployment's words: self-hosted names the
  *  server's models and computers rather than LangAlpha's. */
 function answerTags(t: (key: string) => string, answers: SetupAnswers): [string, string] {
-  const models = answers.models === 'langalpha_models' && !isPlatformMode ? 'serverModels' : answers.models;
+  const models = answers.models === 'langalpha_models'
+    ? (isDaltonBuild ? 'teamModels' : !isPlatformMode ? 'serverModels' : answers.models)
+    : answers.models;
   const runsOn = answers.runsOn === 'cloud' && !isPlatformMode ? 'serverComputer' : answers.runsOn;
   return [t(`setup.answers.tag.${models}`), t(`setup.answers.tag.${runsOn}`)];
 }

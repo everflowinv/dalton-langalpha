@@ -10,6 +10,8 @@ import type { Payer } from '@/lib/modelPayer';
 import { listedFor } from '@/lib/connectionModels';
 import type { ConnectionOf } from '@/lib/providerCatalog';
 import type { CustomModelEntry } from '@/components/model/types';
+// DALTON-HOOK(dalton-setup): Dalton recommended models and Claude Code / credits filtering
+import { DALTON_BACKGROUND_MODEL, DALTON_DEFAULT_MODEL, isDaltonAllowedModel } from '@/config/daltonSetup';
 import type { ModelsAnswer } from './setupSteps';
 
 /** How many models the step lists; the rest are in Settings. */
@@ -33,10 +35,12 @@ export interface DefaultChoicesInput {
   systemBackground: string | null;
   /** The saved default, which connecting in setup set. */
   preferred: string | null;
+  // DALTON-HOOK(dalton-setup): Dalton mode recommends Neon High & Hydrogen High without credits or Claude Code
+  dalton?: boolean;
 }
 
-export type PrimaryWhy = 'strongest' | 'strongestFastest' | 'deployment' | 'claudeCode';
-export type BackgroundWhy = 'fastest' | 'only' | 'deployment' | 'claudeCode' | 'claudeCodeCredits';
+export type PrimaryWhy = 'strongest' | 'strongestFastest' | 'deployment' | 'daltonRecommended' | 'claudeCode';
+export type BackgroundWhy = 'fastest' | 'only' | 'deployment' | 'daltonRecommended' | 'claudeCode' | 'claudeCodeCredits';
 
 export interface RecommendedSetup {
   primary: string | null;
@@ -95,17 +99,42 @@ function fastestOtherPick(input: DefaultChoicesInput, pool: string[], primary: s
 /** Served by the deployment, as LangAlpha's models are: never a key or plan the user connected. */
 const platformServed = (input: DefaultChoicesInput, model: string) => input.payers[model] === 'credits' || input.payers[model] === 'server_key';
 
+const daltonAllowed = (input: DefaultChoicesInput, model: string) =>
+  isDaltonAllowedModel(input.metadata[model], input.payers[model]);
+
 /** How each answer picks its primary and its Background. */
 const RULES: Record<ModelsAnswer, {
   primary: (input: DefaultChoicesInput, pool: string[]) => PrimaryPick;
   background: (input: DefaultChoicesInput, pool: string[], primary: string | null) => BackgroundPick;
 }> = {
   langalpha_models: {
-    primary: (input, pool) => (input.systemDefault && pool.includes(input.systemDefault)
-      ? { primary: input.systemDefault, primaryWhy: 'deployment' } : strongestPick(input, pool)),
-    background: (input, pool, primary) => (input.systemBackground && input.slotModels.includes(input.systemBackground)
-      && platformServed(input, input.systemBackground)
-      ? { background: input.systemBackground, backgroundWhy: 'deployment' } : fastestOtherPick(input, pool, primary)),
+    primary: (input, pool) => {
+      // DALTON-HOOK(dalton-setup): prefer Neon High in Dalton deployments
+      if (input.dalton) {
+        if (pool.includes(DALTON_DEFAULT_MODEL)) return { primary: DALTON_DEFAULT_MODEL, primaryWhy: 'daltonRecommended' };
+        if (input.systemDefault && pool.includes(input.systemDefault) && daltonAllowed(input, input.systemDefault)) {
+          return { primary: input.systemDefault, primaryWhy: 'daltonRecommended' };
+        }
+        return strongestPick(input, pool);
+      }
+      return input.systemDefault && pool.includes(input.systemDefault)
+        ? { primary: input.systemDefault, primaryWhy: 'deployment' } : strongestPick(input, pool);
+    },
+    background: (input, pool, primary) => {
+      // DALTON-HOOK(dalton-setup): prefer Hydrogen High for background in Dalton deployments
+      if (input.dalton) {
+        if (input.slotModels.includes(DALTON_BACKGROUND_MODEL) && daltonAllowed(input, DALTON_BACKGROUND_MODEL)) {
+          return { background: DALTON_BACKGROUND_MODEL, backgroundWhy: 'daltonRecommended' };
+        }
+        if (input.systemBackground && input.slotModels.includes(input.systemBackground) && daltonAllowed(input, input.systemBackground)) {
+          return { background: input.systemBackground, backgroundWhy: 'daltonRecommended' };
+        }
+        return fastestOtherPick(input, pool, primary);
+      }
+      return input.systemBackground && input.slotModels.includes(input.systemBackground)
+        && platformServed(input, input.systemBackground)
+        ? { background: input.systemBackground, backgroundWhy: 'deployment' } : fastestOtherPick(input, pool, primary);
+    },
   },
   // Claude Code runs conversations only, so Background stays the deployment's.
   claude_code: {
@@ -119,28 +148,43 @@ const RULES: Record<ModelsAnswer, {
         : input.payers[input.systemBackground] === 'credits' ? 'claudeCodeCredits' : 'claudeCode',
     }),
   },
-  subscription_or_key: { primary: strongestPick, background: fastestOtherPick },
+  subscription_or_key: {
+    // DALTON-HOOK(dalton-setup): prefer Neon High & Hydrogen High under Dalton
+    primary: (input, pool) => (input.dalton && pool.includes(DALTON_DEFAULT_MODEL)
+      ? { primary: DALTON_DEFAULT_MODEL, primaryWhy: 'daltonRecommended' }
+      : strongestPick(input, pool)),
+    background: (input, pool, primary) => (input.dalton
+      && input.slotModels.includes(DALTON_BACKGROUND_MODEL)
+      && daltonAllowed(input, DALTON_BACKGROUND_MODEL)
+      ? { background: DALTON_BACKGROUND_MODEL, backgroundWhy: 'daltonRecommended' }
+      : fastestOtherPick(input, pool, primary)),
+  },
 };
 
-function recommend(input: DefaultChoicesInput, pool: string[]): RecommendedSetup {
-  const rule = RULES[input.models];
+function recommend(input: DefaultChoicesInput, pool: string[], effectiveAnswer: ModelsAnswer): RecommendedSetup {
+  const rule = RULES[effectiveAnswer];
   const primary = rule.primary(input, pool);
   return { ...primary, ...rule.background(input, pool, primary.primary) };
 }
 
 export function defaultChoices(input: DefaultChoicesInput): DefaultChoices {
   const of = (provider: string) => listedFor(provider, input.offered, input.metadata, input.customModels, input.connectionOf);
+  const effectiveAnswer: ModelsAnswer = input.dalton && input.models === 'claude_code' ? 'langalpha_models' : input.models;
   let pool: string[];
-  if (input.models === 'claude_code') pool = of(CLAUDE_CODE);
-  else if (input.models === 'subscription_or_key') pool = input.ownProviders.flatMap(of);
+  if (effectiveAnswer === 'claude_code') pool = of(CLAUDE_CODE);
+  else if (effectiveAnswer === 'subscription_or_key') pool = input.ownProviders.flatMap(of);
   else {
     pool = Object.values(input.offered)
       .flatMap((p) => p.models ?? [])
-      .filter((m) => platformServed(input, m));
+      // DALTON-HOOK(dalton-setup): Dalton team credentials offer OAuth/provider models, excluding Claude Code & credits
+      .filter((m) => (input.dalton ? daltonAllowed(input, m) : platformServed(input, m)));
+  }
+  if (input.dalton) {
+    pool = pool.filter((m) => daltonAllowed(input, m));
   }
   pool = [...new Set(pool)];
 
-  const recommended = recommend(input, pool);
+  const recommended = recommend(input, pool, effectiveAnswer);
   // Connecting saved the model it starts on, which is the recommended one; a
   // default saved on an earlier run of setup is kept.
   const saved = input.models !== 'langalpha_models' && input.preferred && pool.includes(input.preferred)
