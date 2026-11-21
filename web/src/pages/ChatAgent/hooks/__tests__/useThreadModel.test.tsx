@@ -1210,5 +1210,95 @@ describe('useThreadModel', () => {
       expect(mocks.updateThread).not.toHaveBeenCalled();
       expect(result.current.sendModel).toBe('gemini-4-neon-low-oauth');
     });
+
+    // DALTON-HOOK(antigravity-series): retired old thread model must not clear a valid pick made while shared list loads
+    it('preserves a valid loading-time pick on a thread with a retired saved model, then flushes PATCH and sends it once confirmed personal', async () => {
+      mocks.seriesCatalog = NEON_CATALOG;
+      mocks.rawMetadata = NEON_RAW_META;
+      mocks.catalogModelNames = new Set([
+        'model-default',
+        'gemini-4-neon-low-oauth',
+        'gemini-4-neon-medium-oauth',
+        'gemini-4-neon-high-oauth',
+      ]);
+      mocks.sharedEntry = undefined;
+      mocks.updateThread.mockResolvedValueOnce(row('gemini-4-neon-high-oauth'));
+
+      const { result, rerender, queryClient } = setup(
+        { workspaceId: 'ws-personal' },
+        row('model-retired'),
+      );
+      expect(result.current.retired).toEqual({ model: 'model-retired', fallback: 'model-default' });
+
+      act(() => {
+        void result.current.pickModel('gemini-4-neon-high-oauth');
+      });
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+      expect(result.current.model).toBe('gemini-4-neon-high-oauth');
+      expect(result.current.sendModel).toBe('gemini-4-neon-high-oauth');
+
+      // DALTON-HOOK(antigravity-series): confirmed personal workspace flushes PATCH and preserves sendModel
+      mocks.sharedEntry = null;
+      rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-personal' });
+
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledTimes(1));
+      expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, {
+        llm_model: 'gemini-4-neon-high-oauth',
+      });
+      expect(cachedModel(queryClient)).toBe('gemini-4-neon-high-oauth');
+      expect(result.current.model).toBe('gemini-4-neon-high-oauth');
+      expect(result.current.sendModel).toBe('gemini-4-neon-high-oauth');
+    });
+
+    // DALTON-HOOK(antigravity-series): late thread detail arrival must not overwrite a pending loading-time pick before shared list resolves
+    it('keeps a loading-time pick as displayed and sent model when thread detail arrives before shared workspace list resolves', async () => {
+      mocks.seriesCatalog = NEON_CATALOG;
+      mocks.rawMetadata = NEON_RAW_META;
+      mocks.catalogModelNames = new Set([
+        'model-default',
+        'gemini-4-neon-low-oauth',
+        'gemini-4-neon-medium-oauth',
+        'gemini-4-neon-high-oauth',
+      ]);
+      mocks.sharedEntry = undefined;
+      const detail = deferred<Thread>();
+      mocks.getThread.mockReturnValue(detail.promise);
+      mocks.updateThread.mockResolvedValueOnce(row('gemini-4-neon-high-oauth'));
+      const queryClient = createTestQueryClient();
+      const { result, rerender } = renderHookWithProviders(
+        (p: Props = { threadId: THREAD, isLoading: false, workspaceId: 'ws-personal' }) => useThreadModel(p),
+        { queryClient },
+      );
+      expect(result.current.model).toBeNull();
+      expect(result.current.sendModel).toBeNull();
+
+      act(() => {
+        void result.current.pickModel('gemini-4-neon-high-oauth');
+      });
+      expect(result.current.model).toBe('gemini-4-neon-high-oauth');
+      expect(result.current.sendModel).toBe('gemini-4-neon-high-oauth');
+
+      // DALTON-HOOK(antigravity-series): thread detail resolves with old model before shared list returns
+      await act(async () => {
+        detail.resolve(row('gemini-4-neon-medium-oauth'));
+        await detail.promise;
+      });
+      await waitFor(() => expect(cachedModel(queryClient)).toBe('gemini-4-neon-medium-oauth'));
+
+      // Sending before shared list resolves still uses the newly picked model
+      expect(result.current.model).toBe('gemini-4-neon-high-oauth');
+      expect(result.current.sendModel).toBe('gemini-4-neon-high-oauth');
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+
+      // DALTON-HOOK(antigravity-series): once shared list resolves to personal, PATCH flushes with the new pick
+      mocks.sharedEntry = null;
+      rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-personal' });
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledTimes(1));
+      expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, {
+        llm_model: 'gemini-4-neon-high-oauth',
+      });
+      expect(result.current.model).toBe('gemini-4-neon-high-oauth');
+      expect(result.current.sendModel).toBe('gemini-4-neon-high-oauth');
+    });
   });
 });
