@@ -262,21 +262,6 @@ async def _research(
     if config.llm is None:
         raise ValueError("No LLM configured — set a model in agent_config.yaml or select one in Settings")
 
-    # DALTON-HOOK(background-effort-low): system research path (user_id=None in
-    # platform mode, or fallback to setup.agent_config) skips resolve_llm_config,
-    # so build the Background-slot client at low for models with a reasoning ladder.
-    if config is agent_config and config.llm_client is None:
-        from src.llms.llm import create_llm
-        from src.server.services.llm.config import background_default_effort, slot_model
-
-        model_name = slot_model(config.llm, "background")
-        effort = background_default_effort({}, model_name)
-        if effort is not None:
-            config = config.model_copy(deep=True)
-            config.llm_client = create_llm(
-                model_name, cache_key=config.cache_key, reasoning_effort=effort
-            )
-
     graph = build_insight_graph(config)
     input_state = {"messages": [HumanMessage(content=prompt)]}
     # WebFetch reads the user's fetch model from the context, as in a chat
