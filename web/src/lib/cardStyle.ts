@@ -1,9 +1,6 @@
 /**
- * How the app is drawn: Balanced (the upstream default, which leaves each
- * component as it draws itself), Soft, or Terminal. With nothing stored the app
- * shows Balanced (`defaultCardStyle`), Dalton builds included; a stored or
- * account choice wins.
- * Terminal is the data cards' own
+ * How the app is drawn: Balanced (the default, which leaves each component as it
+ * draws itself), Soft, or Terminal. Terminal is the data cards' own
  * stylesheets, and the other two take marks away from them
  * (charts/termCardStyles.css); the rest of the app reads the style as
  * variables (styles/cardStyle.css, which declares every style's values).
