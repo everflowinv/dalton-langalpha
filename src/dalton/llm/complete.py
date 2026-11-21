@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 import time
 import hashlib
 import json
@@ -36,7 +37,7 @@ from src.dalton.database.llm_journal import (
     record_journal_replay,
 )
 from src.dalton.credentials import (  # DALTON-HOOK(team-credentials): record credential_user_id in journal usage while user_id stays caller
-    credential_user_id,
+    credential_user_id as _resolve_credential_user_id,
     is_team_credential_sharing_enabled,
 )
 from src.dalton.database.provider_events import record_provider_event, sanitize_error_text
@@ -128,6 +129,27 @@ def resolve_model_billing_and_provider(model_key: str) -> tuple[str, str]:
         pass
 
     return "platform", _resolve_provider_for_model(key, "platform")
+
+
+def model_requires_user_oauth(model_key: str) -> bool:
+    """Return True only when ``model_key`` requires a user OAuth or setup token.
+
+    Coding-plan subscription models (e.g. ``glm-5.3-flash-plan``) have
+    ``billing="subscription"`` / ``billing_type="oauth"`` for notional pricing,
+    yet run on API keys (deployment env key or BYOK) rather than user OAuth
+    tokens, so they must NOT be gated as requiring a ``credential_user_id``.
+    """
+    key = (model_key or "").strip()
+    if not key:
+        return False
+    from src.llms.claude_code import is_claude_code_model
+    from src.llms.llm import LLM as LLMFactory
+    from src.server.services.llm.clients import subscription_route
+
+    if is_claude_code_model(key):
+        return True
+    mc = LLMFactory.get_model_config()
+    return subscription_route(key, mc, custom_entry=None) is not None
 
 
 def compute_invocation_id_and_hash(
@@ -631,10 +653,16 @@ def _finish(result: DaltonCompleteResult, *, raise_on_error: bool) -> DaltonComp
     )
 
 
+_UNSET = object()
+
+
 async def dalton_complete(
     llm_service: Any = None,
     *,
     user_id: str,
+    credential_user_id: Any = _UNSET,
+    ignore_custom_models: bool = False,
+    record_provider_events: bool = True,
     user_prompt: str = "",
     system_prompt: str | None = None,
     scope_ref: str | None = None,
@@ -655,6 +683,7 @@ async def dalton_complete(
     raise_on_error: bool = False,
     disable_tracing: bool = True,
     persist_raw: bool = True,
+    persist_response: bool = True,
     skip_journal: bool = False,
     deadline: float | None = None,
 ) -> DaltonCompleteResult:
@@ -664,7 +693,85 @@ async def dalton_complete(
     consulted first, so a finished call still replays after the deadline; the time
     left is re-read just before sending (after the journal, claim and config waits)
     and caps the model timeout.
+
+    ``credential_user_id`` separates credential resolution (passed to
+    ``LLMService.complete``; ``None`` enforces deployment env/platform credentials
+    only) from ``user_id`` (used for budget admission and journal accounting).
+    ``record_provider_events=False`` suppresses writing raw error text to
+    ``dalton_provider_events``, ``dalton_llm_journal.error_text``, and parse
+    retry debug logs. ``persist_response=False`` writes usage, cost, and state
+    to ``dalton_llm_journal`` while keeping ``response`` NULL.
     """
+    from src.llms.api_call import redact_parse_error_logs
+
+    with (
+        redact_parse_error_logs()
+        if not record_provider_events
+        else nullcontext()
+    ):
+        return await _dalton_complete_impl(
+            llm_service=llm_service,
+            user_id=user_id,
+            credential_user_id=credential_user_id,
+            ignore_custom_models=ignore_custom_models,
+            record_provider_events=record_provider_events,
+            user_prompt=user_prompt,
+            system_prompt=system_prompt,
+            scope_ref=scope_ref,
+            purpose=purpose,
+            request_model=request_model,
+            model=model,
+            response_schema=response_schema,
+            slot=slot,
+            reasoning_effort=reasoning_effort,
+            is_byok=is_byok,
+            timeout_s=timeout_s,
+            stale_after_s=stale_after_s,
+            resend_indeterminate=resend_indeterminate,
+            resend_max_attempts=resend_max_attempts,
+            invocation_id=invocation_id,
+            workspace_id=workspace_id,
+            thread_id=thread_id,
+            raise_on_error=raise_on_error,
+            disable_tracing=disable_tracing,
+            persist_raw=persist_raw,
+            persist_response=persist_response,
+            skip_journal=skip_journal,
+            deadline=deadline,
+        )
+
+
+async def _dalton_complete_impl(
+    llm_service: Any = None,
+    *,
+    user_id: str,
+    credential_user_id: Any = _UNSET,
+    ignore_custom_models: bool = False,
+    record_provider_events: bool = True,
+    user_prompt: str = "",
+    system_prompt: str | None = None,
+    scope_ref: str | None = None,
+    purpose: str = "general",
+    request_model: str | None = None,
+    model: str | None = None,
+    response_schema: Type[BaseModel] | dict[str, Any] | None = None,
+    slot: Literal["background", "primary"] = "background",
+    reasoning_effort: str | None = None,
+    is_byok: bool = True,
+    timeout_s: float = 300.0,
+    stale_after_s: int = 900,
+    resend_indeterminate: bool = False,
+    resend_max_attempts: int | None = None,
+    invocation_id: str | None = None,
+    workspace_id: str | None = None,
+    thread_id: str | None = None,
+    raise_on_error: bool = False,
+    disable_tracing: bool = True,
+    persist_raw: bool = True,
+    persist_response: bool = True,
+    skip_journal: bool = False,
+    deadline: float | None = None,
+) -> DaltonCompleteResult:
     effective_model = (model or request_model or "").strip()
     if not effective_model:
         try:
@@ -719,6 +826,12 @@ async def dalton_complete(
     if not user_id or not str(user_id).strip():
         raise ValueError("user_id is required")
     eff_user_id = str(user_id).strip()
+    if credential_user_id is _UNSET:
+        llm_user_id: str | None = user_id
+    elif credential_user_id is None:
+        llm_user_id = None
+    else:
+        llm_user_id = str(credential_user_id).strip() or None
 
     # 1. Inspect journal first so cached replays (`done`) and indeterminate/in-flight states
     #    return immediately without charging or re-sending.
@@ -889,6 +1002,7 @@ async def dalton_complete(
             stale_after_s=stale_after_s,
             resend_indeterminate=resend_indeterminate,
             resend_max_attempts=resend_max_attempts,
+            **({"stamp_credential_holder": False} if llm_user_id is None else {}),
         )
     )
     attempt = int(claimed_row.get("attempt") or 1)
@@ -957,6 +1071,9 @@ async def dalton_complete(
     cash_dec: Decimal | None = None
     notional_dec: Decimal | None = None
     try:
+        if not llm_user_id and model_requires_user_oauth(effective_model):
+            raise ValueError("OAuth model requires a credential user")
+
         if llm_service is None:
             from ptc_agent.config import load_from_files
             from src.server.services.llm.service import LLMService
@@ -978,7 +1095,7 @@ async def dalton_complete(
         resend_sent = is_resend
         raw_result = await asyncio.wait_for(
             llm_service.complete(
-                user_id=user_id,
+                user_id=llm_user_id,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 response_schema=pydantic_schema,
@@ -988,6 +1105,7 @@ async def dalton_complete(
                 reasoning_effort=reasoning_effort,
                 disable_tracing=disable_tracing,
                 return_token_usage=True,
+                **({"ignore_custom_models": True} if ignore_custom_models else {}),
             ),
             timeout=send_timeout_s,
         )
@@ -999,13 +1117,20 @@ async def dalton_complete(
             out_obj, token_usage = raw_result, {}
 
         usage_dict = dict(token_usage) if isinstance(token_usage, dict) else {}
-        if eff_user_id and is_team_credential_sharing_enabled():  # DALTON-HOOK(team-credentials): stamp credential holder into usage while billing/journal user_id stays caller
-            usage_dict.setdefault("credential_user_id", credential_user_id(eff_user_id))
+        if credential_user_id is _UNSET:
+            if eff_user_id and is_team_credential_sharing_enabled():  # DALTON-HOOK(team-credentials): stamp credential holder into usage while billing/journal user_id stays caller
+                usage_dict.setdefault("credential_user_id", _resolve_credential_user_id(eff_user_id))
+        elif llm_user_id and llm_user_id != eff_user_id:
+            usage_dict.setdefault("credential_user_id", llm_user_id)
         cash_dec, notional_dec = compute_call_costs(
             effective_model, billing_type, usage_dict
         )
         db_resp, parsed_data, text_val = _serialize_response_payload(out_obj)
-        journal_resp = db_resp if persist_raw else _redact_response_for_journal(db_resp)
+        journal_resp = (
+            None
+            if not persist_response
+            else (db_resp if persist_raw else _redact_response_for_journal(db_resp))
+        )
 
         if not skip_journal:
             await complete_journal_done(
@@ -1017,6 +1142,7 @@ async def dalton_complete(
                 notional_usd=notional_dec,
                 provider=provider,
                 billing_type=billing_type,
+                **({"stamp_credential_holder": False} if llm_user_id is None else {}),
             )
 
         return DaltonCompleteResult(
@@ -1049,27 +1175,37 @@ async def dalton_complete(
         if provider == "muse-oauth" and error_kind == "auth_expired":
             if "请重新连接 Muse" not in safe_msg:
                 safe_msg = f"{safe_msg}（请重新连接 Muse）"
+        err_summary = safe_msg if record_provider_events else type(exc).__name__
         if not skip_journal:
             try:
                 await complete_journal_failed(
                     inv_id,
                     attempt=attempt,
                     error_kind=error_kind,
-                    error_text=safe_msg,
+                    error_text=err_summary,
                     state=target_state,
                     cash_usd=cash_dec,
                     notional_usd=notional_dec,
                 )
             except Exception as journal_exc:
-                logger.error(
-                    "[DaltonComplete] complete_journal_failed failed for %s (original %s: %s): %s",
-                    inv_id,
-                    error_kind,
-                    safe_msg,
-                    journal_exc,
-                    exc_info=True,
-                )
-            if provider:
+                if record_provider_events:
+                    logger.error(
+                        "[DaltonComplete] complete_journal_failed failed for %s (original %s: %s): %s",
+                        inv_id,
+                        error_kind,
+                        safe_msg,
+                        journal_exc,
+                        exc_info=True,
+                    )
+                else:
+                    logger.error(
+                        "[DaltonComplete] complete_journal_failed failed for %s (original %s/%s): %s",
+                        inv_id,
+                        error_kind,
+                        type(exc).__name__,
+                        type(journal_exc).__name__,
+                    )
+            if provider and record_provider_events:
                 await record_provider_event(
                     provider,
                     "journal_fail",
@@ -1097,14 +1233,14 @@ async def dalton_complete(
                 invocation_id=inv_id,
                 attempt=attempt,
                 error_kind=error_kind,
-                error=safe_msg,
+                error=err_summary,
                 stream_started=stream_started,
                 chunks_received=chunks_received,
             ),
             raise_on_error=raise_on_error,
         )
     finally:
-        if resend_sent:
+        if resend_sent and record_provider_events:
             # Bounded: a note stuck on a database lock must not hold up the
             # call's own result, its exception, or a cancellation in progress.
             try:

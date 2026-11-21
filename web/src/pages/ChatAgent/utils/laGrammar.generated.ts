@@ -164,6 +164,7 @@ export const LA_GLOBAL_FLAGS: FlagSpecs = {
   }
 };
 
+// DALTON-HOOK(workspace-dedup): annotate generated LA_COMMANDS table when workspaces create flags change
 export const LA_COMMANDS: readonly CommandSpec[] = [
   {"words":["login"],"operands":[],"flags":{"with-token":{"type":"bool"},"no-browser":{"type":"bool"}}},
   {"words":["logout"],"operands":[],"flags":{}},
@@ -174,7 +175,7 @@ export const LA_COMMANDS: readonly CommandSpec[] = [
   {"words":["computers","stop"],"operands":["id"],"flags":{}},
   {"words":["computers","remove"],"operands":["id"],"flags":{"yes":{"type":"bool","short":"y"}}},
   {"words":["workspaces","list"],"operands":[],"flags":{"include-home":{"type":"bool"},"limit":{"type":"int"}}},
-  {"words":["workspaces","create"],"operands":["name"],"flags":{"description":{"type":"string"},"computer":{"type":"string"}}},
+  {"words":["workspaces","create"],"operands":["name"],"flags":{"description":{"type":"string"},"computer":{"type":"string"},"allow-duplicate":{"type":"bool"},"skip-coverage-suggestion":{"type":"bool"}}},
   {"words":["workspaces","archive"],"operands":["ws"],"flags":{}},
   {"words":["workspaces","delete"],"operands":["ws"],"flags":{"yes":{"type":"bool","short":"y"},"delete-files":{"type":"bool"}}},
   {"words":["threads","list"],"operands":[],"flags":{"workspace":{"type":"string","short":"w"},"archived":{"type":"bool"},"limit":{"type":"int"},"offset":{"type":"int"}}},

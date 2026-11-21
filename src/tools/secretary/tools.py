@@ -279,6 +279,13 @@ async def workspaces_create(
     description: str | None,
     tool_call_id: str,
     preapproved: bool = False,
+    # DALTON-HOOK(workspace-dedup): allow bypassing company dedup when user explicitly confirms
+    allow_duplicate_company: bool = False,
+    # DALTON-HOOK(workspace-dedup): optional coverage unit auto-registration fields
+    coverage_kind: str | None = None,
+    ticker: str | None = None,
+    display_name: str | None = None,
+    skip_coverage_suggestion: bool = False,
 ) -> Command:
     """Create a new workspace, once the user confirms unless ``preapproved``.
 
@@ -290,6 +297,72 @@ async def workspaces_create(
         return error_command(
             "name is required for create action", tool_call_id
         )
+
+    # --- DALTON-HOOK(workspace-dedup): begin ---
+    from src.dalton.coverage.dedup import find_existing_company_workspace
+    from src.dalton.coverage.units import is_workspace_coverage_registration_active
+
+    raw_coverage_kind = str(coverage_kind or "").strip().lower()
+    requested_coverage = raw_coverage_kind not in ("", "none", "other")
+    coverage_active: bool | None = None
+    if requested_coverage:
+        coverage_active = await is_workspace_coverage_registration_active(user_id)
+    wants_coverage = bool(requested_coverage and coverage_active)
+    if not allow_duplicate_company:
+        dup = None
+        try:
+            dup = await find_existing_company_workspace(
+                user_id, name, channel="cos"
+            )
+        except Exception as exc:
+            logger.warning(
+                "Company workspace dedup check failed (%s); proceeding",
+                type(exc).__name__,
+            )
+        if dup is not None and dup.matches:
+            extra_fields: dict[str, Any] = {}
+            suggestion = dup.suggestion_payload()
+            if suggestion is not None:
+                extra_fields["suggestion"] = suggestion
+            return error_command(
+                dup.message,
+                tool_call_id,
+                code="company_workspace_exists",
+                message=dup.message,
+                matches=dup.matches_payload(),
+                **extra_fields,
+            )
+        if (
+            dup is not None
+            and dup.suggestion is not None
+            and not wants_coverage
+            and not skip_coverage_suggestion
+        ):
+            if coverage_active is None:
+                coverage_active = await is_workspace_coverage_registration_active(user_id)
+            if coverage_active:
+                suggestion = dup.suggestion_payload()
+                kind_label = (
+                    "公司" if dup.suggestion.coverage_kind == "company" else "行业"
+                )
+                ticker_note = (
+                    f"（代码 {dup.suggestion.ticker}）"
+                    if dup.suggestion.ticker
+                    else ""
+                )
+                msg = (
+                    f"「{name}」识别为{kind_label}{ticker_note}，"
+                    "请按 suggestion 带上 coverage_kind / ticker / display_name 重新新建以自动登记覆盖单元，"
+                    "或在用户明确不要登记时传 skip_coverage_suggestion=True。"
+                )
+                return error_command(
+                    msg,
+                    tool_call_id,
+                    code="coverage_suggestion",
+                    message=msg,
+                    suggestion=suggestion,
+                )
+    # --- DALTON-HOOK(workspace-dedup): end ---
 
     if not preapproved:
         holder, confirmed = await duplicate_workspace(user_id, name)
@@ -317,6 +390,32 @@ async def workspaces_create(
                 )
             return decline_routing_command(declined, response, tool_call_id)
 
+    # --- DALTON-HOOK(workspace-dedup): begin ---
+    if allow_duplicate_company:
+        matched_ids: list[str] = []
+        try:
+            dup_for_log = await find_existing_company_workspace(
+                user_id, name, channel="cos"
+            )
+            if dup_for_log is not None and dup_for_log.matches:
+                matched_ids = list(
+                    dup_for_log.matched_workspace_ids
+                    or [
+                        m.workspace_id
+                        for m in dup_for_log.matches
+                        if m.workspace_id
+                    ]
+                )
+        except Exception:
+            matched_ids = []
+        logger.info(
+            "Skipping company workspace dedup check (allow_duplicate_company=True, user_id=%s, name=%r, matched_workspace_ids=%s)",
+            user_id,
+            name,
+            matched_ids,
+        )
+    # --- DALTON-HOOK(workspace-dedup): end ---
+
     from src.server.database.workspace_names import (
         WorkspaceNameInvalid,
         WorkspaceNameTaken,
@@ -338,6 +437,25 @@ async def workspaces_create(
             "workspace_id": str(workspace["workspace_id"]),
             "workspace_name": workspace["name"],
         }
+        # --- DALTON-HOOK(workspace-dedup): begin ---
+        if wants_coverage:
+            from src.dalton.coverage.units import auto_register_workspace_coverage_unit
+
+            unit_row, unit_warning, unit_warning_detail = await auto_register_workspace_coverage_unit(
+                user_id,
+                workspace_id=str(workspace["workspace_id"]),
+                workspace_name=str(workspace.get("name") or name),
+                coverage_kind=coverage_kind,
+                ticker=ticker,
+                display_name=display_name,
+            )
+            if unit_row is not None:
+                result["coverage_unit"] = unit_row
+            if unit_warning is not None:
+                result["coverage_unit_warning"] = unit_warning
+            if unit_warning_detail is not None:
+                result["coverage_unit_warning_detail"] = unit_warning_detail
+        # --- DALTON-HOOK(workspace-dedup): end ---
         # --- DALTON-HOOK(workspace-folder-ready): begin ---
         # The folder is only built at the machine's next acquire, so say where
         # it will be and whether it is there now — the incident's hand-off
