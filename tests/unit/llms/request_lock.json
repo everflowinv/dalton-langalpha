@@ -151,7 +151,7 @@
    },
    "headers": {
     "accept": "application/json",
-    "anthropic-beta": "thinking-binding-controls-2026-08-01,mid-conversation-system-clear-at-2026-08-21,compact-2026-09-04",
+    "anthropic-beta": "thinking-binding-controls-2026-08-01,compact-2026-09-04",
     "anthropic-version": "2023-06-01",
     "connection": "keep-alive",
     "content-type": "application/json",
@@ -434,7 +434,7 @@
    },
    "headers": {
     "accept": "application/json",
-    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,thinking-binding-controls-2026-08-01,mid-conversation-system-clear-at-2026-08-21,compact-2026-09-04",
+    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,thinking-binding-controls-2026-08-01,compact-2026-09-04",
     "anthropic-version": "2023-06-01",
     "connection": "keep-alive",
     "content-type": "application/json",
@@ -597,7 +597,7 @@
    },
    "headers": {
     "accept": "application/json",
-    "anthropic-beta": "thinking-binding-controls-2026-08-01,mid-conversation-system-clear-at-2026-08-21,compact-2026-09-04",
+    "anthropic-beta": "thinking-binding-controls-2026-08-01,compact-2026-09-04",
     "anthropic-version": "2023-06-01",
     "connection": "keep-alive",
     "content-type": "application/json",
@@ -880,7 +880,7 @@
    },
    "headers": {
     "accept": "application/json",
-    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,thinking-binding-controls-2026-08-01,mid-conversation-system-clear-at-2026-08-21,compact-2026-09-04",
+    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,thinking-binding-controls-2026-08-01,compact-2026-09-04",
     "anthropic-version": "2023-06-01",
     "connection": "keep-alive",
     "content-type": "application/json",
@@ -1043,7 +1043,7 @@
    },
    "headers": {
     "accept": "application/json",
-    "anthropic-beta": "thinking-binding-controls-2026-08-01,mid-conversation-system-clear-at-2026-08-21,compact-2026-09-04",
+    "anthropic-beta": "thinking-binding-controls-2026-08-01,compact-2026-09-04",
     "anthropic-version": "2023-06-01",
     "connection": "keep-alive",
     "content-type": "application/json",
@@ -1326,7 +1326,7 @@
    },
    "headers": {
     "accept": "application/json",
-    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,thinking-binding-controls-2026-08-01,mid-conversation-system-clear-at-2026-08-21,compact-2026-09-04",
+    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,thinking-binding-controls-2026-08-01,compact-2026-09-04",
     "anthropic-version": "2023-06-01",
     "connection": "keep-alive",
     "content-type": "application/json",
@@ -1489,7 +1489,7 @@
    },
    "headers": {
     "accept": "application/json",
-    "anthropic-beta": "thinking-binding-controls-2026-08-01,mid-conversation-system-clear-at-2026-08-21,compact-2026-09-04",
+    "anthropic-beta": "thinking-binding-controls-2026-08-01,compact-2026-09-04",
     "anthropic-version": "2023-06-01",
     "connection": "keep-alive",
     "content-type": "application/json",
@@ -1772,7 +1772,7 @@
    },
    "headers": {
     "accept": "application/json",
-    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,thinking-binding-controls-2026-08-01,mid-conversation-system-clear-at-2026-08-21,compact-2026-09-04",
+    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,thinking-binding-controls-2026-08-01,compact-2026-09-04",
     "anthropic-version": "2023-06-01",
     "connection": "keep-alive",
     "content-type": "application/json",

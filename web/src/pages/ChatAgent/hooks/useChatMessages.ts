@@ -18,7 +18,7 @@ import { useStableHandler } from '@/hooks/useStableHandler';
 import { useUser } from '@/hooks/useUser';
 import { sendChatMessageStream, sendRetryStream, getWorkflowStatus, sendHitlResponse, fetchThreadTurns, cancelWorkflow } from '../utils/api';
 import { useLocalRunPublisher } from '@/lib/threadLifecycle/useLocalRunPublisher';
-import { peekThreadMux } from '../session/stream/threadStreamMux';
+import { ThreadMuxSlot } from '../session/stream/threadStreamMux';
 import type { NextSummary, WorkflowStatusResponse } from '../utils/api';
 import type { CancelOutcome, HeldSteer } from '../utils/cancelOutcome';
 // Imported from the dependency-free signal module (not `../utils/api`) so this
@@ -743,12 +743,11 @@ export function useChatMessages(
   // task frames always route through live refs instead of a stale closure.
   const subagentProcessEventRef = useRef<((event: SSEEvent) => void) | null>(null);
 
+  // The view's subagent mux.
+  const [muxSlot] = useState(() => new ThreadMuxSlot());
+
   // Open subagent run channels, from mux truth (empty when no mux exists).
-  const muxOpenTaskIds = (): Set<string> => {
-    const tid = threadIdRef.current;
-    const mux = tid ? peekThreadMux(tid) : null;
-    return mux ? mux.openTaskIds() : new Set<string>();
-  };
+  const muxOpenTaskIds = (): Set<string> => muxSlot.openTaskIds(threadIdRef.current);
 
   // Terminal outcomes the client has observed live (per-task chan_close), keyed by
   // short task id. Authoritative and monotonic: once a task settles here, no stale
@@ -893,6 +892,7 @@ export function useChatMessages(
     terminalTaskOutcomesRef,
     pendingMuxResyncRef,
     nextSummaryOwedRef,
+    muxSlot,
   };
 
   // Keep threadIdRef in sync with state (for use inside closures)
@@ -1510,6 +1510,10 @@ export function useChatMessages(
     }
 
     let cancelled = false;
+    // This load replaces the view's projection, so a mux it still holds (one
+    // a skipped load never registered the cleanup for) has delivered what the
+    // new projection lacks.
+    muxSlot.release();
 
     const loadAndMaybeReconnect = async () => {
       // Check workflow status FIRST, then load history.
@@ -1848,7 +1852,7 @@ export function useChatMessages(
       endLoad();
       // Thread switch/unmount: tear the mux down without marking anything
       // completed, and drop the processor so no stale closure can fire.
-      if (threadId) peekThreadMux(threadId)?.detach();
+      muxSlot.release();
       subagentProcessEventRef.current = null;
       subagentStateRefsRef.current = {};
     };
@@ -2018,6 +2022,13 @@ export function useChatMessages(
     queuedSendRef.current?.settleQueued(false);
     queuedSendRef.current = null;
   }, [historyWindow]);
+
+  // The load effect registers no cleanup when it skips, as it does for a view
+  // still streaming its first turn, so unmounting is what ends the mux there.
+  useEffect(() => {
+    muxSlot.mount();
+    return () => muxSlot.unmount();
+  }, [muxSlot]);
 
   /**
    * Subagent mux settlement (sink, positive per-task closure, drain dedup)
