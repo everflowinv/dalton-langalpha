@@ -1,7 +1,7 @@
-"""Dalton d042: indexes for computer-scoped execution history lookup by thread and workspace.
+"""Dalton d043: indexes for computer-scoped execution history lookup by thread and workspace.
 
-Revision ID: d042
-Revises: d041
+Revision ID: d043
+Revises: d042
 Create Date: 2026-11-21
 """
 
@@ -12,8 +12,8 @@ from typing import Any, Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "d042"
-down_revision: Union[str, None] = "d041"
+revision: str = "d043"
+down_revision: Union[str, None] = "d042"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

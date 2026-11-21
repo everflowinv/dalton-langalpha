@@ -2,8 +2,9 @@
 
 from contextlib import asynccontextmanager, contextmanager
 import sqlite3
-from unittest.mock import MagicMock, create_autospec, patch
+from unittest.mock import create_autospec, patch
 
+from alembic.runtime.migration import MigrationContext
 import psycopg
 import pytest
 
@@ -920,14 +921,14 @@ async def test_detail_last_execution_probe_uses_same_computer_ownership_rules():
         sq.close()
 
 
-def test_d042_migration_creates_and_drops_execution_thread_and_automation_workspace_indexes():
-    """Verify d042 migration chain and CONCURRENTLY index DDL."""
+def test_d043_migration_creates_and_drops_execution_thread_and_automation_workspace_indexes():
+    """Verify d043 migration chain and CONCURRENTLY index DDL."""
     from src.dalton.migrations.versions import (
-        d042_automation_executions_thread_index as d042,
+        d043_automation_executions_thread_index as d043,
     )
 
-    assert d042.revision == "d042"
-    assert d042.down_revision == "d041"
+    assert d043.revision == "d043"
+    assert d043.down_revision == "d042"
 
     executed_sql: list[str] = []
 
@@ -944,23 +945,23 @@ def test_d042_migration_creates_and_drops_execution_thread_and_automation_worksp
     def _autocommit_block():
         yield
 
-    fake_ctx = MagicMock()
+    fake_ctx = create_autospec(MigrationContext, instance=True)
     fake_ctx.autocommit_block.side_effect = _autocommit_block
     fake_conn = _FakeConn()
 
     with (
-        patch.object(d042.op, "get_context", return_value=fake_ctx),
-        patch.object(d042.op, "get_bind", return_value=fake_conn),
+        patch.object(d043.op, "get_context", return_value=fake_ctx),
+        patch.object(d043.op, "get_bind", return_value=fake_conn),
     ):
-        d042.upgrade()
-        d042.downgrade()
+        d043.upgrade()
+        d043.downgrade()
 
     joined = "\n".join(executed_sql)
-    assert f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {d042.EXECUTION_THREAD_INDEX}" in joined
+    assert f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {d043.EXECUTION_THREAD_INDEX}" in joined
     assert "ON automation_executions (conversation_thread_id, created_at DESC, automation_execution_id DESC)" in joined
-    assert f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {d042.AUTOMATION_USER_WORKSPACE_INDEX}" in joined
-    assert f"DROP INDEX CONCURRENTLY IF EXISTS {d042.EXECUTION_THREAD_INDEX}" in joined
-    assert f"DROP INDEX CONCURRENTLY IF EXISTS {d042.AUTOMATION_USER_WORKSPACE_INDEX}" in joined
+    assert f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {d043.AUTOMATION_USER_WORKSPACE_INDEX}" in joined
+    assert f"DROP INDEX CONCURRENTLY IF EXISTS {d043.EXECUTION_THREAD_INDEX}" in joined
+    assert f"DROP INDEX CONCURRENTLY IF EXISTS {d043.AUTOMATION_USER_WORKSPACE_INDEX}" in joined
 
 
 def _run_full_last_execution_probe_sqlite(
