@@ -119,6 +119,12 @@ async def read_activity(
             ),
             timeout=_READ_TIMEOUT_S,
         )
+        # --- DALTON-HOOK(execution-delivery-status): enrich today's settled runs with delivery summary ---
+        from src.dalton.services.execution_delivery_status import (
+            enrich_executions_with_delivery_summary,
+        )
+
+        await enrich_executions_with_delivery_summary(runs)
         # --- DALTON-HOOK(workspace-sharing-settings): begin ---
         colleague_workspaces: list[dict[str, Any]] | None = None
         from src.dalton.settings import is_dalton_supabase_auth_enabled
@@ -331,9 +337,19 @@ def _run_line(run: dict[str, Any], zone: Zone) -> str:
         else _RUN_FAILURE.get(str(run.get("failure_reason")))
         or _one_line(run.get("error_message"), _EXCERPT_CHARS)
     )
+    # DALTON-HOOK(execution-delivery-status): surface terminal/partial/retrying delivery state on completed runs
+    status_label = _RUN_STATUS.get(status, status)
+    if status == "completed":
+        from src.dalton.services.execution_delivery_status import (
+            format_execution_delivery_note,
+        )
+
+        delivery_label = format_execution_delivery_note(run, lang="en")
+        if delivery_label:
+            status_label = _one_line(delivery_label, _EXCERPT_CHARS) or status_label
     line = (
         f"- {run['completed_at'].astimezone(zone):%H:%M} {name}, "
-        f"{_RUN_STATUS.get(status, status)}{f': {said}' if said else ''}"
+        f"{status_label}{f': {said}' if said else ''}"
     )
     thread = run.get("conversation_thread_id")
     return f"{line} (thread_id `{thread}`)" if thread else line

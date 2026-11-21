@@ -5,6 +5,7 @@ import { HeaderButton } from '@/components/mcp/McpPrimitives';
 import { ErrorLink } from '@/components/ui/error-banner';
 import type { AutomationExecution } from '@/types/automation';
 import type { PageLinkSpec } from '@/utils/rateLimitError';
+import { formatDeliveryFailureReason } from '../utils/delivery'; // DALTON-HOOK(execution-delivery-status)
 import type { RunView } from '../utils/status';
 import { StatusGlyph } from './StatusMark';
 import './RunReport.css';
@@ -40,6 +41,30 @@ export function RunReport({ run, view, meta, layout, busy, onSkip, onOpenThread,
   const { t } = useTranslation();
   const classes = LAYOUT[layout];
   const hasThread = !!run.conversation_thread_id;
+  // DALTON-HOOK(execution-delivery-status): format delivery failure detail or retrying note for completed runs
+  const delivery = run.status === 'completed' ? view.deliverySummary : null;
+  const deliveryReason =
+    delivery && (delivery.status === 'failed' || delivery.status === 'partial_failed')
+      ? formatDeliveryFailureReason(delivery.failure_code, delivery.failure_reason, t)
+      : null;
+  const deliveryErrorLine =
+    delivery?.status === 'failed'
+      ? deliveryReason
+        ? t('automation.deliveryFailedDetail', { reason: deliveryReason })
+        : t('automation.deliveryStatusFailed')
+      : delivery?.status === 'partial_failed'
+        ? deliveryReason
+          ? t('automation.deliveryPartialFailedDetail', {
+              failed: delivery.failed_count,
+              total: delivery.total_targets,
+              reason: deliveryReason,
+            })
+          : t('automation.deliveryPartialFailedNoReason', {
+              failed: delivery.failed_count,
+              total: delivery.total_targets,
+            })
+        : null;
+  const deliveryRetrying = delivery?.status === 'retrying';
   return (
     <>
       <div className="automation-mono automation-run-meta">
@@ -48,6 +73,9 @@ export function RunReport({ run, view, meta, layout, busy, onSkip, onOpenThread,
       </div>
       {run.excerpt && <p className={classes.excerpt}>{run.excerpt}</p>}
       {view.ui.danger && run.error_message && <p className="automation-mono automation-run-error">{run.error_message}</p>}
+      {/* DALTON-HOOK(execution-delivery-status): render delivery failure reason or retrying note */}
+      {deliveryErrorLine && <p className="automation-mono automation-run-error">{deliveryErrorLine}</p>}
+      {deliveryRetrying && <p className="automation-run-note">{t('automation.deliveryRetryingNote')}</p>}
       {view.noteKey && <p className="automation-run-note">{t(view.noteKey)}</p>}
       {(view.waiting || onRetry || onResume || links.length > 0 || hasThread) && (
         <div className="automation-run-actions">

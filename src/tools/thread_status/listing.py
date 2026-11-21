@@ -362,6 +362,15 @@ def automation_item(row: Mapping[str, Any], now: datetime) -> Item | None:
             at=started,
         )
     last_word = _RUN_WORD.get(str(run_status)) if run_status else None
+    # DALTON-HOOK(execution-delivery-status): surface delivery failure/retrying on completed automation summary
+    if run_status == "completed":
+        from src.dalton.services.execution_delivery_status import (
+            format_execution_delivery_note,
+        )
+
+        delivery_word = format_execution_delivery_note(last, lang="en")
+        if delivery_word:
+            last_word = _one_line(delivery_word)
     next_run = as_datetime(row.get("next_run_at"))
     if row.get("status") == "active" and next_run is not None:
         return Item(
@@ -400,6 +409,15 @@ def automation_detail(row: Mapping[str, Any], now: datetime, automations_dir: st
         lines.append(f"Next run: {_local(next_run, row):%a %Y-%m-%d %H:%M}")
     if last.get("status"):
         word = _RUN_WORD.get(str(last["status"]), str(last["status"]))
+        # DALTON-HOOK(execution-delivery-status): surface delivery failure/retrying in automation detail
+        if last.get("status") == "completed":
+            from src.dalton.services.execution_delivery_status import (
+                format_execution_delivery_note,
+            )
+
+            delivery_word = format_execution_delivery_note(last, lang="en")
+            if delivery_word:
+                word = _one_line(delivery_word)
         when = f" {_local(last_at, row):%a %Y-%m-%d %H:%M}" if last_at else ""
         lines.append(f"Last run: {word}{when}")
     lines.append(f"File: {automations_dir}/{row.get('file_name')}")

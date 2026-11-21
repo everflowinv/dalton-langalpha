@@ -25,6 +25,7 @@ import {
   deliveryEntryName,
   deliveryMethodName,
   deliveryNames,
+  formatDeliveryFailureReason, // DALTON-HOOK(execution-delivery-status)
 } from '../utils/delivery';
 import { distanceLabel } from '../utils/price';
 import { scheduleSentence } from '../utils/schedule';
@@ -434,18 +435,37 @@ function RunHistory({
         </thead>
         <tbody>
           {executions.map((e) => {
-            const { ui, showDuration } = describeRun(e);
+            const { ui, showDuration, deliverySummary } = describeRun(e);
             // Only a failure's label takes the glyph's color: amber marks
             // liveness on the glyph and never tints words.
             const attempts = e.delivery_result ?? [];
+            // DALTON-HOOK(execution-delivery-status): localize attempt errors and fall back to delivery_summary when delivery_result is absent
+            const attemptErrors = attempts.flatMap((d) => {
+              if (d.success || !d.error) return [];
+              const localized = formatDeliveryFailureReason(null, d.error, t) ?? d.error;
+              return [t('automation.deliveryNamedProblem', { name: deliveryAttemptName(d, t, names), message: localized })];
+            });
+            const summaryError =
+              attemptErrors.length === 0 &&
+              deliverySummary &&
+              (deliverySummary.status === 'failed' || deliverySummary.status === 'partial_failed')
+                ? formatDeliveryFailureReason(deliverySummary.failure_code, deliverySummary.failure_reason, t)
+                : null;
             const errors = [
               ...(ui.danger && e.error_message ? [e.error_message] : []),
-              ...attempts.flatMap((d) =>
-                !d.success && d.error
-                  ? [t('automation.deliveryNamedProblem', { name: deliveryAttemptName(d, t, names), message: d.error })]
-                  : [],
-              ),
+              ...attemptErrors,
+              ...(summaryError ? [summaryError] : []),
             ];
+            const deliverySummaryLabelKey =
+              deliverySummary?.status === 'failed'
+                ? 'automation.deliveryStatusFailed'
+                : deliverySummary?.status === 'partial_failed'
+                  ? 'automation.deliveryStatusPartialFailed'
+                  : deliverySummary?.status === 'retrying'
+                    ? 'automation.deliveryStatusRetrying'
+                    : deliverySummary?.status === 'delivered'
+                      ? 'automation.deliveryStatusDelivered'
+                      : null;
             const shown = e.automation_execution_id === shownId;
             return (
               <Fragment key={e.automation_execution_id}>
@@ -469,15 +489,25 @@ function RunHistory({
                   </td>
                   <td className="automation-mono">{showDuration ? formatDuration(e.started_at, e.completed_at, t) : ''}</td>
                   <td className="automation-history-delivery">
-                    {attempts.map((d, i) => (
-                      <span key={`${d.method}|${d.address ?? ''}|${i}`} className="automation-history-attempt">
-                        {!d.success && (
-                          <AlertCircle className="h-3 w-3 shrink-0" style={{ color: 'var(--color-icon-danger)' }} aria-label={t('automation.runFailed')} />
+                    {/* DALTON-HOOK(execution-delivery-status): render delivery_summary status when delivery_result is absent */}
+                    {attempts.length > 0
+                      ? attempts.map((d, i) => (
+                          <span key={`${d.method}|${d.address ?? ''}|${i}`} className="automation-history-attempt">
+                            {!d.success && (
+                              <AlertCircle className="h-3 w-3 shrink-0" style={{ color: 'var(--color-icon-danger)' }} aria-label={t('automation.runFailed')} />
+                            )}
+                            {/* Where it landed and how; an older run says only which app. */}
+                            {isLegacyAttempt(d) ? deliveryMethodName(d.method, t) : deliveryAttemptLabel(d, t, names)}
+                          </span>
+                        ))
+                      : deliverySummaryLabelKey && (
+                          <span className="automation-history-attempt">
+                            {(deliverySummary?.status === 'failed' || deliverySummary?.status === 'partial_failed') && (
+                              <AlertCircle className="h-3 w-3 shrink-0" style={{ color: 'var(--color-icon-danger)' }} aria-label={t('automation.deliveryStatusFailed')} />
+                            )}
+                            {t(deliverySummaryLabelKey)}
+                          </span>
                         )}
-                        {/* Where it landed and how; an older run says only which app. */}
-                        {isLegacyAttempt(d) ? deliveryMethodName(d.method, t) : deliveryAttemptLabel(d, t, names)}
-                      </span>
-                    ))}
                   </td>
                   <td className="text-right">
                     {e.conversation_thread_id && (

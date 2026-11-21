@@ -794,6 +794,11 @@ async def list_automations_for_scope(
     )
     items = [AutomationResponse.model_validate(r) for r in rows]
     await populate_automation_notify_state(principal.user_id, items)
+    from src.dalton.services.execution_delivery_status import (
+        enrich_automations_with_delivery_summary,
+    )
+
+    await enrich_automations_with_delivery_summary(items)
     return AutomationsListResponse(automations=items, total=total)
 
 

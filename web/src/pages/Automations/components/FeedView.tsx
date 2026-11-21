@@ -13,7 +13,7 @@ import { useRecentRuns } from '../hooks/useRecentRuns';
 import type { TemplateId } from '../utils/templates';
 import { deliveryAttemptLabel } from '../utils/delivery';
 import { groupRunsByDay, nearDayKeys, runTime } from '../utils/feed';
-import { automationActions, describeRun } from '../utils/status';
+import { automationActions, describeRun, isRunFailed } from '../utils/status'; // DALTON-HOOK(execution-delivery-status)
 import { formatClock, formatDayHeading, formatDuration } from '../utils/time';
 import { StatusGlyph } from './StatusMark';
 import { FeedRail } from './FeedRail';
@@ -183,7 +183,12 @@ function RunEntry({
   const now = useNow(60_000, !!ui.live);
 
   const meta: string[] = [];
-  if (run.status !== 'completed') meta.push(t(ui.labelKey));
+  // DALTON-HOOK(execution-delivery-status): show status in feed when completed run's delivery failed, partially failed, or is retrying
+  const showDeliveryStatus =
+    view.deliveryStatus === 'failed' ||
+    view.deliveryStatus === 'partial_failed' ||
+    view.deliveryStatus === 'retrying';
+  if (run.status !== 'completed' || showDeliveryStatus) meta.push(t(ui.labelKey));
   meta.push(placeLabel(run));
   if (ui.live) {
     if (run.started_at) meta.push(t('automation.startedAgo', { when: relativeTime(run.started_at, locale, now) }));
@@ -194,8 +199,8 @@ function RunEntry({
   for (const attempt of run.delivery_result ?? []) meta.push(deliveryAttemptLabel(attempt, t));
 
   // Retry is a fresh run, offered as the inspector's Run now is; a disabled
-  // automation has to be resumed first.
-  const remedy = ui.danger && automation ? automationActions(automation).remedy : null;
+  // automation has to be resumed first. Only failed executions offer run retry.
+  const remedy = isRunFailed(run.status) && automation ? automationActions(automation).remedy : null;
 
   return (
     <article className="automation-run rule-b">

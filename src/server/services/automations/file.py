@@ -220,6 +220,16 @@ def _state(row: dict[str, Any]) -> dict[str, Any]:
             run["error"] = error if len(error) <= _ERROR_EXCERPT else f"{error[:_ERROR_EXCERPT]}…"
         if last.get("dismissed_at"):
             run["dismissed"] = True
+        # DALTON-HOOK(execution-delivery-status): expose delivery_status and failure reason on last_run without altering status
+        from src.dalton.services.execution_delivery_status import (
+            resolve_execution_delivery_summary,
+        )
+
+        delivery_summary = resolve_execution_delivery_summary(last)
+        if delivery_summary:
+            run["delivery_status"] = delivery_summary["status"]
+            if delivery_summary.get("failure_reason"):
+                run["delivery_failure_reason"] = delivery_summary["failure_reason"]
         state["last_run"] = run
     if row.get("failure_count"):
         state["failure_count"] = row["failure_count"]
@@ -243,7 +253,14 @@ def _render(row: dict[str, Any]) -> tuple[str, str]:
 
 async def rendered_files(user_id: str) -> dict[str, tuple[str, str]]:
     """Every automation's file, by file name: its content and version."""
-    return {row["file_name"]: _render(row) for row in await auto_db.list_all_automations(user_id)}
+    rows = await auto_db.list_all_automations(user_id)
+    # DALTON-HOOK(execution-delivery-status): enrich last_execution before rendering livefs automation files
+    from src.dalton.services.execution_delivery_status import (
+        enrich_automations_with_delivery_summary,
+    )
+
+    await enrich_automations_with_delivery_summary(rows)
+    return {row["file_name"]: _render(row) for row in rows}
 
 
 async def file_names(user_id: str) -> list[str]:

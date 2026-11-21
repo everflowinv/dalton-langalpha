@@ -32,6 +32,10 @@ export function pollMs(live: boolean): number {
  * when its automation has somewhere to deliver (`awaitsRecord`).
  */
 export function isDeliverySettling(run: AutomationExecution, awaitsRecord: boolean, now = Date.now()): boolean {
+  // DALTON-HOOK(execution-delivery-status): poll while delivery_summary is retrying; stop once terminal
+  if (run.delivery_summary) {
+    return run.delivery_summary.status === 'retrying';
+  }
   if (!run.completed_at) return false;
   // NaN, from a timestamp that doesn't parse, settles nothing.
   if (!(now - Date.parse(run.completed_at) < DELIVERY_SETTLE_MS)) return false;

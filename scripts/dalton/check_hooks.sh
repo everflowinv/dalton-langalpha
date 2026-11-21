@@ -460,6 +460,9 @@ ALLOWED_HOOKS=(
   "browser-kill-switch"
   # Background-slot calls default to low reasoning effort (src/server/services/llm/config.py).
   "background-effort-low"
+  # Surface terminal/partial/retrying delivery outcomes on completed executions
+  # in execution history, detail, CoS activity, ThreadStatus, and automation state files.
+  "execution-delivery-status"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

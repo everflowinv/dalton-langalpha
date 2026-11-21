@@ -1,7 +1,16 @@
 import type { TFunction } from 'i18next';
 import { isDmAddress, messagingAppName, platformOf } from '@/pages/ChatAgent/components/messaging/messageDelivery';
 import { apiErrorDetail, apiErrorStatus } from '@/api/errors';
-import type { DeliveryAttempt, DeliveryDefault, DeliveryOptions } from '@/types/automation';
+// DALTON-HOOK(execution-delivery-status): import execution delivery summary types
+import type {
+  AutomationExecution,
+  DeliveryAttempt,
+  DeliveryDefault,
+  DeliveryOptions,
+  ExecutionDeliveryStatus,
+  ExecutionDeliverySummary,
+  ExecutionDeliveryTarget,
+} from '@/types/automation';
 import { mutationErrorMessage } from './errors';
 
 const METHOD_KEY: Record<string, string> = {
@@ -161,4 +170,153 @@ export function deliveryDefaultError(err: unknown, t: TFunction): string {
     : [];
   if (messages.length) return messages.join(' ');
   return mutationErrorMessage(err, t('automation.deliveryDefaultFailed'));
+}
+
+// DALTON-HOOK(execution-delivery-status): normalize and localize execution delivery outcomes & failure reasons
+const UNCONFIRMED_DELIVERY_PREFIX = "Delivery couldn't be confirmed.";
+const DELIVERY_SETTLE_WINDOW_MS = 3 * 60_000;
+const SYNCED_UNDELIVERED_RE = /已生成但未送达[（(]([^）)]+)[）)]/;
+const CARD_ELEMENT_LIMIT_RE = /(?:element\s+card\s+limit|exceeds\s+\d+\s+element\s+card\s+limit)/i;
+const CARD_BYTE_LIMIT_RE = /(?:byte\s+card\s+limit|exceeds\s+\d+\s+byte\s+card\s+limit|30720|card\s+too\s+large)/i;
+
+const DELIVERY_REASON_KEY: Record<string, string> = {
+  card_limit_exceeded: 'automation.deliveryReasonCardLimit',
+  card_element_limit_exceeded: 'automation.deliveryReasonCardElementLimit',
+  attempts_exhausted: 'automation.deliveryReasonAttemptsExhausted',
+  target_failed: 'automation.deliveryReasonTargetFailed',
+  delivery_failed: 'automation.deliveryReasonTargetFailed',
+  feishu_cards_not_supported: 'automation.deliveryReasonUnsupportedMedia',
+  images_not_supported: 'automation.deliveryReasonUnsupportedMedia',
+  image_placeholder_not_supported: 'automation.deliveryReasonUnsupportedMedia',
+  missing_card: 'automation.deliveryReasonEmptyContent',
+  missing_text: 'automation.deliveryReasonEmptyContent',
+  unsupported_platform: 'automation.deliveryReasonUnsupportedPlatform',
+  service_token_unconfigured: 'automation.deliveryReasonGatewayUnconfigured',
+  gateway_url_unconfigured: 'automation.deliveryReasonGatewayUnconfigured',
+  connecterror: 'automation.deliveryReasonGatewayUnavailable',
+  connecttimeout: 'automation.deliveryReasonGatewayUnavailable',
+  http_500: 'automation.deliveryReasonGatewayUnavailable',
+  http_502: 'automation.deliveryReasonGatewayUnavailable',
+  http_503: 'automation.deliveryReasonGatewayUnavailable',
+  http_504: 'automation.deliveryReasonGatewayUnavailable',
+  not_allowed: 'automation.deliveryReasonNotAllowed',
+};
+
+export function detectDeliveryErrorCode(
+  code: string | null | undefined,
+  message?: string | null,
+): string | null {
+  let rawCode = (code ?? '').trim();
+  const rawMsg = (message ?? '').trim();
+  if (!rawCode && rawMsg) {
+    const matched = SYNCED_UNDELIVERED_RE.exec(rawMsg);
+    if (matched?.[1]) rawCode = matched[1].trim();
+  }
+  const lower = rawCode.toLowerCase();
+  if (CARD_ELEMENT_LIMIT_RE.test(rawMsg)) return 'card_element_limit_exceeded';
+  if (lower === 'card_limit_exceeded' || CARD_BYTE_LIMIT_RE.test(rawMsg)) return 'card_limit_exceeded';
+  if (lower && lower in DELIVERY_REASON_KEY) return lower;
+  return lower || null;
+}
+
+export function formatDeliveryFailureReason(
+  code: string | null | undefined,
+  fallback: string | null | undefined,
+  t: TFunction,
+): string | null {
+  const detected = detectDeliveryErrorCode(code, fallback);
+  if (detected && DELIVERY_REASON_KEY[detected]) {
+    return t(DELIVERY_REASON_KEY[detected]);
+  }
+  const raw = (fallback ?? '').trim();
+  if (raw) {
+    const matched = SYNCED_UNDELIVERED_RE.exec(raw);
+    if (matched?.[1]) {
+      const inner = matched[1].trim();
+      const innerKey = DELIVERY_REASON_KEY[inner.toLowerCase()];
+      return innerKey ? t(innerKey) : inner;
+    }
+    return raw;
+  }
+  return detected;
+}
+
+export function resolveExecutionDelivery(
+  run: Pick<AutomationExecution, 'delivery_summary' | 'delivery_result' | 'completed_at'>,
+  now = Date.now(),
+): ExecutionDeliverySummary | null {
+  if (run.delivery_summary) return run.delivery_summary;
+  const attempts = run.delivery_result;
+  if (!attempts || attempts.length === 0) return null;
+
+  const withinSettle =
+    !!run.completed_at &&
+    (() => {
+      const elapsed = now - Date.parse(run.completed_at);
+      return elapsed >= 0 && elapsed < DELIVERY_SETTLE_WINDOW_MS;
+    })();
+
+  const targets: ExecutionDeliveryTarget[] = [];
+  let sentCount = 0;
+  let failedCount = 0;
+  let retryingCount = 0;
+  let firstCode: string | null = null;
+  const failureReasons: string[] = [];
+
+  for (const attempt of attempts) {
+    if (attempt.success) {
+      sentCount += 1;
+      targets.push({
+        target: attempt.address ?? attempt.method,
+        channel: attempt.method.split(':', 1)[0]?.toLowerCase() || null,
+        name: attempt.name ?? null,
+        status: 'sent',
+      });
+      continue;
+    }
+    const err = (attempt.error ?? '').trim();
+    if (err.startsWith(UNCONFIRMED_DELIVERY_PREFIX) && withinSettle) {
+      retryingCount += 1;
+      targets.push({
+        target: attempt.address ?? attempt.method,
+        channel: attempt.method.split(':', 1)[0]?.toLowerCase() || null,
+        name: attempt.name ?? null,
+        status: 'retrying',
+      });
+      continue;
+    }
+    failedCount += 1;
+    const detected = detectDeliveryErrorCode(null, err);
+    if (!firstCode && detected) firstCode = detected;
+    if (err && !failureReasons.includes(err)) failureReasons.push(err);
+    targets.push({
+      target: attempt.address ?? attempt.method,
+      channel: attempt.method.split(':', 1)[0]?.toLowerCase() || null,
+      name: attempt.name ?? null,
+      status: 'failed',
+      error_code: detected,
+      error_message: err || null,
+    });
+  }
+
+  let status: ExecutionDeliveryStatus;
+  if (retryingCount > 0) status = 'retrying';
+  else if (failedCount === 0) status = 'delivered';
+  else if (sentCount > 0) status = 'partial_failed';
+  else status = 'failed';
+
+  return {
+    status,
+    total_targets: targets.length,
+    sent_count: sentCount,
+    failed_count: failedCount,
+    retrying_count: retryingCount,
+    failure_code: status === 'failed' || status === 'partial_failed' ? firstCode : null,
+    failure_reason:
+      (status === 'failed' || status === 'partial_failed') && failureReasons.length > 0
+        ? failureReasons[0]
+        : null,
+    failure_reasons: status === 'failed' || status === 'partial_failed' ? failureReasons : [],
+    targets,
+  };
 }

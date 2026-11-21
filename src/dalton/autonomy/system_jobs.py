@@ -155,6 +155,13 @@ def _summarize_last_execution(
     ).strip()
 
     if st == "completed":
+        from src.dalton.services.execution_delivery_status import (
+            format_execution_delivery_note,
+        )
+
+        delivery_note = format_execution_delivery_note(last_exec, lang="zh")
+        if delivery_note:
+            return ts_str, delivery_note
         return ts_str, (excerpt[:80] if excerpt else "执行完成")
     if st == "skipped":
         if kind == "data_health" and skip_reason in ("", "precheck", "skip"):
@@ -1729,6 +1736,11 @@ async def list_system_jobs(user_id: str) -> dict[str, Any]:
     pm = is_pm_user(uid)
     is_internal = await get_user_tier(uid) in ("admin", "internal")
     rows = await list_all_user_automations(uid, name_prefix="dalton-")
+    from src.dalton.services.execution_delivery_status import (
+        enrich_automations_with_delivery_summary,
+    )
+
+    await enrich_automations_with_delivery_summary(rows)
     by_name: dict[str, dict[str, Any]] = {}
     for r in rows:
         if isinstance(r, dict) and r.get("name"):
@@ -1903,6 +1915,11 @@ async def get_system_job_status(
         raise ValueError(f"未找到运维任务: {key}")
 
     rows = await list_all_user_automations(uid, name_prefix="dalton-")
+    from src.dalton.services.execution_delivery_status import (
+        enrich_automations_with_delivery_summary,
+    )
+
+    await enrich_automations_with_delivery_summary(rows)
     if scope == "home":
         specs = build_global_director_specs()
         by_name = {
