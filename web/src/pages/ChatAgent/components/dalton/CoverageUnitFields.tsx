@@ -88,7 +88,7 @@ export function CoverageUnitFields({
               className="w-full"
               style={INPUT_STYLE}
             />
-            <div className="cwm-field-hint" style={tickerTooLong ? { color: 'var(--color-danger, #ef4444)' } : undefined}>
+            <div className="cwm-field-hint" style={tickerTooLong ? { color: 'var(--color-loss)' } : undefined}>
               {tickerTooLong
                 ? t(
                     'workspace.coverage.tickerLengthExceeded',
@@ -116,7 +116,7 @@ export function CoverageUnitFields({
               className="w-full"
               style={INPUT_STYLE}
             />
-            <div className="cwm-field-hint" style={displayNameTooLong ? { color: 'var(--color-danger, #ef4444)' } : undefined}>
+            <div className="cwm-field-hint" style={displayNameTooLong ? { color: 'var(--color-loss)' } : undefined}>
               {displayNameTooLong
                 ? t(
                     'workspace.coverage.displayNameLengthExceeded',
@@ -148,7 +148,7 @@ export function CoverageUnitFields({
             className="w-full"
             style={INPUT_STYLE}
           />
-          <div className="cwm-field-hint" style={displayNameTooLong ? { color: 'var(--color-danger, #ef4444)' } : undefined}>
+          <div className="cwm-field-hint" style={displayNameTooLong ? { color: 'var(--color-loss)' } : undefined}>
             {displayNameTooLong
               ? t(
                   'workspace.coverage.displayNameLengthExceeded',
