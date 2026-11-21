@@ -1837,9 +1837,12 @@
       "summaryReadableWithLead": "「{{company}}」已有工作区「{{workspace}}」（所有者 {{owner}}，主分析师 {{lead}}），请直接在那里继续。确实要另建，请确认后重试。",
       "summaryReadable": "「{{company}}」已有工作区「{{workspace}}」（所有者 {{owner}}），请直接在那里继续。确实要另建，请确认后重试。",
       "summaryUnreadable": "「{{company}}」已有工作区「{{workspace}}」（所有者 {{owner}}），你目前没有访问权限，可以请 {{owner}} 开放共享。确实要另建，请确认后重试。",
+      "summaryUnboundUnitWithLead": "「{{company}}」已登记为团队覆盖公司（主分析师 {{lead}}），尚未绑定工作区",
+      "summaryUnboundUnit": "「{{company}}」已登记为团队覆盖公司，尚未绑定工作区",
       "summaryFallback": "「{{company}}」已存在相关工作区。确实要另建，请确认后重试。",
       "openWorkspace": "打开该工作区",
       "askOwnerShare": "请所有者开放共享",
+      "unboundUnit": "尚未绑定工作区",
       "createAnyway": "仍然新建",
       "ownerLabel": "所有者 {{owner}}",
       "leadLabel": "主分析师 {{lead}}"

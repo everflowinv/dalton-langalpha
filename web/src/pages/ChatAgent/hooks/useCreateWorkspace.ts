@@ -34,17 +34,26 @@ export function companyWorkspaceExistsOf(err: unknown): CompanyWorkspaceExistsIn
   const matches: DuplicateWorkspaceMatch[] = rawMatches.flatMap((item) => {
     if (!item || typeof item !== 'object') return [];
     const rec = item as Record<string, unknown>;
+    const unboundUnit = Boolean(rec.unbound_unit);
     const workspaceName = typeof rec.workspace_name === 'string' ? rec.workspace_name : '';
     const ownerName = typeof rec.owner_name === 'string' ? rec.owner_name : '';
-    if (!workspaceName || !ownerName) return [];
+    const displayName = typeof rec.display_name === 'string' ? rec.display_name : '';
+    const ticker = typeof rec.ticker === 'string' ? rec.ticker : '';
+    if (unboundUnit) {
+      if (!displayName && !ticker) return [];
+    } else if (!workspaceName || !ownerName) {
+      return [];
+    }
     return [
       {
         workspace_id: typeof rec.workspace_id === 'string' ? rec.workspace_id : null,
-        workspace_name: workspaceName,
-        owner_name: ownerName,
+        workspace_name: workspaceName || null,
+        owner_name: ownerName || null,
+        display_name: displayName || null,
         lead_analyst_name: typeof rec.lead_analyst_name === 'string' ? rec.lead_analyst_name : null,
-        ticker: typeof rec.ticker === 'string' ? rec.ticker : null,
+        ticker: ticker || null,
         can_read: Boolean(rec.can_read),
+        unbound_unit: unboundUnit,
       },
     ];
   });

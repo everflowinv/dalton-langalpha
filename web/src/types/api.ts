@@ -215,14 +215,16 @@ export interface WorkspaceCreate {
   allow_duplicate_company?: boolean;
 }
 
-// DALTON-HOOK(workspace-dedup): matched existing company workspace from 409 company_workspace_exists
+// DALTON-HOOK(workspace-dedup): matched existing company workspace or unbound coverage unit from 409 company_workspace_exists
 export interface DuplicateWorkspaceMatch {
   workspace_id?: string | null;
-  workspace_name: string;
-  owner_name: string;
+  workspace_name?: string | null;
+  owner_name?: string | null;
+  display_name?: string | null;
   lead_analyst_name?: string | null;
   ticker?: string | null;
   can_read: boolean;
+  unbound_unit?: boolean;
 }
 
 /** Count-quota status for one elevated capability. `limit === -1` means unlimited. */

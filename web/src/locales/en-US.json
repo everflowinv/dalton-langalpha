@@ -1792,9 +1792,12 @@
       "summaryReadableWithLead": "{{company}} already has a workspace \"{{workspace}}\" (owner: {{owner}}, lead: {{lead}}). Continue there, or confirm to create another.",
       "summaryReadable": "{{company}} already has a workspace \"{{workspace}}\" (owner: {{owner}}). Continue there, or confirm to create another.",
       "summaryUnreadable": "{{company}} already has a workspace \"{{workspace}}\" (owner: {{owner}}). You do not have access yet — ask {{owner}} to share it, or confirm to create another.",
+      "summaryUnboundUnitWithLead": "\"{{company}}\" is already registered as a team coverage company (lead: {{lead}}) with no workspace bound yet.",
+      "summaryUnboundUnit": "\"{{company}}\" is already registered as a team coverage company with no workspace bound yet.",
       "summaryFallback": "A workspace for \"{{company}}\" already exists. Confirm to create another.",
       "openWorkspace": "Open this workspace",
       "askOwnerShare": "Ask the owner to share access",
+      "unboundUnit": "No workspace bound yet",
       "createAnyway": "Create anyway",
       "ownerLabel": "Owner: {{owner}}",
       "leadLabel": "Lead: {{lead}}"

@@ -1,21 +1,31 @@
 """Company workspace deduplication before creating a new workspace.
 
-Collects candidate workspaces (and bound active company coverage units for
-internal team members) within strict tier visibility boundaries, then delegates
-"is this the same company?" matching to an LLM via `dalton_complete` using
-`models.assist_model` (falling back to `models.assist_fallback_model`).
+Collects candidate workspaces (and active company coverage units, bound or
+unbound, for internal team members) within strict tier visibility boundaries,
+then delegates "is this the same company?" matching to an LLM via
+`dalton_complete` using the Dalton assist model chain (`resolve_assist_model` /
+`resolve_assist_fallback_models`, which filter out caller custom_models and
+forbidden role variants).
 
-Visibility and authorization remain strictly deterministic in code:
+Visibility, credentials, and authorization remain strictly deterministic in code:
 - Active only when both `is_coverage_units_enabled()` and
   `is_dalton_supabase_auth_enabled()` are True.
 - `company` tier callers bypass dedup.
 - `external` tier callers check ONLY their own live, non-Home,
   non-historical-duplicate workspaces (no coverage units, no internal data).
+  External callers always use their own credentials (never shared team
+  credentials); if missing credentials cause model calls to fail, dedup treats
+  it as an error, logs a warning, and allows creation to proceed.
 - `admin` / `internal` tier callers check all internal members' live,
   non-Home, non-historical-duplicate workspaces (all kinds: company, sector,
-  topic) enriched with active company coverage units and latest company docs.
+  topic) enriched with active company coverage units and latest company docs,
+  plus active unbound company coverage units.
 - Caller's own exact `workspace_name_key` exits early for `WorkspaceNameTaken`
   without calling the model.
+- Each model call passes a per-call `scope_ref` containing `user_id` and a
+  unique nonce (with `skip_journal=False`) so budget checks and usage recording
+  run normally under the caller's account without cross-user/retry journal
+  deduplication or replay.
 - Advisory only: DB/LLM/timeout/budget/permission failures log a warning
   (exception class name only, no user data) and allow creation to proceed.
 """
@@ -27,23 +37,26 @@ import json
 import logging
 import re
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any
 
 from fastapi import HTTPException
 from psycopg.rows import dict_row
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from src.dalton.access_tiers import get_user_tier
 from src.dalton.coverage.identity import is_historical_duplicate_workspace
 from src.dalton.database.coverage_units import _norm_uuid
+from src.dalton.llm.assist import (
+    resolve_assist_fallback_models,
+    resolve_assist_model,
+)
 import src.dalton.llm.complete as complete_mod
 from src.dalton.llm.complete import dalton_complete
 from src.dalton.settings import (
-    get_assist_fallback_models,
-    get_dalton_settings,
     is_coverage_units_enabled,
     is_dalton_supabase_auth_enabled,
 )
@@ -51,6 +64,7 @@ import src.dalton.sharing as sharing_mod
 from src.server.database.home_workspace import HOME_STAND_IN_KEY, is_reserved_row
 from src.server.database.pool import get_db_connection
 from src.server.database.workspace_names import WorkspaceNameInvalid, workspace_name_key
+from src.server.services.runs.coordinator import spawn_protected
 
 logger = logging.getLogger(__name__)
 
@@ -60,10 +74,12 @@ _REAL_DALTON_COMPLETE = dalton_complete
 MAX_DUPLICATE_MATCHES = 3
 DEDUP_BATCH_SIZE = 1000
 DEDUP_TIMEOUT_SECONDS = 15.0
+DEDUP_PRIMARY_MODEL_TIMEOUT_SECONDS = 9.0
 
 DEDUP_SYSTEM_PROMPT = (
-    "你是投研工作区查重助手。给定「待新建工作区名称」和「已有工作区候选清单」，"
-    "请判断清单中是否有与待新建名称指代同一家公司的已有工作区。\n"
+    "你是投研工作区查重助手。给定「待新建工作区名称」和「已有工作区候选清单」"
+    "（含已登记但尚未绑定工作区的团队覆盖公司，其工作区名为 -），"
+    "请判断清单中是否有与待新建名称指代同一家公司的条目。\n"
     "判断标准：\n"
     "1. 只有当待新建名称与候选指代同一家公司（同一法人或同一上市主体，包括中英文名、常用简称、去掉公司后缀后的名称、股票代码的不同市场写法）时，才算重复。\n"
     "2. 同一行业、上下游合作或竞争关系、母子公司（非同一上市主体）均不算重复。\n"
@@ -73,35 +89,47 @@ DEDUP_SYSTEM_PROMPT = (
 )
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
+_UUID_RE = re.compile(
+    r"(?<![0-9a-fA-F])[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?![0-9a-fA-F])"
+)
 
 
 class DedupMatchItem(BaseModel):
     """Single duplicate candidate identified by the LLM."""
 
     id: str
-    confidence: Literal["high", "medium"]
+    confidence: str
     reason: str = ""
 
 
 class DedupLlmResult(BaseModel):
     """Structured LLM response for company workspace deduplication."""
 
-    matches: list[DedupMatchItem] = Field(default_factory=list)
+    matches: list[DedupMatchItem]
 
 
 @dataclass(frozen=True)
 class DuplicateWorkspaceCandidate:
-    """Single existing workspace matching the requested company name or ticker."""
+    """Single existing workspace or unbound coverage unit matching the requested company."""
 
-    workspace_name: str
-    owner_name: str
+    workspace_name: str | None
+    owner_name: str | None
     can_read: bool
     workspace_id: str | None = None
     lead_analyst_name: str | None = None
     ticker: str | None = None
-    matched_by: str = ""
+    display_name: str | None = None
+    unbound_unit: bool = False
 
     def to_dict(self) -> dict[str, Any]:
+        if self.unbound_unit:
+            return {
+                "unbound_unit": True,
+                "display_name": self.display_name,
+                "ticker": self.ticker,
+                "lead_analyst_name": self.lead_analyst_name,
+                "can_read": True,
+            }
         if not self.can_read:
             return {
                 "workspace_name": self.workspace_name,
@@ -140,11 +168,11 @@ class DuplicateMatch:
         return self.matches[0].workspace_id if self.matches[0].can_read else None
 
     @property
-    def workspace_name(self) -> str:
+    def workspace_name(self) -> str | None:
         return self.matches[0].workspace_name
 
     @property
-    def owner_name(self) -> str:
+    def owner_name(self) -> str | None:
         return self.matches[0].owner_name
 
     @property
@@ -165,13 +193,15 @@ class DuplicateMatch:
 
 @dataclass(frozen=True)
 class _CandidateEntry:
-    """Internal candidate workspace representation before LLM matching."""
+    """Internal candidate workspace or unbound unit representation before LLM matching."""
 
     short_id: str
     order_idx: int
-    ws_id: str
+    ws_id: str | None
+    unit_id: str | None
+    unbound_unit: bool
     workspace_name: str
-    owner_name: str
+    owner_name: str | None
     lead_analyst_name: str | None
     ticker: str | None
     unit_ticker: str | None
@@ -181,7 +211,7 @@ class _CandidateEntry:
     doc_name_zh: str | None
     is_unit: bool
     activity_ts: float
-    ws_row: dict[str, Any]
+    ws_row: dict[str, Any] | None
 
 
 def _safe_workspace_name_key(raw: str | None) -> str | None:
@@ -218,8 +248,10 @@ def _activity_timestamp(row: Mapping[str, Any]) -> float:
         "workspace_last_activity_at",
         "last_activity_at",
         "workspace_updated_at",
+        "unit_updated_at",
         "updated_at",
         "workspace_created_at",
+        "unit_created_at",
         "created_at",
     ):
         val = row.get(key)
@@ -242,6 +274,13 @@ def _activity_timestamp(row: Mapping[str, Any]) -> float:
 def _format_duplicate_message(
     company: str, primary: DuplicateWorkspaceCandidate
 ) -> str:
+    if primary.unbound_unit:
+        lead_part = (
+            f"（主分析师 {primary.lead_analyst_name}）"
+            if primary.lead_analyst_name
+            else ""
+        )
+        return f"「{company}」已登记为团队覆盖公司{lead_part}，尚未绑定工作区"
     if primary.can_read:
         lead_part = (
             f"，主分析师 {primary.lead_analyst_name}"
@@ -261,17 +300,19 @@ def _format_duplicate_message(
     )
 
 
-async def _load_active_bound_units(cur: Any) -> list[dict[str, Any]]:
+async def _load_active_company_units(cur: Any) -> list[dict[str, Any]]:
     await cur.execute(
         """
         SELECT u.unit_id::text AS unit_id,
                u.kind,
+               u.status,
                u.owner_user_id,
                COALESCE(u.lead_analyst_user_id, u.owner_user_id) AS lead_analyst_user_id,
                u.display_name,
                u.workspace_id::text AS workspace_id,
                u.ticker,
-               u.ticker_key,
+               u.updated_at AS unit_updated_at,
+               u.created_at AS unit_created_at,
                w.name AS workspace_name,
                w.user_id AS workspace_owner_id,
                w.status AS workspace_status,
@@ -286,15 +327,21 @@ async def _load_active_bound_units(cur: Any) -> list[dict[str, Any]]:
                ul.name AS lead_name,
                ul.email AS lead_email
         FROM dalton_coverage_units u
-        JOIN workspaces w ON w.workspace_id = u.workspace_id
+        LEFT JOIN workspaces w ON w.workspace_id = u.workspace_id
         LEFT JOIN users uo ON uo.user_id = w.user_id
         LEFT JOIN users uuo ON uuo.user_id = u.owner_user_id
         LEFT JOIN users ul ON ul.user_id = COALESCE(u.lead_analyst_user_id, u.owner_user_id)
         WHERE u.status = 'active'
           AND u.kind = 'company'
-          AND w.status NOT IN ('deleted', 'unbound')
-          AND (w.config->'home_stand_in') IS DISTINCT FROM 'true'::jsonb
-          AND NULLIF(BTRIM(COALESCE(w.config->>'dalton_historical_duplicate_of', '')), '') IS NULL
+          AND (
+              u.workspace_id IS NULL
+              OR (
+                  w.workspace_id IS NOT NULL
+                  AND w.status NOT IN ('deleted', 'unbound')
+                  AND (w.config->'home_stand_in') IS DISTINCT FROM 'true'::jsonb
+                  AND NULLIF(BTRIM(COALESCE(w.config->>'dalton_historical_duplicate_of', '')), '') IS NULL
+              )
+          )
         """
     )
     return [dict(r) for r in await cur.fetchall()]
@@ -535,7 +582,7 @@ async def _collect_candidates(
                     if str(ws.get("user_id") or "").strip() == uid
                 ]
             else:
-                unit_rows = await _load_active_bound_units(cur)
+                unit_rows = await _load_active_company_units(cur)
                 ws_rows = await _load_live_workspaces(cur)
 
             if stats is not None:
@@ -547,11 +594,28 @@ async def _collect_candidates(
                 return True, []
 
             units_by_ws: dict[str, dict[str, Any]] = {}
+            unbound_units: dict[str, dict[str, Any]] = {}
             if not is_external:
                 for u in unit_rows:
                     if str(u.get("kind") or "").strip().lower() != "company":
                         continue
+                    if "status" in u and str(u.get("status") or "").strip().lower() != "active":
+                        continue
                     ws_id_u = _norm_uuid(u.get("workspace_id"))
+                    if not ws_id_u:
+                        unit_id_u = _norm_uuid(u.get("unit_id"))
+                        if not unit_id_u:
+                            continue
+                        unit_owner_id = str(u.get("owner_user_id") or "").strip()
+                        unit_owner_email = (
+                            u.get("unit_owner_email")
+                            if "unit_owner_email" in u
+                            else u.get("owner_email")
+                        )
+                        if not _is_internal_team_owner(unit_owner_id, unit_owner_email):
+                            continue
+                        unbound_units[unit_id_u] = u
+                        continue
                     ws_owner_id = str(
                         u.get("workspace_owner_id") or u.get("owner_user_id") or ""
                     ).strip()
@@ -605,6 +669,8 @@ async def _collect_candidates(
                 )
                 raw_items[ws_id] = {
                     "ws_id": ws_id,
+                    "unit_id": None,
+                    "unbound_unit": False,
                     "ws_name": ws_name,
                     "owner_name": owner_name,
                     "activity_ts": _activity_timestamp(ws),
@@ -630,6 +696,8 @@ async def _collect_candidates(
                 )
                 raw_items[ws_id] = {
                     "ws_id": ws_id,
+                    "unit_id": _norm_uuid(u.get("unit_id")) or None,
+                    "unbound_unit": False,
                     "ws_name": ws_name,
                     "owner_name": owner_name,
                     "activity_ts": _activity_timestamp(u),
@@ -645,10 +713,14 @@ async def _collect_candidates(
             if stats is not None:
                 stats["workspace_count"] = max(stats["workspace_count"], len(raw_items))
 
-            if not raw_items:
+            if not raw_items and not unbound_units:
                 return False, []
 
-            docs_by_ws = await _load_workspace_company_docs(cur, sorted(raw_items))
+            docs_by_ws = (
+                await _load_workspace_company_docs(cur, sorted(raw_items))
+                if raw_items
+                else {}
+            )
 
     # Connection `c` is now released before LLM calls and permission checks.
     prelim: list[dict[str, Any]] = []
@@ -683,6 +755,7 @@ async def _collect_candidates(
         prelim.append(
             {
                 **item,
+                "unit_id": _norm_uuid(u.get("unit_id")) or None if u is not None else None,
                 "is_unit": u is not None,
                 "lead_analyst_name": lead_name,
                 "ticker": effective_ticker,
@@ -694,12 +767,45 @@ async def _collect_candidates(
             }
         )
 
+    for unit_id_u, u in unbound_units.items():
+        unit_ticker = str(u.get("ticker") or "").strip().upper() or None
+        unit_display_name = str(u.get("display_name") or "").strip() or None
+        if not unit_ticker and not unit_display_name:
+            continue
+        lead_uid = str(
+            u.get("lead_analyst_user_id") or u.get("owner_user_id") or ""
+        ).strip()
+        lead_name = (
+            _resolve_display_name(u.get("lead_name"), u.get("lead_email"), lead_uid)
+            if lead_uid
+            else None
+        )
+        prelim.append(
+            {
+                "ws_id": None,
+                "unit_id": unit_id_u,
+                "unbound_unit": True,
+                "ws_name": "",
+                "owner_name": None,
+                "activity_ts": _activity_timestamp(u),
+                "ws_row": None,
+                "is_unit": True,
+                "lead_analyst_name": lead_name,
+                "ticker": unit_ticker,
+                "unit_ticker": unit_ticker,
+                "unit_display_name": unit_display_name,
+                "doc_ticker": None,
+                "doc_name": None,
+                "doc_name_zh": None,
+            }
+        )
+
     prelim.sort(
         key=lambda x: (
             0 if x["is_unit"] else 1,
             -float(x["activity_ts"]),
-            str(x["ws_name"]).casefold(),
-            str(x["ws_id"]),
+            str(x["ws_name"] or x["unit_display_name"] or "").casefold(),
+            str(x["ws_id"] or x["unit_id"] or ""),
         )
     )
 
@@ -710,6 +816,8 @@ async def _collect_candidates(
                 short_id=f"c{idx + 1}",
                 order_idx=idx,
                 ws_id=item["ws_id"],
+                unit_id=item["unit_id"],
+                unbound_unit=item["unbound_unit"],
                 workspace_name=item["ws_name"],
                 owner_name=item["owner_name"],
                 lead_analyst_name=item["lead_analyst_name"],
@@ -727,14 +835,18 @@ async def _collect_candidates(
     return False, entries
 
 
+def _redact_uuids(text: str) -> str:
+    return _UUID_RE.sub("[id]", text)
+
+
 def _clean_cell(raw: str | None) -> str:
     if not raw:
         return ""
-    return " ".join(str(raw).replace("|", "/").split())
+    return _redact_uuids(" ".join(str(raw).replace("|", "/").split()))
 
 
 def _format_candidate_line(entry: _CandidateEntry) -> str:
-    """Format one candidate as a single pipe-delimited line without UUID or owner."""
+    """Format one candidate as a fixed 4-column pipe-delimited line without UUID or owner."""
     tickers: list[str] = []
     for raw_t in (entry.unit_ticker, entry.doc_ticker):
         cleaned_t = _clean_cell(raw_t).upper()
@@ -752,28 +864,33 @@ def _format_candidate_line(entry: _CandidateEntry) -> str:
             seen_names.add(folded)
             names.append(cleaned_n)
 
-    parts = [entry.short_id, _clean_cell(entry.workspace_name)]
-    if tickers:
-        parts.append(" / ".join(tickers))
-    if names:
-        parts.append(" / ".join(names))
-    return " | ".join(parts)
+    ws_col = _clean_cell(entry.workspace_name) or "-"
+    ticker_col = " / ".join(tickers) if tickers else "-"
+    name_col = " / ".join(names) if names else "-"
+    return f"{entry.short_id} | {ws_col} | {ticker_col} | {name_col}"
 
 
 def _build_batch_user_prompt(raw_name: str, batch: list[_CandidateEntry]) -> str:
     lines = "\n".join(_format_candidate_line(entry) for entry in batch)
-    cleaned_name = " ".join(str(raw_name or "").split())
+    cleaned_name = _redact_uuids(" ".join(str(raw_name or "").split()))
     return (
         f"待新建工作区名称：{cleaned_name}\n\n"
-        "已有工作区候选清单（每行格式：编号 | 工作区名 | 代码 | 公司名，无代码或公司名时省略）：\n"
+        "已有工作区候选清单（每行固定 4 列，格式：编号 | 工作区名 | 代码 | 公司名，缺失项用 - 表示）：\n"
         f"{lines}"
     )
 
 
-def _resolve_dedup_models() -> list[str]:
-    cfg = get_dalton_settings()
-    primary = str(getattr(cfg.models, "assist_model", "") or "").strip()
-    fallbacks = get_assist_fallback_models()
+async def _resolve_dedup_models(user_id: str) -> list[str]:
+    """Resolve assist primary and fallback models via ``assist.py`` / ``model_prefs.py``.
+
+    Uses ``resolve_assist_model`` and ``resolve_assist_fallback_models`` (which
+    delegate to ``dalton_model_pref``) so caller ``custom_models`` shadowing and
+    ``is_forbidden_for_roles`` (L21) checks are enforced.
+    """
+    primary = await resolve_assist_model(role="assist", user_id=user_id)
+    fallbacks = await resolve_assist_fallback_models(
+        role="assist_fallback", user_id=user_id
+    )
     models: list[str] = []
     for m in (primary, *fallbacks):
         cleaned = str(m or "").strip()
@@ -794,7 +911,7 @@ def _parse_llm_matches(
     comp: Any,
     batch_by_id: Mapping[str, _CandidateEntry],
 ) -> list[tuple[_CandidateEntry, str, str]]:
-    """Parse structured LLM output and keep only valid confidence & existing IDs."""
+    """Parse structured LLM output, filter confidence & IDs, and cap per batch at 3."""
     raw_data = getattr(comp, "data", None)
     raw_text = getattr(comp, "text", None)
 
@@ -819,7 +936,7 @@ def _parse_llm_matches(
     else:
         raise ValueError("Empty or unparseable dedup LLM payload")
 
-    parsed_hits: list[tuple[_CandidateEntry, str, str]] = []
+    best_by_id: dict[str, tuple[_CandidateEntry, str, str]] = {}
     for item in raw_matches:
         if isinstance(item, DedupMatchItem):
             raw_id = item.id
@@ -842,9 +959,20 @@ def _parse_llm_matches(
             continue
 
         reason = str(raw_reason or "").strip()
-        parsed_hits.append((entry, conf, reason))
+        existing = best_by_id.get(cand_id)
+        if existing is None or (existing[1] != "high" and conf == "high"):
+            best_by_id[cand_id] = (entry, conf, reason)
 
-    return parsed_hits
+    ranked = sorted(
+        best_by_id.values(),
+        key=lambda item: (
+            0 if item[1] == "high" else 1,
+            0 if item[0].is_unit else 1,
+            -item[0].activity_ts,
+            item[0].order_idx,
+        ),
+    )
+    return ranked[:MAX_DUPLICATE_MATCHES]
 
 
 async def _run_batch_with_fallback(
@@ -861,24 +989,46 @@ async def _run_batch_with_fallback(
     complete_fn = _get_dalton_complete_fn()
 
     last_exc: Exception | None = None
-    for model_name in models:
+    for idx, model_name in enumerate(models):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("Workspace dedup LLM deadline exceeded")
+        model_timeout = (
+            min(DEDUP_PRIMARY_MODEL_TIMEOUT_SECONDS, remaining)
+            if idx == 0
+            else remaining
+        )
         try:
-            comp = await complete_fn(
-                user_id=uid,
-                system_prompt=DEDUP_SYSTEM_PROMPT,
-                user_prompt=user_prompt,
-                purpose="workspace_dedup",
-                request_model=model_name,
-                response_schema=DedupLlmResult,
-                slot="background",
-                timeout_s=remaining,
-                deadline=deadline,
-                raise_on_error=False,
-                skip_journal=skip_journal,
+            call_task = spawn_protected(
+                complete_fn(
+                    user_id=uid,
+                    system_prompt=DEDUP_SYSTEM_PROMPT,
+                    user_prompt=user_prompt,
+                    scope_ref=f"workspace_dedup:{uid}:{uuid.uuid4().hex}",
+                    purpose="workspace_dedup",
+                    request_model=model_name,
+                    response_schema=DedupLlmResult,
+                    slot="background",
+                    timeout_s=model_timeout,
+                    deadline=deadline,
+                    persist_raw=False,
+                    raise_on_error=False,
+                    skip_journal=skip_journal,
+                ),
+                name=f"workspace-dedup-{model_name}",
+                log_failure=False,
             )
+            _done_calls, pending_calls = await asyncio.wait(
+                {call_task}, timeout=model_timeout
+            )
+            if pending_calls:
+                # Keep call_task detached in spawn_protected so usage/journal writes
+                # complete cleanly even after dedup stops waiting on this attempt.
+                last_exc = TimeoutError(f"Dedup model {model_name} timed out")
+                if time.monotonic() >= deadline:
+                    raise last_exc
+                continue
+            comp = call_task.result()
             if not getattr(comp, "ok", False):
                 err_kind = str(getattr(comp, "error_kind", None) or "").strip().lower()
                 status = str(getattr(comp, "status", None) or "").strip().lower()
@@ -894,7 +1044,10 @@ async def _run_batch_with_fallback(
             return _parse_llm_matches(comp, batch_by_id)
         except Exception as exc:
             last_exc = exc
-            if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) and time.monotonic() >= deadline:
+            if (
+                isinstance(exc, (asyncio.TimeoutError, TimeoutError))
+                and time.monotonic() >= deadline
+            ):
                 raise
             continue
 
@@ -914,7 +1067,7 @@ async def _judge_candidates_with_llm(
     """Run parallel batched LLM matching under a shared 15s deadline."""
     if not entries:
         return []
-    models = _resolve_dedup_models()
+    models = await _resolve_dedup_models(uid)
     if not models:
         raise RuntimeError("No assist model configured for workspace dedup")
 
@@ -973,16 +1126,17 @@ async def _judge_candidates_with_llm(
             ws_count,
         )
 
-    # Deduplicate by workspace_id (prefer higher confidence) and sort:
+    # Deduplicate by candidate identity (prefer higher confidence) and sort:
     # high before medium, then unit-backed, recent activity, original order.
-    best_by_ws: dict[str, tuple[_CandidateEntry, str, str]] = {}
+    best_by_key: dict[str, tuple[_CandidateEntry, str, str]] = {}
     for entry, conf, reason in all_hits:
-        existing = best_by_ws.get(entry.ws_id)
+        dedup_key = f"ws:{entry.ws_id}" if entry.ws_id else f"unit:{entry.unit_id}"
+        existing = best_by_key.get(dedup_key)
         if existing is None or (existing[1] != "high" and conf == "high"):
-            best_by_ws[entry.ws_id] = (entry, conf, reason)
+            best_by_key[dedup_key] = (entry, conf, reason)
 
     ranked = sorted(
-        best_by_ws.values(),
+        best_by_key.values(),
         key=lambda item: (
             0 if item[1] == "high" else 1,
             0 if item[0].is_unit else 1,
@@ -991,6 +1145,115 @@ async def _judge_candidates_with_llm(
         ),
     )
     return ranked[:MAX_DUPLICATE_MATCHES]
+
+
+async def _refresh_live_hits(
+    hits: list[tuple[_CandidateEntry, str, str]],
+    *,
+    conn: Any = None,
+) -> list[tuple[_CandidateEntry, dict[str, Any] | None, str, str]]:
+    """Re-query hit workspaces and unbound units after LLM return, releasing conn before permission checks."""
+    if not hits:
+        return []
+
+    unbound_unit_ids = sorted(
+        {entry.unit_id for entry, _, _ in hits if entry.unbound_unit and entry.unit_id}
+    )
+    ws_ids: set[str] = {
+        entry.ws_id for entry, _, _ in hits if not entry.unbound_unit and entry.ws_id
+    }
+    unit_state_by_id: dict[str, dict[str, Any]] = {}
+    live_ws_by_id: dict[str, dict[str, Any]] = {}
+
+    async with get_db_connection(conn) as c:
+        async with c.cursor(row_factory=dict_row) as cur:
+            if unbound_unit_ids:
+                unbound_set = set(unbound_unit_ids)
+                await cur.execute(
+                    """
+                    SELECT u.unit_id::text AS unit_id,
+                           u.status,
+                           u.kind,
+                           u.workspace_id::text AS workspace_id
+                    FROM dalton_coverage_units u
+                    WHERE u.unit_id = ANY(%s::uuid[])
+                    """,
+                    (unbound_unit_ids,),
+                )
+                for row in await cur.fetchall():
+                    uid_row = _norm_uuid(row.get("unit_id"))
+                    if not uid_row or uid_row not in unbound_set:
+                        continue
+                    unit_state_by_id[uid_row] = dict(row)
+                    bound_ws = _norm_uuid(row.get("workspace_id"))
+                    if bound_ws:
+                        ws_ids.add(bound_ws)
+
+            if ws_ids:
+                await cur.execute(
+                    """
+                    SELECT w.workspace_id::text AS workspace_id,
+                           w.user_id,
+                           w.name,
+                           w.status,
+                           (w.config->'home_stand_in') = 'true'::jsonb AS is_home_stand_in,
+                           NULLIF(BTRIM(COALESCE(w.config->>'dalton_historical_duplicate_of', '')), '') IS NOT NULL AS is_historical_duplicate
+                    FROM workspaces w
+                    WHERE w.workspace_id = ANY(%s::uuid[])
+                    """,
+                    (sorted(ws_ids),),
+                )
+                for row in await cur.fetchall():
+                    wid = _norm_uuid(row.get("workspace_id"))
+                    if not wid or wid not in ws_ids:
+                        continue
+                    ws_owner_id = str(row.get("user_id") or "").strip()
+                    ws_status = str(row.get("status") or "").strip()
+                    ws_name = str(row.get("name") or "").strip()
+                    if not ws_name or _is_excluded_workspace(
+                        ws_id=wid,
+                        ws_owner_id=ws_owner_id,
+                        ws_status=ws_status,
+                        row=row,
+                    ):
+                        continue
+                    live_ws_by_id[wid] = {
+                        "workspace_id": wid,
+                        "user_id": ws_owner_id,
+                        "name": ws_name,
+                        "status": ws_status,
+                    }
+
+    refreshed: list[tuple[_CandidateEntry, dict[str, Any] | None, str, str]] = []
+    for entry, conf, reason in hits:
+        if entry.unbound_unit:
+            u_row = unit_state_by_id.get(entry.unit_id or "")
+            if u_row is None:
+                continue
+            u_kind = str(u_row.get("kind") or "company").strip().lower()
+            u_status = str(
+                u_row.get("status") if "status" in u_row else "active"
+            ).strip().lower()
+            if u_kind != "company" or u_status != "active":
+                continue
+            newly_bound_ws = _norm_uuid(u_row.get("workspace_id"))
+            if newly_bound_ws:
+                fresh_ws = live_ws_by_id.get(newly_bound_ws)
+                if fresh_ws is None:
+                    continue
+                refreshed.append((entry, fresh_ws, conf, reason))
+            else:
+                refreshed.append((entry, None, conf, reason))
+            continue
+
+        if not entry.ws_id:
+            continue
+        fresh_ws = live_ws_by_id.get(entry.ws_id)
+        if fresh_ws is None:
+            continue
+        refreshed.append((entry, fresh_ws, conf, reason))
+
+    return refreshed
 
 
 async def _find_matches(
@@ -1021,11 +1284,34 @@ async def _find_matches(
     if not hits:
         return None
 
-    # Connection is already released before checking workspace permissions.
+    # Re-verify live workspace/unit status after LLM return, then release DB
+    # connection before checking workspace read permissions.
+    live_hits = await _refresh_live_hits(hits, conn=conn)
+    if not live_hits:
+        return None
+
     resolved: list[DuplicateWorkspaceCandidate] = []
     matched_ids: list[str] = []
-    for entry, conf, _reason in hits:
-        ws_id = entry.ws_id
+    for entry, fresh_ws, _conf, _reason in live_hits:
+        if entry.unbound_unit and fresh_ws is None:
+            resolved.append(
+                DuplicateWorkspaceCandidate(
+                    workspace_name=None,
+                    owner_name=None,
+                    can_read=True,
+                    workspace_id=None,
+                    lead_analyst_name=entry.lead_analyst_name,
+                    ticker=entry.ticker,
+                    display_name=entry.unit_display_name or entry.ticker,
+                    unbound_unit=True,
+                )
+            )
+            continue
+
+        ws_id = str((fresh_ws or {}).get("workspace_id") or entry.ws_id or "").strip()
+        ws_name = str((fresh_ws or {}).get("name") or entry.workspace_name or "").strip()
+        owner_name = entry.owner_name or entry.lead_analyst_name or "Teammate"
+        ws_row = fresh_ws or entry.ws_row or {}
         if ws_id:
             matched_ids.append(ws_id)
         can_read = False
@@ -1034,18 +1320,17 @@ async def _find_matches(
                 ws_id,
                 uid,
                 channel=channel,
-                workspace=entry.ws_row,
+                workspace=ws_row,
                 conn=conn,
             )
         resolved.append(
             DuplicateWorkspaceCandidate(
-                workspace_name=entry.workspace_name,
-                owner_name=entry.owner_name,
+                workspace_name=ws_name,
+                owner_name=owner_name,
                 can_read=can_read,
                 workspace_id=ws_id if can_read else None,
                 lead_analyst_name=entry.lead_analyst_name if can_read else None,
                 ticker=entry.ticker if can_read else None,
-                matched_by=f"llm:{conf}",
             )
         )
 

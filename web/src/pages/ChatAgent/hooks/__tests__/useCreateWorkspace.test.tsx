@@ -70,4 +70,45 @@ describe('useCreateWorkspace', () => {
     expect(out).toBe(created);
     expect(createWorkspace).toHaveBeenLastCalledWith('Anthropic', 'Notes', {}, 'comp-1', true);
   });
+
+  // DALTON-HOOK(workspace-dedup): preserves unbound coverage unit matches without workspace_id or owner_name
+  it('parses unbound coverage unit matches from company_workspace_exists', async () => {
+    const { companyWorkspaceExistsOf } = await import('../useCreateWorkspace');
+    const refusal = {
+      response: {
+        status: 409,
+        data: {
+          detail: {
+            code: 'company_workspace_exists',
+            message: '「Anthropic」已登记为团队覆盖公司（主分析师 Richard），尚未绑定工作区',
+            matches: [
+              {
+                unbound_unit: true,
+                display_name: 'Anthropic, PBC',
+                ticker: 'ANT',
+                lead_analyst_name: 'Richard',
+                can_read: true,
+              },
+            ],
+          },
+        },
+      },
+    };
+    const parsed = companyWorkspaceExistsOf(refusal);
+    expect(parsed).toEqual({
+      message: '「Anthropic」已登记为团队覆盖公司（主分析师 Richard），尚未绑定工作区',
+      matches: [
+        {
+          workspace_id: null,
+          workspace_name: null,
+          owner_name: null,
+          display_name: 'Anthropic, PBC',
+          lead_analyst_name: 'Richard',
+          ticker: 'ANT',
+          can_read: true,
+          unbound_unit: true,
+        },
+      ],
+    });
+  });
 });

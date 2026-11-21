@@ -72,4 +72,41 @@ describe('DuplicateCompanyNotice', () => {
     await user.click(screen.getByRole('button', { name: 'Create anyway' }));
     expect(onCreateAnyway).toHaveBeenCalledWith('Anthropic');
   });
+
+  it('renders unbound coverage unit notices in English and Chinese without workspace actions', async () => {
+    renderWithProviders(
+      <DuplicateCompanyNotice
+        requestedName="Anthropic"
+        matches={[
+          {
+            unbound_unit: true,
+            display_name: 'Anthropic, PBC',
+            ticker: 'ANT',
+            lead_analyst_name: 'Richard',
+            can_read: true,
+          },
+        ]}
+        onCloseModal={vi.fn()}
+        onCreateAnyway={vi.fn()}
+      />,
+    );
+
+    const card = screen.getByRole('alert');
+    expect(card).toHaveTextContent(
+      '"Anthropic" is already registered as a team coverage company (lead: Richard) with no workspace bound yet.',
+    );
+    expect(card).toHaveTextContent('Anthropic, PBC');
+    expect(card).toHaveTextContent('ANT');
+    expect(card).toHaveTextContent('Lead: Richard');
+    expect(card).toHaveTextContent('No workspace bound yet');
+    expect(screen.queryByRole('button', { name: 'Open this workspace' })).toBeNull();
+    expect(card).not.toHaveTextContent('Ask the owner to share access');
+
+    await i18n.changeLanguage('zh-CN');
+    expect(card).toHaveTextContent(
+      '「Anthropic」已登记为团队覆盖公司（主分析师 Richard），尚未绑定工作区',
+    );
+    expect(card).toHaveTextContent('尚未绑定工作区');
+    expect(card).toHaveTextContent('仍然新建');
+  });
 });

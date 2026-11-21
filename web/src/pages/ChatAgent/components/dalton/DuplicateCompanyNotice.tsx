@@ -26,7 +26,22 @@ export function DuplicateCompanyNotice({
   const primary = matches[0];
   let summaryText: string;
   if (primary) {
-    if (primary.can_read) {
+    if (primary.unbound_unit) {
+      summaryText = primary.lead_analyst_name
+        ? t(
+          'workspace.duplicateCompany.summaryUnboundUnitWithLead',
+          '"{{company}}" is already registered as a team coverage company (lead: {{lead}}) with no workspace bound yet.',
+          {
+            company: requestedName,
+            lead: primary.lead_analyst_name,
+          },
+        )
+        : t(
+          'workspace.duplicateCompany.summaryUnboundUnit',
+          '"{{company}}" is already registered as a team coverage company with no workspace bound yet.',
+          { company: requestedName },
+        );
+    } else if (primary.can_read) {
       summaryText = primary.lead_analyst_name
         ? t(
           'workspace.duplicateCompany.summaryReadableWithLead',
@@ -78,54 +93,70 @@ export function DuplicateCompanyNotice({
       <div className="cwm-dup-message">{summaryText}</div>
       {matches.length > 0 && (
         <ul className="cwm-dup-list">
-          {matches.map((match, idx) => (
-            <li
-              key={match.workspace_id || `${match.owner_name}-${match.workspace_name}-${idx}`}
-              className="cwm-dup-item"
-            >
-              <div className="cwm-dup-item-info">
-                <div className="cwm-dup-item-title">
-                  <span className="cwm-dup-ws-name">{match.workspace_name}</span>
-                  {match.can_read && match.ticker && (
-                    <span className="cwm-dup-ticker">{match.ticker}</span>
-                  )}
+          {matches.map((match, idx) => {
+            const titleText = match.unbound_unit
+              ? match.display_name || match.ticker || requestedName
+              : match.workspace_name || match.display_name || requestedName;
+            const itemKey =
+              match.workspace_id ||
+              (match.unbound_unit
+                ? `unit-${match.display_name ?? ''}-${match.ticker ?? ''}-${idx}`
+                : `${match.owner_name ?? ''}-${match.workspace_name ?? ''}-${idx}`);
+            return (
+              <li key={itemKey} className="cwm-dup-item">
+                <div className="cwm-dup-item-info">
+                  <div className="cwm-dup-item-title">
+                    <span className="cwm-dup-ws-name">{titleText}</span>
+                    {match.can_read && match.ticker && (
+                      <span className="cwm-dup-ticker">{match.ticker}</span>
+                    )}
+                  </div>
+                  <div className="cwm-dup-item-meta">
+                    {!match.unbound_unit && match.owner_name && (
+                      <span>
+                        {t('workspace.duplicateCompany.ownerLabel', 'Owner: {{owner}}', {
+                          owner: match.owner_name,
+                        })}
+                      </span>
+                    )}
+                    {match.can_read && match.lead_analyst_name && (
+                      <span>
+                        {!match.unbound_unit && match.owner_name ? ' · ' : ''}
+                        {t('workspace.duplicateCompany.leadLabel', 'Lead: {{lead}}', {
+                          lead: match.lead_analyst_name,
+                        })}
+                      </span>
+                    )}
+                  </div>
                 </div>
-                <div className="cwm-dup-item-meta">
-                  <span>
-                    {t('workspace.duplicateCompany.ownerLabel', 'Owner: {{owner}}', {
-                      owner: match.owner_name,
-                    })}
-                  </span>
-                  {match.can_read && match.lead_analyst_name && (
-                    <span>
-                      {' · '}
-                      {t('workspace.duplicateCompany.leadLabel', 'Lead: {{lead}}', {
-                        lead: match.lead_analyst_name,
-                      })}
+                <div className="cwm-dup-item-action">
+                  {match.unbound_unit ? (
+                    <span className="cwm-dup-unreadable">
+                      {t('workspace.duplicateCompany.unboundUnit', 'No workspace bound yet')}
+                    </span>
+                  ) : match.can_read && match.workspace_id ? (
+                    <button
+                      type="button"
+                      {...buttonSlot('outline')}
+                      className="cwm-dup-open-btn"
+                      onClick={() =>
+                        handleOpenExistingWorkspace(
+                          match.workspace_id!,
+                          match.workspace_name || titleText,
+                        )
+                      }
+                    >
+                      {t('workspace.duplicateCompany.openWorkspace', 'Open this workspace')}
+                    </button>
+                  ) : (
+                    <span className="cwm-dup-unreadable">
+                      {t('workspace.duplicateCompany.askOwnerShare', 'Ask the owner to share access')}
                     </span>
                   )}
                 </div>
-              </div>
-              <div className="cwm-dup-item-action">
-                {match.can_read && match.workspace_id ? (
-                  <button
-                    type="button"
-                    {...buttonSlot('outline')}
-                    className="cwm-dup-open-btn"
-                    onClick={() =>
-                      handleOpenExistingWorkspace(match.workspace_id!, match.workspace_name)
-                    }
-                  >
-                    {t('workspace.duplicateCompany.openWorkspace', 'Open this workspace')}
-                  </button>
-                ) : (
-                  <span className="cwm-dup-unreadable">
-                    {t('workspace.duplicateCompany.askOwnerShare', 'Ask the owner to share access')}
-                  </span>
-                )}
-              </div>
-            </li>
-          ))}
+              </li>
+            );
+          })}
         </ul>
       )}
       <div className="cwm-dup-footer">

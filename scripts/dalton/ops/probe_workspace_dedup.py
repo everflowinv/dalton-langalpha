@@ -3,8 +3,9 @@
 
 Collects candidate workspaces (inside a ``READ ONLY`` Postgres transaction) and
 runs ``_judge_candidates_with_llm(..., skip_journal=True)`` against the real
-configured ``assist_model`` / ``assist_fallback_model`` without writing to the
-database or creating any workspace.
+configured assist model chain without writing ``dalton_llm_journal`` rows or
+creating any workspace. Note: 模型凭据刷新时应用会更新凭据记录（当默认模型的
+OAuth 凭据需要刷新时，底层调用仍会更新数据库中的 ``user_oauth_tokens``）。
 
 Usage (outside the sandbox, with DB + LLM credentials configured):
     .venv/bin/python scripts/dalton/ops/probe_workspace_dedup.py Anthropic 富途 Macro
@@ -76,7 +77,7 @@ async def probe_names(
     await pool.open()
     try:
         caller_tier = await _resolve_caller_tier(eff_uid)
-        models = _resolve_dedup_models()
+        models = await _resolve_dedup_models(eff_uid)
         results: list[dict[str, Any]] = []
         candidate_lines_sample: list[str] | None = None
 
@@ -108,9 +109,6 @@ async def probe_names(
                         stats=stats,
                     )
 
-            if show_candidates and candidate_lines_sample is None:
-                candidate_lines_sample = [_format_candidate_line(e) for e in entries]
-
             if early_exit:
                 results.append(
                     {
@@ -121,6 +119,9 @@ async def probe_names(
                     }
                 )
                 continue
+
+            if show_candidates and candidate_lines_sample is None:
+                candidate_lines_sample = [_format_candidate_line(e) for e in entries]
 
             if not entries:
                 results.append(
@@ -144,21 +145,32 @@ async def probe_names(
             match_records: list[dict[str, Any]] = []
             resolved_candidates: list[DuplicateWorkspaceCandidate] = []
             for entry, conf, reason in hits:
-                can_read = await _check_workspace_readable(
-                    entry.ws_id,
-                    eff_uid,
-                    channel=channel,
-                    workspace=entry.ws_row,
-                )
-                cand = DuplicateWorkspaceCandidate(
-                    workspace_name=entry.workspace_name,
-                    owner_name=entry.owner_name,
-                    can_read=can_read,
-                    workspace_id=entry.ws_id if can_read else None,
-                    lead_analyst_name=entry.lead_analyst_name if can_read else None,
-                    ticker=entry.ticker if can_read else None,
-                    matched_by=f"llm:{conf}",
-                )
+                if entry.unbound_unit:
+                    cand = DuplicateWorkspaceCandidate(
+                        workspace_name=None,
+                        owner_name=None,
+                        can_read=True,
+                        workspace_id=None,
+                        lead_analyst_name=entry.lead_analyst_name,
+                        ticker=entry.ticker,
+                        display_name=entry.unit_display_name or entry.ticker,
+                        unbound_unit=True,
+                    )
+                else:
+                    can_read = await _check_workspace_readable(
+                        entry.ws_id or "",
+                        eff_uid,
+                        channel=channel,
+                        workspace=entry.ws_row or {},
+                    )
+                    cand = DuplicateWorkspaceCandidate(
+                        workspace_name=entry.workspace_name,
+                        owner_name=entry.owner_name,
+                        can_read=can_read,
+                        workspace_id=entry.ws_id if can_read else None,
+                        lead_analyst_name=entry.lead_analyst_name if can_read else None,
+                        ticker=entry.ticker if can_read else None,
+                    )
                 resolved_candidates.append(cand)
                 match_records.append(
                     {

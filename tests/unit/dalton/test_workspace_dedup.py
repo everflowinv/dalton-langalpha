@@ -122,6 +122,8 @@ def _install_db(
     unit_rows: list[dict[str, Any]] | None = None,
     ws_rows: list[dict[str, Any]] | None = None,
     doc_rows: list[dict[str, Any]] | None = None,
+    ws_rows_sequence: list[list[dict[str, Any]]] | None = None,
+    unit_rows_sequence: list[list[dict[str, Any]]] | None = None,
     sql_log: list[tuple[str, Any]] | None = None,
     fail_on_table: dict[str, Exception] | None = None,
     fail_on_execute: Exception | None = None,
@@ -133,6 +135,7 @@ def _install_db(
     cursor.__aexit__.return_value = None
     last_query: dict[str, str] = {"sql": ""}
     table_errors = fail_on_table or {}
+    query_counts = {"ws": 0, "unit": 0}
 
     async def _execute(sql: str, params: Any = None) -> None:
         if fail_on_execute is not None:
@@ -147,8 +150,16 @@ def _install_db(
     async def _fetchall() -> list[dict[str, Any]]:
         sql = last_query["sql"]
         if "FROM dalton_coverage_units" in sql:
+            idx = query_counts["unit"]
+            query_counts["unit"] += 1
+            if unit_rows_sequence is not None:
+                return list(unit_rows_sequence[min(idx, len(unit_rows_sequence) - 1)])
             return list(unit_rows or [])
         if "FROM workspaces" in sql:
+            idx = query_counts["ws"]
+            query_counts["ws"] += 1
+            if ws_rows_sequence is not None:
+                return list(ws_rows_sequence[min(idx, len(ws_rows_sequence) - 1)])
             return list(ws_rows or [])
         if "FROM dalton_knowledge_versions" in sql:
             return list(doc_rows or [])
@@ -159,6 +170,12 @@ def _install_db(
 
     conn = create_autospec(psycopg.AsyncConnection, instance=True)
     conn.cursor.return_value = cursor
+
+    @asynccontextmanager
+    async def _tx():
+        yield
+
+    conn.transaction.side_effect = _tx
 
     @asynccontextmanager
     async def _get_conn(_conn: Any = None):
@@ -458,6 +475,15 @@ async def test_llm_uses_assist_fallback_model_when_primary_fails(
                 display_name="Anthropic, PBC",
             )
         ],
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_1,
+                name="ANT",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            )
+        ],
     )
     _install_read_access(monkeypatch, web_readable={WS_1})
 
@@ -609,12 +635,15 @@ async def test_external_caller_candidates_only_contain_own_workspaces(
         }
     ]
 
-    # Must NOT query dalton_coverage_units; workspaces query must filter by owner_user_id.
+    # Must NOT query dalton_coverage_units; initial workspaces query filters by owner_user_id,
+    # and post-LLM live-state check queries only the matched workspace_id.
     assert not any("dalton_coverage_units" in sql for sql, _ in sql_log)
     ws_queries = [(sql, params) for sql, params in sql_log if "FROM workspaces" in sql]
-    assert len(ws_queries) == 1
+    assert len(ws_queries) == 2
     assert "w.user_id = %s" in ws_queries[0][0]
     assert ws_queries[0][1] == (USER_EXTERNAL,)
+    assert "w.workspace_id = ANY(%s::uuid[])" in ws_queries[1][0]
+    assert ws_queries[1][1] == ([WS_3],)
 
     # Prompt sent to LLM must contain ONLY external user's own workspace, zero internal data.
     assert len(calls) == 1
@@ -750,6 +779,15 @@ async def test_channel_aware_access_and_unreadable_redaction(
                 ws_name="ANT",
                 ticker="ANT",
                 display_name="Anthropic, PBC",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            )
+        ],
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_1,
+                name="ANT",
                 owner_id=USER_RICHARD,
                 owner_name="Richard",
                 owner_email=EMAIL_RICHARD,
@@ -1608,3 +1646,724 @@ async def test_workspaces_create_proceeds_when_dedup_raises(
     assert payload["success"] is True
     assert "Company workspace dedup check failed" in caplog.text
     assert "db unreachable" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_custom_shadowed_model_and_forbidden_role_model_never_selected(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import src.dalton.llm.model_prefs as model_prefs_mod
+
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="Anthropic",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            )
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_2})
+
+    # Case A: caller defines a custom_model with the same name as assist_model
+    # plus a custom_provider; model resolution via assist.py/model_prefs.py must
+    # drop the shadowed model and use the unshadowed system fallback instead.
+    async def _prefs_shadow_primary(uid: str) -> dict[str, Any]:
+        if uid == USER_CALLER:
+            return {
+                "model_preference": {
+                    "custom_providers": [
+                        {"name": "attacker-proxy", "parent_provider": "openai"}
+                    ],
+                    "custom_models": [
+                        {
+                            "name": "gemini-4-hydrogen-low-oauth",
+                            "model_id": "evil-intercept",
+                            "provider": "attacker-proxy",
+                        }
+                    ],
+                }
+            }
+        return {"model_preference": {}}
+
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_user_preferences",
+        create_autospec(model_prefs_mod._DEFAULT_GET_USER_PREFERENCES, side_effect=_prefs_shadow_primary),
+    )
+
+    calls: list[dict[str, Any]] = []
+    _install_llm(
+        monkeypatch,
+        lambda **_kw: _ok_result([{"id": "c1", "confidence": "high", "reason": "dup"}]),
+        captured_calls=calls,
+    )
+
+    match = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert match is not None
+    assert len(calls) == 1
+    assert calls[0]["request_model"] == "deepseek-flash"
+
+    # Case B: caller shadows BOTH assist_model and assist_fallback_model -> fail open without calling LLM.
+    async def _prefs_shadow_both(uid: str) -> dict[str, Any]:
+        if uid == USER_CALLER:
+            return {
+                "model_preference": {
+                    "custom_models": [
+                        {"name": "gemini-4-hydrogen-low-oauth", "model_id": "m1", "provider": "openai"},
+                        {"name": "deepseek-flash", "model_id": "m2", "provider": "openai"},
+                    ]
+                }
+            }
+        return {"model_preference": {}}
+
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_user_preferences",
+        create_autospec(model_prefs_mod._DEFAULT_GET_USER_PREFERENCES, side_effect=_prefs_shadow_both),
+    )
+    calls.clear()
+    with caplog.at_level(logging.WARNING):
+        assert await find_existing_company_workspace(USER_CALLER, "Anthropic") is None
+    assert len(calls) == 0
+    assert "RuntimeError" in caplog.text
+
+    # Case C: forbidden contributor fallback model is rejected by RolePolicyError -> fail open.
+    async def _prefs_empty(_uid: str) -> dict[str, Any]:
+        return {"model_preference": {}}
+
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_user_preferences",
+        create_autospec(model_prefs_mod._DEFAULT_GET_USER_PREFERENCES, side_effect=_prefs_empty),
+    )
+    monkeypatch.setenv("DALTON_ASSIST_FALLBACK_MODEL", "gemini-3-contributor-oauth")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert await find_existing_company_workspace(USER_CALLER, "Anthropic") is None
+    assert len(calls) == 0
+    assert "RolePolicyError" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_primary_9s_cap_fallback_remaining_and_protected_usage_survives_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="Anthropic",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            )
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_2})
+
+    assert dedup_mod.DEDUP_PRIMARY_MODEL_TIMEOUT_SECONDS == 9.0
+    assert dedup_mod.DEDUP_TIMEOUT_SECONDS == 15.0
+
+    # Case A: default 9s primary cap & fallback remaining time (< 15s total).
+    seen_timeouts: list[tuple[str, float]] = []
+
+    async def _timeout_probe(**kwargs: Any) -> DaltonCompleteResult:
+        model = kwargs["request_model"]
+        seen_timeouts.append((model, kwargs["timeout_s"]))
+        if model == "gemini-4-hydrogen-low-oauth":
+            return DaltonCompleteResult(ok=False, status="indeterminate", error_kind="timeout", model=model)
+        return _ok_result([{"id": "c1", "confidence": "high", "reason": "dup"}])
+
+    _install_llm(monkeypatch, _timeout_probe)
+    match = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert match is not None
+    assert seen_timeouts[0][0] == "gemini-4-hydrogen-low-oauth"
+    assert seen_timeouts[0][1] == pytest.approx(9.0, abs=0.2)
+    assert seen_timeouts[1][0] == "deepseek-flash"
+    assert 9.0 < seen_timeouts[1][1] <= 15.0
+
+    # Case B: primary hangs past its 9s cap (patched to 0.04s) while writing usage;
+    # dedup stops waiting and falls back, while primary's protected task is NOT cancelled
+    # and finishes writing usage.
+    monkeypatch.setattr(dedup_mod, "DEDUP_PRIMARY_MODEL_TIMEOUT_SECONDS", 0.04)
+    monkeypatch.setattr(dedup_mod, "DEDUP_TIMEOUT_SECONDS", 0.5)
+    events: dict[str, bool] = {"primary_cancelled": False, "primary_usage_written": False}
+
+    async def _primary_slow_fallback_fast(**kwargs: Any) -> DaltonCompleteResult:
+        if kwargs["request_model"] == "gemini-4-hydrogen-low-oauth":
+            try:
+                await asyncio.sleep(0.12)
+                events["primary_usage_written"] = True
+            except asyncio.CancelledError:
+                events["primary_cancelled"] = True
+                raise
+            return _ok_result([])
+        return _ok_result([{"id": "c1", "confidence": "high", "reason": "fallback"}])
+
+    _install_llm(monkeypatch, _primary_slow_fallback_fast)
+    fb_match = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert fb_match is not None
+    assert fb_match.workspace_id == WS_2
+    await asyncio.sleep(0.18)
+    assert events["primary_cancelled"] is False
+    assert events["primary_usage_written"] is True
+
+    # Case C: both primary and fallback exceed total 15s deadline (patched to 0.06s);
+    # dedup returns None (fail-open), while both protected tasks finish writing usage uncancelled.
+    monkeypatch.setattr(dedup_mod, "DEDUP_PRIMARY_MODEL_TIMEOUT_SECONDS", 0.03)
+    monkeypatch.setattr(dedup_mod, "DEDUP_TIMEOUT_SECONDS", 0.06)
+    both_events: dict[str, int] = {"cancelled": 0, "usage_written": 0}
+
+    async def _both_hang_during_usage_write(**_kwargs: Any) -> DaltonCompleteResult:
+        try:
+            await asyncio.sleep(0.12)
+            both_events["usage_written"] += 1
+        except asyncio.CancelledError:
+            both_events["cancelled"] += 1
+            raise
+        return _ok_result([])
+
+    _install_llm(monkeypatch, _both_hang_during_usage_write)
+    assert await find_existing_company_workspace(USER_CALLER, "Anthropic") is None
+    await asyncio.sleep(0.18)
+    assert both_events["cancelled"] == 0
+    assert both_events["usage_written"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_name_dedup_two_users_isolated_with_budget_and_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.dalton.llm.complete as complete_mod
+    import src.dalton.llm.model_prefs as model_prefs_mod
+    from src.server.services.llm.service import LLMService
+
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="Anthropic",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            )
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_2, WS_1})
+
+    # Shadow primary so both users resolve to the cash model `deepseek-flash`,
+    # exercising budget admission + journal usage recording under real `dalton_complete`.
+    async def _prefs_cash(uid: str) -> dict[str, Any]:
+        return {
+            "model_preference": {
+                "custom_models": [
+                    {"name": "gemini-4-hydrogen-low-oauth", "model_id": "x", "provider": "openai"}
+                ]
+            }
+        }
+
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_user_preferences",
+        create_autospec(model_prefs_mod._DEFAULT_GET_USER_PREFERENCES, side_effect=_prefs_cash),
+    )
+
+    journal_rows: dict[str, dict[str, Any]] = {}
+    admitted_users: list[str] = []
+    recorded_done: list[dict[str, Any]] = []
+
+    async def _budget_ok(user_id: str, **_kw: Any) -> tuple[bool, None, None]:
+        admitted_users.append(user_id)
+        return True, None, None
+
+    async def _inspect(inv_id: str, **_kw: Any) -> tuple[str, dict[str, Any] | None]:
+        row = journal_rows.get(inv_id)
+        if row is not None:
+            raise AssertionError(f"Duplicate invocation_id across concurrent dedup calls: {inv_id}")
+        return "proceed", None
+
+    async def _claim(**kwargs: Any) -> tuple[str, dict[str, Any]]:
+        inv_id = kwargs["invocation_id"]
+        if inv_id in journal_rows:
+            raise AssertionError(f"invocation_id collided on claim: {inv_id}")
+        journal_rows[inv_id] = {
+            "invocation_id": inv_id,
+            "user_id": kwargs["user_id"],
+            "scope_ref": kwargs["scope_ref"],
+            "state": "pending",
+            "attempt": 1,
+        }
+        return "claimed", journal_rows[inv_id]
+
+    async def _done(inv_id: str, **kwargs: Any) -> dict[str, Any]:
+        journal_rows[inv_id]["state"] = "done"
+        journal_rows[inv_id]["usage"] = kwargs.get("usage")
+        recorded_done.append({"invocation_id": inv_id, "user_id": journal_rows[inv_id]["user_id"], **kwargs})
+        return journal_rows[inv_id]
+
+    monkeypatch.setattr(
+        complete_mod,
+        "_check_cash_budget_admission",
+        create_autospec(complete_mod._check_cash_budget_admission, side_effect=_budget_ok),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "inspect_journal_state",
+        create_autospec(complete_mod.inspect_journal_state, side_effect=_inspect),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "claim_journal_invocation",
+        create_autospec(complete_mod.claim_journal_invocation, side_effect=_claim),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "complete_journal_done",
+        create_autospec(complete_mod.complete_journal_done, side_effect=_done),
+    )
+
+    llm_service = create_autospec(LLMService, instance=True)
+
+    async def _llm_complete(**_kw: Any) -> tuple[DedupLlmResult, dict[str, Any]]:
+        await asyncio.sleep(0.02)
+        return (
+            DedupLlmResult(matches=[DedupMatchItem(id="c1", confidence="high", reason="same")]),
+            {"input_tokens": 100, "output_tokens": 20},
+        )
+
+    llm_service.complete.side_effect = _llm_complete
+
+    async def _patched_complete(*args: Any, **kwargs: Any) -> DaltonCompleteResult:
+        kwargs["llm_service"] = llm_service
+        return await _REAL_DALTON_COMPLETE(*args, **kwargs)
+
+    monkeypatch.setattr(
+        dedup_mod,
+        "dalton_complete",
+        create_autospec(_REAL_DALTON_COMPLETE, side_effect=_patched_complete),
+    )
+
+    res_a, res_b = await asyncio.gather(
+        find_existing_company_workspace(USER_CALLER, "Anthropic"),
+        find_existing_company_workspace(USER_RICHARD, "Anthropic"),
+    )
+    assert res_a is not None and res_b is not None
+    assert res_a.workspace_id == WS_2 and res_b.workspace_id == WS_2
+    assert sorted(admitted_users) == sorted([USER_CALLER, USER_RICHARD])
+    assert len(journal_rows) == 2
+    assert {r["user_id"] for r in journal_rows.values()} == {USER_CALLER, USER_RICHARD}
+    assert all(uid in row["scope_ref"] for row in journal_rows.values() for uid in [row["user_id"]])
+    assert len(recorded_done) == 2
+    assert llm_service.complete.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_workspace_deleted_unbound_or_historical_during_llm_wait_is_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    _install_read_access(monkeypatch, web_readable={WS_1, WS_2, WS_3, WS_4})
+
+    # Case A: WS_2 deleted, WS_3 unbound, WS_4 marked historical duplicate during LLM wait;
+    # only WS_1 remains live.
+    _install_db(
+        monkeypatch,
+        ws_rows_sequence=[
+            [
+                _ws_row(ws_id=WS_1, name="Anthropic", owner_id=USER_RICHARD, owner_name="Richard", owner_email=EMAIL_RICHARD),
+                _ws_row(ws_id=WS_2, name="ANT-2", owner_id=USER_CY, owner_name="CY", owner_email=EMAIL_CY),
+                _ws_row(ws_id=WS_3, name="ANT-3", owner_id=USER_CY, owner_name="CY", owner_email=EMAIL_CY),
+                _ws_row(ws_id=WS_4, name="ANT-4", owner_id=USER_CY, owner_name="CY", owner_email=EMAIL_CY),
+            ],
+            [
+                _ws_row(ws_id=WS_1, name="Anthropic", owner_id=USER_RICHARD, owner_name="Richard", owner_email=EMAIL_RICHARD, status="running"),
+                _ws_row(ws_id=WS_2, name="ANT-2", owner_id=USER_CY, owner_name="CY", owner_email=EMAIL_CY, status="deleted"),
+                _ws_row(ws_id=WS_3, name="ANT-3", owner_id=USER_CY, owner_name="CY", owner_email=EMAIL_CY, status="unbound"),
+                _ws_row(ws_id=WS_4, name="ANT-4", owner_id=USER_CY, owner_name="CY", owner_email=EMAIL_CY, is_historical_duplicate=True),
+            ],
+        ],
+    )
+    _install_llm(
+        monkeypatch,
+        lambda **_kw: _ok_result(
+            [
+                {"id": "c2", "confidence": "high", "reason": "deleted"},
+                {"id": "c3", "confidence": "high", "reason": "unbound"},
+                {"id": "c4", "confidence": "high", "reason": "historical"},
+                {"id": "c1", "confidence": "medium", "reason": "live"},
+            ]
+        ),
+    )
+    match = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert match is not None
+    assert [m.workspace_id for m in match.matches] == [WS_1]
+
+    # Case B: only matched workspace disappears completely from DB while waiting -> returns None.
+    _install_db(
+        monkeypatch,
+        ws_rows_sequence=[
+            [_ws_row(ws_id=WS_2, name="Anthropic", owner_id=USER_CY, owner_name="CY", owner_email=EMAIL_CY)],
+            [],
+        ],
+    )
+    _install_llm(
+        monkeypatch,
+        lambda **_kw: _ok_result([{"id": "c1", "confidence": "high", "reason": "deleted"}]),
+    )
+    assert await find_existing_company_workspace(USER_CALLER, "Anthropic") is None
+
+
+@pytest.mark.asyncio
+async def test_missing_matches_triggers_fallback_confidence_case_and_per_batch_cap_3(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pydantic import ValidationError
+
+    # Schema requires `matches` (empty dict fails validation).
+    with pytest.raises(ValidationError):
+        DedupLlmResult.model_validate({})
+
+    # `confidence` is `str`, so `"low"` / `"HIGH"` do not fail Pydantic validation.
+    parsed_schema = DedupLlmResult.model_validate(
+        {
+            "matches": [
+                {"id": "c1", "confidence": "HIGH", "reason": "upper"},
+                {"id": "c2", "confidence": "low", "reason": "dropped later"},
+            ]
+        }
+    )
+    assert len(parsed_schema.matches) == 2
+
+    _enable_team_mode(monkeypatch)
+    ws_rows = [
+        _ws_row(
+            ws_id=f"00000000-0000-4000-8000-{i:012d}",
+            name=f"AntCo-{i}",
+            owner_id=USER_RICHARD,
+            owner_name="Richard",
+            owner_email=EMAIL_RICHARD,
+            last_activity_at=NOW - timedelta(minutes=i),
+        )
+        for i in range(1, 7)
+    ]
+    _install_db(monkeypatch, ws_rows=ws_rows)
+    _install_read_access(monkeypatch, web_readable={r["workspace_id"] for r in ws_rows})
+
+    seen_models: list[str] = []
+
+    def _llm_missing_then_5(**kwargs: Any) -> DaltonCompleteResult:
+        model = kwargs["request_model"]
+        seen_models.append(model)
+        if model == "gemini-4-hydrogen-low-oauth":
+            # Primary omits `matches` -> treated as parse failure -> switches to fallback!
+            return DaltonCompleteResult(ok=True, status="done", data={}, text="{}")
+        return DaltonCompleteResult(
+            ok=True,
+            status="done",
+            data={
+                "matches": [
+                    {"id": "c1", "confidence": "low", "reason": "ignored-low"},
+                    {"id": "c2", "confidence": "Medium", "reason": "med-2"},
+                    {"id": "c3", "confidence": "medium", "reason": "med-3"},
+                    {"id": "c4", "confidence": "HIGH", "reason": "high-4"},
+                    {"id": "c5", "confidence": "High", "reason": "high-5"},
+                    {"id": "c6", "confidence": "unknown", "reason": "ignored"},
+                ]
+            },
+        )
+
+    _install_llm(monkeypatch, _llm_missing_then_5)
+    match = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert match is not None
+    assert seen_models == ["gemini-4-hydrogen-low-oauth", "deepseek-flash"]
+    # High confidence (c4, c5) before medium (c2), capped at 3 per batch; low/unknown dropped.
+    assert [m.workspace_name for m in match.matches] == ["AntCo-4", "AntCo-5", "AntCo-2"]
+
+
+@pytest.mark.asyncio
+async def test_unbound_company_unit_candidates_return_shape_rest_cos_and_archived_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    unbound_unit = {
+        "unit_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "kind": "company",
+        "status": "active",
+        "owner_user_id": USER_RICHARD,
+        "lead_analyst_user_id": USER_RICHARD,
+        "display_name": "Anthropic, PBC",
+        "workspace_id": None,
+        "ticker": "ANT",
+        "unit_updated_at": NOW,
+        "unit_created_at": NOW,
+        "workspace_name": None,
+        "workspace_owner_id": None,
+        "workspace_status": None,
+        "is_home_stand_in": False,
+        "is_historical_duplicate": False,
+        "owner_name": None,
+        "owner_email": None,
+        "unit_owner_email": EMAIL_RICHARD,
+        "lead_name": "Richard",
+        "lead_email": EMAIL_RICHARD,
+    }
+
+    # 1. External caller NEVER receives unbound units.
+    _install_db(monkeypatch, unit_rows=[unbound_unit], ws_rows=[])
+    llm_mock = _install_llm(monkeypatch, _ok_result([]))
+    assert await find_existing_company_workspace(USER_EXTERNAL, "Anthropic") is None
+    llm_mock.assert_not_awaited()
+
+    # 2. Internal caller sees unbound unit formatted with `-` in workspace name column,
+    # and hit returns display_name, ticker, lead_analyst_name without workspace_id.
+    _install_db(monkeypatch, unit_rows=[unbound_unit], ws_rows=[])
+    calls: list[dict[str, Any]] = []
+    _install_llm(
+        monkeypatch,
+        lambda **_kw: _ok_result([{"id": "c1", "confidence": "high", "reason": "registered unit"}]),
+        captured_calls=calls,
+    )
+    match = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert match is not None
+    assert len(calls) == 1
+    assert "c1 | - | ANT | Anthropic, PBC" in calls[0]["user_prompt"]
+    assert match.workspace_id is None
+    assert match.matched_workspace_ids == ()
+    assert match.message == "「Anthropic」已登记为团队覆盖公司（主分析师 Richard），尚未绑定工作区"
+    assert match.matches_payload() == [
+        {
+            "unbound_unit": True,
+            "display_name": "Anthropic, PBC",
+            "ticker": "ANT",
+            "lead_analyst_name": "Richard",
+            "can_read": True,
+        }
+    ]
+
+    # 3. REST 409 & CoS manage_workspaces propagate unbound unit payload cleanly.
+    from src.server.app.workspaces import router
+
+    app = create_test_app(router)
+    mgr = create_autospec(WorkspaceManager, instance=True)
+    dedup_mock = create_autospec(_REAL_FIND_DEDUP, return_value=match)
+    with (
+        patch("src.dalton.coverage.dedup.find_existing_company_workspace", dedup_mock),
+        patch(
+            "src.server.app.workspaces.WorkspaceManager.get_instance",
+            create_autospec(WorkspaceManager.get_instance, return_value=mgr),
+        ),
+        patch(
+            "src.server.services.platform_client.platform_gating_active",
+            return_value=False,
+        ),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post("/api/v1/workspaces", json={"name": "Anthropic"})
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == {
+            "code": "company_workspace_exists",
+            "message": "「Anthropic」已登记为团队覆盖公司（主分析师 Richard），尚未绑定工作区",
+            "matches": match.matches_payload(),
+        }
+
+        cos_res = await chief_of_staff_workspaces.ainvoke(
+            {
+                "name": "manage_workspaces",
+                "args": {"action": "create", "name": "Anthropic", "state": {}},
+                "id": "call-unbound",
+                "type": "tool_call",
+            },
+            config={"configurable": {"user_id": USER_CALLER}},
+        )
+        cos_payload = json.loads(cos_res.update["messages"][0].content)
+        assert cos_payload == {
+            "success": False,
+            "error": match.message,
+            "code": "company_workspace_exists",
+            "message": match.message,
+            "matches": match.matches_payload(),
+        }
+
+    # 4. Unbound unit archived while waiting for LLM -> dropped -> returns None.
+    _install_db(
+        monkeypatch,
+        unit_rows_sequence=[
+            [unbound_unit],
+            [{**unbound_unit, "status": "archived"}],
+        ],
+        ws_rows=[],
+    )
+    _install_llm(
+        monkeypatch,
+        lambda **_kw: _ok_result([{"id": "c1", "confidence": "high", "reason": "stale"}]),
+    )
+    assert await find_existing_company_workspace(USER_CALLER, "Anthropic") is None
+
+
+@pytest.mark.asyncio
+async def test_uuid_redaction_fixed_4_columns_cleanup_external_cred_error_and_probe_script(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    assert not hasattr(DuplicateWorkspaceCandidate, "matched_by")
+
+    _enable_team_mode(monkeypatch)
+    uuid_a = "12345678-1234-4123-8123-123456789abc"
+    uuid_b = "abcdefab-cdef-4abc-8abc-abcdefabcdef"
+    uuid_c = "99999999-aaaa-4bbb-8ccc-dddddddddddd"
+
+    sql_log: list[tuple[str, Any]] = []
+    _install_db(
+        monkeypatch,
+        unit_rows=[
+            _unit_row(
+                ws_id=WS_1,
+                ws_name=f"deal_{uuid_a}",
+                ticker="ANT",
+                display_name=f"Anthropic {uuid_b}",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+                last_activity_at=NOW,
+            )
+        ],
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_1,
+                name=f"deal_{uuid_a}",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+                last_activity_at=NOW,
+            ),
+            _ws_row(
+                ws_id=WS_2,
+                name="Macro",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+                last_activity_at=NOW - timedelta(minutes=5),
+            ),
+            _ws_row(
+                ws_id=WS_3,
+                name="Anthropic",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+                last_activity_at=NOW - timedelta(minutes=10),
+            ),
+        ],
+        doc_rows=[
+            {
+                "workspace_id": WS_3,
+                "doc_key": "company",
+                "content": {"ticker": "", "name": "Anthropic, PBC", "name_zh": ""},
+            }
+        ],
+        sql_log=sql_log,
+    )
+    _install_read_access(monkeypatch, web_readable={WS_1, WS_2, WS_3})
+
+    calls: list[dict[str, Any]] = []
+    _install_llm(
+        monkeypatch,
+        lambda **_kw: _ok_result([{"id": "c1", "confidence": "high", "reason": "same"}]),
+        captured_calls=calls,
+    )
+
+    match = await find_existing_company_workspace(USER_CALLER, f"New_{uuid_c}")
+    assert match is not None
+    # Returned workspace_name keeps real name, while prompt sent to LLM replaces all UUIDs with [id].
+    assert match.workspace_name == f"deal_{uuid_a}"
+    prompt = calls[0]["user_prompt"]
+    assert uuid_a not in prompt
+    assert uuid_b not in prompt
+    assert uuid_c not in prompt
+    assert "待新建工作区名称：New_[id]" in prompt
+    assert "c1 | deal_[id] | ANT | Anthropic [id]" in prompt
+    assert "c2 | Macro | - | -" in prompt
+    assert "c3 | Anthropic | - | Anthropic, PBC" in prompt
+    assert "固定 4 列" in prompt
+
+    # SQL no longer selects unused ticker_key column.
+    unit_sqls = [sql for sql, _ in sql_log if "FROM dalton_coverage_units" in sql]
+    assert unit_sqls
+    assert all("ticker_key" not in sql for sql in unit_sqls)
+
+    # External member with missing credentials -> fails open with redacted warning.
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_4,
+                name="MyNVDA",
+                owner_id=USER_EXTERNAL,
+                owner_name="ExtUser",
+                owner_email=EMAIL_EXTERNAL,
+            )
+        ],
+    )
+    _install_llm(
+        monkeypatch,
+        lambda **_kw: DaltonCompleteResult(
+            ok=False, status="failed", error_kind="pre_send", error="oauth_required"
+        ),
+    )
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert await find_existing_company_workspace(USER_EXTERNAL, "NVIDIA") is None
+    assert "Company workspace dedup check failed" in caplog.text
+    assert "RuntimeError" in caplog.text
+
+    # Probe script --show-candidates captures candidates from the second query when the
+    # first query exits early due to caller's own same-name workspace.
+    import scripts.dalton.ops.probe_workspace_dedup as probe_mod
+    import src.server.database.pool as pool_mod
+
+    fake_pool = create_autospec(pool_mod.get_or_create_pool(), instance=True)
+    fake_pool.open.return_value = None
+    fake_pool.close.return_value = None
+    monkeypatch.setattr(pool_mod, "get_or_create_pool", lambda: fake_pool)
+
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_1,
+                name="OwnCo",
+                owner_id=USER_CALLER,
+                owner_name="Caller",
+                owner_email=EMAIL_CALLER,
+                last_activity_at=NOW,
+            ),
+            _ws_row(
+                ws_id=WS_2,
+                name="TargetCo",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+                last_activity_at=NOW - timedelta(minutes=1),
+            ),
+        ],
+    )
+    monkeypatch.setattr(pool_mod, "get_db_connection", dedup_mod.get_db_connection)
+    _install_read_access(monkeypatch, web_readable={WS_1, WS_2})
+    _install_llm(monkeypatch, lambda **_kw: _ok_result([]))
+
+    report = await probe_mod.probe_names(
+        ["OwnCo", "OtherCo"], user_id=USER_CALLER, show_candidates=True
+    )
+    assert report["results"][0]["early_exit_same_name"] is True
+    assert len(report["candidates"]) == 2
+    assert any("TargetCo | - | -" in ln for ln in report["candidates"])
+    assert "模型凭据刷新时应用会更新凭据记录" in (probe_mod.__doc__ or "")
