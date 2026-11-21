@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Args } from "../src/args.js";
-import { Exit } from "../src/errors.js";
+// DALTON-HOOK(workspace-dedup): import CliError for 409 conflict assertions in workspaces create tests
+import { CliError, Exit } from "../src/errors.js";
 import type { Command, Ctx } from "../src/commands/command.js";
 import { threads } from "../src/commands/threads.js";
 import { workspaces } from "../src/commands/workspaces.js";
@@ -133,5 +134,96 @@ describe("threads cancel", () => {
     const out = await printed(cancel, { json } as unknown as Api, false, args);
     expect(out).toContain("Run already finished; nothing to cancel.");
     expect(out).not.toContain("Cancel requested");
+  });
+});
+
+// DALTON-HOOK(workspace-dedup): tests for --allow-duplicate, --skip-coverage-suggestion, and 409 hints
+describe("workspaces create", () => {
+  const create = workspaces.find((c) => c.words[1] === "create")!;
+
+  it("forwards --allow-duplicate and --skip-coverage-suggestion in the request body", async () => {
+    const json = vi.fn(async () => ({ workspace_id: "w-new", name: "Nvidia" }));
+    const args = new Args(
+      new Map<string, string | number | true>([
+        ["allow-duplicate", true],
+        ["skip-coverage-suggestion", true],
+      ]),
+      new Map([["name", "Nvidia"]]),
+    );
+    const out = await printed(create, { json } as unknown as Api, false, args);
+    expect(json).toHaveBeenCalledWith("POST", "/api/v1/workspaces", {
+      body: {
+        name: "Nvidia",
+        description: undefined,
+        computer_id: undefined,
+        allow_duplicate_company: true,
+        skip_coverage_suggestion: true,
+      },
+    });
+    expect(out).toContain("Created workspace Nvidia (w-new).");
+  });
+
+  it("prints readable matches and --allow-duplicate hint on 409 company_workspace_exists", async () => {
+    const detail = {
+      detail: {
+        code: "company_workspace_exists",
+        message: "Nvidia already has a workspace.",
+        matches: [
+          { workspace_id: "ws-1", workspace_name: "NVDA", owner_name: "Richard", can_read: true },
+          { workspace_name: "NVDA-Private", owner_name: "CY", can_read: false },
+        ],
+      },
+    };
+    const a: Api = {
+      json: vi.fn(async () => {
+        throw new CliError("Nvidia already has a workspace.", Exit.conflict, {
+          status: 409,
+          reason: "company_workspace_exists",
+          detail,
+        });
+      }),
+    } as unknown as Api;
+    const args = new Args(new Map(), new Map([["name", "Nvidia"]]));
+    await expect(printed(create, a, false, args)).rejects.toSatisfy((e: unknown) => {
+      expect(e).toBeInstanceOf(CliError);
+      const err = e as CliError;
+      expect(err.code).toBe(Exit.conflict);
+      expect(err.message).toContain("NVDA (owner: Richard, id: ws-1)");
+      expect(err.message).toContain("NVDA-Private (owner: CY, no access)");
+      expect(err.message).toContain("--allow-duplicate");
+      return true;
+    });
+  });
+
+  it("prints readable suggestion and --skip-coverage-suggestion hint on 409 coverage_suggestion", async () => {
+    const detail = {
+      detail: {
+        code: "coverage_suggestion",
+        message: "Detected company NVDA.",
+        suggestion: {
+          coverage_kind: "company",
+          ticker: "NVDA",
+          display_name: "NVIDIA Corporation",
+        },
+      },
+    };
+    const a: Api = {
+      json: vi.fn(async () => {
+        throw new CliError("Detected company NVDA.", Exit.conflict, {
+          status: 409,
+          reason: "coverage_suggestion",
+          detail,
+        });
+      }),
+    } as unknown as Api;
+    const args = new Args(new Map(), new Map([["name", "Nvidia"]]));
+    await expect(printed(create, a, false, args)).rejects.toSatisfy((e: unknown) => {
+      expect(e).toBeInstanceOf(CliError);
+      const err = e as CliError;
+      expect(err.code).toBe(Exit.conflict);
+      expect(err.message).toContain("Detected company NVDA.");
+      expect(err.message).toContain("--skip-coverage-suggestion");
+      return true;
+    });
   });
 });

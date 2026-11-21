@@ -443,6 +443,8 @@ ALLOWED_HOOKS=(
   # on ToolMessage JSON parse and recursively replace non-finite floats with None
   # across request payloads (antigravity/client.py).
   "antigravity-json-nan"
+  # Company workspace deduplication before create (REST, manage_workspaces, web modal, CoS prompt).
+  "workspace-dedup"
   # Agent-triggered current-thread model switch (switch_thread_model Dalton tool
   # and extracted switch_thread_model service shared with PATCH /threads/{id}).
   "agent-switch-model"
@@ -453,6 +455,8 @@ ALLOWED_HOOKS=(
   # browser_runtime / agent-browser wrapper uploads, browser-quality sync &
   # endpoint, browser_available, and default sandbox image agent-browser install.
   "browser-kill-switch"
+  # Background-slot calls default to low reasoning effort (src/server/services/llm/config.py).
+  "background-effort-low"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

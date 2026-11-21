@@ -260,6 +260,8 @@ async def classify_model(
     user_id: str,
     model_name: str,
     _pref_cache: dict | None = None,
+    # DALTON-HOOK(workspace-dedup): optional builtins-only classification (ignores custom_models).
+    ignore_custom_models: bool = False,
 ) -> tuple[str, dict]:
     """Classify ``model_name`` as system / custom / unknown.
 
@@ -268,16 +270,18 @@ async def classify_model(
       - the entry from ``models.json`` for system models
       - ``{}`` for unknown
 
-    Custom is checked first. When a user's ``custom_models`` entry shadows a
-    built-in of the same name, the custom entry wins — lets users route a
-    built-in model name (e.g. ``glm-5.3``) through a variant's own key.
-    ``_pref_cache`` keeps the chat hot path free of extra DB reads.
+    Custom is checked first unless ``ignore_custom_models=True``. When a user's
+    ``custom_models`` entry shadows a built-in of the same name, the custom
+    entry wins — lets users route a built-in model name (e.g. ``glm-5.3``)
+    through a variant's own key. ``_pref_cache`` keeps the chat hot path free
+    of extra DB reads.
     """
     from src.llms.llm import LLM as LLMFactory
 
-    custom_cm = await get_custom_model_config(user_id, model_name, _pref_cache=_pref_cache)
-    if custom_cm:
-        return ModelSource.CUSTOM, custom_cm
+    if not ignore_custom_models:
+        custom_cm = await get_custom_model_config(user_id, model_name, _pref_cache=_pref_cache)
+        if custom_cm:
+            return ModelSource.CUSTOM, custom_cm
 
     mc = LLMFactory.get_model_config()
     system_info = mc.get_model_config(model_name)
