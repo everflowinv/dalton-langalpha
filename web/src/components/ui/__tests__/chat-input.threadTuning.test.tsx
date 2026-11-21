@@ -217,4 +217,33 @@ describe('ChatInput: the thread owns its effort and fast mode', () => {
     });
     expect(mocks.mutate).not.toHaveBeenCalled();
   });
+
+  // DALTON-HOOK(automation-effort): ordinary retry omits saved thread effort unless explicitly picked for this retry
+  it('omits saved thread reasoningEffort on getRetryModelOptions unless explicitly picked for this retry', () => {
+    const onSend = vi.fn();
+    const onPickReasoningEffort = vi.fn();
+    const inputRef = createRef<ChatInputHandle>();
+    render(tree({
+      onSend,
+      inputRef,
+      tuning: { reasoningEffort: 'low', fastMode: false },
+      onPickReasoningEffort,
+    }));
+
+    // Normal send/edit/regenerate still reads the saved thread effort
+    expect(inputRef.current?.getModelOptions().reasoningEffort).toBe('low');
+
+    // Ordinary retry without explicitly picking an effort omits saved thread effort
+    expect(inputRef.current?.getRetryModelOptions?.().reasoningEffort).toBeNull();
+
+    // Explicitly picking an effort for this retry submits it once, then resets
+    fireEvent.click(screen.getByText('pick-high'));
+    expect(inputRef.current?.getRetryModelOptions?.().reasoningEffort).toBe('high');
+    expect(inputRef.current?.getRetryModelOptions?.().reasoningEffort).toBeNull();
+
+    // DALTON-HOOK(automation-effort): picking an effort and then sending a normal message clears the retry pick
+    fireEvent.click(screen.getByText('pick-high'));
+    send('normal follow-up');
+    expect(inputRef.current?.getRetryModelOptions?.().reasoningEffort).toBeNull();
+  });
 });

@@ -88,6 +88,8 @@ function withGivenBack(typed: string, text: string): string {
 
 export interface ChatInputHandle {
   getModelOptions: () => ModelOptions;
+  // DALTON-HOOK(automation-effort): retry reads composer options without auto-sending saved effort unless explicitly picked for this retry
+  getRetryModelOptions?: () => ModelOptions;
   addContext: (ctx: ContextPayload) => void;
   /**
    * Imperatively add a widget context snapshot to the deck. Local-only —
@@ -452,6 +454,11 @@ function ChatInput({
   // The thread's own picks over Settings. A thread host owns them. Without
   // one the composer holds them, following Settings until touched.
   const [ownTuning, setOwnTuning] = useState<{ reasoningEffort: string | null; fastMode: boolean | null }>(FOLLOWS_SETTINGS);
+  // DALTON-HOOK(automation-effort): tracks whether the user explicitly picked a reasoning effort for the next retry
+  const explicitRetryEffortRef = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    explicitRetryEffortRef.current = undefined;
+  }, [draftKey]);
   const tuning = hostTuning === undefined ? ownTuning : hostTuning;
   const sentEffort = tuning.reasoningEffort === undefined
     ? null
@@ -659,6 +666,19 @@ function ChatInput({
         ...ownOverrides,
       };
     },
+    // DALTON-HOOK(automation-effort): omit saved composer effort on retry unless explicitly picked for this retry
+    getRetryModelOptions() {
+      const explicitEffort = explicitRetryEffortRef.current;
+      explicitRetryEffortRef.current = undefined;
+      return {
+        model: sentModel,
+        reasoningEffort: explicitEffort !== undefined ? explicitEffort : null,
+        fastMode: resolvedFastMode,
+        marketWatch: effectiveMarketWatch,
+        subagentsAllowed: draftSubagents,
+        ...ownOverrides,
+      };
+    },
     addContext(ctx) {
       // Dictation rewrites the draft from what it held when it started.
       if (ctx.kind !== 'chip') abandonListening();
@@ -811,14 +831,17 @@ function ChatInput({
       if (hostTuning === undefined) {
         setOwnTuning((prev) => ({ ...prev, reasoningEffort: null }));
       }
+      explicitRetryEffortRef.current = undefined;
       return;
     }
+    // DALTON-HOOK(automation-effort): mark explicit effort pick so an ensuing retry submits the chosen level
+    explicitRetryEffortRef.current = effort ?? settingsTuning.reasoning_effort ?? null;
     if (effort === tuning.reasoningEffort) return;
     if (hostTuning === undefined) setOwnTuning((prev) => ({ ...prev, reasoningEffort: effort }));
     else onPickReasoningEffort?.(effort);
   }, [
     pillSeriesMatch, pillSelectableSeries, pillModel, hostModel, setOwnModel, onPickModel,
-    tuning.reasoningEffort, hostTuning, onPickReasoningEffort,
+    tuning.reasoningEffort, hostTuning, onPickReasoningEffort, settingsTuning.reasoning_effort,
   ]);
 
   // Speed has no Default of its own in the menu, so the side Settings is on
@@ -1046,6 +1069,8 @@ function ChatInput({
       // DALTON-HOOK(composer-drafts): files still being read go unsent and leave the box
       { filesWithheld: readyAttachments.length < totalBeforeTake },
     );
+    // DALTON-HOOK(automation-effort): a normal send consumes any pending retry effort pick
+    explicitRetryEffortRef.current = undefined;
     // DALTON-HOOK(chat-large-upload): mark sent uploadIds so unmount cleanup keeps them intact
     consumeSentFiles();
     resetSlash();
