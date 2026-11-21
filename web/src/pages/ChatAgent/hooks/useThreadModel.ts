@@ -7,6 +7,13 @@ import type { SubscriptionProvider } from '@/api/oauth';
 import type { Thread } from '@/types/api';
 import { useAllModels } from '@/hooks/useAllModels';
 import { useLapsedSignIn } from '@/hooks/useLapsedSignIn';
+// DALTON-HOOK(antigravity-series): inspect series membership & avoid 403 PATCH on shared workspaces
+import { useSharedEntry } from '@/hooks/useSharedWorkspaces';
+import {
+  formatAntigravityVariantLabel,
+  inspectSavedAntigravityModel,
+  sameAntigravitySeries,
+} from '@/lib/antigravitySeries';
 import { useDefaultModel } from '@/hooks/useSlotDefaultModels';
 import { useSeededModel } from '@/hooks/useSeededModel';
 import { useTurnDefaultModel } from '@/hooks/useTurnModels';
@@ -58,6 +65,8 @@ interface UseThreadModelOptions {
   /** Whether the thread is the Chief of Staff's, whose turn may start on
    *  another Default than the account's (`useTurnDefaultModel`). */
   chiefOfStaff?: boolean;
+  // DALTON-HOOK(antigravity-series): workspace id to detect shared workspaces before issuing PATCH
+  workspaceId?: string | null;
 }
 
 /**
@@ -83,10 +92,18 @@ export function useThreadModel({
   isLoading,
   initialModel = null,
   chiefOfStaff = false,
+  // DALTON-HOOK(antigravity-series): accept workspaceId to skip PATCH on shared workspaces
+  workspaceId = null,
 }: UseThreadModelOptions) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const { catalogModelNames, metadata } = useAllModels();
+  const { catalogModelNames, metadata, customModels, rawApiResponse, seriesCatalog } = useAllModels();
+  const sharedEntry = useSharedEntry(workspaceId);
+  // DALTON-HOOK(antigravity-series): distinguish loading vs confirmed shared workspace so picks during load are preserved
+  const isSharedLoading = Boolean(workspaceId) && sharedEntry === undefined;
+  const isSharedWorkspace = Boolean(workspaceId) && sharedEntry != null;
+  const isSharedOrLoading = isSharedLoading || isSharedWorkspace;
+  const rawMetadata = rawApiResponse?.model_metadata ?? metadata;
   const defaultModel = useDefaultModel();
   const lapsedOf = useLapsedSignIn();
   const liveThreadId = threadId && threadId !== '__default__' ? threadId : null;
@@ -130,8 +147,15 @@ export function useThreadModel({
   const [heldThreadId, setHeldThreadId] = useState(liveThreadId);
   // DALTON-HOOK(agent-switch-model): only include llm_model in send requests when the user manually picked a model on this page
   const [manualPick, setManualPick] = useState<string | null>(null);
+  // DALTON-HOOK(antigravity-series): retain a pick made while shared workspace membership is loading
+  const [deferredSharedPick, setDeferredSharedPick] = useState<{
+    threadId: string;
+    picked: string;
+    before: string | null;
+  } | null>(null);
   let nextPending = pending;
   let nextManualPick = manualPick;
+  let nextDeferredSharedPick = deferredSharedPick;
 
   if (heldThreadId !== liveThreadId) {
     if (heldThreadId) {
@@ -140,22 +164,55 @@ export function useThreadModel({
       setPending(null);
       nextManualPick = null;
       setManualPick(null);
+      // DALTON-HOOK(antigravity-series): drop deferred shared-loading pick when switching threads
+      nextDeferredSharedPick = null;
+      setDeferredSharedPick(null);
     } else if (liveThreadId) {
       createdHereRef.current = true;
     }
   }
 
-  if (nextPending !== null && (Boolean(retiredName) || !isModelAvailable(nextPending, catalogModelNames))) {
+  // DALTON-HOOK(antigravity-series): clear pending/deferred/shared picks only when the pick itself is unavailable (not when an older saved row model is retired)
+  if (nextPending !== null && !isModelAvailable(nextPending, catalogModelNames)) {
     nextPending = null;
     createdHereRef.current = false;
     setPending(null);
   }
 
+  if (
+    nextDeferredSharedPick !== null
+    && !isModelAvailable(nextDeferredSharedPick.picked, catalogModelNames)
+  ) {
+    nextDeferredSharedPick = null;
+    setDeferredSharedPick(null);
+  }
+
+  if (
+    isSharedOrLoading
+    && nextManualPick !== null
+    && !isModelAvailable(nextManualPick, catalogModelNames)
+  ) {
+    nextManualPick = null;
+    setManualPick(null);
+  }
+
   pendingRef.current = nextPending;
 
-  const [model, setModel] = useSeededModel(nextPending ?? seed);
+  // DALTON-HOOK(antigravity-series): keep deferred/shared pick driving displayed and sent model when thread detail loads before shared list resolves
+  const effectiveSeed = nextPending
+    ?? nextDeferredSharedPick?.picked
+    ?? (isSharedOrLoading ? nextManualPick : null)
+    ?? seed;
+  const [model, setModel] = useSeededModel(effectiveSeed);
 
-  if (nextManualPick !== null && nextPending === null && seed !== nextManualPick) {
+  // DALTON-HOOK(antigravity-series): keep local manualPick across rerenders on shared/loading threads or while a deferred pick awaits flush
+  if (
+    !isSharedOrLoading
+    && nextManualPick !== null
+    && nextPending === null
+    && nextDeferredSharedPick === null
+    && seed !== nextManualPick
+  ) {
     nextManualPick = null;
     setManualPick(null);
   }
@@ -229,26 +286,112 @@ export function useThreadModel({
       const to = saved.llm_model || startsOn;
       const key = saved.brief_handoff ? 'chat.threadModel.brief' : saved.summary_handoff ? 'chat.threadModel.handoff' : null;
       if (!key || !to) return;
-      toast({ description: t(key, { model: modelLabel(to, metadata) }) });
+      const toLabel = formatAntigravityVariantLabel(to, {
+        seriesCatalog,
+        rawMetadata,
+        customModels,
+      }) ?? modelLabel(to, metadata);
+      toast({ description: t(key, { model: toLabel }) });
     },
   });
 
   /** Resolves false only when this pick's own save failed. */
   const pickModel = useCallback((picked: string): Promise<boolean> => {
     const previous = model;
-    // DALTON-HOOK(ui-model-pick): record the pick as pending until confirmed.
-    pendingRef.current = picked;
-    setPending(picked);
+    const seriesOpts = { seriesCatalog, rawMetadata, customModels };
+    const isAntigravityPick = Boolean(inspectSavedAntigravityModel(picked, seriesOpts));
+    const sameSeriesPick = sameAntigravitySeries(previous, picked, seriesOpts);
+    // DALTON-HOOK(ui-model-pick): record the pick as pending until confirmed (skip for shared/new threads).
+    // DALTON-HOOK(antigravity-series): keep pending for unsaved new threads; defer PATCH on existing threads while shared status loads
+    if (!isSharedOrLoading || !liveThreadId) {
+      pendingRef.current = picked;
+      setPending(picked);
+      setDeferredSharedPick(null);
+    } else if (isSharedLoading) {
+      setDeferredSharedPick((current) => ({
+        threadId: liveThreadId,
+        picked,
+        before: current && current.threadId === liveThreadId ? current.before : previous,
+      }));
+    } else {
+      setDeferredSharedPick(null);
+    }
     // DALTON-HOOK(agent-switch-model): mark as manually picked for the upcoming send
     setManualPick(picked);
     setModel(picked);
+    // DALTON-HOOK(antigravity-series): switching effort within the same series does not re-open the default banner
     const dismissedForThread = !!liveThreadId
       && userSessionStorage.getItem(OFFER_DISMISSED_PREFIX + liveThreadId) !== null;
-    if (!dismissed && !dismissedForThread) setOffered(picked);
-    if (!liveThreadId) return Promise.resolve(true);
+    if (!dismissed && !dismissedForThread && !sameSeriesPick) {
+      setOffered(picked);
+    } else if (sameSeriesPick && offered && sameAntigravitySeries(offered, picked, seriesOpts)) {
+      setOffered(picked);
+    }
+    if (!liveThreadId || isSharedOrLoading) return Promise.resolve(true);
     createdHereRef.current = false;
-    return saveModel({ threadId: liveThreadId, value: picked, before: previous });
-  }, [model, setModel, liveThreadId, dismissed, saveModel]);
+    const shouldClearEffort = isAntigravityPick && thread?.reasoning_effort != null;
+    return saveModel({
+      threadId: liveThreadId,
+      value: picked,
+      before: previous,
+      ...(shouldClearEffort ? { extraUpdates: { reasoning_effort: null } } : {}),
+    });
+  }, [
+    model,
+    setModel,
+    liveThreadId,
+    isSharedLoading,
+    isSharedOrLoading,
+    dismissed,
+    offered,
+    saveModel,
+    seriesCatalog,
+    rawMetadata,
+    customModels,
+    thread?.reasoning_effort,
+  ]);
+
+  // DALTON-HOOK(antigravity-series): once shared workspace status settles, flush a loading-time pick via PATCH (personal) or keep send-with-message (shared)
+  useEffect(() => {
+    if (!deferredSharedPick || isSharedLoading) return;
+    if (deferredSharedPick.threadId !== liveThreadId || !liveThreadId) {
+      setDeferredSharedPick(null);
+      return;
+    }
+    if (isSharedWorkspace) {
+      setDeferredSharedPick(null);
+      setModel(deferredSharedPick.picked);
+      return;
+    }
+    const { threadId: targetThreadId, picked, before } = deferredSharedPick;
+    const seriesOpts = { seriesCatalog, rawMetadata, customModels };
+    const isAntigravityPick = Boolean(inspectSavedAntigravityModel(picked, seriesOpts));
+    const shouldClearEffort = isAntigravityPick && thread?.reasoning_effort != null;
+    setDeferredSharedPick(null);
+    pendingRef.current = picked;
+    setPending(picked);
+    setManualPick(picked);
+    setModel(picked);
+    createdHereRef.current = false;
+    // DALTON-HOOK(antigravity-series): flush confirmed-personal deferred pick with optional reasoning_effort clear
+    void saveModel({
+      threadId: targetThreadId,
+      value: picked,
+      before,
+      ...(shouldClearEffort ? { extraUpdates: { reasoning_effort: null } } : {}),
+    });
+  }, [
+    deferredSharedPick,
+    isSharedLoading,
+    isSharedWorkspace,
+    liveThreadId,
+    seriesCatalog,
+    rawMetadata,
+    customModels,
+    thread?.reasoning_effort,
+    saveModel,
+    setModel,
+  ]);
 
   // A send stores the model it named on the row, so the cached detail is
   // behind once a turn ends. That includes a turn refused as `model_removed`:
@@ -264,6 +407,9 @@ export function useThreadModel({
   startsOnRef.current = startsOn;
   const catalogModelNamesRef = useRef(catalogModelNames);
   catalogModelNamesRef.current = catalogModelNames;
+  // DALTON-HOOK(antigravity-series): never issue turn-end repick PATCH on shared or still-loading workspaces
+  const isSharedOrLoadingRef = useRef(isSharedOrLoading);
+  isSharedOrLoadingRef.current = isSharedOrLoading;
 
   // DALTON-HOOK(ui-model-pick): what a turn's end does with the reread row,
   // run once that reread (or, when another field was saving, the reread after
@@ -285,7 +431,8 @@ export function useThreadModel({
         setPending(null);
         return;
       }
-      if (createdHere && currentPending !== firstSendModelRef.current) {
+      // DALTON-HOOK(antigravity-series): skip saveModel on shared/loading workspaces after first-turn creation
+      if (createdHere && currentPending !== firstSendModelRef.current && !isSharedOrLoadingRef.current) {
         void saveModel({
           threadId: id,
           value: currentPending,
@@ -315,7 +462,8 @@ export function useThreadModel({
     const saving = queryClient.isMutating({ mutationKey: threadFieldMutationKey(id) }) > 0;
     const modelSaving = queryClient.isMutating({ mutationKey: threadFieldMutationKey(id, 'llm_model') }) > 0;
     // DALTON-HOOK(agent-switch-model): clear manual pick when turn ends only if no PATCH for llm_model is in flight
-    if (!modelSaving) {
+    // DALTON-HOOK(antigravity-series): keep local manual pick on shared/loading threads or while a deferred pick awaits flush
+    if (!modelSaving && !isSharedOrLoading && !deferredSharedPick) {
       setManualPick(null);
     }
     // DALTON-HOOK(ui-model-pick): the reread's own result decides the pick;
@@ -334,7 +482,7 @@ export function useThreadModel({
     // running both on the same reread would undo the repick the first saves.
     deferredCheckRef.current = null;
     turnEndCheck(id, invalidated);
-  }, [isLoading, liveThreadId, queryClient, turnEndCheck]);
+  }, [isLoading, liveThreadId, queryClient, turnEndCheck, isSharedOrLoading, deferredSharedPick]);
 
   // A turn that ended while another field of the thread was saving runs its
   // check once that save settles, so a repick made during creation is not

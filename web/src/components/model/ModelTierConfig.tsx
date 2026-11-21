@@ -7,10 +7,13 @@ import { TWEEN } from "@/lib/motion"
 import { BACKGROUND_AUTO } from "@/lib/modelPreferences"
 import { ModelSelector } from "./ModelSelector"
 import { useModelSlotCopy } from "./useModelSlotCopy"
-import type { ProviderModelsData } from "./types"
+import type { CustomModelEntry, ProviderModelsData } from "./types"
 import type { Payer } from "@/lib/modelPayer"
 import { isClaudeCodeModel } from "@/lib/claudeCode"
 import type { ModelMetadataEntry } from "@/hooks/useFilteredModels"
+// DALTON-HOOK(antigravity-series): forward seriesCatalog & series-only background formatting to ModelSelector slots
+import { formatAntigravityVariantLabel, type AntigravitySeriesCatalog } from "@/lib/antigravitySeries"
+import { modelLabel } from "@/lib/modelLabel"
 
 export interface ModelTierConfigProps {
   /** Available models grouped by provider */
@@ -32,8 +35,6 @@ export interface ModelTierConfigProps {
   payers?: Record<string, Payer>
   /** Optional model metadata, for display names */
   metadata?: Record<string, ModelMetadataEntry>
-  // DALTON-HOOK(dalton-setup): optional custom labeler for background dropdown (omits fixed-low effort suffix)
-  backgroundNameOf?: (model: string) => string
   /** Settings, where both slots are account defaults and may stay unset: the
    *  models Auto runs, the deployment's primary and Background, each as printed and
    *  absent when the deployment names none. An unset primary is Auto; an unset
@@ -41,6 +42,13 @@ export interface ModelTierConfigProps {
    *  beside it, and is Auto before. Setup leaves this off: a first run fills
    *  both. */
   auto?: { primary?: string; background?: string }
+  // DALTON-HOOK(antigravity-series): optional series catalog & missingLabel forwarded to ModelSelector
+  seriesCatalog?: AntigravitySeriesCatalog
+  rawMetadata?: Record<string, ModelMetadataEntry>
+  customModels?: readonly CustomModelEntry[]
+  missingLabel?: (value: string) => string
+  backgroundMissingLabel?: (value: string) => string
+  hideEffortPicker?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -58,13 +66,27 @@ export function ModelTierConfig({
   showExplainer = false,
   payers,
   metadata,
-  // DALTON-HOOK(dalton-setup): custom background dropdown labeler
-  backgroundNameOf,
   auto,
+  seriesCatalog,
+  rawMetadata,
+  customModels,
+  missingLabel,
+  backgroundMissingLabel,
+  hideEffortPicker = false,
 }: ModelTierConfigProps) {
   const { t } = useTranslation()
   const [explainerOpen, setExplainerOpen] = useState(true)
   const copy = useModelSlotCopy()
+  // DALTON-HOOK(antigravity-series): background slot prints pure Antigravity series name without effort suffix
+  const resolvedBackgroundMissingLabel = backgroundMissingLabel
+    ?? (seriesCatalog
+      ? (m: string) =>
+          formatAntigravityVariantLabel(m, {
+            seriesCatalog,
+            rawMetadata: rawMetadata ?? metadata,
+            customModels,
+          }) ?? missingLabel?.(m) ?? modelLabel(m, metadata)
+      : missingLabel)
   const autoLabel = (model: string | undefined) =>
     model ? t("settings.autoModel", { model }) : undefined
   const primaryAuto = autoLabel(auto?.primary)
@@ -171,6 +193,12 @@ export function ModelTierConfig({
         required={!primaryAuto}
         payers={payers}
         metadata={metadata}
+        missingLabel={missingLabel}
+        // DALTON-HOOK(antigravity-series): pass seriesCatalog, rawMetadata, and customModels to slot selectors
+        seriesCatalog={seriesCatalog}
+        rawMetadata={rawMetadata}
+        customModels={customModels}
+        hideEffortPicker={hideEffortPicker}
       />
 
       {/* Background model selector */}
@@ -190,8 +218,13 @@ export function ModelTierConfig({
         required={!auto}
         payers={payers}
         metadata={metadata}
-        // DALTON-HOOK(dalton-setup): omit fixed-low effort suffix in Dalton background dropdown
-        nameOf={backgroundNameOf}
+        // DALTON-HOOK(antigravity-series): background slot hides effort picker, prints series name only, and picks -low (or lowest)
+        missingLabel={resolvedBackgroundMissingLabel}
+        seriesCatalog={seriesCatalog}
+        rawMetadata={rawMetadata}
+        customModels={customModels}
+        hideEffortPicker
+        preferLowEffort
       />
 
     </div>

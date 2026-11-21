@@ -181,6 +181,55 @@ vi.mock('@/api/client', async (importOriginal) => {
           ...s.metadataExtra,
         },
         system_defaults: s.systemDefaults,
+        antigravity_series: [
+          {
+            series_id: 'antigravity-oauth:gemini-4-neon',
+            series_prefix: 'gemini-4-neon',
+            display_name: 'Gemini 4 Neon',
+            qualified_display_name: 'Gemini 4 Neon (Antigravity)',
+            provider: 'antigravity-oauth',
+            default_effort: 'high',
+            default_model: 'gemini-4-neon-high-oauth',
+            efforts: ['high'],
+            variants: { high: 'gemini-4-neon-high-oauth' },
+          },
+          {
+            series_id: 'antigravity-oauth:gemini-4-carbon',
+            series_prefix: 'gemini-4-carbon',
+            display_name: 'Gemini 4 Carbon',
+            qualified_display_name: 'Gemini 4 Carbon (Antigravity)',
+            provider: 'antigravity-oauth',
+            default_effort: 'medium',
+            default_model: 'gemini-4-carbon-medium-oauth',
+            efforts: ['medium'],
+            variants: { medium: 'gemini-4-carbon-medium-oauth' },
+          },
+          {
+            series_id: 'antigravity-oauth:gemini-4-hydrogen',
+            series_prefix: 'gemini-4-hydrogen',
+            display_name: 'Gemini 4 Hydrogen',
+            qualified_display_name: 'Gemini 4 Hydrogen (Antigravity)',
+            provider: 'antigravity-oauth',
+            default_effort: 'high',
+            default_model: 'gemini-4-hydrogen-high-oauth',
+            efforts: ['low', 'high'],
+            variants: {
+              low: 'gemini-4-hydrogen-low-oauth',
+              high: 'gemini-4-hydrogen-high-oauth',
+            },
+          },
+          {
+            series_id: 'antigravity-oauth:claude-opus-5-5',
+            series_prefix: 'claude-opus-5-5',
+            display_name: 'Claude Opus 5.5',
+            qualified_display_name: 'Claude Opus 5.5 (Antigravity)',
+            provider: 'antigravity-oauth',
+            default_effort: 'medium',
+            default_model: 'claude-opus-5-5-medium-oauth',
+            efforts: ['medium'],
+            variants: { medium: 'claude-opus-5-5-medium-oauth' },
+          },
+        ],
         compaction_profiles: {},
         search_providers: {},
         provider_catalog: [
@@ -547,8 +596,9 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
 
     // Real SetupStart -> nextSetupStep -> skips /setup/model -> lands on /setup/default
     await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/setup/default'), { timeout: 5000 });
-    const neonRadio = await screen.findByRole('radio', { name: /Gemini 4 Neon High/i }, { timeout: 5000 });
+    const neonRadio = await screen.findByRole('radio', { name: /Gemini 4 Neon/i }, { timeout: 5000 });
     expect(neonRadio).toBeChecked();
+    expect(screen.queryByText(/Gemini 4 Neon High/i)).toBeNull();
     expect(screen.queryByText(/Credits Only Model/i)).toBeNull();
     expect(screen.queryByText(/Claude Code Sonnet/i)).toBeNull();
     // Only curated available candidates appear (Neon, Carbon, Opus fallback — never Hydrogen)
@@ -607,7 +657,7 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     // Admin configures team models; clicking Retry loads them, unlocks Continue, and saves BOTH recommended models
     server.state.teamModelsConfigured = true;
     await user.click(screen.getByRole('button', { name: 'Try again' }));
-    await waitFor(() => expect(screen.getByRole('radio', { name: /Gemini 4 Neon High/i })).toBeChecked(), { timeout: 5000 });
+    await waitFor(() => expect(screen.getByRole('radio', { name: /Gemini 4 Neon/i })).toBeChecked(), { timeout: 5000 });
     const continueBtn = screen.getByRole('button', { name: 'Continue' });
     expect(continueBtn).toBeEnabled();
 

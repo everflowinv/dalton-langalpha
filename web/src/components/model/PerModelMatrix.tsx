@@ -20,6 +20,14 @@ import type { GuidanceLevel } from '@/lib/modelTuning';
 import type { CompactionProfileCatalog, CompactionProfileName } from '@/hooks/useAllModels';
 import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
 import { modelLabel } from '@/lib/modelLabel';
+// DALTON-HOOK(antigravity-series): collapse addable Antigravity variants by series & label rows as Series · Effort
+import type { CustomModelEntry } from './types';
+import {
+  formatAntigravityVariantLabel,
+  inspectSavedAntigravityModel,
+  type AntigravitySeriesCatalog,
+} from '@/lib/antigravitySeries';
+import { resolveEffort } from '@/lib/modelTuning';
 
 export interface PerModelMatrixProps {
   metadata: Record<string, ModelMetadataEntry>;
@@ -27,6 +35,9 @@ export interface PerModelMatrixProps {
   compactionProfiles: CompactionProfileCatalog | null;
   /** Deployment-pinned `prompt.guidance`; null on the `auto` default. */
   pinnedGuidance?: string | null;
+  seriesCatalog?: AntigravitySeriesCatalog;
+  rawMetadata?: Record<string, ModelMetadataEntry>;
+  customModels?: readonly CustomModelEntry[];
 }
 
 /** A cell whose setting the model has no control for — stated, not left blank,
@@ -52,6 +63,10 @@ export function PerModelMatrix({
   validModelNames,
   compactionProfiles,
   pinnedGuidance = null,
+  // DALTON-HOOK(antigravity-series): series labeling & collapsed addable options
+  seriesCatalog,
+  rawMetadata,
+  customModels,
 }: PerModelMatrixProps) {
   const { t } = useTranslation();
   const { preferences } = usePreferences();
@@ -59,6 +74,13 @@ export function PerModelMatrix({
   // Rows the user opened but has not set anything on yet. They carry no server
   // state — a profile only exists once a field is picked.
   const [pendingRows, setPendingRows] = useState<string[]>([]);
+  const rawMeta = rawMetadata ?? metadata;
+  const seriesOpts = useMemo(
+    () => ({ seriesCatalog, rawMetadata: rawMeta, customModels }),
+    [seriesCatalog, rawMeta, customModels],
+  );
+  const rowLabel = (m: string) =>
+    formatAntigravityVariantLabel(m, { ...seriesOpts, t, includeEffort: true }) ?? modelLabel(m, metadata);
 
   const account = useMemo(() => modelPrefs(preferences), [preferences]);
   const profiles = useMemo(() => account.profiles ?? {}, [account]);
@@ -81,10 +103,34 @@ export function PerModelMatrix({
     [rows, validModelNames],
   );
 
-  const addable = useMemo(
-    () => [...validModelNames].filter((m) => !rows.includes(m)).sort(),
-    [validModelNames, rows],
-  );
+  // DALTON-HOOK(antigravity-series): collapse Antigravity variants in "+ Add model" to 1 option per series (default_effort)
+  const addableOptions = useMemo(() => {
+    const raw = [...validModelNames].filter((m) => !rows.includes(m)).sort();
+    const seriesBuckets = new Map<string, { displayName: string; defaultEffort: string; variants: Map<string, string> }>();
+    const nonSeries: Array<{ value: string; label: string }> = [];
+    for (const m of raw) {
+      const hit = inspectSavedAntigravityModel(m, seriesOpts);
+      if (!hit) {
+        nonSeries.push({ value: m, label: modelLabel(m, metadata) });
+        continue;
+      }
+      const sid = hit.series.series_id;
+      let bucket = seriesBuckets.get(sid);
+      if (!bucket) {
+        bucket = { displayName: hit.displayName, defaultEffort: hit.series.default_effort, variants: new Map() };
+        seriesBuckets.set(sid, bucket);
+      }
+      bucket.variants.set(hit.effort, m);
+    }
+    const collapsedSeries: Array<{ value: string; label: string }> = [];
+    for (const bucket of seriesBuckets.values()) {
+      const efforts = [...bucket.variants.keys()];
+      const chosen = resolveEffort(bucket.defaultEffort, efforts) ?? efforts[0];
+      const key = chosen ? bucket.variants.get(chosen) : undefined;
+      if (key) collapsedSeries.push({ value: key, label: bucket.displayName });
+    }
+    return [...nonSeries, ...collapsedSeries].sort((a, b) => a.label.localeCompare(b.label));
+  }, [validModelNames, rows, seriesOpts, metadata]);
 
   const profileOptions = useMemo(
     () =>
@@ -165,8 +211,9 @@ export function PerModelMatrix({
                 if (unreachable.has(model)) {
                   return (
                     <tr key={model} style={{ borderTop: '1px solid var(--color-border-muted)' }}>
+                      {/* DALTON-HOOK(antigravity-series): display unreachable variant as Series · Effort */}
                       <td className="py-2 pl-px pr-3 align-middle" style={{ color: 'var(--color-text-tertiary)' }}>
-                        {modelLabel(model, metadata)}
+                        {rowLabel(model)}
                       </td>
                       <td className="py-2 pl-px pr-3 align-middle" colSpan={settingColumns}>
                         <NotSupported label={t('settings.modelTuning.modelUnavailable')} />
@@ -202,8 +249,9 @@ export function PerModelMatrix({
                 const offersNative = inherited.native_compaction !== null || storedNative !== null;
                 return (
                   <tr key={model} style={{ borderTop: '1px solid var(--color-border-muted)' }}>
+                    {/* DALTON-HOOK(antigravity-series): display reachable Antigravity variant as Series · Effort */}
                     <td className="py-2 pl-px pr-3 align-middle" style={{ color: 'var(--color-text-primary)' }}>
-                      {modelLabel(model, metadata)}
+                      {rowLabel(model)}
                     </td>
                     <td className="py-2 pl-px pr-3 align-middle">
                       {hasEffortOptions(efforts, storedEffort) ? (
@@ -321,7 +369,8 @@ export function PerModelMatrix({
         </div>
       )}
 
-      {addable.length > 0 && (
+      {/* DALTON-HOOK(antigravity-series): "+ Add a model" uses collapsed series options */}
+      {addableOptions.length > 0 && (
         <Select
           value=""
           onChange={(e) => {
@@ -331,8 +380,8 @@ export function PerModelMatrix({
           className="self-start text-xs"
         >
           <option value="">+ {t('settings.modelTuning.addModel')}</option>
-          {addable.map((m) => (
-            <option key={m} value={m}>{modelLabel(m, metadata)}</option>
+          {addableOptions.map((opt) => (
+            <option key={opt.value} value={opt.value}>{opt.label}</option>
           ))}
         </Select>
       )}

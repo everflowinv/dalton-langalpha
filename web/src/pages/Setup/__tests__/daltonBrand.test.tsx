@@ -202,6 +202,9 @@ vi.mock('@/hooks/useAllModels', () => ({
     isLoading: false,
     unread: false,
     listedProviders: [],
+    seriesCatalog: { series: [], bySeriesId: {}, bySeriesPrefix: {}, byVariantKey: {} },
+    selectableSeries: [],
+    selectableSlotSeries: [],
   }),
 }));
 

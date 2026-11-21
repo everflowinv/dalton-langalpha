@@ -15,15 +15,15 @@ import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
 import { getModelDisplayName } from '@/components/ui/chat-input.helpers';
 import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(dalton-setup): Dalton build defaults, curated setup list, & credits/Claude Code filtering
+// DALTON-HOOK(antigravity-series): series-only display & hide effort pickers in onboarding
 import { isDaltonBuild } from '@/config/brand';
 import {
-  dedupeDaltonBackgroundModels,
   filterDaltonCuratedModels,
   filterDaltonPayers,
   filterDaltonProviderModels,
   isDaltonAllowedModel,
-  stripEffortFromModelLabel,
 } from '@/config/daltonSetup';
+import { formatAntigravityVariantLabel, sameAntigravitySeries } from '@/lib/antigravitySeries';
 import { isDesktopShell } from '@/lib/desktop';
 import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
 import { homeWorkspaceQuery } from '@/hooks/useHomeWorkspace';
@@ -109,7 +109,10 @@ export default function DefaultStep() {
     systemBackground: allowedSystemBackground,
     preferred: saved.preferred_model ?? null,
     // DALTON-HOOK(dalton-setup): pass dalton build flag and team state into DefaultForm
+    // DALTON-HOOK(antigravity-series): pass seriesCatalog & selectableSeries into defaultChoices
     dalton: isDaltonBuild,
+    seriesCatalog: all.seriesCatalog,
+    selectableSeries: all.selectableSeries,
   });
   // Mounted once the preferences are read, so the picks are seeded from what
   // is saved and never from an unread row; keyed by the account, whose drafts
@@ -158,7 +161,9 @@ function DefaultForm({
 }) {
   const { t } = useTranslation();
   const copy = useModelSlotCopy();
-  const { slotModels, payers, metadata, systemDefaults, cannotRun } = all;
+  const { slotModels, payers, metadata, systemDefaults, cannotRun, seriesCatalog, customModels, rawApiResponse } = all;
+  const rawMetadata = rawApiResponse?.model_metadata ?? metadata;
+  const seriesOpts = { seriesCatalog, rawMetadata, customModels };
   // DALTON-HOOK(dalton-setup): exclude Claude Code / credits / rejected-credential models and payers in Dalton builds
   const visiblePayers = filterDaltonPayers(payers, isDaltonBuild);
   const visibleSlotModels = filterDaltonProviderModels(slotModels, metadata, payers, isDaltonBuild, team.rejectedProviders);
@@ -195,9 +200,12 @@ function DefaultForm({
   // is confirmed not to run.
   const settled = !all.isLoading && !all.unread && !(isDaltonBuild && team.isLoading);
   const backgroundOffered = Object.values(visibleSlotModels).flatMap((p) => p.models ?? []);
+  const primaryInList = (pick: string | null) => !!pick && (
+    choices.list.includes(pick) || choices.list.some((m) => sameAntigravitySeries(m, pick, seriesOpts))
+  );
   const primary = primaryPick === null
     ? (settled ? (choices.initial ?? recommended.primary) : null)
-    : (settled && !choices.list.includes(primaryPick) ? recommended.primary : primaryPick);
+    : (settled && !primaryInList(primaryPick) ? recommended.primary : primaryPick);
   // DALTON-HOOK(dalton-setup): reject credits/Claude Code/rejected-credential background models including Auto, and follow latest recommended when untouched
   const backgroundDisallowed = isDaltonBuild && backgroundPick !== null && backgroundPick !== '' && (
     backgroundPick === BACKGROUND_AUTO
@@ -263,12 +271,11 @@ function DefaultForm({
     behindNow.current = behind;
   }, [behind]);
 
-  const name = (m: string) => getModelDisplayName(m, metadata);
-  // DALTON-HOOK(dalton-setup): background slot runs at fixed low effort, so omit effort suffixes from its label
-  const backgroundName = (m: string) => (isDaltonBuild ? stripEffortFromModelLabel(name(m)) : name(m));
-  const backgroundSlotModels = dedupeDaltonBackgroundModels(visibleSlotModels, isDaltonBuild);
+  // DALTON-HOOK(antigravity-series): display Antigravity models purely as series names without effort suffix
+  const name = (m: string) =>
+    formatAntigravityVariantLabel(m, seriesOpts) ?? getModelDisplayName(m, metadata);
   const curatedCustomizeModels = filterDaltonCuratedModels(visibleSlotModels, isDaltonBuild);
-  const deploymentBackground = systemBackground ? t('settings.autoModel', { model: backgroundName(systemBackground) }) : undefined;
+  const deploymentBackground = systemBackground ? t('settings.autoModel', { model: name(systemBackground) }) : undefined;
   const onRecommended = primary === recommended.primary && background === recommendedBackground;
   // Self-hosted runs it on the token the server saved, wherever the turn is.
   const target = flow.tokenTarget;
@@ -425,8 +432,8 @@ function DefaultForm({
                     <dt style={{ color: 'var(--color-text-tertiary)' }}>{copy.background.label}</dt>
                     <dd className="flex flex-col gap-0.5">
                       <span className="font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                        {/* DALTON-HOOK(dalton-setup): omit effort suffix on background model label */}
-                        {recommended.background ? backgroundName(recommended.background) : deploymentBackground}
+                        {/* DALTON-HOOK(antigravity-series): pure series name without effort suffix */}
+                        {recommended.background ? name(recommended.background) : deploymentBackground}
                       </span>
                       {recommended.backgroundWhy && (
                         <span style={{ color: 'var(--color-text-secondary)' }}>
@@ -443,20 +450,24 @@ function DefaultForm({
           )}
 
           <div role="radiogroup" aria-labelledby={headingId} className="flex flex-col gap-2">
-            {choices.list.map((m) => (
-              <PickCard key={m} name={groupName} value={m} checked={m === primary} onSelect={setPrimary}>
-                <span className="flex min-w-0 flex-1 flex-col gap-1">
-                  <span className="flex flex-wrap items-center gap-2 text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                    {name(m)}
-                    {recommended.primary === m && <NameTag>{t('setup.answers.default.recommended')}</NameTag>}
+            {choices.list.map((m) => {
+              const isPrimaryCard = m === primary || sameAntigravitySeries(m, primary, seriesOpts);
+              const isRecommendedCard = recommended.primary === m || sameAntigravitySeries(m, recommended.primary, seriesOpts);
+              return (
+                <PickCard key={m} name={groupName} value={m} checked={isPrimaryCard} onSelect={setPrimary}>
+                  <span className="flex min-w-0 flex-1 flex-col gap-1">
+                    <span className="flex flex-wrap items-center gap-2 text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
+                      {name(m)}
+                      {isRecommendedCard && <NameTag>{t('setup.answers.default.recommended')}</NameTag>}
+                    </span>
+                    <Ratings meta={metadata[m]} />
+                    {isPrimaryCard && where && <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{where}</span>}
                   </span>
-                  <Ratings meta={metadata[m]} />
-                  {m === primary && where && <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{where}</span>}
-                </span>
-                {/* DALTON-HOOK(dalton-setup): hide credits payer badges under Dalton */}
-                <PayerBadge payer={visiblePayers[m]} />
-              </PickCard>
-            ))}
+                  {/* DALTON-HOOK(dalton-setup): hide credits payer badges under Dalton */}
+                  <PayerBadge payer={visiblePayers[m]} />
+                </PickCard>
+              );
+            })}
           </div>
 
           <div>
@@ -479,19 +490,25 @@ function DefaultForm({
                   transition={TWEEN.quick}
                 >
                   <div className="flex flex-col gap-6 pt-4">
-                    {/* DALTON-HOOK(dalton-setup): Dalton background dropdown omits effort labels & dedupes variants; Customize routing uses curated 5 */}
+                    {/* DALTON-HOOK(dalton-setup): pass Dalton-filtered slot models, payers, and Auto option; Customize routing uses curated 5 */}
+                    {/* DALTON-HOOK(antigravity-series): never render effort pickers on onboarding step; background picks -low via series index */}
                     <ModelSelector
                       label={copy.background.label}
                       description={copy.background.description}
                       value={background}
                       onChange={setBackground}
-                      models={backgroundSlotModels}
-                      missingLabel={backgroundName}
-                      nameOf={isDaltonBuild ? backgroundName : undefined}
+                      models={visibleSlotModels}
+                      missingLabel={name}
+                      nameOf={isDaltonBuild ? name : undefined}
                       placeholder={copy.background.placeholder}
                       autoOption={deploymentBackground ? { value: BACKGROUND_AUTO, label: deploymentBackground } : undefined}
                       payers={visiblePayers}
                       metadata={metadata}
+                      seriesCatalog={seriesCatalog}
+                      rawMetadata={rawMetadata}
+                      customModels={customModels}
+                      hideEffortPicker
+                      preferLowEffort
                     />
                     <ModelSelector
                       label={t('settings.modelTuning.fetchModel')}
@@ -503,6 +520,10 @@ function DefaultForm({
                       placeholder={copy.defaultsToBackground}
                       payers={visiblePayers}
                       metadata={metadata}
+                      seriesCatalog={seriesCatalog}
+                      rawMetadata={rawMetadata}
+                      customModels={customModels}
+                      hideEffortPicker
                     />
                     <ModelSelector
                       label={t('settings.modelTuning.compactionModel')}
@@ -514,6 +535,10 @@ function DefaultForm({
                       placeholder={copy.defaultsToConversation}
                       payers={visiblePayers}
                       metadata={metadata}
+                      seriesCatalog={seriesCatalog}
+                      rawMetadata={rawMetadata}
+                      customModels={customModels}
+                      hideEffortPicker
                     />
                     {/* DALTON-HOOK(dalton-setup): pass Dalton curated models and payers to FallbackModelsPicker */}
                     <FallbackModelsPicker
@@ -522,6 +547,10 @@ function DefaultForm({
                       models={curatedCustomizeModels}
                       metadata={metadata}
                       payers={visiblePayers}
+                      seriesCatalog={seriesCatalog}
+                      rawMetadata={rawMetadata}
+                      customModels={customModels}
+                      hideEffortPicker
                     />
                   </div>
                 </motion.div>

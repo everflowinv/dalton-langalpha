@@ -13,11 +13,13 @@ import { Disclosure } from '@/components/ui/Disclosure';
 import { Input } from '@/components/ui/input';
 import { SegmentedControl } from '@/components/ui/segmented-control';
 // DALTON-HOOK(automation-model): reuse Settings ModelSelector & useAllModels
+// DALTON-HOOK(antigravity-series): format saved Antigravity variants as "Series · Effort"
 import { ModelSelector } from '@/components/model/ModelSelector';
 import { getModelDisplayName } from '@/components/ui/chat-input.helpers';
 import { useAllModels } from '@/hooks/useAllModels';
 import { useApiKeys } from '@/hooks/useApiKeys';
 import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
+import { formatAntigravityVariantLabel } from '@/lib/antigravitySeries';
 import { cn } from '@/lib/utils';
 import type { DeliveryAttempt } from '@/types/automation';
 import { useAutomationPlace } from '../hooks/useAutomationPlace';
@@ -101,7 +103,18 @@ export default function MoreOptions({
   const names = useMemo(() => deliveryNames(picker, deliveryAttempts ?? []), [picker, deliveryAttempts]);
   const entryName = (entry: string) => deliveryEntryName(entry, t, picker, names);
   // DALTON-HOOK(automation-model): available user models (excluding keyless custom models) and display formatting
-  const { models, metadata, payers, keylessModels, isLoading: modelsLoading, rawApiResponse } = useAllModels();
+  // DALTON-HOOK(antigravity-series): read seriesCatalog & customModels for Antigravity series display and selector
+  const {
+    models,
+    metadata,
+    payers,
+    keylessModels,
+    isLoading: modelsLoading,
+    rawApiResponse,
+    seriesCatalog,
+    customModels,
+  } = useAllModels();
+  const rawMetadata = rawApiResponse?.model_metadata ?? metadata;
   // Until the catalog (and the keys deciding which custom models are keyless) has
   // arrived, an empty list is not "no models": showing the saved model as
   // unavailable then would invite clearing it, so the selector waits.
@@ -123,7 +136,15 @@ export default function MoreOptions({
     }
     return filtered;
   }, [models, keylessModels]);
-  const formatModel = (m: string) => getModelDisplayName(m, metadata);
+  // DALTON-HOOK(antigravity-series): format saved Antigravity models as "Series · Effort"
+  const formatModel = (m: string) =>
+    formatAntigravityVariantLabel(m, {
+      seriesCatalog,
+      rawMetadata,
+      customModels,
+      t,
+      includeEffort: true,
+    }) ?? getModelDisplayName(m, metadata);
 
   // What the folded options are set to, so they can stay folded.
   const summary = [
@@ -189,6 +210,7 @@ export default function MoreOptions({
                 {modelsLoading ? t('automation.modelCatalogLoading') : t('automation.modelCatalogUnavailable')}
               </p>
             ) : (
+            // DALTON-HOOK(antigravity-series): pass seriesCatalog, rawMetadata & customModels into automation ModelSelector
             <ModelSelector
               ariaLabel={t('automation.detailModel')}
               nameOf={formatModel}
@@ -206,6 +228,9 @@ export default function MoreOptions({
               placeholder={t('automation.defaultModelOption')}
               payers={payers}
               metadata={metadata}
+              seriesCatalog={seriesCatalog}
+              rawMetadata={rawMetadata}
+              customModels={customModels}
               allowEmpty
             />
             )}

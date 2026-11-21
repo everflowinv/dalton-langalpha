@@ -27,6 +27,13 @@ import { useFavoriteModels } from '@/hooks/useFavoriteModels';
 import { useAccount } from '@/hooks/useAccount';
 import { modelRefusedBy } from '@/lib/accountRules';
 import { modelLabel, modelMatches } from '@/lib/modelLabel';
+// DALTON-HOOK(antigravity-series): wire seriesCatalog, missingLabel & Quick Access collapsing in Settings
+import {
+  buildSelectableAntigravitySeries,
+  formatAntigravityVariantLabel,
+  indexSelectableSeries,
+  inspectSavedAntigravityModel,
+} from '@/lib/antigravitySeries';
 import { Trans, useTranslation } from 'react-i18next';
 // DALTON-HOOK(settings-reorg): move Dalton cards to dedicated sections; keep personal model access + collapsed advanced routing here
 import { ModelAccessSection } from './ModelAccessSection';
@@ -98,7 +105,22 @@ export function ModelsPanel() {
   const { preferences: prefsData } = usePreferences();
   const { mutate } = useUpdatePreferences();
   // DALTON-HOOK(settings-section): customModels is read to keep custom models out of the Dalton selectors
-  const { models: visibleModels, slotModels, metadata: modelMetadata, payers, systemDefaults: hookSystemDefaults, customModels, validModelNames, catalogModelNames, isLoading: modelsLoading, compactionProfiles } = useAllModels();
+  const {
+    models: visibleModels,
+    slotModels,
+    metadata: modelMetadata,
+    payers,
+    systemDefaults: hookSystemDefaults,
+    customModels,
+    validModelNames,
+    catalogModelNames,
+    isLoading: modelsLoading,
+    compactionProfiles,
+    // DALTON-HOOK(antigravity-series): read seriesCatalog & rawMetadata for Settings pickers
+    seriesCatalog,
+    rawApiResponse,
+  } = useAllModels();
+  const rawMetadata = rawApiResponse?.model_metadata ?? modelMetadata;
   const { t } = useTranslation();
   const copy = useSettingCopy();
   const modelSlotCopy = useModelSlotCopy();
@@ -113,13 +135,40 @@ export function ModelsPanel() {
   // ask about the threads on the old default before it writes. ModelTierConfig
   // stays a plain controlled pair because Setup shares it, and a first-run
   // pick has no threads to ask about.
-  const label = useCallback((model: string) => modelLabel(model, modelMetadata), [modelMetadata]);
+  // DALTON-HOOK(antigravity-series): format primary/general labels with effort and background slot with pure series name
+  const label = useCallback(
+    (model: string) => (
+      formatAntigravityVariantLabel(model, {
+        seriesCatalog,
+        rawMetadata,
+        customModels,
+        t,
+        includeEffort: true,
+      }) ?? modelLabel(model, modelMetadata)
+    ),
+    [seriesCatalog, rawMetadata, customModels, t, modelMetadata],
+  );
+  const backgroundLabel = useCallback(
+    (model: string) => (
+      formatAntigravityVariantLabel(model, {
+        seriesCatalog,
+        rawMetadata,
+        customModels,
+      }) ?? modelLabel(model, modelMetadata)
+    ),
+    [seriesCatalog, rawMetadata, customModels, modelMetadata],
+  );
+  // DALTON-HOOK(antigravity-series): route background slot through pure-series formatter in default-change prompts
+  const slotLabel = useCallback(
+    (model: string, slot?: ModelSlot) => (slot === 'background' ? backgroundLabel(model) : label(model)),
+    [backgroundLabel, label],
+  );
   const {
     question: defaultQuestion,
     draft: draftDefaults,
     request: requestDefault,
     clear: clearDefault,
-  } = useDefaultModelChange(label);
+  } = useDefaultModelChange(slotLabel);
 
   const [mode, setMode] = useState<ModelsMode>(readStoredMode);
   const isAdvanced = mode === 'advanced';
@@ -199,9 +248,10 @@ export function ModelsPanel() {
   // on its primary one.
   const deploymentPrimary = hookSystemDefaults?.default_model || undefined;
   const deploymentBackground = hookSystemDefaults?.background_model || deploymentPrimary;
+  // DALTON-HOOK(antigravity-series): print Auto background model without effort suffix
   const autoModels = {
     primary: deploymentPrimary && label(deploymentPrimary),
-    background: deploymentBackground && label(deploymentBackground),
+    background: deploymentBackground && backgroundLabel(deploymentBackground),
   };
   const defaultModelScope = readDefaultModelScope(prefsData);
 
@@ -373,6 +423,7 @@ export function ModelsPanel() {
         {/* Default + Background model selectors. Routing lives in its own group
             below in Advanced, so the component's own drawer stays closed. */}
         <SettingsCardBody id={SETTINGS.defaultModels.anchor}>
+          {/* DALTON-HOOK(antigravity-series): pass seriesCatalog, missingLabel & pure-series backgroundMissingLabel to ModelTierConfig */}
           <ModelTierConfig
             models={visibleModels}
             backgroundModels={slotModels}
@@ -383,6 +434,11 @@ export function ModelsPanel() {
             onBackgroundModelChange={setDefault('background')}
             payers={payers}
             auto={autoModels}
+            seriesCatalog={seriesCatalog}
+            rawMetadata={rawMetadata}
+            customModels={customModels}
+            missingLabel={label}
+            backgroundMissingLabel={backgroundLabel}
           />
           <ClaudeCodeDefaultHeld className="mt-3" />
           {defaultQuestion && <DefaultModelScopeChoice className="mt-4" {...defaultQuestion} />}
@@ -406,6 +462,7 @@ export function ModelsPanel() {
         <SettingsCardBody id={SETTINGS.quickAccess.anchor}>
           <div ref={modelPickerRef}>
             <div className="flex flex-wrap items-center gap-1.5">
+              {/* DALTON-HOOK(antigravity-series): format favorite chips as Series · Effort */}
               {favorites.models.map((key) => (
                 <span
                   key={key}
@@ -416,7 +473,7 @@ export function ModelsPanel() {
                     color: 'var(--color-text-secondary)',
                   }}
                 >
-                  {modelLabel(key, modelMetadata)}
+                  {label(key)}
                   {refusedModel(key)
                     ? <NameTag>{t('modelAccess.status.notAllowed')}</NameTag>
                     : <PayerBadge payer={payers[key]} />}
@@ -428,7 +485,7 @@ export function ModelsPanel() {
                     // the box ends at the chip's edge, off the next chip and Add.
                     className="tap-target ml-0.5 hover:opacity-70 [--tap-target-h:32px] [--tap-target-x:-9.5px]"
                     style={{ color: 'var(--color-text-tertiary)' }}
-                    aria-label={t('settings.removeModel', { model: modelLabel(key, modelMetadata) })}
+                    aria-label={t('settings.removeModel', { model: label(key) })}
                   >
                     &times;
                   </button>
@@ -472,38 +529,78 @@ export function ModelsPanel() {
                   </div>
                 </div>
                 <div className="px-1 pb-1 max-h-[280px] overflow-y-auto">
-                  {Object.entries(visibleModels).map(([provider, providerData]) => {
-                    const models: string[] = providerData?.models || [];
-                    const query = modelPickerSearch.toLowerCase();
-                    const filtered = models.filter(m => modelMatches(m, query, modelMetadata));
-                    if (filtered.length === 0) return null;
-                    const displayName = providerData?.display_name || provider.charAt(0).toUpperCase() + provider.slice(1);
-                    return (
-                      <div key={provider} className="mb-1">
-                        <div className="px-2 py-1 text-[0.625rem] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-tertiary)' }}>
-                          {displayName}
-                        </div>
-                        {filtered.map((m) => {
+                  {/* DALTON-HOOK(antigravity-series): collapse Antigravity series in Quick Access add dropdown */}
+                  {(() => {
+                    const selectableById = indexSelectableSeries(
+                      buildSelectableAntigravitySeries(seriesCatalog, visibleModels, { rawMetadata, customModels }),
+                    );
+                    const seriesOpts = { seriesCatalog, rawMetadata, customModels };
+                    return Object.entries(visibleModels).map(([provider, providerData]) => {
+                      const models: string[] = providerData?.models || [];
+                      const query = modelPickerSearch.toLowerCase();
+                      const seenSeries = new Set<string>();
+                      const rows: Array<{ key: string; text: string; starred: boolean; onToggle: () => void; payerKey: string }> = [];
+                      for (const m of models) {
+                        const hit = inspectSavedAntigravityModel(m, seriesOpts);
+                        if (!hit) {
+                          if (!modelMatches(m, query, modelMetadata)) continue;
                           const isStarred = favorites.models.includes(m);
-                          return (
+                          rows.push({
+                            key: m,
+                            text: modelLabel(m, modelMetadata),
+                            starred: isStarred,
+                            onToggle: () => (isStarred ? favorites.remove(m) : favorites.add(m)),
+                            payerKey: m,
+                          });
+                          continue;
+                        }
+                        const sid = hit.series.series_id;
+                        if (seenSeries.has(sid)) continue;
+                        seenSeries.add(sid);
+                        const sel = selectableById[sid];
+                        const pickKey = sel?.defaultVariantKey ?? m;
+                        const matchesSeries = !query
+                          || hit.displayName.toLowerCase().includes(query)
+                          || hit.series.series_prefix.toLowerCase().includes(query)
+                          || Object.values(hit.series.variants).some((v) => modelMatches(v, query, modelMetadata));
+                        if (!matchesSeries) continue;
+                        const favVariants = Object.values(hit.series.variants).filter((v) => favorites.models.includes(v));
+                        const isStarred = favVariants.length > 0;
+                        rows.push({
+                          key: sid,
+                          text: hit.displayName,
+                          starred: isStarred,
+                          onToggle: () => (isStarred ? favorites.removeMany(favVariants) : favorites.add(pickKey)),
+                          payerKey: pickKey,
+                        });
+                      }
+                      if (rows.length === 0) return null;
+                      const displayName = providerData?.display_name || provider.charAt(0).toUpperCase() + provider.slice(1);
+                      return (
+                        <div key={provider} className="mb-1">
+                          <div className="px-2 py-1 text-[0.625rem] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-tertiary)' }}>
+                            {displayName}
+                          </div>
+                          {/* DALTON-HOOK(antigravity-series): render collapsed Quick Access rows with aggregated series */}
+                          {rows.map((r) => (
                             <button
-                              key={m}
+                              key={r.key}
                               type="button"
-                              onClick={() => (isStarred ? favorites.remove(m) : favorites.add(m))}
-                              className={`w-full flex items-center justify-between px-2 py-1.5 rounded-md text-xs transition-colors ${isStarred ? 'bg-(--color-bg-tag)' : 'hover:bg-(--color-bg-elevated)'}`}
+                              onClick={r.onToggle}
+                              className={`w-full flex items-center justify-between px-2 py-1.5 rounded-md text-xs transition-colors ${r.starred ? 'bg-(--color-bg-tag)' : 'hover:bg-(--color-bg-elevated)'}`}
                               style={{ color: 'var(--color-text-primary)' }}
                             >
                               <span className="flex min-w-0 items-center gap-2">
-                                <span className="truncate">{modelLabel(m, modelMetadata)}</span>
-                                <PayerBadge payer={payers[m]} />
+                                <span className="truncate">{r.text}</span>
+                                <PayerBadge payer={payers[r.payerKey]} />
                               </span>
-                              {isStarred && <Pin className="h-3 w-3 shrink-0" style={{ color: 'var(--color-accent-primary)' }} />}
+                              {r.starred && <Pin className="h-3 w-3 shrink-0" style={{ color: 'var(--color-accent-primary)' }} />}
                             </button>
-                          );
-                        })}
-                      </div>
-                    );
-                  })}
+                          ))}
+                        </div>
+                      );
+                    });
+                  })()}
                 </div>
               </div>
             )}
@@ -524,6 +621,7 @@ export function ModelsPanel() {
       {isAdvanced && (
         <>
           <SettingsGroup title={t(SETTINGS.routing.labelKey)}>
+            {/* DALTON-HOOK(antigravity-series): pass seriesCatalog, missingLabel & series pickers to Routing controls */}
             <SettingsCardBody id={SETTINGS.routing.anchor} className="flex flex-col gap-4">
               <ModelSelector
                 label={t('settings.modelTuning.fetchModel')}
@@ -534,6 +632,11 @@ export function ModelsPanel() {
                 placeholder={modelSlotCopy.defaultsToBackground}
                 payers={payers}
                 metadata={modelMetadata}
+                // DALTON-HOOK(antigravity-series): pass series props to compaction and fallback pickers
+                missingLabel={label}
+                seriesCatalog={seriesCatalog}
+                rawMetadata={rawMetadata}
+                customModels={customModels}
               />
               <ModelSelector
                 label={t('settings.modelTuning.compactionModel')}
@@ -550,6 +653,11 @@ export function ModelsPanel() {
                 placeholder={modelSlotCopy.defaultsToConversation}
                 payers={payers}
                 metadata={modelMetadata}
+                // DALTON-HOOK(antigravity-series): pass series props to compaction and fallback pickers
+                missingLabel={label}
+                seriesCatalog={seriesCatalog}
+                rawMetadata={rawMetadata}
+                customModels={customModels}
               />
               {/* A subagent's model is the subagent's own setting, kept with
                   the rest of it rather than as a routing slot here. */}
@@ -572,6 +680,10 @@ export function ModelsPanel() {
                 models={slotModels}
                 metadata={modelMetadata}
                 payers={payers}
+                // DALTON-HOOK(antigravity-series): pass series props into FallbackModelsPicker
+                seriesCatalog={seriesCatalog}
+                rawMetadata={rawMetadata}
+                customModels={customModels}
                 skipped={{
                   models: deploymentOnlyFallbacks,
                   reason: t(isPlatformMode ? 'settings.payerOrder.skipped' : 'settings.payerOrder.skippedSelfHosted'),
@@ -652,11 +764,15 @@ export function ModelsPanel() {
                   <div className="text-xs font-medium" style={{ color: 'var(--color-text-primary)' }}>
                     {t(SETTINGS.perModel.labelKey)}
                   </div>
+                  {/* DALTON-HOOK(antigravity-series): pass seriesCatalog to PerModelMatrix and Dalton routing pickers */}
                   <PerModelMatrix
                     metadata={modelMetadata}
                     validModelNames={validModelNames}
                     compactionProfiles={compactionProfiles}
                     pinnedGuidance={hookSystemDefaults?.prompt_guidance ?? null}
+                    seriesCatalog={seriesCatalog}
+                    rawMetadata={rawMetadata}
+                    customModels={customModels}
                   />
                 </div>
                 <div id={SETTINGS.daltonAuditModel.anchor}>
@@ -669,6 +785,10 @@ export function ModelsPanel() {
                     placeholder={daltonDefaultHint(hookSystemDefaults?.dalton_audit_model)}
                     payers={payers}
                     metadata={modelMetadata}
+                    missingLabel={label}
+                    seriesCatalog={seriesCatalog}
+                    rawMetadata={rawMetadata}
+                    customModels={customModels}
                   />
                 </div>
                 <div id={SETTINGS.daltonLanguageModel.anchor}>
@@ -681,6 +801,10 @@ export function ModelsPanel() {
                     placeholder={daltonDefaultHint(hookSystemDefaults?.dalton_language_model)}
                     payers={payers}
                     metadata={modelMetadata}
+                    missingLabel={label}
+                    seriesCatalog={seriesCatalog}
+                    rawMetadata={rawMetadata}
+                    customModels={customModels}
                   />
                 </div>
                 <div id={SETTINGS.daltonAuditFallbackModels.anchor}>
@@ -692,6 +816,9 @@ export function ModelsPanel() {
                     models={daltonSystemModels}
                     metadata={modelMetadata}
                     payers={payers}
+                    seriesCatalog={seriesCatalog}
+                    rawMetadata={rawMetadata}
+                    customModels={customModels}
                   />
                 </div>
                 <div id={SETTINGS.daltonAuditTimeout.anchor} className="flex flex-col gap-1.5">
@@ -734,6 +861,7 @@ export function ModelsPanel() {
                     </p>
                   )}
                 </div>
+                {/* DALTON-HOOK(antigravity-series): pass seriesCatalog & missingLabel to Dalton assist/reviewer/extract selectors */}
                 <div id={SETTINGS.daltonAssistModel.anchor}>
                   <ModelSelector
                     label={t('settings.modelTuning.daltonAssistModel')}
@@ -744,6 +872,10 @@ export function ModelsPanel() {
                     placeholder={daltonDefaultHint(hookSystemDefaults?.dalton_assist_model)}
                     payers={payers}
                     metadata={modelMetadata}
+                    missingLabel={label}
+                    seriesCatalog={seriesCatalog}
+                    rawMetadata={rawMetadata}
+                    customModels={customModels}
                   />
                 </div>
                 {/* DALTON-HOOK(settings-reorg): keep remaining background-task model pickers hooked */}
@@ -756,6 +888,9 @@ export function ModelsPanel() {
                     models={daltonSystemModels}
                     metadata={modelMetadata}
                     payers={payers}
+                    seriesCatalog={seriesCatalog}
+                    rawMetadata={rawMetadata}
+                    customModels={customModels}
                   />
                 </div>
                 <div id={SETTINGS.daltonReviewerModels.anchor}>
@@ -767,6 +902,9 @@ export function ModelsPanel() {
                     models={daltonSystemModels}
                     metadata={modelMetadata}
                     payers={payers}
+                    seriesCatalog={seriesCatalog}
+                    rawMetadata={rawMetadata}
+                    customModels={customModels}
                   />
                 </div>
                 {/* DALTON-HOOK(settings-reorg): extract model selector */}
@@ -780,6 +918,10 @@ export function ModelsPanel() {
                     placeholder={daltonDefaultHint(hookSystemDefaults?.dalton_extract_model)}
                     payers={payers}
                     metadata={modelMetadata}
+                    missingLabel={label}
+                    seriesCatalog={seriesCatalog}
+                    rawMetadata={rawMetadata}
+                    customModels={customModels}
                   />
                 </div>
               </SettingsCardBody>

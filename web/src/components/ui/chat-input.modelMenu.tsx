@@ -20,6 +20,9 @@ import { EFFORT_LABELS, hasTuningMenu, tuningMenuLevels } from '@/lib/modelTunin
 import type { ModelMetadataEntry, TaskCost } from '@/hooks/useFilteredModels';
 import type { ModelGroup } from '@/lib/modelGroups';
 import type { Payer } from '@/lib/modelPayer';
+// DALTON-HOOK(antigravity-series): accept series catalog & exactEffort mode for Antigravity series pills
+import type { CustomModelEntry } from '@/components/model/types';
+import type { AntigravitySeriesCatalog, SelectableAntigravitySeries } from '@/lib/antigravitySeries';
 import { MarkedModelName } from '@/components/model/ModelMark';
 import { llmProviderArt } from '@/lib/brandArt';
 import { NameTag } from '@/components/model/PayerBadge';
@@ -42,8 +45,10 @@ const PILL_FLEX = { model: 'min-w-0', effort: 'flex-none' } as const;
  *  the model has one. */
 const NAME_FLOOR = 'max-w-8';
 
-function ModelTriggerBody({ selectedModel, metadata, floor = false, nameHidden = false }: {
+// DALTON-HOOK(antigravity-series): accept explicit series displayName on ModelTriggerBody
+function ModelTriggerBody({ selectedModel, displayName, metadata, floor = false, nameHidden = false }: {
   selectedModel: string | null;
+  displayName?: string;
   metadata?: ModelMetadata;
   floor?: boolean;
   /** Logo only. The name stays for a screen reader, which reads it as the
@@ -58,7 +63,7 @@ function ModelTriggerBody({ selectedModel, metadata, floor = false, nameHidden =
     <>
       <MarkedModelName
         provider={provider}
-        name={getModelDisplayName(selectedModel, metadata) || t('chat.modelSelector.fallbackName')}
+        name={displayName || getModelDisplayName(selectedModel, metadata) || t('chat.modelSelector.fallbackName')}
         nameClassName={logoOnly ? 'sr-only' : cn('min-w-0 truncate', floor || nameHidden ? NAME_FLOOR : 'max-w-[120px]')}
         short
       />
@@ -90,8 +95,9 @@ function EffortTriggerBody({ effortLabel, fast, accent }: {
  *  rocket a Codex model can show, so a pick never moves the fold under the
  *  menu it was made in. It holds the level shown now too, which a Codex
  *  model with no levels to pick can still name. */
+// DALTON-HOOK(antigravity-series): carry displayName into ModelTriggerMeasure
 export function ModelTriggerMeasure(props:
-  | { pill: 'model'; selectedModel: string | null; metadata?: ModelMetadata; floor?: boolean }
+  | { pill: 'model'; selectedModel: string | null; displayName?: string; metadata?: ModelMetadata; floor?: boolean }
   | { pill: 'effort'; effortLabel: string | null; reasoningEfforts: readonly string[]; isCodexModel: boolean }) {
   const { t } = useTranslation();
   const labels = props.pill === 'effort'
@@ -103,7 +109,7 @@ export function ModelTriggerMeasure(props:
   return (
     <button type="button" tabIndex={-1} className={TRIGGER_CLASS}>
       {props.pill === 'model'
-        ? <ModelTriggerBody selectedModel={props.selectedModel} metadata={props.metadata} floor={props.floor} />
+        ? <ModelTriggerBody selectedModel={props.selectedModel} displayName={props.displayName} metadata={props.metadata} floor={props.floor} />
         : (
           <EffortTriggerBody
             // Stacked in one cell, the labels take the widest one's room.
@@ -158,10 +164,13 @@ function Pill({ pill, buttonRef, open, popup, onPress, title, disabled, children
  * up rather than leaving a composer with no hint of why it cannot send.
  */
 export function ChatInputModelMenu({
-  selectedModel, metadata, payers, groups, favorites, recent, onToggleFavorite, onSelectModel,
+  selectedModel, displayName, metadata, payers, groups, favorites, recent, onToggleFavorite, onToggleFavoriteMany,
+  onSelectModel, seriesCatalog, selectableSeries, rawMetadata, customModels,
   rowStatus, planMeter, dropdownDirection, container, draftRef, disabled = false, nameHidden = false,
 }: {
   selectedModel: string | null;
+  // DALTON-HOOK(antigravity-series): series display name & series catalog props for collapsed picker rows
+  displayName?: string;
   /** Supplies authored display names; a model without one gets a derived name. */
   metadata?: ModelMetadata;
   /** Who pays for a turn on each model, tagged beside its name. */
@@ -171,7 +180,12 @@ export function ChatInputModelMenu({
   /** This thread's models and the current one that are not favorites. */
   recent: string[];
   onToggleFavorite: (model: string, favorite: boolean) => void;
+  onToggleFavoriteMany?: (models: readonly string[], favorite: boolean) => void;
   onSelectModel: (model: string) => void;
+  seriesCatalog?: AntigravitySeriesCatalog;
+  selectableSeries?: readonly SelectableAntigravitySeries[];
+  rawMetadata?: ModelMetadata;
+  customModels?: readonly CustomModelEntry[];
   /** What each row says beside its model, and whether it is a pick. */
   rowStatus: (model: string, now: number) => ModelRowStatus;
   /** The Claude plan Claude Code's models run on here, for the picker's meter. */
@@ -217,7 +231,8 @@ export function ChatInputModelMenu({
         title={t('chat.modelSelector.select')}
         disabled={disabled}
       >
-        <ModelTriggerBody selectedModel={selectedModel} metadata={metadata} nameHidden={nameHidden} />
+        {/* DALTON-HOOK(antigravity-series): pass resolved displayName & series props into ModelPicker */}
+        <ModelTriggerBody selectedModel={selectedModel} displayName={displayName} metadata={metadata} nameHidden={nameHidden} />
       </Pill>
       <ModelPicker
         triggerRef={triggerRef}
@@ -233,6 +248,11 @@ export function ChatInputModelMenu({
         favorites={favorites}
         recent={recent}
         onToggleFavorite={onToggleFavorite}
+        onToggleFavoriteMany={onToggleFavoriteMany}
+        seriesCatalog={seriesCatalog}
+        selectableSeries={selectableSeries}
+        rawMetadata={rawMetadata}
+        customModels={customModels}
         onPick={onSelectModel}
         rowStatus={rowStatus}
         planMeter={planMeter}
@@ -270,6 +290,8 @@ export interface EffortMenuProps {
    *  at the default level. */
   taskCost?: Record<string, TaskCost>;
   disabled?: boolean;
+  // DALTON-HOOK(antigravity-series): pass the selected effort level verbatim instead of null for defaultEffort
+  exactEffort?: boolean;
 }
 
 /**
@@ -327,8 +349,9 @@ function EffortMenu(props: EffortMenuProps) {
  * submenu: each level with its "Default" tag and task cost, and, on a Codex
  * model, the two speeds.
  */
+// DALTON-HOOK(antigravity-series): exactEffort keeps series default selectable when switching Antigravity variants
 function effortRows(
-  { reasoningEfforts, defaultEffort, onReasoningEffortChange, isCodexModel, taskCost }: EffortMenuProps,
+  { reasoningEfforts, defaultEffort, onReasoningEffortChange, isCodexModel, taskCost, exactEffort = false }: EffortMenuProps,
   t: TFunction,
 ) {
   const levels = tuningMenuLevels(reasoningEfforts);
@@ -350,8 +373,9 @@ function effortRows(
       ]
       : [],
     // Picking the level Settings gives clears the thread's own instead of
-    // pinning today's default as a permanent choice.
-    pick: (level: string) => onReasoningEffortChange(level === defaultEffort ? null : level),
+    // pinning today's default as a permanent choice (unless exactEffort is set
+    // for Antigravity series variant switching).
+    pick: (level: string) => onReasoningEffortChange(exactEffort || level !== defaultEffort ? level : null),
   };
 }
 

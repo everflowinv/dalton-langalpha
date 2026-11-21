@@ -54,15 +54,19 @@ export function namePhrase(t: TFunction, names: string[]): { text: string; conte
 /** A draft as the question and the toast print it: the new models and the
  *  ones they replace, each named once, primary first. A draft that changes no
  *  default names what it writes. */
-function describe(draft: Draft, label: (model: string) => string): { models: string[]; previous: string[] } {
+// DALTON-HOOK(antigravity-series): pass slot to label formatter so background slot can omit Antigravity effort suffix
+function describe(
+  draft: Draft,
+  label: (model: string, slot?: ModelSlot) => string,
+): { models: string[]; previous: string[] } {
   const changing = SLOTS.filter((slot) => slot in draft.previous);
   const models = new Set<string>();
   const previous = new Set<string>();
   for (const slot of changing.length > 0 ? changing : SLOTS) {
     const model = draft.models[slot];
-    if (model) models.add(label(model));
+    if (model) models.add(label(model, slot));
     const replaced = draft.previous[slot];
-    if (replaced) previous.add(label(replaced));
+    if (replaced) previous.add(label(replaced, slot));
   }
   return { models: [...models], previous: [...previous] };
 }
@@ -83,7 +87,8 @@ function describe(draft: Draft, label: (model: string) => string): { models: str
  * `label` prints a model the way the calling surface does, so the toast names
  * it as the control beside it does.
  */
-export function useDefaultModelChange(label: (model: string) => string) {
+// DALTON-HOOK(antigravity-series): allow slot-aware model label formatter for background slot display
+export function useDefaultModelChange(label: (model: string, slot?: ModelSlot) => string) {
   const { t } = useTranslation();
   const { preferences } = usePreferences();
   const defaults = useSlotDefaultModels();

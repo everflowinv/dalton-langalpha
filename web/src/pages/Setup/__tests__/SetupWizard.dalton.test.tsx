@@ -4,6 +4,9 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
+import type { AntigravitySeriesEntry } from '@/api/model';
+import type { ProviderModelsData } from '@/components/model/types';
+import { buildSelectableAntigravitySeries, buildSeriesCatalog } from '@/lib/antigravitySeries';
 
 const h = vi.hoisted(() => ({
   isDaltonBuild: true,
@@ -137,8 +140,8 @@ vi.mock('@/hooks/useOnboardingProgress', () => ({
 }));
 
 vi.mock('@/hooks/useAllModels', () => ({
-  useAllModels: () => ({
-    models: h.teamHasAvailableModels
+  useAllModels: () => {
+    const models: Record<string, ProviderModelsData> = h.teamHasAvailableModels
       ? {
           'antigravity-oauth': {
             display_name: 'Antigravity',
@@ -162,8 +165,8 @@ vi.mock('@/hooks/useAllModels', () => ({
             models: ['gpt-6.2-sol-oauth', 'gpt-6.2-astra-oauth'],
           },
         }
-      : {},
-    slotModels: h.teamHasAvailableModels
+      : {};
+    const slotModels = h.teamHasAvailableModels
       ? {
           'antigravity-oauth': {
             display_name: 'Antigravity',
@@ -186,39 +189,112 @@ vi.mock('@/hooks/useAllModels', () => ({
             models: ['gpt-6.2-sol-oauth', 'gpt-6.2-astra-oauth'],
           },
         }
-      : {},
-    payers: {
-      'gemini-4-neon-high-oauth': 'subscription:antigravity-oauth',
-      'gemini-4-carbon-medium-oauth': 'subscription:antigravity-oauth',
-      'gemini-4-hydrogen-low-oauth': 'subscription:antigravity-oauth',
-      'gemini-4-hydrogen-high-oauth': 'subscription:antigravity-oauth',
-      'gemini-4-argon-high-oauth': 'subscription:antigravity-oauth',
-      'claude-opus-5-5-oauth': 'subscription:claude-oauth',
-      'claude-opus-5-5-medium-oauth': 'subscription:antigravity-oauth',
-      'gpt-6.2-astra-oauth': 'subscription:codex-oauth',
-      'gpt-6.2-sol-oauth': 'subscription:codex-oauth',
-      'credits-only-model': 'credits',
-      'claude-code-sonnet': 'subscription:claude-code',
-    },
-    metadata: {
-      'gemini-4-neon-high-oauth': { intelligence: 5, speed: 4 },
-      'gemini-4-carbon-medium-oauth': { intelligence: 5, speed: 3 },
-      'gemini-4-hydrogen-low-oauth': { intelligence: 4, speed: 5 },
-      'gemini-4-hydrogen-high-oauth': { intelligence: 4, speed: 5 },
-      'gemini-4-argon-high-oauth': { intelligence: 5, speed: 2 },
-      'claude-opus-5-5-oauth': { display_name: 'Claude Opus 5.5', intelligence: 5, speed: 3 },
-      'claude-opus-5-5-medium-oauth': { intelligence: 5, speed: 3 },
-      'gpt-6.2-astra-oauth': { display_name: 'GPT-6.2 Astra', intelligence: 5, speed: 3 },
-      'gpt-6.2-sol-oauth': { display_name: 'GPT-6.2 Sol', intelligence: 5, speed: 3 },
-      'credits-only-model': { display_name: 'Credits Only Model', intelligence: 5, speed: 5 },
+      : {};
+    const metadata = {
+      'gemini-4-neon-high-oauth': { provider: 'antigravity-oauth', intelligence: 5, speed: 4 },
+      'gemini-4-carbon-medium-oauth': { provider: 'antigravity-oauth', intelligence: 5, speed: 3 },
+      'gemini-4-hydrogen-low-oauth': { provider: 'antigravity-oauth', intelligence: 4, speed: 5 },
+      'gemini-4-hydrogen-high-oauth': { provider: 'antigravity-oauth', intelligence: 4, speed: 5 },
+      'gemini-4-argon-high-oauth': { provider: 'antigravity-oauth', intelligence: 5, speed: 2 },
+      'claude-opus-5-5-oauth': { display_name: 'Claude Opus 5.5', provider: 'claude-oauth', intelligence: 5, speed: 3 },
+      'claude-opus-5-5-medium-oauth': { provider: 'antigravity-oauth', intelligence: 5, speed: 3 },
+      'gpt-6.2-astra-oauth': { display_name: 'GPT-6.2 Astra', provider: 'codex-oauth', intelligence: 5, speed: 3 },
+      'gpt-6.2-sol-oauth': { display_name: 'GPT-6.2 Sol', provider: 'codex-oauth', intelligence: 5, speed: 3 },
+      'credits-only-model': { display_name: 'Credits Only Model', provider: 'platform', intelligence: 5, speed: 5 },
       'claude-code-sonnet': { display_name: 'Claude Code Sonnet', sdk: 'claude-code', provider: 'claude-code', intelligence: 5, speed: 4 },
-    },
-    customModels: [],
-    systemDefaults: { default_model: 'gemini-4-hydrogen-low-oauth', background_model: 'credits-only-model' },
-    cannotRun: () => false,
-    isLoading: false,
-    unread: false,
-  }),
+    };
+    const seriesList: AntigravitySeriesEntry[] = [
+      {
+        series_id: 'antigravity-oauth:gemini-4-neon',
+        series_prefix: 'gemini-4-neon',
+        display_name: 'Gemini 4 Neon',
+        qualified_display_name: 'Gemini 4 Neon (Antigravity)',
+        provider: 'antigravity-oauth',
+        default_effort: 'high',
+        default_model: 'gemini-4-neon-high-oauth',
+        efforts: ['high'],
+        variants: { high: 'gemini-4-neon-high-oauth' },
+      },
+      {
+        series_id: 'antigravity-oauth:gemini-4-carbon',
+        series_prefix: 'gemini-4-carbon',
+        display_name: 'Gemini 4 Carbon',
+        qualified_display_name: 'Gemini 4 Carbon (Antigravity)',
+        provider: 'antigravity-oauth',
+        default_effort: 'medium',
+        default_model: 'gemini-4-carbon-medium-oauth',
+        efforts: ['medium'],
+        variants: { medium: 'gemini-4-carbon-medium-oauth' },
+      },
+      {
+        series_id: 'antigravity-oauth:gemini-4-hydrogen',
+        series_prefix: 'gemini-4-hydrogen',
+        display_name: 'Gemini 4 Hydrogen',
+        qualified_display_name: 'Gemini 4 Hydrogen (Antigravity)',
+        provider: 'antigravity-oauth',
+        default_effort: 'high',
+        default_model: 'gemini-4-hydrogen-high-oauth',
+        efforts: ['low', 'high'],
+        variants: {
+          low: 'gemini-4-hydrogen-low-oauth',
+          high: 'gemini-4-hydrogen-high-oauth',
+        },
+      },
+      {
+        series_id: 'antigravity-oauth:gemini-4-argon',
+        series_prefix: 'gemini-4-argon',
+        display_name: 'Gemini 4 Argon',
+        qualified_display_name: 'Gemini 4 Argon (Antigravity)',
+        provider: 'antigravity-oauth',
+        default_effort: 'high',
+        default_model: 'gemini-4-argon-high-oauth',
+        efforts: ['high'],
+        variants: { high: 'gemini-4-argon-high-oauth' },
+      },
+      {
+        series_id: 'antigravity-oauth:claude-opus-5-5',
+        series_prefix: 'claude-opus-5-5',
+        display_name: 'Claude Opus 5.5',
+        qualified_display_name: 'Claude Opus 5.5 (Antigravity)',
+        provider: 'antigravity-oauth',
+        default_effort: 'medium',
+        default_model: 'claude-opus-5-5-medium-oauth',
+        efforts: ['medium'],
+        variants: { medium: 'claude-opus-5-5-medium-oauth' },
+      },
+    ];
+    const seriesCatalog = buildSeriesCatalog(seriesList);
+    const selectableSeries = buildSelectableAntigravitySeries(seriesCatalog, models, {
+      rawMetadata: metadata,
+      customModels: [],
+    });
+    return {
+      models,
+      slotModels,
+      payers: {
+        'gemini-4-neon-high-oauth': 'subscription:antigravity-oauth',
+        'gemini-4-carbon-medium-oauth': 'subscription:antigravity-oauth',
+        'gemini-4-hydrogen-low-oauth': 'subscription:antigravity-oauth',
+        'gemini-4-hydrogen-high-oauth': 'subscription:antigravity-oauth',
+        'gemini-4-argon-high-oauth': 'subscription:antigravity-oauth',
+        'claude-opus-5-5-oauth': 'subscription:claude-oauth',
+        'claude-opus-5-5-medium-oauth': 'subscription:antigravity-oauth',
+        'gpt-6.2-astra-oauth': 'subscription:codex-oauth',
+        'gpt-6.2-sol-oauth': 'subscription:codex-oauth',
+        'credits-only-model': 'credits',
+        'claude-code-sonnet': 'subscription:claude-code',
+      },
+      metadata,
+      customModels: [],
+      seriesCatalog,
+      selectableSeries,
+      rawApiResponse: { model_metadata: metadata, antigravity_series: seriesList },
+      systemDefaults: { default_model: 'gemini-4-hydrogen-low-oauth', background_model: 'credits-only-model' },
+      cannotRun: () => false,
+      isLoading: false,
+      unread: false,
+    };
+  },
 }));
 
 vi.mock('@/hooks/useProviderCatalog', () => ({

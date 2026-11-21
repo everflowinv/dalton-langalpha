@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import type { ThreadTuning } from '@/components/ui/chat-input.types';
+// DALTON-HOOK(antigravity-series): detect shared workspaces to avoid 403 PATCH on tuning changes
+import { useSharedEntry } from '@/hooks/useSharedWorkspaces';
 import type { Thread } from '@/types/api';
 import { threadDetailQuery } from '../utils/threadQueries';
 import { useThreadFieldSave } from './useThreadFieldSave';
@@ -29,6 +31,8 @@ interface UseThreadTuningOptions {
    * takes it up, so a new `key` replaces whatever the view held.
    */
   landing?: { key: string; reasoningEffort: string | null; fastMode: boolean | null } | null;
+  // DALTON-HOOK(antigravity-series): workspace id to detect shared workspaces before issuing PATCH
+  workspaceId?: string | null;
 }
 
 /**
@@ -48,9 +52,12 @@ interface UseThreadTuningOptions {
  * because the create failed and the legacy send minted the thread, is saved
  * on the row once it is read.
  */
-export function useThreadTuning({ threadId, landing = null }: UseThreadTuningOptions) {
+export function useThreadTuning({ threadId, landing = null, workspaceId = null }: UseThreadTuningOptions) {
   const { t } = useTranslation();
   const liveThreadId = threadId && threadId !== '__default__' ? threadId : null;
+  // DALTON-HOOK(antigravity-series): skip PATCH when workspace is shared or still loading
+  const sharedEntry = useSharedEntry(workspaceId);
+  const skipSave = Boolean(workspaceId) && sharedEntry !== null;
 
   const { data: thread } = useQuery({
     ...threadDetailQuery(liveThreadId ?? ''),
@@ -63,6 +70,7 @@ export function useThreadTuning({ threadId, landing = null }: UseThreadTuningOpt
     field: 'reasoning_effort',
     landing: landing && { key: landing.key, value: landing.reasoningEffort },
     failedMessage: t('chat.pills.effortFailed'),
+    skipSave,
   });
   const fast = useThreadOverride({
     liveThreadId,
@@ -70,6 +78,7 @@ export function useThreadTuning({ threadId, landing = null }: UseThreadTuningOpt
     field: 'fast_mode',
     landing: landing && { key: landing.key, value: landing.fastMode },
     failedMessage: t('chat.pills.fastModeFailed'),
+    skipSave,
   });
 
   const tuning = useMemo<ThreadTuning>(
@@ -81,7 +90,14 @@ export function useThreadTuning({ threadId, landing = null }: UseThreadTuningOpt
     ...(fast.toSend !== undefined ? { fastModeOverride: fast.toSend } : {}),
   }), [effort.toSend, fast.toSend]);
 
-  return { tuning, toSend, setReasoningEffort: effort.set, setFastMode: fast.set };
+  // DALTON-HOOK(antigravity-series): expose clearLocalEffort & skipSave for shared/Antigravity atomic clear
+  return {
+    tuning,
+    toSend,
+    setReasoningEffort: effort.set,
+    setFastMode: fast.set,
+    clearLocalEffort: effort.clearLocal,
+  };
 }
 
 function useThreadOverride<F extends TuningField>({
@@ -90,12 +106,15 @@ function useThreadOverride<F extends TuningField>({
   field,
   landing,
   failedMessage,
+  skipSave = false,
 }: {
   liveThreadId: string | null;
   thread: Thread | undefined;
   field: F;
   landing: { key: string; value: Override<F> } | null;
   failedMessage: string;
+  // DALTON-HOOK(antigravity-series): allow shared workspace turns to skip PATCH in useThreadOverride
+  skipSave?: boolean;
 }) {
   // Undefined while there is no row: none yet, or one not read (loading, failed).
   const rowValue: Override<F> | undefined = liveThreadId && thread
@@ -141,19 +160,24 @@ function useThreadOverride<F extends TuningField>({
   useEffect(() => {
     if (shownBeforeRef.current === null && liveThreadId) createdRef.current = liveThreadId;
     shownBeforeRef.current = liveThreadId;
-    if (!liveThreadId || createdRef.current !== liveThreadId || rowValue === undefined) return;
+    if (!liveThreadId || skipSave || createdRef.current !== liveThreadId || rowValue === undefined) return;
     createdRef.current = null;
     if (held === null) return;
     void save({ threadId: liveThreadId, value: held.value, before: null });
-  }, [held, liveThreadId, rowValue, save]);
+  }, [held, liveThreadId, rowValue, save, skipSave]);
 
   /** Resolves false only when this pick's own save failed. */
   const set = useCallback((next: Override<F>): Promise<boolean> => {
     setHeld({ value: next });
-    if (!liveThreadId) return Promise.resolve(true);
+    if (!liveThreadId || skipSave) return Promise.resolve(true);
     // `before` goes unused: a failure drops the hold rather than restoring one.
     return save({ threadId: liveThreadId, value: next, before: null });
-  }, [liveThreadId, save]);
+  }, [liveThreadId, save, skipSave]);
+
+  // DALTON-HOOK(antigravity-series): clear local reasoning_effort state without triggering a second PATCH
+  const clearLocal = useCallback(() => {
+    setHeld({ value: null as Override<F> });
+  }, []);
 
   const value: Override<F> | undefined = held ? held.value : liveThreadId ? rowValue : null as Override<F>;
   // A new thread's create names a pick, and otherwise nothing, so the thread
@@ -162,5 +186,5 @@ function useThreadOverride<F extends TuningField>({
     ? held.value as Exclude<Override<F>, null>
     : undefined;
 
-  return { value, toSend, set };
+  return { value, toSend, set, clearLocal };
 }

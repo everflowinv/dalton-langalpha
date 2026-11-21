@@ -26,6 +26,14 @@ import { useNow } from '@/hooks/useNow';
 import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
 import { ModelMark, MarkedModelName } from '@/components/model/ModelMark';
 import { PayerBadge } from '@/components/model/PayerBadge';
+// DALTON-HOOK(antigravity-series): collapse Antigravity variants into one row across tabs, search, favorites, recent
+import type { CustomModelEntry } from '@/components/model/types';
+import {
+  indexSelectableSeries,
+  inspectSavedAntigravityModel,
+  type AntigravitySeriesCatalog,
+  type SelectableAntigravitySeries,
+} from '@/lib/antigravitySeries';
 
 export const FAVORITES_TAB = '__favorites__';
 
@@ -50,6 +58,12 @@ interface ListProps {
    *  under the favorites so the current model is always on the first tab. */
   recent: string[];
   onToggleFavorite: (model: string, favorite: boolean) => void;
+  // DALTON-HOOK(antigravity-series): optional batch toggle for collapsed series favorites & series catalogs
+  onToggleFavoriteMany?: (models: readonly string[], favorite: boolean) => void;
+  seriesCatalog?: AntigravitySeriesCatalog;
+  selectableSeries?: readonly SelectableAntigravitySeries[];
+  rawMetadata?: Metadata;
+  customModels?: readonly CustomModelEntry[];
   /** What the row says at `now`, the picker's minute clock, so a hold that
    *  ends while the picker is open ends there too. */
   rowStatus: (model: string, now: number) => ModelRowStatus;
@@ -117,12 +131,90 @@ export function ModelPicker({
 }
 
 /** What the list shows: a search across every model, or one tab. */
-type View =
-  | { kind: 'search'; rows: string[] }
-  | { kind: 'favorites'; rows: string[]; recent: string[] }
-  | { kind: 'brand'; group: ModelGroup; connection: ModelConnection; rows: string[] };
+// DALTON-HOOK(antigravity-series): collapsed row descriptor used across brand/search/favorites/recent views
+interface PickerRow {
+  rowKey: string;
+  rawModel: string;
+  displayName: string;
+  provider?: string;
+  selected: boolean;
+  favorite: boolean;
+  favoriteKeys: string[];
+}
 
-function viewOf({ query, tab, connectionTab, groups, favorites, recent, selectedModel, matches }: {
+type View =
+  | { kind: 'search'; rows: PickerRow[] }
+  | { kind: 'favorites'; rows: PickerRow[]; recent: PickerRow[] }
+  | { kind: 'brand'; group: ModelGroup; connection: ModelConnection; rows: PickerRow[] };
+
+function collapseToRows({
+  models,
+  selectedModel,
+  metadata,
+  favoriteSet,
+  seriesCatalog,
+  selectableById,
+  rawMetadata,
+  customModels,
+  seenSeries,
+}: {
+  models: readonly string[];
+  selectedModel: string | null;
+  metadata?: Metadata;
+  favoriteSet: ReadonlySet<string>;
+  seriesCatalog?: AntigravitySeriesCatalog;
+  selectableById: Readonly<Record<string, SelectableAntigravitySeries>>;
+  rawMetadata?: Metadata;
+  customModels?: readonly CustomModelEntry[];
+  seenSeries: Set<string>;
+}): PickerRow[] {
+  const seriesOpts = { seriesCatalog, rawMetadata: rawMetadata ?? metadata, customModels };
+  const selectedSeriesId = inspectSavedAntigravityModel(selectedModel, seriesOpts)?.series.series_id ?? null;
+  const rows: PickerRow[] = [];
+  for (const m of models) {
+    const hit = inspectSavedAntigravityModel(m, seriesOpts);
+    if (!hit) {
+      rows.push({
+        rowKey: m,
+        rawModel: m,
+        displayName: getModelDisplayName(m, metadata),
+        provider: metadata?.[m]?.provider,
+        selected: m === selectedModel,
+        favorite: favoriteSet.has(m),
+        favoriteKeys: [m],
+      });
+      continue;
+    }
+    const sid = hit.series.series_id;
+    if (seenSeries.has(sid)) continue;
+    seenSeries.add(sid);
+    const sel = selectableById[sid];
+    const isSelected = selectedSeriesId === sid;
+    const pickKey = isSelected && selectedModel
+      ? selectedModel
+      : sel
+        ? sel.defaultVariantKey
+        : m;
+    const favVariants = Object.values(hit.series.variants).filter((v) => favoriteSet.has(v));
+    const isFav = favVariants.length > 0;
+    rows.push({
+      rowKey: pickKey,
+      rawModel: pickKey,
+      displayName: hit.displayName,
+      provider: hit.series.provider,
+      selected: isSelected,
+      favorite: isFav,
+      favoriteKeys: isFav ? favVariants : [pickKey],
+    });
+  }
+  return rows;
+}
+
+// DALTON-HOOK(antigravity-series): collapse Antigravity series variants in viewOf tabs & search
+function viewOf({
+  query, tab, connectionTab, groups, favorites, recent, selectedModel, matches,
+  metadata, favoriteSet, seriesCatalog, selectableById, rawMetadata, customModels,
+}: {
   query: string;
   tab: string | null;
   connectionTab: string | null;
@@ -130,30 +222,52 @@ function viewOf({ query, tab, connectionTab, groups, favorites, recent, selected
   favorites: string[];
   recent: string[];
   selectedModel: string | null;
-  matches: (model: string) => boolean;
+  matches: (displayName: string) => boolean;
+  metadata?: Metadata;
+  favoriteSet: ReadonlySet<string>;
+  seriesCatalog?: AntigravitySeriesCatalog;
+  selectableById: Readonly<Record<string, SelectableAntigravitySeries>>;
+  rawMetadata?: Metadata;
+  customModels?: readonly CustomModelEntry[];
 }): View {
+  const toRows = (list: readonly string[], seenSeries = new Set<string>()) => collapseToRows({
+    models: list,
+    selectedModel,
+    metadata,
+    favoriteSet,
+    seriesCatalog,
+    selectableById,
+    rawMetadata,
+    customModels,
+    seenSeries,
+  });
   if (query.trim()) {
     const all = new Set(groups.flatMap((g) => g.connections.flatMap((c) => c.models)));
-    return { kind: 'search', rows: [...all].filter(matches) };
+    return { kind: 'search', rows: toRows([...all]).filter((r) => matches(r.displayName)) };
   }
   // The first tab holds the current model, so it opens there unless it has
   // nothing at all to show. A brand that has since gone falls back to it too.
   const group = tab === null
     ? (favorites.length + recent.length > 0 ? undefined : groups[0])
     : groups.find((g) => g.id === tab);
-  if (!group) return { kind: 'favorites', rows: favorites, recent };
+  if (!group) {
+    const seen = new Set<string>();
+    return { kind: 'favorites', rows: toRows(favorites, seen), recent: toRows(recent, seen) };
+  }
   // Within a brand it opens on the way the current model is paid for, else
   // on the user's own before the deployment's.
   const connection = group.connections.find((c) => c.id === connectionTab)
     ?? group.connections.find((c) => !!selectedModel && c.models.includes(selectedModel))
     ?? group.connections[0];
-  return { kind: 'brand', group, connection, rows: connection.models };
+  return { kind: 'brand', group, connection, rows: toRows(connection.models) };
 }
 
 /** The picker's content, mounted while it is open, so the search, the tab and
  *  the brand's payer start over on each opening. */
+// DALTON-HOOK(antigravity-series): wire selectableSeries & customModels into ModelList
 function ModelList({
-  selectedModel, metadata, payers, groups, favorites, recent, onToggleFavorite, rowStatus, planMeter, onPick, onManage,
+  selectedModel, metadata, payers, groups, favorites, recent, onToggleFavorite, onToggleFavoriteMany,
+  seriesCatalog, selectableSeries, rawMetadata, customModels, rowStatus, planMeter, onPick, onManage,
 }: ListProps & { onPick: (model: string) => void; onManage: () => void }) {
   const { t } = useTranslation();
   const payerLabel = usePayerLabel();
@@ -172,11 +286,19 @@ function ModelList({
   const currentRowRef = useRef<HTMLDivElement | null>(null);
   const { attach: attachRail, style: railFade } = useFadeAtEnd<HTMLDivElement>();
   const { attach: attachList, style: listFade } = useFadeAtEnd<HTMLDivElement>();
+  const favoriteSet = new Set(favorites);
+  const selectableById = indexSelectableSeries(selectableSeries);
 
-  // A search matches what each row shows, its display name.
+  // DALTON-HOOK(antigravity-series): pass series & customModels context into viewOf
   const view = viewOf({
     query, tab, connectionTab, groups, favorites, recent, selectedModel,
-    matches: (m) => contains(getModelDisplayName(m, metadata), query),
+    matches: (displayName) => contains(displayName, query),
+    metadata,
+    favoriteSet,
+    seriesCatalog,
+    selectableById,
+    rawMetadata,
+    customModels,
   });
   const header = view.kind === 'favorites' ? t('chat.modelSelector.favorites')
     : view.kind === 'brand' ? view.group.label
@@ -186,13 +308,12 @@ function ModelList({
   // The tab's own subscription (Claude Code's) is named by its header already.
   const headerNamesPayer = view.kind === 'brand' && headerPayer === subscriptionPayer(view.group.id);
   const inThread = view.kind === 'favorites' ? view.recent : [];
-  const first = [...view.rows, ...inThread].find((m) => !('unavailable' in rowStatus(m, now)));
+  const first = [...view.rows, ...inThread].find((r) => !('unavailable' in rowStatus(r.rawModel, now)))?.rowKey;
   // Claude Code's plan heads the tab of its models, and Favorites while the
   // current model is one of them.
   const isClaudeCode = (m: string | null) => !!m && isClaudeCodeModel(metadata?.[m]);
   const meter = (view.kind === 'brand' && view.connection.models.some(isClaudeCode))
     || (view.kind === 'favorites' && isClaudeCode(selectedModel)) ? planMeter : undefined;
-  const favoriteSet = new Set(favorites);
 
   // The current model's check is what the user looks for on opening, and a
   // long first tab can hold it below the fold.
@@ -212,19 +333,30 @@ function ModelList({
     inputRef.current?.focus();
   };
 
-  const row = (m: string) => (
+  // DALTON-HOOK(antigravity-series): unfavorite all variants in collapsed series row at once
+  const toggleFav = (r: PickerRow) => {
+    const next = !r.favorite;
+    if (!next && r.favoriteKeys.length > 1 && onToggleFavoriteMany) {
+      onToggleFavoriteMany(r.favoriteKeys, false);
+    } else {
+      onToggleFavorite(r.favoriteKeys[0] ?? r.rowKey, next);
+    }
+  };
+
+  const row = (r: PickerRow) => (
     <ModelRow
-      key={m}
-      model={m}
+      key={r.rowKey}
+      model={r.rowKey}
+      displayName={r.displayName}
+      provider={r.provider}
       // The first row takes Down from the search; the current one is
       // scrolled to on opening, which a first row never needs.
-      rowRef={m === first ? firstRowRef : m === selectedModel ? currentRowRef : undefined}
-      metadata={metadata}
-      payer={headerPayer ? undefined : payers[m]}
-      selected={m === selectedModel}
-      favorite={favoriteSet.has(m)}
-      status={rowStatus(m, now)}
-      onToggleFavorite={onToggleFavorite}
+      rowRef={r.rowKey === first ? firstRowRef : r.selected ? currentRowRef : undefined}
+      payer={headerPayer ? undefined : payers[r.rawModel]}
+      selected={r.selected}
+      favorite={r.favorite}
+      status={rowStatus(r.rawModel, now)}
+      onToggleFavorite={() => toggleFav(r)}
     />
   );
 
@@ -451,19 +583,20 @@ function RailIcon({ provider, label }: { provider: string; label: string }) {
   );
 }
 
-function ModelRow({ model, rowRef, metadata, payer, selected, favorite, status, onToggleFavorite }: {
+// DALTON-HOOK(antigravity-series): render pre-resolved series or model display name on row
+function ModelRow({ model, displayName, provider, rowRef, payer, selected, favorite, status, onToggleFavorite }: {
   model: string;
+  displayName: string;
+  provider?: string;
   rowRef?: Ref<HTMLDivElement>;
-  metadata?: Metadata;
   payer?: Payer;
   selected: boolean;
   favorite: boolean;
   status: ModelRowStatus;
-  onToggleFavorite: (model: string, favorite: boolean) => void;
+  onToggleFavorite: () => void;
 }) {
   const { t } = useTranslation();
-  const provider = metadata?.[model]?.provider;
-  const name = getModelDisplayName(model, metadata);
+  const name = displayName;
   const reason = 'unavailable' in status ? status.unavailable : undefined;
   const check = 'unavailable' in status ? status.check : undefined;
   const fixLabel = 'unavailable' in status && status.fix ? status.fixLabel : undefined;
@@ -491,9 +624,10 @@ function ModelRow({ model, rowRef, metadata, payer, selected, favorite, status, 
           {tag && <span className="flex-none text-xs text-(--color-text-tertiary)">{tag}</span>}
           <Check aria-hidden className={cn('h-4 w-4 flex-none text-(--color-accent-primary)', !selected && 'invisible')} />
           {selected && <span className="sr-only">{t('chat.modelSelector.current')}</span>}
+          {/* DALTON-HOOK(antigravity-series): unfavorite button triggers collapsed variant cleanup */}
           <Button
             aria-label={t(favorite ? 'chat.modelSelector.unfavorite' : 'chat.modelSelector.favorite', { model: name })}
-            onPress={() => onToggleFavorite(model, !favorite)}
+            onPress={onToggleFavorite}
             className={cn(
               'flex h-5 w-5 flex-none items-center justify-center rounded outline-hidden data-focus-visible:outline-current',
               favorite
