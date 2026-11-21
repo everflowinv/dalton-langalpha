@@ -8,6 +8,20 @@ import type { GatewayIndex, ModelMetadataEntry } from '@/hooks/useFilteredModels
 import type { CompactionProfileCatalog, SearchProviderCatalog, SystemDefaults } from '@/hooks/useAllModels';
 import { apiErrorStatus } from '@/api/errors';
 
+/** Built-in Antigravity series metadata returned by `GET /api/v1/models`. */
+// DALTON-HOOK(antigravity-series): series grouping & centralized default effort contract
+export interface AntigravitySeriesEntry {
+  series_id: string;
+  series_prefix: string;
+  provider: string;
+  display_name: string;
+  qualified_display_name: string;
+  default_effort: string;
+  default_model: string;
+  efforts: string[];
+  variants: Record<string, string>;
+}
+
 /** `GET /api/v1/models`: the deployment's catalog, the same for every user. */
 export interface ModelsResponse {
   /** The manifest's models, grouped by the provider that lists them. */
@@ -22,6 +36,9 @@ export interface ModelsResponse {
   key_candidates: Record<string, KeyCandidates>;
   /** How a pick from a gateway's list meets the built-in it is tuned as. */
   gateway_index?: GatewayIndex;
+  /** Built-in Antigravity models grouped by series with centralized default efforts. */
+  // DALTON-HOOK(antigravity-series): expose Antigravity series metadata from /api/v1/models
+  antigravity_series?: AntigravitySeriesEntry[];
 }
 
 export async function getAvailableModels(): Promise<ModelsResponse> {

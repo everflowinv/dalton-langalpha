@@ -750,4 +750,8 @@ async def list_models():
         "key_candidates": key_candidates(),
         # A pick from a gateway's list is tuned as the built-in it matched.
         "gateway_index": gateway_index(config),
+        # DALTON-HOOK(antigravity-series): expose Antigravity series grouping & centralized default efforts
+        "antigravity_series": __import__(
+            "src.dalton.llm.antigravity_series", fromlist=["build_antigravity_series_catalog"]
+        ).build_antigravity_series_catalog(config),
     }

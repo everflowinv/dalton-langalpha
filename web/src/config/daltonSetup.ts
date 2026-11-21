@@ -1,12 +1,59 @@
 import { CLAUDE_CODE, isClaudeCodeModel } from '@/lib/claudeCode';
 import type { Payer } from '@/lib/modelPayer';
 import type { ProviderModelsData } from '@/components/model/types';
+import {
+  type AntigravitySeriesCatalog,
+  type SelectableAntigravitySeries,
+} from '@/lib/antigravitySeries';
+import { resolveEffort } from '@/lib/modelTuning';
 
-/** Recommended primary default model for Dalton deployments. */
+/** Recommended primary series for Dalton onboarding. */
+export const DALTON_DEFAULT_SERIES = 'antigravity-oauth:gemini-4-neon';
+
+/** Recommended background series for Dalton onboarding. */
+export const DALTON_BACKGROUND_SERIES = 'antigravity-oauth:gemini-4-hydrogen';
+
+/** Fallback primary model key when antigravity_series catalog metadata is unavailable. */
 export const DALTON_DEFAULT_MODEL = 'gemini-4-neon-high-oauth';
 
-/** Recommended background model for Dalton deployments. */
+/** Fallback background model key when antigravity_series catalog metadata is unavailable. */
 export const DALTON_BACKGROUND_MODEL = 'gemini-4-hydrogen-high-oauth';
+
+/**
+ * Resolve the recommended variant key for a Dalton Antigravity series from
+ * `antigravity_series` metadata, falling back to `fallbackModel` when series
+ * metadata is absent (e.g. legacy test mocks).
+ */
+export function resolveDaltonSeriesDefaultModel(
+  seriesId: string,
+  candidates: readonly string[],
+  options: {
+    seriesCatalog?: AntigravitySeriesCatalog | null;
+    selectableSeries?: readonly SelectableAntigravitySeries[] | null;
+    fallbackModel?: string;
+  } = {},
+): string | null {
+  const candidateSet = new Set(candidates);
+  const selectable = options.selectableSeries?.find((s) => s.seriesId === seriesId);
+  if (selectable && candidateSet.has(selectable.defaultVariantKey)) {
+    return selectable.defaultVariantKey;
+  }
+  const series = options.seriesCatalog?.bySeriesId[seriesId];
+  if (series) {
+    const availableEfforts = Object.entries(series.variants)
+      .filter(([, variantKey]) => candidateSet.has(variantKey))
+      .map(([effort]) => effort);
+    if (availableEfforts.length > 0) {
+      const chosen = resolveEffort(series.default_effort, availableEfforts) ?? availableEfforts[0];
+      const key = chosen ? series.variants[chosen] : undefined;
+      if (key && candidateSet.has(key)) return key;
+    }
+  }
+  if (options.fallbackModel && candidateSet.has(options.fallbackModel)) {
+    return options.fallbackModel;
+  }
+  return null;
+}
 
 export interface DaltonModelMeta {
   sdk?: string;

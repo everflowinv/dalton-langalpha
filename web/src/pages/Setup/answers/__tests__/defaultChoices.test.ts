@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { defaultChoices, type DefaultChoicesInput } from '../defaultChoices';
 import { connectedModel } from '../connectedDefault';
+// DALTON-HOOK(antigravity-series): buildSeriesCatalog helper for series tests
+import { buildSeriesCatalog } from '@/lib/antigravitySeries';
 
 const input = (over: Partial<DefaultChoicesInput>): DefaultChoicesInput => ({
   models: 'subscription_or_key',
@@ -186,5 +188,95 @@ describe('connectedModel', () => {
       'cc-sonnet': { model_id: 'claude-sonnet-5-5', sdk: 'claude-code', intelligence: 4, speed: 4 },
     };
     expect(connectedModel('claude-code', models, metadata, null, [], (p) => p)).toBe('cc-sonnet');
+  });
+});
+
+// DALTON-HOOK(antigravity-series): series collapsing & series default resolution in defaultChoices
+describe('defaultChoices Antigravity series collapsing', () => {
+  const seriesCatalog = buildSeriesCatalog([
+    {
+      series_id: 'gemini-4-neon',
+      series_prefix: 'gemini-4-neon-',
+      display_name: 'Gemini 4 Neon',
+      qualified_display_name: 'Gemini 4 Neon (Antigravity)',
+      provider: 'antigravity-oauth',
+      default_effort: 'high',
+      default_model: 'gemini-4-neon-high-oauth',
+      efforts: ['low', 'medium', 'high', 'xhigh'],
+      variants: {
+        low: 'gemini-4-neon-low-oauth',
+        medium: 'gemini-4-neon-medium-oauth',
+        high: 'gemini-4-neon-high-oauth',
+        xhigh: 'gemini-4-neon-xhigh-oauth',
+      },
+    },
+    {
+      series_id: 'gemini-4-hydrogen',
+      series_prefix: 'gemini-4-hydrogen-',
+      display_name: 'Gemini 4 Hydrogen',
+      qualified_display_name: 'Gemini 4 Hydrogen (Antigravity)',
+      provider: 'antigravity-oauth',
+      default_effort: 'high',
+      default_model: 'gemini-4-hydrogen-high-oauth',
+      efforts: ['low', 'medium', 'high'],
+      variants: {
+        low: 'gemini-4-hydrogen-low-oauth',
+        medium: 'gemini-4-hydrogen-medium-oauth',
+        high: 'gemini-4-hydrogen-high-oauth',
+      },
+    },
+  ]);
+  const antigravityOffered = {
+    'antigravity-oauth': {
+      models: [
+        'gemini-4-neon-low-oauth',
+        'gemini-4-neon-medium-oauth',
+        'gemini-4-neon-high-oauth',
+        'gemini-4-neon-xhigh-oauth',
+        'gemini-4-hydrogen-low-oauth',
+        'gemini-4-hydrogen-medium-oauth',
+        'gemini-4-hydrogen-high-oauth',
+      ],
+    },
+  };
+  const antigravityMeta = {
+    'gemini-4-neon-low-oauth': { provider: 'antigravity-oauth', display_name: 'Gemini 4 Neon (Low)', intelligence: 5, speed: 3 },
+    'gemini-4-neon-medium-oauth': { provider: 'antigravity-oauth', display_name: 'Gemini 4 Neon (Medium)', intelligence: 5, speed: 3 },
+    'gemini-4-neon-high-oauth': { provider: 'antigravity-oauth', display_name: 'Gemini 4 Neon (High)', intelligence: 5, speed: 3 },
+    'gemini-4-neon-xhigh-oauth': { provider: 'antigravity-oauth', display_name: 'Gemini 4 Neon (XHigh)', intelligence: 5, speed: 2 },
+    'gemini-4-hydrogen-low-oauth': { provider: 'antigravity-oauth', display_name: 'Gemini 4 Hydrogen (Low)', intelligence: 4, speed: 5 },
+    'gemini-4-hydrogen-medium-oauth': { provider: 'antigravity-oauth', display_name: 'Gemini 4 Hydrogen (Medium)', intelligence: 4, speed: 5 },
+    'gemini-4-hydrogen-high-oauth': { provider: 'antigravity-oauth', display_name: 'Gemini 4 Hydrogen (High)', intelligence: 4, speed: 5 },
+  };
+
+  it('collapses Neon and Hydrogen to one representative per series and recommends high default variants', () => {
+    const choices = defaultChoices(input({
+      dalton: true,
+      offered: antigravityOffered,
+      slotModels: antigravityOffered['antigravity-oauth'].models,
+      ownProviders: ['antigravity-oauth'],
+      metadata: antigravityMeta,
+      seriesCatalog,
+    }));
+
+    expect(choices.recommended.primary).toBe('gemini-4-neon-high-oauth');
+    expect(choices.recommended.background).toBe('gemini-4-hydrogen-high-oauth');
+    expect(choices.initial).toBe('gemini-4-neon-high-oauth');
+    expect(choices.list).toEqual(['gemini-4-neon-high-oauth', 'gemini-4-hydrogen-high-oauth']);
+  });
+
+  it('preserves a saved variant in initial while keeping its series folded to a single card', () => {
+    const choices = defaultChoices(input({
+      dalton: true,
+      offered: antigravityOffered,
+      slotModels: antigravityOffered['antigravity-oauth'].models,
+      ownProviders: ['antigravity-oauth'],
+      metadata: antigravityMeta,
+      seriesCatalog,
+      preferred: 'gemini-4-neon-medium-oauth',
+    }));
+
+    expect(choices.initial).toBe('gemini-4-neon-medium-oauth');
+    expect(choices.list).toEqual(['gemini-4-neon-medium-oauth', 'gemini-4-hydrogen-high-oauth']);
   });
 });

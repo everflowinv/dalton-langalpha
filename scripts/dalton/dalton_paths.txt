@@ -515,3 +515,10 @@ web/src/pages/Setup/answers/useTeamModels.ts
 web/src/pages/Setup/__tests__/SetupWizard.dalton.test.tsx
 web/src/pages/Setup/__tests__/SetupWizard.firstRun.dalton.test.tsx
 web/src/pages/Setup/__tests__/daltonBrand.test.tsx
+# Antigravity series grouping helpers & tests
+web/src/lib/antigravitySeries.ts
+web/src/lib/__tests__/antigravitySeries.test.ts
+web/src/components/model/__tests__/FallbackModelsPicker.dalton.test.tsx
+web/src/components/ui/__tests__/chat-input.antigravitySeries.dalton.test.tsx
+web/src/pages/Plugins/components/subagents/__tests__/SubagentAside.antigravity.dalton.test.tsx
+web/src/pages/Setup/steps/__tests__/DefaultStep.antigravity.dalton.test.tsx

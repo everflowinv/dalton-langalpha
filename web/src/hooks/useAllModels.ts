@@ -17,6 +17,13 @@ import { CLAUDE_CODE_CONNECTION, isClaudeCodeModel } from '@/lib/claudeCode';
 import { useClaudeCodeStatus } from './useClaudeCode';
 import { useAccount } from './useAccount';
 import { allows, modelRefusedBy, restrictsModels, RULE, withoutRefusedModels } from '@/lib/accountRules';
+// DALTON-HOOK(antigravity-series): build separated seriesCatalog (saved echo) & selectableSeries (current pool)
+import {
+  buildSelectableAntigravitySeries,
+  buildSeriesCatalog,
+  type AntigravitySeriesCatalog,
+  type SelectableAntigravitySeries,
+} from '@/lib/antigravitySeries';
 
 export interface SystemDefaults {
   default_model?: string;
@@ -129,6 +136,13 @@ export interface UseAllModelsResult {
   unread: boolean;
   /** The connections whose own list is read to hide what they cannot run. */
   listedProviders: readonly string[];
+  /** Unfiltered Antigravity series catalog for echo/display of saved keys. */
+  // DALTON-HOOK(antigravity-series): expose seriesCatalog and selectableSeries/selectableSlotSeries
+  seriesCatalog: AntigravitySeriesCatalog;
+  /** Currently selectable Antigravity series for chat pickers (`offered`). */
+  selectableSeries: SelectableAntigravitySeries[];
+  /** Currently selectable Antigravity series for background/slot pickers (`offeredSlots`). */
+  selectableSlotSeries: SelectableAntigravitySeries[];
 }
 
 /**
@@ -385,6 +399,29 @@ export function useAllModels(): UseAllModelsResult {
     )));
   }, [payers, policy, visible]);
 
+  // DALTON-HOOK(antigravity-series): separate unfiltered seriesCatalog (saved echo) from pool-filtered selectableSeries
+  const seriesCatalog = useMemo(
+    () => buildSeriesCatalog(modelsData?.antigravity_series),
+    [modelsData?.antigravity_series],
+  );
+  const rawMetadata = modelsData?.model_metadata ?? null;
+  const selectableSeries = useMemo(
+    () => buildSelectableAntigravitySeries(seriesCatalog, offered, {
+      rawMetadata,
+      customModels,
+      customPairs: visible.customPairs,
+    }),
+    [seriesCatalog, offered, rawMetadata, customModels, visible.customPairs],
+  );
+  const selectableSlotSeries = useMemo(
+    () => buildSelectableAntigravitySeries(seriesCatalog, offeredSlots, {
+      rawMetadata,
+      customModels,
+      customPairs: visible.customPairs,
+    }),
+    [seriesCatalog, offeredSlots, rawMetadata, customModels, visible.customPairs],
+  );
+
   return {
     models: offered,
     slotModels: offeredSlots,
@@ -406,5 +443,9 @@ export function useAllModels(): UseAllModelsResult {
     isLoading: modelsLoading || prefsLoading || configuredLoading || platformLoading || listsLoading || claudeCode.isLoading,
     unread: (modelsError && !modelsData) || !!configuredUnread || claudeCode.unread,
     listedProviders,
+    // DALTON-HOOK(antigravity-series): return separated unfiltered catalog and selectable series indexes
+    seriesCatalog,
+    selectableSeries,
+    selectableSlotSeries,
   };
 }

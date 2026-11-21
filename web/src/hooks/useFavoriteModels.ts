@@ -52,6 +52,11 @@ export function useFavoriteModels() {
     if (!saved.includes(model)) write([...saved, model]);
   }, [saved, write]);
   const remove = useCallback((model: string) => write(saved.filter((m) => m !== model)), [saved, write]);
+  // DALTON-HOOK(antigravity-series): remove all variants of a collapsed series in one preference write
+  const removeMany = useCallback((modelsToRemove: readonly string[]) => {
+    const drop = new Set(modelsToRemove);
+    write(saved.filter((m) => !drop.has(m)));
+  }, [saved, write]);
 
-  return { models, add, remove };
+  return { models, add, remove, removeMany };
 }

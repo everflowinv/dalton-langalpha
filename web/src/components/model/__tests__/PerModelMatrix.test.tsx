@@ -173,3 +173,83 @@ describe('PerModelMatrix provider compaction cell', () => {
     expect(screen.queryByText(/OpenAI compacts the conversation/)).toBeNull();
   });
 });
+
+// DALTON-HOOK(antigravity-series): verify PerModelMatrix displays Series · Effort and collapses + Add model by series
+describe('PerModelMatrix Antigravity series', () => {
+  it('labels existing and unreachable Antigravity rows as Series · Effort and collapses + Add model', async () => {
+    const { buildSeriesCatalog } = await import('@/lib/antigravitySeries');
+    const seriesCatalog = buildSeriesCatalog([
+      {
+        series_id: 'antigravity-oauth:gemini-4-neon',
+        series_prefix: 'gemini-4-neon',
+        provider: 'antigravity-oauth',
+        display_name: 'Gemini 4 Neon',
+        qualified_display_name: 'Gemini 4 Neon (Antigravity)',
+        default_effort: 'high',
+        default_model: 'gemini-4-neon-high-oauth',
+        efforts: ['low', 'medium', 'high'],
+        variants: {
+          low: 'gemini-4-neon-low-oauth',
+          medium: 'gemini-4-neon-medium-oauth',
+          high: 'gemini-4-neon-high-oauth',
+        },
+      },
+      {
+        series_id: 'antigravity-oauth:gemini-4-carbon',
+        series_prefix: 'gemini-4-carbon',
+        provider: 'antigravity-oauth',
+        display_name: 'Gemini 4 Carbon',
+        qualified_display_name: 'Gemini 4 Carbon (Antigravity)',
+        default_effort: 'medium',
+        default_model: 'gemini-4-carbon-medium-oauth',
+        efforts: ['low', 'medium', 'high'],
+        variants: {
+          low: 'gemini-4-carbon-low-oauth',
+          medium: 'gemini-4-carbon-medium-oauth',
+          high: 'gemini-4-carbon-high-oauth',
+        },
+      },
+    ]);
+    const agMetadata: Record<string, ModelMetadataEntry> = {
+      'gemini-4-neon-low-oauth': { provider: 'antigravity-oauth' },
+      'gemini-4-neon-medium-oauth': { provider: 'antigravity-oauth' },
+      'gemini-4-neon-high-oauth': { provider: 'antigravity-oauth' },
+      'gemini-4-carbon-low-oauth': { provider: 'antigravity-oauth' },
+      'gemini-4-carbon-medium-oauth': { provider: 'antigravity-oauth' },
+      'gemini-4-carbon-high-oauth': { provider: 'antigravity-oauth' },
+    };
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+    qc.setQueryData(queryKeys.user.preferences(), {
+      model_preference: {
+        profiles: { 'gemini-4-neon-medium-oauth': { prompt_guidance: 'lean' } },
+      },
+    });
+    qc.setQueryData(queryKeys.features.list(), [{ key: 'provider_compaction', enabled: false }]);
+
+    render(
+      <QueryClientProvider client={qc}>
+        <PerModelMatrix
+          metadata={agMetadata}
+          rawMetadata={agMetadata}
+          seriesCatalog={seriesCatalog}
+          validModelNames={new Set([
+            'gemini-4-carbon-low-oauth',
+            'gemini-4-carbon-medium-oauth',
+            'gemini-4-carbon-high-oauth',
+          ])}
+          compactionProfiles={profilesCatalog}
+        />
+      </QueryClientProvider>,
+    );
+
+    // Unreachable saved neon-medium row still displays as "Gemini 4 Neon · Medium"
+    expect(screen.getByText('Gemini 4 Neon · Medium')).toBeTruthy();
+
+    // "+ Add a model" collapses Carbon's 3 variants into 1 option with default_effort (medium)
+    const addSelect = screen.getByLabelText('Add a model') as HTMLSelectElement;
+    expect([...addSelect.options].map((o) => ({ text: o.textContent, value: o.value }))).toEqual([
+      { text: '+ Add a model', value: '' },
+      { text: 'Gemini 4 Carbon', value: 'gemini-4-carbon-medium-oauth' },
+    ]);
+  });
+});

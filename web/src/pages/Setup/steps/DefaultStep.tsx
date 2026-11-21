@@ -15,8 +15,10 @@ import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
 import { getModelDisplayName } from '@/components/ui/chat-input.helpers';
 import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(dalton-setup): Dalton build defaults & credits/Claude Code filtering
+// DALTON-HOOK(antigravity-series): series-only display & hide effort pickers in onboarding
 import { isDaltonBuild } from '@/config/brand';
 import { filterDaltonPayers, filterDaltonProviderModels, isDaltonAllowedModel } from '@/config/daltonSetup';
+import { formatAntigravityVariantLabel, sameAntigravitySeries } from '@/lib/antigravitySeries';
 import { isDesktopShell } from '@/lib/desktop';
 import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
 import { homeWorkspaceQuery } from '@/hooks/useHomeWorkspace';
@@ -100,7 +102,10 @@ export default function DefaultStep() {
     systemBackground: allowedSystemBackground,
     preferred: saved.preferred_model ?? null,
     // DALTON-HOOK(dalton-setup): pass dalton build flag and team state into DefaultForm
+    // DALTON-HOOK(antigravity-series): pass seriesCatalog & selectableSeries into defaultChoices
     dalton: isDaltonBuild,
+    seriesCatalog: all.seriesCatalog,
+    selectableSeries: all.selectableSeries,
   });
   // Mounted once the preferences are read, so the picks are seeded from what
   // is saved and never from an unread row; keyed by the account, whose drafts
@@ -149,7 +154,9 @@ function DefaultForm({
 }) {
   const { t } = useTranslation();
   const copy = useModelSlotCopy();
-  const { slotModels, payers, metadata, systemDefaults, cannotRun } = all;
+  const { slotModels, payers, metadata, systemDefaults, cannotRun, seriesCatalog, customModels, rawApiResponse } = all;
+  const rawMetadata = rawApiResponse?.model_metadata ?? metadata;
+  const seriesOpts = { seriesCatalog, rawMetadata, customModels };
   // DALTON-HOOK(dalton-setup): exclude Claude Code / credits models and payers in Dalton builds
   const visiblePayers = filterDaltonPayers(payers, isDaltonBuild);
   const visibleSlotModels = filterDaltonProviderModels(slotModels, metadata, payers, isDaltonBuild);
@@ -183,7 +190,10 @@ function DefaultForm({
   // is confirmed not to run.
   const settled = !all.isLoading && !all.unread;
   const backgroundOffered = Object.values(visibleSlotModels).flatMap((p) => p.models ?? []);
-  const primary = settled && (!primaryPick || !choices.list.includes(primaryPick)) ? recommended.primary : primaryPick;
+  const primaryInList = (pick: string | null) => !!pick && (
+    choices.list.includes(pick) || choices.list.some((m) => sameAntigravitySeries(m, pick, seriesOpts))
+  );
+  const primary = settled && !primaryInList(primaryPick) ? recommended.primary : primaryPick;
   // DALTON-HOOK(dalton-setup): reject credits/Claude Code background models including Auto
   const backgroundDisallowed = isDaltonBuild && (
     backgroundPick === BACKGROUND_AUTO
@@ -247,7 +257,9 @@ function DefaultForm({
     behindNow.current = behind;
   }, [behind]);
 
-  const name = (m: string) => getModelDisplayName(m, metadata);
+  // DALTON-HOOK(antigravity-series): display Antigravity models purely as series names without effort suffix
+  const name = (m: string) =>
+    formatAntigravityVariantLabel(m, seriesOpts) ?? getModelDisplayName(m, metadata);
   const deploymentBackground = systemBackground ? t('settings.autoModel', { model: name(systemBackground) }) : undefined;
   const onRecommended = primary === recommended.primary && background === recommendedBackground;
   // Self-hosted runs it on the token the server saved, wherever the turn is.
@@ -418,20 +430,26 @@ function DefaultForm({
           )}
 
           <div role="radiogroup" aria-labelledby={headingId} className="flex flex-col gap-2">
-            {choices.list.map((m) => (
-              <PickCard key={m} name={groupName} value={m} checked={m === primary} onSelect={setPrimary}>
-                <span className="flex min-w-0 flex-1 flex-col gap-1">
-                  <span className="flex flex-wrap items-center gap-2 text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                    {name(m)}
-                    {recommended.primary === m && <NameTag>{t('setup.answers.default.recommended')}</NameTag>}
+            {choices.list.map((m) => {
+              const isPrimaryCard = m === primary || (
+                primary === recommended.primary && sameAntigravitySeries(m, recommended.primary, seriesOpts)
+              );
+              const isRecommendedCard = recommended.primary === m || sameAntigravitySeries(m, recommended.primary, seriesOpts);
+              return (
+                <PickCard key={m} name={groupName} value={m} checked={isPrimaryCard} onSelect={setPrimary}>
+                  <span className="flex min-w-0 flex-1 flex-col gap-1">
+                    <span className="flex flex-wrap items-center gap-2 text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
+                      {name(m)}
+                      {isRecommendedCard && <NameTag>{t('setup.answers.default.recommended')}</NameTag>}
+                    </span>
+                    <Ratings meta={metadata[m]} />
+                    {isPrimaryCard && where && <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{where}</span>}
                   </span>
-                  <Ratings meta={metadata[m]} />
-                  {m === primary && where && <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{where}</span>}
-                </span>
-                {/* DALTON-HOOK(dalton-setup): hide credits payer badges under Dalton */}
-                <PayerBadge payer={visiblePayers[m]} />
-              </PickCard>
-            ))}
+                  {/* DALTON-HOOK(dalton-setup): hide credits payer badges under Dalton */}
+                  <PayerBadge payer={visiblePayers[m]} />
+                </PickCard>
+              );
+            })}
           </div>
 
           <div>
@@ -455,6 +473,7 @@ function DefaultForm({
                 >
                   <div className="flex flex-col gap-6 pt-4">
                     {/* DALTON-HOOK(dalton-setup): pass Dalton-filtered slot models, payers, and Auto option */}
+                    {/* DALTON-HOOK(antigravity-series): never render effort pickers on onboarding step */}
                     <ModelSelector
                       label={copy.background.label}
                       description={copy.background.description}
@@ -466,6 +485,10 @@ function DefaultForm({
                       autoOption={deploymentBackground ? { value: BACKGROUND_AUTO, label: deploymentBackground } : undefined}
                       payers={visiblePayers}
                       metadata={metadata}
+                      seriesCatalog={seriesCatalog}
+                      rawMetadata={rawMetadata}
+                      customModels={customModels}
+                      hideEffortPicker
                     />
                     <ModelSelector
                       label={t('settings.modelTuning.fetchModel')}
@@ -476,6 +499,10 @@ function DefaultForm({
                       placeholder={copy.defaultsToBackground}
                       payers={visiblePayers}
                       metadata={metadata}
+                      seriesCatalog={seriesCatalog}
+                      rawMetadata={rawMetadata}
+                      customModels={customModels}
+                      hideEffortPicker
                     />
                     <ModelSelector
                       label={t('settings.modelTuning.compactionModel')}
@@ -486,6 +513,10 @@ function DefaultForm({
                       placeholder={copy.defaultsToConversation}
                       payers={visiblePayers}
                       metadata={metadata}
+                      seriesCatalog={seriesCatalog}
+                      rawMetadata={rawMetadata}
+                      customModels={customModels}
+                      hideEffortPicker
                     />
                     {/* DALTON-HOOK(dalton-setup): pass Dalton-filtered slot models and payers to FallbackModelsPicker */}
                     <FallbackModelsPicker
@@ -494,6 +525,10 @@ function DefaultForm({
                       models={visibleSlotModels}
                       metadata={metadata}
                       payers={visiblePayers}
+                      seriesCatalog={seriesCatalog}
+                      rawMetadata={rawMetadata}
+                      customModels={customModels}
+                      hideEffortPicker
                     />
                   </div>
                 </motion.div>

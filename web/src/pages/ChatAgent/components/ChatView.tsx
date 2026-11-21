@@ -13,6 +13,9 @@ import { useStableHandler } from '@/hooks/useStableHandler';
 import { useLatestRef } from '@/hooks/useLatestRef';
 import { ScrollArea } from '../../../components/ui/scroll-area';
 import { usePreferences } from '@/hooks/usePreferences';
+// DALTON-HOOK(antigravity-series): clear local thread effort on Antigravity switch without extra PATCH
+import { useAllModels } from '@/hooks/useAllModels';
+import { inspectSavedAntigravityModel } from '@/lib/antigravitySeries';
 import { usePlanReader } from '@/hooks/useClaudeCodePlan';
 import { planActionText } from '@/lib/claudeCodePlan';
 import { readTurnEndScroll } from '@/lib/turnEndScroll';
@@ -444,11 +447,13 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
   const activeThreadId =
     currentThreadId && currentThreadId !== '__default__' ? currentThreadId : threadId;
+  // DALTON-HOOK(antigravity-series): pass workspaceId so shared workspaces never issue 403 PATCH
   const threadModel = useThreadModel({
     threadId: activeThreadId,
     isLoading,
     initialModel: navModel,
     chiefOfStaff: isHome,
+    workspaceId,
   });
   const { pickModel: pickThreadModel, thread: threadRecord } = threadModel;
   // DALTON-HOOK(colleague-dispatch): determine whether the active thread is read-only for the caller
@@ -529,11 +534,21 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     landing: subagentsLanding,
   });
   const { toSend: subagentsToSend } = threadSubagents;
+  // DALTON-HOOK(antigravity-series): pass workspaceId to useThreadTuning so shared workspaces stay local
   const threadTuning = useThreadTuning({
     threadId: currentThreadId,
     landing: tuningLanding,
+    workspaceId,
   });
-  const { toSend: tuningToSend } = threadTuning;
+  const { toSend: tuningToSend, clearLocalEffort } = threadTuning;
+  const { seriesCatalog, customModels, metadata: modelMetadata, rawApiResponse } = useAllModels();
+  const handlePickThreadModel = useCallback((nextModel: string) => {
+    const rawMeta = rawApiResponse?.model_metadata ?? modelMetadata;
+    if (inspectSavedAntigravityModel(nextModel, { seriesCatalog, rawMetadata: rawMeta, customModels })) {
+      clearLocalEffort();
+    }
+    return pickThreadModel(nextModel);
+  }, [clearLocalEffort, customModels, modelMetadata, pickThreadModel, rawApiResponse, seriesCatalog]);
 
   // The route's `__default__` stands for a chat with no thread yet; handing it
   // to the panel would give every unsent chat in a workspace one shared strip.
@@ -2129,7 +2144,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         onAction={handleAction}
                         model={threadModel.model}
                         sendModel={threadModel.sendModel}
-                        onPickModel={pickThreadModel}
+                        // DALTON-HOOK(antigravity-series): clear local effort alongside Antigravity model switch
+                        onPickModel={handlePickThreadModel}
                         threadModels={threadModels}
                         subagentsAllowed={threadSubagents.allowed}
                         onToggleSubagents={threadSubagents.setAllowed}
