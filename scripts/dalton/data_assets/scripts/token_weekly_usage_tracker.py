@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+from decimal import Decimal
 import importlib.util
 import json
 import os
@@ -353,9 +354,11 @@ def _empty_effort_bucket(bucket_name: str) -> dict[str, Any]:
         "total_tokens": 0,
         "prompt_tokens": 0,
         "cost_usd": None,
+        "_cost_values": [],
         "unpriced_tokens": 0,
         "no_public_price": False,
         "reference_cost_usd": None,
+        "_ref_cost_values": [],
         "reference_model": None,
         "price_note": None,
     }
@@ -381,25 +384,33 @@ def _accumulate_bucket_fields(
     bucket["prompt_tokens"] += prompt_tokens
     bucket["unpriced_tokens"] += unpriced_tokens
     if src.get("cost_usd") is not None:
-        bucket["cost_usd"] = (bucket["cost_usd"] or 0.0) + float(src["cost_usd"])
+        bucket["_cost_values"].append(float(src["cost_usd"]))
     if src.get("no_public_price"):
         bucket["no_public_price"] = True
     if src.get("reference_cost_usd") is not None:
-        bucket["reference_cost_usd"] = (bucket["reference_cost_usd"] or 0.0) + float(src["reference_cost_usd"])
+        bucket["_ref_cost_values"].append(float(src["reference_cost_usd"]))
     if src.get("reference_model") and not bucket["reference_model"]:
         bucket["reference_model"] = src["reference_model"]
     if src.get("price_note") and not bucket["price_note"]:
         bucket["price_note"] = src["price_note"]
 
 
+def _finalize_bucket_costs(bucket: dict[str, Any]) -> dict[str, Any]:
+    costs = bucket.pop("_cost_values", [])
+    ref_costs = bucket.pop("_ref_cost_values", [])
+    bucket["cost_usd"] = sum(costs) if costs else None
+    bucket["reference_cost_usd"] = sum(ref_costs) if ref_costs else None
+    return bucket
+
+
 def _order_effort_breakdown(breakdown: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     ordered: dict[str, dict[str, Any]] = {}
     for key in EFFORT_BUCKET_ORDER:
         if key in breakdown:
-            ordered[key] = breakdown[key]
+            ordered[key] = _finalize_bucket_costs(breakdown[key])
     for key in sorted(breakdown):
         if key not in ordered:
-            ordered[key] = breakdown[key]
+            ordered[key] = _finalize_bucket_costs(breakdown[key])
     return ordered
 
 
@@ -493,11 +504,13 @@ def merge_rows_by_model(
                 "total_tokens": 0,
                 "prompt_tokens": 0,
                 "cost_usd": None,
+                "_cost_values": [],
                 "unpriced_tokens": 0,
                 "estimated_split_records": 0,
                 "units": {},
                 "no_public_price": False,
                 "reference_cost_usd": None,
+                "_ref_cost_values": [],
                 "reference_model": None,
                 "price_note": None,
             }
@@ -534,11 +547,11 @@ def merge_rows_by_model(
         m["estimated_split_records"] += int(r.get("estimated_split_records") or 0)
         m["unpriced_tokens"] += unpriced_tokens
         if r.get("cost_usd") is not None:
-            m["cost_usd"] = (m["cost_usd"] or 0.0) + float(r["cost_usd"])
+            m["_cost_values"].append(float(r["cost_usd"]))
         if r.get("no_public_price"):
             m["no_public_price"] = True
         if r.get("reference_cost_usd") is not None:
-            m["reference_cost_usd"] = (m["reference_cost_usd"] or 0.0) + float(r["reference_cost_usd"])
+            m["_ref_cost_values"].append(float(r["reference_cost_usd"]))
         if r.get("reference_model") and not m["reference_model"]:
             m["reference_model"] = r["reference_model"]
         if r.get("price_note") and not m["price_note"]:
@@ -586,6 +599,10 @@ def merge_rows_by_model(
     for m in merged.values():
         m["provider"] = "+".join(m["providers"])
         m["source"] = "|".join(m["sources"])
+        costs = m.pop("_cost_values", [])
+        ref_costs = m.pop("_ref_cost_values", [])
+        m["cost_usd"] = sum(costs) if costs else None
+        m["reference_cost_usd"] = sum(ref_costs) if ref_costs else None
         if "effort_breakdown" in m:
             m["effort_breakdown"] = _order_effort_breakdown(m["effort_breakdown"])
     return list(merged.values())
@@ -943,7 +960,52 @@ def _format_effective_notes(price_catalog: dict[str, Any]) -> list[str]:
     return notes
 
 
-def _format_effort_breakdown_line(effort_breakdown: dict[str, Any] | None) -> str | None:
+def _displayed_cents(val: float) -> int:
+    """Return the exact integer cents rendered by ``format_usd(val)``."""
+    rendered = format_usd(val).lstrip("$").replace(",", "")
+    return int((Decimal(rendered) * 100).to_integral_exact())
+
+
+def _allocate_display_cents(
+    target_usd: float,
+    ordered_buckets: list[tuple[str, dict[str, Any]]],
+    rank_map: dict[str, int],
+) -> dict[str, int]:
+    """Allocate the series row's displayed cents across priced effort buckets so their sum equals the series row."""
+    priced = [
+        (bk, Decimal(str(float(bv["cost_usd"]))) * 100, int(bv.get("total_tokens") or 0), rank_map.get(bk, len(EFFORT_BUCKET_ORDER)))
+        for bk, bv in ordered_buckets
+        if isinstance(bv, dict) and bv.get("cost_usd") is not None
+    ]
+    if not priced:
+        return {}
+    target_cents = _displayed_cents(target_usd)
+    floors = {bk: max(0, int(raw_c)) for bk, raw_c, _, _ in priced}
+    diff = target_cents - sum(floors.values())
+    if diff > 0:
+        order = sorted(priced, key=lambda it: (-(it[1] - floors[it[0]]), -it[1], -it[2], it[3]))
+        for idx in range(diff):
+            floors[order[idx % len(order)][0]] += 1
+    elif diff < 0:
+        need = -diff
+        while need > 0:
+            pos = [it for it in priced if floors[it[0]] > 0]
+            if not pos:
+                break
+            order = sorted(pos, key=lambda it: ((it[1] - floors[it[0]]), it[1], it[2], -it[3]))
+            for it in order:
+                if need <= 0:
+                    break
+                floors[it[0]] -= 1
+                need -= 1
+    return floors
+
+
+def _format_effort_breakdown_line(
+    effort_breakdown: dict[str, Any] | None,
+    *,
+    series_cost_usd: float | None = None,
+) -> str | None:
     """Format per-effort breakdown for Antigravity series rows on the Feishu card."""
     if not isinstance(effort_breakdown, dict) or not effort_breakdown:
         return None
@@ -955,8 +1017,15 @@ def _format_effort_breakdown_line(effort_breakdown: dict[str, Any] | None) -> st
         toks = int(bv.get("total_tokens") or 0) if isinstance(bv, dict) else 0
         return (is_unknown, -toks, rank_map.get(bk, len(EFFORT_BUCKET_ORDER)))
 
+    ordered_buckets = sorted(effort_breakdown.items(), key=_sort_key)
+    allocated_cents = (
+        _allocate_display_cents(series_cost_usd, ordered_buckets, rank_map)
+        if series_cost_usd is not None
+        else {}
+    )
+
     parts: list[str] = []
-    for bk, bv in sorted(effort_breakdown.items(), key=_sort_key):
+    for bk, bv in ordered_buckets:
         if not isinstance(bv, dict):
             continue
         label = UNKNOWN_EFFORT_LABEL if bk == UNKNOWN_EFFORT_BUCKET else bk
@@ -966,7 +1035,10 @@ def _format_effort_breakdown_line(effort_breakdown: dict[str, Any] | None) -> st
         unpriced = int(bv.get("unpriced_tokens") or 0)
         ref_cost = bv.get("reference_cost_usd")
         if cost_val is not None:
-            cost_part = format_usd(float(cost_val))
+            if bk in allocated_cents:
+                cost_part = f"${Decimal(allocated_cents[bk]) / Decimal(100):,.2f}"
+            else:
+                cost_part = format_usd(float(cost_val))
             if unpriced > 0:
                 cost_part += f"，另 {format_tokens(unpriced)} 无公开价"
         elif ref_cost is not None:
@@ -1139,7 +1211,7 @@ def build_card(stats: dict[str, Any]) -> dict[str, Any]:
             f"<font color='grey'>· 参考成本: {cost_disp} ｜ 调用: {calls:,} 次</font>\n"
             f"<font color='grey'>· 构成拆分: 缓存读取 {cr_str} ｜ 缓存写入 {format_tokens(r['cache_write'])} ｜ 新增 {fresh_str} ｜ 输出 {out_str}</font>"
         )
-        effort_line = _format_effort_breakdown_line(r.get("effort_breakdown"))
+        effort_line = _format_effort_breakdown_line(r.get("effort_breakdown"), series_cost_usd=cost_val)
         if effort_line:
             item_text += f"\n<font color='grey'>{effort_line}</font>"
         elements.append({"tag": "markdown", "content": item_text})
@@ -1158,7 +1230,7 @@ def build_card(stats: dict[str, Any]) -> dict[str, Any]:
             tail_line = (
                 f"**{idx}. {model}** <font color='grey'>({prov})</font>: {tok_str} Tokens ｜ {cost_str} ｜ {r['calls']:,} 次调用"
             )
-            effort_line = _format_effort_breakdown_line(r.get("effort_breakdown"))
+            effort_line = _format_effort_breakdown_line(r.get("effort_breakdown"), series_cost_usd=r["cost_usd"])
             if effort_line:
                 tail_line += f"\n<font color='grey'>  {effort_line}</font>"
             tail_lines.append(tail_line)

@@ -1617,170 +1617,228 @@ def test_r2_gpt_oss_120b_local_agy_and_dalton_prod_merge_into_single_row(
     assert rem[0]["norm_provider"] == "Anthropic"
 
 
-def test_r3_exact_field_by_field_parity_against_origin_main_on_multisource_and_rounding_cases(
+def test_r3_exact_field_by_field_parity_against_legacy_baseline_fixture(
+    tmp_path: Path,
+) -> None:
+    """Round 3/4 Decision #2: frozen legacy baseline vs new --json totals, subtotals & card overview are strictly == (no git dependency)."""
+    import os
+    import subprocess
+
+    fixture_path = REPO_ROOT / "tests" / "fixtures" / "dalton" / "weekly_token_usage" / "legacy_parity_cases.json"
+    cases = json.loads(fixture_path.read_text(encoding="utf-8"))
+    assert set(cases.keys()) == {"case1_5k_plus_3cr", "case2_single_5k", "case3_full_multisource"}
+
+    env = dict(os.environ, OPENCLAW_WORKSPACE=str(REPO_ROOT / "scripts/dalton/data_assets"))
+    strict_fields = (
+        "total_tokens",
+        "total_fresh",
+        "total_cw",
+        "total_cr",
+        "total_out",
+        "total_prompt",
+        "total_records",
+        "total_calls",
+        "total_cost",
+        "unpriced_tokens",
+        "cache_hit_rate",
+        "local_stats",
+        "dalton_stats",
+        "dalton_prod",
+        "estimated_split_records",
+        "time_estimated_records",
+        "tier_context_unknown_records",
+        "provider_reported_cost_records",
+    )
+
+    for name, bundle in cases.items():
+        snap_file = tmp_path / f"{name}.json"
+        snap_file.write_text(json.dumps(bundle["snapshot"], ensure_ascii=False), encoding="utf-8")
+        legacy_j = bundle["legacy_json"]
+        legacy_overview = bundle["legacy_card_overview"]
+
+        new_j = json.loads(
+            subprocess.check_output(
+                [sys.executable, str(TRACKER_PATH), "--input-json", str(snap_file), "--json"],
+                text=True,
+                env=env,
+            )
+        )
+        new_c = json.loads(
+            subprocess.check_output(
+                [sys.executable, str(TRACKER_PATH), "--input-json", str(snap_file), "--dry-run"],
+                text=True,
+                env=env,
+            )
+        )
+
+        for field in strict_fields:
+            assert new_j[field] == legacy_j[field], (
+                f"[{name}] {field} mismatch: new={new_j[field]!r} vs legacy={legacy_j[field]!r}"
+            )
+        assert sum((m.get("reference_cost_usd") or 0.0) for m in new_j["unpriced_models"]) == sum(
+            (m.get("reference_cost_usd") or 0.0) for m in legacy_j["unpriced_models"]
+        )
+        assert new_c["body"]["elements"][0]["content"] == legacy_overview, f"[{name}] overview card mismatch"
+
+        if name == "case1_5k_plus_3cr":
+            assert new_j["local_stats"]["cost"] == 0.015
+            assert new_j["dalton_stats"]["cost"] == 0.015
+            assert new_j["total_cost"] == 0.03
+        elif name == "case2_single_5k":
+            assert "$0.01" in json.dumps(new_c, ensure_ascii=False)
+        elif name == "case3_full_multisource":
+            assert len(new_j["top10"] + new_j["tail"]) < len(legacy_j["top10"] + legacy_j["tail"])
+            by_m = {r["model"]: r for r in new_j["top10"] + new_j["tail"]}
+            assert "Gemini 4 Neon" in by_m
+            assert "Claude Opus 5.5 (Antigravity)" in by_m
+            assert "claude-opus-5-5-oauth" in by_m
+            assert "GPT-OSS 120B (Antigravity)" in by_m
+
+
+def test_r4_card_series_and_effort_breakdown_usd_are_strictly_self_consistent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Round 3 Decision #2: old (origin/dalton/main) vs new --json totals, subtotals & card USD are strictly ==."""
-    import os
+    """Round 4 Item #1: displayed card USD for effort buckets MUST sum strictly to the displayed series USD."""
+    from decimal import Decimal
+    import re
     import sqlite3
-    import subprocess
 
     monkeypatch.syspath_prepend(str(SKILL_SCRIPTS_DIR))
     import model_usage_cost_cli as cli
     import usage_sources
     from test_usage_accounting import pb
 
-    # Load baseline tracker from origin/dalton/main (or HEAD fallback)
-    ref = "origin/dalton/main"
-    chk = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "cat-file", "-e", f"{ref}:scripts/dalton/data_assets/scripts/token_weekly_usage_tracker.py"],
-        capture_output=True,
-        check=False,
-    )
-    if chk.returncode != 0:
-        ref = "HEAD"
-    old_src = subprocess.check_output(
-        ["git", "-C", str(REPO_ROOT), "show", f"{ref}:scripts/dalton/data_assets/scripts/token_weekly_usage_tracker.py"],
-        text=True,
-    )
-    old_tracker = tmp_path / "old_tracker.py"
-    old_tracker.write_text(old_src, encoding="utf-8")
-    env = dict(os.environ, OPENCLAW_WORKSPACE=str(REPO_ROOT / "scripts/dalton/data_assets"))
-
-    def run_pair(snapshot: dict, name: str) -> tuple[dict, dict, dict, dict]:
-        snap_file = tmp_path / f"{name}.json"
-        snap_file.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
-        old_j = json.loads(
-            subprocess.check_output([sys.executable, str(old_tracker), "--input-json", str(snap_file), "--json"], text=True, env=env)
-        )
-        new_j = json.loads(
-            subprocess.check_output([sys.executable, str(TRACKER_PATH), "--input-json", str(snap_file), "--json"], text=True, env=env)
-        )
-        old_c = json.loads(
-            subprocess.check_output([sys.executable, str(old_tracker), "--input-json", str(snap_file), "--dry-run"], text=True, env=env)
-        )
-        new_c = json.loads(
-            subprocess.check_output([sys.executable, str(TRACKER_PATH), "--input-json", str(snap_file), "--dry-run"], text=True, env=env)
-        )
-        # Strict == parity across EVERY aggregate and source-subtotal field
-        for field in (
-            "total_tokens",
-            "total_fresh",
-            "total_cw",
-            "total_cr",
-            "total_out",
-            "total_prompt",
-            "total_records",
-            "total_calls",
-            "total_cost",
-            "unpriced_tokens",
-            "cache_hit_rate",
-            "local_stats",
-            "dalton_stats",
-        ):
-            assert new_j[field] == old_j[field], f"[{name}] {field} mismatch: new={new_j[field]!r} vs old={old_j[field]!r}"
-        # Overview markdown (local/dalton/total lines with formatted USD) must match character-for-character
-        assert new_c["body"]["elements"][0]["content"] == old_c["body"]["elements"][0]["content"], f"[{name}] overview card mismatch"
-        return old_j, new_j, old_c, new_c
-
+    tracker = _load_tracker()
     until_ts = datetime(2026, 11, 21, 4, 0, tzinfo=timezone.utc).timestamp()
     since_ts = until_ts - 7 * 86400
 
-    def make_db(path: Path, model_bytes: bytes, m_code: int, fresh: int, cr: int, out: int, ts_val: float, resp_id: bytes) -> None:
-        c = sqlite3.connect(path)
+    def parse_cents(usd_str: str) -> int:
+        return int((Decimal(usd_str.lstrip("$").replace(",", "")) * 100).to_integral_exact())
+
+    def assert_card_series_breakdown_consistent(card: dict, expected_series_usd: str | None = None) -> None:
+        checked = 0
+        for el in card["body"]["elements"]:
+            if el.get("tag") == "markdown":
+                content = el.get("content", "")
+                if "· 档位明细:" in content:
+                    checked += 1
+                    series_m = re.search(r"· 参考成本: (\$[0-9,]+\.\d{2})", content)
+                    assert series_m is not None, f"Missing series USD in: {content}"
+                    series_usd = series_m.group(1)
+                    if expected_series_usd is not None:
+                        assert series_usd == expected_series_usd, f"Expected {expected_series_usd}, got {series_usd}"
+                    bd_line = content.split("· 档位明细:", 1)[1]
+                    bucket_usds = re.findall(r"(\$[0-9,]+\.\d{2})", bd_line)
+                    assert bucket_usds, f"No bucket USDs in: {bd_line}"
+                    assert sum(parse_cents(u) for u in bucket_usds) == parse_cents(series_usd), (
+                        f"Card mismatch: series={series_usd} vs buckets={bucket_usds} in {content}"
+                    )
+        assert checked > 0
+
+    # Part A: Exact Codex R3 repro via real SQLite agy-db -> scan_agy -> reconcile -> window_result -> tracker -> card
+    # Local Neon high: 5,000 fresh + 2 cache_read ($0.0150003); medium: 1 cache_read ($0.00000015); low: 0 fresh + 1 cr ($0.00000015 -> wait: 2 other tiers)
+    def make_db(name: str, model_b: bytes, m_code: int, fresh: int, cr: int, ts_val: float, resp_b: bytes) -> str:
+        p = tmp_path / name
+        c = sqlite3.connect(p)
         c.execute("CREATE TABLE steps(idx INTEGER, metadata BLOB)")
         c.execute("CREATE TABLE gen_metadata(data BLOB)")
-        meta = pb([(19, model_bytes), (20, pb([(1, b"model_enum"), (2, f"MODEL_PLACEHOLDER_M{m_code}".encode())]))])
+        meta = pb([(19, model_b), (20, pb([(1, b"model_enum"), (2, f"MODEL_PLACEHOLDER_M{m_code}".encode())]))])
         c.execute("INSERT INTO gen_metadata VALUES (?)", (pb([(1, meta)]),))
-        usage = pb([(1, 1000 + m_code), (2, fresh), (3, out), (5, cr), (11, resp_id)])
+        usage = pb([(1, 1000 + m_code), (2, fresh), (3, 0), (5, cr), (11, resp_b)])
         c.execute("INSERT INTO steps VALUES (1, ?)", (pb([(8, pb([(1, int(ts_val))])), (9, usage)]),))
         c.commit()
         c.close()
+        return str(p)
 
-    # Case 1: Codex R2 repro — local & prod each have Neon 5,000 fresh + 3 cache_read ($0.015 + $0.015 = $0.03)
-    db_5k = tmp_path / "neon_5k.db"
-    make_db(db_5k, b"gemini-4-neon-high", 420, 5_000, 3, 0, until_ts - 300, b"r-5k")
-    e1 = usage_sources.Evidence(since_ts, until_ts)
-    roots1 = {k: [] for k in usage_sources.ROOTS}
-    roots1["agy-db"] = [str(db_5k)]
-    with patch.object(usage_sources, "ROOTS", roots1):
-        usage_sources.scan_agy(e1)
-    e1.put(
-        "dalton-prod", "dp-5k", until_ts - 200, "google", "gemini-4-neon-high-oauth", usage_sources.DALTON_PROD_CHANNEL,
-        (5_000, 0, 3, 0), unit="model-invocation", calls=1, runs=1, window_days=7, dalton_prod=True, strip_oauth=True,
-    )
-    snap1 = _build_cli_snapshot(cli, usage_sources, e1, until_ts, days=7)
-    snap1["antigravity_series"] = usage_sources.load_antigravity_series_catalog()
-    snap1["dalton_prod"] = {"ok": True, "error": None, "runs": 1, "calls": 1, "models": 1}
-    snap1["collector_status"] = {"ok": True, "fresh": True}
-    _, new1, _, _ = run_pair(snap1, "case1_5k_plus_3cr")
-    assert new1["local_stats"]["cost"] == 0.015
-    assert new1["dalton_stats"]["cost"] == 0.015
-    assert new1["total_cost"] == 0.03
+    # Case A1: 5,000 fresh + 2 cr (high) + 1 cr (medium) -> total $0.01500045 -> row $0.015 -> card series $0.01, high $0.01, medium $0.00
+    e_a1 = usage_sources.Evidence(since_ts, until_ts)
+    roots_a1 = {k: [] for k in usage_sources.ROOTS}
+    roots_a1["agy-db"] = [
+        make_db("a1_hi.db", b"gemini-4-neon-high", 420, 5_000, 2, until_ts - 300, b"a1-hi"),
+        make_db("a1_med.db", b"gemini-4-neon-medium", 421, 0, 1, until_ts - 200, b"a1-med"),
+    ]
+    with patch.object(usage_sources, "ROOTS", roots_a1):
+        usage_sources.scan_agy(e_a1)
+    snap_a1 = _build_cli_snapshot(cli, usage_sources, e_a1, until_ts, days=7)
+    snap_a1["antigravity_series"] = usage_sources.load_antigravity_series_catalog()
+    snap_a1["dalton_prod"] = {"ok": True, "error": None, "runs": 0, "calls": 0, "models": 0}
+    snap_a1["collector_status"] = {"ok": True, "fresh": True}
+    stats_a1 = tracker.process_usage_stats(snap_a1)
+    card_a1 = tracker.build_card(stats_a1)
+    assert_card_series_breakdown_consistent(card_a1, expected_series_usd="$0.01")
+    card_a1_text = json.dumps(card_a1, ensure_ascii=False)
+    assert "high 5.0K (1 次, $0.01)" in card_a1_text
+    assert "medium 1 (1 次, $0.00)" in card_a1_text
+    assert "$0.02" not in card_a1_text
 
-    # Case 2: Single-row 5,000 fresh ($0.015 -> card "$0.01", exact match to origin/dalton/main)
-    e2 = usage_sources.Evidence(since_ts, until_ts)
-    e2.put(
-        "dalton-prod", "dp-single-5k", until_ts - 200, "google", "gemini-4-neon-high-oauth", usage_sources.DALTON_PROD_CHANNEL,
-        (5_000, 0, 0, 0), unit="model-invocation", calls=1, runs=1, window_days=7, dalton_prod=True, strip_oauth=True,
-    )
-    snap2 = _build_cli_snapshot(cli, usage_sources, e2, until_ts, days=7)
-    snap2["antigravity_series"] = usage_sources.load_antigravity_series_catalog()
-    snap2["dalton_prod"] = {"ok": True, "error": None, "runs": 1, "calls": 1, "models": 1}
-    snap2["collector_status"] = {"ok": True, "fresh": True}
-    _, _, old_c2, new_c2 = run_pair(snap2, "case2_single_5k")
-    assert "$0.01" in json.dumps(new_c2, ensure_ascii=False)
-    assert "$0.01" in json.dumps(old_c2, ensure_ascii=False)
+    # Case A2: high 5,000 fresh + 2 other tiers (medium 1 cr + low 1 cr -> total $0.0150003 -> row $0.015 -> card $0.01)
+    e_a2 = usage_sources.Evidence(since_ts, until_ts)
+    roots_a2 = {k: [] for k in usage_sources.ROOTS}
+    roots_a2["agy-db"] = [
+        make_db("a2_hi.db", b"gemini-4-neon-high", 420, 5_000, 0, until_ts - 300, b"a2-hi"),
+        make_db("a2_med.db", b"gemini-4-neon-medium", 421, 0, 1, until_ts - 200, b"a2-med"),
+        make_db("a2_lo.db", b"gemini-4-neon-low", 422, 0, 1, until_ts - 100, b"a2-lo"),
+    ]
+    with patch.object(usage_sources, "ROOTS", roots_a2):
+        usage_sources.scan_agy(e_a2)
+    snap_a2 = _build_cli_snapshot(cli, usage_sources, e_a2, until_ts, days=7)
+    snap_a2["antigravity_series"] = usage_sources.load_antigravity_series_catalog()
+    snap_a2["dalton_prod"] = {"ok": True, "error": None, "runs": 0, "calls": 0, "models": 0}
+    snap_a2["collector_status"] = {"ok": True, "fresh": True}
+    card_a2 = tracker.build_card(tracker.process_usage_stats(snap_a2))
+    assert_card_series_breakdown_consistent(card_a2, expected_series_usd="$0.01")
 
-    # Case 3: Codex R1 repro — $0.075 + $0.06 + $0.03 Neon rows + local 10+10+60000 cache_read ($0.009003)
-    # + multi-source + multi-effort + unpriced/reference_only models
-    db_hi = tmp_path / "neon_hi.db"
-    db_med = tmp_path / "neon_med.db"
-    db_lo = tmp_path / "neon_lo.db"
-    db_arg = tmp_path / "argon_u.db"
-    make_db(db_hi, b"gemini-4-neon-high", 420, 0, 10, 0, until_ts - 500, b"r-hi")
-    make_db(db_med, b"gemini-4-neon-medium", 421, 0, 10, 0, until_ts - 400, b"r-med")
-    make_db(db_lo, b"gemini-4-neon-low", 422, 0, 60_000, 0, until_ts - 300, b"r-lo")
-    make_db(db_arg, b"gemini-4-argon", 417, 100_000, 50_000, 10_000, until_ts - 250, b"r-arg")
-
-    e3 = usage_sources.Evidence(since_ts, until_ts)
-    roots3 = {k: [] for k in usage_sources.ROOTS}
-    roots3["agy-db"] = [str(db_hi), str(db_med), str(db_lo), str(db_arg)]
-    with patch.object(usage_sources, "ROOTS", roots3):
-        usage_sources.scan_agy(e3)
-    e3.put("claude", "cl1", until_ts - 240, "anthropic", "claude-opus-5-5", "claude-code(手动)", (80_000, 10_000, 300_000, 15_000), unit="model-response")
-    e3.put("muse", "mu1", until_ts - 230, "muse-cli-gateway", "muse-wonder-full-1.0", "muse-cli(手动)", (100_000, 0, 50_000, 10_000), unit="model-response")
-    for idx, (model, calls, runs, v) in enumerate([
-        ("gemini-4-neon-high-oauth", 10, 4, (25_000, 0, 0, 0)),
-        ("gemini-4-neon-medium-oauth", 8, 3, (20_000, 0, 0, 0)),
-        ("gemini-4-neon-low-oauth", 5, 2, (10_000, 0, 0, 0)),
-        ("claude-opus-5-5-low-oauth", 20, 6, (100_000, 0, 200_000, 15_000)),
-        ("claude-opus-5-5-medium-oauth", 40, 12, (200_000, 0, 500_000, 30_000)),
-        ("claude-opus-5-5-high-oauth", 60, 18, (300_000, 0, 700_000, 45_000)),
-        ("claude-opus-5-5-oauth", 300, 80, (1_500_000, 0, 6_000_000, 200_000)),
-        ("gpt-oss-120b-medium-oauth", 12, 4, (50_000, 0, 10_000, 5_000)),
-    ]):
-        e3.put(
-            "dalton-prod", f"dp3:{idx}", until_ts - 100 - idx, usage_sources.infer_dalton_provider(model), model,
-            usage_sources.DALTON_PROD_CHANNEL, v, unit="model-invocation", calls=calls, runs=runs, window_days=7,
-            dalton_prod=True, strip_oauth=True,
-        )
-    snap3 = _build_cli_snapshot(cli, usage_sources, e3, until_ts, days=7)
-    snap3["antigravity_series"] = usage_sources.load_antigravity_series_catalog()
-    snap3["dalton_prod"] = {"ok": True, "error": None, "runs": 129, "calls": 455, "models": 8}
-    snap3["collector_status"] = {"ok": True, "fresh": True}
-    old3, new3, _, _ = run_pair(snap3, "case3_full_multisource")
-    assert sum((m.get("reference_cost_usd") or 0.0) for m in new3["unpriced_models"]) == sum(
-        (m.get("reference_cost_usd") or 0.0) for m in old3["unpriced_models"]
-    )
-    # Verify series rows collapsed while totals remained strictly identical
-    assert len(new3["top10"] + new3["tail"]) < len(old3["top10"] + old3["tail"])
-    by_m3 = {r["model"]: r for r in new3["top10"] + new3["tail"]}
-    assert "Gemini 4 Neon" in by_m3
-    assert "Claude Opus 5.5 (Antigravity)" in by_m3
-    assert "claude-opus-5-5-oauth" in by_m3
-    assert "GPT-OSS 120B (Antigravity)" in by_m3
+    # Part B: Sub-cent carry cases across multiple Dalton prod tiers (3x$0.004=$0.012->$0.01; 2x$0.014=$0.028->$0.03; $0.075+$0.06+$0.03=$0.165->$0.16)
+    series_cat = usage_sources.load_antigravity_series_catalog()
+    for label, tier_costs, expected_disp in (
+        ("three_x_004", [("high", 0.004), ("medium", 0.004), ("low", 0.004)], "$0.01"),
+        ("two_x_014", [("high", 0.014), ("medium", 0.014)], "$0.03"),
+        ("half_cent_165", [("high", 0.075), ("medium", 0.06), ("low", 0.03)], "$0.16"),
+    ):
+        rows = [
+            {
+                "source": "Dalton 生产（订阅）",
+                "provider": "google",
+                "model": f"gemini-4-neon-{eff}-oauth",
+                "dalton_prod": True,
+                "records": 1,
+                "calls": 1,
+                "runs": 1,
+                "fresh": 1000 * (idx + 1),
+                "cache_write": 0,
+                "cache_read": 0,
+                "output": 0,
+                "cost_usd": c_val,
+            }
+            for idx, (eff, c_val) in enumerate(tier_costs)
+        ]
+        snap_b = {
+            "ok": True,
+            "version": "3.1.0",
+            "price_catalog": {"generated": "2026-11-14", "effective_notes": []},
+            "antigravity_series": series_cat,
+            "dalton_prod": {"ok": True, "error": None, "runs": len(rows), "calls": len(rows), "models": len(rows)},
+            "collector_status": {"ok": True, "fresh": True},
+            "windows": [
+                {
+                    "days": 7.0,
+                    "from": "2026-11-14T04:00:00+00:00",
+                    "to": "2026-11-21T04:00:00+00:00",
+                    "row_count": len(rows),
+                    "rows": rows,
+                    "totals": {
+                        "tokens": sum(r["fresh"] for r in rows),
+                        "records": len(rows),
+                        "calls": len(rows),
+                        "priced_cost_usd": round(sum(c for _, c in tier_costs), 6),
+                        "unpriced_tokens": 0,
+                    },
+                }
+            ],
+        }
+        card_b = tracker.build_card(tracker.process_usage_stats(snap_b))
+        assert_card_series_breakdown_consistent(card_b, expected_series_usd=expected_disp)
 
 
 def test_r2_tracker_loads_only_sibling_usage_sources_and_rejects_version_mismatch(

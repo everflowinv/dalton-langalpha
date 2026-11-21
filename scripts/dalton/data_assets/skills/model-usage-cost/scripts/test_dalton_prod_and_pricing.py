@@ -636,6 +636,49 @@ class TestDaltonProdAndPricing(unittest.TestCase):
         self.assertEqual(by_id["agy:resp-1999-b"]["model"], "agy-enum-1999")
         self.assertIsNone(by_id["agy:resp-1999-b"]["meta"].get("effort"))
 
+    def test_window_result_allocates_effort_breakdown_micro_usd_to_match_row_cost_usd(self):
+        import sqlite3
+        from test_usage_accounting import pb
+
+        now = dt.datetime(2026, 11, 20, 12, 0, tzinfo=s.UTC).timestamp()
+
+        def make_db(name, model_b, m_code, fresh, cr, ts_val, resp_b):
+            p = self.tmp / name
+            c = sqlite3.connect(p)
+            c.execute("CREATE TABLE steps(idx INTEGER, metadata BLOB)")
+            c.execute("CREATE TABLE gen_metadata(data BLOB)")
+            meta = pb([(19, model_b), (20, pb([(1, b"model_enum"), (2, f"MODEL_PLACEHOLDER_M{m_code}".encode())]))])
+            c.execute("INSERT INTO gen_metadata VALUES (?)", (pb([(1, meta)]),))
+            usage = pb([(1, 1000 + m_code), (2, fresh), (3, 0), (5, cr), (11, resp_b)])
+            c.execute("INSERT INTO steps VALUES (1, ?)", (pb([(8, pb([(1, int(ts_val))])), (9, usage)]),))
+            c.commit()
+            c.close()
+            return str(p)
+
+        # Codex R3 repro: high has 5,000 fresh + 2 cache_read ($0.0150003), medium has 1 cache_read ($0.00000015).
+        # Row cost rounds to $0.015; effort buckets must sum to $0.015 exactly (high=$0.015, medium=$0.0).
+        roots = {k: [] for k in s.ROOTS}
+        roots["agy-db"] = [
+            make_db("r3_hi.db", b"gemini-4-neon-high", 420, 5_000, 2, now - 200, b"r3-hi"),
+            make_db("r3_med.db", b"gemini-4-neon-medium", 421, 0, 1, now - 100, b"r3-med"),
+        ]
+        e = s.Evidence(now - 86400, now)
+        with patch.object(s, "ROOTS", roots):
+            s.scan_agy(e)
+        records, held = s.reconcile(e)
+        self.assertEqual(held, [])
+        w = cli.window_result(records, now, 1, cli.load_prices(), by_model=True)
+        self.assertEqual(len(w["rows"]), 1)
+        row = w["rows"][0]
+        self.assertEqual(row["cost_usd"], 0.015)
+        bd = row["effort_breakdown"]
+        self.assertEqual(bd["high"]["cost_usd"], 0.015)
+        self.assertEqual(bd["medium"]["cost_usd"], 0.0)
+        self.assertEqual(
+            sum(round(b["cost_usd"] * 1_000_000) for b in bd.values()),
+            round(row["cost_usd"] * 1_000_000),
+        )
+
     def test_summary_json_includes_antigravity_series_from_dalton_prod_or_fallback(self):
         fake_home = self.tmp / "series-home"
         fake_home.mkdir()
