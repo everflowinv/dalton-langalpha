@@ -173,32 +173,36 @@ async def require_target_ownership(
             ws_row = await get_workspace(str(workspace_id), conn=conn)
             ws_owner = str((ws_row or {}).get("user_id") or "").strip()
             # DALTON-HOOK(coverage-units): fast path for workspace owner; relax cross-user only when units & auth enabled
-            if ws_row is not None and ws_owner == str(user_id or "").strip():
-                require_workspace_owner(ws_row, user_id=user_id)
-            else:
-                from src.dalton.settings import (
-                    is_coverage_units_enabled,
-                    is_dalton_supabase_auth_enabled,
-                )
+            from src.dalton.settings import (
+                is_coverage_units_enabled,
+                is_dalton_supabase_auth_enabled,
+            )
+
+            colleague_write = (
+                ws_row is not None
+                and ws_owner != str(user_id or "").strip()
+                and is_coverage_units_enabled()
+                and is_dalton_supabase_auth_enabled()
+            )
+            if colleague_write:
                 from src.dalton.sharing import (
                     ColleagueAccessRevokedError,
                     require_workspace_access,
                 )
 
-                if is_coverage_units_enabled() and is_dalton_supabase_auth_enabled():
-                    try:
-                        await require_workspace_access(
-                            str(workspace_id),
-                            user_id,
-                            channel="web",
-                            need="write",
-                            workspace=ws_row,
-                            conn=conn,
-                        )
-                    except ColleagueAccessRevokedError as exc:
-                        raise HTTPException(status_code=403, detail=str(exc)) from exc
-                else:
-                    require_workspace_owner(ws_row, user_id=user_id)
+                try:
+                    await require_workspace_access(
+                        str(workspace_id),
+                        user_id,
+                        channel="web",
+                        need="write",
+                        workspace=ws_row,
+                        conn=conn,
+                    )
+                except ColleagueAccessRevokedError as exc:
+                    raise HTTPException(status_code=403, detail=str(exc)) from exc
+            else:
+                require_workspace_owner(ws_row, user_id=user_id)
         except HTTPException as exc:
             raise TargetRefused(exc, field="workspace_id") from None
     if conversation_thread_id:
