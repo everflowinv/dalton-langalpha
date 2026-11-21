@@ -19,7 +19,7 @@ from langchain_anthropic import ChatAnthropic
 from src.dalton.llm.providers.antigravity import ChatAntigravity
 from src.dalton.llm.providers.muse.client import ChatMuseOpenAI
 from src.dalton.llm.providers.xai_grok.client import ChatGrokOpenAI
-from src.llms.operator_channel import carries_tool_changes, carries_turn_scoped
+from src.llms.operator_channel import carries_tool_changes
 
 
 def test_antigravity_muse_and_grok_never_carry_claude_only_fields():
@@ -31,7 +31,6 @@ def test_antigravity_muse_and_grok_never_carry_claude_only_fields():
     for client in clients:
         assert not isinstance(client, ChatAnthropic)
         assert carries_tool_changes(client) is False
-        assert carries_turn_scoped(client) is False
 
 
 def test_anthropic_compatible_host_never_carries_claude_only_fields():
@@ -39,7 +38,6 @@ def test_anthropic_compatible_host_never_carries_claude_only_fields():
     compat = ChatAnthropic(model="claude-x", api_key="k", base_url="https://api.deepseek.com/anthropic")
     assert isinstance(compat, ChatAnthropic)
     assert carries_tool_changes(compat) is False
-    assert carries_turn_scoped(compat) is False
 
 
 def test_the_gates_ask_the_client_not_its_name():
@@ -48,4 +46,3 @@ def test_the_gates_ask_the_client_not_its_name():
     name, so a Dalton line named like a Claude model cannot slip through."""
     other_sdk = create_autospec(ChatGrokOpenAI, instance=True)
     assert carries_tool_changes(other_sdk) is False
-    assert carries_turn_scoped(other_sdk) is False
