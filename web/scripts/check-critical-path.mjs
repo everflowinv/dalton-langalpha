@@ -44,7 +44,8 @@ const EXPECTED = ['index', 'rolldown-runtime', 'vendor-react']
 // Upstream moved its own ceiling 505 -> 533 by sync7 (bf56add19); the Dalton figure is
 // re-measured on the sync7 production build before release.
 // #435 的团队模型判断已移出首屏，回落到 560
-const MAX_EAGER_KB = 560
+// #457 在 zh-CN 文案目录（首屏必载）加了投递状态文案，生产构建实测 560.1 kB，上调到 562
+const MAX_EAGER_KB = 562
 
 const outDir = process.argv[2] || 'dist'
 const indexPath = join(outDir, 'index.html')
