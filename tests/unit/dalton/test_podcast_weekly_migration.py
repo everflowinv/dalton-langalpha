@@ -20,6 +20,27 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
+@pytest.fixture
+def frozen_hk_now(monkeypatch: pytest.MonkeyPatch):
+    """Pin the store's clock to 2026-11-15 12:00 HK.
+
+    These tests hard-code report weeks (2026-11-15, then 2026-11-22). The store stamps
+    ``reported_at`` with the real clock, so on the real HK date 2026-11-22 a report made
+    "last week" read as already made today and the empty week turned into nothing_to_report.
+    """
+    from datetime import datetime as _dt
+
+    from src.dalton import podcast_weekly_store as store
+
+    class _Frozen(_dt):
+        @classmethod
+        def now(cls, tz=None):
+            fixed = _dt(2026, 11, 15, 12, 0, 0, tzinfo=store.HK_TZ)
+            return fixed.astimezone(tz) if tz is not None else fixed.replace(tzinfo=None)
+
+    monkeypatch.setattr(store, "datetime", _Frozen)
+
+
 from src.dalton.app.internal_llm_router import (
     get_allowed_host_oauth_models,
     internal_llm_router,
@@ -916,6 +937,7 @@ def test_run_sh_uses_skill_venv_even_when_dalton_python_bin_set(tmp_path: Path) 
 async def test_backend_podcast_weekly_tools_auth_path_guard_and_resumable_docs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    frozen_hk_now,
 ) -> None:
     from src.dalton import podcast_weekly_store as store
     from src.dalton.tools import build_dalton_tools
@@ -1575,6 +1597,7 @@ def test_persisted_manifest_overrides_stale_doc_total_parts_and_drops_extra_part
 
 def test_recovery_from_prior_failure_sets_recovered_flag_and_never_overwrites_timestamps(
     tmp_path: Path,
+    frozen_hk_now,
 ) -> None:
     """Failed episodes recorded via mark_reported trigger recovered=True once published and preserve prior timestamps."""
     from src.dalton import podcast_weekly_store as store
@@ -1817,7 +1840,7 @@ def test_skipped_episode_in_step3_allows_submitting_published_and_retries_next_r
     assert st_next["report_success"] == []
 
 
-def test_podcast_publish_cli_mark_reported_and_empty_week_subcommands(tmp_path: Path) -> None:
+def test_podcast_publish_cli_mark_reported_and_empty_week_subcommands(tmp_path: Path, frozen_hk_now) -> None:
     """podcast_publish.py mark-reported handles both episode IDs and --empty-date cleanly end-to-end."""
     from src.dalton import podcast_weekly_store as store
 
