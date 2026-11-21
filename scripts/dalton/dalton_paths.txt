@@ -530,3 +530,4 @@ web/src/pages/Setup/answers/daltonTeamModelsCheck.ts
 web/src/pages/Setup/answers/useTeamModelsAvailable.ts
 # Execution delivery status frontend tests (completed + delivery failed / partial / retrying / delivered / none).
 web/src/pages/Automations/__tests__/Automations.executionDeliveryStatus.test.tsx
+web/src/pages/Setup/answers/__tests__/daltonTeamModelsCheck.test.ts

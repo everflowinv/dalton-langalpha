@@ -30,6 +30,7 @@ import { modelLabel, modelMatches } from '@/lib/modelLabel';
 // DALTON-HOOK(antigravity-series): wire seriesCatalog, missingLabel & Quick Access collapsing in Settings
 import {
   buildSelectableAntigravitySeries,
+  favoriteAntigravitySeriesVariants,
   formatAntigravityVariantLabel,
   indexSelectableSeries,
   inspectSavedAntigravityModel,
@@ -562,9 +563,13 @@ export function ModelsPanel() {
                         const matchesSeries = !query
                           || hit.displayName.toLowerCase().includes(query)
                           || hit.series.series_prefix.toLowerCase().includes(query)
-                          || Object.values(hit.series.variants).some((v) => modelMatches(v, query, modelMetadata));
+                          || Object.values(hit.series.variants).some(
+                            (v) => inspectSavedAntigravityModel(v, seriesOpts)?.series.series_id === sid
+                              && modelMatches(v, query, modelMetadata),
+                          );
                         if (!matchesSeries) continue;
-                        const favVariants = Object.values(hit.series.variants).filter((v) => favorites.models.includes(v));
+                        // DALTON-HOOK(antigravity-series): exclude same-name custom models when aggregating/removing Quick Access series favorites
+                        const favVariants = favoriteAntigravitySeriesVariants(hit.series, favorites.models, seriesOpts);
                         const isStarred = favVariants.length > 0;
                         rows.push({
                           key: sid,
