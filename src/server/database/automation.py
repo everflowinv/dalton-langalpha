@@ -67,57 +67,108 @@ def not_a_server_skip(alias: str) -> str:
     )
 
 
-def execution_computer_reach_sql(task_alias: str, thread_alias: str) -> str:
-    """SQL predicate matching an execution reachable from a computer token.
+def owned_execution_thread_join_sql(
+    exec_alias: str, task_alias: str, thread_alias: str = "t"
+) -> str:
+    """LEFT JOIN ``conversation_threads`` only when the thread sits in a
+    workspace owned by the automation's owner.
 
-    DALTON-HOOK(history-computer-scope): an execution belongs to ``computer_id``
-    when either its task's workspace or its conversation thread's workspace
-    belongs to that computer (excluding Home). Using a single ``EXISTS`` keeps
-    every matching execution row unique even when both workspaces sit on the
-    same computer, and falls back to the task workspace when the execution has
-    no thread (``thread_alias.workspace_id IS NULL``).
-
-    Caller binds ``(home_id, computer_id)``.
+    DALTON-HOOK(history-computer-scope): ``automation_executions.conversation_thread_id``
+    has no foreign key. If a run's thread was deleted and another account
+    reused that UUID in their own workspace, treat the execution as having no
+    thread so neither its ``workspace_id`` nor computer-scope reach leaks across
+    accounts.
     """
     return (
-        "EXISTS (SELECT 1 FROM workspaces execution_workspace"
-        " WHERE execution_workspace.workspace_id <> %s::uuid"
-        " AND execution_workspace.computer_id = %s::uuid"
-        f" AND (execution_workspace.workspace_id = {task_alias}.workspace_id"
-        f" OR execution_workspace.workspace_id = {thread_alias}.workspace_id))"
+        f"LEFT JOIN conversation_threads {thread_alias}\n"
+        f"    ON {thread_alias}.conversation_thread_id = {exec_alias}.conversation_thread_id\n"
+        "   AND EXISTS (\n"
+        "       SELECT 1 FROM workspaces thread_workspace\n"
+        f"       WHERE thread_workspace.workspace_id = {thread_alias}.workspace_id\n"
+        f"         AND thread_workspace.user_id = {task_alias}.user_id\n"
+        "   )"
+    )
+
+
+def target_computer_workspace_predicate_sql(ws_alias: str, owner_expr: str) -> str:
+    """SQL predicate matching caller-owned non-Home workspaces on a computer.
+
+    DALTON-HOOK(history-computer-scope): shared by both the split task/thread
+    execution history query and the detail/list ``last_execution`` probes so
+    both narrow by target computer workspaces first and enforce workspace
+    ownership. Caller binds ``(home_id, computer_id)``.
+    """
+    return (
+        f"{ws_alias}.workspace_id <> %s::uuid"
+        f" AND {ws_alias}.computer_id IS NOT NULL"
+        f" AND {ws_alias}.computer_id = %s::uuid"
+        f" AND {ws_alias}.user_id = {owner_expr}"
     )
 
 
 def _reached_execution_probe(outer: str, alias: str, predicate: str) -> str:
     """One last-run probe limited to the token computer before LIMIT.
 
-    Matches runs whose task workspace (``outer.workspace_id``) or thread
+    Matches runs whose task workspace (``outer.workspace_id``) or owned thread
     workspace (``reach_thread.workspace_id``) belongs to the token computer,
-    excluding Home. Runs with no thread belong by ``outer.workspace_id``.
+    excluding Home. Runs with no thread, a deleted thread, or an inaccessible
+    thread belong by ``outer.workspace_id``.
+
+    Splits task-side and thread-side reach without a cross-table ``OR``:
+    when ``outer.workspace_id`` itself sits on the token computer, every run
+    of ``outer`` belongs to that computer and a single index descent suffices;
+    otherwise the probe starts from the target computer's caller-owned
+    workspaces into ``conversation_threads`` and ``automation_executions``.
     """
     # DALTON-HOOK(company-automations): computer tokens read each last-run probe on that computer only
-    # DALTON-HOOK(history-computer-scope): match when either task or thread workspace belongs to computer_id
+    # DALTON-HOOK(history-computer-scope): split task-side and owned thread-side probes without cross-table OR
     narrowed = f" AND {predicate}" if predicate else ""
-    reach = execution_computer_reach_sql(outer, "reach_thread")
+    task_ws_pred = target_computer_workspace_predicate_sql("task_ws", f"{outer}.user_id")
+    thread_ws_pred = target_computer_workspace_predicate_sql("thread_ws", f"{outer}.user_id")
     return (
-        f"(SELECT {alias}.automation_execution_id\n"
-        f"                     FROM automation_executions {alias}\n"
-        f"                     LEFT JOIN conversation_threads reach_thread\n"
-        f"                       ON reach_thread.conversation_thread_id = {alias}.conversation_thread_id\n"
-        f"                     WHERE {alias}.automation_id = {outer}.automation_id"
+        f"CASE\n"
+        f"                         WHEN {outer}.workspace_id IS NOT NULL\n"
+        f"                          AND EXISTS (\n"
+        f"                              SELECT 1 FROM workspaces task_ws\n"
+        f"                              WHERE task_ws.workspace_id = {outer}.workspace_id\n"
+        f"                                AND {task_ws_pred}\n"
+        f"                          )\n"
+        f"                         THEN (\n"
+        f"                             SELECT {alias}.automation_execution_id\n"
+        f"                             FROM automation_executions {alias}\n"
+        f"                             WHERE {alias}.automation_id = {outer}.automation_id"
         f"{narrowed}\n"
-        f"                       AND {reach}\n"
-        f"                     ORDER BY {alias}.created_at DESC, {alias}.automation_execution_id DESC\n"
-        f"                     LIMIT 1)"
+        f"                             ORDER BY {alias}.created_at DESC, {alias}.automation_execution_id DESC\n"
+        f"                             LIMIT 1\n"
+        f"                         )\n"
+        f"                         ELSE (\n"
+        f"                             SELECT {alias}.automation_execution_id\n"
+        f"                             FROM workspaces thread_ws\n"
+        f"                             JOIN conversation_threads reach_thread\n"
+        f"                               ON reach_thread.workspace_id = thread_ws.workspace_id\n"
+        f"                             JOIN automation_executions {alias}\n"
+        f"                               ON {alias}.conversation_thread_id = reach_thread.conversation_thread_id\n"
+        f"                             WHERE {thread_ws_pred}\n"
+        f"                               AND {alias}.conversation_thread_id IS NOT NULL\n"
+        f"                               AND {alias}.automation_id = {outer}.automation_id"
+        f"{narrowed}\n"
+        f"                             ORDER BY {alias}.created_at DESC, {alias}.automation_execution_id DESC\n"
+        f"                             LIMIT 1\n"
+        f"                         )\n"
+        f"                     END"
     )
 
 
 def _last_execution_computer_params(
     user_id: str, computer_id: str
-) -> tuple[str, str, str, str, str, str]:
-    """Binds for the three probes, in unsettled, non-skip, newest order."""
+) -> tuple[str, ...]:
+    """Binds for the three probes, in unsettled, non-skip, newest order.
+
+    DALTON-HOOK(history-computer-scope): each probe binds ``(home_id, computer_id)``
+    once for its task-workspace check and once for its thread-workspace branch.
+    """
     home_id = get_home_workspace_id(user_id)
-    return (home_id, computer_id, home_id, computer_id, home_id, computer_id)
+    return (home_id, computer_id) * 6
 
 
 def _last_execution_join(outer: str, *, computer_id: Optional[str] = None) -> str:

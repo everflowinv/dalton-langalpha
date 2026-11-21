@@ -33,6 +33,8 @@ async def test_a_page_reads_one_row_past_itself(db, fetched, has_more):
     sql, params = db.execute.await_args.args
     assert "COUNT" not in sql.upper()
     assert "execution_workspace" not in sql
+    assert "matched_execution_ids" not in sql
+    assert "thread_workspace.user_id = a.user_id" in sql
     assert params[-2:] == (3, 4)
     assert sql.index("WHERE") < sql.index("LIMIT")
 
@@ -40,21 +42,41 @@ async def test_a_page_reads_one_row_past_itself(db, fetched, has_more):
 @pytest.mark.asyncio
 async def test_computer_token_filters_the_run_workspace_before_the_page(db):
     # DALTON-HOOK(company-automations): filter task and execution workspaces before pagination
-    # DALTON-HOOK(history-computer-scope): match when either task or thread workspace belongs to computer_id
+    # DALTON-HOOK(history-computer-scope): narrow by target computer workspaces via split task/thread UNION and verify thread owner
     db.fetchall.return_value = []
     home_id = get_home_workspace_id("user-1")
 
     await exec_db.list_executions("user-1", computer_id="comp-b", limit=2, offset=0)
 
     sql, params = db.execute.await_args.args
-    assert "execution_workspace.workspace_id <> %s::uuid" in sql
-    assert "execution_workspace.computer_id = %s::uuid" in sql
-    assert (
-        "execution_workspace.workspace_id = a.workspace_id"
-        " OR execution_workspace.workspace_id = t.workspace_id"
-    ) in sql
-    assert sql.index("execution_workspace") < sql.index("LIMIT")
-    assert params == ("user-1", home_id, "comp-b", 3, 0)
+    assert "WITH matched_execution_ids AS" in sql
+    assert "task_ws.workspace_id <> %s::uuid" in sql
+    assert "task_ws.computer_id IS NOT NULL" in sql
+    assert "task_ws.computer_id = %s::uuid" in sql
+    assert "task_ws.user_id = %s" in sql
+    assert "thread_ws.workspace_id <> %s::uuid" in sql
+    assert "thread_ws.computer_id IS NOT NULL" in sql
+    assert "thread_ws.computer_id = %s::uuid" in sql
+    assert "thread_ws.user_id = %s" in sql
+    assert "UNION" in sql
+    assert "e.conversation_thread_id IS NOT NULL" in sql
+    assert "thread_workspace.user_id = a.user_id" in sql
+    assert "OR execution_workspace.workspace_id" not in sql
+    assert sql.index("matched_execution_ids") < sql.index("paged_execution_ids")
+    assert params == (
+        home_id,
+        "comp-b",
+        "user-1",
+        "user-1",
+        3,
+        home_id,
+        "comp-b",
+        "user-1",
+        "user-1",
+        3,
+        3,
+        0,
+    )
 
 
 @pytest.mark.asyncio
