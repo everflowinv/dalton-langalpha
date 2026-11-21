@@ -48,7 +48,7 @@ from src.dalton.coverage.units import (
 )
 from src.dalton.database import plans as plans_db
 from src.dalton.database import watch as watch_db
-from src.dalton.settings import get_dalton_settings, is_coverage_units_enabled
+from src.dalton.settings import is_coverage_units_enabled
 
 logger = logging.getLogger(__name__)
 
