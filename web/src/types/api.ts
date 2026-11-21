@@ -211,6 +211,18 @@ export interface WorkspaceCreate {
   config?: Record<string, unknown>;
   /** The caller's live computer to put the folder on. Omitted means the primary. */
   computer_id?: string;
+  // DALTON-HOOK(workspace-dedup): allow overriding duplicate company workspace check on explicit confirm
+  allow_duplicate_company?: boolean;
+}
+
+// DALTON-HOOK(workspace-dedup): matched existing company workspace from 409 company_workspace_exists
+export interface DuplicateWorkspaceMatch {
+  workspace_id?: string | null;
+  workspace_name: string;
+  owner_name: string;
+  lead_analyst_name?: string | null;
+  ticker?: string | null;
+  can_read: boolean;
 }
 
 /** Count-quota status for one elevated capability. `limit === -1` means unlimited. */

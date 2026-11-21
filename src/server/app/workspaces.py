@@ -250,6 +250,36 @@ async def create_workspace(
             await cli_approval.workspace_create(http_request, principal, request)
             or computer_id
         )
+        # --- DALTON-HOOK(workspace-dedup): begin ---
+        if request.allow_duplicate_company:
+            logger.info(
+                "Skipping company workspace dedup check (allow_duplicate_company=True, user_id=%s, name=%r)",
+                x_user_id,
+                request.name,
+            )
+        else:
+            from src.dalton.coverage.dedup import find_existing_company_workspace
+
+            dup = None
+            try:
+                dup = await find_existing_company_workspace(x_user_id, request.name)
+            except Exception as exc:
+                logger.warning(
+                    "Company workspace dedup check failed for user %s (%r); proceeding: %s",
+                    x_user_id,
+                    request.name,
+                    exc,
+                )
+            if dup is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "company_workspace_exists",
+                        "message": dup.message,
+                        "matches": dup.matches_payload(),
+                    },
+                )
+        # --- DALTON-HOOK(workspace-dedup): end ---
         manager = WorkspaceManager.get_instance()
         with computer_cause("create"):
             workspace = await manager.create_workspace(

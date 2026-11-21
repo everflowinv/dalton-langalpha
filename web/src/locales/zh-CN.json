@@ -1833,6 +1833,13 @@
     "filesUploaded": "已上传 {{count}} 个文件",
     "filesFailed": "· {{count}} 个失败",
     "openWorkspace": "打开工作区",
+    "duplicateCompany": {
+      "openWorkspace": "打开该工作区",
+      "askOwnerShare": "请所有者开放共享",
+      "createAnyway": "仍然新建",
+      "ownerLabel": "所有者 {{owner}}",
+      "leadLabel": "主分析师 {{lead}}"
+    },
     "fileTooLarge": "{{name}} 太大了（{{size}} MB），无法上传。",
     "cosWorksOn": "运行于",
     "cosComputerHint": "{{name}} 在你的默认计算机上工作，使用工作区旁的总控文件夹。将另一台计算机设为默认后，它会随之迁移。"

@@ -279,6 +279,8 @@ async def workspaces_create(
     description: str | None,
     tool_call_id: str,
     preapproved: bool = False,
+    # DALTON-HOOK(workspace-dedup): allow bypassing company dedup when user explicitly confirms
+    allow_duplicate_company: bool = False,
 ) -> Command:
     """Create a new workspace, once the user confirms unless ``preapproved``.
 
@@ -316,6 +318,36 @@ async def workspaces_create(
                     "instead of creating a duplicate"
                 )
             return decline_routing_command(declined, response, tool_call_id)
+
+    # --- DALTON-HOOK(workspace-dedup): begin ---
+    if allow_duplicate_company:
+        logger.info(
+            "Skipping company workspace dedup check (allow_duplicate_company=True, user_id=%s, name=%r)",
+            user_id,
+            name,
+        )
+    else:
+        from src.dalton.coverage.dedup import find_existing_company_workspace
+
+        dup = None
+        try:
+            dup = await find_existing_company_workspace(user_id, name)
+        except Exception as exc:
+            logger.warning(
+                "Company workspace dedup check failed for user %s (%r); proceeding: %s",
+                user_id,
+                name,
+                exc,
+            )
+        if dup is not None:
+            return error_command(
+                dup.message,
+                tool_call_id,
+                code="company_workspace_exists",
+                message=dup.message,
+                matches=dup.matches_payload(),
+            )
+    # --- DALTON-HOOK(workspace-dedup): end ---
 
     from src.server.database.workspace_names import (
         WorkspaceNameInvalid,

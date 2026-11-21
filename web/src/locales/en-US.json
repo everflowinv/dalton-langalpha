@@ -1788,6 +1788,13 @@
     "filesUploaded": "{{count}} file(s) uploaded",
     "filesFailed": "· {{count}} failed",
     "openWorkspace": "Open Workspace",
+    "duplicateCompany": {
+      "openWorkspace": "Open this workspace",
+      "askOwnerShare": "Ask the owner to share access",
+      "createAnyway": "Create anyway",
+      "ownerLabel": "Owner: {{owner}}",
+      "leadLabel": "Lead: {{lead}}"
+    },
     "fileTooLarge": "{{name}} is too large to upload ({{size}} MB).",
     "cosWorksOn": "Works on",
     "cosComputerHint": "{{name}} works on your primary computer, in its dedicated folder beside your workspaces. Make another computer primary and it moves there."

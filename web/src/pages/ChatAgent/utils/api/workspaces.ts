@@ -38,8 +38,16 @@ export async function createWorkspace(
   description: string = '',
   config: Record<string, unknown> = {},
   computerId?: string | null,
+  // DALTON-HOOK(workspace-dedup): optional override when user confirms creating anyway
+  allowDuplicateCompany?: boolean,
 ): Promise<Workspace> {
-  const body: WorkspaceCreate = { name, description, config, ...(computerId ? { computer_id: computerId } : {}) };
+  const body: WorkspaceCreate = {
+    name,
+    description,
+    config,
+    ...(computerId ? { computer_id: computerId } : {}),
+    ...(allowDuplicateCompany ? { allow_duplicate_company: true } : {}),
+  };
   const { data } = await api.post<Workspace>('/api/v1/workspaces', body);
   return data;
 }

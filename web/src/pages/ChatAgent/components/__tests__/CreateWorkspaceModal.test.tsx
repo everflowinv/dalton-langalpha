@@ -471,3 +471,92 @@ describe('CreateWorkspaceModal, a computer still being prepared', () => {
     expect(openComputersPanel).toHaveBeenCalledWith({ view: 'details', computerId: SECOND_ID });
   });
 });
+
+// DALTON-HOOK(workspace-dedup): duplicate company workspace refusal UX (open readable, ask owner, create anyway)
+describe('CreateWorkspaceModal, duplicate company workspace', () => {
+  it('offers "Open this workspace" for readable matches and navigates there on click', async () => {
+    const user = userEvent.setup();
+    const existingId = '99999999-9999-4999-8999-999999999999';
+    const onCreate = vi.fn().mockRejectedValue(
+      Object.assign(new Error('Request failed with status code 409'), {
+        response: {
+          status: 409,
+          data: {
+            detail: {
+              code: 'company_workspace_exists',
+              message: '「Anthropic」已有工作区「ANT」（所有者 Richard，主分析师 Richard），请直接在那里继续。确实要另建，请确认后重试。',
+              matches: [
+                {
+                  workspace_id: existingId,
+                  workspace_name: 'ANT',
+                  owner_name: 'Richard',
+                  lead_analyst_name: 'Richard',
+                  ticker: 'ANT',
+                  can_read: true,
+                },
+              ],
+            },
+          },
+        },
+      }),
+    );
+    const { onClose, onComplete } = setup(onCreate);
+
+    await user.type(screen.getByPlaceholderText(/name/i), 'Anthropic');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    const card = await screen.findByRole('alert');
+    expect(card).toHaveTextContent('ANT');
+    expect(card).toHaveTextContent('Richard');
+    expect(onComplete).not.toHaveBeenCalled();
+
+    await user.click(within(card).getByRole('button', { name: 'Open this workspace' }));
+    expect(onClose).toHaveBeenCalled();
+    expect(screen.getByTestId('path')).toHaveTextContent(`/chat/${existingId}`);
+  });
+
+  it('shows share notice for unreadable matches and resubmits with allowDuplicateCompany on "Create anyway"', async () => {
+    const user = userEvent.setup();
+    const onCreate = vi
+      .fn()
+      .mockRejectedValueOnce(
+        Object.assign(new Error('Request failed with status code 409'), {
+          response: {
+            status: 409,
+            data: {
+              detail: {
+                code: 'company_workspace_exists',
+                message: '「Anthropic」已有工作区「Anthropic」（所有者 CY），你目前没有访问权限，可以请 CY 开放共享。确实要另建，请确认后重试。',
+                matches: [
+                  {
+                    workspace_name: 'Anthropic',
+                    owner_name: 'CY',
+                    can_read: false,
+                  },
+                ],
+              },
+            },
+          },
+        }),
+      )
+      .mockResolvedValueOnce(LIVE_CREATED);
+    const { onComplete } = setup(onCreate);
+
+    await user.type(screen.getByPlaceholderText(/name/i), 'Anthropic');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    const card = await screen.findByRole('alert');
+    expect(card).toHaveTextContent('Ask the owner to share access');
+    expect(within(card).queryByRole('button', { name: 'Open this workspace' })).not.toBeInTheDocument();
+
+    await user.click(within(card).getByRole('button', { name: 'Create anyway' }));
+    await waitFor(() =>
+      expect(onCreate).toHaveBeenLastCalledWith({
+        name: 'Anthropic',
+        description: '',
+        allowDuplicateCompany: true,
+      }),
+    );
+    await waitFor(() => expect(onComplete).toHaveBeenCalledWith(LIVE_CREATED));
+  });
+});

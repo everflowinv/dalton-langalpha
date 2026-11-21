@@ -439,6 +439,8 @@ ALLOWED_HOOKS=(
   # on ToolMessage JSON parse and recursively replace non-finite floats with None
   # across request payloads (antigravity/client.py).
   "antigravity-json-nan"
+  # Company workspace deduplication before create (REST, manage_workspaces, web modal, CoS prompt).
+  "workspace-dedup"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

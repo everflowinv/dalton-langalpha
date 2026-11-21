@@ -64,6 +64,11 @@ class WorkspaceCreate(BaseModel):
             "primary computer when absent"
         ),
     )
+    # DALTON-HOOK(workspace-dedup): allow overriding company workspace dedup check when user confirms.
+    allow_duplicate_company: bool = Field(
+        False,
+        description="Skip company workspace deduplication check after user confirmation",
+    )
 
 
 class WorkspaceUpdate(BaseModel):

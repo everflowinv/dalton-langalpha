@@ -63,6 +63,8 @@ async def chief_of_staff_workspaces(
     content: str | None = None,
     dest_path: str | None = None,
     dest_workspace_id: str | None = None,
+    # DALTON-HOOK(workspace-dedup): override duplicate company workspace check only after explicit user confirmation
+    allow_duplicate_company: bool = False,
     tool_call_id: Annotated[str, InjectedToolCallId] = "",
 ) -> Command:
     """List the user's and colleagues' shared workspaces, create or delete the user's own workspace, or list/read/copy/write files in a workspace.
@@ -89,6 +91,7 @@ async def chief_of_staff_workspaces(
         content: Full UTF-8 text to write; required for "write_file" (requires "rw" access).
         dest_path: Where "copy_file" lands the file, relative to the destination's folder; default shared/<filename>.
         dest_workspace_id: Destination for "copy_file" other than Home; must be one of the user's own workspaces.
+        allow_duplicate_company: Only for "create" when the user explicitly confirms creating another workspace after a `company_workspace_exists` refusal; default False.
 
     Returns:
         One short row per workspace, with its id and its folder (dir_name); with more
@@ -111,6 +114,8 @@ async def chief_of_staff_workspaces(
         return await workspaces_create(
             user_id, name, description, tool_call_id,
             preapproved=preapproved(state, tool_call_id),
+            # DALTON-HOOK(workspace-dedup): pass explicit duplicate override flag
+            allow_duplicate_company=allow_duplicate_company,
         )
     if action == "delete":
         return await _workspaces_delete(user_id, workspace_id, tool_call_id)
