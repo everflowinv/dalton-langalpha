@@ -1,27 +1,17 @@
 import { useCallback, useMemo } from 'react';
 import { useQueries, useQueryClient } from '@tanstack/react-query';
-import { apiErrorStatus } from '@/api/errors';
 import { getProviderAvailableModels } from '@/api/model';
 import { isDaltonBuild } from '@/config/brand';
 import { hasAvailableDaltonModels } from '@/config/daltonSetup';
 import { useAllModels, type UseAllModelsResult } from '@/hooks/useAllModels';
 import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { queryKeys } from '@/lib/queryKeys';
+import { collectRejectedProviders, REJECTED_CREDENTIAL_REASONS } from './daltonTeamModelsCheck';
 
 const STALE_MS = 10 * 60_000;
+const EMPTY_PROVIDERS: readonly string[] = [];
 
-/**
- * Fallback reasons from `/api/v1/providers/{p}/available-models` where the
- * provider explicitly rejected the credential (401/403, revoked OAuth, or a
- * plan with no API access). Transient failures (`unreachable`, `bad_response`,
- * `refresh_unavailable`, etc.) are deliberately not listed so network blips do
- * not mark team models unavailable.
- */
-export const REJECTED_CREDENTIAL_REASONS: ReadonlySet<string> = new Set([
-  'unauthorized',
-  'needs_reauth',
-  'no_api_access',
-]);
+export { REJECTED_CREDENTIAL_REASONS };
 
 export interface DaltonTeamModelsState {
   /** True in Dalton builds when team credential sharing is active. */
@@ -53,7 +43,7 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
   const all = useAllModels();
 
   const shared = isDaltonBuild && isShared;
-  const listedProviders = all.listedProviders ?? [];
+  const listedProviders = all.listedProviders ?? EMPTY_PROVIDERS;
   const providerResults = useQueries({
     queries: (shared ? listedProviders : []).map((provider) => ({
       queryKey: queryKeys.providerModels.available(provider, ''),
@@ -64,42 +54,11 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
   });
   const listsLoading = shared && providerResults.some((r) => r.isLoading);
 
-  const rejectedSignature = shared
-    ? providerResults
-        .map((r, i) => {
-          const provider = listedProviders[i];
-          if (!provider) return '';
-          const fallbackRejected =
-            r.data?.status === 'fallback'
-            && typeof r.data.reason === 'string'
-            && REJECTED_CREDENTIAL_REASONS.has(r.data.reason);
-          const httpUnauthorized = apiErrorStatus(r.error) === 401;
-          return fallbackRejected || httpUnauthorized ? provider : '';
-        })
-        .filter(Boolean)
-        .join('\0')
-    : '';
-
   const keyCandidates = all.rawApiResponse?.key_candidates;
-  const rejectedProviders = useMemo<ReadonlySet<string>>(() => {
-    const out = new Set<string>();
-    if (!rejectedSignature) return out;
-    for (const p of rejectedSignature.split('\0')) {
-      if (p) out.add(p);
-    }
-    if (keyCandidates) {
-      const listedSet = new Set(listedProviders);
-      for (const [provider, candidates] of Object.entries(keyCandidates)) {
-        if (listedSet.has(provider)) continue;
-        const sharedHolders = candidates.shared ?? [];
-        const hasWorkingHolder = sharedHolders.some((h) => listedSet.has(h) && !out.has(h));
-        if (!hasWorkingHolder && sharedHolders.some((h) => out.has(h))) {
-          out.add(provider);
-        }
-      }
-    }
-    return out;
-  }, [rejectedSignature, listedProviders, keyCandidates]);
+  const rejectedProviders = useMemo<ReadonlySet<string>>(
+    () => (shared ? collectRejectedProviders(listedProviders, providerResults, keyCandidates) : new Set()),
+    [shared, listedProviders, providerResults, keyCandidates],
+  );
 
   const isLoading = isDaltonBuild && (callerTierPending || (shared && (all.isLoading || listsLoading)));
   const unread = shared && !all.isLoading && !listsLoading && all.unread;
@@ -125,7 +84,7 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
       queryClient.refetchQueries({ queryKey: queryKeys.oauth.all }),
       queryClient.refetchQueries({ queryKey: queryKeys.providerModels.all }),
       queryClient.refetchQueries({ queryKey: queryKeys.user.preferences() }),
-    ]);
+    ]).then(() => queryClient.invalidateQueries({ queryKey: [...queryKeys.dalton.all, 'team-models-available'] }));
   }, [queryClient]);
 
   return {
@@ -143,6 +102,7 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
 }
 
 const noopRetry = () => {};
+const EMPTY_REJECTED: ReadonlySet<string> = new Set();
 
 /**
  * Non-Dalton builds: team sharing never applies, so read neither auth nor the
@@ -159,6 +119,7 @@ function useInertTeamModels(): DaltonTeamModelsState {
     unread: false,
     canManage: true,
     callerTierPending: false,
+    rejectedProviders: EMPTY_REJECTED,
     retry: noopRetry,
     all,
   };
