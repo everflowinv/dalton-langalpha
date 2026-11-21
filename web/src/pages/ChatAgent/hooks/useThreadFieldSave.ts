@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from '@/components/ui/use-toast';
+// DALTON-HOOK(antigravity-series): gate chained extraUpdates rollback preservation to Dalton builds
+import { isDaltonBuild } from '@/config/brand';
 import { queryKeys } from '@/lib/queryKeys';
 import { threadFieldMutationKey, type ThreadField } from '@/lib/threadFieldMutations';
 import type { Thread } from '@/types/api';
@@ -91,6 +93,15 @@ export function useThreadFieldSave<F extends ThreadField>({
       const previous: Known<F> = cached ? { value: cached[field], ...(extraPrev ? { extra: extraPrev } : {}) } : null;
       if (queryClient.isMutating({ mutationKey: threadFieldMutationKey(id, field) }) === 1) {
         confirmedRef.current.set(id, previous);
+      } else if (isDaltonBuild && extraPrev && confirmedRef.current.has(id)) {
+        // DALTON-HOOK(antigravity-series): when a chained save introduces extraUpdates (e.g. Antigravity clearing reasoning_effort behind a non-Antigravity pick), preserve the pre-optimistic extra field value on confirmedRef
+        const existing = confirmedRef.current.get(id);
+        if (existing) {
+          confirmedRef.current.set(id, {
+            ...existing,
+            extra: { ...extraPrev, ...(existing.extra ?? {}) },
+          });
+        }
       }
       // A read in flight was asked before this save and would land over it.
       // It may carry other fields too, so it is asked again once the save
@@ -105,6 +116,7 @@ export function useThreadFieldSave<F extends ThreadField>({
       return { previous };
     },
     onSuccess: (saved, { threadId: id, value, extraUpdates }) => {
+      const priorExtra = isDaltonBuild ? confirmedRef.current.get(id)?.extra : undefined;
       const extraSaved: Partial<Thread> | undefined = saved && extraUpdates
         ? Object.fromEntries(
             Object.keys(extraUpdates).map((k) => [
@@ -113,7 +125,19 @@ export function useThreadFieldSave<F extends ThreadField>({
             ]),
           ) as Partial<Thread>
         : (extraUpdates as Partial<Thread> | undefined);
-      confirmedRef.current.set(id, { value: answered(saved, value), ...(extraSaved ? { extra: extraSaved } : {}) });
+      // DALTON-HOOK(antigravity-series): keep prior confirmed extra fields (refreshed from saved when present) across chained saves
+      const mergedExtra: Partial<Thread> | undefined = isDaltonBuild && priorExtra
+        ? {
+            ...Object.fromEntries(
+              Object.keys(priorExtra).map((k) => [
+                k,
+                saved && saved[k as keyof Thread] !== undefined ? saved[k as keyof Thread] : priorExtra[k as keyof Thread],
+              ]),
+            ) as Partial<Thread>,
+            ...(extraSaved ?? {}),
+          }
+        : extraSaved;
+      confirmedRef.current.set(id, { value: answered(saved, value), ...(mergedExtra ? { extra: mergedExtra } : {}) });
       if (saved) onSaved?.(saved);
     },
     onError: (_error, save, context) => {

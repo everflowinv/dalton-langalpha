@@ -15,6 +15,15 @@ import { renderHookWithProviders } from '@/test/utils';
 // Mocks – declared before any imports that depend on them
 // ---------------------------------------------------------------------------
 
+// DALTON-HOOK(antigravity-series): configurable Dalton build flag for compaction-queued activeTurnModel tests
+const brandMock = vi.hoisted(() => ({ isDaltonBuild: false }));
+vi.mock('@/config/brand', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/config/brand')>()),
+  get isDaltonBuild() {
+    return brandMock.isDaltonBuild;
+  },
+}));
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (k: string) => k }),
 }));
@@ -102,6 +111,8 @@ describe('useChatMessages – queued send during compaction', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockEmptyStream();
+    // DALTON-HOOK(antigravity-series): reset brand build flag between tests
+    brandMock.isDaltonBuild = false;
   });
 
   it('holds a Send issued while compacting instead of starting a turn', async () => {
@@ -587,5 +598,39 @@ describe('useChatMessages – queued send during compaction', () => {
       await firstSend.catch(() => undefined);
       await Promise.resolve();
     });
+  });
+
+  // DALTON-HOOK(antigravity-series): Item 4 — compaction-queued message preserves its captured model & modelPickSeq onto activeTurnModel when flushed in Dalton builds
+  it('exposes the queued message model and modelPickSeq as activeTurnModel when flushing after compaction in Dalton builds', async () => {
+    brandMock.isDaltonBuild = true;
+    const flushedHang = deferred<{ disconnected: boolean }>();
+    mockSendStream.mockImplementationOnce(async () => flushedHang.promise);
+
+    const { result } = renderHookWithProviders(() => useChatMessages('ws-test', 'thread-q-seq'));
+    act(() => {
+      result.current.setIsCompacting('summarize');
+    });
+    await act(async () => {
+      await result.current.handleSendMessage('queued with high', null, null, {
+        model: 'gemini-4-neon-high-oauth',
+        modelPickSeq: 1,
+      });
+    });
+    expect(result.current.activeTurnModel).toBeNull();
+
+    // Compaction ends -> queued message starts with High (seq 1), NOT any newer Low the user picked meanwhile.
+    await act(async () => {
+      result.current.setIsCompacting(false);
+    });
+    await waitFor(() => expect(result.current.isLoading).toBe(true));
+    expect(result.current.activeTurnModel).toEqual({
+      model: 'gemini-4-neon-high-oauth',
+      pickSeq: 1,
+    });
+    expect((mockSendStream.mock.calls[0][3] as { llmModel?: string | null }).llmModel).toBe('gemini-4-neon-high-oauth');
+
+    flushedHang.resolve({ disconnected: false });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(result.current.activeTurnModel).toBeNull();
   });
 });

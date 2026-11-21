@@ -161,6 +161,7 @@ const agSeriesMock = vi.hoisted(() => ({
   isDaltonBuild: false,
   featuresData: undefined as Array<{ key: string; enabled: boolean }> | undefined,
   featuresPending: false,
+  featuresPromise: null as Promise<Array<{ key: string; enabled: boolean }>> | null,
   currentUser: null as { user_id: string; organization?: { id: string; name: string } | null } | null,
   sharedEnabled: false,
   sharedWorkspaces: undefined as Array<{ workspace: { workspace_id: string } }> | undefined,
@@ -180,6 +181,7 @@ vi.mock('@/api/features', async (importOriginal) => {
     ...actual,
     getFeatures: () => {
       if (!agSeriesMock.useCustomPermissions) return actual.getFeatures();
+      if (agSeriesMock.featuresPromise) return agSeriesMock.featuresPromise;
       if (agSeriesMock.featuresPending) return new Promise(() => {});
       return Promise.resolve(agSeriesMock.featuresData ?? []);
     },
@@ -1119,6 +1121,7 @@ describe('MarketChatPanel', () => {
       agSeriesMock.isDaltonBuild = false;
       agSeriesMock.featuresData = undefined;
       agSeriesMock.featuresPending = false;
+      agSeriesMock.featuresPromise = null;
       agSeriesMock.currentUser = null;
       agSeriesMock.sharedEnabled = false;
       agSeriesMock.sharedWorkspaces = undefined;
@@ -1466,6 +1469,150 @@ describe('MarketChatPanel', () => {
       });
       expect(api.updateThread).toHaveBeenCalledTimes(1);
       expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: null }));
+    });
+
+    // DALTON-HOOK(antigravity-series): Item 7 — when a second Antigravity switch fails behind a succeeded first one, restore to the pre-save state (Pick 1's null effort & model), never the earlier 'high' effort
+    it('restores to the pre-save value (not an earlier value) when a second Antigravity switch fails after the first switch succeeded', async () => {
+      agSeriesMock.enabled = true;
+      agSeriesMock.isDaltonBuild = true;
+      agSeriesMock.useCustomPermissions = true;
+      agSeriesMock.featuresPending = false;
+      agSeriesMock.featuresData = [{ key: 'shared_workspaces', enabled: false }];
+      agSeriesMock.sharedEnabled = false;
+
+      // Unread thread detail + prior local effort pick 'high' before switching to Antigravity.
+      api.getThread.mockReturnValue(new Promise(() => {}));
+      let resolveFirst!: (v: Record<string, unknown>) => void;
+      let rejectSecond!: (e: unknown) => void;
+      api.updateThread
+        .mockImplementationOnce(() => Promise.resolve({ thread_id: 'thread-xyz', reasoning_effort: 'high' }))
+        .mockImplementationOnce(() => new Promise((res) => { resolveFirst = res; }))
+        .mockImplementationOnce(() => new Promise((_res, rej) => { rejectSecond = rej; }));
+
+      const { qc } = renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
+      await vi.waitFor(() => expect(qc.getQueryData(queryKeys.features.list())).toBeDefined());
+
+      // Establish local effort 'high' before Pick 1.
+      await act(async () => {
+        await (ci.props!.onPickReasoningEffort as (effort: string | null) => Promise<boolean>)('high');
+      });
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
+
+      // Pick 1 (medium) and Pick 2 (high) overlap in flight; Pick 1 succeeds, Pick 2 fails.
+      let pick1!: Promise<boolean>;
+      let pick2!: Promise<boolean>;
+      act(() => {
+        pick1 = (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-medium-oauth');
+        pick2 = (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-high-oauth');
+      });
+      await vi.waitFor(() => expect(api.updateThread).toHaveBeenCalledTimes(2));
+
+      await act(async () => {
+        resolveFirst({
+          thread_id: 'thread-xyz',
+          llm_model: 'gemini-4-neon-medium-oauth',
+          reasoning_effort: null,
+          fast_mode: null,
+        });
+        expect(await pick1).toBe(true);
+      });
+      await vi.waitFor(() => expect(api.updateThread).toHaveBeenCalledTimes(3));
+
+      await act(async () => {
+        rejectSecond(Object.assign(new Error('500'), { response: { status: 500 } }));
+        expect(await pick2).toBe(false);
+      });
+
+      // DALTON-HOOK(antigravity-series): must restore to Pick 1's confirmed model & null effort (the state before Pick 2), NOT earlier 'high'
+      expect(ci.props!.model).toBe('gemini-4-neon-medium-oauth');
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: null }));
+    });
+
+    // DALTON-HOOK(antigravity-series): Item 7 — a deferred Antigravity pick whose flushed PATCH fails restores the pre-switch effort, and a failed Antigravity pick behind a non-Antigravity pick restores both pre-save model and effort
+    it('restores pre-switch effort when a deferred Antigravity pick fails on flush and when an Antigravity pick fails behind a succeeded non-Antigravity pick', async () => {
+      agSeriesMock.enabled = true;
+      agSeriesMock.isDaltonBuild = true;
+      agSeriesMock.useCustomPermissions = true;
+      let resolveFeatures!: (v: Array<{ key: string; enabled: boolean }>) => void;
+      agSeriesMock.featuresPromise = new Promise((res) => { resolveFeatures = res; });
+      agSeriesMock.sharedEnabled = false;
+
+      api.getThread.mockResolvedValue({
+        thread_id: 'thread-xyz',
+        llm_model: 'claude-sonnet-4',
+        reasoning_effort: 'high',
+        fast_mode: null,
+      });
+      api.updateThread.mockRejectedValueOnce(Object.assign(new Error('500'), { response: { status: 500 } }));
+
+      const deferredView = renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
+      await vi.waitFor(() => expect(ci.props!.tuning).toEqual({ reasoningEffort: 'high', fastMode: null }));
+
+      // Pick Antigravity while permission is still unresolved -> effort optimistically clears, no PATCH yet.
+      await act(async () => {
+        await (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-medium-oauth');
+      });
+      expect(api.updateThread).not.toHaveBeenCalled();
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: null }));
+
+      // Permission resolves personal -> flushed PATCH fails -> restores pre-switch effort 'high' and model 'claude-sonnet-4'.
+      await act(async () => {
+        resolveFeatures([{ key: 'shared_workspaces', enabled: false }]);
+      });
+      agSeriesMock.featuresPromise = null;
+      agSeriesMock.featuresData = [{ key: 'shared_workspaces', enabled: false }];
+
+      await vi.waitFor(() => expect(api.updateThread).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(ci.props!.model).toBe('claude-sonnet-4'));
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
+      deferredView.unmount();
+
+      // DALTON-HOOK(antigravity-series): non-Antigravity Pick 1 succeeds while chained Antigravity Pick 2 fails -> restores Pick 1 model AND pre-Pick-2 'high' effort
+      api.updateThread.mockReset();
+      let serverChained: Record<string, unknown> = {
+        thread_id: 'thread-xyz',
+        llm_model: 'claude-sonnet-4',
+        reasoning_effort: 'high',
+        fast_mode: null,
+      };
+      api.getThread.mockImplementation(() => Promise.resolve(serverChained));
+      let resolveNonAg!: (v: Record<string, unknown>) => void;
+      let rejectAg!: (e: unknown) => void;
+      api.updateThread
+        .mockImplementationOnce(() => new Promise((res) => { resolveNonAg = res; }))
+        .mockImplementationOnce(() => new Promise((_res, rej) => { rejectAg = rej; }));
+
+      const chainedView = renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
+      await vi.waitFor(() => expect(chainedView.qc.getQueryData(queryKeys.features.list())).toBeDefined());
+      await vi.waitFor(() => expect(ci.props!.tuning).toEqual({ reasoningEffort: 'high', fastMode: null }));
+
+      let p1!: Promise<boolean>;
+      let p2!: Promise<boolean>;
+      act(() => {
+        p1 = (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gpt-5');
+        p2 = (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-high-oauth');
+      });
+      await vi.waitFor(() => expect(api.updateThread).toHaveBeenCalledTimes(1));
+
+      await act(async () => {
+        serverChained = {
+          thread_id: 'thread-xyz',
+          llm_model: 'gpt-5',
+          reasoning_effort: 'high',
+          fast_mode: null,
+        };
+        resolveNonAg(serverChained);
+        expect(await p1).toBe(true);
+      });
+      await vi.waitFor(() => expect(api.updateThread).toHaveBeenCalledTimes(2));
+
+      await act(async () => {
+        rejectAg(Object.assign(new Error('500'), { response: { status: 500 } }));
+        expect(await p2).toBe(false);
+      });
+
+      expect(ci.props!.model).toBe('gpt-5');
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
     });
   });
 });

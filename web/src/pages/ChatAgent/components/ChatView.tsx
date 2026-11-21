@@ -13,6 +13,8 @@ import { useStableHandler } from '@/hooks/useStableHandler';
 import { useLatestRef } from '@/hooks/useLatestRef';
 import { ScrollArea } from '../../../components/ui/scroll-area';
 import { usePreferences } from '@/hooks/usePreferences';
+// DALTON-HOOK(antigravity-series): gate Dalton-only turn-pick & effort rollback behavior to Dalton builds
+import { isDaltonBuild } from '@/config/brand';
 // DALTON-HOOK(antigravity-series): clear local thread effort on Antigravity switch without extra PATCH
 import { useAllModels } from '@/hooks/useAllModels';
 import { inspectSavedAntigravityModel } from '@/lib/antigravitySeries';
@@ -447,13 +449,14 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
   const activeThreadId =
     currentThreadId && currentThreadId !== '__default__' ? currentThreadId : threadId;
-  // DALTON-HOOK(antigravity-series): pass workspaceId so shared workspaces never issue 403 PATCH
+  // DALTON-HOOK(antigravity-series): pass workspaceId and activeTurnModel so shared workspaces skip 403 PATCH and queued sends never clear a newer unsent pick
   const threadModel = useThreadModel({
     threadId: activeThreadId,
     isLoading,
     initialModel: navModel,
     chiefOfStaff: isHome,
     workspaceId,
+    ...(isDaltonBuild ? { activeTurnModel: chat.activeTurnModel } : {}),
   });
   const { pickModel: pickThreadModel, thread: threadRecord } = threadModel;
   // DALTON-HOOK(colleague-dispatch): determine whether the active thread is read-only for the caller
@@ -542,12 +545,24 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   });
   const { toSend: tuningToSend, clearLocalEffort } = threadTuning;
   const { seriesCatalog, customModels, metadata: modelMetadata, rawApiResponse } = useAllModels();
+  // DALTON-HOOK(antigravity-series): clear local effort on Antigravity pick, confirming on success and restoring to pre-save value on immediate or deferred failure in Dalton builds
   const handlePickThreadModel = useCallback((nextModel: string) => {
     const rawMeta = rawApiResponse?.model_metadata ?? modelMetadata;
-    if (inspectSavedAntigravityModel(nextModel, { seriesCatalog, rawMetadata: rawMeta, customModels })) {
-      clearLocalEffort();
+    const isAntigravity = Boolean(inspectSavedAntigravityModel(nextModel, { seriesCatalog, rawMetadata: rawMeta, customModels }));
+    if (!isDaltonBuild) {
+      if (isAntigravity) clearLocalEffort();
+      return pickThreadModel(nextModel);
     }
-    return pickThreadModel(nextModel);
+    const effortClear = isAntigravity ? clearLocalEffort() : null;
+    return pickThreadModel(nextModel, effortClear ? {
+      onSettled: (saved) => {
+        if (saved) effortClear.confirm();
+        else effortClear();
+      },
+    } : undefined).catch((err: unknown) => {
+      effortClear?.();
+      throw err;
+    });
   }, [clearLocalEffort, customModels, modelMetadata, pickThreadModel, rawApiResponse, seriesCatalog]);
 
   // The route's `__default__` stands for a chat with no thread yet; handing it
@@ -803,9 +818,19 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // which always run after commit, so they never see a stale function.
   const stableSendMessage = useStableHandler(handleSendMessage);
   // What every send from this chat carries beside its own.
-  const composerSendOptions = useStableHandler((options: SendOptions): SendOptions => ({
-    ...options, subagentsAllowed: subagentsToSend, ...tuningToSend, ...privacySendOptions,
-  }));
+  // DALTON-HOOK(antigravity-series): tag outgoing Dalton sends with the active manual model pick sequence so queued sends never clear a newer unsent pick
+  const composerSendOptions = useStableHandler((options: SendOptions): SendOptions => {
+    const modelPickSeq = isDaltonBuild && options.model && options.model === threadModel.sendModel
+      ? threadModel.sendModelSeq
+      : undefined;
+    return {
+      ...options,
+      ...(modelPickSeq != null ? { modelPickSeq } : {}),
+      subagentsAllowed: subagentsToSend,
+      ...tuningToSend,
+      ...privacySendOptions,
+    };
+  });
   // The file comments queued for this thread's next send, shown above the
   // text box and carried by its send, and the sender the file panel uses.
   const commentSends = useChatCommentSends({

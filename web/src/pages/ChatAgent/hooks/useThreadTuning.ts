@@ -15,7 +15,14 @@ type Override<F extends TuningField> = Exclude<Thread[F], undefined>;
 /** A pick the row does not hold yet. Boxed, since null is a pick too: the
  *  thread going back to following Settings. */
 // DALTON-HOOK(antigravity-series): attach optional rollback metadata for optimistic Antigravity clearLocal
-type Hold<V> = { value: V; clearToken?: symbol; restoreHeld?: Hold<V> } | null;
+type Hold<V> = {
+  value: V;
+  clearToken?: symbol;
+  restoreHeld?: Hold<V>;
+  restoreDeferred?: { threadId: string; value: V } | null;
+} | null;
+
+export type ClearLocalHandle = (() => void) & { confirm: () => void };
 
 /** What a thread's first send stores as its own, beside the turn's level. */
 export interface TuningToSend {
@@ -138,24 +145,42 @@ function useThreadOverride<F extends TuningField>({
   const [held, setHeld] = useState<Hold<Override<F>>>(landing ? landingHold(landing.value) : null);
   // DALTON-HOOK(antigravity-series): retain a tuning pick made while workspace write permission is unresolved so it flushes via PATCH once confirmed personal
   const [deferredPick, setDeferredPick] = useState<{ threadId: string; value: Override<F> } | null>(null);
+  const heldRef = useRef<Hold<Override<F>>>(held);
+  const deferredPickRef = useRef<{ threadId: string; value: Override<F> } | null>(deferredPick);
   // A pick belongs to the thread it was made on, and one instance can move
   // between threads. A thread being created by its first send is not a move.
   const [heldThreadId, setHeldThreadId] = useState(liveThreadId);
   const [landingKey, setLandingKey] = useState(landing?.key ?? null);
+  let nextHeld = held;
+  let nextDeferredPick = deferredPick;
   if (heldThreadId !== liveThreadId) {
     setHeldThreadId(liveThreadId);
     if (heldThreadId) {
+      nextHeld = null;
+      nextDeferredPick = null;
       setHeld(null);
       setDeferredPick(null);
     }
   }
   if (landing && landing.key !== landingKey) {
     setLandingKey(landing.key);
-    setHeld(landingHold(landing.value));
+    nextHeld = landingHold(landing.value);
+    nextDeferredPick = null;
+    setHeld(nextHeld);
     setDeferredPick(null);
   }
-  if (held && rowValue !== undefined && rowValue === held.value) setHeld(null);
-  if (deferredPick && rowValue !== undefined && rowValue === deferredPick.value) setDeferredPick(null);
+  // DALTON-HOOK(antigravity-series): in Dalton builds never drop an unsent deferredPick (or held while deferred / awaiting optimistic Antigravity clear settlement) just because it matches possibly-stale cached rowValue
+  const keepHeldForDalton = isDaltonBuild && (nextDeferredPick !== null || Boolean(nextHeld?.clearToken));
+  if (nextHeld && !keepHeldForDalton && rowValue !== undefined && rowValue === nextHeld.value) {
+    nextHeld = null;
+    setHeld(null);
+  }
+  if (!isDaltonBuild && nextDeferredPick && rowValue !== undefined && rowValue === nextDeferredPick.value) {
+    nextDeferredPick = null;
+    setDeferredPick(null);
+  }
+  heldRef.current = nextHeld;
+  deferredPickRef.current = nextDeferredPick;
 
   const save = useThreadFieldSave({
     threadId: liveThreadId,
@@ -165,6 +190,7 @@ function useThreadOverride<F extends TuningField>({
     // the row shows through, unless the pick has moved on since. With no row
     // cached the composer falls back to Settings until the settle reads it.
     onFailed: ({ value }) => {
+      if (heldRef.current && heldRef.current.value === value) heldRef.current = null;
       setHeld((current) => (current && current.value === value ? null : current));
     },
   });
@@ -190,32 +216,41 @@ function useThreadOverride<F extends TuningField>({
   useEffect(() => {
     if (!deferredPick || isUnresolved) return;
     if (deferredPick.threadId !== liveThreadId || !liveThreadId) {
+      deferredPickRef.current = null;
       setDeferredPick(null);
       return;
     }
     if (skipSave) {
+      deferredPickRef.current = null;
       setDeferredPick(null);
       return;
     }
     const { threadId: targetThreadId, value: targetValue } = deferredPick;
+    deferredPickRef.current = null;
     setDeferredPick(null);
     createdRef.current = null;
-    if (rowValue !== undefined && rowValue === targetValue) return;
+    // DALTON-HOOK(antigravity-series): always persist the user's last explicit deferred pick even when it matches cached rowValue (which may be stale)
     void save({ threadId: targetThreadId, value: targetValue, before: null });
-  }, [deferredPick, isUnresolved, liveThreadId, rowValue, save, skipSave]);
+  }, [deferredPick, isUnresolved, liveThreadId, save, skipSave]);
 
   /** Resolves false only when this pick's own save failed. */
   const set = useCallback((next: Override<F>): Promise<boolean> => {
-    setHeld({ value: next });
+    const nextHold: Hold<Override<F>> = { value: next };
+    heldRef.current = nextHold;
+    setHeld(nextHold);
     if (!liveThreadId) {
+      deferredPickRef.current = null;
       setDeferredPick(null);
       return Promise.resolve(true);
     }
     // DALTON-HOOK(antigravity-series): defer PATCH while workspace write permission is unresolved; skip on confirmed shared workspaces
     if (isUnresolved) {
-      setDeferredPick({ threadId: liveThreadId, value: next });
+      const nextDeferred = { threadId: liveThreadId, value: next };
+      deferredPickRef.current = nextDeferred;
+      setDeferredPick(nextDeferred);
       return Promise.resolve(true);
     }
+    deferredPickRef.current = null;
     setDeferredPick(null);
     if (skipSave) return Promise.resolve(true);
     // `before` goes unused: a failure drops the hold rather than restoring one.
@@ -225,26 +260,71 @@ function useThreadOverride<F extends TuningField>({
   const shownThreadRef = useRef(liveThreadId);
   shownThreadRef.current = liveThreadId;
 
-  // DALTON-HOOK(antigravity-series): clear local reasoning_effort state without triggering a second PATCH, returning a restore callback for failed model switches
-  const clearLocal = useCallback((): (() => void) => {
+  // DALTON-HOOK(antigravity-series): clear local reasoning_effort state without triggering a second PATCH, returning a restore handle with .confirm() so a later failure rolls back to the pre-save value and never an earlier one
+  const clearLocal = useCallback((): ClearLocalHandle => {
     const token = Symbol('clearLocal');
     const targetThreadId = liveThreadId;
-    setDeferredPick(null);
-    setHeld((current) => {
-      const restoreHeld = current?.clearToken ? (current.restoreHeld ?? null) : current;
-      return { value: null as Override<F>, clearToken: token, restoreHeld };
-    });
-    return () => {
-      if (shownThreadRef.current !== targetThreadId) return;
-      setHeld((current) => (current?.clearToken === token ? (current.restoreHeld ?? null) : current));
+    const prevDeferred = deferredPickRef.current;
+    if (prevDeferred !== null) {
+      deferredPickRef.current = null;
+      setDeferredPick(null);
+    }
+    const current = heldRef.current;
+    const restoreHeld = current?.clearToken ? (current.restoreHeld ?? null) : current;
+    const restoreDeferred = current?.clearToken ? (current.restoreDeferred ?? null) : prevDeferred;
+    const cleared: Hold<Override<F>> = {
+      value: null as Override<F>,
+      clearToken: token,
+      restoreHeld,
+      restoreDeferred,
     };
+    heldRef.current = cleared;
+    setHeld(cleared);
+
+    const restore = () => {
+      if (shownThreadRef.current !== targetThreadId) return;
+      const active = heldRef.current;
+      if (active?.clearToken !== token) return;
+      const nextRestored = active.restoreHeld ?? null;
+      const deferredToRestore = active.restoreDeferred ?? null;
+      heldRef.current = nextRestored;
+      setHeld(nextRestored);
+      if (isDaltonBuild && deferredToRestore && deferredToRestore.threadId === targetThreadId) {
+        deferredPickRef.current = deferredToRestore;
+        setDeferredPick(deferredToRestore);
+      }
+    };
+
+    const confirm = () => {
+      if (shownThreadRef.current !== targetThreadId) return;
+      const active = heldRef.current;
+      if (!active?.clearToken) return;
+      if (active.clearToken === token) {
+        const confirmed: Hold<Override<F>> = { value: null as Override<F> };
+        heldRef.current = confirmed;
+        setHeld(confirmed);
+        return;
+      }
+      // A newer clearLocal is in flight behind this confirmed clear: advance its
+      // rollback baseline to null (the value now confirmed on the server).
+      const advanced: Hold<Override<F>> = {
+        ...active,
+        restoreHeld: { value: null as Override<F> },
+        restoreDeferred: null,
+      };
+      heldRef.current = advanced;
+      setHeld(advanced);
+    };
+
+    return Object.assign(restore, { confirm });
   }, [liveThreadId]);
 
-  const value: Override<F> | undefined = held ? held.value : liveThreadId ? rowValue : null as Override<F>;
+  // DALTON-HOOK(antigravity-series): derive displayed value and first-send overrides from adjusted nextHeld
+  const value: Override<F> | undefined = nextHeld ? nextHeld.value : liveThreadId ? rowValue : null as Override<F>;
   // A new thread's create names a pick, and otherwise nothing, so the thread
   // follows Settings.
-  const toSend = !liveThreadId && held && held.value !== null
-    ? held.value as Exclude<Override<F>, null>
+  const toSend = !liveThreadId && nextHeld && nextHeld.value !== null
+    ? nextHeld.value as Exclude<Override<F>, null>
     : undefined;
 
   return { value, toSend, set, clearLocal };

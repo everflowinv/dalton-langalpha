@@ -467,13 +467,14 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   useActiveThreadPublisher(threadId, { canMarkSeen });
 
   // The Chief of Staff's turn may start on another Default than the account's.
-  // DALTON-HOOK(antigravity-series): in Dalton builds pass activeWorkspaceId (including Home) like ChatView so shared threads skip 403 PATCH and Home waits for detail confirmation before Antigravity PATCH; non-Dalton keeps origin/dalton/main behavior
+  // DALTON-HOOK(antigravity-series): in Dalton builds pass activeWorkspaceId (including Home) and activeTurnModel like ChatView so shared threads skip 403 PATCH and queued sends never clear a newer unsent pick; non-Dalton keeps origin/dalton/main behavior
   const threadWorkspaceId = isDaltonBuild ? activeWorkspaceId : null;
   const threadModel = useThreadModel({
     threadId,
     isLoading,
     chiefOfStaff: scope === 'all',
     ...(threadWorkspaceId ? { workspaceId: threadWorkspaceId } : {}),
+    ...(isDaltonBuild ? { activeTurnModel: chat.activeTurnModel } : {}),
   });
   const { pickModel: pickThreadModel } = threadModel;
   const threadSubagents = useThreadSubagents({ threadId });
@@ -484,23 +485,22 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   });
   const { toSend: tuningToSend, clearLocalEffort } = threadTuning;
   const { seriesCatalog, customModels, metadata: modelMetadata, rawApiResponse } = useAllModels();
-  // DALTON-HOOK(antigravity-series): in Dalton builds clear local effort on Antigravity pick, restoring previous effort if the model switch fails without clobbering newer updates
+  // DALTON-HOOK(antigravity-series): in Dalton builds clear local effort on Antigravity pick, confirming on save success and restoring to pre-save value on immediate or deferred failure without clobbering newer updates
   const handlePickThreadModel = useCallback((nextModel: string) => {
     if (!isDaltonBuild) return pickThreadModel(nextModel);
     const rawMeta = rawApiResponse?.model_metadata ?? modelMetadata;
-    const restoreEffort = inspectSavedAntigravityModel(nextModel, { seriesCatalog, rawMetadata: rawMeta, customModels })
+    const effortClear = inspectSavedAntigravityModel(nextModel, { seriesCatalog, rawMetadata: rawMeta, customModels })
       ? clearLocalEffort()
       : null;
-    return pickThreadModel(nextModel).then(
-      (saved) => {
-        if (!saved) restoreEffort?.();
-        return saved;
+    return pickThreadModel(nextModel, effortClear ? {
+      onSettled: (saved) => {
+        if (saved) effortClear.confirm();
+        else effortClear();
       },
-      (err: unknown) => {
-        restoreEffort?.();
-        throw err;
-      },
-    );
+    } : undefined).catch((err: unknown) => {
+      effortClear?.();
+      throw err;
+    });
   }, [clearLocalEffort, customModels, modelMetadata, pickThreadModel, rawApiResponse, seriesCatalog]);
 
   // MarketView has no floating cards layer, so subagent rows resolve through
@@ -595,8 +595,13 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         if (sentImage && chartImageRef.current === sentImage) onClearChartImage();
         for (const id of sentSelectionIds) chartSelectionStore.remove(id);
       };
+      // DALTON-HOOK(antigravity-series): tag outgoing Dalton sends with the active manual model pick sequence so queued sends never clear a newer unsent pick
+      const modelPickSeq = isDaltonBuild && modelOptions?.model && modelOptions.model === threadModel.sendModel
+        ? threadModel.sendModelSeq
+        : undefined;
       const sent = handleSendMessage(send.outgoingMessage, additionalContext, attachmentMeta, {
         ...modelOptions,
+        ...(modelPickSeq != null ? { modelPickSeq } : {}),
         ...(send.snapshots.length > 0 ? { chartSelections: send.snapshots } : {}),
         ...(send.chartViews.length > 0 ? { chartViews: send.chartViews } : {}),
         subagentsAllowed: subagentsToSend,
@@ -608,7 +613,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       });
       return sent;
     },
-    [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend, tuningToSend, collectViews, t],
+    [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend, tuningToSend, collectViews, t, threadModel.sendModel, threadModel.sendModelSeq],
   );
 
   // DALTON-HOOK(chat-attachment-count): reject capturing a new chart screenshot when already at MAX_FILES
