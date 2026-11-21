@@ -1175,3 +1175,152 @@ async def test_follow_default_automation_on_persistent_thread_overrides_stale_th
         resolve=resolver,
     )
     assert resolved_calls[-1] == ("claude-opus-5-5-oauth", None)
+
+
+@pytest.mark.asyncio
+async def test_colleague_workspace_wakeup_restart_retries_as_recorded_sender_and_passes_sharing_auth(
+    monkeypatch,
+) -> None:
+    """Automation wakeup in a colleague's thread inside another user's workspace restarts before
+    entering the graph: recovery reads r.user_id, posts /retry as the recorded sender (colleague A)
+    rather than workspace owner B, passes sharing.py write auth, while owner B remains 403."""
+    from datetime import UTC, datetime
+
+    from src.dalton import sharing as sharing_mod
+    from src.server.database.runs import restart_resume as rr_db
+    from src.server.services.report_back import restart as restart_mod
+    from src.server.services.runs import pending_input as pending_mod
+
+    colleague_a = "user-colleague-a"
+    ws_owner_b = "user-ws-owner-b"
+    wakeup_run_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    now = datetime.now(UTC)
+
+    # 1. Verify read_resume_state SQL selects r.user_id AS run_user_id
+    executed_sql: list[str] = []
+    fake_conn = create_autospec(AsyncConnection, instance=True)
+
+    @asynccontextmanager
+    async def _get_conn():
+        yield fake_conn
+
+    @asynccontextmanager
+    async def _cursor(*_a: Any, **_kw: Any):
+        cur = create_autospec(AsyncCursor, instance=True)
+
+        async def _exec(sql: str, _params: Any = None) -> None:
+            executed_sql.append(" ".join(sql.split()))
+
+        cur.execute.side_effect = _exec
+        cur.fetchone.return_value = {
+            "user_id": ws_owner_b,
+            "workspace_id": WS,
+            "no_turn": False,
+            "latest_run_id": wakeup_run_id,
+            "status": "cancelled",
+            "metadata": {
+                "automation_source_execution_id": EXEC_A,
+                rr_db.RESTART_INTERRUPTED_META: True,
+            },
+            "created_at": now,
+            "run_user_id": colleague_a,
+        }
+        yield cur
+
+    fake_conn.cursor.side_effect = _cursor
+    monkeypatch.setattr(
+        rr_db.pool,
+        "get_db_connection",
+        create_autospec(rr_db.pool.get_db_connection, side_effect=_get_conn),
+    )
+    state = await rr_db.read_resume_state(THREAD, wakeup_run_id)
+    assert any("r.user_id AS run_user_id" in sql for sql in executed_sql)
+    assert state is not None and state["run_user_id"] == colleague_a
+
+    # 2. resume_verdict uses recorded sender (colleague_a) for /retry, NOT workspace owner B
+    monkeypatch.setattr(
+        restart_mod,
+        "waits_on_user",
+        create_autospec(restart_mod.waits_on_user, return_value=False),
+    )
+    monkeypatch.setattr(
+        rr_db,
+        "list_restart_stopped_tasks",
+        create_autospec(rr_db.list_restart_stopped_tasks, return_value=[]),
+    )
+    monkeypatch.setattr(
+        rr_db,
+        "has_unsettled_tasks",
+        create_autospec(rr_db.has_unsettled_tasks, return_value=False),
+    )
+    monkeypatch.setattr(
+        pending_mod,
+        "read_pending_input",
+        create_autospec(
+            pending_mod.read_pending_input,
+            return_value=SimpleNamespace(needs_client=False),
+        ),
+    )
+    verdict = await restart_mod.resume_verdict(
+        {
+            "conversation_thread_id": THREAD,
+            "payload": {"run_id": wakeup_run_id},
+            "created_at": now,
+        }
+    )
+    assert isinstance(verdict, restart_mod.OwedResume)
+    assert verdict.retry_run_id == wakeup_run_id
+    assert verdict.user_id == colleague_a
+    route, body = restart_mod.resume_turn(verdict, "req-key-colleague")
+    assert route == "retry"
+    assert body["run_id"] == wakeup_run_id
+
+    # 3. Existing sharing.py write authorization passes for verdict.user_id (colleague A),
+    #    while workspace owner B is still refused 403 on colleague A's thread!
+    ws_obj = {"workspace_id": WS, "user_id": ws_owner_b, "status": "running"}
+    monkeypatch.setattr(
+        sharing_mod,
+        "is_dalton_supabase_auth_enabled",
+        create_autospec(sharing_mod.is_dalton_supabase_auth_enabled, return_value=True),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "is_colleague_dispatch_enabled",
+        create_autospec(sharing_mod.is_colleague_dispatch_enabled, return_value=True),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_team_reader",
+        create_autospec(sharing_mod.require_team_reader, return_value=None),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "get_user_tier",
+        create_autospec(sharing_mod.get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_workspace_access",
+        create_autospec(sharing_mod.require_workspace_access, return_value=ws_obj),
+    )
+
+    authorized_owner = await sharing_mod.require_thread_access(
+        THREAD,
+        verdict.user_id,
+        need="write",
+        owner_id=colleague_a,
+        workspace_owner_id=ws_owner_b,
+        workspace_id=ws_obj,
+    )
+    assert authorized_owner == colleague_a
+
+    with pytest.raises(HTTPException) as owner_exc:
+        await sharing_mod.require_thread_access(
+            THREAD,
+            ws_owner_b,
+            need="write",
+            owner_id=colleague_a,
+            workspace_owner_id=ws_owner_b,
+            workspace_id=ws_obj,
+        )
+    assert owner_exc.value.status_code == 403

@@ -689,7 +689,12 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     handleEditMessage(id, content, chatInputRef.current?.getModelOptions?.()));
   const stableRegenerate = useStableHandler((id: string) =>
     handleRegenerate(id, chatInputRef.current?.getModelOptions?.()));
-  const stableRetry = useStableHandler(() => handleRetry(chatInputRef.current?.getModelOptions?.()));
+  // DALTON-HOOK(automation-effort): prefer getRetryModelOptions so saved composer effort is not auto-sent on retry
+  const stableRetry = useStableHandler(() =>
+    handleRetry(
+      chatInputRef.current?.getRetryModelOptions?.()
+      ?? chatInputRef.current?.getModelOptions?.(),
+    ));
   // Steering the agent finished without reading, edit text whose message is
   // gone, and the files of a send a stop held back come back to the composer,
   // beside whatever was typed there since.
