@@ -8,6 +8,9 @@ import { ClaudeCodeTokenSheet } from '@/components/modelAccess/ClaudeCodeToken';
 import { AccessRow } from '@/components/modelAccess/AccessRow';
 import { Group } from '@/components/modelAccess/parts';
 import { isPlatformMode } from '@/config/hostMode';
+// DALTON-HOOK(dalton-setup): Dalton build & team credentials skip model connection
+import { isDaltonBuild } from '@/config/brand';
+import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
 import { useAccount, useRule } from '@/hooks/useAccount';
 import { allows, RULE } from '@/lib/accountRules';
@@ -36,8 +39,12 @@ export default function ModelStep() {
   const flow = useAnswerFlow('model');
   const step = useClaudeCodeStep(flow);
   const { t } = useTranslation();
-  if (flow.isLoading) return <StepLoading />;
+  // DALTON-HOOK(dalton-setup): team-shared credentials skip model connection; Claude Code is disabled
+  const { isShared: teamShared, callerTierPending } = useTeamCredentials();
+  if (flow.isLoading || (isDaltonBuild && callerTierPending)) return <StepLoading />;
   if (!flow.answers) return <Navigate to="/setup" replace />;
+  if (isDaltonBuild && teamShared) return <Navigate to="/setup/default" replace />;
+  if (isDaltonBuild && flow.answers.models === 'claude_code') return <Navigate to="/setup/use" replace />;
   if (flow.answers.models === 'langalpha_models') return <Navigate to="/setup/default" replace />;
   if (flow.answers.models !== 'claude_code') return <SubscriptionStep flow={flow} />;
   switch (step.kind) {

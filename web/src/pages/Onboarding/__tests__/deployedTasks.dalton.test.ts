@@ -58,4 +58,17 @@ describe('Dalton getting-started tasks', () => {
 
     expect(screen.queryByRole('button', { name: /desktopApp|Get the desktop app/i })).toBeNull();
   });
+
+  // DALTON-HOOK(onboarding-tasks): remoteControl must also stay hidden in Dalton even if desktop shell is simulated
+  it('hides remoteControl and desktopApp in Dalton build even under desktop shell', async () => {
+    vi.stubEnv('VITE_BRAND_MARK', 'everflow');
+    vi.doMock('@/lib/desktop', () => ({ isDesktopShell: () => true }));
+    vi.resetModules();
+
+    const { DEPLOYED_TASKS: daltonDeployed } = await import('../registry');
+    expect(daltonDeployed.some((t) => t.id === 'desktopApp')).toBe(false);
+    expect(daltonDeployed.some((t) => t.id === 'remoteControl')).toBe(false);
+    expect(daltonDeployed.some((t) => t.id === 'integrations')).toBe(false);
+    vi.doUnmock('@/lib/desktop');
+  });
 });

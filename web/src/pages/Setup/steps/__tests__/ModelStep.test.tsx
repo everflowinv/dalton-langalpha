@@ -36,6 +36,10 @@ const h = vi.hoisted(() => ({
   featuresLoading: false,
   policy: null as null | object,
 }));
+// DALTON-HOOK(dalton-setup): ModelStep reads team credential sharing state
+vi.mock('@/hooks/useTeamCredentials', () => ({
+  useTeamCredentials: () => ({ isShared: false, callerTierPending: false }),
+}));
 vi.mock('@/hooks/useAccount', async () => {
   const { allows } = await import('@/lib/accountRules');
   const who = { start: 'Your organization', mid: 'your organization' };

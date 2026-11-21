@@ -73,6 +73,7 @@ ALLOWED_HOOKS=(
   # Dalton hides getting-started tasks it does not offer (the desktop app
   # download); the checklist count and progress ring follow DEPLOYED_TASKS.
   "onboarding-tasks"
+  "dalton-setup"
   "dalton-auth"
   "home-workspace-alias"
   "team-sharing"

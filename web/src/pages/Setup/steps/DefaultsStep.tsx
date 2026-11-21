@@ -18,6 +18,15 @@ import { modelPrefs, splitPreferenceWrite, starredModels } from '@/lib/modelPref
 import { apiErrorDetail } from '@/api/errors';
 import { suggestBackgroundModel } from './suggestBackgroundModel';
 import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
+// DALTON-HOOK(dalton-setup): Dalton build defaults, team credential notice, and credits/Claude Code filtering
+import { isDaltonBuild } from '@/config/brand';
+import {
+  DALTON_BACKGROUND_MODEL,
+  DALTON_DEFAULT_MODEL,
+  filterDaltonPayers,
+  filterDaltonProviderModels,
+} from '@/config/daltonSetup';
+import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 
 // ---------------------------------------------------------------------------
 // DefaultsStep — Step 5: Set default primary + Background models
@@ -44,7 +53,13 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
   const updatePreferences = useUpdatePreferences();
   const { t } = useTranslation();
   const copy = useModelSlotCopy();
+  const { isShared: teamShared } = useTeamCredentials();
   const headingId = useId();
+
+  // DALTON-HOOK(dalton-setup): filter out credits & Claude Code models under Dalton
+  const visiblePayers = filterDaltonPayers(payers, isDaltonBuild);
+  const visibleModels = filterDaltonProviderModels(models, metadata, payers, isDaltonBuild);
+  const visibleSlotModels = filterDaltonProviderModels(slotModels, metadata, payers, isDaltonBuild);
 
   // ---------------------------------------------------------------------------
   // Selection state — seed from existing preferences if available
@@ -76,9 +91,12 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
   // they just picked. Set during render like the Background fill below.
   // From the slot models, so the fill never lands on a conversation-only
   // model (Claude Code); the user may still pick one.
-  const fillable = Object.values(slotModels).flatMap((p) => p.models ?? []);
+  const fillable = Object.values(visibleSlotModels).flatMap((p) => p.models ?? []);
   const primaryFill = !primaryModel && !isLoading && prefsLoaded
-    ? [systemDefaults?.default_model, ...starredModels(preferences)].find(
+    ? (isDaltonBuild
+      ? [DALTON_DEFAULT_MODEL, systemDefaults?.default_model, ...starredModels(preferences)]
+      : [systemDefaults?.default_model, ...starredModels(preferences)]
+    ).find(
         (m): m is string => typeof m === 'string' && fillable.includes(m),
       ) ?? fillable[0]
     : undefined;
@@ -88,7 +106,11 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
   // go with the primary, set during render so the slot never paints empty.
   // The fill is a pick like any other: it stays when the primary changes, and
   // nothing is saved before Continue.
-  const backgroundFill = !backgroundModel && primaryModel && prefsLoaded ? suggestBackgroundModel(slotModels, primaryModel) : undefined;
+  const backgroundFill = !backgroundModel && primaryModel && prefsLoaded
+    ? (isDaltonBuild && fillable.includes(DALTON_BACKGROUND_MODEL)
+      ? DALTON_BACKGROUND_MODEL
+      : suggestBackgroundModel(visibleSlotModels, primaryModel))
+    : undefined;
   if (backgroundFill) setBackgroundModel(backgroundFill);
 
   const canContinue = prefsLoaded && Boolean(primaryModel && backgroundModel);
@@ -171,20 +193,20 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
           className="text-xs leading-relaxed"
           style={{ color: 'var(--color-text-secondary)' }}
         >
-          {t('setup.modelAccessReminder')}
+          {isDaltonBuild && teamShared ? t('setup.daltonModelAccessNote') : t('setup.modelAccessReminder')}
         </p>
       </div>
 
       {/* Model tier config */}
       <ModelTierConfig
-        models={models}
-        backgroundModels={slotModels}
+        models={visibleModels}
+        backgroundModels={visibleSlotModels}
         primaryModel={primaryModel}
         onPrimaryModelChange={setPrimaryModel}
         backgroundModel={backgroundModel}
         onBackgroundModelChange={setBackgroundModel}
         showExplainer
-        payers={payers}
+        payers={visiblePayers}
         metadata={metadata}
       />
 
@@ -221,9 +243,9 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
                   description={t('settings.modelTuning.fetchModelDesc')}
                   value={advancedModels.fetchModel}
                   onChange={(v) => handleAdvancedChange({ fetchModel: v })}
-                  models={slotModels}
+                  models={visibleSlotModels}
                   placeholder={copy.defaultsToBackground}
-                  payers={payers}
+                  payers={visiblePayers}
                   metadata={metadata}
                 />
                 <ModelSelector
@@ -231,17 +253,17 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
                   description={t('settings.modelTuning.compactionModelDesc')}
                   value={advancedModels.compactionModel}
                   onChange={(v) => handleAdvancedChange({ compactionModel: v })}
-                  models={slotModels}
+                  models={visibleSlotModels}
                   placeholder={copy.defaultsToConversation}
-                  payers={payers}
+                  payers={visiblePayers}
                   metadata={metadata}
                 />
                 <FallbackModelsPicker
                   selected={advancedModels.fallbackModels}
                   onChange={(list) => handleAdvancedChange({ fallbackModels: list })}
-                  models={slotModels}
+                  models={visibleSlotModels}
                   metadata={metadata}
-                  payers={payers}
+                  payers={visiblePayers}
                 />
               </div>
             </motion.div>

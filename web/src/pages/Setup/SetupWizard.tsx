@@ -17,6 +17,8 @@ import { useSetupFacts } from './answers/useSetupFacts';
 
 import { isPlatformMode } from '@/config/hostMode';
 import { ONBOARDING_USE_URL } from '@/config/supportLinks';
+// DALTON-HOOK(dalton-setup): gate Mac & Claude Code setup routes in Dalton builds
+import { isDaltonBuild } from '@/config/brand';
 import React from 'react';
 
 const MethodStep = React.lazy(() => import('./steps/MethodStep'));
@@ -81,6 +83,8 @@ const PAGES: readonly SetupPage[] = [
   { path: 'model', element: <ModelStep />, rail: 'answers', step: 'model' },
   { path: 'default', element: <DefaultStep />, rail: 'answers', step: 'default' },
 ];
+
+const DALTON_DISABLED_PATHS = new Set(['mac', 'this-mac', 'continue', 'claude-code']);
 
 const pageOf = (pathname: string): SetupPage | null => {
   const path = pathname.replace(/^\/setup\/?/, '').replace(/\/$/, '');
@@ -186,7 +190,14 @@ export default function SetupWizard() {
         {held ? <StepLoadFailed onRetry={retryFacts} /> : (
           <Suspense fallback={<StepLoading />}>
             <Routes location={location}>
-              {PAGES.map((p) => <Route key={p.path} path={p.path} element={p.element} />)}
+              {/* DALTON-HOOK(dalton-setup): redirect Mac & Claude Code routes away in Dalton builds */}
+              {PAGES.map((p) => (
+                <Route
+                  key={p.path}
+                  path={p.path}
+                  element={isDaltonBuild && DALTON_DISABLED_PATHS.has(p.path) ? <Navigate to="/setup" replace /> : p.element}
+                />
+              ))}
               <Route index element={<SetupStart />} />
               <Route path="*" element={<Navigate to="/setup" replace />} />
             </Routes>

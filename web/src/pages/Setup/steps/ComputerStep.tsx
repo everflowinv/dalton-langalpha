@@ -1,8 +1,11 @@
 import { useId, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, Laptop, SquareTerminal } from 'lucide-react';
+// DALTON-HOOK(dalton-setup): Dalton build hides Mac pairing and uses cloud by default
+import { AlertTriangle, ChevronRight, Cloud, Laptop, SquareTerminal } from 'lucide-react';
 import { WizardStepHeader } from '@/components/ui/wizard';
+import { isDaltonBuild } from '@/config/brand';
+import { useOnboardingProgress } from '@/hooks/useOnboardingProgress';
 import { canAddThisMac, canRemoteControl, desktop, isDesktopShell } from '@/lib/desktop';
 import { serverTakesRemoteControl, useThisMacAvailability } from '@/pages/ChatAgent/hooks/useRemoteControl';
 import { useComputerProviders } from '@/pages/ChatAgent/hooks/useComputers';
@@ -51,10 +54,15 @@ export default function ComputerStep() {
   const navigate = useNavigate();
   const headingId = useId();
   const flow = useAnswerFlow('computer');
+  const { update, isUpdating } = useOnboardingProgress();
+  const [advancedSshOpen, setAdvancedSshOpen] = useState(false);
+  const [cloudSwitchFailed, setCloudSwitchFailed] = useState(false);
   const inApp = isDesktopShell();
-  const availability = useThisMacAvailability({ enabled: canAddThisMac(), poll: false });
-  const providers = useComputerProviders({ enabled: !inApp });
-  const kind = macRowKind(inApp, availability, serverTakesRemoteControl(providers.data));
+  // DALTON-HOOK(dalton-setup): skip Mac pairing probes and hide Mac row in Dalton builds
+  const availability = useThisMacAvailability({ enabled: !isDaltonBuild && canAddThisMac(), poll: false });
+  const providers = useComputerProviders({ enabled: isDaltonBuild || !inApp });
+  const sshOffered = !isDaltonBuild || !!providers.data?.providers.some((p) => p.kind === 'ssh');
+  const kind = isDaltonBuild ? null : macRowKind(inApp, availability, serverTakesRemoteControl(providers.data));
   const mac = kind && MAC_ROW[kind];
   const macAction = mac?.action;
   const claudeCode = flow.answers?.models === 'claude_code';
@@ -64,17 +72,41 @@ export default function ComputerStep() {
   const [homeTargetId, setHomeTargetId] = useState<string | null>(null);
   const homeTarget = flow.ownComputers.find((c) => c.computer_id === homeTargetId);
   // Its ways in stay out until the computers already connected are read.
-  if (flow.isLoading) return <StepLoading />;
+  if (flow.isLoading || (isDaltonBuild && !providers.data && !providers.isError)) return <StepLoading />;
   // Whether this Mac can pair is unknown until the server answers.
-  if (availability.settled && availability.serverFailed) return <StepLoadFailed onRetry={availability.retryServer} />;
+  if (!isDaltonBuild && availability.settled && availability.serverFailed) return <StepLoadFailed onRetry={availability.retryServer} />;
+
+  const continueOnCloud = () => {
+    setCloudSwitchFailed(false);
+    update({ runs_on: 'cloud' }).then(
+      () => navigate('/setup/default', { replace: true }),
+      () => setCloudSwitchFailed(true),
+    );
+  };
+
+  const sshRow = (
+    <AccessRow
+      testId="setup-computer-ssh"
+      icon={<SquareTerminal />}
+      name={t(S + '.ssh.name')}
+      tag={t('computer.ssh.previewLabel')}
+      wrapDetail
+      detail={t(S + '.ssh.note')}
+      action={<RowButton onClick={() => navigate('/setup/ssh')}>{t(S + '.ssh.add')}</RowButton>}
+    />
+  );
 
   return (
     <div>
       {flow.first && flow.answers && <AnswersStrip answers={flow.answers} />}
       <WizardStepHeader
         titleId={headingId}
-        title={t('setup.answers.computer.title')}
-        helper={t(claudeCode ? 'setup.answers.computer.leadClaudeCode' : 'setup.answers.computer.lead')}
+        title={t(isDaltonBuild && !sshOffered ? 'setup.answers.computer.cloudReadyTitle' : 'setup.answers.computer.title')}
+        helper={t(
+          isDaltonBuild && !sshOffered
+            ? 'setup.answers.computer.cloudReadyLead'
+            : claudeCode ? 'setup.answers.computer.leadClaudeCode' : 'setup.answers.computer.lead',
+        )}
       />
       <div className="flex flex-col gap-5">
         {flow.ownComputers.length > 0 && (
@@ -92,32 +124,58 @@ export default function ComputerStep() {
             ))}
           </Group>
         )}
-        <Group title={t(S + '.waysTitle')}>
-          {mac && (
-            <AccessRow
-              testId="setup-computer-mac"
-              icon={<Laptop />}
-              name={t(S + '.mac.name')}
-              tag={t('computer.ssh.previewLabel')}
-              wrapDetail
-              detail={t(mac.detail)}
-              action={macAction && <RowButton onClick={() => navigate(macAction.to)}>{t(macAction.label)}</RowButton>}
-            />
-          )}
-          <AccessRow
-            testId="setup-computer-ssh"
-            icon={<SquareTerminal />}
-            name={t(S + '.ssh.name')}
-            tag={t('computer.ssh.previewLabel')}
-            wrapDetail
-            detail={t(S + '.ssh.note')}
-            action={<RowButton onClick={() => navigate('/setup/ssh')}>{t(S + '.ssh.add')}</RowButton>}
-          />
-        </Group>
+        {isDaltonBuild ? (
+          /* DALTON-HOOK(dalton-setup): managed cloud computer default; SSH tucked into Advanced when offered */
+          <>
+            <Group title={t('setup.answers.use.serverComputer')}>
+              <AccessRow
+                testId="setup-computer-cloud"
+                icon={<Cloud />}
+                name={t('setup.answers.computer.cloudReadyRow')}
+                detail={t('setup.answers.computer.cloudReadyDetail')}
+                status="connected"
+              />
+            </Group>
+            {sshOffered && (
+              <div>
+                <button
+                  type="button"
+                  onClick={() => setAdvancedSshOpen((v) => !v)}
+                  className="inline-flex items-center gap-1 text-xs font-medium"
+                  style={{ color: 'var(--color-text-tertiary)' }}
+                  aria-expanded={advancedSshOpen}
+                >
+                  <ChevronRight className={`h-3 w-3 transition-transform ${advancedSshOpen ? 'rotate-90' : ''}`} />
+                  {t('setup.answers.computer.advancedSsh')}
+                </button>
+                {advancedSshOpen && <div className="mt-3">{sshRow}</div>}
+              </div>
+            )}
+          </>
+        ) : (
+          <Group title={t(S + '.waysTitle')}>
+            {mac && (
+              <AccessRow
+                testId="setup-computer-mac"
+                icon={<Laptop />}
+                name={t(S + '.mac.name')}
+                tag={t('computer.ssh.previewLabel')}
+                wrapDetail
+                detail={t(mac.detail)}
+                action={macAction && <RowButton onClick={() => navigate(macAction.to)}>{t(macAction.label)}</RowButton>}
+              />
+            )}
+            {sshRow}
+          </Group>
+        )}
       </div>
-      <SetupNote icon={<AlertTriangle />}>{t('setup.answers.computer.accountNote')}</SetupNote>
-      <SetupNote icon={<Laptop />}>{t('setup.answers.computer.onlineNote')}</SetupNote>
-      {flow.finishFailed && <StepError>{t('setup.answers.saveFailed')}</StepError>}
+      {(!isDaltonBuild || (sshOffered && advancedSshOpen)) && (
+        <>
+          <SetupNote icon={<AlertTriangle />}>{t('setup.answers.computer.accountNote')}</SetupNote>
+          <SetupNote icon={<Laptop />}>{t('setup.answers.computer.onlineNote')}</SetupNote>
+        </>
+      )}
+      {(flow.finishFailed || cloudSwitchFailed) && <StepError>{t('setup.answers.saveFailed')}</StepError>}
       <SetupFooter
         back={flow.back ? { label: t('setup.back'), onClick: flow.back } : null}
         primary={flow.ownComputers.length > 0 ? {
@@ -125,6 +183,11 @@ export default function ComputerStep() {
           onClick: () => void flow.finish(),
           disabled: flow.finishing,
           busy: flow.finishing,
+        } : isDaltonBuild ? {
+          label: t('setup.continue'),
+          onClick: continueOnCloud,
+          disabled: isUpdating,
+          busy: isUpdating,
         } : null}
       />
       {homeTarget && (

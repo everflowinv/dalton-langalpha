@@ -4809,6 +4809,8 @@
     "defaultsSubtitle": "Pick the models that power your research",
     "doneTitle": "You're all set!",
     "doneSummary": "Your AI research assistant is configured and ready to go.",
+    "teamSharedProvider": "Team-configured models",
+    "daltonModelAccessNote": "Your team has already configured shared models for you. Pick your default models below.",
     "goToDashboard": "Go to Dashboard",
     "personalizeLink": "Set up investing profile",
     "invitationCodeLink": "Have an invitation code?",
@@ -5002,6 +5004,7 @@
         "subscription_or_key": "Subscription or key",
         "langalpha_models": "LangAlpha's models",
         "serverModels": "This server's models",
+        "teamModels": "Team models",
         "cloud": "Cloud computer",
         "serverComputer": "This server's computer",
         "own_computer": "Your computer"
@@ -5016,6 +5019,8 @@
         "title": "How will you use LangAlpha?",
         "lead": "Two questions. Your answers pick the setup steps that follow, and you can change both later.",
         "modelsLabel": "Which models do you want to use?",
+        "teamSharedTitle": "Team-configured models",
+        "teamSharedDesc": "Your team has already configured models for you, so you can use them directly.",
         "claudeCode": "Your Claude plan, with Claude Code",
         "claudeCodeDesc": "Pro or Max. Claude Code runs on your plan, with LangAlpha's tools.",
         "subscription": "Another subscription or an API key",
@@ -5028,6 +5033,7 @@
         "homeStays": "Home stays on this Mac. Move it in Settings.",
         "own": "On your own computer",
         "ownDesc": "Your Mac, or any Mac or Linux computer over SSH.",
+        "advancedComputer": "Advanced",
         "saveFailed": "Your answers couldn't be saved. Try again."
       },
       "computer": {
@@ -5041,7 +5047,12 @@
         "onlineNote": "Home lives on the computer you connect, and your turns run there, so it needs to be on and online while they run.",
         "onlineNoteNamed": "Home lives on {{name}}, and your turns run there, so it needs to be on and online while they run.",
         "noBackupNote": "Without backup, this computer can't be your primary computer, so Home and new workspaces go on a cloud computer.",
-        "macUpdateApp": "Update the LangAlpha app to pair this Mac."
+        "macUpdateApp": "Update the LangAlpha app to pair this Mac.",
+        "cloudReadyTitle": "Use the deployment's cloud computer",
+        "cloudReadyLead": "Your team uses a managed cloud computer for your tasks, so no local computer setup is needed.",
+        "cloudReadyRow": "Managed cloud computer",
+        "cloudReadyDetail": "Provided by your deployment and ready to use.",
+        "advancedSsh": "Advanced: connect your own computer over SSH"
       },
       "ssh": {
         "title": "Add a computer over SSH",
@@ -5080,10 +5091,12 @@
           "strongest": "Highest intelligence rating of your models.",
           "strongestFastest": "Highest intelligence rating of your models, and the fastest of those.",
           "deployment": "The default for LangAlpha's models.",
+          "daltonRecommended": "Recommended default model for research conversations.",
           "claudeCode": "A good fit for any Claude plan.",
           "fastestBackground": "Fastest of your other models, which is what background work needs.",
           "onlyBackground": "Your only model that can run background work.",
           "deploymentBackground": "The background default for LangAlpha's models.",
+          "daltonRecommendedBackground": "Recommended model for background tasks.",
           "claudeCodeBackground": "Claude Code runs conversations only, so background work runs on {{model}}.",
           "claudeCodeCreditsBackground": "Claude Code runs conversations only, so background work runs on {{model}}, a LangAlpha model that uses your credits."
         },

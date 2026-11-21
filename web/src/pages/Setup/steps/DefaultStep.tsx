@@ -14,6 +14,9 @@ import { FallbackModelsPicker } from '@/components/model/FallbackModelsPicker';
 import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
 import { getModelDisplayName } from '@/components/ui/chat-input.helpers';
 import { isPlatformMode } from '@/config/hostMode';
+// DALTON-HOOK(dalton-setup): Dalton build defaults & credits/Claude Code filtering
+import { isDaltonBuild } from '@/config/brand';
+import { filterDaltonPayers, filterDaltonProviderModels } from '@/config/daltonSetup';
 import { isDesktopShell } from '@/lib/desktop';
 import { useAllModels } from '@/hooks/useAllModels';
 import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
@@ -68,11 +71,15 @@ export default function DefaultStep() {
   if (!flow.answers) return <Navigate to="/setup" replace />;
 
   const saved = modelPrefs(preferences);
+  // DALTON-HOOK(dalton-setup): exclude Claude Code / credits models and payers in Dalton builds
+  const visiblePayers = filterDaltonPayers(payers, isDaltonBuild);
+  const visibleModels = filterDaltonProviderModels(models, metadata, payers, isDaltonBuild);
+  const visibleSlotModels = filterDaltonProviderModels(slotModels, metadata, payers, isDaltonBuild);
   const choices = defaultChoices({
     models: flow.answers.models,
-    offered: models,
-    slotModels: Object.values(slotModels).flatMap((p) => p.models ?? []),
-    payers,
+    offered: visibleModels,
+    slotModels: Object.values(visibleSlotModels).flatMap((p) => p.models ?? []),
+    payers: visiblePayers,
     // Not a connection the account's rules keep off, which no turn runs on.
     ownProviders: providers.filter((p) => p.masked_key !== SERVER_KEY && p.state !== 'needs_reauth'
       && (p.access_type === 'oauth' ? allows(policy, RULE.ownSubscriptions)
@@ -83,6 +90,7 @@ export default function DefaultStep() {
     systemDefault: systemDefaults?.default_model ?? null,
     systemBackground: systemDefaults?.background_model ?? null,
     preferred: saved.preferred_model ?? null,
+    dalton: isDaltonBuild,
   });
   // Mounted once the preferences are read, so the picks are seeded from what
   // is saved and never from an unread row; keyed by the account, whose drafts
@@ -108,6 +116,9 @@ function DefaultForm({ flow, choices, saved, all }: { flow: Flow; choices: Defau
   const { t } = useTranslation();
   const copy = useModelSlotCopy();
   const { slotModels, payers, metadata, systemDefaults, cannotRun } = all;
+  // DALTON-HOOK(dalton-setup): exclude Claude Code / credits models and payers in Dalton builds
+  const visiblePayers = filterDaltonPayers(payers, isDaltonBuild);
+  const visibleSlotModels = filterDaltonProviderModels(slotModels, metadata, payers, isDaltonBuild);
   const update = useUpdatePreferences();
   const headingId = useId();
   const groupName = useId();
@@ -349,7 +360,7 @@ function DefaultForm({ flow, choices, saved, all }: { flow: Flow; choices: Defau
                   <Ratings meta={metadata[m]} />
                   {m === primary && where && <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{where}</span>}
                 </span>
-                <PayerBadge payer={payers[m]} />
+                <PayerBadge payer={visiblePayers[m]} />
               </PickCard>
             ))}
           </div>
@@ -379,11 +390,11 @@ function DefaultForm({ flow, choices, saved, all }: { flow: Flow; choices: Defau
                       description={copy.background.description}
                       value={background}
                       onChange={setBackground}
-                      models={slotModels}
+                      models={visibleSlotModels}
                       missingLabel={name}
                       placeholder={copy.background.placeholder}
                       autoOption={deploymentBackground ? { value: BACKGROUND_AUTO, label: deploymentBackground } : undefined}
-                      payers={payers}
+                      payers={visiblePayers}
                       metadata={metadata}
                     />
                     <ModelSelector
@@ -391,9 +402,9 @@ function DefaultForm({ flow, choices, saved, all }: { flow: Flow; choices: Defau
                       description={t('settings.modelTuning.fetchModelDesc')}
                       value={fetchModel}
                       onChange={setFetchModel}
-                      models={slotModels}
+                      models={visibleSlotModels}
                       placeholder={copy.defaultsToBackground}
-                      payers={payers}
+                      payers={visiblePayers}
                       metadata={metadata}
                     />
                     <ModelSelector
@@ -401,17 +412,17 @@ function DefaultForm({ flow, choices, saved, all }: { flow: Flow; choices: Defau
                       description={t('settings.modelTuning.compactionModelDesc')}
                       value={compactionModel}
                       onChange={setCompactionModel}
-                      models={slotModels}
+                      models={visibleSlotModels}
                       placeholder={copy.defaultsToConversation}
-                      payers={payers}
+                      payers={visiblePayers}
                       metadata={metadata}
                     />
                     <FallbackModelsPicker
                       selected={fallbackModels}
                       onChange={setFallbackModels}
-                      models={slotModels}
+                      models={visibleSlotModels}
                       metadata={metadata}
-                      payers={payers}
+                      payers={visiblePayers}
                     />
                   </div>
                 </motion.div>

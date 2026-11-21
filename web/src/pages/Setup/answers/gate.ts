@@ -7,6 +7,8 @@
  * in one place.
  */
 import type { OnboardingSetupOn as SetupOn } from '@/api/onboarding';
+// DALTON-HOOK(dalton-setup): Dalton builds never redirect to Mac pairing/handoff routes
+import { isDaltonBuild } from '@/config/brand';
 import { nextSetupPath, type SetupStep } from './setupSteps';
 
 export interface OnboardingRouteInput {
@@ -74,12 +76,14 @@ export function shellTarget(
 ): ShellTarget {
   if (route.kind === 'platform') return { kind: 'platform' };
   if (skipped) return null;
-  if (desktop && canPair && (route.kind === 'questions' || route.kind === 'answers') && route.unpaired) {
+  if (!isDaltonBuild && desktop && canPair && (route.kind === 'questions' || route.kind === 'answers') && route.unpaired) {
     return { kind: 'path', to: '/setup/this-mac' };
   }
   if (route.kind === 'questions') return { kind: 'path', to: '/setup/use' };
   if (route.kind === 'provider') return { kind: 'path', to: '/setup/method' };
   if (route.kind !== 'answers') return null;
+  // DALTON-HOOK(dalton-setup): no Mac app handoff in Dalton builds
+  if (isDaltonBuild) return { kind: 'path', to: route.nextPath };
   if (desktop) {
     if (route.owner === 'app') return { kind: 'path', to: route.nextPath };
     if (route.owner === 'mac_pending') return { kind: 'path', to: '/setup/continue' };

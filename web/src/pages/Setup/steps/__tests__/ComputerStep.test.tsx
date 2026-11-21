@@ -37,6 +37,10 @@ vi.mock('@/pages/ChatAgent/hooks/useRemoteControl', () => ({
 vi.mock('@/pages/ChatAgent/hooks/useComputers', () => ({ useComputerProviders: () => ({ data: { providers: [] } }) }));
 vi.mock('@/pages/ChatAgent/hooks/useComputerActions', () => ({ useComputerActions: () => ({ makePrimary: { mutate: h.makePrimary, isPending: false, error: null } }) }));
 vi.mock('@/pages/ChatAgent/hooks/useHomePlacement', () => ({ useHomePlacement: () => ({ data: undefined }) }));
+// DALTON-HOOK(dalton-setup): ComputerStep reads onboarding progress update helper
+vi.mock('@/hooks/useOnboardingProgress', () => ({
+  useOnboardingProgress: () => ({ update: vi.fn(), isUpdating: false }),
+}));
 vi.mock('@/pages/ChatAgent/components/MakePrimaryDialog', () => ({
   default: ({ computer, onConfirm }: { computer: { name: string }; onConfirm: (c: object) => void }) => (
     <button type="button" onClick={() => onConfirm({ turnOnBackup: false, fromBackup: false })}>{`Confirm ${computer.name}`}</button>

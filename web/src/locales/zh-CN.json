@@ -4792,6 +4792,8 @@
     "defaultsSubtitle": "选择驱动你研究的模型",
     "doneTitle": "准备就绪！",
     "doneSummary": "你的 AI 研究助手已配置完成，随时可用。",
+    "teamSharedProvider": "团队已配置模型",
+    "daltonModelAccessNote": "团队已为你配置好共享模型，请在下方选择默认模型。",
     "goToDashboard": "前往控制台",
     "personalizeLink": "设置投资画像",
     "invitationCodeLink": "有邀请码？",
@@ -4984,6 +4986,7 @@
         "subscription_or_key": "订阅或 API key",
         "langalpha_models": "LangAlpha 的模型",
         "serverModels": "此服务器提供的模型",
+        "teamModels": "团队共享模型",
         "cloud": "云端计算机",
         "serverComputer": "此服务器运行的计算机",
         "own_computer": "你的计算机"
@@ -4998,6 +5001,8 @@
         "title": "你打算怎么使用 LangAlpha？",
         "lead": "两个问题。后面的设置步骤按你的回答来定，之后也可以随时修改。",
         "modelsLabel": "你想用哪些模型？",
+        "teamSharedTitle": "团队已配置好模型",
+        "teamSharedDesc": "团队已为你配置好模型，可直接使用。",
         "claudeCode": "你的 Claude 套餐，配合 Claude Code",
         "claudeCodeDesc": "Pro 或 Max。Claude Code 用你的套餐运行，并使用 LangAlpha 的工具。",
         "subscription": "其他订阅或 API key",
@@ -5010,6 +5015,7 @@
         "homeStays": "Home 会留在这台 Mac 上。可在设置中迁移。",
         "own": "在你自己的计算机上",
         "ownDesc": "你的 Mac，或任意可通过 SSH 连接的 Mac 或 Linux 计算机。",
+        "advancedComputer": "高级",
         "saveFailed": "你的回答没能保存，请重试。"
       },
       "computer": {
@@ -5023,7 +5029,12 @@
         "onlineNote": "Home 会放在你连接的计算机上，你的对话也在那里运行，所以运行期间它需要保持开机并联网。",
         "onlineNoteNamed": "Home 会放在 {{name}} 上，你的对话也在那里运行，所以运行期间它需要保持开机并联网。",
         "noBackupNote": "不开启备份，这台计算机就不能设为你的默认计算机，所以 Home 和新工作区会放在云端计算机上。",
-        "macUpdateApp": "更新 LangAlpha 应用后即可配对这台 Mac。"
+        "macUpdateApp": "更新 LangAlpha 应用后即可配对这台 Mac。",
+        "cloudReadyTitle": "使用部署提供的云端计算机",
+        "cloudReadyLead": "你的团队使用托管云端计算机运行任务，无需配置本地计算机。",
+        "cloudReadyRow": "托管云端计算机",
+        "cloudReadyDetail": "由当前部署提供，可直接开始使用。",
+        "advancedSsh": "高级：通过 SSH 连接你自己的计算机"
       },
       "ssh": {
         "title": "通过 SSH 添加计算机",
@@ -5062,10 +5073,12 @@
           "strongest": "在你的模型中智能评分最高。",
           "strongestFastest": "在你的模型中智能评分最高，且是其中速度最快的。",
           "deployment": "LangAlpha 模型的默认选择。",
+          "daltonRecommended": "推荐用于研究对话的默认模型。",
           "claudeCode": "适合任何 Claude 套餐。",
           "fastestBackground": "你其他模型中速度最快的，正适合后台任务。",
           "onlyBackground": "你唯一能运行后台任务的模型。",
           "deploymentBackground": "LangAlpha 模型的后台默认选择。",
+          "daltonRecommendedBackground": "推荐用于后台任务的模型。",
           "claudeCodeBackground": "Claude Code 只运行对话，因此后台任务在 {{model}} 上运行。",
           "claudeCodeCreditsBackground": "Claude Code 只运行对话，因此后台任务在 LangAlpha 的 {{model}} 上运行，会消耗你的 credits。"
         },

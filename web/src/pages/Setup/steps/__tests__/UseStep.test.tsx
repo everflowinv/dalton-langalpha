@@ -47,6 +47,10 @@ vi.mock('@/pages/ChatAgent/hooks/useComputers', () => ({
 vi.mock('@/hooks/useOnboardingProgress', () => ({
   useOnboardingProgress: () => ({ progress: h.progress, isLoading: false, update: h.update, isUpdating: false }),
 }));
+// DALTON-HOOK(dalton-setup): UseStep reads team credential sharing state
+vi.mock('@/hooks/useTeamCredentials', () => ({
+  useTeamCredentials: () => ({ isShared: false, callerTierPending: false }),
+}));
 
 import UseStep from '../UseStep';
 

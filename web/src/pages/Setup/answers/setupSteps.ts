@@ -8,6 +8,8 @@
  * deployment's own models), then the default model.
  */
 import type { OnboardingModels, OnboardingProgress, OnboardingRunsOn, OnboardingSetupStep } from '@/api/onboarding';
+// DALTON-HOOK(dalton-setup): Dalton builds never require the Claude Code model step
+import { isDaltonBuild } from '@/config/brand';
 import { WELCOME_PATH } from '@/pages/Onboarding/welcome/paths';
 
 export type ModelsAnswer = OnboardingModels;
@@ -52,7 +54,8 @@ export function readAnswers(progress: Pick<OnboardingProgress, 'models' | 'runs_
 }
 
 /** Whether the answers need a model connected in setup. */
-export const needsModelStep = (answers: SetupAnswers): boolean => answers.models !== 'langalpha_models';
+export const needsModelStep = (answers: SetupAnswers): boolean =>
+  answers.models !== 'langalpha_models' && !(isDaltonBuild && answers.models === 'claude_code');
 
 /**
  * The steps the rail shows, from the answers alone: a step whose outcome is
@@ -77,7 +80,7 @@ export function nextSetupStep(facts: SetupFacts): SetupStep | 'done' {
   const { models, runsOn } = facts.answers;
   // One already connected while Home is on the cloud is offered as Home once.
   if (runsOn === 'own_computer' && (!facts.ownComputer || (facts.homeOnCloud && facts.lastStep === null))) return 'computer';
-  if (models === 'claude_code' && !facts.claudeCodeToken) return 'model';
+  if (!isDaltonBuild && models === 'claude_code' && !facts.claudeCodeToken) return 'model';
   if (models === 'subscription_or_key' && !facts.providerConnected) return 'model';
   return 'default';
 }
