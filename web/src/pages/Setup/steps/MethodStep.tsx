@@ -174,9 +174,10 @@ export default function MethodStep() {
   const navigate = useNavigate();
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const { providers: configuredProviders, hasAny: hasConfigured } = useConfiguredProviders();
+  // DALTON-HOOK(dalton-setup): surface provider/catalog/credentials read failures with retry on legacy /setup/method
+  const { providers: configuredProviders, hasAny: hasConfigured, unread: configuredUnread } = useConfiguredProviders();
   // DALTON-HOOK(team-credentials): team-shared credentials status
-  const { isShared: isTeamShared, canDisconnect, canManage } = useTeamCredentials();
+  const { isShared: isTeamShared, canDisconnect, canManage, callerTierError } = useTeamCredentials();
   // DALTON-HOOK(dalton-setup): check live Dalton team-model availability via useDaltonTeamModels
   const team = useDaltonTeamModels();
   const allowDisconnect = !isDaltonAuth || canDisconnect;
@@ -261,10 +262,12 @@ export default function MethodStep() {
     }
   }, [invitationCode, queryClient, navigate, t]);
 
-  // DALTON-HOOK(dalton-setup): show load-failure notice with retry when reading team models fails under team sharing;
-  // keep provider connection entries visible for admins so they can still connect another provider
-  const teamUnread = isDaltonBuild && team.shared && team.unread;
-  if (teamUnread && !team.canManage) {
+  // DALTON-HOOK(dalton-setup): show load-failure notice with retry when reading models/providers/credentials fails;
+  // keep provider connection entries visible for admins / sharing-off users so they can still connect another provider
+  const readFailed = isDaltonBuild && (
+    (team.shared && team.unread) || team.all.unread || configuredUnread || callerTierError
+  );
+  if (readFailed && !team.canManage) {
     return <StepLoadFailed onRetry={team.retry} />;
   }
 
@@ -276,8 +279,8 @@ export default function MethodStep() {
         helper={canSkip ? t('setup.addMoreProviders') : t('setup.methodSubtitle')}
       />
       <div className="flex flex-col gap-4 sm:gap-6">
-      {/* DALTON-HOOK(dalton-setup): inline load-failure notice with retry for admins while preserving connect entries */}
-      {teamUnread && team.canManage && (
+      {/* DALTON-HOOK(dalton-setup): inline load-failure notice with retry for admins / sharing-off users while preserving connect entries */}
+      {readFailed && team.canManage && (
         <div data-testid="setup-load-failed">
           <FlowFailure
             title={t('setup.answers.loadFailed')}

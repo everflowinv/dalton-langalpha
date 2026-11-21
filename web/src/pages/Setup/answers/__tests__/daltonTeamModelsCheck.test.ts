@@ -210,4 +210,67 @@ describe('daltonTeamModelsCheck forced retry', () => {
     expect(calls).toEqual([{ refresh: true }, { refresh: true }]);
     qc.clear();
   });
+
+  it('deduplicates concurrent retry checks on the same generation while cancelling an in-flight non-refresh request', async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let normalSignal: AbortSignal | undefined;
+    let resolveForced!: (v: AvailableModels) => void;
+    let forcedSignal: AbortSignal | undefined;
+    const calls: Array<{ refresh: boolean }> = [];
+
+    h.getProviderAvailableModels.mockImplementation((_provider, opts) => {
+      const refresh = Boolean(opts?.refresh);
+      calls.push({ refresh });
+      if (!refresh) {
+        normalSignal = opts?.signal;
+        return new Promise<AvailableModels>(() => {});
+      }
+      forcedSignal = opts?.signal;
+      return new Promise<AvailableModels>((resolve) => {
+        resolveForced = resolve;
+      });
+    });
+
+    const normalFetch = qc
+      .fetchQuery({
+        queryKey: queryKeys.providerModels.available('antigravity-oauth', ''),
+        queryFn: ({ signal }) => h.getProviderAvailableModels('antigravity-oauth', { signal }),
+        staleTime: 10 * 60_000,
+        retry: false,
+      })
+      .catch(() => null);
+
+    expect(calls).toEqual([{ refresh: false }]);
+    expect(normalSignal?.aborted).toBe(false);
+
+    bumpDaltonTeamModelsRetry(qc);
+    // Fire two overlapping availability checks for the same retry generation.
+    const first = checkDaltonTeamModelsAvailable({
+      queryClient: qc,
+      providers: PROVIDERS,
+      byokEnabled: false,
+      providersUnread: false,
+      policy: null,
+    });
+    const second = checkDaltonTeamModelsAvailable({
+      queryClient: qc,
+      providers: PROVIDERS,
+      byokEnabled: false,
+      providersUnread: false,
+      policy: null,
+    });
+
+    await vi.waitFor(() => expect(calls).toEqual([{ refresh: false }, { refresh: true }]));
+    expect(normalSignal?.aborted).toBe(true);
+    expect(forcedSignal?.aborted).toBe(false);
+
+    resolveForced(freshReady());
+    const [res1, res2] = await Promise.all([first, second]);
+    expect(res1.available).toBe(true);
+    expect(res2.available).toBe(true);
+    // Exactly one refresh=1 request was sent; the second concurrent caller never cancelled it or reused the non-refresh request.
+    expect(calls).toEqual([{ refresh: false }, { refresh: true }]);
+    await normalFetch;
+    qc.clear();
+  });
 });

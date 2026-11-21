@@ -18,7 +18,9 @@ import { apiErrorDetail } from '@/api/errors';
 import { suggestBackgroundModel } from './suggestBackgroundModel';
 import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
 // DALTON-HOOK(dalton-setup): Dalton build defaults, unified team-model availability, and credits/Claude Code filtering
+// DALTON-HOOK(antigravity-series): series-only display & hide effort pickers across onboarding dropdowns
 import { isDaltonBuild } from '@/config/brand';
+import { formatAntigravityVariantLabel } from '@/lib/antigravitySeries';
 import { modelLabel } from '@/lib/modelLabel';
 import {
   DALTON_BACKGROUND_MODEL,
@@ -228,6 +230,10 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
   // Render
   // ---------------------------------------------------------------------------
 
+  // DALTON-HOOK(antigravity-series): format Antigravity keys purely as series names without effort suffix in Dalton onboarding
+  const formatModelName = (m: string) =>
+    formatAntigravityVariantLabel(m, { seriesCatalog, rawMetadata, customModels }) ?? modelLabel(m, metadata);
+
   // DALTON-HOOK(dalton-setup): wait for team-model reads and surface retry on failed reads
   if (isLoading || (isDaltonBuild && team.isLoading)) {
     return (
@@ -325,16 +331,22 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
             >
               <div className="flex flex-col pt-4" style={{ gap: '24px' }}>
                 {/* DALTON-HOOK(dalton-setup): pass Dalton curated slot models and payers */}
+                {/* DALTON-HOOK(antigravity-series): hide effort pickers & format series names in Advanced routing dropdowns */}
                 <ModelSelector
                   label={t('settings.modelTuning.fetchModel')}
                   description={t('settings.modelTuning.fetchModelDesc')}
                   value={advancedModels.fetchModel}
                   onChange={(v) => handleAdvancedChange({ fetchModel: v })}
                   models={curatedSlotModels}
-                  missingLabel={isDaltonBuild ? (m) => modelLabel(m, metadata) : undefined}
+                  nameOf={isDaltonBuild ? formatModelName : undefined}
+                  missingLabel={isDaltonBuild ? formatModelName : undefined}
                   placeholder={copy.defaultsToBackground}
                   payers={visiblePayers}
                   metadata={metadata}
+                  seriesCatalog={seriesCatalog}
+                  rawMetadata={rawMetadata}
+                  customModels={customModels}
+                  hideEffortPicker
                 />
                 <ModelSelector
                   label={t('settings.modelTuning.compactionModel')}
@@ -342,18 +354,28 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
                   value={advancedModels.compactionModel}
                   onChange={(v) => handleAdvancedChange({ compactionModel: v })}
                   models={curatedSlotModels}
-                  missingLabel={isDaltonBuild ? (m) => modelLabel(m, metadata) : undefined}
+                  nameOf={isDaltonBuild ? formatModelName : undefined}
+                  missingLabel={isDaltonBuild ? formatModelName : undefined}
                   placeholder={copy.defaultsToConversation}
                   payers={visiblePayers}
                   metadata={metadata}
+                  seriesCatalog={seriesCatalog}
+                  rawMetadata={rawMetadata}
+                  customModels={customModels}
+                  hideEffortPicker
                 />
                 {/* DALTON-HOOK(dalton-setup): pass Dalton curated slot models & payers */}
+                {/* DALTON-HOOK(antigravity-series): hide effort pickers & collapse series in FallbackModelsPicker */}
                 <FallbackModelsPicker
                   selected={advancedModels.fallbackModels}
                   onChange={(list) => handleAdvancedChange({ fallbackModels: list })}
                   models={curatedSlotModels}
                   metadata={metadata}
                   payers={visiblePayers}
+                  seriesCatalog={seriesCatalog}
+                  rawMetadata={rawMetadata}
+                  customModels={customModels}
+                  hideEffortPicker
                 />
               </div>
             </motion.div>

@@ -1403,4 +1403,199 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
       },
     });
   }, 15_000);
+
+  it('(leftover-1) sharing-off Retry discovers newly connected provider after invalidation and force-refreshes with refresh=1', async () => {
+    const user = userEvent.setup();
+    server.state.teamSharingEnabled = false;
+    server.state.teamModelsConfigured = false;
+    server.state.connectedOAuthProviders = [];
+    server.state.modelsExtra = {
+      openai: { display_name: 'OpenAI', models: ['gpt-5', 'gpt-5-mini'] },
+    };
+    server.state.metadataExtra = {
+      'gpt-5': { display_name: 'GPT 5 Pro', provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3 },
+      'gpt-5-mini': { display_name: 'GPT 5 Mini', provider: 'openai', access_type: 'api_key', intelligence: 3, speed: 5 },
+    };
+    server.state.userApiKeys = [
+      { provider: 'openai', display_name: 'OpenAI', has_key: true, access_type: 'api_key', masked_key: 'sk-...user' },
+    ];
+    server.state.availableModelsByProvider = {
+      openai: { status: 'ok', ready: ['gpt-5', 'gpt-5-mini'] },
+      'antigravity-oauth': ({ refresh }) => (
+        refresh
+          ? {
+              status: 'ok',
+              ready: ['gemini-4-neon-high-oauth', 'gemini-4-hydrogen-low-oauth'],
+              missing: [],
+              cached: false,
+            }
+          : {
+              status: 'ok',
+              ready: [],
+              missing: [
+                'gemini-4-neon-high-oauth',
+                'gemini-4-carbon-medium-oauth',
+                'gemini-4-hydrogen-low-oauth',
+                'gemini-4-hydrogen-high-oauth',
+                'claude-opus-5-5-medium-oauth',
+              ],
+              cached: true,
+            }
+      ),
+    };
+    server.state.progress.models = 'langalpha_models';
+    server.state.progress.runs_on = 'cloud';
+
+    renderRealWizardApp('/setup/default');
+    expect(await screen.findByTestId('setup-default-team-models-empty', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
+
+    // Antigravity becomes connected while pre-retry listedProviders did NOT include it;
+    // clicking Retry must discover antigravity-oauth from refreshed OAuth cache and send refresh=1.
+    server.state.connectedOAuthProviders = ['antigravity'];
+    await user.click(screen.getByRole('button', { name: 'Try again' }));
+
+    await waitFor(
+      () => expect(screen.getByRole('radio', { name: /Gemini 4 Neon/i })).toBeChecked(),
+      { timeout: 5000 },
+    );
+    expect(
+      server.state.availableModelsCalls.some((c) => c.provider === 'antigravity-oauth' && c.refresh),
+    ).toBe(true);
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeEnabled();
+  }, 15_000);
+
+  it('(leftover-2) sharing-off with only off-list API key models shows contact-admin + Retry on /setup/default and refuses to save on /setup/defaults', async () => {
+    server.state.teamSharingEnabled = false;
+    server.state.teamModelsConfigured = false;
+    server.state.connectedOAuthProviders = [];
+    server.state.modelsExtra = {
+      openai: { display_name: 'OpenAI', models: ['gpt-5', 'gpt-5-mini'] },
+    };
+    server.state.metadataExtra = {
+      'gpt-5': { display_name: 'GPT 5 Pro', provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3 },
+      'gpt-5-mini': { display_name: 'GPT 5 Mini', provider: 'openai', access_type: 'api_key', intelligence: 3, speed: 5 },
+    };
+    server.state.userApiKeys = [
+      { provider: 'openai', display_name: 'OpenAI', has_key: true, access_type: 'api_key', masked_key: 'sk-...user' },
+    ];
+    server.state.availableModelsByProvider = {
+      openai: { status: 'ok', ready: ['gpt-5', 'gpt-5-mini'] },
+    };
+    server.state.progress.models = 'langalpha_models';
+    server.state.progress.runs_on = 'cloud';
+
+    renderRealWizardApp('/setup/default');
+    const defaultEmpty = await screen.findByTestId('setup-default-team-models-empty', {}, { timeout: 5000 });
+    expect(defaultEmpty).toHaveTextContent(/contact your administrator/i);
+    expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument();
+    expect(screen.queryByRole('radio', { name: /GPT 5 Pro/i })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
+
+    cleanup();
+    server.state.preferences = {
+      model_preference: {
+        preferred_model: 'gpt-5',
+        preferred_background_model: 'gpt-5-mini',
+      },
+    };
+    renderRealWizardApp('/setup/defaults');
+    const defaultsEmpty = await screen.findByTestId('setup-defaults-team-models-empty', {}, { timeout: 5000 });
+    expect(defaultsEmpty).toHaveTextContent(/contact your administrator/i);
+    expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
+    expect(server.lastPreferencesPut).toBeNull();
+  }, 15_000);
+
+  it('(leftover-3) legacy /setup/method shows Retry while preserving connect entries on read failures with sharing off or credentials status failure', async () => {
+    const user = userEvent.setup();
+    server.state.teamSharingEnabled = false;
+    server.state.teamModelsConfigured = false;
+    server.state.modelsFailCount = 99;
+
+    renderRealWizardApp('/setup/method');
+    expect(await screen.findByTestId('setup-load-failed', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Sign in to Google Antigravity, ChatGPT or Grok/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /API key/i })).toBeInTheDocument();
+
+    server.state.modelsFailCount = 0;
+    await user.click(screen.getByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(screen.queryByTestId('setup-load-failed')).toBeNull(), { timeout: 5000 });
+
+    // Also when /api/v1/dalton/credentials/status itself fails (useTeamCredentials retries once):
+    cleanup();
+    server.state.teamSharingEnabled = true;
+    server.state.callerTier = 'admin';
+    server.state.credentialsStatusFailCount = 99;
+    renderRealWizardApp('/setup/method');
+    expect(await screen.findByTestId('setup-load-failed', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Sign in to Google Antigravity, ChatGPT or Grok/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /API key/i })).toBeInTheDocument();
+
+    server.state.credentialsStatusFailCount = 0;
+    await user.click(screen.getByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(screen.queryByTestId('setup-load-failed')).toBeNull(), { timeout: 5000 });
+  }, 15_000);
+
+  it('(leftover-4) legacy /setup/defaults aligns background/advanced dropdown options with saved variants and normalizes out-of-candidate saved defaults', async () => {
+    const user = userEvent.setup();
+    server.state.antigravityModelsOverride = [
+      'gemini-4-neon-high-oauth',
+      'gemini-4-carbon-medium-oauth',
+      'gemini-4-hydrogen-low-oauth',
+      'gemini-4-hydrogen-high-oauth',
+    ];
+    server.state.preferences = {
+      model_preference: {
+        preferred_model: 'gemini-4-neon-high-oauth',
+        preferred_background_model: 'gemini-4-hydrogen-high-oauth',
+        fetch_model: 'gemini-4-hydrogen-low-oauth',
+      },
+    };
+
+    renderRealWizardApp('/setup/defaults');
+    const bgSelect = await screen.findByLabelText(/Background model/i, {}, { timeout: 5000 }) as HTMLSelectElement;
+    await waitFor(() => expect(bgSelect.value).toBe('gemini-4-hydrogen-high-oauth'), { timeout: 5000 });
+    expect(bgSelect.selectedOptions[0]?.textContent).toContain('Gemini 4 Hydrogen');
+    expect(bgSelect.selectedOptions[0]?.textContent).not.toMatch(/\bHigh\b|\bLow\b/i);
+
+    await user.click(screen.getByRole('button', { name: 'Advanced' }));
+    const fetchSelect = screen.getByLabelText('Web fetch model') as HTMLSelectElement;
+    expect(fetchSelect.value).toBe('gemini-4-hydrogen-low-oauth');
+    expect(fetchSelect.selectedOptions[0]?.textContent).toBe('Gemini 4 Hydrogen');
+    const neonOption = [...fetchSelect.querySelectorAll('optgroup option')].find(
+      (o) => (o as HTMLOptionElement).value === 'gemini-4-neon-high-oauth',
+    );
+    expect(neonOption?.textContent).toContain('Gemini 4 Neon');
+    expect(neonOption?.textContent).not.toMatch(/\bHigh\b/i);
+
+    // Out-of-candidate saved primary & background normalize to curated Neon High + Hydrogen Low
+    cleanup();
+    server.state.antigravityModelsOverride = [
+      'gemini-4-neon-high-oauth',
+      'gemini-4-hydrogen-low-oauth',
+    ];
+    server.state.preferences = {
+      model_preference: {
+        preferred_model: 'gemini-4-hydrogen-high-oauth',
+        preferred_background_model: 'gemini-4-hydrogen-high-oauth',
+      },
+    };
+    renderRealWizardApp('/setup/defaults');
+    const primarySelect = await screen.findByLabelText(/Default model/i, {}, { timeout: 5000 }) as HTMLSelectElement;
+    const bgSelectNorm = screen.getByLabelText(/Background model/i) as HTMLSelectElement;
+    await waitFor(() => {
+      expect(primarySelect.value).toBe('gemini-4-neon-high-oauth');
+      expect(bgSelectNorm.value).toBe('gemini-4-hydrogen-low-oauth');
+    }, { timeout: 5000 });
+
+    await user.click(screen.getByRole('button', { name: 'Continue' }));
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/setup/ready'), { timeout: 5000 });
+    expect(server.lastPreferencesPut).toEqual({
+      model_preference: {
+        preferred_model: 'gemini-4-neon-high-oauth',
+        preferred_background_model: 'gemini-4-hydrogen-low-oauth',
+      },
+    });
+  }, 15_000);
 });
