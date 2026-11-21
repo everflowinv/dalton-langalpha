@@ -461,8 +461,9 @@ class EmptyToolCallRetryMiddleware(AgentMiddleware):
     # so every already-streamed prefix stays in checkpoint history ahead of it.
     @staticmethod
     def _keep_injected(response, injected: list, *, keep_all: bool = False):
-        """Only an answer carrying Claude's thinking (or an output_cap /
-        malformed_call retry) needs them kept; any other answer goes alone."""
+        """Only an answer carrying reasoning bound to its prefix (or an
+        output_cap / malformed_call retry) needs them kept; any other answer
+        goes into history alone."""
         if not injected:
             return response
         if not keep_all and not is_bound_answer(response.result[0]):
