@@ -22,10 +22,10 @@ import { useComputers } from '@/pages/ChatAgent/hooks/useComputers';
 import type { Computer } from '@/types/api';
 import { useOnboardingProgress } from '@/hooks/useOnboardingProgress';
 import { isPlatformMode } from '@/config/hostMode';
-// DALTON-HOOK(dalton-setup): check live Dalton team-model availability for step routing
+// DALTON-HOOK(dalton-setup): check live Dalton team-model availability off the entry bundle and normalize legacy answers
 import { isDaltonBuild } from '@/config/brand';
-import { useDaltonTeamModels } from './useTeamModels';
-import { nextSetupPath, nextSetupStep, readAnswers, setupRail, type SetupFacts } from './setupSteps';
+import { useDaltonTeamModelsAvailable } from './useTeamModelsAvailable';
+import { effectiveModelsAnswer, nextSetupPath, nextSetupStep, readAnswers, setupRail, type SetupFacts } from './setupSteps';
 
 /** A machine the user brought (SSH, this Mac through Remote control) that is
  *  still there to run tasks. */
@@ -38,8 +38,15 @@ export const homeMachine = (computers: readonly Computer[]): Computer | null =>
 
 export function useSetupFacts({ refetchInterval = false }: { refetchInterval?: number | false } = {}) {
   const { progress, isLoading: progressLoading, isError: progressFailed, refetch: refetchProgress } = useOnboardingProgress({ refetchInterval });
-  const answers = readAnswers(progress);
-  const running = !!answers && !progress?.setup_completed_at;
+  // DALTON-HOOK(dalton-setup): read entry-safe Dalton team-model availability while setup runs on answers
+  const rawAnswers = readAnswers(progress);
+  const running = !!rawAnswers && !progress?.setup_completed_at;
+  const { providers, byokEnabled, isLoading: providersLoading, unread: providersUnread } = useConfiguredProviders({ enabled: running });
+  const { policy } = useAccount();
+  const team = useDaltonTeamModelsAvailable(running, providers, byokEnabled, providersLoading, providersUnread, policy);
+  const answers = rawAnswers
+    ? { ...rawAnswers, models: effectiveModelsAnswer(rawAnswers.models, team.available) }
+    : null;
   const ownAnswer = answers?.runsOn === 'own_computer';
   const computers = useComputers({ enabled: running });
   const listed = computers.data?.computers ?? [];
@@ -77,7 +84,6 @@ export function useSetupFacts({ refetchInterval = false }: { refetchInterval?: n
     : null);
   const savedTarget = !targetComputer && !(ownAnswer && isPlatformMode);
   const custody = useClaudeCodeCustody({ enabled: running && claudeCodeAnswer && savedTarget });
-  const { providers, byokEnabled, isLoading: providersLoading, unread: providersUnread } = useConfiguredProviders({ enabled: running });
   const queryClient = useQueryClient();
   const tokenTarget: TokenTarget | null = !claudeCodeAnswer ? null
     : savedTarget ? SAVED_TOKEN
@@ -88,9 +94,7 @@ export function useSetupFacts({ refetchInterval = false }: { refetchInterval?: n
   // A connection that runs a turn, as the model filters count one: a
   // subscription signed in, a key only while BYOK is on where it can be off,
   // either only while the account's rules allow it.
-  const { policy } = useAccount();
-  // DALTON-HOOK(dalton-setup): use the unified team-model availability check in Dalton
-  const team = useDaltonTeamModels();
+  // DALTON-HOOK(dalton-setup): providers, policy, and team availability already read above
   const providerConnected = providers.some((p) => p.masked_key !== SERVER_KEY
     && (p.access_type === 'oauth'
       ? allows(policy, RULE.ownSubscriptions) && p.state === 'connected'

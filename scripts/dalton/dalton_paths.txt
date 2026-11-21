@@ -515,3 +515,7 @@ web/src/pages/Setup/answers/useTeamModels.ts
 web/src/pages/Setup/__tests__/SetupWizard.dalton.test.tsx
 web/src/pages/Setup/__tests__/SetupWizard.firstRun.dalton.test.tsx
 web/src/pages/Setup/__tests__/daltonBrand.test.tsx
+web/src/hooks/__tests__/useOnboardingRoute.dalton.test.tsx
+web/src/pages/Setup/answers/__tests__/daltonSetup.test.ts
+web/src/pages/Setup/answers/daltonTeamModelsCheck.ts
+web/src/pages/Setup/answers/useTeamModelsAvailable.ts

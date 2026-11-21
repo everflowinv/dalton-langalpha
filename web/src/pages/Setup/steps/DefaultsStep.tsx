@@ -10,7 +10,6 @@ import { Loader } from '@/components/ui/loader';
 import { ModelTierConfig } from '@/components/model/ModelTierConfig';
 import { ModelSelector } from '@/components/model/ModelSelector';
 import { FallbackModelsPicker } from '@/components/model/FallbackModelsPicker';
-import { useAllModels } from '@/hooks/useAllModels';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { useTranslation } from 'react-i18next';
@@ -18,14 +17,18 @@ import { modelPrefs, splitPreferenceWrite, starredModels } from '@/lib/modelPref
 import { apiErrorDetail } from '@/api/errors';
 import { suggestBackgroundModel } from './suggestBackgroundModel';
 import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
-// DALTON-HOOK(dalton-setup): Dalton build defaults, team credential notice, and credits/Claude Code filtering
+// DALTON-HOOK(dalton-setup): Dalton build defaults, unified team-model availability, and credits/Claude Code filtering
+import { getModelDisplayName } from '@/components/ui/chat-input.helpers';
 import { isDaltonBuild } from '@/config/brand';
 import {
   DALTON_BACKGROUND_MODEL,
   DALTON_DEFAULT_MODEL,
+  dedupeDaltonBackgroundModels,
   filterDaltonPayers,
   filterDaltonProviderModels,
+  stripEffortFromModelLabel,
 } from '@/config/daltonSetup';
+import { RowButton, StepLoadFailed } from '../answers/parts';
 import { useDaltonTeamModels } from '../answers/useTeamModels';
 
 // ---------------------------------------------------------------------------
@@ -48,18 +51,19 @@ export default function DefaultsStep() {
 
 function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; prefsFailed: boolean }) {
   const navigate = useNavigate();
-  const { models, slotModels, metadata, payers, systemDefaults, isLoading } = useAllModels();
+  // DALTON-HOOK(dalton-setup): read unified Dalton team-model availability instead of raw sharing flag
+  const team = useDaltonTeamModels();
+  const { models, slotModels, metadata, payers, systemDefaults, isLoading } = team.all;
   const { preferences } = usePreferences();
   const updatePreferences = useUpdatePreferences();
   const { t } = useTranslation();
   const copy = useModelSlotCopy();
-  const teamShared = useDaltonTeamModels().shared;
   const headingId = useId();
 
-  // DALTON-HOOK(dalton-setup): filter out credits & Claude Code models under Dalton
+  // DALTON-HOOK(dalton-setup): filter out credits, Claude Code, and rejected-credential models under Dalton
   const visiblePayers = filterDaltonPayers(payers, isDaltonBuild);
-  const visibleModels = filterDaltonProviderModels(models, metadata, payers, isDaltonBuild);
-  const visibleSlotModels = filterDaltonProviderModels(slotModels, metadata, payers, isDaltonBuild);
+  const visibleModels = filterDaltonProviderModels(models, metadata, payers, isDaltonBuild, team.rejectedProviders);
+  const visibleSlotModels = filterDaltonProviderModels(slotModels, metadata, payers, isDaltonBuild, team.rejectedProviders);
 
   // ---------------------------------------------------------------------------
   // Selection state — seed from existing preferences if available
@@ -91,30 +95,38 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
   // they just picked. Set during render like the Background fill below.
   // From the slot models, so the fill never lands on a conversation-only
   // model (Claude Code); the user may still pick one.
-  // DALTON-HOOK(dalton-setup): seed defaults from Dalton-filtered slots and recommended models
+  // DALTON-HOOK(dalton-setup): enforce live catalog membership only in Dalton builds; non-Dalton preserves upstream behavior
+  const availablePrimary = Object.values(visibleModels).flatMap((p) => p.models ?? []);
   const fillable = Object.values(visibleSlotModels).flatMap((p) => p.models ?? []);
-  const primaryFill = !primaryModel && !isLoading && prefsLoaded
+  const primaryValid = Boolean(primaryModel) && (!isDaltonBuild || availablePrimary.includes(primaryModel));
+  const backgroundValid = Boolean(backgroundModel) && (!isDaltonBuild || fillable.includes(backgroundModel));
+  const catalogReady = !isLoading && (!isDaltonBuild || (!team.isLoading && !team.unread));
+  const primaryFill = !primaryValid && catalogReady && prefsLoaded
     ? (isDaltonBuild
       ? [DALTON_DEFAULT_MODEL, systemDefaults?.default_model, ...starredModels(preferences)]
       : [systemDefaults?.default_model, ...starredModels(preferences)]
     ).find(
-        (m): m is string => typeof m === 'string' && fillable.includes(m),
-      ) ?? fillable[0]
+        (m): m is string => typeof m === 'string' && fillable.includes(m) && (!isDaltonBuild || availablePrimary.includes(m)),
+      ) ?? (isDaltonBuild ? fillable.find((m) => availablePrimary.includes(m)) : fillable[0])
     : undefined;
-  if (primaryFill) setPrimaryModel(primaryFill);
+  if (primaryFill && primaryFill !== primaryModel) setPrimaryModel(primaryFill);
 
   // A first run fills both defaults, so an empty Background slot takes a model to
   // go with the primary, set during render so the slot never paints empty.
   // The fill is a pick like any other: it stays when the primary changes, and
   // nothing is saved before Continue.
-  const backgroundFill = !backgroundModel && primaryModel && prefsLoaded
+  // DALTON-HOOK(dalton-setup): validate catalog membership before enabling Continue in Dalton builds only
+  const effectivePrimary = primaryValid ? primaryModel : (primaryFill ?? '');
+  const backgroundFill = !backgroundValid && effectivePrimary && catalogReady && prefsLoaded
     ? (isDaltonBuild && fillable.includes(DALTON_BACKGROUND_MODEL)
       ? DALTON_BACKGROUND_MODEL
-      : suggestBackgroundModel(visibleSlotModels, primaryModel))
+      : suggestBackgroundModel(visibleSlotModels, effectivePrimary))
     : undefined;
-  if (backgroundFill) setBackgroundModel(backgroundFill);
+  if (backgroundFill && backgroundFill !== backgroundModel) setBackgroundModel(backgroundFill);
 
-  const canContinue = prefsLoaded && Boolean(primaryModel && backgroundModel);
+  const canContinue = isDaltonBuild
+    ? prefsLoaded && catalogReady && primaryValid && backgroundValid
+    : prefsLoaded && Boolean(primaryModel && backgroundModel);
 
   // ---------------------------------------------------------------------------
   // Handlers
@@ -142,15 +154,20 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
       // resolves a blank fetch model from the Background model, and a
       // blank compaction model from the conversation's own, at turn time, so a
       // later change in Settings keeps following it.
-      const compaction = advancedModels.compactionModel || null;
-      const fetchModel = advancedModels.fetchModel || null;
+      // DALTON-HOOK(dalton-setup): drop unavailable advanced routing models before saving under Dalton
+      const validSlot = (m: string) => (isDaltonBuild ? (fillable.includes(m) ? m : null) : (m || null));
+      const compaction = validSlot(advancedModels.compactionModel);
+      const fetchModel = validSlot(advancedModels.fetchModel);
+      const fallbacks = isDaltonBuild
+        ? advancedModels.fallbackModels.filter((m) => fillable.includes(m))
+        : advancedModels.fallbackModels;
 
       await updatePreferences.mutateAsync(splitPreferenceWrite({
         preferred_model: primaryModel,
         preferred_background_model: backgroundModel,
         compaction_model: compaction,
         fetch_model: fetchModel,
-        fallback_models: advancedModels.fallbackModels,
+        fallback_models: fallbacks,
       }));
 
       navigate('/setup/ready');
@@ -160,28 +177,46 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
     } finally {
       setSaving(false);
     }
-  }, [canContinue, primaryModel, backgroundModel, advancedModels, updatePreferences, navigate, t]);
+  }, [canContinue, primaryModel, backgroundModel, advancedModels, fillable, updatePreferences, navigate, t]);
 
   // ---------------------------------------------------------------------------
   // Render
   // ---------------------------------------------------------------------------
 
-  if (isLoading) {
+  // DALTON-HOOK(dalton-setup): wait for team-model reads and surface retry on failed reads
+  if (isLoading || (isDaltonBuild && team.isLoading)) {
     return (
       <div className="flex items-center justify-center py-20">
         <Loader size={20} className="text-(--color-text-tertiary)" label={t('common.loading')} />
       </div>
     );
   }
+  if (isDaltonBuild && team.shared && team.unread) {
+    return <StepLoadFailed onRetry={team.retry} />;
+  }
 
   // In platform mode, models are already tier-filtered by useAllModels.
   // In OSS mode, they're filtered by configured providers.
   // Either way, `models` is the correct set to display.
+  const teamEmpty = isDaltonBuild && team.shared && (team.empty || availablePrimary.length === 0);
 
   return (
     <div>
       <WizardStepHeader titleId={headingId} title={t('setup.chooseYourModels')} helper={copy.chooseDesc} />
       <div className="flex flex-col gap-4 sm:gap-6">
+      {teamEmpty ? (
+        /* DALTON-HOOK(dalton-setup): reuse DefaultStep's contact-admin & retry notice when team models are empty */
+        <div
+          data-testid="setup-defaults-team-models-empty"
+          className="shell-box flex items-center justify-between gap-3 px-4 py-3"
+        >
+          <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
+            {t('setup.answers.default.teamModelsEmpty')}
+          </p>
+          <RowButton onClick={team.retry}>{t('setup.answers.tryAgain')}</RowButton>
+        </div>
+      ) : (
+        <>
       {/* Model access reminder: a neutral panel with the accent on its icon
           alone; amber annotates, it does not wash or ring (DESIGN.md, accent
           discipline). */}
@@ -194,19 +229,20 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
           className="text-xs leading-relaxed"
           style={{ color: 'var(--color-text-secondary)' }}
         >
-          {/* DALTON-HOOK(dalton-setup): show team-configured access note & filtered models */}
-          {isDaltonBuild && teamShared ? t('setup.daltonModelAccessNote') : t('setup.modelAccessReminder')}
+          {/* DALTON-HOOK(dalton-setup): show team-configured note only when Dalton team models are actually available */}
+          {isDaltonBuild && team.available ? t('setup.daltonModelAccessNote') : t('setup.modelAccessReminder')}
         </p>
       </div>
 
-      {/* Model tier config */}
+      {/* DALTON-HOOK(dalton-setup): dedupe background effort variants & omit effort suffix in Dalton */}
       <ModelTierConfig
         models={visibleModels}
-        backgroundModels={visibleSlotModels}
+        backgroundModels={dedupeDaltonBackgroundModels(visibleSlotModels, isDaltonBuild)}
         primaryModel={primaryModel}
         onPrimaryModelChange={setPrimaryModel}
         backgroundModel={backgroundModel}
         onBackgroundModelChange={setBackgroundModel}
+        backgroundNameOf={isDaltonBuild ? (m) => stripEffortFromModelLabel(getModelDisplayName(m, metadata)) : undefined}
         showExplainer
         payers={visiblePayers}
         metadata={metadata}
@@ -274,6 +310,8 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
           )}
         </AnimatePresence>
       </div>
+        </>
+      )}
 
       {/* A read that failed: nothing is filled, and nothing can be saved over it. */}
       {prefsFailed && (

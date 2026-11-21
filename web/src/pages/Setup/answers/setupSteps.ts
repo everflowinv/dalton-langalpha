@@ -55,10 +55,14 @@ export function readAnswers(progress: Pick<OnboardingProgress, 'models' | 'runs_
   return { models: progress.models, runsOn: progress.runs_on };
 }
 
-// DALTON-HOOK(dalton-setup): treat legacy model answers as team models when Dalton team models are available
+// DALTON-HOOK(dalton-setup): normalize legacy model answers in Dalton (never expose claude_code; map to team or subscription_or_key)
 export function effectiveModelsAnswer(models: ModelsAnswer, teamModelsAvailable = false): ModelsAnswer {
-  if (isDaltonBuild && teamModelsAvailable && (models === 'subscription_or_key' || models === 'claude_code')) {
+  if (!isDaltonBuild) return models;
+  if (teamModelsAvailable && (models === 'subscription_or_key' || models === 'claude_code')) {
     return 'langalpha_models';
+  }
+  if (models === 'claude_code') {
+    return 'subscription_or_key';
   }
   return models;
 }
@@ -66,7 +70,7 @@ export function effectiveModelsAnswer(models: ModelsAnswer, teamModelsAvailable 
 /** Whether the answers need a model connected in setup. */
 export const needsModelStep = (answers: SetupAnswers, teamModelsAvailable = false): boolean => {
   const models = effectiveModelsAnswer(answers.models, teamModelsAvailable);
-  return models !== 'langalpha_models' && !(isDaltonBuild && models === 'claude_code');
+  return models !== 'langalpha_models';
 };
 
 /**

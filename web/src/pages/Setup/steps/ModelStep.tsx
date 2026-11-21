@@ -65,7 +65,7 @@ export default function ModelStep() {
   }
   if (isDaltonBuild && effectiveModels === 'claude_code') return <Navigate to="/setup/use" replace />;
   if (effectiveModels === 'langalpha_models') return <Navigate to="/setup/default" replace />;
-  if (effectiveModels !== 'claude_code') return <SubscriptionStep flow={flow} />;
+  if (effectiveModels !== 'claude_code') return <SubscriptionStep flow={flow} teamModelsAvailable={team.available} />;
   switch (step.kind) {
     case 'loading':
       return <StepLoading />;
@@ -118,7 +118,8 @@ type ClaudeCodeStepState =
  * it keeps when self-hosted, and stores none without it when hosted.
  */
 function useClaudeCodeStep(flow: Flow): ClaudeCodeStepState {
-  const answered = flow.answers?.models === 'claude_code';
+  // DALTON-HOOK(dalton-setup): never query Claude Code setup in Dalton builds
+  const answered = !isDaltonBuild && flow.answers?.models === 'claude_code';
   const saved = flow.tokenTarget?.kind === 'saved';
   const { setup, isLoading, unread, retry: retrySetup } = useClaudeCodeSetup({ enabled: answered });
   // A rule against the user's own subscriptions keeps Claude Code off too:
@@ -250,7 +251,8 @@ function ClaudeCodeTokenStep({ flow, askConsent }: { flow: Flow; askConsent: boo
   );
 }
 
-function SubscriptionStep({ flow }: { flow: Flow }) {
+// DALTON-HOOK(dalton-setup): pass teamModelsAvailable to AnswersStrip
+function SubscriptionStep({ flow, teamModelsAvailable }: { flow: Flow; teamModelsAvailable: boolean }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
@@ -284,7 +286,8 @@ function SubscriptionStep({ flow }: { flow: Flow }) {
 
   return (
     <div>
-      {flow.first && flow.answers && <AnswersStrip answers={flow.answers} />}
+      {/* DALTON-HOOK(dalton-setup): normalize legacy answer chips in AnswersStrip */}
+      {flow.first && flow.answers && <AnswersStrip answers={flow.answers} teamModelsAvailable={teamModelsAvailable} />}
       <WizardStepHeader titleId={headingId} title={t('setup.answers.model.subTitle')} helper={t('setup.answers.model.subLead')} />
       {/* The legacy Claude sign-in is left to Settings: Claude Code is an answer of its own. */}
       <SubscriptionChoices

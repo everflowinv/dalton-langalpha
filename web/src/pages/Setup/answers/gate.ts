@@ -52,8 +52,8 @@ export function onboardingRoute(input: OnboardingRouteInput): OnboardingRoute {
   if (input.hasAnswers) {
     if (input.next === null) return { kind: 'loading' };
     if (input.setupCompleted || input.next === 'done') return { kind: 'done' };
-    // DALTON-HOOK(dalton-setup): treat legacy mac_pending ownership as browser in Dalton builds
-    const owner = isDaltonBuild && input.setupOn === 'mac_pending' ? 'browser' : input.setupOn;
+    // DALTON-HOOK(dalton-setup): treat legacy mac_pending and app ownership as browser in Dalton builds
+    const owner = isDaltonBuild && (input.setupOn === 'mac_pending' || input.setupOn === 'app') ? 'browser' : input.setupOn;
     return { kind: 'answers', next: input.next, nextPath: nextSetupPath(input.next), owner, unpaired: input.unpaired };
   }
   if (!input.platform && !input.onboarded) return { kind: 'questions', unpaired: input.unpaired };

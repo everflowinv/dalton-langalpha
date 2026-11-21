@@ -6,6 +6,7 @@ import copy
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -339,6 +340,54 @@ def _enforce_pinned_overlay_routes(llm_config: dict[str, Any]) -> None:
             llm_config[key] = copy.deepcopy(entry)
 
 
+_ANTIGRAVITY_EFFORT_RE = re.compile(r"-(?:minimal|low|medium|high|xhigh|max)$")
+
+
+def antigravity_gemini_direct_base(entry: dict[str, Any]) -> str | None:
+    """Return the direct Gemini manifest key (e.g. ``gemini-4-neon``) for an
+    ``antigravity-oauth`` Gemini entry, or ``None`` for any other entry."""
+    if entry.get("provider") != "antigravity-oauth":
+        return None
+    model_id = str(entry.get("model_id") or "")
+    if not model_id:
+        return None
+    # The caller keeps only a base whose catalog entry is a direct ``gemini`` row,
+    # so non-Gemini Antigravity models (Claude, GPT-OSS) inherit nothing.
+    return _ANTIGRAVITY_EFFORT_RE.sub("", model_id)
+
+
+def inherit_antigravity_gemini_ratings(
+    entries: dict[str, Any],
+    source_catalog: dict[str, Any] | None = None,
+) -> int:
+    """Fill missing ``intelligence`` / ``speed`` ratings on ``antigravity-oauth``
+    Gemini entries from their matching direct ``gemini`` API manifest entry
+    (e.g. ``gemini-4-neon`` -> ``gemini-4-neon-*-oauth``).
+
+    Existing explicit ratings and non-Antigravity (or non-Gemini) entries are
+    left untouched. Returns the number of entries that gained at least one rating.
+    """
+    catalog = source_catalog if source_catalog is not None else entries
+    updated = 0
+    for entry in entries.values():
+        if not isinstance(entry, dict):
+            continue
+        base_key = antigravity_gemini_direct_base(entry)
+        if not base_key:
+            continue
+        direct = catalog.get(base_key)
+        if not isinstance(direct, dict) or direct.get("provider") != "gemini":
+            continue
+        changed = False
+        for field in ("intelligence", "speed"):
+            if entry.get(field) is None and isinstance(direct.get(field), int):
+                entry[field] = direct[field]
+                changed = True
+        if changed:
+            updated += 1
+    return updated
+
+
 def apply_model_overlay(
     llm_config: dict[str, Any],
     manifest: dict[str, Any],
@@ -361,6 +410,7 @@ def apply_model_overlay(
         overlay = load_overlay_data(path)
         if overlay:
             _merge_single_overlay(overlay, path.name, llm_config, manifest)
+        inherit_antigravity_gemini_ratings(llm_config)
         return stamp
 
     retired_records: list[dict[str, Any]] = []
@@ -376,6 +426,7 @@ def apply_model_overlay(
     if retired_records:
         _drop_retired_models(retired_records, llm_config, manifest)
     _enforce_pinned_overlay_routes(llm_config)
+    inherit_antigravity_gemini_ratings(llm_config)
     return stamp
 
 
