@@ -1,7 +1,6 @@
 import React, { useState, useRef, useCallback, useEffect, useId } from 'react';
 import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
-import { useNavigate } from 'react-router';
 import { X, Upload, FileText, CheckCircle2, Circle, AlertCircle } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
 import { buttonSlot } from '@/components/ui/button-class';
@@ -16,6 +15,8 @@ import { useOpenComputers } from '../hooks/useOpenComputers';
 import { ComputerRefusal, type ComputerRefusalKind } from './ComputerRefusal';
 import { createWorkspaceDenialMessage, denialMessage } from '../utils/denialMessage';
 import { clampWorkspaceName } from '../utils/workspaceName';
+// DALTON-HOOK(workspace-dedup): duplicate company workspace check helper & notice card
+import { DuplicateCompanyNotice } from './dalton/DuplicateCompanyNotice';
 import {
   companyWorkspaceExistsOf,
   type CompanyWorkspaceExistsInfo,
@@ -41,8 +42,8 @@ type FileUploadStatus = 'pending' | 'uploading' | 'done' | 'failed';
 /** Why the form can't go on: in words, or for want of a computer Home can live on. */
 type FormRefusal =
   | { kind: 'message'; message: string }
-  // DALTON-HOOK(workspace-dedup): non-fatal duplicate company workspace notice with open/override actions
-  | ({ kind: 'companyExists' } & CompanyWorkspaceExistsInfo)
+  // DALTON-HOOK(workspace-dedup): non-fatal duplicate company workspace notice bound to requestedName
+  | ({ kind: 'companyExists'; requestedName: string } & CompanyWorkspaceExistsInfo)
   | Exclude<ComputerRefusalKind, { kind: 'onlyComputer' }>;
 
 /**
@@ -58,7 +59,6 @@ type FormRefusal =
 function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateWorkspaceModalProps) {
   const { t } = useTranslation();
   const locale = useLocale();
-  const navigate = useNavigate();
 
   // Lock body scroll while modal is open
   useEffect(() => {
@@ -70,6 +70,8 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
 
   // Form state
   const [name, setName] = useState('');
+  // DALTON-HOOK(workspace-dedup): track latest typed name to discard stale 409 dedup responses
+  const latestNameRef = useRef('');
   const [description, setDescription] = useState('');
   const [queuedFiles, setQueuedFiles] = useState<File[]>([]);
   // Why the form can't go on: in words, or for want of a computer (none is
@@ -209,9 +211,11 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
     setCreationStep(failed ? 'error' : 'done');
   };
 
-  const submitCreate = async (allowDuplicateCompany = false) => {
-    if (!name.trim() || submitting || preparingTarget) {
-      if (!name.trim()) setRefusal({ kind: 'message', message: t('workspace.workspaceNameRequired') });
+  // DALTON-HOOK(workspace-dedup): support optional allowDuplicateCompany and lock override to the 409'd name
+  const submitCreate = async (allowDuplicateCompany = false, overrideName?: string) => {
+    const submittedName = (overrideName ?? name).trim();
+    if (!submittedName || submitting || preparingTarget) {
+      if (!submittedName) setRefusal({ kind: 'message', message: t('workspace.workspaceNameRequired') });
       return;
     }
 
@@ -221,7 +225,7 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
     let workspace: Workspace;
     try {
       workspace = await onCreate({
-        name: name.trim(),
+        name: submittedName,
         description: description.trim(),
         ...(choosesComputer && target ? { computerId: target.computer_id } : {}),
         ...(allowDuplicateCompany ? { allowDuplicateCompany: true } : {}),
@@ -235,8 +239,11 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
       const companyExists = companyWorkspaceExistsOf(err);
       if (isNeedsComputer(err)) setRefusal({ kind: 'needsComputer' });
       else if (backupOff) setRefusal({ kind: 'needsBackup', ...backupOff });
-      else if (companyExists) setRefusal({ kind: 'companyExists', ...companyExists });
-      else setRefusal({ kind: 'message', message: createWorkspaceDenialMessage(err, t) });
+      else if (companyExists) {
+        if (latestNameRef.current.trim() === submittedName) {
+          setRefusal({ kind: 'companyExists', requestedName: submittedName, ...companyExists });
+        }
+      } else setRefusal({ kind: 'message', message: createWorkspaceDenialMessage(err, t) });
       return;
     }
 
@@ -255,17 +262,10 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
     await runUploads(workspace);
   };
 
+  // DALTON-HOOK(workspace-dedup): default form submit runs company dedup check
   const handleSubmit = async (e: React.FormEvent | Event) => {
     e.preventDefault();
     await submitCreate(false);
-  };
-
-  // DALTON-HOOK(workspace-dedup): jump directly to a readable existing company workspace
-  const handleOpenExistingWorkspace = (workspaceId: string, workspaceName: string) => {
-    resetAndClose();
-    navigate(`/chat/${workspaceId}`, {
-      state: { workspaceName, workspaceStatus: null },
-    });
   };
 
   // ---- Retry (after an upload failure) ----
@@ -278,6 +278,8 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
 
   const resetAndClose = () => {
     setName('');
+    // DALTON-HOOK(workspace-dedup): clear tracked name ref when resetting modal
+    latestNameRef.current = '';
     setDescription('');
     setQueuedFiles([]);
     setRefusal(null);
@@ -427,7 +429,10 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
               type="text"
               value={name}
               onChange={(e) => {
-                setName(clampWorkspaceName(e.target.value));
+                const nextName = clampWorkspaceName(e.target.value);
+                setName(nextName);
+                // DALTON-HOOK(workspace-dedup): keep tracked name current and clear dedup refusal on edit
+                latestNameRef.current = nextName;
                 if (refusal?.kind === 'companyExists') setRefusal(null);
               }}
               placeholder={t('workspace.enterWorkspaceName')}
@@ -547,72 +552,15 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
 
           {/* Error */}
           {refusal?.kind === 'message' && <div className="cwm-error">{refusal.message}</div>}
-          {/* DALTON-HOOK(workspace-dedup): duplicate company workspace matches list */}
+          {/* DALTON-HOOK(workspace-dedup): duplicate company workspace notice card */}
           {refusal?.kind === 'companyExists' && (
-            <div className="cwm-dup-card" role="alert">
-              {refusal.message && <div className="cwm-dup-message">{refusal.message}</div>}
-              {refusal.matches.length > 0 && (
-                <ul className="cwm-dup-list">
-                  {refusal.matches.map((match, idx) => (
-                    <li
-                      key={match.workspace_id || `${match.owner_name}-${match.workspace_name}-${idx}`}
-                      className="cwm-dup-item"
-                    >
-                      <div className="cwm-dup-item-info">
-                        <div className="cwm-dup-item-title">
-                          <span className="cwm-dup-ws-name">{match.workspace_name}</span>
-                          {match.ticker && <span className="cwm-dup-ticker">{match.ticker}</span>}
-                        </div>
-                        <div className="cwm-dup-item-meta">
-                          <span>
-                            {t('workspace.duplicateCompany.ownerLabel', 'Owner: {{owner}}', {
-                              owner: match.owner_name,
-                            })}
-                          </span>
-                          {match.lead_analyst_name && (
-                            <span>
-                              {' · '}
-                              {t('workspace.duplicateCompany.leadLabel', 'Lead: {{lead}}', {
-                                lead: match.lead_analyst_name,
-                              })}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                      <div className="cwm-dup-item-action">
-                        {match.can_read && match.workspace_id ? (
-                          <button
-                            type="button"
-                            {...buttonSlot('outline')}
-                            className="cwm-dup-open-btn"
-                            onClick={() =>
-                              handleOpenExistingWorkspace(match.workspace_id!, match.workspace_name)
-                            }
-                          >
-                            {t('workspace.duplicateCompany.openWorkspace', 'Open this workspace')}
-                          </button>
-                        ) : (
-                          <span className="cwm-dup-unreadable">
-                            {t('workspace.duplicateCompany.askOwnerShare', 'Ask the owner to share access')}
-                          </span>
-                        )}
-                      </div>
-                    </li>
-                  ))}
-                </ul>
-              )}
-              <div className="cwm-dup-footer">
-                <button
-                  type="button"
-                  {...buttonSlot('outline')}
-                  className="cwm-dup-anyway-btn"
-                  disabled={submitting || !!preparingTarget}
-                  onClick={() => void submitCreate(true)}
-                >
-                  {t('workspace.duplicateCompany.createAnyway', 'Create anyway')}
-                </button>
-              </div>
-            </div>
+            <DuplicateCompanyNotice
+              requestedName={refusal.requestedName}
+              matches={refusal.matches}
+              disabled={submitting || !!preparingTarget}
+              onCloseModal={resetAndClose}
+              onCreateAnyway={(requested) => void submitCreate(true, requested)}
+            />
           )}
           {refusal && refusal.kind !== 'message' && refusal.kind !== 'companyExists' && (
             <ComputerRefusal

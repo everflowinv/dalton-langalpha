@@ -1789,6 +1789,10 @@
     "filesFailed": "· {{count}} failed",
     "openWorkspace": "Open Workspace",
     "duplicateCompany": {
+      "summaryReadableWithLead": "{{company}} already has a workspace \"{{workspace}}\" (owner: {{owner}}, lead: {{lead}}). Continue there, or confirm to create another.",
+      "summaryReadable": "{{company}} already has a workspace \"{{workspace}}\" (owner: {{owner}}). Continue there, or confirm to create another.",
+      "summaryUnreadable": "{{company}} already has a workspace \"{{workspace}}\" (owner: {{owner}}). You do not have access yet — ask {{owner}} to share it, or confirm to create another.",
+      "summaryFallback": "A workspace for \"{{company}}\" already exists. Confirm to create another.",
       "openWorkspace": "Open this workspace",
       "askOwnerShare": "Ask the owner to share access",
       "createAnyway": "Create anyway",

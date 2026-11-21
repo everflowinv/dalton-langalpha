@@ -251,24 +251,41 @@ async def create_workspace(
             or computer_id
         )
         # --- DALTON-HOOK(workspace-dedup): begin ---
+        from src.dalton.coverage.dedup import find_existing_company_workspace
+
         if request.allow_duplicate_company:
+            matched_ids: list[str] = []
+            try:
+                dup_for_log = await find_existing_company_workspace(
+                    x_user_id, request.name, channel="web"
+                )
+                if dup_for_log is not None:
+                    matched_ids = list(
+                        dup_for_log.matched_workspace_ids
+                        or [
+                            m.workspace_id
+                            for m in dup_for_log.matches
+                            if m.workspace_id
+                        ]
+                    )
+            except Exception:
+                matched_ids = []
             logger.info(
-                "Skipping company workspace dedup check (allow_duplicate_company=True, user_id=%s, name=%r)",
+                "Skipping company workspace dedup check (allow_duplicate_company=True, user_id=%s, name=%r, matched_workspace_ids=%s)",
                 x_user_id,
                 request.name,
+                matched_ids,
             )
         else:
-            from src.dalton.coverage.dedup import find_existing_company_workspace
-
             dup = None
             try:
-                dup = await find_existing_company_workspace(x_user_id, request.name)
+                dup = await find_existing_company_workspace(
+                    x_user_id, request.name, channel="web"
+                )
             except Exception as exc:
                 logger.warning(
-                    "Company workspace dedup check failed for user %s (%r); proceeding: %s",
-                    x_user_id,
-                    request.name,
-                    exc,
+                    "Company workspace dedup check failed (%s); proceeding",
+                    type(exc).__name__,
                 )
             if dup is not None:
                 raise HTTPException(

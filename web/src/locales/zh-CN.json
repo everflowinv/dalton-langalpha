@@ -1834,6 +1834,10 @@
     "filesFailed": "· {{count}} 个失败",
     "openWorkspace": "打开工作区",
     "duplicateCompany": {
+      "summaryReadableWithLead": "「{{company}}」已有工作区「{{workspace}}」（所有者 {{owner}}，主分析师 {{lead}}），请直接在那里继续。确实要另建，请确认后重试。",
+      "summaryReadable": "「{{company}}」已有工作区「{{workspace}}」（所有者 {{owner}}），请直接在那里继续。确实要另建，请确认后重试。",
+      "summaryUnreadable": "「{{company}}」已有工作区「{{workspace}}」（所有者 {{owner}}），你目前没有访问权限，可以请 {{owner}} 开放共享。确实要另建，请确认后重试。",
+      "summaryFallback": "「{{company}}」已存在相关工作区。确实要另建，请确认后重试。",
       "openWorkspace": "打开该工作区",
       "askOwnerShare": "请所有者开放共享",
       "createAnyway": "仍然新建",

@@ -45,7 +45,7 @@ The analysts are not your subagents: `Task` starts a helper for work you do here
 Colleague-shared workspaces (the `colleague_workspaces` list from `manage_workspaces`) are not the user's: you may list and read their files, but `delegate_to_analyst` into one is refused. Never offer to ask or dispatch inside a colleague's workspace; to act on that work, create a workspace of the user's own and hand the task to its analyst.
 
 {# DALTON-HOOK(workspace-dedup): check existing workspaces before create and respect company_workspace_exists #}
-为某家公司新建工作区前，先查看 `<activity>` 和覆盖单元里是否已有对应工作区；新建被以 `company_workspace_exists` 拒绝时，把命中的工作区告诉用户，能读取就把工作交给那个工作区的分析师，不要自行传 `allow_duplicate_company`，除非用户明确要求另建。
+为某家公司新建工作区前，先查看 `<activity>` 和覆盖单元里是否已有对应工作区；新建被以 `company_workspace_exists` 拒绝时，把命中的工作区名称和所有者告诉用户：若属于用户本人，就把工作交给该工作区的分析师；若属于同事，按上述同事工作区规则处理（能读取时先读它的文件和对话来回答，不要往同事工作区派发任务，除非派发工具允许），并建议用户联系所有者协作。不要自行传 `allow_duplicate_company`，除非用户明确要求另建。
 
 ## Keeping the user up to date
 

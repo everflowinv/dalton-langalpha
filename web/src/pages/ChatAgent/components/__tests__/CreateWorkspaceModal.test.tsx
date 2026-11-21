@@ -472,9 +472,9 @@ describe('CreateWorkspaceModal, a computer still being prepared', () => {
   });
 });
 
-// DALTON-HOOK(workspace-dedup): duplicate company workspace refusal UX (open readable, ask owner, create anyway)
+// DALTON-HOOK(workspace-dedup): duplicate company workspace refusal UX (open readable, ask owner, i18n, name-change reset, create anyway)
 describe('CreateWorkspaceModal, duplicate company workspace', () => {
-  it('offers "Open this workspace" for readable matches and navigates there on click', async () => {
+  it('offers "Open this workspace" for readable matches using i18n copy and navigates there on click', async () => {
     const user = userEvent.setup();
     const existingId = '99999999-9999-4999-8999-999999999999';
     const onCreate = vi.fn().mockRejectedValue(
@@ -484,7 +484,7 @@ describe('CreateWorkspaceModal, duplicate company workspace', () => {
           data: {
             detail: {
               code: 'company_workspace_exists',
-              message: '「Anthropic」已有工作区「ANT」（所有者 Richard，主分析师 Richard），请直接在那里继续。确实要另建，请确认后重试。',
+              message: '服务端中文提示不应直接展示',
               matches: [
                 {
                   workspace_id: existingId,
@@ -506,8 +506,9 @@ describe('CreateWorkspaceModal, duplicate company workspace', () => {
     await user.click(screen.getByRole('button', { name: /^create$/i }));
 
     const card = await screen.findByRole('alert');
-    expect(card).toHaveTextContent('ANT');
+    expect(card).toHaveTextContent('Anthropic already has a workspace "ANT"');
     expect(card).toHaveTextContent('Richard');
+    expect(card).not.toHaveTextContent('服务端中文提示不应直接展示');
     expect(onComplete).not.toHaveBeenCalled();
 
     await user.click(within(card).getByRole('button', { name: 'Open this workspace' }));
@@ -515,7 +516,7 @@ describe('CreateWorkspaceModal, duplicate company workspace', () => {
     expect(screen.getByTestId('path')).toHaveTextContent(`/chat/${existingId}`);
   });
 
-  it('shows share notice for unreadable matches and resubmits with allowDuplicateCompany on "Create anyway"', async () => {
+  it('shows share notice for unreadable matches, clears on edit, and resubmits the 409 name on "Create anyway"', async () => {
     const user = userEvent.setup();
     const onCreate = vi
       .fn()
@@ -526,7 +527,7 @@ describe('CreateWorkspaceModal, duplicate company workspace', () => {
             data: {
               detail: {
                 code: 'company_workspace_exists',
-                message: '「Anthropic」已有工作区「Anthropic」（所有者 CY），你目前没有访问权限，可以请 CY 开放共享。确实要另建，请确认后重试。',
+                message: '服务端中文提示不应直接展示',
                 matches: [
                   {
                     workspace_name: 'Anthropic',
@@ -542,11 +543,14 @@ describe('CreateWorkspaceModal, duplicate company workspace', () => {
       .mockResolvedValueOnce(LIVE_CREATED);
     const { onComplete } = setup(onCreate);
 
-    await user.type(screen.getByPlaceholderText(/name/i), 'Anthropic');
+    const input = screen.getByPlaceholderText(/name/i);
+    await user.type(input, 'Anthropic');
     await user.click(screen.getByRole('button', { name: /^create$/i }));
 
     const card = await screen.findByRole('alert');
+    expect(card).toHaveTextContent('Anthropic already has a workspace "Anthropic" (owner: CY)');
     expect(card).toHaveTextContent('Ask the owner to share access');
+    expect(card).not.toHaveTextContent('服务端中文提示不应直接展示');
     expect(within(card).queryByRole('button', { name: 'Open this workspace' })).not.toBeInTheDocument();
 
     await user.click(within(card).getByRole('button', { name: 'Create anyway' }));
@@ -558,5 +562,67 @@ describe('CreateWorkspaceModal, duplicate company workspace', () => {
       }),
     );
     await waitFor(() => expect(onComplete).toHaveBeenCalledWith(LIVE_CREATED));
+  });
+
+  it('clears the duplicate notice when the user edits the name, and ignores stale in-flight 409s', async () => {
+    const user = userEvent.setup();
+    let rejectFirst!: (err: unknown) => void;
+    const firstPending = new Promise<typeof LIVE_CREATED>((_resolve, reject) => {
+      rejectFirst = reject;
+    });
+    const onCreate = vi
+      .fn()
+      .mockReturnValueOnce(firstPending)
+      .mockRejectedValueOnce(
+        Object.assign(new Error('Request failed with status code 409'), {
+          response: {
+            status: 409,
+            data: {
+              detail: {
+                code: 'company_workspace_exists',
+                message: 'dup',
+                matches: [{ workspace_name: 'NVDA', owner_name: 'Richard', can_read: false }],
+              },
+            },
+          },
+        }),
+      );
+    setup(onCreate);
+
+    const input = screen.getByPlaceholderText(/name/i);
+    await user.type(input, 'Anthropic');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    // Edit the name while the "Anthropic" request is still in flight.
+    await user.clear(input);
+    await user.type(input, 'NVDA');
+
+    await act(async () => {
+      rejectFirst(
+        Object.assign(new Error('Request failed with status code 409'), {
+          response: {
+            status: 409,
+            data: {
+              detail: {
+                code: 'company_workspace_exists',
+                message: 'stale',
+                matches: [{ workspace_name: 'ANT', owner_name: 'Richard', can_read: false }],
+              },
+            },
+          },
+        }),
+      );
+    });
+
+    // Stale 409 for "Anthropic" must not render while input holds "NVDA".
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+    // Now submit "NVDA" and verify the 409 notice renders, then clears on edit.
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+    const card = await screen.findByRole('alert');
+    expect(card).toHaveTextContent('NVDA already has a workspace "NVDA"');
+
+    await user.type(input, ' Corp');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 });

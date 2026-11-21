@@ -1,12 +1,24 @@
-"""Company workspace deduplication before workspace creation.
+"""Company workspace deduplication before workspace creation (round 2).
 
-Covers matching rules (coverage unit ticker/name/aliases, normalized workspace
-name, ticker-shaped workspace names), exclusions (historical duplicate, Home,
-deleted, unbound, sector units, caller's own exact name_key), ordering/cap
-(coverage unit first, then activity timestamp, max 3), readability redaction
-(`workspace_id` omitted when unreadable), `allow_duplicate_company`, feature flag
-off, DB error passthrough, REST 409 response, and `manage_workspaces` create
-response. All test doubles use `create_autospec`.
+Covers:
+1. Deterministic `display_name` candidate derivation (parens, CJK/Latin boundary,
+   repeated corporate suffix stripping, >= 2 chars; 6 real prod display names)
+   and exclusion of unit `slug`;
+2. Strict `normalize_company_name` (keeps `+`, `#`, `&`, parens);
+3. Visibility boundaries: team mode (`is_dalton_supabase_auth_enabled()`),
+   `external` caller bypass, internal-only candidate units/workspaces/aliases;
+4. Channel-aware read access (`web` vs `cos`) and redaction of `ticker`,
+   `workspace_id`, `lead_analyst_name` when unreadable;
+5. Chief of Staff prompt non-contradiction;
+6. Caller's own exact `workspace_name_key` exits dedup early for `WorkspaceNameTaken`;
+7. Permission lookup failures (503 / `OwnerTierUnavailable`) and `dalton_coverage`
+   alias read failures allow creation and log only exception class + workspace count;
+8. DB connection released before permission checks, SQL projects only booleans
+   from `config` and filters in SQL;
+9. Sector exclusion reused from `company_routing._is_sector_workspace` and rule (b)
+   requires `identity.py` company classification;
+10. CoS dedup runs before `hitl_confirm` when `allow_duplicate_company=False`;
+12. `allow_duplicate_company=True` runs dedup once to audit-log matched workspace IDs.
 """
 
 from __future__ import annotations
@@ -24,15 +36,16 @@ from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 
 import src.dalton.coverage.dedup as dedup_mod
-import src.dalton.database.coverage_units as cu_db
 import src.dalton.sharing as sharing_mod
 from src.dalton.coverage.dedup import (
     DuplicateMatch,
     DuplicateWorkspaceCandidate,
+    derive_display_name_candidates,
     find_existing_company_workspace,
     normalize_company_name,
 )
 from src.dalton.coverage.identity import SOURCE_HISTORICAL_DUPLICATE
+from src.ptc_agent.agent.prompts import get_loader
 from src.server.database.home_workspace import (
     HOME_STAND_IN_KEY,
     get_home_stand_in_id,
@@ -44,12 +57,20 @@ from src.tools.secretary.tools import hitl_confirm, workspaces_create
 from tests.conftest import create_test_app
 
 _REAL_FIND_DEDUP = dedup_mod.find_existing_company_workspace
-_REAL_CAN_READ = cu_db._can_read_workspace
 _REAL_REQ_ACCESS = sharing_mod.require_workspace_access
+_REAL_GET_USER_TIER = dedup_mod.get_user_tier
 
 USER_CALLER = "user-caller"
 USER_RICHARD = "user-richard"
 USER_CY = "user-cy"
+USER_EXTERNAL = "user-external"
+USER_UNKNOWN = "user-unknown"
+
+EMAIL_CALLER = "caller@everflow.ai"
+EMAIL_RICHARD = "richard@everflow.ai"
+EMAIL_CY = "cy@everflow.ai"
+EMAIL_EXTERNAL = "guest@gmail.com"
+
 WS_1 = "11111111-1111-4111-8111-111111111111"
 WS_2 = "22222222-2222-4222-8222-222222222222"
 WS_3 = "33333333-3333-4333-8333-333333333333"
@@ -59,24 +80,61 @@ WS_5 = "55555555-5555-4555-8555-555555555555"
 NOW = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
 
 
+def _enable_team_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    coverage_enabled: bool = True,
+    supabase_auth: bool = True,
+    caller_tier: str = "internal",
+) -> None:
+    monkeypatch.setenv(
+        "DALTON_COVERAGE_UNITS_ENABLED", "true" if coverage_enabled else "false"
+    )
+    monkeypatch.setenv("HOST_MODE", "oss")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase" if supabase_auth else "none")
+    monkeypatch.setenv(
+        "DALTON_ALLOWED_EMAILS",
+        f"{EMAIL_CALLER},{EMAIL_RICHARD},{EMAIL_CY},alice@everflow.ai,bob@everflow.ai",
+    )
+
+    async def _tier(user_id: str | None) -> str:
+        if user_id == USER_EXTERNAL:
+            return "external"
+        return caller_tier
+
+    monkeypatch.setattr(
+        dedup_mod,
+        "get_user_tier",
+        create_autospec(_REAL_GET_USER_TIER, side_effect=_tier),
+    )
+
+
 def _install_db(
     monkeypatch: pytest.MonkeyPatch,
     *,
     unit_rows: list[dict[str, Any]] | None = None,
     ws_rows: list[dict[str, Any]] | None = None,
     coverage_rows: list[dict[str, Any]] | None = None,
+    doc_rows: list[dict[str, Any]] | None = None,
+    automation_rows: list[dict[str, Any]] | None = None,
     sql_log: list[tuple[str, Any]] | None = None,
+    fail_on_table: dict[str, Exception] | None = None,
     fail_on_execute: Exception | None = None,
+    conn_state: dict[str, bool] | None = None,
 ) -> None:
     """Install a `create_autospec` DB connection yielding deterministic query rows."""
     cursor = create_autospec(psycopg.AsyncCursor, instance=True)
     cursor.__aenter__.return_value = cursor
     cursor.__aexit__.return_value = None
     last_query: dict[str, str] = {"sql": ""}
+    table_errors = fail_on_table or {}
 
     async def _execute(sql: str, params: Any = None) -> None:
         if fail_on_execute is not None:
             raise fail_on_execute
+        for marker, exc in table_errors.items():
+            if marker in sql:
+                raise exc
         last_query["sql"] = sql
         if sql_log is not None:
             sql_log.append((sql, params))
@@ -89,420 +147,43 @@ def _install_db(
             return list(ws_rows or [])
         if "FROM dalton_coverage" in sql:
             return list(coverage_rows or [])
+        if "FROM dalton_knowledge_versions" in sql:
+            return list(doc_rows or [])
+        if "FROM automations" in sql:
+            return list(automation_rows or [])
         return []
 
     cursor.execute.side_effect = _execute
     cursor.fetchall.side_effect = _fetchall
 
     conn = create_autospec(psycopg.AsyncConnection, instance=True)
-
-    @asynccontextmanager
-    async def _tx():
-        yield conn
-
     conn.cursor.return_value = cursor
-    conn.transaction.side_effect = _tx
 
     @asynccontextmanager
     async def _get_conn(_conn: Any = None):
-        yield conn
+        if conn_state is not None:
+            conn_state["active"] = True
+        try:
+            yield conn
+        finally:
+            if conn_state is not None:
+                conn_state["active"] = False
 
     monkeypatch.setattr(dedup_mod, "get_db_connection", _get_conn)
 
 
 def _install_read_access(
     monkeypatch: pytest.MonkeyPatch,
-    readable_ws_ids: set[str] | None = None,
-) -> None:
-    allowed = set(readable_ws_ids or set())
-
-    async def _can_read(
-        ws_id: str | None,
-        actor_user_id: str,
-        *,
-        workspace: Any = None,
-        conn: Any = None,
-    ) -> bool:
-        return str(ws_id or "") in allowed
-
-    monkeypatch.setattr(
-        dedup_mod,
-        "_can_read_workspace",
-        create_autospec(_REAL_CAN_READ, side_effect=_can_read),
-    )
-
-
-def _unit_row(
     *,
-    ws_id: str = WS_1,
-    ws_name: str = "ANT",
-    ticker: str | None = "ANT",
-    ticker_key: str | None = None,
-    display_name: str = "Anthropic",
-    slug: str = "ant",
-    kind: str = "company",
-    owner_id: str = USER_RICHARD,
-    owner_name: str = "Richard",
-    lead_id: str | None = None,
-    lead_name: str | None = None,
-    config: dict[str, Any] | None = None,
-    last_activity_at: datetime | None = NOW,
-    aliases: Any = None,
-) -> dict[str, Any]:
-    row: dict[str, Any] = {
-        "unit_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        "kind": kind,
-        "owner_user_id": owner_id,
-        "lead_analyst_user_id": lead_id or owner_id,
-        "slug": slug,
-        "display_name": display_name,
-        "workspace_id": ws_id,
-        "ticker": ticker,
-        "ticker_key": ticker_key if ticker_key is not None else ticker,
-        "workspace_name": ws_name,
-        "workspace_owner_id": owner_id,
-        "workspace_status": "running",
-        "workspace_config": config,
-        "workspace_last_activity_at": last_activity_at,
-        "workspace_updated_at": last_activity_at,
-        "workspace_created_at": last_activity_at,
-        "owner_name": owner_name,
-        "owner_email": f"{owner_name.lower()}@example.com",
-        "lead_name": lead_name or owner_name,
-        "lead_email": f"{(lead_name or owner_name).lower()}@example.com",
-    }
-    if aliases is not None:
-        row["aliases"] = aliases
-    return row
-
-
-def _ws_row(
-    *,
-    ws_id: str = WS_2,
-    name: str = "Anthropic",
-    owner_id: str = USER_CY,
-    owner_name: str = "CY",
-    status: str = "running",
-    config: dict[str, Any] | None = None,
-    last_activity_at: datetime | None = NOW,
-) -> dict[str, Any]:
-    return {
-        "workspace_id": ws_id,
-        "user_id": owner_id,
-        "name": name,
-        "status": status,
-        "config": config,
-        "last_activity_at": last_activity_at,
-        "updated_at": last_activity_at,
-        "created_at": last_activity_at,
-        "owner_name": owner_name,
-        "owner_email": f"{owner_name.lower()}@example.com",
-    }
-
-
-def _enable_feature(monkeypatch: pytest.MonkeyPatch, enabled: bool = True) -> None:
-    monkeypatch.setenv(
-        "DALTON_COVERAGE_UNITS_ENABLED", "true" if enabled else "false"
-    )
-
-
-def test_normalize_company_name_strips_whitespace_case_and_punctuation() -> None:
-    assert normalize_company_name("  Alphabet (Google)  ") == "alphabetgoogle"
-    assert normalize_company_name("Meta Platforms, Inc.") == "metaplatformsinc"
-    assert normalize_company_name("Open-AI") == "openai"
-    assert normalize_company_name("腾讯控股。") == "腾讯控股"
-
-
-@pytest.mark.asyncio
-async def test_unit_alias_match_for_anthropic_and_ant(
-    monkeypatch: pytest.MonkeyPatch,
+    web_readable: set[str] | None = None,
+    cos_readable: set[str] | None = None,
+    error_for_ws: dict[str, Exception] | None = None,
+    conn_state: dict[str, bool] | None = None,
+    seen_channels: list[str] | None = None,
 ) -> None:
-    _enable_feature(monkeypatch, True)
-    sql_log: list[tuple[str, Any]] = []
-    _install_db(
-        monkeypatch,
-        unit_rows=[
-            _unit_row(
-                ws_id=WS_1,
-                ws_name="ANT",
-                ticker="ANT",
-                display_name="ANT",
-                slug="ant",
-                owner_id=USER_RICHARD,
-                owner_name="Richard",
-                lead_id=USER_RICHARD,
-                lead_name="Richard",
-            )
-        ],
-        coverage_rows=[
-            {
-                "ticker": "ANT",
-                "name": "Anthropic",
-                "aliases": {"search_names": ["Anthropic", "Claude"]},
-            }
-        ],
-        sql_log=sql_log,
-    )
-    _install_read_access(monkeypatch, {WS_1})
-
-    match = await find_existing_company_workspace(USER_CALLER, "Anthropic")
-    assert match is not None
-    assert match.workspace_id == WS_1
-    assert match.workspace_name == "ANT"
-    assert match.owner_name == "Richard"
-    assert match.lead_analyst_name == "Richard"
-    assert match.ticker == "ANT"
-    assert match.can_read is True
-    assert match.message == (
-        "「Anthropic」已有工作区「ANT」（所有者 Richard，主分析师 Richard），"
-        "请直接在那里继续。确实要另建，请确认后重试。"
-    )
-    assert match.matches_payload() == [
-        {
-            "workspace_name": "ANT",
-            "owner_name": "Richard",
-            "lead_analyst_name": "Richard",
-            "ticker": "ANT",
-            "can_read": True,
-            "workspace_id": WS_1,
-        }
-    ]
-    assert all("Anthropic" not in sql for sql, _ in sql_log)
-
-
-@pytest.mark.asyncio
-async def test_colleague_same_name_workspace_readable_vs_unreadable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _enable_feature(monkeypatch, True)
-    _install_db(
-        monkeypatch,
-        ws_rows=[
-            _ws_row(
-                ws_id=WS_2,
-                name="Anthropic",
-                owner_id=USER_CY,
-                owner_name="CY",
-            )
-        ],
-    )
-
-    _install_read_access(monkeypatch, {WS_2})
-    readable_match = await find_existing_company_workspace(
-        USER_CALLER, "  anthropic  "
-    )
-    assert readable_match is not None
-    assert readable_match.can_read is True
-    assert readable_match.workspace_id == WS_2
-    assert readable_match.matches_payload()[0]["workspace_id"] == WS_2
-    assert (
-        readable_match.message
-        == "「anthropic」已有工作区「Anthropic」（所有者 CY），请直接在那里继续。确实要另建，请确认后重试。"
-    )
-
-    _install_read_access(monkeypatch, set())
-    unreadable_match = await find_existing_company_workspace(
-        USER_CALLER, "Anthropic"
-    )
-    assert unreadable_match is not None
-    assert unreadable_match.can_read is False
-    assert unreadable_match.workspace_id is None
-    assert unreadable_match.lead_analyst_name is None
-    payload = unreadable_match.matches_payload()[0]
-    assert "workspace_id" not in payload
-    assert payload["workspace_name"] == "Anthropic"
-    assert payload["owner_name"] == "CY"
-    assert payload["can_read"] is False
-    assert (
-        unreadable_match.message
-        == "「Anthropic」已有工作区「Anthropic」（所有者 CY），你目前没有访问权限，可以请 CY 开放共享。确实要另建，请确认后重试。"
-    )
-
-
-@pytest.mark.asyncio
-async def test_excludes_historical_duplicate_home_deleted_and_sector(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _enable_feature(monkeypatch, True)
-    assert SOURCE_HISTORICAL_DUPLICATE == "historical_duplicate"
-    home_id = get_home_workspace_id(USER_RICHARD)
-    stand_in_id = get_home_stand_in_id(USER_RICHARD)
-
-    _install_db(
-        monkeypatch,
-        unit_rows=[
-            # Sector unit must never participate, even when name/slug matches.
-            _unit_row(
-                ws_id=WS_1,
-                ws_name="Anthropic",
-                ticker=None,
-                display_name="Anthropic",
-                slug="anthropic",
-                kind="sector",
-                owner_id=USER_RICHARD,
-                owner_name="Richard",
-            ),
-            # Historical duplicate bound to a company unit is excluded.
-            _unit_row(
-                ws_id=WS_2,
-                ws_name="Anthropic Copy",
-                ticker="ANT",
-                display_name="Anthropic",
-                slug="ant",
-                kind="company",
-                owner_id=USER_RICHARD,
-                owner_name="Richard",
-                config={"dalton_historical_duplicate_of": WS_3},
-            ),
-        ],
-        ws_rows=[
-            _ws_row(
-                ws_id=WS_2,
-                name="Anthropic",
-                owner_id=USER_RICHARD,
-                owner_name="Richard",
-                config={"dalton_historical_duplicate_of": WS_3},
-            ),
-            _ws_row(
-                ws_id=home_id,
-                name="Anthropic",
-                owner_id=USER_RICHARD,
-                owner_name="Richard",
-            ),
-            _ws_row(
-                ws_id=stand_in_id,
-                name="Anthropic",
-                owner_id=USER_RICHARD,
-                owner_name="Richard",
-                config={HOME_STAND_IN_KEY: True},
-            ),
-            _ws_row(
-                ws_id=WS_3,
-                name="Anthropic",
-                owner_id=USER_CY,
-                owner_name="CY",
-                status="deleted",
-            ),
-            _ws_row(
-                ws_id=WS_4,
-                name="Anthropic",
-                owner_id=USER_CY,
-                owner_name="CY",
-                status="unbound",
-            ),
-            # Workspace bound to the sector unit above must also be excluded from rule (b).
-            _ws_row(
-                ws_id=WS_1,
-                name="Anthropic",
-                owner_id=USER_RICHARD,
-                owner_name="Richard",
-            ),
-            # Caller's own exact name_key is handled by WorkspaceNameTaken, not dedup.
-            _ws_row(
-                ws_id=WS_5,
-                name="anthropic",
-                owner_id=USER_CALLER,
-                owner_name="Caller",
-            ),
-        ],
-    )
-    _install_read_access(monkeypatch, {WS_1, WS_2, WS_3, WS_4, WS_5})
-
-    assert await find_existing_company_workspace(USER_CALLER, "Anthropic") is None
-
-
-@pytest.mark.asyncio
-async def test_ticker_rule_and_sorting_cap_at_three(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _enable_feature(monkeypatch, True)
-    _install_db(
-        monkeypatch,
-        unit_rows=[
-            _unit_row(
-                ws_id=WS_1,
-                ws_name="Tencent Unit",
-                ticker="0700.HK",
-                display_name="Tencent",
-                slug="tencent",
-                owner_id=USER_RICHARD,
-                owner_name="Richard",
-                last_activity_at=NOW - timedelta(days=10),
-            )
-        ],
-        ws_rows=[
-            _ws_row(
-                ws_id=WS_2,
-                name="700.HK",
-                owner_id=USER_CY,
-                owner_name="CY",
-                last_activity_at=NOW - timedelta(days=1),
-            ),
-            _ws_row(
-                ws_id=WS_3,
-                name="700",
-                owner_id="user-3",
-                owner_name="Alice",
-                last_activity_at=NOW - timedelta(days=2),
-            ),
-            _ws_row(
-                ws_id=WS_4,
-                name="0700.HK",
-                owner_id="user-4",
-                owner_name="Bob",
-                last_activity_at=NOW - timedelta(days=5),
-            ),
-        ],
-    )
-    _install_read_access(monkeypatch, {WS_1, WS_2, WS_3, WS_4})
-
-    match = await find_existing_company_workspace(USER_CALLER, "0700.HK")
-    assert match is not None
-    assert len(match.matches) == 3
-    # Coverage unit ranks first despite older activity; remaining sorted by recent activity.
-    assert [m.workspace_name for m in match.matches] == [
-        "Tencent Unit",
-        "700.HK",
-        "700",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_feature_flag_off_returns_none_without_db(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _enable_feature(monkeypatch, False)
-
-    def _fail_db(*_args: Any, **_kwargs: Any) -> Any:
-        raise AssertionError("DB must not be queried when coverage_units is disabled")
-
-    monkeypatch.setattr(dedup_mod, "get_db_connection", _fail_db)
-    assert await find_existing_company_workspace(USER_CALLER, "Anthropic") is None
-
-
-@pytest.mark.asyncio
-async def test_db_error_returns_none_and_logs_warning(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    _enable_feature(monkeypatch, True)
-    _install_db(monkeypatch, fail_on_execute=RuntimeError("db connection lost"))
-
-    with caplog.at_level(logging.WARNING):
-        res = await find_existing_company_workspace(USER_CALLER, "Anthropic")
-
-    assert res is None
-    assert "Company workspace dedup check failed" in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_real_can_read_workspace_used_by_dedup(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _enable_feature(monkeypatch, True)
-    _install_db(
-        monkeypatch,
-        ws_rows=[_ws_row(ws_id=WS_2, name="Anthropic", owner_id=USER_CY, owner_name="CY")],
-    )
+    web_set = set(web_readable or set())
+    cos_set = set(cos_readable or set())
+    errs = error_for_ws or {}
 
     async def _req(
         ws_id: Any,
@@ -513,7 +194,17 @@ async def test_real_can_read_workspace_used_by_dedup(
         workspace: Any = None,
         conn: Any = None,
     ) -> dict[str, Any]:
-        raise HTTPException(status_code=403, detail="forbidden")
+        if conn_state is not None and conn_state.get("active"):
+            raise AssertionError("Outer DB connection was still held during permission check")
+        if seen_channels is not None:
+            seen_channels.append(channel)
+        wid = str(ws_id or "")
+        if wid in errs:
+            raise errs[wid]
+        allowed = cos_set if channel == "cos" else web_set
+        if wid in allowed:
+            return dict(workspace or {"workspace_id": wid})
+        raise HTTPException(status_code=404, detail="Workspace not found")
 
     monkeypatch.setattr(
         sharing_mod,
@@ -521,15 +212,682 @@ async def test_real_can_read_workspace_used_by_dedup(
         create_autospec(_REAL_REQ_ACCESS, side_effect=_req),
     )
 
-    match = await find_existing_company_workspace(USER_CALLER, "Anthropic")
-    assert match is not None
-    assert match.can_read is False
-    assert match.workspace_id is None
+
+def _unit_row(
+    *,
+    ws_id: str = WS_1,
+    ws_name: str = "ANT",
+    ticker: str | None = "ANT",
+    ticker_key: str | None = None,
+    display_name: str = "Anthropic, PBC",
+    kind: str = "company",
+    owner_id: str = USER_RICHARD,
+    owner_name: str = "Richard",
+    owner_email: str | None = EMAIL_RICHARD,
+    lead_id: str | None = None,
+    lead_name: str | None = None,
+    is_home_stand_in: bool = False,
+    is_historical_duplicate: bool = False,
+    config: dict[str, Any] | None = None,
+    last_activity_at: datetime | None = NOW,
+) -> dict[str, Any]:
+    return {
+        "unit_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "kind": kind,
+        "owner_user_id": owner_id,
+        "lead_analyst_user_id": lead_id or owner_id,
+        "display_name": display_name,
+        "workspace_id": ws_id,
+        "ticker": ticker,
+        "ticker_key": ticker_key if ticker_key is not None else ticker,
+        "workspace_name": ws_name,
+        "workspace_owner_id": owner_id,
+        "workspace_status": "running",
+        "is_home_stand_in": is_home_stand_in,
+        "is_historical_duplicate": is_historical_duplicate,
+        "workspace_config": config,
+        "workspace_last_activity_at": last_activity_at,
+        "workspace_updated_at": last_activity_at,
+        "workspace_created_at": last_activity_at,
+        "owner_name": owner_name,
+        "owner_email": owner_email,
+        "unit_owner_email": owner_email,
+        "lead_name": lead_name or owner_name,
+        "lead_email": owner_email,
+    }
+
+
+def _ws_row(
+    *,
+    ws_id: str = WS_2,
+    name: str = "Anthropic",
+    owner_id: str = USER_CY,
+    owner_name: str = "CY",
+    owner_email: str | None = EMAIL_CY,
+    status: str = "running",
+    is_home_stand_in: bool = False,
+    is_historical_duplicate: bool = False,
+    config: dict[str, Any] | None = None,
+    last_activity_at: datetime | None = NOW,
+) -> dict[str, Any]:
+    return {
+        "workspace_id": ws_id,
+        "user_id": owner_id,
+        "name": name,
+        "status": status,
+        "is_home_stand_in": is_home_stand_in,
+        "is_historical_duplicate": is_historical_duplicate,
+        "config": config,
+        "last_activity_at": last_activity_at,
+        "updated_at": last_activity_at,
+        "created_at": last_activity_at,
+        "owner_name": owner_name,
+        "owner_email": owner_email,
+    }
+
+
+def test_normalize_company_name_preserves_symbols_and_strips_specified_chars() -> None:
+    assert normalize_company_name("  Alphabet (Google)  ") == "alphabet(google)"
+    assert normalize_company_name("Meta Platforms, Inc.") == "metaplatformsinc"
+    assert normalize_company_name("Open-AI") == "openai"
+    assert normalize_company_name("腾讯控股。") == "腾讯控股"
+    assert normalize_company_name("Foo_Bar's ’Baz·中国，") == "foobarsbaz中国"
+    assert normalize_company_name("C++") == "c++"
+    assert normalize_company_name("C#") == "c#"
+    assert normalize_company_name("AT&T") == "at&t"
+
+
+def test_derive_display_name_candidates_rules_and_edge_cases() -> None:
+    assert "Anthropic" in derive_display_name_candidates("Anthropic, PBC")
+    assert derive_display_name_candidates("Futu Holdings（富途）") == (
+        "Futu Holdings（富途）",
+        "Futu Holdings",
+        "Futu",
+        "富途",
+    )
+    assert derive_display_name_candidates("Interactive Brokers Group, Inc.") == (
+        "Interactive Brokers Group, Inc.",
+        "Interactive Brokers Group",
+        "Interactive Brokers",
+    )
+    assert derive_display_name_candidates("邦吉 Bunge Global") == (
+        "邦吉 Bunge Global",
+        "邦吉",
+        "Bunge Global",
+    )
+    assert derive_display_name_candidates("海大集团") == ("海大集团", "海大")
+    assert derive_display_name_candidates("宁德时代") == ("宁德时代",)
+    # < 2 char stripped candidates are dropped; mid-word suffixes like MetaCo are untouched.
+    assert derive_display_name_candidates("A Inc.") == ("A Inc.",)
+    assert derive_display_name_candidates("MetaCo") == ("MetaCo",)
 
 
 @pytest.mark.asyncio
-async def test_rest_create_workspace_returns_409_and_allows_override(
+async def test_real_prod_display_names_matching_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    units = [
+        _unit_row(ws_id=WS_1, ws_name="ANT", ticker="ANT", display_name="Anthropic, PBC"),
+        _unit_row(ws_id=WS_2, ws_name="FUTU", ticker="FUTU", display_name="Futu Holdings（富途）"),
+        _unit_row(
+            ws_id=WS_3,
+            ws_name="IBKR",
+            ticker="IBKR",
+            display_name="Interactive Brokers Group, Inc.",
+        ),
+        _unit_row(ws_id=WS_4, ws_name="BG", ticker="BG", display_name="邦吉 Bunge Global"),
+        _unit_row(ws_id="66666666-6666-4666-8666-666666666666", ws_name="002311.SZ", ticker="002311.SZ", display_name="海大集团"),
+        _unit_row(ws_id="77777777-7777-4777-8777-777777777777", ws_name="300750.SZ", ticker="300750.SZ", display_name="宁德时代"),
+    ]
+    _install_db(monkeypatch, unit_rows=units)
+    _install_read_access(monkeypatch, web_readable={WS_1, WS_2, WS_3, WS_4})
+
+    assert (await find_existing_company_workspace(USER_CALLER, "Anthropic")).workspace_name == "ANT"
+    assert (await find_existing_company_workspace(USER_CALLER, "富途")).workspace_name == "FUTU"
+    assert (await find_existing_company_workspace(USER_CALLER, "Futu Holdings")).workspace_name == "FUTU"
+    assert (await find_existing_company_workspace(USER_CALLER, "Futu")).workspace_name == "FUTU"
+    assert (await find_existing_company_workspace(USER_CALLER, "Interactive Brokers")).workspace_name == "IBKR"
+    assert await find_existing_company_workspace(USER_CALLER, "Bunge") is None
+    assert (await find_existing_company_workspace(USER_CALLER, "邦吉")).workspace_name == "BG"
+    assert (await find_existing_company_workspace(USER_CALLER, "海大集团")).workspace_name == "002311.SZ"
+    assert (await find_existing_company_workspace(USER_CALLER, "海大")).workspace_name == "002311.SZ"
+    assert (await find_existing_company_workspace(USER_CALLER, "宁德时代")).workspace_name == "300750.SZ"
+
+
+@pytest.mark.asyncio
+async def test_slug_ignored_and_c_plus_plus_does_not_hit_c(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        unit_rows=[
+            {
+                **_unit_row(
+                    ws_id=WS_1,
+                    ws_name="NVDA",
+                    ticker="NVDA",
+                    display_name="NVIDIA Corporation",
+                ),
+                "slug": "ai-infrastructure",
+            },
+            _unit_row(
+                ws_id=WS_2,
+                ws_name="C",
+                ticker="C",
+                display_name="Citigroup, Inc.",
+            ),
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_1, WS_2})
+
+    assert await find_existing_company_workspace(USER_CALLER, "AI Infrastructure") is None
+    assert await find_existing_company_workspace(USER_CALLER, "C++") is None
+    assert await find_existing_company_workspace(USER_CALLER, "C#") is None
+
+
+@pytest.mark.asyncio
+async def test_team_mode_off_and_external_caller_skip_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fail_db(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("DB must not be queried")
+
+    monkeypatch.setattr(dedup_mod, "get_db_connection", _fail_db)
+
+    _enable_team_mode(monkeypatch, supabase_auth=False)
+    assert await find_existing_company_workspace(USER_CALLER, "Anthropic") is None
+
+    _enable_team_mode(monkeypatch, coverage_enabled=False, supabase_auth=True)
+    assert await find_existing_company_workspace(USER_CALLER, "Anthropic") is None
+
+    _enable_team_mode(monkeypatch, coverage_enabled=True, supabase_auth=True)
+    assert await find_existing_company_workspace(USER_EXTERNAL, "Anthropic") is None
+
+
+@pytest.mark.asyncio
+async def test_excludes_external_and_unknown_owners_and_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        unit_rows=[
+            _unit_row(
+                ws_id=WS_1,
+                ws_name="ANT",
+                ticker="ANT",
+                display_name="ANT",
+                owner_id=USER_RICHARD,
+                owner_email=EMAIL_RICHARD,
+            ),
+            # External owner's unit must not participate.
+            _unit_row(
+                ws_id=WS_3,
+                ws_name="NVDA",
+                ticker="NVDA",
+                display_name="NVIDIA",
+                owner_id=USER_EXTERNAL,
+                owner_email=EMAIL_EXTERNAL,
+            ),
+        ],
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="Anthropic",
+                owner_id=USER_EXTERNAL,
+                owner_name="Ext",
+                owner_email=EMAIL_EXTERNAL,
+            ),
+            _ws_row(
+                ws_id=WS_4,
+                name="Anthropic",
+                owner_id=USER_UNKNOWN,
+                owner_name="Unknown",
+                owner_email=None,
+            ),
+        ],
+        coverage_rows=[
+            # External user's personal alias must be ignored.
+            {
+                "ticker": "ANT",
+                "name": "ExternalSecretAlias",
+                "aliases": {"search_names": ["ExternalSecretAlias"]},
+                "user_id": USER_EXTERNAL,
+                "owner_email": EMAIL_EXTERNAL,
+            },
+            # Internal user's personal alias matches.
+            {
+                "ticker": "ANT",
+                "name": "Anthropic AI",
+                "aliases": {"search_names": ["Claude"]},
+                "user_id": USER_RICHARD,
+                "owner_email": EMAIL_RICHARD,
+            },
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_1})
+
+    assert await find_existing_company_workspace(USER_CALLER, "ExternalSecretAlias") is None
+    assert await find_existing_company_workspace(USER_CALLER, "NVIDIA") is None
+    assert await find_existing_company_workspace(USER_CALLER, "Anthropic") is None
+
+    claude_match = await find_existing_company_workspace(USER_CALLER, "Claude")
+    assert claude_match is not None
+    assert claude_match.workspace_id == WS_1
+
+
+@pytest.mark.asyncio
+async def test_channel_aware_access_and_unreadable_redaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        unit_rows=[
+            _unit_row(
+                ws_id=WS_1,
+                ws_name="ANT",
+                ticker="ANT",
+                display_name="Anthropic, PBC",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            )
+        ],
+    )
+    seen_channels: list[str] = []
+    _install_read_access(
+        monkeypatch,
+        web_readable=set(),
+        cos_readable={WS_1},
+        seen_channels=seen_channels,
+    )
+
+    web_match = await find_existing_company_workspace(
+        USER_CALLER, "Anthropic", channel="web"
+    )
+    assert web_match is not None
+    assert web_match.can_read is False
+    assert web_match.workspace_id is None
+    assert web_match.ticker is None
+    assert web_match.lead_analyst_name is None
+    assert web_match.matched_workspace_ids == (WS_1,)
+    assert web_match.matches_payload() == [
+        {
+            "workspace_name": "ANT",
+            "owner_name": "Richard",
+            "can_read": False,
+        }
+    ]
+    assert "你目前没有访问权限" in web_match.message
+
+    cos_match = await find_existing_company_workspace(
+        USER_CALLER, "Anthropic", channel="cos"
+    )
+    assert cos_match is not None
+    assert cos_match.can_read is True
+    assert cos_match.workspace_id == WS_1
+    assert cos_match.ticker == "ANT"
+    assert cos_match.lead_analyst_name == "Richard"
+    assert seen_channels == ["web", "cos"]
+
+
+@pytest.mark.asyncio
+async def test_caller_own_exact_name_exits_early_for_workspace_name_taken(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        unit_rows=[
+            _unit_row(
+                ws_id=WS_1,
+                ws_name="ANT",
+                ticker="ANT",
+                display_name="Anthropic, PBC",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            )
+        ],
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_5,
+                name="anthropic",
+                owner_id=USER_CALLER,
+                owner_name="Caller",
+                owner_email=EMAIL_CALLER,
+            )
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_1, WS_5})
+
+    assert await find_existing_company_workspace(USER_CALLER, "Anthropic") is None
+
+
+@pytest.mark.asyncio
+async def test_excludes_historical_duplicate_home_deleted_and_sector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    assert SOURCE_HISTORICAL_DUPLICATE == "historical_duplicate"
+    home_id = get_home_workspace_id(USER_RICHARD)
+    stand_in_id = get_home_stand_in_id(USER_RICHARD)
+
+    _install_db(
+        monkeypatch,
+        unit_rows=[
+            _unit_row(
+                ws_id=WS_1,
+                ws_name="Anthropic",
+                ticker=None,
+                display_name="Anthropic",
+                kind="sector",
+                owner_id=USER_RICHARD,
+                owner_email=EMAIL_RICHARD,
+            ),
+            _unit_row(
+                ws_id=WS_2,
+                ws_name="Anthropic Copy",
+                ticker="ANT",
+                display_name="Anthropic",
+                kind="company",
+                owner_id=USER_RICHARD,
+                owner_email=EMAIL_RICHARD,
+                is_historical_duplicate=True,
+            ),
+        ],
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="Anthropic",
+                owner_id=USER_RICHARD,
+                owner_email=EMAIL_RICHARD,
+                is_historical_duplicate=True,
+            ),
+            _ws_row(
+                ws_id=home_id,
+                name="Anthropic",
+                owner_id=USER_RICHARD,
+                owner_email=EMAIL_RICHARD,
+            ),
+            _ws_row(
+                ws_id=stand_in_id,
+                name="Anthropic",
+                owner_id=USER_RICHARD,
+                owner_email=EMAIL_RICHARD,
+                is_home_stand_in=True,
+                config={HOME_STAND_IN_KEY: True},
+            ),
+            _ws_row(
+                ws_id=WS_3,
+                name="Anthropic",
+                owner_id=USER_CY,
+                owner_email=EMAIL_CY,
+                status="deleted",
+            ),
+            _ws_row(
+                ws_id=WS_4,
+                name="Anthropic",
+                owner_id=USER_CY,
+                owner_email=EMAIL_CY,
+                status="unbound",
+            ),
+            _ws_row(
+                ws_id=WS_1,
+                name="Anthropic",
+                owner_id=USER_RICHARD,
+                owner_email=EMAIL_RICHARD,
+            ),
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_1, WS_2, WS_3, WS_4})
+
+    assert await find_existing_company_workspace(USER_CALLER, "Anthropic") is None
+
+
+@pytest.mark.asyncio
+async def test_sector_doc_sector_automation_and_non_company_topic_excluded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            # Sector doc workspace (no sector unit) -> excluded.
+            _ws_row(
+                ws_id=WS_1,
+                name="NVDA",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            ),
+            # Sector automation workspace -> excluded.
+            _ws_row(
+                ws_id=WS_2,
+                name="TSLA",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            ),
+            # Ordinary topic workspace (unclassified by identity.py) -> excluded from rule (b).
+            _ws_row(
+                ws_id=WS_3,
+                name="Macro Research",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            ),
+            # Company workspace classified by company doc -> matches rule (b).
+            _ws_row(
+                ws_id=WS_4,
+                name="Meta Platforms",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            ),
+        ],
+        doc_rows=[
+            {"workspace_id": WS_1, "doc_key": "sector", "content": {}},
+            {"workspace_id": WS_4, "doc_key": "company", "content": {"ticker": "META"}},
+        ],
+        automation_rows=[
+            {
+                "user_id": USER_CY,
+                "workspace_id": WS_2,
+                "name": "dalton-sector-ev-weekly",
+                "metadata": {},
+            }
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_1, WS_2, WS_3, WS_4})
+
+    assert await find_existing_company_workspace(USER_CALLER, "NVDA") is None
+    assert await find_existing_company_workspace(USER_CALLER, "TSLA") is None
+    assert await find_existing_company_workspace(USER_CALLER, "Macro Research") is None
+
+    meta_match = await find_existing_company_workspace(USER_CALLER, "Meta Platforms")
+    assert meta_match is not None
+    assert meta_match.workspace_id == WS_4
+    assert meta_match.ticker == "META"
+
+
+@pytest.mark.asyncio
+async def test_ticker_rule_and_sorting_cap_at_three(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        unit_rows=[
+            _unit_row(
+                ws_id=WS_1,
+                ws_name="Tencent Unit",
+                ticker="0700.HK",
+                display_name="Tencent",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+                last_activity_at=NOW - timedelta(days=10),
+            )
+        ],
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="700.HK",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+                last_activity_at=NOW - timedelta(days=1),
+            ),
+            _ws_row(
+                ws_id=WS_3,
+                name="700",
+                owner_id="user-3",
+                owner_name="Alice",
+                owner_email="alice@everflow.ai",
+                last_activity_at=NOW - timedelta(days=2),
+            ),
+            _ws_row(
+                ws_id=WS_4,
+                name="0700.HK",
+                owner_id="user-4",
+                owner_name="Bob",
+                owner_email="bob@everflow.ai",
+                last_activity_at=NOW - timedelta(days=5),
+            ),
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_1, WS_2, WS_3, WS_4})
+
+    match = await find_existing_company_workspace(USER_CALLER, "0700.HK")
+    assert match is not None
+    assert len(match.matches) == 3
+    assert [m.workspace_name for m in match.matches] == [
+        "Tencent Unit",
+        "700.HK",
+        "700",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_connection_released_before_permission_check_and_sql_projects_booleans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    sql_log: list[tuple[str, Any]] = []
+    conn_state = {"active": False}
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="Anthropic",
+                owner_id=USER_CY,
+                owner_email=EMAIL_CY,
+            )
+        ],
+        sql_log=sql_log,
+        conn_state=conn_state,
+    )
+    _install_read_access(
+        monkeypatch, web_readable={WS_2}, conn_state=conn_state
+    )
+
+    match = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert match is not None
+    assert conn_state["active"] is False
+
+    # SQL projects only the two booleans rather than fetching full w.config JSONB,
+    # and skips dalton_coverage entirely when there are no active company units.
+    assert not any("FROM dalton_coverage " in sql for sql, _ in sql_log)
+    for sql, _ in sql_log:
+        if "FROM workspaces" in sql or "FROM dalton_coverage_units" in sql:
+            assert "is_home_stand_in" in sql
+            assert "is_historical_duplicate" in sql
+            assert "w.config AS" not in sql
+            assert "w.config," not in sql
+
+
+@pytest.mark.asyncio
+async def test_permission_503_and_alias_failure_proceed_with_redacted_warning(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="Anthropic",
+                owner_id=USER_CY,
+                owner_email=EMAIL_CY,
+            )
+        ],
+    )
+    _install_read_access(
+        monkeypatch,
+        error_for_ws={
+            WS_2: HTTPException(
+                status_code=503, detail="secret-db-host-user-data"
+            )
+        },
+    )
+
+    with caplog.at_level(logging.WARNING):
+        res_perm = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert res_perm is None
+    assert "HTTPException" in caplog.text
+    assert "workspace_count=1" in caplog.text
+    assert "secret-db-host-user-data" not in caplog.text
+    assert "Anthropic" not in caplog.text
+
+    caplog.clear()
+    _install_db(
+        monkeypatch,
+        unit_rows=[
+            _unit_row(
+                ws_id=WS_1,
+                ws_name="ANT",
+                ticker="ANT",
+                display_name="ANT",
+                owner_id=USER_RICHARD,
+                owner_email=EMAIL_RICHARD,
+            )
+        ],
+        ws_rows=[
+            _ws_row(ws_id=WS_1, name="ANT", owner_id=USER_RICHARD, owner_email=EMAIL_RICHARD)
+        ],
+        fail_on_table={
+            "FROM dalton_coverage ": RuntimeError("sensitive-alias-payload")
+        },
+    )
+    with caplog.at_level(logging.WARNING):
+        res_alias = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert res_alias is None
+    assert "RuntimeError" in caplog.text
+    assert "workspace_count=1" in caplog.text
+    assert "sensitive-alias-payload" not in caplog.text
+    assert "Anthropic" not in caplog.text
+
+
+def test_chief_of_staff_prompt_non_contradictory() -> None:
+    prompt = get_loader().get_system_prompt(
+        current_time="2026-11-20 12:00 ET",
+        subagent_summary="",
+        role="chief_of_staff",
+    )
+    assert "delegate_to_analyst` into one is refused" in prompt
+    assert "company_workspace_exists" in prompt
+    assert "不要往同事工作区派发任务，除非派发工具允许" in prompt
+    assert "allow_duplicate_company" in prompt
+
+
+@pytest.mark.asyncio
+async def test_rest_create_workspace_returns_409_and_allows_override_with_match_log(
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from src.server.app.workspaces import router
 
@@ -544,12 +902,10 @@ async def test_rest_create_workspace_returns_409_and_allows_override(
             DuplicateWorkspaceCandidate(
                 workspace_name="ANT",
                 owner_name="Richard",
-                can_read=True,
-                workspace_id=WS_1,
-                lead_analyst_name="Richard",
-                ticker="ANT",
+                can_read=False,
             ),
         ),
+        matched_workspace_ids=(WS_1,),
     )
     mgr = create_autospec(WorkspaceManager, instance=True)
     mgr.create_workspace.return_value = {
@@ -591,13 +947,11 @@ async def test_rest_create_workspace_returns_409_and_allows_override(
                     {
                         "workspace_name": "ANT",
                         "owner_name": "Richard",
-                        "lead_analyst_name": "Richard",
-                        "ticker": "ANT",
-                        "can_read": True,
-                        "workspace_id": WS_1,
+                        "can_read": False,
                     }
                 ],
             }
+            assert dedup_mock.await_args.kwargs["channel"] == "web"
             mgr.create_workspace.assert_not_awaited()
 
             with caplog.at_level(logging.INFO):
@@ -607,13 +961,14 @@ async def test_rest_create_workspace_returns_409_and_allows_override(
                 )
             assert resp_201.status_code == 201
             assert resp_201.json()["workspace_id"] == WS_5
-            dedup_mock.assert_awaited_once()
+            assert dedup_mock.await_count == 2
             assert "allow_duplicate_company=True" in caplog.text
+            assert WS_1 in caplog.text
 
 
 @pytest.mark.asyncio
 async def test_rest_create_workspace_proceeds_when_dedup_raises(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from src.server.app.workspaces import router
 
@@ -654,10 +1009,13 @@ async def test_rest_create_workspace_proceeds_when_dedup_raises(
 
     assert resp.status_code == 201
     assert "Company workspace dedup check failed" in caplog.text
+    assert "transient error" not in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_manage_workspaces_create_returns_dedup_error_and_allows_override() -> None:
+async def test_manage_workspaces_create_runs_dedup_before_hitl_and_logs_override(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     dup = DuplicateMatch(
         company="Anthropic",
         message=(
@@ -669,23 +1027,19 @@ async def test_manage_workspaces_create_returns_dedup_error_and_allows_override(
                 workspace_name="Anthropic",
                 owner_name="CY",
                 can_read=False,
-                workspace_id=None,
-                lead_analyst_name=None,
-                ticker=None,
             ),
         ),
+        matched_workspace_ids=(WS_2,),
     )
     mgr = create_autospec(WorkspaceManager, instance=True)
     mgr.create_workspace.return_value = {"workspace_id": WS_5, "name": "Anthropic"}
     mgr.resolve_binding.return_value = None
     dedup_mock = create_autospec(_REAL_FIND_DEDUP, return_value=dup)
+    hitl_mock = create_autospec(hitl_confirm, return_value=(True, {}))
 
     with (
         patch("src.dalton.coverage.dedup.find_existing_company_workspace", dedup_mock),
-        patch(
-            "src.tools.secretary.tools.hitl_confirm",
-            create_autospec(hitl_confirm, return_value=(True, {})),
-        ),
+        patch("src.tools.secretary.tools.hitl_confirm", hitl_mock),
         patch(
             "src.server.services.workspace_manager.WorkspaceManager.get_instance",
             create_autospec(WorkspaceManager.get_instance, return_value=mgr),
@@ -710,32 +1064,36 @@ async def test_manage_workspaces_create_returns_dedup_error_and_allows_override(
                 {
                     "workspace_name": "Anthropic",
                     "owner_name": "CY",
-                    "lead_analyst_name": None,
-                    "ticker": None,
                     "can_read": False,
                 }
             ],
         }
+        assert dedup_mock.await_args.kwargs["channel"] == "cos"
+        hitl_mock.assert_not_called()
         mgr.create_workspace.assert_not_awaited()
 
-        res_allowed = await chief_of_staff_workspaces.ainvoke(
-            {
-                "name": "manage_workspaces",
-                "args": {
-                    "action": "create",
-                    "name": "Anthropic",
-                    "allow_duplicate_company": True,
-                    "state": {},
+        with caplog.at_level(logging.INFO):
+            res_allowed = await chief_of_staff_workspaces.ainvoke(
+                {
+                    "name": "manage_workspaces",
+                    "args": {
+                        "action": "create",
+                        "name": "Anthropic",
+                        "allow_duplicate_company": True,
+                        "state": {},
+                    },
+                    "id": "call-2",
+                    "type": "tool_call",
                 },
-                "id": "call-2",
-                "type": "tool_call",
-            },
-            config={"configurable": {"user_id": USER_CALLER}},
-        )
+                config={"configurable": {"user_id": USER_CALLER}},
+            )
         ok_payload = json.loads(res_allowed.update["messages"][0].content)
         assert ok_payload["success"] is True
         assert ok_payload["workspace_id"] == WS_5
-        dedup_mock.assert_awaited_once()
+        assert dedup_mock.await_count == 2
+        assert "allow_duplicate_company=True" in caplog.text
+        assert WS_2 in caplog.text
+        hitl_mock.assert_called_once()
         mgr.create_workspace.assert_awaited_once()
 
 
@@ -765,3 +1123,4 @@ async def test_workspaces_create_proceeds_when_dedup_raises(
     payload = json.loads(res.update["messages"][0].content)
     assert payload["success"] is True
     assert "Company workspace dedup check failed" in caplog.text
+    assert "db unreachable" not in caplog.text
