@@ -27,6 +27,8 @@ from src.dalton.access_tiers import get_user_tier
 from src.dalton.autonomy.units_view import load_dalton_automations_by_user
 from src.dalton.coverage.identity import (
     _CLEAN_TICKER_RE,
+    SOURCE_REGISTERED,
+    TICKER_SOURCE_WORKSPACE_NAME,
     is_historical_duplicate_workspace,
     resolve_workspace_coverage_identity,
 )
@@ -47,6 +49,8 @@ from src.server.database.pool import get_db_connection
 from src.server.database.workspace_names import WorkspaceNameInvalid, workspace_name_key
 
 logger = logging.getLogger(__name__)
+
+_REAL_GET_USER_TIER = get_user_tier
 
 MAX_DUPLICATE_MATCHES = 3
 
@@ -451,7 +455,6 @@ async def _load_live_workspaces(cur: Any) -> list[dict[str, Any]]:
         LEFT JOIN users u ON u.user_id = w.user_id
         WHERE w.status NOT IN ('deleted', 'unbound')
           AND (w.config->'home_stand_in') IS DISTINCT FROM 'true'::jsonb
-          AND NULLIF(BTRIM(COALESCE(w.config->>'dalton_historical_duplicate_of', '')), '') IS NULL
         """
     )
     return [dict(r) for r in await cur.fetchall()]
@@ -496,21 +499,30 @@ async def _load_coverage_aliases(
     return merged
 
 
+def _row_is_home_stand_in(
+    row: Mapping[str, Any],
+    *,
+    config_key: str = "config",
+) -> bool:
+    if bool(row.get("is_home_stand_in")):
+        return True
+    cfg = row.get(config_key)
+    return isinstance(cfg, Mapping) and bool(cfg.get(HOME_STAND_IN_KEY))
+
+
 def _row_is_stand_in_or_historical(
     row: Mapping[str, Any],
     *,
     config_key: str = "config",
 ) -> bool:
-    if bool(row.get("is_home_stand_in")) or bool(row.get("is_historical_duplicate")):
+    if _row_is_home_stand_in(row, config_key=config_key) or bool(
+        row.get("is_historical_duplicate")
+    ):
         return True
     cfg = row.get(config_key)
     if cfg is None:
         return False
-    ws_check = {"config": cfg}
-    return bool(
-        (isinstance(cfg, Mapping) and cfg.get(HOME_STAND_IN_KEY))
-        or is_historical_duplicate_workspace(ws_check)
-    )
+    return is_historical_duplicate_workspace({"config": cfg})
 
 
 def _is_excluded_workspace(
@@ -547,12 +559,13 @@ def _unit_matches_input(
     aliases_by_key: Mapping[str, Iterable[str]],
 ) -> bool:
     raw_ticker = str(unit.get("ticker") or "").strip()
-    unit_ticker_key = str(unit.get("ticker_key") or "").strip().upper() or (
-        _ticker_key(raw_ticker) if raw_ticker else None
+    raw_ticker_key = str(unit.get("ticker_key") or "").strip()
+    unit_ticker_key = (
+        _ticker_key(raw_ticker_key or raw_ticker)
+        if (raw_ticker_key or raw_ticker)
+        else None
     )
     if input_ticker_key and unit_ticker_key and input_ticker_key == unit_ticker_key:
-        return True
-    if raw_ticker and norm_input and normalize_company_name(raw_ticker) == norm_input:
         return True
 
     display_name = str(unit.get("display_name") or "").strip()
@@ -565,11 +578,33 @@ def _unit_matches_input(
     if unit_ticker_key and unit_ticker_key in aliases_by_key:
         alias_candidates.extend(aliases_by_key[unit_ticker_key])
     for alias in alias_candidates:
+        if input_ticker_key and _is_ticker_shaped(alias):
+            if _ticker_key(alias) == input_ticker_key:
+                return True
+            continue
         if norm_input and normalize_company_name(alias) == norm_input:
             return True
-        if input_ticker_key and _is_ticker_shaped(alias) and _ticker_key(alias) == input_ticker_key:
-            return True
     return False
+
+
+async def _resolve_caller_tier(uid: str) -> str:
+    """Resolve caller tier strictly so roster/DB lookup failures raise instead of masquerading as 'external'."""
+    if get_user_tier is not _REAL_GET_USER_TIER:
+        return await get_user_tier(uid)
+    from src.dalton.company_identity import is_company_system_user
+    from src.dalton.invites import is_invite_pm
+    from src.dalton.settings import get_dalton_allowed_emails
+    from src.server.database.user import get_user as get_user_row
+
+    if is_company_system_user(uid):
+        return "company"
+    if is_invite_pm(uid):
+        return "admin"
+    user = await get_user_row(uid)
+    email = str((user or {}).get("email") or "").strip().lower()
+    if email and email in get_dalton_allowed_emails():
+        return "internal"
+    return "external"
 
 
 async def _check_workspace_readable(
@@ -580,6 +615,7 @@ async def _check_workspace_readable(
     workspace: Mapping[str, Any],
     conn: Any = None,
 ) -> bool:
+    token = sharing_mod._raise_on_caller_tier_external.set(True)
     try:
         await sharing_mod.require_workspace_access(
             ws_id,
@@ -598,6 +634,8 @@ async def _check_workspace_readable(
         raise
     except PermissionError:
         return False
+    finally:
+        sharing_mod._raise_on_caller_tier_external.reset(token)
 
 
 @dataclass(frozen=True)
@@ -643,7 +681,7 @@ async def _find_matches(
                     if (
                         ws_owner_id == uid
                         and ws_status not in ("deleted", "unbound")
-                        and not _row_is_stand_in_or_historical(ws)
+                        and not _row_is_home_stand_in(ws)
                         and not is_reserved_row(
                             {
                                 "workspace_id": ws_id,
@@ -759,11 +797,15 @@ async def _find_matches(
 
                 matched_by = ""
                 matched_ticker: str | None = None
-                if norm_input and normalize_company_name(ws_name) == norm_input:
+                both_ticker_shaped = bool(input_ticker_key and _is_ticker_shaped(ws_name))
+                if (
+                    norm_input
+                    and normalize_company_name(ws_name) == norm_input
+                    and (not both_ticker_shaped or _ticker_key(ws_name) == input_ticker_key)
+                ):
                     matched_by = "workspace_name"
                 elif (
-                    input_ticker_key
-                    and _is_ticker_shaped(ws_name)
+                    both_ticker_shaped
                     and _ticker_key(ws_name) == input_ticker_key
                 ):
                     matched_by = "workspace_ticker"
@@ -839,7 +881,10 @@ async def _find_matches(
                         registered_units=units_by_ws,
                         automations=owner_autos,
                     )
-                    if not identity.is_company:
+                    if not identity.is_company or (
+                        identity.source != SOURCE_REGISTERED
+                        and identity.ticker_source == TICKER_SOURCE_WORKSPACE_NAME
+                    ):
                         continue
                     if matched_ticker is None and identity.ticker:
                         matched_ticker = identity.ticker
@@ -935,7 +980,7 @@ async def find_existing_company_workspace(
 
     stats = {"workspace_count": 0}
     try:
-        caller_tier = await get_user_tier(uid)
+        caller_tier = await _resolve_caller_tier(uid)
         if caller_tier in ("external", "company"):
             return None
         return await _find_matches(

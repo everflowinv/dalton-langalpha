@@ -789,6 +789,9 @@ async def test_connection_released_before_permission_check_and_sql_projects_bool
                 owner_email=EMAIL_CY,
             )
         ],
+        doc_rows=[
+            {"workspace_id": WS_2, "doc_key": "company", "content": {"ticker": "ANT"}}
+        ],
         sql_log=sql_log,
         conn_state=conn_state,
     )
@@ -825,6 +828,9 @@ async def test_permission_503_and_alias_failure_proceed_with_redacted_warning(
                 owner_id=USER_CY,
                 owner_email=EMAIL_CY,
             )
+        ],
+        doc_rows=[
+            {"workspace_id": WS_2, "doc_key": "company", "content": {"ticker": "ANT"}}
         ],
     )
     _install_read_access(
@@ -881,7 +887,8 @@ def test_chief_of_staff_prompt_non_contradictory() -> None:
     )
     assert "delegate_to_analyst` into one is refused" in prompt
     assert "company_workspace_exists" in prompt
-    assert "不要往同事工作区派发任务，除非派发工具允许" in prompt
+    assert "不往同事工作区派发任务" in prompt
+    assert "除非派发工具允许" not in prompt
     assert "allow_duplicate_company" in prompt
 
 
@@ -1124,3 +1131,300 @@ async def test_workspaces_create_proceeds_when_dedup_raises(
     assert payload["success"] is True
     assert "Company workspace dedup check failed" in caplog.text
     assert "db unreachable" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ticker_shaped_ordinary_workspace_not_company_vs_bound_unit_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        unit_rows=[
+            _unit_row(
+                ws_id=WS_1,
+                ws_name="NVDA",
+                ticker="NVDA",
+                display_name="NVIDIA Corporation",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            ),
+            # Bound company unit without ticker: still classified via SOURCE_REGISTERED.
+            _unit_row(
+                ws_id=WS_3,
+                ws_name="AAPL",
+                ticker=None,
+                ticker_key=None,
+                display_name="Apple Computer",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            ),
+        ],
+        ws_rows=[
+            # Ordinary topic workspace whose name looks like a ticker ("Macro").
+            _ws_row(
+                ws_id=WS_2,
+                name="Macro",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            ),
+            _ws_row(
+                ws_id=WS_1,
+                name="NVDA",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            ),
+            _ws_row(
+                ws_id=WS_3,
+                name="AAPL",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            ),
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_1, WS_2, WS_3})
+
+    assert await find_existing_company_workspace(USER_CALLER, "Macro") is None
+
+    nvda_match = await find_existing_company_workspace(USER_CALLER, "NVDA")
+    assert nvda_match is not None
+    assert nvda_match.workspace_id == WS_1
+
+    aapl_match = await find_existing_company_workspace(USER_CALLER, "AAPL")
+    assert aapl_match is not None
+    assert aapl_match.workspace_id == WS_3
+
+
+@pytest.mark.asyncio
+async def test_ticker_comparison_uses_ticker_key_not_name_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        unit_rows=[
+            _unit_row(
+                ws_id=WS_1,
+                ws_name="AX-L",
+                ticker="AX-L",
+                ticker_key="AX.L",
+                display_name="Axon London Ltd.",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            )
+        ],
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_1,
+                name="AX-L",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            )
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_1})
+
+    assert await find_existing_company_workspace(USER_CALLER, "AXL") is None
+
+    match_hyphen = await find_existing_company_workspace(USER_CALLER, "AX-L")
+    assert match_hyphen is not None
+    assert match_hyphen.workspace_id == WS_1
+
+    match_dot = await find_existing_company_workspace(USER_CALLER, "AX.L")
+    assert match_dot is not None
+    assert match_dot.workspace_id == WS_1
+
+
+@pytest.mark.asyncio
+async def test_workspace_name_ticker_comparison_uses_ticker_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="AX-L",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            )
+        ],
+        doc_rows=[
+            {"workspace_id": WS_2, "doc_key": "company", "content": {"ticker": "AX-L"}},
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_2})
+
+    assert await find_existing_company_workspace(USER_CALLER, "AXL") is None
+    assert (await find_existing_company_workspace(USER_CALLER, "AX-L")).workspace_id == WS_2
+    assert (await find_existing_company_workspace(USER_CALLER, "AX.L")).workspace_id == WS_2
+
+
+@pytest.mark.asyncio
+async def test_identity_lookup_failure_or_fallback_default_allows_creation(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from src.dalton import auth as dalton_auth
+    from src.server.database import user as user_db
+
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "true")
+    monkeypatch.setenv("HOST_MODE", "oss")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    monkeypatch.setenv(
+        "DALTON_ALLOWED_EMAILS",
+        f"{EMAIL_CALLER},{EMAIL_RICHARD},{EMAIL_CY}",
+    )
+
+    _install_db(
+        monkeypatch,
+        unit_rows=[
+            _unit_row(
+                ws_id=WS_1,
+                ws_name="ANT",
+                ticker="ANT",
+                display_name="Anthropic, PBC",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            )
+        ],
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_1,
+                name="ANT",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            )
+        ],
+    )
+
+    _real_get_user = user_db.get_user
+
+    # Case 1: initial caller identity lookup fails -> proceeds and logs only exception class.
+    async def _fail_first(uid: str) -> dict[str, Any]:
+        raise TimeoutError("secret-dsn-caller-host")
+
+    monkeypatch.setattr(
+        user_db,
+        "get_user",
+        create_autospec(_real_get_user, side_effect=_fail_first),
+    )
+    with caplog.at_level(logging.WARNING):
+        res_first = await find_existing_company_workspace(USER_CALLER, "Anthropic")
+    assert res_first is None
+    assert "TimeoutError" in caplog.text
+    assert "secret-dsn-caller-host" not in caplog.text
+    assert "Anthropic" not in caplog.text
+
+    # Case 2: initial identity check succeeds, then get_user inside
+    # require_workspace_access -> get_user_tier times out and returns fallback
+    # 'external'; dedup treats it as lookup error (503) and proceeds.
+    caplog.clear()
+    call_count = {"n": 0}
+
+    async def _fail_second(uid: str) -> dict[str, Any]:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return {"user_id": uid, "email": EMAIL_CALLER}
+        raise TimeoutError("secret-pool-timeout-second")
+
+    monkeypatch.setattr(
+        user_db,
+        "get_user",
+        create_autospec(_real_get_user, side_effect=_fail_second),
+    )
+    token = dalton_auth._verified_token_identity.set((USER_CALLER, EMAIL_CALLER))
+    try:
+        with caplog.at_level(logging.WARNING):
+            res_second = await find_existing_company_workspace(
+                USER_CALLER, "Anthropic"
+            )
+    finally:
+        dalton_auth._verified_token_identity.reset(token)
+
+    assert res_second is None
+    assert call_count["n"] >= 2
+    assert "HTTPException" in caplog.text
+    assert "workspace_count=1" in caplog.text
+    assert "secret-pool-timeout-second" not in caplog.text
+    assert "Anthropic" not in caplog.text
+
+    # Case 3: real external member (get_user returns non-allowlisted email) skips dedup without warning.
+    caplog.clear()
+    monkeypatch.setattr(
+        user_db,
+        "get_user",
+        create_autospec(
+            _real_get_user,
+            return_value={"user_id": USER_EXTERNAL, "email": EMAIL_EXTERNAL},
+        ),
+    )
+    with caplog.at_level(logging.WARNING):
+        res_ext = await find_existing_company_workspace(USER_EXTERNAL, "Anthropic")
+    assert res_ext is None
+    assert "Company workspace dedup check failed" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_caller_own_historical_duplicate_exits_early_while_candidates_exclude_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_team_mode(monkeypatch)
+    sql_log: list[tuple[str, Any]] = []
+    _install_db(
+        monkeypatch,
+        unit_rows=[
+            _unit_row(
+                ws_id=WS_1,
+                ws_name="ANT",
+                ticker="ANT",
+                display_name="Anthropic, PBC",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            )
+        ],
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="Anthropic",
+                owner_id=USER_CALLER,
+                owner_name="Caller",
+                owner_email=EMAIL_CALLER,
+                is_historical_duplicate=True,
+                config={"dalton_historical_duplicate_of": WS_1},
+            ),
+            _ws_row(
+                ws_id=WS_3,
+                name="OpenAI",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+                is_historical_duplicate=True,
+                config={"dalton_historical_duplicate_of": WS_4},
+            ),
+        ],
+        sql_log=sql_log,
+    )
+    _install_read_access(monkeypatch, web_readable={WS_1, WS_2, WS_3})
+
+    # Caller's own historical duplicate still holds idx_workspaces_user_name_key -> early exit.
+    assert await find_existing_company_workspace(USER_CALLER, "Anthropic") is None
+    # Colleague's historical duplicate remains excluded from candidate matching.
+    assert await find_existing_company_workspace(USER_CALLER, "OpenAI") is None
+
+    ws_sql = [sql for sql, _ in sql_log if "FROM workspaces " in sql][0]
+    assert "is_historical_duplicate" in ws_sql
+    assert "WHERE" in ws_sql
+    where_part = ws_sql.split("WHERE", 1)[1]
+    assert "dalton_historical_duplicate_of" not in where_part
