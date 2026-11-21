@@ -2088,3 +2088,32 @@ def test_gemini_4_overlay_models_default_to_expansive_compaction_and_user_pref_o
         assert resolve_tuning({"compaction_profile": "moderate"}, key).compaction_profile == "moderate"
 
 
+def test_kimi_k31_overlay_sets_conservative_max_tokens_and_wire_payload(monkeypatch):
+    """Kimi K3.1 models override the 32000 Anthropic default / unset OpenAI output limit
+    via native_overlay.json model_overrides with a conservative 65536 max_tokens."""
+    from src.llms.llm import create_llm
+    from tests.unit.llms.test_request_lock import _request_of
+
+    monkeypatch.setattr(LLM, "_model_config", None)
+    mc = LLM.get_model_config()
+
+    expected_models = (
+        ("kimi-k3.1-pro", "max_tokens"),
+        ("kimi-k3.1-pro-highspeed", "max_tokens"),
+        ("kimi-k3.1-pro-coding", "max_output_tokens"),
+        ("kimi-k3.1-pro-highspeed-coding", "max_output_tokens"),
+    )
+    for key, body_field in expected_models:
+        entry = mc.get_model_config(key)
+        assert entry is not None, key
+        assert (entry.get("parameters") or {}).get("max_tokens") == 65536, key
+
+        client = create_llm(key, api_key="sk-kimi-test")
+        assert isinstance(client.profile, dict)
+        assert client.profile.get("max_output_tokens") == 65536, key
+
+        req = _request_of(client)
+        assert req is not None, key
+        assert req["body"].get(body_field) == 65536, (key, req["body"])
+
+

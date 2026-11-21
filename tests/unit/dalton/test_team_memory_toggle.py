@@ -744,3 +744,206 @@ async def test_home_turn_follows_user_level_switch(
     assert "first call `conversation_search` to check the team's prior views, assumptions and decisions" in cos_prompt_on
     assert "回答某家公司或主题时，先用 `conversation_search`" in cos_prompt_on
     assert "归档统计：" in cos_prompt_on
+
+
+@pytest.mark.asyncio
+async def test_codex_next_turn_drops_team_memory_prompt_and_tool_after_toggle_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After turning off Team Memory, the next GPT/Codex turn refreshes its pinned prompt
+    and OpenAI tool surface so no team memory instructions, data map rows, or
+    conversation_search tool schema remain in the outgoing Codex request."""
+    import json
+
+    from langchain.agents import create_agent
+    from langchain.agents.middleware.types import ModelRequest, ModelResponse
+    from langchain_core.messages import AIMessage, HumanMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from langchain_core.tools import tool
+    from langchain_openai.chat_models.base import BaseChatOpenAI
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from ptc_agent.agent.main_state import MainAgentState
+    from ptc_agent.agent.middleware.reasoning_compat import ReasoningCompatibilityMiddleware
+    from ptc_agent.agent.middleware.runtime_context.frozen_prompt import (
+        STATE_SYSTEM_PIN,
+        SystemPinMiddleware,
+    )
+    from ptc_agent.agent.middleware.tool_surface import TOOL_SURFACE_KEY, ToolSurfaceMiddleware
+    from src.llms.llm import create_llm
+
+    @tool
+    def search_data(query: str) -> str:
+        """Look up market data."""
+        return query
+
+    @tool("conversation_search")
+    def conversation_search_stub(query: str) -> str:
+        """Search Dalton's team conversation archive for prior views and decisions."""
+        return query
+
+    cached_md = _sample_cached_data_map_markdown()
+    monkeypatch.setattr(
+        db_data_map,
+        "get_cached_data_map",
+        create_autospec(
+            db_data_map.get_cached_data_map,
+            return_value={
+                "cache_date": "2026-11-05",
+                "rendered_markdown": cached_md,
+                "payload": {},
+            },
+        ),
+    )
+
+    codex_client = create_llm("gpt-6.2-sol-oauth", api_key="sk-codex-test")
+    captured_payloads: list[dict[str, Any]] = []
+    replies = [
+        AIMessage(
+            content=[
+                {
+                    "type": "reasoning",
+                    "id": "rs_turn1",
+                    "summary": [],
+                    "encrypted_content": "enc_turn1",
+                },
+                {"type": "text", "text": "Checked team memory on turn 1."},
+            ],
+            id="msg_codex_1",
+            response_metadata={"model_name": "gpt-6.2-sol", "reasoning_origin": "codex-oauth"},
+        ),
+        AIMessage(
+            content=[
+                {
+                    "type": "reasoning",
+                    "id": "rs_turn2",
+                    "summary": [],
+                    "encrypted_content": "enc_turn2",
+                },
+                {"type": "text", "text": "Answered without team memory on turn 2."},
+            ],
+            id="msg_codex_2",
+            response_metadata={"model_name": "gpt-6.2-sol", "reasoning_origin": "codex-oauth"},
+        ),
+    ]
+
+    async def _fake_agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        payload = self._get_request_payload(messages, stop=stop, **kwargs)
+        captured_payloads.append(payload)
+        return ChatResult(generations=[ChatGeneration(message=replies.pop(0))])
+
+    monkeypatch.setattr(BaseChatOpenAI, "_agenerate", _fake_agenerate)
+    monkeypatch.setattr(BaseChatOpenAI, "_should_stream", lambda self, **_: False)
+
+    saver = InMemorySaver()
+    cfg = {"configurable": {"thread_id": "t-codex-team-memory", "user_id": "u-richard"}}
+
+    # Turn 1: Team Memory ON
+    await map_builder.warm_turn_data_map(
+        search_api="openclaw",
+        cache_date=date(2026, 11, 5),
+        team_memory_enabled=True,
+    )
+    prompt_on = PromptLoader().get_system_prompt(
+        role="chief_of_staff",
+        conversation_search_enabled=True,
+    )
+    agent_on = create_agent(
+        model=codex_client,
+        tools=[search_data, conversation_search_stub],
+        system_prompt=prompt_on,
+        middleware=[
+            ToolSurfaceMiddleware(team_memory_enabled=True),
+            SystemPinMiddleware(team_memory_enabled=True),
+            ReasoningCompatibilityMiddleware(),
+        ],
+        checkpointer=saver,
+        state_schema=MainAgentState,
+    )
+    await agent_on.ainvoke({"messages": [HumanMessage("NVDA 团队怎么看？")]}, cfg)
+
+    assert len(captured_payloads) == 1
+    wire_turn1 = json.dumps(captured_payloads[0], ensure_ascii=False)
+    assert "conversation_search" in wire_turn1
+    assert "归档统计：" in wire_turn1
+    assert [t["name"] for t in captured_payloads[0]["tools"]] == [
+        "search_data",
+        "conversation_search",
+    ]
+
+    # Turn 2: Team Memory OFF (same thread, bound GPT-6.2 reasoning in history)
+    await map_builder.warm_turn_data_map(
+        search_api="openclaw",
+        cache_date=date(2026, 11, 5),
+        team_memory_enabled=False,
+    )
+    prompt_off = PromptLoader().get_system_prompt(
+        role="chief_of_staff",
+        conversation_search_enabled=False,
+    )
+    agent_off = create_agent(
+        model=codex_client,
+        tools=[search_data],
+        system_prompt=prompt_off,
+        middleware=[
+            ToolSurfaceMiddleware(team_memory_enabled=False),
+            SystemPinMiddleware(team_memory_enabled=False),
+            ReasoningCompatibilityMiddleware(),
+        ],
+        checkpointer=saver,
+        state_schema=MainAgentState,
+    )
+    await agent_off.ainvoke({"messages": [HumanMessage("继续看下估值")]}, cfg)
+
+    assert len(captured_payloads) == 2
+    payload_turn2 = captured_payloads[1]
+    wire_turn2 = json.dumps(payload_turn2, ensure_ascii=False)
+    assert "conversation_search" not in wire_turn2
+    assert "归档统计：" not in wire_turn2
+    assert "团队以前的观点" not in wire_turn2
+    assert "prior views, assumptions and decisions" not in wire_turn2
+    assert [t["name"] for t in payload_turn2["tools"]] == ["search_data"]
+    developer_msgs = [
+        item for item in payload_turn2["input"] if isinstance(item, dict) and item.get("role") == "developer"
+    ]
+    assert len(developer_msgs) == 1
+    assert "conversation_search" not in json.dumps(developer_msgs[0], ensure_ascii=False)
+
+    # Legacy checkpoint pin without explicit team_memory_enabled also refreshes immediately
+    legacy_pin = {
+        "model": "gpt-6.2-sol",
+        "content": prompt_on,
+        "source_digest": (await agent_off.aget_state(cfg)).values[STATE_SYSTEM_PIN]["source_digest"],
+    }
+    legacy_surface = {
+        "openai": {"tools": captured_payloads[0]["tools"], "epoch": None},
+        "offered": ["search_data", "conversation_search"],
+    }
+    seen_req: list[ModelRequest] = []
+
+    async def _capture_handler(req: ModelRequest) -> ModelResponse:
+        seen_req.append(req)
+        return ModelResponse(result=[AIMessage("ok")])
+
+    bound_msg = AIMessage(
+        content=[{"type": "reasoning", "id": "rs_legacy", "summary": [], "encrypted_content": "enc"}],
+        response_metadata={"model_name": "gpt-6.2-sol", "reasoning_origin": "codex-oauth"},
+    )
+    req = ModelRequest(
+        model=codex_client,
+        messages=[HumanMessage("q1"), bound_msg, HumanMessage("q2")],
+        system_prompt=prompt_off,
+        state={STATE_SYSTEM_PIN: legacy_pin, TOOL_SURFACE_KEY: legacy_surface},
+        tools=[search_data],
+        model_settings={},
+    )
+    pin_mw = SystemPinMiddleware(team_memory_enabled=False)
+    surf_mw = ToolSurfaceMiddleware(team_memory_enabled=False)
+
+    async def _run_pin(r: ModelRequest) -> ModelResponse:
+        return await pin_mw.awrap_model_call(r, _capture_handler)
+
+    await surf_mw.awrap_model_call(req, _run_pin)
+    assert len(seen_req) == 1
+    assert "conversation_search" not in str(seen_req[0].system_message.content)
+    assert [t["function"]["name"] for t in seen_req[0].tools] == ["search_data"]

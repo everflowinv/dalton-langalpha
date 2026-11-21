@@ -5364,7 +5364,7 @@
   },
   "request": {
    "body": {
-    "max_tokens": 32000,
+    "max_tokens": 65536,
     "messages": [
      {
       "content": "Look up AAPL.",
@@ -5531,6 +5531,7 @@
       "type": "message"
      }
     ],
+    "max_output_tokens": 65536,
     "model": "k3.1-pro",
     "reasoning": {
      "effort": "high",
@@ -5679,7 +5680,7 @@
   },
   "request": {
    "body": {
-    "max_tokens": 32000,
+    "max_tokens": 65536,
     "messages": [
      {
       "content": "Look up AAPL.",
@@ -5846,6 +5847,7 @@
       "type": "message"
      }
     ],
+    "max_output_tokens": 65536,
     "model": "k3.1-pro-highspeed",
     "reasoning": {
      "effort": "high",

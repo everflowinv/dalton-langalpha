@@ -1451,7 +1451,7 @@ class PTCAgent:
                 multimodal_read,
                 AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
                 SystemPromptCacheMiddleware(),
-                ToolSurfaceMiddleware(),
+                ToolSurfaceMiddleware(team_memory_enabled=conversation_search_enabled),  # DALTON-HOOK(team-memory-toggle)
                 EmptyToolCallRetryMiddleware(),
                 DaltonPatchToolCallsMiddleware(),  # DALTON-HOOK(dalton-patch-tool-calls)
                 context.turn,
@@ -1478,7 +1478,7 @@ class PTCAgent:
                     else []
                 ),
                 context.tail,
-                SystemPinMiddleware(),
+                SystemPinMiddleware(team_memory_enabled=conversation_search_enabled),  # DALTON-HOOK(team-memory-toggle)
                 ReasoningCompatibilityMiddleware(),
             ]
             if m is not None

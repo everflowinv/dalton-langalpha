@@ -887,6 +887,26 @@
     },
     "gemini-4-hydrogen": {
       "compaction_profile": "expansive"
+    },
+    "kimi-k3.1-pro": {
+      "parameters": {
+        "max_tokens": 65536
+      }
+    },
+    "kimi-k3.1-pro-highspeed": {
+      "parameters": {
+        "max_tokens": 65536
+      }
+    },
+    "kimi-k3.1-pro-coding": {
+      "parameters": {
+        "max_tokens": 65536
+      }
+    },
+    "kimi-k3.1-pro-highspeed-coding": {
+      "parameters": {
+        "max_tokens": 65536
+      }
     }
   },
   "providers": {
