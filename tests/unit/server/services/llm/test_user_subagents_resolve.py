@@ -250,13 +250,9 @@ async def test_a_build_that_compiles_no_subagents_never_reads_them(
     reads = AsyncMock(return_value=[])
     monkeypatch.setattr(user_subagents, "list_user_subagents", reads)
 
-    base = _agent_config()
-    # DALTON-HOOK(background-effort-low): a background call now carries "low", which
-    # builds its client from the manifest, so the model has to be a real manifest row.
-    base.llm = LLMConfig(name="claude-sonnet-5-5")
     with _offline_turn():
         config = await resolve_llm_config(
-            base, USER, None, False, slot=slot, user_facing=user_facing,
+            _agent_config(), USER, None, False, slot=slot, user_facing=user_facing,
         )
 
     reads.assert_not_awaited()
