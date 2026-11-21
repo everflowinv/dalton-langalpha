@@ -8,11 +8,19 @@
  * whose failure the reader dismissed: each keeps its group and shows the pause
  * glyph in the muted tone.
  */
-import { AlertCircle, Clock, Pause, type LucideIcon } from 'lucide-react';
+import { AlertCircle, AlertTriangle, Clock, Pause, type LucideIcon } from 'lucide-react'; // DALTON-HOOK(execution-delivery-status)
 import type {
-  Automation, AutomationExecution, ExecutionStatus, FailureReason, SkipReason, WaitReason,
+  Automation,
+  AutomationExecution,
+  ExecutionDeliveryStatus,
+  ExecutionDeliverySummary,
+  ExecutionStatus,
+  FailureReason,
+  SkipReason,
+  WaitReason,
 } from '@/types/automation';
 import { buildRateLimitError, type PageLinkSpec } from '@/utils/rateLimitError';
+import { resolveExecutionDelivery } from './delivery'; // DALTON-HOOK(execution-delivery-status)
 
 export function isRunLive(status: ExecutionStatus): boolean {
   return status === 'running' || status === 'pending';
@@ -345,7 +353,31 @@ export interface RunView {
   noteKey: string | null;
   /** Only a run that actually ran to an end has a length worth stating. */
   showDuration: boolean;
+  // DALTON-HOOK(execution-delivery-status): resolved delivery status & summary without altering run.status
+  deliveryStatus: ExecutionDeliveryStatus | null;
+  deliverySummary: ExecutionDeliverySummary | null;
 }
+
+// DALTON-HOOK(execution-delivery-status): display overlays for completed runs whose delivery failed or is retrying
+const COMPLETED_DELIVERY_UI: Partial<Record<ExecutionDeliveryStatus, StatusUi>> = {
+  failed: {
+    labelKey: 'automation.runCompletedDeliveryFailed',
+    Icon: AlertCircle,
+    color: DANGER,
+    danger: true,
+  },
+  partial_failed: {
+    labelKey: 'automation.runCompletedPartialDeliveryFailed',
+    Icon: AlertTriangle,
+    color: DANGER,
+    danger: true,
+  },
+  retrying: {
+    labelKey: 'automation.runCompletedDelivering',
+    Icon: Clock,
+    color: 'var(--color-accent-primary)',
+  },
+};
 
 export function describeRun(run: AutomationExecution): RunView {
   const { status } = run;
@@ -355,10 +387,20 @@ export function describeRun(run: AutomationExecution): RunView {
   else if (status === 'skipped' && run.skip_reason) noteKey = SKIP_REASON_NOTE[run.skip_reason] ?? null;
   else if (isRunFailed(status) && run.failure_reason) noteKey = FAILURE_REASON_NOTE[run.failure_reason] ?? null;
   const ended = status === 'completed' || isRunFailed(status);
+  // DALTON-HOOK(execution-delivery-status): overlay delivery state on completed runs while keeping status='completed'
+  const deliverySummary = resolveExecutionDelivery(run);
+  const deliveryStatus = deliverySummary?.status ?? null;
+  const baseUi = RUN_STATUS_UI[status] ?? UNKNOWN_RUN_UI;
+  const ui =
+    status === 'completed' && deliveryStatus && COMPLETED_DELIVERY_UI[deliveryStatus]
+      ? COMPLETED_DELIVERY_UI[deliveryStatus]!
+      : baseUi;
   return {
-    ui: RUN_STATUS_UI[status] ?? UNKNOWN_RUN_UI,
+    ui,
     waiting,
     noteKey,
     showDuration: ended && !!run.started_at && !!run.completed_at,
+    deliveryStatus,
+    deliverySummary,
   };
 }

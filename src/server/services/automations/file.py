@@ -214,8 +214,19 @@ def _state(row: dict[str, Any]) -> dict[str, Any]:
         }
         if last.get("conversation_thread_id"):
             run["thread_id"] = str(last["conversation_thread_id"])
-        if last.get("excerpt"):
-            run["excerpt"] = last["excerpt"]
+        # DALTON-HOOK(execution-delivery-status): expose delivery_status and English failure reason on last_run without altering status
+        from src.dalton.services.execution_delivery_status import (
+            humanize_delivery_error,
+            resolve_execution_delivery_summary,
+            strip_synced_delivery_excerpt_suffix,
+        )
+
+        delivery_summary = resolve_execution_delivery_summary(last)
+        excerpt = last.get("excerpt")
+        if delivery_summary and isinstance(excerpt, str):
+            excerpt = strip_synced_delivery_excerpt_suffix(excerpt)
+        if excerpt:
+            run["excerpt"] = excerpt
         for key in ("failure_reason", "skip_reason"):
             if last.get(key):
                 run[key] = last[key]
@@ -224,6 +235,16 @@ def _state(row: dict[str, Any]) -> dict[str, Any]:
             run["error"] = error if len(error) <= _ERROR_EXCERPT else f"{error[:_ERROR_EXCERPT]}…"
         if last.get("dismissed_at"):
             run["dismissed"] = True
+        if delivery_summary:
+            run["delivery_status"] = delivery_summary["status"]
+            if delivery_summary.get("status") in ("failed", "partial_failed"):
+                en_reason = humanize_delivery_error(
+                    delivery_summary.get("failure_code"),
+                    delivery_summary.get("failure_reason"),
+                    lang="en",
+                )
+                if en_reason:
+                    run["delivery_failure_reason"] = en_reason
         state["last_run"] = run
     if row.get("failure_count"):
         state["failure_count"] = row["failure_count"]
@@ -247,7 +268,14 @@ def _render(row: dict[str, Any]) -> tuple[str, str]:
 
 async def rendered_files(user_id: str) -> dict[str, tuple[str, str]]:
     """Every automation's file, by file name: its content and version."""
-    return {row["file_name"]: _render(row) for row in await auto_db.list_all_automations(user_id)}
+    rows = await auto_db.list_all_automations(user_id)
+    # DALTON-HOOK(execution-delivery-status): enrich last_execution before rendering livefs automation files
+    from src.dalton.services.execution_delivery_status import (
+        enrich_automations_with_delivery_summary,
+    )
+
+    await enrich_automations_with_delivery_summary(rows)
+    return {row["file_name"]: _render(row) for row in rows}
 
 
 async def file_names(user_id: str) -> list[str]:
@@ -726,7 +754,15 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
         return "\n".join([f"No changes: {self.file_name} already matches the saved automation", *notes])
 
     async def fetch(self, user_id: str, conn: Any = None) -> dict[str, Any] | None:
-        return await auto_db.get_automation_file(user_id, self.file_name, conn=conn)
+        row = await auto_db.get_automation_file(user_id, self.file_name, conn=conn)
+        # DALTON-HOOK(execution-delivery-status): enrich last_execution on single-file reads to match rendered_files
+        if row is not None:
+            from src.dalton.services.execution_delivery_status import (
+                enrich_automations_with_delivery_summary,
+            )
+
+            await enrich_automations_with_delivery_summary([row], conn=conn)
+        return row
 
     def render(self, row: dict[str, Any] | None) -> tuple[str, str] | None:
         return _render(row) if row else None

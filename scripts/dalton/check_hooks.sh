@@ -460,6 +460,9 @@ ALLOWED_HOOKS=(
   "browser-kill-switch"
   # Background-slot calls default to low reasoning effort (src/server/services/llm/config.py).
   "background-effort-low"
+  # Surface terminal/partial/retrying delivery outcomes on completed executions
+  # in execution history, detail, CoS activity, ThreadStatus, and automation state files.
+  "execution-delivery-status"
   # Execution history and automation detail last_execution computer-scope filter:
   # include executions when either the automation's workspace or the thread's
   # workspace belongs to computer_id (excluding Home), without duplicating rows.

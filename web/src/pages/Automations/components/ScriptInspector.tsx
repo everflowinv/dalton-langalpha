@@ -10,6 +10,8 @@ import { useModificationHistory } from '../hooks/useModificationHistory';
 import { useAutomationExecutionReads } from '../hooks/useAutomationReads';
 import { useAutomationMutations } from '../hooks/useAutomationMutations';
 import { cronToHuman } from '../utils/cron'; // DALTON-HOOK(ui-unify)
+import { formatDeliveryFailureReason } from '../utils/delivery';
+import { scriptDeliveryPollMs } from '../utils/polling';
 import { formatDateTimeShort } from '../utils/time';
 import { isCompanyTask, isDeletedTask, isForbiddenError, runStatusKey, scriptStatusLabelKey } from '../utils/taskKind';
 import { DeletedMeta, ModificationHistory, RecordTabs, RollbackDialog } from './ModificationHistory';
@@ -34,7 +36,13 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
   const { pause, resume, busy } = useAutomationMutations();
   const deleted = isDeletedTask(script);
   const history = useModificationHistory(script, isCompanyTask(script), onRunsForbidden, onRestored);
-  const runs = useAutomationExecutionReads(script.automation_id, { limit: 20, offset: 0, enabled: !deleted });
+  const runs = useAutomationExecutionReads(script.automation_id, {
+    limit: 20,
+    offset: 0,
+    enabled: !deleted,
+    refetchInterval: (data) =>
+      scriptDeliveryPollMs((data?.executions ?? []).filter((run) => run.engine_kind === 'script')),
+  });
   const runsForbidden = isCompanyTask(script) && isForbiddenError(runs.error);
   useEffect(() => {
     if (runsForbidden) onRunsForbidden(script.automation_id);
@@ -174,13 +182,32 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
           <p className="automations-quiet-note">{t('automation.noRunsForThis')}</p>
         ) : (
           <ul className="automation-details">
-            {(executions.length > 0 ? executions : script.last_execution ? [script.last_execution] : []).map((run) => (
-              <li key={run.automation_execution_id} className="automation-mono">
-                {runStatusKey(run.status) ? t(runStatusKey(run.status)!) : run.status}
-                {run.started_at ? ` · ${formatDateTimeShort(run.started_at, locale)}` : ''}
-                {run.completed_at ? ` · ${formatDateTimeShort(run.completed_at, locale)}` : ''}
-              </li>
-            ))}
+            {(executions.length > 0 ? executions : script.last_execution ? [script.last_execution] : []).map((run) => {
+              const delivery = run.delivery_summary;
+              const deliveryLabel =
+                run.status === 'succeeded' && delivery
+                  ? delivery.status === 'failed'
+                    ? t('automation.deliveryStatusFailed')
+                    : delivery.status === 'partial_failed'
+                      ? t('automation.deliveryStatusPartialFailed')
+                      : delivery.status === 'retrying'
+                        ? t('automation.deliveryStatusRetrying')
+                        : null
+                  : null;
+              const deliveryReason =
+                delivery && (delivery.status === 'failed' || delivery.status === 'partial_failed')
+                  ? formatDeliveryFailureReason(delivery.failure_code, delivery.failure_reason, t)
+                  : null;
+              return (
+                <li key={run.automation_execution_id} className="automation-mono">
+                  {runStatusKey(run.status) ? t(runStatusKey(run.status)!) : run.status}
+                  {deliveryLabel ? ` · ${deliveryLabel}` : ''}
+                  {deliveryReason ? ` (${deliveryReason})` : ''}
+                  {run.started_at ? ` · ${formatDateTimeShort(run.started_at, locale)}` : ''}
+                  {run.completed_at ? ` · ${formatDateTimeShort(run.completed_at, locale)}` : ''}
+                </li>
+              );
+            })}
           </ul>
         )}
         </>

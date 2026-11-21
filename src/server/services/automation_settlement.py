@@ -494,6 +494,34 @@ def _nudge_drainer() -> None:
         logger.warning(f"[AUTOMATION_SETTLE] Nudging the hook outbox drainer failed: {e}")
 
 
+# DALTON-HOOK(execution-delivery-status): persist sender retry eligibility on unconfirmed delivery_result items
+def _stamp_delivery_retry(
+    result: list[Dict[str, Any]], *, retrying: bool
+) -> list[Dict[str, Any]]:
+    """Mark unconfirmed failed attempts with whether the sender will retry them."""
+    stamped: list[Dict[str, Any]] = []
+    for item in result:
+        if item.get("success") is True:
+            stamped.append(item)
+            continue
+        if not str(item.get("error") or "").startswith(automation_delivery._UNCONFIRMED):
+            stamped.append(item)
+            continue
+        stamped.append({**item, "retrying": bool(retrying)})
+    return stamped
+
+
+# DALTON-HOOK(execution-delivery-status): clear retrying on kept delivery_result when sender stops retrying
+async def _clear_delivery_retrying(execution_id: str) -> None:
+    try:
+        await exec_db.clear_delivery_retrying(execution_id)
+    except Exception as e:
+        logger.error(
+            f"[AUTOMATION_SETTLE] Clearing delivery retrying flag failed: "
+            f"execution_id={execution_id} error={e}"
+        )
+
+
 async def _finish_here(
     automation: Dict[str, Any],
     execution_id: str,
@@ -510,7 +538,11 @@ async def _finish_here(
         targets=delivery.targets, final_text=final_text, thread_id=thread_id,
     )
     finish = await ask()
-    await _record_delivery(execution_id, finish.result)
+    # DALTON-HOOK(execution-delivery-status): persist whether finish will be retried
+    will_retry = finish.retry and bool(automation_delivery.FINISH_RETRY_DELAYS)
+    await _record_delivery(
+        execution_id, _stamp_delivery_retry(finish.result, retrying=will_retry)
+    )
     if finish.retry:
         # Off the settle's path, which the executor waits on.
         _hold(asyncio.create_task(
@@ -558,11 +590,17 @@ async def _finish_held_run(job: Dict[str, Any]) -> None:
         targets=delivery.targets, final_text=payload.get("final_text"),
         thread_id=str(job["conversation_thread_id"]),
     )
+    # DALTON-HOOK(execution-delivery-status): persist sender retry decision on delivery_result
+    will_retry = finish.retry and job["attempts"] < MAX_ATTEMPTS
     if not recorded or _replaces_record(finish, answered):
         await _keep_record(
-            str(job["hook_outbox_id"]), execution_id, finish.result,
+            str(job["hook_outbox_id"]),
+            execution_id,
+            _stamp_delivery_retry(finish.result, retrying=will_retry),
             answered=answered or finish.answered,
         )
+    elif not will_retry:
+        await _clear_delivery_retrying(execution_id)
     if not finish.retry:
         return
     if job["attempts"] >= MAX_ATTEMPTS:
@@ -603,11 +641,18 @@ async def _finish_again(
     ends the asking. A refusal replaces only a record no answer made, which
     says less than any answer. When the asks run out, the last record
     stands, rows still being posted reading as unconfirmed."""
-    for delay in automation_delivery.FINISH_RETRY_DELAYS:
+    delays = automation_delivery.FINISH_RETRY_DELAYS
+    for idx, delay in enumerate(delays):
         await asyncio.sleep(delay)
         finish = await ask()
+        # DALTON-HOOK(execution-delivery-status): persist sender retry decision on replacement records
+        will_retry = finish.retry and idx < len(delays) - 1
         if _replaces_record(finish, answered):
-            await _record_delivery(execution_id, finish.result)
+            await _record_delivery(
+                execution_id, _stamp_delivery_retry(finish.result, retrying=will_retry)
+            )
+        elif not will_retry:
+            await _clear_delivery_retrying(execution_id)
         answered = answered or finish.answered
         if not finish.retry:
             return
