@@ -7,10 +7,14 @@ import asyncio
 import contextvars
 import logging
 import re
+import uuid
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
+
+from fastapi import HTTPException
 
 from src.dalton.auth import (
     resolve_caller_home_workspace_id,
@@ -46,6 +50,25 @@ _held_user_locks: contextvars.ContextVar[frozenset[tuple[int, str]]] = contextva
 _held_user_conn: contextvars.ContextVar[dict[tuple[int, str], Any] | None] = contextvars.ContextVar(
     "_held_user_conn", default=None
 )
+_prelock_unit_workspace: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_prelock_unit_workspace", default=None
+)
+
+
+@asynccontextmanager
+async def _user_automations_lock_for_write(
+    user_id: str,
+    *,
+    conn: Any = None,
+    prelock_ws: str | None = None,
+):
+    tok = _prelock_unit_workspace.set(prelock_ws) if prelock_ws else None
+    try:
+        async with user_automations_lock(user_id, conn=conn) as active_conn:
+            yield active_conn
+    finally:
+        if tok is not None:
+            _prelock_unit_workspace.reset(tok)
 
 
 class AutomationLockError(RuntimeError):
@@ -72,8 +95,17 @@ async def user_automations_lock(user_id: str, *, conn: Any = None):
 
     inproc_lock = _inproc_user_locks.setdefault(uid, asyncio.Lock())
     lock_acquired = False
+    prelock_ws = _prelock_unit_workspace.get()
     try:
         async with inproc_lock, get_db_connection() as db_conn, db_conn.transaction():
+            if prelock_ws:
+                from src.dalton.database.coverage_units import get_active_unit_by_workspace
+                from src.dalton.settings import is_coverage_units_enabled
+
+                if is_coverage_units_enabled():
+                    await get_active_unit_by_workspace(
+                        prelock_ws, conn=db_conn, for_share=True
+                    )
             await auto_db.lock_user_automations(uid, conn=db_conn)
             lock_acquired = True
             tok_held = _held_user_locks.set(held | {task_key})
@@ -138,6 +170,7 @@ def build_company_watch_specs(
     workspace_id: str,
     tier: str = "Core",
     timezone_name: str | None = None,
+    unit_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return the standard automation definitions for a covered company (PK.15 / A13)."""
     t_upper = ticker.upper()
@@ -146,6 +179,12 @@ def build_company_watch_specs(
     tz = timezone_name or ("Asia/Shanghai" if is_cnhk else "America/New_York")
     watch_cron = "*/30 6-20 * * 1-5" if tier.lower() == "core" else "30 7 * * 1-5"
     delta_cron, delta_tz = resolve_delta_schedule(tier)
+    clean_unit_id = str(unit_id or "").strip()
+
+    def _with_unit(meta: dict[str, Any]) -> dict[str, Any]:
+        if clean_unit_id:
+            meta["unit_id"] = clean_unit_id
+        return meta
 
     return [
         {
@@ -160,12 +199,14 @@ def build_company_watch_specs(
                 f"请阅读本轮 `<dalton_wake>` 中的触发信号，使用 `.agents/skills/dalton-agenda/SKILL.md` 与相关分析技能处理 {t_upper} 的最新事项，"
                 "更新公司知识层并在收盘前写入 `knowledge_append_verdict`。"
             ),
-            "metadata": {
-                "dalton_managed": True,
-                "dalton_kind": "company_watch",
-                "ticker": t_upper,
-                "tier": tier,
-            },
+            "metadata": _with_unit(
+                {
+                    "dalton_managed": True,
+                    "dalton_kind": "company_watch",
+                    "ticker": t_upper,
+                    "tier": tier,
+                }
+            ),
         },
         {
             "name": f"dalton-{t_lower}-delta",
@@ -179,12 +220,14 @@ def build_company_watch_specs(
                 f"请按 `.agents/skills/dalton-thesis-delta/SKILL.md` 对 {t_upper} 最新证据、预期变化与催化剂进展做复盘，"
                 "必要时更新 `thesis` / `debate` / `agenda` 并追加一条 `knowledge_append_verdict`。"
             ),
-            "metadata": {
-                "dalton_managed": True,
-                "dalton_kind": "weekly_delta",
-                "ticker": t_upper,
-                "tier": tier,
-            },
+            "metadata": _with_unit(
+                {
+                    "dalton_managed": True,
+                    "dalton_kind": "weekly_delta",
+                    "ticker": t_upper,
+                    "tier": tier,
+                }
+            ),
         },
         {
             "name": f"dalton-{t_lower}-move-up",
@@ -212,12 +255,14 @@ def build_company_watch_specs(
                 f"{t_upper} 日内涨幅达到或超过 +4%。请按 `.agents/skills/dalton-stock-move/SKILL.md` 第一步先用 `web_search` 与 `x_search` 搜最新新闻和 X（当天与前一天）拿到“今天发生了什么”，再去查基本面、卖方预期与同行联动原因，"
                 "并追加 `knowledge_append_verdict`。"
             ),
-            "metadata": {
-                "dalton_managed": True,
-                "dalton_kind": "price_move",
-                "ticker": t_upper,
-                "direction": "up",
-            },
+            "metadata": _with_unit(
+                {
+                    "dalton_managed": True,
+                    "dalton_kind": "price_move",
+                    "ticker": t_upper,
+                    "direction": "up",
+                }
+            ),
         },
         {
             "name": f"dalton-{t_lower}-move-down",
@@ -245,12 +290,14 @@ def build_company_watch_specs(
                 f"{t_upper} 日内跌幅达到或超过 -4%。请按 `.agents/skills/dalton-stock-move/SKILL.md` 第一步先用 `web_search` 与 `x_search` 搜最新新闻和 X（当天与前一天）拿到“今天发生了什么”，再去查基本面、卖方预期与同行联动原因，"
                 "并追加 `knowledge_append_verdict`。"
             ),
-            "metadata": {
-                "dalton_managed": True,
-                "dalton_kind": "price_move",
-                "ticker": t_upper,
-                "direction": "down",
-            },
+            "metadata": _with_unit(
+                {
+                    "dalton_managed": True,
+                    "dalton_kind": "price_move",
+                    "ticker": t_upper,
+                    "direction": "down",
+                }
+            ),
         },
     ]
 
@@ -580,6 +627,7 @@ async def schedule_dalton_automation_helper(
         merged_spec.pop(_protected_key, None)
     resolved_action = str(action or merged_spec.get("action") or "upsert").strip().lower()
     resolved_name = str(name or merged_spec.get("name") or "").strip()
+    target_auto_id = str(merged_spec.get("automation_id") or "").strip()
     raw_ws = workspace_id if workspace_id is not None else merged_spec.get("workspace_id")
     ws_id_str = str(raw_ws or "").strip()
     home_job_names = {str(s["name"]) for s in build_global_director_specs()}
@@ -615,12 +663,31 @@ async def schedule_dalton_automation_helper(
 
     is_home_target = False
     ws_row: dict[str, Any] | None = None
+    unit_probe: dict[str, Any] | None = None
+    from src.dalton.autonomy.system_jobs import is_pm_user
+    from src.dalton.database.coverage_units import get_active_unit_by_workspace
+    from src.dalton.settings import (
+        is_coverage_units_enabled,
+        is_dalton_supabase_auth_enabled,
+    )
+    from src.dalton.sharing import ColleagueAccessRevokedError
+
+    units_on = is_coverage_units_enabled()
+    supabase_auth_on = is_dalton_supabase_auth_enabled()
+    caller_is_pm = bool(units_on and supabase_auth_on and is_pm_user(user_id))
+
     if resolved_action == "list":
         if ws_id_str and ws_id_str.lower() != "home":
-            ws_row = await verify_workspace_access(ws_id_str, user_id)
+            try:
+                ws_row = await verify_workspace_access(
+                    ws_id_str, user_id, need="read", channel="web"
+                )
+            except ColleagueAccessRevokedError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
             ws_id: str | None = ws_id_str
         elif ws_id_str.lower() == "home":
             ws_id = await resolve_caller_home_workspace_id(user_id)
+            is_home_target = True
         else:
             ws_id = None
     else:
@@ -628,19 +695,71 @@ async def schedule_dalton_automation_helper(
             ws_id = await resolve_caller_home_workspace_id(user_id)
             is_home_target = True
         else:
-            ws_row = await verify_workspace_access(ws_id_str, user_id)
+            try:
+                ws_row = await verify_workspace_access(
+                    ws_id_str,
+                    user_id,
+                    need="read" if caller_is_pm else "write",
+                    channel="web",
+                )
+            except ColleagueAccessRevokedError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
             ws_id = ws_id_str
             is_home_target = bool(
                 isinstance(ws_row, dict)
                 and (is_home_row(ws_row) or ws_row.get("is_home"))
             )
+            if caller_is_pm and not is_home_target:
+                ws_owner = str((ws_row or {}).get("user_id") or "").strip()
+                if ws_owner and ws_owner != user_id:
+                    from src.dalton.access_tiers import classify_owner_tier
+
+                    owner_tier = await classify_owner_tier(ws_owner)
+                    if owner_tier == "unknown":
+                        raise HTTPException(status_code=404, detail="Workspace not found")
+                    if owner_tier == "external":
+                        raise HTTPException(
+                            status_code=403,
+                            detail="External member workspace cannot be modified.",
+                        )
+                unit_probe = await get_active_unit_by_workspace(ws_id, conn=conn)
+                if unit_probe is None:
+                    try:
+                        ws_row = await verify_workspace_access(
+                            ws_id_str, user_id, need="write", channel="web"
+                        )
+                    except ColleagueAccessRevokedError as exc:
+                        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     tz = str(merged_spec.get("timezone") or merged_spec.get("timezone_name") or get_dalton_settings().autonomy.timezone)
     resolved_ticker = ticker or (merged_spec.get("metadata") or {}).get("ticker") or merged_spec.get("ticker")
 
     if resolved_action == "list":
+        list_owner = user_id
+        if caller_is_pm and ws_id and not is_home_target:
+            ws_owner = str((ws_row or {}).get("user_id") or "").strip()
+            if ws_owner and ws_owner != user_id:
+                from src.dalton.access_tiers import classify_owner_tier
+
+                owner_tier = await classify_owner_tier(ws_owner)
+                if owner_tier == "unknown":
+                    raise HTTPException(status_code=404, detail="Workspace not found")
+                if owner_tier == "external":
+                    raise HTTPException(
+                        status_code=403,
+                        detail="External member workspace cannot be accessed.",
+                    )
+            list_unit = await get_active_unit_by_workspace(ws_id, conn=conn)
+            if list_unit is not None:
+                list_lead = str(
+                    list_unit.get("lead_analyst_user_id")
+                    or list_unit.get("owner_user_id")
+                    or ""
+                ).strip()
+                if list_lead:
+                    list_owner = list_lead
         rows = await list_all_user_automations(
-            user_id,
+            list_owner,
             name_prefix="dalton-",
             conn=conn,
         )
@@ -707,12 +826,16 @@ async def schedule_dalton_automation_helper(
             }
         resolved_ticker = ws_ticker
 
-    valid, err_msg = validate_automation_name(
-        resolved_name,
-        ticker=str(resolved_ticker) if (resolved_ticker and role != "chief_of_staff") else None,
+    skip_upfront_name_check = bool(
+        target_auto_id and resolved_action in ("pause", "resume")
     )
-    if not valid:
-        return {"ok": False, "error": err_msg}
+    if not skip_upfront_name_check:
+        valid, err_msg = validate_automation_name(
+            resolved_name,
+            ticker=str(resolved_ticker) if (resolved_ticker and role != "chief_of_staff") else None,
+        )
+        if not valid:
+            return {"ok": False, "error": err_msg}
 
     name_prefix = (
         f"dalton-{str(resolved_ticker).lower()}-"
@@ -723,26 +846,216 @@ async def schedule_dalton_automation_helper(
     pending_report_finalize: tuple[Any, dict[str, Any], str | None] | None = None
     pending_result: dict[str, Any] | None = None
 
-    async with user_automations_lock(user_id, conn=conn) as active_conn:
+    from src.dalton.autonomy.classification import (
+        is_managed_unit_automation,
+        is_managed_unit_automation_for_unit,
+    )
+
+    eff_meta_check: dict[str, Any] = dict(merged_spec.get("metadata") or {})
+    if resolved_ticker and not eff_meta_check.get("ticker"):
+        eff_meta_check["ticker"] = str(resolved_ticker).strip().upper()
+
+    task_owner = user_id
+    if units_on and not is_home_target and ws_id:
+        if unit_probe is None:
+            unit_probe = await get_active_unit_by_workspace(ws_id, conn=conn)
+        if caller_is_pm and unit_probe is not None:
+            probe_lead = str(
+                unit_probe.get("lead_analyst_user_id")
+                or unit_probe.get("owner_user_id")
+                or ""
+            ).strip()
+            if probe_lead and probe_lead != user_id:
+                lead_pre_rows = await list_all_user_automations(
+                    probe_lead,
+                    name_prefix=name_prefix,
+                    conn=conn,
+                )
+                existing_lead_pre = next(
+                    (
+                        r
+                        for r in lead_pre_rows
+                        if r.get("name") == resolved_name
+                        and (
+                            (not ws_id or not r.get("workspace_id") or str(r.get("workspace_id")) == str(ws_id))
+                            if is_home_target or role == "chief_of_staff"
+                            else str(r.get("workspace_id") or "") == str(ws_id)
+                        )
+                    ),
+                    None,
+                )
+                lead_pre_meta = (
+                    dict(existing_lead_pre.get("metadata") or {})
+                    if isinstance(existing_lead_pre, dict)
+                    and isinstance(existing_lead_pre.get("metadata"), dict)
+                    else {}
+                )
+                combined_lead_meta = {**lead_pre_meta, **eff_meta_check}
+                for mk, mv in list(combined_lead_meta.items()):
+                    if mv is None:
+                        combined_lead_meta.pop(mk, None)
+                if (
+                    existing_lead_pre is not None
+                    and is_managed_unit_automation_for_unit(existing_lead_pre, unit=unit_probe)
+                ) or is_managed_unit_automation_for_unit(
+                    name=resolved_name,
+                    metadata=combined_lead_meta,
+                    unit=unit_probe,
+                ):
+                    task_owner = probe_lead
+                else:
+                    try:
+                        await verify_workspace_access(
+                            ws_id, user_id, need="write", channel="web"
+                        )
+                    except ColleagueAccessRevokedError as exc:
+                        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    should_check_unit_tx = bool(
+        not is_home_target
+        and ws_id
+        and units_on
+        and (
+            unit_probe is not None
+            or is_managed_unit_automation(name=resolved_name, metadata=eff_meta_check)
+        )
+    )
+
+    async with _user_automations_lock_for_write(
+        task_owner,
+        conn=conn,
+        prelock_ws=str(ws_id) if should_check_unit_tx else None,
+    ) as active_conn:
         conn_kw = {"conn": active_conn} if active_conn is not None else {}
+        unit: dict[str, Any] | None = None
+        if should_check_unit_tx:
+            unit = await get_active_unit_by_workspace(
+                ws_id, conn=active_conn, for_share=True
+            )
+            if caller_is_pm and task_owner != user_id:
+                if unit is None:
+                    return {
+                        "ok": False,
+                        "error": "unit_unbound",
+                        "message": (
+                            f"工作区 {ws_id} 的覆盖单元已解绑或归档，请刷新后重试。"
+                        ),
+                    }
+                locked_lead = str(
+                    unit.get("lead_analyst_user_id")
+                    or unit.get("owner_user_id")
+                    or ""
+                ).strip()
+                if locked_lead and locked_lead != task_owner:
+                    return {
+                        "ok": False,
+                        "error": "not_unit_lead_analyst",
+                        "message": (
+                            f"工作区 {ws_id} 已绑定覆盖单元，当前主分析师已变更为 {locked_lead}，请重试。"
+                        ),
+                    }
         rows = await list_all_user_automations(
-            user_id,
-            name_prefix=name_prefix,
+            task_owner,
+            name_prefix=(
+                None if skip_upfront_name_check else name_prefix
+            ),
             conn=active_conn,
         )
-        existing = next(
-            (
-                r
-                for r in rows
-                if r.get("name") == resolved_name
-                and (
-                    (not ws_id or not r.get("workspace_id") or str(r.get("workspace_id")) == str(ws_id))
-                    if is_home_target or role == "chief_of_staff"
-                    else str(r.get("workspace_id") or "") == str(ws_id)
+        def _ws_key(value: Any) -> str:
+            raw = str(value or "").strip()
+            try:
+                return str(uuid.UUID(raw)) if raw else ""
+            except ValueError:
+                return raw.lower()
+
+        def _matches_requested_workspace(row: Mapping[str, Any]) -> bool:
+            row_ws = _ws_key(row.get("workspace_id"))
+            req_ws = _ws_key(ws_id)
+            if is_home_target or role == "chief_of_staff":
+                return (not req_ws) or (not row_ws) or (row_ws == req_ws)
+            return row_ws == req_ws
+
+        if skip_upfront_name_check:
+            existing = next(
+                (
+                    r
+                    for r in rows
+                    if str(r.get("automation_id") or "").strip() == target_auto_id
+                    and _matches_requested_workspace(r)
+                ),
+                None,
+            )
+            if existing is None:
+                return {"ok": False, "error": f"未找到任务 `{resolved_name}`"}
+        else:
+            existing = next(
+                (
+                    r
+                    for r in rows
+                    if r.get("name") == resolved_name and _matches_requested_workspace(r)
+                ),
+                None,
+            )
+
+        effective_unit = unit
+        if existing is not None and units_on:
+            actual_existing_ws = str(existing.get("workspace_id") or "").strip()
+            if not actual_existing_ws:
+                effective_unit = None
+            elif actual_existing_ws != str(ws_id or "").strip():
+                effective_unit = await get_active_unit_by_workspace(
+                    actual_existing_ws, conn=active_conn, for_share=True
                 )
-            ),
-            None,
-        )
+
+        if skip_upfront_name_check:
+            valid_after, err_after = validate_automation_name(
+                str((existing or {}).get("name") or resolved_name),
+                ticker=str(resolved_ticker) if (resolved_ticker and role != "chief_of_staff") else None,
+            )
+            if not valid_after and not (
+                existing is not None
+                and units_on
+                and effective_unit is not None
+                and is_managed_unit_automation_for_unit(existing, unit=effective_unit)
+            ):
+                return {"ok": False, "error": err_after}
+        if existing is not None or should_check_unit_tx:
+            existing_db_meta = (
+                dict(existing.get("metadata") or {})
+                if isinstance(existing, dict) and isinstance(existing.get("metadata"), dict)
+                else {}
+            )
+            combined_unit_meta = {**existing_db_meta, **eff_meta_check}
+            for mk, mv in list(combined_unit_meta.items()):
+                if mv is None:
+                    combined_unit_meta.pop(mk, None)
+            if effective_unit is not None:
+                is_unit_managed = (
+                    (existing is not None and is_managed_unit_automation_for_unit(existing, unit=effective_unit))
+                    or is_managed_unit_automation_for_unit(
+                        name=resolved_name,
+                        metadata=combined_unit_meta,
+                        unit=effective_unit,
+                    )
+                )
+                if is_unit_managed:
+                    lead_uid = str(
+                        effective_unit.get("lead_analyst_user_id")
+                        or effective_unit.get("owner_user_id")
+                        or ""
+                    ).strip()
+                    if lead_uid and lead_uid != str(task_owner or "").strip():
+                        unit_ws_label = str(
+                            (existing.get("workspace_id") if existing is not None else None) or ws_id or ""
+                        ).strip()
+                        return {
+                            "ok": False,
+                            "error": "not_unit_lead_analyst",
+                            "message": (
+                                f"工作区 {unit_ws_label} 已绑定覆盖单元，受管自动任务 {resolved_name} "
+                                f"仅可由当前主分析师（{lead_uid}）持有或修改。"
+                            ),
+                        }
         if existing is not None and not is_home_target:
             existing_ws = str(existing.get("workspace_id") or "").strip()
             if not existing_ws or str(existing.get("name") or "") in home_job_names:
@@ -785,18 +1098,95 @@ async def schedule_dalton_automation_helper(
         if resolved_action in ("pause", "resume"):
             if not existing:
                 return {"ok": False, "error": f"未找到任务 `{resolved_name}`"}
-            new_status = "paused" if resolved_action == "pause" else "active"
-            with automation_history_context(
-                actor_user_id=effective_actor_id,
-                action=resolved_action,
-                skip_if_unchanged=True,
-            ):
-                updated = await auto_db.update_automation(
-                    str(existing["automation_id"]),
-                    user_id,
-                    status=new_status,
-                    **conn_kw,
+            from src.server.services.automations.lifecycle import (
+                AutomationRefusal,
+                apply_locked_pause_schedule,
+                apply_locked_resume_schedule,
+                pause_update_fields,
+                resume_update_fields,
+            )
+
+            candidate_row = dict(existing)
+            if not candidate_row.get("trigger_type"):
+                candidate_row["trigger_type"] = (
+                    "cron" if candidate_row.get("cron_expression") else "price"
                 )
+            try:
+                if resolved_action == "pause":
+                    new_status = "paused"
+                    update_fields = pause_update_fields(candidate_row)
+                else:
+                    new_status = "active"
+                    update_fields = resume_update_fields(candidate_row)
+                    existing_meta = existing.get("metadata")
+                    if isinstance(existing_meta, Mapping) and (
+                        "handoff_paused_reason" in existing_meta
+                        or "paused_by_user" in existing_meta
+                    ):
+                        cleaned_meta = dict(existing_meta)
+                        cleaned_meta.pop("handoff_paused_reason", None)
+                        cleaned_meta.pop("paused_by_user", None)
+                        update_fields["metadata"] = cleaned_meta
+            except AutomationRefusal as exc:
+                return {
+                    "ok": False,
+                    "error": str(exc),
+                    "message": str(exc),
+                }
+
+            async def _reconcile_locked_schedule_action(
+                locked_row: Any,
+                effective_kwargs: dict[str, Any],
+                _locked_conn: Any,
+            ) -> None:
+                locked_view = dict(locked_row) if isinstance(locked_row, Mapping) else {}
+                # The row may have moved to another workspace between the
+                # unlocked read that matched it and this lock; a move takes it
+                # out of the workspace (and coverage unit) the caller was
+                # checked against, so the write must not land.
+                if _ws_key(locked_view.get("workspace_id")) != _ws_key(
+                    existing.get("workspace_id")
+                ):
+                    raise AutomationRefusal(
+                        f"任务 `{resolved_name}` 已移到其他工作区，请刷新后重试。"
+                    )
+                if not locked_view.get("trigger_type"):
+                    locked_view["trigger_type"] = (
+                        "cron" if locked_view.get("cron_expression") else "price"
+                    )
+                if resolved_action == "pause":
+                    apply_locked_pause_schedule(locked_view, effective_kwargs)
+                else:
+                    apply_locked_resume_schedule(locked_view, effective_kwargs)
+                    locked_meta = locked_view.get("metadata")
+                    if isinstance(locked_meta, Mapping) and (
+                        "handoff_paused_reason" in locked_meta
+                        or "paused_by_user" in locked_meta
+                    ):
+                        cleaned_locked_meta = dict(locked_meta)
+                        cleaned_locked_meta.pop("handoff_paused_reason", None)
+                        cleaned_locked_meta.pop("paused_by_user", None)
+                        effective_kwargs["metadata"] = cleaned_locked_meta
+
+            try:
+                with automation_history_context(
+                    actor_user_id=effective_actor_id,
+                    action=resolved_action,
+                    skip_if_unchanged=True,
+                    locked_row_reconciler=_reconcile_locked_schedule_action,
+                ):
+                    updated = await auto_db.update_automation(
+                        str(existing["automation_id"]),
+                        task_owner,
+                        **update_fields,
+                        **conn_kw,
+                    )
+            except AutomationRefusal as exc:
+                return {
+                    "ok": False,
+                    "error": str(exc),
+                    "message": str(exc),
+                }
             return {
                 "ok": True,
                 "action": resolved_action,
@@ -843,15 +1233,36 @@ async def schedule_dalton_automation_helper(
         if resolved_ticker and not meta.get("ticker"):
             meta["ticker"] = str(resolved_ticker).upper()
 
+        from src.server.services.automations.lifecycle import (
+            _assert_replaced_by_tracker_preserved,
+            _replaced_by_tracker_refusal,
+        )
+
         if existing:
+            if (replaced_refusal := _replaced_by_tracker_refusal(existing)) is not None:
+                return {
+                    "ok": False,
+                    "error": str(replaced_refusal),
+                    "message": str(replaced_refusal),
+                }
             existing_meta = (
                 dict(existing.get("metadata") or {})
                 if isinstance(existing.get("metadata"), dict)
                 else {}
             )
             merged_meta = {**existing_meta, **meta}
+            try:
+                _assert_replaced_by_tracker_preserved(existing_meta, merged_meta)
+            except HTTPException as exc:
+                if via_rest:
+                    raise
+                return {
+                    "ok": False,
+                    "error": "forbidden_replaced_by_tracker",
+                    "message": str(exc.detail),
+                }
             for mk, mv in list(merged_meta.items()):
-                if mv is None:
+                if mv is None and mk != "replaced_by_tracker":
                     merged_meta.pop(mk, None)
 
             old_rp = existing_meta.get("report_profile")
@@ -924,7 +1335,7 @@ async def schedule_dalton_automation_helper(
                 else existing.get("metadata")
             )
             patch["scope"] = await resolve_automation_scope_for_write(
-                user_id,
+                task_owner,
                 name=saved_name,
                 workspace_id=str(saved_workspace_id) if saved_workspace_id else None,
                 metadata=saved_metadata if isinstance(saved_metadata, dict) else None,
@@ -948,7 +1359,7 @@ async def schedule_dalton_automation_helper(
             ):
                 updated = await auto_db.update_automation(
                     str(existing["automation_id"]),
-                    user_id,
+                    task_owner,
                     **conn_kw,
                     **patch,
                 )
@@ -959,7 +1370,7 @@ async def schedule_dalton_automation_helper(
                     active_conn,
                     change=report_profile_change,
                     saved_row=updated_row,
-                    default_owner_user_id=user_id,
+                    default_owner_user_id=task_owner,
                 )
             result: dict[str, Any] = {
                 "ok": True,
@@ -984,6 +1395,26 @@ async def schedule_dalton_automation_helper(
                 return result
 
         if pending_result is None:
+            try:
+                _assert_replaced_by_tracker_preserved({}, meta)
+            except HTTPException as exc:
+                if via_rest:
+                    raise
+                return {
+                    "ok": False,
+                    "error": "forbidden_replaced_by_tracker",
+                    "message": str(exc.detail),
+                }
+            if (
+                units_on
+                and unit is not None
+                and str(unit.get("kind") or "").strip().lower() == "company"
+                and not meta.get("unit_id")
+                and is_managed_unit_automation_for_unit(
+                    name=resolved_name, metadata=meta, unit=unit
+                )
+            ):
+                meta["unit_id"] = str(unit["unit_id"])
             clean_meta = {k: v for k, v in meta.items() if v is not None}
             create_report_change = None
             if "report_profile" in clean_meta:
@@ -996,7 +1427,7 @@ async def schedule_dalton_automation_helper(
                     create_report_change = await validate_report_profile_change(
                         effective_actor_id,
                         {
-                            "user_id": user_id,
+                            "user_id": task_owner,
                             "name": resolved_name,
                             "instruction": instruction or "",
                             "metadata": {},
@@ -1018,7 +1449,7 @@ async def schedule_dalton_automation_helper(
                 else clean_meta
             )
             resolved_scope = await resolve_automation_scope_for_write(
-                user_id,
+                task_owner,
                 name=resolved_name,
                 workspace_id=ws_id,
                 metadata=create_meta,
@@ -1038,7 +1469,7 @@ async def schedule_dalton_automation_helper(
                 report_delivery_audit=create_audit_payload,
             ):
                 created = await auto_db.create_automation(
-                    user_id=user_id,
+                    user_id=task_owner,
                     name=resolved_name,
                     description=description,
                     trigger_type=trigger_type,
@@ -1064,7 +1495,7 @@ async def schedule_dalton_automation_helper(
                     active_conn,
                     change=create_report_change,
                     saved_row=created,
-                    default_owner_user_id=user_id,
+                    default_owner_user_id=task_owner,
                 )
             created_result: dict[str, Any] = {
                 "ok": True,

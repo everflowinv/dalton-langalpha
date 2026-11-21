@@ -381,3 +381,134 @@ class TestLockOrder:
         assert _locks(db) == ["user", "row"]
         assert all(made > i for i, sql in enumerate(db.sql) if _USER_WRITES in sql or _ROW_LOCK in sql)
         assert db.rows[BRIEF]["workspace_id"] == UUID(HOME)
+
+    @pytest.mark.asyncio
+    async def test_ordinary_task_save_skips_unit_queries(
+        self, db, backend, monkeypatch
+    ):
+        """Round 6 Item 5: ordinary file save reads DB row once in prelock_units but skips unit queries."""
+        from unittest.mock import create_autospec
+        from src.dalton import settings as dalton_settings
+        from src.dalton.database import coverage_units as cu_db
+        from src.server.services.automations.file import AutomationFile
+
+        monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+        unit_lookup = create_autospec(cu_db.get_active_unit_by_workspace, return_value=None)
+        monkeypatch.setattr(cu_db, "get_active_unit_by_workspace", unit_lookup)
+
+        orig_prelock = AutomationFile.prelock_units
+        orig_fetch = AutomationFile.fetch
+        prelock_calls: list[str] = []
+        fetch_in_prelock: list[str] = []
+        in_prelock = False
+
+        async def _spy_prelock(self_file, uid, conn, *, parsed=None):
+            nonlocal in_prelock
+            prelock_calls.append(self_file.file_name)
+            in_prelock = True
+            try:
+                return await orig_prelock(self_file, uid, conn, parsed=parsed)
+            finally:
+                in_prelock = False
+
+        async def _spy_fetch(self_file, uid, conn=None):
+            if in_prelock:
+                fetch_in_prelock.append(self_file.file_name)
+            return await orig_fetch(self_file, uid, conn=conn)
+
+        monkeypatch.setattr(AutomationFile, "prelock_units", _spy_prelock)
+        fetch_spy = create_autospec(AutomationFile.fetch, side_effect=_spy_fetch)
+        monkeypatch.setattr(AutomationFile, "fetch", fetch_spy)
+
+        db.add(_row())
+        report = await _write(
+            backend,
+            {**_shown(_row()), "instruction": "Summarize ordinary brief.", "workspace_id": WORKSPACE},
+        )
+        assert "Saved morning-brief.json" in report
+        assert prelock_calls == ["morning-brief.json"]
+        unit_lookup.assert_not_awaited()
+        assert fetch_in_prelock == ["morning-brief.json"]
+
+    @pytest.mark.asyncio
+    async def test_renamed_managed_file_plain_edit_still_prelocks_unit(
+        self, db, backend, monkeypatch
+    ):
+        """Round 6 Item 5: DB row carrying unit-managed markers triggers unit prelock even on non-dalton filename & plain edit."""
+        from unittest.mock import create_autospec
+        from src.dalton import settings as dalton_settings
+        from src.dalton.database import coverage_units as cu_db
+
+        monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+        unit_lookup = create_autospec(
+            cu_db.get_active_unit_by_workspace,
+            return_value={
+                "unit_id": "unit-nvda",
+                "workspace_id": HOME,
+                "owner_user_id": USER,
+                "lead_analyst_user_id": USER,
+                "status": "active",
+                "kind": "company",
+                "ticker": "NVDA",
+            },
+        )
+        monkeypatch.setattr(cu_db, "get_active_unit_by_workspace", unit_lookup)
+
+        from ptc_agent.agent.backends.langgraph_store import ReadOnlyStoreError
+
+        renamed_row = _row(
+            file_name="research.json",
+            name="NVDA custom watch",
+            metadata={"dalton_kind": "company_watch", "ticker": "NVDA", "unit_id": "unit-nvda", "dalton_managed": True},
+        )
+        db.add(renamed_row)
+        research_path = PATH.replace("morning-brief.json", "research.json")
+        with pytest.raises(ReadOnlyStoreError):
+            await _write(
+                backend,
+                {**_shown(renamed_row), "description": "Updated note"},
+                path=research_path,
+            )
+        unit_lookup.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_dalton_personal_watch_without_workspace_id_on_unit_bound_workspace(
+        self, db, backend, monkeypatch
+    ):
+        """Round 7 Item 6: creating dalton-personal-watch without workspace_id in a bound workspace
+        includes CALL.workspace_id in prelock_units and succeeds without spurious version_conflict."""
+        from unittest.mock import create_autospec
+        from src.dalton import settings as dalton_settings
+        from src.dalton.database import coverage_units as cu_db
+
+        monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+        unit_lookup = create_autospec(
+            cu_db.get_active_unit_by_workspace,
+            return_value={
+                "unit_id": "unit-nvda",
+                "workspace_id": WORKSPACE,
+                "owner_user_id": USER,
+                "lead_analyst_user_id": USER,
+                "status": "active",
+                "kind": "company",
+                "ticker": "NVDA",
+            },
+        )
+        monkeypatch.setattr(cu_db, "get_active_unit_by_workspace", unit_lookup)
+        monkeypatch.setattr(
+            "src.dalton.database.company_automations.resolve_automation_scope_for_write",
+            AsyncMock(return_value="personal"),
+        )
+
+        personal_path = PATH.replace("morning-brief.json", "dalton-personal-watch.json")
+        report = await _write(
+            backend,
+            {
+                "name": "dalton-personal-watch",
+                "cron_expression": "0 9 * * 1-5",
+                "instruction": "Track personal notes.",
+            },
+            path=personal_path,
+        )
+        assert "Created dalton-personal-watch.json" in report or "dalton-personal-watch.json" in report
+        assert any(call.args[0] == WORKSPACE and call.kwargs.get("for_share") is True for call in unit_lookup.await_args_list)

@@ -475,7 +475,8 @@ async def test_d035_upgrade_from_d031_preserves_state_and_enforces_safe_downgrad
         await db_conn.execute(
             """
             INSERT INTO dalton_coverage_units (
-                unit_id, kind, owner_user_id, slug, display_name, workspace_id, ticker, status
+                unit_id, kind, owner_user_id, slug,
+                display_name, workspace_id, ticker, status
             )
             VALUES (%s::uuid, 'company', %s, 'msft', 'Microsoft', %s::uuid, 'MSFT', 'archived')
             """,
@@ -1069,11 +1070,12 @@ async def test_creation_paths_match_sql_classification_and_keep_director_persona
         await db_conn.execute(
             """
             INSERT INTO dalton_coverage_units (
-                unit_id, kind, owner_user_id, slug, display_name, workspace_id, ticker, status
+                unit_id, kind, owner_user_id, created_by_user_id, lead_analyst_user_id, slug,
+                display_name, workspace_id, ticker, ticker_key, status
             )
-            VALUES (%s::uuid, 'company', %s, 'tsla', 'Tesla', %s::uuid, 'TSLA', 'active')
+            VALUES (%s::uuid, 'company', %s, %s, %s, 'tsla', 'Tesla', %s::uuid, 'TSLA', 'TSLA', 'active')
             """,
-            (str(uuid.uuid4()), uid, ws_cov),
+            (str(uuid.uuid4()), uid, uid, uid, ws_cov),
         )
 
     monkeypatch.setattr(
@@ -2264,13 +2266,21 @@ async def test_sql_python_create_update_scope_parity_and_null_ws_pm_upsert_real_
         await db_conn.execute(
             """
             INSERT INTO dalton_coverage_units (
-                unit_id, kind, owner_user_id, slug, display_name, workspace_id, ticker, status
+                unit_id, kind, owner_user_id, slug,
+                display_name, workspace_id, ticker, status
             )
             VALUES
                 (%s::uuid, 'sector', %s, 'semi', 'Semiconductors', %s::uuid, NULL, 'active'),
                 (%s::uuid, 'company', %s, 'msft', 'Microsoft', %s::uuid, 'MSFT', 'archived')
             """,
-            (str(uuid.uuid4()), uid, ws_unit_sector, str(uuid.uuid4()), uid, ws_archived_unit),
+            (
+                str(uuid.uuid4()),
+                uid,
+                ws_unit_sector,
+                str(uuid.uuid4()),
+                uid,
+                ws_archived_unit,
+            ),
         )
 
         for label, name, ws_id, meta, _exp_scope in shared_matrix:
@@ -3471,11 +3481,12 @@ async def test_au1_batch_a_dalton_schedule_system_jobs_tracking_and_runtime_isol
         await conn.execute(
             """
             INSERT INTO dalton_coverage_units (
-                unit_id, kind, owner_user_id, slug, display_name, workspace_id, ticker, status
+                unit_id, kind, owner_user_id, created_by_user_id, lead_analyst_user_id, slug,
+                display_name, workspace_id, ticker, ticker_key, status
             )
-            VALUES (%s::uuid, 'sector', %s, 'semi', 'Semiconductors', %s::uuid, NULL, 'active')
+            VALUES (%s::uuid, 'sector', %s, %s, %s, 'semi', 'Semiconductors', %s::uuid, NULL, NULL, 'active')
             """,
-            (sector_unit_id, uid, ws_sector_new),
+            (sector_unit_id, uid, uid, uid, ws_sector_new),
         )
 
     # 1. schedule_dalton_automation_helper: create -> idempotent repeat -> update -> pause -> resume
@@ -3680,7 +3691,11 @@ async def test_au1_batch_a_dalton_schedule_system_jobs_tracking_and_runtime_isol
             ]
 
     # 3. enable_tracking / disable_tracking / resync_delta_schedule / _pause_stale_sector_rows
-    monkeypatch.setattr(tracking_mod, "_resolve_workspace_ticker", lambda _w, _r=None: _coro("NVDA"))
+    monkeypatch.setattr(
+        tracking_mod,
+        "_resolve_workspace_ticker",
+        create_autospec(tracking_mod._resolve_workspace_ticker, return_value="NVDA"),
+    )
     await tracking_mod.enable_tracking(uid, ws_nvda, tier="core", force=True)
     # Repeat enable_tracking with same tier -> no version bump!
     await tracking_mod.enable_tracking(uid, ws_nvda, tier="core", force=True)

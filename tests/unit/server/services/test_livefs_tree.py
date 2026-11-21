@@ -1143,3 +1143,177 @@ def test_a_failure_line_names_the_error_without_quoting_the_row(caplog):
         "livefs request failed: path=/mnt/livefs/user/automations error_type=CheckViolation sqlstate=23514"
     )
     assert record.exc_info is None
+
+
+@pytest.mark.asyncio
+async def test_item12_and_17_managed_unit_automation_file_blocked_for_owner_and_preserves_errors(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Items 12 & 17: LivefsTree write/delete/rename on a managed unit task on a bound unit workspace
+    are refused with 403 read_only EVEN FOR THE WORKSPACE OWNER, while preserving 404 not_found,
+    412 changed, and normal non-managed automation file operations."""
+    from unittest.mock import create_autospec
+    from src.dalton import settings as dalton_settings
+    from src.dalton.database import coverage_units as cu_db
+    from src.server.database import automation as auto_db
+
+    unit_ws = "11111111-1111-1111-1111-111111111111"
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+    unit_row = {
+        "unit_id": "u-unit-nvda",
+        "workspace_id": unit_ws,
+        "owner_user_id": USER,
+        "lead_analyst_user_id": USER,
+        "status": "active",
+        "kind": "company",
+        "ticker": "NVDA",
+    }
+    monkeypatch.setattr(
+        cu_db,
+        "get_active_unit_by_workspace",
+        create_autospec(cu_db.get_active_unit_by_workspace, return_value=unit_row),
+    )
+
+    rows_by_file: dict[str, dict] = {
+        "nvda-watch.json": {
+            "automation_id": "11111111-1111-1111-1111-111111111111",
+            "user_id": USER,
+            "name": "dalton-nvda-watch",
+            "file_name": "nvda-watch.json",
+            "description": "watch",
+            "trigger_type": "cron",
+            "cron_expression": "*/30 6-20 * * 1-5",
+            "timezone": "America/New_York",
+            "instruction": "watch nvda",
+            "workspace_id": unit_ws,
+            "thread_strategy": "new",
+            "conversation_thread_id": None,
+            "llm_model": None,
+            "delivery_config": None,
+            "max_failures": 3,
+            "status": "active",
+            "metadata": {"dalton_kind": "company_watch", "ticker": "NVDA"},
+            "next_run_at": None,
+            "failure_count": 0,
+            "disable_reason": None,
+        },
+        "morning-brief.json": {
+            "automation_id": "22222222-2222-2222-2222-222222222222",
+            "user_id": USER,
+            "name": "Morning brief",
+            "file_name": "morning-brief.json",
+            "description": None,
+            "trigger_type": "cron",
+            "cron_expression": "0 9 * * 1-5",
+            "timezone": "UTC",
+            "instruction": "summarize",
+            "workspace_id": unit_ws,
+            "thread_strategy": "new",
+            "conversation_thread_id": None,
+            "llm_model": None,
+            "delivery_config": None,
+            "max_failures": 3,
+            "status": "active",
+            "metadata": {},
+            "next_run_at": None,
+            "failure_count": 0,
+            "disable_reason": None,
+        },
+    }
+
+    async def _get_file(_uid, fname, **_kw):
+        return rows_by_file.get(fname)
+
+    @asynccontextmanager
+    async def _fake_tx_conn(_c=None):
+        class _FakeConn:
+            @asynccontextmanager
+            async def transaction(self):
+                yield self
+
+            @asynccontextmanager
+            async def cursor(self):
+                class _Cur:
+                    async def execute(self, *_a, **_kw):
+                        return None
+
+                    async def fetchone(self):
+                        return None
+
+                yield _Cur()
+
+        yield _FakeConn()
+
+    monkeypatch.setattr(auto_db, "get_automation_file", _get_file)
+    monkeypatch.setattr(auto_db, "lock_user_automations", AsyncMock())
+    monkeypatch.setattr(auto_db, "delete_automation", AsyncMock(return_value=True))
+    monkeypatch.setattr(auto_db, "rename_automation_file", AsyncMock(return_value=True))
+    monkeypatch.setattr(db_json_route, "get_db_connection", _fake_tx_conn)
+    monkeypatch.setattr(
+        "src.dalton.database.company_automations.lock_and_fetch_user_preferences_for_snapshot",
+        AsyncMock(return_value={}),
+    )
+
+    real_tree = LivefsTree(LivefsIdentity(COMPUTER, USER, ROOT), InMemoryStore(), CallContext(workspace_id=unit_ws))
+
+    # 1. Workspace owner CANNOT overwrite managed unit file -> 403 read_only mentioning dalton_schedule_automation
+    _content, ver, _path = await real_tree.read("user/automations/nvda-watch.json")
+    updated_payload = json.dumps(
+        {
+            "name": "dalton-nvda-watch",
+            "trigger_type": "cron",
+            "cron_expression": "0 8 * * 1-5",
+            "timezone": "America/New_York",
+            "instruction": "tamper",
+            "workspace_id": unit_ws,
+        }
+    ).encode()
+    refused_write = await _refusal(
+        lambda: real_tree.write(
+            "user/automations/nvda-watch.json",
+            updated_payload,
+            if_match=f'"{ver}"',
+            if_none_match=None,
+        )
+    )
+    assert (refused_write.status, refused_write.code) == (403, "read_only")
+    assert "dalton_schedule_automation" in refused_write.message
+
+    # 2. Workspace owner CANNOT delete managed unit file -> 403 read_only (NOT 503)
+    refused_delete = await _refusal(lambda: real_tree.delete("user/automations/nvda-watch.json"))
+    assert (refused_delete.status, refused_delete.code) == (403, "read_only")
+    auto_db.delete_automation.assert_not_awaited()
+
+    # 3. Workspace owner CANNOT rename managed unit file -> 403 read_only
+    refused_rename = await _refusal(
+        lambda: real_tree.rename("user/automations/nvda-watch.json", "user/automations/nvda-watch-v2.json")
+    )
+    assert (refused_rename.status, refused_rename.code) == (403, "read_only")
+    auto_db.rename_automation_file.assert_not_awaited()
+
+    # 4. Stale ETag on write still returns 412 changed; missing file delete/rename still returns 404 not_found
+    refused_stale = await _refusal(
+        lambda: real_tree.write(
+            "user/automations/nvda-watch.json",
+            updated_payload,
+            if_match='"wrong-etag"',
+            if_none_match=None,
+        )
+    )
+    assert (refused_stale.status, refused_stale.code) == (412, "changed")
+
+    refused_missing_del = await _refusal(lambda: real_tree.delete("user/automations/no-such.json"))
+    assert (refused_missing_del.status, refused_missing_del.code) == (404, "not_found")
+    refused_missing_ren = await _refusal(
+        lambda: real_tree.rename("user/automations/no-such.json", "user/automations/other.json")
+    )
+    assert (refused_missing_ren.status, refused_missing_ren.code) == (404, "not_found")
+
+    # 5. Non-managed personal automation on SAME bound workspace still renames/deletes cleanly!
+    _, _, ren_msg = await real_tree.rename(
+        "user/automations/morning-brief.json", "user/automations/morning-brief-2.json"
+    )
+    assert ren_msg is None or "Renamed" in str(ren_msg)
+    del_path, del_report = await real_tree.delete("user/automations/morning-brief.json")
+    assert del_path.endswith("morning-brief.json")
+    assert "Deleted" in (del_report or "")

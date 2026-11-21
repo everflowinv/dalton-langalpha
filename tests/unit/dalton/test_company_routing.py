@@ -587,6 +587,8 @@ async def test_find_company_workspaces_excludes_sector_and_projects_ticker(
             assert "user_id = %s" in sql
             assert params == (U1,)
             return [_ws(WS_CURRENT, "农业"), _ws(WS_OTHER, "农业-牧原")]
+        if "FROM dalton_coverage_units" in sql:
+            return []
         if "FROM automations" in sql:
             return []
         if "dalton_knowledge_versions" in sql:
@@ -704,3 +706,310 @@ def test_company_workflow_list_matches_the_contracts() -> None:
         if "ticker" in doc.get("params_required", []):
             ticker_workflows.add(doc["name"])
     assert ticker_workflows == set(COMPANY_WORKFLOWS)
+
+
+@pytest.mark.asyncio
+async def test_find_company_workspaces_skips_historical_duplicates_and_respects_colleague_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Historical duplicate workspaces are excluded; colleague workspaces only match when web-readable."""
+    import src.dalton.autonomy.units_view as units_view_mod
+
+    monkeypatch.setattr(cr_mod, "is_coverage_units_enabled", lambda: True)
+    colleague_delegatable_ws = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c001"
+    colleague_ro_ws = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c003"
+    colleague_hidden_ws = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c002"
+    dup_ws = "d0d0d0d0-d0d0-4d0d-8d0d-d0d0d0d0d001"
+
+    docs_by_ws = {
+        WS_CURRENT: {"workspace_id": WS_CURRENT, "doc_key": "company", "content": {"ticker": "NVDA"}},
+        dup_ws: {"workspace_id": dup_ws, "doc_key": "company", "content": {"ticker": "NVDA"}},
+        colleague_delegatable_ws: {"workspace_id": colleague_delegatable_ws, "doc_key": "company", "content": {"ticker": "NVDA"}},
+        colleague_ro_ws: {"workspace_id": colleague_ro_ws, "doc_key": "company", "content": {"ticker": "NVDA"}},
+        colleague_hidden_ws: {"workspace_id": colleague_hidden_ws, "doc_key": "company", "content": {"ticker": "NVDA"}},
+    }
+
+    async def _fake_colleague_access(uid: str) -> dict[str, tuple[bool, bool]]:
+        return {
+            colleague_delegatable_ws: (True, True),
+            colleague_ro_ws: (True, False),
+            colleague_hidden_ws: (False, False),
+        }
+
+    monkeypatch.setattr(
+        units_view_mod,
+        "load_colleague_workspace_access",
+        create_autospec(units_view_mod.load_colleague_workspace_access, side_effect=_fake_colleague_access),
+    )
+
+    def rows_for(sql: str, params: tuple[Any, ...], _executed: Any) -> list[dict[str, Any]]:
+        if "FROM workspaces" in sql and "user_id = %s" in sql:
+            return [
+                {**_ws(WS_CURRENT, "NVDA Canonical"), "config": {}},
+                {
+                    **_ws(dup_ws, "NVDA Old Dup"),
+                    "config": {"dalton_historical_duplicate_of": WS_CURRENT},
+                },
+            ]
+        if "FROM workspaces" in sql and "ANY(%s::uuid[])" in sql:
+            wanted = {str(w) for w in (params[0] if params else [])}
+            out = []
+            if colleague_delegatable_ws in wanted:
+                out.append({**_ws(colleague_delegatable_ws, "Colleague NVDA Delegatable"), "config": {}})
+            if colleague_ro_ws in wanted:
+                out.append({**_ws(colleague_ro_ws, "Colleague NVDA ReadOnly"), "config": {}})
+            return out
+        if "FROM dalton_coverage_units" in sql:
+            return []
+        if "FROM automations" in sql:
+            return []
+        if "dalton_knowledge_versions" in sql:
+            wanted = {str(w) for w in (params[0] if params else [])}
+            return [doc for ws_id, doc in docs_by_ws.items() if ws_id in wanted]
+        raise AssertionError(f"unexpected query: {sql}")
+
+    _scripted_conn(monkeypatch, rows_for)
+    matches = await find_company_workspaces(U1, "NVDA")
+    by_ws = {m["workspace_id"]: m for m in matches}
+    assert set(by_ws) == {WS_CURRENT, colleague_delegatable_ws, colleague_ro_ws}
+    assert by_ws[WS_CURRENT]["delegatable"] is True
+    assert by_ws[colleague_delegatable_ws]["delegatable"] is True
+    assert by_ws[colleague_ro_ws]["delegatable"] is False
+
+
+@pytest.mark.asyncio
+async def test_launch_routing_allows_readonly_colleague_with_hint_but_refuses_delegatable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 7 (Codex M5): read-only colleague workspace returns advisory hint without refusing;
+    delegatable colleague workspace refuses with CompanyRoutingRefused."""
+    colleague_ro = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c011"
+    colleague_del = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c012"
+
+    # Sector/other current workspace, only read-only colleague workspace matches NVDA
+    _current(monkeypatch, None, is_sector=True)
+    _finder(
+        monkeypatch,
+        [{"workspace_id": colleague_ro, "name": "Colleague RO NVDA", "delegatable": False}],
+    )
+    hint = await cr_mod.resolve_launch_company_routing(
+        "full-coverage",
+        {"ticker": "NVDA", "workspace_dir": "."},
+        {"user_id": U1, "workspace_id": WS_CURRENT},
+    )
+    assert hint is not None
+    assert "只读工作区" in hint
+    assert "Colleague RO NVDA" in hint
+
+    # Same setup with a delegatable colleague workspace raises CompanyRoutingRefused
+    _current(monkeypatch, None, is_sector=True)
+    _finder(
+        monkeypatch,
+        [{"workspace_id": colleague_del, "name": "Colleague Delegatable NVDA", "delegatable": True}],
+    )
+    with pytest.raises(cr_mod.CompanyRoutingRefused, match="Colleague Delegatable NVDA"):
+        await cr_mod.resolve_launch_company_routing(
+            "full-coverage",
+            {"ticker": "NVDA", "workspace_dir": "."},
+            {"user_id": U1, "workspace_id": WS_CURRENT},
+        )
+
+
+@pytest.mark.asyncio
+async def test_flag_off_keeps_legacy_ticker_key_and_historical_duplicates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 6 Item 6: with coverage_units disabled, _ticker_key does not fold BRK-B/BRK.B
+    and historical duplicate workspaces remain included like baseline 49a56df4b."""
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "false")
+    assert cr_mod._ticker_key("BRK-B") == "BRK-B"
+    assert cr_mod._ticker_key("BRK.B") == "BRK.B"
+    assert cr_mod._ticker_key("BRK-B") != cr_mod._ticker_key("BRK.B")
+
+    import src.dalton.autonomy.units_view as units_view_mod
+
+    dup_ws = "d0d0d0d0-d0d0-4d0d-8d0d-d0d0d0d0d001"
+    monkeypatch.setattr(
+        units_view_mod,
+        "load_colleague_workspace_access",
+        create_autospec(units_view_mod.load_colleague_workspace_access, return_value={}),
+    )
+
+    def rows_for(sql: str, params: Any, _executed: Any) -> list[dict[str, Any]]:
+        if "FROM workspaces" in sql:
+            return [
+                {
+                    **_ws(dup_ws, "NVDA Historical Dup"),
+                    "config": {"coverage_unit_historical_duplicate": True},
+                }
+            ]
+        if "FROM automations" in sql:
+            return []
+        if "dalton_knowledge_versions" in sql:
+            return [{"workspace_id": dup_ws, "doc_key": "company", "content": {"ticker": "NVDA"}}]
+        raise AssertionError(f"unexpected query: {sql}")
+
+    _scripted_conn(monkeypatch, rows_for)
+    matches = await find_company_workspaces(U1, "NVDA")
+    assert [m["workspace_id"] for m in matches] == [dup_ws]
+
+
+@pytest.mark.asyncio
+async def test_flag_off_extract_ticker_does_not_classify_brk_b_from_workspace_name_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 7 Item 7a: when coverage_units is disabled, _extract_ticker_from_text preserves
+    pre-PR behavior and does NOT classify 'BRK-B' from workspace name alone without docs."""
+    from src.dalton.coverage import identity as id_mod
+
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "false")
+    assert id_mod._extract_ticker_from_text("BRK-B") is None
+    assert id_mod._extract_ticker_from_text("AAPL") == "AAPL"
+
+    async def _no_db(*_a: Any, **_kw: Any) -> Any:
+        raise AssertionError("flag off must not touch dalton_coverage_units")
+
+    from src.dalton.database import coverage_units as cu_db
+
+    monkeypatch.setattr(cu_db, "get_active_unit_by_workspace", _no_db)
+    resolved = await id_mod.resolve_workspace_coverage_identity(
+        {"workspace_id": WS_CURRENT, "name": "BRK-B", "config": {}},
+        company_content=None,
+        thesis_content=None,
+        automations=[],
+    )
+    assert resolved.kind == "unclassified"
+    assert resolved.is_company is False
+    assert resolved.ticker is None
+
+
+@pytest.mark.asyncio
+async def test_historical_duplicate_cannot_launch_company_workflow_and_hints_only_readable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 8 Item 5: _resolve_workspace_company excludes dalton_historical_duplicate_of when
+    coverage_units is enabled; launch refuses on historical duplicate even with matching docs,
+    citing only caller-readable canonical workspaces (and hiding unreadable ones)."""
+    import src.dalton.autonomy.units_view as units_view_mod
+    from src.dalton.database import coverage_units as cu_db
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "true")
+    monkeypatch.setattr(cr_mod, "is_coverage_units_enabled", lambda: True)
+
+    dup_ws = "d0d0d0d0-d0d0-4d0d-8d0d-d0d0d0d0d099"
+    canon_ws = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c099"
+    hidden_ws = "88888888-8888-4888-8888-888888888899"
+
+    dup_row = {
+        **_ws(dup_ws, "NVDA"),
+        "config": {"dalton_historical_duplicate_of": canon_ws},
+    }
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(_REAL_GET_WORKSPACE, return_value=dup_row),
+    )
+
+    state = {"colleague_readable": True, "has_canon": True}
+
+    monkeypatch.setattr(
+        units_view_mod,
+        "load_colleague_workspace_access",
+        create_autospec(
+            units_view_mod.load_colleague_workspace_access,
+            side_effect=lambda _uid: {canon_ws: (state["colleague_readable"], True)} if state["has_canon"] else {},
+        ),
+    )
+
+    def rows_for(sql: str, params: Any, _executed: Any) -> list[dict[str, Any]]:
+        if "FROM dalton_coverage_units" in sql:
+            return []
+        if "FROM automations" in sql:
+            return []
+        if "dalton_knowledge_versions" in sql:
+            return [
+                {"workspace_id": dup_ws, "doc_key": "company", "content": {"ticker": "NVDA"}},
+                {"workspace_id": canon_ws, "doc_key": "company", "content": {"ticker": "NVDA"}},
+            ]
+        if "FROM workspaces" in sql:
+            if not state["has_canon"]:
+                return [dup_row]
+            if "user_id = %s" in sql:
+                return [dup_row]
+            # Extra colleague workspaces
+            return [{**_ws(canon_ws, "Colleague NVDA Canonical", user_id="colleague"), "config": {}}]
+        raise AssertionError(f"unexpected query: {sql}")
+
+    _scripted_conn(monkeypatch, rows_for)
+    monkeypatch.setattr(
+        cu_db,
+        "load_active_units_by_workspace",
+        create_autospec(cu_db.load_active_units_by_workspace, return_value={}),
+    )
+
+    # 1) _resolve_workspace_company excludes historical duplicate when flag ON
+    ident, is_sec = await cr_mod._resolve_workspace_company(dup_ws)
+    assert ident is not None and ident.is_company is False and is_sec is False
+
+    # 2) Readable colleague canonical workspace exists -> refuse citing it; check hint cites it too
+    with pytest.raises(cr_mod.CompanyRoutingRefused) as exc_readable:
+        await cr_mod.resolve_launch_company_routing(
+            "full-coverage",
+            {"ticker": "NVDA", "workspace_dir": "."},
+            {"user_id": U1, "workspace_id": dup_ws},
+        )
+    assert "Colleague NVDA Canonical" in str(exc_readable.value)
+
+    hint = await cr_mod.routing_hint_for_check(
+        {"ticker": "NVDA", "workspace_dir": "."},
+        U1,
+        dup_ws,
+        workflow="full-coverage",
+    )
+    assert hint is not None and "Colleague NVDA Canonical" in hint
+
+    # 3) Canonical workspace belongs to colleague and is Web-hidden -> STILL refuse to launch
+    #    from historical duplicate, and NEVER leak hidden workspace name/UUID!
+    state["colleague_readable"] = False
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(_REAL_GET_WORKSPACE, return_value={**_ws(dup_ws, "NVDA"), "config": {"dalton_historical_duplicate_of": hidden_ws}}),
+    )
+    with pytest.raises(cr_mod.CompanyRoutingRefused) as exc_hidden:
+        await cr_mod.resolve_launch_company_routing(
+            "full-coverage",
+            {"ticker": "NVDA", "workspace_dir": "."},
+            {"user_id": U1, "workspace_id": dup_ws},
+        )
+    assert "历史副本" in str(exc_hidden.value)
+    assert hidden_ws not in str(exc_hidden.value)
+    assert "Colleague NVDA Canonical" not in str(exc_hidden.value)
+
+    # 4) Even if candidate lookup (find_company_workspaces) raises on an already-identified
+    #    historical duplicate, launch STILL refuses and routing_hint_for_check STILL warns (no names leaked).
+    monkeypatch.setattr(
+        cr_mod,
+        "find_company_workspaces",
+        create_autospec(cr_mod.find_company_workspaces, side_effect=RuntimeError("registry error")),
+    )
+    with pytest.raises(cr_mod.CompanyRoutingRefused) as exc_lookup_err:
+        await cr_mod.resolve_launch_company_routing(
+            "full-coverage",
+            {"ticker": "NVDA", "workspace_dir": "."},
+            {"user_id": U1, "workspace_id": dup_ws},
+        )
+    assert "历史副本" in str(exc_lookup_err.value)
+    assert "Colleague NVDA Canonical" not in str(exc_lookup_err.value)
+    assert hidden_ws not in str(exc_lookup_err.value)
+
+    err_hint = await cr_mod.routing_hint_for_check(
+        {"ticker": "NVDA", "workspace_dir": "."},
+        U1,
+        dup_ws,
+        workflow="full-coverage",
+    )
+    assert err_hint is not None and "历史副本" in err_hint
+    assert "Colleague NVDA Canonical" not in err_hint
+    assert hidden_ws not in err_hint

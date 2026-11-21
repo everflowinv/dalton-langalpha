@@ -4399,7 +4399,7 @@ def test_dalton_migration_graph_has_a_single_head() -> None:
         revisions[mod.revision] = mod.down_revision
     parents = {down for down in revisions.values() if down}
     heads = sorted(rev for rev in revisions if rev not in parents)
-    assert heads == ["d040"], heads
+    assert heads == ["d041"], heads
 
 
 @pytest.mark.asyncio
@@ -5423,3 +5423,386 @@ async def test_release_in_settlement_transaction_retries_a_cancelled_statement_o
     assert released == 1
     assert calls["n"] == 2
     assert conn.transaction.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_phase1_preflight_web_write_g3_g4_and_c2_lead_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§3.2 Row 4, G3, G4, C2:
+    - Auth enabled: preflight uses verify_workspace_access(need='write', channel='web');
+      ColleagueAccessRevokedError -> HTTPException(403) in preflight_check and
+      workspace_access_denied in decide().
+    - Auth disabled (G3): non-owner fails closed.
+    - C2: stale lead on bound unit managed task is skipped both after ownership check
+      and right before claim_signals_woken, and begin_execution_if_not_deleted emits
+      unit lead SQL gate.
+    """
+    from contextlib import asynccontextmanager
+    from unittest.mock import create_autospec
+    from fastapi import HTTPException
+    from src.dalton import auth as dalton_auth
+    from src.dalton import settings as dalton_settings
+    from src.dalton import sharing as dalton_sharing
+    from src.dalton.autonomy import preflight as preflight_mod
+    from src.dalton.database import coverage_units as cu_db
+    from src.dalton.database import watch as watch_db
+    from src.server.database import automation_executions as exec_db
+    from src.server.database import workspace as ws_db
+
+    ws_id = "22222222-2222-2222-2222-222222222222"
+    auto = {
+        "automation_id": "11111111-1111-1111-1111-111111111111",
+        "name": "dalton-nvda-watch",
+        "trigger_type": "cron",
+        "user_id": "colleague-a",
+        "workspace_id": ws_id,
+        "metadata": {"dalton_kind": "company_watch", "ticker": "NVDA"},
+    }
+    ws_row = {"workspace_id": ws_id, "user_id": "owner-b"}
+
+    monkeypatch.setattr(
+        ws_db, "get_workspace", create_autospec(ws_db.get_workspace, return_value=ws_row)
+    )
+
+    # G3: auth disabled -> non-owner fails closed (403 -> workspace_access_denied)
+    monkeypatch.setattr(dalton_settings, "is_dalton_supabase_auth_enabled", lambda: False)
+    with pytest.raises(HTTPException) as exc_off:
+        await preflight_mod._verify_automation_workspace_ownership(auto)
+    assert exc_off.value.status_code == 403
+    dec_off = await preflight_mod.decide(auto, "exec-g3-off")
+    assert dec_off is not None and dec_off.reason == "workspace_access_denied"
+
+    # Row 4: auth enabled -> need='write', channel='web'
+    monkeypatch.setattr(dalton_settings, "is_dalton_supabase_auth_enabled", lambda: True)
+    seen_calls: list[tuple[str, str, str, str]] = []
+
+    async def _vwa(wid, uid, *, need="read", channel="cos", conn=None):
+        seen_calls.append((wid, uid, need, channel))
+        return ws_row
+
+    monkeypatch.setattr(
+        preflight_mod,
+        "verify_workspace_access",
+        create_autospec(dalton_auth.verify_workspace_access, side_effect=_vwa),
+    )
+    verified = await preflight_mod._verify_automation_workspace_ownership(auto)
+    assert verified.user_id == "colleague-a"
+    assert seen_calls == [(ws_id, "colleague-a", "write", "web")]
+
+    # G4: ColleagueAccessRevokedError -> HTTPException(403) in preflight_check & skip in decide()
+    monkeypatch.setattr(
+        preflight_mod,
+        "verify_workspace_access",
+        create_autospec(
+            dalton_auth.verify_workspace_access,
+            side_effect=dalton_sharing.ColleagueAccessRevokedError("revoked"),
+        ),
+    )
+    with pytest.raises(HTTPException) as exc_rev:
+        await preflight_mod.preflight_check(auto, "exec-rev")
+    assert exc_rev.value.status_code == 403
+    dec_rev = await preflight_mod.decide(auto, "exec-rev")
+    assert dec_rev is not None and dec_rev.reason == "workspace_access_denied"
+
+    # C2: _conclude_preflight checks _is_stale_managed_unit_lead BEFORE claim_signals_woken
+    orig_get_active_unit = cu_db.get_active_unit_by_workspace
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(
+        cu_db,
+        "get_active_unit_by_workspace",
+        create_autospec(
+            orig_get_active_unit,
+            return_value={
+                "unit_id": "u-1",
+                "workspace_id": ws_id,
+                "owner_user_id": "owner-b",
+                "lead_analyst_user_id": "lead-new",
+                "status": "active",
+                "kind": "company",
+                "ticker": "NVDA",
+            },
+        ),
+    )
+    claim_mock = create_autospec(watch_db.claim_signals_woken, return_value=[])
+    monkeypatch.setattr(watch_db, "claim_signals_woken", claim_mock)
+    monkeypatch.setattr(
+        watch_db, "list_unwoken_signals", create_autospec(watch_db.list_unwoken_signals, return_value=[])
+    )
+    monkeypatch.setattr(
+        watch_db,
+        "upsert_signal",
+        create_autospec(watch_db.upsert_signal, return_value=({"signal_id": "sig-c2"}, True)),
+    )
+    res_conclude = await preflight_mod._conclude_preflight(
+        emitted=[
+            preflight_mod.ProbeSignal(
+                probe="sec",
+                signal_key="8k-1",
+                priority="P0",
+                summary="filing",
+            )
+        ],
+        state={},
+        persist=True,
+        workspace_id=ws_id,
+        ticker="NVDA",
+        automation_id="11111111-1111-1111-1111-111111111111",
+        execution_id="exec-c2",
+        name="dalton-nvda-watch",
+        user_id="colleague-a",
+        agenda_doc_override={},
+        watch_state_override=None,
+        group_refresh_summary=None,
+        load_saved_signals=False,
+    )
+    assert res_conclude.should_wake is False
+    assert res_conclude.reason == "not_unit_lead_analyst"
+    claim_mock.assert_not_awaited()
+
+    # C2 / Items 7 & 17: real transaction-double test for begin_execution_if_not_deleted lock order, skip, and stamp
+    events: list[str] = []
+
+    class _BeginCur:
+        def __init__(self, state):
+            self._state = state
+            self._last_row = None
+            self._last_rows = []
+
+        async def execute(self, query, params=None):
+            q = " ".join(str(query).split())
+            if "SELECT a.workspace_id" in q:
+                events.append("PROBE_WS")
+                self._last_row = {"workspace_id": self._state["ws_id"]}
+            elif "FROM dalton_coverage_units" in q and "FOR SHARE" in q:
+                events.append("LOCK_UNIT_FOR_SHARE")
+                self._last_rows = [
+                    {"unit_id": self._state["unit_id"], "updated_at": self._state["unit_version"]}
+                ]
+                self._last_row = self._last_rows[0]
+            elif "WITH target AS" in q:
+                events.append("LOCK_EXEC_AND_START_OR_SKIP")
+                if self._state["allow_start"]:
+                    self._last_row = {
+                        "conversation_thread_id": None,
+                        "conversation_response_id": None,
+                        "scheduled_at": self._state["started_at"],
+                        "wait_reason": None,
+                        "awaits_computer": False,
+                        "checked_computer_id": None,
+                        "coverage_unit_id": self._state["unit_id"],
+                        "coverage_unit_version": self._state["unit_version"],
+                    }
+                else:
+                    self._last_row = None
+
+        async def fetchone(self):
+            return self._last_row
+
+        async def fetchall(self):
+            return self._last_rows
+
+    class _BeginConn:
+        def __init__(self, state):
+            self._state = state
+
+        @asynccontextmanager
+        async def transaction(self):
+            events.append("BEGIN")
+            yield self
+            events.append("COMMIT")
+
+        @asynccontextmanager
+        async def cursor(self, **_kw):
+            yield _BeginCur(self._state)
+
+    unit_ver = __import__("datetime").datetime(2026, 11, 20, 12, 0, tzinfo=__import__("datetime").timezone.utc)
+    tx_state = {"ws_id": ws_id, "unit_id": "u-1", "unit_version": unit_ver, "allow_start": False}
+
+    @asynccontextmanager
+    async def _pool_conn(c=None):
+        yield _BeginConn(tx_state)
+
+    monkeypatch.setattr(exec_db, "get_db_connection", _pool_conn)
+    started_row = await exec_db.begin_execution_if_not_deleted(
+        "exec-c2-gate", started_at=tx_state.setdefault("started_at", __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+    )
+    assert started_row is None
+    assert events == ["BEGIN", "PROBE_WS", "LOCK_UNIT_FOR_SHARE", "LOCK_EXEC_AND_START_OR_SKIP", "COMMIT"]
+
+    # When unit lead matches & active, begin_execution_if_not_deleted stamps coverage_unit_id and version
+    events.clear()
+    tx_state["allow_start"] = True
+    started_ok = await exec_db.begin_execution_if_not_deleted(
+        "exec-c2-ok", started_at=tx_state["started_at"]
+    )
+    assert started_ok is not None
+    assert started_ok["coverage_unit_id"] == "u-1"
+    assert started_ok["coverage_unit_version"] == unit_ver
+
+    # Item 7: _conclude_preflight locks unit FOR SHARE -> automations FOR SHARE in one tx before claim_signals_woken
+    preflight_events: list[str] = []
+
+    class _PreflightTxConn:
+        @asynccontextmanager
+        async def transaction(self):
+            preflight_events.append("BEGIN")
+            yield self
+            preflight_events.append("COMMIT")
+
+        @asynccontextmanager
+        async def cursor(self, **_kw):
+            class _PCur:
+                async def execute(self_c, sql, _p=None):
+                    s = " ".join(str(sql).split())
+                    if "FROM dalton_coverage_units" in s and "FOR SHARE" in s:
+                        preflight_events.append("LOCK_UNIT_FOR_SHARE")
+                        self_c._r = {
+                            "unit_id": "u-1",
+                            "workspace_id": ws_id,
+                            "owner_user_id": "owner-b",
+                            "lead_analyst_user_id": "lead-new",
+                            "status": "active",
+                            "kind": "company",
+                            "ticker": "NVDA",
+                        }
+                    elif "FROM automations" in s and "FOR SHARE" in s:
+                        preflight_events.append("LOCK_AUTO_FOR_SHARE")
+                        self_c._r = {
+                            "automation_id": "11111111-1111-1111-1111-111111111111",
+                            "user_id": "lead-new",
+                            "workspace_id": ws_id,
+                            "status": "paused",  # handoff paused while probe ran!
+                            "deleted_at": None,
+                            "name": "dalton-nvda-watch",
+                            "metadata": {"dalton_kind": "company_watch", "ticker": "NVDA"},
+                        }
+
+                async def fetchone(self_c):
+                    return getattr(self_c, "_r", None)
+
+            yield _PCur()
+
+    @asynccontextmanager
+    async def _preflight_conn(c=None):
+        yield _PreflightTxConn()
+
+    monkeypatch.setattr("src.server.database.pool.get_db_connection", _preflight_conn)
+    monkeypatch.setattr(cu_db, "get_db_connection", _preflight_conn)
+    monkeypatch.setattr(cu_db, "get_active_unit_by_workspace", orig_get_active_unit)
+    res_paused_tx = await preflight_mod._conclude_preflight(
+        emitted=[preflight_mod.ProbeSignal(probe="sec", signal_key="8k-2", priority="P0", summary="filing")],
+        state={},
+        persist=True,
+        workspace_id=ws_id,
+        ticker="NVDA",
+        automation_id="11111111-1111-1111-1111-111111111111",
+        execution_id="exec-c2-paused",
+        name="dalton-nvda-watch",
+        user_id="lead-new",
+        agenda_doc_override={},
+        watch_state_override=None,
+        group_refresh_summary=None,
+        load_saved_signals=False,
+    )
+    assert res_paused_tx.should_wake is False
+    assert res_paused_tx.reason == "automation_inactive_or_deleted"
+    assert preflight_events == ["BEGIN", "LOCK_UNIT_FOR_SHARE", "LOCK_AUTO_FOR_SHARE", "COMMIT"]
+    claim_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_phase1_schedule_helper_row5_web_access_g3_and_c2_lead_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§3.2 Row 5, G3, C2 on schedule_dalton_automation_helper."""
+    from contextlib import asynccontextmanager
+    from unittest.mock import create_autospec
+    from fastapi import HTTPException
+    from src.dalton import settings as dalton_settings
+    from src.dalton.autonomy import schedule as sched_mod
+    from src.dalton.database import coverage_units as cu_db
+
+    ws_id = "22222222-2222-2222-2222-222222222222"
+    ws_row = {"workspace_id": ws_id, "user_id": "owner-b", "is_home": False}
+    seen: list[tuple[str, str, str, str]] = []
+
+    async def _vwa(wid, uid, *, need="read", channel="cos", conn=None):
+        seen.append((wid, uid, need, channel))
+        return ws_row
+
+    monkeypatch.setattr(
+        sched_mod, "verify_workspace_access", create_autospec(sched_mod.verify_workspace_access, side_effect=_vwa)
+    )
+    monkeypatch.setattr(
+        sched_mod,
+        "list_all_user_automations",
+        create_autospec(sched_mod.list_all_user_automations, return_value=[]),
+    )
+
+    @asynccontextmanager
+    async def _lock(_uid, conn=None):
+        yield object()
+
+    monkeypatch.setattr(sched_mod, "user_automations_lock", _lock)
+
+    # list -> need="read", channel="web"
+    listed = await sched_mod.schedule_dalton_automation_helper(
+        None,
+        {},
+        user_id="colleague-a",
+        workspace_id=ws_id,
+        action="list",
+    )
+    assert listed["ok"] is True
+    assert seen[-1] == (ws_id, "colleague-a", "read", "web")
+
+    # C2: write managed earn-* task on bound unit workspace as non-lead -> not_unit_lead_analyst
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(
+        cu_db,
+        "get_active_unit_by_workspace",
+        create_autospec(
+            cu_db.get_active_unit_by_workspace,
+            return_value={
+                "unit_id": "u-1",
+                "workspace_id": ws_id,
+                "owner_user_id": "owner-b",
+                "lead_analyst_user_id": "lead-new",
+                "status": "active",
+                "kind": "company",
+                "ticker": "NVDA",
+            },
+        ),
+    )
+    res_non_lead = await sched_mod.schedule_dalton_automation_helper(
+        "dalton-nvda-earn-fy26q3-t0",
+        {"trigger_type": "once", "next_run_at": "2026-11-20T09:00:00Z", "instruction": "earnings"},
+        user_id="colleague-a",
+        workspace_id=ws_id,
+        ticker="NVDA",
+        role="chief_of_staff",
+        action="upsert",
+    )
+    assert seen[-1] == (ws_id, "colleague-a", "write", "web")
+    assert res_non_lead["ok"] is False
+    assert res_non_lead["error"] == "not_unit_lead_analyst"
+
+    # G3: real verify_workspace_access with auth disabled rejects non-owner with 403
+    from src.dalton import auth as real_auth
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setattr(sched_mod, "verify_workspace_access", real_auth.verify_workspace_access)
+    monkeypatch.setattr(dalton_settings, "is_dalton_supabase_auth_enabled", lambda: False)
+    monkeypatch.setattr(
+        ws_db, "get_workspace", create_autospec(ws_db.get_workspace, return_value=ws_row)
+    )
+    with pytest.raises(HTTPException) as exc_g3:
+        await sched_mod.schedule_dalton_automation_helper(
+            "dalton-nvda-earn-fy26q3-t0",
+            {"trigger_type": "once", "next_run_at": "2026-11-20T09:00:00Z", "instruction": "earnings"},
+            user_id="colleague-a",
+            workspace_id=ws_id,
+            action="upsert",
+        )
+    assert exc_g3.value.status_code == 403

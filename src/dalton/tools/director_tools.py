@@ -7,7 +7,7 @@ import json
 import logging
 import re
 from datetime import date
-from typing import Any
+from typing import Any, Mapping
 
 from fastapi import HTTPException
 from langchain_core.runnables import RunnableConfig
@@ -31,13 +31,14 @@ from src.dalton.autonomy.tracking import (
     get_tracking_status,
     resolve_workspace_id_by_ticker,
     resolve_workspace_id_by_ticker_any_owner,
+    system_job_viewer_context,
 )
 from src.dalton.coverage.models import (
     canonical_ledger_sha256,
     validate_earnings_calendar_ledger,
 )
 from src.dalton.coverage.service import publish_user_earnings_calendar_mirror
-from src.dalton.coverage.unit_errors import classify_coverage_unit_error
+from src.dalton.coverage.unit_errors import coverage_unit_error_detail
 from src.dalton.coverage.units import (
     archive_coverage_unit,
     bind_coverage_unit_workspace,
@@ -186,16 +187,91 @@ TRACKING_OWNER_ONLY_DETAIL = (
     "当前用户不是该工作区的所有者。")
 
 
-async def _verify_tracking_workspace_owner(workspace_id: str, user_id: str) -> None:
-    """Tracking stays owner-only; a non-owner's generic 403 is re-raised with why."""
+async def _verify_tracking_workspace_owner(workspace_id: str, user_id: str) -> str:
+    """Verify caller may mutate tracking/system jobs on ``workspace_id`` and return effective task owner."""
+    from src.dalton.autonomy.tracking import resolve_workspace_tracking_owner
+    from src.dalton.database.coverage_units import get_active_unit_by_workspace
+    from src.dalton.settings import (
+        get_dalton_settings,
+        is_coverage_units_enabled,
+        is_dalton_supabase_auth_enabled,
+    )
+    from src.dalton.sharing import ColleagueAccessRevokedError, require_workspace_access
+
+    uid = str(user_id or "").strip()
+    is_pm = bool(uid and uid in get_dalton_settings().pm_user_ids)
+    units_on = is_coverage_units_enabled()
+
+    if units_on and is_dalton_supabase_auth_enabled():
+        ws_row: dict[str, Any] | None = None
+        if units_on:
+            try:
+                ws_row = await require_workspace_access(
+                    workspace_id, uid, channel="web", need="read"
+                )
+            except ColleagueAccessRevokedError as exc:
+                raise HTTPException(
+                    status_code=403, detail=TRACKING_OWNER_ONLY_DETAIL
+                ) from exc
+            except HTTPException as exc:
+                if exc.status_code == 403:
+                    raise HTTPException(
+                        status_code=403, detail=TRACKING_OWNER_ONLY_DETAIL
+                    ) from exc
+                raise
+            unit = await get_active_unit_by_workspace(workspace_id)
+            if unit is not None:
+                from src.dalton.access_tiers import classify_owner_tier
+
+                ws_owner = str((ws_row or {}).get("user_id") or "").strip()
+                if ws_owner and ws_owner != uid:
+                    owner_tier = await classify_owner_tier(ws_owner)
+                    if owner_tier == "unknown":
+                        raise HTTPException(status_code=404, detail="Workspace not found")
+                    if owner_tier == "external":
+                        raise HTTPException(
+                            status_code=403, detail=TRACKING_OWNER_ONLY_DETAIL
+                        )
+                lead_uid = str(
+                    unit.get("lead_analyst_user_id")
+                    or unit.get("owner_user_id")
+                    or ""
+                ).strip() or ws_owner
+                if is_pm:
+                    return lead_uid
+                if uid != lead_uid:
+                    raise HTTPException(
+                        status_code=403, detail=TRACKING_OWNER_ONLY_DETAIL
+                    )
+                try:
+                    await require_workspace_access(
+                        workspace_id, uid, channel="web", need="write", workspace=ws_row
+                    )
+                except ColleagueAccessRevokedError as exc:
+                    raise HTTPException(
+                        status_code=403, detail=TRACKING_OWNER_ONLY_DETAIL
+                    ) from exc
+                except HTTPException as exc:
+                    if exc.status_code == 403:
+                        raise HTTPException(
+                            status_code=403, detail=TRACKING_OWNER_ONLY_DETAIL
+                        ) from exc
+                    raise
+                return lead_uid
+
     try:
-        await verify_workspace_access(workspace_id, user_id)
+        ws_row = await verify_workspace_access(workspace_id, uid)
     except HTTPException as exc:
         if exc.status_code == 403:
             raise HTTPException(
                 status_code=403, detail=TRACKING_OWNER_ONLY_DETAIL
             ) from exc
         raise
+    task_owner = await resolve_workspace_tracking_owner(workspace_id, ws_row)
+    ws_owner = str((ws_row or {}).get("user_id") or uid).strip()
+    if units_on and is_dalton_supabase_auth_enabled() and task_owner and uid != task_owner and not is_pm:
+        raise HTTPException(status_code=403, detail=TRACKING_OWNER_ONLY_DETAIL)
+    return task_owner or ws_owner
 
 
 async def _resolve_system_job_owner_ws(
@@ -211,7 +287,14 @@ async def _resolve_system_job_owner_ws(
     the same "not found" it would for a missing key."""
     from src.server.database import workspace as ws_db
 
-    async def _readable_owner_ws(ws_id: str) -> tuple[str, str] | None:
+    async def _readable_owner_ws(
+        ws_id: str,
+        *,
+        unit: Mapping[str, Any] | None = None,
+    ) -> tuple[str, str] | None:
+        from src.dalton.settings import is_coverage_units_enabled
+        from src.dalton.sharing import require_workspace_access
+
         try:
             ws = await ws_db.get_workspace(ws_id)
             if not ws:
@@ -223,7 +306,17 @@ async def _resolve_system_job_owner_ws(
             await verify_workspace_access(
                 resolved_id, user_id, need="read", channel="cos"
             )
-            return resolved_id, owner
+            if is_coverage_units_enabled():
+                await require_workspace_access(
+                    resolved_id, user_id, channel="web", need="read"
+                )
+            from src.dalton.autonomy.tracking import resolve_workspace_tracking_owner
+
+            task_owner = (
+                await resolve_workspace_tracking_owner(resolved_id, ws, unit=unit)
+                or owner
+            )
+            return resolved_id, task_owner
         except HTTPException:
             return None
 
@@ -239,12 +332,29 @@ async def _resolve_system_job_owner_ws(
             return await _readable_owner_ws(any_ws)
         return None
     if scope == "sector":
+        from src.dalton.access_tiers import is_internal_or_admin
+        from src.dalton.coverage.identity import CoverageIdentityUnavailableError
         from src.dalton.settings import is_coverage_units_enabled
 
         if not is_coverage_units_enabled():
             return None
+        if not await is_internal_or_admin(user_id):
+            return None
         lowered = str(target or "").strip().lower()
-        for unit in await get_registered_units():
+        try:
+            units = await get_registered_units()
+        except CoverageIdentityUnavailableError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[DALTON_DIRECTOR_TOOLS] sector registry unavailable resolving %s: %s",
+                target,
+                exc,
+            )
+            raise CoverageIdentityUnavailableError(
+                "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。"
+            ) from exc
+        for unit in units:
             if str(unit.get("kind") or "") != "sector":
                 continue
             slug = str(unit.get("slug") or "").strip().lower()
@@ -254,7 +364,11 @@ async def _resolve_system_job_owner_ws(
             bound_ws = str(unit.get("workspace_id") or "").strip()
             # Round-5 item 3: keep looking past unreadable same-name
             # candidates — only a READABLE match resolves.
-            resolved = await _readable_owner_ws(bound_ws) if bound_ws else None
+            resolved = (
+                await _readable_owner_ws(bound_ws, unit=unit)
+                if bound_ws
+                else None
+            )
             if resolved is not None:
                 return resolved
         return None
@@ -280,10 +394,22 @@ def build_director_tools(
             unit (sector and company) with `readable` / `delegatable` / `auto_tracked` flags, sector
             members and each member's `workspace_created`; `companies` keeps its exact shape either way.
         """
+        from src.dalton.access_tiers import is_internal_or_admin
+        from src.dalton.settings import is_coverage_units_enabled
+
         configurable = (config or {}).get("configurable") or {}
         user_id = str(configurable.get("user_id") or "").strip()
         if not user_id:
             raise ValueError("user_id is required")
+        if is_coverage_units_enabled() and not await is_internal_or_admin(user_id):
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "forbidden",
+                    "message": "仅内部成员或管理员可查看覆盖看板。",
+                },
+                ensure_ascii=False,
+            )
         board = await build_coverage_board(user_id=user_id)
         return json.dumps(board, ensure_ascii=False, default=str)
 
@@ -697,39 +823,51 @@ def build_director_tools(
         include_archived: bool = False,
         config: RunnableConfig = None,
     ) -> str:
-        """Register, bind, unbind, archive, or list the caller's OWN coverage units.
+        """Register, bind, unbind, archive, or list team coverage units.
 
         Reach for this when the user starts covering a new sector or company: register the
-        unit (`action="register"`), then bind one of the user's own non-Home workspaces to it
-        (`action="bind"`) — only then do tracking, dispatch and the coverage board resolve that
-        workspace as the unit. Owner-scoped throughout: another user's units and workspaces are
-        refused. A sector unit never takes a `ticker` (refused); a company unit's ticker is
-        normalized to the auto-tracking shape. One workspace holds at most one active unit, so
-        check `action="list"` before re-registering a name. `action="archive"` frees the
-        workspace slot and the unit stops resolving; it deletes nothing. `action="unbind"`
-        clears the binding without archiving.
+        unit (`action="register"`, optionally with `workspace_id`), bind an unbound unit to a
+        writable non-Home workspace (`action="bind"` — Phase 1 does not support rebinding a bound
+        unit to a different workspace; unbind first), unbind (`action="unbind"`), archive
+        (`action="archive"`), or check existing units (`action="list"`). Only internal/admin
+        members may call this.
+        A sector unit never takes a `ticker` (refused); a company unit's ticker is normalized.
+        One workspace holds at most one active unit, and one `(kind, slug)` / `ticker_key`
+        is globally unique across active units. Before `unbind` or `archive` on a bound unit,
+        disable tracking first so no managed tasks (`active`/`executing`) or unstarted
+        executions (`pending`/`waiting`) remain active.
 
         Args:
             action: `"register"` | `"bind"` | `"unbind"` | `"archive"` | `"list"`.
             kind: `"sector"` or `"company"` (register only).
-            slug: Stable lowercase slug, 1-64 chars of `[a-z0-9._-]` (e.g. `ai-infrastructure`); unique per owner+kind, never rewritten (register only).
+            slug: Stable lowercase slug, 1-64 chars of `[a-z0-9._-]` (e.g. `ai-infrastructure`); globally unique per kind among active units (register only).
             display_name: Human-readable name; defaults to the slug (register only).
             ticker: Company ticker (e.g. `"NVDA"`); must be omitted for a sector.
             research_tz: IANA zone for the unit's agenda due-times (register only).
             unit_id: The unit UUID (bind/unbind/archive).
-            workspace_id: One of the user's own non-Home workspaces (bind only).
+            workspace_id: Writable non-Home workspace UUID (optional on register; required on bind).
             include_archived: Include archived rows in `"list"`.
 
         Returns:
             JSON with `ok`; success carries the unit row (`unit`, or `units` for `"list"`),
-            failure a stable `error` code with `message`. A successful sector bind also carries
-            a `hint` recommending `dalton-init-sector` in the bound workspace — a suggestion,
-            not a requirement.
+            failure a stable `error` code with `message`.
         """
+        from src.dalton.access_tiers import is_internal_or_admin
+
         configurable = (config or {}).get("configurable") or {}
         user_id = str(configurable.get("user_id") or "").strip()
         if not user_id:
             raise ValueError("user_id is required")
+
+        if not await is_internal_or_admin(user_id):
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "forbidden",
+                    "message": "仅内部成员或管理员可访问覆盖单元。",
+                },
+                ensure_ascii=False,
+            )
 
         act = str(action or "").strip().lower()
         if act not in {"register", "bind", "unbind", "archive", "list"}:
@@ -737,7 +875,10 @@ def build_director_tools(
                 {
                     "ok": False,
                     "error": "invalid_action",
-                    "message": f"不支持的 action `{action}`，仅支持 register、bind、unbind、archive、list。",
+                    "message": (
+                        f"不支持的 action `{action}`，仅支持 register、bind、unbind、"
+                        "archive、list。"
+                    ),
                 },
                 ensure_ascii=False,
             )
@@ -763,14 +904,16 @@ def build_director_tools(
                         },
                         ensure_ascii=False,
                     )
-                row = await register_coverage_unit(
-                    user_id,
-                    kind=str(kind or ""),
-                    slug=str(slug),
-                    display_name=str(display_name or ""),
-                    ticker=ticker,
-                    research_tz=research_tz,
-                )
+                reg_kwargs: dict[str, Any] = {
+                    "kind": str(kind or ""),
+                    "slug": str(slug),
+                    "display_name": str(display_name or ""),
+                    "ticker": ticker,
+                    "research_tz": research_tz,
+                }
+                if workspace_id is not None and str(workspace_id).strip():
+                    reg_kwargs["workspace_id"] = str(workspace_id).strip()
+                row = await register_coverage_unit(user_id, **reg_kwargs)
                 return json.dumps({"ok": True, "unit": row}, ensure_ascii=False, default=str)
 
             if act == "bind":
@@ -788,8 +931,10 @@ def build_director_tools(
                 row = await bind_coverage_unit_workspace(clean_unit, clean_ws, user_id)
                 out: dict[str, Any] = {"ok": True, "unit": row}
                 if str(row.get("kind") or "") == "sector":
+                    vis_ws = str(row.get("workspace_id") or "").strip()
+                    ws_desc = f"工作区 {vis_ws}" if vis_ws else "目标工作区"
                     out["hint"] = (
-                        f"行业单元 {row.get('slug')} 已绑定工作区 {clean_ws}。"
+                        f"行业单元 {row.get('slug')} 已绑定{ws_desc}。"
                         "建议向该工作区委派 dalton-init-sector 技能初始化行业知识层（用户不需要时可跳过）。"
                     )
                 return json.dumps(out, ensure_ascii=False, default=str)
@@ -802,15 +947,31 @@ def build_director_tools(
                 row = await archive_coverage_unit(str(unit_id or ""), user_id)
                 return json.dumps({"ok": True, "unit": row}, ensure_ascii=False, default=str)
 
+            from src.dalton.coverage.units import clear_unreadable_unit_identity
+
             rows = await get_registered_units(user_id, include_archived=include_archived)
+            filtered_rows: list[dict[str, Any]] = []
+            for r in rows:
+                entry = dict(r)
+                ws_val = str(entry.get("workspace_id") or "").strip()
+                if ws_val:
+                    try:
+                        await verify_workspace_access(
+                            ws_val, user_id, channel="web", need="read"
+                        )
+                        entry["readable"] = True
+                    except HTTPException:
+                        clear_unreadable_unit_identity(entry)
+                        entry["readable"] = False
+                else:
+                    entry["readable"] = True
+                filtered_rows.append(entry)
             return json.dumps(
-                {"ok": True, "units": rows}, ensure_ascii=False, default=str
+                {"ok": True, "units": filtered_rows}, ensure_ascii=False, default=str
             )
         except ValueError as e:
-            code, _status = classify_coverage_unit_error(e)
-            return json.dumps(
-                {"ok": False, "error": code, "message": str(e)}, ensure_ascii=False
-            )
+            detail = coverage_unit_error_detail(e)
+            return json.dumps({"ok": False, **detail}, ensure_ascii=False, default=str)
 
     @tool("dalton_agenda_note")
     async def dalton_agenda_note(
@@ -928,7 +1089,20 @@ def build_director_tools(
         user_id = str(configurable.get("user_id") or "").strip()
         if not user_id:
             raise ValueError("user_id is required")
-        await verify_workspace_access(workspace_id, user_id, need="write", channel="cos")
+        from src.dalton.settings import is_dalton_supabase_auth_enabled
+        from src.dalton.sharing import ColleagueAccessRevokedError
+
+        access_channel = "cos"
+        try:
+            await verify_workspace_access(workspace_id, user_id, need="write", channel="cos")
+        except HTTPException as exc:
+            if exc.status_code not in (403, 404) or not is_dalton_supabase_auth_enabled():
+                raise
+            try:
+                await verify_workspace_access(workspace_id, user_id, need="write", channel="web")
+            except ColleagueAccessRevokedError as rev_exc:
+                raise HTTPException(status_code=403, detail=str(rev_exc)) from rev_exc
+            access_channel = "web"
         try:
             from src.dalton.database import knowledge as db_knowledge
             from src.dalton.knowledge import service as knowledge_service
@@ -1060,17 +1234,20 @@ def build_director_tools(
                     if matched_ev is not None
                     else f"新增议程监控事件 {target_id}" + ("（首建 agenda）" if first_write else "")
                 )
-                res = await knowledge_service.apply_update(
-                    user_id=user_id,
-                    workspace_id=workspace_id,
-                    doc_key="agenda",
-                    ops=ops,
-                    reason=reason_str,
-                    base_version=base_ver,
-                    source="tool",
-                    backend=None,
-                    thread_id=str(configurable.get("thread_id")) if configurable.get("thread_id") else None,
-                )
+                apply_kwargs: dict[str, Any] = {
+                    "user_id": user_id,
+                    "workspace_id": workspace_id,
+                    "doc_key": "agenda",
+                    "ops": ops,
+                    "reason": reason_str,
+                    "base_version": base_ver,
+                    "source": "tool",
+                    "backend": None,
+                    "thread_id": str(configurable.get("thread_id")) if configurable.get("thread_id") else None,
+                }
+                if access_channel != "cos":
+                    apply_kwargs["access_channel"] = access_channel
+                res = await knowledge_service.apply_update(**apply_kwargs)
                 if isinstance(res, dict):
                     if res.get("ok"):
                         res["event_id"] = target_id
@@ -1470,11 +1647,45 @@ def build_director_tools(
             # 显式传 ticker 一律拒绝，不给"猜一个"留口。
             # 开关门控（codex r3 #6）：开关关闭时连身份查询都不发，
             # 公司路径与 P3 前逐字一致（零新增查询）。
+            # 先查 Web 读权限再解析当前工作区身份（codex r7 中 2 / r8 中 1）：所有
+            # 操作都先验证当前工作区可读，避免 CoS 可读但 Web 隐藏的工作区把 UUID 写进拒信。
+            if is_coverage_units_enabled():
+                from src.dalton.sharing import require_workspace_access
+
+                try:
+                    await require_workspace_access(
+                        current_ws, user_id, channel="web", need="read"
+                    )
+                except HTTPException:
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": "forbidden_workspace",
+                            "message": "当前工作区不存在或无权限访问。",
+                        },
+                        ensure_ascii=False,
+                    )
             sector_current = None
             if is_coverage_units_enabled():
                 from src.dalton.autonomy.tracking import _resolve_workspace_sector
+                from src.dalton.coverage.identity import CoverageIdentityUnavailableError
 
-                sector_current = await _resolve_workspace_sector(current_ws)
+                try:
+                    sector_current = await _resolve_workspace_sector(current_ws)
+                except CoverageIdentityUnavailableError as exc:
+                    logger.warning(
+                        "[DALTON_DIRECTOR_TOOLS] tracking sector check unavailable for %s: %s",
+                        current_ws,
+                        exc,
+                    )
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": "coverage_identity_unavailable",
+                            "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+                        },
+                        ensure_ascii=False,
+                    )
             if sector_current is not None:
                 if passed_ticker:
                     return json.dumps(
@@ -1493,6 +1704,22 @@ def build_director_tools(
                 try:
                     cur_ticker = str(await _resolve_workspace_ticker(current_ws) or "").strip().upper()
                 except Exception as exc:
+                    from src.dalton.coverage.identity import CoverageIdentityUnavailableError
+
+                    if isinstance(exc, CoverageIdentityUnavailableError):
+                        logger.warning(
+                            "[DALTON_DIRECTOR_TOOLS] tracking ticker resolution unavailable for %s: %s",
+                            current_ws,
+                            exc,
+                        )
+                        return json.dumps(
+                            {
+                                "ok": False,
+                                "error": "coverage_identity_unavailable",
+                                "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+                            },
+                            ensure_ascii=False,
+                        )
                     return json.dumps(
                         {
                             "ok": False,
@@ -1567,27 +1794,80 @@ def build_director_tools(
         if act == "status":
             # Round-2 F: 有读权限的同事可查状态；跟踪任务挂在所有者名下，
             # 按所有者的自动化记录报告，避免把已开启的跟踪误报成 disabled。
+            from contextlib import nullcontext
+            from src.dalton.coverage.identity import CoverageIdentityUnavailableError
+            from src.dalton.sharing import require_workspace_access
+
             status_ws_row = await verify_workspace_access(
                 target_ws_id, user_id, need="read", channel="cos"
             )
-            status_owner = str((status_ws_row or {}).get("user_id") or "").strip() or user_id
-            res = await get_tracking_status(status_owner, target_ws_id)
+            from src.dalton.autonomy.tracking import resolve_workspace_tracking_owner
+
+            units_enabled = is_coverage_units_enabled()
+            if units_enabled:
+                await require_workspace_access(
+                    target_ws_id, user_id, channel="web", need="read"
+                )
+            status_owner = (
+                await resolve_workspace_tracking_owner(target_ws_id, status_ws_row)
+                or str((status_ws_row or {}).get("user_id") or "").strip()
+                or user_id
+            )
+            viewer_ctx = system_job_viewer_context(user_id) if units_enabled else nullcontext()
+            try:
+                with viewer_ctx:
+                    res = await get_tracking_status(status_owner, target_ws_id)
+            except CoverageIdentityUnavailableError as exc:
+                logger.warning(
+                    "[DALTON_DIRECTOR_TOOLS] get_tracking_status unavailable for %s: %s",
+                    target_ws_id,
+                    exc,
+                )
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": "coverage_identity_unavailable",
+                        "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+                    },
+                    ensure_ascii=False,
+                )
         else:
             # 开启/停用只允许所有者（所有入口统一），并把调度层
             # （schedule_dalton_automation_helper）的通用 403 换成说明原因的
             # 文案，不改权限本身。
-            await _verify_tracking_workspace_owner(target_ws_id, user_id)
+            from src.dalton.coverage.identity import CoverageIdentityUnavailableError
+
+            task_owner = await _verify_tracking_workspace_owner(target_ws_id, user_id)
             try:
                 if act == "enable":
                     is_user_action = src == "user"
                     res = await enable_tracking(
-                        user_id,
+                        task_owner,
                         target_ws_id,
                         force=is_user_action,
                         respect_user_pause=not is_user_action,
+                        viewer_user_id=user_id,
                     )
                 else:
-                    res = await disable_tracking(user_id, target_ws_id)
+                    res = await disable_tracking(
+                        task_owner,
+                        target_ws_id,
+                        viewer_user_id=user_id,
+                    )
+            except CoverageIdentityUnavailableError as exc:
+                logger.warning(
+                    "[DALTON_DIRECTOR_TOOLS] tracking toggle unavailable for %s: %s",
+                    target_ws_id,
+                    exc,
+                )
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": "coverage_identity_unavailable",
+                        "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+                    },
+                    ensure_ascii=False,
+                )
             except HTTPException as exc:
                 if exc.status_code == 403:
                     raise HTTPException(
@@ -1679,11 +1959,45 @@ def build_director_tools(
             # sector 任务，权限规则与公司 scope 一致——只准当前工作区（key
             # 只认本单元的 slug / unit_id，服务层的解析走同一注册表）。
             # 开关门控（codex r3 #6）：关闭时零新增查询，公司路径原样。
+            # 先查 Web 读权限再解析当前工作区身份（codex r7 中 2 / r8 中 1）：所有
+            # 操作都先验证当前工作区可读，避免 CoS 可读但 Web 隐藏的行业工作区把 slug 写进拒信。
+            if is_coverage_units_enabled():
+                from src.dalton.sharing import require_workspace_access
+
+                try:
+                    await require_workspace_access(
+                        current_ws, user_id, channel="web", need="read"
+                    )
+                except HTTPException:
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": "forbidden_workspace",
+                            "message": "当前工作区不存在或无权限访问。",
+                        },
+                        ensure_ascii=False,
+                    )
             sector_current = None
             if is_coverage_units_enabled():
                 from src.dalton.autonomy.tracking import _resolve_workspace_sector
+                from src.dalton.coverage.identity import CoverageIdentityUnavailableError
 
-                sector_current = await _resolve_workspace_sector(current_ws)
+                try:
+                    sector_current = await _resolve_workspace_sector(current_ws)
+                except CoverageIdentityUnavailableError as exc:
+                    logger.warning(
+                        "[DALTON_DIRECTOR_TOOLS] tracking sector check unavailable for %s: %s",
+                        current_ws,
+                        exc,
+                    )
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": "coverage_identity_unavailable",
+                            "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+                        },
+                        ensure_ascii=False,
+                    )
             if sector_current is not None:
                 sector_slug = str(sector_current["unit"].get("slug") or "").strip()
                 sector_unit_id = str(sector_current["unit"].get("unit_id") or "").strip()
@@ -1717,14 +2031,38 @@ def build_director_tools(
                 if act in ("list", "status"):
                     # Round-3 decision 3: readable colleagues may look; the
                     # jobs live under the workspace owner's automations.
+                    from src.dalton.autonomy.tracking import resolve_workspace_tracking_owner
+                    from src.dalton.coverage.identity import CoverageIdentityUnavailableError
+
                     status_ws_row = await verify_workspace_access(
                         current_ws, user_id, need="read", channel="cos"
                     )
                     status_owner = (
-                        str((status_ws_row or {}).get("user_id") or "").strip()
+                        await resolve_workspace_tracking_owner(
+                            current_ws,
+                            status_ws_row,
+                            unit=sector_current.get("unit"),
+                        )
+                        or str((status_ws_row or {}).get("user_id") or "").strip()
                         or user_id
                     )
-                    res = await get_system_job_status(status_owner, sector_key)
+                    try:
+                        with system_job_viewer_context(user_id):
+                            res = await get_system_job_status(status_owner, sector_key)
+                    except CoverageIdentityUnavailableError as exc:
+                        logger.warning(
+                            "[DALTON_DIRECTOR_TOOLS] analyst sector system-job status unavailable for %s: %s",
+                            sector_key,
+                            exc,
+                        )
+                        return json.dumps(
+                            {
+                                "ok": False,
+                                "error": "coverage_identity_unavailable",
+                                "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+                            },
+                            ensure_ascii=False,
+                        )
                     return json.dumps(res, ensure_ascii=False, default=str)
                 if act in ("update", "rollback") or cron_expr is not None or timezone is not None or notify_routes is not None:
                     return json.dumps(
@@ -1735,16 +2073,33 @@ def build_director_tools(
                         },
                         ensure_ascii=False,
                     )
-                await _verify_tracking_workspace_owner(current_ws, user_id)
+                task_owner = await _verify_tracking_workspace_owner(current_ws, user_id)
                 if act in ("enable", "disable"):
                     return await dalton_coverage_tracking.ainvoke(
                         {"action": act, "workspace_id": current_ws},
                         config=config,
                     )
                 try:
-                    res = await run_system_job_now(user_id, sector_key)
+                    with system_job_viewer_context(user_id):
+                        res = await run_system_job_now(task_owner, sector_key)
                     return json.dumps(res, ensure_ascii=False, default=str)
                 except Exception as exc:
+                    from src.dalton.coverage.identity import CoverageIdentityUnavailableError
+
+                    if isinstance(exc, CoverageIdentityUnavailableError):
+                        logger.warning(
+                            "[DALTON_DIRECTOR_TOOLS] analyst sector run_now unavailable for %s: %s",
+                            sector_key,
+                            exc,
+                        )
+                        return json.dumps(
+                            {
+                                "ok": False,
+                                "error": "coverage_identity_unavailable",
+                                "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+                            },
+                            ensure_ascii=False,
+                        )
                     return json.dumps(
                         {"ok": False, "error": "system_job_error", "message": str(exc)},
                         ensure_ascii=False,
@@ -1820,13 +2175,46 @@ def build_director_tools(
             if act in ("list", "status"):
                 # Round-3 decision 3: readable colleagues may look; report from
                 # the workspace owner's automation rows.
+                from contextlib import nullcontext
+                from src.dalton.sharing import require_workspace_access
+
+                from src.dalton.autonomy.tracking import resolve_workspace_tracking_owner
+
                 status_ws_row = await verify_workspace_access(
                     current_ws, user_id, need="read", channel="cos"
                 )
+                units_enabled = is_coverage_units_enabled()
+                if units_enabled:
+                    await require_workspace_access(
+                        current_ws, user_id, channel="web", need="read"
+                    )
                 status_owner = (
-                    str((status_ws_row or {}).get("user_id") or "").strip() or user_id
+                    await resolve_workspace_tracking_owner(current_ws, status_ws_row)
+                    or str((status_ws_row or {}).get("user_id") or "").strip()
+                    or user_id
                 )
-                res = await get_system_job_status(status_owner, current_ws)
+                viewer_ctx = system_job_viewer_context(user_id) if units_enabled else nullcontext()
+                try:
+                    with viewer_ctx:
+                        res = await get_system_job_status(status_owner, current_ws)
+                except Exception as exc:
+                    from src.dalton.coverage.identity import CoverageIdentityUnavailableError
+
+                    if isinstance(exc, CoverageIdentityUnavailableError):
+                        logger.warning(
+                            "[DALTON_DIRECTOR_TOOLS] analyst company system-job status unavailable for %s: %s",
+                            current_ws,
+                            exc,
+                        )
+                        return json.dumps(
+                            {
+                                "ok": False,
+                                "error": "coverage_identity_unavailable",
+                                "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+                            },
+                            ensure_ascii=False,
+                        )
+                    raise
                 return json.dumps(res, ensure_ascii=False, default=str)
             if act in ("update", "rollback") or cron_expr is not None or timezone is not None or notify_routes is not None:
                 return json.dumps(
@@ -1837,16 +2225,33 @@ def build_director_tools(
                     },
                     ensure_ascii=False,
                 )
-            await _verify_tracking_workspace_owner(current_ws, user_id)
+            task_owner = await _verify_tracking_workspace_owner(current_ws, user_id)
             if act in ("enable", "disable"):
                 return await dalton_coverage_tracking.ainvoke(
                     {"action": act, "workspace_id": current_ws},
                     config=config,
                 )
             try:
-                res = await run_system_job_now(user_id, current_ws)
+                with system_job_viewer_context(user_id):
+                    res = await run_system_job_now(task_owner, current_ws)
                 return json.dumps(res, ensure_ascii=False, default=str)
             except Exception as exc:
+                from src.dalton.coverage.identity import CoverageIdentityUnavailableError
+
+                if isinstance(exc, CoverageIdentityUnavailableError):
+                    logger.warning(
+                        "[DALTON_DIRECTOR_TOOLS] analyst company run_now unavailable for %s: %s",
+                        current_ws,
+                        exc,
+                    )
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": "coverage_identity_unavailable",
+                            "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+                        },
+                        ensure_ascii=False,
+                    )
                 return json.dumps(
                     {"ok": False, "error": "system_job_error", "message": str(exc)},
                     ensure_ascii=False,
@@ -1918,8 +2323,24 @@ def build_director_tools(
         # below accept the raw UUID and resolve the ticker (a leak), so the
         # not-found shape is built here and permission errors collapse into it.
         if act == "status" and scope in ("company", "sector"):
+            from src.dalton.coverage.identity import CoverageIdentityUnavailableError
+
             try:
                 owner_ws = await _resolve_system_job_owner_ws(scope, target, user_id)
+            except CoverageIdentityUnavailableError as exc:
+                logger.warning(
+                    "[DALTON_DIRECTOR_TOOLS] system-jobs status resolver unavailable for %s: %s",
+                    raw_key,
+                    exc,
+                )
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": "coverage_identity_unavailable",
+                        "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+                    },
+                    ensure_ascii=False,
+                )
             except HTTPException:
                 owner_ws = None
             if owner_ws is None:
@@ -1934,7 +2355,23 @@ def build_director_tools(
                 )
             owner_ws_id, owner_id = owner_ws
             job_key = f"company:{owner_ws_id}" if scope == "company" else raw_key
-            res = await get_system_job_status(owner_id, job_key)
+            try:
+                with system_job_viewer_context(user_id):
+                    res = await get_system_job_status(owner_id, job_key)
+            except CoverageIdentityUnavailableError as exc:
+                logger.warning(
+                    "[DALTON_DIRECTOR_TOOLS] system-jobs status unavailable for %s: %s",
+                    job_key,
+                    exc,
+                )
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": "coverage_identity_unavailable",
+                        "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+                    },
+                    ensure_ascii=False,
+                )
             return json.dumps(res, ensure_ascii=False, default=str)
 
         try:
@@ -1982,7 +2419,19 @@ def build_director_tools(
                         actor_user_id=user_id,
                     )
                 else:
-                    res = await toggle_system_job(user_id, raw_key, act == "enable")
+                    task_owner = user_id
+                    if scope in ("company", "sector"):
+                        owner_ws = await _resolve_system_job_owner_ws(scope, target, user_id)
+                        if owner_ws is not None:
+                            task_owner = await _verify_tracking_workspace_owner(
+                                owner_ws[0], user_id
+                            )
+                    with system_job_viewer_context(user_id):
+                        res = await toggle_system_job(
+                            task_owner,
+                            raw_key,
+                            act == "enable",
+                        )
             else:
                 if scope == "data":
                     res = await run_system_job_now(
@@ -1991,7 +2440,15 @@ def build_director_tools(
                         actor_user_id=user_id,
                     )
                 else:
-                    res = await run_system_job_now(user_id, raw_key)
+                    task_owner = user_id
+                    if scope in ("company", "sector"):
+                        owner_ws = await _resolve_system_job_owner_ws(scope, target, user_id)
+                        if owner_ws is not None:
+                            task_owner = await _verify_tracking_workspace_owner(
+                                owner_ws[0], user_id
+                            )
+                    with system_job_viewer_context(user_id):
+                        res = await run_system_job_now(task_owner, raw_key)
             return json.dumps(res, ensure_ascii=False, default=str)
         except HTTPException as exc:
             # Round-2 F: toggle/run_now 深处的调度层所有者 403 统一换成
@@ -2017,6 +2474,22 @@ def build_director_tools(
                 ensure_ascii=False,
             )
         except Exception as exc:
+            from src.dalton.coverage.identity import CoverageIdentityUnavailableError
+
+            if isinstance(exc, CoverageIdentityUnavailableError):
+                logger.warning(
+                    "[DALTON_DIRECTOR_TOOLS] system-jobs command unavailable for %s: %s",
+                    raw_key,
+                    exc,
+                )
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": "coverage_identity_unavailable",
+                        "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+                    },
+                    ensure_ascii=False,
+                )
             return json.dumps(
                 {"ok": False, "error": "system_job_error", "message": str(exc)},
                 ensure_ascii=False,

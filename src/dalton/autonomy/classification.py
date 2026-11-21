@@ -138,6 +138,135 @@ def needs_workspace_tracking_lookup(
     return bool(DALTON_TRACKING_NAME_RE.match(cleaned_name))
 
 
+MANAGED_UNIT_AUTOMATION_KINDS: frozenset[str] = frozenset(
+    {
+        "company_watch",
+        "weekly_delta",
+        "price_move",
+        "earnings_tm3",
+        "earnings_t0",
+        "earnings_tp1",
+        "sector_watch",
+        "sector_delta",
+    }
+)
+
+MANAGED_UNIT_NAME_SQL_REGEX: str = (
+    r"^dalton-(?:sector-[a-z0-9-]+-(?:watch|delta)|[a-z0-9._-]+-(?:watch|delta|move-up|move-down|earn-[a-z0-9._-]+))$"
+)
+MANAGED_UNIT_NAME_RE = re.compile(MANAGED_UNIT_NAME_SQL_REGEX)
+
+
+def is_managed_unit_automation(
+    row: Mapping[str, Any] | None = None,
+    *,
+    name: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> bool:
+    """Return True if an automation is a unit-managed tracking or earnings task."""
+    eff_name = normalize_scope_text(name if name is not None else (row or {}).get("name"))
+    eff_meta = metadata if metadata is not None else ((row or {}).get("metadata") if row else None)
+    if normalize_dalton_kind(eff_meta) in MANAGED_UNIT_AUTOMATION_KINDS:
+        return True
+    if not eff_name or eff_name in EXCLUDED_RESEARCH_NAMES:
+        return False
+    return bool(MANAGED_UNIT_NAME_RE.match(eff_name))
+
+
+def is_managed_unit_automation_for_unit(
+    row: Mapping[str, Any] | None = None,
+    *,
+    name: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    unit: Mapping[str, Any] | None = None,
+) -> bool:
+    """Return True if an automation is a unit-managed task bound to ``unit``.
+
+    In addition to matching the managed name regex / ``dalton_kind``, ``metadata``
+    must identify the unit via matching ``unit_id`` or matching ``ticker`` so
+    user-created personal ``dalton-*`` tasks are never treated as unit-managed.
+    """
+    if not is_managed_unit_automation(row, name=name, metadata=metadata):
+        return False
+    if unit is None:
+        return True
+    eff_meta = metadata if metadata is not None else ((row or {}).get("metadata") if row else None)
+    if not isinstance(eff_meta, Mapping):
+        return False
+
+    meta_unit_id = normalize_scope_text(eff_meta.get("unit_id"))
+    unit_id = normalize_scope_text(unit.get("unit_id"))
+    if meta_unit_id:
+        return bool(unit_id and meta_unit_id == unit_id)
+
+    meta_ticker = normalize_scope_text(eff_meta.get("ticker"))
+    if not meta_ticker:
+        return False
+    unit_ticker = normalize_scope_text(unit.get("ticker"))
+    unit_ticker_key = normalize_scope_text(unit.get("ticker_key"))
+    if not unit_ticker and not unit_ticker_key:
+        return False
+    if unit_ticker and meta_ticker.upper() == unit_ticker.upper():
+        return True
+    from src.dalton.coverage.identity import normalize_ticker_key
+
+    meta_key = normalize_ticker_key(meta_ticker)
+    if not meta_key:
+        return False
+    effective_unit_key = unit_ticker_key or normalize_ticker_key(unit_ticker)
+    return bool(effective_unit_key and meta_key == effective_unit_key)
+
+
+def managed_unit_automation_sql_predicate(alias: str = "a") -> str:
+    """SQL predicate matching ``is_managed_unit_automation`` on an ``automations`` alias."""
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", alias):
+        raise ValueError(f"Invalid SQL alias: {alias!r}")
+    kinds_sql = ", ".join(f"'{k}'" for k in sorted(MANAGED_UNIT_AUTOMATION_KINDS))
+    excluded_sql = ", ".join(f"'{n}'" for n in sorted(EXCLUDED_RESEARCH_NAMES))
+    trimmed_name = sql_trim_scope_text(f"{alias}.name")
+    raw_kind_expr = (
+        f"CASE WHEN jsonb_typeof({alias}.metadata) = 'object' "
+        f"AND jsonb_typeof({alias}.metadata->'dalton_kind') = 'string' "
+        f"THEN {alias}.metadata->>'dalton_kind' ELSE '' END"
+    )
+    trimmed_lower_kind = f"LOWER({sql_trim_scope_text(raw_kind_expr)})"
+    return (
+        f"({trimmed_lower_kind} IN ({kinds_sql}) OR "
+        f"({trimmed_name} NOT IN ({excluded_sql}) AND {trimmed_name} ~ '{MANAGED_UNIT_NAME_SQL_REGEX}'))"
+    )
+
+
+def managed_unit_automation_for_unit_sql_predicate(
+    alias: str = "a",
+    unit_alias: str = "u",
+) -> str:
+    """SQL predicate matching ``is_managed_unit_automation_for_unit`` across aliases."""
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", unit_alias):
+        raise ValueError(f"Invalid SQL alias: {unit_alias!r}")
+    base_pred = managed_unit_automation_sql_predicate(alias)
+    raw_ticker = f"UPPER(TRIM({alias}.metadata->>'ticker'))"
+    norm_us_ticker = f"REGEXP_REPLACE({raw_ticker}, '^([A-Z0-9]+)-([A-Z])$', '\\1.\\2')"
+    norm_cn_ticker = f"REGEXP_REPLACE({raw_ticker}, '^([0-9]{{6}})\\.SH$', '\\1.SS')"
+    return (
+        f"({base_pred} AND jsonb_typeof({alias}.metadata) = 'object' AND ("
+        f"(NULLIF(TRIM(COALESCE({alias}.metadata->>'unit_id', '')), '') IS NOT NULL "
+        f"AND TRIM({alias}.metadata->>'unit_id') = {unit_alias}.unit_id::text) "
+        f"OR ("
+        f"NULLIF(TRIM(COALESCE({alias}.metadata->>'unit_id', '')), '') IS NULL "
+        f"AND NULLIF(TRIM(COALESCE({alias}.metadata->>'ticker', '')), '') IS NOT NULL "
+        f"AND ("
+        f"{raw_ticker} = UPPER(TRIM(COALESCE({unit_alias}.ticker, ''))) "
+        f"OR (NULLIF(TRIM(COALESCE({unit_alias}.ticker_key, '')), '') IS NOT NULL AND ("
+        f"{norm_us_ticker} = {unit_alias}.ticker_key "
+        f"OR {norm_cn_ticker} = {unit_alias}.ticker_key "
+        f"OR ({raw_ticker} ~ '^[0-9]{{1,5}}(\\.HK)?$' AND LPAD(REGEXP_REPLACE({raw_ticker}, '\\.HK$', ''), 5, '0') = {unit_alias}.ticker_key)"
+        f"))"
+        f")"
+        f")"
+        f"))"
+    )
+
+
 def _matches_active_coverage_unit(
     unit: Mapping[str, Any],
     *,
@@ -147,7 +276,10 @@ def _matches_active_coverage_unit(
     unit_ws = _canonical_uuid_or_none(unit.get("workspace_id"))
     if not unit_ws or unit_ws != workspace_uuid:
         return False
-    if normalize_scope_text(unit.get("owner_user_id")) != user_id:
+    unit_lead = normalize_scope_text(unit.get("lead_analyst_user_id")) or normalize_scope_text(
+        unit.get("owner_user_id")
+    )
+    if unit_lead != user_id:
         return False
     if normalize_scope_text(unit.get("kind")).lower() not in ("company", "sector"):
         return False
@@ -230,7 +362,9 @@ def build_research_tracking_sql_predicate(alias: str = "a") -> str:
         f"THEN {alias}.metadata->>'dalton_kind' ELSE '' END"
     )
     trimmed_lower_kind = f"LOWER({sql_trim_scope_text(raw_kind_expr)})"
-    trimmed_unit_owner = sql_trim_scope_text("u.owner_user_id")
+    trimmed_unit_owner = sql_trim_scope_text(
+        "COALESCE(NULLIF(BTRIM(u.lead_analyst_user_id), ''), u.owner_user_id)"
+    )
     trimmed_unit_kind = f"LOWER({sql_trim_scope_text('u.kind')})"
     trimmed_unit_status = f"LOWER({sql_trim_scope_text('u.status')})"
     trimmed_ws_owner = sql_trim_scope_text("w.user_id")

@@ -384,3 +384,301 @@ class TestMoveUnpinsTheThread:
 
         assert exc.value.field == "conversation_thread_id"
         mock_auto_db.update_automation.assert_not_called()
+
+
+class TestManagedUnitMetadataProtection:
+    @pytest.mark.asyncio
+    @patch(f"{_LIFECYCLE}.auto_db")
+    async def test_stripping_or_mutating_managed_unit_metadata_is_refused(
+        self, mock_auto_db, monkeypatch: pytest.MonkeyPatch
+    ):
+        from unittest.mock import create_autospec
+        from src.dalton import settings as dalton_settings
+        from src.dalton.coverage import units as cu_units
+        from src.server.database import pool as pool_mod
+        from src.server.services.automations.lifecycle import TargetRefused
+
+        monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+        managed_row = _row(
+            name="dalton-nvda-watch",
+            metadata={
+                "unit_id": "unit-nvda",
+                "ticker": "NVDA",
+                "dalton_kind": "company_watch",
+                "dalton_managed": True,
+            },
+        )
+        mock_auto_db.get_automation = AsyncMock(return_value=managed_row)
+        mock_auto_db.update_automation = AsyncMock(return_value=managed_row)
+
+        class _NoopTx:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_a):
+                return False
+
+        class _NoopConn:
+            def transaction(self):
+                return _NoopTx()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_a):
+                return False
+
+        monkeypatch.setattr(
+            pool_mod, "get_db_connection", create_autospec(pool_mod.get_db_connection, return_value=_NoopConn())
+        )
+        monkeypatch.setattr(
+            cu_units,
+            "lock_and_assert_managed_unit_write_allowed",
+            create_autospec(
+                cu_units.lock_and_assert_managed_unit_write_allowed,
+                return_value={"unit_id": "unit-nvda", "lead_analyst_user_id": OWNER},
+            ),
+        )
+
+        # Stripping unit_id via generic PATCH refused with 403 TargetRefused(field="metadata")
+        with pytest.raises(TargetRefused) as exc_strip:
+            await update_automation(
+                AUTOMATION_ID,
+                OWNER,
+                {
+                    "metadata": {
+                        "ticker": "NVDA",
+                        "dalton_kind": "company_watch",
+                        "dalton_managed": True,
+                    }
+                },
+            )
+        assert exc_strip.value.status_code == 403
+        assert exc_strip.value.field == "metadata"
+        mock_auto_db.update_automation.assert_not_called()
+
+        # Mutating ticker refused
+        with pytest.raises(TargetRefused) as exc_mut:
+            await update_automation(
+                AUTOMATION_ID,
+                OWNER,
+                {
+                    "metadata": {
+                        "unit_id": "unit-nvda",
+                        "ticker": "AMD",
+                        "dalton_kind": "company_watch",
+                        "dalton_managed": True,
+                    }
+                },
+            )
+        assert exc_mut.value.status_code == 403
+        mock_auto_db.update_automation.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch(f"{_LIFECYCLE}.auto_db")
+    async def test_ordinary_task_metadata_update_allowed(
+        self, mock_auto_db, monkeypatch: pytest.MonkeyPatch
+    ):
+        from src.dalton import settings as dalton_settings
+
+        monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+        ordinary = _row(name="Daily morning brief", metadata={"note": "v1"})
+        mock_auto_db.get_automation = AsyncMock(return_value=ordinary)
+        mock_auto_db.update_automation = AsyncMock(
+            return_value={**ordinary, "metadata": {"note": "v2"}}
+        )
+
+        updated = await update_automation(
+            AUTOMATION_ID, OWNER, {"metadata": {"note": "v2"}}
+        )
+        assert updated["metadata"] == {"note": "v2"}
+        mock_auto_db.update_automation.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch(f"{_LIFECYCLE}.auto_db")
+    async def test_resume_automation_refuses_replaced_by_tracker(
+        self, mock_auto_db
+    ):
+        """Round 6 Item 2: generic resume endpoint refuses replaced_by_tracker delta automations."""
+        from src.server.services.automations.lifecycle import resume_automation
+
+        replaced = _row(
+            status="paused",
+            next_run_at=None,
+            metadata={"dalton_kind": "company_watch", "replaced_by_tracker": True},
+        )
+        mock_auto_db.get_automation = AsyncMock(return_value=replaced)
+        mock_auto_db.update_automation = AsyncMock()
+
+        with pytest.raises(AutomationRefusal) as exc:
+            await resume_automation(AUTOMATION_ID, OWNER)
+        assert "多空跟踪替代" in str(exc.value)
+        mock_auto_db.update_automation.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{_LIFECYCLE}.auto_db")
+    async def test_ordinary_row_protects_replaced_by_tracker_unconditionally(
+        self, mock_auto_db, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Round 6 Item 3: stripping/mutating replaced_by_tracker is refused even on non-unit rows."""
+        from unittest.mock import create_autospec
+        from src.dalton import settings as dalton_settings
+        from src.dalton.database import coverage_units as cu_db
+        from src.server.services.automations.lifecycle import TargetRefused
+
+        monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+        monkeypatch.setattr(
+            cu_db,
+            "get_active_unit_by_workspace",
+            create_autospec(cu_db.get_active_unit_by_workspace, return_value=None),
+        )
+        ordinary_replaced = _row(
+            name="custom-delta-name",
+            metadata={"replaced_by_tracker": True, "note": "v1"},
+        )
+        mock_auto_db.get_automation = AsyncMock(return_value=ordinary_replaced)
+        mock_auto_db.update_automation = AsyncMock()
+
+        with pytest.raises(TargetRefused) as exc_strip:
+            await update_automation(
+                AUTOMATION_ID, OWNER, {"metadata": {"note": "v2"}}
+            )
+        assert exc_strip.value.status_code == 403
+        assert exc_strip.value.field == "metadata"
+
+        with pytest.raises(TargetRefused) as exc_flip:
+            await update_automation(
+                AUTOMATION_ID,
+                OWNER,
+                {"metadata": {"replaced_by_tracker": False, "note": "v2"}},
+            )
+        assert exc_flip.value.status_code == 403
+        mock_auto_db.update_automation.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{_LIFECYCLE}.auto_db")
+    async def test_adding_dalton_kind_weekly_delta_derives_research_tracking_scope(
+        self, mock_auto_db, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Round 7 Item 5: generic update adding dalton_kind='weekly_delta' derives scope='research_tracking'."""
+        from unittest.mock import create_autospec
+        from src.dalton import settings as dalton_settings
+        from src.dalton.database import coverage_units as cu_db
+        from src.server.database import pool as pool_mod
+
+        monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: True)
+        monkeypatch.setattr(dalton_settings, "is_dalton_supabase_auth_enabled", lambda: False)
+        monkeypatch.setattr(
+            cu_db,
+            "get_active_unit_by_workspace",
+            create_autospec(cu_db.get_active_unit_by_workspace, return_value=None),
+        )
+
+        class _NoopTx:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_a):
+                return False
+
+        class _NoopConn:
+            def transaction(self):
+                return _NoopTx()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_a):
+                return False
+
+        monkeypatch.setattr(
+            pool_mod,
+            "get_db_connection",
+            create_autospec(pool_mod.get_db_connection, return_value=_NoopConn()),
+        )
+
+        ordinary = _row(name="Daily morning brief", scope="personal", metadata={"note": "v1"})
+        mock_auto_db.get_automation = AsyncMock(return_value=ordinary)
+        mock_auto_db.update_automation = AsyncMock(
+            side_effect=lambda aid, uid, conn=None, **kw: {**ordinary, **kw}
+        )
+
+        updated = await update_automation(
+            AUTOMATION_ID,
+            OWNER,
+            {"metadata": {"note": "v1", "dalton_kind": "weekly_delta"}},
+        )
+        assert updated["scope"] == "research_tracking"
+        assert mock_auto_db.update_automation.await_args.kwargs["scope"] == "research_tracking"
+
+    @pytest.mark.asyncio
+    @patch(f"{_LIFECYCLE}.get_workspace")
+    @patch(f"{_LIFECYCLE}.auto_db")
+    async def test_replaced_by_tracker_null_value_protected_and_generic_add_forbidden(
+        self, mock_auto_db, mock_get_workspace, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Round 7 Item 7: key presence (even with None) is protected on update, and adding
+        replaced_by_tracker via generic update or create is refused with 403 TargetRefused."""
+        from src.dalton import settings as dalton_settings
+        from src.server.models.automation import AutomationCreate
+        from src.server.services.automations.lifecycle import TargetRefused, create_automation
+
+        monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", lambda: False)
+        mock_get_workspace.return_value = {"workspace_id": WORKSPACE_ID, "user_id": OWNER}
+
+        # 1. Existing row with replaced_by_tracker=None cannot drop or mutate the key
+        null_marked = _row(name="custom-delta", metadata={"replaced_by_tracker": None, "note": "v1"})
+        mock_auto_db.get_automation = AsyncMock(return_value=null_marked)
+        mock_auto_db.update_automation = AsyncMock()
+
+        with pytest.raises(TargetRefused) as exc_drop_null:
+            await update_automation(AUTOMATION_ID, OWNER, {"metadata": {"note": "v2"}})
+        assert exc_drop_null.value.status_code == 403
+        assert exc_drop_null.value.field == "metadata"
+
+        with pytest.raises(TargetRefused) as exc_set_val:
+            await update_automation(
+                AUTOMATION_ID,
+                OWNER,
+                {"metadata": {"replaced_by_tracker": "tracker-1", "note": "v2"}},
+            )
+        assert exc_set_val.value.status_code == 403
+        mock_auto_db.update_automation.assert_not_awaited()
+
+        # 2. Ordinary row without replaced_by_tracker cannot add it via generic update
+        unmarked = _row(name="custom-delta", metadata={"note": "v1"})
+        mock_auto_db.get_automation = AsyncMock(return_value=unmarked)
+
+        with pytest.raises(TargetRefused) as exc_add:
+            await update_automation(
+                AUTOMATION_ID,
+                OWNER,
+                {"metadata": {"note": "v1", "replaced_by_tracker": "tracker-1"}},
+            )
+        assert exc_add.value.status_code == 403
+        with pytest.raises(TargetRefused) as exc_add_null:
+            await update_automation(
+                AUTOMATION_ID,
+                OWNER,
+                {"metadata": {"note": "v1", "replaced_by_tracker": None}},
+            )
+        assert exc_add_null.value.status_code == 403
+        mock_auto_db.update_automation.assert_not_awaited()
+
+        # 3. Generic create_automation refuses replaced_by_tracker in metadata
+        mock_auto_db.create_automation = AsyncMock()
+        with pytest.raises(TargetRefused) as exc_create:
+            await create_automation(
+                OWNER,
+                AutomationCreate(
+                    name="custom-delta",
+                    trigger_type="cron",
+                    cron_expression="0 9 * * *",
+                    timezone="UTC",
+                    instruction="run",
+                    workspace_id=WORKSPACE_ID,
+                    metadata={"replaced_by_tracker": "tracker-1"},
+                ),
+            )
+        assert exc_create.value.status_code == 403
+        mock_auto_db.create_automation.assert_not_awaited()

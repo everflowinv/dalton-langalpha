@@ -70,6 +70,12 @@ _NON_TERMINAL_CARD_CODES = frozenset(
         "dalton_disabled",
         "report_recovered",
         "not_started",
+        "unit_unbound_or_archived",
+        "unit_rebound",
+        "unit_binding_changed",
+        "not_unit_lead_analyst",
+        "unit_managed_dm_only",
+        "workspace_unreadable",
     }
 )
 # Native item statuses that are still open. They are not a recovered card and
@@ -220,7 +226,9 @@ SELECT automation_execution_id::text AS automation_execution_id,
        automation_id::text AS automation_id,
        status,
        conversation_thread_id::text AS conversation_thread_id,
-       conversation_response_id::text AS conversation_response_id
+       conversation_response_id::text AS conversation_response_id,
+       coverage_unit_id::text AS coverage_unit_id,
+       coverage_unit_version
 FROM automation_executions
 WHERE automation_execution_id = %s::uuid
   AND automation_id = %s::uuid
@@ -232,7 +240,9 @@ SELECT automation_execution_id::text AS automation_execution_id,
        automation_id::text AS automation_id,
        status,
        conversation_thread_id::text AS conversation_thread_id,
-       conversation_response_id::text AS conversation_response_id
+       conversation_response_id::text AS conversation_response_id,
+       coverage_unit_id::text AS coverage_unit_id,
+       coverage_unit_version
 FROM automation_executions
 WHERE automation_execution_id = %s::uuid
   AND automation_id = %s::uuid
@@ -838,6 +848,33 @@ async def submit_automation_report(
                             "held_delivery_configured",
                             "This report profile cannot also use held delivery methods.",
                         )
+                    exec_unit_id = str(row.get("coverage_unit_id") or "").strip()
+                    exec_unit_ver = row.get("coverage_unit_version")
+                    gate_include_chats: bool | None = None
+                    from src.dalton.settings import is_coverage_units_enabled
+
+                    if is_coverage_units_enabled():
+                        from src.dalton.notify.dispatch import (
+                            _normalize_coverage_unit_version,
+                            _resolve_unit_managed_notify_gate,
+                        )
+
+                        gate_ok, gate_reason, _, gate_include_chats = (
+                            await _resolve_unit_managed_notify_gate(
+                                str(row["user_id"]),
+                                str(row.get("workspace_id") or ""),
+                                _automation_view(row),
+                                stamped_unit_id=exec_unit_id,
+                                stamped_unit_version=_normalize_coverage_unit_version(exec_unit_ver),
+                                conn=owned,
+                            )
+                        )
+                        if not gate_ok:
+                            return _error(
+                                action,
+                                gate_reason or "not_unit_lead_analyst",
+                                "Coverage unit handoff or binding state no longer permits sending this report.",
+                            )
                     targets, auth_code = await _authorize_all_targets(
                         cur,
                         owned,
@@ -845,6 +882,7 @@ async def submit_automation_report(
                         automation=_automation_view(row),
                         profile=parsed,
                         content_kind=str(prepared["content_kind"]),
+                        include_chat_targets=gate_include_chats,
                         resolve_enabled_fn=resolve_enabled_fn,
                         resolve_overrides_fn=resolve_overrides_fn,
                         resolve_targets_fn=resolve_targets_fn,
@@ -870,6 +908,8 @@ async def submit_automation_report(
                         owner_user_id=str(row["user_id"]),
                         automation_id=str(row["automation_id"]),
                         targets=targets,
+                        coverage_unit_id=exec_unit_id or None,
+                        coverage_unit_version=exec_unit_ver,
                     )
                     await _insert_rows(
                         cur,
@@ -1281,6 +1321,8 @@ def _build_payload(
     owner_user_id: str,
     automation_id: str,
     targets: Sequence[str],
+    coverage_unit_id: str | None = None,
+    coverage_unit_version: Any = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "source": REPORT_SOURCE,
@@ -1295,6 +1337,15 @@ def _build_payload(
         "target_snapshot": list(targets),
         "expected_item_count": prepared["expected_item_count"],
     }
+    clean_unit_id = str(coverage_unit_id or "").strip()
+    if clean_unit_id:
+        payload["coverage_unit_id"] = clean_unit_id
+    if coverage_unit_version is not None:
+        payload["coverage_unit_version"] = (
+            coverage_unit_version.isoformat()
+            if hasattr(coverage_unit_version, "isoformat")
+            else str(coverage_unit_version)
+        )
     if prepared["content_kind"] == "cards":
         payload["cards"] = prepared["cards"]
         payload["failure_target_snapshot"] = list(profile["failure_targets"])
@@ -1368,6 +1419,8 @@ async def lock_report_execution(
         "name": automation.get("name"),
         "metadata": automation.get("metadata"),
         "delivery_config": automation.get("delivery_config"),
+        "coverage_unit_id": execution.get("coverage_unit_id"),
+        "coverage_unit_version": execution.get("coverage_unit_version"),
     }
 
 
@@ -1485,6 +1538,7 @@ async def _authorize_all_targets(
     automation: Mapping[str, Any],
     profile: Mapping[str, Any],
     content_kind: str,
+    include_chat_targets: bool | None = None,
     resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] | None,
     resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] | None,
     resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] | None,
@@ -1502,6 +1556,8 @@ async def _authorize_all_targets(
     from src.dalton.database import channel_gateway as channel_gateway_db
 
     kwargs: dict[str, Any] = {}
+    if include_chat_targets is not None:
+        kwargs["include_chat_targets"] = include_chat_targets
     if resolve_enabled_fn is not None:
         kwargs["resolve_enabled_fn"] = resolve_enabled_fn
     if resolve_overrides_fn is not None:
@@ -1534,6 +1590,8 @@ async def _authorize_all_targets(
                 return None, "profile_invalid"
             platform, kind, ident = parsed
             if kind == "group":
+                if include_chat_targets is False:
+                    return None, "unit_managed_dm_only"
                 ok_group, _group_err, _name = await _verify_group_target_deliverable(
                     cur,
                     user_id=owner_user_id,
@@ -2607,6 +2665,7 @@ async def _authorize_failure_alert_row(
         """
         SELECT automation_id::text AS automation_id,
                user_id,
+               workspace_id::text AS workspace_id,
                name,
                metadata
         FROM automations
@@ -2628,6 +2687,51 @@ async def _authorize_failure_alert_row(
             message="The task owner no longer matches the saved failure notice.",
         )
     automation = _automation_view(automation_row)
+    gate_include_chats: bool | None = None
+    from src.dalton.settings import is_coverage_units_enabled
+
+    if is_coverage_units_enabled():
+        from src.dalton.notify.dispatch import (
+            _normalize_coverage_unit_version,
+            _resolve_unit_managed_notify_gate,
+        )
+
+        stamped_uid = str(
+            payload.get("coverage_unit_id") or parent.get("coverage_unit_id") or ""
+        ).strip()
+        stamped_ver = payload.get("coverage_unit_version")
+        if stamped_ver is None:
+            stamped_ver = parent.get("coverage_unit_version")
+        if not stamped_uid:
+            await cur.execute(
+                """
+                SELECT coverage_unit_id::text AS coverage_unit_id,
+                       coverage_unit_version
+                FROM automation_executions
+                WHERE automation_execution_id = %s::uuid
+                """,
+                (row_execution,),
+            )
+            exec_row = await cur.fetchone()
+            if isinstance(exec_row, Mapping):
+                stamped_uid = str(exec_row.get("coverage_unit_id") or "").strip()
+                if stamped_ver is None:
+                    stamped_ver = exec_row.get("coverage_unit_version")
+        gate_ok, gate_reason, _, gate_include_chats = await _resolve_unit_managed_notify_gate(
+            owner_user_id,
+            str(automation_row.get("workspace_id") or ""),
+            automation,
+            stamped_unit_id=stamped_uid,
+            stamped_unit_version=_normalize_coverage_unit_version(stamped_ver),
+            target=target,
+            conn=conn,
+        )
+        if not gate_ok:
+            return _deny_report(
+                status="skipped",
+                code=gate_reason or "not_unit_lead_analyst",
+                message="The coverage unit handoff or target policy no longer permits delivering this failure notice.",
+            )
     parsed, err = parse_report_profile(automation.get("metadata"))
     if err or parsed is None or str(parsed.get("profile") or "") != str(payload.get("profile") or ""):
         return _deny_report(
@@ -2672,17 +2776,20 @@ async def _authorize_failure_alert_row(
             message="Frozen failure recipient does not match the saved target.",
         )
     async with _use_held_connection(conn):
+        elig_kwargs = _resolver_kwargs(
+            resolve_enabled_fn=resolve_enabled_fn,
+            resolve_overrides_fn=resolve_overrides_fn,
+            resolve_targets_fn=resolve_targets_fn,
+            resolve_routes_fn=resolve_routes_fn,
+            is_admin_fn=is_admin_fn,
+        )
+        if gate_include_chats is not None:
+            elig_kwargs["include_chat_targets"] = gate_include_chats
         allowed, reason, _effective = await evaluate_user_notify_eligibility(
             owner_user_id,
             automation,
             target=target,
-            **_resolver_kwargs(
-                resolve_enabled_fn=resolve_enabled_fn,
-                resolve_overrides_fn=resolve_overrides_fn,
-                resolve_targets_fn=resolve_targets_fn,
-                resolve_routes_fn=resolve_routes_fn,
-                is_admin_fn=is_admin_fn,
-            ),
+            **elig_kwargs,
         )
     if not allowed:
         return _deny_report(
@@ -2889,6 +2996,7 @@ async def authorize_saved_report_target(
         """
         SELECT automation_id::text AS automation_id,
                user_id,
+               workspace_id::text AS workspace_id,
                name,
                metadata
         FROM automations
@@ -2910,6 +3018,47 @@ async def authorize_saved_report_target(
             message="The task owner no longer matches the saved report.",
         )
     automation = _automation_view(automation_row)
+    gate_include_chats: bool | None = None
+    from src.dalton.settings import is_coverage_units_enabled
+
+    if is_coverage_units_enabled():
+        from src.dalton.notify.dispatch import (
+            _normalize_coverage_unit_version,
+            _resolve_unit_managed_notify_gate,
+        )
+
+        stamped_uid = str(payload.get("coverage_unit_id") or "").strip()
+        stamped_ver = payload.get("coverage_unit_version")
+        if not stamped_uid:
+            await cur.execute(
+                """
+                SELECT coverage_unit_id::text AS coverage_unit_id,
+                       coverage_unit_version
+                FROM automation_executions
+                WHERE automation_execution_id = %s::uuid
+                """,
+                (row_execution,),
+            )
+            exec_row = await cur.fetchone()
+            if isinstance(exec_row, Mapping):
+                stamped_uid = str(exec_row.get("coverage_unit_id") or "").strip()
+                if stamped_ver is None:
+                    stamped_ver = exec_row.get("coverage_unit_version")
+        gate_ok, gate_reason, _, gate_include_chats = await _resolve_unit_managed_notify_gate(
+            owner_user_id,
+            str(automation_row.get("workspace_id") or ""),
+            automation,
+            stamped_unit_id=stamped_uid,
+            stamped_unit_version=_normalize_coverage_unit_version(stamped_ver),
+            target=cleaned_target,
+            conn=conn,
+        )
+        if not gate_ok:
+            return _deny_report(
+                status="skipped",
+                code=gate_reason or "not_unit_lead_analyst",
+                message="The coverage unit handoff or target policy no longer permits delivering this report.",
+            )
     configured, config_code = saved_report_target_still_configured(
         automation, payload, cleaned_target
     )
@@ -2947,6 +3096,8 @@ async def authorize_saved_report_target(
             message="Frozen report recipient does not match the saved target.",
         )
     kwargs: dict[str, Any] = {}
+    if gate_include_chats is not None:
+        kwargs["include_chat_targets"] = gate_include_chats
     if resolve_enabled_fn is not None:
         kwargs["resolve_enabled_fn"] = resolve_enabled_fn
     if resolve_overrides_fn is not None:

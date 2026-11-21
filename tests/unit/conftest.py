@@ -128,6 +128,21 @@ def _no_claude_plan_rows(monkeypatch):
     monkeypatch.setattr(claude_code_plan, "get_plans", _no_rows)
 
 
+@pytest.fixture(autouse=True)
+def _coverage_units_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep ``coverage_units.enabled`` off by default in unit tests.
+
+    ``src/dalton/dalton.yaml`` enables ``coverage_units`` (``true``) in
+    production, which causes publish, tracking, knowledge, and system-job paths
+    to query ``dalton_coverage_units`` through the Postgres pool. Existing
+    pool-less unit tests were written assuming the switch starts off; tests
+    that exercise the enabled registry opt in explicitly via
+    ``DALTON_COVERAGE_UNITS_ENABLED=true`` (or patching
+    ``is_coverage_units_enabled``).
+    """
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "false")
+
+
 @pytest.fixture(scope="session")
 def shipped_skill_md():
     """Locate a shipped skill's SKILL.md on disk, by name.

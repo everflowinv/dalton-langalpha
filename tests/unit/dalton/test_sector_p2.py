@@ -2864,6 +2864,11 @@ def _board_cursor(
 
     def _fetchall() -> list[dict[str, Any]]:
         sql = last["sql"]
+        ws_by_id = {
+            str(w.get("workspace_id") or ""): w
+            for w in ws_rows
+            if w.get("workspace_id") and w.get("status") != "deleted"
+        }
         if "FROM workspaces" in sql:
             return ws_rows
         if "dalton_knowledge_versions" in sql:
@@ -2880,28 +2885,49 @@ def _board_cursor(
             return [r for r in (member_rows or []) if str(r.get("sector_unit_id")) in ids]
         if "FROM dalton_coverage_units" in sql:
             p = list(last["params"] or [])
-            rows = list(unit_rows or [])
+            rows = []
+            for r in unit_rows or []:
+                item = dict(r)
+                ws_id = str(item.get("workspace_id") or "")
+                if ws_id and "workspace_owner_id" not in item:
+                    ws_match = ws_by_id.get(ws_id)
+                    item["workspace_owner_id"] = (
+                        ws_match.get("user_id") if ws_match is not None else item.get("owner_user_id")
+                    )
+                if "lead_analyst_user_id" not in item:
+                    item["lead_analyst_user_id"] = item.get("owner_user_id")
+                rows.append(item)
             if "unit_id = ANY" in sql:
                 # 成员公司单元反查（任意状态）
                 ids = {str(u) for u in (p[0] if p else [])}
                 return [r for r in rows if str(r.get("unit_id")) in ids]
             if "workspace_id = ANY" in sql:
-                # 同事可见工作区上的单元，排除本人
+                # 同事可见工作区上的单元（lead 也可能落在同事工作区上）
                 ws_ids = {str(u) for u in (p[0] if p else [])}
-                rows = [r for r in rows if str(r.get("workspace_id")) in ws_ids]
-                if len(p) >= 3 and p[2] is not None:
-                    rows = [r for r in rows if str(r.get("owner_user_id")) != str(p[2])]
-                return rows
-            # 本人（或 user_id=None 时全部）active 单元清单
+                return [r for r in rows if str(r.get("workspace_id")) in ws_ids]
+            # 本人（lead 或 owner）或 user_id=None 时全部 active 单元清单
             if len(p) >= 2 and p[1] is not None:
-                owner = str(p[1])
-                rows = [r for r in rows if str(r.get("owner_user_id")) == owner]
+                uid = str(p[1])
+                rows = [
+                    r
+                    for r in rows
+                    if str(r.get("lead_analyst_user_id") or r.get("owner_user_id") or "") == uid
+                    or str(r.get("owner_user_id") or "") == uid
+                ]
             return rows
         return []
 
     cur.fetchall.side_effect = _fetchall
     cur.fetchone.return_value = {"cnt": 0}
     return cur, executed
+
+
+class _NullTx:
+    async def __aenter__(self) -> "_NullTx":
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        return None
 
 
 class _Lease:
@@ -2917,8 +2943,10 @@ class _Lease:
             raise RuntimeError("connection already returned to the pool")
         return self._cur
 
-    def transaction(self, *args: Any) -> "_Lease":
-        return self
+    def transaction(self, *args: Any) -> _NullTx:
+        if self._returned:
+            raise RuntimeError("connection already returned to the pool")
+        return _NullTx()
 
     async def __aenter__(self) -> "_Lease":
         return self
@@ -2927,12 +2955,15 @@ class _Lease:
         self._returned = True
 
 
-def _install_board(monkeypatch: pytest.MonkeyPatch, cur: Any) -> None:
+def _install_board(
+    monkeypatch: pytest.MonkeyPatch, cur: Any, *, internal: bool = True
+) -> None:
     """每次 get_db_connection() 租出一条新连接（同一 cursor 数据面）。
 
     P4 起 units 视图的枚举在 units_view 模块里执行（board 委托），连接
     替身需要同时挂在两个命名空间上，断言不变。
     """
+    import src.dalton.access_tiers as tiers_mod
     import src.dalton.autonomy.board as board_mod
     import src.dalton.autonomy.units_view as units_view_mod
 
@@ -2940,20 +2971,28 @@ def _install_board(monkeypatch: pytest.MonkeyPatch, cur: Any) -> None:
     monkeypatch.setattr(board_mod, "get_user_coverage", lambda uid: {})
     monkeypatch.setattr(board_mod, "get_db_connection", lambda: _Lease(cur))
     monkeypatch.setattr(units_view_mod, "get_db_connection", lambda: _Lease(cur))
+    monkeypatch.setattr(
+        board_mod,
+        "is_internal_or_admin",
+        create_autospec(tiers_mod.is_internal_or_admin, return_value=internal),
+    )
 
 
 _U1 = USER
 
 
-def _ws_row(ws_id: str, name: str) -> dict[str, Any]:
-    return {
+def _ws_row(ws_id: str, name: str, **overrides: Any) -> dict[str, Any]:
+    row = {
         "workspace_id": ws_id,
         "user_id": _U1,
         "name": name,
         "description": "",
         "status": "active",
+        "config": {},
         "updated_at": None,
     }
+    row.update(overrides)
+    return row
 
 
 @pytest.mark.asyncio
@@ -3086,7 +3125,7 @@ async def test_board_units_colleague_unit_readable_not_delegatable(
     monkeypatch.setattr(board_mod, "is_coverage_units_enabled", lambda: True)
     colleague_ws = "77777777-7777-7777-7777-777777777777"
 
-    async def _fake_team(uid: str) -> list[dict[str, Any]]:
+    async def _fake_team(uid: str, *, conn: Any = None) -> list[dict[str, Any]]:
         return [
             {
                 "user_id": "user-2",
@@ -3138,7 +3177,7 @@ async def test_board_member_workspace_id_respects_visibility(
     colleague_sector_ws = "77777777-7777-7777-7777-777777777777"
     hidden_company_ws = "88888888-8888-8888-8888-888888888888"  # 属 user-3，未共享
 
-    async def _fake_team(uid: str) -> list[dict[str, Any]]:
+    async def _fake_team(uid: str, *, conn: Any = None) -> list[dict[str, Any]]:
         # 只看到 user-2 的行业工作区；user-3 的公司工作区对查看者隐藏
         return [
             {
@@ -3258,6 +3297,179 @@ async def test_board_flag_off_has_no_units_and_no_new_queries(
     # 一次都没查新表
     assert not any("dalton_sector_members" in s for s in executed)
     assert not any("dalton_coverage_units" in s for s in executed)
+
+
+@pytest.mark.asyncio
+async def test_board_flag_off_includes_historical_duplicate_workspaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 6 Item 6: with coverage_units disabled, board does not filter historical duplicate workspaces."""
+    import src.dalton.autonomy.board as board_mod
+
+    monkeypatch.setattr(board_mod, "is_coverage_units_enabled", lambda: False)
+    dup_ws = "d0d0d0d0-d0d0-4d0d-8d0d-d0d0d0d0d002"
+    cur, _ = _board_cursor(
+        [
+            {
+                **_ws_row(dup_ws, "NVDA Historical"),
+                "config": {"coverage_unit_historical_duplicate": True},
+            }
+        ],
+        [
+            {
+                "workspace_id": dup_ws,
+                "doc_key": "company",
+                "version_no": 1,
+                "content": {"ticker": "NVDA"},
+                "created_at": None,
+            }
+        ],
+    )
+    _install_board(monkeypatch, cur)
+
+    board = await board_mod.build_coverage_board(user_id=_U1)
+    assert "units" not in board
+    assert [c["ticker"] for c in board["companies"]] == ["NVDA"]
+    assert board["companies"][0]["workspace_id"] == dup_ws
+
+
+@pytest.mark.asyncio
+async def test_board_read_isolation_for_unit_owner_on_hidden_colleague_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C8: unit.owner_user_id == viewer without workspace read access does not grant readable or leak workspace_id."""
+    import src.dalton.autonomy.board as board_mod
+    import src.dalton.sharing as sharing_mod
+
+    monkeypatch.setattr(board_mod, "is_coverage_units_enabled", lambda: True)
+    hidden_ws = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    monkeypatch.setattr(
+        sharing_mod,
+        "list_team_workspaces",
+        create_autospec(sharing_mod.list_team_workspaces, return_value=[]),
+    )
+    unit_rows = [
+        {
+            "unit_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            "kind": "company",
+            "owner_user_id": _U1,
+            "lead_analyst_user_id": _U1,
+            "slug": "nvda",
+            "display_name": "NVIDIA",
+            "workspace_id": hidden_ws,
+            "workspace_owner_id": "user-2",
+            "ticker": "NVDA",
+            "status": "active",
+        }
+    ]
+    cur, _ = _board_cursor([], [], None, unit_rows, [])
+    _install_board(monkeypatch, cur)
+
+    board = await board_mod.build_coverage_board(user_id=_U1)
+    assert len(board["units"]) == 1
+    u = board["units"][0]
+    assert u["readable"] is False
+    assert u["delegatable"] is False
+    assert u["workspace_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_board_filters_historical_duplicate_workspaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When coverage_units is enabled, workspaces flagged with dalton_historical_duplicate_of are excluded from board company list."""
+    import src.dalton.autonomy.board as board_mod
+
+    monkeypatch.setattr(board_mod, "is_coverage_units_enabled", lambda: True)
+    cur, _ = _board_cursor(
+        [
+            _ws_row(WS_COMPANY, "NVDA Canonical"),
+            _ws_row(
+                WS_SECTOR,
+                "NVDA Historical Dup",
+                config={"dalton_historical_duplicate_of": WS_COMPANY},
+            ),
+        ],
+        [
+            {
+                "workspace_id": WS_COMPANY,
+                "doc_key": "company",
+                "version_no": 1,
+                "content": {"ticker": "NVDA"},
+                "created_at": None,
+            },
+            {
+                "workspace_id": WS_SECTOR,
+                "doc_key": "company",
+                "version_no": 1,
+                "content": {"ticker": "NVDA"},
+                "created_at": None,
+            },
+        ],
+    )
+    _install_board(monkeypatch, cur)
+
+    board = await board_mod.build_coverage_board(user_id=_U1)
+    assert [c["workspace_id"] for c in board["companies"]] == [WS_COMPANY]
+
+
+@pytest.mark.asyncio
+async def test_board_redacts_unreadable_sector_members_and_omits_units_for_external(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unreadable sector never exposes doc-derived members; external callers receive no units key."""
+    import src.dalton.autonomy.board as board_mod
+    import src.dalton.sharing as sharing_mod
+
+    monkeypatch.setattr(board_mod, "is_coverage_units_enabled", lambda: True)
+    hidden_sector_ws = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    monkeypatch.setattr(
+        sharing_mod,
+        "list_team_workspaces",
+        create_autospec(sharing_mod.list_team_workspaces, return_value=[]),
+    )
+    unit_rows = [
+        {
+            "unit_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            "kind": "sector",
+            "owner_user_id": _U1,
+            "lead_analyst_user_id": _U1,
+            "slug": "semi",
+            "display_name": "Semis",
+            "workspace_id": hidden_sector_ws,
+            "workspace_owner_id": "user-2",
+            "ticker": None,
+            "status": "active",
+        }
+    ]
+    member_rows = [
+        {
+            "sector_unit_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            "member_id": "M1",
+            "member_name": "Secret Member",
+            "ticker": "SEC",
+            "company_unit_id": None,
+            "workspace_created": False,
+            "scope": "secret scope text",
+            "reason": "secret inclusion reason",
+            "valid_until": "2027-01-01",
+            "position": 0,
+            "synced_version_no": 1,
+        }
+    ]
+    cur, _ = _board_cursor([], [], None, unit_rows, member_rows)
+    _install_board(monkeypatch, cur, internal=True)
+
+    board_internal = await board_mod.build_coverage_board(user_id=_U1)
+    assert len(board_internal["units"]) == 1
+    assert board_internal["units"][0]["readable"] is False
+    assert board_internal["units"][0]["workspace_id"] is None
+    assert board_internal["units"][0]["members"] == []
+
+    cur2, _ = _board_cursor([], [], None, unit_rows, member_rows)
+    _install_board(monkeypatch, cur2, internal=False)
+    board_external = await board_mod.build_coverage_board(user_id="u-external")
+    assert "units" not in board_external
 
 
 @pytest.mark.asyncio

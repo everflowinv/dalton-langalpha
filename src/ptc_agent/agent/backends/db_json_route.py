@@ -518,6 +518,8 @@ class DbJsonRoute:
         """Answer every failure of a save that saved nothing as a refusal."""
         try:
             yield
+        except ReadOnlyStoreError:
+            raise
         except UserDataValidationError as exc:
             # A refusal over a stale Read drops it, so the next Read pulls
             # fresh rows and the next Write of a deleted file makes it anew;
@@ -602,6 +604,10 @@ class DbJsonRoute:
                 # the plan and the writes go over the rows the version check
                 # read, under the lock taken before reading them.
                 async with self._transaction() as conn:
+                    # DALTON-HOOK(coverage-units): prelock unit FOR SHARE before user automation lock
+                    prelock = getattr(file, "prelock_units", None)
+                    if prelock is not None:
+                        await prelock(user_id, conn, parsed=parsed)
                     await file.lock(user_id, conn)
                     rows = await file.fetch(user_id, conn)
                     rendered = file.render(rows)
@@ -778,7 +784,7 @@ class DbJsonRoute:
             report = (
                 await self._save(filename, new_content, base.version, served=base.content, may_delete=True)
             ).report
-        except UserDataValidationError as exc:
+        except (UserDataValidationError, ReadOnlyStoreError) as exc:
             return {"success": False, "error": str(exc)}
 
         if report:

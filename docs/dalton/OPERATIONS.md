@@ -345,3 +345,9 @@ python3 scripts/dalton/alphaengine_usage_report.py
 | 语音转写或大文件上传报存储未配置 | 起 Compose 时漏了 `--profile storage`（或 `--profile infra`），或者 MinIO 没初始化 | 用 `--profile infra --profile storage up -d`（用外部 DB/Redis 时 `--profile storage up -d minio`）拉起 `minio`，并对照 `AUDIO-STORAGE.md` 查 `DALTON_ASR_STORAGE_*` 变量 |
 | 外置盘没挂载导致夜间备份失败 | `/Volumes/EveSSD` 掉线，脚本按规定拒绝退回内置盘 | 挂回外置盘后手动补跑 `bash scripts/dalton/ops/dalton_db_offsite.sh` |
 | 监控面板点“发布/更新”返回 403 `artifact_publishing_disabled` | 当前环境没开发布总开关 | 检查 `.env` 里的 `DALTON_ARTIFACT_PUBLISHING_ENABLED=true` 并重建 `backend`（见 [monitors.md](./features/monitors.md)） |
+| 覆盖单元绑定/解绑/归档返回 409 | 单元已绑定其他工作区，或当前绑定工作区仍有活动受管任务/未开始执行 | 首期不支持改绑；解绑或归档前须先关闭跟踪（会暂停相关标准与财报任务并跳过未开始执行），再解绑或归档；切换工作区须先解绑再重新绑定 |
+
+### 覆盖单元（绑定 / 解绑 / 归档规则）
+
+- 同事自己创建的同名或同代码任务属于他们的个人任务，不挡住解绑或归档。
+- 解绑或归档后，原工作区里剩下的任务按普通个人任务处理。

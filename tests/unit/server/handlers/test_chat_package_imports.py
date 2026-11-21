@@ -106,9 +106,20 @@ class TestNoCircularImports:
             mod = importlib.import_module("src.server.handlers.chat")
             assert hasattr(mod, "astream_ptc_workflow")
         finally:
-            # Restore original modules to avoid polluting other tests
-            for k, v in saved.items():
-                sys.modules[k] = v
+            # Evict any modules created by the fresh import, restore original
+            # modules, and rebind the parent package's ``chat`` attribute so
+            # string-targeted monkeypatch calls resolve to the original object.
+            for k in list(sys.modules):
+                if k.startswith("src.server.handlers.chat"):
+                    del sys.modules[k]
+            sys.modules.update(saved)
+            parent = sys.modules.get("src.server.handlers")
+            original_pkg = saved.get("src.server.handlers.chat")
+            if parent is not None:
+                if original_pkg is not None:
+                    parent.chat = original_pkg
+                elif hasattr(parent, "chat"):
+                    del parent.chat
 
 
 class TestLoggerName:

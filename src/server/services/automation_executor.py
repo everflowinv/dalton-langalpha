@@ -11,6 +11,7 @@ reached the run ledger, by the run's own finalize.
 import asyncio
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -139,6 +140,7 @@ class _Firing:
     # The computer a computer token's run now was checked to run on; its
     # turn's START refuses any other (``admission.refuse_moved_off``).
     checked_computer_id: Optional[str] = None
+    workspace_owner_id: Optional[str] = None
     route: Optional[TurnRoute] = None
     thread_id: Optional[str] = None
     run_id: Optional[str] = None
@@ -432,17 +434,82 @@ async def _stored_workspace(automation: Dict[str, Any]) -> Dict[str, Any]:
             "The automation's workspace was not found "
             "(workspace may have been deleted)"
         )
-    # DALTON-HOOK(dalton-auth): verify workspace belongs to automation owner before thread creation
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    # DALTON-HOOK(coverage-units): allow web write access when auth enabled; fail closed when disabled or revoked
+    await _verify_executor_workspace_access(
+        workspace,
+        automation,
+        str(workspace.get("workspace_id") or ws_id or ""),
+    )
+    return workspace
 
-    if is_dalton_supabase_auth_enabled():
-        ws_owner = str(workspace.get("user_id") or "").strip()
-        auto_owner = str(automation.get("user_id") or "").strip()
-        if not ws_owner or not auto_owner or ws_owner != auto_owner:
+
+async def _verify_executor_workspace_access(
+    workspace: Mapping[str, Any],
+    automation: Mapping[str, Any],
+    workspace_id: str,
+) -> None:
+    """Verify automation owner has web write access to ``workspace`` (fast path for owner; fail-closed otherwise)."""
+    ws_owner = str(workspace.get("user_id") or "").strip()
+    auto_owner = str(automation.get("user_id") or "").strip()
+    if ws_owner and auto_owner and ws_owner == auto_owner:
+        return
+
+    from src.dalton.settings import (
+        is_coverage_units_enabled,
+        is_dalton_supabase_auth_enabled,
+    )
+    from src.dalton.sharing import ColleagueAccessRevokedError, require_workspace_access
+
+    if is_coverage_units_enabled() and is_dalton_supabase_auth_enabled():
+        if not ws_owner or not auto_owner:
             raise ValueError(
                 "The automation's workspace does not belong to the automation owner"
             )
-    return workspace
+        eff_ws_id = str(workspace.get("workspace_id") or workspace_id or "").strip()
+        try:
+            await require_workspace_access(
+                eff_ws_id,
+                auto_owner,
+                channel="web",
+                need="write",
+                workspace=dict(workspace),
+            )
+        except ColleagueAccessRevokedError as exc:
+            raise ValueError(
+                f"The automation's workspace does not belong to the automation owner: {exc}"
+            ) from exc
+        except HTTPException as exc:
+            if exc.status_code in (403, 404):
+                raise ValueError(
+                    f"The automation's workspace does not belong to the automation owner: {exc.detail}"
+                ) from exc
+            raise
+    elif ws_owner and auto_owner and ws_owner != auto_owner:
+        raise ValueError(
+            "The automation's workspace does not belong to the automation owner"
+        )
+
+
+async def _verify_thread_matches_automation(
+    thread_id: str,
+    automation: Mapping[str, Any],
+    *,
+    expected_workspace_id: Optional[str],
+) -> None:
+    """Re-verify ``thread_id`` still belongs to ``automation``'s workspace and user."""
+    from src.server.database.conversation import get_thread_auth_meta
+
+    meta = await get_thread_auth_meta(thread_id)
+    if meta is None:
+        return
+    thread_ws = str(meta.get("workspace_id") or "").strip()
+    expected_ws = str(expected_workspace_id or "").strip()
+    thread_uid = str(meta.get("user_id") or "").strip()
+    auto_uid = str(automation.get("user_id") or "").strip()
+    if (expected_ws and thread_ws != expected_ws) or thread_uid != auto_uid:
+        raise ValueError(
+            "Automation thread does not match automation workspace or owner"
+        )
 
 
 class AutomationExecutor:
@@ -494,6 +561,8 @@ class AutomationExecutor:
                 workspace_id=workspace_id,
                 current_status="completed",
                 title=f"{name} — {run_date}"[:255],
+                # DALTON-HOOK(coverage-units): pre-created thread belongs to automation owner even in colleague workspaces
+                user_id=str(automation["user_id"]),
                 metadata={
                     "origin": {
                         "type": "automation",
@@ -510,21 +579,16 @@ class AutomationExecutor:
     ) -> str:
         """The pinned thread ``place`` continues, else a new titled one, which
         'continue' pins in place of any pin the run left behind."""
-        # DALTON-HOOK(dalton-auth): verify workspace belongs to automation owner before pre-creating thread
-        from src.dalton.settings import is_dalton_supabase_auth_enabled
-
-        if is_dalton_supabase_auth_enabled():
-            ws_owner = str((place.workspace or {}).get("user_id") or "").strip()
-            auto_owner = str(automation.get("user_id") or "").strip()
-            if (
-                not ws_owner
-                or not auto_owner
-                or ws_owner != auto_owner
-                or str((place.workspace or {}).get("workspace_id") or "") != str(workspace_id or "")
-            ):
-                raise ValueError(
-                    "The automation's workspace does not belong to the automation owner"
-                )
+        # DALTON-HOOK(coverage-units): verify web write access or ownership before pre-creating thread
+        if workspace_id and str((place.workspace or {}).get("workspace_id") or "") != str(workspace_id):
+            raise ValueError(
+                "The automation's workspace does not belong to the automation owner"
+            )
+        await _verify_executor_workspace_access(
+            place.workspace or {},
+            automation,
+            str(workspace_id or (place.workspace or {}).get("workspace_id") or ""),
+        )
         if place.thread_id is not None:
             return place.thread_id
         thread_id = str(uuid4())
@@ -906,6 +970,11 @@ class AutomationExecutor:
                 ]
             if firing.delivery is not None:
                 run_metadata.update(automation_delivery.run_metadata(firing.delivery))
+            # DALTON-HOOK(coverage-units): stamp workspace_owner_id and origin_channel=web for cross-user colleague runs
+            if firing.workspace_owner_id and str(firing.workspace_owner_id) != str(user_id):
+                run_metadata["workspace_owner_id"] = firing.workspace_owner_id
+                run_metadata["origin_channel"] = "web"
+                extra_configurable["workspace_owner_id"] = firing.workspace_owner_id
             request = ChatRequest(
                 workspace_id=firing.workspace_id,
                 messages=[ChatMessage(role="user", content=instruction)],
@@ -955,6 +1024,12 @@ class AutomationExecutor:
                             execution_id, firing
                         )
             except Exception as e:
+                from src.dalton.sharing import ColleagueAccessRevokedError
+
+                if isinstance(e, ColleagueAccessRevokedError) or (
+                    isinstance(e, HTTPException) and e.status_code in (403, 404)
+                ):
+                    raise ValueError(str(getattr(e, "detail", e))) from e
                 if firing.admitted or not _lost_thread_race(e):
                     raise
             else:
@@ -963,6 +1038,9 @@ class AutomationExecutor:
                     f"execution_id={execution_id} events={event_count}"
                 )
                 return True
+            # DALTON-HOOK(coverage-units): capture thread continuation state before waiting
+            prior_strategy = str(firing.automation.get("thread_strategy") or "").strip().lower()
+            prior_pinned = _pinned_thread(firing.automation)
             firing.run_id = None
             fresh = await self._wait_for_thread(
                 automation, execution_id, firing.thread_id, deadline
@@ -973,9 +1051,76 @@ class AutomationExecutor:
             from src.server.services.account import read_standing
 
             (await read_standing(user_id)).refuse_if_suspended()
-            # Where a Home turn runs is read again: the wait may outlast the
-            # placement the route was bound with (Home back, or gone).
-            firing.route = await firing.route.placed(user_id)
+            # DALTON-HOOK(coverage-units): re-verify owner, resolved workspace, pinned thread, and thread match after wait
+            if str(fresh.get("user_id") or "").strip() != str(user_id or "").strip():
+                raise ValueError("Automation owner changed while waiting for thread")
+            prior_ws_id = firing.workspace_id
+            place = await _turn_place(fresh)
+            fresh_route = await turn_route(user_id, place.workspace).bind(
+                user_id, place.workspace
+            )
+            if prior_ws_id and fresh_route.workspace_id != prior_ws_id:
+                raise ValueError(
+                    "Automation workspace changed while waiting for thread; refusing stale thread"
+                )
+            fresh_strategy = str(fresh.get("thread_strategy") or "").strip().lower()
+            fresh_pinned = _pinned_thread(fresh)
+            # DALTON-HOOK(coverage-units): cancelling pinned/continue thread settles as SKIPPED instead of FAILED
+            if (
+                prior_strategy == "continue"
+                and fresh_strategy != "continue"
+                and firing.thread_id
+            ) or (
+                prior_pinned is not None
+                and firing.thread_id
+                and fresh_pinned is None
+            ):
+                logger.info(
+                    "[EXECUTOR] Execution %s settled as skipped: continue/pinned thread %s was cancelled while waiting",
+                    execution_id,
+                    firing.thread_id,
+                )
+                settled = await settle(
+                    firing.automation,
+                    execution_id,
+                    Outcome.SKIPPED,
+                    workspace_id=fresh_route.workspace_id,
+                    skip_reason="user",
+                    delivery=firing.delivery,
+                    from_statuses=("running",),
+                )
+                if not settled:
+                    logger.warning(
+                        "[EXECUTOR] Failed to settle execution %s as skipped after continue/pinned thread cancellation",
+                        execution_id,
+                    )
+                return False
+            if (
+                prior_pinned is not None
+                and firing.thread_id
+                and str(fresh_pinned) != str(firing.thread_id)
+            ):
+                raise ValueError(
+                    "Automation pinned thread changed while waiting for thread; refusing stale thread"
+                )
+            if (
+                fresh_pinned is not None
+                and firing.thread_id
+                and str(fresh_pinned) != str(firing.thread_id)
+            ):
+                raise ValueError(
+                    "Automation pinned thread changed while waiting for thread; refusing stale thread"
+                )
+            firing.route = fresh_route
+            firing.workspace_owner_id = (
+                str((place.workspace or {}).get("user_id") or "").strip() or None
+            )
+            if firing.thread_id:
+                await _verify_thread_matches_automation(
+                    firing.thread_id,
+                    fresh,
+                    expected_workspace_id=fresh_route.workspace_id,
+                )
             # Before the credit gate, so a refusal there ends the run with
             # the delivery the automation now has.
             await self._start_delivery(execution_id, firing)
@@ -1114,11 +1259,21 @@ class AutomationExecutor:
             # ─── Resolve workspace + thread ───────────────────────
             route = await route.bind(user_id, place.workspace)
             firing.route = route
-            firing.thread_id = (
-                str(handed_thread)
-                if handed_thread
-                else await self._resolve_thread(firing.automation, place, firing.workspace_id)
+            firing.workspace_owner_id = (
+                str((place.workspace or {}).get("user_id") or "").strip() or None
             )
+            if handed_thread:
+                # DALTON-HOOK(coverage-units): re-verify handed thread matches automation workspace and owner
+                await _verify_thread_matches_automation(
+                    str(handed_thread),
+                    firing.automation,
+                    expected_workspace_id=firing.workspace_id,
+                )
+                firing.thread_id = str(handed_thread)
+            else:
+                firing.thread_id = await self._resolve_thread(
+                    firing.automation, place, firing.workspace_id
+                )
             # The thread exists from here on, so record it on the run now: a
             # live run can then be opened and watched while it streams, not
             # only once it settles.

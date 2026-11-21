@@ -27,7 +27,7 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -41,6 +41,7 @@ from ptc_agent.agent.backends.db_json_route import (
     DbJsonFile,
     ErrorType,
     Plan,
+    ReadOnlyStoreError,
     UnreadableJsonError,
     UserDataValidationError,
     load_json,
@@ -350,6 +351,8 @@ class _Update:
 class _Delete:
     automation_id: str
     name: str
+    workspace_id: Any = None
+    metadata: Any = None
 
 
 @dataclass
@@ -495,6 +498,8 @@ class Document:
     # the chats it refused.
     delivery: list[str] | None = None
     delivery_problems: list[str] = field(default_factory=list)
+    # The calling workspace that ``_plan_create`` falls back to when omitted.
+    default_workspace_id: str | None = None
 
 
 def _names_model(fields: dict[str, Any], shown: dict[str, Any] | None) -> bool:
@@ -721,6 +726,61 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
     def render(self, row: dict[str, Any] | None) -> tuple[str, str] | None:
         return _render(row) if row else None
 
+    async def prelock_units(
+        self,
+        user_id: str,
+        conn: Any,
+        *,
+        parsed: Document | None = None,
+    ) -> None:
+        """Acquire ``dalton_coverage_units FOR SHARE`` in sorted order before ``file.lock``."""
+        from uuid import UUID
+
+        from src.dalton.autonomy.classification import is_managed_unit_automation
+        from src.dalton.database.coverage_units import get_active_unit_by_workspace
+        from src.dalton.settings import is_coverage_units_enabled
+
+        if not is_coverage_units_enabled():
+            return
+        existing = await self.fetch(user_id, conn=conn)
+        existing_managed = isinstance(existing, dict) and is_managed_unit_automation(
+            existing
+        )
+        written_managed = (
+            parsed is not None
+            and isinstance(parsed.fields, dict)
+            and is_managed_unit_automation(
+                name=parsed.fields.get("name"),
+                metadata=parsed.fields.get("metadata"),
+            )
+        )
+        if not existing_managed and not written_managed:
+            return
+        ws_ids: set[str] = set()
+        if isinstance(existing, dict) and existing.get("workspace_id") is not None:
+            raw_existing_ws = str(existing.get("workspace_id") or "").strip()
+            try:
+                ws_ids.add(str(UUID(raw_existing_ws)))
+            except (ValueError, TypeError, AttributeError):
+                pass
+        if parsed is not None and isinstance(parsed.fields, dict):
+            raw_target_ws = parsed.fields.get("workspace_id")
+            if raw_target_ws == _HOME:
+                raw_target_ws = parsed.home_id
+            elif (
+                raw_target_ws is None
+                and "workspace_id" not in parsed.fields
+                and existing is None
+            ):
+                raw_target_ws = parsed.default_workspace_id
+            if raw_target_ws is not None:
+                try:
+                    ws_ids.add(str(UUID(str(raw_target_ws).strip())))
+                except (ValueError, TypeError, AttributeError):
+                    pass
+        for ws_id in sorted(ws_ids):
+            await get_active_unit_by_workspace(ws_id, conn=conn, for_share=True)
+
     async def lock(self, user_id: str, conn: Any) -> None:
         await auto_db.lock_user_automations(user_id, conn=conn)
 
@@ -754,6 +814,7 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
             home_id=get_home_workspace_id(user_id),
             delivery=delivery,
             delivery_problems=refused,
+            default_workspace_id=call.workspace_id,
         )
 
     async def _check_delivery(
@@ -817,7 +878,12 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
             if row is None:
                 problems.add("status", f'"deleted" deletes an existing automation, and none is filed as {self.file_name}')
             else:
-                result.delete = _Delete(automation_id=str(row["automation_id"]), name=row["name"])
+                result.delete = _Delete(
+                    automation_id=str(row["automation_id"]),
+                    name=row["name"],
+                    workspace_id=row.get("workspace_id"),
+                    metadata=row.get("metadata"),
+                )
         elif row is None:
             result.create = _plan_create(entry, call, document.timezone, problems)
         else:
@@ -826,7 +892,16 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
         return Plan(result)
 
     def plan_delete(self, row: dict[str, Any] | None) -> Plan[FilePlan]:
-        return Plan(FilePlan(delete=_Delete(automation_id=str(row["automation_id"]), name=row["name"])))
+        return Plan(
+            FilePlan(
+                delete=_Delete(
+                    automation_id=str(row["automation_id"]),
+                    name=row["name"],
+                    workspace_id=row.get("workspace_id"),
+                    metadata=row.get("metadata"),
+                )
+            )
+        )
 
     async def hold(self, user_id: str, plan: FilePlan, row: dict[str, Any] | None, conn: Any) -> str | None:
         """Lock the row before a save writes over it: its version as it
@@ -889,6 +964,9 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
         problems = _Problems(self.file_name)
         report = ""
         warning: str | None = None
+
+        # DALTON-HOOK(coverage-units): block direct automation file create/update/delete for unit-managed tasks (any user, including owner)
+        await self._check_plan_not_managed_unit(plan, conn=conn)
 
         async def step(change: Callable[..., Awaitable[Any]], *args: Any, **kwargs: Any) -> Any:
             try:
@@ -1031,12 +1109,88 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
             lines.append(f"Note: {warning}")
         return "\n".join([*lines, *plan.notes])
 
+    async def _assert_not_managed_unit_file_edit(
+        self,
+        *,
+        workspace_id: Any,
+        name: str | None,
+        metadata: Any,
+        conn: Any,
+    ) -> None:
+        from src.dalton.autonomy.classification import (
+            is_managed_unit_automation,
+            is_managed_unit_automation_for_unit,
+        )
+        from src.dalton.database.coverage_units import get_active_unit_by_workspace
+        from src.dalton.settings import is_coverage_units_enabled
+
+        if not is_coverage_units_enabled():
+            return
+        ws_id = str(workspace_id or "").strip()
+        if not ws_id or not is_managed_unit_automation(name=name, metadata=metadata):
+            return
+        if not isinstance(metadata, Mapping) or (
+            not str(metadata.get("unit_id") or "").strip()
+            and not str(metadata.get("ticker") or "").strip()
+        ):
+            return
+
+        unit = await get_active_unit_by_workspace(ws_id, conn=conn, for_share=True)
+        blocked = bool(
+            unit is not None
+            and is_managed_unit_automation_for_unit(name=name, metadata=metadata, unit=unit)
+        )
+        if blocked:
+            raise ReadOnlyStoreError(
+                f"{self.file_name} is a managed coverage unit automation; direct file "
+                "writes, deletes, and renames are disabled for all users (including "
+                "workspace owners). Use the dalton_schedule_automation tool instead."
+            )
+
+    async def _check_plan_not_managed_unit(self, plan: FilePlan, *, conn: Any) -> None:
+        if plan.delete is not None:
+            await self._assert_not_managed_unit_file_edit(
+                workspace_id=plan.delete.workspace_id,
+                name=plan.delete.name,
+                metadata=plan.delete.metadata,
+                conn=conn,
+            )
+        if plan.update is not None:
+            row = plan.update.row
+            fields = plan.update.fields
+            await self._assert_not_managed_unit_file_edit(
+                workspace_id=row.get("workspace_id"),
+                name=row.get("name"),
+                metadata=row.get("metadata"),
+                conn=conn,
+            )
+            await self._assert_not_managed_unit_file_edit(
+                workspace_id=fields.get("workspace_id") or row.get("workspace_id"),
+                name=fields.get("name") or row.get("name"),
+                metadata=fields.get("metadata") or row.get("metadata"),
+                conn=conn,
+            )
+        if plan.create is not None:
+            await self._assert_not_managed_unit_file_edit(
+                workspace_id=getattr(plan.create.data, "workspace_id", None),
+                name=getattr(plan.create.data, "name", None),
+                metadata=getattr(plan.create.data, "metadata", None),
+                conn=conn,
+            )
+
     async def rename(self, user_id: str, to: str, conn: Any, call: CallContext) -> str | None:
         # The row is locked, since a delete on the Automations page takes no
         # user lock: a rename that lost to one moved nothing.
         row = await auto_db.get_automation_file(user_id, self.file_name, conn=conn, lock=True)
         if row is None:
             return None
+        # DALTON-HOOK(coverage-units): block direct rename of unit-managed tasks (any user, including owner)
+        await self._assert_not_managed_unit_file_edit(
+            workspace_id=row.get("workspace_id"),
+            name=row.get("name"),
+            metadata=row.get("metadata"),
+            conn=conn,
+        )
         try:
             moved = await auto_db.rename_automation_file(str(row["automation_id"]), user_id, to, conn=conn)
         except UniqueViolation as exc:

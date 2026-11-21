@@ -887,9 +887,10 @@ async def update_automation(
                     ):
                         once_iso = _to_iso_str(effective_kwargs["next_run_at"])
                         if once_iso is not None:
-                            merged_meta = dict(locked_row.get("metadata") or {})
                             if isinstance(effective_kwargs.get("metadata"), dict):
-                                merged_meta.update(effective_kwargs["metadata"])
+                                merged_meta = dict(effective_kwargs["metadata"])
+                            else:
+                                merged_meta = dict(locked_row.get("metadata") or {})
                             merged_meta["once_schedule_at"] = once_iso
                             effective_kwargs["metadata"] = merged_meta
 

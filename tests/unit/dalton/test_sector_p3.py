@@ -749,6 +749,19 @@ def _install_sector_store(
         sector_mod, "resolve_sector_due_timezone",
         create_autospec(sector_mod.resolve_sector_due_timezone, side_effect=_tz),
     )
+    from datetime import UTC, datetime
+    from src.server.database import automation_executions as exec_db
+
+    monkeypatch.setattr(
+        exec_db,
+        "skip_unstarted_executions_for_automations",
+        create_autospec(exec_db.skip_unstarted_executions_for_automations, return_value=0),
+    )
+    monkeypatch.setattr(
+        exec_db,
+        "get_db_now",
+        create_autospec(exec_db.get_db_now, return_value=datetime.now(UTC)),
+    )
     return {"store": store}
 
 
@@ -865,7 +878,7 @@ async def test_pausing_sector_never_touches_member_company_rows(
 async def test_sector_tracking_flag_off_never_queries_registry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("DALTON_COVERAGE_UNITS_ENABLED", raising=False)
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "0")
     _install_sector_store(monkeypatch)
 
     from src.dalton.database import coverage_units as cu_db
@@ -951,11 +964,21 @@ async def test_list_system_jobs_sector_group_flag_gated(monkeypatch: pytest.Monk
 
     # 开关打开：bound sector 单元进入 sector 组，key/主体身份正确
     monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "1")
+    monkeypatch.setenv("DALTON_PM_USER_IDS", USER_ID)
+    from src.dalton import sharing as sharing_mod
     from src.dalton.database import coverage_units as cu_db
 
     monkeypatch.setattr(
         cu_db, "list_coverage_units",
         create_autospec(cu_db.list_coverage_units, return_value=[_sector_unit_row()]),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_workspace_access",
+        create_autospec(
+            sharing_mod.require_workspace_access,
+            return_value={"workspace_id": WS_ID, "user_id": USER_ID},
+        ),
     )
     out_on = await sj.list_system_jobs(USER_ID)
     sector_jobs = out_on["groups"].get("sector") or []
@@ -1022,7 +1045,7 @@ async def test_run_publish_rejects_sector_subject_before_pseudo_ticker(
 async def test_run_publish_flag_off_keeps_company_path_and_skips_registry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("DALTON_COVERAGE_UNITS_ENABLED", raising=False)
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "0")
     import src.dalton.publish.service as pub_mod
     from src.dalton.database import coverage_units as cu_db
     from src.dalton.database import knowledge as db_knowledge
@@ -1672,6 +1695,7 @@ def _install_router_doubles(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     monkeypatch.setenv("DALTON_ENABLED", "1")
     monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "1")
+    monkeypatch.setenv("DALTON_PM_USER_IDS", USER_ID)
     observed: dict[str, Any] = {"company_resolve": 0}
 
     async def _forbidden_company(uid: str, target: str) -> str:
@@ -1727,8 +1751,23 @@ def test_system_jobs_toggle_endpoint_sector(monkeypatch: pytest.MonkeyPatch) -> 
     _install_router_doubles(monkeypatch)
     captured: dict[str, Any] = {}
 
-    async def _toggle(uid: str, key: str, *, enabled: bool, force: bool, respect_user_pause: bool):
-        captured.update({"uid": uid, "key": key, "enabled": enabled})
+    async def _toggle(
+        uid: str,
+        key: str,
+        *,
+        enabled: bool,
+        force: bool,
+        respect_user_pause: bool,
+        viewer_user_id: str | None = None,
+    ):
+        captured.update(
+            {
+                "uid": uid,
+                "key": key,
+                "enabled": enabled,
+                "viewer_user_id": viewer_user_id,
+            }
+        )
         return {"ok": True, "job": {"key": key, "scope": "sector"}}
 
     monkeypatch.setattr(sj, "toggle_system_job", create_autospec(sj.toggle_system_job, side_effect=_toggle))
@@ -1740,7 +1779,12 @@ def test_system_jobs_toggle_endpoint_sector(monkeypatch: pytest.MonkeyPatch) -> 
     resp = client.post("/api/v1/dalton/system-jobs/sector:ai-infrastructure", json={"enabled": False})
     assert resp.status_code == 200
     assert resp.json()["job"]["scope"] == "sector"
-    assert captured == {"uid": USER_ID, "key": "sector:ai-infrastructure", "enabled": False}
+    assert captured == {
+        "uid": USER_ID,
+        "key": "sector:ai-infrastructure",
+        "enabled": False,
+        "viewer_user_id": USER_ID,
+    }
 
 
 # --- r2 #5：跟踪工具支持行业工作区 ----------------------------------------
@@ -1870,7 +1914,7 @@ async def test_system_jobs_tool_analyst_company_workspace_rejects_sector_key(
             return {"workspace_id": "ws-nvda", "user_id": "user-1", "name": "NVDA", "status": "running"}
         return None
 
-    monkeypatch.delenv("DALTON_COVERAGE_UNITS_ENABLED", raising=False)
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "0")
     monkeypatch.setattr(ws_db, "get_workspace", create_autospec(ws_db.get_workspace, side_effect=_get_nvda))
     tool = {t.name: t for t in build_director_tools(role="analyst")}["dalton_system_jobs"]
     res = json.loads(
@@ -2043,7 +2087,7 @@ async def test_preflight_flag_off_skips_sector_task_with_zero_state_access(
     import src.dalton.autonomy.preflight as preflight_mod
     from src.dalton.database import coverage_units as cu_db
 
-    monkeypatch.delenv("DALTON_COVERAGE_UNITS_ENABLED", raising=False)
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "0")
     doubles = _install_outer_preflight_doubles(monkeypatch)
 
     async def _forbidden(uid: str, *, conn: Any = None):
@@ -2197,7 +2241,7 @@ async def test_tool_company_path_flag_off_makes_no_extra_queries(
     from src.server.database import automation as auto_db
     from src.server.database import workspace as ws_db
 
-    monkeypatch.delenv("DALTON_COVERAGE_UNITS_ENABLED", raising=False)
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "0")
 
     async def _forbidden(ws_id: str, *, conn: Any = None):
         raise AssertionError("flag off must not resolve sector identity")
@@ -2265,7 +2309,7 @@ async def test_preflight_autonomy_disabled_still_gates_sector_task(
     开关关闭时遗留 sector 任务仍 skip；公司任务照旧 passthrough。"""
     import src.dalton.autonomy.preflight as preflight_mod
 
-    monkeypatch.delenv("DALTON_COVERAGE_UNITS_ENABLED", raising=False)
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "0")
     doubles = _install_outer_preflight_doubles(monkeypatch)
     real_settings = preflight_mod.get_dalton_settings()
     off = real_settings.model_copy(
@@ -2323,3 +2367,895 @@ async def test_preflight_autonomy_disabled_sector_gate_honours_timeout(
     assert res.decision == "skip"
     assert res.reason == "preflight_timeout_sector"
     assert doubles["insert_preflight_log"].await_args.kwargs["reason"] == "preflight_timeout_sector"
+
+
+@pytest.mark.asyncio
+async def test_list_system_jobs_hides_unreadable_transferred_and_external_sector_units(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 2: transferred hidden sector unit is skipped BEFORE get_tracking_status via HTTP & tool;
+    demoted non-internal former lead also sees no sector units."""
+    from fastapi import HTTPException
+    import src.dalton.autonomy.system_jobs as sj
+    from src.dalton import sharing as sharing_mod
+    from src.dalton.database import coverage_units as cu_db
+
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "1")
+    monkeypatch.setattr(
+        sj,
+        "list_all_user_automations",
+        create_autospec(sj.list_all_user_automations, return_value=[]),
+    )
+    monkeypatch.setattr(
+        sj,
+        "_discover_company_workspaces",
+        create_autospec(sj._discover_company_workspaces, return_value=[]),
+    )
+    monkeypatch.setattr(sj, "_fetch_ops_jobs", create_autospec(sj._fetch_ops_jobs, return_value=[]))
+    monkeypatch.setattr(sj, "_fetch_data_system_jobs", create_autospec(sj._fetch_data_system_jobs, return_value=[]))
+
+    hidden_ws = "99999999-9999-4999-8999-999999999999"
+    transferred_unit = _sector_unit_row(
+        unit_id="77777777-7777-4777-8777-777777777777",
+        slug="hidden-sector-slug",
+        display_name="保密行业名",
+        workspace_id=hidden_ws,
+        owner_user_id=USER_ID,
+        lead_analyst_user_id="colleague-1",
+    )
+    monkeypatch.setattr(
+        cu_db,
+        "list_coverage_units",
+        create_autospec(cu_db.list_coverage_units, return_value=[transferred_unit]),
+    )
+    tracking_spy = create_autospec(sj.get_tracking_status)
+    monkeypatch.setattr(sj, "get_tracking_status", tracking_spy)
+
+    async def _deny_web(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise HTTPException(status_code=403, detail="hidden")
+
+    orig_req_ws = sharing_mod.require_workspace_access
+
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_workspace_access",
+        create_autospec(orig_req_ws, side_effect=_deny_web),
+    )
+
+    # 1) Internal former owner whose unit transferred & workspace became hidden
+    monkeypatch.setenv("DALTON_PM_USER_IDS", USER_ID)
+    listed = await sj.list_system_jobs(USER_ID)
+    assert "sector" not in listed["groups"]
+    dumped = json.dumps(listed, ensure_ascii=False)
+    for leak in (hidden_ws, "hidden-sector-slug", "保密行业名", "77777777-7777-4777-8777-777777777777"):
+        assert leak not in dumped
+    tracking_spy.assert_not_awaited()
+
+    # Same via dalton_system_jobs(action="list") tool
+    tools = {t.name: t for t in build_director_tools(role="chief_of_staff")}
+    tool_out = json.loads(
+        await tools["dalton_system_jobs"].ainvoke(
+            {"action": "list"},
+            config={"configurable": {"user_id": USER_ID}},
+        )
+    )
+    assert "sector" not in tool_out["groups"]
+    assert "保密行业名" not in json.dumps(tool_out, ensure_ascii=False)
+    tracking_spy.assert_not_awaited()
+
+    # 2) External former lead never sees sector jobs even if require_workspace_access were readable
+    monkeypatch.delenv("DALTON_PM_USER_IDS", raising=False)
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_workspace_access",
+        create_autospec(
+            orig_req_ws,
+            return_value={"workspace_id": hidden_ws, "user_id": USER_ID},
+        ),
+    )
+    ext_listed = await sj.list_system_jobs(USER_ID)
+    assert "sector" not in ext_listed["groups"]
+    tracking_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_registry_unavailable_marks_system_jobs_and_refuses_tracking_and_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 4: registry outage sets units_unavailable=True without dropping company jobs,
+    and raises/returns coverage_identity_unavailable on tracking writes & publish."""
+    import src.dalton.autonomy.system_jobs as sj
+    import src.dalton.autonomy.tracking as tr
+    from src.dalton.coverage.identity import CoverageIdentityUnavailableError
+    from src.dalton.database import coverage_units as cu_db
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "1")
+    monkeypatch.setenv("DALTON_PM_USER_IDS", USER_ID)
+
+    async def _db_down(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("coverage_units db down")
+
+    monkeypatch.setattr(
+        cu_db,
+        "get_active_unit_by_workspace",
+        create_autospec(cu_db.get_active_unit_by_workspace, side_effect=_db_down),
+    )
+    monkeypatch.setattr(
+        cu_db,
+        "list_coverage_units",
+        create_autospec(cu_db.list_coverage_units, side_effect=_db_down),
+    )
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={
+                "workspace_id": WS_ID,
+                "user_id": USER_ID,
+                "name": "NVDA",
+                "status": "running",
+                "config": {},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        sj,
+        "list_all_user_automations",
+        create_autospec(sj.list_all_user_automations, return_value=[]),
+    )
+    monkeypatch.setattr(
+        sj,
+        "_discover_company_workspaces",
+        create_autospec(sj._discover_company_workspaces, return_value=[WS_ID]),
+    )
+    monkeypatch.setattr(sj, "_fetch_ops_jobs", create_autospec(sj._fetch_ops_jobs, return_value=[]))
+    monkeypatch.setattr(sj, "_fetch_data_system_jobs", create_autospec(sj._fetch_data_system_jobs, return_value=[]))
+    monkeypatch.setattr(
+        tr,
+        "list_all_user_automations",
+        create_autospec(tr.list_all_user_automations, return_value=[]),
+    )
+
+    listed = await sj.list_system_jobs(USER_ID)
+    assert listed["units_unavailable"] is True
+    assert [c["ticker"] for c in listed["groups"]["company"]] == ["NVDA"]
+
+    # enable_tracking / disable_tracking never misclassify on registry outage
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _noop_lock(_uid: str):
+        yield None
+
+    monkeypatch.setattr(tr, "user_automations_lock", _noop_lock)
+    with pytest.raises(CoverageIdentityUnavailableError):
+        await tr.enable_tracking(USER_ID, WS_ID)
+    with pytest.raises(CoverageIdentityUnavailableError):
+        await tr.disable_tracking(USER_ID, WS_ID)
+
+    # Single-key status / toggle / run_now NEVER degrade on registry outage or return "未找到"
+    with pytest.raises(CoverageIdentityUnavailableError) as company_err:
+        await sj.get_system_job_status(USER_ID, f"company:{WS_ID}")
+    assert "coverage_units db down" not in str(company_err.value)
+    with pytest.raises(CoverageIdentityUnavailableError):
+        await sj.get_system_job_status(USER_ID, "sector:ai-infrastructure")
+    with pytest.raises(CoverageIdentityUnavailableError):
+        await sj.toggle_system_job(USER_ID, "sector:ai-infrastructure", enabled=True)
+    with pytest.raises(CoverageIdentityUnavailableError):
+        await sj.run_system_job_now(USER_ID, "sector:ai-infrastructure")
+
+    # Publish run_publish returns coverage_identity_unavailable on registry outage
+    import src.dalton.publish.service as publish_svc
+    from src.dalton.database import knowledge as pub_knowledge
+
+    class _DraftBackendProto:
+        async def aread_text(self, path: str) -> str | None: ...
+
+    draft_backend = create_autospec(_DraftBackendProto, instance=True)
+    draft_backend.aread_text.return_value = "# Draft\n"
+    monkeypatch.setattr(
+        pub_knowledge,
+        "list_all_latest_for_workspace",
+        create_autospec(pub_knowledge.list_all_latest_for_workspace, return_value={}),
+    )
+    monkeypatch.setattr(
+        publish_svc,
+        "verify_workspace_access",
+        create_autospec(
+            publish_svc.verify_workspace_access,
+            return_value={
+                "workspace_id": WS_ID,
+                "user_id": USER_ID,
+                "name": "NVDA",
+                "status": "running",
+                "config": {},
+            },
+        ),
+    )
+    pub_out = await publish_svc.run_publish(
+        user_id=USER_ID,
+        workspace_id=WS_ID,
+        thread_id="t-1",
+        tool_call_id="tc-1",
+        draft_path="drafts/nvda.md",
+        title="NVDA",
+        kind="initial_coverage",
+        slug="nvda",
+        backend=draft_backend,
+        author_model="test-model",
+    )
+    assert pub_out["ok"] is False
+    assert pub_out["status"] == "coverage_identity_unavailable"
+    assert pub_out["error"] == "coverage_identity_unavailable"
+    assert "coverage_units db down" not in json.dumps(pub_out, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_rebind_and_transfer_hides_stale_hidden_workspace_and_checks_director_web_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 6 Item 2 & Item 4:
+    1) After rebinding a sector unit from hidden_ws -> shared_ws and transferring to colleague,
+       stale automation rows still sitting on hidden_ws are redacted from list/status/tool tasks[];
+    2) Director status on sector:* requires internal/admin tier BEFORE registry lookup and
+       requires Web read access (Web-hidden workspace is denied even when CoS is rw);
+    3) _discover_company_workspaces excludes automation rows on Web-unreadable workspaces;
+    4) Director status returns coverage_identity_unavailable (not '未找到') on registry outage.
+    """
+    from contextlib import asynccontextmanager
+    from fastapi import HTTPException
+    import src.dalton.access_tiers as tiers_mod
+    import src.dalton.autonomy.system_jobs as sj
+    import src.dalton.autonomy.tracking as tr
+    from src.dalton import sharing as sharing_mod
+    import src.dalton.tools.director_tools as dt_mod
+    from src.dalton.coverage import units as cu_mod
+    from src.dalton.database import coverage_units as cu_db
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "1")
+    monkeypatch.setenv("DALTON_PM_USER_IDS", USER_ID)
+
+    colleague_id = "colleague-1"
+    hidden_ws = "99999999-9999-4999-8999-999999999991"
+    shared_ws = "88888888-8888-4888-8888-888888888882"
+    secret_desc = "SECRET_OLD_HIDDEN_TASK_DESC"
+
+    ws_rows = {
+        hidden_ws: {"workspace_id": hidden_ws, "user_id": USER_ID, "name": "SecretSector", "status": "running", "config": {}},
+        shared_ws: {"workspace_id": shared_ws, "user_id": colleague_id, "name": "SharedSector", "status": "running", "config": {}},
+    }
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(ws_db.get_workspace, side_effect=lambda wid, *a, **k: ws_rows.get(str(wid))),
+    )
+    transferred_unit = _sector_unit_row(
+        workspace_id=shared_ws,
+        owner_user_id=colleague_id,
+        lead_analyst_user_id=colleague_id,
+    )
+    monkeypatch.setattr(cu_db, "list_coverage_units", create_autospec(cu_db.list_coverage_units, return_value=[transferred_unit]))
+    monkeypatch.setattr(cu_db, "get_active_unit_by_workspace", create_autospec(cu_db.get_active_unit_by_workspace, return_value=transferred_unit))
+    real_get_reg = cu_mod.get_registered_units
+    monkeypatch.setattr(cu_mod, "get_registered_units", create_autospec(real_get_reg, return_value=[transferred_unit]))
+    monkeypatch.setattr(dt_mod, "get_registered_units", create_autospec(real_get_reg, return_value=[transferred_unit]))
+
+    sector_slug = "ai-infrastructure"
+    stale_row_on_hidden = {
+        "automation_id": "auto-hidden-stale-1",
+        "user_id": colleague_id,
+        "workspace_id": hidden_ws,
+        "name": f"dalton-sector-{sector_slug}-agenda",
+        "description": secret_desc,
+        "status": "paused",
+        "metadata": {"subject_kind": "sector", "unit_id": UNIT_ID, "stale_unit_binding": True},
+    }
+    monkeypatch.setattr(tr, "list_all_user_automations", create_autospec(tr.list_all_user_automations, return_value=[stale_row_on_hidden]))
+    monkeypatch.setattr(
+        sj,
+        "list_all_user_automations",
+        create_autospec(
+            sj.list_all_user_automations,
+            return_value=[stale_row_on_hidden, {"name": "dalton-msft-watch", "workspace_id": hidden_ws}],
+        ),
+    )
+    monkeypatch.setattr(sj, "_fetch_ops_jobs", create_autospec(sj._fetch_ops_jobs, return_value=[]))
+    monkeypatch.setattr(sj, "_fetch_data_system_jobs", create_autospec(sj._fetch_data_system_jobs, return_value=[]))
+
+    @asynccontextmanager
+    async def _no_db():
+        raise RuntimeError("no pool in unit test")
+        yield None  # pragma: no cover
+
+    monkeypatch.setattr(sj, "get_db_connection", _no_db)
+
+    async def _req_ws(ws_arg: Any, uid: str, *, channel: str = "web", need: str = "read", **kwargs: Any) -> dict[str, Any]:
+        wid = str(ws_arg.get("workspace_id") if isinstance(ws_arg, dict) else ws_arg)
+        if wid == hidden_ws and uid == colleague_id:
+            raise HTTPException(status_code=403, detail="hidden")
+        if wid == shared_ws and uid == colleague_id:
+            return ws_rows[shared_ws]
+        if uid == USER_ID and wid == shared_ws:
+            return ws_rows[shared_ws]
+        raise HTTPException(status_code=403, detail="denied")
+
+    import src.dalton.autonomy.sector as sector_mod
+    real_req_ws = sharing_mod.require_workspace_access
+    monkeypatch.setattr(sharing_mod, "require_workspace_access", create_autospec(real_req_ws, side_effect=_req_ws))
+    monkeypatch.setattr(sector_mod, "resolve_sector_due_timezone", create_autospec(sector_mod.resolve_sector_due_timezone, return_value=("America/New_York", "default")))
+    monkeypatch.setattr(tiers_mod, "is_internal_or_admin", create_autospec(tiers_mod.is_internal_or_admin, side_effect=lambda u: str(u) != "external-user"))
+    monkeypatch.setattr(sj, "is_internal_or_admin", create_autospec(sj.is_internal_or_admin, side_effect=lambda u: str(u) != "external-user"))
+
+    # 1) Colleague's list_system_jobs & single-key get_system_job_status omit hidden_ws + secret_desc + hidden company row
+    listed = await sj.list_system_jobs(colleague_id)
+    assert "company" in listed["groups"] and listed["groups"]["company"] == []
+    assert len(listed["groups"]["sector"]) == 1
+    sector_job = listed["groups"]["sector"][0]
+    agenda_slot = next(t for t in sector_job["tasks"] if t["name"] == f"dalton-sector-{sector_slug}-agenda")
+    assert agenda_slot["status"] == "missing"
+    assert agenda_slot["exists"] is False
+    assert agenda_slot["workspace_id"] is None
+    for leak in (hidden_ws, secret_desc, "auto-hidden-stale-1"):
+        assert leak not in json.dumps(listed, ensure_ascii=False)
+
+    single = await sj.get_system_job_status(colleague_id, f"sector:{sector_slug}")
+    single_slot = next(t for t in single["job"]["tasks"] if t["name"] == f"dalton-sector-{sector_slug}-agenda")
+    assert single_slot["exists"] is False
+    assert single_slot["workspace_id"] is None
+    for leak in (hidden_ws, secret_desc, "auto-hidden-stale-1"):
+        assert leak not in json.dumps(single, ensure_ascii=False)
+
+    # 2) Director CoS status passes caller Web read gate cleanly & redacts stale hidden_ws
+    monkeypatch.setattr(dt_mod, "verify_workspace_access", create_autospec(dt_mod.verify_workspace_access, side_effect=lambda ws_id, u, **k: ws_rows[str(ws_id)]))
+    tools = {t.name: t for t in build_director_tools(role="chief_of_staff")}
+    cos_jobs = tools["dalton_system_jobs"]
+    tool_status = json.loads(
+        await cos_jobs.ainvoke(
+            {"action": "status", "key": f"sector:{sector_slug}"},
+            config={"configurable": {"user_id": colleague_id}},
+        )
+    )
+    assert tool_status["ok"] is True
+    for leak in (hidden_ws, secret_desc, "auto-hidden-stale-1"):
+        assert leak not in json.dumps(tool_status, ensure_ascii=False)
+
+    # CoS rw shared workspace whose Web access is hidden -> denied (returns not found)
+    async def _req_ws_web_hidden(ws_arg: Any, uid: str, *, channel: str = "web", need: str = "read", **kwargs: Any) -> dict[str, Any]:
+        if channel == "web":
+            raise HTTPException(status_code=403, detail="web hidden")
+        return ws_rows[shared_ws]
+
+    monkeypatch.setattr(sharing_mod, "require_workspace_access", create_autospec(real_req_ws, side_effect=_req_ws_web_hidden))
+    web_hidden_res = json.loads(
+        await cos_jobs.ainvoke(
+            {"action": "status", "key": f"sector:{sector_slug}"},
+            config={"configurable": {"user_id": USER_ID}},
+        )
+    )
+    assert web_hidden_res["ok"] is False
+    assert web_hidden_res["error"] == "system_job_error"
+
+    # External user on sector:* -> denied BEFORE touching get_registered_units
+    dt_mod.get_registered_units.reset_mock()
+    ext_res = json.loads(
+        await cos_jobs.ainvoke(
+            {"action": "status", "key": f"sector:{sector_slug}"},
+            config={"configurable": {"user_id": "external-user"}},
+        )
+    )
+    assert ext_res["ok"] is False
+    assert ext_res["error"] == "system_job_error"
+    dt_mod.get_registered_units.assert_not_awaited()
+
+    # Registry outage in director status returns coverage_identity_unavailable (not "未找到")
+    monkeypatch.setattr(
+        dt_mod,
+        "get_registered_units",
+        create_autospec(real_get_reg, side_effect=RuntimeError("db down secret")),
+    )
+    unavail_res = json.loads(
+        await cos_jobs.ainvoke(
+            {"action": "status", "key": f"sector:{sector_slug}"},
+            config={"configurable": {"user_id": colleague_id}},
+        )
+    )
+    assert unavail_res["ok"] is False
+    assert unavail_res["error"] == "coverage_identity_unavailable"
+    assert "db down secret" not in json.dumps(unavail_res, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_sector_tracking_enable_disable_and_director_status_respect_web_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 7 Item 2: sector POST /tracking/{ws_id} (enable/disable) and director
+    dalton_coverage_tracking(status) check caller Web read permission and omit stale
+    task rows belonging to an unreadable pre-rebind workspace."""
+    from fastapi import FastAPI, HTTPException
+    from fastapi.testclient import TestClient
+    import src.dalton.access_tiers as tiers_mod
+    import src.dalton.autonomy.tracking as tr
+    import src.dalton.database.coverage_units as cu_db
+    import src.dalton.sharing as sharing_mod
+    import src.dalton.tools.director_tools as dt_mod
+    from src.dalton.app import dalton_router
+    from src.dalton.tools.director_tools import build_director_tools
+    from src.server.database import workspace as ws_db
+    from src.server.utils.api import get_current_user_id
+
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "1")
+    monkeypatch.setenv("DALTON_PM_USER_IDS", "pm-viewer")
+
+    owner_id = "colleague-owner"
+    pm_id = "pm-viewer"
+    hidden_ws = "99999999-9999-4999-8999-999999999991"
+    shared_ws = "88888888-8888-4888-8888-888888888882"
+    sector_slug = "ai-infrastructure"
+    unit = _sector_unit_row(
+        workspace_id=shared_ws,
+        owner_user_id=owner_id,
+        lead_analyst_user_id=owner_id,
+    )
+
+    ws_rows = {
+        hidden_ws: {"workspace_id": hidden_ws, "user_id": owner_id, "name": "SecretOldWS", "status": "running", "config": {}},
+        shared_ws: {"workspace_id": shared_ws, "user_id": owner_id, "name": "SharedSectorWS", "status": "running", "config": {}},
+    }
+    orig_get_ws = ws_db.get_workspace
+    fixtures = _install_sector_store(monkeypatch)
+    # Pre-seed stale active task on hidden_ws (owner later rebound unit to shared_ws)
+    fixtures["store"].append(
+        {
+            "automation_id": "auto-hidden-stale-task",
+            "user_id": owner_id,
+            "workspace_id": hidden_ws,
+            "name": f"dalton-sector-{sector_slug}-agenda",
+            "description": "SECRET_HIDDEN_DESC",
+            "status": "active",
+            "metadata": {"subject_kind": "sector", "unit_id": UNIT_ID},
+        }
+    )
+
+    monkeypatch.setattr(cu_db, "get_active_unit_by_workspace", create_autospec(cu_db.get_active_unit_by_workspace, return_value=unit))
+    monkeypatch.setattr(cu_db, "get_coverage_unit", create_autospec(cu_db.get_coverage_unit, return_value=unit))
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(orig_get_ws, side_effect=lambda wid, *a, **k: ws_rows.get(str(wid))),
+    )
+    monkeypatch.setattr(tiers_mod, "is_internal_or_admin", create_autospec(tiers_mod.is_internal_or_admin, return_value=True))
+    monkeypatch.setattr(tiers_mod, "classify_owner_tier", create_autospec(tiers_mod.classify_owner_tier, return_value="internal"))
+
+    async def _req_ws(ws_arg: Any, uid: str, *, channel: str = "web", need: str = "read", **kwargs: Any) -> dict[str, Any]:
+        wid = str(ws_arg.get("workspace_id") if isinstance(ws_arg, dict) else ws_arg)
+        if wid == hidden_ws and uid == pm_id:
+            raise HTTPException(status_code=403, detail="hidden")
+        if wid == shared_ws and uid == pm_id and channel == "web" and need == "read":
+            return ws_rows[shared_ws]
+        if uid == owner_id and wid in ws_rows:
+            return ws_rows[wid]
+        raise HTTPException(status_code=403, detail="denied")
+
+    orig_req_ws = sharing_mod.require_workspace_access
+    monkeypatch.setattr(sharing_mod, "require_workspace_access", create_autospec(orig_req_ws, side_effect=_req_ws))
+    monkeypatch.setattr(
+        sharing_mod,
+        "verify_workspace_access",
+        create_autospec(
+            sharing_mod.verify_workspace_access,
+            side_effect=lambda wid, uid, **k: _req_ws(wid, uid, **k),
+        ),
+    )
+
+    app = FastAPI()
+    app.dependency_overrides[get_current_user_id] = lambda: pm_id
+    app.include_router(dalton_router)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    # PM can enable & disable on readable shared_ws, and stale hidden_ws task NEVER leaks in tasks[]
+    en_resp = client.post(f"/api/v1/dalton/tracking/{shared_ws}", json={"enabled": True})
+    assert en_resp.status_code == 200
+    assert hidden_ws not in en_resp.text
+    assert "SECRET_HIDDEN_DESC" not in en_resp.text
+    assert all(t.get("workspace_id") != hidden_ws for t in en_resp.json().get("tasks", []))
+
+    dis_resp = client.post(f"/api/v1/dalton/tracking/{shared_ws}", json={"enabled": False})
+    assert dis_resp.status_code == 200
+    assert hidden_ws not in dis_resp.text
+    assert all(t.get("workspace_id") != hidden_ws for t in dis_resp.json().get("tasks", []))
+
+    # PM calling tracking endpoint on hidden_ws is denied
+    assert client.post(f"/api/v1/dalton/tracking/{hidden_ws}", json={"enabled": True}).status_code == 403
+    assert client.get(f"/api/v1/dalton/tracking/{hidden_ws}").status_code == 403
+
+    # Director dalton_coverage_tracking(status) also enforces Web read when coverage_units is ON
+    async def _cos_only_ws(ws_arg: Any, uid: str, *, channel: str = "web", need: str = "read", **kwargs: Any) -> dict[str, Any]:
+        if channel == "web":
+            raise HTTPException(status_code=403, detail="web hidden")
+        return ws_rows[shared_ws]
+
+    monkeypatch.setattr(dt_mod, "verify_workspace_access", create_autospec(dt_mod.verify_workspace_access, return_value=ws_rows[shared_ws]))
+    monkeypatch.setattr(sharing_mod, "require_workspace_access", create_autospec(orig_req_ws, side_effect=_cos_only_ws))
+    monkeypatch.setattr(dt_mod, "get_tracking_status", create_autospec(tr.get_tracking_status, side_effect=tr.get_tracking_status))
+    tools = {t.name: t for t in build_director_tools(role="chief_of_staff")}
+    with pytest.raises(HTTPException) as exc_info:
+        await tools["dalton_coverage_tracking"].ainvoke(
+            {"action": "status", "workspace_id": shared_ws},
+            config={"configurable": {"user_id": pm_id, "workspace_id": "home"}},
+        )
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_analyst_sector_run_now_surfaces_coverage_identity_unavailable_on_registry_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 8 Item 7.2b: first sector check (get_active_unit_by_workspace) succeeds,
+    and only the second registry query inside run_system_job_now (list_coverage_units)
+    fails -> analyst tool catches CoverageIdentityUnavailableError cleanly without raw exc."""
+    import src.dalton.access_tiers as tiers_mod
+    import src.dalton.autonomy.system_jobs as sj
+    import src.dalton.database.coverage_units as cu_db
+    import src.dalton.database.knowledge as kv_db
+    import src.dalton.sharing as sharing_mod
+    import src.dalton.tools.director_tools as dt_mod
+    from src.dalton.tools.director_tools import build_director_tools
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "1")
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_workspace_access",
+        create_autospec(
+            sharing_mod.require_workspace_access,
+            return_value={"workspace_id": WS_ID, "user_id": USER_ID, "name": "AI", "config": {}},
+        ),
+    )
+    unit = _sector_unit_row()
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={"workspace_id": WS_ID, "user_id": USER_ID, "name": "AI", "config": {}},
+        ),
+    )
+    monkeypatch.setattr(
+        dt_mod,
+        "verify_workspace_access",
+        create_autospec(
+            dt_mod.verify_workspace_access,
+            return_value={"workspace_id": WS_ID, "user_id": USER_ID, "name": "AI", "config": {}},
+        ),
+    )
+    monkeypatch.setattr(
+        kv_db,
+        "list_all_latest_for_workspace",
+        create_autospec(kv_db.list_all_latest_for_workspace, return_value={}),
+    )
+    # 1st query succeeds (tool pre-check identifies sector workspace)
+    monkeypatch.setattr(
+        cu_db,
+        "get_active_unit_by_workspace",
+        create_autospec(cu_db.get_active_unit_by_workspace, return_value=unit),
+    )
+    # 2nd query inside real run_system_job_now fails
+    monkeypatch.setattr(
+        tiers_mod,
+        "is_internal_or_admin",
+        create_autospec(tiers_mod.is_internal_or_admin, return_value=True),
+    )
+    monkeypatch.setattr(
+        sj,
+        "is_internal_or_admin",
+        create_autospec(sj.is_internal_or_admin, return_value=True),
+    )
+    monkeypatch.setattr(
+        cu_db,
+        "list_coverage_units",
+        create_autospec(
+            cu_db.list_coverage_units,
+            side_effect=RuntimeError("secret pg connection failure"),
+        ),
+    )
+    tool = {t.name: t for t in build_director_tools(role="analyst")}["dalton_system_jobs"]
+    res = json.loads(
+        await tool.ainvoke(
+            {"action": "run_now", "key": "sector:ai-infrastructure"},
+            config={"configurable": {"user_id": USER_ID, "workspace_id": WS_ID}},
+        )
+    )
+    assert res["ok"] is False
+    assert res["error"] == "coverage_identity_unavailable"
+    assert "secret pg connection failure" not in json.dumps(res, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_toggle_sector_system_job_three_entrypoints_filter_hidden_stale_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 8 Item 1: POST /system-jobs/sector:<slug>, director dalton_system_jobs(enable/disable),
+    and director dalton_coverage_tracking(enable/disable) all pass caller as effective_viewer and
+    omit stale task rows belonging to an unreadable pre-rebind workspace A."""
+    from fastapi import FastAPI, HTTPException
+    from fastapi.testclient import TestClient
+    import src.dalton.access_tiers as tiers_mod
+    import src.dalton.autonomy.system_jobs as sj
+    import src.dalton.database.coverage_units as cu_db
+    import src.dalton.sharing as sharing_mod
+    import src.dalton.tools.director_tools as dt_mod
+    from src.dalton.app import dalton_router
+    from src.dalton.tools.director_tools import build_director_tools
+    from src.server.database import workspace as ws_db
+    from src.server.utils.api import get_current_user_id
+
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "1")
+    monkeypatch.setenv("DALTON_PM_USER_IDS", "pm-viewer")
+
+    owner_id = "colleague-owner"
+    pm_id = "pm-viewer"
+    hidden_ws = "99999999-9999-4999-8999-999999999991"
+    shared_ws = "88888888-8888-4888-8888-888888888882"
+    sector_slug = "ai-infrastructure"
+    unit = _sector_unit_row(
+        workspace_id=shared_ws,
+        owner_user_id=owner_id,
+        lead_analyst_user_id=pm_id,
+    )
+    ws_rows = {
+        hidden_ws: {"workspace_id": hidden_ws, "user_id": owner_id, "name": "SecretHiddenWS", "status": "running", "config": {}},
+        shared_ws: {"workspace_id": shared_ws, "user_id": owner_id, "name": "SharedSectorWS", "status": "running", "config": {}},
+    }
+    orig_get_ws = ws_db.get_workspace
+    fixtures = _install_sector_store(monkeypatch)
+    fixtures["store"].append(
+        {
+            "automation_id": "auto-hidden-stale-1",
+            "user_id": owner_id,
+            "workspace_id": hidden_ws,
+            "name": f"dalton-sector-{sector_slug}-agenda",
+            "description": "SECRET_STALE_TASK_DESC",
+            "status": "active",
+            "metadata": {"subject_kind": "sector", "unit_id": UNIT_ID},
+        }
+    )
+    # Mirror for when shared_ws owner toggles via dalton_system_jobs (owner_id != hidden viewer or PM toggles via REST)
+    fixtures["store"].append(
+        {
+            "automation_id": "auto-hidden-stale-pm",
+            "user_id": pm_id,
+            "workspace_id": hidden_ws,
+            "name": f"dalton-sector-{sector_slug}-agenda",
+            "description": "SECRET_STALE_PM_TASK_DESC",
+            "status": "active",
+            "metadata": {"subject_kind": "sector", "unit_id": UNIT_ID},
+        }
+    )
+
+    monkeypatch.setattr(cu_db, "get_active_unit_by_workspace", create_autospec(cu_db.get_active_unit_by_workspace, return_value=unit))
+    monkeypatch.setattr(cu_db, "get_coverage_unit", create_autospec(cu_db.get_coverage_unit, return_value=unit))
+    monkeypatch.setattr(cu_db, "list_coverage_units", create_autospec(cu_db.list_coverage_units, return_value=[unit]))
+    monkeypatch.setattr(ws_db, "get_workspace", create_autospec(orig_get_ws, side_effect=lambda wid, *a, **k: ws_rows.get(str(wid))))
+    monkeypatch.setattr(tiers_mod, "is_internal_or_admin", create_autospec(tiers_mod.is_internal_or_admin, return_value=True))
+    monkeypatch.setattr(tiers_mod, "classify_owner_tier", create_autospec(tiers_mod.classify_owner_tier, return_value="internal"))
+    monkeypatch.setattr(sj, "is_internal_or_admin", create_autospec(sj.is_internal_or_admin, return_value=True))
+
+    async def _req_ws(ws_arg: Any, uid: str, *, channel: str = "web", need: str = "read", **kwargs: Any) -> dict[str, Any]:
+        wid = str(ws_arg.get("workspace_id") if isinstance(ws_arg, dict) else ws_arg)
+        if wid == hidden_ws:
+            raise HTTPException(status_code=403, detail="hidden")
+        if wid == shared_ws and uid in (pm_id, owner_id):
+            return ws_rows[shared_ws]
+        raise HTTPException(status_code=403, detail="denied")
+
+    async def _verify_ws(wid: Any, uid: str, **k: Any) -> dict[str, Any]:
+        return await _req_ws(wid, uid, **k)
+
+    monkeypatch.setattr(sharing_mod, "require_workspace_access", create_autospec(sharing_mod.require_workspace_access, side_effect=_req_ws))
+    monkeypatch.setattr(
+        sharing_mod,
+        "verify_workspace_access",
+        create_autospec(sharing_mod.verify_workspace_access, side_effect=_verify_ws),
+    )
+    monkeypatch.setattr(
+        dt_mod,
+        "verify_workspace_access",
+        create_autospec(dt_mod.verify_workspace_access, side_effect=_verify_ws),
+    )
+
+    def _assert_no_stale(payload: Any) -> None:
+        raw = json.dumps(payload, ensure_ascii=False)
+        assert hidden_ws not in raw
+        assert "SECRET_STALE_TASK_DESC" not in raw
+        assert "SECRET_STALE_PM_TASK_DESC" not in raw
+        tasks = payload.get("job", {}).get("tasks") if "job" in payload else payload.get("tasks")
+        assert all(t.get("workspace_id") != hidden_ws for t in (tasks or []))
+
+    # Entry A: REST POST /system-jobs/sector:<slug> (enable & disable as PM)
+    app = FastAPI()
+    app.dependency_overrides[get_current_user_id] = lambda: pm_id
+    app.include_router(dalton_router)
+    client = TestClient(app, raise_server_exceptions=False)
+    for en in (True, False):
+        resp = client.post(f"/api/v1/dalton/system-jobs/sector:{sector_slug}", json={"enabled": en})
+        assert resp.status_code == 200
+        _assert_no_stale(resp.json())
+
+    # Entry B: director dalton_system_jobs(action="enable"/"disable")
+    tools = {t.name: t for t in build_director_tools(role="chief_of_staff")}
+    for act in ("enable", "disable"):
+        sys_res = json.loads(
+            await tools["dalton_system_jobs"].ainvoke(
+                {"action": act, "key": f"sector:{sector_slug}"},
+                config={"configurable": {"user_id": pm_id, "workspace_id": "home"}},
+            )
+        )
+        assert sys_res["ok"] is True
+        _assert_no_stale(sys_res)
+
+    # Entry C: director dalton_coverage_tracking(action="enable"/"disable") as the unit's lead
+    # analyst. Part 2 (design §3.2): on a bound unit only the lead (or a PM) toggles tracking, so
+    # the workspace owner who is not the lead is refused outright.
+    for act in ("enable", "disable"):
+        trk_res = json.loads(
+            await tools["dalton_coverage_tracking"].ainvoke(
+                {"action": act, "workspace_id": shared_ws},
+                config={"configurable": {"user_id": pm_id, "workspace_id": "home"}},
+            )
+        )
+        assert trk_res["ok"] is True
+        _assert_no_stale(trk_res)
+    with pytest.raises(HTTPException) as refused:
+        await tools["dalton_coverage_tracking"].ainvoke(
+            {"action": "enable", "workspace_id": shared_ws},
+            config={"configurable": {"user_id": owner_id, "workspace_id": "home"}},
+        )
+    assert refused.value.status_code == 403
+    assert hidden_ws not in str(refused.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_analyst_tools_check_web_read_before_resolving_sector_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 8 Item 3: analyst dalton_coverage_tracking(status) and dalton_system_jobs(status)
+    check Web read permission BEFORE resolving current_ws identity, never leaking ws UUID or slug."""
+    from fastapi import HTTPException
+    import src.dalton.coverage.identity as id_mod
+    import src.dalton.sharing as sharing_mod
+    from src.dalton.tools.director_tools import build_director_tools
+
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "1")
+    hidden_sector_ws = "99999999-9999-4999-8999-999999999991"
+    secret_slug = "secret-semi-slug"
+
+    monkeypatch.setattr(
+        id_mod,
+        "resolve_workspace_coverage_identity",
+        create_autospec(
+            id_mod.resolve_workspace_coverage_identity,
+            side_effect=AssertionError("must check Web read before resolving identity"),
+        ),
+    )
+
+    async def _web_denied(ws_id: Any, uid: str, *, channel: str = "web", need: str = "read", **kw: Any) -> dict[str, Any]:
+        if channel == "web":
+            raise HTTPException(status_code=403, detail="web hidden")
+        return {"workspace_id": hidden_sector_ws, "user_id": uid}
+
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_workspace_access",
+        create_autospec(sharing_mod.require_workspace_access, side_effect=_web_denied),
+    )
+
+    analyst_tools = {t.name: t for t in build_director_tools(role="analyst")}
+    cfg = {"configurable": {"user_id": USER_ID, "workspace_id": hidden_sector_ws}}
+
+    for trk_call in (
+        {"action": "status", "ticker": "NVDA"},
+        {"action": "enable", "ticker": "NVDA"},
+        {"action": "disable"},
+    ):
+        trk_err = json.loads(
+            await analyst_tools["dalton_coverage_tracking"].ainvoke(trk_call, config=cfg)
+        )
+        assert trk_err["ok"] is False
+        assert trk_err["error"] == "forbidden_workspace"
+        assert hidden_sector_ws not in json.dumps(trk_err, ensure_ascii=False)
+        assert secret_slug not in json.dumps(trk_err, ensure_ascii=False)
+
+    for job_call in (
+        {"action": "status", "key": "dalton-data-health"},
+        {"action": "list"},
+        {"action": "disable", "key": "dalton-data-health"},
+        {"action": "enable", "key": "dalton-data-health"},
+        {"action": "run_now", "key": f"sector:{secret_slug}"},
+    ):
+        job_err = json.loads(
+            await analyst_tools["dalton_system_jobs"].ainvoke(job_call, config=cfg)
+        )
+        assert job_err["ok"] is False
+        assert job_err["error"] == "forbidden_workspace"
+        assert hidden_sector_ws not in json.dumps(job_err, ensure_ascii=False)
+        assert secret_slug not in json.dumps(job_err, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_round11_renamed_sector_task_visible_across_status_disable_and_enable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 11 Item 3:
+    A sector task renamed away from `dalton-sector-*` still carries its `unit_id`
+    association and remains visible in `get_tracking_status`, `disable_tracking`,
+    and `enable_tracking` refreshes.
+    """
+    import src.dalton.autonomy.tracking as tr
+
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "1")
+    unit = _sector_unit_row(workspace_id=WS_ID, owner_user_id=USER_ID, lead_analyst_user_id=USER_ID)
+    _install_sector_unit(monkeypatch, unit)
+    fx = _install_sector_store(
+        monkeypatch,
+        workspace_ids=(WS_ID,),
+        initial_rows=[
+            {
+                "automation_id": "auto-sector-renamed",
+                "user_id": USER_ID,
+                "workspace_id": WS_ID,
+                "name": "custom-sector-focus",
+                "status": "paused",
+                "trigger_type": "cron",
+                "cron_expression": "0 8 * * 1-5",
+                "timezone": "America/New_York",
+                "next_run_at": None,
+                "metadata": {
+                    "dalton_kind": "sector_watch",
+                    "subject_kind": "sector",
+                    "unit_id": UNIT_ID,
+                    "paused_by_user": True,
+                },
+            }
+        ],
+    )
+
+    helper_mock = tr.schedule_dalton_automation_helper
+    orig_side = helper_mock.side_effect
+
+    async def _helper_with_resume(name: Any, spec: Any = None, **kwargs: Any) -> dict[str, Any]:
+        if isinstance(spec, dict) and spec.get("action") == "resume":
+            target_id = str(spec.get("automation_id") or "")
+            for r in fx["store"]:
+                if (target_id and str(r.get("automation_id")) == target_id) or str(r.get("name")) == str(name):
+                    r["status"] = "active"
+                    meta = dict(r.get("metadata") or {})
+                    meta.pop("paused_by_user", None)
+                    r["metadata"] = meta
+                    return {"ok": True, "action": "resumed", "name": name}
+        return await orig_side(name, spec=spec, **kwargs)
+
+    helper_mock.side_effect = _helper_with_resume
+
+    paused_status = await tr.get_tracking_status(USER_ID, WS_ID)
+    assert paused_status["status"] == "disabled"
+    assert any(t["name"] == "custom-sector-focus" for t in paused_status["tasks"])
+
+    dis_res = await tr.disable_tracking(USER_ID, WS_ID)
+    assert dis_res["status"] == "disabled"
+    assert fx["store"][0]["status"] == "paused"
+
+    en_res = await tr.enable_tracking(USER_ID, WS_ID, respect_user_pause=False)
+    assert en_res["status"] == "enabled"
+    assert fx["store"][0]["status"] == "active"
+
+    refreshed = await tr.get_tracking_status(USER_ID, WS_ID)
+    assert refreshed["status"] == "enabled"
+    assert any(
+        t["name"] == "custom-sector-focus" and t["status"] == "active"
+        for t in refreshed["tasks"]
+    )

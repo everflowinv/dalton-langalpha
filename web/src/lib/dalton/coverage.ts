@@ -30,11 +30,19 @@ export interface CoverageUnitEntry {
   kind: CoverageUnitKind;
   slug: string | null;
   display_name: string | null;
-  owner_user_id: string;
+  owner_user_id: string | null;
+  created_by_user_id?: string | null;
+  lead_analyst_user_id?: string | null;
+  bound?: boolean;
   workspace_id: string | null;
+  workspace_owner_id?: string | null;
   readable: boolean;
   delegatable: boolean;
   auto_tracked: boolean;
+  workspace_share_rw?: boolean;
+  can_bind?: boolean;
+  can_unbind?: boolean;
+  can_archive?: boolean;
   ticker?: string | null;
   members?: SectorMember[];
 }
@@ -46,10 +54,22 @@ export interface UnclassifiedWorkspace {
   updated_at: string | null;
 }
 
+export interface BindableWorkspace extends UnclassifiedWorkspace {
+  owner_user_id: string;
+  owner_name: string | null;
+  owner_email: string | null;
+  is_own: boolean;
+}
+
 /** 开关关闭时后端只返回 `{enabled: false}`，不带其余键。 */
 export type DaltonCoverageUnitsResponse =
   | { enabled: false }
-  | { enabled: true; units: CoverageUnitEntry[]; unclassified: UnclassifiedWorkspace[] };
+  | {
+      enabled: true;
+      units: CoverageUnitEntry[];
+      unclassified: UnclassifiedWorkspace[];
+      bindable_workspaces?: BindableWorkspace[];
+    };
 
 export interface SectorDocSummary {
   version_no: number | null;
@@ -162,7 +182,7 @@ export interface ReReviewItem {
   value: string;
   urgency: string;
   status: string;
-  source_ref: Record<string, unknown> | null;
+  source_ref?: Record<string, unknown> | null;
 }
 
 export interface CoverageUnitDetail {
@@ -170,11 +190,19 @@ export interface CoverageUnitDetail {
   kind: CoverageUnitKind;
   slug: string | null;
   display_name: string | null;
-  owner_user_id: string;
+  owner_user_id: string | null;
+  created_by_user_id?: string | null;
+  lead_analyst_user_id?: string | null;
+  bound?: boolean;
   workspace_id: string | null;
+  workspace_owner_id?: string | null;
   readable: boolean;
   delegatable: boolean;
   auto_tracked: boolean;
+  workspace_share_rw?: boolean;
+  can_bind?: boolean;
+  can_unbind?: boolean;
+  can_archive?: boolean;
   ticker?: string | null;
   sector?: {
     docs: {
@@ -361,11 +389,14 @@ export function useDaltonCoverageUnitDetail(unitId: string | null) {
 export interface CoverageUnitRecord {
   unit_id: string;
   kind: CoverageUnitKind;
-  owner_user_id: string;
+  owner_user_id: string | null;
+  created_by_user_id?: string | null;
+  lead_analyst_user_id?: string | null;
   slug: string;
   display_name: string;
   workspace_id: string | null;
   ticker: string | null;
+  ticker_key?: string | null;
   status: string;
   research_tz: string | null;
   created_at: string;
@@ -378,6 +409,13 @@ export interface RegisterCoverageUnitPayload {
   display_name?: string;
   ticker?: string | null;
   research_tz?: string | null;
+  workspace_id?: string | null;
+}
+
+export interface CoverageUnitBlockingAutomations {
+  names: string[];
+  count: number;
+  hasMore: boolean;
 }
 
 /** 从被拒请求里取稳定错误码；非本写路径的错误（无结构 detail）返回 null。 */
@@ -394,6 +432,40 @@ export function coverageUnitErrorCode(err: unknown): string | null {
     return (detail as { error: string }).error;
   }
   return null;
+}
+
+/** 从 409 detail 里提取阻塞解绑/归档的受管任务信息（无读取权限时仅返回 count）。 */
+export function coverageUnitBlockingAutomations(
+  err: unknown,
+): CoverageUnitBlockingAutomations | null {
+  const detail = (
+    err as { response?: { data?: { detail?: unknown } } } | null
+  )?.response?.data?.detail;
+  if (!detail || typeof detail !== 'object') {
+    return null;
+  }
+  const obj = detail as {
+    blocking_automations?: unknown;
+    blocking_automations_count?: unknown;
+    blocking_automations_has_more?: unknown;
+  };
+  const names = Array.isArray(obj.blocking_automations)
+    ? obj.blocking_automations
+        .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+        .map((item) => item.trim())
+    : [];
+  const count =
+    typeof obj.blocking_automations_count === 'number' && obj.blocking_automations_count > 0
+      ? obj.blocking_automations_count
+      : names.length;
+  if (names.length === 0 && count === 0) {
+    return null;
+  }
+  return {
+    names,
+    count,
+    hasMore: Boolean(obj.blocking_automations_has_more),
+  };
 }
 
 export async function registerDaltonCoverageUnit(

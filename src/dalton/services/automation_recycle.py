@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 from psycopg.errors import UniqueViolation
+from psycopg.rows import dict_row
 
 from ptc_agent.core.paths import AUTOMATION_FILE_NAME
 
@@ -572,9 +573,35 @@ async def soft_delete_automation(
     principal: Principal | None = None,
 ) -> AutomationReadResponse | None:
     """Soft-delete one automation. None when the owner filter misses the row."""
+    from src.dalton.autonomy.classification import is_managed_unit_automation
+    from src.dalton.coverage.units import lock_and_assert_managed_unit_write_allowed
+    from src.dalton.settings import is_coverage_units_enabled
+
+    units_on = (not company) and is_coverage_units_enabled()
     async with get_db_connection(conn) as db:
         async with db.transaction():
             pref_owner = owner_user_id or COMPANY_SYSTEM_USER_ID
+            pre_unit_ws: str | None = None
+            if units_on:
+                async with db.cursor(row_factory=dict_row) as probe_cur:
+                    await probe_cur.execute(
+                        "SELECT workspace_id, user_id, name, metadata FROM automations WHERE automation_id = %s::uuid",
+                        (automation_id,),
+                    )
+                    probe = await probe_cur.fetchone()
+                if (
+                    probe is not None
+                    and probe.get("workspace_id") is not None
+                    and is_managed_unit_automation(probe)
+                ):
+                    pre_unit_ws = str(probe["workspace_id"])
+                    await lock_and_assert_managed_unit_write_allowed(
+                        owner_user_id=str(probe.get("user_id") or pref_owner),
+                        workspace_id=pre_unit_ws,
+                        name=probe.get("name"),
+                        metadata=probe.get("metadata"),
+                        conn=db,
+                    )
             prefs = await _prepare_prefs(
                 pref_owner,
                 company=company,
@@ -590,6 +617,16 @@ async def soft_delete_automation(
                 return None
             if company:
                 _assert_company_recycle_row(row)
+            elif units_on and row.get("workspace_id") is not None:
+                row_ws = str(row["workspace_id"])
+                if is_managed_unit_automation(row) or (pre_unit_ws and row_ws == pre_unit_ws):
+                    await lock_and_assert_managed_unit_write_allowed(
+                        owner_user_id=str(row.get("user_id") or pref_owner),
+                        workspace_id=row_ws,
+                        name=row.get("name"),
+                        metadata=row.get("metadata"),
+                        conn=db,
+                    )
             if row.get("deleted_at") is not None:
                 raise HTTPException(
                     status_code=409,
@@ -673,9 +710,35 @@ async def restore_automation(
     principal: Principal | None = None,
 ) -> AutomationReadResponse | None:
     """Restore one soft-deleted automation. None when the owner filter misses."""
+    from src.dalton.autonomy.classification import is_managed_unit_automation
+    from src.dalton.coverage.units import lock_and_assert_managed_unit_write_allowed
+    from src.dalton.settings import is_coverage_units_enabled
+
+    units_on = (not company) and is_coverage_units_enabled()
     async with get_db_connection(conn) as db:
         async with db.transaction():
             pref_owner = owner_user_id or COMPANY_SYSTEM_USER_ID
+            pre_unit_ws: str | None = None
+            if units_on:
+                async with db.cursor(row_factory=dict_row) as probe_cur:
+                    await probe_cur.execute(
+                        "SELECT workspace_id, user_id, name, metadata FROM automations WHERE automation_id = %s::uuid",
+                        (automation_id,),
+                    )
+                    probe = await probe_cur.fetchone()
+                if (
+                    probe is not None
+                    and probe.get("workspace_id") is not None
+                    and is_managed_unit_automation(probe)
+                ):
+                    pre_unit_ws = str(probe["workspace_id"])
+                    await lock_and_assert_managed_unit_write_allowed(
+                        owner_user_id=str(probe.get("user_id") or pref_owner),
+                        workspace_id=pre_unit_ws,
+                        name=probe.get("name"),
+                        metadata=probe.get("metadata"),
+                        conn=db,
+                    )
             prefs = await _prepare_prefs(
                 pref_owner,
                 company=company,
@@ -691,6 +754,16 @@ async def restore_automation(
                 return None
             if company:
                 _assert_company_recycle_row(row)
+            elif units_on and row.get("workspace_id") is not None:
+                row_ws = str(row["workspace_id"])
+                if is_managed_unit_automation(row) or (pre_unit_ws and row_ws == pre_unit_ws):
+                    await lock_and_assert_managed_unit_write_allowed(
+                        owner_user_id=str(row.get("user_id") or pref_owner),
+                        workspace_id=row_ws,
+                        name=row.get("name"),
+                        metadata=row.get("metadata"),
+                        conn=db,
+                    )
             if row.get("deleted_at") is None:
                 raise HTTPException(
                     status_code=409,
@@ -855,9 +928,35 @@ async def rollback_automation(
 ) -> AutomationReadResponse | None:
     """Roll one automation back to the active entry's immediate previous version."""
     cache_user_id: str | None = None
+    from src.dalton.autonomy.classification import is_managed_unit_automation
+    from src.dalton.coverage.units import lock_and_assert_managed_unit_write_allowed
+    from src.dalton.settings import is_coverage_units_enabled
+
+    units_on = (not company) and is_coverage_units_enabled()
     async with get_db_connection(conn) as db:
         async with db.transaction():
             pref_owner = owner_user_id or COMPANY_SYSTEM_USER_ID
+            pre_unit_ws: str | None = None
+            if units_on:
+                async with db.cursor(row_factory=dict_row) as probe_cur:
+                    await probe_cur.execute(
+                        "SELECT workspace_id, user_id, name, metadata FROM automations WHERE automation_id = %s::uuid",
+                        (automation_id,),
+                    )
+                    probe = await probe_cur.fetchone()
+                if (
+                    probe is not None
+                    and probe.get("workspace_id") is not None
+                    and is_managed_unit_automation(probe)
+                ):
+                    pre_unit_ws = str(probe["workspace_id"])
+                    await lock_and_assert_managed_unit_write_allowed(
+                        owner_user_id=str(probe.get("user_id") or pref_owner),
+                        workspace_id=pre_unit_ws,
+                        name=probe.get("name"),
+                        metadata=probe.get("metadata"),
+                        conn=db,
+                    )
             prefs = await _prepare_prefs(
                 pref_owner,
                 company=company,
@@ -873,6 +972,16 @@ async def rollback_automation(
                 return None
             if company:
                 _assert_company_recycle_row(row)
+            elif units_on and row.get("workspace_id") is not None:
+                row_ws = str(row["workspace_id"])
+                if is_managed_unit_automation(row) or (pre_unit_ws and row_ws == pre_unit_ws):
+                    await lock_and_assert_managed_unit_write_allowed(
+                        owner_user_id=str(row.get("user_id") or pref_owner),
+                        workspace_id=row_ws,
+                        name=row.get("name"),
+                        metadata=row.get("metadata"),
+                        conn=db,
+                    )
             if row.get("deleted_at") is not None:
                 raise HTTPException(
                     status_code=409,

@@ -17,7 +17,11 @@ from fastapi import HTTPException
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from src.dalton.access_tiers import get_user_tier
+from src.dalton.access_tiers import get_user_tier, is_internal_or_admin
+from src.dalton.coverage.identity import (
+    _TICKER_FROM_AUTO_NAME_RE,
+    CoverageIdentityUnavailableError,
+)
 from src.dalton.services.company_automations import (
     automation_history_context,
     get_current_history_context,
@@ -29,12 +33,12 @@ from src.dalton.autonomy.schedule import (
     user_automations_lock,
 )
 from src.dalton.autonomy.tracking import (
+    _SYSTEM_JOB_VIEWER_USER_ID,
     disable_tracking,
     enable_tracking,
     get_tracking_status,
     resolve_workspace_id_by_ticker,
 )
-from src.dalton.coverage.identity import _TICKER_FROM_AUTO_NAME_RE
 from src.dalton.data_jobs.manifest import (
     DataTaskManifestEntry,
     load_data_task_manifest,
@@ -330,6 +334,7 @@ async def _discover_company_workspaces(
     """Return company workspace IDs for ``user_id`` from ``workspaces`` table + existing automations."""
     ws_ids: list[str] = []
     seen: set[str] = set()
+    own_ws_ids: set[str] = set()
     try:
         async with get_db_connection() as conn, conn.cursor() as cur:
             await cur.execute(
@@ -354,9 +359,29 @@ async def _discover_company_workspaces(
                 ):
                     continue
                 seen.add(wid)
+                own_ws_ids.add(wid)
                 ws_ids.append(wid)
     except Exception as exc:
         logger.debug("[DALTON_SYSTEM_JOBS] Failed querying company workspaces: %s", exc)
+
+    from src.dalton.settings import is_coverage_units_enabled
+    from src.dalton.sharing import require_workspace_access
+
+    if is_coverage_units_enabled():
+        try:
+            from src.dalton.database.coverage_units import list_coverage_units
+
+            lead_units = await list_coverage_units(user_id, include_archived=False)
+            for u in lead_units or []:
+                if str(u.get("kind") or "") != "company":
+                    continue
+                wid = str(u.get("workspace_id") or "").strip()
+                if not wid or wid in seen or is_home_id(user_id, wid):
+                    continue
+                seen.add(wid)
+                ws_ids.append(wid)
+        except Exception as exc:
+            logger.debug("[DALTON_SYSTEM_JOBS] Failed querying lead company units: %s", exc)
 
     for r in automation_rows:
         if not isinstance(r, dict):
@@ -365,9 +390,15 @@ async def _discover_company_workspaces(
         if not _TICKER_FROM_AUTO_NAME_RE.match(name):
             continue
         wid = str(r.get("workspace_id") or "").strip()
-        if wid and wid not in seen and not is_home_id(user_id, wid):
-            seen.add(wid)
-            ws_ids.append(wid)
+        if not wid or wid in seen or is_home_id(user_id, wid):
+            continue
+        if wid not in own_ws_ids:
+            try:
+                await require_workspace_access(wid, user_id, channel="web", need="read")
+            except Exception:
+                continue
+        seen.add(wid)
+        ws_ids.append(wid)
     return ws_ids
 
 
@@ -401,10 +432,70 @@ async def _build_company_job_entry(
     user_id: str,
     workspace_id: str,
     automation_rows: list[dict[str, Any]],
+    *,
+    allow_registry_fallback: bool = False,
+    viewer_user_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Build a ``company`` scope system job entry by reusing ``tracking.get_tracking_status``."""
+    from src.dalton.autonomy.tracking import resolve_workspace_tracking_owner
+    from src.dalton.database.coverage_units import get_active_unit_by_workspace
+    from src.dalton.settings import is_coverage_units_enabled
+
+    caller_id = str(viewer_user_id or user_id or "").strip()
+    task_owner = str(user_id or "").strip()
+    active_unit: dict[str, Any] | None = None
+    if is_coverage_units_enabled():
+        try:
+            active_unit = await get_active_unit_by_workspace(workspace_id)
+            if active_unit is not None:
+                lead_uid = str(
+                    active_unit.get("lead_analyst_user_id")
+                    or active_unit.get("owner_user_id")
+                    or ""
+                ).strip()
+                if lead_uid:
+                    task_owner = lead_uid
+            else:
+                resolved_owner = await resolve_workspace_tracking_owner(workspace_id)
+                if resolved_owner:
+                    task_owner = resolved_owner
+        except Exception as exc:
+            logger.debug(
+                "[DALTON_SYSTEM_JOBS] Task owner lookup failed for %s: %s",
+                workspace_id,
+                exc,
+            )
+
+    identity_unavailable = False
     try:
-        tracking = await get_tracking_status(user_id, workspace_id)
+        tracking = await get_tracking_status(
+            task_owner,
+            workspace_id,
+            viewer_user_id=viewer_user_id,
+        )
+    except CoverageIdentityUnavailableError as exc:
+        logger.warning(
+            "[DALTON_SYSTEM_JOBS] Coverage registry unavailable for company workspace %s: %s",
+            workspace_id,
+            exc,
+        )
+        if not allow_registry_fallback:
+            raise
+        identity_unavailable = True
+        try:
+            tracking = await get_tracking_status(
+                task_owner,
+                workspace_id,
+                fallback_on_registry_error=True,
+                viewer_user_id=viewer_user_id,
+            )
+        except Exception as fallback_exc:
+            logger.debug(
+                "[DALTON_SYSTEM_JOBS] Fallback company status failed for %s: %s",
+                workspace_id,
+                fallback_exc,
+            )
+            return {"_units_unavailable": True}
     except ValueError:
         return None
     except Exception as exc:
@@ -418,17 +509,27 @@ async def _build_company_job_entry(
     ticker = str(tracking.get("ticker") or "").strip().upper()
     raw_status = str(tracking.get("status") or "disabled")
     if raw_status == "not_applicable" or not ticker:
-        return None
+        return {"_units_unavailable": True} if identity_unavailable else None
     mapped_status = _TRACKING_STATUS_TO_JOB_STATUS.get(raw_status, "partial")
 
+    owner_rows = (
+        automation_rows
+        if task_owner == str(user_id or "").strip()
+        else await list_all_user_automations(task_owner, name_prefix="dalton-")
+    )
     prefix = f"dalton-{ticker.lower()}-"
     company_rows = [
         r
-        for r in automation_rows
+        for r in owner_rows
         if isinstance(r, dict)
         and str(r.get("name") or "").strip().lower().startswith(prefix)
         and (not r.get("workspace_id") or str(r.get("workspace_id")) == str(workspace_id))
     ]
+    can_manage = (
+        is_pm_user(caller_id) or caller_id == task_owner
+        if active_unit is not None
+        else True
+    )
     last_run_at, last_result, next_run_at = _summarize_company_runs(company_rows)
     if next_run_at is None:
         task_nexts = [
@@ -439,7 +540,7 @@ async def _build_company_job_entry(
         if task_nexts:
             next_run_at = min(task_nexts)
 
-    return {
+    entry: dict[str, Any] = {
         "key": f"company:{ticker}",
         "kind": "company_tracking",
         "scope": "company",
@@ -457,26 +558,44 @@ async def _build_company_job_entry(
         "last_run_at": last_run_at,
         "last_result": last_result,
         "next_run_at": next_run_at,
-        "can_toggle": True,
-        "can_run_now": True,
+        "can_toggle": can_manage,
+        "can_run_now": can_manage,
         "missing_tasks": tracking.get("missing_tasks") or [],
         "paused_tasks": tracking.get("paused_tasks") or [],
         "active_tasks": tracking.get("active_tasks") or [],
         "tasks": tracking.get("tasks") or [],
     }
+    if identity_unavailable or tracking.get("identity_unavailable"):
+        entry["_units_unavailable"] = True
+    return entry
 
 
-async def _discover_sector_units(user_id: str) -> list[dict[str, Any]]:
-    """The user's active sector units with a workspace binding (P3, flag on only)."""
+async def _discover_sector_units(
+    user_id: str,
+    *,
+    degrade_on_error: bool = False,
+    on_unavailable: list[bool] | None = None,
+    include_all_for_pm: bool = False,
+) -> list[dict[str, Any]]:
+    """The user's active sector units with a workspace binding (P3, flag on + internal only)."""
     if not is_coverage_units_enabled():
+        return []
+    if not await is_internal_or_admin(user_id):
         return []
     try:
         from src.dalton.database.coverage_units import list_coverage_units
 
-        units = await list_coverage_units(user_id, include_archived=False)
+        lookup_uid = None if (include_all_for_pm and is_pm_user(user_id)) else user_id
+        units = await list_coverage_units(lookup_uid, include_archived=False)
     except Exception as exc:
-        logger.debug("[DALTON_SYSTEM_JOBS] sector unit lookup failed: %s", exc)
-        return []
+        logger.warning("[DALTON_SYSTEM_JOBS] sector unit lookup failed: %s", exc)
+        if on_unavailable is not None:
+            on_unavailable.append(True)
+        if degrade_on_error:
+            return []
+        raise CoverageIdentityUnavailableError(
+            "覆盖单元登记表暂时不可用，请稍后重试。"
+        ) from exc
     return [
         dict(u)
         for u in units or []
@@ -514,6 +633,15 @@ def _build_sector_job_entry(
         if task_nexts:
             next_run_at = min(task_nexts)
 
+    lead_uid = str(
+        unit.get("lead_analyst_user_id") or unit.get("owner_user_id") or ""
+    ).strip()
+    can_manage = (
+        is_pm_user(user_id)
+        or not lead_uid
+        or lead_uid == str(user_id or "").strip()
+    )
+
     return {
         "key": f"sector:{slug}",
         "kind": "sector_tracking",
@@ -534,8 +662,8 @@ def _build_sector_job_entry(
         "last_run_at": last_run_at,
         "last_result": last_result,
         "next_run_at": next_run_at,
-        "can_toggle": True,
-        "can_run_now": True,
+        "can_toggle": can_manage,
+        "can_run_now": can_manage,
         "missing_tasks": tracking.get("missing_tasks") or [],
         "paused_tasks": tracking.get("paused_tasks") or [],
         "active_tasks": tracking.get("active_tasks") or [],
@@ -547,9 +675,17 @@ async def _resolve_sector_unit_for_key(
     user_id: str,
     target: str,
     units: list[dict[str, Any]] | None = None,
+    *,
+    include_all_for_pm: bool = False,
 ) -> dict[str, Any]:
     """Resolve a sector key's target (slug or unit_id) to one of the user's bound sector units."""
-    owned = units if units is not None else await _discover_sector_units(user_id)
+    owned = (
+        units
+        if units is not None
+        else await _discover_sector_units(
+            user_id, include_all_for_pm=include_all_for_pm
+        )
+    )
     cleaned = str(target or "").strip()
     for u in owned:
         if str(u.get("slug") or "").strip().lower() == cleaned.lower():
@@ -1603,10 +1739,24 @@ async def list_system_jobs(user_id: str) -> dict[str, Any]:
     company_ws_ids = await _discover_company_workspaces(uid, rows)
     company_jobs: list[dict[str, Any]] = []
     seen_tickers: set[str] = set()
+    units_unavailable = False
     for wid in company_ws_ids:
-        entry = await _build_company_job_entry(uid, wid, rows)
-        if entry and entry["ticker"] not in seen_tickers:
-            seen_tickers.add(entry["ticker"])
+        entry = await _build_company_job_entry(
+            uid,
+            wid,
+            rows,
+            allow_registry_fallback=True,
+            viewer_user_id=uid,
+        )
+        if not entry:
+            continue
+        if entry.pop("_units_unavailable", False):
+            units_unavailable = True
+        ticker_val = str(entry.get("ticker") or "").strip()
+        if not ticker_val:
+            continue
+        if ticker_val not in seen_tickers:
+            seen_tickers.add(ticker_val)
             company_jobs.append(entry)
 
     home_specs = build_global_director_specs()
@@ -1615,19 +1765,64 @@ async def list_system_jobs(user_id: str) -> dict[str, Any]:
         for spec in home_specs
     ]
 
-    # 行业单元（P3）：开关关闭时 _discover_sector_units 直接返回空列表，
-    # 不查注册表，输出与 P3 前一致（无 sector 组）。
-    sector_units = await _discover_sector_units(uid)
+    # 行业单元（P3）：开关关闭或非 internal/admin 直接返回空列表，不查注册表。
+    # 校验调用者对单元工作区的当前 Web 读权限后才查跟踪状态，不可读单元完全跳过。
+    from src.dalton.sharing import require_workspace_access
+
+    sector_unavailable: list[bool] = []
+    try:
+        sector_units = await _discover_sector_units(
+            uid,
+            degrade_on_error=True,
+            on_unavailable=sector_unavailable,
+        )
+    except CoverageIdentityUnavailableError:
+        sector_units = []
+        units_unavailable = True
+    if sector_unavailable:
+        units_unavailable = True
     sector_jobs: list[dict[str, Any]] = []
     for s_unit in sector_units:
-        s_ws = str(s_unit.get("workspace_id"))
+        s_ws = str(s_unit.get("workspace_id") or "").strip()
+        if not s_ws:
+            continue
         try:
-            s_tracking = await get_tracking_status(uid, s_ws)
+            s_ws_row = await require_workspace_access(
+                s_ws, uid, channel="web", need="read"
+            )
+        except HTTPException as exc:
+            if exc.status_code >= 500:
+                units_unavailable = True
+            continue
+        except Exception:
+            units_unavailable = True
+            continue
+        s_owner = (
+            str(
+                s_unit.get("lead_analyst_user_id")
+                or s_unit.get("owner_user_id")
+                or ""
+            ).strip()
+            or str((s_ws_row or {}).get("user_id") or "").strip()
+            or uid
+        )
+        try:
+            s_tracking = await get_tracking_status(
+                s_owner, s_ws, viewer_user_id=uid
+            )
+        except CoverageIdentityUnavailableError:
+            units_unavailable = True
+            continue
         except ValueError:
             continue
         if str(s_tracking.get("subject_kind") or "") != "sector":
             continue
-        sector_jobs.append(_build_sector_job_entry(uid, s_unit, rows, s_tracking))
+        s_owner_rows = (
+            rows
+            if s_owner == uid
+            else await list_all_user_automations(s_owner, name_prefix="dalton-")
+        )
+        sector_jobs.append(_build_sector_job_entry(uid, s_unit, s_owner_rows, s_tracking))
 
     ops_jobs = await _fetch_ops_jobs()
 
@@ -1642,34 +1837,55 @@ async def list_system_jobs(user_id: str) -> dict[str, Any]:
         "host": [],
         "ops": ops_jobs,
     }
-    if sector_units:
+    if sector_jobs:
         groups["sector"] = sector_jobs
     if is_internal:
         groups["data"] = data_jobs
-    return {
+    payload: dict[str, Any] = {
         "ok": True,
         "is_pm": pm,
         "jobs": all_jobs,
         "groups": groups,
     }
+    if units_unavailable:
+        payload["units_unavailable"] = True
+    return payload
 
 
 async def _resolve_company_workspace_id(user_id: str, target: str) -> str:
     """Resolve a ticker or workspace_id string into a workspace_id for ``user_id``."""
+    from src.dalton.autonomy.tracking import resolve_workspace_id_by_ticker_any_owner
+
     cleaned = str(target or "").strip()
     if "-" in cleaned and len(cleaned) >= 32:
         return cleaned
     resolved = await resolve_workspace_id_by_ticker(cleaned.upper(), user_id)
     if resolved:
         return resolved
+    if is_pm_user(user_id):
+        any_resolved = await resolve_workspace_id_by_ticker_any_owner(
+            cleaned.upper(), user_id
+        )
+        if any_resolved:
+            return any_resolved
     return cleaned
 
 
-async def get_system_job_status(user_id: str, key: str) -> dict[str, Any]:
+async def get_system_job_status(
+    user_id: str,
+    key: str,
+    *,
+    viewer_user_id: str | None = None,
+) -> dict[str, Any]:
     """Return the status item for a single system job ``key``."""
     uid = str(user_id or "").strip()
     if not uid:
         raise ValueError("user_id is required")
+    effective_viewer = (
+        str(viewer_user_id).strip()
+        if viewer_user_id is not None and str(viewer_user_id).strip()
+        else (_SYSTEM_JOB_VIEWER_USER_ID.get() or uid)
+    )
 
     pm = is_pm_user(uid)
     scope, target = classify_system_job_key(key)
@@ -1700,17 +1916,44 @@ async def get_system_job_status(user_id: str, key: str) -> dict[str, Any]:
         job = _apply_caller_visibility(_build_home_job_entry(spec, by_name.get(target)), is_pm=pm)
         return {"ok": True, "job": job}
 
+    from src.dalton.sharing import require_workspace_access
+
     if scope == "sector":
         s_unit = await _resolve_sector_unit_for_key(uid, target)
-        s_ws = str(s_unit.get("workspace_id"))
-        s_tracking = await get_tracking_status(uid, s_ws)
+        s_ws = str(s_unit.get("workspace_id") or "").strip()
+        try:
+            await require_workspace_access(
+                s_ws, effective_viewer, channel="web", need="read"
+            )
+        except HTTPException as exc:
+            raise ValueError(f"未找到行业自动跟踪任务: {key}") from exc
+        s_tracking = await get_tracking_status(
+            uid,
+            s_ws,
+            viewer_user_id=effective_viewer,
+        )
         if str(s_tracking.get("subject_kind") or "") != "sector":
             raise ValueError(f"未找到行业自动跟踪任务: {key}")
         return {"ok": True, "job": _build_sector_job_entry(uid, s_unit, rows, s_tracking)}
 
     ws_id = await _resolve_company_workspace_id(uid, target)
-    entry = await _build_company_job_entry(uid, ws_id, rows)
-    if not entry:
+    if is_coverage_units_enabled() and (
+        viewer_user_id is not None or _SYSTEM_JOB_VIEWER_USER_ID.get() is not None
+    ):
+        try:
+            await require_workspace_access(
+                ws_id, effective_viewer, channel="web", need="read"
+            )
+        except HTTPException as exc:
+            raise ValueError(f"未找到公司自动跟踪任务: {key}") from exc
+    entry = await _build_company_job_entry(
+        uid,
+        ws_id,
+        rows,
+        allow_registry_fallback=False,
+        viewer_user_id=effective_viewer,
+    )
+    if not entry or not entry.get("ticker"):
         raise ValueError(f"未找到公司自动跟踪任务: {key}")
     return {"ok": True, "job": entry}
 
@@ -1869,6 +2112,33 @@ async def _create_paused_home_job_for_run_now(
         )
 
 
+async def _assert_unit_lead_for_managed_action(
+    workspace_id: str,
+    task_owner_user_id: str,
+    actor_user_id: str,
+) -> None:
+    """Enforce C2 single-lead ownership on managed unit tracking toggles and run_now."""
+    if not is_coverage_units_enabled():
+        return
+    from src.dalton.database.coverage_units import get_active_unit_by_workspace
+
+    unit = await get_active_unit_by_workspace(str(workspace_id))
+    if unit is None:
+        return
+    lead_uid = str(
+        unit.get("lead_analyst_user_id") or unit.get("owner_user_id") or ""
+    ).strip()
+    if lead_uid and str(task_owner_user_id or "").strip() != lead_uid:
+        raise PermissionError(
+            f"工作区 {workspace_id} 已绑定覆盖单元，受管自动任务仅归属于当前主分析师（{lead_uid}）"
+        )
+    eff_actor = str(actor_user_id or task_owner_user_id or "").strip()
+    if lead_uid and eff_actor != lead_uid and not is_pm_user(eff_actor):
+        raise PermissionError(
+            f"工作区 {workspace_id} 的受管自动任务仅当前主分析师（{lead_uid}）或 PM 可操作"
+        )
+
+
 async def toggle_system_job(
     user_id: str,
     key: str,
@@ -1878,6 +2148,7 @@ async def toggle_system_job(
     cron_expr: str | None = None,
     timezone: str | None = None,
     actor_user_id: str | None = None,
+    viewer_user_id: str | None = None,
     force: bool = True,
     respect_user_pause: bool = False,
 ) -> dict[str, Any]:
@@ -1885,6 +2156,18 @@ async def toggle_system_job(
     uid = str(user_id or "").strip()
     if not uid:
         raise ValueError("user_id is required")
+    effective_viewer = (
+        str(viewer_user_id).strip()
+        if viewer_user_id is not None and str(viewer_user_id).strip()
+        else (
+            _SYSTEM_JOB_VIEWER_USER_ID.get()
+            or (
+                str(actor_user_id).strip()
+                if actor_user_id is not None and str(actor_user_id).strip()
+                else uid
+            )
+        )
+    )
 
     scope, target = classify_system_job_key(key)
     if scope == "ops":
@@ -2252,23 +2535,41 @@ async def toggle_system_job(
             return {"ok": True, "job": _build_home_job_entry(spec, updated_row)}
 
     if scope == "sector":
-        s_unit = await _resolve_sector_unit_for_key(uid, target)
+        s_unit = await _resolve_sector_unit_for_key(
+            uid, target, include_all_for_pm=True
+        )
         s_ws = str(s_unit.get("workspace_id"))
+        await _assert_unit_lead_for_managed_action(s_ws, uid, effective_viewer)
         with automation_history_context(
             actor_user_id=actor_uid,
             skip_if_unchanged=True,
         ):
             if enabled:
-                await enable_tracking(uid, s_ws, force=force, respect_user_pause=respect_user_pause)
+                await enable_tracking(
+                    uid,
+                    s_ws,
+                    force=force,
+                    respect_user_pause=respect_user_pause,
+                    viewer_user_id=effective_viewer,
+                )
             else:
-                await disable_tracking(uid, s_ws)
+                await disable_tracking(
+                    uid,
+                    s_ws,
+                    viewer_user_id=effective_viewer,
+                )
         rows_after = await list_all_user_automations(uid, name_prefix="dalton-")
-        s_tracking = await get_tracking_status(uid, s_ws)
+        s_tracking = await get_tracking_status(
+            uid,
+            s_ws,
+            viewer_user_id=effective_viewer,
+        )
         if str(s_tracking.get("subject_kind") or "") != "sector":
             raise ValueError(f"未找到行业自动跟踪任务: {key}")
-        return {"ok": True, "job": _build_sector_job_entry(uid, s_unit, rows_after, s_tracking)}
+        return {"ok": True, "job": _build_sector_job_entry(effective_viewer, s_unit, rows_after, s_tracking)}
 
     ws_id = await _resolve_company_workspace_id(uid, target)
+    await _assert_unit_lead_for_managed_action(ws_id, uid, effective_viewer)
     with automation_history_context(
         actor_user_id=actor_uid,
         skip_if_unchanged=True,
@@ -2279,11 +2580,21 @@ async def toggle_system_job(
                 ws_id,
                 force=force,
                 respect_user_pause=respect_user_pause,
+                viewer_user_id=effective_viewer,
             )
         else:
-            await disable_tracking(uid, ws_id)
+            await disable_tracking(
+                uid,
+                ws_id,
+                viewer_user_id=effective_viewer,
+            )
     rows_after = await list_all_user_automations(uid, name_prefix="dalton-")
-    entry = await _build_company_job_entry(uid, ws_id, rows_after)
+    entry = await _build_company_job_entry(
+        uid,
+        ws_id,
+        rows_after,
+        viewer_user_id=effective_viewer,
+    )
     if not entry:
         raise ValueError(f"未找到公司自动跟踪任务: {key}")
     return {"ok": True, "job": entry}
@@ -2485,9 +2796,17 @@ async def run_system_job_now(
 
     # Sector scope: trigger the sector unit's agenda automation if it exists (P3)
     if scope == "sector":
-        s_unit = await _resolve_sector_unit_for_key(uid, target)
+        s_unit = await _resolve_sector_unit_for_key(
+            uid, target, include_all_for_pm=True
+        )
         s_slug = str(s_unit.get("slug") or "").strip()
         s_ws = str(s_unit.get("workspace_id"))
+        eff_actor = str(
+            actor_user_id
+            if actor_user_id is not None
+            else (_SYSTEM_JOB_VIEWER_USER_ID.get() or uid)
+        ).strip()
+        await _assert_unit_lead_for_managed_action(s_ws, uid, eff_actor)
         agenda_name = f"dalton-sector-{s_slug.lower()}-agenda"
         rows = await list_all_user_automations(uid, name_prefix=agenda_name)
         row = next(
@@ -2496,6 +2815,7 @@ async def run_system_job_now(
                 for r in rows
                 if isinstance(r, dict)
                 and str(r.get("name") or "").strip().lower() == agenda_name
+                and str(r.get("user_id") or uid).strip() == uid
                 and (not r.get("workspace_id") or str(r.get("workspace_id")) == str(s_ws))
             ),
             None,
@@ -2519,7 +2839,13 @@ async def run_system_job_now(
 
     # Company scope: trigger the company's watch automation (`dalton-<t>-watch`) if it exists
     ws_id = await _resolve_company_workspace_id(uid, target)
-    tracking = await get_tracking_status(uid, ws_id)
+    eff_actor = str(
+        actor_user_id
+        if actor_user_id is not None
+        else (_SYSTEM_JOB_VIEWER_USER_ID.get() or uid)
+    ).strip()
+    await _assert_unit_lead_for_managed_action(ws_id, uid, eff_actor)
+    tracking = await get_tracking_status(uid, ws_id, viewer_user_id=eff_actor or uid)
     ticker = str(tracking.get("ticker") or "").strip().upper()
     if tracking.get("status") == "not_applicable" or not ticker:
         raise ValueError(f"Unable to resolve company ticker for workspace '{ws_id}'")
@@ -2531,6 +2857,7 @@ async def run_system_job_now(
             for r in rows
             if isinstance(r, dict)
             and str(r.get("name") or "").strip().lower() == watch_name
+            and str(r.get("user_id") or uid).strip() == uid
             and (not r.get("workspace_id") or str(r.get("workspace_id")) == str(ws_id))
         ),
         None,

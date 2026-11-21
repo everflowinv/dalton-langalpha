@@ -818,6 +818,7 @@ async def apply_update(
     # 可做，但保留这个显式标记，任何将来重新引入 agenda 侧钩子的人必须先
     # 处理它，而不是让联动写静默递归。
     skip_linkage_retry: bool = False,
+    access_channel: str = "cos",
 ) -> dict[str, Any]:
     """Execute the full PK.4 knowledge update pipeline: validate -> DB version -> write files.
 
@@ -827,7 +828,12 @@ async def apply_update(
     docs validate against the same schemas and invariants in both profiles.
     """
     if not skip_access_check:
-        await verify_workspace_access(workspace_id, user_id, need="write", channel="cos")
+        await verify_workspace_access(
+            workspace_id,
+            user_id,
+            need="write",
+            channel=access_channel,
+        )
     if profile is None:
         try:
             profile = await resolve_workspace_profile(workspace_id)

@@ -12,12 +12,14 @@ import { useUser } from '@/hooks/useUser';
 import {
   archiveDaltonCoverageUnit,
   bindDaltonCoverageUnit,
+  coverageUnitBlockingAutomations,
   coverageUnitErrorCode,
   registerDaltonCoverageUnit,
   splitCoverageUnits,
   unbindDaltonCoverageUnit,
   useDaltonCoverageUnitDetail,
   useDaltonCoverageUnits,
+  type BindableWorkspace,
   type CoverageUnitDetail,
   type CoverageUnitEntry,
   type SectorMember,
@@ -43,7 +45,7 @@ import {
 type CoverageTab = 'sectors' | 'companies' | 'unclassified';
 
 interface NoticeState {
-  tone: 'success' | 'error' | 'info';
+  tone: 'success' | 'warning' | 'error' | 'info';
   message: string;
 }
 
@@ -99,8 +101,12 @@ function UnitCapabilityBadges({
 interface ManageActionsProps {
   unitId: string;
   unitName: string;
+  bound?: boolean;
   workspaceId: string | null | undefined;
-  unclassified: UnclassifiedWorkspace[];
+  bindableWorkspaces: Array<UnclassifiedWorkspace | BindableWorkspace>;
+  canBind: boolean;
+  canUnbind: boolean;
+  canArchive: boolean;
   selectedWs: string;
   onSelectWs: (workspaceId: string) => void;
   onBind: (unitId: string, workspaceId: string) => Promise<void>;
@@ -111,11 +117,29 @@ interface ManageActionsProps {
   archiving: boolean;
 }
 
+function formatBindableWorkspaceLabel(
+  ws: UnclassifiedWorkspace | BindableWorkspace,
+  t: (key: string, opts?: Record<string, unknown>) => string,
+): string {
+  const base = ws.name || ws.workspace_id;
+  if ('is_own' in ws && !ws.is_own) {
+    const owner = ws.owner_name || ws.owner_email || ws.owner_user_id;
+    if (owner) {
+      return `${base} ${t('dalton.coverage.colleagueWsSuffix', { owner })}`;
+    }
+  }
+  return base;
+}
+
 function UnitManageActions({
   unitId,
   unitName,
+  bound,
   workspaceId,
-  unclassified,
+  bindableWorkspaces,
+  canBind,
+  canUnbind,
+  canArchive,
   selectedWs,
   onSelectWs,
   onBind,
@@ -127,23 +151,27 @@ function UnitManageActions({
 }: ManageActionsProps) {
   const { t } = useTranslation();
   const busy = binding || unbinding || archiving;
+  const isBound = bound ?? Boolean(workspaceId);
+  const availableWorkspaces = bindableWorkspaces.filter(
+    (ws) => ws.workspace_id !== workspaceId,
+  );
 
   return (
     <div className="flex flex-wrap items-center gap-2">
-      {!workspaceId ? (
+      {!isBound && canBind && (
         <>
           <Select
             value={selectedWs}
             onChange={(e) => onSelectWs(e.target.value)}
             aria-label={t('dalton.coverage.bindTargetNone')}
-            disabled={busy || unclassified.length === 0}
-            className="w-44 text-xs"
+            disabled={busy || availableWorkspaces.length === 0}
+            className="w-48 text-xs"
             data-testid={`dalton-coverage-bind-select-${unitId}`}
           >
             <option value="">{t('dalton.coverage.bindTargetNone')}</option>
-            {unclassified.map((ws) => (
+            {availableWorkspaces.map((ws) => (
               <option key={ws.workspace_id} value={ws.workspace_id}>
-                {ws.name || ws.workspace_id}
+                {formatBindableWorkspaceLabel(ws, t)}
               </option>
             ))}
           </Select>
@@ -159,7 +187,9 @@ function UnitManageActions({
             {binding ? t('dalton.coverage.binding') : t('dalton.coverage.bind')}
           </Button>
         </>
-      ) : (
+      )}
+
+      {canUnbind && (
         <DaltonActionConfirmButton
           label={t('dalton.coverage.unbind')}
           confirmTitle={t('dalton.coverage.unbindTitle')}
@@ -171,15 +201,17 @@ function UnitManageActions({
         />
       )}
 
-      <DaltonActionConfirmButton
-        label={t('dalton.coverage.archiveUnit')}
-        confirmTitle={t('dalton.coverage.archiveTitle')}
-        confirmMessage={t('dalton.coverage.archiveConfirm', { unit: unitName })}
-        confirmLabel={t('dalton.coverage.archiveUnit')}
-        busy={archiving}
-        onConfirm={() => onArchive(unitId)}
-        testId={`dalton-coverage-archive-${unitId}`}
-      />
+      {canArchive && (
+        <DaltonActionConfirmButton
+          label={t('dalton.coverage.archiveUnit')}
+          confirmTitle={t('dalton.coverage.archiveTitle')}
+          confirmMessage={t('dalton.coverage.archiveConfirm', { unit: unitName })}
+          confirmLabel={t('dalton.coverage.archiveUnit')}
+          busy={archiving}
+          onConfirm={() => onArchive(unitId)}
+          testId={`dalton-coverage-archive-${unitId}`}
+        />
+      )}
     </div>
   );
 }
@@ -289,7 +321,7 @@ function CompanyDetailView({ company }: { company: CoverageCompanyPayload }) {
 
 interface MemberManageHandlers {
   currentUserId?: string;
-  unclassified: UnclassifiedWorkspace[];
+  bindableWorkspaces: Array<UnclassifiedWorkspace | BindableWorkspace>;
   bindSelections: Record<string, string>;
   onSelectWs: (unitId: string, workspaceId: string) => void;
   onBind: (unitId: string, workspaceId: string) => Promise<void>;
@@ -376,33 +408,37 @@ function SectorMemberRow({
           ) : detailQuery.isError || !detailQuery.data ? (
             <DaltonInlineNotice tone="error">{t('dalton.coverage.detailError')}</DaltonInlineNotice>
           ) : (
-            <>
-              {(!manage.currentUserId ||
-                detailQuery.data.owner_user_id === manage.currentUserId) && (
-                <UnitManageActions
-                  unitId={detailQuery.data.unit_id}
-                  unitName={
-                    detailQuery.data.display_name ||
-                    detailQuery.data.ticker ||
-                    detailQuery.data.slug ||
-                    detailQuery.data.unit_id
-                  }
-                  workspaceId={detailQuery.data.workspace_id}
-                  unclassified={manage.unclassified}
-                  selectedWs={manage.bindSelections[detailQuery.data.unit_id] ?? ''}
-                  onSelectWs={(wsId) => manage.onSelectWs(detailQuery.data!.unit_id, wsId)}
-                  onBind={manage.onBind}
-                  onUnbind={manage.onUnbind}
-                  onArchive={manage.onArchive}
-                  binding={manage.bindingUnitId === detailQuery.data.unit_id}
-                  unbinding={manage.unbindingUnitId === detailQuery.data.unit_id}
-                  archiving={manage.archivingUnitId === detailQuery.data.unit_id}
-                />
-              )}
-              {detailQuery.data.company && (
-                <CompanyDetailView company={detailQuery.data.company} />
-              )}
-            </>
+            (() => {
+              const d = detailQuery.data;
+              const canBind = Boolean(d.can_bind);
+              const canUnbind = Boolean(d.can_unbind);
+              const canArchive = Boolean(d.can_archive);
+              const showManage = canBind || canUnbind || canArchive;
+              return (
+                <>
+                  {showManage && (
+                    <UnitManageActions
+                      unitId={d.unit_id}
+                      unitName={d.display_name || d.ticker || d.slug || d.unit_id}
+                      workspaceId={d.workspace_id}
+                      bindableWorkspaces={manage.bindableWorkspaces}
+                      canBind={canBind}
+                      canUnbind={canUnbind}
+                      canArchive={canArchive}
+                      selectedWs={manage.bindSelections[d.unit_id] ?? ''}
+                      onSelectWs={(wsId) => manage.onSelectWs(d.unit_id, wsId)}
+                      onBind={manage.onBind}
+                      onUnbind={manage.onUnbind}
+                      onArchive={manage.onArchive}
+                      binding={manage.bindingUnitId === d.unit_id}
+                      unbinding={manage.unbindingUnitId === d.unit_id}
+                      archiving={manage.archivingUnitId === d.unit_id}
+                    />
+                  )}
+                  {d.company && <CompanyDetailView company={d.company} />}
+                </>
+              );
+            })()
           )}
         </div>
       )}
@@ -628,6 +664,24 @@ export function DaltonCoverageCard() {
 
   const resolveError = (err: unknown) => {
     const code = coverageUnitErrorCode(err);
+    if (code === 'active_tracking_blocks_unbind') {
+      const blocking = coverageUnitBlockingAutomations(err);
+      if (blocking && blocking.names.length > 0) {
+        const sep = t('dalton.coverage.errors.blockingTasksSeparator', { defaultValue: '、' });
+        const joined = blocking.names.join(sep);
+        const tasksText = blocking.hasMore
+          ? t('dalton.coverage.errors.blockingTasksMore', { tasks: joined })
+          : joined;
+        return t('dalton.coverage.errors.active_tracking_blocks_unbind_with_tasks', {
+          tasks: tasksText,
+        });
+      }
+      if (blocking && blocking.count > 0) {
+        return t('dalton.coverage.errors.active_tracking_blocks_unbind_with_count', {
+          count: blocking.count,
+        });
+      }
+    }
     if (code) {
       return t(`dalton.coverage.errors.${code}`, {
         defaultValue: t('dalton.coverage.errors.fallback'),
@@ -706,6 +760,7 @@ export function DaltonCoverageCard() {
 
   const units = coverageQuery.data.units;
   const unclassified = coverageQuery.data.unclassified;
+  const bindableWorkspaces = coverageQuery.data.bindable_workspaces ?? unclassified;
   const { sectors, standaloneCompanies } = splitCoverageUnits(units);
 
   const bindingUnitId = bindMutation.isPending ? (bindMutation.variables?.unitId ?? null) : null;
@@ -714,18 +769,30 @@ export function DaltonCoverageCard() {
 
   const manageHandlers: MemberManageHandlers = {
     currentUserId: user?.user_id,
-    unclassified,
+    bindableWorkspaces,
     bindSelections,
     onSelectWs: (unitId, wsId) =>
       setBindSelections((prev) => ({ ...prev, [unitId]: wsId })),
     onBind: async (unitId, workspaceId) => {
-      await bindMutation.mutateAsync({ unitId, workspaceId });
+      try {
+        await bindMutation.mutateAsync({ unitId, workspaceId });
+      } catch {
+        // Error surfaced via mutation onError -> inline notice.
+      }
     },
     onUnbind: async (unitId) => {
-      await unbindMutation.mutateAsync(unitId);
+      try {
+        await unbindMutation.mutateAsync(unitId);
+      } catch {
+        // Error surfaced via mutation onError -> inline notice.
+      }
     },
     onArchive: async (unitId) => {
-      await archiveMutation.mutateAsync(unitId);
+      try {
+        await archiveMutation.mutateAsync(unitId);
+      } catch {
+        // Error surfaced via mutation onError -> inline notice.
+      }
     },
     bindingUnitId,
     unbindingUnitId,
@@ -734,8 +801,12 @@ export function DaltonCoverageCard() {
 
   const renderUnitRow = (unit: CoverageUnitEntry) => {
     const unitName = unit.display_name || unit.slug || unit.ticker || unit.unit_id;
-    const isOwner = !user?.user_id || unit.owner_user_id === user.user_id;
+    const canBind = Boolean(unit.can_bind);
+    const canUnbind = Boolean(unit.can_unbind);
+    const canArchive = Boolean(unit.can_archive);
+    const showManage = canBind || canUnbind || canArchive;
     const isExpanded = expandedUnitId === unit.unit_id;
+    const isBound = unit.bound ?? Boolean(unit.workspace_id);
     const canOpenWs = Boolean(unit.workspace_id && unit.readable !== false);
 
     return (
@@ -770,7 +841,11 @@ export function DaltonCoverageCard() {
               delegatable={unit.delegatable}
               autoTracked={unit.auto_tracked}
             />
-            {!unit.workspace_id && (
+            {isBound ? (
+              !unit.workspace_id && (
+                <DaltonStatusBadge tone="neutral" label={t('dalton.coverage.boundWorkspace')} />
+              )
+            ) : (
               <DaltonStatusBadge tone="neutral" label={t('dalton.coverage.noWorkspace')} />
             )}
           </span>
@@ -783,12 +858,16 @@ export function DaltonCoverageCard() {
                 label={t('dalton.coverage.openWorkspace')}
               />
             )}
-            {isOwner && (
+            {showManage && (
               <UnitManageActions
                 unitId={unit.unit_id}
                 unitName={unitName}
+                bound={isBound}
                 workspaceId={unit.workspace_id}
-                unclassified={unclassified}
+                bindableWorkspaces={bindableWorkspaces}
+                canBind={canBind}
+                canUnbind={canUnbind}
+                canArchive={canArchive}
                 selectedWs={bindSelections[unit.unit_id] ?? ''}
                 onSelectWs={(wsId) => manageHandlers.onSelectWs(unit.unit_id, wsId)}
                 onBind={manageHandlers.onBind}
@@ -879,7 +958,11 @@ export function DaltonCoverageCard() {
         </div>
       </div>
 
-      {notice && <DaltonInlineNotice tone={notice.tone}>{notice.message}</DaltonInlineNotice>}
+      {notice && (
+        <DaltonInlineNotice tone={notice.tone} testId="dalton-coverage-notice">
+          {notice.message}
+        </DaltonInlineNotice>
+      )}
 
       <div className="flex flex-wrap items-center gap-2" role="tablist">
         <DaltonToolbarPill

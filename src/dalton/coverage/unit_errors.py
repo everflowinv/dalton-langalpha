@@ -24,11 +24,20 @@ _ERROR_PREFIXES: tuple[tuple[str, str, int], ...] = (
     ("workspace_id must be a UUID", "invalid_id", 400),
     # unique-constraint arbitration (the DB index is the real guard)
     ("coverage unit slug already registered", "slug_conflict", 409),
+    ("coverage unit ticker already registered", "ticker_conflict", 409),
     ("workspace already bound to another active coverage unit", "workspace_conflict", 409),
+    ("coverage unit already bound to another workspace", "rebind_not_supported", 409),
+    ("coverage unit still has active automations or unstarted executions", "active_tracking_blocks_unbind", 409),
     ("coverage unit constraint violated", "constraint_conflict", 409),
-    # bind: workspace policy, checked inside the binding transaction
+    # bind: workspace & team policy, checked inside the transaction
     ("workspace belongs to another user", "workspace_not_owned", 403),
+    ("workspace write permission required", "workspace_write_forbidden", 403),
     ("the Home workspace never binds a coverage unit", "home_workspace_refused", 400),
+    (
+        "historical duplicate workspace cannot bind a coverage unit",
+        "historical_duplicate_workspace_refused",
+        400,
+    ),
 )
 
 DEFAULT_CODE = "invalid_input"
@@ -45,8 +54,18 @@ def classify_coverage_unit_error(exc: ValueError) -> tuple[str, int]:
     # part, so they cannot be prefix-matched; the suffix is the stable bit
     # ("active coverage unit <id> not found for this owner" from bind,
     # "coverage unit <id> not found for this owner" from unbind/archive).
-    if "does not exist or is deleted" in message:
+    if "does not exist or is deleted" in message or "does not exist or is hidden" in message:
         return "workspace_not_found", 404
-    if "not found for this owner" in message:
+    if "not found for this owner" in message or message.startswith(("active coverage unit ", "coverage unit ")) and "not found" in message:
         return "unit_not_found", 404
     return DEFAULT_CODE, DEFAULT_STATUS
+
+
+def coverage_unit_error_detail(exc: ValueError) -> dict[str, object]:
+    """Build structured HTTP/tool error detail, including redacted conflict metadata when present."""
+    code, _ = classify_coverage_unit_error(exc)
+    detail: dict[str, object] = {"error": code, "message": str(exc)}
+    conflict = getattr(exc, "conflict", None)
+    if isinstance(conflict, dict) and conflict:
+        detail.update(conflict)
+    return detail

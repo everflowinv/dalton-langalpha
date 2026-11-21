@@ -141,11 +141,12 @@ class CoverageUnitRegisterRequest(BaseModel):
     slug: str
     display_name: str = ""
     ticker: str | None = None
+    workspace_id: str | None = None
     research_tz: str | None = None
 
 
 class CoverageUnitBindRequest(BaseModel):
-    """`POST /coverage/units/{id}/bind` body — the workspace must be the caller's own, non-Home."""
+    """`POST /coverage/units/{id}/bind` body — target workspace must be writable and non-Home."""
 
     workspace_id: str
 
@@ -1265,6 +1266,12 @@ async def put_dalton_automation_endpoint(
 
     raw_body_dict = body.model_dump(exclude_none=True)
     spec = body.entry or body.spec or body.model_dump(exclude={"workspace_id", "entry", "spec"}, exclude_none=True)
+    if (
+        isinstance(spec, dict)
+        and "automation_id" in raw_body_dict
+        and "automation_id" not in spec
+    ):
+        spec = {**spec, "automation_id": raw_body_dict["automation_id"]}
     for payload in (raw_body_dict, spec if isinstance(spec, dict) else {}):
         if str(payload.get("scope") or "").strip().lower() == "company":
             raise HTTPException(
@@ -1311,11 +1318,19 @@ async def get_coverage_board_endpoint(
     tier: str = Query(default="all"),
     stale_only: bool = Query(default=False),
 ) -> dict[str, Any]:
-    _require_dalton_enabled()
+    from src.dalton.settings import is_coverage_units_enabled
+
+    if is_coverage_units_enabled():
+        uid = await _require_coverage_team_member(user_id)
+    else:
+        _require_dalton_enabled()
+        uid = str(user_id or "").strip()
+        if not uid:
+            raise HTTPException(status_code=401, detail="Authentication required")
     from src.dalton.autonomy.board import build_coverage_board
 
     return await build_coverage_board(
-        user_id=user_id,
+        user_id=uid,
         tier=tier,
         stale_only=stale_only,
     )
@@ -1326,21 +1341,42 @@ async def get_coverage_board_endpoint(
 # ---------------------------------------------------------------------------
 
 
+async def _require_coverage_team_member(user_id: str | None) -> str:
+    """Enforce internal/admin access on every coverage-unit endpoint (C8)."""
+    _require_dalton_enabled()
+    from src.dalton.access_tiers import is_internal_or_admin
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not await is_internal_or_admin(uid):
+        raise HTTPException(
+            status_code=403,
+            detail="Only internal or admin team members can access coverage units.",
+        )
+    return uid
+
+
 @router.get("/coverage/units")
 @handle_api_exceptions("list coverage units", logger)
 async def list_coverage_units_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
-    _require_dalton_enabled()
-    from src.dalton.autonomy.units_view import build_units_listing
     from src.dalton.settings import is_coverage_units_enabled
 
     # 开关关闭返回 200 + {"enabled": false} 而不是 404：列表接口兼任前端
     # 获知开关状态的通道，404 会让"未启用"与"Dalton 未开启/路由不存在"
-    # 在查询层无法区分，正常状态被迫走错误处理路径。
+    # 在查询层无法区分，正常状态被迫走错误处理路径。外部用户也据此看到功能关闭，
+    # 不会撞上 403。
+    _require_dalton_enabled()
     if not is_coverage_units_enabled():
+        if not str(user_id or "").strip():
+            raise HTTPException(status_code=401, detail="Authentication required")
         return {"enabled": False}
-    return await build_units_listing(str(user_id).strip())
+    uid = await _require_coverage_team_member(user_id)
+    from src.dalton.autonomy.units_view import build_units_listing
+
+    return await build_units_listing(uid)
 
 
 @router.get("/coverage/units/{unit_id}")
@@ -1349,16 +1385,14 @@ async def get_coverage_unit_detail_endpoint(
     unit_id: str,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
-    _require_dalton_enabled()
-    from src.dalton.autonomy.units_view import UnitNotFound, build_unit_detail
-    from src.dalton.settings import is_coverage_units_enabled
-
     # 详情在开关关闭时一律 404：未启用的功能里不存在"单元详情"这种资源，
     # 与不可见单元同一语义（不泄漏存在性）。
-    if not is_coverage_units_enabled():
-        raise HTTPException(status_code=404, detail="coverage units disabled")
+    _require_coverage_units_enabled()
+    uid = await _require_coverage_team_member(user_id)
+    from src.dalton.autonomy.units_view import UnitNotFound, build_unit_detail
+
     try:
-        return await build_unit_detail(str(user_id).strip(), unit_id)
+        return await build_unit_detail(uid, unit_id)
     except UnitNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -1380,11 +1414,14 @@ def _require_coverage_units_enabled() -> None:
 
 
 def _coverage_unit_http_error(exc: ValueError) -> HTTPException:
-    from src.dalton.coverage.unit_errors import classify_coverage_unit_error
+    from src.dalton.coverage.unit_errors import (
+        classify_coverage_unit_error,
+        coverage_unit_error_detail,
+    )
 
-    code, status = classify_coverage_unit_error(exc)
-    # detail 带稳定错误码，前端据此选 i18n 文案；message 保留服务层原文兜底。
-    return HTTPException(status_code=status, detail={"error": code, "message": str(exc)})
+    _code, status = classify_coverage_unit_error(exc)
+    # detail 带稳定错误码（冲突时附脱敏后的胜出单元信息），前端据此选 i18n 文案。
+    return HTTPException(status_code=status, detail=coverage_unit_error_detail(exc))
 
 
 @router.post("/coverage/units")
@@ -1394,17 +1431,20 @@ async def register_coverage_unit_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     _require_coverage_units_enabled()
+    uid = await _require_coverage_team_member(user_id)
     from src.dalton.coverage.units import register_coverage_unit
 
     try:
-        return await register_coverage_unit(
-            str(user_id).strip(),
-            kind=body.kind,
-            slug=body.slug,
-            display_name=body.display_name,
-            ticker=body.ticker,
-            research_tz=body.research_tz,
-        )
+        kwargs: dict[str, Any] = {
+            "kind": body.kind,
+            "slug": body.slug,
+            "display_name": body.display_name,
+            "ticker": body.ticker,
+            "research_tz": body.research_tz,
+        }
+        if body.workspace_id is not None and str(body.workspace_id).strip():
+            kwargs["workspace_id"] = body.workspace_id
+        return await register_coverage_unit(uid, **kwargs)
     except ValueError as exc:
         raise _coverage_unit_http_error(exc) from exc
 
@@ -1417,12 +1457,11 @@ async def bind_coverage_unit_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     _require_coverage_units_enabled()
+    uid = await _require_coverage_team_member(user_id)
     from src.dalton.coverage.units import bind_coverage_unit_workspace
 
     try:
-        return await bind_coverage_unit_workspace(
-            unit_id, body.workspace_id, str(user_id).strip()
-        )
+        return await bind_coverage_unit_workspace(unit_id, body.workspace_id, uid)
     except ValueError as exc:
         raise _coverage_unit_http_error(exc) from exc
 
@@ -1434,10 +1473,11 @@ async def unbind_coverage_unit_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     _require_coverage_units_enabled()
+    uid = await _require_coverage_team_member(user_id)
     from src.dalton.coverage.units import unbind_coverage_unit_workspace
 
     try:
-        return await unbind_coverage_unit_workspace(unit_id, str(user_id).strip())
+        return await unbind_coverage_unit_workspace(unit_id, uid)
     except ValueError as exc:
         raise _coverage_unit_http_error(exc) from exc
 
@@ -1449,10 +1489,11 @@ async def archive_coverage_unit_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     _require_coverage_units_enabled()
+    uid = await _require_coverage_team_member(user_id)
     from src.dalton.coverage.units import archive_coverage_unit
 
     try:
-        return await archive_coverage_unit(unit_id, str(user_id).strip())
+        return await archive_coverage_unit(unit_id, uid)
     except ValueError as exc:
         raise _coverage_unit_http_error(exc) from exc
 
@@ -1475,25 +1516,33 @@ async def _resolve_tracking_workspace_owner(
     *,
     require_write: bool,
 ) -> tuple[str, bool]:
-    """Verify workspace access for tracking and return ``(owner_user_id, can_edit)``."""
+    """Verify workspace access for tracking and return ``(task_owner_user_id, can_edit)``."""
     _require_dalton_enabled()
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.autonomy.tracking import resolve_workspace_tracking_owner
+    from src.dalton.database.coverage_units import get_active_unit_by_workspace
+    from src.dalton.settings import (
+        is_coverage_units_enabled,
+        is_dalton_supabase_auth_enabled,
+    )
     from src.dalton.sharing import (
         EXTERNAL_OWNED_ADMIN_WRITE_FORBIDDEN_DETAIL,
+        ColleagueAccessRevokedError,
+        require_workspace_access,
         require_workspace_reader,
     )
     from src.server.database import workspace as ws_db
 
     uid = str(user_id or "").strip()
     is_pm = bool(uid and uid in get_dalton_settings().pm_user_ids)
+    units_on = is_coverage_units_enabled()
 
     if is_dalton_supabase_auth_enabled():
         from src.dalton.access_tiers import classify_owner_tier
 
         workspace = await require_workspace_reader(workspace_id, uid)
-        owner_id = str((workspace or {}).get("user_id") or uid).strip()
-        if owner_id != uid:
-            owner_tier = await classify_owner_tier(owner_id)
+        ws_owner = str((workspace or {}).get("user_id") or uid).strip()
+        if ws_owner != uid:
+            owner_tier = await classify_owner_tier(ws_owner)
             if owner_tier == "unknown":
                 raise HTTPException(
                     status_code=404,
@@ -1507,19 +1556,57 @@ async def _resolve_tracking_workspace_owner(
                         status_code=403,
                         detail=EXTERNAL_OWNED_ADMIN_WRITE_FORBIDDEN_DETAIL,
                     )
-                return owner_id, False
-        can_edit = (owner_id == uid) or is_pm
+                task_owner = await resolve_workspace_tracking_owner(
+                    workspace_id, workspace
+                )
+                return (task_owner or ws_owner), False
+
+        unit = (
+            await get_active_unit_by_workspace(workspace_id)
+            if units_on
+            else None
+        )
+        task_owner = (
+            str(
+                unit.get("lead_analyst_user_id")
+                or unit.get("owner_user_id")
+                or ""
+            ).strip()
+            if unit is not None
+            else ""
+        ) or ws_owner
+
+        if unit is not None:
+            if is_pm:
+                can_edit = True
+            elif uid == task_owner:
+                try:
+                    await require_workspace_access(
+                        workspace_id,
+                        uid,
+                        channel="web",
+                        need="write",
+                        workspace=workspace,
+                    )
+                    can_edit = True
+                except (HTTPException, ColleagueAccessRevokedError):
+                    can_edit = False
+            else:
+                can_edit = False
+        else:
+            can_edit = (ws_owner == uid) or is_pm
+
         if require_write and not can_edit:
-            raise HTTPException(
-                status_code=403,
-                detail="Only workspace owner or PM may modify tracking",
+            detail = (
+                "Only unit lead analyst or PM may modify tracking"
+                if unit is not None
+                else "Only workspace owner or PM may modify tracking"
             )
-        return owner_id, can_edit
+            raise HTTPException(status_code=403, detail=detail)
+        return task_owner, can_edit
 
     try:
         workspace = await _verify_workspace_access(workspace_id, uid)
-        owner_id = str((workspace or {}).get("user_id") or uid).strip()
-        return owner_id, True
     except HTTPException as exc:
         if exc.status_code == 403 and is_pm:
             ws = await ws_db.get_workspace(workspace_id)
@@ -1528,9 +1615,28 @@ async def _resolve_tracking_workspace_owner(
                     status_code=404,
                     detail=f"Workspace '{workspace_id}' not found",
                 ) from exc
-            owner_id = str(ws.get("user_id") or uid).strip()
-            return owner_id, True
+            task_owner = await resolve_workspace_tracking_owner(workspace_id, ws)
+            return (task_owner or str(ws.get("user_id") or uid).strip()), True
         raise
+
+    ws_owner = str((workspace or {}).get("user_id") or uid).strip()
+    unit = await get_active_unit_by_workspace(workspace_id) if units_on else None
+    task_owner = (
+        str(
+            unit.get("lead_analyst_user_id") or unit.get("owner_user_id") or ""
+        ).strip()
+        if unit is not None
+        else ""
+    ) or ws_owner
+    can_edit = True
+    if unit is not None and not is_pm and uid != task_owner:
+        can_edit = False
+        if require_write:
+            raise HTTPException(
+                status_code=403,
+                detail="Only unit lead analyst or PM may modify tracking",
+            )
+    return task_owner, can_edit
 
 
 @router.get("/tracking/{workspace_id}")
@@ -1542,13 +1648,32 @@ async def get_workspace_tracking_endpoint(
     from src.dalton.autonomy.schedule import AutomationLockError
     from src.dalton.autonomy.tracking import get_tracking_status
 
+    from src.dalton.coverage.identity import CoverageIdentityUnavailableError
+
     owner_id, can_edit = await _resolve_tracking_workspace_owner(
         workspace_id,
         user_id,
         require_write=False,
     )
     try:
-        res = await get_tracking_status(owner_id, workspace_id)
+        res = await get_tracking_status(
+            owner_id,
+            workspace_id,
+            viewer_user_id=str(user_id).strip(),
+        )
+    except CoverageIdentityUnavailableError as exc:
+        logger.warning(
+            "[dalton.router] coverage identity unavailable getting tracking for %s: %s",
+            workspace_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "coverage_identity_unavailable",
+                "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+            },
+        ) from exc
     except AutomationLockError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
@@ -1565,7 +1690,12 @@ async def update_workspace_tracking_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     from src.dalton.autonomy.schedule import AutomationLockError
-    from src.dalton.autonomy.tracking import disable_tracking, enable_tracking
+    from src.dalton.autonomy.tracking import (
+        disable_tracking,
+        enable_tracking,
+        system_job_viewer_context,
+    )
+    from src.dalton.coverage.identity import CoverageIdentityUnavailableError
     from src.dalton.services.company_automations import automation_history_context
 
     owner_id, _ = await _resolve_tracking_workspace_owner(
@@ -1574,9 +1704,12 @@ async def update_workspace_tracking_endpoint(
         require_write=True,
     )
     try:
-        with automation_history_context(
-            actor_user_id=str(user_id).strip(),
-            skip_if_unchanged=True,
+        with (
+            system_job_viewer_context(str(user_id).strip()),
+            automation_history_context(
+                actor_user_id=str(user_id).strip(),
+                skip_if_unchanged=True,
+            ),
         ):
             if body.enabled:
                 res = await enable_tracking(
@@ -1587,6 +1720,19 @@ async def update_workspace_tracking_endpoint(
                 )
             else:
                 res = await disable_tracking(owner_id, workspace_id)
+    except CoverageIdentityUnavailableError as exc:
+        logger.warning(
+            "[dalton.router] coverage identity unavailable updating tracking for %s: %s",
+            workspace_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "coverage_identity_unavailable",
+                "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+            },
+        ) from exc
     except AutomationLockError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
@@ -1636,8 +1782,25 @@ async def _authorize_system_job_mutation(key: str, user_id: str) -> str:
         # sector:<slug|unit_id> 的目标是覆盖单元，不是 ticker 也不是工作区
         # ID（codex r2 #4）：按当前用户解析单元，再对单元当前绑定的工作区
         # 做原有的跟踪权限校验。
+        from src.dalton.coverage.identity import CoverageIdentityUnavailableError
+
         try:
-            unit = await _resolve_sector_unit_for_key(str(user_id).strip(), target)
+            unit = await _resolve_sector_unit_for_key(
+                str(user_id).strip(), target, include_all_for_pm=True
+            )
+        except CoverageIdentityUnavailableError as exc:
+            logger.warning(
+                "[dalton.router] coverage identity unavailable resolving sector %s: %s",
+                key,
+                exc,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "coverage_identity_unavailable",
+                    "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+                },
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         sector_ws = str(unit.get("workspace_id") or "").strip()
@@ -1653,7 +1816,21 @@ async def _authorize_system_job_mutation(key: str, user_id: str) -> str:
         )
         return owner_id
 
-    ws_id = await _resolve_company_workspace_id(user_id, target)
+    try:
+        ws_id = await _resolve_company_workspace_id(user_id, target)
+    except CoverageIdentityUnavailableError as exc:
+        logger.warning(
+            "[dalton.router] coverage identity unavailable resolving company %s: %s",
+            key,
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "coverage_identity_unavailable",
+                "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+            },
+        ) from exc
     owner_id, _ = await _resolve_tracking_workspace_owner(
         ws_id,
         user_id,
@@ -1686,6 +1863,7 @@ async def toggle_system_job_endpoint(
 ) -> dict[str, Any]:
     from src.dalton.autonomy.schedule import AutomationLockError
     from src.dalton.autonomy.system_jobs import classify_system_job_key, toggle_system_job
+    from src.dalton.coverage.identity import CoverageIdentityUnavailableError
 
     owner_id = await _authorize_system_job_mutation(key, user_id)
     scope, _ = classify_system_job_key(key)
@@ -1725,7 +1903,21 @@ async def toggle_system_job_endpoint(
                 enabled=body.enabled,
                 force=True,
                 respect_user_pause=False,
+                viewer_user_id=str(user_id).strip(),
             )
+    except CoverageIdentityUnavailableError as exc:
+        logger.warning(
+            "[dalton.router] coverage identity unavailable toggling system job %s: %s",
+            key,
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "coverage_identity_unavailable",
+                "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+            },
+        ) from exc
     except AutomationLockError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -1744,6 +1936,7 @@ async def run_system_job_now_endpoint(
 ) -> dict[str, Any]:
     from src.dalton.autonomy.schedule import AutomationLockError
     from src.dalton.autonomy.system_jobs import classify_system_job_key, run_system_job_now
+    from src.dalton.coverage.identity import CoverageIdentityUnavailableError
 
     owner_id = await _authorize_system_job_mutation(key, user_id)
     scope, _ = classify_system_job_key(key)
@@ -1760,7 +1953,24 @@ async def run_system_job_now_endpoint(
             actor_user_id=str(user_id).strip(),
             skip_if_unchanged=True,
         ):
-            return await run_system_job_now(owner_id, key)
+            return await run_system_job_now(
+                owner_id,
+                key,
+                actor_user_id=str(user_id).strip(),
+            )
+    except CoverageIdentityUnavailableError as exc:
+        logger.warning(
+            "[dalton.router] coverage identity unavailable toggling system job %s: %s",
+            key,
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "coverage_identity_unavailable",
+                "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+            },
+        ) from exc
     except AutomationLockError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -1782,6 +1992,7 @@ async def rollback_system_job_endpoint(
         classify_system_job_key,
         rollback_data_task_config,
     )
+    from src.dalton.coverage.identity import CoverageIdentityUnavailableError
 
     await _authorize_system_job_mutation(key, user_id)
     scope, target = classify_system_job_key(key)
@@ -1795,6 +2006,19 @@ async def rollback_system_job_endpoint(
             actor_user_id=str(user_id).strip(),
             job_key=target,
         )
+    except CoverageIdentityUnavailableError as exc:
+        logger.warning(
+            "[dalton.router] coverage identity unavailable toggling system job %s: %s",
+            key,
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "coverage_identity_unavailable",
+                "message": "工作区覆盖身份暂时无法解析（覆盖登记表查询失败），请稍后重试。",
+            },
+        ) from exc
     except AutomationLockError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -1886,11 +2110,14 @@ async def list_user_coverage_groups_endpoint(
     from src.dalton.coverage import list_user_coverage_summary
 
     summary = await list_user_coverage_summary(str(user_id).strip())
-    return {
+    groups_out: dict[str, Any] = {
         "ok": True,
         "user_id": str(user_id).strip(),
         "groups": summary.get("groups") or [],
     }
+    if summary.get("units_unavailable"):
+        groups_out["units_unavailable"] = True
+    return groups_out
 
 
 @router.post("/coverage/groups/preview")

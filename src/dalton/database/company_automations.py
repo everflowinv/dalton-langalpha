@@ -50,7 +50,9 @@ async def fetch_scope_classification_context(
     if not clean_ws or not clean_uid:
         return None, [], []
 
-    trimmed_unit_owner = sql_trim_scope_text("u.owner_user_id")
+    trimmed_unit_owner = sql_trim_scope_text(
+        "COALESCE(NULLIF(BTRIM(u.lead_analyst_user_id), ''), u.owner_user_id)"
+    )
     trimmed_cov_owner = sql_trim_scope_text("c.user_id")
     trimmed_cov_ticker = sql_trim_scope_text("c.ticker")
 
@@ -75,6 +77,7 @@ async def fetch_scope_classification_context(
                                     SELECT
                                         u.workspace_id::text AS workspace_id,
                                         u.owner_user_id,
+                                        u.lead_analyst_user_id,
                                         u.kind,
                                         u.status
                                     FROM dalton_coverage_units u
@@ -600,11 +603,27 @@ async def resolve_snapshot_notify_fields(
 
     if include_chat_targets is not None:
         include_chats = bool(include_chat_targets)
-    elif owner_id:
-        owner_tier = await resolve_owner_tier_for_snapshot(owner_id, conn=conn)
-        include_chats = owner_tier in ("admin", "internal")
     else:
-        include_chats = False
+        from src.dalton.autonomy.classification import is_managed_unit_automation
+        from src.dalton.database.coverage_units import get_active_unit_by_workspace
+        from src.dalton.settings import is_coverage_units_enabled
+
+        unit_dm_only = False
+        ws_id_snap = normalize_scope_text(row.get("workspace_id"))
+        if (
+            is_coverage_units_enabled()
+            and ws_id_snap
+            and is_managed_unit_automation(row)
+        ):
+            unit_row = await get_active_unit_by_workspace(ws_id_snap, conn=conn)
+            unit_dm_only = unit_row is not None
+        if unit_dm_only:
+            include_chats = False
+        elif owner_id:
+            owner_tier = await resolve_owner_tier_for_snapshot(owner_id, conn=conn)
+            include_chats = owner_tier in ("admin", "internal")
+        else:
+            include_chats = False
 
     routed = resolve_notify_route_targets(
         row,

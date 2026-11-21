@@ -2259,6 +2259,1010 @@ async def test_extractor_derived_alias_caches_ttl_refresh_and_user_isolation(
     assert "伽马77半导体" not in bob_strip_refreshed
 
 
+@pytest.mark.asyncio
+async def test_sync_lead_analyst_personal_coverage_and_canonical_overlay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§6 Decision 2 / G6: bind/transfer writes lead analyst's dalton_coverage idempotently and overlays/redacts workspace_id by Web read permission."""
+    from fastapi import HTTPException
+    import src.dalton.database.coverage_units as cu_db_mod
+    import src.dalton.settings as settings_mod
+    import src.dalton.sharing as sharing_mod
+
+    store = _InMemoryCoverageStore()
+    _wire_coverage_store(monkeypatch, store)
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "true")
+    monkeypatch.setattr(settings_mod, "is_coverage_units_enabled", lambda: True)
+
+    canon_ws = "11111111-1111-1111-1111-111111111111"
+    personal_ws = "33333333-3333-3333-3333-333333333333"
+    readable_for: dict[str, set[str]] = {
+        USER_ALICE: {canon_ws, personal_ws},
+        USER_BOB: {canon_ws},
+    }
+
+    async def _fake_req_ws_access(
+        ws_id: Any,
+        uid: str,
+        *,
+        channel: str = "web",
+        need: str = "read",
+        workspace: dict[str, Any] | None = None,
+        conn: Any = None,
+    ) -> dict[str, Any]:
+        wid = str(ws_id or "").strip()
+        if wid in readable_for.get(str(uid), set()):
+            return {"workspace_id": wid, "user_id": uid}
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_workspace_access",
+        create_autospec(sharing_mod.require_workspace_access, side_effect=_fake_req_ws_access),
+    )
+
+    # Bob already had 700 in personal coverage as tier='watch' -> preserve tier & normalized ticker_key match
+    await store.upsert_coverage_rows(
+        USER_BOB,
+        [
+            company_to_row(
+                {"ticker": "700", "name": "Tencent Old", "tier": "watch", "market": "HK"},
+                user_id=USER_BOB,
+                source="chat",
+            )
+        ],
+    )
+
+    unit_alice = {
+        "unit_id": "22222222-2222-2222-2222-222222222222",
+        "kind": "company",
+        "status": "active",
+        "owner_user_id": USER_ALICE,
+        "lead_analyst_user_id": USER_ALICE,
+        "slug": "tencent",
+        "display_name": "Tencent",
+        "ticker": "0700.HK",
+        "workspace_id": canon_ws,
+    }
+    # First sync writes Alice (new row -> defaults to tier='core', canonical workspace_id attached)
+    await coverage_svc.sync_lead_analyst_personal_coverage(unit_alice)
+    alice_rows = await store.list_coverage_rows(USER_ALICE)
+    assert len(alice_rows) == 1
+    assert alice_rows[0]["tier"] == "core"
+    assert alice_rows[0]["extra"]["workspace"]["workspace_id"] == canon_ws
+
+    # Alice also has her OWN unrelated NVDA personal workspace; Bob owning canonical NVDA must NOT erase Alice's unrelated workspace_id (GLM L5)
+    await store.upsert_coverage_rows(
+        USER_ALICE,
+        [
+            company_to_row(
+                {
+                    "ticker": "NVDA",
+                    "name": "NVIDIA",
+                    "tier": "core",
+                    "market": "US",
+                    "workspace": {"name": "NVDA", "status": "active", "workspace_id": personal_ws},
+                },
+                user_id=USER_ALICE,
+                source="chat",
+            )
+        ],
+    )
+    nvda_unit_bob = {
+        "unit_id": "44444444-4444-4444-4444-444444444444",
+        "kind": "company",
+        "status": "active",
+        "owner_user_id": USER_BOB,
+        "lead_analyst_user_id": USER_BOB,
+        "slug": "nvda",
+        "display_name": "NVIDIA",
+        "ticker": "NVDA",
+        "workspace_id": "55555555-5555-5555-5555-555555555555",
+    }
+
+    # Transfer to Bob: clears Alice's synced canonical ws & idempotently updates Bob's row preserving 'watch'
+    await coverage_svc.clear_unit_from_personal_coverage(unit_alice)
+    unit_bob = {**unit_alice, "owner_user_id": USER_BOB, "lead_analyst_user_id": USER_BOB}
+    await coverage_svc.sync_lead_analyst_personal_coverage(unit_bob)
+    alice_rows_after = await store.list_coverage_rows(USER_ALICE)
+    alice_tx_row = next(r for r in alice_rows_after if r["ticker"] == "0700.HK")
+    assert "workspace_id" not in alice_tx_row["extra"]["workspace"]
+    bob_rows = await store.list_coverage_rows(USER_BOB)
+    assert len(bob_rows) == 1
+    assert bob_rows[0]["tier"] == "watch"
+    assert bob_rows[0]["extra"]["workspace"]["workspace_id"] == canon_ws
+
+    # Read overlay (both get_user_coverage AND GET /coverage summary):
+    monkeypatch.setattr(
+        cu_db_mod,
+        "list_active_company_units_with_ticker",
+        create_autospec(
+            cu_db_mod.list_active_company_units_with_ticker,
+            return_value=[unit_bob, nvda_unit_bob],
+        ),
+    )
+    alice_doc = await coverage_svc.get_user_coverage(USER_ALICE)
+    alice_by_t = {c["ticker"]: c for c in alice_doc["companies"]}
+    assert alice_by_t["0700.HK"]["workspace"]["status"] == "none"
+    assert "workspace_id" not in alice_by_t["0700.HK"]["workspace"]
+    assert alice_by_t["NVDA"]["workspace"]["workspace_id"] == personal_ws  # unrelated personal link kept
+
+    bob_doc = await coverage_svc.get_user_coverage(USER_BOB)
+    assert bob_doc["companies"][0]["workspace"] == {"name": "Tencent", "status": "active", "workspace_id": canon_ws}
+    bob_summary = await coverage_svc.list_user_coverage_summary(USER_BOB)
+    assert bob_summary["companies"][0]["workspace"]["workspace_id"] == canon_ws
+
+    # Revoke Bob's Web read permission -> both coverage.yaml AND GET /coverage redact canon_ws
+    readable_for[USER_BOB] = set()
+    bob_doc_revoked = await coverage_svc.get_user_coverage(USER_BOB)
+    assert bob_doc_revoked["companies"][0]["workspace"]["status"] == "none"
+    assert "workspace_id" not in bob_doc_revoked["companies"][0]["workspace"]
+    bob_summary_revoked = await coverage_svc.list_user_coverage_summary(USER_BOB)
+    assert bob_summary_revoked["companies"][0]["workspace"]["status"] == "none"
+    assert "workspace_id" not in bob_summary_revoked["companies"][0]["workspace"]
+
+    # Archive cleanup clears synced canonical workspace_id even after unit stops appearing in active list
+    await coverage_svc.clear_unit_from_personal_coverage(unit_bob)
+    bob_after_archive = await store.list_coverage_rows(USER_BOB)
+    assert "workspace_id" not in bob_after_archive[0]["extra"]["workspace"]
 
 
+@pytest.mark.asyncio
+async def test_personal_sync_preserves_manual_ws_and_infers_cnhk_bse_markets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Items 5 & 10: manual workspace_id is never overwritten/deleted on sync/clear, same-ws rebind skips personal sync, and new HK/CN/BSE rows get accurate market."""
+    import src.dalton.coverage.units as cu_svc_mod
+    import src.dalton.database.coverage_units as cu_db_mod
+    import src.dalton.settings as settings_mod
 
+    store = _InMemoryCoverageStore()
+    _wire_coverage_store(monkeypatch, store)
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "true")
+    monkeypatch.setattr(settings_mod, "is_coverage_units_enabled", lambda: True)
+
+    canon_ws = "66666666-6666-6666-6666-666666666666"
+    manual_ws = "77777777-7777-7777-7777-777777777777"
+
+    # 1) User already has AAPL with manual workspace_id="manual_ws" -> sync must preserve manual_ws & record _synced_*
+    await store.upsert_coverage_rows(
+        USER_ALICE,
+        [
+            company_to_row(
+                {
+                    "ticker": "AAPL",
+                    "name": "Apple",
+                    "tier": "watch",
+                    "market": "US",
+                    "workspace": {"name": "My Apple", "status": "active", "workspace_id": manual_ws},
+                },
+                user_id=USER_ALICE,
+                source="chat",
+            )
+        ],
+    )
+    aapl_unit = {
+        "unit_id": "88888888-8888-8888-8888-888888888888",
+        "kind": "company",
+        "status": "active",
+        "owner_user_id": USER_ALICE,
+        "lead_analyst_user_id": USER_ALICE,
+        "slug": "apple",
+        "display_name": "Apple",
+        "ticker": "AAPL",
+        "workspace_id": canon_ws,
+    }
+    await coverage_svc.sync_lead_analyst_personal_coverage(aapl_unit)
+    aapl_rows = await store.list_coverage_rows(USER_ALICE)
+    assert aapl_rows[0]["extra"]["workspace"]["workspace_id"] == manual_ws
+    assert aapl_rows[0]["extra"]["_synced_unit_id"] == aapl_unit["unit_id"]
+    assert aapl_rows[0]["extra"]["_synced_workspace_id"] == canon_ws
+
+    # Clear after transfer/archive removes _synced_* metadata WITHOUT touching manual_ws
+    await coverage_svc.clear_unit_from_personal_coverage(aapl_unit)
+    aapl_after = await store.list_coverage_rows(USER_ALICE)
+    assert aapl_after[0]["extra"]["workspace"]["workspace_id"] == manual_ws
+    assert "_synced_unit_id" not in aapl_after[0]["extra"]
+
+    # Manual row pointing to canon_ws WITHOUT _synced_unit_id is never cleared on transfer/archive
+    await store.upsert_coverage_rows(
+        USER_BOB,
+        [
+            company_to_row(
+                {
+                    "ticker": "AAPL",
+                    "name": "Apple Manual",
+                    "tier": "watch",
+                    "market": "US",
+                    "workspace": {"name": "Apple", "status": "active", "workspace_id": canon_ws},
+                },
+                user_id=USER_BOB,
+                source="chat",
+            )
+        ],
+    )
+    assert await coverage_svc.clear_unit_from_personal_coverage(aapl_unit) is None
+    assert (await store.list_coverage_rows(USER_BOB))[0]["extra"]["workspace"]["workspace_id"] == canon_ws
+
+    # 2) Same-workspace duplicate bind skips personal coverage sync (does not recreate removed row)
+    fake_unit = {**aapl_unit, "workspace_id": canon_ws}
+    async def _fake_bind(uid: str, wsid: str, actor: str, *, conn: Any = None, previous_out: Any = None) -> dict[str, Any]:
+        if isinstance(previous_out, dict):
+            previous_out.update(fake_unit)
+        return dict(fake_unit)
+
+    from psycopg import AsyncConnection
+
+    class _TxCm:
+        async def __aenter__(self) -> "_TxCm":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+    class _ConnWrap:
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        async def __aenter__(self) -> Any:
+            return self._inner
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+    import src.dalton.sharing as sharing_mod
+    from fastapi import HTTPException
+
+    async def _allow_ws_read(
+        ws_id: Any,
+        uid: str,
+        *,
+        channel: str = "web",
+        need: str = "read",
+        workspace: dict[str, Any] | None = None,
+        conn: Any = None,
+    ) -> dict[str, Any]:
+        if str(ws_id or "").strip() == canon_ws:
+            return {"workspace_id": canon_ws, "user_id": uid}
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_workspace_access",
+        create_autospec(sharing_mod.require_workspace_access, side_effect=_allow_ws_read),
+    )
+    tx_conn = create_autospec(AsyncConnection, instance=True)
+    tx_conn.transaction.return_value = _TxCm()
+    sync_spy = create_autospec(coverage_svc.sync_lead_analyst_personal_coverage)
+    monkeypatch.setattr(cu_db_mod, "get_db_connection", create_autospec(cu_db_mod.get_db_connection, return_value=_ConnWrap(tx_conn)))
+    monkeypatch.setattr(cu_db_mod, "bind_coverage_unit_workspace", create_autospec(cu_db_mod.bind_coverage_unit_workspace, side_effect=_fake_bind))
+    monkeypatch.setattr(coverage_svc, "sync_lead_analyst_personal_coverage", sync_spy)
+    same = await cu_svc_mod.bind_coverage_unit_workspace(aapl_unit["unit_id"], canon_ws, USER_ALICE)
+    assert same["workspace_id"] == canon_ws
+    sync_spy.assert_not_awaited()
+
+    # 3) New personal rows created for naked HK ("700") & BSE ("920001.BJ") infer accurate markets
+    monkeypatch.undo()
+    _wire_coverage_store(monkeypatch, store)
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "true")
+    monkeypatch.setattr(settings_mod, "is_coverage_units_enabled", lambda: True)
+    hk_row = await coverage_svc.sync_lead_analyst_personal_coverage(
+        {
+            "unit_id": "99999999-9999-9999-9999-999999999901",
+            "kind": "company",
+            "status": "active",
+            "owner_user_id": "u-new-mkt",
+            "lead_analyst_user_id": "u-new-mkt",
+            "slug": "tencent-hk",
+            "display_name": "Tencent",
+            "ticker": "700",
+            "workspace_id": "10101010-1010-1010-1010-101010101010",
+        }
+    )
+    bj_row = await coverage_svc.sync_lead_analyst_personal_coverage(
+        {
+            "unit_id": "99999999-9999-9999-9999-999999999902",
+            "kind": "company",
+            "status": "active",
+            "owner_user_id": "u-new-mkt",
+            "lead_analyst_user_id": "u-new-mkt",
+            "slug": "bse-co",
+            "display_name": "BSE Co",
+            "ticker": "920001.BJ",
+            "workspace_id": "20202020-2020-2020-2020-202020202020",
+        }
+    )
+    assert hk_row is not None and hk_row["market"] == "HK"
+    assert bj_row is not None and bj_row["market"] == "CN"
+
+
+@pytest.mark.asyncio
+async def test_add_tickers_redacts_unreadable_ws_and_preserves_manual_vs_synced_links(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 4 Items 3 & 4:
+    - POST /coverage (add_user_coverage_tickers) redacts unreadable canonical workspace_id.
+    - Manual workspace link equal to canon_ws is marked manual and preserved across sync, re-add, and clear.
+    - System-synced _synced_* metadata survives re-add and still clears on transfer/archive.
+    """
+    from fastapi import HTTPException
+    import src.dalton.database.coverage_units as cu_db_mod
+    import src.dalton.settings as settings_mod
+    import src.dalton.sharing as sharing_mod
+
+    store = _InMemoryCoverageStore()
+    _wire_coverage_store(monkeypatch, store)
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "true")
+    monkeypatch.setattr(settings_mod, "is_coverage_units_enabled", lambda: True)
+
+    canon_ws = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    readable_for: dict[str, set[str]] = {
+        USER_ALICE: set(),
+        USER_BOB: {canon_ws},
+    }
+
+    async def _req_ws(
+        ws_id: Any,
+        uid: str,
+        *,
+        channel: str = "web",
+        need: str = "read",
+        workspace: dict[str, Any] | None = None,
+        conn: Any = None,
+    ) -> dict[str, Any]:
+        wid = str(ws_id or "").strip()
+        if wid in readable_for.get(str(uid), set()):
+            return {"workspace_id": wid, "user_id": uid}
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_workspace_access",
+        create_autospec(sharing_mod.require_workspace_access, side_effect=_req_ws),
+    )
+
+    nvda_unit_alice = {
+        "unit_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "kind": "company",
+        "status": "active",
+        "owner_user_id": USER_ALICE,
+        "lead_analyst_user_id": USER_ALICE,
+        "slug": "nvda",
+        "display_name": "NVIDIA",
+        "ticker": "NVDA",
+        "workspace_id": canon_ws,
+    }
+    aapl_unit_bob = {
+        "unit_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+        "kind": "company",
+        "status": "active",
+        "owner_user_id": USER_BOB,
+        "lead_analyst_user_id": USER_BOB,
+        "slug": "aapl",
+        "display_name": "Apple",
+        "ticker": "AAPL",
+        "workspace_id": canon_ws,
+    }
+    orig_list_active_units = cu_db_mod.list_active_company_units_with_ticker
+    monkeypatch.setattr(
+        cu_db_mod,
+        "list_active_company_units_with_ticker",
+        create_autospec(
+            orig_list_active_units,
+            return_value=[nvda_unit_alice, aapl_unit_bob],
+        ),
+    )
+
+    # Item 3 + Item 4 (system-written link survives re-add and still clears on archive/transfer)
+    await coverage_svc.sync_lead_analyst_personal_coverage(nvda_unit_alice)
+    readded_alice = await coverage_svc.add_user_coverage_tickers(
+        USER_ALICE,
+        ["NVDA"],
+        tier="watch",
+        prevalidated={"NVDA": {"ticker": "NVDA", "name": "NVIDIA", "market": "US"}},
+        ensure_automation=False,
+        sync_home=False,
+    )
+    assert readded_alice["added"][0]["workspace"]["status"] == "none"
+    assert "workspace_id" not in readded_alice["added"][0]["workspace"]
+    alice_row_after_readd = (await store.list_coverage_rows(USER_ALICE))[0]
+    assert alice_row_after_readd["extra"]["_synced_unit_id"] == nvda_unit_alice["unit_id"]
+    assert alice_row_after_readd["extra"]["_synced_ws_written"] is True
+
+    await coverage_svc.clear_unit_from_personal_coverage(nvda_unit_alice)
+    alice_cleared = (await store.list_coverage_rows(USER_ALICE))[0]
+    assert "workspace_id" not in alice_cleared["extra"]["workspace"]
+    assert "_synced_unit_id" not in alice_cleared["extra"]
+
+    # Item 4 (user manual link happens to equal canon_ws): kept across sync, re-add, and clear
+    await store.upsert_coverage_rows(
+        USER_BOB,
+        [
+            company_to_row(
+                {
+                    "ticker": "AAPL",
+                    "name": "Apple Manual",
+                    "tier": "watch",
+                    "market": "US",
+                    "workspace": {"name": "Apple Manual", "status": "active", "workspace_id": canon_ws},
+                },
+                user_id=USER_BOB,
+                source="chat",
+            )
+        ],
+    )
+    await coverage_svc.sync_lead_analyst_personal_coverage(aapl_unit_bob)
+    bob_synced = (await store.list_coverage_rows(USER_BOB))[0]
+    assert bob_synced["extra"]["_manual_workspace_id"] == canon_ws
+    assert bob_synced["extra"]["_synced_ws_written"] is False
+    assert bob_synced["extra"]["_synced_unit_id"] == aapl_unit_bob["unit_id"]
+
+    await coverage_svc.add_user_coverage_tickers(
+        USER_BOB,
+        ["AAPL"],
+        tier="core",
+        prevalidated={"AAPL": {"ticker": "AAPL", "name": "Apple", "market": "US"}},
+        ensure_automation=False,
+        sync_home=False,
+    )
+    bob_readded = (await store.list_coverage_rows(USER_BOB))[0]
+    assert bob_readded["extra"]["_manual_workspace_id"] == canon_ws
+    assert bob_readded["extra"]["_synced_ws_written"] is False
+    assert bob_readded["extra"]["workspace"]["workspace_id"] == canon_ws
+
+    await coverage_svc.clear_unit_from_personal_coverage(aapl_unit_bob)
+    bob_after_clear = (await store.list_coverage_rows(USER_BOB))[0]
+    assert bob_after_clear["extra"]["workspace"]["workspace_id"] == canon_ws
+    assert bob_after_clear["extra"]["_manual_workspace_id"] == canon_ws
+    assert "_synced_unit_id" not in bob_after_clear["extra"]
+
+    # Non-lead colleague's readable manual link equal to canon_ws is preserved on GET /coverage
+    nvda_other_lead = {
+        **nvda_unit_alice,
+        "owner_user_id": USER_ALICE,
+        "lead_analyst_user_id": USER_ALICE,
+    }
+    monkeypatch.setattr(
+        cu_db_mod,
+        "list_active_company_units_with_ticker",
+        create_autospec(
+            orig_list_active_units,
+            return_value=[nvda_other_lead],
+        ),
+    )
+    await store.upsert_coverage_rows(
+        USER_BOB,
+        [
+            company_to_row(
+                {
+                    "ticker": "NVDA",
+                    "name": "NVIDIA",
+                    "tier": "core",
+                    "market": "US",
+                    "workspace": {"name": "NVDA", "status": "active", "workspace_id": canon_ws},
+                    "_manual_workspace_id": canon_ws,
+                    "_synced_ws_written": False,
+                },
+                user_id=USER_BOB,
+                source="chat",
+            )
+        ],
+    )
+    # Item 14 / C4: non-lead user's manual link equal to canon_ws is hidden in coverage.yaml/get_user_coverage,
+    # while DB row association stays intact.
+    bob_doc = await coverage_svc.get_user_coverage(USER_BOB)
+    nvda_entry = next(c for c in bob_doc["companies"] if c["ticker"] == "NVDA")
+    assert nvda_entry["workspace"]["status"] == "none"
+    assert "workspace_id" not in nvda_entry["workspace"]
+    bob_nvda_row = await store.get_coverage_row(USER_BOB, "NVDA")
+    assert bob_nvda_row["extra"]["workspace"]["workspace_id"] == canon_ws
+    assert bob_nvda_row["extra"]["_manual_workspace_id"] == canon_ws
+
+
+@pytest.mark.asyncio
+async def test_personal_roster_endpoints_degrade_when_coverage_units_registry_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 7 Item 4: when canonical coverage-units registry fails, personal roster reads
+    and group/add responses keep personal rows, omit unconfirmed synced links, and flag
+    units_unavailable=True instead of raising HTTP 500."""
+    import src.dalton.database.coverage_units as cu_db_mod
+    import src.dalton.settings as settings_mod
+    import src.dalton.sharing as sharing_mod
+    from fastapi import HTTPException
+
+    store = _InMemoryCoverageStore()
+    _wire_coverage_store(monkeypatch, store)
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "true")
+    monkeypatch.setattr(settings_mod, "is_coverage_units_enabled", lambda: True)
+    synced_ws = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    manual_ws = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+    async def _req_ws(ws_id: Any, uid: str, **kwargs: Any) -> dict[str, Any]:
+        wid = str(ws_id or "").strip()
+        if wid in {manual_ws, synced_ws}:
+            return {"workspace_id": wid, "user_id": uid}
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_workspace_access",
+        create_autospec(sharing_mod.require_workspace_access, side_effect=_req_ws),
+    )
+    monkeypatch.setattr(
+        coverage_svc,
+        "sync_user_coverage_to_home",
+        create_autospec(coverage_svc.sync_user_coverage_to_home, return_value=True),
+    )
+    monkeypatch.setattr(
+        coverage_svc,
+        "ensure_user_earnings_calendar_automation",
+        create_autospec(
+            coverage_svc.ensure_user_earnings_calendar_automation,
+            return_value={"ok": True, "action": "exists", "automation_id": "auto-cal-1", "name": "dalton-earnings-calendar"},
+        ),
+    )
+    monkeypatch.setattr(
+        coverage_svc,
+        "_user_workspace_tickers",
+        create_autospec(coverage_svc._user_workspace_tickers, return_value={}),
+    )
+
+    async def _fake_validate(ticker: str) -> dict[str, Any] | None:
+        sym = ticker.strip().upper()
+        return {"ticker": sym, "name": f"{sym} Corp", "market": "US", "sector": "Technology", "industry": "Semiconductors"}
+
+    monkeypatch.setattr(
+        coverage_svc,
+        "validate_and_enrich_ticker",
+        create_autospec(coverage_svc.validate_and_enrich_ticker, side_effect=_fake_validate),
+    )
+
+    await store.upsert_coverage_rows(
+        USER_ALICE,
+        [
+            company_to_row(
+                {
+                    "ticker": "NVDA",
+                    "name": "NVIDIA",
+                    "tier": "core",
+                    "market": "US",
+                    "workspace": {"name": "NVDA", "status": "active", "workspace_id": synced_ws},
+                    "_synced_ws_written": True,
+                    "_synced_unit_id": "unit-nvda",
+                },
+                user_id=USER_ALICE,
+                source="chat",
+            ),
+            company_to_row(
+                {
+                    "ticker": "AAPL",
+                    "name": "Apple",
+                    "tier": "watch",
+                    "market": "US",
+                    "workspace": {"name": "Apple Manual", "status": "active", "workspace_id": manual_ws},
+                    "_manual_workspace_id": manual_ws,
+                    "_synced_ws_written": False,
+                },
+                user_id=USER_ALICE,
+                source="chat",
+            ),
+        ],
+    )
+
+    orig_list_units = cu_db_mod.list_active_company_units_with_ticker
+    monkeypatch.setattr(
+        cu_db_mod,
+        "list_active_company_units_with_ticker",
+        create_autospec(orig_list_units, side_effect=RuntimeError("db down")),
+    )
+
+    doc = await coverage_svc.get_user_coverage(USER_ALICE)
+    assert doc["units_unavailable"] is True
+    by_t = {c["ticker"]: c for c in doc["companies"]}
+    # Registry failed: synced binding is preserved cleanly instead of taking the "no active unit" path
+    assert by_t["NVDA"]["workspace"]["workspace_id"] == synced_ws
+    assert by_t["AAPL"]["workspace"]["workspace_id"] == manual_ws
+    rendered = await coverage_svc.render_coverage_yaml(USER_ALICE)
+    assert "units_unavailable" not in rendered
+
+    summary = await coverage_svc.list_user_coverage_summary(USER_ALICE)
+    assert summary["units_unavailable"] is True
+    assert {c["ticker"] for c in summary["companies"]} == {"NVDA", "AAPL"}
+
+    added = await coverage_svc.add_user_coverage_tickers(
+        USER_ALICE,
+        ["MSFT"],
+        tier="watch",
+        ensure_automation=False,
+        sync_home=False,
+    )
+    assert added["units_unavailable"] is True
+    assert [c["ticker"] for c in added["added"]] == ["MSFT"]
+
+    app = FastAPI()
+    app.dependency_overrides[get_current_user_id] = lambda: USER_ALICE
+    app.include_router(dalton_router)
+    client = TestClient(app, raise_server_exceptions=False)
+    cov_resp = client.get("/api/v1/dalton/coverage")
+    assert cov_resp.status_code == 200
+    cov_body = cov_resp.json()
+    assert cov_body["units_unavailable"] is True
+    assert {c["ticker"] for c in cov_body["companies"]} == {"NVDA", "AAPL", "MSFT"}
+
+    grp_resp = client.get("/api/v1/dalton/coverage/groups")
+    assert grp_resp.status_code == 200
+    grp_body = grp_resp.json()
+    assert grp_body["units_unavailable"] is True
+    assert "groups" in grp_body
+
+
+@pytest.mark.asyncio
+async def test_coverage_units_flag_off_and_permission_db_error_preserve_persisted_ws_and_market(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 8 Items 6 & 7.1:
+    - When coverage_units is disabled, infer_market preserves 49a56df4b ('700' -> 'US')
+      and get_user_coverage preserves persisted workspace_id without checking permissions.
+    - When enabled and _caller_can_read_workspace hits a DB error, keep persisted workspace_id
+      and surface units_unavailable=True; only confirmed HTTPException 403/404 clears it."""
+    import src.dalton.coverage.models as models_mod
+    import src.dalton.database.coverage_units as cu_db_mod
+    import src.dalton.settings as settings_mod
+    import src.dalton.sharing as sharing_mod
+    from fastapi import HTTPException
+
+    store = _InMemoryCoverageStore()
+    _wire_coverage_store(monkeypatch, store)
+    persisted_ws = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    await store.upsert_coverage_rows(
+        USER_ALICE,
+        [
+            company_to_row(
+                {
+                    "ticker": "NVDA",
+                    "name": "NVIDIA",
+                    "tier": "core",
+                    "market": "US",
+                    "workspace": {"name": "NVDA", "status": "active", "workspace_id": persisted_ws},
+                },
+                user_id=USER_ALICE,
+                source="chat",
+            )
+        ],
+    )
+
+    # Flag OFF -> infer_market("700") is "US", zero permission/unit queries, persisted_ws stays intact
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "false")
+    monkeypatch.setattr(settings_mod, "is_coverage_units_enabled", lambda: False)
+    assert models_mod.infer_market("700") == "US"
+    assert models_mod.infer_market("0700.HK") == "HK"
+    assert models_mod.infer_market("600519") == "US"
+    assert models_mod.infer_market("600519.SH") == "CN"
+
+    orig_req_ws = sharing_mod.require_workspace_access
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_workspace_access",
+        create_autospec(orig_req_ws, side_effect=AssertionError("flag off must not check ws access")),
+    )
+    doc_off = await coverage_svc.get_user_coverage(USER_ALICE)
+    assert "units_unavailable" not in doc_off
+    assert doc_off["companies"][0]["workspace"]["workspace_id"] == persisted_ws
+
+    # Flag ON -> infer_market("700") == "HK"; transient DB error in read check preserves persisted_ws + flags units_unavailable
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "true")
+    monkeypatch.setattr(settings_mod, "is_coverage_units_enabled", lambda: True)
+    assert models_mod.infer_market("700") == "HK"
+    monkeypatch.setattr(
+        cu_db_mod,
+        "list_active_company_units_with_ticker",
+        create_autospec(cu_db_mod.list_active_company_units_with_ticker, return_value=[]),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_workspace_access",
+        create_autospec(orig_req_ws, side_effect=RuntimeError("transient pool timeout")),
+    )
+    doc_err = await coverage_svc.get_user_coverage(USER_ALICE)
+    assert doc_err["units_unavailable"] is True
+    assert doc_err["companies"][0]["workspace"]["workspace_id"] == persisted_ws
+
+    # HTTPException(503) from sharing lookup ALSO treated as unavailable (keeps persisted_ws + strips YAML)
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_workspace_access",
+        create_autospec(
+            orig_req_ws,
+            side_effect=HTTPException(status_code=503, detail="Workspace sharing settings unavailable"),
+        ),
+    )
+    doc_503 = await coverage_svc.get_user_coverage(USER_ALICE)
+    assert doc_503["units_unavailable"] is True
+    assert doc_503["companies"][0]["workspace"]["workspace_id"] == persisted_ws
+    yaml_503 = await coverage_svc.render_coverage_yaml(USER_ALICE)
+    assert "units_unavailable" not in yaml_503
+    assert persisted_ws in yaml_503
+
+    # Confirmed HTTPException(403) clears persisted_ws cleanly
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_workspace_access",
+        create_autospec(orig_req_ws, side_effect=HTTPException(status_code=403, detail="forbidden")),
+    )
+    doc_denied = await coverage_svc.get_user_coverage(USER_ALICE)
+    assert "units_unavailable" not in doc_denied
+    assert "workspace_id" not in doc_denied["companies"][0]["workspace"]
+
+
+@pytest.mark.asyncio
+async def test_group_write_isolates_registry_failure_in_savepoint_and_commits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 8 Item 4: add_coverage_group and resolve_coverage_group run registry
+    overlay queries inside a SAVEPOINT so catching registry errors never leaves
+    the outer tx in InFailedSqlTransaction."""
+    import src.dalton.database.coverage_units as cu_db_mod
+    import src.dalton.settings as settings_mod
+
+    store = _InMemoryCoverageStore()
+    tx_state = {"depth": 0, "aborted_levels": set(), "savepoints": 0, "committed": False}
+
+    class _TxCm:
+        def __init__(self, is_savepoint: bool) -> None:
+            self._sp = is_savepoint
+
+        async def __aenter__(self) -> None:
+            tx_state["depth"] += 1
+            if self._sp:
+                tx_state["savepoints"] += 1
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+            depth = tx_state["depth"]
+            tx_state["depth"] -= 1
+            if exc_type is not None:
+                # Exception inside SAVEPOINT rolls back ONLY the savepoint; outer tx stays healthy!
+                if not self._sp:
+                    tx_state["aborted_levels"].add(depth)
+            elif not self._sp and depth == 1:
+                if tx_state["aborted_levels"]:
+                    raise RuntimeError("InFailedSqlTransaction")
+                tx_state["committed"] = True
+            return False
+
+    class _SpConn:
+        def transaction(self) -> _TxCm:
+            return _TxCm(tx_state["depth"] >= 1)
+
+    _wire_coverage_store(monkeypatch, store)
+    conn = _SpConn()
+
+    @asynccontextmanager
+    async def _conn_ctx(existing: Any = None):
+        yield existing if existing is not None else conn
+
+    monkeypatch.setattr(coverage_db, "get_db_connection", _conn_ctx)
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "true")
+    monkeypatch.setattr(settings_mod, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(coverage_svc, "sync_user_coverage_to_home", create_autospec(coverage_svc.sync_user_coverage_to_home, return_value=True))
+    monkeypatch.setattr(
+        coverage_svc,
+        "ensure_user_earnings_calendar_automation",
+        create_autospec(coverage_svc.ensure_user_earnings_calendar_automation, return_value={"ok": True, "action": "exists"}),
+    )
+    monkeypatch.setattr(coverage_svc, "_user_workspace_tickers", create_autospec(coverage_svc._user_workspace_tickers, return_value={}))
+    orig_screener = coverage_svc._fetch_yf_screener_rows
+    monkeypatch.setattr(
+        coverage_svc,
+        "_fetch_yf_screener_rows",
+        create_autospec(
+            orig_screener,
+            return_value=[{"symbol": "NVDA", "companyName": "NVIDIA Corp", "exchangeShortName": "NMS"}],
+        ),
+    )
+
+    def _failing_registry(*, conn: Any = None):
+        if conn is not None and not tx_state["savepoints"]:
+            tx_state["aborted_levels"].add(tx_state["depth"])
+        raise RuntimeError("registry query error inside tx")
+
+    monkeypatch.setattr(
+        cu_db_mod,
+        "list_active_company_units_with_ticker",
+        create_autospec(cu_db_mod.list_active_company_units_with_ticker, side_effect=_failing_registry),
+    )
+
+    added = await coverage_svc.add_coverage_group(
+        USER_ALICE,
+        label="Semis",
+        criteria={"country": "US", "industry": "Semiconductors"},
+        default_tier="core",
+    )
+    assert added["ok"] is True
+    assert added["units_unavailable"] is True
+    assert tx_state["savepoints"] >= 1
+    assert tx_state["committed"] is True
+
+    tx_state["committed"] = False
+    tx_state["savepoints"] = 0
+    monkeypatch.setattr(
+        coverage_svc,
+        "_fetch_yf_screener_rows",
+        create_autospec(
+            orig_screener,
+            return_value=[
+                {"symbol": "NVDA", "companyName": "NVIDIA Corp", "exchangeShortName": "NMS"},
+                {"symbol": "AMD", "companyName": "AMD Inc", "exchangeShortName": "NMS"},
+            ],
+        ),
+    )
+    resolved = await coverage_svc.resolve_coverage_group(USER_ALICE, added["group"]["group_id"])
+    assert resolved["ok"] is True
+    assert resolved["units_unavailable"] is True
+    assert tx_state["savepoints"] >= 1
+    assert tx_state["committed"] is True
+
+
+@pytest.mark.asyncio
+async def test_unreadable_owner_tier_404_is_a_failed_lookup_not_a_denial(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The owner-tier-unavailable 404 keeps the binding; a plain 404 is a denial."""
+    from fastapi import HTTPException
+
+    import src.dalton.coverage.service as svc
+    import src.dalton.sharing as sharing_mod
+
+    check = create_autospec(sharing_mod.require_workspace_access, side_effect=sharing_mod.OwnerTierUnavailable())
+    monkeypatch.setattr(sharing_mod, "require_workspace_access", check)
+    assert await svc._caller_can_read_workspace("ws-1", "lead-1") is None
+
+    check.side_effect = HTTPException(status_code=404, detail="Workspace not found")
+    assert await svc._caller_can_read_workspace("ws-1", "lead-1") is False
+
+
+@pytest.mark.asyncio
+async def test_phase1_c4_non_lead_synced_or_unmarked_canonical_ws_is_cleared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C4: coverage.yaml only outputs canonical workspace_id + active to current lead_analyst_user_id."""
+    import src.dalton.database.coverage_units as cu_db_mod
+    import src.dalton.settings as settings_mod
+    import src.dalton.sharing as sharing_mod
+
+    store = _InMemoryCoverageStore()
+    _wire_coverage_store(monkeypatch, store)
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "true")
+    monkeypatch.setattr(settings_mod, "is_coverage_units_enabled", lambda: True)
+
+    canon_ws = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_workspace_access",
+        create_autospec(
+            sharing_mod.require_workspace_access,
+            side_effect=lambda ws_id, uid, **_kw: {"workspace_id": str(ws_id), "user_id": uid},
+        ),
+    )
+    unit = {
+        "unit_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "kind": "company",
+        "status": "active",
+        "owner_user_id": USER_ALICE,
+        "lead_analyst_user_id": USER_BOB,
+        "slug": "nvda",
+        "display_name": "NVIDIA",
+        "ticker": "NVDA",
+        "workspace_id": canon_ws,
+    }
+    monkeypatch.setattr(
+        cu_db_mod,
+        "list_active_company_units_with_ticker",
+        create_autospec(cu_db_mod.list_active_company_units_with_ticker, return_value=[unit]),
+    )
+    # Non-lead prior owner (USER_ALICE) still has persisted canon_ws row without manual tag -> cleared
+    await store.upsert_coverage_rows(
+        USER_ALICE,
+        [
+            company_to_row(
+                {
+                    "ticker": "NVDA",
+                    "name": "NVIDIA",
+                    "tier": "core",
+                    "market": "US",
+                    "workspace": {"name": "NVDA", "status": "active", "workspace_id": canon_ws},
+                },
+                user_id=USER_ALICE,
+                source="chat",
+            )
+        ],
+    )
+    await store.upsert_coverage_rows(
+        USER_BOB,
+        [
+            company_to_row(
+                {"ticker": "NVDA", "name": "NVIDIA", "tier": "core", "market": "US"},
+                user_id=USER_BOB,
+                source="chat",
+            )
+        ],
+    )
+
+    alice_doc = await coverage_svc.get_user_coverage(USER_ALICE)
+    bob_doc = await coverage_svc.get_user_coverage(USER_BOB)
+    alice_nvda = next(c for c in alice_doc["companies"] if c["ticker"] == "NVDA")
+    bob_nvda = next(c for c in bob_doc["companies"] if c["ticker"] == "NVDA")
+    assert alice_nvda["workspace"]["status"] == "none"
+    assert "workspace_id" not in alice_nvda["workspace"]
+    assert bob_nvda["workspace"]["status"] == "active"
+    assert bob_nvda["workspace"]["workspace_id"] == canon_ws
+
+
+@pytest.mark.asyncio
+async def test_c4_hides_canonical_workspace_for_non_lead_even_when_manual_row_is_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 14 / C4: non-lead user's manual association pointing at canonical unit workspace is
+    hidden from coverage.yaml while preserving DB row."""
+    import src.dalton.database.coverage_units as cu_db_mod
+    import src.dalton.settings as settings_mod
+    import src.dalton.sharing as sharing_mod
+
+    store = _InMemoryCoverageStore()
+    _wire_coverage_store(monkeypatch, store)
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "true")
+    monkeypatch.setattr(settings_mod, "is_coverage_units_enabled", lambda: True)
+
+    canon_ws = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_workspace_access",
+        create_autospec(
+            sharing_mod.require_workspace_access,
+            side_effect=lambda ws_id, uid, **_kw: {"workspace_id": str(ws_id), "user_id": uid},
+        ),
+    )
+    unit = {
+        "unit_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "kind": "company",
+        "status": "active",
+        "owner_user_id": USER_ALICE,
+        "lead_analyst_user_id": USER_BOB,
+        "slug": "nvda",
+        "display_name": "NVIDIA",
+        "ticker": "NVDA",
+        "workspace_id": canon_ws,
+    }
+    monkeypatch.setattr(
+        cu_db_mod,
+        "list_active_company_units_with_ticker",
+        create_autospec(cu_db_mod.list_active_company_units_with_ticker, return_value=[unit]),
+    )
+    row = company_to_row(
+        {
+            "ticker": "NVDA",
+            "name": "NVIDIA",
+            "tier": "core",
+            "market": "US",
+            "workspace": {"name": "NVDA", "status": "active", "workspace_id": canon_ws},
+        },
+        user_id=USER_ALICE,
+        source="chat",
+    )
+    row["extra"]["_manual_workspace_id"] = canon_ws
+    await store.upsert_coverage_rows(USER_ALICE, [row])
+
+    alice_doc = await coverage_svc.get_user_coverage(USER_ALICE)
+    alice_nvda = next(c for c in alice_doc["companies"] if c["ticker"] == "NVDA")
+    assert alice_nvda["workspace"]["status"] == "none"
+    assert "workspace_id" not in alice_nvda["workspace"]
+    # Persisted DB row stays intact (not stripped in DB)
+    raw_rows = await store.list_coverage_rows(USER_ALICE)
+    assert raw_rows[0]["extra"]["workspace"]["workspace_id"] == canon_ws
+    assert raw_rows[0]["extra"]["_manual_workspace_id"] == canon_ws
+
+
+@pytest.mark.asyncio
+async def test_owner_tier_unavailable_is_still_a_plain_404_to_http_clients() -> None:
+    import src.dalton.sharing as sharing_mod
+
+    exc = sharing_mod.OwnerTierUnavailable()
+    assert exc.status_code == 404 and exc.detail == "Workspace not found"

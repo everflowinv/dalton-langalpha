@@ -341,6 +341,7 @@ async def test_tracking_topic_workspace_no_longer_yields_a_ticker(
     """验收：普通主题工作区不再被当成公司——旧逻辑取首词会解析出 "AI"。"""
     from src.dalton.autonomy.tracking import _resolve_workspace_ticker
 
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "0")
     _install_workspace(monkeypatch, _ws("ws-topic", "AI Infrastructure"))
     _install_docs(monkeypatch)
     with pytest.raises(ValueError, match="Unable to resolve company ticker"):
@@ -352,6 +353,7 @@ async def test_tracking_exact_ticker_name_still_resolves(monkeypatch: pytest.Mon
     """bootstrap 约定（工作区名 = ticker）不受影响：整串即 ticker 的名字仍解析。"""
     from src.dalton.autonomy.tracking import _resolve_workspace_ticker
 
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "0")
     _install_workspace(monkeypatch, _ws("ws-nvda", "NVDA"))
     _install_docs(monkeypatch)
     assert await _resolve_workspace_ticker("ws-nvda") == "NVDA"
@@ -363,6 +365,7 @@ async def test_tracking_company_doc_and_automation_paths_unchanged(
 ) -> None:
     from src.dalton.autonomy.tracking import _resolve_workspace_ticker
 
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "0")
     # 公司文档优先于中文名（老公司工作区主路径）
     _install_workspace(monkeypatch, _ws("ws-tx", "腾讯"))
     _install_docs(monkeypatch, company={"ticker": "0700.HK"})
@@ -635,6 +638,7 @@ async def test_board_flag_off_includes_automation_only_old_company(
 async def test_board_flag_off_never_queries_units_table(monkeypatch: pytest.MonkeyPatch) -> None:
     from src.dalton.database import coverage_units as cu_db
 
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "0")
     def _forbidden(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("units table must not be queried while the flag is off")
 
@@ -902,6 +906,7 @@ async def test_same_workspace_multiple_automations_resolve_identically_everywher
     故意按 MSFT 在前存放，替身按 ORDER BY file_name 真实排序。"""
     from src.dalton.autonomy.tracking import _resolve_workspace_ticker
 
+    monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "0")
     auto_table = [
         {"user_id": U1, "workspace_id": "ws-mix", "name": "dalton-msft-watch", "file_name": "dalton-msft-watch", "metadata": {}},
         {"user_id": U1, "workspace_id": "ws-mix", "name": "dalton-amzn-watch", "file_name": "dalton-amzn-watch", "metadata": {}},

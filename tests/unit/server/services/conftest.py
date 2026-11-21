@@ -5,10 +5,14 @@ touches one copy, not two that had already drifted apart in their docstrings.
 """
 
 from contextlib import ExitStack, contextmanager, nullcontext
-from unittest.mock import AsyncMock, patch
+# DALTON-HOOK(coverage-units): import typed autospec helper and delete-guard function.
+from unittest.mock import AsyncMock, create_autospec, patch
 
 import pytest
 
+from src.server.services.workspace_manager import (  # DALTON-HOOK(coverage-units)
+    _has_active_coverage_unit,
+)
 from tests.computer_manager_patch import cm_patch
 
 
@@ -71,6 +75,17 @@ def _no_published_reports():
         AsyncMock(return_value=False),
     ) as published:
         yield published
+
+
+@pytest.fixture(autouse=True)
+def _no_active_coverage_unit():
+    """DALTON-HOOK(coverage-units): every delete path checks dalton_coverage_units;
+    a row read these pool-less tests cannot make."""
+    with patch(
+        "src.server.services.workspace_manager._has_active_coverage_unit",
+        create_autospec(_has_active_coverage_unit, return_value=False),
+    ) as bound:
+        yield bound
 
 
 @pytest.fixture(autouse=True)

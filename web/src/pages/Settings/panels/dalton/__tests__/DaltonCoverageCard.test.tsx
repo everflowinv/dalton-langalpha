@@ -52,36 +52,48 @@ vi.mock('@/components/TimezonePicker', () => ({
   ),
 }));
 
-vi.mock('@/lib/dalton/coverage', () => ({
-  useDaltonCoverageUnits: () => ({
-    data: h.unitsResponse,
-    isLoading: h.unitsLoading,
-    isFetching: false,
-    isError: false,
-    refetch: vi.fn(async () => ({ data: h.unitsResponse })),
-  }),
-  useDaltonCoverageUnitDetail: (unitId: string | null) => ({
-    data: unitId ? h.detailByUnit[unitId] : undefined,
-    isLoading: false,
-    isError: false,
-  }),
-  splitCoverageUnits: (units: Array<{ kind: string }>) => ({
-    sectors: units.filter((u) => u.kind === 'sector'),
-    standaloneCompanies: units.filter((u) => u.kind === 'company'),
-  }),
-  coverageUnitErrorCode: () => null,
-  registerDaltonCoverageUnit: (p: unknown) => h.registerUnit(p),
-  bindDaltonCoverageUnit: (u: string, w: string) => h.bindUnit(u, w),
-  unbindDaltonCoverageUnit: (u: string) => h.unbindUnit(u),
-  archiveDaltonCoverageUnit: (u: string) => h.archiveUnit(u),
-}));
+vi.mock('@/lib/dalton/coverage', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/dalton/coverage')>('@/lib/dalton/coverage');
+  return {
+    useDaltonCoverageUnits: () => ({
+      data: h.unitsResponse,
+      isLoading: h.unitsLoading,
+      isFetching: false,
+      isError: false,
+      refetch: vi.fn(async () => ({ data: h.unitsResponse })),
+    }),
+    useDaltonCoverageUnitDetail: (unitId: string | null) => ({
+      data: unitId ? h.detailByUnit[unitId] : undefined,
+      isLoading: false,
+      isError: false,
+    }),
+    splitCoverageUnits: (units: Array<{ kind: string }>) => ({
+      sectors: units.filter((u) => u.kind === 'sector'),
+      standaloneCompanies: units.filter((u) => u.kind === 'company'),
+    }),
+    coverageUnitErrorCode: actual.coverageUnitErrorCode,
+    coverageUnitBlockingAutomations: actual.coverageUnitBlockingAutomations,
+    registerDaltonCoverageUnit: (p: unknown) => h.registerUnit(p),
+    bindDaltonCoverageUnit: (u: string, w: string) => h.bindUnit(u, w),
+    unbindDaltonCoverageUnit: (u: string) => h.unbindUnit(u),
+    archiveDaltonCoverageUnit: (u: string) => h.archiveUnit(u),
+  };
+});
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string, opts?: Record<string, unknown>) =>
-      opts && 'count' in opts && 'total' in opts
-        ? `${key}:${opts.count}/${opts.total}`
-        : key,
+    t: (key: string, opts?: Record<string, unknown>) => {
+      if (opts && 'count' in opts && 'total' in opts) {
+        return `${key}:${opts.count}/${opts.total}`;
+      }
+      if (opts && 'tasks' in opts) {
+        return `${key}:${String(opts.tasks)}`;
+      }
+      if (opts && 'count' in opts && typeof opts.count === 'number') {
+        return `${key}:${opts.count}`;
+      }
+      return key;
+    },
   }),
 }));
 
@@ -171,6 +183,9 @@ describe('DaltonCoverageCard', () => {
           readable: true,
           delegatable: true,
           auto_tracked: true,
+          can_bind: true,
+          can_unbind: false,
+          can_archive: true,
         },
         {
           unit_id: 'sec-2',
@@ -182,6 +197,9 @@ describe('DaltonCoverageCard', () => {
           readable: true,
           delegatable: true,
           auto_tracked: true,
+          can_bind: true,
+          can_unbind: true,
+          can_archive: true,
         },
         {
           unit_id: 'sec-other',
@@ -192,6 +210,17 @@ describe('DaltonCoverageCard', () => {
           workspace_id: null,
           readable: true,
           delegatable: false,
+          auto_tracked: false,
+        },
+        {
+          unit_id: 'sec-no-flags',
+          kind: 'sector',
+          slug: 'fintech',
+          display_name: 'Fintech',
+          owner_user_id: 'u-self',
+          workspace_id: 'ws-fintech',
+          readable: true,
+          delegatable: true,
           auto_tracked: false,
         },
       ],
@@ -323,6 +352,9 @@ describe('DaltonCoverageCard', () => {
         readable: true,
         delegatable: true,
         auto_tracked: true,
+        can_bind: true,
+        can_unbind: true,
+        can_archive: true,
         company: {
           docs: {
             thesis: {
@@ -377,6 +409,11 @@ describe('DaltonCoverageCard', () => {
     renderCard();
 
     expect(screen.queryByTestId('dalton-coverage-archive-sec-other')).not.toBeInTheDocument();
+    // Missing permission flags never infer write controls from owner_user_id
+    expect(screen.queryByTestId('dalton-coverage-unbind-sec-no-flags')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dalton-coverage-archive-sec-no-flags')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dalton-coverage-bind-select-sec-no-flags')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dalton-coverage-rebind-select-sec-no-flags')).not.toBeInTheDocument();
     const row = screen.getByTestId('dalton-coverage-unit-sec-2');
     expect(row).toHaveTextContent('dalton.coverage.readable');
     expect(row).toHaveTextContent('dalton.coverage.delegatable');
@@ -459,5 +496,206 @@ describe('DaltonCoverageCard', () => {
     fireEvent.click(screen.getByTestId('dalton-coverage-tab-sectors'));
     fireEvent.click(screen.getByTestId('dalton-coverage-open-ws-ws-1'));
     expect(screen.getByTestId('coverage-location-spy')).toHaveTextContent('/chat/ws-1');
+  });
+
+  it('offers colleague rw workspaces in bind dropdown and honors permission flags', async () => {
+    h.userId = 'u-lead';
+    h.unitsResponse = {
+      enabled: true,
+      units: [
+        {
+          unit_id: 'co-shared',
+          kind: 'company',
+          slug: 'nvda',
+          display_name: 'NVIDIA',
+          owner_user_id: 'u-pm',
+          lead_analyst_user_id: 'u-lead',
+          bound: true,
+          workspace_id: 'ws-colleague',
+          readable: true,
+          delegatable: true,
+          auto_tracked: false,
+          workspace_share_rw: true,
+          can_bind: true,
+          can_unbind: true,
+          can_archive: true,
+          ticker: 'NVDA',
+        },
+        {
+          unit_id: 'co-ro',
+          kind: 'company',
+          slug: 'amd',
+          display_name: 'AMD',
+          owner_user_id: 'u-lead',
+          lead_analyst_user_id: 'u-other',
+          bound: true,
+          workspace_id: 'ws-ro',
+          readable: true,
+          delegatable: false,
+          auto_tracked: false,
+          workspace_share_rw: false,
+          can_bind: false,
+          can_unbind: false,
+          can_archive: false,
+          ticker: 'AMD',
+        },
+        {
+          unit_id: 'co-redacted',
+          kind: 'company',
+          slug: 'avgo',
+          display_name: 'Broadcom',
+          owner_user_id: 'u-pm',
+          lead_analyst_user_id: 'u-other',
+          bound: true,
+          workspace_id: null,
+          readable: false,
+          delegatable: false,
+          auto_tracked: false,
+          can_bind: true,
+          can_unbind: true,
+          can_archive: true,
+          ticker: 'AVGO',
+        },
+        {
+          unit_id: 'co-unbound',
+          kind: 'company',
+          slug: 'tsm',
+          display_name: 'TSMC',
+          owner_user_id: 'u-lead',
+          lead_analyst_user_id: 'u-lead',
+          bound: false,
+          workspace_id: null,
+          readable: true,
+          delegatable: false,
+          auto_tracked: false,
+          can_bind: true,
+          can_unbind: false,
+          can_archive: true,
+          ticker: 'TSM',
+        },
+      ],
+      unclassified: [],
+      bindable_workspaces: [
+        {
+          workspace_id: 'ws-colleague-rw',
+          name: 'TSMC Deep Dive',
+          description: null,
+          updated_at: null,
+          owner_user_id: 'u-colleague',
+          owner_name: 'Alice',
+          owner_email: 'alice@firm.com',
+          is_own: false,
+        },
+      ],
+    };
+
+    renderCard();
+    fireEvent.click(screen.getByTestId('dalton-coverage-tab-companies'));
+
+    // Phase 1 hides rebind controls on bound units; unbind & archive still show (driven by backend flags)
+    expect(screen.queryByTestId('dalton-coverage-rebind-select-co-shared')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dalton-coverage-bind-select-co-shared')).not.toBeInTheDocument();
+    expect(screen.getByTestId('dalton-coverage-unbind-co-shared')).toBeInTheDocument();
+    expect(screen.getByTestId('dalton-coverage-archive-co-shared')).toBeInTheDocument();
+
+    // Bound-but-redacted unit renders bound badge (not noWorkspace) and unbind without rebind or Open link
+    const redactedRow = screen.getByTestId('dalton-coverage-unit-co-redacted');
+    expect(redactedRow).toHaveTextContent('dalton.coverage.boundWorkspace');
+    expect(redactedRow).not.toHaveTextContent('dalton.coverage.noWorkspace');
+    expect(screen.queryByTestId('dalton-coverage-rebind-select-co-redacted')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dalton-coverage-bind-select-co-redacted')).not.toBeInTheDocument();
+    expect(screen.getByTestId('dalton-coverage-unbind-co-redacted')).toBeInTheDocument();
+
+    // Unbound unit renders noWorkspace badge and bind (never unbind)
+    const unboundRow = screen.getByTestId('dalton-coverage-unit-co-unbound');
+    expect(unboundRow).toHaveTextContent('dalton.coverage.noWorkspace');
+    expect(screen.queryByTestId('dalton-coverage-unbind-co-unbound')).not.toBeInTheDocument();
+
+    // Historical creator with read-only access (all can_* false) sees no manage controls
+    expect(screen.queryByTestId('dalton-coverage-rebind-select-co-ro')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dalton-coverage-unbind-co-ro')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dalton-coverage-archive-co-ro')).not.toBeInTheDocument();
+
+    // Bind unbound unit to colleague rw workspace
+    const bindSelect = screen.getByTestId('dalton-coverage-bind-select-co-unbound');
+    expect(bindSelect).toHaveTextContent('TSMC Deep Dive dalton.coverage.colleagueWsSuffix');
+    fireEvent.change(bindSelect, { target: { value: 'ws-colleague-rw' } });
+    fireEvent.click(screen.getByTestId('dalton-coverage-bind-btn-co-unbound'));
+    await waitFor(() => expect(h.bindUnit).toHaveBeenCalledWith('co-unbound', 'ws-colleague-rw'));
+  });
+
+  it('lists blocking automation names on 409 when provided and falls back to count-only when redacted', async () => {
+    h.unitsResponse = {
+      enabled: true,
+      units: [
+        {
+          unit_id: 'sec-1',
+          kind: 'sector',
+          slug: 'semi',
+          display_name: 'Semis',
+          owner_user_id: 'u-self',
+          workspace_id: 'ws-1',
+          readable: true,
+          delegatable: true,
+          auto_tracked: true,
+          can_bind: false,
+          can_unbind: true,
+          can_archive: true,
+        },
+      ],
+      unclassified: [],
+    };
+    h.unbindUnit.mockRejectedValueOnce({
+      response: {
+        status: 409,
+        data: {
+          detail: {
+            error: 'active_tracking_blocks_unbind',
+            blocking_automations: ['dalton-nvda-watch', 'dalton-nvda-earn-2026q4-t0'],
+            blocking_automations_has_more: true,
+            blocking_automations_count: 6,
+          },
+        },
+      },
+    });
+    h.archiveUnit.mockRejectedValueOnce({
+      response: {
+        status: 409,
+        data: {
+          detail: {
+            error: 'active_tracking_blocks_unbind',
+            blocking_automations_count: 2,
+          },
+        },
+      },
+    });
+
+    renderCard();
+
+    fireEvent.click(screen.getByTestId('dalton-coverage-unbind-sec-1'));
+    const unbindConfirmBtns = await screen.findAllByRole('button', {
+      name: 'dalton.coverage.unbind',
+    });
+    fireEvent.click(unbindConfirmBtns[unbindConfirmBtns.length - 1]);
+
+    await waitFor(() => {
+      const notice = screen.getByTestId('dalton-coverage-notice');
+      expect(notice).toHaveTextContent(
+        'dalton.coverage.errors.active_tracking_blocks_unbind_with_tasks:dalton.coverage.errors.blockingTasksMore:dalton-nvda-watchdalton.coverage.errors.blockingTasksSeparatordalton-nvda-earn-2026q4-t0',
+      );
+    });
+
+    fireEvent.click(screen.getByTestId('dalton-coverage-archive-sec-1'));
+    const archiveConfirmBtns = await screen.findAllByRole('button', {
+      name: 'dalton.coverage.archiveUnit',
+    });
+    fireEvent.click(archiveConfirmBtns[archiveConfirmBtns.length - 1]);
+
+    await waitFor(() => {
+      const notice = screen.getByTestId('dalton-coverage-notice');
+      expect(notice).toHaveTextContent(
+        'dalton.coverage.errors.active_tracking_blocks_unbind_with_count:2',
+      );
+    });
   });
 });

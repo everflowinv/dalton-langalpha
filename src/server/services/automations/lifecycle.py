@@ -11,7 +11,7 @@ field it is about, so an automation's file can point at that field.
 
 import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass  # DALTON-HOOK(company-automations): shared prepared-update value for personal and company tasks
 from datetime import datetime, timezone
 from typing import Any, Dict, Final, Optional
@@ -91,6 +91,67 @@ class TargetRefused(HTTPException):
         self.field = field
 
 
+# DALTON-HOOK(coverage-units): managed coverage unit metadata keys are immutable on generic PATCH
+_MANAGED_UNIT_PROTECTED_METADATA_KEYS: Final = (
+    "unit_id",
+    "ticker",
+    "dalton_kind",
+    "dalton_managed",
+    "subject_kind",
+    "replaced_by_tracker",
+)
+
+
+def _has_replaced_by_tracker_marker(meta: Any) -> bool:
+    if not isinstance(meta, Mapping):
+        return False
+    raw = meta.get("replaced_by_tracker")
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return bool(raw.strip())
+    return False
+
+
+def _assert_replaced_by_tracker_preserved(
+    existing_meta: Any,
+    updated_meta: Any,
+) -> None:
+    """Forbid adding, removing, or mutating ``replaced_by_tracker`` via generic endpoints."""
+    old_map = existing_meta if isinstance(existing_meta, Mapping) else {}
+    new_map = updated_meta if isinstance(updated_meta, Mapping) else {}
+    in_old = "replaced_by_tracker" in old_map
+    in_new = "replaced_by_tracker" in new_map
+    if in_old != in_new or (in_old and new_map.get("replaced_by_tracker") != old_map.get("replaced_by_tracker")):
+        raise TargetRefused(
+            HTTPException(
+                status_code=403,
+                detail="受管覆盖单元自动任务的元数据键 'replaced_by_tracker' 不可通过通用接口新增、修改或删除。",
+            ),
+            field="metadata",
+        )
+
+
+def _assert_managed_unit_metadata_preserved(
+    existing_meta: Any,
+    updated_meta: Any,
+) -> None:
+    """Refuse adding, removing, or mutating unit-identity metadata keys via generic update."""
+    old_map = existing_meta if isinstance(existing_meta, Mapping) else {}
+    new_map = updated_meta if isinstance(updated_meta, Mapping) else {}
+    for key in _MANAGED_UNIT_PROTECTED_METADATA_KEYS:
+        if (key in old_map) != (key in new_map) or old_map.get(key) != new_map.get(key):
+            raise TargetRefused(
+                HTTPException(
+                    status_code=403,
+                    detail=(
+                        f"受管覆盖单元自动任务的元数据键 {key!r} 不可通过通用更新接口新增、修改或删除。"
+                    ),
+                ),
+                field="metadata",
+            )
+
+
 async def require_target_ownership(
     user_id: str,
     workspace_id: UUID | str | None,
@@ -109,9 +170,39 @@ async def require_target_ownership(
     """
     if workspace_id:
         try:
-            require_workspace_owner(
-                await get_workspace(str(workspace_id), conn=conn), user_id=user_id
+            ws_row = await get_workspace(str(workspace_id), conn=conn)
+            ws_owner = str((ws_row or {}).get("user_id") or "").strip()
+            # DALTON-HOOK(coverage-units): fast path for workspace owner; relax cross-user only when units & auth enabled
+            from src.dalton.settings import (
+                is_coverage_units_enabled,
+                is_dalton_supabase_auth_enabled,
             )
+
+            colleague_write = (
+                ws_row is not None
+                and ws_owner != str(user_id or "").strip()
+                and is_coverage_units_enabled()
+                and is_dalton_supabase_auth_enabled()
+            )
+            if colleague_write:
+                from src.dalton.sharing import (
+                    ColleagueAccessRevokedError,
+                    require_workspace_access,
+                )
+
+                try:
+                    await require_workspace_access(
+                        str(workspace_id),
+                        user_id,
+                        channel="web",
+                        need="write",
+                        workspace=ws_row,
+                        conn=conn,
+                    )
+                except ColleagueAccessRevokedError as exc:
+                    raise HTTPException(status_code=403, detail=str(exc)) from exc
+            else:
+                require_workspace_owner(ws_row, user_id=user_id)
         except HTTPException as exc:
             raise TargetRefused(exc, field="workspace_id") from None
     if conversation_thread_id:
@@ -410,42 +501,77 @@ async def create_automation(
         delivery = DeliveryConfig(methods=methods)
         data = data.model_copy(update={"delivery_config": delivery})
 
-    # DALTON-HOOK(company-automations): resolve scope via shared classification rule
-    resolved_scope = await resolve_automation_scope_for_write(
-        user_id,
-        name=data.name,
-        workspace_id=workspace_id,
-        metadata=data.metadata,
-        conn=conn,
-    )
+    # DALTON-HOOK(coverage-units): generic creation never writes replaced_by_tracker; serialize managed writes FOR SHARE
+    if isinstance(data.metadata, Mapping) and "replaced_by_tracker" in data.metadata:
+        raise TargetRefused(
+            HTTPException(
+                status_code=403,
+                detail="受管覆盖单元自动任务的元数据键 'replaced_by_tracker' 不可通过通用创建接口写入。",
+            ),
+            field="metadata",
+        )
+    from src.dalton.autonomy.classification import is_managed_unit_automation
+    from src.dalton.coverage.units import lock_and_assert_managed_unit_write_allowed
+    from src.dalton.settings import is_coverage_units_enabled
+    from src.server.database.pool import get_db_connection
 
-    automation = await auto_db.create_automation(
-        user_id=user_id,
-        name=data.name,
-        file_name=file_name,
-        trigger_type=data.trigger_type,
-        instruction=data.instruction,
-        description=data.description,
-        cron_expression=data.cron_expression,
-        timezone=data.timezone,
-        trigger_config=data.trigger_config,
-        next_run_at=next_run_at,
-        workspace_id=workspace_id,
-        llm_model=data.llm_model,
-        additional_context=data.additional_context,
-        thread_strategy=data.thread_strategy,
-        conversation_thread_id=(
-            str(data.conversation_thread_id) if data.conversation_thread_id else None
-        ),
-        max_failures=data.max_failures,
-        delivery_config=(
-            data.delivery_config.model_dump() if data.delivery_config else None
-        ),
-        metadata=data.metadata,
-        scope=resolved_scope,  # DALTON-HOOK(company-automations)
-        created_by=user_id,
-        conn=conn,
-    )
+    async def _do_create(write_conn: Any) -> Dict[str, Any]:
+        if is_coverage_units_enabled():
+            try:
+                await lock_and_assert_managed_unit_write_allowed(
+                    owner_user_id=user_id,
+                    workspace_id=workspace_id,
+                    name=data.name,
+                    metadata=data.metadata,
+                    conn=write_conn,
+                )
+            except HTTPException as exc:
+                raise TargetRefused(exc, field="workspace_id") from None
+
+        # DALTON-HOOK(company-automations): resolve scope via shared classification rule
+        resolved_scope = await resolve_automation_scope_for_write(
+            user_id,
+            name=data.name,
+            workspace_id=workspace_id,
+            metadata=data.metadata,
+            conn=write_conn,
+        )
+
+        return await auto_db.create_automation(
+            user_id=user_id,
+            name=data.name,
+            file_name=file_name,
+            trigger_type=data.trigger_type,
+            instruction=data.instruction,
+            description=data.description,
+            cron_expression=data.cron_expression,
+            timezone=data.timezone,
+            trigger_config=data.trigger_config,
+            next_run_at=next_run_at,
+            workspace_id=workspace_id,
+            llm_model=data.llm_model,
+            additional_context=data.additional_context,
+            thread_strategy=data.thread_strategy,
+            conversation_thread_id=(
+                str(data.conversation_thread_id) if data.conversation_thread_id else None
+            ),
+            max_failures=data.max_failures,
+            delivery_config=(
+                data.delivery_config.model_dump() if data.delivery_config else None
+            ),
+            metadata=data.metadata,
+            scope=resolved_scope,  # DALTON-HOOK(company-automations)
+            created_by=user_id,
+            conn=write_conn,
+        )
+
+    if conn is None and is_coverage_units_enabled() and is_managed_unit_automation(
+        name=data.name, metadata=data.metadata
+    ):
+        async with get_db_connection() as tx_conn, tx_conn.transaction():
+            automation = await _do_create(tx_conn)
+    else:
+        automation = await _do_create(conn)
 
     logger.info(
         f"[AUTOMATION] Created automation {automation['automation_id']} "
@@ -721,9 +847,22 @@ def apply_locked_pause_schedule(
         effective_kwargs.pop("next_run_at", None)
 
 
+def _replaced_by_tracker_refusal(row: Any) -> AutomationRefusal | None:
+    """Refuse resuming an automation replaced by long-short tracker monitoring."""
+    meta = row.get("metadata") if isinstance(row, Mapping) else getattr(row, "metadata", None)
+    if _has_replaced_by_tracker_marker(meta):
+        return AutomationRefusal(
+            "该任务已由多空跟踪替代，无法恢复执行。",
+            field="metadata",
+        )
+    return None
+
+
 def resume_refusal(current: Dict[str, Any]) -> AutomationRefusal | None:
     """Why ``current`` cannot be resumed, or None: only a paused or disabled
     row, and a paused one-time row only while its time is still ahead."""
+    if (replaced := _replaced_by_tracker_refusal(current)) is not None:
+        return replaced
     if current["status"] not in ("paused", "disabled"):
         return AutomationRefusal(
             f"Cannot resume automation in '{current['status']}' status "
@@ -779,6 +918,8 @@ def apply_locked_resume_schedule(
     locked_row: Any, effective_kwargs: Dict[str, Any]
 ) -> None:
     """Re-apply resume schedule rules to the locked row."""
+    if (replaced := _replaced_by_tracker_refusal(locked_row)) is not None:
+        raise replaced
     if locked_row.get("status") not in ("paused", "disabled"):
         raise AutomationRefusal(
             f"Cannot resume automation in '{locked_row.get('status')}' status "
@@ -1000,21 +1141,144 @@ async def update_automation(
                 else:
                     effective_kwargs.pop("scope", None)
 
+        if effective_kwargs.get("metadata") is not None:
+            _assert_replaced_by_tracker_preserved(
+                locked_row.get("metadata"),
+                effective_kwargs.get("metadata"),
+            )
+
+        from src.dalton.coverage.units import lock_and_assert_managed_unit_write_allowed
+        from src.dalton.settings import is_coverage_units_enabled
+
+        if is_coverage_units_enabled():
+            saved_name_for_unit = (
+                str(effective_kwargs["name"])
+                if effective_kwargs.get("name") is not None
+                else str(locked_row.get("name") or "")
+            )
+            saved_ws_for_unit = (
+                effective_kwargs["workspace_id"]
+                if effective_kwargs.get("workspace_id") is not None
+                else locked_stored_in
+            )
+            saved_meta_for_unit = (
+                effective_kwargs["metadata"]
+                if effective_kwargs.get("metadata") is not None
+                else locked_row.get("metadata")
+            )
+            try:
+                locked_existing_unit = await lock_and_assert_managed_unit_write_allowed(
+                    owner_user_id=user_id,
+                    workspace_id=locked_stored_in,
+                    name=locked_row.get("name"),
+                    metadata=locked_row.get("metadata"),
+                    conn=locked_conn,
+                )
+                await lock_and_assert_managed_unit_write_allowed(
+                    owner_user_id=user_id,
+                    workspace_id=saved_ws_for_unit,
+                    name=saved_name_for_unit,
+                    metadata=saved_meta_for_unit,
+                    conn=locked_conn,
+                )
+            except HTTPException as exc:
+                raise TargetRefused(exc, field="workspace_id") from None
+            if (
+                locked_existing_unit is not None
+                and effective_kwargs.get("metadata") is not None
+            ):
+                _assert_managed_unit_metadata_preserved(
+                    locked_row.get("metadata"),
+                    effective_kwargs.get("metadata"),
+                )
+
     outer_ctx = get_current_history_context()
     eff_actor_for_ctx = (
         outer_ctx.actor_user_id
         if outer_ctx is not None and outer_ctx.has_explicit_actor
         else user_id
     )
-    with automation_history_context(
-        actor_user_id=eff_actor_for_ctx,
-        action="update",
-        expected_config_version=resolved_expected_cv,
-        locked_row_reconciler=_reconcile_locked_update,
-    ):
-        result = await auto_db.update_automation(
-            automation_id, user_id, conn=conn, **update_kwargs
+    from src.dalton.autonomy.classification import is_managed_unit_automation
+    from src.dalton.coverage.units import lock_and_assert_managed_unit_write_allowed
+    from src.dalton.settings import is_coverage_units_enabled
+    from src.server.database.pool import get_db_connection
+
+    candidate_name = (
+        str(update_kwargs["name"])
+        if update_kwargs.get("name") is not None
+        else str(current.get("name") or "")
+    )
+    candidate_meta = (
+        update_kwargs["metadata"]
+        if update_kwargs.get("metadata") is not None
+        else current.get("metadata")
+    )
+    candidate_ws_list = sorted(
+        {
+            str(w)
+            for w in (stored_in, update_kwargs.get("workspace_id"))
+            if w is not None and str(w).strip()
+        }
+    )
+
+    async def _run_update(write_conn: Any) -> Optional[Dict[str, Any]]:
+        if update_kwargs.get("metadata") is not None:
+            _assert_replaced_by_tracker_preserved(
+                current.get("metadata"),
+                update_kwargs.get("metadata"),
+            )
+        if is_coverage_units_enabled() and candidate_ws_list:
+            existing_unit: dict[str, Any] | None = None
+            for cws in candidate_ws_list:
+                try:
+                    if cws == stored_in:
+                        existing_unit = await lock_and_assert_managed_unit_write_allowed(
+                            owner_user_id=user_id,
+                            workspace_id=stored_in,
+                            name=current.get("name"),
+                            metadata=current.get("metadata"),
+                            conn=write_conn,
+                        )
+                    await lock_and_assert_managed_unit_write_allowed(
+                        owner_user_id=user_id,
+                        workspace_id=cws,
+                        name=candidate_name,
+                        metadata=candidate_meta,
+                        conn=write_conn,
+                    )
+                except HTTPException as exc:
+                    raise TargetRefused(exc, field="workspace_id") from None
+            if (
+                existing_unit is not None
+                and update_kwargs.get("metadata") is not None
+            ):
+                _assert_managed_unit_metadata_preserved(
+                    current.get("metadata"),
+                    update_kwargs.get("metadata"),
+                )
+        with automation_history_context(
+            actor_user_id=eff_actor_for_ctx,
+            action="update",
+            expected_config_version=resolved_expected_cv,
+            locked_row_reconciler=_reconcile_locked_update,
+        ):
+            return await auto_db.update_automation(
+                automation_id, user_id, conn=write_conn, **update_kwargs
+            )
+
+    if (
+        conn is None
+        and is_coverage_units_enabled()
+        and candidate_ws_list
+        and (
+            is_managed_unit_automation(current)
+            or is_managed_unit_automation(name=candidate_name, metadata=candidate_meta)
         )
+    ):
+        async with get_db_connection() as tx_conn, tx_conn.transaction():
+            result = await _run_update(tx_conn)
+    else:
+        result = await _run_update(conn)
     if result:
         logger.info(
             f"[AUTOMATION] Updated automation {automation_id} "
@@ -1152,9 +1416,23 @@ async def resume_automation(
     async def _reconcile_locked_resume(
         locked_row: Any,
         effective_kwargs: Dict[str, Any],
-        _locked_conn: Any,
+        locked_conn: Any,
     ) -> None:
         _refuse_personal_company_control(user_id, locked_row, action="resume")
+        from src.dalton.coverage.units import lock_and_assert_managed_unit_write_allowed
+        from src.dalton.settings import is_coverage_units_enabled
+
+        if is_coverage_units_enabled() and locked_row.get("workspace_id") is not None:
+            try:
+                await lock_and_assert_managed_unit_write_allowed(
+                    owner_user_id=user_id,
+                    workspace_id=str(locked_row["workspace_id"]),
+                    name=locked_row.get("name"),
+                    metadata=locked_row.get("metadata"),
+                    conn=locked_conn,
+                )
+            except HTTPException as exc:
+                raise TargetRefused(exc, field="workspace_id") from None
         apply_locked_resume_schedule(locked_row, effective_kwargs)
 
     outer_ctx = get_current_history_context()
@@ -1163,16 +1441,43 @@ async def resume_automation(
         if outer_ctx is not None and outer_ctx.has_explicit_actor
         else user_id
     )
-    # DALTON-HOOK(company-automations): bind resume history context for database update
-    with automation_history_context(
-        actor_user_id=eff_actor_for_ctx,
-        action="resume",
-        expected_config_version=resolved_expected_cv,
-        locked_row_reconciler=_reconcile_locked_resume,
+    from src.dalton.autonomy.classification import is_managed_unit_automation
+    from src.dalton.coverage.units import lock_and_assert_managed_unit_write_allowed
+    from src.dalton.settings import is_coverage_units_enabled
+    from src.server.database.pool import get_db_connection
+
+    async def _run_resume(write_conn: Any) -> Optional[Dict[str, Any]]:
+        if is_coverage_units_enabled() and current.get("workspace_id") is not None:
+            try:
+                await lock_and_assert_managed_unit_write_allowed(
+                    owner_user_id=user_id,
+                    workspace_id=str(current["workspace_id"]),
+                    name=current.get("name"),
+                    metadata=current.get("metadata"),
+                    conn=write_conn,
+                )
+            except HTTPException as exc:
+                raise TargetRefused(exc, field="workspace_id") from None
+        # DALTON-HOOK(company-automations): bind resume history context for database update
+        with automation_history_context(
+            actor_user_id=eff_actor_for_ctx,
+            action="resume",
+            expected_config_version=resolved_expected_cv,
+            locked_row_reconciler=_reconcile_locked_resume,
+        ):
+            return await auto_db.update_automation(
+                automation_id, user_id, conn=write_conn, **update_kwargs
+            )
+
+    if (
+        conn is None
+        and is_coverage_units_enabled()
+        and current.get("workspace_id") is not None
+        and is_managed_unit_automation(current)
     ):
-        return await auto_db.update_automation(
-            automation_id, user_id, conn=conn, **update_kwargs
-        )
+        async with get_db_connection() as tx_conn, tx_conn.transaction():
+            return await _run_resume(tx_conn)
+    return await _run_resume(conn)
 
 
 async def trigger_automation(
