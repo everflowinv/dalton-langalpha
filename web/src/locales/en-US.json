@@ -1826,6 +1826,9 @@
       "companyWithTicker": "\"{{name}}\" looks like a company ({{ticker}}). Review the pre-filled coverage fields above and choose whether to register a coverage unit when creating.",
       "company": "\"{{name}}\" looks like a company. Review the pre-filled coverage fields above and choose whether to register a coverage unit when creating.",
       "sector": "\"{{name}}\" looks like a sector. Review the pre-filled coverage fields above and choose whether to register a coverage unit when creating.",
+      "companyWithTickerUnavailable": "\"{{name}}\" looks like a company ({{ticker}}). Coverage registration fields are currently unavailable; you can create the workspace without registering.",
+      "companyUnavailable": "\"{{name}}\" looks like a company. Coverage registration fields are currently unavailable; you can create the workspace without registering.",
+      "sectorUnavailable": "\"{{name}}\" looks like a sector. Coverage registration fields are currently unavailable; you can create the workspace without registering.",
       "registerAndCreate": "Register & Create",
       "createWithoutRegistering": "Create without registering"
     },

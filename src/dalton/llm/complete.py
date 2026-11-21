@@ -38,7 +38,6 @@ from src.dalton.database.llm_journal import (
 )
 from src.dalton.credentials import (  # DALTON-HOOK(team-credentials): record credential_user_id in journal usage while user_id stays caller
     credential_user_id as _resolve_credential_user_id,
-    disable_team_credential_sharing,
     is_team_credential_sharing_enabled,
 )
 from src.dalton.database.provider_events import record_provider_event, sanitize_error_text
@@ -662,8 +661,6 @@ async def dalton_complete(
     *,
     user_id: str,
     credential_user_id: Any = _UNSET,
-    disable_team_credentials: bool = False,
-    disable_platform_fallback: bool = False,
     ignore_custom_models: bool = False,
     record_provider_events: bool = True,
     user_prompt: str = "",
@@ -686,6 +683,7 @@ async def dalton_complete(
     raise_on_error: bool = False,
     disable_tracing: bool = True,
     persist_raw: bool = True,
+    persist_response: bool = True,
     skip_journal: bool = False,
     deadline: float | None = None,
 ) -> DaltonCompleteResult:
@@ -699,55 +697,48 @@ async def dalton_complete(
     ``credential_user_id`` separates credential resolution (passed to
     ``LLMService.complete``; ``None`` enforces deployment env/platform credentials
     only) from ``user_id`` (used for budget admission and journal accounting).
-    ``disable_team_credentials`` explicitly disables team credential sharing for
-    this invocation. ``disable_platform_fallback`` forwards to
-    ``LLMService.complete`` to forbid deployment/platform key fallback.
     ``record_provider_events=False`` suppresses writing raw error text to
     ``dalton_provider_events``, ``dalton_llm_journal.error_text``, and parse
-    retry debug logs.
+    retry debug logs. ``persist_response=False`` writes usage, cost, and state
+    to ``dalton_llm_journal`` while keeping ``response`` NULL.
     """
     from src.llms.api_call import redact_parse_error_logs
 
     with (
-        disable_team_credential_sharing()
-        if disable_team_credentials
+        redact_parse_error_logs()
+        if not record_provider_events
         else nullcontext()
     ):
-        with (
-            redact_parse_error_logs()
-            if not record_provider_events
-            else nullcontext()
-        ):
-            return await _dalton_complete_impl(
-                llm_service=llm_service,
-                user_id=user_id,
-                credential_user_id=credential_user_id,
-                disable_platform_fallback=disable_platform_fallback,
-                ignore_custom_models=ignore_custom_models,
-                record_provider_events=record_provider_events,
-                user_prompt=user_prompt,
-                system_prompt=system_prompt,
-                scope_ref=scope_ref,
-                purpose=purpose,
-                request_model=request_model,
-                model=model,
-                response_schema=response_schema,
-                slot=slot,
-                reasoning_effort=reasoning_effort,
-                is_byok=is_byok,
-                timeout_s=timeout_s,
-                stale_after_s=stale_after_s,
-                resend_indeterminate=resend_indeterminate,
-                resend_max_attempts=resend_max_attempts,
-                invocation_id=invocation_id,
-                workspace_id=workspace_id,
-                thread_id=thread_id,
-                raise_on_error=raise_on_error,
-                disable_tracing=disable_tracing,
-                persist_raw=persist_raw,
-                skip_journal=skip_journal,
-                deadline=deadline,
-            )
+        return await _dalton_complete_impl(
+            llm_service=llm_service,
+            user_id=user_id,
+            credential_user_id=credential_user_id,
+            ignore_custom_models=ignore_custom_models,
+            record_provider_events=record_provider_events,
+            user_prompt=user_prompt,
+            system_prompt=system_prompt,
+            scope_ref=scope_ref,
+            purpose=purpose,
+            request_model=request_model,
+            model=model,
+            response_schema=response_schema,
+            slot=slot,
+            reasoning_effort=reasoning_effort,
+            is_byok=is_byok,
+            timeout_s=timeout_s,
+            stale_after_s=stale_after_s,
+            resend_indeterminate=resend_indeterminate,
+            resend_max_attempts=resend_max_attempts,
+            invocation_id=invocation_id,
+            workspace_id=workspace_id,
+            thread_id=thread_id,
+            raise_on_error=raise_on_error,
+            disable_tracing=disable_tracing,
+            persist_raw=persist_raw,
+            persist_response=persist_response,
+            skip_journal=skip_journal,
+            deadline=deadline,
+        )
 
 
 async def _dalton_complete_impl(
@@ -755,7 +746,6 @@ async def _dalton_complete_impl(
     *,
     user_id: str,
     credential_user_id: Any = _UNSET,
-    disable_platform_fallback: bool = False,
     ignore_custom_models: bool = False,
     record_provider_events: bool = True,
     user_prompt: str = "",
@@ -778,6 +768,7 @@ async def _dalton_complete_impl(
     raise_on_error: bool = False,
     disable_tracing: bool = True,
     persist_raw: bool = True,
+    persist_response: bool = True,
     skip_journal: bool = False,
     deadline: float | None = None,
 ) -> DaltonCompleteResult:
@@ -1114,7 +1105,6 @@ async def _dalton_complete_impl(
                 reasoning_effort=reasoning_effort,
                 disable_tracing=disable_tracing,
                 return_token_usage=True,
-                **({"disable_platform_fallback": True} if disable_platform_fallback else {}),
                 **({"ignore_custom_models": True} if ignore_custom_models else {}),
             ),
             timeout=send_timeout_s,
@@ -1136,7 +1126,11 @@ async def _dalton_complete_impl(
             effective_model, billing_type, usage_dict
         )
         db_resp, parsed_data, text_val = _serialize_response_payload(out_obj)
-        journal_resp = db_resp if persist_raw else _redact_response_for_journal(db_resp)
+        journal_resp = (
+            None
+            if not persist_response
+            else (db_resp if persist_raw else _redact_response_for_journal(db_resp))
+        )
 
         if not skip_journal:
             await complete_journal_done(

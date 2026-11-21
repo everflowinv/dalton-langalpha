@@ -82,8 +82,12 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
   // DALTON-HOOK(workspace-dedup): track latest typed name & coverage unit fields / prefill state (gated by coverage_units & internal tier)
   const { data: coverageUnitsData, isError: coverageUnitsError } = useDaltonCoverageUnits(isOpen);
   const coverageUnitsEnabled = !coverageUnitsError && coverageUnitsData?.enabled === true;
+  const coverageUnitsEnabledRef = useRef(coverageUnitsEnabled);
+  coverageUnitsEnabledRef.current = coverageUnitsEnabled;
   const latestNameRef = useRef('');
   const [coverageKind, setCoverageKind] = useState<CoverageUnitKindChoice>('none');
+  const coverageKindRef = useRef(coverageKind);
+  coverageKindRef.current = coverageKind;
   const [coverageTicker, setCoverageTicker] = useState('');
   const [coverageDisplayName, setCoverageDisplayName] = useState('');
   const [coveragePrefilled, setCoveragePrefilled] = useState(false);
@@ -227,6 +231,33 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
     setCreationStep(failed ? 'error' : 'done');
   };
 
+  // DALTON-HOOK(workspace-dedup): apply suggestion prefill once coverage eligibility is enabled (handles query finishing after submit/409)
+  const applySuggestionPrefill = useCallback(
+    (suggestion: { coverage_kind?: string; ticker?: string | null; display_name?: string | null } | undefined) => {
+      if (
+        !coverageUnitsEnabledRef.current ||
+        !suggestion ||
+        (suggestion.coverage_kind !== 'company' && suggestion.coverage_kind !== 'sector') ||
+        coverageUserEditedRef.current ||
+        coverageKindRef.current !== 'none'
+      ) {
+        return;
+      }
+      setCoverageKind(suggestion.coverage_kind);
+      setCoverageTicker(suggestion.coverage_kind === 'company' ? (suggestion.ticker ?? '') : '');
+      setCoverageDisplayName(suggestion.display_name ?? '');
+      setCoveragePrefilled(true);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!coverageUnitsEnabled || !refusal) return;
+    if (refusal.kind !== 'coverageSuggestion' && refusal.kind !== 'companyExists') return;
+    if (latestNameRef.current.trim() !== refusal.requestedName) return;
+    applySuggestionPrefill(refusal.suggestion);
+  }, [coverageUnitsEnabled, refusal, applySuggestionPrefill]);
+
   // DALTON-HOOK(workspace-dedup): support optional allowDuplicateCompany / skipCoverageSuggestion and lock override to the 409'd name
   const submitCreate = async (
     allowDuplicateCompany = false,
@@ -253,7 +284,7 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
         ...(allowDuplicateCompany ? { allowDuplicateCompany: true } : {}),
         ...(skipCoverageSuggestion ? { skipCoverageSuggestion: true } : {}),
         // DALTON-HOOK(workspace-dedup): attach coverage registration fields when company or sector is selected (unless user chose skip or gated off)
-        ...(!skipCoverageSuggestion && coverageUnitsEnabled && coverageKind !== 'none'
+        ...(!skipCoverageSuggestion && coverageUnitsEnabledRef.current && coverageKind !== 'none'
           ? {
               coverageKind,
               ...(coverageKind === 'company' && trimmedTicker ? { ticker: trimmedTicker } : {}),
@@ -274,38 +305,16 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
       else if (companyExists) {
         if (latestNameRef.current.trim() === submittedName) {
           setRefusal({ kind: 'companyExists', requestedName: submittedName, ...companyExists });
-          const suggestion = companyExists.suggestion;
-          if (
-            coverageUnitsEnabled &&
-            suggestion &&
-            (suggestion.coverage_kind === 'company' || suggestion.coverage_kind === 'sector') &&
-            !coverageUserEditedRef.current &&
-            coverageKind === 'none'
-          ) {
-            setCoverageKind(suggestion.coverage_kind);
-            setCoverageTicker(suggestion.coverage_kind === 'company' ? (suggestion.ticker ?? '') : '');
-            setCoverageDisplayName(suggestion.display_name ?? '');
-            setCoveragePrefilled(true);
-          }
+          applySuggestionPrefill(companyExists.suggestion);
         }
-      } else if (coverageUnitsEnabled && coverageSuggestion) {
+      } else if (coverageSuggestion) {
         if (latestNameRef.current.trim() === submittedName) {
           setRefusal({
             kind: 'coverageSuggestion',
             requestedName: submittedName,
             ...coverageSuggestion,
           });
-          const suggestion = coverageSuggestion.suggestion;
-          if (
-            (suggestion.coverage_kind === 'company' || suggestion.coverage_kind === 'sector') &&
-            !coverageUserEditedRef.current &&
-            coverageKind === 'none'
-          ) {
-            setCoverageKind(suggestion.coverage_kind);
-            setCoverageTicker(suggestion.coverage_kind === 'company' ? (suggestion.ticker ?? '') : '');
-            setCoverageDisplayName(suggestion.display_name ?? '');
-            setCoveragePrefilled(true);
-          }
+          applySuggestionPrefill(coverageSuggestion.suggestion);
         }
       } else setRefusal({ kind: 'message', message: createWorkspaceDenialMessage(err, t) });
       return;
@@ -677,6 +686,7 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
               requestedName={refusal.requestedName}
               suggestion={refusal.suggestion}
               currentCoverageKind={coverageKind}
+              registrable={coverageUnitsEnabled}
               disabled={submitting || !!preparingTarget}
               onRegisterAndCreate={(requested) => void submitCreate(false, requested, false)}
               onCreateWithoutRegistering={(requested) => void submitCreate(false, requested, true)}

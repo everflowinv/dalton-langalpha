@@ -1871,6 +1871,9 @@
       "companyWithTicker": "「{{name}}」识别为公司（{{ticker}}）。请确认上方预填的覆盖字段，并选择是否在新建时自动登记覆盖单元。",
       "company": "「{{name}}」识别为公司。请确认上方预填的覆盖字段，并选择是否在新建时自动登记覆盖单元。",
       "sector": "「{{name}}」识别为行业。请确认上方预填的覆盖字段，并选择是否在新建时自动登记覆盖单元。",
+      "companyWithTickerUnavailable": "「{{name}}」识别为公司（{{ticker}}）。当前无法加载覆盖登记字段，你可以选择直接新建（不登记）。",
+      "companyUnavailable": "「{{name}}」识别为公司。当前无法加载覆盖登记字段，你可以选择直接新建（不登记）。",
+      "sectorUnavailable": "「{{name}}」识别为行业。当前无法加载覆盖登记字段，你可以选择直接新建（不登记）。",
       "registerAndCreate": "登记并新建",
       "createWithoutRegistering": "直接新建（不登记）"
     },

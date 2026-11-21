@@ -991,7 +991,7 @@ def _parse_llm_payload(
     comp: Any,
     batch_by_id: Mapping[str, _CandidateEntry],
 ) -> tuple[list[tuple[_CandidateEntry, str, str]], DedupCoverageSuggestion | None]:
-    """Parse structured LLM output, filter confidence & IDs, cap matches at 3, and extract high-confidence suggestion."""
+    """Parse structured LLM output, filter confidence & IDs, and extract high-confidence suggestion."""
     raw_data = getattr(comp, "data", None)
     raw_text = getattr(comp, "text", None)
 
@@ -1071,14 +1071,14 @@ def _parse_llm_payload(
     suggestion = _extract_suggestion(
         raw_s_kind, raw_s_conf, raw_s_ticker, raw_s_display
     )
-    return ranked[:MAX_DUPLICATE_MATCHES], suggestion
+    return ranked, suggestion
 
 
 def _parse_llm_matches(
     comp: Any,
     batch_by_id: Mapping[str, _CandidateEntry],
 ) -> list[tuple[_CandidateEntry, str, str]]:
-    """Parse structured LLM output, filter confidence & IDs, and cap per batch at 3."""
+    """Parse structured LLM output and filter confidence & IDs."""
     matches, _ = _parse_llm_payload(comp, batch_by_id)
     return matches
 
@@ -1125,6 +1125,7 @@ async def _run_batch_with_fallback(
             "timeout_s": model_timeout,
             "deadline": model_deadline,
             "persist_raw": False,
+            "persist_response": False,
             "raise_on_error": False,
             "skip_journal": skip_journal,
             "record_provider_events": False,
@@ -1622,7 +1623,8 @@ async def _find_matches(
         return None
 
     # Re-verify live workspace/unit status and bindings after LLM return, release DB
-    # connection before permission checks, and truncate to MAX_DUPLICATE_MATCHES after refresh.
+    # connection before permission checks, check read access across ALL live hits,
+    # and truncate to MAX_DUPLICATE_MATCHES afterwards.
     all_live_hits = await _refresh_live_hits(hits, conn=conn)
     if not all_live_hits:
         if suggestion_out:
@@ -1634,11 +1636,9 @@ async def _find_matches(
                 suggestion=suggestion_out[0],
             )
         return None
-    live_hits = all_live_hits[:MAX_DUPLICATE_MATCHES]
 
-    resolved: list[DuplicateWorkspaceCandidate] = []
-    matched_ids: list[str] = []
-    for entry, fresh_ws, _conf, _reason in live_hits:
+    resolved_all: list[tuple[DuplicateWorkspaceCandidate, str | None]] = []
+    for entry, fresh_ws, _conf, _reason in all_live_hits:
         cand, ws_id = await _resolve_live_hit_candidate(
             uid,
             entry,
@@ -1646,23 +1646,12 @@ async def _find_matches(
             channel=channel,
             conn=conn,
         )
-        if ws_id:
-            matched_ids.append(ws_id)
-        resolved.append(cand)
+        resolved_all.append((cand, ws_id))
 
-    all_hits_readable = all(item.can_read for item in resolved)
-    if all_hits_readable and suggestion_out and len(all_live_hits) > MAX_DUPLICATE_MATCHES:
-        for entry, fresh_ws, _conf, _reason in all_live_hits[MAX_DUPLICATE_MATCHES:]:
-            extra_cand, _ = await _resolve_live_hit_candidate(
-                uid,
-                entry,
-                fresh_ws,
-                channel=channel,
-                conn=conn,
-            )
-            if not extra_cand.can_read:
-                all_hits_readable = False
-                break
+    all_hits_readable = all(cand.can_read for cand, _ in resolved_all)
+    display_pairs = resolved_all[:MAX_DUPLICATE_MATCHES]
+    resolved = [cand for cand, _ in display_pairs]
+    matched_ids = [ws_id for _cand, ws_id in display_pairs if ws_id]
 
     message = _format_duplicate_message(raw_name, resolved[0])
     return DuplicateMatch(

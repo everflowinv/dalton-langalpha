@@ -973,4 +973,180 @@ describe('CreateWorkspaceModal, duplicate company workspace', () => {
     );
     expect(screen.queryByRole('button', { name: 'Company' })).not.toBeInTheDocument();
   });
+
+  // DALTON-HOOK(workspace-dedup): 409 coverage_suggestion when eligibility query failed (shows create without registering, never generic error)
+  it('shows coverage suggestion with Create without registering when eligibility query fails', async () => {
+    const user = userEvent.setup();
+    vi.mocked(useDaltonCoverageUnits).mockReturnValue({
+      data: undefined,
+      isError: true,
+    } as unknown as ReturnType<typeof useDaltonCoverageUnits>);
+
+    const suggestionErr = Object.assign(new Error('Request failed with status code 409'), {
+      response: {
+        status: 409,
+        data: {
+          detail: {
+            code: 'coverage_suggestion',
+            message: '「Nvidia」识别为公司（代码 NVDA）',
+            suggestion: {
+              coverage_kind: 'company',
+              ticker: 'NVDA',
+              display_name: 'NVIDIA Corporation',
+            },
+          },
+        },
+      },
+    });
+    const onCreate = vi
+      .fn()
+      .mockRejectedValueOnce(suggestionErr)
+      .mockResolvedValueOnce(LIVE_CREATED);
+    const { onComplete } = setup(onCreate);
+
+    expect(screen.queryByRole('button', { name: 'Company' })).not.toBeInTheDocument();
+
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'Nvidia');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    const card = await screen.findByRole('alert');
+    expect(card).toHaveTextContent('"Nvidia" looks like a company (NVDA).');
+    expect(within(card).queryByRole('button', { name: 'Register & Create' })).not.toBeInTheDocument();
+    await user.click(within(card).getByRole('button', { name: 'Create without registering' }));
+
+    await waitFor(() =>
+      expect(onCreate).toHaveBeenLastCalledWith({
+        name: 'Nvidia',
+        description: '',
+        skipCoverageSuggestion: true,
+      }),
+    );
+    await waitFor(() => expect(onComplete).toHaveBeenCalledWith(LIVE_CREATED));
+  });
+
+  // DALTON-HOOK(workspace-dedup): eligibility query completing after submit starts or after 409 arrives still shows notice and prefills
+  it('handles coverage_suggestion when eligibility query finishes after submit starts or after 409 arrives', async () => {
+    const user = userEvent.setup();
+    const suggestionErr = Object.assign(new Error('Request failed with status code 409'), {
+      response: {
+        status: 409,
+        data: {
+          detail: {
+            code: 'coverage_suggestion',
+            message: '「Nvidia」识别为公司（代码 NVDA）',
+            suggestion: {
+              coverage_kind: 'company',
+              ticker: 'NVDA',
+              display_name: 'NVIDIA Corporation',
+            },
+          },
+        },
+      },
+    });
+
+    // Order A: query is still loading when submit starts, resolves { enabled: true } while onCreate is in-flight
+    let queryState: ReturnType<typeof useDaltonCoverageUnits> = {
+      data: undefined,
+      isError: false,
+    } as unknown as ReturnType<typeof useDaltonCoverageUnits>;
+    vi.mocked(useDaltonCoverageUnits).mockImplementation(() => queryState);
+
+    let rejectFirst!: (err: unknown) => void;
+    const pendingCreate = new Promise<typeof LIVE_CREATED>((_resolve, reject) => {
+      rejectFirst = reject;
+    });
+    const onCreateOrderA = vi
+      .fn()
+      .mockReturnValueOnce(pendingCreate)
+      .mockResolvedValueOnce(LIVE_CREATED);
+    const onCompleteA = vi.fn();
+    const viewA = renderWithProviders(
+      <CreateWorkspaceModal isOpen onClose={vi.fn()} onCreate={onCreateOrderA} onComplete={onCompleteA} />,
+    );
+
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'Nvidia');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    // Query resolves while submit is still in flight
+    queryState = {
+      data: { enabled: true, units: [], unclassified: [] },
+      isError: false,
+    } as unknown as ReturnType<typeof useDaltonCoverageUnits>;
+    viewA.rerender(
+      <CreateWorkspaceModal isOpen onClose={vi.fn()} onCreate={onCreateOrderA} onComplete={onCompleteA} />,
+    );
+
+    await act(async () => {
+      rejectFirst(suggestionErr);
+    });
+
+    const cardA = await screen.findByRole('alert');
+    expect(cardA).toHaveTextContent('"Nvidia" looks like a company (NVDA).');
+    expect(screen.getByRole('button', { name: 'Company' })).toHaveAttribute('aria-pressed', 'true');
+    expect((screen.getByLabelText(/ticker/i) as HTMLInputElement).value).toBe('NVDA');
+    expect((screen.getByLabelText(/company name/i) as HTMLInputElement).value).toBe('NVIDIA Corporation');
+
+    await user.click(within(cardA).getByRole('button', { name: 'Register & Create' }));
+    await waitFor(() =>
+      expect(onCreateOrderA).toHaveBeenLastCalledWith({
+        name: 'Nvidia',
+        description: '',
+        coverageKind: 'company',
+        ticker: 'NVDA',
+        displayName: 'NVIDIA Corporation',
+      }),
+    );
+    await waitFor(() => expect(onCompleteA).toHaveBeenCalledWith(LIVE_CREATED));
+    viewA.unmount();
+
+    // Order B: 409 coverage_suggestion arrives BEFORE query finishes; query then resolves { enabled: true }
+    queryState = {
+      data: undefined,
+      isError: false,
+    } as unknown as ReturnType<typeof useDaltonCoverageUnits>;
+    const onCreateOrderB = vi
+      .fn()
+      .mockRejectedValueOnce(suggestionErr)
+      .mockResolvedValueOnce(LIVE_CREATED);
+    const onCompleteB = vi.fn();
+    const viewB = renderWithProviders(
+      <CreateWorkspaceModal isOpen onClose={vi.fn()} onCreate={onCreateOrderB} onComplete={onCompleteB} />,
+    );
+
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'Nvidia');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    const cardBInitial = await screen.findByRole('alert');
+    expect(cardBInitial).toHaveTextContent('"Nvidia" looks like a company (NVDA).');
+    expect(within(cardBInitial).getByRole('button', { name: 'Create without registering' })).toBeInTheDocument();
+    expect(within(cardBInitial).queryByRole('button', { name: 'Register & Create' })).not.toBeInTheDocument();
+
+    // Now eligibility query resolves after the 409 response
+    queryState = {
+      data: { enabled: true, units: [], unclassified: [] },
+      isError: false,
+    } as unknown as ReturnType<typeof useDaltonCoverageUnits>;
+    viewB.rerender(
+      <CreateWorkspaceModal isOpen onClose={vi.fn()} onCreate={onCreateOrderB} onComplete={onCompleteB} />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Company' })).toHaveAttribute('aria-pressed', 'true'),
+    );
+    expect((screen.getByLabelText(/ticker/i) as HTMLInputElement).value).toBe('NVDA');
+    expect((screen.getByLabelText(/company name/i) as HTMLInputElement).value).toBe('NVIDIA Corporation');
+
+    const cardBAfter = screen.getByRole('alert');
+    await user.click(within(cardBAfter).getByRole('button', { name: 'Register & Create' }));
+    await waitFor(() =>
+      expect(onCreateOrderB).toHaveBeenLastCalledWith({
+        name: 'Nvidia',
+        description: '',
+        coverageKind: 'company',
+        ticker: 'NVDA',
+        displayName: 'NVIDIA Corporation',
+      }),
+    );
+    await waitFor(() => expect(onCompleteB).toHaveBeenCalledWith(LIVE_CREATED));
+  });
 });

@@ -94,10 +94,15 @@ def _enable_team_mode(
     supabase_auth: bool = True,
     caller_tier: str = "internal",
 ) -> None:
+    import src.config.settings as app_settings
+    import src.dalton.settings as dalton_settings_mod
+
     monkeypatch.setenv(
         "DALTON_COVERAGE_UNITS_ENABLED", "true" if coverage_enabled else "false"
     )
-    monkeypatch.setenv("HOST_MODE", "oss")
+    monkeypatch.setattr(app_settings, "HOST_MODE", "oss")
+    monkeypatch.setattr(dalton_settings_mod, "HOST_MODE", "oss")
+    monkeypatch.delenv("DALTON_ASSIST_FALLBACK_MODEL", raising=False)
     monkeypatch.setenv("DALTON_AUTH_MODE", "supabase" if supabase_auth else "none")
     monkeypatch.setenv(
         "DALTON_ALLOWED_EMAILS",
@@ -1288,11 +1293,14 @@ async def test_shared_timeout_cancels_hanging_batches_and_keeps_completed_or_fai
 async def test_identity_lookup_failure_or_fallback_default_allows_creation(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    import src.config.settings as app_settings
     from src.dalton import auth as dalton_auth
+    import src.dalton.settings as dalton_settings_mod
     from src.server.database import user as user_db
 
     monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "true")
-    monkeypatch.setenv("HOST_MODE", "oss")
+    monkeypatch.setattr(app_settings, "HOST_MODE", "oss")
+    monkeypatch.setattr(dalton_settings_mod, "HOST_MODE", "oss")
     monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
     monkeypatch.setenv(
         "DALTON_ALLOWED_EMAILS",
@@ -4783,10 +4791,16 @@ async def test_coverage_fields_ignored_when_disabled_or_external_or_company_tier
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """R10: coverage_kind/ticker/display_name are ignored (no registration, no warning) when disabled, external, or company tier; 'other' never 422s."""
+    from starlette.requests import Request as StarletteRequest
     import src.dalton.access_tiers as access_tiers_mod
+    from src.dalton.access_tiers import COMPANY_SYSTEM_USER_ID
     import src.dalton.coverage.units as cu_svc
     import src.tools.secretary.tools as sec_tools
-    from src.server.app.workspaces import router
+    from src.server.app.workspaces import create_workspace as create_workspace_endpoint, router
+    from src.server.dependencies.principal import Principal
+    from src.server.models.workspace import WorkspaceCreate
+
+    real_is_internal_or_admin = access_tiers_mod.is_internal_or_admin
 
     reg_spy = create_autospec(cu_svc.register_coverage_unit)
     monkeypatch.setattr(cu_svc, "register_coverage_unit", reg_spy)
@@ -4884,21 +4898,36 @@ async def test_coverage_fields_ignored_when_disabled_or_external_or_company_tier
             assert "coverage_unit_warning" not in cos_ext_payload
             assert "coverage_unit_warning_detail" not in cos_ext_payload
 
-            # 2. Company tier -> backend ignores coverage fields (no registration, no warning).
+            # 2. Company tier -> use real is_internal_or_admin + COMPANY_SYSTEM_USER_ID (no stub).
+            # HTTP rejects COMPANY_SYSTEM_USER_ID via reject_company_system_auth (401), so internal
+            # create_workspace handler & Chief of Staff tool paths pass COMPANY_SYSTEM_USER_ID directly.
             _enable_team_mode(monkeypatch, caller_tier="company")
-            resp_company_tier = await client.post(
-                "/api/v1/workspaces",
-                json={
-                    "name": "Nvidia",
-                    "coverage_kind": "sector",
-                    "display_name": "Semiconductors",
-                },
+            company_internal_spy = create_autospec(
+                real_is_internal_or_admin, wraps=real_is_internal_or_admin
             )
-            assert resp_company_tier.status_code == 201
-            body_ct = resp_company_tier.json()
-            assert body_ct["coverage_unit"] is None
-            assert body_ct["coverage_unit_warning"] is None
-            assert body_ct["coverage_unit_warning_detail"] is None
+            monkeypatch.setattr(
+                access_tiers_mod, "is_internal_or_admin", company_internal_spy
+            )
+            dummy_req = StarletteRequest(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/api/v1/workspaces",
+                    "headers": [],
+                }
+            )
+            ct_ws_resp = await create_workspace_endpoint(
+                WorkspaceCreate(
+                    name="Nvidia",
+                    coverage_kind="sector",
+                    display_name="Semiconductors",
+                ),
+                Principal(user_id=COMPANY_SYSTEM_USER_ID, auth="service"),
+                dummy_req,
+            )
+            assert ct_ws_resp.coverage_unit is None
+            assert ct_ws_resp.coverage_unit_warning is None
+            assert ct_ws_resp.coverage_unit_warning_detail is None
 
             cos_ct = await chief_of_staff_workspaces.ainvoke(
                 {
@@ -4913,16 +4942,24 @@ async def test_coverage_fields_ignored_when_disabled_or_external_or_company_tier
                     "id": "call-ct-cos",
                     "type": "tool_call",
                 },
-                config={"configurable": {"user_id": "company-system-user"}},
+                config={"configurable": {"user_id": COMPANY_SYSTEM_USER_ID}},
             )
             cos_ct_payload = json.loads(cos_ct.update["messages"][0].content)
             assert cos_ct_payload["success"] is True
             assert "coverage_unit" not in cos_ct_payload
             assert "coverage_unit_warning" not in cos_ct_payload
+            assert [call.args[0] for call in company_internal_spy.await_args_list] == [
+                COMPANY_SYSTEM_USER_ID,
+                COMPANY_SYSTEM_USER_ID,
+            ]
 
             # 3. coverage_units disabled -> even internal member's coverage fields are ignored.
             _enable_team_mode(monkeypatch, coverage_enabled=False, caller_tier="internal")
-            is_internal_spy.return_value = True
+            monkeypatch.setattr(
+                access_tiers_mod,
+                "is_internal_or_admin",
+                create_autospec(real_is_internal_or_admin, return_value=True),
+            )
             resp_disabled = await client.post(
                 "/api/v1/workspaces",
                 json={
@@ -5828,3 +5865,364 @@ async def test_auto_register_warning_returns_structured_code_and_params(
         "code": "ticker_conflict",
         "params": {"ticker": "NVDA"},
     }
+
+
+@pytest.mark.asyncio
+async def test_scoped_tokens_skip_coverage_suggestion_409_and_keep_token_not_allowed_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R11 #2: Scoped PAT and computer tokens skip 409 coverage_suggestion and still warn on explicit coverage fields."""
+    import src.dalton.access_tiers as access_tiers_mod
+    import src.dalton.coverage.units as cu_svc
+    from src.server.app.workspaces import router
+    from src.server.dependencies import cli_approval
+    from src.server.dependencies.principal import Principal, get_principal
+
+    _enable_team_mode(monkeypatch)
+    monkeypatch.setattr(
+        cli_approval,
+        "workspace_create",
+        create_autospec(cli_approval.workspace_create, return_value=None),
+    )
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "is_internal_or_admin",
+        create_autospec(access_tiers_mod.is_internal_or_admin, return_value=True),
+    )
+    reg_spy = create_autospec(cu_svc.register_coverage_unit)
+    monkeypatch.setattr(cu_svc, "register_coverage_unit", reg_spy)
+
+    app = create_test_app(router)
+    mgr = create_autospec(WorkspaceManager, instance=True)
+    mgr.create_workspace.return_value = {
+        "workspace_id": WS_5,
+        "user_id": USER_CALLER,
+        "name": "Nvidia",
+        "description": None,
+        "sandbox_id": None,
+        "computer_id": None,
+        "status": "creating",
+        "created_at": NOW,
+        "updated_at": NOW,
+        "config": {},
+    }
+    suggestion_only_dup = dedup_mod.DuplicateMatch(
+        company="Nvidia",
+        message="",
+        matches=(),
+        matched_workspace_ids=(),
+        suggestion=dedup_mod.DedupCoverageSuggestion(
+            coverage_kind="company",
+            ticker="NVDA",
+            display_name="NVIDIA Corporation",
+        ),
+    )
+    dedup_mock = create_autospec(_REAL_FIND_DEDUP, return_value=suggestion_only_dup)
+
+    with (
+        patch("src.dalton.coverage.dedup.find_existing_company_workspace", dedup_mock),
+        patch(
+            "src.server.app.workspaces.WorkspaceManager.get_instance",
+            create_autospec(WorkspaceManager.get_instance, return_value=mgr),
+        ),
+        patch(
+            "src.server.services.platform_client.platform_gating_active",
+            return_value=False,
+        ),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            for limited_principal in (
+                Principal(user_id=USER_CALLER, auth="pat", scopes=("workspace:write",)),
+                Principal(
+                    user_id=USER_CALLER,
+                    auth="computer",
+                    scopes=("workspace:write",),
+                    computer_id="comp-1",
+                ),
+            ):
+                app.dependency_overrides[get_principal] = lambda p=limited_principal: p
+                resp = await client.post("/api/v1/workspaces", json={"name": "Nvidia"})
+                assert resp.status_code == 201
+                body = resp.json()
+                assert body["workspace_id"] == WS_5
+                assert body["coverage_unit"] is None
+                assert body["coverage_unit_warning"] is None
+
+                resp_explicit = await client.post(
+                    "/api/v1/workspaces",
+                    json={
+                        "name": "Nvidia",
+                        "coverage_kind": "company",
+                        "ticker": "NVDA",
+                    },
+                )
+                assert resp_explicit.status_code == 201
+                body_explicit = resp_explicit.json()
+                assert body_explicit["coverage_unit"] is None
+                assert body_explicit["coverage_unit_warning_detail"] == {
+                    "code": "token_not_allowed",
+                    "params": {},
+                }
+
+            # First-party session still receives 409 coverage_suggestion.
+            app.dependency_overrides[get_principal] = lambda: Principal(
+                user_id=USER_CALLER, auth="session"
+            )
+            resp_session = await client.post(
+                "/api/v1/workspaces", json={"name": "Nvidia"}
+            )
+            assert resp_session.status_code == 409
+            assert resp_session.json()["detail"]["code"] == "coverage_suggestion"
+    reg_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dedup_checks_all_batch_hits_for_read_access_before_truncating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R11 #3: All hits within a single batch (>=4) are checked for read access before truncating to 3."""
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_1,
+                name="NVDA 1",
+                owner_id=USER_RICHARD,
+                owner_name="R",
+                owner_email=EMAIL_RICHARD,
+                last_activity_at=NOW,
+            ),
+            _ws_row(
+                ws_id=WS_2,
+                name="NVDA 2",
+                owner_id=USER_RICHARD,
+                owner_name="R",
+                owner_email=EMAIL_RICHARD,
+                last_activity_at=NOW - timedelta(hours=1),
+            ),
+            _ws_row(
+                ws_id=WS_3,
+                name="NVDA 3",
+                owner_id=USER_RICHARD,
+                owner_name="R",
+                owner_email=EMAIL_RICHARD,
+                last_activity_at=NOW - timedelta(hours=2),
+            ),
+            _ws_row(
+                ws_id=WS_4,
+                name="NVDA 4 Private",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+                last_activity_at=NOW - timedelta(hours=3),
+            ),
+        ],
+    )
+    _install_llm(
+        monkeypatch,
+        lambda **_kw: _ok_result(
+            DedupLlmResult(
+                matches=[
+                    DedupMatchItem(id="c1", confidence="high", reason="same 1"),
+                    DedupMatchItem(id="c2", confidence="high", reason="same 2"),
+                    DedupMatchItem(id="c3", confidence="high", reason="same 3"),
+                    DedupMatchItem(id="c4", confidence="high", reason="same 4"),
+                ],
+                suggested_kind="company",
+                suggested_confidence="high",
+                suggested_ticker="NVDA",
+                suggested_display_name="NVIDIA Corporation",
+            )
+        ),
+    )
+
+    # Real _parse_llm_payload + _judge_candidates_with_llm (no stub) with 4th hit unreadable -> suggestion withheld.
+    _install_read_access(monkeypatch, web_readable={WS_1, WS_2, WS_3})
+    dup_fourth_unreadable = await find_existing_company_workspace(USER_CALLER, "Nvidia")
+    assert dup_fourth_unreadable is not None
+    assert [m.workspace_id for m in dup_fourth_unreadable.matches] == [WS_1, WS_2, WS_3]
+    assert dup_fourth_unreadable.suggestion is None
+
+    # Same 4 hits, all readable -> still capped at 3 matches and suggestion is returned.
+    _install_read_access(monkeypatch, web_readable={WS_1, WS_2, WS_3, WS_4})
+    dup_all_readable = await find_existing_company_workspace(USER_CALLER, "Nvidia")
+    assert dup_all_readable is not None
+    assert [m.workspace_id for m in dup_all_readable.matches] == [WS_1, WS_2, WS_3]
+    assert dup_all_readable.suggestion == dedup_mod.DedupCoverageSuggestion(
+        coverage_kind="company",
+        ticker="NVDA",
+        display_name="NVIDIA Corporation",
+    )
+
+
+@pytest.mark.asyncio
+async def test_dedup_journal_stores_usage_cost_status_without_reason_or_suggestion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R11 #4: Dedup journal writes usage, cost, and status='done' with response=None (no reason/suggested_*), leaving other callers unchanged."""
+    from decimal import Decimal
+    import src.dalton.llm.complete as complete_mod
+    from src.server.services.llm.service import LLMService
+
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_1,
+                name="NVDA",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            )
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_1})
+    monkeypatch.setattr(
+        dedup_mod,
+        "_resolve_dedup_models",
+        create_autospec(
+            dedup_mod._resolve_dedup_models,
+            return_value=["gemini-4-hydrogen-low-oauth"],
+        ),
+    )
+    monkeypatch.setattr(dedup_mod, "get_team_credential_holder_id", lambda: USER_RICHARD)
+    monkeypatch.setattr(dedup_mod, "dalton_complete", complete_mod.dalton_complete)
+
+    done_calls: list[dict[str, Any]] = []
+
+    async def _fake_inspect(
+        invocation_id: str,
+        *,
+        request_hash: str,
+        stale_after_s: int = 900,
+        resend_indeterminate: bool = False,
+        resend_max_attempts: int | None = None,
+        conn: Any = None,
+    ) -> tuple[str, dict[str, Any] | None]:
+        return "proceed", None
+
+    async def _fake_claim(**kwargs: Any) -> tuple[str, dict[str, Any]]:
+        return "claimed", {
+            "invocation_id": kwargs["invocation_id"],
+            "state": "pending",
+            "attempt": 1,
+        }
+
+    async def _fake_done(
+        invocation_id: str,
+        *,
+        attempt: int,
+        response: dict[str, Any] | None,
+        usage: dict[str, Any] | None = None,
+        cash_usd: Decimal = Decimal("0"),
+        notional_usd: Decimal = Decimal("0"),
+        provider: str | None = None,
+        billing_type: str | None = None,
+        stamp_credential_holder: bool = True,
+        conn: Any = None,
+    ) -> dict[str, Any] | None:
+        done_calls.append(
+            {
+                "invocation_id": invocation_id,
+                "attempt": attempt,
+                "response": response,
+                "usage": usage,
+                "cash_usd": cash_usd,
+                "notional_usd": notional_usd,
+                "provider": provider,
+                "billing_type": billing_type,
+            }
+        )
+        return {"invocation_id": invocation_id, "state": "done", "response": response}
+
+    monkeypatch.setattr(
+        complete_mod,
+        "inspect_journal_state",
+        create_autospec(complete_mod.inspect_journal_state, side_effect=_fake_inspect),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "claim_journal_invocation",
+        create_autospec(complete_mod.claim_journal_invocation, side_effect=_fake_claim),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "complete_journal_done",
+        create_autospec(complete_mod.complete_journal_done, side_effect=_fake_done),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "compute_call_costs",
+        create_autospec(
+            complete_mod.compute_call_costs,
+            return_value=(Decimal("0"), Decimal("0.0012")),
+        ),
+    )
+
+    llm_mock = create_autospec(LLMService, instance=True)
+    llm_mock.complete.return_value = (
+        DedupLlmResult(
+            matches=[
+                DedupMatchItem(
+                    id="c1",
+                    confidence="high",
+                    reason="SECRET_REASON_MUST_NOT_BE_JOURNALED",
+                )
+            ],
+            suggested_kind="company",
+            suggested_confidence="high",
+            suggested_ticker="NVDA",
+            suggested_display_name="SECRET_SUGGESTED_NAME",
+        ),
+        {"input_tokens": 111, "output_tokens": 22, "total_tokens": 133},
+    )
+    with patch("src.server.services.llm.service.LLMService", return_value=llm_mock):
+        dup = await find_existing_company_workspace(USER_CALLER, "Nvidia")
+
+    assert dup is not None
+    assert len(dup.matches) == 1
+    assert dup.suggestion is not None
+    assert len(done_calls) == 1
+    assert done_calls[0]["response"] is None
+    assert done_calls[0]["usage"]["input_tokens"] == 111
+    assert done_calls[0]["usage"]["output_tokens"] == 22
+    assert done_calls[0]["notional_usd"] == Decimal("0.0012")
+    assert done_calls[0]["cash_usd"] == Decimal("0")
+
+    # Other callers with persist_raw=False (and default persist_response=True) keep existing redaction behavior.
+    done_calls.clear()
+    llm_mock.complete.return_value = (
+        json.dumps(
+            {
+                "category": "research",
+                "topic_label": "NVDA",
+                "cards": [
+                    {
+                        "type": "fact",
+                        "claim": "NVDA grew",
+                        "quote": "RAW_QUOTE_STRIPPED",
+                    }
+                ],
+            }
+        ),
+        {"input_tokens": 50, "output_tokens": 10},
+    )
+    res_other = await complete_mod.dalton_complete(
+        llm_service=llm_mock,
+        user_id=USER_CALLER,
+        system_prompt="sys",
+        user_prompt="usr",
+        scope_ref="other:caller:1",
+        purpose="assist.conversation.extract_cards",
+        request_model="gemini-4-hydrogen-low-oauth",
+        persist_raw=False,
+    )
+    assert res_other.ok is True
+    assert len(done_calls) == 1
+    assert isinstance(done_calls[0]["response"], dict)
+    assert done_calls[0]["response"]["data"]["cards"][0]["claim"] == "NVDA grew"
+    assert "quote" not in done_calls[0]["response"]["data"]["cards"][0]

@@ -11,10 +11,6 @@ everyone else's connection and key-saving entry points refuse before any write.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from contextvars import ContextVar
-from typing import Iterator
-
 from fastapi import HTTPException
 
 from src.dalton.settings import (
@@ -25,21 +21,6 @@ from src.dalton.settings import (
 
 TEAM_CREDENTIAL_DISCONNECT_FORBIDDEN_DETAIL = "团队共用凭据只能由管理员断开"
 TEAM_CREDENTIAL_WRITE_FORBIDDEN_DETAIL = "团队共用凭据只能由管理员设置"
-
-_TEAM_CREDENTIAL_SHARING_DISABLED: ContextVar[bool] = ContextVar(
-    "dalton_team_credential_sharing_disabled",
-    default=False,
-)
-
-
-@contextmanager
-def disable_team_credential_sharing() -> Iterator[None]:
-    """Explicitly disable team credential sharing within the current async/sync context."""
-    token = _TEAM_CREDENTIAL_SHARING_DISABLED.set(True)
-    try:
-        yield
-    finally:
-        _TEAM_CREDENTIAL_SHARING_DISABLED.reset(token)
 
 
 def get_configured_pm_user_ids() -> list[str]:
@@ -53,8 +34,6 @@ def get_configured_pm_user_ids() -> list[str]:
 
 def get_team_credential_holder_id() -> str | None:
     """Return the single team credential holder user_id when sharing is active, else None."""
-    if _TEAM_CREDENTIAL_SHARING_DISABLED.get():
-        return None
     cfg = get_dalton_config()
     if not cfg.enabled or cfg.credentials.sharing != "team":
         return None

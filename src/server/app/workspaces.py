@@ -316,6 +316,7 @@ async def create_workspace(
                 and dup.suggestion is not None
                 and not wants_coverage
                 and not request.skip_coverage_suggestion
+                and principal.unlimited
             ):
                 if coverage_active is None:
                     coverage_active = await is_workspace_coverage_registration_active(x_user_id)
