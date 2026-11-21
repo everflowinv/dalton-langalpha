@@ -62,10 +62,10 @@ python3 .agents/skills/dalton-vip-news-alert/scripts/vip_news_alert.py \
 
 `plan` 不写文件。它给出四组请求：
 
-- `wires`：8 个账号，顺序为 DeItaone、CNN、WSJ、Bloomberg、SkyNews、FT、FoxNews、TrumpDailyPosts。每项有 `handle`、`since`、`until`、`count`。`since` 和 `until` 是窗口两端的香港公历日。`count` 为 50。
-- `web_search`：每位人物一条。`query` 形如 `"Donald Trump" (interview OR speech OR says OR remarks)`。`start_date` 是窗口起点的 UTC 公历日，`end_date` 是窗口结束时刻再加一天之后的 UTC 公历日。
+- `wires`：8 个账号，顺序为 DeItaone、CNN、WSJ、Bloomberg、SkyNews、FT、FoxNews、TrumpDailyPosts。每项有 `handle`、`since`、`until`、`count`。`since` 和 `until` 是窗口两端的 UTC 日历日。`count` 为 50。
+- `web_search`：每位人物一条。`query` 形如 `"Donald Trump" (interview OR speech OR says OR remarks)`。`start_date` 是窗口起点的 UTC 日历日，`end_date` 是窗口结束时刻再加一天之后的 UTC 日历日。
 - `youtube`：每位人物的每条原查询各一行，查询词末尾已加 `site:youtube.com`。日期字段与 `web_search` 相同。
-- `x_search`：只有一条。`from_date` 和 `to_date` 是严格 24 小时窗口覆盖到的 UTC 公历日。两个理解开关都为 true。没有 `handles`。
+- `x_search`：只有一条。`from_date` 和 `to_date` 是严格 24 小时窗口覆盖到的 UTC 日历日。两个理解开关都为 true。没有 `handles`。
 - `fetch_prompt`：稍后取字幕时原样使用。
 
 ## 2. 采集
@@ -87,7 +87,7 @@ community(
 )
 ```
 
-另外七个 handle 用各自的 `since`、`until`、`count` 同样调用。`START_DATE` 和 `END_DATE` 用该项的 `since` 和 `until`。返回里的 `has_more` 为 true 时照写。不要翻页，也不要编造未返回的帖。转发也保留，脚本按关键词归人。
+另外七个账号用各自的 `since`、`until`、`count` 同样调用。`START_DATE` 和 `END_DATE` 用该项的 `since` 和 `until`。接口不支持翻页，不要尝试翻页，也不要编造未返回的帖。把工具返回的 `items`（帖子列表）以及 4 个覆盖度字段原样写入 `raw.json`（直接保留整段返回结构也可以）：`has_more`（是否还有更早的未取回帖子）、`truncated`（是否因达到 `count` 上限被截断）、`oldest_fetched_at`（过滤和截断前抓到的非置顶原始帖最早时间）和 `oldest_returned_at`（过滤和截断后最终返回帖的最早时间）。第 3 步 `filter` 脚本会据此判断：未截断且 `oldest_fetched_at` 早于窗口起点，或已截断且 `oldest_returned_at` 早于窗口起点时视为取全；其余只要 `has_more` 或 `truncated` 为 true，筛选结果的 `notes` 会自动记为「窗口内可能还有未取回的帖子，最早只取到 <时间>（香港时间）」（因为有些情况下无法确认被截掉的帖子是否在窗口内）。时间优先使用 `oldest_returned_at`，缺失时回退到 `oldest_fetched_at`；两者均缺失时，若旧版 `raw.json` 里带有帖子时间会改用帖子里最早的时间，否则省略「，最早只取到……」后半句。转发也保留，脚本按关键词归人。
 
 ### 2b. YouTube 检索
 
@@ -138,7 +138,7 @@ x_search(
 ```json
 {
   "wires": {
-    "DeItaone": {"ok": true, "has_more": false, "items": []},
+    "DeItaone": {"ok": true, "has_more": false, "truncated": false, "oldest_fetched_at": null, "oldest_returned_at": null, "items": []},
     "CNN": {"ok": false, "items": []}
   },
   "web": {
@@ -176,7 +176,7 @@ python3 .agents/skills/dalton-vip-news-alert/scripts/vip_news_alert.py \
 - `duration` 是大于 0 且小于 120 的数字时，这条视频丢掉。缺时长、时长为 0 或不是数字时保留。
 - 八个时间线、七组网页、七组视频和 `x_search` 全部失败时，`sources_all_failed` 为 true。只跑其中几位人物时，这个字段保持 false。某一路 `ok` 为 true 但列表是空的，算安静的一天，这个字段为 false。
 
-`notes` 里会出现这些句子，渲染时原样放进 `source_notes`：某账号「时间线没有返回」，某账号「时间线已返回，窗口内可能还有未取回的帖子」，某人「的网页检索没有返回」，某人「的视频检索没有返回」，以及「补充检索没有返回」。
+`notes` 里会出现这些句子，渲染时原样放进 `source_notes`：某账号「时间线没有返回」，某账号「窗口内可能还有未取回的帖子，最早只取到 <时间>（香港时间）」（时间线工具未返回 `oldest_returned_at` 和 `oldest_fetched_at` 时，若旧版 `raw.json` 里带有帖子时间会改用帖子里最早的时间，否则省略后半句），某人「的网页检索没有返回」，某人「的视频检索没有返回」，以及「补充检索没有返回」。
 
 ## 4. 字幕、合并和严格过滤
 

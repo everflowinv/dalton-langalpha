@@ -11,7 +11,7 @@ description: "无人值守的 CT 半导体情绪日报：汇总十个固定账�
 
 接收方在 `metadata.report_profile`，配置名是 `ct-semi-sentiment`。正文和工具参数都不写接收方。
 
-窗口、标题日期和 `report_run_id` 用美洲/纽约时间（America/New_York），即使自动化时区不是纽约。原任务没有写时区，按纽约处理。`report_run_id` 是 `ct-semi-sentiment-<summary_date>`。日期、24 小时窗口、账号名单和补充检索的 query 都用第 1 步的返回，不要自己另算，也不要增减账号。
+窗口、标题日期、数据备注里的时间和 `report_run_id` 用美洲/纽约时间（America/New_York），即使自动化时区不是纽约。原任务没有写时区，按纽约处理。`report_run_id` 是 `ct-semi-sentiment-<summary_date>`。日期、24 小时窗口、账号名单和补充检索的 query 都用第 1 步的返回，不要自己另算，也不要增减账号。
 
 状态文件是 `state/ct-semi-sentiment/sentiment.log`。草稿放在 `temp/ct-semi-sentiment/<summary_date>/`。发送失败也保留草稿，不要追加日志。
 
@@ -48,7 +48,7 @@ python3 .agents/skills/dalton-ct-semi-sentiment/scripts/sentiment_log.py \
 
 ## 2. 十个账号的时间线
 
-按 `handles` 的顺序逐个调用，不要并行。每个账号失败后重试一次。仍然失败就记下来，继续下一个，不要让整份日报停住。不要传嵌套的 `params`。`tweets` 不要带 `url`、`tweet_id`、`query` 或 `include_replies`。`since` 和 `until` 用窗口覆盖到的日历日。桥接层会按日历日过滤再截到 `count`，第 4 步还会按精确 24 小时再滤一次。`count` 用 50。
+按 `handles` 的顺序逐个调用，不要并行。每个账号失败后重试一次。仍然失败就记下来，继续下一个，不要让整份日报停住。不要传嵌套的 `params`。`tweets` 不要带 `url`、`tweet_id`、`query` 或 `include_replies`。`since` 和 `until` 填窗口两端的 UTC 日历日（即第 1 步返回的 `start_date` 和 `end_date`）。时间线工具在取回之后按 UTC 日历日过滤再截到 `count`，第 4 步还会按精确 24 小时再滤一次。`count` 用 50。
 
 ```python
 community(
@@ -61,14 +61,14 @@ community(
 )
 ```
 
-其余九个 handle 同样调用。这十次时间线是完整名单。不要用别的搜索代替某一次失败的时间线。返回里的 `has_more` 为 true 时，数据备注说明窗口内可能还有未取回的帖子，不要翻页，也不要编造。
+其余九个账号同样调用。这十次时间线是完整名单，接口不支持翻页，不要尝试翻页、不要编造未返回的帖，也不要用别的搜索代替某一次失败的时间线。把工具返回的 `items`（帖子列表）以及 4 个覆盖度字段原样写入 `raw.json`（直接保留整段返回结构也可以）：`has_more`（是否还有更早的未取回帖子）、`truncated`（是否因达到 `count` 上限被截断）、`oldest_fetched_at`（过滤和截断前抓到的非置顶原始帖最早时间）和 `oldest_returned_at`（过滤和截断后最终返回帖的最早时间）。第 4 步脚本会据此判断：未截断且 `oldest_fetched_at` 早于窗口起点，或已截断且 `oldest_returned_at` 早于窗口起点时视为取全；其余只要 `has_more` 或 `truncated` 为 true，脚本会在 `incomplete_notes` 中自动标出「窗口内可能还有未取回的帖子，最早只取到 <时间>（纽约时间）」（因为有些情况下无法确认被截掉的帖子是否在窗口内）。时间优先使用 `oldest_returned_at`，缺失时回退到 `oldest_fetched_at`；两者均缺失时，若旧版 `raw.json` 里带有帖子时间会改用帖子里最早的时间，否则省略「，最早只取到……」后半句。
 
 把十次结果写成 `temp/ct-semi-sentiment/<summary_date>/raw.json`。`items` 用工具返回的 `data.items`。工具对象本身也可以放进该账号，脚本认 `items` 和 `data.items`。
 
 ```json
 {
   "accounts": {
-    "xiaomustock": {"ok": true, "has_more": false, "items": []}
+    "xiaomustock": {"ok": true, "has_more": false, "truncated": false, "oldest_fetched_at": null, "oldest_returned_at": null, "items": []}
   },
   "x_search": {"ok": false, "items": []}
 }
@@ -91,7 +91,7 @@ x_search(
 )
 ```
 
-`from_date` 和 `to_date` 用 24 小时窗口覆盖到的日历日。返回的帖子是摘录，不是保证完整的原文。图或视频若有文字说明，放进该帖的 `image_understanding` 或 `video_understanding`。没有这些字段就不要描述图片或视频里的内容。
+`from_date` 和 `to_date` 用窗口返回的 `start_date` 和 `end_date`（窗口覆盖到的 UTC 日历日）。返回的帖子是摘录，不是保证完整的原文。图或视频若有文字说明，放进该帖的 `image_understanding` 或 `video_understanding`。没有这些字段就不要描述图片或视频里的内容。
 
 补充失败，包括工具不接受这两个媒体开关时，继续用时间线。把 `x_search.ok` 设为 false。不要再做一次更宽的 X 搜索，也不要逐帖重复查询。
 
@@ -109,7 +109,7 @@ python3 .agents/skills/dalton-ct-semi-sentiment/scripts/sentiment_log.py \
 
 `--as-of` 用第 1 步的 `end_iso`。脚本丢掉窗口外的帖和纯转推，保留带观点的 quote。同一 status id 或同一原帖 URL 只留一条：补充检索里新出现的图、视频说明和正文上下文并进这条记录，来源写成 `timeline+x_search`。时间线里没有的帖才另加一条，来源是 `x_search`。置顶旧帖按时间排除。补充帖必须带有核验过的原帖 URL、作者和时间，作者还必须是这十个账号之一。
 
-`failed` 是时间线没有取到的账号。`no_posts` 是时间线成功但过去 24 小时没有新帖的账号。`with_posts` 是窗口内有帖的账号。时间线失败但补充检索补到帖时，该账号会同时出现在 `failed` 和 `with_posts`。`has_more` 里的账号要在数据备注写明可能还有未取回的帖子。
+`failed` 是时间线没有取到的账号。`no_posts` 是时间线成功但过去 24 小时没有新帖的账号。`with_posts` 是窗口内有帖的账号。时间线失败但补充检索补到帖时，该账号会同时出现在 `failed` 和 `with_posts`。`incomplete`（兼容旧字段名 `has_more`）列出时间线未能确认取全的账号，`incomplete_notes` 已为这些账号生成现成提示语（格式为「@账号 窗口内可能还有未取回的帖子，最早只取到 <时间>（纽约时间）」；时间线工具未返回 `oldest_returned_at` 和 `oldest_fetched_at` 时，若旧版 `raw.json` 里带有帖子时间会改用帖子里最早的时间，否则自动省略「，最早只取到……」后半句）。`incomplete_notes` 非空时，成稿时逐条原样写入【数据备注】。
 
 ## 5. 成稿
 
@@ -126,14 +126,15 @@ python3 .agents/skills/dalton-ct-semi-sentiment/scripts/sentiment_log.py \
 
 【个股/仓位信号】每人最多 1 条，只列实质新信息（新开仓、加减仓、止盈、新目标价、关键数据），格式「@账号：…」。无新推的不列。
 
-【数据备注】分开列下面四类，没有就写「无」，不要合成一句：
+【数据备注】分开列下面四类，没有就写「无」，不要合成一句；`incomplete_notes` 非空时，还须逐条原样写入下面：
 时间线抓取失败账号
 过去24小时无新推账号
 有新推但无半导体相关观点账号
 SuperGrok X Search 补充状态
+（`incomplete_notes` 非空时，在此逐条原样附入）
 ```
 
-标题日期用 `summary_date`。温度用半角 `N/10`。四类备注都要出现。补充检索成功，且没有新帖、也没有把图、视频或上下文并进已有帖时，写「补充成功，没有新增」。并进已有帖的说明要写进对应的个股或数据备注。补充失败写「补充未完成，日报采用时间线」。
+标题日期用 `summary_date`。温度用半角 `N/10`。四类备注都要出现；第 4 步 `incomplete_notes` 非空时，还必须逐条原样写入【数据备注】（`check` 会逐句核对，缺了就报错）。补充检索成功，且没有新帖、也没有把图、视频或上下文并进已有帖时，写「补充成功，没有新增」。并进已有帖的说明要写进对应的个股或数据备注。补充失败写「补充未完成，日报采用时间线」。
 
 十个时间线都失败时，【共识主线】写「本轮没有取到时间线」，【情绪温度】写「本轮无法评分」。这种日报仍要提交，不要改成静默，也不要追加日志。
 

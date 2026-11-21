@@ -25,6 +25,12 @@ from ptc_agent.agent.middleware.runtime_context.turn import (
     TURN_DEADLINE_KEY,
     TURN_TIME_LIMIT_KEY,
 )
+# DALTON-HOOK(empty-turn-guard): reuse output_cap / malformed_call stop-reason
+# detectors so pre-emitted tool_calls (Antigravity) are settled as not executed.
+from ptc_agent.agent.middleware.tool.empty_call_retry import (
+    malformed_call_stop_reason,
+    output_cap_stop_reason,
+)
 
 from src.server.utils.content_normalizer import (
     normalize_text_content,
@@ -93,6 +99,13 @@ class TurnTimeLimitError(asyncio.TimeoutError):
 SSE_EVENT_LOG_ENABLED = is_sse_event_log_enabled()
 
 DEFAULT_TOKEN_THRESHOLD = 120000
+
+# DALTON-HOOK(empty-turn-guard): explicit user-facing messages emitted via
+# tool_call_result(status="error") when pre-finish tool_calls (Antigravity)
+# are discarded before execution.
+_DISCARDED_TRUNCATED_TEXT = "工具调用未执行：回复超出输出上限被截断"
+_DISCARDED_MALFORMED_TEXT = "工具调用未执行：调用格式错误"
+_DISCARDED_INTERRUPTED_TEXT = "工具调用未执行：模型输出中断"
 
 
 def resolve_token_threshold(agent_config=None) -> int:
@@ -316,6 +329,11 @@ class RunSSEProducer:
         # Anthropic sends name/id in initial tool_use, then streams args via input_json_delta
         # Key: (agent_name, index), Value: {name, id, message_id, args_accumulated}
         self.anthropic_tool_call_state: dict = {}
+
+        # DALTON-HOOK(empty-turn-guard): tool calls emitted before a message's
+        # finish_reason arrives (e.g. Antigravity), keyed by (agent_name, message_id),
+        # so an output_cap/malformed_call finish can settle them with error results.
+        self._emitted_tool_calls: dict[tuple[str, str], list[dict]] = {}
 
         # Event sequence numbering for reconnection support
         self.event_sequence: int = 0
@@ -547,6 +565,8 @@ class RunSSEProducer:
 
                     # Hard timeout
                     if elapsed_time >= self.workflow_timeout:
+                        for frame in self.flush_pending_tool_calls():
+                            yield frame
                         timeout_error = self._build_sse_event(
                             "error",
                             {
@@ -909,6 +929,15 @@ class RunSSEProducer:
             for frame in self.flush_open_thinking():
                 yield frame
 
+            # DALTON-HOOK(empty-turn-guard): if the turn ended without a finish
+            # reason for previously emitted tool calls (and is not paused on an
+            # interrupt), settle them as not executed and clear remaining state.
+            if self._pending_interrupts:
+                self._emitted_tool_calls.clear()
+            else:
+                for frame in self.flush_pending_tool_calls():
+                    yield frame
+
             # I8 durability barrier. The graph iterator is exhausted, so the
             # executor has torn down and awaited its submitted saver tasks;
             # now verify a run-matching pending interrupt actually reached
@@ -1001,6 +1030,11 @@ class RunSSEProducer:
                 logger.exception(f"Error in stream generator for thread_id={self.thread_id}: {e}")
             _stream_span.record_exception(e)
             _stream_span.set_status(Status(StatusCode.ERROR))
+            # DALTON-HOOK(empty-turn-guard): before emitting the turn error event,
+            # flush any still-unsettled emitted tool calls so orphaned cards are
+            # marked not executed when retries fail before opening a new message.
+            for frame in self.flush_pending_tool_calls():
+                yield frame
             if not isinstance(e, TurnTimeLimitError):
                 yield await self._build_error_event(str(e), exc=e)
             raise  # Re-raise so the run executor finalizes as failed
@@ -1024,6 +1058,9 @@ class RunSSEProducer:
             # Clear any stale windows alongside the active flag so a reused
             # handler re-arms the guard (was_empty stays accurate) on reopen.
             self._compaction_windows.clear()
+            # DALTON-HOOK(empty-turn-guard): ensure no per-run emitted tool
+            # call state survives stream error/cancellation/teardown.
+            self._emitted_tool_calls.clear()
             if timeout_warning_sent:
                 _stream_span.set_attribute("timeout_warning", True)
             _stream_span.end()
@@ -1212,6 +1249,52 @@ class RunSSEProducer:
         """
         return self._frames_for_released(self._thinking_leak.release_all())
 
+    # DALTON-HOOK(empty-turn-guard): build tool_call_result(status="error")
+    # frames for pre-finish tool calls (e.g. Antigravity) discarded due to
+    # output_cap, malformed_call, or an interrupted/superseded stream.
+    def _flush_discarded_tool_calls(
+        self,
+        calls: list[dict],
+        *,
+        agent_name: str,
+        message_id: str,
+        reason: str,
+        discarded_reason: str,
+    ) -> list[StreamFrame]:
+        frames: list[StreamFrame] = []
+        for tc in calls:
+            tc_id = tc.get("id")
+            if not tc_id:
+                continue
+            frames.append(self._build_sse_event("tool_call_result", {
+                "thread_id": self.thread_id,
+                "agent": agent_name,
+                "id": f"{message_id}-discarded-{tc_id}",
+                "role": "assistant",
+                "tool_call_id": tc_id,
+                "status": "error",
+                "discarded": True,
+                "discarded_reason": discarded_reason,
+                "content": reason,
+                "content_type": "text",
+            }))
+        return frames
+
+    # DALTON-HOOK(empty-turn-guard): flush and clear any un-finished emitted
+    # tool calls when the turn ends.
+    def flush_pending_tool_calls(self) -> list[StreamFrame]:
+        frames: list[StreamFrame] = []
+        for (agent_name, message_id), calls in list(self._emitted_tool_calls.items()):
+            frames.extend(self._flush_discarded_tool_calls(
+                calls,
+                agent_name=agent_name,
+                message_id=message_id,
+                reason=_DISCARDED_INTERRUPTED_TEXT,
+                discarded_reason="interrupted",
+            ))
+        self._emitted_tool_calls.clear()
+        return frames
+
     async def _process_message_chunk(
         self,
         message_chunk: BaseMessage,
@@ -1239,6 +1322,31 @@ class RunSSEProducer:
         # create_agent registers the tool node as graph.add_node("tools", ...).
         metadata = message_metadata or {}
         is_tool_node = metadata.get("langgraph_node") == "tools"
+
+        # DALTON-HOOK(empty-turn-guard): if a new message opens in the same
+        # agent lane while an earlier message still has un-finished emitted
+        # tool calls (e.g. stream broke before finish_reason and was retried),
+        # mark the earlier calls not executed and drop their records.
+        if (
+            not is_compaction
+            and not is_tool_node
+            and isinstance(message_chunk, (AIMessageChunk, AIMessage))
+        ):
+            stale_keys = [
+                (k_agent, k_msg_id)
+                for (k_agent, k_msg_id) in self._emitted_tool_calls
+                if k_agent == agent_name and k_msg_id != message_id
+            ]
+            for stale_key in stale_keys:
+                stale_calls = self._emitted_tool_calls.pop(stale_key, [])
+                for frame in self._flush_discarded_tool_calls(
+                    stale_calls,
+                    agent_name=stale_key[0],
+                    message_id=stale_key[1],
+                    reason=_DISCARDED_INTERRUPTED_TEXT,
+                    discarded_reason="interrupted",
+                ):
+                    yield frame
 
         # Check for thinking/reasoning status signals in main content
         status_info = is_thinking_status_signal(message_chunk.content)
@@ -1296,11 +1404,19 @@ class RunSSEProducer:
                         # Need to accumulate arguments across chunks for final tool_calls emission
                         state_key = (agent_name, index)
 
-                        # Initialize state if not exists
-                        if state_key not in self.function_call_state:
+                        # DALTON-HOOK(empty-turn-guard): record message_id on
+                        # function_call_state and reset when a new message opens
+                        # at the same index so truncated calls cannot bleed across
+                        # retries in the same lane.
+                        existing_state = self.function_call_state.get(state_key)
+                        if existing_state is None or (
+                            item.get("name")
+                            and existing_state.get("message_id") != message_id
+                        ):
                             self.function_call_state[state_key] = {
                                 "name": None,
                                 "call_id": None,
+                                "message_id": message_id,
                                 "args_accumulated": ""
                             }
 
@@ -1519,12 +1635,17 @@ class RunSSEProducer:
         # - Anthropic: stop_reason (e.g., "end_turn", "tool_use")
         # - OpenAI Chat: finish_reason (e.g., "stop", "length", "tool_calls")
         # - OpenAI Response API: status (e.g., "completed", "failed")
+        # DALTON-HOOK(empty-turn-guard): Responses API signals output cap
+        # truncation as status="incomplete" (codex r2 #2). Recognize
+        # "incomplete" as a finish signal and clear accumulated tool-call state
+        # for this agent so a retried message's "completed" never emits stale
+        # calls from the truncated attempt.
         finish_reason = (
             message_chunk.response_metadata.get("stop_reason") or
             message_chunk.response_metadata.get("finish_reason") or
             # Response API uses status="completed" instead of finish_reason
             (message_chunk.response_metadata.get("status")
-             if message_chunk.response_metadata.get("status") in ["completed", "failed"]
+             if message_chunk.response_metadata.get("status") in ["completed", "failed", "incomplete"]
              else None)
         )
 
@@ -1543,6 +1664,21 @@ class RunSSEProducer:
                 if key[0] == agent_name and state.get("message_id") != message_id
             ]:
                 del self.anthropic_tool_call_state[stale_key]
+            # DALTON-HOOK(empty-turn-guard): also drop stale Responses API
+            # function_call_state from an earlier message in the same lane,
+            # and clear this agent's accumulated tool-call state immediately on
+            # "incomplete" / "failed" so truncated calls never emit on a retry.
+            for stale_key in [
+                key
+                for key, state in self.function_call_state.items()
+                if key[0] == agent_name and state.get("message_id") != message_id
+            ]:
+                del self.function_call_state[stale_key]
+            if finish_reason in ("incomplete", "failed"):
+                for key in [k for k in self.function_call_state if k[0] == agent_name]:
+                    del self.function_call_state[key]
+                for key in [k for k in self.anthropic_tool_call_state if k[0] == agent_name]:
+                    del self.anthropic_tool_call_state[key]
 
             # Check if we have tool call state for this agent to disambiguate "completed"
             has_response_api_tool_state = any(
@@ -1738,6 +1874,18 @@ class RunSSEProducer:
         if isinstance(message_chunk, ToolMessage):
             # Tool Message - Return the result of the tool call
             event_stream_message["tool_call_id"] = message_chunk.tool_call_id
+            # DALTON-HOOK(empty-turn-guard): remove executed tool_call_id from
+            # _emitted_tool_calls regardless of node/agent name (model vs tools).
+            if message_chunk.tool_call_id:
+                for k in list(self._emitted_tool_calls):
+                    remaining = [
+                        tc for tc in self._emitted_tool_calls[k]
+                        if tc.get("id") != message_chunk.tool_call_id
+                    ]
+                    if remaining:
+                        self._emitted_tool_calls[k] = remaining
+                    else:
+                        del self._emitted_tool_calls[k]
 
             # The whole status travels, not just the failing one. An explicit
             # success is what stops a client from reading prose that merely
@@ -1804,6 +1952,12 @@ class RunSSEProducer:
                     # Don't include tool_call_chunks in complete tool_calls event
                     # This makes behavior consistent with Response API and Anthropic
                     yield self._build_sse_event("tool_calls", event_stream_message)
+                    # DALTON-HOOK(empty-turn-guard): record pre-finish tool_calls so
+                    # a subsequent output_cap/malformed_call finish can mark them
+                    # not executed.
+                    self._emitted_tool_calls.setdefault(
+                        (agent_name, message_id), []
+                    ).extend(filtered_tool_calls)
                     # Note: file_operation events are now emitted via custom events from middleware
 
             # Emit tool_call_chunks event for client consumption (if present)
@@ -1823,6 +1977,32 @@ class RunSSEProducer:
                     if is_chunk and event_stream_message.get("content"):
                         self._streamed_content_ids.add(message_id)
                     yield self._build_sse_event(chunk_event_type, event_stream_message)
+
+            # DALTON-HOOK(empty-turn-guard): when Antigravity (or another route
+            # emitting tool_calls before finishReason) subsequently ends with
+            # output_cap or malformed_call, emit tool_call_result(status="error")
+            # for every already-emitted call on this message so the UI marks them
+            # failed/not-executed instead of leaving spinning cards.
+            cap_reason = output_cap_stop_reason(message_chunk)
+            malformed_reason = malformed_call_stop_reason(message_chunk)
+            if cap_reason is not None or malformed_reason is not None:
+                discarded = self._emitted_tool_calls.pop((agent_name, message_id), [])
+                if discarded:
+                    discard_text, discard_reason_key = (
+                        (_DISCARDED_TRUNCATED_TEXT, "output_cap")
+                        if cap_reason is not None
+                        else (_DISCARDED_MALFORMED_TEXT, "malformed_call")
+                    )
+                    for frame in self._flush_discarded_tool_calls(
+                        discarded,
+                        agent_name=agent_name,
+                        message_id=message_id,
+                        reason=discard_text,
+                        discarded_reason=discard_reason_key,
+                    ):
+                        yield frame
+            elif finish_reason:
+                self._emitted_tool_calls.pop((agent_name, message_id), None)
 
     def _filter_tool_calls(self, tool_calls: list) -> list:
         """Remove tool calls with empty names or already-seen IDs."""

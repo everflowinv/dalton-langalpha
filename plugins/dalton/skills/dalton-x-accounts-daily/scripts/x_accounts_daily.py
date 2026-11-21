@@ -13,7 +13,7 @@ import importlib.util
 import json
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -60,17 +60,19 @@ def compute_window(as_of: str | None = None) -> dict[str, Any]:
     else:
         end = datetime.now(TZ)
     start = end - timedelta(hours=24)
+    start_utc = start.astimezone(timezone.utc)
+    end_utc = end.astimezone(timezone.utc)
     return {
         "timezone": "Asia/Hong_Kong",
         "start_iso": start.isoformat(),
         "end_iso": end.isoformat(),
-        "start_date": start.date().isoformat(),
-        "end_date": end.date().isoformat(),
+        "start_date": start_utc.date().isoformat(),
+        "end_date": end_utc.date().isoformat(),
         "summary_date": end.date().isoformat(),
     }
 
 
-def _parse_time(value: Any) -> datetime | None:
+def _parse_time(value: Any, *, default_tz: ZoneInfo | timezone = TZ) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
     text = value.strip()
@@ -80,7 +82,7 @@ def _parse_time(value: Any) -> datetime | None:
         parsed = None
     if parsed is not None:
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=TZ)
+            parsed = parsed.replace(tzinfo=default_tz)
         return parsed
     try:
         return datetime.strptime(text, "%a %b %d %H:%M:%S %z %Y")
@@ -96,6 +98,12 @@ def _iter_items(payload: Any) -> list[Any]:
             value = payload.get(key)
             if isinstance(value, list):
                 return value
+        data = payload.get("data")
+        if isinstance(data, dict):
+            for key in ("items", "tweets"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return value
     return []
 
 
@@ -161,15 +169,110 @@ def _in_window(created: datetime | None, start: datetime, end: datetime) -> bool
     return created is not None and start <= created <= end
 
 
-def _account_payload(raw: Any) -> tuple[bool, list[Any], bool]:
+def _account_payload(
+    raw: Any,
+) -> tuple[bool, list[Any], bool, bool, datetime | None, datetime | None, bool, bool]:
     if isinstance(raw, list):
-        return True, raw, False
+        return True, raw, False, False, None, None, False, False
     if not isinstance(raw, dict):
-        return False, [], False
-    has_more = bool(raw.get("has_more") or raw.get("hasMore"))
-    if "ok" in raw:
-        return bool(raw.get("ok")), _iter_items(raw), has_more
-    return True, _iter_items(raw), has_more
+        return False, [], False, False, None, None, False, False
+    data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+    has_more = bool(
+        raw.get("has_more")
+        or raw.get("hasMore")
+        or data.get("has_more")
+        or data.get("hasMore")
+    )
+    truncated = bool(raw.get("truncated") or data.get("truncated"))
+    has_fetched_key = any(
+        key in container
+        for container in (raw, data)
+        for key in ("oldest_fetched_at", "oldestFetchedAt")
+    )
+    has_returned_key = any(
+        key in container
+        for container in (raw, data)
+        for key in ("oldest_returned_at", "oldestReturnedAt")
+    )
+    oldest_fetched = _parse_time(
+        raw.get("oldest_fetched_at")
+        or raw.get("oldestFetchedAt")
+        or data.get("oldest_fetched_at")
+        or data.get("oldestFetchedAt"),
+        default_tz=timezone.utc,
+    )
+    oldest_returned = _parse_time(
+        raw.get("oldest_returned_at")
+        or raw.get("oldestReturnedAt")
+        or data.get("oldest_returned_at")
+        or data.get("oldestReturnedAt"),
+        default_tz=timezone.utc,
+    )
+    ok = bool(raw.get("ok")) if "ok" in raw else True
+    return (
+        ok,
+        _iter_items(raw),
+        has_more,
+        truncated,
+        oldest_fetched,
+        oldest_returned,
+        has_fetched_key,
+        has_returned_key,
+    )
+
+
+def _oldest_timeline_item(items: list[Any], handle: str) -> datetime | None:
+    oldest_item: datetime | None = None
+    for item in items:
+        if isinstance(item, dict) and _folded_handle(_handle(item, handle)) == handle:
+            created = _item_created(item)
+            if created is not None:
+                created_utc = created.astimezone(timezone.utc)
+                if oldest_item is None or created_utc < oldest_item:
+                    oldest_item = created_utc
+    return oldest_item
+
+
+def _evaluate_timeline_coverage(
+    *,
+    has_more: bool,
+    truncated: bool,
+    oldest_fetched: datetime | None,
+    oldest_returned: datetime | None,
+    has_fetched_key: bool,
+    has_returned_key: bool,
+    items: list[Any],
+    handle: str,
+    window_start: datetime,
+) -> tuple[bool, datetime | None]:
+    """Evaluate `(incomplete, display_oldest)` using bridge fields with legacy fallback."""
+    start_utc = window_start.astimezone(timezone.utc)
+    fetched_utc = oldest_fetched.astimezone(timezone.utc) if oldest_fetched is not None else None
+    returned_utc = oldest_returned.astimezone(timezone.utc) if oldest_returned is not None else None
+    if not has_fetched_key and not has_returned_key:
+        oldest = _oldest_timeline_item(items, handle)
+        incomplete = bool((has_more or truncated) and (oldest is None or oldest >= start_utc))
+        return incomplete, oldest
+    effective_returned = (
+        returned_utc if has_returned_key else _oldest_timeline_item(items, handle)
+    )
+    if truncated:
+        covered = effective_returned is not None and effective_returned < start_utc
+    elif fetched_utc is None and not has_returned_key:
+        fallback_oldest = _oldest_timeline_item(items, handle)
+        covered = fallback_oldest is not None and fallback_oldest < start_utc
+        effective_returned = effective_returned or fallback_oldest
+    else:
+        covered = fetched_utc is not None and fetched_utc < start_utc
+    incomplete = bool((has_more or truncated) and not covered)
+    display_oldest = effective_returned if effective_returned is not None else fetched_utc
+    return incomplete, display_oldest
+
+
+def _item_created(item: Any) -> datetime | None:
+    if not isinstance(item, dict):
+        return None
+    return _parse_time(item.get("created_at") or item.get("createdAt") or item.get("date"))
 
 
 def _folded_handle(value: str) -> str:
@@ -207,7 +310,16 @@ def select_posts(raw: dict[str, Any], window: dict[str, Any]) -> dict[str, Any]:
     for handle in HANDLES:
         names.setdefault(handle, handle)
         present = handle in accounts_in
-        ok, items, has_more = _account_payload(accounts_in.get(handle))
+        (
+            ok,
+            items,
+            has_more,
+            truncated,
+            oldest_fetched,
+            oldest_returned,
+            has_fetched_key,
+            has_returned_key,
+        ) = _account_payload(accounts_in.get(handle))
         if not present:
             ok = False
         kept: list[dict[str, Any]] = []
@@ -225,9 +337,38 @@ def select_posts(raw: dict[str, Any], window: dict[str, Any]) -> dict[str, Any]:
                     seen_urls.add(norm["url"])
                 _remember_name(names, handle, norm["handle"])
                 kept.append(norm)
+        if ok:
+            incomplete, display_oldest = _evaluate_timeline_coverage(
+                has_more=has_more,
+                truncated=truncated,
+                oldest_fetched=oldest_fetched,
+                oldest_returned=oldest_returned,
+                has_fetched_key=has_fetched_key,
+                has_returned_key=has_returned_key,
+                items=items,
+                handle=handle,
+                window_start=start,
+            )
+        else:
+            incomplete, display_oldest = False, None
         accounts[handle] = {
             "ok": ok,
             "has_more": has_more if ok else False,
+            "truncated": truncated if ok else False,
+            "incomplete": incomplete,
+            "oldest_fetched_at": (
+                oldest_fetched.astimezone(timezone.utc).isoformat()
+                if (ok and oldest_fetched is not None)
+                else None
+            ),
+            "oldest_returned_at": (
+                oldest_returned.astimezone(timezone.utc).isoformat()
+                if (ok and oldest_returned is not None)
+                else None
+            ),
+            "oldest_created_at": display_oldest.astimezone(TZ).isoformat()
+            if (ok and display_oldest is not None)
+            else "",
             "items": kept,
         }
     search = raw.get("x_search")
@@ -278,22 +419,70 @@ def _summary_map(payload: Any) -> dict[str, str]:
     return out
 
 
+def _account_coverage(
+    account: dict[str, Any],
+    window_start: datetime | None,
+) -> tuple[bool, datetime | None]:
+    if not account.get("ok"):
+        return False, None
+    oldest_returned = _parse_time(account.get("oldest_returned_at"), default_tz=timezone.utc)
+    oldest_fetched = _parse_time(account.get("oldest_fetched_at"), default_tz=timezone.utc)
+    oldest_created = _parse_time(account.get("oldest_created_at"))
+    display_oldest = oldest_returned or oldest_fetched or oldest_created
+    truncated = bool(account.get("truncated"))
+    if "incomplete" in account:
+        return bool(account.get("incomplete")), display_oldest
+    # Legacy selected.json (from older select_posts) already merged x_search into `items`;
+    # never inspect `items` here so supplemented posts cannot masquerade as timeline reach.
+    has_more = bool(account.get("has_more") or truncated)
+    if window_start is None:
+        return has_more, display_oldest
+    has_fetched_key = "oldest_fetched_at" in account or "oldestFetchedAt" in account
+    has_returned_key = "oldest_returned_at" in account or "oldestReturnedAt" in account
+    start_utc = window_start.astimezone(timezone.utc)
+    if not has_fetched_key and not has_returned_key:
+        covered = oldest_created is not None and oldest_created.astimezone(timezone.utc) < start_utc
+        return bool(has_more and not covered), display_oldest
+    if truncated:
+        covered = (
+            oldest_returned is not None and oldest_returned.astimezone(timezone.utc) < start_utc
+        )
+    else:
+        covered = (
+            oldest_fetched is not None and oldest_fetched.astimezone(timezone.utc) < start_utc
+        )
+    incomplete = bool(has_more and not covered)
+    return incomplete, display_oldest
+
+
+def _incomplete_note(handle: str, oldest: datetime | None) -> str:
+    prefix = "窗口内可能还有未取回的帖子"
+    if oldest is None:
+        return f"- @{handle} {prefix}"
+    earliest = oldest.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return f"- @{handle} {prefix}，最早只取到 {earliest}（香港时间）"
+
+
 def compose_markdown(selected: dict[str, Any], summaries: dict[str, str]) -> dict[str, Any]:
     window = selected.get("window") or {}
     summary_date = str(window.get("summary_date") or "")
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", summary_date):
         raise RuntimeError("selected file has no summary date")
+    window_start = _parse_time(window.get("start_iso"))
     accounts = selected.get("accounts") or {}
     search_ok = bool((selected.get("x_search") or {}).get("ok"))
     title = f"📋 推特每日总结 — {summary_date}"
     lines = [f"# {title}", ""]
     all_ok = True
-    any_more = False
+    any_incomplete = False
+    coverage: dict[str, tuple[bool, datetime | None]] = {}
     for handle in HANDLES:
         account = accounts.get(handle) or {}
         ok = bool(account.get("ok"))
         all_ok = all_ok and ok
-        any_more = any_more or bool(account.get("has_more"))
+        incomplete, oldest = _account_coverage(account, window_start)
+        coverage[handle] = (incomplete, oldest)
+        any_incomplete = any_incomplete or incomplete
         shown = str(account.get("display_handle") or handle)
         lines.extend(["", f"## @{shown}", ""])
         items = account.get("items") or []
@@ -314,13 +503,14 @@ def compose_markdown(selected: dict[str, Any], summaries: dict[str, str]) -> dic
             else:
                 lines.append(f"{index}. {summary}")
     notes = [f"- 严格 24 小时窗口：{window.get('start_iso')} 至 {window.get('end_iso')}（Asia/Hong_Kong）"]
-    if all_ok and search_ok and not any_more:
+    if all_ok and search_ok and not any_incomplete:
         notes.append(f"- {SUCCESS_NOTE}")
     else:
         for handle in HANDLES:
             account = accounts.get(handle) or {}
-            if account.get("ok") and account.get("has_more"):
-                notes.append(f"- @{handle} 时间线已返回，窗口内还有未取回的帖子")
+            incomplete, oldest = coverage[handle]
+            if account.get("ok") and incomplete:
+                notes.append(_incomplete_note(handle, oldest))
             elif account.get("ok"):
                 notes.append(f"- @{handle} 时间线抓取成功")
             else:

@@ -6,7 +6,7 @@ import { useTranslation } from 'react-i18next';
 import { TextShimmer } from '@/components/ui/text-shimmer';
 import { DotLoader } from '@/components/ui/dot-loader';
 import { ToolIcon } from '../ToolIcon';
-import { getDisplayName, getToolIcon, getPreparingText } from '../toolDisplayConfig';
+import { getDiscardedToolCallReason, getDisplayName, getFailedToolCallLabel, getToolIcon, getPreparingText } from '../toolDisplayConfig';
 import { liveToolLabel, completedToolTitle, completedToolSummary } from './activitySummary';
 import { TWEEN } from '@/lib/motion';
 import { useLaNames } from '../../hooks/useLaNames';
@@ -46,6 +46,10 @@ export const ToolCallLiveRow = memo(function ToolCallLiveRow({ tc, liveState }: 
   const completedTitle = !isInProgress ? completedToolTitle(tc, t) : null;
   const laNames = useLaNames([{ toolName, args }]);
   const summary = !isInProgress ? completedToolSummary(tc, t, laNames) : null;
+  // DALTON-HOOK(empty-turn-guard): show the localized non-executed notice for
+  // discarded pre-finish calls and use the dedicated not-executed a11y label.
+  const discardedReason = getDiscardedToolCallReason(tc, t);
+  const failedLabel = getFailedToolCallLabel(tc, t);
 
   return (
     <motion.div
@@ -54,11 +58,11 @@ export const ToolCallLiveRow = memo(function ToolCallLiveRow({ tc, liveState }: 
       transition={DIM}
       style={{ fontSize: '0.8125rem', color: 'var(--Labels-Secondary)' }}
     >
-      <div className="relative shrink-0 flex items-center justify-center h-5 w-5">
+      <div className="relative shrink-0 flex items-center justify-center h-5 w-5" title={liveState === 'failed' ? failedLabel : undefined}>
         <RunningIcon running={isInProgress}>
           <ToolIcon toolName={toolName} args={args} artifact={artifact} className="h-4 w-4" />
         </RunningIcon>
-        <FailedIconBadge failed={liveState === 'failed'} label={t('toolArtifact.a11y.toolCallFailed')} />
+        <FailedIconBadge failed={liveState === 'failed'} label={failedLabel} />
       </div>
       <SwapCell swapKey={isInProgress ? 'running' : 'settled'} className="flex-1" layerClassName="flex items-center gap-2">
         {isInProgress ? (
@@ -72,9 +76,11 @@ export const ToolCallLiveRow = memo(function ToolCallLiveRow({ tc, liveState }: 
         ) : (
           <>
             <span className="font-medium shrink-0 whitespace-nowrap">{completedTitle}</span>
-            {summary
-              ? <span className="truncate min-w-0" style={{ opacity: 0.55 }}>&mdash; {summary}</span>
-              : <span style={{ opacity: 0.55 }}>{t('toolArtifact.done')}</span>}
+            {discardedReason
+              ? <span className="truncate min-w-0" style={{ opacity: 0.65 }}>&mdash; {discardedReason}</span>
+              : summary
+                ? <span className="truncate min-w-0" style={{ opacity: 0.55 }}>&mdash; {summary}</span>
+                : <span style={{ opacity: 0.55 }}>{t('toolArtifact.done')}</span>}
           </>
         )}
       </SwapCell>

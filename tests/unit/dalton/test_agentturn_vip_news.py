@@ -434,7 +434,7 @@ def test_exact_window_dedup_and_duration() -> None:
                     "url": "https://x.com/DeItaone/status/82",
                 },
             ]),
-            "CNN": _ok([], has_more=True),
+            "CNN": _ok([_tweet("20", "market update", "2026-11-11T12:00:00+08:00", "CNN")], has_more=True),
             "Bloomberg": _ok([_tweet("30", "MUSK launched a rocket", end_iso, "Bloomberg")]),
         },
         "web": {
@@ -587,7 +587,7 @@ def test_exact_window_dedup_and_duration() -> None:
     assert "82" not in wire_ids
     assert [row["text"] for row in result["unmatched_x"]] == ["schedule update"]
     assert result["sources_all_failed"] is False
-    assert "CNN 时间线已返回，窗口内可能还有未取回的帖子" in result["notes"]
+    assert "CNN 窗口内可能还有未取回的帖子，最早只取到 2026-11-11 12:00:00（香港时间）" in result["notes"]
     assert "WSJ 时间线没有返回" in result["notes"]
     assert "Kevin Warsh 的视频检索没有返回" in result["notes"]
     assert cli.filter_raw({}, window, {})["sources_all_failed"] is True
@@ -1182,3 +1182,318 @@ def test_the_card_links_the_feishu_transcript_doc_when_one_was_made(tmp_path: Pa
         assert expected in markdown, (record, markdown)
         if expected != workspace_line:
             assert workspace_line not in markdown
+
+
+def test_wire_has_more_checks_oldest_timestamp() -> None:
+    cli = _load("vip_news_has_more", CLI_PATH)
+    window = cli.compute_window(AS_OF)
+    start = datetime.fromisoformat(window["start_iso"])
+    earlier = (start - timedelta(seconds=1)).isoformat()
+
+    raw = {
+        "wires": {
+            # has_more=True, oldest item is earlier than window start -> covered, no note
+            "DeItaone": _ok([
+                {"id": "10", "text": "undated entry", "author_handle": "DeItaone"},
+                _tweet("11", "TRUMP spoke", "2026-11-11T04:00:00Z", "DeItaone"),
+                _tweet("12", "earlier outside window", earlier, "DeItaone"),
+            ], has_more=True),
+            # has_more=True, oldest timestamped item is inside window (undated item ignored)
+            "CNN": _ok([
+                {"id": "20", "text": "undated should be ignored", "author_handle": "CNN"},
+                _tweet("21", "TRUMP latest", "2026-11-12T01:00:00+08:00", "CNN"),
+                _tweet("22", "market brief", "2026-11-11T04:15:30Z", "CNN"),
+            ], has_more=True),
+            # has_more=True, no timestamped items -> incomplete fallback note
+            "WSJ": _ok([{"id": "30", "text": "undated only", "author_handle": "WSJ"}], has_more=True),
+            # has_more=False -> unchanged (no incomplete note even when items stay in window)
+            "Bloomberg": _ok([_tweet("40", "in window", "2026-11-11T15:00:00+08:00", "Bloomberg")], has_more=False),
+            "SkyNews": _ok([], has_more=False),
+            "FT": _ok([], has_more=False),
+            "FoxNews": _ok([], has_more=False),
+            "TrumpDailyPosts": _ok([], has_more=False),
+        },
+        "web": {},
+        "videos": {},
+        "x_search": _ok([]),
+    }
+
+    result = cli.filter_raw(raw, window, {})
+    notes = result["notes"]
+    assert not any(note.startswith("DeItaone") for note in notes)
+    assert "CNN 窗口内可能还有未取回的帖子，最早只取到 2026-11-11 12:15:30（香港时间）" in notes
+    assert "WSJ 窗口内可能还有未取回的帖子" in notes
+    assert not any(note.startswith("Bloomberg") for note in notes)
+
+
+def test_vip_news_nested_bridge_coverage_and_utc_window() -> None:
+    from datetime import timezone
+
+    scripts_dalton = REPO_ROOT / "scripts" / "dalton"
+    if str(scripts_dalton) not in sys.path:
+        sys.path.insert(0, str(scripts_dalton))
+    import researchdata_bridge as rb
+
+    cli = _load("vip_news_nested_utc", CLI_PATH)
+    window = cli.compute_window(AS_OF)
+    start = datetime.fromisoformat(window["start_iso"])
+
+    # 1. Nested bridge shape (truncated, covered): 49 items inside window + 2 items before window start -> 50th returned item is before start.
+    raw_tweets = []
+    for idx in range(49):
+        dt_utc = (start + timedelta(minutes=25 * (49 - idx))).astimezone(timezone.utc)
+        raw_tweets.append(
+            {
+                "id": str(600 + idx),
+                "text": f"TRUMP update {idx}",
+                "createdAt": dt_utc.strftime("%a %b %d %H:%M:%S +0000 %Y"),
+                "user": {"screenName": "DeItaone", "name": "DeItaone"},
+            }
+        )
+    before_utc = (start - timedelta(minutes=1)).astimezone(timezone.utc)
+    older_utc = (start - timedelta(minutes=10)).astimezone(timezone.utc)
+    for idx, dt_utc in enumerate((before_utc, older_utc)):
+        raw_tweets.append(
+            {
+                "id": str(599 - idx),
+                "text": f"TRUMP before window {idx}",
+                "createdAt": dt_utc.strftime("%a %b %d %H:%M:%S +0000 %Y"),
+                "user": {"screenName": "DeItaone", "name": "DeItaone"},
+            }
+        )
+    plan = cli.plan_requests(AS_OF)
+    bridge_data = rb._normalize_x_timeline_output(
+        {"items": raw_tweets, "hasMore": False},
+        operation="tweets",
+        count=50,
+        since=plan["wires"][0]["since"],
+        until=plan["wires"][0]["until"],
+    )
+    assert len(bridge_data["items"]) == 50
+    assert bridge_data["truncated"] is True
+    assert bridge_data["has_more"] is True
+    assert bridge_data["oldest_fetched_at"] == older_utc.isoformat(timespec="seconds")
+    assert bridge_data["oldest_returned_at"] == before_utc.isoformat(timespec="seconds")
+
+    # 1b. Codex middle-1: 51 in-window + 1 before-window truncated to 50 -> oldest_returned_at in window -> warns!
+    raw_51 = []
+    for idx in range(51):
+        dt_utc = (start + timedelta(minutes=20 * (51 - idx))).astimezone(timezone.utc)
+        raw_51.append(
+            {
+                "id": str(700 + idx),
+                "text": f"TRUMP 51-{idx}",
+                "createdAt": dt_utc.strftime("%a %b %d %H:%M:%S +0000 %Y"),
+                "user": {"screenName": "FT", "name": "FT"},
+            }
+        )
+    raw_51.append(
+        {
+            "id": "699",
+            "text": "TRUMP pre-window 51",
+            "createdAt": before_utc.strftime("%a %b %d %H:%M:%S +0000 %Y"),
+            "user": {"screenName": "FT", "name": "FT"},
+        }
+    )
+    bridge_51 = rb._normalize_x_timeline_output(
+        {"items": raw_51, "hasMore": False},
+        operation="tweets",
+        count=50,
+        since=plan["wires"][0]["since"],
+        until=plan["wires"][0]["until"],
+    )
+    assert bridge_51["truncated"] is True
+    assert bridge_51["oldest_fetched_at"] == before_utc.isoformat(timespec="seconds")
+    assert bridge_51["oldest_returned_at"] == (start + timedelta(minutes=40)).astimezone(timezone.utc).isoformat(timespec="seconds")
+
+    # 1c. Codex middle-2: old pinned tweet at index 0 + in-window tweets with hasMore=True -> pinned excluded -> warns!
+    bridge_pinned = rb._normalize_x_timeline_output(
+        {
+            "items": [
+                {
+                    "id": "901",
+                    "text": "TRUMP old pinned",
+                    "createdAt": "Thu Jan 01 00:00:00 +0000 2026",
+                    "user": {"screenName": "SkyNews", "name": "SkyNews"},
+                },
+                {
+                    "id": "902",
+                    "text": "TRUMP in window",
+                    "createdAt": "Thu Nov 12 00:00:00 +0000 2026",  # 08:00 HKT
+                    "user": {"screenName": "SkyNews", "name": "SkyNews"},
+                },
+            ],
+            "hasMore": True,
+        },
+        operation="tweets",
+        count=50,
+        since=plan["wires"][0]["since"],
+        until=plan["wires"][0]["until"],
+    )
+    assert bridge_pinned["truncated"] is False
+    assert bridge_pinned["oldest_fetched_at"] == "2026-11-12T00:00:00+00:00"
+    assert bridge_pinned["oldest_returned_at"] == "2026-11-12T00:00:00+00:00"
+
+    raw = {
+        "wires": {
+            "DeItaone": {"ok": True, "status": "ok", "data": bridge_data},
+            # truncated=True with has_more=False + oldest_fetched_at >= start + oldest_returned_at=None -> incomplete note
+            "CNN": {
+                "ok": True,
+                "status": "ok",
+                "data": {
+                    "items": [],
+                    "returned": 0,
+                    "has_more": False,
+                    "truncated": True,
+                    "oldest_fetched_at": "2026-11-12T01:30:00+00:00",  # 09:30 HKT > end
+                    "oldest_returned_at": None,
+                },
+            },
+            # Nested empty + has_more=True + oldest_fetched_at=None -> omits earliest suffix even if x_search has items
+            "WSJ": {
+                "ok": True,
+                "status": "empty",
+                "empty_reason": "no_matching_items",
+                "data": {"items": [], "returned": 0, "has_more": True, "truncated": False, "oldest_fetched_at": None, "oldest_returned_at": None},
+            },
+            # Non-truncated with oldest_fetched_at < start and oldest_returned_at >= start -> covered, no note
+            "Bloomberg": {
+                "ok": True,
+                "status": "ok",
+                "data": {
+                    "items": [],
+                    "has_more": True,
+                    "truncated": False,
+                    "oldest_fetched_at": before_utc.isoformat(timespec="seconds"),
+                    "oldest_returned_at": "2026-11-11T10:00:00+00:00",
+                },
+            },
+            "SkyNews": {"ok": True, "status": "ok", "data": bridge_pinned},
+            "FT": {"ok": True, "status": "ok", "data": bridge_51},
+            "FoxNews": _ok([], has_more=False),
+            "TrumpDailyPosts": _ok([], has_more=False),
+        },
+        "web": {},
+        "videos": {},
+        "x_search": _ok([
+            {
+                "id": "799",
+                "author": "WSJ",
+                "date": "2026-11-11T15:00:00+08:00",
+                "text": "TRUMP from x_search",
+                "url": "https://x.com/WSJ/status/799",
+            }
+        ]),
+    }
+    res = cli.filter_raw(raw, window, {})
+    notes = res["notes"]
+    assert not any(note.startswith("DeItaone") for note in notes)
+    assert not any(note.startswith("Bloomberg") for note in notes)
+    assert "CNN 窗口内可能还有未取回的帖子，最早只取到 2026-11-12 09:30:00（香港时间）" in notes
+    assert "SkyNews 窗口内可能还有未取回的帖子，最早只取到 2026-11-12 08:00:00（香港时间）" in notes
+    expected_ft_hk = (start + timedelta(minutes=40)).astimezone(cli.TZ).strftime("%Y-%m-%d %H:%M:%S")
+    assert f"FT 窗口内可能还有未取回的帖子，最早只取到 {expected_ft_hk}（香港时间）" in notes
+    assert "WSJ 窗口内可能还有未取回的帖子" in notes
+    assert not any(note.startswith("WSJ 窗口内可能还有未取回的帖子，") for note in notes)
+
+    # 1d. Unified possible wording for both 50+1 pre-window and 51 in-window truncated timelines.
+    raw_50_plus_1 = [
+        {
+            "id": str(750 + idx),
+            "text": f"TRUMP 50-{idx}",
+            "createdAt": (start + timedelta(minutes=20 * (50 - idx))).astimezone(timezone.utc).strftime("%a %b %d %H:%M:%S +0000 %Y"),
+            "user": {"screenName": "FoxNews", "name": "FoxNews"},
+        }
+        for idx in range(50)
+    ]
+    raw_50_plus_1.append(
+        {
+            "id": "749",
+            "text": "TRUMP pre-50",
+            "createdAt": before_utc.strftime("%a %b %d %H:%M:%S +0000 %Y"),
+            "user": {"screenName": "FoxNews", "name": "FoxNews"},
+        }
+    )
+    bridge_50_plus_1 = rb._normalize_x_timeline_output(
+        {"items": raw_50_plus_1, "hasMore": False},
+        operation="tweets",
+        count=50,
+        since=plan["wires"][0]["since"],
+        until=plan["wires"][0]["until"],
+    )
+    raw_51_only = [
+        {
+            "id": str(850 + idx),
+            "text": f"TRUMP 51-only-{idx}",
+            "createdAt": (start + timedelta(minutes=20 * (51 - idx))).astimezone(timezone.utc).strftime("%a %b %d %H:%M:%S +0000 %Y"),
+            "user": {"screenName": "TrumpDailyPosts", "name": "TrumpDailyPosts"},
+        }
+        for idx in range(51)
+    ]
+    bridge_51_only = rb._normalize_x_timeline_output(
+        {"items": raw_51_only, "hasMore": False},
+        operation="tweets",
+        count=50,
+        since=plan["wires"][0]["since"],
+        until=plan["wires"][0]["until"],
+    )
+    res_dist = cli.filter_raw(
+        {
+            "wires": {
+                "FoxNews": {"ok": True, "status": "ok", "data": bridge_50_plus_1},
+                "TrumpDailyPosts": {"ok": True, "status": "ok", "data": bridge_51_only},
+                **{acc: _ok([]) for acc in WIRE_HANDLES if acc not in ("FoxNews", "TrumpDailyPosts")},
+            },
+            "web": {},
+            "videos": {},
+            "x_search": _ok([]),
+        },
+        window,
+        {},
+    )
+    expected_fox_hk = (start + timedelta(minutes=20)).astimezone(cli.TZ).strftime("%Y-%m-%d %H:%M:%S")
+    expected_tdp_hk = (start + timedelta(minutes=40)).astimezone(cli.TZ).strftime("%Y-%m-%d %H:%M:%S")
+    assert f"FoxNews 窗口内可能还有未取回的帖子，最早只取到 {expected_fox_hk}（香港时间）" in res_dist["notes"]
+    assert f"TrumpDailyPosts 窗口内可能还有未取回的帖子，最早只取到 {expected_tdp_hk}（香港时间）" in res_dist["notes"]
+    assert all("窗口内帖子超过已取回的数量" not in n for n in res_dist["notes"])
+
+    # 2. HKT 07:30 window end: since/until use UTC dates so tweets near window start (previous UTC day) survive bridge filtering.
+    as_of_0730 = "2026-11-12T07:30:00+08:00"
+    plan_0730 = cli.plan_requests(as_of_0730)
+    assert plan_0730["window"]["summary_date"] == "2026-11-12"
+    assert plan_0730["wires"][0]["since"] == "2026-11-10"
+    assert plan_0730["wires"][0]["until"] == "2026-11-11"
+    bridge_0730 = rb._normalize_x_timeline_output(
+        {
+            "items": [
+                {
+                    "id": "899",
+                    "text": "TRUMP 07:45 HKT remarks",
+                    "createdAt": "Tue Nov 10 23:45:00 +0000 2026",
+                    "user": {"screenName": "DeItaone", "name": "DeItaone"},
+                }
+            ],
+            "hasMore": False,
+        },
+        operation="tweets",
+        count=50,
+        since=plan_0730["wires"][0]["since"],
+        until=plan_0730["wires"][0]["until"],
+    )
+    assert len(bridge_0730["items"]) == 1
+    filtered_0730 = cli.filter_raw(
+        {
+            "wires": {
+                "DeItaone": {"ok": True, "status": "ok", "data": bridge_0730},
+                **{acc: _ok([]) for acc in WIRE_HANDLES if acc != "DeItaone"},
+            },
+            "web": {},
+            "videos": {},
+            "x_search": _ok([]),
+        },
+        plan_0730["window"],
+        {},
+    )
+    trump_wire = _person(filtered_0730, "Trump")["wire_headlines"]
+    assert [row["status_id"] for row in trump_wire] == ["899"]

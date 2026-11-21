@@ -4,7 +4,7 @@ import type { TFunction } from 'i18next';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { cn } from '@/lib/utils';
 import { ArrowRight, ArrowUpRight, ChevronRight, FileText } from 'lucide-react';
-import { isTaskTool, parseTruncatedResult, stripLineNumbers } from './toolDisplayConfig';
+import { getDiscardedToolCallReason, isTaskTool, parseTruncatedResult, stripLineNumbers } from './toolDisplayConfig';
 import { FaviconImg } from './charts/FaviconImg';
 import { TermCard } from './charts/TermCard';
 import { TermPanel } from './charts/TermPanel';
@@ -34,6 +34,9 @@ export interface ToolCallData {
 export interface ToolCallResultData {
   content?: string | unknown;
   artifact?: ArtifactRecord;
+  status?: string;
+  discarded?: boolean;
+  discarded_reason?: string;
   [key: string]: unknown;
 }
 
@@ -349,6 +352,9 @@ interface ArtifactOrMarkdownProps {
 function ArtifactOrMarkdown(props: ArtifactOrMarkdownProps): React.ReactElement {
   const { content, toolName, toolCallProcess, onOpenFile } = props;
   const { t } = useTranslation();
+  // DALTON-HOOK(empty-turn-guard): show localized not-executed text for discarded calls.
+  const discardedReason = getDiscardedToolCallReason(toolCallProcess, t);
+  if (discardedReason) return <Markdown variant="panel" content={discardedReason} className="text-sm" />;
   const panel = panelBody(props, t);
   if (panel) return <TermPanel>{panel}</TermPanel>;
 
