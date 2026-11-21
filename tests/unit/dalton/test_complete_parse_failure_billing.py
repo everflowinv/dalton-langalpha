@@ -1990,13 +1990,32 @@ def test_d044_migration_revision_upgrade_and_downgrade(monkeypatch: pytest.Monke
     assert "COALESCE(j.completed_at, j.created_at)" not in joined_up
     assert "ON CONFLICT (invocation_id, attempt, call_seq) DO NOTHING" in joined_up
 
+    autocommit_down_events: list[str] = []
+
+    class _FakeDownCtx:
+        as_sql = True
+
+        @contextlib.contextmanager
+        def autocommit_block(self):
+            autocommit_down_events.append("enter")
+            executed_down.append("-- DOWN_AUTOCOMMIT_ENTER")
+            try:
+                yield
+            finally:
+                executed_down.append("-- DOWN_AUTOCOMMIT_EXIT")
+                autocommit_down_events.append("exit")
+
+    monkeypatch.setattr(d044.op, "get_context", lambda: _FakeDownCtx())
     monkeypatch.setattr(d044.op, "execute", lambda sql: executed_down.append(str(sql)))
     d044.downgrade()
+    assert autocommit_down_events == ["enter", "exit"]
     joined_down = "\n".join(executed_down)
+    down_ac_enter = joined_down.index("-- DOWN_AUTOCOMMIT_ENTER")
     rollup_idx = joined_down.index("UPDATE dalton_llm_journal j")
+    down_ac_exit = joined_down.index("-- DOWN_AUTOCOMMIT_EXIT")
     drop_fk_idx = joined_down.index("DROP CONSTRAINT IF EXISTS fk_dalton_llm_journal_attempts_invocation")
     drop_idx = joined_down.index("DROP TABLE IF EXISTS dalton_llm_journal_attempts CASCADE")
-    assert rollup_idx < drop_fk_idx < drop_idx
+    assert down_ac_enter < rollup_idx < down_ac_exit < drop_fk_idx < drop_idx
 
 
 # ---------------------------------------------------------------------------
@@ -2773,72 +2792,107 @@ async def test_d044_downgrade_rolls_up_late_settled_attempts_into_parent_before_
     store.rows[inv_id]["cash_usd"] = c2
     store.rows[inv_id]["usage"] = {**u2, "total_tokens": u2["input_tokens"] + u2["output_tokens"]}
 
-    # Execute d044.downgrade(), verifying rollup SQL runs BEFORE DROP TABLE and mirrors its semantics
+    # Execute d044.downgrade(), verifying batched rollup SQL runs inside autocommit_block()
+    # BEFORE the separate short DDL transaction drops FK and table.
+    import contextlib
+
     downgrade_steps: list[str] = []
     attempts_dropped = False
+
+    class _RollupResult:
+        def __init__(self, row: tuple[Any, ...]) -> None:
+            self._row = row
+
+        def fetchone(self) -> tuple[Any, ...]:
+            return self._row
+
+    class _RollupBind:
+        def execute(self, stmt: Any, params: dict[str, Any] | None = None) -> _RollupResult:
+            s = str(stmt)
+            if "SELECT to_regclass('dalton_llm_journal_attempts')" in s:
+                return _RollupResult(("dalton_llm_journal_attempts",))
+            if "UPDATE dalton_llm_journal j" in s:
+                assert not attempts_dropped, "rollup MUST run before dropping attempts table"
+                assert "GREATEST(COALESCE(j.cash_usd, 0), agg.total_cash_usd)" in s
+                assert "GREATEST(COALESCE(j.notional_usd, 0), agg.total_notional_usd)" in s
+                assert "'per_call_usages', pca.per_call_usages" in s
+                assert "'attempt_details', agg.attempt_details" in s
+                assert "agg.attempt_row_count > 1" in s
+                downgrade_steps.append("rollup")
+                # Apply the exact rollup aggregation onto in-memory tables
+                by_inv: dict[str, list[dict[str, Any]]] = {}
+                for rec in store.attempts.values():
+                    by_inv.setdefault(rec["invocation_id"], []).append(rec)
+                last_id = str((params or {}).get("last_id") or "")
+                inv_keys = sorted(k for k in by_inv if k > last_id)
+                for j_inv in inv_keys:
+                    recs = by_inv[j_inv]
+                    recs.sort(key=lambda r: (r["attempt"], r["call_seq"]))
+                    parent = store.rows[j_inv]
+                    tot_cash = sum((Decimal(str(r["cash_usd"])) for r in recs), Decimal("0"))
+                    tot_notional = sum((Decimal(str(r["notional_usd"])) for r in recs), Decimal("0"))
+                    tot_unk = sum(int(r["unknown_usage_calls"]) for r in recs)
+                    all_known = all(bool(r["usage_known"]) for r in recs) and tot_unk == 0
+                    per_call: list[dict[str, Any]] = []
+                    sums: dict[str, int] = {}
+                    for r in recs:
+                        ru = r.get("usage") or {}
+                        if isinstance(ru.get("per_call_usages"), list) and ru["per_call_usages"]:
+                            per_call.extend(ru["per_call_usages"])
+                        elif any((ru.get(k) or 0) > 0 for k in ("input_tokens", "output_tokens", "total_tokens")):
+                            per_call.append(
+                                {k: ru[k] for k in ("input_tokens", "output_tokens", "total_tokens") if k in ru}
+                            )
+                        for k in ("input_tokens", "output_tokens", "total_tokens"):
+                            if isinstance(ru.get(k), (int, float)):
+                                sums[k] = sums.get(k, 0) + int(ru[k])
+                    parent["cash_usd"] = max(Decimal(str(parent["cash_usd"])), tot_cash)
+                    parent["notional_usd"] = max(Decimal(str(parent["notional_usd"])), tot_notional)
+                    if parent["state"] != "done" and (tot_cash > 0 or tot_notional > 0 or tot_unk > 0):
+                        parent["state"] = "indeterminate"
+                    new_usage = dict(parent.get("usage") or {})
+                    new_usage.update(sums)
+                    new_usage["per_call_usages"] = per_call
+                    new_usage["usage_known"] = all_known
+                    new_usage["unknown_usage_calls"] = tot_unk
+                    new_usage["attempt_details"] = [
+                        {
+                            "attempt": r["attempt"],
+                            "call_seq": r["call_seq"],
+                            "cash_usd": r["cash_usd"],
+                            "occurred_at": r["occurred_at"],
+                        }
+                        for r in recs
+                    ]
+                    parent["usage"] = new_usage
+                return _RollupResult((inv_keys[-1] if inv_keys else None, len(inv_keys)))
+            return _RollupResult((None, 0))
+
+    class _DownOnlineCtx:
+        as_sql = False
+
+        @contextlib.contextmanager
+        def autocommit_block(self):
+            downgrade_steps.append("autocommit_enter")
+            try:
+                yield
+            finally:
+                downgrade_steps.append("autocommit_exit")
 
     def _exec_downgrade_sql(sql: Any) -> None:
         nonlocal attempts_dropped
         s = str(sql)
-        if "UPDATE dalton_llm_journal j" in s:
-            assert not attempts_dropped, "rollup MUST run before dropping attempts table"
-            assert "GREATEST(COALESCE(j.cash_usd, 0), agg.total_cash_usd)" in s
-            assert "GREATEST(COALESCE(j.notional_usd, 0), agg.total_notional_usd)" in s
-            assert "'per_call_usages', pca.per_call_usages" in s
-            assert "'attempt_details', agg.attempt_details" in s
-            downgrade_steps.append("rollup")
-            # Apply the exact rollup aggregation onto in-memory tables
-            by_inv: dict[str, list[dict[str, Any]]] = {}
-            for rec in store.attempts.values():
-                by_inv.setdefault(rec["invocation_id"], []).append(rec)
-            for j_inv, recs in by_inv.items():
-                recs.sort(key=lambda r: (r["attempt"], r["call_seq"]))
-                parent = store.rows[j_inv]
-                tot_cash = sum((Decimal(str(r["cash_usd"])) for r in recs), Decimal("0"))
-                tot_notional = sum((Decimal(str(r["notional_usd"])) for r in recs), Decimal("0"))
-                tot_unk = sum(int(r["unknown_usage_calls"]) for r in recs)
-                all_known = all(bool(r["usage_known"]) for r in recs) and tot_unk == 0
-                per_call: list[dict[str, Any]] = []
-                sums: dict[str, int] = {}
-                for r in recs:
-                    ru = r.get("usage") or {}
-                    if isinstance(ru.get("per_call_usages"), list) and ru["per_call_usages"]:
-                        per_call.extend(ru["per_call_usages"])
-                    elif any((ru.get(k) or 0) > 0 for k in ("input_tokens", "output_tokens", "total_tokens")):
-                        per_call.append(
-                            {k: ru[k] for k in ("input_tokens", "output_tokens", "total_tokens") if k in ru}
-                        )
-                    for k in ("input_tokens", "output_tokens", "total_tokens"):
-                        if isinstance(ru.get(k), (int, float)):
-                            sums[k] = sums.get(k, 0) + int(ru[k])
-                parent["cash_usd"] = max(Decimal(str(parent["cash_usd"])), tot_cash)
-                parent["notional_usd"] = max(Decimal(str(parent["notional_usd"])), tot_notional)
-                if parent["state"] != "done" and (tot_cash > 0 or tot_notional > 0 or tot_unk > 0):
-                    parent["state"] = "indeterminate"
-                new_usage = dict(parent.get("usage") or {})
-                new_usage.update(sums)
-                new_usage["per_call_usages"] = per_call
-                new_usage["usage_known"] = all_known
-                new_usage["unknown_usage_calls"] = tot_unk
-                new_usage["attempt_details"] = [
-                    {
-                        "attempt": r["attempt"],
-                        "call_seq": r["call_seq"],
-                        "cash_usd": r["cash_usd"],
-                        "occurred_at": r["occurred_at"],
-                    }
-                    for r in recs
-                ]
-                parent["usage"] = new_usage
-        elif "DROP TABLE IF EXISTS dalton_llm_journal_attempts" in s:
+        if "DROP TABLE IF EXISTS dalton_llm_journal_attempts" in s:
             downgrade_steps.append("drop")
             store.attempts.clear()
             attempts_dropped = True
 
+    monkeypatch.setattr(d044.op, "get_context", lambda: _DownOnlineCtx())
+    monkeypatch.setattr(d044.op, "get_bind", lambda: _RollupBind())
     monkeypatch.setattr(d044.op, "execute", _exec_downgrade_sql)
     d044.downgrade()
 
-    assert downgrade_steps == ["rollup", "drop"]
+    assert downgrade_steps == ["autocommit_enter", "rollup", "autocommit_exit", "drop"]
     assert attempts_dropped is True
     assert store.attempts == {}
 
@@ -3535,3 +3589,369 @@ async def test_unbilled_402_billing_muse_invalid_api_key_and_text_4xx_never_coun
     )
     setattr(err_mid_402, "status_code", 402)
     assert api_call_mod._is_unbilled_sdk_error(err_mid_402) is False
+
+
+# ---------------------------------------------------------------------------
+# Round 5 final fixes (3 narrow items from .agy/review_billing3_{carbon,codex}.md)
+# ---------------------------------------------------------------------------
+
+
+def test_d044_downgrade_batches_divergent_rollup_in_autocommit_then_drops_in_short_tx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 5 Item 1 (Carbon High / Codex Medium):
+    `d044.downgrade()` MUST:
+    1) Run rollup inside `ctx.autocommit_block()` in keyset batches of 1000 `invocation_id`s
+       (both online and offline `as_sql=True` with `DO $$ ... LOOP ... COMMIT; ... END $$`).
+    2) Filter UPDATE to only divergent rows (higher cash/notional/unknown calls, multi-row
+       attempts, or non-done rows needing escalation to indeterminate), skipping already-consistent
+       backfilled historical rows.
+    3) Exit `autocommit_block()` first, then execute `SET LOCAL lock_timeout = '5s'`,
+       `DROP CONSTRAINT`, and `DROP TABLE` in a separate short DDL transaction."""
+    import contextlib
+    from src.dalton.migrations.versions import d044_llm_journal_attempts as d044
+
+    # --- Part A: Online mode (`as_sql=False`) multi-batch keyset pagination + diff filter ---
+    online_events: list[str] = []
+    batch_params: list[dict[str, Any]] = []
+    batch_responses = [
+        ("lj1:1000", d044._BACKFILL_BATCH_SIZE),
+        ("lj1:2000", d044._BACKFILL_BATCH_SIZE),
+        ("lj1:2150", 150),
+    ]
+
+    class _FakeResult:
+        def __init__(self, row: tuple[Any, ...]) -> None:
+            self._row = row
+
+        def fetchone(self) -> tuple[Any, ...]:
+            return self._row
+
+    class _FakeBind:
+        def execute(self, stmt: Any, params: dict[str, Any] | None = None) -> _FakeResult:
+            s = str(stmt)
+            if "SELECT to_regclass('dalton_llm_journal_attempts')" in s:
+                online_events.append("check_regclass")
+                return _FakeResult(("dalton_llm_journal_attempts",))
+            if "UPDATE dalton_llm_journal j" in s:
+                assert "SELECT DISTINCT a.invocation_id" in s
+                assert "WHERE a.invocation_id > :last_id" in s
+                assert "LIMIT :batch_size" in s
+                # Diff filter skips consistent backfilled historical rows
+                assert "agg.total_cash_usd > COALESCE(j.cash_usd, 0)" in s
+                assert "agg.total_notional_usd > COALESCE(j.notional_usd, 0)" in s
+                assert "agg.total_unknown_calls >" in s
+                assert "agg.attempt_row_count > 1" in s
+                assert "j.state NOT IN ('done', 'indeterminate')" in s
+                online_events.append("rollup_batch")
+                batch_params.append(dict(params or {}))
+                return _FakeResult(batch_responses[len(batch_params) - 1])
+            online_events.append(f"conn:{s.strip()}")
+            return _FakeResult((None, 0))
+
+    class _OnlineCtx:
+        as_sql = False
+
+        @contextlib.contextmanager
+        def autocommit_block(self):
+            online_events.append("ac_enter")
+            try:
+                yield
+            finally:
+                online_events.append("ac_exit")
+
+    def _rec_op(sql: Any) -> None:
+        s = str(sql).strip()
+        if "SET LOCAL lock_timeout = '5s'" in s:
+            online_events.append("ddl_lock_timeout")
+        elif "DROP CONSTRAINT IF EXISTS fk_dalton_llm_journal_attempts_invocation" in s:
+            online_events.append("drop_fk")
+        elif "DROP TABLE IF EXISTS dalton_llm_journal_attempts CASCADE" in s:
+            online_events.append("drop_table")
+        else:
+            online_events.append(f"op:{s}")
+
+    monkeypatch.setattr(d044.op, "get_context", lambda: _OnlineCtx())
+    monkeypatch.setattr(d044.op, "get_bind", lambda: _FakeBind())
+    monkeypatch.setattr(d044.op, "execute", _rec_op)
+    d044.downgrade()
+
+    ac_enter = online_events.index("ac_enter")
+    ac_exit = online_events.index("ac_exit")
+    batch_idxs = [i for i, e in enumerate(online_events) if e == "rollup_batch"]
+    assert len(batch_idxs) == 3
+    assert all(ac_enter < i < ac_exit for i in batch_idxs)
+    assert batch_params == [
+        {"last_id": "", "batch_size": 1000},
+        {"last_id": "lj1:1000", "batch_size": 1000},
+        {"last_id": "lj1:2000", "batch_size": 1000},
+    ]
+    assert "conn:SET lock_timeout = '5s'" in online_events
+    assert "conn:SET lock_timeout = '0'" in online_events
+    # Drop DDL runs strictly AFTER exiting autocommit_block() in its own short transaction
+    ddl_lt = online_events.index("ddl_lock_timeout")
+    drop_fk = online_events.index("drop_fk")
+    drop_tbl = online_events.index("drop_table")
+    assert ac_exit < ddl_lt < drop_fk < drop_tbl
+
+    # --- Part B: Offline mode (`as_sql=True`) emits batched DO $$ ... COMMIT loop + short drop ---
+    offline_stmts: list[str] = []
+
+    class _OfflineCtx:
+        as_sql = True
+
+        @contextlib.contextmanager
+        def autocommit_block(self):
+            offline_stmts.append("-- AC_ENTER")
+            try:
+                yield
+            finally:
+                offline_stmts.append("-- AC_EXIT")
+
+    monkeypatch.setattr(d044.op, "get_context", lambda: _OfflineCtx())
+    monkeypatch.setattr(d044.op, "execute", lambda sql: offline_stmts.append(str(sql)))
+    d044.downgrade()
+
+    joined_off = "\n".join(offline_stmts)
+    off_enter = joined_off.index("-- AC_ENTER")
+    off_do = joined_off.index("DO $$")
+    off_commit = joined_off.index("COMMIT;")
+    off_exit = joined_off.index("-- AC_EXIT")
+    off_local_lt = joined_off.index("SET LOCAL lock_timeout = '5s'")
+    off_drop_fk = joined_off.index("DROP CONSTRAINT IF EXISTS fk_dalton_llm_journal_attempts_invocation")
+    off_drop_tbl = joined_off.index("DROP TABLE IF EXISTS dalton_llm_journal_attempts CASCADE")
+    assert off_enter < off_do < off_commit < off_exit < off_local_lt < off_drop_fk < off_drop_tbl
+    assert "agg.total_cash_usd > COALESCE(j.cash_usd, 0)" in joined_off
+    assert "agg.attempt_row_count > 1" in joined_off
+    assert f"LIMIT {d044._BACKFILL_BATCH_SIZE}" in joined_off
+
+    # --- Part C: Verify diff filter semantics skip consistent historical rows and update diffs ---
+    def _would_update_parent(parent: dict[str, Any], recs: list[dict[str, Any]]) -> bool:
+        tot_cash = sum((Decimal(str(r["cash_usd"])) for r in recs), Decimal("0"))
+        tot_notional = sum((Decimal(str(r["notional_usd"])) for r in recs), Decimal("0"))
+        tot_unk = sum(int(r["unknown_usage_calls"]) for r in recs)
+        has_billed = any(r["outcome"] in ("done", "indeterminate") for r in recs)
+        p_usage = parent.get("usage") or {}
+        if isinstance(p_usage.get("unknown_usage_calls"), int):
+            p_unk = int(p_usage["unknown_usage_calls"])
+        elif parent["state"] == "indeterminate" and (
+            p_usage.get("usage_known") is False
+            or (
+                p_usage.get("usage_known") is not True
+                and Decimal(str(parent.get("cash_usd") or "0")) <= 0
+                and Decimal(str(parent.get("notional_usd") or "0")) <= 0
+            )
+        ):
+            p_unk = 1
+        else:
+            p_unk = 0
+        return (
+            tot_cash > Decimal(str(parent.get("cash_usd") or "0"))
+            or tot_notional > Decimal(str(parent.get("notional_usd") or "0"))
+            or tot_unk > p_unk
+            or len(recs) > 1
+            or (
+                parent["state"] not in ("done", "indeterminate")
+                and (tot_cash > 0 or tot_notional > 0 or tot_unk > 0 or has_billed)
+            )
+        )
+
+    # Consistent single-row backfilled done row -> SKIPPED
+    assert (
+        _would_update_parent(
+            {"state": "done", "cash_usd": Decimal("0.05"), "notional_usd": Decimal("0"), "usage": {"input_tokens": 1000}},
+            [{"outcome": "done", "cash_usd": Decimal("0.05"), "notional_usd": Decimal("0"), "unknown_usage_calls": 0}],
+        )
+        is False
+    )
+    # Consistent single-row backfilled unknown-usage indeterminate row -> SKIPPED
+    assert (
+        _would_update_parent(
+            {"state": "indeterminate", "cash_usd": Decimal("0"), "notional_usd": Decimal("0"), "usage": None},
+            [{"outcome": "indeterminate", "cash_usd": Decimal("0"), "notional_usd": Decimal("0"), "unknown_usage_calls": 1}],
+        )
+        is False
+    )
+    # Divergent rows -> UPDATED
+    assert (
+        _would_update_parent(
+            {"state": "done", "cash_usd": Decimal("0.05"), "notional_usd": Decimal("0"), "usage": {}},
+            [{"outcome": "done", "cash_usd": Decimal("0.09"), "notional_usd": Decimal("0"), "unknown_usage_calls": 0}],
+        )
+        is True
+    )
+    assert (
+        _would_update_parent(
+            {"state": "done", "cash_usd": Decimal("0.05"), "notional_usd": Decimal("0"), "usage": {}},
+            [
+                {"outcome": "indeterminate", "cash_usd": Decimal("0.02"), "notional_usd": Decimal("0"), "unknown_usage_calls": 0},
+                {"outcome": "done", "cash_usd": Decimal("0.03"), "notional_usd": Decimal("0"), "unknown_usage_calls": 0},
+            ],
+        )
+        is True
+    )
+    assert (
+        _would_update_parent(
+            {"state": "pending", "cash_usd": Decimal("0"), "notional_usd": Decimal("0"), "usage": None},
+            [{"outcome": "indeterminate", "cash_usd": Decimal("0.02"), "notional_usd": Decimal("0"), "unknown_usage_calls": 0}],
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("err_kind", ["value_error", "validation_error"])
+async def test_fallback_pre_send_client_value_or_validation_error_does_not_retry_and_allows_assist_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    err_kind: str,
+) -> None:
+    """Round 5 Item 2 (Carbon Medium):
+    When `llm.ainvoke(messages)` itself raises a client-side pre-send `ValueError` or
+    `pydantic.ValidationError` WITHOUT usage:
+    1) `make_api_call` fallback loop MUST NOT treat it as an output parsing failure or retry
+       `max_parsing_retries` times; it re-raises immediately after 1 call with 0 sleep.
+    2) `dalton_complete` sees all `call_records` are `unbilled_error`, `not has_usage`,
+       `unknown_usage_calls == 0`, so parent `state` is `'failed'` (NOT `'indeterminate'`)
+       and `error_kind == 'pre_send'`.
+    3) `assist_json` treats this as safe to fall back (`_is_safe_to_fallback(res) is True`)
+       and successfully switches to its fallback model."""
+    from pydantic import ValidationError
+    from src.dalton.llm import assist as assist_mod
+
+    store = _InMemoryJournalStore()
+    _wire_journal_and_budget(monkeypatch, store)
+
+    def _make_client_err() -> BaseException:
+        if err_kind == "value_error":
+            return ValueError("Unsupported content block type in request payload")
+        try:
+            _VerdictSchema.model_validate({"verdict": 123})
+        except ValidationError as ve:
+            return ve
+        raise AssertionError("unreachable")
+
+    # 1. `dalton_complete` with Pydantic `response_schema`: fallback `llm.ainvoke` raises pre-send error
+    sleep_mock = create_autospec(_REAL_ASYNCIO_SLEEP, return_value=None)
+    monkeypatch.setattr(api_call_mod.asyncio, "sleep", sleep_mock)
+
+    chat_model = _SequencedChatModel([_make_client_err()])
+    svc = _make_real_llm_service(
+        monkeypatch, chat_model=chat_model, model_key="grok-4.7", max_parsing_retries=5
+    )
+    res = await dalton_complete(
+        svc,
+        user_id="u1",
+        user_prompt="check client error",
+        scope_ref=f"review:r5-client-{err_kind}",
+        purpose="publish.review",
+        request_model="grok-4.7",
+        response_schema=_VerdictSchema,
+    )
+
+    assert chat_model.ainvoke_calls == 1  # MUST NOT retry 5 times!
+    sleep_mock.assert_not_awaited()
+    assert res.ok is False
+    assert res.status == "failed"
+    assert res.error_kind == "pre_send"
+    assert res.cash_usd == 0.0
+    assert store.rows[res.invocation_id]["state"] == "failed"
+    assert store.attempts[(res.invocation_id, 1, 1)]["outcome"] == "failed"
+    assert store.attempts[(res.invocation_id, 1, 1)]["unknown_usage_calls"] == 0
+    assert store.attempts[(res.invocation_id, 1, 1)]["usage_known"] is True
+    assert assist_mod._is_safe_to_fallback(res) is True
+
+    # 2. End-to-end `assist_json` switches cleanly to fallback model when primary hits pre-send error
+    primary_model = _SequencedChatModel([_make_client_err()])
+    u_fb = {"input_tokens": 5_000, "output_tokens": 120}
+    fallback_model = _SequencedChatModel(
+        [_ai_msg('{"verdict": "pass", "reason": "from fallback"}', **u_fb)]
+    )
+
+    async def _resolve_by_model(*_args: Any, **kwargs: Any) -> Any:
+        req_m = kwargs.get("request_model") or "grok-4.7"
+        client = primary_model if req_m == "grok-4.7" else fallback_model
+        return SimpleNamespace(
+            llm_client=client,
+            llm=SimpleNamespace(background=req_m, name=req_m),
+            credential_source=CredentialSource.PLATFORM,
+        )
+
+    def _create_by_model(model_name: str, **_kwargs: Any) -> Any:
+        return primary_model if model_name == "grok-4.7" else fallback_model
+
+    monkeypatch.setattr(
+        llm_svc_mod,
+        "resolve_llm_config",
+        create_autospec(_REAL_RESOLVE_LLM_CONFIG, side_effect=_resolve_by_model),
+    )
+    monkeypatch.setattr(
+        llm_svc_mod,
+        "create_llm",
+        create_autospec(_REAL_CREATE_LLM, side_effect=_create_by_model),
+    )
+    multi_svc = llm_svc_mod.LLMService(
+        agent_config=SimpleNamespace(llm=SimpleNamespace(background="grok-4.7", name="grok-4.7"))
+    )
+
+    assist_res = await assist_mod.assist_json(
+        task=f"test_pre_send_{err_kind}",
+        instructions="Return JSON verdict",
+        payload={"doc": "sample"},
+        schema={
+            "type": "object",
+            "properties": {"verdict": {"type": "string"}, "reason": {"type": "string"}},
+            "required": ["verdict", "reason"],
+        },
+        user_id="u1",
+        model="grok-4.7",
+        fallback_models=["gpt-6.1-terra"],
+        llm_service=multi_svc,
+        scope_ref=f"assist:r5-fallback-{err_kind}",
+    )
+
+    assert primary_model.ainvoke_calls == 1
+    assert fallback_model.ainvoke_calls == 1
+    assert assist_res.ok is True
+    assert assist_res.model == "gpt-6.1-terra"
+    assert assist_res.data == {"verdict": "pass", "reason": "from fallback"}
+
+
+def test_api_call_billing_additions_all_have_dalton_hook_within_25_lines() -> None:
+    """Round 5 Item 3 (Codex Medium):
+    Every billing-added region in upstream `src/llms/api_call.py` (including `_track_upstream_call`
+    and all billing helpers/fallback branches) MUST stay within 25 lines of a
+    `DALTON-HOOK(complete-parse-failure-billing)` marker."""
+    from pathlib import Path
+    import inspect
+
+    api_call_path = Path(inspect.getsourcefile(api_call_mod) or "")
+    lines = api_call_path.read_text(encoding="utf-8").splitlines()
+    billing_hook_lines = [
+        idx + 1
+        for idx, line in enumerate(lines)
+        if "DALTON-HOOK(complete-parse-failure-billing)" in line
+    ]
+    assert billing_hook_lines, "expected DALTON-HOOK(complete-parse-failure-billing) markers in api_call.py"
+
+    # All Dalton billing helper definitions added between StructuredOutputParseError and create_messages
+    start_line = next(i + 1 for i, l in enumerate(lines) if l.startswith("class StructuredOutputParseError"))
+    end_line = next(i + 1 for i, l in enumerate(lines) if l.startswith("def create_messages(")) - 1
+    assert end_line > start_line
+
+    violations: list[tuple[int, int, str]] = []
+    for ln in range(start_line, end_line + 1):
+        if not lines[ln - 1].strip():
+            continue
+        dist = min(abs(ln - h) for h in billing_hook_lines)
+        if dist > 25:
+            violations.append((ln, dist, lines[ln - 1].strip()[:60]))
+    assert violations == [], f"Lines >25 lines from DALTON-HOOK(complete-parse-failure-billing): {violations}"
+
+    # Also verify `_track_upstream_call` specifically (flagged in Codex review)
+    track_lines, track_start = inspect.getsourcelines(api_call_mod._track_upstream_call)
+    for offset in range(len(track_lines)):
+        ln = track_start + offset
+        if not track_lines[offset].strip():
+            continue
+        dist = min(abs(ln - h) for h in billing_hook_lines)
+        assert dist <= 25, f"_track_upstream_call line {ln} is {dist} lines from nearest billing hook"

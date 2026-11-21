@@ -272,11 +272,66 @@ BEGIN
 END $$
 """
 
-_DOWNGRADE_ROLLUP_SQL = """
-DO $$
-BEGIN
-    IF to_regclass('dalton_llm_journal_attempts') IS NOT NULL THEN
-        WITH attempt_calls AS (
+_DOWNGRADE_PARENT_UNKNOWN_EXPR = """
+COALESCE(
+    CASE
+        WHEN (j.usage->>'unknown_usage_calls') ~ '^[0-9]+$'
+            THEN (j.usage->>'unknown_usage_calls')::int
+        WHEN j.state = 'indeterminate' AND (
+            j.usage->>'usage_known' = 'false'
+            OR (
+                j.usage->>'usage_known' IS DISTINCT FROM 'true'
+                AND COALESCE(j.cash_usd, 0) <= 0
+                AND COALESCE(j.notional_usd, 0) <= 0
+                AND COALESCE(
+                    CASE WHEN (j.usage->>'input_tokens') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (j.usage->>'input_tokens')::numeric ELSE 0 END,
+                    0
+                ) <= 0
+                AND COALESCE(
+                    CASE WHEN (j.usage->>'output_tokens') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (j.usage->>'output_tokens')::numeric ELSE 0 END,
+                    0
+                ) <= 0
+                AND COALESCE(
+                    CASE WHEN (j.usage->>'total_tokens') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (j.usage->>'total_tokens')::numeric ELSE 0 END,
+                    0
+                ) <= 0
+            )
+        ) THEN 1
+        ELSE 0
+    END,
+    0
+)
+""".strip()
+
+_DOWNGRADE_DIFF_FILTER_EXPR = f"""
+(
+    agg.total_cash_usd > COALESCE(j.cash_usd, 0)
+    OR agg.total_notional_usd > COALESCE(j.notional_usd, 0)
+    OR agg.total_unknown_calls > {_DOWNGRADE_PARENT_UNKNOWN_EXPR}
+    OR agg.attempt_row_count > 1
+    OR (
+        j.state NOT IN ('done', 'indeterminate')
+        AND (
+            agg.total_cash_usd > 0
+            OR agg.total_notional_usd > 0
+            OR agg.total_unknown_calls > 0
+            OR agg.has_billed_outcome
+        )
+    )
+)
+""".strip()
+
+
+def _build_downgrade_rollup_ctes(last_id_expr: str, limit_expr: str) -> str:
+    return f"""
+        WITH batch_ids AS (
+            SELECT DISTINCT a.invocation_id
+            FROM dalton_llm_journal_attempts a
+            WHERE a.invocation_id > {last_id_expr}
+            ORDER BY a.invocation_id
+            LIMIT {limit_expr}
+        ),
+        attempt_calls AS (
             SELECT
                 a.invocation_id,
                 a.attempt,
@@ -318,6 +373,7 @@ BEGIN
                     ELSE '[]'::jsonb
                 END AS extracted_calls
             FROM dalton_llm_journal_attempts a
+            JOIN batch_ids b ON b.invocation_id = a.invocation_id
         ),
         per_call_agg AS (
             SELECT
@@ -330,6 +386,7 @@ BEGIN
         agg AS (
             SELECT
                 ac.invocation_id,
+                COUNT(*) AS attempt_row_count,
                 COALESCE(SUM(ac.cash_usd), 0) AS total_cash_usd,
                 COALESCE(SUM(ac.notional_usd), 0) AS total_notional_usd,
                 COALESCE(SUM(ac.unknown_usage_calls), 0) AS total_unknown_calls,
@@ -361,52 +418,82 @@ BEGIN
                 ) AS attempt_details
             FROM attempt_calls ac
             GROUP BY ac.invocation_id
+        ),
+        updated AS (
+            UPDATE dalton_llm_journal j
+            SET cash_usd = GREATEST(COALESCE(j.cash_usd, 0), agg.total_cash_usd),
+                notional_usd = GREATEST(COALESCE(j.notional_usd, 0), agg.total_notional_usd),
+                state = CASE
+                    WHEN j.state = 'done' THEN 'done'
+                    WHEN agg.total_cash_usd > 0
+                         OR agg.total_notional_usd > 0
+                         OR agg.total_unknown_calls > 0
+                         OR agg.has_billed_outcome
+                    THEN 'indeterminate'
+                    ELSE j.state
+                END,
+                completed_at = CASE
+                    WHEN j.completed_at IS NOT NULL THEN j.completed_at
+                    WHEN agg.total_cash_usd > 0
+                         OR agg.total_notional_usd > 0
+                         OR agg.total_unknown_calls > 0
+                         OR agg.has_billed_outcome
+                    THEN NOW()
+                    ELSE j.completed_at
+                END,
+                usage = COALESCE(j.usage, '{{}}'::jsonb)
+                    || jsonb_strip_nulls(jsonb_build_object(
+                        'input_tokens', CASE WHEN agg.sum_input_tokens > 0 THEN agg.sum_input_tokens END,
+                        'output_tokens', CASE WHEN agg.sum_output_tokens > 0 THEN agg.sum_output_tokens END,
+                        'total_tokens', CASE WHEN GREATEST(agg.sum_total_tokens, agg.sum_input_tokens + agg.sum_output_tokens) > 0 THEN GREATEST(agg.sum_total_tokens, agg.sum_input_tokens + agg.sum_output_tokens) END,
+                        'cached_tokens', CASE WHEN agg.sum_cached_tokens > 0 THEN agg.sum_cached_tokens END,
+                        'cache_5m_tokens', CASE WHEN agg.sum_cache_5m_tokens > 0 THEN agg.sum_cache_5m_tokens END,
+                        'cache_1h_tokens', CASE WHEN agg.sum_cache_1h_tokens > 0 THEN agg.sum_cache_1h_tokens END,
+                        'reasoning_tokens', CASE WHEN agg.sum_reasoning_tokens > 0 THEN agg.sum_reasoning_tokens END,
+                        'audio_input_tokens', CASE WHEN agg.sum_audio_input_tokens > 0 THEN agg.sum_audio_input_tokens END,
+                        'audio_output_tokens', CASE WHEN agg.sum_audio_output_tokens > 0 THEN agg.sum_audio_output_tokens END,
+                        'per_call_usages', pca.per_call_usages
+                    ))
+                    || jsonb_build_object(
+                        'usage_known', (agg.all_usage_known AND agg.total_unknown_calls = 0),
+                        'unknown_usage_calls', agg.total_unknown_calls,
+                        'attempt_details', agg.attempt_details
+                    )
+            FROM agg
+            LEFT JOIN per_call_agg pca ON pca.invocation_id = agg.invocation_id
+            WHERE j.invocation_id = agg.invocation_id
+              AND {_DOWNGRADE_DIFF_FILTER_EXPR}
+            RETURNING j.invocation_id
         )
-        UPDATE dalton_llm_journal j
-        SET cash_usd = GREATEST(COALESCE(j.cash_usd, 0), agg.total_cash_usd),
-            notional_usd = GREATEST(COALESCE(j.notional_usd, 0), agg.total_notional_usd),
-            state = CASE
-                WHEN j.state = 'done' THEN 'done'
-                WHEN agg.total_cash_usd > 0
-                     OR agg.total_notional_usd > 0
-                     OR agg.total_unknown_calls > 0
-                     OR agg.has_billed_outcome
-                THEN 'indeterminate'
-                ELSE j.state
-            END,
-            completed_at = CASE
-                WHEN j.completed_at IS NOT NULL THEN j.completed_at
-                WHEN agg.total_cash_usd > 0
-                     OR agg.total_notional_usd > 0
-                     OR agg.total_unknown_calls > 0
-                     OR agg.has_billed_outcome
-                THEN NOW()
-                ELSE j.completed_at
-            END,
-            usage = COALESCE(j.usage, '{}'::jsonb)
-                || jsonb_strip_nulls(jsonb_build_object(
-                    'input_tokens', CASE WHEN agg.sum_input_tokens > 0 THEN agg.sum_input_tokens END,
-                    'output_tokens', CASE WHEN agg.sum_output_tokens > 0 THEN agg.sum_output_tokens END,
-                    'total_tokens', CASE WHEN GREATEST(agg.sum_total_tokens, agg.sum_input_tokens + agg.sum_output_tokens) > 0 THEN GREATEST(agg.sum_total_tokens, agg.sum_input_tokens + agg.sum_output_tokens) END,
-                    'cached_tokens', CASE WHEN agg.sum_cached_tokens > 0 THEN agg.sum_cached_tokens END,
-                    'cache_5m_tokens', CASE WHEN agg.sum_cache_5m_tokens > 0 THEN agg.sum_cache_5m_tokens END,
-                    'cache_1h_tokens', CASE WHEN agg.sum_cache_1h_tokens > 0 THEN agg.sum_cache_1h_tokens END,
-                    'reasoning_tokens', CASE WHEN agg.sum_reasoning_tokens > 0 THEN agg.sum_reasoning_tokens END,
-                    'audio_input_tokens', CASE WHEN agg.sum_audio_input_tokens > 0 THEN agg.sum_audio_input_tokens END,
-                    'audio_output_tokens', CASE WHEN agg.sum_audio_output_tokens > 0 THEN agg.sum_audio_output_tokens END,
-                    'per_call_usages', pca.per_call_usages
-                ))
-                || jsonb_build_object(
-                    'usage_known', (agg.all_usage_known AND agg.total_unknown_calls = 0),
-                    'unknown_usage_calls', agg.total_unknown_calls,
-                    'attempt_details', agg.attempt_details
-                )
-        FROM agg
-        LEFT JOIN per_call_agg pca ON pca.invocation_id = agg.invocation_id
-        WHERE j.invocation_id = agg.invocation_id;
+    """.strip()
+
+
+_ONLINE_DOWNGRADE_ROLLUP_BATCH_SQL = f"""
+{_build_downgrade_rollup_ctes(':last_id', ':batch_size')}
+SELECT MAX(invocation_id) AS last_id, COUNT(*) AS scanned
+FROM batch_ids
+""".strip()
+
+_OFFLINE_BATCHED_DOWNGRADE_ROLLUP_SQL = f"""
+DO $$
+DECLARE
+    v_last_id TEXT := '';
+    v_scanned INT := 0;
+BEGIN
+    IF to_regclass('dalton_llm_journal_attempts') IS NOT NULL THEN
+        LOOP
+            {_build_downgrade_rollup_ctes('v_last_id', str(_BACKFILL_BATCH_SIZE))}
+            SELECT MAX(invocation_id), COUNT(*)
+            INTO v_last_id, v_scanned
+            FROM batch_ids;
+
+            COMMIT;
+
+            EXIT WHEN v_scanned < {_BACKFILL_BATCH_SIZE} OR v_last_id IS NULL;
+        END LOOP;
     END IF;
 END $$
-"""
+""".strip()
 
 
 _CREATE_INDEX_USER_OCCURRED_SQL = """
@@ -516,10 +603,44 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Phase 1 (autocommit): roll up only divergent rows (higher attempt totals/unknown calls,
+    # multi-row attempts, or non-done rows needing escalation to indeterminate) in bounded
+    # keyset batches of 1000 `invocation_id`s, committing each batch independently so row locks
+    # on `dalton_llm_journal` are released before Phase 2 acquires DDL locks.
+    ctx = op.get_context()
+    with ctx.autocommit_block():
+        if getattr(ctx, "as_sql", False):
+            op.execute("SET lock_timeout = '5s'")
+            op.execute(_OFFLINE_BATCHED_DOWNGRADE_ROLLUP_SQL)
+            op.execute("SET lock_timeout = '0'")
+        else:
+            conn = op.get_bind()
+            conn.execute(sa.text("SET lock_timeout = '5s'"))
+            try:
+                exists_row = conn.execute(
+                    sa.text("SELECT to_regclass('dalton_llm_journal_attempts')")
+                ).fetchone()
+                if exists_row and exists_row[0] is not None:
+                    last_id = ""
+                    stmt = sa.text(_ONLINE_DOWNGRADE_ROLLUP_BATCH_SQL)
+                    while True:
+                        res = conn.execute(
+                            stmt,
+                            {"last_id": last_id, "batch_size": _BACKFILL_BATCH_SIZE},
+                        )
+                        row = res.fetchone()
+                        if not row:
+                            break
+                        next_last_id, scanned = row[0], int(row[1] or 0)
+                        if scanned < _BACKFILL_BATCH_SIZE or not next_last_id:
+                            break
+                        last_id = str(next_last_id)
+            finally:
+                conn.execute(sa.text("SET lock_timeout = '0'"))
+
+    # Phase 2 (separate short DDL transaction): drop FK and table only after all rollup batches
+    # have committed, avoiding same-transaction ROW EXCLUSIVE -> ACCESS EXCLUSIVE lock upgrade.
     op.execute("SET LOCAL lock_timeout = '5s'")
-    # Roll up per-request attempt billing, token usage, per_call_usages, and attempt_details
-    # back into `dalton_llm_journal` (the table d043 reads) BEFORE dropping the attempts table.
-    op.execute(_DOWNGRADE_ROLLUP_SQL)
     op.execute(
         "ALTER TABLE IF EXISTS dalton_llm_journal_attempts "
         "DROP CONSTRAINT IF EXISTS fk_dalton_llm_journal_attempts_invocation"

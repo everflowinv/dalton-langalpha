@@ -1635,14 +1635,27 @@ async def _dalton_complete_impl(
             # explicitly unbilled provider rejection (e.g. xAI 402 pre-stream) has
             # `traced_unknown_calls == 0`.
             attempt_unknown_calls = traced_unknown_calls
+            raw_records = getattr(collected_usages, "call_records", None)
+            all_records_unbilled = (
+                isinstance(raw_records, list)
+                and bool(raw_records)
+                and all(
+                    isinstance(r, dict) and r.get("outcome") == "unbilled_error"
+                    for r in raw_records
+                )
+            )
             if (
                 not llm_call_completed
                 and not has_usage
                 and attempt_unknown_calls == 0
-                and tracking_active
-                and sent_calls == 0
+                and (
+                    (tracking_active and sent_calls == 0)
+                    or all_records_unbilled
+                )
             ):
                 target_state = "failed"
+                if all_records_unbilled and error_kind == "parse_error":
+                    error_kind = "pre_send"
         elif not llm_call_entered:
             attempt_unknown_calls = 0
             if not has_usage:

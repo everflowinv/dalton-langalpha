@@ -57,6 +57,7 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# DALTON-HOOK(complete-parse-failure-billing): per-request usage bucket with timing and unknown-call counters.
 class _ApiCallUsageBucket(list):
     """List of collected per-call provider usage dicts with per-request timing and unknown-call tracking."""
 
@@ -88,6 +89,7 @@ _REPORTED_TOKEN_KEYS = (
 )
 
 
+# DALTON-HOOK(complete-parse-failure-billing): opt-in context manager and pre-send tracking activation.
 @contextlib.contextmanager
 def collect_api_call_usage(
     *,
@@ -145,6 +147,7 @@ def _normalize_raw_provider_usage(raw: Any) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         return {}
 
+    # DALTON-HOOK(complete-parse-failure-billing): normalize input/output/total token fields across SDKs.
     out: Dict[str, Any] = {}
     in_tok = _nonneg_num(raw.get("input_tokens"))
     if in_tok is None:
@@ -171,7 +174,7 @@ def _normalize_raw_provider_usage(raw: Any) -> Dict[str, Any]:
     elif (in_tok or 0) > 0 or (out_tok or 0) > 0:
         out["total_tokens"] = (in_tok or 0) + (out_tok or 0)
 
-    # Cached input tokens across OpenAI Responses, Chat Completions, LangChain, Anthropic, Gemini
+    # DALTON-HOOK(complete-parse-failure-billing): normalize cached input tokens across provider formats.
     cached = _positive_num(raw.get("cached_tokens"))
     for details_key, sub_key in (
         ("input_tokens_details", "cached_tokens"),
@@ -190,7 +193,7 @@ def _normalize_raw_provider_usage(raw: Any) -> Dict[str, Any]:
     if cached is not None:
         out["cached_tokens"] = cached
 
-    # Cache creation tokens (Anthropic / LangChain)
+    # DALTON-HOOK(complete-parse-failure-billing): normalize cache-creation, reasoning, and audio tokens.
     cache_5m = _positive_num(raw.get("cache_5m_tokens"))
     cache_1h = _positive_num(raw.get("cache_1h_tokens"))
     cc = raw.get("cache_creation")
@@ -221,6 +224,7 @@ def _normalize_raw_provider_usage(raw: Any) -> Dict[str, Any]:
     if reasoning is not None:
         out["reasoning_tokens"] = reasoning
 
+    # DALTON-HOOK(complete-parse-failure-billing): normalize audio tokens and require positive reported usage.
     for details_key, sub_key, dest_key in (
         ("prompt_tokens_details", "audio_tokens", "audio_input_tokens"),
         ("completion_tokens_details", "audio_tokens", "audio_output_tokens"),
@@ -258,6 +262,7 @@ def _extract_usage_from_sdk_exception(exc: BaseException) -> Dict[str, Any]:
             if cand:
                 return cand
 
+    # DALTON-HOOK(complete-parse-failure-billing): recover usage from attached HTTP/SDK response body.
     resp = getattr(exc, "response", None)
     if resp is not None:
         if hasattr(resp, "usage_metadata") or hasattr(resp, "response_metadata"):
@@ -324,6 +329,7 @@ def _extract_structured_err_code(exc: BaseException) -> Optional[str]:
     return None
 
 
+# DALTON-HOOK(complete-parse-failure-billing): classify deterministic client/pre-billing SDK errors.
 def _is_unbilled_sdk_error(exc: BaseException) -> bool:
     """Return True for client-side/pre-billing rejections that never incur upstream charges."""
     if _exc_stream_started(exc):
@@ -341,6 +347,7 @@ def _is_unbilled_sdk_error(exc: BaseException) -> bool:
     cls_name = exc.__class__.__name__
     if cls_name in ("MissingProviderKeyError", "ProviderDisabledError", "ValueError"):
         return True
+    # DALTON-HOOK(complete-parse-failure-billing): match pre-send/billing/4xx text markers when no status_code is set.
     msg_lower = str(exc).lower()
     if any(
         token in msg_lower
@@ -371,6 +378,7 @@ def _is_unbilled_sdk_error(exc: BaseException) -> bool:
     return False
 
 
+# DALTON-HOOK(complete-parse-failure-billing): record completed call usage into the active bucket and call record.
 def _record_collected_usage(
     token_info: Any,
     *,
@@ -393,11 +401,14 @@ def _record_collected_usage(
             bucket.append(numeric)
 
 
+# DALTON-HOOK(complete-parse-failure-billing): track each upstream ainvoke call's send timestamp and outcome.
 @contextlib.contextmanager
-def _track_upstream_call():
+def _track_upstream_call(*, treat_empty_validation_error_as_unbilled: bool = False):
     """Track an active upstream `ainvoke` call, timestamping when it is sent so cross-day
     attribution uses send time and timeouts during retry backoff sleep are distinguished from
     in-flight provider requests."""
+    from pydantic import ValidationError
+
     bucket = _USAGE_ACCUMULATOR.get()
     sent_at = _utc_now()
     record: Dict[str, Any] = {
@@ -416,6 +427,7 @@ def _track_upstream_call():
     try:
         yield capture
     except BaseException as exc:
+        # DALTON-HOOK(complete-parse-failure-billing): recover usage from this request's own exception or classify unbilled vs unknown.
         extracted: Dict[str, Any] = {}
         if isinstance(exc, Exception):
             extracted = _extract_usage_from_sdk_exception(exc)
@@ -432,12 +444,17 @@ def _track_upstream_call():
         if not extracted:
             is_unbilled = False
             if not isinstance(exc, (asyncio.CancelledError, TimeoutError)):
-                is_unbilled = _is_unbilled_sdk_error(exc)
+                is_unbilled = _is_unbilled_sdk_error(exc) or (
+                    treat_empty_validation_error_as_unbilled
+                    and isinstance(exc, ValidationError)
+                    and not _exc_stream_started(exc)
+                )
                 if not is_unbilled and bucket is not None and callable(bucket.is_unbilled_error):
                     try:
                         is_unbilled = bool(bucket.is_unbilled_error(exc))
                     except Exception:
                         is_unbilled = False
+            # DALTON-HOOK(complete-parse-failure-billing): stamp unbilled_error vs unknown_error on this call record.
             if is_unbilled:
                 record["outcome"] = "unbilled_error"
                 record["usage_known"] = True
@@ -538,7 +555,7 @@ async def make_api_call(
         # Case 1: No schema requested, return raw content
         if response_schema is None:
             # DALTON-HOOK(complete-parse-failure-billing): track active upstream call for accurate unknown-usage accounting.
-            with _track_upstream_call() as raw_capture:
+            with _track_upstream_call(treat_empty_validation_error_as_unbilled=True) as raw_capture:
                 response = await llm.ainvoke(messages)
             content = get_message_content(response)
 
@@ -592,6 +609,7 @@ async def make_api_call(
                     native_failed = True
             else:
                 # Fallback to direct response if include_raw didn't work
+                # DALTON-HOOK(complete-parse-failure-billing): track direct structured-output upstream call.
                 client = llm.with_structured_output(response_schema)
                 with _track_upstream_call() as direct_capture:
                     native_captures.append(direct_capture)
@@ -632,11 +650,54 @@ async def make_api_call(
         for attempt in range(max_parsing_retries):
             retry_count = attempt + 1
             fb_capture: Dict[str, Any] = {"usage": {}}
+            # DALTON-HOOK(complete-parse-failure-billing): isolate `llm.ainvoke` from response parsing so
+            # pre-send client ValueError/ValidationError (without usage) re-raises immediately instead of
+            # entering parsing retries; only billed SDK parse errors (with recovered usage) retry.
             try:
-                # Get response from LLM
-                # DALTON-HOOK(complete-parse-failure-billing): track active upstream fallback call.
-                with _track_upstream_call() as fb_capture:
+                with _track_upstream_call(treat_empty_validation_error_as_unbilled=True) as fb_capture:
                     response = await llm.ainvoke(messages)
+            except (json.JSONDecodeError, ValidationError, ValueError) as invoke_parse_err:
+                if fb_capture.get("usage"):
+                    for key, value in fb_capture["usage"].items():
+                        total_token_info[key] = total_token_info.get(key, 0) + value
+                    per_call_usages.append(dict(fb_capture["usage"]))
+                    last_error = invoke_parse_err
+                    if retry_count < max_parsing_retries:
+                        messages = create_messages(
+                            system_prompt + f"\n\nIMPORTANT: Your response MUST be valid JSON that matches this schema: {response_schema.model_json_schema()}",
+                            user_prompt + f"\n\n(Retry {retry_count + 1}/{max_parsing_retries} due to parsing error. Please ensure your response is properly formatted JSON.)"
+                        )
+                        await asyncio.sleep(0.5 * retry_count)  # Exponential backoff
+                        continue
+                    break
+                # DALTON-HOOK(complete-parse-failure-billing): attach prior call usages before re-raising unbilled client error.
+                if per_call_usages and getattr(invoke_parse_err, "token_usage", None) is None:
+                    partial_usage = dict(total_token_info)
+                    partial_usage["retry_attempts"] = retry_count
+                    partial_usage["per_call_usages"] = [dict(cu) for cu in per_call_usages]
+                    try:
+                        setattr(invoke_parse_err, "token_usage", partial_usage)
+                    except Exception:
+                        pass
+                raise
+            except Exception as retry_exc:
+                # DALTON-HOOK(complete-parse-failure-billing): preserve usage from earlier
+                # completed calls if a subsequent retry aborts with timeout/5xx/stream cut.
+                if fb_capture.get("usage"):
+                    for key, value in fb_capture["usage"].items():
+                        total_token_info[key] = total_token_info.get(key, 0) + value
+                    per_call_usages.append(dict(fb_capture["usage"]))
+                if per_call_usages and getattr(retry_exc, "token_usage", None) is None:
+                    partial_usage = dict(total_token_info)
+                    partial_usage["retry_attempts"] = retry_count
+                    partial_usage["per_call_usages"] = [dict(cu) for cu in per_call_usages]
+                    try:
+                        setattr(retry_exc, "token_usage", partial_usage)
+                    except Exception:
+                        pass
+                raise
+
+            try:
                 content = get_message_content(response)
 
                 # Extract and accumulate token usage
@@ -698,12 +759,6 @@ async def make_api_call(
                     raise ValueError(f"Response is not a string (attempt {retry_count}/{max_parsing_retries})")
 
             except (json.JSONDecodeError, ValidationError, ValueError) as parse_error:
-                # DALTON-HOOK(complete-parse-failure-billing): retain SDK-recovered usage when
-                # `llm.ainvoke` itself raised ValidationError/ValueError on a billed response.
-                if fb_capture.get("usage"):
-                    for key, value in fb_capture["usage"].items():
-                        total_token_info[key] = total_token_info.get(key, 0) + value
-                    per_call_usages.append(dict(fb_capture["usage"]))
                 last_error = parse_error
                 if retry_count < max_parsing_retries:
                     # Add clarification to the prompt for next attempt
@@ -713,22 +768,6 @@ async def make_api_call(
                     )
                     await asyncio.sleep(0.5 * retry_count)  # Exponential backoff
                     continue
-            except Exception as retry_exc:
-                # DALTON-HOOK(complete-parse-failure-billing): preserve usage from earlier
-                # completed calls if a subsequent retry aborts with timeout/5xx/stream cut.
-                if fb_capture.get("usage"):
-                    for key, value in fb_capture["usage"].items():
-                        total_token_info[key] = total_token_info.get(key, 0) + value
-                    per_call_usages.append(dict(fb_capture["usage"]))
-                if per_call_usages and getattr(retry_exc, "token_usage", None) is None:
-                    partial_usage = dict(total_token_info)
-                    partial_usage["retry_attempts"] = retry_count
-                    partial_usage["per_call_usages"] = [dict(cu) for cu in per_call_usages]
-                    try:
-                        setattr(retry_exc, "token_usage", partial_usage)
-                    except Exception:
-                        pass
-                raise
 
         # All retries failed, raise the last error with context
         # DALTON-HOOK(notional-pricing): retain per_call_usages on exhausted parsing retries.
