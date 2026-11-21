@@ -3,6 +3,18 @@
 Revision ID: d042
 Revises: d041
 Create Date: 2026-11-21
+
+Downgrade / Rollback Notes:
+- Schema-preserving rollback (reverting application code while keeping d042):
+  Before re-deploying newer code, clean any stale `reasoning_effort` values on
+  automations whose `llm_model` was edited under older code (for example,
+  `UPDATE automations SET reasoning_effort = NULL WHERE llm_model LIKE '%-oauth' AND reasoning_effort IS NOT NULL;`).
+  The executor also ignores stale `reasoning_effort` values whenever the
+  automation's current model is a built-in Antigravity model.
+- Full schema downgrade (`alembic downgrade d041`):
+  `downgrade()` drops the `ck_automations_reasoning_effort` constraint and the
+  `reasoning_effort` column. Export any non-NULL values first if you plan to
+  restore them after re-upgrading (`SELECT automation_id, config_version, llm_model, reasoning_effort FROM automations WHERE reasoning_effort IS NOT NULL`).
 """
 
 from __future__ import annotations

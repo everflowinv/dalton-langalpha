@@ -530,23 +530,30 @@ async def _resolve_automation_notification_context(
     str | None,
 ]:
     """Resolve ``(target_exec, inherited_model, user_prefs, fallback_eligible, effort_configured, inherited_effort)``."""
-    if not _is_server_notification_turn(
+    is_server_turn = _is_server_notification_turn(
         request,
         from_service=from_service,
         retry_of_run_id=retry_of_run_id,
         is_server_retry=is_server_retry,
-    ):
+    )
+    is_user_retry = bool(retry_of_run_id) and not is_server_turn
+    if not is_server_turn and not is_user_retry:
         return None, None, None, False, False, None
     if normalize_uuid(thread_id) is None:
         return None, None, None, False, False, None
 
     try:
-        target_exec, match_kind = await _resolve_source_execution(
-            request,
-            thread_id=thread_id,
-            retry_of_run_id=retry_of_run_id,
-            allow_running_fallback=allow_running_fallback,
-        )
+        if is_user_retry:
+            exec_row = await _get_execution_for_run_id(str(retry_of_run_id))
+            target_exec = exec_row
+            match_kind = "user_retry_run" if exec_row is not None else "none"
+        else:
+            target_exec, match_kind = await _resolve_source_execution(
+                request,
+                thread_id=thread_id,
+                retry_of_run_id=retry_of_run_id,
+                allow_running_fallback=allow_running_fallback,
+            )
     except Exception:
         logger.warning(
             f"[AUTOMATION_THREAD_MODEL] Failed resolving source execution "
@@ -557,11 +564,14 @@ async def _resolve_automation_notification_context(
     if target_exec is None:
         return None, None, None, False, False, None
 
-    fallback_eligible = match_kind in _EXPLICIT_EXECUTION_MATCH_KINDS
+    fallback_eligible = is_server_turn and match_kind in _EXPLICIT_EXECUTION_MATCH_KINDS
+    confirmed_source = fallback_eligible or match_kind == "user_retry_run"
+    if confirmed_source and not fallback_eligible:
+        target_exec = {**target_exec, "_effort_source_confirmed": True}
     explicit_request_model = getattr(request, "llm_model", None)
     explicit_request_effort = getattr(request, "reasoning_effort", None)
-    need_model = bool(resolve_model and not explicit_request_model)
-    need_effort = explicit_request_effort is None
+    need_model = bool(is_server_turn and resolve_model and not explicit_request_model)
+    need_effort = bool(confirmed_source and explicit_request_effort is None)
     if not need_model and not need_effort:
         return target_exec, None, None, fallback_eligible, False, None
 
@@ -588,7 +598,7 @@ async def _resolve_automation_notification_context(
         if need_model and first_model:
             chosen_model = first_model
             source = "first_turn"
-        if first_effort_configured:
+        if confirmed_source and first_effort_configured:
             effort_configured = True
             inherited_effort = first_effort
 
@@ -799,11 +809,16 @@ async def resolve_turn_config_with_automation_inheritance(
     fallback_eligible = False
     effort_configured = False
     inherited_effort: str | None = None
-    if requested_model is None or flagged_subscription is not None or _is_server_notification_turn(
-        request,
-        from_service=from_service,
-        retry_of_run_id=retry_of_run_id,
-        is_server_retry=is_server_retry,
+    if (
+        requested_model is None
+        or flagged_subscription is not None
+        or bool(retry_of_run_id)
+        or _is_server_notification_turn(
+            request,
+            from_service=from_service,
+            retry_of_run_id=retry_of_run_id,
+            is_server_retry=is_server_retry,
+        )
     ):
         (
             target_exec,
@@ -823,7 +838,10 @@ async def resolve_turn_config_with_automation_inheritance(
             resolve_model=(requested_model is None),
         )
 
-    if target_exec is not None and on_automation_context is not None:
+    confirmed_for_context = target_exec is not None and (
+        fallback_eligible or bool(target_exec.get("_effort_source_confirmed"))
+    )
+    if confirmed_for_context and on_automation_context is not None:
         exec_id = target_exec.get("automation_execution_id")
         if exec_id:
             ctx_meta: dict[str, Any] = {

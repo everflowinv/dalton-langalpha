@@ -58,8 +58,8 @@ interface MoreOptionsProps {
   deliveryProblems?: DeliveryProblem[];
   // DALTON-HOOK(automation-model): server refusal message when saving an unavailable model
   modelError?: string | null;
-  // DALTON-HOOK(automation-effort): distinguish create vs edit default effort behavior
-  isEdit?: boolean;
+  // DALTON-HOOK(automation-effort): track explicit "Follow default" selection on create
+  onExplicitDefaultEffort?: (explicit: boolean) => void;
   /** Company tasks cannot store a personal delivery choice. */
   omitDelivery?: boolean;
 }
@@ -76,7 +76,7 @@ export default function MoreOptions({
   deliveryAttempts,
   deliveryProblems = NO_PROBLEMS,
   modelError = null,
-  isEdit = false,
+  onExplicitDefaultEffort,
   omitDelivery = false,
 }: MoreOptionsProps) {
   const { t } = useTranslation();
@@ -173,22 +173,15 @@ export default function MoreOptions({
     patch('llm_model', nextModel);
     if (!nextModel) return;
     if (inspectSavedAntigravityModel(nextModel, seriesOpts)) {
+      onExplicitDefaultEffort?.(false);
       if (form.reasoning_effort !== null) patch('reasoning_effort', null);
       return;
     }
     const nextMeta = metadata[nextModel] ?? rawMetadata[nextModel];
     const offered = nextMeta?.reasoning_efforts ?? [];
     if (offered.length === 0) {
+      onExplicitDefaultEffort?.(false);
       if (form.reasoning_effort !== null) patch('reasoning_effort', null);
-      return;
-    }
-    if (!isEdit && offered.length > 1) {
-      if (!form.reasoning_effort || !offered.includes(form.reasoning_effort)) {
-        const defaultPick = offered.includes('medium')
-          ? 'medium'
-          : (nextMeta?.reasoning_effort_default ?? offered[0]);
-        patch('reasoning_effort', defaultPick);
-      }
       return;
     }
     if (form.reasoning_effort && !offered.includes(form.reasoning_effort)) {
@@ -318,7 +311,11 @@ export default function MoreOptions({
               <NativeSelect
                 aria-label={t('chat.modelSelector.reasoningEffort')}
                 value={form.reasoning_effort ?? ''}
-                onChange={(e) => patch('reasoning_effort', e.target.value || null)}
+                onChange={(e) => {
+                  const next = e.target.value || null;
+                  onExplicitDefaultEffort?.(next === null);
+                  patch('reasoning_effort', next);
+                }}
               >
                 <option value="">{t('automation.reasoningEffortDefault')}</option>
                 {nonAntigravityEfforts.map((lv) => (

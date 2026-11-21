@@ -383,11 +383,15 @@ def _effective_reasoning_ladder(
     resolved_entry: Mapping[str, Any] = entry if isinstance(entry, Mapping) else {}
     if source == user_models.ModelSource.CUSTOM:
         try:
-            builtin = LLMFactory.get_model_config().get_model_config(target_model)
+            model_config = LLMFactory.get_model_config()
+            builtin = model_config.get_model_config(target_model)
         except Exception:
+            model_config = None
             builtin = None
-        if isinstance(builtin, Mapping):
-            resolved_entry = with_inherited_declarations(dict(resolved_entry), dict(builtin))
+        if model_config is not None and isinstance(builtin, Mapping):
+            resolved_entry = with_inherited_declarations(
+                dict(resolved_entry), dict(builtin), model_config
+            )
     block = reasoning_block(dict(resolved_entry))
     efforts = canonical_reasoning_efforts(block.get("efforts"))
     default_level = default_reasoning_effort(efforts, block.get("default"))
@@ -430,23 +434,9 @@ async def _reconcile_reasoning_effort(
     if not target_model:
         if effort_set:
             return True, raw_effort
-        if not is_create:
-            return False, stored_effort
-        from src.server.services.llm.config import deployment_llm, saved_default_model
-
-        pref = await _safe_model_pref(user_id, model_pref)
-        default_name = saved_default_model(pref, "primary") or getattr(deployment_llm(), "name", None)
-        if default_name:
-            def_source, def_entry = await user_models.classify_model(
-                user_id, default_name, _pref_cache=pref
-            )
-            if (
-                def_source == user_models.ModelSource.SYSTEM
-                and isinstance(def_entry, Mapping)
-                and def_entry.get("provider") == ANTIGRAVITY_PROVIDER
-            ):
-                return True, None
-        return True, "medium"
+        if is_create:
+            return True, None
+        return False, stored_effort
 
     # Case 2: explicit target_model
     # Avoid extra classify_model calls when an update touches neither model nor effort
@@ -511,8 +501,6 @@ async def _reconcile_reasoning_effort(
         return True, raw_effort
 
     if is_create:
-        if len(efforts) > 1:
-            return True, ("medium" if "medium" in efforts else model_default)
         return True, None
 
     # Update with reasoning_effort omitted

@@ -1060,6 +1060,7 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
                 prelocked_pref_row=prelocked_pref,
             ):
                 if update.fields:
+                    # DALTON-HOOK(automation-effort): pass pre-read/reused model preference for effort validation
                     row = await step(
                         lifecycle.update_automation,
                         update.automation_id,
@@ -1105,6 +1106,7 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
                 pause=bool(create.pause),
                 prelocked_pref_row=prelocked_pref,
             ):
+                # DALTON-HOOK(automation-effort): pass pre-read/reused model preference for effort validation
                 row = await step(
                     lifecycle.create_automation,
                     user_id,

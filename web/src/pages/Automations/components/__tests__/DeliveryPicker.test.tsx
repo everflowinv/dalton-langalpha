@@ -1008,8 +1008,8 @@ describe('model selection in MoreOptions and AutomationInlineForm', () => {
     });
   });
 
-  // DALTON-HOOK(automation-effort): non-Antigravity effort dropdown saves/clears and Antigravity hides/clears it
-  it('shows reasoning effort dropdown for non-Antigravity models, defaults to medium on create, clears on Antigravity switch, and preserves untouched null on edit', async () => {
+  // DALTON-HOOK(automation-effort): non-Antigravity effort dropdown defaults to follow-default, distinguishes omitted vs explicit null, and Antigravity hides/clears it
+  it('shows reasoning effort dropdown for non-Antigravity models, distinguishes omitted vs explicit null on create, clears on Antigravity switch, and preserves untouched null on edit', async () => {
     const { buildSeriesCatalog } = await import('@/lib/antigravitySeries');
     const mixedMeta: Record<string, ModelMetadataEntry> = {
       'claude-opus-5-5-oauth': {
@@ -1066,7 +1066,8 @@ describe('model selection in MoreOptions and AutomationInlineForm', () => {
     };
     serve();
 
-    // 1. Create mode: picking non-Antigravity multi-tier model defaults effort to 'medium' and allows changing to 'high'
+    // 1. Create mode: picking non-Antigravity multi-tier model keeps Follow default (omitted),
+    //    allows setting 'high', and explicitly re-selecting Follow default sends explicit null.
     const createSubs: FormSubmission[] = [];
     const { unmount } = renderWithProviders(
       <AutomationInlineForm
@@ -1090,23 +1091,36 @@ describe('model selection in MoreOptions and AutomationInlineForm', () => {
     fireEvent.change(modelSelect, { target: { value: 'claude-opus-5-5-oauth' } });
 
     const effortSelect = screen.getByLabelText(label('chat.modelSelector.reasoningEffort')) as HTMLSelectElement;
-    expect(effortSelect.value).toBe('medium');
+    expect(effortSelect.value).toBe('');
 
-    fireEvent.change(effortSelect, { target: { value: 'high' } });
+    // Submitting without touching effort omits reasoning_effort
     fireEvent.click(screen.getByRole('button', { name: label('common.create') }));
     await waitFor(() => expect(createSubs).toHaveLength(1));
-    expect(createSubs[0]).toMatchObject({
+    expect(createSubs[0].payload.llm_model).toBe('claude-opus-5-5-oauth');
+    expect(createSubs[0].payload).not.toHaveProperty('reasoning_effort');
+
+    // Selecting 'high' sends reasoning_effort: 'high'
+    fireEvent.change(effortSelect, { target: { value: 'high' } });
+    fireEvent.click(screen.getByRole('button', { name: label('common.create') }));
+    await waitFor(() => expect(createSubs).toHaveLength(2));
+    expect(createSubs[1]).toMatchObject({
       kind: 'create',
       payload: { llm_model: 'claude-opus-5-5-oauth', reasoning_effort: 'high' },
     });
+
+    // Explicitly selecting Follow default sends explicit reasoning_effort: null
+    fireEvent.change(effortSelect, { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: label('common.create') }));
+    await waitFor(() => expect(createSubs).toHaveLength(3));
+    expect(createSubs[2].payload).toHaveProperty('reasoning_effort', null);
 
     // Switching to Antigravity hides standalone effort dropdown and clears reasoning_effort
     fireEvent.change(modelSelect, { target: { value: 'gemini-4-neon-high-oauth' } });
     expect(screen.queryByLabelText(label('chat.modelSelector.reasoningEffort'))).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: label('common.create') }));
-    await waitFor(() => expect(createSubs).toHaveLength(2));
-    expect(createSubs[1].payload.llm_model).toBe('gemini-4-neon-high-oauth');
-    expect(createSubs[1].payload).not.toHaveProperty('reasoning_effort');
+    await waitFor(() => expect(createSubs).toHaveLength(4));
+    expect(createSubs[3].payload.llm_model).toBe('gemini-4-neon-high-oauth');
+    expect(createSubs[3].payload).not.toHaveProperty('reasoning_effort');
     unmount();
 
     // 2. Edit mode: saved null stays omitted when untouched, and switching to Antigravity clears stored 'high' to null

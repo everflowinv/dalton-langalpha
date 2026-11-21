@@ -529,3 +529,399 @@ async def test_first_turn_settings_sql_reads_earliest_response_metadata(monkeypa
         fallback_thread_id=THREAD,
     )
     assert (model, configured, effort) == ("claude-opus-5-5-oauth", True, "medium")
+
+
+@pytest.mark.asyncio
+async def test_normal_user_retry_inherits_first_turn_effort_even_with_explicit_model_without_subscription_fallback(
+    monkeypatch,
+) -> None:
+    """Normal user /retry (from_service=False, is_server_retry=False) inherits first-turn effort
+    via route-validated retry_of_run_id while keeping subscription fallback gated to server turns."""
+    exec_row = {
+        "automation_execution_id": EXEC_A,
+        "automation_id": AUTO_A,
+        "status": "failed",
+        "conversation_thread_id": THREAD,
+        "user_id": USER,
+    }
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_for_run_id",
+        create_autospec(atm_mod._get_execution_for_run_id, return_value=exec_row),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_first_turn_settings",
+        create_autospec(
+            atm_mod._get_execution_first_turn_settings,
+            return_value=("claude-opus-5-5-oauth", True, "high"),
+        ),
+    )
+    fallback_spy = create_autospec(
+        atm_mod.resolve_with_subscription_fallback,
+        side_effect=AssertionError("User retry must not invoke subscription fallback"),
+    )
+    monkeypatch.setattr(atm_mod, "resolve_with_subscription_fallback", fallback_spy)
+    monkeypatch.setattr(
+        user_models,
+        "get_model_preference",
+        create_autospec(user_models.get_model_preference, return_value={}),
+    )
+    monkeypatch.setattr(
+        atm_mod.thread_model,
+        "model_resolves",
+        create_autospec(atm_mod.thread_model.model_resolves, return_value=True),
+    )
+
+    resolved: list[tuple[str | None, str | None]] = []
+
+    async def _fake_resolve_llm_config(_base, _uid, model, _byok, *, reasoning_effort=None, **_kw):
+        resolved.append((model, reasoning_effort))
+        return _make_cfg(str(model), reasoning_effort)
+
+    orig_resolve_llm = llm_config_mod.resolve_llm_config
+    monkeypatch.setattr(
+        llm_config_mod,
+        "resolve_llm_config",
+        create_autospec(orig_resolve_llm, side_effect=_fake_resolve_llm_config),
+    )
+    monkeypatch.setattr("src.server.app.setup.agent_config", SimpleNamespace())
+
+    resolver = thread_agent.thread_resolver(
+        USER,
+        THREAD,
+        TurnRoute(workspace_id=WS, owner_id=USER, role="analyst"),
+        identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER, org_id=None),
+        thread={"reasoning_effort": "low"},
+        is_byok=False,
+    )
+
+    # Case 1: Normal user retry without explicit model -> inherits "high" effort (not thread's "low")
+    ctx_1: dict[str, Any] = {}
+    await atm_mod.resolve_turn_config_with_automation_inheritance(
+        user_id=USER,
+        thread_id=THREAD,
+        request=ChatRequest(workspace_id=WS, messages=[], reasoning_effort=None),
+        requested_model=None,
+        held_model="claude-opus-5-5-oauth",
+        from_service=False,
+        is_server_retry=False,
+        retry_of_run_id=RUN_A,
+        resolve=resolver,
+        on_automation_context=ctx_1.update,
+    )
+    assert resolved[-1] == ("claude-opus-5-5-oauth", "high")
+    assert ctx_1 == {
+        "automation_execution_id": EXEC_A,
+        "automation_reasoning_effort_configured": True,
+        "automation_reasoning_effort": "high",
+    }
+
+    # Case 2: Normal user retry WITH explicit model -> respects user model and still inherits "high" effort
+    ctx_2: dict[str, Any] = {}
+    await atm_mod.resolve_turn_config_with_automation_inheritance(
+        user_id=USER,
+        thread_id=THREAD,
+        request=ChatRequest(
+            workspace_id=WS,
+            messages=[],
+            llm_model="gpt-6.2-sol-oauth",
+            reasoning_effort=None,
+        ),
+        requested_model="gpt-6.2-sol-oauth",
+        held_model="claude-opus-5-5-oauth",
+        from_service=False,
+        is_server_retry=False,
+        retry_of_run_id=RUN_A,
+        resolve=resolver,
+        on_automation_context=ctx_2.update,
+    )
+    assert resolved[-1] == ("gpt-6.2-sol-oauth", "high")
+    assert ctx_2["automation_execution_id"] == EXEC_A
+
+    # Case 3: Subscription failure during normal user retry raises directly without fallback
+    async def _fail_sub(_base, _uid, _model, _byok, *, reasoning_effort=None, **_kw):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "type": "oauth_reauth_required",
+                "provider": "claude-oauth",
+                "message": "Reconnect it.",
+            },
+        )
+
+    monkeypatch.setattr(
+        llm_config_mod,
+        "resolve_llm_config",
+        create_autospec(orig_resolve_llm, side_effect=_fail_sub),
+    )
+    resolver_fail = thread_agent.thread_resolver(
+        USER,
+        THREAD,
+        TurnRoute(workspace_id=WS, owner_id=USER, role="analyst"),
+        identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER, org_id=None),
+        thread={"reasoning_effort": "low"},
+        is_byok=False,
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await atm_mod.resolve_turn_config_with_automation_inheritance(
+            user_id=USER,
+            thread_id=THREAD,
+            request=ChatRequest(workspace_id=WS, messages=[], reasoning_effort=None),
+            requested_model=None,
+            held_model="claude-opus-5-5-oauth",
+            from_service=False,
+            is_server_retry=False,
+            retry_of_run_id=RUN_A,
+            resolve=resolver_fail,
+        )
+    assert exc_info.value.status_code == 400
+    fallback_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unattributed_legacy_wakeup_does_not_inherit_other_running_automation_effort_or_exec_id(
+    monkeypatch,
+) -> None:
+    """When a legacy wakeup lacks created_by_run_id and falls back to running_thread (Automation B),
+    Automation B's effort and execution_id must NOT be inherited or stamped."""
+    exec_b = {
+        "automation_execution_id": EXEC_B,
+        "automation_id": AUTO_B,
+        "status": "running",
+        "conversation_thread_id": THREAD,
+        "user_id": USER,
+    }
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_wakeup_creator_run_ids",
+        create_autospec(atm_mod._get_wakeup_creator_run_ids, return_value=[]),
+    )
+    monkeypatch.setattr(
+        atm_mod.exec_db,
+        "get_running_executions_for_thread",
+        create_autospec(atm_mod.exec_db.get_running_executions_for_thread, return_value=[exec_b]),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_first_turn_settings",
+        create_autospec(
+            atm_mod._get_execution_first_turn_settings,
+            return_value=("gpt-6.2-sol-oauth", True, "low"),
+        ),
+    )
+    monkeypatch.setattr(
+        atm_mod.user_models,
+        "get_model_preference",
+        create_autospec(user_models.get_model_preference, return_value={}),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "model_resolves",
+        create_autospec(atm_mod.model_resolves, return_value=True),
+    )
+
+    resolved: list[tuple[str | None, str | None]] = []
+
+    async def _fake_resolve_llm_config(_base, _uid, model, _byok, *, reasoning_effort=None, **_kw):
+        resolved.append((model, reasoning_effort))
+        return _make_cfg(str(model), reasoning_effort)
+
+    monkeypatch.setattr(
+        llm_config_mod,
+        "resolve_llm_config",
+        create_autospec(llm_config_mod.resolve_llm_config, side_effect=_fake_resolve_llm_config),
+    )
+    monkeypatch.setattr("src.server.app.setup.agent_config", SimpleNamespace())
+
+    resolver = thread_agent.thread_resolver(
+        USER,
+        THREAD,
+        TurnRoute(workspace_id=WS, owner_id=USER, role="analyst"),
+        identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER, org_id=None),
+        thread={"reasoning_effort": "high"},
+        is_byok=False,
+    )
+
+    legacy_wakeup = ChatRequest(
+        workspace_id=WS,
+        messages=[ChatMessage(role="user", content="legacy wakeup")],
+        query_type="wakeup",
+        wakeup={"notices": [{"wakeup_id": WAKEUP_A}]},
+    )
+    ctx: dict[str, Any] = {}
+    await atm_mod.resolve_turn_config_with_automation_inheritance(
+        user_id=USER,
+        thread_id=THREAD,
+        request=legacy_wakeup,
+        requested_model=None,
+        held_model="claude-opus-5-5-oauth",
+        from_service=True,
+        resolve=resolver,
+        on_automation_context=ctx.update,
+    )
+    # Must NOT inherit Automation B's "low" effort (keeps thread's "high") and must NOT stamp EXEC_B
+    assert resolved[-1][1] == "high"
+    assert ctx == {}
+
+
+@pytest.mark.asyncio
+async def test_executor_restart_redispatch_preserves_recorded_first_turn_effort_and_explicit_null(
+    monkeypatch,
+) -> None:
+    """When restart redispatches an execution that already wrote a first-turn response row,
+    _run_turn reuses the recorded effort (including explicit None) rather than a later DB edit."""
+    captured: list[dict[str, Any]] = []
+
+    async def _fake_astream(**kwargs: Any):
+        captured.append(kwargs)
+        if False:
+            yield None
+
+    monkeypatch.setattr(
+        chat_handler_mod,
+        "astream_ptc_workflow",
+        create_autospec(chat_handler_mod.astream_ptc_workflow, side_effect=_fake_astream),
+    )
+    monkeypatch.setattr(
+        exec_mod.TurnIdentity,
+        "of",
+        create_autospec(TurnIdentity.of, return_value=SimpleNamespace(recorded_as=USER)),
+    )
+    monkeypatch.setattr(
+        user_models,
+        "classify_model",
+        create_autospec(
+            user_models.classify_model,
+            return_value=(user_models.ModelSource.SYSTEM, {"provider": "claude-oauth"}),
+        ),
+    )
+
+    executor = exec_mod.AutomationExecutor.__new__(exec_mod.AutomationExecutor)
+    executor._note_admission = create_autospec(executor._note_admission, return_value=True)
+    orig_first_turn = atm_mod._get_execution_first_turn_settings
+
+    for recorded_effort, edited_db_effort in (("high", "low"), (None, "max")):
+        monkeypatch.setattr(
+            atm_mod,
+            "_get_execution_first_turn_settings",
+            create_autospec(
+                orig_first_turn,
+                return_value=("claude-opus-5-5-oauth", True, recorded_effort),
+            ),
+        )
+        firing = SimpleNamespace(
+            automation={
+                "automation_id": AUTO_A,
+                "user_id": USER,
+                "name": "Restarted Task",
+                "llm_model": "claude-opus-5-5-oauth",
+                "reasoning_effort": edited_db_effort,
+                "instruction": "Continue.",
+                "additional_context": None,
+                "thread_strategy": "new",
+            },
+            workspace_id=WS,
+            thread_id=THREAD,
+            route=TurnRoute(workspace_id=WS, owner_id=USER, role="analyst"),
+            late=None,
+            held=False,
+            delivery=None,
+            wake_context=None,
+            workspace_owner_id=USER,
+            checked_computer_id=None,
+            run_id=None,
+            admitted=False,
+        )
+        ok = await executor._run_turn(
+            EXEC_A,
+            firing,
+            has_byok=False,
+            deadline=9999999999.0,
+        )
+        assert ok is True
+        assert captured[-1]["request"].reasoning_effort == recorded_effort
+        assert captured[-1]["run_metadata"]["automation_reasoning_effort_configured"] is True
+        assert captured[-1]["run_metadata"]["automation_reasoning_effort"] == recorded_effort
+
+
+@pytest.mark.asyncio
+async def test_executor_ignores_stale_effort_on_builtin_antigravity_but_keeps_custom_shadow(
+    monkeypatch,
+) -> None:
+    """Executor ignores stale reasoning_effort values on built-in Antigravity models while
+    preserving explicit effort on a same-named custom model."""
+    captured: list[dict[str, Any]] = []
+
+    async def _fake_astream(**kwargs: Any):
+        captured.append(kwargs)
+        if False:
+            yield None
+
+    monkeypatch.setattr(
+        chat_handler_mod,
+        "astream_ptc_workflow",
+        create_autospec(chat_handler_mod.astream_ptc_workflow, side_effect=_fake_astream),
+    )
+    monkeypatch.setattr(
+        exec_mod.TurnIdentity,
+        "of",
+        create_autospec(TurnIdentity.of, return_value=SimpleNamespace(recorded_as=USER)),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_first_turn_settings",
+        create_autospec(
+            atm_mod._get_execution_first_turn_settings,
+            return_value=(None, False, None),
+        ),
+    )
+
+    executor = exec_mod.AutomationExecutor.__new__(exec_mod.AutomationExecutor)
+    executor._note_admission = create_autospec(executor._note_admission, return_value=True)
+    orig_classify = user_models.classify_model
+
+    for source, expected in (
+        (user_models.ModelSource.SYSTEM, None),
+        (user_models.ModelSource.CUSTOM, "low"),
+    ):
+        monkeypatch.setattr(
+            user_models,
+            "classify_model",
+            create_autospec(
+                orig_classify,
+                return_value=(source, {"provider": "antigravity-oauth"}),
+            ),
+        )
+        firing = SimpleNamespace(
+            automation={
+                "automation_id": AUTO_A,
+                "user_id": USER,
+                "name": "Antigravity Task",
+                "llm_model": "claude-opus-5-5-high-oauth",
+                "reasoning_effort": "low",  # stale value left over on Antigravity row
+                "instruction": "Check.",
+                "additional_context": None,
+                "thread_strategy": "new",
+            },
+            workspace_id=WS,
+            thread_id=THREAD,
+            route=TurnRoute(workspace_id=WS, owner_id=USER, role="analyst"),
+            late=None,
+            held=False,
+            delivery=None,
+            wake_context=None,
+            workspace_owner_id=USER,
+            checked_computer_id=None,
+            run_id=None,
+            admitted=False,
+        )
+        ok = await executor._run_turn(
+            EXEC_A,
+            firing,
+            has_byok=False,
+            deadline=9999999999.0,
+        )
+        assert ok is True
+        assert captured[-1]["request"].reasoning_effort == expected
+        assert captured[-1]["run_metadata"]["automation_reasoning_effort"] == expected

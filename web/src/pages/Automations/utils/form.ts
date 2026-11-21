@@ -255,14 +255,23 @@ function triggerPayload(form: FormState): Trigger {
   }
 }
 
-export function formStateToPayload(form: FormState, workspaceId: string): AutomationPayload {
+export function formStateToPayload(
+  form: FormState,
+  workspaceId: string,
+  // DALTON-HOOK(automation-effort): distinguish omitted vs explicit null reasoning_effort on create
+  options?: { explicitNullEffort?: boolean },
+): AutomationPayload {
   return {
     ...settingsPayload(form, workspaceId),
     ...(form.description ? { description: form.description } : {}),
     // DALTON-HOOK(automation-model): include llm_model when selected
     ...(form.llm_model ? { llm_model: form.llm_model } : {}),
-    // DALTON-HOOK(automation-effort): include reasoning_effort when selected
-    ...(form.reasoning_effort ? { reasoning_effort: form.reasoning_effort } : {}),
+    // DALTON-HOOK(automation-effort): include reasoning_effort when set or explicitly cleared to follow default
+    ...(form.reasoning_effort
+      ? { reasoning_effort: form.reasoning_effort }
+      : options?.explicitNullEffort
+        ? { reasoning_effort: null }
+        : {}),
     trigger_type: form.trigger_type,
     timezone: form.timezone,
     ...triggerPayload(form),

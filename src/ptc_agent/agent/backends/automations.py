@@ -16,7 +16,9 @@ from src.server.services.automations import file
 
 __all__ = ["README_FILE", "AutomationsBackend"]
 
-_README_CONTENT = """\
+# DALTON-HOOK(automation-effort): parenthesize README fragments so hook comments never truncate _README_CONTENT
+_README_CONTENT = (
+    """\
 # Automations
 
 Each automation the user has is one JSON file in this folder: an agent run
@@ -53,8 +55,8 @@ where they go stale.
   starts a new run, so Read again after asking. A field you leave out keeps
   its value; `null` clears `description`, `llm_model` or `reasoning_effort`. Each file is checked
 """
-# DALTON-HOOK(automation-effort): document reasoning_effort in automation file README
-"""  on its own, so a change to one never conflicts with another.
+    # DALTON-HOOK(automation-effort): document reasoning_effort in automation file README
+    """  on its own, so a change to one never conflicts with another.
 - **Pause / resume:** set `status` to `"paused"` or `"active"`.
 - **Delete:** set `status` to `"deleted"`, or `rm` the file from code. Its run
   history goes with it and cannot be restored.
@@ -90,8 +92,8 @@ first, which is refused or becomes an automation of its own.
   "thread": "new",
   "llm_model": null,
 """
-# DALTON-HOOK(automation-effort): include reasoning_effort in example and field reference table
-"""  "reasoning_effort": null,
+    # DALTON-HOOK(automation-effort): include reasoning_effort in example and field reference table
+    """  "reasoning_effort": null,
   "delivery": ["slack"],
   "max_failures": 3,
   "state": {
@@ -134,8 +136,8 @@ A new one needs only what has no default, e.g. `aapl-below-200.json`:
 | thread         | no  | `new` (default): a fresh thread each run. `persistent`: one thread that every run continues, created by the first run (`state.last_run.thread_id` names it). `current`: continue in this conversation. A thread id: continue in that thread. |
 | llm_model      | no  | A model the user can run; `null` uses their default. An unknown name is refused with the list. |
 """
-# DALTON-HOOK(automation-effort): document reasoning_effort field semantics in README table
-"""| reasoning_effort | no | Thinking effort override (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`); `null` follows user/model default. Omit on create to use the default (`medium` for multi-level models, `null` for Antigravity or non-reasoning models). Antigravity models encode effort in `llm_model` suffix and keep `reasoning_effort` as `null`. |
+    # DALTON-HOOK(automation-effort): document reasoning_effort field semantics in README table
+    """| reasoning_effort | no | Thinking effort override (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`); omit or pass `null` to follow user preference / model default. Antigravity models encode effort in `llm_model` suffix and keep `reasoning_effort` as `null`. |
 | delivery       | no  | Where results also go besides the app: a chat app, e.g. `["slack"]`, or one chat there by address, e.g. `["slack:T1/C0123"]` from `.agents/user/channels/available.json`, which lists every chat on each connected app; `[]` for none. A chat is checked when you save, and so is an app, which is refused while the user hasn't linked it. An app alone posts to the chat set for the automations of the workspace it runs in (Home has none), else the app's preferred chat, else the user's direct messages; to always post to the direct messages, name them, e.g. `["discord:@me"]` (`slack:<team>` on Slack). Leave sending out of `instruction`: each run sends its result there itself, a chat it missed gets the final answer, and a failed or stopped run posts a short notice. |
 | max_failures   | no  | 1–100, default 3. Consecutive failed runs before it is disabled. |
 
@@ -187,6 +189,7 @@ you save a price alert.
   `provider_auth`: the model provider rejected the user's own key; resume it
   once the key is fixed. `max_failures`: it failed `max_failures` times in a row.
 """
+)
 
 
 class AutomationsBackend(DbJsonFolderRoute):

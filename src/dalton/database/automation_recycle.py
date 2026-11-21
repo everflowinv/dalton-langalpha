@@ -44,7 +44,7 @@ _AGENT_LOCK_COLUMNS = """
     automation_id, user_id, name, file_name, description,
     trigger_type, cron_expression, timezone, trigger_config,
     next_run_at, last_run_at,
-    instruction, workspace_id, llm_model, additional_context,
+    instruction, workspace_id, llm_model, reasoning_effort, additional_context,
     thread_strategy, conversation_thread_id,
     status, max_failures, failure_count, disable_reason,
     delivery_config, metadata,

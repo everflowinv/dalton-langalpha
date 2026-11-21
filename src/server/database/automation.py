@@ -352,6 +352,7 @@ async def create_automation(
                     # A savepoint inside a caller's transaction, so a clash
                     # leaves it usable for the next attempt.
                     async with conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
+                        # DALTON-HOOK(automation-effort): include reasoning_effort in INSERT column list and placeholders
                         await cur.execute(f"""
                             INSERT INTO automations (
                                 automation_id, user_id, name, file_name, description,

@@ -82,6 +82,8 @@ export default function AutomationInlineForm({
   const [refused, setRefused] = useState<DeliveryProblem[]>([]);
   // DALTON-HOOK(automation-model): server error when saving an unavailable model
   const [modelError, setModelError] = useState<string | null>(null);
+  // DALTON-HOOK(automation-effort): distinguish untouched omitted effort vs explicit "Follow default" (null) on create
+  const [explicitNullEffort, setExplicitNullEffort] = useState(false);
   const uid = useId();
   const ids = { name: `${uid}-name`, instruction: `${uid}-instruction` };
 
@@ -122,7 +124,11 @@ export default function AutomationInlineForm({
     }
     const submission: FormSubmission = opened.automation
       ? { kind: 'edit', payload: formStateToUpdatePayload(form, opened.values, opened.automation, workspaceId) }
-      : { kind: 'create', payload: formStateToPayload(form, workspaceId) };
+      : {
+          kind: 'create',
+          // DALTON-HOOK(automation-effort): pass explicitNullEffort so create distinguishes omitted vs explicit null
+          payload: formStateToPayload(form, workspaceId, { explicitNullEffort }),
+        };
     // The refusal itself was already announced; one naming delivery entries
     // is also shown beside them, unfolded.
     void Promise.resolve(onSubmit(submission)).catch((err: unknown) => {
@@ -193,9 +199,9 @@ export default function AutomationInlineForm({
             deliveryAttempts={opened.automation?.last_execution?.delivery_result}
             deliveryProblems={refused}
             // DALTON-HOOK(automation-model): pass server model error to MoreOptions
-            // DALTON-HOOK(automation-effort): pass isEdit so create vs edit effort defaults behave distinctly
+            // DALTON-HOOK(automation-effort): track explicit "Follow default" selection on create
             modelError={modelError}
-            isEdit={isEdit}
+            onExplicitDefaultEffort={setExplicitNullEffort}
             omitDelivery={omitDelivery}
           />
         </div>

@@ -207,7 +207,7 @@ async def test_rest_create_and_patch_save_and_clear_reasoning_effort(monkeypatch
     principal = Principal(user_id=USER, auth="user")
     http_req = create_autospec(Request, instance=True)
 
-    # 1. Create on multi-tier model omitting reasoning_effort -> defaults to "medium"
+    # 1. Create on multi-tier model omitting reasoning_effort -> stays None (follows user/model default)
     resp_create = await automations_router.create_automation(
         AutomationCreate(
             name="Opus Task",
@@ -220,8 +220,25 @@ async def test_rest_create_and_patch_save_and_clear_reasoning_effort(monkeypatch
         principal,
         http_req,
     )
-    assert created_kwargs["reasoning_effort"] == "medium"
-    assert resp_create.reasoning_effort == "medium"
+    assert created_kwargs["reasoning_effort"] is None
+    assert resp_create.reasoning_effort is None
+
+    # 1b. Create with explicit reasoning_effort="high" saves "high"
+    resp_create_high = await automations_router.create_automation(
+        AutomationCreate(
+            name="Opus High Task",
+            trigger_type="cron",
+            cron_expression="0 9 * * *",
+            instruction="Run research.",
+            workspace_id=UUID(WS),
+            llm_model="claude-opus-5-5-oauth",
+            reasoning_effort="high",
+        ),
+        principal,
+        http_req,
+    )
+    assert created_kwargs["reasoning_effort"] == "high"
+    assert resp_create_high.reasoning_effort == "high"
 
     # 2. PATCH updating reasoning_effort explicitly to "low"
     resp_patch = await automations_router.update_automation(
@@ -471,6 +488,14 @@ async def test_sandbox_file_create_update_clear_and_antigravity_refusal(monkeypa
     )
     path = f"{root}/effort-brief.json"
 
+    # Verify complete README renders via AutomationsBackend (not truncated by hook comments)
+    readme_text = await backend.aread_range(f"{root}/README.md", 0, 2000)
+    assert "## Example" in readme_text
+    assert "## Fields" in readme_text
+    assert "| reasoning_effort |" in readme_text
+    assert "## Price alerts" in readme_text
+    assert "## state (read-only)" in readme_text
+
     # Create with explicit effort
     created_payload = {
         "name": "Effort Brief",
@@ -702,3 +727,292 @@ def test_audit_snapshot_tracks_19_fields_and_rollback_accepts_pre_d042_snapshot(
     with pytest.raises(HTTPException) as exc_info:
         automation_recycle._require_complete_snapshot(bad_snap)
     assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_custom_model_shadowing_exact_builtin_name_inherits_ladder_without_typeerror(
+    monkeypatch,
+) -> None:
+    """Custom model using the EXACT built-in name ('claude-opus-5-5' and 'claude-opus-5-5-high-oauth')
+    runs real with_inherited_declarations(..., manifest) without TypeError."""
+    _install_model_stubs(
+        monkeypatch,
+        extra_models={
+            # Truly identical name to built-in Anthropic Claude Opus 5.5 in models.json
+            "claude-opus-5-5": (
+                ModelSource.CUSTOM,
+                {
+                    "name": "claude-opus-5-5",
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-5-5",
+                },
+            ),
+            # Truly identical name to built-in Antigravity suffixed model in manifest
+            "claude-opus-5-5-high-oauth": (
+                ModelSource.CUSTOM,
+                {
+                    "name": "claude-opus-5-5-high-oauth",
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-5-5",
+                    "reasoning": {"efforts": ["low", "medium", "high"], "default": "medium"},
+                },
+            ),
+        },
+    )
+
+    write_eff, normalized = await lifecycle._reconcile_reasoning_effort(
+        USER,
+        target_model="claude-opus-5-5",
+        effort_set=True,
+        raw_effort="high",
+        stored_effort=None,
+        is_create=True,
+    )
+    assert (write_eff, normalized) == (True, "high")
+
+    write_ag_shadow, norm_ag_shadow = await lifecycle._reconcile_reasoning_effort(
+        USER,
+        target_model="claude-opus-5-5-high-oauth",
+        effort_set=True,
+        raw_effort="low",
+        stored_effort=None,
+        is_create=True,
+    )
+    assert (write_ag_shadow, norm_ag_shadow) == (True, "low")
+
+
+@pytest.mark.asyncio
+async def test_recycle_bin_lock_query_delete_and_restore_preserve_reasoning_effort(
+    monkeypatch,
+) -> None:
+    """Deleting and restoring an automation preserves reasoning_effort in row & audit snapshots."""
+    from psycopg import AsyncCursor
+    from src.dalton.database import automation_recycle as recycle_db
+
+    assert "reasoning_effort" in recycle_db._AGENT_LOCK_COLUMNS
+
+    stored_row: dict[str, Any] = _row(
+        reasoning_effort="high",
+        scope="company",
+        user_id=COMPANY_SYSTEM_USER_ID,
+        notify_storage_mode="task_row",
+        notify_enabled=True,
+        notify_routes=[],
+        audit_history=[],
+        pre_delete_desired_status=None,
+    )
+    captured_updates: list[dict[str, Any]] = []
+
+    conn = create_autospec(AsyncConnection, instance=True)
+
+    @asynccontextmanager
+    async def _tx():
+        yield conn
+
+    conn.transaction.side_effect = _tx
+
+    @asynccontextmanager
+    async def _cursor(*_a: Any, **_kw: Any):
+        cur = create_autospec(AsyncCursor, instance=True)
+        selected: dict[str, Any] = {"row": None}
+
+        async def _execute(sql: str, params: Any = None) -> None:
+            norm = " ".join(sql.split())
+            if norm.startswith("SELECT ") and "FROM automations" in norm:
+                # Parse the exact SELECT column list so missing columns truly vanish!
+                cols_part = norm[len("SELECT ") : norm.index(" FROM automations")]
+                col_names = [c.strip().split()[-1] for c in cols_part.split(",")]
+                selected["row"] = {c: stored_row[c] for c in col_names if c in stored_row}
+                return
+            selected["row"] = None
+
+        cur.execute.side_effect = _execute
+        cur.fetchone.side_effect = lambda: selected["row"]
+        cur.fetchall.side_effect = lambda: []
+        yield cur
+
+    conn.cursor.side_effect = _cursor
+
+    async def _fake_update_recycle(
+        aid: str, *, expected_config_version: int, fields: dict[str, Any], conn: Any
+    ) -> bool:
+        captured_updates.append(dict(fields))
+        stored_row.update(
+            {
+                "status": fields["status"],
+                "next_run_at": fields["next_run_at"],
+                "file_name": fields["file_name"],
+                "deleted_by": fields["deleted_by"],
+                "deleted_at": datetime(2026, 11, 21, 13, 0, tzinfo=UTC)
+                if fields.get("set_deleted_at")
+                else None,
+                "pre_delete_desired_status": fields["pre_delete_desired_status"],
+                "config_version": fields["config_version"],
+                "active_version": fields["active_version"],
+                "audit_history": fields["audit_history"],
+                "reasoning_effort": fields.get("reasoning_effort"),
+            }
+        )
+        return True
+
+    monkeypatch.setattr(
+        recycle_db,
+        "update_automation_recycle",
+        create_autospec(recycle_db.update_automation_recycle, side_effect=_fake_update_recycle),
+    )
+    monkeypatch.setattr(
+        recycle_db,
+        "lock_unfinished_executions",
+        create_autospec(recycle_db.lock_unfinished_executions, return_value=[]),
+    )
+    monkeypatch.setattr(
+        recycle_db,
+        "skip_unstarted_executions",
+        create_autospec(recycle_db.skip_unstarted_executions, return_value=0),
+    )
+    monkeypatch.setattr(
+        recycle_db,
+        "fetch_automation_read_row",
+        create_autospec(recycle_db.fetch_automation_read_row, side_effect=lambda *_a, **_kw: dict(stored_row)),
+    )
+    monkeypatch.setattr(
+        recycle_db,
+        "live_file_name_taken",
+        create_autospec(recycle_db.live_file_name_taken, return_value=False),
+    )
+    monkeypatch.setattr(
+        automation_recycle,
+        "_resolve_effective_once_run_at",
+        create_autospec(automation_recycle._resolve_effective_once_run_at, return_value=None),
+    )
+    monkeypatch.setattr("src.dalton.settings.is_coverage_units_enabled", lambda: False)
+
+    # 1. Soft delete must preserve reasoning_effort="high" on row and in delete snapshot
+    await automation_recycle.soft_delete_automation(
+        AUTO_ID,
+        actor_user_id=USER,
+        expected_config_version=1,
+        owner_user_id=COMPANY_SYSTEM_USER_ID,
+        company=True,
+        conn=conn,
+    )
+    assert captured_updates[-1]["reasoning_effort"] == "high"
+    assert stored_row["reasoning_effort"] == "high"
+    assert stored_row["audit_history"][-1]["snapshot"]["reasoning_effort"] == "high"
+
+    # 2. Restore must preserve reasoning_effort="high" on row and in restore snapshot
+    await automation_recycle.restore_automation(
+        AUTO_ID,
+        actor_user_id=USER,
+        expected_config_version=stored_row["config_version"],
+        owner_user_id=COMPANY_SYSTEM_USER_ID,
+        company=True,
+        conn=conn,
+    )
+    assert captured_updates[-1]["reasoning_effort"] == "high"
+    assert stored_row["reasoning_effort"] == "high"
+    assert stored_row["audit_history"][-1]["snapshot"]["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_dalton_schedule_automation_revalidates_effort_in_locked_row_reconciler(
+    monkeypatch,
+) -> None:
+    """Concurrent REST switch to Antigravity before CoS update lock is caught inside locked_row_reconciler."""
+    import src.dalton.autonomy.schedule as schedule_mod
+
+    _install_model_stubs(monkeypatch)
+    tools = {t.name: t for t in build_director_tools(role="chief_of_staff")}
+    sched = tools["dalton_schedule_automation"]
+
+    lock_conn = create_autospec(AsyncConnection, instance=True)
+
+    @asynccontextmanager
+    async def _tx(*_a: Any, **_kw: Any):
+        yield lock_conn
+
+    lock_conn.transaction.side_effect = _tx
+
+    @asynccontextmanager
+    async def _get_conn():
+        yield lock_conn
+
+    monkeypatch.setattr(
+        schedule_mod,
+        "get_db_connection",
+        create_autospec(schedule_mod.get_db_connection, side_effect=_get_conn),
+    )
+    monkeypatch.setattr(
+        auto_db,
+        "lock_user_automations",
+        create_autospec(auto_db.lock_user_automations, return_value=None),
+    )
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(ws_db.get_workspace, return_value={"workspace_id": WS, "user_id": USER}),
+    )
+    monkeypatch.setattr("src.dalton.settings.is_coverage_units_enabled", lambda: False)
+
+    # Pre-lock read still sees Opus, but under lock a concurrent REST write switched to Antigravity high
+    stale_pre_row = _row(
+        name="dalton-nvda-watch",
+        llm_model="claude-opus-5-5-oauth",
+        reasoning_effort="medium",
+    )
+    locked_concurrent_row = {
+        **stale_pre_row,
+        "llm_model": "gemini-4-neon-high-oauth",
+        "reasoning_effort": None,
+    }
+    captured_effective: list[dict[str, Any]] = []
+
+    async def _list_all(_uid: str, *, conn: Any = None):
+        return [dict(stale_pre_row)]
+
+    async def _fake_update_with_lock(aid: str, uid: str, *, conn: Any = None, **kw: Any):
+        effective = dict(kw)
+        hist_ctx = company_automations.get_current_history_context()
+        assert hist_ctx is not None and hist_ctx.locked_row_reconciler is not None
+        await hist_ctx.locked_row_reconciler(locked_concurrent_row, effective, conn)
+        captured_effective.append(effective)
+        return {**locked_concurrent_row, **effective}
+
+    monkeypatch.setattr(
+        auto_db, "list_all_automations", create_autospec(auto_db.list_all_automations, side_effect=_list_all)
+    )
+    monkeypatch.setattr(
+        auto_db, "update_automation", create_autospec(auto_db.update_automation, side_effect=_fake_update_with_lock)
+    )
+
+    cfg = {"configurable": {"user_id": USER, "workspace_id": WS}}
+
+    # Case 1: CoS sets reasoning_effort="high" (matching Antigravity suffix) -> locked reconciler normalizes to None
+    res_ok = json.loads(
+        await sched.ainvoke(
+            {
+                "action": "upsert",
+                "name": "dalton-nvda-watch",
+                "workspace_id": WS,
+                "reasoning_effort": "high",
+            },
+            config=cfg,
+        )
+    )
+    assert res_ok["ok"] is True
+    assert captured_effective[-1]["reasoning_effort"] is None
+
+    # Case 2: CoS sets reasoning_effort="low" (conflicting with Antigravity high suffix) -> refused under lock!
+    res_refused = json.loads(
+        await sched.ainvoke(
+            {
+                "action": "upsert",
+                "name": "dalton-nvda-watch",
+                "workspace_id": WS,
+                "reasoning_effort": "low",
+            },
+            config=cfg,
+        )
+    )
+    assert res_refused["ok"] is False
+    assert res_refused["error"] == "invalid_reasoning_effort"

@@ -1406,18 +1406,57 @@ async def schedule_dalton_automation_helper(
                 if report_profile_change is not None
                 else None
             )
-            with automation_history_context(
-                actor_user_id=effective_actor_id,
-                action=effective_update_action,
-                skip_if_unchanged=True,
-                report_delivery_audit=report_audit_payload,
-            ):
-                updated = await auto_db.update_automation(
-                    str(existing["automation_id"]),
-                    task_owner,
-                    **conn_kw,
-                    **patch,
+            async def _reconcile_locked_effort(
+                locked_row: Mapping[str, Any],
+                effective_kwargs: dict[str, Any],
+                _locked_conn: Any,
+            ) -> None:
+                locked_model = locked_row.get("llm_model")
+                locked_effort = locked_row.get("reasoning_effort")
+                final_model = (
+                    effective_kwargs["llm_model"]
+                    if "llm_model" in effective_kwargs
+                    else locked_model
                 )
+                if not (effort_in_spec or model_in_spec or locked_effort is not None):
+                    return
+                write_eff, reconciled_eff = await _reconcile_reasoning_effort(
+                    task_owner,
+                    target_model=final_model,
+                    effort_set=effort_in_spec,
+                    raw_effort=raw_effort_spec,
+                    stored_effort=locked_effort,
+                    is_create=False,
+                    model_pref=pref_for_effort,
+                    model_changed=(model_in_spec and final_model != locked_model),
+                )
+                if write_eff:
+                    effective_kwargs["reasoning_effort"] = reconciled_eff
+                else:
+                    effective_kwargs.pop("reasoning_effort", None)
+
+            try:
+                with automation_history_context(
+                    actor_user_id=effective_actor_id,
+                    action=effective_update_action,
+                    skip_if_unchanged=True,
+                    locked_row_reconciler=_reconcile_locked_effort,
+                    report_delivery_audit=report_audit_payload,
+                ):
+                    updated = await auto_db.update_automation(
+                        str(existing["automation_id"]),
+                        task_owner,
+                        **conn_kw,
+                        **patch,
+                    )
+            except AutomationRefusal as exc:
+                if via_rest:
+                    raise
+                return {
+                    "ok": False,
+                    "error": "invalid_reasoning_effort",
+                    "message": str(exc),
+                }
             updated_row = updated or existing
             sync_failed_warning: str | None = None
             if report_profile_change is not None:
