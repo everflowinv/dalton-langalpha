@@ -1149,4 +1149,141 @@ describe('CreateWorkspaceModal, duplicate company workspace', () => {
     );
     await waitFor(() => expect(onCompleteB).toHaveBeenCalledWith(LIVE_CREATED));
   });
+
+  // DALTON-HOOK(workspace-dedup): preserve skip-registration choice across coverage_suggestion -> company_workspace_exists -> Create anyway, and reset on name edit or modal close
+  it('preserves skip-registration choice across coverage_suggestion then company_workspace_exists and resets on name change or close', async () => {
+    const user = userEvent.setup();
+    const suggestionErr = Object.assign(new Error('Request failed with status code 409'), {
+      response: {
+        status: 409,
+        data: {
+          detail: {
+            code: 'coverage_suggestion',
+            message: '「Nvidia」识别为公司（代码 NVDA）',
+            suggestion: {
+              coverage_kind: 'company',
+              ticker: 'NVDA',
+              display_name: 'NVIDIA Corporation',
+            },
+          },
+        },
+      },
+    });
+    const duplicateErr = Object.assign(new Error('Request failed with status code 409'), {
+      response: {
+        status: 409,
+        data: {
+          detail: {
+            code: 'company_workspace_exists',
+            message: 'dup',
+            matches: [{ workspace_name: 'NVDA', owner_name: 'Richard', can_read: false }],
+            suggestion: {
+              coverage_kind: 'company',
+              ticker: 'NVDA',
+              display_name: 'NVIDIA Corporation',
+            },
+          },
+        },
+      },
+    });
+
+    // 1. coverage_suggestion -> Create without registering -> company_workspace_exists -> Create anyway
+    const onCreate = vi
+      .fn()
+      .mockRejectedValueOnce(suggestionErr)
+      .mockRejectedValueOnce(duplicateErr)
+      .mockResolvedValueOnce(LIVE_CREATED);
+    const { onComplete } = setup(onCreate);
+
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'Nvidia');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    const suggestionCard = await screen.findByRole('alert');
+    expect(screen.getByRole('button', { name: 'Company' })).toHaveAttribute('aria-pressed', 'true');
+    expect((screen.getByLabelText(/ticker/i) as HTMLInputElement).value).toBe('NVDA');
+
+    await user.click(within(suggestionCard).getByRole('button', { name: 'Create without registering' }));
+
+    const duplicateCard = await screen.findByRole('alert');
+    expect(duplicateCard).toHaveTextContent('Nvidia already has a workspace "NVDA"');
+    expect(screen.getByRole('button', { name: 'Other' })).toHaveAttribute('aria-pressed', 'true');
+
+    await user.click(within(duplicateCard).getByRole('button', { name: 'Create anyway' }));
+
+    await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(3));
+    const finalPayload = onCreate.mock.calls[2][0];
+    expect(finalPayload).toEqual({
+      name: 'Nvidia',
+      description: '',
+      allowDuplicateCompany: true,
+      skipCoverageSuggestion: true,
+    });
+    expect(finalPayload).not.toHaveProperty('coverageKind');
+    expect(finalPayload).not.toHaveProperty('ticker');
+    expect(finalPayload).not.toHaveProperty('displayName');
+    await waitFor(() => expect(onComplete).toHaveBeenCalledWith(LIVE_CREATED));
+
+    // 2. Editing the name after choosing "Create without registering" resets the skip choice
+    const onCreateAfterRename = vi
+      .fn()
+      .mockRejectedValueOnce(suggestionErr)
+      .mockRejectedValueOnce(duplicateErr)
+      .mockResolvedValueOnce(LIVE_CREATED);
+    const viewRename = renderWithProviders(
+      <CreateWorkspaceModal isOpen onClose={vi.fn()} onCreate={onCreateAfterRename} />,
+    );
+    const renameInput = within(viewRename.container).getByPlaceholderText(/enter workspace name/i);
+    await user.type(renameInput, 'Nvidia');
+    await user.click(within(viewRename.container).getByRole('button', { name: /^create$/i }));
+    const suggestionCard2 = await within(viewRename.container).findByRole('alert');
+    await user.click(within(suggestionCard2).getByRole('button', { name: 'Create without registering' }));
+    await within(viewRename.container).findByText(/Nvidia already has a workspace/);
+
+    await user.clear(renameInput);
+    await user.type(renameInput, 'AMD');
+    await user.click(within(viewRename.container).getByRole('button', { name: /^create$/i }));
+    await waitFor(() =>
+      expect(onCreateAfterRename).toHaveBeenLastCalledWith({
+        name: 'AMD',
+        description: '',
+      }),
+    );
+    viewRename.unmount();
+
+    // 3. Closing and reopening the modal resets the skip choice
+    const onCreateAfterClose = vi
+      .fn()
+      .mockRejectedValueOnce(suggestionErr)
+      .mockRejectedValueOnce(duplicateErr)
+      .mockResolvedValueOnce(LIVE_CREATED);
+    const onCloseSpy = vi.fn();
+    const viewClose = renderWithProviders(
+      <CreateWorkspaceModal isOpen onClose={onCloseSpy} onCreate={onCreateAfterClose} />,
+    );
+    const closeInput = within(viewClose.container).getByPlaceholderText(/enter workspace name/i);
+    await user.type(closeInput, 'Nvidia');
+    await user.click(within(viewClose.container).getByRole('button', { name: /^create$/i }));
+    const suggestionCard3 = await within(viewClose.container).findByRole('alert');
+    await user.click(within(suggestionCard3).getByRole('button', { name: 'Create without registering' }));
+    await within(viewClose.container).findByText(/Nvidia already has a workspace/);
+
+    await user.click(within(viewClose.container).getByRole('button', { name: /^cancel$/i }));
+    expect(onCloseSpy).toHaveBeenCalledOnce();
+    viewClose.rerender(
+      <CreateWorkspaceModal isOpen={false} onClose={onCloseSpy} onCreate={onCreateAfterClose} />,
+    );
+    viewClose.rerender(
+      <CreateWorkspaceModal isOpen onClose={onCloseSpy} onCreate={onCreateAfterClose} />,
+    );
+
+    await user.type(within(viewClose.container).getByPlaceholderText(/enter workspace name/i), 'Nvidia');
+    await user.click(within(viewClose.container).getByRole('button', { name: /^create$/i }));
+    await waitFor(() =>
+      expect(onCreateAfterClose).toHaveBeenLastCalledWith({
+        name: 'Nvidia',
+        description: '',
+      }),
+    );
+    viewClose.unmount();
+  });
 });

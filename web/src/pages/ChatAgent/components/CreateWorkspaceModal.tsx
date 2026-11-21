@@ -92,6 +92,7 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
   const [coverageDisplayName, setCoverageDisplayName] = useState('');
   const [coveragePrefilled, setCoveragePrefilled] = useState(false);
   const coverageUserEditedRef = useRef(false);
+  const skipCoverageRegistrationRef = useRef(false);
   const [description, setDescription] = useState('');
   const [queuedFiles, setQueuedFiles] = useState<File[]>([]);
   // Why the form can't go on: in words, or for want of a computer (none is
@@ -231,6 +232,13 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
     setCreationStep(failed ? 'error' : 'done');
   };
 
+  // DALTON-HOOK(workspace-dedup): reset sticky skip-registration choice if modal closes externally
+  useEffect(() => {
+    if (!isOpen) {
+      skipCoverageRegistrationRef.current = false;
+    }
+  }, [isOpen]);
+
   // DALTON-HOOK(workspace-dedup): apply suggestion prefill once coverage eligibility is enabled (handles query finishing after submit/409)
   const applySuggestionPrefill = useCallback(
     (suggestion: { coverage_kind?: string; ticker?: string | null; display_name?: string | null } | undefined) => {
@@ -238,6 +246,7 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
         !coverageUnitsEnabledRef.current ||
         !suggestion ||
         (suggestion.coverage_kind !== 'company' && suggestion.coverage_kind !== 'sector') ||
+        skipCoverageRegistrationRef.current ||
         coverageUserEditedRef.current ||
         coverageKindRef.current !== 'none'
       ) {
@@ -270,6 +279,16 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
       return;
     }
 
+    const effectiveSkipCoverage = skipCoverageSuggestion || skipCoverageRegistrationRef.current;
+    if (skipCoverageSuggestion) {
+      skipCoverageRegistrationRef.current = true;
+      setCoverageKind('none');
+      setCoverageTicker('');
+      setCoverageDisplayName('');
+      setCoveragePrefilled(false);
+      coverageUserEditedRef.current = false;
+    }
+
     setSubmitting(true);
     setRefusal(null);
 
@@ -282,9 +301,9 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
         description: description.trim(),
         ...(choosesComputer && target ? { computerId: target.computer_id } : {}),
         ...(allowDuplicateCompany ? { allowDuplicateCompany: true } : {}),
-        ...(skipCoverageSuggestion ? { skipCoverageSuggestion: true } : {}),
+        ...(effectiveSkipCoverage ? { skipCoverageSuggestion: true } : {}),
         // DALTON-HOOK(workspace-dedup): attach coverage registration fields when company or sector is selected (unless user chose skip or gated off)
-        ...(!skipCoverageSuggestion && coverageUnitsEnabledRef.current && coverageKind !== 'none'
+        ...(!effectiveSkipCoverage && coverageUnitsEnabledRef.current && coverageKind !== 'none'
           ? {
               coverageKind,
               ...(coverageKind === 'company' && trimmedTicker ? { ticker: trimmedTicker } : {}),
@@ -367,6 +386,7 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
     setCoverageDisplayName('');
     setCoveragePrefilled(false);
     coverageUserEditedRef.current = false;
+    skipCoverageRegistrationRef.current = false;
     setDescription('');
     setQueuedFiles([]);
     setRefusal(null);
@@ -518,8 +538,11 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
               onChange={(e) => {
                 const nextName = clampWorkspaceName(e.target.value);
                 setName(nextName);
-                // DALTON-HOOK(workspace-dedup): keep tracked name current, clear dedup/suggestion refusal & unedited prefill on edit
+                // DALTON-HOOK(workspace-dedup): keep tracked name current, clear dedup/suggestion refusal, skip choice & unedited prefill on edit
                 latestNameRef.current = nextName;
+                if (nextName !== name) {
+                  skipCoverageRegistrationRef.current = false;
+                }
                 if (refusal?.kind === 'companyExists' || refusal?.kind === 'coverageSuggestion') setRefusal(null);
                 if (coveragePrefilled && !coverageUserEditedRef.current) {
                   setCoverageKind('none');
@@ -549,6 +572,7 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
               disabled={submitting}
               onChangeKind={(next) => {
                 coverageUserEditedRef.current = true;
+                if (next !== 'none') skipCoverageRegistrationRef.current = false;
                 setCoveragePrefilled(false);
                 setCoverageKind(next);
               }}
@@ -678,7 +702,9 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
               matches={refusal.matches}
               disabled={submitting || !!preparingTarget}
               onCloseModal={resetAndClose}
-              onCreateAnyway={(requested) => void submitCreate(true, requested)}
+              onCreateAnyway={(requested) =>
+                void submitCreate(true, requested, skipCoverageRegistrationRef.current)
+              }
             />
           )}
           {refusal?.kind === 'coverageSuggestion' && (
