@@ -111,4 +111,51 @@ describe('useCreateWorkspace', () => {
       ],
     });
   });
+
+  // DALTON-HOOK(workspace-dedup): forward coverage registration fields and parse 409 model prefill suggestion
+  it('forwards coverageKind/ticker/displayName and parses model suggestion from 409', async () => {
+    const { companyWorkspaceExistsOf } = await import('../useCreateWorkspace');
+    const refusal = {
+      response: {
+        status: 409,
+        data: {
+          detail: {
+            code: 'company_workspace_exists',
+            message: 'dup',
+            matches: [{ workspace_name: 'NVDA', owner_name: 'Richard', can_read: false }],
+            suggestion: {
+              coverage_kind: 'company',
+              ticker: 'NVDA',
+              display_name: 'NVIDIA Corporation',
+            },
+          },
+        },
+      },
+    };
+    const parsed = companyWorkspaceExistsOf(refusal);
+    expect(parsed?.suggestion).toEqual({
+      coverage_kind: 'company',
+      ticker: 'NVDA',
+      display_name: 'NVIDIA Corporation',
+    });
+
+    const created = { workspace_id: 'ws-nvda', name: 'Nvidia' };
+    (createWorkspace as Mock).mockResolvedValueOnce(created);
+    const { result, queryClient } = renderHookWithProviders(() => useCreateWorkspace());
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
+    const out = await result.current({
+      name: 'Nvidia',
+      description: '',
+      coverageKind: 'company',
+      ticker: 'NVDA',
+      displayName: 'NVIDIA Corporation',
+    });
+    expect(out).toBe(created);
+    expect(createWorkspace).toHaveBeenLastCalledWith('Nvidia', '', {}, undefined, undefined, {
+      kind: 'company',
+      ticker: 'NVDA',
+      displayName: 'NVIDIA Corporation',
+    });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.dalton.coverageUnits() });
+  });
 });

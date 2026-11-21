@@ -42,14 +42,17 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import HTTPException
 from psycopg.rows import dict_row
 from pydantic import BaseModel
 
 from src.dalton.access_tiers import get_user_tier
-from src.dalton.coverage.identity import is_historical_duplicate_workspace
+from src.dalton.coverage.identity import (
+    _extract_ticker_from_text,
+    is_historical_duplicate_workspace,
+)
 from src.dalton.credentials import (
     disable_team_credential_sharing,
     get_team_credential_holder_id,
@@ -94,12 +97,20 @@ DEDUP_SYSTEM_PROMPT = (
     "2. 同一行业、上下游合作或竞争关系、母子公司（非同一上市主体）均不算重复。\n"
     "3. 若待新建名称是普通主题词（例如 \"Macro\"、\"AI\"），除非候选清单里有明显就是以该词为名称或代码的公司条目，否则不算重复。\n"
     "4. 把握不足、不确定时不要报告。\n"
-    "输出要求：只返回确认为同一家公司的候选项，最多 3 条；每条包含清单中的编号 id、把握程度 confidence（仅限 \"high\" 或 \"medium\"）和一句话原因 reason；没有匹配时 matches 返回空列表。"
+    "输出要求：只返回确认为同一家公司的候选项，最多 3 条；每条包含清单中的编号 id、把握程度 confidence（仅限 \"high\" 或 \"medium\"）和一句话原因 reason；没有匹配时 matches 返回空列表。\n"
+    "同时，请判断「待新建工作区名称」本身属于公司、行业还是其他，并填写附加字段（仅用于表单预填，只在把握高时给）：\n"
+    "- suggested_kind：\"company\"（某家具体公司）、\"sector\"（某个行业或赛道）或 \"none\"（其他主题/个人/不确定）。\n"
+    "- suggested_confidence：\"high\"、\"medium\" 或 \"low\"；只有非常确定时才填 \"high\"，不确定时填 \"low\" 或将 suggested_kind 设为 \"none\"。\n"
+    "- suggested_ticker：仅当 suggested_kind 为 \"company\"、suggested_confidence 为 \"high\" 且能唯一确定股票代码时填写标准代码（如 \"MSFT\"、\"0700.HK\"、\"600519.SS\"）；未上市、存在歧义或把握不足时填 null。\n"
+    "- suggested_display_name：仅当 suggested_kind 为 \"company\" 或 \"sector\" 且 suggested_confidence 为 \"high\" 时填写规范的公司名或行业名；把握不足时填 null。"
 )
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
 _UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+_SUGGESTION_PLACEHOLDERS = frozenset(
+    {"-", "--", "n/a", "na", "none", "null", "unknown", "未知", "无"}
 )
 
 
@@ -115,6 +126,27 @@ class DedupLlmResult(BaseModel):
     """Structured LLM response for company workspace deduplication."""
 
     matches: list[DedupMatchItem]
+    suggested_kind: str | None = None
+    suggested_confidence: str | None = None
+    suggested_ticker: str | None = None
+    suggested_display_name: str | None = None
+
+
+@dataclass(frozen=True)
+class DedupCoverageSuggestion:
+    """High-confidence workspace coverage classification suggested by the dedup LLM."""
+
+    coverage_kind: Literal["company", "sector", "none"]
+    ticker: str | None = None
+    display_name: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"coverage_kind": self.coverage_kind}
+        if self.ticker:
+            out["ticker"] = self.ticker
+        if self.display_name:
+            out["display_name"] = self.display_name
+        return out
 
 
 @dataclass(frozen=True)
@@ -167,6 +199,7 @@ class DuplicateMatch:
     # Internal-only IDs for server audit logging when allow_duplicate_company=True;
     # never serialized into client or tool payloads.
     matched_workspace_ids: tuple[str, ...] = ()
+    suggestion: DedupCoverageSuggestion | None = None
 
     @property
     def primary(self) -> DuplicateWorkspaceCandidate:
@@ -198,6 +231,11 @@ class DuplicateMatch:
 
     def matches_payload(self) -> list[dict[str, Any]]:
         return [m.to_dict() for m in self.matches]
+
+    def suggestion_payload(self) -> dict[str, Any] | None:
+        if self.suggestion is None:
+            return None
+        return self.suggestion.to_dict()
 
 
 @dataclass(frozen=True)
@@ -916,21 +954,65 @@ def _get_dalton_complete_fn() -> Any:
     return dalton_complete
 
 
-def _parse_llm_matches(
+def _extract_suggestion(
+    raw_kind: Any,
+    raw_confidence: Any,
+    raw_ticker: Any,
+    raw_display_name: Any,
+) -> DedupCoverageSuggestion | None:
+    kind = str(raw_kind or "").strip().lower()
+    if kind == "other":
+        kind = "none"
+    if kind not in ("company", "sector"):
+        return None
+    conf = str(raw_confidence or "").strip().lower()
+    if conf != "high":
+        return None
+
+    clean_display = " ".join(str(raw_display_name or "").split()).strip()
+    if not clean_display or clean_display.lower() in _SUGGESTION_PLACEHOLDERS:
+        clean_display = None
+
+    clean_ticker: str | None = None
+    if kind == "company":
+        raw_t = str(raw_ticker or "").strip()
+        if raw_t and raw_t.lower() not in _SUGGESTION_PLACEHOLDERS:
+            clean_ticker = _extract_ticker_from_text(raw_t)
+
+    return DedupCoverageSuggestion(
+        coverage_kind=kind,  # type: ignore[arg-type]
+        ticker=clean_ticker,
+        display_name=clean_display,
+    )
+
+
+def _parse_llm_payload(
     comp: Any,
     batch_by_id: Mapping[str, _CandidateEntry],
-) -> list[tuple[_CandidateEntry, str, str]]:
-    """Parse structured LLM output, filter confidence & IDs, and cap per batch at 3."""
+) -> tuple[list[tuple[_CandidateEntry, str, str]], DedupCoverageSuggestion | None]:
+    """Parse structured LLM output, filter confidence & IDs, cap matches at 3, and extract high-confidence suggestion."""
     raw_data = getattr(comp, "data", None)
     raw_text = getattr(comp, "text", None)
 
     raw_matches: Any = None
+    raw_s_kind: Any = None
+    raw_s_conf: Any = None
+    raw_s_ticker: Any = None
+    raw_s_display: Any = None
     if isinstance(raw_data, DedupLlmResult):
         raw_matches = raw_data.matches
+        raw_s_kind = raw_data.suggested_kind
+        raw_s_conf = raw_data.suggested_confidence
+        raw_s_ticker = raw_data.suggested_ticker
+        raw_s_display = raw_data.suggested_display_name
     elif isinstance(raw_data, Mapping):
         if "matches" not in raw_data or not isinstance(raw_data["matches"], list):
             raise ValueError("Invalid dedup structured payload: missing matches list")
         raw_matches = raw_data["matches"]
+        raw_s_kind = raw_data.get("suggested_kind")
+        raw_s_conf = raw_data.get("suggested_confidence")
+        raw_s_ticker = raw_data.get("suggested_ticker")
+        raw_s_display = raw_data.get("suggested_display_name")
     elif raw_data is None and isinstance(raw_text, str) and raw_text.strip():
         txt = raw_text.strip()
         fence = _FENCE_RE.match(txt)
@@ -942,6 +1024,10 @@ def _parse_llm_matches(
         ):
             raise ValueError("Invalid dedup JSON text payload: missing matches list")
         raw_matches = parsed["matches"]
+        raw_s_kind = parsed.get("suggested_kind")
+        raw_s_conf = parsed.get("suggested_confidence")
+        raw_s_ticker = parsed.get("suggested_ticker")
+        raw_s_display = parsed.get("suggested_display_name")
     else:
         raise ValueError("Empty or unparseable dedup LLM payload")
 
@@ -981,7 +1067,19 @@ def _parse_llm_matches(
             item[0].order_idx,
         ),
     )
-    return ranked[:MAX_DUPLICATE_MATCHES]
+    suggestion = _extract_suggestion(
+        raw_s_kind, raw_s_conf, raw_s_ticker, raw_s_display
+    )
+    return ranked[:MAX_DUPLICATE_MATCHES], suggestion
+
+
+def _parse_llm_matches(
+    comp: Any,
+    batch_by_id: Mapping[str, _CandidateEntry],
+) -> list[tuple[_CandidateEntry, str, str]]:
+    """Parse structured LLM output, filter confidence & IDs, and cap per batch at 3."""
+    matches, _ = _parse_llm_payload(comp, batch_by_id)
+    return matches
 
 
 async def _run_batch_with_fallback(
@@ -993,6 +1091,7 @@ async def _run_batch_with_fallback(
     deadline: float,
     is_external: bool = False,
     skip_journal: bool = False,
+    suggestion_out: list[DedupCoverageSuggestion] | None = None,
 ) -> list[tuple[_CandidateEntry, str, str]]:
     batch_by_id = {entry.short_id: entry for entry in batch}
     user_prompt = _build_batch_user_prompt(raw_name, batch)
@@ -1070,14 +1169,17 @@ async def _run_batch_with_fallback(
                 status = str(getattr(comp, "status", None) or "").strip().lower()
                 if err_kind in ("timeout", "deadline"):
                     last_exc = TimeoutError(f"Dedup model {err_kind}")
-                    if err_kind == "deadline" or time.monotonic() >= deadline:
+                    if time.monotonic() >= deadline:
                         raise last_exc
                 else:
                     last_exc = RuntimeError(
                         f"Dedup model call failed: {status or err_kind or 'unknown'}"
                     )
                 continue
-            return _parse_llm_matches(comp, batch_by_id)
+            matches, suggestion = _parse_llm_payload(comp, batch_by_id)
+            if suggestion is not None and suggestion_out is not None:
+                suggestion_out.append(suggestion)
+            return matches
         except Exception as exc:
             last_exc = exc
             if (
@@ -1092,6 +1194,21 @@ async def _run_batch_with_fallback(
     raise RuntimeError("No assist model configured for workspace dedup")
 
 
+def _pick_best_suggestion(
+    suggestions: list[DedupCoverageSuggestion],
+) -> DedupCoverageSuggestion | None:
+    if not suggestions:
+        return None
+    ranked = sorted(
+        suggestions,
+        key=lambda s: (
+            0 if s.coverage_kind == "company" and s.ticker else (1 if s.coverage_kind == "company" else 2),
+            0 if s.display_name else 1,
+        ),
+    )
+    return ranked[0]
+
+
 async def _judge_candidates_with_llm(
     *,
     uid: str,
@@ -1100,6 +1217,7 @@ async def _judge_candidates_with_llm(
     stats: dict[str, int] | None = None,
     is_external: bool = False,
     skip_journal: bool = False,
+    suggestion_out: list[DedupCoverageSuggestion] | None = None,
 ) -> list[tuple[_CandidateEntry, str, str]]:
     """Run parallel batched LLM matching under a shared 15s deadline."""
     if not entries:
@@ -1124,6 +1242,7 @@ async def _judge_candidates_with_llm(
         for i in range(0, len(entries), DEDUP_BATCH_SIZE)
     ]
 
+    batch_suggestions: list[DedupCoverageSuggestion] = []
     tasks = [
         asyncio.create_task(
             _run_batch_with_fallback(
@@ -1134,6 +1253,7 @@ async def _judge_candidates_with_llm(
                 deadline=deadline,
                 is_external=is_external,
                 skip_journal=skip_journal,
+                suggestion_out=batch_suggestions if suggestion_out is not None else None,
             )
         )
         for batch in batches
@@ -1164,6 +1284,11 @@ async def _judge_candidates_with_llm(
     ws_count = stats["workspace_count"] if stats is not None else len(entries)
     if succeeded == 0:
         raise failed_exc or TimeoutError("Workspace dedup LLM timed out")
+
+    if suggestion_out is not None and not is_external:
+        best_suggestion = _pick_best_suggestion(batch_suggestions)
+        if best_suggestion is not None:
+            suggestion_out.append(best_suggestion)
 
     if failed_exc is not None:
         logger.warning(
@@ -1319,9 +1444,18 @@ async def _refresh_live_hits(
                 else entry.lead_analyst_name
             )
             fresh_display = str(u_row.get("display_name") or "").strip() or entry.unit_display_name
-            fresh_ticker = str(u_row.get("ticker") or "").strip().upper() or entry.ticker
-
             current_ws_id = _norm_uuid(u_row.get("workspace_id"))
+            same_ws = bool(
+                current_ws_id and entry.ws_id and current_ws_id == entry.ws_id
+            )
+            unit_ticker_now = str(u_row.get("ticker") or "").strip().upper() or None
+            kept_doc_ticker = entry.doc_ticker if same_ws else None
+            if "ticker" in u_row:
+                fresh_ticker = unit_ticker_now or kept_doc_ticker
+            else:
+                unit_ticker_now = entry.unit_ticker
+                fresh_ticker = entry.unit_ticker or kept_doc_ticker
+
             if not current_ws_id:
                 updated_entry = replace(
                     entry,
@@ -1331,6 +1465,8 @@ async def _refresh_live_hits(
                     owner_name=None,
                     lead_analyst_name=fresh_lead,
                     ticker=fresh_ticker,
+                    unit_ticker=unit_ticker_now,
+                    doc_ticker=None,
                     unit_display_name=fresh_display,
                     ws_row=None,
                 )
@@ -1347,6 +1483,8 @@ async def _refresh_live_hits(
                     owner_name=fresh_ws.get("owner_name") or entry.owner_name,
                     lead_analyst_name=fresh_lead,
                     ticker=fresh_ticker,
+                    unit_ticker=unit_ticker_now,
+                    doc_ticker=kept_doc_ticker,
                     unit_display_name=fresh_display,
                     ws_row=fresh_ws,
                 )
@@ -1415,12 +1553,14 @@ async def _find_matches(
     if early_exit or not entries:
         return None
 
+    suggestion_out: list[DedupCoverageSuggestion] = []
     hits = await _judge_candidates_with_llm(
         uid=uid,
         raw_name=raw_name,
         entries=entries,
         stats=stats,
         is_external=(caller_tier == "external"),
+        suggestion_out=suggestion_out,
     )
     if not hits:
         return None
@@ -1486,6 +1626,7 @@ async def _find_matches(
         message=message,
         matches=tuple(resolved),
         matched_workspace_ids=tuple(matched_ids),
+        suggestion=suggestion_out[0] if suggestion_out else None,
     )
 
 

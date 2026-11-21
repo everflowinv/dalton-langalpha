@@ -8,8 +8,10 @@ table constraints and locked transactions live in
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
+import unicodedata
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -438,3 +440,122 @@ def _require_uuid(raw: str, field: str) -> str:
         return str(uuid.UUID(val))
     except (ValueError, AttributeError) as exc:
         raise ValueError(f"{field} must be a UUID, got {raw!r}") from exc
+
+
+def _slugify_for_unit(raw: str, *, kind: str) -> str:
+    """Derive a deterministic `[a-z0-9][a-z0-9._-]{0,63}` slug from a ticker or display name."""
+    cleaned = str(raw or "").strip()
+    if not cleaned:
+        return f"{kind}-unit"
+    digest = hashlib.sha1(cleaned.encode("utf-8")).hexdigest()
+    has_non_ascii = any(ord(ch) > 127 for ch in cleaned)
+    ascii_text = "".join(
+        ch for ch in unicodedata.normalize("NFKD", cleaned) if not unicodedata.combining(ch)
+    ).lower()
+    base = re.sub(r"[^a-z0-9._-]+", "-", ascii_text)
+    base = re.sub(r"-{2,}", "-", base).strip("._-")
+    if not base or not re.match(r"^[a-z0-9]", base):
+        return f"{kind}-{digest[:8]}"
+    if has_non_ascii:
+        suffix = f"-{digest[:6]}"
+        base = base[: 64 - len(suffix)].rstrip("._-")
+        if not base or not re.match(r"^[a-z0-9]", base):
+            return f"{kind}-{digest[:8]}"
+        candidate = f"{base}{suffix}"
+    else:
+        candidate = base[:64].rstrip("._-")
+    if not candidate or not _SLUG_RE.match(candidate):
+        return f"{kind}-{digest[:8]}"
+    return candidate
+
+
+def _format_auto_register_failure(exc: ValueError, *, ticker: str | None) -> str:
+    from src.dalton.coverage.unit_errors import classify_coverage_unit_error
+
+    code, _ = classify_coverage_unit_error(exc)
+    if code == "ticker_conflict":
+        t_label = f" {ticker}" if ticker else ""
+        return f"股票代码{t_label} 已被其他覆盖单元登记，工作区已创建但未自动登记覆盖单元。"
+    if code == "slug_conflict":
+        return "同名覆盖单元已被登记，工作区已创建但未自动登记覆盖单元。"
+    if code == "workspace_conflict":
+        return "该工作区已绑定其他覆盖单元。"
+    if code == "invalid_ticker":
+        return f"股票代码格式无效，工作区已创建但未自动登记覆盖单元（{exc}）。"
+    if code == "sector_ticker_refused":
+        return "行业覆盖单元不能填写股票代码，工作区已创建但未自动登记覆盖单元。"
+    return f"覆盖单元自动登记未成功，工作区已创建但未绑定覆盖单元（{exc}）。"
+
+
+async def auto_register_workspace_coverage_unit(
+    user_id: str,
+    *,
+    workspace_id: str,
+    workspace_name: str,
+    coverage_kind: str | None,
+    ticker: str | None = None,
+    display_name: str | None = None,
+    conn: Any = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Auto-register and bind a coverage unit after workspace creation.
+
+    Returns ``(unit_row, warning_message)``. Failures never raise or roll back
+    the newly created workspace: external members are refused without calling
+    ``register_coverage_unit``, and validation/conflict errors return a
+    non-fatal hint in ``warning_message``.
+    """
+    raw_kind = str(coverage_kind or "").strip().lower()
+    if raw_kind in ("", "none", "other"):
+        return None, None
+    if raw_kind not in VALID_UNIT_KINDS:
+        return None, f"不支持的覆盖类型 {coverage_kind!r}，工作区已创建但未登记覆盖单元。"
+
+    from src.dalton.access_tiers import is_internal_or_admin
+    from src.dalton.settings import get_dalton_settings, is_coverage_units_enabled
+
+    if not get_dalton_settings().enabled or not is_coverage_units_enabled():
+        return None, "覆盖单元功能未开启，工作区已创建但未登记覆盖单元。"
+
+    uid = str(user_id or "").strip()
+    if not uid or not await is_internal_or_admin(uid):
+        return None, "外部成员无权登记团队覆盖单元，工作区已创建但未自动登记。"
+
+    eff_display_name = str(display_name or "").strip() or str(workspace_name or "").strip()
+    eff_ticker = str(ticker or "").strip() or None
+
+    try:
+        if raw_kind == "company" and eff_ticker:
+            norm_ticker = _normalize_ticker(eff_ticker)
+            slug = _slugify_for_unit(norm_ticker, kind=raw_kind)
+            eff_ticker = norm_ticker
+        else:
+            slug = _slugify_for_unit(eff_display_name or workspace_name, kind=raw_kind)
+
+        row = await register_coverage_unit(
+            uid,
+            kind=raw_kind,
+            slug=slug,
+            display_name=eff_display_name,
+            ticker=eff_ticker,
+            workspace_id=workspace_id,
+            conn=conn,
+        )
+        serializable = {
+            k: (v.isoformat() if hasattr(v, "isoformat") else (str(v) if isinstance(v, uuid.UUID) else v))
+            for k, v in row.items()
+        }
+        return serializable, None
+    except ValueError as exc:
+        logger.info(
+            "Workspace %s created without coverage unit registration (%s)",
+            workspace_id,
+            type(exc).__name__,
+        )
+        return None, _format_auto_register_failure(exc, ticker=eff_ticker)
+    except Exception as exc:
+        logger.warning(
+            "Unexpected error auto-registering coverage unit for workspace %s (%s)",
+            workspace_id,
+            type(exc).__name__,
+        )
+        return None, "覆盖单元自动登记失败，工作区已创建但未绑定覆盖单元，可在覆盖管理中手动登记。"

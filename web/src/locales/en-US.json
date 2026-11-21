@@ -1788,6 +1788,20 @@
     "filesUploaded": "{{count}} file(s) uploaded",
     "filesFailed": "· {{count}} failed",
     "openWorkspace": "Open Workspace",
+    "coverage": {
+      "typeLabel": "Type",
+      "company": "Company",
+      "sector": "Sector",
+      "other": "Other",
+      "tickerLabel": "Ticker",
+      "tickerPlaceholder": "e.g. NVDA, 0700.HK (optional if unlisted)",
+      "companyNameLabel": "Company Name",
+      "companyNamePlaceholder": "e.g. NVIDIA Corporation (defaults to workspace name)",
+      "sectorNameLabel": "Sector Name",
+      "sectorNamePlaceholder": "e.g. AI Infrastructure (defaults to workspace name)",
+      "prefilledHint": "Pre-filled from workspace check — you can edit these before creating.",
+      "registrationWarningTitle": "Workspace created, coverage unit not registered"
+    },
     "duplicateCompany": {
       "summaryReadableWithLead": "{{company}} already has a workspace \"{{workspace}}\" (owner: {{owner}}, lead: {{lead}}). Continue there, or confirm to create another.",
       "summaryReadable": "{{company}} already has a workspace \"{{workspace}}\" (owner: {{owner}}). Continue there, or confirm to create another.",

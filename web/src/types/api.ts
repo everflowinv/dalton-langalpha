@@ -196,12 +196,24 @@ export interface Workspace {
   // DALTON-HOOK(colleague-dispatch): effective web access level and master switch for colleague workspace
   effective_web_access?: 'owner' | 'rw' | 'ro' | 'thread_only' | string | null;
   colleague_dispatch_enabled?: boolean | null;
+  // DALTON-HOOK(workspace-dedup): coverage unit auto-registration outcome on create
+  coverage_unit?: Record<string, unknown> | null;
+  coverage_unit_warning?: string | null;
   [key: string]: unknown;
 }
 
 export interface WorkspacesResponse {
   workspaces: Workspace[];
   total?: number;
+}
+
+// DALTON-HOOK(workspace-dedup): coverage unit type choice and model prefill suggestion
+export type CoverageUnitKindChoice = 'company' | 'sector' | 'none';
+
+export interface DedupCoverageSuggestion {
+  coverage_kind: CoverageUnitKindChoice;
+  ticker?: string | null;
+  display_name?: string | null;
 }
 
 /** Request body for `POST /api/v1/workspaces`. */
@@ -211,8 +223,11 @@ export interface WorkspaceCreate {
   config?: Record<string, unknown>;
   /** The caller's live computer to put the folder on. Omitted means the primary. */
   computer_id?: string;
-  // DALTON-HOOK(workspace-dedup): allow overriding duplicate company workspace check on explicit confirm
+  // DALTON-HOOK(workspace-dedup): allow overriding duplicate company workspace check and auto-registering coverage unit
   allow_duplicate_company?: boolean;
+  coverage_kind?: CoverageUnitKindChoice;
+  ticker?: string;
+  display_name?: string;
 }
 
 // DALTON-HOOK(workspace-dedup): matched existing company workspace or unbound coverage unit from 409 company_workspace_exists

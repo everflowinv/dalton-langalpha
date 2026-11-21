@@ -4,18 +4,21 @@ import { useTranslation } from 'react-i18next';
 import { X, Upload, FileText, CheckCircle2, Circle, AlertCircle } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
 import { buttonSlot } from '@/components/ui/button-class';
+// DALTON-HOOK(workspace-dedup): non-fatal toast when coverage unit auto-registration fails
+import { toast } from '@/components/ui/use-toast';
 import { Input } from '../../../components/ui/input';
 import { Select } from '@/components/ui/select';
 import { useLocale } from '@/hooks/useLocale';
 import { formatBytes } from '@/lib/format';
-import type { Computer, Workspace } from '@/types/api';
+import type { Computer, CoverageUnitKindChoice, Workspace } from '@/types/api';
 import { startWorkspace, uploadWorkspaceFile } from '../utils/api';
 import { isNeedsComputer, needsBackupOf } from '../utils/needsComputer';
 import { useOpenComputers } from '../hooks/useOpenComputers';
 import { ComputerRefusal, type ComputerRefusalKind } from './ComputerRefusal';
 import { createWorkspaceDenialMessage, denialMessage } from '../utils/denialMessage';
 import { clampWorkspaceName } from '../utils/workspaceName';
-// DALTON-HOOK(workspace-dedup): duplicate company workspace check helper & notice card
+// DALTON-HOOK(workspace-dedup): duplicate company workspace check helper, coverage fields & notice card
+import { CoverageUnitFields } from './dalton/CoverageUnitFields';
 import { DuplicateCompanyNotice } from './dalton/DuplicateCompanyNotice';
 import {
   companyWorkspaceExistsOf,
@@ -70,8 +73,13 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
 
   // Form state
   const [name, setName] = useState('');
-  // DALTON-HOOK(workspace-dedup): track latest typed name to discard stale 409 dedup responses
+  // DALTON-HOOK(workspace-dedup): track latest typed name & coverage unit fields / prefill state
   const latestNameRef = useRef('');
+  const [coverageKind, setCoverageKind] = useState<CoverageUnitKindChoice>('none');
+  const [coverageTicker, setCoverageTicker] = useState('');
+  const [coverageDisplayName, setCoverageDisplayName] = useState('');
+  const [coveragePrefilled, setCoveragePrefilled] = useState(false);
+  const coverageUserEditedRef = useRef(false);
   const [description, setDescription] = useState('');
   const [queuedFiles, setQueuedFiles] = useState<File[]>([]);
   // Why the form can't go on: in words, or for want of a computer (none is
@@ -224,27 +232,57 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
 
     let workspace: Workspace;
     try {
+      const trimmedTicker = coverageTicker.trim();
+      const trimmedDisplay = coverageDisplayName.trim();
       workspace = await onCreate({
         name: submittedName,
         description: description.trim(),
         ...(choosesComputer && target ? { computerId: target.computer_id } : {}),
         ...(allowDuplicateCompany ? { allowDuplicateCompany: true } : {}),
+        // DALTON-HOOK(workspace-dedup): attach coverage registration fields when company or sector is selected
+        ...(coverageKind !== 'none'
+          ? {
+              coverageKind,
+              ...(coverageKind === 'company' && trimmedTicker ? { ticker: trimmedTicker } : {}),
+              ...(trimmedDisplay ? { displayName: trimmedDisplay } : {}),
+            }
+          : {}),
       });
     } catch (err: unknown) {
       // A refusal keeps the user on the form with their input intact. On a 429
       // the sentence is the quota service's, relayed as it arrived.
       setSubmitting(false);
       const backupOff = needsBackupOf(err);
-      // DALTON-HOOK(workspace-dedup): parse 409 company_workspace_exists before generic denial copy
+      // DALTON-HOOK(workspace-dedup): parse 409 company_workspace_exists before generic denial copy and prefill coverage fields
       const companyExists = companyWorkspaceExistsOf(err);
       if (isNeedsComputer(err)) setRefusal({ kind: 'needsComputer' });
       else if (backupOff) setRefusal({ kind: 'needsBackup', ...backupOff });
       else if (companyExists) {
         if (latestNameRef.current.trim() === submittedName) {
           setRefusal({ kind: 'companyExists', requestedName: submittedName, ...companyExists });
+          const suggestion = companyExists.suggestion;
+          if (
+            suggestion &&
+            (suggestion.coverage_kind === 'company' || suggestion.coverage_kind === 'sector') &&
+            !coverageUserEditedRef.current &&
+            coverageKind === 'none'
+          ) {
+            setCoverageKind(suggestion.coverage_kind);
+            setCoverageTicker(suggestion.coverage_kind === 'company' ? (suggestion.ticker ?? '') : '');
+            setCoverageDisplayName(suggestion.display_name ?? '');
+            setCoveragePrefilled(true);
+          }
         }
       } else setRefusal({ kind: 'message', message: createWorkspaceDenialMessage(err, t) });
       return;
+    }
+
+    // DALTON-HOOK(workspace-dedup): show non-fatal hint when workspace succeeded but coverage registration did not
+    if (workspace.coverage_unit_warning) {
+      toast({
+        title: t('workspace.coverage.registrationWarningTitle', 'Workspace created, coverage unit not registered'),
+        description: workspace.coverage_unit_warning,
+      });
     }
 
     setCreatedWorkspace(workspace);
@@ -278,8 +316,13 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
 
   const resetAndClose = () => {
     setName('');
-    // DALTON-HOOK(workspace-dedup): clear tracked name ref when resetting modal
+    // DALTON-HOOK(workspace-dedup): clear tracked name ref & coverage fields when resetting modal
     latestNameRef.current = '';
+    setCoverageKind('none');
+    setCoverageTicker('');
+    setCoverageDisplayName('');
+    setCoveragePrefilled(false);
+    coverageUserEditedRef.current = false;
     setDescription('');
     setQueuedFiles([]);
     setRefusal(null);
@@ -431,9 +474,15 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
               onChange={(e) => {
                 const nextName = clampWorkspaceName(e.target.value);
                 setName(nextName);
-                // DALTON-HOOK(workspace-dedup): keep tracked name current and clear dedup refusal on edit
+                // DALTON-HOOK(workspace-dedup): keep tracked name current, clear dedup refusal & unedited prefill on edit
                 latestNameRef.current = nextName;
                 if (refusal?.kind === 'companyExists') setRefusal(null);
+                if (coveragePrefilled && !coverageUserEditedRef.current) {
+                  setCoverageKind('none');
+                  setCoverageTicker('');
+                  setCoverageDisplayName('');
+                  setCoveragePrefilled(false);
+                }
               }}
               placeholder={t('workspace.enterWorkspaceName')}
               className="w-full"
@@ -445,6 +494,30 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
               autoFocus
             />
           </div>
+
+          {/* DALTON-HOOK(workspace-dedup): workspace coverage type, ticker, and display name fields */}
+          <CoverageUnitFields
+            coverageKind={coverageKind}
+            ticker={coverageTicker}
+            displayName={coverageDisplayName}
+            prefilled={coveragePrefilled}
+            disabled={submitting}
+            onChangeKind={(next) => {
+              coverageUserEditedRef.current = true;
+              setCoveragePrefilled(false);
+              setCoverageKind(next);
+            }}
+            onChangeTicker={(next) => {
+              coverageUserEditedRef.current = true;
+              setCoveragePrefilled(false);
+              setCoverageTicker(next);
+            }}
+            onChangeDisplayName={(next) => {
+              coverageUserEditedRef.current = true;
+              setCoveragePrefilled(false);
+              setCoverageDisplayName(next);
+            }}
+          />
 
           <div className="cwm-field">
             <label className="cwm-label">

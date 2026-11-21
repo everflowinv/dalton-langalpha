@@ -27,6 +27,12 @@ vi.mock('../../utils/api', () => ({
     (err as { message?: string })?.message ?? 'Request failed',
 }));
 
+// DALTON-HOOK(workspace-dedup): mock toast for coverage registration warning
+vi.mock('@/components/ui/use-toast', () => ({
+  toast: vi.fn(),
+}));
+
+import { toast } from '@/components/ui/use-toast';
 import { getComputerProviders, getComputers, startWorkspace, uploadWorkspaceFile } from '../../utils/api';
 import { openComputersPanel } from '../../hooks/computerPanelStore';
 import CreateWorkspaceModal from '../CreateWorkspaceModal';
@@ -624,5 +630,125 @@ describe('CreateWorkspaceModal, duplicate company workspace', () => {
 
     await user.type(input, ' Corp');
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('submits coverageKind/ticker/displayName when Company is selected and defaults to Other', async () => {
+    const user = userEvent.setup();
+    const onCreate = vi.fn().mockResolvedValue(LIVE_CREATED);
+    const { onComplete } = setup(onCreate);
+
+    // Default selection is "Other" -> no ticker/displayName fields rendered.
+    const otherBtn = screen.getByRole('button', { name: 'Other' });
+    expect(otherBtn).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.queryByLabelText(/ticker/i)).not.toBeInTheDocument();
+
+    // Select Company, fill ticker and company name, and submit.
+    await user.click(screen.getByRole('button', { name: 'Company' }));
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'Nvidia');
+    await user.type(screen.getByLabelText(/ticker/i), 'NVDA');
+    await user.type(screen.getByLabelText(/company name/i), 'NVIDIA Corporation');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    await waitFor(() =>
+      expect(onCreate).toHaveBeenCalledWith({
+        name: 'Nvidia',
+        description: '',
+        coverageKind: 'company',
+        ticker: 'NVDA',
+        displayName: 'NVIDIA Corporation',
+      }),
+    );
+    await waitFor(() => expect(onComplete).toHaveBeenCalledWith(LIVE_CREATED));
+  });
+
+  it('prefills Type, Ticker, and Company Name from 409 suggestion and lets user edit before Create anyway', async () => {
+    const user = userEvent.setup();
+    const onCreate = vi
+      .fn()
+      .mockRejectedValueOnce(
+        Object.assign(new Error('Request failed with status code 409'), {
+          response: {
+            status: 409,
+            data: {
+              detail: {
+                code: 'company_workspace_exists',
+                message: 'dup',
+                matches: [{ workspace_name: 'NVDA', owner_name: 'Richard', can_read: false }],
+                suggestion: {
+                  coverage_kind: 'company',
+                  ticker: 'NVDA',
+                  display_name: 'NVIDIA Corporation',
+                },
+              },
+            },
+          },
+        }),
+      )
+      .mockResolvedValueOnce({
+        ...LIVE_CREATED,
+        coverage_unit_warning: '股票代码 NVDA.US 已被其他覆盖单元登记，工作区已创建但未自动登记覆盖单元。',
+      });
+    const { onComplete } = setup(onCreate);
+
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'Nvidia');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    const card = await screen.findByRole('alert');
+    expect(screen.getByRole('button', { name: 'Company' })).toHaveAttribute('aria-pressed', 'true');
+    const tickerInput = screen.getByLabelText(/ticker/i) as HTMLInputElement;
+    const companyInput = screen.getByLabelText(/company name/i) as HTMLInputElement;
+    expect(tickerInput.value).toBe('NVDA');
+    expect(companyInput.value).toBe('NVIDIA Corporation');
+
+    // User can edit the prefilled ticker before clicking Create anyway.
+    await user.clear(tickerInput);
+    await user.type(tickerInput, 'NVDA.US');
+    await user.click(within(card).getByRole('button', { name: 'Create anyway' }));
+
+    await waitFor(() =>
+      expect(onCreate).toHaveBeenLastCalledWith({
+        name: 'Nvidia',
+        description: '',
+        allowDuplicateCompany: true,
+        coverageKind: 'company',
+        ticker: 'NVDA.US',
+        displayName: 'NVIDIA Corporation',
+      }),
+    );
+    await waitFor(() => expect(onComplete).toHaveBeenCalled());
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Workspace created, coverage unit not registered',
+        description: '股票代码 NVDA.US 已被其他覆盖单元登记，工作区已创建但未自动登记覆盖单元。',
+      }),
+    );
+  });
+
+  it('supports Sector type and Chinese i18n labels', async () => {
+    const user = userEvent.setup();
+    const { default: i18n } = await import('@/i18n');
+    await i18n.changeLanguage('zh-CN');
+    try {
+      const onCreate = vi.fn().mockResolvedValue(LIVE_CREATED);
+      setup(onCreate);
+
+      expect(screen.getByRole('button', { name: '其他' })).toHaveAttribute('aria-pressed', 'true');
+      await user.click(screen.getByRole('button', { name: '行业' }));
+      expect(screen.queryByLabelText(/股票代码/)).not.toBeInTheDocument();
+      await user.type(screen.getByPlaceholderText('输入工作区名称'), '半导体');
+      await user.type(screen.getByLabelText(/行业名/), '半导体行业');
+      await user.click(screen.getByRole('button', { name: '创建' }));
+
+      await waitFor(() =>
+        expect(onCreate).toHaveBeenCalledWith({
+          name: '半导体',
+          description: '',
+          coverageKind: 'sector',
+          displayName: '半导体行业',
+        }),
+      );
+    } finally {
+      await i18n.changeLanguage('en-US');
+    }
   });
 });

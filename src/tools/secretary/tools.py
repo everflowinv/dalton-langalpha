@@ -281,6 +281,10 @@ async def workspaces_create(
     preapproved: bool = False,
     # DALTON-HOOK(workspace-dedup): allow bypassing company dedup when user explicitly confirms
     allow_duplicate_company: bool = False,
+    # DALTON-HOOK(workspace-dedup): optional coverage unit auto-registration fields
+    coverage_kind: str | None = None,
+    ticker: str | None = None,
+    display_name: str | None = None,
 ) -> Command:
     """Create a new workspace, once the user confirms unless ``preapproved``.
 
@@ -308,12 +312,17 @@ async def workspaces_create(
                 type(exc).__name__,
             )
         if dup is not None:
+            extra_fields: dict[str, Any] = {}
+            suggestion = dup.suggestion_payload()
+            if suggestion is not None:
+                extra_fields["suggestion"] = suggestion
             return error_command(
                 dup.message,
                 tool_call_id,
                 code="company_workspace_exists",
                 message=dup.message,
                 matches=dup.matches_payload(),
+                **extra_fields,
             )
     # --- DALTON-HOOK(workspace-dedup): end ---
 
@@ -390,6 +399,23 @@ async def workspaces_create(
             "workspace_id": str(workspace["workspace_id"]),
             "workspace_name": workspace["name"],
         }
+        # --- DALTON-HOOK(workspace-dedup): begin ---
+        if coverage_kind and str(coverage_kind).strip().lower() not in ("", "none", "other"):
+            from src.dalton.coverage.units import auto_register_workspace_coverage_unit
+
+            unit_row, unit_warning = await auto_register_workspace_coverage_unit(
+                user_id,
+                workspace_id=str(workspace["workspace_id"]),
+                workspace_name=str(workspace.get("name") or name),
+                coverage_kind=coverage_kind,
+                ticker=ticker,
+                display_name=display_name,
+            )
+            if unit_row is not None:
+                result["coverage_unit"] = unit_row
+            if unit_warning is not None:
+                result["coverage_unit_warning"] = unit_warning
+        # --- DALTON-HOOK(workspace-dedup): end ---
         # --- DALTON-HOOK(workspace-folder-ready): begin ---
         # The folder is only built at the machine's next acquire, so say where
         # it will be and whether it is there now — the incident's hand-off

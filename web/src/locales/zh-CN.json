@@ -1833,6 +1833,20 @@
     "filesUploaded": "已上传 {{count}} 个文件",
     "filesFailed": "· {{count}} 个失败",
     "openWorkspace": "打开工作区",
+    "coverage": {
+      "typeLabel": "类型",
+      "company": "公司",
+      "sector": "行业",
+      "other": "其他",
+      "tickerLabel": "股票代码",
+      "tickerPlaceholder": "如 NVDA、0700.HK（未上市可留空）",
+      "companyNameLabel": "公司名",
+      "companyNamePlaceholder": "如 英伟达（留空则使用工作区名称）",
+      "sectorNameLabel": "行业名",
+      "sectorNamePlaceholder": "如 人工智能基础设施（留空则使用工作区名称）",
+      "prefilledHint": "已根据查重结果预填，创建前可修改。",
+      "registrationWarningTitle": "工作区已创建，覆盖单元未登记"
+    },
     "duplicateCompany": {
       "summaryReadableWithLead": "「{{company}}」已有工作区「{{workspace}}」（所有者 {{owner}}，主分析师 {{lead}}），请直接在那里继续。确实要另建，请确认后重试。",
       "summaryReadable": "「{{company}}」已有工作区「{{workspace}}」（所有者 {{owner}}），请直接在那里继续。确实要另建，请确认后重试。",

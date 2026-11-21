@@ -3,6 +3,7 @@
  */
 import { api } from '@/api/client';
 import type {
+  CoverageUnitKindChoice, // DALTON-HOOK(workspace-dedup): coverage unit kind on create
   Workspace,
   WorkspaceCreate,
   WorkspaceMove,
@@ -38,15 +39,32 @@ export async function createWorkspace(
   description: string = '',
   config: Record<string, unknown> = {},
   computerId?: string | null,
-  // DALTON-HOOK(workspace-dedup): optional override when user confirms creating anyway
+  // DALTON-HOOK(workspace-dedup): optional override when user confirms creating anyway & coverage registration fields
   allowDuplicateCompany?: boolean,
+  coverage?: {
+    kind?: CoverageUnitKindChoice;
+    ticker?: string;
+    displayName?: string;
+  },
 ): Promise<Workspace> {
+  const covKind = coverage?.kind;
   const body: WorkspaceCreate = {
     name,
     description,
     config,
     ...(computerId ? { computer_id: computerId } : {}),
     ...(allowDuplicateCompany ? { allow_duplicate_company: true } : {}),
+    ...(covKind && covKind !== 'none'
+      ? {
+          coverage_kind: covKind,
+          ...(covKind === 'company' && coverage?.ticker?.trim()
+            ? { ticker: coverage.ticker.trim() }
+            : {}),
+          ...(coverage?.displayName?.trim()
+            ? { display_name: coverage.displayName.trim() }
+            : {}),
+        }
+      : {}),
   };
   const { data } = await api.post<Workspace>('/api/v1/workspaces', body);
   return data;

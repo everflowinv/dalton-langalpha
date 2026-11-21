@@ -69,6 +69,21 @@ class WorkspaceCreate(BaseModel):
         False,
         description="Skip company workspace deduplication check after user confirmation",
     )
+    # DALTON-HOOK(workspace-dedup): optional coverage unit auto-registration fields on workspace create.
+    coverage_kind: Optional[Literal["company", "sector", "none"]] = Field(
+        None,
+        description="Optional coverage unit kind to register and bind on creation: company, sector, or none",
+    )
+    ticker: Optional[str] = Field(
+        None,
+        max_length=32,
+        description="Optional stock ticker when coverage_kind is 'company' (leave empty if unlisted)",
+    )
+    display_name: Optional[str] = Field(
+        None,
+        max_length=120,
+        description="Optional company or sector display name for coverage unit registration",
+    )
 
 
 class WorkspaceUpdate(BaseModel):
@@ -257,6 +272,15 @@ class WorkspaceResponse(BaseModel):
     colleague_dispatch_enabled: Optional[bool] = Field(
         None,
         description="Whether colleague workspace task dispatch and chat messaging are enabled",
+    )
+    # DALTON-HOOK(workspace-dedup): coverage unit auto-registration outcome and non-fatal warning on create.
+    coverage_unit: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Registered coverage unit row when auto-registered on creation",
+    )
+    coverage_unit_warning: Optional[str] = Field(
+        None,
+        description="Non-fatal notice when coverage unit auto-registration failed or was skipped",
     )
 
     model_config = ConfigDict(from_attributes=True)
