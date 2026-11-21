@@ -168,9 +168,10 @@ async def models_client():
     app = create_test_app(router)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         with (
-            patch("src.server.app.api_keys._get_supported_providers", return_value=["antigravity-oauth"]),
+            patch("src.server.app.api_keys._get_supported_providers", autospec=True, return_value=["antigravity-oauth"]),
             patch(
                 "src.server.app.api_keys._get_provider_info_map",
+                autospec=True,
                 return_value={
                     "antigravity-oauth": {
                         "display_name": "Google Antigravity",
@@ -179,7 +180,7 @@ async def models_client():
                     }
                 },
             ),
-            patch("src.server.app.api_keys.provider_catalog", return_value=[]),
+            patch("src.server.app.api_keys.provider_catalog", autospec=True, return_value=[]),
         ):
             yield client
 
@@ -197,14 +198,16 @@ async def test_models_endpoint_exposes_antigravity_series_and_keeps_legacy_keys(
         mcp=MCPConfig(),
         filesystem=FilesystemConfig(),
     )
+    from src.llms import llm as llm_mod
+
     stub_get_models = create_autospec(
-        lambda: {},
+        llm_mod.get_configured_llm_models,
         return_value={"antigravity-oauth": [{"name": "gemini-4-neon-high-oauth", "model_id": "gemini-4-neon-high"}]},
     )
 
     with (
         patch("src.llms.llm.get_configured_llm_models", stub_get_models),
-        patch.object(LLM, "get_model_config", return_value=real_mc),
+        patch.object(LLM, "get_model_config", autospec=True, return_value=real_mc),
         patch("src.server.app.setup.agent_config", agent_cfg),
     ):
         resp = await models_client.get("/api/v1/models")
