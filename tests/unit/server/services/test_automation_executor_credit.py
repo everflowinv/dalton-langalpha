@@ -456,6 +456,9 @@ class TestAdmitted:
         assert mock_astream.call_args.kwargs["steerable"] is False
         # What the run's finalize settles the firing by.
         assert mock_astream.call_args.kwargs["run_metadata"] == {
+            # DALTON-HOOK(automation-effort): the run records the task's own thinking level.
+            "automation_reasoning_effort": None,
+            "automation_reasoning_effort_configured": True,
             "automation_execution_id": _EXEC_ID,
             "automation_id": _AUTO_ID,
         }
