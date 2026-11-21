@@ -20,14 +20,14 @@ import type { GuidanceLevel } from '@/lib/modelTuning';
 import type { CompactionProfileCatalog, CompactionProfileName } from '@/hooks/useAllModels';
 import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
 import { modelLabel } from '@/lib/modelLabel';
-// DALTON-HOOK(antigravity-series): collapse addable Antigravity variants by series & label rows as Series · Effort
+// DALTON-HOOK(antigravity-series): collapse addable Antigravity variants by series, allow picking explicit effort, & label rows as Series · Effort
 import type { CustomModelEntry } from './types';
 import {
   formatAntigravityVariantLabel,
   inspectSavedAntigravityModel,
   type AntigravitySeriesCatalog,
 } from '@/lib/antigravitySeries';
-import { resolveEffort } from '@/lib/modelTuning';
+import { EFFORT_ORDER, effortLabelFor, resolveEffort } from '@/lib/modelTuning';
 
 export interface PerModelMatrixProps {
   metadata: Record<string, ModelMetadataEntry>;
@@ -74,6 +74,9 @@ export function PerModelMatrix({
   // Rows the user opened but has not set anything on yet. They carry no server
   // state — a profile only exists once a field is picked.
   const [pendingRows, setPendingRows] = useState<string[]>([]);
+  // DALTON-HOOK(antigravity-series): track selected series + explicit effort when adding an Antigravity series row
+  const [selectedAddSeriesId, setSelectedAddSeriesId] = useState<string | null>(null);
+  const [selectedAddEffort, setSelectedAddEffort] = useState<string>('');
   const rawMeta = rawMetadata ?? metadata;
   const seriesOpts = useMemo(
     () => ({ seriesCatalog, rawMetadata: rawMeta, customModels }),
@@ -103,34 +106,97 @@ export function PerModelMatrix({
     [rows, validModelNames],
   );
 
-  // DALTON-HOOK(antigravity-series): collapse Antigravity variants in "+ Add model" to 1 option per series (default_effort)
-  const addableOptions = useMemo(() => {
+  // DALTON-HOOK(antigravity-series): collapse Antigravity variants in "+ Add model" by series while allowing explicit effort selection
+  type AddableOption =
+    | { kind: 'model'; value: string; label: string }
+    | {
+        kind: 'series';
+        value: string;
+        seriesId: string;
+        label: string;
+        defaultEffort: string;
+        efforts: string[];
+        variants: Record<string, string>;
+      };
+
+  const addableOptions = useMemo<AddableOption[]>(() => {
     const raw = [...validModelNames].filter((m) => !rows.includes(m)).sort();
-    const seriesBuckets = new Map<string, { displayName: string; defaultEffort: string; variants: Map<string, string> }>();
-    const nonSeries: Array<{ value: string; label: string }> = [];
+    const seriesBuckets = new Map<
+      string,
+      { displayName: string; defaultEffort: string; totalVariants: number; variants: Map<string, string> }
+    >();
+    const nonSeries: AddableOption[] = [];
     for (const m of raw) {
       const hit = inspectSavedAntigravityModel(m, seriesOpts);
       if (!hit) {
-        nonSeries.push({ value: m, label: modelLabel(m, metadata) });
+        nonSeries.push({ kind: 'model', value: m, label: modelLabel(m, metadata) });
         continue;
       }
       const sid = hit.series.series_id;
       let bucket = seriesBuckets.get(sid);
       if (!bucket) {
-        bucket = { displayName: hit.displayName, defaultEffort: hit.series.default_effort, variants: new Map() };
+        bucket = {
+          displayName: hit.displayName,
+          defaultEffort: hit.series.default_effort,
+          totalVariants: Object.keys(hit.series.variants).length,
+          variants: new Map(),
+        };
         seriesBuckets.set(sid, bucket);
       }
       bucket.variants.set(hit.effort, m);
     }
-    const collapsedSeries: Array<{ value: string; label: string }> = [];
-    for (const bucket of seriesBuckets.values()) {
-      const efforts = [...bucket.variants.keys()];
-      const chosen = resolveEffort(bucket.defaultEffort, efforts) ?? efforts[0];
-      const key = chosen ? bucket.variants.get(chosen) : undefined;
-      if (key) collapsedSeries.push({ value: key, label: bucket.displayName });
+    const collapsedSeries: AddableOption[] = [];
+    for (const [seriesId, bucket] of seriesBuckets.entries()) {
+      const rawEfforts = [...bucket.variants.keys()];
+      const orderedEfforts = [
+        ...EFFORT_ORDER.filter((lv) => rawEfforts.includes(lv)),
+        ...rawEfforts.filter((lv) => !EFFORT_ORDER.includes(lv)),
+      ];
+      if (orderedEfforts.length === 1) {
+        const onlyEffort = orderedEfforts[0];
+        const key = bucket.variants.get(onlyEffort);
+        if (key) {
+          const singleLabel = bucket.totalVariants > 1
+            ? (formatAntigravityVariantLabel(key, { ...seriesOpts, t, includeEffort: true }) ?? bucket.displayName)
+            : bucket.displayName;
+          collapsedSeries.push({ kind: 'model', value: key, label: singleLabel });
+        }
+        continue;
+      }
+      const defaultEffort = resolveEffort(bucket.defaultEffort, orderedEfforts) ?? orderedEfforts[0];
+      const variants: Record<string, string> = {};
+      for (const lv of orderedEfforts) {
+        const key = bucket.variants.get(lv);
+        if (key) variants[lv] = key;
+      }
+      collapsedSeries.push({
+        kind: 'series',
+        value: `series:${seriesId}`,
+        seriesId,
+        label: bucket.displayName,
+        defaultEffort,
+        efforts: orderedEfforts,
+        variants,
+      });
     }
     return [...nonSeries, ...collapsedSeries].sort((a, b) => a.label.localeCompare(b.label));
-  }, [validModelNames, rows, seriesOpts, metadata]);
+  }, [validModelNames, rows, seriesOpts, metadata, t]);
+
+  // DALTON-HOOK(antigravity-series): resolve active series & effort for explicit tier addition
+  const activeAddSeries = useMemo(
+    () => (
+      selectedAddSeriesId
+        ? addableOptions.find(
+            (opt): opt is Extract<AddableOption, { kind: 'series' }> =>
+              opt.kind === 'series' && opt.seriesId === selectedAddSeriesId,
+          ) ?? null
+        : null
+    ),
+    [selectedAddSeriesId, addableOptions],
+  );
+  const activeAddEffort = activeAddSeries
+    ? (activeAddSeries.efforts.includes(selectedAddEffort) ? selectedAddEffort : activeAddSeries.defaultEffort)
+    : '';
 
   const profileOptions = useMemo(
     () =>
@@ -369,21 +435,78 @@ export function PerModelMatrix({
         </div>
       )}
 
-      {/* DALTON-HOOK(antigravity-series): "+ Add a model" uses collapsed series options */}
+      {/* DALTON-HOOK(antigravity-series): "+ Add a model" collapses series and offers explicit effort selection before adding */}
       {addableOptions.length > 0 && (
-        <Select
-          value=""
-          onChange={(e) => {
-            if (e.target.value) setPendingRows((prev) => [...prev, e.target.value]);
-          }}
-          aria-label={t('settings.modelTuning.addModel')}
-          className="self-start text-xs"
-        >
-          <option value="">+ {t('settings.modelTuning.addModel')}</option>
-          {addableOptions.map((opt) => (
-            <option key={opt.value} value={opt.value}>{opt.label}</option>
-          ))}
-        </Select>
+        <div className="flex flex-wrap items-center gap-2 self-start">
+          <Select
+            value={activeAddSeries ? activeAddSeries.value : ''}
+            onChange={(e) => {
+              const nextValue = e.target.value;
+              if (!nextValue) {
+                setSelectedAddSeriesId(null);
+                setSelectedAddEffort('');
+                return;
+              }
+              const picked = addableOptions.find((opt) => opt.value === nextValue);
+              if (picked?.kind === 'series') {
+                setSelectedAddSeriesId(picked.seriesId);
+                setSelectedAddEffort(picked.defaultEffort);
+                return;
+              }
+              setSelectedAddSeriesId(null);
+              setSelectedAddEffort('');
+              setPendingRows((prev) => (prev.includes(nextValue) ? prev : [...prev, nextValue]));
+            }}
+            aria-label={t('settings.modelTuning.addModel')}
+            className="text-xs"
+          >
+            <option value="">+ {t('settings.modelTuning.addModel')}</option>
+            {addableOptions.map((opt) => (
+              <option key={opt.value} value={opt.value}>{opt.label}</option>
+            ))}
+          </Select>
+          {activeAddSeries && (
+            <>
+              <Select
+                value={activeAddEffort}
+                onChange={(e) => setSelectedAddEffort(e.target.value)}
+                aria-label={`${activeAddSeries.label} ${t('chat.modelSelector.reasoningEffort')}`}
+                className="w-auto min-w-28 text-xs"
+              >
+                {activeAddSeries.efforts.map((lv) => {
+                  const effLabel = effortLabelFor(t, lv) ?? lv;
+                  const text = lv === activeAddSeries.defaultEffort
+                    ? `${effLabel} (${t('chat.modelSelector.defaultBadge')})`
+                    : effLabel;
+                  return (
+                    <option key={lv} value={lv}>
+                      {text}
+                    </option>
+                  );
+                })}
+              </Select>
+              <button
+                type="button"
+                onClick={() => {
+                  const variantKey = activeAddSeries.variants[activeAddEffort];
+                  if (variantKey) {
+                    setPendingRows((prev) => (prev.includes(variantKey) ? prev : [...prev, variantKey]));
+                  }
+                  setSelectedAddSeriesId(null);
+                  setSelectedAddEffort('');
+                }}
+                className="inline-flex items-center px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors"
+                style={{
+                  border: '1px solid var(--color-border-default)',
+                  color: 'var(--color-text-primary)',
+                  backgroundColor: 'var(--color-bg-elevated)',
+                }}
+              >
+                + {t('settings.addModels')}
+              </button>
+            </>
+          )}
+        </div>
       )}
     </div>
   );

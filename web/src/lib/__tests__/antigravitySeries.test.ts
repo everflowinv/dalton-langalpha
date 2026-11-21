@@ -6,6 +6,7 @@ import {
   ANTIGRAVITY_PROVIDER,
   buildSelectableAntigravitySeries,
   buildSeriesCatalog,
+  favoriteAntigravitySeriesVariants,
   formatAntigravityVariantLabel,
   inspectSavedAntigravityModel,
   resolveLowEffortVariantKey,
@@ -169,5 +170,34 @@ describe('antigravitySeries helpers', () => {
       rawMetadata: RAW_METADATA,
     });
     expect(resolveLowEffortVariantKey(carbon)).toBe('gemini-4-carbon-medium-oauth');
+  });
+
+  it('excludes same-named custom models when aggregating favorite variants for an Antigravity series', () => {
+    const customModels: CustomModelEntry[] = [
+      { name: 'gemini-4-neon-high-oauth', provider: 'openai', model_id: 'custom-neon' },
+    ];
+    const neonSeries = catalog.bySeriesId['antigravity-oauth:gemini-4-neon'];
+
+    // Only the shadowed custom model is favorited -> series itself has no favorited built-in variants
+    expect(
+      favoriteAntigravitySeriesVariants(neonSeries, ['gemini-4-neon-high-oauth'], {
+        seriesCatalog: catalog,
+        rawMetadata: RAW_METADATA,
+        customModels,
+      }),
+    ).toEqual([]);
+
+    // Built-in low + shadowed custom high both favorited -> only built-in low belongs to the series
+    expect(
+      favoriteAntigravitySeriesVariants(
+        neonSeries,
+        new Set(['gemini-4-neon-low-oauth', 'gemini-4-neon-high-oauth']),
+        {
+          seriesCatalog: catalog,
+          rawMetadata: RAW_METADATA,
+          customModels,
+        },
+      ),
+    ).toEqual(['gemini-4-neon-low-oauth']);
   });
 });

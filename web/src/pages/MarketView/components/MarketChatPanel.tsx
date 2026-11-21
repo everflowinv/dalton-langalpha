@@ -15,7 +15,12 @@ import { useStableHandler } from '@/hooks/useStableHandler';
 import { useWorkspace } from '@/hooks/useWorkspace';
 // DALTON-HOOK(team-sharing): gate the seen cursor on workspace ownership
 import { isDaltonAuth } from '@/config/daltonAuth';
+// DALTON-HOOK(antigravity-series): scope MarketChatPanel workspaceId & Antigravity effort reset to Dalton builds
+import { isDaltonBuild } from '@/config/brand';
 import { usePreferences } from '@/hooks/usePreferences';
+// DALTON-HOOK(antigravity-series): inspect picked Antigravity variants to clear local effort alongside ChatView
+import { useAllModels } from '@/hooks/useAllModels';
+import { inspectSavedAntigravityModel } from '@/lib/antigravitySeries';
 import { useLocale } from '@/hooks/useLocale';
 import { compactNumber } from '@/lib/format';
 import { readTurnEndScroll } from '@/lib/turnEndScroll';
@@ -462,11 +467,41 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   useActiveThreadPublisher(threadId, { canMarkSeen });
 
   // The Chief of Staff's turn may start on another Default than the account's.
-  const threadModel = useThreadModel({ threadId, isLoading, chiefOfStaff: scope === 'all' });
+  // DALTON-HOOK(antigravity-series): in Dalton builds pass activeWorkspaceId (including Home) like ChatView so shared threads skip 403 PATCH and Home waits for detail confirmation before Antigravity PATCH; non-Dalton keeps origin/dalton/main behavior
+  const threadWorkspaceId = isDaltonBuild ? activeWorkspaceId : null;
+  const threadModel = useThreadModel({
+    threadId,
+    isLoading,
+    chiefOfStaff: scope === 'all',
+    ...(threadWorkspaceId ? { workspaceId: threadWorkspaceId } : {}),
+  });
+  const { pickModel: pickThreadModel } = threadModel;
   const threadSubagents = useThreadSubagents({ threadId });
   const { toSend: subagentsToSend } = threadSubagents;
-  const threadTuning = useThreadTuning({ threadId });
-  const { toSend: tuningToSend } = threadTuning;
+  const threadTuning = useThreadTuning({
+    threadId,
+    ...(threadWorkspaceId ? { workspaceId: threadWorkspaceId } : {}),
+  });
+  const { toSend: tuningToSend, clearLocalEffort } = threadTuning;
+  const { seriesCatalog, customModels, metadata: modelMetadata, rawApiResponse } = useAllModels();
+  // DALTON-HOOK(antigravity-series): in Dalton builds clear local effort on Antigravity pick, restoring previous effort if the model switch fails without clobbering newer updates
+  const handlePickThreadModel = useCallback((nextModel: string) => {
+    if (!isDaltonBuild) return pickThreadModel(nextModel);
+    const rawMeta = rawApiResponse?.model_metadata ?? modelMetadata;
+    const restoreEffort = inspectSavedAntigravityModel(nextModel, { seriesCatalog, rawMetadata: rawMeta, customModels })
+      ? clearLocalEffort()
+      : null;
+    return pickThreadModel(nextModel).then(
+      (saved) => {
+        if (!saved) restoreEffort?.();
+        return saved;
+      },
+      (err: unknown) => {
+        restoreEffort?.();
+        throw err;
+      },
+    );
+  }, [clearLocalEffort, customModels, modelMetadata, pickThreadModel, rawApiResponse, seriesCatalog]);
 
   // MarketView has no floating cards layer, so subagent rows resolve through
   // history only, and a run launched since the page loaded shows no progress.
@@ -986,7 +1021,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         onScopeChange={onScopeChange}
         model={threadModel.model}
         sendModel={threadModel.sendModel}
-        onPickModel={threadModel.pickModel}
+        // DALTON-HOOK(antigravity-series): clear local effort when switching to an Antigravity variant (aligned with ChatView)
+        onPickModel={handlePickThreadModel}
         subagentsAllowed={threadSubagents.allowed}
         onToggleSubagents={threadSubagents.setAllowed}
         tuning={threadTuning.tuning}
