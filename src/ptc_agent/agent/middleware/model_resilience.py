@@ -92,23 +92,17 @@ _QUOTA_EXHAUSTED_REDIS_PREFIX = "dalton:quota_exhausted"
 _HKT = ZoneInfo("Asia/Hong_Kong")
 
 
-def _quota_redis_keys(  # DALTON-HOOK(antigravity-series)
+def quota_redis_key(  # DALTON-HOOK(quota-exhaustion)
     name: str,
     client: Any,
     *,
     user_id: str | None = None,
-) -> tuple[str | None, str | None]:
-    """Return ``(new_key, legacy_key)`` for quota cooldown coordination.
-
-    ``new_key`` uses the disjoint ``:vendor:{vendor}`` (built-in Antigravity)
-    or ``:model:{model_id}`` namespace. ``legacy_key`` is the pre-upgrade
-    single-model key without the scope-kind segment, consulted on a miss of
-    ``new_key`` during rolling upgrades.
-    """
+) -> str | None:
+    """Coordination key scoped by credential owner, provider, vendor/model, and subscription account."""
     if client is None:
-        return None, None
+        return None
     from src.dalton.credentials import credential_user_id
-    from src.dalton.llm.antigravity_series import quota_cooldown_target
+    from src.dalton.llm.antigravity_series import quota_cooldown_target  # DALTON-HOOK(antigravity-series)
     from src.dalton.llm.oauth_refresh import oauth_rebuild_spec
 
     spec = oauth_rebuild_spec(client)
@@ -143,7 +137,7 @@ def _quota_redis_keys(  # DALTON-HOOK(antigravity-series)
             raw_user = "platform"
 
     if not raw_user or not provider or not model_id:
-        return None, None
+        return None
     if raw_user != "platform":
         try:
             cred_user = credential_user_id(str(raw_user))
@@ -152,66 +146,13 @@ def _quota_redis_keys(  # DALTON-HOOK(antigravity-series)
     else:
         cred_user = "platform"
     if not cred_user:
-        return None, None
+        return None
+    # DALTON-HOOK(antigravity-series): built-in antigravity-oauth models share a
+    # disjoint `:vendor:{vendor}` namespace; other providers and custom models
+    # use `:model:{model_id}`.
     scope_kind, target = quota_cooldown_target(provider, model_id, is_custom=is_custom)
-    suffix = f":{cred_id}" if cred_id else ""
-    new_key = f"{_QUOTA_EXHAUSTED_REDIS_PREFIX}:{cred_user}:{provider}:{scope_kind}:{target}{suffix}"
-    legacy_key = f"{_QUOTA_EXHAUSTED_REDIS_PREFIX}:{cred_user}:{provider}:{model_id}{suffix}"
-    return new_key, legacy_key
-
-
-def quota_redis_key(  # DALTON-HOOK(quota-exhaustion)
-    name: str,
-    client: Any,
-    *,
-    user_id: str | None = None,
-) -> str | None:
-    """Coordination key scoped by credential owner, provider, vendor/model, and subscription account."""
-    # DALTON-HOOK(antigravity-series): built-in antigravity-oauth models share
-    # `:vendor:{vendor}`; other providers and custom models use `:model:{model_id}`.
-    new_key, _ = _quota_redis_keys(name, client, user_id=user_id)
-    return new_key
-
-
-def _remaining_quota_ttl_seconds(data: Any) -> int | None:  # DALTON-HOOK(antigravity-series)
-    """Return remaining whole-second TTL for a valid Redis cooldown payload, else ``None``."""
-    if not isinstance(data, dict):
-        return None
-    expires_at = data.get("expires_at")
-    if isinstance(expires_at, (int, float)):
-        remaining = float(expires_at) - time.time()
-        if remaining <= 0:
-            return None
-        return max(1, math.ceil(remaining))
-    return DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS
-
-
-async def _read_quota_redis_async(  # DALTON-HOOK(antigravity-series)
-    new_key: str, legacy_key: str | None
-) -> dict[str, Any] | None:
-    """Read ``new_key`` from Redis; on miss, read ``legacy_key`` and migrate remaining TTL."""
-    from src.utils.cache.redis_cache import get_cache_client
-
-    cache = get_cache_client()
-    data = await cache.get(new_key)
-    if _remaining_quota_ttl_seconds(data) is not None:
-        return data
-    if not legacy_key or legacy_key == new_key:
-        return None
-    legacy_data = await cache.get(legacy_key)
-    remaining_ttl = _remaining_quota_ttl_seconds(legacy_data)
-    if remaining_ttl is None:
-        return None
-    try:
-        await cache.set(new_key, legacy_data, ttl=remaining_ttl)
-    except Exception as err:
-        logger.debug(
-            "[ModelResilience] Failed to migrate legacy quota key to new key",
-            legacy_key=legacy_key,
-            new_key=new_key,
-            error=str(err),
-        )
-    return legacy_data
+    base = f"{_QUOTA_EXHAUSTED_REDIS_PREFIX}:{cred_user}:{provider}:{scope_kind}:{target}"
+    return f"{base}:{cred_id}" if cred_id else base
 
 
 def format_quota_cooldown_message(  # DALTON-HOOK(quota-exhaustion)
@@ -256,12 +197,13 @@ async def check_oauth_quota_cooldown(  # DALTON-HOOK(quota-exhaustion)
         or client_label(client)
         or ""
     )
-    # DALTON-HOOK(antigravity-series): read new vendor/model key with legacy-key migration fallback.
-    redis_key, legacy_key = _quota_redis_keys(label, client, user_id=user_id)
+    redis_key = quota_redis_key(label, client, user_id=user_id)
     if redis_key is None:
         return None
     try:
-        data = await _read_quota_redis_async(redis_key, legacy_key)
+        from src.utils.cache.redis_cache import get_cache_client
+
+        data = await get_cache_client().get(redis_key)
     except Exception as err:
         logger.debug(
             "[ModelResilience] Redis pre-dispatch quota read unavailable, failing open",
@@ -281,17 +223,21 @@ async def check_oauth_quota_cooldown(  # DALTON-HOOK(quota-exhaustion)
 class _RemoteQuotaExhaustedError(RuntimeError):  # DALTON-HOOK(quota-exhaustion)
     """Refusal placeholder reconstructed from Redis or shared cooldown state."""
 
-    # DALTON-HOOK(antigravity-series): preserve expires_at so benched refusals surface reset time.
+    # DALTON-HOOK(antigravity-series): preserve expires_at and structured ProviderRefusal
+    # so stream_errors renders a subscription plan_limit card with reset time (and keeps
+    # provider plan tier/window such as Codex's).
     def __init__(
         self,
         message: str,
         status_code: int | None = None,
         *,
         expires_at: float | None = None,
+        provider_refusal: Any = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.expires_at = expires_at
+        self.provider_refusal = provider_refusal
 
 #: The ``response_metadata`` key naming the fallback that wrote an answer. Its
 #: usage counts that model's tokens, so compaction measures nothing for the
@@ -799,27 +745,104 @@ class ModelResilienceMiddleware(AgentMiddleware):
     ) -> tuple[Exception, int | None]:
         """Build the refusal raised when ``primary_name`` was skipped on cooldown.
 
-        Timed quota cooldowns (HTTP 429 or Redis-reconstructed entries) construct
-        a fresh refusal naming ``primary_name`` with HTTP status (default 429)
-        and HKT recovery time so ``stream_errors`` classifies it as upstream
-        with ``attempts=0`` rather than an internal error.
+        Carries an explicit ``ProviderRefusal`` (``plan_limit`` with reset time
+        for quota cooldowns, while preserving structured provider fields such as
+        Codex's tier/window/until or 402 ``out_of_credit``) so ``stream_errors``
+        renders a subscription quota card instead of a generic 429 rate-limit banner.
         """
+        from src.llms.provider_errors import ProviderRefusal, read_refusal
+
         refills_at_mono, orig_exc = remembered
         status = extract_status_code(orig_exc)
+        orig_refusal = read_refusal(orig_exc)
+
         if isinstance(orig_exc, _RemoteQuotaExhaustedError):
             eff_status = status if isinstance(status, int) else 429
             expires_at = orig_exc.expires_at
             if expires_at is None and math.isfinite(refills_at_mono):
                 expires_at = time.time() + max(0.0, refills_at_mono - time.monotonic())
-            if eff_status == 402:
-                msg = str(orig_exc)
-            else:
-                msg = format_quota_cooldown_message(primary_name, expires_at)
-            return _RemoteQuotaExhaustedError(msg, eff_status, expires_at=expires_at), eff_status
-        if status == 429 and math.isfinite(refills_at_mono):
-            expires_at = time.time() + max(0.0, refills_at_mono - time.monotonic())
-            msg = format_quota_cooldown_message(primary_name, expires_at)
-            return _RemoteQuotaExhaustedError(msg, 429, expires_at=expires_at), 429
+            if orig_refusal is not None and orig_refusal.reason in (
+                "out_of_credit",
+                "quota_exceeded",
+                "plan_excludes",
+            ):
+                return (
+                    _RemoteQuotaExhaustedError(
+                        str(orig_exc),
+                        eff_status,
+                        expires_at=expires_at,
+                        provider_refusal=orig_refusal,
+                    ),
+                    eff_status,
+                )
+            until_dt = (
+                orig_refusal.until
+                if orig_refusal is not None and orig_refusal.until is not None
+                else (
+                    datetime.fromtimestamp(expires_at, tz=timezone.utc)
+                    if isinstance(expires_at, (int, float))
+                    else None
+                )
+            )
+            refusal = ProviderRefusal(
+                "plan_limit",
+                tier=orig_refusal.tier if orig_refusal is not None else None,
+                window=orig_refusal.window if orig_refusal is not None else None,
+                until=until_dt,
+            )
+            msg = (
+                str(orig_exc)
+                if eff_status == 402
+                else format_quota_cooldown_message(primary_name, expires_at)
+            )
+            return (
+                _RemoteQuotaExhaustedError(
+                    msg, eff_status, expires_at=expires_at, provider_refusal=refusal
+                ),
+                eff_status,
+            )
+
+        if orig_refusal is not None and orig_refusal.reason in (
+            "out_of_credit",
+            "quota_exceeded",
+            "plan_excludes",
+        ):
+            return orig_exc, status
+
+        if status == 429 or (orig_refusal is not None and orig_refusal.reason == "plan_limit"):
+            eff_status = status if isinstance(status, int) else 429
+            expires_at: float | None = None
+            if orig_refusal is not None and orig_refusal.until is not None:
+                expires_at = orig_refusal.until.timestamp()
+            elif math.isfinite(refills_at_mono):
+                expires_at = time.time() + max(0.0, refills_at_mono - time.monotonic())
+            until_dt = (
+                orig_refusal.until
+                if orig_refusal is not None and orig_refusal.until is not None
+                else (
+                    datetime.fromtimestamp(expires_at, tz=timezone.utc)
+                    if isinstance(expires_at, (int, float))
+                    else None
+                )
+            )
+            refusal = ProviderRefusal(
+                "plan_limit",
+                tier=orig_refusal.tier if orig_refusal is not None else None,
+                window=orig_refusal.window if orig_refusal is not None else None,
+                until=until_dt,
+            )
+            msg = (
+                format_quota_cooldown_message(primary_name, expires_at)
+                if expires_at is not None
+                else f"{primary_name} 的订阅额度已用完，请换用其他模型或稍后重试"
+            )
+            return (
+                _RemoteQuotaExhaustedError(
+                    msg, eff_status, expires_at=expires_at, provider_refusal=refusal
+                ),
+                eff_status,
+            )
+
         return orig_exc, status
 
     def _raise_run_exhausted(  # DALTON-HOOK(quota-exhaustion)
@@ -943,6 +966,63 @@ class ModelResilienceMiddleware(AgentMiddleware):
         benched = self._quota_exhausted.get(scope_key)
         return benched is not None and time.monotonic() < benched[0]
 
+    @staticmethod
+    def _serialize_provider_refusal(exc: Exception) -> dict[str, Any] | None:  # DALTON-HOOK(antigravity-series)
+        """Extract structured ProviderRefusal fields (e.g. Codex tier/window/until) for Redis."""
+        from src.llms.provider_errors import read_refusal
+
+        refusal = read_refusal(exc)
+        if refusal is None:
+            return None
+        out: dict[str, Any] = {"reason": refusal.reason}
+        if refusal.tier is not None:
+            out["tier"] = refusal.tier
+        if refusal.window is not None:
+            out["window"] = refusal.window
+        if refusal.until is not None:
+            out["until"] = refusal.until.isoformat()
+        return out
+
+    @staticmethod
+    def _deserialize_provider_refusal(  # DALTON-HOOK(antigravity-series)
+        raw: Any,
+        *,
+        status_code: int | None,
+        expires_at: float | None,
+    ) -> Any:
+        from src.llms.claude_code import PLAN_LIMITS
+        from src.llms.provider_errors import ProviderRefusal
+
+        until_dt = (
+            datetime.fromtimestamp(expires_at, tz=timezone.utc)
+            if isinstance(expires_at, (int, float))
+            else None
+        )
+        if isinstance(raw, dict):
+            reason = raw.get("reason")
+            tier = raw.get("tier") if isinstance(raw.get("tier"), str) and raw.get("tier") else None
+            raw_window = raw.get("window")
+            window = raw_window if raw_window in PLAN_LIMITS else None
+            raw_until = raw.get("until")
+            parsed_until: datetime | None = None
+            if isinstance(raw_until, str) and raw_until:
+                try:
+                    parsed_until = datetime.fromisoformat(raw_until)
+                except ValueError:
+                    parsed_until = None
+            if reason == "plan_limit":
+                return ProviderRefusal(
+                    "plan_limit",
+                    tier=tier,
+                    window=window,
+                    until=parsed_until or until_dt,
+                )
+            if reason in ("out_of_credit", "quota_exceeded", "plan_excludes"):
+                return ProviderRefusal(reason, tier=tier, window=window, until=parsed_until)
+        if status_code == 402:
+            return ProviderRefusal("out_of_credit")
+        return ProviderRefusal("plan_limit", until=until_dt)
+
     def _apply_remote_quota_state(  # DALTON-HOOK(antigravity-series)
         self, scope_key: str, name: str, data: Any
     ) -> bool:
@@ -959,8 +1039,16 @@ class ModelResilienceMiddleware(AgentMiddleware):
             return False
         raw_status = data.get("status_code")
         status_code = raw_status if isinstance(raw_status, int) else 429
+        provider_refusal = self._deserialize_provider_refusal(
+            data.get("refusal"), status_code=status_code, expires_at=exp_ts
+        )
         msg = str(data.get("message") or format_quota_cooldown_message(name, exp_ts))
-        refusal = _RemoteQuotaExhaustedError(msg, status_code, expires_at=exp_ts)
+        refusal = _RemoteQuotaExhaustedError(
+            msg,
+            status_code,
+            expires_at=exp_ts,
+            provider_refusal=provider_refusal,
+        )
         self._quota_exhausted[scope_key] = (time.monotonic() + remaining, refusal)
         return True
 
@@ -973,12 +1061,16 @@ class ModelResilienceMiddleware(AgentMiddleware):
             if math.isfinite(horizon) and horizon > 0
             else DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS
         )
-        payload = {
+        payload: dict[str, Any] = {
             "expires_at": time.time() + ttl_s,
             "message": str(exc)[:_ERROR_SUMMARY_MAX_CHARS],
             "status_code": extract_status_code(exc),
             "model": name,
         }
+        # DALTON-HOOK(antigravity-series): persist structured ProviderRefusal (e.g. Codex tier/window/until).
+        refusal_data = ModelResilienceMiddleware._serialize_provider_refusal(exc)
+        if refusal_data is not None:
+            payload["refusal"] = refusal_data
         return ttl_s, payload
 
     @staticmethod
@@ -1034,36 +1126,6 @@ class ModelResilienceMiddleware(AgentMiddleware):
             return
         self._run_sync_cache_call(lambda: cache.set(redis_key, payload, ttl=ttl_s))
 
-    def _read_quota_redis_sync(  # DALTON-HOOK(antigravity-series)
-        self, new_key: str, legacy_key: str | None
-    ) -> dict[str, Any] | None:
-        """Sync twin of ``_read_quota_redis_async`` with legacy-key read-through migration."""
-        data = self._sync_redis_get(new_key)
-        if _remaining_quota_ttl_seconds(data) is not None:
-            return data
-        if not legacy_key or legacy_key == new_key:
-            return None
-        legacy_data = self._sync_redis_get(legacy_key)
-        remaining_ttl = _remaining_quota_ttl_seconds(legacy_data)
-        if remaining_ttl is None:
-            return None
-        try:
-            self._sync_redis_set(new_key, legacy_data, remaining_ttl)
-        except Exception as err:
-            logger.debug(
-                "[ModelResilience] Failed to migrate legacy quota key (sync)",
-                legacy_key=legacy_key,
-                new_key=new_key,
-                error=str(err),
-            )
-        return legacy_data
-
-    def _quota_redis_keys(  # DALTON-HOOK(antigravity-series)
-        self, name: str, client: Any = None
-    ) -> tuple[str | None, str | None]:
-        target = self._current_client(self.primary_client if client is None else client)
-        return _quota_redis_keys(name, target, user_id=self.user_id)
-
     def _quota_skipped(  # DALTON-HOOK(antigravity-series)
         self, name: str, client: Any = None
     ) -> bool:
@@ -1071,11 +1133,11 @@ class ModelResilienceMiddleware(AgentMiddleware):
         scope_key = self._quota_scope_key(name, client)
         if self._local_quota_skipped(scope_key):
             return True
-        redis_key, legacy_key = self._quota_redis_keys(name, client)
+        redis_key = self._quota_redis_key(name, client)
         if redis_key is None:
             return False
         try:
-            data = self._read_quota_redis_sync(redis_key, legacy_key)
+            data = self._sync_redis_get(redis_key)
         except Exception as err:
             logger.debug(
                 "[ModelResilience] Redis sync quota read unavailable, using local state",
@@ -1089,8 +1151,8 @@ class ModelResilienceMiddleware(AgentMiddleware):
         self, name: str, client: Any = None
     ) -> str | None:
         """Coordination key scoped by credential owner, provider, vendor/model, and subscription account."""
-        new_key, _ = self._quota_redis_keys(name, client)
-        return new_key
+        target = self._current_client(self.primary_client if client is None else client)
+        return quota_redis_key(name, target, user_id=self.user_id)
 
     def _quota_scope_key(  # DALTON-HOOK(antigravity-series)
         self, name: str, client: Any = None
@@ -1106,11 +1168,13 @@ class ModelResilienceMiddleware(AgentMiddleware):
         scope_key = self._quota_scope_key(name, client)
         if self._local_quota_skipped(scope_key):
             return True
-        redis_key, legacy_key = self._quota_redis_keys(name, client)
+        redis_key = self._quota_redis_key(name, client)
         if redis_key is None:
             return False
         try:
-            data = await _read_quota_redis_async(redis_key, legacy_key)
+            from src.utils.cache.redis_cache import get_cache_client
+
+            data = await get_cache_client().get(redis_key)
         except Exception as err:
             logger.debug(
                 "[ModelResilience] Redis quota read unavailable, using local state",

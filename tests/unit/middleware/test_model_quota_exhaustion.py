@@ -1224,12 +1224,13 @@ async def test_antigravity_vendor_cooldown_shared_with_oauth_billing_and_isolate
 
 
 @pytest.mark.asyncio
-async def test_all_skipped_cooldown_classified_as_upstream_429_not_internal_error(
+async def test_all_skipped_cooldown_classified_as_upstream_plan_limit_with_reset_time(
     no_sleep, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When all candidates are skipped on cooldown (e.g. fresh worker reading Redis),
-    the raised error carries RESILIENCE_TRACE_ATTR with current primary model, 429 status,
-    HKT reset time, and attempts=0 so stream_errors classifies it as upstream, not internal."""
+    """When Gemini same-vendor cooldown skips all candidates (via Redis or local state),
+    the raised error carries `reason='plan_limit'` and `plan_limit.until` (plus 429,
+    current primary model, and attempts=0) so the frontend renders the subscription
+    quota-exhausted card with reset time rather than a generic 429 rate-limit banner."""
     from datetime import datetime, timezone
     from types import SimpleNamespace
 
@@ -1243,11 +1244,11 @@ async def test_all_skipped_cooldown_classified_as_upstream_429_not_internal_erro
 
     fixed_now = datetime(2026, 11, 21, 5, 0, tzinfo=timezone.utc).timestamp()
     expires_at = datetime(2026, 11, 21, 8, 30, tzinfo=timezone.utc).timestamp()
+    expected_until = datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat()
     monkeypatch.setattr("ptc_agent.agent.middleware.model_resilience.time.time", lambda: fixed_now)
     monkeypatch.setattr("src.dalton.credentials.get_team_credential_holder_id", lambda: None)
 
     google_key = "dalton:quota_exhausted:u1:antigravity-oauth:vendor:google:cred-a"
-    # Even a Redis payload without status_code/message must preserve 429 + reset time + model
     store: dict[str, dict] = {
         google_key: {
             "expires_at": expires_at,
@@ -1293,117 +1294,155 @@ async def test_all_skipped_cooldown_classified_as_upstream_429_not_internal_erro
     assert frame["status_code"] == 429
     assert frame["model"] == "gemini-4-hydrogen-high-oauth"
     assert frame["payer"] == "subscription"
+    assert frame["account"] == "Google Antigravity"
+    assert frame["reason"] == "plan_limit"
+    assert frame["hints"] == ["try_another_model"]
+    assert frame["plan_limit"] == {
+        "plan": "Google Antigravity",
+        "window": None,
+        "until": expected_until,
+    }
     assert "2026-11-21 16:30 HKT" in frame["error"]
     assert len(frame["attempted_models"]) == 1
     assert frame["attempted_models"][0]["model"] == "gemini-4-hydrogen-high-oauth"
     assert frame["attempted_models"][0]["status_code"] == 429
     assert frame["attempted_models"][0]["attempts"] == 0
 
+    # Same-instance local vendor cooldown (after live 429 on Neon) produces the same plan_limit card
+    store.clear()
+    neon = _make_antigravity_client(
+        "gemini-4-neon-high-oauth", user_id="u1", credential_id="cred-a"
+    )
+    mw_local = _make_middleware(neon, [])
+
+    async def neon_429(req):
+        raise _refusal(ANTIGRAVITY_LONG_RESET_429, 429)
+
+    with pytest.raises(Exception, match="Individual quota reached"):
+        await mw_local.awrap_model_call(_FakeRequest(neon), neon_429)
+
+    with pytest.raises(Exception) as local_caught:
+        await mw_local.awrap_model_call(_FakeRequest(hydrogen), should_not_dial)
+    local_frame = error_event_data(
+        "thread-1", str(local_caught.value), exc=local_caught.value, config=oauth_cfg
+    )
+    assert local_frame["error_kind"] == "upstream"
+    assert local_frame["status_code"] == 429
+    assert local_frame["reason"] == "plan_limit"
+    assert local_frame["hints"] == ["try_another_model"]
+    assert local_frame["plan_limit"]["plan"] == "Google Antigravity"
+    assert local_frame["plan_limit"]["until"] is not None
+    assert local_frame["attempted_models"][0]["attempts"] == 0
+
 
 @pytest.mark.asyncio
-async def test_legacy_single_model_redis_key_migrates_with_remaining_ttl(
+async def test_codex_plan_limit_cooldown_preserves_plan_tier_window_and_reset(
     no_sleep, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Upgrade transition: when the new vendor/model key is absent, reading cooldown
-    checks the legacy single-model key for the same credential holder & account, migrates
-    still-valid entries to the new key preserving remaining TTL, and ignores expired ones."""
-    from ptc_agent.agent.middleware.model_resilience import check_oauth_quota_cooldown
+    """Other providers (e.g. Codex `usage_limit_reached`) keep their original plan tier,
+    window, and reset timestamp across both in-process and cross-worker Redis cooldowns."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
 
-    fake_now = 1_800_000_000.0
-    monkeypatch.setattr("ptc_agent.agent.middleware.model_resilience.time.time", lambda: fake_now)
+    import httpx
+    import openai
+
+    from ptc_agent.config.agent import CredentialPayer
+    from src.server.services.runs.stream_errors import error_event_data, model_call_failure
+
+    fixed_now = datetime(2026, 11, 21, 5, 0, tzinfo=timezone.utc).timestamp()
+    reset_epoch = int(datetime(2026, 11, 21, 9, 45, tzinfo=timezone.utc).timestamp())
+    expected_until = datetime.fromtimestamp(reset_epoch, tz=timezone.utc).isoformat()
+    monkeypatch.setattr("ptc_agent.agent.middleware.model_resilience.time.time", lambda: fixed_now)
     monkeypatch.setattr("src.dalton.credentials.get_team_credential_holder_id", lambda: None)
 
-    ttl_calls: list[tuple[str, int | None]] = []
-    legacy_google_key = "dalton:quota_exhausted:u1:antigravity-oauth:gemini-4-neon-high-oauth:cred-1"
-    new_google_key = "dalton:quota_exhausted:u1:antigravity-oauth:vendor:google:cred-1"
-    legacy_claude_key = "dalton:quota_exhausted:u1:claude-oauth:claude-opus-5-5-oauth:cred-c"
-    new_claude_key = "dalton:quota_exhausted:u1:claude-oauth:model:claude-opus-5-5-oauth:cred-c"
-    legacy_codex_key = "dalton:quota_exhausted:u1:codex-oauth:gpt-6.2-sol-oauth:cred-x"
-    new_codex_key = "dalton:quota_exhausted:u1:codex-oauth:model:gpt-6.2-sol-oauth:cred-x"
-    expired_legacy_key = "dalton:quota_exhausted:u2:antigravity-oauth:gemini-4-neon-high-oauth:cred-2"
-    expired_new_key = "dalton:quota_exhausted:u2:antigravity-oauth:vendor:google:cred-2"
-
-    store: dict[str, dict] = {
-        legacy_google_key: {
-            "expires_at": fake_now + 1234.2,
-            "message": ANTIGRAVITY_LONG_RESET_429,
-            "status_code": 429,
-            "model": "gemini-4-neon-high-oauth",
-        },
-        legacy_claude_key: {
-            "expires_at": fake_now + 600.0,
-            "message": "quota exhausted",
-            "status_code": 429,
-            "model": "claude-opus-5-5-oauth",
-        },
-        legacy_codex_key: {
-            "expires_at": fake_now + 900.0,
-            "message": "quota exhausted",
-            "status_code": 429,
-            "model": "gpt-6.2-sol-oauth",
-        },
-        expired_legacy_key: {
-            "expires_at": fake_now - 5.0,
-            "message": "stale",
-            "status_code": 429,
-            "model": "gemini-4-neon-high-oauth",
-        },
-    }
-    cache = _make_memory_redis_cache(store, ttl_calls=ttl_calls)
+    store: dict[str, dict] = {}
+    cache = _make_memory_redis_cache(store)
     monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: cache)
 
-    # 1. Antigravity async read migrates legacy key -> `:vendor:google` with remaining TTL (1235s)
-    neon_high = _make_antigravity_client(
-        "gemini-4-neon-high-oauth", user_id="u1", credential_id="cred-1"
-    )
-    hydrogen = _make_antigravity_client(
-        "gemini-4-hydrogen-high-oauth", user_id="u1", credential_id="cred-1"
-    )
-    mw_neon = _make_middleware(neon_high, [])
-
-    async def neon_should_not_run(req):
-        raise AssertionError("Legacy key should have cooled down neon_high")
-
-    with pytest.raises(Exception, match="gemini-4-neon-high-oauth 的订阅额度已用完"):
-        await mw_neon.awrap_model_call(_FakeRequest(neon_high), neon_should_not_run)
-    assert new_google_key in store
-    assert (new_google_key, 1235) in ttl_calls
-
-    # Migrated vendor key now immediately cools down sibling Gemini model (Hydrogen)
-    mw_hydro = _make_middleware(hydrogen, [])
-    assert await mw_hydro._aquota_skipped("gemini-4-hydrogen-high-oauth", hydrogen) is True
-
-    # 2. Non-Antigravity provider migrates legacy key -> `:model:` in pre-dispatch check
-    claude_client = _make_antigravity_client(
-        "claude-opus-5-5-oauth",
-        user_id="u1",
-        provider="claude-oauth",
-        credential_id="cred-c",
-    )
-    msg = await check_oauth_quota_cooldown(claude_client)
-    assert msg is not None and "claude-opus-5-5-oauth 的订阅额度已用完" in msg
-    assert new_claude_key in store
-    assert (new_claude_key, 600) in ttl_calls
-
-    # 3. Sync `_quota_skipped` also reads legacy key and migrates to new key with remaining TTL
     codex_client = _make_antigravity_client(
         "gpt-6.2-sol-oauth",
-        user_id="u1",
+        user_id="u-codex",
         provider="codex-oauth",
-        credential_id="cred-x",
+        credential_id="cred-codex-1",
     )
-    mw_codex = _make_middleware(codex_client, [])
-    assert mw_codex._quota_skipped("gpt-6.2-sol-oauth", codex_client) is True
-    assert new_codex_key in store
-    assert (new_codex_key, 900) in ttl_calls
+    codex_cfg = SimpleNamespace(
+        credential_source="oauth",
+        credential_payer=CredentialPayer(payer="subscription", account="ChatGPT"),
+    )
 
-    # 4. Expired legacy key is ignored and never migrated
-    expired_client = _make_antigravity_client(
-        "gemini-4-neon-high-oauth", user_id="u2", credential_id="cred-2"
+    body = {
+        "error": {
+            "type": "usage_limit_reached",
+            "message": "The usage limit has been reached",
+            "plan_type": "plus",
+            "resets_at": reset_epoch,
+            "limit_window_minutes": 300,
+            "resets_in_seconds": int(reset_epoch - fixed_now),
+        }
+    }
+    req_http = httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses")
+    codex_err = openai.RateLimitError(
+        "Error code: 429",
+        response=httpx.Response(429, request=req_http, json=body),
+        body=body,
     )
-    mw_exp = _make_middleware(expired_client, [])
-    assert await mw_exp._aquota_skipped("gemini-4-neon-high-oauth", expired_client) is False
-    assert expired_new_key not in store
+
+    mw_a = _make_middleware(codex_client, [])
+
+    async def codex_429(req):
+        raise codex_err
+
+    with pytest.raises(openai.RateLimitError):
+        await mw_a.awrap_model_call(_FakeRequest(codex_client), codex_429)
+
+    # 1. Same middleware instance (in-process cooldown) preserves plan tier, window, and reset
+    async def should_not_dial(req):
+        raise AssertionError("Cooled Codex client must not dial upstream")
+
+    with pytest.raises(Exception) as local_exc:
+        await mw_a.awrap_model_call(_FakeRequest(codex_client), should_not_dial)
+
+    local_frame = error_event_data(
+        "thread-codex", str(local_exc.value), exc=local_exc.value, config=codex_cfg
+    )
+    assert local_frame["error_kind"] == "upstream"
+    assert local_frame["status_code"] == 429
+    assert local_frame["reason"] == "plan_limit"
+    assert local_frame["hints"] == ["try_another_model"]
+    assert local_frame["plan_limit"] == {
+        "plan": "ChatGPT Plus",
+        "window": "five_hour",
+        "until": expected_until,
+    }
+    assert local_frame["attempted_models"][0]["attempts"] == 0
+    assert model_call_failure(local_exc.value, codex_cfg) == {
+        "error_status_code": 429,
+        "error_credential_owned": True,
+    }
+
+    # 2. Fresh worker (cross-worker Redis cooldown) preserves the exact same Codex fields
+    mw_b = _make_middleware(codex_client, [])
+    with pytest.raises(Exception) as remote_exc:
+        await mw_b.awrap_model_call(_FakeRequest(codex_client), should_not_dial)
+
+    remote_frame = error_event_data(
+        "thread-codex", str(remote_exc.value), exc=remote_exc.value, config=codex_cfg
+    )
+    assert remote_frame["error_kind"] == "upstream"
+    assert remote_frame["status_code"] == 429
+    assert remote_frame["reason"] == "plan_limit"
+    assert remote_frame["hints"] == ["try_another_model"]
+    assert remote_frame["plan_limit"] == {
+        "plan": "ChatGPT Plus",
+        "window": "five_hour",
+        "until": expected_until,
+    }
+    assert remote_frame["attempted_models"][0]["attempts"] == 0
+    assert model_call_failure(remote_exc.value, codex_cfg) == {
+        "error_status_code": 429,
+        "error_credential_owned": True,
+    }
 
 
 @pytest.mark.asyncio
