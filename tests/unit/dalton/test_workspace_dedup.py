@@ -1428,3 +1428,58 @@ async def test_caller_own_historical_duplicate_exits_early_while_candidates_excl
     assert "WHERE" in ws_sql
     where_part = ws_sql.split("WHERE", 1)[1]
     assert "dalton_historical_duplicate_of" not in where_part
+
+
+def test_suffix_stripping_stays_linear_on_long_whitespace_runs() -> None:
+    """A user-entered display_name must not stall the event loop (codex final review)."""
+    import time
+
+    from src.dalton.coverage.dedup import derive_display_name_candidates
+
+    started = time.monotonic()
+    derive_display_name_candidates("A" + " " * 199 + "x")
+    assert derive_display_name_candidates("A" + " " * 5000 + "x") == ()
+    assert time.monotonic() - started < 0.5
+    assert derive_display_name_candidates("Costco") == ("Costco",)
+    assert derive_display_name_candidates("Coca-Cola Co") == ("Coca-Cola Co", "Coca-Cola")
+
+
+@pytest.mark.asyncio
+async def test_ticker_named_workspace_with_tracking_automation_counts_as_company(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`NVDA` with only `dalton-nvda-watch` (no unit, no company doc) still blocks (codex final review)."""
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_1,
+                name="NVDA",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            ),
+            _ws_row(
+                ws_id=WS_2,
+                name="Macro",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            ),
+        ],
+        automation_rows=[
+            {
+                "user_id": USER_RICHARD,
+                "workspace_id": WS_1,
+                "name": "dalton-nvda-watch",
+                "metadata": {},
+            }
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_1, WS_2})
+
+    match = await find_existing_company_workspace(USER_CALLER, "NVDA")
+    assert match is not None
+    assert match.workspace_id == WS_1
+    assert await find_existing_company_workspace(USER_CALLER, "Macro") is None

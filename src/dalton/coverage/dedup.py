@@ -31,6 +31,7 @@ from src.dalton.coverage.identity import (
     TICKER_SOURCE_WORKSPACE_NAME,
     is_historical_duplicate_workspace,
     resolve_workspace_coverage_identity,
+    ticker_from_automation_rows,
 )
 from src.dalton.database.coverage_units import _norm_uuid
 from src.dalton.settings import (
@@ -66,46 +67,14 @@ _CJK_LATIN_SPACE_RE = re.compile(
 )
 
 # Trailing corporate suffixes stripped repeatedly (longest-first within each script).
-_LATIN_SUFFIX_PATTERN = "|".join(
-    sorted(
-        (
-            "Corporation",
-            "Limited",
-            "Holdings",
-            "Holding",
-            "Group",
-            "Corp",
-            "Inc.",
-            "Inc",
-            "Co.",
-            "Co",
-            "Ltd.",
-            "Ltd",
-            "PBC",
-            "PLC",
-            "plc",
-            "N.V.",
-            "NV",
-            "SA",
-            "AG",
-        ),
-        key=len,
-        reverse=True,
-    )
-).replace(".", r"\.")
-_LATIN_SUFFIX_RE = re.compile(
-    rf"(?:^|[\s,，]+|(?<=[\u4e00-\u9fff]))[,，\s]*(?:{_LATIN_SUFFIX_PATTERN})\s*$",
-    re.IGNORECASE,
-)
-
-_CJK_SUFFIX_PATTERN = "|".join(
-    sorted(
-        ("股份有限公司", "有限公司", "股份", "集团", "控股"),
-        key=len,
-        reverse=True,
-    )
-)
-_CJK_SUFFIX_RE = re.compile(rf"[,，\s]*(?:{_CJK_SUFFIX_PATTERN})\s*$")
+# Plain string comparison, not a regex: a regex with adjacent optional separator
+# runs backtracks cubically on a long run of spaces, and a coverage unit's
+# display_name is user-entered and unbounded.
+_LATIN_SUFFIXES = tuple(sorted(("Corporation", "Limited", "Holdings", "Holding", "Group", "Corp", "Inc.", "Inc", "Co.", "Co", "Ltd.", "Ltd", "PBC", "PLC", "plc", "N.V.", "NV", "SA", "AG"), key=len, reverse=True))
+_CJK_SUFFIXES = tuple(sorted(("股份有限公司", "有限公司", "股份", "集团", "控股"), key=len, reverse=True))
+_SUFFIX_SEPARATORS = " ,，\t\r\n"
+# Longer names are not company names; deriving from them only costs time.
+_MAX_DISPLAY_NAME_CHARS = 200
 
 
 @dataclass(frozen=True)
@@ -191,19 +160,25 @@ def normalize_company_name(raw: str | None) -> str:
 
 
 def _strip_one_trailing_suffix(text: str) -> str | None:
-    stripped_latin = _LATIN_SUFFIX_RE.sub("", text).rstrip(" ,，\t\r\n")
-    if stripped_latin != text:
-        return stripped_latin
-    stripped_cjk = _CJK_SUFFIX_RE.sub("", text).rstrip(" ,，\t\r\n")
-    if stripped_cjk != text:
-        return stripped_cjk
+    body = text.rstrip(_SUFFIX_SEPARATORS)
+    folded = body.casefold()
+    for suffix in _LATIN_SUFFIXES:
+        if not folded.endswith(suffix.casefold()):
+            continue
+        head = body[: len(body) - len(suffix)]
+        # A Latin suffix must stand alone: start of name, a separator, or a CJK character before it.
+        if head == "" or head[-1] in _SUFFIX_SEPARATORS or "\u4e00" <= head[-1] <= "\u9fff":
+            return head.rstrip(_SUFFIX_SEPARATORS)
+    for suffix in _CJK_SUFFIXES:
+        if body.endswith(suffix):
+            return body[: len(body) - len(suffix)].rstrip(_SUFFIX_SEPARATORS)
     return None
 
 
 def derive_display_name_candidates(display_name: str | None) -> tuple[str, ...]:
     """Derive deterministic candidate names from a company coverage unit's ``display_name``."""
     raw = str(display_name or "").strip()
-    if not raw:
+    if not raw or len(raw) > _MAX_DISPLAY_NAME_CHARS:
         return ()
 
     seeds: list[str] = [raw]
@@ -881,9 +856,14 @@ async def _find_matches(
                         registered_units=units_by_ws,
                         automations=owner_autos,
                     )
+                    # A ticker-shaped name alone ("Macro") is not a company, but the
+                    # compat order puts the name before tracking automations, so a
+                    # workspace the owner tracks by name ("NVDA" + dalton-nvda-watch)
+                    # must still count.
                     if not identity.is_company or (
                         identity.source != SOURCE_REGISTERED
                         and identity.ticker_source == TICKER_SOURCE_WORKSPACE_NAME
+                        and ticker_from_automation_rows(ws_id, owner_autos) is None
                     ):
                         continue
                     if matched_ticker is None and identity.ticker:
