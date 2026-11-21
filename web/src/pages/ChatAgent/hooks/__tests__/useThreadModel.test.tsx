@@ -30,7 +30,8 @@ const mocks = vi.hoisted(() => ({
   /** The thread the Default was last asked for, where the row follows it. */
   catalogModelNames: new Set<string>(),
   metadata: undefined as Record<string, { sdk?: string; provider?: string }> | undefined,
-  // DALTON-HOOK(antigravity-series): series catalog + rawMetadata + shared workspace / features / user query mocks
+  // DALTON-HOOK(antigravity-series): series catalog + rawMetadata + Dalton build & shared workspace / features / user query mocks
+  isDaltonBuild: false,
   seriesCatalog: { series: [], bySeriesId: {}, bySeriesPrefix: {}, byVariantKey: {} } as AntigravitySeriesCatalog,
   rawMetadata: undefined as Record<string, { provider?: string }> | undefined,
   sharedEnabled: true,
@@ -73,7 +74,14 @@ vi.mock('@/hooks/useAllModels', () => ({
     customModels: [],
   }),
 }));
-// DALTON-HOOK(antigravity-series): mock useSharedWorkspaces, getFeatures, and useUser to simulate loading, error, shared, and confirmed-personal states
+// DALTON-HOOK(antigravity-series): mock isDaltonBuild, useSharedWorkspaces, getFeatures, and useUser to simulate Dalton vs non-Dalton builds and loading/error/shared/personal states
+vi.mock('@/config/brand', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/config/brand')>()),
+  get isDaltonBuild() {
+    return mocks.isDaltonBuild;
+  },
+}));
+
 vi.mock('@/hooks/useSharedWorkspaces', () => ({
   useSharedEntry: (_workspaceId?: string | null) => mocks.sharedEntry,
   useSharedWorkspaces: () => {
@@ -174,7 +182,8 @@ describe('useThreadModel', () => {
     mocks.chiefOfStaffDefault = null;
     mocks.catalogModelNames = new Set();
     mocks.metadata = undefined;
-    // DALTON-HOOK(antigravity-series): reset seriesCatalog, rawMetadata, sharedEnabled, sharedEntry, sharedError, featuresMode, and user state between tests
+    // DALTON-HOOK(antigravity-series): reset isDaltonBuild, seriesCatalog, rawMetadata, sharedEnabled, sharedEntry, sharedError, featuresMode, and user state between tests
+    mocks.isDaltonBuild = false;
     mocks.seriesCatalog = buildSeriesCatalog([]);
     mocks.rawMetadata = undefined;
     mocks.sharedEnabled = true;
@@ -1087,6 +1096,10 @@ describe('useThreadModel', () => {
 
   // DALTON-HOOK(antigravity-series): atomic PATCH + intra-series banner + shared-workspace 403 guard
   describe('Antigravity series and shared workspace picks', () => {
+    beforeEach(() => {
+      mocks.isDaltonBuild = true;
+    });
+
     const NEON_CATALOG = buildSeriesCatalog([
       {
         series_id: 'gemini-4-neon',
@@ -1706,6 +1719,26 @@ describe('useThreadModel', () => {
       expect(result.current.model).toBe('gemini-4-neon-medium-oauth');
       expect(result.current.sendModel).toBe('gemini-4-neon-medium-oauth');
       expect(mocks.updateThread).not.toHaveBeenCalled();
+    });
+
+    // DALTON-HOOK(antigravity-series): non-Dalton builds must keep exact upstream immediate-PATCH behavior even when /features first-read fails
+    it('keeps upstream immediate-PATCH behavior on non-Dalton builds when /features first-read fails', async () => {
+      mocks.isDaltonBuild = false;
+      mocks.sharedEnabled = false;
+      mocks.featuresMode = 'error';
+      mocks.catalogModelNames = new Set(['model-default', 'model-thread', 'model-beta']);
+      mocks.updateThread.mockResolvedValueOnce(row('model-beta'));
+
+      const { result, queryClient } = setup({ workspaceId: 'ws-personal' }, row('model-thread'));
+
+      await act(async () => {
+        expect(await result.current.pickModel('model-beta')).toBe(true);
+      });
+
+      expect(mocks.updateThread).toHaveBeenCalledTimes(1);
+      expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, { llm_model: 'model-beta' });
+      expect(cachedModel(queryClient)).toBe('model-beta');
+      expect(result.current.model).toBe('model-beta');
     });
   });
 });

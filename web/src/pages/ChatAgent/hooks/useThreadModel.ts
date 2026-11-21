@@ -7,7 +7,8 @@ import type { SubscriptionProvider } from '@/api/oauth';
 import type { Thread } from '@/types/api';
 import { useAllModels } from '@/hooks/useAllModels';
 import { useLapsedSignIn } from '@/hooks/useLapsedSignIn';
-// DALTON-HOOK(antigravity-series): inspect series membership & resolve thread write permissions before issuing PATCH
+// DALTON-HOOK(antigravity-series): inspect series membership & resolve thread write permissions before issuing PATCH (Dalton builds only)
+import { isDaltonBuild } from '@/config/brand';
 import { useThreadWriteAccess } from '@/lib/dalton/useThreadWriteAccess';
 import {
   formatAntigravityVariantLabel,
@@ -107,12 +108,13 @@ export function useThreadModel({
     ...threadDetailQuery(liveThreadId ?? ''),
     enabled: !!liveThreadId,
   });
-  // DALTON-HOOK(antigravity-series): distinguish confirmed writable vs shared/foreign vs unresolved permissions (including pending feature flags & Dalton team sharing) so picks never 403
+  // DALTON-HOOK(antigravity-series): distinguish confirmed writable vs shared/foreign vs unresolved permissions in Dalton builds; non-Dalton builds match upstream immediate-PATCH behavior
   const writeAccess = useThreadWriteAccess({
     workspaceId,
     liveThreadId,
     thread,
     threadError,
+    checkUpstreamShared: isDaltonBuild,
   });
   const isSharedUnresolved = writeAccess.status === 'unresolved';
   const isSharedWorkspace = writeAccess.status === 'shared';

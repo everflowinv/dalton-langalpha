@@ -1,4 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
+import { isDaltonBuild } from '@/config/brand';
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { featuresQuery, isFeatureEnabled } from '@/hooks/useFeatures';
 import { useSharedWorkspaces } from '@/hooks/useSharedWorkspaces';
@@ -43,7 +44,7 @@ export function useThreadWriteAccess({
   liveThreadId,
   thread,
   threadError = false,
-  checkUpstreamShared = true,
+  checkUpstreamShared = isDaltonBuild,
 }: UseThreadWriteAccessOptions): ThreadWriteAccess {
   const hasWorkspace = Boolean(workspaceId);
 
@@ -123,11 +124,13 @@ export function useThreadWriteAccess({
         daltonStatus = 'unresolved';
         daltonError = workspaceError || userError || (Boolean(liveThreadId) && threadError);
       }
-    } else if (liveThreadId && !thread && teamReadOnly.colleagueDispatchEnabled) {
-      // Owner's workspace with colleague dispatch enabled: wait for thread
-      // detail to confirm a colleague did not dispatch this thread.
+    } else if (liveThreadId && (!thread || (threadUserId && !currentUserId))) {
+      // Existing thread under Dalton team sharing: never treat workspace
+      // ownership alone as thread write permission before thread detail
+      // confirms thread ownership (a colleague may have started this thread
+      // even if colleague dispatch is currently disabled).
       daltonStatus = 'unresolved';
-      daltonError = threadError;
+      daltonError = threadError || (Boolean(threadUserId && !currentUserId) && userError);
     }
   }
 

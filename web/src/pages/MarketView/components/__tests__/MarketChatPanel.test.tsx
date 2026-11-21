@@ -1339,5 +1339,59 @@ describe('MarketChatPanel', () => {
       });
       expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'low' }));
     });
+
+    // DALTON-HOOK(antigravity-series): R4 #1 — workspace owner opening a colleague-initiated thread (even with colleague dispatch disabled) must not PATCH before thread detail confirms ownership
+    it('does not PATCH model or reasoning effort before thread detail confirms ownership when workspace owner opens a colleague-initiated thread with colleague dispatch off', async () => {
+      agSeriesMock.enabled = true;
+      agSeriesMock.isDaltonBuild = true;
+      agSeriesMock.useCustomPermissions = true;
+      agSeriesMock.featuresPending = false;
+      agSeriesMock.featuresData = [{ key: 'shared_workspaces', enabled: false }];
+      agSeriesMock.sharedEnabled = false;
+      agSeriesMock.currentUser = { user_id: 'user-owner' };
+      team.auth = true;
+      team.readOnly = false; // workspace owner, colleagueDispatchEnabled is falsy (off)
+
+      api.getWorkspace.mockResolvedValue({
+        workspace_id: 'ws-owner',
+        name: 'Owner Workspace',
+        user_id: 'user-owner',
+      });
+      let resolveThread!: (value: Record<string, unknown>) => void;
+      api.getThread.mockReturnValue(new Promise((resolve) => { resolveThread = resolve; }));
+
+      const { qc } = renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-owner' });
+      await vi.waitFor(() => expect(qc.getQueryData(queryKeys.features.list())).toBeDefined());
+      await vi.waitFor(() => expect(api.getWorkspace).toHaveBeenCalledWith('ws-owner'));
+
+      // Before thread detail returns, user changes model and reasoning effort -> must NOT PATCH.
+      await act(async () => {
+        await (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-high-oauth');
+        await (ci.props!.onPickReasoningEffort as (effort: string | null) => Promise<boolean>)('high');
+      });
+
+      expect(api.updateThread).not.toHaveBeenCalled();
+      expect(ci.props!.model).toBe('gemini-4-neon-high-oauth');
+      expect(ci.props!.sendModel).toBe('gemini-4-neon-high-oauth');
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
+
+      // DALTON-HOOK(antigravity-series): thread detail arrives showing a colleague started this thread -> stays local, still zero PATCHes
+      await act(async () => {
+        resolveThread({
+          thread_id: 'thread-xyz',
+          llm_model: 'claude-sonnet-4',
+          reasoning_effort: 'low',
+          fast_mode: null,
+          workspace_owner_id: 'user-owner',
+          thread_user_id: 'user-colleague',
+        });
+      });
+      await act(async () => {});
+
+      expect(api.updateThread).not.toHaveBeenCalled();
+      expect(ci.props!.model).toBe('gemini-4-neon-high-oauth');
+      expect(ci.props!.sendModel).toBe('gemini-4-neon-high-oauth');
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
+    });
   });
 });
