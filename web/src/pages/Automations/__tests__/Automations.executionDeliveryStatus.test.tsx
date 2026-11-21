@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { screen, within } from '@testing-library/react';
+import { act, screen, waitFor, within } from '@testing-library/react';
 import i18n from '@/i18n';
 import { renderWithProviders } from '@/test/utils';
 import type {
@@ -7,12 +7,15 @@ import type {
   AutomationExecution,
   AutomationRun,
   ExecutionDeliverySummary,
+  ScriptAutomationRead,
+  ScriptAutomationRunRead,
 } from '@/types/automation';
 import * as api from '../utils/api';
-import { resolveExecutionDelivery } from '../utils/delivery';
-import { DELIVERY_SETTLE_MS, isDeliverySettling } from '../utils/polling';
+import { deliveryTargetName, matchAttemptForTarget, resolveExecutionDelivery } from '../utils/delivery';
+import { DELIVERY_SETTLE_MS, isDeliverySettling, isScriptDeliveryPending, LIVE_POLL_MS } from '../utils/polling';
 import { describeRun } from '../utils/status';
 import Automations from '../Automations';
+import ScriptInspector from '../components/ScriptInspector';
 
 const prefMocks = vi.hoisted(() => ({
   preferences: {
@@ -61,6 +64,8 @@ vi.mock('../utils/api', async (importOriginal) => {
     listRecentRuns: vi.fn(),
     getDeliveryOptions: vi.fn(),
     ...personalReadMocks(listAutomations),
+    listAutomationExecutionReads: vi.fn(),
+    listAutomationHistory: vi.fn(),
   };
 });
 
@@ -464,5 +469,249 @@ describe('round-2 review regressions in inspector history and detail', () => {
     expect(reportCard).toHaveTextContent('已完成 · 投递失败');
     expect(reportCard).toHaveTextContent('投递失败：卡片超过 30 KB 上限');
     expect(reportCard).not.toHaveTextContent('已完成 · 投递中');
+  });
+});
+
+describe('round-3 review regressions', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('does not borrow Feishu group A name for group B failure when only A is in delivery_result', async () => {
+    await i18n.changeLanguage('zh-CN');
+    const attemptGroupA = {
+      method: 'feishu',
+      address: 'feishu:chat:oc_group_a',
+      name: '飞书群 A',
+      success: true,
+    };
+    const targetGroupA = {
+      target: 'feishu:oc_group_a',
+      channel: 'feishu',
+      name: null,
+      status: 'sent' as const,
+    };
+    const targetGroupB = {
+      target: 'feishu:chat:oc_group_b',
+      channel: 'feishu',
+      name: null,
+      status: 'failed' as const,
+      error_code: 'card_limit_exceeded',
+      error_message: '卡片超过 30 KB 上限',
+    };
+
+    // Normalized address matches A (`feishu:oc_group_a` === `feishu:chat:oc_group_a`),
+    // while B must NEVER fall back to channel-only match and borrow A's name.
+    expect(matchAttemptForTarget(targetGroupA, [attemptGroupA])).toBe(attemptGroupA);
+    expect(matchAttemptForTarget(targetGroupB, [attemptGroupA])).toBeNull();
+    expect(deliveryTargetName(targetGroupB, i18n.t, undefined, null)).not.toContain('飞书群 A');
+
+    const runWithTwoGroups: AutomationExecution = {
+      ...makeExecution('run-two-feishu-groups', 20, {
+        status: 'partial_failed',
+        total_targets: 2,
+        sent_count: 1,
+        failed_count: 1,
+        retrying_count: 0,
+        failure_code: 'card_limit_exceeded',
+        failure_reason: '卡片超过 30 KB 上限',
+        targets: [targetGroupA, targetGroupB],
+      }),
+      delivery_result: [attemptGroupA],
+    };
+
+    const auto = { ...AUTOMATION, last_execution: runWithTwoGroups };
+    vi.mocked(api.listAutomations).mockResolvedValue({ data: { automations: [auto], total: 1 } } as never);
+    vi.mocked(api.listExecutions).mockResolvedValue({
+      data: { executions: [runWithTwoGroups], has_more: false },
+    } as never);
+    vi.mocked(api.listRecentRuns).mockResolvedValue({ data: { executions: [], has_more: false } } as never);
+    vi.mocked(api.getDeliveryOptions).mockResolvedValue({ data: { enabled: false, apps: {}, workspace_id: 'ws-1' } } as never);
+    renderWithProviders(<Automations />, { route: '/automations?id=auto-market-pm' });
+
+    const heading = await screen.findByRole('heading', { level: 2, name: '市场晚报' });
+    const pane = heading.closest('article')!;
+    const table = await within(pane).findByRole('table');
+
+    const row = within(table).getByRole('button', { name: /20/ }).closest('tr')!;
+    const errRow = row.nextElementSibling as HTMLElement;
+    expect(row).toHaveTextContent('已发送到 飞书群 A');
+    expect(errRow).toHaveTextContent('卡片超过 30 KB 上限');
+    expect(errRow).not.toHaveTextContent('飞书群 A');
+  });
+
+  it('shows every target status and all distinct failure reasons in RunReport detail card', async () => {
+    await i18n.changeLanguage('zh-CN');
+    const multiFailureRun: AutomationExecution = {
+      ...makeExecution('run-two-reasons', 20, {
+        status: 'failed',
+        total_targets: 2,
+        sent_count: 0,
+        failed_count: 2,
+        retrying_count: 0,
+        failure_code: 'card_limit_exceeded',
+        failure_reason: '卡片超过 30 KB 上限',
+        failure_reasons: ['卡片超过 30 KB 上限', '通知网关连接或服务异常'],
+        targets: [
+          {
+            target: 'feishu:chat:oc_group_a',
+            channel: 'feishu',
+            name: '投研大群',
+            status: 'failed',
+            error_code: 'card_limit_exceeded',
+            error_message: '卡片超过 30 KB 上限',
+          },
+          {
+            target: 'feishu:chat:oc_group_b',
+            channel: 'feishu',
+            name: '风控群',
+            status: 'failed',
+            error_code: 'connecterror',
+            error_message: '通知网关连接或服务异常',
+          },
+        ],
+      }),
+    };
+
+    const auto = { ...AUTOMATION, last_execution: multiFailureRun };
+    vi.mocked(api.listAutomations).mockResolvedValue({ data: { automations: [auto], total: 1 } } as never);
+    vi.mocked(api.listExecutions).mockResolvedValue({
+      data: { executions: [multiFailureRun], has_more: false },
+    } as never);
+    vi.mocked(api.listRecentRuns).mockResolvedValue({ data: { executions: [], has_more: false } } as never);
+    vi.mocked(api.getDeliveryOptions).mockResolvedValue({ data: { enabled: false, apps: {}, workspace_id: 'ws-1' } } as never);
+    renderWithProviders(<Automations />, { route: '/automations?id=auto-market-pm' });
+
+    const heading = await screen.findByRole('heading', { level: 2, name: '市场晚报' });
+    const pane = heading.closest('article')!;
+    await within(pane).findByRole('table');
+
+    const reportCard = pane.querySelector('.automation-report') as HTMLElement;
+    expect(reportCard).toHaveTextContent('投研大群 发送失败：卡片超过 30 KB 上限');
+    expect(reportCard).toHaveTextContent('风控群 发送失败：通知网关连接或服务异常');
+  });
+
+  it('polls ScriptInspector execution history while pending_dispatch and stops once terminal result arrives', async () => {
+    await i18n.changeLanguage('zh-CN');
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+
+    const makeScriptRun = (
+      notifyStatus: string,
+      summary: ExecutionDeliverySummary,
+    ): ScriptAutomationRunRead => ({
+      automation_execution_id: 'script-run-1',
+      automation_id: 'data:daily-brief',
+      automation_name: 'Daily Brief',
+      engine_kind: 'script',
+      status: 'succeeded',
+      scheduled_at: '2026-11-20T13:10:00Z',
+      created_at: '2026-11-20T13:10:00Z',
+      started_at: '2026-11-20T13:10:01Z',
+      completed_at: '2026-11-20T13:10:15Z',
+      conversation_thread_id: null,
+      workspace_id: null,
+      excerpt: null,
+      exit_code: 0,
+      failure_reason: null,
+      notify_status: notifyStatus,
+      delivery_summary: summary,
+      triggered_by_user_id: null,
+      log_tail: null,
+      trigger_source: 'schedule',
+    });
+
+    const pendingRun = makeScriptRun('pending_dispatch', {
+      status: 'retrying',
+      total_targets: 0,
+      sent_count: 0,
+      failed_count: 0,
+      retrying_count: 0,
+      failure_code: null,
+      failure_reason: null,
+    });
+    const deliveredRun = makeScriptRun('dispatched', {
+      status: 'delivered',
+      total_targets: 1,
+      sent_count: 1,
+      failed_count: 0,
+      retrying_count: 0,
+      failure_code: null,
+      failure_reason: null,
+    });
+
+    expect(isScriptDeliveryPending(pendingRun)).toBe(true);
+    expect(isScriptDeliveryPending(deliveredRun)).toBe(false);
+
+    const script: ScriptAutomationRead = {
+      automation_id: 'data:daily-brief',
+      name: 'Daily Brief',
+      status: 'active',
+      enabled: true,
+      paused_by_user: false,
+      cron_expression: '0 9 * * 1-5',
+      timezone: 'Asia/Shanghai',
+      config_version: 1,
+      active_version: 1,
+      updated_at: '2026-11-20T00:00:00Z',
+      notify_storage_mode: 'task_row',
+      engine_kind: 'script',
+      scope: 'company',
+      description: null,
+      next_run_at: '2026-11-21T01:00:00Z',
+      last_run_at: '2026-11-20T13:10:15Z',
+      updated_by: null,
+      dalton_notify_category: 'data_task',
+      dalton_notify_effective: true,
+      dalton_notify_source: 'task_row',
+      dalton_notify_route_targets: ['feishu:chat:oc_ops'],
+      last_execution: pendingRun,
+    };
+
+    const execReadMock = vi.mocked(api.listAutomationExecutionReads);
+    execReadMock
+      .mockResolvedValueOnce({ data: { executions: [pendingRun], has_more: false } } as never)
+      .mockResolvedValue({ data: { executions: [deliveredRun], has_more: false } } as never);
+    vi.mocked(api.listAutomationHistory).mockResolvedValue({
+      data: {
+        automation_id: script.automation_id,
+        scope: 'company',
+        engine_kind: 'script',
+        config_version: 1,
+        active_version: 1,
+        entries: [],
+        total: 0,
+        limit: 50,
+        offset: 0,
+      },
+    } as never);
+
+    renderWithProviders(
+      <ScriptInspector
+        script={script}
+        runId={null}
+        configVersion={1}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onRunsForbidden={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText(/投递中/)).toBeInTheDocument();
+    expect(execReadMock).toHaveBeenCalledTimes(1);
+
+    // Advance by LIVE_POLL_MS: refetches and transitions from retrying -> delivered
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_POLL_MS);
+    });
+    await waitFor(() => {
+      expect(execReadMock).toHaveBeenCalledTimes(2);
+      expect(screen.queryByText(/投递中/)).not.toBeInTheDocument();
+    });
+
+    // Advance well past several poll intervals: polling has stopped once terminal status arrived
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_POLL_MS * 4);
+    });
+    expect(execReadMock).toHaveBeenCalledTimes(2);
   });
 });

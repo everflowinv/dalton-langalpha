@@ -899,6 +899,40 @@ async def record_delivery(execution_id: str, delivery_result: list, *, conn=None
             """, (Json(delivery_result), execution_id))
 
 
+# DALTON-HOOK(execution-delivery-status): clear retrying flag on saved delivery_result without replacing the record
+async def clear_delivery_retrying(execution_id: str, *, conn=None) -> None:
+    """Set ``retrying`` to ``false`` on saved ``delivery_result`` entries once retries stop."""
+    async with get_db_connection(conn) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE automation_executions
+                SET delivery_result = (
+                    SELECT jsonb_agg(
+                        CASE
+                            WHEN jsonb_typeof(elem) = 'object'
+                                 AND elem -> 'retrying' = 'true'::jsonb
+                            THEN jsonb_set(elem, '{retrying}', 'false'::jsonb, true)
+                            ELSE elem
+                        END
+                        ORDER BY ord
+                    )
+                    FROM jsonb_array_elements(delivery_result) WITH ORDINALITY AS t(elem, ord)
+                )
+                WHERE automation_execution_id = %s
+                  AND delivery_result IS NOT NULL
+                  AND jsonb_typeof(delivery_result) = 'array'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM jsonb_array_elements(delivery_result) AS e
+                      WHERE jsonb_typeof(e) = 'object'
+                        AND e -> 'retrying' = 'true'::jsonb
+                  )
+                """,
+                (execution_id,),
+            )
+
+
 async def dismiss_execution(execution_id: str, *, automation_id: str) -> bool:
     """Mark a failed run of this automation dismissed. False when it has no
     such failed run. A second dismissal keeps the first one's time."""

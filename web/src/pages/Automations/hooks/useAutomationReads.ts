@@ -61,6 +61,8 @@ export interface AutomationRunReadArgs extends AutomationRunReadParams {
 
 export interface AutomationReadPageArgs extends AutomationReadPageParams {
   enabled?: boolean;
+  /** Optional polling interval (or callback over latest page data) for in-flight script deliveries. */
+  refetchInterval?: number | false | ((data: AutomationRunReadList | undefined) => number | false);
 }
 
 function isForbidden(error: unknown): boolean {
@@ -86,11 +88,22 @@ function useAutomationReadQuery<T>(
   queryKey: readonly unknown[],
   read: () => Promise<T>,
   enabled: boolean,
+  refetchInterval?: number | false | ((data: T | undefined) => number | false),
 ): AutomationReadState<T> {
   const queryClient = useQueryClient();
   const query = useQuery({
     queryKey,
     enabled,
+    refetchInterval:
+      enabled && refetchInterval
+        ? (q) =>
+            isForbidden(q.state.error)
+              ? false
+              : typeof refetchInterval === 'function'
+                ? refetchInterval(q.state.data)
+                : refetchInterval
+        : false,
+    refetchIntervalInBackground: false,
     queryFn: async () => {
       // `Query.fetch` assigns the retryer before this function runs, so the
       // promise here is this attempt. Do not read the query context `signal`:
@@ -182,7 +195,7 @@ export function useAutomationExecutionReads(
   args: AutomationReadPageArgs = {},
 ): AutomationReadState<AutomationRunReadList> {
   const { userId } = useAuth();
-  const { enabled, ...filters } = args;
+  const { enabled, refetchInterval, ...filters } = args;
   const id = presentId(automationId);
   return useAutomationReadQuery(
     queryKeys.automations.readExecutions(userId, id ?? '', automationExecutionReadQuery(filters)),
@@ -191,6 +204,7 @@ export function useAutomationExecutionReads(
       return (await listAutomationExecutionReads(id, filters)).data;
     },
     (enabled ?? true) && !!userId && id !== null,
+    refetchInterval,
   );
 }
 

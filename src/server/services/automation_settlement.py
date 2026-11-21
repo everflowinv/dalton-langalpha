@@ -511,6 +511,17 @@ def _stamp_delivery_retry(
     return stamped
 
 
+# DALTON-HOOK(execution-delivery-status): clear retrying on kept delivery_result when sender stops retrying
+async def _clear_delivery_retrying(execution_id: str) -> None:
+    try:
+        await exec_db.clear_delivery_retrying(execution_id)
+    except Exception as e:
+        logger.error(
+            f"[AUTOMATION_SETTLE] Clearing delivery retrying flag failed: "
+            f"execution_id={execution_id} error={e}"
+        )
+
+
 async def _finish_here(
     automation: Dict[str, Any],
     execution_id: str,
@@ -588,6 +599,8 @@ async def _finish_held_run(job: Dict[str, Any]) -> None:
             _stamp_delivery_retry(finish.result, retrying=will_retry),
             answered=answered or finish.answered,
         )
+    elif not will_retry:
+        await _clear_delivery_retrying(execution_id)
     if not finish.retry:
         return
     if job["attempts"] >= MAX_ATTEMPTS:
@@ -638,6 +651,8 @@ async def _finish_again(
             await _record_delivery(
                 execution_id, _stamp_delivery_retry(finish.result, retrying=will_retry)
             )
+        elif not will_retry:
+            await _clear_delivery_retrying(execution_id)
         answered = answered or finish.answered
         if not finish.retry:
             return

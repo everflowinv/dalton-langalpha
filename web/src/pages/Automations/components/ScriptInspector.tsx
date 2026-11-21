@@ -11,6 +11,7 @@ import { useAutomationExecutionReads } from '../hooks/useAutomationReads';
 import { useAutomationMutations } from '../hooks/useAutomationMutations';
 import { cronToHuman } from '../utils/cron'; // DALTON-HOOK(ui-unify)
 import { formatDeliveryFailureReason } from '../utils/delivery';
+import { isScriptDeliveryPending, LIVE_POLL_MS } from '../utils/polling';
 import { formatDateTimeShort } from '../utils/time';
 import { isCompanyTask, isDeletedTask, isForbiddenError, runStatusKey, scriptStatusLabelKey } from '../utils/taskKind';
 import { DeletedMeta, ModificationHistory, RecordTabs, RollbackDialog } from './ModificationHistory';
@@ -35,7 +36,15 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
   const { pause, resume, busy } = useAutomationMutations();
   const deleted = isDeletedTask(script);
   const history = useModificationHistory(script, isCompanyTask(script), onRunsForbidden, onRestored);
-  const runs = useAutomationExecutionReads(script.automation_id, { limit: 20, offset: 0, enabled: !deleted });
+  const runs = useAutomationExecutionReads(script.automation_id, {
+    limit: 20,
+    offset: 0,
+    enabled: !deleted,
+    refetchInterval: (data) =>
+      data?.executions.some((run) => run.engine_kind === 'script' && isScriptDeliveryPending(run))
+        ? LIVE_POLL_MS
+        : false,
+  });
   const runsForbidden = isCompanyTask(script) && isForbiddenError(runs.error);
   useEffect(() => {
     if (runsForbidden) onRunsForbidden(script.automation_id);

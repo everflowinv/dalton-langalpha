@@ -265,7 +265,50 @@ export function formatDeliveryFailureReason(
   return detected;
 }
 
-/** Match a backend delivery_summary target back to a delivery_result attempt for chat name / via enrichment. */
+// DALTON-HOOK(execution-delivery-status): normalize target addresses for strict per-target attempt/name matching
+const FEISHU_OPEN_ID_RE = /^ou_[A-Za-z0-9_-]+$/;
+const FEISHU_CHAT_ID_RE = /^oc_[A-Za-z0-9_-]+$/;
+const DISCORD_SNOWFLAKE_RE = /^[0-9]{5,32}$/;
+
+/** Canonical `(platform, kind, ident)` key for matching a summary target against attempts and chat names. */
+export function normalizeDeliveryTargetKey(
+  rawTarget: string | null | undefined,
+  fallbackChannel?: string | null,
+): string | null {
+  const cleaned = (rawTarget ?? '').trim();
+  if (!cleaned) return null;
+  const parts = cleaned.split(':');
+  if (parts.length === 1) {
+    const platform = (fallbackChannel ?? '').trim().toLowerCase();
+    const ident = parts[0].trim();
+    if (!platform || !ident) return null;
+    if (ident.toLowerCase() === platform) return `${platform}:app`;
+    if (ident === '@me') return `${platform}:dm:@me`;
+    if (platform === 'feishu' && FEISHU_OPEN_ID_RE.test(ident)) return `feishu:dm:${ident}`;
+    if (platform === 'feishu' && FEISHU_CHAT_ID_RE.test(ident)) return `feishu:group:${ident}`;
+    if (platform === 'discord' && DISCORD_SNOWFLAKE_RE.test(ident)) return `discord:group:${ident}`;
+    return `${platform}:raw:${ident}`;
+  }
+  const platform = parts[0].trim().toLowerCase();
+  if (!platform) return null;
+  if (parts.length === 2) {
+    const second = parts[1].trim();
+    if (!second) return null;
+    if (second === '@me') return `${platform}:dm:@me`;
+    if (platform === 'feishu' && FEISHU_OPEN_ID_RE.test(second)) return `feishu:dm:${second}`;
+    if (platform === 'feishu' && FEISHU_CHAT_ID_RE.test(second)) return `feishu:group:${second}`;
+    if (platform === 'discord' && DISCORD_SNOWFLAKE_RE.test(second)) return `discord:group:${second}`;
+    return `${platform}:raw:${second}`;
+  }
+  const subkind = parts[1].trim().toLowerCase();
+  const ident = parts.slice(2).join(':').trim();
+  if (!ident) return null;
+  if (subkind === 'user') return `${platform}:dm:${ident}`;
+  if (subkind === 'chat' || subkind === 'channel' || subkind === 'group') return `${platform}:group:${ident}`;
+  return `${platform}:raw:${parts.slice(1).join(':').trim()}`;
+}
+
+/** Match a backend delivery_summary target back to a delivery_result attempt by exact or normalized address. */
 export function matchAttemptForTarget(
   target: ExecutionDeliveryTarget,
   attempts: readonly DeliveryAttempt[],
@@ -273,14 +316,28 @@ export function matchAttemptForTarget(
   const tAddr = (target.target ?? '').trim();
   const tChan = (target.channel ?? '').trim().toLowerCase();
   if (tAddr) {
-    const byAddress = attempts.find((a) => (a.address ?? '').trim() === tAddr || a.method.trim() === tAddr);
-    if (byAddress) return byAddress;
+    const byExact = attempts.find((a) => (a.address ?? '').trim() === tAddr || a.method.trim() === tAddr);
+    if (byExact) return byExact;
+
+    const targetKey = normalizeDeliveryTargetKey(tAddr, tChan);
+    if (targetKey && !targetKey.endsWith(':app')) {
+      const byNormalized = attempts.find((a) => {
+        const aChan = a.method.split(':', 1)[0]?.trim().toLowerCase() ?? '';
+        const addrKey = normalizeDeliveryTargetKey(a.address, aChan);
+        if (addrKey && addrKey === targetKey) return true;
+        const methodKey = normalizeDeliveryTargetKey(a.method, aChan);
+        return methodKey === targetKey;
+      });
+      if (byNormalized) return byNormalized;
+      return null;
+    }
   }
-  if (tChan) {
-    const byChannel = attempts.filter(
-      (a) => a.method.split(':', 1)[0]?.toLowerCase() === tChan,
+  // Bare app-level target (no specific chat address): only match a bare app-level attempt on the same channel.
+  if (tChan && (!tAddr || tAddr.toLowerCase() === tChan)) {
+    const bareAttempts = attempts.filter(
+      (a) => !(a.address ?? '').trim() && a.method.trim().toLowerCase() === tChan,
     );
-    if (byChannel.length === 1) return byChannel[0];
+    if (bareAttempts.length === 1) return bareAttempts[0];
   }
   return null;
 }
@@ -295,12 +352,21 @@ export function deliveryTargetName(
   if (target.name) return target.name;
   if (matchedAttempt?.name) return matchedAttempt.name;
   const addr = (target.target ?? '').trim();
-  if (addr && namesChat(addr)) {
-    const known = names?.get(addr);
-    if (known) return known;
+  const chan = (target.channel ?? '').trim().toLowerCase();
+  if (addr && names) {
+    if (namesChat(addr)) {
+      const exact = names.get(addr);
+      if (exact) return exact;
+    }
+    const targetKey = normalizeDeliveryTargetKey(addr, chan);
+    if (targetKey && !targetKey.endsWith(':app')) {
+      for (const [knownAddr, knownName] of names.entries()) {
+        if (normalizeDeliveryTargetKey(knownAddr) === targetKey) return knownName;
+      }
+    }
   }
   if (matchedAttempt) return deliveryAttemptName(matchedAttempt, t, names);
-  const fallbackKey = addr || (target.channel ?? '').trim();
+  const fallbackKey = addr || chan;
   return fallbackKey ? deliveryMethodName(fallbackKey, t) : t('automation.delivery');
 }
 

@@ -1213,3 +1213,536 @@ def test_activity_strips_synced_undelivered_excerpt_suffix() -> None:
     assert "- 13:13 市场晚报, finished · delivery failed (Card exceeds 30 KB limit): 晚报已生成" in rendered
     assert "not_allowed" not in rendered
     assert "已生成但未送达" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# 5. Round-3 review regression tests (high & medium findings)
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_only_uncertain_pending_shows_unconfirmed_and_updates_on_receipt() -> None:
+    """R3 High #1: gateway/report uncertain pending rows (reconcile-only) never show retrying."""
+    now = _utc(15, 0)
+    recent_at = now - timedelta(minutes=2)
+
+    # Trigger: automation_report 3rd attempt timed out -> pending + delivery_uncertain.
+    # Sender stopped resending and only checks receipts.
+    uncertain_third = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "exec-report-timeout-3",
+                "channel": "feishu",
+                "target": "feishu:chat:oc_market_pm",
+                "status": "pending",
+                "attempt_count": 3,
+                "error_code": "delivery_uncertain",
+                "created_at": recent_at,
+                "updated_at": recent_at,
+                "payload_json": {"source": "automation_report"},
+            }
+        ],
+        now=now,
+    )
+    assert uncertain_third is not None
+    assert uncertain_third["status"] == "failed"
+    assert uncertain_third["retrying_count"] == 0
+    assert uncertain_third["failed_count"] == 1
+    assert uncertain_third["failure_code"] == "delivery_uncertain"
+    assert uncertain_third["failure_reason"] == "投递状态未确认"
+    assert (
+        eds.format_execution_delivery_note(
+            {"status": "completed", "delivery_summary": uncertain_third}, lang="zh"
+        )
+        == "已完成 · 投递失败（投递状态未确认）"
+    )
+    assert (
+        eds.format_execution_delivery_note(
+            {"status": "completed", "delivery_summary": uncertain_third}, lang="en"
+        )
+        == "finished · delivery failed (Delivery could not be confirmed)"
+    )
+
+    # Even attempt 1 on gateway/report/data_task with delivery_uncertain is reconcile-only (never resent).
+    for row in (
+        {
+            "delivery_id": str(uuid4()),
+            "execution_id": "exec-report-timeout-1",
+            "channel": "feishu",
+            "target": "feishu:chat:oc_market_pm",
+            "status": "pending",
+            "attempt_count": 1,
+            "error_code": "delivery_uncertain",
+            "created_at": recent_at,
+            "updated_at": recent_at,
+            "payload_json": {"source": "automation_report"},
+        },
+        {
+            "delivery_id": str(uuid4()),
+            "execution_id": "exec-gw-timeout-1",
+            "channel": "feishu",
+            "target": "feishu:user:ou_richard",
+            "status": "pending",
+            "attempt_count": 1,
+            "error_code": "in_flight",
+            "created_at": recent_at,
+            "updated_at": recent_at,
+            "payload_json": {"source": "automation_completion", "transport": "gateway"},
+        },
+        {
+            "delivery_id": str(uuid4()),
+            "execution_id": "exec-script-timeout-1",
+            "automation_id": "data:daily-brief",
+            "channel": "feishu",
+            "target": "feishu:chat:oc_ops",
+            "status": "pending",
+            "attempt_count": 1,
+            "error_code": "delivery_uncertain",
+            "created_at": recent_at,
+            "updated_at": recent_at,
+            "payload_json": {"route_key": "data:daily-brief"},
+        },
+    ):
+        summary = eds.summarize_execution_delivery(notify_rows=[row], now=now)
+        assert summary is not None
+        assert summary["status"] == "failed"
+        assert summary["retrying_count"] == 0
+        assert summary["failure_reason"] == "投递状态未确认"
+
+    # Queued report (attempt 0, no error) is still eligible to send -> retrying.
+    queued_report = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "exec-report-queued",
+                "channel": "feishu",
+                "target": "feishu:chat:oc_market_pm",
+                "status": "pending",
+                "attempt_count": 0,
+                "error_code": None,
+                "created_at": recent_at,
+                "updated_at": recent_at,
+                "payload_json": {"source": "automation_report"},
+            }
+        ],
+        now=now,
+    )
+    assert queued_report is not None
+    assert queued_report["status"] == "retrying"
+
+    # Once reconciliation receives receipt and updates row to sent -> delivered.
+    after_receipt = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "exec-report-timeout-3",
+                "channel": "feishu",
+                "target": "feishu:chat:oc_market_pm",
+                "status": "sent",
+                "attempt_count": 3,
+                "error_code": None,
+                "created_at": recent_at,
+                "updated_at": now,
+                "payload_json": {"source": "automation_report"},
+            }
+        ],
+        now=now,
+    )
+    assert after_receipt is not None
+    assert after_receipt["status"] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_settlement_clears_retrying_flag_when_stopping_retries_without_replacing_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 High #2: stopping retries on 503 exhaustion or 401/404 after answered clears retrying without overwriting record."""
+    import asyncio as _asyncio
+
+    from src.server.services import (
+        automation_delivery,
+        automation_settlement,
+        hook_outbox,
+    )
+
+    outbox_db = automation_settlement.outbox_db
+
+    # In-memory simulation of automation_executions.delivery_result and clear_delivery_retrying
+    stored_records: dict[str, list[dict[str, Any]]] = {}
+    record_calls: list[tuple[str, list[dict[str, Any]]]] = []
+    clear_calls: list[str] = []
+
+    async def _fake_record(execution_id: str, delivery_result: list[dict[str, Any]], *, conn: Any = None) -> None:
+        _ = conn
+        copied = [dict(item) for item in delivery_result]
+        stored_records[execution_id] = copied
+        record_calls.append((execution_id, copied))
+
+    async def _fake_clear(execution_id: str, *, conn: Any = None) -> None:
+        _ = conn
+        clear_calls.append(execution_id)
+        if execution_id in stored_records:
+            stored_records[execution_id] = [
+                {**item, "retrying": False} if item.get("retrying") is True else item
+                for item in stored_records[execution_id]
+            ]
+
+    async def _fake_merge(job_id: str, patch: dict[str, Any], *, remove: Any = None, conn: Any = None) -> bool:
+        _ = job_id, patch, remove, conn
+        return True
+
+    @contextlib.asynccontextmanager
+    async def _fake_conn(_conn: Any = None):
+        conn = create_autospec(psycopg.AsyncConnection, instance=True)
+
+        @contextlib.asynccontextmanager
+        async def _tx():
+            yield
+
+        conn.transaction.side_effect = _tx
+        yield conn
+
+    monkeypatch.setattr(
+        exec_db,
+        "record_delivery",
+        create_autospec(exec_db.record_delivery, side_effect=_fake_record),
+    )
+    orig_clear_delivery_retrying = exec_db.clear_delivery_retrying
+    monkeypatch.setattr(
+        exec_db,
+        "clear_delivery_retrying",
+        create_autospec(orig_clear_delivery_retrying, side_effect=_fake_clear),
+    )
+    monkeypatch.setattr(
+        outbox_db,
+        "merge_job_payload",
+        create_autospec(outbox_db.merge_job_payload, side_effect=_fake_merge),
+    )
+    monkeypatch.setattr(
+        automation_settlement,
+        "get_db_connection",
+        create_autospec(automation_settlement.get_db_connection, side_effect=_fake_conn),
+    )
+    monkeypatch.setattr(
+        auto_db,
+        "get_automation",
+        create_autospec(
+            auto_db.get_automation,
+            return_value={
+                "automation_id": "auto-1",
+                "user_id": "user-1",
+                "delivery_config": {"methods": ["slack:T1/C1"]},
+            },
+        ),
+    )
+
+    delivery = automation_delivery.Delivery(
+        id="exec-r3",
+        targets=[
+            automation_delivery.Target(
+                entry="slack:T1/C1", address="slack:T1/C1", name="#desk", ok=True
+            )
+        ],
+    )
+    stamped_delivery = automation_delivery.stamp(delivery)
+
+    finish_503 = automation_delivery.Finish(
+        result=[
+            {
+                "method": "slack:T1/C1",
+                "address": "slack:T1/C1",
+                "name": "#desk",
+                "success": False,
+                "error": "Delivery couldn't be confirmed. The messaging service returned 503.",
+            }
+        ],
+        retry=True,
+        answered=False,
+    )
+    finish_posting = automation_delivery.Finish(
+        result=[
+            {
+                "method": "slack:T1/C1",
+                "address": "slack:T1/C1",
+                "name": "#desk",
+                "success": False,
+                "error": "Delivery couldn't be confirmed. Still posting to #desk.",
+            }
+        ],
+        retry=True,
+        answered=True,
+    )
+    finish_404 = automation_delivery.Finish(
+        result=[
+            {
+                "method": "slack:T1/C1",
+                "address": "slack:T1/C1",
+                "name": "#desk",
+                "success": False,
+                "error": "Delivery couldn't be confirmed. The messaging service has no record of this run.",
+            }
+        ],
+        retry=False,
+        answered=False,
+    )
+
+    # Case 1a: Outbox _finish_held_run final attempt still returns 503 -> keeps first record, clears retrying
+    orig_finish_run = automation_delivery.finish_run
+    monkeypatch.setattr(
+        automation_delivery,
+        "finish_run",
+        create_autospec(orig_finish_run, side_effect=[finish_503, finish_503]),
+    )
+    job_1 = {
+        "hook_outbox_id": "job-1",
+        "conversation_thread_id": "thread-1",
+        "attempts": 1,
+        "payload": {
+            "execution_id": "exec-503-outbox",
+            "automation_id": "auto-1",
+            "user_id": "user-1",
+            "status": "completed",
+            "final_text": "Done",
+            "delivery": stamped_delivery,
+            "recorded": False,
+            "answered": False,
+        },
+    }
+    with pytest.raises(automation_settlement._FinishPending):
+        await automation_settlement._finish_held_run(job_1)
+    assert stored_records["exec-503-outbox"][0]["retrying"] is True
+
+    job_last = {
+        **job_1,
+        "attempts": hook_outbox.MAX_ATTEMPTS,
+        "payload": {**job_1["payload"], "recorded": True, "answered": False},
+    }
+    await automation_settlement._finish_held_run(job_last)
+    assert len([c for c in record_calls if c[0] == "exec-503-outbox"]) == 1
+    assert "exec-503-outbox" in clear_calls
+    assert stored_records["exec-503-outbox"][0]["retrying"] is False
+    now = _utc(15, 0)
+    summary_503 = eds.summarize_execution_delivery(
+        delivery_result=stored_records["exec-503-outbox"],
+        completed_at=now - timedelta(seconds=10),
+        now=now,
+    )
+    assert summary_503 is not None
+    assert summary_503["status"] == "failed"
+
+    # Case 1b: Outbox _finish_held_run received "still posting" (answered=True), then 404 (retry=False)
+    monkeypatch.setattr(
+        automation_delivery,
+        "finish_run",
+        create_autospec(orig_finish_run, side_effect=[finish_posting, finish_404]),
+    )
+    job_ans = {
+        "hook_outbox_id": "job-2",
+        "conversation_thread_id": "thread-1",
+        "attempts": 1,
+        "payload": {
+            "execution_id": "exec-ans-404-outbox",
+            "automation_id": "auto-1",
+            "user_id": "user-1",
+            "status": "completed",
+            "final_text": "Done",
+            "delivery": stamped_delivery,
+            "recorded": False,
+            "answered": False,
+        },
+    }
+    with pytest.raises(automation_settlement._FinishPending):
+        await automation_settlement._finish_held_run(job_ans)
+    assert stored_records["exec-ans-404-outbox"][0]["retrying"] is True
+
+    job_ans_next = {
+        **job_ans,
+        "attempts": 2,
+        "payload": {**job_ans["payload"], "recorded": True, "answered": True},
+    }
+    await automation_settlement._finish_held_run(job_ans_next)
+    # Original "still posting" record is kept (NOT overwritten by 404), and retrying is cleared to False.
+    assert "Still posting to #desk." in stored_records["exec-ans-404-outbox"][0]["error"]
+    assert stored_records["exec-ans-404-outbox"][0]["retrying"] is False
+    summary_ans = eds.summarize_execution_delivery(
+        delivery_result=stored_records["exec-ans-404-outbox"],
+        completed_at=now - timedelta(seconds=10),
+        now=now,
+    )
+    assert summary_ans is not None
+    assert summary_ans["status"] == "failed"
+
+    # Case 2: In-process _finish_again for both 503 exhaustion and 401/404 after answered=True
+    monkeypatch.setattr(automation_delivery, "FINISH_RETRY_DELAYS", (0, 0))
+
+    async def _noop_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(
+        _asyncio, "sleep", create_autospec(_asyncio.sleep, side_effect=_noop_sleep)
+    )
+
+    auto_stub = {
+        "automation_id": "auto-1",
+        "user_id": "user-1",
+        "delivery_config": {"methods": ["slack:T1/C1"]},
+    }
+    stored_records["exec-503-inline"] = automation_settlement._stamp_delivery_retry(
+        finish_503.result, retrying=True
+    )
+    ask_503 = create_autospec(
+        orig_finish_run, side_effect=[finish_503, finish_503]
+    )
+    await automation_settlement._finish_again(
+        lambda: ask_503(
+            auto_stub,
+            delivery.id,
+            "completed",
+            targets=delivery.targets,
+            final_text="Done",
+            thread_id="thread-1",
+        ),
+        "exec-503-inline",
+        answered=False,
+    )
+    assert stored_records["exec-503-inline"][0]["retrying"] is False
+
+    stored_records["exec-ans-401-inline"] = automation_settlement._stamp_delivery_retry(
+        finish_posting.result, retrying=True
+    )
+    ask_401 = create_autospec(orig_finish_run, side_effect=[finish_404])
+    await automation_settlement._finish_again(
+        lambda: ask_401(
+            auto_stub,
+            delivery.id,
+            "completed",
+            targets=delivery.targets,
+            final_text="Done",
+            thread_id="thread-1",
+        ),
+        "exec-ans-401-inline",
+        answered=True,
+    )
+    assert "Still posting to #desk." in stored_records["exec-ans-401-inline"][0]["error"]
+    assert stored_records["exec-ans-401-inline"][0]["retrying"] is False
+
+    # Case 3: Verify exec_db.clear_delivery_retrying executes the atomic JSONB retrying->false update.
+    executed: list[tuple[str, Any]] = []
+    cur = create_autospec(psycopg.AsyncCursor, instance=True)
+
+    async def _cap_exec(sql: Any, params: Any = None) -> None:
+        executed.append((" ".join(str(sql).split()), params))
+
+    cur.execute.side_effect = _cap_exec
+    db_conn = create_autospec(psycopg.AsyncConnection, instance=True)
+
+    @contextlib.asynccontextmanager
+    async def _cur_cm(*_a: Any, **_kw: Any):
+        yield cur
+
+    db_conn.cursor.side_effect = _cur_cm
+    await orig_clear_delivery_retrying("exec-sql-check", conn=db_conn)
+    assert len(executed) == 1
+    assert "UPDATE automation_executions" in executed[0][0]
+    assert "jsonb_set(elem, '{retrying}', 'false'::jsonb, true)" in executed[0][0]
+    assert executed[0][1] == ("exec-sql-check",)
+
+
+def test_company_script_pending_dispatch_failed_over_24h_remains_retrying_until_cap() -> None:
+    """R3 Med #3: company script still in pending_dispatch retries failed targets even after 24h."""
+    now = _utc(15, 0)
+    old_at = now - timedelta(hours=30)
+
+    # Trigger: scheduler down for >24h, target failed on attempt 1, script run still pending_dispatch.
+    still_retryable = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "script-run-1",
+                "automation_id": "data:daily-brief",
+                "channel": "feishu",
+                "target": "feishu:chat:oc_ops",
+                "status": "failed",
+                "attempt_count": 1,
+                "error_code": "target_failed",
+                "created_at": old_at,
+                "updated_at": old_at,
+                "payload_json": {"route_key": "data:daily-brief"},
+            }
+        ],
+        notify_status="pending_dispatch",
+        now=now,
+    )
+    assert still_retryable is not None
+    assert still_retryable["status"] == "retrying"
+    assert still_retryable["retrying_count"] == 1
+    assert still_retryable["failed_count"] == 0
+
+    # Once attempts reach cap (3), script scheduler cannot claim -> terminal failed.
+    capped = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "script-run-2",
+                "automation_id": "data:daily-brief",
+                "channel": "feishu",
+                "target": "feishu:chat:oc_ops",
+                "status": "failed",
+                "attempt_count": 3,
+                "error_code": "target_failed",
+                "created_at": old_at,
+                "updated_at": old_at,
+                "payload_json": {"route_key": "data:daily-brief"},
+            }
+        ],
+        notify_status="pending_dispatch",
+        now=now,
+    )
+    assert capped is not None
+    assert capped["status"] == "failed"
+
+    # Non-retryable card limit error is terminal failed even while pending_dispatch.
+    non_retryable = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "script-run-3",
+                "automation_id": "data:daily-brief",
+                "channel": "feishu",
+                "target": "feishu:chat:oc_ops",
+                "status": "failed",
+                "attempt_count": 1,
+                "error_code": "card_limit_exceeded",
+                "created_at": old_at,
+                "updated_at": old_at,
+                "payload_json": {"route_key": "data:daily-brief"},
+            }
+        ],
+        notify_status="pending_dispatch",
+        now=now,
+    )
+    assert non_retryable is not None
+    assert non_retryable["status"] == "failed"
+
+    # Once notify_status is no longer pending_dispatch (>24h), retry_failed_notify_deliveries won't retry either.
+    settled_script = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "script-run-4",
+                "automation_id": "data:daily-brief",
+                "channel": "feishu",
+                "target": "feishu:chat:oc_ops",
+                "status": "failed",
+                "attempt_count": 1,
+                "error_code": "target_failed",
+                "created_at": old_at,
+                "updated_at": old_at,
+                "payload_json": {"route_key": "data:daily-brief"},
+            }
+        ],
+        notify_status="dispatched",
+        now=now,
+    )
+    assert settled_script is not None
+    assert settled_script["status"] == "failed"

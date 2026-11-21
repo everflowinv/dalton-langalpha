@@ -276,6 +276,8 @@ export default function AutomationInspector({
         ) : shownRun ? (
           <RunCard
             execution={shownRun}
+            // DALTON-HOOK(execution-delivery-status): pass known chat names for per-target delivery details in RunReport
+            deliveryNames={names}
             // Only the newest run links to a fix: an older limit may be long
             // lifted, and in the feed the rail already offers the links.
             links={isLatest ? attentionLinks(a) : []}
@@ -382,14 +384,17 @@ function Instruction({ text }: { text: string }) {
 }
 
 // DALTON-HOOK(company-automations): skip is omitted when the open task is a company agent.
+// DALTON-HOOK(execution-delivery-status): forward deliveryNames to RunReport for per-target detail rows
 function RunCard({
   execution: e,
+  deliveryNames,
   links,
   busy,
   onOpen,
   onSkip,
 }: {
   execution: AutomationExecution;
+  deliveryNames: DeliveryNames;
   links: PageLinkSpec[];
   busy: boolean;
   onOpen: () => void;
@@ -411,6 +416,8 @@ function RunCard({
         onSkip={onSkip}
         onOpenThread={onOpen}
         links={links}
+        // DALTON-HOOK(execution-delivery-status): pass deliveryNames to RunReport
+        deliveryNames={deliveryNames}
       />
     </div>
   );

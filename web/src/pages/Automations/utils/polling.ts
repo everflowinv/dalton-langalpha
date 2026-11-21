@@ -1,4 +1,4 @@
-import type { AutomationExecution } from '@/types/automation';
+import type { AutomationExecution, ScriptExecutionRead } from '@/types/automation'; // DALTON-HOOK(execution-delivery-status)
 
 export const IDLE_POLL_MS = 30_000;
 /** A run takes seconds to minutes, and its row has to move from the loader
@@ -43,4 +43,15 @@ export function isDeliverySettling(run: AutomationExecution, awaitsRecord: boole
   if (!(now - Date.parse(run.completed_at) < DELIVERY_SETTLE_MS)) return false;
   const attempts = run.delivery_result;
   return attempts ? attempts.some((d) => !d.success && d.retrying !== false) : awaitsRecord;
+}
+
+// DALTON-HOOK(execution-delivery-status): poll company script execution history while notification dispatch is still pending
+export function isScriptDeliveryPending(
+  run: Pick<ScriptExecutionRead, 'notify_status' | 'delivery_summary'> | null | undefined,
+): boolean {
+  if (!run) return false;
+  if (run.delivery_summary) {
+    return run.delivery_summary.status === 'retrying';
+  }
+  return run.notify_status === 'pending_dispatch';
 }

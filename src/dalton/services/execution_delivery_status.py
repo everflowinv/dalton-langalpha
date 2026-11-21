@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_DELIVERY_ATTEMPTS = 3
 DEFAULT_RETRY_LOOKBACK_HOURS = 24
+DEFAULT_STALE_PENDING_MINUTES = 10
 DELIVERY_SETTLE_SECONDS = 180
 
 _FAILURE_ALERT_SOURCE = "automation_report_failure_alert"
@@ -259,6 +260,46 @@ def _notify_row_source(row: Mapping[str, Any]) -> str:
     return ""
 
 
+def _is_pending_stale(
+    row: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
+    stale_pending_minutes: int = DEFAULT_STALE_PENDING_MINUTES,
+) -> bool:
+    """Return True when a pending notify row has exceeded the sender's stale-pending threshold."""
+    updated = _parse_datetime(row.get("updated_at")) or _parse_datetime(row.get("created_at"))
+    if updated is None:
+        return False
+    ref = now or datetime.now(UTC)
+    if ref.tzinfo is None:
+        ref = ref.replace(tzinfo=UTC)
+    return (ref - updated) >= timedelta(minutes=max(1, int(stale_pending_minutes)))
+
+
+def _is_reconcile_only_transport(
+    row: Mapping[str, Any],
+    *,
+    notify_status: Any = None,
+) -> bool:
+    """Return True when uncertain pending rows are reconciled read-only and never resent."""
+    auto_id = str(row.get("automation_id") or "").strip().lower()
+    if auto_id.startswith("data:"):
+        return True
+    payload = row.get("payload_json")
+    if isinstance(payload, Mapping):
+        route_key = str(payload.get("route_key") or "").strip().lower()
+        if route_key.startswith("data:"):
+            return True
+        source = str(payload.get("source") or "").strip().lower()
+        if source in ("automation_report", "automation_report_failure_alert"):
+            return True
+        transport = str(payload.get("transport") or "").strip().lower()
+        if transport == "gateway":
+            return True
+    ns = str(notify_status or "").strip().lower()
+    return ns in ("pending_dispatch", "dispatched", "failed", "skipped", "preview_only")
+
+
 def _summarize_script_notify_status(
     notify_status: Any,
 ) -> dict[str, Any] | None:
@@ -308,8 +349,12 @@ def summarize_execution_delivery(
     or only skipped rows).
     """
     bounded_max = max(1, int(max_attempts))
+    is_script_pending_dispatch = (
+        str(notify_status or "").strip().lower() == "pending_dispatch"
+    )
     targets: list[dict[str, Any]] = []
-    seen_notify_keys: set[tuple[str, str]] = set()
+    seen_notify_keys: dict[tuple[str, str], dict[str, Any]] = {}
+    seen_normalized_targets: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     for raw in notify_rows or ():
         if not isinstance(raw, Mapping) or _is_failure_alert_row(raw):
@@ -319,8 +364,6 @@ def summarize_execution_delivery(
             continue
         channel = str(raw.get("channel") or "").strip().lower() or None
         target = str(raw.get("target") or "").strip() or None
-        if channel or target:
-            seen_notify_keys.add((channel or "", target or ""))
         raw_code = str(raw.get("error_code") or "").strip()
         raw_code_l = raw_code.lower()
         ch_err_code = str(raw.get("channel_error_code") or "").strip()
@@ -337,21 +380,38 @@ def summarize_execution_delivery(
             now=now,
             lookback_hours=retry_lookback_hours,
         )
+        # Company script scheduler scans all `notify_status = 'pending_dispatch'` runs
+        # without a 24h created_at cutoff, subject to attempt_count < max_attempts.
+        within_retry_eligibility = within_window or is_script_pending_dispatch
         source_retried = source not in _NON_RETRIED_NOTIFY_SOURCES
+        reconcile_only_transport = _is_reconcile_only_transport(
+            raw, notify_status=notify_status
+        )
 
         if st == "sent":
             target_status = "sent"
             reason_zh = None
         elif st == "pending":
-            can_retry_pending = (
-                within_window
-                and source_retried
-                and (
-                    raw_code_l in UNCERTAIN_NOTIFY_ERROR_CODES
-                    or source != "automation_report"
-                    or attempt < bounded_max
+            if raw_code_l in UNCERTAIN_NOTIFY_ERROR_CODES:
+                # Gateway / report / data-task rows with uncertain error codes are never
+                # resent by the sender — only reconciled read-only against receipts.
+                # Legacy bridge rows are only retried while eligible and under the attempt cap.
+                can_retry_pending = (
+                    not reconcile_only_transport
+                    and within_retry_eligibility
+                    and source_retried
+                    and attempt < bounded_max
                 )
-            )
+            elif attempt == 0:
+                can_retry_pending = within_retry_eligibility and source_retried
+            elif not _is_pending_stale(raw, now=now):
+                can_retry_pending = True
+            else:
+                can_retry_pending = (
+                    within_retry_eligibility
+                    and source_retried
+                    and attempt < bounded_max
+                )
             if can_retry_pending:
                 target_status = "retrying"
                 reason_zh = None
@@ -365,7 +425,7 @@ def summarize_execution_delivery(
                 )
         elif st == "failed":
             can_retry_failed = (
-                within_window
+                within_retry_eligibility
                 and source_retried
                 and attempt < bounded_max
                 and eff_code not in NON_RETRYABLE_TERMINAL_ERROR_CODES
@@ -384,18 +444,22 @@ def summarize_execution_delivery(
         else:
             continue
 
-        targets.append(
-            {
-                "target": target,
-                "channel": channel,
-                "name": None,
-                "status": target_status,
-                "error_code": eff_code if target_status == "failed" else None,
-                "error_message": reason_zh if target_status == "failed" else None,
-                "attempt_count": attempt,
-                "max_attempts": bounded_max,
-            }
-        )
+        target_entry: dict[str, Any] = {
+            "target": target,
+            "channel": channel,
+            "name": None,
+            "status": target_status,
+            "error_code": eff_code if target_status == "failed" else None,
+            "error_message": reason_zh if target_status == "failed" else None,
+            "attempt_count": attempt,
+            "max_attempts": bounded_max,
+        }
+        targets.append(target_entry)
+        if channel or target:
+            seen_notify_keys[(channel or "", target or "")] = target_entry
+        norm_key = _parse_normalized_target(target, channel)
+        if norm_key is not None:
+            seen_normalized_targets[norm_key] = target_entry
 
     for raw in delivery_result or ():
         if not isinstance(raw, Mapping):
@@ -409,7 +473,15 @@ def summarize_execution_delivery(
         # Avoid double-counting failures mirrored by sync_terminal_undelivered_execution
         # when authoritative dalton_notify_deliveries rows were already loaded.
         if seen_notify_keys:
-            if (method.lower(), address or "") in seen_notify_keys:
+            matched_notify = seen_notify_keys.get((method.lower(), address or ""))
+            if matched_notify is None:
+                dr_channel = method.split(":", 1)[0].lower() if method else None
+                dr_norm = _parse_normalized_target(address or method, dr_channel)
+                if dr_norm is not None:
+                    matched_notify = seen_normalized_targets.get(dr_norm)
+            if matched_notify is not None:
+                if name and not matched_notify.get("name"):
+                    matched_notify["name"] = name
                 continue
             if raw_err and _SYNCED_UNDELIVERED_RE.search(raw_err):
                 continue
@@ -672,6 +744,7 @@ async def load_execution_notify_rows(
             """
             SELECT delivery_id::text AS delivery_id,
                    execution_id,
+                   automation_id,
                    channel,
                    target,
                    status,
