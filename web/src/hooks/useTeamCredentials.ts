@@ -1,5 +1,6 @@
+import { useContext } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { useAuth } from '@/contexts/AuthContext';
+import { AuthContext } from '@/contexts/AuthContext';
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { queryKeys } from '@/lib/queryKeys';
 
@@ -37,7 +38,9 @@ export function useTeamCredentials(): {
    */
   callerTierError: boolean;
 } {
-  const { userId } = useAuth();
+  // Read AuthContext directly so pure-setup hooks tested outside AuthProvider
+  // fall back to unauthenticated (enabled: false) rather than throwing.
+  const userId = useContext(AuthContext)?.userId ?? null;
 
   const { data, isError, isLoading } = useQuery<TeamCredentialsStatus>({
     queryKey: queryKeys.dalton.credentialsStatus(userId),

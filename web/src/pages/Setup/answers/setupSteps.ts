@@ -32,6 +32,8 @@ export interface SetupFacts {
   claudeCodeToken: boolean;
   /** A subscription or key of the user's own is connected. */
   providerConnected: boolean;
+  // DALTON-HOOK(dalton-setup): true when Dalton team sharing is active with available models
+  teamModelsAvailable?: boolean;
   /** The last setup step the record says was finished. */
   lastStep: SetupStep | null;
 }
@@ -53,19 +55,29 @@ export function readAnswers(progress: Pick<OnboardingProgress, 'models' | 'runs_
   return { models: progress.models, runsOn: progress.runs_on };
 }
 
+// DALTON-HOOK(dalton-setup): treat legacy model answers as team models when Dalton team models are available
+export function effectiveModelsAnswer(models: ModelsAnswer, teamModelsAvailable = false): ModelsAnswer {
+  if (isDaltonBuild && teamModelsAvailable && (models === 'subscription_or_key' || models === 'claude_code')) {
+    return 'langalpha_models';
+  }
+  return models;
+}
+
 /** Whether the answers need a model connected in setup. */
-export const needsModelStep = (answers: SetupAnswers): boolean =>
-  answers.models !== 'langalpha_models' && !(isDaltonBuild && answers.models === 'claude_code');
+export const needsModelStep = (answers: SetupAnswers, teamModelsAvailable = false): boolean => {
+  const models = effectiveModelsAnswer(answers.models, teamModelsAvailable);
+  return models !== 'langalpha_models' && !(isDaltonBuild && models === 'claude_code');
+};
 
 /**
  * The steps the rail shows, from the answers alone: a step whose outcome is
  * already in place stays on it as a finished one (`nextSetupStep` goes past
  * it), so connecting a computer never changes the rail under the user.
  */
-export function setupRail(answers: SetupAnswers): SetupStep[] {
+export function setupRail(answers: SetupAnswers, teamModelsAvailable = false): SetupStep[] {
   return [
     ...(answers.runsOn === 'own_computer' ? (['computer'] as const) : []),
-    ...(needsModelStep(answers) ? (['model'] as const) : []),
+    ...(needsModelStep(answers, teamModelsAvailable) ? (['model'] as const) : []),
     'default',
   ];
 }
@@ -77,7 +89,9 @@ export function setupRail(answers: SetupAnswers): SetupStep[] {
  */
 export function nextSetupStep(facts: SetupFacts): SetupStep | 'done' {
   if (facts.lastStep === 'default') return 'done';
-  const { models, runsOn } = facts.answers;
+  const { runsOn } = facts.answers;
+  // DALTON-HOOK(dalton-setup): resolve legacy answers against live team-model availability
+  const models = effectiveModelsAnswer(facts.answers.models, !!facts.teamModelsAvailable);
   // One already connected while Home is on the cloud is offered as Home once.
   if (runsOn === 'own_computer' && (!facts.ownComputer || (facts.homeOnCloud && facts.lastStep === null))) return 'computer';
   if (!isDaltonBuild && models === 'claude_code' && !facts.claudeCodeToken) return 'model';

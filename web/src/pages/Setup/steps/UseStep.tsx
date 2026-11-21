@@ -4,7 +4,6 @@ import { useTranslation } from 'react-i18next';
 // DALTON-HOOK(dalton-setup): Dalton build & team credentials imports
 import { ChevronRight, Cloud, KeyRound, Laptop, Server } from 'lucide-react';
 import { isDaltonBuild } from '@/config/brand';
-import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { WizardSection, WizardStepHeader } from '@/components/ui/wizard';
 import { ExternalRedirect } from '@/components/ExternalRedirect';
 import { ONBOARDING_USE_URL } from '@/config/supportLinks';
@@ -17,8 +16,9 @@ import { CLAUDE_CODE } from '@/lib/claudeCode';
 import { llmProviderArt } from '@/lib/brandArt';
 import { BrandMark } from '@/pages/ChatAgent/components/mcp/BrandMark';
 import { SetupFooter } from '../SetupFooter';
-import { AnswerOption, SetupNote, StepError, StepLoadFailed, StepLoading } from '../answers/parts';
+import { AnswerOption, RowButton, SetupNote, StepError, StepLoadFailed, StepLoading } from '../answers/parts';
 import { homeMachine } from '../answers/useSetupFacts';
+import { useDaltonTeamModels } from '../answers/useTeamModels';
 import { useOnboardingProgress } from '@/hooks/useOnboardingProgress';
 import { readAnswers, type ModelsAnswer, type RunsOnAnswer } from '../answers/setupSteps';
 
@@ -46,16 +46,21 @@ function UseForm() {
   const saved = readAnswers(progress);
   const [models, setModels] = useState<ModelsAnswer | null>(null);
   const [runsOn, setRunsOn] = useState<RunsOnAnswer | null>(null);
-  // DALTON-HOOK(dalton-setup): Dalton shares team credentials and disables Claude Code / SSH by default
-  const { isShared: teamShared, callerTierPending } = useTeamCredentials();
-  const teamModelsOnly = isDaltonBuild && teamShared;
+  // DALTON-HOOK(dalton-setup): skip connect only when team sharing has at least one available model
+  const team = useDaltonTeamModels();
+  const teamModelsOnly = isDaltonBuild && team.available;
+  const teamModelsEmpty = team.empty;
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const { setup: claudeCodeSetup, isLoading: claudeCodeLoading, unread: claudeCodeUnread, retry: retryClaudeCode } = useClaudeCodeSetup({ enabled: !isDaltonBuild });
-  const serverModels = !teamModelsOnly && user?.deployment_serves === true;
+  const serverModels = !teamModelsOnly && !teamModelsEmpty && user?.deployment_serves === true;
   const claudeCode = !isDaltonBuild && claudeCodeSetup !== null;
   const offered = (answer: ModelsAnswer) =>
     answer === 'langalpha_models' ? (teamModelsOnly || serverModels) : answer === 'claude_code' ? claudeCode : true;
-  const pickedModels = teamModelsOnly ? 'langalpha_models' : (models ?? (saved && offered(saved.models) ? saved.models : null));
+  const pickedModels = teamModelsOnly
+    ? 'langalpha_models'
+    : teamModelsEmpty
+      ? null
+      : (models ?? (saved && offered(saved.models) ? saved.models : null));
   // An own computer is reached over SSH, the Mac app's included.
   const providers = useComputerProviders({ enabled: true });
   const ownComputer = !!providers.data?.providers.some((p) => p.kind === 'ssh');
@@ -91,13 +96,16 @@ function UseForm() {
   const userUnread = userFailed && !user;
   const progressUnread = progressFailed && !progress;
   const providersUnread = providers.isError && !providers.data;
-  if (userUnread || progressUnread || providersUnread || (!isDaltonBuild && claudeCodeUnread)) {
+  // DALTON-HOOK(dalton-setup): wait for and retry team model catalog reads under team sharing
+  const teamUnread = isDaltonBuild && team.shared && team.unread;
+  if (userUnread || progressUnread || providersUnread || teamUnread || (!isDaltonBuild && claudeCodeUnread)) {
     return (
       <StepLoadFailed
         onRetry={() => {
           if (userUnread) void refetchUser();
           if (progressUnread) void refetchProgress();
           if (providersUnread) void providers.refetch();
+          if (teamUnread) team.retry();
           if (!isDaltonBuild && claudeCodeUnread) retryClaudeCode();
         }}
       />
@@ -107,7 +115,7 @@ function UseForm() {
     isLoading ||
     userLoading ||
     (!isDaltonBuild && claudeCodeLoading) ||
-    (isDaltonBuild && callerTierPending) ||
+    (isDaltonBuild && team.isLoading) ||
     providers.isLoading ||
     computers.isLoading
   ) {
@@ -136,7 +144,24 @@ function UseForm() {
               </span>
             </div>
           </div>
+        ) : teamModelsEmpty ? (
+          /* DALTON-HOOK(dalton-setup): block completion when team sharing has no available models */
+          <div
+            data-testid="setup-use-team-models-empty"
+            className="shell-box flex items-center justify-between gap-3 px-4 py-3"
+          >
+            <div className="flex items-start gap-3">
+              <Server aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
+              <div className="flex flex-col gap-0.5">
+                <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
+                  {t('setup.answers.use.teamModelsEmptyTitle')}
+                </span>
+              </div>
+            </div>
+            <RowButton onClick={team.retry}>{t('setup.answers.tryAgain')}</RowButton>
+          </div>
         ) : (
+          /* DALTON-HOOK(dalton-setup): personal model choices when team sharing has no models */
           <div role="radiogroup" aria-labelledby={modelsId} className="flex flex-col gap-2">
             {claudeCode && (
               <AnswerOption
@@ -158,6 +183,7 @@ function UseForm() {
               title={t('setup.answers.use.subscription')}
               detail={t('setup.answers.use.subscriptionDesc')}
             />
+            {/* DALTON-HOOK(dalton-setup): personal choices wrapper ends here */}
             {serverModels && (
               <AnswerOption
                 name={modelsId}
@@ -221,6 +247,7 @@ function UseForm() {
                   />
                 </div>
               )}
+              {/* DALTON-HOOK(dalton-setup) */}
             </div>
           )}
         </div>

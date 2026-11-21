@@ -511,4 +511,7 @@ web/src/pages/MarketView/__tests__/MarketView.screenshotCap.test.tsx
 src/server/handlers/thread_model_handoff.py
 # Dalton setup wizard customization helper & tests
 web/src/config/daltonSetup.ts
+web/src/pages/Setup/answers/useTeamModels.ts
 web/src/pages/Setup/__tests__/SetupWizard.dalton.test.tsx
+web/src/pages/Setup/__tests__/SetupWizard.firstRun.dalton.test.tsx
+web/src/pages/Setup/__tests__/daltonBrand.test.tsx

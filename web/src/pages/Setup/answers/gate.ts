@@ -52,7 +52,9 @@ export function onboardingRoute(input: OnboardingRouteInput): OnboardingRoute {
   if (input.hasAnswers) {
     if (input.next === null) return { kind: 'loading' };
     if (input.setupCompleted || input.next === 'done') return { kind: 'done' };
-    return { kind: 'answers', next: input.next, nextPath: nextSetupPath(input.next), owner: input.setupOn, unpaired: input.unpaired };
+    // DALTON-HOOK(dalton-setup): treat legacy mac_pending ownership as browser in Dalton builds
+    const owner = isDaltonBuild && input.setupOn === 'mac_pending' ? 'browser' : input.setupOn;
+    return { kind: 'answers', next: input.next, nextPath: nextSetupPath(input.next), owner, unpaired: input.unpaired };
   }
   if (!input.platform && !input.onboarded) return { kind: 'questions', unpaired: input.unpaired };
   return input.needsProvider ? { kind: 'provider' } : { kind: 'done' };

@@ -84,6 +84,7 @@ export default function ComputerStep() {
     );
   };
 
+  // DALTON-HOOK(dalton-setup): render SSH option when Mac pairing is disabled in Dalton
   const sshRow = (
     <AccessRow
       testId="setup-computer-ssh"
@@ -169,6 +170,7 @@ export default function ComputerStep() {
           </Group>
         )}
       </div>
+      {/* DALTON-HOOK(dalton-setup): hide SSH notes and default Continue to cloud in Dalton */}
       {(!isDaltonBuild || (sshOffered && advancedSshOpen)) && (
         <>
           <SetupNote icon={<AlertTriangle />}>{t('setup.answers.computer.accountNote')}</SetupNote>

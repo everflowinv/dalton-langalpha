@@ -60,6 +60,8 @@ export interface PageIntroStepDef {
    * `PageIntroDef.steps` rejects.
    */
   platformOnly?: boolean;
+  // DALTON-HOOK(onboarding-tasks): hide Mac remote-control intro step in Dalton builds
+  hideInDalton?: boolean;
 }
 
 /**
@@ -77,7 +79,7 @@ export interface PageIntroDef {
    * first shows on every deployment, so dropping platform-only steps never
    * empties an intro.
    */
-  steps: [PageIntroStepDef & { platformOnly?: false }, ...PageIntroStepDef[]];
+  steps: [PageIntroStepDef & { platformOnly?: false; hideInDalton?: false }, ...PageIntroStepDef[]];
 }
 
 /** A task on the getting-started list in the sidebar. Copy is i18n keys. */

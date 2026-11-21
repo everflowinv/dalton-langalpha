@@ -122,6 +122,7 @@ export default function ProviderStep() {
             onPickSignIn={(p) => goOn({ method: 'oauth', list: 'oauth', provider: p, displayName: t(`modelAccess.${subscriptionKey(p)}.name`), modelsFrom: p })}
             onPickPlan={pickKeyGroup('oauth')}
             claudeSignIn={!answering}
+            // DALTON-HOOK(dalton-setup): omit Claude Code from OAuth provider choices
             claudeCode={isDaltonBuild || answering ? undefined : claudeCodeChoice(claudeCode, claudeCodeUnread, () => navigate('/setup/claude-code'))}
           />
         )}

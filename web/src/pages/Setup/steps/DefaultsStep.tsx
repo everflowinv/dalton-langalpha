@@ -91,6 +91,7 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
   // they just picked. Set during render like the Background fill below.
   // From the slot models, so the fill never lands on a conversation-only
   // model (Claude Code); the user may still pick one.
+  // DALTON-HOOK(dalton-setup): seed defaults from Dalton-filtered slots and recommended models
   const fillable = Object.values(visibleSlotModels).flatMap((p) => p.models ?? []);
   const primaryFill = !primaryModel && !isLoading && prefsLoaded
     ? (isDaltonBuild
@@ -193,6 +194,7 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
           className="text-xs leading-relaxed"
           style={{ color: 'var(--color-text-secondary)' }}
         >
+          {/* DALTON-HOOK(dalton-setup): show team-configured access note & filtered models */}
           {isDaltonBuild && teamShared ? t('setup.daltonModelAccessNote') : t('setup.modelAccessReminder')}
         </p>
       </div>
@@ -238,6 +240,7 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
               transition={TWEEN.quick}
             >
               <div className="flex flex-col pt-4" style={{ gap: '24px' }}>
+                {/* DALTON-HOOK(dalton-setup): pass Dalton-filtered slot models and payers */}
                 <ModelSelector
                   label={t('settings.modelTuning.fetchModel')}
                   description={t('settings.modelTuning.fetchModelDesc')}
@@ -258,6 +261,7 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
                   payers={visiblePayers}
                   metadata={metadata}
                 />
+                {/* DALTON-HOOK(dalton-setup): pass Dalton-filtered slot models & payers */}
                 <FallbackModelsPicker
                   selected={advancedModels.fallbackModels}
                   onChange={(list) => handleAdvancedChange({ fallbackModels: list })}

@@ -525,6 +525,10 @@ AUDIT_EXEMPT_FILES = {
     # Same class as zh-CN.json: pure locale JSON, no inline markers possible.
     # Dalton's copy here is the "研究总监" wording for the CoS (B8).
     "web/src/locales/intros/zh-CN.json",
+    # Pure locale JSON for Mac first-run copy (brand interpolation {{brand}});
+    # same class as en-US.json / zh-CN.json.
+    "web/src/locales/thisMacFirstRun/en-US.json",
+    "web/src/locales/thisMacFirstRun/zh-CN.json",
     # B9 r2: asserts Dalton's OAuth routes win over the upstream {key}
     # wildcard by registration order (setup.py include order); a test file,
     # no inline markers.

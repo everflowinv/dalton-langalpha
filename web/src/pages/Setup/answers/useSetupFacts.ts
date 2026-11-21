@@ -22,6 +22,9 @@ import { useComputers } from '@/pages/ChatAgent/hooks/useComputers';
 import type { Computer } from '@/types/api';
 import { useOnboardingProgress } from '@/hooks/useOnboardingProgress';
 import { isPlatformMode } from '@/config/hostMode';
+// DALTON-HOOK(dalton-setup): check live Dalton team-model availability for step routing
+import { isDaltonBuild } from '@/config/brand';
+import { useDaltonTeamModels } from './useTeamModels';
 import { nextSetupPath, nextSetupStep, readAnswers, setupRail, type SetupFacts } from './setupSteps';
 
 /** A machine the user brought (SSH, this Mac through Remote control) that is
@@ -86,13 +89,17 @@ export function useSetupFacts({ refetchInterval = false }: { refetchInterval?: n
   // subscription signed in, a key only while BYOK is on where it can be off,
   // either only while the account's rules allow it.
   const { policy } = useAccount();
+  // DALTON-HOOK(dalton-setup): use the unified team-model availability check in Dalton
+  const team = useDaltonTeamModels();
   const providerConnected = providers.some((p) => p.masked_key !== SERVER_KEY
     && (p.access_type === 'oauth'
       ? allows(policy, RULE.ownSubscriptions) && p.state === 'connected'
       : allows(policy, RULE.ownApiKeys) && (!isPlatformMode || byokEnabled)));
 
   const isLoading = progressLoading || (running && (
-    computers.isLoading || providersLoading || (claudeCodeAnswer && (ccComputers.isLoading || ccStatus.isLoading || (savedTarget && custody.isLoading)))
+    computers.isLoading || providersLoading
+    || (isDaltonBuild && team.isLoading)
+    || (claudeCodeAnswer && (ccComputers.isLoading || ccStatus.isLoading || (savedTarget && custody.isLoading)))
   ));
   // A fact whose read failed is unknown, not false: setup resumes on no step
   // until it is read (`factsFailed`), rather than on one it may be past. The
@@ -100,16 +107,19 @@ export function useSetupFacts({ refetchInterval = false }: { refetchInterval?: n
   const computersUnread = (ownAnswer || claudeCodeAnswer) && computers.isError && !computers.data;
   const factsFailed = (progressFailed && !progress) || (running && (
     computersUnread
+    || (isDaltonBuild && team.unread)
     || (claudeCodeAnswer && (savedTarget ? ccStatus.unread || custody.unread : computersUnread || ccComputers.unread))
     || (answers?.models === 'subscription_or_key' && !providerConnected && providersUnread)
   ));
 
+  // DALTON-HOOK(dalton-setup): include teamModelsAvailable in SetupFacts & rail
   const facts: SetupFacts | null = answers && {
     answers,
     ownComputer: own.length > 0,
     homeOnCloud: listed.some((c) => c.is_primary && c.status !== 'deleted' && !providerIsOwnMachine(c.kind)),
     claudeCodeToken,
     providerConnected,
+    teamModelsAvailable: team.available,
     lastStep: progress?.setup_step ?? null,
   };
 
@@ -127,7 +137,8 @@ export function useSetupFacts({ refetchInterval = false }: { refetchInterval?: n
     isLoading,
     ownComputers: own,
     tokenTarget,
-    rail: answers ? setupRail(answers) : [],
+    // DALTON-HOOK(dalton-setup): pass teamModelsAvailable to setupRail
+    rail: answers ? setupRail(answers, team.available) : [],
     next,
     /** Where setup goes from here, /welcome once it is done; null while unknown. */
     nextPath: next ? nextSetupPath(next) : null,

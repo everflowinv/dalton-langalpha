@@ -19,7 +19,8 @@ export const PAGE_INTROS: PageIntroDef[] = [
         platformOnly: true,
       },
       { id: 'ptc', visual: 'ptcSandbox' },
-      { id: 'workspace', visual: 'workspaceGrid' },
+      // DALTON-HOOK(onboarding-tasks): hide Mac remote-control workspace intro step under Dalton
+      { id: 'workspace', visual: 'workspaceGrid', hideInDalton: true },
       { id: 'create', visual: 'createWorkspace' },
     ],
   },

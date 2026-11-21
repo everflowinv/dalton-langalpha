@@ -19,6 +19,7 @@ import { isPlatformMode } from '@/config/hostMode';
 import { ONBOARDING_USE_URL } from '@/config/supportLinks';
 // DALTON-HOOK(dalton-setup): gate Mac & Claude Code setup routes in Dalton builds
 import { isDaltonBuild } from '@/config/brand';
+import { useIsPresent } from '@/lib/framer';
 import React from 'react';
 
 const MethodStep = React.lazy(() => import('./steps/MethodStep'));
@@ -84,6 +85,7 @@ const PAGES: readonly SetupPage[] = [
   { path: 'default', element: <DefaultStep />, rail: 'answers', step: 'default' },
 ];
 
+// DALTON-HOOK(dalton-setup): Mac & Claude Code routes disabled under Dalton builds
 const DALTON_DISABLED_PATHS = new Set(['mac', 'this-mac', 'continue', 'claude-code']);
 
 const pageOf = (pathname: string): SetupPage | null => {
@@ -96,7 +98,10 @@ const pageOf = (pathname: string): SetupPage | null => {
  * (`setupStartTarget`), on any surface.
  */
 function SetupStart() {
+  // DALTON-HOOK(dalton-setup): never re-trigger Navigate while exiting AnimatePresence frame
+  const present = useIsPresent();
   const route = useOnboardingRoute();
+  if (!present) return null;
   if (route.kind === 'loading') return <StepLoading />;
   const target = setupStartTarget(route);
   if (target?.kind === 'platform') return ONBOARDING_USE_URL ? <ExternalRedirect to={ONBOARDING_USE_URL} /> : null;

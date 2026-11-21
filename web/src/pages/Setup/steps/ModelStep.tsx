@@ -8,9 +8,10 @@ import { ClaudeCodeTokenSheet } from '@/components/modelAccess/ClaudeCodeToken';
 import { AccessRow } from '@/components/modelAccess/AccessRow';
 import { Group } from '@/components/modelAccess/parts';
 import { isPlatformMode } from '@/config/hostMode';
-// DALTON-HOOK(dalton-setup): Dalton build & team credentials skip model connection
+// DALTON-HOOK(dalton-setup): Dalton build & unified team-model availability check
 import { isDaltonBuild } from '@/config/brand';
-import { useTeamCredentials } from '@/hooks/useTeamCredentials';
+import { effectiveModelsAnswer } from '../answers/setupSteps';
+import { useDaltonTeamModels } from '../answers/useTeamModels';
 import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
 import { useAccount, useRule } from '@/hooks/useAccount';
 import { allows, RULE } from '@/lib/accountRules';
@@ -39,14 +40,32 @@ export default function ModelStep() {
   const flow = useAnswerFlow('model');
   const step = useClaudeCodeStep(flow);
   const { t } = useTranslation();
-  // DALTON-HOOK(dalton-setup): team-shared credentials skip model connection; Claude Code is disabled
-  const { isShared: teamShared, callerTierPending } = useTeamCredentials();
-  if (flow.isLoading || (isDaltonBuild && callerTierPending)) return <StepLoading />;
+  const headingId = useId();
+  // DALTON-HOOK(dalton-setup): use the same team-model availability check as nextSetupStep and DefaultStep
+  const team = useDaltonTeamModels();
+  if (flow.isLoading || (isDaltonBuild && team.isLoading)) return <StepLoading />;
+  if (isDaltonBuild && team.shared && team.unread) return <StepLoadFailed onRetry={team.retry} />;
   if (!flow.answers) return <Navigate to="/setup" replace />;
-  if (isDaltonBuild && teamShared) return <Navigate to="/setup/default" replace />;
-  if (isDaltonBuild && flow.answers.models === 'claude_code') return <Navigate to="/setup/use" replace />;
-  if (flow.answers.models === 'langalpha_models') return <Navigate to="/setup/default" replace />;
-  if (flow.answers.models !== 'claude_code') return <SubscriptionStep flow={flow} />;
+  const effectiveModels = effectiveModelsAnswer(flow.answers.models, team.available);
+  if (isDaltonBuild && team.available) return <Navigate to="/setup/default" replace />;
+  if (isDaltonBuild && team.empty && !team.canManage) {
+    return (
+      <div data-testid="setup-model-team-models-empty">
+        <WizardStepHeader
+          titleId={headingId}
+          title={t('setup.answers.use.teamSharedTitle')}
+          helper={t('setup.answers.use.teamModelsEmptyTitle')}
+        />
+        <SetupFooter
+          back={flow.back ? { label: t('setup.back'), onClick: flow.back } : null}
+          primary={{ label: t('setup.answers.tryAgain'), onClick: team.retry }}
+        />
+      </div>
+    );
+  }
+  if (isDaltonBuild && effectiveModels === 'claude_code') return <Navigate to="/setup/use" replace />;
+  if (effectiveModels === 'langalpha_models') return <Navigate to="/setup/default" replace />;
+  if (effectiveModels !== 'claude_code') return <SubscriptionStep flow={flow} />;
   switch (step.kind) {
     case 'loading':
       return <StepLoading />;

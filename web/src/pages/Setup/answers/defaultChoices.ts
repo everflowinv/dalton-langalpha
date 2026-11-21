@@ -11,7 +11,7 @@ import { listedFor } from '@/lib/connectionModels';
 import type { ConnectionOf } from '@/lib/providerCatalog';
 import type { CustomModelEntry } from '@/components/model/types';
 // DALTON-HOOK(dalton-setup): Dalton recommended models and Claude Code / credits filtering
-import { DALTON_BACKGROUND_MODEL, DALTON_DEFAULT_MODEL, isClaudeCodeMeta } from '@/config/daltonSetup';
+import { DALTON_BACKGROUND_MODEL, DALTON_DEFAULT_MODEL, isDaltonAllowedModel } from '@/config/daltonSetup';
 import type { ModelsAnswer } from './setupSteps';
 
 /** How many models the step lists; the rest are in Settings. */
@@ -100,7 +100,7 @@ function fastestOtherPick(input: DefaultChoicesInput, pool: string[], primary: s
 const platformServed = (input: DefaultChoicesInput, model: string) => input.payers[model] === 'credits' || input.payers[model] === 'server_key';
 
 const daltonAllowed = (input: DefaultChoicesInput, model: string) =>
-  !isClaudeCodeMeta(input.metadata[model]) && input.payers[model] !== 'credits';
+  isDaltonAllowedModel(input.metadata[model], input.payers[model]);
 
 /** How each answer picks its primary and its Background. */
 const RULES: Record<ModelsAnswer, {
@@ -112,7 +112,9 @@ const RULES: Record<ModelsAnswer, {
       // DALTON-HOOK(dalton-setup): prefer Neon High in Dalton deployments
       if (input.dalton) {
         if (pool.includes(DALTON_DEFAULT_MODEL)) return { primary: DALTON_DEFAULT_MODEL, primaryWhy: 'daltonRecommended' };
-        if (input.systemDefault && pool.includes(input.systemDefault)) return { primary: input.systemDefault, primaryWhy: 'daltonRecommended' };
+        if (input.systemDefault && pool.includes(input.systemDefault) && daltonAllowed(input, input.systemDefault)) {
+          return { primary: input.systemDefault, primaryWhy: 'daltonRecommended' };
+        }
         return strongestPick(input, pool);
       }
       return input.systemDefault && pool.includes(input.systemDefault)
@@ -147,6 +149,7 @@ const RULES: Record<ModelsAnswer, {
     }),
   },
   subscription_or_key: {
+    // DALTON-HOOK(dalton-setup): prefer Neon High & Hydrogen High under Dalton
     primary: (input, pool) => (input.dalton && pool.includes(DALTON_DEFAULT_MODEL)
       ? { primary: DALTON_DEFAULT_MODEL, primaryWhy: 'daltonRecommended' }
       : strongestPick(input, pool)),

@@ -20,6 +20,8 @@ import { SUBSCRIPTIONS } from '@/api/oauth';
 import type { AccessType } from '@/components/model/types';
 import type { AccountPolicy } from '@/types/api';
 import { isPlatformMode } from '@/config/hostMode';
+// DALTON-HOOK(dalton-setup): omit Claude Code recommendation from OAuth method copy in Dalton
+import { isDaltonBuild } from '@/config/brand';
 // DALTON-HOOK(team-credentials): team-shared credentials hint & PM disconnect guard
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { TEAM_SHARED_CREDENTIALS_HINT, useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(team-credentials)
@@ -41,8 +43,9 @@ const markOf = (p: { provider: string; brand_key?: string | null }) =>
  * A coding plan is a subscription bought with a key, listed with the
  * subscriptions, so it is not a way of its own here.
  */
+// DALTON-HOOK(dalton-setup): omit Claude Code copy from OAuth method description in Dalton
 const METHODS: Array<{ id: Method; titleKey: string; descKey: string }> = [
-  { id: 'oauth', titleKey: 'setup.methodOAuth', descKey: 'setup.methodOAuthDesc' },
+  { id: 'oauth', titleKey: 'setup.methodOAuth', descKey: isDaltonBuild ? 'setup.methodOAuthDescDalton' : 'setup.methodOAuthDesc' },
   { id: 'api_key', titleKey: 'setup.methodApiKey', descKey: 'setup.methodApiKeyDesc' },
   ...(isPlatformMode ? [] : [{ id: 'local' as const, titleKey: 'setup.methodLocal', descKey: 'setup.methodLocalDesc' }]),
 ];

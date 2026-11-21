@@ -33,6 +33,7 @@ export const DEPLOYED_TASKS: GettingStartedTaskDef[] = GETTING_STARTED_TASKS.fil
 export const DEPLOYED_INTROS: PageIntroDef[] = PAGE_INTROS.map(
   ({ steps: [first, ...rest], ...intro }) => ({
     ...intro,
-    steps: [first, ...rest.filter((s) => !s.platformOnly || isPlatformMode)],
+    // DALTON-HOOK(onboarding-tasks): drop platform-only and Dalton-hidden intro steps
+    steps: [first, ...rest.filter((s) => (!s.platformOnly || isPlatformMode) && (!s.hideInDalton || !isDaltonBuild))],
   })
 );
