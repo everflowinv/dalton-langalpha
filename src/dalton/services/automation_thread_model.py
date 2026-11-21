@@ -149,10 +149,11 @@ async def _get_execution_by_id(
 
 
 def _response_execution_id_sql(alias: str) -> str:
-    """SQL expression resolving execution UUID from ``automation_execution_id`` or ``automation_delivery.id``."""
+    """SQL expression resolving execution UUID from firing, source-inheritance, or delivery metadata."""
     return (
         f"COALESCE("
         f"NULLIF({alias}.metadata->>'automation_execution_id', ''), "
+        f"NULLIF({alias}.metadata->>'automation_source_execution_id', ''), "
         f"NULLIF(split_part(COALESCE({alias}.metadata->'automation_delivery'->>'id', ''), '.', 1), '')"
         f")"
     )
@@ -844,8 +845,11 @@ async def resolve_turn_config_with_automation_inheritance(
     if confirmed_for_context and on_automation_context is not None:
         exec_id = target_exec.get("automation_execution_id")
         if exec_id:
+            # Stamp automation_source_execution_id (NOT automation_execution_id) so
+            # restart recovery never mistakes a wakeup/continuation/retry run for a
+            # scheduler-refirable firing turn while still preserving provenance.
             ctx_meta: dict[str, Any] = {
-                "automation_execution_id": str(exec_id),
+                "automation_source_execution_id": str(exec_id),
             }
             if effort_configured:
                 ctx_meta["automation_reasoning_effort_configured"] = True

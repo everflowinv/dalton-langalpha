@@ -213,10 +213,11 @@ async def test_wakeup_inherits_creator_automation_effort_not_other_running_task_
     )
     assert resolved_calls[-1] == ("claude-opus-5-5-oauth", "high")
     assert ctx_a == {
-        "automation_execution_id": EXEC_A,
+        "automation_source_execution_id": EXEC_A,
         "automation_reasoning_effort_configured": True,
         "automation_reasoning_effort": "high",
     }
+    assert "automation_execution_id" not in ctx_a
 
     # 2. Wakeup created by a normal user turn MUST NOT inherit running Automation B's model or effort
     req_user = ChatRequest(
@@ -384,10 +385,11 @@ async def test_explicit_model_retry_still_inherits_first_turn_effort_and_propaga
     # Explicit retry model is respected while effort is still inherited from first turn
     assert resolved == [("gpt-6.2-sol-oauth", "high")]
     assert ctx == {
-        "automation_execution_id": EXEC_A,
+        "automation_source_execution_id": EXEC_A,
         "automation_reasoning_effort_configured": True,
         "automation_reasoning_effort": "high",
     }
+    assert "automation_execution_id" not in ctx
 
 
 @pytest.mark.asyncio
@@ -612,10 +614,11 @@ async def test_normal_user_retry_inherits_first_turn_effort_even_with_explicit_m
     )
     assert resolved[-1] == ("claude-opus-5-5-oauth", "high")
     assert ctx_1 == {
-        "automation_execution_id": EXEC_A,
+        "automation_source_execution_id": EXEC_A,
         "automation_reasoning_effort_configured": True,
         "automation_reasoning_effort": "high",
     }
+    assert "automation_execution_id" not in ctx_1
 
     # Case 2: Normal user retry WITH explicit model -> respects user model and still inherits "high" effort
     ctx_2: dict[str, Any] = {}
@@ -637,7 +640,8 @@ async def test_normal_user_retry_inherits_first_turn_effort_even_with_explicit_m
         on_automation_context=ctx_2.update,
     )
     assert resolved[-1] == ("gpt-6.2-sol-oauth", "high")
-    assert ctx_2["automation_execution_id"] == EXEC_A
+    assert ctx_2["automation_source_execution_id"] == EXEC_A
+    assert "automation_execution_id" not in ctx_2
 
     # Case 3: Subscription failure during normal user retry raises directly without fallback
     async def _fail_sub(_base, _uid, _model, _byok, *, reasoning_effort=None, **_kw):
@@ -925,3 +929,121 @@ async def test_executor_ignores_stale_effort_on_builtin_antigravity_but_keeps_cu
         assert ok is True
         assert captured[-1]["request"].reasoning_effort == expected
         assert captured[-1]["run_metadata"]["automation_reasoning_effort"] == expected
+
+
+@pytest.mark.asyncio
+async def test_wakeup_turn_records_source_execution_id_and_recovers_via_retry_on_pre_graph_restart(
+    monkeypatch,
+) -> None:
+    """Wakeup turns store automation_source_execution_id (NOT scheduler-owned automation_execution_id),
+    so pre-graph restart recovery routes them through /retry instead of FiringRunsAgain while still
+    preserving provenance for retries and post-graph resumes."""
+    from datetime import UTC, datetime
+
+    from src.server.database.runs import restart_resume as rr_db
+    from src.server.services.report_back import restart as restart_mod
+    from src.server.services.runs import pending_input as pending_mod
+
+    # 1. SQL provenance helper recognizes automation_source_execution_id
+    assert "automation_source_execution_id" in atm_mod._response_execution_id_sql("r")
+
+    # 2. Wakeup metadata emitted by on_automation_context carries automation_source_execution_id only
+    wakeup_run_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    wakeup_meta: dict[str, Any] = {
+        "automation_source_execution_id": EXEC_A,
+        "automation_reasoning_effort_configured": True,
+        "automation_reasoning_effort": "high",
+        rr_db.RESTART_INTERRUPTED_META: True,
+    }
+    now = datetime.now(UTC)
+
+    monkeypatch.setattr(
+        restart_mod,
+        "waits_on_user",
+        create_autospec(restart_mod.waits_on_user, return_value=False),
+    )
+    monkeypatch.setattr(
+        rr_db,
+        "list_restart_stopped_tasks",
+        create_autospec(rr_db.list_restart_stopped_tasks, return_value=[]),
+    )
+    monkeypatch.setattr(
+        rr_db,
+        "has_unsettled_tasks",
+        create_autospec(rr_db.has_unsettled_tasks, return_value=False),
+    )
+    monkeypatch.setattr(
+        pending_mod,
+        "read_pending_input",
+        create_autospec(
+            pending_mod.read_pending_input,
+            return_value=SimpleNamespace(needs_client=False),
+        ),
+    )
+
+    orig_read_state = rr_db.read_resume_state
+
+    # Case A: Pre-graph restart on a wakeup turn -> recovers via /retry (OwedResume with retry_run_id), NOT FiringRunsAgain!
+    monkeypatch.setattr(
+        rr_db,
+        "read_resume_state",
+        create_autospec(
+            orig_read_state,
+            return_value={
+                "user_id": USER,
+                "workspace_id": WS,
+                "no_turn": False,
+                "latest_run_id": wakeup_run_id,
+                "status": "cancelled",
+                "created_at": now,
+                "metadata": wakeup_meta,
+            },
+        ),
+    )
+    verdict_wakeup = await restart_mod.resume_verdict(
+        {
+            "conversation_thread_id": THREAD,
+            "payload": {"run_id": wakeup_run_id},
+            "created_at": now,
+        }
+    )
+    assert isinstance(verdict_wakeup, restart_mod.OwedResume)
+    assert verdict_wakeup.retry_run_id == wakeup_run_id
+    assert verdict_wakeup.automation_execution_id == EXEC_A
+
+    # Case B: _refire returns False for a wakeup run (no scheduler automation_execution_id)
+    fake_conn = create_autospec(AsyncConnection, instance=True)
+    refired = await rr_db._refire(
+        fake_conn,
+        {"conversation_response_id": wakeup_run_id, "metadata": wakeup_meta},
+    )
+    assert refired is False
+
+    # Case C: True scheduler firing (with metadata["automation_execution_id"]) STILL returns FiringRunsAgain
+    monkeypatch.setattr(
+        rr_db,
+        "read_resume_state",
+        create_autospec(
+            orig_read_state,
+            return_value={
+                "user_id": USER,
+                "workspace_id": WS,
+                "no_turn": False,
+                "latest_run_id": RUN_A,
+                "status": "cancelled",
+                "created_at": now,
+                "metadata": {
+                    "automation_execution_id": EXEC_A,
+                    rr_db.RESTART_INTERRUPTED_META: True,
+                },
+            },
+        ),
+    )
+    verdict_firing = await restart_mod.resume_verdict(
+        {
+            "conversation_thread_id": THREAD,
+            "payload": {"run_id": RUN_A},
+            "created_at": now,
+        }
+    )
+    assert isinstance(verdict_firing, restart_mod.FiringRunsAgain)

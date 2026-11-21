@@ -907,7 +907,7 @@ async def _handle_send_message(
     }
 
     # DALTON-HOOK(colleague-dispatch): pass origin_channel, tail_turn_no_new_work, and workspace_owner_id into run metadata & configurable.
-    # DALTON-HOOK(automation-effort): propagate automation_execution_id and two-state effort to continuation/retry run_meta
+    # DALTON-HOOK(automation-effort): propagate automation_source_execution_id (not scheduler firing automation_execution_id) and two-state effort to continuation/retry run_meta
     run_meta: dict[str, object] = {}
     if automation_run_ctx:
         run_meta.update(automation_run_ctx)

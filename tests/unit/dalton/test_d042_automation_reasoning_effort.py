@@ -14,6 +14,9 @@ def test_d042_revision_chain_and_upgrade_downgrade_sql(monkeypatch) -> None:
     assert d042.revision == "d042"
     assert d042.down_revision == "d041"
     assert d042.__doc__ and "Downgrade / Rollback Notes" in d042.__doc__
+    assert "automation_id = '<verified_automation_id>'" in d042.__doc__
+    assert "config_version = <verified_config_version>" in d042.__doc__
+    assert "LIKE '%-oauth'" not in d042.__doc__
 
     executed_up: list[str] = []
     op_mock = create_autospec(Operations, instance=True)

@@ -2,36 +2,41 @@
 """Controlled ops script for backfilling reasoning_effort='medium' on fixed Opus automations.
 
 Scope (per locked spec):
-  Only touches undeleted automations whose `llm_model` is explicitly fixed to a
-  built-in Claude Opus 5.5 non-Antigravity catalog key (e.g. `claude-opus-5-5`,
-  `claude-opus-5-5-oauth`, `claude-opus-5-5-code`) AND whose `reasoning_effort`
-  is `NULL`. Automations following the default model (`llm_model IS NULL`),
-  Antigravity suffixed keys (effort encoded in the ID), custom models, and
-  deleted automations are excluded.
+  Only touches undeleted automations whose `llm_model` is strictly equal to
+  `claude-opus-5-5-oauth` or `claude-opus-5-5` (built-in Claude Opus 5.5 OAuth
+  and API channels only; excludes `-code`, Antigravity suffixed keys, and any
+  other channels), whose owner has NO same-named custom model in
+  `custom_models`, whose `reasoning_effort` is `NULL`, and whose `audit_history`
+  does not show a prior un-rolled-back backfill (so user-cleared tasks are
+  never overwritten on a re-run).
 
 Modes:
   --dry-run [--out <plan.json>]  (default)
       Read-only scan (`SET TRANSACTION READ ONLY`). Prints automation_id, name,
       owner (user_id), current llm_model, and config_version for every target
-      row, and optionally writes a 0600 plan JSON file.
+      row (plus skipped rows and reasons), and optionally writes a 0600 plan
+      JSON file.
 
   --apply [--plan <plan.json>] [--batch-id <id>] [--archive-dir <dir>]
       Generates a batch_id (unless supplied), locks user_preferences (user_id
-      order) and target rows FOR UPDATE (automation_id order) in a single
-      transaction, re-verifies deleted_at IS NULL, fixed Opus llm_model,
-      reasoning_effort IS NULL, and config_version, archives pre-images (0600)
-      under `var/dalton/operator-records/` before writing, updates
-      `reasoning_effort = 'medium'` with `audit_history` entry carrying
+      order, skipping system company account) and target rows FOR UPDATE
+      (automation_id order) in a single transaction, re-verifies deleted_at IS
+      NULL, exact Opus llm_model without custom_models shadow, reasoning_effort
+      IS NULL, no prior un-rolled-back backfill, and config_version, archives
+      pre-images (0600) under `var/dalton/operator-records/` before writing,
+      updates `reasoning_effort = 'medium'` with `audit_history` entry carrying
       `action = 'backfill_opus_medium'` and `batch_id`, and asserts affected
       row count == dry-run count (rolling back the whole transaction otherwise).
 
   --rollback <batch_id> [--archive-dir <dir>]
-      Reverts only rows belonging to `<batch_id>` that still have
-      `reasoning_effort = 'medium'`, `config_version == after_config_version`,
-      and a matching `audit_history` entry with `version == after_config_version`,
+      Accepts both `applied` and `pending` archives (handles crashes after DB
+      commit before the archive status was flipped). Under `FOR UPDATE` row
+      lock, reverts ONLY rows that still have `reasoning_effort = 'medium'`,
+      `config_version == after_config_version`, and a matching `audit_history`
+      entry with `version == after_config_version`,
       `action == 'backfill_opus_medium'`, and `batch_id == <batch_id>`. Rows
-      edited by users afterwards (or from unapplied/pending archives) are never
-      reverted.
+      edited by users afterwards or from aborted transactions without a
+      matching batch audit entry are safely skipped.
 """
 
 from __future__ import annotations
@@ -63,12 +68,21 @@ from src.llms.model_spec import (
 )
 from src.server.database.pool import get_db_connection, get_or_create_pool
 from src.server.database.user import lock_user_preferences
+from src.server.services.llm.user_models import model_preference_of
 
 DEFAULT_ARCHIVE_DIR = Path("var/dalton/operator-records")
 BACKFILL_ACTION = "backfill_opus_medium"
 ROLLBACK_ACTION = "rollback_backfill_opus_medium"
 OPS_ACTOR_USER_ID = "system:ops-backfill"
 TARGET_EFFORT = "medium"
+
+# Strictly Claude Opus 5.5 built-in OAuth and API keys (never -code or Antigravity suffixed keys).
+ALLOWED_OPUS_MODEL_KEYS: frozenset[str] = frozenset(
+    {
+        "claude-opus-5-5",
+        "claude-opus-5-5-oauth",
+    }
+)
 
 _ROW_SELECT_COLUMNS = """
     automation_id, user_id, name, file_name, description,
@@ -143,28 +157,84 @@ def _has_matching_batch_audit_entry(
     return False
 
 
-def eligible_opus_catalog_models(model_config: Any | None = None) -> set[str]:
-    """Return built-in Claude Opus 5.5 non-Antigravity catalog keys that support ``medium``.
+def _was_previously_backfilled(audit_history: Any) -> bool:
+    """Return True if the task was already backfilled and not subsequently rolled back by ops.
 
-    Identified directly from the active model catalog (`LLM.get_model_config()`),
-    excluding Antigravity channel keys (whose effort is encoded in the model ID).
+    Prevents re-running the backfill from overwriting tasks where a user
+    explicitly cleared `reasoning_effort` back to NULL after a prior backfill.
+    """
+    entries = _history_entries(audit_history)
+    ordered = sorted(
+        entries,
+        key=lambda e: int(e["version"]) if isinstance(e.get("version"), int) else 0,
+    )
+    last_ops_action: str | None = None
+    for entry in ordered:
+        action = entry.get("action")
+        if action in (BACKFILL_ACTION, ROLLBACK_ACTION):
+            last_ops_action = str(action)
+    return last_ops_action == BACKFILL_ACTION
+
+
+def _owner_custom_model_names(pref_row: Mapping[str, Any] | None) -> set[str]:
+    """Return all custom model names declared in the owner's preferences row."""
+    if not isinstance(pref_row, Mapping):
+        return set()
+    merged = model_preference_of(dict(pref_row))
+    custom_models = merged.get("custom_models")
+    if not isinstance(custom_models, list):
+        return set()
+    names: set[str] = set()
+    for cm in custom_models:
+        if isinstance(cm, Mapping):
+            name = cm.get("name")
+            if isinstance(name, str) and name.strip():
+                names.add(name.strip())
+    return names
+
+
+def eligible_opus_catalog_models(model_config: Any | None = None) -> set[str]:
+    """Return eligible fixed Claude Opus 5.5 OAuth/API catalog keys.
+
+    Strictly restricted to ``ALLOWED_OPUS_MODEL_KEYS`` (``claude-opus-5-5`` and
+    ``claude-opus-5-5-oauth``), verified in the active model catalog as
+    non-Antigravity multi-tier models supporting ``medium``.
     """
     mc = model_config if model_config is not None else LLMFactory.get_model_config()
     entries = getattr(mc, "llm_config", None) or {}
     eligible: set[str] = set()
-    for key, entry in entries.items():
+    for key in sorted(ALLOWED_OPUS_MODEL_KEYS):
+        entry = entries.get(key)
         if not isinstance(entry, Mapping):
             continue
         if entry.get("provider") == ANTIGRAVITY_PROVIDER:
             continue
-        model_id = str(entry.get("model_id") or "")
-        if "opus" not in str(key).lower() and "opus" not in model_id.lower():
-            continue
         block = reasoning_block(dict(entry))
         efforts = canonical_reasoning_efforts(block.get("efforts"))
         if len(efforts) > 1 and TARGET_EFFORT in efforts:
-            eligible.add(str(key))
+            eligible.add(key)
     return eligible
+
+
+def _row_ineligible_reason(
+    row: Mapping[str, Any],
+    *,
+    eligible_models: set[str],
+    pref_row: Mapping[str, Any] | None,
+) -> str | None:
+    """Shared eligibility check used identically by both --dry-run and locked --apply."""
+    if row.get("deleted_at") is not None:
+        return "deleted"
+    if row.get("reasoning_effort") is not None:
+        return f"effort_already_set:{row.get('reasoning_effort')!r}"
+    llm_model = str(row.get("llm_model") or "")
+    if llm_model not in eligible_models:
+        return f"model_not_eligible:{llm_model!r}"
+    if llm_model in _owner_custom_model_names(pref_row):
+        return f"shadowed_by_custom_model:{llm_model!r}"
+    if _was_previously_backfilled(row.get("audit_history")):
+        return "previously_backfilled"
+    return None
 
 
 def _candidate_summary(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -177,17 +247,60 @@ def _candidate_summary(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+async def _fetch_pref_rows_readonly(
+    conn: Any, user_ids: Sequence[str]
+) -> dict[str, dict[str, Any]]:
+    target_users = sorted(
+        {str(u) for u in user_ids if u and not is_company_system_user(str(u))}
+    )
+    if not target_users:
+        return {}
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT user_id, model_preference, other_preference
+            FROM user_preferences
+            WHERE user_id = ANY(%s)
+            """,
+            (target_users,),
+        )
+        rows = await cur.fetchall()
+    return {str(r["user_id"]): dict(r) for r in (rows or ()) if r.get("user_id")}
+
+
+async def _fetch_pref_rows_for_locked_users(
+    conn: Any, user_ids: Sequence[str]
+) -> dict[str, dict[str, Any]]:
+    prefs: dict[str, dict[str, Any]] = {}
+    for uid in sorted({str(u) for u in user_ids if u and not is_company_system_user(str(u))}):
+        await lock_user_preferences(uid, conn=conn)
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT user_id, model_preference, other_preference
+                FROM user_preferences
+                WHERE user_id = %s
+                """,
+                (uid,),
+            )
+            row = await cur.fetchone()
+        prefs[uid] = dict(row) if isinstance(row, Mapping) else {}
+    return prefs
+
+
 async def run_dry_run(
     *,
     conn: Any = None,
     out_path: Path | None = None,
     model_config: Any | None = None,
 ) -> dict[str, Any]:
-    """Scan undeleted NULL-effort automations explicitly fixed to built-in Opus models."""
-    eligible_models = sorted(eligible_opus_catalog_models(model_config))
+    """Scan undeleted NULL-effort automations strictly fixed to claude-opus-5-5(-oauth)."""
+    eligible_models = eligible_opus_catalog_models(model_config)
+    eligible_list = sorted(eligible_models)
     candidates: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
 
-    if eligible_models:
+    if eligible_list:
         async with get_db_connection(conn) as db_conn:
             async with db_conn.transaction():
                 async with db_conn.cursor(row_factory=dict_row) as cur:
@@ -201,49 +314,37 @@ async def run_dry_run(
                           AND llm_model = ANY(%s)
                         ORDER BY automation_id
                         """,
-                        (eligible_models,),
+                        (eligible_list,),
                     )
-                    rows = await cur.fetchall()
-            for row in rows or ():
-                row_dict = dict(row)
-                if row_dict.get("deleted_at") is not None:
-                    continue
-                if row_dict.get("reasoning_effort") is not None:
-                    continue
-                if str(row_dict.get("llm_model") or "") not in eligible_models:
+                    rows = [dict(r) for r in (await cur.fetchall() or ())]
+                pref_rows = await _fetch_pref_rows_readonly(
+                    db_conn,
+                    [str(r.get("user_id") or "") for r in rows],
+                )
+            for row_dict in rows:
+                owner_id = str(row_dict.get("user_id") or "")
+                pref_row = {} if is_company_system_user(owner_id) else pref_rows.get(owner_id, {})
+                reason = _row_ineligible_reason(
+                    row_dict,
+                    eligible_models=eligible_models,
+                    pref_row=pref_row,
+                )
+                if reason is not None:
+                    skipped.append({**_candidate_summary(row_dict), "reason": reason})
                     continue
                 candidates.append(_candidate_summary(row_dict))
 
     plan: dict[str, Any] = {
         "generated_at": datetime.now(UTC).isoformat(),
         "target_effort": TARGET_EFFORT,
-        "eligible_models": eligible_models,
+        "eligible_models": eligible_list,
         "expected_count": len(candidates),
         "candidates": candidates,
+        "skipped": skipped,
     }
     if out_path is not None:
         _write_secure_json(out_path, plan)
     return plan
-
-
-async def _fetch_pref_rows_for_locked_users(
-    conn: Any, user_ids: Sequence[str]
-) -> dict[str, dict[str, Any]]:
-    prefs: dict[str, dict[str, Any]] = {}
-    for uid in sorted({str(u) for u in user_ids if u and not is_company_system_user(str(u))}):
-        await lock_user_preferences(uid, conn=conn)
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                SELECT model_preference, other_preference
-                FROM user_preferences
-                WHERE user_id = %s
-                """,
-                (uid,),
-            )
-            row = await cur.fetchone()
-        prefs[uid] = dict(row) if isinstance(row, Mapping) else {}
-    return prefs
 
 
 async def run_apply(
@@ -338,16 +439,12 @@ async def run_apply(
             for item in ordered_candidates:
                 aid = str(item["automation_id"])
                 locked = locked_by_id[aid]
-                if locked.get("deleted_at") is not None:
-                    raise OpsRefusalError(f"Drift on {aid}: row was deleted since dry-run")
-                if locked.get("reasoning_effort") is not None:
-                    raise OpsRefusalError(
-                        f"Drift on {aid}: reasoning_effort is no longer NULL "
-                        f"({locked.get('reasoning_effort')!r})"
-                    )
+                owner_id = str(locked["user_id"])
+                owner_pref = {} if is_company_system_user(owner_id) else pref_rows.get(owner_id, {})
+
                 expected_model = str(item["llm_model"])
                 actual_model = str(locked.get("llm_model") or "")
-                if actual_model != expected_model or actual_model not in eligible_models:
+                if actual_model != expected_model:
                     raise OpsRefusalError(
                         f"Drift on {aid}: llm_model changed from {expected_model!r} to {actual_model!r}"
                     )
@@ -357,19 +454,27 @@ async def run_apply(
                     raise OpsRefusalError(
                         f"Drift on {aid}: config_version changed from {expected_cv} to {actual_cv}"
                     )
+                ineligible_reason = _row_ineligible_reason(
+                    locked,
+                    eligible_models=eligible_models,
+                    pref_row=owner_pref,
+                )
+                if ineligible_reason is not None:
+                    raise OpsRefusalError(
+                        f"Drift/ineligible on {aid}: {ineligible_reason}"
+                    )
 
-                owner_id = str(locked["user_id"])
-                pref_row = (
+                snapshot_pref = (
                     {}
                     if str(locked.get("notify_storage_mode") or "legacy").strip() == "task_row"
-                    else pref_rows.get(owner_id, {})
+                    else owner_pref
                 )
                 hist_cols, skipped = await prepare_update_history_columns(
                     locked,
                     {"reasoning_effort": TARGET_EFFORT},
                     actor_user_id=OPS_ACTOR_USER_ID,
                     action=BACKFILL_ACTION,
-                    pref_row=pref_row,
+                    pref_row=snapshot_pref,
                     changed_at_iso=now_iso,
                     skip_if_unchanged=False,
                     conn=db_conn,
@@ -478,7 +583,14 @@ async def run_rollback(
     archive_dir: Path = DEFAULT_ARCHIVE_DIR,
     conn: Any = None,
 ) -> dict[str, Any]:
-    """Revert rows written by ``batch_id`` only if still untouched since that batch."""
+    """Revert rows written by ``batch_id`` only if verified under row lock.
+
+    Accepts both ``applied`` and ``pending`` archives so a batch whose DB
+    transaction committed before the process exited (leaving archive status as
+    ``pending``) can still be rolled back cleanly; rows from aborted
+    transactions or user-edited rows are safely skipped via the locked
+    ``audit_history`` batch_id + version + effort check.
+    """
     archive_path = _resolve_rollback_archive_path(batch_or_path, archive_dir)
     if not archive_path.exists():
         raise OpsRefusalError(f"Archive not found for {batch_or_path!r}: {archive_path}")
@@ -487,15 +599,15 @@ async def run_rollback(
     batch_id = str(archive.get("batch_id") or "").strip()
     if not batch_id:
         raise OpsRefusalError(f"Archive {archive_path} is missing batch_id")
-    if archive.get("status") != "applied":
+    archive_status = archive.get("status")
+    if archive_status not in ("pending", "applied"):
         raise OpsRefusalError(
-            f"Refusing rollback of archive {archive_path}: status is {archive.get('status')!r}, "
-            "not 'applied' (the batch did not commit)"
+            f"Refusing rollback of archive {archive_path}: unexpected status {archive_status!r}"
         )
 
     rows = [dict(r) for r in archive.get("rows") or ()]
     if not rows:
-        return {"batch_id": batch_id, "reverted": [], "skipped": []}
+        return {"batch_id": batch_id, "archive_status": archive_status, "reverted": [], "skipped": []}
 
     ordered_rows = sorted(rows, key=lambda r: str(r["automation_id"]))
     target_ids = [str(r["automation_id"]) for r in ordered_rows]
@@ -620,6 +732,7 @@ async def run_rollback(
 
     return {
         "batch_id": batch_id,
+        "archive_status": archive_status,
         "reverted": reverted,
         "skipped": skipped,
     }
@@ -627,6 +740,7 @@ async def run_rollback(
 
 def _print_dry_run(plan: Mapping[str, Any]) -> None:
     candidates = plan.get("candidates") or ()
+    skipped = plan.get("skipped") or ()
     print(f"Eligible Opus catalog models: {', '.join(plan.get('eligible_models') or ())}")
     print(f"Candidates ({len(candidates)}):")
     for item in candidates:
@@ -634,13 +748,20 @@ def _print_dry_run(plan: Mapping[str, Any]) -> None:
             f"  {item['automation_id']} | name={item['name']!r} | owner={item['user_id']} "
             f"| model={item['llm_model']} | version={item['config_version']}"
         )
+    if skipped:
+        print(f"Skipped ({len(skipped)}):")
+        for item in skipped:
+            print(
+                f"  {item['automation_id']} | name={item['name']!r} | owner={item['user_id']} "
+                f"| model={item['llm_model']} | version={item['config_version']} | reason={item['reason']}"
+            )
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Backfill reasoning_effort='medium' for undeleted automations explicitly "
-            "fixed to built-in Claude Opus 5.5 models (excluding Antigravity suffixed keys)."
+            "Backfill reasoning_effort='medium' for undeleted automations strictly "
+            "fixed to claude-opus-5-5-oauth or claude-opus-5-5."
         )
     )
     mode = parser.add_mutually_exclusive_group()
@@ -657,7 +778,7 @@ def _build_parser() -> argparse.ArgumentParser:
     mode.add_argument(
         "--rollback",
         metavar="BATCH_ID",
-        help="Rollback a previously applied batch by batch_id (or archive path).",
+        help="Rollback a batch by batch_id (or archive path), verifying locked audit history.",
     )
     parser.add_argument("--out", type=Path, help="Optional output path for --dry-run plan JSON.")
     parser.add_argument("--plan", type=Path, help="Optional reviewed plan JSON for --apply.")

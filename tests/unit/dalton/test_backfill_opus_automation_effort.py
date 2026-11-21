@@ -17,13 +17,17 @@ from scripts.dalton.ops import backfill_opus_automation_effort as ops
 
 U1 = "user-a"
 U2 = "user-b"
+U_SHADOW = "user-shadow"
 A_OPUS_OAUTH = "11111111-1111-4111-8111-111111111111"
 A_OPUS_API = "22222222-2222-4222-8222-222222222222"
 A_DEFAULT_MODEL = "33333333-3333-4333-8333-333333333333"
 A_AG_OPUS = "44444444-4444-4444-8444-444444444444"
-A_CUSTOM_OPUS = "55555555-5555-4555-8555-555555555555"
-A_DELETED = "66666666-6666-4666-8666-666666666666"
-WS = "77777777-7777-4777-8777-777777777777"
+A_CODE_OPUS = "55555555-5555-4555-8555-555555555555"
+A_SHADOW_OPUS = "66666666-6666-4666-8666-666666666666"
+A_DELETED = "77777777-7777-4777-8777-777777777777"
+A_PRIOR_CLEARED = "88888888-8888-4888-8888-888888888888"
+A_ROLLED_BACK = "99999999-9999-4999-8999-999999999999"
+WS = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
 
 def _make_conn(
@@ -63,6 +67,9 @@ def _make_conn(
                             and r.get("reasoning_effort") is None
                             and r.get("llm_model") in allowed
                         ]
+                    elif key == "FROM user_preferences WHERE user_id = %s" and params:
+                        target_uid = params[0]
+                        buf["rows"] = [dict(r) for r in rows if r.get("user_id") == target_uid]
                     else:
                         buf["rows"] = [dict(r) for r in rows]
                     return
@@ -85,16 +92,15 @@ def _make_conn(
 
 
 @pytest.mark.asyncio
-async def test_dry_run_selects_only_fixed_builtin_opus_and_excludes_default_antigravity_custom_deleted(
-    tmp_path: Path,
+async def test_dry_run_and_apply_strictly_limit_to_opus_oauth_and_api_and_exclude_custom_shadow(
+    tmp_path: Path, monkeypatch
 ) -> None:
-    # Uses the REAL model catalog from LLM.get_model_config()
+    """Only claude-opus-5-5-oauth and claude-opus-5-5 qualify (not -code, not Antigravity);
+    same-named custom_models entries are excluded identically in dry-run and locked apply."""
     eligible = ops.eligible_opus_catalog_models()
-    assert "claude-opus-5-5" in eligible
-    assert "claude-opus-5-5-oauth" in eligible
+    assert eligible == {"claude-opus-5-5", "claude-opus-5-5-oauth"}
+    assert "claude-opus-5-5-code" not in eligible
     assert "claude-opus-5-5-high-oauth" not in eligible
-    assert "claude-opus-5-5-medium-oauth" not in eligible
-    assert "claude-opus-5-5-low-oauth" not in eligible
 
     plan_path = tmp_path / "plan.json"
     all_rows = [
@@ -107,6 +113,7 @@ async def test_dry_run_selects_only_fixed_builtin_opus_and_excludes_default_anti
             "reasoning_effort": None,
             "config_version": 2,
             "deleted_at": None,
+            "audit_history": [],
         },
         {
             "automation_id": A_OPUS_API,
@@ -117,6 +124,29 @@ async def test_dry_run_selects_only_fixed_builtin_opus_and_excludes_default_anti
             "reasoning_effort": None,
             "config_version": 4,
             "deleted_at": None,
+            "audit_history": [],
+        },
+        {
+            "automation_id": A_CODE_OPUS,
+            "user_id": U1,
+            "workspace_id": WS,
+            "name": "Claude Code Opus",
+            "llm_model": "claude-opus-5-5-code",
+            "reasoning_effort": None,
+            "config_version": 1,
+            "deleted_at": None,
+            "audit_history": [],
+        },
+        {
+            "automation_id": A_SHADOW_OPUS,
+            "user_id": U_SHADOW,
+            "workspace_id": WS,
+            "name": "Shadowed Custom Opus",
+            "llm_model": "claude-opus-5-5",
+            "reasoning_effort": None,
+            "config_version": 1,
+            "deleted_at": None,
+            "audit_history": [],
         },
         {
             "automation_id": A_DEFAULT_MODEL,
@@ -127,6 +157,7 @@ async def test_dry_run_selects_only_fixed_builtin_opus_and_excludes_default_anti
             "reasoning_effort": None,
             "config_version": 1,
             "deleted_at": None,
+            "audit_history": [],
         },
         {
             "automation_id": A_AG_OPUS,
@@ -137,16 +168,7 @@ async def test_dry_run_selects_only_fixed_builtin_opus_and_excludes_default_anti
             "reasoning_effort": None,
             "config_version": 1,
             "deleted_at": None,
-        },
-        {
-            "automation_id": A_CUSTOM_OPUS,
-            "user_id": U1,
-            "workspace_id": WS,
-            "name": "Custom Opus",
-            "llm_model": "my-custom-opus",
-            "reasoning_effort": None,
-            "config_version": 1,
-            "deleted_at": None,
+            "audit_history": [],
         },
         {
             "automation_id": A_DELETED,
@@ -157,9 +179,28 @@ async def test_dry_run_selects_only_fixed_builtin_opus_and_excludes_default_anti
             "reasoning_effort": None,
             "config_version": 1,
             "deleted_at": "2026-11-20T00:00:00Z",
+            "audit_history": [],
         },
     ]
-    conn = _make_conn(select_rows={"llm_model = ANY": all_rows}, updates=[])
+    pref_rows = [
+        {"user_id": U1, "model_preference": {}, "other_preference": {}},
+        {"user_id": U2, "model_preference": {}, "other_preference": {}},
+        {
+            "user_id": U_SHADOW,
+            "model_preference": {
+                "custom_models": [{"name": "claude-opus-5-5", "provider": "anthropic"}]
+            },
+            "other_preference": {},
+        },
+    ]
+
+    conn = _make_conn(
+        select_rows={
+            "llm_model = ANY": all_rows,
+            "FROM user_preferences WHERE user_id = ANY": pref_rows,
+        },
+        updates=[],
+    )
     plan = await ops.run_dry_run(conn=conn, out_path=plan_path)
 
     assert plan["expected_count"] == 2
@@ -180,6 +221,147 @@ async def test_dry_run_selects_only_fixed_builtin_opus_and_excludes_default_anti
             "config_version": 4,
         },
     ]
+    skipped_by_id = {s["automation_id"]: s["reason"] for s in plan["skipped"]}
+    assert skipped_by_id == {A_SHADOW_OPUS: "shadowed_by_custom_model:'claude-opus-5-5'"}
+
+    # Locked apply ALSO refuses if a user added a same-named custom model after dry-run
+    monkeypatch.setattr(
+        ops,
+        "lock_user_preferences",
+        create_autospec(ops.lock_user_preferences, return_value=None),
+    )
+    updates_shadow: list[tuple[str, Any]] = []
+    conn_shadow_apply = _make_conn(
+        select_rows={
+            "FOR UPDATE": [
+                {
+                    "automation_id": A_OPUS_API,
+                    "user_id": U2,
+                    "name": "Fixed Opus API",
+                    "llm_model": "claude-opus-5-5",
+                    "reasoning_effort": None,
+                    "config_version": 4,
+                    "deleted_at": None,
+                    "notify_storage_mode": "task_row",
+                    "audit_history": [],
+                }
+            ],
+            "FROM user_preferences WHERE user_id = %s": [
+                {
+                    "user_id": U2,
+                    "model_preference": {
+                        "custom_models": [{"name": "claude-opus-5-5", "provider": "anthropic"}]
+                    },
+                    "other_preference": {},
+                }
+            ],
+        },
+        updates=updates_shadow,
+    )
+    with pytest.raises(ops.OpsRefusalError, match="shadowed_by_custom_model"):
+        await ops.run_apply(
+            plan_data={
+                "expected_count": 1,
+                "candidates": [
+                    {
+                        "automation_id": A_OPUS_API,
+                        "name": "Fixed Opus API",
+                        "user_id": U2,
+                        "llm_model": "claude-opus-5-5",
+                        "config_version": 4,
+                    }
+                ],
+            },
+            batch_id="batch-shadow-drift",
+            archive_dir=tmp_path / "records",
+            conn=conn_shadow_apply,
+        )
+    assert updates_shadow == []
+
+
+@pytest.mark.asyncio
+async def test_dry_run_and_apply_exclude_previously_backfilled_then_user_cleared_tasks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Re-running backfill must never overwrite tasks previously backfilled and cleared by users,
+    while tasks rolled back by ops remain eligible."""
+    rows = [
+        {
+            "automation_id": A_PRIOR_CLEARED,
+            "user_id": U1,
+            "name": "User Cleared After Backfill",
+            "llm_model": "claude-opus-5-5-oauth",
+            "reasoning_effort": None,
+            "config_version": 3,
+            "deleted_at": None,
+            "notify_storage_mode": "task_row",
+            "audit_history": [
+                {"version": 2, "action": ops.BACKFILL_ACTION, "batch_id": "batch-old-1"},
+                {"version": 3, "action": "update"},
+            ],
+        },
+        {
+            "automation_id": A_ROLLED_BACK,
+            "user_id": U1,
+            "name": "Ops Rolled Back Task",
+            "llm_model": "claude-opus-5-5-oauth",
+            "reasoning_effort": None,
+            "config_version": 3,
+            "deleted_at": None,
+            "notify_storage_mode": "task_row",
+            "audit_history": [
+                {"version": 2, "action": ops.BACKFILL_ACTION, "batch_id": "batch-old-1"},
+                {"version": 3, "action": ops.ROLLBACK_ACTION, "rollback_of_batch_id": "batch-old-1"},
+            ],
+        },
+    ]
+
+    conn_dry = _make_conn(
+        select_rows={
+            "llm_model = ANY": rows,
+            "FROM user_preferences WHERE user_id = ANY": [],
+        },
+        updates=[],
+    )
+    plan = await ops.run_dry_run(conn=conn_dry)
+    assert [c["automation_id"] for c in plan["candidates"]] == [A_ROLLED_BACK]
+    assert {s["automation_id"]: s["reason"] for s in plan["skipped"]} == {
+        A_PRIOR_CLEARED: "previously_backfilled"
+    }
+
+    # Even if a stale plan includes A_PRIOR_CLEARED, locked apply refuses it
+    monkeypatch.setattr(
+        ops,
+        "lock_user_preferences",
+        create_autospec(ops.lock_user_preferences, return_value=None),
+    )
+    updates: list[tuple[str, Any]] = []
+    conn_apply = _make_conn(
+        select_rows={
+            "FOR UPDATE": [rows[0]],
+            "FROM user_preferences WHERE user_id = %s": [],
+        },
+        updates=updates,
+    )
+    with pytest.raises(ops.OpsRefusalError, match="previously_backfilled"):
+        await ops.run_apply(
+            plan_data={
+                "expected_count": 1,
+                "candidates": [
+                    {
+                        "automation_id": A_PRIOR_CLEARED,
+                        "name": "User Cleared After Backfill",
+                        "user_id": U1,
+                        "llm_model": "claude-opus-5-5-oauth",
+                        "config_version": 3,
+                    }
+                ],
+            },
+            batch_id="batch-rerun",
+            archive_dir=tmp_path / "records",
+            conn=conn_apply,
+        )
+    assert updates == []
 
 
 @pytest.mark.asyncio
@@ -240,7 +422,8 @@ async def test_apply_writes_medium_records_batch_id_archives_pre_image_and_asser
                     "notify_storage_mode": "task_row",
                     "audit_history": [],
                 }
-            ]
+            ],
+            "FROM user_preferences WHERE user_id = %s": [],
         },
         updates=updates_drift,
     )
@@ -253,7 +436,7 @@ async def test_apply_writes_medium_records_batch_id_archives_pre_image_and_asser
         )
     assert updates_drift == []
 
-    # Case 2: rowcount assertion failure -> refuses, archive stays pending (not applied)
+    # Case 2: rowcount assertion failure -> refuses, archive stays pending
     conn_zero = _make_conn(
         select_rows={
             "FOR UPDATE": [
@@ -268,7 +451,8 @@ async def test_apply_writes_medium_records_batch_id_archives_pre_image_and_asser
                     "notify_storage_mode": "task_row",
                     "audit_history": [],
                 }
-            ]
+            ],
+            "FROM user_preferences WHERE user_id = %s": [],
         },
         updates=[],
         rowcount_override=0,
@@ -301,7 +485,8 @@ async def test_apply_writes_medium_records_batch_id_archives_pre_image_and_asser
                     "notify_storage_mode": "task_row",
                     "audit_history": [],
                 }
-            ]
+            ],
+            "FROM user_preferences WHERE user_id = %s": [],
         },
         updates=updates_ok,
     )
@@ -328,70 +513,13 @@ async def test_apply_writes_medium_records_batch_id_archives_pre_image_and_asser
 
 
 @pytest.mark.asyncio
-async def test_rollback_refuses_pending_archive_and_verifies_batch_audit_entry_under_lock(
+async def test_rollback_accepts_pending_archive_after_commit_crash_and_skips_uncommitted_or_user_edited(
     tmp_path: Path, monkeypatch
 ) -> None:
+    """A pending archive (process exited after DB commit before flipping archive status) can
+    still be rolled back by verifying batch_id/action/version/medium under FOR UPDATE lock;
+    aborted rows where the user set medium themselves (no matching batch audit) are skipped."""
     archive_dir = tmp_path / "operator-records"
-
-    # 1. Pending archive (from an aborted apply where user themselves set medium at v3) MUST be refused
-    pending_batch = "batch-aborted-pending"
-    ops._write_secure_json(
-        ops.archive_path_for_batch(pending_batch, archive_dir),
-        {
-            "batch_id": pending_batch,
-            "status": "pending",
-            "rows": [
-                {
-                    "automation_id": A_OPUS_OAUTH,
-                    "user_id": U1,
-                    "before_reasoning_effort": None,
-                    "before_config_version": 2,
-                    "after_config_version": 3,
-                }
-            ],
-        },
-    )
-    with pytest.raises(ops.OpsRefusalError, match="not 'applied'"):
-        await ops.run_rollback(batch_or_path=pending_batch, archive_dir=archive_dir)
-
-    # 2. Applied archive: verifies batch_id & action in locked audit_history;
-    #    reverts untouched row from this batch, skips user-edited row and row whose v3 was user-authored!
-    applied_batch = "batch-applied-42"
-    a_reverted = A_OPUS_OAUTH
-    a_user_edited_ver = A_OPUS_API
-    a_user_authored_same_ver = A_CUSTOM_OPUS
-
-    ops._write_secure_json(
-        ops.archive_path_for_batch(applied_batch, archive_dir),
-        {
-            "batch_id": applied_batch,
-            "status": "applied",
-            "rows": [
-                {
-                    "automation_id": a_reverted,
-                    "user_id": U1,
-                    "before_reasoning_effort": None,
-                    "before_config_version": 2,
-                    "after_config_version": 3,
-                },
-                {
-                    "automation_id": a_user_edited_ver,
-                    "user_id": U1,
-                    "before_reasoning_effort": None,
-                    "before_config_version": 2,
-                    "after_config_version": 3,
-                },
-                {
-                    "automation_id": a_user_authored_same_ver,
-                    "user_id": U1,
-                    "before_reasoning_effort": None,
-                    "before_config_version": 2,
-                    "after_config_version": 3,
-                },
-            ],
-        },
-    )
-
     monkeypatch.setattr(
         ops,
         "lock_user_preferences",
@@ -414,12 +542,48 @@ async def test_rollback_refuses_pending_archive_and_verifies_batch_audit_entry_u
         ),
     )
 
+    # Case 1: DB committed, process exited while archive stayed 'pending':
+    #   - A_OPUS_OAUTH has matching batch_id audit at v3 & medium -> REVERTED
+    #   - A_OPUS_API was user-authored medium at v3 (no matching batch_id) -> SKIPPED
+    #   - A_CODE_OPUS was later edited by user to v4 -> SKIPPED
+    pending_batch = "batch-crash-after-commit"
+    ops._write_secure_json(
+        ops.archive_path_for_batch(pending_batch, archive_dir),
+        {
+            "batch_id": pending_batch,
+            "status": "pending",
+            "rows": [
+                {
+                    "automation_id": A_OPUS_OAUTH,
+                    "user_id": U1,
+                    "before_reasoning_effort": None,
+                    "before_config_version": 2,
+                    "after_config_version": 3,
+                },
+                {
+                    "automation_id": A_OPUS_API,
+                    "user_id": U1,
+                    "before_reasoning_effort": None,
+                    "before_config_version": 2,
+                    "after_config_version": 3,
+                },
+                {
+                    "automation_id": A_CODE_OPUS,
+                    "user_id": U1,
+                    "before_reasoning_effort": None,
+                    "before_config_version": 2,
+                    "after_config_version": 3,
+                },
+            ],
+        },
+    )
+
     updates: list[tuple[str, Any]] = []
     conn = _make_conn(
         select_rows={
             "FOR UPDATE": [
                 {
-                    "automation_id": a_reverted,
+                    "automation_id": A_OPUS_OAUTH,
                     "user_id": U1,
                     "reasoning_effort": "medium",
                     "config_version": 3,
@@ -429,29 +593,13 @@ async def test_rollback_refuses_pending_archive_and_verifies_batch_audit_entry_u
                         {
                             "version": 3,
                             "action": ops.BACKFILL_ACTION,
-                            "batch_id": applied_batch,
+                            "batch_id": pending_batch,
                         }
                     ],
                 },
                 {
-                    "automation_id": a_user_edited_ver,
-                    "user_id": U1,
-                    "reasoning_effort": "high",
-                    "config_version": 4,
-                    "deleted_at": None,
-                    "notify_storage_mode": "task_row",
-                    "audit_history": [
-                        {
-                            "version": 3,
-                            "action": ops.BACKFILL_ACTION,
-                            "batch_id": applied_batch,
-                        },
-                        {"version": 4, "action": "update"},
-                    ],
-                },
-                {
                     # Same version 3 and effort='medium', but written by user (no matching batch_id!)
-                    "automation_id": a_user_authored_same_ver,
+                    "automation_id": A_OPUS_API,
                     "user_id": U1,
                     "reasoning_effort": "medium",
                     "config_version": 3,
@@ -461,20 +609,38 @@ async def test_rollback_refuses_pending_archive_and_verifies_batch_audit_entry_u
                         {"version": 3, "action": "update"},
                     ],
                 },
-            ]
+                {
+                    "automation_id": A_CODE_OPUS,
+                    "user_id": U1,
+                    "reasoning_effort": "high",
+                    "config_version": 4,
+                    "deleted_at": None,
+                    "notify_storage_mode": "task_row",
+                    "audit_history": [
+                        {
+                            "version": 3,
+                            "action": ops.BACKFILL_ACTION,
+                            "batch_id": pending_batch,
+                        },
+                        {"version": 4, "action": "update"},
+                    ],
+                },
+            ],
+            "FROM user_preferences WHERE user_id = %s": [],
         },
         updates=updates,
     )
 
     res = await ops.run_rollback(
-        batch_or_path=applied_batch,
+        batch_or_path=pending_batch,
         archive_dir=archive_dir,
         conn=conn,
     )
-    assert res["reverted"] == [a_reverted]
+    assert res["archive_status"] == "pending"
+    assert res["reverted"] == [A_OPUS_OAUTH]
     skipped_by_id = {item["automation_id"]: item["reason"] for item in res["skipped"]}
-    assert a_user_edited_ver in skipped_by_id
-    assert skipped_by_id[a_user_authored_same_ver] == "missing_matching_batch_audit_entry"
+    assert skipped_by_id[A_OPUS_API] == "missing_matching_batch_audit_entry"
+    assert skipped_by_id[A_CODE_OPUS].startswith("version_changed:")
     assert len(updates) == 1
     assert updates[0][1][0] is None  # reverted reasoning_effort back to NULL
 
@@ -513,7 +679,13 @@ async def test_company_system_user_and_missing_pref_user_never_fail_online_polic
         },
     ]
 
-    dry_conn = _make_conn(select_rows={"llm_model = ANY": rows}, updates=[])
+    dry_conn = _make_conn(
+        select_rows={
+            "llm_model = ANY": rows,
+            "FROM user_preferences WHERE user_id = ANY": [],
+        },
+        updates=[],
+    )
     plan = await ops.run_dry_run(conn=dry_conn)
     assert plan["expected_count"] == 2
     assert {c["user_id"] for c in plan["candidates"]} == {
@@ -554,7 +726,7 @@ async def test_company_system_user_and_missing_pref_user_never_fail_online_polic
     apply_conn = _make_conn(
         select_rows={
             "FOR UPDATE": rows,
-            "FROM user_preferences": [],  # suspended/missing user has no preferences row
+            "FROM user_preferences WHERE user_id = %s": [],
         },
         updates=updates,
     )
@@ -565,5 +737,4 @@ async def test_company_system_user_and_missing_pref_user_never_fail_online_polic
         conn=apply_conn,
     )
     assert res["updated_count"] == 2
-    # Company system account skips user_preferences locking; suspended user locks without policy error
     assert locked_uids == ["suspended-member-99"]
