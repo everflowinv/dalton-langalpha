@@ -20,6 +20,8 @@ import { useAnswerFlow } from '../answers/flow';
 import { Group } from '@/components/modelAccess/parts';
 import { AccessRow } from '@/components/modelAccess/AccessRow';
 import { AnswersStrip, RowButton, SetupNote, StepError, StepLoadFailed, StepLoading } from '../answers/parts';
+// DALTON-HOOK(dalton-setup): normalize legacy model answers with the same rule as setupSteps
+import { effectiveModelsAnswer } from '../answers/setupSteps';
 
 const S = 'modelAccess.claudeCode.setup';
 
@@ -70,7 +72,11 @@ export default function ComputerStep() {
   const kind = isDaltonBuild ? null : macRowKind(inApp, availability, serverTakesRemoteControl(providers.data));
   const mac = kind && MAC_ROW[kind];
   const macAction = mac?.action;
-  const claudeCode = flow.answers?.models === 'claude_code';
+  // DALTON-HOOK(dalton-setup): normalize legacy claude_code answer with effectiveModelsAnswer
+  const effectiveModels = flow.answers
+    ? effectiveModelsAnswer(flow.answers.models, !!flow.facts?.teamModelsAvailable)
+    : null;
+  const claudeCode = effectiveModels === 'claude_code';
   const offerHome = flow.answers?.runsOn === 'own_computer' && !!flow.facts?.homeOnCloud;
   const { makePrimary } = useComputerActions();
   const { data: placement } = useHomePlacement({ enabled: offerHome });
@@ -105,7 +111,8 @@ export default function ComputerStep() {
 
   return (
     <div>
-      {flow.first && flow.answers && <AnswersStrip answers={flow.answers} />}
+      {/* DALTON-HOOK(dalton-setup): pass teamModelsAvailable so legacy answers normalize in AnswersStrip */}
+      {flow.first && flow.answers && <AnswersStrip answers={flow.answers} teamModelsAvailable={!!flow.facts?.teamModelsAvailable} />}
       <WizardStepHeader
         titleId={headingId}
         title={t(isDaltonBuild && !sshOffered ? 'setup.answers.computer.cloudReadyTitle' : 'setup.answers.computer.title')}

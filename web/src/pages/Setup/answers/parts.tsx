@@ -13,17 +13,18 @@ import { RadioChoice } from '@/components/ui/choice';
 import { Loader } from '@/components/ui/loader';
 import { FlowFailure, ROW_BUTTON } from '@/components/modelAccess/parts';
 import { isPlatformMode } from '@/config/hostMode';
-// DALTON-HOOK(dalton-setup): team-shared model tag in Dalton
+// DALTON-HOOK(dalton-setup): normalize legacy model answers and render team-shared model tag in Dalton
 import { isDaltonBuild } from '@/config/brand';
 import { useChangeAnswers } from './flow';
-import type { SetupAnswers } from './setupSteps';
+import { effectiveModelsAnswer, type SetupAnswers } from './setupSteps';
 
 /** The answers' tags, in this deployment's words: self-hosted names the
  *  server's models and computers rather than LangAlpha's. */
-function answerTags(t: (key: string) => string, answers: SetupAnswers): [string, string] {
-  const models = answers.models === 'langalpha_models'
-    ? (isDaltonBuild ? 'teamModels' : !isPlatformMode ? 'serverModels' : answers.models)
-    : answers.models;
+function answerTags(t: (key: string) => string, answers: SetupAnswers, teamModelsAvailable = false): [string, string] {
+  const normalizedModels = effectiveModelsAnswer(answers.models, teamModelsAvailable);
+  const models = normalizedModels === 'langalpha_models'
+    ? (isDaltonBuild ? 'teamModels' : !isPlatformMode ? 'serverModels' : normalizedModels)
+    : normalizedModels;
   const runsOn = answers.runsOn === 'cloud' && !isPlatformMode ? 'serverComputer' : answers.runsOn;
   return [t(`setup.answers.tag.${models}`), t(`setup.answers.tag.${runsOn}`)];
 }
@@ -33,13 +34,14 @@ function answerTags(t: (key: string) => string, answers: SetupAnswers): [string,
  * chips and the way back to change them, the hosted onboarding questions on
  * hosted, this app's on self-hosted.
  */
-export function AnswersStrip({ answers }: { answers: SetupAnswers }) {
+// DALTON-HOOK(dalton-setup): accept teamModelsAvailable so legacy model answers normalize in chips
+export function AnswersStrip({ answers, teamModelsAvailable = false }: { answers: SetupAnswers; teamModelsAvailable?: boolean }) {
   const { t } = useTranslation();
   const change = useChangeAnswers();
   return (
     <div data-testid="setup-answers" className="shell-box mb-6 flex flex-wrap items-center gap-x-2 gap-y-1.5 px-4 py-2.5 sm:mb-8">
       <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{t('setup.answers.fromYourAnswers')}</span>
-      {answerTags(t, answers).map((tag) => (
+      {answerTags(t, answers, teamModelsAvailable).map((tag) => (
         <span
           key={tag}
           className="rounded-full px-2 py-0.5 text-xs"

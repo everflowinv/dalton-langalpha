@@ -290,7 +290,8 @@ import DefaultsStep from '../steps/DefaultsStep';
 import DoneStep from '../steps/DoneStep';
 import SetupWizard from '../SetupWizard';
 import { defaultChoices } from '../answers/defaultChoices';
-import { shellTarget } from '../answers/gate';
+import { onboardingRoute, shellTarget } from '../answers/gate';
+import { effectiveModelsAnswer } from '../answers/setupSteps';
 import { sectionShown } from '@/pages/Settings/sections';
 
 function LocationEcho() {
@@ -545,6 +546,38 @@ describe('Dalton SetupWizard external & internal member flows', () => {
     expect(sectionShown('teamModels', { callerTier: 'admin' })).toBe(true);
     expect(sectionShown('teamModels', { callerTier: 'internal' })).toBe(false);
     expect(sectionShown('teamModels', { callerTier: 'external' })).toBe(false);
+  });
+
+  it('normalizes legacy claude_code answers and setup_on=app in Dalton while preserving upstream behavior when isDaltonBuild is false', () => {
+    expect(effectiveModelsAnswer('claude_code', true)).toBe('langalpha_models');
+    expect(effectiveModelsAnswer('claude_code', false)).toBe('subscription_or_key');
+    expect(
+      onboardingRoute({
+        platform: false,
+        onboarded: true,
+        hasAnswers: true,
+        setupCompleted: false,
+        setupOn: 'app',
+        next: 'default',
+        needsProvider: false,
+        unpaired: false,
+      }),
+    ).toMatchObject({ kind: 'answers', owner: 'browser', nextPath: '/setup/default' });
+
+    h.isDaltonBuild = false;
+    expect(effectiveModelsAnswer('claude_code', false)).toBe('claude_code');
+    expect(
+      onboardingRoute({
+        platform: false,
+        onboarded: true,
+        hasAnswers: true,
+        setupCompleted: false,
+        setupOn: 'app',
+        next: 'default',
+        needsProvider: false,
+        unpaired: false,
+      }),
+    ).toMatchObject({ kind: 'answers', owner: 'app', nextPath: '/setup/default' });
   });
 
   it('leaves upstream defaultChoices & shellTarget Mac pairing behavior unchanged when isDaltonBuild is false', () => {

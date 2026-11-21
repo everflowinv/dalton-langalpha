@@ -46,10 +46,10 @@ function UseForm() {
   const saved = readAnswers(progress);
   const [models, setModels] = useState<ModelsAnswer | null>(null);
   const [runsOn, setRunsOn] = useState<RunsOnAnswer | null>(null);
-  // DALTON-HOOK(dalton-setup): skip connect only when team sharing has at least one available model
+  // DALTON-HOOK(dalton-setup): skip connect only when team sharing has available models; allow admins to configure when empty
   const team = useDaltonTeamModels();
   const teamModelsOnly = isDaltonBuild && team.available;
-  const teamModelsEmpty = team.empty;
+  const teamModelsEmpty = team.empty && !team.canManage;
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const { setup: claudeCodeSetup, isLoading: claudeCodeLoading, unread: claudeCodeUnread, retry: retryClaudeCode } = useClaudeCodeSetup({ enabled: !isDaltonBuild });
   const serverModels = !teamModelsOnly && !teamModelsEmpty && user?.deployment_serves === true;

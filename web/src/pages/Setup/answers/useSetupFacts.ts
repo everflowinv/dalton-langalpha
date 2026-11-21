@@ -22,10 +22,10 @@ import { useComputers } from '@/pages/ChatAgent/hooks/useComputers';
 import type { Computer } from '@/types/api';
 import { useOnboardingProgress } from '@/hooks/useOnboardingProgress';
 import { isPlatformMode } from '@/config/hostMode';
-// DALTON-HOOK(dalton-setup): check live Dalton team-model availability for step routing
+// DALTON-HOOK(dalton-setup): check live Dalton team-model availability and normalize legacy answers
 import { isDaltonBuild } from '@/config/brand';
 import { useDaltonTeamModels } from './useTeamModels';
-import { nextSetupPath, nextSetupStep, readAnswers, setupRail, type SetupFacts } from './setupSteps';
+import { effectiveModelsAnswer, nextSetupPath, nextSetupStep, readAnswers, setupRail, type SetupFacts } from './setupSteps';
 
 /** A machine the user brought (SSH, this Mac through Remote control) that is
  *  still there to run tasks. */
@@ -38,7 +38,12 @@ export const homeMachine = (computers: readonly Computer[]): Computer | null =>
 
 export function useSetupFacts({ refetchInterval = false }: { refetchInterval?: number | false } = {}) {
   const { progress, isLoading: progressLoading, isError: progressFailed, refetch: refetchProgress } = useOnboardingProgress({ refetchInterval });
-  const answers = readAnswers(progress);
+  // DALTON-HOOK(dalton-setup): read unified Dalton team-model availability and normalize legacy answers
+  const team = useDaltonTeamModels();
+  const rawAnswers = readAnswers(progress);
+  const answers = rawAnswers
+    ? { ...rawAnswers, models: effectiveModelsAnswer(rawAnswers.models, team.available) }
+    : null;
   const running = !!answers && !progress?.setup_completed_at;
   const ownAnswer = answers?.runsOn === 'own_computer';
   const computers = useComputers({ enabled: running });
@@ -89,8 +94,7 @@ export function useSetupFacts({ refetchInterval = false }: { refetchInterval?: n
   // subscription signed in, a key only while BYOK is on where it can be off,
   // either only while the account's rules allow it.
   const { policy } = useAccount();
-  // DALTON-HOOK(dalton-setup): use the unified team-model availability check in Dalton
-  const team = useDaltonTeamModels();
+  // DALTON-HOOK(dalton-setup): team availability already read above for answer normalization
   const providerConnected = providers.some((p) => p.masked_key !== SERVER_KEY
     && (p.access_type === 'oauth'
       ? allows(policy, RULE.ownSubscriptions) && p.state === 'connected'
