@@ -564,6 +564,145 @@ async def claim_journal_invocation(
             return await _do_claim(db_conn)
 
 
+_NUMERIC_USAGE_KEYS: tuple[str, ...] = (
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cached_tokens",
+    "cache_5m_tokens",
+    "cache_1h_tokens",
+    "reasoning_tokens",
+    "audio_input_tokens",
+    "audio_output_tokens",
+)
+
+
+def _jsonb_num_expr(obj_expr: str, key: str) -> str:
+    return (
+        f"COALESCE("
+        f"CASE WHEN ({obj_expr}->>'{key}') ~ '^[0-9]+(\\.[0-9]+)?$' "
+        f"THEN ({obj_expr}->>'{key}')::numeric ELSE 0 END, 0)"
+    )
+
+
+def _extract_calls_jsonb_expr(obj_expr: str) -> str:
+    positive_checks = " OR ".join(f"{_jsonb_num_expr(obj_expr, k)} > 0" for k in _REPORTED_TOKEN_KEYS)
+    single_obj_pairs = ", ".join(
+        f"'{k}', CASE WHEN ({obj_expr}->>'{k}') ~ '^[0-9]+(\\.[0-9]+)?$' "
+        f"THEN ({obj_expr}->>'{k}')::numeric END"
+        for k in _NUMERIC_USAGE_KEYS
+    )
+    return (
+        f"CASE "
+        f"WHEN {obj_expr} IS NOT NULL "
+        f"AND jsonb_typeof({obj_expr}->'per_call_usages') = 'array' "
+        f"AND jsonb_array_length({obj_expr}->'per_call_usages') > 0 "
+        f"THEN {obj_expr}->'per_call_usages' "
+        f"WHEN {obj_expr} IS NOT NULL AND ({positive_checks}) "
+        f"THEN jsonb_build_array(jsonb_strip_nulls(jsonb_build_object({single_obj_pairs}))) "
+        f"ELSE '[]'::jsonb END"
+    )
+
+
+def _build_usage_merge_sql(
+    base_col: str,
+    delta_expr: str,
+    *,
+    strip_credential_holder: bool = False,
+) -> str:
+    """Merge `delta_expr` JSONB onto `base_col` in SQL (summing numeric token counters and
+    concatenating `per_call_usages`) without using `||`."""
+    token_pairs: list[str] = []
+    for k in _NUMERIC_USAGE_KEYS:
+        sum_expr = f"({_jsonb_num_expr(base_col, k)} + {_jsonb_num_expr(delta_expr, k)})"
+        token_pairs.append(f"'{k}', CASE WHEN {sum_expr} > 0 THEN {sum_expr} END")
+    base_calls = _extract_calls_jsonb_expr(base_col)
+    delta_calls = _extract_calls_jsonb_expr(delta_expr)
+    combined_calls = f"jsonb_concat({base_calls}, {delta_calls})"
+    token_pairs.append(
+        f"'per_call_usages', CASE WHEN jsonb_array_length({combined_calls}) > 0 THEN {combined_calls} END"
+    )
+    merged = (
+        f"jsonb_concat("
+        f"jsonb_concat(COALESCE({base_col}, '{{}}'::jsonb), COALESCE({delta_expr}, '{{}}'::jsonb)), "
+        f"jsonb_strip_nulls(jsonb_build_object({', '.join(token_pairs)}))"
+        f")"
+    )
+    if strip_credential_holder:
+        merged = f"({merged} - 'credential_user_id')"
+    return merged
+
+
+def _build_late_parent_sync_ctes() -> str:
+    """CTEs that fold late-settled `recorded_attempt` rows back into parent `dalton_llm_journal`
+    when `updated_journal` did not match (stale takeover), without touching `state`/`response`/`attempt`."""
+    sum_cols = ",\n                        ".join(
+        f"COALESCE(SUM({_jsonb_num_expr('ra.usage', k)}), 0) AS add_{k}"
+        for k in _NUMERIC_USAGE_KEYS
+    )
+    any_tok_cond = " OR ".join(f"la.add_{k} > 0" for k in _NUMERIC_USAGE_KEYS)
+    merged_tok_pairs: list[str] = []
+    for k in _NUMERIC_USAGE_KEYS:
+        tot = f"({_jsonb_num_expr('j.usage', k)} + la.add_{k})"
+        merged_tok_pairs.append(f"'{k}', CASE WHEN {tot} > 0 THEN {tot} END")
+    j_calls = _extract_calls_jsonb_expr("j.usage")
+    combined_calls = f"jsonb_concat({j_calls}, COALESCE(lpc.add_per_call_usages, '[]'::jsonb))"
+    merged_tok_pairs.append(
+        f"'per_call_usages', CASE WHEN jsonb_array_length({combined_calls}) > 0 THEN {combined_calls} END"
+    )
+    return f"""
+                late_calls AS (
+                    SELECT
+                        ra.invocation_id,
+                        ra.call_seq,
+                        {_extract_calls_jsonb_expr('ra.usage')} AS extracted_calls
+                    FROM recorded_attempt ra
+                ),
+                late_per_call AS (
+                    SELECT
+                        lc.invocation_id,
+                        jsonb_agg(elem ORDER BY lc.call_seq, ord) AS add_per_call_usages
+                    FROM late_calls lc
+                    CROSS JOIN LATERAL jsonb_array_elements(lc.extracted_calls) WITH ORDINALITY AS t(elem, ord)
+                    GROUP BY lc.invocation_id
+                ),
+                late_agg AS (
+                    SELECT
+                        ra.invocation_id,
+                        COALESCE(SUM(ra.cash_usd), 0) AS add_cash_usd,
+                        COALESCE(SUM(ra.notional_usd), 0) AS add_notional_usd,
+                        {sum_cols}
+                    FROM recorded_attempt ra
+                    GROUP BY ra.invocation_id
+                ),
+                late_parent_sync AS (
+                    UPDATE dalton_llm_journal j
+                    SET cash_usd = COALESCE(j.cash_usd, 0) + la.add_cash_usd,
+                        notional_usd = COALESCE(j.notional_usd, 0) + la.add_notional_usd,
+                        usage = CASE
+                            WHEN {any_tok_cond}
+                            THEN jsonb_concat(
+                                COALESCE(j.usage, '{{}}'::jsonb),
+                                jsonb_strip_nulls(jsonb_build_object({', '.join(merged_tok_pairs)}))
+                            )
+                            ELSE j.usage
+                        END
+                    FROM late_agg la
+                    LEFT JOIN late_per_call lpc ON lpc.invocation_id = la.invocation_id
+                    WHERE j.invocation_id = la.invocation_id
+                      AND NOT EXISTS (SELECT 1 FROM updated_journal)
+                      AND (
+                          la.add_cash_usd > 0
+                          OR la.add_notional_usd > 0
+                          OR {any_tok_cond}
+                      )
+                )
+    """.strip()
+
+
+_LATE_PARENT_SYNC_CTES = _build_late_parent_sync_ctes()
+
+
 def _normalize_attempt_call_records(
     *,
     call_records: list[dict[str, Any]] | None,
@@ -686,11 +825,25 @@ async def complete_journal_done(
     )
     records_json = json.dumps(records_payload, ensure_ascii=False, default=str)
 
-    usage_clause = (
-        "COALESCE(usage, '{}'::jsonb) || %s::jsonb"
-        if (stamp_credential_holder and is_team_credential_sharing_enabled())
-        else "%s::jsonb"
-    )
+    use_live_delta_merge = int(attempt) > 1 and attempt_usage is not None
+    if use_live_delta_merge:
+        usage_param_json = json.dumps(eff_attempt_usage, ensure_ascii=False, default=str)
+        usage_clause = (
+            "(SELECT "
+            + _build_usage_merge_sql(
+                "dalton_llm_journal.usage",
+                "d.u",
+                strip_credential_holder=not stamp_credential_holder,
+            )
+            + " FROM (VALUES (%s::jsonb)) AS d(u))"
+        )
+    else:
+        usage_param_json = usage_json
+        usage_clause = (
+            "COALESCE(usage, '{}'::jsonb) || %s::jsonb"
+            if (stamp_credential_holder and is_team_credential_sharing_enabled())
+            else "%s::jsonb"
+        )
 
     async def _do_update(c: Any) -> dict[str, Any] | None:
         async with c.cursor(row_factory=dict_row) as cur:
@@ -712,7 +865,8 @@ async def complete_journal_done(
                     -- mark (pending -> indeterminate) keeps the attempt number, so
                     -- that attempt may still settle it; a takeover bumps the attempt
                     -- and shuts the older worker out of updating state/response while
-                    -- `recorded_attempt` below still settles its unique attempt cost.
+                    -- `recorded_attempt` + `late_parent_sync` below settle its unique
+                    -- attempt cost and fold its cost/usage back into the parent row.
                     WHERE invocation_id = %s AND attempt = %s
                       AND state IN ('pending', 'indeterminate')
                     RETURNING *
@@ -782,12 +936,14 @@ async def complete_journal_done(
                       AND dalton_llm_journal_attempts.usage_known = FALSE
                       AND dalton_llm_journal_attempts.cash_usd = 0
                       AND dalton_llm_journal_attempts.notional_usd = 0
-                )
+                    RETURNING invocation_id, attempt, call_seq, usage, cash_usd, notional_usd
+                ),
+                {_LATE_PARENT_SYNC_CTES}
                 SELECT * FROM updated_journal
                 """,
                 (
                     resp_json,
-                    usage_json,
+                    usage_param_json,
                     cash_usd,
                     notional_usd,
                     provider,
@@ -882,12 +1038,25 @@ async def complete_journal_failed(
     usage_sql = ""
     usage_params: tuple[Any, ...] = ()
     if usage is not None:
-        usage_json = json.dumps(usage, ensure_ascii=False, default=str)
-        usage_clause = (
-            "COALESCE(usage, '{}'::jsonb) || %s::jsonb"
-            if (stamp_credential_holder and is_team_credential_sharing_enabled())
-            else "%s::jsonb"
-        )
+        use_live_delta_merge = int(attempt) > 1 and attempt_usage is not None
+        if use_live_delta_merge:
+            usage_json = json.dumps(attempt_usage, ensure_ascii=False, default=str)
+            usage_clause = (
+                "(SELECT "
+                + _build_usage_merge_sql(
+                    "dalton_llm_journal.usage",
+                    "d.u",
+                    strip_credential_holder=not stamp_credential_holder,
+                )
+                + " FROM (VALUES (%s::jsonb)) AS d(u))"
+            )
+        else:
+            usage_json = json.dumps(usage, ensure_ascii=False, default=str)
+            usage_clause = (
+                "COALESCE(usage, '{}'::jsonb) || %s::jsonb"
+                if (stamp_credential_holder and is_team_credential_sharing_enabled())
+                else "%s::jsonb"
+            )
         usage_sql = f",\n                        usage = {usage_clause}"
         usage_params = (usage_json,)
 
@@ -945,7 +1114,8 @@ async def complete_journal_failed(
                     -- mark (pending -> indeterminate) keeps the attempt number, so
                     -- that attempt may still settle it; a takeover bumps the attempt
                     -- and shuts the older worker out of updating state while
-                    -- `recorded_attempt` below still settles its unique attempt cost.
+                    -- `recorded_attempt` + `late_parent_sync` below settle its unique
+                    -- attempt cost and fold its cost/usage back into the parent row.
                     WHERE invocation_id = %s AND attempt = %s
                       AND state IN ('pending', 'indeterminate')
                     RETURNING *
@@ -1015,7 +1185,9 @@ async def complete_journal_failed(
                       AND dalton_llm_journal_attempts.usage_known = FALSE
                       AND dalton_llm_journal_attempts.cash_usd = 0
                       AND dalton_llm_journal_attempts.notional_usd = 0
-                )
+                    RETURNING invocation_id, attempt, call_seq, usage, cash_usd, notional_usd
+                ),
+                {_LATE_PARENT_SYNC_CTES}
                 SELECT * FROM updated_journal
                 """,
                 (

@@ -35,7 +35,7 @@ _BACKFILL_BATCH_SIZE = 1000
 
 _USAGE_KNOWN_EXPR = """
 CASE
-    WHEN j.state = 'indeterminate' AND (
+    WHEN j.state IN ('indeterminate', 'pending') AND (
         j.usage->>'usage_known' = 'false'
         OR (
             j.usage->>'usage_known' IS DISTINCT FROM 'true'
@@ -63,7 +63,7 @@ _UNKNOWN_CALLS_EXPR = """
 CASE
     WHEN (j.usage->>'unknown_usage_calls') ~ '^[0-9]+$'
         THEN (j.usage->>'unknown_usage_calls')::int
-    WHEN j.state = 'indeterminate' AND (
+    WHEN j.state IN ('indeterminate', 'pending') AND (
         j.usage->>'usage_known' = 'false'
         OR (
             j.usage->>'usage_known' IS DISTINCT FROM 'true'
@@ -84,6 +84,20 @@ CASE
         )
     ) THEN 1
     ELSE 0
+END
+""".strip()
+
+_BACKFILL_ATTEMPT_EXPR = """
+CASE
+    WHEN j.state = 'pending' THEN GREATEST(1, j.attempt - 1)
+    ELSE j.attempt
+END
+""".strip()
+
+_BACKFILL_OUTCOME_EXPR = """
+CASE
+    WHEN j.state IN ('done', 'failed', 'indeterminate') THEN j.state
+    ELSE 'indeterminate'
 END
 """.strip()
 
@@ -137,7 +151,7 @@ inserted AS (
     )
     SELECT
         j.invocation_id,
-        j.attempt,
+        {_BACKFILL_ATTEMPT_EXPR} AS attempt,
         1,
         j.user_id,
         j.scope_ref,
@@ -145,7 +159,7 @@ inserted AS (
         j.model_key,
         j.provider,
         j.billing_type,
-        j.state,
+        {_BACKFILL_OUTCOME_EXPR} AS outcome,
         j.error_kind,
         j.usage,
         j.cash_usd,
@@ -222,7 +236,7 @@ BEGIN
             )
             SELECT
                 j.invocation_id,
-                j.attempt,
+                {_BACKFILL_ATTEMPT_EXPR} AS attempt,
                 1,
                 j.user_id,
                 j.scope_ref,
@@ -230,7 +244,7 @@ BEGIN
                 j.model_key,
                 j.provider,
                 j.billing_type,
-                j.state,
+                {_BACKFILL_OUTCOME_EXPR} AS outcome,
                 j.error_kind,
                 j.usage,
                 j.cash_usd,
@@ -395,14 +409,49 @@ END $$
 """
 
 
+_CREATE_INDEX_USER_OCCURRED_SQL = """
+CREATE INDEX IF NOT EXISTS ix_dalton_llm_journal_attempts_user_occurred
+ON dalton_llm_journal_attempts (user_id, occurred_at)
+""".strip()
+
+_CREATE_INDEX_SCOPE_SQL = """
+CREATE INDEX IF NOT EXISTS ix_dalton_llm_journal_attempts_scope
+ON dalton_llm_journal_attempts (scope_ref)
+""".strip()
+
+_ADD_FK_NOT_VALID_SQL = """
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'fk_dalton_llm_journal_attempts_invocation'
+          AND conrelid = 'dalton_llm_journal_attempts'::regclass
+    ) THEN
+        ALTER TABLE dalton_llm_journal_attempts
+        ADD CONSTRAINT fk_dalton_llm_journal_attempts_invocation
+        FOREIGN KEY (invocation_id)
+        REFERENCES dalton_llm_journal(invocation_id)
+        ON DELETE CASCADE
+        NOT VALID;
+    END IF;
+END $$
+""".strip()
+
+_VALIDATE_FK_SQL = """
+ALTER TABLE dalton_llm_journal_attempts
+VALIDATE CONSTRAINT fk_dalton_llm_journal_attempts_invocation
+""".strip()
+
+
 def upgrade() -> None:
-    # Phase 1 (DDL transaction): create table + FK + indexes only so the SHARE ROW EXCLUSIVE
-    # lock on `dalton_llm_journal` is released immediately before historical backfill runs.
+    # Phase 1 (DDL transaction): create table with primary key only (NO inline FK yet),
+    # so `dalton_llm_journal` is not locked at all during table creation or backfill.
     op.execute("SET LOCAL lock_timeout = '5s'")
     op.execute(
         """
         CREATE TABLE IF NOT EXISTS dalton_llm_journal_attempts (
-            invocation_id       TEXT NOT NULL REFERENCES dalton_llm_journal(invocation_id) ON DELETE CASCADE,
+            invocation_id       TEXT NOT NULL,
             attempt             INT  NOT NULL,
             call_seq            INT  NOT NULL DEFAULT 1,
             user_id             TEXT,
@@ -424,25 +473,22 @@ def upgrade() -> None:
         )
         """
     )
-    op.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_dalton_llm_journal_attempts_user_occurred
-        ON dalton_llm_journal_attempts (user_id, occurred_at)
-        """
-    )
-    op.execute(
-        """
-        CREATE INDEX IF NOT EXISTS ix_dalton_llm_journal_attempts_scope
-        ON dalton_llm_journal_attempts (scope_ref)
-        """
-    )
 
-    # Phase 2 (separate transactions): commit DDL first, then backfill historical rows in
-    # bounded keyset batches preserving `j.created_at` as `occurred_at` (d042 date attribution).
+    # Phase 2 (autocommit): backfill historical rows in bounded keyset batches (preserving
+    # `j.created_at` as `occurred_at` and mapping in-flight `pending` rows with prior cost to
+    # `GREATEST(1, j.attempt - 1)` / `'indeterminate'`), then build secondary indexes, then
+    # attach the FK as `NOT VALID` (brief metadata-only lock) and validate separately
+    # (`SHARE UPDATE EXCLUSIVE` on child / `ROW SHARE` on parent — does not block writes).
     ctx = op.get_context()
     with ctx.autocommit_block():
         if getattr(ctx, "as_sql", False):
             op.execute(_OFFLINE_BATCHED_BACKFILL_SQL)
+            op.execute(_CREATE_INDEX_USER_OCCURRED_SQL)
+            op.execute(_CREATE_INDEX_SCOPE_SQL)
+            op.execute("SET lock_timeout = '5s'")
+            op.execute(_ADD_FK_NOT_VALID_SQL)
+            op.execute(_VALIDATE_FK_SQL)
+            op.execute("SET lock_timeout = '0'")
         else:
             conn = op.get_bind()
             conn.execute(sa.text("SET lock_timeout = '5s'"))
@@ -461,6 +507,10 @@ def upgrade() -> None:
                     if scanned < _BACKFILL_BATCH_SIZE or not next_last_id:
                         break
                     last_id = str(next_last_id)
+                conn.execute(sa.text(_CREATE_INDEX_USER_OCCURRED_SQL))
+                conn.execute(sa.text(_CREATE_INDEX_SCOPE_SQL))
+                conn.execute(sa.text(_ADD_FK_NOT_VALID_SQL))
+                conn.execute(sa.text(_VALIDATE_FK_SQL))
             finally:
                 conn.execute(sa.text("SET lock_timeout = '0'"))
 
@@ -470,4 +520,8 @@ def downgrade() -> None:
     # Roll up per-request attempt billing, token usage, per_call_usages, and attempt_details
     # back into `dalton_llm_journal` (the table d042 reads) BEFORE dropping the attempts table.
     op.execute(_DOWNGRADE_ROLLUP_SQL)
+    op.execute(
+        "ALTER TABLE IF EXISTS dalton_llm_journal_attempts "
+        "DROP CONSTRAINT IF EXISTS fk_dalton_llm_journal_attempts_invocation"
+    )
     op.execute("DROP TABLE IF EXISTS dalton_llm_journal_attempts CASCADE")

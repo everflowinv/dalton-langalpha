@@ -288,15 +288,55 @@ def _extract_usage_from_sdk_exception(exc: BaseException) -> Dict[str, Any]:
     return {}
 
 
+# DALTON-HOOK(complete-parse-failure-billing): align unbilled pre-stream error detection with
+# provider classification (402/billing only when stream never started, invalid_api_key, text 4xx).
+def _exc_stream_started(exc: BaseException) -> bool:
+    """Return True if the exception (or its causal chain) indicates stream output had already started."""
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if getattr(cur, "stream_started", None) is True:
+            return True
+        raw_chunks = getattr(cur, "chunks_received", None)
+        if isinstance(raw_chunks, int) and not isinstance(raw_chunks, bool) and raw_chunks > 0:
+            return True
+        if getattr(cur, "mid_stream", False) is True:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _extract_structured_err_code(exc: BaseException) -> Optional[str]:
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code:
+        return code
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        top = body.get("code")
+        if isinstance(top, str) and top:
+            return top
+        err_obj = body.get("error")
+        if isinstance(err_obj, dict):
+            nested = err_obj.get("code")
+            if isinstance(nested, str) and nested:
+                return nested
+    return None
+
+
 def _is_unbilled_sdk_error(exc: BaseException) -> bool:
     """Return True for client-side/pre-billing rejections that never incur upstream charges."""
+    if _exc_stream_started(exc):
+        return False
     if isinstance(exc, (NotImplementedError, AttributeError, TypeError, KeyError)):
         return True
     status_code = getattr(exc, "status_code", None)
     if status_code is None:
         resp = getattr(exc, "response", None)
         status_code = getattr(resp, "status_code", None)
-    if isinstance(status_code, int) and status_code in (400, 401, 403, 404, 422, 426):
+    if isinstance(status_code, int) and status_code in (400, 401, 402, 403, 404, 422, 426):
+        return True
+    if _extract_structured_err_code(exc) == "invalid_api_key":
         return True
     cls_name = exc.__class__.__name__
     if cls_name in ("MissingProviderKeyError", "ProviderDisabledError", "ValueError"):
@@ -313,9 +353,21 @@ def _is_unbilled_sdk_error(exc: BaseException) -> bool:
             "oauth_required",
             "requires a connected",
             "unsupported sdk",
+            "used all credits",
+            "monthly spending limit",
+            "need a grok subscription",
+            "usage balance exhausted",
         )
     ):
         return True
+    for code in ("400", "401", "402", "403", "404", "422"):
+        if (
+            f"http {code}" in msg_lower
+            or f"status {code}" in msg_lower
+            or f"status_code={code}" in msg_lower
+            or f"error code: {code}" in msg_lower
+        ):
+            return True
     return False
 
 

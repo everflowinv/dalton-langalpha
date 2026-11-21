@@ -173,11 +173,13 @@ class _FakeCursor:
         }
         if existing is None:
             self._store.attempts[key] = candidate
-            return
+            return candidate
         if insert_only:
-            return
+            return None
         if self._is_crash_placeholder(existing):
             self._store.attempts[key] = candidate
+            return candidate
+        return None
 
     def _record_call_records(
         self,
@@ -188,18 +190,19 @@ class _FakeCursor:
         now: datetime,
         provider: str | None = None,
         billing_type: str | None = None,
-    ) -> None:
+    ) -> list[dict[str, Any]]:
         inv_id = str(parent["invocation_id"])
         if self._attempt_already_settled(inv_id, attempt):
-            return
+            return []
         records = json.loads(records_json)
+        written: list[dict[str, Any]] = []
         for item in records:
             raw_occ = item.get("occurred_at")
             if isinstance(raw_occ, str) and raw_occ:
                 occ = datetime.fromisoformat(raw_occ)
             else:
                 occ = parent.get("claimed_at") or now
-            self._upsert_attempt(
+            res = self._upsert_attempt(
                 parent=parent,
                 attempt=attempt,
                 call_seq=int(item.get("call_seq") or 1),
@@ -214,6 +217,116 @@ class _FakeCursor:
                 provider=provider,
                 billing_type=billing_type,
             )
+            if res is not None:
+                written.append(res)
+        return written
+
+    @staticmethod
+    def _extract_calls_from_usage(u: Any) -> list[dict[str, Any]]:
+        if not isinstance(u, dict):
+            return []
+        raw_calls = u.get("per_call_usages")
+        if isinstance(raw_calls, list) and raw_calls:
+            return [dict(c) for c in raw_calls if isinstance(c, dict)]
+        tok_keys = (
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "cached_tokens",
+            "cache_5m_tokens",
+            "cache_1h_tokens",
+            "reasoning_tokens",
+            "audio_input_tokens",
+            "audio_output_tokens",
+        )
+        single = {
+            k: u[k]
+            for k in tok_keys
+            if isinstance(u.get(k), (int, float)) and not isinstance(u.get(k), bool)
+        }
+        if any(single.get(k, 0) > 0 for k in tok_keys[:6]):
+            return [single]
+        return []
+
+    @classmethod
+    def _merge_usage_dicts_sql_equiv(
+        cls,
+        base: Any,
+        delta: Any,
+        *,
+        strip_credential_holder: bool = False,
+    ) -> dict[str, Any]:
+        tok_keys = (
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "cached_tokens",
+            "cache_5m_tokens",
+            "cache_1h_tokens",
+            "reasoning_tokens",
+            "audio_input_tokens",
+            "audio_output_tokens",
+        )
+        b_dict = dict(base) if isinstance(base, dict) else {}
+        d_dict = dict(delta) if isinstance(delta, dict) else {}
+        merged = {**b_dict, **d_dict}
+        for k in tok_keys:
+            bv = b_dict.get(k)
+            dv = d_dict.get(k)
+            b_num = bv if isinstance(bv, (int, float)) and not isinstance(bv, bool) else 0
+            d_num = dv if isinstance(dv, (int, float)) and not isinstance(dv, bool) else 0
+            if b_num + d_num > 0:
+                merged[k] = b_num + d_num
+        combined_calls = cls._extract_calls_from_usage(b_dict) + cls._extract_calls_from_usage(d_dict)
+        if combined_calls:
+            merged["per_call_usages"] = combined_calls
+        if strip_credential_holder:
+            merged.pop("credential_user_id", None)
+        return merged
+
+    @classmethod
+    def _apply_late_parent_sync(cls, row: dict[str, Any], written: list[dict[str, Any]]) -> None:
+        if not written:
+            return
+        tok_keys = (
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "cached_tokens",
+            "cache_5m_tokens",
+            "cache_1h_tokens",
+            "reasoning_tokens",
+            "audio_input_tokens",
+            "audio_output_tokens",
+        )
+        add_cash = sum((Decimal(str(r.get("cash_usd") or "0")) for r in written), Decimal("0"))
+        add_notional = sum((Decimal(str(r.get("notional_usd") or "0")) for r in written), Decimal("0"))
+        add_tokens: dict[str, int | float] = {}
+        add_calls: list[dict[str, Any]] = []
+        for r in sorted(written, key=lambda item: int(item.get("call_seq") or 1)):
+            ru = r.get("usage")
+            if isinstance(ru, dict):
+                for k in tok_keys:
+                    v = ru.get(k)
+                    if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+                        add_tokens[k] = add_tokens.get(k, 0) + v
+                add_calls.extend(cls._extract_calls_from_usage(ru))
+        if add_cash <= Decimal("0") and add_notional <= Decimal("0") and not add_tokens:
+            return
+        row["cash_usd"] = Decimal(str(row.get("cash_usd") or "0")) + add_cash
+        row["notional_usd"] = Decimal(str(row.get("notional_usd") or "0")) + add_notional
+        if add_tokens:
+            base_u = dict(row.get("usage") or {})
+            for k in tok_keys:
+                bv = base_u.get(k)
+                b_num = bv if isinstance(bv, (int, float)) and not isinstance(bv, bool) else 0
+                tot = b_num + add_tokens.get(k, 0)
+                if tot > 0:
+                    base_u[k] = tot
+            combined_calls = cls._extract_calls_from_usage(row.get("usage")) + add_calls
+            if combined_calls:
+                base_u["per_call_usages"] = combined_calls
+            row["usage"] = base_u
 
     async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
         text = " ".join(sql.split()).upper()
@@ -344,13 +457,22 @@ class _FakeCursor:
             row = rows.get(inv_id)
             if row is not None:
                 parent_snapshot = dict(row)
+                updated_parent = False
                 if (
                     int(row.get("attempt") or 1) == attempt
                     and row.get("state") in ("pending", "indeterminate")
                 ):
+                    updated_parent = True
                     resp_val = json.loads(params[0]) if params[0] is not None else None
                     usage_val = json.loads(params[1]) if params[1] is not None else {}
-                    if "COALESCE(USAGE" in text and isinstance(row.get("usage"), dict):
+                    upd_part = text.split("ALREADY_SETTLED")[0]
+                    if "FROM (VALUES (%S::JSONB)) AS D(U)" in upd_part:
+                        usage_val = self._merge_usage_dicts_sql_equiv(
+                            row.get("usage"),
+                            usage_val,
+                            strip_credential_holder="- 'CREDENTIAL_USER_ID'" in upd_part,
+                        )
+                    elif "COALESCE(USAGE" in upd_part and isinstance(row.get("usage"), dict):
                         merged_u = dict(row["usage"])
                         merged_u.update(usage_val)
                         usage_val = merged_u
@@ -369,7 +491,7 @@ class _FakeCursor:
                     self._one = dict(row)
                 if "DALTON_LLM_JOURNAL_ATTEMPTS" in text:
                     # params: (..., inv_id[8], att[9], provider[10], billing_type[11], records_json[12], inv_id[13], att[14])
-                    self._record_call_records(
+                    written = self._record_call_records(
                         parent=parent_snapshot,
                         attempt=int(params[-1]),
                         records_json=str(params[12]),
@@ -377,20 +499,25 @@ class _FakeCursor:
                         provider=params[10],
                         billing_type=params[11],
                     )
+                    if not updated_parent and "LATE_PARENT_SYNC" in text:
+                        self._apply_late_parent_sync(row, written)
             return
 
         if "UPDATE DALTON_LLM_JOURNAL" in text and "SET STATE = %S" in text:
-            has_usage_param = "USAGE = " in text.split("ALREADY_SETTLED")[0]
+            upd_part = text.split("ALREADY_SETTLED")[0]
+            has_usage_param = "USAGE = " in upd_part
             upd_inv_idx = 6 if has_usage_param else 5
             inv_id = str(params[upd_inv_idx])
             attempt = int(params[upd_inv_idx + 1])
             row = rows.get(inv_id)
             if row is not None:
                 parent_snapshot = dict(row)
+                updated_parent = False
                 if (
                     int(row.get("attempt") or 1) == attempt
                     and row.get("state") in ("pending", "indeterminate")
                 ):
+                    updated_parent = True
                     add_cash = Decimal(str(params[3])) if params[3] is not None else Decimal("0")
                     add_notional = Decimal(str(params[4])) if params[4] is not None else Decimal("0")
                     row.update(
@@ -403,7 +530,13 @@ class _FakeCursor:
                     )
                     if has_usage_param:
                         usage_val = json.loads(params[5])
-                        if "COALESCE(USAGE" in text.split("ALREADY_SETTLED")[0] and isinstance(row.get("usage"), dict):
+                        if "FROM (VALUES (%S::JSONB)) AS D(U)" in upd_part:
+                            usage_val = self._merge_usage_dicts_sql_equiv(
+                                row.get("usage"),
+                                usage_val,
+                                strip_credential_holder="- 'CREDENTIAL_USER_ID'" in upd_part,
+                            )
+                        elif "COALESCE(USAGE" in upd_part and isinstance(row.get("usage"), dict):
                             merged_u = dict(row["usage"])
                             merged_u.update(usage_val)
                             usage_val = merged_u
@@ -411,12 +544,14 @@ class _FakeCursor:
                     self._one = dict(row)
                 if "DALTON_LLM_JOURNAL_ATTEMPTS" in text:
                     # params end with (..., inv_id, att, records_json, inv_id, att)
-                    self._record_call_records(
+                    written = self._record_call_records(
                         parent=parent_snapshot,
                         attempt=int(params[-1]),
                         records_json=str(params[-3]),
                         now=now,
                     )
+                    if not updated_parent and "LATE_PARENT_SYNC" in text:
+                        self._apply_late_parent_sync(row, written)
             return
 
         if "SET USAGE = COALESCE(USAGE" in text and "REPLAY_COUNT" in text:
@@ -1840,11 +1975,17 @@ def test_d043_migration_revision_upgrade_and_downgrade(monkeypatch: pytest.Monke
     assert "CREATE TABLE IF NOT EXISTS dalton_llm_journal_attempts" in joined_up
     assert "PRIMARY KEY (invocation_id, attempt, call_seq)" in joined_up
     assert "ix_dalton_llm_journal_attempts_user_occurred" in joined_up
-    # FK DDL must finish BEFORE autocommit_block starts the batched backfill
+    # Carbon Medium #3: table created WITHOUT inline FK -> autocommit batched backfill ->
+    # secondary indexes -> ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID -> VALIDATE CONSTRAINT.
+    ddl_stmt = next(s for s in executed_up if "CREATE TABLE IF NOT EXISTS dalton_llm_journal_attempts" in s)
+    assert "REFERENCES dalton_llm_journal" not in ddl_stmt
     ddl_idx = joined_up.index("CREATE TABLE IF NOT EXISTS dalton_llm_journal_attempts")
     ac_idx = joined_up.index("-- AUTOCOMMIT_ENTER")
     bf_idx = joined_up.index("INSERT INTO dalton_llm_journal_attempts")
-    assert ddl_idx < ac_idx < bf_idx
+    ix_idx = joined_up.index("ix_dalton_llm_journal_attempts_user_occurred")
+    fk_add_idx = joined_up.index("NOT VALID")
+    fk_val_idx = joined_up.index("VALIDATE CONSTRAINT fk_dalton_llm_journal_attempts_invocation")
+    assert ddl_idx < ac_idx < bf_idx < ix_idx < fk_add_idx < fk_val_idx
     assert "j.created_at AS occurred_at" in joined_up
     assert "COALESCE(j.completed_at, j.created_at)" not in joined_up
     assert "ON CONFLICT (invocation_id, attempt, call_seq) DO NOTHING" in joined_up
@@ -1853,8 +1994,9 @@ def test_d043_migration_revision_upgrade_and_downgrade(monkeypatch: pytest.Monke
     d043.downgrade()
     joined_down = "\n".join(executed_down)
     rollup_idx = joined_down.index("UPDATE dalton_llm_journal j")
+    drop_fk_idx = joined_down.index("DROP CONSTRAINT IF EXISTS fk_dalton_llm_journal_attempts_invocation")
     drop_idx = joined_down.index("DROP TABLE IF EXISTS dalton_llm_journal_attempts CASCADE")
-    assert rollup_idx < drop_idx
+    assert rollup_idx < drop_fk_idx < drop_idx
 
 
 # ---------------------------------------------------------------------------
@@ -2443,10 +2585,11 @@ async def test_unsent_config_timeout_and_xai_402_pre_stream_not_counted_as_unkno
 def test_d043_upgrade_separates_fk_ddl_and_batched_backfill_transactions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Round 3 Medium #7 (d043:37) & High #2 backfill:
-    Online upgrade runs FK table + index creation in Transaction 1, exits into `autocommit_block()`
-    (releasing the SHARE ROW EXCLUSIVE lock on `dalton_llm_journal`), then backfills historical
-    rows across multiple keyset batches using `j.created_at AS occurred_at`."""
+    """Round 3 Medium #7 & Round 4 Carbon Medium #3 (d043):
+    Online upgrade creates the table WITHOUT inline FK in Transaction 1, enters `autocommit_block()`,
+    runs bounded keyset backfill batches (`j.created_at AS occurred_at`), then builds secondary
+    indexes, then attaches FK as `NOT VALID`, and finally validates the FK constraint separately
+    so `dalton_llm_journal` writes are never blocked during backfill."""
     import contextlib
     from src.dalton.migrations.versions import d043_llm_journal_attempts as d043
 
@@ -2475,6 +2618,15 @@ def test_d043_upgrade_separates_fk_ddl_and_batched_backfill_transactions(
                 events.append("backfill_batch")
                 batch_params.append(dict(params or {}))
                 return _FakeResult(batch_responses[len(batch_params) - 1])
+            if "CREATE INDEX" in sql_text:
+                events.append("create_index")
+                return _FakeResult((None, 0))
+            if "NOT VALID" in sql_text and "ADD CONSTRAINT fk_dalton_llm_journal_attempts_invocation" in sql_text:
+                events.append("add_fk_not_valid")
+                return _FakeResult((None, 0))
+            if "VALIDATE CONSTRAINT fk_dalton_llm_journal_attempts_invocation" in sql_text:
+                events.append("validate_fk")
+                return _FakeResult((None, 0))
             events.append(f"conn_sql:{sql_text.strip()}")
             return _FakeResult((None, 0))
 
@@ -2491,25 +2643,33 @@ def test_d043_upgrade_separates_fk_ddl_and_batched_backfill_transactions(
 
     monkeypatch.setattr(d043.op, "get_context", lambda: _OnlineCtx())
     monkeypatch.setattr(d043.op, "get_bind", lambda: _FakeBind())
-    monkeypatch.setattr(
-        d043.op,
-        "execute",
-        lambda sql: events.append(
-            "create_table"
-            if "CREATE TABLE" in str(sql)
-            else ("create_index" if "CREATE INDEX" in str(sql) else f"op_sql:{str(sql).strip()}")
-        ),
-    )
+
+    def _rec_op_exec(sql: Any) -> None:
+        s = str(sql)
+        if "CREATE TABLE" in s:
+            assert "REFERENCES dalton_llm_journal" not in s
+            events.append("create_table_no_fk")
+        elif "CREATE INDEX" in s:
+            events.append("create_index")
+        else:
+            events.append(f"op_sql:{s.strip()}")
+
+    monkeypatch.setattr(d043.op, "execute", _rec_op_exec)
 
     d043.upgrade()
 
-    assert events.index("create_table") < events.index("autocommit_enter")
-    assert events.index("create_index") < events.index("autocommit_enter")
     ac_enter = events.index("autocommit_enter")
     ac_exit = events.index("autocommit_exit")
+    assert events.index("create_table_no_fk") < ac_enter
     batch_indices = [i for i, e in enumerate(events) if e == "backfill_batch"]
+    index_indices = [i for i, e in enumerate(events) if e == "create_index"]
+    fk_add_idx = events.index("add_fk_not_valid")
+    fk_val_idx = events.index("validate_fk")
     assert len(batch_indices) == 3
+    assert len(index_indices) == 2
     assert all(ac_enter < i < ac_exit for i in batch_indices)
+    assert max(batch_indices) < min(index_indices)
+    assert max(index_indices) < fk_add_idx < fk_val_idx < ac_exit
     assert batch_params == [
         {"last_id": "", "batch_size": 1000},
         {"last_id": "lj1:1000", "batch_size": 1000},
@@ -2604,10 +2764,14 @@ async def test_d043_downgrade_rolls_up_late_settled_attempts_into_parent_before_
     release_att1.set()
     await task1
 
-    # Confirm the exact pre-downgrade hazard: parent row only has c2, while attempts has c1 + c2.
-    assert store.rows[inv_id]["cash_usd"] == c2
+    # Round 4 Carbon Medium #4 already syncs late attempt 1 back into parent; also seed a
+    # lagging parent row (simulating a pre-r4 row where parent only holds c2 while attempts has c1+c2)
+    # to prove d043.downgrade() rolls up lagging rows AND is idempotent on already-synced rows.
+    assert store.rows[inv_id]["cash_usd"] == c1 + c2
     assert store.attempts[(inv_id, 1, 1)]["cash_usd"] == c1
     assert store.attempts[(inv_id, 2, 1)]["cash_usd"] == c2
+    store.rows[inv_id]["cash_usd"] = c2
+    store.rows[inv_id]["usage"] = {**u2, "total_tokens": u2["input_tokens"] + u2["output_tokens"]}
 
     # Execute d043.downgrade(), verifying rollup SQL runs BEFORE DROP TABLE and mirrors its semantics
     downgrade_steps: list[str] = []
@@ -2700,3 +2864,674 @@ async def test_d043_downgrade_rolls_up_late_settled_attempts_into_parent_before_
         Decimal("0"),
     )
     assert d042_cash == c1 + c2
+
+
+# ---------------------------------------------------------------------------
+# Round 4 review fixes (all High & Medium items from .agy/review_billing2_carbon.md)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_d043_backfill_pending_row_with_prior_cost_maps_outcome_and_prior_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Carbon High #1 (d043:45, 93-101, 155-160):
+    A historical `done` row (`persist_raw=False` / `persist_response=False` / pruned `response`)
+    with `cash_usd > 0` (and an OAuth row with `notional_usd > 0`) is reclaimed into
+    `state = 'pending', attempt >= 2` when `d043` backfill runs.
+    Backfill MUST:
+    1) Never insert `outcome = 'pending'` (which violates `CHECK (outcome IN ('done', 'failed', 'indeterminate'))`).
+    2) Write prior cost to `GREATEST(1, j.attempt - 1)` instead of occupying in-flight `j.attempt`.
+    3) Leave in-flight `attempt = 2` free so when attempt 2 completes, BOTH c1 and c2 are billed."""
+    from src.dalton.migrations.versions import d043_llm_journal_attempts as d043
+
+    # Verify both online and offline backfill SQL use safe attempt/outcome mapping
+    for sql_text in (d043._ONLINE_BACKFILL_BATCH_SQL, d043._OFFLINE_BATCHED_BACKFILL_SQL):
+        assert "WHEN j.state = 'pending' THEN GREATEST(1, j.attempt - 1)" in sql_text
+        assert "WHEN j.state IN ('done', 'failed', 'indeterminate') THEN j.state" in sql_text
+        assert "ELSE 'indeterminate'" in sql_text
+        assert "WHEN j.state IN ('indeterminate', 'pending') AND (" in sql_text
+
+    t0 = datetime(2026, 11, 21, 9, 0, 0, tzinfo=timezone.utc)
+    store = _InMemoryJournalStore(now_fn=lambda: t0)
+    _wire_journal_and_budget(monkeypatch, store)
+
+    u1 = {"input_tokens": 10_000, "output_tokens": 500}
+    u2 = {"input_tokens": 12_000, "output_tokens": 600}
+    c1, _ = compute_call_costs("grok-4.7", "platform", u1)
+    c2, _ = compute_call_costs("grok-4.7", "platform", u2)
+    _, n1 = compute_call_costs("muse-ember-1.0-oauth", "oauth", u1)
+    assert c1 > Decimal("0") and c2 > Decimal("0") and n1 > Decimal("0")
+
+    # 1. Historical done row with persist_response=False (response=None) -> reclaimed into pending attempt=2
+    svc1 = _make_real_llm_service(
+        monkeypatch,
+        chat_model=_SequencedChatModel([_ai_msg('{"verdict": "pass", "reason": "v1"}', **u1)]),
+        model_key="grok-4.7",
+        max_parsing_retries=1,
+    )
+    res1 = await dalton_complete(
+        svc1,
+        user_id="u1",
+        user_prompt="reclaimed pending backfill",
+        scope_ref="review:carbon-h1-cash",
+        purpose="publish.review",
+        request_model="grok-4.7",
+        response_schema=_VerdictSchema,
+        persist_response=False,
+    )
+    assert res1.ok is True
+    inv_cash = res1.invocation_id
+    # Simulate pre-d043 state (attempts table doesn't exist yet) and reclaim into state='pending', attempt=2
+    store.attempts.clear()
+    act2, row2 = await journal_db.claim_journal_invocation(
+        invocation_id=inv_cash,
+        user_id="u1",
+        scope_ref="review:carbon-h1-cash",
+        purpose="publish.review",
+        model_key="grok-4.7",
+        provider="xai",
+        billing_type="platform",
+        request_hash=store.rows[inv_cash]["request_hash"],
+        conn=store.conn(),
+    )
+    assert act2 == "claimed"
+    assert row2["state"] == "pending"
+    assert row2["attempt"] == 2
+    assert row2["cash_usd"] == c1
+
+    # Also seed a pre-d043 OAuth row reclaimed into state='pending', attempt=3 with prior notional_usd
+    # and prior unknown_usage_calls=1 (from an earlier indeterminate attempt)
+    inv_oauth = "lj1:carbon-h1-oauth-pending"
+    store.rows[inv_oauth] = {
+        "invocation_id": inv_oauth,
+        "user_id": "u1",
+        "scope_ref": "review:carbon-h1-oauth",
+        "purpose": "publish.review",
+        "model_key": "muse-ember-1.0-oauth",
+        "provider": "muse-oauth",
+        "billing_type": "oauth",
+        "request_hash": "hash-oauth",
+        "state": "pending",
+        "attempt": 3,
+        "cash_usd": Decimal("0"),
+        "notional_usd": n1,
+        "usage": {**u1, "usage_known": False, "unknown_usage_calls": 1},
+        "response": None,
+        "error_kind": None,
+        "error_text": None,
+        "claimed_at": t0,
+        "completed_at": None,
+        "created_at": t0,
+    }
+
+    # Emulate d043 backfill SQL semantics WITH strict CHECK constraint enforcement
+    allowed_outcomes = {"done", "failed", "indeterminate"}
+    for inv_id, j in store.rows.items():
+        if not (
+            j["state"] in ("done", "indeterminate")
+            or Decimal(str(j["cash_usd"])) > Decimal("0")
+            or Decimal(str(j["notional_usd"])) > Decimal("0")
+        ):
+            continue
+        if any(a_inv == inv_id for a_inv, _att, _seq in store.attempts):
+            continue
+        bf_attempt = max(1, int(j["attempt"]) - 1) if j["state"] == "pending" else int(j["attempt"])
+        bf_outcome = j["state"] if j["state"] in allowed_outcomes else "indeterminate"
+        # Strict CHECK (outcome IN ('done', 'failed', 'indeterminate'))
+        assert bf_outcome in allowed_outcomes, f"CHECK violation: outcome={bf_outcome!r}"
+        j_usage = j.get("usage") or {}
+        u_known_flag = j_usage.get("usage_known")
+        u_unk_raw = j_usage.get("unknown_usage_calls")
+        if isinstance(u_unk_raw, int) and u_unk_raw >= 0:
+            bf_unk = u_unk_raw
+        elif j["state"] in ("indeterminate", "pending") and u_known_flag is False:
+            bf_unk = 1
+        else:
+            bf_unk = 0
+        bf_known = not (j["state"] in ("indeterminate", "pending") and u_known_flag is False)
+        store.attempts[(inv_id, bf_attempt, 1)] = {
+            "invocation_id": inv_id,
+            "attempt": bf_attempt,
+            "call_seq": 1,
+            "user_id": j["user_id"],
+            "scope_ref": j["scope_ref"],
+            "purpose": j["purpose"],
+            "model_key": j["model_key"],
+            "provider": j["provider"],
+            "billing_type": j["billing_type"],
+            "outcome": bf_outcome,
+            "error_kind": j["error_kind"],
+            "usage": dict(j_usage),
+            "cash_usd": Decimal(str(j["cash_usd"])),
+            "notional_usd": Decimal(str(j["notional_usd"])),
+            "usage_known": bf_known,
+            "unknown_usage_calls": bf_unk,
+            "occurred_at": j["created_at"],
+            "created_at": j["created_at"],
+        }
+
+    # Verify backfilled rows landed on prior attempt (attempt-1), NOT in-flight attempt
+    assert (inv_cash, 1, 1) in store.attempts
+    assert (inv_cash, 2, 1) not in store.attempts
+    assert store.attempts[(inv_cash, 1, 1)]["outcome"] == "indeterminate"
+    assert store.attempts[(inv_cash, 1, 1)]["cash_usd"] == c1
+    assert store.attempts[(inv_cash, 1, 1)]["usage_known"] is True
+    assert store.attempts[(inv_cash, 1, 1)]["unknown_usage_calls"] == 0
+
+    assert (inv_oauth, 2, 1) in store.attempts
+    assert (inv_oauth, 3, 1) not in store.attempts
+    assert store.attempts[(inv_oauth, 2, 1)]["outcome"] == "indeterminate"
+    assert store.attempts[(inv_oauth, 2, 1)]["notional_usd"] == n1
+    assert store.attempts[(inv_oauth, 2, 1)]["usage_known"] is False
+    assert store.attempts[(inv_oauth, 2, 1)]["unknown_usage_calls"] == 1
+
+    # Now in-flight Attempt 2 completes `done` with c2 -> MUST NOT collide with backfilled Attempt 1!
+    done_row = await journal_db.complete_journal_done(
+        inv_cash,
+        attempt=2,
+        response={"kind": "structured", "data": {"verdict": "pass", "reason": "v2"}},
+        usage={**u1, **u2},
+        attempt_usage=u2,
+        cash_usd=c2,
+        notional_usd=Decimal("0"),
+        provider="xai",
+        billing_type="platform",
+        occurred_at=t0,
+        conn=store.conn(),
+    )
+    assert done_row is not None
+    assert store.attempts[(inv_cash, 1, 1)]["cash_usd"] == c1
+    assert store.attempts[(inv_cash, 2, 1)]["cash_usd"] == c2
+    assert store.rows[inv_cash]["cash_usd"] == c1 + c2
+
+    summary = await budget_svc.reconcile_and_summarize_day(store.conn(), "u1", now_utc=t0)
+    assert summary["journal_cash_usd"] == pytest.approx(float(c1 + c2))
+    assert summary["subscription_notional_usd"] == pytest.approx(float(n1))
+    assert summary["journal_unknown_usage_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallback_kind", ["http_400", "http_422", "xai_pre_stream_billing"])
+async def test_native_unknown_failure_then_fallback_unbilled_4xx_marks_indeterminate_not_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    fallback_kind: str,
+) -> None:
+    """Carbon High #2 (complete.py:1346-1374, api_call.py:458-524):
+    With `response_schema`, native `client.ainvoke` fails with a 503/timeout without usage
+    (`unknown_calls=1`, `has_usage=False`), then `make_api_call` enters fallback where `llm.ainvoke`
+    fails with a deterministic unbilled error (HTTP 400 / HTTP 422 / xAI pre-stream billing).
+    Parent `state` and `DaltonCompleteResult.status` MUST be escalated to `'indeterminate'`
+    (NOT `'failed'`), blocking auto-resend (`resend_indeterminate=False`) and `assist_json` fallback."""
+    from src.dalton.llm import assist as assist_mod
+    from src.dalton.llm.providers.xai_grok.client import mark_xai_exception
+
+    store = _InMemoryJournalStore()
+    _wire_journal_and_budget(monkeypatch, store)
+
+    native_err = RuntimeError("HTTP 503 Service Unavailable")
+    setattr(native_err, "status_code", 503)
+
+    if fallback_kind == "http_400":
+        fb_err: BaseException = RuntimeError("HTTP 400 Bad Request: context length exceeded")
+        setattr(fb_err, "status_code", 400)
+        model_key = "grok-4.7"
+        cred_src = CredentialSource.PLATFORM
+    elif fallback_kind == "http_422":
+        fb_err = RuntimeError("HTTP 422 Unprocessable Entity: schema too large")
+        setattr(fb_err, "status_code", 422)
+        model_key = "grok-4.7"
+        cred_src = CredentialSource.PLATFORM
+    else:
+        fb_err = mark_xai_exception(
+            RuntimeError("HTTP 402 Payment Required: usage balance exhausted"),
+            stream_started=False,
+            chunks_received=0,
+        )
+        setattr(fb_err, "status_code", 402)
+        model_key = "grok-4.7-oauth"
+        cred_src = CredentialSource.OAUTH
+
+    chat_model = _SequencedChatModel(
+        [fb_err],
+        structured_responses=[native_err],
+    )
+    svc = _make_real_llm_service(
+        monkeypatch,
+        chat_model=chat_model,
+        model_key=model_key,
+        credential_source=cred_src,
+        max_parsing_retries=2,
+    )
+
+    res = await dalton_complete(
+        svc,
+        user_id="u1",
+        user_prompt="check report",
+        scope_ref=f"review:carbon-h2-{fallback_kind}",
+        purpose="publish.review",
+        request_model=model_key,
+        response_schema=_VerdictSchema,
+    )
+
+    assert chat_model.structured_calls == 1
+    assert chat_model.ainvoke_calls == 1
+    assert res.ok is False
+    assert res.status == "indeterminate"
+    assert res.usage["usage_known"] is False
+    assert res.usage["unknown_usage_calls"] == 1
+
+    row = store.rows[res.invocation_id]
+    assert row["state"] == "indeterminate"
+    assert row["usage"]["usage_known"] is False
+    assert row["usage"]["unknown_usage_calls"] == 1
+
+    # Attempt ledger distinguishes Request 1 (unknown 503) vs Request 2 (unbilled 4xx/billing)
+    assert store.attempts[(res.invocation_id, 1, 1)]["outcome"] == "indeterminate"
+    assert store.attempts[(res.invocation_id, 1, 1)]["unknown_usage_calls"] == 1
+    assert store.attempts[(res.invocation_id, 1, 2)]["outcome"] == "failed"
+    assert store.attempts[(res.invocation_id, 1, 2)]["unknown_usage_calls"] == 0
+
+    # `assist_json` MUST NOT treat this result as safe to fall back (would double-bill!)
+    assert assist_mod._is_safe_to_fallback(res) is False
+
+    # Re-calling `dalton_complete` with `resend_indeterminate=False` MUST refuse auto-resend!
+    res_again = await dalton_complete(
+        svc,
+        user_id="u1",
+        user_prompt="check report",
+        scope_ref=f"review:carbon-h2-{fallback_kind}",
+        purpose="publish.review",
+        request_model=model_key,
+        response_schema=_VerdictSchema,
+        resend_indeterminate=False,
+    )
+    assert res_again.ok is False
+    assert res_again.status == "indeterminate"
+    assert chat_model.structured_calls == 1  # ZERO extra upstream calls
+    assert chat_model.ainvoke_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_attempt_late_settlement_syncs_parent_for_cache_replay_and_pending_takeover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Carbon Medium #4 (llm_journal.py:580-629, 773-819):
+    Case A: Attempt 1 goes past `stale_after_s`, Attempt 2 takes over and completes `done`
+      (`u2, c2, n2`), then stale Attempt 1 returns late (`u1, c1, n1`). Parent row MUST keep
+      Attempt 2's `state='done'`, `attempt=2`, `response='fresh_v2'` while syncing `c1+c2`,
+      `n1+n2`, and summed token `usage` (`per_call_usages` len 2) back into `dalton_llm_journal`,
+      so a subsequent cache replay returns full cumulative `usage` and `notional_usd`!
+    Case B: Stale Attempt 1 returns late while Attempt 2 is STILL `pending`, then Attempt 2
+      finishes `done`. Attempt 2's settlement MUST NOT overwrite Attempt 1's late-synced `usage`."""
+    t0 = datetime(2026, 11, 21, 11, 0, 0, tzinfo=timezone.utc)
+    clock = {"now": t0}
+    store = _InMemoryJournalStore(now_fn=lambda: clock["now"])
+    _wire_journal_and_budget(monkeypatch, store)
+    monkeypatch.setattr(
+        journal_db,
+        "_is_stale",
+        lambda claimed_at, stale_after_s, now_utc=None: (
+            (clock["now"] - claimed_at) > timedelta(seconds=max(1, int(stale_after_s)))
+            if isinstance(claimed_at, datetime)
+            else False
+        ),
+    )
+
+    u1 = {"input_tokens": 100_000, "output_tokens": 1_000}
+    u2 = {"input_tokens": 150_000, "output_tokens": 1_500}
+    _, n1 = compute_call_costs("muse-ember-1.0-oauth", "oauth", u1)
+    _, n2 = compute_call_costs("muse-ember-1.0-oauth", "oauth", u2)
+    assert n1 > Decimal("0") and n2 > Decimal("0")
+
+    # --- Case A: Late Attempt 1 returns AFTER Attempt 2 completed `done` (OAuth notional + cache replay) ---
+    a1_started = asyncio.Event()
+    a1_release = asyncio.Event()
+
+    async def _slow_a1() -> AIMessage:
+        a1_started.set()
+        await a1_release.wait()
+        return _ai_msg('{"verdict": "stale_v1", "reason": "late"}', **u1)
+
+    svc_a1 = _make_real_llm_service(
+        monkeypatch,
+        chat_model=_SequencedChatModel([_slow_a1]),
+        model_key="muse-ember-1.0-oauth",
+        credential_source=CredentialSource.OAUTH,
+        max_parsing_retries=1,
+    )
+    task_a1 = asyncio.create_task(
+        dalton_complete(
+            svc_a1,
+            user_id="u1",
+            user_prompt="stale replay check",
+            scope_ref="review:carbon-m4-case-a",
+            purpose="publish.review",
+            request_model="muse-ember-1.0-oauth",
+            response_schema=_VerdictSchema,
+            stale_after_s=10,
+            resend_indeterminate=True,
+        )
+    )
+    await a1_started.wait()
+
+    clock["now"] = t0 + timedelta(seconds=60)
+    svc_a2 = _make_real_llm_service(
+        monkeypatch,
+        chat_model=_SequencedChatModel(
+            [_ai_msg('{"verdict": "fresh_v2", "reason": "winner"}', **u2)]
+        ),
+        model_key="muse-ember-1.0-oauth",
+        credential_source=CredentialSource.OAUTH,
+        max_parsing_retries=1,
+    )
+    res_a2 = await dalton_complete(
+        svc_a2,
+        user_id="u1",
+        user_prompt="stale replay check",
+        scope_ref="review:carbon-m4-case-a",
+        purpose="publish.review",
+        request_model="muse-ember-1.0-oauth",
+        response_schema=_VerdictSchema,
+        stale_after_s=10,
+        resend_indeterminate=True,
+    )
+    inv_a = res_a2.invocation_id
+    assert res_a2.ok is True and res_a2.attempt == 2
+
+    # Stale Attempt 1 now returns late -> syncs notional_usd & usage back to parent without clobbering v2
+    clock["now"] = t0 + timedelta(seconds=90)
+    a1_release.set()
+    await task_a1
+
+    parent_a = store.rows[inv_a]
+    assert parent_a["state"] == "done"
+    assert parent_a["attempt"] == 2
+    assert parent_a["response"]["data"]["verdict"] == "fresh_v2"
+    assert parent_a["cash_usd"] == Decimal("0")
+    assert parent_a["notional_usd"] == n1 + n2
+    assert parent_a["usage"]["input_tokens"] == 250_000
+    assert parent_a["usage"]["output_tokens"] == 2_500
+    assert len(parent_a["usage"]["per_call_usages"]) == 2
+
+    # Duplicate late writeback for Attempt 1 MUST be idempotent (zero double count)
+    dup_res = await journal_db.complete_journal_done(
+        inv_a,
+        attempt=1,
+        response={"kind": "structured", "data": {"verdict": "dup"}},
+        usage=u1,
+        cash_usd=Decimal("0"),
+        notional_usd=n1,
+        conn=store.conn(),
+    )
+    assert dup_res is None
+    assert store.rows[inv_a]["notional_usd"] == n1 + n2
+    assert store.rows[inv_a]["usage"]["input_tokens"] == 250_000
+
+    # Subsequent cache replay returns full cumulative usage and notional_usd!
+    replay_svc = create_autospec(llm_svc_mod.LLMService, instance=True)
+    replayed = await dalton_complete(
+        replay_svc,
+        user_id="u1",
+        user_prompt="stale replay check",
+        scope_ref="review:carbon-m4-case-a",
+        purpose="publish.review",
+        request_model="muse-ember-1.0-oauth",
+        response_schema=_VerdictSchema,
+    )
+    replay_svc.complete.assert_not_awaited()
+    assert replayed.ok is True
+    assert replayed.cached is True
+    assert replayed.replayed is True
+    assert replayed.data.verdict == "fresh_v2"
+    assert replayed.cash_usd == 0.0
+    assert replayed.notional_usd == pytest.approx(float(n1 + n2))
+    assert replayed.usage["input_tokens"] == 250_000
+    assert replayed.usage["output_tokens"] == 2_500
+    assert len(replayed.usage["per_call_usages"]) == 2
+
+    # --- Case B: Late Attempt 1 returns WHILE Attempt 2 is still `pending`, then Attempt 2 completes ---
+    c1, _ = compute_call_costs("grok-4.7", "platform", u1)
+    c2, _ = compute_call_costs("grok-4.7", "platform", u2)
+    b1_started = asyncio.Event()
+    b1_release = asyncio.Event()
+    b2_started = asyncio.Event()
+    b2_release = asyncio.Event()
+
+    async def _slow_b1() -> AIMessage:
+        b1_started.set()
+        await b1_release.wait()
+        return _ai_msg('{"verdict": "b1_late", "reason": "late"}', **u1)
+
+    async def _slow_b2() -> AIMessage:
+        b2_started.set()
+        await b2_release.wait()
+        return _ai_msg('{"verdict": "b2_fresh", "reason": "winner"}', **u2)
+
+    clock["now"] = t0
+    svc_b1 = _make_real_llm_service(
+        monkeypatch, chat_model=_SequencedChatModel([_slow_b1]), model_key="grok-4.7", max_parsing_retries=1
+    )
+    task_b1 = asyncio.create_task(
+        dalton_complete(
+            svc_b1,
+            user_id="u1",
+            user_prompt="stale pending race",
+            scope_ref="review:carbon-m4-case-b",
+            purpose="publish.review",
+            request_model="grok-4.7",
+            response_schema=_VerdictSchema,
+            stale_after_s=10,
+            resend_indeterminate=True,
+        )
+    )
+    await b1_started.wait()
+
+    clock["now"] = t0 + timedelta(seconds=60)
+    svc_b2 = _make_real_llm_service(
+        monkeypatch, chat_model=_SequencedChatModel([_slow_b2]), model_key="grok-4.7", max_parsing_retries=1
+    )
+    task_b2 = asyncio.create_task(
+        dalton_complete(
+            svc_b2,
+            user_id="u1",
+            user_prompt="stale pending race",
+            scope_ref="review:carbon-m4-case-b",
+            purpose="publish.review",
+            request_model="grok-4.7",
+            response_schema=_VerdictSchema,
+            stale_after_s=10,
+            resend_indeterminate=True,
+        )
+    )
+    await b2_started.wait()
+
+    # Attempt 1 finishes while Attempt 2 is still in flight (pending)
+    clock["now"] = t0 + timedelta(seconds=70)
+    b1_release.set()
+    res_b1 = await task_b1
+    inv_b = res_b1.invocation_id
+    assert store.rows[inv_b]["state"] == "pending"
+    assert store.rows[inv_b]["attempt"] == 2
+    assert store.rows[inv_b]["cash_usd"] == c1
+    assert store.rows[inv_b]["usage"]["input_tokens"] == 100_000
+
+    # Now Attempt 2 finishes -> parent MUST keep c1+c2 AND u1+u2 (never clobber u1!)
+    clock["now"] = t0 + timedelta(seconds=80)
+    b2_release.set()
+    res_b2 = await task_b2
+    assert res_b2.ok is True and res_b2.attempt == 2
+    parent_b = store.rows[inv_b]
+    assert parent_b["state"] == "done"
+    assert parent_b["attempt"] == 2
+    assert parent_b["response"]["data"]["verdict"] == "b2_fresh"
+    assert parent_b["cash_usd"] == c1 + c2
+    assert parent_b["usage"]["input_tokens"] == 250_000
+    assert parent_b["usage"]["output_tokens"] == 2_500
+    assert len(parent_b["usage"]["per_call_usages"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_unbilled_402_billing_muse_invalid_api_key_and_text_4xx_never_count_unknown_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Carbon Medium #5 (api_call.py:277-305, 341-345, complete.py:1356-1376, llm_journal.py:56-65):
+    1) Single calls encountering non-xAI pre-stream HTTP 402, xAI pre-stream 'used all credits'
+       (without status_code), muse-oauth structured `invalid_api_key` (without status_code), or
+       text-only 'HTTP 400'/'status 401' MUST record `state='failed', unknown_usage_calls=0`.
+    2) Parse retry where Call 1 returns bad JSON WITH usage u1 (c1) and Call 2 hits pre-stream
+       HTTP 402 (or xAI 'usage balance exhausted') MUST bill c1 with `usage_known=True,
+       unknown_usage_calls=0` (no false unknown-usage in summary or by_provider).
+    3) Direct `_is_unbilled_sdk_error` aligns with `_classify_exception` and STILL returns False
+       for mid-stream 402 (`stream_started=True` / `chunks_received > 0`)."""
+    from src.dalton.llm.providers.xai_grok.client import mark_xai_exception
+
+    store = _InMemoryJournalStore()
+    _wire_journal_and_budget(monkeypatch, store)
+
+    # 1a. Non-xAI pre-stream HTTP 402
+    err_402 = RuntimeError("Payment required: insufficient balance")
+    setattr(err_402, "status_code", 402)
+    assert api_call_mod._is_unbilled_sdk_error(err_402) is True
+    svc_402 = _make_real_llm_service(
+        monkeypatch,
+        chat_model=_SequencedChatModel([err_402]),
+        model_key="gpt-6.1-terra",
+        max_parsing_retries=1,
+    )
+    res_402 = await dalton_complete(
+        svc_402,
+        user_id="u1",
+        user_prompt="single 402",
+        scope_ref="review:carbon-m5-402",
+        purpose="publish.review",
+        request_model="gpt-6.1-terra",
+        response_schema=_VerdictSchema,
+    )
+    assert res_402.ok is False
+    assert res_402.status == "failed"
+    assert res_402.error_kind == "http_402"
+    assert store.attempts[(res_402.invocation_id, 1, 1)]["unknown_usage_calls"] == 0
+    assert store.attempts[(res_402.invocation_id, 1, 1)]["usage_known"] is True
+
+    # 1b. xAI pre-stream "used all credits" WITHOUT numeric status_code
+    err_xai_credits = mark_xai_exception(
+        RuntimeError("You have used all credits for this billing cycle"),
+        stream_started=False,
+        chunks_received=0,
+    )
+    assert api_call_mod._is_unbilled_sdk_error(err_xai_credits) is True
+    svc_xai = _make_real_llm_service(
+        monkeypatch,
+        chat_model=_SequencedChatModel([err_xai_credits]),
+        model_key="grok-4.7-oauth",
+        credential_source=CredentialSource.OAUTH,
+        max_parsing_retries=1,
+    )
+    res_xai = await dalton_complete(
+        svc_xai,
+        user_id="u1",
+        user_prompt="xai credits",
+        scope_ref="review:carbon-m5-xai-credits",
+        purpose="publish.review",
+        request_model="grok-4.7-oauth",
+        response_schema=_VerdictSchema,
+    )
+    assert res_xai.status == "failed"
+    assert res_xai.error_kind == "billing"
+    assert store.attempts[(res_xai.invocation_id, 1, 1)]["unknown_usage_calls"] == 0
+
+    # 1c. muse-oauth structured `invalid_api_key` WITHOUT numeric status_code
+    err_muse_key = RuntimeError("Authentication rejected")
+    setattr(err_muse_key, "code", "invalid_api_key")
+    assert api_call_mod._is_unbilled_sdk_error(err_muse_key) is True
+    svc_muse = _make_real_llm_service(
+        monkeypatch,
+        chat_model=_SequencedChatModel([err_muse_key]),
+        model_key="muse-ember-1.0-oauth",
+        credential_source=CredentialSource.OAUTH,
+        max_parsing_retries=1,
+    )
+    res_muse = await dalton_complete(
+        svc_muse,
+        user_id="u1",
+        user_prompt="muse invalid key",
+        scope_ref="review:carbon-m5-muse-key",
+        purpose="publish.review",
+        request_model="muse-ember-1.0-oauth",
+        response_schema=_VerdictSchema,
+    )
+    assert res_muse.status == "failed"
+    assert res_muse.error_kind == "auth_expired"
+    assert store.attempts[(res_muse.invocation_id, 1, 1)]["unknown_usage_calls"] == 0
+
+    # 1d. Text-only 4xx ("HTTP 400" / "status 401") WITHOUT numeric status_code
+    err_text_400 = RuntimeError("Provider returned HTTP 400: malformed prompt")
+    err_text_401 = RuntimeError("Upstream rejected with status 401 unauthorized")
+    assert api_call_mod._is_unbilled_sdk_error(err_text_400) is True
+    assert api_call_mod._is_unbilled_sdk_error(err_text_401) is True
+    svc_t400 = _make_real_llm_service(
+        monkeypatch,
+        chat_model=_SequencedChatModel([err_text_400]),
+        model_key="grok-4.7",
+        max_parsing_retries=1,
+    )
+    res_t400 = await dalton_complete(
+        svc_t400,
+        user_id="u1",
+        user_prompt="text 400",
+        scope_ref="review:carbon-m5-text-400",
+        purpose="publish.review",
+        request_model="grok-4.7",
+        response_schema=_VerdictSchema,
+    )
+    assert res_t400.status == "failed"
+    assert res_t400.error_kind == "http_4xx"
+    assert store.attempts[(res_t400.invocation_id, 1, 1)]["unknown_usage_calls"] == 0
+
+    # 2. Parse retry: Call 1 returns bad JSON WITH usage u1 (c1), Call 2 hits pre-stream HTTP 402
+    u1 = {"input_tokens": 10_000, "output_tokens": 500}
+    c1, _ = compute_call_costs("gpt-6.1-terra", "platform", u1)
+    assert c1 > Decimal("0")
+    retry_402 = RuntimeError("HTTP 402 Payment Required: balance exhausted")
+    setattr(retry_402, "status_code", 402)
+    svc_retry_402 = _make_real_llm_service(
+        monkeypatch,
+        chat_model=_SequencedChatModel([_ai_msg("not json", **u1), retry_402]),
+        model_key="gpt-6.1-terra",
+        max_parsing_retries=2,
+    )
+    res_retry = await dalton_complete(
+        svc_retry_402,
+        user_id="u1",
+        user_prompt="retry then 402",
+        scope_ref="review:carbon-m5-retry-402",
+        purpose="publish.review",
+        request_model="gpt-6.1-terra",
+        response_schema=_VerdictSchema,
+    )
+    assert res_retry.ok is False
+    assert res_retry.status == "indeterminate"  # Call 1 was billed!
+    assert res_retry.cash_usd == pytest.approx(float(c1))
+    assert res_retry.usage["usage_known"] is True
+    assert res_retry.usage["unknown_usage_calls"] == 0
+    assert store.attempts[(res_retry.invocation_id, 1, 1)]["cash_usd"] == c1
+    assert store.attempts[(res_retry.invocation_id, 1, 1)]["unknown_usage_calls"] == 0
+    assert store.attempts[(res_retry.invocation_id, 1, 2)]["outcome"] == "failed"
+    assert store.attempts[(res_retry.invocation_id, 1, 2)]["unknown_usage_calls"] == 0
+
+    summary = await budget_svc.reconcile_and_summarize_day(store.conn(), "u1")
+    assert summary["journal_cash_usd"] == pytest.approx(float(c1))
+    assert summary["journal_unknown_usage_count"] == 0
+    assert summary["journal_unknown_usage_cash_count"] == 0
+    for prov_stats in summary["by_provider"].values():
+        assert "unknown_usage_calls" not in prov_stats
+
+    # 3. Mid-stream 402 MUST still return False from `_is_unbilled_sdk_error`
+    err_mid_402 = mark_xai_exception(
+        RuntimeError("HTTP 402 Payment Required: usage balance exhausted"),
+        stream_started=True,
+        chunks_received=2,
+    )
+    setattr(err_mid_402, "status_code", 402)
+    assert api_call_mod._is_unbilled_sdk_error(err_mid_402) is False

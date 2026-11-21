@@ -616,6 +616,8 @@ def _classify_exception(
         return "failed", "pre_send"
 
     if isinstance(status_code, int):
+        if status_code == 402 and not has_stream_started(exc):
+            return "failed", "http_402"
         if status_code in (400, 401, 403, 404, 422, 426):
             # 426 Upgrade Required: the request was refused before any work (e.g. an
             # outdated client version), so it is a clean failure, not an unknown outcome.
@@ -628,6 +630,11 @@ def _classify_exception(
     for code in ("400", "401", "403", "404"):
         if f"http {code}" in msg_lower or f"status {code}" in msg_lower or f"status_code={code}" in msg_lower or f"error code: {code}" in msg_lower:
             return "failed", "http_4xx"
+    if not has_stream_started(exc) and any(
+        marker in msg_lower
+        for marker in ("http 402", "status 402", "status_code=402", "error code: 402")
+    ):
+        return "failed", "http_402"
 
     if "timeout" in msg_lower or "timed out" in msg_lower:
         return "indeterminate", "timeout"
@@ -1427,7 +1434,7 @@ async def _dalton_complete_impl(
             extra_done_kwargs: dict[str, Any] = {}
             if llm_user_id is None:
                 extra_done_kwargs["stamp_credential_holder"] = False
-            if merged_prior:
+            if merged_prior or attempt > 1:
                 extra_done_kwargs["attempt_usage"] = usage_dict
             if attempt_unknown_calls > 0:
                 extra_done_kwargs["unknown_usage_calls"] = attempt_unknown_calls
@@ -1555,7 +1562,7 @@ async def _dalton_complete_impl(
                 }
                 if llm_user_id is None:
                     extra_cancel_kwargs["stamp_credential_holder"] = False
-                if merged_prior_cancel:
+                if merged_prior_cancel or (attempt > 1 and attempt_cancel_usage is not None):
                     extra_cancel_kwargs["attempt_usage"] = attempt_cancel_usage
                 if cancel_call_records:
                     extra_cancel_kwargs["call_records"] = cancel_call_records
@@ -1648,6 +1655,8 @@ async def _dalton_complete_impl(
                 else 0
             )
         final_attempt_unknown = attempt_unknown_calls > 0
+        if final_attempt_unknown and target_state == "failed":
+            target_state = "indeterminate"
         attempt_fail_usage: dict[str, Any] | None = None
         journal_fail_usage: dict[str, Any] | None = None
         merged_prior_fail = False
@@ -1703,7 +1712,7 @@ async def _dalton_complete_impl(
                 }
                 if llm_user_id is None:
                     extra_fail_kwargs["stamp_credential_holder"] = False
-                if merged_prior_fail:
+                if merged_prior_fail or (attempt > 1 and attempt_fail_usage is not None):
                     extra_fail_kwargs["attempt_usage"] = attempt_fail_usage
                 if fail_call_records:
                     extra_fail_kwargs["call_records"] = fail_call_records
