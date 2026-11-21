@@ -858,7 +858,8 @@ async def resolve_turn_config_with_automation_inheritance(
 
     explicit_request_effort = getattr(request, "reasoning_effort", None)
     apply_effort_override = (
-        inherited_effort is not None
+        confirmed_for_context
+        and effort_configured
         and explicit_request_effort is None
         and _accepts_effort_override(resolve)
     )

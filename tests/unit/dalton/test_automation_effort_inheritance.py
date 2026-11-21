@@ -1047,3 +1047,131 @@ async def test_wakeup_turn_records_source_execution_id_and_recovers_via_retry_on
         }
     )
     assert isinstance(verdict_firing, restart_mod.FiringRunsAgain)
+
+
+@pytest.mark.asyncio
+async def test_follow_default_automation_on_persistent_thread_overrides_stale_thread_effort_on_wakeup_continuation_and_retry(
+    monkeypatch,
+) -> None:
+    """When a reasoning_effort=None ('follow default') automation runs on a persistent/pinned thread
+    whose conversation_threads.reasoning_effort was previously set to 'low' by a user, wakeup,
+    continuation (automation_delivery), and /retry must pass reasoning_effort_override=None so
+    resolve_llm_config receives None (user pref / model default) instead of the stale thread effort."""
+    exec_a = {
+        "automation_execution_id": EXEC_A,
+        "automation_id": AUTO_A,
+        "status": "running",
+        "conversation_thread_id": THREAD,
+        "user_id": USER,
+    }
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_wakeup_creator_run_ids",
+        create_autospec(atm_mod._get_wakeup_creator_run_ids, return_value=[RUN_A]),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_for_run_id",
+        create_autospec(atm_mod._get_execution_for_run_id, return_value=exec_a),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_by_id",
+        create_autospec(atm_mod._get_execution_by_id, return_value=exec_a),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_first_turn_settings",
+        create_autospec(
+            atm_mod._get_execution_first_turn_settings,
+            return_value=("claude-opus-5-5-oauth", True, None),
+        ),
+    )
+    monkeypatch.setattr(
+        user_models,
+        "get_model_preference",
+        create_autospec(user_models.get_model_preference, return_value={}),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "model_resolves",
+        create_autospec(atm_mod.model_resolves, return_value=True),
+    )
+    monkeypatch.setattr(
+        atm_mod.thread_model,
+        "model_resolves",
+        create_autospec(atm_mod.thread_model.model_resolves, return_value=True),
+    )
+
+    resolved_calls: list[tuple[str | None, str | None]] = []
+
+    async def _fake_resolve_llm_config(
+        _base, _uid, model, _byok, *, reasoning_effort=None, **_kw
+    ):
+        resolved_calls.append((model, reasoning_effort))
+        return _make_cfg(str(model), reasoning_effort)
+
+    monkeypatch.setattr(
+        llm_config_mod,
+        "resolve_llm_config",
+        create_autospec(llm_config_mod.resolve_llm_config, side_effect=_fake_resolve_llm_config),
+    )
+    monkeypatch.setattr("src.server.app.setup.agent_config", SimpleNamespace())
+
+    # Persistent/pinned thread previously had reasoning_effort='low' from user composer
+    resolver = thread_agent.thread_resolver(
+        USER,
+        THREAD,
+        TurnRoute(workspace_id=WS, owner_id=USER, role="analyst"),
+        identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER, org_id=None),
+        thread={"reasoning_effort": "low"},
+        is_byok=False,
+    )
+
+    # 1. Wakeup on persistent thread -> must pass reasoning_effort=None (NOT thread's 'low')
+    await atm_mod.resolve_turn_config_with_automation_inheritance(
+        user_id=USER,
+        thread_id=THREAD,
+        request=ChatRequest(
+            workspace_id=WS,
+            messages=[ChatMessage(role="user", content="wakeup")],
+            query_type="wakeup",
+            wakeup={"notices": [{"wakeup_id": WAKEUP_A}]},
+        ),
+        requested_model=None,
+        held_model="claude-opus-5-5-oauth",
+        from_service=True,
+        resolve=resolver,
+    )
+    assert resolved_calls[-1] == ("claude-opus-5-5-oauth", None)
+
+    # 2. Continuation (automation_delivery) on persistent thread -> must pass reasoning_effort=None
+    await atm_mod.resolve_turn_config_with_automation_inheritance(
+        user_id=USER,
+        thread_id=THREAD,
+        request=ChatRequest(
+            workspace_id=WS,
+            messages=[ChatMessage(role="user", content="report back")],
+            query_type="system",
+            automation_delivery={"id": EXEC_A, "targets": []},
+        ),
+        requested_model=None,
+        held_model="claude-opus-5-5-oauth",
+        from_service=True,
+        resolve=resolver,
+    )
+    assert resolved_calls[-1] == ("claude-opus-5-5-oauth", None)
+
+    # 3. Normal user /retry on persistent thread -> must pass reasoning_effort=None
+    await atm_mod.resolve_turn_config_with_automation_inheritance(
+        user_id=USER,
+        thread_id=THREAD,
+        request=ChatRequest(workspace_id=WS, messages=[], reasoning_effort=None),
+        requested_model=None,
+        held_model="claude-opus-5-5-oauth",
+        from_service=False,
+        is_server_retry=False,
+        retry_of_run_id=RUN_A,
+        resolve=resolver,
+    )
+    assert resolved_calls[-1] == ("claude-opus-5-5-oauth", None)
