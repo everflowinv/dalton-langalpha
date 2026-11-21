@@ -996,17 +996,19 @@ class PTCAgent:
         )
 
         # DALTON-HOOK(dalton-tools): build role-scoped Dalton tools before rendering prompt
-        # DALTON-HOOK(team-memory-toggle): mount conversation_search and render its prompt line only when enabled
+        # DALTON-HOOK(team-memory-toggle): mount conversation_search and render its prompt line from deployment/tier availability only (not personal toggle)
         from src.dalton.tools import build_dalton_tools
 
         dalton_tools = build_dalton_tools(
             role,
             filesystem_backend,
             user_tier=user_tier,
-            team_memory_enabled=team_memory_enabled,
         )
-        conversation_search_enabled = any(
+        conversation_search_available = any(
             getattr(t, "name", None) == "conversation_search" for t in dalton_tools
+        )
+        conversation_search_enabled = (
+            bool(team_memory_enabled) if conversation_search_available else None
         )
         # DALTON-HOOK(monitors): render monitor prompt hint only when dalton_monitor is mounted
         dalton_monitors_enabled = any(
@@ -1034,7 +1036,7 @@ class PTCAgent:
             role=role,
             channels_enabled=gates.channels,
             claude_code=claude_code,
-            conversation_search_enabled=conversation_search_enabled,  # DALTON-HOOK(team-memory-toggle)
+            conversation_search_enabled=conversation_search_available,  # DALTON-HOOK(team-memory-toggle)
             research_writing_enabled=research_writing_enabled,  # DALTON-HOOK(research-writing)
             dalton_monitors_enabled=dalton_monitors_enabled,  # DALTON-HOOK(monitors)
             dalton_report_delivery_enabled=dalton_report_delivery_enabled,  # DALTON-HOOK(report-delivery)
@@ -1226,6 +1228,7 @@ class PTCAgent:
             user_data_counts=user_data_counts,
             role=role,
             conversation_search_enabled=conversation_search_enabled,  # DALTON-HOOK(team-memory-toggle)
+            claude_code=claude_code,  # DALTON-HOOK(team-memory-toggle)
         )
         if main_compaction is not None:
             main_compaction = main_compaction.with_baseline(context.baseline.sent_sections)

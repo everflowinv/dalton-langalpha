@@ -194,7 +194,9 @@ def test_d028_migration_upgrade_and_downgrade(monkeypatch: pytest.MonkeyPatch) -
 async def test_default_off_omits_tool_prompt_and_data_map_card_line(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When no row exists in dalton_workspace_settings, Team Memory defaults to off across tool, prompt, and data map."""
+    """When no row exists in dalton_workspace_settings, personal toggle defaults to False,
+    while static prompt and top-level tools follow deployment availability (not personal toggle);
+    when deployment conversations.enabled=False, tool/prompt/data map omit it."""
     fake_conn = create_autospec(psycopg.AsyncConnection, instance=True)
     fake_cur = create_autospec(psycopg.AsyncCursor, instance=True)
     fake_cur.fetchone.return_value = None
@@ -223,13 +225,13 @@ async def test_default_off_omits_tool_prompt_and_data_map_card_line(
     )
     assert enabled is False
 
-    # 1) Tool not mounted by default
+    # 1) Top-level tool list always declares conversation_search when deployment allows it
     analyst_tool_names = {t.name for t in build_dalton_tools("analyst", user_tier="internal")}
     cos_tool_names = {t.name for t in build_dalton_tools("chief_of_staff", user_tier="internal")}
-    assert "conversation_search" not in analyst_tool_names
-    assert "conversation_search" not in cos_tool_names
+    assert "conversation_search" in analyst_tool_names
+    assert "conversation_search" in cos_tool_names
 
-    # 2) Shared cached data map is filtered at turn render time (no card stats line)
+    # 2) Shared cached data map stays deployment-level (unchanged by personal toggle)
     cached_md = _sample_cached_data_map_markdown()
     assert "**1542**" in cached_md
     assert "- `conversation_search`" in cached_md
@@ -249,25 +251,47 @@ async def test_default_off_omits_tool_prompt_and_data_map_card_line(
     turn_md = await map_builder.warm_turn_data_map(
         search_api="openclaw",
         cache_date=date(2026, 11, 5),
-        team_memory_enabled=False,
+        team_memory_enabled=True,
     )
-    assert "- `conversation_search`" not in turn_md
-    assert "归档统计：" not in turn_md
-    assert "**1542**" not in turn_md
-    assert "先用 `conversation_search`" not in turn_md
-    assert "- `web_search`" in turn_md
+    assert "- `conversation_search`" in turn_md
+    assert "团队记忆开启时可用；当前是否开启以对话中的运行时说明为准" in turn_md
 
-    # 3) System prompt for both roles omits the conversation_search sentence and card stats line
+    # 3) Static prompt for both roles declares conditional team memory wording regardless of personal toggle
     loader = PromptLoader()
     for role in ("analyst", "chief_of_staff"):
-        prompt = loader.get_system_prompt(
-            role=role,
-            conversation_search_enabled=False,
-        )
-        assert "conversation_search" not in prompt
-        assert "回答某家公司或主题时，先用" not in prompt
-        assert "归档统计：" not in prompt
-        assert "说“证据不足/无法确定”之前，对照下方数据地图，看是否还有会改变结论的直接相关来源没查" in prompt
+        prompt = loader.get_system_prompt(role=role)
+        assert "conversation_search" in prompt
+        assert "团队记忆开启时可用；当前是否开启以对话中的运行时说明为准" in prompt
+
+    # 4) Deployment-level conversations.enabled=False omits tool, prompt line, and data map card row
+    from src.dalton import settings as dalton_settings_mod
+    from src.dalton import tools as dalton_tools_mod
+
+    off_cfg = dalton_settings_mod.get_dalton_settings().model_copy(
+        update={
+            "conversations": dalton_settings_mod.get_dalton_settings().conversations.model_copy(
+                update={"enabled": False}
+            )
+        }
+    )
+    monkeypatch.setattr(dalton_tools_mod, "get_dalton_settings", lambda: off_cfg)
+    assert "conversation_search" not in {
+        t.name for t in build_dalton_tools("analyst", user_tier="internal")
+    }
+    filtered_md = await map_builder.warm_turn_data_map(
+        search_api="openclaw",
+        cache_date=date(2026, 11, 5),
+        team_memory_enabled=False,
+    )
+    assert "- `conversation_search`" not in filtered_md
+    assert "归档统计：" not in filtered_md
+    assert "**1542**" not in filtered_md
+    assert "- `web_search`" in filtered_md
+    for role in ("analyst", "chief_of_staff"):
+        prompt_off = loader.get_system_prompt(role=role, conversation_search_enabled=False)
+        assert "conversation_search" not in prompt_off
+        assert "归档统计：" not in prompt_off
+        assert "说“证据不足/无法确定”之前，对照下方数据地图，看是否还有会改变结论的直接相关来源没查" in prompt_off
 
 
 @pytest.mark.asyncio
@@ -378,15 +402,10 @@ async def test_owner_enables_workspace_team_memory_mounts_all_three(
     assert "归档统计：" in turn_md
     assert "**1542**" in turn_md
 
-    # 3) System prompt includes the tool_guide sentence and the data map card row
-    prompt = PromptLoader().get_system_prompt(
-        role="analyst",
-        conversation_search_enabled=turn_enabled,
-    )
-    assert (
-        "回答某家公司或主题时，先用 `conversation_search` 查团队以前的观点、假设和决定，并在答案里说明与之前看法相比有什么变化"
-        in prompt
-    )
+    # 3) System prompt includes the conditional tool_guide sentence and the data map card row
+    prompt = PromptLoader().get_system_prompt(role="analyst")
+    assert "团队记忆开启时可用；当前是否开启以对话中的运行时说明为准" in prompt
+    assert "先用 `conversation_search` 查团队以前的观点、假设和决定，并在答案里说明与之前看法相比有什么变化" in prompt
     assert "归档统计：" in prompt
     assert "**1542**" in prompt
 
@@ -704,18 +723,15 @@ async def test_home_turn_follows_user_level_switch(
         user_tier="internal",
     )
     assert resolved_off is False
-    assert "conversation_search" not in {
+    tools_off = {
         t.name
         for t in build_dalton_tools(
             "chief_of_staff", user_tier="internal", team_memory_enabled=resolved_off
         )
     }
-    cos_prompt_off = PromptLoader().get_system_prompt(
-        role="chief_of_staff",
-        conversation_search_enabled=resolved_off,
-    )
-    assert "conversation_search" not in cos_prompt_off
-    assert "归档统计：" not in cos_prompt_off
+    assert "conversation_search" in tools_off
+    cos_prompt_static = PromptLoader().get_system_prompt(role="chief_of_staff")
+    assert "团队记忆开启时可用；当前是否开启以对话中的运行时说明为准" in cos_prompt_static
 
     # 2) User enables Home Team Memory via PUT /user-settings
     updated = await dalton_router.update_user_settings_endpoint(
@@ -731,19 +747,16 @@ async def test_home_turn_follows_user_level_switch(
         user_tier="internal",
     )
     assert resolved_on is True
-    assert "conversation_search" in {
+    tools_on = {
         t.name
         for t in build_dalton_tools(
             "chief_of_staff", user_tier="internal", team_memory_enabled=resolved_on
         )
     }
-    cos_prompt_on = PromptLoader().get_system_prompt(
-        role="chief_of_staff",
-        conversation_search_enabled=resolved_on,
-    )
-    assert "first call `conversation_search` to check the team's prior views, assumptions and decisions" in cos_prompt_on
-    assert "回答某家公司或主题时，先用 `conversation_search`" in cos_prompt_on
-    assert "归档统计：" in cos_prompt_on
+    assert tools_on == tools_off
+    assert "first call `conversation_search` to check the team's prior views, assumptions and decisions" in cos_prompt_static
+    assert "团队记忆开启时可用；当前是否开启以对话中的运行时说明为准" in cos_prompt_static
+    assert "归档统计：" in cos_prompt_static
 
 
 @pytest.mark.asyncio
@@ -844,13 +857,10 @@ async def test_codex_round_trip_preserves_prefix_and_appends_runtime_messages(
         await map_builder.warm_turn_data_map(
             search_api="openclaw",
             cache_date=date(2026, 11, 5),
-            team_memory_enabled=enabled,
+            team_memory_enabled=True,
         )
-        prompt = PromptLoader().get_system_prompt(
-            role="chief_of_staff",
-            conversation_search_enabled=enabled,
-        )
-        tools_list = [search_data, conversation_search_stub] if enabled else [search_data]
+        prompt = PromptLoader().get_system_prompt(role="chief_of_staff")
+        tools_list = [search_data, conversation_search_stub]
         agent = create_agent(
             model=codex_client,
             tools=tools_list,
@@ -890,9 +900,9 @@ async def test_codex_round_trip_preserves_prefix_and_appends_runtime_messages(
                 rows.append((bool(upd.provenance.get("enabled")), upd.text))
         return rows
 
-    # Turn 1 (ON): initial prompt has conversation_search; no extra toggle row
+    # Turn 1 (ON): initial prompt declares conversation_search; ON notice emitted once
     await _run_turn("NVDA 团队怎么看？", enabled=True, step_minutes=0)
-    # Turn 2 (ON, unchanged): no toggle row appended
+    # Turn 2 (ON, unchanged): no duplicate ON row
     await _run_turn("毛利率呢？", enabled=True, step_minutes=1)
     # Turn 3 (OFF): prefix (system prompt + top-level tools) identical to Turn 1; OFF row appended
     await _run_turn("关闭团队记忆后继续看下估值", enabled=False, step_minutes=2)
@@ -922,14 +932,17 @@ async def test_codex_round_trip_preserves_prefix_and_appends_runtime_messages(
         state_schema=MainAgentState,
     ).aget_state(cfg)
     assert _toggle_rows(state_after.values["messages"]) == [
+        (True, TEAM_MEMORY_ON_TEXT),
         (False, TEAM_MEMORY_OFF_TEXT),
         (True, TEAM_MEMORY_ON_TEXT),
     ]
+    assert TEAM_MEMORY_ON_TEXT in _developer_texts(captured_payloads[0])[-1]
     assert TEAM_MEMORY_OFF_TEXT in _developer_texts(captured_payloads[2])[-1]
     assert TEAM_MEMORY_ON_TEXT in _developer_texts(captured_payloads[4])[-1]
     # Unchanged turns did not append a new toggle row in the trailing developer block
-    assert TEAM_MEMORY_OFF_TEXT not in _developer_texts(captured_payloads[1])[-1]
-    assert TEAM_MEMORY_ON_TEXT not in _developer_texts(captured_payloads[3])[-1]
+    assert TEAM_MEMORY_ON_TEXT not in _developer_texts(captured_payloads[1])[-1]
+    assert TEAM_MEMORY_OFF_TEXT not in _developer_texts(captured_payloads[3])[-1]
+    assert TEAM_MEMORY_ON_TEXT not in _developer_texts(captured_payloads[5])[-1]
     assert not state_after.values[STATE_SYSTEM_PIN].get("stale")
 
 
@@ -1085,13 +1098,22 @@ async def test_team_memory_notice_reappended_after_compaction_and_legacy_pin() -
     assert TEAM_MEMORY_ROW_KIND in NON_CHANGE_ROW_KINDS
     now = datetime(2026, 11, 21, 10, 0, tzinfo=UTC)
 
-    # 1) Compaction cutoff moves past the last team_memory_switched row -> re-appended once
+    # 1) Turn 1 emits initial notice; unchanged Turn 2 skips; flip emits; compaction past cutoff re-emits
     t1 = await TurnContextMiddleware(
         now=now, timezone="UTC", conversation_search_enabled=True
     ).abefore_agent({"messages": [HumanMessage("q1")]})
-    assert [runtime_update_from_message(m).kind for m in t1["messages"]] == ["turn_opened"]
+    assert [runtime_update_from_message(m).kind for m in t1["messages"]] == [
+        "turn_opened",
+        TEAM_MEMORY_ROW_KIND,
+    ]
+    assert t1["messages"][1].content == TEAM_MEMORY_ON_TEXT
 
     hist = [HumanMessage("q1"), *t1["messages"], AIMessage("a1"), HumanMessage("q2")]
+    t1_repeat = await TurnContextMiddleware(
+        now=now, timezone="UTC", conversation_search_enabled=True
+    ).abefore_agent({"messages": hist})
+    assert [runtime_update_from_message(m).kind for m in t1_repeat["messages"]] == ["turn_opened"]
+
     t2 = await TurnContextMiddleware(
         now=now, timezone="UTC", conversation_search_enabled=False
     ).abefore_agent({"messages": hist})
@@ -1119,25 +1141,28 @@ async def test_team_memory_notice_reappended_after_compaction_and_legacy_pin() -
     ).abefore_agent({"messages": hist_after, "_summarization_event": {"cutoff_index": len(hist)}})
     assert [runtime_update_from_message(m).kind for m in t4["messages"]] == ["turn_opened"]
 
-    # 2) Legacy pinned thread (no turn_opened provenance) detects mismatch via STATE_SYSTEM_PIN
-    legacy_state_on = {
-        "messages": [HumanMessage("old q")],
+    # 2) Legacy thread without any team_memory_switched row in visible history emits notice regardless of pin/turn_opened
+    legacy_turn_open = build_update_message(
+        DurableUpdate(
+            kind="turn_opened",
+            schema_version=1,
+            text="now",
+            provenance={"source": "harness", "team_memory_enabled": False},
+            created_at=now,
+        )
+    )
+    legacy_state = {
+        "messages": [HumanMessage("old q"), legacy_turn_open, AIMessage("old a"), HumanMessage("new q")],
         STATE_SYSTEM_PIN: {"model": "gpt-6.2-sol", "content": "Call conversation_search first."},
     }
-    unchanged_legacy = await TurnContextMiddleware(
-        now=now, timezone="UTC", conversation_search_enabled=True
-    ).abefore_agent(legacy_state_on)
-    assert [runtime_update_from_message(m).kind for m in unchanged_legacy["messages"]] == [
-        "turn_opened"
-    ]
-    flipped_legacy = await TurnContextMiddleware(
+    legacy_off = await TurnContextMiddleware(
         now=now, timezone="UTC", conversation_search_enabled=False
-    ).abefore_agent(legacy_state_on)
-    assert [runtime_update_from_message(m).kind for m in flipped_legacy["messages"]] == [
+    ).abefore_agent(legacy_state)
+    assert [runtime_update_from_message(m).kind for m in legacy_off["messages"]] == [
         "turn_opened",
         TEAM_MEMORY_ROW_KIND,
     ]
-    assert flipped_legacy["messages"][1].content == TEAM_MEMORY_OFF_TEXT
+    assert legacy_off["messages"][1].content == TEAM_MEMORY_OFF_TEXT
 
     # 3) Summarizer & baseline rebuild ignore team_memory_switched; render is level-agnostic
     switch_msg = build_update_message(
@@ -1262,7 +1287,7 @@ def test_ptc_agent_passes_conversation_search_enabled_to_turn_context_middleware
         SecurityConfig,
     )
 
-    def _build_with(team_memory_enabled: bool, user_tier: str = "internal") -> list[Any]:
+    def _build_with(team_memory_enabled: bool, user_tier: str = "internal") -> dict[str, Any]:
         cfg = AgentConfig(
             llm=LLMConfig(name="test-model"),
             security=SecurityConfig(),
@@ -1312,19 +1337,678 @@ def test_ptc_agent_passes_conversation_search_enabled_to_turn_context_middleware
                 user_tier=user_tier,
                 team_memory_enabled=team_memory_enabled,
             )
-        return captured[0]["middleware"]
+        return captured[0]
 
-    mw_on = _build_with(True, user_tier="internal")
-    turn_on = next(m for m in mw_on if isinstance(m, TurnContextMiddleware))
+    built_on = _build_with(True, user_tier="internal")
+    turn_on = next(m for m in built_on["middleware"] if isinstance(m, TurnContextMiddleware))
     assert turn_on._conversation_search_enabled is True
 
-    mw_off = _build_with(False, user_tier="internal")
-    turn_off = next(m for m in mw_off if isinstance(m, TurnContextMiddleware))
+    built_off = _build_with(False, user_tier="internal")
+    turn_off = next(m for m in built_off["middleware"] if isinstance(m, TurnContextMiddleware))
     assert turn_off._conversation_search_enabled is False
 
-    # External member with team_memory_enabled=True still resolves conversation_search_enabled=False
-    mw_ext = _build_with(True, user_tier="external")
-    turn_ext = next(m for m in mw_ext if isinstance(m, TurnContextMiddleware))
-    assert turn_ext._conversation_search_enabled is False
+    # Static prompt and top-level tools are identical regardless of personal toggle
+    assert built_on["system_prompt"] == built_off["system_prompt"]
+    assert [t.name for t in built_on["tools"]] == [t.name for t in built_off["tools"]]
+    assert "conversation_search" in [t.name for t in built_off["tools"]]
+
+    # External member does not mount conversation_search or emit toggle notices
+    built_ext = _build_with(True, user_tier="external")
+    turn_ext = next(m for m in built_ext["middleware"] if isinstance(m, TurnContextMiddleware))
+    assert turn_ext._conversation_search_enabled is None
+    assert "conversation_search" not in [t.name for t in built_ext["tools"]]
+    assert "conversation_search" not in built_ext["system_prompt"]
+
+
+def _build_ptc_agent_kwargs(
+    *,
+    model: Any,
+    team_memory_enabled: bool,
+    role: str = "chief_of_staff",
+    user_tier: str = "internal",
+    claude_code_launcher: Any = None,
+) -> dict[str, Any]:
+    from unittest.mock import patch
+
+    from ptc_agent.config.agent import AgentConfig, LLMConfig
+    from ptc_agent.config.core import (
+        DaytonaConfig,
+        FilesystemConfig,
+        LoggingConfig,
+        MCPConfig,
+        SandboxConfig,
+        SecurityConfig,
+    )
+    from ptc_agent.core.mcp_registry import MCPRegistry
+    from ptc_agent.core.paths import SandboxLayout, WorkspaceLayout
+
+    cfg = AgentConfig(
+        llm=LLMConfig(name="test-model"),
+        security=SecurityConfig(),
+        logging=LoggingConfig(),
+        sandbox=SandboxConfig(daytona=DaytonaConfig(api_key="test-key")),
+        mcp=MCPConfig(),
+        filesystem=FilesystemConfig(),
+    )
+    captured: list[dict[str, Any]] = []
+
+    def _fake_create_agent(_model: Any, **kwargs: Any) -> Any:
+        captured.append(kwargs)
+        g = create_autospec(PTCAgent, instance=True)
+        g.with_config = lambda *_a, **_kw: g
+        return g
+
+    fake_sandbox = create_autospec(PTCSandbox, instance=True)
+    fake_sandbox.config = cfg
+    fake_sandbox.working_dir = "/home/workspace"
+    fake_sandbox.livefs = None
+    fake_sandbox.mounts_livefs = False
+    fake_sandbox.history = None
+    fake_sandbox.skills_manifest = None
+    fake_sandbox.vault_secrets = {}
+    fake_sandbox.layout = SandboxLayout("/home/workspace")
+    fake_sandbox.workspace.return_value = WorkspaceLayout("/home/workspace")
+    fake_registry = create_autospec(MCPRegistry, instance=True)
+    fake_registry.connectors = {}
+    fake_registry.tools_by_server = {}
+
+    with (
+        patch.object(AgentConfig, "get_llm_client", return_value=model),
+        patch(
+            "ptc_agent.agent.middleware.compaction.compact.create_llm",
+            return_value=model,
+        ),
+        patch("ptc_agent.agent.agent.create_agent", side_effect=_fake_create_agent),
+    ):
+        PTCAgent(cfg).create_agent(
+            llm=model,
+            thread_id="t-real-build",
+            sandbox=fake_sandbox,
+            mcp_registry=fake_registry,
+            tool_summary="",
+            user_id="u-richard",
+            user_tier=user_tier,
+            role=role,
+            team_memory_enabled=team_memory_enabled,
+            claude_code_launcher=claude_code_launcher,
+        )
+    return captured[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", ["gpt-6.2-sol", "gpt-6.2-sol-oauth"])
+async def test_gpt62_and_codex_toggle_and_post_deploy_first_turn_preserve_system_prompt_and_tools(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+) -> None:
+    """Across personal toggle flips (OFF -> ON -> OFF) AND on the first turn
+    after a new deploy (with or without bound reasoning), GPT-6.2 API and Codex
+    OAuth requests keep the exact same static system prompt and top-level tools."""
+    from langchain.agents import create_agent
+    from langchain_core.messages import AIMessage, HumanMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from langchain_openai.chat_models.base import BaseChatOpenAI
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from ptc_agent.agent.main_state import MainAgentState
+    from ptc_agent.agent.middleware.reasoning_compat import ReasoningCompatibilityMiddleware
+    from ptc_agent.agent.middleware.runtime_context import (
+        TEAM_MEMORY_OFF_MARKER,
+        TEAM_MEMORY_OFF_TEXT,
+        TEAM_MEMORY_ON_MARKER,
+        TEAM_MEMORY_ON_TEXT,
+        RowCarrierMiddleware,
+        TurnContextMiddleware,
+    )
+    from ptc_agent.agent.middleware.runtime_context.frozen_prompt import (
+        STATE_SYSTEM_PIN,
+        SystemPinMiddleware,
+    )
+    from ptc_agent.agent.middleware.tool_surface import ToolSurfaceMiddleware
+    from ptc_agent.agent.prompts import release
+    from src.llms.llm import create_llm
+
+    cached_md = _sample_cached_data_map_markdown()
+    monkeypatch.setattr(
+        db_data_map,
+        "get_cached_data_map",
+        create_autospec(
+            db_data_map.get_cached_data_map,
+            return_value={
+                "cache_date": "2026-11-05",
+                "rendered_markdown": cached_md,
+                "payload": {},
+            },
+        ),
+    )
+
+    client = create_llm(model_name, api_key="sk-gpt62-test")
+    captured_payloads: list[dict[str, Any]] = []
+    turn_counter = 0
+
+    async def _fake_agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        nonlocal turn_counter
+        turn_counter += 1
+        payload = self._get_request_payload(messages, stop=stop, **kwargs)
+        captured_payloads.append(payload)
+        return ChatResult(
+            generations=[
+                ChatGeneration(
+                    message=AIMessage(
+                        content=[
+                            {
+                                "type": "reasoning",
+                                "id": f"rs_{turn_counter}",
+                                "summary": [],
+                                "encrypted_content": f"enc_{turn_counter}",
+                            },
+                            {"type": "text", "text": f"Reply {turn_counter}."},
+                        ],
+                        id=f"msg_{turn_counter}",
+                        response_metadata={
+                            "model_name": "gpt-6.2-sol",
+                            "reasoning_origin": "codex-oauth" if model_name.endswith("-oauth") else "openai",
+                        },
+                    )
+                )
+            ]
+        )
+
+    monkeypatch.setattr(BaseChatOpenAI, "_agenerate", _fake_agenerate)
+    monkeypatch.setattr(BaseChatOpenAI, "_should_stream", lambda self, **_: False)
+
+    saver = InMemorySaver()
+    cfg = {"configurable": {"thread_id": f"t-deploy-{model_name}", "user_id": "u-richard"}}
+
+    async def _invoke_turn(user_text: str, *, enabled: bool, minute: int) -> None:
+        await map_builder.warm_turn_data_map(
+            search_api="openclaw",
+            cache_date=date(2026, 11, 5),
+            team_memory_enabled=True,
+        )
+        built = _build_ptc_agent_kwargs(
+            model=client,
+            team_memory_enabled=enabled,
+            role="chief_of_staff",
+        )
+        turn_mw = next(m for m in built["middleware"] if isinstance(m, TurnContextMiddleware))
+        assert turn_mw._conversation_search_enabled is enabled
+        agent = create_agent(
+            model=client,
+            tools=built["tools"],
+            system_prompt=built["system_prompt"],
+            middleware=[
+                ToolSurfaceMiddleware(),
+                TurnContextMiddleware(
+                    now=datetime(2026, 11, 21, 12, minute, tzinfo=UTC),
+                    timezone="UTC",
+                    conversation_search_enabled=enabled,
+                ),
+                RowCarrierMiddleware(),
+                SystemPinMiddleware(),
+                ReasoningCompatibilityMiddleware(),
+            ],
+            checkpointer=saver,
+            state_schema=MainAgentState,
+        )
+        await agent.ainvoke({"messages": [HumanMessage(user_text)]}, cfg)
+
+    def _developer_texts(payload: dict[str, Any]) -> list[str]:
+        out: list[str] = []
+        for item in payload["input"]:
+            if isinstance(item, dict) and item.get("role") == "developer":
+                content = item.get("content")
+                if isinstance(content, list):
+                    out.append("\n".join(str(b.get("text") or "") for b in content if isinstance(b, dict)))
+                else:
+                    out.append(str(content or ""))
+        return out
+
+    def _system_prompt_text(payload: dict[str, Any]) -> str:
+        if payload.get("instructions"):
+            return str(payload["instructions"])
+        for item in payload["input"]:
+            if isinstance(item, dict) and item.get("role") in ("system", "developer"):
+                content = item.get("content")
+                if isinstance(content, list):
+                    return "\n".join(str(b.get("text") or "") for b in content if isinstance(b, dict))
+                return str(content or "")
+        return ""
+
+    # Turn 1 (OFF): top-level tools still declares conversation_search; OFF notice sent
+    await _invoke_turn("q1 off", enabled=False, minute=0)
+    # Turn 2 (ON): same system prompt & top-level tools; ON notice sent
+    await _invoke_turn("q2 on", enabled=True, minute=1)
+    # Turn 3 (post-deploy first turn + toggle OFF): source_digest advances as on a new deploy
+    monkeypatch.setattr(release, "source_digest", lambda: "post-deploy-digest-v2")
+    await _invoke_turn("q3 post-deploy off", enabled=False, minute=2)
+
+    assert len(captured_payloads) == 3
+    base_tools = captured_payloads[0]["tools"]
+    assert "conversation_search" in [t["name"] for t in base_tools]
+    base_system = _system_prompt_text(captured_payloads[0])
+    assert "团队记忆开启时可用；当前是否开启以对话中的运行时说明为准" in base_system
+
+    for i, payload in enumerate(captured_payloads):
+        assert payload["tools"] == base_tools, f"turn {i + 1} tools changed"
+        assert _system_prompt_text(payload) == base_system, f"turn {i + 1} system prompt changed"
+
+    assert TEAM_MEMORY_OFF_TEXT in _developer_texts(captured_payloads[0])[-1]
+    assert TEAM_MEMORY_OFF_MARKER in _developer_texts(captured_payloads[0])[-1]
+    assert TEAM_MEMORY_ON_TEXT in _developer_texts(captured_payloads[1])[-1]
+    assert TEAM_MEMORY_ON_MARKER in _developer_texts(captured_payloads[1])[-1]
+    assert TEAM_MEMORY_OFF_TEXT in _developer_texts(captured_payloads[2])[-1]
+    assert TEAM_MEMORY_OFF_MARKER in _developer_texts(captured_payloads[2])[-1]
+
+    state_after = await create_agent(
+        model=client,
+        tools=captured_payloads[0]["tools"],
+        system_prompt="noop",
+        checkpointer=saver,
+        state_schema=MainAgentState,
+    ).aget_state(cfg)
+    pin = state_after.values[STATE_SYSTEM_PIN]
+    assert pin.get("source_digest") == "post-deploy-digest-v2"
+    assert not pin.get("stale")
+
+
+@pytest.mark.parametrize("model_name", ["gpt-6.2-sol", "gpt-6.2-sol-oauth"])
+def test_toggle_before_compaction_threshold_does_not_trigger_at_turn_start(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+) -> None:
+    """When a long thread with bound reasoning reaches the compaction threshold
+    right after toggling Team Memory, static prompt equality keeps `due()` False
+    so TurnStartRebuilds does NOT trigger `at_turn_start` rebuild."""
+    from types import SimpleNamespace
+
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+    from ptc_agent.agent.middleware.compaction.rebuild import TurnStartRebuilds
+    from ptc_agent.agent.middleware.runtime_context.frozen_prompt import (
+        STATE_SYSTEM_PIN,
+        due,
+    )
+    from ptc_agent.agent.prompts import release
+    from src.llms.llm import create_llm
+
+    cached_md = _sample_cached_data_map_markdown()
+    monkeypatch.setattr(
+        db_data_map,
+        "get_cached_data_map",
+        create_autospec(
+            db_data_map.get_cached_data_map,
+            return_value={
+                "cache_date": "2026-11-05",
+                "rendered_markdown": cached_md,
+                "payload": {},
+            },
+        ),
+    )
+    map_builder.set_turn_data_map(cached_md)
+    try:
+        client = create_llm(model_name, api_key="sk-compact-test")
+        built_on = _build_ptc_agent_kwargs(
+            model=client, team_memory_enabled=True, role="analyst"
+        )
+        built_off = _build_ptc_agent_kwargs(
+            model=client, team_memory_enabled=False, role="analyst"
+        )
+    finally:
+        map_builder.set_turn_data_map(None)
+
+    assert built_on["system_prompt"] == built_off["system_prompt"]
+    bound_reply = AIMessage(
+        content=[
+            {
+                "type": "reasoning",
+                "id": "rs_prev",
+                "summary": [],
+                "encrypted_content": "enc_prev",
+            },
+            {"type": "text", "text": "Earlier answer."},
+        ],
+        response_metadata={
+            "model_name": "gpt-6.2-sol",
+            "reasoning_origin": "codex-oauth" if model_name.endswith("-oauth") else "openai",
+        },
+    )
+    view = [HumanMessage("q1"), bound_reply, HumanMessage("q2 after toggle")]
+    pin = {
+        "model": "gpt-6.2-sol",
+        "content": built_on["system_prompt"],
+        "source_digest": release.source_digest(),
+        "prompt_version": release.prompt_version(),
+    }
+    req = SimpleNamespace(
+        model=client,
+        system_message=SystemMessage(content=built_off["system_prompt"]),
+        state={STATE_SYSTEM_PIN: pin},
+        messages=view,
+    )
+    assert due(req, view) is False
+    plan = TurnStartRebuilds(floor_tokens=1000).plan(
+        req, view, tokens=200_000, threshold=150_000, now=1.0, first_call=True
+    )
+    assert plan.due is False
+    assert plan.cut == 0
+
+
+@pytest.mark.asyncio
+async def test_team_memory_notice_reappended_after_compaction_and_window_trim() -> None:
+    """When compaction + `window.trim` physically drops the earlier
+    `team_memory_switched` row while later `turn_opened` rows remain, the next
+    turn re-emits the current toggle notice because visible history lacks one."""
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    from ptc_agent.agent.middleware.compaction.window import trim as window_trim
+    from ptc_agent.agent.middleware.runtime_context import (
+        TEAM_MEMORY_OFF_MARKER,
+        TEAM_MEMORY_OFF_TEXT,
+        TEAM_MEMORY_ROW_KIND,
+        TurnContextMiddleware,
+        runtime_update_from_message,
+    )
+    from ptc_agent.agent.transcript.identity import Window
+
+    now = datetime(2026, 11, 21, 10, 0, tzinfo=UTC)
+
+    # Turn 1 (OFF): emits turn_opened + team_memory_switched(OFF)
+    u1 = HumanMessage("q1", id="u1")
+    t1 = await TurnContextMiddleware(
+        now=now, timezone="UTC", conversation_search_enabled=False
+    ).abefore_agent({"messages": [u1]})
+    for idx, msg in enumerate(t1["messages"]):
+        msg.id = f"t1_{idx}"
+    assert [runtime_update_from_message(m).kind for m in t1["messages"]] == [
+        "turn_opened",
+        TEAM_MEMORY_ROW_KIND,
+    ]
+    a1 = AIMessage("a1", id="a1")
+
+    # Turn 2 (OFF): notice still in view -> no duplicate
+    u2 = HumanMessage("q2", id="u2")
+    hist = [u1, *t1["messages"], a1, u2]
+    t2 = await TurnContextMiddleware(
+        now=now, timezone="UTC", conversation_search_enabled=False
+    ).abefore_agent({"messages": hist})
+    for idx, msg in enumerate(t2["messages"]):
+        msg.id = f"t2_{idx}"
+    assert [runtime_update_from_message(m).kind for m in t2["messages"]] == ["turn_opened"]
+    a2 = AIMessage("a2", id="a2")
+
+    # Turn 3 (OFF): still in view -> no duplicate
+    u3 = HumanMessage("q3", id="u3")
+    hist.extend([*t2["messages"], a2, u3])
+    t3 = await TurnContextMiddleware(
+        now=now, timezone="UTC", conversation_search_enabled=False
+    ).abefore_agent({"messages": hist})
+    for idx, msg in enumerate(t3["messages"]):
+        msg.id = f"t3_{idx}"
+    a3 = AIMessage("a3", id="a3")
+    hist.extend([*t3["messages"], a3])
+
+    # Compaction cuts at u3 AND window.trim physically removes Turn 1 & Turn 2 (including t1's toggle row)
+    cut = hist.index(u3)
+    trimmed_state = window_trim(
+        {
+            "messages": hist,
+            "_summarization_event": {"cutoff_index": cut, "anchor_message_id": u3.id},
+        },
+        cut,
+        [],
+        head=Window().extend(hist[:cut]),
+    )
+    kept_messages = list(trimmed_state["messages"].value)
+    assert all(
+        (upd := runtime_update_from_message(m)) is None or upd.kind != TEAM_MEMORY_ROW_KIND
+        for m in kept_messages
+    )
+    assert any(
+        (upd := runtime_update_from_message(m)) is not None and upd.kind == "turn_opened"
+        for m in kept_messages
+    )
+
+    # Turn 4 (still OFF): notice was trimmed away -> MUST re-send OFF notice
+    u4 = HumanMessage("q4", id="u4")
+    t4 = await TurnContextMiddleware(
+        now=now, timezone="UTC", conversation_search_enabled=False
+    ).abefore_agent(
+        {
+            "messages": [*kept_messages, u4],
+            "_summarization_event": {"cutoff_index": 0, "anchor_message_id": u3.id},
+        }
+    )
+    assert [runtime_update_from_message(m).kind for m in t4["messages"]] == [
+        "turn_opened",
+        TEAM_MEMORY_ROW_KIND,
+    ]
+    assert t4["messages"][1].content == TEAM_MEMORY_OFF_TEXT
+    assert TEAM_MEMORY_OFF_MARKER in t4["messages"][1].content
+
+    # Turn 5 (still OFF, re-appended notice now visible) -> NOT repeated
+    for idx, msg in enumerate(t4["messages"]):
+        msg.id = f"t4_{idx}"
+    t5 = await TurnContextMiddleware(
+        now=now, timezone="UTC", conversation_search_enabled=False
+    ).abefore_agent(
+        {
+            "messages": [*kept_messages, u4, *t4["messages"], AIMessage("a4", id="a4"), HumanMessage("q5", id="u5")],
+            "_summarization_event": {"cutoff_index": 0, "anchor_message_id": u3.id},
+        }
+    )
+    assert [runtime_update_from_message(m).kind for m in t5["messages"]] == ["turn_opened"]
+
+
+@pytest.mark.asyncio
+async def test_claude_code_static_prompt_tools_and_runtime_notices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude Code sessions keep identical static prompt and tool list
+    (including `conversation_search`) regardless of personal toggle, append
+    the ON/OFF notice via TurnContextMiddleware -> turn_prompt, re-send after
+    CLI compaction, and emit the notice on legacy pre-deploy Claude sessions."""
+    from unittest.mock import patch
+
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    from ptc_agent.agent.claude_code.agent import ClaudeCodeGraph
+    from ptc_agent.agent.claude_code.runtime import turn_prompt
+    from ptc_agent.agent.middleware.runtime_context import (
+        TEAM_MEMORY_OFF_MARKER,
+        TEAM_MEMORY_OFF_TEXT,
+        TEAM_MEMORY_ON_MARKER,
+        TEAM_MEMORY_ON_TEXT,
+        TEAM_MEMORY_ROW_KIND,
+        TurnContextMiddleware,
+        runtime_update_from_message,
+    )
+    from ptc_agent.config.agent import Admitted, AgentConfig, LLMConfig
+    from ptc_agent.config.core import (
+        DaytonaConfig,
+        FilesystemConfig,
+        LoggingConfig,
+        MCPConfig,
+        SandboxConfig,
+        SecurityConfig,
+    )
+    from ptc_agent.core.mcp_registry import MCPRegistry
+    from ptc_agent.core.paths import SandboxLayout, WorkspaceLayout
+    from src.llms.llm import create_llm
+
+    cached_md = _sample_cached_data_map_markdown()
+    monkeypatch.setattr(
+        db_data_map,
+        "get_cached_data_map",
+        create_autospec(
+            db_data_map.get_cached_data_map,
+            return_value={
+                "cache_date": "2026-11-05",
+                "rendered_markdown": cached_md,
+                "payload": {},
+            },
+        ),
+    )
+    map_builder.set_turn_data_map(cached_md)
+    try:
+        claude_target = create_llm("claude-opus-5-5-code")
+        cfg = AgentConfig(
+            llm=LLMConfig(name="claude-opus-5-5-code"),
+            security=SecurityConfig(),
+            logging=LoggingConfig(),
+            sandbox=SandboxConfig(daytona=DaytonaConfig(api_key="test-key")),
+            mcp=MCPConfig(),
+            filesystem=FilesystemConfig(),
+            claude_code_admitted=Admitted(),
+        )
+
+        def _build_claude_graph(team_memory_enabled: bool) -> ClaudeCodeGraph:
+            fake_sandbox = create_autospec(PTCSandbox, instance=True)
+            fake_sandbox.config = cfg
+            fake_sandbox.working_dir = "/home/workspace"
+            fake_sandbox.livefs = None
+            fake_sandbox.mounts_livefs = False
+            fake_sandbox.history = None
+            fake_sandbox.skills_manifest = None
+            fake_sandbox.vault_secrets = {}
+            fake_sandbox.layout = SandboxLayout("/home/workspace")
+            fake_sandbox.workspace.return_value = WorkspaceLayout("/home/workspace")
+            fake_registry = create_autospec(MCPRegistry, instance=True)
+            fake_registry.connectors = {}
+            fake_registry.tools_by_server = {}
+            with (
+                patch.object(AgentConfig, "get_llm_client", return_value=claude_target),
+                patch(
+                    "ptc_agent.agent.middleware.compaction.compact.create_llm",
+                    return_value=claude_target,
+                ),
+            ):
+                return PTCAgent(cfg).create_agent(
+                    llm=claude_target,
+                    thread_id="t-claude-toggle",
+                    sandbox=fake_sandbox,
+                    mcp_registry=fake_registry,
+                    tool_summary="",
+                    user_id="u-richard",
+                    user_tier="internal",
+                    role="chief_of_staff",
+                    team_memory_enabled=team_memory_enabled,
+                    claude_code_launcher=lambda *_a, **_kw: None,
+                )
+
+        graph_off = _build_claude_graph(False)
+        graph_on = _build_claude_graph(True)
+    finally:
+        map_builder.set_turn_data_map(None)
+
+    turn_off = graph_off.turn({"configurable": {"thread_id": "t-claude-toggle"}})
+    turn_on = graph_on.turn({"configurable": {"thread_id": "t-claude-toggle"}})
+    assert turn_off.spec.system_prompt == turn_on.spec.system_prompt
+    assert "团队记忆开启时可用；当前是否开启以对话中的运行时说明为准" in turn_off.spec.system_prompt
+    assert [t.name for t in turn_off.spec.tools] == [t.name for t in turn_on.spec.tools]
+    assert "conversation_search" in [t.name for t in turn_off.spec.tools]
+
+    now = datetime(2026, 11, 21, 10, 0, tzinfo=UTC)
+
+    def _claude_reply(text: str, msg_id: str) -> AIMessage:
+        return AIMessage(text, response_metadata={"claude_message_id": msg_id})
+
+    def _joined_prompt_text(prompt_out: str | list[dict[str, Any]]) -> str:
+        if isinstance(prompt_out, str):
+            return prompt_out
+        return "\n".join(str(b.get("text") or "") for b in prompt_out if b.get("type") == "text")
+
+    # 1) Turn 1 (OFF): emits OFF notice and turn_prompt frames it into <system-reminder>
+    s1_msgs = [HumanMessage("q1")]
+    entry1 = await TurnContextMiddleware(
+        now=now, timezone="UTC", conversation_search_enabled=False, claude_code=True
+    ).abefore_agent({"messages": s1_msgs})
+    assert [runtime_update_from_message(m).kind for m in entry1["messages"]] == [
+        "turn_opened",
+        TEAM_MEMORY_ROW_KIND,
+    ]
+    prompt1 = turn_prompt({"messages": [*s1_msgs, *entry1["messages"]]})
+    text1 = _joined_prompt_text(prompt1)
+    assert TEAM_MEMORY_OFF_TEXT in text1
+    assert TEAM_MEMORY_OFF_MARKER in text1
+
+    # Record CLI user entry + assistant reply
+    entries = [
+        {"uuid": "u1", "type": "user", "message": {"role": "user", "content": prompt1}},
+        {"uuid": "a1", "type": "assistant", "message": {"id": "msg_c1"}},
+    ]
+    msgs = [*s1_msgs, *entry1["messages"], _claude_reply("reply 1", "msg_c1")]
+
+    # 2) Turn 2 (still OFF): already in Claude's visible session -> no duplicate notice
+    s2_msgs = [*msgs, HumanMessage("q2")]
+    entry2 = await TurnContextMiddleware(
+        now=now, timezone="UTC", conversation_search_enabled=False, claude_code=True
+    ).abefore_agent(
+        {"messages": s2_msgs, "claude_session": {"session_id": "s1", "entries": entries}}
+    )
+    assert [runtime_update_from_message(m).kind for m in entry2["messages"]] == ["turn_opened"]
+    prompt2 = turn_prompt({"messages": [*s2_msgs, *entry2["messages"]]})
+    assert TEAM_MEMORY_OFF_MARKER not in _joined_prompt_text(prompt2)
+
+    # 3) Turn 3 (ON): flips from OFF -> ON, appends ON notice into turn_prompt; tool is already mounted
+    s3_msgs = [*s2_msgs, *entry2["messages"], _claude_reply("reply 2", "msg_c2"), HumanMessage("q3")]
+    entry3 = await TurnContextMiddleware(
+        now=now, timezone="UTC", conversation_search_enabled=True, claude_code=True
+    ).abefore_agent(
+        {"messages": s3_msgs, "claude_session": {"session_id": "s1", "entries": entries}}
+    )
+    assert [runtime_update_from_message(m).kind for m in entry3["messages"]] == [
+        "turn_opened",
+        TEAM_MEMORY_ROW_KIND,
+    ]
+    prompt3 = turn_prompt({"messages": [*s3_msgs, *entry3["messages"]]})
+    text3 = _joined_prompt_text(prompt3)
+    assert TEAM_MEMORY_ON_TEXT in text3
+    assert TEAM_MEMORY_ON_MARKER in text3
+
+    entries.extend([
+        {"uuid": "u3", "type": "user", "message": {"role": "user", "content": prompt3}},
+        {"uuid": "a3", "type": "assistant", "message": {"id": "msg_c3"}},
+    ])
+
+    # 4) Turn 4 (after Claude CLI compaction): compact_boundary drops earlier notice -> re-sends ON notice
+    compacted_entries = [
+        *entries,
+        {"uuid": "b1", "type": "system", "subtype": "compact_boundary"},
+        {"uuid": "sum1", "type": "user", "isCompactSummary": True, "message": {"role": "user", "content": "Summary"}},
+    ]
+    s4_msgs = [*s3_msgs, *entry3["messages"], _claude_reply("reply 3", "msg_c3"), HumanMessage("q4")]
+    entry4 = await TurnContextMiddleware(
+        now=now, timezone="UTC", conversation_search_enabled=True, claude_code=True
+    ).abefore_agent(
+        {"messages": s4_msgs, "claude_session": {"session_id": "s1", "entries": compacted_entries}}
+    )
+    assert [runtime_update_from_message(m).kind for m in entry4["messages"]] == [
+        "turn_opened",
+        TEAM_MEMORY_ROW_KIND,
+    ]
+    assert TEAM_MEMORY_ON_TEXT in _joined_prompt_text(
+        turn_prompt({"messages": [*s4_msgs, *entry4["messages"]]})
+    )
+
+    # 5) Legacy pre-deploy Claude Code session (no [team-memory:...] marker in entries) receives notice for both OFF & ON
+    legacy_entries = [
+        {"uuid": "lu1", "type": "user", "message": {"role": "user", "content": "old question"}},
+        {"uuid": "la1", "type": "assistant", "message": {"id": "msg_old"}},
+    ]
+    legacy_msgs = [HumanMessage("old question"), _claude_reply("old answer", "msg_old"), HumanMessage("new question")]
+    for enabled, expected_text in ((False, TEAM_MEMORY_OFF_TEXT), (True, TEAM_MEMORY_ON_TEXT)):
+        legacy_entry = await TurnContextMiddleware(
+            now=now, timezone="UTC", conversation_search_enabled=enabled, claude_code=True
+        ).abefore_agent(
+            {"messages": legacy_msgs, "claude_session": {"session_id": "s-legacy", "entries": legacy_entries}}
+        )
+        assert [runtime_update_from_message(m).kind for m in legacy_entry["messages"]] == [
+            "turn_opened",
+            TEAM_MEMORY_ROW_KIND,
+        ]
+        assert expected_text in _joined_prompt_text(
+            turn_prompt({"messages": [*legacy_msgs, *legacy_entry["messages"]]})
+        )
 
 

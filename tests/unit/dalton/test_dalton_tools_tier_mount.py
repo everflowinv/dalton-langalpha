@@ -24,7 +24,30 @@ def _tool_names(
 
 
 @pytest.mark.parametrize("role", _ROLES)
-def test_default_off_omits_conversation_search(role: str):
+def test_personal_toggle_off_still_mounts_conversation_search(role: str):
+    assert "conversation_search" in {
+        t.name
+        for t in build_dalton_tools(
+            role, None, user_tier="internal", team_memory_enabled=False
+        )
+    }
+
+
+@pytest.mark.parametrize("role", _ROLES)
+def test_deployment_conversations_disabled_omits_conversation_search(
+    role: str, monkeypatch: pytest.MonkeyPatch
+):
+    from src.dalton import settings as dalton_settings_mod
+    from src.dalton import tools as dalton_tools_mod
+
+    cfg = dalton_settings_mod.get_dalton_settings().model_copy(
+        update={
+            "conversations": dalton_settings_mod.get_dalton_settings().conversations.model_copy(
+                update={"enabled": False}
+            )
+        }
+    )
+    monkeypatch.setattr(dalton_tools_mod, "get_dalton_settings", lambda: cfg)
     assert "conversation_search" not in {
         t.name for t in build_dalton_tools(role, None, user_tier="internal")
     }

@@ -68,6 +68,7 @@ def build_context_middleware(
     switches: ProfileSwitches = ProfileSwitches(),
     # DALTON-HOOK(team-memory-toggle): actual per-turn conversation_search state for durable toggle notices
     conversation_search_enabled: bool | None = None,
+    claude_code: bool = False,
 ) -> ContextMiddleware:
     """Wire the turn row, the per-thread baseline and the tail envelope.
 
@@ -95,6 +96,7 @@ def build_context_middleware(
             home_away=turn.home_away,
             home_back=turn.home_back,
             conversation_search_enabled=conversation_search_enabled,  # DALTON-HOOK(team-memory-toggle)
+            claude_code=claude_code,  # DALTON-HOOK(team-memory-toggle)
         ),
         baseline=BaselineContextMiddleware(
             session=session,

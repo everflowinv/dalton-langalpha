@@ -39,10 +39,16 @@ def build_dalton_tools(
     tools mounted (the refusal stays the second line of defense for builds
     without a resolved tier).
 
+    ``team_memory_enabled`` is kept for signature compatibility; top-level tool
+    mounting follows deployment/tier availability only so switching the user
+    toggle never changes the top-level tool list. Per-turn enforcement uses the
+    runtime notice and ``conversation_search``'s execution-time check.
+
     ``prepare_transcription`` mounts only when ``is_transcription_enabled()``
     is true (``DALTON_TRANSCRIPTION_ENABLED`` on and storage configured); with
     the master switch off the agent never sees a tool it cannot run.
     """
+    _ = team_memory_enabled
     from src.dalton.services.transcriptions import is_transcription_enabled
     from src.dalton.settings import is_artifact_publishing_enabled
 
@@ -184,11 +190,8 @@ def build_dalton_tools(
         if settings.autonomy.enabled:
             tools.extend(build_director_tools(role=role, filesystem_backend=filesystem_backend))
             tools.extend(build_coverage_tools(role=role))
-        if (
-            settings.conversations.enabled
-            and tier_mounts_conversation_search
-            and team_memory_enabled
-        ):
+        # DALTON-HOOK(team-memory-toggle): mount conversation_search from deployment/tier availability only (not personal toggle)
+        if settings.conversations.enabled and tier_mounts_conversation_search:
             try:
                 from src.dalton.tools.conversation_tools import create_conversation_tools
 
@@ -296,11 +299,8 @@ def build_dalton_tools(
     if settings.autonomy.enabled:
         tools.extend(build_director_tools(role=role, filesystem_backend=filesystem_backend))
 
-    if (
-        settings.conversations.enabled
-        and tier_mounts_conversation_search
-        and team_memory_enabled
-    ):
+    # DALTON-HOOK(team-memory-toggle): mount conversation_search from deployment/tier availability only (not personal toggle)
+    if settings.conversations.enabled and tier_mounts_conversation_search:
         try:
             from src.dalton.tools.conversation_tools import create_conversation_tools
 
