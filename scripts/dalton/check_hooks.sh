@@ -462,6 +462,10 @@ ALLOWED_HOOKS=(
   "background-effort-low"
   # Bill completed upstream provider usage even when structured-output parsing fails or a later retry aborts (src/llms/api_call.py).
   "complete-parse-failure-billing"
+  # Execution history and automation detail last_execution computer-scope filter:
+  # include executions when either the automation's workspace or the thread's
+  # workspace belongs to computer_id (excluding Home), without duplicating rows.
+  "history-computer-scope"
   # Per-automation reasoning_effort field (d042), shared write/snapshot/file paths,
   # executor/continuation/wakeup/fallback inheritance, and MoreOptions effort selector.
   "automation-effort"
