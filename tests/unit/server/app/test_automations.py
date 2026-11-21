@@ -1438,3 +1438,97 @@ async def test_a_run_now_starts_held_to_the_computer_the_gate_checked(
 
     assert resp.status_code == 200
     assert trigger.await_args.kwargs == {"checked_computer_id": "computer-1"}
+
+
+@pytest.mark.asyncio
+async def test_computer_scope_routes_forward_computer_id_and_keep_owner_auth(
+    computer_client, monkeypatch
+):
+    """DALTON-HOOK(history-computer-scope): run feed, single-task history, and detail forward computer_id."""
+    from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID
+    from src.dalton.database import company_data_tasks as company_data_db
+    from src.dalton.notify import dispatch as notify_dispatch
+    from src.server.app import automations as automations_app
+    from tests.unit.server.dependencies.reach_world import COMPUTER
+
+    list_runs = create_autospec(
+        automations_app.exec_db.list_executions, return_value=([_run()], False)
+    )
+    get_auto = create_autospec(
+        automations_app.auto_db.get_automation,
+        return_value=_automation(user_id=USER, last_execution=_execution()),
+    )
+    owner_identity = create_autospec(
+        company_data_db.get_automation_owner_identity, return_value=None
+    )
+    company_detail = create_autospec(
+        company_data_db.get_company_agent_detail, return_value=None
+    )
+    populate_notify = create_autospec(
+        notify_dispatch.populate_automation_notify_state, return_value=None
+    )
+
+    monkeypatch.setattr(automations_app.exec_db, "list_executions", list_runs)
+    monkeypatch.setattr(automations_app.auto_db, "get_automation", get_auto)
+    monkeypatch.setattr(company_data_db, "get_automation_owner_identity", owner_identity)
+    monkeypatch.setattr(company_data_db, "get_company_agent_detail", company_detail)
+    monkeypatch.setattr(
+        notify_dispatch, "populate_automation_notify_state", populate_notify
+    )
+
+    feed_resp = await computer_client.get("/api/v1/automations/executions")
+    assert feed_resp.status_code == 200
+    list_runs.assert_awaited_once_with(
+        USER,
+        thread_id=None,
+        status=None,
+        wait_reason=None,
+        limit=20,
+        offset=0,
+        computer_id=COMPUTER,
+    )
+
+    list_runs.reset_mock()
+    scoped_resp = await computer_client.get(
+        "/api/v1/automations/executions?scope=personal"
+    )
+    assert scoped_resp.status_code == 200
+    list_runs.assert_awaited_once_with(
+        USER,
+        thread_id=None,
+        status=None,
+        wait_reason=None,
+        limit=20,
+        offset=0,
+        scope="personal",
+        computer_id=COMPUTER,
+    )
+
+    list_runs.reset_mock()
+    history_resp = await computer_client.get(f"/api/v1/automations/{AUTO_ID}/executions")
+    assert history_resp.status_code == 200
+    list_runs.assert_awaited_once_with(
+        USER,
+        automation_id=AUTO_ID,
+        limit=20,
+        offset=0,
+        computer_id=COMPUTER,
+    )
+
+    detail_resp = await computer_client.get(f"/api/v1/automations/{AUTO_ID}")
+    assert detail_resp.status_code == 200
+    assert detail_resp.json()["last_execution"]["automation_execution_id"] == EXEC_ID
+    get_auto.assert_awaited_once_with(AUTO_ID, USER, computer_id=COMPUTER)
+
+    # Unauthorized non-owner task stays 404; company task stays 403 for computer tokens.
+    get_auto.reset_mock()
+    get_auto.return_value = None
+    missing_resp = await computer_client.get(f"/api/v1/automations/{AUTO_ID}")
+    assert missing_resp.status_code == 404
+    get_auto.assert_awaited_once_with(AUTO_ID, USER, computer_id=COMPUTER)
+
+    company_detail.return_value = _automation(
+        user_id=COMPANY_SYSTEM_USER_ID, scope="company"
+    )
+    company_resp = await computer_client.get(f"/api/v1/automations/{AUTO_ID}")
+    assert company_resp.status_code == 403
