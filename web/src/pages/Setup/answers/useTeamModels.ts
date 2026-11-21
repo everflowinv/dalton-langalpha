@@ -28,7 +28,7 @@ export interface DaltonTeamModelsState {
  * available to the current member, shared across UseStep, nextSetupStep,
  * ModelStep, and DefaultStep.
  */
-export function useDaltonTeamModels(): DaltonTeamModelsState {
+function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
   const queryClient = useQueryClient();
   const { isShared, callerTierPending, canManage } = useTeamCredentials();
   const all = useAllModels();
@@ -65,3 +65,31 @@ export function useDaltonTeamModels(): DaltonTeamModelsState {
     all,
   };
 }
+
+const noopRetry = () => {};
+
+/**
+ * Non-Dalton builds: team sharing never applies, so read neither auth nor the
+ * team credentials status (upstream Setup steps render outside AuthProvider in
+ * their tests). Only the model catalog is read, as upstream DefaultStep did.
+ */
+function useInertTeamModels(): DaltonTeamModelsState {
+  const all = useAllModels();
+  return {
+    shared: false,
+    available: false,
+    empty: false,
+    isLoading: false,
+    unread: false,
+    canManage: true,
+    callerTierPending: false,
+    retry: noopRetry,
+    all,
+  };
+}
+
+// `isDaltonBuild` is fixed at build time, so each build always calls the same hooks.
+export const useDaltonTeamModels: () => DaltonTeamModelsState = isDaltonBuild
+  ? useDaltonTeamModelsImpl
+  : useInertTeamModels;
+

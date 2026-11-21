@@ -26,7 +26,7 @@ import {
   filterDaltonPayers,
   filterDaltonProviderModels,
 } from '@/config/daltonSetup';
-import { useTeamCredentials } from '@/hooks/useTeamCredentials';
+import { useDaltonTeamModels } from '../answers/useTeamModels';
 
 // ---------------------------------------------------------------------------
 // DefaultsStep — Step 5: Set default primary + Background models
@@ -53,7 +53,7 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
   const updatePreferences = useUpdatePreferences();
   const { t } = useTranslation();
   const copy = useModelSlotCopy();
-  const { isShared: teamShared } = useTeamCredentials();
+  const teamShared = useDaltonTeamModels().shared;
   const headingId = useId();
 
   // DALTON-HOOK(dalton-setup): filter out credits & Claude Code models under Dalton
