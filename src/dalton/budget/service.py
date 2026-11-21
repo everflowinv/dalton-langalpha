@@ -29,7 +29,10 @@ from src.dalton.database.budget import (
     upsert_task_cap,
     verify_task_cap_scope_owner,
 )
-from src.dalton.database.llm_journal import fetch_journal_rows_in_window
+from src.dalton.database.llm_journal import (
+    count_unknown_usage_in_row,
+    fetch_journal_rows_in_window,
+)
 from src.dalton.llm.notional_pricing import (
     build_notional_price_index,
     calculate_notional_cost,
@@ -272,6 +275,7 @@ def compute_provider_breakdown(
                 "cash_usd": Decimal("0"),
                 "notional_usd": Decimal("0"),
                 "calls": 0,
+                "unknown_usage_calls": 0,
             }
         return buckets[prov]
 
@@ -332,13 +336,21 @@ def compute_provider_breakdown(
                     b["cash_usd"] += cost_dec
 
     for j in journal_rows or []:
-        if not isinstance(j, dict) or j.get("state") not in ("done", "indeterminate"):
+        if not isinstance(j, dict):
+            continue
+        cash_val = Decimal(str(j.get("cash_usd") or "0"))
+        notional_val = Decimal(str(j.get("notional_usd") or "0"))
+        unknown_cnt = count_unknown_usage_in_row(j)
+        if (
+            j.get("state") not in ("done", "indeterminate")
+            and cash_val <= Decimal("0")
+            and notional_val <= Decimal("0")
+            and unknown_cnt <= 0
+        ):
             continue
         m_name = str(j.get("model_key") or "unknown")
         b_type = str(j.get("billing_type") or "platform")
         j_prov = str(j.get("provider") or "") or None
-        cash_val = Decimal(str(j.get("cash_usd") or "0"))
-        notional_val = Decimal(str(j.get("notional_usd") or "0"))
         is_sub = _is_subscription_model(
             m_name,
             b_type,
@@ -353,20 +365,25 @@ def compute_provider_breakdown(
         )
         b = _ensure(prov)
         b["calls"] += 1
+        if unknown_cnt > 0:
+            b["unknown_usage_calls"] += unknown_cnt
         if is_sub:
             b["notional_usd"] += notional_val if notional_val > Decimal("0") else cash_val
         else:
             b["cash_usd"] += cash_val
             b["notional_usd"] += notional_val
 
-    return {
-        prov: {
+    out: dict[str, dict[str, Any]] = {}
+    for prov, vals in sorted(buckets.items()):
+        entry: dict[str, Any] = {
             "cash_usd": float(vals["cash_usd"].quantize(Decimal("0.000001"))),
             "notional_usd": float(vals["notional_usd"].quantize(Decimal("0.000001"))),
             "calls": int(vals["calls"]),
         }
-        for prov, vals in sorted(buckets.items())
-    }
+        if vals["unknown_usage_calls"] > 0:
+            entry["unknown_usage_calls"] = int(vals["unknown_usage_calls"])
+        out[prov] = entry
+    return out
 
 
 async def resolve_user_budget_config(conn: Any, user_id: str) -> dict[str, Any]:
@@ -452,12 +469,44 @@ async def reconcile_and_summarize_day(
         (
             Decimal(str(j.get("notional_usd") or "0"))
             for j in journal_rows
-            if isinstance(j, dict) and j.get("state") in ("done", "indeterminate")
+            if isinstance(j, dict)
+            and (
+                j.get("state") in ("done", "indeterminate")
+                or Decimal(str(j.get("notional_usd") or "0")) > Decimal("0")
+            )
         ),
         Decimal("0"),
     )
     sub_notional_usd = compute_subscription_notional_usd(tu_rows) + journal_notional_usd
     by_provider = compute_provider_breakdown(tu_rows, journal_rows)
+
+    journal_unknown_usage_rows = [
+        j for j in journal_rows if isinstance(j, dict) and count_unknown_usage_in_row(j) > 0
+    ]
+    journal_unknown_usage_count = sum(
+        count_unknown_usage_in_row(j) for j in journal_unknown_usage_rows
+    )
+    journal_unknown_usage_cash_count = sum(
+        count_unknown_usage_in_row(j)
+        for j in journal_unknown_usage_rows
+        if not _is_subscription_model(
+            str(j.get("model_key") or "unknown"),
+            str(j.get("billing_type") or "platform"),
+            pricing_provider=str(j.get("provider") or "") or None,
+        )
+    )
+    journal_unknown_usage_calls = [
+        {
+            "invocation_id": str(j.get("invocation_id") or ""),
+            "model_key": str(j.get("model_key") or ""),
+            "provider": j.get("provider"),
+            "billing_type": str(j.get("billing_type") or "platform"),
+            "error_kind": j.get("error_kind"),
+            "attempt": int(j.get("attempt") or 1),
+            "cash_usd": float(Decimal(str(j.get("cash_usd") or "0"))),
+        }
+        for j in journal_unknown_usage_rows[:20]
+    ]
 
     settled_usd = Decimal("0")
     open_reserved_usd = Decimal("0")
@@ -509,6 +558,9 @@ async def reconcile_and_summarize_day(
         "expired_conservative_usd": float(expired_conservative_usd),
         "unreserved_usage_usd": float(unreserved_usd),
         "journal_cash_usd": float(journal_cash_usd),
+        "journal_unknown_usage_count": journal_unknown_usage_count,
+        "journal_unknown_usage_cash_count": journal_unknown_usage_cash_count,
+        "journal_unknown_usage_calls": journal_unknown_usage_calls,
         "spent_usd": float(spent_usd),
         "remaining_usd": float(remaining_usd),
         "subscription_notional_usd": float(sub_notional_usd),

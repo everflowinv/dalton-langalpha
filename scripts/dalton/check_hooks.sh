@@ -460,6 +460,8 @@ ALLOWED_HOOKS=(
   "browser-kill-switch"
   # Background-slot calls default to low reasoning effort (src/server/services/llm/config.py).
   "background-effort-low"
+  # Bill completed upstream provider usage even when structured-output parsing fails or a later retry aborts (src/llms/api_call.py).
+  "complete-parse-failure-billing"
   # Surface terminal/partial/retrying delivery outcomes on completed executions
   # in execution history, detail, CoS activity, ThreadStatus, and automation state files.
   "execution-delivery-status"

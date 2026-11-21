@@ -516,19 +516,45 @@ async def fetch_journal_cash_today(
     day_end_utc: datetime,
     user_id: str | None = None,
 ) -> Decimal:
-    """Sum `cash_usd` from `dalton_llm_journal` for today where `state IN ('done', 'indeterminate')` (P0N.6 §5, P0N.7, P0H §5 B2).
+    """Sum `cash_usd` for today's one-shot journal attempts attributed by each attempt's
+    `occurred_at` (with legacy fallback for `dalton_llm_journal` rows that predate
+    `dalton_llm_journal_attempts`) (P0N.6 §5, P0N.7, P0H §5 B2).
 
     Fails closed by logging ERROR and re-raising on DB query failure.
     """
     query = """
         SELECT COALESCE(SUM(cash_usd), 0) AS journal_cash_usd
-        FROM dalton_llm_journal
-        WHERE created_at >= %s
-          AND created_at < %s
-          AND state IN ('done', 'indeterminate')
-          AND (%s::text IS NULL OR user_id = %s OR user_id IS NULL)
+        FROM (
+            SELECT a.cash_usd
+            FROM dalton_llm_journal_attempts a
+            WHERE a.occurred_at >= %s
+              AND a.occurred_at < %s
+              AND (a.outcome IN ('done', 'indeterminate') OR a.cash_usd > 0)
+              AND (%s::text IS NULL OR a.user_id = %s OR a.user_id IS NULL)
+            UNION ALL
+            SELECT j.cash_usd
+            FROM dalton_llm_journal j
+            WHERE j.created_at >= %s
+              AND j.created_at < %s
+              AND (j.state IN ('done', 'indeterminate') OR j.cash_usd > 0)
+              AND (%s::text IS NULL OR j.user_id = %s OR j.user_id IS NULL)
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM dalton_llm_journal_attempts a
+                  WHERE a.invocation_id = j.invocation_id
+              )
+        ) AS billed
     """
-    params = (day_start_utc, day_end_utc, user_id, user_id)
+    params = (
+        day_start_utc,
+        day_end_utc,
+        user_id,
+        user_id,
+        day_start_utc,
+        day_end_utc,
+        user_id,
+        user_id,
+    )
     try:
         if hasattr(conn_or_cur, "cursor"):
             async with conn_or_cur.cursor(row_factory=dict_row) as cur:
@@ -602,15 +628,30 @@ async def fetch_scoped_task_spend(
     scope_token = str(thread_id or workspace_id or "").strip()
     if scope_token and hasattr(conn, "cursor"):
         async with conn.cursor(row_factory=dict_row) as cur:
+            scope_like = f"%{scope_token}%"
             await cur.execute(
                 """
                 SELECT COALESCE(SUM(cash_usd), 0) AS journal_scoped_usd
-                FROM dalton_llm_journal
-                WHERE state IN ('done', 'indeterminate')
-                  AND (%s::text IS NULL OR user_id = %s OR user_id IS NULL)
-                  AND scope_ref LIKE %s
+                FROM (
+                    SELECT a.cash_usd
+                    FROM dalton_llm_journal_attempts a
+                    WHERE (a.outcome IN ('done', 'indeterminate') OR a.cash_usd > 0)
+                      AND (%s::text IS NULL OR a.user_id = %s OR a.user_id IS NULL)
+                      AND a.scope_ref LIKE %s
+                    UNION ALL
+                    SELECT j.cash_usd
+                    FROM dalton_llm_journal j
+                    WHERE (j.state IN ('done', 'indeterminate') OR j.cash_usd > 0)
+                      AND (%s::text IS NULL OR j.user_id = %s OR j.user_id IS NULL)
+                      AND j.scope_ref LIKE %s
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM dalton_llm_journal_attempts a
+                          WHERE a.invocation_id = j.invocation_id
+                      )
+                ) AS scoped
                 """,
-                (user_id, user_id, f"%{scope_token}%"),
+                (user_id, user_id, scope_like, user_id, user_id, scope_like),
             )
             j_row = await cur.fetchone()
             if isinstance(j_row, dict):
