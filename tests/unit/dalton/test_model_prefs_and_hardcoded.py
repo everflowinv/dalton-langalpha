@@ -29,6 +29,12 @@ _MODEL_LITERAL_RE = re.compile(
 # Every entry here is a provider ID, a family/broker prefix pattern (ending with '-' or '-oauth'),
 # an OAuth CLI User-Agent, a nominal price fallback, or a persisted embedding format identifier.
 HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
+    ("llm/antigravity_series.py", "antigravity-oauth"): "Provider id the series grouping matches on",
+    ("llm/antigravity_series.py", "-oauth"): "Catalog key suffix stripped before parsing the effort",
+    ("llm/antigravity_series.py", "gemini-4-neon"): "User-confirmed series default effort table (single config point)",
+    ("llm/antigravity_series.py", "gemini-4-hydrogen"): "User-confirmed series default effort table (single config point)",
+    ("llm/antigravity_series.py", "gemini-4-argon"): "User-confirmed series default effort table (single config point)",
+    ("llm/antigravity_series.py", "gemini-4-carbon"): "User-confirmed series default effort table (single config point)",
     ("tools/ai_finance_signals_tools.py", "gemini-embedding-2"): (
         "Validates the migrated signal store's fixed 768-dimensional embedding format; "
         "does not select the conversation model."

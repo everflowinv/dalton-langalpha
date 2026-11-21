@@ -18,15 +18,12 @@ import { apiErrorDetail } from '@/api/errors';
 import { suggestBackgroundModel } from './suggestBackgroundModel';
 import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
 // DALTON-HOOK(dalton-setup): Dalton build defaults, unified team-model availability, and credits/Claude Code filtering
-import { getModelDisplayName } from '@/components/ui/chat-input.helpers';
 import { isDaltonBuild } from '@/config/brand';
 import {
   DALTON_BACKGROUND_MODEL,
   DALTON_DEFAULT_MODEL,
-  dedupeDaltonBackgroundModels,
   filterDaltonPayers,
   filterDaltonProviderModels,
-  stripEffortFromModelLabel,
 } from '@/config/daltonSetup';
 import { RowButton, StepLoadFailed } from '../answers/parts';
 import { useDaltonTeamModels } from '../answers/useTeamModels';
@@ -53,7 +50,8 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
   const navigate = useNavigate();
   // DALTON-HOOK(dalton-setup): read unified Dalton team-model availability instead of raw sharing flag
   const team = useDaltonTeamModels();
-  const { models, slotModels, metadata, payers, systemDefaults, isLoading } = team.all;
+  const { models, slotModels, metadata, payers, systemDefaults, isLoading, seriesCatalog, customModels, rawApiResponse } = team.all;
+  const rawMetadata = rawApiResponse?.model_metadata ?? metadata;
   const { preferences } = usePreferences();
   const updatePreferences = useUpdatePreferences();
   const { t } = useTranslation();
@@ -234,18 +232,21 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
         </p>
       </div>
 
-      {/* DALTON-HOOK(dalton-setup): dedupe background effort variants & omit effort suffix in Dalton */}
+      {/* DALTON-HOOK(antigravity-series): collapse background effort variants to -low & omit effort suffix via series catalog */}
       <ModelTierConfig
         models={visibleModels}
-        backgroundModels={dedupeDaltonBackgroundModels(visibleSlotModels, isDaltonBuild)}
+        backgroundModels={visibleSlotModels}
         primaryModel={primaryModel}
         onPrimaryModelChange={setPrimaryModel}
         backgroundModel={backgroundModel}
         onBackgroundModelChange={setBackgroundModel}
-        backgroundNameOf={isDaltonBuild ? (m) => stripEffortFromModelLabel(getModelDisplayName(m, metadata)) : undefined}
         showExplainer
         payers={visiblePayers}
         metadata={metadata}
+        seriesCatalog={seriesCatalog}
+        rawMetadata={rawMetadata}
+        customModels={customModels}
+        hideEffortPicker
       />
 
       {/* Routing models. Folded away because a first run never needs them, and

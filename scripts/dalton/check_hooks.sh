@@ -451,6 +451,9 @@ ALLOWED_HOOKS=(
   # Preserve server-written dalton_historical_duplicate_of marker in
   # SERVER_OWNED_CONFIG_KEYS across whole-config replacements (workspace.py).
   "historical-duplicate-marker"
+  # Collapse Antigravity model variants into series + reasoning-effort pickers
+  # across UI selectors while preserving suffixed model IDs on the wire.
+  "antigravity-series"
   # SYNC10 (#831): deployment kill switch for the built-in browser — skips
   # browser_runtime / agent-browser wrapper uploads, browser-quality sync &
   # endpoint, browser_available, and default sandbox image agent-browser install.

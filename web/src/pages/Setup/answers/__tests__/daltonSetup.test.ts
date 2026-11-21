@@ -1,14 +1,15 @@
-// DALTON-HOOK(dalton-setup): unit tests for Dalton setup candidate list, background default, and effort label stripping
+// DALTON-HOOK(dalton-setup): unit tests for Dalton setup candidate list and background defaults
 import { describe, expect, it } from 'vitest';
 import {
   DALTON_BACKGROUND_MODEL,
+  DALTON_BACKGROUND_SERIES,
   DALTON_DEFAULT_MODEL,
   DALTON_SETUP_CANDIDATES,
-  dedupeDaltonBackgroundModels,
   filterDaltonCuratedModels,
+  resolveDaltonSeriesDefaultModel,
   resolveDaltonSetupCandidates,
-  stripEffortFromModelLabel,
 } from '@/config/daltonSetup';
+import { buildSeriesCatalog } from '@/lib/antigravitySeries';
 import { defaultChoices } from '../defaultChoices';
 
 describe('daltonSetup candidate list & background defaults', () => {
@@ -67,40 +68,31 @@ describe('daltonSetup candidate list & background defaults', () => {
     ]);
   });
 
-  it('strips trailing effort labels for the fixed-low background dropdown', () => {
-    expect(stripEffortFromModelLabel('Gemini 4 Hydrogen Low')).toBe('Gemini 4 Hydrogen');
-    expect(stripEffortFromModelLabel('Gemini 4 Hydrogen (low)')).toBe('Gemini 4 Hydrogen');
-    expect(stripEffortFromModelLabel('Gemini 4 Neon High')).toBe('Gemini 4 Neon');
-    expect(stripEffortFromModelLabel('Gemini 4 Hydrogen Xhigh')).toBe('Gemini 4 Hydrogen');
-    expect(stripEffortFromModelLabel('GPT-6.2 Astra')).toBe('GPT-6.2 Astra');
-    expect(stripEffortFromModelLabel('GPT 5 Mini')).toBe('GPT 5 Mini');
-  });
-
-  it('dedupes background effort siblings preferring -low', () => {
-    const deduped = dedupeDaltonBackgroundModels(
+  it('resolves background series to -low even when the series default_effort is high', () => {
+    const seriesCatalog = buildSeriesCatalog([
       {
-        'antigravity-oauth': {
-          display_name: 'Antigravity',
-          models: [
-            'gemini-4-hydrogen-high-oauth',
-            'gemini-4-hydrogen-low-oauth',
-            'gemini-4-hydrogen-medium-oauth',
-            'gemini-4-neon-high-oauth',
-            'gemini-4-neon-low-oauth',
-          ],
-        },
-        'codex-oauth': {
-          display_name: 'Codex',
-          models: ['gpt-6.2-astra-oauth', 'gpt-6.2-sol-oauth'],
+        series_id: DALTON_BACKGROUND_SERIES,
+        series_prefix: 'gemini-4-hydrogen',
+        provider: 'antigravity-oauth',
+        display_name: 'Gemini 4 Hydrogen',
+        qualified_display_name: 'Gemini 4 Hydrogen (Antigravity)',
+        default_effort: 'high',
+        default_model: 'gemini-4-hydrogen-high-oauth',
+        efforts: ['low', 'medium', 'high'],
+        variants: {
+          low: 'gemini-4-hydrogen-low-oauth',
+          medium: 'gemini-4-hydrogen-medium-oauth',
+          high: 'gemini-4-hydrogen-high-oauth',
         },
       },
-      true,
-    );
-    expect(deduped['antigravity-oauth'].models).toEqual([
-      'gemini-4-hydrogen-low-oauth',
-      'gemini-4-neon-low-oauth',
     ]);
-    expect(deduped['codex-oauth'].models).toEqual(['gpt-6.2-astra-oauth', 'gpt-6.2-sol-oauth']);
+    expect(
+      resolveDaltonSeriesDefaultModel(
+        DALTON_BACKGROUND_SERIES,
+        ['gemini-4-hydrogen-high-oauth', 'gemini-4-hydrogen-medium-oauth', 'gemini-4-hydrogen-low-oauth'],
+        { seriesCatalog, fallbackModel: DALTON_BACKGROUND_MODEL, preferLowEffort: true },
+      ),
+    ).toBe('gemini-4-hydrogen-low-oauth');
   });
 
   it('narrows Customize provider groups to curated 5 in fixed order', () => {

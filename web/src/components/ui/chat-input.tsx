@@ -30,7 +30,9 @@ import './chat-input.css';
 import type { ComposerDraft, ComposerScope, ComposerSend, ContextPayload, ModelOptions, QuoteMention, ReadyAttachment, SlashCommand, ThreadTuning, Workspace } from './chat-input.types';
 import { isLargePaste, getModelDisplayName, MAX_FILES, sameMention } from './chat-input.helpers'; // DALTON-HOOK(chat-attachment-count)
 import { useToast } from './use-toast';
-import { effortLabelFor, resolveEffort } from '@/lib/modelTuning';
+import { effortLabelFor, effortOptions, resolveEffort } from '@/lib/modelTuning';
+// DALTON-HOOK(antigravity-series): series display name, effort switching, and collapsed picker wiring
+import { inspectSavedAntigravityModel, sameAntigravitySeries } from '@/lib/antigravitySeries';
 import { ChatInputWidgetDeck, MentionAutocompleteList, SlashCommandList } from './chat-input.parts';
 import {
   ComposerAttachments, ComposerChips, DraftTokenLayer, DropOverlay, FilesHoldHint, SendStopButton, ToolbarOverflowMenu, VoiceButton, VoiceOverlay,
@@ -299,7 +301,19 @@ function ChatInput({
   const isMobile = useIsMobile();
   const { preferences, isLoaded: preferencesRead } = usePreferences();
   const marketWatchEnabled = useFeatureEnabled('market_watch');
-  const { models: visibleModels, validModelNames, metadata: modelMetadata, payers, isLoading: modelsLoading } = useAllModels();
+  const {
+    models: visibleModels,
+    validModelNames,
+    metadata: modelMetadata,
+    payers,
+    isLoading: modelsLoading,
+    // DALTON-HOOK(antigravity-series): read seriesCatalog, selectableSeries, customModels & rawMetadata
+    seriesCatalog,
+    selectableSeries,
+    customModels,
+    rawApiResponse,
+  } = useAllModels();
+  const rawMetadata = rawApiResponse?.model_metadata ?? modelMetadata;
   const lapsedSignIn = useLapsedSignIn();
   const otherPref = (preferences as Record<string, Record<string, unknown>> | null)?.other_preference;
   // DALTON-HOOK(composer-drafts): persist unsent composer text in localStorage when draftKey is set
@@ -409,6 +423,27 @@ function ChatInput({
   // else what the model declares. The level is clamped onto the model's
   // ladder, as the server runs it, so the menu's Default names one it lists.
   const { efforts: reasoningEfforts, effective: settingsTuning } = useEffectiveTuning(pillModel);
+  // DALTON-HOOK(antigravity-series): resolve Antigravity series membership & available series efforts
+  const pillSeriesMatch = useMemo(
+    () => inspectSavedAntigravityModel(pillModel, { seriesCatalog, rawMetadata, customModels }),
+    [pillModel, seriesCatalog, rawMetadata, customModels],
+  );
+  const pillSelectableSeries = useMemo(
+    () => (pillSeriesMatch
+      ? selectableSeries?.find((s) => s.seriesId === pillSeriesMatch.series.series_id) ?? null
+      : null),
+    [pillSeriesMatch, selectableSeries],
+  );
+  const seriesEfforts = useMemo(
+    () => (pillSeriesMatch
+      ? effortOptions(pillSelectableSeries?.efforts ?? [], pillSeriesMatch.effort)
+      : []),
+    [pillSeriesMatch, pillSelectableSeries],
+  );
+  const seriesDefaultEffort = pillSeriesMatch
+    ? (pillSelectableSeries?.defaultEffort ?? pillSeriesMatch.series.default_effort)
+    : null;
+  const pillDisplayName = pillSeriesMatch?.displayName ?? getModelDisplayName(pillModel, modelMetadata);
   const settingsEffort = settingsTuning.reasoning_effort && reasoningEfforts.length > 0
     ? resolveEffort(settingsTuning.reasoning_effort, reasoningEfforts)
     : settingsTuning.reasoning_effort;
@@ -418,27 +453,17 @@ function ChatInput({
   // one the composer holds them, following Settings until touched.
   const [ownTuning, setOwnTuning] = useState<{ reasoningEffort: string | null; fastMode: boolean | null }>(FOLLOWS_SETTINGS);
   const tuning = hostTuning === undefined ? ownTuning : hostTuning;
-  // What a send carries as the turn's level, and what the pill shows of it.
-  // Saves and Settings writes are optimistic and not awaited, so between a
-  // pick and its write landing the composer already shows the pick while the
-  // row the server reads still holds the old level. Sending nothing would let
-  // the server resolve against the row the write is still replacing, so the
-  // turn runs a setting the screen no longer shows. Sending what is displayed
-  // cannot disagree with it. The level goes out unclamped, as the row holds
-  // it: every client of the turn, a fallback model included, clamps it onto
-  // its own ladder, and a turn no composer started reads the same level from
-  // the row. Only the pill clamps, onto this model's ladder, which names none
-  // until the ladder is known. A thread whose row is unread shows and sends
-  // none, since Settings may not be what it runs, and the server runs the
-  // thread's own.
   const sentEffort = tuning.reasoningEffort === undefined
     ? null
     : tuning.reasoningEffort ?? settingsTuning.reasoning_effort;
-  const resolvedEffort = tuning.reasoningEffort === undefined
-    ? null
-    : tuning.reasoningEffort === null
-      ? settingsEffort
-      : resolveEffort(tuning.reasoningEffort, reasoningEfforts);
+  // DALTON-HOOK(antigravity-series): derive pill effort from saved Antigravity variant
+  const resolvedEffort = pillSeriesMatch
+    ? pillSeriesMatch.effort
+    : tuning.reasoningEffort === undefined
+      ? null
+      : tuning.reasoningEffort === null
+        ? settingsEffort
+        : resolveEffort(tuning.reasoningEffort, reasoningEfforts);
   const resolvedFastMode = tuning.fastMode === undefined ? null : tuning.fastMode ?? settingsFast;
   // A composer with no thread behind it hands its picks to the thread its
   // send starts, which keeps them as its own.
@@ -469,9 +494,16 @@ function ChatInput({
     if (model === pillModel) return;
     if (hostModel === undefined) setOwnModel(model);
     else onPickModel?.(model);
-  }, [pillModel, hostModel, setOwnModel, onPickModel]);
+    // DALTON-HOOK(antigravity-series): reset local composer reasoningEffort when picking an Antigravity variant
+    if (
+      hostTuning === undefined
+      && inspectSavedAntigravityModel(model, { seriesCatalog, rawMetadata, customModels })
+    ) {
+      setOwnTuning((prev) => ({ ...prev, reasoningEffort: null }));
+    }
+  }, [pillModel, hostModel, setOwnModel, onPickModel, hostTuning, seriesCatalog, rawMetadata, customModels]);
 
-  const isCodexModel = pillModel ? modelMetadata[pillModel]?.sdk === 'codex' : false;
+  const isCodexModel = !pillSeriesMatch && pillModel ? modelMetadata[pillModel]?.sdk === 'codex' : false;
 
   // Widget context deck state lives above useFileAttachments so image-bearing
   // snapshots reserve slots against MAX_FILES. Each input mirrors the same
@@ -768,11 +800,26 @@ function ChatInput({
 
   // The menu names null for the level Settings gives, which returns the
   // thread to following Settings rather than pinning today's value.
+  // DALTON-HOOK(antigravity-series): for Antigravity series, switching effort picks the series variant key
   const handleReasoningEffortChange = useCallback((effort: string | null) => {
+    if (pillSeriesMatch) {
+      if (!effort) return;
+      const targetKey = pillSelectableSeries?.variants[effort] ?? pillSeriesMatch.series.variants[effort];
+      if (!targetKey || targetKey === pillModel) return;
+      if (hostModel === undefined) setOwnModel(targetKey);
+      else onPickModel?.(targetKey);
+      if (hostTuning === undefined) {
+        setOwnTuning((prev) => ({ ...prev, reasoningEffort: null }));
+      }
+      return;
+    }
     if (effort === tuning.reasoningEffort) return;
     if (hostTuning === undefined) setOwnTuning((prev) => ({ ...prev, reasoningEffort: effort }));
     else onPickReasoningEffort?.(effort);
-  }, [tuning.reasoningEffort, hostTuning, onPickReasoningEffort]);
+  }, [
+    pillSeriesMatch, pillSelectableSeries, pillModel, hostModel, setOwnModel, onPickModel,
+    tuning.reasoningEffort, hostTuning, onPickReasoningEffort,
+  ]);
 
   // Speed has no Default of its own in the menu, so the side Settings is on
   // stands for it: flipping there follows Settings again.
@@ -1082,13 +1129,18 @@ function ChatInput({
     draftRef: textareaRef,
   });
   // The effort pill sits beside the model pill and folds last (`slot: 'right'`).
+  // DALTON-HOOK(antigravity-series): Antigravity series offers effort switching only when > 1 effort exists
   const effortLabel = effortLabelFor(t, resolvedEffort);
   const taskCost = pillModel ? modelMetadata[pillModel]?.task_cost : undefined;
+  const menuReasoningEfforts = pillSeriesMatch
+    ? (seriesEfforts.length > 1 ? seriesEfforts : [])
+    : reasoningEfforts;
+  const menuDefaultEffort = pillSeriesMatch ? seriesDefaultEffort : settingsEffort;
   const effortProps = useMemo<EffortMenuProps>(() => ({
     effortLabel,
     reasoningEffort: resolvedEffort,
-    defaultEffort: settingsEffort,
-    reasoningEfforts,
+    defaultEffort: menuDefaultEffort,
+    reasoningEfforts: menuReasoningEfforts,
     onReasoningEffortChange: handleReasoningEffortChange,
     fastMode: resolvedFastMode,
     onFastModeChange: handleFastModeChange,
@@ -1097,9 +1149,10 @@ function ChatInput({
     container: chatContainer,
     taskCost,
     disabled: modelsLoading,
+    exactEffort: !!pillSeriesMatch,
   }), [
-    effortLabel, resolvedEffort, settingsEffort, reasoningEfforts, handleReasoningEffortChange, resolvedFastMode,
-    handleFastModeChange, isCodexModel, dropdownDirection, chatContainer, taskCost, modelsLoading,
+    effortLabel, resolvedEffort, menuDefaultEffort, menuReasoningEfforts, handleReasoningEffortChange, resolvedFastMode,
+    handleFastModeChange, isCodexModel, dropdownDirection, chatContainer, taskCost, modelsLoading, pillSeriesMatch,
   ]);
   const effortItem = useEffortToolbarItem(effortProps, isMobile);
   const foldItems = useMemo(() => [...toolbarItems, effortItem], [toolbarItems, effortItem]);
@@ -1117,7 +1170,8 @@ function ChatInput({
     // The model pill is measured too, but it isn't foldable. Its label joins
     // the key because an authored display_name comes with the models request,
     // which can land after the pill was first measured under the key's label.
-    measureKey: `${pillModel}|${getModelDisplayName(pillModel, modelMetadata)}|${resolvedEffort}|${resolvedFastMode && isCodexModel}`,
+    // DALTON-HOOK(antigravity-series): include series display name in pill measurement key
+    measureKey: `${pillModel}|${pillDisplayName}|${resolvedEffort}|${resolvedFastMode && isCodexModel}`,
     // Left of the first pill: container border + px-3, the attach button, and
     // the optional ring / chart-capture button (see the action bar below).
     fixedLeft: CONTAINER_BORDER + CONTAINER_PX + ICON_BUTTON_W
@@ -1160,8 +1214,11 @@ function ChatInput({
       };
     },
   }), [turn.models, visibleModels, payers, entryFor]);
+  // DALTON-HOOK(antigravity-series): deduplicate recent items by Antigravity series against favorites
   const recentModels = deriveRecentModels({ selectedModel: pillModel, threadModels: threadModelsProp, validModelNames })
-    .filter((m) => !favorites.models.includes(m));
+    .filter((m) => !favorites.models.some((fav) => (
+      fav === m || sameAntigravitySeries(m, fav, { seriesCatalog, rawMetadata, customModels })
+    )));
   const modelRowStatus = (m: string, now: number): ModelRowStatus => {
     // A favorite or a thread's model a rule keeps a turn off stays listed and
     // says which rule; nothing the user does here frees it.
@@ -1467,25 +1524,32 @@ function ChatInput({
                   <span key={item.id} data-measure={item.id}>{item.inline({ measureOnly: true })}</span>
                 ))}
                 <span data-measure="model">
-                  <ModelTriggerMeasure pill="model" selectedModel={pillModel} metadata={modelMetadata} />
+                  <ModelTriggerMeasure pill="model" selectedModel={pillModel} displayName={pillDisplayName} metadata={modelMetadata} />
                 </span>
                 <span data-measure="modelFloor">
-                  <ModelTriggerMeasure pill="model" selectedModel={pillModel} metadata={modelMetadata} floor />
+                  <ModelTriggerMeasure pill="model" selectedModel={pillModel} displayName={pillDisplayName} metadata={modelMetadata} floor />
                 </span>
               </div>
             </div>
 
             {/* Right Tools */}
             <div className="flex flex-row items-center min-w-0 gap-1">
+              {/* DALTON-HOOK(antigravity-series): pass series catalogs & collapsed displayName into ChatInputModelMenu */}
               <ChatInputModelMenu
                 selectedModel={pillModel}
+                displayName={pillDisplayName}
                 metadata={modelMetadata}
                 payers={payers}
                 groups={modelGroupList}
                 favorites={favorites.models}
                 recent={recentModels}
                 onToggleFavorite={(m, on) => (on ? favorites.add(m) : favorites.remove(m))}
+                onToggleFavoriteMany={(ms, on) => (!on ? favorites.removeMany(ms) : ms.forEach((m) => favorites.add(m)))}
                 onSelectModel={handlePickModel}
+                seriesCatalog={seriesCatalog}
+                selectableSeries={selectableSeries}
+                rawMetadata={rawMetadata}
+                customModels={customModels}
                 rowStatus={modelRowStatus}
                 planMeter={claudeCode.meter}
                 dropdownDirection={dropdownDirection}

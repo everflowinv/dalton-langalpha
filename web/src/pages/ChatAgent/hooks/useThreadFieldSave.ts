@@ -13,6 +13,8 @@ export interface ThreadFieldSave<V> {
   value: V;
   /** What the composer showed before this save, put back if it fails. */
   before: V | null;
+  // DALTON-HOOK(antigravity-series): optional extra fields sent atomically in the same PATCH (e.g. clearing reasoning_effort)
+  extraUpdates?: Partial<ThreadUpdates>;
 }
 
 interface UseThreadFieldSaveOptions<F extends ThreadField> {
@@ -28,7 +30,10 @@ interface UseThreadFieldSaveOptions<F extends ThreadField> {
 }
 
 /** What the server is known to hold, or null when no row was cached to restore. */
-type Known<F extends ThreadField> = { value: Thread[F] } | null;
+type Known<F extends ThreadField> = {
+  value: Thread[F];
+  extra?: Partial<Thread>;
+} | null;
 
 /**
  * Saves one field of a thread row the way a composer needs it. The cached
@@ -68,16 +73,22 @@ export function useThreadFieldSave<F extends ThreadField>({
   const { mutateAsync } = useMutation({
     mutationKey: threadFieldMutationKey(threadId ?? '', field),
     scope: { id: `thread-field:${field}:${threadId ?? ''}` },
-    mutationFn: ({ threadId: id, value }: ThreadFieldSave<FieldValue<F>>) => (
-      updateThread(id, { [field]: value } as ThreadUpdates)
+    mutationFn: ({ threadId: id, value, extraUpdates }: ThreadFieldSave<FieldValue<F>>) => (
+      // DALTON-HOOK(antigravity-series): merge extraUpdates into the same single PATCH request
+      updateThread(id, { [field]: value, ...(extraUpdates ?? {}) } as ThreadUpdates)
     ),
-    onMutate: async ({ threadId: id, value }: ThreadFieldSave<FieldValue<F>>) => {
+    onMutate: async ({ threadId: id, value, extraUpdates }: ThreadFieldSave<FieldValue<F>>) => {
       const key = queryKeys.threads.detail(id);
       // Read before the await, so a second save cannot slip in between the
       // count and the snapshot. This save already counts, so 1 means no other
       // is out and the cached row is the server's.
       const cached = queryClient.getQueryData<Thread>(key);
-      const previous: Known<F> = cached ? { value: cached[field] } : null;
+      const extraPrev: Partial<Thread> | undefined = cached && extraUpdates
+        ? Object.fromEntries(
+            Object.keys(extraUpdates).map((k) => [k, cached[k as keyof Thread]]),
+          ) as Partial<Thread>
+        : undefined;
+      const previous: Known<F> = cached ? { value: cached[field], ...(extraPrev ? { extra: extraPrev } : {}) } : null;
       if (queryClient.isMutating({ mutationKey: threadFieldMutationKey(id, field) }) === 1) {
         confirmedRef.current.set(id, previous);
       }
@@ -89,11 +100,20 @@ export function useThreadFieldSave<F extends ThreadField>({
       // A stale mark, left while an earlier save was out for the settle to
       // act on, does not survive the write below, so it is carried over.
       if (queryClient.getQueryState(key)?.isInvalidated) interruptedRef.current.add(id);
-      writeField(id, value);
+      // DALTON-HOOK(antigravity-series): apply extraUpdates optimistically and capture on confirmedRef
+      writeField(id, value, extraUpdates as Partial<Thread> | undefined);
       return { previous };
     },
-    onSuccess: (saved, { threadId: id, value }) => {
-      confirmedRef.current.set(id, { value: answered(saved, value) });
+    onSuccess: (saved, { threadId: id, value, extraUpdates }) => {
+      const extraSaved: Partial<Thread> | undefined = saved && extraUpdates
+        ? Object.fromEntries(
+            Object.keys(extraUpdates).map((k) => [
+              k,
+              saved[k as keyof Thread] !== undefined ? saved[k as keyof Thread] : extraUpdates[k as keyof ThreadUpdates],
+            ]),
+          ) as Partial<Thread>
+        : (extraUpdates as Partial<Thread> | undefined);
+      confirmedRef.current.set(id, { value: answered(saved, value), ...(extraSaved ? { extra: extraSaved } : {}) });
       if (saved) onSaved?.(saved);
     },
     onError: (_error, save, context) => {
@@ -103,11 +123,11 @@ export function useThreadFieldSave<F extends ThreadField>({
       // stands in only when the chain began in another mount.
       const confirmed = confirmedRef.current;
       const restored = confirmed.has(save.threadId) ? confirmed.get(save.threadId) : context?.previous;
-      if (restored) writeField(save.threadId, restored.value);
+      if (restored) writeField(save.threadId, restored.value, restored.extra);
       if (shownThreadRef.current === save.threadId) onFailed(save);
       toast({ description: failedMessage, variant: 'destructive' });
     },
-    onSettled: (saved, error, { threadId: id, value }) => {
+    onSettled: (saved, error, { threadId: id, value, extraUpdates }) => {
       if (queryClient.isMutating({ mutationKey: threadFieldMutationKey(id, field) }) !== 1) return;
       confirmedRef.current.delete(id);
       const interrupted = interruptedRef.current.delete(id);
@@ -116,7 +136,20 @@ export function useThreadFieldSave<F extends ThreadField>({
       // change made elsewhere or by a turn ending. Read before the write
       // below, which clears it.
       const marked = queryClient.getQueryState(key)?.isInvalidated ?? false;
-      if (!error) writeField(id, answered(saved, value));
+      // DALTON-HOOK(antigravity-series): preserve confirmed extraUpdates on settled cache write
+      if (!error) {
+        const extraApplied: Partial<Thread> | undefined = extraUpdates
+          ? Object.fromEntries(
+              Object.keys(extraUpdates).map((k) => [
+                k,
+                saved && saved[k as keyof Thread] !== undefined
+                  ? saved[k as keyof Thread]
+                  : extraUpdates[k as keyof ThreadUpdates],
+              ]),
+            ) as Partial<Thread>
+          : undefined;
+        writeField(id, answered(saved, value), extraApplied);
+      }
       // A failure is read back, since the save may have landed with its
       // response lost; so is a row never cached, a read this chain cancelled,
       // one started meanwhile, which the server may have answered first, and
@@ -138,9 +171,10 @@ export function useThreadFieldSave<F extends ThreadField>({
     return saved && saved[field] !== undefined ? saved[field] : value;
   }
 
-  function writeField(id: string, value: Thread[F]) {
+  // DALTON-HOOK(antigravity-series): include extraUpdates when updating cached thread detail
+  function writeField(id: string, value: Thread[F], extra?: Partial<Thread>) {
     queryClient.setQueryData<Thread>(queryKeys.threads.detail(id), (current) => (
-      current ? { ...current, [field]: value } : current
+      current ? { ...current, ...(extra ?? {}), [field]: value } : current
     ));
   }
 

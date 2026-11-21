@@ -1,8 +1,20 @@
 import { CLAUDE_CODE, isClaudeCodeModel } from '@/lib/claudeCode';
 import type { Payer } from '@/lib/modelPayer';
 import type { ProviderModelsData } from '@/components/model/types';
+import {
+  resolveLowEffortVariantKey,
+  type AntigravitySeriesCatalog,
+  type SelectableAntigravitySeries,
+} from '@/lib/antigravitySeries';
+import { EFFORT_ORDER, resolveEffort } from '@/lib/modelTuning';
 
-/** Recommended primary default model for Dalton deployments. */
+/** Recommended primary series for Dalton onboarding. */
+export const DALTON_DEFAULT_SERIES = 'antigravity-oauth:gemini-4-neon';
+
+/** Recommended background series for Dalton onboarding. */
+export const DALTON_BACKGROUND_SERIES = 'antigravity-oauth:gemini-4-hydrogen';
+
+/** Fallback primary model key when antigravity_series catalog metadata is unavailable. */
 export const DALTON_DEFAULT_MODEL = 'gemini-4-neon-high-oauth';
 
 /** Recommended background model for Dalton deployments (background slot runs at fixed low effort). */
@@ -76,61 +88,52 @@ export function filterDaltonCuratedModels(
   return out;
 }
 
-const EFFORT_LABEL_SUFFIX_RE =
-  /(?:\s*\((?:minimal|low|medium|high|xhigh|max)\)|\s+(?:minimal|low|medium|high|xhigh|max))$/i;
-
 /**
- * Remove trailing reasoning-effort words (e.g. "Low", "(low)") from a model
- * label for Dalton's background slot, whose effort is fixed to low.
+ * Resolve the recommended variant key for a Dalton Antigravity series from
+ * `antigravity_series` metadata, falling back to `fallbackModel` when series
+ * metadata is absent (e.g. legacy test mocks). When `preferLowEffort` is set
+ * (for fixed-low slots like Background), prefers `'low'` or the series' lowest
+ * available effort instead of the series default.
  */
-export function stripEffortFromModelLabel(label: string): string {
-  const stripped = label.replace(EFFORT_LABEL_SUFFIX_RE, '').trim();
-  return stripped || label;
-}
-
-const EFFORT_KEY_RE = /-(minimal|low|medium|high|xhigh|max)(?=-oauth$|$)/i;
-const BACKGROUND_EFFORT_RANK: Record<string, number> = {
-  low: 0,
-  minimal: 1,
-  medium: 2,
-  high: 3,
-  xhigh: 4,
-  max: 5,
-};
-
-/**
- * Collapse effort-suffixed siblings within each provider group (e.g.
- * `gemini-4-hydrogen-{low,medium,high,xhigh}-oauth`) to a single entry per
- * base model for Dalton's background dropdown, preferring `-low`.
- */
-export function dedupeDaltonBackgroundModels(
-  groups: Record<string, ProviderModelsData>,
-  dalton: boolean,
-): Record<string, ProviderModelsData> {
-  if (!dalton) return groups;
-  const out: Record<string, ProviderModelsData> = {};
-  for (const [provider, data] of Object.entries(groups)) {
-    const models = data.models ?? [];
-    const chosen = new Map<string, { model: string; rank: number; index: number }>();
-    models.forEach((m, index) => {
-      const match = EFFORT_KEY_RE.exec(m);
-      if (!match) {
-        chosen.set(`raw:${m}`, { model: m, rank: -1, index });
-        return;
-      }
-      const base = m.replace(EFFORT_KEY_RE, '');
-      const rank = BACKGROUND_EFFORT_RANK[match[1].toLowerCase()] ?? 99;
-      const existing = chosen.get(`base:${base}`);
-      if (!existing || rank < existing.rank) {
-        chosen.set(`base:${base}`, { model: m, rank, index: existing ? existing.index : index });
-      }
-    });
-    const deduped = [...chosen.values()].sort((a, b) => a.index - b.index).map((e) => e.model);
-    if (deduped.length > 0) {
-      out[provider] = { ...data, models: deduped };
+export function resolveDaltonSeriesDefaultModel(
+  seriesId: string,
+  candidates: readonly string[],
+  options: {
+    seriesCatalog?: AntigravitySeriesCatalog | null;
+    selectableSeries?: readonly SelectableAntigravitySeries[] | null;
+    fallbackModel?: string;
+    preferLowEffort?: boolean;
+  } = {},
+): string | null {
+  const candidateSet = new Set(candidates);
+  const selectable = options.selectableSeries?.find((s) => s.seriesId === seriesId);
+  if (selectable) {
+    const picked = options.preferLowEffort
+      ? resolveLowEffortVariantKey(selectable)
+      : selectable.defaultVariantKey;
+    if (picked && candidateSet.has(picked)) return picked;
+  }
+  const series = options.seriesCatalog?.bySeriesId[seriesId];
+  if (series) {
+    const rawEfforts = Object.entries(series.variants)
+      .filter(([, variantKey]) => candidateSet.has(variantKey))
+      .map(([effort]) => effort);
+    if (rawEfforts.length > 0) {
+      const availableEfforts = [
+        ...EFFORT_ORDER.filter((lv) => rawEfforts.includes(lv)),
+        ...rawEfforts.filter((lv) => !EFFORT_ORDER.includes(lv)),
+      ];
+      const chosen = options.preferLowEffort
+        ? (availableEfforts.includes('low') ? 'low' : availableEfforts[0])
+        : (resolveEffort(series.default_effort, availableEfforts) ?? availableEfforts[0]);
+      const key = chosen ? series.variants[chosen] : undefined;
+      if (key && candidateSet.has(key)) return key;
     }
   }
-  return out;
+  if (options.fallbackModel && candidateSet.has(options.fallbackModel)) {
+    return options.fallbackModel;
+  }
+  return null;
 }
 
 export interface DaltonModelMeta {

@@ -11,7 +11,14 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { CompactSelect, EffortSelect } from '@/components/model/EffortSelect';
 import { ModelSelector } from '@/components/model/ModelSelector';
+import { Select } from '@/components/ui/select';
 import type { useAllModels } from '@/hooks/useAllModels';
+// DALTON-HOOK(antigravity-series): collapse Antigravity in ModelBlock & switch variant key directly in EffortBlock
+import {
+  buildSelectableAntigravitySeries,
+  formatAntigravityVariantLabel,
+  inspectSavedAntigravityModel,
+} from '@/lib/antigravitySeries';
 import { useClaudeCodeSetup } from '@/hooks/useClaudeCode';
 import { useLocale } from '@/hooks/useLocale';
 import { usePreferences } from '@/hooks/usePreferences';
@@ -20,7 +27,7 @@ import { useSkills } from '@/hooks/useSkills';
 import { cn } from '@/lib/utils';
 import { accountClaudeCodeHold, isClaudeCodeModel } from '@/lib/claudeCode';
 import { modelPrefs, modelProfile } from '@/lib/modelPreferences';
-import { EFFORT_LABELS, EFFORT_ORDER, effortLabelFor, hasEffortOptions, resolveTuning } from '@/lib/modelTuning';
+import { EFFORT_LABELS, EFFORT_ORDER, effortLabelFor, effortOptions, hasEffortOptions, resolveTuning } from '@/lib/modelTuning';
 import type { SubagentEdit } from '@/hooks/useSubagents';
 import type {
   SubagentAudience,
@@ -73,7 +80,10 @@ export interface AsideProps {
 
 export function ModelBlock({ view, models, write }: AsideProps) {
   const { t } = useTranslation();
-  const { metadata } = models;
+  // DALTON-HOOK(antigravity-series): inspect pinned model's series for EffortBlock variant switching
+  const { metadata, seriesCatalog, rawApiResponse, customModels } = models;
+  const rawMetadata = rawApiResponse?.model_metadata ?? metadata;
+  const seriesOpts = { seriesCatalog, rawMetadata, customModels };
   const unavailable = hasProblem(view, 'model_unavailable');
   const base = view.base;
   // Claude Code's models too: a pin runs one where the turn's workspace runs
@@ -82,11 +92,18 @@ export function ModelBlock({ view, models, write }: AsideProps) {
   const { setup } = useClaudeCodeSetup();
   const hold = accountClaudeCodeHold(setup);
   const pinnedClaudeCode = !!view.model && isClaudeCodeModel(metadata[view.model]);
+  const formatSubagentModel = (m: string) =>
+    formatAntigravityVariantLabel(m, { ...seriesOpts, t, includeEffort: true }) ?? modelName(m, metadata);
 
   // As a provider change does the depth: a set effort stays if the new model
   // offers it and goes if not, since a save holds it to that model's ladder.
   // Following the thread keeps any level, which the turn steps down.
+  // DALTON-HOOK(antigravity-series): clear independent effort when pinning an Antigravity variant
   function pickModel(next: string) {
+    if (next && inspectSavedAntigravityModel(next, seriesOpts)) {
+      write({ model: next, effort: null });
+      return;
+    }
     const keep = !next || !view.effort || (metadata[next]?.reasoning_efforts ?? []).includes(view.effort);
     write({ model: next || null, ...(keep ? {} : { effort: null }) });
   }
@@ -96,7 +113,7 @@ export function ModelBlock({ view, models, write }: AsideProps) {
       title={t('plugins.subagents.model')}
       side={
         base
-          ? baseSide(t, view, base.model ? modelName(base.model, metadata) : t('plugins.subagents.threadsModel'))
+          ? baseSide(t, view, base.model ? formatSubagentModel(base.model) : t('plugins.subagents.threadsModel'))
           : undefined
       }
     >
@@ -109,14 +126,19 @@ export function ModelBlock({ view, models, write }: AsideProps) {
         placeholder={t('plugins.subagents.threadsModel')}
         payers={models.payers}
         metadata={metadata}
+        // DALTON-HOOK(antigravity-series): hide ModelSelector companion effort picker inside SubagentAside
+        seriesCatalog={seriesCatalog}
+        rawMetadata={rawMetadata}
+        customModels={customModels}
+        hideEffortPicker
         disabledModels={offered.locked}
         heldBy={(m) => (hold && isClaudeCodeModel(metadata[m]) ? { reason: t(hold.messageKey), pickable: !!hold.link } : null)}
         // The server says whether a saved model still runs; one this picker
         // doesn't list (a key the user can't pick today) may well still run.
         missingLabel={(m) =>
           unavailable
-            ? t('plugins.subagents.modelUnavailableOption', { model: modelName(m, metadata) })
-            : modelName(m, metadata)
+            ? t('plugins.subagents.modelUnavailableOption', { model: formatSubagentModel(m) })
+            : formatSubagentModel(m)
         }
       />
       {unavailable ? (
@@ -151,13 +173,26 @@ export function ModelBlock({ view, models, write }: AsideProps) {
 export function EffortBlock({ view, models, write }: AsideProps) {
   const { t } = useTranslation();
   const { preferences } = usePreferences();
-  const { metadata } = models;
+  // DALTON-HOOK(antigravity-series): inspect pinned model's series for EffortBlock variant switching
+  const { metadata, seriesCatalog, rawApiResponse, customModels } = models;
+  const rawMetadata = rawApiResponse?.model_metadata ?? metadata;
+  const seriesOpts = { seriesCatalog, rawMetadata, customModels };
   const unavailablePin = hasProblem(view, 'model_unavailable') ? view.model : null;
   const pinned = unavailablePin ? null : view.model;
   const stored = view.effort ?? '';
   // A name the catalog no longer has gets no ladder on the server either, and
   // any level saves.
   const pinMeta = unavailablePin ? metadata[unavailablePin] : undefined;
+  const pinnedSeries = pinned ? inspectSavedAntigravityModel(pinned, seriesOpts) : null;
+  const pinnedSeriesSelectable = useMemo(() => {
+    if (!pinnedSeries) return null;
+    const fromModels = models.selectableSeries?.find((s) => s.seriesId === pinnedSeries.series.series_id);
+    if (fromModels) return fromModels;
+    return buildSelectableAntigravitySeries(seriesCatalog, models.models, {
+      rawMetadata,
+      customModels,
+    }).find((s) => s.seriesId === pinnedSeries.series.series_id) ?? null;
+  }, [pinnedSeries, models.selectableSeries, models.models, seriesCatalog, rawMetadata, customModels]);
 
   // Every level some model the user can pick offers, to tell a pinned
   // model's short ladder from the vocabulary itself.
@@ -170,6 +205,45 @@ export function EffortBlock({ view, models, write }: AsideProps) {
     }
     return levels;
   }, [models.models, metadata]);
+
+  const base = view.base;
+
+  // DALTON-HOOK(antigravity-series): for pinned Antigravity series, EffortBlock reads/writes the suffixed model directly with effort=null
+  if (pinned && pinnedSeries) {
+    const seriesEfforts = effortOptions(pinnedSeriesSelectable?.efforts ?? [], pinnedSeries.effort);
+    const defaultEffort = pinnedSeriesSelectable?.defaultEffort ?? pinnedSeries.series.default_effort;
+    return (
+      <DetailAsideBlock
+        title={t('plugins.subagents.effort')}
+        side={base ? baseSide(t, view, effortOrSetting(t, base.effort, pinned)) : undefined}
+      >
+        {seriesEfforts.length > 1 ? (
+          <Select
+            value={pinnedSeries.effort}
+            onChange={(e) => {
+              const nextEffort = e.target.value;
+              const nextKey = pinnedSeriesSelectable?.variants[nextEffort]
+                ?? pinnedSeries.series.variants[nextEffort];
+              if (nextKey) write({ model: nextKey, effort: null });
+            }}
+            aria-label={t('plugins.subagents.effortAria', { name: view.name })}
+            className="w-full min-w-0"
+            style={{ fontSize: 'var(--cs-text-field, 0.75rem)', paddingTop: '0.25rem', paddingBottom: '0.25rem' }}
+          >
+            {seriesEfforts.map((lv) => {
+              const effLabel = effortLabelFor(t, lv) ?? lv;
+              const text = lv === defaultEffort
+                ? `${effLabel} (${t('chat.modelSelector.defaultBadge')})`
+                : effLabel;
+              return <option key={lv} value={lv}>{text}</option>;
+            })}
+          </Select>
+        ) : (
+          <p className="sa-hint">{t('plugins.subagents.effortNone', { model: pinnedSeries.displayName })}</p>
+        )}
+      </DetailAsideBlock>
+    );
+  }
 
   let efforts: string[];
   let defaultLabel: string;
@@ -203,7 +277,6 @@ export function EffortBlock({ view, models, write }: AsideProps) {
         : t('plugins.subagents.effortHintInherit');
   }
 
-  const base = view.base;
   return (
     <DetailAsideBlock
       title={t('plugins.subagents.effort')}

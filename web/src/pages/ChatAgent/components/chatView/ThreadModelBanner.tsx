@@ -7,6 +7,8 @@ import { subscriptionKey, type SubscriptionProvider } from '@/api/oauth';
 import { getModelDisplayName } from '@/components/ui/chat-input.helpers';
 import { DefaultModelScopeChoice } from '@/components/model/DefaultModelScopeChoice';
 import { useAllModels } from '@/hooks/useAllModels';
+// DALTON-HOOK(antigravity-series): print Antigravity series display name to match composer pill
+import { formatAntigravityVariantLabel } from '@/lib/antigravitySeries';
 import { CLAUDE_CODE_CHOICE_URL } from '@/lib/claudeCode';
 import { useClaudeCodeSteps } from '@/hooks/useClaudeCodeSteps';
 import { useDefaultModelChange } from '@/hooks/useDefaultModelChange';
@@ -16,8 +18,15 @@ import { StatusLine } from './StatusLine';
 /** Prints a model the way the composer pill does, so the banner names it as
  *  the control right below it. */
 function useComposerModelLabel(): (model: string) => string {
-  const { metadata } = useAllModels();
-  return useCallback((model: string) => getModelDisplayName(model, metadata), [metadata]);
+  const { metadata, seriesCatalog, customModels, rawApiResponse } = useAllModels();
+  const rawMetadata = rawApiResponse?.model_metadata ?? metadata;
+  return useCallback(
+    (model: string) => (
+      formatAntigravityVariantLabel(model, { seriesCatalog, rawMetadata, customModels })
+      ?? getModelDisplayName(model, metadata)
+    ),
+    [metadata, seriesCatalog, rawMetadata, customModels],
+  );
 }
 
 /* The offer that follows a pick: this thread now runs on a model other than
