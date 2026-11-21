@@ -313,6 +313,91 @@ class TestDaltonProdAndPricing(unittest.TestCase):
         self.assertEqual(w["totals"]["tokens"], 1100)
         self.assertEqual(w["totals"]["calls"], 16)
 
+    def test_reconcile_preserves_effort_for_agy_and_gateway_and_keeps_unknown_empty(self):
+        now = dt.datetime(2026, 11, 20, 12, 0, tzinfo=s.UTC).timestamp()
+        e = s.Evidence(now - 7 * 86400, now)
+        # 1. agy DB record with explicit effort suffix -> preserved before normalization
+        e.put("agy", "a1", now - 500, "antigravity-cli-gateway", "gemini-4-neon-high", "agy-cli(含网关)", (100_000, 0, 50_000, 10_000), conversation="c1", enum=1420, unit="model-response")
+        # 2. agy DB enum record reconciled with gateway carrying effort suffix -> inherits gateway effort
+        e.put("agy", "a2", now - 400, "antigravity-cli-gateway", "agy-enum-1417", "agy-cli(含网关)", (200_000, 0, 0, 20_000), conversation="c2", enum=1417, unit="model-response")
+        e.put("gateway", "gw2", now - 400, "antigravity-cli-gateway", "gemini-4-argon-medium", "openclaw", (200_000, 0, 0, 20_000), request="req2", start=now - 402, conversation="c2", unit="gateway-request")
+        # 3. agy DB record with no effort suffix -> stays empty (becomes unknown bucket in tracker)
+        e.put("agy", "a3", now - 300, "antigravity-cli-gateway", "gemini-4-neon", "agy-cli(含网关)", (50_000, 0, 0, 5_000), conversation="c3", enum=1421, unit="model-response")
+        # 4. unreconciled antigravity gateway record with effort suffix -> preserved before normalization
+        e.put("gateway", "gw4", now - 200, "antigravity-cli-gateway", "claude-opus-5-5-low", "openclaw", (80_000, 0, 20_000, 10_000), request="req4", start=now - 202, unit="gateway-request")
+        # 5. Dalton prod record for same series -> must never merge with local in layer 1
+        e.put("dalton-prod", "dp1", now - 100, "google", "gemini-4-neon-high-oauth", s.DALTON_PROD_CHANNEL, (300_000, 0, 0, 30_000), calls=12, runs=4, dalton_prod=True, strip_oauth=True)
+
+        records, held = s.reconcile(e)
+        self.assertEqual(held, [])
+        by_id = {r["id"]: r for r in records}
+        self.assertEqual(by_id["agy:a1"]["model"], "gemini-4-neon")
+        self.assertEqual(by_id["agy:a1"]["meta"].get("effort"), "high")
+        self.assertEqual(by_id["agy:a2"]["model"], "gemini-4-argon")
+        self.assertEqual(by_id["agy:a2"]["source"], "openclaw")
+        self.assertEqual(by_id["agy:a2"]["meta"].get("effort"), "medium")
+        self.assertEqual(by_id["agy:a3"]["model"], "gemini-4-neon")
+        self.assertIsNone(by_id["agy:a3"]["meta"].get("effort"))
+        self.assertEqual(by_id["gateway:gw4"]["model"], "claude-opus-5-5")
+        self.assertEqual(by_id["gateway:gw4"]["meta"].get("effort"), "low")
+
+        prices = cli.load_prices()
+        w = cli.window_result(records, now, 7, prices, by_model=True)
+        # 5 distinct rows: neon(local,high), neon(local,None), argon(local,medium), opus(local,low), neon-high-oauth(dalton)
+        self.assertEqual(len(w["rows"]), 5)
+        self.assertEqual(
+            {(r["dalton_prod"], r["model"], r.get("effort")) for r in w["rows"]},
+            {
+                (False, "gemini-4-neon", "high"),
+                (False, "gemini-4-neon", None),
+                (False, "gemini-4-argon", "medium"),
+                (False, "claude-opus-5-5", "low"),
+                (True, "gemini-4-neon-high-oauth", None),
+            },
+        )
+        self.assertEqual(w["totals"]["tokens"], 160_000 + 220_000 + 55_000 + 110_000 + 330_000)
+
+    def test_summary_json_includes_antigravity_series_from_dalton_prod_or_fallback(self):
+        fake_home = self.tmp / "series-home"
+        fake_home.mkdir()
+        custom_state = self.tmp / "series-state"
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": str(fake_home),
+                "DALTON_USAGE_STATE_DIR": str(custom_state),
+                "DALTON_BACKEND_URL": "",
+                "INTERNAL_SERVICE_TOKEN": "",
+            },
+        ):
+            out_buf = io.StringIO()
+            with patch("sys.argv", ["model_usage_cost_cli.py", "--json", "summary", "--days", "1", "--no-ledger"]), \
+                 patch("sys.stdout", out_buf):
+                rc = cli.main()
+            self.assertEqual(rc, 0)
+            payload = json.loads(out_buf.getvalue())
+            self.assertIsInstance(payload.get("antigravity_series"), list)
+            series_ids = {item["series_id"] for item in payload["antigravity_series"]}
+            self.assertIn("antigravity-oauth:gemini-4-neon", series_ids)
+            self.assertIn("antigravity-oauth:claude-opus-5-5", series_ids)
+
+        # Also verify scan_dalton_prod captures live antigravity_series from backend payload
+        now = dt.datetime(2026, 11, 20, 12, 0, tzinfo=s.UTC).timestamp()
+        e = s.Evidence(now - 86400, now)
+        custom_series = [{"series_id": "antigravity-oauth:gemini-4-nova", "series_prefix": "gemini-4-nova", "display_name": "Gemini 4 Nova", "qualified_display_name": "Gemini 4 Nova (Antigravity)", "variants": {"high": "gemini-4-nova-high-oauth"}}]
+        mock_fetch = create_autospec(
+            s.fetch_dalton_prod_by_model,
+            return_value={
+                "models": [],
+                "antigravity_series": custom_series,
+                "totals": {"calls": 0, "runs": 0, "fresh_input": 0, "cache_read": 0, "cache_write": 0, "output": 0, "total_tokens": 0},
+            },
+        )
+        with patch.dict(os.environ, {"DALTON_BACKEND_URL": "http://127.0.0.1:8000", "INTERNAL_SERVICE_TOKEN": "tok"}), \
+             patch.object(s, "fetch_dalton_prod_by_model", mock_fetch):
+            self.assertTrue(s.scan_dalton_prod(e, window_days=1.0, window_since=now - 86400, window_until=now))
+        self.assertEqual(e.antigravity_series, custom_series)
+
 
 if __name__ == "__main__":
     unittest.main()

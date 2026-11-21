@@ -10,6 +10,8 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel
 
 from src.dalton.app.channels_router import require_channel_service_token
+from src.dalton.llm.antigravity_series import build_antigravity_series_catalog
+from src.llms.llm import LLM
 from src.server.database import pool
 
 MAX_USAGE_WINDOW = timedelta(days=31)
@@ -239,6 +241,7 @@ async def fetch_usage_by_model(
         "bucket": bucket,
         "input_includes_cached": True,
         "models": models,
+        "antigravity_series": build_antigravity_series_catalog(LLM.get_model_config()),
         "totals": {
             "calls": tot_calls,
             "fresh_input": tot_fresh,

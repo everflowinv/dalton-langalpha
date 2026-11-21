@@ -346,13 +346,15 @@ def window_result(records, now, days, prices, top=0, by_model=False):
             or r['source'] == sources.DALTON_PROD_CHANNEL
             or meta.get('dalton_prod')
         )
-        key = (is_dalton if by_model else r['source'], provider, model)
+        effort = meta.get('effort') or None
+        key = (is_dalton if by_model else r['source'], provider, model, effort)
         b = groups.setdefault(
             key,
             dict(
                 source=set(),
                 provider=provider,
                 model=model,
+                effort=effort,
                 dalton_prod=is_dalton,
                 records=0,
                 calls=0,
@@ -405,6 +407,8 @@ def window_result(records, now, days, prices, top=0, by_model=False):
     for b in groups.values():
         v = b.pop('v')
         has_ref = b.pop('has_reference_cost')
+        if b.get('effort') is None:
+            b.pop('effort', None)
         b['source'] = '|'.join(sorted(b['source']))
         b.update(dict(zip(('fresh', 'cache_write', 'cache_read', 'output'), v)))
         b['tokens'] = sum(v)
@@ -566,11 +570,17 @@ def command(args):
             records, held = sources.reconcile(e)
             records = [r for r in records if e.since <= r['ts'] < e.until]
             held = [r for r in held if e.since <= r['ts'] < e.until]
+            antigravity_series = (
+                e.antigravity_series
+                if isinstance(e.antigravity_series, list) and e.antigravity_series
+                else sources.load_antigravity_series_catalog()
+            )
             out = {
                 'ok': True,
                 'version': VERSION,
                 'generated_at': dt.datetime.fromtimestamp(e.until, sources.UTC).isoformat(),
                 'price_catalog': catalog_meta,
+                'antigravity_series': antigravity_series,
                 'dalton_prod': e.dalton_prod or {'ok': False, 'error': 'not queried', 'models': 0, 'runs': 0, 'calls': 0},
                 'windows': [window_result(records, e.until, w, prices, args.top, args.by_model) for w in windows],
                 'coverage': {

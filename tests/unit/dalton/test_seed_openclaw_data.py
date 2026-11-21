@@ -107,3 +107,44 @@ class SeedOpenClawDataTests(unittest.TestCase):
                 "deploy --no-upload",
                 (target / "skills/kweb-dashboard/SKILL.md").read_text(encoding="utf-8"),
             )
+
+    def test_syncs_antigravity_series_module_and_exports_json_catalog(self):
+        import json
+
+        repo_root = Path(__file__).resolve().parents[3]
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target"
+
+            dry = subprocess.run(
+                ["bash", str(SCRIPT), "--dry-run", "--target", str(target)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(dry.returncode, 0, dry.stdout + dry.stderr)
+            self.assertIn("skills/model-usage-cost/scripts/antigravity_series.py", dry.stdout)
+            self.assertIn("skills/model-usage-cost/references/antigravity_series.json", dry.stdout)
+
+            applied = subprocess.run(
+                ["bash", str(SCRIPT), "--apply", "--target", str(target)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+
+            synced_mod = target / "skills/model-usage-cost/scripts/antigravity_series.py"
+            synced_json = target / "skills/model-usage-cost/references/antigravity_series.json"
+            self.assertTrue(synced_mod.is_file())
+            self.assertTrue(synced_json.is_file())
+            self.assertEqual(
+                synced_mod.read_text(encoding="utf-8"),
+                (repo_root / "src/dalton/llm/antigravity_series.py").read_text(encoding="utf-8"),
+            )
+            catalog = json.loads(synced_json.read_text(encoding="utf-8"))
+            self.assertIsInstance(catalog, list)
+            series_ids = {entry["series_id"] for entry in catalog}
+            self.assertEqual(len(catalog), 7)
+            self.assertIn("antigravity-oauth:gemini-4-neon", series_ids)
+            self.assertIn("antigravity-oauth:claude-opus-5-5", series_ids)
+            self.assertIn("antigravity-oauth:gpt-oss-120b", series_ids)

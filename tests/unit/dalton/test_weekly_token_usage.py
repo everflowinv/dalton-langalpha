@@ -420,9 +420,12 @@ def test_r2_argon_enum_1417_and_d_variant_merge_in_ranking_vendor_and_card(monke
     parsed = tracker.process_usage_stats(snapshot)
     all_rows = parsed["top10"] + parsed["tail"]
     assert len(all_rows) == 1
-    assert all_rows[0]["model"] == "gemini-4-argon"
+    assert all_rows[0]["model"] == "Gemini 4 Argon"
+    assert all_rows[0]["series_id"] == "antigravity-oauth:gemini-4-argon"
     assert all_rows[0]["total_tokens"] == 6_000_000
     assert all_rows[0]["cost_usd"] == pytest.approx(12.0)
+    assert list(all_rows[0]["effort_breakdown"].keys()) == ["unknown"]
+    assert all_rows[0]["effort_breakdown"]["unknown"]["total_tokens"] == 6_000_000
 
     assert len(parsed["prov_list"]) == 1
     assert parsed["prov_list"][0]["tokens"] == 6_000_000
@@ -431,7 +434,8 @@ def test_r2_argon_enum_1417_and_d_variant_merge_in_ranking_vendor_and_card(monke
     assert parsed["unpriced_models"] == []
 
     card_text = json.dumps(tracker.build_card(parsed), ensure_ascii=False)
-    assert "gemini-4-argon" in card_text
+    assert "Gemini 4 Argon" in card_text
+    assert "档位未知" in card_text
     assert "agy-enum-1417" not in card_text
     assert "gemini-4-argon-d" not in card_text
     assert "**无公开价模型**：本期无" in card_text
@@ -879,3 +883,625 @@ def test_data_copy_card_senders_split_oversized_cards(tmp_path: Path) -> None:
     assert len(loaded_cards) > 1
     for card_item in loaded_cards:
         assert send_mod.is_feishu_card_within_envelope(card_item)
+
+
+# ---------------------------------------------------------------------------
+# §5: Weekly token report Antigravity series merge, closure, idempotency & card
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_s5_internal_usage_endpoint_exposes_antigravity_series_and_keeps_raw_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_rows = [
+        {
+            "date": "2026-11-18",
+            "model": "gemini-4-neon-high-oauth",
+            "calls": 100,
+            "fresh_input": 500_000,
+            "cache_read": 200_000,
+            "cache_write": 0,
+            "output": 40_000,
+            "total_tokens": 740_000,
+            "runs": 20,
+            "total_runs": 35,
+        },
+        {
+            "date": "2026-11-18",
+            "model": "gemini-4-neon-medium-oauth",
+            "calls": 50,
+            "fresh_input": 250_000,
+            "cache_read": 100_000,
+            "cache_write": 0,
+            "output": 20_000,
+            "total_tokens": 370_000,
+            "runs": 15,
+            "total_runs": 35,
+        },
+    ]
+    conn, _ = _make_autospec_conn(fake_rows)
+    from_dt = datetime(2026, 11, 14, 4, 0, tzinfo=timezone.utc)
+    to_dt = datetime(2026, 11, 21, 4, 0, tzinfo=timezone.utc)
+
+    result = await fetch_usage_by_model(conn, from_dt=from_dt, to_dt=to_dt, bucket="day")
+    assert [m["model"] for m in result["models"]] == [
+        "gemini-4-neon-high-oauth",
+        "gemini-4-neon-medium-oauth",
+    ]
+    series = result.get("antigravity_series")
+    assert isinstance(series, list) and len(series) == 7
+    series_ids = {s["series_id"] for s in series}
+    assert "antigravity-oauth:gemini-4-neon" in series_ids
+    assert "antigravity-oauth:claude-opus-5-5" in series_ids
+    assert "antigravity-oauth:gpt-oss-120b" in series_ids
+
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", VALID_SERVICE_TOKEN)
+
+    @contextlib.asynccontextmanager
+    async def fake_pool_conn():
+        yield conn
+
+    with patch("src.dalton.app.internal_usage_router.pool.get_db_connection", fake_pool_conn):
+        client = TestClient(_make_app())
+        resp = client.get(
+            "/api/v1/dalton/internal/usage/by-model?from=2026-11-14T04:00:00Z&to=2026-11-21T04:00:00Z&bucket=day",
+            headers={"X-Service-Token": VALID_SERVICE_TOKEN},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["antigravity_series"]) == 7
+    assert body["models"][0]["model"] == "gemini-4-neon-high-oauth"
+
+
+def _make_realistic_series_snapshot(include_series: bool = True) -> dict:
+    from src.dalton.llm.antigravity_series import build_antigravity_series_catalog
+    from src.llms.llm import LLM
+
+    rows = [
+        # --- Antigravity Neon: Dalton prod (high + xhigh) + local (high + medium + unknown) ---
+        {
+            "source": "Dalton 生产（订阅）",
+            "provider": "google",
+            "model": "gemini-4-neon-high-oauth",
+            "dalton_prod": True,
+            "records": 7,
+            "calls": 200,
+            "runs": 60,
+            "fresh": 600_000,
+            "cache_write": 0,
+            "cache_read": 1_200_000,
+            "output": 100_000,
+            "cost_usd": 3.48,
+            "unpriced_tokens": 0,
+            "no_public_price": False,
+        },
+        {
+            "source": "Dalton 生产（订阅）",
+            "provider": "google",
+            "model": "gemini-4-neon-xhigh-oauth",
+            "dalton_prod": True,
+            "records": 3,
+            "calls": 40,
+            "runs": 12,
+            "fresh": 200_000,
+            "cache_write": 0,
+            "cache_read": 400_000,
+            "output": 50_000,
+            "cost_usd": 1.41,
+            "unpriced_tokens": 0,
+            "no_public_price": False,
+        },
+        {
+            "source": "openclaw",
+            "provider": "antigravity-cli-gateway",
+            "model": "gemini-4-neon",
+            "effort": "high",
+            "dalton_prod": False,
+            "records": 25,
+            "calls": 25,
+            "runs": 0,
+            "fresh": 100_000,
+            "cache_write": 0,
+            "cache_read": 200_000,
+            "output": 20_000,
+            "cost_usd": 0.63,
+            "unpriced_tokens": 0,
+            "no_public_price": False,
+        },
+        {
+            "source": "openclaw",
+            "provider": "antigravity-cli-gateway",
+            "model": "gemini-4-neon",
+            "effort": "medium",
+            "dalton_prod": False,
+            "records": 15,
+            "calls": 15,
+            "runs": 0,
+            "fresh": 80_000,
+            "cache_write": 0,
+            "cache_read": 100_000,
+            "output": 10_000,
+            "cost_usd": 0.405,
+            "unpriced_tokens": 0,
+            "no_public_price": False,
+        },
+        {
+            "source": "agy-cli(含网关)",
+            "provider": "antigravity-cli-gateway",
+            "model": "gemini-4-neon",
+            "dalton_prod": False,
+            "records": 10,
+            "calls": 10,
+            "runs": 0,
+            "fresh": 50_000,
+            "cache_write": 0,
+            "cache_read": 50_000,
+            "output": 5_000,
+            "cost_usd": 0.2325,
+            "unpriced_tokens": 0,
+            "no_public_price": False,
+        },
+        # --- Claude Opus 5.5 via Antigravity (3 tiers + local low) ---
+        {
+            "source": "Dalton 生产（订阅）",
+            "provider": "claude-cli-gateway",
+            "model": "claude-opus-5-5-low-oauth",
+            "dalton_prod": True,
+            "records": 2,
+            "calls": 18,
+            "runs": 6,
+            "fresh": 100_000,
+            "cache_write": 10_000,
+            "cache_read": 300_000,
+            "output": 15_000,
+            "cost_usd": 0.84,
+            "unpriced_tokens": 0,
+            "no_public_price": False,
+        },
+        {
+            "source": "Dalton 生产（订阅）",
+            "provider": "claude-cli-gateway",
+            "model": "claude-opus-5-5-medium-oauth",
+            "dalton_prod": True,
+            "records": 4,
+            "calls": 35,
+            "runs": 10,
+            "fresh": 150_000,
+            "cache_write": 20_000,
+            "cache_read": 500_000,
+            "output": 25_000,
+            "cost_usd": 1.36,
+            "unpriced_tokens": 0,
+            "no_public_price": False,
+        },
+        {
+            "source": "Dalton 生产（订阅）",
+            "provider": "claude-cli-gateway",
+            "model": "claude-opus-5-5-high-oauth",
+            "dalton_prod": True,
+            "records": 5,
+            "calls": 45,
+            "runs": 14,
+            "fresh": 200_000,
+            "cache_write": 30_000,
+            "cache_read": 700_000,
+            "output": 40_000,
+            "cost_usd": 1.98,
+            "unpriced_tokens": 0,
+            "no_public_price": False,
+        },
+        {
+            "source": "openclaw",
+            "provider": "antigravity-cli-gateway",
+            "model": "claude-opus-5-5",
+            "effort": "low",
+            "dalton_prod": False,
+            "records": 5,
+            "calls": 5,
+            "runs": 0,
+            "fresh": 50_000,
+            "cache_write": 0,
+            "cache_read": 100_000,
+            "output": 5_000,
+            "cost_usd": 0.32,
+            "unpriced_tokens": 0,
+            "no_public_price": False,
+        },
+        # --- Anthropic official Claude Opus 5.5 (MUST NOT merge into Antigravity) ---
+        {
+            "source": "Dalton 生产（订阅）",
+            "provider": "claude-cli-gateway",
+            "model": "claude-opus-5-5-oauth",
+            "dalton_prod": True,
+            "records": 7,
+            "calls": 500,
+            "runs": 120,
+            "fresh": 400_000,
+            "cache_write": 50_000,
+            "cache_read": 2_000_000,
+            "output": 80_000,
+            "cost_usd": 4.0,
+            "unpriced_tokens": 0,
+            "no_public_price": False,
+        },
+        # --- Local direct Anthropic Claude Code (MUST NOT merge into Antigravity) ---
+        {
+            "source": "claude-code(手动)",
+            "provider": "anthropic",
+            "model": "claude-opus-5-5",
+            "dalton_prod": False,
+            "records": 20,
+            "calls": 20,
+            "runs": 0,
+            "fresh": 60_000,
+            "cache_write": 0,
+            "cache_read": 200_000,
+            "output": 10_000,
+            "cost_usd": 0.48,
+            "unpriced_tokens": 0,
+            "no_public_price": False,
+        },
+        # --- Unpriced + reference_only model (non-Antigravity) ---
+        {
+            "source": "muse-cli(手动)",
+            "provider": "muse-cli-gateway",
+            "model": "muse-wonder-full-1.0",
+            "dalton_prod": False,
+            "records": 6,
+            "calls": 6,
+            "runs": 0,
+            "fresh": 100_000,
+            "cache_write": 0,
+            "cache_read": 50_000,
+            "output": 10_000,
+            "cost_usd": None,
+            "unpriced_tokens": 160_000,
+            "no_public_price": True,
+            "reference_cost_usd": 0.61,
+            "reference_model": "muse-wonder-1.0",
+            "price_note": "无公开价",
+        },
+        # --- Unpriced + reference_only Antigravity series (GPT-OSS 120B, no public price in prices.json) ---
+        {
+            "source": "Dalton 生产（订阅）",
+            "provider": "openai",
+            "model": "gpt-oss-120b-medium-oauth",
+            "dalton_prod": True,
+            "records": 2,
+            "calls": 12,
+            "runs": 4,
+            "fresh": 40_000,
+            "cache_write": 0,
+            "cache_read": 10_000,
+            "output": 5_000,
+            "cost_usd": None,
+            "unpriced_tokens": 55_000,
+            "no_public_price": True,
+            "reference_cost_usd": 0.08,
+            "reference_model": "gpt-oss-120b-groq",
+            "price_note": "参考估算",
+        },
+    ]
+
+    total_fresh = sum(r["fresh"] for r in rows)
+    total_cw = sum(r["cache_write"] for r in rows)
+    total_cr = sum(r["cache_read"] for r in rows)
+    total_out = sum(r["output"] for r in rows)
+    total_tokens = total_fresh + total_cw + total_cr + total_out
+    total_records = sum(r["records"] for r in rows)
+    total_calls = sum(r["calls"] for r in rows)
+    total_cost = round(sum(r["cost_usd"] for r in rows if r["cost_usd"] is not None), 6)
+    total_unpriced = sum(r["unpriced_tokens"] for r in rows)
+
+    dalton_rows = [r for r in rows if r["dalton_prod"]]
+    snap = {
+        "ok": True,
+        "version": "3.1.0",
+        "price_catalog": {"generated": "2026-11-14", "effective_notes": []},
+        "dalton_prod": {
+            "ok": True,
+            "error": None,
+            "runs": sum(r["runs"] for r in dalton_rows),
+            "calls": sum(r["calls"] for r in dalton_rows),
+            "models": len({r["model"] for r in dalton_rows}),
+        },
+        "collector_status": {"ok": True, "fresh": True},
+        "windows": [
+            {
+                "days": 7.0,
+                "from": "2026-11-14T04:00:00+00:00",
+                "to": "2026-11-21T04:00:00+00:00",
+                "row_count": len(rows),
+                "rows": rows,
+                "totals": {
+                    "fresh": total_fresh,
+                    "cache_write": total_cw,
+                    "cache_read": total_cr,
+                    "output": total_out,
+                    "tokens": total_tokens,
+                    "records": total_records,
+                    "calls": total_calls,
+                    "priced_cost_usd": total_cost,
+                    "unpriced_tokens": total_unpriced,
+                },
+            }
+        ],
+    }
+    if include_series:
+        snap["antigravity_series"] = build_antigravity_series_catalog(LLM.get_model_config())
+    return snap
+
+
+def test_s5_series_merge_preserves_totals_source_subtotals_unpriced_and_effort_closure() -> None:
+    tracker = _load_tracker()
+    snap = _make_realistic_series_snapshot(include_series=True)
+    raw_rows = snap["windows"][0]["rows"]
+
+    # Expected pre-merge totals and source subtotals
+    raw_local = [r for r in raw_rows if not r["dalton_prod"]]
+    raw_dalton = [r for r in raw_rows if r["dalton_prod"]]
+    exp_local_tokens = sum(r["fresh"] + r["cache_write"] + r["cache_read"] + r["output"] for r in raw_local)
+    exp_dalton_tokens = sum(r["fresh"] + r["cache_write"] + r["cache_read"] + r["output"] for r in raw_dalton)
+    exp_local_cost = sum(r["cost_usd"] for r in raw_local if r["cost_usd"] is not None)
+    exp_dalton_cost = sum(r["cost_usd"] for r in raw_dalton if r["cost_usd"] is not None)
+    exp_ref_cost = sum(r.get("reference_cost_usd") or 0.0 for r in raw_rows)
+
+    stats = tracker.process_usage_stats(snap)
+    merged_rows = stats["top10"] + stats["tail"]
+
+    # 1. Exact global totals equality
+    assert stats["total_tokens"] == exp_local_tokens + exp_dalton_tokens
+    assert stats["total_calls"] == sum(r["calls"] for r in raw_rows)
+    assert stats["total_records"] == sum(r["records"] for r in raw_rows)
+    assert stats["total_cost"] == pytest.approx(exp_local_cost + exp_dalton_cost, rel=0, abs=1e-9)
+    assert stats["unpriced_tokens"] == sum(r["unpriced_tokens"] for r in raw_rows)
+    assert sum((m.get("reference_cost_usd") or 0.0) for m in stats["unpriced_models"]) == pytest.approx(exp_ref_cost, rel=0, abs=1e-9)
+
+    # 2. Source subtotals unchanged (no cross-source contamination)
+    assert stats["local_stats"]["tokens"] == exp_local_tokens
+    assert stats["local_stats"]["calls"] == sum(r["calls"] for r in raw_local)
+    assert stats["local_stats"]["records"] == sum(r["records"] for r in raw_local)
+    assert stats["local_stats"]["cost"] == pytest.approx(exp_local_cost, rel=0, abs=1e-9)
+    assert stats["local_stats"]["unpriced_tokens"] == sum(r["unpriced_tokens"] for r in raw_local)
+
+    assert stats["dalton_stats"]["tokens"] == exp_dalton_tokens
+    assert stats["dalton_stats"]["calls"] == sum(r["calls"] for r in raw_dalton)
+    assert stats["dalton_stats"]["records"] == sum(r["records"] for r in raw_dalton)
+    assert stats["dalton_stats"]["cost"] == pytest.approx(exp_dalton_cost, rel=0, abs=1e-9)
+    assert stats["dalton_stats"]["unpriced_tokens"] == sum(r["unpriced_tokens"] for r in raw_dalton)
+
+    # 3. Expected merged row names:
+    # Neon (merged), Claude Opus 5.5 (Antigravity) (merged), claude-opus-5-5-oauth (independent!),
+    # claude-opus-5-5 (local Anthropic independent!), muse-wonder-full-1.0, GPT-OSS 120B (Antigravity)
+    by_model = {r["model"]: r for r in merged_rows}
+    assert set(by_model.keys()) == {
+        "Gemini 4 Neon",
+        "Claude Opus 5.5 (Antigravity)",
+        "claude-opus-5-5-oauth",
+        "claude-opus-5-5",
+        "muse-wonder-full-1.0",
+        "GPT-OSS 120B (Antigravity)",
+    }
+
+    # Anthropic official OAuth & local Claude Code stay independent (no series_id / no effort_breakdown)
+    assert "series_id" not in by_model["claude-opus-5-5-oauth"]
+    assert "effort_breakdown" not in by_model["claude-opus-5-5-oauth"]
+    assert by_model["claude-opus-5-5-oauth"]["calls"] == 500
+    assert "series_id" not in by_model["claude-opus-5-5"]
+
+    # Neon effort breakdown: medium, high, xhigh, unknown (in canonical order)
+    neon = by_model["Gemini 4 Neon"]
+    assert neon["series_id"] == "antigravity-oauth:gemini-4-neon"
+    assert list(neon["effort_breakdown"].keys()) == ["medium", "high", "xhigh", "unknown"]
+    assert neon["effort_breakdown"]["unknown"]["total_tokens"] == 105_000
+    assert neon["effort_breakdown"]["unknown"]["calls"] == 10
+
+    # Antigravity Opus effort breakdown: low (Dalton + local combined!), medium, high
+    agy_opus = by_model["Claude Opus 5.5 (Antigravity)"]
+    assert agy_opus["series_id"] == "antigravity-oauth:claude-opus-5-5"
+    assert list(agy_opus["effort_breakdown"].keys()) == ["low", "medium", "high"]
+    assert agy_opus["effort_breakdown"]["low"]["calls"] == 18 + 5
+
+    # GPT-OSS 120B keeps unpriced & reference_cost_usd in both merged row and effort_breakdown
+    gpt_oss = by_model["GPT-OSS 120B (Antigravity)"]
+    assert gpt_oss["cost_usd"] is None
+    assert gpt_oss["unpriced_tokens"] == 55_000
+    assert gpt_oss["reference_cost_usd"] == pytest.approx(0.08)
+    assert gpt_oss["effort_breakdown"]["medium"]["unpriced_tokens"] == 55_000
+    assert gpt_oss["effort_breakdown"]["medium"]["reference_cost_usd"] == pytest.approx(0.08)
+
+    # 4. Closure invariant for EVERY merged series row
+    for r in merged_rows:
+        bd = r.get("effort_breakdown")
+        if not bd:
+            continue
+        assert sum(b["total_tokens"] for b in bd.values()) == r["total_tokens"]
+        assert sum(b["calls"] for b in bd.values()) == r["calls"]
+        assert sum(b["records"] for b in bd.values()) == r["records"]
+        assert sum(b["unpriced_tokens"] for b in bd.values()) == r["unpriced_tokens"]
+        if r["cost_usd"] is None:
+            assert all(b["cost_usd"] is None for b in bd.values())
+        else:
+            assert sum((b["cost_usd"] or 0.0) for b in bd.values()) == pytest.approx(r["cost_usd"], rel=0, abs=1e-9)
+        if r["reference_cost_usd"] is None:
+            assert all(b["reference_cost_usd"] is None for b in bd.values())
+        else:
+            assert sum((b["reference_cost_usd"] or 0.0) for b in bd.values()) == pytest.approx(
+                r["reference_cost_usd"], rel=0, abs=1e-9
+            )
+
+
+def test_s5_merge_rows_by_model_is_idempotent() -> None:
+    tracker = _load_tracker()
+    snap = _make_realistic_series_snapshot(include_series=True)
+    raw_rows = [dict(r) for r in snap["windows"][0]["rows"]]
+    for r in raw_rows:
+        r["total_tokens"] = r["fresh"] + r["cache_write"] + r["cache_read"] + r["output"]
+        r["prompt_tokens"] = r["fresh"] + r["cache_write"] + r["cache_read"]
+        r["norm_provider"] = tracker.normalize_provider(r["provider"], r["model"])
+
+    series_index = tracker.build_series_index(snap["antigravity_series"])
+    merged_once = tracker.merge_rows_by_model(raw_rows, series_index)
+    merged_twice = tracker.merge_rows_by_model(merged_once, series_index)
+    merged_thrice = tracker.merge_rows_by_model(merged_twice, series_index)
+
+    assert merged_twice == merged_once
+    assert merged_thrice == merged_once
+
+
+def test_s5_input_json_offline_uses_embedded_series_and_falls_back_for_legacy_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tracker = _load_tracker()
+
+    # 1. Embedded custom series in --input-json takes precedence over external file
+    custom_snap = _make_realistic_series_snapshot(include_series=False)
+    custom_snap["antigravity_series"] = [
+        {
+            "series_id": "antigravity-oauth:gemini-4-nova",
+            "series_prefix": "gemini-4-nova",
+            "provider": "antigravity-oauth",
+            "display_name": "Gemini 4 Nova",
+            "qualified_display_name": "Gemini 4 Nova (Antigravity)",
+            "default_effort": "high",
+            "default_model": "gemini-4-nova-high-oauth",
+            "efforts": ["low", "high"],
+            "variants": {
+                "low": "gemini-4-nova-low-oauth",
+                "high": "gemini-4-nova-high-oauth",
+            },
+        }
+    ]
+    custom_snap["windows"][0]["rows"] = [
+        {
+            "source": "Dalton 生产（订阅）",
+            "provider": "google",
+            "model": "gemini-4-nova-high-oauth",
+            "dalton_prod": True,
+            "records": 1,
+            "calls": 10,
+            "runs": 3,
+            "fresh": 100_000,
+            "cache_write": 0,
+            "cache_read": 0,
+            "output": 10_000,
+            "cost_usd": 0.5,
+            "unpriced_tokens": 0,
+        },
+        {
+            "source": "Dalton 生产（订阅）",
+            "provider": "google",
+            "model": "gemini-4-nova-low-oauth",
+            "dalton_prod": True,
+            "records": 1,
+            "calls": 5,
+            "runs": 2,
+            "fresh": 50_000,
+            "cache_write": 0,
+            "cache_read": 0,
+            "output": 5_000,
+            "cost_usd": 0.25,
+            "unpriced_tokens": 0,
+        },
+    ]
+    custom_snap["windows"][0]["row_count"] = 2
+    custom_snap["windows"][0]["totals"] = {
+        "tokens": 165_000,
+        "records": 2,
+        "calls": 15,
+        "priced_cost_usd": 0.75,
+        "unpriced_tokens": 0,
+    }
+    snap_with_series = tmp_path / "with_series.json"
+    snap_with_series.write_text(json.dumps(custom_snap, ensure_ascii=False), encoding="utf-8")
+
+    with patch.object(sys, "argv", ["token_weekly_usage_tracker.py", "--input-json", str(snap_with_series), "--json"]):
+        assert tracker.main() == 0
+    out_embedded = json.loads(capsys.readouterr().out)
+    assert len(out_embedded["top10"]) == 1
+    assert out_embedded["top10"][0]["model"] == "Gemini 4 Nova"
+    assert list(out_embedded["top10"][0]["effort_breakdown"].keys()) == ["low", "high"]
+
+    # 2. Legacy snapshot WITHOUT antigravity_series falls back to synced references/antigravity_series.json
+    import subprocess
+
+    seeded_target = tmp_path / "seeded_openclaw_data"
+    seed_res = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts/dalton/seed_openclaw_data.sh"), "--apply", "--target", str(seeded_target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert seed_res.returncode == 0, seed_res.stdout + seed_res.stderr
+    assert (seeded_target / "skills/model-usage-cost/references/antigravity_series.json").is_file()
+    assert (seeded_target / "skills/model-usage-cost/scripts/antigravity_series.py").is_file()
+
+    legacy_snap = _make_realistic_series_snapshot(include_series=False)
+    assert "antigravity_series" not in legacy_snap
+    legacy_path = tmp_path / "legacy_snap.json"
+    legacy_path.write_text(json.dumps(legacy_snap, ensure_ascii=False), encoding="utf-8")
+
+    monkeypatch.setenv("OPENCLAW_WORKSPACE", str(seeded_target))
+    monkeypatch.delenv("DALTON_ANTIGRAVITY_SERIES_FILE", raising=False)
+    with patch.object(sys, "argv", ["token_weekly_usage_tracker.py", "--input-json", str(legacy_path), "--json"]):
+        assert tracker.main() == 0
+    out_legacy = json.loads(capsys.readouterr().out)
+    legacy_models = {r["model"] for r in out_legacy["top10"] + out_legacy["tail"]}
+    assert "Gemini 4 Neon" in legacy_models
+    assert "Claude Opus 5.5 (Antigravity)" in legacy_models
+    assert "claude-opus-5-5-oauth" in legacy_models
+
+
+def test_s5_card_renders_effort_breakdown_in_top10_and_tail_including_unknown_and_unpriced() -> None:
+    tracker = _load_tracker()
+    snap = _make_realistic_series_snapshot(include_series=True)
+    # Add 7 extra dummy models with higher token counts so GPT-OSS 120B (Antigravity) falls into tail (> rank 10)
+    extra_rows = []
+    for idx in range(7):
+        extra_rows.append(
+            {
+                "source": "openclaw",
+                "provider": "openai",
+                "model": f"gpt-6-extra-{idx}",
+                "dalton_prod": False,
+                "records": 10,
+                "calls": 10,
+                "runs": 0,
+                "fresh": 200_000 + idx * 10_000,
+                "cache_write": 0,
+                "cache_read": 0,
+                "output": 10_000,
+                "cost_usd": 1.0,
+                "unpriced_tokens": 0,
+            }
+        )
+    snap["windows"][0]["rows"].extend(extra_rows)
+    snap["windows"][0]["row_count"] = len(snap["windows"][0]["rows"])
+    all_rows = snap["windows"][0]["rows"]
+    snap["windows"][0]["totals"] = {
+        "tokens": sum(r["fresh"] + r["cache_write"] + r["cache_read"] + r["output"] for r in all_rows),
+        "records": sum(r["records"] for r in all_rows),
+        "calls": sum(r["calls"] for r in all_rows),
+        "priced_cost_usd": round(sum(r["cost_usd"] for r in all_rows if r["cost_usd"] is not None), 6),
+        "unpriced_tokens": sum(r["unpriced_tokens"] for r in all_rows),
+    }
+
+    stats = tracker.process_usage_stats(snap)
+    assert any(r["model"] == "GPT-OSS 120B (Antigravity)" for r in stats["tail"])
+
+    card = tracker.build_card(stats)
+    card_text = json.dumps(card, ensure_ascii=False)
+    assert "Gemini 4 Neon" in card_text
+    assert "Claude Opus 5.5 (Antigravity)" in card_text
+    assert "claude-opus-5-5-oauth" in card_text
+    assert "档位明细:" in card_text
+    assert "high " in card_text
+    assert "medium " in card_text
+    assert "xhigh " in card_text
+    assert "档位未知 " in card_text
+    # Tail unpriced Antigravity series displays breakdown with unpriced + reference estimate
+    assert "GPT-OSS 120B (Antigravity)" in card_text
+    assert "无公开价，参考 $0.08" in card_text
