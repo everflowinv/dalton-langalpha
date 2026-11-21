@@ -27,6 +27,7 @@ interface ServerState {
   availableModelsByProvider: Record<string, Partial<AvailableModels> | { httpStatus: number }>;
   modelsExtra: Record<string, { display_name: string; models: string[] }>;
   metadataExtra: Record<string, Record<string, unknown>>;
+  credentialsStatusFailCount: number;
 }
 
 const makeInitialState = (): ServerState => ({
@@ -55,6 +56,7 @@ const makeInitialState = (): ServerState => ({
   availableModelsByProvider: {},
   modelsExtra: {},
   metadataExtra: {},
+  credentialsStatusFailCount: 0,
 });
 
 const server = vi.hoisted(() => ({
@@ -88,6 +90,15 @@ vi.mock('@/api/client', async (importOriginal) => {
       return ok({ ...s.preferences } as T);
     }
     if (url === '/api/v1/dalton/credentials/status') {
+      if (s.credentialsStatusFailCount > 0) {
+        s.credentialsStatusFailCount -= 1;
+        throw new ApiError('Request failed with status code 500', 'ERR_BAD_RESPONSE', {
+          data: { detail: 'temporary failure' },
+          status: 500,
+          statusText: 'Internal Server Error',
+          headers: {},
+        });
+      }
       return ok({
         sharing: s.teamSharingEnabled ? 'team' : 'off',
         enabled: s.teamSharingEnabled,
@@ -751,6 +762,78 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     expect(await screen.findByTestId('setup-model-team-models-empty', {}, { timeout: 5000 })).toBeInTheDocument();
     expect(screen.getByTestId('location')).toHaveTextContent('/setup/model');
   });
+
+  it('(c4) legacy subscription_or_key with initial credentials-status failure then recovery settles on /setup/default without redirect loop', async () => {
+    const user = userEvent.setup();
+    server.state.teamModelsConfigured = false;
+    server.state.credentialsStatusFailCount = 1;
+    server.state.modelsExtra = {
+      openai: { display_name: 'OpenAI', models: ['gpt-5', 'gpt-5-mini'] },
+    };
+    server.state.metadataExtra = {
+      'gpt-5': { display_name: 'GPT 5 Pro', provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3 },
+      'gpt-5-mini': { display_name: 'GPT 5 Mini', provider: 'openai', access_type: 'api_key', intelligence: 3, speed: 5 },
+    };
+    server.state.userApiKeys = [
+      { provider: 'openai', display_name: 'OpenAI', has_key: true, access_type: 'api_key', masked_key: '(server)' },
+    ];
+    server.state.availableModelsByProvider = {
+      openai: { status: 'ok', ready: ['gpt-5', 'gpt-5-mini'] },
+    };
+    server.state.progress.models = 'subscription_or_key';
+    server.state.progress.runs_on = 'cloud';
+    server.state.progress.setup_on = 'browser';
+
+    renderRealWizardApp('/dashboard');
+
+    // First credentials/status fails -> lands on /setup/model -> retry/re-read succeeds ->
+    // shared query updates routing and wizard together to /setup/default without bouncing back.
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/setup/default'), { timeout: 5000 });
+    const gptRadio = await screen.findByRole('radio', { name: /GPT 5 Pro/i }, { timeout: 5000 });
+    expect(gptRadio).toBeChecked();
+    expect(screen.getByTestId('location')).toHaveTextContent('/setup/default');
+
+    await user.click(screen.getByRole('button', { name: 'Continue' }));
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/welcome'), { timeout: 5000 });
+  }, 15_000);
+
+  it('(c5) legacy subscription_or_key recovering from rejected (401/unauthorized) team credential via Try again moves to /setup/default without redirect loop', async () => {
+    const user = userEvent.setup();
+    server.state.teamModelsConfigured = false;
+    server.state.modelsExtra = {
+      openai: { display_name: 'OpenAI', models: ['gpt-5', 'gpt-5-mini'] },
+    };
+    server.state.metadataExtra = {
+      'gpt-5': { display_name: 'GPT 5 Pro', provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3 },
+      'gpt-5-mini': { display_name: 'GPT 5 Mini', provider: 'openai', access_type: 'api_key', intelligence: 3, speed: 5 },
+    };
+    server.state.userApiKeys = [
+      { provider: 'openai', display_name: 'OpenAI', has_key: true, access_type: 'api_key', masked_key: '(server)' },
+    ];
+    server.state.availableModelsByProvider = {
+      openai: { status: 'fallback', reason: 'unauthorized', ready: ['gpt-5', 'gpt-5-mini'] },
+    };
+    server.state.progress.models = 'subscription_or_key';
+    server.state.progress.runs_on = 'cloud';
+    server.state.progress.setup_on = 'browser';
+
+    renderRealWizardApp('/dashboard');
+
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/setup/model'), { timeout: 5000 });
+    expect(await screen.findByTestId('setup-model-team-models-empty', {}, { timeout: 5000 })).toBeInTheDocument();
+
+    // Admin fixes the server key without changing providers list shape; Try again must
+    // invalidate underlying queries and transition cleanly to /setup/default with no loop.
+    server.state.availableModelsByProvider = {
+      openai: { status: 'ok', ready: ['gpt-5', 'gpt-5-mini'] },
+    };
+    await user.click(screen.getByRole('button', { name: 'Try again' }));
+
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/setup/default'), { timeout: 5000 });
+    const gptRadio = await screen.findByRole('radio', { name: /GPT 5 Pro/i }, { timeout: 5000 });
+    expect(gptRadio).toBeChecked();
+    expect(screen.getByTestId('location')).toHaveTextContent('/setup/default');
+  }, 15_000);
 
   it('(c3) normalizes legacy claude_code answers across AnswersStrip, DefaultStep, ComputerStep, and non-shared mode', async () => {
     // 1) Shared team models available -> DefaultStep chip shows Team-configured models, never Claude Code

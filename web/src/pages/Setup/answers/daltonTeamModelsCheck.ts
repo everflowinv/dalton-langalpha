@@ -18,7 +18,6 @@ import {
   planKeyHolders,
   type ProviderRow,
 } from '@/hooks/useFilteredModels';
-import type { TeamCredentialsStatus } from '@/hooks/useTeamCredentials';
 import { allows, modelRefusedBy, restrictsModels, RULE, withoutRefusedModels } from '@/lib/accountRules';
 import { payerResolver, type Payer } from '@/lib/modelPayer';
 import { modelPrefs } from '@/lib/modelPreferences';
@@ -90,46 +89,33 @@ export function collectRejectedProviders(
 
 export interface CheckDaltonTeamModelsParams {
   queryClient: QueryClient;
-  userId: string | null;
   providers: ConfiguredProvider[];
   byokEnabled: boolean;
   providersUnread: boolean;
   policy: AccountPolicy | null;
 }
 
+export interface DaltonTeamModelsCheckResult {
+  available: boolean;
+  rejectedProviders: ReadonlySet<string>;
+}
+
 /**
- * Evaluates whether Dalton team-shared models are currently available, using
- * the same React Query cache keys and visibility/filtering pipeline as
- * `useDaltonTeamModels` / `useAllModels`.
+ * Evaluates whether Dalton team-shared models are currently available (and
+ * which providers were explicitly rejected), using the same React Query cache
+ * keys and visibility/filtering pipeline as `useAllModels`.
  *
- * Throws when team sharing is active and required catalog/provider reads fail,
- * so the caller treats the result as unread rather than empty.
+ * Called only when team credential sharing is active. Throws when required
+ * catalog/provider reads fail so subscribers treat the result as unread rather
+ * than empty.
  */
 export async function checkDaltonTeamModelsAvailable({
   queryClient,
-  userId,
   providers: configuredProviders,
   byokEnabled: byokSwitch,
   providersUnread,
   policy,
-}: CheckDaltonTeamModelsParams): Promise<boolean> {
-  let status: TeamCredentialsStatus;
-  try {
-    status = await queryClient.fetchQuery<TeamCredentialsStatus>({
-      queryKey: queryKeys.dalton.credentialsStatus(userId),
-      queryFn: async () => {
-        const res = await api.get<TeamCredentialsStatus>('/api/v1/dalton/credentials/status');
-        return res.data;
-      },
-      staleTime: MODELS_STALE_MS,
-      retry: false,
-    });
-  } catch {
-    // Matches useTeamCredentials: a failed status read treats sharing as off.
-    return false;
-  }
-
-  if (!status?.enabled) return false;
+}: CheckDaltonTeamModelsParams): Promise<DaltonTeamModelsCheckResult> {
   if (providersUnread) {
     throw new Error('Configured providers could not be read');
   }
@@ -265,5 +251,8 @@ export async function checkDaltonTeamModelsAvailable({
       )
     : payers;
 
-  return hasAvailableDaltonModels(offered, visible.metadata, offeredPayers, true, rejectedProviders);
+  return {
+    available: hasAvailableDaltonModels(offered, visible.metadata, offeredPayers, true, rejectedProviders),
+    rejectedProviders,
+  };
 }

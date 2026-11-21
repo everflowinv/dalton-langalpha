@@ -95,19 +95,19 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
   // they just picked. Set during render like the Background fill below.
   // From the slot models, so the fill never lands on a conversation-only
   // model (Claude Code); the user may still pick one.
-  // DALTON-HOOK(dalton-setup): validate picks against currently available models and seed from Dalton-filtered slots
+  // DALTON-HOOK(dalton-setup): enforce live catalog membership only in Dalton builds; non-Dalton preserves upstream behavior
   const availablePrimary = Object.values(visibleModels).flatMap((p) => p.models ?? []);
   const fillable = Object.values(visibleSlotModels).flatMap((p) => p.models ?? []);
-  const primaryValid = Boolean(primaryModel) && availablePrimary.includes(primaryModel);
-  const backgroundValid = Boolean(backgroundModel) && fillable.includes(backgroundModel);
-  const catalogReady = !isLoading && !(isDaltonBuild && team.isLoading) && !team.unread;
+  const primaryValid = Boolean(primaryModel) && (!isDaltonBuild || availablePrimary.includes(primaryModel));
+  const backgroundValid = Boolean(backgroundModel) && (!isDaltonBuild || fillable.includes(backgroundModel));
+  const catalogReady = !isLoading && (!isDaltonBuild || (!team.isLoading && !team.unread));
   const primaryFill = !primaryValid && catalogReady && prefsLoaded
     ? (isDaltonBuild
       ? [DALTON_DEFAULT_MODEL, systemDefaults?.default_model, ...starredModels(preferences)]
       : [systemDefaults?.default_model, ...starredModels(preferences)]
     ).find(
-        (m): m is string => typeof m === 'string' && fillable.includes(m) && availablePrimary.includes(m),
-      ) ?? fillable.find((m) => availablePrimary.includes(m))
+        (m): m is string => typeof m === 'string' && fillable.includes(m) && (!isDaltonBuild || availablePrimary.includes(m)),
+      ) ?? (isDaltonBuild ? fillable.find((m) => availablePrimary.includes(m)) : fillable[0])
     : undefined;
   if (primaryFill && primaryFill !== primaryModel) setPrimaryModel(primaryFill);
 
@@ -115,7 +115,7 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
   // go with the primary, set during render so the slot never paints empty.
   // The fill is a pick like any other: it stays when the primary changes, and
   // nothing is saved before Continue.
-  // DALTON-HOOK(dalton-setup): validate both primary and background against the live catalog before enabling Continue
+  // DALTON-HOOK(dalton-setup): validate catalog membership before enabling Continue in Dalton builds only
   const effectivePrimary = primaryValid ? primaryModel : (primaryFill ?? '');
   const backgroundFill = !backgroundValid && effectivePrimary && catalogReady && prefsLoaded
     ? (isDaltonBuild && fillable.includes(DALTON_BACKGROUND_MODEL)
@@ -124,7 +124,9 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
     : undefined;
   if (backgroundFill && backgroundFill !== backgroundModel) setBackgroundModel(backgroundFill);
 
-  const canContinue = prefsLoaded && catalogReady && primaryValid && backgroundValid;
+  const canContinue = isDaltonBuild
+    ? prefsLoaded && catalogReady && primaryValid && backgroundValid
+    : prefsLoaded && Boolean(primaryModel && backgroundModel);
 
   // ---------------------------------------------------------------------------
   // Handlers

@@ -1,12 +1,17 @@
-import { useCallback, useMemo } from 'react';
+import { useCallback, useContext, useMemo } from 'react';
 import { useQueries, useQueryClient } from '@tanstack/react-query';
 import { getProviderAvailableModels } from '@/api/model';
 import { isDaltonBuild } from '@/config/brand';
+import { isDaltonAuth } from '@/config/daltonAuth';
 import { hasAvailableDaltonModels } from '@/config/daltonSetup';
+import { AuthContext } from '@/contexts/AuthContext';
+import { useAccount } from '@/hooks/useAccount';
 import { useAllModels, type UseAllModelsResult } from '@/hooks/useAllModels';
+import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
 import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { queryKeys } from '@/lib/queryKeys';
 import { collectRejectedProviders, REJECTED_CREDENTIAL_REASONS } from './daltonTeamModelsCheck';
+import { useDaltonTeamModelsAvailable } from './useTeamModelsAvailable';
 
 const STALE_MS = 10 * 60_000;
 const EMPTY_PROVIDERS: readonly string[] = [];
@@ -36,33 +41,83 @@ export interface DaltonTeamModelsState {
  * Single source of truth for whether Dalton team-shared models are actually
  * available to the current member, shared across UseStep, nextSetupStep,
  * ModelStep, DefaultStep, MethodStep, DefaultsStep, and DoneStep.
+ *
+ * In Dalton auth builds (`isDaltonAuth && userId`), the four availability
+ * states (`available`, `empty`, `isLoading`, `unread`) plus `shared` and
+ * `rejectedProviders` are derived directly from the exact same React Query
+ * entry (`useDaltonTeamModelsAvailable`) that `useSetupFacts` reads, so the
+ * app-shell route and wizard pages can never disagree.
  */
 function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
   const queryClient = useQueryClient();
+  const userId = useContext(AuthContext)?.userId ?? null;
+  const useSharedQuery = isDaltonBuild && isDaltonAuth && Boolean(userId);
   const { isShared, callerTierPending, canManage } = useTeamCredentials();
+  const { providers, byokEnabled, isLoading: providersLoading, unread: providersUnread } = useConfiguredProviders({
+    enabled: useSharedQuery,
+  });
+  const { policy } = useAccount();
+  const sharedAvailability = useDaltonTeamModelsAvailable(
+    useSharedQuery,
+    providers,
+    byokEnabled,
+    providersLoading,
+    providersUnread,
+    policy,
+  );
   const all = useAllModels();
 
-  const shared = isDaltonBuild && isShared;
+  // Fallback path used only in non-Supabase unit tests where AuthContext /
+  // isDaltonAuth are absent and useTeamCredentials + useAllModels are mocked.
+  const localShared = !useSharedQuery && isDaltonBuild && isShared;
   const listedProviders = all.listedProviders ?? EMPTY_PROVIDERS;
   const providerResults = useQueries({
-    queries: (shared ? listedProviders : []).map((provider) => ({
+    queries: (localShared ? listedProviders : []).map((provider) => ({
       queryKey: queryKeys.providerModels.available(provider, ''),
       queryFn: ({ signal }: { signal: AbortSignal }) => getProviderAvailableModels(provider, { signal }),
       staleTime: STALE_MS,
       retry: false,
     })),
   });
-  const listsLoading = shared && providerResults.some((r) => r.isLoading);
+  const listsLoading = localShared && providerResults.some((r) => r.isLoading);
 
   const keyCandidates = all.rawApiResponse?.key_candidates;
-  const rejectedProviders = useMemo<ReadonlySet<string>>(
-    () => (shared ? collectRejectedProviders(listedProviders, providerResults, keyCandidates) : new Set()),
-    [shared, listedProviders, providerResults, keyCandidates],
+  const localRejectedProviders = useMemo<ReadonlySet<string>>(
+    () => (localShared ? collectRejectedProviders(listedProviders, providerResults, keyCandidates) : new Set()),
+    [localShared, listedProviders, providerResults, keyCandidates],
   );
 
-  const isLoading = isDaltonBuild && (callerTierPending || (shared && (all.isLoading || listsLoading)));
-  const unread = shared && !all.isLoading && !listsLoading && all.unread;
-  const available = shared
+  const retry = useCallback(() => {
+    void Promise.all([
+      queryClient.invalidateQueries({ queryKey: queryKeys.dalton.credentialsStatus(userId) }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.models.all }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.user.apiKeys() }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.oauth.all }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.providerModels.all }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.user.preferences() }),
+    ]).then(() =>
+      queryClient.refetchQueries({ queryKey: [...queryKeys.dalton.all, 'team-models-available'] }),
+    );
+  }, [queryClient, userId]);
+
+  if (useSharedQuery) {
+    return {
+      shared: sharedAvailability.shared,
+      available: sharedAvailability.available,
+      empty: sharedAvailability.empty,
+      isLoading: sharedAvailability.isLoading,
+      unread: sharedAvailability.unread,
+      canManage,
+      callerTierPending,
+      rejectedProviders: sharedAvailability.rejectedProviders,
+      retry,
+      all,
+    };
+  }
+
+  const isLoading = isDaltonBuild && (callerTierPending || (localShared && (all.isLoading || listsLoading)));
+  const unread = localShared && !all.isLoading && !listsLoading && all.unread;
+  const available = localShared
     && !callerTierPending
     && !all.isLoading
     && !listsLoading
@@ -72,30 +127,19 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
       all.metadata ?? {},
       all.payers ?? {},
       true,
-      rejectedProviders,
+      localRejectedProviders,
     );
-  const empty = shared && !callerTierPending && !all.isLoading && !listsLoading && !all.unread && !available;
-
-  const retry = useCallback(() => {
-    void Promise.all([
-      queryClient.refetchQueries({ queryKey: queryKeys.dalton.all }),
-      queryClient.refetchQueries({ queryKey: queryKeys.models.all }),
-      queryClient.refetchQueries({ queryKey: queryKeys.user.apiKeys() }),
-      queryClient.refetchQueries({ queryKey: queryKeys.oauth.all }),
-      queryClient.refetchQueries({ queryKey: queryKeys.providerModels.all }),
-      queryClient.refetchQueries({ queryKey: queryKeys.user.preferences() }),
-    ]).then(() => queryClient.invalidateQueries({ queryKey: [...queryKeys.dalton.all, 'team-models-available'] }));
-  }, [queryClient]);
+  const empty = localShared && !callerTierPending && !all.isLoading && !listsLoading && !all.unread && !available;
 
   return {
-    shared,
+    shared: localShared,
     available,
     empty,
     isLoading,
     unread,
     canManage,
     callerTierPending,
-    rejectedProviders,
+    rejectedProviders: localRejectedProviders,
     retry,
     all,
   };
@@ -129,4 +173,3 @@ function useInertTeamModels(): DaltonTeamModelsState {
 export const useDaltonTeamModels: () => DaltonTeamModelsState = isDaltonBuild
   ? useDaltonTeamModelsImpl
   : useInertTeamModels;
-
