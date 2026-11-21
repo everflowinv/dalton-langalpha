@@ -67,16 +67,38 @@ def not_a_server_skip(alias: str) -> str:
     )
 
 
+def execution_computer_reach_sql(task_alias: str, thread_alias: str) -> str:
+    """SQL predicate matching an execution reachable from a computer token.
+
+    DALTON-HOOK(history-computer-scope): an execution belongs to ``computer_id``
+    when either its task's workspace or its conversation thread's workspace
+    belongs to that computer (excluding Home). Using a single ``EXISTS`` keeps
+    every matching execution row unique even when both workspaces sit on the
+    same computer, and falls back to the task workspace when the execution has
+    no thread (``thread_alias.workspace_id IS NULL``).
+
+    Caller binds ``(home_id, computer_id)``.
+    """
+    return (
+        "EXISTS (SELECT 1 FROM workspaces execution_workspace"
+        " WHERE execution_workspace.workspace_id <> %s::uuid"
+        " AND execution_workspace.computer_id = %s::uuid"
+        f" AND (execution_workspace.workspace_id = {task_alias}.workspace_id"
+        f" OR execution_workspace.workspace_id = {thread_alias}.workspace_id))"
+    )
+
+
 def _reached_execution_probe(outer: str, alias: str, predicate: str) -> str:
     """One last-run probe limited to the token computer before LIMIT.
 
-    The effective workspace is the run thread's workspace, or ``outer``'s
-    current workspace when the run has no thread. Home and any other computer
-    drop out of this probe, so a later probe cannot fall back to them.
+    Matches runs whose task workspace (``outer.workspace_id``) or thread
+    workspace (``reach_thread.workspace_id``) belongs to the token computer,
+    excluding Home. Runs with no thread belong by ``outer.workspace_id``.
     """
     # DALTON-HOOK(company-automations): computer tokens read each last-run probe on that computer only
-    effective = f"COALESCE(reach_thread.workspace_id, {outer}.workspace_id)"
+    # DALTON-HOOK(history-computer-scope): match when either task or thread workspace belongs to computer_id
     narrowed = f" AND {predicate}" if predicate else ""
+    reach = execution_computer_reach_sql(outer, "reach_thread")
     return (
         f"(SELECT {alias}.automation_execution_id\n"
         f"                     FROM automation_executions {alias}\n"
@@ -84,10 +106,7 @@ def _reached_execution_probe(outer: str, alias: str, predicate: str) -> str:
         f"                       ON reach_thread.conversation_thread_id = {alias}.conversation_thread_id\n"
         f"                     WHERE {alias}.automation_id = {outer}.automation_id"
         f"{narrowed}\n"
-        f"                       AND {effective} <> %s::uuid\n"
-        f"                       AND EXISTS (SELECT 1 FROM workspaces execution_workspace\n"
-        f"                            WHERE execution_workspace.workspace_id = {effective}\n"
-        f"                              AND execution_workspace.computer_id = %s::uuid)\n"
+        f"                       AND {reach}\n"
         f"                     ORDER BY {alias}.created_at DESC, {alias}.automation_execution_id DESC\n"
         f"                     LIMIT 1)"
     )

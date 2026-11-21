@@ -12,10 +12,12 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 # DALTON-HOOK(company-automations): the locked parent read uses these columns
+# DALTON-HOOK(history-computer-scope): reuse shared computer-scope execution reach predicate
 from src.server.database.automation import (
     AUTOMATION_COLUMNS,
     EXECUTION_COLUMNS,
     UNSETTLED_STATUSES,
+    execution_computer_reach_sql,
     not_a_server_skip,
 )
 from src.server.contracts.status import (
@@ -940,12 +942,11 @@ async def list_executions(
     caller's own executions with no extra predicate. Company runs are not
     selected here.
 
-    A computer token keeps the automation on that computer, outside Home, and
-    applies the same rule to the run's effective workspace
-    ``COALESCE(t.workspace_id, a.workspace_id)``. A later move changes
-    ``a.workspace_id`` while an older thread still names the computer the run
-    happened on. A run with no thread keeps the current automation workspace.
-    Both predicates are in the WHERE, so LIMIT/OFFSET page the rows that remain.
+    A computer token matches executions whose automation workspace OR thread
+    workspace belongs to that computer, outside Home (a run with no thread
+    belongs by its automation workspace). Using a single ``EXISTS`` keeps every
+    matching row unique even when both workspaces sit on the same computer, and
+    keeps the predicate in the WHERE so LIMIT/OFFSET page the rows that remain.
     """
     # DALTON-HOOK(company-automations): optional scope and computer reach on the owner feed
     where_parts = ["a.user_id = %s"]
@@ -965,20 +966,10 @@ async def list_executions(
         where_parts.append("a.scope = %s")
         params.append(scope)
     if computer_id is not None:
+        # DALTON-HOOK(history-computer-scope): include executions whose task workspace OR thread workspace belongs to computer_id (excluding Home)
         home_id = get_home_workspace_id(user_id)
-        where_parts.append(
-            "a.workspace_id <> %s::uuid AND EXISTS (SELECT 1 FROM workspaces w"
-            " WHERE w.workspace_id = a.workspace_id"
-            " AND w.computer_id = %s::uuid)"
-        )
-        where_parts.append(
-            "COALESCE(t.workspace_id, a.workspace_id) <> %s::uuid"
-            " AND EXISTS (SELECT 1 FROM workspaces execution_workspace"
-            " WHERE execution_workspace.workspace_id"
-            " = COALESCE(t.workspace_id, a.workspace_id)"
-            " AND execution_workspace.computer_id = %s::uuid)"
-        )
-        params.extend([home_id, computer_id, home_id, computer_id])
+        where_parts.append(execution_computer_reach_sql("a", "t"))
+        params.extend([home_id, computer_id])
     where_clause = " AND ".join(where_parts)
 
     async with get_db_connection() as conn:

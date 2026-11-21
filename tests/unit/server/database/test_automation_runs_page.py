@@ -40,19 +40,21 @@ async def test_a_page_reads_one_row_past_itself(db, fetched, has_more):
 @pytest.mark.asyncio
 async def test_computer_token_filters_the_run_workspace_before_the_page(db):
     # DALTON-HOOK(company-automations): filter task and execution workspaces before pagination
+    # DALTON-HOOK(history-computer-scope): match when either task or thread workspace belongs to computer_id
     db.fetchall.return_value = []
     home_id = get_home_workspace_id("user-1")
 
     await exec_db.list_executions("user-1", computer_id="comp-b", limit=2, offset=0)
 
     sql, params = db.execute.await_args.args
-    assert "a.workspace_id <> %s::uuid" in sql
-    assert "w.workspace_id = a.workspace_id" in sql
-    assert "COALESCE(t.workspace_id, a.workspace_id) <> %s::uuid" in sql
-    assert "execution_workspace.workspace_id = COALESCE(t.workspace_id, a.workspace_id)" in sql
+    assert "execution_workspace.workspace_id <> %s::uuid" in sql
     assert "execution_workspace.computer_id = %s::uuid" in sql
+    assert (
+        "execution_workspace.workspace_id = a.workspace_id"
+        " OR execution_workspace.workspace_id = t.workspace_id"
+    ) in sql
     assert sql.index("execution_workspace") < sql.index("LIMIT")
-    assert params == ("user-1", home_id, "comp-b", home_id, "comp-b", 3, 0)
+    assert params == ("user-1", home_id, "comp-b", 3, 0)
 
 
 @pytest.mark.asyncio

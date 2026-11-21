@@ -460,6 +460,10 @@ ALLOWED_HOOKS=(
   "browser-kill-switch"
   # Background-slot calls default to low reasoning effort (src/server/services/llm/config.py).
   "background-effort-low"
+  # Execution history and automation detail last_execution computer-scope filter:
+  # include executions when either the automation's workspace or the thread's
+  # workspace belongs to computer_id (excluding Home), without duplicating rows.
+  "history-computer-scope"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
