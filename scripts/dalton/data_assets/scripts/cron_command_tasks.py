@@ -651,15 +651,36 @@ def parse_etf_dry_run_card(stdout):
     return card
 
 
+def _split_feishu_card_chunks(card: dict[str, Any]) -> list[dict[str, Any]]:
+    import importlib.util
+
+    for candidate in (
+        Path(__file__).resolve().with_name('feishu_send_card.py'),
+        WS / 'scripts' / 'feishu_send_card.py',
+    ):
+        if candidate.is_file():
+            spec = importlib.util.spec_from_file_location('_cron_feishu_send_card', candidate)
+            if spec is not None and spec.loader is not None:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                splitter = getattr(mod, 'split_feishu_card_to_chunks', None)
+                if callable(splitter):
+                    chunks = splitter(card)
+                    if isinstance(chunks, list) and chunks:
+                        return chunks
+    return [card]
+
+
 def etf_dry_run_outbox(stdout):
     card = parse_etf_dry_run_card(stdout)
+    cards = _split_feishu_card_chunks(card)
     return {
         'schema_version': 1,
         'task_code': 'T76',
         'job_key': ETF_TASK,
         'channel': 'feishu',
         'chat_id': TRACKING,
-        'feishu_cards': [{'card': card, 'images': [], 'chat_id': TRACKING}],
+        'feishu_cards': [{'card': c, 'images': [], 'chat_id': TRACKING} for c in cards],
         'delivery_writeback': {
             'kind': 'etf_discord_mirror',
             'chat_id': TRACKING,

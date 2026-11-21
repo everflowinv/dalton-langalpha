@@ -26,7 +26,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, NoReturn
+from zoneinfo import ZoneInfo
 
 import structlog
 from langchain.agents.middleware.types import (
@@ -48,6 +50,7 @@ from ptc_agent.agent.middleware.thinking_binding import (
 )
 
 from src.llms.error_classification import (
+    DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS,  # DALTON-HOOK(quota-exhaustion)
     UnfinishedReplyError,
     extract_status_code,
     is_context_overflow,
@@ -84,6 +87,138 @@ logger = structlog.get_logger(__name__)
 RESILIENCE_TRACE_ATTR = "__model_resilience__"
 
 _ERROR_SUMMARY_MAX_CHARS = 300
+
+_QUOTA_EXHAUSTED_REDIS_PREFIX = "dalton:quota_exhausted"
+_HKT = ZoneInfo("Asia/Hong_Kong")
+
+
+def quota_redis_key(  # DALTON-HOOK(quota-exhaustion)
+    name: str,
+    client: Any,
+    *,
+    user_id: str | None = None,
+) -> str | None:
+    """Coordination key scoped by credential owner, provider, model, and subscription account."""
+    if client is None:
+        return None
+    from src.dalton.credentials import credential_user_id
+    from src.dalton.llm.oauth_refresh import oauth_rebuild_spec
+
+    spec = oauth_rebuild_spec(client)
+    raw_user: str | None = None
+    provider: str | None = None
+    model_id = name
+    cred_id = ""
+    if spec is not None:
+        raw_user = spec.user_id or None
+        provider = spec.provider or _stamped(client, "pricing_provider")
+        model_id = spec.model_name or name
+        cred_id = (spec.credential_id or "").strip()
+        if not cred_id:
+            acct = (spec.account_id or "").strip()
+            if acct and not acct.startswith("muse-api-key"):
+                cred_id = acct
+    else:
+        provider = _stamped(client, "pricing_provider")
+        model_id = _stamped(client, "manifest_model") or catalog_model(client) or name
+        raw_user = user_id
+        if not raw_user:
+            try:
+                from langgraph.config import get_config
+
+                cfg_user = (get_config().get("configurable") or {}).get("user_id")
+                raw_user = str(cfg_user) if cfg_user else None
+            except Exception:
+                raw_user = None
+        if not raw_user and _stamped(client, "billing_type") == "platform":
+            raw_user = "platform"
+
+    if not raw_user or not provider or not model_id:
+        return None
+    if raw_user != "platform":
+        try:
+            cred_user = credential_user_id(str(raw_user))
+        except Exception:
+            cred_user = str(raw_user)
+    else:
+        cred_user = "platform"
+    if not cred_user:
+        return None
+    base = f"{_QUOTA_EXHAUSTED_REDIS_PREFIX}:{cred_user}:{provider}:{model_id}"
+    return f"{base}:{cred_id}" if cred_id else base
+
+
+def format_quota_cooldown_message(  # DALTON-HOOK(quota-exhaustion)
+    model_name: str,
+    expires_at: float | int | None,
+) -> str:
+    """Format an actionable pre-dispatch quota exhaustion message with HKT recovery time."""
+    ts = (
+        float(expires_at)
+        if isinstance(expires_at, (int, float))
+        else time.time() + DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS
+    )
+    dt_hkt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(_HKT)
+    when = dt_hkt.strftime("%Y-%m-%d %H:%M") + " HKT"
+    label = model_name or "当前模型"
+    return (
+        f"{label} 的订阅额度已用完，预计 {when} 恢复；"
+        "可以换用其他模型派发，或等恢复后再派"
+    )
+
+
+async def check_oauth_quota_cooldown(  # DALTON-HOOK(quota-exhaustion)
+    client: Any,
+    *,
+    model_name: str = "",
+    user_id: str | None = None,
+) -> str | None:
+    """Return a pre-dispatch refusal message when an OAuth client is in Redis cooldown."""
+    if client is None:
+        return None
+    from src.dalton.llm.oauth_refresh import oauth_rebuild_spec
+
+    spec = oauth_rebuild_spec(client)
+    billing = _stamped(client, "billing_type")
+    if billing != "oauth" and spec is None:
+        return None
+    label = (
+        model_name
+        or (spec.model_name if spec is not None else "")
+        or _stamped(client, "manifest_model")
+        or catalog_model(client)
+        or client_label(client)
+        or ""
+    )
+    redis_key = quota_redis_key(label, client, user_id=user_id)
+    if redis_key is None:
+        return None
+    try:
+        from src.utils.cache.redis_cache import get_cache_client
+
+        data = await get_cache_client().get(redis_key)
+    except Exception as err:
+        logger.debug(
+            "[ModelResilience] Redis pre-dispatch quota read unavailable, failing open",
+            key=redis_key,
+            error=str(err),
+        )
+        return None
+    if not isinstance(data, dict):
+        return None
+    expires_at = data.get("expires_at")
+    if isinstance(expires_at, (int, float)) and float(expires_at) <= time.time():
+        return None
+    display = label or str(data.get("model") or "当前模型")
+    return format_quota_cooldown_message(display, expires_at)
+
+
+class _RemoteQuotaExhaustedError(RuntimeError):  # DALTON-HOOK(quota-exhaustion)
+    """Refusal placeholder reconstructed from Redis cross-worker quota state."""
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 #: The ``response_metadata`` key naming the fallback that wrote an answer. Its
 #: usage counts that model's tokens, so compaction measures nothing for the
@@ -333,10 +468,12 @@ class ModelResilienceMiddleware(AgentMiddleware):
         max_delay: float = 60.0,
         jitter: bool = True,
         compacts_overflow: bool = False,
+        user_id: str | None = None,
     ) -> None:
         super().__init__()
         self.primary_name = primary_name
         self.primary_client = primary_client
+        self.user_id = user_id
         # Repeats only; the model a request targets is dropped per request,
         # as the instance is shared into subagents on other models.
         self.fallbacks = _distinct(list(fallbacks or []), None)
@@ -647,15 +784,14 @@ class ModelResilienceMiddleware(AgentMiddleware):
         # DALTON-HOOK(quota-exhaustion): a candidate benched as out of quota
         # is named by no switch — announcing a move to a model this call
         # would never dial misleads the user's trace.
-        return next(
-            (
-                j
-                for j in range(index + 1, len(candidates))
-                if not self._quota_skipped(candidates[j][0])
-                and self._worth_trying(request, candidates[j], refused_at)
-            ),
-            None,
-        )
+        for j in range(index + 1, len(candidates)):
+            cand_name, cand_client = candidates[j]
+            effective = request.model if cand_client is None else cand_client
+            if not self._quota_skipped(cand_name, effective) and self._worth_trying(
+                request, candidates[j], refused_at
+            ):
+                return j
+        return None
 
     @staticmethod
     def _credit_gate_exhausted() -> bool:  # DALTON-HOOK(budget-gate)
@@ -682,12 +818,151 @@ class ModelResilienceMiddleware(AgentMiddleware):
         except Exception:
             return None
 
-    def _quota_skipped(self, name: str) -> bool:  # DALTON-HOOK(quota-exhaustion)
-        """Whether ``name`` is still benched as out of quota for this run."""
+    def _local_quota_skipped(self, name: str) -> bool:  # DALTON-HOOK(quota-exhaustion)
+        """Whether ``name`` is still benched locally in this middleware instance."""
         benched = self._quota_exhausted.get(name)
         return benched is not None and time.monotonic() < benched[0]
 
-    def _remember_quota_exhausted(  # DALTON-HOOK(quota-exhaustion)
+    def _apply_remote_quota_state(  # DALTON-HOOK(quota-exhaustion)
+        self, name: str, data: Any
+    ) -> bool:
+        if not isinstance(data, dict):
+            return False
+        expires_at = data.get("expires_at")
+        if isinstance(expires_at, (int, float)):
+            remaining = float(expires_at) - time.time()
+        else:
+            remaining = float(DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS)
+        if remaining <= 0:
+            return False
+        status_code = data.get("status_code")
+        msg = str(data.get("message") or f"Quota exhausted for {name}")
+        refusal = _RemoteQuotaExhaustedError(
+            msg, status_code if isinstance(status_code, int) else None
+        )
+        self._quota_exhausted[name] = (time.monotonic() + remaining, refusal)
+        return True
+
+    @staticmethod
+    def _build_quota_redis_payload(  # DALTON-HOOK(quota-exhaustion)
+        name: str, horizon: float, exc: Exception
+    ) -> tuple[int, dict[str, Any]]:
+        ttl_s = (
+            max(1, math.ceil(horizon))
+            if math.isfinite(horizon) and horizon > 0
+            else DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS
+        )
+        payload = {
+            "expires_at": time.time() + ttl_s,
+            "message": str(exc)[:_ERROR_SUMMARY_MAX_CHARS],
+            "status_code": extract_status_code(exc),
+            "model": name,
+        }
+        return ttl_s, payload
+
+    @staticmethod
+    def _run_sync_cache_call(coro_fn: Callable[[], Awaitable[Any]]) -> Any:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro_fn())
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(lambda: asyncio.run(coro_fn())).result(timeout=2.0)
+
+    def _sync_redis_get(self, redis_key: str) -> Any:  # DALTON-HOOK(quota-exhaustion)
+        import json
+        import redis as sync_redis
+        import redis.asyncio as async_redis
+        from src.utils.cache.redis_cache import get_cache_client
+
+        cache = get_cache_client()
+        if isinstance(getattr(cache, "client", None), async_redis.Redis):
+            if not getattr(cache, "enabled", True):
+                return None
+            with sync_redis.Redis.from_url(
+                cache.url,
+                socket_timeout=getattr(cache, "socket_timeout", 2),
+                socket_connect_timeout=getattr(cache, "socket_connect_timeout", 2),
+                decode_responses=False,
+            ) as client:
+                raw = client.get(redis_key)
+                return json.loads(raw) if raw is not None else None
+        return self._run_sync_cache_call(lambda: cache.get(redis_key))
+
+    def _sync_redis_set(  # DALTON-HOOK(quota-exhaustion)
+        self, redis_key: str, payload: dict[str, Any], ttl_s: int
+    ) -> None:
+        import json
+        import redis as sync_redis
+        import redis.asyncio as async_redis
+        from src.utils.cache.redis_cache import get_cache_client
+
+        cache = get_cache_client()
+        if isinstance(getattr(cache, "client", None), async_redis.Redis):
+            if not getattr(cache, "enabled", True):
+                return
+            with sync_redis.Redis.from_url(
+                cache.url,
+                socket_timeout=getattr(cache, "socket_timeout", 2),
+                socket_connect_timeout=getattr(cache, "socket_connect_timeout", 2),
+                decode_responses=False,
+            ) as client:
+                client.setex(redis_key, ttl_s, json.dumps(payload, ensure_ascii=False))
+            return
+        self._run_sync_cache_call(lambda: cache.set(redis_key, payload, ttl=ttl_s))
+
+    def _quota_skipped(  # DALTON-HOOK(quota-exhaustion)
+        self, name: str, client: Any = None
+    ) -> bool:
+        """Whether ``name`` is benched locally or in Redis advisory quota state."""
+        if self._local_quota_skipped(name):
+            return True
+        redis_key = self._quota_redis_key(name, client)
+        if redis_key is None:
+            return False
+        try:
+            data = self._sync_redis_get(redis_key)
+        except Exception as err:
+            logger.debug(
+                "[ModelResilience] Redis sync quota read unavailable, using local state",
+                key=redis_key,
+                error=str(err),
+            )
+            return False
+        return self._apply_remote_quota_state(name, data)
+
+    def _quota_redis_key(  # DALTON-HOOK(quota-exhaustion)
+        self, name: str, client: Any = None
+    ) -> str | None:
+        """Coordination key scoped by credential owner, provider, model, and subscription account."""
+        target = self._current_client(self.primary_client if client is None else client)
+        return quota_redis_key(name, target, user_id=self.user_id)
+
+    async def _aquota_skipped(  # DALTON-HOOK(quota-exhaustion)
+        self, name: str, client: Any = None
+    ) -> bool:
+        """Check both local memory and Redis advisory quota state (fails open to local)."""
+        if self._local_quota_skipped(name):
+            return True
+        redis_key = self._quota_redis_key(name, client)
+        if redis_key is None:
+            return False
+        try:
+            from src.utils.cache.redis_cache import get_cache_client
+
+            data = await get_cache_client().get(redis_key)
+        except Exception as err:
+            logger.debug(
+                "[ModelResilience] Redis quota read unavailable, using local state",
+                key=redis_key,
+                error=str(err),
+            )
+            return False
+        return self._apply_remote_quota_state(name, data)
+
+    def _remember_quota_exhausted_local(  # DALTON-HOOK(quota-exhaustion)
         self, name: str, horizon: float, exc: Exception
     ) -> None:
         """Benches ``name`` until its horizon passes. A fresh refusal writes
@@ -698,6 +973,60 @@ class ModelResilienceMiddleware(AgentMiddleware):
         if benched is not None and time.monotonic() < benched[0]:
             return
         self._quota_exhausted[name] = (time.monotonic() + horizon, exc)
+
+    def _remember_quota_exhausted(  # DALTON-HOOK(quota-exhaustion)
+        self, name: str, horizon: float, exc: Exception, client: Any = None
+    ) -> None:
+        """Record exhaustion locally and coordinate across workers via Redis (sync)."""
+        self._remember_quota_exhausted_local(name, horizon, exc)
+        redis_key = self._quota_redis_key(name, client)
+        if redis_key is None:
+            return
+        ttl_s, payload = self._build_quota_redis_payload(name, horizon, exc)
+        try:
+            self._sync_redis_set(redis_key, payload, ttl_s)
+        except Exception as err:
+            logger.debug(
+                "[ModelResilience] Redis sync quota write unavailable, keeping local state only",
+                key=redis_key,
+                error=str(err),
+            )
+
+    async def _aremember_quota_exhausted(  # DALTON-HOOK(quota-exhaustion)
+        self, name: str, horizon: float, exc: Exception, client: Any = None
+    ) -> None:
+        """Record exhaustion locally and coordinate across workers via Redis."""
+        self._remember_quota_exhausted_local(name, horizon, exc)
+        redis_key = self._quota_redis_key(name, client)
+        if redis_key is None:
+            return
+        ttl_s, payload = self._build_quota_redis_payload(name, horizon, exc)
+        try:
+            from src.utils.cache.redis_cache import get_cache_client
+
+            await get_cache_client().set(redis_key, payload, ttl=ttl_s)
+        except Exception as err:
+            logger.debug(
+                "[ModelResilience] Redis quota write unavailable, keeping local state only",
+                key=redis_key,
+                error=str(err),
+            )
+
+    async def _anext_tried(  # DALTON-HOOK(quota-exhaustion)
+        self,
+        request: ModelRequest,
+        candidates: list[tuple[str, Any | None]],
+        index: int,
+        refused_at: float | None,
+    ) -> int | None:
+        for j in range(index + 1, len(candidates)):
+            cand_name, cand_client = candidates[j]
+            effective = request.model if cand_client is None else cand_client
+            if not await self._aquota_skipped(cand_name, effective) and self._worth_trying(
+                request, candidates[j], refused_at
+            ):
+                return j
+        return None
 
     def _lane(self) -> str:  # DALTON-HOOK(quota-exhaustion)
         """Which lane this call runs on: the main graph, or the subagent
@@ -974,7 +1303,8 @@ class ModelResilienceMiddleware(AgentMiddleware):
             # it answers identically until the account is topped up. A call
             # that therefore starts on a fallback announces the switch once,
             # exactly as a failure-driven switch does.
-            if self._quota_skipped(name):
+            cand_client = request.model if client is None else client
+            if self._quota_skipped(name, cand_client):
                 continue
             if not tried_any:
                 tried_any = True
@@ -1009,7 +1339,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
                     if recovery is None:
                         records.append(_AttemptRecord(name, exc, status, attempts))
                         if benched:
-                            self._remember_quota_exhausted(name, horizon, exc)
+                            self._remember_quota_exhausted(name, horizon, exc, req.model)
                         if self._hands_up(exc):
                             overflow = exc
                             refused_at = max(refused_at or 0, _window(req.model) or math.inf)
@@ -1056,12 +1386,13 @@ class ModelResilienceMiddleware(AgentMiddleware):
 
         tried_any = False
         for index, (name, client) in enumerate(candidates):
-            # DALTON-HOOK(quota-exhaustion): a candidate this run already
-            # judged out of quota is not re-asked — the refusal that benched
-            # it answers identically until the account is topped up. A call
-            # that therefore starts on a fallback announces the switch once,
-            # exactly as a failure-driven switch does.
-            if self._quota_skipped(name):
+            # DALTON-HOOK(quota-exhaustion): a candidate this run (or another worker
+            # sharing the credential in Redis) already judged out of quota is not
+            # re-asked — the refusal that benched it answers identically until the
+            # account is topped up. A call that therefore starts on a fallback
+            # announces the switch once, exactly as a failure-driven switch does.
+            cand_client = request.model if client is None else client
+            if await self._aquota_skipped(name, cand_client):
                 continue
             if not tried_any:
                 tried_any = True
@@ -1114,7 +1445,9 @@ class ModelResilienceMiddleware(AgentMiddleware):
                     if recovery is None:
                         records.append(_AttemptRecord(name, exc, status, attempts))
                         if benched:
-                            self._remember_quota_exhausted(name, horizon, exc)
+                            await self._aremember_quota_exhausted(
+                                name, horizon, exc, req.model
+                            )
                         if self._hands_up(exc):
                             overflow = exc
                             refused_at = max(refused_at or 0, _window(req.model) or math.inf)
@@ -1129,7 +1462,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
             # DALTON-HOOK(budget-gate): do not initiate fallback when the budget lease is exhausted
             if self._credit_gate_exhausted():
                 break
-            following = self._next_tried(request, candidates, index, refused_at)
+            following = await self._anext_tried(request, candidates, index, refused_at)
             if following is not None:
                 to_model, to_client = candidates[following]
                 self._emit_fallback_once(

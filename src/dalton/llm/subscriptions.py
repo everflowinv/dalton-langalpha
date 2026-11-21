@@ -79,7 +79,10 @@ async def _muse_valid_token(user_id: str) -> Optional[TokenSet]:
         access_token=data["access_token"],
         refresh_token="",
         expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        account_id=str(data.get("account_id") or ""),
+        email=data.get("email"),
         plan_type=data.get("plan_type"),
+        updated_at=data.get("updated_at"),
     )
 
 

@@ -13,7 +13,7 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Set as AbstractSet
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -24,7 +24,12 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
 from src.dalton.access_tiers import is_internal_or_admin
-from src.dalton.data_jobs.notification_payloads import markdown_to_card_elements
+from src.dalton.data_jobs.notification_payloads import (
+    extract_feishu_cards_body_fingerprint,
+    is_feishu_card_within_envelope,
+    markdown_to_card_chunks,
+    markdown_to_card_elements,
+)
 from src.dalton.database.automation_reports import automation_report_content_sha256
 from src.dalton.database.market_digest import authorize_market_digest_execution
 from src.dalton.settings import (
@@ -130,6 +135,8 @@ class _Report:
     code: str | None
     failure: bool
     malformed: bool
+    legacy_oversized_single: bool = False
+    body_fingerprint: str | None = None
 
 
 def _token(value: object) -> str | None:
@@ -555,6 +562,14 @@ def _parse_status(raw: object) -> _Report:
         profile = None
     failure_text = payload.get("failure_text")
     failure = kind == "failure_text" or (isinstance(failure_text, str) and bool(failure_text.strip()))
+    legacy_oversized_single = False
+    body_fingerprint: str | None = None
+    payload_obj = payload.get("payload")
+    if isinstance(payload_obj, Mapping):
+        raw_cards = payload_obj.get("cards")
+        if isinstance(raw_cards, list) and raw_cards and all(isinstance(c, Mapping) for c in raw_cards):
+            legacy_oversized_single = len(raw_cards) == 1 and not is_feishu_card_within_envelope(raw_cards[0])
+            body_fingerprint = extract_feishu_cards_body_fingerprint(raw_cards)
     return _Report(
         ok=True,
         found=found,
@@ -567,19 +582,62 @@ def _parse_status(raw: object) -> _Report:
         code=None,
         failure=failure,
         malformed=False,
+        legacy_oversized_single=legacy_oversized_single,
+        body_fingerprint=body_fingerprint,
     )
 
 
-def _matches(report: _Report, saved: _Saved, expected_hash: str, profile: str) -> bool:
+def _legacy_single_card_info(saved: _Saved, profile: str) -> tuple[str | None, str | None]:
+    try:
+        legacy_card = markdown_to_card_elements(
+            markdown=saved.markdown,
+            title=_CARD_TITLE[saved.period].format(date=saved.date),
+        )
+    except Exception:
+        return None, None
+    legacy_fp = extract_feishu_cards_body_fingerprint([legacy_card])
+    if is_feishu_card_within_envelope(legacy_card):
+        return None, legacy_fp
+    try:
+        legacy_hash = automation_report_content_sha256(
+            profile=profile,
+            content_kind="cards",
+            cards=[legacy_card],
+            failure_text=None,
+        )
+    except (TypeError, ValueError):
+        legacy_hash = None
+    return legacy_hash, legacy_fp
+
+
+def _matches(
+    report: _Report,
+    saved: _Saved,
+    expected_hash: str,
+    profile: str,
+    *,
+    expected_body_fingerprints: AbstractSet[str] = frozenset(),
+    legacy_hash: str | None = None,
+) -> bool:
     if report.failure or report.content_kind != "cards":
-        return False
-    if report.content_sha256 != expected_hash:
         return False
     if report.report_run_id != saved.report_run_id:
         return False
     if report.profile not in (None, profile):
         return False
-    return True
+    if report.content_sha256 == expected_hash:
+        return True
+    if _confirmed(report):
+        return False
+    if (
+        report.legacy_oversized_single
+        and report.body_fingerprint
+        and report.body_fingerprint in expected_body_fingerprints
+    ):
+        return True
+    if legacy_hash is not None and report.content_sha256 == legacy_hash:
+        return True
+    return False
 
 
 def _confirmed(report: _Report) -> bool:
@@ -639,7 +697,7 @@ async def _sync_report(
     saved: _Saved,
     profile: str,
     expected_hash: str,
-    card: dict[str, Any],
+    cards: list[dict[str, Any]],
 ) -> tuple[bool, _Report | None, str | None]:
     """Return ``(may_finalize, report, json_to_return)``."""
     try:
@@ -679,9 +737,20 @@ async def _sync_report(
             ok=False,
             code=current.code or "report_unavailable",
         )
+    legacy_hash, legacy_fp = _legacy_single_card_info(saved, profile)
+    expected_body_fingerprints = {extract_feishu_cards_body_fingerprint(cards)}
+    if legacy_fp:
+        expected_body_fingerprints.add(legacy_fp)
     should_submit = False
     if current.found is True:
-        if not _matches(current, saved, expected_hash, profile):
+        if not _matches(
+            current,
+            saved,
+            expected_hash,
+            profile,
+            expected_body_fingerprints=expected_body_fingerprints,
+            legacy_hash=legacy_hash,
+        ):
             return False, current, _progress(
                 action,
                 stage="report_conflict",
@@ -744,7 +813,7 @@ async def _sync_report(
         action="submit",
         report_run_id=saved.report_run_id,
         material="yes",
-        cards=[card],
+        cards=cards,
         config=config,
     )
     accepted = _parse_status(submitted) if isinstance(submitted, str) else _parse_status(None)
@@ -1210,7 +1279,7 @@ def create_market_digest_output_tools() -> list[BaseTool]:
         if isinstance(loaded, str):
             return loaded
         try:
-            card = markdown_to_card_elements(
+            cards = markdown_to_card_chunks(
                 markdown=loaded.markdown,
                 title=_CARD_TITLE[selected].format(date=loaded.date),
             )
@@ -1228,7 +1297,7 @@ def create_market_digest_output_tools() -> list[BaseTool]:
                 profile=profile,
                 saved=loaded,
             )
-        if not isinstance(card, dict):
+        if not isinstance(cards, list) or not cards or not all(isinstance(c, dict) for c in cards):
             return _dump(
                 action=chosen,
                 ok=False,
@@ -1243,7 +1312,7 @@ def create_market_digest_output_tools() -> list[BaseTool]:
             expected_hash = automation_report_content_sha256(
                 profile=profile,
                 content_kind="cards",
-                cards=[card],
+                cards=cards,
                 failure_text=None,
             )
         except (TypeError, ValueError):
@@ -1263,7 +1332,7 @@ def create_market_digest_output_tools() -> list[BaseTool]:
             loaded,
             profile,
             expected_hash,
-            card,
+            cards,
         )
         if stop is not None or report is None or not may_finalize:
             return stop or _progress(

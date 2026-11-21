@@ -163,6 +163,30 @@ async def dispatch_background_subagent(
     # build that raises must leave no run without a writer.
     subagent_graph = subagent_graphs[subagent_type]
 
+    # DALTON-HOOK(quota-exhaustion): refuse before registering/spawning when an
+    # OAuth subscription model has an active Redis quota cooldown.
+    raw_user = (base_configurable or {}).get("user_id")
+    user_id = str(raw_user).strip() or None if raw_user is not None else None
+    model_client_for = getattr(mw, "model_client_for", None)
+    target_client = (
+        model_client_for(subagent_type) if callable(model_client_for) else None
+    ) or getattr(subagent_graph, "default_model", None)
+    check_quota = getattr(mw, "check_dispatch_quota", None)
+    if callable(check_quota):
+        quota_msg = await check_quota(
+            subagent_type, user_id=user_id, client=target_client
+        )
+    elif target_client is not None:
+        from ptc_agent.agent.middleware.model_resilience import (
+            check_oauth_quota_cooldown,
+        )
+
+        quota_msg = await check_oauth_quota_cooldown(target_client, user_id=user_id)
+    else:
+        quota_msg = None
+    if quota_msg:
+        raise SpawnError(quota_msg)
+
     tool_call_id = tool_call_id or f"dispatch-{uuid.uuid4().hex[:12]}"
     task = await mw.registry.register(
         tool_call_id=tool_call_id,

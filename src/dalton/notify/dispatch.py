@@ -47,6 +47,153 @@ logger = logging.getLogger(__name__)
 MAX_CARD_SECTION_CHARS = 320
 MAX_CARD_TOTAL_BODY_CHARS = 3000
 
+CARD_LIMIT_EXCEEDED_ERROR_CODE = "card_limit_exceeded"
+NON_RETRYABLE_TERMINAL_ERROR_CODES = frozenset(
+    {"attempts_exhausted", CARD_LIMIT_EXCEEDED_ERROR_CODE}
+)
+_CARD_LIMIT_MESSAGE_RE = re.compile(
+    r"(?:byte\s+card\s+limit|element\s+card\s+limit|exceeds\s+\d+\s+(?:byte|element)\s+card\s+limit|card\s+too\s+large)",
+    re.IGNORECASE,
+)
+
+
+def is_card_limit_not_allowed(
+    error_code: str | None,
+    error_message: str | None = None,
+) -> bool:
+    """True when gateway rejected a card as exceeding Feishu size/element envelope."""
+    code = str(error_code or "").strip().lower()
+    if code == CARD_LIMIT_EXCEEDED_ERROR_CODE:
+        return True
+    if code == "not_allowed" and _CARD_LIMIT_MESSAGE_RE.search(str(error_message or "")):
+        return True
+    return False
+
+
+async def sync_terminal_undelivered_execution(
+    execution_id: str,
+    *,
+    max_attempts: int = 3,
+    conn: Any = None,
+    rows: Sequence[Mapping[str, Any]] | None = None,
+    fallback_entry: tuple[str, str, str] | None = None,
+) -> bool:
+    """Record generated-but-undelivered status on ``automation_executions``.
+
+    Uses existing ``delivery_result`` and ``result_excerpt`` columns without schema changes.
+    Only updates when ``execution_id`` is a UUID and delivery has terminally failed
+    with zero sent targets and no remaining retryable attempts.
+    """
+    exec_id = str(execution_id or "").strip()
+    if not _notify_id_is_uuid(exec_id):
+        return False
+
+    from src.server.database import automation_executions as exec_db
+
+    try:
+        loaded_rows: list[Mapping[str, Any]]
+        if rows is not None:
+            loaded_rows = [r for r in rows if isinstance(r, Mapping)]
+        else:
+            async with get_db_connection(conn) as owned:
+                async with owned.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        """
+                        SELECT channel, target, status, error_code, attempt_count, payload_json
+                        FROM dalton_notify_deliveries
+                        WHERE lower(execution_id) = lower(%s)
+                          AND COALESCE(payload_json ->> 'source', '') <> 'automation_report_failure_alert'
+                        ORDER BY created_at ASC, delivery_id ASC
+                        """,
+                        (exec_id,),
+                    )
+                    loaded_rows = list(await cur.fetchall() or [])
+
+        delivery_rows = [
+            r
+            for r in loaded_rows
+            if not (
+                isinstance(r.get("payload_json"), Mapping)
+                and str(r["payload_json"].get("source") or "") == "automation_report_failure_alert"
+            )
+        ]
+
+        failed_entries: list[dict[str, Any]] = []
+        bounded = max(1, int(max_attempts))
+        for r in delivery_rows:
+            st = str(r.get("status") or "").strip().lower()
+            code = str(r.get("error_code") or "").strip()
+            code_l = code.lower()
+            try:
+                att = int(r.get("attempt_count") or 0)
+            except (TypeError, ValueError):
+                att = 0
+            if st == "sent":
+                return False
+            if st == "skipped":
+                continue
+            if st == "pending":
+                return False
+            if st == "failed":
+                if code_l in UNCERTAIN_NOTIFY_ERROR_CODES:
+                    return False
+                if code_l not in NON_RETRYABLE_TERMINAL_ERROR_CODES and att < bounded:
+                    return False
+                ch = str(r.get("channel") or "").strip().lower() or "feishu"
+                tgt = str(r.get("target") or "").strip()
+                reason = code or "delivery_failed"
+                entry: dict[str, Any] = {
+                    "method": ch,
+                    "success": False,
+                    "error": f"已生成但未送达（{reason}）",
+                }
+                if tgt:
+                    entry["address"] = tgt
+                failed_entries.append(entry)
+
+        if not failed_entries and fallback_entry is not None:
+            ch, tgt, reason = fallback_entry
+            entry = {
+                "method": (ch or "feishu").strip().lower(),
+                "success": False,
+                "error": f"已生成但未送达（{reason or 'delivery_failed'}）",
+            }
+            if tgt:
+                entry["address"] = tgt
+            failed_entries.append(entry)
+
+        if not failed_entries:
+            return False
+
+        await exec_db.record_delivery(exec_id, failed_entries, conn=conn)
+        first_err = str(failed_entries[0].get("error") or "已生成但未送达")
+        excerpt_note = f"投递状态：{first_err}"
+        async with get_db_connection(conn) as owned:
+            async with owned.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE automation_executions
+                    SET result_excerpt = CASE
+                        WHEN COALESCE(result_excerpt, '') LIKE '%%已生成但未送达%%' THEN result_excerpt
+                        WHEN COALESCE(btrim(result_excerpt), '') = '' THEN %s
+                        ELSE result_excerpt || E'\n\n' || %s
+                    END
+                    WHERE automation_execution_id = %s::uuid
+                    """,
+                    (excerpt_note, excerpt_note, exec_id),
+                )
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "[DALTON_NOTIFY] Failed to record terminal undelivered status on execution_id=%s (%s)",
+            exec_id,
+            type(exc).__name__,
+            exc_info=True,
+        )
+        return False
+
 _EARN_AUTO_RE = re.compile(
     r"^dalton-(?P<ticker>[a-z0-9.]+)-earn-(?P<period>[a-z0-9._-]+)-(?P<stage>t0|tp1|tm3)$",
     re.IGNORECASE,
@@ -1339,7 +1486,10 @@ async def claim_target_delivery_with_attempt(
                         dalton_notify_deliveries.status = 'pending'
                         AND dalton_notify_deliveries.attempt_count = 0
                     )
-                    OR dalton_notify_deliveries.status = 'failed'
+                    OR (
+                        dalton_notify_deliveries.status = 'failed'
+                        AND COALESCE(dalton_notify_deliveries.error_code, '') <> ALL(%s)
+                    )
                     OR (
                         dalton_notify_deliveries.status = 'pending'
                         AND (
@@ -1365,6 +1515,7 @@ async def claim_target_delivery_with_attempt(
                     ch,
                     tgt,
                     Json(dict(payload or {})),
+                    sorted(NON_RETRYABLE_TERMINAL_ERROR_CODES),
                     sorted(UNCERTAIN_NOTIFY_ERROR_CODES),
                     stale_pending_minutes,
                 ),
@@ -2672,6 +2823,8 @@ def _extract_retry_target_error_code(
     use_gateway_transport: bool = False,
 ) -> str:
     """Extract the target-specific error code from ``bridge_res`` when available, falling back to ``batch_err``."""
+    err = ""
+    err_msg = ""
     if isinstance(bridge_res, Mapping):
         results = bridge_res.get("results")
         if isinstance(results, list):
@@ -2683,15 +2836,25 @@ def _extract_retry_target_error_code(
                     err = str(
                         item.get("error") or item.get("error_code") or ""
                     ).strip()
+                    err_msg = str(
+                        item.get("error_message") or item.get("message") or ""
+                    ).strip()
                     if err:
-                        return err
-        if use_gateway_transport:
-            top_err = str(
+                        break
+        if not err and use_gateway_transport:
+            err = str(
                 bridge_res.get("error_code") or bridge_res.get("error") or ""
             ).strip()
-            if top_err:
-                return top_err
-    return batch_err or "target_failed"
+            err_msg = str(
+                bridge_res.get("error_message") or bridge_res.get("message") or ""
+            ).strip()
+        if not err_msg:
+            err_msg = str(
+                bridge_res.get("error_message") or bridge_res.get("message") or ""
+            ).strip()
+    if is_card_limit_not_allowed(err or batch_err, err_msg):
+        return CARD_LIMIT_EXCEEDED_ERROR_CODE
+    return err or batch_err or "target_failed"
 
 
 async def _release_unstarted_retry_claim(
@@ -2791,7 +2954,7 @@ async def _catch_up_terminal_report_failure_alerts(
                   AND d.status = 'failed'
                   AND (
                       d.attempt_count >= %s
-                      OR COALESCE(d.error_code, '') = 'attempts_exhausted'
+                      OR COALESCE(d.error_code, '') IN ('attempts_exhausted', 'card_limit_exceeded')
                   )
                   AND COALESCE(d.error_code, '') <> ''
                   AND COALESCE(d.error_code, '') NOT IN (
@@ -2872,6 +3035,10 @@ async def _catch_up_terminal_report_failure_alerts(
         seen.add(exec_id)
         try:
             await ensure_report_failure_alert(
+                exec_id,
+                max_attempts=max_attempts,
+            )
+            await sync_terminal_undelivered_execution(
                 exec_id,
                 max_attempts=max_attempts,
             )
@@ -3027,7 +3194,11 @@ async def retry_failed_notify_deliveries(
                           ELSE NULL
                       END
                     WHERE (
-                        (d.status = 'failed' AND d.attempt_count < %s)
+                        (
+                            d.status = 'failed'
+                            AND d.attempt_count < %s
+                            AND COALESCE(d.error_code, '') NOT IN ('attempts_exhausted', 'card_limit_exceeded')
+                        )
                         OR (
                             d.status = 'pending'
                             AND d.attempt_count = 0
@@ -3111,6 +3282,11 @@ async def retry_failed_notify_deliveries(
                 else {}
             )
             if not (exec_id and ch and tgt):
+                continue
+            if (
+                raw_row_status == "failed"
+                and row_error_code.lower() in NON_RETRYABLE_TERMINAL_ERROR_CODES
+            ):
                 continue
 
             automation_info = _reconstruct_automation_from_delivery_row(
@@ -3708,6 +3884,18 @@ async def retry_failed_notify_deliveries(
                         expected_status="pending",
                         expected_attempt_count=claimed_attempt_count,
                     )
+                    if (
+                        fail_error_code.lower() in NON_RETRYABLE_TERMINAL_ERROR_CODES
+                        or (
+                            claimed_attempt_count is not None
+                            and claimed_attempt_count >= max_attempts
+                        )
+                    ):
+                        await sync_terminal_undelivered_execution(
+                            exec_id,
+                            max_attempts=max_attempts,
+                            fallback_entry=(ch, tgt, fail_error_code),
+                        )
                 row_claimed = False
             except asyncio.CancelledError:
                 if row_claimed:
@@ -3915,6 +4103,27 @@ def _unresolved_saved_item_code(auth: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _extract_native_target_error_message(
+    target: str,
+    transport_res: Mapping[str, Any],
+) -> str:
+    results = transport_res.get("results")
+    if isinstance(results, list):
+        for item in results:
+            if (
+                isinstance(item, Mapping)
+                and str(item.get("target") or "").strip() == str(target or "").strip()
+            ):
+                msg = str(
+                    item.get("error_message") or item.get("message") or ""
+                ).strip()
+                if msg:
+                    return msg
+    return str(
+        transport_res.get("error_message") or transport_res.get("message") or ""
+    ).strip()
+
+
 def _classify_native_target_result(
     target: str,
     transport_res: Any,
@@ -3955,6 +4164,9 @@ def _classify_native_target_result(
         code = str(
             matched.get("error_code") or matched.get("error") or item_status or "target_failed"
         ).strip() or "target_failed"
+        err_msg = _extract_native_target_error_message(target, transport_res)
+        if is_card_limit_not_allowed(code, err_msg):
+            return "failed", CARD_LIMIT_EXCEEDED_ERROR_CODE
         return "failed", code
     if matched is not None:
         code = str(
@@ -3964,6 +4176,9 @@ def _classify_native_target_result(
         code = str(
             transport_res.get("error_code") or transport_res.get("error") or "target_failed"
         ).strip() or "target_failed"
+    err_msg = _extract_native_target_error_message(target, transport_res)
+    if is_card_limit_not_allowed(code, err_msg):
+        return "failed", CARD_LIMIT_EXCEEDED_ERROR_CODE
     return "failed", code
 
 
@@ -4212,7 +4427,7 @@ async def _dispatch_one_saved_report_target(
         return False
     if (
         is_uncertain_notify_error_code(error_code)
-        or error_code == "attempts_exhausted"
+        or error_code in NON_RETRYABLE_TERMINAL_ERROR_CODES
         or attempt >= max_attempts
     ):
         return False
@@ -4548,6 +4763,11 @@ async def dispatch_automation_report(
                 conn=conn,
                 reconcile_row_fn=reconcile_row_fn,
             )
+            await sync_terminal_undelivered_execution(
+                exec_id,
+                max_attempts=bounded_attempts,
+                conn=conn,
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -4556,6 +4776,19 @@ async def dispatch_automation_report(
                 exec_id,
                 exc_info=True,
             )
+    elif create_failure_alert and load_rows_fn is not None and _notify_id_is_uuid(exec_id):
+        try:
+            latest_rows = await _load_saved_report_rows(loader, exec_id, conn)
+            await sync_terminal_undelivered_execution(
+                exec_id,
+                max_attempts=bounded_attempts,
+                conn=conn,
+                rows=latest_rows,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
     try:
         return await _saved_view()
     except asyncio.CancelledError:
@@ -4695,6 +4928,8 @@ async def on_automation_settled(
             confirmed = bool(await reader(execution_id))
             try:
                 await ensure_report_failure_alert(execution_id)
+                if not confirmed:
+                    await sync_terminal_undelivered_execution(execution_id)
             except asyncio.CancelledError:
                 raise
             except Exception:

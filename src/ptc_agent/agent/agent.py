@@ -915,6 +915,13 @@ class PTCAgent:
                 claude_code=claude_code_cli,
             ),
             task_models=self.config.task_models,
+            # DALTON-HOOK(quota-exhaustion): allow pre-dispatch Redis quota lookup
+            default_model_client=turn.client,
+            subagent_clients={
+                spec["name"]: spec["model"]
+                for spec in subagents
+                if "name" in spec and "model" in spec
+            },
         )
         main_only_middleware.append(background_middleware)
         if not disable_subagents:

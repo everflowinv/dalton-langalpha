@@ -2663,3 +2663,319 @@ def test_saved_report_claim_requires_live_parent(monkeypatch, source):
     sql = executed[0]
     assert "FROM automations AS a" in sql and "a.deleted_at IS NULL" in sql
     assert "[0-9a-f]{8}-[0-9a-f]{4}-" in sql
+
+
+@pytest.mark.asyncio
+async def test_card_limit_not_allowed_stops_retrying_and_records_execution_undelivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import contextlib
+    from unittest.mock import create_autospec
+
+    from src.dalton.database import automation_reports as ar_mod
+    from src.dalton.notify import dispatch as dispatch_mod
+    from src.server.database import automation_executions as exec_db
+
+    exec_uuid = "b8042763-1111-4222-8333-444455556666"
+    target = "feishu:user:ou_richard"
+    row_state: dict[str, Any] = {
+        "execution_id": exec_uuid,
+        "automation_id": "auto-digest",
+        "channel": "feishu",
+        "target": target,
+        "status": "pending",
+        "error_code": None,
+        "attempt_count": 0,
+        "payload_json": {
+            "source": "automation_report",
+            "content_kind": "cards",
+            "cards": [{"schema": "2.0"}],
+            "content_sha256": "0" * 64,
+            "expected_item_count": 1,
+            "failure_target_snapshot": [target],
+        },
+    }
+
+    async def _fake_load_rows(_exec_id: str, **_kwargs: Any):
+        return [dict(row_state)]
+
+    async def _fake_auth(**_kwargs: Any):
+        return {"authorized": True, "items": [{"existing_status": None}]}
+
+    async def _fake_claim(_exec_id: str, _ch: str, _tgt: str, **_kwargs: Any):
+        row_state["attempt_count"] += 1
+        row_state["status"] = "pending"
+        return True, row_state["attempt_count"]
+
+    async def _fake_mark(
+        _exec_id: str,
+        _ch: str,
+        _tgt: str,
+        *,
+        status: str,
+        error_code: str | None = None,
+        **_kwargs: Any,
+    ) -> bool:
+        row_state["status"] = status
+        row_state["error_code"] = error_code
+        return True
+
+    async def _fake_reconcile(*_args: Any, **_kwargs: Any) -> bool:
+        return False
+
+    recorded_deliveries: list[tuple[str, list[dict[str, Any]]]] = []
+    excerpt_updates: list[str] = []
+
+    async def _fake_record_delivery(execution_id: str, delivery_result: list, *, conn=None) -> None:
+        _ = conn
+        recorded_deliveries.append((execution_id, list(delivery_result)))
+
+    monkeypatch.setattr(
+        exec_db,
+        "record_delivery",
+        create_autospec(exec_db.record_delivery, side_effect=_fake_record_delivery),
+    )
+
+    class _ExecCur:
+        async def execute(self, sql, params=None):
+            if "UPDATE automation_executions" in sql and params:
+                excerpt_updates.append(str(params[0]))
+
+        async def fetchall(self):
+            return []
+
+    class _ExecConn:
+        def cursor(self, row_factory=None):
+            _ = row_factory
+
+            @contextlib.asynccontextmanager
+            async def _cm():
+                yield _ExecCur()
+
+            return _cm()
+
+    @contextlib.asynccontextmanager
+    async def _fake_exec_conn(conn=None):
+        _ = conn
+        yield _ExecConn()
+
+    monkeypatch.setattr(dispatch_mod, "get_db_connection", _fake_exec_conn)
+
+    gateway_calls: list[list[str]] = []
+
+    async def _gateway_card_limit_refusal(targets, **_kwargs: Any):
+        gateway_calls.append(list(targets))
+        return {
+            "ok": False,
+            "status": "failed",
+            "uncertain": False,
+            "status_code": 400,
+            "error_code": "not_allowed",
+            "error_message": "Feishu outbound card exceeds 30720 byte card limit (35221 bytes)",
+            "results": [
+                {
+                    "target": target,
+                    "ok": False,
+                    "status": "failed",
+                    "error": "not_allowed",
+                    "error_code": "not_allowed",
+                    "error_message": "Feishu outbound card exceeds 30720 byte card limit (35221 bytes)",
+                }
+            ],
+        }
+
+    # First attempt: gateway rejects with not_allowed card limit -> marked card_limit_exceeded & execution updated
+    res1 = await dispatch_mod.dispatch_automation_report(
+        exec_uuid,
+        load_rows_fn=_fake_load_rows,
+        authorize_fn=_fake_auth,
+        claim_fn=_fake_claim,
+        mark_fn=_fake_mark,
+        reconcile_row_fn=_fake_reconcile,
+        notify_fn=_gateway_card_limit_refusal,
+    )
+    assert len(gateway_calls) == 1
+    assert row_state["status"] == "failed"
+    assert row_state["error_code"] == dispatch_mod.CARD_LIMIT_EXCEEDED_ERROR_CODE
+    assert ar_mod.card_delivery_is_terminal(row_state, max_attempts=3) is True
+    assert res1["delivery_confirmed"] is False
+    assert recorded_deliveries and recorded_deliveries[-1][0] == exec_uuid
+    assert recorded_deliveries[-1][1][0]["success"] is False
+    assert "已生成但未送达" in recorded_deliveries[-1][1][0]["error"]
+    assert excerpt_updates and "已生成但未送达" in excerpt_updates[-1]
+
+    # Second attempt: card_limit_exceeded must NOT be retried even when attempt_count < max_attempts
+    gateway_calls.clear()
+    await dispatch_mod.dispatch_automation_report(
+        exec_uuid,
+        load_rows_fn=_fake_load_rows,
+        authorize_fn=_fake_auth,
+        claim_fn=_fake_claim,
+        mark_fn=_fake_mark,
+        reconcile_row_fn=_fake_reconcile,
+        notify_fn=_gateway_card_limit_refusal,
+    )
+    assert gateway_calls == []
+    assert row_state["attempt_count"] == 1
+
+    # retry_failed_notify_deliveries SQL query must also exclude card_limit_exceeded rows
+    retry_sql_log: list[tuple[str, Any]] = []
+
+    class _RetryCur:
+        async def execute(self, sql, params=None):
+            retry_sql_log.append((str(sql), params))
+
+        async def fetchall(self):
+            return []
+
+    class _RetryConn:
+        def cursor(self, row_factory=None):
+            _ = row_factory
+
+            @contextlib.asynccontextmanager
+            async def _cm():
+                yield _RetryCur()
+
+            return _cm()
+
+    @contextlib.asynccontextmanager
+    async def _fake_retry_conn(conn=None):
+        _ = conn
+        yield _RetryConn()
+
+    monkeypatch.setattr(dispatch_mod, "get_db_connection", _fake_retry_conn)
+    from src.dalton.database.data_task_notifications import (
+        reconcile_uncertain_data_task_deliveries,
+    )
+
+    reconciler_stub = create_autospec(
+        reconcile_uncertain_data_task_deliveries,
+        return_value=0,
+    )
+    await dispatch_mod.retry_failed_notify_deliveries(
+        reconcile_data_tasks_fn=reconciler_stub,
+    )
+    main_scan_calls = [
+        (sql, params) for sql, params in retry_sql_log if "FROM dalton_notify_deliveries d" in sql
+    ]
+    assert main_scan_calls
+    scan_sql, _scan_params = main_scan_calls[0]
+    assert "COALESCE(d.error_code, '') NOT IN ('attempts_exhausted', 'card_limit_exceeded')" in scan_sql
+
+
+@pytest.mark.asyncio
+async def test_sync_terminal_undelivered_execution_queries_valid_d014_columns_and_logs_warning_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Real SQL path (rows=None) references only d014 columns and logs exception type on SQL error."""
+    import contextlib
+    import logging
+    import re
+    from pathlib import Path
+    from unittest.mock import create_autospec
+
+    import psycopg
+    from src.dalton.notify import dispatch as dispatch_mod
+    from src.server.database import automation_executions as exec_db
+
+    # Parse column names directly from d014_notify_deliveries.py CREATE TABLE
+    d014_path = (
+        Path(__file__).resolve().parents[3]
+        / "src/dalton/migrations/versions/d014_notify_deliveries.py"
+    )
+    d014_sql = d014_path.read_text(encoding="utf-8")
+    table_match = re.search(
+        r"CREATE TABLE IF NOT EXISTS dalton_notify_deliveries\s*\((.*?)\n\s*\)",
+        d014_sql,
+        re.DOTALL,
+    )
+    assert table_match is not None
+    d014_columns: set[str] = set()
+    for raw_line in table_match.group(1).splitlines():
+        line = raw_line.strip()
+        if not line or line.upper().startswith(("CHECK", "UNIQUE", "PRIMARY", "CONSTRAINT")):
+            continue
+        col = line.split()[0].strip(",")
+        if col.isidentifier():
+            d014_columns.add(col)
+    assert {"delivery_id", "execution_id", "created_at", "status", "error_code", "payload_json"} <= d014_columns
+    assert "id" not in d014_columns
+
+    exec_uuid = "b8042763-1111-4222-8333-444455556666"
+    captured_sql: list[tuple[str, Any]] = []
+    recorded_deliveries: list[tuple[str, list[dict[str, Any]]]] = []
+
+    cursor_double = create_autospec(psycopg.AsyncCursor, instance=True)
+
+    async def _fake_execute(sql: Any, params: Any = None) -> None:
+        captured_sql.append((" ".join(str(sql).split()), params))
+
+    cursor_double.execute.side_effect = _fake_execute
+    cursor_double.fetchall.return_value = [
+        {
+            "channel": "feishu",
+            "target": "feishu:user:ou_richard",
+            "status": "failed",
+            "error_code": "card_limit_exceeded",
+            "attempt_count": 1,
+            "payload_json": {"source": "automation_report"},
+        }
+    ]
+
+    conn_double = create_autospec(psycopg.AsyncConnection, instance=True)
+
+    @contextlib.asynccontextmanager
+    async def _cur_cm(*_a: Any, **_kw: Any):
+        yield cursor_double
+
+    conn_double.cursor.side_effect = _cur_cm
+
+    @contextlib.asynccontextmanager
+    async def _fake_conn(_conn: Any = None):
+        yield conn_double
+
+    monkeypatch.setattr(dispatch_mod, "get_db_connection", _fake_conn)
+
+    async def _fake_record(eid: str, entries: list[dict[str, Any]], *, conn: Any = None) -> None:
+        _ = conn
+        recorded_deliveries.append((eid, entries))
+
+    monkeypatch.setattr(
+        exec_db,
+        "record_delivery",
+        create_autospec(exec_db.record_delivery, side_effect=_fake_record),
+    )
+
+    ok = await dispatch_mod.sync_terminal_undelivered_execution(exec_uuid)
+    assert ok is True
+    assert recorded_deliveries and recorded_deliveries[0][0] == exec_uuid
+    select_sqls = [s for s, _p in captured_sql if "FROM dalton_notify_deliveries" in s]
+    assert len(select_sqls) == 1
+    sel = select_sqls[0]
+    assert "ORDER BY created_at ASC, delivery_id ASC" in sel
+    assert "ORDER BY created_at ASC, id" not in sel
+
+    # Verify every bare column identifier referenced in SELECT/WHERE/ORDER BY exists in d014
+    select_part = re.search(r"SELECT\s+(.*?)\s+FROM\s+dalton_notify_deliveries", sel, re.IGNORECASE)
+    assert select_part is not None
+    for col in [c.strip() for c in select_part.group(1).split(",")]:
+        assert col in d014_columns, f"unknown column in SELECT: {col}"
+    order_part = re.search(r"ORDER BY\s+(.*)$", sel, re.IGNORECASE)
+    assert order_part is not None
+    for term in [t.strip() for t in order_part.group(1).split(",")]:
+        col = term.split()[0]
+        assert col in d014_columns, f"unknown column in ORDER BY: {col}"
+    for where_col in ("execution_id", "payload_json"):
+        assert where_col in d014_columns
+
+    # SQL error must not be swallowed silently: logs warning with exception type and returns False
+    cursor_double.execute.side_effect = RuntimeError("column does not exist")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=dispatch_mod.logger.name):
+        ok_err = await dispatch_mod.sync_terminal_undelivered_execution(exec_uuid)
+    assert ok_err is False
+    assert any(
+        rec.levelno == logging.WARNING and "RuntimeError" in rec.getMessage()
+        for rec in caplog.records
+    )

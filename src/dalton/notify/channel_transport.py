@@ -240,6 +240,15 @@ async def dispatch_data_task_target_via_gateway(
     gw_status = str(parsed.get("status") or "").strip().lower()
     raw_code = str(parsed.get("code") or parsed.get("error_code") or "").strip()
     safe_code = redact_managed_tokens(raw_code)[:96] if raw_code else ""
+    raw_message = str(parsed.get("message") or parsed.get("error") or "").strip()
+    if not raw_message and isinstance(parsed.get("items"), list):
+        for item in parsed["items"]:
+            if isinstance(item, Mapping):
+                item_msg = str(item.get("message") or item.get("error") or "").strip()
+                if item_msg:
+                    raw_message = item_msg
+                    break
+    safe_message = redact_managed_tokens(raw_message)[:256] if raw_message else ""
 
     if resp.status_code == 200 and gw_status == "sent":
         return {
@@ -298,22 +307,26 @@ async def dispatch_data_task_target_via_gateway(
         }
 
     fail_code = safe_code or f"http_{resp.status_code}"
-    return {
+    fail_item: dict[str, Any] = {
+        "target": cleaned_target,
+        "ok": False,
+        "status": "failed",
+        "error": fail_code,
+        "error_code": fail_code,
+    }
+    if safe_message:
+        fail_item["error_message"] = safe_message
+    fail_out: dict[str, Any] = {
         "ok": False,
         "status": "failed",
         "uncertain": False,
         "status_code": resp.status_code,
         "error_code": fail_code,
-        "results": [
-            {
-                "target": cleaned_target,
-                "ok": False,
-                "status": "failed",
-                "error": fail_code,
-                "error_code": fail_code,
-            }
-        ],
+        "results": [fail_item],
     }
+    if safe_message:
+        fail_out["error_message"] = safe_message
+    return fail_out
 
 
 async def post_data_task_gateway_notify(
@@ -341,6 +354,7 @@ async def post_data_task_gateway_notify(
     any_uncertain = False
     last_status_code = 200
     first_error_code: str | None = None
+    first_error_message: str | None = None
 
     for raw_target in targets:
         tgt = str(raw_target or "").strip()
@@ -367,6 +381,8 @@ async def post_data_task_gateway_notify(
             all_ok = False
             if first_error_code is None:
                 first_error_code = str(single.get("error_code") or "target_failed")
+            if first_error_message is None and single.get("error_message"):
+                first_error_message = str(single.get("error_message"))
 
     overall_status = "unknown" if any_uncertain else ("sent" if all_ok else "failed")
     out: dict[str, Any] = {
@@ -379,6 +395,8 @@ async def post_data_task_gateway_notify(
     if first_error_code:
         out["error_code"] = first_error_code
         out["error"] = first_error_code
+    if first_error_message:
+        out["error_message"] = first_error_message
     return out
 
 
@@ -388,6 +406,7 @@ def _automation_transport_failure(
     error_code: str,
     status_code: int,
     uncertain: bool = False,
+    error_message: str = "",
 ) -> dict[str, Any]:
     status = "unknown" if uncertain else "failed"
     item: dict[str, Any] = {
@@ -397,9 +416,11 @@ def _automation_transport_failure(
         "error": error_code,
         "error_code": error_code,
     }
+    if error_message:
+        item["error_message"] = error_message
     if uncertain:
         item["uncertain"] = True
-    return {
+    out: dict[str, Any] = {
         "ok": False,
         "status": status,
         "uncertain": uncertain,
@@ -407,6 +428,9 @@ def _automation_transport_failure(
         "error_code": error_code,
         "results": [item],
     }
+    if error_message:
+        out["error_message"] = error_message
+    return out
 
 
 async def post_automation_gateway_notify(
@@ -521,6 +545,15 @@ async def post_automation_gateway_notify(
     gw_status = str(parsed.get("status") or "").strip().lower()
     raw_code = str(parsed.get("code") or parsed.get("error_code") or "").strip()
     safe_code = redact_managed_tokens(raw_code)[:96] if raw_code else ""
+    raw_message = str(parsed.get("message") or parsed.get("error") or "").strip()
+    if not raw_message and isinstance(parsed.get("items"), list):
+        for item in parsed["items"]:
+            if isinstance(item, Mapping):
+                item_msg = str(item.get("message") or item.get("error") or "").strip()
+                if item_msg:
+                    raw_message = item_msg
+                    break
+    safe_message = redact_managed_tokens(raw_message)[:256] if raw_message else ""
 
     if resp.status_code == 200 and gw_status == "sent":
         return {
@@ -572,4 +605,5 @@ async def post_automation_gateway_notify(
         target=cleaned_target,
         error_code=fail_code,
         status_code=resp.status_code,
+        error_message=safe_message,
     )

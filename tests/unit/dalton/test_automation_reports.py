@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -955,3 +956,654 @@ def test_text_targets_parse_and_select_the_text_route() -> None:
         chat,
     )
     assert fallback_ok is True and fallback_code == ""
+
+
+@pytest.mark.asyncio
+async def test_submit_automation_report_upgrades_failed_oversized_single_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed oversized 35 KB legacy single-card batch upgrades to split cards without content_conflict."""
+    from contextlib import asynccontextmanager
+    from unittest.mock import create_autospec
+    from uuid import uuid4
+    from src.dalton.data_jobs.notification_payloads import (
+        feishu_card_serialized_utf8_bytes,
+        markdown_to_card_chunks,
+        markdown_to_card_elements,
+    )
+
+    body_lines = [
+        "# 📊 市场晚报 — 2026-11-20",
+        "> 2026-11-20 HKT",
+    ]
+    for sec_idx in range(1, 11):
+        body_lines.append(f"## 板块 {sec_idx}：市场核心异动复盘")
+        for line_idx in range(1, 31):
+            body_lines.append(
+                f"- ({sec_idx}.{line_idx}) 美股与中概重点标的表现追踪："
+                "成交额放量、机构资金流向与隐含波动率变化细节补充说明分析。"
+            )
+    big_md = "\n".join(body_lines)
+    old_single = markdown_to_card_elements(big_md, "📊 市场晚报 — 2026-11-20")
+    assert feishu_card_serialized_utf8_bytes(old_single) > 35_000
+    split_cards = markdown_to_card_chunks(big_md, "📊 市场晚报 — 2026-11-20")
+    assert len(split_cards) > 1
+
+    old_sha = reports.automation_report_content_sha256(
+        profile="market-digest-pm",
+        content_kind="cards",
+        cards=[old_single],
+        failure_text=None,
+    )
+    old_did = str(uuid4())
+    user_id = str(uuid4())
+    auto_id = str(uuid4())
+    exec_id = str(uuid4())
+    ws_id = str(uuid4())
+    th_id = str(uuid4())
+    rn_id = str(uuid4())
+    old_payload = {
+        "source": "automation_report",
+        "version": 1,
+        "profile": "market-digest-pm",
+        "report_run_id": "market-digest:PM:2026-11-20",
+        "content_kind": "cards",
+        "content_sha256": old_sha,
+        "first_execution_id": exec_id,
+        "owner_user_id": user_id,
+        "automation_id": auto_id,
+        "target_snapshot": ["feishu:chat:oc_pmboard1234"],
+        "expected_item_count": 1,
+        "cards": [old_single],
+    }
+
+    stored_rows: list[dict[str, Any]] = [
+        {
+            "delivery_id": old_did,
+            "execution_id": exec_id,
+            "automation_id": auto_id,
+            "user_id": user_id,
+            "channel": "feishu",
+            "target": "feishu:chat:oc_pmboard1234",
+            "status": "failed",
+            "attempt_count": 1,
+            "error_code": "card_limit_exceeded",
+            "payload_json": old_payload,
+        }
+    ]
+    executed_sql: list[str] = []
+
+    class _FakeCur:
+        def __init__(self) -> None:
+            self._rows: list[dict[str, Any]] = []
+            self._one: dict[str, Any] | None = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return None
+
+        async def execute(self, sql: object, params: Any = None) -> None:
+            norm = " ".join(str(sql).split())
+            executed_sql.append(norm)
+            if "FROM automations a" in norm or "automation_executions" in norm and "SELECT" in norm and "FROM dalton_notify_deliveries" not in norm:
+                self._one = {
+                    "automation_id": auto_id,
+                    "user_id": user_id,
+                    "automation_execution_id": exec_id,
+                    "status": "running",
+                    "delivery_config": {},
+                    "metadata": {
+                        "report_profile": {
+                            "profile": "market-digest-pm",
+                            "report_targets": ["feishu:chat:oc_pmboard1234"],
+                            "failure_targets": ["discord:user:424242424242424242"],
+                        }
+                    },
+                    "name": "market-digest-pm",
+                    "thread_id": str(uuid4()),
+                }
+            elif "DELETE FROM dalton_notify_deliveries" in norm:
+                did = str(params[0])
+                stored_rows[:] = [r for r in stored_rows if r["delivery_id"] != did]
+            elif "INSERT INTO dalton_notify_deliveries" in norm:
+                did, eid, aid, uid, ch, tgt, pjson = params
+                stored_rows.append(
+                    {
+                        "delivery_id": str(did),
+                        "execution_id": str(eid),
+                        "automation_id": str(aid),
+                        "user_id": str(uid),
+                        "channel": str(ch),
+                        "target": str(tgt),
+                        "status": "pending",
+                        "attempt_count": 0,
+                        "error_code": None,
+                        "payload_json": json.loads(pjson),
+                    }
+                )
+            elif "FROM dalton_notify_deliveries" in norm and "payload_json->>'report_run_id' <>" in norm:
+                self._one = None
+            elif "FROM dalton_notify_deliveries" in norm:
+                self._rows = list(stored_rows)
+
+        async def fetchone(self):
+            return self._one
+
+        async def fetchall(self):
+            return list(self._rows)
+
+    class _FakeConn:
+        def cursor(self, **_kw):
+            return _FakeCur()
+
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+    @asynccontextmanager
+    async def _fake_conn(_conn=None):
+        yield _FakeConn()
+
+    monkeypatch.setattr(reports, "get_db_connection", _fake_conn)
+    monkeypatch.setattr(
+        reports,
+        "lock_report_execution",
+        create_autospec(
+            reports.lock_report_execution,
+            return_value={
+                "automation_id": auto_id,
+                "user_id": user_id,
+                "workspace_id": ws_id,
+                "conversation_thread_id": th_id,
+                "conversation_response_id": rn_id,
+                "automation_execution_id": exec_id,
+                "status": "running",
+                "delivery_config": {},
+                "metadata": {
+                    "report_profile": {
+                        "profile": "market-digest-pm",
+                        "report_targets": ["feishu:chat:oc_pmboard1234"],
+                        "failure_targets": ["discord:user:424242424242424242"],
+                    }
+                },
+                "name": "market-digest-pm",
+            },
+        ),
+    )
+
+    async def _fake_auth(*_a, **_kw):
+        return ["feishu:chat:oc_pmboard1234"], None
+
+    monkeypatch.setattr(reports, "_authorize_all_targets", _fake_auth)
+    from src.dalton.services import report_delivery as _rd
+
+    monkeypatch.setattr(
+        _rd,
+        "finalize_missing_report_profile_notice",
+        create_autospec(_rd.finalize_missing_report_profile_notice, return_value=None),
+    )
+
+    res = await reports.submit_automation_report(
+        execution_id=exec_id,
+        automation_id=auto_id,
+        user_id=user_id,
+        workspace_id=ws_id,
+        thread_id=th_id,
+        run_id=rn_id,
+        report_run_id="market-digest:PM:2026-11-20",
+        material="yes",
+        cards=split_cards,
+    )
+    assert res["ok"] is True, res
+    assert res["created"] is True
+    assert len(stored_rows) == 1
+    assert stored_rows[0]["delivery_id"] != old_did
+    assert len(stored_rows[0]["payload_json"]["cards"]) == len(split_cards)
+    assert any("DELETE FROM dalton_notify_deliveries" in sql for sql in executed_sql)
+
+    # A different body still fails with content_conflict even when oversized single card is replaced?
+    # Note: after upgrade, stored_rows has compliant split cards so even same-body changes must conflict.
+    other_cards = markdown_to_card_chunks("# 另一份报告\n\n## 摘要\n\n不同正文。", "另一份报告")
+    conflict = await reports.submit_automation_report(
+        execution_id=exec_id,
+        automation_id=auto_id,
+        user_id=user_id,
+        workspace_id=ws_id,
+        thread_id=th_id,
+        run_id=rn_id,
+        report_run_id="market-digest:PM:2026-11-20",
+        material="yes",
+        cards=other_cards,
+    )
+    assert conflict["ok"] is False
+    assert conflict["code"] == "content_conflict"
+
+
+def test_prepare_automation_report_content_splits_oversized_single_cards() -> None:
+    """Any report profile (X accounts, tracker, weekly movers, humanoid, VIP news) splits oversized single cards."""
+    from src.dalton.data_jobs.notification_payloads import (
+        FEISHU_CARD_MAX_BYTES,
+        feishu_card_serialized_utf8_bytes,
+        is_feishu_card_within_envelope,
+        markdown_to_card_elements,
+    )
+
+    md = "\n\n".join(
+        f"## 栏目 {i}\n\n"
+        + "\n".join(
+            f"- 条目 {i}.{j}：核心数据与跟踪分析说明补充，包含晶圆产能、资本开支与供应链细节描述。"
+            for j in range(1, 35)
+        )
+        for i in range(1, 12)
+    )
+    oversized_single = markdown_to_card_elements(md, "X 账号日报")
+    assert feishu_card_serialized_utf8_bytes(oversized_single) > FEISHU_CARD_MAX_BYTES
+
+    for profile in (
+        "x-accounts-daily",
+        "msft-tracker",
+        "us-weekly-movers",
+        "humanoid-robot-weekly",
+        "vip-news-alert",
+    ):
+        prepared, err = reports.prepare_automation_report_content(
+            profile=profile,
+            cards=[oversized_single],
+            failure_text=None,
+        )
+        assert err is None and prepared is not None
+        assert len(prepared["cards"]) >= 2
+        assert prepared["expected_item_count"] == len(prepared["cards"])
+        assert all(is_feishu_card_within_envelope(c) for c in prepared["cards"])
+
+
+@pytest.mark.asyncio
+async def test_submit_automation_report_upgrade_preserves_old_rows_on_auth_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When target authorization fails during legacy oversized card upgrade, old rows are never deleted."""
+    from contextlib import asynccontextmanager
+    from unittest.mock import create_autospec
+    from uuid import uuid4
+    from src.dalton.data_jobs.notification_payloads import (
+        markdown_to_card_chunks,
+        markdown_to_card_elements,
+    )
+
+    big_md = "\n\n".join(
+        f"## 板块 {sec_idx}\n\n"
+        + "\n".join(
+            f"- ({sec_idx}.{line_idx}) 美股与中概重点标的表现追踪：成交额放量、机构资金流向与隐含波动率变化细节补充说明分析。"
+            for line_idx in range(1, 31)
+        )
+        for sec_idx in range(1, 11)
+    )
+    old_single = markdown_to_card_elements(big_md, "市场晚报")
+    split_cards = markdown_to_card_chunks(big_md, "市场晚报")
+    old_sha = reports.automation_report_content_sha256(
+        profile="market-digest-pm",
+        content_kind="cards",
+        cards=[old_single],
+        failure_text=None,
+    )
+    old_did = str(uuid4())
+    user_id = str(uuid4())
+    auto_id = str(uuid4())
+    exec_id = str(uuid4())
+    ws_id = str(uuid4())
+    th_id = str(uuid4())
+    rn_id = str(uuid4())
+
+    stored_rows = [
+        {
+            "delivery_id": old_did,
+            "execution_id": exec_id,
+            "automation_id": auto_id,
+            "user_id": user_id,
+            "channel": "feishu",
+            "target": "feishu:chat:oc_revoked",
+            "status": "failed",
+            "attempt_count": 1,
+            "error_code": "card_limit_exceeded",
+            "payload_json": {
+                "source": "automation_report",
+                "version": 1,
+                "profile": "market-digest-pm",
+                "report_run_id": "market-digest:PM:2026-11-20",
+                "content_kind": "cards",
+                "content_sha256": old_sha,
+                "first_execution_id": exec_id,
+                "owner_user_id": user_id,
+                "automation_id": auto_id,
+                "target_snapshot": ["feishu:chat:oc_revoked"],
+                "expected_item_count": 1,
+                "cards": [old_single],
+            },
+        }
+    ]
+    executed_sql: list[str] = []
+
+    class _Cur:
+        def __init__(self) -> None:
+            self._rows: list[dict[str, Any]] = []
+            self._one: dict[str, Any] | None = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return None
+
+        async def execute(self, sql: object, params: Any = None) -> None:
+            norm = " ".join(str(sql).split())
+            executed_sql.append(norm)
+            if "DELETE FROM dalton_notify_deliveries" in norm:
+                did = str(params[0])
+                stored_rows[:] = [r for r in stored_rows if r["delivery_id"] != did]
+            elif "payload_json->>'report_run_id' <>" in norm:
+                self._one = None
+            elif "FROM dalton_notify_deliveries" in norm:
+                self._rows = list(stored_rows)
+
+        async def fetchone(self):
+            return self._one
+
+        async def fetchall(self):
+            return list(self._rows)
+
+    class _Conn:
+        def cursor(self, **_kw):
+            return _Cur()
+
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+    @asynccontextmanager
+    async def _fake_conn(_conn=None):
+        yield _Conn()
+
+    monkeypatch.setattr(reports, "get_db_connection", _fake_conn)
+    monkeypatch.setattr(
+        reports,
+        "lock_report_execution",
+        create_autospec(
+            reports.lock_report_execution,
+            return_value={
+                "automation_id": auto_id,
+                "user_id": user_id,
+                "workspace_id": ws_id,
+                "conversation_thread_id": th_id,
+                "conversation_response_id": rn_id,
+                "automation_execution_id": exec_id,
+                "status": "running",
+                "delivery_config": {},
+                "metadata": {
+                    "report_profile": {
+                        "profile": "market-digest-pm",
+                        "report_targets": ["feishu:chat:oc_revoked"],
+                        "failure_targets": ["discord:user:424242424242424242"],
+                    }
+                },
+                "name": "market-digest-pm",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        reports,
+        "_authorize_all_targets",
+        create_autospec(reports._authorize_all_targets, return_value=([], "target_revoked")),
+    )
+
+    res = await reports.submit_automation_report(
+        execution_id=exec_id,
+        automation_id=auto_id,
+        user_id=user_id,
+        workspace_id=ws_id,
+        thread_id=th_id,
+        run_id=rn_id,
+        report_run_id="market-digest:PM:2026-11-20",
+        material="yes",
+        cards=split_cards,
+    )
+    assert res["ok"] is False
+    assert res["code"] == "target_revoked"
+    assert len(stored_rows) == 1 and stored_rows[0]["delivery_id"] == old_did
+    assert not any("DELETE FROM dalton_notify_deliveries" in s for s in executed_sql)
+
+
+@pytest.mark.asyncio
+async def test_submit_automation_report_upgrades_single_oversized_section_over_30kb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single >30KB section legacy card upgrades without content_conflict."""
+    from contextlib import asynccontextmanager
+    from unittest.mock import create_autospec
+    from uuid import uuid4
+    from src.dalton.data_jobs.notification_payloads import (
+        FEISHU_CARD_MAX_BYTES,
+        feishu_card_serialized_utf8_bytes,
+        markdown_to_card_chunks,
+        markdown_to_card_elements,
+    )
+
+    huge_single_section_md = "## 单章长复盘\n\n" + "\n".join(
+        f"- 第 {i} 条：高频量化数据观察及超长单一章节分片验证文本内容补充。"
+        for i in range(1, 500)
+    )
+    old_single = markdown_to_card_elements(huge_single_section_md, "单章晚报")
+    assert feishu_card_serialized_utf8_bytes(old_single) > FEISHU_CARD_MAX_BYTES
+    split_cards = markdown_to_card_chunks(huge_single_section_md, "单章晚报")
+    assert len(split_cards) >= 2
+
+    old_sha = reports.automation_report_content_sha256(
+        profile="market-digest-pm",
+        content_kind="cards",
+        cards=[old_single],
+        failure_text=None,
+    )
+    old_did = str(uuid4())
+    user_id = str(uuid4())
+    auto_id = str(uuid4())
+    exec_id = str(uuid4())
+    ws_id = str(uuid4())
+    th_id = str(uuid4())
+    rn_id = str(uuid4())
+    stored_rows = [
+        {
+            "delivery_id": old_did,
+            "execution_id": exec_id,
+            "automation_id": auto_id,
+            "user_id": user_id,
+            "channel": "feishu",
+            "target": "feishu:chat:oc_pmboard1234",
+            "status": "failed",
+            "attempt_count": 1,
+            "error_code": "card_limit_exceeded",
+            "payload_json": {
+                "source": "automation_report",
+                "version": 1,
+                "profile": "market-digest-pm",
+                "report_run_id": "market-digest:PM:2026-11-20",
+                "content_kind": "cards",
+                "content_sha256": old_sha,
+                "first_execution_id": exec_id,
+                "owner_user_id": user_id,
+                "automation_id": auto_id,
+                "target_snapshot": ["feishu:chat:oc_pmboard1234"],
+                "expected_item_count": 1,
+                "cards": [old_single],
+            },
+        }
+    ]
+
+    class _Cur:
+        def __init__(self) -> None:
+            self._rows: list[dict[str, Any]] = []
+            self._one: dict[str, Any] | None = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return None
+
+        async def execute(self, sql: object, params: Any = None) -> None:
+            norm = " ".join(str(sql).split())
+            if "DELETE FROM dalton_notify_deliveries" in norm:
+                did = str(params[0])
+                stored_rows[:] = [r for r in stored_rows if r["delivery_id"] != did]
+            elif "INSERT INTO dalton_notify_deliveries" in norm:
+                did, eid, aid, uid, ch, tgt, pjson = params
+                stored_rows.append(
+                    {
+                        "delivery_id": str(did),
+                        "execution_id": str(eid),
+                        "automation_id": str(aid),
+                        "user_id": str(uid),
+                        "channel": str(ch),
+                        "target": str(tgt),
+                        "status": "pending",
+                        "attempt_count": 0,
+                        "error_code": None,
+                        "payload_json": json.loads(pjson),
+                    }
+                )
+            elif "payload_json->>'report_run_id' <>" in norm:
+                self._one = None
+            elif "FROM dalton_notify_deliveries" in norm:
+                self._rows = list(stored_rows)
+
+        async def fetchone(self):
+            return self._one
+
+        async def fetchall(self):
+            return list(self._rows)
+
+    class _Conn:
+        def cursor(self, **_kw):
+            return _Cur()
+
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+    @asynccontextmanager
+    async def _fake_conn(_conn=None):
+        yield _Conn()
+
+    monkeypatch.setattr(reports, "get_db_connection", _fake_conn)
+    monkeypatch.setattr(
+        reports,
+        "lock_report_execution",
+        create_autospec(
+            reports.lock_report_execution,
+            return_value={
+                "automation_id": auto_id,
+                "user_id": user_id,
+                "workspace_id": ws_id,
+                "conversation_thread_id": th_id,
+                "conversation_response_id": rn_id,
+                "automation_execution_id": exec_id,
+                "status": "running",
+                "delivery_config": {},
+                "metadata": {
+                    "report_profile": {
+                        "profile": "market-digest-pm",
+                        "report_targets": ["feishu:chat:oc_pmboard1234"],
+                        "failure_targets": ["discord:user:424242424242424242"],
+                    }
+                },
+                "name": "market-digest-pm",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        reports,
+        "_authorize_all_targets",
+        create_autospec(reports._authorize_all_targets, return_value=(["feishu:chat:oc_pmboard1234"], None)),
+    )
+
+    res = await reports.submit_automation_report(
+        execution_id=exec_id,
+        automation_id=auto_id,
+        user_id=user_id,
+        workspace_id=ws_id,
+        thread_id=th_id,
+        run_id=rn_id,
+        report_run_id="market-digest:PM:2026-11-20",
+        material="yes",
+        cards=split_cards,
+    )
+    assert res["ok"] is True, res
+    assert res["created"] is True
+    assert len(stored_rows) == 1
+    assert stored_rows[0]["delivery_id"] != old_did
+    assert len(stored_rows[0]["payload_json"]["cards"]) == len(split_cards)
+
+
+def test_prepare_automation_report_content_refuses_unsplittable_element_and_handles_panel_31002() -> None:
+    """prepare_automation_report_content rejects unsplittable oversized cards with card_limit_exceeded
+    before gateway submission, and splits ~31002-byte collapsible_panel cards cleanly."""
+    from src.dalton.data_jobs.notification_payloads import (
+        FEISHU_CARD_MAX_BYTES,
+        feishu_card_serialized_utf8_bytes,
+        is_feishu_card_within_envelope,
+    )
+
+    unsplittable = {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {"title": {"tag": "plain_text", "content": "不可拆卡片"}, "template": "indigo"},
+        "body": {
+            "elements": [
+                {"tag": "div", "text": {"tag": "plain_text", "content": "Z" * (FEISHU_CARD_MAX_BYTES + 500)}}
+            ]
+        },
+    }
+    prepared, err = reports.prepare_automation_report_content(
+        profile="x-accounts-daily",
+        cards=[unsplittable],
+        failure_text=None,
+    )
+    assert prepared is None
+    assert err == "card_limit_exceeded"
+
+    content = ("M" * 98 + "\n\n") * 304
+    panel_card = {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {"title": {"tag": "plain_text", "content": "Token 用量周报"}, "template": "indigo"},
+        "body": {
+            "elements": [
+                {
+                    "tag": "collapsible_panel",
+                    "expanded": False,
+                    "header": {
+                        "title": {"tag": "markdown", "content": "**其余长尾模型（点击展开）** <font color='grey'>汇总</font>"},
+                        "vertical_align": "center",
+                        "padding": "4px 8px 4px 8px",
+                        "icon": {"tag": "standard_icon", "token": "down-small-ccm_outlined", "size": "12px 12px"},
+                        "icon_position": "right",
+                        "icon_expanded_angle": -180,
+                    },
+                    "border": {"color": "grey", "corner_radius": "6px"},
+                    "vertical_spacing": "6px",
+                    "padding": "8px 8px 8px 8px",
+                    "elements": [{"tag": "markdown", "content": content.strip()}],
+                }
+            ]
+        },
+    }
+    assert feishu_card_serialized_utf8_bytes(panel_card) > FEISHU_CARD_MAX_BYTES
+    panel_prepared, panel_err = reports.prepare_automation_report_content(
+        profile="x-accounts-daily",
+        cards=[panel_card],
+        failure_text=None,
+    )
+    assert panel_err is None and panel_prepared is not None
+    assert len(panel_prepared["cards"]) >= 2
+    assert all(is_feishu_card_within_envelope(c) for c in panel_prepared["cards"])
+

@@ -20528,6 +20528,7 @@ _AI_FINANCE_REPORT_SUCCESS_KEYS = frozenset({
     "news_count",
     "github_count",
     "card",
+    "cards",
     "offset",
     "max_chars",
     "total_chars",

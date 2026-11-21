@@ -805,11 +805,29 @@ def build_card(stats: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _split_card_chunks(card: dict[str, Any]) -> list[dict[str, Any]]:
+    import importlib.util
+
+    send_card_path = Path(__file__).resolve().with_name("feishu_send_card.py")
+    if send_card_path.is_file():
+        spec = importlib.util.spec_from_file_location("_dalton_feishu_send_card", send_card_path)
+        if spec is not None and spec.loader is not None:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            splitter = getattr(mod, "split_feishu_card_to_chunks", None)
+            if callable(splitter):
+                chunks = splitter(card)
+                if isinstance(chunks, list) and chunks:
+                    return chunks
+    return [card]
+
+
 def write_outbox_card(outbox_path: str | Path, card: dict[str, Any]) -> None:
-    """将 Feishu Card 2.0 写入 Dalton outbox JSON。"""
+    """将 Feishu Card 2.0 写入 Dalton outbox JSON，超过网关上限时自动拆卡。"""
     target = Path(outbox_path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"feishu_cards": [{"card": card, "images": []}]}
+    cards = _split_card_chunks(card)
+    payload = {"feishu_cards": [{"card": c, "images": []} for c in cards]}
     tmp_path = target.with_name(f".{target.name}.tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp_path.replace(target)

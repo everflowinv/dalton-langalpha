@@ -627,3 +627,67 @@ async def test_subagent_dispatcher_dispatch_passes_through(monkeypatch):
     assert kwargs["owner_task_id"] == "own"
     assert kwargs["base_configurable"] == {"k": "v"}
     assert kwargs["time_limit"] == 1200
+
+
+@pytest.mark.asyncio
+async def test_dispatch_background_subagent_blocks_oauth_cooldown_before_register(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-dispatch quota check raises SpawnError before mw.registry.register for oauth clients in cooldown."""
+    from types import SimpleNamespace
+    from unittest.mock import create_autospec
+    from ptc_agent.agent.middleware.background_subagent.spawn import SpawnError
+    from src.dalton.llm.oauth_refresh import OAuthRebuildSpec, tag_oauth_client
+    from src.utils.cache.redis_cache import RedisCacheClient
+
+    oauth_client = SimpleNamespace(
+        model="gemini-4-neon-high",
+        metadata={"billing_type": "oauth", "pricing_provider": "antigravity"},
+    )
+    tag_oauth_client(
+        oauth_client,
+        OAuthRebuildSpec(
+            user_id="user-quota",
+            model_name="gemini-4-neon-high",
+            provider="antigravity",
+            account_id="acct-sub-1",
+            credential_id="cred_sub_1",
+        ),
+    )
+
+    fake_cache = create_autospec(RedisCacheClient, instance=True)
+
+    async def fake_get(key: str):
+        if key == "dalton:quota_exhausted:user-quota:antigravity:gemini-4-neon-high:cred_sub_1":
+            return {"expires_at": 1_900_000_000.0, "model": "gemini-4-neon-high"}
+        return None
+
+    fake_cache.get.side_effect = fake_get
+    monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: fake_cache)
+    monkeypatch.setattr("ptc_agent.agent.middleware.model_resilience.time.time", lambda: 1_800_000_000.0)
+
+    mw = FakeMiddleware()
+    mw.default_model_client = oauth_client
+    mw.model_client_for = lambda _subagent_type, _override=None: oauth_client
+    register_calls: list[dict] = []
+    monkeypatch.setattr(
+        mw.registry,
+        "register",
+        create_autospec(
+            mw.registry.register,
+            side_effect=lambda *a, **kw: register_calls.append(kw),
+        ),
+    )
+
+    with pytest.raises(SpawnError, match="gemini-4-neon-high 的订阅额度已用完"):
+        await dispatch_mod.dispatch_background_subagent(
+            mw,
+            {"research": object()},
+            subagent_type="research",
+            description="desc",
+            prompt="prm",
+            parent_thread_id="thread-42",
+            run_id="r9",
+            base_configurable={"user_id": "user-quota"},
+        )
+    assert register_calls == []

@@ -366,16 +366,21 @@ def _stage_card_images(
     *,
     workspace: Path,
     run_dir: Path,
+    card_idx: int = 0,
 ) -> list[dict[str, Any]]:
     """Copy ``__img__`` files into the run directory. A missing chart fails the run."""
     placeholders: list[str] = []
+    seen_placeholders: set[str] = set()
 
     def walk(elements: list[Any]) -> None:
         for el in elements:
             if not isinstance(el, dict):
                 continue
             if el.get("tag") == "__img__" and el.get("path"):
-                placeholders.append(str(el["path"]))
+                path_str = str(el["path"])
+                if path_str not in seen_placeholders:
+                    seen_placeholders.add(path_str)
+                    placeholders.append(path_str)
             nested = el.get("elements")
             if el.get("tag") == "collapsible_panel" and isinstance(nested, list):
                 walk(nested)
@@ -391,7 +396,7 @@ def _stage_card_images(
             raise DataTaskNotificationPrepError(f"卡片图片不存在或为空：{placeholder}")
         raw_ext = src.suffix.lower()
         ext = raw_ext if raw_ext in _ALLOWED_IMAGE_EXTS else ".png"
-        rel = f"images/card_0_img_{img_idx}{ext}"
+        rel = f"images/card_{card_idx}_img_{img_idx}{ext}"
         dest = run_dir / rel
         if dest.is_symlink():
             raise DataTaskNotificationPrepError(f"运行目录图片路径是软链接：{rel}")
@@ -470,7 +475,38 @@ def _adjust_semi_rescue(
         tag="半导体",
         tag_color="indigo",
     )
-    images = _stage_card_images(card, workspace=workspace, run_dir=run_dir)
+    from src.dalton.data_jobs.notification_payloads import (
+        is_feishu_card_within_envelope,
+        markdown_to_card_chunks,
+    )
+
+    cards = (
+        [card]
+        if is_feishu_card_within_envelope(card)
+        else markdown_to_card_chunks(
+            markdown,
+            title,
+            subtitle,
+            header_template=str(verdict.get("template") or "indigo"),
+            tag="半导体",
+            tag_color="indigo",
+        )
+    )
+    feishu_cards: list[dict[str, Any]] = []
+    for idx, c in enumerate(cards):
+        card_images = _stage_card_images(
+            c,
+            workspace=workspace,
+            run_dir=run_dir,
+            card_idx=idx,
+        )
+        feishu_cards.append(
+            {
+                "card": c,
+                "images": card_images,
+                "chat_id": str(cfg["chat_id"]),
+            }
+        )
     try:
         rel_dir = out_dir.resolve(strict=True).relative_to(workspace).as_posix()
     except ValueError as exc:
@@ -479,13 +515,7 @@ def _adjust_semi_rescue(
         "job_key": job_key,
         "channel": "feishu",
         "chat_id": str(cfg["chat_id"]),
-        "feishu_cards": [
-            {
-                "card": card,
-                "images": images,
-                "chat_id": str(cfg["chat_id"]),
-            }
-        ],
+        "feishu_cards": feishu_cards,
         "delivery_writeback": {
             "kind": "semi_rescue_alert",
             "dir": rel_dir,
