@@ -1999,6 +1999,20 @@
     },
     "manageComputer": "Manage {{name}}",
     "alwaysOn": "Always-on",
+    "browserQuality": {
+      "label": "Live view quality",
+      "auto": "Auto",
+      "light": "Light",
+      "standard": "Standard",
+      "sharp": "Sharp",
+      "retina": "Retina",
+      "autoIs": "Auto uses {{quality}} on this computer.",
+      "retinaCost": "Retina takes about a whole CPU while someone watches.",
+      "retinaHeld": "Retina needs 2 or more CPUs.",
+      "retinaFallback": "Retina needs 2 or more CPUs, so this computer uses Sharp.",
+      "hint": "Sharper is clearer and uses more bandwidth. It applies the next time the browser opens.",
+      "failed": "Couldn't change the live view quality"
+    },
     "filesBackup": {
       "label": "Back up files",
       "offTitle": "Stop backing up files?",
@@ -3417,6 +3431,76 @@
     "openFiles": "Open tabs",
     "runningApps": "Running apps",
     "reloadApp": "Reload app",
+    "browserTab": "Browser",
+    "browser": {
+      "label": "Live view of this computer's browser",
+      "takeControl": "Take control",
+      "releaseControl": "Hand back",
+      "watchingHint": "Take control to click and type here",
+      "reconnect": "Reconnect",
+      "checking": "Checking the browser",
+      "starting": "Opening the browser",
+      "connecting": "Connecting to the browser",
+      "reconnecting": "Reconnecting",
+      "idleTitle": "The browser isn't open",
+      "idleBody": "It opens when the agent browses, or you can open it here. It's logged out and keeps nothing when it closes.",
+      "open": "Open browser",
+      "lowMemoryTitle": "Not enough memory to open the browser",
+      "lowMemoryBody": "Other work on this computer is using most of its memory. Free some up or choose a larger computer spec, then try again.",
+      "stoppedTitle": "This computer is stopped",
+      "stoppedBody": "Start it to open the browser.",
+      "startAndOpen": "Start and open",
+      "outdatedTitle": "This computer doesn't have the browser",
+      "outdatedBody": "It was built before the browser shipped. A new computer has it.",
+      "unavailableTitle": "No browser on this computer",
+      "unavailableBody": "The browser runs on cloud computers, and this is a machine you connected yourself.",
+      "failedTitle": "The live view couldn't connect",
+      "failedBody": "The browser may still be running on the computer.",
+      "retry": "Try again",
+      "back": "Back",
+      "forward": "Forward",
+      "address": "Address",
+      "addressPlaceholder": "Enter an address",
+      "addressLocked": "Take control to enter an address",
+      "blankTitle": "No page open",
+      "blankBody": "Pages the agent opens show here. Take control to go to one yourself.",
+      "blankBodyHeld": "Enter an address above to open a page.",
+      "navigateFailed": "Couldn't open that page",
+      "badAddress": "Enter a web address, like example.com.",
+      "lostControl": "You don't have control of the browser anymore.",
+      "unreachable": "The page couldn't be reached from this computer.",
+      "qualityNote": "Applies the next time the browser opens.",
+      "noAnswer": "The computer didn't answer. Try again in a moment.",
+      "reload": "Reload",
+      "openOutside": "Open in your browser",
+      "more": "More",
+      "copyAddress": "Copy address",
+      "heldNote": "You have the browser. The agent waits until you hand it back.",
+      "heldKeys": "Shift+Esc to hand back",
+      "agent": "Agent",
+      "doing": {
+        "opening": "Opening {{detail}}",
+        "clicking": "Clicking",
+        "clickingNamed": "Clicking “{{detail}}”",
+        "typing": "Typing",
+        "pressing": "Pressing {{detail}}",
+        "scrolling": "Scrolling",
+        "reading": "Reading the page",
+        "screenshot": "Taking a screenshot",
+        "waiting": "Waiting for the page",
+        "script": "Running a script on the page",
+        "back": "Going back",
+        "forward": "Going forward",
+        "reloading": "Reloading",
+        "tabs": "Switching tabs",
+        "pointing": "Moving the pointer",
+        "choosing": "Choosing an option",
+        "uploading": "Uploading a file",
+        "downloading": "Downloading a file",
+        "closing": "Closing the browser",
+        "using": "Using the browser"
+      }
+    },
     "previewTab": "App",
     "previewFrameTitle": "App on port {{port}}",
     "openInBrowser": "Open in browser",
@@ -4853,6 +4937,7 @@
     "methodSubtitle": "Choose how you'll access AI models. You can add more providers later.",
     "methodOAuth": "Use a subscription",
     "methodOAuthDesc": "Use Claude Code, sign in to ChatGPT or Grok, or add a coding plan from Kimi, GLM, MiniMax or OpenCode.",
+    "methodOAuthDescDalton": "Sign in to Google Antigravity, ChatGPT or Grok, or add a coding plan from Kimi, GLM, MiniMax or OpenCode.",
     "methodApiKey": "I have an API key",
     "methodApiKeyDesc": "Pay per token, from any provider.",
     "methodLocal": "I run models locally",
@@ -4867,6 +4952,8 @@
     "defaultsSubtitle": "Pick the models that power your research",
     "doneTitle": "You're all set!",
     "doneSummary": "Your AI research assistant is configured and ready to go.",
+    "teamSharedProvider": "Team-configured models",
+    "daltonModelAccessNote": "Your team has already configured shared models for you. Pick your default models below.",
     "goToDashboard": "Go to Dashboard",
     "personalizeLink": "Set up investing profile",
     "invitationCodeLink": "Have an invitation code?",
@@ -5058,8 +5145,9 @@
       "tag": {
         "claude_code": "Claude Code",
         "subscription_or_key": "Subscription or key",
-        "langalpha_models": "LangAlpha's models",
+        "langalpha_models": "{{brand}}'s models",
         "serverModels": "This server's models",
+        "teamModels": "Team models",
         "cloud": "Cloud computer",
         "serverComputer": "This server's computer",
         "own_computer": "Your computer"
@@ -5071,11 +5159,17 @@
         "default": "Default"
       },
       "use": {
-        "title": "How will you use LangAlpha?",
+        "title": "How will you use {{brand}}?",
         "lead": "Two questions. Your answers pick the setup steps that follow, and you can change both later.",
         "modelsLabel": "Which models do you want to use?",
+        "teamTitle": "Set up {{brand}}",
+        "teamLead": "Your team has configured models for you. Confirm where your workspace runs, and you can change it later.",
+        "teamModelsLabel": "Models",
+        "teamSharedTitle": "Team-configured models",
+        "teamSharedDesc": "Your team has already configured models for you, so you can use them directly.",
+        "teamModelsEmptyTitle": "No available team models configured yet. Please contact your administrator.",
         "claudeCode": "Your Claude plan, with Claude Code",
-        "claudeCodeDesc": "Pro or Max. Claude Code runs on your plan, with LangAlpha's tools.",
+        "claudeCodeDesc": "Pro or Max. Claude Code runs on your plan, with {{brand}}'s tools.",
         "subscription": "Another subscription or an API key",
         "subscriptionDesc": "ChatGPT, Grok, a coding plan, or a key from any provider.",
         "serverModels": "Models this server provides",
@@ -5086,12 +5180,13 @@
         "homeStays": "Home stays on this Mac. Move it in Settings.",
         "own": "On your own computer",
         "ownDesc": "Your Mac, or any Mac or Linux computer over SSH.",
+        "advancedComputer": "Advanced",
         "saveFailed": "Your answers couldn't be saved. Try again."
       },
       "computer": {
         "title": "Connect your computer",
-        "leadClaudeCode": "Claude Code and your tasks run here. LangAlpha signs in as the account you choose.",
-        "lead": "Your tasks run here. LangAlpha signs in as the account you choose.",
+        "leadClaudeCode": "Claude Code and your tasks run here. {{brand}} signs in as the account you choose.",
+        "lead": "Your tasks run here. {{brand}} signs in as the account you choose.",
         "macDesktop": "Pair this Mac, and Home and new workspaces go on it.",
         "continueOnMac": "Continue on your Mac",
         "pairThisMac": "Pair this Mac",
@@ -5099,17 +5194,22 @@
         "onlineNote": "Home lives on the computer you connect, and your turns run there, so it needs to be on and online while they run.",
         "onlineNoteNamed": "Home lives on {{name}}, and your turns run there, so it needs to be on and online while they run.",
         "noBackupNote": "Without backup, this computer can't be your primary computer, so Home and new workspaces go on a cloud computer.",
-        "macUpdateApp": "Update the LangAlpha app to pair this Mac."
+        "macUpdateApp": "Update the {{brand}} app to pair this Mac.",
+        "cloudReadyTitle": "Use the deployment's cloud computer",
+        "cloudReadyLead": "Your team uses a managed cloud computer for your tasks, so no local computer setup is needed.",
+        "cloudReadyRow": "Managed cloud computer",
+        "cloudReadyDetail": "Provided by your deployment and ready to use.",
+        "advancedSsh": "Advanced: connect your own computer over SSH"
       },
       "ssh": {
         "title": "Add a computer over SSH",
-        "lead": "The script lets LangAlpha sign in, and reports where to reach the computer. This page ticks off each step."
+        "lead": "The script lets {{brand}} sign in, and reports where to reach the computer. This page ticks off each step."
       },
       "model": {
         "tokenTitle": "Add your Claude setup token",
-        "tokenForComputer": "For {{name}}. The token stays on that computer, and LangAlpha doesn't keep it.",
-        "tokenForCloud": "For your cloud computer. LangAlpha keeps it encrypted and uses it only to run Claude Code for your threads.",
-        "tokenForServer": "For the computers this server runs. LangAlpha keeps it encrypted and uses it only to run Claude Code for your threads.",
+        "tokenForComputer": "For {{name}}. The token stays on that computer, and {{brand}} doesn't keep it.",
+        "tokenForCloud": "For your cloud computer. {{brand}} keeps it encrypted and uses it only to run Claude Code for your threads.",
+        "tokenForServer": "For the computers this server runs. {{brand}} keeps it encrypted and uses it only to run Claude Code for your threads.",
         "replaceToken": "Replace token",
         "planOutNote": "When your Claude plan runs out, Claude Code turns wait for it to reset, unless you choose otherwise in Settings. Nothing runs on another model.",
         "subTitle": "Connect your subscription or key",
@@ -5127,6 +5227,7 @@
         "claudeCodeOn": "Claude Code on {{name}}",
         "claudeCodeOnCloud": "Claude Code on your cloud computer",
         "none": "No models are available to you yet. You can choose a default later in Settings.",
+        "teamModelsEmpty": "No available team models configured yet. Please contact your administrator.",
         "saveFailed": "Your default couldn't be saved. Try again.",
         "recommendedSetup": "Recommended setup",
         "useRecommended": "Use recommended",
@@ -5137,13 +5238,15 @@
         "why": {
           "strongest": "Highest intelligence rating of your models.",
           "strongestFastest": "Highest intelligence rating of your models, and the fastest of those.",
-          "deployment": "The default for LangAlpha's models.",
+          "deployment": "The default for {{brand}}'s models.",
+          "daltonRecommended": "Recommended default model for research conversations.",
           "claudeCode": "A good fit for any Claude plan.",
           "fastestBackground": "Fastest of your other models, which is what background work needs.",
           "onlyBackground": "Your only model that can run background work.",
-          "deploymentBackground": "The background default for LangAlpha's models.",
+          "deploymentBackground": "The background default for {{brand}}'s models.",
+          "daltonRecommendedBackground": "Recommended model for background tasks.",
           "claudeCodeBackground": "Claude Code runs conversations only, so background work runs on {{model}}.",
-          "claudeCodeCreditsBackground": "Claude Code runs conversations only, so background work runs on {{model}}, a LangAlpha model that uses your credits."
+          "claudeCodeCreditsBackground": "Claude Code runs conversations only, so background work runs on {{model}}, a {{brand}} model that uses your credits."
         },
         "settingUp": {
           "title": "Setting you up",
@@ -5163,26 +5266,26 @@
       "get": {
         "title": "Continue on your Mac",
         "lead": "The Mac app pairs your Mac in one step, and the rest of setup carries on there.",
-        "step1": "Get the LangAlpha app for Mac",
+        "step1": "Get the {{brand}} app for Mac",
         "download": "Get the Mac app",
         "step2": "Open it and sign in as {{email}}",
         "step2Unnamed": "Open it and sign in with the same account",
         "step3": "Pair this Mac and finish setup there, in a few clicks"
       },
       "waiting": {
-        "title": "Finish setup in the LangAlpha app on your Mac",
+        "title": "Finish setup in the {{brand}} app on your Mac",
         "lead": "Sign in with the same account. The app picks up from here.",
         "artOs": "macOS",
         "artStatus": "Waiting for the app",
-        "artLabel": "Your Mac, waiting for the LangAlpha app",
+        "artLabel": "Your Mac, waiting for the {{brand}} app",
         "live": "Waiting for you to sign in to the app on your Mac…"
       },
       "moved": {
         "title": "Setup moved to your Mac",
-        "lead": "You're finishing setup in the LangAlpha app on {{name}}.",
-        "leadUnnamed": "You're finishing setup in the LangAlpha app on your Mac.",
+        "lead": "You're finishing setup in the {{brand}} app on {{name}}.",
+        "leadUnnamed": "You're finishing setup in the {{brand}} app on your Mac.",
         "yourMac": "Your Mac",
-        "open": "Setup is open in the LangAlpha app",
+        "open": "Setup is open in the {{brand}} app",
         "note": "This tab moves to your first chat when you finish on the Mac. You can also close it."
       },
       "continueHere": "Continue here instead"
@@ -5190,8 +5293,8 @@
     "thisMac": {
       "kicker": "After sign-in",
       "ask": {
-        "title": "Use this Mac with LangAlpha?",
-        "lead": "Pair it, and LangAlpha can run your tasks here.",
+        "title": "Use this Mac with {{brand}}?",
+        "lead": "Pair it, and {{brand}} can run your tasks here.",
         "leadHome": "Pair it, and Home and new workspaces go on this Mac."
       },
       "art": {
@@ -5201,7 +5304,7 @@
       "point": {
         "run": "Your tasks and Claude Code can run on this Mac, with no size limit.",
         "closed": "It works whether or not the app is open, while the Mac is awake and online.",
-        "off": "Turn it off any time from the LangAlpha menu."
+        "off": "Turn it off any time from the {{brand}} menu."
       },
       "account": "The agent can run commands and change files as {{account}}, the macOS account you're using now.",
       "accountUnnamed": "The agent can run commands and change files as the macOS account you're using now.",
@@ -5212,8 +5315,8 @@
       },
       "step": {
         "on": "Remote control turned on",
-        "loginItems": "Allow LangAlpha in Login Items",
-        "loginItemsDetail": "macOS held back the part of LangAlpha that keeps your Mac reachable. Allow it once.",
+        "loginItems": "Allow {{brand}} in Login Items",
+        "loginItemsDetail": "macOS held back the part of {{brand}} that keeps your Mac reachable. Allow it once.",
         "loginItemsPath": "System Settings → General → Login Items",
         "pairing": "Pairing",
         "pairingDetail": "Pairing… {{elapsed}}. If it doesn't finish in 80 seconds, we'll say so here and you can try again."
@@ -7925,7 +8028,7 @@
         "terms": "Anthropic's terms for your Claude plan apply to this use, and you're responsible for following them. Anthropic may limit or suspend accounts that it finds break them.",
         "undo": "You can switch back at any time, and {{brand}} deletes the token right away.",
         "confirm": "Store my token",
-        "agree": "I agree to let LangAlpha store my setup token",
+        "agree": "I agree to let {{brand}} store my setup token",
         "termsLink": "Read Anthropic's terms"
       },
       "leaveStored": {
@@ -9935,7 +10038,7 @@
       "commandOnInThread": "A command from <thread>“{{thread}}”</thread> on “{{computer}}” asked to {{ask}}."
     },
     "note": {
-      "computerFiles": "LangAlpha's files on the machine are deleted too.",
+      "computerFiles": "{{brand}}'s files on the machine are deleted too.",
       "computerKey": "Our key is removed from ~/.ssh/authorized_keys too.",
       "computerWorkspaces": "Its workspaces are deleted with it: {{names}}.",
       "cannotUndo": "This can't be undone."
@@ -9954,12 +10057,17 @@
   },
   "vendorTerms": {
     "title": "Accept {{name}}'s terms",
-    "body": "Your agent wants to use {{name}} to read the web and its data catalog for you. LangAlpha sets up a {{name}} account for you to do this, and {{name}} asks you to accept its Terms of Service first.",
+    "body": "Your agent wants to use {{name}} to read the web and its data catalog for you. {{brand}} sets up a {{name}} account for you to do this, and {{name}} asks you to accept its Terms of Service first.",
     "link": "Read {{name}}'s Terms of Service",
     "accept": "Accept",
     "notNow": "Not now",
     "accepted": "Accepted. Your agent can use {{name}} now.",
     "failed": "Couldn't set up your {{name}} account. Try again later.",
     "notification": "Your agent needs you to accept {{name}}'s terms"
+  },
+  "linkMenu": {
+    "openInBrowser": "Open in agent browser",
+    "openInNewTab": "Open in new tab",
+    "copyLink": "Copy link"
   }
 }

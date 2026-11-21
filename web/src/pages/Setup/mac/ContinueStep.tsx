@@ -1,5 +1,7 @@
 import { useEffect, useId, useState } from 'react';
 import { Navigate, useNavigate } from 'react-router';
+// DALTON-HOOK(dalton-setup): Mac continue step is disabled in Dalton builds
+import { isDaltonBuild } from '@/config/brand';
 import { useTranslation } from 'react-i18next';
 import { WizardStepHeader } from '@/components/ui/wizard';
 import { useOnboardingProgress } from '@/hooks/useOnboardingProgress';
@@ -22,6 +24,12 @@ const T = 'setup.continueMac';
  * which comes back here.
  */
 export default function ContinueStep() {
+  // DALTON-HOOK(dalton-setup): redirect Mac continue step out in Dalton builds
+  if (isDaltonBuild) return <Navigate to="/setup" replace />;
+  return <ContinueStepInner />;
+}
+
+function ContinueStepInner() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const headingId = useId();

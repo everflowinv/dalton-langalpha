@@ -1,5 +1,7 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import { useLocation, useNavigate } from 'react-router';
+import { Navigate, useLocation, useNavigate } from 'react-router';
+// DALTON-HOOK(dalton-setup): Mac pairing is disabled in Dalton builds
+import { isDaltonBuild } from '@/config/brand';
 import { useTranslation } from 'react-i18next';
 import { WizardStepHeader } from '@/components/ui/wizard';
 import { ONBOARDING_USE_URL, PLATFORM_URL } from '@/config/supportLinks';
@@ -29,6 +31,8 @@ const T = 'setup.thisMac';
  */
 export default function ThisMacStep() {
   const { user } = useUser();
+  // DALTON-HOOK(dalton-setup): redirect Mac pairing step out in Dalton builds
+  if (isDaltonBuild) return <Navigate to="/setup" replace />;
   return <ThisMacPage key={user?.user_id ?? ''} />;
 }
 

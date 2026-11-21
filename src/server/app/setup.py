@@ -694,6 +694,12 @@ async def lifespan(app: FastAPI):
     from src.server.services.claude_code.hosted import register_opt_out
 
     register_opt_out()
+    # DALTON-HOOK(agent-switch-model): wire handler-tier model handoff runners into thread_model service
+    from src.server.handlers.thread_model_handoff import (
+        register_thread_model_handoff_runners,
+    )
+
+    register_thread_model_handoff_runners()
     try:
         HookOutboxDrainer.get_instance().start()
         logger.info("HookOutboxDrainer started")
@@ -1648,6 +1654,7 @@ from src.server.app.workspace_files import router as workspace_files_router
 from src.server.app.workspace_files import wsfiles_router
 from src.server.app.attachments import router as attachments_router
 from src.server.app.workspace_sandbox import router as workspace_sandbox_router
+from src.server.app.workspace_browser import router as workspace_browser_router
 from src.server.app.chart_annotations import router as chart_annotations_router
 from src.server.app.artifact_frames import frame_router as artifact_frame_router
 from src.server.app.artifacts import router as artifacts_router
@@ -1744,6 +1751,9 @@ app.include_router(
 app.include_router(
     workspace_sandbox_router
 )  # /api/v1/workspaces/{id}/sandbox/* - Sandbox stats & packages
+app.include_router(
+    workspace_browser_router
+)  # /api/v1/workspaces/{id}/sandbox/browser-* - The computer's browser
 app.include_router(
     chart_annotations_router
 )  # /api/v1/workspaces/{id}/chart-annotations - Agent-drawn chart annotations

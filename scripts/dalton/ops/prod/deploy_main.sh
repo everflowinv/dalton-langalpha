@@ -1,7 +1,10 @@
 #!/bin/bash
 # Deploy origin/dalton/main: wait idle, backup (waits for a fresh dump), ff, frontend build,
 # backend restart (runs Dalton migrations), optional bridge/edge recreate, checks.
-# Usage: deploy_main.sh [--bridge] [--recreate] [--expect-migration dNNN]
+# Usage: deploy_main.sh [--bridge] [--recreate] [--expect-migration dNNN] [--reuse-backup-minutes N]
+# --reuse-backup-minutes N: skip the fresh dump only when the last backup-log line is an ' ok '
+#             dump at most N minutes old AND origin/dalton/main adds no migration files over HEAD;
+#             otherwise back up as usual.
 # --recreate: recreate the backend container (compose changes such as mem_limit);
 #             plain `docker restart` does not re-read docker-compose files.
 set -uo pipefail
@@ -12,10 +15,10 @@ EDGE_PORT="${DALTON_EDGE_PORT:-8088}"
 EDGE_WAIT_TIMEOUT=60
 CONTAINER_LOG_DIR="${DALTON_CONTAINER_LOG_DIR:-$HOME/Library/Logs/Dalton/containers}"
 CONTAINER_LOG_RETENTION_DAYS=14
-BRIDGE=0; RECREATE=0; EXPECT=""
+BRIDGE=0; RECREATE=0; EXPECT=""; REUSE_BACKUP_MIN=""
 
 usage() {
-  echo "Usage: deploy_main.sh [--bridge] [--recreate] [--expect-migration dNNN]"
+  echo "Usage: deploy_main.sh [--bridge] [--recreate] [--expect-migration dNNN] [--reuse-backup-minutes N]"
 }
 
 parse_deploy_args() {
@@ -35,6 +38,15 @@ parse_deploy_args() {
           return 2
         fi
         EXPECT="$2"
+        shift
+        ;;
+      --reuse-backup-minutes)
+        if [ $# -lt 2 ] || ! [[ "${2:-}" =~ ^[1-9][0-9]*$ ]]; then
+          echo "ERROR: --reuse-backup-minutes requires a positive whole number of minutes" >&2
+          usage >&2
+          return 2
+        fi
+        REUSE_BACKUP_MIN="$2"
         shift
         ;;
       *)
@@ -780,6 +792,25 @@ revert_deploy() {
   fi
 }
 
+# Last backup-log line if it is an ' ok ' dump at most $2 minutes old (relative to $3, epoch
+# seconds); prints nothing and returns 1 otherwise. Log line: "YYYY-mm-dd HH:MM:SS ok  <size> <path>".
+recent_ok_backup() {
+  local log="$1" max_min="$2" now="$3" line ts epoch
+  line=$(tail -1 "$log" 2>/dev/null) || return 1
+  case "$line" in *" ok "*) ;; *) return 1;; esac
+  ts="${line:0:19}"
+  epoch=$(date -j -f '%Y-%m-%d %H:%M:%S' "$ts" +%s 2>/dev/null || date -d "$ts" +%s 2>/dev/null) || return 1
+  [ -n "$epoch" ] && [ "$epoch" -le "$now" ] && [ $(( now - epoch )) -le $(( max_min * 60 )) ] || return 1
+  printf '%s\n' "$line"
+}
+
+# True when $1 (the ref about to be deployed) adds or changes no migration file over HEAD.
+no_pending_migrations() {
+  local out rc=0
+  out=$(git diff --name-only HEAD "$1" -- migrations/versions src/dalton/migrations/versions 2>/dev/null) || rc=$?
+  [ "$rc" -eq 0 ] && [ -z "$out" ]
+}
+
 compute_migrating_deploy() {
   local diff_out="" diff_rc=0
   diff_out=$(git diff --name-only "$PRE_FF" HEAD -- migrations/versions src/dalton/migrations/versions 2>/dev/null) || diff_rc=$?
@@ -791,7 +822,7 @@ compute_migrating_deploy() {
 }
 
 run_deploy_main() {
-  local LOG before after out build_rc cur
+  local LOG before after out build_rc cur reused
   parse_deploy_args "$@" || exit $?
   cd "$REPO_ROOT" || exit 1
   cleanup_old_container_logs
@@ -800,10 +831,19 @@ run_deploy_main() {
   echo "pre-deploy migrations: dalton=${PRE_FF_DALTON_REV:-未能读取}, upstream=${PRE_FF_UPSTREAM_REV:-未能读取}"
   bash "$WAIT_IDLE_SCRIPT" || { echo "still busy, abort"; exit 1; }
   LOG="${DALTON_PG_BACKUP_LOG:-$HOME/Library/Logs/dalton-pg-backup.log}"; before=$(tail -1 "$LOG" 2>/dev/null)
-  launchctl kickstart "gui/$(id -u)/com.dalton.pg-backup"
-  for i in $(seq 1 360); do [ "$(tail -1 "$LOG" 2>/dev/null)" != "$before" ] && break; sleep 5; done  # 30 min: dumps of a 7.5G db take over 10 min
-  after=$(tail -1 "$LOG"); echo "backup: $after"
-  case "$after" in *" ok "*) [ "$after" != "$before" ] || { echo "no fresh backup, abort"; exit 1; };; *) echo "backup failed, abort"; exit 1;; esac
+  reused=""
+  if [ -n "$REUSE_BACKUP_MIN" ] && git fetch -q origin && no_pending_migrations origin/dalton/main; then
+    reused=$(recent_ok_backup "$LOG" "$REUSE_BACKUP_MIN" "$(date +%s)") || reused=""
+  fi
+  if [ -n "$reused" ]; then
+    echo "backup: reusing (no migrations to deploy, dump within ${REUSE_BACKUP_MIN} min): $reused"
+  else
+    [ -n "$REUSE_BACKUP_MIN" ] && echo "backup: cannot reuse (migrations to deploy or no ok dump within ${REUSE_BACKUP_MIN} min); taking a fresh one"
+    launchctl kickstart "gui/$(id -u)/com.dalton.pg-backup"
+    for i in $(seq 1 360); do [ "$(tail -1 "$LOG" 2>/dev/null)" != "$before" ] && break; sleep 5; done  # 30 min: dumps of a 7.5G db take over 10 min
+    after=$(tail -1 "$LOG"); echo "backup: $after"
+    case "$after" in *" ok "*) [ "$after" != "$before" ] || { echo "no fresh backup, abort"; exit 1; };; *) echo "backup failed, abort"; exit 1;; esac
+  fi
   # ff and frontend build only after the idle wait and backup, right before the restart, so the new
   # frontend never goes live against the old backend and running code is not swapped under a busy backend.
   PRE_FF=$(git rev-parse HEAD)

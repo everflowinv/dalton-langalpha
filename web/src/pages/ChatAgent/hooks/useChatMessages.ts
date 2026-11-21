@@ -20,6 +20,7 @@ import { sendChatMessageStream, sendRetryStream, getWorkflowStatus, sendHitlResp
 import { useLocalRunPublisher } from '@/lib/threadLifecycle/useLocalRunPublisher';
 import { ThreadMuxSlot } from '../session/stream/threadStreamMux';
 import type { NextSummary, WorkflowStatusResponse } from '../utils/api';
+import type { BrowserUse } from '../session/stream/browserUse';
 import type { CancelOutcome, HeldSteer } from '../utils/cancelOutcome';
 // Imported from the dependency-free signal module (not `../utils/api`) so this
 // keeps decoding wire status even in the hook tests that fully mock `../utils/api`.
@@ -162,6 +163,7 @@ export interface ChatMessagesOptions {
   finalizePendingTodos?: (() => void) | null;
   onFileArtifact?: ((event: SSEEvent) => void) | null;
   onPreviewUrl?: ((data: PreviewData) => void) | null;
+  onBrowserUse?: ((use: BrowserUse) => void) | null;
   clearSubagentCards?: (() => void) | null;
   onWorkspaceCreated?: ((info: { workspaceId: string; question: string }) => void) | null;
   platform?: string | null;
@@ -181,6 +183,7 @@ export function useChatMessages(
     finalizePendingTodos = null,
     onFileArtifact = null,
     onPreviewUrl = null,
+    onBrowserUse = null,
     clearSubagentCards = null,
     onWorkspaceCreated = null,
     platform = null,
@@ -837,6 +840,7 @@ export function useChatMessages(
     setIsReconnecting,
     onFileArtifact,
     onPreviewUrl,
+    onBrowserUse,
     queryClient,
     // setters (stable)
     setMessages,

@@ -8,6 +8,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { isPlatformMode } from '@/config/hostMode';
+// DALTON-HOOK(dalton-setup): reclaim legacy mac_pending progress for the browser in Dalton builds
+import { isDaltonBuild } from '@/config/brand';
 import { ONBOARDING_USE_URL } from '@/config/supportLinks';
 import { authSessionCheck } from '@/lib/authResets';
 import { isDesktopShell, openConsolePage } from '@/lib/desktop';
@@ -29,7 +31,9 @@ export function useAnswerFlow(step: SetupStep) {
   // next step's mount, while the record stays unclaimed; a claim sent or made
   // holds only for the account it was for.
   const claimed = useRef<(() => boolean) | null>(null);
-  const unclaimed = !!setup.progress && setup.answers !== null && setup.progress.setup_on === null
+  // DALTON-HOOK(dalton-setup): reclaim legacy mac_pending progress for the browser in Dalton
+  const unclaimed = !!setup.progress && setup.answers !== null
+    && (setup.progress.setup_on === null || (isDaltonBuild && setup.progress.setup_on === 'mac_pending'))
     && !setup.progress.setup_completed_at;
   useEffect(() => {
     if (!unclaimed) return;

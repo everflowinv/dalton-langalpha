@@ -935,3 +935,852 @@ def test_subagent_runs_query_uses_existing_columns():
     )
     assert used, "expected the subagent_runs query to alias the table as sr"
     assert used <= cols, f"unknown subagent_runs columns: {sorted(used - cols)}"
+
+
+def _make_ptc_agent_config(model_name: str):
+    from ptc_agent.config.agent import AgentConfig, LLMConfig
+
+    cfg = create_autospec(AgentConfig, instance=True)
+    llm_cfg = create_autospec(LLMConfig, instance=True)
+    llm_cfg.name = model_name
+    cfg.llm = llm_cfg
+    cfg.credential_source = CredentialSource.PLATFORM
+    client = object()
+    cfg.llm_client = client
+    cfg.get_llm_client.return_value = client
+    cfg.user_skill_dir = None
+    cfg.disabled_skills = ()
+    cfg.llm_definition = None
+    cfg.claude_code_admitted = None
+    cfg.claude_code = False
+    sub_cfg = create_autospec(AgentConfig, instance=True)
+    sub_cfg.enabled = False
+    cfg.subagents = sub_cfg
+    return cfg
+
+
+def _fake_thread_db_connection(
+    thread_rows: dict[str, dict[str, str | None]],
+    execution_rows: dict[str, dict[str, object]] | None = None,
+):
+    """Build a ``create_autospec`` async DB connection backing threads and executions."""
+    exec_map = (
+        execution_rows
+        if execution_rows is not None
+        else {
+            _EXEC_1: {
+                "automation_execution_id": _EXEC_1,
+                "automation_id": _AUTO_ID,
+                "user_id": _USER,
+                "thread_strategy": "new",
+            },
+            _EXEC_2: {
+                "automation_execution_id": _EXEC_2,
+                "automation_id": _AUTO_ID,
+                "user_id": _USER,
+                "thread_strategy": "new",
+            },
+        }
+    )
+
+    class _CurSpec:
+        rowcount: int = 0
+
+        async def execute(self, sql: str, params: tuple | list = ()) -> None:
+            return None
+
+        async def fetchone(self) -> dict[str, object] | None:
+            return None
+
+    class _ConnSpec:
+        def cursor(self, **kwargs):
+            return None
+
+    executed_sql: list[tuple[str, tuple]] = []
+    last_row: list[dict[str, object] | None] = [None]
+
+    async def _execute(sql: str, params: tuple = ()) -> None:
+        norm = " ".join(sql.split())
+        if "FROM automation_executions e" in norm and "a.thread_strategy" in norm:
+            eid = str(params[0]) if params else ""
+            last_row[0] = exec_map.get(eid)
+            cur.rowcount = 1 if last_row[0] is not None else 0
+            return
+        last_row[0] = None
+        executed_sql.append((sql, tuple(params)))
+        if "UPDATE conversation_threads SET llm_model = %s" in norm and "AND llm_model IS NULL" in norm:
+            new_model, tid = params
+            row = thread_rows.get(str(tid))
+            if row is not None and row.get("llm_model") is None:
+                row["llm_model"] = new_model
+                cur.rowcount = 1
+            else:
+                cur.rowcount = 0
+        else:
+            cur.rowcount = 0
+
+    async def _fetchone() -> dict[str, object] | None:
+        return last_row[0]
+
+    cur = create_autospec(_CurSpec, instance=True)
+    cur.rowcount = 0
+    cur.execute.side_effect = _execute
+    cur.fetchone.side_effect = _fetchone
+
+    @asynccontextmanager
+    async def _cur_cm(**_kwargs):
+        yield cur
+
+    conn = create_autospec(_ConnSpec, instance=True)
+    conn.cursor.side_effect = _cur_cm
+
+    @asynccontextmanager
+    async def _conn_cm():
+        yield conn
+
+    return _conn_cm, executed_sql
+
+
+class _StopAfterBeginRun(Exception):
+    pass
+
+
+async def _drive_automation_ptc_through_begin_run(
+    *,
+    request: ChatRequest,
+    run_metadata: dict,
+    resolve_fn,
+    thread_rows: dict[str, dict[str, str | None]],
+    turn_index: int = 0,
+    execution_rows: dict[str, dict[str, object]] | None = None,
+):
+    from src.dalton.services import automation_subscription_fallback as fb_mod
+    from src.server.app import setup as app_setup
+    from src.server.database import conversation as qr_db
+    from src.server.database.runs import lifecycle as tl_db
+    from src.server.dependencies import usage_limits
+    from src.server.handlers.chat import ptc_run
+    from src.server.services.llm import config as llm_config_mod
+    from src.server.services.report_back.handoff import carry
+    from src.server.services.shared_workspaces import turn as _turn_mod
+    from src.server.services.shared_workspaces.turn import TurnIdentity
+    from src.server.services.turn_runtime import TurnRoute
+
+    base_cfg = _make_ptc_agent_config("base-model")
+    wm = create_autospec(WorkspaceManager, instance=True)
+    wm.has_ready_session.return_value = True
+
+    conn_cm, executed_sql = _fake_thread_db_connection(
+        thread_rows, execution_rows=execution_rows
+    )
+    run_handle = SimpleNamespace(
+        turn_index=turn_index,
+        checkpointer=None,
+        guard=None,
+        origin="automation",
+    )
+
+    patches = [
+        patch.object(app_setup, "agent_config", base_cfg),
+        patch.object(
+            ptc_run.WorkspaceManager,
+            "get_instance",
+            create_autospec(WorkspaceManager.get_instance, return_value=wm),
+        ),
+        patch.object(
+            ptc_run,
+            "wait_or_steer",
+            create_autospec(ptc_run.wait_or_steer, return_value=(True, None)),
+        ),
+        patch.object(
+            ptc_run,
+            "dedup_retransmit_or_raise",
+            create_autospec(ptc_run.dedup_retransmit_or_raise, return_value=None),
+        ),
+        patch.object(
+            ptc_run,
+            "read_disk_notice",
+            create_autospec(ptc_run.read_disk_notice, return_value=(None, False)),
+        ),
+        patch.object(
+            _turn_mod,
+            "get_user_profile_for_prompt",
+            create_autospec(_turn_mod.get_user_profile_for_prompt, return_value=None),
+        ),
+        patch.object(
+            ptc_run.HomeTurnStart,
+            "read",
+            create_autospec(
+                ptc_run.HomeTurnStart.read,
+                return_value=ptc_run.HomeTurnStart(workspace_id=_WS, away=None, back=None),
+            ),
+        ),
+        patch.object(
+            carry,
+            "prior_attempt",
+            create_autospec(
+                carry.prior_attempt,
+                return_value=carry.PriorAttempt(latest=None, retried=None),
+            ),
+        ),
+        patch.object(
+            carry,
+            "carried_pair",
+            create_autospec(carry.carried_pair, return_value={}),
+        ),
+        patch.object(
+            carry,
+            "carried_delivery",
+            create_autospec(carry.carried_delivery, return_value=None),
+        ),
+        patch.object(
+            carry,
+            "carried_firing",
+            create_autospec(carry.carried_firing, return_value={}),
+        ),
+        patch.object(
+            ptc_run,
+            "_resolve_origin_meta",
+            create_autospec(ptc_run._resolve_origin_meta, return_value={}),
+        ),
+        patch.object(
+            ptc_run,
+            "begin_run",
+            create_autospec(ptc_run.begin_run, return_value=run_handle),
+        ),
+        patch.object(
+            ptc_run,
+            "init_tracking",
+            create_autospec(ptc_run.init_tracking, side_effect=_StopAfterBeginRun()),
+        ),
+        patch.object(
+            request_prep.qr_db,
+            "get_thread_by_id",
+            create_autospec(
+                qr_db.get_thread_by_id,
+                return_value={
+                    "conversation_thread_id": _THREAD,
+                    "workspace_id": _WS,
+                    "current_status": "completed",
+                },
+            ),
+        ),
+        patch.object(
+            request_prep.qr_db,
+            "ensure_thread_exists",
+            create_autospec(qr_db.ensure_thread_exists, return_value=False),
+        ),
+        patch.object(
+            request_prep.qr_db,
+            "update_thread_status",
+            create_autospec(qr_db.update_thread_status, return_value=True),
+        ),
+        patch.object(
+            request_prep.tl_db,
+            "get_latest_attempt",
+            create_autospec(tl_db.get_latest_attempt, return_value=None),
+        ),
+        patch.object(
+            fb_mod,
+            "resolve_llm_config",
+            create_autospec(llm_config_mod.resolve_llm_config, side_effect=resolve_fn),
+        ),
+        patch.object(
+            usage_limits,
+            "release_burst_slot",
+            create_autospec(usage_limits.release_burst_slot, return_value=None),
+        ),
+        patch.object(
+            automation_thread_model,
+            "get_db_connection",
+            conn_cm,
+        ),
+    ]
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        gen = ptc_run.astream_ptc_workflow(
+            request=request,
+            thread_id=_THREAD,
+            run_id=_RUN_0,
+            user_input="run check",
+            user_id=_USER,
+            route=TurnRoute(_WS, "analyst"),
+            identity=TurnIdentity(_USER, _USER, _USER),
+            is_byok=False,
+            from_server=True,
+            steerable=False,
+            run_metadata=dict(run_metadata),
+        )
+        try:
+            async for _ in gen:
+                pass
+        except _StopAfterBeginRun:
+            pass
+        finally:
+            await gen.aclose()
+    return executed_sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("automation_llm_model", "resolved_model"),
+    [
+        ("gpt-6.1-sol-oauth", "gpt-6.1-sol-oauth"),
+        (None, "claude-sonnet-5-5"),
+    ],
+    ids=["explicit-automation-model", "user-configured-resolved-model"],
+)
+async def test_new_automation_thread_persists_actual_model_when_null(
+    automation_llm_model: str | None,
+    resolved_model: str,
+):
+    """Automation opening a thread with NULL llm_model persists the turn's resolved model."""
+    thread_rows = {_THREAD: {"llm_model": None}}
+
+    async def _resolve(_cfg, _uid, _model_name, *_args, **_kwargs):
+        return _make_ptc_agent_config(resolved_model)
+
+    req = ChatRequest(
+        workspace_id=_WS,
+        messages=[ChatMessage(role="user", content="run check")],
+        llm_model=automation_llm_model,
+        origin=ThreadOrigin(type="automation", id=_AUTO_ID, name="Daily"),
+    )
+    executed_sql = await _drive_automation_ptc_through_begin_run(
+        request=req,
+        run_metadata={"automation_execution_id": _EXEC_1, "automation_id": _AUTO_ID},
+        resolve_fn=_resolve,
+        thread_rows=thread_rows,
+    )
+
+    assert thread_rows[_THREAD]["llm_model"] == resolved_model
+    assert len(executed_sql) == 1
+    sql, params = executed_sql[0]
+    assert "WHERE conversation_thread_id = %s" in " ".join(sql.split())
+    assert "AND llm_model IS NULL" in " ".join(sql.split())
+    assert params == (resolved_model, _THREAD)
+
+
+@pytest.mark.asyncio
+async def test_existing_thread_llm_model_is_never_overwritten_by_automation():
+    """A thread with an existing llm_model (set by web UI or switch_thread_model) is preserved."""
+    thread_rows = {_THREAD: {"llm_model": "claude-opus-5-5-oauth"}}
+
+    async def _resolve(_cfg, _uid, _model_name, *_args, **_kwargs):
+        return _make_ptc_agent_config("gpt-6.1-sol-oauth")
+
+    req = ChatRequest(
+        workspace_id=_WS,
+        messages=[ChatMessage(role="user", content="run check")],
+        llm_model="gpt-6.1-sol-oauth",
+        origin=ThreadOrigin(type="automation", id=_AUTO_ID, name="Daily"),
+    )
+    executed_sql = await _drive_automation_ptc_through_begin_run(
+        request=req,
+        run_metadata={"automation_execution_id": _EXEC_1, "automation_id": _AUTO_ID},
+        resolve_fn=_resolve,
+        thread_rows=thread_rows,
+    )
+
+    assert len(executed_sql) == 1
+    assert thread_rows[_THREAD]["llm_model"] == "claude-opus-5-5-oauth"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "automation_llm_model",
+    [None, "claude-opus-4-6-oauth"],
+    ids=["no-task-model-writes-nothing", "configured-task-model-also-writes-nothing"],
+)
+async def test_automation_subscription_fallback_never_writes_model(
+    automation_llm_model: str | None,
+):
+    """A fallback turn never persists any model (neither fallback nor task model) onto conversation_threads."""
+    from src.dalton.services import automation_subscription_fallback as fb_mod
+    from src.llms.llm import LLM as LLMFactory
+    from src.server.services.llm import user_models
+    from src.server.services.oauth_providers import SUBSCRIPTIONS
+
+    thread_rows = {_THREAD: {"llm_model": None}}
+    prefs = {
+        "preferred_model": "claude-opus-4-6-oauth",
+        "fallback_models": ["gemini-3-flash"],
+    }
+
+    async def _resolve(_cfg, _uid, model_name, *_args, **_kwargs):
+        if model_name in (None, "claude-opus-4-6-oauth"):
+            from src.server.services.llm.availability import raise_oauth_reauth_required
+
+            raise_oauth_reauth_required(
+                SUBSCRIPTIONS["claude-oauth"], "claude-opus-4-6-oauth", "invalid_grant"
+            )
+        return _make_ptc_agent_config(str(model_name))
+
+    class _Catalog:
+        llm_config = {
+            "claude-opus-4-6-oauth": {"provider": "claude-oauth"},
+            "gemini-3-flash": {"provider": "google"},
+        }
+
+        def get_model_config(self, name: str):
+            return self.llm_config.get(name)
+
+    async def _classify(_uid: str, name: str, _pref_cache=None):
+        providers = {
+            "claude-opus-4-6-oauth": "claude-oauth",
+            "gemini-3-flash": "google",
+        }
+        if name in providers:
+            return user_models.ModelSource.SYSTEM, {"provider": providers[name]}
+        return user_models.ModelSource.UNKNOWN, {}
+
+    req = ChatRequest(
+        workspace_id=_WS,
+        messages=[ChatMessage(role="user", content="run check")],
+        llm_model=automation_llm_model,
+        origin=ThreadOrigin(type="automation", id=_AUTO_ID, name="Daily"),
+    )
+
+    with (
+        patch.object(
+            LLMFactory,
+            "get_model_config",
+            create_autospec(LLMFactory.get_model_config, return_value=_Catalog()),
+        ),
+        patch.object(
+            user_models,
+            "classify_model",
+            create_autospec(user_models.classify_model, side_effect=_classify),
+        ),
+        patch.object(
+            fb_mod.user_models,
+            "get_model_preference",
+            create_autospec(user_models.get_model_preference, return_value=prefs),
+        ),
+        patch.object(
+            fb_mod,
+            "model_resolves",
+            create_autospec(fb_mod.model_resolves, return_value=True),
+        ),
+    ):
+        executed_sql = await _drive_automation_ptc_through_begin_run(
+            request=req,
+            run_metadata={"automation_execution_id": _EXEC_1, "automation_id": _AUTO_ID},
+            resolve_fn=_resolve,
+            thread_rows=thread_rows,
+            turn_index=0,
+        )
+
+    assert thread_rows[_THREAD]["llm_model"] is None
+    assert executed_sql == []
+
+
+@pytest.mark.asyncio
+async def test_pinned_continuation_thread_nonzero_turn_never_writes_model():
+    """Subsequent automation runs reusing a pinned thread (turn_index > 0) never write llm_model."""
+    thread_rows = {_THREAD: {"llm_model": None}}
+
+    async def _resolve(_cfg, _uid, _model_name, *_args, **_kwargs):
+        return _make_ptc_agent_config("gpt-6.1-sol-oauth")
+
+    req = ChatRequest(
+        workspace_id=_WS,
+        messages=[ChatMessage(role="user", content="run check")],
+        llm_model="gpt-6.1-sol-oauth",
+        origin=ThreadOrigin(type="automation", id=_AUTO_ID, name="Daily"),
+    )
+    executed_sql = await _drive_automation_ptc_through_begin_run(
+        request=req,
+        run_metadata={"automation_execution_id": _EXEC_1, "automation_id": _AUTO_ID},
+        resolve_fn=_resolve,
+        thread_rows=thread_rows,
+        turn_index=1,
+    )
+
+    assert executed_sql == []
+    assert thread_rows[_THREAD]["llm_model"] is None
+
+
+@pytest.mark.asyncio
+async def test_user_clearing_thread_model_is_not_overwritten_on_next_automation_run():
+    """After a user resets a pinned thread's llm_model to NULL, the next run leaves it NULL."""
+    thread_rows = {_THREAD: {"llm_model": None}}
+
+    async def _resolve(_cfg, _uid, _model_name, *_args, **_kwargs):
+        return _make_ptc_agent_config("gpt-6.1-sol-oauth")
+
+    req = ChatRequest(
+        workspace_id=_WS,
+        messages=[ChatMessage(role="user", content="run check")],
+        llm_model="gpt-6.1-sol-oauth",
+        origin=ThreadOrigin(type="automation", id=_AUTO_ID, name="Daily"),
+    )
+
+    # First run opens the thread (turn_index=0) and remembers the model.
+    sql_first = await _drive_automation_ptc_through_begin_run(
+        request=req,
+        run_metadata={"automation_execution_id": _EXEC_1, "automation_id": _AUTO_ID},
+        resolve_fn=_resolve,
+        thread_rows=thread_rows,
+        turn_index=0,
+    )
+    assert len(sql_first) == 1
+    assert thread_rows[_THREAD]["llm_model"] == "gpt-6.1-sol-oauth"
+
+    # User clears llm_model back to account default (NULL).
+    thread_rows[_THREAD]["llm_model"] = None
+
+    # Next execution on the same pinned thread (turn_index=1) must not re-write it.
+    sql_next = await _drive_automation_ptc_through_begin_run(
+        request=req,
+        run_metadata={"automation_execution_id": _EXEC_2, "automation_id": _AUTO_ID},
+        resolve_fn=_resolve,
+        thread_rows=thread_rows,
+        turn_index=1,
+    )
+    assert sql_next == []
+    assert thread_rows[_THREAD]["llm_model"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "run_metadata",
+    [{}, {"automation_execution_id": "   "}],
+    ids=["missing-execution-id", "blank-execution-id"],
+)
+async def test_automation_origin_without_execution_id_never_writes_model(
+    run_metadata: dict,
+):
+    """origin.type='automation' alone without automation_execution_id never persists llm_model."""
+    thread_rows = {_THREAD: {"llm_model": None}}
+
+    async def _resolve(_cfg, _uid, _model_name, *_args, **_kwargs):
+        return _make_ptc_agent_config("gpt-6.1-sol-oauth")
+
+    req = ChatRequest(
+        workspace_id=_WS,
+        messages=[ChatMessage(role="user", content="run check")],
+        llm_model="gpt-6.1-sol-oauth",
+        origin=ThreadOrigin(type="automation", id=_AUTO_ID, name="Daily"),
+    )
+    executed_sql = await _drive_automation_ptc_through_begin_run(
+        request=req,
+        run_metadata=run_metadata,
+        resolve_fn=_resolve,
+        thread_rows=thread_rows,
+        turn_index=0,
+    )
+
+    assert executed_sql == []
+    assert thread_rows[_THREAD]["llm_model"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "strategy",
+    ["continue", "pinned", "", None],
+    ids=["continue-strategy", "pinned-strategy", "empty-strategy", "missing-strategy"],
+)
+async def test_reusing_precreated_empty_thread_at_turn_zero_never_writes_model(
+    strategy: str | None,
+):
+    """Automation reusing a pre-created empty thread (turn_index=0, llm_model=NULL)
+    under any non-'new' thread_strategy never persists llm_model."""
+    thread_rows = {_THREAD: {"llm_model": None}}
+    exec_rows = (
+        {}
+        if strategy is None
+        else {
+            _EXEC_1: {
+                "automation_execution_id": _EXEC_1,
+                "automation_id": _AUTO_ID,
+                "user_id": _USER,
+                "conversation_thread_id": _THREAD,
+                "thread_strategy": strategy,
+            }
+        }
+    )
+
+    async def _resolve(_cfg, _uid, _model_name, *_args, **_kwargs):
+        return _make_ptc_agent_config("gpt-6.1-sol-oauth")
+
+    req = ChatRequest(
+        workspace_id=_WS,
+        messages=[ChatMessage(role="user", content="run check")],
+        llm_model="gpt-6.1-sol-oauth",
+        origin=ThreadOrigin(type="automation", id=_AUTO_ID, name="Daily"),
+    )
+    executed_sql = await _drive_automation_ptc_through_begin_run(
+        request=req,
+        run_metadata={"automation_execution_id": _EXEC_1, "automation_id": _AUTO_ID},
+        resolve_fn=_resolve,
+        thread_rows=thread_rows,
+        turn_index=0,
+        execution_rows=exec_rows,
+    )
+
+    assert executed_sql == []
+    assert thread_rows[_THREAD]["llm_model"] is None
+
+
+@pytest.mark.asyncio
+async def test_precreated_empty_thread_end_to_end_via_executor_continue_strategy_leaves_llm_model_null():
+    """Pre-created empty thread pinned to a thread_strategy='continue' automation gets turn_index=0
+    when AutomationExecutor drives astream_ptc_workflow, yet conversation_threads.llm_model stays NULL."""
+    from src.dalton.autonomy import preflight as dalton_preflight
+    from src.dalton.database import automation_recycle
+    from src.server.database import conversation as qr_db
+    from src.server.services import account as account_svc
+    from src.server.services import automation_delivery
+    from src.server.services import automation_computer_wait
+    from src.server.services import automation_executor as exec_mod
+    from src.server.services.automation_executor import AutomationExecutor
+    from src.server.services.turn_runtime import TurnRoute
+
+    thread_rows = {_THREAD: {"llm_model": None}}
+    exec_rows = {
+        _EXEC_1: {
+            "automation_execution_id": _EXEC_1,
+            "automation_id": _AUTO_ID,
+            "user_id": _USER,
+            "conversation_thread_id": _THREAD,
+            "thread_strategy": "continue",
+        }
+    }
+
+    async def _resolve(_cfg, _uid, _model_name, *_args, **_kwargs):
+        return _make_ptc_agent_config("gpt-6.1-sol-oauth")
+
+    captured_calls: list[dict] = []
+
+    async def _run_ptc_turn(**kwargs):
+        captured_calls.append(kwargs)
+        await _drive_automation_ptc_through_begin_run(
+            request=kwargs["request"],
+            run_metadata=kwargs["run_metadata"],
+            resolve_fn=_resolve,
+            thread_rows=thread_rows,
+            turn_index=0,
+            execution_rows=exec_rows,
+        )
+        return
+        yield  # pragma: no cover
+
+    automation = {
+        "automation_id": _AUTO_ID,
+        "user_id": _USER,
+        "name": "Pinned Empty Thread Task",
+        "instruction": "run check",
+        "workspace_id": _WS,
+        "llm_model": "gpt-6.1-sol-oauth",
+        "thread_strategy": "continue",
+        "conversation_thread_id": _THREAD,
+    }
+    place_ws = {"workspace_id": _WS, "user_id": _USER, "status": "running"}
+    route = TurnRoute(_WS, "analyst", _USER)
+
+    with (
+        patch.object(
+            exec_mod.exec_db,
+            "begin_execution_if_not_deleted",
+            create_autospec(
+                exec_db.begin_execution_if_not_deleted,
+                return_value={"automation_execution_id": _EXEC_1},
+            ),
+        ),
+        patch.object(
+            exec_mod,
+            "late_note",
+            create_autospec(automation_computer_wait.late_note, return_value=None),
+        ),
+        patch.object(
+            account_svc,
+            "read_standing",
+            create_autospec(
+                account_svc.read_standing,
+                return_value=SimpleNamespace(refuse_if_suspended=lambda: None),
+            ),
+        ),
+        patch.object(
+            exec_mod,
+            "_thread_busy",
+            create_autospec(exec_mod._thread_busy, return_value=False),
+        ),
+        patch.object(
+            exec_mod,
+            "_stored_workspace",
+            create_autospec(exec_mod._stored_workspace, return_value=place_ws),
+        ),
+        patch.object(
+            qr_db,
+            "get_thread_auth_meta",
+            create_autospec(
+                qr_db.get_thread_auth_meta,
+                return_value={"workspace_id": _WS, "user_id": _USER},
+            ),
+        ),
+        patch.object(
+            exec_mod,
+            "park_for_computer",
+            create_autospec(automation_computer_wait.park_for_computer, return_value=False),
+        ),
+        patch.object(
+            dalton_preflight,
+            "is_dalton_automation",
+            create_autospec(dalton_preflight.is_dalton_automation, return_value=False),
+        ),
+        patch.object(
+            dalton_preflight,
+            "decide",
+            create_autospec(dalton_preflight.decide, return_value=None),
+        ),
+        patch.object(
+            exec_mod,
+            "_credentials",
+            create_autospec(exec_mod._credentials, return_value=(False, True)),
+        ),
+        patch.object(
+            exec_mod,
+            "enforce_credit_limit",
+            create_autospec(exec_mod.enforce_credit_limit, return_value=None),
+        ),
+        patch.object(
+            TurnRoute,
+            "bind",
+            create_autospec(TurnRoute.bind, return_value=route),
+        ),
+        patch.object(
+            exec_mod.exec_db,
+            "transition_execution",
+            create_autospec(exec_db.transition_execution, return_value={"status": "running"}),
+        ),
+        patch.object(
+            automation_recycle,
+            "automation_is_soft_deleted",
+            create_autospec(automation_recycle.automation_is_soft_deleted, return_value=False),
+        ),
+        patch.object(
+            automation_delivery,
+            "start_run",
+            create_autospec(automation_delivery.start_run, return_value=None),
+        ),
+        patch.object(
+            exec_mod.tl_db,
+            "get_run",
+            create_autospec(
+                exec_mod.tl_db.get_run,
+                return_value={"run_id": _RUN_0, "status": "completed", "metadata": {}},
+            ),
+        ),
+        patch(
+            "src.server.handlers.chat.astream_ptc_workflow",
+            side_effect=lambda **kw: _run_ptc_turn(**kw),
+        ),
+    ):
+        await AutomationExecutor().execute(automation, _EXEC_1)
+
+    assert len(captured_calls) == 1
+    assert captured_calls[0]["thread_id"] == _THREAD
+    assert thread_rows[_THREAD]["llm_model"] is None
+
+
+def test_resolve_automation_thread_model_to_remember_requires_new_strategy():
+    """resolve_automation_thread_model_to_remember only returns a model when thread_strategy=='new'."""
+    req = ChatRequest(
+        workspace_id=_WS,
+        messages=[ChatMessage(role="user", content="run check")],
+        llm_model="gpt-6.1-sol-oauth",
+        origin=ThreadOrigin(type="automation", id=_AUTO_ID, name="Daily"),
+    )
+    meta = {"automation_execution_id": _EXEC_1, "automation_id": _AUTO_ID}
+    assert (
+        automation_thread_model.resolve_automation_thread_model_to_remember(
+            request=req,
+            effective_model="gpt-6.1-sol-oauth",
+            run_metadata=meta,
+            from_server=True,
+            is_shared=False,
+            turn_index=0,
+            thread_strategy="new",
+        )
+        == "gpt-6.1-sol-oauth"
+    )
+    for blocked in ("continue", "pinned", "", None):
+        assert (
+            automation_thread_model.resolve_automation_thread_model_to_remember(
+                request=req,
+                effective_model="gpt-6.1-sol-oauth",
+                run_metadata=meta,
+                from_server=True,
+                is_shared=False,
+                turn_index=0,
+                thread_strategy=blocked,
+            )
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_remember_automation_thread_model_logs_warning_on_db_error(caplog):
+    """DB persistence failure logs a warning and returns False without failing the turn."""
+    caplog.set_level(logging.WARNING, logger=automation_thread_model.logger.name)
+    req = ChatRequest(
+        workspace_id=_WS,
+        messages=[ChatMessage(role="user", content="run check")],
+        llm_model="gpt-6.1-sol-oauth",
+        origin=ThreadOrigin(type="automation", id=_AUTO_ID, name="Daily"),
+    )
+    get_exec_ok = create_autospec(
+        automation_thread_model._get_execution_by_id,
+        return_value={"automation_execution_id": _EXEC_1, "thread_strategy": "new"},
+    )
+    failing_fn = create_autospec(
+        automation_thread_model.remember_thread_llm_model_if_unset,
+        side_effect=RuntimeError("db write failed"),
+    )
+    with (
+        patch.object(automation_thread_model, "_get_execution_by_id", get_exec_ok),
+        patch.object(
+            automation_thread_model, "remember_thread_llm_model_if_unset", failing_fn
+        ),
+    ):
+        saved = await automation_thread_model.remember_automation_thread_model(
+            thread_id=_THREAD,
+            request=req,
+            effective_model="gpt-6.1-sol-oauth",
+            run_metadata={"automation_execution_id": _EXEC_1},
+            from_server=True,
+            is_shared=False,
+            turn_index=0,
+        )
+
+    assert saved is False
+    assert any(
+        rec.levelno == logging.WARNING and "Failed persisting model" in rec.message
+        for rec in caplog.records
+    )
+
+    caplog.clear()
+    failing_lookup = create_autospec(
+        automation_thread_model._get_execution_by_id,
+        side_effect=RuntimeError("db lookup failed"),
+    )
+    with patch.object(
+        automation_thread_model, "_get_execution_by_id", failing_lookup
+    ):
+        saved_lookup_err = await automation_thread_model.remember_automation_thread_model(
+            thread_id=_THREAD,
+            request=req,
+            effective_model="gpt-6.1-sol-oauth",
+            run_metadata={"automation_execution_id": _EXEC_1},
+            from_server=True,
+            is_shared=False,
+            turn_index=0,
+        )
+
+    assert saved_lookup_err is False
+    assert any(
+        rec.levelno == logging.WARNING and "Failed reading thread_strategy" in rec.message
+        for rec in caplog.records
+    )

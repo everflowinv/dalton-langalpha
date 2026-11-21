@@ -20,6 +20,8 @@ import { cn } from '@/lib/utils';
 import { QUIET_LINK, connectedProviders, useProviderPick, type LocationState, type ProviderList } from './connectStep/shared';
 import { useAccount } from '@/hooks/useAccount';
 import { allows, RULE } from '@/lib/accountRules';
+// DALTON-HOOK(dalton-setup): hide Claude Code option in Dalton builds
+import { isDaltonBuild } from '@/config/brand';
 
 // ---------------------------------------------------------------------------
 // ProviderStep — Step 2: the provider, as Settings lists them
@@ -50,7 +52,8 @@ export default function ProviderStep() {
   );
   const { connected, goOn, pickKeyGroup } = useProviderPick({ configured: configuredSet, answering });
   const [filter, setFilter] = useState<KeyFilter>(NO_FILTER);
-  const { setup: claudeCode, unread: claudeCodeUnread } = useClaudeCodeSetup({ enabled: list === 'oauth' && !answering });
+  // DALTON-HOOK(dalton-setup): disable Claude Code probe in Dalton builds
+  const { setup: claudeCode, unread: claudeCodeUnread } = useClaudeCodeSetup({ enabled: !isDaltonBuild && list === 'oauth' && !answering });
 
   // The user's own providers, which the key method also offers.
   const userCustomProviders = useMemo(() => {
@@ -119,7 +122,8 @@ export default function ProviderStep() {
             onPickSignIn={(p) => goOn({ method: 'oauth', list: 'oauth', provider: p, displayName: t(`modelAccess.${subscriptionKey(p)}.name`), modelsFrom: p })}
             onPickPlan={pickKeyGroup('oauth')}
             claudeSignIn={!answering}
-            claudeCode={answering ? undefined : claudeCodeChoice(claudeCode, claudeCodeUnread, () => navigate('/setup/claude-code'))}
+            // DALTON-HOOK(dalton-setup): omit Claude Code from OAuth provider choices
+            claudeCode={isDaltonBuild || answering ? undefined : claudeCodeChoice(claudeCode, claudeCodeUnread, () => navigate('/setup/claude-code'))}
           />
         )}
 

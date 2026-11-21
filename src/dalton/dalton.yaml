@@ -108,12 +108,11 @@ publish:
     - "gemini-4-argon-high-oauth"
     - "grok-4.7-oauth"
     - "claude-opus-5-5-oauth"
-  # Number audit (check_draft / publish). Measured on a 48k-character initial
-  # coverage draft (27 batches): argon-medium 139s with no failed batch and the
-  # best agreement with the other two; the OpenClaw-relayed 3.8 flash failed 24.
-  audit_model: "gemini-4-argon-medium-oauth"
+  # Number audit (check_draft / publish). User decision 2026-11-21: neon-medium
+  # (was argon-medium, chosen 2026-10 on a 48k-character coverage draft benchmark).
+  audit_model: "gemini-4-neon-medium-oauth"
   # Language review (check_language). Empty = fall back to audit_model above, so
-  # the effective default stays argon-medium without repeating the key here.
+  # the effective default stays neon-medium without repeating the key here.
   language_model: ""
   audit_fallback_models:
     - "gpt-6.2-sol-oauth"

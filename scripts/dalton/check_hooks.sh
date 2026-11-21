@@ -73,6 +73,7 @@ ALLOWED_HOOKS=(
   # Dalton hides getting-started tasks it does not offer (the desktop app
   # download); the checklist count and progress ring follow DEPLOYED_TASKS.
   "onboarding-tasks"
+  "dalton-setup"
   "dalton-auth"
   "home-workspace-alias"
   "team-sharing"
@@ -416,7 +417,9 @@ ALLOWED_HOOKS=(
   # and missing-config warnings / prompt guidance.
   "report-delivery"
   # Notification turns without an explicit model inherit the running automation
-  # execution's model in messaging.py without writing conversation_threads.llm_model.
+  # execution's model in messaging.py; automation executor turns persist their
+  # actual model onto conversation_threads.llm_model on turn 0 when NULL and
+  # thread_strategy == 'new' (skipping fallback turns).
   "automation-thread-model"
   # Codex client version comes from src/dalton/settings.py (newer than the manifest's)
   # so the ChatGPT subscription lists new models (GPT-6.2 needs >= 0.170.0).
@@ -425,7 +428,8 @@ ALLOWED_HOOKS=(
   # fallback model knows which model this call runs on and which designated model
   # in the frozen <model> baseline it stands in for (main agent and subagent).
   "model-fallback-identity"
-  # Firecrawl budget: skip stealth re-escalation after auto and keep 402 credit-exhaustion notice.
+  # Firecrawl budget: skip stealth re-escalation after auto, keep 402 credit-exhaustion notice,
+  # and support multi-key primary/backup failover with Redis cooldown tracking.
   "firecrawl-budget"
   "chat-attachment-count"
   # Coverage units phase 1 (d041): soft-delete mutex against active unit bind.
@@ -441,6 +445,16 @@ ALLOWED_HOOKS=(
   "antigravity-json-nan"
   # Company workspace deduplication before create (REST, manage_workspaces, web modal, CoS prompt).
   "workspace-dedup"
+  # Agent-triggered current-thread model switch (switch_thread_model Dalton tool
+  # and extracted switch_thread_model service shared with PATCH /threads/{id}).
+  "agent-switch-model"
+  # Preserve server-written dalton_historical_duplicate_of marker in
+  # SERVER_OWNED_CONFIG_KEYS across whole-config replacements (workspace.py).
+  "historical-duplicate-marker"
+  # SYNC10 (#831): deployment kill switch for the built-in browser — skips
+  # browser_runtime / agent-browser wrapper uploads, browser-quality sync &
+  # endpoint, browser_available, and default sandbox image agent-browser install.
+  "browser-kill-switch"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
@@ -519,6 +533,10 @@ AUDIT_EXEMPT_FILES = {
     # Same class as zh-CN.json: pure locale JSON, no inline markers possible.
     # Dalton's copy here is the "研究总监" wording for the CoS (B8).
     "web/src/locales/intros/zh-CN.json",
+    # Pure locale JSON for Mac first-run copy (brand interpolation {{brand}});
+    # same class as en-US.json / zh-CN.json.
+    "web/src/locales/thisMacFirstRun/en-US.json",
+    "web/src/locales/thisMacFirstRun/zh-CN.json",
     # B9 r2: asserts Dalton's OAuth routes win over the upstream {key}
     # wildcard by registration order (setup.py include order); a test file,
     # no inline markers.

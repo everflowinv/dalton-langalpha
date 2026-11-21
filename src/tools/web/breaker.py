@@ -141,3 +141,13 @@ class CircuitBreaker:
 
     def is_open(self) -> bool:
         return self.state == CircuitState.OPEN
+
+    # DALTON-HOOK(firecrawl-budget): reset breaker when a cooled-down API key recovers.
+    async def reset(self) -> None:
+        async with self._lock:
+            self.state = CircuitState.CLOSED
+            self.failure_count = 0
+            self.success_count = 0
+            self._consecutive_opens = 0
+            self.recovery_timeout = self._base_recovery_timeout
+            self._failure_reasons.clear()

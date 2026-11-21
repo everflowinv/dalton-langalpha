@@ -1,5 +1,7 @@
 import { isPlatformMode } from '@/config/hostMode';
 import { isDesktopShell } from '@/lib/desktop';
+// DALTON-HOOK(onboarding-tasks): Dalton build check
+import { isDaltonBuild } from '@/config/brand';
 import { PAGE_INTROS } from './pageIntros';
 import { GETTING_STARTED_TASKS } from './gettingStarted';
 import type { GettingStartedTaskDef, PageIntroDef } from './types';
@@ -15,9 +17,10 @@ export * from './types';
  */
 export const DEPLOYED_TASKS: GettingStartedTaskDef[] = GETTING_STARTED_TASKS.filter(
   (t) =>
-    // DALTON-HOOK(onboarding-tasks): Dalton does not ship the desktop app, so
-    // its download task is hidden; the count and progress ring follow.
+    // DALTON-HOOK(onboarding-tasks): Dalton does not ship the desktop app or
+    // Remote control for this Mac, so both are hidden; progress follows DEPLOYED_TASKS.
     t.id !== 'desktopApp' &&
+    (!isDaltonBuild || t.id !== 'remoteControl') &&
     // DALTON-HOOK(help): omit tasks whose target URL is null in this build
     t.to !== null &&
     (!t.platformOnly || isPlatformMode) &&
@@ -30,6 +33,7 @@ export const DEPLOYED_TASKS: GettingStartedTaskDef[] = GETTING_STARTED_TASKS.fil
 export const DEPLOYED_INTROS: PageIntroDef[] = PAGE_INTROS.map(
   ({ steps: [first, ...rest], ...intro }) => ({
     ...intro,
-    steps: [first, ...rest.filter((s) => !s.platformOnly || isPlatformMode)],
+    // DALTON-HOOK(onboarding-tasks): drop platform-only and Dalton-hidden intro steps
+    steps: [first, ...rest.filter((s) => (!s.platformOnly || isPlatformMode) && (!s.hideInDalton || !isDaltonBuild))],
   })
 );

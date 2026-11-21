@@ -8,10 +8,16 @@ native param ("auto" | "stealth") comes from the manifest level — the
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import math
 import os
-from typing import Any, Dict, List, Optional
+import time
+from collections import OrderedDict
+from contextvars import ContextVar
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 
@@ -22,7 +28,10 @@ from src.tools.web.providers._shared import (
     error_response,
     is_empty_markdown,
     missing_key_error,
+    redact_request_headers,
     request_json,
+    # DALTON-HOOK(firecrawl-budget): multi-key failover
+    sanitize_httpx_error,
 )
 from src.tools.web.types import (
     CrawlJob,
@@ -48,6 +57,338 @@ _MAX_STATUS_PAGES = 20  # crawl-status pagination hop cap (crawls are ≤100 pag
 # Firecrawl's maxAge defaults to 2 DAYS when omitted; bound provider-cache
 # staleness to WebFetch's own Redis cache window instead.
 _DEFAULT_MAX_AGE_SECONDS = 900
+
+# DALTON-HOOK(firecrawl-budget): multi-key primary/backup failover & cooldown constants.
+_DEFAULT_COOLDOWN_SECONDS = 24 * 60 * 60
+_MISSING_BALANCE_COOLDOWN_SECONDS = 60 * 60
+_EXPIRED_RESET_COOLDOWN_SECONDS = 5 * 60
+_COOLDOWN_REDIS_PREFIX = "firecrawl:key_cooldown:"
+_CRAWL_KEY_REDIS_PREFIX = "firecrawl:crawl_key:"
+_CRAWL_KEY_TTL_SECONDS = 24 * 60 * 60
+_MAX_INMEM_CRAWL_KEYS = 1024
+
+_INMEM_COOLDOWNS: Dict[str, Dict[str, Any]] = {}
+_INMEM_CRAWL_KEYS: "OrderedDict[str, str]" = OrderedDict()
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
+# Atomic compare-and-set: keep whichever cooldown_until is later so an in-flight
+# worker with a shorter fallback cannot overwrite a longer explicit resets_at.
+_EXTEND_COOLDOWN_LUA = """
+local kept = redis.call('get', KEYS[1])
+if kept then
+  local ok, t = pcall(cjson.decode, kept)
+  if ok and type(t) == 'table' and tonumber(t.cooldown_until) and tonumber(t.cooldown_until) >= tonumber(ARGV[3]) then
+    return kept
+  end
+end
+redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return nil
+"""
+
+_last_request_key_fp: ContextVar[Optional[str]] = ContextVar(
+    "_last_request_key_fp", default=None
+)
+_pinned_request_key_fp: ContextVar[Optional[str]] = ContextVar(
+    "_pinned_request_key_fp", default=None
+)
+
+
+def load_firecrawl_api_keys() -> List[str]:
+    """Load Firecrawl API keys in priority order: FIRECRAWL_API_KEY, then
+    FIRECRAWL_API_KEY_2, FIRECRAWL_API_KEY_3, ... stopping at the first gap."""
+    keys: List[str] = []
+    first = (os.getenv("FIRECRAWL_API_KEY") or "").strip()
+    if not first:
+        return keys
+    keys.append(first)
+    idx = 2
+    while True:
+        nxt = (os.getenv(f"FIRECRAWL_API_KEY_{idx}") or "").strip()
+        if not nxt:
+            break
+        keys.append(nxt)
+        idx += 1
+    return list(dict.fromkeys(keys))
+
+
+def _key_fingerprint(api_key: str) -> str:
+    """Short non-reversible fingerprint (12-char SHA-256 hex prefix) for logs & Redis."""
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+
+
+def _sanitize_http_error(
+    err: httpx.HTTPError, api_keys: Sequence[str] = ()
+) -> httpx.HTTPError:
+    """Return a newly built httpx error whose request headers and message contain no raw keys."""
+    return sanitize_httpx_error(err, scrub_values=api_keys)
+
+
+def _format_utc_iso(ts: float) -> str:
+    return (
+        datetime.fromtimestamp(ts, tz=timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _compute_cooldown_until(
+    resets_at: Optional[str],
+    now: Optional[float] = None,
+    *,
+    remaining: Optional[float] = None,
+) -> float:
+    """Resolve cooldown deadline from ISO ``resets_at`` and ``remaining`` credits.
+
+    - Future timestamp -> cool down until ``resets_at``.
+    - Already-passed timestamp -> short cooldown (``_EXPIRED_RESET_COOLDOWN_SECONDS``).
+    - Missing or unparseable:
+      - explicit ``remaining <= 0`` -> 24h fallback (``_DEFAULT_COOLDOWN_SECONDS``).
+      - missing ``remaining`` -> 1h fallback (``_MISSING_BALANCE_COOLDOWN_SECONDS``).
+    """
+    current = time.time() if now is None else now
+    if resets_at:
+        try:
+            dt = datetime.fromisoformat(resets_at)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            target = dt.timestamp()
+            if target > current:
+                return target
+            return current + _EXPIRED_RESET_COOLDOWN_SECONDS
+        except ValueError:
+            pass
+    if remaining is not None and remaining <= 0:
+        return current + _DEFAULT_COOLDOWN_SECONDS
+    return current + _MISSING_BALANCE_COOLDOWN_SECONDS
+
+
+def _get_ready_redis_cache():
+    try:
+        from src.utils.cache.redis_cache import get_cache_client
+
+        cache = get_cache_client()
+        if cache.enabled and cache.client:
+            return cache
+    except Exception:
+        logger.debug("Redis cache unavailable for Firecrawl key state", exc_info=True)
+    return None
+
+
+def _merge_local_cooldown(fp: str, candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep whichever cooldown entry for ``fp`` has the later ``cooldown_until``."""
+    existing = _INMEM_COOLDOWNS.get(fp)
+    if existing is not None:
+        existing_until = float(existing.get("cooldown_until", 0) or 0)
+        candidate_until = float(candidate.get("cooldown_until", 0) or 0)
+        if existing_until >= candidate_until:
+            return existing
+    _INMEM_COOLDOWNS[fp] = candidate
+    return candidate
+
+
+async def _get_key_cooldown(fp: str) -> Optional[Dict[str, Any]]:
+    """Return active cooldown payload for key fingerprint ``fp`` by merging Redis and local state."""
+    now = time.time()
+    local_entry = _INMEM_COOLDOWNS.get(fp)
+    if local_entry is not None and float(local_entry.get("cooldown_until", 0) or 0) <= now:
+        _INMEM_COOLDOWNS.pop(fp, None)
+        local_entry = None
+
+    redis_entry: Optional[Dict[str, Any]] = None
+    redis_key = f"{_COOLDOWN_REDIS_PREFIX}{fp}"
+    cache = _get_ready_redis_cache()
+    if cache is not None:
+        try:
+            read_fn = getattr(cache, "get_strict", None) or cache.get
+            data = await read_fn(redis_key)
+            if isinstance(data, dict) and float(data.get("cooldown_until", 0) or 0) > now:
+                redis_entry = data
+        except Exception:
+            logger.debug(
+                "Redis read failed for Firecrawl cooldown fp=%s; using local record",
+                fp,
+                exc_info=True,
+            )
+
+    if local_entry is not None and redis_entry is not None:
+        best = max(
+            (local_entry, redis_entry),
+            key=lambda item: float(item.get("cooldown_until", 0) or 0),
+        )
+    else:
+        best = redis_entry or local_entry
+    if best is not None:
+        _INMEM_COOLDOWNS[fp] = best
+    return best
+
+
+async def _mark_key_cooldown(
+    fp: str, *, resets_at: Optional[str] = None, remaining: Optional[float] = None
+) -> Dict[str, Any]:
+    """Record cooldown for key fingerprint ``fp`` in local memory and Redis, keeping the later deadline."""
+    now = time.time()
+    until = _compute_cooldown_until(resets_at, now, remaining=remaining)
+    payload: Dict[str, Any] = {
+        "fingerprint": fp,
+        "cooldown_until": until,
+        "resets_at": resets_at,
+        "marked_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+        "reason": "insufficient_credits",
+    }
+    effective = _merge_local_cooldown(fp, payload)
+    effective_until = float(effective.get("cooldown_until", until) or until)
+    ttl = max(1, math.ceil(effective_until - now))
+    redis_key = f"{_COOLDOWN_REDIS_PREFIX}{fp}"
+    cache = _get_ready_redis_cache()
+    if cache is not None:
+        try:
+            eval_fn = getattr(cache.client, "eval", None)
+            if callable(eval_fn):
+                kept_raw = await eval_fn(
+                    _EXTEND_COOLDOWN_LUA,
+                    1,
+                    redis_key,
+                    json.dumps(effective, ensure_ascii=False),
+                    ttl,
+                    repr(effective_until),
+                )
+                if isinstance(kept_raw, (bytes, bytearray)):
+                    kept_raw = kept_raw.decode("utf-8")
+                if isinstance(kept_raw, str) and kept_raw:
+                    try:
+                        kept_data = json.loads(kept_raw)
+                        if isinstance(kept_data, dict):
+                            effective = _merge_local_cooldown(fp, kept_data)
+                    except ValueError:
+                        pass
+                elif isinstance(kept_raw, dict):
+                    effective = _merge_local_cooldown(fp, kept_raw)
+            else:
+                read_fn = getattr(cache, "get_strict", None) or cache.get
+                existing_data = await read_fn(redis_key)
+                if (
+                    isinstance(existing_data, dict)
+                    and float(existing_data.get("cooldown_until", 0) or 0) >= effective_until
+                ):
+                    effective = _merge_local_cooldown(fp, existing_data)
+                else:
+                    ok = bool(await cache.set(redis_key, effective, ttl=ttl))
+                    if not ok:
+                        logger.warning(
+                            "Redis set returned False for Firecrawl cooldown fp=%s; kept local record",
+                            fp,
+                        )
+        except Exception:
+            logger.warning(
+                "Redis write failed for Firecrawl cooldown fp=%s; kept local record",
+                fp,
+                exc_info=True,
+            )
+    return effective
+
+
+def _cache_crawl_key_in_memory(crawl_id: str, fp: str) -> None:
+    _INMEM_CRAWL_KEYS[crawl_id] = fp
+    _INMEM_CRAWL_KEYS.move_to_end(crawl_id)
+    while len(_INMEM_CRAWL_KEYS) > _MAX_INMEM_CRAWL_KEYS:
+        _INMEM_CRAWL_KEYS.popitem(last=False)
+
+
+async def _write_crawl_key_to_redis(crawl_id: str, fp: str) -> None:
+    cache = _get_ready_redis_cache()
+    if cache is None:
+        return
+    try:
+        ok = bool(
+            await cache.set(
+                f"{_CRAWL_KEY_REDIS_PREFIX}{crawl_id}",
+                {"fingerprint": fp},
+                ttl=_CRAWL_KEY_TTL_SECONDS,
+            )
+        )
+        if not ok:
+            logger.warning(
+                "Redis set returned False for Firecrawl crawl key map crawl_id=%s fp=%s",
+                crawl_id,
+                fp,
+            )
+    except Exception:
+        logger.warning(
+            "Redis write failed for Firecrawl crawl key map crawl_id=%s fp=%s",
+            crawl_id,
+            fp,
+            exc_info=True,
+        )
+
+
+def _schedule_crawl_key_record(crawl_id: str, fp: str) -> None:
+    """Record ``crawl_id -> fp`` locally at once and persist to Redis asynchronously."""
+    if not crawl_id or not fp:
+        return
+    _cache_crawl_key_in_memory(crawl_id, fp)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(_write_crawl_key_to_redis(crawl_id, fp))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+async def _get_crawl_key(crawl_id: str) -> Optional[str]:
+    """Look up the originating key fingerprint for ``crawl_id``."""
+    if not crawl_id:
+        return None
+    fp = _INMEM_CRAWL_KEYS.get(crawl_id)
+    if fp:
+        return fp
+    cache = _get_ready_redis_cache()
+    if cache is not None:
+        try:
+            read_fn = getattr(cache, "get_strict", None) or cache.get
+            data = await read_fn(f"{_CRAWL_KEY_REDIS_PREFIX}{crawl_id}")
+            if isinstance(data, dict) and isinstance(data.get("fingerprint"), str):
+                fp = data["fingerprint"]
+                _cache_crawl_key_in_memory(crawl_id, fp)
+                return fp
+        except Exception:
+            logger.warning(
+                "Redis read failed for Firecrawl crawl key map crawl_id=%s",
+                crawl_id,
+                exc_info=True,
+            )
+    return None
+
+
+def _earliest_reset_display(cooldowns: Sequence[Dict[str, Any]]) -> Optional[str]:
+    if not cooldowns:
+        return None
+    earliest = min(cooldowns, key=lambda cd: float(cd.get("cooldown_until", 0) or 0))
+    until = float(earliest.get("cooldown_until", 0) or 0)
+    if until <= 0:
+        return None
+    return _format_utc_iso(until)
+
+
+async def get_firecrawl_pool_cooldown_state(
+    api_keys: Optional[Sequence[str]] = None,
+) -> Tuple[bool, Optional[str]]:
+    """Return ``(all_in_cooldown, earliest_resets_at)`` when multiple Firecrawl keys exist.
+
+    Single-key configs return ``(False, None)`` so existing router/breaker
+    behavior stays unchanged.
+    """
+    keys = list(api_keys) if api_keys is not None else load_firecrawl_api_keys()
+    if len(keys) <= 1:
+        return False, None
+    cooldowns: List[Dict[str, Any]] = []
+    for key in keys:
+        cd = await _get_key_cooldown(_key_fingerprint(key))
+        if cd is None:
+            return False, None
+        cooldowns.append(cd)
+    return True, _earliest_reset_display(cooldowns)
 
 
 # Firecrawl returns 408 for scrape-engine timeouts.
@@ -100,11 +441,11 @@ def _extract_remaining_credits(body: Any) -> Optional[float]:
     return None
 
 
-def _firecrawl_402_error(e: httpx.HTTPStatusError) -> Optional[WebError]:
-    from src.dalton.settings import is_dalton_enabled
-
-    if e.response.status_code != 402 or not is_dalton_enabled():
-        return None
+def _parse_402_credit_info(
+    e: httpx.HTTPStatusError,
+) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str], Optional[float]]:
+    if e.response.status_code != 402:
+        return False, None, None, None
     try:
         body = e.response.json()
     except ValueError:
@@ -129,44 +470,126 @@ def _firecrawl_402_error(e: httpx.HTTPStatusError) -> Optional[WebError]:
             )
         )
     if not is_insufficient:
-        return None
+        return False, body if isinstance(body, dict) else None, resets_at, None
     remaining = _extract_remaining_credits(body)
-    if remaining is not None and remaining > 0:
+    return True, body if isinstance(body, dict) else None, resets_at, remaining
+
+
+_PER_REQUEST_CREDIT_MARKERS = (
+    "to perform this request",
+    "for this request",
+    "perform this request",
+    "to perform this scrape",
+    "for this scrape",
+    "to perform this crawl",
+    "for this crawl",
+    "not enough credits for this",
+    "exceeds remaining credits",
+    "exceeds your remaining credits",
+)
+
+
+def _is_per_request_credit_error(body: Any, raw_text: str) -> bool:
+    candidates = [raw_text or ""]
+    if isinstance(body, dict):
+        err_val = body.get("error")
+        if isinstance(err_val, str):
+            candidates.append(err_val)
+        elif isinstance(err_val, dict) and isinstance(err_val.get("message"), str):
+            candidates.append(err_val["message"])
+        if isinstance(body.get("message"), str):
+            candidates.append(body["message"])
+    combined = " ".join(candidates).lower()
+    return any(marker in combined for marker in _PER_REQUEST_CREDIT_MARKERS)
+
+
+def _classify_402_credit_info(
+    e: httpx.HTTPStatusError,
+) -> Tuple[bool, bool, Optional[Dict[str, Any]], Optional[str], Optional[float]]:
+    is_insufficient, body, resets_at, remaining = _parse_402_credit_info(e)
+    if not is_insufficient:
+        return False, False, body, resets_at, None
+    is_per_request = (remaining is not None and remaining > 0) or (
+        remaining is None and _is_per_request_credit_error(body, e.response.text or "")
+    )
+    return True, is_per_request, body, resets_at, remaining
+
+
+def _firecrawl_402_error(
+    e: httpx.HTTPStatusError, *, multi_key: Optional[bool] = None
+) -> Optional[WebError]:
+    from src.dalton.settings import is_dalton_enabled
+
+    if e.response.status_code != 402 or not is_dalton_enabled():
+        return None
+    is_insufficient, is_per_request, body, resets_at, remaining = _classify_402_credit_info(e)
+    if not is_insufficient:
+        return None
+    is_multi = (len(load_firecrawl_api_keys()) > 1) if multi_key is None else multi_key
+
+    if not is_multi:
+        if remaining is not None and remaining > 0:
+            return WebError(
+                type=WebErrorType.BUDGET_EXCEEDED,
+                message="本次请求所需额度超过 Firecrawl 余额",
+                http_status=402,
+                retryable=True,
+                provider_fault=True,
+                native_kind="insufficient_credits_for_request",
+            )
+        if remaining is not None and remaining <= 0:
+            reset_display = resets_at or "下个计费周期"
+            return WebError(
+                type=WebErrorType.BUDGET_EXCEEDED,
+                message=f"Firecrawl 本月额度已用完，将于 {reset_display} 重置，请改用浏览器抓取",
+                http_status=402,
+                retryable=True,
+                provider_fault=True,
+                native_kind="insufficient_credits",
+            )
+        orig_err = body.get("error") if isinstance(body, dict) else None
+        raw_msg = (
+            orig_err.strip()
+            if isinstance(orig_err, str) and orig_err.strip()
+            else (e.response.text or "").strip() or "Insufficient credits"
+        )
         return WebError(
             type=WebErrorType.BUDGET_EXCEEDED,
-            message="本次请求所需额度超过 Firecrawl 余额",
+            message=f"Firecrawl 返回额度不足（402）：{clip_error(raw_msg)}",
             http_status=402,
             retryable=True,
             provider_fault=True,
+            native_kind="insufficient_credits_unknown",
+        )
+
+    if is_per_request:
+        return WebError(
+            type=WebErrorType.PROVIDER_ERROR,
+            message="本次请求所需额度超过账户余额",
+            http_status=402,
+            retryable=True,
+            provider_fault=False,
             native_kind="insufficient_credits_for_request",
         )
-    if remaining is not None and remaining <= 0:
-        reset_display = resets_at or "下个计费周期"
-        return WebError(
-            type=WebErrorType.BUDGET_EXCEEDED,
-            message=f"Firecrawl 本月额度已用完，将于 {reset_display} 重置，请改用浏览器抓取",
-            http_status=402,
-            retryable=True,
-            provider_fault=True,
-            native_kind="insufficient_credits",
+
+    cooldown_until_raw = body.get("cooldown_until") if isinstance(body, dict) else None
+    if isinstance(cooldown_until_raw, str) and cooldown_until_raw.strip():
+        until_display = cooldown_until_raw.strip()
+    else:
+        until_display = _format_utc_iso(
+            _compute_cooldown_until(resets_at, remaining=remaining)
         )
-    orig_err = body.get("error") if isinstance(body, dict) else None
-    raw_msg = (
-        orig_err.strip()
-        if isinstance(orig_err, str) and orig_err.strip()
-        else (e.response.text or "").strip() or "Insufficient credits"
-    )
     return WebError(
         type=WebErrorType.BUDGET_EXCEEDED,
-        message=f"Firecrawl 返回额度不足（402）：{clip_error(raw_msg)}",
+        message=f"Firecrawl 本月额度已用完，将于 {until_display} 重置，请改用浏览器抓取",
         http_status=402,
         retryable=True,
         provider_fault=True,
-        native_kind="insufficient_credits_unknown",
+        native_kind="insufficient_credits",
     )
 
 
-def _scrape_error(e: httpx.HTTPError) -> WebError:
+def _scrape_error(e: httpx.HTTPError, *, multi_key: Optional[bool] = None) -> WebError:
     """Map a failed /scrape call, which carries one URL.
 
     A 400 whose every complaint names the ``url`` field is Firecrawl refusing
@@ -175,7 +598,7 @@ def _scrape_error(e: httpx.HTTPError) -> WebError:
     provider-API failure is, since another provider's rules may differ.
     """
     if isinstance(e, httpx.HTTPStatusError):  # DALTON-HOOK(firecrawl-budget)
-        credit_err = _firecrawl_402_error(e)
+        credit_err = _firecrawl_402_error(e, multi_key=multi_key)
         if credit_err is not None:
             return credit_err
     if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 400:
@@ -238,13 +661,21 @@ class FirecrawlAPI:
     """Raw-httpx Firecrawl client. Key is read lazily so a missing
     FIRECRAWL_API_KEY surfaces as a per-call error, not a build crash."""
 
+    # DALTON-HOOK(firecrawl-budget): multi-key primary/backup failover in _request
+    # and crawl_id -> key fingerprint pinning for crawl_status / cancel_crawl.
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.getenv("FIRECRAWL_API_KEY")
-        if not self.api_key:
+        explicit = (api_key or "").strip()
+        self.api_keys: List[str] = [explicit] if explicit else load_firecrawl_api_keys()
+        if not self.api_keys:
             raise ValueError("FIRECRAWL_API_KEY not found in environment variables")
+        self.api_key = self.api_keys[0]
         self.base_url = os.getenv("FIRECRAWL_BASE_URL", _DEFAULT_BASE_URL).rstrip("/")
-        self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
+        self.headers = self._headers_for(self.api_key)
+
+    @staticmethod
+    def _headers_for(api_key: str) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
 
@@ -270,7 +701,63 @@ class FirecrawlAPI:
 
     async def start_crawl(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """POST /v2/crawl — start an async crawl job; returns {id, url}."""
-        return await self._request("POST", f"{self.base_url}/v2/crawl", json=payload)
+        # DALTON-HOOK(firecrawl-budget): multi-key failover
+        if len(self.api_keys) <= 1:
+            return await self._request("POST", f"{self.base_url}/v2/crawl", json=payload)
+        token = _last_request_key_fp.set(None)
+        try:
+            data = await self._request("POST", f"{self.base_url}/v2/crawl", json=payload)
+            used_fp = _last_request_key_fp.get()
+        finally:
+            _last_request_key_fp.reset(token)
+        job_id = data.get("id")
+        if data.get("success", False) and job_id and used_fp:
+            _schedule_crawl_key_record(str(job_id), used_fp)
+        return data
+
+    async def _request_with_crawl_key_fallback(
+        self, method: str, url: str, crawl_id: str, **kwargs: Any
+    ) -> Dict[str, Any]:
+        """Run a crawl status/cancel request with key pinning and 404 fallback when mapping is lost."""
+        if len(self.api_keys) <= 1:
+            return await self._request(method, url, **kwargs)
+        pinned_fp = await _get_crawl_key(crawl_id)
+        if pinned_fp and any(_key_fingerprint(k) == pinned_fp for k in self.api_keys):
+            token = _pinned_request_key_fp.set(pinned_fp)
+            try:
+                return await self._request(method, url, **kwargs)
+            finally:
+                _pinned_request_key_fp.reset(token)
+
+        last_404: Optional[httpx.HTTPStatusError] = None
+        pending_err: Optional[httpx.HTTPError] = None
+        for idx in range(len(self.api_keys)):
+            fp = _key_fingerprint(self.api_keys[idx])
+            token = _pinned_request_key_fp.set(fp)
+            try:
+                data = await self._request(method, url, **kwargs)
+            except httpx.HTTPStatusError as e:
+                sanitized_e = _sanitize_http_error(e, self.api_keys)
+                assert isinstance(sanitized_e, httpx.HTTPStatusError)
+                # A revoked or foreign key answers 401/403 and an unrelated
+                # account 404: none of them say the job is gone, so try the next key.
+                if sanitized_e.response.status_code in (401, 403, 404):
+                    last_404 = sanitized_e
+                    continue
+                pending_err = sanitized_e
+                break
+            except httpx.HTTPError as e:
+                pending_err = _sanitize_http_error(e, self.api_keys)
+                break
+            finally:
+                _pinned_request_key_fp.reset(token)
+            _schedule_crawl_key_record(crawl_id, fp)
+            return data
+        if pending_err is not None:
+            raise pending_err from None
+        if last_404 is not None:
+            raise last_404 from None
+        return {"success": False}
 
     async def crawl_status(
         self, crawl_id: str, skip: int = 0, page_url: Optional[str] = None
@@ -282,21 +769,202 @@ class FirecrawlAPI:
         """
         url = page_url or f"{self.base_url}/v2/crawl/{crawl_id}"
         params = {"skip": skip} if page_url is None and skip else None
-        return await self._request("GET", url, params=params)
+        return await self._request_with_crawl_key_fallback(
+            "GET", url, crawl_id, params=params
+        )
 
     async def cancel_crawl(self, crawl_id: str) -> Dict[str, Any]:
         """DELETE /v2/crawl/{id} — cancel a running job."""
-        return await self._request("DELETE", f"{self.base_url}/v2/crawl/{crawl_id}")
+        # DALTON-HOOK(firecrawl-budget): multi-key failover
+        url = f"{self.base_url}/v2/crawl/{crawl_id}"
+        return await self._request_with_crawl_key_fallback("DELETE", url, crawl_id)
 
     async def map_site(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """POST /v2/map — discover site URLs; returns {links: [{url, ...}]}."""
         return await self._request("POST", f"{self.base_url}/v2/map", json=payload)
 
-    async def _request(self, method: str, url: str, **kwargs: Any) -> Dict[str, Any]:
-        return await request_json(
-            method, url, provider="Firecrawl", headers=self.headers,
-            json_body=kwargs.get("json"), params=kwargs.get("params"), timeout=_TIMEOUT,
+    @staticmethod
+    def _build_all_cooled_402(
+        method: str, url: str, cooldown_until: Optional[str] = None
+    ) -> httpx.HTTPStatusError:
+        body: Dict[str, Any] = {
+            "success": False,
+            "code": "insufficient_credits",
+            "error": "All configured Firecrawl API keys are in credit cooldown",
+            "remaining_credits": 0,
+        }
+        if cooldown_until:
+            body["resets_at"] = cooldown_until
+            body["cooldown_until"] = cooldown_until
+        req = redact_request_headers(httpx.Request(method, url))
+        resp = httpx.Response(402, json=body, request=req)
+        return httpx.HTTPStatusError(
+            "Firecrawl API error 402: All configured Firecrawl API keys are in credit cooldown",
+            request=req,
+            response=resp,
         )
+
+    # DALTON-HOOK(firecrawl-budget): multi-key failover
+    async def _request(self, method: str, url: str, **kwargs: Any) -> Dict[str, Any]:
+        json_body = kwargs.get("json")
+        params = kwargs.get("params")
+
+        if len(self.api_keys) == 1:
+            key = self.api_keys[0]
+            pending_err: Optional[httpx.HTTPError] = None
+            try:
+                return await request_json(
+                    method,
+                    url,
+                    provider="Firecrawl",
+                    headers=self._headers_for(key),
+                    json_body=json_body,
+                    params=params,
+                    timeout=_TIMEOUT,
+                )
+            except httpx.HTTPError as e:
+                pending_err = _sanitize_http_error(e, self.api_keys)
+            finally:
+                key = None  # type: ignore[assignment]
+            if pending_err is not None:
+                raise pending_err from None
+
+        pinned_fp = _pinned_request_key_fp.get()
+        if pinned_fp:
+            pinned_key = next(
+                (k for k in self.api_keys if _key_fingerprint(k) == pinned_fp),
+                None,
+            )
+            if pinned_key is not None:
+                pinned_err: Optional[httpx.HTTPError] = None
+                try:
+                    data = await request_json(
+                        method,
+                        url,
+                        provider="Firecrawl",
+                        headers=self._headers_for(pinned_key),
+                        json_body=json_body,
+                        params=params,
+                        timeout=_TIMEOUT,
+                    )
+                    _last_request_key_fp.set(pinned_fp)
+                    return data
+                except httpx.HTTPStatusError as e:
+                    sanitized_e = _sanitize_http_error(e, self.api_keys)
+                    assert isinstance(sanitized_e, httpx.HTTPStatusError)
+                    is_insuff, is_per_request, _, resets_at, remaining = _classify_402_credit_info(
+                        sanitized_e
+                    )
+                    if is_insuff and not is_per_request:
+                        await _mark_key_cooldown(
+                            pinned_fp, resets_at=resets_at, remaining=remaining
+                        )
+                        logger.warning(
+                            "Firecrawl pinned key fp=%s returned 402 credit exhaustion (resets_at=%s)",
+                            pinned_fp,
+                            resets_at or "unknown",
+                        )
+                    pinned_err = sanitized_e
+                except httpx.HTTPError as e:
+                    pinned_err = _sanitize_http_error(e, self.api_keys)
+                finally:
+                    pinned_key = None
+                if pinned_err is not None:
+                    raise pinned_err from None
+
+        tried_fps: set[str] = set()
+        last_402_error: Optional[httpx.HTTPStatusError] = None
+        non_failover_err: Optional[httpx.HTTPError] = None
+
+        async def _try_slot(
+            idx: int, key: str, *, recovered: bool = False
+        ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+            nonlocal last_402_error, non_failover_err
+            fp = _key_fingerprint(key)
+            if fp in tried_fps:
+                return False, None
+            cooldown = await _get_key_cooldown(fp)
+            if cooldown is not None:
+                return False, None
+            tried_fps.add(fp)
+            try:
+                data = await request_json(
+                    method,
+                    url,
+                    provider="Firecrawl",
+                    headers=self._headers_for(key),
+                    json_body=json_body,
+                    params=params,
+                    timeout=_TIMEOUT,
+                )
+                _last_request_key_fp.set(fp)
+                logger.debug(
+                    "Firecrawl request succeeded with %skey fp=%s (slot=%d)",
+                    "recovered " if recovered else "",
+                    fp,
+                    idx + 1,
+                )
+                return True, data
+            except httpx.HTTPStatusError as e:
+                sanitized_e = _sanitize_http_error(e, self.api_keys)
+                assert isinstance(sanitized_e, httpx.HTTPStatusError)
+                is_insuff, is_per_request, _, resets_at, remaining = _classify_402_credit_info(
+                    sanitized_e
+                )
+                if is_insuff and not is_per_request:
+                    await _mark_key_cooldown(fp, resets_at=resets_at, remaining=remaining)
+                    logger.warning(
+                        "Firecrawl key fp=%s (slot=%d) returned 402 credit exhaustion (resets_at=%s); failing over",
+                        fp,
+                        idx + 1,
+                        resets_at or "unknown",
+                    )
+                    last_402_error = sanitized_e
+                    return False, None
+                non_failover_err = sanitized_e
+                return False, None
+            except httpx.HTTPError as e:
+                non_failover_err = _sanitize_http_error(e, self.api_keys)
+                return False, None
+            finally:
+                key = None  # type: ignore[assignment]
+
+        for idx in range(len(self.api_keys)):
+            ok, data = await _try_slot(idx, self.api_keys[idx])
+            if ok:
+                return data  # type: ignore[return-value]
+            if non_failover_err is not None:
+                raise non_failover_err from None
+
+        # Re-check once before returning budget_exceeded in case an earlier-cooled
+        # key expired while another key's request was in flight.
+        for idx in range(len(self.api_keys)):
+            ok, data = await _try_slot(idx, self.api_keys[idx], recovered=True)
+            if ok:
+                return data  # type: ignore[return-value]
+            if non_failover_err is not None:
+                raise non_failover_err from None
+
+        all_cooled, earliest_until = await get_firecrawl_pool_cooldown_state(self.api_keys)
+        if not all_cooled:
+            retried = False
+            for idx in range(len(self.api_keys)):
+                prev_tried = len(tried_fps)
+                ok, data = await _try_slot(idx, self.api_keys[idx], recovered=True)
+                if ok:
+                    return data  # type: ignore[return-value]
+                if non_failover_err is not None:
+                    raise non_failover_err from None
+                if len(tried_fps) > prev_tried:
+                    retried = True
+                    break
+            if retried or last_402_error is None:
+                all_cooled, earliest_until = await get_firecrawl_pool_cooldown_state(
+                    self.api_keys
+                )
+        if all_cooled or last_402_error is None:
+            raise self._build_all_cooled_402(method, url, earliest_until) from None
+        raise last_402_error from None
 
 
 class FirecrawlFetchAdapter:
@@ -310,7 +978,10 @@ class FirecrawlFetchAdapter:
         try:
             data = await api.scrape(url, proxy=proxy, max_age_seconds=req.max_age_seconds)
         except httpx.HTTPError as e:
-            return FetchResult(url=url, error=_scrape_error(e))
+            # DALTON-HOOK(firecrawl-budget): multi-key failover
+            return FetchResult(
+                url=url, error=_scrape_error(e, multi_key=len(api.api_keys) > 1)
+            )
 
         if not data.get("success", False):
             # A 200 with success=false reports the outcome of scraping THIS url
@@ -368,10 +1039,10 @@ class FirecrawlFetchAdapter:
         return FetchResponse(results=list(results), provider=self.name)
 
 
-def _crawl_call_error(e: httpx.HTTPError) -> WebToolError:
+def _crawl_call_error(e: httpx.HTTPError, *, multi_key: Optional[bool] = None) -> WebToolError:
     """Wrap an httpx failure as a call-level WebToolError (crawl status overrides)."""
     if isinstance(e, httpx.HTTPStatusError):  # DALTON-HOOK(firecrawl-budget)
-        credit_err = _firecrawl_402_error(e)
+        credit_err = _firecrawl_402_error(e, multi_key=multi_key)
         if credit_err is not None:
             return WebToolError(credit_err)
     return WebToolError(error_from_httpx(e, status_overrides=_STATUS_OVERRIDES))
@@ -457,10 +1128,14 @@ class FirecrawlCrawlAdapter:
             payload["prompt"] = req.query
         payload.update(native_params)
 
+        tool_err: Optional[WebToolError] = None
         try:
             data = await api.start_crawl(payload)
         except httpx.HTTPError as e:
-            raise _crawl_call_error(e)
+            tool_err = _crawl_call_error(e, multi_key=len(api.api_keys) > 1)
+        if tool_err is not None:
+            api = None  # type: ignore[assignment]
+            raise tool_err from None
         job_id = data.get("id")
         if not data.get("success", False) or not job_id:
             message = str(data.get("error") or "Firecrawl did not return a crawl id")
@@ -474,6 +1149,8 @@ class FirecrawlCrawlAdapter:
         except ValueError as e:
             raise WebToolError(missing_key_error(str(e)))
         pages: List[CrawlPage] = []
+        # DALTON-HOOK(firecrawl-budget): multi-key failover
+        tool_err: Optional[WebToolError] = None
         try:
             data = await api.crawl_status(job_id, skip=skip)
             pages.extend(_page_from_item(item) for item in data.get("data") or [])
@@ -494,7 +1171,10 @@ class FirecrawlCrawlAdapter:
                     _MAX_STATUS_PAGES,
                 )
         except httpx.HTTPError as e:
-            raise _crawl_call_error(e)
+            tool_err = _crawl_call_error(e, multi_key=len(api.api_keys) > 1)
+        if tool_err is not None:
+            api = None  # type: ignore[assignment]
+            raise tool_err from None
 
         state = _CRAWL_STATES.get(data.get("status"), CrawlState.RUNNING)
         error = None
@@ -529,10 +1209,15 @@ class FirecrawlCrawlAdapter:
             payload["search"] = req.query
         payload.update(native_params)
 
+        tool_err: Optional[WebToolError] = None
         try:
             data = await api.map_site(payload)
         except httpx.HTTPError as e:
-            raise _crawl_call_error(e)
+            # DALTON-HOOK(firecrawl-budget): multi-key failover
+            tool_err = _crawl_call_error(e, multi_key=len(api.api_keys) > 1)
+        if tool_err is not None:
+            api = None  # type: ignore[assignment]
+            raise tool_err from None
         if not data.get("success", True):
             message = str(data.get("error") or "Firecrawl map returned success=false")
             raise WebToolError(WebError(type=WebErrorType.PROVIDER_ERROR, message=clip_error(message)))

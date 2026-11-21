@@ -58,6 +58,19 @@ vi.mock('@/hooks/useConfiguredProviders', () => ({
   SERVER_KEY: '(server)',
   useConfiguredProviders: () => ({ providers: h.providers, byokEnabled: h.byok, isLoading: false, unread: h.providersUnread }),
 }));
+// DALTON-HOOK(dalton-setup): useSetupFacts reads unified Dalton team-model availability
+vi.mock('../useTeamModels', () => ({
+  useDaltonTeamModels: () => ({
+    shared: false,
+    available: false,
+    empty: false,
+    isLoading: false,
+    unread: false,
+    canManage: true,
+    callerTierPending: false,
+    retry: vi.fn(),
+  }),
+}));
 
 import { useSetupFacts } from '../useSetupFacts';
 

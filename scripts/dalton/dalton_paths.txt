@@ -59,6 +59,7 @@ tests/unit/tools/secretary/test_workspace_file_write_cos.py
 tests/unit/tools/secretary/test_workspace_list_sharing_note.py
 tests/unit/tools/secretary/test_workspaces_create_folder_ready.py
 tests/unit/tools/web/inhouse/test_fetch_binary_route.py
+tests/unit/tools/web/test_firecrawl_failover.py
 tests/unit/mcp_servers/test_market_data_yf_fallback.py
 tests/unit/server/handlers/chat/test_attachments_notes.py
 tests/unit/server/handlers/chat/test_unreadable_image_upload.py
@@ -506,3 +507,11 @@ tests/unit/tools/secretary/test_threads_stop.py
 tests/unit/tools/secretary/test_workspaces_create_conflict.py
 web/src/pages/ChatAgent/components/__tests__/ChatView.attachmentCount.test.tsx
 web/src/pages/MarketView/__tests__/MarketView.screenshotCap.test.tsx
+# Agent-triggered current-thread model switch handler-tier handoff orchestrator.
+src/server/handlers/thread_model_handoff.py
+# Dalton setup wizard customization helper & tests
+web/src/config/daltonSetup.ts
+web/src/pages/Setup/answers/useTeamModels.ts
+web/src/pages/Setup/__tests__/SetupWizard.dalton.test.tsx
+web/src/pages/Setup/__tests__/SetupWizard.firstRun.dalton.test.tsx
+web/src/pages/Setup/__tests__/daltonBrand.test.tsx

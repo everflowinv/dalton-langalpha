@@ -80,6 +80,53 @@ docker compose -f docker-compose.yml -f docker-compose.dalton.yml up -d --force-
   如果 `crawler` 或 `edge` 依赖的变量（比如 `INTERNAL_SERVICE_TOKEN`）也改了，对应服务也要一起 `--force-recreate`。
 - **修改 `agent_config.dalton.yaml` / `config.dalton.yaml` / `src/dalton/dalton.yaml`**：虽然宿主机目录挂进了 `backend` 容器（`./agent_config.dalton.yaml`、`./config.dalton.yaml`、`./config/dalton` 等），但后端镜像启动时会核对 `/app/.build_files.sha256` 清单指纹，所以**生产改动要统一走 `scripts/dalton/docker_build_backend.sh` 重建镜像和容器**。
 
+### 2.1 Firecrawl 多 Key 主备配置与冷却排查
+
+- **添加第二个（及更多）Key**：在 `.env` 中按顺序配置 `FIRECRAWL_API_KEY`（主 Key），再追加 `FIRECRAWL_API_KEY_2`、`FIRECRAWL_API_KEY_3`……（从 `_2` 起按连续数字递增，遇到空缺即停止读取；只写变量名、不要把任何真实密钥写入文档或日志）。
+  - 调度策略为主备切换：请求优先使用顺序最靠前且未冷却的 Key；某个 Key 返回 402 账户额度用完时标记冷却并立即用下一个可用 Key 重试同一个请求（若响应带有余额大于零，或无余额字段但文义为“本次请求所需额度不足”，多 Key 模式下不冷却、不切换、不计入熔断，直接返回提供方错误）。冷却时长规则：有未来的 `resets_at` 就冷却到那时为止；`resets_at` 已过期则短冷却 5 分钟；缺少或无法解析 `resets_at` 时，若响应明确余额为 0（`<= 0`）则冷却 24 小时，若缺少余额字段则冷却 1 小时。仅当所有 Key 都处于冷却时才返回 `budget_exceeded` 并快速失败（提示最早的实际冷却截止时间 `cooldown_until`），任一 Key 冷却到期后自动恢复优先使用。
+  - 改完 `.env` 后必须重建 `backend` 容器使新变量生效（仅 `restart` 不会重读 `.env`）：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dalton.yml up -d --no-deps --force-recreate backend
+```
+
+- **查看当前哪个 Key 在冷却**：冷却状态保存在 Redis 的 `firecrawl:key_cooldown:<fp>` 键中（`<fp>` 为对应 Key 的 SHA-256 前 12 位十六进制指纹；日志与 Redis 均不记录 Key 原文）：
+
+```bash
+# 列出当前所有处于冷却中的 Firecrawl Key 指纹
+docker compose -f docker-compose.yml -f docker-compose.dalton.yml exec -T \
+  -e REDISCLI_AUTH="${REDIS_PASSWORD:-redis}" redis \
+  redis-cli --scan --pattern 'firecrawl:key_cooldown:*'
+
+# 查看具体冷却记录（cooldown_until / resets_at / marked_at）与剩余冷却秒数
+docker compose -f docker-compose.yml -f docker-compose.dalton.yml exec -T \
+  -e REDISCLI_AUTH="${REDIS_PASSWORD:-redis}" redis \
+  redis-cli GET 'firecrawl:key_cooldown:<fp>'
+docker compose -f docker-compose.yml -f docker-compose.dalton.yml exec -T \
+  -e REDISCLI_AUTH="${REDIS_PASSWORD:-redis}" redis \
+  redis-cli TTL 'firecrawl:key_cooldown:<fp>'
+```
+
+  也可以在后端日志中检索 `Firecrawl key fp=` 对照指纹定位是哪一个 Key 触发了 402 切换或冷却；宿主机 `researchdata_bridge.py` 面向 `employee-reviews` 子进程仍仅透传单个 `FIRECRAWL_API_KEY`。
+
+### 2.2 内置浏览器功能（默认关闭与开启条件）
+
+- **为什么关**：合并上游 `#831` 后，Dalton 默认关闭云计算机内置浏览器功能（两份只读评估 `codex_20261121T110709Z_62660.md` 与 `agy_review_20261121T110709Z_62672.md` 第 6 节结论一致）：
+  1. **缺少远程预览通道**：Dalton 通过单域名 Tailscale Funnel + Caddy 暴露服务，且 `DALTON-HOOK(sandbox-port-bind)` 将沙箱端口绑定到宿主机 `127.0.0.1`，未配置独立泛解析 HTTPS 预览域（`PREVIEW_PROXY_BASE_URL`），远程用户无法打开直播流；
+  2. **网络隔离与权限边界不足**：内置出站代理 `browser_runtime/proxy.py` 未拦截私网/兄弟容器网段且会被宿主机 Fake-IP（`198.18.0.0/15`）绕过；每台计算机共用一个 Chrome 实例且 `relay.py` 无服务端控制租约校验，存在共享串屏、越权操控及权限撤回后未断开存量连接的风险；
+  3. **宿主机内存与容器资源受限**：Mac Colima VM 内存余量有限、容器未配置 `/dev/shm` 扩容且缺少跨容器浏览器并发总量限制。
+  - 当前通过三层总闸保持关闭：`config.dalton.yaml` 设置 `features.browser.enabled: false`（隐藏设置页开关、模型 `browser` skill 与前端 Browser 入口，使 `browser-*` 接口返回 `unavailable`），`DALTON-HOOK(browser-kill-switch)` 同步跳过沙箱侧 `browser_runtime` / `agent-browser` 包装器上传、画质同步与画质接口，且 `DockerProvider._ensure_image` 在 `APP_ENV=dalton` 下会自动传入 `INSTALL_AGENT_BROWSER=0`。`Dockerfile.sandbox` 保持上游默认 `ARG INSTALL_AGENT_BROWSER=1`；Dalton 常规部署（`deploy_main.sh`、`docker_build_backend.sh`、`docker-compose.dalton.yml`）不重建沙箱镜像，**如后续手工重建 `langalpha-sandbox:latest` 且浏览器仍保持关闭，必须显式传入 `--build-arg INSTALL_AGENT_BROWSER=0`**（`docker build --build-arg INSTALL_AGENT_BROWSER=0 -f Dockerfile.sandbox -t langalpha-sandbox:latest .`）。现有 Playwright、Scrapling 与普通应用预览保持不受影响；本次部署无需重建沙箱镜像。
+- **开之前要补哪些事**（见上述两份评估第 6 节）：
+  1. **出站网络隔离与 Fake-IP 防护**：在实际出站连接处拦截 Mac 宿主机、Docker 网段及内网地址，并补齐 Fake-IP 真实 IP 复查；
+  2. **独立授权与访问控制**：首轮试用仅限指定内部用户在个人计算机上使用；将观看与控制权限绑定到用户、计算机和连接，并在服务端校验键鼠输入的控制租约；浏览器端口改由专用接口管理，避免普通应用预览转发；
+  3. **连接撤销与独立预览代理**：直播流强制走独立泛解析 HTTPS 预览代理（配好 `PREVIEW_PROXY_BASE_URL` 与边缘路由）；撤回试用权限或关闭开关时断开已建 WebSocket 并停止对应浏览器；
+  4. **并发压测与资源限额**：在生产同规格隔离环境实测 Chrome（含 `/dev/shm` 评估）与分析任务并发时的内存和 CPU 占用，按实测结果限制同时运行的浏览器数量，试用先从 `light` 画质起步。
+- **怎么开**：
+  1. 完成上面四项前置改造并验证通过；
+  2. 将 `config.dalton.yaml` 中的 `features.browser.enabled` 改为 `true`；
+  3. 按第 1.1 节运行 `bash scripts/dalton/docker_build_backend.sh` 重建并重启后端；
+  4. 按上游默认（`INSTALL_AGENT_BROWSER=1`）重建 `langalpha-sandbox:latest`（如 `docker build -f Dockerfile.sandbox -t langalpha-sandbox:latest .` 或显式加 `--build-arg INSTALL_AGENT_BROWSER=1`），并重建替换现有沙箱容器。
+
 ## 3. 宿主机 `launchd` 服务运维
 
 ### 3.1 服务安装与常用管理命令

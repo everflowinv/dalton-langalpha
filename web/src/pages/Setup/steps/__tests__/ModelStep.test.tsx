@@ -36,6 +36,19 @@ const h = vi.hoisted(() => ({
   featuresLoading: false,
   policy: null as null | object,
 }));
+// DALTON-HOOK(dalton-setup): ModelStep reads unified Dalton team-model availability
+vi.mock('../../answers/useTeamModels', () => ({
+  useDaltonTeamModels: () => ({
+    shared: false,
+    available: false,
+    empty: false,
+    isLoading: false,
+    unread: false,
+    canManage: true,
+    callerTierPending: false,
+    retry: vi.fn(),
+  }),
+}));
 vi.mock('@/hooks/useAccount', async () => {
   const { allows } = await import('@/lib/accountRules');
   const who = { start: 'Your organization', mid: 'your organization' };
