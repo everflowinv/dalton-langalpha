@@ -37,7 +37,8 @@ from typing import Any, Literal, Type, TypeVar
 from pydantic import BaseModel
 
 from ptc_agent.config.agent import CredentialSource
-from src.llms.api_call import make_api_call
+# DALTON-HOOK(complete-parse-failure-billing): mark collector active before credential/config resolution.
+from src.llms.api_call import make_api_call, mark_api_call_tracking_active
 from src.llms.llm import create_llm
 # DALTON-HOOK(background-effort-low): default system Background-slot calls to low effort.
 from .config import background_default_effort, resolve_llm_config, slot_model
@@ -75,6 +76,9 @@ class LLMService:
             - ``response_schema=MyModel`` → validated pydantic instance.
             - ``return_token_usage=True`` → ``(response, token_usage_dict)`` tuple.
         """
+        # DALTON-HOOK(complete-parse-failure-billing): notify active usage collector before config/credential
+        # resolution so pre-send timeouts during resolve_llm_config are distinguished from unknown in-flight calls.
+        mark_api_call_tracking_active()
         if user_id is None:
             # Scheduled task / system warmup — no BYOK/OAuth lookup, use
             # platform default. ``resolve_llm_config`` is typed ``user_id: str``

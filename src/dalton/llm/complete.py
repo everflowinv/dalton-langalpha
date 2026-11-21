@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal, Type
 
@@ -341,21 +342,14 @@ def _extract_usage_from_exception(
     exc: BaseException,
     collected_calls: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Extract provider-reported usage from an exception or the active ``make_api_call`` collector.
-
-    Never sums both sources (both observe the same upstream calls); picks whichever carries
-    more completed provider calls so partial retries are neither missed nor double-counted.
-    """
+    """Extract provider-reported usage from *this* exception itself or the active ``make_api_call``
+    collector. Never walks ``__cause__`` or ``__context__`` so prior request usage cannot be
+    double-counted, and never sums both sources (picks whichever carries more completed calls)."""
     exc_usage: dict[str, Any] = {}
-    for candidate in (exc, exc.__cause__):
-        if candidate is None:
-            continue
-        for attr in ("token_usage", "usage"):
-            raw = getattr(candidate, attr, None)
-            if isinstance(raw, dict) and has_reported_token_usage(raw):
-                exc_usage = dict(raw)
-                break
-        if exc_usage:
+    for attr in ("token_usage", "usage"):
+        raw = getattr(exc, attr, None)
+        if isinstance(raw, dict) and has_reported_token_usage(raw):
+            exc_usage = dict(raw)
             break
 
     collected_usage = _build_usage_from_calls(collected_calls)
@@ -374,6 +368,117 @@ def _extract_usage_from_exception(
                 merged[meta_key] = exc_usage[meta_key]
         return merged
     return exc_usage
+
+
+def _build_attempt_call_records(
+    *,
+    collected_usages: Any,
+    effective_model: str,
+    billing_type: str,
+    fallback_usage: dict[str, Any] | None,
+    fallback_cash_usd: Decimal,
+    fallback_notional_usd: Decimal,
+    fallback_outcome: str,
+    fallback_error_kind: str | None,
+    fallback_unknown_calls: int,
+    fallback_occurred_at: datetime | None,
+    credential_holder: str | None = None,
+) -> tuple[list[dict[str, Any]], Decimal, Decimal]:
+    """Convert per-request records captured by `make_api_call` into per-request ledger rows
+    with each request's own `occurred_at` (send timestamp) and per-request cost."""
+    raw_records = getattr(collected_usages, "call_records", None)
+    if not isinstance(raw_records, list) or not raw_records:
+        return [], fallback_cash_usd, fallback_notional_usd
+
+    out: list[dict[str, Any]] = []
+    total_cash = Decimal("0")
+    total_notional = Decimal("0")
+    total_count = len(raw_records)
+
+    for idx, rec in enumerate(raw_records, start=1):
+        if not isinstance(rec, dict):
+            continue
+        rec_usage = dict(rec.get("usage") or {})
+        rec_has_usage = has_reported_token_usage(rec_usage)
+        rec_outcome_raw = str(rec.get("outcome") or "")
+        rec_unknown = max(0, int(rec.get("unknown_usage_calls") or 0))
+        if rec_outcome_raw == "in_flight" and rec_unknown == 0 and not rec_has_usage:
+            rec_unknown = 1
+
+        if rec_has_usage:
+            c_i, n_i = compute_call_costs(effective_model, billing_type, rec_usage)
+        else:
+            c_i, n_i = Decimal("0"), Decimal("0")
+        total_cash += c_i
+        total_notional += n_i
+
+        if credential_holder:
+            rec_usage.setdefault("credential_user_id", credential_holder)
+        rec_usage["usage_known"] = rec_unknown == 0
+        rec_usage["unknown_usage_calls"] = rec_unknown
+
+        if rec_outcome_raw == "unbilled_error" and not rec_has_usage and rec_unknown == 0:
+            row_outcome = "failed"
+            row_error_kind = fallback_error_kind or "pre_send"
+        elif rec_unknown > 0:
+            row_outcome = "indeterminate"
+            row_error_kind = fallback_error_kind or "unknown"
+        elif fallback_outcome == "done":
+            row_outcome = "done"
+            row_error_kind = None
+        elif rec_has_usage:
+            row_outcome = "indeterminate"
+            row_error_kind = (
+                "post_call_error"
+                if fallback_error_kind == "post_call_error"
+                else ("parse_error" if idx < total_count or fallback_error_kind != "cancelled" else "cancelled")
+            )
+        else:
+            row_outcome = fallback_outcome if fallback_outcome in ("done", "failed", "indeterminate") else "indeterminate"
+            row_error_kind = fallback_error_kind
+
+        out.append(
+            {
+                "call_seq": idx,
+                "outcome": row_outcome,
+                "error_kind": row_error_kind,
+                "usage": rec_usage,
+                "cash_usd": c_i,
+                "notional_usd": n_i,
+                "usage_known": rec_unknown == 0,
+                "unknown_usage_calls": rec_unknown,
+                "occurred_at": rec.get("occurred_at") or fallback_occurred_at,
+            }
+        )
+
+    # Defensive fallback if a custom LLM wrapper returned usage without going through
+    # `extract_token_usage` inside `_track_upstream_call`.
+    if (
+        out
+        and total_cash == Decimal("0")
+        and total_notional == Decimal("0")
+        and (fallback_cash_usd > Decimal("0") or fallback_notional_usd > Decimal("0"))
+    ):
+        first_occ = out[0].get("occurred_at") or fallback_occurred_at
+        return (
+            [
+                {
+                    "call_seq": 1,
+                    "outcome": fallback_outcome,
+                    "error_kind": fallback_error_kind,
+                    "usage": dict(fallback_usage) if isinstance(fallback_usage, dict) else fallback_usage,
+                    "cash_usd": fallback_cash_usd,
+                    "notional_usd": fallback_notional_usd,
+                    "usage_known": fallback_unknown_calls == 0,
+                    "unknown_usage_calls": max(0, int(fallback_unknown_calls or 0)),
+                    "occurred_at": first_occ,
+                }
+            ],
+            fallback_cash_usd,
+            fallback_notional_usd,
+        )
+
+    return out, total_cash, total_notional
 
 
 def _merge_attempt_usage(
@@ -426,6 +531,8 @@ class DeadlineBeforeSendError(Exception):
 
 # The ledger note for a resend is best-effort: never wait on it for long.
 _RESEND_NOTE_TIMEOUT_S = 2.0
+# Bounded wait when flushing already-collected billing on external task cancellation.
+_CANCEL_SETTLE_TIMEOUT_S = 5.0
 
 
 def _classify_exception(
@@ -1202,12 +1309,14 @@ async def _dalton_complete_impl(
         and str(existing_row.get("state") or "") in ("indeterminate", "pending")
     )
     resend_sent = False
+    llm_call_entered = False
+    attempt_started_at: datetime | None = None
     cash_dec: Decimal | None = None
     notional_dec: Decimal | None = None
     usage_dict: dict[str, Any] = {}
-    collected_usages: list[dict[str, Any]] = []
+    collected_usages: Any = []
     try:
-        from src.llms.api_call import collect_api_call_usage
+        from src.llms.api_call import _utc_now, collect_api_call_usage
 
         if not llm_user_id and model_requires_user_oauth(effective_model):
             raise ValueError("OAuth model requires a credential user")
@@ -1231,7 +1340,16 @@ async def _dalton_complete_impl(
             if send_timeout_s <= 0:
                 raise DeadlineBeforeSendError("deadline reached before the request was sent")
         resend_sent = is_resend
-        with collect_api_call_usage() as collected_usages:
+
+        def _is_unbilled_provider_error(err: BaseException) -> bool:
+            if isinstance(err, (asyncio.CancelledError, TimeoutError)):
+                return False
+            err_state, _err_kind = _classify_exception(err, provider=provider)
+            return err_state == "failed"
+
+        attempt_started_at = _utc_now()
+        llm_call_entered = True
+        with collect_api_call_usage(is_unbilled_error=_is_unbilled_provider_error) as collected_usages:
             raw_result = await asyncio.wait_for(
                 llm_service.complete(
                     user_id=llm_user_id,
@@ -1273,6 +1391,27 @@ async def _dalton_complete_impl(
         attempt_unknown_calls = int(getattr(collected_usages, "unknown_calls", 0) or 0) + int(
             getattr(collected_usages, "in_flight_calls", 0) or 0
         )
+        cred_holder = (
+            str(usage_dict["credential_user_id"])
+            if usage_dict.get("credential_user_id")
+            else None
+        )
+        done_call_records, per_call_cash, per_call_notional = _build_attempt_call_records(
+            collected_usages=collected_usages,
+            effective_model=effective_model,
+            billing_type=billing_type,
+            fallback_usage=usage_dict,
+            fallback_cash_usd=cash_dec,
+            fallback_notional_usd=notional_dec,
+            fallback_outcome="done",
+            fallback_error_kind=None,
+            fallback_unknown_calls=attempt_unknown_calls,
+            fallback_occurred_at=attempt_started_at,
+            credential_holder=cred_holder,
+        )
+        if done_call_records:
+            cash_dec = per_call_cash
+            notional_dec = per_call_notional
         merged_prior = attempt > 1 and has_reported_token_usage(claimed_row.get("usage"))
         journal_usage = (
             _merge_attempt_usage(
@@ -1292,6 +1431,9 @@ async def _dalton_complete_impl(
                 extra_done_kwargs["attempt_usage"] = usage_dict
             if attempt_unknown_calls > 0:
                 extra_done_kwargs["unknown_usage_calls"] = attempt_unknown_calls
+            if done_call_records:
+                extra_done_kwargs["call_records"] = done_call_records
+                extra_done_kwargs["occurred_at"] = done_call_records[0].get("occurred_at") or attempt_started_at
             await complete_journal_done(
                 inv_id,
                 attempt=attempt,
@@ -1320,6 +1462,130 @@ async def _dalton_complete_impl(
             invocation_id=inv_id,
             attempt=attempt,
         )
+    except asyncio.CancelledError as cancel_exc:
+        if not skip_journal:
+            try:
+                if not llm_call_completed:
+                    exc_usage = _extract_usage_from_exception(cancel_exc, collected_usages)
+                    if has_reported_token_usage(exc_usage):
+                        usage_dict = dict(exc_usage)
+                        if credential_user_id is _UNSET:
+                            if eff_user_id and is_team_credential_sharing_enabled():  # DALTON-HOOK(team-credentials): stamp credential holder into usage while billing/journal user_id stays caller
+                                usage_dict.setdefault(
+                                    "credential_user_id",
+                                    _resolve_credential_user_id(eff_user_id),
+                                )
+                        elif llm_user_id and llm_user_id != eff_user_id:
+                            usage_dict.setdefault("credential_user_id", llm_user_id)
+                        cash_dec, notional_dec = compute_call_costs(
+                            effective_model, billing_type, usage_dict
+                        )
+
+                has_usage = has_reported_token_usage(usage_dict)
+                sent_calls = int(getattr(collected_usages, "sent_calls", 0) or 0)
+                tracking_active = bool(getattr(collected_usages, "tracking_active", False))
+                traced_unknown_calls = int(
+                    getattr(collected_usages, "unknown_calls", 0) or 0
+                ) + int(getattr(collected_usages, "in_flight_calls", 0) or 0)
+
+                if llm_call_completed or tracking_active or sent_calls > 0:
+                    attempt_unknown_calls = traced_unknown_calls
+                elif not llm_call_entered:
+                    attempt_unknown_calls = 0
+                else:
+                    attempt_unknown_calls = 0 if has_usage else 1
+
+                if (
+                    not llm_call_completed
+                    and not has_usage
+                    and attempt_unknown_calls == 0
+                    and (not llm_call_entered or (tracking_active and sent_calls == 0))
+                ):
+                    cancel_state = "failed"
+                else:
+                    cancel_state = "indeterminate"
+                cancel_error_kind = "cancelled"
+                final_attempt_unknown = attempt_unknown_calls > 0
+
+                attempt_cancel_usage: dict[str, Any] | None = None
+                journal_cancel_usage: dict[str, Any] | None = None
+                merged_prior_cancel = False
+                if cancel_state == "indeterminate" or has_usage or final_attempt_unknown:
+                    attempt_cancel_usage = dict(usage_dict)
+                    attempt_cancel_usage["usage_known"] = not final_attempt_unknown
+                    attempt_cancel_usage["unknown_usage_calls"] = attempt_unknown_calls
+                    merged_prior_cancel = attempt > 1 and has_reported_token_usage(
+                        claimed_row.get("usage")
+                    )
+                    journal_cancel_usage = (
+                        _merge_attempt_usage(
+                            claimed_row.get("usage"),
+                            attempt_cancel_usage,
+                            preserve_credential_holder=(llm_user_id is not None),
+                        )
+                        if merged_prior_cancel
+                        else attempt_cancel_usage
+                    )
+
+                cred_holder = (
+                    str(usage_dict["credential_user_id"])
+                    if isinstance(usage_dict, dict) and usage_dict.get("credential_user_id")
+                    else None
+                )
+                cancel_call_records, per_call_cash, per_call_notional = _build_attempt_call_records(
+                    collected_usages=collected_usages,
+                    effective_model=effective_model,
+                    billing_type=billing_type,
+                    fallback_usage=attempt_cancel_usage,
+                    fallback_cash_usd=cash_dec or Decimal("0"),
+                    fallback_notional_usd=notional_dec or Decimal("0"),
+                    fallback_outcome=cancel_state,
+                    fallback_error_kind=cancel_error_kind,
+                    fallback_unknown_calls=attempt_unknown_calls,
+                    fallback_occurred_at=attempt_started_at,
+                    credential_holder=cred_holder,
+                )
+                if cancel_call_records:
+                    cash_dec = per_call_cash
+                    notional_dec = per_call_notional
+
+                extra_cancel_kwargs: dict[str, Any] = {
+                    "usage_known": not final_attempt_unknown,
+                    "unknown_usage_calls": attempt_unknown_calls,
+                }
+                if llm_user_id is None:
+                    extra_cancel_kwargs["stamp_credential_holder"] = False
+                if merged_prior_cancel:
+                    extra_cancel_kwargs["attempt_usage"] = attempt_cancel_usage
+                if cancel_call_records:
+                    extra_cancel_kwargs["call_records"] = cancel_call_records
+                    extra_cancel_kwargs["occurred_at"] = (
+                        cancel_call_records[0].get("occurred_at") or attempt_started_at
+                    )
+                elif attempt_started_at is not None:
+                    extra_cancel_kwargs["occurred_at"] = attempt_started_at
+
+                await asyncio.wait_for(
+                    complete_journal_failed(
+                        inv_id,
+                        attempt=attempt,
+                        error_kind=cancel_error_kind,
+                        error_text="CancelledError",
+                        state=cancel_state,
+                        usage=journal_cancel_usage,
+                        cash_usd=cash_dec,
+                        notional_usd=notional_dec,
+                        **extra_cancel_kwargs,
+                    ),
+                    timeout=_CANCEL_SETTLE_TIMEOUT_S,
+                )
+            except Exception as journal_exc:
+                logger.error(
+                    "[DaltonComplete] complete_journal_failed on cancellation failed for %s: %s",
+                    inv_id,
+                    journal_exc,
+                )
+        raise
     except Exception as exc:
         from src.dalton.llm.providers.xai_grok.client import get_stream_progress
 
@@ -1350,15 +1616,30 @@ async def _dalton_complete_impl(
 
         has_usage = has_reported_token_usage(usage_dict)
         sent_calls = int(getattr(collected_usages, "sent_calls", 0) or 0)
+        tracking_active = bool(getattr(collected_usages, "tracking_active", False))
         traced_unknown_calls = int(getattr(collected_usages, "unknown_calls", 0) or 0) + int(
             getattr(collected_usages, "in_flight_calls", 0) or 0
         )
-        if llm_call_completed or sent_calls > 0:
-            # When `make_api_call` tracked upstream sends, only actually-sent requests
-            # whose outcome was unknown (timeout/5xx/stream cut while in flight) count
-            # as unknown usage — a timeout during retry backoff sleep before sending
-            # the next request has `traced_unknown_calls == 0`.
+        if llm_call_completed or tracking_active or sent_calls > 0:
+            # When `LLMService.complete` / `make_api_call` tracked upstream sends, only
+            # actually-sent requests whose outcome was unknown (timeout/5xx/stream cut
+            # while in flight) count as unknown usage — a timeout during `resolve_llm_config`
+            # (tracking_active=True, sent_calls=0), during retry backoff sleep, or an
+            # explicitly unbilled provider rejection (e.g. xAI 402 pre-stream) has
+            # `traced_unknown_calls == 0`.
             attempt_unknown_calls = traced_unknown_calls
+            if (
+                not llm_call_completed
+                and not has_usage
+                and attempt_unknown_calls == 0
+                and tracking_active
+                and sent_calls == 0
+            ):
+                target_state = "failed"
+        elif not llm_call_entered:
+            attempt_unknown_calls = 0
+            if not has_usage:
+                target_state = "failed"
         else:
             attempt_unknown_calls = (
                 1
@@ -1387,6 +1668,28 @@ async def _dalton_complete_impl(
                 else attempt_fail_usage
             )
 
+        cred_holder = (
+            str(usage_dict["credential_user_id"])
+            if isinstance(usage_dict, dict) and usage_dict.get("credential_user_id")
+            else None
+        )
+        fail_call_records, per_call_cash, per_call_notional = _build_attempt_call_records(
+            collected_usages=collected_usages,
+            effective_model=effective_model,
+            billing_type=billing_type,
+            fallback_usage=attempt_fail_usage,
+            fallback_cash_usd=cash_dec or Decimal("0"),
+            fallback_notional_usd=notional_dec or Decimal("0"),
+            fallback_outcome=target_state,
+            fallback_error_kind=error_kind,
+            fallback_unknown_calls=attempt_unknown_calls,
+            fallback_occurred_at=attempt_started_at,
+            credential_holder=cred_holder,
+        )
+        if fail_call_records:
+            cash_dec = per_call_cash
+            notional_dec = per_call_notional
+
         safe_msg = sanitize_error_text(exc, max_len=240)
         if provider == "muse-oauth" and error_kind == "auth_expired":
             if "请重新连接 Muse" not in safe_msg:
@@ -1402,6 +1705,11 @@ async def _dalton_complete_impl(
                     extra_fail_kwargs["stamp_credential_holder"] = False
                 if merged_prior_fail:
                     extra_fail_kwargs["attempt_usage"] = attempt_fail_usage
+                if fail_call_records:
+                    extra_fail_kwargs["call_records"] = fail_call_records
+                    extra_fail_kwargs["occurred_at"] = (
+                        fail_call_records[0].get("occurred_at") or attempt_started_at
+                    )
                 await complete_journal_failed(
                     inv_id,
                     attempt=attempt,
