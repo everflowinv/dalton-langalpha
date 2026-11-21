@@ -31,8 +31,14 @@ import type { PlatformModelsResponse } from '@/types/platform';
 const MODELS_STALE_MS = 5 * 60_000;
 const PROVIDER_MODELS_STALE_MS = 10 * 60_000;
 
+interface RefreshTracker {
+  gen: number;
+  providers: Set<string>;
+  inFlight: Map<string, symbol>;
+}
+
 const retryGenerationByClient = new WeakMap<QueryClient, number>();
-const refreshedProvidersByClient = new WeakMap<QueryClient, { gen: number; providers: Set<string> }>();
+const refreshedProvidersByClient = new WeakMap<QueryClient, RefreshTracker>();
 
 /** Mark an explicit user retry so the next shared availability check refreshes server-cached provider lists. */
 export function bumpDaltonTeamModelsRetry(queryClient: QueryClient): void {
@@ -199,31 +205,48 @@ export async function checkDaltonTeamModelsAvailable({
 
   let refreshed = refreshedProvidersByClient.get(queryClient);
   if (retryGeneration > 0 && (!refreshed || refreshed.gen !== retryGeneration)) {
-    refreshed = { gen: retryGeneration, providers: new Set<string>() };
+    refreshed = { gen: retryGeneration, providers: new Set<string>(), inFlight: new Map<string, symbol>() };
     refreshedProvidersByClient.set(queryClient, refreshed);
   }
 
   const settled = await Promise.allSettled(
     listedProviders.map(async (provider) => {
       const shouldRefresh = retryGeneration > 0 && !refreshed?.providers.has(provider);
-      const data = await queryClient.fetchQuery<AvailableModels>({
-        queryKey: queryKeys.providerModels.available(provider, ''),
-        queryFn: ({ signal }) => getProviderAvailableModels(provider, {
-          ...(shouldRefresh ? { refresh: true } : {}),
-          signal,
-        }),
-        staleTime: shouldRefresh ? 0 : PROVIDER_MODELS_STALE_MS,
-        retry: false,
-      });
-      if (shouldRefresh && refreshed?.gen === retryGeneration) {
-        refreshed.providers.add(provider);
-        const whole = queryKeys.providerModels.available(provider, '');
-        queryClient.removeQueries({
-          queryKey: queryKeys.providerModels.availableFor(provider),
-          predicate: (q) => q.queryKey.at(-1) !== whole.at(-1),
-        });
+      const whole = queryKeys.providerModels.available(provider, '');
+      const tracker = shouldRefresh ? refreshed : undefined;
+      let forcedToken: symbol | null = null;
+      if (shouldRefresh && tracker && !tracker.inFlight.has(provider)) {
+        await queryClient.cancelQueries({ queryKey: whole, exact: true });
+        forcedToken = Symbol(provider);
+        tracker.inFlight.set(provider, forcedToken);
       }
-      return data;
+      let forcedRan = false;
+      try {
+        const data = await queryClient.fetchQuery<AvailableModels>({
+          queryKey: whole,
+          queryFn: ({ signal }) => {
+            if (shouldRefresh) forcedRan = true;
+            return getProviderAvailableModels(provider, {
+              ...(shouldRefresh ? { refresh: true } : {}),
+              signal,
+            });
+          },
+          staleTime: shouldRefresh ? 0 : PROVIDER_MODELS_STALE_MS,
+          retry: false,
+        });
+        if (shouldRefresh && forcedRan && refreshedProvidersByClient.get(queryClient) === tracker) {
+          tracker?.providers.add(provider);
+          queryClient.removeQueries({
+            queryKey: queryKeys.providerModels.availableFor(provider),
+            predicate: (q) => q.queryKey.at(-1) !== whole.at(-1),
+          });
+        }
+        return data;
+      } finally {
+        if (forcedToken && tracker?.inFlight.get(provider) === forcedToken) {
+          tracker.inFlight.delete(provider);
+        }
+      }
     }),
   );
 

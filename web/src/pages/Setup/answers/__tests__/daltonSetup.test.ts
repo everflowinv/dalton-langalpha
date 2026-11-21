@@ -12,6 +12,7 @@ import {
 } from '@/config/daltonSetup';
 import { buildSeriesCatalog } from '@/lib/antigravitySeries';
 import { defaultChoices } from '../defaultChoices';
+import { DALTON_CURATED_PROVIDERS } from '../setupSteps';
 
 describe('daltonSetup candidate list & background defaults', () => {
   it('uses neon-high as default and hydrogen-low as recommended background', () => {
@@ -232,5 +233,16 @@ describe('daltonSetup candidate list & background defaults', () => {
         backgroundWhy: null,
       },
     });
+  });
+
+  it('restricts Dalton curated providers to subscriptions that can supply the 5 fixed candidates', () => {
+    expect([...DALTON_CURATED_PROVIDERS].sort()).toEqual([
+      'antigravity-oauth',
+      'claude-oauth',
+      'codex-oauth',
+    ]);
+    expect(DALTON_CURATED_PROVIDERS.has('openai')).toBe(false);
+    expect(DALTON_CURATED_PROVIDERS.has('xai-oauth')).toBe(false);
+    expect(DALTON_CURATED_PROVIDERS.has('muse-oauth')).toBe(false);
   });
 });

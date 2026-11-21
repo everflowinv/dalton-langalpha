@@ -36,6 +36,8 @@ interface ServerState {
   credentialsStatusFailCount: number;
   modelsFailCount: number;
   antigravityModelsOverride: string[] | null;
+  connectedOAuthProviders: string[] | null;
+  oauthFailPaths: string[];
 }
 
 const makeInitialState = (): ServerState => ({
@@ -68,6 +70,8 @@ const makeInitialState = (): ServerState => ({
   credentialsStatusFailCount: 0,
   modelsFailCount: 0,
   antigravityModelsOverride: null,
+  connectedOAuthProviders: null,
+  oauthFailPaths: [],
 });
 
 const server = vi.hoisted(() => ({
@@ -263,7 +267,18 @@ vi.mock('@/api/client', async (importOriginal) => {
       return ok({ providers: s.userApiKeys, byok_enabled: false } as T);
     }
     if (url.startsWith('/api/v1/oauth/') && url.endsWith('/status')) {
-      const connected = url === '/api/v1/oauth/antigravity/status' && s.teamSharingEnabled && s.teamModelsConfigured;
+      if (s.oauthFailPaths.includes(url)) {
+        throw new ApiError('Request failed with status code 500', 'ERR_BAD_RESPONSE', {
+          data: { detail: 'oauth status failed' },
+          status: 500,
+          statusText: 'Internal Server Error',
+          headers: {},
+        });
+      }
+      const slug = url.split('/')[4] ?? '';
+      const connected = s.connectedOAuthProviders !== null
+        ? s.connectedOAuthProviders.includes(slug)
+        : (url === '/api/v1/oauth/antigravity/status' && s.teamSharingEnabled && s.teamModelsConfigured);
       return ok({
         connected,
         state: connected ? 'connected' : 'disconnected',
@@ -424,6 +439,7 @@ let Loaded: {
   ThemeProvider: typeof import('@/contexts/ThemeContext').ThemeProvider;
   useOnboardingRoute: typeof import('@/hooks/useOnboardingRoute').useOnboardingRoute;
   useSetupFacts: typeof import('../answers/useSetupFacts').useSetupFacts;
+  connectedModel: typeof import('../answers/connectedDefault').connectedModel;
   shellTarget: typeof import('../answers/gate').shellTarget;
   SetupWizard: ComponentType;
 };
@@ -444,6 +460,7 @@ beforeAll(async () => {
     { ThemeProvider },
     { useOnboardingRoute },
     { useSetupFacts },
+    { connectedModel },
     { shellTarget },
     { default: SetupWizard },
     { initI18n, default: i18n },
@@ -460,6 +477,7 @@ beforeAll(async () => {
     import('@/contexts/ThemeContext'),
     import('@/hooks/useOnboardingRoute'),
     import('../answers/useSetupFacts'),
+    import('../answers/connectedDefault'),
     import('../answers/gate'),
     import('../SetupWizard'),
     import('@/i18n'),
@@ -499,6 +517,7 @@ beforeAll(async () => {
     ThemeProvider,
     useOnboardingRoute,
     useSetupFacts,
+    connectedModel,
     shellTarget,
     SetupWizard,
   };
@@ -997,7 +1016,11 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
 
     await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/setup/model'), { timeout: 5000 });
     expect(screen.queryByTestId('setup-model-team-models-empty')).toBeNull();
-    expect(await screen.findByTestId('setup-sub-api-key', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: /Google Antigravity/i }, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /ChatGPT/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Claude/i })).toBeInTheDocument();
+    expect(screen.queryByTestId('setup-sub-api-key')).toBeNull();
+    expect(screen.queryByRole('button', { name: /Muse Code|Grok/i })).toBeNull();
   }, 15_000);
 
   it('(f) legacy /setup/method & /setup/defaults use useDaltonTeamModels(), block stale unavailable picks, and recover on Retry', async () => {
@@ -1155,7 +1178,7 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
       expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
     }, { timeout: 5000 });
 
-    // Admin is NOT blocked on /setup/use and can proceed to /setup/model to connect an account
+    // Admin is NOT blocked on /setup/use and can proceed to /setup/model to connect a curated subscription
     cleanup();
     server.state.callerTier = 'admin';
     server.state.progress.models = null;
@@ -1166,7 +1189,132 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     await user.click(subRadio);
     await user.click(screen.getByRole('button', { name: 'Continue' }));
     await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/setup/model'), { timeout: 5000 });
-    expect(await screen.findByTestId('setup-sub-api-key', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: /Google Antigravity/i }, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /ChatGPT/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Claude/i })).toBeInTheDocument();
+    expect(screen.queryByTestId('setup-sub-api-key')).toBeNull();
+    expect(screen.queryByRole('button', { name: /Muse Code|Grok/i })).toBeNull();
+  }, 15_000);
+
+  it('(A3-followup) handles sharing-off empty curated candidates on /setup/default, /setup/defaults, and /setup/model without saving uncurated models', async () => {
+    const user = userEvent.setup();
+    server.state.teamSharingEnabled = false;
+    server.state.teamModelsConfigured = false;
+    server.state.modelsExtra = {
+      openai: { display_name: 'OpenAI', models: ['gpt-5', 'gpt-5-mini'] },
+    };
+    server.state.metadataExtra = {
+      'gpt-5': { display_name: 'GPT 5 Pro', provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3 },
+      'gpt-5-mini': { display_name: 'GPT 5 Mini', provider: 'openai', access_type: 'api_key', intelligence: 3, speed: 5 },
+    };
+    server.state.userApiKeys = [
+      { provider: 'openai', display_name: 'OpenAI', has_key: true, access_type: 'api_key', masked_key: 'sk-...user' },
+    ];
+    server.state.availableModelsByProvider = {
+      openai: { status: 'ok', ready: ['gpt-5', 'gpt-5-mini'] },
+    };
+    server.state.connectedOAuthProviders = ['xai'];
+
+    // connectedModel under Dalton never auto-saves uncurated models
+    expect(
+      Loaded.connectedModel(
+        'openai',
+        { openai: { models: ['gpt-5', 'gpt-5-mini'] } },
+        { 'gpt-5': { provider: 'openai', intelligence: 5, speed: 3 } },
+        null,
+        [],
+        (p) => p,
+      ),
+    ).toBeNull();
+    expect(
+      Loaded.connectedModel(
+        'antigravity-oauth',
+        { 'antigravity-oauth': { models: ['gemini-4-argon-high-oauth', 'gemini-4-neon-high-oauth'] } },
+        { 'gemini-4-argon-high-oauth': { provider: 'antigravity-oauth', intelligence: 5, speed: 5 } },
+        null,
+        [],
+        (p) => p,
+      ),
+    ).toBe('gemini-4-neon-high-oauth');
+
+    // 1) With only an OpenAI API key + xAI OAuth connected, /dashboard routes to /setup/model (NOT stuck on /setup/default)
+    // and Continue stays disabled because neither can supply the 5 curated candidates.
+    server.state.progress.models = 'subscription_or_key';
+    server.state.progress.runs_on = 'cloud';
+    server.state.progress.setup_on = 'browser';
+    renderRealWizardApp('/dashboard');
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/setup/model'), { timeout: 5000 });
+    expect(await screen.findByRole('button', { name: /Google Antigravity/i }, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.queryByTestId('setup-sub-api-key')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
+
+    // 2) Legacy /setup/defaults with sharing off and only uncurated OpenAI models:
+    // shows contact-admin + Retry, blocks Continue, and refuses to save gpt-5 / gpt-5-mini.
+    cleanup();
+    server.state.preferences = {
+      model_preference: {
+        preferred_model: 'gpt-5',
+        preferred_background_model: 'gpt-5-mini',
+      },
+    };
+    renderRealWizardApp('/setup/defaults');
+    const defaultsEmpty = await screen.findByTestId('setup-defaults-team-models-empty', {}, { timeout: 5000 });
+    expect(defaultsEmpty).toHaveTextContent(/No recommended team models configured yet\. Please contact your administrator\./i);
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
+    expect(server.lastPreferencesPut).toBeNull();
+
+    // 3) Personal Antigravity OAuth connected (sharing off) with stale server cache missing all 5 curated candidates:
+    // /setup/default shows contact-admin + Retry, Continue is disabled; clicking Try again sends refresh=1 and unlocks setup.
+    cleanup();
+    server.state.preferences = {};
+    server.state.connectedOAuthProviders = ['antigravity'];
+    server.state.availableModelsCalls = [];
+    server.state.availableModelsByProvider = {
+      openai: { status: 'ok', ready: ['gpt-5', 'gpt-5-mini'] },
+      'antigravity-oauth': ({ refresh }) => (
+        refresh
+          ? {
+              status: 'ok',
+              ready: ['gemini-4-neon-high-oauth', 'gemini-4-hydrogen-low-oauth'],
+              missing: [],
+              cached: false,
+            }
+          : {
+              status: 'ok',
+              ready: [],
+              missing: [
+                'gemini-4-neon-high-oauth',
+                'gemini-4-carbon-medium-oauth',
+                'gemini-4-hydrogen-low-oauth',
+                'gemini-4-hydrogen-high-oauth',
+                'claude-opus-5-5-medium-oauth',
+              ],
+              cached: true,
+            }
+      ),
+    };
+    renderRealWizardApp('/setup/default');
+    const defaultEmpty = await screen.findByTestId('setup-default-team-models-empty', {}, { timeout: 5000 });
+    expect(defaultEmpty).toHaveTextContent(/No recommended team models configured yet\. Please contact your administrator\./i);
+    expect(screen.queryByRole('radio', { name: /GPT 5 Pro/i })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
+
+    await user.click(screen.getByRole('button', { name: 'Try again' }));
+    await waitFor(
+      () => expect(screen.getByRole('radio', { name: /Gemini 4 Neon/i })).toBeChecked(),
+      { timeout: 5000 },
+    );
+    expect(server.state.availableModelsCalls.some((c) => c.provider === 'antigravity-oauth' && c.refresh)).toBe(true);
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeEnabled();
+
+    await user.click(screen.getByRole('button', { name: 'Continue' }));
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/welcome'), { timeout: 5000 });
+    expect(server.lastPreferencesPut).toMatchObject({
+      model_preference: expect.objectContaining({
+        preferred_model: 'gemini-4-neon-high-oauth',
+        preferred_background_model: 'gemini-4-hydrogen-low-oauth',
+      }),
+    });
   }, 15_000);
 
   it('(A4) legacy /setup/method surfaces load-failure notice with Try again when reading team models fails and recovers on Retry', async () => {
@@ -1181,6 +1329,24 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     await user.click(retryBtn);
     await waitFor(() => expect(screen.queryByTestId('setup-load-failed')).toBeNull(), { timeout: 5000 });
     expect(await screen.findByRole('button', { name: /Skip to models/i }, { timeout: 5000 })).toBeInTheDocument();
+  }, 15_000);
+
+  it('(A4-admin) legacy /setup/method keeps provider connect entries visible for admins when team-models read fails alongside load-failure notice and Retry', async () => {
+    const user = userEvent.setup();
+    server.state.callerTier = 'admin';
+    server.state.oauthFailPaths = ['/api/v1/oauth/codex/status'];
+
+    renderRealWizardApp('/setup/method');
+    expect(await screen.findByTestId('setup-load-failed', {}, { timeout: 5000 })).toBeInTheDocument();
+    // Admin still sees connection entries (OAuth sign-in & API key) so they can connect another provider
+    expect(screen.getByRole('button', { name: /Sign in to Google Antigravity, ChatGPT or Grok/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /API key/i })).toBeInTheDocument();
+
+    // Recovering via Try again clears the failure banner
+    server.state.oauthFailPaths = [];
+    await user.click(screen.getByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(screen.queryByTestId('setup-load-failed')).toBeNull(), { timeout: 5000 });
+    expect(screen.getByRole('button', { name: /Sign in to Google Antigravity, ChatGPT or Grok/i })).toBeInTheDocument();
   }, 15_000);
 
   it('(A5) legacy /setup/defaults normalizes a saved Hydrogen High background when only Hydrogen Low is offered and keeps dropdown/save consistent', async () => {

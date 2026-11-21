@@ -74,7 +74,8 @@ export default function DefaultStep() {
     if (behind) return <Navigate to={SETUP_STEP_PATHS[behind]} replace />;
     if (unread) return <StepLoadFailed onRetry={retry} />;
     // An unread catalog offers no model, and Continue would finish on none.
-    if (all.unread) return <StepLoadFailed onRetry={isDaltonBuild && team.shared ? team.retry : flow.retryFacts} />;
+    // DALTON-HOOK(dalton-setup): retry via unified team.retry in Dalton so both team and personal catalogs refresh
+    if (all.unread) return <StepLoadFailed onRetry={isDaltonBuild ? team.retry : flow.retryFacts} />;
     return <StepLoading />;
   }
   if (!flow.answers) return <Navigate to="/setup" replace />;
@@ -382,8 +383,8 @@ function DefaultForm({
       {flow.first && flow.answers && <AnswersStrip answers={flow.answers} teamModelsAvailable={team.available} />}
       <WizardStepHeader titleId={headingId} title={t('setup.answers.default.title')} helper={t('setup.answers.default.lead')} />
       {choices.list.length === 0 ? (
-        /* DALTON-HOOK(dalton-setup): prompt to contact admin & retry when team sharing has no available models */
-        isDaltonBuild && team.shared ? (
+        /* DALTON-HOOK(dalton-setup): always prompt to contact admin & retry in Dalton when none of the 5 curated candidates is available */
+        isDaltonBuild ? (
           <div
             data-testid="setup-default-team-models-empty"
             className="shell-box flex items-center justify-between gap-3 px-4 py-3"

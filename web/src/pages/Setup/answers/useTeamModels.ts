@@ -100,28 +100,36 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
       queryClient.invalidateQueries({ queryKey: queryKeys.oauth.all }),
       queryClient.invalidateQueries({ queryKey: queryKeys.user.preferences() }),
     ]).then(async () => {
-      if (useSharedQuery) {
+      const credsStatus = useSharedQuery
+        ? queryClient.getQueryData<{ enabled?: boolean }>(queryKeys.dalton.credentialsStatus(userId))
+        : null;
+      if (useSharedQuery && credsStatus?.enabled) {
         await queryClient.refetchQueries({ queryKey: [...queryKeys.dalton.all, 'team-models-available'] });
         return;
       }
-      // Local fallback path: refresh server-cached provider lists with `?refresh=1`.
+      // Personal credentials (sharing off / status unread) or local fallback path:
+      // cancel any in-flight normal provider list request and force-refresh with `?refresh=1`.
       await Promise.allSettled(
-        listedProviders.map((provider) =>
-          queryClient
-            .fetchQuery({
-              queryKey: queryKeys.providerModels.available(provider, ''),
-              queryFn: ({ signal }) => getProviderAvailableModels(provider, { refresh: true, signal }),
-              staleTime: 0,
-              retry: false,
-            })
-            .then(() => {
-              const whole = queryKeys.providerModels.available(provider, '');
-              queryClient.removeQueries({
-                queryKey: queryKeys.providerModels.availableFor(provider),
-                predicate: (q) => q.queryKey.at(-1) !== whole.at(-1),
-              });
-            }),
-        ),
+        listedProviders.map(async (provider) => {
+          const whole = queryKeys.providerModels.available(provider, '');
+          await queryClient.cancelQueries({ queryKey: whole, exact: true });
+          let forcedRan = false;
+          await queryClient.fetchQuery({
+            queryKey: whole,
+            queryFn: ({ signal }) => {
+              forcedRan = true;
+              return getProviderAvailableModels(provider, { refresh: true, signal });
+            },
+            staleTime: 0,
+            retry: false,
+          });
+          if (forcedRan) {
+            queryClient.removeQueries({
+              queryKey: queryKeys.providerModels.availableFor(provider),
+              predicate: (q) => q.queryKey.at(-1) !== whole.at(-1),
+            });
+          }
+        }),
       );
     });
   }, [queryClient, userId, useSharedQuery, listedProviders]);
