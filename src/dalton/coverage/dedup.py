@@ -1,50 +1,53 @@
 """Company workspace deduplication before creating a new workspace.
 
-Checks active company coverage units (`dalton_coverage_units` + internal-member
-aliases from `dalton_coverage` / `SUPPLEMENTAL_TICKER_ALIASES`) and existing
-live, non-Home, non-historical-duplicate company workspaces owned by internal
-team members when both `is_coverage_units_enabled()` and
-`is_dalton_supabase_auth_enabled()` are True.
+Collects candidate workspaces (and bound active company coverage units for
+internal team members) within strict tier visibility boundaries, then delegates
+"is this the same company?" matching to an LLM via `dalton_complete` using
+`models.assist_model` (falling back to `models.assist_fallback_model`).
 
-Advisory only: DB/permission/alias lookup failures log a warning (without
-user data) and allow creation to proceed.
+Visibility and authorization remain strictly deterministic in code:
+- Active only when both `is_coverage_units_enabled()` and
+  `is_dalton_supabase_auth_enabled()` are True.
+- `company` tier callers bypass dedup.
+- `external` tier callers check ONLY their own live, non-Home,
+  non-historical-duplicate workspaces (no coverage units, no internal data).
+- `admin` / `internal` tier callers check all internal members' live,
+  non-Home, non-historical-duplicate workspaces (all kinds: company, sector,
+  topic) enriched with active company coverage units and latest company docs.
+- Caller's own exact `workspace_name_key` exits early for `WorkspaceNameTaken`
+  without calling the model.
+- Advisory only: DB/LLM/timeout/budget/permission failures log a warning
+  (exception class name only, no user data) and allow creation to proceed.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import re
-import unicodedata
-from collections.abc import Iterable, Mapping
+import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import HTTPException
 from psycopg.rows import dict_row
+from pydantic import BaseModel, Field
 
 from src.dalton.access_tiers import get_user_tier
-from src.dalton.autonomy.units_view import load_dalton_automations_by_user
-from src.dalton.coverage.identity import (
-    _CLEAN_TICKER_RE,
-    SOURCE_REGISTERED,
-    TICKER_SOURCE_WORKSPACE_NAME,
-    is_historical_duplicate_workspace,
-    resolve_workspace_coverage_identity,
-    ticker_from_automation_rows,
-)
+from src.dalton.coverage.identity import is_historical_duplicate_workspace
 from src.dalton.database.coverage_units import _norm_uuid
+import src.dalton.llm.complete as complete_mod
+from src.dalton.llm.complete import dalton_complete
 from src.dalton.settings import (
+    get_assist_fallback_models,
+    get_dalton_settings,
     is_coverage_units_enabled,
     is_dalton_supabase_auth_enabled,
 )
 import src.dalton.sharing as sharing_mod
-from src.dalton.workflows.company_routing import (
-    _doc_ticker_content,
-    _is_sector_workspace,
-    _load_workspace_docs,
-    _ticker_key,
-)
 from src.server.database.home_workspace import HOME_STAND_IN_KEY, is_reserved_row
 from src.server.database.pool import get_db_connection
 from src.server.database.workspace_names import WorkspaceNameInvalid, workspace_name_key
@@ -52,28 +55,38 @@ from src.server.database.workspace_names import WorkspaceNameInvalid, workspace_
 logger = logging.getLogger(__name__)
 
 _REAL_GET_USER_TIER = get_user_tier
+_REAL_DALTON_COMPLETE = dalton_complete
 
 MAX_DUPLICATE_MATCHES = 3
+DEDUP_BATCH_SIZE = 1000
+DEDUP_TIMEOUT_SECONDS = 15.0
 
-# Strip only whitespace and the specified punctuation:
-# `,` `.` `-` `_` `'` `’` `·` `，` `。`.
-# Symbols such as `+`, `#`, `&` are preserved so "C++" does not collapse to "c".
-_NORMALIZE_STRIP_RE = re.compile(r"[\s,.\-_'’·，。]+")
-
-_PAREN_INSIDE_RE = re.compile(r"[（(]([^（）()]+)[）)]")
-_PAREN_BLOCK_RE = re.compile(r"[（(][^（）()]*[）)]")
-_CJK_LATIN_SPACE_RE = re.compile(
-    r"(?<=[\u4e00-\u9fff])\s+(?=[A-Za-z])|(?<=[A-Za-z])\s+(?=[\u4e00-\u9fff])"
+DEDUP_SYSTEM_PROMPT = (
+    "你是投研工作区查重助手。给定「待新建工作区名称」和「已有工作区候选清单」，"
+    "请判断清单中是否有与待新建名称指代同一家公司的已有工作区。\n"
+    "判断标准：\n"
+    "1. 只有当待新建名称与候选指代同一家公司（同一法人或同一上市主体，包括中英文名、常用简称、去掉公司后缀后的名称、股票代码的不同市场写法）时，才算重复。\n"
+    "2. 同一行业、上下游合作或竞争关系、母子公司（非同一上市主体）均不算重复。\n"
+    "3. 若待新建名称是普通主题词（例如 \"Macro\"、\"AI\"），除非候选清单里有明显就是以该词为名称或代码的公司条目，否则不算重复。\n"
+    "4. 把握不足、不确定时不要报告。\n"
+    "输出要求：只返回确认为同一家公司的候选项，最多 3 条；每条包含清单中的编号 id、把握程度 confidence（仅限 \"high\" 或 \"medium\"）和一句话原因 reason；没有匹配时 matches 返回空列表。"
 )
 
-# Trailing corporate suffixes stripped repeatedly (longest-first within each script).
-# Plain string comparison, not a regex: a regex with adjacent optional separator
-# runs backtracks cubically on a long run of spaces, and a coverage unit's
-# display_name is user-entered and unbounded.
-_LATIN_SUFFIXES = tuple(sorted(("Corporation", "Limited", "Holdings", "Holding", "Group", "Corp", "Inc.", "Inc", "Co.", "Co", "Ltd.", "Ltd", "PBC", "PLC", "plc", "N.V.", "NV", "SA", "AG"), key=len, reverse=True))
-_CJK_SUFFIXES = tuple(sorted(("股份有限公司", "有限公司", "股份", "集团", "控股"), key=len, reverse=True))
-# Longer names are not company names; deriving from them only costs time.
-_MAX_DISPLAY_NAME_CHARS = 200
+_FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
+
+
+class DedupMatchItem(BaseModel):
+    """Single duplicate candidate identified by the LLM."""
+
+    id: str
+    confidence: Literal["high", "medium"]
+    reason: str = ""
+
+
+class DedupLlmResult(BaseModel):
+    """Structured LLM response for company workspace deduplication."""
+
+    matches: list[DedupMatchItem] = Field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -150,104 +163,25 @@ class DuplicateMatch:
         return [m.to_dict() for m in self.matches]
 
 
-def normalize_company_name(raw: str | None) -> str:
-    """Normalize a company/workspace name: trim, casefold, strip spaces and `, . - _ ' ’ · ， 。`."""
-    text = unicodedata.normalize("NFC", str(raw or "")).strip().casefold()
-    if not text:
-        return ""
-    return _NORMALIZE_STRIP_RE.sub("", text)
+@dataclass(frozen=True)
+class _CandidateEntry:
+    """Internal candidate workspace representation before LLM matching."""
 
-
-def _is_suffix_separator(ch: str) -> bool:
-    return ch.isspace() or ch in ",，"
-
-
-def _rstrip_separators(text: str) -> str:
-    end = len(text)
-    while end and _is_suffix_separator(text[end - 1]):
-        end -= 1
-    return text[:end]
-
-
-def _strip_one_trailing_suffix(text: str) -> str | None:
-    body = _rstrip_separators(text)
-    folded = body.casefold()
-    for suffix in _LATIN_SUFFIXES:
-        if not folded.endswith(suffix.casefold()):
-            continue
-        head = body[: len(body) - len(suffix)]
-        # A Latin suffix must stand alone: start of name, a separator, or a CJK character before it.
-        if head == "" or _is_suffix_separator(head[-1]) or "\u4e00" <= head[-1] <= "\u9fff":
-            return _rstrip_separators(head)
-    for suffix in _CJK_SUFFIXES:
-        if body.endswith(suffix):
-            return _rstrip_separators(body[: len(body) - len(suffix)])
-    return None
-
-
-def derive_display_name_candidates(display_name: str | None) -> tuple[str, ...]:
-    """Derive deterministic candidate names from a company coverage unit's ``display_name``."""
-    raw = str(display_name or "").strip()
-    if not raw or len(raw) > _MAX_DISPLAY_NAME_CHARS:
-        return ()
-
-    seeds: list[str] = [raw]
-    if any(ch in raw for ch in ("(", ")", "（", "）")):
-        outside = " ".join(_PAREN_BLOCK_RE.sub(" ", raw).split()).strip()
-        if outside:
-            seeds.append(outside)
-        for inside in _PAREN_INSIDE_RE.findall(raw):
-            cleaned_inside = inside.strip()
-            if cleaned_inside:
-                seeds.append(cleaned_inside)
-
-    expanded: list[str] = []
-    for seed in seeds:
-        expanded.append(seed)
-        if _CJK_LATIN_SPACE_RE.search(seed):
-            for part in _CJK_LATIN_SPACE_RE.split(seed):
-                cleaned_part = part.strip()
-                if cleaned_part:
-                    expanded.append(cleaned_part)
-
-    candidates: list[str] = []
-    seen_norm: set[str] = set()
-
-    def _add(val: str) -> None:
-        cleaned = val.strip()
-        norm = normalize_company_name(cleaned)
-        if len(cleaned) < 2 or len(norm) < 2:
-            return
-        if norm not in seen_norm:
-            seen_norm.add(norm)
-            candidates.append(cleaned)
-
-    for item in expanded:
-        _add(item)
-        cur = item
-        while True:
-            nxt = _strip_one_trailing_suffix(cur)
-            if nxt is None or nxt == cur:
-                break
-            _add(nxt)
-            cur = nxt
-
-    return tuple(candidates)
-
-
-def _is_unambiguous_ticker_name(raw: str | None) -> bool:
-    """A ticker-shaped name no ordinary topic would have: digits, `.XX` or `-X`."""
-    text = str(raw or "").strip()
-    return _is_ticker_shaped(text) and (
-        any(ch.isdigit() for ch in text) or "." in text or "-" in text
-    )
-
-
-def _is_ticker_shaped(raw: str | None) -> bool:
-    cleaned = str(raw or "").strip()
-    if not cleaned or cleaned.lower() == "home" or "_" in cleaned:
-        return False
-    return bool(_CLEAN_TICKER_RE.match(cleaned))
+    short_id: str
+    order_idx: int
+    ws_id: str
+    workspace_name: str
+    owner_name: str
+    lead_analyst_name: str | None
+    ticker: str | None
+    unit_ticker: str | None
+    unit_display_name: str | None
+    doc_ticker: str | None
+    doc_name: str | None
+    doc_name_zh: str | None
+    is_unit: bool
+    activity_ts: float
+    ws_row: dict[str, Any]
 
 
 def _safe_workspace_name_key(raw: str | None) -> str | None:
@@ -305,70 +239,6 @@ def _activity_timestamp(row: Mapping[str, Any]) -> float:
     return 0.0
 
 
-def _extract_alias_strings(raw_aliases: Any) -> list[str]:
-    out: list[str] = []
-    if isinstance(raw_aliases, Mapping):
-        for s_name in raw_aliases.get("search_names") or ():
-            cleaned = str(s_name or "").strip()
-            if cleaned:
-                out.append(cleaned)
-        for key in ("adr", "earnings_tracker"):
-            alt = str(raw_aliases.get(key) or "").strip()
-            if alt:
-                out.append(alt)
-    elif isinstance(raw_aliases, (list, tuple, set)):
-        for item in raw_aliases:
-            cleaned = str(item or "").strip()
-            if cleaned:
-                out.append(cleaned)
-    return out
-
-
-def _supplemental_aliases_by_key() -> dict[str, list[str]]:
-    merged: dict[str, list[str]] = {}
-    try:
-        from src.dalton.conversations.extractor import SUPPLEMENTAL_TICKER_ALIASES
-    except Exception:
-        return merged
-    for raw_ticker, names in SUPPLEMENTAL_TICKER_ALIASES.items():
-        t_key = _ticker_key(raw_ticker)
-        if not t_key:
-            continue
-        bucket = merged.setdefault(t_key, [])
-        for candidate in (raw_ticker, *names):
-            cleaned = str(candidate or "").strip()
-            if cleaned and cleaned not in bucket:
-                bucket.append(cleaned)
-    return merged
-
-
-def _ticker_variants_for_units(units: Iterable[Mapping[str, Any]]) -> list[str]:
-    variants: set[str] = set()
-    for u in units:
-        for raw in (u.get("ticker"), u.get("ticker_key")):
-            sym = str(raw or "").strip().upper()
-            if not sym:
-                continue
-            variants.add(sym)
-            if sym.endswith(".SS"):
-                base = sym[:-3]
-                variants.update({base, f"{base}.SH"})
-            elif sym.endswith((".SZ", ".BJ", ".SH")):
-                variants.add(sym.rsplit(".", 1)[0])
-            elif sym.endswith(".HK"):
-                base = sym[:-3]
-                stripped = base.lstrip("0") or "0"
-                variants.update({base, stripped, f"{stripped}.HK", f"{base.zfill(5)}.HK", base.zfill(5)})
-            elif sym.isdigit():
-                stripped = sym.lstrip("0") or "0"
-                variants.update({stripped, sym.zfill(5), f"{sym.zfill(5)}.HK", f"{stripped}.HK"})
-            elif "." in sym:
-                variants.add(sym.replace(".", "-"))
-            elif "-" in sym:
-                variants.add(sym.replace("-", "."))
-    return sorted(variants)
-
-
 def _format_duplicate_message(
     company: str, primary: DuplicateWorkspaceCandidate
 ) -> str:
@@ -421,7 +291,7 @@ async def _load_active_bound_units(cur: Any) -> list[dict[str, Any]]:
         LEFT JOIN users uuo ON uuo.user_id = u.owner_user_id
         LEFT JOIN users ul ON ul.user_id = COALESCE(u.lead_analyst_user_id, u.owner_user_id)
         WHERE u.status = 'active'
-          AND u.kind IN ('company', 'sector')
+          AND u.kind = 'company'
           AND w.status NOT IN ('deleted', 'unbound')
           AND (w.config->'home_stand_in') IS DISTINCT FROM 'true'::jsonb
           AND NULLIF(BTRIM(COALESCE(w.config->>'dalton_historical_duplicate_of', '')), '') IS NULL
@@ -430,9 +300,13 @@ async def _load_active_bound_units(cur: Any) -> list[dict[str, Any]]:
     return [dict(r) for r in await cur.fetchall()]
 
 
-async def _load_live_workspaces(cur: Any) -> list[dict[str, Any]]:
-    await cur.execute(
-        """
+async def _load_live_workspaces(
+    cur: Any,
+    *,
+    owner_user_id: str | None = None,
+) -> list[dict[str, Any]]:
+    owner_clause = "AND w.user_id = %s" if owner_user_id is not None else ""
+    sql = f"""
         SELECT w.workspace_id::text AS workspace_id,
                w.user_id,
                w.name,
@@ -448,48 +322,57 @@ async def _load_live_workspaces(cur: Any) -> list[dict[str, Any]]:
         LEFT JOIN users u ON u.user_id = w.user_id
         WHERE w.status NOT IN ('deleted', 'unbound')
           AND (w.config->'home_stand_in') IS DISTINCT FROM 'true'::jsonb
+          {owner_clause}
         """
-    )
+    if owner_user_id is not None:
+        await cur.execute(sql, (owner_user_id,))
+    else:
+        await cur.execute(sql)
     return [dict(r) for r in await cur.fetchall()]
 
 
-async def _load_coverage_aliases(
+async def _load_workspace_company_docs(
     cur: Any,
-    company_units: Iterable[Mapping[str, Any]],
-) -> dict[str, list[str]]:
-    merged = _supplemental_aliases_by_key()
-    variants = _ticker_variants_for_units(company_units)
-    if not variants:
-        return merged
-
+    ws_ids: list[str],
+) -> dict[str, dict[str, str]]:
+    """Load latest valid `company` knowledge doc ticker & company names per workspace."""
+    if not ws_ids:
+        return {}
     await cur.execute(
         """
-        SELECT dc.ticker, dc.name, dc.aliases, dc.user_id, u.email AS owner_email
-        FROM dalton_coverage dc
-        LEFT JOIN users u ON u.user_id = dc.user_id
-        WHERE UPPER(BTRIM(dc.ticker)) = ANY(%s)
+        SELECT DISTINCT ON (workspace_id)
+               workspace_id::text AS workspace_id,
+               jsonb_build_object(
+                   'ticker', content->>'ticker',
+                   'name', content->>'name',
+                   'name_zh', content->>'name_zh'
+               ) AS content
+        FROM dalton_knowledge_versions
+        WHERE schema_valid = TRUE
+          AND doc_key = 'company'
+          AND workspace_id = ANY(%s::uuid[])
+        ORDER BY workspace_id, version_no DESC
         """,
-        (variants,),
+        (ws_ids,),
     )
-    rows = await cur.fetchall()
-
-    for row in rows or ():
+    out: dict[str, dict[str, str]] = {}
+    for row in await cur.fetchall():
         if not isinstance(row, Mapping):
             continue
-        row_uid = str(row.get("user_id") or "").strip()
-        if not _is_internal_team_owner(row_uid, row.get("owner_email")):
+        if "doc_key" in row and str(row.get("doc_key") or "").strip().lower() != "company":
             continue
-        t_key = _ticker_key(row.get("ticker"))
-        if not t_key:
+        ws_id = _norm_uuid(row.get("workspace_id"))
+        if not ws_id:
             continue
-        bucket = merged.setdefault(t_key, [])
-        comp_name = str(row.get("name") or "").strip()
-        if comp_name and comp_name not in bucket:
-            bucket.append(comp_name)
-        for alias in _extract_alias_strings(row.get("aliases")):
-            if alias not in bucket:
-                bucket.append(alias)
-    return merged
+        content = row.get("content")
+        if not isinstance(content, Mapping):
+            continue
+        out[ws_id] = {
+            "ticker": str(content.get("ticker") or "").strip().upper(),
+            "name": str(content.get("name") or "").strip(),
+            "name_zh": str(content.get("name_zh") or "").strip(),
+        }
+    return out
 
 
 def _row_is_home_stand_in(
@@ -524,12 +407,9 @@ def _is_excluded_workspace(
     ws_owner_id: str,
     ws_status: str,
     row: Mapping[str, Any],
-    sector_ws_ids: set[str],
     config_key: str = "config",
 ) -> bool:
     if not ws_id or ws_status in ("deleted", "unbound"):
-        return True
-    if ws_id in sector_ws_ids:
         return True
     if _row_is_stand_in_or_historical(row, config_key=config_key):
         return True
@@ -541,42 +421,6 @@ def _is_excluded_workspace(
     }
     if is_reserved_row(ws_check) or is_historical_duplicate_workspace(ws_check):
         return True
-    return False
-
-
-def _unit_matches_input(
-    unit: Mapping[str, Any],
-    *,
-    norm_input: str,
-    input_ticker_key: str | None,
-    aliases_by_key: Mapping[str, Iterable[str]],
-) -> bool:
-    raw_ticker = str(unit.get("ticker") or "").strip()
-    raw_ticker_key = str(unit.get("ticker_key") or "").strip()
-    unit_ticker_key = (
-        _ticker_key(raw_ticker_key or raw_ticker)
-        if (raw_ticker_key or raw_ticker)
-        else None
-    )
-    if input_ticker_key and unit_ticker_key and input_ticker_key == unit_ticker_key:
-        return True
-
-    display_name = str(unit.get("display_name") or "").strip()
-    if display_name and norm_input:
-        for cand in derive_display_name_candidates(display_name):
-            if normalize_company_name(cand) == norm_input:
-                return True
-
-    alias_candidates: list[str] = _extract_alias_strings(unit.get("aliases"))
-    if unit_ticker_key and unit_ticker_key in aliases_by_key:
-        alias_candidates.extend(aliases_by_key[unit_ticker_key])
-    for alias in alias_candidates:
-        if input_ticker_key and _is_ticker_shaped(alias):
-            if _ticker_key(alias) == input_ticker_key:
-                return True
-            continue
-        if norm_input and normalize_company_name(alias) == norm_input:
-            return True
     return False
 
 
@@ -631,152 +475,121 @@ async def _check_workspace_readable(
         sharing_mod._raise_on_caller_tier_external.reset(token)
 
 
-@dataclass(frozen=True)
-class _ScoredCandidate:
-    is_unit: bool
-    activity_ts: float
-    candidate: DuplicateWorkspaceCandidate
-    ws_row: dict[str, Any]
+def _caller_has_same_name_workspace(
+    ws_rows: list[dict[str, Any]],
+    *,
+    uid: str,
+    input_name_key: str | None,
+) -> bool:
+    if input_name_key is None:
+        return False
+    for ws in ws_rows:
+        ws_owner_id = str(ws.get("user_id") or "").strip()
+        ws_status = str(ws.get("status") or "").strip()
+        ws_name = str(ws.get("name") or "").strip()
+        ws_id = _norm_uuid(ws.get("workspace_id"))
+        if (
+            ws_owner_id == uid
+            and ws_status not in ("deleted", "unbound")
+            and not _row_is_home_stand_in(ws)
+            and not is_reserved_row(
+                {
+                    "workspace_id": ws_id,
+                    "user_id": ws_owner_id,
+                    "status": ws_status,
+                    "config": ws.get("config"),
+                }
+            )
+            and _safe_workspace_name_key(ws_name) == input_name_key
+        ):
+            return True
+    return False
 
 
-async def _find_matches(
+async def _collect_candidates(
     uid: str,
     raw_name: str,
     *,
-    channel: str,
+    caller_tier: str,
     conn: Any = None,
     stats: dict[str, int] | None = None,
-) -> DuplicateMatch | None:
-    norm_input = normalize_company_name(raw_name)
-    is_ticker_input = _is_ticker_shaped(raw_name)
-    input_ticker_key = _ticker_key(raw_name) if is_ticker_input else None
-    if not norm_input and not input_ticker_key:
-        return None
-    input_name_key = _safe_workspace_name_key(raw_name)
+) -> tuple[bool, list[_CandidateEntry]]:
+    """Collect candidate workspaces (and company units for internal callers).
 
-    matched: dict[str, _ScoredCandidate] = {}
+    Returns ``(early_exit_same_name, candidates)`` with the DB connection released
+    before returning.
+    """
+    input_name_key = _safe_workspace_name_key(raw_name)
+    is_external = caller_tier == "external"
+
+    raw_items: dict[str, dict[str, Any]] = {}
 
     async with get_db_connection(conn) as c:
         async with c.cursor(row_factory=dict_row) as cur:
-            unit_rows = await _load_active_bound_units(cur)
-            ws_rows = await _load_live_workspaces(cur)
+            if is_external:
+                unit_rows: list[dict[str, Any]] = []
+                ws_rows = await _load_live_workspaces(cur, owner_user_id=uid)
+                ws_rows = [
+                    ws
+                    for ws in ws_rows
+                    if str(ws.get("user_id") or "").strip() == uid
+                ]
+            else:
+                unit_rows = await _load_active_bound_units(cur)
+                ws_rows = await _load_live_workspaces(cur)
+
             if stats is not None:
                 stats["workspace_count"] = len(ws_rows)
 
-            # Decision 6: if the caller already has a live non-reserved workspace with the
-            # exact same workspace_name_key, stop dedup and let WorkspaceNameTaken report it.
-            if input_name_key is not None:
-                for ws in ws_rows:
-                    ws_owner_id = str(ws.get("user_id") or "").strip()
-                    ws_status = str(ws.get("status") or "").strip()
-                    ws_name = str(ws.get("name") or "").strip()
-                    ws_id = _norm_uuid(ws.get("workspace_id"))
-                    if (
-                        ws_owner_id == uid
-                        and ws_status not in ("deleted", "unbound")
-                        and not _row_is_home_stand_in(ws)
-                        and not is_reserved_row(
-                            {
-                                "workspace_id": ws_id,
-                                "user_id": ws_owner_id,
-                                "status": ws_status,
-                                "config": ws.get("config"),
-                            }
-                        )
-                        and _safe_workspace_name_key(ws_name) == input_name_key
-                    ):
-                        return None
-
-            sector_ws_ids = {
-                _norm_uuid(u.get("workspace_id"))
-                for u in unit_rows
-                if str(u.get("kind") or "").strip().lower() == "sector"
-                and u.get("workspace_id")
-            }
+            if _caller_has_same_name_workspace(
+                ws_rows, uid=uid, input_name_key=input_name_key
+            ):
+                return True, []
 
             units_by_ws: dict[str, dict[str, Any]] = {}
-            internal_company_units: list[dict[str, Any]] = []
-            for u in unit_rows:
-                ws_id_u = _norm_uuid(u.get("workspace_id"))
-                if ws_id_u:
+            if not is_external:
+                for u in unit_rows:
+                    if str(u.get("kind") or "").strip().lower() != "company":
+                        continue
+                    ws_id_u = _norm_uuid(u.get("workspace_id"))
+                    ws_owner_id = str(
+                        u.get("workspace_owner_id") or u.get("owner_user_id") or ""
+                    ).strip()
+                    if not _is_internal_team_owner(ws_owner_id, u.get("owner_email")):
+                        continue
+                    unit_owner_id = str(u.get("owner_user_id") or ws_owner_id).strip()
+                    unit_owner_email = (
+                        u.get("unit_owner_email")
+                        if "unit_owner_email" in u
+                        else u.get("owner_email")
+                    )
+                    if (
+                        unit_owner_id
+                        and unit_owner_id != ws_owner_id
+                        and not _is_internal_team_owner(unit_owner_id, unit_owner_email)
+                    ):
+                        continue
+                    ws_name = str(u.get("workspace_name") or "").strip()
+                    ws_status = str(u.get("workspace_status") or "").strip()
+                    if not ws_name or _is_excluded_workspace(
+                        ws_id=ws_id_u,
+                        ws_owner_id=ws_owner_id,
+                        ws_status=ws_status,
+                        row=u,
+                        config_key="workspace_config",
+                    ):
+                        continue
                     units_by_ws[ws_id_u] = u
-                if str(u.get("kind") or "").strip().lower() != "company":
-                    continue
-                ws_owner_id = str(u.get("workspace_owner_id") or u.get("owner_user_id") or "").strip()
-                if not _is_internal_team_owner(ws_owner_id, u.get("owner_email")):
-                    continue
-                unit_owner_id = str(u.get("owner_user_id") or ws_owner_id).strip()
-                unit_owner_email = u.get("unit_owner_email") if "unit_owner_email" in u else u.get("owner_email")
-                if unit_owner_id and unit_owner_id != ws_owner_id and not _is_internal_team_owner(unit_owner_id, unit_owner_email):
-                    continue
-                internal_company_units.append(u)
 
-            aliases_by_key = await _load_coverage_aliases(cur, internal_company_units)
-
-            unit_candidates: dict[str, _ScoredCandidate] = {}
-            for u in internal_company_units:
-                ws_id = _norm_uuid(u.get("workspace_id"))
-                ws_owner_id = str(u.get("workspace_owner_id") or u.get("owner_user_id") or "").strip()
-                ws_name = str(u.get("workspace_name") or "").strip()
-                ws_status = str(u.get("workspace_status") or "").strip()
-                if not ws_name or _is_excluded_workspace(
-                    ws_id=ws_id,
-                    ws_owner_id=ws_owner_id,
-                    ws_status=ws_status,
-                    row=u,
-                    sector_ws_ids=sector_ws_ids,
-                    config_key="workspace_config",
-                ):
-                    continue
-                if not _unit_matches_input(
-                    u,
-                    norm_input=norm_input,
-                    input_ticker_key=input_ticker_key,
-                    aliases_by_key=aliases_by_key,
-                ):
-                    continue
-
-                owner_name = _resolve_display_name(
-                    u.get("owner_name"), u.get("owner_email"), ws_owner_id
-                )
-                lead_uid = str(
-                    u.get("lead_analyst_user_id") or u.get("owner_user_id") or ""
-                ).strip()
-                lead_name = (
-                    _resolve_display_name(u.get("lead_name"), u.get("lead_email"), lead_uid)
-                    if lead_uid
-                    else None
-                )
-                unit_ticker = str(u.get("ticker") or "").strip().upper() or None
-                ws_row = {
-                    "workspace_id": ws_id,
-                    "user_id": ws_owner_id,
-                    "name": ws_name,
-                    "status": ws_status,
-                }
-                unit_candidates[ws_id] = _ScoredCandidate(
-                    is_unit=True,
-                    activity_ts=_activity_timestamp(u),
-                    candidate=DuplicateWorkspaceCandidate(
-                        workspace_name=ws_name,
-                        owner_name=owner_name,
-                        can_read=False,
-                        workspace_id=ws_id,
-                        lead_analyst_name=lead_name,
-                        ticker=unit_ticker,
-                        matched_by="coverage_unit",
-                    ),
-                    ws_row=ws_row,
-                )
-
-            ws_pre_candidates: list[tuple[str, str, str | None, dict[str, Any]]] = []
             for ws in ws_rows:
                 ws_id = _norm_uuid(ws.get("workspace_id"))
-                if not ws_id or ws_id in unit_candidates:
-                    continue
                 ws_owner_id = str(ws.get("user_id") or "").strip()
-                if not _is_internal_team_owner(ws_owner_id, ws.get("owner_email")):
+                if is_external:
+                    if ws_owner_id != uid:
+                        continue
+                elif not _is_internal_team_owner(ws_owner_id, ws.get("owner_email")):
                     continue
+
                 ws_name = str(ws.get("name") or "").strip()
                 ws_status = str(ws.get("status") or "").strip()
                 if not ws_name or _is_excluded_workspace(
@@ -784,156 +597,435 @@ async def _find_matches(
                     ws_owner_id=ws_owner_id,
                     ws_status=ws_status,
                     row=ws,
-                    sector_ws_ids=sector_ws_ids,
                 ):
                     continue
-
-                matched_by = ""
-                matched_ticker: str | None = None
-                both_ticker_shaped = bool(input_ticker_key and _is_ticker_shaped(ws_name))
-                if (
-                    norm_input
-                    and normalize_company_name(ws_name) == norm_input
-                    and (not both_ticker_shaped or _ticker_key(ws_name) == input_ticker_key)
-                ):
-                    matched_by = "workspace_name"
-                elif (
-                    both_ticker_shaped
-                    and _ticker_key(ws_name) == input_ticker_key
-                ):
-                    matched_by = "workspace_ticker"
-                    matched_ticker = ws_name.strip().upper()
-
-                if matched_by:
-                    ws_pre_candidates.append((ws_id, matched_by, matched_ticker, ws))
-
-            check_ws_ids = sorted(
-                set(unit_candidates) | {item[0] for item in ws_pre_candidates}
-            )
-            docs_by_ws: dict[str, dict[str, Any]] = {}
-            autos_by_user: dict[str, list[dict[str, Any]]] = {}
-            if check_ws_ids:
-                docs_by_ws = await _load_workspace_docs(cur, check_ws_ids)
-                owner_ids = sorted(
-                    {
-                        item.ws_row["user_id"]
-                        for item in unit_candidates.values()
-                        if item.ws_row.get("user_id")
-                    }
-                    | {
-                        str(ws.get("user_id") or "").strip()
-                        for _, _, _, ws in ws_pre_candidates
-                        if str(ws.get("user_id") or "").strip()
-                    }
-                )
-                if len(owner_ids) <= 3:
-                    for oid in owner_ids:
-                        autos_by_user.update(
-                            await load_dalton_automations_by_user(cur, oid)
-                        )
-                else:
-                    autos_by_user = await load_dalton_automations_by_user(cur, None)
-
-            for ws_id, item in unit_candidates.items():
-                docs = docs_by_ws.get(ws_id) or {}
-                owner_autos = autos_by_user.get(item.ws_row["user_id"], [])
-                if _is_sector_workspace(
-                    unit=units_by_ws.get(ws_id),
-                    doc_keys=set(docs),
-                    automations=owner_autos,
-                    workspace_id=ws_id,
-                ):
-                    continue
-                matched[ws_id] = item
-
-            for ws_id, matched_by, matched_ticker, ws in ws_pre_candidates:
-                ws_owner_id = str(ws.get("user_id") or "").strip()
-                ws_name = str(ws.get("name") or "").strip()
-                ws_status = str(ws.get("status") or "").strip()
-                docs = docs_by_ws.get(ws_id) or {}
-                owner_autos = autos_by_user.get(ws_owner_id, [])
-                if _is_sector_workspace(
-                    unit=units_by_ws.get(ws_id),
-                    doc_keys=set(docs),
-                    automations=owner_autos,
-                    workspace_id=ws_id,
-                ):
-                    continue
-
-                ws_identity_row = {
-                    "workspace_id": ws_id,
-                    "user_id": ws_owner_id,
-                    "name": ws_name,
-                    "status": ws_status,
-                }
-                # Same company test for an exact-name match and a ticker-equivalent
-                # name match ("700.HK" vs "0700.HK"), so the two never disagree.
-                if matched_by in ("workspace_name", "workspace_ticker"):
-                    identity = await resolve_workspace_coverage_identity(
-                        ws_identity_row,
-                        company_content=_doc_ticker_content(docs, "company"),
-                        thesis_content=_doc_ticker_content(docs, "thesis"),
-                        registered_units=units_by_ws,
-                        automations=owner_autos,
-                    )
-                    # An all-letter ticker-shaped name alone ("Macro") is not a company;
-                    # it counts with a unit, a company doc or a bound tracking task
-                    # ("NVDA" + dalton-nvda-watch). A name with digits, a market suffix
-                    # or a share class ("0700.HK", "600519", "BRK-B") is a ticker by itself.
-                    if not identity.is_company or (
-                        identity.source != SOURCE_REGISTERED
-                        and identity.ticker_source == TICKER_SOURCE_WORKSPACE_NAME
-                        and not _is_unambiguous_ticker_name(ws_name)
-                        and ticker_from_automation_rows(
-                            ws_id,
-                            # Only rows bound to this workspace: a legacy row with no
-                            # workspace_id would make every ticker-named workspace of
-                            # the owner look tracked.
-                            [a for a in owner_autos if str(a.get("workspace_id") or "") == str(ws_id)],
-                        )
-                        is None
-                    ):
-                        continue
-                    if matched_ticker is None and identity.ticker:
-                        matched_ticker = identity.ticker
 
                 owner_name = _resolve_display_name(
                     ws.get("owner_name"), ws.get("owner_email"), ws_owner_id
                 )
-                matched[ws_id] = _ScoredCandidate(
-                    is_unit=False,
-                    activity_ts=_activity_timestamp(ws),
-                    candidate=DuplicateWorkspaceCandidate(
-                        workspace_name=ws_name,
-                        owner_name=owner_name,
-                        can_read=False,
-                        workspace_id=ws_id,
-                        lead_analyst_name=None,
-                        ticker=matched_ticker,
-                        matched_by=matched_by,
-                    ),
-                    ws_row=ws_identity_row,
-                )
+                raw_items[ws_id] = {
+                    "ws_id": ws_id,
+                    "ws_name": ws_name,
+                    "owner_name": owner_name,
+                    "activity_ts": _activity_timestamp(ws),
+                    "ws_row": {
+                        "workspace_id": ws_id,
+                        "user_id": ws_owner_id,
+                        "name": ws_name,
+                        "status": ws_status,
+                    },
+                    "unit": units_by_ws.get(ws_id),
+                }
 
-    if not matched:
+            for ws_id, u in units_by_ws.items():
+                if ws_id in raw_items:
+                    continue
+                ws_owner_id = str(
+                    u.get("workspace_owner_id") or u.get("owner_user_id") or ""
+                ).strip()
+                ws_name = str(u.get("workspace_name") or "").strip()
+                ws_status = str(u.get("workspace_status") or "").strip()
+                owner_name = _resolve_display_name(
+                    u.get("owner_name"), u.get("owner_email"), ws_owner_id
+                )
+                raw_items[ws_id] = {
+                    "ws_id": ws_id,
+                    "ws_name": ws_name,
+                    "owner_name": owner_name,
+                    "activity_ts": _activity_timestamp(u),
+                    "ws_row": {
+                        "workspace_id": ws_id,
+                        "user_id": ws_owner_id,
+                        "name": ws_name,
+                        "status": ws_status,
+                    },
+                    "unit": u,
+                }
+
+            if stats is not None:
+                stats["workspace_count"] = max(stats["workspace_count"], len(raw_items))
+
+            if not raw_items:
+                return False, []
+
+            docs_by_ws = await _load_workspace_company_docs(cur, sorted(raw_items))
+
+    # Connection `c` is now released before LLM calls and permission checks.
+    prelim: list[dict[str, Any]] = []
+    for ws_id, item in raw_items.items():
+        u = item["unit"]
+        doc = docs_by_ws.get(ws_id) or {}
+        unit_ticker = (
+            str(u.get("ticker") or "").strip().upper() or None
+            if u is not None
+            else None
+        )
+        unit_display_name = (
+            str(u.get("display_name") or "").strip() or None
+            if u is not None
+            else None
+        )
+        lead_uid = (
+            str(u.get("lead_analyst_user_id") or u.get("owner_user_id") or "").strip()
+            if u is not None
+            else ""
+        )
+        lead_name = (
+            _resolve_display_name(u.get("lead_name"), u.get("lead_email"), lead_uid)
+            if u is not None and lead_uid
+            else None
+        )
+        doc_ticker = str(doc.get("ticker") or "").strip().upper() or None
+        doc_name = str(doc.get("name") or "").strip() or None
+        doc_name_zh = str(doc.get("name_zh") or "").strip() or None
+        effective_ticker = unit_ticker or doc_ticker
+
+        prelim.append(
+            {
+                **item,
+                "is_unit": u is not None,
+                "lead_analyst_name": lead_name,
+                "ticker": effective_ticker,
+                "unit_ticker": unit_ticker,
+                "unit_display_name": unit_display_name,
+                "doc_ticker": doc_ticker,
+                "doc_name": doc_name,
+                "doc_name_zh": doc_name_zh,
+            }
+        )
+
+    prelim.sort(
+        key=lambda x: (
+            0 if x["is_unit"] else 1,
+            -float(x["activity_ts"]),
+            str(x["ws_name"]).casefold(),
+            str(x["ws_id"]),
+        )
+    )
+
+    entries: list[_CandidateEntry] = []
+    for idx, item in enumerate(prelim):
+        entries.append(
+            _CandidateEntry(
+                short_id=f"c{idx + 1}",
+                order_idx=idx,
+                ws_id=item["ws_id"],
+                workspace_name=item["ws_name"],
+                owner_name=item["owner_name"],
+                lead_analyst_name=item["lead_analyst_name"],
+                ticker=item["ticker"],
+                unit_ticker=item["unit_ticker"],
+                unit_display_name=item["unit_display_name"],
+                doc_ticker=item["doc_ticker"],
+                doc_name=item["doc_name"],
+                doc_name_zh=item["doc_name_zh"],
+                is_unit=item["is_unit"],
+                activity_ts=item["activity_ts"],
+                ws_row=item["ws_row"],
+            )
+        )
+    return False, entries
+
+
+def _clean_cell(raw: str | None) -> str:
+    if not raw:
+        return ""
+    return " ".join(str(raw).replace("|", "/").split())
+
+
+def _format_candidate_line(entry: _CandidateEntry) -> str:
+    """Format one candidate as a single pipe-delimited line without UUID or owner."""
+    tickers: list[str] = []
+    for raw_t in (entry.unit_ticker, entry.doc_ticker):
+        cleaned_t = _clean_cell(raw_t).upper()
+        if cleaned_t and cleaned_t not in tickers:
+            tickers.append(cleaned_t)
+
+    names: list[str] = []
+    seen_names: set[str] = set()
+    for raw_n in (entry.unit_display_name, entry.doc_name, entry.doc_name_zh):
+        cleaned_n = _clean_cell(raw_n)
+        if not cleaned_n:
+            continue
+        folded = cleaned_n.casefold()
+        if folded not in seen_names:
+            seen_names.add(folded)
+            names.append(cleaned_n)
+
+    parts = [entry.short_id, _clean_cell(entry.workspace_name)]
+    if tickers:
+        parts.append(" / ".join(tickers))
+    if names:
+        parts.append(" / ".join(names))
+    return " | ".join(parts)
+
+
+def _build_batch_user_prompt(raw_name: str, batch: list[_CandidateEntry]) -> str:
+    lines = "\n".join(_format_candidate_line(entry) for entry in batch)
+    cleaned_name = " ".join(str(raw_name or "").split())
+    return (
+        f"待新建工作区名称：{cleaned_name}\n\n"
+        "已有工作区候选清单（每行格式：编号 | 工作区名 | 代码 | 公司名，无代码或公司名时省略）：\n"
+        f"{lines}"
+    )
+
+
+def _resolve_dedup_models() -> list[str]:
+    cfg = get_dalton_settings()
+    primary = str(getattr(cfg.models, "assist_model", "") or "").strip()
+    fallbacks = get_assist_fallback_models()
+    models: list[str] = []
+    for m in (primary, *fallbacks):
+        cleaned = str(m or "").strip()
+        if cleaned and cleaned not in models:
+            models.append(cleaned)
+    return models
+
+
+def _get_dalton_complete_fn() -> Any:
+    if dalton_complete is not _REAL_DALTON_COMPLETE:
+        return dalton_complete
+    if complete_mod.dalton_complete is not _REAL_DALTON_COMPLETE:
+        return complete_mod.dalton_complete
+    return dalton_complete
+
+
+def _parse_llm_matches(
+    comp: Any,
+    batch_by_id: Mapping[str, _CandidateEntry],
+) -> list[tuple[_CandidateEntry, str, str]]:
+    """Parse structured LLM output and keep only valid confidence & existing IDs."""
+    raw_data = getattr(comp, "data", None)
+    raw_text = getattr(comp, "text", None)
+
+    raw_matches: Any = None
+    if isinstance(raw_data, DedupLlmResult):
+        raw_matches = raw_data.matches
+    elif isinstance(raw_data, Mapping):
+        if "matches" not in raw_data or not isinstance(raw_data["matches"], list):
+            raise ValueError("Invalid dedup structured payload: missing matches list")
+        raw_matches = raw_data["matches"]
+    elif raw_data is None and isinstance(raw_text, str) and raw_text.strip():
+        txt = raw_text.strip()
+        fence = _FENCE_RE.match(txt)
+        if fence:
+            txt = fence.group(1).strip()
+        parsed = json.loads(txt)
+        if not isinstance(parsed, Mapping) or not isinstance(
+            parsed.get("matches"), list
+        ):
+            raise ValueError("Invalid dedup JSON text payload: missing matches list")
+        raw_matches = parsed["matches"]
+    else:
+        raise ValueError("Empty or unparseable dedup LLM payload")
+
+    parsed_hits: list[tuple[_CandidateEntry, str, str]] = []
+    for item in raw_matches:
+        if isinstance(item, DedupMatchItem):
+            raw_id = item.id
+            raw_conf = item.confidence
+            raw_reason = item.reason
+        elif isinstance(item, Mapping):
+            raw_id = item.get("id")
+            raw_conf = item.get("confidence")
+            raw_reason = item.get("reason")
+        else:
+            continue
+
+        cand_id = str(raw_id or "").strip()
+        entry = batch_by_id.get(cand_id)
+        if entry is None:
+            continue
+
+        conf = str(raw_conf or "").strip().lower()
+        if conf not in ("high", "medium"):
+            continue
+
+        reason = str(raw_reason or "").strip()
+        parsed_hits.append((entry, conf, reason))
+
+    return parsed_hits
+
+
+async def _run_batch_with_fallback(
+    *,
+    uid: str,
+    raw_name: str,
+    batch: list[_CandidateEntry],
+    models: list[str],
+    deadline: float,
+    skip_journal: bool = False,
+) -> list[tuple[_CandidateEntry, str, str]]:
+    batch_by_id = {entry.short_id: entry for entry in batch}
+    user_prompt = _build_batch_user_prompt(raw_name, batch)
+    complete_fn = _get_dalton_complete_fn()
+
+    last_exc: Exception | None = None
+    for model_name in models:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Workspace dedup LLM deadline exceeded")
+        try:
+            comp = await complete_fn(
+                user_id=uid,
+                system_prompt=DEDUP_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                purpose="workspace_dedup",
+                request_model=model_name,
+                response_schema=DedupLlmResult,
+                slot="background",
+                timeout_s=remaining,
+                deadline=deadline,
+                raise_on_error=False,
+                skip_journal=skip_journal,
+            )
+            if not getattr(comp, "ok", False):
+                err_kind = str(getattr(comp, "error_kind", None) or "").strip().lower()
+                status = str(getattr(comp, "status", None) or "").strip().lower()
+                if err_kind in ("timeout", "deadline"):
+                    last_exc = TimeoutError(f"Dedup model {err_kind}")
+                    if err_kind == "deadline" or time.monotonic() >= deadline:
+                        raise last_exc
+                else:
+                    last_exc = RuntimeError(
+                        f"Dedup model call failed: {status or err_kind or 'unknown'}"
+                    )
+                continue
+            return _parse_llm_matches(comp, batch_by_id)
+        except Exception as exc:
+            last_exc = exc
+            if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) and time.monotonic() >= deadline:
+                raise
+            continue
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("No assist model configured for workspace dedup")
+
+
+async def _judge_candidates_with_llm(
+    *,
+    uid: str,
+    raw_name: str,
+    entries: list[_CandidateEntry],
+    stats: dict[str, int] | None = None,
+    skip_journal: bool = False,
+) -> list[tuple[_CandidateEntry, str, str]]:
+    """Run parallel batched LLM matching under a shared 15s deadline."""
+    if not entries:
+        return []
+    models = _resolve_dedup_models()
+    if not models:
+        raise RuntimeError("No assist model configured for workspace dedup")
+
+    batches = [
+        entries[i : i + DEDUP_BATCH_SIZE]
+        for i in range(0, len(entries), DEDUP_BATCH_SIZE)
+    ]
+    deadline = time.monotonic() + DEDUP_TIMEOUT_SECONDS
+
+    tasks = [
+        asyncio.create_task(
+            _run_batch_with_fallback(
+                uid=uid,
+                raw_name=raw_name,
+                batch=batch,
+                models=models,
+                deadline=deadline,
+                skip_journal=skip_journal,
+            )
+        )
+        for batch in batches
+    ]
+
+    remaining = max(0.0, deadline - time.monotonic())
+    done, pending = await asyncio.wait(tasks, timeout=remaining)
+    if pending:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    succeeded = 0
+    failed_exc: Exception | None = None
+    all_hits: list[tuple[_CandidateEntry, str, str]] = []
+
+    for task in done:
+        exc = task.exception()
+        if exc is not None:
+            failed_exc = exc if isinstance(exc, Exception) else RuntimeError(type(exc).__name__)
+            continue
+        succeeded += 1
+        all_hits.extend(task.result())
+
+    if pending and failed_exc is None:
+        failed_exc = TimeoutError("Workspace dedup LLM timed out")
+
+    ws_count = stats["workspace_count"] if stats is not None else len(entries)
+    if succeeded == 0:
+        raise failed_exc or TimeoutError("Workspace dedup LLM timed out")
+
+    if failed_exc is not None:
+        logger.warning(
+            "Company workspace dedup partial batch failure (%s, succeeded=%d/%d, workspace_count=%d)",
+            type(failed_exc).__name__,
+            succeeded,
+            len(batches),
+            ws_count,
+        )
+
+    # Deduplicate by workspace_id (prefer higher confidence) and sort:
+    # high before medium, then unit-backed, recent activity, original order.
+    best_by_ws: dict[str, tuple[_CandidateEntry, str, str]] = {}
+    for entry, conf, reason in all_hits:
+        existing = best_by_ws.get(entry.ws_id)
+        if existing is None or (existing[1] != "high" and conf == "high"):
+            best_by_ws[entry.ws_id] = (entry, conf, reason)
+
+    ranked = sorted(
+        best_by_ws.values(),
+        key=lambda item: (
+            0 if item[1] == "high" else 1,
+            0 if item[0].is_unit else 1,
+            -item[0].activity_ts,
+            item[0].order_idx,
+        ),
+    )
+    return ranked[:MAX_DUPLICATE_MATCHES]
+
+
+async def _find_matches(
+    uid: str,
+    raw_name: str,
+    *,
+    channel: str,
+    caller_tier: str,
+    conn: Any = None,
+    stats: dict[str, int] | None = None,
+) -> DuplicateMatch | None:
+    early_exit, entries = await _collect_candidates(
+        uid,
+        raw_name,
+        caller_tier=caller_tier,
+        conn=conn,
+        stats=stats,
+    )
+    if early_exit or not entries:
         return None
 
-    ordered = sorted(
-        matched.values(),
-        key=lambda item: (
-            0 if item.is_unit else 1,
-            -item.activity_ts,
-            item.candidate.workspace_name.casefold(),
-            item.candidate.workspace_id or "",
-        ),
-    )[:MAX_DUPLICATE_MATCHES]
+    hits = await _judge_candidates_with_llm(
+        uid=uid,
+        raw_name=raw_name,
+        entries=entries,
+        stats=stats,
+    )
+    if not hits:
+        return None
 
-    # Connection `c` is already released above before checking workspace permissions.
+    # Connection is already released before checking workspace permissions.
     resolved: list[DuplicateWorkspaceCandidate] = []
     matched_ids: list[str] = []
-    for item in ordered:
-        cand = item.candidate
-        ws_id = str(cand.workspace_id or "").strip()
+    for entry, conf, _reason in hits:
+        ws_id = entry.ws_id
         if ws_id:
             matched_ids.append(ws_id)
         can_read = False
@@ -942,18 +1034,18 @@ async def _find_matches(
                 ws_id,
                 uid,
                 channel=channel,
-                workspace=item.ws_row,
+                workspace=entry.ws_row,
                 conn=conn,
             )
         resolved.append(
             DuplicateWorkspaceCandidate(
-                workspace_name=cand.workspace_name,
-                owner_name=cand.owner_name,
+                workspace_name=entry.workspace_name,
+                owner_name=entry.owner_name,
                 can_read=can_read,
                 workspace_id=ws_id if can_read else None,
-                lead_analyst_name=cand.lead_analyst_name if can_read else None,
-                ticker=cand.ticker if can_read else None,
-                matched_by=cand.matched_by,
+                lead_analyst_name=entry.lead_analyst_name if can_read else None,
+                ticker=entry.ticker if can_read else None,
+                matched_by=f"llm:{conf}",
             )
         )
 
@@ -989,12 +1081,13 @@ async def find_existing_company_workspace(
     stats = {"workspace_count": 0}
     try:
         caller_tier = await _resolve_caller_tier(uid)
-        if caller_tier in ("external", "company"):
+        if caller_tier == "company":
             return None
         return await _find_matches(
             uid,
             raw_name,
             channel=cleaned_channel,
+            caller_tier=caller_tier,
             conn=conn,
             stats=stats,
         )
