@@ -14,9 +14,16 @@ import { FallbackModelsPicker } from '@/components/model/FallbackModelsPicker';
 import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
 import { getModelDisplayName } from '@/components/ui/chat-input.helpers';
 import { isPlatformMode } from '@/config/hostMode';
-// DALTON-HOOK(dalton-setup): Dalton build defaults & credits/Claude Code filtering
+// DALTON-HOOK(dalton-setup): Dalton build defaults, curated setup list, & credits/Claude Code filtering
 import { isDaltonBuild } from '@/config/brand';
-import { filterDaltonPayers, filterDaltonProviderModels, isDaltonAllowedModel } from '@/config/daltonSetup';
+import {
+  dedupeDaltonBackgroundModels,
+  filterDaltonCuratedModels,
+  filterDaltonPayers,
+  filterDaltonProviderModels,
+  isDaltonAllowedModel,
+  stripEffortFromModelLabel,
+} from '@/config/daltonSetup';
 import { isDesktopShell } from '@/lib/desktop';
 import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
 import { homeWorkspaceQuery } from '@/hooks/useHomeWorkspace';
@@ -257,7 +264,11 @@ function DefaultForm({
   }, [behind]);
 
   const name = (m: string) => getModelDisplayName(m, metadata);
-  const deploymentBackground = systemBackground ? t('settings.autoModel', { model: name(systemBackground) }) : undefined;
+  // DALTON-HOOK(dalton-setup): background slot runs at fixed low effort, so omit effort suffixes from its label
+  const backgroundName = (m: string) => (isDaltonBuild ? stripEffortFromModelLabel(name(m)) : name(m));
+  const backgroundSlotModels = dedupeDaltonBackgroundModels(visibleSlotModels, isDaltonBuild);
+  const curatedCustomizeModels = filterDaltonCuratedModels(visibleSlotModels, isDaltonBuild);
+  const deploymentBackground = systemBackground ? t('settings.autoModel', { model: backgroundName(systemBackground) }) : undefined;
   const onRecommended = primary === recommended.primary && background === recommendedBackground;
   // Self-hosted runs it on the token the server saved, wherever the turn is.
   const target = flow.tokenTarget;
@@ -414,7 +425,8 @@ function DefaultForm({
                     <dt style={{ color: 'var(--color-text-tertiary)' }}>{copy.background.label}</dt>
                     <dd className="flex flex-col gap-0.5">
                       <span className="font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                        {recommended.background ? name(recommended.background) : deploymentBackground}
+                        {/* DALTON-HOOK(dalton-setup): omit effort suffix on background model label */}
+                        {recommended.background ? backgroundName(recommended.background) : deploymentBackground}
                       </span>
                       {recommended.backgroundWhy && (
                         <span style={{ color: 'var(--color-text-secondary)' }}>
@@ -467,14 +479,15 @@ function DefaultForm({
                   transition={TWEEN.quick}
                 >
                   <div className="flex flex-col gap-6 pt-4">
-                    {/* DALTON-HOOK(dalton-setup): pass Dalton-filtered slot models, payers, and Auto option */}
+                    {/* DALTON-HOOK(dalton-setup): Dalton background dropdown omits effort labels & dedupes variants; Customize routing uses curated 5 */}
                     <ModelSelector
                       label={copy.background.label}
                       description={copy.background.description}
                       value={background}
                       onChange={setBackground}
-                      models={visibleSlotModels}
-                      missingLabel={name}
+                      models={backgroundSlotModels}
+                      missingLabel={backgroundName}
+                      nameOf={isDaltonBuild ? backgroundName : undefined}
                       placeholder={copy.background.placeholder}
                       autoOption={deploymentBackground ? { value: BACKGROUND_AUTO, label: deploymentBackground } : undefined}
                       payers={visiblePayers}
@@ -485,7 +498,8 @@ function DefaultForm({
                       description={t('settings.modelTuning.fetchModelDesc')}
                       value={fetchModel}
                       onChange={setFetchModel}
-                      models={visibleSlotModels}
+                      models={curatedCustomizeModels}
+                      nameOf={isDaltonBuild ? name : undefined}
                       placeholder={copy.defaultsToBackground}
                       payers={visiblePayers}
                       metadata={metadata}
@@ -495,16 +509,17 @@ function DefaultForm({
                       description={t('settings.modelTuning.compactionModelDesc')}
                       value={compactionModel}
                       onChange={setCompactionModel}
-                      models={visibleSlotModels}
+                      models={curatedCustomizeModels}
+                      nameOf={isDaltonBuild ? name : undefined}
                       placeholder={copy.defaultsToConversation}
                       payers={visiblePayers}
                       metadata={metadata}
                     />
-                    {/* DALTON-HOOK(dalton-setup): pass Dalton-filtered slot models and payers to FallbackModelsPicker */}
+                    {/* DALTON-HOOK(dalton-setup): pass Dalton curated models and payers to FallbackModelsPicker */}
                     <FallbackModelsPicker
                       selected={fallbackModels}
                       onChange={setFallbackModels}
-                      models={visibleSlotModels}
+                      models={curatedCustomizeModels}
                       metadata={metadata}
                       payers={visiblePayers}
                     />

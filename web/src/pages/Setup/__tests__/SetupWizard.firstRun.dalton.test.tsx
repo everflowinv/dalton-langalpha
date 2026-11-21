@@ -104,7 +104,13 @@ vi.mock('@/api/client', async (importOriginal) => {
         models: {
           'antigravity-oauth': {
             display_name: 'Antigravity',
-            models: ['gemini-4-neon-high-oauth', 'gemini-4-hydrogen-high-oauth'],
+            models: [
+              'gemini-4-neon-high-oauth',
+              'gemini-4-carbon-medium-oauth',
+              'gemini-4-hydrogen-low-oauth',
+              'gemini-4-hydrogen-high-oauth',
+              'claude-opus-5-5-medium-oauth',
+            ],
           },
           platform: {
             display_name: 'Platform',
@@ -118,18 +124,34 @@ vi.mock('@/api/client', async (importOriginal) => {
         },
         model_metadata: {
           'gemini-4-neon-high-oauth': {
-            display_name: 'Gemini 4 Neon High',
+            provider: 'antigravity-oauth',
+            access_type: 'oauth',
+            intelligence: 5,
+            speed: 4,
+          },
+          'gemini-4-carbon-medium-oauth': {
+            provider: 'antigravity-oauth',
+            access_type: 'oauth',
+            intelligence: 5,
+            speed: 3,
+          },
+          'gemini-4-hydrogen-low-oauth': {
             provider: 'antigravity-oauth',
             access_type: 'oauth',
             intelligence: 4,
-            speed: 3,
+            speed: 5,
           },
           'gemini-4-hydrogen-high-oauth': {
-            display_name: 'Gemini 4 Hydrogen High',
             provider: 'antigravity-oauth',
             access_type: 'oauth',
-            intelligence: 3,
+            intelligence: 4,
             speed: 5,
+          },
+          'claude-opus-5-5-medium-oauth': {
+            provider: 'antigravity-oauth',
+            access_type: 'oauth',
+            intelligence: 5,
+            speed: 3,
           },
           'credits-only-model': {
             display_name: 'Credits Only Model',
@@ -205,7 +227,15 @@ vi.mock('@/api/client', async (importOriginal) => {
         provider,
         status: 'ok',
         fetched_at: null,
-        ready: provider === 'antigravity-oauth' ? ['gemini-4-neon-high-oauth', 'gemini-4-hydrogen-high-oauth'] : [],
+        ready: provider === 'antigravity-oauth'
+          ? [
+              'gemini-4-neon-high-oauth',
+              'gemini-4-carbon-medium-oauth',
+              'gemini-4-hydrogen-low-oauth',
+              'gemini-4-hydrogen-high-oauth',
+              'claude-opus-5-5-medium-oauth',
+            ]
+          : [],
         missing: [],
         context_windows: {},
         others: provider === 'openai'
@@ -488,7 +518,7 @@ afterEach(async () => {
 });
 
 describe('Dalton real-router & real-progress SetupWizard first-run flows', () => {
-  it('(a) team models available -> skips model connect -> preselects Neon High & Hydrogen High -> completes to /welcome', async () => {
+  it('(a) team models available -> skips model connect -> preselects Neon High & Hydrogen Low (without Low label) -> completes to /welcome', async () => {
     const user = userEvent.setup();
     renderRealWizardApp('/dashboard');
 
@@ -510,11 +540,24 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     expect(neonRadio).toBeChecked();
     expect(screen.queryByText(/Credits Only Model/i)).toBeNull();
     expect(screen.queryByText(/Claude Code Sonnet/i)).toBeNull();
+    // Only curated available candidates appear (Neon, Carbon, Opus fallback — never Hydrogen)
+    const radios = screen.getAllByRole('radio') as HTMLInputElement[];
+    expect(radios.map((r) => r.value)).toEqual([
+      'gemini-4-neon-high-oauth',
+      'gemini-4-carbon-medium-oauth',
+      'claude-opus-5-5-medium-oauth',
+    ]);
+    // Neon (5/4) & Carbon (5/3) display intelligence and speed ratings
+    expect(screen.getByRole('img', { name: 'Speed: 4 of 5' })).toBeInTheDocument();
+    expect(screen.getAllByRole('img', { name: 'Intelligence: 5 of 5' }).length).toBeGreaterThanOrEqual(2);
 
-    // Open Customize: Hydrogen High is preselected and Auto (credits-only deployment default) is filtered out
+    // Open Customize: Hydrogen Low is preselected, label omits "Low", and Auto (credits-only deployment default) is filtered out
     await user.click(screen.getByRole('button', { name: 'Customize' }));
     const bgSelect = screen.getByLabelText('Background model') as HTMLSelectElement;
-    expect(bgSelect.value).toBe('gemini-4-hydrogen-high-oauth');
+    expect(bgSelect.value).toBe('gemini-4-hydrogen-low-oauth');
+    const selectedBgOption = [...bgSelect.options].find((o) => o.value === 'gemini-4-hydrogen-low-oauth');
+    expect(selectedBgOption?.textContent).toContain('Gemini 4 Hydrogen');
+    expect(selectedBgOption?.textContent).not.toMatch(/\bLow\b/i);
     expect(screen.queryByRole('option', { name: /Auto/i })).toBeNull();
 
     await user.click(screen.getByRole('button', { name: 'Continue' }));
@@ -524,7 +567,7 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     expect(server.lastPreferencesPut).toMatchObject({
       model_preference: expect.objectContaining({
         preferred_model: 'gemini-4-neon-high-oauth',
-        preferred_background_model: 'gemini-4-hydrogen-high-oauth',
+        preferred_background_model: 'gemini-4-hydrogen-low-oauth',
       }),
     });
     expect(server.state.progress.setup_completed_at).not.toBeNull();
@@ -562,7 +605,7 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     expect(server.lastPreferencesPut).toMatchObject({
       model_preference: expect.objectContaining({
         preferred_model: 'gemini-4-neon-high-oauth',
-        preferred_background_model: 'gemini-4-hydrogen-high-oauth',
+        preferred_background_model: 'gemini-4-hydrogen-low-oauth',
       }),
     });
   }, 15_000);
@@ -837,7 +880,7 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     expect(server.lastPreferencesPut).toMatchObject({
       model_preference: expect.objectContaining({
         preferred_model: 'gemini-4-neon-high-oauth',
-        preferred_background_model: 'gemini-4-hydrogen-high-oauth',
+        preferred_background_model: 'gemini-4-hydrogen-low-oauth',
       }),
     });
   }, 15_000);

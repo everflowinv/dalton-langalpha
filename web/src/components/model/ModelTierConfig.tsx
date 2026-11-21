@@ -32,6 +32,8 @@ export interface ModelTierConfigProps {
   payers?: Record<string, Payer>
   /** Optional model metadata, for display names */
   metadata?: Record<string, ModelMetadataEntry>
+  // DALTON-HOOK(dalton-setup): optional custom labeler for background dropdown (omits fixed-low effort suffix)
+  backgroundNameOf?: (model: string) => string
   /** Settings, where both slots are account defaults and may stay unset: the
    *  models Auto runs, the deployment's primary and Background, each as printed and
    *  absent when the deployment names none. An unset primary is Auto; an unset
@@ -56,6 +58,8 @@ export function ModelTierConfig({
   showExplainer = false,
   payers,
   metadata,
+  // DALTON-HOOK(dalton-setup): custom background dropdown labeler
+  backgroundNameOf,
   auto,
 }: ModelTierConfigProps) {
   const { t } = useTranslation()
@@ -186,6 +190,8 @@ export function ModelTierConfig({
         required={!auto}
         payers={payers}
         metadata={metadata}
+        // DALTON-HOOK(dalton-setup): omit fixed-low effort suffix in Dalton background dropdown
+        nameOf={backgroundNameOf}
       />
 
     </div>

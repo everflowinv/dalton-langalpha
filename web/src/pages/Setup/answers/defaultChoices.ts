@@ -10,8 +10,13 @@ import type { Payer } from '@/lib/modelPayer';
 import { listedFor } from '@/lib/connectionModels';
 import type { ConnectionOf } from '@/lib/providerCatalog';
 import type { CustomModelEntry } from '@/components/model/types';
-// DALTON-HOOK(dalton-setup): Dalton recommended models and Claude Code / credits filtering
-import { DALTON_BACKGROUND_MODEL, DALTON_DEFAULT_MODEL, isDaltonAllowedModel } from '@/config/daltonSetup';
+// DALTON-HOOK(dalton-setup): Dalton recommended models, curated setup candidates, and Claude Code / credits filtering
+import {
+  DALTON_BACKGROUND_MODEL,
+  DALTON_DEFAULT_MODEL,
+  isDaltonAllowedModel,
+  resolveDaltonSetupCandidates,
+} from '@/config/daltonSetup';
 import type { ModelsAnswer } from './setupSteps';
 
 /** How many models the step lists; the rest are in Settings. */
@@ -161,10 +166,15 @@ const RULES: Record<ModelsAnswer, {
   },
 };
 
-function recommend(input: DefaultChoicesInput, pool: string[], effectiveAnswer: ModelsAnswer): RecommendedSetup {
+function recommend(
+  input: DefaultChoicesInput,
+  primaryPool: string[],
+  backgroundPool: string[],
+  effectiveAnswer: ModelsAnswer,
+): RecommendedSetup {
   const rule = RULES[effectiveAnswer];
-  const primary = rule.primary(input, pool);
-  return { ...primary, ...rule.background(input, pool, primary.primary) };
+  const primary = rule.primary(input, primaryPool);
+  return { ...primary, ...rule.background(input, backgroundPool, primary.primary) };
 }
 
 export function defaultChoices(input: DefaultChoicesInput): DefaultChoices {
@@ -184,12 +194,19 @@ export function defaultChoices(input: DefaultChoicesInput): DefaultChoices {
   }
   pool = [...new Set(pool)];
 
-  const recommended = recommend(input, pool, effectiveAnswer);
+  // DALTON-HOOK(dalton-setup): Dalton /setup/default shows the fixed 5 curated candidates in order when available
+  const curated = input.dalton ? resolveDaltonSetupCandidates(pool) : [];
+  const primaryPool = curated.length > 0 ? curated : pool;
+
+  const recommended = recommend(input, primaryPool, pool, effectiveAnswer);
   // Connecting saved the model it starts on, which is the recommended one; a
   // default saved on an earlier run of setup is kept.
-  const saved = input.models !== 'langalpha_models' && input.preferred && pool.includes(input.preferred)
+  const saved = input.models !== 'langalpha_models' && input.preferred && primaryPool.includes(input.preferred)
     ? input.preferred : null;
   const initial = saved ?? recommended.primary;
+  if (curated.length > 0) {
+    return { list: curated, initial, recommended };
+  }
   const rest = pool.filter((m) => m !== initial && m !== recommended.primary);
   const head = [initial, recommended.primary].filter((m, i, all): m is string => !!m && all.indexOf(m) === i);
   return { list: [...head, ...rest].slice(0, DEFAULT_CHOICES_SHOWN), initial, recommended };

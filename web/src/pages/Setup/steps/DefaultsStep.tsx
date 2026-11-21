@@ -18,12 +18,15 @@ import { apiErrorDetail } from '@/api/errors';
 import { suggestBackgroundModel } from './suggestBackgroundModel';
 import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
 // DALTON-HOOK(dalton-setup): Dalton build defaults, unified team-model availability, and credits/Claude Code filtering
+import { getModelDisplayName } from '@/components/ui/chat-input.helpers';
 import { isDaltonBuild } from '@/config/brand';
 import {
   DALTON_BACKGROUND_MODEL,
   DALTON_DEFAULT_MODEL,
+  dedupeDaltonBackgroundModels,
   filterDaltonPayers,
   filterDaltonProviderModels,
+  stripEffortFromModelLabel,
 } from '@/config/daltonSetup';
 import { RowButton, StepLoadFailed } from '../answers/parts';
 import { useDaltonTeamModels } from '../answers/useTeamModels';
@@ -229,14 +232,15 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
         </p>
       </div>
 
-      {/* Model tier config */}
+      {/* DALTON-HOOK(dalton-setup): dedupe background effort variants & omit effort suffix in Dalton */}
       <ModelTierConfig
         models={visibleModels}
-        backgroundModels={visibleSlotModels}
+        backgroundModels={dedupeDaltonBackgroundModels(visibleSlotModels, isDaltonBuild)}
         primaryModel={primaryModel}
         onPrimaryModelChange={setPrimaryModel}
         backgroundModel={backgroundModel}
         onBackgroundModelChange={setBackgroundModel}
+        backgroundNameOf={isDaltonBuild ? (m) => stripEffortFromModelLabel(getModelDisplayName(m, metadata)) : undefined}
         showExplainer
         payers={visiblePayers}
         metadata={metadata}
