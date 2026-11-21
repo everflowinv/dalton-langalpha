@@ -694,6 +694,12 @@ async def lifespan(app: FastAPI):
     from src.server.services.claude_code.hosted import register_opt_out
 
     register_opt_out()
+    # DALTON-HOOK(agent-switch-model): wire handler-tier model handoff runners into thread_model service
+    from src.server.handlers.thread_model_handoff import (
+        register_thread_model_handoff_runners,
+    )
+
+    register_thread_model_handoff_runners()
     try:
         HookOutboxDrainer.get_instance().start()
         logger.info("HookOutboxDrainer started")

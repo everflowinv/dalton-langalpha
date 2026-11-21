@@ -505,6 +505,16 @@ async def astream_ptc_workflow(
                 request, inherits_rules = await retried_on_its_surface(request)
                 # The attempts this turn may continue, read once for all it carries.
                 prior = await carry.prior_attempt(request, thread_id)
+                # DALTON-HOOK(agent-switch-model): preserve retried run's persisted origin for tool-level gating
+                retried_origin: str | None = None
+                if request.retry_of_run_id and prior.retried is not None:
+                    from src.server.services.llm.thread_model import (
+                        resolve_retried_turn_origin,
+                    )
+
+                    retried_origin = await resolve_retried_turn_origin(
+                        thread_id, prior.retried
+                    )
                 disk_free_mb, disk_known = await read_disk_notice(runs_in)
                 user_profile = await identity.profile()
                 # DALTON-HOOK(i18n): a user with no saved users.locale gets the Dalton default (zh-CN), matching the web UI
@@ -751,6 +761,8 @@ async def astream_ptc_workflow(
                         **firing,
                         **home.run_metadata(),
                         **identity.stamp(run_metadata),
+                        # DALTON-HOOK(agent-switch-model): persist retried_origin on retry run row so retry-of-retry preserves it
+                        **({"retried_origin": retried_origin} if retried_origin else {}),
                     },
                     in_start=home.in_start(
                         user_id,
@@ -1010,6 +1022,15 @@ async def astream_ptc_workflow(
             handoff_brief = await brief_for_turn(
                 owed, session, inputs, user_id=user_id, route=route, reader=effective_model
             )
+            # DALTON-HOOK(agent-switch-model): brief written in-turn fulfills any pending switch handoff
+            if prior_thread.pending_model_handoff is not None and handoff_brief is not None:
+                from src.server.handlers.thread_model_handoff import (
+                    clear_pending_handoff_after_brief,
+                )
+
+                await clear_pending_handoff_after_brief(
+                    thread_id, prior_thread.pending_model_handoff
+                )
             yield _turn_held({"status": "released"})
 
         if session.sandbox:
@@ -1153,6 +1174,8 @@ async def astream_ptc_workflow(
             "workspace_owner_id": workspace_owner_id,
             "origin_channel": origin_channel,
             **({"tail_turn_no_new_work": True} if tail_turn_no_new_work else {}),
+            # DALTON-HOOK(agent-switch-model): forward retried_origin into configurable for switch_thread_model
+            **({"retried_origin": retried_origin} if retried_origin else {}),
         }
         graph_config = build_graph_config(
             thread_id=thread_id,

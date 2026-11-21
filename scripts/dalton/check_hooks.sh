@@ -440,6 +440,9 @@ ALLOWED_HOOKS=(
   # on ToolMessage JSON parse and recursively replace non-finite floats with None
   # across request payloads (antigravity/client.py).
   "antigravity-json-nan"
+  # Agent-triggered current-thread model switch (switch_thread_model Dalton tool
+  # and extracted switch_thread_model service shared with PATCH /threads/{id}).
+  "agent-switch-model"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -688,6 +688,8 @@ async def update_thread_fields(
     subagents_allowed: Any = _UNSET,
     reasoning_effort: Any = _UNSET,
     fast_mode: Any = _UNSET,
+    # DALTON-HOOK(agent-switch-model): allow atomic metadata merge alongside column updates
+    metadata_merge: Any = _UNSET,
 ) -> Optional[Dict[str, Any]]:
     """Dynamic update of user-editable thread fields (title, pin, archive,
     model, subagent switch, effort, fast mode).
@@ -733,6 +735,10 @@ async def update_thread_fields(
     if fast_mode is not _UNSET:
         sets.append("fast_mode = %s")
         params.append(fast_mode)
+    # DALTON-HOOK(agent-switch-model): allow atomic metadata merge alongside column updates (e.g. llm_model + pending handoff marker)
+    if metadata_merge is not _UNSET:
+        sets.append("metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb")
+        params.append(Json(metadata_merge))
     if not sets:
         return None
 

@@ -165,10 +165,14 @@ describe('useThreadModel', () => {
       expect(result.current).toMatchObject({ model: 'model-beta', sendModel: 'model-beta' });
     });
 
-    it("sends the thread's own model while the catalog carries it, and the shown one before the thread exists", () => {
-      mocks.catalogModelNames = new Set(['model-default', 'model-thread']);
-      expect(setup({ chiefOfStaff: true }, row('model-thread')).result.current.sendModel).toBe('model-thread');
-      expect(setup({}, row('model-thread')).result.current.sendModel).toBe('model-thread');
+    // DALTON-HOOK(agent-switch-model): cover manual-pick-only sendModel behavior on existing threads
+    it('omits llm_model for existing threads unless manually picked, while sending initial model before thread creation', async () => {
+      mocks.catalogModelNames = new Set(['model-default', 'model-thread', 'model-beta']);
+      expect(setup({ chiefOfStaff: true }, row('model-thread')).result.current.sendModel).toBeNull();
+      const existing = setup({}, row('model-thread'));
+      expect(existing.result.current.sendModel).toBeNull();
+      await act(async () => { await existing.result.current.pickModel('model-beta'); });
+      expect(existing.result.current.sendModel).toBe('model-beta');
       expect(setup({ chiefOfStaff: true, threadId: '__default__' }, null).result.current.sendModel).toBe('model-default');
     });
 
@@ -946,6 +950,60 @@ describe('useThreadModel', () => {
         queryClient.getQueryData<Thread>(queryKeys.threads.detail(THREAD))?.subagents_allowed,
       ).toBe(false));
       expect(result.current.model).toBe('model-y');
+    });
+
+    // DALTON-HOOK(agent-switch-model): cover turn-end thread model refresh and manualPick reset
+    it('refreshes server-switched model at turn end and clears manual pick so next send does not overwrite it', async () => {
+      mocks.catalogModelNames = new Set(['model-default', 'model-thread', 'model-beta', 'model-agent']);
+      mocks.server = row('model-thread');
+      mocks.getThread.mockImplementation(async () => mocks.server);
+      const { result, rerender, queryClient } = setup({ isLoading: true }, row('model-thread'));
+      await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+
+      // No manual pick on existing thread -> sendModel stays null.
+      expect(result.current.sendModel).toBeNull();
+
+      // Suppose the agent switched the thread model mid-turn on the server.
+      mocks.server = row('model-agent');
+      rerender({ threadId: THREAD, isLoading: false });
+
+      await waitFor(() => expect(result.current.model).toBe('model-agent'));
+      expect(result.current.sendModel).toBeNull();
+
+      // User manually picks model-beta before sending -> sendModel includes it for that turn, then clears at turn end.
+      await act(async () => { await result.current.pickModel('model-beta'); });
+      expect(result.current.sendModel).toBe('model-beta');
+      rerender({ threadId: THREAD, isLoading: true });
+      mocks.server = row('model-beta');
+      rerender({ threadId: THREAD, isLoading: false });
+      await waitFor(() => expect(result.current.sendModel).toBeNull());
+    });
+
+    // DALTON-HOOK(agent-switch-model): keep manualPick when a turn ends while llm_model PATCH is still in flight
+    it('keeps manualPick at turn end while an llm_model PATCH is in flight, then clears on a subsequent idle turn end', async () => {
+      mocks.catalogModelNames = new Set(['model-default', 'model-thread', 'model-beta']);
+      const patchAnswer = deferred<Thread>();
+      mocks.updateThread.mockReturnValue(patchAnswer.promise);
+      const { result, rerender, queryClient } = setup({ isLoading: true }, row('model-thread'));
+      await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+
+      act(() => {
+        void result.current.pickModel('model-beta');
+      });
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, { llm_model: 'model-beta' }));
+      expect(result.current.sendModel).toBe('model-beta');
+
+      // Turn 1 ends before the PATCH resolves -> sendModel must still carry model-beta.
+      rerender({ threadId: THREAD, isLoading: false });
+      expect(result.current.sendModel).toBe('model-beta');
+
+      // PATCH resolves and Turn 2 ends with no PATCH in flight -> manualPick clears.
+      await act(async () => {
+        patchAnswer.resolve(row('model-beta'));
+      });
+      rerender({ threadId: THREAD, isLoading: true });
+      rerender({ threadId: THREAD, isLoading: false });
+      await waitFor(() => expect(result.current.sendModel).toBeNull());
     });
   });
 });
