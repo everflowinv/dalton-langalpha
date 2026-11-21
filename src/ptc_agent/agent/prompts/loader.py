@@ -93,19 +93,40 @@ class PromptLoader:
             **self._config.get("defaults", {}),
             **kwargs,  # User can override date if needed
         }
-        # DALTON-HOOK(team-memory-toggle): static prompt and data map follow deployment/tier availability, not personal toggle
+        # DALTON-HOOK(team-memory-toggle): static prompt and data map follow deployment/tier availability and main-agent role only (never subagents, external/company tiers, or personal toggle)
+        from src.dalton.access_tiers import is_internal_tier
         from src.dalton.settings import get_dalton_settings
 
-        if "conversation_search_enabled" in kwargs:
-            conversation_search_available = bool(
-                kwargs["conversation_search_enabled"]
-            )
-        elif "team_memory_enabled" in kwargs:
-            conversation_search_available = bool(kwargs["team_memory_enabled"])
+        is_subagent_template = (
+            template_name == "subagent_base.md.j2"
+            or template_name.startswith("subagents/")
+            or bool(kwargs.get("is_subagent"))
+            or bool(kwargs.get("subagent"))
+        )
+        raw_tier = kwargs.get("user_tier")
+        tier_allows = raw_tier is None or is_internal_tier(str(raw_tier))
+        deployment_allows = bool(get_dalton_settings().conversations.enabled)
+
+        if is_subagent_template or not tier_allows:
+            conversation_search_available = False
+        elif template_name == "system.md.j2":
+            if "conversation_search_enabled" in kwargs:
+                conversation_search_available = bool(
+                    kwargs["conversation_search_enabled"]
+                )
+            elif "team_memory_enabled" in kwargs:
+                conversation_search_available = bool(kwargs["team_memory_enabled"])
+            else:
+                conversation_search_available = deployment_allows
         else:
-            conversation_search_available = bool(
-                get_dalton_settings().conversations.enabled
-            )
+            if "conversation_search_enabled" in kwargs:
+                conversation_search_available = bool(
+                    kwargs["conversation_search_enabled"]
+                )
+            elif "team_memory_enabled" in kwargs:
+                conversation_search_available = bool(kwargs["team_memory_enabled"])
+            else:
+                conversation_search_available = False
         context["conversation_search_enabled"] = conversation_search_available
         # DALTON-HOOK(data-map): inject system-generated data map (with static unprobed fallback)
         if "dalton_data_map" not in context and template_name in (
@@ -116,6 +137,16 @@ class PromptLoader:
 
             context["dalton_data_map"] = resolve_prompt_data_map(
                 team_memory_enabled=conversation_search_available
+            )
+        elif (
+            not conversation_search_available
+            and isinstance(context.get("dalton_data_map"), str)
+            and context["dalton_data_map"]
+        ):
+            from src.dalton.data_map.builder import _apply_team_memory_filter
+
+            context["dalton_data_map"] = _apply_team_memory_filter(
+                context["dalton_data_map"], False
             )
         return template.render(**context)
 

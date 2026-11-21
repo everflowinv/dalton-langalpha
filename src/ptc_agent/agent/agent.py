@@ -1232,6 +1232,10 @@ class PTCAgent:
         )
         if main_compaction is not None:
             main_compaction = main_compaction.with_baseline(context.baseline.sent_sections)
+            if conversation_search_enabled is not None:
+                main_compaction = main_compaction.with_team_memory(
+                    conversation_search_enabled
+                )  # DALTON-HOOK(team-memory-toggle)
 
         # Compiled subagent graphs live on this middleware; the RunWorkflow
         # dispatcher below shares the same instances so direct dispatches get
@@ -1455,7 +1459,9 @@ class PTCAgent:
                 multimodal_read,
                 AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
                 SystemPromptCacheMiddleware(),
-                ToolSurfaceMiddleware(),
+                ToolSurfaceMiddleware(
+                    conversation_search_enabled=conversation_search_enabled
+                ),  # DALTON-HOOK(team-memory-toggle)
                 EmptyToolCallRetryMiddleware(),
                 DaltonPatchToolCallsMiddleware(),  # DALTON-HOOK(dalton-patch-tool-calls)
                 context.turn,

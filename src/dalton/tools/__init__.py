@@ -49,6 +49,7 @@ def build_dalton_tools(
     the master switch off the agent never sees a tool it cannot run.
     """
     _ = team_memory_enabled
+    from src.dalton.access_tiers import is_internal_tier
     from src.dalton.services.transcriptions import is_transcription_enabled
     from src.dalton.settings import is_artifact_publishing_enabled
 
@@ -69,10 +70,12 @@ def build_dalton_tools(
     # internal/admin-only; an external member's every call would be refused at
     # run time, so the tools are not mounted for them in the first place
     # ("external" is also what a failed tier lookup resolves to — fail closed
-    # on mounting).
-    tier_mounts_conversation_search = user_tier is None or user_tier != "external"
+    # on mounting). Company-system turns keep non-conversation internal tools,
+    # while conversation_search stays restricted to internal/admin tiers.
+    tier_mounts_internal_tools = user_tier is None or user_tier != "external"
+    tier_mounts_conversation_search = user_tier is None or is_internal_tier(user_tier)
 
-    if tier_mounts_conversation_search:
+    if tier_mounts_internal_tools:
         try:
             from src.dalton.tools.notify_tools import create_notify_tools
 

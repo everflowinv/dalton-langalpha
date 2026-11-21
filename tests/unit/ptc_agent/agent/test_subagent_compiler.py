@@ -416,3 +416,32 @@ class TestSubagentDeliveryReachesSubagents:
             assert prompt.count(rule) == 1
             assert prompt.count("## 子代理交付") == 2
             assert prompt.startswith("## 子代理交付")
+
+
+# DALTON-HOOK(team-memory-toggle): subagents never receive conversation_search
+# instructions or team archive entries in tool_guide even with an active MCP registry.
+class TestSubagentOmitsTeamMemory:
+    def test_subagent_with_mcp_registry_omits_team_memory_and_archive(self):
+        from unittest.mock import create_autospec
+
+        from ptc_agent.core.mcp_registry import MCPRegistry
+        from ptc_agent.core.mcp_schema import MCPToolInfo
+
+        fake_tool = MCPToolInfo(
+            name="get_stock_history",
+            description="prices",
+            input_schema={},
+            server_name="yfinance",
+        )
+        registry = create_autospec(MCPRegistry, instance=True)
+        registry.connectors = {}
+        registry.tools_by_server = {"yfinance": [fake_tool]}
+        registry.get_all_tools.return_value = {"yfinance": [fake_tool]}
+        registry.server_configs = {}
+        compiler = _compiler(config=_config(), mcp_registry=registry)
+        for name in ("general-purpose", "data-prep", "equity-analyst", "report-builder"):
+            prompt = compiler.compile(BUILTIN_SUBAGENTS[name])["system_prompt"]
+            assert "<tool_guide>" in prompt
+            assert "conversation_search" not in prompt
+            assert "归档统计：" not in prompt
+            assert "团队记忆开启时可用" not in prompt

@@ -9,7 +9,7 @@ from typing import Any, Optional
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
-from src.dalton.access_tiers import get_user_tier
+from src.dalton.access_tiers import get_user_tier, is_internal_tier
 from src.dalton.conversations.search import hybrid_search_conversations
 from src.dalton.sharing import resolve_turn_team_memory_enabled
 from src.server.database.home_workspace import is_home_id, is_home_stand_in_id
@@ -107,7 +107,7 @@ def create_conversation_tools(*, role: str | None = None) -> list[BaseTool]:
         # members cannot search it, their own threads stay reachable via the
         # global search UI.
         user_tier = await get_user_tier(user_id)
-        if user_tier == "external":
+        if not is_internal_tier(user_tier):
             logger.info(
                 "[dalton.conversations.audit] rejected external conversation_search call (user_id=%s workspace_id=%s)",
                 user_id,

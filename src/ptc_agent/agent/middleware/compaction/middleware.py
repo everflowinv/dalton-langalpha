@@ -341,6 +341,8 @@ class CompactionMiddleware(AgentMiddleware):
         self._rebuilds: StalePinRebuilds = StalePinRebuilds()
         # The baseline sections a call is sent; see with_baseline.
         self._sections: Callable[[Any], Mapping[str, str]] | None = None
+        # DALTON-HOOK(team-memory-toggle): per-turn conversation_search state for post-compaction restatement (main agent only).
+        self._conversation_search_enabled: bool | None = None
 
     @classmethod
     def for_agent(
@@ -489,7 +491,17 @@ class CompactionMiddleware(AgentMiddleware):
             if plan.carry
             else None
         )
-        rows = [row for row in (compaction.note_row(), carried) if row is not None]
+        # DALTON-HOOK(team-memory-toggle): if compaction cropped the visible notice, re-emit before the next model call
+        toggle_row = (
+            self._team_memory_notice(compaction.messages)
+            if self._conversation_search_enabled is not None
+            else None
+        )
+        rows = [
+            row
+            for row in (compaction.note_row(), carried, toggle_row)
+            if row is not None
+        ]
         # A refusal of the view says nothing of what the summary made room
         # for, so its messages are fitted by estimate like any others. The
         # note and the carried step go into history ahead of the answer
@@ -1131,6 +1143,31 @@ class CompactionMiddleware(AgentMiddleware):
         main = copy.copy(self)
         main._notes_dir = notes_dir
         return main
+
+    # DALTON-HOOK(team-memory-toggle): restate the team-memory switch after a main-agent summary drops it
+    def with_team_memory(
+        self, conversation_search_enabled: bool
+    ) -> CompactionMiddleware:
+        """This middleware, re-emitting the current team-memory notice after a
+        summary removes it from the view (for the main agent's stack only)."""
+        main = copy.copy(self)
+        main._conversation_search_enabled = conversation_search_enabled
+        return main
+
+    def _team_memory_notice(self, messages: Sequence[AnyMessage]) -> AnyMessage | None:
+        if self._conversation_search_enabled is None:
+            return None
+        from datetime import UTC, datetime
+
+        from ptc_agent.agent.middleware.runtime_context.durable import written_row
+        from ptc_agent.agent.middleware.runtime_context.turn import (
+            team_memory_row_for_messages,
+        )
+
+        update = team_memory_row_for_messages(
+            messages, self._conversation_search_enabled, datetime.now(tz=UTC)
+        )
+        return written_row(update) if update is not None else None
 
     async def view(self, messages: list[AnyMessage], state: Mapping[str, Any]) -> list[AnyMessage]:
         """What this agent's model is sent of ``messages``: what the summary

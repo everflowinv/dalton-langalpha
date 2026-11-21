@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
 from typing import Any
@@ -2010,5 +2011,481 @@ async def test_claude_code_static_prompt_tools_and_runtime_notices(
         assert expected_text in _joined_prompt_text(
             turn_prompt({"messages": [*legacy_msgs, *legacy_entry["messages"]]})
         )
+
+
+@pytest.mark.asyncio
+async def test_external_company_main_agent_and_internal_subagents_omit_team_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement 1:
+    - External (`external`, `company`) main agents never get team-memory wording
+      or `<data_map>` archive entries, nor `conversation_search`.
+    - Internal (`internal`, `admin`) subagents never get team-memory wording
+      or `<data_map>` archive entries, even when the parent turn has Team Memory on
+      and a non-empty MCP registry enables `<tool_guide>`.
+    - Internal main agents keep team-memory wording and `<data_map>` entries.
+    """
+    from unittest.mock import patch
+
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+
+    from ptc_agent.agent.subagents.builtins import BUILTIN_SUBAGENTS
+    from ptc_agent.agent.subagents.compiler import SubagentCompiler
+    from ptc_agent.config.agent import AgentConfig, LLMConfig
+    from ptc_agent.config.core import (
+        DaytonaConfig,
+        FilesystemConfig,
+        LoggingConfig,
+        MCPConfig,
+        SandboxConfig,
+        SecurityConfig,
+    )
+    from ptc_agent.core.mcp_registry import MCPRegistry
+    from ptc_agent.core.paths import SandboxLayout, WorkspaceLayout
+    from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID
+    from src.dalton.tools import conversation_tools as conv_tools_mod
+
+    cached_md = _sample_cached_data_map_markdown()
+    monkeypatch.setattr(
+        db_data_map,
+        "get_cached_data_map",
+        create_autospec(
+            db_data_map.get_cached_data_map,
+            return_value={
+                "cache_date": "2026-11-05",
+                "rendered_markdown": cached_md,
+                "payload": {},
+            },
+        ),
+    )
+
+    loader = PromptLoader()
+    map_builder.set_turn_data_map(cached_md)
+    try:
+        # 1) Direct PromptLoader checks across main agent tiers & subagent surfaces
+        for tier in ("external", "company"):
+            for role in ("analyst", "chief_of_staff"):
+                ext_prompt = loader.get_system_prompt(role=role, user_tier=tier)
+                assert "<data_map>" in ext_prompt
+                assert "conversation_search" not in ext_prompt
+                assert "归档统计：" not in ext_prompt
+                assert "团队记忆开启时可用" not in ext_prompt
+
+        for tier in ("internal", "admin"):
+            for role in ("analyst", "chief_of_staff"):
+                int_prompt = loader.get_system_prompt(role=role, user_tier=tier)
+                assert "<data_map>" in int_prompt
+                assert "conversation_search" in int_prompt
+                assert "归档统计：" in int_prompt
+                assert "团队记忆开启时可用；当前是否开启以对话中的运行时说明为准" in int_prompt
+
+        subagent_base_prompt = loader.get_subagent_base_prompt(
+            identity_line="You are a subagent.",
+            role_prompt="Do research.",
+            sections={"tool_guide": True},
+        )
+        assert "conversation_search" not in subagent_base_prompt
+        assert "归档统计：" not in subagent_base_prompt
+        assert "团队记忆开启时可用" not in subagent_base_prompt
+
+        tool_guide_standalone = loader.render(
+            "components/tool_guide.md.j2",
+            tool_summary="- yfinance: quotes",
+        )
+        assert "<data_map>" in tool_guide_standalone
+        assert "conversation_search" not in tool_guide_standalone
+        assert "归档统计：" not in tool_guide_standalone
+        assert "团队记忆开启时可用" not in tool_guide_standalone
+
+        # 2) SubagentCompiler with non-empty MCP registry (so tool_guide IS rendered)
+        from ptc_agent.core.mcp_schema import MCPToolInfo
+
+        fake_tool = MCPToolInfo(
+            name="get_stock_history",
+            description="prices",
+            input_schema={},
+            server_name="yfinance",
+        )
+        fake_registry = create_autospec(MCPRegistry, instance=True)
+        fake_registry.connectors = {}
+        fake_registry.tools_by_server = {"yfinance": [fake_tool]}
+        fake_registry.get_all_tools.return_value = {"yfinance": [fake_tool]}
+        fake_registry.server_configs = {}
+        cfg = AgentConfig(
+            llm=LLMConfig(name="test-model"),
+            security=SecurityConfig(),
+            logging=LoggingConfig(),
+            sandbox=SandboxConfig(daytona=DaytonaConfig(api_key="test-key")),
+            mcp=MCPConfig(),
+            filesystem=FilesystemConfig(),
+        )
+        compiler = SubagentCompiler(
+            mcp_registry=fake_registry,
+            config=cfg,
+            current_time="2026-11-21 10:00 UTC",
+            thread_id="t-sub",
+        )
+        for sub_name in ("general-purpose", "data-prep", "equity-analyst", "report-builder"):
+            compiled = compiler.compile(BUILTIN_SUBAGENTS[sub_name])
+            assert "<tool_guide>" in compiled["system_prompt"]
+            assert "conversation_search" not in compiled["system_prompt"]
+            assert "归档统计：" not in compiled["system_prompt"]
+            assert "团队记忆开启时可用" not in compiled["system_prompt"]
+    finally:
+        map_builder.set_turn_data_map(None)
+
+    # 3) Company tier tool mount + runtime refusal + build_ptc_graph_with_session
+    assert "conversation_search" not in {
+        t.name
+        for t in build_dalton_tools("analyst", user_tier="company", team_memory_enabled=True)
+    }
+    monkeypatch.setattr(
+        conv_tools_mod,
+        "get_user_tier",
+        create_autospec(conv_tools_mod.get_user_tier, return_value="company"),
+    )
+    company_cs = conv_tools_mod.create_conversation_tools(role="analyst")[0]
+    company_refused = json.loads(
+        await company_cs.ainvoke(
+            {"query": "NVDA"},
+            config={"configurable": {"user_id": COMPANY_SYSTEM_USER_ID, "workspace_id": "ws-1"}},
+        )
+    )
+    assert company_refused["ok"] is False
+    assert company_refused["error"] == "external_member_forbidden"
+
+    # 4) PTCAgent.create_agent end-to-end check for external/company vs internal main & subagents
+    llm = GenericFakeChatModel(messages=iter([]))
+
+    def _build_full(user_tier: str, team_memory_enabled: bool) -> dict[str, Any]:
+        from ptc_agent.agent.agent import create_subagents as orig_create_subagents
+
+        captured: list[dict[str, Any]] = []
+        captured_subagents: list[dict[str, Any]] = []
+
+        def _fake_create_agent(_model: Any, **kwargs: Any) -> Any:
+            captured.append(kwargs)
+            g = create_autospec(PTCAgent, instance=True)
+            g.with_config = lambda *_a, **_kw: g
+            return g
+
+        def _capture_create_subagents(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            specs = orig_create_subagents(*args, **kwargs)
+            captured_subagents.extend(specs)
+            return specs
+
+        fake_sandbox = create_autospec(PTCSandbox, instance=True)
+        fake_sandbox.config = cfg
+        fake_sandbox.working_dir = "/home/workspace"
+        fake_sandbox.livefs = None
+        fake_sandbox.mounts_livefs = False
+        fake_sandbox.history = None
+        fake_sandbox.skills_manifest = None
+        fake_sandbox.vault_secrets = {}
+        fake_sandbox.layout = SandboxLayout("/home/workspace")
+        fake_sandbox.workspace.return_value = WorkspaceLayout("/home/workspace")
+        with (
+            patch.object(AgentConfig, "get_llm_client", return_value=llm),
+            patch(
+                "ptc_agent.agent.middleware.compaction.compact.create_llm",
+                return_value=llm,
+            ),
+            patch("ptc_agent.agent.agent.create_agent", side_effect=_fake_create_agent),
+            patch(
+                "ptc_agent.agent.agent.create_subagents",
+                side_effect=_capture_create_subagents,
+            ),
+        ):
+            PTCAgent(cfg).create_agent(
+                llm=llm,
+                thread_id="t-tier",
+                sandbox=fake_sandbox,
+                mcp_registry=fake_registry,
+                tool_summary="",
+                user_id="u-tier",
+                user_tier=user_tier,
+                team_memory_enabled=team_memory_enabled,
+            )
+        return {**captured[0], "_captured_subagents": captured_subagents}
+
+    map_builder.set_turn_data_map(cached_md)
+    try:
+        for ext_tier in ("external", "company"):
+            ext_built = _build_full(ext_tier, True)
+            assert "<data_map>" in ext_built["system_prompt"]
+            assert "conversation_search" not in ext_built["system_prompt"]
+            assert "归档统计：" not in ext_built["system_prompt"]
+            assert "conversation_search" not in [t.name for t in ext_built["tools"]]
+            for spec in ext_built["_captured_subagents"]:
+                assert "conversation_search" not in spec["system_prompt"]
+                assert "归档统计：" not in spec["system_prompt"]
+
+        int_built_off = _build_full("internal", False)
+        int_built_on = _build_full("internal", True)
+        assert int_built_off["system_prompt"] == int_built_on["system_prompt"]
+        assert "conversation_search" in int_built_off["system_prompt"]
+        assert "归档统计：" in int_built_off["system_prompt"]
+        assert "团队记忆开启时可用；当前是否开启以对话中的运行时说明为准" in int_built_off["system_prompt"]
+
+        assert int_built_on["_captured_subagents"]
+        for spec in int_built_on["_captured_subagents"]:
+            assert "conversation_search" not in spec["system_prompt"]
+            assert "归档统计：" not in spec["system_prompt"]
+            assert "团队记忆开启时可用" not in spec["system_prompt"]
+    finally:
+        map_builder.set_turn_data_map(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_in_turn_compaction_reemits_team_memory_notice_before_next_model_call(
+    enabled: bool,
+) -> None:
+    """Requirement 2: When in-turn compaction (`CompactionMiddleware`) trims away
+    the earlier `team_memory_switched` row, the current state notice is re-emitted
+    immediately after compaction and sent on the very next model call (`fit.send`),
+    without checking history on normal non-compaction calls."""
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    from langchain.agents.middleware.types import ModelRequest, ModelResponse
+
+    from ptc_agent.agent.middleware.compaction.middleware import CompactionMiddleware
+    from ptc_agent.agent.middleware.compaction.compact import Summarizer
+    from ptc_agent.agent.middleware.runtime_context import (
+        TEAM_MEMORY_OFF_MARKER,
+        TEAM_MEMORY_OFF_TEXT,
+        TEAM_MEMORY_ON_MARKER,
+        TEAM_MEMORY_ON_TEXT,
+        TEAM_MEMORY_ROW_KIND,
+        RowCarrierMiddleware,
+        TurnContextMiddleware,
+        runtime_update_from_message,
+    )
+
+    now = datetime(2026, 11, 21, 10, 0, tzinfo=UTC)
+    expected_text = TEAM_MEMORY_ON_TEXT if enabled else TEAM_MEMORY_OFF_TEXT
+    expected_marker = TEAM_MEMORY_ON_MARKER if enabled else TEAM_MEMORY_OFF_MARKER
+
+    # Turn 1: emits turn_opened + team_memory_switched
+    u1 = HumanMessage("q1 " + ("x " * 120), id="u1")
+    t1 = await TurnContextMiddleware(
+        now=now, timezone="UTC", conversation_search_enabled=enabled
+    ).abefore_agent({"messages": [u1]})
+    for idx, msg in enumerate(t1["messages"]):
+        msg.id = f"t1_{idx}"
+    assert [runtime_update_from_message(m).kind for m in t1["messages"]] == [
+        "turn_opened",
+        TEAM_MEMORY_ROW_KIND,
+    ]
+    a1 = AIMessage(
+        "a1 " + ("y " * 120),
+        id="a1",
+        tool_calls=[{"name": "get_data", "args": {}, "id": "c1", "type": "tool_call"}],
+    )
+    tr1 = ToolMessage("result 1 " + ("z " * 120), tool_call_id="c1", id="tr1")
+    a1_done = AIMessage("done 1", id="a1_done")
+
+    # Turn 2: TurnContextMiddleware sees Turn 1's notice in view, so it skips writing one
+    u2 = HumanMessage("q2 latest", id="u2")
+    turn2_state = {"messages": [u1, *t1["messages"], a1, tr1, a1_done, u2]}
+    turn2_mw = TurnContextMiddleware(
+        now=now, timezone="UTC", conversation_search_enabled=enabled
+    )
+    t2 = await turn2_mw.abefore_agent(turn2_state)
+    for idx, msg in enumerate(t2["messages"]):
+        msg.id = f"t2_{idx}"
+    assert [runtime_update_from_message(m).kind for m in t2["messages"]] == ["turn_opened"]
+    # Normal subsequent abefore_model call does NOT scan history for team memory
+    assert turn2_mw._opened is True
+    assert await turn2_mw.abefore_model(turn2_state) is None
+
+    # Now inside Turn 2, CompactionMiddleware hits threshold and summarizes Turn 1 away
+    summary_model = GenericFakeChatModel(messages=iter([AIMessage("Summary of turn 1.")]))
+    compaction_mw = CompactionMiddleware(
+        Summarizer(model=summary_model, limit=200_000),
+        token_threshold=150,
+        keep_tokens=30,
+        native=False,
+        self_summary=False,
+    ).with_team_memory(enabled)
+
+    carrier_mw = RowCarrierMiddleware()
+    sent_requests: list[ModelRequest] = []
+
+    async def _model_handler(req: ModelRequest) -> ModelResponse:
+        sent_requests.append(req)
+        return ModelResponse(result=[AIMessage("Turn 2 answer", id="a2")])
+
+    messages_before_compact = [*turn2_state["messages"], *t2["messages"]]
+    req = ModelRequest(
+        model=GenericFakeChatModel(messages=iter([])),
+        messages=messages_before_compact,
+        system_prompt="system",
+        state={"messages": messages_before_compact},
+        tools=[],
+        model_settings={},
+    )
+    extended = await compaction_mw.awrap_model_call(
+        req,
+        lambda inner_req: carrier_mw.awrap_model_call(inner_req, _model_handler),
+    )
+
+    # 1) The immediate post-compaction model call received the re-emitted notice
+    assert len(sent_requests) == 1
+    sent_text = "\n".join(
+        str(m.content) if isinstance(m.content, str) else "\n".join(str(b.get("text") or "") for b in m.content if isinstance(b, dict))
+        for m in sent_requests[0].messages
+    )
+    assert expected_text in sent_text
+    assert expected_marker in sent_text
+
+    # 2) ExtendedModelResponse persists the re-emitted notice ahead of the AI reply
+    persisted_rows = [
+        upd
+        for m in extended.model_response.result
+        if (upd := runtime_update_from_message(m)) is not None
+        and upd.kind == TEAM_MEMORY_ROW_KIND
+    ]
+    assert len(persisted_rows) == 1
+    assert persisted_rows[0].text == expected_text
+    assert persisted_rows[0].provenance["enabled"] is enabled
+
+    # 3) On Turn 3 (unchanged switch), TurnContextMiddleware sees the persisted notice and does not duplicate
+    updated_event = extended.command.update["_summarization_event"]
+    turn3_msgs = [*messages_before_compact, *extended.model_response.result, HumanMessage("q3", id="u3")]
+    t3 = await TurnContextMiddleware(
+        now=now, timezone="UTC", conversation_search_enabled=enabled
+    ).abefore_agent({"messages": turn3_msgs, "_summarization_event": updated_event})
+    assert [runtime_update_from_message(m).kind for m in t3["messages"]] == ["turn_opened"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire_kind", ["openai", "anthropic"])
+async def test_pre_deploy_off_thread_withholds_additional_tools_until_enabled(
+    wire_kind: str,
+) -> None:
+    """Requirement 3: A thread created BEFORE the deploy with Team Memory OFF
+    has a stored `tool_surface` lacking `conversation_search`. After deploy:
+    - While Team Memory stays OFF, `ToolSurfaceMiddleware` does NOT inject
+      `conversation_search` via `additional_tools` / `tool_addition`, and
+      `offered` keeps `conversation_search` out (refused by `_refusal`).
+    - Once Team Memory is turned ON, `conversation_search` joins via the
+      existing `additional_tools` / `tool_addition` mechanism."""
+    from types import SimpleNamespace
+
+    from langchain.agents.middleware.types import ModelRequest, ModelResponse
+    from langchain_anthropic.chat_models import convert_to_anthropic_tool
+    from langchain_core.messages import AIMessage, HumanMessage
+    from langchain_core.tools import tool
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+
+    from ptc_agent.agent.middleware.tool_surface import (
+        TOOL_SURFACE_KEY,
+        ToolSurfaceMiddleware,
+        is_tool_change_message,
+    )
+    from src.llms.llm import create_llm
+    from tests.unit.ptc_agent.agent.prefix_stability import anthropic_model
+
+    @tool
+    def search_data(query: str) -> str:
+        """Look up market data."""
+        return query
+
+    @tool("conversation_search")
+    def conversation_search_stub(query: str) -> str:
+        """Search Dalton's team conversation archive."""
+        return query
+
+    if wire_kind == "openai":
+        model = create_llm("gpt-6.2-sol-oauth", api_key="sk-codex-test")
+        pre_deploy_surface = {
+            "openai": {"tools": [convert_to_openai_tool(search_data)], "epoch": None},
+            "offered": ["search_data"],
+        }
+        bound_reply = AIMessage(
+            content=[{"type": "reasoning", "id": "rs1", "summary": [], "encrypted_content": "e1"}],
+            response_metadata={"model_name": "gpt-6.2-sol", "reasoning_origin": "codex-oauth"},
+        )
+    else:
+        model = anthropic_model("claude-opus-5-5")
+        pre_deploy_surface = {
+            "tools": [dict(convert_to_anthropic_tool(search_data))],
+            "epoch": None,
+            "offered": ["search_data"],
+        }
+        bound_reply = AIMessage(
+            content=[
+                {"type": "thinking", "thinking": "", "signature": "sig-1"},
+                {"type": "text", "text": "Earlier answer."},
+            ],
+            response_metadata={"model_name": "claude-opus-5-5"},
+        )
+
+    seen_requests: list[ModelRequest] = []
+
+    async def _capture(req: ModelRequest) -> ModelResponse:
+        seen_requests.append(req)
+        return ModelResponse(result=[AIMessage("ok")])
+
+    # 1) First post-deploy turn with Team Memory STILL OFF:
+    #    must NOT emit additional_tools / tool_addition for conversation_search.
+    mw_off = ToolSurfaceMiddleware(conversation_search_enabled=False)
+    history = [HumanMessage("q1"), bound_reply, HumanMessage("q2")]
+    res_off = await mw_off.awrap_model_call(
+        ModelRequest(
+            model=model,
+            messages=history,
+            system_prompt="new prompt",
+            state={TOOL_SURFACE_KEY: pre_deploy_surface},
+            tools=[search_data, conversation_search_stub],
+            model_settings={},
+        ),
+        _capture,
+    )
+    assert not any(is_tool_change_message(m) for m in seen_requests[0].messages)
+    surface_after_off = (
+        res_off.command.update[TOOL_SURFACE_KEY]
+        if hasattr(res_off, "command")
+        else pre_deploy_surface
+    )
+    assert surface_after_off["offered"] == ["search_data"]
+
+    # Calling conversation_search while OFF is refused by ToolSurfaceMiddleware._refusal
+    refused = await mw_off.awrap_tool_call(
+        SimpleNamespace(
+            state={TOOL_SURFACE_KEY: surface_after_off},
+            tool_call={"name": "conversation_search", "id": "call_off"},
+        ),
+        lambda _r: pytest.fail("should not execute"),
+    )
+    assert refused.status == "error"
+    assert "conversation_search" in refused.content
+
+    # 2) Next turn with Team Memory turned ON:
+    #    conversation_search IS injected via additional_tools (OpenAI) / tool_addition (Anthropic).
+    mw_on = ToolSurfaceMiddleware(conversation_search_enabled=True)
+    res_on = await mw_on.awrap_model_call(
+        ModelRequest(
+            model=model,
+            messages=[*history, AIMessage("ok"), HumanMessage("q3")],
+            system_prompt="new prompt",
+            state={TOOL_SURFACE_KEY: surface_after_off},
+            tools=[search_data, conversation_search_stub],
+            model_settings={},
+        ),
+        _capture,
+    )
+    change_msgs = [m for m in seen_requests[1].messages if is_tool_change_message(m)]
+    assert len(change_msgs) == 1
+    if wire_kind == "openai":
+        assert change_msgs[0].content[0]["type"] == "additional_tools"
+        assert [t["name"] for t in change_msgs[0].content[0]["tools"]] == ["conversation_search"]
+    else:
+        assert change_msgs[0].content[0]["type"] == "tool_addition"
+        assert change_msgs[0].content[0]["tool"]["definition"]["name"] == "conversation_search"
+    surface_after_on = res_on.command.update[TOOL_SURFACE_KEY]
+    assert surface_after_on["offered"] == ["search_data", "conversation_search"]
+
 
 

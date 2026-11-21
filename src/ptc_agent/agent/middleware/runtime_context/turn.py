@@ -42,7 +42,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re  # DALTON-HOOK(team-memory-toggle)
-from collections.abc import Awaitable, Callable, Mapping  # DALTON-HOOK(team-memory-toggle)
+from collections.abc import Awaitable, Callable, Mapping, Sequence  # DALTON-HOOK(team-memory-toggle)
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -993,6 +993,31 @@ def _last_visible_team_memory_state(
     return None
 
 
+def _build_team_memory_update(enabled: bool, now: datetime) -> DurableUpdate:
+    return DurableUpdate(
+        kind=TEAM_MEMORY_ROW_KIND,
+        schema_version=TURN_SCHEMA_VERSION,
+        text=TEAM_MEMORY_ON_TEXT if enabled else TEAM_MEMORY_OFF_TEXT,
+        provenance={"source": "user", "enabled": enabled},
+        created_at=now,
+    )
+
+
+def team_memory_row_for_messages(
+    messages: Sequence[Any], enabled: bool, now: datetime
+) -> DurableUpdate | None:
+    """Return a ``team_memory_switched`` row unless ``messages`` already ends on a matching notice."""
+    stated: bool | None = None
+    for message in reversed(messages):
+        found = _team_memory_state_in_message(message)
+        if found is not None:
+            stated = found
+            break
+    if stated is not None and stated == enabled:
+        return None
+    return _build_team_memory_update(enabled, now)
+
+
 def _team_memory_row(
     state: Any, enabled: bool, now: datetime, *, claude_code: bool = False
 ) -> DurableUpdate | None:
@@ -1002,10 +1027,4 @@ def _team_memory_row(
     if stated is not None and stated == enabled:
         return None
 
-    return DurableUpdate(
-        kind=TEAM_MEMORY_ROW_KIND,
-        schema_version=TURN_SCHEMA_VERSION,
-        text=TEAM_MEMORY_ON_TEXT if enabled else TEAM_MEMORY_OFF_TEXT,
-        provenance={"source": "user", "enabled": enabled},
-        created_at=now,
-    )
+    return _build_team_memory_update(enabled, now)

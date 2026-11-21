@@ -89,6 +89,7 @@ from .turn import (
     WAKEUP_CANCELLED_ROW_KIND,
     TimeUpToolStopMiddleware,
     TurnContextMiddleware,
+    team_memory_row_for_messages,  # DALTON-HOOK(team-memory-toggle)
 )
 from .turn_context import HomeAway, TurnContext
 
@@ -161,4 +162,5 @@ __all__ = [
     "runtime_update_from_message",
     "sha256_text",
     "split_surface",
+    "team_memory_row_for_messages",  # DALTON-HOOK(team-memory-toggle)
 ]

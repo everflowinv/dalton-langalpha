@@ -118,6 +118,7 @@ def _tool_gates(defn: SubagentDefinition, *, market_watch: bool, todo: bool) -> 
         "todo_enabled": "todo" in bound and todo,
         "show_widget_enabled": "show_widget" in bound,
         "chart_annotation_enabled": False,
+        "conversation_search_enabled": False,  # DALTON-HOOK(team-memory-toggle)
         "finance_enabled": "finance" in bound,
         "web_enabled": "web_search" in bound,
     }
