@@ -51,6 +51,7 @@ from typing import Any
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
+from src.dalton.company_identity import is_company_system_user
 from src.dalton.database.company_automations import (
     prepare_update_history_columns,
 )
@@ -229,7 +230,7 @@ async def _fetch_pref_rows_for_locked_users(
     conn: Any, user_ids: Sequence[str]
 ) -> dict[str, dict[str, Any]]:
     prefs: dict[str, dict[str, Any]] = {}
-    for uid in sorted({str(u) for u in user_ids if u}):
+    for uid in sorted({str(u) for u in user_ids if u and not is_company_system_user(str(u))}):
         await lock_user_preferences(uid, conn=conn)
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(

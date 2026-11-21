@@ -971,7 +971,7 @@ class AutomationExecutor:
             if is_builtin_antigravity:
                 return None
 
-        return effective_effort
+        return effective_effort  # DALTON-HOOK(automation-effort)
 
     async def _run_turn(
         self,

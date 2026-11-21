@@ -189,7 +189,7 @@ you save a price alert.
   `provider_auth`: the model provider rejected the user's own key; resume it
   once the key is fixed. `max_failures`: it failed `max_failures` times in a row.
 """
-)
+)  # DALTON-HOOK(automation-effort): end of parenthesized _README_CONTENT
 
 
 class AutomationsBackend(DbJsonFolderRoute):

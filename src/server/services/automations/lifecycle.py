@@ -380,6 +380,7 @@ def _effective_reasoning_ladder(
         with_inherited_declarations,
     )
 
+    # DALTON-HOOK(automation-effort): inherit built-in reasoning ladder for shadowed custom models
     resolved_entry: Mapping[str, Any] = entry if isinstance(entry, Mapping) else {}
     if source == user_models.ModelSource.CUSTOM:
         try:
@@ -398,6 +399,7 @@ def _effective_reasoning_ladder(
     return efforts, default_level
 
 
+# DALTON-HOOK(automation-effort): reconcile reasoning_effort across create, update, and locked recheck
 async def _reconcile_reasoning_effort(
     user_id: str,
     *,
@@ -424,6 +426,7 @@ async def _reconcile_reasoning_effort(
     from src.llms.model_spec import clamp_reasoning_effort
     from src.llms.reasoning import REASONING_LEVELS
 
+    # DALTON-HOOK(automation-effort): validate effort vocabulary and handle account-default target_model
     if raw_effort is not None and raw_effort not in REASONING_LEVELS:
         raise AutomationRefusal(
             f"invalid reasoning_effort {raw_effort!r}; expected one of: {', '.join(REASONING_LEVELS)}",
@@ -458,6 +461,7 @@ async def _reconcile_reasoning_effort(
         and entry.get("provider") == ANTIGRAVITY_PROVIDER
     )
 
+    # DALTON-HOOK(automation-effort): normalize built-in Antigravity models to NULL and reject conflicting effort
     if is_system_antigravity:
         parsed = parse_antigravity_series(target_model)
         suffix_effort = parsed[1] if parsed is not None else None
@@ -481,6 +485,7 @@ async def _reconcile_reasoning_effort(
             return True, None
         return False, None
 
+    # DALTON-HOOK(automation-effort): validate and clamp reasoning_effort on non-Antigravity models
     # Non-Antigravity model (built-in or custom)
     efforts, model_default = _effective_reasoning_ladder(target_model, source, entry)
 
@@ -504,6 +509,7 @@ async def _reconcile_reasoning_effort(
         return True, None
 
     # Update with reasoning_effort omitted
+    # DALTON-HOOK(automation-effort): clamp or clear stored effort when model changes with effort omitted
     if not model_changed:
         return False, stored_effort
     if stored_effort is None:

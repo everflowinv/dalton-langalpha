@@ -79,6 +79,7 @@ export function historyActionKey(action: string): string | null {
       return 'automation.actionPause';
     case 'maintenance_pause_stale_binding':
       return 'automation.actionMaintenancePause';
+    // DALTON-HOOK(automation-effort): label for Opus medium backfill audit action
     case 'backfill_opus_medium':
       return 'automation.actionBackfillOpusMedium';
     case 'seed':

@@ -168,6 +168,7 @@ export default function MoreOptions({
   }, [selectedAntigravity, form.llm_model, form.reasoning_effort, metadata, rawMetadata, seriesOpts]);
   const showEffortSelector = catalogReady && !selectedAntigravity && nonAntigravityEfforts.length > 0;
 
+  // DALTON-HOOK(automation-effort): keep reasoning_effort in sync when switching models
   const handleModelChange = (nextRaw: string) => {
     const nextModel = nextRaw || null;
     patch('llm_model', nextModel);

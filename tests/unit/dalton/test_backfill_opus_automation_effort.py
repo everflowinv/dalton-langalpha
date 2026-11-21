@@ -477,3 +477,93 @@ async def test_rollback_refuses_pending_archive_and_verifies_batch_audit_entry_u
     assert skipped_by_id[a_user_authored_same_ver] == "missing_matching_batch_audit_entry"
     assert len(updates) == 1
     assert updates[0][1][0] is None  # reverted reasoning_effort back to NULL
+
+
+@pytest.mark.asyncio
+async def test_company_system_user_and_missing_pref_user_never_fail_online_policy_gating(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Simplified backfill never calls online require_policy/own_access, so company system
+    accounts (system:dalton-company) and suspended/no-pref users process cleanly without error."""
+    from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID
+
+    archive_dir = tmp_path / "operator-records"
+    rows = [
+        {
+            "automation_id": A_OPUS_OAUTH,
+            "user_id": COMPANY_SYSTEM_USER_ID,
+            "name": "Company Opus Task",
+            "llm_model": "claude-opus-5-5-oauth",
+            "reasoning_effort": None,
+            "config_version": 1,
+            "deleted_at": None,
+            "notify_storage_mode": "task_row",
+            "audit_history": [],
+        },
+        {
+            "automation_id": A_OPUS_API,
+            "user_id": "suspended-member-99",
+            "name": "Suspended Member Opus Task",
+            "llm_model": "claude-opus-5-5",
+            "reasoning_effort": None,
+            "config_version": 2,
+            "deleted_at": None,
+            "notify_storage_mode": "legacy",
+            "audit_history": [],
+        },
+    ]
+
+    dry_conn = _make_conn(select_rows={"llm_model = ANY": rows}, updates=[])
+    plan = await ops.run_dry_run(conn=dry_conn)
+    assert plan["expected_count"] == 2
+    assert {c["user_id"] for c in plan["candidates"]} == {
+        COMPANY_SYSTEM_USER_ID,
+        "suspended-member-99",
+    }
+
+    locked_uids: list[str] = []
+
+    async def _lock_pref(uid: str, *, conn: Any = None):
+        locked_uids.append(uid)
+
+    monkeypatch.setattr(
+        ops,
+        "lock_user_preferences",
+        create_autospec(ops.lock_user_preferences, side_effect=_lock_pref),
+    )
+    monkeypatch.setattr(
+        ops,
+        "prepare_update_history_columns",
+        create_autospec(
+            ops.prepare_update_history_columns,
+            side_effect=lambda row, *_a, **_kw: (
+                {
+                    "config_version": int(row["config_version"]) + 1,
+                    "active_version": int(row["config_version"]) + 1,
+                    "updated_by": ops.OPS_ACTOR_USER_ID,
+                    "audit_history": [
+                        {"version": int(row["config_version"]) + 1, "action": ops.BACKFILL_ACTION}
+                    ],
+                },
+                False,
+            ),
+        ),
+    )
+
+    updates: list[tuple[str, Any]] = []
+    apply_conn = _make_conn(
+        select_rows={
+            "FOR UPDATE": rows,
+            "FROM user_preferences": [],  # suspended/missing user has no preferences row
+        },
+        updates=updates,
+    )
+    res = await ops.run_apply(
+        plan_data=plan,
+        batch_id="batch-company-and-suspended",
+        archive_dir=archive_dir,
+        conn=apply_conn,
+    )
+    assert res["updated_count"] == 2
+    # Company system account skips user_preferences locking; suspended user locks without policy error
+    assert locked_uids == ["suspended-member-99"]

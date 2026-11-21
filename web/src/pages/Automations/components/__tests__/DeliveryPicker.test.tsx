@@ -1034,6 +1034,7 @@ describe('model selection in MoreOptions and AutomationInlineForm', () => {
         provider: 'antigravity-oauth',
         display_name: 'Gemini 4 Neon',
         qualified_display_name: 'Gemini 4 Neon (Antigravity)',
+        // DALTON-HOOK(automation-effort): mock Antigravity series alongside non-Antigravity Opus
         default_effort: 'high',
         default_model: 'gemini-4-neon-high-oauth',
         efforts: ['medium', 'high'],
@@ -1066,6 +1067,7 @@ describe('model selection in MoreOptions and AutomationInlineForm', () => {
     };
     serve();
 
+    // DALTON-HOOK(automation-effort): create mode tests omitted vs explicit null and Antigravity clearing
     // 1. Create mode: picking non-Antigravity multi-tier model keeps Follow default (omitted),
     //    allows setting 'high', and explicitly re-selecting Follow default sends explicit null.
     const createSubs: FormSubmission[] = [];
@@ -1091,6 +1093,7 @@ describe('model selection in MoreOptions and AutomationInlineForm', () => {
     fireEvent.change(modelSelect, { target: { value: 'claude-opus-5-5-oauth' } });
 
     const effortSelect = screen.getByLabelText(label('chat.modelSelector.reasoningEffort')) as HTMLSelectElement;
+    // DALTON-HOOK(automation-effort): verify create mode omits untouched effort and sends explicit null when selected
     expect(effortSelect.value).toBe('');
 
     // Submitting without touching effort omits reasoning_effort
@@ -1123,6 +1126,7 @@ describe('model selection in MoreOptions and AutomationInlineForm', () => {
     expect(createSubs[3].payload).not.toHaveProperty('reasoning_effort');
     unmount();
 
+    // DALTON-HOOK(automation-effort): edit mode clears stored effort to null on Antigravity switch
     // 2. Edit mode: saved null stays omitted when untouched, and switching to Antigravity clears stored 'high' to null
     const savedOpus: Automation = {
       ...SAVED_AUTOMATION,
@@ -1147,6 +1151,7 @@ describe('model selection in MoreOptions and AutomationInlineForm', () => {
     fireEvent.change(editModel, { target: { value: 'gemini-4-neon-high-oauth' } });
     fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
     await waitFor(() => expect(editSubs).toHaveLength(1));
+    // DALTON-HOOK(automation-effort): assert Antigravity edit clears stored effort to null
     expect(editSubs[0]).toMatchObject({
       kind: 'edit',
       payload: { llm_model: 'gemini-4-neon-high-oauth', reasoning_effort: null },

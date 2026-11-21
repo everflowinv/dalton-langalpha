@@ -544,6 +544,7 @@ describe('an edit of each template', () => {
       expect(withEffort.reasoning_effort).toBe('high');
     });
 
+    // DALTON-HOOK(automation-effort): verify edit payload omits untouched effort and sends explicit null on clear
     it('omits reasoning_effort when untouched on edit and sends explicit null when cleared', () => {
       const saved = makeAutomation({
         llm_model: 'claude-opus-5-5-oauth',
@@ -568,6 +569,7 @@ describe('an edit of each template', () => {
       );
       expect(changed).toHaveProperty('reasoning_effort', 'low');
 
+      // DALTON-HOOK(automation-effort): clearing reasoning_effort sends explicit null on edit
       const cleared = formStateToUpdatePayload(
         { ...initial, reasoning_effort: null },
         initial,
