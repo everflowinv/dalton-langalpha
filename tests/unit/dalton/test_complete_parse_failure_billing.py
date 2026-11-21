@@ -3800,7 +3800,7 @@ def test_d044_downgrade_batches_divergent_rollup_in_autocommit_then_drops_in_sho
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("err_kind", ["value_error", "validation_error"])
+@pytest.mark.parametrize("err_kind", ["value_error"])
 async def test_fallback_pre_send_client_value_or_validation_error_does_not_retry_and_allows_assist_fallback(
     monkeypatch: pytest.MonkeyPatch,
     err_kind: str,
@@ -3914,6 +3914,51 @@ async def test_fallback_pre_send_client_value_or_validation_error_does_not_retry
     assert assist_res.ok is True
     assert assist_res.model == "gpt-6.1-terra"
     assert assist_res.data == {"verdict": "pass", "reason": "from fallback"}
+
+
+@pytest.mark.asyncio
+async def test_fallback_validation_error_without_usage_stays_unknown_and_blocks_assist_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A usage-less ValidationError from `llm.ainvoke` may come from building the message out of a
+    response the provider already billed (langchain-openai builds AIMessage before writing usage),
+    so it re-raises without parse retries but stays unknown usage: the journal ends `indeterminate`
+    with one unknown call, and `assist_json` must not switch to a fallback model and pay again."""
+    from pydantic import ValidationError
+    from src.dalton.llm import assist as assist_mod
+
+    store = _InMemoryJournalStore()
+    _wire_journal_and_budget(monkeypatch, store)
+    sleep_mock = create_autospec(_REAL_ASYNCIO_SLEEP, return_value=None)
+    monkeypatch.setattr(api_call_mod.asyncio, "sleep", sleep_mock)
+
+    try:
+        _VerdictSchema.model_validate({"verdict": 123})
+    except ValidationError as ve:
+        err = ve
+    chat_model = _SequencedChatModel([err])
+    svc = _make_real_llm_service(
+        monkeypatch, chat_model=chat_model, model_key="grok-4.7", max_parsing_retries=5
+    )
+    res = await dalton_complete(
+        svc,
+        user_id="u1",
+        user_prompt="check post-response validation error",
+        scope_ref="review:r5-post-response-validation",
+        purpose="publish.review",
+        request_model="grok-4.7",
+        response_schema=_VerdictSchema,
+    )
+
+    assert chat_model.ainvoke_calls == 1
+    sleep_mock.assert_not_awaited()
+    assert res.ok is False
+    assert res.status == "indeterminate"
+    assert store.rows[res.invocation_id]["state"] == "indeterminate"
+    attempt = store.attempts[(res.invocation_id, 1, 1)]
+    assert attempt["unknown_usage_calls"] == 1
+    assert attempt["usage_known"] is False
+    assert assist_mod._is_safe_to_fallback(res) is False
 
 
 def test_api_call_billing_additions_all_have_dalton_hook_within_25_lines() -> None:

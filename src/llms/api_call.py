@@ -403,12 +403,10 @@ def _record_collected_usage(
 
 # DALTON-HOOK(complete-parse-failure-billing): track each upstream ainvoke call's send timestamp and outcome.
 @contextlib.contextmanager
-def _track_upstream_call(*, treat_empty_validation_error_as_unbilled: bool = False):
+def _track_upstream_call():
     """Track an active upstream `ainvoke` call, timestamping when it is sent so cross-day
     attribution uses send time and timeouts during retry backoff sleep are distinguished from
     in-flight provider requests."""
-    from pydantic import ValidationError
-
     bucket = _USAGE_ACCUMULATOR.get()
     sent_at = _utc_now()
     record: Dict[str, Any] = {
@@ -444,11 +442,9 @@ def _track_upstream_call(*, treat_empty_validation_error_as_unbilled: bool = Fal
         if not extracted:
             is_unbilled = False
             if not isinstance(exc, (asyncio.CancelledError, TimeoutError)):
-                is_unbilled = _is_unbilled_sdk_error(exc) or (
-                    treat_empty_validation_error_as_unbilled
-                    and isinstance(exc, ValidationError)
-                    and not _exc_stream_started(exc)
-                )
+                # A ValidationError without usage stays unknown: LangChain can raise it while
+                # building the message from a response the provider already billed.
+                is_unbilled = _is_unbilled_sdk_error(exc)
                 if not is_unbilled and bucket is not None and callable(bucket.is_unbilled_error):
                     try:
                         is_unbilled = bool(bucket.is_unbilled_error(exc))
@@ -555,7 +551,7 @@ async def make_api_call(
         # Case 1: No schema requested, return raw content
         if response_schema is None:
             # DALTON-HOOK(complete-parse-failure-billing): track active upstream call for accurate unknown-usage accounting.
-            with _track_upstream_call(treat_empty_validation_error_as_unbilled=True) as raw_capture:
+            with _track_upstream_call() as raw_capture:
                 response = await llm.ainvoke(messages)
             content = get_message_content(response)
 
@@ -651,10 +647,10 @@ async def make_api_call(
             retry_count = attempt + 1
             fb_capture: Dict[str, Any] = {"usage": {}}
             # DALTON-HOOK(complete-parse-failure-billing): isolate `llm.ainvoke` from response parsing so
-            # pre-send client ValueError/ValidationError (without usage) re-raises immediately instead of
-            # entering parsing retries; only billed SDK parse errors (with recovered usage) retry.
+            # a ValueError/ValidationError without usage re-raises at once instead of entering parsing
+            # retries (its call record decides billed vs unknown); only errors with recovered usage retry.
             try:
-                with _track_upstream_call(treat_empty_validation_error_as_unbilled=True) as fb_capture:
+                with _track_upstream_call() as fb_capture:
                     response = await llm.ainvoke(messages)
             except (json.JSONDecodeError, ValidationError, ValueError) as invoke_parse_err:
                 if fb_capture.get("usage"):
