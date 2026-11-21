@@ -2779,4 +2779,329 @@ async def test_post_deploy_thread_with_stored_conversation_search_keeps_it_acros
     ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire_format", ["openai_chat", "openai_responses", "anthropic"])
+async def test_compaction_replayed_tool_addition_excluded_when_team_memory_off(
+    wire_format: str,
+) -> None:
+    """Follow-up D round 2: when a pre-deploy OFF thread (stored surface lacks
+    `conversation_search`) previously turned Team Memory ON via `tool_addition`
+    / `additional_tools`, then turned OFF before a compaction that keeps no
+    bound thinking:
+    - Even when the compaction summary replays `tool_addition` (Anthropic
+      `tool_changes`) or messages still carry `additional_tools` (OpenAI chat
+      and responses formats), rebuilding while `conversation_search_enabled=False`
+      must NOT add `conversation_search` to top-level `tools` or `offered`.
+    - Anthropic emits a `tool_removal` to cancel the replayed addition; both
+      wires refuse `conversation_search` via `_refusal`.
+    - Turning Team Memory ON afterward restores `conversation_search` into
+      `offered` cleanly."""
+    from types import SimpleNamespace
+
+    from langchain.agents.middleware.types import ModelRequest, ModelResponse
+    from langchain_anthropic.chat_models import convert_to_anthropic_tool
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+    from langchain_core.tools import tool
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+
+    from ptc_agent.agent.middleware.tool_surface import (
+        TOOL_CHANGE_SOURCE,
+        TOOL_SURFACE_KEY,
+        TOOL_WIRE_KEY,
+        ToolSurfaceMiddleware,
+        _as_responses_tool,
+        is_tool_change_message,
+    )
+    from src.llms.llm import create_llm
+    from src.llms.operator_channel import INLINE_TOOLS_BETA
+    from src.llms.provider_compaction import SIDECAR_KEY
+    from tests.unit.ptc_agent.agent.prefix_stability import anthropic_model
+
+    @tool
+    def search_data(query: str) -> str:
+        """Look up market data."""
+        return query
+
+    @tool("conversation_search")
+    def conversation_search_stub(query: str) -> str:
+        """Search Dalton's team conversation archive."""
+        return query
+
+    def _entry_name(entry: dict[str, Any]) -> str | None:
+        return _as_responses_tool(entry).get("name")
+
+    if wire_format == "openai_chat":
+        model = create_llm("gpt-6.2-sol-oauth", api_key="sk-codex-test")
+        pre_deploy_surface = {
+            "openai": {"tools": [convert_to_openai_tool(search_data)], "epoch": None},
+            "offered": ["search_data", "conversation_search"],
+        }
+        post_compact_reply = AIMessage(
+            content=[{"type": "reasoning", "id": "rs_post", "summary": [], "encrypted_content": "e_post"}],
+            response_metadata={"model_name": "gpt-6.2-sol", "reasoning_origin": "codex-oauth"},
+        )
+        summary_msg = HumanMessage(
+            "[Context Summary]\nsummary",
+            id="summary-replay-1",
+            additional_kwargs={"lc_source": "summarization"},
+        )
+        carried_change = SystemMessage(
+            content=[
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [_as_responses_tool(convert_to_openai_tool(conversation_search_stub))],
+                }
+            ],
+            additional_kwargs={"lc_source": TOOL_CHANGE_SOURCE, TOOL_WIRE_KEY: "openai"},
+        )
+        compacted_history = [summary_msg, carried_change, HumanMessage("after compaction")]
+    elif wire_format == "openai_responses":
+        model = create_llm("gpt-6.2-sol-oauth", api_key="sk-codex-test")
+        pre_deploy_surface = {
+            "openai": {
+                "tools": [_as_responses_tool(convert_to_openai_tool(search_data))],
+                "epoch": None,
+            },
+            "offered": ["search_data", "conversation_search"],
+        }
+        post_compact_reply = AIMessage(
+            content=[{"type": "reasoning", "id": "rs_post", "summary": [], "encrypted_content": "e_post"}],
+            response_metadata={"model_name": "gpt-6.2-sol", "reasoning_origin": "codex-oauth"},
+        )
+        summary_msg = HumanMessage(
+            "[Context Summary]\nsummary",
+            id="summary-replay-1",
+            additional_kwargs={"lc_source": "summarization"},
+        )
+        carried_change = SystemMessage(
+            content=[
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [_as_responses_tool(convert_to_openai_tool(conversation_search_stub))],
+                }
+            ],
+            additional_kwargs={"lc_source": TOOL_CHANGE_SOURCE, TOOL_WIRE_KEY: "openai"},
+        )
+        compacted_history = [summary_msg, carried_change, HumanMessage("after compaction")]
+    else:
+        model = anthropic_model("claude-opus-5-5")
+        pre_deploy_surface = {
+            "tools": [dict(convert_to_anthropic_tool(search_data))],
+            "epoch": None,
+            "offered": ["search_data", "conversation_search"],
+        }
+        post_compact_reply = AIMessage(
+            content=[
+                {"type": "thinking", "thinking": "", "signature": "sig-post"},
+                {"type": "text", "text": "Post-compaction answer."},
+            ],
+            response_metadata={"model_name": "claude-opus-5-5"},
+        )
+        summary_msg = HumanMessage(
+            "[Context Summary]\nsummary",
+            id="summary-replay-1",
+            additional_kwargs={
+                "lc_source": "summarization",
+                SIDECAR_KEY: {
+                    "block": {
+                        "type": "compaction",
+                        "content": "summary",
+                        "signature": "sig-c",
+                        "tool_changes": [
+                            {
+                                "type": "tool_addition",
+                                "tool": {
+                                    "type": "tool_definition",
+                                    "definition": dict(
+                                        convert_to_anthropic_tool(conversation_search_stub)
+                                    ),
+                                },
+                            }
+                        ],
+                    },
+                    "origin": "anthropic",
+                    "text": "summary",
+                },
+            },
+        )
+        compacted_history = [summary_msg, HumanMessage("after compaction")]
+
+    seen_requests: list[ModelRequest] = []
+
+    async def _capture(req: ModelRequest) -> ModelResponse:
+        seen_requests.append(req)
+        return ModelResponse(result=[post_compact_reply])
+
+    # 1) Rebuild after compaction with replayed tool addition while Team Memory is OFF.
+    mw_off = ToolSurfaceMiddleware(conversation_search_enabled=False)
+    res_compact_off = await mw_off.awrap_model_call(
+        ModelRequest(
+            model=model,
+            messages=list(compacted_history),
+            system_prompt="new prompt",
+            state={TOOL_SURFACE_KEY: pre_deploy_surface},
+            tools=[search_data, conversation_search_stub],
+            model_settings={},
+        ),
+        _capture,
+    )
+    assert [_entry_name(t) for t in seen_requests[0].tools] == ["search_data"]
+    surface_after_compact = res_compact_off.command.update[TOOL_SURFACE_KEY]
+    assert surface_after_compact["offered"] == ["search_data"]
+    if wire_format.startswith("openai"):
+        assert surface_after_compact["openai"]["epoch"] == "summary-replay-1"
+        assert [_entry_name(t) for t in surface_after_compact["openai"]["tools"]] == ["search_data"]
+        # No new change message emitted beyond the carried one.
+        assert len([m for m in seen_requests[0].messages if is_tool_change_message(m)]) == 1
+        history_after_turn1 = [*compacted_history, post_compact_reply]
+    else:
+        assert surface_after_compact["epoch"] == "summary-replay-1"
+        assert [_entry_name(t) for t in surface_after_compact["tools"]] == ["search_data"]
+        change_msgs = [m for m in seen_requests[0].messages if is_tool_change_message(m)]
+        assert len(change_msgs) == 1
+        assert change_msgs[0].content == [
+            {"type": "tool_removal", "tool": {"type": "tool_reference", "name": "conversation_search"}}
+        ]
+        assert INLINE_TOOLS_BETA in seen_requests[0].model_settings["betas"]
+        history_after_turn1 = [*compacted_history, *res_compact_off.model_response.result]
+
+    refused = await mw_off.awrap_tool_call(
+        SimpleNamespace(
+            state={TOOL_SURFACE_KEY: surface_after_compact},
+            tool_call={"name": "conversation_search", "id": "call_replay_off"},
+        ),
+        lambda _r: pytest.fail("should not execute"),
+    )
+    assert refused.status == "error"
+    assert "conversation_search" in refused.content
+
+    # 2) Next turn while STILL OFF: no duplicate change message, stays out of tools & offered.
+    res_still_off = await mw_off.awrap_model_call(
+        ModelRequest(
+            model=model,
+            messages=[*history_after_turn1, HumanMessage("still off")],
+            system_prompt="new prompt",
+            state={TOOL_SURFACE_KEY: surface_after_compact},
+            tools=[search_data, conversation_search_stub],
+            model_settings={},
+        ),
+        _capture,
+    )
+    assert [_entry_name(t) for t in seen_requests[1].tools] == ["search_data"]
+    assert not hasattr(res_still_off, "command")
+    assert len([m for m in seen_requests[1].messages if is_tool_change_message(m)]) == 1
+
+    # 3) Next turn after turning Team Memory ON: conversation_search enters offered again.
+    mw_on = ToolSurfaceMiddleware(conversation_search_enabled=True)
+    res_back_on = await mw_on.awrap_model_call(
+        ModelRequest(
+            model=model,
+            messages=[*history_after_turn1, HumanMessage("still off"), post_compact_reply, HumanMessage("enable")],
+            system_prompt="new prompt",
+            state={TOOL_SURFACE_KEY: surface_after_compact},
+            tools=[search_data, conversation_search_stub],
+            model_settings={},
+        ),
+        _capture,
+    )
+    assert [_entry_name(t) for t in seen_requests[2].tools] == ["search_data"]
+    surface_after_on = res_back_on.command.update[TOOL_SURFACE_KEY]
+    assert surface_after_on["offered"] == ["search_data", "conversation_search"]
+    if wire_format == "anthropic":
+        change_msgs_on = [m for m in seen_requests[2].messages if is_tool_change_message(m)]
+        assert change_msgs_on[-1].content[0]["type"] == "tool_addition"
+        assert change_msgs_on[-1].content[0]["tool"]["definition"]["name"] == "conversation_search"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_deferred_stored_conversation_search_stays_deferred_with_replayed_addition_when_off() -> None:
+    """When Anthropic's stored surface only keeps `conversation_search` as a
+    deferred entry (`defer_loading=True`), a compaction replaying `tool_addition`
+    while Team Memory is OFF must keep it deferred and remove it from `offered`."""
+    from langchain.agents.middleware.types import ModelRequest, ModelResponse
+    from langchain_anthropic.chat_models import convert_to_anthropic_tool
+    from langchain_core.messages import AIMessage, HumanMessage
+    from langchain_core.tools import tool
+
+    from ptc_agent.agent.middleware.tool_surface import (
+        TOOL_SURFACE_KEY,
+        ToolSurfaceMiddleware,
+        is_tool_change_message,
+    )
+    from src.llms.provider_compaction import SIDECAR_KEY
+    from tests.unit.ptc_agent.agent.prefix_stability import anthropic_model
+
+    @tool
+    def search_data(query: str) -> str:
+        """Look up market data."""
+        return query
+
+    @tool("conversation_search")
+    def conversation_search_stub(query: str) -> str:
+        """Search Dalton's team conversation archive."""
+        return query
+
+    model = anthropic_model("claude-opus-5-5")
+    deferred_surface = {
+        "tools": [
+            dict(convert_to_anthropic_tool(search_data)),
+            {**dict(convert_to_anthropic_tool(conversation_search_stub)), "defer_loading": True},
+        ],
+        "epoch": None,
+        "offered": ["search_data", "conversation_search"],
+    }
+    summary_msg = HumanMessage(
+        "[Context Summary]\nsummary",
+        id="summary-deferred-1",
+        additional_kwargs={
+            "lc_source": "summarization",
+            SIDECAR_KEY: {
+                "block": {
+                    "type": "compaction",
+                    "content": "summary",
+                    "signature": "sig-d",
+                    "tool_changes": [
+                        {
+                            "type": "tool_addition",
+                            "tool": {"type": "tool_reference", "name": "conversation_search"},
+                        }
+                    ],
+                },
+                "origin": "anthropic",
+                "text": "summary",
+            },
+        },
+    )
+    seen: list[ModelRequest] = []
+
+    async def _capture(req: ModelRequest) -> ModelResponse:
+        seen.append(req)
+        return ModelResponse(result=[AIMessage("ok")])
+
+    res = await ToolSurfaceMiddleware(conversation_search_enabled=False).awrap_model_call(
+        ModelRequest(
+            model=model,
+            messages=[summary_msg, HumanMessage("next")],
+            system_prompt="prompt",
+            state={TOOL_SURFACE_KEY: deferred_surface},
+            tools=[search_data, conversation_search_stub],
+            model_settings={},
+        ),
+        _capture,
+    )
+    assert [t["name"] for t in seen[0].tools] == ["search_data", "conversation_search"]
+    assert seen[0].tools[1].get("defer_loading") is True
+    surface_after = res.command.update[TOOL_SURFACE_KEY]
+    assert surface_after["epoch"] == "summary-deferred-1"
+    assert surface_after["offered"] == ["search_data"]
+    change_msgs = [m for m in seen[0].messages if is_tool_change_message(m)]
+    assert len(change_msgs) == 1
+    assert change_msgs[0].content == [
+        {"type": "tool_removal", "tool": {"type": "tool_reference", "name": "conversation_search"}}
+    ]
+
+
+
 
