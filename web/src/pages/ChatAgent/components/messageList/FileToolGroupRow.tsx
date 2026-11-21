@@ -3,7 +3,7 @@ import { SPRING_FOLD } from '@/lib/motion';
 import { motion } from '@/lib/framer';
 import { ChevronDown } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { categorizeTool, getToolIcon, getCompletedRowTitle, getCompletedSummary, isFailedCall } from '../toolDisplayConfig';
+import { categorizeTool, getDiscardedToolCallReason, getFailedToolCallLabel, getToolIcon, getCompletedRowTitle, getCompletedSummary, isDiscardedToolCall, isFailedCall } from '../toolDisplayConfig';
 import { classifyAgentPath, ranElsewhere } from '../../utils/agentPaths';
 import { RunningLine } from './ToolCallRow';
 import { RowIcon, FailedIconBadge } from './ActivityRowParts';
@@ -38,7 +38,11 @@ export const FileToolGroupRow = memo(function FileToolGroupRow({ items, onOpenFi
   const isFailed = items.some(isFailedCall);
   const single = items.length === 1;
   const item = items[0];
-  const failedLabel = t('toolArtifact.a11y.toolCallFailed');
+  // DALTON-HOOK(empty-turn-guard): show the localized non-executed notice for
+  // discarded pre-finish calls and use the dedicated not-executed a11y label.
+  const discardedItem = items.find((entry) => isDiscardedToolCall(entry));
+  const discardedReason = discardedItem ? getDiscardedToolCallReason(discardedItem, t) : null;
+  const failedLabel = getFailedToolCallLabel(discardedItem, t);
 
   const paths: string[] = [];
   for (const item of items) {
@@ -98,6 +102,7 @@ export const FileToolGroupRow = memo(function FileToolGroupRow({ items, onOpenFi
               <button type="button" onClick={() => openPath(path)} className="obj" title={openLabel}>{label}</button>
             </span>)}
             {repeat && <span style={{ opacity: 0.55, fontSize: '0.8125rem' }}>{repeat}</span>}
+            {discardedReason && <span className="truncate min-w-0" style={{ opacity: 0.65, fontSize: '0.8125rem' }}>{discardedReason}</span>}
             {hasDiff && !isStreaming && (
               <button
                 type="button"

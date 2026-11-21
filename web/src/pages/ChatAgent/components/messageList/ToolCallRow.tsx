@@ -2,7 +2,7 @@ import React, { memo } from 'react';
 import { Wrench } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { categorizeTool, getDisplayName, getToolIcon, getPreparingText, isFailedCall } from '../toolDisplayConfig';
+import { categorizeTool, getDisplayName, getDiscardedToolCallReason, getFailedToolCallLabel, getToolIcon, getPreparingText, isFailedCall } from '../toolDisplayConfig';
 import { ToolIcon } from '../ToolIcon';
 import { completedToolTitle, completedToolSummary, liveToolLabel } from './activitySummary';
 import { filePathOf } from './groupFileToolRuns';
@@ -83,7 +83,10 @@ export const ToolCallRow = memo(function ToolCallRow({ item, onClick, running = 
   const laNames = useLaNames([{ toolName, args }]);
   const summary = completedToolSummary(item, t, laNames);
   const isFailed = isFailedCall(item);
-  const failedLabel = t('toolArtifact.a11y.toolCallFailed');
+  // DALTON-HOOK(empty-turn-guard): show the localized non-executed notice for
+  // discarded pre-finish calls and use the dedicated not-executed a11y label.
+  const discardedReason = getDiscardedToolCallReason(item, t);
+  const failedLabel = getFailedToolCallLabel(item, t);
 
   // Decide the destination tab label for the pill tooltip.
   const cat = categorizeTool(toolName, item.toolCall, item.root);
@@ -138,6 +141,11 @@ export const ToolCallRow = memo(function ToolCallRow({ item, onClick, running = 
                   >
                     {summary}
                   </button>
+                </span>
+              )}
+              {discardedReason && (
+                <span className="truncate min-w-0" style={{ opacity: 0.65, fontSize: '0.8125rem' }}>
+                  {discardedReason}
                 </span>
               )}
               {/* A call that moved to the background returned before its

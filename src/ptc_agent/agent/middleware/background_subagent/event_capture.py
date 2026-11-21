@@ -27,6 +27,12 @@ from langgraph.types import Command
 
 from ptc_agent.agent.middleware.background_subagent.middleware import current_background_tool_call_id
 from ptc_agent.agent.middleware.background_subagent.registry import BackgroundTaskRegistry
+# DALTON-HOOK(empty-turn-guard): reuse the output-cap and malformed-call
+# stop-reason detectors so subagent event capture never publishes discarded calls.
+from ptc_agent.agent.middleware.tool.empty_call_retry import (
+    malformed_call_stop_reason,
+    output_cap_stop_reason,
+)
 from src.llms.reasoning_payload import is_unfinished_reply
 from src.server.utils.content_normalizer import normalize_text_content
 
@@ -149,7 +155,15 @@ class SubagentEventCaptureMiddleware(AgentMiddleware):
             try:
                 # Model resilience, outside this middleware, retries a reply
                 # cut off before its response finished, so its calls never run.
-                if ai_msg and not is_unfinished_reply(ai_msg):
+                # DALTON-HOOK(empty-turn-guard): EmptyToolCallRetryMiddleware,
+                # also outside this middleware, discards and retries any reply
+                # that hit the output token cap or malformed_call (codex r2 #3).
+                if (
+                    ai_msg
+                    and not is_unfinished_reply(ai_msg)
+                    and output_cap_stop_reason(ai_msg) is None
+                    and malformed_call_stop_reason(ai_msg) is None
+                ):
                     tool_calls = getattr(ai_msg, "tool_calls", None) or []
                     agent_id = _agent_id(self.registry, tool_call_id)
                     msg_id = getattr(ai_msg, "id", f"msg-{tool_call_id}")
