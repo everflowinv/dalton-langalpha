@@ -88,9 +88,11 @@ interface TreeProps {
   onPickReasoningEffort?: (effort: string | null) => void;
   onPickFastMode?: (fast: boolean | null) => void;
   inputRef?: React.Ref<ChatInputHandle>;
+  // DALTON-HOOK(automation-effort): pass active retry target id into ChatInput
+  retryTargetId?: string | null;
 }
 
-function tree({ onSend = vi.fn(), tuning, onPickReasoningEffort, onPickFastMode, inputRef }: TreeProps = {}) {
+function tree({ onSend = vi.fn(), tuning, onPickReasoningEffort, onPickFastMode, inputRef, retryTargetId }: TreeProps = {}) {
   queryClient.setQueryData(queryKeys.user.preferences(), mocks.preferences);
   return (
     <QueryClientProvider client={queryClient}>
@@ -102,6 +104,7 @@ function tree({ onSend = vi.fn(), tuning, onPickReasoningEffort, onPickFastMode,
           tuning={tuning}
           onPickReasoningEffort={onPickReasoningEffort}
           onPickFastMode={onPickFastMode}
+          retryTargetId={retryTargetId}
         />
       </MemoryRouter>
     </QueryClientProvider>
@@ -244,6 +247,52 @@ describe('ChatInput: the thread owns its effort and fast mode', () => {
     // DALTON-HOOK(automation-effort): picking an effort and then sending a normal message clears the retry pick
     fireEvent.click(screen.getByText('pick-high'));
     send('normal follow-up');
+    expect(inputRef.current?.getRetryModelOptions?.().reasoningEffort).toBeNull();
+  });
+
+  // DALTON-HOOK(automation-effort): unsent effort picked before a failure or followed by draft typing is never submitted on retry
+  it('ignores unsent effort picked before a failed turn or edited as a draft when retrying later', () => {
+    const onSend = vi.fn();
+    const onPickReasoningEffort = vi.fn();
+    const inputRef = createRef<ChatInputHandle>();
+    const { rerender } = render(tree({
+      onSend,
+      inputRef,
+      tuning: { reasoningEffort: 'low', fastMode: false },
+      onPickReasoningEffort,
+      retryTargetId: null,
+    }));
+
+    // 1) Pick effort when no failed turn exists, never send -> later automation fails -> retry omits it
+    fireEvent.click(screen.getByText('pick-high'));
+    rerender(tree({
+      onSend,
+      inputRef,
+      tuning: { reasoningEffort: 'high', fastMode: false },
+      onPickReasoningEffort,
+      retryTargetId: 'err-run-1',
+    }));
+    expect(inputRef.current?.getRetryModelOptions?.().reasoningEffort).toBeNull();
+
+    // 2) Pick effort on err-run-1, never retry -> a newer failure err-run-2 arrives -> retry omits it
+    fireEvent.click(screen.getByText('pick-high'));
+    rerender(tree({
+      onSend,
+      inputRef,
+      tuning: { reasoningEffort: 'high', fastMode: false },
+      onPickReasoningEffort,
+      retryTargetId: 'err-run-2',
+    }));
+    expect(inputRef.current?.getRetryModelOptions?.().reasoningEffort).toBeNull();
+
+    // 3) Pick effort on err-run-2, then type into draft (never sent) -> retry omits it
+    fireEvent.click(screen.getByText('pick-high'));
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'unsent draft' } });
+    expect(inputRef.current?.getRetryModelOptions?.().reasoningEffort).toBeNull();
+
+    // 4) Explicitly pick effort right for err-run-2 without composing -> submits once, then resets
+    fireEvent.click(screen.getByText('pick-high'));
+    expect(inputRef.current?.getRetryModelOptions?.().reasoningEffort).toBe('high');
     expect(inputRef.current?.getRetryModelOptions?.().reasoningEffort).toBeNull();
   });
 });

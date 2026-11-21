@@ -218,6 +218,12 @@ def _build_sqlite_history_world() -> tuple[sqlite3.Connection, dict[str, str]]:
             ON workspaces(computer_id)
             WHERE computer_id IS NOT NULL;
 
+        CREATE TABLE dalton_workspace_sharing (
+            workspace_id TEXT PRIMARY KEY,
+            cos_access TEXT NOT NULL DEFAULT 'ro',
+            web_access TEXT NOT NULL DEFAULT 'hidden'
+        );
+
         CREATE TABLE automations (
             automation_id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL,
@@ -1022,7 +1028,18 @@ async def test_colleague_workspace_thread_preserves_original_workspace_id_after_
         )
         sq.commit()
 
-        with patch("src.server.database.automation_executions.get_db_connection", new=get_conn):
+        from src.dalton import settings as dalton_settings
+
+        with (
+            patch("src.server.database.automation_executions.get_db_connection", new=get_conn),
+            patch(
+                "src.dalton.settings.is_colleague_dispatch_enabled",
+                new=create_autospec(
+                    dalton_settings.is_colleague_dispatch_enabled,
+                    return_value=True,
+                ),
+            ),
+        ):
             session_rows, _ = await exec_db.list_executions(ids["owner"], limit=50)
             comp_a_rows, _ = await exec_db.list_executions(
                 ids["owner"], computer_id=ids["comp_a"], limit=50
@@ -1045,6 +1062,90 @@ async def test_colleague_workspace_thread_preserves_original_workspace_id_after_
         assert comp_a_by_id[exec_colleague_in_own_ws]["workspace_id"] == ids["ws_a1"]
         # Colleague's computer never becomes reachable via owner's computer token.
         assert comp_other_rows == []
+    finally:
+        sq.close()
+
+
+@pytest.mark.asyncio
+async def test_colleague_dispatch_off_hidden_workspace_falls_back_to_task_workspace():
+    """Follow-up #1 (#456): when colleague dispatch is off and colleague workspace is hidden,
+    owned_execution_thread_join_sql matches require_thread_access and falls back to task workspace."""
+    from src.dalton import settings as dalton_settings
+
+    sq, ids = _build_sqlite_history_world()
+    get_conn, _, _ = _sqlite_async_db(sq)
+    colleague_thread = "t8888889-0000-4000-8000-000000000001"
+    exec_colleague_run = "e8888889-0000-4000-8000-000000000001"
+
+    try:
+        sq.execute(
+            "INSERT INTO conversation_threads (conversation_thread_id, workspace_id, user_id) VALUES (?, ?, ?)",
+            (colleague_thread, ids["ws_other_priv"], ids["owner"]),
+        )
+        sq.execute(
+            "INSERT INTO automation_executions "
+            "(automation_execution_id, automation_id, status, conversation_thread_id, created_at) "
+            "VALUES (?, ?, 'completed', ?, ?)",
+            (exec_colleague_run, ids["auto_a"], colleague_thread, "2026-11-21T01:00:00Z"),
+        )
+        # Explicit hidden row in dalton_workspace_sharing for colleague workspace.
+        sq.execute(
+            "INSERT INTO dalton_workspace_sharing (workspace_id, cos_access, web_access) VALUES (?, 'ro', 'hidden')",
+            (ids["ws_other_priv"],),
+        )
+        sq.commit()
+
+        dispatch_off = create_autospec(
+            dalton_settings.is_colleague_dispatch_enabled, return_value=False
+        )
+        with (
+            patch("src.server.database.automation_executions.get_db_connection", new=get_conn),
+            patch("src.dalton.settings.is_colleague_dispatch_enabled", new=dispatch_off),
+        ):
+            # 1) Colleague workspace web_access='hidden' -> thread not linked -> falls back to task workspace ws_a1.
+            hidden_session, _ = await exec_db.list_executions(ids["owner"], limit=50)
+            hidden_comp, _ = await exec_db.list_executions(
+                ids["owner"], computer_id=ids["comp_a"], limit=50
+            )
+            assert {r["automation_execution_id"]: r for r in hidden_session}[exec_colleague_run][
+                "workspace_id"
+            ] == ids["ws_a1"]
+            assert {r["automation_execution_id"]: r for r in hidden_comp}[exec_colleague_run][
+                "workspace_id"
+            ] == ids["ws_a1"]
+
+            # 2) Missing sharing row (default web_access='hidden') -> also falls back to ws_a1.
+            sq.execute(
+                "DELETE FROM dalton_workspace_sharing WHERE workspace_id = ?",
+                (ids["ws_other_priv"],),
+            )
+            sq.commit()
+            default_hidden, _ = await exec_db.list_executions(ids["owner"], limit=50)
+            assert {r["automation_execution_id"]: r for r in default_hidden}[exec_colleague_run][
+                "workspace_id"
+            ] == ids["ws_a1"]
+
+            # 3) Shared web_access='ro' on live colleague workspace -> readable -> keeps colleague workspace_id.
+            sq.execute(
+                "INSERT INTO dalton_workspace_sharing (workspace_id, cos_access, web_access) VALUES (?, 'ro', 'ro')",
+                (ids["ws_other_priv"],),
+            )
+            sq.commit()
+            shared_rows, _ = await exec_db.list_executions(ids["owner"], limit=50)
+            assert {r["automation_execution_id"]: r for r in shared_rows}[exec_colleague_run][
+                "workspace_id"
+            ] == ids["ws_other_priv"]
+
+            # 4) Unbound colleague workspace even with web_access='ro' -> rejected by require_workspace_access -> ws_a1.
+            sq.execute(
+                "UPDATE workspaces SET status = 'unbound' WHERE workspace_id = ?",
+                (ids["ws_other_priv"],),
+            )
+            sq.commit()
+            unbound_rows, _ = await exec_db.list_executions(ids["owner"], limit=50)
+            assert {r["automation_execution_id"]: r for r in unbound_rows}[exec_colleague_run][
+                "workspace_id"
+            ] == ids["ws_a1"]
     finally:
         sq.close()
 

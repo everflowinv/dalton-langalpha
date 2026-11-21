@@ -724,6 +724,16 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     handleEditMessage(id, content, chatInputRef.current?.getModelOptions?.()));
   const stableRegenerate = useStableHandler((id: string) =>
     handleRegenerate(id, chatInputRef.current?.getModelOptions?.()));
+  // DALTON-HOOK(automation-effort): identify the currently retryable failed reply so prior unsent effort picks do not carry into a later retry
+  const retryTargetId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const m = messages[i];
+      if (m.role === 'assistant') {
+        return (m as { error?: unknown }).error ? m.id : null;
+      }
+    }
+    return null;
+  }, [messages]);
   // DALTON-HOOK(automation-effort): prefer getRetryModelOptions so saved composer effort is not auto-sent on retry
   const stableRetry = useStableHandler(() =>
     handleRetry(
@@ -1017,6 +1027,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         ref={chatInputRef}
         // DALTON-HOOK(composer-drafts): persist draft per market panel thread or workspace+symbol
         draftKey={threadId && threadId !== '__default__' ? `market:panel:${threadId}` : `market:panel:${activeWorkspaceId}:${(symbol || 'default').toUpperCase()}`}
+        // DALTON-HOOK(automation-effort): scope explicit retry effort picks to the active failed reply
+        retryTargetId={retryTargetId}
         onSend={handleSend}
         disabled={isLoadingHistory || !!pendingInterrupt}
         onStop={handleStop}

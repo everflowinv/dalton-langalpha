@@ -300,6 +300,62 @@ def _is_reconcile_only_transport(
     return ns in ("pending_dispatch", "dispatched", "failed", "skipped", "preview_only")
 
 
+def _is_receipt_reconcilable(
+    row: Mapping[str, Any],
+    *,
+    notify_status: Any = None,
+) -> bool:
+    """Return True when background read-only receipt reconciliation can still settle this row.
+
+    Mirrors the candidate predicates of ``reconcile_uncertain_data_task_deliveries``
+    (data tasks + ``automation_report``: ``pending`` with empty/uncertain error_code,
+    or ``failed`` with ``attempts_exhausted``) and
+    ``reconcile_uncertain_automation_notify_deliveries`` (gateway completions:
+    ``pending`` with an uncertain error_code).
+    """
+    st = str(row.get("status") or "").strip().lower()
+    raw_code_l = str(row.get("error_code") or "").strip().lower()
+    auto_id = str(row.get("automation_id") or "").strip().lower()
+    payload = row.get("payload_json")
+    route_key = ""
+    source = ""
+    transport = ""
+    content_kind = ""
+    if isinstance(payload, Mapping):
+        route_key = str(payload.get("route_key") or "").strip().lower()
+        source = str(payload.get("source") or "").strip().lower()
+        transport = str(payload.get("transport") or "").strip().lower()
+        content_kind = str(payload.get("content_kind") or "").strip().lower()
+    ns = str(notify_status or "").strip().lower()
+
+    is_data_or_report = (
+        auto_id.startswith("data:")
+        or route_key.startswith("data:")
+        or source == "automation_report"
+        or ns in ("pending_dispatch", "dispatched", "failed", "skipped", "preview_only")
+    )
+    if is_data_or_report:
+        if st == "pending":
+            return not raw_code_l or raw_code_l in UNCERTAIN_NOTIFY_ERROR_CODES
+        if st == "failed":
+            return raw_code_l == "attempts_exhausted"
+        return False
+
+    is_gateway_completion = (
+        transport == "gateway"
+        and source
+        in (
+            "automation_completion",
+            "notify_test",
+            "report_delivery_missing_profile_notice",
+        )
+        and not content_kind
+    )
+    if is_gateway_completion:
+        return st == "pending" and raw_code_l in UNCERTAIN_NOTIFY_ERROR_CODES
+    return False
+
+
 def _summarize_script_notify_status(
     notify_status: Any,
 ) -> dict[str, Any] | None:
@@ -312,6 +368,7 @@ def _summarize_script_notify_status(
             "sent_count": 0,
             "failed_count": 0,
             "retrying_count": 0,
+            "awaiting_receipt": False,
             "failure_code": None,
             "failure_reason": None,
             "failure_reasons": [],
@@ -325,6 +382,7 @@ def _summarize_script_notify_status(
             "sent_count": 0,
             "failed_count": 0,
             "retrying_count": 0,
+            "awaiting_receipt": False,
             "failure_code": "delivery_failed",
             "failure_reason": reason_zh,
             "failure_reasons": [reason_zh] if reason_zh else [],
@@ -345,8 +403,9 @@ def summarize_execution_delivery(
 ) -> dict[str, Any] | None:
     """Compute canonical delivery status summary for one execution.
 
-    Returns ``None`` when no active delivery targets exist (no delivery configured
-    or only skipped rows).
+    Returns ``None`` when no delivery rows exist (not configured / no target records
+    written yet), or a ``skipped`` summary when target rows exist and every target
+    was skipped so downstream readers never fall back to script ``notify_status``.
     """
     bounded_max = max(1, int(max_attempts))
     is_script_pending_dispatch = (
@@ -354,6 +413,7 @@ def summarize_execution_delivery(
     )
     targets: list[dict[str, Any]] = []
     has_notify_rows = False
+    awaiting_receipt = False
     seen_notify_keys: dict[tuple[str, str], dict[str, Any]] = {}
     seen_normalized_targets: dict[tuple[str, str, str], dict[str, Any]] = {}
 
@@ -451,6 +511,11 @@ def summarize_execution_delivery(
         else:
             continue
 
+        if target_status == "failed" and _is_receipt_reconcilable(
+            raw, notify_status=notify_status
+        ):
+            awaiting_receipt = True
+
         target_entry: dict[str, Any] = {
             "target": target,
             "channel": channel,
@@ -538,7 +603,18 @@ def summarize_execution_delivery(
 
     if not targets:
         if has_notify_rows:
-            return None
+            return {
+                "status": "skipped",
+                "total_targets": 0,
+                "sent_count": 0,
+                "failed_count": 0,
+                "retrying_count": 0,
+                "awaiting_receipt": False,
+                "failure_code": None,
+                "failure_reason": None,
+                "failure_reasons": [],
+                "targets": [],
+            }
         return _summarize_script_notify_status(notify_status)
 
     sent_count = sum(1 for item in targets if item["status"] == "sent")
@@ -548,7 +624,7 @@ def summarize_execution_delivery(
     total_targets = len(targets)
 
     if retrying_count > 0:
-        status: Literal["delivered", "failed", "partial_failed", "retrying"] = "retrying"
+        status: Literal["delivered", "failed", "partial_failed", "retrying", "skipped"] = "retrying"
     elif failed_count == 0:
         status = "delivered"
     elif sent_count > 0:
@@ -571,6 +647,7 @@ def summarize_execution_delivery(
         "sent_count": sent_count,
         "failed_count": failed_count,
         "retrying_count": retrying_count,
+        "awaiting_receipt": bool(awaiting_receipt) if status in ("failed", "partial_failed") else False,
         "failure_code": first_code if status in ("failed", "partial_failed") else None,
         "failure_reason": (
             failure_reasons[0]
@@ -950,7 +1027,7 @@ def format_execution_delivery_note(
     if not summary:
         return None
     d_status = str(summary.get("status") or "").strip().lower()
-    if d_status == "delivered":
+    if d_status in ("delivered", "skipped"):
         return None
 
     reason = humanize_delivery_error(

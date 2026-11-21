@@ -2247,3 +2247,269 @@ async def test_401_oauth_rebuild_preserves_original_suffixed_model_name(
         custom_entry=None,
     )
     assert oauth_refresh.oauth_rebuild_spec(fresh).model_name == "gemini-4-neon-high-oauth"
+
+
+@pytest.mark.asyncio
+async def test_cooldown_write_does_not_shorten_or_downgrade_active_redis_record(
+    no_sleep, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Follow-up #3: a late-arriving rate_limited or shorter cooldown response must never
+    downgrade or shorten an active plan_limit cooldown in Redis or local memory."""
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import create_autospec
+
+    import httpx
+    import openai
+
+    from src.llms import provider_errors as pe_mod
+    from src.utils.cache.redis_cache import RedisCacheClient
+
+    t0_dt = datetime(2026, 11, 21, 5, 0, 0, tzinfo=timezone.utc)
+    clock = {"dt": t0_dt, "mono": 5000.0}
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["dt"] if tz is not None else clock["dt"].replace(tzinfo=None)
+
+    monkeypatch.setattr(pe_mod, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(
+        "ptc_agent.agent.middleware.model_resilience.time.time",
+        lambda: clock["dt"].timestamp(),
+    )
+    monkeypatch.setattr(
+        "ptc_agent.agent.middleware.model_resilience.time.monotonic",
+        lambda: clock["mono"],
+    )
+    monkeypatch.setattr("src.dalton.credentials.get_team_credential_holder_id", lambda: None)
+
+    store: dict[str, dict] = {}
+    ttl_history: list[tuple[str, int | None, dict]] = []
+    cache = create_autospec(RedisCacheClient, instance=True)
+
+    async def fake_get(key: str):
+        val = store.get(key)
+        return dict(val) if isinstance(val, dict) else val
+
+    async def fake_set(key: str, value: dict, ttl=None):
+        store[key] = dict(value)
+        ttl_history.append((key, ttl, dict(value)))
+        return True
+
+    cache.get.side_effect = fake_get
+    cache.set.side_effect = fake_set
+    monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: cache)
+
+    client_a = _make_antigravity_client(
+        "gemini-4-neon-high-oauth", user_id="u-race", credential_id="cred-race"
+    )
+    client_b = _make_antigravity_client(
+        "gemini-4-neon-medium-oauth", user_id="u-race", credential_id="cred-race"
+    )
+    expected_key = "dalton:quota_exhausted:u-race:antigravity-oauth:vendor:google:cred-race"
+
+    mw_a = _make_middleware(client_a, [])
+    mw_b = _make_middleware(client_b, [])
+
+    # 1) Worker A records an active 1-hour plan_limit cooldown.
+    plan_limit_err = _refusal("Individual quota reached. Resets in 1h0m0s.", 429)
+    await mw_a._aremember_quota_exhausted(
+        "gemini-4-neon-high-oauth", 3600.0, plan_limit_err, client_a, now_epoch=clock["dt"].timestamp()
+    )
+    assert store[expected_key]["refusal"]["reason"] == "plan_limit"
+    initial_exp = store[expected_key]["expires_at"]
+    assert initial_exp == pytest.approx(clock["dt"].timestamp() + 3600.0)
+    writes_after_first = len(ttl_history)
+
+    # 2) Worker B's late-arriving 429 rate_limited (5m) must NOT overwrite or downgrade Redis.
+    req_http = httpx.Request("POST", "https://example.invalid/v1/models")
+    rate_limit_5m = openai.RateLimitError(
+        "Error code: 429 - rate limit exceeded",
+        response=httpx.Response(429, request=req_http, headers={"Retry-After": "300"}),
+        body={"error": {"code": "rate_limit_exceeded", "message": "rate limit exceeded"}},
+    )
+    await mw_b._aremember_quota_exhausted(
+        "gemini-4-neon-medium-oauth", 300.0, rate_limit_5m, client_b, now_epoch=clock["dt"].timestamp()
+    )
+    assert len(ttl_history) == writes_after_first
+    assert store[expected_key]["refusal"]["reason"] == "plan_limit"
+    assert store[expected_key]["expires_at"] == pytest.approx(initial_exp)
+
+    # 3) Shorter plan_limit (10m) must NOT shorten the active 1-hour plan_limit.
+    plan_limit_10m = _refusal("Individual quota reached. Resets in 10m0s.", 429)
+    await mw_b._aremember_quota_exhausted(
+        "gemini-4-neon-medium-oauth", 600.0, plan_limit_10m, client_b, now_epoch=clock["dt"].timestamp()
+    )
+    assert len(ttl_history) == writes_after_first
+    assert store[expected_key]["expires_at"] == pytest.approx(initial_exp)
+
+    # 4) Longer rate_limited (2h) preserves plan_limit classification while extending expires_at.
+    rate_limit_2h = openai.RateLimitError(
+        "Error code: 429 - rate limit exceeded",
+        response=httpx.Response(429, request=req_http, headers={"Retry-After": "7200"}),
+        body={"error": {"code": "rate_limit_exceeded", "message": "rate limit exceeded"}},
+    )
+    await mw_b._aremember_quota_exhausted(
+        "gemini-4-neon-medium-oauth", 7200.0, rate_limit_2h, client_b, now_epoch=clock["dt"].timestamp()
+    )
+    assert store[expected_key]["refusal"]["reason"] == "plan_limit"
+    assert store[expected_key]["expires_at"] == pytest.approx(clock["dt"].timestamp() + 7200.0)
+
+    # 5) Upgrading active rate_limited (30m) with shorter plan_limit (10m) upgrades reason without shortening.
+    store.clear()
+    await mw_b._aremember_quota_exhausted(
+        "gemini-4-neon-medium-oauth", 1800.0, rate_limit_5m, client_b, now_epoch=clock["dt"].timestamp()
+    )
+    assert store[expected_key]["refusal"]["reason"] == "rate_limited"
+    await mw_a._aremember_quota_exhausted(
+        "gemini-4-neon-high-oauth", 600.0, plan_limit_10m, client_a, now_epoch=clock["dt"].timestamp()
+    )
+    assert store[expected_key]["refusal"]["reason"] == "plan_limit"
+    assert store[expected_key]["expires_at"] == pytest.approx(clock["dt"].timestamp() + 1800.0)
+
+    # 6) Once expired, a fresh record replaces it normally.
+    clock["dt"] = t0_dt + timedelta(hours=3)
+    clock["mono"] += 10800.0
+    await mw_b._aremember_quota_exhausted(
+        "gemini-4-neon-medium-oauth", 300.0, rate_limit_5m, client_b, now_epoch=clock["dt"].timestamp()
+    )
+    assert store[expected_key]["refusal"]["reason"] == "rate_limited"
+    assert store[expected_key]["expires_at"] == pytest.approx(clock["dt"].timestamp() + 300.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resets_in_seconds", "retry_after", "expected_seconds"),
+    [
+        (3600, "60", 3600),
+        (60, "3600", 3600),
+    ],
+)
+async def test_codex_resets_in_seconds_and_retry_after_disagreement_uses_later_for_card_and_cooldown(
+    resets_in_seconds: int,
+    retry_after: str,
+    expected_seconds: int,
+    no_sleep,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Follow-up #4: when body resets_in_seconds and Retry-After header disagree, both the
+    error card and the local/Redis cooldown record use the later of the two."""
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    from unittest.mock import create_autospec
+
+    import httpx
+    import openai
+
+    from ptc_agent.config.agent import CredentialPayer
+    from src.llms import provider_errors as pe_mod
+    from src.server.services.runs.stream_errors import error_event_data
+    from src.utils.cache.redis_cache import RedisCacheClient
+
+    t0_dt = datetime(2026, 11, 21, 5, 0, 0, tzinfo=timezone.utc)
+    clock = {"dt": t0_dt, "mono": 2000.0}
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["dt"] if tz is not None else clock["dt"].replace(tzinfo=None)
+
+    monkeypatch.setattr(pe_mod, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(
+        "ptc_agent.agent.middleware.model_resilience.time.time",
+        lambda: clock["dt"].timestamp(),
+    )
+    monkeypatch.setattr(
+        "ptc_agent.agent.middleware.model_resilience.time.monotonic",
+        lambda: clock["mono"],
+    )
+    monkeypatch.setattr("src.dalton.credentials.get_team_credential_holder_id", lambda: None)
+
+    store: dict[str, dict] = {}
+    ttl_calls: list[tuple[str, int | None]] = []
+    cache = create_autospec(RedisCacheClient, instance=True)
+
+    async def fake_get(key: str):
+        return store.get(key)
+
+    async def fake_set(key: str, value: dict, ttl=None):
+        ttl_calls.append((key, ttl))
+        store[key] = value
+        return True
+
+    cache.get.side_effect = fake_get
+    cache.set.side_effect = fake_set
+    monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: cache)
+
+    codex_client = _make_antigravity_client(
+        "gpt-6.2-sol-oauth",
+        user_id="u-codex-mismatch",
+        provider="codex-oauth",
+        credential_id="cred-codex-mismatch",
+    )
+    codex_cfg = SimpleNamespace(
+        credential_source="oauth",
+        credential_payer=CredentialPayer(payer="subscription", account="ChatGPT"),
+    )
+    body = {
+        "error": {
+            "type": "usage_limit_reached",
+            "message": "The usage limit has been reached",
+            "plan_type": "plus",
+            "limit_window_minutes": 300,
+            "resets_in_seconds": resets_in_seconds,
+        }
+    }
+    req_http = httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses")
+    codex_err = openai.RateLimitError(
+        "Error code: 429",
+        response=httpx.Response(429, request=req_http, json=body, headers={"Retry-After": retry_after}),
+        body=body,
+    )
+
+    expected_dt = t0_dt + timedelta(seconds=expected_seconds)
+    expected_until = expected_dt.isoformat()
+    expected_key = (
+        "dalton:quota_exhausted:u-codex-mismatch:codex-oauth:model:gpt-6.2-sol-oauth:cred-codex-mismatch"
+    )
+
+    mw = _make_middleware(codex_client, [])
+
+    async def fail_429(req):
+        raise codex_err
+
+    with pytest.raises(openai.RateLimitError) as first_exc:
+        await mw.awrap_model_call(_FakeRequest(codex_client), fail_429)
+
+    # 1) First error card uses the later reset timestamp.
+    first_frame = error_event_data(
+        "thread-codex-mismatch", str(first_exc.value), exc=first_exc.value, config=codex_cfg
+    )
+    assert first_frame["plan_limit"] == {
+        "plan": "ChatGPT Plus",
+        "window": "five_hour",
+        "until": expected_until,
+    }
+    # 2) Redis cooldown record uses the exact same later timestamp & TTL.
+    assert (expected_key, expected_seconds) in ttl_calls
+    assert store[expected_key]["expires_at"] == pytest.approx(expected_dt.timestamp())
+    assert store[expected_key]["refusal"]["until"] == expected_until
+
+    # 3) Subsequent benched call on a fresh worker uses the same later reset timestamp.
+    clock["dt"] = t0_dt + timedelta(seconds=120)
+    clock["mono"] += 120.0
+    mw_fresh = _make_middleware(codex_client, [])
+
+    async def must_not_call(req):
+        raise AssertionError("Should skip upstream while cooled down")
+
+    with pytest.raises(Exception) as benched_exc:
+        await mw_fresh.awrap_model_call(_FakeRequest(codex_client), must_not_call)
+    benched_frame = error_event_data(
+        "thread-codex-mismatch", str(benched_exc.value), exc=benched_exc.value, config=codex_cfg
+    )
+    assert benched_frame["plan_limit"] == {
+        "plan": "ChatGPT Plus",
+        "window": "five_hour",
+        "until": expected_until,
+    }

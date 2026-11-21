@@ -104,11 +104,8 @@ export function RunReport({
       delivery.status === 'partial_failed' ||
       delivery.status === 'retrying' ||
       (delivery.status === 'delivered' && layout === 'report' && run.delivery_summary != null));
-  // DALTON-HOOK(execution-delivery-status): strip fallback synced-undelivered suffix from excerpt when structured delivery status is shown
-  const displayExcerpt =
-    delivery && (delivery.status === 'failed' || delivery.status === 'partial_failed' || delivery.status === 'retrying')
-      ? stripSyncedDeliveryExcerptSuffix(run.excerpt)
-      : run.excerpt;
+  // DALTON-HOOK(execution-delivery-status): strip fallback synced-undelivered suffix from excerpt whenever structured delivery summary exists
+  const displayExcerpt = delivery ? stripSyncedDeliveryExcerptSuffix(run.excerpt) : run.excerpt;
   return (
     <>
       <div className="automation-mono automation-run-meta">

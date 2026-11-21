@@ -68,10 +68,18 @@ export function isScriptDeliveryPending(
 export function isScriptDeliveryAwaitingReceipt(
   run: Pick<ScriptExecutionRead, 'notify_status' | 'delivery_summary'> | null | undefined,
 ): boolean {
-  if (!run || run.notify_status !== 'pending_dispatch' || !run.delivery_summary) return false;
-  if (run.delivery_summary.status === 'delivered' || run.delivery_summary.status === 'retrying') {
+  if (!run || !run.delivery_summary) return false;
+  if (
+    run.delivery_summary.status === 'delivered' ||
+    run.delivery_summary.status === 'retrying' ||
+    run.delivery_summary.status === 'skipped'
+  ) {
     return false;
   }
+  if (typeof run.delivery_summary.awaiting_receipt === 'boolean') {
+    return run.delivery_summary.awaiting_receipt;
+  }
+  if (run.notify_status !== 'pending_dispatch') return false;
   const topCode = (run.delivery_summary.failure_code ?? '').trim().toLowerCase();
   if (topCode && UNCONFIRMED_DELIVERY_CODES.has(topCode)) return true;
   return (run.delivery_summary.targets ?? []).some(

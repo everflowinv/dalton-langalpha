@@ -157,12 +157,19 @@ def _summarize_last_execution(
     if st == "completed":
         from src.dalton.services.execution_delivery_status import (
             format_execution_delivery_note,
+            resolve_execution_delivery_summary,
+            strip_synced_delivery_excerpt_suffix,
         )
 
         delivery_note = format_execution_delivery_note(last_exec, lang="zh")
         if delivery_note:
             return ts_str, delivery_note
-        return ts_str, (excerpt[:80] if excerpt else "执行完成")
+        cleaned_excerpt = (
+            strip_synced_delivery_excerpt_suffix(excerpt) or ""
+            if resolve_execution_delivery_summary(last_exec)
+            else excerpt
+        )
+        return ts_str, (cleaned_excerpt[:80] if cleaned_excerpt else "执行完成")
     if st == "skipped":
         if kind == "data_health" and skip_reason in ("", "precheck", "skip"):
             reason_text = str(last_exec.get("reason") or excerpt or err_msg or "").strip()

@@ -72,18 +72,38 @@ def owned_execution_thread_join_sql(
     exec_alias: str, task_alias: str, thread_alias: str = "t"
 ) -> str:
     """LEFT JOIN ``conversation_threads`` only when the thread sits in a live
-    workspace that the automation's owner can read (their own workspace, or a
-    thread they own in a colleague's workspace).
+    workspace that the automation's owner can read on the web channel.
 
     DALTON-HOOK(history-computer-scope): ``automation_executions.conversation_thread_id``
     has no foreign key. If a run's thread was deleted and another account
     reused that UUID in their own workspace, or the thread's workspace was
-    soft-deleted, treat the execution as having no accessible thread so
-    neither its ``workspace_id`` nor computer-scope reach leaks across
-    accounts or points at a deleted workspace. A caller-owned thread in a live
-    colleague workspace remains linked so its actual ``workspace_id`` is
-    preserved even after the automation moves.
+    soft-deleted, or the caller lost web read access to a colleague's workspace,
+    treat the execution as having no accessible thread so neither its
+    ``workspace_id`` nor computer-scope reach leaks across accounts or points
+    at an inaccessible workspace (falling back to the task's ``workspace_id``).
+    Matches ``src/dalton/sharing.py::require_thread_access`` (channel='web',
+    need='read'): when colleague dispatch is enabled, a caller-owned thread in
+    a live colleague workspace stays readable; when colleague dispatch is off,
+    reading a colleague's workspace requires it to be live (not deleted/unbound)
+    and shared on web (``dalton_workspace_sharing.web_access IN ('ro', 'rw')``).
     """
+    # DALTON-HOOK(history-computer-scope): align colleague-workspace thread join with require_thread_access
+    from src.dalton.settings import is_colleague_dispatch_enabled
+
+    if is_colleague_dispatch_enabled():
+        colleague_pred = f"{thread_alias}.user_id = {task_alias}.user_id"
+    else:
+        colleague_pred = (
+            "(\n"
+            f"                 {thread_alias}.user_id = {task_alias}.user_id\n"
+            "                 AND thread_workspace.status <> 'unbound'\n"
+            "                 AND EXISTS (\n"
+            "                     SELECT 1 FROM dalton_workspace_sharing thread_sharing\n"
+            "                     WHERE thread_sharing.workspace_id = thread_workspace.workspace_id\n"
+            "                       AND thread_sharing.web_access IN ('ro', 'rw')\n"
+            "                 )\n"
+            "             )"
+        )
     return (
         f"LEFT JOIN conversation_threads {thread_alias}\n"
         f"    ON {thread_alias}.conversation_thread_id = {exec_alias}.conversation_thread_id\n"
@@ -93,7 +113,7 @@ def owned_execution_thread_join_sql(
         "         AND thread_workspace.status <> 'deleted'\n"
         "         AND (\n"
         f"             thread_workspace.user_id = {task_alias}.user_id\n"
-        f"             OR {thread_alias}.user_id = {task_alias}.user_id\n"
+        f"             OR {colleague_pred}\n"
         "         )\n"
         "   )"
     )

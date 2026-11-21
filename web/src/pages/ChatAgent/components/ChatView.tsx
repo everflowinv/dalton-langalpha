@@ -819,6 +819,16 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     handleEditMessage(id, content, chatInputRef.current?.getModelOptions?.()));
   const stableRegenerate = useStableHandler((id: string) =>
     handleRegenerate(id, chatInputRef.current?.getModelOptions?.()));
+  // DALTON-HOOK(automation-effort): identify the currently retryable failed reply so prior unsent effort picks do not carry into a later retry
+  const retryTargetId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const m = messages[i];
+      if (m.role === 'assistant') {
+        return (m as { error?: unknown }).error ? m.id : null;
+      }
+    }
+    return null;
+  }, [messages]);
   // DALTON-HOOK(automation-effort): forward retry model options from action bundle and prefer getRetryModelOptions
   const stableRetry = useStableHandler((opts?: Parameters<typeof handleRetry>[0]) =>
     handleRetry(
@@ -2137,6 +2147,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         ref={chatInputRef}
                         // DALTON-HOOK(composer-drafts): persist draft per thread or per workspace new chat
                         draftKey={panelThreadId ? `thread:${panelThreadId}` : (workspaceId ? `ws:${workspaceId}:new` : undefined)}
+                        // DALTON-HOOK(automation-effort): scope explicit retry effort picks to the active failed reply
+                        retryTargetId={retryTargetId}
                         onSend={handleSendWithAttachments}
                         {...composerDeck}
                         disabled={isLoadingHistory || !workspaceId || !!pendingInterrupt}

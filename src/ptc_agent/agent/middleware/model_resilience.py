@@ -91,6 +91,144 @@ _ERROR_SUMMARY_MAX_CHARS = 300
 _QUOTA_EXHAUSTED_REDIS_PREFIX = "dalton:quota_exhausted"
 _HKT = ZoneInfo("Asia/Hong_Kong")
 
+# DALTON-HOOK(antigravity-series): severity rank and atomic non-shortening / non-downgrading
+# upsert for shared cooldown records so concurrent late responses never shorten or downgrade
+# an active cooldown (e.g. overwriting `plan_limit` with `rate_limited`).
+_COOLDOWN_REASON_RANK: dict[str, int] = {
+    "out_of_credit": 3,
+    "plan_excludes": 3,
+    "quota_exceeded": 3,
+    "plan_limit": 2,
+    "rate_limited": 1,
+}
+
+_UPSERT_QUOTA_COOLDOWN_LUA = """
+local raw = redis.call('get', KEYS[1])
+if not raw then
+    redis.call('set', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+    return 1
+end
+local ok, cur = pcall(cjson.decode, raw)
+if not ok or type(cur) ~= 'table' then
+    redis.call('set', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+    return 1
+end
+local now = tonumber(ARGV[3])
+local cur_exp = tonumber(cur['expires_at'])
+if not cur_exp or cur_exp <= now then
+    redis.call('set', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+    return 1
+end
+local function reason_rank(tbl)
+    -- DALTON-HOOK(antigravity-series): rank refusal severity inside atomic Lua upsert
+    local ref = tbl['refusal']
+    local r = nil
+    if type(ref) == 'table' and type(ref['reason']) == 'string' and ref['reason'] ~= '' then
+        r = ref['reason']
+    elseif tbl['status_code'] == 402 then
+        r = 'out_of_credit'
+    else
+        r = 'plan_limit'
+    end
+    if r == 'out_of_credit' or r == 'plan_excludes' or r == 'quota_exceeded' then return 3 end
+    if r == 'plan_limit' then return 2 end
+    if r == 'rate_limited' then return 1 end
+    return 0
+end
+local cur_rank = reason_rank(cur)
+local inc_rank = tonumber(ARGV[4])
+local inc_exp = tonumber(ARGV[5])
+if inc_rank < cur_rank then
+    if inc_exp <= cur_exp then
+        return 0
+    end
+    cur['expires_at'] = inc_exp
+    local ttl = math.max(1, math.ceil(inc_exp - now))
+    redis.call('set', KEYS[1], cjson.encode(cur), 'EX', ttl)
+    return 1
+end
+if inc_rank == cur_rank and inc_exp <= cur_exp then
+    return 0
+end
+local inc = cjson.decode(ARGV[1])
+local eff_exp = math.max(cur_exp, inc_exp)
+inc['expires_at'] = eff_exp
+local ttl = math.max(1, math.ceil(eff_exp - now))
+redis.call('set', KEYS[1], cjson.encode(inc), 'EX', ttl)
+return 1
+"""
+
+
+def _cooldown_reason_rank(reason: str | None) -> int:  # DALTON-HOOK(antigravity-series)
+    return _COOLDOWN_REASON_RANK.get(reason or "", 0)
+
+
+def _extract_cooldown_record_reason(data: Any) -> str | None:  # DALTON-HOOK(antigravity-series)
+    if not isinstance(data, dict):
+        return None
+    ref = data.get("refusal")
+    if isinstance(ref, dict):
+        raw_reason = ref.get("reason")
+        if isinstance(raw_reason, str) and raw_reason:
+            return raw_reason
+    if data.get("status_code") == 402:
+        return "out_of_credit"
+    return "plan_limit"
+
+
+def _extract_exc_refusal_reason(exc: BaseException) -> str | None:  # DALTON-HOOK(antigravity-series)
+    attached = getattr(exc, "provider_refusal", None)
+    if attached is not None and isinstance(getattr(attached, "reason", None), str):
+        return attached.reason
+    from src.llms.provider_errors import read_refusal
+
+    ref = read_refusal(exc)
+    return ref.reason if ref is not None else None
+
+
+def _merge_quota_redis_payload(  # DALTON-HOOK(antigravity-series)
+    existing: Any,
+    incoming_payload: dict[str, Any],
+    incoming_ttl_s: int,
+    now: float,
+) -> tuple[int, dict[str, Any]] | None:
+    """Merge an incoming cooldown record against an existing Redis record without shortening or downgrading.
+
+    Returns ``None`` when ``existing`` is still active and strictly supersedes ``incoming_payload``.
+    """
+    if not isinstance(existing, dict):
+        return incoming_ttl_s, incoming_payload
+    raw_cur_exp = existing.get("expires_at")
+    if not isinstance(raw_cur_exp, (int, float)) or not math.isfinite(float(raw_cur_exp)):
+        return incoming_ttl_s, incoming_payload
+    cur_exp = float(raw_cur_exp)
+    if cur_exp <= now:
+        return incoming_ttl_s, incoming_payload
+
+    cur_rank = _cooldown_reason_rank(_extract_cooldown_record_reason(existing))
+    inc_rank = _cooldown_reason_rank(_extract_cooldown_record_reason(incoming_payload))
+    raw_inc_exp = incoming_payload.get("expires_at")
+    inc_exp = (
+        float(raw_inc_exp)
+        if isinstance(raw_inc_exp, (int, float)) and math.isfinite(float(raw_inc_exp))
+        else now + incoming_ttl_s
+    )
+
+    if inc_rank < cur_rank:
+        if inc_exp <= cur_exp:
+            return None
+        merged = dict(existing)
+        merged["expires_at"] = inc_exp
+        return max(1, math.ceil(inc_exp - now)), merged
+
+    if inc_rank == cur_rank and inc_exp <= cur_exp:
+        return None
+
+    eff_exp = max(cur_exp, inc_exp)
+    merged = dict(incoming_payload)
+    merged["expires_at"] = eff_exp
+    return max(1, math.ceil(eff_exp - now)), merged
+
 
 def quota_redis_key(  # DALTON-HOOK(quota-exhaustion)
     name: str,
@@ -1049,24 +1187,43 @@ class ModelResilienceMiddleware(AgentMiddleware):
         if orig_refusal is None:
             orig_refusal = read_refusal(exc)
 
+        horizon_ts = now + horizon if math.isfinite(horizon) and horizon > 0 else None
+
         if orig_refusal is not None and orig_refusal.reason in (
             "out_of_credit",
             "quota_exceeded",
             "plan_excludes",
         ):
-            exp_ts = (
-                orig_refusal.until.timestamp()
-                if orig_refusal.until is not None
-                else (now + horizon if math.isfinite(horizon) and horizon > 0 else None)
-            )
+            refusal_ts = orig_refusal.until.timestamp() if orig_refusal.until is not None else None
+            if refusal_ts is not None and horizon_ts is not None and horizon_ts > refusal_ts:
+                until_dt = datetime.fromtimestamp(horizon_ts, tz=timezone.utc)
+                return (
+                    ProviderRefusal(
+                        orig_refusal.reason,
+                        tier=orig_refusal.tier,
+                        window=orig_refusal.window,
+                        until=until_dt,
+                    ),
+                    horizon_ts,
+                )
+            exp_ts = refusal_ts if refusal_ts is not None else horizon_ts
             return orig_refusal, exp_ts
 
         if ModelResilienceMiddleware._is_confirmed_subscription_quota(exc, orig_refusal):
-            if orig_refusal is not None and orig_refusal.until is not None:
+            # DALTON-HOOK(antigravity-series): pick the later reset when body resets_in_seconds and Retry-After disagree
+            refusal_ts = orig_refusal.until.timestamp() if (orig_refusal is not None and orig_refusal.until is not None) else None
+            if refusal_ts is not None and horizon_ts is not None:
+                if horizon_ts > refusal_ts:
+                    exp_ts = horizon_ts
+                    until_dt = datetime.fromtimestamp(exp_ts, tz=timezone.utc)
+                else:
+                    until_dt = orig_refusal.until
+                    exp_ts = refusal_ts
+            elif refusal_ts is not None:
                 until_dt = orig_refusal.until
-                exp_ts = until_dt.timestamp()
-            elif math.isfinite(horizon) and horizon > 0:
-                exp_ts = now + horizon
+                exp_ts = refusal_ts
+            elif horizon_ts is not None:
+                exp_ts = horizon_ts
                 until_dt = datetime.fromtimestamp(exp_ts, tz=timezone.utc)
             else:
                 exp_ts = None
@@ -1085,22 +1242,18 @@ class ModelResilienceMiddleware(AgentMiddleware):
             return ProviderRefusal("out_of_credit"), None
 
         if status == 429 or (orig_refusal is not None and orig_refusal.reason == "rate_limited"):
-            exp_ts = now + horizon if math.isfinite(horizon) and horizon > 0 else None
-            return ProviderRefusal("rate_limited"), exp_ts
+            return ProviderRefusal("rate_limited"), horizon_ts
 
-        exp_ts = now + horizon if math.isfinite(horizon) and horizon > 0 else None
-        return orig_refusal, exp_ts
+        return orig_refusal, horizon_ts
 
     def _evaluate_cooldown(  # DALTON-HOOK(antigravity-series)
         self, exc: Exception, *, now_epoch: float | None = None
     ) -> tuple[float | None, Any, float | None]:
         """Evaluate cooldown horizon and freeze classification/reset once on first receipt.
 
-        Also derives a horizon from a ``plan_limit`` refusal's reset timestamp
-        (e.g. Codex ``usage_limit_reached`` carrying only ``resets_in_seconds``)
-        so it writes local & Redis cooldown records when the wait exceeds the
-        retry budget, sharing the exact same absolute ``until`` with the first
-        error card.
+        Reconciles body reset timestamps (e.g. Codex ``resets_in_seconds`` / ``resets_at``)
+        and ``Retry-After`` headers by taking the later of the two so the error card,
+        local bench, and Redis cooldown record always share one exact absolute ``until``.
         """
         from src.llms import provider_errors as _pe
 
@@ -1109,14 +1262,16 @@ class ModelResilienceMiddleware(AgentMiddleware):
         orig_refusal = _pe.read_refusal(exc)
         horizon = self._quota_horizon_s(exc)
         if (
-            horizon is None
-            and orig_refusal is not None
-            and orig_refusal.reason == "plan_limit"
+            orig_refusal is not None
+            and orig_refusal.reason in ("plan_limit", "quota_exceeded")
             and orig_refusal.until is not None
         ):
             delta = (orig_refusal.until - pe_now).total_seconds()
             if math.isfinite(delta) and delta > 0:
-                horizon = delta
+                if horizon is None:
+                    horizon = delta
+                elif math.isfinite(horizon):
+                    horizon = max(horizon, delta)
         if horizon is None:
             return None, orig_refusal, None
         frozen_refusal, frozen_expires_at = self._freeze_cooldown_refusal(
@@ -1204,7 +1359,13 @@ class ModelResilienceMiddleware(AgentMiddleware):
             expires_at=exp_ts,
             provider_refusal=provider_refusal,
         )
-        self._quota_exhausted[scope_key] = (time.monotonic() + remaining, refusal)
+        self._remember_quota_exhausted_local(
+            scope_key,
+            remaining,
+            refusal,
+            frozen_refusal=provider_refusal,
+            frozen_expires_at=exp_ts,
+        )
         return True
 
     @staticmethod
@@ -1214,25 +1375,36 @@ class ModelResilienceMiddleware(AgentMiddleware):
         exc: Exception,
         *,
         frozen_refusal: Any = None,
+        frozen_expires_at: float | None = None,
         now_epoch: float | None = None,
     ) -> tuple[int, dict[str, Any]]:
         now = time.time() if now_epoch is None else now_epoch
-        ttl_s = (
-            max(1, math.ceil(horizon))
-            if math.isfinite(horizon) and horizon > 0
-            else DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS
-        )
+        # DALTON-HOOK(antigravity-series): persist the frozen classification and absolute reset time.
+        if frozen_refusal is None:
+            frozen_refusal, computed_exp = ModelResilienceMiddleware._freeze_cooldown_refusal(
+                exc, horizon, now_epoch=now
+            )
+            if frozen_expires_at is None:
+                frozen_expires_at = computed_exp
+        if (
+            isinstance(frozen_expires_at, (int, float))
+            and math.isfinite(float(frozen_expires_at))
+            and float(frozen_expires_at) > now
+        ):
+            exp_ts = float(frozen_expires_at)
+            ttl_s = max(1, math.ceil(exp_ts - now))
+        elif math.isfinite(horizon) and horizon > 0:
+            ttl_s = max(1, math.ceil(horizon))
+            exp_ts = now + ttl_s
+        else:
+            ttl_s = DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS
+            exp_ts = now + ttl_s
         payload: dict[str, Any] = {
-            "expires_at": now + ttl_s,
+            "expires_at": exp_ts,
             "message": str(exc)[:_ERROR_SUMMARY_MAX_CHARS],
             "status_code": extract_status_code(exc),
             "model": name,
         }
-        # DALTON-HOOK(antigravity-series): persist the frozen classification and absolute reset time.
-        if frozen_refusal is None:
-            frozen_refusal, _ = ModelResilienceMiddleware._freeze_cooldown_refusal(
-                exc, horizon, now_epoch=now
-            )
         refusal_data = ModelResilienceMiddleware._serialize_provider_refusal(frozen_refusal)
         if refusal_data is not None:
             payload["refusal"] = refusal_data
@@ -1270,26 +1442,49 @@ class ModelResilienceMiddleware(AgentMiddleware):
         return self._run_sync_cache_call(lambda: cache.get(redis_key))
 
     def _sync_redis_set(  # DALTON-HOOK(quota-exhaustion)
-        self, redis_key: str, payload: dict[str, Any], ttl_s: int
+        self,
+        redis_key: str,
+        payload: dict[str, Any],
+        ttl_s: int,
+        *,
+        now_epoch: float | None = None,
     ) -> None:
+        # DALTON-HOOK(antigravity-series): atomic non-shortening / non-downgrading upsert in Redis
         import json
         import redis as sync_redis
         import redis.asyncio as async_redis
         from src.utils.cache.redis_cache import get_cache_client
 
+        now = time.time() if now_epoch is None else now_epoch
         cache = get_cache_client()
         if isinstance(getattr(cache, "client", None), async_redis.Redis):
             if not getattr(cache, "enabled", True):
                 return
+            inc_rank = _cooldown_reason_rank(_extract_cooldown_record_reason(payload))
+            inc_exp = float(payload.get("expires_at") or (now + ttl_s))
             with sync_redis.Redis.from_url(
                 cache.url,
                 socket_timeout=getattr(cache, "socket_timeout", 2),
                 socket_connect_timeout=getattr(cache, "socket_connect_timeout", 2),
                 decode_responses=False,
             ) as client:
-                client.setex(redis_key, ttl_s, json.dumps(payload, ensure_ascii=False))
+                client.eval(
+                    _UPSERT_QUOTA_COOLDOWN_LUA,
+                    1,
+                    redis_key,
+                    json.dumps(payload, ensure_ascii=False),
+                    str(ttl_s),
+                    str(now),
+                    str(inc_rank),
+                    str(inc_exp),
+                )
             return
-        self._run_sync_cache_call(lambda: cache.set(redis_key, payload, ttl=ttl_s))
+        existing = self._run_sync_cache_call(lambda: cache.get(redis_key))
+        merged = _merge_quota_redis_payload(existing, payload, ttl_s, now)
+        if merged is None:
+            return
+        eff_ttl_s, eff_payload = merged
+        self._run_sync_cache_call(lambda: cache.set(redis_key, eff_payload, ttl=eff_ttl_s))
 
     def _quota_skipped(  # DALTON-HOOK(antigravity-series)
         self, name: str, client: Any = None
@@ -1358,10 +1553,9 @@ class ModelResilienceMiddleware(AgentMiddleware):
         frozen_refusal: Any = None,
         frozen_expires_at: float | None = None,
     ) -> None:
-        """Benches ``scope_key`` until its horizon passes, freezing classification and reset time."""
-        benched = self._quota_exhausted.get(scope_key)
-        if benched is not None and time.monotonic() < benched[0]:
-            return
+        """Benches ``scope_key`` without shortening or downgrading an active cooldown."""
+        now_mono = time.monotonic()
+        incoming_mono = now_mono + horizon
         cached: Exception = exc
         if frozen_refusal is not None and frozen_refusal.reason in ("plan_limit", "rate_limited"):
             status = extract_status_code(exc)
@@ -1372,7 +1566,57 @@ class ModelResilienceMiddleware(AgentMiddleware):
                 expires_at=frozen_expires_at,
                 provider_refusal=frozen_refusal,
             )
-        self._quota_exhausted[scope_key] = (time.monotonic() + horizon, cached)
+        benched = self._quota_exhausted.get(scope_key)
+        if benched is not None and now_mono < benched[0]:
+            existing_mono, existing_exc = benched
+            existing_rank = _cooldown_reason_rank(_extract_exc_refusal_reason(existing_exc))
+            incoming_reason = (
+                frozen_refusal.reason
+                if frozen_refusal is not None
+                else _extract_exc_refusal_reason(cached)
+            )
+            incoming_rank = _cooldown_reason_rank(incoming_reason)
+            if incoming_rank < existing_rank:
+                if incoming_mono <= existing_mono:
+                    return
+                updated_existing = existing_exc
+                if (
+                    isinstance(existing_exc, _RemoteQuotaExhaustedError)
+                    and isinstance(frozen_expires_at, (int, float))
+                    and (
+                        existing_exc.expires_at is None
+                        or float(frozen_expires_at) > float(existing_exc.expires_at)
+                    )
+                ):
+                    updated_existing = _RemoteQuotaExhaustedError(
+                        str(existing_exc),
+                        existing_exc.status_code,
+                        expires_at=float(frozen_expires_at),
+                        provider_refusal=existing_exc.provider_refusal,
+                    )
+                self._quota_exhausted[scope_key] = (incoming_mono, updated_existing)
+                return
+            if incoming_rank == existing_rank and incoming_mono <= existing_mono:
+                return
+            eff_mono = max(existing_mono, incoming_mono)
+            if (
+                isinstance(cached, _RemoteQuotaExhaustedError)
+                and isinstance(existing_exc, _RemoteQuotaExhaustedError)
+                and isinstance(existing_exc.expires_at, (int, float))
+                and (
+                    cached.expires_at is None
+                    or float(existing_exc.expires_at) > float(cached.expires_at)
+                )
+            ):
+                cached = _RemoteQuotaExhaustedError(
+                    str(cached),
+                    cached.status_code,
+                    expires_at=float(existing_exc.expires_at),
+                    provider_refusal=cached.provider_refusal,
+                )
+            self._quota_exhausted[scope_key] = (eff_mono, cached)
+            return
+        self._quota_exhausted[scope_key] = (incoming_mono, cached)
 
     def _remember_quota_exhausted(  # DALTON-HOOK(antigravity-series)
         self,
@@ -1403,10 +1647,15 @@ class ModelResilienceMiddleware(AgentMiddleware):
         if redis_key is None:
             return
         ttl_s, payload = self._build_quota_redis_payload(
-            name, horizon, exc, frozen_refusal=frozen_refusal, now_epoch=now
+            name,
+            horizon,
+            exc,
+            frozen_refusal=frozen_refusal,
+            frozen_expires_at=frozen_expires_at,
+            now_epoch=now,
         )
         try:
-            self._sync_redis_set(redis_key, payload, ttl_s)
+            self._sync_redis_set(redis_key, payload, ttl_s, now_epoch=now)
         except Exception as err:
             logger.debug(
                 "[ModelResilience] Redis sync quota write unavailable, keeping local state only",
@@ -1443,12 +1692,42 @@ class ModelResilienceMiddleware(AgentMiddleware):
         if redis_key is None:
             return
         ttl_s, payload = self._build_quota_redis_payload(
-            name, horizon, exc, frozen_refusal=frozen_refusal, now_epoch=now
+            name,
+            horizon,
+            exc,
+            frozen_refusal=frozen_refusal,
+            frozen_expires_at=frozen_expires_at,
+            now_epoch=now,
         )
         try:
+            # DALTON-HOOK(antigravity-series): non-shortening / non-downgrading Redis cooldown upsert
+            import json
+            import redis.asyncio as async_redis
             from src.utils.cache.redis_cache import get_cache_client
 
-            await get_cache_client().set(redis_key, payload, ttl=ttl_s)
+            cache = get_cache_client()
+            raw_client = getattr(cache, "client", None)
+            if isinstance(raw_client, async_redis.Redis):
+                if not getattr(cache, "enabled", True):
+                    return
+                inc_rank = _cooldown_reason_rank(_extract_cooldown_record_reason(payload))
+                inc_exp = float(payload.get("expires_at") or (now + ttl_s))
+                await raw_client.eval(
+                    _UPSERT_QUOTA_COOLDOWN_LUA,
+                    1,
+                    redis_key,
+                    json.dumps(payload, ensure_ascii=False),
+                    str(ttl_s),
+                    str(now),
+                    str(inc_rank),
+                    str(inc_exp),
+                )
+            else:
+                existing = await cache.get(redis_key)
+                merged = _merge_quota_redis_payload(existing, payload, ttl_s, now)
+                if merged is not None:
+                    eff_ttl_s, eff_payload = merged
+                    await cache.set(redis_key, eff_payload, ttl=eff_ttl_s)
         except Exception as err:
             logger.debug(
                 "[ModelResilience] Redis quota write unavailable, keeping local state only",
