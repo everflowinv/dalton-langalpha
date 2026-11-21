@@ -249,7 +249,7 @@ def _format_conversation_stats_line(
 ) -> str:
     """Format `dalton_conversation_cards` statistics into a compact summary line."""
     if not isinstance(conversation_stats, Mapping):
-        return "归档统计：未统计（可直接调 `conversation_search` 查 fact/estimate/model_assumption/opinion/question/decision/todo 卡片）。"
+        return "归档统计：未统计（团队记忆开启时，可用 `conversation_search` 查 fact/estimate/model_assumption/opinion/question/decision/todo 卡片）。"
 
     total = int(conversation_stats.get("total_cards") or 0)
     min_date = str(conversation_stats.get("min_date") or "").strip()
