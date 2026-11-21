@@ -61,6 +61,12 @@ export function useThreadWriteAccess({
     activeWorkspace,
   );
 
+  // Confirmed shared directly from the thread detail (`thread.shared` is present
+  // only on shared-workspace threads) — never depends on features/account/list.
+  if (checkUpstreamShared && Boolean(thread?.shared)) {
+    return { status: 'shared', isError: false };
+  }
+
   if (!hasWorkspace) {
     return { status: 'writable', isError: false };
   }
