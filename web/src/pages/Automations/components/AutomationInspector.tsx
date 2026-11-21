@@ -500,7 +500,7 @@ function RunHistory({
                     })()
                   : []
                 : attempts.flatMap((d) => {
-                    if (deliveryOutcome(d) !== 'failed' || !d.error) return [];
+                    if (deliveryOutcome(d, e.completed_at) !== 'failed' || !d.error) return [];
                     const localized = formatDeliveryFailureReason(null, d.error, t) ?? d.error;
                     return [t('automation.deliveryNamedProblem', { name: deliveryAttemptName(d, t, names), message: localized })];
                   });
@@ -590,8 +590,8 @@ function RunHistory({
                           )
                         : attempts.length > 0
                           ? attempts.map((d, i) => {
-                              // DALTON-HOOK(execution-delivery-status): distinguish retrying from failed on raw delivery_result attempts
-                              const outcome = deliveryOutcome(d);
+                              // DALTON-HOOK(execution-delivery-status): distinguish retrying from failed on raw delivery_result attempts with settle-window fallback
+                              const outcome = deliveryOutcome(d, e.completed_at);
                               return (
                                 <span key={`${d.method}|${d.address ?? ''}|${i}`} className="automation-history-attempt">
                                   {outcome === 'failed' && (
@@ -601,7 +601,7 @@ function RunHistory({
                                     <Clock className="h-3 w-3 shrink-0" style={{ color: 'var(--color-accent-primary)' }} aria-label={t('automation.deliveryStatusRetrying')} />
                                   )}
                                   {/* Where it landed and how; an older run says only which app. */}
-                                  {isLegacyAttempt(d) ? deliveryMethodName(d.method, t) : deliveryAttemptLabel(d, t, names)}
+                                  {isLegacyAttempt(d) ? deliveryMethodName(d.method, t) : deliveryAttemptLabel(d, t, names, e.completed_at)}
                                 </span>
                               );
                             })

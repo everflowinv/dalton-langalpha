@@ -11,8 +11,20 @@ import type {
   ScriptAutomationRunRead,
 } from '@/types/automation';
 import * as api from '../utils/api';
-import { deliveryTargetName, matchAttemptForTarget, resolveExecutionDelivery } from '../utils/delivery';
-import { DELIVERY_SETTLE_MS, isDeliverySettling, isScriptDeliveryPending, LIVE_POLL_MS } from '../utils/polling';
+import {
+  deliveryOutcome,
+  deliveryTargetName,
+  matchAttemptForTarget,
+  resolveExecutionDelivery,
+} from '../utils/delivery';
+import {
+  DELIVERY_SETTLE_MS,
+  IDLE_POLL_MS,
+  isDeliverySettling,
+  isScriptDeliveryPending,
+  LIVE_POLL_MS,
+  scriptDeliveryPollMs,
+} from '../utils/polling';
 import { describeRun } from '../utils/status';
 import Automations from '../Automations';
 import ScriptInspector from '../components/ScriptInspector';
@@ -711,6 +723,274 @@ describe('round-3 review regressions', () => {
     // Advance well past several poll intervals: polling has stopped once terminal status arrived
     await act(async () => {
       await vi.advanceTimersByTimeAsync(LIVE_POLL_MS * 4);
+    });
+    expect(execReadMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('round-4 review regressions', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('unifies FeedView targets, RunReport delivered notify-only targets, and deliveryOutcome 3-minute settle fallback', async () => {
+    await i18n.changeLanguage('zh-CN');
+
+    // 1) deliveryOutcome 3-minute settle-window fallback when retrying: true was left stale after crash
+    const completedIso = '2026-11-20T13:13:00Z';
+    const completedMs = Date.parse(completedIso);
+    const staleRetryingAttempt = {
+      method: 'slack:T1/C1',
+      address: 'slack:T1/C1',
+      name: '#desk',
+      success: false,
+      retrying: true,
+      error: "Delivery couldn't be confirmed. Gateway timeout.",
+    };
+    expect(deliveryOutcome(staleRetryingAttempt, completedIso, completedMs + 30_000)).toBe('retrying');
+    expect(deliveryOutcome(staleRetryingAttempt, completedIso, completedMs + DELIVERY_SETTLE_MS + 1_000)).toBe('failed');
+
+    // 2) FeedView uses delivery_summary.targets over stale delivery_result AND never shows contradictory retrying after 3m
+    const reconciledDeliveredRun: AutomationExecution = {
+      ...makeExecution('run-reconciled-sent', 20, {
+        status: 'delivered',
+        total_targets: 1,
+        sent_count: 1,
+        failed_count: 0,
+        retrying_count: 0,
+        failure_code: null,
+        failure_reason: null,
+        targets: [
+          {
+            target: 'feishu:chat:oc_market_pm',
+            channel: 'feishu',
+            name: '投研大群',
+            status: 'sent',
+          },
+        ],
+      }),
+      // Stale mirrored failure left in delivery_result before reconciliation confirmed sent
+      delivery_result: [
+        {
+          method: 'feishu',
+          address: 'feishu:chat:oc_market_pm',
+          name: '投研大群',
+          success: false,
+          error: '已生成但未送达（not_allowed）',
+        },
+      ],
+    };
+
+    const expiredStaleRetryingRun: AutomationExecution = {
+      ...makeExecution('run-stale-retrying', 19, null),
+      completed_at: '2026-11-19T13:13:00Z',
+      delivery_result: [staleRetryingAttempt],
+    };
+
+    const auto = { ...AUTOMATION, last_execution: reconciledDeliveredRun };
+    vi.mocked(api.listAutomations).mockResolvedValue({ data: { automations: [auto], total: 1 } } as never);
+    vi.mocked(api.listExecutions).mockResolvedValue({
+      data: { executions: [reconciledDeliveredRun, expiredStaleRetryingRun], has_more: false },
+    } as never);
+    vi.mocked(api.listRecentRuns).mockResolvedValue({
+      data: { executions: [asFeed(reconciledDeliveredRun), asFeed(expiredStaleRetryingRun)], has_more: false },
+    } as never);
+    vi.mocked(api.getDeliveryOptions).mockResolvedValue({ data: { enabled: false, apps: {}, workspace_id: 'ws-1' } } as never);
+
+    const { unmount } = renderWithProviders(<Automations />, { route: '/automations?view=feed' });
+
+    const reconciledEntry = (await screen.findByText('Excerpt run-reconciled-sent')).closest('article')!;
+    expect(reconciledEntry).toHaveTextContent('已发送到 投研大群');
+    expect(reconciledEntry).not.toHaveTextContent('发送失败');
+
+    const staleEntry = screen.getByText('Excerpt run-stale-retrying').closest('article')!;
+    expect(staleEntry).toHaveTextContent('已完成 · 投递失败');
+    expect(staleEntry).toHaveTextContent('#desk 发送失败');
+    expect(staleEntry).not.toHaveTextContent('#desk 投递中');
+    unmount();
+
+    // 3) RunReport detail card renders delivered target when only notify-table summary exists (delivery_result is null)
+    const notifyOnlyDelivered: AutomationExecution = {
+      ...makeExecution('run-notify-only-delivered', 20, {
+        status: 'delivered',
+        total_targets: 1,
+        sent_count: 1,
+        failed_count: 0,
+        retrying_count: 0,
+        failure_code: null,
+        failure_reason: null,
+        targets: [
+          {
+            target: 'feishu:chat:oc_market_pm',
+            channel: 'feishu',
+            name: '投研大群',
+            status: 'sent',
+          },
+        ],
+      }),
+      delivery_result: null,
+    };
+
+    const autoNotifyOnly = { ...AUTOMATION, last_execution: notifyOnlyDelivered };
+    vi.mocked(api.listAutomations).mockResolvedValue({ data: { automations: [autoNotifyOnly], total: 1 } } as never);
+    vi.mocked(api.listExecutions).mockResolvedValue({
+      data: { executions: [notifyOnlyDelivered], has_more: false },
+    } as never);
+    renderWithProviders(<Automations />, { route: '/automations?id=auto-market-pm' });
+
+    const heading = await screen.findByRole('heading', { level: 2, name: '市场晚报' });
+    const pane = heading.closest('article')!;
+    await within(pane).findByRole('table');
+    const reportCard = pane.querySelector('.automation-report') as HTMLElement;
+    expect(reportCard).toHaveTextContent('已发送到 投研大群');
+  });
+
+  it('polls ScriptInspector at 30s slow interval while unconfirmed awaiting receipt and stops once final receipt arrives', async () => {
+    await i18n.changeLanguage('zh-CN');
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+
+    const makeScriptRun = (
+      notifyStatus: string,
+      summary: ExecutionDeliverySummary,
+    ): ScriptAutomationRunRead => ({
+      automation_execution_id: 'script-run-unconfirmed',
+      automation_id: 'data:daily-brief',
+      automation_name: 'Daily Brief',
+      engine_kind: 'script',
+      status: 'succeeded',
+      scheduled_at: '2026-11-20T13:10:00Z',
+      created_at: '2026-11-20T13:10:00Z',
+      started_at: '2026-11-20T13:10:01Z',
+      completed_at: '2026-11-20T13:10:15Z',
+      conversation_thread_id: null,
+      workspace_id: null,
+      excerpt: null,
+      exit_code: 0,
+      failure_reason: null,
+      notify_status: notifyStatus,
+      delivery_summary: summary,
+      triggered_by_user_id: null,
+      log_tail: null,
+      trigger_source: 'schedule',
+    });
+
+    const unconfirmedRun = makeScriptRun('pending_dispatch', {
+      status: 'failed',
+      total_targets: 1,
+      sent_count: 0,
+      failed_count: 1,
+      retrying_count: 0,
+      failure_code: 'delivery_uncertain',
+      failure_reason: '投递状态未确认',
+      targets: [
+        {
+          target: 'feishu:chat:oc_ops',
+          channel: 'feishu',
+          status: 'failed',
+          error_code: 'delivery_uncertain',
+          error_message: '投递状态未确认',
+        },
+      ],
+    });
+    const deliveredAfterReceipt = makeScriptRun('dispatched', {
+      status: 'delivered',
+      total_targets: 1,
+      sent_count: 1,
+      failed_count: 0,
+      retrying_count: 0,
+      failure_code: null,
+      failure_reason: null,
+    });
+    const terminalCardLimitRun = makeScriptRun('pending_dispatch', {
+      status: 'failed',
+      total_targets: 1,
+      sent_count: 0,
+      failed_count: 1,
+      retrying_count: 0,
+      failure_code: 'card_limit_exceeded',
+      failure_reason: '卡片超过 30 KB 上限',
+    });
+
+    // Unconfirmed pending_dispatch polls slowly (30s), truly terminal card_limit stops (false).
+    expect(scriptDeliveryPollMs([unconfirmedRun])).toBe(IDLE_POLL_MS);
+    expect(scriptDeliveryPollMs([deliveredAfterReceipt])).toBe(false);
+    expect(scriptDeliveryPollMs([terminalCardLimitRun])).toBe(false);
+
+    const script: ScriptAutomationRead = {
+      automation_id: 'data:daily-brief',
+      name: 'Daily Brief',
+      status: 'active',
+      enabled: true,
+      paused_by_user: false,
+      cron_expression: '0 9 * * 1-5',
+      timezone: 'Asia/Shanghai',
+      config_version: 1,
+      active_version: 1,
+      updated_at: '2026-11-20T00:00:00Z',
+      notify_storage_mode: 'task_row',
+      engine_kind: 'script',
+      scope: 'company',
+      description: null,
+      next_run_at: '2026-11-21T01:00:00Z',
+      last_run_at: '2026-11-20T13:10:15Z',
+      updated_by: null,
+      dalton_notify_category: 'data_task',
+      dalton_notify_effective: true,
+      dalton_notify_source: 'task_row',
+      dalton_notify_route_targets: ['feishu:chat:oc_ops'],
+      last_execution: unconfirmedRun,
+    };
+
+    const execReadMock = vi.mocked(api.listAutomationExecutionReads);
+    execReadMock
+      .mockResolvedValueOnce({ data: { executions: [unconfirmedRun], has_more: false } } as never)
+      .mockResolvedValue({ data: { executions: [deliveredAfterReceipt], has_more: false } } as never);
+    vi.mocked(api.listAutomationHistory).mockResolvedValue({
+      data: {
+        automation_id: script.automation_id,
+        scope: 'company',
+        engine_kind: 'script',
+        config_version: 1,
+        active_version: 1,
+        entries: [],
+        total: 0,
+        limit: 50,
+        offset: 0,
+      },
+    } as never);
+
+    renderWithProviders(
+      <ScriptInspector
+        script={script}
+        runId={null}
+        configVersion={1}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onRunsForbidden={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText(/投递状态未确认/)).toBeInTheDocument();
+    expect(execReadMock).toHaveBeenCalledTimes(1);
+
+    // At 5s (LIVE_POLL_MS): still no second fetch because unconfirmed uses 30s slow polling
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_POLL_MS);
+    });
+    expect(execReadMock).toHaveBeenCalledTimes(1);
+
+    // At 30s (IDLE_POLL_MS): refetches and picks up delivered receipt
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(IDLE_POLL_MS);
+    });
+    await waitFor(() => {
+      expect(execReadMock).toHaveBeenCalledTimes(2);
+      expect(screen.queryByText(/投递状态未确认/)).not.toBeInTheDocument();
+    });
+
+    // Further intervals make zero additional fetches — stopped once terminal
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(IDLE_POLL_MS * 3);
     });
     expect(execReadMock).toHaveBeenCalledTimes(2);
   });

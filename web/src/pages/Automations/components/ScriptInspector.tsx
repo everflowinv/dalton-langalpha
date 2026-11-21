@@ -11,7 +11,7 @@ import { useAutomationExecutionReads } from '../hooks/useAutomationReads';
 import { useAutomationMutations } from '../hooks/useAutomationMutations';
 import { cronToHuman } from '../utils/cron'; // DALTON-HOOK(ui-unify)
 import { formatDeliveryFailureReason } from '../utils/delivery';
-import { isScriptDeliveryPending, LIVE_POLL_MS } from '../utils/polling';
+import { scriptDeliveryPollMs } from '../utils/polling';
 import { formatDateTimeShort } from '../utils/time';
 import { isCompanyTask, isDeletedTask, isForbiddenError, runStatusKey, scriptStatusLabelKey } from '../utils/taskKind';
 import { DeletedMeta, ModificationHistory, RecordTabs, RollbackDialog } from './ModificationHistory';
@@ -41,9 +41,7 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
     offset: 0,
     enabled: !deleted,
     refetchInterval: (data) =>
-      data?.executions.some((run) => run.engine_kind === 'script' && isScriptDeliveryPending(run))
-        ? LIVE_POLL_MS
-        : false,
+      scriptDeliveryPollMs((data?.executions ?? []).filter((run) => run.engine_kind === 'script')),
   });
   const runsForbidden = isCompanyTask(script) && isForbiddenError(runs.error);
   useEffect(() => {

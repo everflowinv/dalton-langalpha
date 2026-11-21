@@ -96,10 +96,14 @@ export function RunReport({
             })
         : null;
   const deliveryRetrying = delivery?.status === 'retrying';
+  // DALTON-HOOK(execution-delivery-status): also show delivered targets in detail report when only notify-table summary records exist
   const showDeliveryTargetDetails =
     deliveryTargets.length > 0 &&
     delivery != null &&
-    (delivery.status === 'failed' || delivery.status === 'partial_failed' || delivery.status === 'retrying');
+    (delivery.status === 'failed' ||
+      delivery.status === 'partial_failed' ||
+      delivery.status === 'retrying' ||
+      (delivery.status === 'delivered' && layout === 'report' && run.delivery_summary != null));
   // DALTON-HOOK(execution-delivery-status): strip fallback synced-undelivered suffix from excerpt when structured delivery status is shown
   const displayExcerpt =
     delivery && (delivery.status === 'failed' || delivery.status === 'partial_failed' || delivery.status === 'retrying')
@@ -149,6 +153,7 @@ export function RunReport({
           })}
         </ul>
       )}
+      {/* DALTON-HOOK(execution-delivery-status): end of per-target delivery details */}
       {view.noteKey && <p className="automation-run-note">{t(view.noteKey)}</p>}
       {(view.waiting || onRetry || onResume || links.length > 0 || hasThread) && (
         <div className="automation-run-actions">

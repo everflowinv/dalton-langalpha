@@ -1129,6 +1129,11 @@ async def test_system_jobs_data_task_and_cross_owner_sector_batch_enrichment(
     )
     monkeypatch.setattr(
         system_jobs,
+        "require_pm_user",
+        create_autospec(system_jobs.require_pm_user, return_value=None),
+    )
+    monkeypatch.setattr(
+        system_jobs,
         "get_user_tier",
         create_autospec(system_jobs.get_user_tier, return_value="internal"),
     )
@@ -1610,7 +1615,19 @@ async def test_settlement_clears_retrying_flag_when_stopping_retries_without_rep
     stored_records["exec-ans-401-inline"] = automation_settlement._stamp_delivery_retry(
         finish_posting.result, retrying=True
     )
-    ask_401 = create_autospec(orig_finish_run, side_effect=[finish_404])
+    from src.tools.messaging import tools as messaging
+
+    monkeypatch.setattr(
+        messaging,
+        "gateway_request",
+        create_autospec(
+            messaging.gateway_request,
+            side_effect=messaging.GatewayError(
+                "Refused credentials.", delivered_unknown=False, status=401
+            ),
+        ),
+    )
+    ask_401 = create_autospec(orig_finish_run, side_effect=orig_finish_run)
     await automation_settlement._finish_again(
         lambda: ask_401(
             auto_stub,
@@ -1623,6 +1640,7 @@ async def test_settlement_clears_retrying_flag_when_stopping_retries_without_rep
         "exec-ans-401-inline",
         answered=True,
     )
+    assert ask_401.await_count == 1
     assert "Still posting to #desk." in stored_records["exec-ans-401-inline"][0]["error"]
     assert stored_records["exec-ans-401-inline"][0]["retrying"] is False
 
@@ -1746,3 +1764,311 @@ def test_company_script_pending_dispatch_failed_over_24h_remains_retrying_until_
     )
     assert settled_script is not None
     assert settled_script["status"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# 6. Round-4 review regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_claim_cap_exhausted_pending_immediately_unconfirmed_without_waiting_10m() -> None:
+    """R4 Item 4 (Codex High #1): pending row at attempt cap is immediately unconfirmed (<10m)."""
+    now = _utc(15, 0)
+    just_claimed_at = now - timedelta(seconds=30)
+
+    # Trigger: 3rd attempt claimed (attempt_count=3, status=pending, error_code=None) and
+    # worker exited without writing back; dispatch.py:1511 forbids a 4th claim.
+    capped_pending = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "exec-pending-cap-3",
+                "channel": "feishu",
+                "target": "feishu:chat:oc_market_pm",
+                "status": "pending",
+                "attempt_count": 3,
+                "error_code": None,
+                "created_at": just_claimed_at,
+                "updated_at": just_claimed_at,
+                "payload_json": {"source": "automation_report"},
+            }
+        ],
+        now=now,
+    )
+    assert capped_pending is not None
+    assert capped_pending["status"] == "failed"
+    assert capped_pending["retrying_count"] == 0
+    assert capped_pending["failed_count"] == 1
+    assert capped_pending["failure_code"] == "delivery_uncertain"
+    assert capped_pending["failure_reason"] == "投递状态未确认"
+
+    # Control: attempt_count=2 freshly claimed (<10m) can still finish or be reclaimed -> retrying.
+    mid_flight = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "exec-pending-2",
+                "channel": "feishu",
+                "target": "feishu:chat:oc_market_pm",
+                "status": "pending",
+                "attempt_count": 2,
+                "error_code": None,
+                "created_at": just_claimed_at,
+                "updated_at": just_claimed_at,
+                "payload_json": {"source": "automation_report"},
+            }
+        ],
+        now=now,
+    )
+    assert mid_flight is not None
+    assert mid_flight["status"] == "retrying"
+
+
+def test_script_all_skipped_notify_rows_do_not_fallback_to_pending_dispatch() -> None:
+    """R4 Item 2 (Carbon Med #2 / Codex Med #5): all-skipped target rows return None, not retrying."""
+    now = _utc(15, 0)
+
+    # Trigger: script failed initially so notify_status stayed pending_dispatch, then user
+    # disabled notify and retry_failed_notify_deliveries marked all target rows skipped.
+    all_skipped = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "script-run-skipped",
+                "automation_id": "data:daily-brief",
+                "channel": "feishu",
+                "target": "feishu:chat:oc_ops",
+                "status": "skipped",
+                "attempt_count": 1,
+                "error_code": "toggle_off",
+                "created_at": now - timedelta(minutes=5),
+                "updated_at": now - timedelta(minutes=1),
+                "payload_json": {"route_key": "data:daily-brief"},
+            }
+        ],
+        notify_status="pending_dispatch",
+        now=now,
+    )
+    assert all_skipped is None
+
+    # Control: when truly no target rows exist yet, pending_dispatch still falls back to retrying.
+    no_rows = eds.summarize_execution_delivery(
+        notify_rows=[],
+        notify_status="pending_dispatch",
+        now=now,
+    )
+    assert no_rows is not None
+    assert no_rows["status"] == "retrying"
+
+
+@pytest.mark.asyncio
+async def test_system_jobs_toggle_home_sector_and_single_sector_status_enrich_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4 Item 3 (Carbon Med #3 / Codex Med #6): toggle_system_job(home/sector) and get_system_job_status(sector) enrich delivery_summary."""
+    from src.dalton import sharing
+
+    exec_home = str(uuid4())
+    exec_sector = str(uuid4())
+    ws_sector = str(uuid4())
+
+    _mock_db_connection(
+        monkeypatch,
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": exec_home,
+                "channel": "feishu",
+                "target": "feishu:chat:oc_home",
+                "status": "failed",
+                "attempt_count": 3,
+                "error_code": "card_limit_exceeded",
+                "payload_json": {"source": "automation_report"},
+            },
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": exec_sector,
+                "channel": "feishu",
+                "target": "feishu:chat:oc_sector",
+                "status": "failed",
+                "attempt_count": 3,
+                "error_code": "card_limit_exceeded",
+                "payload_json": {"source": "automation_report"},
+            },
+        ],
+    )
+
+    # 1. toggle_system_job(home) — both paused_by_user early return and normal toggle path
+    home_row_paused = {
+        "automation_id": str(uuid4()),
+        "name": "dalton-director-weekly",
+        "status": "paused",
+        "metadata": {"paused_by_user": True},
+        "last_execution": {
+            "automation_execution_id": exec_home,
+            "status": "completed",
+            "completed_at": _utc(13, 13),
+            "excerpt": "每周复盘已生成",
+            "delivery_result": None,
+        },
+    }
+    home_row_active = {
+        "automation_id": home_row_paused["automation_id"],
+        "name": "dalton-director-weekly",
+        "status": "active",
+        "metadata": {"paused_by_user": None},
+        "last_execution": {
+            "automation_execution_id": exec_home,
+            "status": "completed",
+            "completed_at": _utc(13, 13),
+            "excerpt": "每周复盘已生成",
+            "delivery_result": None,
+        },
+    }
+
+    @contextlib.asynccontextmanager
+    async def _fake_lock(_uid: str):
+        yield None
+
+    monkeypatch.setattr(
+        system_jobs,
+        "user_automations_lock",
+        create_autospec(system_jobs.user_automations_lock, side_effect=_fake_lock),
+    )
+    monkeypatch.setattr(
+        system_jobs,
+        "is_pm_user",
+        create_autospec(system_jobs.is_pm_user, return_value=True),
+    )
+    monkeypatch.setattr(
+        system_jobs,
+        "require_pm_user",
+        create_autospec(system_jobs.require_pm_user, return_value=None),
+    )
+    monkeypatch.setattr(
+        system_jobs,
+        "_enable_single_home_job",
+        create_autospec(system_jobs._enable_single_home_job, return_value=None),
+    )
+    orig_list_all = system_jobs.list_all_user_automations
+    orig_resolve_sector = system_jobs._resolve_sector_unit_for_key
+    orig_get_tracking = system_jobs.get_tracking_status
+
+    monkeypatch.setattr(
+        system_jobs,
+        "list_all_user_automations",
+        create_autospec(
+            orig_list_all,
+            side_effect=[
+                [dict(home_row_paused)],  # paused_by_user early return
+                [dict(home_row_paused)],  # pre-toggle read
+                [dict(home_row_active)],  # post-toggle read
+            ],
+        ),
+    )
+
+    paused_res = await system_jobs.toggle_system_job(
+        "pm-user",
+        "dalton-director-weekly",
+        enabled=True,
+        force=False,
+        respect_user_pause=True,
+    )
+    assert paused_res["job"]["last_result"] == "已完成 · 投递失败（卡片超过 30 KB 上限）"
+
+    enabled_res = await system_jobs.toggle_system_job(
+        "pm-user",
+        "dalton-director-weekly",
+        enabled=True,
+        force=True,
+    )
+    assert enabled_res["job"]["last_result"] == "已完成 · 投递失败（卡片超过 30 KB 上限）"
+
+    # 2. toggle_system_job(sector) enriches rows_after before building entry
+    sector_unit = {
+        "slug": "semi",
+        "display_name": "半导体",
+        "workspace_id": ws_sector,
+        "lead_analyst_user_id": "analyst-a",
+    }
+    sector_auto_row = {
+        "automation_id": str(uuid4()),
+        "name": "dalton-sector-semi-watch",
+        "workspace_id": ws_sector,
+        "status": "active",
+        "last_execution": {
+            "automation_execution_id": exec_sector,
+            "status": "completed",
+            "completed_at": _utc(13, 14),
+            "excerpt": "半导体行业周报已生成",
+            "delivery_result": None,
+        },
+    }
+    monkeypatch.setattr(
+        system_jobs,
+        "_resolve_sector_unit_for_key",
+        create_autospec(orig_resolve_sector, return_value=sector_unit),
+    )
+    monkeypatch.setattr(
+        system_jobs,
+        "_assert_unit_lead_for_managed_action",
+        create_autospec(system_jobs._assert_unit_lead_for_managed_action, return_value=None),
+    )
+    monkeypatch.setattr(
+        system_jobs,
+        "enable_tracking",
+        create_autospec(system_jobs.enable_tracking, return_value={"ok": True}),
+    )
+    monkeypatch.setattr(
+        system_jobs,
+        "get_tracking_status",
+        create_autospec(
+            orig_get_tracking,
+            return_value={"subject_kind": "sector", "status": "enabled", "tasks": []},
+        ),
+    )
+    monkeypatch.setattr(
+        system_jobs,
+        "list_all_user_automations",
+        create_autospec(
+            orig_list_all,
+            return_value=[dict(sector_auto_row)],
+        ),
+    )
+
+    sector_toggle_res = await system_jobs.toggle_system_job(
+        "analyst-a",
+        "sector:semi",
+        enabled=True,
+    )
+    assert sector_toggle_res["job"]["last_result"] == "已完成 · 投递失败（卡片超过 30 KB 上限）"
+
+    # 3. get_system_job_status("pm-user", "sector:semi") resolves lead analyst-a and enriches their rows
+    resolve_mock = create_autospec(orig_resolve_sector, return_value=sector_unit)
+    monkeypatch.setattr(system_jobs, "_resolve_sector_unit_for_key", resolve_mock)
+    monkeypatch.setattr(
+        sharing,
+        "require_workspace_access",
+        create_autospec(sharing.require_workspace_access, return_value={"user_id": "analyst-a"}),
+    )
+
+    async def _list_by_owner(user_id: str, **_kwargs: Any) -> list[dict[str, Any]]:
+        if user_id == "analyst-a":
+            return [dict(sector_auto_row)]
+        return []
+
+    monkeypatch.setattr(
+        system_jobs,
+        "list_all_user_automations",
+        create_autospec(orig_list_all, side_effect=_list_by_owner),
+    )
+    tracking_mock = create_autospec(
+        orig_get_tracking,
+        return_value={"subject_kind": "sector", "status": "enabled", "tasks": []},
+    )
+    monkeypatch.setattr(system_jobs, "get_tracking_status", tracking_mock)
+
+    single_res = await system_jobs.get_system_job_status("pm-user", "sector:semi")
+    assert single_res["job"]["last_result"] == "已完成 · 投递失败（卡片超过 30 KB 上限）"
+    resolve_mock.assert_awaited_once_with("pm-user", "semi", include_all_for_pm=True)
+    tracking_mock.assert_awaited_once_with("analyst-a", ws_sector, viewer_user_id="pm-user")

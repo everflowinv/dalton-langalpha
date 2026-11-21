@@ -104,13 +104,27 @@ export function deliveryAttemptName(attempt: DeliveryAttempt, t: TFunction, name
   return deliveryMethodName(attempt.method, t);
 }
 
-// DALTON-HOOK(execution-delivery-status): include retrying outcome for in-progress delivery attempts
+// DALTON-HOOK(execution-delivery-status): include retrying outcome with 3-minute settle-window fallback
 export type DeliveryOutcome = 'sent' | 'fallback' | 'notice' | 'failed' | 'retrying';
+
+function withinDeliverySettleWindow(completedAt: string | null | undefined, now = Date.now()): boolean {
+  if (!completedAt) return true;
+  const parsed = Date.parse(completedAt);
+  if (Number.isNaN(parsed)) return false;
+  const elapsed = now - parsed;
+  return elapsed >= 0 && elapsed < DELIVERY_SETTLE_WINDOW_MS;
+}
 
 /** How a delivery went: the agent sent it (or, for an older run, it was
  *  posted), its final answer was posted for it, a notice went, it is retrying, or it failed. */
-export function deliveryOutcome(attempt: DeliveryAttempt): DeliveryOutcome {
-  if (!attempt.success) return attempt.retrying === true ? 'retrying' : 'failed';
+export function deliveryOutcome(
+  attempt: DeliveryAttempt,
+  completedAt?: string | null,
+  now = Date.now(),
+): DeliveryOutcome {
+  if (!attempt.success) {
+    return attempt.retrying === true && withinDeliverySettleWindow(completedAt, now) ? 'retrying' : 'failed';
+  }
   if (attempt.via === 'fallback') return 'fallback';
   if (attempt.via === 'notice') return 'notice';
   return 'sent';
@@ -121,12 +135,19 @@ const OUTCOME_KEY: Record<DeliveryOutcome, string> = {
   fallback: 'automation.deliveredFallbackVia',
   notice: 'automation.deliveredNoticeVia',
   failed: 'automation.deliveryFailedVia',
+  // DALTON-HOOK(execution-delivery-status): retrying label key & settle-window forwarding
   retrying: 'automation.deliveryRetryingVia',
 };
 
 /** One delivery as a phrase: "sent to #demo", "#demo delivery failed". */
-export function deliveryAttemptLabel(attempt: DeliveryAttempt, t: TFunction, names?: DeliveryNames): string {
-  return t(OUTCOME_KEY[deliveryOutcome(attempt)], { method: deliveryAttemptName(attempt, t, names) });
+export function deliveryAttemptLabel(
+  attempt: DeliveryAttempt,
+  t: TFunction,
+  names?: DeliveryNames,
+  completedAt?: string | null,
+  now = Date.now(),
+): string {
+  return t(OUTCOME_KEY[deliveryOutcome(attempt, completedAt, now)], { method: deliveryAttemptName(attempt, t, names) });
 }
 
 // ── Refusals ───────────────────────────────────────────────

@@ -353,6 +353,7 @@ def summarize_execution_delivery(
         str(notify_status or "").strip().lower() == "pending_dispatch"
     )
     targets: list[dict[str, Any]] = []
+    has_notify_rows = False
     seen_notify_keys: dict[tuple[str, str], dict[str, Any]] = {}
     seen_normalized_targets: dict[tuple[str, str, str], dict[str, Any]] = {}
 
@@ -360,6 +361,8 @@ def summarize_execution_delivery(
         if not isinstance(raw, Mapping) or _is_failure_alert_row(raw):
             continue
         st = str(raw.get("status") or "").strip().lower()
+        if st in ("sent", "pending", "failed", "skipped"):
+            has_notify_rows = True
         if st == "skipped":
             continue
         channel = str(raw.get("channel") or "").strip().lower() or None
@@ -402,6 +405,10 @@ def summarize_execution_delivery(
                     and source_retried
                     and attempt < bounded_max
                 )
+            elif attempt >= bounded_max:
+                # Claim cap exhausted (dispatch.py:1511 forbids another claim/send):
+                # treat unresolved pending immediately as unconfirmed instead of waiting 10m.
+                can_retry_pending = False
             elif attempt == 0:
                 can_retry_pending = within_retry_eligibility and source_retried
             elif not _is_pending_stale(raw, now=now):
@@ -530,6 +537,8 @@ def summarize_execution_delivery(
         )
 
     if not targets:
+        if has_notify_rows:
+            return None
         return _summarize_script_notify_status(notify_status)
 
     sent_count = sum(1 for item in targets if item["status"] == "sent")

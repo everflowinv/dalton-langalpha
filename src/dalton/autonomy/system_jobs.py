@@ -2021,22 +2021,47 @@ async def get_system_job_status(
     from src.dalton.sharing import require_workspace_access
 
     if scope == "sector":
-        s_unit = await _resolve_sector_unit_for_key(uid, target)
+        s_unit = await _resolve_sector_unit_for_key(
+            uid, target, include_all_for_pm=True
+        )
         s_ws = str(s_unit.get("workspace_id") or "").strip()
         try:
-            await require_workspace_access(
+            s_ws_row = await require_workspace_access(
                 s_ws, effective_viewer, channel="web", need="read"
             )
         except HTTPException as exc:
             raise ValueError(f"未找到行业自动跟踪任务: {key}") from exc
+        s_owner = (
+            str(
+                s_unit.get("lead_analyst_user_id")
+                or s_unit.get("owner_user_id")
+                or ""
+            ).strip()
+            or str(
+                s_ws_row.get("user_id") if isinstance(s_ws_row, dict) else ""
+            ).strip()
+            or uid
+        )
         s_tracking = await get_tracking_status(
-            uid,
+            s_owner,
             s_ws,
             viewer_user_id=effective_viewer,
         )
         if str(s_tracking.get("subject_kind") or "") != "sector":
             raise ValueError(f"未找到行业自动跟踪任务: {key}")
-        return {"ok": True, "job": _build_sector_job_entry(uid, s_unit, rows, s_tracking)}
+        if s_owner == uid:
+            sector_rows = rows
+        else:
+            sector_rows = await list_all_user_automations(
+                s_owner, name_prefix="dalton-"
+            )
+            await enrich_automations_with_delivery_summary(sector_rows)
+        return {
+            "ok": True,
+            "job": _build_sector_job_entry(
+                effective_viewer, s_unit, sector_rows, s_tracking
+            ),
+        }
 
     ws_id = await _resolve_company_workspace_id(uid, target)
     if is_coverage_units_enabled() and (
@@ -2587,6 +2612,7 @@ async def toggle_system_job(
         if not spec:
             raise ValueError(f"未找到全局任务: {key}")
 
+        home_row: dict[str, Any] | None = None
         async with user_automations_lock(uid) as conn:
             rows = await list_all_user_automations(
                 uid,
@@ -2603,38 +2629,44 @@ async def toggle_system_job(
                 and existing_row["metadata"].get("paused_by_user")
             )
             if enabled and not force and respect_user_pause and paused_by_user:
-                return {"ok": True, "job": _build_home_job_entry(spec, existing_row)}
+                home_row = existing_row
+            else:
+                with automation_history_context(
+                    actor_user_id=actor_uid,
+                    skip_if_unchanged=True,
+                ):
+                    if enabled:
+                        await _enable_single_home_job(
+                            uid,
+                            spec,
+                            existing_row,
+                            force=force,
+                            respect_user_pause=respect_user_pause,
+                            conn=conn,
+                        )
+                    else:
+                        await _disable_single_home_job(
+                            uid,
+                            spec,
+                            existing_row,
+                            conn=conn,
+                        )
+                updated_rows = await list_all_user_automations(
+                    uid,
+                    name_prefix=target,
+                    conn=conn,
+                )
+                home_row = next(
+                    (r for r in updated_rows if isinstance(r, dict) and str(r.get("name") or "").strip() == target),
+                    None,
+                )
+        if home_row is not None:
+            from src.dalton.services.execution_delivery_status import (
+                enrich_automations_with_delivery_summary,
+            )
 
-            with automation_history_context(
-                actor_user_id=actor_uid,
-                skip_if_unchanged=True,
-            ):
-                if enabled:
-                    await _enable_single_home_job(
-                        uid,
-                        spec,
-                        existing_row,
-                        force=force,
-                        respect_user_pause=respect_user_pause,
-                        conn=conn,
-                    )
-                else:
-                    await _disable_single_home_job(
-                        uid,
-                        spec,
-                        existing_row,
-                        conn=conn,
-                    )
-            updated_rows = await list_all_user_automations(
-                uid,
-                name_prefix=target,
-                conn=conn,
-            )
-            updated_row = next(
-                (r for r in updated_rows if isinstance(r, dict) and str(r.get("name") or "").strip() == target),
-                None,
-            )
-            return {"ok": True, "job": _build_home_job_entry(spec, updated_row)}
+            await enrich_automations_with_delivery_summary([home_row])
+        return {"ok": True, "job": _build_home_job_entry(spec, home_row)}
 
     if scope == "sector":
         s_unit = await _resolve_sector_unit_for_key(
@@ -2661,6 +2693,11 @@ async def toggle_system_job(
                     viewer_user_id=effective_viewer,
                 )
         rows_after = await list_all_user_automations(uid, name_prefix="dalton-")
+        from src.dalton.services.execution_delivery_status import (
+            enrich_automations_with_delivery_summary,
+        )
+
+        await enrich_automations_with_delivery_summary(rows_after)
         s_tracking = await get_tracking_status(
             uid,
             s_ws,
