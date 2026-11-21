@@ -645,6 +645,8 @@ SERVER_OWNED_CONFIG_KEYS = (
     "folder_kept",
     HOME_STAND_IN_KEY,
     *SANDBOX_STAMP_KEYS,
+    # DALTON-HOOK(historical-duplicate-marker): preserve server-written duplicate marker across whole-config replacements
+    "dalton_historical_duplicate_of",
 )
 
 
@@ -1235,6 +1237,7 @@ async def update_workspace(
         if config is not None:
             # A replaced config keeps the row's server-owned keys and never
             # takes the caller's.
+            # DALTON-HOOK(historical-duplicate-marker): SERVER_OWNED_CONFIG_KEYS includes dalton_historical_duplicate_of
             config_sql = (
                 "(%s::jsonb - %s::text[]) || COALESCE("
                 "(SELECT jsonb_object_agg(key, value) FROM jsonb_each(config)"
