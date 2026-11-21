@@ -463,6 +463,10 @@ ALLOWED_HOOKS=(
   # Surface terminal/partial/retrying delivery outcomes on completed executions
   # in execution history, detail, CoS activity, ThreadStatus, and automation state files.
   "execution-delivery-status"
+  # Execution history and automation detail last_execution computer-scope filter:
+  # include executions when either the automation's workspace or the thread's
+  # workspace belongs to computer_id (excluding Home), without duplicating rows.
+  "history-computer-scope"
   # Per-automation reasoning_effort field (d042), shared write/snapshot/file paths,
   # executor/continuation/wakeup/fallback inheritance, and MoreOptions effort selector.
   "automation-effort"

@@ -12,11 +12,14 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 # DALTON-HOOK(company-automations): the locked parent read uses these columns
+# DALTON-HOOK(history-computer-scope): reuse shared thread-ownership and target-computer workspace SQL
 from src.server.database.automation import (
     AUTOMATION_COLUMNS,
     EXECUTION_COLUMNS,
     UNSETTLED_STATUSES,
     not_a_server_skip,
+    owned_execution_thread_join_sql,
+    target_computer_workspace_predicate_sql,
 )
 from src.server.contracts.status import (
     RESTART_INTERRUPTED_META,
@@ -957,7 +960,7 @@ async def list_executions(
     limit: int = 20,
     offset: int = 0,
     scope: Optional[str] = None,
-    computer_id: Optional[str] = None,
+    computer_id: Optional[str] = None,  # DALTON-HOOK(history-computer-scope)
 ) -> tuple[List[Dict[str, Any]], bool]:
     """A page of a user's executions newest first, narrowed to one
     automation, thread, status or wait reason when given, and whether more
@@ -974,16 +977,20 @@ async def list_executions(
     caller's own executions with no extra predicate. Company runs are not
     selected here.
 
-    A computer token keeps the automation on that computer, outside Home, and
-    applies the same rule to the run's effective workspace
-    ``COALESCE(t.workspace_id, a.workspace_id)``. A later move changes
-    ``a.workspace_id`` while an older thread still names the computer the run
-    happened on. A run with no thread keeps the current automation workspace.
-    Both predicates are in the WHERE, so LIMIT/OFFSET page the rows that remain.
+    A computer token matches executions whose automation workspace OR owned
+    thread workspace belongs to that computer, outside Home (a run with no
+    thread, a deleted thread, or an inaccessible thread belongs by its
+    automation workspace). To avoid a cross-table ``OR`` scanning the caller's
+    full history on other computers, the computer-scoped query narrows to the
+    target computer's caller-owned workspaces first, fetches the top window
+    from the task side and thread side separately, deduplicates with ``UNION``,
+    and paginates the merged result.
     """
     # DALTON-HOOK(company-automations): optional scope and computer reach on the owner feed
-    where_parts = ["a.user_id = %s"]
-    params: list = [user_id]
+    task_where_parts = ["a.user_id = %s"]
+    task_params: list = [user_id]
+    exec_where_parts: list[str] = []
+    exec_params: list = []
     for column, value in (
         ("e.automation_id", automation_id),
         ("e.conversation_thread_id", thread_id),
@@ -993,43 +1000,113 @@ async def list_executions(
          " THEN 'thread_busy' END)", wait_reason),
     ):
         if value:
-            where_parts.append(f"{column} = %s")
-            params.append(value)
+            exec_where_parts.append(f"{column} = %s")
+            exec_params.append(value)
     if scope is not None:
-        where_parts.append("a.scope = %s")
-        params.append(scope)
-    if computer_id is not None:
-        home_id = get_home_workspace_id(user_id)
-        where_parts.append(
-            "a.workspace_id <> %s::uuid AND EXISTS (SELECT 1 FROM workspaces w"
-            " WHERE w.workspace_id = a.workspace_id"
-            " AND w.computer_id = %s::uuid)"
-        )
-        where_parts.append(
-            "COALESCE(t.workspace_id, a.workspace_id) <> %s::uuid"
-            " AND EXISTS (SELECT 1 FROM workspaces execution_workspace"
-            " WHERE execution_workspace.workspace_id"
-            " = COALESCE(t.workspace_id, a.workspace_id)"
-            " AND execution_workspace.computer_id = %s::uuid)"
-        )
-        params.extend([home_id, computer_id, home_id, computer_id])
+        task_where_parts.append("a.scope = %s")
+        task_params.append(scope)
+    where_parts = [*task_where_parts, *exec_where_parts]
+    params = [*task_params, *exec_params]
     where_clause = " AND ".join(where_parts)
+    task_where_clause = " AND ".join(task_where_parts)
+    exec_where_and = (
+        " AND " + " AND ".join(exec_where_parts) if exec_where_parts else ""
+    )
+    # DALTON-HOOK(history-computer-scope): verify thread workspace ownership on join and split computer-scoped branches
+    thread_join = owned_execution_thread_join_sql("e", "a", "t")
 
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(f"""
-                SELECT
-                    {EXECUTION_COLUMNS},
-                    a.name AS automation_name, a.trigger_type,
-                    COALESCE(t.workspace_id, a.workspace_id) AS workspace_id
-                FROM automation_executions e
-                JOIN automations a ON a.automation_id = e.automation_id
-                LEFT JOIN conversation_threads t
-                    ON t.conversation_thread_id = e.conversation_thread_id
-                WHERE {where_clause}
-                ORDER BY e.created_at DESC, e.automation_execution_id DESC
-                LIMIT %s OFFSET %s
-            """, (*params, limit + 1, offset))
+            if computer_id is None:
+                await cur.execute(f"""
+                    SELECT
+                        {EXECUTION_COLUMNS},
+                        a.name AS automation_name, a.trigger_type,
+                        COALESCE(t.workspace_id, a.workspace_id) AS workspace_id
+                    FROM automation_executions e
+                    JOIN automations a ON a.automation_id = e.automation_id
+                    {thread_join}
+                    WHERE {where_clause}
+                    ORDER BY e.created_at DESC, e.automation_execution_id DESC
+                    LIMIT %s OFFSET %s
+                """, (*params, limit + 1, offset))
+            else:
+                home_id = get_home_workspace_id(user_id)
+                branch_limit = max(offset + limit + 1, 1)
+                task_ws_pred = target_computer_workspace_predicate_sql(
+                    "task_ws", "%s"
+                )
+                thread_ws_pred = target_computer_workspace_predicate_sql(
+                    "thread_ws", "%s"
+                )
+                await cur.execute(f"""
+                    WITH matched_execution_ids AS (
+                        SELECT task_side.automation_execution_id, task_side.created_at
+                        FROM (
+                            SELECT e.automation_execution_id, e.created_at
+                            FROM workspaces task_ws
+                            JOIN automations a
+                              ON a.workspace_id = task_ws.workspace_id
+                            JOIN automation_executions e
+                              ON e.automation_id = a.automation_id
+                            WHERE {task_ws_pred}
+                              AND a.workspace_id IS NOT NULL
+                              AND {where_clause}
+                            ORDER BY e.created_at DESC, e.automation_execution_id DESC
+                            LIMIT %s
+                        ) task_side
+                        UNION
+                        SELECT thread_side.automation_execution_id, thread_side.created_at
+                        FROM (
+                            SELECT e.automation_execution_id, e.created_at
+                            FROM workspaces thread_ws
+                            JOIN conversation_threads t
+                              ON t.workspace_id = thread_ws.workspace_id
+                            JOIN automation_executions e
+                              ON e.conversation_thread_id = t.conversation_thread_id
+                            WHERE {thread_ws_pred}
+                              AND e.conversation_thread_id IS NOT NULL{exec_where_and}
+                              AND EXISTS (
+                                  SELECT 1 FROM automations a
+                                  WHERE a.automation_id = e.automation_id
+                                    AND {task_where_clause}
+                              )
+                            ORDER BY e.created_at DESC, e.automation_execution_id DESC
+                            LIMIT %s
+                        ) thread_side
+                    ),
+                    paged_execution_ids AS (
+                        SELECT automation_execution_id
+                        FROM matched_execution_ids
+                        ORDER BY created_at DESC, automation_execution_id DESC
+                        LIMIT %s OFFSET %s
+                    )
+                    SELECT
+                        {EXECUTION_COLUMNS},
+                        a.name AS automation_name, a.trigger_type,
+                        COALESCE(t.workspace_id, a.workspace_id) AS workspace_id
+                    FROM paged_execution_ids p
+                    JOIN automation_executions e
+                      ON e.automation_execution_id = p.automation_execution_id
+                    JOIN automations a
+                      ON a.automation_id = e.automation_id
+                    {thread_join}
+                    ORDER BY e.created_at DESC, e.automation_execution_id DESC
+                """, (
+                    home_id,
+                    computer_id,
+                    user_id,
+                    *params,
+                    branch_limit,
+                    home_id,
+                    computer_id,
+                    user_id,
+                    *exec_params,
+                    *task_params,
+                    branch_limit,
+                    limit + 1,
+                    offset,
+                ))
 
             rows = [dict(row) for row in await cur.fetchall()]
             return rows[:limit], len(rows) > limit
