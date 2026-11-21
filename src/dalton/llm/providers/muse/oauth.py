@@ -499,4 +499,7 @@ async def get_valid_token(user_id: str) -> dict[str, Any] | None:
         "access_token": tokens["access_token"],
         "plan_type": tokens.get("plan_type") or "muse",
         "base_url": base_url,
+        "account_id": tokens.get("account_id") or "",
+        "email": tokens.get("email"),
+        "updated_at": tokens.get("updated_at"),
     }

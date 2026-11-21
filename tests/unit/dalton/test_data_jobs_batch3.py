@@ -2148,3 +2148,114 @@ async def test_discord_channel_target_must_be_guild_text(
     assert [item[0] for item in fetched] == ["1481256083589697566"] * 5
     assert {item[1] for item in fetched} == {"bot-token"}
     assert group_verify.call_count == 0
+
+
+def test_semi_rescue_3_images_split_into_2_cards_with_per_card_image_mapping(
+    tmp_path: Path,
+) -> None:
+    """3-image semi_rescue AM report split into 2 cards keeps per-card image mappings for delivery plan."""
+    from typing import Any
+    from uuid import uuid4
+    from src.dalton.data_jobs.notification_payloads import (
+        build_data_task_delivery_plan,
+        feishu_card_gateway_utf8_bytes,
+        FEISHU_CARD_MAX_BYTES,
+    )
+
+    workspace = tmp_path / "ws"
+    out_dir = workspace / "research-outputs" / "semi-rescue-alert" / "2026-11-20-am"
+    out_dir.mkdir(parents=True)
+    charts_dir = workspace / "charts"
+    charts_dir.mkdir(parents=True)
+    png_header = b"\x89PNG\r\n\x1a\n"
+    for name in ("c1.png", "c2.png", "c3.png"):
+        (charts_dir / name).write_bytes(png_header + name.encode("ascii") * 16)
+
+    (workspace / "config").mkdir()
+    (workspace / "config" / "semi_rescue_alert.json").write_text(
+        json.dumps(
+            {
+                "title": "半导体环境追踪",
+                "chat_id": "oc_fixture_semi_chat",
+                "layout": "compact",
+                "manual_items": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    filler = "这是半导体供应链追踪补充说明与财务估值指标归因详情。" * 45
+    md_sections = [
+        "### 第一部分：晶圆代工",
+        filler,
+        "IMG:charts/c1.png",
+        "### 第二部分：存储芯片",
+        filler,
+        "IMG:charts/c2.png",
+    ]
+    for idx in range(3, 12):
+        md_sections.extend([f"### 第{idx}部分：细分领域", filler])
+    md_sections.extend(["### 尾声：设备与材料", filler, "IMG:charts/c3.png"])
+    (out_dir / "card.md").write_text("\n\n".join(md_sections) + "\n", encoding="utf-8")
+
+    snapshot = {
+        "slot": "am",
+        "generated_hkt": "11/20 08:00",
+        "last_day": "2026-11-19",
+        "generated_ts": 1732060800,
+        "verdict": {"emoji": "🟢", "text": "偏强", "template": "green", "g": 2, "y": 1, "r": 0},
+        "indicators": [{"id": "sox", "status": "g"}],
+    }
+    (out_dir / "snapshot.json").write_bytes(
+        json.dumps(snapshot, ensure_ascii=False, indent=2).encode("utf-8")
+    )
+
+    run_dir = tmp_path / "run_artifacts"
+    run_dir.mkdir()
+    adjusted = adjust_batch3_payload(
+        job_key="semi-rescue-alert-am",
+        payload={
+            "status": "generated",
+            "slot": "am",
+            "dir": "research-outputs/semi-rescue-alert/2026-11-20-am",
+        },
+        workspace_dir=workspace,
+        run_artifacts_dir=run_dir,
+    )
+    assert isinstance(adjusted, dict)
+    feishu_cards = adjusted["feishu_cards"]
+    assert len(feishu_cards) >= 2
+
+    def _card_placeholders(card_obj: dict[str, Any]) -> list[str]:
+        found: list[str] = []
+        for el in card_obj["body"]["elements"]:
+            if el.get("tag") == "__img__" and el.get("path"):
+                found.append(str(el["path"]))
+        return found
+
+    all_mapped: list[str] = []
+    for idx, entry in enumerate(feishu_cards):
+        assert feishu_card_gateway_utf8_bytes(entry["card"]) <= FEISHU_CARD_MAX_BYTES
+        expected_phs = _card_placeholders(entry["card"])
+        actual_phs = [img["placeholder"] for img in entry["images"]]
+        assert actual_phs == expected_phs
+        for img_idx, img in enumerate(entry["images"]):
+            assert img["path"] == f"images/card_{idx}_img_{img_idx}.png"
+            assert (run_dir / img["path"]).is_file()
+        all_mapped.extend(actual_phs)
+
+    assert sorted(all_mapped) == ["charts/c1.png", "charts/c2.png", "charts/c3.png"]
+
+    plan = build_data_task_delivery_plan(
+        run_id=str(uuid4()),
+        job_key="semi-rescue-alert-am",
+        raw_outbox=adjusted,
+        run_artifacts_dir=run_dir,
+        delivery_platform="feishu",
+        delivery_target="feishu:chat:oc_fixture_semi_chat",
+    )
+    assert len(plan.items) == len(feishu_cards)
+    for item in plan.items:
+        assert item.card is not None
+        assert [img.placeholder for img in item.images] == _card_placeholders(item.card)

@@ -4527,7 +4527,6 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
                     self._select_rows = [dict(db_row)]
             elif "RETURNING attempt_count, payload_json" in norm:
                 db_row["status"] = "pending"
-                db_row["error_code"] = None
                 db_row["attempt_count"] = int(db_row["attempt_count"]) + 1
                 self.rowcount = 1
                 self._claimed_row = {
@@ -4539,10 +4538,11 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
             elif "attempt_count = GREATEST(0, attempt_count - 1)" in norm:
                 if concurrent_attempt_on_release is not None:
                     db_row["attempt_count"] = concurrent_attempt_on_release
-                expected_att = int(params[4])
+                expected_att = int(params[-1])
+                uncertain_list = params[4] if len(params) > 5 else []
                 if (
                     db_row["status"] == "pending"
-                    and db_row["error_code"] is None
+                    and (db_row["error_code"] or "") not in uncertain_list
                     and int(db_row["attempt_count"]) == expected_att
                 ):
                     db_row["status"] = "failed"
@@ -4701,7 +4701,7 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
     assert sent_2b == 0
     transport_spy.assert_not_awaited()
     assert db_row["status"] == "pending"
-    assert db_row["error_code"] is None
+    assert db_row["error_code"] == "ConnectError"
     assert db_row["attempt_count"] == 3
     advance_clock_on_claim_to = None
     concurrent_attempt_on_release = None
@@ -4948,4 +4948,753 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
             "max_duration_s": 26.0,
         }
     ]
+
+
+def test_feishu_card_limit_constants_match_gateway_source() -> None:
+    import re
+    from pathlib import Path
+
+    from src.dalton.data_jobs.notification_payloads import (
+        FEISHU_CARD_MAX_BYTES,
+        FEISHU_CARD_MAX_ELEMENTS,
+    )
+
+    repo_root = Path(__file__).resolve().parents[3]
+    ts_format = (
+        repo_root / "integrations/dalton-channel-gateway/src/channels/feishu/format.ts"
+    ).read_text(encoding="utf-8")
+    m_bytes = re.search(r"export const FEISHU_CARD_MAX_BYTES\s*=\s*([0-9_]+)\s*;", ts_format)
+    m_elems = re.search(r"export const FEISHU_CARD_MAX_ELEMENTS\s*=\s*([0-9_]+)\s*;", ts_format)
+    assert m_bytes is not None
+    assert m_elems is not None
+    assert FEISHU_CARD_MAX_BYTES == int(m_bytes.group(1).replace("_", ""))
+    assert FEISHU_CARD_MAX_ELEMENTS == int(m_elems.group(1).replace("_", ""))
+
+
+def test_markdown_to_card_chunks_splits_oversized_sections_and_single_large_section() -> None:
+    from src.dalton.data_jobs.notification_payloads import (
+        FEISHU_CARD_MAX_BYTES,
+        FEISHU_CARD_MAX_ELEMENTS,
+        feishu_card_serialized_utf8_bytes,
+        markdown_to_card_chunks,
+    )
+
+    huge_single_section = "## 超大单一章节\n\n" + "\n".join(
+        f"- 第 {i} 条：高频量化数据观察及超长单一章节分片验证文本内容补充。"
+        for i in range(1, 450)
+    )
+    assert len(huge_single_section.encode("utf-8")) > FEISHU_CARD_MAX_BYTES
+    cards = markdown_to_card_chunks(huge_single_section, title="测试报告")
+    assert len(cards) >= 2
+    for idx, card in enumerate(cards, start=1):
+        assert feishu_card_serialized_utf8_bytes(card) <= FEISHU_CARD_MAX_BYTES
+        assert len(card["body"]["elements"]) <= FEISHU_CARD_MAX_ELEMENTS
+        assert card["header"]["title"]["content"] == f"测试报告（{idx}/{len(cards)}）"
+
+
+def test_python_gateway_and_data_copy_table_limit_constants_and_gateway_rules() -> None:
+    """Locks FEISHU_CARD_TABLE_LIMIT parity and gateway __img__/table-limit/repeating-header splitting."""
+    import importlib.util
+    import re
+    from src.dalton.data_jobs.notification_payloads import (
+        FEISHU_CARD_MAX_BYTES,
+        FEISHU_CARD_MAX_ELEMENTS,
+        FEISHU_CARD_TABLE_LIMIT,
+        count_markdown_tables,
+        feishu_card_gateway_utf8_bytes,
+        feishu_card_serialized_utf8_bytes,
+        feishu_card_within_table_limit,
+        is_feishu_card_within_envelope,
+        markdown_to_card_chunks,
+        split_markdown_blocks,
+    )
+
+    repo_root = Path(__file__).resolve().parents[3]
+    ts_format = (
+        repo_root / "integrations/dalton-channel-gateway/src/channels/feishu/format.ts"
+    ).read_text(encoding="utf-8")
+    m_tables = re.search(r"export const FEISHU_CARD_TABLE_LIMIT\s*=\s*([0-9_]+)\s*;", ts_format)
+    assert m_tables is not None
+    assert FEISHU_CARD_TABLE_LIMIT == int(m_tables.group(1).replace("_", "")) == 5
+
+    for script_rel in (
+        "scripts/dalton/data_assets/scripts/feishu_send_card.py",
+        "scripts/dalton/research_runtime/scripts/feishu_send_card.py",
+    ):
+        spec = importlib.util.spec_from_file_location("_feishu_card_lock", repo_root / script_rel)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        assert mod.FEISHU_CARD_MAX_BYTES == FEISHU_CARD_MAX_BYTES
+        assert mod.FEISHU_CARD_MAX_ELEMENTS == FEISHU_CARD_MAX_ELEMENTS
+        assert mod.FEISHU_CARD_TABLE_LIMIT == FEISHU_CARD_TABLE_LIMIT
+
+    # 1. Conservative gateway __img__ expansion triggers split near 30 KB
+    base_md = "## 数据摘要\n\n" + ("中概与美股量化观察正文说明细节。" * 420)
+    md_with_images = base_md + "\n\n" + "\n".join(f"IMG:charts/c{i}.png" for i in range(1, 25))
+    chunks_img = markdown_to_card_chunks(md_with_images, title="含图网关计量")
+    assert all(feishu_card_gateway_utf8_bytes(c) <= FEISHU_CARD_MAX_BYTES for c in chunks_img)
+    assert all(is_feishu_card_within_envelope(c) for c in chunks_img)
+
+    # 2. >5 Markdown tables in a card < 30 KB still splits to satisfy FEISHU_CARD_TABLE_LIMIT
+    tables_md = "\n\n".join(
+        f"## 表 {i}\n\n| 标的 | 涨跌幅 |\n| --- | --- |\n| NVDA | +{i}.0% |"
+        for i in range(1, 8)
+    )
+    assert count_markdown_tables(tables_md) == 7
+    table_chunks = markdown_to_card_chunks(tables_md, title="多表格上限拆分")
+    assert len(table_chunks) >= 2
+    assert all(feishu_card_within_table_limit(c) for c in table_chunks)
+
+    # 3. Long single table > 30 KB repeats header + delimiter in subsequent chunks
+    hdr = "| 代码 | 名称 | 核心结论与估值变动跟踪说明 |"
+    sep = "| --- | --- | --- |"
+    rows = [
+        f"| T{i:03d} | 标的{i} | " + ("详细说明" * 40) + " |"
+        for i in range(1, 90)
+    ]
+    long_table_md = "## 长表拆分\n\n" + hdr + "\n" + sep + "\n" + "\n".join(rows)
+    blocks = split_markdown_blocks(long_table_md, max_chars=2000)
+    assert len(blocks) >= 2
+    for blk in blocks:
+        assert hdr in blk and sep in blk
+    long_tbl_cards = markdown_to_card_chunks(long_table_md, title="长表拆卡")
+    assert len(long_tbl_cards) >= 2
+    for c in long_tbl_cards:
+        assert feishu_card_serialized_utf8_bytes(c) <= FEISHU_CARD_MAX_BYTES
+        card_contents = "\n".join(
+            el["content"]
+            for el in c["body"]["elements"]
+            if el.get("tag") == "markdown" and isinstance(el.get("content"), str)
+        )
+        assert hdr in card_contents and sep in card_contents
+
+
+@pytest.mark.asyncio
+async def test_scheduler_first_attempt_records_card_limit_exceeded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """First-attempt scheduler delivery maps gateway not_allowed card-limit rejection to card_limit_exceeded."""
+    from contextlib import asynccontextmanager
+    from uuid import uuid4
+    from src.dalton.data_jobs import scheduler as sched_mod
+
+    tgt = "feishu:chat:oc_sched_card_limit"
+    card_limit_res = {
+        "ok": False,
+        "error": "not_allowed",
+        "results": [
+            {
+                "target": tgt,
+                "ok": False,
+                "error": "not_allowed",
+                "message": "Feishu card size (35200 bytes) exceeds 30720 byte card limit",
+            }
+        ],
+    }
+    assert (
+        sched_mod._extract_target_error_code(
+            tgt, card_limit_res, "not_allowed", use_gateway_transport=True
+        )
+        == "card_limit_exceeded"
+    )
+    other_not_allowed_res = {
+        "ok": False,
+        "error": "not_allowed",
+        "results": [
+            {
+                "target": tgt,
+                "ok": False,
+                "error": "not_allowed",
+                "message": "chat is not bound to this bot",
+            }
+        ],
+    }
+    assert (
+        sched_mod._extract_target_error_code(
+            tgt, other_not_allowed_res, "not_allowed", use_gateway_transport=True
+        )
+        == "not_allowed"
+    )
+
+    run_id = str(uuid4())
+    path_map = build_path_map(
+        host_var_dir=tmp_path / "host_var",
+        backend_var_dir=tmp_path / "backend_var",
+    )
+    marked: list[dict[str, Any]] = []
+
+    class _Cur:
+        rowcount = 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return None
+
+        async def execute(self, *_a, **_kw):
+            return None
+
+    class _Conn:
+        def cursor(self, **_kw):
+            return _Cur()
+
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+    async def _eval_ok(*_a, **_kw):
+        return True, None, [tgt]
+
+    async def _claim_ok(*_a, **_kw):
+        return notify_dispatch_mod.ClaimAttempt(True, 1, str(uuid4()))
+
+    async def _gateway_post(targets, *, run_id: str, gateway_url: str | None = None):  # noqa: ARG001
+        return card_limit_res
+
+    async def _mark_target(
+        execution_id: str,
+        channel: str,
+        target: str,
+        *,
+        status: str,
+        error_code: str | None = None,
+        **_kw: Any,
+    ) -> bool:
+        marked.append(
+            {
+                "execution_id": execution_id,
+                "channel": channel,
+                "target": target,
+                "status": status,
+                "error_code": error_code,
+            }
+        )
+        return True
+
+    async def _fake_lock(_lock_conn):
+        return None
+
+    monkeypatch.setattr(sched_mod, "check_scheduler_lock", _fake_lock)
+
+    outcome = await sched_mod.dispatch_data_task_run_notification(
+        _Conn(),
+        lock_conn=object(),
+        run_id=run_id,
+        job_key="us-topbottom-dm-v23",
+        db_outbox_payload={
+            "schema_version": 1,
+            "channel": "feishu",
+            "chat_id": "oc_sched_card_limit",
+            "text": "hello",
+            "feishu_cards": [{"card": {"schema": "2.0", "body": {"elements": []}}, "images": []}],
+        },
+        path_map=path_map,
+        evaluate_eligibility_fn=_eval_ok,
+        claim_target_fn=_claim_ok,
+        post_notify_fn=_gateway_post,
+        mark_target_fn=_mark_target,
+    )
+    assert outcome in {"pending_dispatch", "failed"}
+    assert any(
+        m["status"] == "failed" and m["error_code"] == "card_limit_exceeded"
+        for m in marked
+    ), marked
+
+
+def test_blockquote_tables_counted_and_oversized_table_row_keeps_header_or_truncates() -> None:
+    """Blockquoted tables count toward FEISHU_CARD_TABLE_LIMIT, >2000 char rows keep headers,
+    and >single-card-limit rows truncate with （本行过长已截断） rather than headerless text."""
+    from src.dalton.data_jobs.notification_payloads import (
+        FEISHU_CARD_MAX_BYTES,
+        count_markdown_tables,
+        feishu_card_serialized_utf8_bytes,
+        feishu_card_within_table_limit,
+        markdown_to_card_chunks,
+        split_markdown_blocks,
+    )
+
+    # 1. Blockquote tables counted just like GFM parser (6 quoted tables -> split to <= 5 per card)
+    quoted_tables_md = "\n\n".join(
+        f"## 引用表 {i}\n\n> | 标的 | 涨跌幅 |\n> | --- | --- |\n> | NVDA | +{i}.0% |"
+        for i in range(1, 7)
+    )
+    assert count_markdown_tables(quoted_tables_md) == 6
+    quoted_cards = markdown_to_card_chunks(quoted_tables_md, title="引用表格上限")
+    assert len(quoted_cards) >= 2
+    assert all(feishu_card_within_table_limit(c) for c in quoted_cards)
+
+    # 2. Table row > 2000 chars: split_markdown_blocks never turns it into headerless plain text,
+    #    and when pushed across cards, headers repeat on every card.
+    hdr = "| 代码 | 说明 |"
+    sep = "| --- | --- |"
+    row_2500 = "| R1 | " + ("长行内容测试数据补充说明" * 210) + " |"
+    assert len(row_2500) > 2000
+    blocks = split_markdown_blocks(hdr + "\n" + sep + "\n" + row_2500 + "\n| R2 | tail |", max_chars=2000)
+    assert len(blocks) == 2
+    for blk in blocks:
+        assert hdr in blk and sep in blk
+
+    multi_long_rows_md = (
+        "## 超长行多卡表\n\n"
+        + hdr
+        + "\n"
+        + sep
+        + "\n"
+        + "\n".join(f"| R{i} | " + ("长行详情说明文字" * 350) + " |" for i in range(1, 15))
+    )
+    row_split_cards = markdown_to_card_chunks(multi_long_rows_md, title="超长行跨卡")
+    assert len(row_split_cards) >= 2
+    for c in row_split_cards:
+        assert feishu_card_serialized_utf8_bytes(c) <= FEISHU_CARD_MAX_BYTES
+        card_md = "\n".join(
+            el["content"]
+            for el in c["body"]["elements"]
+            if el.get("tag") == "markdown" and isinstance(el.get("content"), str)
+        )
+        assert hdr in card_md and sep in card_md
+
+    # 3. Single row exceeding single-card byte limit (> 30KB) -> truncated with marker & keeps header
+    huge_row = "| HUGE | " + ("单行超限数据" * 2500) + " |"
+    assert len(huge_row.encode("utf-8")) > FEISHU_CARD_MAX_BYTES
+    huge_row_cards = markdown_to_card_chunks(
+        f"## 单行超单卡上限\n\n{hdr}\n{sep}\n{huge_row}",
+        title="单行截断",
+    )
+    assert len(huge_row_cards) == 1
+    card_md = "\n".join(
+        el["content"]
+        for el in huge_row_cards[0]["body"]["elements"]
+        if el.get("tag") == "markdown" and isinstance(el.get("content"), str)
+    )
+    assert feishu_card_serialized_utf8_bytes(huge_row_cards[0]) <= FEISHU_CARD_MAX_BYTES
+    assert hdr in card_md and sep in card_md
+    assert "（本行过长已截断）" in card_md
+
+
+def test_single_section_over_30kb_fingerprint_parity() -> None:
+    """A single >30KB section (prose or table) produces the same body fingerprint whether old single card or split."""
+    from src.dalton.data_jobs.notification_payloads import (
+        FEISHU_CARD_MAX_BYTES,
+        extract_feishu_cards_body_fingerprint,
+        feishu_card_serialized_utf8_bytes,
+        markdown_to_card_chunks,
+        markdown_to_card_elements,
+        split_feishu_card_to_chunks,
+    )
+
+    # Prose single section > 30KB
+    single_sec_md = "## 单章长复盘\n\n" + "\n".join(
+        f"- 第 {i} 条：高频量化数据观察及超长单一章节分片验证文本内容补充。"
+        for i in range(1, 500)
+    )
+    old_single = markdown_to_card_elements(single_sec_md, "单章测试")
+    assert feishu_card_serialized_utf8_bytes(old_single) > FEISHU_CARD_MAX_BYTES
+    split_cards = markdown_to_card_chunks(single_sec_md, "单章测试")
+    assert len(split_cards) >= 2
+    resplit = split_feishu_card_to_chunks(old_single)
+    fp_old = extract_feishu_cards_body_fingerprint([old_single])
+    fp_split = extract_feishu_cards_body_fingerprint(split_cards)
+    fp_resplit = extract_feishu_cards_body_fingerprint(resplit)
+    assert fp_old == fp_split == fp_resplit
+
+    # Table single section > 30KB
+    tbl_md = "## 单章长表格\n\n| 代码 | 详情 |\n| --- | --- |\n" + "\n".join(
+        f"| T{i:03d} | 详细估值与成交额追踪数据补充说明_{i:03d} |" for i in range(1, 550)
+    )
+    old_tbl = markdown_to_card_elements(tbl_md, "单章表格")
+    assert feishu_card_serialized_utf8_bytes(old_tbl) > FEISHU_CARD_MAX_BYTES
+    split_tbl = markdown_to_card_chunks(tbl_md, "单章表格")
+    assert len(split_tbl) >= 2
+    assert extract_feishu_cards_body_fingerprint([old_tbl]) == extract_feishu_cards_body_fingerprint(split_tbl)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_excludes_terminal_card_limit_failed_rows_and_preserves_error_code(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Scheduler & claim SQL exclude failed rows with terminal error_code without clearing error_code."""
+    from contextlib import asynccontextmanager
+    from uuid import uuid4
+    from src.dalton.data_jobs import scheduler as sched_mod
+
+    # 1. claim_target_delivery_with_attempt SQL excludes NON_RETRYABLE_TERMINAL_ERROR_CODES
+    claim_sqls: list[tuple[str, Any]] = []
+
+    class _ClaimCur:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            claim_sqls.append((" ".join(sql.split()), params))
+
+        async def fetchone(self):
+            return None
+
+    class _ClaimConn:
+        def cursor(self, **_kw):
+            return _ClaimCur()
+
+    @asynccontextmanager
+    async def _fake_claim_conn(_c=None):
+        yield _ClaimConn()
+
+    monkeypatch.setattr(
+        notify_dispatch_mod,
+        "get_db_connection",
+        create_autospec(notify_dispatch_mod.get_db_connection, side_effect=_fake_claim_conn),
+    )
+    claimed = await notify_dispatch_mod.claim_target_delivery_with_attempt(
+        "exec-term-1", "feishu", "feishu:chat:oc_term", user_id="u-1", automation_id="data:t"
+    )
+    assert claimed == (False, None)
+    sql_text, sql_params = claim_sqls[0]
+    assert "dalton_notify_deliveries.status = 'failed' AND COALESCE(dalton_notify_deliveries.error_code, '') <> ALL(%s)" in sql_text
+    assert sorted(notify_dispatch_mod.NON_RETRYABLE_TERMINAL_ERROR_CODES) in sql_params
+
+    # 2. Scheduler on existing failed card_limit_exceeded row: does NOT claim, does NOT send, settles to failed
+    tgt = "feishu:chat:oc_term_sched"
+    run_id = str(uuid4())
+    path_map = build_path_map(host_var_dir=tmp_path / "hv", backend_var_dir=tmp_path / "bv")
+    updates: list[dict[str, Any]] = []
+
+    class _SchedCur:
+        rowcount = 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return None
+
+        async def execute(self, sql: str, params: Any = None):
+            updates.append({"sql": " ".join(sql.split()), "params": params})
+
+    class _SchedConn:
+        def cursor(self, **_kw):
+            return _SchedCur()
+
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+    monkeypatch.setattr(sched_mod, "check_scheduler_lock", create_autospec(sched_mod.check_scheduler_lock, return_value=None))
+    claim_spy = create_autospec(notify_dispatch_mod.claim_target_delivery)
+    post_spy = create_autospec(notify_dispatch_mod.post_data_task_gateway_notify)
+    fetch_rows = [
+        {
+            "execution_id": run_id,
+            "channel": "feishu",
+            "target": tgt,
+            "status": "failed",
+            "error_code": "card_limit_exceeded",
+            "attempt_count": 1,
+            "payload_json": {},
+        }
+    ]
+    outcome = await sched_mod.dispatch_data_task_run_notification(
+        _SchedConn(),
+        lock_conn=object(),
+        run_id=run_id,
+        job_key="us-topbottom-dm-v23",
+        db_outbox_payload={
+            "schema_version": 1,
+            "channel": "feishu",
+            "chat_id": "oc_term_sched",
+            "text": "hello",
+            "feishu_cards": [{"card": {"schema": "2.0", "body": {"elements": []}}, "images": []}],
+        },
+        path_map=path_map,
+        evaluate_eligibility_fn=create_autospec(
+            sched_mod.evaluate_user_notify_eligibility,
+            return_value=(True, None, [tgt]),
+        ),
+        claim_target_fn=claim_spy,
+        post_notify_fn=post_spy,
+        fetch_deliveries_fn=create_autospec(
+            notify_dispatch_mod.fetch_execution_deliveries,
+            return_value=fetch_rows,
+        ),
+    )
+    assert outcome == "failed"
+    claim_spy.assert_not_awaited()
+    post_spy.assert_not_awaited()
+    assert updates[-1]["params"]["notify_status"] == "failed"
+
+
+def test_single_column_tables_and_feishu_send_card_long_table_rows() -> None:
+    """Single-column GFM tables count toward FEISHU_CARD_TABLE_LIMIT, and feishu_send_card.py
+    repeats table headers and truncates oversized single rows just like backend."""
+    import importlib.util
+    from src.dalton.data_jobs.notification_payloads import (
+        FEISHU_CARD_MAX_BYTES,
+        count_markdown_tables,
+        feishu_card_serialized_utf8_bytes,
+        feishu_card_within_table_limit,
+        is_feishu_card_within_envelope,
+        markdown_to_card_chunks,
+    )
+
+    single_col_md = "\n\n".join(
+        [
+            "## 单列1\n\n| 标的 |\n| --- |\n| NVDA |",
+            "## 单列2\n\n标的 |\n--- |\nAAPL |",
+            "## 单列3\n\n| 标的\n| ---\n| MSFT",
+            "## 单列4\n\n| 标的 |\n:---\n| META |",
+            "## 单列5\n\n- | 标的 |\n  | --- |\n  | AMZN |",
+            "## 单列6\n\n#1 |\n| --- |\n| GOOGL |",
+        ]
+    )
+    assert count_markdown_tables(single_col_md) == 6
+    backend_chunks = markdown_to_card_chunks(single_col_md, title="六张单列表格")
+    assert len(backend_chunks) >= 2
+    assert all(feishu_card_within_table_limit(c) for c in backend_chunks)
+
+    repo_root = Path(__file__).resolve().parents[3]
+    for script_rel in (
+        "scripts/dalton/data_assets/scripts/feishu_send_card.py",
+        "scripts/dalton/research_runtime/scripts/feishu_send_card.py",
+    ):
+        spec = importlib.util.spec_from_file_location("_feishu_send_card_tbl", repo_root / script_rel)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        assert mod.count_markdown_tables(single_col_md) == 6
+        script_chunks = mod.markdown_to_card_chunks(single_col_md, title="六张单列表格")
+        assert len(script_chunks) >= 2
+        assert all(mod.feishu_card_within_table_limit(c) for c in script_chunks)
+
+        hdr = "| 代码 | 说明 |"
+        sep = "| --- | --- |"
+        multi_long_rows = (
+            "## AI 日报长表\n\n"
+            + hdr
+            + "\n"
+            + sep
+            + "\n"
+            + "\n".join(f"| R{i} | " + ("AI 投研信号长行详情" * 320) + " |" for i in range(1, 14))
+        )
+        split_cards = mod.markdown_to_card_chunks(multi_long_rows, title="脚本长表跨卡")
+        assert len(split_cards) >= 2
+        for card in split_cards:
+            assert mod.feishu_card_serialized_utf8_bytes(card) <= FEISHU_CARD_MAX_BYTES
+            card_md = "\n".join(
+                el["content"]
+                for el in card["body"]["elements"]
+                if el.get("tag") == "markdown" and isinstance(el.get("content"), str)
+            )
+            assert hdr in card_md and sep in card_md
+
+        huge_row = "| HUGE | " + ("单行超限数据" * 2600) + " |"
+        assert len(huge_row.encode("utf-8")) > FEISHU_CARD_MAX_BYTES
+        trunc_cards = mod.markdown_to_card_chunks(
+            f"## 脚本单行截断\n\n{hdr}\n{sep}\n{huge_row}",
+            title="脚本单行截断",
+        )
+        assert len(trunc_cards) >= 1
+        assert all(mod.feishu_card_serialized_utf8_bytes(c) <= FEISHU_CARD_MAX_BYTES for c in trunc_cards)
+        assert all(mod.is_feishu_card_within_envelope(c) for c in trunc_cards)
+        trunc_md = "\n".join(
+            el["content"]
+            for card in trunc_cards
+            for el in card["body"]["elements"]
+            if el.get("tag") == "markdown" and isinstance(el.get("content"), str)
+        )
+        assert hdr in trunc_md and sep in trunc_md
+        assert "（本行过长已截断）" in trunc_md
+
+    assert all(is_feishu_card_within_envelope(c) for c in backend_chunks)
+    assert feishu_card_serialized_utf8_bytes(backend_chunks[0]) <= FEISHU_CARD_MAX_BYTES
+
+
+def test_collapsible_panel_overhead_and_unsplittable_element_rejection() -> None:
+    """Collapsible panel JSON overhead is included when splitting (31002-byte repro),
+    and unsplittable oversized elements are rejected before returning from split_feishu_card_to_chunks."""
+    import importlib.util
+    from src.dalton.data_jobs.notification_payloads import (
+        DataTaskNotificationError,
+        FEISHU_CARD_MAX_BYTES,
+        feishu_card_serialized_utf8_bytes,
+        is_feishu_card_within_envelope,
+        split_feishu_card_to_chunks,
+    )
+
+    def _build_panel_card(target_total_bytes: int) -> dict[str, Any]:
+        # Make an inner markdown element that fits bare (< 30720 with card header),
+        # but exceeds 30720 once wrapped in the collapsible_panel JSON structure.
+        card = {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "Token 用量周报"},
+                "template": "indigo",
+            },
+            "body": {
+                "direction": "vertical",
+                "vertical_spacing": "10px",
+                "elements": [
+                    {
+                        "tag": "collapsible_panel",
+                        "expanded": False,
+                        "header": {
+                            "title": {
+                                "tag": "markdown",
+                                "content": "**其余长尾模型（点击展开）** <font color='grey'>汇总信息</font>",
+                            },
+                            "vertical_align": "center",
+                            "padding": "4px 8px 4px 8px",
+                            "icon": {
+                                "tag": "standard_icon",
+                                "token": "down-small-ccm_outlined",
+                                "size": "12px 12px",
+                            },
+                            "icon_position": "right",
+                            "icon_expanded_angle": -180,
+                        },
+                        "border": {"color": "grey", "corner_radius": "6px"},
+                        "vertical_spacing": "6px",
+                        "padding": "8px 8px 8px 8px",
+                        "elements": [{"tag": "markdown", "content": ""}],
+                    }
+                ],
+            },
+        }
+        # Fill with paragraph-separated lines so it hits target_total_bytes (e.g. 31002 bytes)
+        line = "A" * 98 + "\n\n"
+        lines: list[str] = []
+        while feishu_card_serialized_utf8_bytes(card) < target_total_bytes:
+            lines.append(line)
+            card["body"]["elements"][0]["elements"][0]["content"] = "".join(lines).strip()
+        excess = feishu_card_serialized_utf8_bytes(card) - target_total_bytes
+        if excess > 0:
+            cur = card["body"]["elements"][0]["elements"][0]["content"]
+            card["body"]["elements"][0]["elements"][0]["content"] = cur[:-excess]
+        return card
+
+    # Exact codex repro: 31,002 bytes as panel card (> 30,720), while bare markdown fits <= 30,720
+    card_31002 = _build_panel_card(31_002)
+    raw_bytes = feishu_card_serialized_utf8_bytes(card_31002)
+    assert raw_bytes == 31_002
+    bare_probe = {
+        "schema": "2.0",
+        "config": card_31002["config"],
+        "header": {"title": {"tag": "plain_text", "content": "Token 用量周报（999/999）"}, "template": "indigo"},
+        "body": {"elements": [card_31002["body"]["elements"][0]["elements"][0]]},
+    }
+    assert feishu_card_serialized_utf8_bytes(bare_probe) <= FEISHU_CARD_MAX_BYTES
+
+    split_cards = split_feishu_card_to_chunks(card_31002)
+    assert len(split_cards) >= 2
+    assert all(is_feishu_card_within_envelope(c) for c in split_cards)
+    assert all(feishu_card_serialized_utf8_bytes(c) <= FEISHU_CARD_MAX_BYTES for c in split_cards)
+
+    # Same fix applies to feishu_send_card.py
+    repo_root = Path(__file__).resolve().parents[3]
+    spec = importlib.util.spec_from_file_location(
+        "_feishu_send_card_panel",
+        repo_root / "scripts/dalton/data_assets/scripts/feishu_send_card.py",
+    )
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    script_split = mod.split_feishu_card_to_chunks(card_31002)
+    assert len(script_split) >= 2
+    assert all(mod.is_feishu_card_within_envelope(c) for c in script_split)
+
+    # Unsplittable oversized non-markdown element (e.g. >30KB div) is rejected before gateway
+    unsplittable_card = {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {"title": {"tag": "plain_text", "content": "超限原子元素"}, "template": "indigo"},
+        "body": {
+            "elements": [
+                {"tag": "div", "text": {"tag": "plain_text", "content": "X" * (FEISHU_CARD_MAX_BYTES + 500)}}
+            ]
+        },
+    }
+    with pytest.raises(DataTaskNotificationError) as exc_info:
+        split_feishu_card_to_chunks(unsplittable_card)
+    assert exc_info.value.code == "card_limit_exceeded"
+    with pytest.raises(ValueError):
+        mod.split_feishu_card_to_chunks(unsplittable_card)
+
+
+def test_continuation_heading_fingerprint_parity_with_font_tags_and_bold_boundary_paragraphs() -> None:
+    """Fingerprint stays identical across single card, split cards, and resplit card when:
+    1) an oversized >30KB section has <font ...>-wrapped headings (notation or colored title);
+    2) a bold-opening body paragraph falls directly on a 2000-char element boundary or after a table."""
+    from src.dalton.data_jobs.notification_payloads import (
+        FEISHU_CARD_MAX_BYTES,
+        extract_feishu_cards_body_fingerprint,
+        feishu_card_serialized_utf8_bytes,
+        markdown_to_card_chunks,
+        markdown_to_card_elements,
+        split_feishu_card_to_chunks,
+    )
+
+    # 1a. Notation section >30KB (`## 来源` -> `<font color='grey'>**来源**</font>`)
+    notation_md = "## 来源\n\n" + "\n".join(
+        f"- 信源条目 {i:03d}：交易所公告、Wind 与公开披露数据交叉核对明细补充记录。"
+        for i in range(1, 450)
+    )
+    old_notation = markdown_to_card_elements(notation_md, "市场晚报")
+    assert feishu_card_serialized_utf8_bytes(old_notation) > FEISHU_CARD_MAX_BYTES
+    split_notation = markdown_to_card_chunks(notation_md, "市场晚报")
+    assert len(split_notation) >= 2
+    resplit_notation = split_feishu_card_to_chunks(old_notation)
+    assert (
+        extract_feishu_cards_body_fingerprint([old_notation])
+        == extract_feishu_cards_body_fingerprint(split_notation)
+        == extract_feishu_cards_body_fingerprint(resplit_notation)
+    )
+
+    # 1b. Explicitly <font>-wrapped section heading >30KB
+    font_heading_md = "## <font color='red'>风险提示</font>\n\n" + "\n".join(
+        f"- 风险条目 {i:03d}：宏观流动性波动与汇率敞口压测补充细节观察内容。"
+        for i in range(1, 450)
+    )
+    old_font = markdown_to_card_elements(font_heading_md, "市场晚报")
+    assert feishu_card_serialized_utf8_bytes(old_font) > FEISHU_CARD_MAX_BYTES
+    split_font = markdown_to_card_chunks(font_heading_md, "市场晚报")
+    assert len(split_font) >= 2
+    resplit_font = split_feishu_card_to_chunks(old_font)
+    assert (
+        extract_feishu_cards_body_fingerprint([old_font])
+        == extract_feishu_cards_body_fingerprint(split_font)
+        == extract_feishu_cards_body_fingerprint(resplit_font)
+    )
+
+    # 2. Bold-opening paragraph falling on a 2000-char element boundary inside >30KB single section
+    para_a = "第一部分正文内容：" + ("核心标的跟踪与估值分析说明。" * 130)
+    assert 1500 < len(para_a) < 1990
+    bold_boundary_para = "**段首加粗重点提示**\n" + ("这是落在元素边界之后的普通段落内容。" * 40)
+    tail_paras = "\n\n".join(
+        f"第 {i} 段补充观察：量化跟踪成交额与隐含波动率变化细节补充说明。" * 4
+        for i in range(1, 160)
+    )
+    bold_boundary_md = f"## 深度复盘\n\n{para_a}\n\n{bold_boundary_para}\n\n{tail_paras}"
+    old_bold = markdown_to_card_elements(bold_boundary_md, "边界测试")
+    assert feishu_card_serialized_utf8_bytes(old_bold) > FEISHU_CARD_MAX_BYTES
+    # Verify the bold paragraph actually landed at line 0 of an interior markdown element
+    assert any(
+        el.get("tag") == "markdown"
+        and str(el.get("content") or "").lstrip().startswith("**段首加粗重点提示**")
+        for el in old_bold["body"]["elements"][1:]
+    )
+    split_bold = markdown_to_card_chunks(bold_boundary_md, "边界测试")
+    assert len(split_bold) >= 2
+    resplit_bold = split_feishu_card_to_chunks(old_bold)
+    assert (
+        extract_feishu_cards_body_fingerprint([old_bold])
+        == extract_feishu_cards_body_fingerprint(split_bold)
+        == extract_feishu_cards_body_fingerprint(resplit_bold)
+    )
+
 

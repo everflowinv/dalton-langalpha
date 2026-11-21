@@ -6167,3 +6167,87 @@ describe("Feishu text message chunking", () => {
     }
   });
 });
+
+describe("Feishu card envelope constants parity with Python", () => {
+  it("matches FEISHU_CARD_MAX_BYTES and FEISHU_CARD_MAX_ELEMENTS in notification_payloads.py", async () => {
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const { FEISHU_CARD_MAX_ELEMENTS } = await import(
+      "../src/channels/feishu/format.js"
+    );
+    const pyPath = path.resolve(
+      process.cwd(),
+      "../../src/dalton/data_jobs/notification_payloads.py",
+    );
+    const pyText = fs.readFileSync(pyPath, "utf8");
+    const bytesMatch = pyText.match(
+      /^FEISHU_CARD_MAX_BYTES\s*=\s*([0-9_]+)/m,
+    );
+    const elemsMatch = pyText.match(
+      /^FEISHU_CARD_MAX_ELEMENTS\s*=\s*([0-9_]+)/m,
+    );
+    const tablesMatch = pyText.match(
+      /^FEISHU_CARD_TABLE_LIMIT\s*=\s*([0-9_]+)/m,
+    );
+    expect(bytesMatch).not.toBeNull();
+    expect(elemsMatch).not.toBeNull();
+    expect(tablesMatch).not.toBeNull();
+    expect(FEISHU_CARD_MAX_BYTES).toBe(
+      Number(bytesMatch![1].replaceAll("_", "")),
+    );
+    expect(FEISHU_CARD_MAX_ELEMENTS).toBe(
+      Number(elemsMatch![1].replaceAll("_", "")),
+    );
+    expect(FEISHU_CARD_TABLE_LIMIT).toBe(
+      Number(tablesMatch![1].replaceAll("_", "")),
+    );
+  });
+
+  it("replaces __img__ placeholders via monitor while keeping split cards within envelope", async () => {
+    const {
+      assertFeishuCardWithinEnvelope,
+      FEISHU_CARD_MAX_BYTES,
+    } = await import("../src/channels/feishu/format.js");
+    const { FeishuChannelAdapter } = await import(
+      "../src/channels/feishu/monitor.js"
+    );
+    const { client, calls } = createFakeLarkClient();
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_test_app",
+      appSecret: "sec_test_secret",
+      botOpenId: "ou_test_bot_open_id",
+      client,
+    });
+    const card = {
+      schema: "2.0",
+      config: { wide_screen_mode: true, update_multi: true },
+      header: { title: { tag: "plain_text", content: "图片卡片测试（1/2）" } },
+      body: {
+        elements: [
+          { tag: "markdown", content: "指标跟踪说明。".repeat(200) },
+          { tag: "__img__", path: "charts/c1.png" },
+        ],
+      },
+    };
+    const res = await adapter.sendCard({
+      targetAddress: "chat:oc_test_card_img",
+      card,
+      images: [
+        {
+          placeholder: "charts/c1.png",
+          filename: "c1.png",
+          content: Buffer.from("fake-png-bytes"),
+        },
+      ],
+    });
+    expect(res.messageId).toBeTruthy();
+    expect(calls.imageCreate).toHaveLength(1);
+    expect(calls.messageCreate).toHaveLength(1);
+    const sentCard = JSON.parse(calls.messageCreate[0].data.content);
+    expect(sentCard.body.elements[1].tag).toBe("img");
+    expect(Buffer.byteLength(JSON.stringify(sentCard), "utf8")).toBeLessThanOrEqual(
+      FEISHU_CARD_MAX_BYTES,
+    );
+    expect(() => assertFeishuCardWithinEnvelope(sentCard)).not.toThrow();
+  });
+});

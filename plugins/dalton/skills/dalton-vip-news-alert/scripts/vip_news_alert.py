@@ -1275,17 +1275,18 @@ def manifest_rel(summary_date: str) -> str:
     return f"temp/vip-news-alert/{summary_date}/manifest.json"
 
 
-def card_content_sha256(card: dict[str, Any]) -> str:
+def card_content_sha256(card: dict[str, Any] | list[dict[str, Any]]) -> str:
     """Match the cards branch of automation_report_content_sha256.
 
-    The canonical object is profile, content_kind, the one-card list, and a
+    The canonical object is profile, content_kind, the card list, and a
     null failure text. The text field is omitted. Key order does not change
     the digest.
     """
+    cards_list = card if isinstance(card, list) else [card]
     canonical = {
         "profile": PROFILE,
         "content_kind": "cards",
-        "cards": [card],
+        "cards": cards_list,
         "failure_text": None,
     }
     raw = json.dumps(
@@ -1317,7 +1318,10 @@ def _seen_entries(pushed: list[tuple[str, str]]) -> list[dict[str, str]]:
 
 def _write_manifest(workspace: Path, built: dict[str, Any], card_rel: str) -> None:
     card = _read_json(workspace, card_rel)
-    if not isinstance(card, dict):
+    if not (
+        isinstance(card, dict)
+        or (isinstance(card, list) and card and all(isinstance(c, dict) for c in card))
+    ):
         raise RuntimeError("card digest mismatch")
     payload = {
         "report_run_id": built["report_run_id"],
@@ -1383,7 +1387,10 @@ def _verified_digest(workspace: Path, manifest: dict[str, Any]) -> str:
     if not isinstance(recorded, str) or not recorded or not isinstance(card_rel, str) or not card_rel:
         raise RuntimeError("manifest is invalid")
     card = _read_json(workspace, card_rel)
-    if not isinstance(card, dict):
+    if not (
+        isinstance(card, dict)
+        or (isinstance(card, list) and card and all(isinstance(c, dict) for c in card))
+    ):
         raise RuntimeError("card digest mismatch")
     digest = card_content_sha256(card)
     if digest != recorded:

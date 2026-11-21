@@ -346,13 +346,22 @@ def mirror_after_feishu(chat_id, receive_id_type, card, label=''):
 
 # ─── CLI ──────────────────────────────────────────────────────────────
 
-def _load_card(args):
-    if args.card_json_file:
-        return json.loads(Path(args.card_json_file).read_text())
+def _load_cards(args):
     import feishu_send_card
+    if args.card_json_file:
+        card = json.loads(Path(args.card_json_file).read_text())
+        splitter = getattr(feishu_send_card, 'split_feishu_card_to_chunks', None)
+        return splitter(card) if callable(splitter) else [card]
     content = Path(args.file).read_text(encoding='utf-8')
-    return feishu_send_card.markdown_to_card_elements(markdown=content, title=args.title or '',
-                                                      subtitle=args.subtitle or '')
+    chunker = getattr(feishu_send_card, 'markdown_to_card_chunks', None)
+    if callable(chunker):
+        return chunker(markdown=content, title=args.title or '', subtitle=args.subtitle or '')
+    return [feishu_send_card.markdown_to_card_elements(markdown=content, title=args.title or '',
+                                                       subtitle=args.subtitle or '')]
+
+
+def _load_card(args):
+    return _load_cards(args)[0]
 
 
 def self_test():
@@ -426,17 +435,25 @@ def main():
     args = ap.parse_args()
     if args.cmd == 'self-test':
         return self_test()
-    card = _load_card(args)
+    cards = _load_cards(args)
     if args.cmd == 'preview':
-        text, images = card_to_text(card)
-        msgs = chunk(text)
+        msgs: list[str] = []
+        images: list[str] = []
+        for card in cards:
+            text, card_images = card_to_text(card)
+            images.extend(card_images)
+            msgs.extend(chunk(text))
         for i, m in enumerate(msgs, 1):
             print(f'===== {i}/{len(msgs)} · {len(m)} 字符 · {m.count(chr(10)) + 1} 行')
             print(m)
         if images:
             print('===== 图片：' + ', '.join(images))
         return 0
-    result = mirror_card(card, label=args.label)
+    results = [mirror_card(card, label=args.label) for card in cards]
+    result = results[0] if len(results) == 1 else {
+        'status': 'sent' if all(r.get('status') == 'sent' for r in results) else 'failed',
+        'results': results,
+    }
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result.get('status') == 'sent' else 1
 

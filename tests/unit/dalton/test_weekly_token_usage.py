@@ -803,3 +803,79 @@ def test_default_state_dir_follows_pointer_file(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setenv("DALTON_USAGE_STATE_DIR", str(tmp_path / "x"))
     assert cli.default_state_dir() == tmp_path / "x"  # env overrides pointer
+
+
+def test_data_copy_card_senders_split_oversized_cards(tmp_path: Path) -> None:
+    """token_weekly_usage_tracker, cron_command_tasks.etf_dry_run_outbox, and eve_tracking_mirror split oversized cards."""
+    import importlib.util
+    from argparse import Namespace
+
+    repo_root = Path(__file__).resolve().parents[3]
+    data_scripts = repo_root / "scripts" / "dalton" / "data_assets" / "scripts"
+    rr_scripts = repo_root / "scripts" / "dalton" / "research_runtime" / "scripts"
+
+    send_spec = importlib.util.spec_from_file_location(
+        "_data_feishu_send_card", data_scripts / "feishu_send_card.py"
+    )
+    assert send_spec and send_spec.loader
+    send_mod = importlib.util.module_from_spec(send_spec)
+    send_spec.loader.exec_module(send_mod)
+
+    # Build a >30 KB Schema 2.0 card
+    big_md = "\n\n".join(
+        f"## 板块 {i}\n\n" + ("这是用于测试 data-copy 自动拆卡的长段落内容。" * 60)
+        for i in range(1, 14)
+    )
+    oversized_card = send_mod.markdown_to_card_elements(big_md, "每周 Token 用量与成本")
+    assert send_mod.feishu_card_gateway_utf8_bytes(oversized_card) > send_mod.FEISHU_CARD_MAX_BYTES
+
+    # 1. token_weekly_usage_tracker.write_outbox_card
+    tracker_spec = importlib.util.spec_from_file_location(
+        "_weekly_tracker", data_scripts / "token_weekly_usage_tracker.py"
+    )
+    assert tracker_spec and tracker_spec.loader
+    tracker_mod = importlib.util.module_from_spec(tracker_spec)
+    tracker_spec.loader.exec_module(tracker_mod)
+    outbox_file = tmp_path / "weekly_outbox.json"
+    tracker_mod.write_outbox_card(outbox_file, oversized_card)
+    outbox_data = json.loads(outbox_file.read_text(encoding="utf-8"))
+    assert len(outbox_data["feishu_cards"]) > 1
+    for item in outbox_data["feishu_cards"]:
+        assert send_mod.is_feishu_card_within_envelope(item["card"])
+
+    # 2. cron_command_tasks.etf_dry_run_outbox
+    cron_spec = importlib.util.spec_from_file_location(
+        "_cron_tasks", data_scripts / "cron_command_tasks.py"
+    )
+    assert cron_spec and cron_spec.loader
+    cron_mod = importlib.util.module_from_spec(cron_spec)
+    cron_spec.loader.exec_module(cron_mod)
+    banner = cron_mod.ETF_DRY_RUN_BANNER
+    stdout = f"log line\n{banner}\n" + json.dumps(oversized_card, ensure_ascii=False)
+    etf_outbox = cron_mod.etf_dry_run_outbox(stdout)
+    assert len(etf_outbox["feishu_cards"]) > 1
+    for item in etf_outbox["feishu_cards"]:
+        assert send_mod.is_feishu_card_within_envelope(item["card"])
+
+    # 3. eve_tracking_mirror._load_cards
+    mirror_spec = importlib.util.spec_from_file_location(
+        "_eve_mirror", rr_scripts / "eve_tracking_mirror.py"
+    )
+    assert mirror_spec and mirror_spec.loader
+    mirror_mod = importlib.util.module_from_spec(mirror_spec)
+    mirror_spec.loader.exec_module(mirror_mod)
+    md_file = tmp_path / "eve.md"
+    md_file.write_text(big_md, encoding="utf-8")
+    old_sys_path = list(sys.path)
+    sys.path.insert(0, str(rr_scripts))
+    try:
+        sys.modules.pop("feishu_send_card", None)
+        loaded_cards = mirror_mod._load_cards(
+            Namespace(card_json_file=None, file=str(md_file), title="Eve 跟踪", subtitle="")
+        )
+    finally:
+        sys.path[:] = old_sys_path
+        sys.modules.pop("feishu_send_card", None)
+    assert len(loaded_cards) > 1
+    for card_item in loaded_cards:
+        assert send_mod.is_feishu_card_within_envelope(card_item)

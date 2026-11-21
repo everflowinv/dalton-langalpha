@@ -1096,6 +1096,64 @@ def test_profiles_are_registered() -> None:
     assert set(PROFILES) <= REPORT_PROFILES
 
 
+def test_x_accounts_daily_card_io_splits_oversized_report_and_locks_render_card_constants(
+    tmp_path: Path,
+) -> None:
+    """Oversized X accounts daily markdown (>33 KB) splits into compliant cards via card_io."""
+    from src.dalton.data_jobs.notification_payloads import (
+        FEISHU_CARD_MAX_BYTES,
+        FEISHU_CARD_MAX_ELEMENTS,
+        FEISHU_CARD_TABLE_LIMIT,
+        feishu_card_serialized_utf8_bytes,
+        is_feishu_card_within_envelope,
+    )
+
+    render_mod = _load(
+        "bullbear_render_card_lock",
+        SKILLS / "dalton-bullbear-tracker" / "scripts" / "render_card.py",
+    )
+    assert render_mod.FEISHU_CARD_MAX_BYTES == FEISHU_CARD_MAX_BYTES
+    assert render_mod.FEISHU_CARD_MAX_ELEMENTS == FEISHU_CARD_MAX_ELEMENTS
+    assert render_mod.FEISHU_CARD_TABLE_LIMIT == FEISHU_CARD_TABLE_LIMIT
+
+    x_card_io = _load(
+        "x_accounts_card_io_split_test",
+        SKILLS / "dalton-x-accounts-daily" / "scripts" / "card_io.py",
+    )
+    lines = ["# 📋 推特每日总结 — 2026-11-20", ""]
+    for handle in ("aleabitoreddit", "jukan05", "mingchikuo", "citrini"):
+        lines.extend(["", f"## @{handle}", ""])
+        for idx in range(1, 26):
+            lines.append(
+                f"{idx}. @{handle} 第 {idx} 条深度摘要：追踪 AI 算力资本开支、晶圆代工产能、"
+                f"存储芯片报价与消费电子供应链最新动态变化分析补充说明，"
+                f"涵盖北美云厂商资本开支指引、先进封装 CoWoS 扩产节奏、HBM 高带宽内存价格走势"
+                f"以及终端需求与库存周期的交叉验证细节。"
+                f" [原推](https://x.com/{handle}/status/100000{idx:02d})"
+            )
+    md_text = "\n".join(lines) + "\n"
+    assert len(md_text.encode("utf-8")) > 30_000
+    (tmp_path / "summary.md").write_text(md_text, encoding="utf-8")
+
+    result = x_card_io.render_markdown(
+        workspace=tmp_path,
+        markdown_rel="summary.md",
+        output_rel="card.json",
+        title="📋 推特每日总结 — 2026-11-20",
+    )
+    assert result["ok"] is True
+    cards = result["cards"]
+    assert len(cards) >= 2
+    for idx, card in enumerate(cards, start=1):
+        assert is_feishu_card_within_envelope(card)
+        assert feishu_card_serialized_utf8_bytes(card) <= FEISHU_CARD_MAX_BYTES
+        assert len(card["body"]["elements"]) <= FEISHU_CARD_MAX_ELEMENTS
+        assert f"（{idx}/{len(cards)}）" in card["header"]["title"]["content"]
+
+    saved_json = json.loads((tmp_path / "card.json").read_text(encoding="utf-8"))
+    assert isinstance(saved_json, list) and len(saved_json) == len(cards)
+
+
 def test_x_daily_has_more_checks_oldest_timestamp(tmp_path: Path) -> None:
     cli = _load(
         "x_daily_has_more_family1",

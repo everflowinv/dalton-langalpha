@@ -396,3 +396,175 @@ async def test_period_marker_line_is_not_sent(
     assert payload["code"] == "body_invalid"
     assert payload["stage"] == "body_invalid"
     assert payload["finalized"] is False
+
+
+async def test_oversized_pm_digest_splits_into_numbered_cards_within_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.dalton.data_jobs.notification_payloads import (
+        FEISHU_CARD_MAX_BYTES,
+        FEISHU_CARD_MAX_ELEMENTS,
+        feishu_card_serialized_utf8_bytes,
+        markdown_to_card_chunks,
+    )
+
+    body_lines = []
+    for sec_idx in range(1, 11):
+        body_lines.append(f"## 板块 {sec_idx}：市场核心异动复盘")
+        for line_idx in range(1, 31):
+            body_lines.append(
+                f"- ({sec_idx}.{line_idx}) 美股与中概重点标的表现追踪："
+                "成交额放量、机构资金流向与隐含波动率变化细节补充说明分析。"
+            )
+    body_lines.append("## \U0001f4dd \u6765\u6e90")
+    body_lines.append("- Wind, Bloomberg")
+    big_markdown = _markdown() + "\n\n" + "\n".join(body_lines)
+    assert len(big_markdown.encode("utf-8")) > 35_000
+
+    record = _stored(big_markdown)
+    record["section_count"] = sum(
+        line.startswith("## ") for line in big_markdown.splitlines()
+    )
+    expected_cards = markdown_to_card_chunks(markdown=big_markdown, title=_TITLE)
+    expected_sha = automation_report_content_sha256(
+        profile=_PROFILE,
+        content_kind="cards",
+        cards=expected_cards,
+        failure_text=None,
+    )
+    world = _install(monkeypatch)
+    world.steps.append(record)
+    world.reports.extend(
+        [
+            _status(ok=True, found=False),
+            _submit_accept(),
+            _status(
+                ok=True,
+                found=True,
+                status="pending",
+                delivery_confirmed=False,
+                content_kind="cards",
+                content_sha256=expected_sha,
+                report_run_id=_RUN_ID,
+                profile=_PROFILE,
+            ),
+        ]
+    )
+    _raw, payload = await _run("submit")
+    submit_calls = [c for c in world.calls if c.get("action") == "submit"]
+    assert len(submit_calls) == 1
+    submitted_cards = submit_calls[0]["cards"]
+    assert len(submitted_cards) > 1
+    total = len(submitted_cards)
+    for idx, card_item in enumerate(submitted_cards, start=1):
+        assert feishu_card_serialized_utf8_bytes(card_item) <= FEISHU_CARD_MAX_BYTES
+        assert len(card_item["body"]["elements"]) <= FEISHU_CARD_MAX_ELEMENTS
+        assert f"（{idx}/{total}）" in card_item["header"]["title"]["content"]
+    assert payload["content_sha256"] == expected_sha
+
+
+@pytest.mark.asyncio
+async def test_recover_oversized_35kb_legacy_single_card_splits_sends_and_finalizes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Saved 35 KB legacy single card recovers via split send without report_conflict, then finalizes."""
+    from src.dalton.data_jobs.notification_payloads import (
+        FEISHU_CARD_MAX_BYTES,
+        FEISHU_CARD_MAX_ELEMENTS,
+        feishu_card_serialized_utf8_bytes,
+        markdown_to_card_chunks,
+        markdown_to_card_elements,
+    )
+    from src.dalton.database.automation_reports import automation_report_content_sha256
+
+    body_lines = []
+    for sec_idx in range(1, 11):
+        body_lines.append(f"## 板块 {sec_idx}：市场核心异动复盘")
+        for line_idx in range(1, 31):
+            body_lines.append(
+                f"- ({sec_idx}.{line_idx}) 美股与中概重点标的表现追踪："
+                "成交额放量、机构资金流向与隐含波动率变化细节补充说明分析。"
+            )
+    body_lines.append("## \U0001f4dd \u6765\u6e90")
+    body_lines.append("- Wind, Bloomberg")
+    big_markdown = _markdown() + "\n\n" + "\n".join(body_lines)
+    legacy_single_card = markdown_to_card_elements(markdown=big_markdown, title=_TITLE)
+    assert feishu_card_serialized_utf8_bytes(legacy_single_card) > 35_000
+    legacy_sha = automation_report_content_sha256(
+        profile=_PROFILE,
+        content_kind="cards",
+        cards=[legacy_single_card],
+        failure_text=None,
+    )
+    split_cards = markdown_to_card_chunks(markdown=big_markdown, title=_TITLE)
+    assert len(split_cards) > 1
+    split_sha = automation_report_content_sha256(
+        profile=_PROFILE,
+        content_kind="cards",
+        cards=split_cards,
+        failure_text=None,
+    )
+    assert legacy_sha != split_sha
+
+    world = _install(monkeypatch)
+    pending_record = _stored(big_markdown)
+    pending_record["section_count"] = sum(
+        line.startswith("## ") for line in big_markdown.splitlines()
+    )
+    done_record = dict(pending_record)
+    done_record.update({"archive_status": "done", "embedding_status": "ready", "index_status": "done", "chunk_count": 6})
+    finalize_ok = {
+        "ok": True,
+        "code": "finalized",
+        "report_run_id": pending_record["report_run_id"],
+        "period": pending_record["period"],
+        "date": pending_record["date"],
+        "body_sha256": pending_record["body_sha256"],
+        "archive_status": "done",
+        "embedding_status": "ready",
+        "index_status": "done",
+        "chunk_count": 6,
+        "archive": {"status": "written"},
+        "embedding": {"status": "embedded", "code": "ok"},
+        "index": {"status": "committed", "code": "ok", "chunk_count": 6},
+    }
+    world.steps.extend([pending_record, finalize_ok, done_record])
+    world.reports.extend(
+        [
+            _status(
+                ok=True,
+                found=True,
+                status="failed",
+                delivery_confirmed=False,
+                content_kind="cards",
+                content_sha256=legacy_sha,
+                report_run_id=_RUN_ID,
+                profile=_PROFILE,
+                payload={"cards": [legacy_single_card]},
+            ),
+            _submit_accept(),
+            _status(
+                ok=True,
+                found=True,
+                status="sent",
+                delivery_confirmed=True,
+                content_kind="cards",
+                content_sha256=split_sha,
+                report_run_id=_RUN_ID,
+                profile=_PROFILE,
+            ),
+        ]
+    )
+    _raw, payload = await _run("submit")
+    assert payload["ok"] is True
+    assert payload["code"] == "done"
+    assert payload["stage"] == "done"
+    assert payload["finalized"] is True
+    assert payload["archive_status"] == "done"
+    assert payload["index_status"] == "done"
+    submit_calls = [c for c in world.calls if c.get("action") == "submit"]
+    assert len(submit_calls) == 1
+    assert len(submit_calls[0]["cards"]) > 1
+    for card_item in submit_calls[0]["cards"]:
+        assert feishu_card_serialized_utf8_bytes(card_item) <= FEISHU_CARD_MAX_BYTES
+        assert len(card_item["body"]["elements"]) <= FEISHU_CARD_MAX_ELEMENTS

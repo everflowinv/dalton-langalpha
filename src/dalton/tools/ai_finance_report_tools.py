@@ -13,7 +13,7 @@ import logging
 import os
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
@@ -22,6 +22,11 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
 from src.dalton.access_tiers import is_internal_or_admin
+from src.dalton.data_jobs.notification_payloads import (
+    DataTaskNotificationError,
+    is_feishu_card_within_envelope,
+    split_feishu_card_to_chunks,
+)
 from src.dalton.database.ai_finance import PROFILE, authorize_ai_finance_execution
 from src.dalton.database.automation_reports import automation_report_content_sha256
 from src.dalton.settings import (
@@ -124,7 +129,8 @@ def create_ai_finance_report_tools() -> list[BaseTool]:
         if refusal is not None:
             return refusal
         assert saved is not None
-        if saved["content_sha256"] != _official_hash(saved["card"]):
+        saved_cards = saved.get("cards") if isinstance(saved.get("cards"), list) and saved.get("cards") else [saved["card"]]
+        if saved["content_sha256"] != _official_hash(saved_cards):
             return _refuse(str(parsed["action"]), "state_corrupt", "The saved card failed the hash check.")
         try:
             return await _finish(str(parsed["action"]), config, saved)
@@ -345,6 +351,13 @@ def _accept_host(
     card = payload.get("card")
     if not isinstance(card, dict):
         return None, "invalid_response"
+    raw_cards = payload.get("cards")
+    if raw_cards is not None:
+        if not isinstance(raw_cards, list) or not raw_cards or not all(isinstance(c, dict) for c in raw_cards):
+            return None, "invalid_response"
+        cards = list(raw_cards)
+    else:
+        cards = [card]
     body_sha = payload.get("body_sha256")
     content_sha = payload.get("content_sha256")
     bundle_hash = payload.get("bundle_hash")
@@ -361,15 +374,32 @@ def _accept_host(
         "seen_status": payload["seen_status"],
         "reused": payload["reused"],
         "card": card,
+        "cards": cards,
     }, None
 
 
-def _official_hash(card: dict[str, Any]) -> str | None:
+def _cards_to_submit(saved: Mapping[str, Any]) -> list[dict[str, Any]]:
+    raw_cards = saved.get("cards")
+    cards = (
+        [dict(c) for c in raw_cards if isinstance(c, Mapping)]
+        if isinstance(raw_cards, list) and raw_cards
+        else [dict(saved["card"])]
+    )
+    if all(is_feishu_card_within_envelope(c) for c in cards):
+        return cards
+    split_cards: list[dict[str, Any]] = []
+    for c in cards:
+        split_cards.extend(split_feishu_card_to_chunks(c))
+    return split_cards
+
+
+def _official_hash(cards_or_card: Mapping[str, Any] | Sequence[Mapping[str, Any]]) -> str | None:
+    cards = [dict(cards_or_card)] if isinstance(cards_or_card, Mapping) else [dict(c) for c in cards_or_card]
     try:
         return automation_report_content_sha256(
             profile=PROFILE,
             content_kind="cards",
-            cards=[card],
+            cards=cards,
             failure_text=None,
         )
     except (TypeError, ValueError):
@@ -377,12 +407,24 @@ def _official_hash(card: dict[str, Any]) -> str | None:
 
 
 async def _finish(action: str, config: RunnableConfig, saved: Mapping[str, Any]) -> str:
-    current, kind = await _delivery_status(config, str(saved["report_run_id"]), str(saved["content_sha256"]))
+    try:
+        submit_cards = _cards_to_submit(saved)
+    except DataTaskNotificationError as exc:
+        return _model(
+            action,
+            saved,
+            delivery_confirmed=False,
+            code=exc.code or "card_limit_exceeded",
+            status=None,
+            ok=False,
+        )
+    submit_sha = _official_hash(submit_cards) or str(saved["content_sha256"])
+    current, kind = await _delivery_status(config, str(saved["report_run_id"]), submit_sha)
     if action == "submit" and kind in {"retry", "unknown"}:
-        submitted = await _submit_card(config, saved)
+        submitted = await _submit_card(config, saved, cards=submit_cards)
         if submitted == "cancelled":
             raise asyncio.CancelledError
-        current, kind = await _delivery_status(config, str(saved["report_run_id"]), str(saved["content_sha256"]))
+        current, kind = await _delivery_status(config, str(saved["report_run_id"]), submit_sha)
     if kind == "unavailable":
         return _model(action, saved, delivery_confirmed=False, code="report_unavailable", status=None, ok=False)
     if kind != "sent":
@@ -427,13 +469,18 @@ async def _delivery_status(
     return payload, _delivery_kind(payload, report_run_id, content_sha256)
 
 
-async def _submit_card(config: RunnableConfig, saved: Mapping[str, Any]) -> str | None:
+async def _submit_card(
+    config: RunnableConfig,
+    saved: Mapping[str, Any],
+    *,
+    cards: list[dict[str, Any]] | None = None,
+) -> str | None:
     try:
         await _call_report(
             action="submit",
             report_run_id=str(saved["report_run_id"]),
             material="yes",
-            cards=[saved["card"]],
+            cards=cards if cards is not None else _cards_to_submit(saved),
             config=config,
         )
     except asyncio.CancelledError:

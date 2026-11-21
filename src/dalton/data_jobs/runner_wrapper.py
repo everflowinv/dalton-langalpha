@@ -686,7 +686,10 @@ async def run_wrapped_command(
         redacted_stdout = "".join(stdout_chunks)
         redacted_stderr = "".join(stderr_chunks)
 
-        from src.dalton.data_jobs.notification_payloads import DataTaskNotificationPrepError
+        from src.dalton.data_jobs.notification_payloads import (
+            DataTaskNotificationError,
+            DataTaskNotificationPrepError,
+        )
 
         try:
             outbox_payload = persist_redacted_outbox(
@@ -697,7 +700,7 @@ async def run_wrapped_command(
                 stdout_text=redacted_stdout,
                 workspace_dir=workspace_dir if exit_code == 0 else None,
             )
-        except (DataTaskNotificationPrepError, SafeFsError) as prep_exc:
+        except (DataTaskNotificationPrepError, DataTaskNotificationError, SafeFsError) as prep_exc:
             redacted_err = redactor.redact_text(
                 f"runner_wrapper: report preparation failed: {prep_exc}\n"
             )

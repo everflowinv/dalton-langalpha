@@ -33,10 +33,43 @@ class OAuthRebuildSpec:
     # manifest alone does not carry, and a 401 mid-turn fails the turn instead
     # of rebuilding it (DALTON-HOOK(oauth-dispatch)).
     custom_entry: dict | None = None
+    # Non-secret subscription credential identity (account_id / email / row
+    # timestamp digest) so quota cooldowns stay isolated across account switches
+    # (DALTON-HOOK(quota-exhaustion)).
+    account_id: str = ""
+    credential_id: str = ""
 
 
 def token_digest(access_token: str) -> str:
     return hashlib.sha256(access_token.encode()).hexdigest()[:16]
+
+
+def credential_identity(
+    *,
+    account_id: str = "",
+    email: str | None = None,
+    updated_at: Any = None,
+) -> str:
+    """Short non-secret digest identifying a subscription credential row.
+
+    Prefers ``account_id`` / ``email`` so routine token refreshes preserve cooldown
+    continuity, falling back to ``updated_at`` when no account identity exists.
+    Never reads or hashes token material.
+    """
+    parts: list[str] = []
+    acct = str(account_id or "").strip()
+    if acct and not acct.startswith("muse-api-key"):
+        parts.append(f"acct:{acct}")
+    mail = str(email or "").strip().lower()
+    if mail:
+        parts.append(f"email:{mail}")
+    if not parts and updated_at is not None:
+        ts = updated_at.isoformat() if hasattr(updated_at, "isoformat") else str(updated_at)
+        if ts.strip():
+            parts.append(f"ts:{ts.strip()}")
+    if not parts:
+        return ""
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
 def tag_oauth_client(client: Any, spec: OAuthRebuildSpec) -> Any:

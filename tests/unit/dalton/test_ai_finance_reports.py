@@ -1188,3 +1188,78 @@ async def test_star_mismatch_submit_keeps_repo_identity_without_sending(
     assert str(root) not in dumped
     assert "/Users" not in dumped
     assert "~/" not in dumped
+
+
+@pytest.mark.asyncio
+async def test_ai_finance_oversized_report_splits_and_submits_compliant_cards(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """ai_finance_reports + ai_finance_report_tools split oversized >30KB dailies into compliant cards."""
+    from src.dalton.data_jobs.notification_payloads import (
+        FEISHU_CARD_MAX_BYTES,
+        feishu_card_gateway_utf8_bytes,
+    )
+
+    base_md = MARKDOWN
+    filler_lines = [
+        f"{idx}. 补充跟踪条目：AI 金融大模型推理成本下降、云厂资本开支上行与风控系统改造分析详情。"
+        for idx in range(1, 280)
+    ]
+    oversized_md = base_md.replace(
+        "### 来源说明",
+        "#### 补充产业细节（折叠）\n" + "\n".join(filler_lines) + "\n\n### 来源说明",
+    )
+    cards = reports.render_daily_cards(oversized_md, DATE)
+    assert len(cards) >= 2
+    for card_item in cards:
+        assert feishu_card_gateway_utf8_bytes(card_item) <= FEISHU_CARD_MAX_BYTES
+
+    # Verify ai_finance_report_tools splits an oversized single card from an older host payload too
+    oversized_single = reports.render_daily_card(oversized_md, DATE)
+    assert feishu_card_gateway_utf8_bytes(oversized_single) > FEISHU_CARD_MAX_BYTES
+    saved_stub = {
+        "batch_id": DATE,
+        "report_run_id": f"ai-finance:{DATE}",
+        "body_sha256": hashlib.sha256(oversized_md.encode("utf-8")).hexdigest(),
+        "content_sha256": reports.card_content_sha256([oversized_single]),
+        "seen_status": "pending",
+        "reused": False,
+        "card": oversized_single,
+        "cards": [oversized_single],
+    }
+    split_for_submit = report_tools._cards_to_submit(saved_stub)
+    assert len(split_for_submit) >= 2
+    for c in split_for_submit:
+        assert feishu_card_gateway_utf8_bytes(c) <= FEISHU_CARD_MAX_BYTES
+
+    called_actions: list[dict[str, Any]] = []
+    submitted_once = False
+
+    async def fake_call_report(**kwargs: Any) -> dict[str, Any]:
+        nonlocal submitted_once
+        called_actions.append(dict(kwargs))
+        if kwargs.get("action") == "submit":
+            submitted_once = True
+            return {"ok": True, "action": "submit"}
+        if not submitted_once:
+            return {"ok": True, "found": False, "delivery_confirmed": False}
+        expected_sha = report_tools._official_hash(split_for_submit)
+        return {
+            "ok": True,
+            "found": True,
+            "profile": reports.PROFILE,
+            "content_kind": "cards",
+            "report_run_id": f"ai-finance:{DATE}",
+            "content_sha256": expected_sha,
+            "status": "sent",
+            "delivery_confirmed": True,
+        }
+
+    monkeypatch.setattr(report_tools, "_call_report", fake_call_report)
+    out = json.loads(await report_tools._finish("submit", _config(), saved_stub))
+    assert out["ok"] is True
+    assert out["delivery_confirmed"] is True
+    submit_calls = [c for c in called_actions if c.get("action") == "submit"]
+    assert len(submit_calls) == 1
+    assert len(submit_calls[0]["cards"]) == len(split_for_submit)

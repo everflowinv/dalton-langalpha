@@ -80,6 +80,10 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
         namespace_owner: Any | None = None,
         run_on: Mapping[str, RunOn] | None = None,
         task_models: TaskModelResolver | None = None,
+        # DALTON-HOOK(quota-exhaustion): pre-dispatch quota check resolves the
+        # client each subagent runs on before admitting or spawning a task.
+        default_model_client: Any = None,
+        subagent_clients: Mapping[str, Any] | None = None,
     ) -> None:
         """
         Args:
@@ -106,6 +110,8 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
         self.subagent_types = frozenset(subagent_types)
         self.run_on = dict(run_on or {})
         self.task_models = task_models
+        self.default_model_client = default_model_client  # DALTON-HOOK(quota-exhaustion)
+        self.subagent_clients = dict(subagent_clients or {})  # DALTON-HOOK(quota-exhaustion)
         # Task ids with a resume mid-flight: the liveness check and the
         # writer spawn are separated by awaits, so two parallel resume calls
         # in one model step could otherwise both pass and double-spawn (the
@@ -118,6 +124,50 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
         self.tools = [
             create_task_output_tool(self),
         ]
+
+    def model_client_for(  # DALTON-HOOK(quota-exhaustion)
+        self, subagent_type: str, override: Any = None
+    ) -> Any:
+        override_client = getattr(override, "client", None) if override is not None else None
+        if override_client is not None:
+            return override_client
+        return self.subagent_clients.get(subagent_type, self.default_model_client)
+
+    def model_name_for(  # DALTON-HOOK(quota-exhaustion)
+        self, subagent_type: str, override: Any = None
+    ) -> str:
+        if override is not None and getattr(override, "name", None):
+            return str(override.name)
+        run_on = self.run_on.get(subagent_type)
+        if run_on is not None:
+            if getattr(run_on, "model", None):
+                return str(run_on.model.get("id") or "")
+            if getattr(run_on, "claude_code_model", None):
+                return str(run_on.claude_code_model)
+        return ""
+
+    async def check_dispatch_quota(  # DALTON-HOOK(quota-exhaustion)
+        self,
+        subagent_type: str,
+        *,
+        override: Any = None,
+        user_id: str | None = None,
+        client: Any = None,
+        model_name: str = "",
+    ) -> str | None:
+        target_client = (
+            client if client is not None else self.model_client_for(subagent_type, override)
+        )
+        target_model = model_name or self.model_name_for(subagent_type, override)
+        if target_client is None:
+            return None
+        from ptc_agent.agent.middleware.model_resilience import check_oauth_quota_cooldown
+
+        return await check_oauth_quota_cooldown(
+            target_client,
+            model_name=target_model,
+            user_id=user_id,
+        )
 
     def wrap_tool_call(
         self,

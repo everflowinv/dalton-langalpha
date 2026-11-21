@@ -28,6 +28,7 @@ class TokenSet:
     account_id: str = ""
     email: Optional[str] = None
     plan_type: Optional[str] = None
+    updated_at: Optional[datetime] = None
 
     @classmethod
     def from_row(cls, row: dict) -> "TokenSet":
@@ -38,6 +39,7 @@ class TokenSet:
             account_id=row.get("account_id") or "",
             email=row.get("email"),
             plan_type=row.get("plan_type"),
+            updated_at=row.get("updated_at"),
         )
 
 

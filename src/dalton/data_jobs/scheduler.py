@@ -73,8 +73,10 @@ from src.dalton.notify.channel_transport import (
     post_data_task_gateway_notify,
 )
 from src.dalton.notify.dispatch import (
+    NON_RETRYABLE_TERMINAL_ERROR_CODES,
     _callable_accepts_kwarg,
     _evaluate_target_results,
+    _extract_retry_target_error_code,
     _invoke_mark_delivery,
     _shielded_mark_failed,
     _shielded_mark_uncertain,
@@ -2136,7 +2138,7 @@ async def execute_claimed_container_run(
                 anchor_dir=paths.backend_data_root,
             )
             outbox_payload = prepared_t27
-        except (DataTaskNotificationPrepError, SafeFsError) as prep_exc:
+        except (DataTaskNotificationPrepError, DataTaskNotificationError, SafeFsError) as prep_exc:
             outbox_payload = None
             evaluation = TaskEvaluationResult(
                 ok=False,
@@ -2835,19 +2837,15 @@ def _extract_target_error_code(
     target: str,
     bridge_res: Any,
     batch_err: str | None,
+    *,
+    use_gateway_transport: bool = False,
 ) -> str:
-    if isinstance(bridge_res, Mapping):
-        results = bridge_res.get("results")
-        if isinstance(results, list):
-            for item in results:
-                if (
-                    isinstance(item, Mapping)
-                    and str(item.get("target") or "").strip() == target
-                ):
-                    err = str(item.get("error") or item.get("error_code") or "").strip()
-                    if err:
-                        return err
-    return batch_err or "target_failed"
+    return _extract_retry_target_error_code(
+        target,
+        bridge_res,
+        batch_err,
+        use_gateway_transport=use_gateway_transport,
+    )
 
 
 def _extract_target_skip_reason(target: str, bridge_res: Any) -> str | None:
@@ -3307,6 +3305,7 @@ async def dispatch_data_task_run_notification(
         or fetch_deliveries_fn is not fetch_execution_deliveries
     )
     existing_by_target: dict[tuple[str, str], str] = {}
+    existing_error_by_target: dict[tuple[str, str], str] = {}
     existing_payload_by_target: dict[tuple[str, str], dict[str, Any]] = {}
     for d_row in await _safe_fetch_deliveries(
         fetch_deliveries_fn,
@@ -3316,25 +3315,45 @@ async def dispatch_data_task_run_notification(
         d_ch = str(d_row.get("channel") or "").strip().lower()
         d_tgt = str(d_row.get("target") or "").strip()
         d_st = str(d_row.get("status") or "").strip().lower()
+        d_err = str(d_row.get("error_code") or "").strip().lower()
         if d_ch and d_tgt and d_st:
             existing_by_target[(d_ch, d_tgt)] = d_st
+            if d_err:
+                existing_error_by_target[(d_ch, d_tgt)] = d_err
             d_payload = d_row.get("payload_json")
             if isinstance(d_payload, Mapping):
                 existing_payload_by_target[(d_ch, d_tgt)] = dict(d_payload)
 
     local_by_target: dict[tuple[str, str], str] = {}
+    local_error_by_target: dict[tuple[str, str], str] = {}
     pending_targets: list[tuple[str, str]] = []
     claimed_attempt_by_target: dict[tuple[str, str], int | None] = {}
 
-    def _settle_pending_target(tgt_key: tuple[str, str], status_val: str) -> None:
+    def _is_terminal_target_state(st: str | None, err: str | None) -> bool:
+        if st in ("sent", "skipped"):
+            return True
+        if st == "failed" and (err or "").strip().lower() in NON_RETRYABLE_TERMINAL_ERROR_CODES:
+            return True
+        return False
+
+    def _settle_pending_target(
+        tgt_key: tuple[str, str], status_val: str, error_code: str | None = None
+    ) -> None:
         local_by_target[tgt_key] = status_val
+        if error_code:
+            local_error_by_target[tgt_key] = str(error_code).strip().lower()
+        else:
+            local_error_by_target.pop(tgt_key, None)
         if tgt_key in pending_targets:
             pending_targets.remove(tgt_key)
 
     try:
         if not allowed:
             for ch, cleaned_tgt in valid_targets:
-                if existing_by_target.get((ch, cleaned_tgt)) in ("sent", "skipped"):
+                if _is_terminal_target_state(
+                    existing_by_target.get((ch, cleaned_tgt)),
+                    existing_error_by_target.get((ch, cleaned_tgt)),
+                ):
                     continue
                 await check_scheduler_lock(lock_conn)
                 claimed_ok, claimed_attempt_count = await _invoke_claim_target(
@@ -3364,7 +3383,10 @@ async def dispatch_data_task_run_notification(
                     local_by_target[(ch, cleaned_tgt)] = "skipped"
         elif valid_targets:
             for ch, cleaned_tgt in valid_targets:
-                if existing_by_target.get((ch, cleaned_tgt)) in ("sent", "skipped"):
+                if _is_terminal_target_state(
+                    existing_by_target.get((ch, cleaned_tgt)),
+                    existing_error_by_target.get((ch, cleaned_tgt)),
+                ):
                     continue
                 target_payload = dict(payload_with_route_key)
                 prev_payload = existing_payload_by_target.get((ch, cleaned_tgt))
@@ -3436,10 +3458,11 @@ async def dispatch_data_task_run_notification(
                             target_payload.update(persisted_rec)
 
                     await check_scheduler_lock(lock_conn)
-                    if (
+                    use_gateway_transport = (
                         post_notify_fn is post_data_task_gateway_notify
                         or _callable_accepts_kwarg(post_notify_fn, "gateway_url")
-                    ):
+                    )
+                    if use_gateway_transport:
                         active_native_target = (ch, cleaned_tgt)
                         bridge_res = await post_notify_fn(
                             [cleaned_tgt],
@@ -3519,9 +3542,12 @@ async def dispatch_data_task_run_notification(
                         active_native_target = None
                         transport_outcome_uncertain_or_sent = False
                         err_code = _extract_target_error_code(
-                            cleaned_tgt, bridge_res, batch_err
+                            cleaned_tgt,
+                            bridge_res,
+                            batch_err,
+                            use_gateway_transport=use_gateway_transport,
                         )
-                        _settle_pending_target((ch, cleaned_tgt), "failed")
+                        _settle_pending_target((ch, cleaned_tgt), "failed", err_code)
                         await _shielded_mark_failed(
                             mark_target_fn,
                             str(run_id),
@@ -3530,8 +3556,8 @@ async def dispatch_data_task_run_notification(
                             error_code=err_code,
                             expected_status="pending",
                             expected_attempt_count=claimed_attempt_count,
-                            on_settled=lambda _tgt=(ch, cleaned_tgt): _settle_pending_target(
-                                _tgt, "failed"
+                            on_settled=lambda _tgt=(ch, cleaned_tgt), _code=err_code: _settle_pending_target(
+                                _tgt, "failed", _code
                             ),
                         )
                 except asyncio.CancelledError:
@@ -3645,11 +3671,13 @@ async def dispatch_data_task_run_notification(
         claimed_attempt_by_target.clear()
 
     persisted_by_target: dict[tuple[str, str], str] = dict(existing_by_target)
+    persisted_error_by_target: dict[tuple[str, str], str] = dict(existing_error_by_target)
     if (
         mark_target_fn is not mark_target_delivery
         and fetch_deliveries_fn is fetch_execution_deliveries
     ):
         persisted_by_target.update(local_by_target)
+        persisted_error_by_target.update(local_error_by_target)
     for d_row in await _safe_fetch_deliveries(
         fetch_deliveries_fn,
         str(run_id),
@@ -3658,8 +3686,13 @@ async def dispatch_data_task_run_notification(
         d_ch = str(d_row.get("channel") or "").strip().lower()
         d_tgt = str(d_row.get("target") or "").strip()
         d_st = str(d_row.get("status") or "").strip().lower()
+        d_err = str(d_row.get("error_code") or "").strip().lower()
         if d_ch and d_tgt and d_st:
             persisted_by_target[(d_ch, d_tgt)] = d_st
+            if d_err:
+                persisted_error_by_target[(d_ch, d_tgt)] = d_err
+            else:
+                persisted_error_by_target.pop((d_ch, d_tgt), None)
 
     if not valid_targets and not persisted_by_target:
         logger.info(
@@ -3674,17 +3707,24 @@ async def dispatch_data_task_run_notification(
             tgt_key not in persisted_by_target for tgt_key in valid_targets
         )
         statuses = list(persisted_by_target.values())
+        any_non_terminal = any(
+            not _is_terminal_target_state(st, persisted_error_by_target.get(tgt_key))
+            for tgt_key, st in persisted_by_target.items()
+        )
         # Every expected target persisted and settled: any `sent` means the
-        # run was dispatched (the rest were deliberately skipped); all
+        # run was dispatched; terminal non-retryable failures with no `sent`
+        # settle to `failed` so the scheduler stops re-dispatching them; all
         # `skipped` means nothing was sent. Anything else is still in flight.
         if (
             missing_expected
             or not statuses
-            or any(st not in ("sent", "skipped") for st in statuses)
+            or any_non_terminal
         ):
             terminal_notify_status = "pending_dispatch"
         elif "sent" in statuses:
             terminal_notify_status = "dispatched"
+        elif any(st == "failed" for st in statuses):
+            terminal_notify_status = "failed"
         else:
             terminal_notify_status = "skipped"
 
