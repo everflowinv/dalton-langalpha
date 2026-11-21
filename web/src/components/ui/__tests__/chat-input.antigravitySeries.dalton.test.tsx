@@ -77,6 +77,10 @@ const h = vi.hoisted(() => ({
   customModels: [] as CustomModelEntry[],
   preferences: { model_preference: { preferred_model: 'gemini-4-neon-medium-oauth' }, other_preference: {} } as Record<string, unknown>,
   validModelNames: new Set<string>(),
+  favoriteModels: ['gemini-4-neon-low-oauth', 'gemini-4-neon-high-oauth'] as string[],
+  addFavorite: vi.fn(),
+  removeFavorite: vi.fn(),
+  removeManyFavorites: vi.fn(),
 }));
 
 vi.mock('@/hooks/usePreferences', () => ({
@@ -111,10 +115,10 @@ vi.mock('@/hooks/useAllModels', () => ({
 
 vi.mock('@/hooks/useFavoriteModels', () => ({
   useFavoriteModels: () => ({
-    models: ['gemini-4-neon-low-oauth', 'gemini-4-neon-high-oauth'],
-    add: vi.fn(),
-    remove: vi.fn(),
-    removeMany: vi.fn(),
+    models: h.favoriteModels,
+    add: h.addFavorite,
+    remove: h.removeFavorite,
+    removeMany: h.removeManyFavorites,
   }),
 }));
 
@@ -149,6 +153,10 @@ describe('ChatInput Antigravity series collapsing & effort pill', () => {
     h.metadata = { ...RAW_META };
     h.customModels = [];
     h.validModelNames = new Set(agList);
+    h.favoriteModels = ['gemini-4-neon-low-oauth', 'gemini-4-neon-high-oauth'];
+    h.addFavorite.mockReset();
+    h.removeFavorite.mockReset();
+    h.removeManyFavorites.mockReset();
   });
 
   it('displays saved gemini-4-neon-medium-oauth as "Gemini 4 Neon" + "Medium" and switches variant via effort menu', () => {
@@ -232,5 +240,89 @@ describe('ChatInput Antigravity series collapsing & effort pill', () => {
 
     const { container } = renderComposer({ model: 'gemini-4-neon-high-oauth' });
     expect(container.querySelector('button[data-pill="model"]')).toHaveTextContent('Custom Neon');
+  });
+
+  it('displays the stored effort read-only for a multi-level series when no levels are selectable, while keeping single-level series hidden', () => {
+    const onPickModel = vi.fn();
+    const onPickReasoningEffort = vi.fn();
+    // No Antigravity variants are currently selectable (e.g. policy narrowed / disconnected)
+    h.models = {};
+    h.validModelNames = new Set();
+
+    const { container, rerender } = renderComposer({
+      model: 'gemini-4-neon-medium-oauth',
+      onPickModel,
+      onPickReasoningEffort,
+    });
+
+    const modelPill = container.querySelector('button[data-pill="model"]')!;
+    const effortPill = container.querySelector('[data-pill="effort"]')!;
+    expect(modelPill).toHaveTextContent('Gemini 4 Neon');
+    expect(effortPill).not.toBeNull();
+    expect(effortPill.tagName).toBe('SPAN');
+    expect(effortPill).toHaveAttribute('data-readonly', 'true');
+    expect(effortPill).toHaveTextContent('Medium');
+    expect(effortPill).not.toHaveAttribute('aria-haspopup');
+
+    // Clicking the read-only effort indicator opens no menu and fires no callbacks
+    fireEvent.click(effortPill);
+    expect(screen.queryByRole('menu')).toBeNull();
+    expect(onPickModel).not.toHaveBeenCalled();
+    expect(onPickReasoningEffort).not.toHaveBeenCalled();
+
+    // Single-level series still hides the effort indicator when no levels are selectable
+    rerender(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <ChatInput onSend={vi.fn()} model="gpt-oss-120b-medium-oauth" onPickModel={onPickModel} />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(container.querySelector('[data-pill="effort"]')).toBeNull();
+  });
+
+  it('does not count a same-name custom model into series favorites and does not remove it when unfavoriting the series', () => {
+    h.customModels = [{ name: 'gemini-4-neon-high-oauth', provider: 'openai', model_id: 'custom' }];
+    h.models = {
+      'antigravity-oauth': {
+        display_name: 'Google Antigravity',
+        models: ['gemini-4-neon-low-oauth', 'gemini-4-neon-medium-oauth'],
+      },
+      openai: {
+        display_name: 'OpenAI',
+        models: ['gemini-4-neon-high-oauth'],
+      },
+    };
+    h.metadata = {
+      ...RAW_META,
+      'gemini-4-neon-high-oauth': { provider: 'openai', is_custom_model: true, display_name: 'Custom Neon' },
+    };
+    h.validModelNames = new Set([
+      'gemini-4-neon-low-oauth',
+      'gemini-4-neon-medium-oauth',
+      'gemini-4-neon-high-oauth',
+    ]);
+
+    // Case 1: Only the same-name custom model is favorited -> Antigravity Gemini 4 Neon is NOT starred
+    h.favoriteModels = ['gemini-4-neon-high-oauth'];
+    const { container, unmount } = renderComposer({ model: 'gemini-4-neon-low-oauth' });
+    fireEvent.click(container.querySelector('button[data-pill="model"]')!);
+    const dialog1 = screen.getByRole('dialog');
+    fireEvent.click(within(dialog1).getByRole('radio', { name: 'Google Antigravity' }));
+    expect(within(dialog1).getByRole('button', { name: 'Add Gemini 4 Neon to favorites' })).toBeInTheDocument();
+    expect(within(dialog1).queryByRole('button', { name: 'Remove Gemini 4 Neon from favorites' })).toBeNull();
+    unmount();
+
+    // Case 2: Both built-in Neon variants AND the same-name custom model are favorited ->
+    // unfavoriting Gemini 4 Neon removes ONLY the built-in variants and preserves the custom model favorite.
+    h.favoriteModels = ['gemini-4-neon-low-oauth', 'gemini-4-neon-medium-oauth', 'gemini-4-neon-high-oauth'];
+    const { container: container2 } = renderComposer({ model: 'gemini-4-neon-low-oauth' });
+    fireEvent.click(container2.querySelector('button[data-pill="model"]')!);
+    const dialog2 = screen.getByRole('dialog');
+    fireEvent.click(within(dialog2).getByRole('radio', { name: 'Google Antigravity' }));
+    fireEvent.click(within(dialog2).getByRole('button', { name: 'Remove Gemini 4 Neon from favorites' }));
+    expect(h.removeManyFavorites).toHaveBeenCalledTimes(1);
+    expect(h.removeManyFavorites).toHaveBeenCalledWith(['gemini-4-neon-low-oauth', 'gemini-4-neon-medium-oauth']);
+    expect(h.removeFavorite).not.toHaveBeenCalled();
   });
 });

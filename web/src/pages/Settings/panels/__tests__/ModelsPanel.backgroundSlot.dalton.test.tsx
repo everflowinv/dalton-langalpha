@@ -3,6 +3,8 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { AntigravitySeriesEntry } from '@/api/model';
+import type { CustomModelEntry, ProviderModelsData } from '@/components/model/types';
+import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
 import { buildSelectableAntigravitySeries, buildSeriesCatalog } from '@/lib/antigravitySeries';
 
 const SERIES_LIST: AntigravitySeriesEntry[] = [
@@ -58,6 +60,13 @@ const h = vi.hoisted(() => ({
   preferences: { model_preference: {}, other_preference: {} } as Record<string, unknown>,
   mutate: vi.fn((_payload: unknown) => undefined),
   mutateAsync: vi.fn(async (_payload: unknown) => ({})),
+  models: {} as Record<string, ProviderModelsData>,
+  metadata: {} as Record<string, ModelMetadataEntry>,
+  customModels: [] as CustomModelEntry[],
+  favorites: [] as string[],
+  addFavorite: vi.fn(),
+  removeFavorite: vi.fn(),
+  removeManyFavorites: vi.fn(),
   systemDefaults: {
     default_model: 'gemini-4-neon-high-oauth',
     background_model: 'gemini-4-hydrogen-low-oauth',
@@ -90,22 +99,23 @@ vi.mock('@/hooks/useUpdatePreferences', () => ({
 vi.mock('@/hooks/useAllModels', () => ({
   useAllModels: () => {
     const seriesCatalog = buildSeriesCatalog(SERIES_LIST);
-    const selectableSeries = buildSelectableAntigravitySeries(seriesCatalog, AG_MODELS, {
+    const selectableSeries = buildSelectableAntigravitySeries(seriesCatalog, h.models, {
       rawMetadata: RAW_META,
-      customModels: [],
+      customModels: h.customModels,
     });
+    const allNames = Object.values(h.models).flatMap((p) => p.models ?? []);
     return {
-      models: AG_MODELS,
-      slotModels: AG_MODELS,
-      metadata: RAW_META,
+      models: h.models,
+      slotModels: h.models,
+      metadata: h.metadata,
       payers: {},
       systemDefaults: h.systemDefaults,
-      customModels: [],
+      customModels: h.customModels,
       offPlanModels: new Set<string>(),
       platform: null,
-      validModelNames: new Set(Object.keys(RAW_META)),
-      catalogModelNames: new Set(Object.keys(RAW_META)),
-      rawModels: AG_MODELS,
+      validModelNames: new Set(allNames),
+      catalogModelNames: new Set(allNames),
+      rawModels: h.models,
       rawApiResponse: { model_metadata: RAW_META, antigravity_series: SERIES_LIST },
       compactionProfiles: null,
       searchProviders: null,
@@ -119,7 +129,12 @@ vi.mock('@/hooks/useAllModels', () => ({
 }));
 vi.mock('@/hooks/useAccount', () => ({ useAccount: () => ({ policy: null }) }));
 vi.mock('@/hooks/useFavoriteModels', () => ({
-  useFavoriteModels: () => ({ models: [], add: vi.fn(), remove: vi.fn(), removeMany: vi.fn() }),
+  useFavoriteModels: () => ({
+    models: h.favorites,
+    add: h.addFavorite,
+    remove: h.removeFavorite,
+    removeMany: h.removeManyFavorites,
+  }),
 }));
 vi.mock('@/hooks/usePayerLabel', () => ({ usePayerLabel: () => () => '' }));
 vi.mock('@/hooks/useClaudeCodeSteps', () => ({ useClaudeCodeSteps: () => ({ status: 'done' }) }));
@@ -146,6 +161,13 @@ describe('ModelsPanel — Background slot fixed-low Antigravity behavior', () =>
   beforeEach(() => {
     localStorage.removeItem('settings:modelMode');
     h.preferences = { model_preference: {}, other_preference: {} };
+    h.models = AG_MODELS;
+    h.metadata = RAW_META;
+    h.customModels = [];
+    h.favorites = [];
+    h.addFavorite.mockReset();
+    h.removeFavorite.mockReset();
+    h.removeManyFavorites.mockReset();
     h.mutate.mockClear();
     h.mutateAsync.mockClear();
     h.mutateAsync.mockResolvedValue({});
@@ -203,5 +225,43 @@ describe('ModelsPanel — Background slot fixed-low Antigravity behavior', () =>
     // Primary (Default model) slot is unaffected and keeps its companion effort picker
     const primaryEffort = screen.getByLabelText(/Default model.*Effort/i) as HTMLSelectElement;
     expect(primaryEffort.value).toBe('high');
+  });
+
+  it('excludes same-name custom models from Quick Access series favorites and preserves them when unstarring the series', () => {
+    h.customModels = [{ name: 'gemini-4-neon-high-oauth', provider: 'openai', model_id: 'custom-neon' }];
+    h.models = {
+      'antigravity-oauth': {
+        display_name: 'Google Antigravity',
+        models: ['gemini-4-neon-low-oauth', 'gemini-4-neon-medium-oauth'],
+      },
+      openai: {
+        display_name: 'OpenAI',
+        models: ['gemini-4-neon-high-oauth'],
+      },
+    };
+    h.metadata = {
+      ...RAW_META,
+      'gemini-4-neon-high-oauth': { provider: 'openai', is_custom_model: true, display_name: 'Custom Neon' },
+    };
+
+    // Case 1: Only the same-name custom model is in favorites -> clicking Gemini 4 Neon adds a built-in variant instead of removing custom
+    h.favorites = ['gemini-4-neon-high-oauth'];
+    const { unmount } = renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: '+ Add' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Gemini 4 Neon' }));
+    expect(h.addFavorite).toHaveBeenCalledWith('gemini-4-neon-medium-oauth');
+    expect(h.removeManyFavorites).not.toHaveBeenCalled();
+    unmount();
+
+    // Case 2: Built-in Neon low + medium AND same-name custom model are favorited ->
+    // clicking Gemini 4 Neon removes ONLY the built-in variants and leaves the custom model favorite untouched
+    h.addFavorite.mockReset();
+    h.removeManyFavorites.mockReset();
+    h.favorites = ['gemini-4-neon-low-oauth', 'gemini-4-neon-medium-oauth', 'gemini-4-neon-high-oauth'];
+    renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: '+ Add' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Gemini 4 Neon' }));
+    expect(h.removeManyFavorites).toHaveBeenCalledTimes(1);
+    expect(h.removeManyFavorites).toHaveBeenCalledWith(['gemini-4-neon-low-oauth', 'gemini-4-neon-medium-oauth']);
   });
 });

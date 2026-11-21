@@ -47,6 +47,9 @@ const api = vi.hoisted(() => ({
   summarizeThread: vi.fn().mockResolvedValue({ original_message_count: 3 }),
   offloadThread: vi.fn().mockResolvedValue({ offloaded_args: 1, offloaded_reads: 2 }),
   getWorkspace: vi.fn().mockResolvedValue({ workspace_id: 'ws-1', name: 'Workspace 1' }),
+  // DALTON-HOOK(antigravity-series): spy on getThread & updateThread for B7 shared-workspace & failed-switch rollback tests
+  getThread: vi.fn(),
+  updateThread: vi.fn(),
 }));
 
 // Capture the props MarketChatPanel hands to MessageList + ChatInput.
@@ -146,17 +149,141 @@ vi.mock('@/pages/ChatAgent/hooks/useThreadModel', async (importActual) => {
   return { ...actual, useThreadModel: vi.fn(actual.useThreadModel) };
 });
 
+// DALTON-HOOK(antigravity-series): spy on useThreadTuning to assert workspaceId forwarding & local effort clear
+vi.mock('@/pages/ChatAgent/hooks/useThreadTuning', async (importActual) => {
+  const actual = await importActual<typeof import('@/pages/ChatAgent/hooks/useThreadTuning')>();
+  return { ...actual, useThreadTuning: vi.fn(actual.useThreadTuning) };
+});
+
+// DALTON-HOOK(antigravity-series): allow tests to inject Antigravity series catalog, Dalton build flag, features/user/shared-workspaces state for B7 assertions
+const agSeriesMock = vi.hoisted(() => ({
+  enabled: false,
+  isDaltonBuild: false,
+  featuresData: undefined as Array<{ key: string; enabled: boolean }> | undefined,
+  featuresPending: false,
+  currentUser: null as { user_id: string; organization?: { id: string; name: string } | null } | null,
+  sharedEnabled: false,
+  sharedWorkspaces: undefined as Array<{ workspace: { workspace_id: string } }> | undefined,
+  useCustomPermissions: false,
+}));
+
+vi.mock('@/config/brand', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/config/brand')>()),
+  get isDaltonBuild() {
+    return agSeriesMock.isDaltonBuild;
+  },
+}));
+
+vi.mock('@/api/features', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/api/features')>();
+  return {
+    ...actual,
+    getFeatures: () => {
+      if (!agSeriesMock.useCustomPermissions) return actual.getFeatures();
+      if (agSeriesMock.featuresPending) return new Promise(() => {});
+      return Promise.resolve(agSeriesMock.featuresData ?? []);
+    },
+  };
+});
+
+// DALTON-HOOK(antigravity-series): allow B7 tests to control shared-workspaces and current-user responses
+vi.mock('@/hooks/useSharedWorkspaces', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/hooks/useSharedWorkspaces')>();
+  return {
+    ...actual,
+    useSharedWorkspaces: () => {
+      if (!agSeriesMock.useCustomPermissions) return actual.useSharedWorkspaces();
+      return {
+        enabled: agSeriesMock.sharedEnabled,
+        data: agSeriesMock.sharedWorkspaces !== undefined ? { workspaces: agSeriesMock.sharedWorkspaces } : undefined,
+        isLoading: agSeriesMock.sharedEnabled && agSeriesMock.sharedWorkspaces === undefined,
+        isError: false,
+      };
+    },
+  };
+});
+
+vi.mock('@/hooks/useUser', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/hooks/useUser')>();
+  return {
+    ...actual,
+    useUser: (opts?: { enabled?: boolean }) => {
+      if (!agSeriesMock.useCustomPermissions) return actual.useUser(opts);
+      return {
+        user: agSeriesMock.currentUser,
+        isLoading: agSeriesMock.currentUser === null,
+        isError: false,
+        refetch: vi.fn(),
+      };
+    },
+  };
+});
+
+vi.mock('@/hooks/useAllModels', async (importActual) => {
+  const actual = await importActual<typeof import('@/hooks/useAllModels')>();
+  const { buildSeriesCatalog } = await import('@/lib/antigravitySeries');
+  const testCatalog = buildSeriesCatalog([
+    {
+      series_id: 'antigravity-oauth:gemini-4-neon',
+      series_prefix: 'gemini-4-neon',
+      provider: 'antigravity-oauth',
+      display_name: 'Gemini 4 Neon',
+      qualified_display_name: 'Gemini 4 Neon (Antigravity)',
+      default_effort: 'high',
+      default_model: 'gemini-4-neon-high-oauth',
+      efforts: ['low', 'medium', 'high'],
+      variants: {
+        low: 'gemini-4-neon-low-oauth',
+        medium: 'gemini-4-neon-medium-oauth',
+        high: 'gemini-4-neon-high-oauth',
+      },
+    },
+  ]);
+  const testRawMeta = {
+    'gemini-4-neon-low-oauth': { provider: 'antigravity-oauth' },
+    'gemini-4-neon-medium-oauth': { provider: 'antigravity-oauth' },
+    'gemini-4-neon-high-oauth': { provider: 'antigravity-oauth' },
+  };
+  return {
+    ...actual,
+    useAllModels: () => {
+      const base = actual.useAllModels();
+      if (!agSeriesMock.enabled) return base;
+      return {
+        ...base,
+        seriesCatalog: testCatalog,
+        customModels: [],
+        metadata: { ...base.metadata, ...testRawMeta },
+        rawApiResponse: {
+          ...base.rawApiResponse,
+          model_metadata: { ...(base.rawApiResponse?.model_metadata ?? {}), ...testRawMeta },
+        },
+      };
+    },
+  };
+});
+
 vi.mock('@/pages/MarketView/components/MarketChatHistoryButton', () => ({
   default: () => <div data-testid="history-btn" />,
 }));
 
-vi.mock('@/pages/ChatAgent/utils/api', async (importActual) => ({
-  ...(await importActual<Record<string, unknown>>()),
-  getWorkspace: api.getWorkspace,
-  getPreviewUrl: vi.fn().mockResolvedValue({ url: 'https://signed.example/' }),
-  summarizeThread: api.summarizeThread,
-  offloadThread: api.offloadThread,
-}));
+vi.mock('@/pages/ChatAgent/utils/api', async (importActual) => {
+  const actual = await importActual<typeof import('@/pages/ChatAgent/utils/api')>();
+  return {
+    ...actual,
+    getWorkspace: api.getWorkspace,
+    getPreviewUrl: vi.fn().mockResolvedValue({ url: 'https://signed.example/' }),
+    summarizeThread: api.summarizeThread,
+    offloadThread: api.offloadThread,
+    // DALTON-HOOK(antigravity-series): forward getThread and updateThread to test spies when configured
+    getThread: (...args: Parameters<typeof actual.getThread>) => (
+      agSeriesMock.useCustomPermissions ? api.getThread(...args) : actual.getThread(...args)
+    ),
+    updateThread: (...args: Parameters<typeof actual.updateThread>) => (
+      agSeriesMock.useCustomPermissions ? api.updateThread(...args) : actual.updateThread(...args)
+    ),
+  };
+});
 
 // DALTON-HOOK(team-sharing): capture the seen-gating the panel hands the
 // active-thread publisher (the publisher itself maps canMarkSeen:false to
@@ -195,6 +322,9 @@ vi.mock('@/pages/ChatAgent/components/dalton/TeamSharing', async (importOriginal
 import MarketChatPanel from '../MarketChatPanel';
 import { useChatMessages } from '@/pages/ChatAgent/hooks/useChatMessages';
 import { useThreadModel } from '@/pages/ChatAgent/hooks/useThreadModel';
+// DALTON-HOOK(antigravity-series): import useThreadTuning spy and queryKeys for B7 assertions
+import { queryKeys } from '@/lib/queryKeys';
+import { useThreadTuning } from '@/pages/ChatAgent/hooks/useThreadTuning';
 import { chartSelectionStore } from '../../stores/chartSelectionStore';
 import { userLocalStorage } from '@/lib/userStorage';
 import type { ComposerSend } from '@/components/ui/chat-input.types';
@@ -263,7 +393,8 @@ function renderPanel(override: Partial<PanelProps> = {}, entry = '/market') {
       </MemoryRouter>
     </QueryClientProvider>,
   );
-  return { ...view, rerender };
+  // DALTON-HOOK(antigravity-series): expose QueryClient so B7 tests can await features query settlement
+  return { ...view, rerender, qc };
 }
 
 // The transcript's scroll geometry. jsdom has no layout, so the panel's
@@ -978,6 +1109,363 @@ describe('MarketChatPanel', () => {
         const last = team.publisherCalls[team.publisherCalls.length - 1];
         expect(last).toMatchObject({ threadId: 'thread-xyz', canMarkSeen: true });
       });
+    });
+  });
+
+  // DALTON-HOOK(antigravity-series): B7 — forward workspaceId to useThreadModel/useThreadTuning when scoped to a workspace and clear local effort on Antigravity pick
+  describe('shared-workspace guard and Antigravity effort reset (B7)', () => {
+    afterEach(() => {
+      agSeriesMock.enabled = false;
+      agSeriesMock.isDaltonBuild = false;
+      agSeriesMock.featuresData = undefined;
+      agSeriesMock.featuresPending = false;
+      agSeriesMock.currentUser = null;
+      agSeriesMock.sharedEnabled = false;
+      agSeriesMock.sharedWorkspaces = undefined;
+      agSeriesMock.useCustomPermissions = false;
+      team.auth = false;
+      team.readOnly = false;
+      api.getThread.mockReset();
+      api.updateThread.mockReset();
+      api.getWorkspace.mockResolvedValue({ workspace_id: 'ws-1', name: 'Workspace 1' });
+    });
+
+    it('passes activeWorkspaceId (including Home) to useThreadModel and useThreadTuning in Dalton builds and omits it in non-Dalton builds', () => {
+      agSeriesMock.isDaltonBuild = true;
+      vi.mocked(useThreadModel).mockClear();
+      vi.mocked(useThreadTuning).mockClear();
+
+      renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-shared-1' });
+      expect(vi.mocked(useThreadModel)).toHaveBeenLastCalledWith(
+        expect.objectContaining({ chiefOfStaff: false, workspaceId: 'ws-shared-1' }),
+      );
+      expect(vi.mocked(useThreadTuning)).toHaveBeenLastCalledWith(
+        expect.objectContaining({ workspaceId: 'ws-shared-1' }),
+      );
+
+      vi.mocked(useThreadModel).mockClear();
+      vi.mocked(useThreadTuning).mockClear();
+
+      renderPanel(ALL);
+      expect(vi.mocked(useThreadModel)).toHaveBeenLastCalledWith(
+        expect.objectContaining({ chiefOfStaff: true, workspaceId: 'home-ws' }),
+      );
+      expect(vi.mocked(useThreadTuning)).toHaveBeenLastCalledWith(
+        expect.objectContaining({ workspaceId: 'home-ws' }),
+      );
+
+      agSeriesMock.isDaltonBuild = false;
+      vi.mocked(useThreadModel).mockClear();
+      vi.mocked(useThreadTuning).mockClear();
+
+      renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
+      expect(vi.mocked(useThreadModel).mock.lastCall?.[0]).not.toHaveProperty('workspaceId');
+      expect(vi.mocked(useThreadTuning).mock.lastCall?.[0]).not.toHaveProperty('workspaceId');
+    });
+
+    it('clears local reasoning effort when switching to an Antigravity variant', () => {
+      agSeriesMock.enabled = true;
+      agSeriesMock.isDaltonBuild = true;
+      h.threadId = '__default__';
+      renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
+
+      act(() => {
+        void (ci.props!.onPickReasoningEffort as (effort: string | null) => void)('high');
+      });
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
+
+      act(() => {
+        void (ci.props!.onPickModel as (model: string) => void)('gemini-4-neon-medium-oauth');
+      });
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: null }));
+    });
+
+    // DALTON-HOOK(antigravity-series): B7 follow-up — never issue 403 PATCH on shared threads while shared_workspaces feature flag has not returned yet
+    it('does not PATCH model or reasoning effort on a visible shared thread before the shared_workspaces feature flag returns', async () => {
+      agSeriesMock.enabled = true;
+      agSeriesMock.isDaltonBuild = true;
+      agSeriesMock.useCustomPermissions = true;
+      agSeriesMock.featuresPending = true;
+      agSeriesMock.sharedEnabled = false;
+      agSeriesMock.sharedWorkspaces = undefined;
+      api.getThread.mockResolvedValue({
+        thread_id: 'thread-xyz',
+        llm_model: 'claude-sonnet-4',
+        reasoning_effort: 'low',
+        fast_mode: null,
+      });
+
+      const view = renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-shared-1' });
+      await vi.waitFor(() => expect(ci.props!.tuning).toEqual({ reasoningEffort: 'low', fastMode: null }));
+
+      await act(async () => {
+        await (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-high-oauth');
+        await (ci.props!.onPickReasoningEffort as (effort: string | null) => Promise<boolean>)('high');
+      });
+
+      expect(api.updateThread).not.toHaveBeenCalled();
+      expect(ci.props!.model).toBe('gemini-4-neon-high-oauth');
+      expect(ci.props!.sendModel).toBe('gemini-4-neon-high-oauth');
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
+
+      // Feature flag + shared list resolve confirming ws-shared-1 is shared -> still zero PATCHes.
+      agSeriesMock.featuresPending = false;
+      agSeriesMock.featuresData = [{ key: 'shared_workspaces', enabled: true }];
+      agSeriesMock.sharedEnabled = true;
+      agSeriesMock.sharedWorkspaces = [{ workspace: { workspace_id: 'ws-shared-1' } }];
+      view.rerender({ scope: 'workspace', activeWorkspaceId: 'ws-shared-1' });
+      await act(async () => {});
+
+      expect(api.updateThread).not.toHaveBeenCalled();
+      expect(ci.props!.model).toBe('gemini-4-neon-high-oauth');
+      expect(ci.props!.sendModel).toBe('gemini-4-neon-high-oauth');
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
+    });
+
+    // DALTON-HOOK(antigravity-series): B7 follow-up — never issue 403 PATCH on Dalton colleague threads even when upstream shared_workspaces flag is off
+    it('does not PATCH model or reasoning effort on a Dalton colleague thread when upstream shared_workspaces is off', async () => {
+      agSeriesMock.enabled = true;
+      agSeriesMock.isDaltonBuild = true;
+      agSeriesMock.useCustomPermissions = true;
+      agSeriesMock.featuresPending = false;
+      agSeriesMock.featuresData = [{ key: 'shared_workspaces', enabled: false }];
+      agSeriesMock.sharedEnabled = false;
+      agSeriesMock.currentUser = { user_id: 'user-me' };
+      team.auth = true;
+      team.readOnly = true;
+      api.getWorkspace.mockResolvedValue({
+        workspace_id: 'ws-colleague',
+        name: 'Colleague Workspace',
+        user_id: 'user-colleague',
+      });
+      api.getThread.mockResolvedValue({
+        thread_id: 'thread-xyz',
+        llm_model: 'claude-sonnet-4',
+        reasoning_effort: 'low',
+        fast_mode: null,
+        thread_user_id: 'user-colleague',
+        workspace_owner_id: 'user-colleague',
+      });
+
+      renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-colleague' });
+      await vi.waitFor(() => expect(ci.props!.tuning).toEqual({ reasoningEffort: 'low', fastMode: null }));
+
+      await act(async () => {
+        await (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-high-oauth');
+        await (ci.props!.onPickReasoningEffort as (effort: string | null) => Promise<boolean>)('high');
+      });
+
+      expect(api.updateThread).not.toHaveBeenCalled();
+      expect(ci.props!.model).toBe('gemini-4-neon-high-oauth');
+      expect(ci.props!.sendModel).toBe('gemini-4-neon-high-oauth');
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
+    });
+
+    // DALTON-HOOK(antigravity-series): restore original model effort when Antigravity model PATCH fails, even if thread detail arrives after the failure
+    it('restores the original model effort when switching to Antigravity fails before thread detail arrives', async () => {
+      agSeriesMock.enabled = true;
+      agSeriesMock.isDaltonBuild = true;
+      agSeriesMock.useCustomPermissions = true;
+      agSeriesMock.featuresPending = false;
+      agSeriesMock.featuresData = [{ key: 'shared_workspaces', enabled: false }];
+      agSeriesMock.sharedEnabled = false;
+
+      let resolveThread!: (value: Record<string, unknown>) => void;
+      api.getThread.mockReturnValue(new Promise((resolve) => { resolveThread = resolve; }));
+      api.updateThread.mockRejectedValueOnce(Object.assign(new Error('500'), { response: { status: 500 } }));
+
+      const { qc } = renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
+      // Wait for features query to settle so ws-1 is confirmed writable.
+      await vi.waitFor(() => expect(qc.getQueryData(queryKeys.features.list())).toBeDefined());
+
+      let saved: boolean | undefined;
+      await act(async () => {
+        saved = await (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-medium-oauth');
+      });
+      expect(saved).toBe(false);
+      expect(api.updateThread).toHaveBeenCalledWith('thread-xyz', {
+        llm_model: 'gemini-4-neon-medium-oauth',
+        reasoning_effort: null,
+      });
+
+      // Thread detail now arrives with the original model and saved reasoning effort.
+      await act(async () => {
+        resolveThread({
+          thread_id: 'thread-xyz',
+          llm_model: 'claude-sonnet-4',
+          reasoning_effort: 'high',
+          fast_mode: null,
+        });
+      });
+
+      await vi.waitFor(() => {
+        expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
+      });
+    });
+
+    // DALTON-HOOK(antigravity-series): preserve user effort changes made while a failing Antigravity model switch is in flight
+    it('preserves user effort updates made while waiting for a failing Antigravity model switch', async () => {
+      agSeriesMock.enabled = true;
+      agSeriesMock.isDaltonBuild = true;
+      agSeriesMock.useCustomPermissions = true;
+      agSeriesMock.featuresPending = false;
+      agSeriesMock.featuresData = [{ key: 'shared_workspaces', enabled: false }];
+      agSeriesMock.sharedEnabled = false;
+
+      let serverThread: Record<string, unknown> = {
+        thread_id: 'thread-xyz',
+        llm_model: 'claude-sonnet-4',
+        reasoning_effort: 'high',
+        fast_mode: null,
+      };
+      api.getThread.mockImplementation(() => Promise.resolve(serverThread));
+
+      let rejectModelPatch!: (err: unknown) => void;
+      api.updateThread.mockImplementation((_id: string, updates: Record<string, unknown>) => {
+        if ('llm_model' in updates) {
+          return new Promise((_resolve, reject) => { rejectModelPatch = reject; });
+        }
+        serverThread = { ...serverThread, ...updates };
+        return Promise.resolve(serverThread);
+      });
+
+      const { qc } = renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
+      await vi.waitFor(() => expect(qc.getQueryData(queryKeys.features.list())).toBeDefined());
+      await vi.waitFor(() => expect(ci.props!.tuning).toEqual({ reasoningEffort: 'high', fastMode: null }));
+
+      let pickPromise!: Promise<boolean>;
+      act(() => {
+        pickPromise = (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-medium-oauth');
+      });
+      await vi.waitFor(() => expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: null })));
+
+      // While the model PATCH is still in flight, the user explicitly picks 'low'.
+      await act(async () => {
+        await (ci.props!.onPickReasoningEffort as (effort: string | null) => Promise<boolean>)('low');
+      });
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'low' }));
+
+      // Now the model PATCH fails -> must keep 'low', not roll back to 'high' or null.
+      await act(async () => {
+        rejectModelPatch(Object.assign(new Error('500'), { response: { status: 500 } }));
+        expect(await pickPromise).toBe(false);
+      });
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'low' }));
+    });
+
+    // DALTON-HOOK(antigravity-series): R4 #1 — workspace owner opening a colleague-initiated thread (even with colleague dispatch disabled) must not PATCH before thread detail confirms ownership
+    it('does not PATCH model or reasoning effort before thread detail confirms ownership when workspace owner opens a colleague-initiated thread with colleague dispatch off', async () => {
+      agSeriesMock.enabled = true;
+      agSeriesMock.isDaltonBuild = true;
+      agSeriesMock.useCustomPermissions = true;
+      agSeriesMock.featuresPending = false;
+      agSeriesMock.featuresData = [{ key: 'shared_workspaces', enabled: false }];
+      agSeriesMock.sharedEnabled = false;
+      agSeriesMock.currentUser = { user_id: 'user-owner' };
+      team.auth = true;
+      team.readOnly = false; // workspace owner, colleagueDispatchEnabled is falsy (off)
+
+      api.getWorkspace.mockResolvedValue({
+        workspace_id: 'ws-owner',
+        name: 'Owner Workspace',
+        user_id: 'user-owner',
+      });
+      let resolveThread!: (value: Record<string, unknown>) => void;
+      api.getThread.mockReturnValue(new Promise((resolve) => { resolveThread = resolve; }));
+
+      const { qc } = renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-owner' });
+      await vi.waitFor(() => expect(qc.getQueryData(queryKeys.features.list())).toBeDefined());
+      await vi.waitFor(() => expect(api.getWorkspace).toHaveBeenCalledWith('ws-owner'));
+
+      // Before thread detail returns, user changes model and reasoning effort -> must NOT PATCH.
+      await act(async () => {
+        await (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-high-oauth');
+        await (ci.props!.onPickReasoningEffort as (effort: string | null) => Promise<boolean>)('high');
+      });
+
+      expect(api.updateThread).not.toHaveBeenCalled();
+      expect(ci.props!.model).toBe('gemini-4-neon-high-oauth');
+      expect(ci.props!.sendModel).toBe('gemini-4-neon-high-oauth');
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
+
+      // DALTON-HOOK(antigravity-series): thread detail arrives showing a colleague started this thread -> stays local, still zero PATCHes
+      await act(async () => {
+        resolveThread({
+          thread_id: 'thread-xyz',
+          llm_model: 'claude-sonnet-4',
+          reasoning_effort: 'low',
+          fast_mode: null,
+          workspace_owner_id: 'user-owner',
+          thread_user_id: 'user-colleague',
+        });
+      });
+      await act(async () => {});
+
+      expect(api.updateThread).not.toHaveBeenCalled();
+      expect(ci.props!.model).toBe('gemini-4-neon-high-oauth');
+      expect(ci.props!.sendModel).toBe('gemini-4-neon-high-oauth');
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
+    });
+
+    // DALTON-HOOK(antigravity-series): R5 #2 — Home thread switched to an Antigravity variant before detail returns must include reasoning_effort: null in PATCH (matching ChatView)
+    it('includes reasoning_effort: null when switching a Home thread to an Antigravity variant before thread detail arrives', async () => {
+      agSeriesMock.enabled = true;
+      agSeriesMock.isDaltonBuild = true;
+      agSeriesMock.useCustomPermissions = true;
+      agSeriesMock.featuresPending = false;
+      agSeriesMock.featuresData = [{ key: 'shared_workspaces', enabled: false }];
+      agSeriesMock.sharedEnabled = false;
+      agSeriesMock.currentUser = { user_id: 'user-owner' };
+      team.auth = true;
+      team.readOnly = false;
+
+      api.getWorkspace.mockResolvedValue({
+        workspace_id: 'home-ws',
+        name: 'Home',
+        is_home: true,
+        user_id: 'user-owner',
+      });
+      let resolveThread!: (value: Record<string, unknown>) => void;
+      api.getThread.mockReturnValue(new Promise((resolve) => { resolveThread = resolve; }));
+      api.updateThread.mockResolvedValue({
+        thread_id: 'thread-xyz',
+        llm_model: 'gemini-4-neon-medium-oauth',
+        reasoning_effort: null,
+        fast_mode: null,
+        workspace_owner_id: 'user-owner',
+        thread_user_id: 'user-owner',
+      });
+
+      const { qc } = renderPanel(ALL);
+      await vi.waitFor(() => expect(qc.getQueryData(queryKeys.features.list())).toBeDefined());
+      await vi.waitFor(() => expect(api.getWorkspace).toHaveBeenCalledWith('home-ws'));
+
+      // Switch Home thread to Antigravity before thread detail arrives -> waits for detail confirmation.
+      await act(async () => {
+        await (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-medium-oauth');
+      });
+      expect(api.updateThread).not.toHaveBeenCalled();
+
+      // Thread detail arrives with a saved reasoning_effort -> flushes one PATCH carrying reasoning_effort: null.
+      await act(async () => {
+        resolveThread({
+          thread_id: 'thread-xyz',
+          llm_model: 'claude-sonnet-4',
+          reasoning_effort: 'high',
+          fast_mode: null,
+          workspace_owner_id: 'user-owner',
+          thread_user_id: 'user-owner',
+        });
+      });
+
+      await vi.waitFor(() => {
+        expect(api.updateThread).toHaveBeenCalledWith('thread-xyz', {
+          llm_model: 'gemini-4-neon-medium-oauth',
+          reasoning_effort: null,
+        });
+      });
+      expect(api.updateThread).toHaveBeenCalledTimes(1);
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: null }));
     });
   });
 });

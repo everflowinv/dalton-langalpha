@@ -123,7 +123,18 @@ export function useThreadFieldSave<F extends ThreadField>({
       // stands in only when the chain began in another mount.
       const confirmed = confirmedRef.current;
       const restored = confirmed.has(save.threadId) ? confirmed.get(save.threadId) : context?.previous;
-      if (restored) writeField(save.threadId, restored.value, restored.extra);
+      // DALTON-HOOK(antigravity-series): only roll back extraUpdates fields that still hold this save's optimistic value, preserving concurrent user updates
+      if (restored) {
+        const currentRow = queryClient.getQueryData<Thread>(queryKeys.threads.detail(save.threadId));
+        const safeExtra = restored.extra && save.extraUpdates && currentRow
+          ? Object.fromEntries(
+              Object.entries(restored.extra).filter(
+                ([k]) => currentRow[k as keyof Thread] === save.extraUpdates?.[k as keyof ThreadUpdates],
+              ),
+            ) as Partial<Thread>
+          : restored.extra;
+        writeField(save.threadId, restored.value, safeExtra);
+      }
       if (shownThreadRef.current === save.threadId) onFailed(save);
       toast({ description: failedMessage, variant: 'destructive' });
     },
