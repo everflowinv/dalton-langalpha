@@ -163,15 +163,17 @@ def _parse_as_of(as_of: str | None) -> datetime:
 def compute_window(as_of: str | None = None) -> dict[str, Any]:
     end = _parse_as_of(as_of)
     # Local subtraction is 23 or 25 hours across a New York DST change.
-    start = (end.astimezone(UTC) - timedelta(hours=24)).astimezone(TZ)
+    start_utc = end.astimezone(UTC) - timedelta(hours=24)
+    end_utc = end.astimezone(UTC)
+    start = start_utc.astimezone(TZ)
     summary_date = end.date().isoformat()
     handles = [{"handle": handle, "label": label} for handle, label in HANDLES]
     return {
         "timezone": "America/New_York",
         "start_iso": start.isoformat(),
         "end_iso": end.isoformat(),
-        "start_date": start.date().isoformat(),
-        "end_date": end.date().isoformat(),
+        "start_date": start_utc.date().isoformat(),
+        "end_date": end_utc.date().isoformat(),
         "summary_date": summary_date,
         "report_run_id": f"ct-semi-sentiment-{summary_date}",
         "x_query": X_QUERY,
@@ -223,7 +225,13 @@ def _prior_exists(text: str, summary_date: str) -> bool:
     return any(line.strip() and not line.strip().startswith(prefix) for line in text.splitlines())
 
 
-def validate_report(text: str, summary_date: str, *, require_change: bool) -> list[str]:
+def validate_report(
+    text: str,
+    summary_date: str,
+    *,
+    require_change: bool,
+    incomplete_notes: list[str] | tuple[str, ...] = (),
+) -> list[str]:
     """Return structural problems. An empty list means the draft can be submitted."""
     errors: list[str] = []
     if not isinstance(text, str):
@@ -255,6 +263,13 @@ def validate_report(text: str, summary_date: str, *, require_change: bool) -> li
     missing = [label for label in _NOTE_LABELS if label not in notes]
     if missing:
         errors.append("数据备注要分开列出：" + "、".join(missing))
+    missing_incomplete = [
+        note.strip()
+        for note in incomplete_notes
+        if isinstance(note, str) and note.strip() and note.strip() not in notes
+    ]
+    if missing_incomplete:
+        errors.append("数据备注缺少未取全提示：" + "；".join(missing_incomplete))
     return errors
 
 
@@ -283,7 +298,7 @@ def _parse_twitter(text: str) -> datetime | None:
     return parsed.astimezone(TZ)
 
 
-def _parse_time(value: Any) -> datetime | None:
+def _parse_time(value: Any, *, default_tz: ZoneInfo | timezone = TZ) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
     text = value.strip()
@@ -295,7 +310,7 @@ def _parse_time(value: Any) -> datetime | None:
         parsed = None
     if parsed is not None:
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=TZ)
+            parsed = parsed.replace(tzinfo=default_tz)
         return parsed.astimezone(TZ)
     return _parse_twitter(text)
 
@@ -380,19 +395,114 @@ def _pure_repost(item: dict[str, Any]) -> bool:
 
 
 def _in_window(created: datetime | None, start: datetime, end: datetime) -> bool:
-    return created is not None and start <= created <= end
+    if created is None:
+        return False
+    return start.astimezone(UTC) <= created.astimezone(UTC) <= end.astimezone(UTC)
 
 
-def _account_payload(raw: Any) -> tuple[bool, list[Any], bool]:
+def _account_payload(
+    raw: Any,
+) -> tuple[bool, list[Any], bool, bool, datetime | None, datetime | None, bool, bool]:
     if isinstance(raw, list):
-        return True, raw, False
+        return True, raw, False, False, None, None, False, False
     if not isinstance(raw, dict):
-        return False, [], False
+        return False, [], False, False, None, None, False, False
     data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
     has_more = bool(raw.get("has_more") or raw.get("hasMore") or data.get("has_more") or data.get("hasMore"))
-    if "ok" in raw:
-        return bool(raw.get("ok")), _iter_items(raw), has_more
-    return True, _iter_items(raw), has_more
+    truncated = bool(raw.get("truncated") or data.get("truncated"))
+    has_fetched_key = any(
+        key in container
+        for container in (raw, data)
+        for key in ("oldest_fetched_at", "oldestFetchedAt")
+    )
+    has_returned_key = any(
+        key in container
+        for container in (raw, data)
+        for key in ("oldest_returned_at", "oldestReturnedAt")
+    )
+    oldest_fetched = _parse_time(
+        raw.get("oldest_fetched_at")
+        or raw.get("oldestFetchedAt")
+        or data.get("oldest_fetched_at")
+        or data.get("oldestFetchedAt"),
+        default_tz=UTC,
+    )
+    oldest_returned = _parse_time(
+        raw.get("oldest_returned_at")
+        or raw.get("oldestReturnedAt")
+        or data.get("oldest_returned_at")
+        or data.get("oldestReturnedAt"),
+        default_tz=UTC,
+    )
+    ok = bool(raw.get("ok")) if "ok" in raw else True
+    return (
+        ok,
+        _iter_items(raw),
+        has_more,
+        truncated,
+        oldest_fetched,
+        oldest_returned,
+        has_fetched_key,
+        has_returned_key,
+    )
+
+
+def _oldest_timeline_item(items: list[Any], handle: str) -> datetime | None:
+    """Return the earliest valid UTC datetime among timeline items for `handle`."""
+    oldest: datetime | None = None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if _canonical(_handle(item, handle)) != handle:
+            continue
+        created = _parse_time(item.get("created_at") or item.get("createdAt") or item.get("date"))
+        if created is not None:
+            created_utc = created.astimezone(UTC)
+            if oldest is None or created_utc < oldest:
+                oldest = created_utc
+    return oldest
+
+
+def _evaluate_timeline_coverage(
+    *,
+    has_more: bool,
+    truncated: bool,
+    oldest_fetched: datetime | None,
+    oldest_returned: datetime | None,
+    has_fetched_key: bool,
+    has_returned_key: bool,
+    items: list[Any],
+    handle: str,
+    window_start: datetime,
+) -> tuple[bool, datetime | None]:
+    """Evaluate `(incomplete, display_oldest)` using UTC comparisons."""
+    start_utc = window_start.astimezone(UTC)
+    fetched_utc = oldest_fetched.astimezone(UTC) if oldest_fetched is not None else None
+    returned_utc = oldest_returned.astimezone(UTC) if oldest_returned is not None else None
+    if not has_fetched_key and not has_returned_key:
+        oldest = _oldest_timeline_item(items, handle)
+        incomplete = bool((has_more or truncated) and (oldest is None or oldest >= start_utc))
+        return incomplete, oldest
+    effective_returned = returned_utc if has_returned_key else _oldest_timeline_item(items, handle)
+    if truncated:
+        covered = effective_returned is not None and effective_returned < start_utc
+    elif fetched_utc is None and not has_returned_key:
+        fallback_oldest = _oldest_timeline_item(items, handle)
+        covered = fallback_oldest is not None and fallback_oldest < start_utc
+        effective_returned = effective_returned or fallback_oldest
+    else:
+        covered = fetched_utc is not None and fetched_utc < start_utc
+    incomplete = bool((has_more or truncated) and not covered)
+    display_oldest = effective_returned if effective_returned is not None else fetched_utc
+    return incomplete, display_oldest
+
+
+def _incomplete_note(handle: str, oldest: datetime | None) -> str:
+    prefix = "窗口内可能还有未取回的帖子"
+    if oldest is None:
+        return f"@{handle} {prefix}"
+    earliest = oldest.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return f"@{handle} {prefix}，最早只取到 {earliest}（纽约时间）"
 
 
 def _public_item(item: dict[str, Any], source: str) -> dict[str, str]:
@@ -469,9 +579,19 @@ def select_posts(raw: dict[str, Any], window: dict[str, Any]) -> dict[str, Any]:
     by_id: dict[str, dict[str, Any]] = {}
     by_url: dict[str, dict[str, Any]] = {}
     accounts: dict[str, Any] = {}
+    display_oldest_map: dict[str, datetime | None] = {}
     for handle in HANDLE_ORDER:
         present = handle in accounts_in
-        ok, items, has_more = _account_payload(accounts_in.get(handle))
+        (
+            ok,
+            items,
+            has_more,
+            truncated,
+            oldest_fetched,
+            oldest_returned,
+            has_fetched_key,
+            has_returned_key,
+        ) = _account_payload(accounts_in.get(handle))
         if not present:
             ok = False
         kept: list[dict[str, Any]] = []
@@ -486,9 +606,39 @@ def select_posts(raw: dict[str, Any], window: dict[str, Any]) -> dict[str, Any]:
                     continue
                 _remember(norm, "timeline", seen_ids, seen_urls, by_id, by_url)
                 kept.append(norm)
+        if ok:
+            incomplete, display_oldest = _evaluate_timeline_coverage(
+                has_more=has_more,
+                truncated=truncated,
+                oldest_fetched=oldest_fetched,
+                oldest_returned=oldest_returned,
+                has_fetched_key=has_fetched_key,
+                has_returned_key=has_returned_key,
+                items=items,
+                handle=handle,
+                window_start=start,
+            )
+        else:
+            incomplete, display_oldest = False, None
+        display_oldest_map[handle] = display_oldest
         accounts[handle] = {
             "ok": ok,
             "has_more": has_more if ok else False,
+            "truncated": truncated if ok else False,
+            "incomplete": incomplete,
+            "oldest_fetched_at": (
+                oldest_fetched.astimezone(UTC).isoformat()
+                if (ok and oldest_fetched is not None)
+                else None
+            ),
+            "oldest_returned_at": (
+                oldest_returned.astimezone(UTC).isoformat()
+                if (ok and oldest_returned is not None)
+                else None
+            ),
+            "oldest_created_at": display_oldest.astimezone(TZ).isoformat()
+            if (ok and display_oldest is not None)
+            else "",
             "label": LABELS[handle],
             "items": kept,
         }
@@ -518,9 +668,10 @@ def select_posts(raw: dict[str, Any], window: dict[str, Any]) -> dict[str, Any]:
     no_posts: list[str] = []
     with_posts: list[str] = []
     more: list[str] = []
+    incomplete_notes: list[str] = []
     for handle in HANDLE_ORDER:
         account = accounts[handle]
-        account["items"].sort(key=lambda row: (row["created"], row["id"]))
+        account["items"].sort(key=lambda row: (row["created"].astimezone(UTC), row["id"]))
         public_items = [_public_item(row, row["source"]) for row in account["items"]]
         account["items"] = public_items
         if not account["ok"]:
@@ -529,8 +680,9 @@ def select_posts(raw: dict[str, Any], window: dict[str, Any]) -> dict[str, Any]:
             with_posts.append(handle)
         elif account["ok"]:
             no_posts.append(handle)
-        if account["has_more"]:
+        if account["incomplete"]:
             more.append(handle)
+            incomplete_notes.append(_incomplete_note(handle, display_oldest_map[handle]))
     return {
         "window": window,
         "accounts": accounts,
@@ -539,6 +691,8 @@ def select_posts(raw: dict[str, Any], window: dict[str, Any]) -> dict[str, Any]:
         "no_posts": no_posts,
         "with_posts": with_posts,
         "has_more": more,
+        "incomplete": more,
+        "incomplete_notes": incomplete_notes,
     }
 
 
@@ -582,6 +736,8 @@ def cmd_select(args: argparse.Namespace) -> dict[str, Any]:
         "no_posts": selected["no_posts"],
         "with_posts": selected["with_posts"],
         "has_more": selected["has_more"],
+        "incomplete": selected["incomplete"],
+        "incomplete_notes": selected["incomplete_notes"],
         "x_search_ok": selected["x_search"]["ok"],
         "supplemented": selected["x_search"]["supplemented"],
     }
@@ -597,7 +753,28 @@ def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
     require_change = False
     if log_path.exists():
         require_change = _prior_exists(_read_text(log_path), args.date)
-    errors = validate_report(text, args.date, require_change=require_change)
+    selected_rel = args.selected
+    if selected_rel is None and _valid_date(args.date):
+        default_rel = f"temp/ct-semi-sentiment/{args.date}/selected.json"
+        default_path = workspace_file(workspace, default_rel)
+        if default_path.is_symlink() or default_path.exists():
+            selected_rel = default_rel
+    incomplete_notes: list[str] = []
+    if selected_rel is not None:
+        selected_payload = _read_json(workspace_file(workspace, selected_rel))
+        if not isinstance(selected_payload, dict):
+            raise TypeError("selected file must be a JSON object")
+        raw_notes = selected_payload.get("incomplete_notes")
+        if isinstance(raw_notes, list):
+            incomplete_notes = [
+                item for item in raw_notes if isinstance(item, str) and item.strip()
+            ]
+    errors = validate_report(
+        text,
+        args.date,
+        require_change=require_change,
+        incomplete_notes=incomplete_notes,
+    )
     chars = len(text.replace("\r\n", "\n").strip())
     if errors:
         return {"ok": False, "error": "invalid_report", "errors": errors, "chars": chars}
@@ -663,6 +840,7 @@ def _build_parser() -> argparse.ArgumentParser:
     check = sub.add_parser("check", parents=[shared])
     check.add_argument("--file", required=True)
     check.add_argument("--date", required=True)
+    check.add_argument("--selected", default=None)
     check.set_defaults(func=cmd_check)
 
     append = sub.add_parser("append", parents=[shared])
