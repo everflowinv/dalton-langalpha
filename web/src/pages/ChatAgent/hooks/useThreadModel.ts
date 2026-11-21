@@ -108,13 +108,12 @@ export function useThreadModel({
     ...threadDetailQuery(liveThreadId ?? ''),
     enabled: !!liveThreadId,
   });
-  // DALTON-HOOK(antigravity-series): distinguish confirmed writable vs shared/foreign vs unresolved permissions in Dalton builds; non-Dalton builds match upstream immediate-PATCH behavior
+  // DALTON-HOOK(antigravity-series): resolve thread write access (Dalton adds pending-meta & team-sharing guards; non-Dalton matches origin/dalton/main useSharedEntry)
   const writeAccess = useThreadWriteAccess({
     workspaceId,
     liveThreadId,
     thread,
     threadError,
-    checkUpstreamShared: isDaltonBuild,
   });
   const isSharedUnresolved = writeAccess.status === 'unresolved';
   const isSharedWorkspace = writeAccess.status === 'shared';
@@ -395,7 +394,8 @@ export function useThreadModel({
     }
     if (!liveThreadId || isSharedOrUnresolved) return Promise.resolve(true);
     createdHereRef.current = false;
-    const shouldClearEffort = isAntigravityPick && thread?.reasoning_effort != null;
+    // DALTON-HOOK(antigravity-series): clear reasoning_effort when switching to an Antigravity variant, including before thread detail has loaded so a saved effort is never left behind
+    const shouldClearEffort = isDaltonBuild && isAntigravityPick && (thread === undefined || thread.reasoning_effort != null);
     return saveModel({
       threadId: liveThreadId,
       value: picked,
@@ -414,7 +414,7 @@ export function useThreadModel({
     seriesCatalog,
     rawMetadata,
     customModels,
-    thread?.reasoning_effort,
+    thread,
   ]);
 
   // DALTON-HOOK(antigravity-series): once shared workspace status settles with data, flush a deferred pick via PATCH (personal) or keep send-with-message (shared)
@@ -432,7 +432,8 @@ export function useThreadModel({
     const { threadId: targetThreadId, picked, before, seq } = deferredSharedPick;
     const seriesOpts = { seriesCatalog, rawMetadata, customModels };
     const isAntigravityPick = Boolean(inspectSavedAntigravityModel(picked, seriesOpts));
-    const shouldClearEffort = isAntigravityPick && thread?.reasoning_effort != null;
+    // DALTON-HOOK(antigravity-series): clear reasoning_effort when flushing a deferred Antigravity pick if detail is unread or holds an effort override
+    const shouldClearEffort = isDaltonBuild && isAntigravityPick && (thread === undefined || thread.reasoning_effort != null);
     deferredSharedPickRef.current = null;
     setDeferredSharedPick(null);
     pendingRef.current = picked;
@@ -457,7 +458,7 @@ export function useThreadModel({
     seriesCatalog,
     rawMetadata,
     customModels,
-    thread?.reasoning_effort,
+    thread,
     saveModel,
     setModel,
   ]);

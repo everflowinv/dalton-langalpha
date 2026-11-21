@@ -15,6 +15,8 @@ import { useStableHandler } from '@/hooks/useStableHandler';
 import { useWorkspace } from '@/hooks/useWorkspace';
 // DALTON-HOOK(team-sharing): gate the seen cursor on workspace ownership
 import { isDaltonAuth } from '@/config/daltonAuth';
+// DALTON-HOOK(antigravity-series): scope MarketChatPanel workspaceId & Antigravity effort reset to Dalton builds
+import { isDaltonBuild } from '@/config/brand';
 import { usePreferences } from '@/hooks/usePreferences';
 // DALTON-HOOK(antigravity-series): inspect picked Antigravity variants to clear local effort alongside ChatView
 import { useAllModels } from '@/hooks/useAllModels';
@@ -465,22 +467,26 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   useActiveThreadPublisher(threadId, { canMarkSeen });
 
   // The Chief of Staff's turn may start on another Default than the account's.
-  // DALTON-HOOK(antigravity-series): pass workspaceId when scoped to a workspace so shared threads skip 403 PATCH, and clear local effort on Antigravity picks
-  const threadWorkspaceId = scope === 'all' ? null : activeWorkspaceId;
+  // DALTON-HOOK(antigravity-series): in Dalton builds pass activeWorkspaceId (including Home) like ChatView so shared threads skip 403 PATCH and Home waits for detail confirmation before Antigravity PATCH; non-Dalton keeps origin/dalton/main behavior
+  const threadWorkspaceId = isDaltonBuild ? activeWorkspaceId : null;
   const threadModel = useThreadModel({
     threadId,
     isLoading,
     chiefOfStaff: scope === 'all',
-    workspaceId: threadWorkspaceId,
+    ...(threadWorkspaceId ? { workspaceId: threadWorkspaceId } : {}),
   });
   const { pickModel: pickThreadModel } = threadModel;
   const threadSubagents = useThreadSubagents({ threadId });
   const { toSend: subagentsToSend } = threadSubagents;
-  const threadTuning = useThreadTuning({ threadId, workspaceId: threadWorkspaceId });
+  const threadTuning = useThreadTuning({
+    threadId,
+    ...(threadWorkspaceId ? { workspaceId: threadWorkspaceId } : {}),
+  });
   const { toSend: tuningToSend, clearLocalEffort } = threadTuning;
   const { seriesCatalog, customModels, metadata: modelMetadata, rawApiResponse } = useAllModels();
-  // DALTON-HOOK(antigravity-series): clear local effort on Antigravity pick, restoring previous effort if the model switch fails without clobbering newer updates
+  // DALTON-HOOK(antigravity-series): in Dalton builds clear local effort on Antigravity pick, restoring previous effort if the model switch fails without clobbering newer updates
   const handlePickThreadModel = useCallback((nextModel: string) => {
+    if (!isDaltonBuild) return pickThreadModel(nextModel);
     const rawMeta = rawApiResponse?.model_metadata ?? modelMetadata;
     const restoreEffort = inspectSavedAntigravityModel(nextModel, { seriesCatalog, rawMetadata: rawMeta, customModels })
       ? clearLocalEffort()

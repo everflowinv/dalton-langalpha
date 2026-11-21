@@ -63,15 +63,14 @@ export function useThreadTuning({ threadId, landing = null, workspaceId = null }
     enabled: !!liveThreadId,
   });
 
-  // DALTON-HOOK(antigravity-series): skip/defer PATCH only in Dalton builds (and Dalton auth); non-Dalton builds match upstream behavior exactly
+  // DALTON-HOOK(antigravity-series): resolve thread write access; deferred recovery flush only runs in Dalton builds so non-Dalton matches origin/dalton/main verbatim
   const writeAccess = useThreadWriteAccess({
     workspaceId,
     liveThreadId,
     thread,
     threadError,
-    checkUpstreamShared: isDaltonBuild,
   });
-  const isUnresolved = writeAccess.status === 'unresolved';
+  const isUnresolved = isDaltonBuild && writeAccess.status === 'unresolved';
   const skipSave = writeAccess.status !== 'writable';
 
   const effort = useThreadOverride({

@@ -287,10 +287,26 @@ describe('useThreadTuning', () => {
       });
     });
 
-    // DALTON-HOOK(antigravity-series): non-Dalton builds must keep exact upstream behavior even when shared_workspaces is enabled and its list fails
-    it('keeps upstream immediate-PATCH behavior on non-Dalton builds when shared_workspaces list read fails', async () => {
+    // DALTON-HOOK(antigravity-series): non-Dalton builds must keep exact origin/dalton/main behavior — shared threads skip PATCH, personal threads PATCH immediately even when shared list fails
+    it('keeps origin/dalton/main behavior on non-Dalton builds: skips PATCH on shared threads and PATCHes personal threads immediately when list fails', async () => {
       mocks.isDaltonBuild = false;
       mocks.sharedEnabled = true;
+
+      // Confirmed shared workspace -> skips PATCH (matches origin/dalton/main useSharedEntry).
+      mocks.sharedWorkspaces = [{ workspace: { workspace_id: 'ws-shared' } }];
+      mocks.sharedError = false;
+      const sharedView = setup(
+        { workspaceId: 'ws-shared' },
+        row({ reasoning_effort: 'low', fast_mode: false }),
+      );
+      await act(async () => {
+        await sharedView.result.current.setReasoningEffort('high');
+      });
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+      expect(sharedView.result.current.tuning.reasoningEffort).toBe('high');
+      sharedView.unmount();
+
+      // Personal thread when shared list read fails -> immediate PATCH (matches origin/dalton/main).
       mocks.sharedWorkspaces = undefined;
       mocks.sharedError = true;
 

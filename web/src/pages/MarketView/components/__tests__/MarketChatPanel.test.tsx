@@ -1130,7 +1130,8 @@ describe('MarketChatPanel', () => {
       api.getWorkspace.mockResolvedValue({ workspace_id: 'ws-1', name: 'Workspace 1' });
     });
 
-    it('passes workspaceId to useThreadModel and useThreadTuning when scope !== "all" and null when scope === "all"', () => {
+    it('passes activeWorkspaceId (including Home) to useThreadModel and useThreadTuning in Dalton builds and omits it in non-Dalton builds', () => {
+      agSeriesMock.isDaltonBuild = true;
       vi.mocked(useThreadModel).mockClear();
       vi.mocked(useThreadTuning).mockClear();
 
@@ -1147,15 +1148,24 @@ describe('MarketChatPanel', () => {
 
       renderPanel(ALL);
       expect(vi.mocked(useThreadModel)).toHaveBeenLastCalledWith(
-        expect.objectContaining({ chiefOfStaff: true, workspaceId: null }),
+        expect.objectContaining({ chiefOfStaff: true, workspaceId: 'home-ws' }),
       );
       expect(vi.mocked(useThreadTuning)).toHaveBeenLastCalledWith(
-        expect.objectContaining({ workspaceId: null }),
+        expect.objectContaining({ workspaceId: 'home-ws' }),
       );
+
+      agSeriesMock.isDaltonBuild = false;
+      vi.mocked(useThreadModel).mockClear();
+      vi.mocked(useThreadTuning).mockClear();
+
+      renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
+      expect(vi.mocked(useThreadModel).mock.lastCall?.[0]).not.toHaveProperty('workspaceId');
+      expect(vi.mocked(useThreadTuning).mock.lastCall?.[0]).not.toHaveProperty('workspaceId');
     });
 
     it('clears local reasoning effort when switching to an Antigravity variant', () => {
       agSeriesMock.enabled = true;
+      agSeriesMock.isDaltonBuild = true;
       h.threadId = '__default__';
       renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
 
@@ -1273,7 +1283,10 @@ describe('MarketChatPanel', () => {
         saved = await (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-medium-oauth');
       });
       expect(saved).toBe(false);
-      expect(api.updateThread).toHaveBeenCalledWith('thread-xyz', { llm_model: 'gemini-4-neon-medium-oauth' });
+      expect(api.updateThread).toHaveBeenCalledWith('thread-xyz', {
+        llm_model: 'gemini-4-neon-medium-oauth',
+        reasoning_effort: null,
+      });
 
       // Thread detail now arrives with the original model and saved reasoning effort.
       await act(async () => {
@@ -1392,6 +1405,67 @@ describe('MarketChatPanel', () => {
       expect(ci.props!.model).toBe('gemini-4-neon-high-oauth');
       expect(ci.props!.sendModel).toBe('gemini-4-neon-high-oauth');
       expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
+    });
+
+    // DALTON-HOOK(antigravity-series): R5 #2 — Home thread switched to an Antigravity variant before detail returns must include reasoning_effort: null in PATCH (matching ChatView)
+    it('includes reasoning_effort: null when switching a Home thread to an Antigravity variant before thread detail arrives', async () => {
+      agSeriesMock.enabled = true;
+      agSeriesMock.isDaltonBuild = true;
+      agSeriesMock.useCustomPermissions = true;
+      agSeriesMock.featuresPending = false;
+      agSeriesMock.featuresData = [{ key: 'shared_workspaces', enabled: false }];
+      agSeriesMock.sharedEnabled = false;
+      agSeriesMock.currentUser = { user_id: 'user-owner' };
+      team.auth = true;
+      team.readOnly = false;
+
+      api.getWorkspace.mockResolvedValue({
+        workspace_id: 'home-ws',
+        name: 'Home',
+        is_home: true,
+        user_id: 'user-owner',
+      });
+      let resolveThread!: (value: Record<string, unknown>) => void;
+      api.getThread.mockReturnValue(new Promise((resolve) => { resolveThread = resolve; }));
+      api.updateThread.mockResolvedValue({
+        thread_id: 'thread-xyz',
+        llm_model: 'gemini-4-neon-medium-oauth',
+        reasoning_effort: null,
+        fast_mode: null,
+        workspace_owner_id: 'user-owner',
+        thread_user_id: 'user-owner',
+      });
+
+      const { qc } = renderPanel(ALL);
+      await vi.waitFor(() => expect(qc.getQueryData(queryKeys.features.list())).toBeDefined());
+      await vi.waitFor(() => expect(api.getWorkspace).toHaveBeenCalledWith('home-ws'));
+
+      // Switch Home thread to Antigravity before thread detail arrives -> waits for detail confirmation.
+      await act(async () => {
+        await (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-medium-oauth');
+      });
+      expect(api.updateThread).not.toHaveBeenCalled();
+
+      // Thread detail arrives with a saved reasoning_effort -> flushes one PATCH carrying reasoning_effort: null.
+      await act(async () => {
+        resolveThread({
+          thread_id: 'thread-xyz',
+          llm_model: 'claude-sonnet-4',
+          reasoning_effort: 'high',
+          fast_mode: null,
+          workspace_owner_id: 'user-owner',
+          thread_user_id: 'user-owner',
+        });
+      });
+
+      await vi.waitFor(() => {
+        expect(api.updateThread).toHaveBeenCalledWith('thread-xyz', {
+          llm_model: 'gemini-4-neon-medium-oauth',
+          reasoning_effort: null,
+        });
+      });
+      expect(api.updateThread).toHaveBeenCalledTimes(1);
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: null }));
     });
   });
 });
