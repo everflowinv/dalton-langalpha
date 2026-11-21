@@ -146,6 +146,61 @@ vi.mock('@/pages/ChatAgent/hooks/useThreadModel', async (importActual) => {
   return { ...actual, useThreadModel: vi.fn(actual.useThreadModel) };
 });
 
+// DALTON-HOOK(antigravity-series): spy on useThreadTuning to assert workspaceId forwarding & local effort clear
+vi.mock('@/pages/ChatAgent/hooks/useThreadTuning', async (importActual) => {
+  const actual = await importActual<typeof import('@/pages/ChatAgent/hooks/useThreadTuning')>();
+  return { ...actual, useThreadTuning: vi.fn(actual.useThreadTuning) };
+});
+
+// DALTON-HOOK(antigravity-series): allow tests to inject an Antigravity series catalog for MarketChatPanel pick assertions
+const agSeriesMock = vi.hoisted(() => ({
+  enabled: false,
+}));
+
+vi.mock('@/hooks/useAllModels', async (importActual) => {
+  const actual = await importActual<typeof import('@/hooks/useAllModels')>();
+  const { buildSeriesCatalog } = await import('@/lib/antigravitySeries');
+  const testCatalog = buildSeriesCatalog([
+    {
+      series_id: 'antigravity-oauth:gemini-4-neon',
+      series_prefix: 'gemini-4-neon',
+      provider: 'antigravity-oauth',
+      display_name: 'Gemini 4 Neon',
+      qualified_display_name: 'Gemini 4 Neon (Antigravity)',
+      default_effort: 'high',
+      default_model: 'gemini-4-neon-high-oauth',
+      efforts: ['low', 'medium', 'high'],
+      variants: {
+        low: 'gemini-4-neon-low-oauth',
+        medium: 'gemini-4-neon-medium-oauth',
+        high: 'gemini-4-neon-high-oauth',
+      },
+    },
+  ]);
+  const testRawMeta = {
+    'gemini-4-neon-low-oauth': { provider: 'antigravity-oauth' },
+    'gemini-4-neon-medium-oauth': { provider: 'antigravity-oauth' },
+    'gemini-4-neon-high-oauth': { provider: 'antigravity-oauth' },
+  };
+  return {
+    ...actual,
+    useAllModels: () => {
+      const base = actual.useAllModels();
+      if (!agSeriesMock.enabled) return base;
+      return {
+        ...base,
+        seriesCatalog: testCatalog,
+        customModels: [],
+        metadata: { ...base.metadata, ...testRawMeta },
+        rawApiResponse: {
+          ...base.rawApiResponse,
+          model_metadata: { ...(base.rawApiResponse?.model_metadata ?? {}), ...testRawMeta },
+        },
+      };
+    },
+  };
+});
+
 vi.mock('@/pages/MarketView/components/MarketChatHistoryButton', () => ({
   default: () => <div data-testid="history-btn" />,
 }));
@@ -195,6 +250,8 @@ vi.mock('@/pages/ChatAgent/components/dalton/TeamSharing', async (importOriginal
 import MarketChatPanel from '../MarketChatPanel';
 import { useChatMessages } from '@/pages/ChatAgent/hooks/useChatMessages';
 import { useThreadModel } from '@/pages/ChatAgent/hooks/useThreadModel';
+// DALTON-HOOK(antigravity-series): import useThreadTuning spy for B7 assertions
+import { useThreadTuning } from '@/pages/ChatAgent/hooks/useThreadTuning';
 import { chartSelectionStore } from '../../stores/chartSelectionStore';
 import { userLocalStorage } from '@/lib/userStorage';
 import type { ComposerSend } from '@/components/ui/chat-input.types';
@@ -978,6 +1035,53 @@ describe('MarketChatPanel', () => {
         const last = team.publisherCalls[team.publisherCalls.length - 1];
         expect(last).toMatchObject({ threadId: 'thread-xyz', canMarkSeen: true });
       });
+    });
+  });
+
+  // DALTON-HOOK(antigravity-series): B7 — forward workspaceId to useThreadModel/useThreadTuning when scoped to a workspace and clear local effort on Antigravity pick
+  describe('shared-workspace guard and Antigravity effort reset (B7)', () => {
+    afterEach(() => {
+      agSeriesMock.enabled = false;
+    });
+
+    it('passes workspaceId to useThreadModel and useThreadTuning when scope !== "all" and null when scope === "all"', () => {
+      vi.mocked(useThreadModel).mockClear();
+      vi.mocked(useThreadTuning).mockClear();
+
+      renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-shared-1' });
+      expect(vi.mocked(useThreadModel)).toHaveBeenLastCalledWith(
+        expect.objectContaining({ chiefOfStaff: false, workspaceId: 'ws-shared-1' }),
+      );
+      expect(vi.mocked(useThreadTuning)).toHaveBeenLastCalledWith(
+        expect.objectContaining({ workspaceId: 'ws-shared-1' }),
+      );
+
+      vi.mocked(useThreadModel).mockClear();
+      vi.mocked(useThreadTuning).mockClear();
+
+      renderPanel(ALL);
+      expect(vi.mocked(useThreadModel)).toHaveBeenLastCalledWith(
+        expect.objectContaining({ chiefOfStaff: true, workspaceId: null }),
+      );
+      expect(vi.mocked(useThreadTuning)).toHaveBeenLastCalledWith(
+        expect.objectContaining({ workspaceId: null }),
+      );
+    });
+
+    it('clears local reasoning effort when switching to an Antigravity variant', () => {
+      agSeriesMock.enabled = true;
+      h.threadId = '__default__';
+      renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
+
+      act(() => {
+        void (ci.props!.onPickReasoningEffort as (effort: string | null) => void)('high');
+      });
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
+
+      act(() => {
+        void (ci.props!.onPickModel as (model: string) => void)('gemini-4-neon-medium-oauth');
+      });
+      expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: null }));
     });
   });
 });

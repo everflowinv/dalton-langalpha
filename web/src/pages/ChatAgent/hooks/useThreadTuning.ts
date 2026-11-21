@@ -2,8 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import type { ThreadTuning } from '@/components/ui/chat-input.types';
-// DALTON-HOOK(antigravity-series): detect shared workspaces to avoid 403 PATCH on tuning changes
-import { useSharedEntry } from '@/hooks/useSharedWorkspaces';
+// DALTON-HOOK(antigravity-series): detect shared/unresolved workspaces to avoid 403 PATCH on tuning changes
+import { useSharedWorkspaces } from '@/hooks/useSharedWorkspaces';
 import type { Thread } from '@/types/api';
 import { threadDetailQuery } from '../utils/threadQueries';
 import { useThreadFieldSave } from './useThreadFieldSave';
@@ -55,9 +55,14 @@ interface UseThreadTuningOptions {
 export function useThreadTuning({ threadId, landing = null, workspaceId = null }: UseThreadTuningOptions) {
   const { t } = useTranslation();
   const liveThreadId = threadId && threadId !== '__default__' ? threadId : null;
-  // DALTON-HOOK(antigravity-series): skip PATCH when workspace is shared or still loading
-  const sharedEntry = useSharedEntry(workspaceId);
-  const skipSave = Boolean(workspaceId) && sharedEntry !== null;
+  // DALTON-HOOK(antigravity-series): skip PATCH when workspace is shared or shared list has not loaded yet (including first-read failure)
+  const sharedWorkspaces = useSharedWorkspaces();
+  const skipSave = Boolean(workspaceId)
+    && sharedWorkspaces.enabled
+    && (
+      sharedWorkspaces.data === undefined
+      || sharedWorkspaces.data.workspaces.some((e) => e.workspace.workspace_id === workspaceId)
+    );
 
   const { data: thread } = useQuery({
     ...threadDetailQuery(liveThreadId ?? ''),
