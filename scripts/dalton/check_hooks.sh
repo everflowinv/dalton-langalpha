@@ -417,7 +417,9 @@ ALLOWED_HOOKS=(
   # and missing-config warnings / prompt guidance.
   "report-delivery"
   # Notification turns without an explicit model inherit the running automation
-  # execution's model in messaging.py without writing conversation_threads.llm_model.
+  # execution's model in messaging.py; automation executor turns persist their
+  # actual model onto conversation_threads.llm_model on turn 0 when NULL and
+  # thread_strategy == 'new' (skipping fallback turns).
   "automation-thread-model"
   # Codex client version comes from src/dalton/settings.py (newer than the manifest's)
   # so the ChatGPT subscription lists new models (GPT-6.2 needs >= 0.170.0).
@@ -447,6 +449,10 @@ ALLOWED_HOOKS=(
   # Preserve server-written dalton_historical_duplicate_of marker in
   # SERVER_OWNED_CONFIG_KEYS across whole-config replacements (workspace.py).
   "historical-duplicate-marker"
+  # SYNC10 (#831): deployment kill switch for the built-in browser — skips
+  # browser_runtime / agent-browser wrapper uploads, browser-quality sync &
+  # endpoint, browser_available, and default sandbox image agent-browser install.
+  "browser-kill-switch"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

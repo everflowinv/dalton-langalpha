@@ -233,7 +233,7 @@ def test_settings_defaults_empty_when_dalton_yaml_missing_and_single_assist_sour
     assert real_settings.models.assist_model != ""
     assert len(settings_mod.get_assist_fallback_models()) >= 1
     assert "ocb-deepseek-deepseek-flash" not in settings_mod.get_assist_fallback_models()
-    assert real_settings.publish.audit_model == "gemini-4-argon-medium-oauth"
+    assert real_settings.publish.audit_model == "gemini-4-neon-medium-oauth"
     assert real_settings.publish.audit_fallback_models == [
         "gpt-6.2-sol-oauth",
         "claude-opus-5-5-oauth",
@@ -250,7 +250,7 @@ def test_settings_defaults_empty_when_dalton_yaml_missing_and_single_assist_sour
     assert not hasattr(real_settings.publish, "extract_model")
 
     sys_defaults = mp_mod.get_dalton_system_defaults()
-    assert sys_defaults["dalton_audit_model"] == "gemini-4-argon-medium-oauth"
+    assert sys_defaults["dalton_audit_model"] == "gemini-4-neon-medium-oauth"
     assert sys_defaults["dalton_audit_fallback_models"] == [
         "gpt-6.2-sol-oauth",
         "claude-opus-5-5-oauth",
@@ -736,7 +736,7 @@ async def test_dalton_pref_shadowed_by_later_custom_model_is_ignored(
 
     # Caller's custom_models also shadows PM-inherited and yaml-inherited models:
     # (a) PM holder's dalton_audit_model ('claude-opus-5-5-oauth') is shadowed by caller's custom_models
-    #     -> skips PM and falls through to yaml ('gemini-4-argon-medium-oauth');
+    #     -> skips PM and falls through to yaml ('gemini-4-neon-medium-oauth');
     #     PM holder's fallback list filters out caller-shadowed entries.
     prefs_by_user["user-member"]["model_preference"] = {
         "custom_models": [
@@ -749,19 +749,19 @@ async def test_dalton_pref_shadowed_by_later_custom_model_is_ignored(
     }
     assert (
         await mp_mod.dalton_model_pref("user-member", "dalton_audit_model")
-        == "gemini-4-argon-medium-oauth"
+        == "gemini-4-neon-medium-oauth"
     )
     assert await mp_mod.dalton_model_pref(
         "user-member", "dalton_audit_fallback_models"
     ) == ["gpt-6.2-sol-oauth"]
 
-    # (b) Both PM holder's model and yaml default ('gemini-4-argon-medium-oauth') are shadowed by
+    # (b) Both PM holder's model and yaml default ('gemini-4-neon-medium-oauth') are shadowed by
     #     caller's custom_models -> returns None / "" and assist_json returns unconfigured_model;
     #     yaml fallback list also filters out caller-shadowed entries.
     prefs_by_user["user-member"]["model_preference"] = {
         "custom_models": [
             {"name": "claude-opus-5-5-oauth", "model_id": "custom-opus"},
-            {"name": "gemini-4-argon-medium-oauth", "model_id": "custom-argon"},
+            {"name": "gemini-4-neon-medium-oauth", "model_id": "custom-neon"},
         ],
     }
     prefs_by_user["user-pm-holder"]["model_preference"] = {

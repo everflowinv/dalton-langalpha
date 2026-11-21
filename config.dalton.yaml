@@ -83,6 +83,14 @@ features:
   # product decision that opens it.
   scratchpad:
     enabled: false
+  # SYNC10 (#831): keep upstream's built-in computer browser off by default.
+  # The kill switch hides the Settings toggle, the agent's browser skill, and
+  # the web Browser tab/menu, makes workspace browser-* routes return
+  # unavailable, and (via DALTON-HOOK(browser-kill-switch)) skips uploading
+  # browser_runtime / agent-browser wrappers and browser-quality sync/route.
+  # Flip to true only after meeting the prerequisites in docs/dalton/OPERATIONS.md.
+  browser:
+    enabled: false
   # Keep upstream teams / shared workspaces / org libraries / org connectors off
   # in Dalton production; Dalton uses colleague sharing instead.
   teams:
