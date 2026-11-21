@@ -184,13 +184,24 @@ async def resume_verdict(job: Mapping[str, Any]) -> OwedResume | NotOwed | NotYe
     if not interrupted and not tasks:
         return NotOwed("nothing the restart stopped is left", wake=False)
     # DALTON-HOOK(automation-subscription-fallback): carry interrupted run's execution link on restart resume
+    # DALTON-HOOK(automation-effort): also read automation_source_execution_id for post-graph wakeup/continuation resumes
+    # (pre-graph pending input above checks only firing-owned automation_execution_id so wakeups recover via /retry)
     meta = state.get("metadata") or {}
-    raw_exec_id = meta.get("automation_execution_id")
+    raw_exec_id = (
+        meta.get("automation_execution_id")
+        or meta.get("automation_source_execution_id")
+    )
     if not raw_exec_id and isinstance(meta.get("automation_delivery"), Mapping):
         raw_exec_id = meta["automation_delivery"].get("id")
     execution_id = str(raw_exec_id).strip() if raw_exec_id else None
+    # DALTON-HOOK(automation-effort): post /retry as the interrupted run's recorded sender so colleague-workspace wakeups pass thread write auth
+    resume_user_id = (
+        str(state["run_user_id"]).strip()
+        if retry_run_id is not None and state.get("run_user_id")
+        else str(state["user_id"])
+    )
     return OwedResume(
-        user_id=str(state["user_id"]),
+        user_id=resume_user_id,
         workspace_id=str(state["workspace_id"]),
         interrupted=interrupted,
         tasks=tuple(tasks),

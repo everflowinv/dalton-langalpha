@@ -27,12 +27,14 @@ async def read_resume_state(thread_id: str, run_id: str) -> Optional[Dict[str, A
     names, under their row names; None when the thread is gone."""
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
+            # DALTON-HOOK(automation-effort): include interrupted run's recorded sender (r.user_id) for /retry in colleague threads
             await cur.execute(
                 """
                 SELECT w.user_id, c.workspace_id,
                        (c.archived_at IS NOT NULL OR w.status = 'deleted') AS no_turn,
                        latest.conversation_response_id AS latest_run_id,
-                       r.status, r.metadata, r.created_at
+                       r.status, r.metadata, r.created_at,
+                       r.user_id AS run_user_id
                 FROM conversation_threads c
                 JOIN workspaces w ON w.workspace_id = c.workspace_id
                 LEFT JOIN LATERAL (

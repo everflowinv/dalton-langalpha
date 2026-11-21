@@ -80,6 +80,27 @@ def agy_models(c, e=None):
     return result
 
 
+def agy_model_efforts(c):
+    """Extract raw reasoning effort suffixes per ``1000 + enum`` from ``gen_metadata``.
+
+    Returns a mapping ``enum -> set[str | None]`` so callers only attach an effort
+    when the DB unambiguously associates a single non-empty effort with that enum.
+    """
+    result=collections.defaultdict(set)
+    if not c.execute("SELECT 1 FROM sqlite_master WHERE name='gen_metadata'").fetchone(): return result
+    for raw, in c.execute('SELECT data FROM gen_metadata'):
+        d=s.wire(raw); meta=s.wire(s.first(d,1,b'')); name=s.first(meta,19,b'').decode()
+        if not name: continue
+        effort=s.extract_antigravity_effort(name)
+        for entry in meta.get(20,[]):
+            kv=s.wire(entry)
+            if s.first(kv,1,b'')!=b'model_enum': continue
+            value=s.first(kv,2,b'').decode()
+            if value.startswith('MODEL_PLACEHOLDER_M') and value[19:].isdigit():
+                result[1000+int(value[19:])].add(effort)
+    return result
+
+
 def project_compressed_transcripts(c, project):
     columns={row[1] for row in c.execute('PRAGMA table_info(transcript_events)')}
     if 'event_zstd' not in columns: return

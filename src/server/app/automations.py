@@ -210,6 +210,11 @@ async def create_automation(
             automation = await handler.create_automation(user_id=user_id, data=request)
     except handler.DeliveryRefused as e:
         return _delivery_refused(e)
+    except handler.AutomationRefusal as e:
+        # DALTON-HOOK(automation-effort): map invalid reasoning_effort refusals to HTTP 422
+        if e.field == "reasoning_effort":
+            raise HTTPException(status_code=422, detail=str(e)) from None
+        raise
     resp = AutomationResponse.model_validate(automation)
     # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
     from src.dalton.notify.dispatch import populate_automation_notify_state
@@ -607,6 +612,9 @@ async def update_automation(
         # DALTON-HOOK(automation-model): allow explicit null llm_model to clear model override
         if "llm_model" in request.model_fields_set and request.llm_model is None:
             fields["llm_model"] = None
+        # DALTON-HOOK(automation-effort): allow explicit null reasoning_effort to clear effort override
+        if "reasoning_effort" in request.model_fields_set and request.reasoning_effort is None:
+            fields["reasoning_effort"] = None
         if report_profile_change is not None:
             # DALTON-HOOK(report-delivery): keep profile, route sync, audit history, and notify slot in one transaction
             from src.dalton.services.report_delivery import (
@@ -665,6 +673,11 @@ async def update_automation(
                 )
     except handler.DeliveryRefused as e:
         return _delivery_refused(e)
+    except handler.AutomationRefusal as e:
+        # DALTON-HOOK(automation-effort): map invalid reasoning_effort refusals to HTTP 422
+        if e.field == "reasoning_effort":
+            raise HTTPException(status_code=422, detail=str(e)) from None
+        raise
     except ValidationError as e:
         # The body parsed, then failed against the stored kind of trigger:
         # a 422 shaped like the one FastAPI answers a bad body with.

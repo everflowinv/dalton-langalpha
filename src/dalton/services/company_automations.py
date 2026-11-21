@@ -254,6 +254,7 @@ ALLOWED_AUTOMATION_SNAPSHOT_FIELDS: tuple[str, ...] = (
     "instruction",
     "workspace_id",
     "llm_model",
+    "reasoning_effort",
     "additional_context",
     "thread_strategy",
     "conversation_thread_id",
@@ -505,6 +506,11 @@ def build_automation_config_snapshot(
         "workspace_id": ws_str,
         "llm_model": (
             str(row["llm_model"]) if row.get("llm_model") is not None else None
+        ),
+        "reasoning_effort": (
+            str(row["reasoning_effort"])
+            if row.get("reasoning_effort") is not None
+            else None
         ),
         "additional_context": add_ctx,
         "thread_strategy": str(row.get("thread_strategy") or "new"),

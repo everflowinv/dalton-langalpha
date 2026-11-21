@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import datetime
+from decimal import Decimal
+import importlib.util
 import json
 import os
 import subprocess
@@ -49,18 +51,83 @@ def resolve_workspace_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def _skill_scripts_dir() -> Path:
-    workspace_dir = resolve_workspace_dir()
-    candidate = workspace_dir / "skills" / "model-usage-cost" / "scripts"
-    if (candidate / "usage_state.py").is_file():
-        return candidate
+REQUIRED_USAGE_SOURCES_SERIES_API_VERSION = 2
+
+
+def _sibling_skill_scripts_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "skills" / "model-usage-cost" / "scripts"
+
+
+def _skill_scripts_dir() -> Path:
+    """Resolve helper scripts dir strictly from the sibling directory matching this script."""
+    return _sibling_skill_scripts_dir()
+
+
+def _load_required_usage_sources(scripts_dir: Path) -> Any:
+    """Load sibling ``usage_sources.py`` only and enforce exact series API version match."""
+    required = (
+        "load_antigravity_series_module",
+        "load_antigravity_series_catalog",
+        "build_antigravity_series_from_overlays",
+        "_parse_antigravity_key",
+    )
+    target = scripts_dir / "usage_sources.py"
+    if not target.is_file():
+        raise RuntimeError(
+            f"找不到同目录匹配版本的 usage_sources.py（期望路径：{target}）；"
+            "本脚本不会回退到其他目录的旧模块，请先运行 scripts/dalton/seed_openclaw_data.sh --apply 同步技能目录，或从完整仓库目录运行。"
+        )
+    existing = sys.modules.get("usage_sources")
+    if existing is not None:
+        existing_file = getattr(existing, "__file__", None)
+        if existing_file and Path(existing_file).resolve() == target.resolve():
+            mod = existing
+        else:
+            spec = importlib.util.spec_from_file_location("_weekly_tracker_usage_sources", target)
+            if spec is None or spec.loader is None:
+                raise RuntimeError(f"无法加载 usage_sources.py：{target}")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+    else:
+        spec = importlib.util.spec_from_file_location("usage_sources", target)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"无法加载 usage_sources.py：{target}")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["usage_sources"] = mod
+        spec.loader.exec_module(mod)
+    missing = [attr for attr in required if not hasattr(mod, attr)]
+    raw_ver = getattr(mod, "USAGE_SOURCES_SERIES_API_VERSION", 0)
+    ver = int(raw_ver) if isinstance(raw_ver, int) and not isinstance(raw_ver, bool) else 0
+    if missing or ver < REQUIRED_USAGE_SOURCES_SERIES_API_VERSION:
+        details: list[str] = []
+        if ver < REQUIRED_USAGE_SOURCES_SERIES_API_VERSION:
+            details.append(f"版本为 {ver}，要求 >= {REQUIRED_USAGE_SOURCES_SERIES_API_VERSION}")
+        if missing:
+            details.append(f"缺少 {', '.join(missing)}")
+        raise RuntimeError(
+            f"usage_sources.py 版本不匹配（{target}：{'；'.join(details)}）；"
+            "请先运行 scripts/dalton/seed_openclaw_data.sh --apply 同步技能目录，或从新版仓库直接运行。"
+        )
+    return mod
 
 
 _SKILL_SCRIPTS_DIR = _skill_scripts_dir()
 if str(_SKILL_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SKILL_SCRIPTS_DIR))
+usage_sources = _load_required_usage_sources(_SKILL_SCRIPTS_DIR)
 from usage_state import resolve_usage_state_dir  # noqa: E402
+
+_ANTIGRAVITY_SERIES_MOD = usage_sources.load_antigravity_series_module()
+REASONING_LEVELS: tuple[str, ...] = tuple(
+    getattr(
+        _ANTIGRAVITY_SERIES_MOD,
+        "REASONING_LEVELS",
+        ("none", "minimal", "low", "medium", "high", "xhigh", "max"),
+    )
+)
+UNKNOWN_EFFORT_BUCKET = "unknown"
+UNKNOWN_EFFORT_LABEL = "档位未知"
+EFFORT_BUCKET_ORDER: tuple[str, ...] = (*REASONING_LEVELS, UNKNOWN_EFFORT_BUCKET)
 
 
 def resolve_state_dir() -> Path:
@@ -93,6 +160,8 @@ def normalize_provider(prov_str: str, model: str = "") -> str:
         return "Anthropic"
     if m.startswith("gemini-"):
         return "Google"
+    if m.startswith("gpt-"):
+        return "OpenAI"
     if m.startswith("muse-"):
         return "Meta"
     if m.startswith("agy-enum-"):
@@ -128,8 +197,225 @@ def _row_record_count(row: dict[str, Any]) -> int:
     return 1 if _is_dalton_prod_row(row) else int(row.get("calls") or 0)
 
 
-def merge_rows_by_model(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """同一厂商同一模型合并为一行。"""
+def resolve_antigravity_series(raw_data: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Resolve Antigravity series catalog from snapshot payload, synced JSON, or repo overlays."""
+    if isinstance(raw_data, dict):
+        embedded = raw_data.get("antigravity_series")
+        if isinstance(embedded, list) and embedded:
+            return [item for item in embedded if isinstance(item, dict)]
+    env_file = (os.environ.get("DALTON_ANTIGRAVITY_SERIES_FILE") or "").strip()
+    if env_file:
+        return usage_sources.load_antigravity_series_catalog(env_file)
+    ws_ref = resolve_workspace_dir() / "skills" / "model-usage-cost" / "references" / "antigravity_series.json"
+    if ws_ref.is_file():
+        return usage_sources.load_antigravity_series_catalog(ws_ref)
+    sibling_ref = _sibling_skill_scripts_dir().parent / "references" / "antigravity_series.json"
+    if sibling_ref.is_file():
+        return usage_sources.load_antigravity_series_catalog(sibling_ref)
+    return usage_sources.load_antigravity_series_catalog()
+
+
+def _series_report_display_name(entry: dict[str, Any]) -> str:
+    prefix = str(entry.get("series_prefix") or "").strip()
+    if prefix.startswith("gemini-"):
+        return str(entry.get("display_name") or prefix)
+    return str(entry.get("qualified_display_name") or entry.get("display_name") or prefix)
+
+
+def build_series_index(series_list: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Build lookup maps for Antigravity series grouping."""
+    by_series_id: dict[str, dict[str, Any]] = {}
+    by_variant_model: dict[str, tuple[dict[str, Any], str]] = {}
+    by_prefix: dict[str, dict[str, Any]] = {}
+    for raw in series_list or []:
+        if not isinstance(raw, dict):
+            continue
+        series_id = str(raw.get("series_id") or "").strip()
+        series_prefix = str(raw.get("series_prefix") or "").strip()
+        if not series_id or not series_prefix:
+            continue
+        info = {
+            "series_id": series_id,
+            "series_prefix": series_prefix,
+            "display_name": str(raw.get("display_name") or series_prefix),
+            "qualified_display_name": str(raw.get("qualified_display_name") or raw.get("display_name") or series_prefix),
+            "report_display_name": _series_report_display_name(raw),
+            "variants": dict(raw.get("variants") or {}),
+        }
+        by_series_id[series_id] = info
+        by_prefix[series_prefix] = info
+        for effort, variant_key in info["variants"].items():
+            if isinstance(variant_key, str) and variant_key.strip():
+                eff_str = str(effort) if str(effort) in REASONING_LEVELS else UNKNOWN_EFFORT_BUCKET
+                by_variant_model[variant_key.strip()] = (info, eff_str)
+    return {
+        "by_series_id": by_series_id,
+        "by_variant_model": by_variant_model,
+        "by_prefix": by_prefix,
+    }
+
+
+def _normalize_effort_bucket(effort: Any) -> str:
+    if isinstance(effort, str):
+        low = effort.strip().lower()
+        if low in REASONING_LEVELS:
+            return low
+    return UNKNOWN_EFFORT_BUCKET
+
+
+def _is_local_antigravity_row(row: dict[str, Any]) -> bool:
+    provider = str(row.get("provider") or "").lower()
+    providers = [str(p).lower() for p in (row.get("providers") or [])]
+    source = str(row.get("source") or "").lower()
+    sources_list = [str(s).lower() for s in (row.get("sources") or [])]
+    if "antigravity" in provider or any("antigravity" in p for p in providers):
+        return True
+    if "agy" in source or any("agy" in s for s in sources_list):
+        return True
+    return False
+
+
+def _match_antigravity_series(
+    row: dict[str, Any],
+    series_index: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Return ``(series_info, effort_bucket)`` if ``row`` belongs to an Antigravity series."""
+    by_series_id: dict[str, dict[str, Any]] = series_index.get("by_series_id") or {}
+    by_variant_model: dict[str, tuple[dict[str, Any], str]] = series_index.get("by_variant_model") or {}
+    by_prefix: dict[str, dict[str, Any]] = series_index.get("by_prefix") or {}
+
+    existing_sid = row.get("series_id")
+    if isinstance(existing_sid, str) and existing_sid.strip():
+        sid = existing_sid.strip()
+        info = by_series_id.get(sid)
+        if info is None:
+            info = {
+                "series_id": sid,
+                "series_prefix": sid.split(":", 1)[-1],
+                "provider": "antigravity-oauth",
+                "report_display_name": str(row.get("model") or sid),
+            }
+        return info, None
+
+    model = str(row.get("model") or "").strip()
+    if not model:
+        return None, None
+
+    # 1. Exact Antigravity variant match (Dalton prod *-oauth suffixed rows)
+    hit = by_variant_model.get(model)
+    if hit is not None:
+        return hit[0], hit[1]
+
+    # 2. Suffixed *-oauth variant of a known Antigravity series (e.g. retired effort);
+    # unsuffixed OAuth models such as Anthropic's `claude-opus-5-5-oauth` have effort=None
+    # and MUST stay independent.
+    if model.endswith("-oauth"):
+        parsed = usage_sources._parse_antigravity_key(model)
+        if parsed is not None and parsed[1] is not None:
+            prefix, eff = parsed
+            info = by_prefix.get(prefix)
+            if info is not None:
+                return info, _normalize_effort_bucket(eff)
+        return None, None
+
+    # 3. Local antigravity-cli-gateway / agy rows (already stripped to base prefix or with effort)
+    if _is_local_antigravity_row(row):
+        row_effort = row.get("effort")
+        info = by_prefix.get(model)
+        if info is not None:
+            return info, _normalize_effort_bucket(row_effort)
+        parsed = usage_sources._parse_antigravity_key(f"{model}-oauth")
+        if parsed is not None:
+            prefix, parsed_eff = parsed
+            info = by_prefix.get(prefix)
+            if info is not None:
+                return info, _normalize_effort_bucket(row_effort or parsed_eff)
+    return None, None
+
+
+def _series_norm_provider(series_info: dict[str, Any]) -> str:
+    """Unify display vendor for a recognized Antigravity series regardless of local/prod source."""
+    return normalize_provider(
+        str(series_info.get("provider") or "antigravity-oauth"),
+        str(series_info.get("series_prefix") or ""),
+    )
+
+
+def _empty_effort_bucket(bucket_name: str) -> dict[str, Any]:
+    return {
+        "effort": bucket_name,
+        "records": 0,
+        "calls": 0,
+        "runs": 0,
+        "fresh": 0,
+        "cache_write": 0,
+        "cache_read": 0,
+        "output": 0,
+        "total_tokens": 0,
+        "prompt_tokens": 0,
+        "cost_usd": None,
+        "_cost_values": [],
+        "unpriced_tokens": 0,
+        "no_public_price": False,
+        "reference_cost_usd": None,
+        "_ref_cost_values": [],
+        "reference_model": None,
+        "price_note": None,
+    }
+
+
+def _accumulate_bucket_fields(
+    bucket: dict[str, Any],
+    src: dict[str, Any],
+    *,
+    records: int,
+    total_tokens: int,
+    prompt_tokens: int,
+    unpriced_tokens: int,
+) -> None:
+    bucket["records"] += records
+    bucket["calls"] += int(src.get("calls") or 0)
+    bucket["runs"] += int(src.get("runs") or 0)
+    bucket["fresh"] += int(src.get("fresh") or 0)
+    bucket["cache_write"] += int(src.get("cache_write") or 0)
+    bucket["cache_read"] += int(src.get("cache_read") or 0)
+    bucket["output"] += int(src.get("output") or 0)
+    bucket["total_tokens"] += total_tokens
+    bucket["prompt_tokens"] += prompt_tokens
+    bucket["unpriced_tokens"] += unpriced_tokens
+    if src.get("cost_usd") is not None:
+        bucket["_cost_values"].append(float(src["cost_usd"]))
+    if src.get("no_public_price"):
+        bucket["no_public_price"] = True
+    if src.get("reference_cost_usd") is not None:
+        bucket["_ref_cost_values"].append(float(src["reference_cost_usd"]))
+    if src.get("reference_model") and not bucket["reference_model"]:
+        bucket["reference_model"] = src["reference_model"]
+    if src.get("price_note") and not bucket["price_note"]:
+        bucket["price_note"] = src["price_note"]
+
+
+def _finalize_bucket_costs(bucket: dict[str, Any]) -> dict[str, Any]:
+    costs = bucket.pop("_cost_values", [])
+    ref_costs = bucket.pop("_ref_cost_values", [])
+    bucket["cost_usd"] = sum(costs) if costs else None
+    bucket["reference_cost_usd"] = sum(ref_costs) if ref_costs else None
+    return bucket
+
+
+def _order_effort_breakdown(breakdown: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    ordered: dict[str, dict[str, Any]] = {}
+    for key in EFFORT_BUCKET_ORDER:
+        if key in breakdown:
+            ordered[key] = _finalize_bucket_costs(breakdown[key])
+    for key in sorted(breakdown):
+        if key not in ordered:
+            ordered[key] = _finalize_bucket_costs(breakdown[key])
+    return ordered
+
+
+def _legacy_merge_rows_by_model(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """原版按 `(norm_provider, model)` 合并路径，仅用于产出与旧版完全一致的合计数字。"""
     merged: dict[tuple[str, str], dict[str, Any]] = {}
     for r in rows:
         key = (r["norm_provider"], r["model"])
@@ -138,8 +424,6 @@ def merge_rows_by_model(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             m = merged[key] = {
                 "norm_provider": r["norm_provider"],
                 "model": r["model"],
-                "providers": [],
-                "sources": [],
                 "records": 0,
                 "calls": 0,
                 "runs": 0,
@@ -152,15 +436,7 @@ def merge_rows_by_model(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "cost_usd": None,
                 "unpriced_tokens": 0,
                 "estimated_split_records": 0,
-                "units": {},
-                "no_public_price": False,
-                "reference_cost_usd": None,
-                "reference_model": None,
-                "price_note": None,
             }
-        for field, value in (("providers", r["provider"]), ("sources", r.get("source"))):
-            if value and value not in m[field]:
-                m[field].append(value)
         m["records"] += _row_record_count(r)
         for field in ("calls", "fresh", "cache_write", "cache_read", "output", "total_tokens", "prompt_tokens"):
             m[field] += int(r.get(field) or 0)
@@ -171,40 +447,179 @@ def merge_rows_by_model(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         )
         if r.get("cost_usd") is not None:
             m["cost_usd"] = (m["cost_usd"] or 0.0) + float(r["cost_usd"])
+    return list(merged.values())
+
+
+def merge_rows_by_model(
+    rows: list[dict[str, Any]],
+    series_index: dict[str, Any] | list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """同一厂商同一模型合并为一行；Antigravity 系列按稳定 series_id 幂等合并并保留档位明细。"""
+    if series_index is None:
+        resolved_index = build_series_index(resolve_antigravity_series())
+    elif isinstance(series_index, list):
+        resolved_index = build_series_index(series_index)
+    else:
+        resolved_index = series_index
+
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for r in rows:
+        fresh = int(r.get("fresh") or 0)
+        cw = int(r.get("cache_write") or 0)
+        cr = int(r.get("cache_read") or 0)
+        out = int(r.get("output") or 0)
+        total_tokens = int(r["total_tokens"]) if "total_tokens" in r else (fresh + cw + cr + out)
+        prompt_tokens = int(r["prompt_tokens"]) if "prompt_tokens" in r else (fresh + cw + cr)
+        unpriced_tokens = int(
+            r.get("unpriced_tokens", total_tokens if r.get("cost_usd") is None else 0)
+        )
+        rec_count = _row_record_count(r)
+
+        series_info, matched_effort = _match_antigravity_series(r, resolved_index)
+        if series_info is not None:
+            norm_provider = _series_norm_provider(series_info)
+            key = (norm_provider, series_info["series_id"])
+            display_model = series_info["report_display_name"]
+        else:
+            norm_provider = r.get("norm_provider") or normalize_provider(
+                str(r.get("provider") or ""), str(r.get("model") or "")
+            )
+            key = (norm_provider, str(r["model"]))
+            display_model = str(r["model"])
+
+        m = merged.get(key)
+        if m is None:
+            m = merged[key] = {
+                "norm_provider": norm_provider,
+                "model": display_model,
+                "providers": [],
+                "sources": [],
+                "records": 0,
+                "calls": 0,
+                "runs": 0,
+                "fresh": 0,
+                "cache_write": 0,
+                "cache_read": 0,
+                "output": 0,
+                "total_tokens": 0,
+                "prompt_tokens": 0,
+                "cost_usd": None,
+                "_cost_values": [],
+                "unpriced_tokens": 0,
+                "estimated_split_records": 0,
+                "units": {},
+                "no_public_price": False,
+                "reference_cost_usd": None,
+                "_ref_cost_values": [],
+                "reference_model": None,
+                "price_note": None,
+            }
+            if series_info is not None:
+                m["series_id"] = series_info["series_id"]
+                m["effort_breakdown"] = {}
+
+        row_providers = (
+            r["providers"]
+            if isinstance(r.get("providers"), list) and r["providers"]
+            else ([r["provider"]] if r.get("provider") else [])
+        )
+        for value in row_providers:
+            if value and value not in m["providers"]:
+                m["providers"].append(value)
+        row_sources = (
+            r["sources"]
+            if isinstance(r.get("sources"), list) and r["sources"]
+            else ([r["source"]] if r.get("source") else [])
+        )
+        for value in row_sources:
+            if value and value not in m["sources"]:
+                m["sources"].append(value)
+
+        m["records"] += rec_count
+        m["calls"] += int(r.get("calls") or 0)
+        m["runs"] += int(r.get("runs") or 0)
+        m["fresh"] += fresh
+        m["cache_write"] += cw
+        m["cache_read"] += cr
+        m["output"] += out
+        m["total_tokens"] += total_tokens
+        m["prompt_tokens"] += prompt_tokens
+        m["estimated_split_records"] += int(r.get("estimated_split_records") or 0)
+        m["unpriced_tokens"] += unpriced_tokens
+        if r.get("cost_usd") is not None:
+            m["_cost_values"].append(float(r["cost_usd"]))
         if r.get("no_public_price"):
             m["no_public_price"] = True
         if r.get("reference_cost_usd") is not None:
-            m["reference_cost_usd"] = (m["reference_cost_usd"] or 0.0) + float(r["reference_cost_usd"])
+            m["_ref_cost_values"].append(float(r["reference_cost_usd"]))
         if r.get("reference_model") and not m["reference_model"]:
             m["reference_model"] = r["reference_model"]
         if r.get("price_note") and not m["price_note"]:
             m["price_note"] = r["price_note"]
-        for unit, count in r.get("units", {}).items():
+        for unit, count in (r.get("units") or {}).items():
             m["units"][unit] = m["units"].get(unit, 0) + count
+
+        if series_info is not None:
+            existing_bd = r.get("effort_breakdown")
+            if isinstance(existing_bd, dict) and existing_bd:
+                for raw_bk, raw_bv in existing_bd.items():
+                    if not isinstance(raw_bv, dict):
+                        continue
+                    bk = _normalize_effort_bucket(raw_bk)
+                    bucket = m["effort_breakdown"].setdefault(bk, _empty_effort_bucket(bk))
+                    b_fresh = int(raw_bv.get("fresh") or 0)
+                    b_cw = int(raw_bv.get("cache_write") or 0)
+                    b_cr = int(raw_bv.get("cache_read") or 0)
+                    b_out = int(raw_bv.get("output") or 0)
+                    b_total = int(raw_bv["total_tokens"]) if "total_tokens" in raw_bv else (b_fresh + b_cw + b_cr + b_out)
+                    b_prompt = int(raw_bv["prompt_tokens"]) if "prompt_tokens" in raw_bv else (b_fresh + b_cw + b_cr)
+                    b_unpriced = int(
+                        raw_bv.get("unpriced_tokens", b_total if raw_bv.get("cost_usd") is None else 0)
+                    )
+                    _accumulate_bucket_fields(
+                        bucket,
+                        raw_bv,
+                        records=int(raw_bv.get("records") or 0),
+                        total_tokens=b_total,
+                        prompt_tokens=b_prompt,
+                        unpriced_tokens=b_unpriced,
+                    )
+            else:
+                bk = _normalize_effort_bucket(matched_effort if matched_effort is not None else r.get("effort"))
+                bucket = m["effort_breakdown"].setdefault(bk, _empty_effort_bucket(bk))
+                _accumulate_bucket_fields(
+                    bucket,
+                    r,
+                    records=rec_count,
+                    total_tokens=total_tokens,
+                    prompt_tokens=prompt_tokens,
+                    unpriced_tokens=unpriced_tokens,
+                )
+
     for m in merged.values():
         m["provider"] = "+".join(m["providers"])
         m["source"] = "|".join(m["sources"])
+        costs = m.pop("_cost_values", [])
+        ref_costs = m.pop("_ref_cost_values", [])
+        m["cost_usd"] = sum(costs) if costs else None
+        m["reference_cost_usd"] = sum(ref_costs) if ref_costs else None
+        if "effort_breakdown" in m:
+            m["effort_breakdown"] = _order_effort_breakdown(m["effort_breakdown"])
     return list(merged.values())
 
 
 def fetch_usage_data(days: int = 7, as_of: str | None = None) -> dict[str, Any]:
-    """通过 model-usage-cost skill 获取过去 N 天的汇总数据。"""
-    workspace_dir = resolve_workspace_dir()
-    skill_dir = workspace_dir / "skills" / "model-usage-cost" / "scripts"
-    cli_py = skill_dir / "model_usage_cost_cli.py"
-    run_sh = skill_dir / "run.sh"
-    if not cli_py.is_file():
-        local_cli = Path(__file__).resolve().parent.parent / "skills" / "model-usage-cost" / "scripts" / "model_usage_cost_cli.py"
-        if local_cli.is_file():
-            cli_py = local_cli
-            run_sh = local_cli.parent / "run.sh"
+    """通过同目录 model-usage-cost skill 获取过去 N 天的汇总数据。"""
+    sibling_dir = _sibling_skill_scripts_dir()
+    cli_py = sibling_dir / "model_usage_cost_cli.py"
+    run_sh = sibling_dir / "run.sh"
 
     if cli_py.is_file():
         cmd = [sys.executable, str(cli_py), "--json", "summary", "--days", str(days), "--by-model"]
     elif run_sh.is_file():
         cmd = ["bash", str(run_sh), "--json", "summary", "--days", str(days), "--by-model"]
     else:
-        raise FileNotFoundError("找不到 model-usage-cost 统计脚本")
+        raise FileNotFoundError(f"找不到同目录的 model-usage-cost 统计脚本：{sibling_dir}")
 
     if as_of:
         cmd += ["--as-of", as_of]
@@ -261,7 +676,7 @@ def process_usage_stats(raw_data: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("模型行被裁剪，停止生成不完整周报")
     from_iso = window["from"]
     to_iso = window["to"]
-    raw_rows = window["rows"]
+    raw_rows = [dict(r) for r in window["rows"]]
 
     for r in raw_rows:
         r["total_tokens"] = r["fresh"] + r["cache_write"] + r["cache_read"] + r["output"]
@@ -289,20 +704,20 @@ def process_usage_stats(raw_data: dict[str, Any]) -> dict[str, Any]:
     dalton_bucket["runs"] = int(dalton_prod.get("runs") or 0)
     dalton_bucket["api_calls"] = int(dalton_prod.get("calls") or dalton_bucket["calls"])
 
-    rows = merge_rows_by_model(raw_rows)
-    rows_by_tokens = sorted(rows, key=lambda x: -x["total_tokens"])
-
-    total_fresh = sum(r["fresh"] for r in rows)
-    total_cw = sum(r["cache_write"] for r in rows)
-    total_cr = sum(r["cache_read"] for r in rows)
-    total_out = sum(r["output"] for r in rows)
+    # 所有合计字段严格沿用旧版未按系列合并的累加路径，保证与旧版逐字段完全相等；
+    # 系列合并与档位明细仅用于展示分组，不回写合计。
+    legacy_rows = _legacy_merge_rows_by_model(raw_rows)
+    total_fresh = sum(r["fresh"] for r in legacy_rows)
+    total_cw = sum(r["cache_write"] for r in legacy_rows)
+    total_cr = sum(r["cache_read"] for r in legacy_rows)
+    total_out = sum(r["output"] for r in legacy_rows)
     total_tokens = total_fresh + total_cw + total_cr + total_out
     total_prompt = total_fresh + total_cw + total_cr
-    total_records = sum(r["records"] for r in rows)
-    total_calls = sum(r["calls"] for r in rows)
-    total_cost = sum((r["cost_usd"] or 0.0) for r in rows)
-    unpriced_tokens = sum(r["unpriced_tokens"] for r in rows)
-    estimated_split_records = sum(r["estimated_split_records"] for r in rows)
+    total_records = sum(r["records"] for r in legacy_rows)
+    total_calls = sum(r["calls"] for r in legacy_rows)
+    total_cost = sum((r["cost_usd"] or 0.0) for r in legacy_rows)
+    unpriced_tokens = sum(r["unpriced_tokens"] for r in legacy_rows)
+    estimated_split_records = sum(r["estimated_split_records"] for r in legacy_rows)
     cache_hit_rate = (total_cr / total_prompt * 100) if total_prompt > 0 else 0.0
 
     expected = window.get("totals")
@@ -313,6 +728,10 @@ def process_usage_stats(raw_data: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("周报调用次数与计量总表不一致")
         if abs(total_cost - expected["priced_cost_usd"]) > 0.0001 or unpriced_tokens != expected["unpriced_tokens"]:
             raise ValueError("周报价格聚合与计量总表不一致")
+
+    series_index = build_series_index(resolve_antigravity_series(raw_data))
+    rows = merge_rows_by_model(raw_rows, series_index)
+    rows_by_tokens = sorted(rows, key=lambda x: -x["total_tokens"])
 
     prov_rollup: dict[str, dict[str, Any]] = {}
     for r in rows:
@@ -541,6 +960,97 @@ def _format_effective_notes(price_catalog: dict[str, Any]) -> list[str]:
     return notes
 
 
+def _displayed_cents(val: float) -> int:
+    """Return the exact integer cents rendered by ``format_usd(val)``."""
+    rendered = format_usd(val).lstrip("$").replace(",", "")
+    return int((Decimal(rendered) * 100).to_integral_exact())
+
+
+def _allocate_display_cents(
+    target_usd: float,
+    ordered_buckets: list[tuple[str, dict[str, Any]]],
+    rank_map: dict[str, int],
+) -> dict[str, int]:
+    """Allocate the series row's displayed cents across priced effort buckets so their sum equals the series row."""
+    priced = [
+        (bk, Decimal(str(float(bv["cost_usd"]))) * 100, int(bv.get("total_tokens") or 0), rank_map.get(bk, len(EFFORT_BUCKET_ORDER)))
+        for bk, bv in ordered_buckets
+        if isinstance(bv, dict) and bv.get("cost_usd") is not None
+    ]
+    if not priced:
+        return {}
+    target_cents = _displayed_cents(target_usd)
+    floors = {bk: max(0, int(raw_c)) for bk, raw_c, _, _ in priced}
+    diff = target_cents - sum(floors.values())
+    if diff > 0:
+        order = sorted(priced, key=lambda it: (-(it[1] - floors[it[0]]), -it[1], -it[2], it[3]))
+        for idx in range(diff):
+            floors[order[idx % len(order)][0]] += 1
+    elif diff < 0:
+        need = -diff
+        while need > 0:
+            pos = [it for it in priced if floors[it[0]] > 0]
+            if not pos:
+                break
+            order = sorted(pos, key=lambda it: ((it[1] - floors[it[0]]), it[1], it[2], -it[3]))
+            for it in order:
+                if need <= 0:
+                    break
+                floors[it[0]] -= 1
+                need -= 1
+    return floors
+
+
+def _format_effort_breakdown_line(
+    effort_breakdown: dict[str, Any] | None,
+    *,
+    series_cost_usd: float | None = None,
+) -> str | None:
+    """Format per-effort breakdown for Antigravity series rows on the Feishu card."""
+    if not isinstance(effort_breakdown, dict) or not effort_breakdown:
+        return None
+    rank_map = {lvl: idx for idx, lvl in enumerate(EFFORT_BUCKET_ORDER)}
+
+    def _sort_key(item: tuple[str, Any]) -> tuple[int, int, int]:
+        bk, bv = item
+        is_unknown = 1 if bk == UNKNOWN_EFFORT_BUCKET else 0
+        toks = int(bv.get("total_tokens") or 0) if isinstance(bv, dict) else 0
+        return (is_unknown, -toks, rank_map.get(bk, len(EFFORT_BUCKET_ORDER)))
+
+    ordered_buckets = sorted(effort_breakdown.items(), key=_sort_key)
+    allocated_cents = (
+        _allocate_display_cents(series_cost_usd, ordered_buckets, rank_map)
+        if series_cost_usd is not None
+        else {}
+    )
+
+    parts: list[str] = []
+    for bk, bv in ordered_buckets:
+        if not isinstance(bv, dict):
+            continue
+        label = UNKNOWN_EFFORT_LABEL if bk == UNKNOWN_EFFORT_BUCKET else bk
+        tok_str = format_tokens(int(bv.get("total_tokens") or 0))
+        calls = int(bv.get("calls") or 0)
+        cost_val = bv.get("cost_usd")
+        unpriced = int(bv.get("unpriced_tokens") or 0)
+        ref_cost = bv.get("reference_cost_usd")
+        if cost_val is not None:
+            if bk in allocated_cents:
+                cost_part = f"${Decimal(allocated_cents[bk]) / Decimal(100):,.2f}"
+            else:
+                cost_part = format_usd(float(cost_val))
+            if unpriced > 0:
+                cost_part += f"，另 {format_tokens(unpriced)} 无公开价"
+        elif ref_cost is not None:
+            cost_part = f"无公开价，参考 {format_usd(float(ref_cost))}"
+        else:
+            cost_part = "无公开价"
+        parts.append(f"{label} {tok_str} ({calls:,} 次, {cost_part})")
+    if not parts:
+        return None
+    return "· 档位明细: " + " ｜ ".join(parts)
+
+
 def build_card(stats: dict[str, Any]) -> dict[str, Any]:
     """构造飞书 Card Schema 2.0 卡片。"""
     try:
@@ -701,6 +1211,9 @@ def build_card(stats: dict[str, Any]) -> dict[str, Any]:
             f"<font color='grey'>· 参考成本: {cost_disp} ｜ 调用: {calls:,} 次</font>\n"
             f"<font color='grey'>· 构成拆分: 缓存读取 {cr_str} ｜ 缓存写入 {format_tokens(r['cache_write'])} ｜ 新增 {fresh_str} ｜ 输出 {out_str}</font>"
         )
+        effort_line = _format_effort_breakdown_line(r.get("effort_breakdown"), series_cost_usd=cost_val)
+        if effort_line:
+            item_text += f"\n<font color='grey'>{effort_line}</font>"
         elements.append({"tag": "markdown", "content": item_text})
 
     # 4. 长尾模型折叠面板
@@ -714,9 +1227,13 @@ def build_card(stats: dict[str, Any]) -> dict[str, Any]:
             cost_str = format_usd(r["cost_usd"])
             if r["cost_usd"] is None and r.get("reference_cost_usd") is not None:
                 cost_str = f"无公开价（参考 {format_usd(r['reference_cost_usd'])}）"
-            tail_lines.append(
+            tail_line = (
                 f"**{idx}. {model}** <font color='grey'>({prov})</font>: {tok_str} Tokens ｜ {cost_str} ｜ {r['calls']:,} 次调用"
             )
+            effort_line = _format_effort_breakdown_line(r.get("effort_breakdown"), series_cost_usd=r["cost_usd"])
+            if effort_line:
+                tail_line += f"\n<font color='grey'>  {effort_line}</font>"
+            tail_lines.append(tail_line)
 
         tail_summary = (
             f"**其余 {len(stats['tail'])} 个长尾模型（点击展开）** "

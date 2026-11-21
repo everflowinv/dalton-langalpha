@@ -530,4 +530,11 @@ web/src/pages/Setup/answers/daltonTeamModelsCheck.ts
 web/src/pages/Setup/answers/useTeamModelsAvailable.ts
 # Execution delivery status frontend tests (completed + delivery failed / partial / retrying / delivered / none).
 web/src/pages/Automations/__tests__/Automations.executionDeliveryStatus.test.tsx
+# Per-automation reasoning_effort (d042), Opus backfill ops script, and unit tests
+src/dalton/migrations/versions/d042_automation_reasoning_effort.py
+scripts/dalton/ops/backfill_opus_automation_effort.py
+tests/unit/dalton/test_d042_automation_reasoning_effort.py
+tests/unit/dalton/test_automation_reasoning_effort.py
+tests/unit/dalton/test_automation_effort_inheritance.py
+tests/unit/dalton/test_backfill_opus_automation_effort.py
 web/src/pages/Setup/answers/__tests__/daltonTeamModelsCheck.test.ts

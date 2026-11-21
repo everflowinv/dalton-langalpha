@@ -69,4 +69,50 @@ describe('useMessageActionBundles: the Publish entry follows the caller', () => 
     expect(readOnly.result.current.messageActions.onPublishFile).toBeUndefined();
     expect(readOnly.result.current.subagentMessageActions.onPublishFile).toBeUndefined();
   });
+
+  // DALTON-HOOK(automation-effort): retry reads getRetryModelOptions so saved composer effort is not auto-sent
+  it('uses getRetryModelOptions for onRetry so saved composer effort is omitted unless explicitly picked', () => {
+    const onRetry = vi.fn();
+    const getModelOptions = vi.fn(() => ({
+      model: 'claude-opus-5-5-oauth',
+      reasoningEffort: 'low',
+      fastMode: false,
+    }));
+    const getRetryModelOptions = vi.fn(() => ({
+      model: 'claude-opus-5-5-oauth',
+      reasoningEffort: null,
+      fastMode: false,
+    }));
+    const { result } = renderHook(() =>
+      useMessageActionBundles(
+        sources({
+          onRetry,
+          chatInputRef: {
+            current: {
+              getModelOptions,
+              getRetryModelOptions,
+              addContext: noop,
+              addWidgetSnapshot: () => false,
+              setValue: noop,
+              giveBack: noop,
+              send: () => false,
+              holdsSend: () => false,
+              getAttachmentCount: () => 0,
+              focus: noop,
+            },
+          },
+        }),
+      ),
+    );
+
+    // DALTON-HOOK(automation-effort): verify retry forwards getRetryModelOptions result without saved effort
+    result.current.messageActions.onRetry?.();
+    expect(getRetryModelOptions).toHaveBeenCalledOnce();
+    expect(getModelOptions).not.toHaveBeenCalled();
+    expect(onRetry).toHaveBeenCalledWith({
+      model: 'claude-opus-5-5-oauth',
+      reasoningEffort: null,
+      fastMode: false,
+    });
+  });
 });

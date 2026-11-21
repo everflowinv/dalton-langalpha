@@ -463,6 +463,9 @@ ALLOWED_HOOKS=(
   # Surface terminal/partial/retrying delivery outcomes on completed executions
   # in execution history, detail, CoS activity, ThreadStatus, and automation state files.
   "execution-delivery-status"
+  # Per-automation reasoning_effort field (d042), shared write/snapshot/file paths,
+  # executor/continuation/wakeup/fallback inheritance, and MoreOptions effort selector.
+  "automation-effort"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
