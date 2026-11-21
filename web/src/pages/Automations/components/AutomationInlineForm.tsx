@@ -87,7 +87,8 @@ export default function AutomationInlineForm({
 
   const patch: FormPatch = (key, value) => {
     if (key === 'delivery_methods') setRefused([]);
-    if (key === 'llm_model') setModelError(null);
+    // DALTON-HOOK(automation-effort): clear model/effort refusal banner when either changes
+    if (key === 'llm_model' || key === 'reasoning_effort') setModelError(null);
     setForm((f) => ({ ...f, [key]: value }));
   };
 
@@ -132,13 +133,18 @@ export default function AutomationInlineForm({
         return;
       }
       // DALTON-HOOK(automation-model): surface unavailable model error on the form
+      // DALTON-HOOK(automation-effort): also surface reasoning_effort refusal on the form
       const detail = apiErrorDetail(err);
       const detailField =
         detail && typeof detail === 'object' && !Array.isArray(detail)
           ? (detail as { field?: unknown }).field
           : undefined;
       const message = mutationErrorMessage(err, '');
-      if (detailField === 'llm_model' || /\bmodel\b|模型/i.test(message)) {
+      if (
+        detailField === 'llm_model' ||
+        detailField === 'reasoning_effort' ||
+        /\bmodel\b|模型|reasoning_effort|思考强度/i.test(message)
+      ) {
         setModelError(message || t('automation.actionFailed'));
         setMoreOpen(true);
       }
@@ -187,7 +193,9 @@ export default function AutomationInlineForm({
             deliveryAttempts={opened.automation?.last_execution?.delivery_result}
             deliveryProblems={refused}
             // DALTON-HOOK(automation-model): pass server model error to MoreOptions
+            // DALTON-HOOK(automation-effort): pass isEdit so create vs edit effort defaults behave distinctly
             modelError={modelError}
+            isEdit={isEdit}
             omitDelivery={omitDelivery}
           />
         </div>

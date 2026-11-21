@@ -523,4 +523,51 @@ describe('an edit of each template', () => {
       expect(cleared).toHaveProperty('llm_model', null);
     });
   });
+
+  // DALTON-HOOK(automation-effort): unit tests for reasoning_effort in form state and payloads
+  describe('reasoning_effort in form state and payloads', () => {
+    it('defaults to null in INITIAL_FORM and includes reasoning_effort on create only when set', () => {
+      expect(INITIAL_FORM.reasoning_effort).toBeNull();
+      expect(formStateToPayload(PLACED, HOME)).not.toHaveProperty('reasoning_effort');
+
+      const withEffort = formStateToPayload(
+        { ...PLACED, llm_model: 'claude-opus-5-5-oauth', reasoning_effort: 'high' },
+        HOME,
+      );
+      expect(withEffort.reasoning_effort).toBe('high');
+    });
+
+    it('omits reasoning_effort when untouched on edit and sends explicit null when cleared', () => {
+      const saved = makeAutomation({
+        llm_model: 'claude-opus-5-5-oauth',
+        reasoning_effort: 'high',
+      });
+      const initial = automationToFormState(saved, 'UTC');
+      expect(initial.reasoning_effort).toBe('high');
+
+      const untouched = formStateToUpdatePayload(
+        { ...initial, name: 'Renamed' },
+        initial,
+        saved,
+        initial.place,
+      );
+      expect(untouched).not.toHaveProperty('reasoning_effort');
+
+      const changed = formStateToUpdatePayload(
+        { ...initial, reasoning_effort: 'low' },
+        initial,
+        saved,
+        initial.place,
+      );
+      expect(changed).toHaveProperty('reasoning_effort', 'low');
+
+      const cleared = formStateToUpdatePayload(
+        { ...initial, reasoning_effort: null },
+        initial,
+        saved,
+        initial.place,
+      );
+      expect(cleared).toHaveProperty('reasoning_effort', null);
+    });
+  });
 });

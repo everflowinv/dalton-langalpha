@@ -975,10 +975,15 @@ class AutomationExecutor:
                 run_metadata["workspace_owner_id"] = firing.workspace_owner_id
                 run_metadata["origin_channel"] = "web"
                 extra_configurable["workspace_owner_id"] = firing.workspace_owner_id
+            # DALTON-HOOK(automation-effort): stamp two-state reasoning_effort on first-turn run metadata
+            # and forward automation reasoning_effort into ChatRequest.
+            run_metadata["automation_reasoning_effort_configured"] = True
+            run_metadata["automation_reasoning_effort"] = automation.get("reasoning_effort")
             request = ChatRequest(
                 workspace_id=firing.workspace_id,
                 messages=[ChatMessage(role="user", content=instruction)],
                 llm_model=automation.get("llm_model"),
+                reasoning_effort=automation.get("reasoning_effort"),
                 additional_context=additional_context,
                 origin=ThreadOrigin(
                     type="automation",

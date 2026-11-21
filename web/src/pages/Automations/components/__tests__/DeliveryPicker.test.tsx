@@ -1007,4 +1007,135 @@ describe('model selection in MoreOptions and AutomationInlineForm', () => {
       payload: { llm_model: 'gemini-4-neon-high-oauth' },
     });
   });
+
+  // DALTON-HOOK(automation-effort): non-Antigravity effort dropdown saves/clears and Antigravity hides/clears it
+  it('shows reasoning effort dropdown for non-Antigravity models, defaults to medium on create, clears on Antigravity switch, and preserves untouched null on edit', async () => {
+    const { buildSeriesCatalog } = await import('@/lib/antigravitySeries');
+    const mixedMeta: Record<string, ModelMetadataEntry> = {
+      'claude-opus-5-5-oauth': {
+        display_name: 'Claude Opus 5.5',
+        provider: 'claude-oauth',
+        reasoning_efforts: ['low', 'medium', 'high', 'max'],
+        reasoning_effort_default: 'high',
+      },
+      'gemini-4-neon-high-oauth': {
+        display_name: 'Gemini 4 Neon (High)',
+        provider: 'antigravity-oauth',
+      },
+      'gemini-4-neon-medium-oauth': {
+        display_name: 'Gemini 4 Neon (Medium)',
+        provider: 'antigravity-oauth',
+      },
+    };
+    const seriesCatalog = buildSeriesCatalog([
+      {
+        series_id: 'antigravity-oauth:gemini-4-neon',
+        series_prefix: 'gemini-4-neon',
+        provider: 'antigravity-oauth',
+        display_name: 'Gemini 4 Neon',
+        qualified_display_name: 'Gemini 4 Neon (Antigravity)',
+        default_effort: 'high',
+        default_model: 'gemini-4-neon-high-oauth',
+        efforts: ['medium', 'high'],
+        variants: {
+          medium: 'gemini-4-neon-medium-oauth',
+          high: 'gemini-4-neon-high-oauth',
+        },
+      },
+    ]);
+    allModelsMock.current = {
+      models: {
+        'claude-oauth': {
+          display_name: 'Claude',
+          models: ['claude-opus-5-5-oauth'],
+        },
+        'antigravity-oauth': {
+          display_name: 'Google Antigravity',
+          models: ['gemini-4-neon-medium-oauth', 'gemini-4-neon-high-oauth'],
+        },
+      },
+      lockedModels: {},
+      keylessModels: new Set(),
+      metadata: mixedMeta,
+      payers: {},
+      isLoading: false,
+      rawApiResponse: { model_metadata: mixedMeta },
+      isLoaded: true,
+      seriesCatalog,
+      customModels: [],
+    };
+    serve();
+
+    // 1. Create mode: picking non-Antigravity multi-tier model defaults effort to 'medium' and allows changing to 'high'
+    const createSubs: FormSubmission[] = [];
+    const { unmount } = renderWithProviders(
+      <AutomationInlineForm
+        initialValues={{
+          ...INITIAL_FORM,
+          name: 'Opus Brief',
+          instruction: 'Check markets.',
+          place: 'ws-1',
+        }}
+        original={null}
+        onSubmit={(sub) => {
+          createSubs.push(sub);
+        }}
+        onCancel={vi.fn()}
+        loading={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(label('automation.moreOptions')) }));
+    const modelSelect = screen.getByLabelText(label('automation.detailModel')) as HTMLSelectElement;
+    fireEvent.change(modelSelect, { target: { value: 'claude-opus-5-5-oauth' } });
+
+    const effortSelect = screen.getByLabelText(label('chat.modelSelector.reasoningEffort')) as HTMLSelectElement;
+    expect(effortSelect.value).toBe('medium');
+
+    fireEvent.change(effortSelect, { target: { value: 'high' } });
+    fireEvent.click(screen.getByRole('button', { name: label('common.create') }));
+    await waitFor(() => expect(createSubs).toHaveLength(1));
+    expect(createSubs[0]).toMatchObject({
+      kind: 'create',
+      payload: { llm_model: 'claude-opus-5-5-oauth', reasoning_effort: 'high' },
+    });
+
+    // Switching to Antigravity hides standalone effort dropdown and clears reasoning_effort
+    fireEvent.change(modelSelect, { target: { value: 'gemini-4-neon-high-oauth' } });
+    expect(screen.queryByLabelText(label('chat.modelSelector.reasoningEffort'))).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: label('common.create') }));
+    await waitFor(() => expect(createSubs).toHaveLength(2));
+    expect(createSubs[1].payload.llm_model).toBe('gemini-4-neon-high-oauth');
+    expect(createSubs[1].payload).not.toHaveProperty('reasoning_effort');
+    unmount();
+
+    // 2. Edit mode: saved null stays omitted when untouched, and switching to Antigravity clears stored 'high' to null
+    const savedOpus: Automation = {
+      ...SAVED_AUTOMATION,
+      llm_model: 'claude-opus-5-5-oauth',
+      reasoning_effort: 'high',
+    };
+    const editSubs: FormSubmission[] = [];
+    renderWithProviders(
+      <AutomationInlineForm
+        initialValues={automationToFormState(savedOpus, 'America/New_York', 'home-1')}
+        original={savedOpus}
+        onSubmit={(sub) => {
+          editSubs.push(sub);
+        }}
+        onCancel={vi.fn()}
+        loading={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(label('automation.moreOptions')) }));
+    const editModel = screen.getByLabelText(label('automation.detailModel')) as HTMLSelectElement;
+    fireEvent.change(editModel, { target: { value: 'gemini-4-neon-high-oauth' } });
+    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+    await waitFor(() => expect(editSubs).toHaveLength(1));
+    expect(editSubs[0]).toMatchObject({
+      kind: 'edit',
+      payload: { llm_model: 'gemini-4-neon-high-oauth', reasoning_effort: null },
+    });
+  });
 });

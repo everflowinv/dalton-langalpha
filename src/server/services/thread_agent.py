@@ -30,6 +30,10 @@ if TYPE_CHECKING:
     from src.server.services.turn_runtime import TurnRoute
 
 
+# DALTON-HOOK(automation-effort): sentinel distinguishing omitted vs explicit reasoning_effort_override
+_UNSET_EFFORT: Any = object()
+
+
 def thread_resolver(
     user_id: str,
     thread_id: str,
@@ -41,7 +45,7 @@ def thread_resolver(
     reasoning_effort: str | None = None,
     fast_mode: bool | None = None,
     enabled_subagents: list[str] | None = None,
-) -> Callable[[str | None], Awaitable[AgentConfig]]:
+) -> Callable[..., Awaitable[AgentConfig]]:
     """Maps a model name (None for the account default) to the config a turn
     on the thread runs it under, in the route's workspace and role.
 
@@ -58,13 +62,22 @@ def thread_resolver(
     effort = reasoning_effort or row.get("reasoning_effort")
     fast = fast_mode if fast_mode is not None else row.get("fast_mode")
 
-    async def resolve(model: str | None) -> AgentConfig:
+    async def resolve(
+        model: str | None,
+        *,
+        reasoning_effort_override: Any = _UNSET_EFFORT,  # DALTON-HOOK(automation-effort)
+    ) -> AgentConfig:
+        effective_effort = (
+            effort
+            if reasoning_effort_override is _UNSET_EFFORT
+            else reasoning_effort_override
+        )
         return await resolve_llm_config(
             setup.agent_config,
             user_id,
             model,
             is_byok,
-            reasoning_effort=effort,
+            reasoning_effort=effective_effort,
             fast_mode=fast,
             thread_id=thread_id,
             enabled_subagents=enabled_subagents,

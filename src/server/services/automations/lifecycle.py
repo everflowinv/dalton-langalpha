@@ -334,16 +334,16 @@ async def _claude_code_default_for(user_id: str, workspace_id: str, pref: dict[s
     return name if name and is_claude_code_model(name) else None
 
 
-async def check_model(user_id: str, name: str, pref: dict[str, Any] | None) -> None:
+async def check_model(user_id: str, name: str, pref: dict[str, Any] | None) -> tuple[str, dict[str, Any]]:
     """Refuse a model the run would reject: an unknown name fails every
     firing until the automation is disabled."""
     if pref is None:
         pref = await user_models.get_model_preference(user_id)
-    source, _ = await user_models.classify_model(user_id, name, _pref_cache=pref)
+    source, entry = await user_models.classify_model(user_id, name, _pref_cache=pref)
     if source != user_models.ModelSource.UNKNOWN:
-        return
+        return source, entry if isinstance(entry, dict) else {}
     if await user_models.get_custom_provider_config(user_id, name, _pref_cache=pref):
-        return
+        return user_models.ModelSource.CUSTOM, {}
     names = [
         *sorted(custom_model_names(pref)),
         *sorted(n for group in get_configured_llm_models().values() for n in group),
@@ -352,6 +352,179 @@ async def check_model(user_id: str, name: str, pref: dict[str, Any] | None) -> N
         f"unknown model {name!r}; use null for the user's default, or one of: {', '.join(names)}",
         field="llm_model",
     )
+
+
+# DALTON-HOOK(automation-effort): shared reasoning_effort validation, defaults, and Antigravity normalization
+async def _safe_model_pref(user_id: str, pref: dict[str, Any] | None) -> dict[str, Any]:
+    if pref is not None:
+        return pref
+    try:
+        loaded = await user_models.get_model_preference(user_id)
+        return loaded if isinstance(loaded, dict) else {}
+    except RuntimeError as exc:
+        if "pool" in str(exc).lower():
+            return {}
+        raise
+
+
+def _effective_reasoning_ladder(
+    target_model: str,
+    source: str,
+    entry: Mapping[str, Any] | None,
+) -> tuple[tuple[str, ...], str | None]:
+    from src.llms.llm import LLM as LLMFactory
+    from src.llms.model_spec import (
+        canonical_reasoning_efforts,
+        default_reasoning_effort,
+        reasoning_block,
+        with_inherited_declarations,
+    )
+
+    resolved_entry: Mapping[str, Any] = entry if isinstance(entry, Mapping) else {}
+    if source == user_models.ModelSource.CUSTOM:
+        try:
+            builtin = LLMFactory.get_model_config().get_model_config(target_model)
+        except Exception:
+            builtin = None
+        if isinstance(builtin, Mapping):
+            resolved_entry = with_inherited_declarations(dict(resolved_entry), dict(builtin))
+    block = reasoning_block(dict(resolved_entry))
+    efforts = canonical_reasoning_efforts(block.get("efforts"))
+    default_level = default_reasoning_effort(efforts, block.get("default"))
+    return efforts, default_level
+
+
+async def _reconcile_reasoning_effort(
+    user_id: str,
+    *,
+    target_model: str | None,
+    effort_set: bool,
+    raw_effort: str | None,
+    stored_effort: str | None,
+    is_create: bool,
+    model_pref: dict[str, Any] | None = None,
+    classified: tuple[str, dict[str, Any]] | None = None,
+    model_changed: bool = False,
+) -> tuple[bool, str | None]:
+    """Validate and normalize ``reasoning_effort`` for create, update, and locked recheck.
+
+    Returns ``(should_write, normalized_value)``. On ``is_create=True``,
+    ``should_write`` is always ``True`` and ``normalized_value`` is the column
+    value to store. On ``is_create=False``, ``should_write=False`` means the
+    stored column stays untouched.
+    """
+    from src.dalton.llm.antigravity_series import (
+        ANTIGRAVITY_PROVIDER,
+        parse_antigravity_series,
+    )
+    from src.llms.model_spec import clamp_reasoning_effort
+    from src.llms.reasoning import REASONING_LEVELS
+
+    if raw_effort is not None and raw_effort not in REASONING_LEVELS:
+        raise AutomationRefusal(
+            f"invalid reasoning_effort {raw_effort!r}; expected one of: {', '.join(REASONING_LEVELS)}",
+            field="reasoning_effort",
+        )
+
+    # Case 1: follow account default model (target_model is None)
+    if not target_model:
+        if effort_set:
+            return True, raw_effort
+        if not is_create:
+            return False, stored_effort
+        from src.server.services.llm.config import deployment_llm, saved_default_model
+
+        pref = await _safe_model_pref(user_id, model_pref)
+        default_name = saved_default_model(pref, "primary") or getattr(deployment_llm(), "name", None)
+        if default_name:
+            def_source, def_entry = await user_models.classify_model(
+                user_id, default_name, _pref_cache=pref
+            )
+            if (
+                def_source == user_models.ModelSource.SYSTEM
+                and isinstance(def_entry, Mapping)
+                and def_entry.get("provider") == ANTIGRAVITY_PROVIDER
+            ):
+                return True, None
+        return True, "medium"
+
+    # Case 2: explicit target_model
+    # Avoid extra classify_model calls when an update touches neither model nor effort
+    # and has no stored effort to clean up.
+    if not is_create and not effort_set and not model_changed and stored_effort is None:
+        return False, None
+
+    if classified is not None:
+        source, entry = classified
+    else:
+        pref = await _safe_model_pref(user_id, model_pref)
+        source, entry = await user_models.classify_model(
+            user_id, target_model, _pref_cache=pref
+        )
+
+    is_system_antigravity = (
+        source == user_models.ModelSource.SYSTEM
+        and isinstance(entry, Mapping)
+        and entry.get("provider") == ANTIGRAVITY_PROVIDER
+    )
+
+    if is_system_antigravity:
+        parsed = parse_antigravity_series(target_model)
+        suffix_effort = parsed[1] if parsed is not None else None
+        efforts, _ = _effective_reasoning_ladder(target_model, source, entry)
+        if effort_set and raw_effort is not None:
+            if suffix_effort is not None and raw_effort != suffix_effort:
+                raise AutomationRefusal(
+                    f"model {target_model!r} encodes reasoning_effort={suffix_effort!r} in its model ID; "
+                    f"cannot set conflicting reasoning_effort={raw_effort!r}",
+                    field="reasoning_effort",
+                )
+            if suffix_effort is None and efforts and raw_effort not in efforts:
+                raise AutomationRefusal(
+                    f"reasoning_effort {raw_effort!r} is not supported by model {target_model!r}; "
+                    f"supported: {', '.join(efforts)}",
+                    field="reasoning_effort",
+                )
+        if is_create:
+            return True, None
+        if stored_effort is not None or effort_set:
+            return True, None
+        return False, None
+
+    # Non-Antigravity model (built-in or custom)
+    efforts, model_default = _effective_reasoning_ladder(target_model, source, entry)
+
+    if effort_set:
+        if raw_effort is None:
+            return True, None
+        if not efforts:
+            raise AutomationRefusal(
+                f"model {target_model!r} does not support reasoning_effort",
+                field="reasoning_effort",
+            )
+        if raw_effort not in efforts:
+            raise AutomationRefusal(
+                f"reasoning_effort {raw_effort!r} is not supported by model {target_model!r}; "
+                f"supported: {', '.join(efforts)}",
+                field="reasoning_effort",
+            )
+        return True, raw_effort
+
+    if is_create:
+        if len(efforts) > 1:
+            return True, ("medium" if "medium" in efforts else model_default)
+        return True, None
+
+    # Update with reasoning_effort omitted
+    if not model_changed:
+        return False, stored_effort
+    if stored_effort is None:
+        return False, None
+    if not efforts:
+        return True, None
+    if stored_effort not in efforts:
+        return True, clamp_reasoning_effort(efforts, model_default, stored_effort)
+    return False, stored_effort
 
 
 def delivery_warning(methods: Sequence[str] | None) -> str | None:
@@ -494,8 +667,20 @@ async def create_automation(
             user_id, str(data.conversation_thread_id), workspace_id, conn
         )
     await check_claude_code_hosted(user_id, data.llm_model, workspace_id, conn, model_pref)
+    classified_model: tuple[str, dict[str, Any]] | None = None
     if data.llm_model:
-        await check_model(user_id, data.llm_model, model_pref)
+        classified_model = await check_model(user_id, data.llm_model, model_pref)
+    # DALTON-HOOK(automation-effort): validate and resolve initial reasoning_effort on create
+    _, resolved_effort = await _reconcile_reasoning_effort(
+        user_id,
+        target_model=data.llm_model,
+        effort_set="reasoning_effort" in data.model_fields_set,
+        raw_effort=data.reasoning_effort,
+        stored_effort=None,
+        is_create=True,
+        model_pref=model_pref,
+        classified=classified_model,
+    )
     if data.delivery_config and not delivery_checked:
         methods = await check_delivery(user_id, data.delivery_config.methods)
         delivery = DeliveryConfig(methods=methods)
@@ -550,6 +735,7 @@ async def create_automation(
             next_run_at=next_run_at,
             workspace_id=workspace_id,
             llm_model=data.llm_model,
+            reasoning_effort=resolved_effort,  # DALTON-HOOK(automation-effort)
             additional_context=data.additional_context,
             thread_strategy=data.thread_strategy,
             conversation_thread_id=(
@@ -689,13 +875,30 @@ async def prepare_owned_automation_update(
             await _require_pin_in(user_id, pin, runs_in, conn)
     # Only a new name is checked: a stored one the user can no longer run
     # must not block an edit to anything else.
+    classified_model: tuple[str, dict[str, Any]] | None = None
     if update.llm_model and update.llm_model != current.get("llm_model"):
-        await check_model(user_id, update.llm_model, model_pref)
+        classified_model = await check_model(user_id, update.llm_model, model_pref)
     # A model and a place are judged together, so a move into Home is too.
     moved_to = normalize_uuid(update_kwargs.get("workspace_id")) or stored_in
     runs_on = update_kwargs.get("llm_model", current.get("llm_model"))
     if runs_on != current.get("llm_model") or moved_to != stored_in:
         await check_claude_code_hosted(user_id, runs_on, moved_to, conn, model_pref)
+    # DALTON-HOOK(automation-effort): reconcile reasoning_effort against target model on update
+    write_effort, resolved_effort = await _reconcile_reasoning_effort(
+        user_id,
+        target_model=runs_on,
+        effort_set="reasoning_effort" in update.model_fields_set,
+        raw_effort=update.reasoning_effort,
+        stored_effort=current.get("reasoning_effort"),
+        is_create=False,
+        model_pref=model_pref,
+        classified=classified_model,
+        model_changed=(runs_on != current.get("llm_model")),
+    )
+    if write_effort:
+        update_kwargs["reasoning_effort"] = resolved_effort
+    else:
+        update_kwargs.pop("reasoning_effort", None)
     # Likewise only a chat not already saved.
     delivery = update_kwargs.get("delivery_config")
     if isinstance(delivery, dict) and delivery.get("methods") and not delivery_checked:
@@ -800,6 +1003,28 @@ async def recheck_locked_automation_update(
             await check_claude_code_hosted(
                 user_id, runs_on_locked, moved_to_locked, locked_conn, pref_for_lock
             )
+
+    # DALTON-HOOK(automation-effort): recheck reasoning_effort against locked row's model & stored effort
+    if (
+        locked_row.get("llm_model") != current.get("llm_model")
+        or locked_row.get("reasoning_effort") != current.get("reasoning_effort")
+        or "llm_model" in update.model_fields_set
+        or "reasoning_effort" in update.model_fields_set
+    ):
+        write_effort_locked, resolved_effort_locked = await _reconcile_reasoning_effort(
+            user_id,
+            target_model=runs_on_locked,
+            effort_set="reasoning_effort" in update.model_fields_set,
+            raw_effort=update.reasoning_effort,
+            stored_effort=locked_row.get("reasoning_effort"),
+            is_create=False,
+            model_pref=pref_for_lock,
+            model_changed=(runs_on_locked != locked_row.get("llm_model")),
+        )
+        if write_effort_locked:
+            effective_kwargs["reasoning_effort"] = resolved_effort_locked
+        else:
+            effective_kwargs.pop("reasoning_effort", None)
 
     if new_cron or new_tz:
         locked_cron = new_cron or locked_row.get("cron_expression")
@@ -1070,11 +1295,17 @@ async def update_automation(
             update_kwargs["scope"] = resolved_scope
 
     # DALTON-HOOK(company-automations): record update history, verify expected_config_version, and reconcile derived fields under row lock
+    # DALTON-HOOK(automation-effort): preload model_pref before row lock when model or reasoning_effort may be reconciled
     from src.server.services.claude_code.hosted import checks_automations as _checks_cc_automations
 
     pref_for_lock = model_pref
-    if pref_for_lock is None and _checks_cc_automations():
-        pref_for_lock = await user_models.get_model_preference(user_id)
+    if pref_for_lock is None and (
+        _checks_cc_automations()
+        or "llm_model" in update.model_fields_set
+        or "reasoning_effort" in update.model_fields_set
+        or current.get("reasoning_effort") is not None
+    ):
+        pref_for_lock = await _safe_model_pref(user_id, None)
 
     async def _reconcile_locked_update(
         locked_row: Any,

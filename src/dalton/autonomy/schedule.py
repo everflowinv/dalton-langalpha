@@ -774,6 +774,8 @@ async def schedule_dalton_automation_helper(
                 "cron_expression": r.get("cron_expression"),
                 "next_run_at": str(r.get("next_run_at") or ""),
                 "status": r.get("status"),
+                "llm_model": r.get("llm_model"),
+                "reasoning_effort": r.get("reasoning_effort"),
             }
             for r in rows
             if str(r.get("name") or "").startswith("dalton-")
@@ -1240,9 +1242,26 @@ async def schedule_dalton_automation_helper(
             meta["ticker"] = str(resolved_ticker).upper()
 
         from src.server.services.automations.lifecycle import (
+            AutomationRefusal,
             _assert_replaced_by_tracker_preserved,
+            _reconcile_reasoning_effort,
             _replaced_by_tracker_refusal,
+            _safe_model_pref,
         )
+
+        effort_in_spec = "reasoning_effort" in merged_spec
+        raw_effort_spec = merged_spec.get("reasoning_effort")
+        if isinstance(raw_effort_spec, str):
+            norm_raw = raw_effort_spec.strip().lower()
+            raw_effort_spec = None if norm_raw in ("", "default", "clear", "null") else norm_raw
+        model_in_spec = "llm_model" in merged_spec
+        spec_llm_model = merged_spec.get("llm_model")
+        if isinstance(spec_llm_model, str):
+            spec_llm_model = spec_llm_model.strip() or None
+        # Load user model_pref before DB writes if model or effort reconciliation needs it.
+        pref_for_effort: dict[str, Any] | None = None
+        if effort_in_spec or model_in_spec or existing is None:
+            pref_for_effort = await _safe_model_pref(task_owner, None)
 
         if existing:
             if (replaced_refusal := _replaced_by_tracker_refusal(existing)) is not None:
@@ -1325,6 +1344,36 @@ async def schedule_dalton_automation_helper(
                 patch["metadata"] = merged_meta
             if explicit_status:
                 patch["status"] = explicit_status
+            if model_in_spec:
+                patch["llm_model"] = spec_llm_model
+            target_model_for_effort = (
+                patch["llm_model"] if model_in_spec else existing.get("llm_model")
+            )
+            if effort_in_spec or model_in_spec or existing.get("reasoning_effort") is not None:
+                try:
+                    write_effort, reconciled_effort = await _reconcile_reasoning_effort(
+                        task_owner,
+                        target_model=target_model_for_effort,
+                        effort_set=effort_in_spec,
+                        raw_effort=raw_effort_spec,
+                        stored_effort=existing.get("reasoning_effort"),
+                        is_create=False,
+                        model_pref=pref_for_effort,
+                        model_changed=(
+                            model_in_spec
+                            and target_model_for_effort != existing.get("llm_model")
+                        ),
+                    )
+                except AutomationRefusal as exc:
+                    if via_rest:
+                        raise
+                    return {
+                        "ok": False,
+                        "error": "invalid_reasoning_effort",
+                        "message": str(exc),
+                    }
+                if write_effort:
+                    patch["reasoning_effort"] = reconciled_effort
             saved_workspace_id = (
                 patch["workspace_id"]
                 if "workspace_id" in patch
@@ -1461,9 +1510,30 @@ async def schedule_dalton_automation_helper(
                 metadata=create_meta,
                 conn=active_conn,
             )
+            create_llm_model = spec_llm_model if model_in_spec else None
+            try:
+                _, create_reasoning_effort = await _reconcile_reasoning_effort(
+                    task_owner,
+                    target_model=create_llm_model,
+                    effort_set=effort_in_spec,
+                    raw_effort=raw_effort_spec,
+                    stored_effort=None,
+                    is_create=True,
+                    model_pref=pref_for_effort,
+                )
+            except AutomationRefusal as exc:
+                if via_rest:
+                    raise
+                return {
+                    "ok": False,
+                    "error": "invalid_reasoning_effort",
+                    "message": str(exc),
+                }
             create_kw: dict[str, Any] = dict(conn_kw)
             if explicit_status and explicit_status != "active":
                 create_kw["status"] = explicit_status
+            if create_reasoning_effort is not None:
+                create_kw["reasoning_effort"] = create_reasoning_effort
             create_audit_payload = (
                 create_report_change.build_audit_entry()
                 if create_report_change is not None
@@ -1485,7 +1555,7 @@ async def schedule_dalton_automation_helper(
                     next_run_at=None if explicit_status == "paused" else next_dt,
                     instruction=instruction or "",
                     workspace_id=ws_id,
-                    llm_model=merged_spec.get("llm_model"),
+                    llm_model=create_llm_model,
                     additional_context=merged_spec.get("additional_context"),
                     thread_strategy=str(merged_spec.get("thread_strategy") or "new"),
                     conversation_thread_id=merged_spec.get("conversation_thread_id"),

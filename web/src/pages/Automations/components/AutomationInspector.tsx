@@ -6,6 +6,8 @@ import { HeaderButton, ListSkeleton } from '@/components/mcp/McpPrimitives';
 import { useLocale } from '@/hooks/useLocale';
 import { useModelName } from '@/hooks/useModelName';
 import { useNow } from '@/hooks/useNow';
+// DALTON-HOOK(automation-effort): format stored reasoning_effort label in automation inspector
+import { effortLabelFor } from '@/lib/modelTuning';
 import { scrollMotion } from '@/lib/reducedMotion';
 import { cn } from '@/lib/utils';
 import type { Automation, AutomationExecution, DeliveryAttempt } from '@/types/automation';
@@ -323,6 +325,13 @@ export default function AutomationInspector({
         <dl className="automation-details">
           <dt>{t('automation.detailModel')}</dt>
           <dd>{a.llm_model ? modelName(a.llm_model) : t('automation.defaultModel')}</dd>
+          {/* DALTON-HOOK(automation-effort): display configured reasoning_effort when set */}
+          {a.reasoning_effort && (
+            <>
+              <dt>{t('chat.modelSelector.reasoningEffort')}</dt>
+              <dd>{effortLabelFor(t, a.reasoning_effort) ?? a.reasoning_effort}</dd>
+            </>
+          )}
           <dt>{t('automation.threadStrategy')}</dt>
           <dd>{t(a.thread_strategy === 'continue' ? 'automation.continueExisting' : 'automation.newThreadEachRun')}</dd>
           {workspaceName && (

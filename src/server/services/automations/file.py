@@ -48,6 +48,8 @@ from ptc_agent.agent.backends.db_json_route import (
 )
 from ptc_agent.core.paths import AUTOMATION_FILE_NAME
 from ptc_agent.core.sandbox.livefs_mount import CallContext
+# DALTON-HOOK(automation-effort): canonical reasoning effort literal for automation file schema
+from src.llms.reasoning import ReasoningLevel
 from src.server.database import automation as auto_db
 from src.server.database.home_workspace import get_home_workspace_id, is_home_id
 from src.server.database.user_lock import lock_user_writes
@@ -96,6 +98,7 @@ _EDITABLE = (
     "workspace_id",
     "thread",
     "llm_model",
+    "reasoning_effort",  # DALTON-HOOK(automation-effort)
     "delivery",
     "max_failures",
 )
@@ -183,6 +186,7 @@ def _definition(row: dict[str, Any]) -> dict[str, Any]:
         workspace_id=_HOME if is_home_id(row["user_id"], stored) else stored,
         thread=_thread_value(row),
         llm_model=row.get("llm_model"),
+        reasoning_effort=row.get("reasoning_effort"),  # DALTON-HOOK(automation-effort)
         delivery=[
             m
             for m in (row.get("delivery_config") or {}).get("methods") or []
@@ -280,6 +284,7 @@ class _Entry(BaseModel):
     workspace_id: UUID | None = None
     thread: dict[str, Any] | None = None
     llm_model: str | None = None
+    reasoning_effort: ReasoningLevel | None = None  # DALTON-HOOK(automation-effort)
     delivery: dict[str, list[str]] | None = None
     max_failures: int | None = None
     state: Any = None
@@ -535,7 +540,7 @@ def _plan_create(entry: _Entry, call: CallContext, zone: str, problems: _Problem
         **(entry.thread or {}),
         "workspace_id": entry.workspace_id if "workspace_id" in written else call.workspace_id,
     }
-    for key in ("name", "description", "instruction", "llm_model", "max_failures"):
+    for key in ("name", "description", "instruction", "llm_model", "reasoning_effort", "max_failures"):  # DALTON-HOOK(automation-effort)
         if key in written:
             data[key] = getattr(entry, key)
     if "delivery" in written:
@@ -803,13 +808,30 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
         if not call.timezone and served is None and written.get("timezone") is None:
             zone = await auto_db.get_user_timezone(user_id) or "UTC"
         delivery, refused = await self._check_delivery(user_id, written, shown)
+        # DALTON-HOOK(automation-effort): preload model_pref outside the transaction only when model/effort actually changes or is set
+        needs_model_pref = (
+            _names_model(written, shown)
+            or (not written.get("llm_model") and checks_automations())
+            or (
+                shown is not None
+                and (
+                    ("llm_model" in written and written.get("llm_model") != shown.get("llm_model"))
+                    or (
+                        "reasoning_effort" in written
+                        and written.get("reasoning_effort") != shown.get("reasoning_effort")
+                    )
+                )
+            )
+            or (shown is None and written.get("reasoning_effort") is not None)
+        )
         return Document(
             fields=written,
             shown=shown,
             timezone=zone,
             model_pref=(
                 await user_models.get_model_preference(user_id)
-                if _names_model(written, shown) or (not written.get("llm_model") and checks_automations()) else None
+                if needs_model_pref
+                else None
             ),
             home_id=get_home_workspace_id(user_id),
             delivery=delivery,
@@ -1009,6 +1031,11 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
         )
 
         prelocked_pref = getattr(plan, "prelocked_pref_row", None)
+        # DALTON-HOOK(automation-effort): reuse prelocked model_preference inside commit so create/update never borrows a second connection
+        commit_model_pref = plan.model_pref
+        if commit_model_pref is None and isinstance(prelocked_pref, Mapping):
+            raw_mp = prelocked_pref.get("model_preference")
+            commit_model_pref = dict(raw_mp) if isinstance(raw_mp, Mapping) else {}
 
         if delete := plan.delete:
             # DALTON-HOOK(company-automations): file removal is a recycle-bin soft delete
@@ -1038,7 +1065,7 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
                         update.automation_id,
                         user_id,
                         update.fields,
-                        model_pref=plan.model_pref,
+                        model_pref=commit_model_pref,
                         current=row,
                         delivery_checked=True,
                     )
@@ -1082,7 +1109,7 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
                     lifecycle.create_automation,
                     user_id,
                     create.data,
-                    model_pref=plan.model_pref,
+                    model_pref=commit_model_pref,
                     file_name=self.file_name,
                     delivery_checked=True,
                 )

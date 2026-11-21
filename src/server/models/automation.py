@@ -24,6 +24,8 @@ from pydantic import (
     model_validator,
 )
 
+# DALTON-HOOK(automation-effort): share canonical reasoning effort literal with automation models
+from src.llms.reasoning import ReasoningLevel
 from src.server.utils.error_sanitization import validation_error_text
 from src.utils.timezone_utils import zone_or_none
 
@@ -529,6 +531,10 @@ class AutomationCreate(_ScheduleFields):
     llm_model: Optional[str] = Field(
         None, max_length=100, description="LLM model name override"
     )
+    # DALTON-HOOK(automation-effort): optional per-automation reasoning effort override
+    reasoning_effort: Optional[ReasoningLevel] = Field(
+        None, description="Reasoning effort override; null follows user/model default"
+    )
     additional_context: Optional[List[Dict[str, Any]]] = Field(
         None, description="Additional context items (skills, images, etc.)"
     )
@@ -591,6 +597,8 @@ class AutomationUpdate(_ScheduleFields):
     instruction: Optional[str] = Field(None, min_length=1)
     workspace_id: Optional[UUID] = None
     llm_model: Optional[str] = Field(None, max_length=100)
+    # DALTON-HOOK(automation-effort): optional per-automation reasoning effort override (null clears override)
+    reasoning_effort: Optional[ReasoningLevel] = None
     additional_context: Optional[List[Dict[str, Any]]] = None
 
     # Thread strategy
@@ -823,6 +831,8 @@ class AutomationResponse(BaseModel):
     instruction: str
     workspace_id: Optional[UUID] = None
     llm_model: Optional[str] = None
+    # DALTON-HOOK(automation-effort): expose per-automation reasoning effort override
+    reasoning_effort: Optional[str] = None
     additional_context: Optional[List[Dict[str, Any]]] = None
 
     thread_strategy: str

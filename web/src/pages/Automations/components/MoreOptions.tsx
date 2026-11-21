@@ -14,12 +14,15 @@ import { Input } from '@/components/ui/input';
 import { SegmentedControl } from '@/components/ui/segmented-control';
 // DALTON-HOOK(automation-model): reuse Settings ModelSelector & useAllModels
 // DALTON-HOOK(antigravity-series): format saved Antigravity variants as "Series · Effort"
+// DALTON-HOOK(automation-effort): reasoning effort selector for non-Antigravity automation models
 import { ModelSelector } from '@/components/model/ModelSelector';
+import { Select as NativeSelect } from '@/components/ui/select';
 import { getModelDisplayName } from '@/components/ui/chat-input.helpers';
 import { useAllModels } from '@/hooks/useAllModels';
 import { useApiKeys } from '@/hooks/useApiKeys';
 import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
-import { formatAntigravityVariantLabel } from '@/lib/antigravitySeries';
+import { formatAntigravityVariantLabel, inspectSavedAntigravityModel } from '@/lib/antigravitySeries';
+import { effortLabelFor, effortOptions, resolveEffort } from '@/lib/modelTuning';
 import { cn } from '@/lib/utils';
 import type { DeliveryAttempt } from '@/types/automation';
 import { useAutomationPlace } from '../hooks/useAutomationPlace';
@@ -55,6 +58,8 @@ interface MoreOptionsProps {
   deliveryProblems?: DeliveryProblem[];
   // DALTON-HOOK(automation-model): server refusal message when saving an unavailable model
   modelError?: string | null;
+  // DALTON-HOOK(automation-effort): distinguish create vs edit default effort behavior
+  isEdit?: boolean;
   /** Company tasks cannot store a personal delivery choice. */
   omitDelivery?: boolean;
 }
@@ -71,6 +76,7 @@ export default function MoreOptions({
   deliveryAttempts,
   deliveryProblems = NO_PROBLEMS,
   modelError = null,
+  isEdit = false,
   omitDelivery = false,
 }: MoreOptionsProps) {
   const { t } = useTranslation();
@@ -137,6 +143,59 @@ export default function MoreOptions({
     return filtered;
   }, [models, keylessModels]);
   // DALTON-HOOK(antigravity-series): format saved Antigravity models as "Series · Effort"
+  // DALTON-HOOK(automation-effort): resolve effort options for non-Antigravity models and account default
+  const seriesOpts = useMemo(
+    () => ({ seriesCatalog, rawMetadata, customModels }),
+    [seriesCatalog, rawMetadata, customModels],
+  );
+  const selectedAntigravity = useMemo(
+    () => (form.llm_model ? inspectSavedAntigravityModel(form.llm_model, seriesOpts) : null),
+    [form.llm_model, seriesOpts],
+  );
+  const nonAntigravityEfforts = useMemo(() => {
+    if (selectedAntigravity) return [];
+    if (form.llm_model) {
+      const meta = metadata[form.llm_model] ?? rawMetadata[form.llm_model];
+      return effortOptions(meta?.reasoning_efforts ?? [], form.reasoning_effort ?? '');
+    }
+    const union = new Set<string>();
+    for (const [key, entry] of Object.entries(metadata)) {
+      if (inspectSavedAntigravityModel(key, seriesOpts)) continue;
+      for (const lv of entry?.reasoning_efforts ?? []) union.add(lv);
+    }
+    const offered = union.size > 0 ? [...union] : ['low', 'medium', 'high'];
+    return effortOptions(offered, form.reasoning_effort ?? '');
+  }, [selectedAntigravity, form.llm_model, form.reasoning_effort, metadata, rawMetadata, seriesOpts]);
+  const showEffortSelector = catalogReady && !selectedAntigravity && nonAntigravityEfforts.length > 0;
+
+  const handleModelChange = (nextRaw: string) => {
+    const nextModel = nextRaw || null;
+    patch('llm_model', nextModel);
+    if (!nextModel) return;
+    if (inspectSavedAntigravityModel(nextModel, seriesOpts)) {
+      if (form.reasoning_effort !== null) patch('reasoning_effort', null);
+      return;
+    }
+    const nextMeta = metadata[nextModel] ?? rawMetadata[nextModel];
+    const offered = nextMeta?.reasoning_efforts ?? [];
+    if (offered.length === 0) {
+      if (form.reasoning_effort !== null) patch('reasoning_effort', null);
+      return;
+    }
+    if (!isEdit && offered.length > 1) {
+      if (!form.reasoning_effort || !offered.includes(form.reasoning_effort)) {
+        const defaultPick = offered.includes('medium')
+          ? 'medium'
+          : (nextMeta?.reasoning_effort_default ?? offered[0]);
+        patch('reasoning_effort', defaultPick);
+      }
+      return;
+    }
+    if (form.reasoning_effort && !offered.includes(form.reasoning_effort)) {
+      patch('reasoning_effort', resolveEffort(form.reasoning_effort, offered));
+    }
+  };
+
   const formatModel = (m: string) =>
     formatAntigravityVariantLabel(m, {
       seriesCatalog,
@@ -146,10 +205,20 @@ export default function MoreOptions({
       includeEffort: true,
     }) ?? getModelDisplayName(m, metadata);
 
+  // DALTON-HOOK(automation-effort): include configured reasoning_effort in folded MoreOptions summary
+  const effortSummaryLabel =
+    !selectedAntigravity && form.reasoning_effort
+      ? (effortLabelFor(t, form.reasoning_effort) ?? form.reasoning_effort)
+      : null;
+
   // What the folded options are set to, so they can stay folded.
   const summary = [
     allWorkspaces ? t('agents.chiefOfStaff') : placeLabel({ workspace_id: form.place }, workspaceName),
-    ...(form.llm_model ? [formatModel(form.llm_model)] : []),
+    ...(form.llm_model
+      ? [effortSummaryLabel ? `${formatModel(form.llm_model)} · ${effortSummaryLabel}` : formatModel(form.llm_model)]
+      : effortSummaryLabel
+        ? [`${t('automation.defaultModel')} · ${effortSummaryLabel}`]
+        : []),
     t(form.thread_strategy === 'continue' ? 'automation.continueExisting' : 'automation.newThreadEachRun'),
     ...(omitDelivery
       ? []
@@ -223,7 +292,7 @@ export default function MoreOptions({
                   : t('automation.modelCurrentOption', { model: formatModel(m) })
               }
               value={form.llm_model ?? ''}
-              onChange={(m) => patch('llm_model', m || null)}
+              onChange={handleModelChange}
               models={availableModels}
               placeholder={t('automation.defaultModelOption')}
               payers={payers}
@@ -241,6 +310,26 @@ export default function MoreOptions({
             )}
           </div>
         </FormRow>
+
+        {/* DALTON-HOOK(automation-effort): reasoning effort dropdown for non-Antigravity models and account default */}
+        {showEffortSelector && (
+          <FormRow label={t('chat.modelSelector.reasoningEffort')}>
+            <div className="max-w-sm">
+              <NativeSelect
+                aria-label={t('chat.modelSelector.reasoningEffort')}
+                value={form.reasoning_effort ?? ''}
+                onChange={(e) => patch('reasoning_effort', e.target.value || null)}
+              >
+                <option value="">{t('automation.reasoningEffortDefault')}</option>
+                {nonAntigravityEfforts.map((lv) => (
+                  <option key={lv} value={lv}>
+                    {effortLabelFor(t, lv) ?? lv}
+                  </option>
+                ))}
+              </NativeSelect>
+            </div>
+          </FormRow>
+        )}
 
         <FormRow label={t('automation.threadStrategy')} labelId={ids.thread}>
           <SegmentedControl
