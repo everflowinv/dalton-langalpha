@@ -1437,11 +1437,16 @@ def test_suffix_stripping_stays_linear_on_long_whitespace_runs() -> None:
     from src.dalton.coverage.dedup import derive_display_name_candidates
 
     started = time.monotonic()
-    derive_display_name_candidates("A" + " " * 199 + "x")
+    assert derive_display_name_candidates("A" + " " * 197 + "x") == ("A" + " " * 197 + "x",)
     assert derive_display_name_candidates("A" + " " * 5000 + "x") == ()
     assert time.monotonic() - started < 0.5
     assert derive_display_name_candidates("Costco") == ("Costco",)
     assert derive_display_name_candidates("Coca-Cola Co") == ("Coca-Cola Co", "Coca-Cola")
+    assert "Coca-Cola" in derive_display_name_candidates("Coca-Cola\u00a0Co")
+    assert "Coca-Cola" in derive_display_name_candidates("Coca-Cola\u3000Co")
+    started = time.monotonic()
+    derive_display_name_candidates("A" + " " * 190 + "Inc")
+    assert time.monotonic() - started < 0.5
 
 
 @pytest.mark.asyncio
@@ -1483,3 +1488,60 @@ async def test_ticker_named_workspace_with_tracking_automation_counts_as_company
     assert match is not None
     assert match.workspace_id == WS_1
     assert await find_existing_company_workspace(USER_CALLER, "Macro") is None
+
+
+@pytest.mark.asyncio
+async def test_unbound_tracking_automation_does_not_make_same_owner_topic_workspace_a_company(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy `dalton-nvda-watch` with no workspace_id must not turn Richard's `Macro` into a company."""
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_2,
+                name="Macro",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            ),
+        ],
+        automation_rows=[
+            {
+                "user_id": USER_RICHARD,
+                "workspace_id": None,
+                "name": "dalton-nvda-watch",
+                "metadata": {},
+            }
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_2})
+
+    assert await find_existing_company_workspace(USER_CALLER, "Macro") is None
+
+
+@pytest.mark.asyncio
+async def test_exact_and_equivalent_ticker_names_agree_for_untracked_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`0700.HK` with no unit/doc/task blocks both `0700.HK` and `700.HK` (agy final review low 2)."""
+    _enable_team_mode(monkeypatch)
+    _install_db(
+        monkeypatch,
+        ws_rows=[
+            _ws_row(
+                ws_id=WS_1,
+                name="0700.HK",
+                owner_id=USER_RICHARD,
+                owner_name="Richard",
+                owner_email=EMAIL_RICHARD,
+            ),
+        ],
+    )
+    _install_read_access(monkeypatch, web_readable={WS_1})
+
+    for typed in ("0700.HK", "700.HK"):
+        match = await find_existing_company_workspace(USER_CALLER, typed)
+        assert match is not None, typed
+        assert match.workspace_id == WS_1

@@ -72,7 +72,6 @@ _CJK_LATIN_SPACE_RE = re.compile(
 # display_name is user-entered and unbounded.
 _LATIN_SUFFIXES = tuple(sorted(("Corporation", "Limited", "Holdings", "Holding", "Group", "Corp", "Inc.", "Inc", "Co.", "Co", "Ltd.", "Ltd", "PBC", "PLC", "plc", "N.V.", "NV", "SA", "AG"), key=len, reverse=True))
 _CJK_SUFFIXES = tuple(sorted(("股份有限公司", "有限公司", "股份", "集团", "控股"), key=len, reverse=True))
-_SUFFIX_SEPARATORS = " ,，\t\r\n"
 # Longer names are not company names; deriving from them only costs time.
 _MAX_DISPLAY_NAME_CHARS = 200
 
@@ -159,19 +158,30 @@ def normalize_company_name(raw: str | None) -> str:
     return _NORMALIZE_STRIP_RE.sub("", text)
 
 
+def _is_suffix_separator(ch: str) -> bool:
+    return ch.isspace() or ch in ",，"
+
+
+def _rstrip_separators(text: str) -> str:
+    end = len(text)
+    while end and _is_suffix_separator(text[end - 1]):
+        end -= 1
+    return text[:end]
+
+
 def _strip_one_trailing_suffix(text: str) -> str | None:
-    body = text.rstrip(_SUFFIX_SEPARATORS)
+    body = _rstrip_separators(text)
     folded = body.casefold()
     for suffix in _LATIN_SUFFIXES:
         if not folded.endswith(suffix.casefold()):
             continue
         head = body[: len(body) - len(suffix)]
         # A Latin suffix must stand alone: start of name, a separator, or a CJK character before it.
-        if head == "" or head[-1] in _SUFFIX_SEPARATORS or "\u4e00" <= head[-1] <= "\u9fff":
-            return head.rstrip(_SUFFIX_SEPARATORS)
+        if head == "" or _is_suffix_separator(head[-1]) or "\u4e00" <= head[-1] <= "\u9fff":
+            return _rstrip_separators(head)
     for suffix in _CJK_SUFFIXES:
         if body.endswith(suffix):
-            return body[: len(body) - len(suffix)].rstrip(_SUFFIX_SEPARATORS)
+            return _rstrip_separators(body[: len(body) - len(suffix)])
     return None
 
 
@@ -223,6 +233,14 @@ def derive_display_name_candidates(display_name: str | None) -> tuple[str, ...]:
             cur = nxt
 
     return tuple(candidates)
+
+
+def _is_unambiguous_ticker_name(raw: str | None) -> bool:
+    """A ticker-shaped name no ordinary topic would have: digits, `.XX` or `-X`."""
+    text = str(raw or "").strip()
+    return _is_ticker_shaped(text) and (
+        any(ch.isdigit() for ch in text) or "." in text or "-" in text
+    )
 
 
 def _is_ticker_shaped(raw: str | None) -> bool:
@@ -848,7 +866,9 @@ async def _find_matches(
                     "name": ws_name,
                     "status": ws_status,
                 }
-                if matched_by == "workspace_name":
+                # Same company test for an exact-name match and a ticker-equivalent
+                # name match ("700.HK" vs "0700.HK"), so the two never disagree.
+                if matched_by in ("workspace_name", "workspace_ticker"):
                     identity = await resolve_workspace_coverage_identity(
                         ws_identity_row,
                         company_content=_doc_ticker_content(docs, "company"),
@@ -856,14 +876,22 @@ async def _find_matches(
                         registered_units=units_by_ws,
                         automations=owner_autos,
                     )
-                    # A ticker-shaped name alone ("Macro") is not a company, but the
-                    # compat order puts the name before tracking automations, so a
-                    # workspace the owner tracks by name ("NVDA" + dalton-nvda-watch)
-                    # must still count.
+                    # An all-letter ticker-shaped name alone ("Macro") is not a company;
+                    # it counts with a unit, a company doc or a bound tracking task
+                    # ("NVDA" + dalton-nvda-watch). A name with digits, a market suffix
+                    # or a share class ("0700.HK", "600519", "BRK-B") is a ticker by itself.
                     if not identity.is_company or (
                         identity.source != SOURCE_REGISTERED
                         and identity.ticker_source == TICKER_SOURCE_WORKSPACE_NAME
-                        and ticker_from_automation_rows(ws_id, owner_autos) is None
+                        and not _is_unambiguous_ticker_name(ws_name)
+                        and ticker_from_automation_rows(
+                            ws_id,
+                            # Only rows bound to this workspace: a legacy row with no
+                            # workspace_id would make every ticker-named workspace of
+                            # the owner look tracked.
+                            [a for a in owner_autos if str(a.get("workspace_id") or "") == str(ws_id)],
+                        )
+                        is None
                     ):
                         continue
                     if matched_ticker is None and identity.ticker:
