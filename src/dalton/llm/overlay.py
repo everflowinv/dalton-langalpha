@@ -349,8 +349,10 @@ def antigravity_gemini_direct_base(entry: dict[str, Any]) -> str | None:
     if entry.get("provider") != "antigravity-oauth":
         return None
     model_id = str(entry.get("model_id") or "")
-    if not model_id.startswith("gemini-"):
+    if not model_id:
         return None
+    # The caller keeps only a base whose catalog entry is a direct ``gemini`` row,
+    # so non-Gemini Antigravity models (Claude, GPT-OSS) inherit nothing.
     return _ANTIGRAVITY_EFFORT_RE.sub("", model_id)
 
 
