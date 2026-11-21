@@ -358,6 +358,11 @@ async def test_extraction_verbatim_quote_validation_and_speaker_rules(
         notional_usd: Any = 0,
         provider: str | None = None,
         billing_type: str | None = None,
+        stamp_credential_holder: bool = True,
+        attempt_usage: dict[str, Any] | None = None,
+        unknown_usage_calls: int = 0,
+        occurred_at: Any = None,
+        call_records: list[dict[str, Any]] | None = None,
         conn: Any = None,
     ) -> dict[str, Any] | None:
         journal_saved_responses.append(response)

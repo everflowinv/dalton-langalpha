@@ -1940,15 +1940,15 @@ async def test_deployment_credential_resend_preserves_prior_usage_and_strips_cre
     assert store.attempts[(res2.invocation_id, 2, 1)]["usage"]["input_tokens"] == 14_000
 
 
-def test_d043_migration_revision_upgrade_and_downgrade(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify Dalton migration d043 chains off d042, splits FK DDL and batched backfill into
+def test_d044_migration_revision_upgrade_and_downgrade(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify Dalton migration d044 chains off d043, splits FK DDL and batched backfill into
     separate transactions (preserving `j.created_at` as `occurred_at`), and rolls up attempts
     back into `dalton_llm_journal` before dropping the table on downgrade."""
     import contextlib
-    from src.dalton.migrations.versions import d043_llm_journal_attempts as d043
+    from src.dalton.migrations.versions import d044_llm_journal_attempts as d044
 
-    assert d043.revision == "d043"
-    assert d043.down_revision == "d042"
+    assert d044.revision == "d044"
+    assert d044.down_revision == "d043"
 
     executed_up: list[str] = []
     executed_down: list[str] = []
@@ -1967,9 +1967,9 @@ def test_d043_migration_revision_upgrade_and_downgrade(monkeypatch: pytest.Monke
                 executed_up.append("-- AUTOCOMMIT_EXIT")
                 autocommit_events.append("exit")
 
-    monkeypatch.setattr(d043.op, "get_context", lambda: _FakeCtx())
-    monkeypatch.setattr(d043.op, "execute", lambda sql: executed_up.append(str(sql)))
-    d043.upgrade()
+    monkeypatch.setattr(d044.op, "get_context", lambda: _FakeCtx())
+    monkeypatch.setattr(d044.op, "execute", lambda sql: executed_up.append(str(sql)))
+    d044.upgrade()
     joined_up = "\n".join(executed_up)
     assert autocommit_events == ["enter", "exit"]
     assert "CREATE TABLE IF NOT EXISTS dalton_llm_journal_attempts" in joined_up
@@ -1990,8 +1990,8 @@ def test_d043_migration_revision_upgrade_and_downgrade(monkeypatch: pytest.Monke
     assert "COALESCE(j.completed_at, j.created_at)" not in joined_up
     assert "ON CONFLICT (invocation_id, attempt, call_seq) DO NOTHING" in joined_up
 
-    monkeypatch.setattr(d043.op, "execute", lambda sql: executed_down.append(str(sql)))
-    d043.downgrade()
+    monkeypatch.setattr(d044.op, "execute", lambda sql: executed_down.append(str(sql)))
+    d044.downgrade()
     joined_down = "\n".join(executed_down)
     rollup_idx = joined_down.index("UPDATE dalton_llm_journal j")
     drop_fk_idx = joined_down.index("DROP CONSTRAINT IF EXISTS fk_dalton_llm_journal_attempts_invocation")
@@ -2158,7 +2158,7 @@ async def test_openai_responses_sdk_parse_error_then_fallback_error_no_double_bi
 async def test_cross_midnight_send_time_and_multi_request_split_attribution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Round 3 High #2 (llm_journal.py:611, d043:153):
+    """Round 3 High #2 (llm_journal.py:611, d044:153):
     1) Single request sent before midnight (23:59:50 Asia/Shanghai) and settled after midnight
        (00:00:10 Asia/Shanghai) MUST be attributed to Day 1 (send time), NOT Day 2 (settlement).
     2) Single invocation whose 2 parse-retry requests span midnight (Req 1 on Day 1, Req 2 on Day 2)
@@ -2582,22 +2582,22 @@ async def test_unsent_config_timeout_and_xai_402_pre_stream_not_counted_as_unkno
     assert summary_after_mid["journal_unknown_usage_count"] == 1
 
 
-def test_d043_upgrade_separates_fk_ddl_and_batched_backfill_transactions(
+def test_d044_upgrade_separates_fk_ddl_and_batched_backfill_transactions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Round 3 Medium #7 & Round 4 Carbon Medium #3 (d043):
+    """Round 3 Medium #7 & Round 4 Carbon Medium #3 (d044):
     Online upgrade creates the table WITHOUT inline FK in Transaction 1, enters `autocommit_block()`,
     runs bounded keyset backfill batches (`j.created_at AS occurred_at`), then builds secondary
     indexes, then attaches FK as `NOT VALID`, and finally validates the FK constraint separately
     so `dalton_llm_journal` writes are never blocked during backfill."""
     import contextlib
-    from src.dalton.migrations.versions import d043_llm_journal_attempts as d043
+    from src.dalton.migrations.versions import d044_llm_journal_attempts as d044
 
     events: list[str] = []
     batch_params: list[dict[str, Any]] = []
     batch_responses = [
-        ("lj1:1000", d043._BACKFILL_BATCH_SIZE),
-        ("lj1:2000", d043._BACKFILL_BATCH_SIZE),
+        ("lj1:1000", d044._BACKFILL_BATCH_SIZE),
+        ("lj1:2000", d044._BACKFILL_BATCH_SIZE),
         ("lj1:2250", 250),
     ]
 
@@ -2641,8 +2641,8 @@ def test_d043_upgrade_separates_fk_ddl_and_batched_backfill_transactions(
             finally:
                 events.append("autocommit_exit")
 
-    monkeypatch.setattr(d043.op, "get_context", lambda: _OnlineCtx())
-    monkeypatch.setattr(d043.op, "get_bind", lambda: _FakeBind())
+    monkeypatch.setattr(d044.op, "get_context", lambda: _OnlineCtx())
+    monkeypatch.setattr(d044.op, "get_bind", lambda: _FakeBind())
 
     def _rec_op_exec(sql: Any) -> None:
         s = str(sql)
@@ -2654,9 +2654,9 @@ def test_d043_upgrade_separates_fk_ddl_and_batched_backfill_transactions(
         else:
             events.append(f"op_sql:{s.strip()}")
 
-    monkeypatch.setattr(d043.op, "execute", _rec_op_exec)
+    monkeypatch.setattr(d044.op, "execute", _rec_op_exec)
 
-    d043.upgrade()
+    d044.upgrade()
 
     ac_enter = events.index("autocommit_enter")
     ac_exit = events.index("autocommit_exit")
@@ -2680,15 +2680,15 @@ def test_d043_upgrade_separates_fk_ddl_and_batched_backfill_transactions(
 
 
 @pytest.mark.asyncio
-async def test_d043_downgrade_rolls_up_late_settled_attempts_into_parent_before_drop(
+async def test_d044_downgrade_rolls_up_late_settled_attempts_into_parent_before_drop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Round 3 High #4 (d043:164): After Attempt 2 takes over stale Attempt 1 and finishes `done`
+    """Round 3 High #4 (d044:164): After Attempt 2 takes over stale Attempt 1 and finishes `done`
     (parent row holds only c2/u2), stale Attempt 1 returns late and settles c1/u1 ONLY into
-    `dalton_llm_journal_attempts`. Running `d043.downgrade()` MUST roll up c1+c2, summed token
+    `dalton_llm_journal_attempts`. Running `d044.downgrade()` MUST roll up c1+c2, summed token
     usage, `per_call_usages`, and `attempt_details` into `dalton_llm_journal` BEFORE dropping
     `dalton_llm_journal_attempts`, so d042's budget query retains the full c1+c2 spend."""
-    from src.dalton.migrations.versions import d043_llm_journal_attempts as d043
+    from src.dalton.migrations.versions import d044_llm_journal_attempts as d044
 
     t0 = datetime(2026, 11, 21, 10, 0, 0, tzinfo=timezone.utc)
     clock = {"now": t0}
@@ -2730,7 +2730,7 @@ async def test_d043_downgrade_rolls_up_late_settled_attempts_into_parent_before_
             svc1,
             user_id="u1",
             user_prompt="downgrade rollup test",
-            scope_ref="review:d043-downgrade",
+            scope_ref="review:d044-downgrade",
             purpose="publish.review",
             request_model="grok-4.7",
             response_schema=_VerdictSchema,
@@ -2751,7 +2751,7 @@ async def test_d043_downgrade_rolls_up_late_settled_attempts_into_parent_before_
         svc2,
         user_id="u1",
         user_prompt="downgrade rollup test",
-        scope_ref="review:d043-downgrade",
+        scope_ref="review:d044-downgrade",
         purpose="publish.review",
         request_model="grok-4.7",
         response_schema=_VerdictSchema,
@@ -2766,14 +2766,14 @@ async def test_d043_downgrade_rolls_up_late_settled_attempts_into_parent_before_
 
     # Round 4 Carbon Medium #4 already syncs late attempt 1 back into parent; also seed a
     # lagging parent row (simulating a pre-r4 row where parent only holds c2 while attempts has c1+c2)
-    # to prove d043.downgrade() rolls up lagging rows AND is idempotent on already-synced rows.
+    # to prove d044.downgrade() rolls up lagging rows AND is idempotent on already-synced rows.
     assert store.rows[inv_id]["cash_usd"] == c1 + c2
     assert store.attempts[(inv_id, 1, 1)]["cash_usd"] == c1
     assert store.attempts[(inv_id, 2, 1)]["cash_usd"] == c2
     store.rows[inv_id]["cash_usd"] = c2
     store.rows[inv_id]["usage"] = {**u2, "total_tokens": u2["input_tokens"] + u2["output_tokens"]}
 
-    # Execute d043.downgrade(), verifying rollup SQL runs BEFORE DROP TABLE and mirrors its semantics
+    # Execute d044.downgrade(), verifying rollup SQL runs BEFORE DROP TABLE and mirrors its semantics
     downgrade_steps: list[str] = []
     attempts_dropped = False
 
@@ -2835,8 +2835,8 @@ async def test_d043_downgrade_rolls_up_late_settled_attempts_into_parent_before_
             store.attempts.clear()
             attempts_dropped = True
 
-    monkeypatch.setattr(d043.op, "execute", _exec_downgrade_sql)
-    d043.downgrade()
+    monkeypatch.setattr(d044.op, "execute", _exec_downgrade_sql)
+    d044.downgrade()
 
     assert downgrade_steps == ["rollup", "drop"]
     assert attempts_dropped is True
@@ -2872,21 +2872,21 @@ async def test_d043_downgrade_rolls_up_late_settled_attempts_into_parent_before_
 
 
 @pytest.mark.asyncio
-async def test_d043_backfill_pending_row_with_prior_cost_maps_outcome_and_prior_attempt(
+async def test_d044_backfill_pending_row_with_prior_cost_maps_outcome_and_prior_attempt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Carbon High #1 (d043:45, 93-101, 155-160):
+    """Carbon High #1 (d044:45, 93-101, 155-160):
     A historical `done` row (`persist_raw=False` / `persist_response=False` / pruned `response`)
     with `cash_usd > 0` (and an OAuth row with `notional_usd > 0`) is reclaimed into
-    `state = 'pending', attempt >= 2` when `d043` backfill runs.
+    `state = 'pending', attempt >= 2` when `d044` backfill runs.
     Backfill MUST:
     1) Never insert `outcome = 'pending'` (which violates `CHECK (outcome IN ('done', 'failed', 'indeterminate'))`).
     2) Write prior cost to `GREATEST(1, j.attempt - 1)` instead of occupying in-flight `j.attempt`.
     3) Leave in-flight `attempt = 2` free so when attempt 2 completes, BOTH c1 and c2 are billed."""
-    from src.dalton.migrations.versions import d043_llm_journal_attempts as d043
+    from src.dalton.migrations.versions import d044_llm_journal_attempts as d044
 
     # Verify both online and offline backfill SQL use safe attempt/outcome mapping
-    for sql_text in (d043._ONLINE_BACKFILL_BATCH_SQL, d043._OFFLINE_BATCHED_BACKFILL_SQL):
+    for sql_text in (d044._ONLINE_BACKFILL_BATCH_SQL, d044._OFFLINE_BATCHED_BACKFILL_SQL):
         assert "WHEN j.state = 'pending' THEN GREATEST(1, j.attempt - 1)" in sql_text
         assert "WHEN j.state IN ('done', 'failed', 'indeterminate') THEN j.state" in sql_text
         assert "ELSE 'indeterminate'" in sql_text
@@ -2922,7 +2922,7 @@ async def test_d043_backfill_pending_row_with_prior_cost_maps_outcome_and_prior_
     )
     assert res1.ok is True
     inv_cash = res1.invocation_id
-    # Simulate pre-d043 state (attempts table doesn't exist yet) and reclaim into state='pending', attempt=2
+    # Simulate pre-d044 state (attempts table doesn't exist yet) and reclaim into state='pending', attempt=2
     store.attempts.clear()
     act2, row2 = await journal_db.claim_journal_invocation(
         invocation_id=inv_cash,
@@ -2940,7 +2940,7 @@ async def test_d043_backfill_pending_row_with_prior_cost_maps_outcome_and_prior_
     assert row2["attempt"] == 2
     assert row2["cash_usd"] == c1
 
-    # Also seed a pre-d043 OAuth row reclaimed into state='pending', attempt=3 with prior notional_usd
+    # Also seed a pre-d044 OAuth row reclaimed into state='pending', attempt=3 with prior notional_usd
     # and prior unknown_usage_calls=1 (from an earlier indeterminate attempt)
     inv_oauth = "lj1:carbon-h1-oauth-pending"
     store.rows[inv_oauth] = {
@@ -2965,7 +2965,7 @@ async def test_d043_backfill_pending_row_with_prior_cost_maps_outcome_and_prior_
         "created_at": t0,
     }
 
-    # Emulate d043 backfill SQL semantics WITH strict CHECK constraint enforcement
+    # Emulate d044 backfill SQL semantics WITH strict CHECK constraint enforcement
     allowed_outcomes = {"done", "failed", "indeterminate"}
     for inv_id, j in store.rows.items():
         if not (

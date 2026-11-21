@@ -1,4 +1,4 @@
-"""Dalton d043: per-request LLM journal billing ledger (`dalton_llm_journal_attempts`).
+"""Dalton d044: per-request LLM journal billing ledger (`dalton_llm_journal_attempts`).
 
 Records each individual upstream request of a `dalton_llm_journal` invocation keyed by
 `(invocation_id, attempt, call_seq)` with its own send timestamp `occurred_at`, `usage`,
@@ -11,11 +11,11 @@ This enables:
   parent journal row without clobbering the newer attempt's state or response,
 - preserving unknown-usage records from earlier timed-out/stream-cut attempts
   even after a subsequent resend succeeds,
-- rolling back cleanly to d042 without losing late-settled attempt costs or usage by
+- rolling back cleanly to d043 without losing late-settled attempt costs or usage by
   aggregating per-request ledger rows back into `dalton_llm_journal` before drop.
 
-Revision ID: d043
-Revises: d042
+Revision ID: d044
+Revises: d043
 Create Date: 2026-11-21
 """
 
@@ -26,8 +26,8 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
-revision: str = "d043"
-down_revision: Union[str, None] = "d042"
+revision: str = "d044"
+down_revision: Union[str, None] = "d043"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -518,7 +518,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '5s'")
     # Roll up per-request attempt billing, token usage, per_call_usages, and attempt_details
-    # back into `dalton_llm_journal` (the table d042 reads) BEFORE dropping the attempts table.
+    # back into `dalton_llm_journal` (the table d043 reads) BEFORE dropping the attempts table.
     op.execute(_DOWNGRADE_ROLLUP_SQL)
     op.execute(
         "ALTER TABLE IF EXISTS dalton_llm_journal_attempts "
