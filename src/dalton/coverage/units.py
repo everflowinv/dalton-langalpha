@@ -473,6 +473,19 @@ AUTO_REGISTER_MAX_TICKER_LEN = 32
 AUTO_REGISTER_MAX_DISPLAY_NAME_LEN = 120
 
 
+async def is_workspace_coverage_registration_active(user_id: str | None) -> bool:
+    """Return True when Dalton + coverage_units are enabled and caller is internal or admin."""
+    from src.dalton.access_tiers import is_internal_or_admin
+    from src.dalton.settings import get_dalton_settings, is_coverage_units_enabled
+
+    if not get_dalton_settings().enabled or not is_coverage_units_enabled():
+        return False
+    uid = str(user_id or "").strip()
+    if not uid:
+        return False
+    return await is_internal_or_admin(uid)
+
+
 async def authorize_coverage_unit_registration(caller: Any) -> str:
     """Enforce the shared coverage-unit write gate for ``POST /coverage/units`` and workspace auto-registration.
 

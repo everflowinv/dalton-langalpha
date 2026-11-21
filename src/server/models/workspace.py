@@ -69,8 +69,8 @@ class WorkspaceCreate(BaseModel):
         False,
         description="Skip company workspace deduplication check after user confirmation",
     )
-    # DALTON-HOOK(workspace-dedup): optional coverage unit auto-registration fields on workspace create (length validated at registration so create is never blocked with 422).
-    coverage_kind: Optional[Literal["company", "sector", "none"]] = Field(
+    # DALTON-HOOK(workspace-dedup): optional coverage unit auto-registration fields on workspace create (validated at registration so create is never blocked with 422).
+    coverage_kind: Optional[str] = Field(
         None,
         description="Optional coverage unit kind to register and bind on creation: company, sector, or none",
     )

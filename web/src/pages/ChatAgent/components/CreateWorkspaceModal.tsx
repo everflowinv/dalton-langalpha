@@ -276,6 +276,7 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
           setRefusal({ kind: 'companyExists', requestedName: submittedName, ...companyExists });
           const suggestion = companyExists.suggestion;
           if (
+            coverageUnitsEnabled &&
             suggestion &&
             (suggestion.coverage_kind === 'company' || suggestion.coverage_kind === 'sector') &&
             !coverageUserEditedRef.current &&
@@ -287,7 +288,7 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
             setCoveragePrefilled(true);
           }
         }
-      } else if (coverageSuggestion) {
+      } else if (coverageUnitsEnabled && coverageSuggestion) {
         if (latestNameRef.current.trim() === submittedName) {
           setRefusal({
             kind: 'coverageSuggestion',

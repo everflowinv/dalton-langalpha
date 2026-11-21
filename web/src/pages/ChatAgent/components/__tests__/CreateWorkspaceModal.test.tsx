@@ -683,7 +683,7 @@ describe('CreateWorkspaceModal, duplicate company workspace', () => {
               detail: {
                 code: 'company_workspace_exists',
                 message: 'dup',
-                matches: [{ workspace_name: 'NVDA', owner_name: 'Richard', can_read: false }],
+                matches: [{ workspace_name: 'NVDA', owner_name: 'Richard', can_read: true }],
                 suggestion: {
                   coverage_kind: 'company',
                   ticker: 'NVDA',
@@ -915,19 +915,22 @@ describe('CreateWorkspaceModal, duplicate company workspace', () => {
     }
   });
 
-  // DALTON-HOOK(workspace-dedup): hides coverage fields for external members (isError) or when coverage_units disabled
-  it('hides coverage unit fields when coverage units are disabled or caller is external (isError)', async () => {
+  // DALTON-HOOK(workspace-dedup): hides coverage fields when coverage_units disabled, loading, or caller is external / company tier (isError)
+  it('hides coverage unit fields when coverage units are disabled, loading, or caller is external / company tier (isError)', async () => {
     const user = userEvent.setup();
     vi.mocked(useDaltonCoverageUnits).mockReturnValue({
-      data: { enabled: false, units: [], unclassified: [] },
+      data: { enabled: false },
       isError: false,
     } as unknown as ReturnType<typeof useDaltonCoverageUnits>);
     const onCreateDisabled = vi.fn().mockResolvedValue(LIVE_CREATED);
-    setup(onCreateDisabled);
+    const first = renderWithProviders(
+      <CreateWorkspaceModal isOpen onClose={vi.fn()} onCreate={onCreateDisabled} />,
+    );
 
     expect(screen.queryByRole('button', { name: 'Company' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Sector' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Other' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/ticker/i)).not.toBeInTheDocument();
     await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'My Research');
     await user.click(screen.getByRole('button', { name: /^create$/i }));
     await waitFor(() =>
@@ -936,12 +939,38 @@ describe('CreateWorkspaceModal, duplicate company workspace', () => {
         description: '',
       }),
     );
+    first.unmount();
 
+    // 403 error (external member or company tier) or 404 (Dalton disabled)
     vi.mocked(useDaltonCoverageUnits).mockReturnValue({
       data: undefined,
       isError: true,
     } as unknown as ReturnType<typeof useDaltonCoverageUnits>);
-    setup(vi.fn());
-    expect(screen.queryAllByRole('button', { name: 'Company' })).toHaveLength(0);
+    const onCreateForbidden = vi.fn().mockResolvedValue(LIVE_CREATED);
+    const second = renderWithProviders(
+      <CreateWorkspaceModal isOpen onClose={vi.fn()} onCreate={onCreateForbidden} />,
+    );
+    expect(screen.queryByRole('button', { name: 'Company' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Sector' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Other' })).not.toBeInTheDocument();
+    await user.type(screen.getByPlaceholderText(/enter workspace name/i), 'External Ws');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+    await waitFor(() =>
+      expect(onCreateForbidden).toHaveBeenCalledWith({
+        name: 'External Ws',
+        description: '',
+      }),
+    );
+    second.unmount();
+
+    // Loading state before GET /coverage/units resolves also keeps fields hidden
+    vi.mocked(useDaltonCoverageUnits).mockReturnValue({
+      data: undefined,
+      isError: false,
+    } as unknown as ReturnType<typeof useDaltonCoverageUnits>);
+    renderWithProviders(
+      <CreateWorkspaceModal isOpen onClose={vi.fn()} onCreate={vi.fn()} />,
+    );
+    expect(screen.queryByRole('button', { name: 'Company' })).not.toBeInTheDocument();
   });
 });

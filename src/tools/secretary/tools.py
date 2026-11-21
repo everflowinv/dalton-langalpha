@@ -300,11 +300,14 @@ async def workspaces_create(
 
     # --- DALTON-HOOK(workspace-dedup): begin ---
     from src.dalton.coverage.dedup import find_existing_company_workspace
+    from src.dalton.coverage.units import is_workspace_coverage_registration_active
 
-    wants_coverage = bool(
-        coverage_kind
-        and str(coverage_kind).strip().lower() not in ("", "none", "other")
-    )
+    raw_coverage_kind = str(coverage_kind or "").strip().lower()
+    requested_coverage = raw_coverage_kind not in ("", "none", "other")
+    coverage_active: bool | None = None
+    if requested_coverage:
+        coverage_active = await is_workspace_coverage_registration_active(user_id)
+    wants_coverage = bool(requested_coverage and coverage_active)
     if not allow_duplicate_company:
         dup = None
         try:
@@ -335,27 +338,30 @@ async def workspaces_create(
             and not wants_coverage
             and not skip_coverage_suggestion
         ):
-            suggestion = dup.suggestion_payload()
-            kind_label = (
-                "公司" if dup.suggestion.coverage_kind == "company" else "行业"
-            )
-            ticker_note = (
-                f"（代码 {dup.suggestion.ticker}）"
-                if dup.suggestion.ticker
-                else ""
-            )
-            msg = (
-                f"「{name}」识别为{kind_label}{ticker_note}，"
-                "请按 suggestion 带上 coverage_kind / ticker / display_name 重新新建以自动登记覆盖单元，"
-                "或在用户明确不要登记时传 skip_coverage_suggestion=True。"
-            )
-            return error_command(
-                msg,
-                tool_call_id,
-                code="coverage_suggestion",
-                message=msg,
-                suggestion=suggestion,
-            )
+            if coverage_active is None:
+                coverage_active = await is_workspace_coverage_registration_active(user_id)
+            if coverage_active:
+                suggestion = dup.suggestion_payload()
+                kind_label = (
+                    "公司" if dup.suggestion.coverage_kind == "company" else "行业"
+                )
+                ticker_note = (
+                    f"（代码 {dup.suggestion.ticker}）"
+                    if dup.suggestion.ticker
+                    else ""
+                )
+                msg = (
+                    f"「{name}」识别为{kind_label}{ticker_note}，"
+                    "请按 suggestion 带上 coverage_kind / ticker / display_name 重新新建以自动登记覆盖单元，"
+                    "或在用户明确不要登记时传 skip_coverage_suggestion=True。"
+                )
+                return error_command(
+                    msg,
+                    tool_call_id,
+                    code="coverage_suggestion",
+                    message=msg,
+                    suggestion=suggestion,
+                )
     # --- DALTON-HOOK(workspace-dedup): end ---
 
     if not preapproved:

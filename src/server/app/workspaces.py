@@ -256,8 +256,14 @@ async def create_workspace(
         )
         # --- DALTON-HOOK(workspace-dedup): begin ---
         from src.dalton.coverage.dedup import find_existing_company_workspace
+        from src.dalton.coverage.units import is_workspace_coverage_registration_active
 
-        wants_coverage = bool(request.coverage_kind and request.coverage_kind != "none")
+        raw_coverage_kind = str(request.coverage_kind or "").strip().lower()
+        requested_coverage = raw_coverage_kind not in ("", "none", "other")
+        coverage_active: bool | None = None
+        if requested_coverage:
+            coverage_active = await is_workspace_coverage_registration_active(x_user_id)
+        wants_coverage = bool(requested_coverage and coverage_active)
         if request.allow_duplicate_company:
             matched_ids: list[str] = []
             try:
@@ -311,23 +317,26 @@ async def create_workspace(
                 and not wants_coverage
                 and not request.skip_coverage_suggestion
             ):
-                suggestion = dup.suggestion_payload()
-                kind_label = (
-                    "公司" if dup.suggestion.coverage_kind == "company" else "行业"
-                )
-                ticker_note = (
-                    f"（代码 {dup.suggestion.ticker}）"
-                    if dup.suggestion.ticker
-                    else ""
-                )
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "coverage_suggestion",
-                        "message": f"「{request.name}」识别为{kind_label}{ticker_note}，是否自动登记覆盖单元并创建工作区？",
-                        "suggestion": suggestion,
-                    },
-                )
+                if coverage_active is None:
+                    coverage_active = await is_workspace_coverage_registration_active(x_user_id)
+                if coverage_active:
+                    suggestion = dup.suggestion_payload()
+                    kind_label = (
+                        "公司" if dup.suggestion.coverage_kind == "company" else "行业"
+                    )
+                    ticker_note = (
+                        f"（代码 {dup.suggestion.ticker}）"
+                        if dup.suggestion.ticker
+                        else ""
+                    )
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "coverage_suggestion",
+                            "message": f"「{request.name}」识别为{kind_label}{ticker_note}，是否自动登记覆盖单元并创建工作区？",
+                            "suggestion": suggestion,
+                        },
+                    )
         # --- DALTON-HOOK(workspace-dedup): end ---
         manager = WorkspaceManager.get_instance()
         with computer_cause("create"):

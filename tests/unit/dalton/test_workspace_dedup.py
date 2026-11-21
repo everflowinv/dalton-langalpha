@@ -2640,7 +2640,7 @@ async def test_internal_caller_ignores_byok_base_url_and_uses_server_credentials
 
 
 @pytest.mark.asyncio
-async def test_external_caller_disables_team_credential_sharing_and_fails_open_without_own_credentials(
+async def test_external_caller_uses_team_shared_credentials_and_own_candidates_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import ptc_agent.config as ptc_cfg_mod
@@ -2654,6 +2654,8 @@ async def test_external_caller_disables_team_credential_sharing_and_fails_open_w
     import src.server.database.user as user_db
     import src.server.services.features as features_mod
     import src.server.services.llm.service as llm_svc_mod
+    import src.server.services.oauth_health as oauth_health_mod
+    from src.server.services.oauth_protocol import TokenSet
     import src.server.services.user_skills as user_skills_mod
 
     _enable_team_mode(monkeypatch)
@@ -2670,10 +2672,17 @@ async def test_external_caller_disables_team_credential_sharing_and_fails_open_w
                 owner_id=USER_EXTERNAL,
                 owner_name="ExtUser",
                 owner_email=EMAIL_EXTERNAL,
-            )
+            ),
+            _ws_row(
+                ws_id=WS_2,
+                name="TeamSecretNvidia",
+                owner_id=USER_CY,
+                owner_name="CY",
+                owner_email=EMAIL_CY,
+            ),
         ],
     )
-    _install_read_access(monkeypatch, web_readable={WS_4})
+    _install_read_access(monkeypatch, web_readable={WS_4, WS_2})
 
     fake_cfg = create_autospec(ptc_cfg_mod.AgentConfig, instance=True)
     fake_cfg.llm = LLMConfig(name="gemini-4-hydrogen-low-oauth", background="deepseek-flash")
@@ -2705,6 +2714,17 @@ async def test_external_caller_disables_team_credential_sharing_and_fails_open_w
         create_autospec(features_mod.effective_flags_for_user, return_value={}),
     )
 
+    journal_claims: list[dict[str, Any]] = []
+    journal_dones: list[dict[str, Any]] = []
+
+    async def _claim(**kwargs: Any) -> tuple[str, dict[str, Any]]:
+        journal_claims.append(dict(kwargs))
+        return "claimed", {"attempt": 1, **kwargs}
+
+    async def _done(inv_id: str, **kwargs: Any) -> dict[str, Any]:
+        journal_dones.append({"invocation_id": inv_id, **kwargs})
+        return {"invocation_id": inv_id, **kwargs}
+
     monkeypatch.setattr(
         complete_mod,
         "_check_cash_budget_admission",
@@ -2718,10 +2738,12 @@ async def test_external_caller_disables_team_credential_sharing_and_fails_open_w
     monkeypatch.setattr(
         complete_mod,
         "claim_journal_invocation",
-        create_autospec(
-            complete_mod.claim_journal_invocation,
-            return_value=("claimed", {"attempt": 1}),
-        ),
+        create_autospec(complete_mod.claim_journal_invocation, side_effect=_claim),
+    )
+    monkeypatch.setattr(
+        complete_mod,
+        "complete_journal_done",
+        create_autospec(complete_mod.complete_journal_done, side_effect=_done),
     )
     monkeypatch.setattr(
         complete_mod,
@@ -2732,61 +2754,76 @@ async def test_external_caller_disables_team_credential_sharing_and_fails_open_w
     # Team holder (USER_RICHARD) has OAuth tokens in DB; external user (USER_EXTERNAL) has none.
     seen_oauth_queries: list[tuple[str, str, bool]] = []
 
-    async def _get_tokens(uid: str, provider: str, *, conn: Any = None) -> dict[str, Any] | None:
+    async def _valid_tok(uid: str, provider: str) -> TokenSet | None:
         resolved_uid = cred_mod.credential_user_id(uid)
         seen_oauth_queries.append((uid, resolved_uid, cred_mod.is_team_credential_sharing_enabled()))
-        if resolved_uid == USER_RICHARD:
-            return {
-                "access_token": "holder-token",
-                "refresh_token": "holder-refresh",
-                "account_id": "acct-holder",
-                "email": EMAIL_RICHARD,
-                "plan_type": "pro",
-                "expires_at": NOW + timedelta(hours=2),
-            }
+        if resolved_uid == USER_RICHARD and provider == "antigravity-oauth":
+            return TokenSet(
+                access_token="holder-token",
+                refresh_token="holder-refresh",
+                account_id="acct-holder",
+                email=EMAIL_RICHARD,
+                plan_type="pro",
+                expires_at=NOW + timedelta(hours=2),
+            )
         return None
 
+    monkeypatch.setattr(
+        oauth_health_mod,
+        "valid_token",
+        create_autospec(oauth_health_mod.valid_token, side_effect=_valid_tok),
+    )
     monkeypatch.setattr(
         oauth_tokens_db,
         "get_oauth_tokens",
-        create_autospec(oauth_tokens_db.get_oauth_tokens, side_effect=_get_tokens),
+        create_autospec(oauth_tokens_db.get_oauth_tokens, return_value=None),
     )
-    import src.server.services.oauth_health as oauth_health_mod
-
-    monkeypatch.setattr(oauth_health_mod, "get_oauth_tokens", oauth_tokens_db.get_oauth_tokens)
-
-    seen_byok_queries: list[tuple[str, str]] = []
-
-    async def _get_byok(uid: str, provider: str) -> dict[str, Any] | None:
-        resolved_uid = cred_mod.credential_user_id(uid)
-        seen_byok_queries.append((uid, resolved_uid))
-        return None
-
     monkeypatch.setattr(
         api_keys_db,
         "get_byok_config_for_provider",
-        create_autospec(api_keys_db.get_byok_config_for_provider, side_effect=_get_byok),
+        create_autospec(api_keys_db.get_byok_config_for_provider, return_value=None),
     )
     monkeypatch.setattr(
         api_keys_db,
         "get_byok_configs_for_providers",
         create_autospec(api_keys_db.get_byok_configs_for_providers, return_value={}),
     )
-    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
 
-    api_call_spy = create_autospec(llm_svc_mod.make_api_call)
-    monkeypatch.setattr(llm_svc_mod, "make_api_call", api_call_spy)
+    seen_prompts: list[str] = []
+
+    async def _fake_api_call(_llm: Any, **kw: Any) -> tuple[DedupLlmResult, dict[str, Any]]:
+        seen_prompts.append(str(kw.get("user_prompt") or ""))
+        return (
+            DedupLlmResult(
+                matches=[DedupMatchItem(id="c1", confidence="high", reason="same")],
+                suggested_kind="company",
+                suggested_confidence="high",
+                suggested_ticker="NVDA",
+                suggested_display_name="NVIDIA Corporation",
+            ),
+            {"input_tokens": 50, "output_tokens": 10},
+        )
+
+    monkeypatch.setattr(
+        llm_svc_mod,
+        "make_api_call",
+        create_autospec(llm_svc_mod.make_api_call, side_effect=_fake_api_call),
+    )
 
     res = await find_existing_company_workspace(USER_EXTERNAL, "NVIDIA")
-    assert res is None
-    api_call_spy.assert_not_awaited()
+    assert res is not None
+    assert res.workspace_id == WS_4
+    assert res.suggestion is None
+    assert len(seen_prompts) == 1
+    assert "MyNVDA" in seen_prompts[0]
+    assert "TeamSecretNvidia" not in seen_prompts[0]
     assert seen_oauth_queries
     assert all(
-        uid == USER_EXTERNAL and resolved == USER_EXTERNAL and sharing is False
+        uid == USER_EXTERNAL and resolved == USER_RICHARD and sharing is True
         for uid, resolved, sharing in seen_oauth_queries
     )
-    assert all(resolved == USER_EXTERNAL for _uid, resolved in seen_byok_queries)
-    # Team credential sharing remains intact outside the external dedup call.
+    assert journal_claims[0]["user_id"] == USER_EXTERNAL
+    assert journal_dones[0]["usage"]["credential_user_id"] == USER_RICHARD
     assert cred_mod.is_team_credential_sharing_enabled() is True
     settings_mod.get_dalton_config.cache_clear()
 
@@ -3498,12 +3535,11 @@ async def test_personal_assist_model_preferences_do_not_affect_dedup_models(
 
 
 @pytest.mark.asyncio
-async def test_external_caller_without_own_credentials_skips_llm_and_never_uses_platform_key(
+async def test_external_caller_follows_normal_chat_platform_fallback_when_sharing_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import ptc_agent.config as ptc_cfg_mod
     from ptc_agent.config.agent import LLMConfig
-    import src.dalton.credentials as cred_mod
     import src.dalton.llm.complete as complete_mod
     import src.dalton.llm.model_prefs as model_prefs_mod
     import src.dalton.settings as settings_mod
@@ -3515,36 +3551,36 @@ async def test_external_caller_without_own_credentials_skips_llm_and_never_uses_
     import src.server.services.user_skills as user_skills_mod
 
     _enable_team_mode(monkeypatch)
-    monkeypatch.setenv("DALTON_PM_USER_IDS", USER_RICHARD)
-    # Deployment platform keys ARE set in env, and team holder has OAuth tokens!
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-platform-deepseek-secret")
-    monkeypatch.setenv("ZAI_CN_CODING_API_KEY", "sk-platform-zai-coding-secret")
-    settings_mod.get_dalton_config.cache_clear()
-
-    base_cfg = settings_mod.get_dalton_settings()
-    coding_and_deepseek_cfg = base_cfg.model_copy(
+    orig_load_cfg = settings_mod._load_base_dalton_config
+    base_cfg = orig_load_cfg()
+    off_cfg = base_cfg.model_copy(
         update={
+            "enabled": True,
+            "credentials": settings_mod.DaltonCredentialsConfig(sharing="off"),
             "models": base_cfg.models.model_copy(
                 update={
                     "assist_model": "gemini-4-hydrogen-low-oauth",
-                    "assist_fallback_model": ["glm-5.3-flash-plan", "deepseek-flash"],
+                    "assist_fallback_model": ["deepseek-flash"],
                 }
-            )
+            ),
         }
+    )
+    monkeypatch.setattr(
+        settings_mod,
+        "_load_base_dalton_config",
+        create_autospec(orig_load_cfg, return_value=off_cfg),
     )
     monkeypatch.setattr(
         model_prefs_mod,
         "get_dalton_settings",
-        create_autospec(model_prefs_mod.get_dalton_settings, return_value=coding_and_deepseek_cfg),
+        create_autospec(model_prefs_mod.get_dalton_settings, return_value=off_cfg),
     )
     monkeypatch.setattr(
         model_prefs_mod,
         "get_assist_fallback_models",
-        create_autospec(
-            model_prefs_mod.get_assist_fallback_models,
-            return_value=["glm-5.3-flash-plan", "deepseek-flash"],
-        ),
+        create_autospec(model_prefs_mod.get_assist_fallback_models, return_value=["deepseek-flash"]),
     )
+    settings_mod.get_dalton_config.cache_clear()
 
     _install_db(
         monkeypatch,
@@ -3603,27 +3639,18 @@ async def test_external_caller_without_own_credentials_skips_llm_and_never_uses_
     )
     monkeypatch.setattr(
         complete_mod,
+        "complete_journal_done",
+        create_autospec(complete_mod.complete_journal_done, return_value={}),
+    )
+    monkeypatch.setattr(
+        complete_mod,
         "complete_journal_failed",
         create_autospec(complete_mod.complete_journal_failed, return_value={}),
     )
-
-    async def _get_tokens(uid: str, provider: str, *, conn: Any = None) -> dict[str, Any] | None:
-        resolved = cred_mod.credential_user_id(uid)
-        if resolved == USER_RICHARD:
-            return {
-                "access_token": "holder-token",
-                "refresh_token": "holder-refresh",
-                "account_id": "acct-holder",
-                "email": EMAIL_RICHARD,
-                "plan_type": "pro",
-                "expires_at": NOW + timedelta(hours=2),
-            }
-        return None
-
     monkeypatch.setattr(
         oauth_tokens_db,
         "get_oauth_tokens",
-        create_autospec(oauth_tokens_db.get_oauth_tokens, side_effect=_get_tokens),
+        create_autospec(oauth_tokens_db.get_oauth_tokens, return_value=None),
     )
     import src.server.services.oauth_health as oauth_health_mod
 
@@ -3639,51 +3666,25 @@ async def test_external_caller_without_own_credentials_skips_llm_and_never_uses_
         create_autospec(api_keys_db.get_byok_configs_for_providers, return_value={}),
     )
 
-    api_call_spy = create_autospec(llm_svc_mod.make_api_call)
+    api_call_spy = create_autospec(
+        llm_svc_mod.make_api_call,
+        return_value=(
+            DedupLlmResult(matches=[DedupMatchItem(id="c1", confidence="high", reason="same")]),
+            {"input_tokens": 10, "output_tokens": 5},
+        ),
+    )
     monkeypatch.setattr(llm_svc_mod, "make_api_call", api_call_spy)
 
-    # 1. External caller has no OAuth and no BYOK -> must NOT use DEEPSEEK_API_KEY,
-    # ZAI_CN_CODING_API_KEY, or team OAuth; skips LLM and allows creation.
+    # 1. Sharing OFF + no own creds + no platform env key -> fails open.
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     assert await find_existing_company_workspace(USER_EXTERNAL, "NVIDIA") is None
     api_call_spy.assert_not_awaited()
 
-    # 2. Direct LLMService.complete check: disable_platform_fallback=True blocks both
-    # user_id=None, eager PLATFORM (glm-5.3-flash-plan), and lazy NONE (deepseek-flash),
-    # while default disable_platform_fallback=False still permits platform fallback.
-    from src.llms.llm import MissingProviderKeyError
-
-    svc = llm_svc_mod.LLMService(agent_config=fake_cfg)
-    with pytest.raises(MissingProviderKeyError):
-        await svc.complete(
-            user_id=None,
-            user_prompt="hi",
-            request_model="deepseek-flash",
-            disable_platform_fallback=True,
-        )
-    with pytest.raises(MissingProviderKeyError):
-        await svc.complete(
-            user_id=USER_EXTERNAL,
-            user_prompt="hi",
-            request_model="glm-5.3-flash-plan",
-            disable_platform_fallback=True,
-        )
-    with pytest.raises(MissingProviderKeyError):
-        await svc.complete(
-            user_id=USER_EXTERNAL,
-            user_prompt="hi",
-            request_model="deepseek-flash",
-            disable_platform_fallback=True,
-        )
-    api_call_spy.assert_not_awaited()
-
-    api_call_spy.return_value = ("ok", {"input_tokens": 1, "output_tokens": 1})
-    default_res = await svc.complete(
-        user_id=USER_EXTERNAL,
-        user_prompt="hi",
-        request_model="deepseek-flash",
-        return_token_usage=True,
-    )
-    assert default_res == ("ok", {"input_tokens": 1, "output_tokens": 1})
+    # 2. Sharing OFF + DEEPSEEK_API_KEY set -> falls back to platform key, same as normal chat.
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-platform-deepseek-secret")
+    match = await find_existing_company_workspace(USER_EXTERNAL, "NVIDIA")
+    assert match is not None
+    assert match.workspace_id == WS_4
     api_call_spy.assert_awaited_once()
     settings_mod.get_dalton_config.cache_clear()
 
@@ -3871,14 +3872,14 @@ async def test_probe_script_passes_is_external_for_external_member(
     )
     monkeypatch.setattr(dedup_mod, "_judge_candidates_with_llm", judge_spy)
 
-    # External member -> is_external=True, and dalton_complete receives external isolation flags.
+    # External member -> is_external=True (own candidates only), standard team/normal-chat creds (no disable flags).
     ext_report = await probe_mod.probe_names(["NVDA"], user_id=USER_EXTERNAL)
     assert ext_report["caller_tier"] == "external"
     assert judge_spy.call_args.kwargs["is_external"] is True
     assert len(calls) == 1
     assert calls[0]["is_byok"] is True
-    assert calls[0]["disable_team_credentials"] is True
-    assert calls[0]["disable_platform_fallback"] is True
+    assert "disable_team_credentials" not in calls[0]
+    assert "disable_platform_fallback" not in calls[0]
 
     # Internal member -> is_external=False.
     calls.clear()
@@ -3886,8 +3887,9 @@ async def test_probe_script_passes_is_external_for_external_member(
     int_report = await probe_mod.probe_names(["NVDA"], user_id=USER_CALLER)
     assert int_report["caller_tier"] == "internal"
     assert judge_spy.call_args.kwargs["is_external"] is False
-    assert calls[0]["disable_team_credentials"] is False
-    assert calls[0]["disable_platform_fallback"] is False
+    assert calls[0]["is_byok"] is False
+    assert "disable_team_credentials" not in calls[0]
+    assert "disable_platform_fallback" not in calls[0]
 
 
 @pytest.mark.asyncio
@@ -4777,21 +4779,22 @@ async def test_auto_register_ticker_conflict_keeps_workspace_and_returns_hint(
 
 
 @pytest.mark.asyncio
-async def test_external_member_never_registers_coverage_unit(
+async def test_coverage_fields_ignored_when_disabled_or_external_or_company_tier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """R10: coverage_kind/ticker/display_name are ignored (no registration, no warning) when disabled, external, or company tier; 'other' never 422s."""
     import src.dalton.access_tiers as access_tiers_mod
     import src.dalton.coverage.units as cu_svc
+    import src.tools.secretary.tools as sec_tools
     from src.server.app.workspaces import router
 
-    _enable_team_mode(monkeypatch, caller_tier="external")
-    monkeypatch.setattr(
-        access_tiers_mod,
-        "is_internal_or_admin",
-        create_autospec(access_tiers_mod.is_internal_or_admin, return_value=False),
-    )
     reg_spy = create_autospec(cu_svc.register_coverage_unit)
     monkeypatch.setattr(cu_svc, "register_coverage_unit", reg_spy)
+    auto_reg_spy = create_autospec(
+        cu_svc.auto_register_workspace_coverage_unit,
+        wraps=cu_svc.auto_register_workspace_coverage_unit,
+    )
+    monkeypatch.setattr(cu_svc, "auto_register_workspace_coverage_unit", auto_reg_spy)
 
     app = create_test_app(router)
     mgr = create_autospec(WorkspaceManager, instance=True)
@@ -4807,40 +4810,8 @@ async def test_external_member_never_registers_coverage_unit(
         "updated_at": NOW,
         "config": {},
     }
+    mgr.resolve_binding.return_value = None
     dedup_mock = create_autospec(_REAL_FIND_DEDUP, return_value=None)
-
-    with (
-        patch("src.dalton.coverage.dedup.find_existing_company_workspace", dedup_mock),
-        patch(
-            "src.server.app.workspaces.WorkspaceManager.get_instance",
-            create_autospec(WorkspaceManager.get_instance, return_value=mgr),
-        ),
-        patch(
-            "src.server.services.platform_client.platform_gating_active",
-            return_value=False,
-        ),
-    ):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            resp = await client.post(
-                "/api/v1/workspaces",
-                json={
-                    "name": "Nvidia",
-                    "coverage_kind": "company",
-                    "ticker": "NVDA",
-                },
-            )
-    assert resp.status_code == 201
-    body = resp.json()
-    assert body["workspace_id"] == WS_5
-    assert body["coverage_unit"] is None
-    assert "外部成员" in (body["coverage_unit_warning"] or "")
-    reg_spy.assert_not_awaited()
-
-    # CoS path for external member also skips registration and keeps workspace creation.
-    import src.tools.secretary.tools as sec_tools
-
     monkeypatch.setattr(
         sec_tools,
         "duplicate_workspace",
@@ -4851,38 +4822,152 @@ async def test_external_member_never_registers_coverage_unit(
         "hitl_confirm",
         create_autospec(hitl_confirm, return_value=(True, "ok")),
     )
-    mgr.resolve_binding.return_value = None
+
     with (
         patch("src.dalton.coverage.dedup.find_existing_company_workspace", dedup_mock),
         patch(
             "src.server.services.workspace_manager.WorkspaceManager.get_instance",
             create_autospec(WorkspaceManager.get_instance, return_value=mgr),
         ),
+        patch(
+            "src.server.services.platform_client.platform_gating_active",
+            return_value=False,
+        ),
     ):
-        cos_res = await chief_of_staff_workspaces.ainvoke(
-            {
-                "name": "manage_workspaces",
-                "args": {
-                    "action": "create",
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            # 1. External member -> backend ignores coverage fields (no registration, no warning).
+            _enable_team_mode(monkeypatch, caller_tier="external")
+            is_internal_spy = create_autospec(
+                access_tiers_mod.is_internal_or_admin, return_value=False
+            )
+            monkeypatch.setattr(
+                access_tiers_mod,
+                "is_internal_or_admin",
+                is_internal_spy,
+            )
+            resp_ext = await client.post(
+                "/api/v1/workspaces",
+                json={
                     "name": "Nvidia",
                     "coverage_kind": "company",
                     "ticker": "NVDA",
-                    "state": {},
+                    "display_name": "NVIDIA Corporation",
                 },
-                "id": "call-ext-cos",
-                "type": "tool_call",
-            },
-            config={"configurable": {"user_id": USER_EXTERNAL}},
-        )
-    cos_payload = json.loads(cos_res.update["messages"][0].content)
-    assert cos_payload["success"] is True
-    assert cos_payload["workspace_id"] == WS_5
-    assert "coverage_unit" not in cos_payload
-    assert "外部成员" in (cos_payload.get("coverage_unit_warning") or "")
-    assert cos_payload.get("coverage_unit_warning_detail") == {
-        "code": "external_member_forbidden",
-        "params": {},
-    }
+            )
+            assert resp_ext.status_code == 201
+            body_ext = resp_ext.json()
+            assert body_ext["workspace_id"] == WS_5
+            assert body_ext["coverage_unit"] is None
+            assert body_ext["coverage_unit_warning"] is None
+            assert body_ext["coverage_unit_warning_detail"] is None
+
+            cos_ext = await chief_of_staff_workspaces.ainvoke(
+                {
+                    "name": "manage_workspaces",
+                    "args": {
+                        "action": "create",
+                        "name": "Nvidia",
+                        "coverage_kind": "company",
+                        "ticker": "NVDA",
+                        "state": {},
+                    },
+                    "id": "call-ext-cos",
+                    "type": "tool_call",
+                },
+                config={"configurable": {"user_id": USER_EXTERNAL}},
+            )
+            cos_ext_payload = json.loads(cos_ext.update["messages"][0].content)
+            assert cos_ext_payload["success"] is True
+            assert "coverage_unit" not in cos_ext_payload
+            assert "coverage_unit_warning" not in cos_ext_payload
+            assert "coverage_unit_warning_detail" not in cos_ext_payload
+
+            # 2. Company tier -> backend ignores coverage fields (no registration, no warning).
+            _enable_team_mode(monkeypatch, caller_tier="company")
+            resp_company_tier = await client.post(
+                "/api/v1/workspaces",
+                json={
+                    "name": "Nvidia",
+                    "coverage_kind": "sector",
+                    "display_name": "Semiconductors",
+                },
+            )
+            assert resp_company_tier.status_code == 201
+            body_ct = resp_company_tier.json()
+            assert body_ct["coverage_unit"] is None
+            assert body_ct["coverage_unit_warning"] is None
+            assert body_ct["coverage_unit_warning_detail"] is None
+
+            cos_ct = await chief_of_staff_workspaces.ainvoke(
+                {
+                    "name": "manage_workspaces",
+                    "args": {
+                        "action": "create",
+                        "name": "Nvidia",
+                        "coverage_kind": "sector",
+                        "display_name": "Semiconductors",
+                        "state": {},
+                    },
+                    "id": "call-ct-cos",
+                    "type": "tool_call",
+                },
+                config={"configurable": {"user_id": "company-system-user"}},
+            )
+            cos_ct_payload = json.loads(cos_ct.update["messages"][0].content)
+            assert cos_ct_payload["success"] is True
+            assert "coverage_unit" not in cos_ct_payload
+            assert "coverage_unit_warning" not in cos_ct_payload
+
+            # 3. coverage_units disabled -> even internal member's coverage fields are ignored.
+            _enable_team_mode(monkeypatch, coverage_enabled=False, caller_tier="internal")
+            is_internal_spy.return_value = True
+            resp_disabled = await client.post(
+                "/api/v1/workspaces",
+                json={
+                    "name": "Nvidia",
+                    "coverage_kind": "company",
+                    "ticker": "NVDA",
+                },
+            )
+            assert resp_disabled.status_code == 201
+            body_dis = resp_disabled.json()
+            assert body_dis["coverage_unit"] is None
+            assert body_dis["coverage_unit_warning"] is None
+            assert body_dis["coverage_unit_warning_detail"] is None
+
+            cos_dis = await chief_of_staff_workspaces.ainvoke(
+                {
+                    "name": "manage_workspaces",
+                    "args": {
+                        "action": "create",
+                        "name": "Nvidia",
+                        "coverage_kind": "company",
+                        "ticker": "NVDA",
+                        "state": {},
+                    },
+                    "id": "call-dis-cos",
+                    "type": "tool_call",
+                },
+                config={"configurable": {"user_id": USER_CALLER}},
+            )
+            cos_dis_payload = json.loads(cos_dis.update["messages"][0].content)
+            assert cos_dis_payload["success"] is True
+            assert "coverage_unit" not in cos_dis_payload
+            assert "coverage_unit_warning" not in cos_dis_payload
+
+            # 4. coverage_kind="other" (enabled internal) never returns 422.
+            _enable_team_mode(monkeypatch, coverage_enabled=True, caller_tier="internal")
+            resp_other = await client.post(
+                "/api/v1/workspaces",
+                json={"name": "Misc Research", "coverage_kind": "other"},
+            )
+            assert resp_other.status_code == 201
+            assert resp_other.json()["coverage_unit"] is None
+            assert resp_other.json()["coverage_unit_warning"] is None
+
+    auto_reg_spy.assert_not_awaited()
     reg_spy.assert_not_awaited()
 
 

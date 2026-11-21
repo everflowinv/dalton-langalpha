@@ -13,9 +13,10 @@ Visibility, credentials, and authorization remain strictly deterministic in code
 - `company` tier callers bypass dedup.
 - `external` tier callers check ONLY their own live, non-Home,
   non-historical-duplicate workspaces (no coverage units, no internal data).
-  External callers always use their own credentials (never shared team
-  credentials); if missing credentials cause model calls to fail, dedup treats
-  it as an error, logs a warning, and allows creation to proceed.
+  Credential resolution follows the standard per-user / team-sharing rules
+  (`is_byok=True`, using team shared credentials when sharing is enabled, or
+  own credentials / platform fallback otherwise); if model calls fail, dedup
+  treats it as an error, logs a warning, and allows creation to proceed.
 - `admin` / `internal` tier callers check all internal members' live,
   non-Home, non-historical-duplicate workspaces (all kinds: company, sector,
   topic) enriched with active company coverage units and latest company docs,
@@ -33,7 +34,6 @@ Visibility, credentials, and authorization remain strictly deterministic in code
 from __future__ import annotations
 
 import asyncio
-from contextlib import nullcontext
 import json
 import logging
 import re
@@ -53,10 +53,7 @@ from src.dalton.coverage.identity import (
     _extract_ticker_from_text,
     is_historical_duplicate_workspace,
 )
-from src.dalton.credentials import (
-    disable_team_credential_sharing,
-    get_team_credential_holder_id,
-)
+from src.dalton.credentials import get_team_credential_holder_id
 from src.dalton.database.coverage_units import _norm_uuid
 from src.dalton.llm.assist import (
     resolve_assist_fallback_models,
@@ -1135,29 +1132,20 @@ async def _run_batch_with_fallback(
         }
         if is_external:
             call_kwargs["is_byok"] = True
-            call_kwargs["disable_team_credentials"] = True
-            call_kwargs["disable_platform_fallback"] = True
         else:
             call_kwargs["is_byok"] = False
-            call_kwargs["disable_team_credentials"] = False
-            call_kwargs["disable_platform_fallback"] = False
             if model_requires_user_oauth(model_name):
                 call_kwargs["credential_user_id"] = get_team_credential_holder_id()
             else:
                 call_kwargs["credential_user_id"] = None
 
         try:
-            with (
-                disable_team_credential_sharing()
-                if is_external
-                else nullcontext()
-            ):
-                with redact_parse_error_logs():
-                    call_task = spawn_protected(
-                        complete_fn(**call_kwargs),
-                        name=f"workspace-dedup-{model_name}",
-                        log_failure=False,
-                    )
+            with redact_parse_error_logs():
+                call_task = spawn_protected(
+                    complete_fn(**call_kwargs),
+                    name=f"workspace-dedup-{model_name}",
+                    log_failure=False,
+                )
             _done_calls, pending_calls = await asyncio.wait(
                 {call_task}, timeout=model_timeout
             )
