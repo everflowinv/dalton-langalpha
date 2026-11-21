@@ -11,11 +11,16 @@ from langchain_core.tools import BaseTool, tool
 
 from src.dalton.access_tiers import get_user_tier
 from src.dalton.conversations.search import hybrid_search_conversations
+from src.dalton.sharing import resolve_turn_team_memory_enabled
+from src.server.database.home_workspace import is_home_id, is_home_stand_in_id
 
 logger = logging.getLogger(__name__)
 
 EXTERNAL_CONVERSATION_SEARCH_FORBIDDEN_MESSAGE = (
     "外部成员不能检索团队对话归档；搜索自己的对话请用全局搜索。"
+)
+TEAM_MEMORY_DISABLED_MESSAGE = (
+    "团队记忆已关闭，禁止检索团队对话归档；请勿调用 conversation_search。"
 )
 
 
@@ -31,7 +36,28 @@ def _extract_caller_identity(
     return user_id, workspace_id, thread_id, run_id
 
 
-def create_conversation_tools() -> list[BaseTool]:
+def _infer_role(
+    user_id: str | None,
+    workspace_id: str | None,
+    config: RunnableConfig | None,
+) -> str:
+    """Infer agent role from `RunnableConfig` when the tool was not built with one."""
+    cfg = (config or {}).get("configurable") or {}
+    explicit = str(cfg.get("role") or "").strip().lower()
+    if explicit:
+        return explicit
+    if workspace_id:
+        if (
+            workspace_id.strip().lower() == "home"
+            or is_home_id(user_id, workspace_id)
+            or is_home_stand_in_id(user_id, workspace_id)
+        ):
+            return "chief_of_staff"
+        return "analyst"
+    return "chief_of_staff"
+
+
+def create_conversation_tools(*, role: str | None = None) -> list[BaseTool]:
     """Build `[conversation_search]` for both Analyst and Chief of Staff roles."""
 
     @tool("conversation_search")
@@ -80,7 +106,8 @@ def create_conversation_tools() -> list[BaseTool]:
         # The archive is the whole team's conversation history; external
         # members cannot search it, their own threads stay reachable via the
         # global search UI.
-        if await get_user_tier(user_id) == "external":
+        user_tier = await get_user_tier(user_id)
+        if user_tier == "external":
             logger.info(
                 "[dalton.conversations.audit] rejected external conversation_search call (user_id=%s workspace_id=%s)",
                 user_id,
@@ -91,6 +118,32 @@ def create_conversation_tools() -> list[BaseTool]:
                     "ok": False,
                     "error": "external_member_forbidden",
                     "message": EXTERNAL_CONVERSATION_SEARCH_FORBIDDEN_MESSAGE,
+                },
+                ensure_ascii=False,
+            )
+
+        # Re-check the Team Memory toggle at execution time so mid-turn flips
+        # and paths that bypass ToolSurfaceMiddleware (e.g. Claude Code) cannot
+        # query the archive while Team Memory is off.
+        eff_role = role or _infer_role(user_id, workspace_id, config)
+        if not await resolve_turn_team_memory_enabled(
+            role=eff_role,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            user_tier=user_tier,
+        ):
+            logger.info(
+                "[dalton.conversations.audit] rejected disabled conversation_search call (role=%s user_id=%s workspace_id=%s thread_id=%s)",
+                eff_role,
+                user_id,
+                workspace_id or "-",
+                thread_id or "-",
+            )
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "team_memory_disabled",
+                    "message": TEAM_MEMORY_DISABLED_MESSAGE,
                 },
                 ensure_ascii=False,
             )

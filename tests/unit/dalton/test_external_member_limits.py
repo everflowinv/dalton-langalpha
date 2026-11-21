@@ -889,6 +889,13 @@ class TestConversationSearchRefusal:
             "get_user_tier",
             create_autospec(conv_tools_mod.get_user_tier, return_value="internal"),
         )
+        monkeypatch.setattr(
+            conv_tools_mod,
+            "resolve_turn_team_memory_enabled",
+            create_autospec(
+                conv_tools_mod.resolve_turn_team_memory_enabled, return_value=True
+            ),
+        )
         search_mock = create_autospec(
             conv_tools_mod.hybrid_search_conversations,
             return_value={"ok": True, "count": 0, "cards": []},

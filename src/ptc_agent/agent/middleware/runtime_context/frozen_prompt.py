@@ -146,19 +146,11 @@ def _kept(state: Any, model: Any) -> dict[str, Any] | None:
     return pin if pin.get("model") == (api_model_id(model) or "") else None
 
 
-def _holding(
-    state: Any, model: Any, *, team_memory_enabled: bool | None = None
-) -> dict[str, Any] | None:
+def _holding(state: Any, model: Any) -> dict[str, Any] | None:
     """The pin that still decides what a call to ``model`` sends, or None:
-    kept for it, and not one a deploy or toggle change replaces at once."""
+    kept for it, and not one a deploy replaces at once (``_takes_deploy``)."""
     pin = _kept(state, model)
-    if (
-        pin is None
-        or _takes_deploy(model, state)
-        or _takes_toggle(model, state, team_memory_enabled)  # DALTON-HOOK(team-memory-toggle)
-    ):
-        return None
-    return pin
+    return None if pin is None or _takes_deploy(model, state) else pin
 
 
 def pinned_static(state: Any, model: Any, view: Sequence[AnyMessage]) -> str | None:
@@ -235,11 +227,6 @@ class SystemPinMiddleware(AgentMiddleware):
 
     state_schema = SystemPinState
 
-    # DALTON-HOOK(team-memory-toggle): track per-turn team memory toggle so non-Claude pins refresh immediately
-    def __init__(self, *, team_memory_enabled: bool | None = None) -> None:
-        super().__init__()
-        self._team_memory_enabled = team_memory_enabled
-
     def wrap_model_call(
         self,
         request: ModelRequest,
@@ -254,7 +241,7 @@ class SystemPinMiddleware(AgentMiddleware):
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse | ExtendedModelResponse:
         try:
-            pinned, update, change = _pin(request, team_memory_enabled=self._team_memory_enabled)
+            pinned, update, change = _pin(request)
         except Exception:  # noqa: BLE001 - the stack's message is still a whole one
             logger.warning("[SystemPin] pin failed; sending the stack's message", exc_info=True)
             return await handler(request)
@@ -304,8 +291,6 @@ def _log_committed_change(state: Any) -> None:
 
 def _pin(
     request: ModelRequest,
-    *,
-    team_memory_enabled: bool | None = None,
 ) -> tuple[SystemMessage | None, dict[str, Any] | None, str | None]:
     """The kept message to send instead of the stack's, the pin to store, and
     which change storing it makes: ``stale`` (the build differs while thinking
@@ -323,41 +308,28 @@ def _pin(
     built = request.system_message
     if built is None or not binds_reasoning(request.model):
         return None, None, None
-    state = getattr(request, "state", None)
     replaced: dict[str, Any] = {}
-    # DALTON-HOOK(team-memory-toggle): persist active toggle in pin and refresh non-Claude models on flip
-    toggle_field = (
-        {"team_memory_enabled": team_memory_enabled}
-        if team_memory_enabled is not None
-        else {}
-    )
-    stored = _kept(state, request.model)
+    stored = _kept(getattr(request, "state", None), request.model)
     if stored is not None:
         content = stored["content"]
         if _unmarked(content) == _unmarked(built.content):
             # The build composes the kept message again: the pin takes its
             # sources, so a later due on this thread is read against them.
-            current = {
-                **{k: v for k, v in stored.items() if k != "stale"},
-                **_build_sources(),
-                **toggle_field,
-            }
+            current = {**{k: v for k, v in stored.items() if k != "stale"}, **_build_sources()}
             if current == stored:
                 return None, None, None
             return None, current, "cleared" if stored.get("stale") else None
-        if _takes_deploy(request.model, state):
+        if _takes_deploy(request.model, getattr(request, "state", None)):
             change = "deployed"
             replaced = {"replaced": [*stored.get("replaced", ()), stored.get("source_digest")][-_REPLACED_KEPT:]}
-        elif _takes_toggle(request.model, state, team_memory_enabled):
-            change = "toggle_changed"
         elif holds_bound_thinking(request.messages):
-            if stored.get("stale") or _superseded(state):
+            if stored.get("stale") or _superseded(getattr(request, "state", None)):
                 return SystemMessage(content=content), None, None
             return SystemMessage(content=content), {**stored, "stale": True}, "stale"
         else:
             change = "no_bound_thinking"
     else:
-        previous = as_dict(state_get(state, STATE_SYSTEM_PIN))
+        previous = as_dict(state_get(getattr(request, "state", None), STATE_SYSTEM_PIN))
         if previous.get("content") is None:
             change = "first"
         elif answering_as_fallback():
@@ -365,43 +337,11 @@ def _pin(
         else:
             change = "model_changed"
     model = api_model_id(request.model) or ""
-    return (
-        None,
-        {"model": model, "content": built.content, **_build_sources(), **replaced, **toggle_field},
-        change,
-    )
+    return None, {"model": model, "content": built.content, **_build_sources(), **replaced}, change
 
 
 #: How many builds a pin remembers having replaced (``_takes_deploy``).
 _REPLACED_KEPT = 8
-
-
-def _toggle_changed(state: Any, team_memory_enabled: bool | None) -> bool:
-    """DALTON-HOOK(team-memory-toggle): whether the team-memory toggle flipped since the kept pin."""
-    if team_memory_enabled is None:
-        return False
-    pin = as_dict(state_get(state, STATE_SYSTEM_PIN))
-    if pin.get("content") is None:
-        return False
-    if "team_memory_enabled" in pin:
-        return pin["team_memory_enabled"] != team_memory_enabled
-    static = _static_text(pin.get("content")) or ""
-    return ("conversation_search" in static) != team_memory_enabled
-
-
-def _takes_toggle(model: Any, state: Any, team_memory_enabled: bool | None) -> bool:
-    """DALTON-HOOK(team-memory-toggle): non-Claude binding models refresh immediately on toggle flip."""
-    return not is_claude(model) and _toggle_changed(state, team_memory_enabled)
-
-
-def will_refresh_pin(
-    state: Any, model: Any, *, team_memory_enabled: bool | None = None
-) -> bool:
-    """DALTON-HOOK(team-memory-toggle): whether ``SystemPinMiddleware`` will replace the kept pin on this call."""
-    pin = _kept(state, model)
-    if pin is None:
-        return False
-    return _takes_deploy(model, state) or _takes_toggle(model, state, team_memory_enabled)
 
 
 def _takes_deploy(model: Any, state: Any) -> bool:

@@ -139,6 +139,10 @@ autonomy:
   vendor_quota_alert_ratio: 0.8
 
 conversations:
+  # OpenClaw 已于 2026-11-19 退役，会话导出与定时提取已删除：这里的卡片归档（42842 张，
+  # 截至 2026-11-18）只读，不再新增。`enabled` 仍控制 `conversation_search`（团队记忆）
+  # 能否检索这份归档，关掉它等于关掉团队记忆，不要为"停止提取"而改成 false。
+  # 下面的提取与嵌入参数只在重新提取时使用。
   enabled: true
   # 2026-10-23 盲评中忠实度和覆盖度最高
   extractor_model: "deepseek-flash"

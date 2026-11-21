@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence  # DALTON-HOOK(team-memory-toggle)
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -57,8 +57,13 @@ from ptc_agent.agent.middleware.runtime_context.durable import (
     build_update_message,
     last_stated,
     rows_in_view,
+    runtime_update_from_message,
 )
-from ptc_agent.agent.middleware.runtime_context.state import STATE_BASELINE, state_get
+from ptc_agent.agent.middleware.runtime_context.state import (
+    STATE_BASELINE,
+    as_dict,
+    state_get,
+)
 from ptc_agent.agent.middleware.runtime_context.surface import Surface, parse_surface
 from ptc_agent.agent.middleware.runtime_context.templates import render_template
 from ptc_agent.agent.middleware.runtime_context.turn_context import HomeAway
@@ -72,6 +77,15 @@ TURN_ROW_KIND = "turn_opened"
 #: Row kind of the subagent-switch notice, which ``update_row.md.j2`` hardcodes
 #: the same way.
 SUBAGENTS_ROW_KIND = "subagents_switched"
+
+# DALTON-HOOK(team-memory-toggle): durable row when the team-memory switch flips or is compacted out of view
+TEAM_MEMORY_ROW_KIND = "team_memory_switched"
+TEAM_MEMORY_OFF_TEXT = (
+    "团队记忆已关闭。此前提示词中关于检索团队历史的要求不再适用，请勿调用 `conversation_search`。"
+)
+TEAM_MEMORY_ON_TEXT = (
+    "团队记忆已开启。现在可以按工具说明使用 `conversation_search` 检索团队历史。"
+)
 
 #: Row kind of the scratchpad notes reminder (``compaction/notes.py``), which
 #: ``update_row.md.j2`` hardcodes the same way.
@@ -132,6 +146,7 @@ NON_CHANGE_ROW_KINDS = frozenset(
     {
         TURN_ROW_KIND,
         SUBAGENTS_ROW_KIND,
+        TEAM_MEMORY_ROW_KIND,  # DALTON-HOOK(team-memory-toggle)
         NOTES_DUE_ROW_KIND,
         NOTES_CHECK_IN_ROW_KIND,
         REBUILD_NOTES_ROW_KIND,
@@ -304,6 +319,8 @@ class TurnContextMiddleware(AgentMiddleware):
         home_away: HomeAway | None = None,
         home_back: dict[str, Any] | None = None,
         is_subagent: bool = False,
+        # DALTON-HOOK(team-memory-toggle): per-turn conversation_search availability for durable toggle notices
+        conversation_search_enabled: bool | None = None,
     ) -> None:
         super().__init__()
         self._now = now
@@ -320,6 +337,7 @@ class TurnContextMiddleware(AgentMiddleware):
         self._home_away = home_away
         self._home_back = home_back
         self._is_subagent = is_subagent
+        self._conversation_search_enabled = conversation_search_enabled
         # Set once the turn-open hook has run on this instance; see
         # ``abefore_model``.
         self._opened = False
@@ -448,6 +466,13 @@ class TurnContextMiddleware(AgentMiddleware):
                         home_back = self._home_back
                     elif last == "pending" and not pending and self._home_back.get("folder"):
                         home_back = {**self._home_back, "settled": True}
+            # DALTON-HOOK(team-memory-toggle): record active toggle on turn_opened and append a durable row on flip/compaction
+            toggle_row = None
+            if not self._is_subagent and self._conversation_search_enabled is not None:
+                provenance["team_memory_enabled"] = self._conversation_search_enabled
+                toggle_row = _team_memory_row(
+                    state, self._conversation_search_enabled, now
+                )
             row = DurableUpdate(
                 kind=TURN_ROW_KIND,
                 schema_version=TURN_SCHEMA_VERSION,
@@ -467,7 +492,10 @@ class TurnContextMiddleware(AgentMiddleware):
             # No ids: the row is returned from a middleware hook, so the Pregel
             # path mints them, and minting one here would re-roll a different
             # uuid on every replay.
-            return {"messages": [build_update_message(row)]}
+            messages = [build_update_message(row)]
+            if toggle_row is not None:  # DALTON-HOOK(team-memory-toggle)
+                messages.append(build_update_message(toggle_row))
+            return {"messages": messages}
         except Exception:  # noqa: BLE001 - context is never worth failing a turn for
             logger.warning(
                 "[Turn] anchor row failed; the turn opens without one", exc_info=True
@@ -861,3 +889,54 @@ def _last_disk_low(state: Any) -> bool:
     can no longer read needs no taking back.
     """
     return last_stated(state, TURN_ROW_KIND, "disk_low", False) is True
+
+
+# DALTON-HOOK(team-memory-toggle): emit a durable runtime row when the toggle flips or an earlier notice was compacted out of view
+def _has_team_memory_notice(messages: Sequence[Any]) -> bool:
+    """Whether any ``team_memory_switched`` row exists in ``messages`` (including before cutoff)."""
+    for message in reversed(messages):
+        row = runtime_update_from_message(message)
+        if row is not None and row.kind == TEAM_MEMORY_ROW_KIND:
+            return True
+    return False
+
+
+def _team_memory_row(
+    state: Any, enabled: bool, now: datetime
+) -> DurableUpdate | None:
+    """Return a ``team_memory_switched`` row when ``enabled`` differs from the
+    last visible notice (or baseline/pin) or when a previous notice was compacted
+    out of view; None when unchanged and still visible."""
+    stated = last_stated(state, TEAM_MEMORY_ROW_KIND, "enabled")
+    if stated is not None:
+        if bool(stated) == enabled:
+            return None
+    elif _has_team_memory_notice(state_get(state, "messages") or ()):
+        # Previous toggle notice is behind the compaction cutoff: re-state it.
+        pass
+    else:
+        last_turn = last_stated(state, TURN_ROW_KIND, "team_memory_enabled")
+        if last_turn is not None:
+            if bool(last_turn) == enabled:
+                return None
+        else:
+            from ptc_agent.agent.middleware.runtime_context.frozen_prompt import (
+                STATE_SYSTEM_PIN,
+                _static_text,
+            )
+
+            pin = as_dict(state_get(state, STATE_SYSTEM_PIN))
+            content = pin.get("content")
+            if content is None:
+                return None
+            static = _static_text(content) or ""
+            if ("conversation_search" in static) == enabled:
+                return None
+
+    return DurableUpdate(
+        kind=TEAM_MEMORY_ROW_KIND,
+        schema_version=TURN_SCHEMA_VERSION,
+        text=TEAM_MEMORY_ON_TEXT if enabled else TEAM_MEMORY_OFF_TEXT,
+        provenance={"source": "user", "enabled": enabled},
+        created_at=now,
+    )

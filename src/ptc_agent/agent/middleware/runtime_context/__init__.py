@@ -79,6 +79,9 @@ from .turn import (
     NON_CHANGE_ROW_KINDS,
     NOTICE_ROW_KINDS,
     SUBAGENTS_ROW_KIND,
+    TEAM_MEMORY_OFF_TEXT,  # DALTON-HOOK(team-memory-toggle)
+    TEAM_MEMORY_ON_TEXT,  # DALTON-HOOK(team-memory-toggle)
+    TEAM_MEMORY_ROW_KIND,  # DALTON-HOOK(team-memory-toggle)
     TURN_ROW_KIND,
     TURN_SCHEMA_VERSION,
     WAKEUP_CANCELLED_ROW_KIND,
@@ -106,6 +109,9 @@ __all__ = [
     "RUNTIME_UPDATE_SOURCE",
     "STATE_BASELINE",
     "SUBAGENTS_ROW_KIND",
+    "TEAM_MEMORY_OFF_TEXT",  # DALTON-HOOK(team-memory-toggle)
+    "TEAM_MEMORY_ON_TEXT",  # DALTON-HOOK(team-memory-toggle)
+    "TEAM_MEMORY_ROW_KIND",  # DALTON-HOOK(team-memory-toggle)
     "TURN_ROW_KIND",
     "TURN_SCHEMA_VERSION",
     "UPDATE_SCHEMA_VERSION",

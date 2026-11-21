@@ -1225,6 +1225,7 @@ class PTCAgent:
             },
             user_data_counts=user_data_counts,
             role=role,
+            conversation_search_enabled=conversation_search_enabled,  # DALTON-HOOK(team-memory-toggle)
         )
         if main_compaction is not None:
             main_compaction = main_compaction.with_baseline(context.baseline.sent_sections)
@@ -1451,7 +1452,7 @@ class PTCAgent:
                 multimodal_read,
                 AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
                 SystemPromptCacheMiddleware(),
-                ToolSurfaceMiddleware(team_memory_enabled=conversation_search_enabled),  # DALTON-HOOK(team-memory-toggle)
+                ToolSurfaceMiddleware(),
                 EmptyToolCallRetryMiddleware(),
                 DaltonPatchToolCallsMiddleware(),  # DALTON-HOOK(dalton-patch-tool-calls)
                 context.turn,
@@ -1478,7 +1479,7 @@ class PTCAgent:
                     else []
                 ),
                 context.tail,
-                SystemPinMiddleware(team_memory_enabled=conversation_search_enabled),  # DALTON-HOOK(team-memory-toggle)
+                SystemPinMiddleware(),
                 ReasoningCompatibilityMiddleware(),
             ]
             if m is not None

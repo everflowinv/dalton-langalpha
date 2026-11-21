@@ -192,7 +192,7 @@ def build_dalton_tools(
             try:
                 from src.dalton.tools.conversation_tools import create_conversation_tools
 
-                tools.extend(create_conversation_tools())
+                tools.extend(create_conversation_tools(role="chief_of_staff"))
             except Exception as e:
                 logger.debug("[DALTON_TOOLS] conversation_tools not loaded: %s", e)
         if settings.publish.enabled:
@@ -304,7 +304,7 @@ def build_dalton_tools(
         try:
             from src.dalton.tools.conversation_tools import create_conversation_tools
 
-            tools.extend(create_conversation_tools())
+            tools.extend(create_conversation_tools(role=role))
         except Exception as e:
             logger.debug("[DALTON_TOOLS] conversation_tools not loaded: %s", e)
 

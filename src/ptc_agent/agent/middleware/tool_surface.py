@@ -301,17 +301,12 @@ class ToolSurfaceMiddleware(AgentMiddleware):
 
     state_schema = ToolSurfaceState
 
-    # DALTON-HOOK(team-memory-toggle): refresh OpenAI tools array when team memory toggle flips
-    def __init__(self, *, team_memory_enabled: bool | None = None) -> None:
-        super().__init__()
-        self._team_memory_enabled = team_memory_enabled
-
     def wrap_model_call(
         self,
         request: ModelRequest,
         handler: Callable[[ModelRequest], ModelResponse],
     ) -> Any:
-        prepared = _prepare(request, team_memory_enabled=self._team_memory_enabled)
+        prepared = _prepare(request)
         with operator_request("system") if prepared.bridged else nullcontext():
             return _finish(handler(prepared.request), prepared)
 
@@ -320,7 +315,7 @@ class ToolSurfaceMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> Any:
-        prepared = _prepare(request, team_memory_enabled=self._team_memory_enabled)
+        prepared = _prepare(request)
         # Every change message goes through the bridge, which joins it with a
         # neighbouring row and keeps it off a place the wire refuses.
         with operator_request("system") if prepared.bridged else nullcontext():
@@ -337,9 +332,7 @@ class ToolSurfaceMiddleware(AgentMiddleware):
         return refused if refused is not None else await handler(request)
 
 
-def _prepare(
-    request: ModelRequest, *, team_memory_enabled: bool | None = None
-) -> _Prepared:
+def _prepare(request: ModelRequest) -> _Prepared:
     surface = (request.state or {}).get(TOOL_SURFACE_KEY) or {}
     wire = _wire_for(request.model)
     if wire is None:
@@ -352,32 +345,8 @@ def _prepare(
     if not stored and not wanted:
         return _Prepared(_with_messages(request, messages), None, None, bridged=False)
 
-    # DALTON-HOOK(team-memory-toggle): drop removed conversation_search on OpenAI/Codex when toggle/pin refreshes
-    refresh_openai_surface = False
-    if isinstance(wire, _OpenAIWire) and stored:
-        from ptc_agent.agent.middleware.runtime_context.frozen_prompt import will_refresh_pin
-        from src.llms.model_identity import is_claude
-
-        if not is_claude(request.model) and (
-            will_refresh_pin(
-                request.state, request.model, team_memory_enabled=team_memory_enabled
-            )
-            or (
-                team_memory_enabled is False
-                and any(
-                    _as_responses_tool(t).get("name") == "conversation_search"
-                    for t in stored
-                )
-            )
-        ):
-            refresh_openai_surface = True
-
     epoch = _epoch(messages)
-    if (
-        not stored
-        or refresh_openai_surface
-        or (slot.get("epoch") != epoch and not holds_bound_thinking(messages))
-    ):
+    if not stored or (slot.get("epoch") != epoch and not holds_bound_thinking(messages)):
         declared = wire.render(stored, wanted)
     else:
         declared = stored
