@@ -80,6 +80,35 @@ docker compose -f docker-compose.yml -f docker-compose.dalton.yml up -d --force-
   如果 `crawler` 或 `edge` 依赖的变量（比如 `INTERNAL_SERVICE_TOKEN`）也改了，对应服务也要一起 `--force-recreate`。
 - **修改 `agent_config.dalton.yaml` / `config.dalton.yaml` / `src/dalton/dalton.yaml`**：虽然宿主机目录挂进了 `backend` 容器（`./agent_config.dalton.yaml`、`./config.dalton.yaml`、`./config/dalton` 等），但后端镜像启动时会核对 `/app/.build_files.sha256` 清单指纹，所以**生产改动要统一走 `scripts/dalton/docker_build_backend.sh` 重建镜像和容器**。
 
+### 2.1 Firecrawl 多 Key 主备配置与冷却排查
+
+- **添加第二个（及更多）Key**：在 `.env` 中按顺序配置 `FIRECRAWL_API_KEY`（主 Key），再追加 `FIRECRAWL_API_KEY_2`、`FIRECRAWL_API_KEY_3`……（从 `_2` 起按连续数字递增，遇到空缺即停止读取；只写变量名、不要把任何真实密钥写入文档或日志）。
+  - 调度策略为主备切换：请求优先使用顺序最靠前且未冷却的 Key；某个 Key 返回 402 账户额度用完时标记冷却并立即用下一个可用 Key 重试同一个请求（若响应带有余额大于零，或无余额字段但文义为“本次请求所需额度不足”，多 Key 模式下不冷却、不切换、不计入熔断，直接返回提供方错误）。冷却时长规则：有未来的 `resets_at` 就冷却到那时为止；`resets_at` 已过期则短冷却 5 分钟；缺少或无法解析 `resets_at` 时，若响应明确余额为 0（`<= 0`）则冷却 24 小时，若缺少余额字段则冷却 1 小时。仅当所有 Key 都处于冷却时才返回 `budget_exceeded` 并快速失败（提示最早的实际冷却截止时间 `cooldown_until`），任一 Key 冷却到期后自动恢复优先使用。
+  - 改完 `.env` 后必须重建 `backend` 容器使新变量生效（仅 `restart` 不会重读 `.env`）：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dalton.yml up -d --no-deps --force-recreate backend
+```
+
+- **查看当前哪个 Key 在冷却**：冷却状态保存在 Redis 的 `firecrawl:key_cooldown:<fp>` 键中（`<fp>` 为对应 Key 的 SHA-256 前 12 位十六进制指纹；日志与 Redis 均不记录 Key 原文）：
+
+```bash
+# 列出当前所有处于冷却中的 Firecrawl Key 指纹
+docker compose -f docker-compose.yml -f docker-compose.dalton.yml exec -T \
+  -e REDISCLI_AUTH="${REDIS_PASSWORD:-redis}" redis \
+  redis-cli --scan --pattern 'firecrawl:key_cooldown:*'
+
+# 查看具体冷却记录（cooldown_until / resets_at / marked_at）与剩余冷却秒数
+docker compose -f docker-compose.yml -f docker-compose.dalton.yml exec -T \
+  -e REDISCLI_AUTH="${REDIS_PASSWORD:-redis}" redis \
+  redis-cli GET 'firecrawl:key_cooldown:<fp>'
+docker compose -f docker-compose.yml -f docker-compose.dalton.yml exec -T \
+  -e REDISCLI_AUTH="${REDIS_PASSWORD:-redis}" redis \
+  redis-cli TTL 'firecrawl:key_cooldown:<fp>'
+```
+
+  也可以在后端日志中检索 `Firecrawl key fp=` 对照指纹定位是哪一个 Key 触发了 402 切换或冷却；宿主机 `researchdata_bridge.py` 面向 `employee-reviews` 子进程仍仅透传单个 `FIRECRAWL_API_KEY`。
+
 ## 3. 宿主机 `launchd` 服务运维
 
 ### 3.1 服务安装与常用管理命令

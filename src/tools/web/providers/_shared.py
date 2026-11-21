@@ -13,7 +13,8 @@ import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple, TypeVar
+# DALTON-HOOK(firecrawl-budget): multi-key failover
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, TypeVar
 
 import httpx
 
@@ -162,6 +163,144 @@ def missing_key_error(message: str) -> WebError:
     return WebError(type=WebErrorType.PROVIDER_ERROR, message=message, retryable=True)
 
 
+_SENSITIVE_HEADERS = frozenset({"authorization", "x-api-key", "proxy-authorization", "cookie"})
+
+
+def strip_url_query(raw_url: Any) -> str:
+    """Return ``raw_url`` without query parameters or fragments."""
+    text = str(raw_url or "")
+    if not text:
+        return ""
+    try:
+        return str(httpx.URL(text).copy_with(query=None, fragment=None))
+    except Exception:
+        return text.split("?", 1)[0].split("#", 1)[0]
+
+
+def scrub_text(text: str, scrub_values: Sequence[str] = ()) -> str:
+    """Replace any raw secret strings in ``text`` with ``[REDACTED]``."""
+    cleaned = text
+    for secret in scrub_values:
+        if secret and secret in cleaned:
+            cleaned = cleaned.replace(secret, "[REDACTED]")
+    return cleaned
+
+
+# DALTON-HOOK(firecrawl-budget): redact auth headers and query strings before attaching requests to exceptions.
+def redact_request_headers(
+    req: Optional[httpx.Request], *, strip_query: bool = True
+) -> Optional[httpx.Request]:
+    """Return a shallow copy of ``req`` with credential headers replaced by ``[REDACTED]``."""
+    if req is None:
+        return None
+    clean_headers = httpx.Headers(
+        {
+            k: ("[REDACTED]" if k.lower() in _SENSITIVE_HEADERS else v)
+            for k, v in req.headers.items()
+        }
+    )
+    clean_url = strip_url_query(req.url) if strip_query else req.url
+    return httpx.Request(req.method, clean_url, headers=clean_headers)
+
+
+def _sanitized_response(
+    resp: Optional[httpx.Response],
+    clean_req: Optional[httpx.Request],
+    scrub_values: Sequence[str] = (),
+) -> Optional[httpx.Response]:
+    if resp is None:
+        return None
+    try:
+        raw_content = resp.content
+        if scrub_values and raw_content:
+            text_body = resp.text
+            cleaned_text = scrub_text(text_body, scrub_values)
+            if cleaned_text != text_body:
+                raw_content = cleaned_text.encode("utf-8")
+        safe_headers = [
+            (k, v)
+            for k, v in resp.headers.items()
+            if k.lower() not in ("content-encoding", "content-length", "transfer-encoding")
+        ]
+        return httpx.Response(
+            resp.status_code,
+            content=raw_content,
+            headers=safe_headers,
+            request=clean_req,
+        )
+    except Exception:
+        resp.request = clean_req
+        if hasattr(resp, "history") and isinstance(resp.history, list):
+            resp.history = []
+        return resp
+
+
+def sanitize_httpx_error(
+    err: httpx.HTTPError,
+    *,
+    method: Optional[str] = None,
+    url: Optional[str] = None,
+    scrub_values: Sequence[str] = (),
+) -> httpx.HTTPError:
+    """Build a fresh httpx exception carrying only sanitized request/status details."""
+    raw_req = getattr(err, "_request", None)
+    if raw_req is None and isinstance(err, httpx.HTTPStatusError):
+        raw_req = getattr(err.response, "request", None)
+    clean_req = redact_request_headers(raw_req, strip_query=True)
+    if clean_req is None and (method or url):
+        clean_req = httpx.Request(method or "", strip_url_query(url))
+
+    if isinstance(err, httpx.HTTPStatusError):
+        clean_resp = _sanitized_response(err.response, clean_req, scrub_values=scrub_values)
+        status = getattr(err.response, "status_code", None)
+        exc_name = type(err).__name__
+        clean_msg = scrub_text(str(err), scrub_values)
+        if not clean_msg or any(
+            marker in clean_msg.lower() for marker in ("authorization", "x-api-key")
+        ):
+            clean_url = strip_url_query(clean_req.url if clean_req else url)
+            req_method = clean_req.method if clean_req else (method or "")
+            clean_msg = f"{exc_name} {status}: {req_method} {clean_url}".strip()
+        new_err: httpx.HTTPError = httpx.HTTPStatusError(
+            clean_msg,
+            request=clean_req or httpx.Request(method or "", strip_url_query(url)),
+            response=clean_resp,
+        )
+        new_err.__cause__ = None
+        new_err.__context__ = None
+        return new_err
+
+    exc_name = type(err).__name__
+    req_method = clean_req.method if clean_req else (method or "")
+    clean_url = strip_url_query(clean_req.url if clean_req else url)
+    status = getattr(getattr(err, "response", None), "status_code", None)
+    parts = [exc_name]
+    if status is not None:
+        parts.append(f"HTTP {status}")
+    target = " ".join(p for p in (req_method, clean_url) if p)
+    msg = f"{' '.join(parts)}: {target}" if target else " ".join(parts)
+    msg = scrub_text(msg, scrub_values)
+
+    if isinstance(err, httpx.RequestError):
+        try:
+            new_err = type(err)(msg, request=clean_req)
+        except TypeError:
+            fallback_cls = (
+                httpx.TimeoutException
+                if isinstance(err, httpx.TimeoutException)
+                else httpx.RequestError
+            )
+            new_err = fallback_cls(msg, request=clean_req)
+    else:
+        try:
+            new_err = type(err)(msg)
+        except TypeError:
+            new_err = httpx.HTTPError(msg)
+    new_err.__cause__ = None
+    new_err.__context__ = None
+    return new_err
+
+
 async def request_json(
     method: str,
     url: str,
@@ -177,19 +316,31 @@ async def request_json(
     A status >= 400 raises ``httpx.HTTPStatusError`` with the providers'
     shared ``"{Provider} API error {code}: {text}"`` message so callers can
     funnel it through ``error_from_httpx``; transport failures propagate as
-    their native httpx exceptions.
+    freshly constructed sanitized httpx exceptions without credentials,
+    query parameters, or cause/context chains.
     """
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.request(
-            method, url, headers=headers, json=json_body, params=params
-        )
-        if response.status_code >= 400:
-            raise httpx.HTTPStatusError(
-                f"{provider} API error {response.status_code}: {response.text}",
-                request=response.request,
-                response=response,
+    sanitized_err: Optional[httpx.HTTPError] = None
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.request(
+                method, url, headers=headers, json=json_body, params=params
             )
-        return response.json()
+            # DALTON-HOOK(firecrawl-budget): multi-key failover
+            if response.status_code >= 400:
+                clean_req = redact_request_headers(response.request)
+                clean_resp = _sanitized_response(response, clean_req)
+                sanitized_err = httpx.HTTPStatusError(
+                    f"{provider} API error {response.status_code}: {response.text}",
+                    request=clean_req or httpx.Request(method, strip_url_query(url)),
+                    response=clean_resp,
+                )
+            else:
+                return response.json()
+    except httpx.HTTPError as e:
+        sanitized_err = sanitize_httpx_error(e, method=method, url=url)
+    finally:
+        headers = None
+    raise sanitized_err from None
 
 
 # Terminal states shared by the async research/task poll loops.
