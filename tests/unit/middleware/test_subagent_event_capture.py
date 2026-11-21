@@ -1328,3 +1328,54 @@ async def test_a_reply_a_claude_code_run_commits_reports_its_tool_calls_to_the_t
     finally:
         current_background_tool_call_id.reset(token)
     assert task.captured_event_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("metadata", "expect_captured"),
+    [
+        ({"stop_reason": "max_tokens"}, False),
+        ({"finish_reason": "MAX_TOKENS"}, False),
+        ({"finish_reason": "MALFORMED_FUNCTION_CALL"}, False),
+        ({"finish_reason": "UNEXPECTED_TOOL_CALL"}, False),
+        ({"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}, False),
+        ({"stop_reason": "tool_use"}, True),
+    ],
+    ids=[
+        "anthropic-max_tokens",
+        "gemini-MAX_TOKENS",
+        "gemini-MALFORMED_FUNCTION_CALL",
+        "gemini-UNEXPECTED_TOOL_CALL",
+        "responses-incomplete",
+        "normal-tool_use",
+    ],
+)
+async def test_output_cap_reply_captures_no_tool_calls(metadata, expect_captured) -> None:
+    """Output-capped replies are discarded and retried by outer
+    EmptyToolCallRetryMiddleware, so any parsed tool_calls on them must not
+    be published to the subagent stream."""
+    from langchain.agents.middleware.types import ModelResponse
+    from langchain_core.messages import AIMessage
+
+    registry = _capture_registry()
+    middleware = SubagentEventCaptureMiddleware(registry=registry)
+
+    async def model(_req):
+        return ModelResponse(
+            result=[
+                AIMessage(
+                    "",
+                    tool_calls=[{"name": "Write", "id": "c1", "args": {"file_path": "a.py"}}],
+                    response_metadata=metadata,
+                )
+            ]
+        )
+
+    task = current_background_tool_call_id.set("task-tc")
+    try:
+        await middleware.awrap_model_call(MagicMock(), model)
+    finally:
+        current_background_tool_call_id.reset(task)
+
+    captured = [c.args[1]["event"] for c in registry.append_captured_event.await_args_list]
+    assert captured == (["tool_calls"] if expect_captured else [])

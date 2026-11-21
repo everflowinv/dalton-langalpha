@@ -2,7 +2,7 @@ import React from 'react';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { cn } from '@/lib/utils';
 import { XCircle } from 'lucide-react';
-import { getDisplayName, isTaskTool } from './toolDisplayConfig';
+import { getDisplayName, getFailedToolCallLabel, isTaskTool } from './toolDisplayConfig';
 import { ToolIcon } from './ToolIcon';
 import iconRobo from '../../../assets/img/icon-robo.png';
 import iconRoboSing from '../../../assets/img/icon-robo-sing.png';
@@ -73,7 +73,9 @@ function DetailPanel({ toolCallProcess, onOpenFile, onOpenSubagentTask }: Detail
             {isFailed && (
               <XCircle
                 className="h-4 w-4 shrink-0"
-                aria-label={t('toolArtifact.a11y.toolCallFailed')}
+                // DALTON-HOOK(empty-turn-guard): show the explicit non-executed
+                // notice when the tool call was discarded before running.
+                aria-label={getFailedToolCallLabel(toolCallProcess, t)}
                 style={{ color: 'var(--color-loss)' }}
               />
             )}

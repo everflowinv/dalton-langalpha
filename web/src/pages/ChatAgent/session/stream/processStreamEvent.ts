@@ -807,6 +807,8 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
               tool_call_id: toolCallId,
               artifact: event.artifact,
               status: event.status,
+              ...(event.discarded === true ? { discarded: true } : {}),
+              ...(typeof event.discarded_reason === 'string' ? { discarded_reason: event.discarded_reason } : {}),
             },
             refs,
             updateSubagentCard: rt.updateSubagentCard,
@@ -1179,13 +1181,32 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
     } else if (eventType === 'tool_calls') {
       // A tool call means the model call succeeded — drop the retry/fallback pill.
       deps.clearModelStatus();
+      const eventId = event._eventId as number | undefined;
+      const inlineText = typeof event.content === 'string' && event.content && (!event.content_type || event.content_type === 'text')
+        ? event.content
+        : null;
+      // DALTON-HOOK(empty-turn-guard): render any text carried on the same
+      // tool_calls frame (e.g. Antigravity) ahead of the tool calls so the
+      // live timeline matches checkpoint replay.
+      if (inlineText) {
+        handleTextContent({
+          assistantMessageId,
+          content: inlineText,
+          finishReason: undefined,
+          stop: readStop(event),
+          refs,
+          setMessages: setMessagesForHandlers,
+          eventId,
+          phase: event.phase,
+        });
+      }
       handleToolCalls({
         assistantMessageId,
         toolCalls: (event.tool_calls || []) as unknown as Record<string, unknown>[],
         finishReason: event.finish_reason,
         refs,
         setMessages: setMessagesForHandlers,
-        eventId: event._eventId as number,
+        eventId: eventId != null && inlineText ? eventId + 0.001 : eventId,
       });
       // Queue new Task tool call IDs for matching with upcoming artifact 'spawned' events
       if (event.tool_calls) {
@@ -1232,6 +1253,8 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
           tool_call_id: toolCallId,
           artifact: event.artifact,
           status: event.status,
+          ...(event.discarded === true ? { discarded: true } : {}),
+          ...(typeof event.discarded_reason === 'string' ? { discarded_reason: event.discarded_reason } : {}),
         },
         refs,
         setMessages: setMessagesForHandlers,

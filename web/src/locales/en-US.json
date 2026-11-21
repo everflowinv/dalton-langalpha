@@ -2535,7 +2535,7 @@
       "check": "Check that the computer is on and online, then try again.",
       "checkService": "The service that connects your computers isn't answering right now. Try again in a moment."
     },
-    "autoRetryExhausted": "This reply didn't go through after a few tries. Try again in a moment.",
+    "autoRetryExhausted": "Couldn't finish this reply after a few tries. Try again in a moment.",
     "forkStaleEdit": "This chat changed somewhere else, so it was refreshed. Your edited message is ready to send again.",
     "forkStaleRegenerate": "This chat changed somewhere else, so it was refreshed. Try again.",
     "resendRequired": "Your message is back in the box below. Add any attachments again, then send it.",
@@ -4571,9 +4571,15 @@
     },
     "a11y": {
       "toolCallFailed": "Tool call failed",
+      "toolCallNotExecuted": "Tool call not executed",
       "openInTab": "Open in {{tab}}",
       "collapseDiff": "Collapse diff",
       "expandDiff": "Expand diff"
+    },
+    "discarded": {
+      "output_cap": "Tool call not executed: reply truncated at output limit",
+      "malformed_call": "Tool call not executed: malformed tool call",
+      "interrupted": "Tool call not executed: model output interrupted"
     },
     "directTool": {
       "approvalTitle": "Approve this action?",

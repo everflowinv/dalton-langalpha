@@ -8,9 +8,14 @@ call, so a call must never inherit what an earlier one left at its index.
 """
 
 import pytest
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessageChunk, ToolMessage
 
-from src.server.services.runs.sse_producer import RunSSEProducer
+from src.server.services.runs.sse_producer import (
+    _DISCARDED_INTERRUPTED_TEXT,
+    _DISCARDED_MALFORMED_TEXT,
+    _DISCARDED_TRUNCATED_TEXT,
+    RunSSEProducer,
+)
 
 # A retry or fallback inside one model task streams in the same lane.
 LANE = "model:task-1"
@@ -190,3 +195,251 @@ async def test_a_fallback_sends_its_own_call_and_not_the_dead_one():
         ("Read", "call_1", {"file_path": "a.md"}),
     ]
     assert producer.anthropic_tool_call_state == {}
+
+
+@pytest.mark.asyncio
+async def test_responses_api_incomplete_clears_accumulated_tool_call_state():
+    # DALTON-HOOK(empty-turn-guard): a Responses API message that streams
+    # function_call arguments and ends with status="incomplete"
+    # (max_output_tokens) must drop its accumulated call so the retried text
+    # message's "completed" never emits a stale Write tool_calls event.
+    producer = _producer()
+    first = await _emit(
+        producer,
+        AIMessageChunk(
+            content=[{
+                "type": "function_call", "name": "Write", "call_id": "call_trunc",
+                "arguments": '{"file_path": "a.py"', "index": 0,
+            }],
+            id="resp_1",
+        ),
+        AIMessageChunk(
+            content=[{"type": "function_call", "arguments": ', "content": "half', "index": 0}],
+            id="resp_1",
+        ),
+        AIMessageChunk(
+            content=[],
+            id="resp_1",
+            response_metadata={
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+            },
+        ),
+    )
+    second = await _emit(
+        producer,
+        AIMessageChunk(content=[{"type": "text", "text": "已分段完成。", "index": 0}], id="resp_2"),
+        AIMessageChunk(content=[], id="resp_2", response_metadata={"status": "completed"}),
+    )
+
+    assert _tool_calls(first + second) == []
+    assert [f.data["finish_reason"] for f in second if "finish_reason" in f.data] == ["stop"]
+    assert producer.function_call_state == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "finish_reason",
+    ["MAX_TOKENS", "MALFORMED_FUNCTION_CALL"],
+)
+async def test_antigravity_emitted_tool_calls_settled_as_not_executed(finish_reason):
+    # DALTON-HOOK(empty-turn-guard): Antigravity emits complete tool_calls on
+    # an earlier chunk before finishReason arrives; when finish_reason is
+    # output_cap or malformed_call, SSE must emit tool_call_result(status="error")
+    # so the UI marks those cards failed/not-executed.
+    producer = _producer()
+    frames = await _emit(
+        producer,
+        AIMessageChunk(
+            content="我将写入文件",
+            id="ag-1",
+            tool_calls=[
+                {
+                    "name": "Write",
+                    "args": {"file_path": "model.py", "content": "x = 1"},
+                    "id": "antigravity_call_1",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        AIMessageChunk(
+            content="",
+            id="ag-1",
+            response_metadata={"finish_reason": finish_reason},
+        ),
+    )
+
+    assert [(c["name"], c["id"]) for c in _tool_calls(frames)] == [("Write", "antigravity_call_1")]
+    results = [f.data for f in frames if f.event == "tool_call_result"]
+    assert len(results) == 1
+    assert results[0]["tool_call_id"] == "antigravity_call_1"
+    assert results[0]["status"] == "error"
+    assert results[0]["discarded"] is True
+    expected_reason, expected_text = (
+        ("output_cap", _DISCARDED_TRUNCATED_TEXT)
+        if finish_reason == "MAX_TOKENS"
+        else ("malformed_call", _DISCARDED_MALFORMED_TEXT)
+    )
+    assert results[0]["discarded_reason"] == expected_reason
+    assert results[0]["content"] == expected_text
+    assert "已自动重试" not in results[0]["content"]
+    assert producer._emitted_tool_calls == {}
+
+
+@pytest.mark.asyncio
+async def test_antigravity_stream_interrupted_before_finish_settles_old_calls_on_retry():
+    # DALTON-HOOK(empty-turn-guard): when a stream breaks mid-call after emitting
+    # tool_calls without finish_reason and a retry opens a new message_id in the
+    # same agent lane, settle the orphaned calls as not executed and clear them.
+    producer = _producer()
+    frames = await _emit(
+        producer,
+        AIMessageChunk(
+            content="",
+            id="ag-broken-1",
+            tool_calls=[
+                {
+                    "name": "Write",
+                    "args": {"file_path": "model.py", "content": "x = 1"},
+                    "id": "ag_interrupted_call",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        AIMessageChunk(content="重试正文。", id="ag-retry-2"),
+        AIMessageChunk(content="", id="ag-retry-2", response_metadata={"finish_reason": "STOP"}),
+    )
+
+    assert [(c["name"], c["id"]) for c in _tool_calls(frames)] == [("Write", "ag_interrupted_call")]
+    results = [f.data for f in frames if f.event == "tool_call_result"]
+    assert len(results) == 1
+    assert results[0]["tool_call_id"] == "ag_interrupted_call"
+    assert results[0]["status"] == "error"
+    assert results[0]["discarded"] is True
+    assert results[0]["discarded_reason"] == "interrupted"
+    assert results[0]["content"] == _DISCARDED_INTERRUPTED_TEXT
+    assert producer._emitted_tool_calls == {}
+
+
+@pytest.mark.asyncio
+async def test_flush_pending_tool_calls_clears_remaining_at_turn_end():
+    producer = _producer()
+    await _emit(
+        producer,
+        AIMessageChunk(
+            content="",
+            id="ag-orphan",
+            tool_calls=[
+                {
+                    "name": "Write",
+                    "args": {"file_path": "end.py", "content": "pass"},
+                    "id": "ag_orphan_call",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+    )
+    assert producer._emitted_tool_calls
+
+    end_frames = producer.flush_pending_tool_calls()
+
+    assert len(end_frames) == 1
+    assert end_frames[0].event == "tool_call_result"
+    assert end_frames[0].data["tool_call_id"] == "ag_orphan_call"
+    assert end_frames[0].data["status"] == "error"
+    assert end_frames[0].data["discarded"] is True
+    assert end_frames[0].data["discarded_reason"] == "interrupted"
+    assert end_frames[0].data["content"] == _DISCARDED_INTERRUPTED_TEXT
+    assert producer._emitted_tool_calls == {}
+
+
+@pytest.mark.asyncio
+async def test_executed_write_from_tools_node_after_missing_finish_reason_does_not_emit_discarded():
+    # DALTON-HOOK(empty-turn-guard): when Antigravity emits Write without a
+    # finishReason and the tools node subsequently runs and emits a ToolMessage,
+    # _emitted_tool_calls must drop that call immediately so turn-end never
+    # overwrites the successful result with a discarded error.
+    producer = _producer()
+    frames = await _emit(
+        producer,
+        AIMessageChunk(
+            content="",
+            id="ag-exec-1",
+            tool_calls=[
+                {
+                    "name": "Write",
+                    "args": {"file_path": "ok.py", "content": "x = 1"},
+                    "id": "ag_exec_call",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+    )
+    async for frame in producer._process_message_chunk(
+        ToolMessage(content="Wrote ok.py", tool_call_id="ag_exec_call", status="success"),
+        "tools:task-2",
+        {"langgraph_node": "tools"},
+    ):
+        frames.append(frame)
+
+    end_frames = producer.flush_pending_tool_calls()
+    frames.extend(end_frames)
+
+    results = [f.data for f in frames if f.event == "tool_call_result"]
+    assert len(results) == 1
+    assert results[0]["tool_call_id"] == "ag_exec_call"
+    assert results[0]["status"] == "success"
+    assert results[0].get("discarded") is not True
+    assert producer._emitted_tool_calls == {}
+
+
+@pytest.mark.asyncio
+async def test_stream_error_flushes_unsettled_emitted_tool_calls_before_error_event():
+    # DALTON-HOOK(empty-turn-guard): if a stream emits tool_calls without
+    # finishReason and subsequent retries fail before emitting any new chunk,
+    # the error path must flush discarded tool_call_result before the error frame.
+    producer = _producer()
+
+    class _FailingGraph:
+        checkpointer = None
+
+        async def astream(self, *_args, **_kwargs):
+            yield (
+                (),
+                "messages",
+                (
+                    AIMessageChunk(
+                        content="",
+                        id="ag-fail-1",
+                        tool_calls=[
+                            {
+                                "name": "Write",
+                                "args": {"file_path": "dead.py", "content": "x = 1"},
+                                "id": "ag_dead_call",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    {"langgraph_node": "model"},
+                ),
+            )
+            raise RuntimeError("stream died before retry header")
+
+    emitted = []
+    with pytest.raises(RuntimeError, match="stream died before retry header"):
+        async for frame in producer._stream_frames(_FailingGraph(), None, {"configurable": {"thread_id": "t-1"}}):
+            if frame is not None:
+                emitted.append(frame)
+
+    events = [f.event for f in emitted]
+    assert "tool_calls" in events
+    assert "tool_call_result" in events
+    assert "error" in events
+    assert events.index("tool_call_result") < events.index("error")
+    discarded = [f.data for f in emitted if f.event == "tool_call_result"][0]
+    assert discarded["tool_call_id"] == "ag_dead_call"
+    assert discarded["status"] == "error"
+    assert discarded["discarded"] is True
+    assert discarded["discarded_reason"] == "interrupted"
+    assert discarded["content"] == _DISCARDED_INTERRUPTED_TEXT
+    assert producer._emitted_tool_calls == {}
