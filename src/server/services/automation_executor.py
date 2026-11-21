@@ -904,6 +904,75 @@ class AutomationExecutor:
             )
         return handed
 
+    # DALTON-HOOK(automation-effort): preserve first-turn effort on restart redispatch and ignore stale effort on Antigravity models
+    async def _resolve_turn_reasoning_effort(
+        self,
+        *,
+        execution_id: str,
+        thread_id: str | None,
+        user_id: str,
+        llm_model: str | None,
+        stored_effort: str | None,
+    ) -> str | None:
+        from src.dalton.llm.antigravity_series import ANTIGRAVITY_PROVIDER
+        from src.dalton.services import automation_thread_model
+        from src.llms.llm import LLM as LLMFactory
+        from src.server.services.llm import user_models
+
+        effective_effort: str | None = stored_effort
+        if thread_id:
+            try:
+                (
+                    _first_model,
+                    prior_configured,
+                    prior_effort,
+                ) = await automation_thread_model._get_execution_first_turn_settings(
+                    {
+                        "automation_execution_id": execution_id,
+                        "conversation_thread_id": thread_id,
+                    },
+                    fallback_thread_id=thread_id,
+                )
+            except RuntimeError as exc:
+                if "pool" not in str(exc).lower():
+                    logger.warning(
+                        f"[AUTOMATION_EXEC] Failed reading prior turn effort for execution_id={execution_id}: {exc}"
+                    )
+            except Exception as exc:
+                logger.warning(
+                    f"[AUTOMATION_EXEC] Failed reading prior turn effort for execution_id={execution_id}: {exc}"
+                )
+            else:
+                if prior_configured:
+                    effective_effort = prior_effort
+
+        # DALTON-HOOK(automation-effort): ignore stale column values when the automation runs a built-in Antigravity model
+        if effective_effort is not None and llm_model:
+            is_builtin_antigravity = False
+            try:
+                source, entry = await user_models.classify_model(user_id, llm_model)
+                is_builtin_antigravity = (
+                    source == user_models.ModelSource.SYSTEM
+                    and isinstance(entry, dict)
+                    and entry.get("provider") == ANTIGRAVITY_PROVIDER
+                )
+            except RuntimeError as exc:
+                if "pool" in str(exc).lower():
+                    try:
+                        builtin = LLMFactory.get_model_config().get_model_config(llm_model)
+                        is_builtin_antigravity = (
+                            isinstance(builtin, dict)
+                            and builtin.get("provider") == ANTIGRAVITY_PROVIDER
+                        )
+                    except Exception:
+                        is_builtin_antigravity = False
+                else:
+                    raise
+            if is_builtin_antigravity:
+                return None
+
+        return effective_effort  # DALTON-HOOK(automation-effort)
+
     async def _run_turn(
         self,
         execution_id: str,
@@ -975,10 +1044,23 @@ class AutomationExecutor:
                 run_metadata["workspace_owner_id"] = firing.workspace_owner_id
                 run_metadata["origin_channel"] = "web"
                 extra_configurable["workspace_owner_id"] = firing.workspace_owner_id
+            # DALTON-HOOK(automation-effort): stamp two-state reasoning_effort on first-turn run metadata
+            # and forward automation reasoning_effort into ChatRequest (preserving prior first-turn effort on
+            # restart redispatch and ignoring stale column values on built-in Antigravity models).
+            effective_effort = await self._resolve_turn_reasoning_effort(
+                execution_id=execution_id,
+                thread_id=firing.thread_id,
+                user_id=user_id,
+                llm_model=automation.get("llm_model"),
+                stored_effort=automation.get("reasoning_effort"),
+            )
+            run_metadata["automation_reasoning_effort_configured"] = True
+            run_metadata["automation_reasoning_effort"] = effective_effort
             request = ChatRequest(
                 workspace_id=firing.workspace_id,
                 messages=[ChatMessage(role="user", content=instruction)],
                 llm_model=automation.get("llm_model"),
+                reasoning_effort=effective_effort,
                 additional_context=additional_context,
                 origin=ThreadOrigin(
                     type="automation",

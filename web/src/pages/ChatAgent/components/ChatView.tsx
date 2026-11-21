@@ -819,7 +819,13 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     handleEditMessage(id, content, chatInputRef.current?.getModelOptions?.()));
   const stableRegenerate = useStableHandler((id: string) =>
     handleRegenerate(id, chatInputRef.current?.getModelOptions?.()));
-  const stableRetry = useStableHandler(() => handleRetry(chatInputRef.current?.getModelOptions?.()));
+  // DALTON-HOOK(automation-effort): forward retry model options from action bundle and prefer getRetryModelOptions
+  const stableRetry = useStableHandler((opts?: Parameters<typeof handleRetry>[0]) =>
+    handleRetry(
+      opts
+      ?? chatInputRef.current?.getRetryModelOptions?.()
+      ?? chatInputRef.current?.getModelOptions?.(),
+    ));
   const stableStopWorkflow = useStableHandler(stopWorkflow);
   const stableStopCompaction = useStableHandler(stopCompaction);
 

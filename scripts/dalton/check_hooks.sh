@@ -460,6 +460,9 @@ ALLOWED_HOOKS=(
   "browser-kill-switch"
   # Background-slot calls default to low reasoning effort (src/server/services/llm/config.py).
   "background-effort-low"
+  # Per-automation reasoning_effort field (d042), shared write/snapshot/file paths,
+  # executor/continuation/wakeup/fallback inheritance, and MoreOptions effort selector.
+  "automation-effort"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

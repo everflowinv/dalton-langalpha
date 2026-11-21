@@ -1523,6 +1523,7 @@ def build_director_tools(
         timezone_name: str | None = None,
         workspace_id: str | None = None,
         ticker: str | None = None,
+        reasoning_effort: str | None = None,
         config: RunnableConfig = None,
     ) -> str:
         """Create, update, pause, resume, or list Dalton (`dalton-*`) automations.
@@ -1538,6 +1539,7 @@ def build_director_tools(
             timezone_name: IANA timezone (defaults to `Asia/Shanghai`).
             workspace_id: Workspace UUID (defaults to current workspace in config).
             ticker: Optional company ticker for naming validation.
+            reasoning_effort: Optional thinking effort override (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Pass `""` or `"default"` to clear back to user/model default; omit on update to keep the current value. Antigravity models encode effort in their model ID suffix and keep this field null.
         """
         configurable = (config or {}).get("configurable") or {}
         user_id = str(configurable.get("user_id") or "").strip()
@@ -1549,7 +1551,7 @@ def build_director_tools(
         # creating, and an update that names none keeps the task's stored timezone.
         tz = timezone_name or None
 
-        spec = {
+        spec: dict[str, Any] = {
             "action": action,
             "name": name,
             "trigger_type": trigger_type,
@@ -1561,6 +1563,11 @@ def build_director_tools(
             "workspace_id": ws_id,
             "ticker": ticker,
         }
+        if reasoning_effort is not None:
+            cleaned_effort = reasoning_effort.strip().lower()
+            spec["reasoning_effort"] = (
+                None if cleaned_effort in ("", "default", "clear", "null") else cleaned_effort
+            )
         result = await schedule_dalton_automation_helper(
             name,
             spec,

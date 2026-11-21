@@ -31,11 +31,12 @@ logger = logging.getLogger(__name__)
 
 
 # DALTON-HOOK(company-automations): include scope, notify storage, versioning, actor, and soft-delete columns
+# DALTON-HOOK(automation-effort): include reasoning_effort column
 AUTOMATION_COLUMNS = """
     automation_id, user_id, name, file_name, description,
     trigger_type, cron_expression, timezone, trigger_config,
     next_run_at, last_run_at,
-    instruction, workspace_id, llm_model, additional_context,
+    instruction, workspace_id, llm_model, reasoning_effort, additional_context,
     thread_strategy, conversation_thread_id,
     status, max_failures, failure_count, disable_reason,
     delivery_config, metadata,
@@ -219,6 +220,7 @@ async def create_automation(
     next_run_at: Optional[datetime] = None,
     workspace_id: Optional[str] = None,
     llm_model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,  # DALTON-HOOK(automation-effort)
     additional_context: Optional[List[Dict[str, Any]]] = None,
     thread_strategy: str = "new",
     conversation_thread_id: Optional[str] = None,
@@ -328,6 +330,7 @@ async def create_automation(
                     "instruction": instruction,
                     "workspace_id": workspace_id,
                     "llm_model": llm_model,
+                    "reasoning_effort": reasoning_effort,  # DALTON-HOOK(automation-effort)
                     "additional_context": additional_context,
                     "thread_strategy": thread_strategy,
                     "conversation_thread_id": conversation_thread_id,
@@ -349,12 +352,13 @@ async def create_automation(
                     # A savepoint inside a caller's transaction, so a clash
                     # leaves it usable for the next attempt.
                     async with conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
+                        # DALTON-HOOK(automation-effort): include reasoning_effort in INSERT column list and placeholders
                         await cur.execute(f"""
                             INSERT INTO automations (
                                 automation_id, user_id, name, file_name, description,
                                 trigger_type, cron_expression, timezone, trigger_config,
                                 next_run_at,
-                                instruction, workspace_id, llm_model, additional_context,
+                                instruction, workspace_id, llm_model, reasoning_effort, additional_context,
                                 thread_strategy, conversation_thread_id,
                                 status, max_failures, failure_count,
                                 delivery_config, metadata,
@@ -366,7 +370,7 @@ async def create_automation(
                                 %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s,
                                 %s,
-                                %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s,
                                 %s, %s,
                                 %s, %s, 0,
                                 %s, %s,
@@ -380,7 +384,7 @@ async def create_automation(
                             trigger_type, cron_expression, timezone,
                             Json(trigger_config or {}),
                             next_run_at,
-                            instruction, workspace_id, llm_model,
+                            instruction, workspace_id, llm_model, reasoning_effort,  # DALTON-HOOK(automation-effort)
                             Json(additional_context) if additional_context else None,
                             thread_strategy, conversation_thread_id,
                             eff_status,  # DALTON-HOOK(coverage-tracking)
@@ -675,9 +679,10 @@ async def update_automation(
     explicit_skip_unchanged = kwargs.pop("skip_if_unchanged", None)
 
     hist_ctx = get_current_history_context()
+    # DALTON-HOOK(automation-effort): include reasoning_effort in nullable, config-update, and scalar update columns
     nullable_fields = {
         "next_run_at", "last_run_at", "conversation_thread_id", "disable_reason",
-        "description", "llm_model", "cron_expression", "updated_by",
+        "description", "llm_model", "reasoning_effort", "cron_expression", "updated_by",
     }
     _config_update_fields = {
         "name",
@@ -688,6 +693,7 @@ async def update_automation(
         "instruction",
         "workspace_id",
         "llm_model",
+        "reasoning_effort",
         "thread_strategy",
         "conversation_thread_id",
         "max_failures",
@@ -762,7 +768,7 @@ async def update_automation(
         b = UpdateQueryBuilder()
         for field in [
             "name", "description", "trigger_type", "cron_expression", "timezone",
-            "instruction", "workspace_id", "llm_model",
+            "instruction", "workspace_id", "llm_model", "reasoning_effort",  # DALTON-HOOK(automation-effort)
             "thread_strategy", "conversation_thread_id",
             "status", "max_failures", "failure_count", "disable_reason",
             "next_run_at", "last_run_at",

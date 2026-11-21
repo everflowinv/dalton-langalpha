@@ -82,12 +82,15 @@ export default function AutomationInlineForm({
   const [refused, setRefused] = useState<DeliveryProblem[]>([]);
   // DALTON-HOOK(automation-model): server error when saving an unavailable model
   const [modelError, setModelError] = useState<string | null>(null);
+  // DALTON-HOOK(automation-effort): distinguish untouched omitted effort vs explicit "Follow default" (null) on create
+  const [explicitNullEffort, setExplicitNullEffort] = useState(false);
   const uid = useId();
   const ids = { name: `${uid}-name`, instruction: `${uid}-instruction` };
 
   const patch: FormPatch = (key, value) => {
     if (key === 'delivery_methods') setRefused([]);
-    if (key === 'llm_model') setModelError(null);
+    // DALTON-HOOK(automation-effort): clear model/effort refusal banner when either changes
+    if (key === 'llm_model' || key === 'reasoning_effort') setModelError(null);
     setForm((f) => ({ ...f, [key]: value }));
   };
 
@@ -121,7 +124,11 @@ export default function AutomationInlineForm({
     }
     const submission: FormSubmission = opened.automation
       ? { kind: 'edit', payload: formStateToUpdatePayload(form, opened.values, opened.automation, workspaceId) }
-      : { kind: 'create', payload: formStateToPayload(form, workspaceId) };
+      : {
+          kind: 'create',
+          // DALTON-HOOK(automation-effort): pass explicitNullEffort so create distinguishes omitted vs explicit null
+          payload: formStateToPayload(form, workspaceId, { explicitNullEffort }),
+        };
     // The refusal itself was already announced; one naming delivery entries
     // is also shown beside them, unfolded.
     void Promise.resolve(onSubmit(submission)).catch((err: unknown) => {
@@ -132,13 +139,18 @@ export default function AutomationInlineForm({
         return;
       }
       // DALTON-HOOK(automation-model): surface unavailable model error on the form
+      // DALTON-HOOK(automation-effort): also surface reasoning_effort refusal on the form
       const detail = apiErrorDetail(err);
       const detailField =
         detail && typeof detail === 'object' && !Array.isArray(detail)
           ? (detail as { field?: unknown }).field
           : undefined;
       const message = mutationErrorMessage(err, '');
-      if (detailField === 'llm_model' || /\bmodel\b|模型/i.test(message)) {
+      if (
+        detailField === 'llm_model' ||
+        detailField === 'reasoning_effort' ||
+        /\bmodel\b|模型|reasoning_effort|思考强度/i.test(message)
+      ) {
         setModelError(message || t('automation.actionFailed'));
         setMoreOpen(true);
       }
@@ -187,7 +199,9 @@ export default function AutomationInlineForm({
             deliveryAttempts={opened.automation?.last_execution?.delivery_result}
             deliveryProblems={refused}
             // DALTON-HOOK(automation-model): pass server model error to MoreOptions
+            // DALTON-HOOK(automation-effort): track explicit "Follow default" selection on create
             modelError={modelError}
+            onExplicitDefaultEffort={setExplicitNullEffort}
             omitDelivery={omitDelivery}
           />
         </div>
