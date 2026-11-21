@@ -1108,3 +1108,383 @@ def test_documented_commands_run_in_skill_order(tmp_path: Path) -> None:
     assert code == 0, (payload, stderr)
     assert payload["lines"] == [_LINE]
     assert not (workspace / "state").is_symlink()
+
+
+def test_sentiment_coverage_and_utc_window() -> None:
+    from datetime import timezone
+
+    scripts_dalton = REPO_ROOT / "scripts" / "dalton"
+    if str(scripts_dalton) not in sys.path:
+        sys.path.insert(0, str(scripts_dalton))
+    import researchdata_bridge as rb
+
+    sentiment = _sentiment()
+
+    # 1. NY 20:30 is UTC next day (01:30Z): since/until must use UTC dates so late-evening NY posts survive bridge filtering.
+    win_evening = sentiment.compute_window("2026-11-12T20:30:00-05:00")
+    assert win_evening["summary_date"] == "2026-11-12"
+    assert win_evening["start_date"] == "2026-11-12"
+    assert win_evening["end_date"] == "2026-11-13"
+    bridge_evening = rb._normalize_x_timeline_output(
+        {
+            "items": [
+                {
+                    "id": "888",
+                    "text": "20:00 NY post (01:00 UTC next day)",
+                    "createdAt": "Fri Nov 13 01:00:00 +0000 2026",
+                    "user": {"screenName": "xiaomustock", "name": "xiaomustock"},
+                }
+            ],
+            "hasMore": False,
+        },
+        operation="tweets",
+        count=50,
+        since=win_evening["start_date"],
+        until=win_evening["end_date"],
+    )
+    assert len(bridge_evening["items"]) == 1
+
+    # 2. Coverage matrix matching daily reports:
+    #    - 49 in-window + 2 pre-window truncated to 50 -> covered (oldest_returned_at < start)
+    #    - 51 in-window + 1 pre-window truncated to 50 -> incomplete (oldest_returned_at >= start)
+    #    - old pinned tweet at index 0 + in-window tweet with hasMore=True -> incomplete (pinned excluded)
+    #    - nested empty + has_more=True + x_search supplement -> incomplete, note omits timestamp
+    #    - truncated + oldest_returned_at=None + oldest_fetched_at >= start -> incomplete, note uses oldest_fetched_at
+    win = sentiment.compute_window(_END_ISO)
+    start = datetime.fromisoformat(win["start_iso"])
+
+    raw_49 = []
+    for idx in range(49):
+        dt_utc = (start + timedelta(minutes=25 * (49 - idx))).astimezone(timezone.utc)
+        raw_49.append(
+            {
+                "id": str(500 + idx),
+                "text": f"covered-{idx}",
+                "createdAt": dt_utc.strftime("%a %b %d %H:%M:%S +0000 %Y"),
+                "user": {"screenName": "xiaomustock", "name": "xiaomustock"},
+            }
+        )
+    for idx, mins in enumerate((1, 10)):
+        dt_utc = (start - timedelta(minutes=mins)).astimezone(timezone.utc)
+        raw_49.append(
+            {
+                "id": str(498 - idx),
+                "text": f"before-{idx}",
+                "createdAt": dt_utc.strftime("%a %b %d %H:%M:%S +0000 %Y"),
+                "user": {"screenName": "xiaomustock", "name": "xiaomustock"},
+            }
+        )
+    bridge_covered = rb._normalize_x_timeline_output(
+        {"items": raw_49, "hasMore": False},
+        operation="tweets",
+        count=50,
+        since=win["start_date"],
+        until=win["end_date"],
+    )
+    assert bridge_covered["truncated"] is True
+
+    raw_51 = []
+    for idx in range(51):
+        dt_utc = (start + timedelta(minutes=20 * (51 - idx))).astimezone(timezone.utc)
+        raw_51.append(
+            {
+                "id": str(600 + idx),
+                "text": f"trunc-inc-{idx}",
+                "createdAt": dt_utc.strftime("%a %b %d %H:%M:%S +0000 %Y"),
+                "user": {"screenName": "nft_hu", "name": "nft_hu"},
+            }
+        )
+    raw_51.append(
+        {
+            "id": "599",
+            "text": "pre-51",
+            "createdAt": (start - timedelta(minutes=1)).astimezone(timezone.utc).strftime("%a %b %d %H:%M:%S +0000 %Y"),
+            "user": {"screenName": "nft_hu", "name": "nft_hu"},
+        }
+    )
+    bridge_51 = rb._normalize_x_timeline_output(
+        {"items": raw_51, "hasMore": False},
+        operation="tweets",
+        count=50,
+        since=win["start_date"],
+        until=win["end_date"],
+    )
+    assert bridge_51["truncated"] is True
+
+    bridge_pinned = rb._normalize_x_timeline_output(
+        {
+            "items": [
+                {
+                    "id": "901",
+                    "text": "old pinned",
+                    "createdAt": "Thu Jan 01 00:00:00 +0000 2026",
+                    "user": {"screenName": "octopusycc", "name": "octopusycc"},
+                },
+                {
+                    "id": "902",
+                    "text": "in-window post",
+                    "createdAt": "Thu Nov 12 10:00:00 +0000 2026",  # 05:00 NY
+                    "user": {"screenName": "octopusycc", "name": "octopusycc"},
+                },
+            ],
+            "hasMore": True,
+        },
+        operation="tweets",
+        count=50,
+        since=win["start_date"],
+        until=win["end_date"],
+    )
+
+    accounts = {
+        handle: {"ok": True, "has_more": False, "truncated": False, "oldest_fetched_at": None, "oldest_returned_at": None, "items": []}
+        for handle in sentiment.HANDLE_ORDER
+    }
+    accounts["xiaomustock"] = {"ok": True, "status": "ok", "data": bridge_covered}
+    accounts["nft_hu"] = {"ok": True, "status": "ok", "data": bridge_51}
+    accounts["octopusycc"] = {"ok": True, "status": "ok", "data": bridge_pinned}
+    accounts["bitfool1"] = {
+        "ok": True,
+        "status": "empty",
+        "data": {"items": [], "returned": 0, "has_more": True, "truncated": False, "oldest_fetched_at": None, "oldest_returned_at": None},
+    }
+    accounts["blknoiz06"] = {
+        "ok": True,
+        "status": "ok",
+        "data": {
+            "items": [],
+            "returned": 0,
+            "has_more": False,
+            "truncated": True,
+            "oldest_fetched_at": "2026-11-12T13:00:00+00:00",  # 08:00 NY > end
+            "oldest_returned_at": None,
+        },
+    }
+    accounts["notthreadguy"] = {
+        "ok": True,
+        "status": "ok",
+        "data": {
+            "items": [],
+            "has_more": True,
+            "truncated": False,
+            "oldest_fetched_at": (start - timedelta(minutes=5)).astimezone(timezone.utc).isoformat(),
+            "oldest_returned_at": "2026-11-12T10:00:00+00:00",
+        },
+    }
+    selected = sentiment.select_posts(
+        {
+            "accounts": accounts,
+            "x_search": {
+                "ok": True,
+                "items": [
+                    {
+                        "author": "bitfool1",
+                        "url": "https://x.com/bitfool1/status/777",
+                        "date": "2026-11-12T06:00:00-05:00",
+                        "summary_excerpt": "from x_search only",
+                    }
+                ],
+            },
+        },
+        win,
+    )
+    assert selected["has_more"] == ["nft_hu", "octopusycc", "bitfool1", "blknoiz06"]
+    assert selected["incomplete"] == ["nft_hu", "octopusycc", "bitfool1", "blknoiz06"]
+    assert selected["accounts"]["xiaomustock"]["incomplete"] is False
+    assert selected["accounts"]["notthreadguy"]["incomplete"] is False
+    notes = selected["incomplete_notes"]
+    expected_nft_ny = (start + timedelta(minutes=40)).astimezone(sentiment.TZ).strftime("%Y-%m-%d %H:%M:%S")
+    assert f"@nft_hu 窗口内可能还有未取回的帖子，最早只取到 {expected_nft_ny}（纽约时间）" in notes
+    assert "@octopusycc 窗口内可能还有未取回的帖子，最早只取到 2026-11-12 05:00:00（纽约时间）" in notes
+    assert "@bitfool1 窗口内可能还有未取回的帖子" in notes
+    assert not any(n.startswith("@bitfool1 窗口内可能还有未取回的帖子，") for n in notes)
+    assert "@blknoiz06 窗口内可能还有未取回的帖子，最早只取到 2026-11-12 08:00:00（纽约时间）" in notes
+
+    # 3. Unified possible wording for both 50+1 pre-window and 51 in-window truncated timelines (NY time).
+    raw_50_plus_1 = [
+        {
+            "id": str(700 + idx),
+            "text": f"in-50-{idx}",
+            "createdAt": (start + timedelta(minutes=20 * (50 - idx))).astimezone(timezone.utc).strftime("%a %b %d %H:%M:%S +0000 %Y"),
+            "user": {"screenName": "degentradingLSD", "name": "degentradingLSD"},
+        }
+        for idx in range(50)
+    ]
+    raw_50_plus_1.append(
+        {
+            "id": "699",
+            "text": "pre-50",
+            "createdAt": (start - timedelta(minutes=1)).astimezone(timezone.utc).strftime("%a %b %d %H:%M:%S +0000 %Y"),
+            "user": {"screenName": "degentradingLSD", "name": "degentradingLSD"},
+        }
+    )
+    bridge_50_plus_1 = rb._normalize_x_timeline_output(
+        {"items": raw_50_plus_1, "hasMore": False},
+        operation="tweets",
+        count=50,
+        since=win["start_date"],
+        until=win["end_date"],
+    )
+    raw_51_only = [
+        {
+            "id": str(800 + idx),
+            "text": f"in-51-only-{idx}",
+            "createdAt": (start + timedelta(minutes=20 * (51 - idx))).astimezone(timezone.utc).strftime("%a %b %d %H:%M:%S +0000 %Y"),
+            "user": {"screenName": "qinbafrank", "name": "qinbafrank"},
+        }
+        for idx in range(51)
+    ]
+    bridge_51_only = rb._normalize_x_timeline_output(
+        {"items": raw_51_only, "hasMore": False},
+        operation="tweets",
+        count=50,
+        since=win["start_date"],
+        until=win["end_date"],
+    )
+    dist_accounts = {
+        handle: {"ok": True, "has_more": False, "truncated": False, "oldest_fetched_at": None, "oldest_returned_at": None, "items": []}
+        for handle in sentiment.HANDLE_ORDER
+    }
+    dist_accounts["degentradingLSD"] = {"ok": True, "status": "ok", "data": bridge_50_plus_1}
+    dist_accounts["qinbafrank"] = {"ok": True, "status": "ok", "data": bridge_51_only}
+    dist_sel = sentiment.select_posts({"accounts": dist_accounts, "x_search": {"ok": False, "items": []}}, win)
+    expected_degen_ny = (start + timedelta(minutes=20)).astimezone(sentiment.TZ).strftime("%Y-%m-%d %H:%M:%S")
+    expected_qin_ny = (start + timedelta(minutes=40)).astimezone(sentiment.TZ).strftime("%Y-%m-%d %H:%M:%S")
+    assert "incomplete_certain" not in dist_sel["accounts"]["qinbafrank"]
+    assert f"@degentradingLSD 窗口内可能还有未取回的帖子，最早只取到 {expected_degen_ny}（纽约时间）" in dist_sel["incomplete_notes"]
+    assert f"@qinbafrank 窗口内可能还有未取回的帖子，最早只取到 {expected_qin_ny}（纽约时间）" in dist_sel["incomplete_notes"]
+    assert all("窗口内帖子超过已取回的数量" not in n for n in dist_sel["incomplete_notes"])
+
+
+def test_sentiment_ny_dst_fallback_compares_in_utc() -> None:
+    from datetime import timezone
+
+    sentiment = _sentiment()
+    # 2026-11-01 is NY DST fall-back day (06:00 UTC = 02:00 EDT -> 01:00 EST).
+    # 05:35 UTC = 01:35-04:00 (EDT); 06:15 UTC = 01:15-05:00 (EST).
+    # Window starting at 2026-11-01T05:45:00Z (01:45-04:00) is covered by 05:35 UTC.
+    win = sentiment.compute_window("2026-11-02T00:45:00-05:00")
+    assert datetime.fromisoformat(win["start_iso"]).astimezone(timezone.utc) == datetime(2026, 11, 1, 5, 45, tzinfo=timezone.utc)
+    legacy_items = [
+        {"id": "2", "author_handle": "xiaomustock", "created_at": "2026-11-01T06:15:00Z", "text": "post at 06:15Z"},
+        {"id": "1", "author_handle": "xiaomustock", "created_at": "2026-11-01T05:35:00Z", "text": "post at 05:35Z"},
+    ]
+    assert sentiment._oldest_timeline_item(legacy_items, "xiaomustock") == datetime(2026, 11, 1, 5, 35, tzinfo=timezone.utc)
+
+    accounts = {handle: {"ok": True, "has_more": False, "items": []} for handle in sentiment.HANDLE_ORDER}
+    accounts["xiaomustock"] = {"ok": True, "has_more": True, "items": legacy_items}
+    selected = sentiment.select_posts({"accounts": accounts, "x_search": {"ok": False, "items": []}}, win)
+    assert selected["accounts"]["xiaomustock"]["incomplete"] is False
+    assert selected["accounts"]["xiaomustock"]["oldest_created_at"] == "2026-11-01T01:35:00-04:00"
+    assert selected["incomplete_notes"] == []
+
+    # Also verify when both 05:35Z and 06:15Z are inside a window starting at 05:20Z: 05:35Z is chosen as oldest.
+    win_in = sentiment.compute_window("2026-11-02T00:20:00-05:00")
+    selected_in = sentiment.select_posts({"accounts": accounts, "x_search": {"ok": False, "items": []}}, win_in)
+    assert selected_in["accounts"]["xiaomustock"]["incomplete"] is True
+    assert selected_in["accounts"]["xiaomustock"]["oldest_created_at"] == "2026-11-01T01:35:00-04:00"
+    assert [row["id"] for row in selected_in["accounts"]["xiaomustock"]["items"]] == ["1", "2"]
+    assert "@xiaomustock 窗口内可能还有未取回的帖子，最早只取到 2026-11-01 01:35:00（纽约时间）" in selected_in["incomplete_notes"]
+
+
+def test_check_requires_incomplete_notes_in_data_notes(tmp_path: Path) -> None:
+    sentiment = _sentiment()
+    note_a = "@xiaomustock 窗口内可能还有未取回的帖子，最早只取到 2026-11-12 05:00:00（纽约时间）"
+    note_b = "@bitfool1 窗口内可能还有未取回的帖子"
+    base_report = _daily_report(_SUMMARY_DATE, temperature="3/10，仓位偏谨慎。")
+
+    # Direct validate_report checks: omitted or placed outside 【数据备注】 fails; verbatim inside 【数据备注】 passes.
+    missing_errs = sentiment.validate_report(
+        base_report, _SUMMARY_DATE, require_change=False, incomplete_notes=[note_a, note_b]
+    )
+    assert any("数据备注缺少未取全提示" in err and note_a in err and note_b in err for err in missing_errs)
+
+    wrong_section = base_report.replace("【共识主线】今日一致关注存储价格。", f"【共识主线】今日一致关注存储价格。\n{note_a}", 1) + note_b + "\n"
+    wrong_errs = sentiment.validate_report(
+        wrong_section, _SUMMARY_DATE, require_change=False, incomplete_notes=[note_a, note_b]
+    )
+    assert any(note_a in err and note_b not in err for err in wrong_errs)
+
+    complete_report = base_report + f"{note_a}\n{note_b}\n"
+    assert sentiment.validate_report(complete_report, _SUMMARY_DATE, require_change=False, incomplete_notes=[note_a, note_b]) == []
+
+    # End-to-end select -> check via CLI: default selected.json path enforces every incomplete_note.
+    workspace = tmp_path / "ws"
+    day = workspace / "temp" / "ct-semi-sentiment" / _SUMMARY_DATE
+    day.mkdir(parents=True)
+    accounts = {
+        handle: {"ok": True, "has_more": False, "truncated": False, "oldest_fetched_at": None, "oldest_returned_at": None, "items": []}
+        for handle in sentiment.HANDLE_ORDER
+    }
+    accounts["xiaomustock"] = {
+        "ok": True,
+        "has_more": True,
+        "truncated": False,
+        "oldest_fetched_at": "2026-11-12T10:00:00+00:00",
+        "oldest_returned_at": "2026-11-12T10:00:00+00:00",
+        "items": [],
+    }
+    accounts["bitfool1"] = {
+        "ok": True,
+        "has_more": False,
+        "truncated": True,
+        "oldest_fetched_at": None,
+        "oldest_returned_at": None,
+        "items": [],
+    }
+    (day / "raw.json").write_text(
+        json.dumps({"accounts": accounts, "x_search": {"ok": True, "items": []}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    code, sel_out, stderr = _run(
+        sentiment,
+        [
+            "--json",
+            "select",
+            "--workspace-dir",
+            str(workspace),
+            "--as-of",
+            _END_ISO,
+            "--input",
+            f"temp/ct-semi-sentiment/{_SUMMARY_DATE}/raw.json",
+            "--output",
+            f"temp/ct-semi-sentiment/{_SUMMARY_DATE}/selected.json",
+        ],
+    )
+    assert code == 0, (sel_out, stderr)
+    assert sel_out["incomplete_notes"] == [note_a, note_b]
+
+    report_path = day / "report.txt"
+    check_argv = [
+        "--json",
+        "check",
+        "--workspace-dir",
+        str(workspace),
+        "--file",
+        f"temp/ct-semi-sentiment/{_SUMMARY_DATE}/report.txt",
+        "--date",
+        _SUMMARY_DATE,
+    ]
+    report_path.write_text(base_report, encoding="utf-8")
+    code, payload, stderr = _run(sentiment, check_argv)
+    assert code == 1, (payload, stderr)
+    assert payload["error"] == "invalid_report"
+    assert any(note_a in err and note_b in err for err in payload["errors"])
+
+    report_path.write_text(base_report + note_a + "\n", encoding="utf-8")
+    code, payload, stderr = _run(sentiment, check_argv)
+    assert code == 1, (payload, stderr)
+    assert any(note_b in err and note_a not in err for err in payload["errors"])
+
+    report_path.write_text(complete_report, encoding="utf-8")
+    code, payload, stderr = _run(sentiment, check_argv)
+    assert code == 0, (payload, stderr)
+    assert payload["ok"] is True
+
+    # Symlinked selected.json is refused.
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"incomplete_notes": []}), encoding="utf-8")
+    (day / "selected.json").unlink()
+    os.symlink(outside, day / "selected.json")
+    code, payload, stderr = _run(sentiment, check_argv)
+    assert code == 1, (payload, stderr)
+    assert payload["error"] == "refusing symlink"

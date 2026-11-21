@@ -28,7 +28,7 @@ python3 .agents/skills/dalton-x-accounts-daily/scripts/x_accounts_daily.py \
 
 ## 2. 四个账号的时间线
 
-按顺序调用，不要并行。每个账号失败后重试一次。仍然失败就记「抓取失败」并继续，不要让整份日报停住。不要传嵌套的 `params`。`tweets` 不要带 `url`、`tweet_id` 或 `query`。`since` 和 `until` 是日历日，桥接层在取回之后按日历日过滤再截到 `count`。脚本还会按精确 24 小时再滤一次。`count` 用 50。不要传 `include_replies`。
+按顺序调用，不要并行。每个账号失败后重试一次。仍然失败就记「抓取失败」并继续，不要让整份日报停住。不要传嵌套的 `params`。`tweets` 不要带 `url`、`tweet_id` 或 `query`。`since` 和 `until` 填窗口两端的 UTC 日历日（即第 1 步返回的 `start_date` 和 `end_date`），时间线工具在取回之后按 UTC 日历日过滤再截到 `count`。脚本还会按精确 24 小时再滤一次。`count` 用 50。不要传 `include_replies`。
 
 ```python
 community(
@@ -41,14 +41,14 @@ community(
 )
 ```
 
-另外三个 handle 同样调用。返回里的 `has_more` 为 true 时，数据备注说明窗口内可能还有未取回的帖子，不要翻页，也不要编造。
+另外三个账号同样调用。接口不支持翻页，不要尝试翻页，也不要编造未返回的帖。把工具返回的 `items`（帖子列表）以及 4 个覆盖度字段原样写入 `raw.json`（直接保留整段返回结构也可以）：`has_more`（是否还有更早的未取回帖子）、`truncated`（是否因达到 `count` 上限被截断）、`oldest_fetched_at`（过滤和截断前抓到的非置顶原始帖最早时间）和 `oldest_returned_at`（过滤和截断后最终返回帖的最早时间）。第 5 步脚本会据此判断：未截断且 `oldest_fetched_at` 早于窗口起点，或已截断且 `oldest_returned_at` 早于窗口起点时视为取全；其余只要 `has_more` 或 `truncated` 为 true，脚本会在数据备注里自动写明「窗口内可能还有未取回的帖子，最早只取到 <时间>（香港时间）」（因为有些情况下无法确认被截掉的帖子是否在窗口内）。时间优先使用 `oldest_returned_at`，缺失时回退到 `oldest_fetched_at`；两者均缺失时，若旧版 `raw.json` 里带有帖子时间会改用帖子里最早的时间，否则省略「，最早只取到……」后半句。
 
 把四次结果写成 `temp/x-accounts-daily/<summary_date>/raw.json`：
 
 ```json
 {
   "accounts": {
-    "aleabitoreddit": {"ok": true, "has_more": false, "items": []},
+    "aleabitoreddit": {"ok": true, "has_more": false, "truncated": false, "oldest_fetched_at": null, "oldest_returned_at": null, "items": []},
     "jukan05": {"ok": true, "has_more": false, "items": []},
     "mingchikuo": {"ok": true, "has_more": false, "items": []},
     "citrini": {"ok": false, "items": []}
