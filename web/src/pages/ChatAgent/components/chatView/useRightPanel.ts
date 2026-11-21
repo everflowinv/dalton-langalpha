@@ -14,19 +14,19 @@ import { clampPanelWidth as clampPanelWidthUtil } from '@/lib/panelUtils';
 import { buildMarketViewUrl } from '@/pages/MarketView/utils/marketRoute';
 import { CHART_SURFACE_MIN_WIDTH } from '@/pages/MarketView/components/chartSurfaceLayout';
 import type { FileTab } from '../filePanel/useFileTabs';
+import type { Computer } from '@/types/api';
+import type { LinkActions } from '../../contexts/LinkActionsContext';
 import type { ChartTabSpec, UnsequencedTarget } from '../filePanel/types';
 import type { PreviewData } from '../../hooks/utils/types';
 import { readArtifactCommentReply, type ArtifactCommentRef } from '../artifactComments/artifactCommentReply';
 import { NO_TRANSCRIPTS, useToolCallLookup, type TranscriptMessage } from './toolCallLookup';
 import { useTranscriptReader } from '../filePanel/transcriptStore';
-import { DEFAULT_PANEL_WIDTH, detailPanelWidth } from '../filePanel/detailWidth';
+import { DEFAULT_PANEL_WIDTH, PREVIEW_MAX_RATIO, detailPanelWidth } from '../filePanel/detailWidth';
 import { usePanelAsks, usePanelLinkOpen } from './usePanelLinks';
 import { useFileDeepLink } from './useFileDeepLink';
+import { useChatBrowser } from './useChatBrowser';
 
 export { nextPanelOverride } from './usePanelLinks';
-
-// A running app or a live chart opens wide, so its toolbar has room.
-const PREVIEW_MAX_RATIO = 0.92;
 
 // Held for a shortcut or a modified click; no intent of their own.
 const MODIFIER_KEYS = new Set(['Shift', 'Control', 'Alt', 'Meta']);
@@ -46,12 +46,21 @@ export function useRightPanel({
   messages,
   subagentTranscripts = NO_TRANSCRIPTS,
   watching = false,
+  computer = null,
+  shared = false,
+  browserOn = false,
   // DALTON-HOOK(workspace-sharing-settings): prevent preview sandbox startup for colleague workspaces
   readOnly = false,
   isColleague = readOnly,
 }: {
   isMobile: boolean;
   workspaceId: string;
+  /** The chat's computer, which decides whether it has a browser to show. */
+  computer?: Computer | null;
+  /** The workspace is shared with the reader, who is not sent its computer. */
+  shared?: boolean;
+  /** The reader turned the browser on in Settings. */
+  browserOn?: boolean;
   /** The workspace's folder, those a rename moved it out of, which older
    *  turns' paths still name, and the other workspaces on its computer. */
   folders?: ComputerFolders | null;
@@ -503,6 +512,11 @@ export function useRightPanel({
   // DALTON-HOOK(workspace-sharing-settings): colleague check for a teammate's workspace
   }, [isColleague, isMobile, landInFilePanel, filePanelWorkspaceId, leaveFiles, setFilePanelWorkspaceId, applyPanelWidth, pushPanelHistory, workspaceId, resolveAndSetPreview]);
 
+  const { viewFor: browserViewFor, handleBrowserUse, openInBrowser } = useChatBrowser({
+    workspaceId, threadId: threadId ?? null, computer, shared, browserOn, isMobile, panelOpen: rightPanelType === 'file',
+    filePanelWorkspaceId, setFilePanelWorkspaceId, askPanel, land: landInFilePanel, leave: leaveFiles,
+  });
+
   /**
    * An `/a/` link in a reply, opened as the panel tab its item already has:
    * the app on its port at the page the link names, or the file. Desktop shell
@@ -569,6 +583,11 @@ export function useRightPanel({
   // unmounting, and a view moved to another workspace leaves this one's links
   // behind; each runs this cleanup.
   useEffect(() => () => { shareLinkClickRef.current += 1; }, [isActive, workspaceId]);
+
+  const linkActions = useMemo<LinkActions>(
+    () => ({ openShareLink: handleOpenShareLink, openInBrowser }),
+    [handleOpenShareLink, openInBrowser],
+  );
 
   // The sheets are the only surfaces that show a `preview` or `detail` panel
   // type; the desktop column shows a running app or a tool result as a Files
@@ -791,6 +810,9 @@ export function useRightPanel({
     handleActiveTabKindChange,
     leaveFiles,
     handleOpenPreview,
+    handleBrowserUse,
+    browserViewFor,
+    linkActions,
     handleOpenArtifactComment,
     handleOpenShareLink,
     handleOpenChart,
