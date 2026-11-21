@@ -417,6 +417,48 @@ def _bucket(payload: Any) -> tuple[bool, list[Any], bool]:
     return True, _items(payload), has_more
 
 
+def _wire_bucket(
+    payload: Any,
+) -> tuple[bool, list[Any], bool, bool, datetime | None, datetime | None, bool, bool]:
+    ok, items, has_more = _bucket(payload)
+    if not ok or not isinstance(payload, dict):
+        return ok, items, has_more, False, None, None, False, False
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    truncated = bool(payload.get("truncated") or data.get("truncated"))
+    has_fetched_key = any(
+        key in container
+        for container in (payload, data)
+        for key in ("oldest_fetched_at", "oldestFetchedAt")
+    )
+    has_returned_key = any(
+        key in container
+        for container in (payload, data)
+        for key in ("oldest_returned_at", "oldestReturnedAt")
+    )
+    oldest_fetched = parse_time(
+        payload.get("oldest_fetched_at")
+        or payload.get("oldestFetchedAt")
+        or data.get("oldest_fetched_at")
+        or data.get("oldestFetchedAt")
+    )
+    oldest_returned = parse_time(
+        payload.get("oldest_returned_at")
+        or payload.get("oldestReturnedAt")
+        or data.get("oldest_returned_at")
+        or data.get("oldestReturnedAt")
+    )
+    return (
+        ok,
+        items,
+        has_more,
+        truncated,
+        oldest_fetched,
+        oldest_returned,
+        has_fetched_key,
+        has_returned_key,
+    )
+
+
 def _index_accounts(raw: Any, names: tuple[str, ...]) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return {}
@@ -538,8 +580,8 @@ def plan_requests(as_of: str | None = None) -> dict[str, Any]:
     wires = [
         {
             "handle": handle,
-            "since": window["start_date"],
-            "until": window["end_date"],
+            "since": window["x_from_date"],
+            "until": window["x_to_date"],
             "count": TIMELINE_COUNT,
         }
         for handle in WIRE_ACCOUNTS
@@ -778,6 +820,61 @@ def _public_x(item: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def _oldest_wire_moment(items: list[Any]) -> datetime | None:
+    """Return the earliest valid UTC timestamp among returned wire items; ignore undated items."""
+    oldest: datetime | None = None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        moment = _moment_of(item)
+        if moment is not None:
+            moment_utc = moment.astimezone(timezone.utc)
+            if oldest is None or moment_utc < oldest:
+                oldest = moment_utc
+    return oldest
+
+
+def _evaluate_wire_coverage(
+    *,
+    has_more: bool,
+    truncated: bool,
+    oldest_fetched: datetime | None,
+    oldest_returned: datetime | None,
+    has_fetched_key: bool,
+    has_returned_key: bool,
+    items: list[Any],
+    window_start: datetime,
+) -> tuple[bool, datetime | None]:
+    """Evaluate `(incomplete, display_oldest)` using bridge fields with legacy fallback."""
+    start_utc = window_start.astimezone(timezone.utc)
+    fetched_utc = oldest_fetched.astimezone(timezone.utc) if oldest_fetched is not None else None
+    returned_utc = oldest_returned.astimezone(timezone.utc) if oldest_returned is not None else None
+    if not has_fetched_key and not has_returned_key:
+        oldest = _oldest_wire_moment(items)
+        incomplete = bool((has_more or truncated) and (oldest is None or oldest >= start_utc))
+        return incomplete, oldest
+    effective_returned = returned_utc if has_returned_key else _oldest_wire_moment(items)
+    if truncated:
+        covered = effective_returned is not None and effective_returned < start_utc
+    elif fetched_utc is None and not has_returned_key:
+        fallback_oldest = _oldest_wire_moment(items)
+        covered = fallback_oldest is not None and fallback_oldest < start_utc
+        effective_returned = effective_returned or fallback_oldest
+    else:
+        covered = fetched_utc is not None and fetched_utc < start_utc
+    incomplete = bool((has_more or truncated) and not covered)
+    display_oldest = effective_returned if effective_returned is not None else fetched_utc
+    return incomplete, display_oldest
+
+
+def _incomplete_wire_note(account: str, oldest: datetime | None) -> str:
+    prefix = "窗口内可能还有未取回的帖子"
+    if oldest is None:
+        return f"{account} {prefix}"
+    earliest = oldest.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return f"{account} {prefix}，最早只取到 {earliest}（香港时间）"
+
+
 def filter_raw(
     raw: dict[str, Any],
     window: dict[str, str],
@@ -797,15 +894,34 @@ def filter_raw(
     wire_ok = 0
     wires = _index_accounts(raw.get("wires") or raw.get("accounts"), WIRE_ACCOUNTS)
     for account in WIRE_ACCOUNTS:
-        ok, items, has_more = _bucket(wires.get(account))
+        (
+            ok,
+            items,
+            has_more,
+            truncated,
+            oldest_fetched,
+            oldest_returned,
+            has_fetched_key,
+            has_returned_key,
+        ) = _wire_bucket(wires.get(account))
         if account not in wires:
             ok = False
         if not ok:
             notes.append(f"{account} 时间线没有返回")
             continue
         wire_ok += 1
-        if has_more:
-            notes.append(f"{account} 时间线已返回，窗口内可能还有未取回的帖子")
+        incomplete, display_oldest = _evaluate_wire_coverage(
+            has_more=has_more,
+            truncated=truncated,
+            oldest_fetched=oldest_fetched,
+            oldest_returned=oldest_returned,
+            has_fetched_key=has_fetched_key,
+            has_returned_key=has_returned_key,
+            items=items,
+            window_start=start,
+        )
+        if incomplete:
+            notes.append(_incomplete_wire_note(account, display_oldest))
         for item in items:
             norm = _normalize_wire(item, account)
             if norm is None or not in_window(norm["moment"], start, end):
@@ -1159,17 +1275,18 @@ def manifest_rel(summary_date: str) -> str:
     return f"temp/vip-news-alert/{summary_date}/manifest.json"
 
 
-def card_content_sha256(card: dict[str, Any]) -> str:
+def card_content_sha256(card: dict[str, Any] | list[dict[str, Any]]) -> str:
     """Match the cards branch of automation_report_content_sha256.
 
-    The canonical object is profile, content_kind, the one-card list, and a
+    The canonical object is profile, content_kind, the card list, and a
     null failure text. The text field is omitted. Key order does not change
     the digest.
     """
+    cards_list = card if isinstance(card, list) else [card]
     canonical = {
         "profile": PROFILE,
         "content_kind": "cards",
-        "cards": [card],
+        "cards": cards_list,
         "failure_text": None,
     }
     raw = json.dumps(
@@ -1201,7 +1318,10 @@ def _seen_entries(pushed: list[tuple[str, str]]) -> list[dict[str, str]]:
 
 def _write_manifest(workspace: Path, built: dict[str, Any], card_rel: str) -> None:
     card = _read_json(workspace, card_rel)
-    if not isinstance(card, dict):
+    if not (
+        isinstance(card, dict)
+        or (isinstance(card, list) and card and all(isinstance(c, dict) for c in card))
+    ):
         raise RuntimeError("card digest mismatch")
     payload = {
         "report_run_id": built["report_run_id"],
@@ -1267,7 +1387,10 @@ def _verified_digest(workspace: Path, manifest: dict[str, Any]) -> str:
     if not isinstance(recorded, str) or not recorded or not isinstance(card_rel, str) or not card_rel:
         raise RuntimeError("manifest is invalid")
     card = _read_json(workspace, card_rel)
-    if not isinstance(card, dict):
+    if not (
+        isinstance(card, dict)
+        or (isinstance(card, list) and card and all(isinstance(c, dict) for c in card))
+    ):
         raise RuntimeError("card digest mismatch")
     digest = card_content_sha256(card)
     if digest != recorded:

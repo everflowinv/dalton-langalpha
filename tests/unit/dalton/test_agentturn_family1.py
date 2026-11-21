@@ -1094,3 +1094,542 @@ async def test_bullbear_renderer_stays_when_a_dependent_is_enabled(tmp_path: Pat
 
 def test_profiles_are_registered() -> None:
     assert set(PROFILES) <= REPORT_PROFILES
+
+
+def test_x_accounts_daily_card_io_splits_oversized_report_and_locks_render_card_constants(
+    tmp_path: Path,
+) -> None:
+    """Oversized X accounts daily markdown (>33 KB) splits into compliant cards via card_io."""
+    from src.dalton.data_jobs.notification_payloads import (
+        FEISHU_CARD_MAX_BYTES,
+        FEISHU_CARD_MAX_ELEMENTS,
+        FEISHU_CARD_TABLE_LIMIT,
+        feishu_card_serialized_utf8_bytes,
+        is_feishu_card_within_envelope,
+    )
+
+    render_mod = _load(
+        "bullbear_render_card_lock",
+        SKILLS / "dalton-bullbear-tracker" / "scripts" / "render_card.py",
+    )
+    assert render_mod.FEISHU_CARD_MAX_BYTES == FEISHU_CARD_MAX_BYTES
+    assert render_mod.FEISHU_CARD_MAX_ELEMENTS == FEISHU_CARD_MAX_ELEMENTS
+    assert render_mod.FEISHU_CARD_TABLE_LIMIT == FEISHU_CARD_TABLE_LIMIT
+
+    x_card_io = _load(
+        "x_accounts_card_io_split_test",
+        SKILLS / "dalton-x-accounts-daily" / "scripts" / "card_io.py",
+    )
+    lines = ["# 📋 推特每日总结 — 2026-11-20", ""]
+    for handle in ("aleabitoreddit", "jukan05", "mingchikuo", "citrini"):
+        lines.extend(["", f"## @{handle}", ""])
+        for idx in range(1, 26):
+            lines.append(
+                f"{idx}. @{handle} 第 {idx} 条深度摘要：追踪 AI 算力资本开支、晶圆代工产能、"
+                f"存储芯片报价与消费电子供应链最新动态变化分析补充说明，"
+                f"涵盖北美云厂商资本开支指引、先进封装 CoWoS 扩产节奏、HBM 高带宽内存价格走势"
+                f"以及终端需求与库存周期的交叉验证细节。"
+                f" [原推](https://x.com/{handle}/status/100000{idx:02d})"
+            )
+    md_text = "\n".join(lines) + "\n"
+    assert len(md_text.encode("utf-8")) > 30_000
+    (tmp_path / "summary.md").write_text(md_text, encoding="utf-8")
+
+    result = x_card_io.render_markdown(
+        workspace=tmp_path,
+        markdown_rel="summary.md",
+        output_rel="card.json",
+        title="📋 推特每日总结 — 2026-11-20",
+    )
+    assert result["ok"] is True
+    cards = result["cards"]
+    assert len(cards) >= 2
+    for idx, card in enumerate(cards, start=1):
+        assert is_feishu_card_within_envelope(card)
+        assert feishu_card_serialized_utf8_bytes(card) <= FEISHU_CARD_MAX_BYTES
+        assert len(card["body"]["elements"]) <= FEISHU_CARD_MAX_ELEMENTS
+        assert f"（{idx}/{len(cards)}）" in card["header"]["title"]["content"]
+
+    saved_json = json.loads((tmp_path / "card.json").read_text(encoding="utf-8"))
+    assert isinstance(saved_json, list) and len(saved_json) == len(cards)
+
+
+def test_x_daily_has_more_checks_oldest_timestamp(tmp_path: Path) -> None:
+    cli = _load(
+        "x_daily_has_more_family1",
+        SKILLS / "dalton-x-accounts-daily" / "scripts" / "x_accounts_daily.py",
+    )
+    as_of = "2026-11-12T08:30:00+08:00"
+    day = "temp/x-accounts-daily/2026-11-12"
+    base_dir = tmp_path / day
+    base_dir.mkdir(parents=True)
+
+    # 1. has_more=True + oldest item earlier than window start -> treated as success, no incomplete note
+    covered_raw = {
+        "accounts": {
+            "aleabitoreddit": {
+                "ok": True,
+                "has_more": True,
+                "items": [
+                    {"id": "1", "author_handle": "aleabitoreddit", "text": "undated"},
+                    {
+                        "id": "2",
+                        "author_handle": "aleabitoreddit",
+                        "created_at": "2026-11-11T09:00:00+08:00",
+                        "text": "in window",
+                        "url": "https://x.com/aleabitoreddit/status/2",
+                    },
+                    {
+                        "id": "3",
+                        "author_handle": "aleabitoreddit",
+                        "created_at": "2026-11-11T08:29:59+08:00",
+                        "text": "before window start",
+                        "url": "https://x.com/aleabitoreddit/status/3",
+                    },
+                ],
+            },
+            "jukan05": {"ok": True, "has_more": False, "items": []},
+            "mingchikuo": {"ok": True, "has_more": False, "items": []},
+            "citrini": {"ok": True, "has_more": False, "items": []},
+        },
+        "x_search": {"ok": True, "items": []},
+    }
+    (base_dir / "raw.json").write_text(json.dumps(covered_raw), encoding="utf-8")
+    (base_dir / "summaries.json").write_text(json.dumps({"summaries": {"2": "窗口内推文"}}), encoding="utf-8")
+    code, selected = _run(
+        cli,
+        [
+            "--json", "select", "--workspace-dir", str(tmp_path),
+            "--as-of", as_of,
+            "--input", f"{day}/raw.json",
+            "--output", f"{day}/selected.json",
+        ],
+    )
+    assert code == 0
+    assert selected["selected"]["accounts"]["aleabitoreddit"]["incomplete"] is False
+    code, _ = _run(
+        cli,
+        [
+            "--json", "compose", "--workspace-dir", str(tmp_path),
+            "--selected", f"{day}/selected.json",
+            "--summaries", f"{day}/summaries.json",
+            "--output", f"{day}/summary.md",
+        ],
+    )
+    assert code == 0
+    md_covered = (base_dir / "summary.md").read_text(encoding="utf-8")
+    assert "四个账号均抓取成功；SuperGrok X Search 补充成功" in md_covered
+    assert "超过已取回的数量" not in md_covered
+    assert "未取回" not in md_covered
+
+    # 2. has_more=True + oldest timestamped item inside window (undated ignored);
+    #    plus has_more=True with undated-only; plus has_more=False unchanged.
+    incomplete_raw = {
+        "accounts": {
+            "aleabitoreddit": {
+                "ok": True,
+                "has_more": True,
+                "items": [
+                    {"id": "10", "author_handle": "aleabitoreddit", "text": "undated item"},
+                    {
+                        "id": "11",
+                        "author_handle": "aleabitoreddit",
+                        "created_at": "2026-11-12T01:00:00+08:00",
+                        "text": "latest",
+                        "url": "https://x.com/aleabitoreddit/status/11",
+                    },
+                    {
+                        "id": "12",
+                        "author_handle": "aleabitoreddit",
+                        "created_at": "2026-11-11T04:15:30Z",
+                        "text": "oldest in window",
+                        "url": "https://x.com/aleabitoreddit/status/12",
+                    },
+                ],
+            },
+            "jukan05": {
+                "ok": True,
+                "has_more": True,
+                "items": [{"id": "20", "author_handle": "jukan05", "text": "no timestamp"}],
+            },
+            "mingchikuo": {
+                "ok": True,
+                "has_more": False,
+                "items": [
+                    {
+                        "id": "30",
+                        "author_handle": "mingchikuo",
+                        "created_at": "2026-11-11T18:00:00+08:00",
+                        "text": "complete page",
+                        "url": "https://x.com/mingchikuo/status/30",
+                    }
+                ],
+            },
+            "citrini": {"ok": True, "has_more": False, "items": []},
+        },
+        "x_search": {"ok": True, "items": []},
+    }
+    (base_dir / "raw_inc.json").write_text(json.dumps(incomplete_raw), encoding="utf-8")
+    (base_dir / "summaries_inc.json").write_text(
+        json.dumps({"summaries": {"11": "最新", "12": "窗口内最早", "30": "完整页"}}),
+        encoding="utf-8",
+    )
+    code, selected_inc = _run(
+        cli,
+        [
+            "--json", "select", "--workspace-dir", str(tmp_path),
+            "--as-of", as_of,
+            "--input", f"{day}/raw_inc.json",
+            "--output", f"{day}/selected_inc.json",
+        ],
+    )
+    assert code == 0
+    assert selected_inc["selected"]["accounts"]["aleabitoreddit"]["incomplete"] is True
+    assert selected_inc["selected"]["accounts"]["jukan05"]["incomplete"] is True
+    assert selected_inc["selected"]["accounts"]["mingchikuo"]["incomplete"] is False
+    code, _ = _run(
+        cli,
+        [
+            "--json", "compose", "--workspace-dir", str(tmp_path),
+            "--selected", f"{day}/selected_inc.json",
+            "--summaries", f"{day}/summaries_inc.json",
+            "--output", f"{day}/summary_inc.md",
+        ],
+    )
+    assert code == 0
+    md_inc = (base_dir / "summary_inc.md").read_text(encoding="utf-8")
+    assert "- @aleabitoreddit 窗口内可能还有未取回的帖子，最早只取到 2026-11-11 12:15:30（香港时间）" in md_inc
+    assert "- @jukan05 窗口内可能还有未取回的帖子\n" in md_inc
+    assert "- @mingchikuo 时间线抓取成功" in md_inc
+    assert "- @citrini 时间线抓取成功" in md_inc
+    assert "四个账号均抓取成功" not in md_inc
+
+
+def test_x_daily_nested_bridge_coverage_and_utc_window(tmp_path: Path) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    scripts_dalton = REPO_ROOT / "scripts" / "dalton"
+    if str(scripts_dalton) not in sys.path:
+        sys.path.insert(0, str(scripts_dalton))
+    import researchdata_bridge as rb
+
+    cli = _load(
+        "x_daily_nested_utc_family1",
+        SKILLS / "dalton-x-accounts-daily" / "scripts" / "x_accounts_daily.py",
+    )
+
+    # 1. Nested bridge shape (truncated, covered): 49 items inside window + 2 items before window start -> 50th returned item is before start.
+    as_of = "2026-11-12T08:30:00+08:00"
+    win = cli.compute_window(as_of)
+    raw_tweets = []
+    base = datetime(2026, 11, 11, 8, 30, 0, tzinfo=cli.TZ)
+    for idx in range(49):
+        dt_utc = (base + timedelta(minutes=25 * (49 - idx))).astimezone(timezone.utc)
+        raw_tweets.append(
+            {
+                "id": str(500 + idx),
+                "text": f"in-window-{idx}",
+                "createdAt": dt_utc.strftime("%a %b %d %H:%M:%S +0000 %Y"),
+                "user": {"screenName": "aleabitoreddit", "name": "aleabitoreddit"},
+            }
+        )
+    for idx, mins in enumerate((1, 10)):
+        dt_utc = (base - timedelta(minutes=mins)).astimezone(timezone.utc)
+        raw_tweets.append(
+            {
+                "id": str(498 - idx),
+                "text": f"before-window-{idx}",
+                "createdAt": dt_utc.strftime("%a %b %d %H:%M:%S +0000 %Y"),
+                "user": {"screenName": "aleabitoreddit", "name": "aleabitoreddit"},
+            }
+        )
+    bridge_data = rb._normalize_x_timeline_output(
+        {"items": raw_tweets, "hasMore": False},
+        operation="tweets",
+        count=50,
+        since=win["start_date"],
+        until=win["end_date"],
+    )
+    assert len(bridge_data["items"]) == 50
+    assert bridge_data["truncated"] is True
+    assert bridge_data["has_more"] is True
+    assert bridge_data["oldest_fetched_at"] == "2026-11-11T00:20:00+00:00"
+    assert bridge_data["oldest_returned_at"] == "2026-11-11T00:29:00+00:00"
+
+    # 1b. Codex middle-1: 51 in-window + 1 before-window truncated to 50 -> oldest_returned_at is still in window -> warns!
+    raw_51 = []
+    for idx in range(51):
+        dt_utc = (base + timedelta(minutes=20 * (51 - idx))).astimezone(timezone.utc)
+        raw_51.append(
+            {
+                "id": str(600 + idx),
+                "text": f"in-window-51-{idx}",
+                "createdAt": dt_utc.strftime("%a %b %d %H:%M:%S +0000 %Y"),
+                "user": {"screenName": "citrini", "name": "citrini"},
+            }
+        )
+    raw_51.append(
+        {
+            "id": "599",
+            "text": "before-window-51",
+            "createdAt": "Wed Nov 11 00:29:00 +0000 2026",
+            "user": {"screenName": "citrini", "name": "citrini"},
+        }
+    )
+    bridge_51 = rb._normalize_x_timeline_output(
+        {"items": raw_51, "hasMore": False},
+        operation="tweets",
+        count=50,
+        since=win["start_date"],
+        until=win["end_date"],
+    )
+    assert bridge_51["truncated"] is True
+    assert bridge_51["oldest_fetched_at"] == "2026-11-11T00:29:00+00:00"
+    assert bridge_51["oldest_returned_at"] == "2026-11-11T01:10:00+00:00"  # 09:10 HKT >= start
+
+    # 1c. Codex middle-2: old pinned tweet at index 0 + in-window tweets with hasMore=True -> pinned excluded -> warns!
+    bridge_pinned = rb._normalize_x_timeline_output(
+        {
+            "items": [
+                {
+                    "id": "901",
+                    "text": "old pinned post",
+                    "createdAt": "Thu Jan 01 00:00:00 +0000 2026",
+                    "user": {"screenName": "mingchikuo", "name": "mingchikuo"},
+                },
+                {
+                    "id": "902",
+                    "text": "in-window post",
+                    "createdAt": "Thu Nov 12 00:00:00 +0000 2026",  # 08:00 HKT
+                    "user": {"screenName": "mingchikuo", "name": "mingchikuo"},
+                },
+            ],
+            "hasMore": True,
+        },
+        operation="tweets",
+        count=50,
+        since=win["start_date"],
+        until=win["end_date"],
+    )
+    assert bridge_pinned["truncated"] is False
+    assert bridge_pinned["oldest_fetched_at"] == "2026-11-12T00:00:00+00:00"
+    assert bridge_pinned["oldest_returned_at"] == "2026-11-12T00:00:00+00:00"
+
+    raw_nested = {
+        "accounts": {
+            "aleabitoreddit": {"ok": True, "status": "ok", "data": bridge_data},
+            # Codex middle-3: nested empty timeline with has_more=True + x_search item for jukan05.
+            "jukan05": {
+                "ok": True,
+                "status": "empty",
+                "empty_reason": "no_matching_items",
+                "data": {
+                    "items": [],
+                    "returned": 0,
+                    "has_more": True,
+                    "truncated": False,
+                    "oldest_fetched_at": None,
+                    "oldest_returned_at": None,
+                },
+            },
+            "mingchikuo": {"ok": True, "status": "ok", "data": bridge_pinned},
+            "citrini": {"ok": True, "status": "ok", "data": bridge_51},
+        },
+        "x_search": {
+            "ok": True,
+            "items": [
+                {
+                    "id": "777",
+                    "author": "jukan05",
+                    "date": "2026-11-11T15:00:00+08:00",
+                    "summary_excerpt": "from x_search only",
+                    "url": "https://x.com/jukan05/status/777",
+                }
+            ],
+        },
+    }
+    selected = cli.select_posts(raw_nested, win)
+    assert selected["accounts"]["aleabitoreddit"]["incomplete"] is False
+    assert selected["accounts"]["jukan05"]["incomplete"] is True
+    assert selected["accounts"]["jukan05"]["oldest_created_at"] == ""
+    assert selected["accounts"]["mingchikuo"]["incomplete"] is True
+    assert selected["accounts"]["citrini"]["incomplete"] is True
+
+    summaries = {str(500 + idx): f"摘要{idx}" for idx in range(49)}
+    summaries.update({str(600 + idx): f"摘要51-{idx}" for idx in range(50)})
+    summaries["902"] = "置顶同行"
+    summaries["777"] = "补充摘要"
+    composed = cli.compose_markdown(selected, summaries)
+    md = composed["markdown"]
+    assert "- @aleabitoreddit 时间线抓取成功" in md
+    assert "- @jukan05 窗口内可能还有未取回的帖子\n" in md
+    assert "2026-11-11 15:00:00" not in md  # x_search timestamp never leaks into timeline note
+    assert "- @mingchikuo 窗口内可能还有未取回的帖子，最早只取到 2026-11-12 08:00:00（香港时间）" in md
+    assert "- @citrini 窗口内可能还有未取回的帖子，最早只取到 2026-11-11 09:10:00（香港时间）" in md
+
+    # 1d. Post-end oldest_fetched_at (>= start) + truncated=True with empty items (oldest_returned_at=None) falls back to oldest_fetched_at.
+    selected_post_end = cli.select_posts(
+        {
+            "accounts": {
+                "aleabitoreddit": {"ok": True, "items": []},
+                "jukan05": {"ok": True, "items": []},
+                "mingchikuo": {
+                    "ok": True,
+                    "status": "ok",
+                    "data": {
+                        "items": [],
+                        "returned": 0,
+                        "has_more": False,
+                        "truncated": True,
+                        "oldest_fetched_at": "2026-11-12T01:00:00+00:00",  # 09:00 HKT > end
+                        "oldest_returned_at": None,
+                    },
+                },
+                "citrini": {"ok": True, "items": []},
+            },
+            "x_search": {"ok": True, "items": []},
+        },
+        win,
+    )
+    assert selected_post_end["accounts"]["mingchikuo"]["incomplete"] is True
+    md_post_end = cli.compose_markdown(selected_post_end, {})["markdown"]
+    assert "- @mingchikuo 窗口内可能还有未取回的帖子，最早只取到 2026-11-12 09:00:00（香港时间）" in md_post_end
+
+    # 1e. Unified possible wording for both 50+1 pre-window and 51 in-window truncated timelines.
+    raw_50_plus_1 = []
+    for idx in range(50):
+        dt_utc = (base + timedelta(minutes=20 * (50 - idx))).astimezone(timezone.utc)
+        raw_50_plus_1.append(
+            {
+                "id": str(700 + idx),
+                "text": f"in-win-50-{idx}",
+                "createdAt": dt_utc.strftime("%a %b %d %H:%M:%S +0000 %Y"),
+                "user": {"screenName": "aleabitoreddit", "name": "aleabitoreddit"},
+            }
+        )
+    raw_50_plus_1.append(
+        {
+            "id": "699",
+            "text": "pre-win-1",
+            "createdAt": "Wed Nov 11 00:29:00 +0000 2026",
+            "user": {"screenName": "aleabitoreddit", "name": "aleabitoreddit"},
+        }
+    )
+    bridge_50_plus_1 = rb._normalize_x_timeline_output(
+        {"items": raw_50_plus_1, "hasMore": False},
+        operation="tweets",
+        count=50,
+        since=win["start_date"],
+        until=win["end_date"],
+    )
+    raw_51_in_window = []
+    for idx in range(51):
+        dt_utc = (base + timedelta(minutes=20 * (51 - idx))).astimezone(timezone.utc)
+        raw_51_in_window.append(
+            {
+                "id": str(800 + idx),
+                "text": f"in-win-51-only-{idx}",
+                "createdAt": dt_utc.strftime("%a %b %d %H:%M:%S +0000 %Y"),
+                "user": {"screenName": "jukan05", "name": "jukan05"},
+            }
+        )
+    bridge_51_in_window = rb._normalize_x_timeline_output(
+        {"items": raw_51_in_window, "hasMore": False},
+        operation="tweets",
+        count=50,
+        since=win["start_date"],
+        until=win["end_date"],
+    )
+    selected_distinction = cli.select_posts(
+        {
+            "accounts": {
+                "aleabitoreddit": {"ok": True, "status": "ok", "data": bridge_50_plus_1},
+                "jukan05": {"ok": True, "status": "ok", "data": bridge_51_in_window},
+                "mingchikuo": {"ok": True, "items": []},
+                "citrini": {"ok": True, "items": []},
+            },
+            "x_search": {"ok": True, "items": []},
+        },
+        win,
+    )
+    assert selected_distinction["accounts"]["aleabitoreddit"]["incomplete"] is True
+    assert selected_distinction["accounts"]["jukan05"]["incomplete"] is True
+    assert "incomplete_certain" not in selected_distinction["accounts"]["jukan05"]
+    dist_summaries = {str(700 + idx): f"五十摘要{idx}" for idx in range(50)}
+    dist_summaries.update({str(800 + idx): f"五一摘要{idx}" for idx in range(50)})
+    md_dist = cli.compose_markdown(selected_distinction, dist_summaries)["markdown"]
+    assert "- @aleabitoreddit 窗口内可能还有未取回的帖子，最早只取到 2026-11-11 08:50:00（香港时间）" in md_dist
+    assert "- @jukan05 窗口内可能还有未取回的帖子，最早只取到 2026-11-11 09:10:00（香港时间）" in md_dist
+    assert "窗口内帖子超过已取回的数量" not in md_dist
+
+    # 2. HKT 07:30 window end: since/until use UTC dates so tweets near window start (previous UTC day) survive bridge filtering.
+    win_0730 = cli.compute_window("2026-11-12T07:30:00+08:00")
+    assert win_0730["start_date"] == "2026-11-10"
+    assert win_0730["end_date"] == "2026-11-11"
+    assert win_0730["summary_date"] == "2026-11-12"
+    bridge_0730 = rb._normalize_x_timeline_output(
+        {
+            "items": [
+                {
+                    "id": "888",
+                    "text": "07:45 HKT tweet (23:45 UTC prev day)",
+                    "createdAt": "Tue Nov 10 23:45:00 +0000 2026",
+                    "user": {"screenName": "aleabitoreddit", "name": "aleabitoreddit"},
+                }
+            ],
+            "hasMore": False,
+        },
+        operation="tweets",
+        count=50,
+        since=win_0730["start_date"],
+        until=win_0730["end_date"],
+    )
+    assert len(bridge_0730["items"]) == 1
+    sel_0730 = cli.select_posts(
+        {
+            "accounts": {
+                "aleabitoreddit": {"ok": True, "status": "ok", "data": bridge_0730},
+                "jukan05": {"ok": True, "items": []},
+                "mingchikuo": {"ok": True, "items": []},
+                "citrini": {"ok": True, "items": []},
+            },
+            "x_search": {"ok": True, "items": []},
+        },
+        win_0730,
+    )
+    assert [row["id"] for row in sel_0730["accounts"]["aleabitoreddit"]["items"]] == ["888"]
+
+
+def test_x_daily_compose_ignores_merged_items_for_legacy_selected() -> None:
+    cli = _load(
+        "x_daily_legacy_compose_family1",
+        SKILLS / "dalton-x-accounts-daily" / "scripts" / "x_accounts_daily.py",
+    )
+    win = cli.compute_window("2026-11-12T08:30:00+08:00")
+    # Exact shape generated by old select_posts (no incomplete / oldest_fetched_at / oldest_returned_at / oldest_created_at)
+    # when timeline was empty with has_more=True and x_search merged a post into `items`.
+    legacy_selected = {
+        "window": win,
+        "accounts": {
+            "aleabitoreddit": {"ok": True, "has_more": False, "display_handle": "aleabitoreddit", "items": []},
+            "jukan05": {
+                "ok": True,
+                "has_more": True,
+                "display_handle": "jukan05",
+                "items": [
+                    {
+                        "id": "777",
+                        "url": "https://x.com/jukan05/status/777",
+                        "created_at": "2026-11-11T15:00:00+08:00",
+                        "text": "supplemented via x_search",
+                    }
+                ],
+            },
+            "mingchikuo": {"ok": True, "has_more": False, "display_handle": "mingchikuo", "items": []},
+            "citrini": {"ok": True, "has_more": False, "display_handle": "citrini", "items": []},
+        },
+        "x_search": {"ok": True},
+    }
+    md = cli.compose_markdown(legacy_selected, {"777": "补充帖"})["markdown"]
+    assert "- @jukan05 窗口内可能还有未取回的帖子\n" in md
+    assert "2026-11-11 15:00:00" not in md

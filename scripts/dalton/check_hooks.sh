@@ -435,6 +435,10 @@ ALLOWED_HOOKS=(
   # unavailable, record the notice in execution result_excerpt/delivery, and
   # release pre-START claimed signals on synchronous executor failed settle.
   "automation-subscription-fallback"
+  # Antigravity strict JSON compliance: coerce NaN/+Inf/-Inf via parse_constant
+  # on ToolMessage JSON parse and recursively replace non-finite floats with None
+  # across request payloads (antigravity/client.py).
+  "antigravity-json-nan"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

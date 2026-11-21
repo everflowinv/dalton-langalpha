@@ -1842,6 +1842,7 @@ COMMUNITY_CATALOG_ROUTE_SPECS: dict[str, dict[str, Any]] = {
         "rules": [
             "固定账号建\"不漏\"底表用它（按账号顺序全量拉取）；跨账号观点与媒体补充用 x_search",
             "x-timeline 与 x_search 的结果按原帖 URL 去重，同帖只计一次",
+            "返回 truncated（是否因 count 截断）、oldest_fetched_at（过滤和截断前非置顶原始帖子最旧 UTC 时间，无帖时为 null）和 oldest_returned_at（过滤和截断后最终返回帖子最旧 UTC 时间，无返回帖时为 null）",
             "仅算情绪与线索；引用须带 @handle、日期与原帖 URL（source_attribution 已附）",
         ],
     },
@@ -3070,7 +3071,14 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "until": "YYYY-MM-DD（end/to/end_date 自动映射为 until；禁用 params）",
             "count": "整数 1-100（默认 20；limit/max_results 自动映射为 count）",
         },
-        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"data\": {\"items\": [{\"id\": ..., \"text\": ..., \"created_at\": ..., \"url\": ...}]}, \"_sources\": [...]}",
+        "return_shape": (
+            "{\"ok\": true, \"status\": \"ok\", \"data\": {\"items\": [{\"id\": ..., \"text\": ..., "
+            "\"created_at\": ..., \"url\": ...}], \"returned\": 0, \"has_more\": false, "
+            "\"truncated\": false, \"oldest_fetched_at\": \"...|null\", \"oldest_returned_at\": \"...|null\"}, \"_sources\": [...]}. "
+            "oldest_fetched_at 为过滤和截断前非置顶原始帖子最旧创建时间（UTC ISO 8601，无帖时为 null），"
+            "oldest_returned_at 为过滤和截断后最终返回帖子最旧创建时间（UTC ISO 8601，无返回帖时为 null），"
+            "truncated 表示是否因 count 截断。"
+        ),
         "examples": [
             "community(route=\"x-timeline\", operation=\"tweets\", handle=\"@AIatMeta\", since=\"2026-10-01\", until=\"2026-10-23\", count=20)",
             "community(route=\"x-timeline\", operation=\"search\", query=\"Meta Llama\", since=\"2026-10-01\", until=\"2026-10-23\", count=20)",
@@ -6366,17 +6374,31 @@ def _extract_x_tweet_target(clean_args: dict[str, Any]) -> str:
     return tid
 
 
+def _parse_xreach_created_at_dt(raw: Any) -> datetime | None:
+    """Parse xreach `createdAt` (`Wed Oct 21 14:54:03 +0000 2026` or ISO-8601) into a datetime."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    for fmt in (_XREACH_CREATED_AT_FMT, "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        candidate = text[:-1] + "+0000" if fmt.endswith("%z") and text.endswith("Z") else text
+        try:
+            return datetime.strptime(candidate, fmt)
+        except ValueError:
+            continue
+    iso = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        return datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+
+
 def _parse_xreach_created_at(raw: Any) -> tuple[str, str]:
     """Parse xreach `createdAt` (`Wed Oct 21 14:54:03 +0000 2026`) to `(ISO-8601, YYYY-MM-DD)`; falls back to raw text."""
     text = str(raw or "").strip()
     if not text:
         return "", ""
-    for fmt in (_XREACH_CREATED_AT_FMT, "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-        candidate = text[:-1] + "+0000" if fmt.endswith("%z") and text.endswith("Z") else text
-        try:
-            dt = datetime.strptime(candidate, fmt)
-        except ValueError:
-            continue
+    dt = _parse_xreach_created_at_dt(text)
+    if dt is not None:
         return dt.isoformat(timespec="seconds"), dt.strftime("%Y-%m-%d")
     return text, text[:10] if _YMD_RE.fullmatch(text[:10]) else ""
 
@@ -6429,14 +6451,68 @@ def _normalize_xreach_item(item: Any) -> dict[str, Any] | None:
     }
 
 
+def _raw_xreach_utc_dt(raw_item: Any) -> datetime | None:
+    if not isinstance(raw_item, dict):
+        return None
+    dt = _parse_xreach_created_at_dt(raw_item.get("createdAt") or raw_item.get("created_at"))
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+def _pinned_xreach_indices(raw_items: list[Any], *, operation: str) -> set[int]:
+    """只有识别出的置顶帖会从时间计算中排除。
+
+    Basis (inspected local `xreach-cli`):
+    - `dist/types/twitter.d.ts:21-99` (`User`, `UserResult`, `Tweet`, `TimelineResponse`) and
+      `dist/lib/client/tweets.js:87-128, 140-182`, `dist/lib/client/users.js:36-57`: neither user
+      objects (no `pinnedTweetIds`/`pinned_tweet_ids_str`) nor tweet objects carry a pinned flag,
+      and `parseTweetList()` pushes `TimelinePinEntry` and `TimelineAddEntries` into the same
+      `items` array in upstream instruction order.
+    - When no explicit pinned key is present on `tweets`, exclude any item whose timestamp is
+      strictly earlier than its successor (violates newest-first order).
+
+    Residual:
+    - xreach 不提供置顶标记，排在末尾或单独一条（`len < 2`）的旧置顶帖无法识别，可能让缺帖提示漏报。
+    """
+    pinned_keys = ("isPinned", "is_pinned", "pinned")
+    has_explicit = any(
+        isinstance(item, dict) and any(k in item for k in pinned_keys) for item in raw_items
+    )
+    if has_explicit:
+        return {
+            idx
+            for idx, item in enumerate(raw_items)
+            if isinstance(item, dict) and any(bool(item.get(k)) for k in pinned_keys)
+        }
+    if operation != "tweets":
+        return set()
+    timed: list[tuple[int, datetime]] = []
+    for idx, raw_item in enumerate(raw_items):
+        dt = _raw_xreach_utc_dt(raw_item)
+        if dt is not None:
+            timed.append((idx, dt))
+    if len(timed) < 2:
+        return set()
+    pinned: set[int] = set()
+    for pos in range(len(timed) - 1):
+        idx_curr, dt_curr = timed[pos]
+        _idx_next, dt_next = timed[pos + 1]
+        if dt_curr < dt_next:
+            pinned.add(idx_curr)
+    return pinned
+
+
 def _normalize_x_timeline_output(
     parsed: Any, *, operation: str, count: int, since: str, until: str
 ) -> dict[str, Any]:
-    """Normalize raw xreach JSON into `{items, returned, has_more}`.
+    """Normalize raw xreach JSON into `{items, returned, has_more, truncated, oldest_fetched_at, oldest_returned_at}`.
 
     xreach ignores an exact `-n` bound (observed: `-n 3` returned 15 items), so the bridge
     truncates to `count` itself; `tweets` additionally filters items to the `since`/`until`
-    window (inclusive) before truncation.
+    window (inclusive) before truncation. `oldest_fetched_at` is computed from all non-pinned raw
+    outer `createdAt` timestamps before date filtering and truncation; `oldest_returned_at` is the
+    oldest UTC timestamp among the final returned items (excluding pinned tweets), or None if empty.
     """
     if isinstance(parsed, dict):
         raw_items = parsed.get("items") if isinstance(parsed.get("items"), list) else [parsed]
@@ -6447,7 +6523,24 @@ def _normalize_x_timeline_output(
     else:
         raw_items = []
         has_more = False
-    items = [n for n in (_normalize_xreach_item(x) for x in raw_items) if n is not None]
+    pinned_indices = _pinned_xreach_indices(raw_items, operation=operation)
+    oldest_dt: datetime | None = None
+    for idx, raw_item in enumerate(raw_items):
+        if idx in pinned_indices:
+            continue
+        dt_utc = _raw_xreach_utc_dt(raw_item)
+        if dt_utc is None:
+            continue
+        if oldest_dt is None or dt_utc < oldest_dt:
+            oldest_dt = dt_utc
+    oldest_fetched_at = oldest_dt.isoformat(timespec="seconds") if oldest_dt is not None else None
+    items: list[dict[str, Any]] = []
+    for idx, raw_item in enumerate(raw_items):
+        norm = _normalize_xreach_item(raw_item)
+        if norm is not None:
+            if idx in pinned_indices:
+                norm["_pinned"] = True
+            items.append(norm)
     if operation == "tweets" and (since or until):
         items = [
             it
@@ -6458,12 +6551,25 @@ def _normalize_x_timeline_output(
     if operation in ("tweets", "search"):
         truncated = len(items) > count
         items = items[:count]
+    oldest_ret_dt: datetime | None = None
     for it in items:
+        is_pinned = bool(it.pop("_pinned", False))
         it.pop("_date", None)
+        if is_pinned:
+            continue
+        dt_utc = _raw_xreach_utc_dt({"createdAt": it.get("created_at")})
+        if dt_utc is not None and (oldest_ret_dt is None or dt_utc < oldest_ret_dt):
+            oldest_ret_dt = dt_utc
+    oldest_returned_at = (
+        oldest_ret_dt.isoformat(timespec="seconds") if oldest_ret_dt is not None else None
+    )
     return {
         "items": items,
         "returned": len(items),
         "has_more": has_more or truncated,
+        "truncated": truncated,
+        "oldest_fetched_at": oldest_fetched_at,
+        "oldest_returned_at": oldest_returned_at,
     }
 
 
@@ -8454,7 +8560,7 @@ class ResearchDataBridge:
                         "count",
                         {
                             "type": "integer",
-                            "description": "Item count for x-timeline tweets/search (1-100, default 20; bridge truncates to count).",
+                            "description": "Item count for x-timeline tweets/search (1-100, default 20; bridge truncates to count, sets truncated, and reports pre-filter UTC oldest_fetched_at and post-filter/truncation oldest_returned_at).",
                         },
                     )
                     props.setdefault(
@@ -20528,6 +20634,7 @@ _AI_FINANCE_REPORT_SUCCESS_KEYS = frozenset({
     "news_count",
     "github_count",
     "card",
+    "cards",
     "offset",
     "max_chars",
     "total_chars",

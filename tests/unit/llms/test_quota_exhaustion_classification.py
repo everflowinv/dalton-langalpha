@@ -7,9 +7,13 @@ is proven against what the account actually received.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import math
 
+import pytest
+
 from src.llms.error_classification import (
+    DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS,
     extract_status_code,
     is_retryable_error,
     quota_exhaustion_seconds,
@@ -135,3 +139,75 @@ def test_no_status_and_no_quota_prose_answers_none() -> None:
     assert (
         quota_exhaustion_seconds(_exc_with_status("Error code: 500", 500)) is None
     )
+
+
+# Sanitized verbatim 429 body sample from audit72h/subagent_runs.csv (no account id).
+AUDIT_OPENAI_SUBSCRIPTION_429_MESSAGE = (
+    "Error code: 429 - {'error': {'code': 'rate_limit_exceeded', "
+    "'message': 'Subscription quota exhausted. Your usage window resets at 2026-11-19T10:05:20Z.', "
+    "'param': None, 'resets_at': 1795082720, 'type': 'rate_limit_error'}}"
+)
+
+
+def test_openai_429_reads_resets_at_unix_and_iso_and_retry_after_max(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 10:00:00Z -> 320s before 2026-11-19T10:05:20Z (epoch 1795082720)
+    now_epoch = datetime(2026, 11, 19, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr("src.llms.error_classification.time.time", lambda: now_epoch)
+
+    # Message-only (as logged/serialized from OpenAIRateLimitError) without Retry-After header
+    exc_msg = _exc_with_status(AUDIT_OPENAI_SUBSCRIPTION_429_MESSAGE, 429)
+    assert quota_exhaustion_seconds(exc_msg) == pytest.approx(320.0)
+
+    # Structured .body dict with Unix resets_at
+    exc_unix_body = _exc_with_status("Error code: 429", 429)
+    exc_unix_body.body = {
+        "error": {
+            "code": "rate_limit_exceeded",
+            "message": "Subscription quota exhausted. Your usage window resets at 2026-11-19T10:05:20Z.",
+            "param": None,
+            "resets_at": 1795082720,
+            "type": "rate_limit_error",
+        }
+    }
+    assert quota_exhaustion_seconds(exc_unix_body) == pytest.approx(320.0)
+
+    # ISO-8601 resets_at in body
+    exc_iso_body = _exc_with_status("Error code: 429", 429)
+    exc_iso_body.body = {
+        "error": {
+            "code": "rate_limit_exceeded",
+            "message": "Subscription quota exhausted.",
+            "resets_at": "2026-11-19T10:15:20Z",
+        }
+    }
+    assert quota_exhaustion_seconds(exc_iso_body) == pytest.approx(920.0)
+
+    # Both Retry-After and resets_at present -> pick whichever is later
+    class _Headers(dict):
+        pass
+
+    class _Response:
+        def __init__(self, ra: str) -> None:
+            self.status_code = 429
+            self.headers = _Headers({"Retry-After": ra})
+
+    exc_both_resets_later = _exc_with_status(AUDIT_OPENAI_SUBSCRIPTION_429_MESSAGE, 429)
+    exc_both_resets_later.response = _Response("120")
+    assert quota_exhaustion_seconds(exc_both_resets_later) == pytest.approx(320.0)
+
+    exc_both_header_later = _exc_with_status(AUDIT_OPENAI_SUBSCRIPTION_429_MESSAGE, 429)
+    exc_both_header_later.response = _Response("1800")
+    assert quota_exhaustion_seconds(exc_both_header_later) == pytest.approx(1800.0)
+
+    # Neither Retry-After nor resets_at, but clearly subscription quota exhaustion -> 600s default
+    exc_no_horizon = _exc_with_status(
+        "Error code: 429 - {'error': {'code': 'rate_limit_exceeded', "
+        "'message': 'Subscription quota exhausted.', 'type': 'rate_limit_error'}}",
+        429,
+    )
+    assert quota_exhaustion_seconds(exc_no_horizon) == pytest.approx(
+        float(DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS)
+    )
+    assert DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS == 600

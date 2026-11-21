@@ -33,6 +33,10 @@ HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
         "Validates the migrated signal store's fixed 768-dimensional embedding format; "
         "does not select the conversation model."
     ),
+    ("llm/oauth_refresh.py", "muse-api-key"): (
+        "Prefix of Muse's sentinel account_id (MUSE_API_KEY_ACCOUNT_ID, providers/muse/oauth.py); "
+        "an API-key row has no account identity, so quota cooldown keys skip it. Not a model name."
+    ),
     ("llm/notional_pricing.py", "-oauth"): "Nominal pricing model reference normalization",
     ("llm/notional_pricing.py", "{candidate}-oauth"): "Nominal pricing model reference normalization",
     ("llm/notional_pricing.py", "{identity}-oauth"): "Nominal pricing model reference normalization",

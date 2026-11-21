@@ -181,31 +181,47 @@ def render_markdown(
     module = load_renderer_module()
     if hasattr(module, "card_markdown"):
         markdown = module.card_markdown(markdown)
-    builder = module.markdown_to_card_elements
+    builder = getattr(module, "markdown_to_card_chunks", None)
+    if builder is None:
+        builder = module.markdown_to_card_elements
     kwargs: dict[str, Any] = {"markdown": markdown, "title": title}
     parameters = inspect.signature(builder).parameters
     if "subtitle" in parameters:
         kwargs["subtitle"] = subtitle
     if "header_template" in parameters:
         kwargs["header_template"] = "indigo"
-    card = builder(**kwargs)
-    if not isinstance(card, dict):
-        raise TypeError("card schema is not 2.0")
-    if card.get("schema") != "2.0":
-        raise ValueError("card schema is not 2.0")
-    elements = (card.get("body") or {}).get("elements") if isinstance(card.get("body"), dict) else None
-    if not isinstance(elements, list):
-        raise TypeError("card body is empty")
-    if not elements:
+    built = builder(**kwargs)
+    cards = built if isinstance(built, list) else [built]
+    if not cards:
         raise ValueError("card body is empty")
-    _scan(card)
+    for card in cards:
+        if not isinstance(card, dict):
+            raise TypeError("card schema is not 2.0")
+        if card.get("schema") != "2.0":
+            raise ValueError("card schema is not 2.0")
+        elements = (card.get("body") or {}).get("elements") if isinstance(card.get("body"), dict) else None
+        if not isinstance(elements, list):
+            raise TypeError("card body is empty")
+        if not elements:
+            raise ValueError("card body is empty")
+        _scan(card)
+    payload_obj: Any = cards[0] if len(cards) == 1 else cards
     if hasattr(module, "dump_card"):
-        text = module.dump_card(card)
+        text = module.dump_card(payload_obj)
     else:
-        text = json.dumps(card, ensure_ascii=False, indent=2) + "\n"
+        text = json.dumps(payload_obj, ensure_ascii=False, indent=2) + "\n"
     encoded = text.encode("utf-8")
     if not output.exists() and write_bytes_new(output, encoded):
-        return {"ok": True, "reused": False, "path": output_rel, "card": card}
+        res: dict[str, Any] = {
+            "ok": True,
+            "reused": False,
+            "path": output_rel,
+            "cards": cards,
+            "chunk_count": len(cards),
+        }
+        if len(cards) == 1:
+            res["card"] = cards[0]
+        return res
     # The card already exists, or another run created it between the check and the write.
     if output.is_symlink():
         raise ValueError("refusing symlink")
@@ -224,4 +240,13 @@ def render_markdown(
             ),
             "path": output_rel,
         }
-    return {"ok": True, "reused": True, "path": output_rel, "card": card}
+    res_reused: dict[str, Any] = {
+        "ok": True,
+        "reused": True,
+        "path": output_rel,
+        "cards": cards,
+        "chunk_count": len(cards),
+    }
+    if len(cards) == 1:
+        res_reused["card"] = cards[0]
+    return res_reused

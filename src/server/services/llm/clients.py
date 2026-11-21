@@ -524,7 +524,12 @@ async def resolve_oauth_llm_client(
         )
     # DALTON-HOOK(oauth-dispatch): remember how the client was built, so a 401 mid-turn
     # (token outlived by a long turn) can rebuild it with a fresh token
-    from src.dalton.llm.oauth_refresh import OAuthRebuildSpec, tag_oauth_client, token_digest
+    from src.dalton.llm.oauth_refresh import (
+        OAuthRebuildSpec,
+        credential_identity,
+        tag_oauth_client,
+        token_digest,
+    )
 
     return tag_oauth_client(
         client,
@@ -539,6 +544,12 @@ async def resolve_oauth_llm_client(
             # A custom model the manifest does not carry rebuilds only from
             # its own saved entry, so the 401 path must keep it (DALTON-HOOK(oauth-dispatch)).
             custom_entry=custom_entry,
+            account_id=token.account_id,
+            credential_id=credential_identity(
+                account_id=token.account_id,
+                email=token.email,
+                updated_at=token.updated_at,
+            ),
         ),
     )
 

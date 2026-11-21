@@ -78,6 +78,25 @@ _CALL_SIGNATURES_KEY = "antigravity_call_signatures"
 _SKIP_SIGNATURE = "skip_thought_signature_validator"
 
 
+# DALTON-HOOK(antigravity-json-nan): coerce NaN/+Inf/-Inf in tool outputs and request payloads to JSON null
+def _parse_non_finite_constant(_constant: str) -> None:
+    """Map non-standard JSON constants (NaN, Infinity, -Infinity) to None."""
+    return None
+
+
+def _sanitize_json_non_finite(value: Any) -> Any:
+    """Recursively replace non-finite floats (NaN, +Inf, -Inf) with None."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _sanitize_json_non_finite(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_json_non_finite(v) for v in value]
+    if isinstance(value, tuple):
+        return [_sanitize_json_non_finite(v) for v in value]
+    return value
+
+
 class _SignatureState:
     """The signatures of one response; never shared between calls."""
 
@@ -252,7 +271,8 @@ def _messages_to_gemini(
             result: Any = message.content
             if isinstance(result, str):
                 try:
-                    result = json.loads(result)
+                    # DALTON-HOOK(antigravity-json-nan): coerce bare NaN/Infinity/-Infinity JSON constants to None
+                    result = json.loads(result, parse_constant=_parse_non_finite_constant)
                 except json.JSONDecodeError:
                     result = {"result": result}
             elif isinstance(result, list):
@@ -265,6 +285,7 @@ def _messages_to_gemini(
                 }
             if not isinstance(result, dict):
                 result = {"result": result}
+            result = _sanitize_json_non_finite(result)
             resolved_name = (
                 message.name
                 or tool_call_names.get(message.tool_call_id or "")
@@ -609,14 +630,17 @@ class ChatAntigravity(BaseChatModel):
             inner["tools"] = [{"functionDeclarations": self.tools}]
         inner["sessionId"] = str(uuid.uuid4().int & ((1 << 63) - 1))
 
-        return {
-            "project": self.project,
-            "requestId": _build_request_id(),
-            "model": self.model,
-            "userAgent": ANTIGRAVITY_BODY_USER_AGENT,
-            "requestType": "agent",
-            "request": inner,
-        }
+        # DALTON-HOOK(antigravity-json-nan): ensure the entire envelope is strict-JSON compliant before httpx serializes it
+        return _sanitize_json_non_finite(
+            {
+                "project": self.project,
+                "requestId": _build_request_id(),
+                "model": self.model,
+                "userAgent": ANTIGRAVITY_BODY_USER_AGENT,
+                "requestType": "agent",
+                "request": inner,
+            }
+        )
 
     def _request_headers(self) -> dict[str, str]:
         return {

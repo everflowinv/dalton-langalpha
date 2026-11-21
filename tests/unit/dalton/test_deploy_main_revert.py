@@ -627,3 +627,275 @@ def test_deploy_scripts_have_no_lock_or_auto_downgrade_or_model_specific_wording
             "覆盖",
         ):
             assert forbidden not in text, f"unexpected {forbidden!r} in {path}"
+
+
+def test_recreate_saves_container_logs_before_replacing_containers(tmp_path: Path) -> None:
+    import gzip
+    import os
+    import time
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    trace = tmp_path / "docker.trace"
+    log_dir = tmp_path / "container-logs"
+    log_dir.mkdir()
+    stale_gz = log_dir / "backend-20200101T000000Z.log.gz"
+    stale_gz.write_bytes(b"stale")
+    old_mtime = time.time() - 20 * 86400
+    os.utime(stale_gz, (old_mtime, old_mtime))
+
+    (fake_bin / "docker").write_text(
+        f"""#!/bin/bash
+echo "docker:$*" >> "{trace}"
+case "$1" in
+  ps)
+    echo "abc123"
+    exit 0
+    ;;
+  logs)
+    echo "2026-11-20T12:00:00Z sample container log line"
+    exit 0
+    ;;
+  compose)
+    exit 0
+    ;;
+esac
+exit 0
+"""
+    )
+    (fake_bin / "docker").chmod(0o755)
+
+    res = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'DALTON_DEPLOY_LIB_ONLY=1 source "{_DEPLOY_SCRIPT}" && RECREATE=1 && '
+            f'save_calls=0; orig_fn=$(declare -f save_container_logs); '
+            f'eval "real_${{orig_fn}}"; '
+            f'save_container_logs() {{ save_calls=$((save_calls + 1)); real_save_container_logs "$@"; }}; '
+            f'apply_backend && apply_crawler && echo "save_calls=$save_calls"',
+        ],
+        env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HOME": str(tmp_path),
+            "DALTON_CONTAINER_LOG_DIR": str(log_dir),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert res.returncode == 0, res.stderr + res.stdout
+    assert "save_calls=2" in res.stdout
+
+    trace_lines = trace.read_text().splitlines()
+    backend_logs_idx = trace_lines.index("docker:logs --timestamps dalton-langalpha-backend-1")
+    backend_up_idx = trace_lines.index("docker:compose up -d --no-deps backend")
+    crawler_logs_idx = trace_lines.index("docker:logs --timestamps dalton-langalpha-crawler-1")
+    crawler_up_idx = trace_lines.index("docker:compose up -d --no-deps --no-build crawler")
+    assert backend_logs_idx < backend_up_idx
+    assert crawler_logs_idx < crawler_up_idx
+
+    assert not stale_gz.exists()
+    backend_files = list(log_dir.glob("backend-*.log.gz"))
+    crawler_files = list(log_dir.glob("crawler-*.log.gz"))
+    assert len(backend_files) == 1
+    assert len(crawler_files) == 1
+    assert "sample container log line" in gzip.decompress(backend_files[0].read_bytes()).decode("utf-8")
+
+    # Failure to dump logs only warns and does not abort deploy
+    (fake_bin / "docker").write_text(
+        f"""#!/bin/bash
+echo "docker:$*" >> "{trace}"
+case "$1" in
+  ps)
+    echo "abc123"
+    exit 0
+    ;;
+  logs)
+    echo "no such container" >&2
+    exit 1
+    ;;
+  compose)
+    exit 0
+    ;;
+esac
+exit 0
+"""
+    )
+    (fake_bin / "docker").chmod(0o755)
+    res_warn = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'DALTON_DEPLOY_LIB_ONLY=1 source "{_DEPLOY_SCRIPT}" && RECREATE=1 && apply_backend',
+        ],
+        env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HOME": str(tmp_path),
+            "DALTON_CONTAINER_LOG_DIR": str(log_dir),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_warn.returncode == 0, res_warn.stderr + res_warn.stdout
+    assert "WARN:" in res_warn.stderr
+
+
+def test_cleanup_logs_only_removes_generated_archives_and_edge_saves_logs(
+    tmp_path: Path,
+) -> None:
+    """Cleanup removes only `<service>-<UTC timestamp>.log.gz`, and `recreate_edge` saves edge logs."""
+    import os
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True)
+    gen_backend = log_dir / "backend-20261120T010203Z.log.gz"
+    gen_edge = log_dir / "edge-20261120T010203Z.log.gz"
+    unrelated_gz = log_dir / "custom-backup.log.gz"
+    unrelated_other = log_dir / "backend-note.txt"
+    for f in (gen_backend, gen_edge, unrelated_gz, unrelated_other):
+        f.write_bytes(b"data")
+
+    script_text = _DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    assert "-name 'backend-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z.log.gz'" in script_text
+    assert "-name 'edge-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z.log.gz'" in script_text
+
+    cleanup_cmd = (
+        f"find {log_dir!s} -maxdepth 1 -type f \\( "
+        "-name 'backend-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z.log.gz' "
+        "-o -name 'crawler-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z.log.gz' "
+        "-o -name 'edge-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z.log.gz' "
+        "\\) -delete"
+    )
+    res = subprocess.run(["bash", "-c", cleanup_cmd], capture_output=True, text=True, check=False)
+    assert res.returncode == 0, res.stderr
+    assert not gen_backend.exists()
+    assert not gen_edge.exists()
+    assert unrelated_gz.exists()
+    assert unrelated_other.exists()
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    call_log = tmp_path / "docker_calls.txt"
+    (fake_bin / "docker").write_text(
+        f"""#!/bin/bash
+echo "$*" >> "{call_log}"
+case "$1" in
+  ps)
+    echo "cid-edge-123"
+    ;;
+  logs)
+    echo "edge log line"
+    ;;
+  compose)
+    exit 0
+    ;;
+esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    (fake_bin / "docker").chmod(0o755)
+    edge_res = subprocess.run(
+        ["bash", "-c", f'DALTON_DEPLOY_LIB_ONLY=1 source "{_DEPLOY_SCRIPT}" && recreate_edge'],
+        env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HOME": str(tmp_path),
+            "DALTON_CONTAINER_LOG_DIR": str(log_dir),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert edge_res.returncode == 0, edge_res.stderr
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    logs_idx = next(i for i, line in enumerate(calls) if "logs --timestamps dalton-langalpha-edge-1" in line)
+    recreate_idx = next(i for i, line in enumerate(calls) if "--force-recreate edge" in line)
+    assert logs_idx < recreate_idx
+    assert list(log_dir.glob("edge-*Z.log.gz"))
+
+
+def test_run_deploy_main_cleans_old_container_logs_even_without_recreate(
+    tmp_path: Path,
+) -> None:
+    """Every deploy cleans >14-day generated container log archives at startup even on normal restart."""
+    import os
+    import time
+
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(origin)], check=True)
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "clone", "-q", str(origin), str(seed)], check=True)
+    subprocess.run(["git", "-C", str(seed), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(seed), "config", "user.name", "Test"], check=True)
+    (seed / "src/dalton/migrations/versions").mkdir(parents=True)
+    (seed / "migrations/versions").mkdir(parents=True)
+    (seed / "scripts/dalton").mkdir(parents=True)
+    (seed / "web").mkdir(parents=True)
+    (seed / "web/.keep").write_text("")
+    (seed / "scripts/dalton/build_frontend_prod.sh").write_text(
+        "#!/bin/bash\necho 'OK: Production bundle'\nexit 0\n"
+    )
+    (seed / "scripts/dalton/check_public_edge.sh").write_text("#!/bin/bash\necho 'edge ok'\nexit 0\n")
+    subprocess.run(["git", "-C", str(seed), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-q", "-m", "v1"], check=True)
+    subprocess.run(["git", "-C", str(seed), "branch", "-M", "dalton/main"], check=True)
+    subprocess.run(["git", "-C", str(seed), "push", "-q", "-u", "origin", "dalton/main"], check=True)
+
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "clone", "-q", "-b", "dalton/main", str(origin), str(repo)], check=True)
+
+    fake_bin, _ = _make_fake_docker(tmp_path, dalton_out="", upstream_out="", dalton_rc=1, upstream_rc=1)
+    backup_log = tmp_path / "pg-backup.log"
+    backup_log.write_text("2026-11-20 00:00:00 ok prev\n")
+    wait_idle = tmp_path / "wait_idle.sh"
+    wait_idle.write_text("#!/bin/bash\nexit 0\n")
+    wait_idle.chmod(0o755)
+    (fake_bin / "launchctl").write_text(
+        f'#!/bin/bash\n[ "$1" = "kickstart" ] && echo "2026-11-20 00:01:00 ok fresh" >> "{backup_log}"\nexit 0\n'
+    )
+    (fake_bin / "curl").write_text("#!/bin/bash\necho 200\nexit 0\n")
+    (fake_bin / "uv").write_text("#!/bin/bash\nexit 0\n")
+    (fake_bin / "pnpm").write_text("#!/bin/bash\nexit 0\n")
+    for name in ("launchctl", "curl", "uv", "pnpm"):
+        (fake_bin / name).chmod(0o755)
+
+    log_dir = tmp_path / "container-logs"
+    log_dir.mkdir()
+    stale_backend = log_dir / "backend-20200101T000000Z.log.gz"
+    fresh_backend = log_dir / "backend-20261120T000000Z.log.gz"
+    unrelated = log_dir / "manual-keep.log.gz"
+    for f in (stale_backend, fresh_backend, unrelated):
+        f.write_bytes(b"data")
+    old_mtime = time.time() - 20 * 86400
+    os.utime(stale_backend, (old_mtime, old_mtime))
+    os.utime(unrelated, (old_mtime, old_mtime))
+
+    script = f"""
+set -uo pipefail
+DALTON_DEPLOY_LIB_ONLY=1
+source "{_DEPLOY_SCRIPT}"
+WAIT_IDLE_SCRIPT="{wait_idle}"
+run_deploy_main
+"""
+    res = subprocess.run(
+        ["bash", "-c", script],
+        env={
+            "PATH": f"{fake_bin}:/bin:/usr/bin",
+            "HOME": str(tmp_path),
+            "DALTON_REPO_ROOT": str(repo),
+            "DALTON_PG_BACKUP_LOG": str(backup_log),
+            "DALTON_CONTAINER_LOG_DIR": str(log_dir),
+            "DALTON_ALEMBIC_QUERY_RETRY_DELAY_S": "0",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert not stale_backend.exists()
+    assert fresh_backend.exists()
+    assert unrelated.exists()
+

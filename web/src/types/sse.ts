@@ -97,6 +97,11 @@ export interface ToolCallData {
 export interface ToolCallsEvent extends BaseSSEEvent {
   event: 'tool_calls';
   tool_calls: ToolCallData[];
+  // DALTON-HOOK(empty-turn-guard): providers like Antigravity can emit visible
+  // text on the same message chunk as complete tool_calls.
+  content?: string;
+  content_type?: string;
+  phase?: 'commentary' | 'final_answer';
 }
 
 export interface ToolCallResultData {
@@ -107,6 +112,10 @@ export interface ToolCallResultData {
   /** The ToolMessage status the backend stamped, 'success' or 'error'. Absent
    *  only on turns persisted before the field rode the wire. */
   status?: string;
+  // DALTON-HOOK(empty-turn-guard): true when pre-finish tool calls were
+  // discarded before execution and never ran.
+  discarded?: boolean;
+  discarded_reason?: string;
 }
 
 export interface ToolCallResultEvent extends BaseSSEEvent {
@@ -116,6 +125,10 @@ export interface ToolCallResultEvent extends BaseSSEEvent {
   content_type?: string;
   artifact?: unknown;
   status?: string;
+  // DALTON-HOOK(empty-turn-guard): true when pre-finish tool calls were
+  // discarded before execution and never ran.
+  discarded?: boolean;
+  discarded_reason?: string;
 }
 
 export interface ToolCallChunksEvent extends BaseSSEEvent {

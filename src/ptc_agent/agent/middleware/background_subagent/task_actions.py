@@ -785,6 +785,12 @@ async def _handle_resume(
                 ),
                 tool_call_id,
             )
+        # DALTON-HOOK(quota-exhaustion): refuse before fencing/spawning when an
+        # OAuth subscription model is already in Redis cooldown.
+        if quota_msg := await _check_pre_dispatch_quota(
+            mw, request, task.subagent_type, override=override
+        ):
+            return _refusal(quota_msg, tool_call_id)
         if mw.namespace_owner is not None:
             # Not live in THIS process: the namespace lock is the
             # cluster-wide arbiter. Contended = a writer on another
@@ -988,6 +994,22 @@ def _model_artifact(override: TaskModel | None) -> dict[str, str]:
     return {"model": override.name} if override is not None else {}
 
 
+async def _check_pre_dispatch_quota(  # DALTON-HOOK(quota-exhaustion)
+    mw: "BackgroundSubagentMiddleware",
+    request: ToolCallRequest,
+    subagent_type: str,
+    *,
+    override: TaskModel | None = None,
+) -> str | None:
+    check_quota = getattr(mw, "check_dispatch_quota", None)
+    if not callable(check_quota):
+        return None
+    runtime_cfg = getattr(getattr(request, "runtime", None), "config", None) or {}
+    raw_user = (runtime_cfg.get("configurable") or {}).get("user_id")
+    user_id = str(raw_user).strip() or None if raw_user is not None else None
+    return await check_quota(subagent_type, override=override, user_id=user_id)
+
+
 async def _handle_init(
     mw: "BackgroundSubagentMiddleware",
     request: ToolCallRequest,
@@ -1008,6 +1030,12 @@ async def _handle_init(
     override = await _resolve_model(mw, model, subagent_type) if model else None
     if isinstance(override, TaskModelRefused):
         return _refusal(override.message, tool_call_id)
+    # DALTON-HOOK(quota-exhaustion): refuse before registering/spawning when an
+    # OAuth subscription model is already in Redis cooldown.
+    if quota_msg := await _check_pre_dispatch_quota(
+        mw, request, subagent_type, override=override
+    ):
+        return _refusal(quota_msg, tool_call_id)
 
     # Register the task first to get the task_id. A checkpoint
     # re-execution of an already-spawned call raises TaskWriterLive

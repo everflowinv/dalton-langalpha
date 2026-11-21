@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable, Mapping
+import copy
 import importlib.util
 import json
 import os
@@ -16,6 +18,19 @@ from typing import Any, Optional, Tuple
 
 CARD_MARKDOWN_MAX_CHARS = 2000
 CARD_BODY_MAX_CHARS = 3000
+# Keep synchronized with FEISHU_CARD_MAX_BYTES / FEISHU_CARD_MAX_ELEMENTS /
+# FEISHU_CARD_TABLE_LIMIT in src/dalton/data_jobs/notification_payloads.py and format.ts
+FEISHU_CARD_MAX_BYTES = 30_720
+FEISHU_CARD_MAX_ELEMENTS = 200
+FEISHU_CARD_TABLE_LIMIT = 5
+_GATEWAY_IMG_KEY_PROBE = "img_v3_" + ("x" * 57)
+_TABLE_DELIM_CELL_RE = re.compile(r":?-{1,}:?")
+_FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+_BLOCKQUOTE_STEP_RE = re.compile(r"^\s{0,3}> ?")
+_LIST_MARKER_PREFIX_RE = re.compile(r"^(\s{0,3}(?:[-*+]|\d{1,9}[.)])\s+)")
+_ATX_HEADING_PREFIX_RE = re.compile(r"^#{1,6}(?:\s|$)")
+_SECTION_CONT_SUFFIX_RE = re.compile(r"（续）$")
+_TABLE_ROW_TRUNCATED_SUFFIX = "（本行过长已截断）"
 SKILL_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -51,8 +66,159 @@ class RenderError(Exception):
         super().__init__(message)
 
 
-def split_markdown_blocks(text: str, max_chars: int = CARD_MARKDOWN_MAX_CHARS) -> list[str]:
-    """Split markdown without dropping content, preferring paragraph boundaries."""
+def _strip_blockquote_prefix(line: str) -> tuple[int, str]:
+    rem = line
+    depth = 0
+    while True:
+        m = _BLOCKQUOTE_STEP_RE.match(rem)
+        if not m:
+            break
+        depth += 1
+        rem = rem[m.end() :]
+    return depth, rem
+
+
+def _split_table_row_cells(line: str) -> list[str]:
+    stripped = line.strip()
+    if "|" not in stripped:
+        return []
+    parts = re.split(r"(?<!\\)\|", stripped)
+    if stripped.startswith("|") and parts:
+        parts = parts[1:]
+    if stripped.endswith("|") and not stripped.endswith("\\|") and parts:
+        parts = parts[:-1]
+    return [cell.strip() for cell in parts]
+
+
+def _is_table_delimiter_row(line: str, expected_cols: int) -> bool:
+    if expected_cols <= 0:
+        return False
+    stripped = line.strip()
+    if "|" not in stripped:
+        return (
+            expected_cols == 1
+            and ":" in stripped
+            and bool(_TABLE_DELIM_CELL_RE.fullmatch(stripped))
+        )
+    cells = _split_table_row_cells(stripped)
+    return len(cells) == expected_cols and all(
+        bool(_TABLE_DELIM_CELL_RE.fullmatch(cell)) for cell in cells
+    )
+
+
+def _is_table_body_row_inner(inner_line: str) -> bool:
+    stripped = inner_line.strip()
+    if not stripped or "|" not in stripped:
+        return False
+    if re.match(r"^(?:```|~~~|#{1,6}(?:\s|$))", stripped):
+        return False
+    return True
+
+
+def _extract_markdown_segments(text: str) -> list[tuple[Any, ...]]:
+    lines = text.splitlines()
+    segments: list[tuple[Any, ...]] = []
+    text_buf: list[str] = []
+    fence_char = ""
+    fence_len = 0
+
+    def flush_text() -> None:
+        if not text_buf:
+            return
+        joined = "\n".join(text_buf).strip()
+        text_buf.clear()
+        if joined:
+            segments.append(("text", joined))
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if fence_char:
+            text_buf.append(line)
+            close_m = re.match(rf"^\s*{re.escape(fence_char)}{{{fence_len},}}\s*$", line)
+            if close_m:
+                fence_char = ""
+                fence_len = 0
+            i += 1
+            continue
+
+        open_m = _FENCE_OPEN_RE.match(line)
+        if open_m:
+            marker = open_m.group(1)
+            fence_char = marker[0]
+            fence_len = len(marker)
+            text_buf.append(line)
+            i += 1
+            continue
+
+        hdr_depth, hdr_inner = _strip_blockquote_prefix(line)
+        list_m = _LIST_MARKER_PREFIX_RE.match(hdr_inner)
+        list_indent = len(list_m.group(1)) if list_m else 0
+        hdr_content = hdr_inner[list_indent:] if list_m else hdr_inner
+        hdr_leading_spaces = len(hdr_content) - len(hdr_content.lstrip(" "))
+        if (
+            i + 1 < len(lines)
+            and "|" in hdr_content
+            and hdr_leading_spaces < 4
+            and not hdr_content.startswith("\t")
+            and not _ATX_HEADING_PREFIX_RE.match(hdr_content.lstrip())
+            and not _FENCE_OPEN_RE.match(hdr_content)
+        ):
+            sep_depth, sep_inner = _strip_blockquote_prefix(lines[i + 1])
+            sep_ok = sep_depth == hdr_depth
+            if sep_ok and list_indent > 0:
+                sep_leading_spaces = len(sep_inner) - len(sep_inner.lstrip(" "))
+                sep_ok = sep_leading_spaces >= list_indent
+                sep_inner = sep_inner[list_indent:]
+            hdr_cells = _split_table_row_cells(hdr_content) if sep_ok else []
+            if hdr_cells and _is_table_delimiter_row(sep_inner, len(hdr_cells)):
+                flush_text()
+                j = i + 2
+                while j < len(lines) and not _FENCE_OPEN_RE.match(lines[j]):
+                    row_depth, row_inner = _strip_blockquote_prefix(lines[j])
+                    if row_depth != hdr_depth:
+                        break
+                    if list_indent > 0:
+                        row_leading_spaces = len(row_inner) - len(row_inner.lstrip(" "))
+                        if row_leading_spaces < list_indent:
+                            break
+                        row_inner = row_inner[list_indent:]
+                    if not _is_table_body_row_inner(row_inner):
+                        break
+                    j += 1
+                segments.append(("table", line, lines[i + 1], lines[i + 2 : j]))
+                i = j
+                continue
+
+        text_buf.append(line)
+        i += 1
+
+    flush_text()
+    return segments
+
+
+def count_markdown_tables(text: str) -> int:
+    if "|" not in text:
+        return 0
+    return sum(1 for seg in _extract_markdown_segments(text) if seg[0] == "table")
+
+
+def _count_card_tables(node: Any) -> int:
+    if isinstance(node, Mapping):
+        total = 0
+        content = node.get("content")
+        if isinstance(content, str):
+            total += count_markdown_tables(content)
+        for key, val in node.items():
+            if key != "content" and isinstance(val, (Mapping, list)):
+                total += _count_card_tables(val)
+        return total
+    if isinstance(node, list):
+        return sum(_count_card_tables(item) for item in node)
+    return 0
+
+
+def _split_plain_text_blocks(text: str, max_chars: int) -> list[str]:
     remaining = text.strip()
     blocks: list[str] = []
 
@@ -72,6 +238,135 @@ def split_markdown_blocks(text: str, max_chars: int = CARD_MARKDOWN_MAX_CHARS) -
             blocks.append(block)
         remaining = remaining[split_at:].lstrip("\n")
 
+    return blocks
+
+
+def _split_table_rows_with_header(
+    header_line: str,
+    sep_line: str,
+    rows: list[str],
+    *,
+    fits_text: Callable[[str], bool],
+) -> list[str]:
+    prefix = f"{header_line}\n{sep_line}"
+    if not rows:
+        return [prefix]
+    chunks: list[str] = []
+    buf: list[str] = []
+    for row in rows:
+        candidate = prefix + "\n" + "\n".join([*buf, row])
+        if buf and not fits_text(candidate):
+            chunks.append(prefix + "\n" + "\n".join(buf))
+            buf = [row]
+        else:
+            buf.append(row)
+    if buf:
+        chunks.append(prefix + "\n" + "\n".join(buf))
+    return chunks
+
+
+def _truncate_table_row_to_fit(
+    header_line: str,
+    sep_line: str,
+    row_line: str,
+    *,
+    fits_text: Callable[[str], bool],
+) -> str:
+    prefix = f"{header_line}\n{sep_line}\n"
+    if fits_text(prefix + row_line):
+        return prefix + row_line
+    stripped = row_line.rstrip()
+    closing_pipe = " |" if stripped.endswith("|") and not stripped.endswith("\\|") else ""
+    marker = f"{_TABLE_ROW_TRUNCATED_SUFFIX}{closing_pipe}"
+    lo, hi = 0, len(stripped)
+    best = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate_row = stripped[:mid].rstrip() + marker
+        if fits_text(prefix + candidate_row):
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    truncated = stripped[:best].rstrip() + marker
+    if fits_text(prefix + truncated):
+        return prefix + truncated
+    return prefix + marker
+
+
+def _split_table_to_fitting_chunks(
+    header_line: str,
+    sep_line: str,
+    rows: list[str],
+    *,
+    fits_text: Callable[[str], bool],
+) -> list[str]:
+    out: list[str] = []
+    for sub_tbl in _split_table_rows_with_header(
+        header_line,
+        sep_line,
+        rows,
+        fits_text=fits_text,
+    ):
+        if fits_text(sub_tbl):
+            out.append(sub_tbl)
+            continue
+        sub_lines = sub_tbl.splitlines()
+        sub_rows = sub_lines[2:] if len(sub_lines) > 2 else []
+        if not sub_rows:
+            out.append(sub_tbl)
+            continue
+        for single_row in sub_rows:
+            out.append(
+                _truncate_table_row_to_fit(
+                    header_line,
+                    sep_line,
+                    single_row,
+                    fits_text=fits_text,
+                )
+            )
+    return out
+
+
+def split_markdown_blocks(text: str, max_chars: int = CARD_MARKDOWN_MAX_CHARS) -> list[str]:
+    """Split markdown without dropping content, repeating headers when tables split."""
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+    if len(cleaned) <= max_chars:
+        return [cleaned]
+
+    units: list[str] = []
+    for seg in _extract_markdown_segments(cleaned):
+        if seg[0] == "table":
+            _, hdr, sep, rows = seg
+            full_table = hdr + "\n" + sep + ("\n" + "\n".join(rows) if rows else "")
+            if len(full_table) <= max_chars:
+                units.append(full_table)
+            else:
+                units.extend(
+                    _split_table_rows_with_header(
+                        hdr,
+                        sep,
+                        rows,
+                        fits_text=lambda cand: len(cand) <= max_chars,
+                    )
+                )
+        else:
+            units.extend(_split_plain_text_blocks(seg[1], max_chars))
+
+    blocks: list[str] = []
+    current = ""
+    for unit in units:
+        if not current:
+            current = unit
+        elif len(current) + 2 + len(unit) <= max_chars:
+            current = f"{current}\n\n{unit}"
+        else:
+            blocks.append(current)
+            current = unit
+    if current:
+        blocks.append(current)
     return blocks
 
 
@@ -137,20 +432,73 @@ def auto_infer_tag(title: str) -> Optional[Tuple[str, str]]:
     return None
 
 
-def markdown_to_card_elements(markdown: str, title: str, subtitle: str = "",
-                              header_template: str = "indigo",
-                              tag: str = "", tag_color: str = "") -> dict[str, Any]:
-    """
-    将 markdown 内容转成飞书 Card Schema 2.0 卡片 JSON
-    
-    卡片结构:
-    - schema: "2.0"
-    - config: wide_screen_mode, update_multi
-    - header: 标题、副标题（原生呈现于彩条下方）、配色模板、业务标签
-    - body: 各章节 markdown 块、折叠面板、说明性脚注（notation）、图片与分隔线
-    """
+def _replace_card_img_placeholders_for_size(node: Any) -> Any:
+    if isinstance(node, list):
+        return [_replace_card_img_placeholders_for_size(item) for item in node]
+    if isinstance(node, Mapping):
+        if node.get("tag") == "__img__":
+            raw_alt = node.get("alt")
+            if isinstance(raw_alt, Mapping):
+                alt_obj: dict[str, Any] = copy.deepcopy(dict(raw_alt))
+            else:
+                alt_obj = {
+                    "tag": "plain_text",
+                    "content": raw_alt if isinstance(raw_alt, str) else "",
+                }
+            return {
+                "tag": "img",
+                "img_key": _GATEWAY_IMG_KEY_PROBE,
+                "alt": alt_obj,
+                "mode": "fit_horizontal",
+                "preview": True,
+            }
+        return {
+            key: _replace_card_img_placeholders_for_size(val)
+            for key, val in node.items()
+        }
+    return node
+
+
+def feishu_card_serialized_utf8_bytes(card: Mapping[str, Any]) -> int:
+    return len(json.dumps(card, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def feishu_card_gateway_utf8_bytes(card: Mapping[str, Any]) -> int:
+    return feishu_card_serialized_utf8_bytes(_replace_card_img_placeholders_for_size(card))
+
+
+def is_feishu_card_within_envelope(
+    card: Mapping[str, Any],
+    *,
+    max_bytes: int = FEISHU_CARD_MAX_BYTES,
+    max_elements: int = FEISHU_CARD_MAX_ELEMENTS,
+    max_tables: int = FEISHU_CARD_TABLE_LIMIT,
+) -> bool:
+    if feishu_card_gateway_utf8_bytes(card) > max_bytes:
+        return False
+    body = card.get("body")
+    elements = body.get("elements") if isinstance(body, Mapping) else card.get("elements")
+    if isinstance(elements, list):
+        total_elements = len(elements)
+        for element in elements:
+            if (
+                isinstance(element, Mapping)
+                and element.get("tag") == "action"
+                and isinstance(element.get("actions"), list)
+            ):
+                total_elements += len(element["actions"])
+        if total_elements > max_elements:
+            return False
+    return _count_card_tables(card) <= max(1, int(max_tables))
+
+
+def _parse_markdown_sections_and_subtitle(
+    markdown: str,
+    title: str,
+    subtitle: str = "",
+) -> tuple[list[dict[str, Any]], str]:
     sections: list[dict[str, Any]] = []
-    current_section = {"title": "", "content": []}
+    current_section: dict[str, Any] = {"title": "", "content": []}
 
     def flush_current_section() -> None:
         nonlocal current_section
@@ -167,30 +515,24 @@ def markdown_to_card_elements(markdown: str, title: str, subtitle: str = "",
             sections.append(current_section)
         current_section = {"title": "", "content": []}
 
-    lines = markdown.strip().split('\n')
+    lines = markdown.strip().split("\n")
     i = 0
     extracted_subtitle = ""
 
     while i < len(lines):
         line = lines[i]
-
-        # 跳过顶级文档标题 (# 开头)
-        if line.startswith('# ') and not line.startswith('## '):
-            if not subtitle and i + 1 < len(lines) and lines[i + 1].startswith('> '):
+        if line.startswith("# ") and not line.startswith("## "):
+            if not subtitle and i + 1 < len(lines) and lines[i + 1].startswith("> "):
                 extracted_subtitle = lines[i + 1][2:].strip()
                 i += 2
                 continue
             i += 1
             continue
 
-        # 二至四级标题都开始新章节；四级标题用于栏目内的独立子区块
-        heading = re.match(r'^#{2,4}\s+(.+?)\s*$', line)
+        heading = re.match(r"^#{2,4}\s+(.+?)\s*$", line)
         if heading:
             flush_current_section()
-            current_section = {
-                "title": heading.group(1),
-                "content": []
-            }
+            current_section = {"title": heading.group(1), "content": []}
             i += 1
             continue
 
@@ -198,123 +540,361 @@ def markdown_to_card_elements(markdown: str, title: str, subtitle: str = "",
         i += 1
 
     flush_current_section()
+    return sections, subtitle or extracted_subtitle
 
-    effective_subtitle = subtitle or extracted_subtitle
 
-    # 构建 Header (Card Schema 2.0)
+def _build_feishu_card_header(
+    *,
+    title: str,
+    subtitle: str = "",
+    header_template: str = "indigo",
+    tag: str = "",
+    tag_color: str = "",
+) -> dict[str, Any]:
     header: dict[str, Any] = {
-        "title": {
-            "tag": "plain_text",
-            "content": title
-        },
-        "template": header_template or "indigo"
+        "title": {"tag": "plain_text", "content": title},
+        "template": header_template or "indigo",
     }
-    if effective_subtitle:
-        header["subtitle"] = {
-            "tag": "plain_text",
-            "content": effective_subtitle
-        }
-
-    # 业务标签
+    if subtitle:
+        header["subtitle"] = {"tag": "plain_text", "content": subtitle}
     if tag:
-        header["text_tag_list"] = [{
-            "tag": "text_tag",
-            "text": {"tag": "plain_text", "content": tag},
-            "color": tag_color or "blue"
-        }]
+        header["text_tag_list"] = [
+            {
+                "tag": "text_tag",
+                "text": {"tag": "plain_text", "content": tag},
+                "color": tag_color or "blue",
+            }
+        ]
     else:
         inferred = auto_infer_tag(title)
         if inferred:
-            header["text_tag_list"] = [{
-                "tag": "text_tag",
-                "text": {"tag": "plain_text", "content": inferred[0]},
-                "color": tag_color or inferred[1]
-            }]
+            header["text_tag_list"] = [
+                {
+                    "tag": "text_tag",
+                    "text": {"tag": "plain_text", "content": inferred[0]},
+                    "color": tag_color or inferred[1],
+                }
+            ]
+    return header
 
-    # 构建 Body Elements
+
+def _sections_to_card_elements(
+    sections: list[dict[str, Any]],
+    *,
+    raw_markdown: str = "",
+) -> list[dict[str, Any]]:
     elements: list[dict[str, Any]] = []
     titled_sections = [s for s in sections if s["title"]]
 
     if not titled_sections:
-        # 无 ## 章节：全部内容作为普通 markdown 块
-        elements.extend(content_to_elements(markdown.strip()))
-    else:
-        for section in sections:
-            sec_title = section["title"].strip()
-            if not sec_title:
-                continue
+        fallback_text = (
+            raw_markdown.strip()
+            if raw_markdown.strip()
+            else "\n".join(
+                "\n".join(s.get("content") or []).strip() for s in sections
+            ).strip()
+        )
+        elements.extend(content_to_elements(fallback_text))
+        return elements
 
-            section_text = '\n'.join(section["content"]).strip()
+    for section in sections:
+        sec_title = section["title"].strip()
+        if not sec_title:
+            continue
+        section_text = "\n".join(section["content"]).strip()
 
-            # 1. 脚注/信源/说明类栏目：使用 notation 次要字号呈现，不抢占主干焦点
-            if NOTATION_SECTION_RE.match(sec_title):
-                if elements and elements[-1].get("tag") != "hr":
-                    elements.append({"tag": "hr"})
-                notation_lines = [
-                    f"<font color='grey'>{l}</font>" if l.strip() else ""
-                    for l in f"**{sec_title}**\n{section_text}".splitlines()
-                ]
-                elements.append({
+        if NOTATION_SECTION_RE.match(_SECTION_CONT_SUFFIX_RE.sub("", sec_title).strip()):
+            if elements and elements[-1].get("tag") != "hr":
+                elements.append({"tag": "hr"})
+            notation_lines = [
+                f"<font color='grey'>{ln}</font>" if ln.strip() else ""
+                for ln in f"**{sec_title}**\n{section_text}".splitlines()
+            ]
+            elements.append(
+                {
                     "tag": "markdown",
                     "text_size": "notation",
-                    "content": "\n".join(notation_lines)
-                })
-                continue
+                    "content": "\n".join(notation_lines),
+                }
+            )
+            continue
 
-            # 2. 折叠面板栏目：以 (折叠) / (点击展开) 结尾或例行类栏目
-            is_collapsible = bool(COLLAPSIBLE_SUFFIX_RE.search(sec_title)) or sec_title.startswith(("例行披露", "长尾"))
-            if is_collapsible:
-                if elements and elements[-1].get("tag") != "hr":
-                    elements.append({"tag": "hr"})
-                clean_title = COLLAPSIBLE_SUFFIX_RE.sub("", sec_title).strip()
-                inner_elements = content_to_elements(section_text)
-                elements.append({
+        is_collapsible = bool(COLLAPSIBLE_SUFFIX_RE.search(sec_title)) or sec_title.startswith(
+            ("例行披露", "长尾")
+        )
+        if is_collapsible:
+            if elements and elements[-1].get("tag") != "hr":
+                elements.append({"tag": "hr"})
+            clean_title = COLLAPSIBLE_SUFFIX_RE.sub("", sec_title).strip()
+            inner_elements = content_to_elements(section_text)
+            elements.append(
+                {
                     "tag": "collapsible_panel",
                     "expanded": False,
                     "header": {
-                        "title": {
-                            "tag": "markdown",
-                            "content": f"**{clean_title}**"
-                        },
+                        "title": {"tag": "markdown", "content": f"**{clean_title}**"},
                         "vertical_align": "center",
                         "padding": "4px 8px 4px 8px",
                         "icon": {
                             "tag": "standard_icon",
                             "token": "down-small-ccm_outlined",
-                            "size": "12px 12px"
+                            "size": "12px 12px",
                         },
                         "icon_position": "right",
-                        "icon_expanded_angle": -180
+                        "icon_expanded_angle": -180,
                     },
                     "border": {"color": "grey", "corner_radius": "6px"},
                     "vertical_spacing": "6px",
                     "padding": "8px 8px 8px 8px",
-                    "elements": inner_elements
-                })
-                continue
+                    "elements": inner_elements,
+                }
+            )
+            continue
 
-            # 3. 常规业务章节
-            section_content = f"**{sec_title}**\n\n{section_text}"
-            elements.extend(content_to_elements(section_content))
-            elements.append({"tag": "hr"})
+        section_content = f"**{sec_title}**\n\n{section_text}"
+        elements.extend(content_to_elements(section_content))
+        elements.append({"tag": "hr"})
 
-        # 移除末尾多余分隔线
-        while elements and elements[-1].get("tag") == "hr":
-            elements.pop()
+    while elements and elements[-1].get("tag") == "hr":
+        elements.pop()
+    return elements
 
+
+def _build_feishu_card(
+    header: dict[str, Any],
+    elements: list[dict[str, Any]],
+) -> dict[str, Any]:
     return {
         "schema": "2.0",
-        "config": {
-            "wide_screen_mode": True,
-            "update_multi": True
-        },
+        "config": {"wide_screen_mode": True, "update_multi": True},
         "header": header,
         "body": {
             "direction": "vertical",
             "vertical_spacing": "8px",
-            "elements": elements
-        }
+            "elements": elements,
+        },
     }
+
+
+def _split_oversized_section(
+    sec_title: str,
+    section_text: str,
+    *,
+    fits_fn: Callable[[list[dict[str, Any]]], bool],
+) -> list[dict[str, Any]]:
+    segments = _extract_markdown_segments(section_text.strip())
+    if not segments:
+        return [{"title": sec_title, "content": []}]
+
+    def make_sec(part_index: int, lines: list[str]) -> dict[str, Any]:
+        eff_title = sec_title if not sec_title or part_index == 0 else f"{sec_title}（续）"
+        return {"title": eff_title, "content": lines}
+
+    def fits_single(part_index: int, text: str) -> bool:
+        sec = make_sec(part_index, text.splitlines() if text else [])
+        return fits_fn([sec])
+
+    def split_plain_unit(unit_text: str) -> list[str]:
+        parts = [p for p in re.split(r"\n{2,}", unit_text.strip()) if p.strip()]
+        if len(parts) <= 1:
+            parts = [ln for ln in unit_text.splitlines() if ln]
+        out: list[str] = []
+        for unit in parts:
+            if fits_single(0, unit) and fits_single(1, unit):
+                out.append(unit)
+                continue
+            lines = unit.splitlines() if "\n" in unit else [unit]
+            for ln in lines:
+                if fits_single(0, ln) and fits_single(1, ln):
+                    out.append(ln)
+                    continue
+                rem = ln
+                while rem:
+                    lo, hi = 1, len(rem)
+                    best = 1
+                    while lo <= hi:
+                        mid = (lo + hi) // 2
+                        cand = rem[:mid]
+                        if fits_single(0, cand) and fits_single(1, cand):
+                            best = mid
+                            lo = mid + 1
+                        else:
+                            hi = mid - 1
+                    out.append(rem[:best])
+                    rem = rem[best:]
+        return out
+
+    normalized_units: list[str] = []
+    for seg in segments:
+        if seg[0] == "table":
+            _, hdr, sep, rows = seg
+            full_table = hdr + "\n" + sep + ("\n" + "\n".join(rows) if rows else "")
+            if fits_single(0, full_table) and fits_single(1, full_table):
+                normalized_units.append(full_table)
+            else:
+                normalized_units.extend(
+                    _split_table_to_fitting_chunks(
+                        hdr,
+                        sep,
+                        rows,
+                        fits_text=lambda cand: fits_single(0, cand) and fits_single(1, cand),
+                    )
+                )
+        else:
+            normalized_units.extend(split_plain_unit(seg[1]))
+
+    out_sections: list[dict[str, Any]] = []
+    buf: list[str] = []
+    sep = "\n\n"
+    for unit in normalized_units:
+        candidate_text = sep.join([*buf, unit]) if buf else unit
+        if buf and not fits_single(len(out_sections), candidate_text):
+            out_sections.append(make_sec(len(out_sections), sep.join(buf).splitlines()))
+            buf = [unit]
+        else:
+            buf.append(unit)
+    if buf:
+        out_sections.append(make_sec(len(out_sections), sep.join(buf).splitlines()))
+    return out_sections
+
+
+def markdown_to_card_elements(
+    markdown: str,
+    title: str,
+    subtitle: str = "",
+    header_template: str = "indigo",
+    tag: str = "",
+    tag_color: str = "",
+) -> dict[str, Any]:
+    """将 markdown 内容转成飞书 Card Schema 2.0 卡片 JSON."""
+    sections, effective_subtitle = _parse_markdown_sections_and_subtitle(
+        markdown, title, subtitle
+    )
+    header = _build_feishu_card_header(
+        title=title,
+        subtitle=effective_subtitle,
+        header_template=header_template,
+        tag=tag,
+        tag_color=tag_color,
+    )
+    elements = _sections_to_card_elements(sections, raw_markdown=markdown)
+    return _build_feishu_card(header, elements)
+
+
+def markdown_to_card_chunks(
+    markdown: str,
+    title: str,
+    subtitle: str = "",
+    header_template: str = "indigo",
+    tag: str = "",
+    tag_color: str = "",
+    *,
+    max_bytes: int = FEISHU_CARD_MAX_BYTES,
+    max_elements: int = FEISHU_CARD_MAX_ELEMENTS,
+    max_tables: int = FEISHU_CARD_TABLE_LIMIT,
+) -> list[dict[str, Any]]:
+    """Render Markdown into one or more Feishu Schema 2.0 cards within gateway limits."""
+    sections, effective_subtitle = _parse_markdown_sections_and_subtitle(
+        markdown, title, subtitle
+    )
+    single_header = _build_feishu_card_header(
+        title=title,
+        subtitle=effective_subtitle,
+        header_template=header_template,
+        tag=tag,
+        tag_color=tag_color,
+    )
+    single_elements = _sections_to_card_elements(sections, raw_markdown=markdown)
+    single_card = _build_feishu_card(single_header, single_elements)
+    if is_feishu_card_within_envelope(
+        single_card,
+        max_bytes=max_bytes,
+        max_elements=max_elements,
+        max_tables=max_tables,
+    ):
+        return [single_card]
+
+    probe_header = _build_feishu_card_header(
+        title=f"{title}（999/999）",
+        subtitle=effective_subtitle,
+        header_template=header_template,
+        tag=tag,
+        tag_color=tag_color,
+    )
+
+    def _bucket_fits(bucket_sections: list[dict[str, Any]], *, fallback_md: str = "") -> bool:
+        elems = _sections_to_card_elements(bucket_sections, raw_markdown=fallback_md)
+        probe_card = _build_feishu_card(probe_header, elems)
+        return is_feishu_card_within_envelope(
+            probe_card,
+            max_bytes=max_bytes,
+            max_elements=max_elements,
+            max_tables=max_tables,
+        )
+
+    titled_sections = [s for s in sections if s["title"]]
+    atomic_sections: list[dict[str, Any]] = []
+    if not titled_sections:
+        for sub in _split_oversized_section(
+            "",
+            markdown.strip(),
+            fits_fn=lambda cand: _bucket_fits(
+                cand,
+                fallback_md="\n".join(cand[0].get("content") or []),
+            ),
+        ):
+            atomic_sections.append(sub)
+    else:
+        for sec in titled_sections:
+            if _bucket_fits([sec]):
+                atomic_sections.append(sec)
+            else:
+                sec_title = str(sec["title"]).strip()
+                sec_text = "\n".join(sec.get("content") or []).strip()
+                atomic_sections.extend(
+                    _split_oversized_section(
+                        sec_title,
+                        sec_text,
+                        fits_fn=lambda cand: _bucket_fits(cand),
+                    )
+                )
+
+    buckets: list[list[dict[str, Any]]] = []
+    if not titled_sections:
+        for sec in atomic_sections:
+            buckets.append([sec])
+    else:
+        current_bucket: list[dict[str, Any]] = []
+        for sec in atomic_sections:
+            candidate = [*current_bucket, sec]
+            if current_bucket and not _bucket_fits(candidate):
+                buckets.append(current_bucket)
+                current_bucket = [sec]
+            else:
+                current_bucket = candidate
+        if current_bucket:
+            buckets.append(current_bucket)
+
+    total = len(buckets)
+    cards: list[dict[str, Any]] = []
+    for idx, bucket in enumerate(buckets, start=1):
+        chunk_title = f"{title}（{idx}/{total}）" if total > 1 else title
+        header = _build_feishu_card_header(
+            title=chunk_title,
+            subtitle=effective_subtitle,
+            header_template=header_template,
+            tag=tag,
+            tag_color=tag_color,
+        )
+        if not titled_sections:
+            elems = _sections_to_card_elements(
+                [],
+                raw_markdown="\n".join(bucket[0].get("content") or []),
+            )
+        else:
+            elems = _sections_to_card_elements(bucket)
+        cards.append(_build_feishu_card(header, elems))
+    return cards
 
 
 def card_markdown(md: str) -> str:
@@ -433,7 +1013,7 @@ def load_card_style(ticker: str = "MSFT", workspace: Path | str | None = None) -
     return {key: str(data["card"][key]) for key in cfg_mod.CARD_STYLE_KEYS}
 
 
-def dump_card(card: dict[str, Any]) -> str:
+def dump_card(card: Any) -> str:
     return json.dumps(card, ensure_ascii=False, indent=2) + "\n"
 
 
@@ -471,7 +1051,7 @@ def render_card(
         raise RenderError("card_missing", "找不到卡片正文")
     prepared, glossed = prepare_body(source.read_text(encoding="utf-8"), root / "research" / "tracker" / "thesis.md")
     title = f"{style['title_prefix']}{stamp:%m-%d %H:%M} ET"
-    card = markdown_to_card_elements(
+    cards = markdown_to_card_chunks(
         prepared,
         title=title,
         subtitle=style["subtitle"],
@@ -479,9 +1059,11 @@ def render_card(
         tag=style["tag"],
         tag_color=style["tag_color"],
     )
-    if _forbidden_payload(card):
-        raise RenderError("unsupported_content", "卡片不接受图片或表格")
-    text = dump_card(card)
+    for item in cards:
+        if _forbidden_payload(item):
+            raise RenderError("unsupported_content", "卡片不接受图片或表格")
+    payload_obj: Any = cards[0] if len(cards) == 1 else cards
+    text = dump_card(payload_obj)
     if output.is_symlink():
         raise RenderError("symlink_escape", "拒绝透过符号链接写入卡片")
     reused = False

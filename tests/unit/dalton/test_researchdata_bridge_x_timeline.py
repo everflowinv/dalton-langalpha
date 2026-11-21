@@ -397,6 +397,9 @@ class TestXTimelineNormalization:
         assert len(data["items"]) == 3  # bridge truncates xreach's over-return to count
         assert data["returned"] == 3
         assert data["has_more"] is True
+        assert data["truncated"] is True
+        assert data["oldest_fetched_at"] == "2026-10-21T09:48:59+00:00"
+        assert data["oldest_returned_at"] == "2026-10-21T10:41:28+00:00"
 
         first = data["items"][0]
         raw_first = fixture["items"][0]
@@ -522,10 +525,266 @@ class TestXTimelineNormalization:
         body_cut = await _call(bridge, 30, {"route": "x-timeline", "handle": "nvidia", "count": 5})
         assert len(body_cut["data"]["items"]) == 5  # 15 fixture items truncated
         assert body_cut["data"]["has_more"] is True
+        assert body_cut["data"]["truncated"] is True
+        assert body_cut["data"]["oldest_fetched_at"] == "2026-10-21T09:48:59+00:00"
+        assert body_cut["data"]["oldest_returned_at"] == "2026-10-21T10:41:11+00:00"
 
         body_full = await _call(bridge, 31, {"route": "x-timeline", "handle": "nvidia", "count": 20})
         assert len(body_full["data"]["items"]) == 15  # nothing truncated
         assert body_full["data"]["has_more"] is False  # upstream hasMore preserved
+        assert body_full["data"]["truncated"] is False
+        assert body_full["data"]["oldest_fetched_at"] == "2026-10-21T09:48:59+00:00"
+        assert body_full["data"]["oldest_returned_at"] == "2026-10-21T09:48:59+00:00"
+
+    @pytest.mark.asyncio
+    async def test_oldest_fetched_at_computed_before_date_filter_and_null_when_empty(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fixture = _load_fixture()
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        exec_mock, _calls = _xreach_exec_double(fixture)
+        exec_empty, _calls_empty = _xreach_exec_double({"items": [], "hasMore": False})
+
+        # Date filter drops every fixture item, yet oldest_fetched_at reflects raw pre-filter items.
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+        body_filtered = await _call(
+            bridge,
+            32,
+            {"route": "x-timeline", "handle": "nvidia", "until": "2026-10-20", "count": 20},
+        )
+        assert body_filtered["ok"] is True
+        assert body_filtered["status"] == "empty"
+        assert body_filtered["data"]["items"] == []
+        assert body_filtered["data"]["truncated"] is False
+        assert body_filtered["data"]["oldest_fetched_at"] == "2026-10-21T09:48:59+00:00"
+        assert body_filtered["data"]["oldest_returned_at"] is None
+
+        # Empty xreach payload yields oldest_fetched_at=None and truncated=False.
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_empty)
+        body_empty = await _call(bridge, 33, {"route": "x-timeline", "handle": "nvidia", "count": 20})
+        assert body_empty["ok"] is True
+        assert body_empty["status"] == "empty"
+        assert body_empty["data"]["truncated"] is False
+        assert body_empty["data"]["has_more"] is False
+        assert body_empty["data"]["oldest_fetched_at"] is None
+        assert body_empty["data"]["oldest_returned_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_route_contract_and_schema_document_oldest_fetched_at_and_truncated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        contract = rb.ROUTE_CONTRACT_SPECS["x-timeline"]
+        assert "oldest_fetched_at" in contract["return_shape"]
+        assert "oldest_returned_at" in contract["return_shape"]
+        assert "truncated" in contract["return_shape"]
+        catalog_rules = " ".join(rb.COMMUNITY_CATALOG_ROUTE_SPECS["x-timeline"]["rules"])
+        assert "oldest_fetched_at" in catalog_rules
+        assert "oldest_returned_at" in catalog_rules
+        assert "truncated" in catalog_rules
+
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            bridge,
+            "ensure_initialized",
+            create_autospec(bridge.ensure_initialized, return_value={"serverInfo": {"version": "1.0"}}),
+        )
+        monkeypatch.setattr(
+            bridge,
+            "_run_stdio_rpc",
+            create_autospec(
+                bridge._run_stdio_rpc,
+                return_value=[
+                    {
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": "community",
+                                    "description": "desc",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {"route": {"type": "string", "enum": []}},
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ],
+            ),
+        )
+        tools = await bridge.get_filtered_tools()
+        comm = next(t for t in tools if t["name"] == "community")
+        count_desc = comm["inputSchema"]["properties"]["count"]["description"]
+        assert "truncated" in count_desc
+        assert "oldest_fetched_at" in count_desc
+        assert "oldest_returned_at" in count_desc
+
+    @pytest.mark.asyncio
+    async def test_50_in_window_plus_1_before_window_reports_pre_truncation_oldest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from datetime import datetime, timezone
+
+        fixture = _load_fixture()
+        template = dict(fixture["items"][0])
+        raw_items = []
+        # 50 items from 2026-11-11T01:00:00+00:00..2026-11-12T02:00:00+00:00 + 1 earlier item at 2026-11-11T00:15:00+00:00
+        base_ts = datetime(2026, 11, 11, 1, 0, 0, tzinfo=timezone.utc)
+        for idx in range(50):
+            row = dict(template)
+            row["id"] = str(9000 + idx)
+            dt = base_ts + timedelta(minutes=20 * (49 - idx))
+            row["createdAt"] = dt.strftime("%a %b %d %H:%M:%S +0000 %Y")
+            raw_items.append(row)
+        older = dict(template)
+        older["id"] = "8999"
+        older["createdAt"] = "Wed Nov 11 00:15:00 +0000 2026"
+        raw_items.append(older)
+
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        exec_mock, _calls = _xreach_exec_double({"items": raw_items, "hasMore": False})
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        body = await _call(
+            bridge,
+            34,
+            {
+                "route": "x-timeline",
+                "handle": "nvidia",
+                "since": "2026-11-11",
+                "until": "2026-11-12",
+                "count": 50,
+            },
+        )
+        assert body["ok"] is True
+        data = body["data"]
+        assert len(data["items"]) == 50
+        assert data["truncated"] is True
+        assert data["has_more"] is True
+        assert data["oldest_fetched_at"] == "2026-11-11T00:15:00+00:00"
+        assert data["oldest_returned_at"] == "2026-11-11T01:00:00+00:00"
+
+    @pytest.mark.asyncio
+    async def test_pinned_tweet_excluded_from_oldest_timestamps_and_51_in_window_reported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from datetime import datetime, timezone
+
+        fixture = _load_fixture()
+        template = dict(fixture["items"][0])
+
+        # 1. Real xreach shape has no pinned marker; index 0 older than index 1 is excluded as pinned.
+        pinned = dict(template)
+        pinned["id"] = "1001"
+        pinned["createdAt"] = "Thu Jan 01 00:00:00 +0000 2026"
+        newer = dict(template)
+        newer["id"] = "1002"
+        newer["createdAt"] = "Thu Nov 12 01:00:00 +0000 2026"
+        second = dict(template)
+        second["id"] = "1003"
+        second["createdAt"] = "Wed Nov 11 12:00:00 +0000 2026"
+
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        exec_pinned, _ = _xreach_exec_double({"items": [pinned, newer, second], "hasMore": True})
+
+        # 2. Explicit isPinned inside the date filter is still excluded from both oldest fields.
+        explicit_pinned = dict(template)
+        explicit_pinned["id"] = "1004"
+        explicit_pinned["isPinned"] = True
+        explicit_pinned["createdAt"] = "Wed Nov 11 00:05:00 +0000 2026"
+        exec_explicit, _ = _xreach_exec_double({"items": [explicit_pinned, newer, second], "hasMore": True})
+
+        # 3. `thread` is chronological: index 0 < index 1 must NOT treat index 0 as pinned.
+        exec_thread, _ = _xreach_exec_double([second, newer])
+
+        # 4. 51 in-window + 1 pre-window truncated at 50 -> oldest_returned_at stays in window.
+        raw_52 = []
+        base_ts = datetime(2026, 11, 11, 1, 0, 0, tzinfo=timezone.utc)
+        for idx in range(51):
+            row = dict(template)
+            row["id"] = str(9100 + idx)
+            dt = base_ts + timedelta(minutes=15 * (50 - idx))
+            row["createdAt"] = dt.strftime("%a %b %d %H:%M:%S +0000 %Y")
+            raw_52.append(row)
+        pre_win = dict(template)
+        pre_win["id"] = "9099"
+        pre_win["createdAt"] = "Wed Nov 11 00:10:00 +0000 2026"
+        raw_52.append(pre_win)
+        exec_52, _ = _xreach_exec_double({"items": raw_52, "hasMore": False})
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_pinned)
+        body_pinned = await _call(
+            bridge,
+            35,
+            {"route": "x-timeline", "handle": "nvidia", "since": "2026-11-11", "until": "2026-11-12", "count": 50},
+        )
+        assert body_pinned["ok"] is True
+        assert body_pinned["data"]["returned"] == 2
+        assert body_pinned["data"]["has_more"] is True
+        assert body_pinned["data"]["oldest_fetched_at"] == "2026-11-11T12:00:00+00:00"
+        assert body_pinned["data"]["oldest_returned_at"] == "2026-11-11T12:00:00+00:00"
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_explicit)
+        body_explicit = await _call(
+            bridge,
+            36,
+            {"route": "x-timeline", "handle": "nvidia", "since": "2026-11-11", "until": "2026-11-12", "count": 50},
+        )
+        assert body_explicit["data"]["returned"] == 3
+        assert body_explicit["data"]["oldest_fetched_at"] == "2026-11-11T12:00:00+00:00"
+        assert body_explicit["data"]["oldest_returned_at"] == "2026-11-11T12:00:00+00:00"
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_thread)
+        body_thread = await _call(
+            bridge,
+            37,
+            {"route": "x-timeline", "operation": "thread", "tweet_id": second["id"]},
+        )
+        assert body_thread["data"]["oldest_fetched_at"] == "2026-11-11T12:00:00+00:00"
+        assert body_thread["data"]["oldest_returned_at"] == "2026-11-11T12:00:00+00:00"
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_52)
+        body_52 = await _call(
+            bridge,
+            38,
+            {"route": "x-timeline", "handle": "nvidia", "since": "2026-11-11", "until": "2026-11-12", "count": 50},
+        )
+        assert body_52["data"]["truncated"] is True
+        assert body_52["data"]["oldest_fetched_at"] == "2026-11-11T00:10:00+00:00"
+        assert body_52["data"]["oldest_returned_at"] == "2026-11-11T01:15:00+00:00"
+
+    @pytest.mark.asyncio
+    async def test_pinned_tweet_excluded_at_head_and_middle_tail_unidentifiable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fixture = _load_fixture()
+        template = dict(fixture["items"][0])
+        newer = dict(template, id="2001", createdAt="Thu Nov 12 01:00:00 +0000 2026")
+        second = dict(template, id="2002", createdAt="Wed Nov 11 12:00:00 +0000 2026")
+        head_pinned = dict(template, id="2000", createdAt="Thu Jan 01 00:00:00 +0000 2026")
+        mid_pinned = dict(template, id="2003", createdAt="Wed Nov 11 08:00:00 +0000 2026")
+        # xreach does not mark pinned tweets; an old pinned tweet appended at the tail cannot be distinguished.
+        tail_pinned = dict(template, id="2004", createdAt="Wed Nov 04 12:00:00 +0000 2026")
+
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        cases = (
+            ("head", [head_pinned, newer, second], "2026-11-11T12:00:00+00:00", "2026-11-11T12:00:00+00:00"),
+            ("middle", [newer, mid_pinned, second], "2026-11-11T12:00:00+00:00", "2026-11-11T12:00:00+00:00"),
+            ("tail_unidentifiable", [newer, second, tail_pinned], "2026-11-04T12:00:00+00:00", "2026-11-11T12:00:00+00:00"),
+        )
+        doubles = [
+            (label, _xreach_exec_double({"items": raw_items, "hasMore": True})[0], exp_fetched, exp_returned)
+            for label, raw_items, exp_fetched, exp_returned in cases
+        ]
+        for idx, (label, exec_mock, exp_fetched, exp_returned) in enumerate(doubles):
+            monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+            body = await _call(
+                bridge,
+                50 + idx,
+                {"route": "x-timeline", "handle": "nvidia", "since": "2026-11-11", "until": "2026-11-12", "count": 50},
+            )
+            assert body["ok"] is True, label
+            assert body["data"]["oldest_fetched_at"] == exp_fetched, label
+            assert body["data"]["oldest_returned_at"] == exp_returned, label
 
     @pytest.mark.asyncio
     async def test_exit_zero_with_429_error_json_returns_ok_false_and_is_error_true(

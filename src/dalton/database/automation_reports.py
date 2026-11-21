@@ -42,6 +42,12 @@ from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 
 from src.dalton.bullbear_tickers import bullbear_report_profiles
+from src.dalton.data_jobs.notification_payloads import (
+    DataTaskNotificationError,
+    extract_feishu_cards_body_fingerprint,
+    is_feishu_card_within_envelope,
+    split_feishu_card_to_chunks,
+)
 from src.dalton.notify.channel_transport import UNCERTAIN_NOTIFY_ERROR_CODES
 from src.server.database.pool import get_db_connection
 
@@ -347,6 +353,12 @@ def is_failure_alert_payload(payload: Any) -> bool:
     return isinstance(payload, Mapping) and payload.get("source") == FAILURE_ALERT_SOURCE
 
 
+CARD_LIMIT_EXCEEDED_ERROR_CODE = "card_limit_exceeded"
+NON_RETRYABLE_CARD_ERROR_CODES = frozenset(
+    {"attempts_exhausted", CARD_LIMIT_EXCEEDED_ERROR_CODE}
+)
+
+
 def card_delivery_is_terminal(
     row: Mapping[str, Any],
     *,
@@ -354,8 +366,9 @@ def card_delivery_is_terminal(
 ) -> bool:
     """True when a saved card row has exhausted certain retries.
 
-    ``failed`` with ``attempt_count >= max_attempts``, or ``attempts_exhausted``,
-    is terminal. Uncertain codes and permission or route skips are not.
+    ``failed`` with ``attempt_count >= max_attempts``, ``attempts_exhausted``,
+    or ``card_limit_exceeded`` is terminal. Uncertain codes and permission or
+    route skips are not.
     """
     status = str(row.get("status") or "").strip().lower()
     code = str(row.get("error_code") or "").strip().lower()
@@ -363,7 +376,7 @@ def card_delivery_is_terminal(
         return False
     if code in UNCERTAIN_NOTIFY_ERROR_CODES or code in _NON_TERMINAL_CARD_CODES:
         return False
-    if code == "attempts_exhausted":
+    if code in NON_RETRYABLE_CARD_ERROR_CODES:
         return True
     try:
         attempt = int(row.get("attempt_count") or 0)
@@ -596,7 +609,9 @@ def prepare_automation_report_content(
             "expected_item_count": 1,
         }, None
     assert card_list is not None
-    if len(card_list) > MAX_CARDS:
+    if len(card_list) == 1 and isinstance(card_list[0], list):
+        card_list = card_list[0]
+    if not card_list or len(card_list) > MAX_CARDS:
         return None, "invalid_card"
     stored: list[dict[str, Any]] = []
     for item in card_list:
@@ -605,7 +620,19 @@ def prepare_automation_report_content(
         copied = deepcopy(dict(item))
         if _validate_card(copied):
             return None, "invalid_card"
-        stored.append(copied)
+        if is_feishu_card_within_envelope(copied):
+            stored.append(copied)
+        else:
+            try:
+                chunks = split_feishu_card_to_chunks(copied)
+            except DataTaskNotificationError as exc:
+                return None, exc.code or "card_limit_exceeded"
+            for chunk in chunks:
+                if _validate_card(chunk):
+                    return None, "invalid_card"
+                stored.append(chunk)
+    if not stored or len(stored) > MAX_CARDS:
+        return None, "invalid_card"
     try:
         encoded = json.dumps(
             stored, ensure_ascii=False, separators=(",", ":")
@@ -790,14 +817,21 @@ async def submit_automation_report(
                         report_run_id=cleaned_run,
                         lock=True,
                     )
+                    upgrade_delete_ids: list[str] = []
                     if existing:
-                        if not _same_saved_body(existing, prepared["content_sha256"]):
+                        if _same_saved_body(existing, prepared["content_sha256"]):
+                            return _success_from_rows(existing, created=False)
+                        if not _can_upgrade_oversized_legacy_card_batch(existing, prepared):
                             return _error(
                                 action,
                                 "content_conflict",
                                 "This report_run_id is already saved with a different body.",
                             )
-                        return _success_from_rows(existing, created=False)
+                        upgrade_delete_ids = [
+                            str(old_row.get("delivery_id") or "").strip()
+                            for old_row in existing
+                            if str(old_row.get("delivery_id") or "").strip()
+                        ]
                     if await _execution_has_other_report(
                         cur,
                         execution_id=str(row["automation_execution_id"]),
@@ -860,6 +894,11 @@ async def submit_automation_report(
                             action,
                             auth_code or "no_authorized_target",
                             "Not every configured recipient is currently authorized.",
+                        )
+                    for did in upgrade_delete_ids:
+                        await cur.execute(
+                            "DELETE FROM dalton_notify_deliveries WHERE delivery_id = %s::uuid",
+                            (did,),
                         )
                     payload = _build_payload(
                         profile=parsed,
@@ -1196,6 +1235,50 @@ def _same_saved_body(rows: Sequence[Mapping[str, Any]], digest: str) -> bool:
         if payload.get("content_sha256") != digest:
             return False
     return True
+
+
+def _can_upgrade_oversized_legacy_card_batch(
+    rows: Sequence[Mapping[str, Any]],
+    prepared: Mapping[str, Any],
+) -> bool:
+    """Allow replacing an unconfirmed oversized single-card batch with its split chunks."""
+    if not rows or prepared.get("content_kind") != "cards":
+        return False
+    new_cards = prepared.get("cards")
+    if (
+        not isinstance(new_cards, list)
+        or not new_cards
+        or not all(isinstance(c, Mapping) and is_feishu_card_within_envelope(c) for c in new_cards)
+    ):
+        return False
+    first_payload = _payload_dict(rows[0].get("payload_json"))
+    old_digest = str(first_payload.get("content_sha256") or "")
+    old_cards = first_payload.get("cards")
+    if (
+        not old_digest
+        or not isinstance(old_cards, list)
+        or len(old_cards) != 1
+        or not isinstance(old_cards[0], Mapping)
+        or is_feishu_card_within_envelope(old_cards[0])
+    ):
+        return False
+    for row in rows:
+        payload = _payload_dict(row.get("payload_json"))
+        if payload.get("source") != REPORT_SOURCE or payload.get("content_kind") != "cards":
+            return False
+        if str(payload.get("content_sha256") or "") != old_digest:
+            return False
+        status = str(row.get("status") or "").strip().lower()
+        if status not in {"failed", "pending"}:
+            return False
+    new_fp = extract_feishu_cards_body_fingerprint(new_cards)
+    if extract_feishu_cards_body_fingerprint(old_cards) == new_fp:
+        return True
+    try:
+        resplit = split_feishu_card_to_chunks(old_cards[0])
+    except DataTaskNotificationError:
+        return False
+    return extract_feishu_cards_body_fingerprint(resplit) == new_fp
 
 
 def _snapshot_of(rows: Sequence[Mapping[str, Any]]) -> list[str]:

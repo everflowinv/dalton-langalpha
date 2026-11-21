@@ -10,6 +10,8 @@ REPO_ROOT="${DALTON_REPO_ROOT:-$(cd "${SCRIPT_DIR}/../../../.." && pwd)}"
 WAIT_IDLE_SCRIPT="${SCRIPT_DIR}/wait_backend_idle.sh"
 EDGE_PORT="${DALTON_EDGE_PORT:-8088}"
 EDGE_WAIT_TIMEOUT=60
+CONTAINER_LOG_DIR="${DALTON_CONTAINER_LOG_DIR:-$HOME/Library/Logs/Dalton/containers}"
+CONTAINER_LOG_RETENTION_DAYS=14
 BRIDGE=0; RECREATE=0; EXPECT=""
 
 usage() {
@@ -446,9 +448,47 @@ EOF
   [ "$old_edge" != "$new_edge" ]
 }
 
+cleanup_old_container_logs() {
+  [ -d "$CONTAINER_LOG_DIR" ] || return 0
+  find "$CONTAINER_LOG_DIR" -maxdepth 1 -type f \( \
+    -name 'backend-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z.log.gz' \
+    -o -name 'crawler-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z.log.gz' \
+    -o -name 'edge-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z.log.gz' \
+  \) -mtime +"$CONTAINER_LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+  return 0
+}
+
+save_container_logs() {
+  local service="${1:-}" container="${2:-}"
+  local ts out_file tmp_file
+  [ -n "$service" ] && [ -n "$container" ] || return 0
+  if ! docker ps -aq --filter "name=${container}" 2>/dev/null | grep -q .; then
+    return 0
+  fi
+  if ! mkdir -p "$CONTAINER_LOG_DIR" 2>/dev/null; then
+    echo "WARN: failed to create container log dir $CONTAINER_LOG_DIR; continuing deploy" >&2
+    return 0
+  fi
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  out_file="${CONTAINER_LOG_DIR}/${service}-${ts}.log.gz"
+  tmp_file="${out_file}.tmp.$$"
+  if docker logs --timestamps "$container" 2>&1 | gzip -c > "$tmp_file"; then
+    if ! mv -f "$tmp_file" "$out_file"; then
+      rm -f "$tmp_file"
+      echo "WARN: failed to save container logs for ${service} (${container}); continuing deploy" >&2
+    fi
+  else
+    rm -f "$tmp_file"
+    echo "WARN: failed to save container logs for ${service} (${container}); continuing deploy" >&2
+  fi
+  cleanup_old_container_logs
+  return 0
+}
+
 apply_backend() {
   local out rc
   if [ "$RECREATE" = "1" ]; then
+    save_container_logs "backend" "dalton-langalpha-backend-1"
     out=$(docker compose up -d --no-deps backend 2>&1)
     rc=$?
     [ -n "$out" ] && printf '%s\n' "$out" | tail -2
@@ -460,6 +500,7 @@ apply_backend() {
 apply_crawler() {
   local out rc
   if [ "$RECREATE" = "1" ]; then
+    save_container_logs "crawler" "dalton-langalpha-crawler-1"
     out=$(docker compose up -d --no-deps --no-build crawler 2>&1)
     rc=$?
     [ -n "$out" ] && printf '%s\n' "$out" | tail -1
@@ -467,6 +508,7 @@ apply_crawler() {
   elif docker ps -q --filter name=dalton-langalpha-crawler-1 | grep -q .; then
     docker restart dalton-langalpha-crawler-1 >/dev/null
   else
+    save_container_logs "crawler" "dalton-langalpha-crawler-1"
     out=$(docker compose up -d --no-deps --no-build crawler 2>&1)
     rc=$?
     [ -n "$out" ] && printf '%s\n' "$out" | tail -1
@@ -476,6 +518,7 @@ apply_crawler() {
 
 recreate_edge() {
   local out rc
+  save_container_logs "edge" "dalton-langalpha-edge-1"
   out=$(docker compose up -d --no-deps --force-recreate edge 2>&1)
   rc=$?
   [ -n "$out" ] && printf '%s\n' "$out" | tail -2
@@ -751,6 +794,7 @@ run_deploy_main() {
   local LOG before after out build_rc cur
   parse_deploy_args "$@" || exit $?
   cd "$REPO_ROOT" || exit 1
+  cleanup_old_container_logs
   PRE_FF_DALTON_REV=$(get_dalton_alembic_version || true)
   PRE_FF_UPSTREAM_REV=$(get_upstream_alembic_version || true)
   echo "pre-deploy migrations: dalton=${PRE_FF_DALTON_REV:-未能读取}, upstream=${PRE_FF_UPSTREAM_REV:-未能读取}"

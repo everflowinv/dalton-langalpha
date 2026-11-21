@@ -9,8 +9,13 @@ separate because ptc_agent code must not import from src/server.
 
 from __future__ import annotations
 
+import ast
+from datetime import datetime, timezone
+import json
 import math
 import re
+import time
+from typing import Any
 
 # Client-side errors that fail identically on every retry of the same model:
 # bad request shape, auth, unknown model, oversized payload, unsupported
@@ -232,6 +237,132 @@ def is_retryable_error(exc: BaseException, status_code: int | None = None) -> bo
     return status_code not in NON_RETRYABLE_STATUSES
 
 
+# DALTON-HOOK(quota-exhaustion): fallback TTL (10 minutes) when a subscription
+# quota refusal names no parseable reset horizon.
+DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS = 600
+
+_RESETS_AT_TEXT_RE = re.compile(
+    r"""['"]resets_at['"]\s*:\s*(?:(?P<num>\d+(?:\.\d+)?)|['"](?P<iso>[^'"]+)['"])"""
+)
+_SUBSCRIPTION_QUOTA_CODES = frozenset({"insufficient_quota"})
+_SUBSCRIPTION_QUOTA_PHRASES = (
+    "subscription quota",
+    "quota exhausted",
+    "exceeded your current quota",
+    "usage window resets",
+    "your usage window",
+)
+
+
+def _extract_resets_at_raw(exc: BaseException) -> Any:
+    """Return the first ``resets_at`` value from SDK error body, response, or message."""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        if "resets_at" in body and body["resets_at"] is not None:
+            return body["resets_at"]
+        err = body.get("error")
+        if isinstance(err, dict) and err.get("resets_at") is not None:
+            return err.get("resets_at")
+    response = getattr(exc, "response", None)
+    if response is not None:
+        parsed_resp: Any = None
+        try:
+            json_fn = getattr(response, "json", None)
+            if callable(json_fn):
+                parsed_resp = json_fn()
+        except Exception:
+            parsed_resp = None
+        if not isinstance(parsed_resp, dict):
+            raw_text = getattr(response, "text", None)
+            if isinstance(raw_text, str) and "resets_at" in raw_text:
+                try:
+                    parsed_resp = json.loads(raw_text)
+                except Exception:
+                    parsed_resp = None
+        if isinstance(parsed_resp, dict):
+            if parsed_resp.get("resets_at") is not None:
+                return parsed_resp.get("resets_at")
+            err = parsed_resp.get("error")
+            if isinstance(err, dict) and err.get("resets_at") is not None:
+                return err.get("resets_at")
+    text = str(exc)
+    if "resets_at" in text:
+        idx = text.find("{")
+        if idx != -1:
+            candidate = text[idx:]
+            for loader in (json.loads, ast.literal_eval):
+                try:
+                    obj = loader(candidate)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    if obj.get("resets_at") is not None:
+                        return obj.get("resets_at")
+                    err = obj.get("error")
+                    if isinstance(err, dict) and err.get("resets_at") is not None:
+                        return err.get("resets_at")
+        m = _RESETS_AT_TEXT_RE.search(text)
+        if m:
+            if m.group("num") is not None:
+                return float(m.group("num"))
+            if m.group("iso") is not None:
+                return m.group("iso")
+    return None
+
+
+def _parse_resets_at_seconds(raw: Any, now_epoch: float) -> float | None:
+    """Convert a Unix timestamp or ISO-8601 ``resets_at`` value to remaining seconds."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        epoch = float(raw)
+        if not math.isfinite(epoch) or epoch <= 0:
+            return None
+        if epoch > 1e12:
+            epoch /= 1000.0
+        return max(0.0, epoch - now_epoch)
+    if isinstance(raw, str):
+        cleaned = raw.strip()
+        if not cleaned:
+            return None
+        try:
+            epoch = float(cleaned)
+        except ValueError:
+            iso = cleaned[:-1] + "+00:00" if cleaned.endswith("Z") else cleaned
+            try:
+                dt = datetime.fromisoformat(iso)
+            except ValueError:
+                return None
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return max(0.0, dt.timestamp() - now_epoch)
+        if not math.isfinite(epoch) or epoch <= 0:
+            return None
+        if epoch > 1e12:
+            epoch /= 1000.0
+        return max(0.0, epoch - now_epoch)
+    return None
+
+
+def _is_subscription_quota_429(exc: BaseException) -> bool:
+    """True when a 429 error chain identifies a subscription/quota exhaustion."""
+    for current in iter_exception_chain(exc):
+        if _SUBSCRIPTION_QUOTA_CODES.intersection(_error_codes(current)):
+            return True
+        parts = [str(current)]
+        body = getattr(current, "body", None)
+        if isinstance(body, dict):
+            parts.append(str(body))
+        response = getattr(current, "response", None)
+        resp_text = getattr(response, "text", None) if response is not None else None
+        if isinstance(resp_text, str):
+            parts.append(resp_text)
+        lowered = " ".join(parts).lower()
+        if any(phrase in lowered for phrase in _SUBSCRIPTION_QUOTA_PHRASES):
+            return True
+    return False
+
+
 # DALTON-HOOK(quota-exhaustion): the quota/billing half of error
 # classification, shared by the model-resilience middleware with
 # ``is_retryable_error``. Kept here so every caller classifies one way.
@@ -272,16 +403,32 @@ def quota_exhaustion_seconds(
     except Exception:
         pass
     if status_code == 429:
-        # A numeric Retry-After header is a horizon too; the HTTP-date form
-        # is not parsed — providers that mean hours say so in the body.
+        retry_after_s: float | None = None
+        resets_at_s: float | None = None
+        now_epoch = time.time()
         for current in iter_exception_chain(exc):
-            response = getattr(current, "response", None)
-            headers = getattr(response, "headers", None)
-            raw = headers.get("Retry-After") if hasattr(headers, "get") else None
-            if raw is None:
-                continue
-            try:
-                return float(raw)
-            except (TypeError, ValueError):
-                continue
+            if retry_after_s is None:
+                response = getattr(current, "response", None)
+                headers = getattr(response, "headers", None)
+                raw = headers.get("Retry-After") if hasattr(headers, "get") else None
+                if raw is not None:
+                    try:
+                        parsed_ra = float(raw)
+                        if math.isfinite(parsed_ra) and parsed_ra >= 0:
+                            retry_after_s = parsed_ra
+                    except (TypeError, ValueError):
+                        pass
+            if resets_at_s is None:
+                raw_reset = _extract_resets_at_raw(current)
+                parsed_reset = _parse_resets_at_seconds(raw_reset, now_epoch)
+                if parsed_reset is not None:
+                    resets_at_s = parsed_reset
+        if retry_after_s is not None and resets_at_s is not None:
+            return max(retry_after_s, resets_at_s)
+        if resets_at_s is not None:
+            return resets_at_s
+        if retry_after_s is not None:
+            return retry_after_s
+        if _is_subscription_quota_429(exc):
+            return float(DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS)
     return None

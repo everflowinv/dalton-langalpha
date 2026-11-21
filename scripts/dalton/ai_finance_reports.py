@@ -124,16 +124,12 @@ def first_report_date() -> str | None | dict[str, Any]:
     return parsed
 
 
-def _overlay_card_renderer() -> Any:
-    """Load only the overlay card renderer from the file next to this module.
-
-    The overlay module defines send helpers, but importing it does not read
-    config or send a card. Callers use ``markdown_to_card_elements`` only.
-    """
+def _overlay_card_module() -> Any:
+    """Load only the overlay card module from the file next to this module."""
     global _CARD_RENDERER
     renderer = _CARD_RENDERER
-    if renderer is not None:
-        return renderer
+    if isinstance(renderer, tuple):
+        return renderer[0]
     spec = importlib.util.spec_from_file_location("_ai_finance_overlay_card", _OVERLAY_CARD)
     if spec is None or spec.loader is None:
         raise ImportError("card renderer")
@@ -142,8 +138,24 @@ def _overlay_card_renderer() -> Any:
     loaded = getattr(module, "markdown_to_card_elements", None)
     if not callable(loaded):
         raise ImportError("card renderer")
-    _CARD_RENDERER = loaded
-    return loaded
+    _CARD_RENDERER = (module, loaded)
+    return module
+
+
+def _overlay_card_renderer() -> Any:
+    """Load only the overlay card renderer from the file next to this module.
+
+    The overlay module defines send helpers, but importing it does not read
+    config or send a card. Callers use ``markdown_to_card_elements`` only.
+    """
+    global _CARD_RENDERER
+    renderer = _CARD_RENDERER
+    if callable(renderer):
+        return renderer
+    if isinstance(renderer, tuple):
+        return renderer[1]
+    module = _overlay_card_module()
+    return getattr(module, "markdown_to_card_elements")
 
 
 def render_daily_card(markdown: str, batch_id: str) -> dict[str, Any]:
@@ -152,6 +164,17 @@ def render_daily_card(markdown: str, batch_id: str) -> dict[str, Any]:
     if not isinstance(card, dict):
         raise TypeError("card")
     return card
+
+
+def render_daily_cards(markdown: str, batch_id: str) -> list[dict[str, Any]]:
+    """Render and split into gateway-compliant cards when chunking is available."""
+    title = CARD_TITLE.format(date=batch_id)
+    chunker = getattr(_overlay_card_module(), "markdown_to_card_chunks", None)
+    if callable(chunker):
+        cards = chunker(markdown, title)
+        if isinstance(cards, list) and cards and all(isinstance(c, dict) for c in cards):
+            return cards
+    return [render_daily_card(markdown, batch_id)]
 
 
 def parse_report_request(body: object) -> dict[str, Any]:
@@ -467,17 +490,19 @@ def _check_daily(
         return broadcast
     assert isinstance(broadcast, dict)
     try:
-        card = render_daily_card(markdown, batch_id)
+        cards = render_daily_cards(markdown, batch_id)
     except (OSError, TypeError, ValueError, ImportError):
         return _error("report_invalid", batch_id=batch_id)
-    card_bytes = json.dumps([card], ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    if len(card_bytes) > MAX_CARD_JSON_BYTES:
+    if not cards or not all(isinstance(c, dict) for c in cards):
+        return _error("report_invalid", batch_id=batch_id)
+    cards_bytes = json.dumps(cards, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(cards_bytes) > MAX_CARD_JSON_BYTES:
         return _error("report_too_large", batch_id=batch_id)
     started = _parse_instant(bundle.get("started_at"))
     if started is None:
         return _error("clock_inconsistent", batch_id=batch_id)
     body_sha = hashlib.sha256(encoded).hexdigest()
-    content_sha = card_content_sha256([card])
+    content_sha = card_content_sha256(cards)
     rows = list(broadcast["rows"])
     identity = _identity_sha(
         body_sha,
@@ -490,7 +515,8 @@ def _check_daily(
         "ok": True,
         "markdown": markdown,
         "encoded": encoded,
-        "card": card,
+        "card": cards[0],
+        "cards": cards,
         "news_keys": news_keys,
         "rows": rows,
         "complete_through": broadcast["complete_through"],
@@ -678,6 +704,11 @@ def _save_locked(
     }
     _atomic_write(directory / "body.md", checked["encoded"])
     _atomic_write(directory / "card.json", _canonical(checked["card"]))
+    cards_list = list(checked.get("cards") or [checked["card"]])
+    if len(cards_list) > 1:
+        _atomic_write(directory / "cards.json", _canonical(cards_list))
+    elif (directory / "cards.json").exists():
+        (directory / "cards.json").unlink()
     _atomic_write(directory / "broadcast.json", _canonical(broadcast))
     _atomic_write(directory / "report.json", _canonical(report))
     loaded = _load_saved(root, batch_id, owner)
@@ -720,7 +751,20 @@ def _load_saved(root: Path, batch_id: str, owner: str) -> dict[str, Any]:
         return _error("commit_inconsistent", batch_id=batch_id)
     if not isinstance(card, dict) or not isinstance(broadcast, dict):
         return _error("commit_inconsistent", batch_id=batch_id)
-    if card_content_sha256([card]) != report["content_sha256"]:
+    cards: list[dict[str, Any]] = [card]
+    cards_path = directory / "cards.json"
+    if cards_path.exists():
+        cards_raw = _read_file(cards_path, max_bytes=MAX_CARD_JSON_BYTES)
+        if cards_raw is None:
+            return _error("commit_inconsistent", batch_id=batch_id)
+        try:
+            loaded_cards = json.loads(cards_raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            return _error("commit_inconsistent", batch_id=batch_id)
+        if not isinstance(loaded_cards, list) or not loaded_cards or not all(isinstance(c, dict) for c in loaded_cards):
+            return _error("commit_inconsistent", batch_id=batch_id)
+        cards = loaded_cards
+    if card_content_sha256(cards) != report["content_sha256"]:
         return _error("hash_mismatch", batch_id=batch_id)
     completion = _completion(directory, report)
     return {
@@ -728,6 +772,7 @@ def _load_saved(root: Path, batch_id: str, owner: str) -> dict[str, Any]:
         "report": report,
         "markdown": markdown,
         "card": card,
+        "cards": cards,
         "broadcast": broadcast,
         "body_sha256": report["body_sha256"],
         "content_sha256": report["content_sha256"],
@@ -794,6 +839,7 @@ def _public_saved(loaded: Mapping[str, Any], *, action: str) -> dict[str, Any]:
         "news_count": report["news_count"],
         "github_count": report["github_count"],
         "card": loaded["card"],
+        "cards": list(loaded.get("cards") or [loaded["card"]]),
         "reused": False,
     }
 

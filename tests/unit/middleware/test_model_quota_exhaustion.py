@@ -610,3 +610,384 @@ async def test_the_missing_item_repair_answers_on_the_fallback_while_the_primary
     calls.clear()
     assert await mw.awrap_model_call(_FakeRequest(primary, history), handler)
     assert calls == ["spare"], "the benched primary is not re-asked"
+
+
+@pytest.mark.asyncio
+async def test_quota_exhaustion_shared_via_redis_across_instances_and_recovers_after_ttl(
+    no_sleep, events, monkeypatch
+):
+    """Instance A records quota exhaustion to Redis; Instance B skips the
+    exhausted model and routes directly to fallback within TTL, recovers after
+    TTL expiry, and degrades gracefully to local behavior if Redis raises."""
+    import time
+    from unittest.mock import create_autospec
+
+    from langchain.agents.middleware.types import ModelResponse
+    from langchain_core.messages import AIMessage
+
+    from ptc_agent.agent.middleware.model_resilience import (
+        DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS,
+    )
+    from src.dalton.llm.oauth_refresh import OAuthRebuildSpec, tag_oauth_client
+    from src.utils.cache.redis_cache import RedisCacheClient
+
+    fake_now = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: fake_now[0])
+    # Prevent time.monotonic from staying cached when we advance fake_now
+    fake_mono = [500.0]
+    monkeypatch.setattr(time, "monotonic", lambda: fake_mono[0])
+
+    store: dict[str, tuple[float, dict]] = {}
+    ttl_calls: list[int | None] = []
+
+    async def _redis_get(key: str):
+        entry = store.get(key)
+        if entry is None:
+            return None
+        exp_at, payload = entry
+        if fake_now[0] >= exp_at:
+            del store[key]
+            return None
+        return payload
+
+    async def _redis_set(key: str, value, ttl: int | None = None):
+        ttl_calls.append(ttl)
+        eff_ttl = ttl if ttl is not None else DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS
+        store[key] = (fake_now[0] + eff_ttl, value)
+        return True
+
+    cache_mock = create_autospec(RedisCacheClient, instance=True)
+    cache_mock.get.side_effect = _redis_get
+    cache_mock.set.side_effect = _redis_set
+    monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: cache_mock)
+
+    primary_a = _FakeModel("gemini-4-neon-high")
+    tag_oauth_client(
+        primary_a,
+        OAuthRebuildSpec(
+            user_id="mark-xie",
+            model_name="gemini-4-neon-high",
+            provider="antigravity",
+        ),
+    )
+    primary_b = _FakeModel("gemini-4-neon-high")
+    tag_oauth_client(
+        primary_b,
+        OAuthRebuildSpec(
+            user_id="mark-xie",
+            model_name="gemini-4-neon-high",
+            provider="antigravity",
+        ),
+    )
+    fallback = _FakeModel("spare-model")
+
+    mw_a = _make_middleware(primary_a, [(fallback.model, fallback)])
+    mw_b = _make_middleware(primary_b, [(fallback.model, fallback)])
+
+    calls_a: list[str] = []
+
+    async def handler_a(req):
+        calls_a.append(req.model.model)
+        if req.model is primary_a:
+            raise _refusal(ANTIGRAVITY_LONG_RESET_429, 429)
+        return ModelResponse(result=[AIMessage("ok-a")])
+
+    res_a = await mw_a.awrap_model_call(_FakeRequest(primary_a), handler_a)
+    assert res_a.result[0].content == "ok-a"
+    assert calls_a == ["gemini-4-neon-high", "spare-model"]
+    assert "dalton:quota_exhausted:mark-xie:antigravity:gemini-4-neon-high" in store
+    # 6h49m18s == 24558s
+    assert ttl_calls[-1] == 24558
+
+    # Instance B (fresh middleware / worker) within TTL skips primary immediately
+    calls_b: list[str] = []
+
+    async def handler_b(req):
+        calls_b.append(req.model.model)
+        if req.model is primary_b:
+            raise AssertionError("Instance B should not call exhausted primary inside TTL")
+        return ModelResponse(result=[AIMessage("ok-b")])
+
+    res_b = await mw_b.awrap_model_call(_FakeRequest(primary_b), handler_b)
+    assert res_b.result[0].content == "ok-b"
+    assert calls_b == ["spare-model"]
+
+    # After TTL expires, fresh Instance C retries primary and succeeds
+    fake_now[0] += 25000.0
+    fake_mono[0] += 25000.0
+    primary_c = _FakeModel("gemini-4-neon-high")
+    tag_oauth_client(
+        primary_c,
+        OAuthRebuildSpec(
+            user_id="mark-xie",
+            model_name="gemini-4-neon-high",
+            provider="antigravity",
+        ),
+    )
+    mw_c = _make_middleware(primary_c, [(fallback.model, fallback)])
+    calls_c: list[str] = []
+
+    async def handler_c(req):
+        calls_c.append(req.model.model)
+        return ModelResponse(result=[AIMessage("recovered")])
+
+    res_c = await mw_c.awrap_model_call(_FakeRequest(primary_c), handler_c)
+    assert res_c.result[0].content == "recovered"
+    assert calls_c == ["gemini-4-neon-high"]
+
+    # Default conservative TTL used when refusal has infinity horizon (402 / unparsed)
+    store.clear()
+    await mw_a._aremember_quota_exhausted("gemini-4-neon-high", float("inf"), _grok_402(), primary_a)
+    assert ttl_calls[-1] == DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS
+
+    # Redis errors must fail open to local behavior without raising
+    broken_cache = create_autospec(RedisCacheClient, instance=True)
+    broken_cache.get.side_effect = RuntimeError("redis down")
+    broken_cache.set.side_effect = RuntimeError("redis down")
+    monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: broken_cache)
+
+    mw_err = _make_middleware(primary_b, [(fallback.model, fallback)])
+    calls_err: list[str] = []
+
+    async def handler_err(req):
+        calls_err.append(req.model.model)
+        if req.model is primary_b:
+            raise _refusal(ANTIGRAVITY_LONG_RESET_429, 429)
+        return ModelResponse(result=[AIMessage("ok-fallback")])
+
+    res_err = await mw_err.awrap_model_call(_FakeRequest(primary_b), handler_err)
+    assert res_err.result[0].content == "ok-fallback"
+    assert calls_err == ["gemini-4-neon-high", "spare-model"]
+    # Second call in same instance still uses local memory despite broken Redis
+    calls_err.clear()
+    res_err2 = await mw_err.awrap_model_call(_FakeRequest(primary_b), handler_err)
+    assert res_err2.result[0].content == "ok-fallback"
+    assert calls_err == ["spare-model"]
+
+
+@pytest.mark.asyncio
+async def test_oauth_account_switch_uses_distinct_redis_key_and_pre_dispatch_blocks_subagent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OAuth cooldown Redis key includes subscription credential identity and blocks pre-dispatch."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from typing import Any
+    from unittest.mock import create_autospec
+    from langchain_core.messages import ToolMessage
+    from ptc_agent.agent.middleware.background_subagent.middleware import (
+        BackgroundSubagentMiddleware,
+    )
+    from ptc_agent.agent.middleware.background_subagent.task_actions import (
+        handle_task_action,
+    )
+    from ptc_agent.agent.middleware.background_subagent import dispatch as bg_dispatch
+    from ptc_agent.agent.middleware.background_subagent.spawn import SpawnError
+    from ptc_agent.agent.middleware.model_resilience import (
+        check_oauth_quota_cooldown,
+        quota_redis_key,
+    )
+    from src.dalton.llm.oauth_refresh import (
+        OAuthRebuildSpec,
+        credential_identity,
+        tag_oauth_client,
+    )
+    from src.utils.cache.redis_cache import RedisCacheClient
+
+    store: dict[str, dict] = {}
+    fake_cache = create_autospec(RedisCacheClient, instance=True)
+
+    async def fake_get(k: str):
+        return store.get(k)
+
+    async def fake_set(k: str, v: dict, ttl=None):
+        store[k] = v
+
+    fake_cache.get.side_effect = fake_get
+    fake_cache.set.side_effect = fake_set
+    monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: fake_cache)
+
+    # 1. Credential identity includes account_id / updated_at without touching tokens
+    cid_a = credential_identity(account_id="acct-A")
+    cid_b = credential_identity(account_id="acct-B")
+    cid_ts1 = credential_identity(account_id="", updated_at=datetime(2026, 11, 20, 1, 0, tzinfo=timezone.utc))
+    cid_ts2 = credential_identity(account_id="", updated_at=datetime(2026, 11, 20, 2, 0, tzinfo=timezone.utc))
+    assert cid_a != cid_b
+    assert cid_ts1 != cid_ts2
+
+    client_a = _FakeModel("claude-opus-oauth")
+    client_a.metadata = {"billing_type": "oauth", "pricing_provider": "claude-oauth"}
+    tag_oauth_client(
+        client_a,
+        OAuthRebuildSpec(
+            user_id="user-1",
+            model_name="claude-opus-oauth",
+            provider="claude-oauth",
+            account_id="acct-A",
+            credential_id=cid_a,
+        ),
+    )
+
+    client_b = _FakeModel("claude-opus-oauth")
+    client_b.metadata = {"billing_type": "oauth", "pricing_provider": "claude-oauth"}
+    tag_oauth_client(
+        client_b,
+        OAuthRebuildSpec(
+            user_id="user-1",
+            model_name="claude-opus-oauth",
+            provider="claude-oauth",
+            account_id="acct-B",
+            credential_id=cid_b,
+        ),
+    )
+
+    key_a = quota_redis_key("claude-opus-oauth", client_a)
+    key_b = quota_redis_key("claude-opus-oauth", client_b)
+    assert key_a is not None and key_b is not None and key_a != key_b
+
+    # Put acct-A in cooldown; acct-B must NOT inherit acct-A's cooldown
+    await fake_set(
+        key_a,
+        {
+            "expires_at": datetime(2026, 11, 21, 8, 30, tzinfo=timezone.utc).timestamp(),
+            "message": "quota exhausted",
+            "status_code": 429,
+            "model": "claude-opus-oauth",
+        },
+        ttl=3600,
+    )
+    # Force current clock before 2026-11-21T08:30Z
+    monkeypatch.setattr(
+        "ptc_agent.agent.middleware.model_resilience.time.time",
+        lambda: datetime(2026, 11, 21, 7, 0, tzinfo=timezone.utc).timestamp(),
+    )
+
+    msg_a = await check_oauth_quota_cooldown(client_a)
+    assert msg_a is not None
+    assert "claude-opus-oauth 的订阅额度已用完" in msg_a
+    assert "2026-11-21 16:30 HKT" in msg_a
+    assert "可以换用其他模型派发，或等恢复后再派" in msg_a
+    assert await check_oauth_quota_cooldown(client_b) is None
+
+    # 2. Pre-dispatch refuses Task init without registering or spawning subagent
+    mw = BackgroundSubagentMiddleware(
+        subagent_types=frozenset({"research"}),
+        default_model_client=client_a,
+    )
+    register_calls: list[Any] = []
+    monkeypatch.setattr(mw.registry, "register", create_autospec(mw.registry.register, side_effect=lambda *a, **kw: register_calls.append(kw)))
+    handler_calls: list[Any] = []
+
+    async def fake_handler(req):
+        handler_calls.append(req)
+        return ToolMessage(content="should not run", tool_call_id="tc-1", name="Task")
+
+    request = SimpleNamespace(
+        tool_call={
+            "id": "tc-1",
+            "name": "Task",
+            "args": {
+                "action": "init",
+                "subagent_type": "research",
+                "description": "scan",
+                "prompt": "do research",
+            },
+        },
+        runtime=SimpleNamespace(config={"configurable": {"thread_id": "t-1", "user_id": "user-1"}}),
+    )
+    reply = await handle_task_action(mw, request, fake_handler)
+    assert isinstance(reply, ToolMessage)
+    assert reply.status == "error"
+    assert "claude-opus-oauth 的订阅额度已用完" in str(reply.content)
+    assert "2026-11-21 16:30 HKT" in str(reply.content)
+    assert register_calls == []
+    assert handler_calls == []
+
+    # 3. Direct dispatch (dispatch_background_subagent) also blocks before register when in cooldown
+    with pytest.raises(SpawnError, match="claude-opus-oauth 的订阅额度已用完"):
+        await bg_dispatch.dispatch_background_subagent(
+            mw,
+            {"research": object()},
+            subagent_type="research",
+            description="scan",
+            prompt="do research",
+            parent_thread_id="t-1",
+            run_id="r-1",
+            base_configurable={"user_id": "user-1"},
+        )
+    assert register_calls == []
+
+
+def test_sync_wrap_model_call_shares_redis_quota_state_across_instances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sync wrap_model_call and _next_tried read/write Redis quota state identically to async path."""
+    from unittest.mock import create_autospec
+    from langchain.agents.middleware.types import ModelResponse
+    from langchain_core.messages import AIMessage
+    from src.dalton.llm.oauth_refresh import OAuthRebuildSpec, tag_oauth_client
+    from src.utils.cache.redis_cache import RedisCacheClient
+
+    store: dict[str, dict] = {}
+    fake_cache = create_autospec(RedisCacheClient, instance=True)
+
+    async def fake_get(k: str):
+        return store.get(k)
+
+    async def fake_set(k: str, v: dict, ttl=None):
+        _ = ttl
+        store[k] = v
+        return True
+
+    fake_cache.get.side_effect = fake_get
+    fake_cache.set.side_effect = fake_set
+    monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: fake_cache)
+
+    primary = _FakeModel("primary-oauth")
+    tag_oauth_client(
+        primary,
+        OAuthRebuildSpec(
+            user_id="user-sync-1",
+            model_name="primary-oauth",
+            provider="codex-oauth",
+        ),
+    )
+    fallback = _FakeModel("fallback-m")
+
+    mw_a = _make_middleware(primary, [(fallback.model, fallback)], max_retries=1, initial_delay=0.0)
+    mw_b = _make_middleware(primary, [(fallback.model, fallback)], max_retries=1, initial_delay=0.0)
+
+    calls_a: list[str] = []
+
+    def handler_a(req):
+        calls_a.append(req.model.model)
+        if req.model.model == "primary-oauth":
+            exc = RuntimeError(
+                "Error code: 429 - {'error': {'code': 'rate_limit_exceeded', "
+                "'message': 'Subscription quota exhausted.', 'type': 'rate_limit_error'}}"
+            )
+            exc.status_code = 429  # type: ignore[attr-defined]
+            raise exc
+        return ModelResponse(result=[AIMessage("from-fallback-a")])
+
+    req_a = _FakeRequest(primary)
+    res_a = mw_a.wrap_model_call(req_a, handler_a)
+    assert res_a.result[0].content == "from-fallback-a"
+    assert calls_a == ["primary-oauth", "fallback-m"]
+    assert any("primary-oauth" in k for k in store)
+
+    # Instance B (fresh local memory) skips primary via Redis on sync wrap_model_call
+    calls_b: list[str] = []
+
+    def handler_b(req):
+        calls_b.append(req.model.model)
+        return ModelResponse(result=[AIMessage("from-fallback-b")])
+
+    res_b = mw_b.wrap_model_call(_FakeRequest(primary), handler_b)
+    assert res_b.result[0].content == "from-fallback-b"
+    assert calls_b == ["fallback-m"]
+
+    # _next_tried on a fresh instance C also skips Redis-benched candidate
+    mw_c = _make_middleware(primary, [(fallback.model, fallback)], max_retries=1, initial_delay=0.0)
+    candidates = [("other", primary), ("primary-oauth", primary), ("fallback-m", fallback)]
+    assert mw_c._next_tried(_FakeRequest(primary), candidates, 0, None) == 2

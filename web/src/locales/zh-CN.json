@@ -4559,9 +4559,15 @@
     },
     "a11y": {
       "toolCallFailed": "工具调用失败",
+      "toolCallNotExecuted": "工具调用未执行",
       "openInTab": "在 {{tab}} 中打开",
       "collapseDiff": "折叠差异",
       "expandDiff": "展开差异"
+    },
+    "discarded": {
+      "output_cap": "工具调用未执行：回复超出输出上限被截断",
+      "malformed_call": "工具调用未执行：调用格式错误",
+      "interrupted": "工具调用未执行：模型输出中断"
     },
     "directTool": {
       "approvalTitle": "是否批准此操作？",

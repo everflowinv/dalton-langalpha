@@ -172,7 +172,13 @@ export interface ToolTitleContext {
 
 /** What a title reads of a call's record: its result, and how it ended. */
 export interface ToolCallOutcome {
-  toolCallResult?: { content?: unknown; artifact?: ArtifactRecord } | null;
+  toolCallResult?: {
+    content?: unknown;
+    artifact?: ArtifactRecord;
+    status?: string;
+    discarded?: boolean;
+    discarded_reason?: string;
+  } | null;
   isFailed?: boolean;
   _liveState?: LiveState;
 }
@@ -800,4 +806,42 @@ export function stripLineNumbers(content: string | null | undefined): string | n
   return lines
     .map((line) => line.replace(lineNumPattern, ''))
     .join('\n');
+}
+
+// DALTON-HOOK(empty-turn-guard): discarded pre-finish tool calls (output_cap,
+// malformed_call, or interrupted stream) carry an explicit ``discarded: true``
+// flag alongside ``status: "error"``; only show the localized non-executed
+// notice when that explicit flag and error state hold, never on ordinary tool
+// output text, and use ``toolArtifact.a11y.toolCallNotExecuted`` for a11y/icon labels.
+const KNOWN_DISCARDED_REASONS = new Set(['output_cap', 'malformed_call', 'interrupted']);
+
+export function isDiscardedToolCall(
+  record?: Pick<ToolCallOutcome, 'isFailed' | '_liveState' | 'toolCallResult'>,
+): boolean {
+  if (!record || !isFailedCall(record)) return false;
+  const res = record.toolCallResult;
+  return Boolean(res && res.discarded === true && res.status === 'error');
+}
+
+export function getDiscardedToolCallReason(
+  record?: Pick<ToolCallOutcome, 'isFailed' | '_liveState' | 'toolCallResult'>,
+  t?: TFn,
+): string | null {
+  if (!isDiscardedToolCall(record)) return null;
+  const res = record!.toolCallResult!;
+  const reasonKey = res.discarded_reason;
+  if (t && typeof reasonKey === 'string' && KNOWN_DISCARDED_REASONS.has(reasonKey)) {
+    return t(`toolArtifact.discarded.${reasonKey}`);
+  }
+  if (typeof res.content !== 'string') return null;
+  const trimmed = res.content.trim();
+  return trimmed || null;
+}
+
+export function getFailedToolCallLabel(
+  record: Pick<ToolCallOutcome, 'isFailed' | '_liveState' | 'toolCallResult'> | undefined,
+  t: TFn,
+): string {
+  if (isDiscardedToolCall(record)) return t('toolArtifact.a11y.toolCallNotExecuted');
+  return t('toolArtifact.a11y.toolCallFailed');
 }
