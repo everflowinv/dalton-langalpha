@@ -731,7 +731,10 @@ async def schedule_dalton_automation_helper(
                     except ColleagueAccessRevokedError as exc:
                         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
-    tz = str(merged_spec.get("timezone") or merged_spec.get("timezone_name") or get_dalton_settings().autonomy.timezone)
+    # Timezone the caller actually named; ``tz`` adds the deployment default for creation.
+    # An update without one must keep the stored timezone, not reset it to the default.
+    tz_given = str(merged_spec.get("timezone") or merged_spec.get("timezone_name") or "").strip() or None
+    tz = tz_given or str(get_dalton_settings().autonomy.timezone)
     resolved_ticker = ticker or (merged_spec.get("metadata") or {}).get("ticker") or merged_spec.get("ticker")
 
     if resolved_action == "list":
@@ -1202,6 +1205,9 @@ async def schedule_dalton_automation_helper(
         if not instruction and not existing:
             return {"ok": False, "error": "新建任务必须提供 `instruction`。"}
 
+        # The timezone this run is scheduled in: the one named, else the task's stored one
+        # (an update), else the deployment default (a new task).
+        run_tz = tz_given or str((existing or {}).get("timezone") or "").strip() or tz
         next_run_raw = merged_spec.get("next_run_at") or merged_spec.get("run_at")
         next_dt: datetime | None = None
         if isinstance(next_run_raw, datetime):
@@ -1210,7 +1216,7 @@ async def schedule_dalton_automation_helper(
             next_dt = datetime.fromisoformat(next_run_raw.strip())
         if next_dt is not None and next_dt.tzinfo is None:
             try:
-                next_dt = next_dt.replace(tzinfo=ZoneInfo(tz))
+                next_dt = next_dt.replace(tzinfo=ZoneInfo(run_tz))
             except Exception:
                 next_dt = next_dt.replace(tzinfo=UTC)
 
@@ -1222,7 +1228,7 @@ async def schedule_dalton_automation_helper(
             # without one never fires. Compute it the same way the upstream API does.
             from src.server.services.automation_scheduler import AutomationScheduler
 
-            next_dt = AutomationScheduler.calculate_first_run(str(cron_for_next), tz or "UTC")
+            next_dt = AutomationScheduler.calculate_first_run(str(cron_for_next), run_tz or "UTC")
 
         description = merged_spec.get("description")
         cron_expression = merged_spec.get("cron_expression") or merged_spec.get("cron")
@@ -1305,8 +1311,8 @@ async def schedule_dalton_automation_helper(
                 patch["description"] = description
             if cron_expression is not None:
                 patch["cron_expression"] = cron_expression
-            if tz:
-                patch["timezone"] = tz
+            if tz_given:
+                patch["timezone"] = tz_given
             if trigger_config is not None:
                 patch["trigger_config"] = trigger_config
             if explicit_status == "paused":

@@ -347,6 +347,29 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
     assert res_update["action"] == "updated"
     assert len(store) == 2
 
+    # An update that names no timezone keeps the stored one instead of resetting it to the
+    # deployment default (Chief of Staff audit 2026-11-21).
+    watch = next(r for r in store if r.get("name") == "dalton-meta-watch")
+    watch["timezone"] = "America/New_York"
+    entry_no_tz = {k: v for k, v in specs[0].items() if k not in ("timezone", "timezone_name")}
+    res_keep = await schedule_dalton_automation_helper(
+        user_id="user-1",
+        workspace_id="ws-meta",
+        name="dalton-meta-watch",
+        entry={**entry_no_tz, "instruction": "only the instruction changes"},
+    )
+    assert res_keep["ok"] is True and res_keep["action"] == "updated"
+    assert watch["timezone"] == "America/New_York"
+
+    res_set = await schedule_dalton_automation_helper(
+        user_id="user-1",
+        workspace_id="ws-meta",
+        name="dalton-meta-watch",
+        entry={**entry_no_tz, "timezone": "Asia/Hong_Kong"},
+    )
+    assert res_set["ok"] is True
+    assert watch["timezone"] == "Asia/Hong_Kong"
+
 
 @pytest.mark.asyncio
 async def test_probes_detect_real_signals_and_resolve_cik():

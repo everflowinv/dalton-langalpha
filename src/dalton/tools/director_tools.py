@@ -1545,7 +1545,9 @@ def build_director_tools(
             raise ValueError("user_id is required")
         caller_ws_id = str(configurable.get("workspace_id") or "").strip() or None
         ws_id = workspace_id if workspace_id is not None else caller_ws_id
-        tz = timezone_name or get_dalton_settings().autonomy.timezone
+        # Only the caller's own timezone goes down: the helper applies the default when
+        # creating, and an update that names none keeps the task's stored timezone.
+        tz = timezone_name or None
 
         spec = {
             "action": action,
