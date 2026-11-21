@@ -102,6 +102,7 @@ def quota_redis_key(  # DALTON-HOOK(quota-exhaustion)
     if client is None:
         return None
     from src.dalton.credentials import credential_user_id
+    from src.dalton.llm.antigravity_series import quota_cooldown_target  # DALTON-HOOK(antigravity-series)
     from src.dalton.llm.oauth_refresh import oauth_rebuild_spec
 
     spec = oauth_rebuild_spec(client)
@@ -109,10 +110,12 @@ def quota_redis_key(  # DALTON-HOOK(quota-exhaustion)
     provider: str | None = None
     model_id = name
     cred_id = ""
+    is_custom = False
     if spec is not None:
         raw_user = spec.user_id or None
         provider = spec.provider or _stamped(client, "pricing_provider")
         model_id = spec.model_name or name
+        is_custom = spec.custom_entry is not None
         cred_id = (spec.credential_id or "").strip()
         if not cred_id:
             acct = (spec.account_id or "").strip()
@@ -144,7 +147,11 @@ def quota_redis_key(  # DALTON-HOOK(quota-exhaustion)
         cred_user = "platform"
     if not cred_user:
         return None
-    base = f"{_QUOTA_EXHAUSTED_REDIS_PREFIX}:{cred_user}:{provider}:{model_id}"
+    # DALTON-HOOK(antigravity-series): built-in antigravity-oauth variants share
+    # a disjoint `:series:{prefix}` namespace; other providers and custom models
+    # use `:model:{model_id}`.
+    scope_kind, target = quota_cooldown_target(provider, model_id, is_custom=is_custom)
+    base = f"{_QUOTA_EXHAUSTED_REDIS_PREFIX}:{cred_user}:{provider}:{scope_kind}:{target}"
     return f"{base}:{cred_id}" if cred_id else base
 
 
@@ -722,7 +729,10 @@ class ModelResilienceMiddleware(AgentMiddleware):
         return self.compacts_overflow and is_context_overflow(exc)
 
     def _raise_run_exhausted(  # DALTON-HOOK(quota-exhaustion)
-        self, records: list[_AttemptRecord], candidates: list[tuple[str, Any | None]]
+        self,
+        records: list[_AttemptRecord],
+        candidates: list[tuple[str, Any | None]],
+        request: ModelRequest,
     ) -> NoReturn:
         """The total-exhaustion raise, quota-aware.
 
@@ -734,15 +744,23 @@ class ModelResilienceMiddleware(AgentMiddleware):
         with the fallback attempts riding along in the trace, not the last
         fallback's failure dressed up as the primary's.
         """
+        # DALTON-HOOK(antigravity-series): resolve primary cooldown via effective
+        # candidate client (falling back to request.model when cand_client is None).
         if not records and self._quota_exhausted and candidates:
-            remembered = self._quota_exhausted.get(candidates[0][0])
+            primary_name, primary_client = candidates[0]
+            eff_primary = request.model if primary_client is None else primary_client
+            primary_scope = self._quota_scope_key(primary_name, eff_primary)
+            remembered = self._quota_exhausted.get(primary_scope)
             raise (remembered if remembered is not None
                    else next(iter(self._quota_exhausted.values())))[1]
         if records and candidates:
-            benched = self._quota_exhausted.get(candidates[0][0])
-            if benched is not None and self._quota_skipped(candidates[0][0]):
+            primary_name, primary_client = candidates[0]
+            eff_primary = request.model if primary_client is None else primary_client
+            primary_scope = self._quota_scope_key(primary_name, eff_primary)
+            benched = self._quota_exhausted.get(primary_scope)
+            if benched is not None and self._quota_skipped(primary_name, eff_primary):
                 primary = _AttemptRecord(
-                    candidates[0][0],
+                    primary_name,
                     benched[1],
                     extract_status_code(benched[1]),
                     0,
@@ -818,13 +836,13 @@ class ModelResilienceMiddleware(AgentMiddleware):
         except Exception:
             return None
 
-    def _local_quota_skipped(self, name: str) -> bool:  # DALTON-HOOK(quota-exhaustion)
-        """Whether ``name`` is still benched locally in this middleware instance."""
-        benched = self._quota_exhausted.get(name)
+    def _local_quota_skipped(self, scope_key: str) -> bool:  # DALTON-HOOK(antigravity-series)
+        """Whether ``scope_key`` is still benched locally in this middleware instance."""
+        benched = self._quota_exhausted.get(scope_key)
         return benched is not None and time.monotonic() < benched[0]
 
-    def _apply_remote_quota_state(  # DALTON-HOOK(quota-exhaustion)
-        self, name: str, data: Any
+    def _apply_remote_quota_state(  # DALTON-HOOK(antigravity-series)
+        self, scope_key: str, name: str, data: Any
     ) -> bool:
         if not isinstance(data, dict):
             return False
@@ -840,7 +858,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
         refusal = _RemoteQuotaExhaustedError(
             msg, status_code if isinstance(status_code, int) else None
         )
-        self._quota_exhausted[name] = (time.monotonic() + remaining, refusal)
+        self._quota_exhausted[scope_key] = (time.monotonic() + remaining, refusal)
         return True
 
     @staticmethod
@@ -913,11 +931,12 @@ class ModelResilienceMiddleware(AgentMiddleware):
             return
         self._run_sync_cache_call(lambda: cache.set(redis_key, payload, ttl=ttl_s))
 
-    def _quota_skipped(  # DALTON-HOOK(quota-exhaustion)
+    def _quota_skipped(  # DALTON-HOOK(antigravity-series)
         self, name: str, client: Any = None
     ) -> bool:
-        """Whether ``name`` is benched locally or in Redis advisory quota state."""
-        if self._local_quota_skipped(name):
+        """Whether ``name`` (or its cooldown scope) is benched locally or in Redis."""
+        scope_key = self._quota_scope_key(name, client)
+        if self._local_quota_skipped(scope_key):
             return True
         redis_key = self._quota_redis_key(name, client)
         if redis_key is None:
@@ -931,7 +950,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
                 error=str(err),
             )
             return False
-        return self._apply_remote_quota_state(name, data)
+        return self._apply_remote_quota_state(scope_key, name, data)
 
     def _quota_redis_key(  # DALTON-HOOK(quota-exhaustion)
         self, name: str, client: Any = None
@@ -940,11 +959,19 @@ class ModelResilienceMiddleware(AgentMiddleware):
         target = self._current_client(self.primary_client if client is None else client)
         return quota_redis_key(name, target, user_id=self.user_id)
 
-    async def _aquota_skipped(  # DALTON-HOOK(quota-exhaustion)
+    def _quota_scope_key(  # DALTON-HOOK(antigravity-series)
+        self, name: str, client: Any = None
+    ) -> str:
+        """Unified local/Redis cooldown scope key; falls back to ``local:model:<name>``."""
+        redis_key = self._quota_redis_key(name, client)
+        return redis_key if redis_key is not None else f"local:model:{name}"
+
+    async def _aquota_skipped(  # DALTON-HOOK(antigravity-series)
         self, name: str, client: Any = None
     ) -> bool:
         """Check both local memory and Redis advisory quota state (fails open to local)."""
-        if self._local_quota_skipped(name):
+        scope_key = self._quota_scope_key(name, client)
+        if self._local_quota_skipped(scope_key):
             return True
         redis_key = self._quota_redis_key(name, client)
         if redis_key is None:
@@ -960,25 +987,26 @@ class ModelResilienceMiddleware(AgentMiddleware):
                 error=str(err),
             )
             return False
-        return self._apply_remote_quota_state(name, data)
+        return self._apply_remote_quota_state(scope_key, name, data)
 
-    def _remember_quota_exhausted_local(  # DALTON-HOOK(quota-exhaustion)
-        self, name: str, horizon: float, exc: Exception
+    def _remember_quota_exhausted_local(  # DALTON-HOOK(antigravity-series)
+        self, scope_key: str, horizon: float, exc: Exception
     ) -> None:
-        """Benches ``name`` until its horizon passes. A fresh refusal writes
+        """Benches ``scope_key`` until its horizon passes. A fresh refusal writes
         a fresh deadline whenever the last bench has lapsed — an expired
         entry must never stand between the run and a re-armed bench — while a
         bench still live keeps its earliest refill."""
-        benched = self._quota_exhausted.get(name)
+        benched = self._quota_exhausted.get(scope_key)
         if benched is not None and time.monotonic() < benched[0]:
             return
-        self._quota_exhausted[name] = (time.monotonic() + horizon, exc)
+        self._quota_exhausted[scope_key] = (time.monotonic() + horizon, exc)
 
-    def _remember_quota_exhausted(  # DALTON-HOOK(quota-exhaustion)
+    def _remember_quota_exhausted(  # DALTON-HOOK(antigravity-series)
         self, name: str, horizon: float, exc: Exception, client: Any = None
     ) -> None:
         """Record exhaustion locally and coordinate across workers via Redis (sync)."""
-        self._remember_quota_exhausted_local(name, horizon, exc)
+        scope_key = self._quota_scope_key(name, client)
+        self._remember_quota_exhausted_local(scope_key, horizon, exc)
         redis_key = self._quota_redis_key(name, client)
         if redis_key is None:
             return
@@ -992,11 +1020,12 @@ class ModelResilienceMiddleware(AgentMiddleware):
                 error=str(err),
             )
 
-    async def _aremember_quota_exhausted(  # DALTON-HOOK(quota-exhaustion)
+    async def _aremember_quota_exhausted(  # DALTON-HOOK(antigravity-series)
         self, name: str, horizon: float, exc: Exception, client: Any = None
     ) -> None:
         """Record exhaustion locally and coordinate across workers via Redis."""
-        self._remember_quota_exhausted_local(name, horizon, exc)
+        scope_key = self._quota_scope_key(name, client)
+        self._remember_quota_exhausted_local(scope_key, horizon, exc)
         redis_key = self._quota_redis_key(name, client)
         if redis_key is None:
             return
@@ -1069,7 +1098,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
             record, to_model, to_client, request, from_is_primary=from_is_primary
         )
 
-    def _notify_bench_switch(  # DALTON-HOOK(quota-exhaustion)
+    def _notify_bench_switch(  # DALTON-HOOK(antigravity-series)
         self,
         request: ModelRequest,
         candidates: list[tuple[str, Any | None]],
@@ -1082,12 +1111,16 @@ class ModelResilienceMiddleware(AgentMiddleware):
         subagent's notice neither satisfies nor suppresses the main
         agent's."""
         benched_name: str | None = None
-        for name, _ in candidates[:index]:
-            if self._quota_skipped(name):
+        benched_eff_client: Any = None
+        for name, cand_client in candidates[:index]:
+            eff_client = request.model if cand_client is None else cand_client
+            if self._quota_skipped(name, eff_client):
                 benched_name = name
+                benched_eff_client = eff_client
         if benched_name is None:
             return
-        remembered = self._quota_exhausted.get(benched_name)
+        benched_scope = self._quota_scope_key(benched_name, benched_eff_client)
+        remembered = self._quota_exhausted.get(benched_scope)
         if remembered is None:
             return
         to_name, to_client = candidates[index]
@@ -1369,7 +1402,8 @@ class ModelResilienceMiddleware(AgentMiddleware):
             self._raise_overflow(records, overflow)
         # DALTON-HOOK(quota-exhaustion): the quota-aware total-exhaustion
         # raise — see ``_raise_run_exhausted``.
-        return self._raise_run_exhausted(records, candidates)
+        # DALTON-HOOK(antigravity-series): forward request so primary scope uses request.model.
+        return self._raise_run_exhausted(records, candidates, request)
 
     async def awrap_model_call(
         self,
@@ -1477,4 +1511,5 @@ class ModelResilienceMiddleware(AgentMiddleware):
             self._raise_overflow(records, overflow)
         # DALTON-HOOK(quota-exhaustion): the quota-aware total-exhaustion
         # raise — see ``_raise_run_exhausted``.
-        return self._raise_run_exhausted(records, candidates)
+        # DALTON-HOOK(antigravity-series): forward request so primary scope uses request.model.
+        return self._raise_run_exhausted(records, candidates, request)

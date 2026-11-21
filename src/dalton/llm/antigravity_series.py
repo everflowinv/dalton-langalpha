@@ -10,7 +10,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 ANTIGRAVITY_PROVIDER = "antigravity-oauth"
 
@@ -238,3 +238,43 @@ def build_antigravity_series_catalog(
         )
         result.append(entry.to_dict())
     return result
+
+
+def quota_cooldown_target(
+    provider: str,
+    model_name: str,
+    *,
+    is_custom: bool = False,
+    model_config: Any = None,
+) -> tuple[Literal["series", "model"], str]:
+    """Return ``("series", series_prefix)`` for built-in Antigravity models, else ``("model", model_name)``.
+
+    Built-in ``antigravity-oauth`` models share one upstream quota pool across
+    reasoning-effort variants of the same series. All other providers and
+    user-defined custom models (including custom entries that shadow a built-in
+    model name) remain scoped to the individual model.
+    """
+    if provider != ANTIGRAVITY_PROVIDER or is_custom or not model_name:
+        return ("model", model_name)
+
+    parsed = parse_antigravity_series(model_name)
+    if parsed is None:
+        return ("model", model_name)
+
+    llm_cfg = _extract_llm_config(model_config)
+    if llm_cfg is None:
+        try:
+            from src.llms.llm import LLM
+
+            llm_cfg = _extract_llm_config(LLM.get_model_config())
+        except Exception:
+            llm_cfg = None
+    if llm_cfg is None:
+        return ("model", model_name)
+
+    entry = llm_cfg.get(model_name)
+    if not isinstance(entry, Mapping) or entry.get("provider") != ANTIGRAVITY_PROVIDER:
+        return ("model", model_name)
+
+    series_prefix, _effort = parsed
+    return ("series", series_prefix)
