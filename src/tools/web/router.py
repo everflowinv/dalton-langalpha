@@ -49,7 +49,8 @@ from src.observability.langsmith_run import (
     TOOL_PROVIDER,
     record_child_run,
 )
-from src.tools.web.breaker import CircuitBreaker
+# DALTON-HOOK(firecrawl-budget): multi-key failover
+from src.tools.web.breaker import CircuitBreaker, CircuitState
 from src.tools.decorators import get_tool_tracker
 from src.tools.web.manifest import (
     CAPABILITY_FETCH,
@@ -396,11 +397,57 @@ class FetchRouter:
                 logger.debug("fetch: skipping %s (no API key)", entry.adapter.name)
                 continue
             await entry.breaker.check_state()
+            # DALTON-HOOK(firecrawl-budget): in multi-key mode, fast-fail only when all
+            # configured Firecrawl keys are in cooldown, and clear stale budget notice
+            # + breaker state once any key recovers.
+            from src.dalton.settings import is_dalton_enabled
+
+            firecrawl_all_cooled = False
+            firecrawl_resets_at: Optional[str] = None
+            if is_dalton_enabled() and entry.adapter.name == "firecrawl":
+                from src.tools.web.providers.firecrawl import (
+                    get_firecrawl_pool_cooldown_state,
+                    load_firecrawl_api_keys,
+                )
+
+                firecrawl_all_cooled, firecrawl_resets_at = await get_firecrawl_pool_cooldown_state()
+                if (
+                    not firecrawl_all_cooled
+                    and entry.adapter.name in self._budget_errors
+                    and len(load_firecrawl_api_keys()) > 1
+                ):
+                    self._budget_errors.pop(entry.adapter.name, None)
+                    if entry.breaker.state is not CircuitState.CLOSED:
+                        await entry.breaker.reset()
+
+            if firecrawl_all_cooled:
+                if firecrawl_resets_at:
+                    budget_msg = f"Firecrawl 本月额度已用完，将于 {firecrawl_resets_at} 重置，请改用浏览器抓取"
+                else:
+                    budget_msg = "Firecrawl 本月额度已用完，当前全部 Key 冷却中，请改用浏览器抓取"
+                budget_err = WebError(
+                    type=WebErrorType.BUDGET_EXCEEDED,
+                    message=budget_msg,
+                    http_status=402,
+                    retryable=True,
+                    provider_fault=True,
+                    native_kind="insufficient_credits",
+                )
+                self._budget_errors[entry.adapter.name] = budget_err
+                skipped_budget_error = budget_err
+                skipped_budget_urls.update(urls_now)
+                _trace_attempt(
+                    entry.adapter.name,
+                    urls_now,
+                    WebErrorType.BUDGET_EXCEEDED.value,
+                    error=budget_err.message,
+                    error_class=WebErrorType.BUDGET_EXCEEDED.value,
+                )
+                continue
+
             if entry.breaker.is_open():
                 logger.debug("fetch: skipping %s (breaker open)", entry.adapter.name)
                 # DALTON-HOOK(firecrawl-budget): preserve 402 reset notice for URLs skipped by Firecrawl's open breaker.
-                from src.dalton.settings import is_dalton_enabled
-
                 if is_dalton_enabled() and entry.adapter.name in self._budget_errors:
                     skipped_budget_error = self._budget_errors[entry.adapter.name]
                     skipped_budget_urls.update(urls_now)
@@ -473,7 +520,26 @@ class FetchRouter:
                             budget_402s[0] if budget_402s else None,
                         )
                         if exhausted_err is not None:
-                            self._budget_errors[entry.adapter.name] = exhausted_err
+                            from src.tools.web.providers.firecrawl import (
+                                get_firecrawl_pool_cooldown_state,
+                                load_firecrawl_api_keys,
+                            )
+
+                            if len(load_firecrawl_api_keys()) > 1:
+                                all_cooled_now, earliest_resets_at = await get_firecrawl_pool_cooldown_state()
+                                if all_cooled_now:
+                                    if earliest_resets_at:
+                                        exhausted_err = WebError(
+                                            type=WebErrorType.BUDGET_EXCEEDED,
+                                            message=f"Firecrawl 本月额度已用完，将于 {earliest_resets_at} 重置，请改用浏览器抓取",
+                                            http_status=402,
+                                            retryable=True,
+                                            provider_fault=True,
+                                            native_kind="insufficient_credits",
+                                        )
+                                    self._budget_errors[entry.adapter.name] = exhausted_err
+                            else:
+                                self._budget_errors[entry.adapter.name] = exhausted_err
                     await entry.breaker.record_failure(reason=provider_failure)
             _trace_attempt(
                 entry.adapter.name,

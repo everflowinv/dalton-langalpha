@@ -425,7 +425,8 @@ ALLOWED_HOOKS=(
   # fallback model knows which model this call runs on and which designated model
   # in the frozen <model> baseline it stands in for (main agent and subagent).
   "model-fallback-identity"
-  # Firecrawl budget: skip stealth re-escalation after auto and keep 402 credit-exhaustion notice.
+  # Firecrawl budget: skip stealth re-escalation after auto, keep 402 credit-exhaustion notice,
+  # and support multi-key primary/backup failover with Redis cooldown tracking.
   "firecrawl-budget"
   "chat-attachment-count"
   # Coverage units phase 1 (d041): soft-delete mutex against active unit bind.
