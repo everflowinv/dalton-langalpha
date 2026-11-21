@@ -6,11 +6,13 @@ import {
   DALTON_DEFAULT_MODEL,
   DALTON_SETUP_CANDIDATES,
   filterDaltonCuratedModels,
+  hasAvailableDaltonModels,
   resolveDaltonSeriesDefaultModel,
   resolveDaltonSetupCandidates,
 } from '@/config/daltonSetup';
 import { buildSeriesCatalog } from '@/lib/antigravitySeries';
 import { defaultChoices } from '../defaultChoices';
+import { DALTON_CURATED_PROVIDERS } from '../setupSteps';
 
 describe('daltonSetup candidate list & background defaults', () => {
   it('uses neon-high as default and hydrogen-low as recommended background', () => {
@@ -185,5 +187,62 @@ describe('daltonSetup candidate list & background defaults', () => {
       background: 'gemini-4-hydrogen-low-oauth',
       backgroundWhy: 'daltonRecommended',
     });
+  });
+
+  it('never falls back to uncurated models when none of the 5 fixed candidates is available', () => {
+    const nonCuratedGroups = {
+      openai: { display_name: 'OpenAI', models: ['gpt-5', 'gpt-5-mini'] },
+      'antigravity-oauth': { display_name: 'Antigravity', models: ['gemini-4-hydrogen-low-oauth'] },
+    };
+    const meta = {
+      'gpt-5': { provider: 'openai', intelligence: 5, speed: 3 },
+      'gpt-5-mini': { provider: 'openai', intelligence: 3, speed: 5 },
+      'gemini-4-hydrogen-low-oauth': { provider: 'antigravity-oauth', intelligence: 4, speed: 5 },
+    };
+    const payers = {
+      'gpt-5': 'own_key' as const,
+      'gpt-5-mini': 'own_key' as const,
+      'gemini-4-hydrogen-low-oauth': 'subscription:antigravity-oauth' as const,
+    };
+
+    expect(filterDaltonCuratedModels(nonCuratedGroups, true)).toEqual({});
+    expect(hasAvailableDaltonModels(nonCuratedGroups, meta, payers, true)).toBe(false);
+    expect(hasAvailableDaltonModels(nonCuratedGroups, meta, payers, false)).toBe(true);
+
+    const choices = defaultChoices({
+      models: 'langalpha_models',
+      offered: nonCuratedGroups,
+      slotModels: ['gpt-5', 'gpt-5-mini', 'gemini-4-hydrogen-low-oauth'],
+      payers,
+      ownProviders: ['openai'],
+      metadata: meta,
+      customModels: [],
+      connectionOf: (p) => p,
+      systemDefault: 'gpt-5',
+      systemBackground: 'gemini-4-hydrogen-low-oauth',
+      preferred: 'gpt-5',
+      dalton: true,
+    });
+    expect(choices).toEqual({
+      list: [],
+      initial: null,
+      recommended: {
+        primary: null,
+        primaryWhy: null,
+        background: null,
+        backgroundWhy: null,
+      },
+    });
+  });
+
+  it('restricts Dalton curated providers to subscriptions that can supply the 5 fixed candidates', () => {
+    expect([...DALTON_CURATED_PROVIDERS].sort()).toEqual([
+      'antigravity-oauth',
+      'claude-oauth',
+      'codex-oauth',
+    ]);
+    expect(DALTON_CURATED_PROVIDERS.has('openai')).toBe(false);
+    expect(DALTON_CURATED_PROVIDERS.has('xai-oauth')).toBe(false);
+    expect(DALTON_CURATED_PROVIDERS.has('muse-oauth')).toBe(false);
   });
 });

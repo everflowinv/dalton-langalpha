@@ -10,7 +10,7 @@ import { Group } from '@/components/modelAccess/parts';
 import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(dalton-setup): Dalton build & unified team-model availability check
 import { isDaltonBuild } from '@/config/brand';
-import { effectiveModelsAnswer } from '../answers/setupSteps';
+import { DALTON_CURATED_PROVIDERS, effectiveModelsAnswer } from '../answers/setupSteps';
 import { useDaltonTeamModels } from '../answers/useTeamModels';
 import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
 import { useAccount, useRule } from '@/hooks/useAccount';
@@ -289,18 +289,20 @@ function SubscriptionStep({ flow, teamModelsAvailable }: { flow: Flow; teamModel
       {/* DALTON-HOOK(dalton-setup): normalize legacy answer chips in AnswersStrip */}
       {flow.first && flow.answers && <AnswersStrip answers={flow.answers} teamModelsAvailable={teamModelsAvailable} />}
       <WizardStepHeader titleId={headingId} title={t('setup.answers.model.subTitle')} helper={t('setup.answers.model.subLead')} />
-      {/* The legacy Claude sign-in is left to Settings: Claude Code is an answer of its own. */}
+      {/* DALTON-HOOK(dalton-setup): in Dalton, offer only subscriptions that can supply the 5 curated candidates and gate Continue on them */}
+      {/* The legacy Claude sign-in is left to Settings: Claude Code is an answer of its own (in Dalton, Claude Code is hidden so Claude OAuth is offered). */}
       <SubscriptionChoices
-        planGroups={ownKeys ? planGroups : []}
+        planGroups={!isDaltonBuild && ownKeys ? planGroups : []}
         configured={configured}
-        claudeSignIn={false}
+        claudeSignIn={isDaltonBuild}
+        allowedSignIns={isDaltonBuild ? DALTON_CURATED_PROVIDERS : undefined}
         signIns={allows(policy, RULE.ownSubscriptions)}
         onPickSignIn={(provider) => goOn({
           method: 'oauth', list: 'oauth', provider, displayName: t(`modelAccess.${subscriptionKey(provider)}.name`), modelsFrom: provider,
         })}
         onPickPlan={pickKeyGroup('oauth')}
       />
-      {ownKeys && (
+      {!isDaltonBuild && ownKeys && (
         <button
           type="button"
           data-testid="setup-sub-api-key"
@@ -313,12 +315,17 @@ function SubscriptionStep({ flow, teamModelsAvailable }: { flow: Flow; teamModel
       <OwnAccessNote variant="setup" />
       {defaultFailed && <StepError quiet>{t('setup.answers.model.saveDefaultFailed')}</StepError>}
       {flow.finishFailed && <StepError>{t('setup.answers.saveFailed')}</StepError>}
+      {/* DALTON-HOOK(dalton-setup): in Dalton, require a curated-candidate subscription before advancing to /setup/default */}
       <SetupFooter
         back={flow.back ? { label: t('setup.back'), onClick: flow.back } : null}
         primary={{
           label: t('setup.continue'),
           onClick: () => void flow.finish(),
-          disabled: !flow.facts?.providerConnected || flow.finishing || defaults.saving || !!justConnected,
+          disabled: !flow.facts?.providerConnected
+            || (isDaltonBuild && ![...configured].some((p) => DALTON_CURATED_PROVIDERS.has(p)))
+            || flow.finishing
+            || defaults.saving
+            || !!justConnected,
           busy: flow.finishing || defaults.saving || !!justConnected,
         }}
       />

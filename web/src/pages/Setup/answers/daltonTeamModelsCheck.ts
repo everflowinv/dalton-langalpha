@@ -31,6 +31,20 @@ import type { PlatformModelsResponse } from '@/types/platform';
 const MODELS_STALE_MS = 5 * 60_000;
 const PROVIDER_MODELS_STALE_MS = 10 * 60_000;
 
+interface RefreshTracker {
+  gen: number;
+  providers: Set<string>;
+  inFlight: Map<string, symbol>;
+}
+
+const retryGenerationByClient = new WeakMap<QueryClient, number>();
+const refreshedProvidersByClient = new WeakMap<QueryClient, RefreshTracker>();
+
+/** Mark an explicit user retry so the next shared availability check refreshes server-cached provider lists. */
+export function bumpDaltonTeamModelsRetry(queryClient: QueryClient): void {
+  retryGenerationByClient.set(queryClient, (retryGenerationByClient.get(queryClient) ?? 0) + 1);
+}
+
 /**
  * Fallback reasons from `/api/v1/providers/{p}/available-models` where the
  * provider explicitly rejected the credential (401/403, revoked OAuth, or a
@@ -93,6 +107,8 @@ export interface CheckDaltonTeamModelsParams {
   byokEnabled: boolean;
   providersUnread: boolean;
   policy: AccountPolicy | null;
+  /** Non-zero generation bumped on explicit Retry to bypass server-cached provider lists with `?refresh=1`. */
+  retryGeneration?: number;
 }
 
 export interface DaltonTeamModelsCheckResult {
@@ -115,6 +131,7 @@ export async function checkDaltonTeamModelsAvailable({
   byokEnabled: byokSwitch,
   providersUnread,
   policy,
+  retryGeneration = retryGenerationByClient.get(queryClient) ?? 0,
 }: CheckDaltonTeamModelsParams): Promise<DaltonTeamModelsCheckResult> {
   if (providersUnread) {
     throw new Error('Configured providers could not be read');
@@ -186,15 +203,51 @@ export async function checkDaltonTeamModelsAvailable({
     .filter((p) => (p.access_type === 'oauth' ? ownSignIns && p.state === 'connected' : !isPlatformMode || byokEnabled))
     .map((p) => p.provider);
 
+  let refreshed = refreshedProvidersByClient.get(queryClient);
+  if (retryGeneration > 0 && (!refreshed || refreshed.gen !== retryGeneration)) {
+    refreshed = { gen: retryGeneration, providers: new Set<string>(), inFlight: new Map<string, symbol>() };
+    refreshedProvidersByClient.set(queryClient, refreshed);
+  }
+
   const settled = await Promise.allSettled(
-    listedProviders.map((provider) =>
-      queryClient.fetchQuery<AvailableModels>({
-        queryKey: queryKeys.providerModels.available(provider, ''),
-        queryFn: ({ signal }) => getProviderAvailableModels(provider, { signal }),
-        staleTime: PROVIDER_MODELS_STALE_MS,
-        retry: false,
-      }),
-    ),
+    listedProviders.map(async (provider) => {
+      const shouldRefresh = retryGeneration > 0 && !refreshed?.providers.has(provider);
+      const whole = queryKeys.providerModels.available(provider, '');
+      const tracker = shouldRefresh ? refreshed : undefined;
+      let forcedToken: symbol | null = null;
+      if (shouldRefresh && tracker && !tracker.inFlight.has(provider)) {
+        await queryClient.cancelQueries({ queryKey: whole, exact: true });
+        forcedToken = Symbol(provider);
+        tracker.inFlight.set(provider, forcedToken);
+      }
+      let forcedRan = false;
+      try {
+        const data = await queryClient.fetchQuery<AvailableModels>({
+          queryKey: whole,
+          queryFn: ({ signal }) => {
+            if (shouldRefresh) forcedRan = true;
+            return getProviderAvailableModels(provider, {
+              ...(shouldRefresh ? { refresh: true } : {}),
+              signal,
+            });
+          },
+          staleTime: shouldRefresh ? 0 : PROVIDER_MODELS_STALE_MS,
+          retry: false,
+        });
+        if (shouldRefresh && forcedRan && refreshedProvidersByClient.get(queryClient) === tracker) {
+          tracker?.providers.add(provider);
+          queryClient.removeQueries({
+            queryKey: queryKeys.providerModels.availableFor(provider),
+            predicate: (q) => q.queryKey.at(-1) !== whole.at(-1),
+          });
+        }
+        return data;
+      } finally {
+        if (forcedToken && tracker?.inFlight.get(provider) === forcedToken) {
+          tracker.inFlight.delete(provider);
+        }
+      }
+    }),
   );
 
   const outcomes: ProviderAvailabilityOutcome[] = settled.map((entry) =>

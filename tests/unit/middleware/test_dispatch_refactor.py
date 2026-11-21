@@ -658,7 +658,8 @@ async def test_dispatch_background_subagent_blocks_oauth_cooldown_before_registe
     fake_cache = create_autospec(RedisCacheClient, instance=True)
 
     async def fake_get(key: str):
-        if key == "dalton:quota_exhausted:user-quota:antigravity:gemini-4-neon-high:cred_sub_1":
+        # DALTON-HOOK(antigravity-series): single-model cooldown keys carry `:model:` namespace.
+        if key == "dalton:quota_exhausted:user-quota:antigravity:model:gemini-4-neon-high:cred_sub_1":
             return {"expires_at": 1_900_000_000.0, "model": "gemini-4-neon-high"}
         return None
 

@@ -119,6 +119,13 @@ def read_refusal(exc: BaseException) -> ProviderRefusal | None:
         # A Claude Code turn its plan stopped, with no window known.
         if isinstance(current, ClaudeTurnFailed) and current.kind == "plan_exhausted":
             return ProviderRefusal("plan_limit")
+        # DALTON-HOOK(antigravity-series): honor a structured ProviderRefusal attached
+        # to a cooldown refusal exception so skipped-on-bench 429s surface as
+        # subscription plan_limit (with reset time and provider tier/window) instead
+        # of falling through to generic 429 rate_limited.
+        attached = getattr(current, "provider_refusal", None)
+        if isinstance(attached, ProviderRefusal):
+            return attached
         error = _error_body(current)
         headers = _headers(current)
         if (refusal := _subscription_limit(error, headers)) is not None:

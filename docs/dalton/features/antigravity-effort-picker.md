@@ -264,7 +264,10 @@ FALLBACK_SERIES_DEFAULT_EFFORT = "medium"
 
 ---
 
-## 4. 额度冷却按系列合并
+## 4. 额度冷却按厂商合并（原"按系列"）
+
+> **用户决定（2026-11-21，取代本节下文的"按系列"）**：同一 Antigravity 账号下，同一上游厂商的内置模型共用一个额度池——Gemini 系列（Neon / Hydrogen / Argon / Carbon）任一模型额度耗尽，该账号下全部 Gemini 模型一起冷却；经 Antigravity 的 Claude（Opus / Sonnet）彼此共用、与 Gemini 独立；GPT-OSS 单独。冷却键为 `dalton:quota_exhausted:{cred_user}:antigravity-oauth:vendor:{vendor}`（有 `cred_id` 时追加 `:{cred_id}`），`vendor` 由 `src/dalton/llm/antigravity_series.py` 的 `quota_cooldown_target` 按模型 ID 前缀确定；自定义同名模型与其他提供商仍用 `:model:` 单模型键。订阅调用不自动换模型（上游 `_on_its_payer` 对 OAuth 返回空备用列表）不变：冷却合并的作用是同厂商其他模型直接返回"订阅额度耗尽"卡片（带重置时间），不再发出必然失败的请求。不做旧格式键的过渡读取。
+
 
 ### 4.1 现状问题
 
@@ -277,7 +280,7 @@ Antigravity 返回 HTTP 429 `"individual quota reached"` 时，`antigravity_quot
      - 当 `provider == "antigravity-oauth"` 且 `not is_custom`（`OAuthRebuildSpec.custom_entry is None`）且 `model_name` 命中系统内置 `antigravity-oauth` 条目时，返回 `("series", series_prefix)`（如 `("series", "gemini-4-neon")`、`("series", "claude-opus-5-5")`）；
      - 其余所有提供商模型或用户自定义模型返回 `("model", model_name)`。
    - 修改 `quota_redis_key`（`src/ptc_agent/agent/middleware/model_resilience.py:95-149`），在键中显式加入 `series:` / `model:` 类型段（模型名不含 `:`，两个命名空间在语法上不可能碰撞）：
-     - Antigravity 内置系列：`dalton:quota_exhausted:{cred_user}:antigravity-oauth:series:{series_prefix}`（有 `cred_id` 时追加 `:{cred_id}`）；
+     - Antigravity 内置模型（已改为厂商级，见本节开头的用户决定）：`dalton:quota_exhausted:{cred_user}:antigravity-oauth:vendor:{vendor}`（有 `cred_id` 时追加 `:{cred_id}`）；
      - 单模型：`dalton:quota_exhausted:{cred_user}:{provider}:model:{model_id}`（有 `cred_id` 时追加 `:{cred_id}`）。
    - `src/dalton/llm/oauth_refresh.py:20-41,124-148` 的 `OAuthRebuildSpec.model_name` 保持原始带后缀模型 ID 不变，401 刷新令牌重建仍 100% 还原原档位客户端。
 2. **补齐全部本地读写与候选客户端透传（含错误汇总与切模型通知）**：

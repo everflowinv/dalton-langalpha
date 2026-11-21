@@ -72,10 +72,12 @@ function ModelTriggerBody({ selectedModel, displayName, metadata, floor = false,
   );
 }
 
-function EffortTriggerBody({ effortLabel, fast, accent }: {
+// DALTON-HOOK(antigravity-series): support read-only effort trigger display without chevron
+function EffortTriggerBody({ effortLabel, fast, accent, readOnly = false }: {
   effortLabel: ReactNode;
   fast: boolean;
   accent?: boolean;
+  readOnly?: boolean;
 }) {
   return (
     <>
@@ -83,7 +85,7 @@ function EffortTriggerBody({ effortLabel, fast, accent }: {
       {fast && (
         <Rocket className="h-3 w-3 flex-none" style={accent ? { color: 'var(--color-accent-light)' } : undefined} />
       )}
-      <ChevronDown className="h-3 w-3 flex-none" />
+      {!readOnly && <ChevronDown className="h-3 w-3 flex-none" />}
     </>
   );
 }
@@ -95,10 +97,10 @@ function EffortTriggerBody({ effortLabel, fast, accent }: {
  *  rocket a Codex model can show, so a pick never moves the fold under the
  *  menu it was made in. It holds the level shown now too, which a Codex
  *  model with no levels to pick can still name. */
-// DALTON-HOOK(antigravity-series): carry displayName into ModelTriggerMeasure
+// DALTON-HOOK(antigravity-series): carry displayName & readOnly into ModelTriggerMeasure
 export function ModelTriggerMeasure(props:
   | { pill: 'model'; selectedModel: string | null; displayName?: string; metadata?: ModelMetadata; floor?: boolean }
-  | { pill: 'effort'; effortLabel: string | null; reasoningEfforts: readonly string[]; isCodexModel: boolean }) {
+  | { pill: 'effort'; effortLabel: string | null; reasoningEfforts: readonly string[]; isCodexModel: boolean; readOnly?: boolean }) {
   const { t } = useTranslation();
   const labels = props.pill === 'effort'
     ? [...new Set([
@@ -121,6 +123,8 @@ export function ModelTriggerMeasure(props:
               </span>
             )}
             fast={props.isCodexModel}
+            // DALTON-HOOK(antigravity-series): omit chevron in measure twin for read-only stored effort
+            readOnly={props.readOnly}
           />
         )}
     </button>
@@ -290,8 +294,9 @@ export interface EffortMenuProps {
    *  at the default level. */
   taskCost?: Record<string, TaskCost>;
   disabled?: boolean;
-  // DALTON-HOOK(antigravity-series): pass the selected effort level verbatim instead of null for defaultEffort
+  // DALTON-HOOK(antigravity-series): pass the selected effort level verbatim instead of null for defaultEffort, or render read-only when no selectable tiers remain
   exactEffort?: boolean;
+  readOnlyEffort?: boolean;
 }
 
 /**
@@ -303,7 +308,28 @@ export interface EffortMenuProps {
  * setting, not a send.
  */
 export function ChatInputEffortMenu(props: EffortMenuProps) {
-  if (!hasTuningMenu(props.reasoningEfforts, props.isCodexModel)) return null;
+  const { t } = useTranslation();
+  if (!hasTuningMenu(props.reasoningEfforts, props.isCodexModel)) {
+    if (props.readOnlyEffort && props.effortLabel) {
+      return (
+        <span
+          data-pill="effort"
+          data-readonly="true"
+          title={t('chat.modelSelector.reasoningEffort')}
+          aria-label={`${t('chat.modelSelector.reasoningEffort')}: ${props.effortLabel}`}
+          className={cn(
+            'model-selector-trigger',
+            TRIGGER_CLASS,
+            PILL_FLEX.effort,
+            'cursor-default opacity-70 pointer-events-none select-none',
+          )}
+        >
+          <EffortTriggerBody effortLabel={props.effortLabel} fast={false} readOnly />
+        </span>
+      );
+    }
+    return null;
+  }
   return <EffortMenu {...props} />;
 }
 
@@ -566,11 +592,27 @@ function EffortOverflowRows({ rows, title, noteId, reasoningEffort, fastMode, on
 }
 
 /** The effort pill folded into ⋯, as a submenu there. */
+// DALTON-HOOK(antigravity-series): render read-only effort row in overflow menu when no selectable levels exist
 export function EffortSubmenu(props: EffortMenuProps) {
-  const { effortLabel, fastMode, isCodexModel, disabled = false } = props;
+  const { effortLabel, fastMode, isCodexModel, disabled = false, readOnlyEffort = false } = props;
   const { t } = useTranslation();
   const noteId = useId();
   const rows = effortRows(props, t);
+
+  if (readOnlyEffort && effortLabel && !hasTuningMenu(props.reasoningEfforts, isCodexModel)) {
+    return (
+      <div
+        role="group"
+        aria-label={`${t('chat.modelSelector.reasoningEffort')}: ${effortLabel}`}
+        data-readonly="true"
+        className="flex items-center gap-2 px-2 py-1.5 text-[0.8125rem] text-(--color-text-tertiary) select-none"
+      >
+        <Gauge className="h-4 w-4 flex-none" />
+        <span>{t('chat.modelSelector.reasoningEffort')}</span>
+        <span className="ml-auto">{effortLabel}</span>
+      </div>
+    );
+  }
 
   return (
     <DropdownMenuSub>
@@ -606,11 +648,27 @@ export function EffortSubmenu(props: EffortMenuProps) {
  * The effort pill folded into ⋯ on a phone, its levels and speeds listed in
  * ⋯ itself: a phone has no room beside ⋯ for a submenu to open into.
  */
+// DALTON-HOOK(antigravity-series): render read-only effort row on phone overflow menu when no selectable levels exist
 export function EffortMenuSection(props: EffortMenuProps) {
   const { t } = useTranslation();
   const noteId = useId();
   const rows = effortRows(props, t);
   const title = t('chat.modelSelector.reasoningEffort');
+
+  if (props.readOnlyEffort && props.effortLabel && !hasTuningMenu(props.reasoningEfforts, props.isCodexModel)) {
+    return (
+      <div
+        role="group"
+        aria-label={`${title}: ${props.effortLabel}`}
+        data-readonly="true"
+        className="flex items-center gap-2 px-2 py-1.5 text-[0.8125rem] text-(--color-text-tertiary) select-none"
+      >
+        <Gauge className="h-4 w-4 flex-none" />
+        <span>{title}</span>
+        <span className="ml-auto">{props.effortLabel}</span>
+      </div>
+    );
+  }
 
   return (
     <div

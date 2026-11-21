@@ -1129,12 +1129,16 @@ function ChatInput({
     draftRef: textareaRef,
   });
   // The effort pill sits beside the model pill and folds last (`slot: 'right'`).
-  // DALTON-HOOK(antigravity-series): Antigravity series offers effort switching only when > 1 effort exists
+  // DALTON-HOOK(antigravity-series): multi-effort Antigravity series offers effort switching when > 1 effort exists, or displays the stored effort read-only when none are selectable
   const effortLabel = effortLabelFor(t, resolvedEffort);
   const taskCost = pillModel ? modelMetadata[pillModel]?.task_cost : undefined;
+  const isMultiEffortSeries = Boolean(
+    pillSeriesMatch && Object.keys(pillSeriesMatch.series.variants).length > 1,
+  );
   const menuReasoningEfforts = pillSeriesMatch
     ? (seriesEfforts.length > 1 ? seriesEfforts : [])
     : reasoningEfforts;
+  const readOnlySeriesEffort = isMultiEffortSeries && seriesEfforts.length <= 1 && Boolean(effortLabel);
   const menuDefaultEffort = pillSeriesMatch ? seriesDefaultEffort : settingsEffort;
   const effortProps = useMemo<EffortMenuProps>(() => ({
     effortLabel,
@@ -1150,9 +1154,11 @@ function ChatInput({
     taskCost,
     disabled: modelsLoading,
     exactEffort: !!pillSeriesMatch,
+    readOnlyEffort: readOnlySeriesEffort,
   }), [
     effortLabel, resolvedEffort, menuDefaultEffort, menuReasoningEfforts, handleReasoningEffortChange, resolvedFastMode,
     handleFastModeChange, isCodexModel, dropdownDirection, chatContainer, taskCost, modelsLoading, pillSeriesMatch,
+    readOnlySeriesEffort,
   ]);
   const effortItem = useEffortToolbarItem(effortProps, isMobile);
   const foldItems = useMemo(() => [...toolbarItems, effortItem], [toolbarItems, effortItem]);
