@@ -786,7 +786,7 @@ FailureReason = Literal["usage_limit", "claude_plan", "plan_limit", "provider_au
 
 
 # DALTON-HOOK(execution-delivery-status): structured per-execution delivery summary models
-ExecutionDeliveryStatus = Literal["delivered", "failed", "partial_failed", "retrying"]
+ExecutionDeliveryStatus = Literal["delivered", "failed", "partial_failed", "retrying", "skipped"]
 
 
 class ExecutionDeliveryTarget(BaseModel):
@@ -810,6 +810,7 @@ class ExecutionDeliverySummary(BaseModel):
     sent_count: int = 0
     failed_count: int = 0
     retrying_count: int = 0
+    awaiting_receipt: bool = False
     failure_code: Optional[str] = None
     failure_reason: Optional[str] = None
     failure_reasons: List[str] = Field(default_factory=list)

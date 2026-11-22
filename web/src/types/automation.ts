@@ -72,7 +72,7 @@ export interface DeliveryAttempt {
 }
 
 // DALTON-HOOK(execution-delivery-status): structured delivery summary attached by backend
-export type ExecutionDeliveryStatus = 'delivered' | 'failed' | 'partial_failed' | 'retrying';
+export type ExecutionDeliveryStatus = 'delivered' | 'failed' | 'partial_failed' | 'retrying' | 'skipped';
 
 export interface ExecutionDeliveryTarget {
   target?: string | null;
@@ -91,6 +91,7 @@ export interface ExecutionDeliverySummary {
   sent_count: number;
   failed_count: number;
   retrying_count: number;
+  awaiting_receipt?: boolean;
   failure_code?: string | null;
   failure_reason?: string | null;
   failure_reasons?: string[];

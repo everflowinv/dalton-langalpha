@@ -141,4 +141,50 @@ describe('useRecentRuns: polling while a delivery settles', () => {
     await tick(IDLE_POLL_MS);
     expect(calls()).toBe(4);
   });
+
+  // DALTON-HOOK(execution-delivery-status): keep slow polling past page 1 while a run awaits a late receipt
+  it('keeps polling at the idle pace past the first page while awaiting_receipt is true, then stops once delivered', async () => {
+    let newest: AutomationRun = {
+      ...run('late', DELIVERY_SETTLE_MS + 60_000, null),
+      delivery_summary: {
+        status: 'failed',
+        total_targets: 1,
+        sent_count: 0,
+        failed_count: 1,
+        retrying_count: 0,
+        failure_code: 'attempts_exhausted',
+        failure_reason: '投递重试已耗尽',
+        awaiting_receipt: true,
+      },
+    };
+    serve(() => newest);
+    const { result } = renderHookWithProviders(() => useRecentRuns(deliversAll));
+    await tick(0);
+    await act(async () => {
+      await result.current.fetchNextPage();
+    });
+    expect(calls()).toBe(2);
+
+    // DALTON-HOOK(execution-delivery-status): page 2+ polls at IDLE_POLL_MS, not LIVE_POLL_MS
+    await tick(LIVE_POLL_MS);
+    expect(calls()).toBe(2);
+
+    newest = {
+      ...run('late', DELIVERY_SETTLE_MS + 60_000, null),
+      delivery_summary: {
+        status: 'delivered',
+        total_targets: 1,
+        sent_count: 1,
+        failed_count: 0,
+        retrying_count: 0,
+        awaiting_receipt: false,
+      },
+    };
+    await tick(IDLE_POLL_MS - LIVE_POLL_MS);
+    expect(calls()).toBe(4);
+    expect(result.current.runs[0].delivery_summary?.status).toBe('delivered');
+
+    await tick(IDLE_POLL_MS);
+    expect(calls()).toBe(4);
+  });
 });

@@ -276,20 +276,27 @@ def test_summarize_delivery_retrying() -> None:
 def test_summarize_delivery_none_configured() -> None:
     assert eds.summarize_execution_delivery() is None
     assert eds.summarize_execution_delivery(delivery_result=[]) is None
+    skipped_summary = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "exec-skip",
+                "channel": "feishu",
+                "target": "feishu:user:ou_richard",
+                "status": "skipped",
+                "attempt_count": 0,
+                "error_code": "toggle_off",
+                "payload_json": {"source": "automation_completion"},
+            }
+        ]
+    )
+    assert skipped_summary is not None
+    assert skipped_summary["status"] == "skipped"
+    assert skipped_summary["total_targets"] == 0
+    assert skipped_summary["awaiting_receipt"] is False
     assert (
-        eds.summarize_execution_delivery(
-            notify_rows=[
-                {
-                    "delivery_id": str(uuid4()),
-                    "execution_id": "exec-skip",
-                    "channel": "feishu",
-                    "target": "feishu:user:ou_richard",
-                    "status": "skipped",
-                    "attempt_count": 0,
-                    "error_code": "toggle_off",
-                    "payload_json": {"source": "automation_completion"},
-                }
-            ]
+        eds.format_execution_delivery_note(
+            {"status": "completed", "delivery_summary": skipped_summary}, lang="zh"
         )
         is None
     )
@@ -489,6 +496,61 @@ def test_cos_activity_renders_all_five_delivery_states() -> None:
     assert "- 13:20 Partial Task, finished · partial delivery failed (1/2: Target channel delivery failed): Summary ready" in lines
     assert "- 13:25 Retrying Task, finished · delivering: Pending push" in lines
     assert "- 13:30 Plain Task, finished: No delivery configured" in lines
+
+
+def test_cos_activity_strips_stale_delivery_suffix_for_delivered_and_skipped() -> None:
+    zone = ZoneInfo("Asia/Shanghai")
+    runs = [
+        {
+            "automation_name": "晚间研报",
+            "status": "completed",
+            "excerpt": "晚报已生成\n投递状态：已生成但未送达（通道短暂超时）",
+            "completed_at": _utc(5, 0),
+            "delivery_summary": {
+                "status": "delivered",
+                "total_targets": 1,
+                "sent_count": 1,
+                "failed_count": 0,
+                "retrying_count": 0,
+            },
+        },
+        {
+            "automation_name": "跳过投递任务",
+            "status": "completed",
+            "excerpt": "晨报已生成 投递状态：已生成但未送达（已跳过）",
+            "completed_at": _utc(5, 10),
+            "delivery_summary": {
+                "status": "skipped",
+                "total_targets": 1,
+                "sent_count": 0,
+                "failed_count": 0,
+                "retrying_count": 0,
+                "skipped_count": 1,
+            },
+        },
+        {
+            "automation_name": "无摘要任务",
+            "status": "completed",
+            "excerpt": "普通报告 投递状态：已生成但未送达（手工备注）",
+            "completed_at": _utc(5, 20),
+            "delivery_summary": None,
+        },
+    ]
+
+    rendered = activity.render_activity(
+        workspaces=[],
+        workspace_total=0,
+        threads=[],
+        runs=runs,
+        holdings=[],
+        home_id="home-1",
+        zone=zone,
+        today=date(2026, 11, 20),
+    )
+    lines = rendered.splitlines()
+    assert "- 13:00 晚间研报, finished: 晚报已生成" in lines
+    assert "- 13:10 跳过投递任务, finished: 晨报已生成" in lines
+    assert "- 13:20 无摘要任务, finished: 普通报告 投递状态：已生成但未送达（手工备注）" in lines
 
 
 def test_system_jobs_summarize_last_execution_five_states() -> None:
@@ -1825,7 +1887,9 @@ def test_claim_cap_exhausted_pending_immediately_unconfirmed_without_waiting_10m
 
 
 def test_script_all_skipped_notify_rows_do_not_fallback_to_pending_dispatch() -> None:
-    """R4 Item 2 (Carbon Med #2 / Codex Med #5): all-skipped target rows return None, not retrying."""
+    """R4 Item 2 + follow-up #2b: all-skipped target rows return status='skipped' so
+    downstream readers (resolve_execution_delivery_summary, format_execution_delivery_note,
+    and frontend polling) distinguish all-skipped from no-rows and never fall back to notify_status."""
     now = _utc(15, 0)
 
     # Trigger: script failed initially so notify_status stayed pending_dispatch, then user
@@ -1849,7 +1913,25 @@ def test_script_all_skipped_notify_rows_do_not_fallback_to_pending_dispatch() ->
         notify_status="pending_dispatch",
         now=now,
     )
-    assert all_skipped is None
+    assert all_skipped is not None
+    assert all_skipped["status"] == "skipped"
+    assert all_skipped["total_targets"] == 0
+    assert all_skipped["awaiting_receipt"] is False
+    assert all_skipped["targets"] == []
+
+    # Downstream readers with delivery_summary=all_skipped never fall back to notify_status.
+    script_run_row = {
+        "status": "succeeded",
+        "notify_status": "pending_dispatch",
+        "delivery_summary": all_skipped,
+    }
+    resolved = eds.resolve_execution_delivery_summary(script_run_row, now=now)
+    assert resolved is not None
+    assert resolved["status"] == "skipped"
+    assert eds.format_execution_delivery_note(script_run_row, lang="zh") is None
+    assert eds.format_execution_delivery_note(script_run_row, lang="en") is None
+    _, summary_text, _ = system_jobs._summarize_data_task_run(script_run_row)
+    assert summary_text == "成功"
 
     # Control: when truly no target rows exist yet, pending_dispatch still falls back to retrying.
     no_rows = eds.summarize_execution_delivery(
@@ -1859,6 +1941,117 @@ def test_script_all_skipped_notify_rows_do_not_fallback_to_pending_dispatch() ->
     )
     assert no_rows is not None
     assert no_rows["status"] == "retrying"
+    assert no_rows["awaiting_receipt"] is False
+
+
+def test_attempts_exhausted_failed_row_sets_awaiting_receipt_and_delivered_strips_excerpt() -> None:
+    """Follow-up #2a & #2c: failed/attempts_exhausted marks awaiting_receipt=True for reconcilable
+    data-task & report rows (False for terminal non-reconcilable errors); system_jobs strips stale
+    synced-undelivered excerpt suffix once late receipt turns summary to delivered."""
+    now = _utc(15, 0)
+
+    # 1) Data-task failed with attempts_exhausted -> background reconciler still checks late receipts.
+    data_exhausted = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "script-run-exhausted",
+                "automation_id": "data:daily-brief",
+                "channel": "feishu",
+                "target": "feishu:chat:oc_ops",
+                "status": "failed",
+                "attempt_count": 3,
+                "error_code": "attempts_exhausted",
+                "created_at": now - timedelta(minutes=15),
+                "updated_at": now - timedelta(minutes=2),
+                "payload_json": {"route_key": "data:daily-brief"},
+            }
+        ],
+        notify_status="pending_dispatch",
+        now=now,
+    )
+    assert data_exhausted is not None
+    assert data_exhausted["status"] == "failed"
+    assert data_exhausted["failure_code"] == "attempts_exhausted"
+    assert data_exhausted["awaiting_receipt"] is True
+
+    # 2) Automation report failed with attempts_exhausted -> also awaiting_receipt=True.
+    report_exhausted = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "exec-report-exhausted",
+                "channel": "feishu",
+                "target": "feishu:chat:oc_market_pm",
+                "status": "failed",
+                "attempt_count": 3,
+                "error_code": "attempts_exhausted",
+                "created_at": now - timedelta(minutes=15),
+                "updated_at": now - timedelta(minutes=2),
+                "payload_json": {"source": "automation_report"},
+            }
+        ],
+        now=now,
+    )
+    assert report_exhausted is not None
+    assert report_exhausted["status"] == "failed"
+    assert report_exhausted["awaiting_receipt"] is True
+
+    # 3) Terminal non-reconcilable error (card_limit_exceeded) -> awaiting_receipt=False.
+    card_limit = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "script-run-card-limit",
+                "automation_id": "data:daily-brief",
+                "channel": "feishu",
+                "target": "feishu:chat:oc_ops",
+                "status": "failed",
+                "attempt_count": 1,
+                "error_code": "card_limit_exceeded",
+                "created_at": now - timedelta(minutes=5),
+                "updated_at": now - timedelta(minutes=1),
+                "payload_json": {"route_key": "data:daily-brief"},
+            }
+        ],
+        notify_status="pending_dispatch",
+        now=now,
+    )
+    assert card_limit is not None
+    assert card_limit["status"] == "failed"
+    assert card_limit["awaiting_receipt"] is False
+
+    # 4) After late receipt updates target to sent -> awaiting_receipt=False and system_jobs strips stale excerpt suffix.
+    delivered_summary = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "exec-report-late-sent",
+                "channel": "feishu",
+                "target": "feishu:chat:oc_market_pm",
+                "status": "sent",
+                "attempt_count": 3,
+                "error_code": None,
+                "created_at": now - timedelta(minutes=15),
+                "updated_at": now - timedelta(seconds=10),
+                "payload_json": {"source": "automation_report"},
+            }
+        ],
+        now=now,
+    )
+    assert delivered_summary is not None
+    assert delivered_summary["status"] == "delivered"
+    assert delivered_summary["awaiting_receipt"] is False
+    _, last_result = system_jobs._summarize_last_execution(
+        {
+            "status": "completed",
+            "completed_at": now,
+            "excerpt": "市场晚报已生成\n\n投递状态：已生成但未送达（attempts_exhausted）",
+            "delivery_summary": delivered_summary,
+        },
+        kind="home",
+    )
+    assert last_result == "市场晚报已生成"
 
 
 @pytest.mark.asyncio

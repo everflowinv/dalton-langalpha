@@ -235,7 +235,7 @@ def _state(row: dict[str, Any]) -> dict[str, Any]:
             run["error"] = error if len(error) <= _ERROR_EXCERPT else f"{error[:_ERROR_EXCERPT]}…"
         if last.get("dismissed_at"):
             run["dismissed"] = True
-        if delivery_summary:
+        if delivery_summary and delivery_summary.get("status") != "skipped":
             run["delivery_status"] = delivery_summary["status"]
             if delivery_summary.get("status") in ("failed", "partial_failed"):
                 en_reason = humanize_delivery_error(

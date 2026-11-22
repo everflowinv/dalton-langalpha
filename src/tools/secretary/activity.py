@@ -338,12 +338,16 @@ def _run_line(run: dict[str, Any], zone: Zone) -> str:
     if status == "completed":
         from src.dalton.services.execution_delivery_status import (
             format_execution_delivery_note,
+            resolve_execution_delivery_summary,
             strip_synced_delivery_excerpt_suffix,
         )
 
+        delivery_summary = resolve_execution_delivery_summary(run)
         delivery_label = format_execution_delivery_note(run, lang="en")
         if delivery_label:
             status_label = _one_line(delivery_label, _EXCERPT_CHARS) or status_label
+        # DALTON-HOOK(execution-delivery-status): strip stale delivery suffix whenever a structured summary exists
+        if delivery_summary:
             raw_excerpt = strip_synced_delivery_excerpt_suffix(
                 str(raw_excerpt) if raw_excerpt is not None else None
             )
