@@ -1529,18 +1529,18 @@ def build_director_tools(
         """Create, update, pause, resume, or list Dalton (`dalton-*`) automations.
 
         Supports `cron` and `once` triggers only. For standard price tracking use
-        `dalton_coverage_tracking`; for personal price alerts configure `trigger_config`
-        in the automation file.
+        `dalton_coverage_tracking`; for personal price alerts set `trigger_config`
+        in `.agents/user/automations/*.json`.
 
         Args:
             action: "upsert", "pause", "resume", or "list".
             name: Automation name (must start with `dalton-`, e.g. `dalton-meta-watch`).
             trigger_type: "cron" or "once".
             cron_expression: Standard 5-field cron expression when trigger_type="cron".
-            next_run_at: ISO 8601 datetime when trigger_type="once"; naive values are interpreted in the automation's timezone.
+            next_run_at: ISO 8601 datetime when trigger_type="once"; values without an offset use the automation's timezone.
             instruction: Prompt instruction executed when the automation fires.
             description: Short description of the automation.
-            timezone_name: IANA timezone. Omit on create to use the deployment default; omit on update to keep the existing timezone. Naive `next_run_at` values are interpreted in this timezone.
+            timezone_name: IANA timezone. Omit on create to use the deployment default; omit on update to keep the existing timezone.
             workspace_id: Workspace UUID used to place a new automation or locate an existing one in that workspace (does not move an existing automation; defaults to the current workspace in config).
             ticker: Optional company ticker for naming validation.
             reasoning_effort: Optional thinking effort override (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Omit on create to inherit user/model default; omit on update to keep the current value, or pass `""` / `"default"` to clear. Built-in Antigravity effort is determined by the task's model ID; change the model in the automation's settings.
@@ -1560,7 +1560,7 @@ def build_director_tools(
                     "error": "price_trigger_unsupported",
                     "message": "dalton_schedule_automation supports cron and once only. "
                     "Use dalton_coverage_tracking for standard price tracking, or set "
-                    "trigger_config in the automation file for a personal price alert.",
+                    "trigger_config in .agents/user/automations/*.json for a personal price alert.",
                 },
                 ensure_ascii=False,
             )

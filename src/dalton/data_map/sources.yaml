@@ -137,7 +137,7 @@ direct_tools:
     category: filing
     title: SEC XBRL与报表
     call: "get_sec_filing"
-    description: "美股报表原文直接查 `get_sec_filing`；归一化XBRL财务事实(含重述)经 `ExecuteCode` 调 MCP 工具 `tools.dalton_sec.get_company_facts`。"
+    description: "美股报表原文直接查 `get_sec_filing`；归一化XBRL财务事实(含重述)经 `ExecuteCode` 调用 `tools.dalton_sec.get_company_facts`。"
 
 unavailable_sources:
   - id: futures_realtime

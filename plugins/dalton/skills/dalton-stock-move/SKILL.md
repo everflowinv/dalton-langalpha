@@ -96,7 +96,7 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
 
 ### 第 2 步：新闻、同业与卖方研报 / 销售台点评（sales color）
 
-1. **最新新闻检索（`WebSearch`，优先日期提示为事件窗口 `[NEWS_START, NEWS_END]`）**：
+1. **最新新闻检索（`WebSearch`，日期范围传入事件窗口 `[NEWS_START, NEWS_END]`）**：
    调用直连工具 `WebSearch`（定义见 `src/dalton/web_search/gemini_grounding.py`）：
    ```python
    WebSearch(
@@ -107,7 +107,7 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
    )
    ```
    （“今天”的异动即 `TODAY - 1d` 至 `TODAY`。）
-   - `start_date` 和 `end_date` 仅向搜索服务提示优先日期，不是硬过滤；须逐条核对原网页或视频的实际发布日期是否在窗口内，剔除窗口外的旧闻。
+   - `start_date` 和 `end_date` 仅作搜索优先日期提示，不是严格过滤；须逐条核对原网页或视频的实际发布日期是否在窗口内，剔除窗口外的旧闻。
    - 每条保留的新闻必须附上标题、来源媒体、发布日期、原始链接，并标明是**一手报道**（公司新闻稿、路透/彭博首发、监管原文）还是**二手转载**。
 
 2. **市场状态与同业联动**：

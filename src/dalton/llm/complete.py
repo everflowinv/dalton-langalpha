@@ -1189,7 +1189,7 @@ async def _dalton_complete_impl(
                 error_kind=str((existing_row or {}).get("error_kind") or "indeterminate"),
                 error=(
                     "上次请求的结果未确认，供应商可能已计费。"
-                    "重新发起可能产生额外费用。用量按实际发出的上游请求逐次记录，暂无法确认的用量单独标记。"
+                    "重新发起可能产生额外费用。用量按实际发出的请求逐次记录，结果未确认的用量单独标记。"
                 ),
             ),
             raise_on_error=raise_on_error,

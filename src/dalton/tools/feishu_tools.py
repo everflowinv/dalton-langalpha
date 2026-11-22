@@ -441,10 +441,10 @@ def create_feishu_tools(filesystem_backend: Any = None) -> list[BaseTool]:
 
         Args:
             token: Feishu document URL (`.../docx/<id>` or `.../wiki/<id>`) or the raw document/wiki token.
-            max_chars: Plain-text budget, 1000-50000 (default 20000); hard cap is 50000 chars with no pagination.
+            max_chars: Plain-text character limit, 1000-50000 (default 20000; hard cap 50000, no pagination).
 
         Returns:
-            Plain-text document JSON (`title`, `content`, `truncated`, `total_chars`) — capped at 50,000 chars without pagination.
+            Plain-text document JSON (`title`, `content`, `truncated`, `total_chars`).
 
         Proceed with full-document actions only when `truncated=false`. If truncated, retry once with `max_chars=50000`; if still truncated, ask the user to provide the full file.
         """
@@ -598,7 +598,7 @@ def create_feishu_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         Returns:
             Append confirmation JSON with `document_id` and `appended_blocks` — not the full document text.
 
-        Confirm to the user what was appended and provide the document link if available (omit internal machine fields unless the user asks for diagnostics). Read the doc back with `feishu_read` when the user needs to verify.
+        Confirm to the user what was appended and include the document link if available (omit `document_id` and `appended_blocks` unless the user asks for diagnostics). Read the doc back with `feishu_read` when the user needs to verify.
         """
         user_id, err = await _require_authenticated_user(config)
         if err is not None:

@@ -50,11 +50,11 @@ where they go stale.
 
 ## Editing
 
-Personal automations are managed through these files. Tasks managed by a
-coverage unit refuse direct file create/update/delete/rename: use
+Personal automations are managed through these files. Automations managed by a
+coverage unit refuse direct file create, update, delete, or rename: use
 `dalton_schedule_automation` for earnings schedules, `dalton_coverage_tracking`
 for standard coverage tracking, and `dalton_system_jobs` for company public data
-jobs (ops tasks are read-only).
+jobs (ops jobs are read-only).
 
 - **Create:** Write a new file. A name that is taken is refused, never
   overwritten.
@@ -68,11 +68,10 @@ jobs (ops tasks are read-only).
     """  on its own, so a change to one never conflicts with another.
 - **Pause / resume:** set `status` to `"paused"` or `"active"`.
 - **Delete:** set `status` to `"deleted"`, or `rm` the file from code. The
-  automation moves to the recycle bin and keeps its run history; restore
-  deleted personal automations from the recycle bin on the Automations page
-  (regular tasks deleted for more than 30 days are cleaned up). Tasks managed
-  by a coverage unit cannot be deleted via files and can be paused through
-  their dedicated tools.
+  automation moves to the recycle bin and keeps its run history; restore it
+  from the recycle bin on the Automations page (regular automations in the
+  recycle bin are purged after 30 days). Coverage-unit automations cannot be
+  deleted via files; pause them through their dedicated tools instead.
 - **Rename:** `mv` a file to another name in this folder changes only the
   file name; the automation and its history stay.
 - Copying a file creates a second automation that runs too, so never copy one
@@ -145,13 +144,13 @@ A new one needs only what has no default, e.g. `aapl-below-200.json`:
 | trigger_config | price | See Price alerts. |
 | timezone       | no  | IANA region name, e.g. `America/New_York` (not `EST`, which ignores daylight saving). Defaults to the user's timezone. Changing it keeps a one-time automation's moment, since `next_run_at` carries its offset. |
 | instruction    | yes | The prompt each run executes. |
-| workspace_id   | no  | Where each run happens. Defaults to this workspace. `home`: the Chief of Staff runs it from the user's Home rather than in one workspace; best for price alerts and quick lookups. Another workspace's id runs it there. Changing `workspace_id` moves the automation to that workspace; if a new fixed thread is omitted, the previous thread binding is cleared. |
+| workspace_id   | no  | Where each run happens. Defaults to this workspace. `home`: the Chief of Staff runs it from the user's Home rather than in one workspace; best for price alerts and quick lookups. Another workspace's id runs it there. Changing `workspace_id` moves the automation to that workspace; unless `thread` also names a thread in the new workspace, any pinned thread ID is cleared. |
 | thread         | no  | `new` (default): a fresh thread each run. `persistent`: one thread that every run continues, created by the first run (`state.last_run.thread_id` names it). `current`: continue in this conversation. A thread id: continue in that thread. |
 | llm_model      | no  | A model the user can run; `null` uses their default. An unknown name is refused with the list. |
 """
     # DALTON-HOOK(automation-effort): document reasoning_effort field semantics in README table
     # DALTON-HOOK(prompt-audit-text): clarify effort omit vs null, Dalton channel examples, and multi-market price alert symbols
-    """| reasoning_effort | no | Thinking effort override (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Omit on create to inherit user or model default; omit on update to keep the current value when `llm_model` is unchanged (when `llm_model` also changes, an unsupported stored effort is cleared if the new model has no effort levels, or adjusted to the new model's supported range); pass explicit `null` to clear and inherit default. When an explicit `llm_model` is set, use an effort level that model supports. Built-in Antigravity models choose effort via the suffixed `llm_model` ID and keep `reasoning_effort` as `null`. |
+    """| reasoning_effort | no | Thinking effort override (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Omit on create to inherit the user or model default; omit on update to keep the stored value (if `llm_model` also changes, an incompatible stored effort is cleared when the new model has no effort levels, or clamped to its supported range); pass `null` to clear back to default. When `llm_model` is set, pick an effort level that model supports. Built-in Antigravity models encode effort in the suffixed `llm_model` ID and keep `reasoning_effort` as `null`. |
 | delivery       | no  | Where results also go besides the app: a connected chat app in Dalton (Feishu, Discord, or personal WeChat), e.g. `["discord:@me"]` or `["feishu"]`, or a group address from `.agents/user/channels/available.json`, which lists every chat on each connected app; `[]` for none. Personal WeChat supports direct messages only (`weixin:@me`). A chat is checked when you save, and so is an app, which is refused while the user hasn't linked it. An app alone posts to the chat set for the automations of the workspace it runs in (Home has none), else the app's preferred chat, else the user's direct messages; to always post to direct messages, name them, e.g. `["discord:@me"]`, `["feishu:@me"]`, or `["weixin:@me"]`. Leave sending out of `instruction`: each run sends its result there itself, a chat it missed gets the final answer, and a failed or stopped run posts a short notice. |
 | max_failures   | no  | 1–100, default 3. Consecutive failed runs before it is disabled. |
 

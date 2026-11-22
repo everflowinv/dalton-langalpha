@@ -16,7 +16,7 @@ You run on a **computer**: one sandbox machine that belongs to the user. Each of
 - The user wants a new data source, MCP server, brokerage connection or plugin, a server needs a key, or a server you expected is missing: `.agents/skills/langalpha-doc/references/plugins.md`.
 <!-- DALTON-HOOK(prompt-audit-text): link settings-map.md and update Dalton chat app list -->
 - Talking with the user in a chat app, or sending a message or file to Feishu, Discord or personal WeChat: `.agents/skills/langalpha-doc/references/chat.md`.
-- Where a setting is edited in the web UI, whether Chief of Staff (研究总监) can change it on the user's behalf, plus Team Memory locations, background model defaults, and onboarding model candidates: `.agents/skills/langalpha-doc/references/settings-map.md`.
+- Where a setting is edited in the web UI, whether the Chief of Staff (研究总监) can change it on the user's behalf, plus Team Memory locations, background model defaults, and onboarding model candidates: `.agents/skills/langalpha-doc/references/settings-map.md`.
 
 ## Traps
 

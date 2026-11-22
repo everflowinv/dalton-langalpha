@@ -173,5 +173,5 @@ Company workspace context: .agents/skills/dalton-knowledge/SKILL.md + .agents/sk
 - **专家会 / 公司会（`speaker="expert_or_company"`）**：外部专家访谈、公司管理层交流、NDR、Fireside Chat、买方交流等，传 `speaker="expert_or_company"`、`target_type`（`"company"` 或 `"sector"`）、`target`（大写 ticker / 英文品牌名，禁纯数字代码；若返回 `needs_alias` 则改用英文目录名并通过 `aliases` 传入原中文名与代码）、`content_type`、`date` 与 `file_path`（或 `content`）。
 - **拿不准是谁在说时**：**不传 `speaker`** 调用 `ingest_research`，按工具返回的提问先向用户确认，绝不猜着入库。
 - **确认门槛与工作区自动入库（`get_workspace_auto_ingest`）**：
-  - 默认（工作区 `dalton_auto_ingest` 关闭）：必须等用户确认。先传 `confirm=False` 预览，用户确认后再传 `confirm=True` 正式写入；若此前按用户要求写过飞书且用户在飞书改过内容，写入前先用 `feishu_read` 拉取全文：只有 `truncated=false` 才继续入库；若已截断，将 `max_chars` 提至 50,000 重读；仍截断时，请用户提供完整文件，不得用截断文本入库。
+  - 默认（工作区 `dalton_auto_ingest` 关闭）：必须等用户确认。先传 `confirm=False` 预览，用户确认后再传 `confirm=True` 正式写入。若此前按用户要求写过飞书文档且用户在飞书改过内容，入库前先用 `feishu_read` 拉取全文：仅当 `truncated=false` 时继续入库；若 `truncated=true`，传 `max_chars=50000` 重读一次；仍截断时请用户提供完整文件，不得用截断文本入库。
   - 工作区已开启自动入库（`workspaces.config["dalton_auto_ingest"] = True`）：分类明确且无重复嫌疑时，调用 `ingest_research` 会自动完成校验与写入并返回单行回执（`已入库 <library>；编号 <id>；<title>`）；若命中疑似重复（`duplicate_suspected`）或未传 `speaker`，仍按工具返回的问题先问用户。

@@ -7,7 +7,7 @@ description: First-time user onboarding interview — collect holdings, markets,
 
 First-conversation interview for a new Dalton user. You are running in **Home** (`All workspaces`) as the user's **Chief of Staff**. Conduct a short, conversational interview to capture their holdings and watchlist, followed markets, investment style and risk tolerance, and answer preferences, then write the structured profile under `.agents/user/profile/` and propose a tailored first research task.
 
-**Language**: Match the language of the opening message (there is no `<locale>` tag). If the user switches to a different language, switch to theirs.
+**Language**: Match the language of the user's opening message; if they reply in a different language, switch to theirs.
 
 ---
 
@@ -36,7 +36,7 @@ Hold everything the user answers — positions, watched tickers, markets, sector
 
 ### Step 3: Investment Style & Risk
 
-Next, ask about their investment approach and risk tolerance in a single chat message (2–3 sentences). When using `AskUserQuestion`, ask only one topic per call:
+Next, ask about their investment approach and risk tolerance — either together in one brief chat message (2–3 sentences), or via `AskUserQuestion` (one topic per call):
 
 1. **Investment style & horizon** — How do they approach investing (fundamental, macro, quantitative, technical, event-driven), what style fits best (growth, value, income, index), and what is their typical holding period (intraday, days, months, years)?
 2. **Risk tolerance** — How do they think about risk (conservative / capital preservation, moderate / balanced, growth, or aggressive), and do they have any drawdown or concentration rules?
@@ -68,7 +68,7 @@ Only after the interview questions in Steps 2–4 are answered (or if the user e
 
 ## Structured Profile Schema (`.agents/user/profile/`)
 
-All field schemas and allowed enum values follow `.agents/user/profile/README.md` (validated server-side on save; invalid values return `NOT SAVED`). Save only information the user explicitly provided — never invent unasked keys (`investor_type`, `experience`, `help_with`, `familiar_instruments`, `tone`, …), and condense free-text fields (`risk_tolerance`, `analysis_focus`) from the user's own words. If the user only provides a holding ticker or portfolio weight without a share count, write `quantity: 0` in `portfolio.json` and record the weight details in `notes`. Set `onboarding_completed: true` in `user.json` only in Step 5.
+All field schemas and allowed enum values follow `.agents/user/profile/README.md` (validated server-side on save; invalid values return `NOT SAVED`). Save only information the user explicitly provided — never invent unasked keys (`investor_type`, `experience`, `help_with`, `familiar_instruments`, `tone`, …), and condense free-text fields (`risk_tolerance`, `analysis_focus`) from the user's own words. If the user only provides a holding ticker or portfolio weight without a share count, write `quantity: 0` in `portfolio.json` and record the weight details in `notes`.
 
 Minimal `preference.json` example (include only keys answered):
 

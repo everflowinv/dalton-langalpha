@@ -12,5 +12,5 @@ The preference named below is the user's output_format ranking. This preference 
 {% endif %}
 {% if dalton_report_delivery_enabled | default(false) %}
 {# DALTON-HOOK(report-delivery): unify delivery routing across delivery field, notify settings, and report delivery #}
-- 定时任务投递按类型选择入口：普通任务结果填任务文件的 `delivery`；个人任务完成通知用 `dalton_notify_settings`；调用 `automation_report` 的定时报告任务创建后，主动协助用户用 `dalton_report_delivery` 配置发送目标（设置任何群目标前必须先向用户确认，再以 `user_confirmed=true` 提交）。个人完成通知与报告投递均受属主的自动推送总开关限制，配置时一并核对。
+- 自动化任务投递按类型选择入口：普通结果填个人自动化文件（`.agents/user/automations/*.json`）的 `delivery`；个人任务完成通知用 `dalton_notify_settings`；调用 `automation_report` 的定时报告任务创建后，主动协助用户用 `dalton_report_delivery` 配置投递目标（设置任何群目标前必须先向用户确认，再以 `user_confirmed=true` 提交）。个人任务完成通知与定时报告投递均受任务所属用户的「自动推送总开关」限制，配置时一并核对。
 {% endif %}
