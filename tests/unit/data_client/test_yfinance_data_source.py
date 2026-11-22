@@ -310,37 +310,39 @@ def test_fetch_single_snapshot_maps_post_market_fields():
         assert snap["regular_trading_date"] == "2026-10-22"
 
     # Saturday 2026-10-24 12:00 ET (1792857600) with Friday 2026-10-23 close (16:00 ET = 1792785600)
-    # and Friday after-hours print (18:30 ET = 1792794600).
-    sat_ticker, sat_info_prop = _make_stub_ticker(
-        fast_info={
-            "lastPrice": 330.95,
-            "regularMarketPreviousClose": 336.40,
-            "lastVolume": 19_200_000,
-        },
-        info={
-            "marketState": "POSTPOST",
-            "postMarketPrice": 333.76,
-            "postMarketTime": 1792794600,
-        },
-        regular_market_time=1792785600,
-    )
-    mock_sat_ticker = create_autospec(yahoo_ticker, return_value=sat_ticker)
-    mock_sat_now = create_autospec(
-        _now_utc, return_value=datetime.fromtimestamp(1792857600, tz=timezone.utc)
-    )
-    with (
-        patch("src.data_client.yfinance.data_source.yahoo_ticker", new=mock_sat_ticker),
-        patch("src.dalton.extended_hours._now_utc", new=mock_sat_now),
-    ):
-        sat_snap = _fetch_single_snapshot("GOOG")
+    # and Friday after-hours print (18:30 ET = 1792794600). Yahoo reports CLOSED for every
+    # US quote over the weekend while still serving the print, so CLOSED counts too.
+    for sat_state in ("POSTPOST", "CLOSED"):
+        sat_ticker, sat_info_prop = _make_stub_ticker(
+            fast_info={
+                "lastPrice": 330.95,
+                "regularMarketPreviousClose": 336.40,
+                "lastVolume": 19_200_000,
+            },
+            info={
+                "marketState": sat_state,
+                "postMarketPrice": 333.76,
+                "postMarketTime": 1792794600,
+            },
+            regular_market_time=1792785600,
+        )
+        mock_sat_ticker = create_autospec(yahoo_ticker, return_value=sat_ticker)
+        mock_sat_now = create_autospec(
+            _now_utc, return_value=datetime.fromtimestamp(1792857600, tz=timezone.utc)
+        )
+        with (
+            patch("src.data_client.yfinance.data_source.yahoo_ticker", new=mock_sat_ticker),
+            patch("src.dalton.extended_hours._now_utc", new=mock_sat_now),
+        ):
+            sat_snap = _fetch_single_snapshot("GOOG")
 
-    assert sat_info_prop.call_count == 1
-    assert sat_snap is not None
-    assert sat_snap["market_status"] == "late_trading"
-    assert sat_snap["regular_only"] is False
-    assert sat_snap["last_trade_price"] == 333.76
-    assert sat_snap["as_of"] == 1792794600 * 1000
-    assert sat_snap["regular_trading_date"] == "2026-10-23"
+        assert sat_info_prop.call_count == 1
+        assert sat_snap is not None
+        assert sat_snap["market_status"] == "late_trading"
+        assert sat_snap["regular_only"] is False
+        assert sat_snap["last_trade_price"] == 333.76
+        assert sat_snap["as_of"] == 1792794600 * 1000
+        assert sat_snap["regular_trading_date"] == "2026-10-23"
 
 
 def test_fetch_single_snapshot_keeps_regular_only_when_no_extended_data_or_info_fails():
