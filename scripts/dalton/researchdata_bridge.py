@@ -1590,6 +1590,13 @@ ERROR_HANDLING_CONTRACT_NOTE: str = (
 ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE: str = (
     "单家公司检索一次完成：检索一家公司时，把中英文公司名和股票代码用空格隔开写在同一个查询里，"
     "从返回列表挑选文档；已有结果时从现有列表筛选，报错时切换备用数据源；不同公司或新主题照常各自检索。"
+    "AlphaEngine 按实际向上游请求的页数计检索额度，命中短时缓存不计；每页至少请求 20 条（`limit` 超过 20 时按 `limit` 请求，"
+    "去重或筛选后不足 `limit` 条时会自动翻页，单次最多 5 页）。"
+    "先用 `limit` 20 以内，不够再翻页，不要一次要 50 条再只看前几条。"
+)
+
+TRANSCRIPT_DATE_WINDOW_RULE: str = (
+    "查业绩会转写时把 `start` / `end` 收窄到业绩会前后几天，避免日期范围过宽导致连续翻页。"
 )
 
 
@@ -1611,13 +1618,13 @@ def build_researchdata_plugin_instruction() -> str:
         "Leave `timeout` unset: the bridge sets per-route limits and long reads may take minutes. "
         'AlphaEngine 支持文档与机构/个人会议浏览与筛选（params.meeting_scope="institution"|"personal"，无关键词默认 sort="newest"，按公司检索请用关键词 query（公司名 + ticker）及必要时 search_in="title"）、'
         "录制任务与状态查询（list_recording_tasks/get_recording_status/get_recording_task）、文档基础信息与附件列表（get_document_info/list_attachments）、"
-        "按字段读取正文（get_document 的 params.content_field）及词典查询（list_filters）；每次检索（search_library）都扣一次额度，参数完全相同也扣；同一篇文档读过一次全文后再读不扣。检索前先合并关键词：同一公司或同一主题的相关词放进一次检索，不要拆成多次相近的检索。"
+        "按字段读取正文（get_document 的 params.content_field）及词典查询（list_filters）；同一篇文档读过一次全文后再读不计额度。检索前先合并关键词：同一公司或同一主题的相关词放进一次检索，不要拆成多次相近的检索。"
         f"{ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE}"
         "相同检索短时间内会直接返回缓存结果（看 `_bridge_cache`），只有确实需要最新结果时（例如财报刚发、用户明确要最新进展）才传 `params.fresh=true`。"
         "Guidepoint 仅返回问答摘录（无全文接口、无 cursor 翻页；limit 省略默认 3，最大 30，不能由 30 条摘录推断已扫完全部访谈；"
         "params.keywords 为 1–10 个非空字符串，多项 OR、词组内 AND，先筛访谈再排片段，不筛选时省略或传 null；"
         "params.recency_bias 为 1–100 整数，偏好近期一般从 30 起，只调排序非日期窗口；start/end 按 UTC 日期硬过滤）。"
-        'transcript 单次最多扫 10 页×50 条，返回 coverage（complete=false 时将 continuation_params 交给 route="alphaengine", operation="search_library" 续查，不要传回 transcript）。'
+        f'transcript 单次最多扫 10 页×50 条，返回 coverage（complete=false 时将 continuation_params 交给 route="alphaengine", operation="search_library" 续查，不要传回 transcript）。{TRANSCRIPT_DATE_WINDOW_RULE}'
         "Every result has `_sources` (identity, document_id, as_of, url) and `normalized_params`. "
         "Cite with identity, publisher and date. Expert calls: identity, not name. "
         "Guidepoint verbatim <=20 words. "
@@ -8934,7 +8941,9 @@ class ResearchDataBridge:
         caller_identity: dict[str, str] | None,
         ok: bool,
         cache_status: str,
-    ) -> str | None:
+        result_payload: dict[str, Any] | None = None,
+        raw_arguments: dict[str, Any] | None = None,
+    ) -> tuple[str | None, list[dict[str, str]]]:
         args = arguments if isinstance(arguments, dict) else {}
         params = args.get("params") if isinstance(args.get("params"), dict) else {}
         query_val = args.get("query") if args.get("query") not in (None, "") else params.get("query")
@@ -8942,46 +8951,111 @@ class ResearchDataBridge:
         ticker_val = args.get("ticker") or ""
         is_personal = _ae_cache._is_personal_scope_request(params)
 
-        companies, advice = self._get_ae_company_tracker().record_and_check(
-            caller_identity=caller_identity if isinstance(caller_identity, dict) else None,
-            query=query_val,
-            keywords=keywords_val,
-            ticker=ticker_val,
-        )
-
-        if not is_personal:
-            ci = caller_identity if isinstance(caller_identity, Mapping) else {}
-            user_val = str(ci.get("user") or "").strip()
-            ws_val = str(ci.get("workspace") or "").strip()
-            th_val = str(ci.get("thread") or "").strip()
-            sanitized_params = {
-                k: v for k, v in params.items() if k != "fresh" and v is not None
-            }
-            if args.get("start"):
-                sanitized_params.setdefault("start", str(args.get("start")))
-            if args.get("end"):
-                sanitized_params.setdefault("end", str(args.get("end")))
-            if args.get("limit") is not None:
-                sanitized_params.setdefault("limit", args.get("limit"))
-            if ticker_val:
-                sanitized_params.setdefault("ticker", str(ticker_val))
-            await self._get_ae_query_logger().log(
-                {
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "op": str(operation or "search_library"),
-                    "query": _ae_cache.normalize_search_query(query_val),
-                    "keywords": keywords_val if isinstance(keywords_val, list) else [],
-                    "params": sanitized_params,
-                    "companies": companies,
-                    "user": user_val,
-                    "workspace": ws_val,
-                    "thread": th_val,
-                    "session": th_val or ws_val,
-                    "cache": str(cache_status or ""),
-                    "ok": bool(ok),
-                }
+        # Repeat-query matching uses the caller's own query before ticker folding.
+        raw_query_val: Any = _ae_cache._UNSET
+        if isinstance(raw_arguments, dict):
+            raw_params = (
+                raw_arguments.get("params")
+                if isinstance(raw_arguments.get("params"), dict)
+                else {}
             )
-        return advice
+            raw_query_val = (
+                raw_arguments.get("query")
+                if raw_arguments.get("query") not in (None, "")
+                else raw_params.get("query")
+            )
+
+        advice: str | None = None
+        previous_docs: list[dict[str, str]] = []
+        companies: list[str] = []
+        try:
+            raw_cursor = params.get("cursor") if "cursor" in params else args.get("cursor")
+            cursor_val = raw_cursor.strip() if isinstance(raw_cursor, str) else raw_cursor
+            has_cursor = cursor_val not in (None, "", [], {})
+            eff_mode = str(args.get("mode") or "").strip().lower() or "fetch"
+            result_count, returned_docs = (
+                _ae_cache.extract_search_result_docs(result_payload, op=operation)
+                if ok and isinstance(result_payload, dict)
+                else (0, [])
+            )
+
+            advice_res = self._get_ae_company_tracker().record_and_evaluate(
+                caller_identity=caller_identity if isinstance(caller_identity, dict) else None,
+                query=query_val,
+                keywords=keywords_val,
+                ticker=ticker_val,
+                raw_query=raw_query_val,
+                operation=operation,
+                has_cursor=has_cursor,
+                ok=ok,
+                result_count=result_count,
+                returned_docs=returned_docs,
+                is_personal=is_personal,
+                record_docs=not is_personal,
+                mode=eff_mode,
+            )
+            companies = advice_res.companies
+            advice = advice_res.advice
+            previous_docs = advice_res.previous_docs
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Failed to evaluate alphaengine search advice: %s",
+                type(exc).__name__,
+            )
+            advice = None
+            previous_docs = []
+            try:
+                companies = _ae_cache.extract_companies_from_search(
+                    query_val, keywords_val, ticker_val
+                )
+            except Exception:
+                companies = []
+
+        # Query logging is isolated independently: a log failure logs a warning
+        # and intentionally keeps any already-computed advice / previous_docs.
+        if not is_personal:
+            try:
+                ci = caller_identity if isinstance(caller_identity, Mapping) else {}
+                user_val = str(ci.get("user") or "").strip()
+                ws_val = str(ci.get("workspace") or "").strip()
+                th_val = str(ci.get("thread") or "").strip()
+                sanitized_params = {
+                    k: v for k, v in params.items() if k != "fresh" and v is not None
+                }
+                if args.get("start"):
+                    sanitized_params.setdefault("start", str(args.get("start")))
+                if args.get("end"):
+                    sanitized_params.setdefault("end", str(args.get("end")))
+                if args.get("limit") is not None:
+                    sanitized_params.setdefault("limit", args.get("limit"))
+                if ticker_val:
+                    sanitized_params.setdefault("ticker", str(ticker_val))
+                await self._get_ae_query_logger().log(
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "op": str(operation or "search_library"),
+                        "query": _ae_cache.normalize_search_query(query_val),
+                        "keywords": keywords_val if isinstance(keywords_val, list) else [],
+                        "params": sanitized_params,
+                        "companies": companies,
+                        "user": user_val,
+                        "workspace": ws_val,
+                        "thread": th_val,
+                        "session": th_val or ws_val,
+                        "cache": str(cache_status or ""),
+                        "ok": bool(ok),
+                    }
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Failed to log alphaengine search query: %s",
+                    type(exc).__name__,
+                )
+        return advice, previous_docs
 
     def _get_inflight_searches(self) -> dict[str, dict[str, Any]]:
         inflight = getattr(self, "_inflight_searches", None)
@@ -14681,6 +14755,11 @@ class ResearchDataBridge:
                                         rules_list.insert(0, ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE)
                                     r_copy["rules"] = rules_list
                                 elif rid == "transcript":
+                                    if not any(
+                                        TRANSCRIPT_DATE_WINDOW_RULE in str(item)
+                                        for item in rules_list
+                                    ):
+                                        rules_list.append(TRANSCRIPT_DATE_WINDOW_RULE)
                                     if TRANSCRIPT_CATALOG_RULE not in rules_list:
                                         rules_list.append(TRANSCRIPT_CATALOG_RULE)
                                     r_copy["rules"] = rules_list
@@ -14732,7 +14811,10 @@ class ResearchDataBridge:
                                 if req_route == "alphaengine":
                                     synth["rules"] = [ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE]
                                 elif req_route == "transcript":
-                                    synth["rules"] = [TRANSCRIPT_CATALOG_RULE]
+                                    synth["rules"] = [
+                                        TRANSCRIPT_DATE_WINDOW_RULE,
+                                        TRANSCRIPT_CATALOG_RULE,
+                                    ]
                                 elif req_route in INTERNAL_LIBRARY_ROUTES:
                                     synth["rules"] = [INTERNAL_LIBRARY_PAGINATION_RULE]
                                 kept_routes.append(synth)
@@ -14869,22 +14951,35 @@ class ResearchDataBridge:
                             chars, first_open=doc_first_open
                         )
 
-                    # Soft company-search reminder & team-scope query text log
+                    # Soft company-search / repeat-query reminder & team-scope query text log
                     if is_cached_direct:
                         direct_log_args = (
                             direct_upstream_arguments
                             if isinstance(direct_upstream_arguments, dict)
                             else call_args
                         )
-                        direct_advice = await self._track_company_search_and_log_query(
-                            operation=eff_ae_op if route == "alphaengine" else "transcript",
-                            arguments=direct_log_args,
-                            caller_identity=caller_identity,
-                            ok=bool(payload.get("ok")),
-                            cache_status=str((direct_cache_meta or {}).get("status") or ""),
-                        )
+                        try:
+                            direct_advice, direct_prev_docs = await self._track_company_search_and_log_query(
+                                operation=eff_ae_op if route == "alphaengine" else "transcript",
+                                arguments=direct_log_args,
+                                caller_identity=caller_identity,
+                                ok=bool(payload.get("ok")),
+                                cache_status=str((direct_cache_meta or {}).get("status") or ""),
+                                result_payload=payload,
+                                raw_arguments=raw_arguments,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed to track direct alphaengine search advice: %s",
+                                type(exc).__name__,
+                            )
+                            direct_advice, direct_prev_docs = None, []
                         if direct_advice:
                             payload["advice"] = direct_advice
+                        if direct_prev_docs:
+                            payload["advice_previous_docs"] = direct_prev_docs
 
                     # B5: one ledger line per served AlphaEngine call — the
                     # direct route, transcript, and the route='all' fan-out leg each.
@@ -14958,21 +15053,38 @@ class ResearchDataBridge:
                             if isinstance(ae_outcome.get("upstream_arguments"), dict)
                             else ae_args
                         )
-                        fanout_advice = await self._track_company_search_and_log_query(
-                            operation=str(ae_args.get("operation") or "search_library"),
-                            arguments=fanout_log_args,
-                            caller_identity=caller_identity,
-                            ok=ae_ok,
-                            cache_status=(
-                                str(ae_bc.get("status") or "")
-                                if isinstance(ae_bc, dict)
-                                else ""
-                            ),
-                        )
+                        try:
+                            fanout_advice, fanout_prev_docs = await self._track_company_search_and_log_query(
+                                operation=str(ae_args.get("operation") or "search_library"),
+                                arguments=fanout_log_args,
+                                caller_identity=caller_identity,
+                                ok=ae_ok,
+                                cache_status=(
+                                    str(ae_bc.get("status") or "")
+                                    if isinstance(ae_bc, dict)
+                                    else ""
+                                ),
+                                result_payload=ae_outcome,
+                                raw_arguments=raw_arguments,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed to track fanout alphaengine search advice: %s",
+                                type(exc).__name__,
+                            )
+                            fanout_advice, fanout_prev_docs = None, []
                         if fanout_advice:
                             payload["advice"] = fanout_advice
                             if isinstance(payload.get("alphaengine"), dict):
                                 payload["alphaengine"]["advice"] = fanout_advice
+                        if fanout_prev_docs:
+                            payload["advice_previous_docs"] = fanout_prev_docs
+                            if isinstance(payload.get("alphaengine"), dict):
+                                payload["alphaengine"]["advice_previous_docs"] = list(
+                                    fanout_prev_docs
+                                )
                         await self._record_alphaengine_usage(
                             operation=str(ae_args.get("operation") or "search_library"),
                             arguments=ae_args,
