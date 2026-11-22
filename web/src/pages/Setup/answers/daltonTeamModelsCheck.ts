@@ -103,16 +103,19 @@ export async function forceRefreshProviderAvailableModels(
       staleTime: 0,
       retry: false,
     });
-    // DALTON-HOOK(dalton-setup): only mark refreshed on a live (non-cached) forced response
-    if (forcedRan && !data.cached) {
-      const latestTracker = refreshedProvidersByClient.get(queryClient);
-      if (latestTracker && latestTracker.gen >= retryGeneration) {
-        latestTracker.providers.add(provider);
-      }
+    // DALTON-HOOK(dalton-setup): the forced response replaces the list, so drop per-search caches;
+    // mark the provider refreshed only when the server answered live (not its rate-limited cache)
+    if (forcedRan) {
       queryClient.removeQueries({
         queryKey: queryKeys.providerModels.availableFor(provider),
         predicate: (q) => q.queryKey.at(-1) !== whole.at(-1),
       });
+      if (!data.cached) {
+        const latestTracker = refreshedProvidersByClient.get(queryClient);
+        if (latestTracker && latestTracker.gen >= retryGeneration) {
+          latestTracker.providers.add(provider);
+        }
+      }
     }
     return data;
   })();
