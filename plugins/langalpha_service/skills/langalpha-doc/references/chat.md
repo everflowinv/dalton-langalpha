@@ -1,6 +1,7 @@
 # Chat Apps
 
-This page applies when you have `send_message` and `list_message_targets`: the user has connected chat apps such as Slack, Discord, Telegram, iMessage or Feishu, and you can message them there.
+<!-- DALTON-HOOK(prompt-audit-text): align chat reference to Dalton supported platforms (Feishu, Discord, personal WeChat) -->
+This page applies when you have `send_message` and `list_message_targets`: the user has connected chat apps supported by the Dalton gateway — Feishu, Discord, or personal WeChat (`weixin:@me`, direct messages only) — and you can message them there. Group chat addresses come from `.agents/user/channels/available.json` or `list_message_targets`.
 
 ## Which rules apply
 
@@ -15,7 +16,7 @@ In a chat the user sees what you send, not your updates between tool calls.
 - Keep them posted. Before a long step, or a hand-off whose result comes later, say so and that you will follow up. When the result comes back, send it where the request came from.
 - Write like a colleague answering a message: short and plain, the answer first. Put detail in an attached file, not a long message.
 - If a send is refused, don't send it somewhere else instead. Tell the user it couldn't go there and how to allow it.
-- A request made on the web to send something to a chat ("send me the summary on Slack") is an ordinary task: send what was asked, where it was asked.
+- A request made on the web to send something to a chat ("send me the summary on Feishu" or "on Discord") is an ordinary task: send what was asked, where it was asked.
 
 ## How sending works
 
@@ -28,22 +29,21 @@ In a chat the user sees what you send, not your updates between tool calls.
 
 ## What each app shows
 
-| What you write | Slack | Discord | Telegram | iMessage | Feishu |
-|---|---|---|---|---|---|
-| Headings | Shown, all one size | `#`, `##` and `###` only | Shown | Marks removed | Shown |
-| Bold, italic, strikethrough | Shown | Shown, plus underline and spoilers | Shown | Marks removed | Shown |
-| Lists | Shown, plus task lists | Shown | Shown | Bullets kept as • | Shown |
-| Code blocks | Shown, with the language | Shown, with the language | Shown | Fence removed, code kept | Shown, with the language |
-| Tables | Shown; keep to a few columns and attach a wide one | Turned into a code block, hard to read on a phone | Shown; monospace text in the fallback | Labelled lines, a block per row | Shown; at most 5 in one card |
-| `[text](url)` links | Shown | Shown | Shown | Becomes `text (url)` | Shown |
-| Math | Not rendered | Not rendered | Shown; as written in the fallback | As written | Not rendered |
-| One message holds | 12,000 characters, then it is split | 2,000 characters, then it is split | A send's 20,000 characters (4,096 in the fallback); a long list or table splits sooner | 2,000 characters a bubble, at most 3 bubbles | About 28 KB a card (some 9,000 Chinese characters), then it is split; tables split it sooner |
-| Files | 20 MB each | 10 together, 20 MB each or the server's lower limit | Photos (PNG, JPEG, GIF, WebP) up to 10 MB show as photos; other files go as documents, up to 20 MB | 10 MB each, 25 MB in all; larger ones, up to 20 MB, go as links | Images (PNG, JPEG, GIF, WebP, BMP, TIFF) up to 10 MB show as images; other files go as files, up to 20 MB |
-| `reply: true` | No effect | Works in server channels | Works in groups | Works in group chats | No effect |
+<!-- DALTON-HOOK(prompt-audit-text): focus formatting table on Dalton supported apps (Feishu, Discord, personal WeChat) -->
+| What you write | Feishu | Discord | Personal WeChat (`weixin:@me`) |
+|---|---|---|---|
+| Headings | Shown | `#`, `##` and `###` only | Plain text |
+| Bold, italic, strikethrough | Shown | Shown, plus underline and spoilers | Plain text |
+| Lists | Shown | Shown | Plain text |
+| Code blocks | Shown, with the language | Shown, with the language | Plain text |
+| Tables | Shown; at most 5 in one card | Turned into a code block, hard to read on a phone | Plain text; attach a file for wide tables |
+| `[text](url)` links | Shown | Shown | Write URLs plainly |
+| Math | Not rendered | Not rendered | As written |
+| One message holds | About 28 KB a card (some 9,000 Chinese characters), then it is split; tables split it sooner | 2,000 characters, then it is split | Prefer concise text messages |
+| Files | Images (PNG, JPEG, GIF, WebP, BMP, TIFF) up to 10 MB show as images; other files go as files, up to 20 MB | 10 together, 20 MB each or the server's lower limit | Supported as attachments via direct message |
+| `reply: true` | No effect | Works in server channels | Direct messages only |
 
-- **Slack**: an image written in Markdown shows as a link, not a picture. Write links as `[text](url)`.
-- **Discord**: underline is `__text__` and a spoiler is `||text||`. Mentions you write don't notify anyone.
-- **Telegram**: a dollar sign before a digit is shown as money, not math. If Telegram refuses the rich format, the message is resent as simpler text: 4,096 characters, tables as monospace text, math as written. Prefer short messages.
-- **iMessage**: plain text only. Write plain sentences and short lists, and write URLs out in full. Keep it to one message: several in a row read as spam and can get the line filtered.
 - **Feishu**: each message is a card. An image written in Markdown with a public web address shows as a picture in it.
+- **Discord**: underline is `__text__` and a spoiler is `||text||`. Mentions you write don't notify anyone.
+- **Personal WeChat**: direct messages only (`weixin:@me`); group chats are not supported.
 - **Every app**: a workspace path written as a link does not open in a chat. Attach the file.

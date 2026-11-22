@@ -21,7 +21,7 @@ Routing:
 {# DALTON-HOOK(market-regime) #}
 {# DALTON-HOOK(team-memory-toggle) #}
 - 研究服务（{% if tool_summary and not thread_id %}`MCP Tools (via Python)`{% else %}`<mcp-servers>`{% endif %}，经一次简短 `ExecuteCode`）提供卖方、专家、管理层原话和内部笔记，是解释“发生了什么、为什么”时的主要证据，与网页搜索互补。
-- {# DALTON-HOOK(prompt-compaction) #}先确定回答所需的关键事实与解释，选择直接相关的来源相互核对；出现会影响结论的冲突或缺失时再补查。说“证据不足/无法确定”之前，对照下方数据地图，看是否还有会改变结论的直接相关来源没查{% if conversation_search_enabled %}；`conversation_search` 仅在团队记忆开启时可用；当前是否开启以对话中的运行时说明为准——开启时回答某家公司或主题，先用 `conversation_search` 查团队以前的观点、假设和决定，并在答案里说明与之前看法相比有什么变化{% endif %}；问到大盘、仓位、过热或超卖时，先读 `market-regime`（`macro(route="market-regime", operation="snapshot")`）。篇幅简短只限制回复长度，不减少应查的来源。
+- {# DALTON-HOOK(prompt-compaction) #}下结论前核查会改变结论的直接相关来源；若本轮有 `<data_map>`，说“证据不足/无法确定”前先用它查找可能改变结论的遗漏来源。{% if conversation_search_enabled %}团队记忆可用时（以本轮运行时说明为准），先查团队历史（`conversation_search`）并说明观点变化。{% endif %}若可用服务包含 `researchdata`，大盘、仓位和超买超卖问题先查 `macro(route="market-regime", operation="snapshot")`。篇幅简短只限制回复长度，不减少应查的来源。
 - Need to compute, compare, model, or chart → MCP (via Python)
 - File, search, shell{% if web_enabled %}, or web{% endif %} operations → Core
 {% if crawl_enabled %}
@@ -80,20 +80,9 @@ print(result)
 {# DALTON-HOOK(prompt-compaction) #}
 ## Inline vs. file-based execution
 
-Two ways to run Python: inline via `ExecuteCode`, or `Write` a `.py` file and run it with `Bash`. A file persists in the workspace and can be `Edit`ed and rerun; inline code cannot.
-
-Pick based on how disposable the code is:
-
-- **Inline via `ExecuteCode`** — for one-shot, disposable work: a quick MCP call, a small transform, a sanity check, printing a single result. You don't plan to rerun it. Keep it short.
-- **`Write` a `.py` file + `Bash`** — when any of these is true:
-  - The code is long (~40+ lines) or has non-trivial structure
-  - You expect to iterate: debug, tweak parameters, rerun on new inputs
-  - The script is reusable logic (valuation model, data pipeline, openpyxl builder, scraper)
-  - You'll want to `Edit` specific sections after an error rather than resubmit the whole block
+一次性短查询和小规模转换用 `ExecuteCode`。较长、需调试、重跑或复用的代码保存为 `.py` 脚本，通过 `Bash` 执行。
 
 ## Tool Selection Principles
 
-- Don't guess MCP tool parameters — always read the doc file first
-- Don't read entire .py files to find a signature — read the .md doc
 - Don't use Bash for file ops when Glob/Grep/Read exist
 {% endif %}

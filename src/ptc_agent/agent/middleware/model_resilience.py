@@ -392,25 +392,43 @@ def _format_cooldown_refusal_message(  # DALTON-HOOK(antigravity-series)
     expires_at: float | int | None,
     *,
     reason: str | None = None,
+    shared_antigravity_vendor: bool = False,
 ) -> str:
     """Format a pre-dispatch cooldown refusal message according to the stored refusal reason."""
     label = model_name or "当前模型"
+    if shared_antigravity_vendor:
+        tail_wait = "同一 Antigravity 账户下，该厂商的模型共用冷却；请选择其他厂商的可用模型，或等恢复后再试"
+        tail_later = "同一 Antigravity 账户下，该厂商的模型共用冷却；请选择其他厂商的可用模型，或稍后再试"
+        tail_topup = "同一 Antigravity 账户下，该厂商的模型共用冷却；请选择其他厂商的可用模型，或充值后再试"
+    else:
+        tail_wait = "可以换用其他模型派发，或等恢复后再派"
+        tail_later = "可以换用其他模型派发，或稍后再派"
+        tail_topup = "可以换用其他模型派发，或充值后再派"
     if reason == "rate_limited":
         if isinstance(expires_at, (int, float)):
             dt_hkt = datetime.fromtimestamp(float(expires_at), tz=timezone.utc).astimezone(_HKT)
             when = dt_hkt.strftime("%Y-%m-%d %H:%M") + " HKT"
-            return f"{label} 当前触发请求频率限制，预计 {when} 恢复；可以换用其他模型派发，或稍后再派"
-        return f"{label} 当前触发请求频率限制；可以换用其他模型派发，或稍后再派"
+            return f"{label} 当前触发请求频率限制，预计 {when} 恢复；{tail_later}"
+        return f"{label} 当前触发请求频率限制；{tail_later}"
     if reason == "out_of_credit":
-        return f"{label} 的账户余额已用完；可以换用其他模型派发，或充值后再派"
+        return f"{label} 的账户余额已用完；{tail_topup}"
     if reason == "quota_exceeded":
         if isinstance(expires_at, (int, float)):
             dt_hkt = datetime.fromtimestamp(float(expires_at), tz=timezone.utc).astimezone(_HKT)
             when = dt_hkt.strftime("%Y-%m-%d %H:%M") + " HKT"
-            return f"{label} 的配额已用完，预计 {when} 恢复；可以换用其他模型派发，或等恢复后再派"
-        return f"{label} 的配额已用完；可以换用其他模型派发，或等恢复后再派"
+            return f"{label} 的配额已用完，预计 {when} 恢复；{tail_wait}"
+        return f"{label} 的配额已用完；{tail_wait}"
     if reason == "plan_limit" and not isinstance(expires_at, (int, float)):
-        return f"{label} 的订阅额度已用完；可以换用其他模型派发，或等恢复后再派"
+        return f"{label} 的订阅额度已用完；{tail_wait}"
+    if shared_antigravity_vendor:
+        ts = (
+            float(expires_at)
+            if isinstance(expires_at, (int, float))
+            else time.time() + DEFAULT_QUOTA_EXHAUSTION_TTL_SECONDS
+        )
+        dt_hkt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(_HKT)
+        when = dt_hkt.strftime("%Y-%m-%d %H:%M") + " HKT"
+        return f"{label} 的订阅额度已用完，预计 {when} 恢复；{tail_wait}"
     return format_quota_cooldown_message(label, expires_at)
 
 
@@ -475,7 +493,13 @@ async def check_oauth_quota_cooldown(  # DALTON-HOOK(quota-exhaustion)
             else:
                 reset_at = None
     display = label or str(data.get("model") or "当前模型")
-    return _format_cooldown_refusal_message(display, reset_at, reason=reason)
+    shared_vendor = ":antigravity-oauth:vendor:" in redis_key
+    return _format_cooldown_refusal_message(
+        display,
+        reset_at,
+        reason=reason,
+        shared_antigravity_vendor=shared_vendor,
+    )
 
 
 class _RemoteQuotaExhaustedError(RuntimeError):  # DALTON-HOOK(quota-exhaustion)

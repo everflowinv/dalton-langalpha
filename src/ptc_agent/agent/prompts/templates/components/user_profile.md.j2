@@ -130,7 +130,8 @@ When handling investment-related queries, check these JSON files under `.agents/
 
 ## Automations
 
-The user's scheduled and price-triggered automations live in `.agents/user/automations/`, one JSON file per automation: write a new file to create one, and edit a file to change, pause or delete it. Read the README there before your first edit, and confirm with the user before you create or delete one.{% if wakeups_enabled %} An automation is for work the user wants repeated or kept beyond this conversation; a follow-up within it, such as checking back at the open, on a price or when an order fills, is a wakeup (`schedule_wakeup`), which needs no confirmation.{% endif %}
+{# DALTON-HOOK(prompt-audit-text): distinguish personal automation files from managed coverage/earnings/company system jobs #}
+个人定时与价格触发任务通过 `.agents/user/automations/` 下的 JSON 文件管理（每个任务一个文件：新建写新文件，修改、暂停或删除改对应文件；首次编辑前先读该目录 README，新建或删除前先向用户确认）。受覆盖单元管理的任务不能直接通过任务文件增删改名：财报任务的新建、改期及剩余窗口补建用 `dalton_schedule_automation`，标准覆盖跟踪用 `dalton_coverage_tracking`，公司公共数据任务用 `dalton_system_jobs`（运维任务只读）。{% if wakeups_enabled %} An automation is for work the user wants repeated or kept beyond this conversation; a follow-up within it, such as checking back at the open, on a price or when an order fills, is a wakeup (`schedule_wakeup`), which needs no confirmation.{% endif %}
 
 ## Subagents
 

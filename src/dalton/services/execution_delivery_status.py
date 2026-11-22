@@ -1038,6 +1038,34 @@ def format_execution_delivery_note(
     failed_count = _safe_int(summary.get("failed_count"), 0)
     total_targets = _safe_int(summary.get("total_targets"), 0)
 
+    if d_status in ("failed", "partial_failed") and summary.get("awaiting_receipt"):
+        raw_targets = summary.get("targets") or ()
+        confirmed_failed = [
+            item
+            for item in raw_targets
+            if isinstance(item, Mapping)
+            and str(item.get("status") or "").strip().lower() == "failed"
+            and str(item.get("error_code") or "").strip().lower() not in UNCERTAIN_NOTIFY_ERROR_CODES
+        ]
+        if confirmed_failed:
+            first_confirmed = confirmed_failed[0]
+            confirmed_reason = humanize_delivery_error(
+                first_confirmed.get("error_code"),
+                first_confirmed.get("error_message"),
+                lang=lang,
+            )
+            c_count = len(confirmed_failed)
+            if lang == "zh":
+                detail = f"{c_count} 个目标已确认投递失败（{confirmed_reason}）" if confirmed_reason else f"{c_count} 个目标已确认投递失败"
+                return f"任务已完成，仍有目标等待送达确认；另有 {detail}"
+            detail = f"{c_count} target(s) failed ({confirmed_reason})" if confirmed_reason else f"{c_count} target(s) failed"
+            return f"finished · awaiting delivery confirmation; {detail}"
+        return (
+            "任务已完成，仍有目标等待送达确认"
+            if lang == "zh"
+            else "finished · awaiting delivery confirmation"
+        )
+
     if d_status == "failed":
         if lang == "zh":
             return f"已完成 · 投递失败（{reason}）" if reason else "已完成 · 投递失败"
@@ -1062,6 +1090,6 @@ def format_execution_delivery_note(
         return "finished · partial delivery failed"
 
     if d_status == "retrying":
-        return "已完成 · 投递中" if lang == "zh" else "finished · delivering"
+        return "任务已完成，系统正在重试投递" if lang == "zh" else "finished · retrying delivery"
 
     return None

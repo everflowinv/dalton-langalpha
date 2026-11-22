@@ -345,19 +345,25 @@ def build_web_search_tool(
         - Verify or update information
 
         Args:
-            query: Search query to look up. Filter by time with `start_date`/`end_date` rather than putting dates in `query`.
-            time_range: Filter by recency - 'day'/'d' (24h), 'week'/'w' (7d),
+            query: Search query to look up. Pass preferred dates via `start_date`/`end_date` rather than putting dates in `query`.
+            time_range: Preferred recency hint - 'day'/'d' (24h), 'week'/'w' (7d),
                 'month'/'m' (30d), 'year'/'y' (365d).
                 Ignored if start_date or end_date is provided.
-            start_date: Start date for results (YYYY-MM-DD format).
-                Takes priority over time_range.
-            end_date: End date for results (YYYY-MM-DD format).
-                Takes priority over time_range.
+            start_date: Preferred start date hint for results (YYYY-MM-DD format);
+                passed as a search preference rather than a hard filter — verify the
+                publication date on the original page or video before including it in a report,
+                and mark time unverified if it cannot be confirmed. Takes priority over time_range.
+            end_date: Preferred end date hint for results (YYYY-MM-DD format);
+                passed as a search preference rather than a hard filter — verify the
+                publication date on the original page or video before including it in a report,
+                and mark time unverified if it cannot be confirmed. Takes priority over time_range.
             topic: Search topic - 'general' (default), 'news', or 'finance'
                 （该搜索不区分 topic，忽略该参数）
 
         Returns:
-            Ranked results as titles, snippets and URLs — not full page text.
+            Either a ranked list of sources (titles, snippets, URLs) or a synthesized answer
+            with source links — not full page text. Use the synthesized answer to locate
+            verifiable sources.
         """
         _ = (verbose, topic)
         try:

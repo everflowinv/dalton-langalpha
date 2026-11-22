@@ -1379,12 +1379,17 @@ class TestThePreferredMark:
         assert "preferred chat marked" in messaging.LIST_MESSAGE_TARGETS_DESCRIPTION
 
     def test_the_descriptions_name_the_dm_by_address(self):
+        # DALTON-HOOK(prompt-audit-text): bare app name routes to preferred chat (or DM if unset); @me explicitly targets DM; Dalton supports Feishu, Discord, personal WeChat
         assert (
-            "only an app name, like `discord`, is the user's direct messages there, "
-            "the same as `discord:@me`" in messaging.SEND_MESSAGE_DESCRIPTION
+            "Passing only an app name (such as `discord` or `feishu`) sends to that app's preferred chat"
+            in messaging.SEND_MESSAGE_DESCRIPTION
         )
         assert (
-            "A direct message is listed as `<app>:@me`, or `slack:<team>` on Slack."
+            "To explicitly send to the user's direct messages, use `<app>:@me`"
+            in messaging.SEND_MESSAGE_DESCRIPTION
+        )
+        assert (
+            "A direct message is listed as `<app>:@me`"
             in messaging.LIST_MESSAGE_TARGETS_DESCRIPTION
         )
 

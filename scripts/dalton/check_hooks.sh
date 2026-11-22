@@ -472,6 +472,9 @@ ALLOWED_HOOKS=(
   # Per-automation reasoning_effort field (d042), shared write/snapshot/file paths,
   # executor/continuation/wakeup/fallback inheritance, and MoreOptions effort selector.
   "automation-effort"
+  # Prompt audit v2 & CoS audit v2 wording/copy fixes across upstream templates,
+  # backend READMEs, tool descriptions, and langalpha-doc.
+  "prompt-audit-text"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

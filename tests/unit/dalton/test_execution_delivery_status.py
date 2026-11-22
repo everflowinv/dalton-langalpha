@@ -494,7 +494,7 @@ def test_cos_activity_renders_all_five_delivery_states() -> None:
     assert "- 13:00 Delivered Task, finished: All clear" in lines
     assert "- 13:13 市场晚报, finished · delivery failed (Card exceeds 30 KB limit): 晚报已生成" in lines
     assert "- 13:20 Partial Task, finished · partial delivery failed (1/2: Target channel delivery failed): Summary ready" in lines
-    assert "- 13:25 Retrying Task, finished · delivering: Pending push" in lines
+    assert "- 13:25 Retrying Task, finished · retrying delivery: Pending push" in lines
     assert "- 13:30 Plain Task, finished: No delivery configured" in lines
 
 
@@ -596,7 +596,7 @@ def test_system_jobs_summarize_last_execution_five_states() -> None:
     _, retrying = system_jobs._summarize_last_execution(
         {**base, "delivery_summary": {"status": "retrying", "total_targets": 1, "sent_count": 0, "failed_count": 0, "retrying_count": 1}}
     )
-    assert retrying == "已完成 · 投递中"
+    assert retrying == "任务已完成，系统正在重试投递"
 
     _, no_delivery = system_jobs._summarize_last_execution({**base, "delivery_summary": None})
     assert no_delivery == "市场晚报摘要"
@@ -968,7 +968,7 @@ async def test_script_notify_status_fallback_without_target_rows(
 
     assert runs[0]["delivery_summary"] is not None
     assert runs[0]["delivery_summary"]["status"] == "retrying"
-    assert eds.format_execution_delivery_note(runs[0], lang="zh") == "已完成 · 投递中"
+    assert eds.format_execution_delivery_note(runs[0], lang="zh") == "任务已完成，系统正在重试投递"
 
     assert runs[1]["delivery_summary"] is not None
     assert runs[1]["delivery_summary"]["status"] == "failed"
@@ -1096,7 +1096,7 @@ async def test_system_jobs_data_task_and_cross_owner_sector_batch_enrichment(
     }
     await eds.enrich_executions_with_delivery_summary([pending_data_run])
     _, label_pending, _ = system_jobs._summarize_data_task_run(pending_data_run)
-    assert label_pending == "已完成 · 投递中"
+    assert label_pending == "任务已完成，系统正在重试投递"
 
     # 2. list_system_jobs batch-enriches cross-owner sector units (single batch call for foreign owners)
     exec_s1 = str(uuid4())
@@ -1242,7 +1242,7 @@ async def test_system_jobs_data_task_and_cross_owner_sector_batch_enrichment(
     result = await system_jobs.list_system_jobs("pm-user")
     sector_by_key = {item["key"]: item for item in result["groups"]["sector"]}
     assert sector_by_key["sector:semi"]["last_result"] == "已完成 · 投递失败（卡片超过 30 KB 上限）"
-    assert sector_by_key["sector:ai"]["last_result"] == "已完成 · 投递中"
+    assert sector_by_key["sector:ai"]["last_result"] == "任务已完成，系统正在重试投递"
     # 1 call for caller's own rows + 1 single batch call for BOTH foreign owners (no N+1)
     assert len(enrich_calls) == 2
     assert enrich_calls[1] == 2
@@ -1321,13 +1321,13 @@ def test_reconcile_only_uncertain_pending_shows_unconfirmed_and_updates_on_recei
         eds.format_execution_delivery_note(
             {"status": "completed", "delivery_summary": uncertain_third}, lang="zh"
         )
-        == "已完成 · 投递失败（投递状态未确认）"
+        == "任务已完成，仍有目标等待送达确认"
     )
     assert (
         eds.format_execution_delivery_note(
             {"status": "completed", "delivery_summary": uncertain_third}, lang="en"
         )
-        == "finished · delivery failed (Delivery could not be confirmed)"
+        == "finished · awaiting delivery confirmation"
     )
 
     # Even attempt 1 on gateway/report/data_task with delivery_uncertain is reconcile-only (never resent).

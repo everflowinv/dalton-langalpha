@@ -9,7 +9,7 @@ description: "无人值守的新能源与中概股周报：按35家公司取数�
 
 两种运行模式由自动化指令写明，技能不自行选择。两条自动化共用一个 `report_run_id`（本次周报的运行标识）：`mark-weekly-newenergy-<saturday>`（`<saturday>` 是 `window` 命令返回的 `saturday` 字段，即美东周六日期，格式 `YYYY-MM-DD`）。只有改写模式提交 `automation_report`（自动化报告）。
 
-- **原版**：`collect` 抓取 AlphaEngine 和内部库结果并写入 `state/mark-weekly-news/runs/<saturday>/raw.json`，对话里补 `web_search`，写稿，`check` 到 35/35，发布原版飞书文档。不提交 `automation_report`。结果只写入状态文件。最终回复只写 `NO_REPLY`。
+- **原版**：`collect` 抓取 AlphaEngine 和内部库结果并写入 `state/mark-weekly-news/runs/<saturday>/raw.json`，对话里补 `WebSearch`，写稿，`check` 到 35/35，发布原版飞书文档。不提交 `automation_report`。结果只写入状态文件。最终回复只写 `NO_REPLY`。
 - **改写**：读本周原版定稿，按 `.agents/skills/dalton-mark-weekly-newenergy/references/restyle_style.md` 逐段改写，脚本逐段校验。没通过的段保留原文。整体校验通过后发布改写版飞书文档，然后提交纯文本摘要。原版未完成或失败时，不改写，改由改写模式提交含失败原因的 `text`。
 
 接收方在 `metadata.report_profile`，配置名是 `mark-weekly-newenergy`。技能正文和工具参数都不写接收方。
@@ -76,7 +76,7 @@ python3 .agents/skills/dalton-mark-weekly-newenergy/scripts/mark_weekly.py \
   --json window --workspace-dir <workspace>
 ```
 
-记下 `saturday`、`report_run_id`、`title`、`window`。`window` 里有 `date_from`、`date_to`、`web_date_after`、`web_date_before`、`calendar_until`。时区是 America/New_York（美东）。结束日默认是今天的美东日期。`web_date_after` 和 `web_date_before` 就是后面 `web_search` 的 `start_date` 和 `end_date`。
+记下 `saturday`、`report_run_id`、`title`、`window`。`window` 里有 `date_from`、`date_to`、`web_date_after`、`web_date_before`、`calendar_until`。时区是 America/New_York（美东）。结束日默认是今天的美东日期。`web_date_after` 和 `web_date_before` 就是后面 `WebSearch` 的 `start_date` 和 `end_date`。
 
 ## 2. 计划
 
@@ -90,9 +90,9 @@ python3 .agents/skills/dalton-mark-weekly-newenergy/scripts/mark_weekly.py \
 
 - `alphaengine`：35 家各两条，再加 11 条行业查询，共 81 条。公司 `limit` 为 8，行业 `limit` 为 10。卖方类目是 `sell_side_report`、`sell_side_comment`、`meeting_minutes`。新闻类目是 `news`、`announcement`。行业查询不传 `document_categories`。这些调用由下一步的 `collect` 执行。
 - `internal`：`handled_by` 为 `collect`。脚本先列 `company-wiki`（企业维基，`limit` 100，`indexed_since` 用窗口的 `date_from`），再对 sales-notes、tmtb、funda-ai（内部邮件与笔记库）按公司检索，读正文时用 `route="all"`、`operation="read"`。
-- `web_search` 与 `get_document`：在 `assemble` 之后执行，见第 4 节末。
+- `WebSearch` 与 `get_document`：在 `assemble` 之后执行，见第 4 节末。
 
-`researchdata` 只能从 Python 调用。Bash 运行本技能脚本前会带上 `PYTHONPATH` 和 `PTC_WORKSPACE_CONFIG`，所以脚本里可以 `from tools import researchdata`。`web_search`、`feishu_create_doc`、`automation_report` 是直接工具。
+`researchdata` 只能从 Python 调用。Bash 运行本技能脚本前会带上 `PYTHONPATH` 和 `PTC_WORKSPACE_CONFIG`，所以脚本里可以 `from tools import researchdata`。`WebSearch`、`feishu_create_doc`、`automation_report` 是直接工具。
 
 ## 3. 采集
 
@@ -137,7 +137,7 @@ python3 .agents/skills/dalton-mark-weekly-newenergy/scripts/mark_weekly.py \
   --raw state/mark-weekly-news/runs/<saturday>/raw.json
 ```
 
-读 `window`、`evidence_files`、`big_moves_ge_8pct`、`prev_run`、`errors`、`errors_summary`、`ae_queries`、`ae_failed`。`errors` 是全部失败，`errors_summary` 是前 30 条。`ae_failed` 超过三分之一时，`hint` 会要求改用 `web_search`，并在「未核实」写明「AlphaEngine 不可用：错误码」。不要把检索失败写成无更新。
+读 `window`、`evidence_files`、`big_moves_ge_8pct`、`prev_run`、`errors`、`errors_summary`、`ae_queries`、`ae_failed`。`errors` 是全部失败，`errors_summary` 是前 30 条。`ae_failed` 超过三分之一时，`hint` 会要求改用 `WebSearch`，并在「未核实」写明「AlphaEngine 不可用：错误码」。不要把检索失败写成无更新。
 
 `prev_run.draft` 是上周稿。上周已经写过的事件本周不重复。同一事件有新进展时只写新进展，并注明「上周已报」。`state/mark-weekly-news/runs/<saturday>/evidence/prev-earnings.md` 是上一期稿的「五、业绩日历」，业绩日历以它和证据里的业绩日历线索为底。
 
@@ -162,17 +162,17 @@ research(
 
 优先读摘要。只在要写进稿件的数字或原话对不上摘要时才读全文。这 6 篇不代替 `collect` 已经做过的 `search_library`。
 
-网页检索在对话里调用。工具名是 `web_search`。只传 `query`、`start_date`、`end_date`。不要传 `count`、`country`、`language`、`domain_filter`、`freshness`、`date_after`、`date_before`、`time_range`、`topic`。日期用 `plan` 里该条的 `start_date` 和 `end_date`。样例窗口是 2026-10-31 至 2026-11-08：
+网页检索在对话里调用。工具名是 `WebSearch`。只传 `query`、`start_date`、`end_date`。不要传 `count`、`country`、`language`、`domain_filter`、`freshness`、`date_after`、`date_before`、`time_range`、`topic`。日期用 `plan` 里该条的 `start_date` 和 `end_date`。样例窗口是 2026-10-31 至 2026-11-08：
 
 ```python
-web_search(
+WebSearch(
     query="宁德时代",
     start_date="2026-10-31",
     end_date="2026-11-08",
 )
 ```
 
-`plan` 里每家的 `query`：`ae_q` 不含汉字时用 `ae_q`，例如松下用 `Panasonic Energy`、三星SDI 用 `Samsung SDI`；`ae_q` 含汉字时用中文名，例如宁德时代。行业查询用 `plan` 里的 `q`，中文和英文都要覆盖。对 `big_moves_ge_8pct` 里的公司，以及未来 7 天有业绩日期的公司，再各做一次同样的 `web_search`。结果直接用于写稿，不要写入 `state/mark-weekly-news/runs/<saturday>/raw.json`。
+`plan` 里每家的 `query`：`ae_q` 不含汉字时用 `ae_q`，例如松下用 `Panasonic Energy`、三星SDI 用 `Samsung SDI`；`ae_q` 含汉字时用中文名，例如宁德时代。行业查询用 `plan` 里的 `q`，中文和英文都要覆盖。对 `big_moves_ge_8pct` 里的公司，以及未来 7 天有业绩日期的公司，再各做一次同样的 `WebSearch`。结果直接用于写稿，不要写入 `state/mark-weekly-news/runs/<saturday>/raw.json`。
 
 ## 5. 写稿
 

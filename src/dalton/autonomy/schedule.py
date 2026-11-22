@@ -252,7 +252,7 @@ def build_company_watch_specs(
                 },
             },
             "instruction": (
-                f"{t_upper} 日内涨幅达到或超过 +4%。请按 `.agents/skills/dalton-stock-move/SKILL.md` 第一步先用 `web_search` 与 `x_search` 搜最新新闻和 X（当天与前一天）拿到“今天发生了什么”，再去查基本面、卖方预期与同行联动原因，"
+                f"{t_upper} 日内涨幅达到或超过 +4%。请按 `.agents/skills/dalton-stock-move/SKILL.md` 第一步先用 `WebSearch` 与 `x_search` 搜最新新闻和 X（当天与前一天）拿到“今天发生了什么”，再去查基本面、卖方预期与同行联动原因，"
                 "并追加 `knowledge_append_verdict`。"
             ),
             "metadata": _with_unit(
@@ -287,7 +287,7 @@ def build_company_watch_specs(
                 },
             },
             "instruction": (
-                f"{t_upper} 日内跌幅达到或超过 -4%。请按 `.agents/skills/dalton-stock-move/SKILL.md` 第一步先用 `web_search` 与 `x_search` 搜最新新闻和 X（当天与前一天）拿到“今天发生了什么”，再去查基本面、卖方预期与同行联动原因，"
+                f"{t_upper} 日内跌幅达到或超过 -4%。请按 `.agents/skills/dalton-stock-move/SKILL.md` 第一步先用 `WebSearch` 与 `x_search` 搜最新新闻和 X（当天与前一天）拿到“今天发生了什么”，再去查基本面、卖方预期与同行联动原因，"
                 "并追加 `knowledge_append_verdict`。"
             ),
             "metadata": _with_unit(

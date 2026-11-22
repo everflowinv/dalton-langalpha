@@ -433,8 +433,9 @@ async def test_still_indeterminate_review_returns_clear_error_and_next_call_runs
         workspace_id="ws-1", draft_path=DRAFT, round=1, backend=_backend(files), user_id="user-1"
     )
     assert first["ok"] is False
-    assert "语言审查服务暂时不可用" in first["message"]
-    assert "可稍后重试或跳过" in first["message"]
+    assert "本轮语言审查未完成，可稍后重试" in first["message"]
+    assert "需要语言审查的交付请等该轮通过后继续" in first["message"]
+    assert "或跳过" not in first["message"]
     assert "可能已经计费" not in first["message"]
     assert f"{DRAFT}.language.json" not in files
     assert f"{DRAFT}.language.md" not in files
@@ -686,7 +687,7 @@ async def test_resend_is_capped_after_one_resend_per_request_hash(
     # Rounds 2 and 3 refuse without sending and without another ledger note.
     assert results[1].status == "indeterminate" and not results[1].ok
     assert results[2].status == "indeterminate" and not results[2].ok
-    assert "供应商可能已经计费" in (results[1].error or "")
+    assert "供应商可能已计费" in (results[1].error or "")
     assert service.complete.await_count == 1
     resend_notes = [e for e in events if e["kind"] == "journal_resend_indeterminate"]
     assert len(resend_notes) == 1

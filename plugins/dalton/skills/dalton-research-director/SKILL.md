@@ -29,7 +29,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
   - **最近投资重估（`last_revaluation_at`）**：最近一次 `thesis` 的 `underwriting.scenario_version` 递增的时间，或者最近一次五词结论不是 `NO_CHANGE`（`NEW_THESIS`、`THESIS_STRENGTHENED`、`THESIS_WEAKENED`、`THESIS_BROKEN`）的时间，取两者较晚的；不含 `underwriting` 块的旧版 `thesis` 只看五词结论。
   - **仅扫描而长期未投资重估（`scan_only_stale`）**：看板和排期都分别使用最近扫描（`last_scan_at`）与最近投资重估（`last_revaluation_at`），不再用一个混在一起的“最近更新”；只做扫描（连续 `NO_CHANGE`）、长期未投资重估的公司（`scan_only_stale=true`）会被单独标出并抬高最近投资重估权重（`revaluation_staleness`）。
 - `candidates`：服务端已按紧迫度与两种新鲜度权重算好并排好序的候选任务列表，每项包含 `rank`、`workspace_id`、`ticker`、`task`、`kind`（候选任务来源类型，仅允许 `"open_question"`、`"validation_check"`、`"event_note"` 三种）、`score`、`est_usd`、`decision_impact`（这个问题解决后会改变哪个决定）、`last_scan_at`、`last_revaluation_at`、`scan_staleness`、`revaluation_staleness`、`scan_only_stale`、`why`。
-- `units`（`coverage_units.enabled` 开启时才有此键）：已登记覆盖单元视图，行业与公司各一条，每项 `{unit_id, kind(company|sector), slug, display_name, owner_user_id, workspace_id, readable, delegatable, auto_tracked}`；行业单元另有 `members`：每项 `{member_id, name, ticker, company_unit_id, workspace_created, workspace_id, scope, reason, valid_until}`。三态含义：`readable`=可读（本人或共享可见）；`delegatable`=可委派（本人工作区，或共享 rw）；`auto_tracked`=纳入本人自动调度（本人有 `dalton-*` 自动化挂在该工作区）。**同事共享的行业/公司可以是资料来源（readable），但不会因为可见就成为本人调度对象**；`workspace_created=false` 的成员表示尚未建公司工作区，是否建由用户决定，不要擅自初始化。
+- `units`（`coverage_units.enabled` 开启时才有此键）：已登记覆盖单元视图，行业与公司各一条，每项 `{unit_id, kind(company|sector), slug, display_name, owner_user_id, workspace_id, readable, delegatable, auto_tracked}`；行业单元另有 `members`：每项 `{member_id, name, ticker, company_unit_id, workspace_created, workspace_id, scope, reason, valid_until}`。三态含义：`readable`=可读（按共享权限可见）；`delegatable`=可委派（本人工作区，或部署已启用同事派发且共享权限为 `rw` 的同事工作区，以工具返回的当前权限为准）；`auto_tracked`=纳入本人自动调度（本人有 `dalton-*` 自动化挂在该工作区）。**同事共享的行业/公司可以是资料来源（readable），但不会因为可见就成为本人调度对象**；`workspace_created=false` 的成员表示尚未建公司工作区，是否建由用户决定，不要擅自初始化。
 - `budget`：今日额度与剩余可分配预算（`cap_usd`、`spent_usd`、`open_reserved_usd`、`remaining_usd`、`reserve_for_events_usd`、`allocatable_usd`）。
 - `est_cost_by_kind`、`pending_approvals`（每项 `{request_id, publish_request_id, workspace_id, thread_id, kind, title, draft_path, review, created_at}`，通过 `workspace_id` 去 `companies` 里对应到公司）、`pm_handoffs`（每项 `{ticker, workspace_id, id, what, since}`）。
 
@@ -128,7 +128,7 @@ python3 .agents/skills/dalton-research-director/scripts/render_coverage.py \
 2. **登记**：`action="register", kind="sector", slug=..., display_name=..., research_tz=...`。行业单元**不传 `ticker`**（传了会被拒）；公司单元（`kind` 传 `"company"`）可传 `ticker`，服务端自动规范化。
 3. **绑定**：`action="bind", unit_id=..., workspace_id=...`，只能绑本人非 Home 工作区，一个工作区最多一个 active 单元。绑定 sector 单元成功后返回带 `hint`：向用户提示可委派该工作区运行 `dalton-init-sector` 初始化行业知识层（提示即可，用户不需要时跳过，不要擅自初始化）。
 4. **解绑 / 归档**：`action="unbind"` 只清绑定；`action="archive"` 归档单元——它停止身份解析并腾出工作区槽位，**不删除任何数据**。
-5. **失败即回报**：返回 `ok=false` 时带稳定 `error` 码（如 `slug_conflict`、`workspace_conflict`、`workspace_not_owned`、`home_workspace_refused`、`sector_ticker_refused`），把 message 原样带给用户，让用户决定换 slug、先解绑还是归档旧单元。
+5. **失败即回报**：返回 `ok=false` 时（如 `slug_conflict`、`workspace_conflict`、`workspace_not_owned`、`home_workspace_refused`、`sector_ticker_refused`），向用户说明失败原因和可执行的处理方式（如换 slug、先解绑还是归档旧单元）；用户明确要求技术诊断时可附原始字段。
 
 
 

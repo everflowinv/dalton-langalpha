@@ -47,7 +47,7 @@ def test_stock_move_skill_quant_freeze_first_filings_before_news_social_last() -
     # Step 2: news bounded to the event window, then market regime / peers and
     # sell-side research.
     step2 = _step_text(md_text, 2)
-    assert "web_search(" in step2
+    assert "WebSearch(" in step2
     assert "start_date=NEWS_START" in step2
     assert "end_date=NEWS_END" in step2
     assert 'route="alphaengine"' in step2

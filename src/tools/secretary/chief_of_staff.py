@@ -83,9 +83,10 @@ async def chief_of_staff_workspaces(
     PDF (.pdf), and image (.png, .jpg, .jpeg, .gif, .webp, .bmp, .tiff) files up to 50 MB
     only; archives, pickle/database, audio/video, and text files are refused — read text with
     "read_file".
-    You cannot delegate into a colleague's shared
-    workspace — delegate_to_analyst refuses it; to act on that work, create a workspace of
-    the user's own and hand off to its analyst.
+    Colleague-shared workspaces are read according to their shared access level; dispatching
+    into one with delegate_to_analyst is allowed only when colleague dispatch is enabled for
+    this deployment and the workspace's access is "rw" (follow the current access returned by
+    the tool). Otherwise, create a workspace of the user's own and hand off to its analyst.
 
     Args:
         action: "list", "create", "delete", "list_files", "read_file", "copy_file", or "write_file".

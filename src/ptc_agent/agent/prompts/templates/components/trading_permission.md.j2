@@ -1,4 +1,5 @@
-{% set settings_place %}Settings > Preferences > Trading permission{% if trading_settings_url %} ({{ trading_settings_url }}){% endif %}{% endset %}
+{# DALTON-HOOK(prompt-audit-text): update stale Preferences path to Trading > Trading permission #}
+{% set settings_place %}Settings > Trading > Trading permission{% if trading_settings_url %} ({{ trading_settings_url }}){% endif %}{% endset %}
 {% if level == "no_trading" %}
 **None.** The user has not given you permission to trade. Do not place or stage real-money orders on your own initiative, including in scheduled runs. If the user asks you for a specific order in this conversation, submit it; it stops for their approval before it is sent, and that approval is the only confirmation it needs.
 {% elif level == "approve_each" %}

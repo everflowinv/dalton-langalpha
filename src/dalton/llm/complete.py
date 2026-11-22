@@ -1188,8 +1188,8 @@ async def _dalton_complete_impl(
                 attempt=int((existing_row or {}).get("attempt") or 1),
                 error_kind=str((existing_row or {}).get("error_kind") or "indeterminate"),
                 error=(
-                    "上次调用在返回前中断，供应商可能已经计费。"
-                    "确认后可重新发起（会再计一次费用）。"
+                    "上次请求的结果未确认，供应商可能已计费。"
+                    "重新发起可能产生额外费用。用量按实际发出的上游请求逐次记录，暂无法确认的用量单独标记。"
                 ),
             ),
             raise_on_error=raise_on_error,

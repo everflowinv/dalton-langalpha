@@ -541,7 +541,7 @@ async def test_tools_list_catalog_and_data_map_integration(
     loader = PromptLoader()
     map_builder.set_turn_data_map(None)
     analyst_prompt = loader.get_system_prompt(role="analyst")
-    assert "问到大盘、仓位、过热或超卖时，先读 `market-regime`" in analyst_prompt
+    assert '若可用服务包含 `researchdata`，大盘、仓位和超买超卖问题先查 `macro(route="market-regime", operation="snapshot")`' in analyst_prompt
 
     stock_move_md = (REPO_ROOT / "plugins/dalton/skills/dalton-stock-move/SKILL.md").read_text(encoding="utf-8")
     assert 'macro(route="market-regime", operation="snapshot")' in stock_move_md
