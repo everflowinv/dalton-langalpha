@@ -511,9 +511,10 @@ def summarize_execution_delivery(
         else:
             continue
 
-        if target_status == "failed" and _is_receipt_reconcilable(
+        target_awaiting_receipt = target_status == "failed" and _is_receipt_reconcilable(
             raw, notify_status=notify_status
-        ):
+        )
+        if target_awaiting_receipt:
             awaiting_receipt = True
 
         target_entry: dict[str, Any] = {
@@ -521,6 +522,7 @@ def summarize_execution_delivery(
             "channel": channel,
             "name": None,
             "status": target_status,
+            "awaiting_receipt": target_awaiting_receipt,
             "error_code": eff_code if target_status == "failed" else None,
             "error_message": reason_zh if target_status == "failed" else None,
             "attempt_count": attempt,
@@ -594,9 +596,11 @@ def summarize_execution_delivery(
                 "channel": method.split(":", 1)[0].lower() if method else None,
                 "name": name,
                 "status": target_status,
+                "awaiting_receipt": False,
                 "error_code": eff_code,
                 "error_message": reason_zh,
-                "attempt_count": _safe_int(raw.get("attempt_count"), 1 if target_status != "retrying" else 0),
+                # A delivery_result row exists only after at least one finish attempt.
+                "attempt_count": _safe_int(raw.get("attempt_count"), 1),
                 "max_attempts": bounded_max,
             }
         )
@@ -1038,6 +1042,34 @@ def format_execution_delivery_note(
     failed_count = _safe_int(summary.get("failed_count"), 0)
     total_targets = _safe_int(summary.get("total_targets"), 0)
 
+    if d_status in ("failed", "partial_failed") and summary.get("awaiting_receipt"):
+        raw_targets = summary.get("targets") or ()
+        confirmed_failed = [
+            item
+            for item in raw_targets
+            if isinstance(item, Mapping)
+            and str(item.get("status") or "").strip().lower() == "failed"
+            and not bool(item.get("awaiting_receipt"))
+        ]
+        if confirmed_failed:
+            first_confirmed = confirmed_failed[0]
+            confirmed_reason = humanize_delivery_error(
+                first_confirmed.get("error_code"),
+                first_confirmed.get("error_message"),
+                lang=lang,
+            )
+            c_count = len(confirmed_failed)
+            if lang == "zh":
+                detail = f"{c_count} 个目标已确认投递失败（{confirmed_reason}）" if confirmed_reason else f"{c_count} 个目标已确认投递失败"
+                return f"任务已完成，仍有目标等待送达确认；另有 {detail}"
+            detail = f"{c_count} target(s) failed ({confirmed_reason})" if confirmed_reason else f"{c_count} target(s) failed"
+            return f"finished · awaiting delivery confirmation; {detail}"
+        return (
+            "任务已完成，仍有目标等待送达确认"
+            if lang == "zh"
+            else "finished · awaiting delivery confirmation"
+        )
+
     if d_status == "failed":
         if lang == "zh":
             return f"已完成 · 投递失败（{reason}）" if reason else "已完成 · 投递失败"
@@ -1062,6 +1094,27 @@ def format_execution_delivery_note(
         return "finished · partial delivery failed"
 
     if d_status == "retrying":
-        return "已完成 · 投递中" if lang == "zh" else "finished · delivering"
+        raw_targets = summary.get("targets") or ()
+        retrying_targets = [
+            item
+            for item in raw_targets
+            if isinstance(item, Mapping)
+            and str(item.get("status") or "").strip().lower() == "retrying"
+        ]
+        # First send only while no target has been tried yet: every target is still
+        # retrying with an explicit attempt_count of 0 (a missing count is a retry).
+        mapped_targets = [item for item in raw_targets if isinstance(item, Mapping)]
+        is_first_send = total_targets == 0 or (
+            bool(mapped_targets)
+            and len(retrying_targets) == len(mapped_targets)
+            and all(
+                item.get("attempt_count") is not None
+                and _safe_int(item.get("attempt_count"), 0) == 0
+                for item in retrying_targets
+            )
+        )
+        if is_first_send:
+            return "任务已完成，等待首次发送" if lang == "zh" else "finished · pending first send"
+        return "任务已完成，系统正在重试投递" if lang == "zh" else "finished · retrying delivery"
 
     return None

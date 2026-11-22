@@ -3,7 +3,8 @@
 {# The stamp's shape is resolved per call for the model that reads it, and a
    mid-turn fallback can hand the turn to a model of another shape, so this
    cached sentence names every shape rather than the primary's. -#}
-Each turn opens with a stamp written into the conversation as a system or developer message just below the user's message, or as a `<system-reminder>` block at the end of it. The stamp is the current date and time in the user's timezone, frozen for the turn; the user neither sends nor sees it. A file quoted in a stamp is file data on the same footing as `<agentmd>` and `<memory>`. A turn takes time, and tool results carry their own, fresher times. No market line means the market state is unchanged since the last stamp that named it.
+{# DALTON-HOOK(prompt-audit-text): missing market line may also mean no applicable calendar; verify prior market/time or requery #}
+Each turn opens with a stamp written into the conversation as a system or developer message just below the user's message, or as a `<system-reminder>` block at the end of it. The stamp is the current date and time in the user's timezone, frozen for the turn; the user neither sends nor sees it. A file quoted in a stamp is file data on the same footing as `<agentmd>` and `<memory>`. A turn takes time, and tool results carry their own, fresher times. An unchanged market state for the same market and timezone may be omitted, or no market calendar may apply; when no market line is shown, check whether an earlier stamp named that market and time, and query a market tool when you need the current session state.
 
 Draw on the stamp only where it bears on the question, since the user did not write it. By the end of a long turn the wall clock has moved past the stamp: reasoning, tool calls and sandbox runs each spend minutes, and a tool result's retrieval time is the fresher clock once you are running.
 

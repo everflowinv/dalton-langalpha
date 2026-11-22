@@ -122,12 +122,15 @@ def build_tool_signature_registry() -> dict[str, set[str]]:
         fields = set(t.args_schema.model_fields.keys()) if t.args_schema else set()
         registry.setdefault(t.name, set()).update(fields)
 
-    # 4. Direct web tools (`web_search`, `x_search`, `WebFetch`)
+    # 4. Direct web tools (`WebSearch` / legacy `web_search`, `x_search`, `WebFetch`)
     from src.tools.web.fetch import web_fetch_tool
 
-    for t in (build_web_search_tool(), build_direct_x_search_tool(), web_fetch_tool):
+    web_search_tool = build_web_search_tool()
+    for t in (web_search_tool, build_direct_x_search_tool(), web_fetch_tool):
         fields = set(t.args_schema.model_fields.keys()) if t.args_schema else set()
         registry[t.name] = fields
+    # Runtime registers `web_search` under the public tool name `WebSearch` (src/tools/web/search.py:99).
+    registry["WebSearch"] = set(registry["web_search"])
 
     # 4b. Direct market tools (`get_market_overview` etc. in src/tools/market_data/tool.py)
     from langchain_core.tools import BaseTool

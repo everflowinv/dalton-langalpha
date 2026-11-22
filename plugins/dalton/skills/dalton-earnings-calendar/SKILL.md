@@ -16,7 +16,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 - **只认公司官方来源**：仅公司 IR 新闻稿、IR Events 页面、美股 SEC 8-K/6-K 或港股/A 股交易所法定排期公告（通过 `researchdata.finance(route="cn-hk", operation="filings", ...)` 或披露易 HKEXnews 原文核实的董事会会议召期通告、定期报告预约披露时间表）明确披露未来发布日期时，才标为 `confirmed`（`date_status: confirmed`）并创建财报链自动任务。
 - **聚合日历一律标“待确认”**：FMP、yfinance、Nasdaq、Zacks、Earnings Whispers、WSJ、MarketWatch、`get_earnings_calendar` 等给出的日期只记为 `pending`（附 `tentative_date`、`tentative_sources`），`date_status: estimated`，界面与总结显示“待确认”，**在官方公布前绝不建 `tm3/t0/tp1` 自动任务**（若 `tentative_date` 在 10 天内，只建一条 T-5 的 `once` 日期复查任务，仅复查日期不做研究）。详见 [`references/classification.md`](references/classification.md)。
-- **跨工作区建任务统一调用 `dalton_schedule_automation`**：Home 的研究总监调用 `dalton_schedule_automation(action="upsert", name=..., trigger_type="once", next_run_at=..., instruction=..., description=..., timezone_name=..., workspace_id=..., ticker=...)` 创建或原地改期；分析师在本公司工作区补建时可直接写文件或调用该工具（常设授权）。标准四项自动跟踪（含 `move-up` / `move-down` 价格触发）在自动维护路径统一调用 `dalton_coverage_tracking(action="enable", source="coverage_finish", ticker=..., workspace_id=...)` 开启与补建（自动维护时 `source` 必须传 `"coverage_finish"`，以尊重 `paused_by_user` 标记、不重新打开用户主动暂停的跟踪和财报任务；仅当用户明确要求恢复跟踪时 `source` 才传 `"user"`）。
+- **个人自动化任务与受覆盖单元管理的自动化任务分入口管理**：个人自动化任务通过 `.agents/user/automations/` 下的文件管理。受覆盖单元管理的自动化任务禁止直接通过文件新建、修改、删除或改名。财报任务的新建、改期和剩余窗口补建统一调用 `dalton_schedule_automation(action="upsert", name=..., trigger_type="once", next_run_at=..., instruction=..., description=..., timezone_name=..., workspace_id=..., ticker=...)`。标准四项自动跟踪（含 `move-up` / `move-down` 价格触发）在自动维护时统一调用 `dalton_coverage_tracking(action="enable", source="coverage_finish", ticker=..., workspace_id=...)` 开启与补建：自动维护时 `source` 必须传 `"coverage_finish"`，保留 `paused_by_user` 标记，不恢复用户主动暂停的跟踪和财报任务；仅当用户明确要求恢复跟踪时 `source` 才传 `"user"`。
 - **无工作区不建链**：只为 `workspace.status=active` 的公司创建自动任务链；没有工作区的 Core 公司列入总结“缺工作区”，严禁在 Home 工作区跑出无知识层支撑的前瞻。
 
 ---
@@ -103,7 +103,7 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
 1. **检索词与时间窗**：先算 `SEARCH_START_DATE = 今天 - 180 天`。每家公司执行两条检索：
    - `"{公司}" "to report" "{季度}" results`（限 180 天内）
    - `"{公司}" earnings date announcement`（限 180 天内）
-2. **官方源确认**：美股阅读公司 IR 页面（`coverage.yaml` 中的 `earnings.ir_url`）或 SEC 8-K/6-K 原文确认；港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=SEARCH_START_DATE, end=TODAY, limit=20)`（港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`）检索巨潮资讯披露的董事会会议召期通告（Date of Board Meeting）或定期报告预约披露公告原文（港股若 `cn-hk filings` 未覆盖则用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接确认）。判定标准严格执行 [`references/classification.md`](references/classification.md)。
+2. **官方源确认**：美股阅读公司 IR 页面（`coverage.yaml` 中的 `earnings.ir_url`）或 SEC 8-K/6-K 原文确认；港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=SEARCH_START_DATE, end=TODAY, limit=20)`（港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`）检索巨潮资讯披露的董事会会议召期通告（Date of Board Meeting）或定期报告预约披露公告原文（港股若 `cn-hk filings` 未覆盖则用 `WebSearch` 查披露易 `site:hkexnews.hk` 原文链接确认）。判定标准严格执行 [`references/classification.md`](references/classification.md)。
 3. **逐家追加 JSONL**：每查完一家，立即用 `json.dumps` 追加一行到 `dalton/research/earnings-scan-<YYYY-MM-DD>.jsonl`（本 skill 在 Home 工作区运行，路径相对 Home 根；禁止手写字符串拼接）。字段固定为：
    `ticker, name, status, earnings_date, timing, quarter_label, confidence, source_url, evidence, notes`
    - 工具报错或超时写 `"status": "scan_failed"`，**严禁写成 `"not_announced"`**。
@@ -128,7 +128,7 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
    - `recorded: true` 且日期未变 → 跳过建任务，仅确认议程已同步。
    - `date_changed: true`（已确认日期发生变更）：
      - 若三条 `once` 自动任务尚未执行，调用 `dalton_schedule_automation(action="upsert", name=..., trigger_type="once", next_run_at=..., workspace_id=..., ticker=...)` **原地修改**它们的 `next_run_at`（保持连续生效），并在台账 `history` 记一条改期原因；
-     - 若某条 `once` 已经执行完毕（`file.py` 禁止修改已完成的 `once` 任务），只为尚未执行的剩余窗口写入新自动任务文件。
+     - 若某条 `once` 已经执行完毕（`file.py` 禁止修改已完成的 `once` 任务），只为尚未执行的剩余窗口调用 `dalton_schedule_automation` 补建新任务（不要直接写自动化文件）。
 2. **计算触发时间（官方 `confirmed` 且 `workspace.status=active`）**：
    - **前瞻（`tm3`）**：用 `trading_days.py` 计算发布日前 3 个交易日，设为当天市场时区 `08:00`（带 UTC 偏移）：
      ```bash
@@ -177,10 +177,10 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
      --scan dalton/research/earnings-scan-$(date +%F).jsonl
    ```
    检查 `missing` 与 `date_mismatch`。
-2. **自动任务文件读回核验**：
-   逐个读回三条自动任务文件的 `state.next_run_at`（或顶层 `next_run_at`），确认：
-   - 任务 `status` 为 `"active"`；
-   - 带时区偏移的时间先转换到公司所在市场时区（如 `America/New_York`）再比对日期与时点，**严禁直接截取字符串前 10 位**；
+2. **自动任务读回核验**：
+   按 `chain_by_tier` 核对该公司应有的自动化任务（如 Core 为 `tm3`/`t0`/`tp1`，Watch 默认仅 `t0`）；仅标待确认日期（`pending`）的公司，只核对应建的日期复查任务：
+   - 未执行的任务核对 `status` 为 `"active"` 及计划时间（读回 `state.next_run_at` 或顶层 `next_run_at`，带时区偏移的时间先转换到公司所在市场时区如 `America/New_York` 再比对日期与时点，**严禁直接截取字符串前 10 位**）；
+   - 已执行的一次性任务（`status` 可为 `"completed"`）核对运行记录；
    - 若读回不可用，只能报告“本地已记录”，严禁报告“对账通过”；
    - 对账未通过的公司及原因逐条进入总结第 2 项“**未落库**”。
 

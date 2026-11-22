@@ -38,7 +38,10 @@ create or delete one, summarize it and get a yes. Pin down:
 - the instruction: it runs with no one to ask. Make it self-contained: which
   tickers, which metrics, what format.
 - the thread: a fresh one each run, one ongoing thread, or this conversation.
-- delivery: in-app only, or also a chat app such as Slack, or one chat there.
+"""
+    # DALTON-HOOK(prompt-audit-text): Dalton channels (Feishu, Discord, personal WeChat), recycle bin delete, managed-task split
+    """- delivery: in-app only, or also a connected chat app (Feishu, Discord, or
+  personal WeChat), or one chat there.
 
 Change only what the user asked for; suggest any other edit instead of making
 it. These files are the record of the user's automations: Read them when you
@@ -46,6 +49,12 @@ need them rather than keeping their schedules or statuses in notes or memory,
 where they go stale.
 
 ## Editing
+
+Personal automations are managed through these files. Automations managed by a
+coverage unit refuse direct file create, update, delete, or rename: use
+`dalton_schedule_automation` for earnings schedules, `dalton_coverage_tracking`
+for standard coverage tracking, and `dalton_system_jobs` for company public data
+jobs (ops jobs are read-only).
 
 - **Create:** Write a new file. A name that is taken is refused, never
   overwritten.
@@ -58,8 +67,11 @@ where they go stale.
     # DALTON-HOOK(automation-effort): document reasoning_effort in automation file README
     """  on its own, so a change to one never conflicts with another.
 - **Pause / resume:** set `status` to `"paused"` or `"active"`.
-- **Delete:** set `status` to `"deleted"`, or `rm` the file from code. Its run
-  history goes with it and cannot be restored.
+- **Delete:** set `status` to `"deleted"`, or `rm` the file from code. The
+  automation moves to the recycle bin and keeps its run history; restore it
+  from the recycle bin on the Automations page (regular automations in the
+  recycle bin are purged after 30 days). Coverage-unit automations cannot be
+  deleted via files; pause them through their dedicated tools instead.
 - **Rename:** `mv` a file to another name in this folder changes only the
   file name; the automation and its history stay.
 - Copying a file creates a second automation that runs too, so never copy one
@@ -94,7 +106,7 @@ first, which is refused or becomes an automation of its own.
 """
     # DALTON-HOOK(automation-effort): include reasoning_effort in example and field reference table
     """  "reasoning_effort": null,
-  "delivery": ["slack"],
+  "delivery": ["discord:@me"],
   "max_failures": 3,
   "state": {
     "automation_id": "00000000-0000-4000-8000-000000000001",
@@ -132,13 +144,14 @@ A new one needs only what has no default, e.g. `aapl-below-200.json`:
 | trigger_config | price | See Price alerts. |
 | timezone       | no  | IANA region name, e.g. `America/New_York` (not `EST`, which ignores daylight saving). Defaults to the user's timezone. Changing it keeps a one-time automation's moment, since `next_run_at` carries its offset. |
 | instruction    | yes | The prompt each run executes. |
-| workspace_id   | no  | Where each run happens. Defaults to this workspace. `home`: the Chief of Staff runs it from the user's Home rather than in one workspace; best for price alerts and quick lookups. Another workspace's id runs it there. |
+| workspace_id   | no  | Where each run happens. Defaults to this workspace. `home`: the Chief of Staff runs it from the user's Home rather than in one workspace; best for price alerts and quick lookups. Another workspace's id runs it there. Changing `workspace_id` moves the automation to that workspace; unless `thread` also names a thread in the new workspace, any pinned thread ID is cleared. |
 | thread         | no  | `new` (default): a fresh thread each run. `persistent`: one thread that every run continues, created by the first run (`state.last_run.thread_id` names it). `current`: continue in this conversation. A thread id: continue in that thread. |
 | llm_model      | no  | A model the user can run; `null` uses their default. An unknown name is refused with the list. |
 """
     # DALTON-HOOK(automation-effort): document reasoning_effort field semantics in README table
-    """| reasoning_effort | no | Thinking effort override (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`); omit or pass `null` to follow user preference / model default. Antigravity models encode effort in `llm_model` suffix and keep `reasoning_effort` as `null`. |
-| delivery       | no  | Where results also go besides the app: a chat app, e.g. `["slack"]`, or one chat there by address, e.g. `["slack:T1/C0123"]` from `.agents/user/channels/available.json`, which lists every chat on each connected app; `[]` for none. A chat is checked when you save, and so is an app, which is refused while the user hasn't linked it. An app alone posts to the chat set for the automations of the workspace it runs in (Home has none), else the app's preferred chat, else the user's direct messages; to always post to the direct messages, name them, e.g. `["discord:@me"]` (`slack:<team>` on Slack). Leave sending out of `instruction`: each run sends its result there itself, a chat it missed gets the final answer, and a failed or stopped run posts a short notice. |
+    # DALTON-HOOK(prompt-audit-text): clarify effort omit vs null, Dalton channel examples, and multi-market price alert symbols
+    """| reasoning_effort | no | Thinking effort override (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Omit on create to inherit the user or model default; omit on update to keep the stored value (if `llm_model` also changes, an incompatible stored effort is cleared when the new model has no effort levels, or clamped to its supported range); pass `null` to clear back to default. When `llm_model` is set, pick an effort level that model supports. Built-in Antigravity models encode effort in the suffixed `llm_model` ID and keep `reasoning_effort` as `null`. |
+| delivery       | no  | Where results also go besides the app: a connected chat app in Dalton (Feishu, Discord, or personal WeChat), e.g. `["discord:@me"]` or `["feishu"]`, or a group address from `.agents/user/channels/available.json`, which lists every chat on each connected app; `[]` for none. Personal WeChat supports direct messages only (`weixin:@me`). A chat is checked when you save, and so is an app, which is refused while the user hasn't linked it. An app alone posts to the chat set for the automations of the workspace it runs in (Home has none), else the app's preferred chat, else the user's direct messages; to always post to direct messages, name them, e.g. `["discord:@me"]`, `["feishu:@me"]`, or `["weixin:@me"]`. Leave sending out of `instruction`: each run sends its result there itself, a chat it missed gets the final answer, and a failed or stopped run posts a short notice. |
 | max_failures   | no  | 1–100, default 3. Consecutive failed runs before it is disabled. |
 
 ## Price alerts
@@ -146,6 +159,7 @@ A new one needs only what has no default, e.g. `aapl-below-200.json`:
 ```json
 "trigger_config": {
   "symbol": "TSLA",
+  "market": "stock",
   "conditions": [
     {"type": "pct_change_above", "value": 5, "reference": "previous_close"}
   ],
@@ -153,7 +167,7 @@ A new one needs only what has no default, e.g. `aapl-below-200.json`:
 }
 ```
 
-- `symbol`: a bare US stock or index ticker (`AAPL`, `SPX`), no `^` or `I:` prefix.
+- `symbol`: a stock or index ticker recognized by the market-data service (US, HK, or A-shares, e.g. `AAPL`, `0700.HK`, `HSI`, `SPX`), omitting `^` and `I:` prefixes. Set `market` to `stock` or `index`.
   There is no crypto, currency or futures feed, so no alert can watch those.
 - `conditions`: one or more, all of which must hold. `type` is `price_above`,
   `price_below` (a dollar `value`), `pct_change_above` or `pct_change_below` (a

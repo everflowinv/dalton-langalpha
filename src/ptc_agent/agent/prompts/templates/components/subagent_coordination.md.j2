@@ -9,7 +9,7 @@ The sub-agents you can delegate to are listed in the `<subagents>` element of th
 {# DALTON-HOOK(prompt-compaction): same status words as the Task tool description. Update is running-only; resume is only when the tool marks the task recoverable. #}
 ## When to Update vs Resume
 
-更新用于正在运行的任务；恢复仅用于工具明确标为可恢复的任务。用户取消的任务不自动恢复或重新派发。因超时、额度或执行中断而停止的任务，按返回的原因和恢复说明处理。更新在子代理下一步推理之前送达，用来补充约束或后续数据。恢复时保留原任务上下文和已完成结果。
+更新用于正在运行的任务；恢复仅用于工具明确标为可恢复的任务。用户取消的任务不自动恢复或重新派发。因超时、额度或执行中断而停止的任务，按返回的原因和恢复说明处理。
 
 {# DALTON-HOOK(dispatch-delivery): the dispatch checklist is required in lean and detailed. Whether to delegate follows independence, context load, and handoff cost, not a tool-call count. One screenshot's transcription, second read, and discrepancy handling stay in one task. #}
 ## 派发任务
@@ -32,7 +32,7 @@ The sub-agents you can delegate to are listed in the `<subagents>` element of th
 {# DALTON-HOOK(subagent-no-self-quotas): a cap on a subtask's searching is set
    by the user's ask or a real quota error this run — never invented from a
    remembered failure, and a real error is passed on verbatim. #}
-Never invent caps on a subtask's searching or reading ("检索最多 3 次，全文只读 4–5 篇", "no searching"): set such limits only when the user asked for them or a tool actually returned a quota error this run. When a real quota error does come back, switch sources, record the gap in the result, and quote the error text verbatim to the subtask — a budget extrapolated from a past failure ("额度有限，约 30 次后拒绝") is a guess, not a quota, and hard-coding it starves the questions the user asked.
+不要自行给子代理编造检索次数或阅读篇数上限；仅在用户明确要求，或本轮工具实际返回额度报错时才设限。本轮遇到额度报错时，改用替代来源、在结果中记录缺项，并在派发子代理时原样附上该报错文本。
 
 {# DALTON-HOOK(dispatch-delivery): only a run that ended successfully with an incomplete delivery is recovered or repaired. A run the user stopped is reported and left for instruction; other stops and failures follow the tool's own recovery or retry guidance. #}
 ## 主代理取回和检查

@@ -12,7 +12,8 @@
 {% if subagent | default(false) %}
 You run on {{ content }}. This is the server-designated model; an individual call moved to a fallback uses that fallback model instead.
 {% else %}
-You run on {{ content }}. This is the server-designated model for the thread; an individual call moved to a fallback uses that fallback model instead.{% if cli_tokens | default(false) %} The user picks the model; `la models list` shows the models they can run and who each one bills to.{% else %} The user picks the model.{% endif %}
+{# DALTON-HOOK(agent-switch-model): note switch_thread_model availability for main agents #}
+You run on {{ content }}. This is the server-designated model for the thread; an individual call moved to a fallback uses that fallback model instead.{% if cli_tokens | default(false) %} The user picks the model; `la models list` shows the models they can run and who each one bills to.{% else %} The user picks the model.{% endif %} When the user explicitly asks in this turn to switch the current thread's model and `switch_thread_model` is available, use `switch_thread_model` (takes effect from the user's next message).
 
 {% endif %}
 </model>

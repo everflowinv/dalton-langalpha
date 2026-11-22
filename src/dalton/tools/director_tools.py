@@ -1528,18 +1528,22 @@ def build_director_tools(
     ) -> str:
         """Create, update, pause, resume, or list Dalton (`dalton-*`) automations.
 
+        Supports `cron` and `once` triggers only. For standard price tracking use
+        `dalton_coverage_tracking`; for personal price alerts set `trigger_config`
+        in `.agents/user/automations/*.json`.
+
         Args:
             action: "upsert", "pause", "resume", or "list".
             name: Automation name (must start with `dalton-`, e.g. `dalton-meta-watch`).
-            trigger_type: "cron", "once", or "price".
+            trigger_type: "cron" or "once".
             cron_expression: Standard 5-field cron expression when trigger_type="cron".
-            next_run_at: ISO 8601 datetime when trigger_type="once".
+            next_run_at: ISO 8601 datetime when trigger_type="once"; values without an offset use the automation's timezone.
             instruction: Prompt instruction executed when the automation fires.
             description: Short description of the automation.
-            timezone_name: IANA timezone (defaults to `Asia/Shanghai`).
-            workspace_id: Workspace UUID (defaults to current workspace in config).
+            timezone_name: IANA timezone. Omit on create to use the deployment default; omit on update to keep the existing timezone.
+            workspace_id: Workspace UUID used to place a new automation or locate an existing one in that workspace (does not move an existing automation; defaults to the current workspace in config).
             ticker: Optional company ticker for naming validation.
-            reasoning_effort: Optional thinking effort override (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Pass `""` or `"default"` to clear back to user/model default; omit on update to keep the current value. Antigravity models encode effort in their model ID suffix and keep this field null.
+            reasoning_effort: Optional thinking effort override (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Omit on create to inherit user/model default; omit on update to keep the current value, or pass `""` / `"default"` to clear. Built-in Antigravity effort is determined by the task's model ID; change the model in the automation's settings.
         """
         configurable = (config or {}).get("configurable") or {}
         user_id = str(configurable.get("user_id") or "").strip()
@@ -1547,6 +1551,19 @@ def build_director_tools(
             raise ValueError("user_id is required")
         caller_ws_id = str(configurable.get("workspace_id") or "").strip() or None
         ws_id = workspace_id if workspace_id is not None else caller_ws_id
+        if str(trigger_type or "").strip().lower() == "price":
+            # This tool cannot pass a price condition, and the price monitor skips a task
+            # without one, so refuse instead of saving a task that never fires.
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "price_trigger_unsupported",
+                    "message": "dalton_schedule_automation supports cron and once only. "
+                    "Use dalton_coverage_tracking for standard price tracking, or set "
+                    "trigger_config in .agents/user/automations/*.json for a personal price alert.",
+                },
+                ensure_ascii=False,
+            )
         # Only the caller's own timezone goes down: the helper applies the default when
         # creating, and an update that names none keeps the task's stored timezone.
         tz = timezone_name or None

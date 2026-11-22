@@ -1408,9 +1408,9 @@ def test_chief_of_staff_prompt_non_contradictory() -> None:
         subagent_summary="",
         role="chief_of_staff",
     )
-    assert "delegate_to_analyst` into one is refused" in prompt
+    assert "only when colleague dispatch is enabled for this deployment and the workspace's access is `rw`" in prompt
     assert "company_workspace_exists" in prompt
-    assert "不往同事工作区派发任务" in prompt
+    assert "仅在部署已启用同事派发且该工作区权限为 `rw` 时才可派发" in prompt
     assert "除非派发工具允许" not in prompt
     assert "allow_duplicate_company" in prompt
 

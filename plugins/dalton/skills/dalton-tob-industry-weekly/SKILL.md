@@ -93,7 +93,7 @@ research(route="alphaengine", operation="get_document", params={"doc_id": "DOC_I
 
 Guidepoint 不是每周必扫。只有需要专家库时才用：`research(route="guidepoint", operation="search_library", query=..., start=..., end=..., limit=30, params={"keywords": [...], "recency_bias": 50})`。逐字引用不超过 20 个英文词，并写来源属性。不写专家姓名。
 
-网页：`web_search(query=QUERY, start_date=START, end_date=END, time_range="week")`。不传 `country`、`language`、`domain_filter`。用来补财报日历、目标价新闻和池外亮点。
+网页：`WebSearch(query=QUERY, start_date=START, end_date=END, time_range="week")`。不传 `country`、`language`、`domain_filter`。用来补财报日历、目标价新闻和池外亮点。
 
 社区默认关闭。用户点名某家口碑时才用 `community(route="xueqiu", operation="search", query=QUERY)` 或 `community(route="last30days", operation="search", query=QUERY, days=7)`。社区内容只作发现。
 
@@ -284,7 +284,7 @@ automation_report(
 
 ## 已知限制
 
-- 财报日历没有专用数据源，靠 AlphaEngine、`web_search` 和逐家公告拼。池内 120 家靠逐家检索。
+- 财报日历没有专用数据源，靠 AlphaEngine、`WebSearch` 和逐家公告拼。池内 120 家靠逐家检索。
 - `finance(route="sec", operation="list-filings")` 没有日期参数，日期在本地滤。
 - `finance(route="cn-hk", operation="quote")` 没有历史日期。交易日来自 `get_market_overview` 的返回，按报告周写入 `sessions.json`。返回里没有日期时，`price_as_of` 留空，业绩窗口终点用周五，并写上 `holiday_note`。三市最早的 `price_as_of` 早于窗口起点时不输出业绩窗口。
 - 公告筛选只看 A 股标题。只发业绩说明会通知的公司不算命中。标题写法特殊、命中数明显偏低时，再读一遍原始 filings。

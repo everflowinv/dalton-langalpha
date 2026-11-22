@@ -493,6 +493,119 @@ async def workspaces_create(
         return error_command("failed to create workspace", tool_call_id)
 
 
+# --- DALTON-HOOK(cos-settings-tools): begin ---
+def _http_error_message(exc: Any) -> str:
+    """Human-readable refusal text from an ``HTTPException``."""
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, dict):
+        return str(detail.get("message") or detail.get("detail") or detail)
+    if detail:
+        return str(detail)
+    return str(exc)
+
+
+async def workspaces_update(
+    user_id: str,
+    workspace_id: str | None,
+    name: str | None,
+    description: str | None,
+    tool_call_id: str,
+) -> Command:
+    """Update a workspace's name and/or description, matching PUT /workspaces/{id}."""
+    if not workspace_id:
+        return error_command(
+            "workspace_id is required for update action", tool_call_id
+        )
+    if name is None and description is None:
+        return error_command(
+            "name or description is required for update action", tool_call_id
+        )
+
+    from fastapi import HTTPException
+    from pydantic import ValidationError
+    from src.server.database.home_workspace import is_reserved_row
+    from src.server.database.workspace import (
+        get_workspace,
+        update_workspace as db_update_workspace,
+    )
+    from src.server.database.workspace_folders import WorkspaceFolderMoving
+    from src.server.database.workspace_names import (
+        WorkspaceNameInvalid,
+        WorkspaceNameTaken,
+    )
+    from src.server.models.workspace import WorkspaceUpdate
+    from src.server.services.shared_workspaces.access import workspace_access
+    from src.server.services.shared_workspaces.feed import publish_workspace_changed
+
+    try:
+        validated = WorkspaceUpdate(name=name, description=description)
+    except ValidationError as exc:
+        err = exc.errors()[0]
+        loc = ".".join(str(part) for part in err.get("loc") or ())
+        msg = err.get("msg") or str(exc)
+        return error_command(f"{loc}: {msg}" if loc else msg, tool_call_id)
+
+    try:
+        workspace = await get_workspace(workspace_id)
+        access = await workspace_access(workspace, user_id, manage=True)
+    except HTTPException as exc:
+        return error_command(_http_error_message(exc), tool_call_id)
+    except Exception as e:
+        logger.error(f"Failed to verify workspace access for update: {e}")
+        return error_command("failed to update workspace", tool_call_id)
+
+    reserved = is_reserved_row(workspace)
+    if (
+        reserved
+        and validated.name is not None
+        and validated.name != workspace.get("name")
+    ):
+        return error_command("Home can't be renamed.", tool_call_id)
+    effective_name = (
+        None if (reserved and validated.name == workspace.get("name")) else validated.name
+    )
+
+    try:
+        updated = await db_update_workspace(
+            workspace_id=workspace_id,
+            name=effective_name,
+            description=validated.description,
+        )
+        if not updated:
+            return error_command("Workspace not found", tool_call_id)
+        if access.is_shared and access.org_id:
+            await publish_workspace_changed(access.org_id, workspace_id, "updated")
+        return success_command(
+            {
+                "success": True,
+                "workspace_id": str(updated["workspace_id"]),
+                "name": updated.get("name"),
+                "description": updated.get("description"),
+                "dir_name": updated.get("dir_name"),
+            },
+            tool_call_id,
+        )
+    except WorkspaceNameTaken as e:
+        if e.workspace_id is None:
+            hint = "Try again with a different name."
+        else:
+            hint = (
+                f"Its workspace_id is {e.workspace_id}: choose a different name."
+            )
+        return error_command(f"{e} {hint}", tool_call_id)
+    except WorkspaceNameInvalid as e:
+        return error_command(str(e), tool_call_id)
+    except WorkspaceFolderMoving:
+        return error_command(
+            "This workspace's folder is being moved. Try renaming it again in a moment.",
+            tool_call_id,
+        )
+    except Exception as e:
+        logger.error(f"Failed to update workspace {workspace_id}: {e}")
+        return error_command("failed to update workspace", tool_call_id)
+# --- DALTON-HOOK(cos-settings-tools): end ---
+
+
 async def _workspaces_delete(
     user_id: str, workspace_id: str | None, tool_call_id: str
 ) -> Command:

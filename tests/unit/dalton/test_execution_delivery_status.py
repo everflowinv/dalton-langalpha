@@ -494,7 +494,7 @@ def test_cos_activity_renders_all_five_delivery_states() -> None:
     assert "- 13:00 Delivered Task, finished: All clear" in lines
     assert "- 13:13 市场晚报, finished · delivery failed (Card exceeds 30 KB limit): 晚报已生成" in lines
     assert "- 13:20 Partial Task, finished · partial delivery failed (1/2: Target channel delivery failed): Summary ready" in lines
-    assert "- 13:25 Retrying Task, finished · delivering: Pending push" in lines
+    assert "- 13:25 Retrying Task, finished · retrying delivery: Pending push" in lines
     assert "- 13:30 Plain Task, finished: No delivery configured" in lines
 
 
@@ -596,7 +596,7 @@ def test_system_jobs_summarize_last_execution_five_states() -> None:
     _, retrying = system_jobs._summarize_last_execution(
         {**base, "delivery_summary": {"status": "retrying", "total_targets": 1, "sent_count": 0, "failed_count": 0, "retrying_count": 1}}
     )
-    assert retrying == "已完成 · 投递中"
+    assert retrying == "任务已完成，系统正在重试投递"
 
     _, no_delivery = system_jobs._summarize_last_execution({**base, "delivery_summary": None})
     assert no_delivery == "市场晚报摘要"
@@ -968,7 +968,8 @@ async def test_script_notify_status_fallback_without_target_rows(
 
     assert runs[0]["delivery_summary"] is not None
     assert runs[0]["delivery_summary"]["status"] == "retrying"
-    assert eds.format_execution_delivery_note(runs[0], lang="zh") == "已完成 · 投递中"
+    assert eds.format_execution_delivery_note(runs[0], lang="zh") == "任务已完成，等待首次发送"
+    assert eds.format_execution_delivery_note(runs[0], lang="en") == "finished · pending first send"
 
     assert runs[1]["delivery_summary"] is not None
     assert runs[1]["delivery_summary"]["status"] == "failed"
@@ -1096,7 +1097,7 @@ async def test_system_jobs_data_task_and_cross_owner_sector_batch_enrichment(
     }
     await eds.enrich_executions_with_delivery_summary([pending_data_run])
     _, label_pending, _ = system_jobs._summarize_data_task_run(pending_data_run)
-    assert label_pending == "已完成 · 投递中"
+    assert label_pending == "任务已完成，等待首次发送"
 
     # 2. list_system_jobs batch-enriches cross-owner sector units (single batch call for foreign owners)
     exec_s1 = str(uuid4())
@@ -1242,7 +1243,7 @@ async def test_system_jobs_data_task_and_cross_owner_sector_batch_enrichment(
     result = await system_jobs.list_system_jobs("pm-user")
     sector_by_key = {item["key"]: item for item in result["groups"]["sector"]}
     assert sector_by_key["sector:semi"]["last_result"] == "已完成 · 投递失败（卡片超过 30 KB 上限）"
-    assert sector_by_key["sector:ai"]["last_result"] == "已完成 · 投递中"
+    assert sector_by_key["sector:ai"]["last_result"] == "任务已完成，系统正在重试投递"
     # 1 call for caller's own rows + 1 single batch call for BOTH foreign owners (no N+1)
     assert len(enrich_calls) == 2
     assert enrich_calls[1] == 2
@@ -1321,13 +1322,13 @@ def test_reconcile_only_uncertain_pending_shows_unconfirmed_and_updates_on_recei
         eds.format_execution_delivery_note(
             {"status": "completed", "delivery_summary": uncertain_third}, lang="zh"
         )
-        == "已完成 · 投递失败（投递状态未确认）"
+        == "任务已完成，仍有目标等待送达确认"
     )
     assert (
         eds.format_execution_delivery_note(
             {"status": "completed", "delivery_summary": uncertain_third}, lang="en"
         )
-        == "finished · delivery failed (Delivery could not be confirmed)"
+        == "finished · awaiting delivery confirmation"
     )
 
     # Even attempt 1 on gateway/report/data_task with delivery_uncertain is reconcile-only (never resent).
@@ -1974,6 +1975,19 @@ def test_attempts_exhausted_failed_row_sets_awaiting_receipt_and_delivered_strip
     assert data_exhausted["status"] == "failed"
     assert data_exhausted["failure_code"] == "attempts_exhausted"
     assert data_exhausted["awaiting_receipt"] is True
+    assert data_exhausted["targets"][0]["awaiting_receipt"] is True
+    assert (
+        eds.format_execution_delivery_note(
+            {"status": "succeeded", "delivery_summary": data_exhausted}, lang="zh"
+        )
+        == "任务已完成，仍有目标等待送达确认"
+    )
+    assert (
+        eds.format_execution_delivery_note(
+            {"status": "succeeded", "delivery_summary": data_exhausted}, lang="en"
+        )
+        == "finished · awaiting delivery confirmation"
+    )
 
     # 2) Automation report failed with attempts_exhausted -> also awaiting_receipt=True.
     report_exhausted = eds.summarize_execution_delivery(
@@ -1996,6 +2010,124 @@ def test_attempts_exhausted_failed_row_sets_awaiting_receipt_and_delivered_strip
     assert report_exhausted is not None
     assert report_exhausted["status"] == "failed"
     assert report_exhausted["awaiting_receipt"] is True
+    assert report_exhausted["targets"][0]["awaiting_receipt"] is True
+    assert (
+        eds.format_execution_delivery_note(
+            {"status": "completed", "delivery_summary": report_exhausted}, lang="zh"
+        )
+        == "任务已完成，仍有目标等待送达确认"
+    )
+
+    # 2b) Mixed targets: 1 attempts_exhausted awaiting receipt + 1 confirmed failure -> no double-counting.
+    mixed_receipt_and_failed = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "exec-report-mixed",
+                "channel": "feishu",
+                "target": "feishu:chat:oc_market_pm",
+                "status": "failed",
+                "attempt_count": 3,
+                "error_code": "attempts_exhausted",
+                "created_at": now - timedelta(minutes=15),
+                "updated_at": now - timedelta(minutes=2),
+                "payload_json": {"source": "automation_report"},
+            },
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "exec-report-mixed",
+                "channel": "feishu",
+                "target": "feishu:chat:oc_other",
+                "status": "failed",
+                "attempt_count": 1,
+                "error_code": "card_limit_exceeded",
+                "created_at": now - timedelta(minutes=15),
+                "updated_at": now - timedelta(minutes=2),
+                "payload_json": {"source": "automation_report"},
+            },
+        ],
+        now=now,
+    )
+    assert mixed_receipt_and_failed is not None
+    assert mixed_receipt_and_failed["awaiting_receipt"] is True
+    assert [t["awaiting_receipt"] for t in mixed_receipt_and_failed["targets"]] == [True, False]
+    assert (
+        eds.format_execution_delivery_note(
+            {"status": "completed", "delivery_summary": mixed_receipt_and_failed}, lang="zh"
+        )
+        == "任务已完成，仍有目标等待送达确认；另有 1 个目标已确认投递失败（卡片超过 30 KB 上限）"
+    )
+    assert (
+        eds.format_execution_delivery_note(
+            {"status": "completed", "delivery_summary": mixed_receipt_and_failed}, lang="en"
+        )
+        == "finished · awaiting delivery confirmation; 1 target(s) failed (Card exceeds 30 KB limit)"
+    )
+
+    # 2c) First-time pending send (attempt_count=0) vs active retry (attempt_count>=1).
+    first_send_row = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "exec-first-send",
+                "channel": "feishu",
+                "target": "feishu:chat:oc_market_pm",
+                "status": "pending",
+                "attempt_count": 0,
+                "error_code": None,
+                "created_at": now - timedelta(minutes=1),
+                "updated_at": now - timedelta(minutes=1),
+                "payload_json": {"source": "automation_report"},
+            }
+        ],
+        now=now,
+    )
+    assert first_send_row is not None
+    assert first_send_row["status"] == "retrying"
+    assert (
+        eds.format_execution_delivery_note(
+            {"status": "completed", "delivery_summary": first_send_row}, lang="zh"
+        )
+        == "任务已完成，等待首次发送"
+    )
+    assert (
+        eds.format_execution_delivery_note(
+            {"status": "completed", "delivery_summary": first_send_row}, lang="en"
+        )
+        == "finished · pending first send"
+    )
+
+    active_retry_row = eds.summarize_execution_delivery(
+        notify_rows=[
+            {
+                "delivery_id": str(uuid4()),
+                "execution_id": "exec-active-retry",
+                "channel": "feishu",
+                "target": "feishu:chat:oc_market_pm",
+                "status": "failed",
+                "attempt_count": 1,
+                "error_code": "target_failed",
+                "created_at": now - timedelta(minutes=3),
+                "updated_at": now - timedelta(minutes=1),
+                "payload_json": {"source": "automation_report"},
+            }
+        ],
+        now=now,
+    )
+    assert active_retry_row is not None
+    assert active_retry_row["status"] == "retrying"
+    assert (
+        eds.format_execution_delivery_note(
+            {"status": "completed", "delivery_summary": active_retry_row}, lang="zh"
+        )
+        == "任务已完成，系统正在重试投递"
+    )
+    assert (
+        eds.format_execution_delivery_note(
+            {"status": "completed", "delivery_summary": active_retry_row}, lang="en"
+        )
+        == "finished · retrying delivery"
+    )
 
     # 3) Terminal non-reconcilable error (card_limit_exceeded) -> awaiting_receipt=False.
     card_limit = eds.summarize_execution_delivery(
@@ -2265,3 +2397,36 @@ async def test_system_jobs_toggle_home_sector_and_single_sector_status_enrich_de
     assert single_res["job"]["last_result"] == "已完成 · 投递失败（卡片超过 30 KB 上限）"
     resolve_mock.assert_awaited_once_with("pm-user", "semi", include_all_for_pm=True)
     tracking_mock.assert_awaited_once_with("analyst-a", ws_sector, viewer_user_id="pm-user")
+
+
+def test_gateway_retry_without_attempt_count_reads_as_retrying_not_first_send() -> None:
+    """A regular automation whose gateway returned a retryable error is stored as
+    `retrying` without an attempt count; the note must say it is retrying."""
+    summary = {
+        "status": "retrying",
+        "total_targets": 1,
+        "targets": [{"channel": "feishu", "status": "retrying"}],
+    }
+    run = {"status": "completed", "delivery_summary": summary}
+    assert eds.format_execution_delivery_note(run, lang="zh") == "任务已完成，系统正在重试投递"
+    assert eds.format_execution_delivery_note(run, lang="en") == "finished · retrying delivery"
+
+
+def test_one_target_sent_and_one_pending_reads_as_retrying_not_first_send() -> None:
+    summary = {
+        "status": "retrying",
+        "total_targets": 2,
+        "targets": [
+            {"channel": "feishu", "status": "sent", "attempt_count": 1},
+            {"channel": "discord", "status": "retrying", "attempt_count": 0},
+        ],
+    }
+    run = {"status": "completed", "delivery_summary": summary}
+    assert eds.format_execution_delivery_note(run, lang="zh") == "任务已完成，系统正在重试投递"
+
+
+def test_delivery_target_model_keeps_awaiting_receipt() -> None:
+    from src.server.models.automation import ExecutionDeliveryTarget
+
+    target = ExecutionDeliveryTarget(status="failed", awaiting_receipt=True)
+    assert target.model_dump()["awaiting_receipt"] is True

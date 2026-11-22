@@ -554,7 +554,7 @@ async def _run_check_language_locked(
                 # journal's "可能已经计费" wording, which reads like a dead end —
                 # the next check_language call re-sends rather than being locked.
                 raise LanguageReviewCallError(
-                    "语言审查服务暂时不可用，可稍后重试或跳过",
+                    "本轮语言审查未完成，可稍后重试；需要语言审查的交付请等该轮通过后继续",
                     error_kind=res.error_kind or "indeterminate",
                     status="indeterminate",
                 )
@@ -579,7 +579,7 @@ async def _run_check_language_locked(
             # The mandated sentence is added once by the check_language tool.
             # This layer only names the round and the parser error.
             message = f"ERROR: 语言审查第 {round} 轮未完成（{detail}）。{record}。"
-        elif "可稍后重试或跳过" in detail:
+        elif "本轮语言审查未完成，可稍后重试" in detail:
             message = f"ERROR: {detail}。{record}。"
         else:
             message = (

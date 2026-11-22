@@ -800,6 +800,8 @@ class ExecutionDeliveryTarget(BaseModel):
     error_message: Optional[str] = None
     attempt_count: int = 0
     max_attempts: int = 3
+    # DALTON-HOOK(execution-delivery-status): a failed target the sender may still confirm by receipt
+    awaiting_receipt: bool = False
 
 
 class ExecutionDeliverySummary(BaseModel):

@@ -22,7 +22,9 @@ from src.server.services.channel_settings import (
 
 __all__ = ["AVAILABLE_FILE", "CHANNELS_FILE", "README_FILE", "ChannelsBackend"]
 
-_README_CONTENT = """\
+# DALTON-HOOK(prompt-audit-text): use Dalton gateway channel platforms (Feishu, Discord, personal WeChat) in README
+_README_CONTENT = (
+    """\
 # Channels
 
 The user's chat-app settings, kept by the messaging service. Reach this folder
@@ -40,16 +42,22 @@ seen is refused.
 
 ## channels.json
 
+Dalton supports Feishu (`feishu`), Discord (`discord`), and personal WeChat
+(`weixin`, direct messages only: `weixin:@me`). Take group chat addresses from
+`available.json` or `list_message_targets`.
+
 ```json
 {
   "default": {"workspace_id": null, "workspace": null},
-  "slack": {
-    "preferred": "slack:T1/C0456",
+"""
+    # DALTON-HOOK(prompt-audit-text): Dalton gateway example and field notes
+    """  "discord": {
+    "preferred": "discord:channel:1234567890",
     "chats": {
-      "slack:T1/C0456": {"workspace_id": "9f2c…", "workspace": "Research", "name": "#research"}
+      "discord:channel:1234567890": {"workspace_id": "9f2c…", "workspace": "Research", "name": "#research"}
     },
-    "automation_output": {"9f2c…": "slack:T1/C0123"},
-    "agent_messages": {"enabled": true, "allowed": ["slack:T1/C0456"]}
+    "automation_output": {"9f2c…": "discord:channel:1234567890"},
+    "agent_messages": {"enabled": true, "allowed": ["discord:channel:1234567890"]}
   }
 }
 ```
@@ -57,7 +65,7 @@ seen is refused.
 | Field | Meaning |
 |-------|---------|
 | `default` | The workspace a chat runs in when it has no entry in its app's `chats`: `workspace_id` null is the Chief of Staff, who answers from Home; an id is that workspace, where its Analyst answers. |
-| `<app>` | One key per connected app. Connecting or removing an app happens in the app, not here: keep every key. |
+| `<app>` | One key per connected app (`feishu`, `discord`, `weixin`). Connecting or removing an app happens in the app, not here: keep every key. |
 | `<app>.chats` | Per chat address: `workspace_id`, null for the Chief of Staff. Applies to new threads started in that chat; a thread already running keeps its workspace. A chat with no entry follows `default`. |
 | `<app>.preferred` | Where to send on this app when the user names only the app. `null` means the user's direct messages. A preferred chat counts as allowed. |
 | `<app>.automation_output` | Per workspace id: the chat that automation results from that workspace go to on this app. |
@@ -71,9 +79,9 @@ changes saving.
 
 An automation whose `delivery` names only an app posts to its workspace's
 `automation_output` on that app, else to the app's `preferred`, else to the
-user's direct messages. To always post to the direct messages, name them:
-`discord:@me`, `feishu:@me`, `imessage:@me`, `telegram:@me`, or
-`slack:<team>` on Slack.
+user's direct messages. To always post to direct messages, name them:
+`feishu:@me`, `discord:@me`, or `weixin:@me` (personal WeChat supports direct
+messages only).
 
 ## Editing rules
 
@@ -86,6 +94,7 @@ user's direct messages. To always post to the direct messages, name them:
 - The messaging service checks every save. A refused save is an error listing
   each problem, and nothing is saved: fix them all and save again.
 """
+)  # DALTON-HOOK(prompt-audit-text): end of _README_CONTENT
 
 
 class ChannelsBackend(DbJsonRoute):

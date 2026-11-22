@@ -255,14 +255,14 @@ async def test_default_off_omits_tool_prompt_and_data_map_card_line(
         team_memory_enabled=True,
     )
     assert "- `conversation_search`" in turn_md
-    assert "团队记忆开启时可用；当前是否开启以对话中的运行时说明为准" in turn_md
+    assert "(仅团队记忆开启时可用)" in turn_md
 
     # 3) Static prompt for both roles declares conditional team memory wording regardless of personal toggle
     loader = PromptLoader()
     for role in ("analyst", "chief_of_staff"):
         prompt = loader.get_system_prompt(role=role)
         assert "conversation_search" in prompt
-        assert "团队记忆开启时可用；当前是否开启以对话中的运行时说明为准" in prompt
+        assert "团队记忆可用时（以本轮运行时说明为准）" in prompt
 
     # 4) Deployment-level conversations.enabled=False omits tool, prompt line, and data map card row
     from src.dalton import settings as dalton_settings_mod
@@ -287,12 +287,12 @@ async def test_default_off_omits_tool_prompt_and_data_map_card_line(
     assert "- `conversation_search`" not in filtered_md
     assert "归档统计：" not in filtered_md
     assert "**1542**" not in filtered_md
-    assert "- `web_search`" in filtered_md
+    assert "- `WebSearch`" in filtered_md
     for role in ("analyst", "chief_of_staff"):
         prompt_off = loader.get_system_prompt(role=role, conversation_search_enabled=False)
         assert "conversation_search" not in prompt_off
         assert "归档统计：" not in prompt_off
-        assert "说“证据不足/无法确定”之前，对照下方数据地图，看是否还有会改变结论的直接相关来源没查" in prompt_off
+        assert "说“证据不足/无法确定”前先用它查找可能改变结论的遗漏来源" in prompt_off
 
 
 @pytest.mark.asyncio
@@ -405,8 +405,8 @@ async def test_owner_enables_workspace_team_memory_mounts_all_three(
 
     # 3) System prompt includes the conditional tool_guide sentence and the data map card row
     prompt = PromptLoader().get_system_prompt(role="analyst")
-    assert "团队记忆开启时可用；当前是否开启以对话中的运行时说明为准" in prompt
-    assert "先用 `conversation_search` 查团队以前的观点、假设和决定，并在答案里说明与之前看法相比有什么变化" in prompt
+    assert "团队记忆可用时（以本轮运行时说明为准）" in prompt
+    assert "回答公司或主题问题前先用 `conversation_search` 核查团队既有观点、假设和决定，并说明观点变化" in prompt
     assert "归档统计：" in prompt
     assert "**1542**" in prompt
 
@@ -732,7 +732,7 @@ async def test_home_turn_follows_user_level_switch(
     }
     assert "conversation_search" in tools_off
     cos_prompt_static = PromptLoader().get_system_prompt(role="chief_of_staff")
-    assert "团队记忆开启时可用；当前是否开启以对话中的运行时说明为准" in cos_prompt_static
+    assert "团队记忆可用时（以本轮运行时说明为准）" in cos_prompt_static
 
     # 2) User enables Home Team Memory via PUT /user-settings
     updated = await dalton_router.update_user_settings_endpoint(
@@ -755,8 +755,8 @@ async def test_home_turn_follows_user_level_switch(
         )
     }
     assert tools_on == tools_off
-    assert "first call `conversation_search` to check the team's prior views, assumptions and decisions" in cos_prompt_static
-    assert "团队记忆开启时可用；当前是否开启以对话中的运行时说明为准" in cos_prompt_static
+    assert "回答公司或主题问题前先用 `conversation_search` 核查团队既有观点、假设和决定，并说明观点变化" in cos_prompt_static
+    assert "团队记忆可用时（以本轮运行时说明为准）" in cos_prompt_static
     assert "归档统计：" in cos_prompt_static
 
 
@@ -1588,7 +1588,7 @@ async def test_gpt62_and_codex_toggle_and_post_deploy_first_turn_preserve_system
     base_tools = captured_payloads[0]["tools"]
     assert "conversation_search" in [t["name"] for t in base_tools]
     base_system = _system_prompt_text(captured_payloads[0])
-    assert "团队记忆开启时可用；当前是否开启以对话中的运行时说明为准" in base_system
+    assert "团队记忆可用时（以本轮运行时说明为准）" in base_system
 
     for i, payload in enumerate(captured_payloads):
         assert payload["tools"] == base_tools, f"turn {i + 1} tools changed"
@@ -1905,7 +1905,7 @@ async def test_claude_code_static_prompt_tools_and_runtime_notices(
     turn_off = graph_off.turn({"configurable": {"thread_id": "t-claude-toggle"}})
     turn_on = graph_on.turn({"configurable": {"thread_id": "t-claude-toggle"}})
     assert turn_off.spec.system_prompt == turn_on.spec.system_prompt
-    assert "团队记忆开启时可用；当前是否开启以对话中的运行时说明为准" in turn_off.spec.system_prompt
+    assert "团队记忆可用时（以本轮运行时说明为准）" in turn_off.spec.system_prompt
     assert [t.name for t in turn_off.spec.tools] == [t.name for t in turn_on.spec.tools]
     assert "conversation_search" in [t.name for t in turn_off.spec.tools]
 
@@ -2069,7 +2069,7 @@ async def test_external_company_main_agent_and_internal_subagents_omit_team_memo
                 assert "<data_map>" in ext_prompt
                 assert "conversation_search" not in ext_prompt
                 assert "归档统计：" not in ext_prompt
-                assert "团队记忆开启时可用" not in ext_prompt
+                assert "团队记忆可用时（以本轮运行时说明为准）" not in ext_prompt
 
         for tier in ("internal", "admin"):
             for role in ("analyst", "chief_of_staff"):
@@ -2077,7 +2077,7 @@ async def test_external_company_main_agent_and_internal_subagents_omit_team_memo
                 assert "<data_map>" in int_prompt
                 assert "conversation_search" in int_prompt
                 assert "归档统计：" in int_prompt
-                assert "团队记忆开启时可用；当前是否开启以对话中的运行时说明为准" in int_prompt
+                assert "团队记忆可用时（以本轮运行时说明为准）" in int_prompt
 
         subagent_base_prompt = loader.get_subagent_base_prompt(
             identity_line="You are a subagent.",
@@ -2086,7 +2086,7 @@ async def test_external_company_main_agent_and_internal_subagents_omit_team_memo
         )
         assert "conversation_search" not in subagent_base_prompt
         assert "归档统计：" not in subagent_base_prompt
-        assert "团队记忆开启时可用" not in subagent_base_prompt
+        assert "团队记忆可用时（以本轮运行时说明为准）" not in subagent_base_prompt
 
         tool_guide_standalone = loader.render(
             "components/tool_guide.md.j2",
@@ -2095,7 +2095,7 @@ async def test_external_company_main_agent_and_internal_subagents_omit_team_memo
         assert "<data_map>" in tool_guide_standalone
         assert "conversation_search" not in tool_guide_standalone
         assert "归档统计：" not in tool_guide_standalone
-        assert "团队记忆开启时可用" not in tool_guide_standalone
+        assert "团队记忆可用时（以本轮运行时说明为准）" not in tool_guide_standalone
 
         # 2) SubagentCompiler with non-empty MCP registry (so tool_guide IS rendered)
         from ptc_agent.core.mcp_schema import MCPToolInfo
@@ -2130,7 +2130,7 @@ async def test_external_company_main_agent_and_internal_subagents_omit_team_memo
             assert "<tool_guide>" in compiled["system_prompt"]
             assert "conversation_search" not in compiled["system_prompt"]
             assert "归档统计：" not in compiled["system_prompt"]
-            assert "团队记忆开启时可用" not in compiled["system_prompt"]
+            assert "团队记忆可用时（以本轮运行时说明为准）" not in compiled["system_prompt"]
     finally:
         map_builder.set_turn_data_map(None)
 
@@ -2225,13 +2225,13 @@ async def test_external_company_main_agent_and_internal_subagents_omit_team_memo
         assert int_built_off["system_prompt"] == int_built_on["system_prompt"]
         assert "conversation_search" in int_built_off["system_prompt"]
         assert "归档统计：" in int_built_off["system_prompt"]
-        assert "团队记忆开启时可用；当前是否开启以对话中的运行时说明为准" in int_built_off["system_prompt"]
+        assert "团队记忆可用时（以本轮运行时说明为准）" in int_built_off["system_prompt"]
 
         assert int_built_on["_captured_subagents"]
         for spec in int_built_on["_captured_subagents"]:
             assert "conversation_search" not in spec["system_prompt"]
             assert "归档统计：" not in spec["system_prompt"]
-            assert "团队记忆开启时可用" not in spec["system_prompt"]
+            assert "团队记忆可用时（以本轮运行时说明为准）" not in spec["system_prompt"]
     finally:
         map_builder.set_turn_data_map(None)
 

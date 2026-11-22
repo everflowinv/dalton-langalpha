@@ -325,7 +325,7 @@ def create_thread_model_tools() -> list[BaseTool]:
         Do not call this on automated, scheduled, wakeup, report-back, or delegated turns unless the user explicitly asked in a steering message on this turn, and do not use this when only a subagent or delegated task needs a different model (pass the `model` parameter on that call instead).
 
         Args:
-            model: Model ID (e.g. `gemini-4-neon-high-oauth`) or exact display name (case-insensitive, e.g. `Gemini 4 Neon`).
+            model: Available model ID or the exact display name of a single model entry (case-insensitive). Built-in Antigravity models use effort-suffixed IDs (e.g. `gemini-4-neon-high-oauth`); if the user gives only a series name (such as `Gemini 4 Neon`) without an effort level, confirm the effort level first.
 
         Returns:
             Short status confirmation with the selected model and when it takes effect, or an error listing available models.

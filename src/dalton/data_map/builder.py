@@ -309,7 +309,6 @@ def _build_data_map_lines(
 ) -> list[str]:
     lines: list[str] = [
         "## Dalton 数据地图",
-        f"**下结论前先对照地图**：说“证据不足/无法确定”前，先对照本图看还有哪些相关来源没查{_TEAM_MEMORY_PRINCIPLE_CLAUSE}。",
         "### 1. 直接工具与对话归档",
     ]
 
@@ -319,19 +318,22 @@ def _build_data_map_lines(
             continue
         if tid == "x_search" and not include_x_search:
             continue
+        display_id = str(raw_tool.get("display_id") or tid).strip()
         title = str(raw_tool.get("title") or tid).strip()
-        call_hint = str(raw_tool.get("call") or tid).strip()
+        call_hint = str(raw_tool.get("call") or display_id).strip()
         desc = str(raw_tool.get("description") or "未写说明").strip()
         st_label = format_health_status(health_lookup.get(tid))
-        call_part = f"|`{call_hint}`" if (call_hint and call_hint != tid) else ""
-        lines.append(f"- `{tid}`({title}|{st_label}{call_part}):{desc}")
+        call_part = f"|`{call_hint}`" if (call_hint and call_hint != display_id) else ""
+        lines.append(f"- `{display_id}`({title}|{st_label}{call_part}):{desc}")
         if tid == "conversation_search":
             lines.append(
                 f"  - {_format_conversation_stats_line(conversation_stats, include_top_subjects=include_top_subjects)}"
             )
 
     lines.append("")
-    lines.append("### 2. 研究库与金融/宏观路由（`researchdata`，经 `ExecuteCode` 调 `research`/`finance`/`macro`）")
+    lines.append(
+        "### 2. 研究库与金融/宏观/社区路由（经 `ExecuteCode` 调用 `researchdata` 的 `research`、`finance`、`macro` 或 `community`）"
+    )
 
     for r in routes:
         rid = r["id"]
@@ -434,7 +436,7 @@ def render_data_map_markdown(
                 return md
 
     # Step 3: truncate Section 2 (researchdata routes) lines from the end and append overflow notice
-    overflow_line = '…其余路由见 `research(route="all")` / `catalog()`'
+    overflow_line = "…其余路由见 `catalog()`"
     sec2_header_idx = next(
         (i for i, ln in enumerate(mutable_lines) if ln.startswith("### 2. ")),
         None,

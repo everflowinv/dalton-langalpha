@@ -276,14 +276,17 @@ class TestBaselineDeterminism:
     def test_the_model_block_says_who_picks_the_model_only_to_the_main_agent(self):
         """A subagent cannot pick its model or run `la`, so it gets the fact alone.
         DALTON-HOOK(computer-cli-tokens-off): `la models list` only appears when cli_tokens=True.
-        DALTON-HOOK(model-designated-note): both state server-designated vs fallback."""
+        DALTON-HOOK(model-designated-note): both state server-designated vs fallback.
+        DALTON-HOOK(agent-switch-model): main agent baseline mentions switch_thread_model."""
         main_cli_off = _render("envelope/baseline_model.md.j2", "detailed")
         assert main_cli_off.strip() == (
             "<model>\n"
             "You run on Claude Opus 5.5, reasoning effort high. "
             "This is the server-designated model for the thread; an individual call "
             "moved to a fallback uses that fallback model instead. "
-            "The user picks the model.\n"
+            "The user picks the model. When the user explicitly asks in this turn to "
+            "switch the current thread's model and `switch_thread_model` is available, "
+            "use `switch_thread_model` (takes effect from the user's next message).\n\n"
             "</model>"
         )
         main_cli_on = init_loader().render(
@@ -297,7 +300,9 @@ class TestBaselineDeterminism:
             "This is the server-designated model for the thread; an individual call "
             "moved to a fallback uses that fallback model instead. "
             "The user picks the model; `la models list` shows the models they can "
-            "run and who each one bills to.\n"
+            "run and who each one bills to. When the user explicitly asks in this turn "
+            "to switch the current thread's model and `switch_thread_model` is available, "
+            "use `switch_thread_model` (takes effect from the user's next message).\n\n"
             "</model>"
         )
         subagent = init_loader().render(

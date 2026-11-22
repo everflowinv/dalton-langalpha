@@ -35,7 +35,7 @@
 | `sec` (`researchdata` 或 `dalton_sec`) | `sec:{accession}` | `filing` | `"SEC EDGAR"` | `filing_date` (`filed`) |
 | `estimates` (`consensus`) | `estimates:yahoo:{ticker}:{fetched_at}` | `_sources` 标 `street_estimate`；知识层 `source.type` 记 `consensus`（tier 3） | `"Yahoo Finance via yfinance"` | `fetched_at` |
 | `fred` / `treasury` | `fred:{series}` / `treasury:{dataset}` | `official_data` | `"FRED"` / `"US Treasury"` | `observation_date` |
-| `market-regime` (`snapshot` / `us_topbottom` / `crowding` / `cn_leverage`) | `regime:<op>:<date>` | `derived`（OpenClaw 监控二手读数） | `"OpenClaw"` | 数据日期（`date` / `trade_date` / `as_of`） |
+| `market-regime` (`snapshot` / `us_topbottom` / `crowding` / `cn_leverage`) | `regime:<op>:<date>` | `derived`（Dalton 市场监控数据任务产物） | `"OpenClaw"`（兼容保留的来源字段值） | 数据日期（`date` / `trade_date` / `as_of`） |
 | `cn-hk` (`filings`) | `cn-hk:{ticker}:{date}:{index}` | `filing` | `"cninfo"`（巨潮资讯；港股未覆盖时补 HKEXnews 原文链接） | 公告日期 (`date`) |
 | `cn-hk` (`ask`) | 无独立归档 ID（平台聚合表） | 二手初值线索（非 `filing`，核心财务数须回公告核实） | 底层平台（AkShare / 东财 / 同花顺 / 新浪等，见 `plan.source`） | 报告期 / 查询日（无历史 as-of 保证） |
 
@@ -159,7 +159,7 @@
 调用 `researchdata.macro(route="market-regime", operation="snapshot"|"us_topbottom"|"crowding"|"cn_leverage")` 引用市场状态、美股顶部/底部框架、指数拥挤度与 A 股杠杆监控时，必须严格遵守以下三条规则：
 
 1. **二手读数必须标注数据日期（`as_of` / `date` / `trade_date`）**：
-   - `market-regime` 是 OpenClaw 每日生成的监控二手读数（`document_id` 为 `regime:<op>:<date>`，`identity="derived"`，`publisher="OpenClaw"`），引用任何读数时必须显式标注对应的数据日期（如 `signals.json` 的 `date`、`as_of` 各分项日期、拥挤度的 `trade_date` 或去杠杆信号的 `date`）；当返回 `stale=true` 时，正文注明数据日期与滞后情况，具体告警说明放进 `## 附注`（不在正文写 `stale=true` 或原样贴 `warnings`）。
+   - `market-regime` 读取 Dalton 市场监控数据任务的产物（`document_id` 为 `regime:<op>:<date>`，`identity="derived"`，`publisher="OpenClaw"` 为兼容保留的来源字段值）。引用任何读数时必须写明实际数据日期（如 `signals.json` 的 `date`、`as_of` 各分项日期、拥挤度的 `trade_date` 或去杠杆信号的 `date`）；返回 `stale=true` 时，正文还须注明数据滞后情况，具体告警说明放进 `## 附注`（不在正文写 `stale=true` 或原样贴 `warnings`）。
 2. **顶部和底部的“阶段（`stage`）”是框架状态，不是预测**：
    - `us_topbottom`（`top_framework` / `bottom_framework`）中的 `stage`（如“无信号”、“预警”等）与 `summary` 仅代表监控框架当前所处的条件状态，绝不是对未来走势的概率预测，**严禁将其写成或解读为“上涨概率”或“下跌概率”**。
 3. **拥挤度 `probability_pct` 属于源站统计，必须原样标注来源**：

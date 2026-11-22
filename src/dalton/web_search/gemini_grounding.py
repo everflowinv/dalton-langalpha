@@ -345,19 +345,21 @@ def build_web_search_tool(
         - Verify or update information
 
         Args:
-            query: Search query to look up. Filter by time with `start_date`/`end_date` rather than putting dates in `query`.
-            time_range: Filter by recency - 'day'/'d' (24h), 'week'/'w' (7d),
+            query: Search query to look up. Pass preferred dates via `start_date`/`end_date` rather than putting dates in `query`.
+            time_range: Preferred recency hint - 'day'/'d' (24h), 'week'/'w' (7d),
                 'month'/'m' (30d), 'year'/'y' (365d).
                 Ignored if start_date or end_date is provided.
-            start_date: Start date for results (YYYY-MM-DD format).
-                Takes priority over time_range.
-            end_date: End date for results (YYYY-MM-DD format).
-                Takes priority over time_range.
+            start_date: Preferred start date (YYYY-MM-DD); soft hint, not a strict filter.
+                Overrides time_range.
+            end_date: Preferred end date (YYYY-MM-DD); soft hint, not a strict filter.
+                Overrides time_range.
             topic: Search topic - 'general' (default), 'news', or 'finance'
                 （该搜索不区分 topic，忽略该参数）
 
         Returns:
-            Ranked results as titles, snippets and URLs — not full page text.
+            A ranked list of sources (titles, snippets, URLs) or a synthesized answer with source links — not full page text.
+
+        Verify each source's publication date on the original page or video before citing it in a report, and mark the date as unverified if it cannot be confirmed. Use a synthesized answer only to locate verifiable source links.
         """
         _ = (verbose, topic)
         try:

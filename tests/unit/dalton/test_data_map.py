@@ -158,8 +158,9 @@ def test_render_data_map_markdown_contents_date_free_title_and_search_api() -> N
     first_line = md.splitlines()[0]
     assert first_line == "## Dalton 数据地图"
 
-    # 2. Operating principle & health statuses
-    assert "下结论前先对照地图" in md
+    # 2. Direct tools & health statuses
+    assert "### 1. 直接工具与对话归档" in md
+    assert "- `WebSearch`(全网新闻|可用):" in md
     assert "`tmtb`[research/TMT总结|可用]" in md
     assert "`guidepoint`[research/专家访谈|不可用(DesktopLoginRequired)]" in md
     assert "`xueqiu`[community/雪球讨论|可用]" in md
@@ -180,7 +181,7 @@ def test_render_data_map_markdown_contents_date_free_title_and_search_api() -> N
     assert "hkexnews" not in unavail_ids
     assert (
         "`filings` 覆盖 A 股和港股的法定公告（巨潮转载），港股约有 5% 的缺口，"
-        "主要是仅英文版公告和股东大会投票结果，这类需要原文时，用 `web_search` 查 `site:hkexnews.hk`"
+        "主要是仅英文版公告和股东大会投票结果，这类需要原文时，用 `WebSearch` 查 `site:hkexnews.hk`"
     ) in md
     assert "港交所披露易公告" not in md
     assert "期货与大宗商品实时(非延迟)行情" in md
@@ -295,7 +296,7 @@ def test_render_data_map_token_limit_trimming() -> None:
         max_tokens=step3_budget,
     )
     assert map_builder.estimate_data_map_tokens(step3_md) <= step3_budget
-    assert '…其余路由见 `research(route="all")` / `catalog()`' in step3_md
+    assert "…其余路由见 `catalog()`" in step3_md
     assert "- `all`[" in step3_md
     assert "- `new-alt-route`[" not in step3_md
     assert "### 3. 明确没有的数据（切勿以为查过）" in step3_md
@@ -396,7 +397,7 @@ def test_prompt_loader_injects_data_map_and_rules_into_both_roles() -> None:
         assert "## Dalton 数据地图" in prompt
         assert "说“证据不足/无法确定”" in prompt
         assert "conversation_search" in prompt
-        assert "说明与之前看法相比有什么变化" in prompt
+        assert "并说明观点变化" in prompt
 
 
 def test_resolve_endpoint_and_cn_hk_probe_spec(

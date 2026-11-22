@@ -538,3 +538,7 @@ tests/unit/dalton/test_automation_reasoning_effort.py
 tests/unit/dalton/test_automation_effort_inheritance.py
 tests/unit/dalton/test_backfill_opus_automation_effort.py
 web/src/pages/Setup/answers/__tests__/daltonTeamModelsCheck.test.ts
+# Prompt audit v2 & CoS audit v2 on-demand settings map reference under langalpha-doc.
+plugins/langalpha_service/skills/langalpha-doc/references/settings-map.md
+# Chief of Staff settings tools (manage_workspaces update) tests.
+tests/unit/tools/secretary/test_workspace_settings_tools.py

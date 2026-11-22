@@ -91,10 +91,10 @@ community(
 
 ### 2b. YouTube 检索
 
-`youtube` 的每一行调用一次 `web_search`。工具名是 `web_search`。签名还有 `time_range` 和 `topic`，本任务都不传。也不传 `count`、`country`、`language`、`domain_filter`、`search_lang`、`ui_lang`。不要用 `freshness` 或 `time_range` 代替精确 24 小时。同一人物的多条结果以后合并进该人物的 `videos`。
+按 `plan` 中 `youtube` 列表逐行调用 `WebSearch`。签名还有 `time_range` 和 `topic`，本任务都不传。也不传 `count`、`country`、`language`、`domain_filter`、`search_lang`、`ui_lang`。不要用 `freshness` 或 `time_range` 代替精确 24 小时。同一人物的多条结果以后合并进该人物的 `videos`。
 
 ```python
-web_search(
+WebSearch(
     query=YOUTUBE_QUERY,
     start_date=SEARCH_START_DATE,
     end_date=SEARCH_END_DATE,
@@ -105,10 +105,10 @@ web_search(
 
 ### 2c. 网页新闻
 
-`web_search` 的每一行调用一次，参数规则与 YouTube 相同。查询词用该行的 `query`，不要改成按人物拆开的别的句子。
+按 `plan` 中 `web_search` 列表逐行调用 `WebSearch`，参数规则与 YouTube 相同。查询词用该行的 `query`，不要改成按人物拆开的别的句子。
 
 ```python
-web_search(
+WebSearch(
     query=WEB_QUERY,
     start_date=SEARCH_START_DATE,
     end_date=SEARCH_END_DATE,
@@ -133,7 +133,7 @@ x_search(
 
 ### 2e. 写成 raw.json
 
-把结果写成 `temp/vip-news-alert/<summary_date>/raw.json`。`items` 用工具返回的列表。工具放在 `data` 里时照原样留下，脚本两种都认。时间字段保持工具原文，不要编造。网页和视频如果带 `date`、`published_date` 或 `publishedDate`，原样留下。没有这些字段时也要写入：`web_search` 的引用通常只有 `url` 和 `title`。视频若有 `duration`（秒）就原样留下；没有就省略该字段。
+把结果写成 `temp/vip-news-alert/<summary_date>/raw.json`。`WebSearch` 返回的结果可能是来源列表，也可能是带来源链接的综合答案：将可核查的逐条来源整理进 `items`，保留原有 URL、标题和时间；综合答案只用于定位来源，不要把综合答案正文写入 `items`。工具把列表放在 `data` 里时照原样留下，脚本两种都认。时间字段保持工具原文，不要编造。网页和视频如果带 `date`、`published_date` 或 `publishedDate`，原样留下；没有这些字段时也要写入（`WebSearch` 的来源条目通常只有 `url` 和 `title`）。视频若有 `duration`（秒）就原样留下；没有就省略该字段。
 
 ```json
 {
@@ -168,7 +168,7 @@ python3 .agents/skills/dalton-vip-news-alert/scripts/vip_news_alert.py \
 筛选规则：
 
 - wire 和 `x_search` 只保留 `start_iso` 到 `end_iso` 之间的条目，两端都包含。刚好 24 小时前的留下，再早一秒的丢掉。没有时间、时间无法解析的丢掉。纯日期按 UTC 零点理解。没有时区的时钟时间按 UTC 理解。正文为空的 wire 推文，只要时间在窗口内，仍参加关键词归人。
-- 网页和视频：有可解析时间且落在窗口外的丢掉。没有可解析时间的保留，并标 `time_unverified: true`。`web_search` 已用 `start_date` 和 `end_date` 限定检索日期。对 `time_unverified` 的条目，取字幕或读页面时看页面上的发布时间。能确认早于窗口的，不要写进卡片。确认不了的可以写进卡片，这时不要写成“今天发生”。
+- 网页和视频：有可解析时间且落在窗口外的丢掉。没有可解析时间的保留，并标 `time_unverified: true`。由于 `WebSearch` 的 `start_date` 和 `end_date` 仅提示优先日期、不是严格过滤，所有拟写进卡片的网页和视频均须在第 4 步读页面或取字幕时核对发布时间。
 - 去重顺序是 wire、视频、网页、`x_search`。先出现的留下。同一 status id、同一规范 URL、或同一标题哈希只留一条。X 和 YouTube 链接会先收成规范形式。网页结果里的 youtube.com 和 youtu.be 链接归入该人物的视频组，标题保留，随后走取字幕流程。
 - `state/vip-news-alert/seen.json` 里未过期的 URL 哈希和标题哈希也会丢掉。超过 7 天的记录不挡新条目。这一步只读不写。
 - wire 用关键词归人，名单顺序先命中先归入。一条同时含多个人物关键词时，只出现在更靠前的那一位下面。匹配用正文前 500 个字符。网页留在检索的那位人物下。视频留在检索的那位人物下。这两类都不因为缺少关键词被丢掉。
@@ -188,7 +188,7 @@ WebFetch(url=VIDEO_URL, prompt=FETCH_PROMPT)
 
 抽取器把字幕放在页面 markdown 的 Transcript 章节。`WebFetch` 返回的是按 prompt 抽出的文本，没有单独的字幕字段。返回 `NO_TRANSCRIPT`，或正文写明 No transcript available，或没有字幕正文时，这条视频没有 transcript，照常继续，不要编字幕。
 
-带 `time_unverified` 的网页和视频，取字幕或读页面时看页面上的发布时间。能确认早于窗口的，不要写进卡片。确认不了的可以写进卡片，这时不要写成“今天发生”。`web_search` 已经用 `start_date` 和 `end_date` 限定了检索日期。
+所有拟写进卡片的网页和视频（不限于带 `time_unverified` 的条目）都须在取字幕或读页面时核对原网页或视频的发布时间（`WebSearch` 的 `start_date` 和 `end_date` 仅提示优先日期，不是严格过滤）。能确认早于窗口的，不要写进卡片；无法核实时标明时间未确认，写进卡片时不要写成“今天发生”。
 
 然后对筛选结果做这些判断：
 
