@@ -47,8 +47,8 @@
 - **内存滑动窗口与条目上限**：状态仅保存在单进程 bridge 内存中，按会话（优先取 `thread`，缺省回退 `workspace`）维护 30 分钟滑动窗口（`COMPANY_SEARCH_WINDOW_S = 1800` 秒），每次调用（含失败与无会话请求）均先按时间清理并受条目上限约束：同公司签名记录、同词历史、文档清单三类各自跨会话最多 `COMPANY_SEARCH_MAX_ENTRIES = 5000` 条（三类合计最多 15,000 条），超出时淘汰最旧条目，不落盘。同一 `(会话, 公司)` 下每个查询签名仅保留最近一次时间戳，每个会话仅保留提示所需的最少信息（时间、返回条数、每家公司最多 10 条文档的 `doc_id` / 标题 / 日期）。提示计算与查询日志写入相互独立异常隔离：提示计算异常仅记 warning 并降级为不附提示；查询日志写入异常仅记 warning，有意保留已算出的 `advice` / `advice_previous_docs` 正常返回，二者均不影响检索结果返回和台账记录。
 - **公司识别口径**：基于 `plugins/dalton/skills/dalton-daily-filing-alert/watchlist*.txt`、各行业 `universe.json` 与核心中英文别名表（`extract_companies_from_search`）匹配 `query` 与 `ticker`：
   - 纯 ASCII 股票代码严格区分大小写（仅认大写，例如 `NVDA` 命中而 `nvda` 不计入）。
-  - 与常见英文词重名的代码（如 `APP`、`AI`、`ON`、`NOW`、`ALL`、`CAN`、`IT`、`META`、`UBER`、`SNOW`、`PATH`、`CARS`、`FAST`、`REAL`、`LOVE`、`OPEN`、`PLAY`、`TEAM`、`BOX`、`LIFE`、`ARM`、`FUN`、`COST`、`SHOP`、`SPOT`、`DASH`、`CART`、`BOX` 等）单独裸写时不触发，仅在查询同时包含该公司其他名称（如 `AppLovin`、`Meta Platforms`）或明确代码写法（`$APP`、`APP US`、`APP.O`）时命中。
-  - 无法识别出公司的纯主题词跳过公司计数，不触发同公司提醒（但仍受同词重搜提醒覆盖）；调用方未写 `query`（仅传 `ticker`）的请求不参与同词判断，纯 `ticker` 的 `transcript` 请求跳过同公司计数但已返回的团队文档仍记入同公司文档清单。
+  - 与常见英文词重名的代码（如 `APP`、`AI`、`ON`、`NOW`、`ALL`、`CAN`、`IT`、`META`、`UBER`、`SNOW`、`PATH`、`CARS`、`FAST`、`REAL`、`LOVE`、`OPEN`、`PLAY`、`TEAM`、`BOX`、`LIFE`、`ARM`、`FUN`、`COST`、`SHOP`、`SPOT`、`DASH`、`CART` 等）单独裸写时不触发，仅在查询同时包含该公司其他名称（如 `AppLovin`、`Meta Platforms`）或明确代码写法（`$APP`、`APP US`、`APP.O`）时命中。
+  - 未匹配到已知公司的纯主题词跳过公司计数，仅受同词重搜提醒覆盖；调用方未写 `query`（仅传 `ticker`）的请求不参与同词判断，纯 `ticker` 的 `transcript` 请求跳过同公司计数但已返回的团队文档仍记入同公司文档清单。
 - **同词重搜提醒（只提示、不拦截）**：同一会话 30 分钟内对调用方原始传入的同一规范化查询词（跨 `search_library` 与 `transcript`，忽略日期、条数、排序、筛选差异，且不以 bridge 折叠后的 `ticker` 充当查询词）再次发起非翻页检索（不带 `cursor`）时（`transcript` 忽略主题词、返回带 `query_ignored` 时，这个主题词不算本次查询词，不参与同词提醒），检索照常执行并返回全部结果，在返回对象附加 `advice`：`本会话 {N} 分钟前已用相同查询词检索过（上次返回 {M} 条）；请先从现有结果中挑选，确实需要不同时间段或更多结果时再检索`（不足 1 分钟写“不到 1 分钟前”）。缓存命中同样计入“上次检索”；命中 `_is_personal_scope_request` 的个人会议请求完全不进入同词历史，既不记录也不触发同词提醒。
 - **同公司多次检索提醒与已有文档清单**：沿用原有同公司计数口径（含失败、`mode=plan`、个人会议与带查询词的续页刷新时间），同一会话 30 分钟内对同一家公司发起第 3 次及以上且为**新查询词**的检索时，在返回对象附加 `advice`，并将本会话此前该公司检索已返回的文档清单放在独立字段 `advice_previous_docs`（每条含 `doc_id`、`title`、`date`，去重、按最近一次返回排序、最多 10 条），并在 `advice` 中指向 `advice_previous_docs`。个人会议范围的请求（`_is_personal_scope_request`）不记录文档清单。
 - **同时触发优先级与 `route="all"` 透传**：同词重搜与同公司多次检索分开判断；两者同时满足时仅附一条 `advice`（同词重搜优先，括号内附“，此前返回的文档见 `advice_previous_docs`”），`advice_previous_docs` 照常附带；`route="all"` 的 AlphaEngine 子腿将 `advice` 与 `advice_previous_docs` 同时附在顶层及 `payload["alphaengine"]`。
@@ -73,7 +73,7 @@
 当出现以下任一情况且缓存存在同键的保留期内旧条目时，bridge 直接返回旧缓存，并在响应与 `_bridge_cache` 中标注 `stale: true`、`stale_reason` 与原条目抓取时间 `cached_at`（UTC ISO-8601）：
 
 1. **上游失败兜底**：上游返回 **「上游不可用」** 或 **「权限或额度」** 失败时，返回旧缓存，分别标注 `stale_reason: "upstream_unavailable"` 或 `"quota"`。
-2. **调用方截止前兜底**：共享单飞等待期间，若在调用方超时截止前保留余量（如 2 秒）仍未完成且本地存在同键旧缓存，则先向调用方返回旧缓存并标注 `stale_reason: "upstream_timeout"`；共享的上游任务继续在后台完成并在成功时正常回写最新缓存，之后其他等待者取消也不会中止它。读取旧缓存本身也受截止时间限制；`params.fresh` 为真的请求不走这条兜底。无可用旧缓存时保持原超时返回行为。
+2. **调用方截止前兜底**：共享单飞等待期间，若在调用方超时截止前保留余量（如 2 秒）仍未完成且本地存在同键旧缓存，则先向调用方返回旧缓存并标注 `stale_reason: "upstream_timeout"`；共享的上游任务继续在后台完成并在成功时回写最新缓存，其余等待者取消时后台任务继续跑完。读取旧缓存本身也受截止时间限制；`params.fresh` 为真时直接等待上游结果。无可用旧缓存时保持原超时返回行为。
 
 ## 5. 四档动态有效期（TTL）
 
@@ -101,7 +101,8 @@
 
 1. **强制刷新（`params.fresh`）**：`params.fresh` 为真值时，常规时段跳过本地有效缓存读取，向 AlphaEngine 发起实时检索并写回覆盖缓存；熔断期间优先返回本地可用缓存。
 2. **个人会议直通（`_is_personal_scope_request`）**：命中 `meeting_scope == "personal"`、`own_reservations_only` 为真，或 `document_categories`/`document_codes`/`type_ids` 包含 `personal_meeting`/`personal_meetings` 时，跳过团队缓存读写，直通上游。
-3. **规划与游标翻页**：`mode == "plan"` 以及携带 `cursor` 的续页请求直通上游执行。
+3. **规划与游标翻页**：`mode == "plan"` 以及携带 `cursor` 的续页请求直通上游执行。由于上游翻页游标仅在约 15 分钟内有效，缓存层规定超过 `CURSOR_SAFE_AGE_S`（12 分钟）的缓存副本会剥离失效游标并附带提示（`STALE_CURSOR_NOTE` / `STALE_CONTINUATION_NOTE`），不再允许跨时段用旧游标续查。
+   - **`dalton-thesis-delta` 按日期续采**：每日增量采集脚本（`plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py`）跨轮仅保存已覆盖日期边界，游标只在单轮内使用（单次 `AE_PAGE_LIMIT = 20`，每轮上限 `MAX_CURSOR_PAGES = 5` 次请求）。采集时先对含 3 天回看的整窗请求：待扫描日期跨多天时整窗扫描最多使用 4 次请求（留 1 次给逐日推进），待扫描日期仅 1 天时整窗扫描可使用全部 5 次请求；超出后再按最旧日期逐日推进。仅当单日真正用尽本轮预算且尚无进度时才越过该日（越过后该日遗漏的文档仅能在后续 3 天回看窗口内补采）；遇到取数失败、旧缓存兜底或游标过期时，未取得有效进度则保留原覆盖边界，逐日推进中已完成的日期继续计入进度。积压超过 `MAX_AE_BACKLOG_DAYS = 7` 天时截断并上报，且每段首页请求均带 `params.fresh = true`。
 
 ## 7. 用量台账、团队检索文本日志与统计报告
 

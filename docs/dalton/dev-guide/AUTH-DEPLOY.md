@@ -16,7 +16,7 @@
 | `SUPABASE_URL` | Supabase 项目 URL | 用于拉取 JWKS 验签公钥及 `/auth/v1/settings` 就绪检查（为空时 503） |
 | `SUPABASE_PUBLISHABLE_KEY` | Supabase Publishable Key | 用于异步请求 `${SUPABASE_URL}/auth/v1/settings` 校验项目安全配置 |
 | `INTERNAL_SERVICE_TOKEN` | 至少 32 个字符的高熵随机串 | 内部服务自派发与受控脚本通道令牌（为空或 `< 32` 字符时启动报错且所有服务令牌路径一律拒绝） |
-| `DALTON_PM_USER_IDS` | 逗号分隔的 Supabase 用户 UUID | 拥有 PM 权限的用户 UUID 列表（不能为空、不能含 `local-dev-user` 或非 UUID 值） |
+| `DALTON_PM_USER_IDS` | 逗号分隔的 Supabase 用户 UUID | 拥有 PM 权限的用户 UUID 列表（必填，须全部为有效 UUID 并排除 `local-dev-user`） |
 
 ### 前端构建/运行环境变量
 | 变量名 | 必填要求 | 说明 |
@@ -57,17 +57,17 @@
 ## 5. 团队共用凭据（`credentials.sharing: team | "off"`）
 
 - **配置开关**：`src/dalton/dalton.yaml` 中的 `credentials.sharing: team | "off"`（例如关闭时写 `sharing: "off"`，解析器也兼容未加引号被 YAML 1.1 解析为布尔 `false` 的 `sharing: off`；默认 `team`）。仅在 **Dalton Supabase 登录开启**（`DALTON_AUTH_MODE=supabase`）且 **环境变量 `DALTON_PM_USER_IDS` 已配置且非空**时生效；未设置 `DALTON_PM_USER_IDS`、设为空字符串 `""` 或关闭 Supabase 登录时一律等同 `"off"`（保持上游按 `user_id` 隔离的多租户行为）。
-- **单一凭据持有人**：启用 `team` 共享后，`src/dalton/credentials.py:credential_user_id(user_id)` 将所有团队成员的模型凭据读写透明解析到 **`DALTON_PM_USER_IDS` 的第一个用户 ID**（持有人）。任何成员连接模型 OAuth 或填写非空 BYOK API Key，均写入持有人名下并立即对全队生效；OAuth 活跃缓存、BYOK 缓存与 Redis OAuth 刷新锁（`oauth:refresh:{holder_id}:{provider}`）均按持有人 ID 计算。
+- **单一凭据持有人**：启用 `team` 共享后，`src/dalton/credentials.py:credential_user_id(user_id)` 将所有团队成员的模型凭据读写透明解析到 **`DALTON_PM_USER_IDS` 的第一个用户 ID**（持有人）。管理员连接模型 OAuth 或填写 BYOK API Key 后，写入持有人名下并立即对全队生效；OAuth 活跃缓存、BYOK 缓存与 Redis OAuth 刷新锁（`oauth:refresh:{holder_id}:{provider}`）均按持有人 ID 计算。
 - **共享范围与隔离边界**：
-  - **共享（仅限模型凭据）**：`user_oauth_tokens`（模型 OAuth：Codex / Claude / Antigravity / Muse）、`user_api_keys`（BYOK 密钥、`base_url`）以及 `users.byok_enabled`（用户资料表中的 `has_api_key` / `has_oauth_token` 统一只看解析后的持有人）。
+  - **共享（仅限模型凭据）**：`user_oauth_tokens`（模型 OAuth：Codex / Claude / Antigravity / Grok / Muse 等）、`user_api_keys`（BYOK 密钥、`base_url`，含走 Coding Plan API 密钥订阅计费的智谱 GLM）以及 `users.byok_enabled`（用户资料表中的 `has_api_key` / `has_oauth_token` 统一只看解析后的持有人）。
   - **仍按本人隔离**：
     1. **MCP 服务器、插件、Vault 密钥与出网授权（egress grants）**：在上游与交易授权级别（`trading_permissions`）、插件复合外键、egress grant 及各工作区 schema/配置版本号强绑定，共享会导致持有人交易权限越权扩散及跨用户目录/工作区状态冲突，因此保持按人隔离。
     2. **用户资料与审计**：用户资料、偏好（`user_preferences`）、工作区、线程、记忆、日预算、`dalton_provider_events` 日志与 `dalton_llm_journal.user_id` 均记实际调用者（共享开启时 `usage.credential_user_id` 记录所借用的持有人 ID）。
-- **断开、清空与关闭权限**：所有白名单成员均可连接模型 OAuth、新增或更新为非空 BYOK API Key（可同时附带该 provider 的 `base_url`）、开启 `byok_enabled=true`；**仅 PM 用户（`DALTON_PM_USER_IDS`）可断开模型 OAuth、删除/置空 API Key（含传 `""` 或借 `base_url` 写空）、单独修改/清空已有密钥的 `base_url`（未同时提供非空新密钥）或将 `byok_enabled` 设为 `false`**，非 PM 成员调用返回 `403`（`"团队共用凭据只能由管理员断开"`），前端通过 React Query（`queryKeys.dalton.credentialsStatus`）按当前登录用户获取权限并对非 PM 成员隐藏断开按钮。
+- **连接、更新与断开权限（仅管理员可写）**：启用团队共用凭据后，**仅 PM 管理员（`DALTON_PM_USER_IDS`）可执行任何写操作**——包括连接/重连/轮询/回调模型 OAuth、新增或修改 BYOK API Key 及 `base_url`、切换 `byok_enabled`、断开模型 OAuth 或删除密钥（后端由 `require_credential_write_admin` 与 `require_credential_admin` 在首次写库或写 Redis 前拦截，非 PM 成员返回 `403`，提示 `"团队共用凭据只能由管理员设置"` 或 `"团队共用凭据只能由管理员断开"`；后台自动刷新令牌以持有人身份运行不受此限制）。前端通过 React Query（`queryKeys.dalton.credentialsStatus`）按当前登录用户控制界面入口，团队模型管理面板（**设置 → 团队管理 → 模型与供应商**）仅对 `admin` 显示。
 
 ## 6. 邀请注册
 
-管理员（`DALTON_PM_USER_IDS`）可在**设置 → 邀请成员**区块生成一次性邀请链接（`{DALTON_FRONTEND_URL}/invite#{token}`，7 天有效，可随时撤销；token 放在 URL 片段中，永不发送至服务器访问日志，前端加载后立即清除 URL 片段并通过 JSON body 调用接口）。受邀人打开链接设置**用户名 + 密码**后，后端通过 Supabase Admin API 创建账户并写入 `dalton_members` 表，自动完成首次登录。
+管理员（`DALTON_PM_USER_IDS`）与内部成员权限范围内可在 **设置 → 团队管理 → 成员与权限**（`DaltonInvitesCard`）生成一次性邀请链接（`{DALTON_FRONTEND_URL}/invite#{token}`，前端地址按 `DALTON_FRONTEND_URL` → `PUBLIC_APP_URL` → `FRONTEND_URL` 依次回退，7 天有效，可随时撤销；token 放在 URL 片段中，永不发送至服务器访问日志，前端加载后立即清除 URL 片段并通过 JSON body 调用接口）。受邀人打开链接设置**用户名 + 密码**后，后端通过 Supabase Admin API 创建账户并写入 `dalton_members` 表，自动完成首次登录。
 
 ### 环境变量
 

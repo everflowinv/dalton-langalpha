@@ -21,6 +21,11 @@
 │   - 访问日志：format filter 将 query 中 token 替换为 REDACTED            │
 │   - 响应头：nosniff / strict-origin-when-cross-origin / SAMEORIGIN       │
 │                                                                         │
+│   ├─ /api/v1/threads/<id>/messages/replay                               │
+│   │    • 剥离 X-Service-Token 与 X-User-Id                              │
+│   │    • 针对 text/event-stream 强制 zstd/gzip 压缩 (minimum_length 1)  │
+│   │    • flush_interval -1 ──► Docker 内网 backend:8000                 │
+│   │                                                                     │
 │   ├─ /api/* , /ws/*                                                     │
 │   │    • 剥离外来请求头 X-Service-Token 与 X-User-Id                     │
 │   │    • flush_interval -1 (SSE 零缓冲 + 原生 WebSocket Upgrade)        │
@@ -32,7 +37,14 @@
 │   ├─ /assets/*                                                          │
 │   │    └──► 静态只读卷 /srv/assets/* (immutable 长缓存；不存在时 404)    │
 │   │                                                                     │
-│   ├─ 其余 GET/HEAD（排除 /health, /docs, /openapi.json 等后端根路径）   │
+│   ├─ /health*, /docs*, /redoc*, /openapi.json, /metrics*                │
+│   │    └──► 直接返回 404 Not Found（不回退 SPA）                         │
+│   │                                                                     │
+│   ├─ /help, /help/*                                                     │
+│   │    • /help/_astro/*：immutable 长缓存；不存在时 404                 │
+│   │    • HTML 文档：no-store；缺失路径返回 HTTP 404 + /help/404.html    │
+│   │                                                                     │
+│   ├─ 其余 GET/HEAD                                                      │
 │   │    └──► 静态只读卷 /srv + SPA 回退 /index.html (index.html 不缓存)  │
 │   │                                                                     │
 │   └─ 其余所有路径 / 方法 ──► 404 Not Found                              │
@@ -48,8 +60,10 @@
 | `frontend` (Vite dev) | `127.0.0.1:5173` (`!override`) | `5173` | 覆盖 `docker-compose.yml` 的 `0.0.0.0:5173`，仅本机开发调试用 |
 | `postgres` | `127.0.0.1:5432` | `5432` | 数据库（仅本机可达） |
 | `redis` | `127.0.0.1:6379` | `6379` | 缓存与流缓冲（仅本机可达） |
+| `minio`（`storage` profile） | `127.0.0.1:9000` / `9001` | `9000` / `9001` | 语音转写与聊天大文件对象存储及控制台（仅本机可达） |
+| `crawler` | 无宿主机端口 | `8100` | 仅挂载隔离的 Docker `crawl` 网络，供 `backend` 内网调用 |
 
-> **说明（为什么改绑 `127.0.0.1` 不会断工作区沙箱）**：工作区沙箱经 `host.docker.internal`（Colima 下解析为 `192.168.5.2`，即宿主回环转发地址）回连后端；经实测，宿主端口改绑 `127.0.0.1` 后容器内通过 `host.docker.internal:8000` 依然可达，沙箱 livefs 与 egress relay 不受影响。
+> **说明（改绑 `127.0.0.1` 后沙箱连通性）**：工作区沙箱经 `host.docker.internal`（Colima 下解析为 `192.168.5.2`，即宿主回环转发地址）回连后端；经实测，宿主端口改绑 `127.0.0.1` 后容器内通过 `host.docker.internal:8000` 依然可达，沙箱 livefs 与 egress relay 正常运行。
 
 ---
 
@@ -100,7 +114,7 @@ PUBLIC_APP_URL=https://<主机名>.<tailnet>.ts.net:8443
 ## 4. 构建与启动步骤
 
 ### 步骤 1：构建前端生产产物 (`web/dist`)
-在仓库根目录执行生产构建脚本（自动读取 `.env` 中的 `VITE_*` 与 `web/.env.dalton` 品牌默认项，输出到 `web/dist` 并校验 `index.html` 与 `version.json`）：
+在仓库根目录执行生产构建脚本（自动读取 `.env` 中的 `VITE_*` 与 `web/.env.dalton` 品牌默认项，输出应用到 `web/dist` 并校验 `index.html` 与 `version.json`，同时构建 `docs-site/` 静态帮助站点输出到 `web/dist/help/`）：
 
 ```bash
 bash scripts/dalton/build_frontend_prod.sh --require-supabase
@@ -124,7 +138,7 @@ bash scripts/dalton/check_public_edge.sh
 
 ---
 
-## 5. Tailscale Serve / Funnel 命令（由 lead 执行）
+## 5. Tailscale Serve / Funnel 命令（由宿主机管理员执行）
 
 > **重要警告**：本机 Tailscale 已在 `443`（`/`、`/d/`、`/dalton/`）和 `10000` 端口开放其他服务。**严禁执行不带端口参数的 `tailscale serve reset` 或 `tailscale funnel reset`**，所有命令必须显式指定 `--https=8443`。
 
@@ -163,8 +177,9 @@ tailscale funnel status
 - **选择方案**：采用 Caddy 的 `log` + `format filter`（`request>uri query { replace token REDACTED }`），输出 JSON 结构化日志。
 - **取舍原因**：相比直接删除整个查询字符串，按参数名过滤 `token` 既能确保 `/ws/v1/market-data/aggregates/{market}?token=<jwt>` 握手中的 Supabase JWT 被替换为 `token=REDACTED`（绝不以明文进日志），又能保留 `interval=second`、`tier=realtime`、`format=cmdp` 以及 REST 接口的分页筛选参数，兼顾安全性与线上排障可观测性。
 
-### 6.3 站点级 `encode` 与 SSE 流式响应实测结论
-- **保留站点级 `encode zstd gzip`**：Caddy 2.9.1 的 `encode` 默认不压缩 `text/event-stream`。经实测（每秒推送一条事件的 SSE 服务通过本 `Caddyfile` 代理，客户端带 `Accept-Encoding: gzip, zstd` 请求），响应不含 `Content-Encoding`，事件按 0s/1s/2s/3s 逐条实时到达，配合 `flush_interval -1` 不会造成 SSE 缓冲延迟。
+### 6.3 站点级 `encode` 与 SSE 流式响应（含历史回放压缩）
+- **常规实时 SSE 流不压缩**：站点级保留 `encode zstd gzip`；Caddy 2.9.1 的 `encode` 默认跳过 `text/event-stream`，配合 `flush_interval -1` 实时推送，保持零缓冲延迟。
+- **长对话历史回放专用压缩**：`deploy/dalton/Caddyfile` 单独匹配 `/api/v1/threads/<id>/messages/replay`，对该有限长 SSE 流显式启用 `encode zstd gzip`（`minimum_length 1`，匹配 `Content-Type: text/event-stream*`），避免首帧小于 512 字节跳过压缩导致长对话回放体积过大。
 
 ### 6.4 安全响应头与后续演进项（CSP）
 - **已启用响应头**：
@@ -174,7 +189,7 @@ tailscale funnel status
   - `-Server`（隐藏 `Server: Caddy` 标识）
 - **不启用 `Strict-Transport-Security` (HSTS)**：TLS 在 Tailscale Funnel 层终止，Caddy 仅在宿主机 `127.0.0.1:8088` 提供明文 HTTP。
 - **后续演进项：`Content-Security-Policy` (CSP)**：
-  - 本次上线暂不加 CSP，避免阻断前端正常运行。
+  - 待后续补齐白名单后再启用，保证现有前端脚本与编辑器正常运行。
   - 原因：`web/index.html` 包含内联的 stale-build 恢复 IIFE 脚本、locale 预加载脚本及窗口拖拽样式，且前端包含 Monaco Editor、PDF.js Web Worker / WebAssembly (`wasm`) 与运行时样式注入。后续需盘点完整的内联脚本 SHA-256 hash、`worker-src 'self' blob:`、`script-src 'self' 'wasm-unsafe-eval'` 及 `connect-src 'self' https://*.supabase.co` 后，先以 `Content-Security-Policy-Report-Only` 观察无误再正式开启。
 
 ---
@@ -212,7 +227,7 @@ tailscale funnel status
   docker compose -f docker-compose.yml -f docker-compose.dalton.yml logs --tail=50 edge
   ```
   确认 `/ws/v1/market-data/aggregates/stock` 请求日志中查询参数显示为 `token=REDACTED`，无明文 token。
-- [ ] **局域网无法直连 8000 / 5173 / 8088**：
+- [ ] **局域网仅限本机回环访问 8000 / 5173 / 8088**：
   - 在本机执行：
     ```bash
     lsof -nP -iTCP:8000 -iTCP:5173 -iTCP:8088 -sTCP:LISTEN

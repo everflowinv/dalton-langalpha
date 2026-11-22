@@ -39,7 +39,7 @@ Dalton 开发分支是 `origin/dalton/main`，定期用 `git merge upstream/main
 
 ```bash
 bash scripts/dalton/pr_baseline.sh --baseline-only
-# 关联 PR 并在基线后自动拉取 PR 描述执行声明核验（脚本不支持 --report，--pr 必须传入 PR 编号）：
+# 关联 PR 并在基线后自动拉取 PR 描述执行声明核验（--pr 须传入 PR 编号；本地报告核验请用下方 check_report_claims.py）：
 bash scripts/dalton/pr_baseline.sh --pr <PR_NUMBER> --baseline-only
 # 独立核验本地报告 Markdown 时直接调用 check_report_claims.py：
 uv run python scripts/dalton/check_report_claims.py --strict <path/to/report.md>
@@ -55,17 +55,17 @@ uv run python scripts/dalton/check_report_claims.py --strict <path/to/report.md>
 
 ## 4. 前端首屏体积预算与按需导入规则
 
-生产前端包会用 `web/scripts/check-critical-path.mjs` 强制卡住两项指标：首屏 JS 块集合必须等于 `EXPECTED = ['index', 'rolldown-runtime', 'vendor-react']`，首屏总负载上限是 **`MAX_EAGER_KB = 525`**（单位为 **KiB**，即 `bytes / 1024`）。统计范围包括 **gzip** 压缩后的入口 `index.html`、所有被引用的首屏 JS/CSS 资源，以及体积最大的语言包 catalog 字节总和。默认中文语言包 `zh-CN` 纳入首屏后，上限从 500 KiB 调高到了 525 KiB。
+生产前端包会用 `web/scripts/check-critical-path.mjs` 强制卡住两项指标：首屏 JS 块集合必须等于 `EXPECTED = ['index', 'rolldown-runtime', 'vendor-react']`，首屏总负载上限是 **`MAX_EAGER_KB = 562`**（单位为 **KiB**，即 `bytes / 1024`）。统计范围包括 **gzip** 压缩后的入口 `index.html`、所有被引用的首屏 JS/CSS 资源，以及体积最大的语言包（当前为默认中文包 `zh-CN`）字节总和。
 
-- **严禁在 Settings 以外的页面从 `@/components/dalton/primitives`（即 `web/src/components/dalton/primitives/index.ts` barrel 入口）导入组件**。
-- **原因**：`primitives/index.ts` barrel 导出了 `DaltonActionConfirmButton`，它里面引了 `ConfirmDialog` 和 `framer-motion`。只要首屏同步路由误引这个 barrel，整套 `framer-motion` 就会被拖进首屏同步块，直接爆预算（+45.6 kB 回归）。
-- **正确做法**：Settings 页以外的组件必须直接按文件精确导入子模块，比如 `@/components/dalton/primitives/DaltonStatusPill` 或 `@/components/dalton/primitives/DaltonSectionCard`。每次前端构建（`pnpm --dir web build` 或 `build_frontend_prod.sh`）后都会跑首屏体积校验。
+- **严禁在 Settings 以外的页面从 `@/components/dalton/primitives`（即 `web/src/components/dalton/primitives/index.ts` 汇总导出入口）导入组件**。
+- **原因**：`primitives/index.ts` 汇总导出了 `DaltonActionConfirmButton`，它里面引了 `ConfirmDialog` 和 `framer-motion`。只要首屏同步路由误引这个入口，整套 `framer-motion` 就会被拖进首屏同步块，直接爆预算。
+- **正确做法**：Settings 页以外的组件必须直接按文件精确导入子模块，比如 `@/components/dalton/primitives/DaltonStatusBadge`、`@/components/dalton/primitives/DaltonToolbarPill` 或 `@/components/dalton/primitives/DaltonSettingsCard`。每次前端构建（`pnpm --dir web build` 或 `build_frontend_prod.sh`）后都会跑首屏体积校验。
 
 ## 5. 品牌开发规则
 
 系统对内外用户用明确的双命名契约（详见 [features/brand.md](./features/brand.md)）：
 
-- **助手叫 Dalton，产品平台叫 Everflow**：前端所有面向用户的产品文案都用 i18n 插值占位符 `{{brand}}`（Dalton 构建下解析成 `Everflow`），统一由品牌配置注入产品名。
+- **助手叫 Dalton，产品平台叫 Everflow**：前端所有面向用户的产品文案都用国际化（i18n）插值占位符 `{{brand}}`（Dalton 构建下解析成 `Everflow`），统一由品牌配置注入产品名。
 - **提示词自我介绍**：智能体基础提示词 `src/ptc_agent/agent/prompts/templates/system.md.j2` 固定用 `Dalton, Everflow's investment research agent` 身份运行。
 - **HTML 与分享降级页**：通过 `web/vite.config.js` 的 `brandIndexHtml` 和 `src/server/app/share_pages.py`，保证浏览器标签页、OpenGraph 链接预览和失效分享页统一下发 Everflow 品牌和 `/everflow/favicon.svg`。
 
@@ -73,7 +73,7 @@ uv run python scripts/dalton/check_report_claims.py --strict <path/to/report.md>
 
 - Dalton 迁移独立于上游 `migrations/`，放在 `src/dalton/migrations/versions/`，配置文件是 `src/dalton/alembic.ini`，数据库里用独立版本表 `alembic_version_dalton`。
 - 迁移脚本统一写原生异步友好 SQL（`op.execute(...)`），不用 ORM 模型自动生成。
-- `d031` 之后由于多线并发合入，当前真实依赖链路是：**`d031 -> d035 -> d036 -> d032 -> d033 -> d037 -> d038 -> d039`**（没有 `d034`）。
+- `d031` 之后由于多线并发合入，当前真实依赖链路是（共 43 个迁移，无 `d034`）：**`d031 -> d035 -> d036 -> d032 -> d033 -> d037 -> d038 -> d039 -> d040 -> d041 -> d042 -> d043 -> d044`**。
 - 新增迁移前，一定要先跑下面这条命令确认唯一线性头节点，再沿着它往下接 `down_revision`：
 
 ```bash
@@ -86,4 +86,4 @@ uv run alembic -c src/dalton/alembic.ini heads
 2. **禁止无签名的松散 Mock**：后端单测模拟对象方法时，要用 `create_autospec(<Class>, instance=True)` 或受协议约束的真实假实现，禁止用随意的 `MagicMock` / `SimpleNamespace` 盖住缺失字段或同步异步签名不匹配。
 3. **Fail-Closed 安全边界**：所有认证（Supabase JWT）、内部服务令牌（`X-Service-Token`）、外部数据访问和目录 Containment（比如防符号链接越权 `O_NOFOLLOW`）校验失败时必须明确拒绝，绝不静默退回无鉴权分支，也绝不打印明文密钥。
 4. **测试数据库安全**：删表或重建表结构（`DROP SCHEMA public` 等）的集成测试，只能跑在以 `_test` 结尾的隔离测试库上，严禁指向生产或本地开发库。
-5. **变更可验证、不伪造**：文档、发版说明和报告里的数字及声明，必须能在当前代码或当次真实工具输出里复核。无法确认的外部环境事项要明确标出待确认。
+5. **变更可验证、不伪造**：文档、发版说明和报告里的数字及声明，必须能在当前代码或当次真实工具输出里复核。尚未现场核实的外部环境事项要明确标出待确认。

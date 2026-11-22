@@ -2,8 +2,9 @@
 
 Round-2 rules, decided by roster tiers inside `sharing.py` before any sharing
 row is read: external callers see no colleague workspace at all (404 on both
-channels), and external-owned workspaces are visible to admins (read-only) and
-nobody else. Also covers the tool-layer refusals (`ingest_company_wiki`,
+channels), and external-owned workspaces are hidden from everyone else by
+default (admins included) until the external owner turns on web sharing, and
+never reachable from another member's Chief of Staff. Also covers the tool-layer refusals (`ingest_company_wiki`,
 `conversation_search`, `publish_report`) and fail-closed tier resolution. All
 doubles use `unittest.mock.create_autospec`.
 """
@@ -524,7 +525,8 @@ def _list_rows() -> list[dict[str, Any]]:
 
 
 class TestTeamWorkspaceListIsolation:
-    """External callers get empty lists; external-owned rows appear to admins only."""
+    """External callers get empty lists; external-owned rows appear to internal
+    members and admins only once the external owner turns on web sharing."""
 
     @pytest.mark.asyncio
     async def test_external_caller_gets_empty_lists(

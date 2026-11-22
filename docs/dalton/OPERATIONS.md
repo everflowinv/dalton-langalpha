@@ -40,7 +40,7 @@ Caddy `edge` 容器直接静态托管 `./web/dist`。每次发布前端代码或
 bash scripts/dalton/build_frontend_prod.sh --require-supabase
 ```
 
-- 这个脚本先读 `web/.env.dalton` 当 `VITE_*` 默认值，再用仓库 `.env` 里的 `VITE_*`（以及 `DALTON_AUTH_MODE`、`SUPABASE_URL`、`SUPABASE_PUBLISHABLE_KEY` 回退）覆盖并导出环境变量，接着进 `web/` 跑 `pnpm build`（脚本没设 `APP_ENV=dalton`），最后强制检查首屏预算（`web/scripts/check-critical-path.mjs`）和认证配置完整性（`--require-supabase` 防止打出没带 Supabase 认证的裸包）。
+- 这个脚本先读 `web/.env.dalton` 当 `VITE_*` 默认值，再用仓库 `.env` 里的 `VITE_*`（以及 `DALTON_AUTH_MODE`、`SUPABASE_URL`、`SUPABASE_PUBLISHABLE_KEY` 回退）覆盖并导出环境变量，接着进 `web/` 跑 `pnpm build`（脚本没设 `APP_ENV=dalton`），校验首屏预算（`web/scripts/check-critical-path.mjs`）和认证配置完整性（`--require-supabase` 防止打出没带 Supabase 认证的裸包），最后构建静态帮助站点 `docs-site/` 并把产物复制到 `web/dist/help/`。
 - 默认构建入口已经带了 `web/.env.dalton`（`VITE_BRAND_NAME=Everflow`、`VITE_BRAND_MARK=everflow`）。
 
 ### 1.4 生产部署
@@ -53,25 +53,28 @@ bash scripts/dalton/ops/prod/deploy_main.sh
 bash scripts/dalton/ops/prod/deploy_main.sh --recreate
 # 同步改动了 researchdata_bridge.py 或其依赖时：
 bash scripts/dalton/ops/prod/deploy_main.sh --bridge
-# 包含 Dalton Alembic 迁移时校对目标版本号：
-bash scripts/dalton/ops/prod/deploy_main.sh --expect-migration d039
+# 包含 Dalton Alembic 迁移时校对目标版本号（自动先做新备份）：
+bash scripts/dalton/ops/prod/deploy_main.sh --expect-migration d044
+# 仅在目标提交已固定、且已核对不含任何数据库迁移时，可复用 N 分钟内的成功备份以跳过重新 dump（含迁移或不确定时用默认命令）：
+bash scripts/dalton/ops/prod/deploy_main.sh --reuse-backup-minutes 60
 ```
 
-- **发布流程**：脚本先按单次 10 秒超时（`perl` 进程超时与 PostgreSQL `statement_timeout`）尽力读取并记录当前两条 Alembic 迁移链版本（仅用于失败提示，读取不到或超时时不中止发布），调用 `wait_backend_idle.sh` 连续两次确认没有进行中的会话或子代理任务，随后触发 `com.dalton.pg-backup` 完成一次新的 Postgres 备份并核对备份日志；备份完成后记录 `PRE_FF` 提交、快进合并 `origin/dalton/main` 并检查 `migrations/versions` 与 `src/dalton/migrations/versions` 是否有文件变更（`MIGRATING_DEPLOY`），接着同步宿主机 `.venv`（`uv sync --frozen`）与前端依赖（`pnpm install --frozen-lockfile`）并执行 `scripts/dalton/build_frontend_prod.sh --require-supabase`；重启前再次确认后端空闲，然后重建或重启 `backend` 与 `crawler`（以及有配置变更时的 `edge`），最后依次检查 `/health`、Dalton 迁移版本、`crawler:8100/health` 与 `scripts/dalton/check_public_edge.sh`。
+- **发布流程**：脚本先按单次 10 秒超时（`perl` 进程超时与 PostgreSQL `statement_timeout`）尽力读取并记录当前两条 Alembic 迁移链版本（仅用于失败提示，读取不到或超时时不中止发布），调用 `wait_backend_idle.sh` 连续两次确认没有进行中的会话或子代理任务，随后触发 `com.dalton.pg-backup` 完成一次新的 Postgres 备份并核对备份日志（仅在目标提交固定、核对无迁移且传入 `--reuse-backup-minutes N`、日志末行为 N 分钟内 ` ok ` 记录时复用已有备份）；备份完成后记录 `PRE_FF` 提交、快进合并 `origin/dalton/main` 并检查 `migrations/versions` 与 `src/dalton/migrations/versions` 是否有文件变更（`MIGRATING_DEPLOY`），接着同步宿主机 `.venv`（`uv sync --frozen`）与前端依赖（`pnpm install --frozen-lockfile`）并执行 `scripts/dalton/build_frontend_prod.sh --require-supabase`；重启前再次确认后端空闲，然后重建或重启 `backend` 与 `crawler`（以及有配置变更时的 `edge`），最后依次检查 `/health`、Dalton 迁移版本、`crawler:8100/health` 与 `scripts/dalton/check_public_edge.sh`。
 - **常用参数**：
-  - `--recreate`：在 `docker-compose.yml` 或 `docker-compose.dalton.yml` 中调整了容器编排字段（如资源上限、环境变量、挂载路径）时传入，使用 `docker compose up -d --no-deps` 重建 `backend` 与 `crawler` 使配置生效；日常纯代码发布保持默认 `docker restart` 即可。每次部署开始时都会按文件名模式清理 `~/Library/Logs/Dalton/containers/<service>-<UTC时间戳>.log.gz` 中超过 14 天的旧归档；重建 `backend`、`crawler` 或 `edge` 容器前，脚本会自动将旧容器的 `docker logs --timestamps` 压缩保存至该目录（保存失败仅告警不中止部署）。新部署脚本发布后的第一次部署仍由旧脚本执行，从第二次起保存日志。
-  - **数据任务运行副本同步（ETF 月度资金流 / Token 用量周报）**：`scripts/dalton/data_assets/scripts/token_weekly_usage_tracker.py`、`scripts/dalton/data_assets/scripts/cron_command_tasks.py` 与 `scripts/dalton/data_assets/scripts/feishu_send_card.py` 由 `scripts/dalton/seed_openclaw_data.sh` 拷贝到运行目录（默认 `var/dalton/openclaw-data/`）。常规 `deploy_main.sh` 不会刷新这些运行副本，改了这两份脚本（ETF 月度资金流、Token 用量周报相关脚本）后需要重新执行 seed 脚本：`bash scripts/dalton/seed_openclaw_data.sh --apply`（先可用 `--dry-run` 预览）。
+  - `--recreate`：在 `docker-compose.yml` 或 `docker-compose.dalton.yml` 中调整了容器编排字段（如资源上限、环境变量、挂载路径）时传入，使用 `docker compose up -d --no-deps` 重建 `backend` 与 `crawler` 使配置生效；日常纯代码发布保持默认 `docker restart` 即可。每次部署开始时都会按文件名模式清理 `~/Library/Logs/Dalton/containers/<service>-<UTC时间戳>.log.gz` 中超过 14 天的旧归档；重建 `backend`、`crawler` 或 `edge` 容器前，脚本会自动将旧容器的 `docker logs --timestamps` 压缩保存至该目录（保存失败仅告警不中止部署）。
+  - **数据任务运行副本同步（ETF 月度资金流 / Token 用量周报 / Antigravity 系列快照）**：`scripts/dalton/data_assets/` 中的脚本与技能（含 `token_weekly_usage_tracker.py`、`cron_command_tasks.py`、`feishu_send_card.py` 等），以及 `src/dalton/llm/antigravity_series.py` 和导出的 `references/antigravity_series.json`，均由 `scripts/dalton/seed_openclaw_data.sh` 同步到运行目录（默认 `var/dalton/openclaw-data/`）。改过 `data_assets/` 或 Antigravity 模型系列配置后，需在常规 `deploy_main.sh` 之外单独执行：`bash scripts/dalton/seed_openclaw_data.sh --apply`（先可用 `--dry-run` 预览）。
   - `--bridge`：本次发布包含 `scripts/dalton/researchdata_bridge.py` 或宿主机桥接逻辑改动时传入，在健康检查后重启 `com.dalton.researchdata-bridge` 并输出服务状态。
   - `--expect-migration dNNN`：本次发布附带 Dalton 数据库迁移时传入，解析参数时即校验 `dNNN` 格式（无效值以状态码 `2` 退出），并在后端就绪后核对 `alembic -c src/dalton/alembic.ini current` 输出的迁移版本前缀。
+  - `--reuse-backup-minutes N`（正整数分钟）：**仅用于目标提交已固定、且已提前核对不含任何上游或 Dalton 数据库迁移的发布**；满足 `dalton-pg-backup.log` 末行是 N 分钟内带 ` ok ` 的成功备份时跳过重新 dump。凡包含迁移、远端分支仍可能推进或不确定是否有迁移时，直接使用默认发布命令自动执行新备份。
 - **失败回滚与迁移保护**：脚本在快进合并前记录 `PRE_FF`。若 `pnpm install`、前端生产构建、重启前二次空闲等待失败，或容器重启/重建（`backend`、`crawler`、`edge`）、后端 `/health`、Dalton `crawler:8100/health`、`edge` 就绪探测及 `check_public_edge.sh` 任一步失败，会调用 `revert_deploy`：
   - **自动回退代码**（`MIGRATING_DEPLOY=0`）：本次合并未改动任何迁移文件（且对比成功）时，不论是否已触动后端，均按原流程将代码复位到 `PRE_FF`、重新同步 `.venv` 与 `web/node_modules` 并重打旧版前端静态包；若已触动容器，还会按需重建/重启 `backend`、`crawler` 与 `edge`，并重跑健康检查报告回滚后状态，最终以非零状态码退出。
-  - **中止自动回退并交由人工处理**（`MIGRATING_DEPLOY=1`）：由于迁移目录挂载进容器，快进后后端随时可能被 Docker 或看门狗拉起并执行迁移，因此只要本次发布包含迁移文件（或无法确认），不论 `BACKEND_TOUCHED` 是否为 `1`，**一律不执行 `git reset`、不自动降级数据库、也不停止服务**，保持当前代码与各服务现状，再次按 10 秒超时读取双链版本（读不到时显示“未能读取”）并给出在部署检出根目录下的排查命令（`docker ps -a`、后端日志、后端实际连接的 `DB_(HOST|PORT|NAME)`、两条 `SELECT version_num`）、备份完成确认（`~/Library/Logs/dalton-pg-backup.log` 末行新的 ` ok ` 记录）、第 4 节全量停写（`backend`、`crawler`、`edge` 及 `com.dalton.monitor-feeds`、`com.dalton.researchdata-bridge`、`com.dalton.channel-gateway`）与看门狗停启（`launchctl bootout` / `bootstrap`）、维护容器降级指引以及复位后的服务重启（含 `--bridge` 桥接重启）与健康/公网验证步骤，最后以非零状态码退出。
+  - **中止自动回退并交由人工处理**（`MIGRATING_DEPLOY=1`）：由于迁移目录挂载进容器，快进后后端随时可能被 Docker 或看门狗拉起并执行迁移，因此只要本次发布包含迁移文件（或状态待人工核实），不论 `BACKEND_TOUCHED` 是否为 `1`，**一律保留当前代码与各服务现状，由人工按步骤核查后再处理**，再次按 10 秒超时读取双链版本（读不到时显示“未能读取”）并给出在部署检出根目录下的排查命令（`docker ps -a`、后端日志、后端实际连接的 `DB_(HOST|PORT|NAME)`、两条 `SELECT version_num`）、备份完成确认（`~/Library/Logs/dalton-pg-backup.log` 末行新的 ` ok ` 记录）、第 4 节全量停写（`backend`、`crawler`、`edge` 及 `com.dalton.monitor-feeds`、`com.dalton.researchdata-bridge`、`com.dalton.channel-gateway`）与看门狗停启（`launchctl bootout` / `bootstrap`）、维护容器降级指引（如涉及删除列的迁移如 `d042 -> d041`，须先按 [antigravity-effort-picker.md](./features/antigravity-effort-picker.md) §3 导出受影响列并保留迁移文件执行降级）以及复位后的服务重启（含 `--bridge` 桥接重启）与健康/公网验证步骤，最后以非零状态码退出。
 - **边缘代理（`edge`）重载**：快进合并后通过 `deploy/dalton/Caddyfile` 差异及 `docker compose config` 解析后的 `edge` 服务配置对比，检测到任一变化时会在健康检查前执行 `docker compose up -d --no-deps --force-recreate edge`，随后以 60 秒统一截止时间循环探测 `http://127.0.0.1:8088/`（端口由 `DALTON_EDGE_PORT` 控制，要求 `curl` 成功且返回 `200`）；超时直接触发回滚并以非零退出，就绪后再运行 `check_public_edge.sh`。
 - **配套宿主机脚本与 `launchd` 模板**：`scripts/dalton/ops/prod/` 下同时收拢了 `wait_backend_idle.sh`、`backup.sh`、`watchdog.sh`、`colima_launch.sh` 以及 `launchd/` 下的三份模板（`com.dalton.backend-watchdog.plist.template`、`com.dalton.colima.plist.template`、`com.dalton.pg-backup.plist.template`）。
 
 ## 2. `.env` 与叠加配置文件改动生效规则
 
-- **改完 `.env` 必须重建容器**：Docker Compose 只在创建容器时读 `.env`，跑 `docker compose restart backend` 不会重新注入新变量！只要改了 `INTERNAL_SERVICE_TOKEN`、`DALTON_ALLOWED_EMAILS`、`DALTON_PM_USER_IDS`、`DALTON_ARTIFACT_PUBLISHING_ENABLED`、`GEMINI_API_KEY`、`XAI_API_KEY` 等 `.env` 变量，就必须跑：
+- **改完 `.env` 必须重建容器**：Docker Compose 只在创建容器时读 `.env`；修改 `INTERNAL_SERVICE_TOKEN`、`DALTON_ALLOWED_EMAILS`、`DALTON_PM_USER_IDS`、`DALTON_ARTIFACT_PUBLISHING_ENABLED`、`GEMINI_API_KEY`、`XAI_API_KEY` 等 `.env` 变量后，执行 `--force-recreate` 使新变量生效：
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.dalton.yml up -d --force-recreate backend
@@ -83,8 +86,8 @@ docker compose -f docker-compose.yml -f docker-compose.dalton.yml up -d --force-
 ### 2.1 Firecrawl 多 Key 主备配置与冷却排查
 
 - **添加第二个（及更多）Key**：在 `.env` 中按顺序配置 `FIRECRAWL_API_KEY`（主 Key），再追加 `FIRECRAWL_API_KEY_2`、`FIRECRAWL_API_KEY_3`……（从 `_2` 起按连续数字递增，遇到空缺即停止读取；只写变量名、不要把任何真实密钥写入文档或日志）。
-  - 调度策略为主备切换：请求优先使用顺序最靠前且未冷却的 Key；某个 Key 返回 402 账户额度用完时标记冷却并立即用下一个可用 Key 重试同一个请求（若响应带有余额大于零，或无余额字段但文义为“本次请求所需额度不足”，多 Key 模式下不冷却、不切换、不计入熔断，直接返回提供方错误）。冷却时长规则：有未来的 `resets_at` 就冷却到那时为止；`resets_at` 已过期则短冷却 5 分钟；缺少或无法解析 `resets_at` 时，若响应明确余额为 0（`<= 0`）则冷却 24 小时，若缺少余额字段则冷却 1 小时。仅当所有 Key 都处于冷却时才返回 `budget_exceeded` 并快速失败（提示最早的实际冷却截止时间 `cooldown_until`），任一 Key 冷却到期后自动恢复优先使用。
-  - 改完 `.env` 后必须重建 `backend` 容器使新变量生效（仅 `restart` 不会重读 `.env`）：
+  - 调度策略为主备切换：请求优先使用顺序最靠前且未冷却的 Key；某个 Key 返回 402 账户额度用完时标记冷却并立即用下一个可用 Key 重试同一个请求（若响应带有余额大于零，或无余额字段但文义为“本次请求所需额度不足”，多 Key 模式下直接返回提供方错误，保持其余 Key 正常）。冷却时长规则：有未来的 `resets_at` 就冷却到那时为止；`resets_at` 已过期则短冷却 5 分钟；缺少或难以解析 `resets_at` 时，若响应明确余额为 0（`<= 0`）则冷却 24 小时，若缺少余额字段则冷却 1 小时。仅当所有 Key 都处于冷却时才返回 `budget_exceeded` 并快速失败（提示最早的实际冷却截止时间 `cooldown_until`），任一 Key 冷却到期后自动恢复优先使用。
+  - 改完 `.env` 后执行 `--force-recreate` 重建 `backend` 容器以重读环境变量：
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.dalton.yml up -d --no-deps --force-recreate backend
@@ -111,12 +114,12 @@ docker compose -f docker-compose.yml -f docker-compose.dalton.yml exec -T \
 
 ### 2.2 内置浏览器功能（默认关闭与开启条件）
 
-- **为什么关**：合并上游 `#831` 后，Dalton 默认关闭云计算机内置浏览器功能（两份只读评估 `codex_20261121T110709Z_62660.md` 与 `agy_review_20261121T110709Z_62672.md` 第 6 节结论一致）：
-  1. **缺少远程预览通道**：Dalton 通过单域名 Tailscale Funnel + Caddy 暴露服务，且 `DALTON-HOOK(sandbox-port-bind)` 将沙箱端口绑定到宿主机 `127.0.0.1`，未配置独立泛解析 HTTPS 预览域（`PREVIEW_PROXY_BASE_URL`），远程用户无法打开直播流；
+- **为什么关**：合并上游 `#831` 后，Dalton 默认关闭云计算机内置浏览器功能，原因有三项：
+  1. **缺少远程预览通道**：Dalton 通过单域名 Tailscale Funnel + Caddy 暴露服务，且 `DALTON-HOOK(sandbox-port-bind)` 将沙箱端口绑定到宿主机 `127.0.0.1`，需先配置独立泛解析 HTTPS 预览域（`PREVIEW_PROXY_BASE_URL`）才可向远程用户提供直播流；
   2. **网络隔离与权限边界不足**：内置出站代理 `browser_runtime/proxy.py` 未拦截私网/兄弟容器网段且会被宿主机 Fake-IP（`198.18.0.0/15`）绕过；每台计算机共用一个 Chrome 实例且 `relay.py` 无服务端控制租约校验，存在共享串屏、越权操控及权限撤回后未断开存量连接的风险；
   3. **宿主机内存与容器资源受限**：Mac Colima VM 内存余量有限、容器未配置 `/dev/shm` 扩容且缺少跨容器浏览器并发总量限制。
-  - 当前通过三层总闸保持关闭：`config.dalton.yaml` 设置 `features.browser.enabled: false`（隐藏设置页开关、模型 `browser` skill 与前端 Browser 入口，使 `browser-*` 接口返回 `unavailable`），`DALTON-HOOK(browser-kill-switch)` 同步跳过沙箱侧 `browser_runtime` / `agent-browser` 包装器上传、画质同步与画质接口，且 `DockerProvider._ensure_image` 在 `APP_ENV=dalton` 下会自动传入 `INSTALL_AGENT_BROWSER=0`。`Dockerfile.sandbox` 保持上游默认 `ARG INSTALL_AGENT_BROWSER=1`；Dalton 常规部署（`deploy_main.sh`、`docker_build_backend.sh`、`docker-compose.dalton.yml`）不重建沙箱镜像，**如后续手工重建 `langalpha-sandbox:latest` 且浏览器仍保持关闭，必须显式传入 `--build-arg INSTALL_AGENT_BROWSER=0`**（`docker build --build-arg INSTALL_AGENT_BROWSER=0 -f Dockerfile.sandbox -t langalpha-sandbox:latest .`）。现有 Playwright、Scrapling 与普通应用预览保持不受影响；本次部署无需重建沙箱镜像。
-- **开之前要补哪些事**（见上述两份评估第 6 节）：
+  - 当前通过三层总闸保持关闭：`config.dalton.yaml` 设置 `features.browser.enabled: false`（隐藏设置页开关、模型 `browser` 技能与前端 Browser 入口，使 `browser-*` 接口返回 `unavailable`），`DALTON-HOOK(browser-kill-switch)` 同步跳过沙箱侧 `browser_runtime` / `agent-browser` 包装器上传、画质同步与画质接口，且 `DockerProvider._ensure_image` 在 `APP_ENV=dalton` 下会自动传入 `INSTALL_AGENT_BROWSER=0`。`Dockerfile.sandbox` 保持上游默认 `ARG INSTALL_AGENT_BROWSER=1`；Dalton 常规部署（`deploy_main.sh`、`docker_build_backend.sh`、`docker-compose.dalton.yml`）不重建沙箱镜像，**如后续手工重建 `langalpha-sandbox:latest` 且浏览器仍保持关闭，必须显式传入 `--build-arg INSTALL_AGENT_BROWSER=0`**（`docker build --build-arg INSTALL_AGENT_BROWSER=0 -f Dockerfile.sandbox -t langalpha-sandbox:latest .`）。现有 Playwright、Scrapling 与普通应用预览保持不受影响。
+- **开之前要补哪些事**：
   1. **出站网络隔离与 Fake-IP 防护**：在实际出站连接处拦截 Mac 宿主机、Docker 网段及内网地址，并补齐 Fake-IP 真实 IP 复查；
   2. **独立授权与访问控制**：首轮试用仅限指定内部用户在个人计算机上使用；将观看与控制权限绑定到用户、计算机和连接，并在服务端校验键鼠输入的控制租约；浏览器端口改由专用接口管理，避免普通应用预览转发；
   3. **连接撤销与独立预览代理**：直播流强制走独立泛解析 HTTPS 预览代理（配好 `PREVIEW_PROXY_BASE_URL` 与边缘路由）；撤回试用权限或关闭开关时断开已建 WebSocket 并停止对应浏览器；
@@ -154,7 +157,7 @@ docker compose -f docker-compose.yml -f docker-compose.dalton.yml exec -T \
 launchctl print gui/$(id -u)/com.dalton.researchdata-bridge | head -n 40
 ```
 
-> 安全提醒：改了 Vault 里的飞书应用凭据（`DALTON_FEISHU_APP_ID` / `DALTON_FEISHU_APP_SECRET`）后，网关不会热替换内存凭据。确认没有正在发的重要推送后，用 `launchctl kickstart -k gui/$(id -u)/com.dalton.channel-gateway` 重启刷新内存。
+> 安全提醒：改了 Vault 里的飞书应用凭据（`DALTON_FEISHU_APP_ID` / `DALTON_FEISHU_APP_SECRET`）后，需在确认无进行中推送时执行 `launchctl kickstart -k gui/$(id -u)/com.dalton.channel-gateway` 重启网关以刷新内存凭据。
 
 ### 3.2 研究数据常驻服务
 
@@ -244,8 +247,25 @@ launchctl print gui/$(id -u)/com.dalton.researchdata-bridge | head -n 40
 
 - **先计划后写入**：默认不加 `--apply` 为只读计划模式；写入前会校验 `scope='company'` 是否提供了合法的 `--actor-user-id`（经 `is_internal_or_admin` 校验为内部成员或管理员），缺失或无权限会在写入任何数据前报错退出。
 - **归档文件位置**：执行 `--apply` 前把原始值以 `0600` 权限写入 `var/dalton/operator-records/model-switch-<UTC时间戳>.json`，并在偏好 CAS 写入完成后同步记录实际被替换的原值与跳过的冲突用户。
-- **范围边界**：用户自定义模型（`model_preference.custom_models`）**不在切换范围内**，脚本不会改动；`automations.instruction` 文本中的旧模型名只列出原文片段与建议改法，**不会自动改写**。
-- **并发与中断恢复**：线程只更新计划内的 `thread_id`（事务内核对行数不符即回滚）；用户偏好在事务内加锁重读并通过 CAS 保护，冲突时跳过该用户并报告；任一阶段失败会打印已完成与未完成进度摘要并以非零退出码退出，修复后可直接重跑（幂等，已切换行不会再次进入计划）。
+- **范围边界**：仅替换系统模型引用，用户自定义模型（`model_preference.custom_models`）保持原样；`automations.instruction` 文本中的旧模型名仅列出原文片段与建议改法，由人工按需修订。
+- **并发与中断恢复**：线程只更新计划内的 `thread_id`（事务内核对行数不符即回滚）；用户偏好在事务内加锁重读并通过 CAS 保护，冲突时跳过该用户并报告；任一阶段失败会打印已完成与未完成进度摘要并以非零退出码退出，修复后可直接重跑（幂等，已切换行自动跳过）。
+
+### 3.5 专项运维脚本（Opus 思考强度回填与重复公司工作区合并）
+
+- **存量 Opus 定时任务思考强度一次性回填（`scripts/dalton/ops/backfill_opus_automation_effort.py`）**：仅针对未删除且 `llm_model` 严格等于 `claude-opus-5-5-oauth` 或 `claude-opus-5-5`、`reasoning_effort IS NULL` 且未被用户自定义模型遮蔽的任务，写入 `reasoning_effort = 'medium'`。默认只读预演（`--dry-run --out <plan.json>`），确认后执行 `--apply --plan <plan.json>`（写前落盘 `0600` 归档文件至 `var/dalton/operator-records/opus-effort-backfill-<batch_id>.json` 并在单事务行锁内复核，保留用户已主动清空的任务），支持 `--rollback <batch_id>` 安全还原。详见 [antigravity-effort-picker.md](./features/antigravity-effort-picker.md)。
+- **历史重复公司工作区合并（`scripts/dalton/ops/merge_duplicate_company_workspace.py`）**：
+  - **权限变更副作用（执行前必核对）**：执行 `--apply` 除了将重复工作区（`--dup`）的对话与知识版本合并到规范工作区（`--canon`）、标记重复项（不复制工作区磁盘文件）外，**还会把规范工作区 `canon` 的网页共享直接设为可读写（`web_access='rw'`）**，并同时写入旧的工作区级协同字段（`cos_access='rw'`）。在当前生产已开启跨人协同（`DALTON_COLLEAGUE_DISPATCH_ENABLED=true`）的环境下，研究总监协同实际权限取决于工作区所有者的账户级开关。执行前须先在预演输出中核对共享设置变更。
+  - **执行与归档路径**：必传 `--dup <重复工作区UUID> --canon <规范工作区UUID>`；在宿主机直接执行时默认归档写到 `~/Backups/dalton/merge-ws-<UTC时间戳>/before.jsonl`（容器内默认 `var/dalton/operator-records/`，可用 `--archive-out` 指定路径）。在两个工作区无人使用时加 `--apply` 单事务执行并落盘 `0600` 归档，支持 `--revert <before.jsonl>` 撤销：
+    ```bash
+    # 1. 只读预演并核对预演中的共享设置变更
+    .venv/bin/python scripts/dalton/ops/merge_duplicate_company_workspace.py \
+      --dup <重复工作区UUID> --canon <规范工作区UUID>
+
+    # 2. 确认后执行写入（按需通过 --archive-out 指定归档文件）
+    .venv/bin/python scripts/dalton/ops/merge_duplicate_company_workspace.py \
+      --dup <重复工作区UUID> --canon <规范工作区UUID> --apply
+    ```
+  - **提交后核查**：合并完成后，抽查已迁移对话链接是否正常打开，并核对规范工作区的网页共享权限及所有者的账户级研究总监协同开关是否符合预期。
 
 ### 3.6 加入或切换模型的检查清单
 
@@ -322,7 +342,7 @@ launchctl print gui/$(id -u)/com.dalton.researchdata-bridge | head -n 40
    - `dalton_config_git_backup.sh`：每 6 小时备份体积小、改得勤的配置（`.env` 等用 `~/.config/dalton/backup.key` AES 加密成 `.enc` 后推到私人 Git 仓库）。
    - `dalton_db_offsite.sh`：每天 03:40 把最新的完整 `dalton-pg-*.dump` 流式加密传到 Google Drive `DaltonBackup/db/<日期>/`（先写 `.partial-<随机>` 并校对大小和 MD5，再原子 `moveto`；默认留 7 份）。
    - `dalton_data_backup.sh`：每周日 05:00 流式加密上传 MinIO 卷、沙箱 `/home/workspace`、Redis 快照和宿主机 `var/dalton`（留 4 周）。对没排除的 SQLite 文件，先在外置盘 `/Volumes/EveSSD` 上生成在线一致副本再打包，不写宿主机内置盘临时目录。
-2. **密钥必须离线保管**：`~/.config/dalton/backup.key`（默认对应 `DALTON_BACKUP_KEY_FILE`，权限 `0600`）**绝不会进 GitHub 或 Google Drive**，一定要存进团队密码管理器。
+2. **密钥必须离线保管**：`~/.config/dalton/backup.key`（默认对应 `DALTON_BACKUP_KEY_FILE`，权限 `0600`）**仅保存在本地与团队密码管理器中，隔离在 GitHub 与 Google Drive 之外**。
 3. **恢复步骤（按实际备份内容逐项来）**：
    - **解密参数**：`dalton_config_git_backup.sh`、`dalton_db_offsite.sh` 和 `dalton_data_backup.sh` 统一用 `openssl enc -aes-256-cbc -pbkdf2 -salt -pass "file:${DALTON_BACKUP_KEY_FILE}"` 加密。解密命令如下：
      ```bash
@@ -344,7 +364,7 @@ launchctl print gui/$(id -u)/com.dalton.researchdata-bridge | head -n 40
    - **恢复后核查**：
      1. 双链迁移版本校验：进 `backend` 容器确认 `uv run alembic current` 和 `uv run alembic -c src/dalton/alembic.ini current` 都停在 head。
      2. 健康与端到端检查：依次跑 `GET /health`、带认证的 `GET /api/v1/dalton/openclaw/health`、`bash scripts/dalton/check_bridge.sh`、`bash scripts/dalton/check_public_edge.sh`。
-     3. 持久数据校验：对 `var/dalton` 下的关键 SQLite 库跑 `sqlite3 <数据库路径> "PRAGMA integrity_check;"`，再去 MinIO 或应用里抽查近期音频转写和工作区聊天附件能不能正常打开。
+     3. 持久数据校验：对 `var/dalton` 下的关键 SQLite 库跑 `sqlite3 <数据库路径> "PRAGMA integrity_check;"`，再去 MinIO 或应用里抽查近期音频转写和工作区聊天附件是否正常打开。
    - **SQLite `-wal` 告警处置**：碰上 SQLite `-wal` 残留且目录不可写导致备份脚本告警时，先确认没有进程在写，再跑一次 `sqlite3 <数据库路径> "PRAGMA wal_checkpoint(TRUNCATE);"`。
 
 ## 5. 公开入口与网络边界
@@ -392,7 +412,7 @@ python3 scripts/dalton/alphaengine_usage_report.py
 | 语音转写或大文件上传报存储未配置 | 起 Compose 时漏了 `--profile storage`（或 `--profile infra`），或者 MinIO 没初始化 | 用 `--profile infra --profile storage up -d`（用外部 DB/Redis 时 `--profile storage up -d minio`）拉起 `minio`，并对照 `AUDIO-STORAGE.md` 查 `DALTON_ASR_STORAGE_*` 变量 |
 | 外置盘没挂载导致夜间备份失败 | `/Volumes/EveSSD` 掉线，脚本按规定拒绝退回内置盘 | 挂回外置盘后手动补跑 `bash scripts/dalton/ops/dalton_db_offsite.sh` |
 | 监控面板点“发布/更新”返回 403 `artifact_publishing_disabled` | 当前环境没开发布总开关 | 检查 `.env` 里的 `DALTON_ARTIFACT_PUBLISHING_ENABLED=true` 并重建 `backend`（见 [monitors.md](./features/monitors.md)） |
-| 覆盖单元绑定/解绑/归档返回 409 | 单元已绑定其他工作区，或当前绑定工作区仍有活动受管任务/未开始执行 | 首期不支持改绑；解绑或归档前须先关闭跟踪（会暂停相关标准与财报任务并跳过未开始执行），再解绑或归档；切换工作区须先解绑再重新绑定 |
+| 覆盖单元绑定/解绑/归档返回 409 | 单元已绑定其他工作区，或当前绑定工作区仍有活动受管任务/未开始执行 | 切换工作区须先解绑再重新绑定；解绑或归档前须先关闭跟踪（会暂停相关标准与财报任务并跳过未开始执行），再执行解绑或归档 |
 
 ### 覆盖单元（绑定 / 解绑 / 归档规则）
 

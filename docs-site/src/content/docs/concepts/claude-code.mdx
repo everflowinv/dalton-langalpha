@@ -1,63 +1,53 @@
 ---
 title: Claude Code 模式
-description: 这页讲清 Claude Code 模式在当前 Everflow（Dalton）环境的状态、前置条件、运行位置与个人账号配置。
-lastUpdated: 2026-11-17
+description: 这页讲清 Claude Code 模式在当前 Everflow 环境的状态、使用前提、运行位置与团队 Claude 模型的使用方式。
+lastUpdated: 2026-11-22
 ---
 
-这页讲清 **Claude Code 模式**怎么跑、当前 Dalton 环境为什么没开，以及怎么用个人 Claude 账号。
+这页讲清 **Claude Code 模式**的概念、使用前提，以及在当前 Everflow 团队环境里使用 Claude 模型的方法。
 
-在当前 Everflow（Dalton）部署里，**Claude Code 运行时（`claude_code_runtime`）默认关闭**（见 `config.dalton.yaml`），平台统一用托管 Docker 沙箱，也暂未开放桌面端和个人 SSH 电脑。**个人 Claude 登录（`claude_oauth`）则向全员开放**，你可以去「设置 → 个人设置 → 模型」连上自己的 Claude 账号，或者直接用团队共享目录里的 Claude 模型。
+在当前 Everflow 团队部署里，日常使用 Claude 系列模型，直接在模型选择器里选用团队共享目录中的 Claude 订阅模型即可（团队共用凭据由管理员在「设置 → 团队管理 → 模型与供应商」统一连接与维护）。
 
 <span id="how-it-runs" aria-hidden="true"></span>
 ## 运行方式
 
-在开启了这个模式的上游环境里，Claude Code 模式会把对话交给沙箱或指定主机里的 Claude Code CLI 会话来跑：
+在开启了 Claude Code 模式的部署环境中，对话会交给沙箱或指定主机里的命令行会话来跑：
 
-- 每次回合会复用或交接一个对应工作区目录的 CLI 会话，切换模型前后还会按需自动生成上下文交接摘要。
-- 切换和运行行为由平台开关（`claude_code_runtime`）和服务器环境变量共同控制。
-- **在当前 Everflow（Dalton）环境里**：`features.claude_code_runtime.enabled` 固定为 `false`，生产后端镜像默认不开这个运行时，模型选择器里也不会路由去需要它的模型。
+- 每次回合会复用或交接一个对应工作区目录的会话，切换模型前后还会按需自动生成上下文交接摘要。
 
 <span id="requirements" aria-hidden="true"></span>
 ## 使用前置条件
 
-将来如果部署开了 Claude Code 模式，一般要同时满足三个条件：
+将来如果团队决定开启 Claude Code 模式，需要同时满足三个条件：
 
-1. **平台开关与镜像依赖就绪**：部署配置打开 `claude_code_runtime`，运行环境里装好对应 CLI 和密钥配置。
-2. **计算机规格达标**：云端容器沙箱要到 **Medium** 及以上规格才能跑；Small 规格会提示先升级计算机配置。
-3. **有效认证令牌**：需要绑定设置令牌（Setup Token）并通过可用性校验；遇上缺 `perl`、`musl` 系统或组织策略限制的环境会拒绝启动。
-
-:::note[当前 Dalton 环境的实际条件]
-当前 Dalton 工作区统一跑在平台托管 Docker 沙箱（默认 `2.0 vCPU / 3 GB`），桌面客户端和个人 SSH 电脑都未开放。日常研究直接用标准对话模型或个人 `claude_oauth` 连接就行。
-:::
+1. **平台已开启该功能并就绪对应运行环境**；
+2. **计算机规格达标**：云端容器沙箱需要达到中等（Medium）及以上规格（当前托管沙箱默认为 `2.0 vCPU / 3 GB`）；
+3. **有效认证令牌**：需要绑定设置令牌（Setup Token）并通过可用性校验。
 
 <span id="where-it-runs-and-when-it-can-run" aria-hidden="true"></span>
 ## 运行位置与何时可运行
 
-在「模型接入」里选不同的托管方式，Claude Code 会话就会落在不同的机器上：
+开启该模式时，一般有两种运行位置：
 
-- **云端容器托管模式（Stored）**：把设置令牌安全托管后，放进规格达标的云端沙箱里跑。托管开关没开或容器规格太小时，这个模式就跑不起来。
-- **自有电脑模式（Local）**：把 CLI 会话放进你绑定的个人 Mac（通过桌面端远程控制）或 SSH 电脑里跑。电脑离线或休眠连不上时，这轮对话就发不出去。
-- **在当前 Dalton 部署里**：因为 `claude_code_runtime` 关着，桌面端和 SSH 通道也没开，这两种模式都未启用。日常研究请直接用标准对话模型或个人 `claude_oauth`。
+- **云端容器托管模式**：把设置令牌安全托管后，在规格达标的云端沙箱里运行。
+- **自有电脑模式**：在绑定的个人 Mac（桌面端远程控制）或 SSH 电脑在线唤醒状态下运行。
 
 <span id="set-it-up" aria-hidden="true"></span>
 ## 如何配置
 
-在当前版本里，想用 Claude 系列模型可以这样配：
+在当前版本里，使用 Claude 系列模型按下面操作即可：
 
 1. 点左下角头像，进「设置 → 个人设置 → 模型」。
-2. **用团队共享模型**：在默认模型下拉框里直接挑团队配好的 Claude 模型（比如系统默认的 Claude Opus 模型）。
-3. **连自己的 Claude 账号（可选）**：在**模型接入**卡片里找到 Claude 登录入口，按提示做一次 OAuth 授权就行。当前 `claude_oauth` 对所有成员开放，没有额外白名单限制。
-4. 以后如果管理员通知团队开了 Claude Code 模式，再到同一页面按通知绑上令牌。
+2. **使用团队共享 Claude 模型**：在默认模型下拉框或聊天输入框的模型菜单里直接选择团队配好的 Claude 模型（如 Claude Opus 5.5）。
+3. **团队共用凭据管理**：团队共用凭据模式下，账号连接、重连与断开由管理员在「设置 → 团队管理 → 模型与供应商」操作；普通成员看到“请重新连接”时联系管理员即可。（当部署关闭团队共用凭据时，由个人在「设置 → 个人设置 → 模型」自行绑定账号。）
+4. 以后如果管理员通知团队开启了 Claude Code 模式，再到同一页面按通知绑定令牌。
 
 <span id="moving-from-the-claude-sign-in" aria-hidden="true"></span>
 ## 从 Claude 账号登录迁移
 
-在常规的 Claude Code 架构里，上线 Claude Code 模式后会把老的个人 Claude 登录标成“旧版”，并提示大家去迁成设置令牌。
+在开启 Claude Code 模式的环境里，旧版 Claude 登录方式通常会被标记为旧版并提示迁移到设置令牌。
 
-而在 **Everflow（Dalton）** 里做法不一样：
-
-- Dalton 的主力 Claude 模型靠团队凭据和成员个人 `claude_oauth` 跑得很稳，又还没开 Claude Code 运行时，所以**团队把 `claude_oauth` 保留为全员可用**（`gate: none`）。
-- 你现有的 Claude 登录可以放心继续用，新同事随时也能绑自己的 Claude 账号。
+在当前 **Everflow** 团队部署里，主力 Claude 模型通过标准 Claude 订阅通道稳定运行，团队继续沿用现有的 Claude 订阅登录方式即可；管理员随时可以在「设置 → 团队管理 → 模型与供应商」检查连接状态或重新授权。
 
 ## 相关页面
 

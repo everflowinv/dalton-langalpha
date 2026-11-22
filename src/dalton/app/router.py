@@ -918,7 +918,7 @@ async def update_user_sharing_settings_endpoint(
         if caller_tier == "external":
             raise HTTPException(
                 status_code=403,
-                detail="外部成员的工作区仅管理员可查看，不提供共享设置",
+                detail="外部成员的工作区不对其他人的研究总监开放，无需此项设置",
             )
     else:
         caller_tier = "internal"

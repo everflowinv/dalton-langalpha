@@ -8684,7 +8684,7 @@
       "levelRo": "Read Only",
       "levelHidden": "Hidden",
       "homeNote": "The Chief of Staff (global) workspace is never open to others",
-      "externalOwnerNote": "External members' workspaces are visible to admins only; sharing settings do not apply",
+      "externalOwnerNote": "External members' workspaces are hidden from others by default; once the owner turns on web sharing, internal members and admins get the access level it grants",
       "nextPhaseNotice": "Available in the next phase",
       "cosUserToggleTitle": "Others' Chief of Staff",
       "cosUserToggleLabel": "Allow internal colleagues' Chief of Staff to access my workspaces and dispatch tasks",
