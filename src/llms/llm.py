@@ -373,6 +373,8 @@ class ModelConfig:
                 "display_name",
                 "speed",
                 "intelligence",
+                # DALTON-HOOK(llm-overlay): surface plain_language editorial rating from Dalton overlay
+                "plain_language",
                 "context",
                 "input_modalities",
             ):

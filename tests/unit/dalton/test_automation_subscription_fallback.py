@@ -3449,3 +3449,250 @@ async def test_confirmed_link_with_unreadable_model_and_no_thread_model_stops_th
     assert exc_info.value.status_code == 503
     assert exc_info.value.detail["type"] == "automation_model_unavailable"
     assert resolved_calls == []
+
+
+_DEPLOYMENT_DEFAULT_FALLBACKS = [
+    "gemini-4-neon-high-oauth",
+    "claude-opus-5-5-oauth",
+    "gpt-6.2-sol-oauth",
+    "grok-4.7-oauth",
+    "muse-wonder-1.0-oauth",
+    "deepseek-flash",
+]
+
+_DEPLOYMENT_DEFAULT_PROVIDERS = {
+    "gemini-4-neon-high-oauth": "antigravity-oauth",
+    "claude-opus-5-5-oauth": "claude-oauth",
+    "gpt-6.2-sol-oauth": "codex-oauth",
+    "grok-4.7-oauth": "xai-oauth",
+    "muse-wonder-1.0-oauth": "muse-oauth",
+    "deepseek-flash": "deepseek",
+}
+
+
+def _make_deployment_llm(fallback: list[str] | None) -> LLMConfig:
+    llm_cfg = create_autospec(LLMConfig, instance=True)
+    llm_cfg.fallback = fallback
+    return llm_cfg
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefs", [{}, {"fallback_models": None}], ids=["missing_key", "none_value"])
+async def test_subscription_fallback_uses_deployment_defaults_in_order_when_unset(prefs):
+    """Unset fallback_models (absent or None) walks deployment llm.fallback in order, skipping failed provider."""
+    attempted: list[str] = []
+
+    async def _resolve_candidate(model_name: str):
+        attempted.append(model_name)
+        if model_name != "deepseek-flash":
+            raise HTTPException(
+                status_code=400,
+                detail={"message": f"{model_name} unavailable", "type": "oauth_required"},
+            )
+        return _make_agent_config(model_name)
+
+    resolve_mock = create_autospec(_resolve_candidate, side_effect=_resolve_candidate)
+    resolves_mock = create_autospec(fb_mod.model_resolves, return_value=True)
+    deploy_llm_mock = create_autospec(
+        fb_mod.deployment_llm,
+        return_value=_make_deployment_llm(_DEPLOYMENT_DEFAULT_FALLBACKS),
+    )
+
+    with (
+        _catalog_and_classify(_DEPLOYMENT_DEFAULT_PROVIDERS),
+        patch.object(fb_mod, "deployment_llm", deploy_llm_mock),
+    ):
+        cfg, record = await fb_mod.resolve_with_subscription_fallback(
+            user_id=_USER,
+            prefs=prefs,
+            original_model="claude-opus-5-5-oauth",
+            failed_provider="claude-oauth",
+            reason="oauth_reauth_required",
+            resolve_candidate=resolve_mock,
+            exc_to_raise=_reauth_exc("claude-oauth", "claude-opus-5-5-oauth"),
+            model_resolves_fn=resolves_mock,
+        )
+
+    assert cfg.llm.name == "deepseek-flash"
+    assert record["fallback_model"] == "deepseek-flash"
+    # claude-opus-5-5-oauth skipped (matches original_model & failed_provider); remaining 5 tried in order.
+    assert attempted == [
+        "gemini-4-neon-high-oauth",
+        "gpt-6.2-sol-oauth",
+        "grok-4.7-oauth",
+        "muse-wonder-1.0-oauth",
+        "deepseek-flash",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_subscription_fallback_skips_same_provider_items_from_deployment_defaults():
+    """Deployment default entries on the failed provider are skipped even when model name differs."""
+    attempted: list[str] = []
+
+    async def _resolve_candidate(model_name: str):
+        attempted.append(model_name)
+        return _make_agent_config(model_name)
+
+    resolve_mock = create_autospec(_resolve_candidate, side_effect=_resolve_candidate)
+    resolves_mock = create_autospec(fb_mod.model_resolves, return_value=True)
+    deploy_llm_mock = create_autospec(
+        fb_mod.deployment_llm,
+        return_value=_make_deployment_llm(_DEPLOYMENT_DEFAULT_FALLBACKS),
+    )
+
+    with (
+        _catalog_and_classify(
+            {
+                **_DEPLOYMENT_DEFAULT_PROVIDERS,
+                "gemini-4-carbon-medium-oauth": "antigravity-oauth",
+            }
+        ),
+        patch.object(fb_mod, "deployment_llm", deploy_llm_mock),
+    ):
+        cfg, record = await fb_mod.resolve_with_subscription_fallback(
+            user_id=_USER,
+            prefs={},
+            original_model="gemini-4-carbon-medium-oauth",
+            failed_provider="antigravity-oauth",
+            reason="oauth_reauth_required",
+            resolve_candidate=resolve_mock,
+            exc_to_raise=_reauth_exc("antigravity-oauth", "gemini-4-carbon-medium-oauth"),
+            model_resolves_fn=resolves_mock,
+        )
+
+    assert cfg.llm.name == "claude-opus-5-5-oauth"
+    assert record["fallback_model"] == "claude-opus-5-5-oauth"
+    # gemini-4-neon-high-oauth shares failed_provider antigravity-oauth and must be skipped.
+    assert attempted == ["claude-opus-5-5-oauth"]
+
+
+@pytest.mark.asyncio
+async def test_subscription_fallback_explicit_empty_list_disables_deployment_defaults():
+    """An explicitly saved empty fallback_models=[] means no fallback and must not read deployment defaults."""
+    attempted: list[str] = []
+
+    async def _resolve_candidate(model_name: str):
+        attempted.append(model_name)
+        return _make_agent_config(model_name)
+
+    resolve_mock = create_autospec(_resolve_candidate, side_effect=_resolve_candidate)
+    resolves_mock = create_autospec(fb_mod.model_resolves, return_value=True)
+    deploy_llm_mock = create_autospec(
+        fb_mod.deployment_llm,
+        return_value=_make_deployment_llm(_DEPLOYMENT_DEFAULT_FALLBACKS),
+    )
+    exc = _reauth_exc("claude-oauth", "claude-opus-5-5-oauth")
+
+    with (
+        _catalog_and_classify(_DEPLOYMENT_DEFAULT_PROVIDERS),
+        patch.object(fb_mod, "deployment_llm", deploy_llm_mock),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await fb_mod.resolve_with_subscription_fallback(
+            user_id=_USER,
+            prefs={"fallback_models": []},
+            original_model="claude-opus-5-5-oauth",
+            failed_provider="claude-oauth",
+            reason="oauth_reauth_required",
+            resolve_candidate=resolve_mock,
+            exc_to_raise=exc,
+            model_resolves_fn=resolves_mock,
+        )
+
+    assert exc_info.value is exc
+    assert attempted == []
+    deploy_llm_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_subscription_fallback_uses_only_user_saved_list_without_deployment_defaults():
+    """When the user saved their own fallback_models, only those entries are tried (never deployment defaults)."""
+    attempted: list[str] = []
+
+    async def _resolve_candidate(model_name: str):
+        attempted.append(model_name)
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "unavailable", "type": "oauth_required"},
+        )
+
+    resolve_mock = create_autospec(_resolve_candidate, side_effect=_resolve_candidate)
+    resolves_mock = create_autospec(fb_mod.model_resolves, return_value=True)
+    deploy_llm_mock = create_autospec(
+        fb_mod.deployment_llm,
+        return_value=_make_deployment_llm(_DEPLOYMENT_DEFAULT_FALLBACKS),
+    )
+    exc = _reauth_exc("claude-oauth", "claude-opus-5-5-oauth")
+
+    with (
+        _catalog_and_classify(_DEPLOYMENT_DEFAULT_PROVIDERS),
+        patch.object(fb_mod, "deployment_llm", deploy_llm_mock),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await fb_mod.resolve_with_subscription_fallback(
+            user_id=_USER,
+            prefs={"fallback_models": ["gpt-6.2-sol-oauth"]},
+            original_model="claude-opus-5-5-oauth",
+            failed_provider="claude-oauth",
+            reason="oauth_reauth_required",
+            resolve_candidate=resolve_mock,
+            exc_to_raise=exc,
+            model_resolves_fn=resolves_mock,
+        )
+
+    assert exc_info.value is exc
+    assert attempted == ["gpt-6.2-sol-oauth"]
+    deploy_llm_mock.assert_not_called()
+
+
+
+def test_deployment_default_fallbacks_fixture_matches_dalton_config():
+    """The fixture above mirrors agent_config.dalton.yaml, so the order tests pin the real list."""
+    from pathlib import Path
+
+    import yaml
+
+    cfg = yaml.safe_load((Path(__file__).resolve().parents[3] / "agent_config.dalton.yaml").read_text())
+    assert cfg["llm"]["fallback"] == _DEPLOYMENT_DEFAULT_FALLBACKS
+
+
+@pytest.mark.asyncio
+async def test_subscription_fallback_tries_all_six_deployment_defaults_in_order():
+    """A failed provider outside the list leaves all six defaults to try, in configured order."""
+    attempted: list[str] = []
+
+    async def _resolve_candidate(model_name: str):
+        attempted.append(model_name)
+        raise HTTPException(
+            status_code=400,
+            detail={"message": f"{model_name} unavailable", "type": "oauth_required"},
+        )
+
+    resolve_mock = create_autospec(_resolve_candidate, side_effect=_resolve_candidate)
+    resolves_mock = create_autospec(fb_mod.model_resolves, return_value=True)
+    deploy_llm_mock = create_autospec(
+        fb_mod.deployment_llm,
+        return_value=_make_deployment_llm(_DEPLOYMENT_DEFAULT_FALLBACKS),
+    )
+    exc = _reauth_exc("claude-oauth", "claude-sonnet-5-5-oauth")
+
+    with (
+        _catalog_and_classify(
+            {**_DEPLOYMENT_DEFAULT_PROVIDERS, "glm-5.3-plan": "z-ai-cn-coding"}
+        ),
+        patch.object(fb_mod, "deployment_llm", deploy_llm_mock),
+    ):
+        with pytest.raises(HTTPException):
+            await fb_mod.resolve_with_subscription_fallback(
+                user_id=_USER,
+                prefs={},
+                original_model="glm-5.3-plan",
+                failed_provider="z-ai-cn-coding",
+                reason="oauth_reauth_required",
+                resolve_candidate=resolve_mock,
+                exc_to_raise=exc,
+                model_resolves_fn=resolves_mock,
+            )
+
+    assert attempted == _DEPLOYMENT_DEFAULT_FALLBACKS

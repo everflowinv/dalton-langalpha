@@ -107,7 +107,8 @@
         "write": "parameters.thinking_level"
       },
       "intelligence": 5,
-      "speed": 3
+      "speed": 3,
+      "plain_language": 5
     },
     "gemini-4-carbon-medium-oauth": {
       "prompt_guidance": "lean",
@@ -134,7 +135,8 @@
         "write": "parameters.thinking_level"
       },
       "intelligence": 5,
-      "speed": 3
+      "speed": 3,
+      "plain_language": 5
     },
     "gemini-4-carbon-high-oauth": {
       "prompt_guidance": "lean",
@@ -161,7 +163,8 @@
         "write": "parameters.thinking_level"
       },
       "intelligence": 5,
-      "speed": 3
+      "speed": 3,
+      "plain_language": 5
     },
     "gemini-4-hydrogen-low-oauth": {
       "prompt_guidance": "lean",
@@ -295,8 +298,9 @@
         "default": "low",
         "write": "parameters.thinking_level"
       },
-      "intelligence": 5,
-      "speed": 4
+      "intelligence": 4,
+      "speed": 4,
+      "plain_language": 5
     },
     "gemini-4-neon-medium-oauth": {
       "prompt_guidance": "lean",
@@ -322,8 +326,9 @@
         "default": "medium",
         "write": "parameters.thinking_level"
       },
-      "intelligence": 5,
-      "speed": 4
+      "intelligence": 4,
+      "speed": 4,
+      "plain_language": 5
     },
     "gemini-4-neon-high-oauth": {
       "prompt_guidance": "lean",
@@ -349,8 +354,9 @@
         "default": "high",
         "write": "parameters.thinking_level"
       },
-      "intelligence": 5,
-      "speed": 4
+      "intelligence": 4,
+      "speed": 4,
+      "plain_language": 5
     },
     "gemini-2.5-pro-oauth": {
       "prompt_guidance": "lean",
@@ -384,6 +390,7 @@
       "visible": true,
       "speed": 3,
       "intelligence": 5,
+      "plain_language": 4,
       "context": 1000000,
       "input_modalities": [
         "text",
@@ -408,6 +415,7 @@
       "visible": true,
       "speed": 3,
       "intelligence": 5,
+      "plain_language": 4,
       "context": 1000000,
       "input_modalities": [
         "text",
@@ -432,6 +440,7 @@
       "visible": true,
       "speed": 2,
       "intelligence": 5,
+      "plain_language": 4,
       "context": 1000000,
       "input_modalities": [
         "text",
@@ -886,13 +895,16 @@
         "default": "xhigh",
         "write": "parameters.thinking_level"
       },
-      "intelligence": 5,
-      "speed": 4
+      "intelligence": 4,
+      "speed": 4,
+      "plain_language": 5
     }
   },
   "model_overrides": {
     "gemini-4-neon": {
-      "compaction_profile": "expansive"
+      "compaction_profile": "expansive",
+      "intelligence": 4,
+      "plain_language": 5
     },
     "claude-fable-5-2": {
       "reasoning": {
@@ -905,10 +917,36 @@
       }
     },
     "gemini-4-carbon": {
-      "compaction_profile": "expansive"
+      "compaction_profile": "expansive",
+      "plain_language": 5
     },
     "gemini-4-hydrogen": {
       "compaction_profile": "expansive"
+    },
+    "claude-opus-5-5": {
+      "plain_language": 4
+    },
+    "claude-opus-5-5-oauth": {
+      "plain_language": 4
+    },
+    "claude-opus-5-5-code": {
+      "plain_language": 4
+    },
+    "gpt-6.2-astra": {
+      "speed": 2,
+      "plain_language": 3
+    },
+    "gpt-6.2-astra-oauth": {
+      "speed": 2,
+      "plain_language": 3
+    },
+    "gpt-6.2-sol": {
+      "intelligence": 4,
+      "plain_language": 3
+    },
+    "gpt-6.2-sol-oauth": {
+      "intelligence": 4,
+      "plain_language": 3
     }
   },
   "providers": {

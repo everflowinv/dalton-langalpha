@@ -13,10 +13,15 @@ llm:
   # under models.assist_model / models.assist_fallback_model (not here).
   compaction: ""
   fetch: ""
+  # 未保存个人备用列表的用户在自动任务订阅失败时依次使用；
+  # 对话中订阅主模型失败不自动切换；DeepSeek 按现有 key 规则取用（团队共享或个人 key，均无可用时用服务器 key），放最后。
   fallback:
     - "gemini-4-neon-high-oauth"
-    - "muse-wonder-1.0-oauth"
+    - "claude-opus-5-5-oauth"
     - "gpt-6.2-sol-oauth"
+    - "grok-4.7-oauth"
+    - "muse-wonder-1.0-oauth"
+    - "deepseek-flash"
 
 sandbox:
   provider: "docker"

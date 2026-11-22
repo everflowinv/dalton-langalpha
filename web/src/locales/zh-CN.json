@@ -5247,6 +5247,7 @@
         "customize": "自定义",
         "intelligence": "智能",
         "speed": "速度",
+        "plain_language": "说人话",
         "rating": "{{label}}：{{value}}/5",
         "why": {
           "strongest": "在你的模型中智能评分最高。",

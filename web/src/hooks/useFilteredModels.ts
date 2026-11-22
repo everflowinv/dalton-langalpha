@@ -20,6 +20,8 @@ export interface ModelMetadataEntry {
   /** The manifest's 1 to 5 ratings, highest best. Absent = not rated. */
   intelligence?: number;
   speed?: number;
+  // DALTON-HOOK(llm-overlay): surface plain_language 1 to 5 rating from Dalton overlay; absent = not rated.
+  plain_language?: number;
   /** Numeric tier for platform-served access. Absent = 0. */
   tier?: number;
   /** OAuth-plan allowlist — the connected subscription's plan_type must be

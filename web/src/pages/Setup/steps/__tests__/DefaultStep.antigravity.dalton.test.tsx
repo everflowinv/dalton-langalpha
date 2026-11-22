@@ -81,18 +81,18 @@ const h = vi.hoisted(() => {
     'claude-opus-5-5-medium-oauth',
     'claude-opus-5-5-high-oauth',
   ];
-  const metadata = {
-    'gemini-4-neon-low-oauth': { display_name: 'Gemini 4 Neon (Low)', provider: 'antigravity-oauth', intelligence: 5, speed: 3, reasoning_efforts: ['low'] },
-    'gemini-4-neon-medium-oauth': { display_name: 'Gemini 4 Neon (Medium)', provider: 'antigravity-oauth', intelligence: 5, speed: 3, reasoning_efforts: ['medium'] },
-    'gemini-4-neon-high-oauth': { display_name: 'Gemini 4 Neon (High)', provider: 'antigravity-oauth', intelligence: 5, speed: 3, reasoning_efforts: ['high'] },
-    'gemini-4-neon-xhigh-oauth': { display_name: 'Gemini 4 Neon (XHigh)', provider: 'antigravity-oauth', intelligence: 5, speed: 2, reasoning_efforts: ['xhigh'] },
-    'gemini-4-carbon-medium-oauth': { display_name: 'Gemini 4 Carbon (Medium)', provider: 'antigravity-oauth', intelligence: 5, speed: 3, reasoning_efforts: ['medium'] },
-    'gemini-4-carbon-high-oauth': { display_name: 'Gemini 4 Carbon (High)', provider: 'antigravity-oauth', intelligence: 5, speed: 3, reasoning_efforts: ['high'] },
+  const metadata: Record<string, { display_name: string; provider: string; intelligence: number; speed: number; plain_language?: number; reasoning_efforts: string[] }> = {
+    'gemini-4-neon-low-oauth': { display_name: 'Gemini 4 Neon (Low)', provider: 'antigravity-oauth', intelligence: 4, speed: 4, plain_language: 5, reasoning_efforts: ['low'] },
+    'gemini-4-neon-medium-oauth': { display_name: 'Gemini 4 Neon (Medium)', provider: 'antigravity-oauth', intelligence: 4, speed: 4, plain_language: 5, reasoning_efforts: ['medium'] },
+    'gemini-4-neon-high-oauth': { display_name: 'Gemini 4 Neon (High)', provider: 'antigravity-oauth', intelligence: 4, speed: 4, plain_language: 5, reasoning_efforts: ['high'] },
+    'gemini-4-neon-xhigh-oauth': { display_name: 'Gemini 4 Neon (XHigh)', provider: 'antigravity-oauth', intelligence: 4, speed: 4, plain_language: 5, reasoning_efforts: ['xhigh'] },
+    'gemini-4-carbon-medium-oauth': { display_name: 'Gemini 4 Carbon (Medium)', provider: 'antigravity-oauth', intelligence: 5, speed: 3, plain_language: 5, reasoning_efforts: ['medium'] },
+    'gemini-4-carbon-high-oauth': { display_name: 'Gemini 4 Carbon (High)', provider: 'antigravity-oauth', intelligence: 5, speed: 3, plain_language: 5, reasoning_efforts: ['high'] },
     'gemini-4-hydrogen-low-oauth': { display_name: 'Gemini 4 Hydrogen (Low)', provider: 'antigravity-oauth', intelligence: 4, speed: 5, reasoning_efforts: ['low'] },
     'gemini-4-hydrogen-medium-oauth': { display_name: 'Gemini 4 Hydrogen (Medium)', provider: 'antigravity-oauth', intelligence: 4, speed: 5, reasoning_efforts: ['medium'] },
     'gemini-4-hydrogen-high-oauth': { display_name: 'Gemini 4 Hydrogen (High)', provider: 'antigravity-oauth', intelligence: 4, speed: 5, reasoning_efforts: ['high'] },
     'claude-opus-5-5-medium-oauth': { display_name: 'Claude Opus 5.5 (Medium)', provider: 'antigravity-oauth', intelligence: 5, speed: 3, reasoning_efforts: ['medium'] },
-    'claude-opus-5-5-high-oauth': { display_name: 'Claude Opus 5.5 (High)', provider: 'antigravity-oauth', intelligence: 5, speed: 3, reasoning_efforts: ['high'] },
+    'claude-opus-5-5-high-oauth': { display_name: 'Claude Opus 5.5 (High)', provider: 'antigravity-oauth', intelligence: 5, speed: 2, reasoning_efforts: ['high'] },
   };
   return {
     seriesCatalogList,
@@ -103,6 +103,9 @@ const h = vi.hoisted(() => {
     toWelcome: vi.fn(),
     home: vi.fn(async () => ({ workspace_id: 'home' })),
     preferences: {} as object,
+    systemDefaults: null as null | { fallback_models?: string[] },
+    payers: {} as Record<string, string>,
+    cannotRun: [] as string[],
   };
 });
 
@@ -140,7 +143,7 @@ vi.mock('@/hooks/useAllModels', () => ({
     return {
       models,
       slotModels: models,
-      payers: {},
+      payers: h.payers,
       metadata: h.metadata,
       customModels: [],
       seriesCatalog,
@@ -150,8 +153,8 @@ vi.mock('@/hooks/useAllModels', () => ({
         model_metadata: h.metadata,
         antigravity_series: h.seriesCatalogList,
       },
-      cannotRun: () => false,
-      systemDefaults: null,
+      cannotRun: (m: string) => h.cannotRun.includes(m),
+      systemDefaults: h.systemDefaults,
       isLoading: false,
       unread: false,
     };
@@ -199,6 +202,9 @@ describe('DefaultStep Antigravity series onboarding', () => {
     h.finish = vi.fn(async () => true);
     h.toWelcome = vi.fn();
     h.preferences = {};
+    h.systemDefaults = null;
+    h.payers = {};
+    h.cannotRun = [];
     client.clear();
   });
 
@@ -282,5 +288,121 @@ describe('DefaultStep Antigravity series onboarding', () => {
       preferred_background_model: 'gemini-4-hydrogen-low-oauth',
       background_follows: null,
     });
+  });
+
+  it('renders plain_language as the third rating when present and omits it when absent', () => {
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={['/setup/default']}>
+          <Routes>
+            <Route path="/setup/default" element={<DefaultStep />} />
+            <Route path="*" element={<div />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const radios = screen.getAllByRole('radio') as HTMLInputElement[];
+    const neonCard = radios.find((r) => r.value === 'gemini-4-neon-high-oauth')?.closest('label');
+    const opusCard = radios.find((r) => r.value === 'claude-opus-5-5-medium-oauth')?.closest('label');
+    expect(neonCard).not.toBeNull();
+    expect(opusCard).not.toBeNull();
+
+    // Neon carries plain_language: 5 -> shows Intelligence, Speed, Plain language in order.
+    const neonImgs = Array.from(neonCard!.querySelectorAll('[role="img"]')).map((el) =>
+      el.getAttribute('aria-label'),
+    );
+    expect(neonImgs).toEqual([
+      'Intelligence: 4 of 5',
+      'Speed: 4 of 5',
+      'Plain language: 5 of 5',
+    ]);
+
+    // Opus in this fixture omits plain_language -> shows only Intelligence and Speed.
+    const opusImgs = Array.from(opusCard!.querySelectorAll('[role="img"]')).map((el) =>
+      el.getAttribute('aria-label'),
+    );
+    expect(opusImgs).toEqual([
+      'Intelligence: 5 of 5',
+      'Speed: 3 of 5',
+    ]);
+  });
+
+  it('omits fallback_models on Continue when unset and untouched even if deployment defaults are filtered', async () => {
+    h.preferences = {};
+    h.systemDefaults = {
+      fallback_models: ['gemini-4-neon-high-oauth', 'grok-4.7-oauth', 'deepseek-flash'],
+    };
+    h.cannotRun = ['grok-4.7-oauth', 'deepseek-flash'];
+
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={['/setup/default']}>
+          <Routes>
+            <Route path="/setup/default" element={<DefaultStep />} />
+            <Route path="*" element={<div />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1));
+
+    const savedArg = (h.mutateAsync.mock.calls[0] as unknown as [{ model_preference: Record<string, unknown> }])[0];
+    expect(savedArg.model_preference).not.toHaveProperty('fallback_models');
+  });
+
+  it('saves fallback_models when an unset user explicitly edits fallback models in Customize', async () => {
+    h.preferences = {};
+    h.systemDefaults = {
+      fallback_models: ['gemini-4-neon-high-oauth', 'gemini-4-carbon-medium-oauth'],
+    };
+
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={['/setup/default']}>
+          <Routes>
+            <Route path="/setup/default" element={<DefaultStep />} />
+            <Route path="*" element={<div />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: /Customize/i }));
+    await userEvent.click(screen.getByRole('button', { name: /Remove Gemini 4 Carbon · Medium/i }));
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1));
+
+    const savedArg = (h.mutateAsync.mock.calls[0] as unknown as [{ model_preference: Record<string, unknown> }])[0];
+    expect(savedArg.model_preference.fallback_models).toEqual(['gemini-4-neon-high-oauth']);
+  });
+
+  it('preserves existing behavior for already-saved fallback_models when a saved provider is filtered', async () => {
+    h.preferences = {
+      model_preference: {
+        preferred_model: 'gemini-4-neon-high-oauth',
+        fallback_models: ['gemini-4-neon-high-oauth', 'grok-4.7-oauth'],
+      },
+    };
+    h.cannotRun = ['grok-4.7-oauth'];
+
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={['/setup/default']}>
+          <Routes>
+            <Route path="/setup/default" element={<DefaultStep />} />
+            <Route path="*" element={<div />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    await waitFor(() => expect(h.mutateAsync).toHaveBeenCalledTimes(1));
+
+    const savedArg = (h.mutateAsync.mock.calls[0] as unknown as [{ model_preference: Record<string, unknown> }])[0];
+    expect(savedArg.model_preference.fallback_models).toEqual(['gemini-4-neon-high-oauth']);
   });
 });

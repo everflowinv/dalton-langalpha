@@ -5260,6 +5260,7 @@
         "customize": "Customize",
         "intelligence": "Intelligence",
         "speed": "Speed",
+        "plain_language": "Plain language",
         "rating": "{{label}}: {{value}} of 5",
         "why": {
           "strongest": "Highest intelligence rating of your models.",

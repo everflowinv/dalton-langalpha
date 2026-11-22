@@ -360,9 +360,9 @@ def inherit_antigravity_gemini_ratings(
     entries: dict[str, Any],
     source_catalog: dict[str, Any] | None = None,
 ) -> int:
-    """Fill missing ``intelligence`` / ``speed`` ratings on ``antigravity-oauth``
-    Gemini entries from their matching direct ``gemini`` API manifest entry
-    (e.g. ``gemini-4-neon`` -> ``gemini-4-neon-*-oauth``).
+    """Fill missing ``intelligence`` / ``speed`` / ``plain_language`` ratings on
+    ``antigravity-oauth`` Gemini entries from their matching direct ``gemini``
+    API manifest entry (e.g. ``gemini-4-neon`` -> ``gemini-4-neon-*-oauth``).
 
     Existing explicit ratings and non-Antigravity (or non-Gemini) entries are
     left untouched. Returns the number of entries that gained at least one rating.
@@ -379,9 +379,10 @@ def inherit_antigravity_gemini_ratings(
         if not isinstance(direct, dict) or direct.get("provider") != "gemini":
             continue
         changed = False
-        for field in ("intelligence", "speed"):
-            if entry.get(field) is None and isinstance(direct.get(field), int):
-                entry[field] = direct[field]
+        for field in ("intelligence", "speed", "plain_language"):
+            val = direct.get(field)
+            if entry.get(field) is None and isinstance(val, int) and not isinstance(val, bool):
+                entry[field] = val
                 changed = True
         if changed:
             updated += 1

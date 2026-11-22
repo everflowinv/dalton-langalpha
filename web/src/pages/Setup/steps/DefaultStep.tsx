@@ -223,10 +223,12 @@ function DefaultForm({
   // Routing seeded from what is saved, else what the deployment runs, and
   // written only when changed here: an unset one keeps following the
   // deployment.
+  // DALTON-HOOK(dalton-setup): track whether fallback_models was previously saved
   const [routing] = useState(() => ({
     fetch: saved.fetch_model ?? '',
     compaction: saved.compaction_model ?? '',
     fallbacks: saved.fallback_models ?? systemDefaults?.fallback_models ?? [],
+    hasSavedFallbacks: saved.fallback_models != null,
   }));
   const [fetchModel, setFetchModel] = useState(routing.fetch);
   const [compactionModel, setCompactionModel] = useState(routing.compaction);
@@ -313,7 +315,10 @@ function DefaultForm({
           background_follows: auto ? 'deployment' : null,
           ...(fetchDraft !== routing.fetch ? { fetch_model: fetchDraft || null } : {}),
           ...(compactionDraft !== routing.compaction ? { compaction_model: compactionDraft || null } : {}),
-          ...(sameList(fallbackDraft, routing.fallbacks) ? {} : { fallback_models: fallbackDraft }),
+          // DALTON-HOOK(dalton-setup): an unset list the user left as shown stays unset, even if filtering drops deployment defaults
+          ...((routing.hasSavedFallbacks || !sameList(fallbackModels, routing.fallbacks)) && !sameList(fallbackDraft, routing.fallbacks)
+            ? { fallback_models: fallbackDraft }
+            : {}),
         }));
       } catch {
         if (live.current) setPhase(null);
@@ -574,7 +579,8 @@ function DefaultForm({
   );
 }
 
-const RATINGS = ['intelligence', 'speed'] as const;
+// DALTON-HOOK(dalton-setup): show plain_language rating after intelligence and speed when rated
+const RATINGS = ['intelligence', 'speed', 'plain_language'] as const;
 
 /** The manifest's 1 to 5 ratings, as dots; nothing for a model it doesn't rate. */
 function Ratings({ meta }: { meta: ModelMetadataEntry | undefined }) {
