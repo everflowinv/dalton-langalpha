@@ -1102,7 +1102,12 @@ def format_execution_delivery_note(
         ]
         is_first_send = total_targets == 0 or (
             bool(retrying_targets)
-            and all(_safe_int(item.get("attempt_count"), 0) == 0 for item in retrying_targets)
+            # A missing attempt_count (a gateway retry stored as `retrying`) is not a first send.
+            and all(
+                item.get("attempt_count") is not None
+                and _safe_int(item.get("attempt_count"), 0) == 0
+                for item in retrying_targets
+            )
         )
         if is_first_send:
             return "任务已完成，等待首次发送" if lang == "zh" else "finished · pending first send"

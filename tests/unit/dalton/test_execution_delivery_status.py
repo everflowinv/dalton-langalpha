@@ -2397,3 +2397,16 @@ async def test_system_jobs_toggle_home_sector_and_single_sector_status_enrich_de
     assert single_res["job"]["last_result"] == "已完成 · 投递失败（卡片超过 30 KB 上限）"
     resolve_mock.assert_awaited_once_with("pm-user", "semi", include_all_for_pm=True)
     tracking_mock.assert_awaited_once_with("analyst-a", ws_sector, viewer_user_id="pm-user")
+
+
+def test_gateway_retry_without_attempt_count_reads_as_retrying_not_first_send() -> None:
+    """A regular automation whose gateway returned a retryable error is stored as
+    `retrying` without an attempt count; the note must say it is retrying."""
+    summary = {
+        "status": "retrying",
+        "total_targets": 1,
+        "targets": [{"channel": "feishu", "status": "retrying"}],
+    }
+    run = {"status": "completed", "delivery_summary": summary}
+    assert eds.format_execution_delivery_note(run, lang="zh") == "任务已完成，系统正在重试投递"
+    assert eds.format_execution_delivery_note(run, lang="en") == "finished · retrying delivery"
