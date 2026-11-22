@@ -5,8 +5,10 @@ an allowlisted team member (``DALTON_ALLOWED_EMAILS``).
 
 External members (``get_user_tier == 'external'``, roster-fixed) are fully
 isolated: they see no colleague workspace on either channel, whatever the owner
-shared, and their own workspaces are visible to admins (read-only) and nobody
-else — the owner's sharing settings never apply to an external-owned workspace.
+shared. Their own workspaces are hidden from everyone else by default, admins
+included; on the web channel the external owner's own ``web_access`` setting
+decides whether internal members and admins see it, and an external-owned
+workspace is never reachable from another member's Chief of Staff.
 """
 
 from __future__ import annotations
@@ -50,9 +52,9 @@ VALID_NEEDS: frozenset[str] = frozenset({"read", "write"})
 DEFAULT_COS_ACCESS: str = "ro"
 DEFAULT_WEB_ACCESS: str = "hidden"
 
-# Admins may look into an external member's workspace but never write it;
-# the sharing settings of an external-owned workspace never take effect.
-EXTERNAL_OWNED_ADMIN_WRITE_FORBIDDEN_DETAIL = "外部成员的工作区仅管理员可查看（只读）"
+# Tracking on an external member's workspace stays under the owner's control:
+# other members, admins included, may read it but never change it.
+EXTERNAL_OWNED_ADMIN_WRITE_FORBIDDEN_DETAIL = "外部成员工作区的跟踪设置只能由本人修改"
 
 COLLEAGUE_ACCESS_REVOKED_CODE = "colleague_access_revoked"
 
@@ -822,9 +824,10 @@ async def require_workspace_access(
     - External-member isolation (roster-fixed tiers, checked before the
       Home/status checks, the owner membership check, and any sharing row):
       a non-owner external caller gets HTTP 404 on every colleague workspace;
-      an external-owned workspace is HTTP 404 for every non-owner except
-      admins, who get read-only access (HTTP 403 on ``need='write'``); an
-      unresolvable owner tier (``unknown``) is HTTP 404 for everyone.
+      an external-owned workspace is HTTP 404 on the ``cos`` channel for every
+      non-owner, and on ``web`` follows the owner's ``web_access`` like any
+      other workspace (hidden by default, admins included); an unresolvable
+      owner tier (``unknown``) is HTTP 404 for everyone.
     Owners keep full access regardless of their own tier.
     """
     cleaned_channel = str(channel or "web").strip().lower()
@@ -2377,9 +2380,9 @@ async def list_colleague_cos_workspaces(
             rows = [dict(r) for r in await cur.fetchall()]
 
     items: list[dict[str, Any]] = []
-    # Sharing settings never apply to an external-owned workspace: admins see
-    # it read-only (even when marked hidden), everyone else sees nothing. The
-    # owner tier is classified from the joined email (no per-owner lookup).
+    # An external-owned workspace never appears in another member's Chief of
+    # Staff list, whatever its sharing row says. The owner tier is classified
+    # from the joined email (no per-owner lookup).
     default_cos = "rw" if dispatch_enabled else DEFAULT_COS_ACCESS
     owner_tiers: dict[str, str] = {}
     for row in rows:

@@ -32,6 +32,7 @@ OpenClaw 已于 2026-11-19 全部停用，宿主机 `~/.openclaw` 已归档移�
 - `src/dalton/database/openclaw_sync.py` 与 `dalton_openclaw_sync_runs` 数据库表（原生模型巡检台账）。
 - 数据任务的 `OPENCLAW_WORKSPACE` 环境变量、容器内固定挂载点 `/Users/everflow/.openclaw/workspace` 以及宿主机数据卷目录 `var/dalton/openclaw-data`。
 - `plugins/dalton/skills/dalton-bullbear-tracker` 与 `scripts/dalton/ai_finance*` 中用于确保运行目录限定在受管工作区内的路径校验逻辑。
+- 历史团队对话归档（`dalton_conversation_cards`，截至 2026-11-18 共 42,842 张卡片）：不再运行导出和每日提取，保留只读检索供 `conversation_search`（团队记忆）使用；`src/dalton/dalton.yaml` 中的 `conversations.enabled` 控制检索开关，不要为“停止提取”而关闭它。
 
 ## 4. 数据目录的备份与重建
 

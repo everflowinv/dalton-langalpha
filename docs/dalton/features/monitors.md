@@ -29,11 +29,12 @@
 
 | 数据任务 ID | 绑定 Slug | 分类与排序权重 | 静态目录 / 共享目录 | 实时 `data_keys` |
 |---|---|---|---|---|
-| `monitor-live-demo` | `live-demo` | 示例验证绑定 | `research-outputs/monitor-demo` | `("metrics",)` |
+| `monitor-live-demo` | `live-demo` | `overview`(0)（示例验证绑定） | `research-outputs/monitor-demo` | `("metrics",)` |
 | `sentiment-dashboard-refresh` | 6 项面板（`SENTIMENT_DASHBOARD_PANELS`） | `overview`(10) / `us`(20) / `cn`(30) / `hk`(40) / `asia`(50) / `stocks`(60) | `research-outputs/sentiment-dashboard/panels/<slug>` + `_shared` | 无（静态重建） |
-| `pm-market-state` | `pm-market-state`、`cn-sector-rotation` | `us`(25)、`cn`(35) | 对应输出目录 | 无 |
-| `cn-intraday` | `cn-intraday` | `cn`(32) | 对应静态目录 | `("snapshot",)` |
-| `hk-momentum` | `hk-momentum` | `hk`(45) | 对应静态目录 | `("intraday",)` |
+| `richard-relative-dashboard-refresh` | `relative-strength` | `stocks`(65) | `research-outputs/kweb-dashboard` | 无 |
+| `pm-market-state` | `pm-market-state`、`cn-sector-rotation` | `us`(25)、`cn`(35) | `research-outputs/pm-market-state/pm-market-state`、`research-outputs/pm-market-state/cn-sector-rotation` | 无 |
+| `cn-intraday` | `cn-intraday` | `cn`(32) | `research-outputs/cn-intraday` | `("snapshot",)` |
+| `hk-momentum` | `hk-momentum` | `hk`(45) | `research-outputs/hk-momentum` | `("intraday",)` |
 
 文件读取器 `HostDirFileSource` 和 `ScopedMountFileSource` 及其单文件上限 **`MAX_HOST_FILE_BYTES = 25 MiB`** 都定义在 `src/dalton/monitors/data_job_registry.py`（由 `src/dalton/monitors/service.py` 导入），打开目录时带 `O_DIRECTORY | O_NOFOLLOW`，拒绝任何符号链接逃逸。
 
@@ -51,5 +52,5 @@
 
 - 开关关着时：
   - **HTTP 发布与重发接口**（`publish_workspace_monitor` / `republish_workspace_monitor`，把已有 `public` 面板降级成非公开的情况除外）直接返回 **`403`**（`{"code": "artifact_publishing_disabled"}`）。
-  - **后台自动更新钩子**（数据任务跑完后的 `maybe_publish_data_job_monitor` 和对话回合结束后的 `republish_workspace_monitors_after_turn`）直接提前返回跳过发布，不会抛 `403`。
+  - **后台自动更新钩子**（数据任务跑完后的 `maybe_publish_data_job_monitor` 和对话回合结束后的 `republish_workspace_monitors_after_turn`）直接提前返回跳过发布，静默结束而不抛 `403`。
 - 作为止血退路，即使总开关关着，管理员和用户依然可以只读看已有公开面板、把已有 `public` 面板降成非公开，或者删掉风险面板。

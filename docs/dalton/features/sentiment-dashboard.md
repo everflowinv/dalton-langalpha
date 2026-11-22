@@ -34,6 +34,6 @@
    bash scripts/dalton/seed_openclaw_data.sh --apply
    ```
 - **唯一来源**：脚本直接从仓库 `scripts/dalton/data_assets/`（含 `scripts/` 与 6 个技能目录）读取源文件并同步到 `--target`（默认 `var/dalton/openclaw-data/`），不再读取宿主机外部目录（传入旧参数 `--source` 会明确报错退出）。
-- **每次 `--apply` 的写入行为**：将 `scripts/dalton/data_assets/` 中的脚本与技能同步进 `var/dalton/openclaw-data/`，确保 `state/a-share-volume-watch` 目录就绪，并创建或刷新 `state/sentiment-dashboard/cos-venv/bin/python` 启动器。
+- **每次 `--apply` 的写入行为**：将 `scripts/dalton/data_assets/` 中的脚本与技能同步进 `var/dalton/openclaw-data/`，同步 `src/dalton/llm/antigravity_series.py` 并导出 `skills/model-usage-cost/references/antigravity_series.json`，确保 `state/a-share-volume-watch` 目录就绪，并创建或刷新 `state/sentiment-dashboard/cos-venv/bin/python` 启动器。
 - **保护既有业务状态与凭据隔离**：`seed_openclaw_data.sh` 默认保留运行期既有 `state/`、`data/`、`temp/` 等业务目录，并自动跳过凭据文件名模式（`.env`、`*secret*`、`*token*.json` 等）以及 `__pycache__`/`*.pyc`。
 - 修改 `scripts/dalton/data_assets/` 下的脚本并在生产重建或发布后，在宿主机数据卷上执行一次 `bash scripts/dalton/seed_openclaw_data.sh --apply` 以刷新容器挂载副本。

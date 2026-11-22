@@ -8599,7 +8599,7 @@
       "levelRo": "仅可读",
       "levelHidden": "不可见",
       "homeNote": "总控工作区（研究总监）始终不对他人开放",
-      "externalOwnerNote": "外部成员的工作区仅管理员可查看，不提供共享设置",
+      "externalOwnerNote": "外部成员的工作区默认对其他人不可见；本人开启网页共享后，内部成员和管理员按共享级别访问",
       "nextPhaseNotice": "该功能下一期开放",
       "cosUserToggleTitle": "其他人的研究总监",
       "cosUserToggleLabel": "允许内部同事的研究总监访问我的工作区并派任务",

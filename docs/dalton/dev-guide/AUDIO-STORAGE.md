@@ -23,13 +23,13 @@
 - 后端实现是 `src/dalton/transcription_storage.py`（与全局 `src/utils/storage/` 完全独立）；桥侧由 `scripts/dalton/asr_jobs.py` 的 `SourceObjectStore` 读取同一组变量。
 - 对象键前缀规则两侧**必须完全一致**（后端 `resolve_full_key` 与桥 `SourceObjectStore.resolve_full_key`），否则后端上传的对象桥会找不到；该一致性由 `tests/unit/dalton/test_transcription_storage.py` 的 `test_resolve_full_key_matches_bridge_source_object_store` 钉死。
 - 分片上传的行为与全局实现一致：每个分片的字节长度签入预签名 URL（`sign_upload_part` 的 `ContentLength` 绑定），`list_uploaded_parts` 返回 `{"part_number", "size", "etag"}` 且以存储侧清单为准。
-- 沙箱向 `host.docker.internal` 的分片 PUT 走沙箱普通出网，不经出口代理；部署时确认 Docker 沙箱内能解析 `host.docker.internal`（Docker Desktop 内建；原生 Linux 不会自动解析，本仓库由 Compose 与 Docker 沙箱 provider 添加的 `host.docker.internal:host-gateway` 映射提供，Docker Engine 需 20.10+）。
+- 沙箱向 `host.docker.internal` 的分片 PUT 走沙箱普通出网，不经出口代理；部署时确认 Docker 沙箱内能解析 `host.docker.internal`（Docker Desktop 内建；原生 Linux 由本仓库 Compose 与 Docker 沙箱 provider 添加的 `host.docker.internal:host-gateway` 映射提供，Docker Engine 需 20.10+）。
 - `VOLC_TOS_ENDPOINT`（桥经 boto3 把音频分片上传到火山 TOS 临时对象、预签名与删除，见 `scripts/dalton/seed_asr_client.py` 的 `VolcTosClient`）可填火山原生端点（`tos-<region>.volces.com` / `tos-<region>.ivolces.com`）或 S3 兼容端点（`tos-s3-<region>.volces.com` / `tos-s3-<region>.ivolces.com`），代码会自动把原生端点映射为 S3 兼容端点使用（boto3 走 S3 协议，打原生端点会 400；未配置时默认 `tos-s3-cn-beijing.volces.com`）。
 - **聊天输入框大文件附件复用同一独立存储（前缀隔离，不开启全局 `STORAGE_*`）**：
-  - 聊天输入框对小于等于 30 MiB（整条消息内联总计 60 MiB）的图片/PDF 等小文件保持既有内联行为；超出内联预算、单文件不超过 200 MiB（整条消息上限 600 MiB，最多 5 个附件）的大文件走 `/api/v1/dalton/chat-uploads*` 鉴权分片中继（默认每片 8 MiB，浏览器最多 2 片并发，后端信号量限流至 MinIO 并对分片请求体施加分块空闲超时与整片总时长截止保护），**无需将私有 MinIO（`127.0.0.1:9000`）暴露到公网或开放浏览器直传 CORS**，全局 `STORAGE_*` 仍保持关闭。每用户未采纳上传（含上传中、合并中及未发送的 `ready` 状态）统一受 10 个文件 / 1000 MiB 配额保护。
+  - 聊天输入框对小于等于 30 MiB（整条消息内联总计 60 MiB）的图片/PDF 等小文件保持既有内联行为；超出内联预算、单文件不超过 200 MiB（整条消息上限 600 MiB，最多 10 个附件，`src/dalton/services/chat_uploads.py`）的大文件走 `/api/v1/dalton/chat-uploads*` 鉴权分片中继（默认每片 8 MiB，浏览器最多 2 片并发，后端信号量限流至 MinIO 并对分片请求体施加分块空闲超时与整片总时长截止保护），**无需将私有 MinIO（`127.0.0.1:9000`）暴露到公网或开放浏览器直传 CORS**，全局 `STORAGE_*` 仍保持关闭。每用户未采纳上传（含上传中、合并中及未发送的 `ready` 状态）统一受 20 个文件（`MAX_ACTIVE_USER_UPLOADS = 2 * MAX_MESSAGE_ATTACHMENTS`）/ 1000 MiB 配额保护。
   - 对象键固定落在 `<DALTON_ASR_STORAGE_KEY_PREFIX>chat-uploads/<workspace_id>/<upload_id>/<safe_name>`（`src/dalton/chat_upload_storage.py`），与录音转写的 `transcriptions/` 前缀严格隔离；任何非 `chat-uploads/` 键在聊天附件存储封装中一律被拒绝。
   - 发送或插话（steer）时先对整批内联与 `chat_upload` 附件做全量校验并登记有界临时请求租约（`pending_claims`），仅在轮次准入（`start_run`）或插话持久化（`admit_steer`）事务提交时才将 `used_at` 置位、`expires_at` 置为 `NULL`（被拒绝或冲突的请求自动释放临时租约且保持可取消、可过期）；轮次与插话落盘阶段在 `path_write_lock` 内核验所属工作区文件夹（含 Chief of Staff 的 `Home`），由沙箱经 `DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL` 短期预签名 GET URL 直接拉取（`pull_direct`，校验字节数与 SHA-256；不可直连时按 4 MiB 流式分块回退）落盘至对应工作区的 `work/uploads/`，仅向模型上下文注入 `<system-reminder>` 路径提示，用户可见历史保持原始文本与附件卡片。
-  - 跨 worker 状态保存在 Postgres `dalton_chat_file_uploads` 表（迁移 `d033_chat_file_uploads.py`），每次合并完成与清理批次均绑定独立 `claim_token` 做 CAS 校验（数据库检查约束保证仅 `aborted` / `failed` 终态允许记录 `cleaned_at`），租约超时回收后迟到的旧 worker 不会回退、置败或误删已生效对象。由于全局 `STORAGE_PROVIDER` 为 `none` 时工作区数据库文件备份仅收纳 `<= 100 MiB` 的文件（`INLINE_MAX_BYTES`），已被对话持久采纳的附件源对象（`used_at IS NOT NULL`）归属该工作区的持久内容保留（共享工作区协作者权限变更后工作区所有者冷恢复仍可重放，且已移除权限的协作者无法继续上传或发送）：沙箱停止回收后冷重建（`persistence/restore.py`）及后续轮次引用现有附件路径时自动从 `chat-uploads/` 重新拉取落盘，用户无需重新上传。仅显式删除文件（`DELETE /api/v1/workspaces/{id}/files`）、删除工作区（`WorkspaceManager.delete_workspace`），或取消、失败、超时未采纳的上传（上传中 6 小时、已完成未发送 24 小时）会回收 `chat-uploads/` 前缀下的分片与对象（后台清理循环按 `FOR UPDATE SKIP LOCKED` 兜底），绝不触碰 `transcriptions/` 下的 ASR 数据。
+  - 跨 worker 状态保存在 Postgres `dalton_chat_file_uploads` 表（迁移 `d033_chat_file_uploads.py`），每次合并完成与清理批次均绑定独立 `claim_token` 做 CAS 校验（数据库检查约束保证仅 `aborted` / `failed` 终态允许记录 `cleaned_at`），租约超时回收后迟到的旧 worker 会被 CAS 拦截、保持已生效对象完整。由于全局 `STORAGE_PROVIDER` 为 `none` 时工作区数据库文件备份仅收纳 `<= 100 MiB` 的文件（`INLINE_MAX_BYTES`），已被对话持久采纳的附件源对象（`used_at IS NOT NULL`）归属该工作区的持久内容保留（共享工作区协作者权限变更后，工作区所有者冷恢复仍可重放，仅保有写权限的成员可继续上传或发送）：沙箱停止回收后冷重建（`persistence/restore.py`）及后续轮次引用现有附件路径时自动从 `chat-uploads/` 重新拉取落盘，用户无需重新上传。仅显式删除文件（`DELETE /api/v1/workspaces/{id}/files`）、删除工作区（`WorkspaceManager.delete_workspace`），或取消、失败、超时未采纳的上传（上传中 6 小时、已完成未发送 24 小时）会回收 `chat-uploads/` 前缀下的分片与对象（后台清理循环按 `FOR UPDATE SKIP LOCKED` 兜底），`transcriptions/` 下的 ASR 数据保持隔离。
 
 ---
 
@@ -39,7 +39,7 @@
 
 ## 1. 三种网络视角与 Endpoint 职责
 
-在 `docker-compose.dalton.yml` 中，`minio` 服务仅绑定在宿主机回环地址 `127.0.0.1:9000`。**在 Linux 宿主机上，容器内的 `host.docker.internal` 解析为 Docker 网桥网关 IP（如 `172.17.0.1`），无法连通宿主机 `127.0.0.1:9000`**。因此后端必须通过 Docker Compose 网络以服务名 `http://minio:9000` 通信，浏览器通过 HTTPS 反向代理域名访问（实现见 `src/utils/storage/s3_compatible.py:99-137`）。沙箱分两条路径：**录音转写（A1）的分片上传已改用独立的 `DALTON_ASR_STORAGE_*` 存储并经 `host.docker.internal` 访问 MinIO（生产方案见第 0 节；本节的历史方案曾与浏览器 2 GiB 直传共用 `STORAGE_BROWSER_ENDPOINT_URL` 公网 HTTPS 反代），沙箱不需要也不应接入 Compose 网络**（接入会让沙箱内的代理代码直连后端的 Postgres / Redis）；仅工作区直传拉取（`workspace_upload_pull.py`）在 `STORAGE_BLOB_TRANSFER=direct` 时才需要加入同一 Compose 网络，该项在生产保持关闭：
+在 `docker-compose.dalton.yml` 中，`minio` 服务仅绑定在宿主机回环地址 `127.0.0.1:9000`。**在 Linux 宿主机上，容器内的 `host.docker.internal` 解析为 Docker 网桥网关 IP（如 `172.17.0.1`），与宿主机 `127.0.0.1:9000` 隔离**。因此后端必须通过 Docker Compose 网络以服务名 `http://minio:9000` 通信，浏览器通过 HTTPS 反向代理域名访问（实现见 `src/utils/storage/s3_compatible.py:99-137`）。沙箱分两条路径：**录音转写（A1）的分片上传已改用独立的 `DALTON_ASR_STORAGE_*` 存储并经 `host.docker.internal` 访问 MinIO（生产方案见第 0 节；本节的历史方案曾与浏览器 2 GiB 直传共用 `STORAGE_BROWSER_ENDPOINT_URL` 公网 HTTPS 反代），沙箱保持脱离 Compose 网络**（避免沙箱内的代理代码直连后端的 Postgres / Redis）；仅工作区直传拉取（`workspace_upload_pull.py`）在 `STORAGE_BLOB_TRANSFER=direct` 时才需要加入同一 Compose 网络，该项在生产保持关闭：
 
 | 网络视角 | 使用的环境变量 | 调用阶段与职责 | 必须配置的值 |
 |---|---|---|---|
@@ -79,7 +79,7 @@
 
 ## 2. 全部环境变量清单
 
-以下变量用于启用 MinIO / S3 分片直传（参见 `.agy/backlog/backlog_codex_result.md` 第二节第 1 小节、`src/utils/storage/__init__.py`、`src/utils/storage/s3_compatible.py:99-137`）：
+以下变量用于启用 MinIO / S3 分片直传（实现见 `src/utils/storage/__init__.py`、`src/utils/storage/s3_compatible.py`）：
 
 | 变量名 | 代码默认值 | 直传推荐值 / 示例 | 说明 |
 |---|---|---|---|
@@ -91,8 +91,8 @@
 | `STORAGE_ADDRESSING_STYLE` | `virtual`（`s3_compatible.py:89`） | **`path`**（必填） | MinIO 必须显式设为 `path`，否则默认 `virtual` 会拼接 `<bucket>.minio:9000` 导致 DNS 失败 |
 | `STORAGE_ENDPOINT_URL` | 无（必填） | `http://minio:9000` | 后端容器在 Compose 网络内访问 MinIO 的地址；沙箱仅在非生产的工作区直传拉取方案（`STORAGE_BLOB_TRANSFER=direct`，生产保持关闭）下使用它，A1 转写与浏览器直传都不经过该地址 |
 | `STORAGE_BROWSER_ENDPOINT_URL` | 回退到 `STORAGE_ENDPOINT_URL` | `https://storage.example.com` | 浏览器直传 `PUT` 分片的公网 HTTPS 反代地址 |
-| `STORAGE_BLOB_TRANSFER` | **`auto`**（`__init__.py:78`） | **生产：不设置（保持默认 `auto`）** | 工作区直传拉取的路径开关：`direct` 要求 Docker 沙箱接入 Compose 网络（见第 1 节），是**非生产方案**，生产不设置或保持默认——`auto` 仅对远程沙箱（Daytona/E2B）启用 `direct`，对 Docker 沙箱回退为 `relay`（`__init__.py:90-106`）。生产不开 `direct` 时，文件面板 / 工作区上传全部走后端内存中继（`POST /{workspace_id}/files/upload`，`crud.py:1364`），单文件上限即中继上限：`RELAY_MAX_BYTES` = 256 MiB（`blob_keys.py:39`；`MAX_UPLOAD_BYTES = RELAY_MAX_BYTES`，`_shared.py:202`；生效值为 `min(RELAY_MAX_BYTES, scan_cap)`，见 `uploads.py:183`、`crud.py:1417-1419`），超过直接返回 `413`（见第 6 节）。**只有 A1 转写的沙箱分片上传**不依赖本变量也不依赖全局存储——它使用独立的 `DALTON_ASR_STORAGE_*` 存储（第 0 节），由沙箱直接 `PUT` 到 `DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL`（不检查传输模式与 `browser_uploads_enabled`）；但录音需先放进工作区，单个录音文件因此也受中继上限约束（常见 2 小时 mp3 约 115 MB，在 256 MiB 上限内；超大的无损 WAV 需先转码或压缩） |
-| `STORAGE_BROWSER_UPLOADS` | **`false`**（`__init__.py:85-87`） | **生产：不设置（默认 `false`）**；仅与非生产的 `direct` 方案一起设为 `true` | 浏览器分片直传的开关，但**单独设 `true` 并不能开启直传**：`direct_available()`（`uploads.py:108-118`）还要求传输模式已解析为 `direct`（即 `scan_cap_bytes` 返回 `None`，`transfer.py:224-238`）且沙箱非 SSH——`relay` 模式下浏览器分片直传不可用（`browser_uploads_enabled` 仅在这一处被检查，`uploads.py:115`），上传一律走后端中继单请求路径。生产（`auto` → Docker 回退 `relay`）不设置本变量；A1 转写的沙箱分片上传同样不依赖它 |
+| `STORAGE_BLOB_TRANSFER` | **`auto`**（`__init__.py`） | **生产：不设置（保持默认 `auto`）** | 工作区直传拉取的路径开关：`direct` 要求 Docker 沙箱接入 Compose 网络（见第 1 节），是**非生产方案**，生产不设置或保持默认——`auto` 仅对远程沙箱（Daytona/E2B）启用 `direct`，对 Docker 沙箱回退为 `relay`。生产不开 `direct` 时，文件面板 / 工作区上传全部走后端内存中继（`POST /{workspace_id}/files/upload`），单文件上限即中继上限：`RELAY_MAX_BYTES` = 256 MiB（`src/server/database/blob_keys.py`；生效值为 `min(RELAY_MAX_BYTES, scan_cap)`），超过直接返回 `413`（见第 6 节）。**只有 A1 转写的沙箱分片上传**不依赖本变量也不依赖全局存储——它使用独立的 `DALTON_ASR_STORAGE_*` 存储（第 0 节），由沙箱直接 `PUT` 到 `DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL`（不检查传输模式与 `browser_uploads_enabled`）；但录音需先放进工作区，单个录音文件因此也受中继上限约束（常见 2 小时 mp3 约 115 MB，在 256 MiB 上限内；超大的无损 WAV 需先转码或压缩） |
+| `STORAGE_BROWSER_UPLOADS` | **`false`**（`__init__.py:85-87`） | **生产：不设置（默认 `false`）**；仅与非生产的 `direct` 方案一起设为 `true` | 浏览器分片直传开关，须同时配合 `direct` 传输模式生效：`direct_available()`（`uploads.py:108-118`）要求传输模式已解析为 `direct`（即 `scan_cap_bytes` 返回 `None`，`transfer.py:224-238`）且沙箱非 SSH；`relay` 模式下上传统一走后端中继单请求路径。生产（`auto` → Docker 回退 `relay`）保持未设置；A1 转写的沙箱分片上传独立使用第 0 节配置 |
 | `STORAGE_KEY_PREFIX` | 空字符串 `""` | `dalton/`（或保持空） | 对象键全局前缀；**一旦上线切勿修改**（见第 4 节） |
 | `DALTON_CORS_ALLOWED_ORIGINS` | 无（必填） | `https://dalton.example.com` | 逗号分隔的允许浏览器源（禁止 `*`）；在 `docker-compose.dalton.yml` 中注入为 `MINIO_API_CORS_ALLOW_ORIGIN` |
 | `DALTON_UPLOADS_EXPIRE_DAYS` | `2` | `2`（仅允许 `1` 或 `2`） | `configure_minio.sh` 为 `<STORAGE_KEY_PREFIX>uploads/` 配置的对象过期天数 |
@@ -116,7 +116,7 @@
      - `storage.browser_uploads` → `STORAGE_BROWSER_UPLOADS`
    - 注意：这 3 个开关项在 YAML 中的显式值（包括 `false` / `relay` 这类假值）会直接覆盖 `.env` 中的同名环境变量——`_load_storage_setting` 先读 YAML、未设置时才回退环境变量（`__init__.py:36-48`）。生产不开启 `direct`：`STORAGE_BLOB_TRANSFER` 不设置即保持默认 `auto`（Docker 沙箱解析为 `relay`）；浏览器分片直传是否开启以 `STORAGE_BROWSER_UPLOADS` 为准（见第 2 节——仅与非生产的 `direct` 方案一起设置）。
 2. **仅从环境变量读取的 S3 连接与桶参数（不读 YAML）**：
-   - `StorageConfig`（`src/utils/storage/s3_compatible.py:99-137`）与 `src/utils/storage/key_prefix.py` **只从环境变量**读取 `STORAGE_BUCKET_NAME`、`STORAGE_ACCESS_KEY_ID`、`STORAGE_SECRET_ACCESS_KEY`、`STORAGE_REGION`、`STORAGE_ENDPOINT_URL`、`STORAGE_BROWSER_ENDPOINT_URL`、`STORAGE_ADDRESSING_STYLE`、`STORAGE_KEY_PREFIX`、`STORAGE_MAX_UPLOAD_SIZE`，在任何 YAML 中配置这些字段均不会生效。
+   - `StorageConfig`（`src/utils/storage/s3_compatible.py:99-137`）与 `src/utils/storage/key_prefix.py` **只从环境变量**读取 `STORAGE_BUCKET_NAME`、`STORAGE_ACCESS_KEY_ID`、`STORAGE_SECRET_ACCESS_KEY`、`STORAGE_REGION`、`STORAGE_ENDPOINT_URL`、`STORAGE_BROWSER_ENDPOINT_URL`、`STORAGE_ADDRESSING_STYLE`、`STORAGE_KEY_PREFIX`、`STORAGE_MAX_UPLOAD_SIZE`，须统一配置在 `.env` 中。
 
 ---
 
@@ -134,7 +134,7 @@
 
 ### 桶必须私有 & 严禁默认凭据 & 镜像说明
 - 存储桶包含用户的原始录音、工作区文件与内部资料，**严禁设为 `public` 或 `download`（匿名可读）**，必须保持 `mc anonymous set none`（完全私有）。
-- `docker-compose.dalton.yml` 中的 `minio` 服务**不提供 `minioadmin` 默认凭据**；启用 `--profile storage` 时必须提供 `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`（或 `STORAGE_ACCESS_KEY_ID` / `STORAGE_SECRET_ACCESS_KEY`）及 `DALTON_CORS_ALLOWED_ORIGINS`。
+- `docker-compose.dalton.yml` 中的 `minio` 服务强制显式配置凭据，无内置默认账号；启用 `--profile storage` 时必须提供 `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`（或 `STORAGE_ACCESS_KEY_ID` / `STORAGE_SECRET_ACCESS_KEY`）及 `DALTON_CORS_ALLOWED_ORIGINS`。
 - MinIO 官方已不再发布社区镜像（Docker Hub / Quay 已停更或拒拉），`docker-compose.dalton.yml` 使用 Chainguard 镜像按 digest 固定（`cgr.dev/chainguard/minio@sha256:e70b2b1e74d79457f808710483bd726ff364529ca30736eaa15a6ab547d3a5a7`），离线镜像备份见 `~/Backups/dalton/images/`。
 
 ### 启动与一键初始化校验
@@ -157,7 +157,7 @@
    - **创建 Bucket 并强制私有**：执行 `mc mb --ignore-existing` 与 `mc anonymous set none`，并读回校验匿名权限为 `none`、清空桶策略。
    - **校验 CORS 真实生效**：对 `DALTON_CORS_ALLOWED_ORIGINS` 中的每个源发起真实 HTTP `OPTIONS` 预检请求（`Access-Control-Request-Method: PUT`），校验响应头允许该源、允许 `PUT`/`GET`/`HEAD`、未放行未授权源。
    - **配置并读回校验 `uploads/` 过期规则**：通过 S3 Lifecycle 配置 `<STORAGE_KEY_PREFIX>uploads/` 前缀 `Expiration (Days: DALTON_UPLOADS_EXPIRE_DAYS)`（1–2 天自动删除残留在中转前缀下的完整对象），并读回校验规则已启用。
-   - **校验未完成分片清理**：MinIO 的 S3 ILM XML 不支持 `AbortIncompleteMultipartUpload` 动作，未完成分片由 MinIO 内置 `api` 子系统的 `stale_uploads_expiry`（默认 `24h`，通过 `MINIO_API_STALE_UPLOADS_EXPIRY` 注入）与 `stale_uploads_cleanup_interval`（默认 `6h`，通过 `MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL` 注入）自动回收；脚本通过 `mc admin config get dalton api` 校验该机制处于激活状态。
+   - **校验未完成分片清理**：未完成分片由 MinIO 内置 `api` 子系统的 `stale_uploads_expiry`（默认 `24h`，通过 `MINIO_API_STALE_UPLOADS_EXPIRY` 注入）与 `stale_uploads_cleanup_interval`（默认 `6h`，通过 `MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL` 注入）自动回收（MinIO 的 S3 ILM XML 无 `AbortIncompleteMultipartUpload` 动作）；脚本通过 `mc admin config get dalton api` 校验该机制处于激活状态。
 
 ---
 
@@ -172,5 +172,5 @@
    - **第 4–5 份及分段文件（后续转写流水线与归档）**：后续录音转文字（A1b）进行切分生成的音频分段（chunks）、重采样中间文件以及沙箱工作区备份归档。
    - **容量公式建议**：若单次长录音为 `500 MB`，单任务峰值磁盘消耗按 `500 MB × (3 ~ 5) ≈ 1.5 GB ~ 2.5 GB` 预留；支持并发上传时按同一电脑上所有上传者的预留总和叠加，并保留至少 `50 MiB`（`CRITICAL_FREE_BYTES`，见 `src/server/services/computer_disk.py:29`）的电脑级安全余量。
 2. **内存边界保护**：
-   - `backend` 容器内存限制为 `4g`（见 `docker-compose.dalton.yml`）。
-   - 当 `direct_available()` 为假（对象存储未启用或沙箱不支持直拉）时，超过内存中转上限（`relay_cap` = `min(RELAY_MAX_BYTES, scan_cap)`：对象存储启用、走中继时为 `RELAY_MAX_BYTES` 256 MiB（`blob_keys.py:39`），对象存储未启用时收紧为 `INLINE_MAX_BYTES` 100 MiB（`blob_keys.py:44`））的大文件会直接返回 `413 Payload Too Large`（提示*"大文件需要对象存储直传，当前未启用"*），**绝不降级为后端整文件读入内存**。
+   - `backend` 容器内存限制为 `6g`（见 `docker-compose.dalton.yml` 中的 `mem_limit: 6g`、`memswap_limit: 6g`）。
+   - 当 `direct_available()` 为假（对象存储未启用或沙箱未开直拉）时，超过内存中转上限（`relay_cap` = `min(RELAY_MAX_BYTES, scan_cap)`：对象存储启用、走中继时为 `RELAY_MAX_BYTES` 256 MiB，对象存储未启用时收紧为 `INLINE_MAX_BYTES` 100 MiB，均见 `src/server/database/blob_keys.py`）的大文件会直接返回 `413 Payload Too Large`（提示*"大文件需要对象存储直传，当前未启用"*），保护后端内存边界。

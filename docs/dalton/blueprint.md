@@ -9,7 +9,7 @@
 | 蓝图设想 | 当前状态 | 现状说明与代码/文档入口 |
 |---|---|---|
 | **四块核心补齐**（公司知识层、自主研究议程、发布治理、本地每日预算） | **已实现** | 分别对应 `src/dalton/knowledge/`、`src/dalton/autonomy/`、`src/dalton/publish/` 与 `src/dalton/budget/`（`LocalBudgetPort`） |
-| **方法论与研究技能从旧 Dalton/OpenClaw 迁入** | **已实现（大幅扩充）** | 从方法论骨架扩展到 50 个 `plugins/dalton/skills/dalton-*` 分析与周期报告技能，并引入统一工具 `automation_report` 与报告投递体系（[automations.md](./features/automations.md)） |
+| **方法论与研究技能从旧 Dalton/OpenClaw 迁入** | **已实现（大幅扩充）** | 从方法论骨架扩展到 51 个 `plugins/dalton/skills/dalton-*` 分析与周期报告技能，并引入统一工具 `automation_report` 与报告投递体系（[automations.md](./features/automations.md)） |
 | **团队协作与外部渠道接入**（超越初版范围） | **已扩展实现** | 新增 Supabase 三层权限、`dalton-channel-gateway`（飞书/Discord/微信）、多面板监控平台（[monitors.md](./features/monitors.md)）、确定性数据任务层（[data-jobs.md](./features/data-jobs.md)）与 Everflow 对外品牌体系（[brand.md](./features/brand.md)） |
 | **OpenClaw `ocb-*` 模型代理过渡方案** | **已调整并退役** | `ocb-*` 与 OpenClaw 模型调用已全部下线，改为直连 OAuth / 原生提供商及直连 Gemini Grounding / xAI 搜索（[openclaw-retirement.md](./features/openclaw-retirement.md)） |
 | **阶段性过程文档**（P0*/PK/PS 与各轮审查记录） | **已归档** | 已全部移至 [`archive/`](./archive/README.md)，不再作为现行开发依据 |
@@ -152,7 +152,7 @@ Dalton 服务层（新建，在 LangAlpha 后端内）
 
 ### 4.3 模型接入：复用 OpenClaw 的模型列表
 
-> **OC-5（2026-11-12）：** 这一节规划的 OpenClaw 对话模型路径（含 `scripts/sync_openclaw_models.py`）已移除。现行对话模型是 LangAlpha 原生订阅和现金 API。OpenClaw 仍提供 researchdata、x_search 和飞书通道。
+> **退役说明（2026-11-19）：** 这一节规划的 OpenClaw 对话模型路径（含 `scripts/sync_openclaw_models.py`）已于 2026-11-12 移除，OpenClaw 其余组件（`researchdata`、`x_search`、飞书通道等）也已于 2026-11-19 全部退役并由 Dalton 原生模块承担（详见 [openclaw-retirement.md](./features/openclaw-retirement.md)）。下文保留供立项历史参考。
 
 **现状：**
 - 旧 Dalton 通过一个专属 broker（Unix socket，HMAC 认证）调用 OpenClaw 模型。它带调用日志、只读重放和"不重复付费"，但只支持单条 prompt 进、整段文本出，不支持流式，也不支持工具调用。
