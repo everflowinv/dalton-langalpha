@@ -28,6 +28,7 @@ from src.tools.secretary._commands import (
 from src.tools.secretary.approvals import preapproved
 from src.tools.secretary.dispatch import dispatch
 # DALTON-HOOK(computer-cli-tokens-off): retain server-side CoS tools when la CLI is off.
+# DALTON-HOOK(cos-settings-tools): wire update action into manage_workspaces.
 from src.tools.secretary.tools import (
     _workspaces_delete,
     threads_delete,
@@ -40,6 +41,7 @@ from src.tools.secretary.tools import (
     workspace_files_list_cos,
     workspaces_create,
     workspaces_list,
+    workspaces_update,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,7 +74,7 @@ async def chief_of_staff_workspaces(
     skip_coverage_suggestion: bool = False,
     tool_call_id: Annotated[str, InjectedToolCallId] = "",
 ) -> Command:
-    """List the user's and colleagues' shared workspaces, create or delete the user's own workspace, or list/read/copy/write files in a workspace.
+    """List the user's and colleagues' shared workspaces, create, update, or delete a workspace, or list/read/copy/write files in a workspace.
 
     Use "list_files", "read_file", and "write_file" to inspect or update files in a colleague's
     shared workspace (which does not share this computer's filesystem); use "write_file" only
@@ -89,10 +91,10 @@ async def chief_of_staff_workspaces(
     the tool). Otherwise, create a workspace of the user's own and hand off to its analyst.
 
     Args:
-        action: "list", "create", "delete", "list_files", "read_file", "copy_file", or "write_file".
-        name: Name for the new workspace; required for "create".
-        description: What the new workspace is for; optional.
-        workspace_id: Target workspace ID; required for "delete", "list_files", "read_file", "copy_file", and "write_file". Home cannot be deleted.
+        action: "list", "create", "update", "delete", "list_files", "read_file", "copy_file", or "write_file". Call "delete" only when the user explicitly asks; verify the workspace name first and wait for confirmation.
+        name: Workspace name; required for "create", optional for "update". Renaming a workspace also changes its folder name on its computer; Home cannot be renamed.
+        description: What the workspace is for; optional for "create" and "update" (an "update" keeps it to 1,000 characters).
+        workspace_id: Target workspace ID; required for "update", "delete", "list_files", "read_file", "copy_file", and "write_file". Home cannot be deleted.
         path: Relative directory or file path INSIDE workspace_id's own folder (sources/x.md, not DASH/sources/x.md); optional prefix for "list_files", required for "read_file", "copy_file" and "write_file". Workspace folders sit beside Home (../<folder>), never inside it — a path starting with a workspace folder name is refused, because it would silently land in the wrong workspace.
         content: Full UTF-8 text to write; required for "write_file" (requires "rw" access).
         dest_path: Where "copy_file" lands the file, relative to the destination's folder; default shared/<filename>.
@@ -104,19 +106,10 @@ async def chief_of_staff_workspaces(
         skip_coverage_suggestion: Only for "create" when retrying after a `coverage_suggestion` response and the user explicitly declines registering a coverage unit; default False.
 
     Returns:
-        One short row per workspace, with its id and its folder (dir_name); with more
-        than one computer, also the computer it is on, and for one on another computer
-        than yours, the folder's whole path there (path); plus the colleague-shared
-        workspaces, each with its owner and access level. For "create" the new id with
-        `folder_path` and `folder_ready` (before copying or cleaning into a new
-        workspace, confirm `folder_path` exists and is non-empty — until `folder_ready`
-        is true the folder is not on the machine yet), plus `coverage_unit` (or
-        `coverage_unit_warning` / `coverage_unit_warning_detail`) when coverage
-        registration ran; file paths/content
-        for file actions; for "copy_file" the destination path, its absolute
-        `folder_path`, and the size.
-        (DALTON-HOOK(workspace-folder-ready): the create result's folder fields.)
+        Workspace rows with id/folder/computer/access for "list", new id with `folder_path`/`folder_ready` (verify `folder_path` exists and `folder_ready` is true before copying into it) and `coverage_unit` for "create", updated metadata for "update", or file paths/content/destination size for file actions.
     """
+    # DALTON-HOOK(workspace-folder-ready): the create result's folder fields are documented above.
+    # DALTON-HOOK(cos-settings-tools): support manage_workspaces(action="update").
     user_id = config.get("configurable", {}).get("user_id")
     if not user_id:
         return error_command("user_id not found in config", tool_call_id)
@@ -133,6 +126,12 @@ async def chief_of_staff_workspaces(
             display_name=display_name,
             skip_coverage_suggestion=skip_coverage_suggestion,
         )
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    if action == "update":
+        return await workspaces_update(
+            user_id, workspace_id, name, description, tool_call_id
+        )
+    # --- DALTON-HOOK(cos-settings-tools): end ---
     if action == "delete":
         return await _workspaces_delete(user_id, workspace_id, tool_call_id)
     # --- DALTON-HOOK(workspace-sharing-settings): begin ---
@@ -154,8 +153,9 @@ async def chief_of_staff_workspaces(
             user_id, workspace_id, path, content, tool_call_id
         )
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
+    # DALTON-HOOK(cos-settings-tools): list update in unknown-action error
     return error_command(
-        f"Unknown action: {action}. Use list, create, delete, list_files, "
+        f"Unknown action: {action}. Use list, create, update, delete, list_files, "
         "read_file, copy_file, or write_file.",
         tool_call_id,
     )
