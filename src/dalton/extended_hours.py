@@ -23,6 +23,9 @@ from src.data_client.instrument_clock import clock_for, clock_for_ref
 
 logger = logging.getLogger(__name__)
 
+# Yahoo marketState values seen between a regular close and the next pre-market open.
+_POST_WINDOW_STATES = frozenset({"POST", "POSTPOST", "PREPRE", "CLOSED"})
+
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -217,7 +220,13 @@ def enrich_yfinance_snapshot_extended_hours(
             return enriched
 
         if mode == "post":
-            if state not in ("POST", "POSTPOST"):
+            # Yahoo marks every US quote CLOSED (or PREPRE overnight) soon after
+            # 20:00 ET while still serving the session's after-hours print, and the
+            # closed-phase cache then freezes each row until the next open. Gating
+            # on POST/POSTPOST alone made a weekend quote show or drop its
+            # after-hours print by when it was first fetched; the print-time window
+            # checks below are what keep a stale print out.
+            if state not in _POST_WINDOW_STATES:
                 return base_snap
             post_price = _finite(info.get("postMarketPrice"))
             if post_price is None or post_price <= 0:

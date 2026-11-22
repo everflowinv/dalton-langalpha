@@ -64,7 +64,9 @@ _NO_DATA = {"__no_data__": True}
 # v10: ginlix-data rows carry ``last_trade_at``, and an index row the feed
 # rolled past its stamp carries no stale stamp or move.
 # v11: DALTON-HOOK(extended-hours-quotes) yfinance snapshots carry extended-hours fields.
-_QUOTE_SCHEMA_VERSION = 11  # DALTON-HOOK(extended-hours-quotes)
+# v12: DALTON-HOOK(extended-hours-quotes) yfinance rows fetched once Yahoo marks
+# the market CLOSED keep the session's after-hours print.
+_QUOTE_SCHEMA_VERSION = 12  # DALTON-HOOK(extended-hours-quotes)
 
 
 def _closed_recently(cal: MarketCalendar, now: datetime, window: timedelta) -> bool:
