@@ -223,6 +223,8 @@ export interface ChatInputProps {
   toolbarStatus?: React.ReactNode;
   // DALTON-HOOK(composer-drafts): storage key suffix for persisting unsent composer draft text
   draftKey?: string;
+  // DALTON-HOOK(automation-effort): failed reply id currently eligible for Retry (null when no failed reply is retryable)
+  retryTargetId?: string | null;
   /**
    * Context the host gathers above the text box, ruled off from it (the chat
    * view's queued file comments). The host owns what it holds and what a send
@@ -294,6 +296,8 @@ function ChatInput({
   toolbarStatus = null,
   // DALTON-HOOK(composer-drafts): storage key suffix for persisting unsent composer draft text
   draftKey,
+  // DALTON-HOOK(automation-effort): failed reply id currently eligible for Retry (null when no failed reply is retryable)
+  retryTargetId,
   deck = null,
   ref,
 }: ChatInputProps & { ref?: React.Ref<ChatInputHandle> }) {
@@ -454,11 +458,28 @@ function ChatInput({
   // The thread's own picks over Settings. A thread host owns them. Without
   // one the composer holds them, following Settings until touched.
   const [ownTuning, setOwnTuning] = useState<{ reasoningEffort: string | null; fastMode: boolean | null }>(FOLLOWS_SETTINGS);
-  // DALTON-HOOK(automation-effort): tracks whether the user explicitly picked a reasoning effort for the next retry
-  const explicitRetryEffortRef = useRef<string | null | undefined>(undefined);
+  // DALTON-HOOK(automation-effort): tracks an explicit effort pick made specifically for the active retry target
+  // Also tracks Antigravity series-effort variant switches so an unsent draft effort pick does not submit llm_model on a later retry.
+  const explicitRetryEffortRef = useRef<{ targetId: string | null; effort: string | null } | undefined>(undefined);
+  const seriesEffortModelRef = useRef<{ model: string; targetId: string | null; activeForRetry: boolean } | undefined>(undefined);
   useEffect(() => {
     explicitRetryEffortRef.current = undefined;
+    seriesEffortModelRef.current = undefined;
   }, [draftKey]);
+  useEffect(() => {
+    explicitRetryEffortRef.current = undefined;
+    if (seriesEffortModelRef.current) {
+      seriesEffortModelRef.current = { ...seriesEffortModelRef.current, activeForRetry: false };
+    }
+  }, [retryTargetId]);
+  useEffect(() => {
+    if (isLoading) {
+      explicitRetryEffortRef.current = undefined;
+      if (seriesEffortModelRef.current) {
+        seriesEffortModelRef.current = { ...seriesEffortModelRef.current, activeForRetry: false };
+      }
+    }
+  }, [isLoading]);
   const tuning = hostTuning === undefined ? ownTuning : hostTuning;
   const sentEffort = tuning.reasoningEffort === undefined
     ? null
@@ -499,6 +520,9 @@ function ChatInput({
   const handlePickModel = useCallback((model: string) => {
     // The checked row is the model the composer already runs.
     if (model === pillModel) return;
+    // DALTON-HOOK(automation-effort): switching model invalidates any earlier retry effort pick
+    explicitRetryEffortRef.current = undefined;
+    seriesEffortModelRef.current = undefined;
     if (hostModel === undefined) setOwnModel(model);
     else onPickModel?.(model);
     // DALTON-HOOK(antigravity-series): reset local composer reasoningEffort when picking an Antigravity variant
@@ -666,17 +690,44 @@ function ChatInput({
         ...ownOverrides,
       };
     },
-    // DALTON-HOOK(automation-effort): omit saved composer effort on retry unless explicitly picked for this retry
+    // DALTON-HOOK(automation-effort): omit saved composer effort (and unsent Antigravity effort variant) on retry unless explicitly picked for this retry
     getRetryModelOptions() {
-      const explicitEffort = explicitRetryEffortRef.current;
+      const explicit = explicitRetryEffortRef.current;
       explicitRetryEffortRef.current = undefined;
+      const matchedExplicit =
+        explicit !== undefined
+        && !isLoading
+        && (retryTargetId === undefined
+          ? explicit.targetId === null
+          : retryTargetId !== null && explicit.targetId === retryTargetId);
+      const seriesPick = seriesEffortModelRef.current;
+      let retryModel = sentModel;
+      if (seriesPick && sentModel && seriesPick.model === sentModel) {
+        const matchedSeriesRetry =
+          seriesPick.activeForRetry
+          && !isLoading
+          && (retryTargetId === undefined
+            ? seriesPick.targetId === null
+            : retryTargetId !== null && seriesPick.targetId === retryTargetId);
+        seriesEffortModelRef.current = { ...seriesPick, activeForRetry: false };
+        if (!matchedSeriesRetry) {
+          retryModel = null;
+        }
+      }
+      const retryOwnOverrides = hostTuning === undefined
+        ? {
+            ...(matchedExplicit && explicit.effort !== null ? { reasoningEffortOverride: explicit.effort } : {}),
+            ...(ownTuning.fastMode !== null ? { fastModeOverride: ownTuning.fastMode } : {}),
+          }
+        : {};
+      // DALTON-HOOK(automation-effort): retry submits the variant only when it was picked for this retry
       return {
-        model: sentModel,
-        reasoningEffort: explicitEffort !== undefined ? explicitEffort : null,
+        model: retryModel,
+        reasoningEffort: matchedExplicit ? explicit.effort : null,
         fastMode: resolvedFastMode,
         marketWatch: effectiveMarketWatch,
         subagentsAllowed: draftSubagents,
-        ...ownOverrides,
+        ...retryOwnOverrides,
       };
     },
     addContext(ctx) {
@@ -771,7 +822,7 @@ function ChatInput({
     focus() {
       textareaRef.current?.focus();
     },
-  }), [sentModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, holdsStale, restoreSlash, pruneDraft, handleFiles, abandonListening, setMessage, giveBackDraft, tryAttachWidgetSnapshot]);
+  }), [sentModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, ownTuning.fastMode, hostTuning, isLoading, retryTargetId, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, holdsStale, restoreSlash, pruneDraft, handleFiles, abandonListening, setMessage, giveBackDraft, tryAttachWidgetSnapshot]);
 
   // Subscribe to ContextBus so this input mirrors the global widget-context
   // deck. Multiple chat inputs can be visible simultaneously (hero card +
@@ -825,23 +876,38 @@ function ChatInput({
     if (pillSeriesMatch) {
       if (!effort) return;
       const targetKey = pillSelectableSeries?.variants[effort] ?? pillSeriesMatch.series.variants[effort];
-      if (!targetKey || targetKey === pillModel) return;
+      if (!targetKey) return;
+      // DALTON-HOOK(automation-effort): bind Antigravity series-effort variant switch to the active retry target
+      seriesEffortModelRef.current = {
+        model: targetKey,
+        targetId: retryTargetId ?? null,
+        activeForRetry: !isLoading && retryTargetId !== null,
+      };
+      explicitRetryEffortRef.current = undefined;
+      if (targetKey === pillModel) return;
       if (hostModel === undefined) setOwnModel(targetKey);
       else onPickModel?.(targetKey);
       if (hostTuning === undefined) {
         setOwnTuning((prev) => ({ ...prev, reasoningEffort: null }));
       }
-      explicitRetryEffortRef.current = undefined;
       return;
     }
-    // DALTON-HOOK(automation-effort): mark explicit effort pick so an ensuing retry submits the chosen level
-    explicitRetryEffortRef.current = effort ?? settingsTuning.reasoning_effort ?? null;
+    // DALTON-HOOK(automation-effort): mark explicit effort pick only for the current active retry target
+    if (!isLoading && retryTargetId !== null) {
+      explicitRetryEffortRef.current = {
+        targetId: retryTargetId ?? null,
+        effort: effort ?? settingsTuning.reasoning_effort ?? null,
+      };
+    } else {
+      explicitRetryEffortRef.current = undefined;
+    }
     if (effort === tuning.reasoningEffort) return;
     if (hostTuning === undefined) setOwnTuning((prev) => ({ ...prev, reasoningEffort: effort }));
     else onPickReasoningEffort?.(effort);
   }, [
     pillSeriesMatch, pillSelectableSeries, pillModel, hostModel, setOwnModel, onPickModel,
     tuning.reasoningEffort, hostTuning, onPickReasoningEffort, settingsTuning.reasoning_effort,
+    isLoading, retryTargetId,
   ]);
 
   // Speed has no Default of its own in the menu, so the side Settings is on
@@ -957,6 +1023,11 @@ function ChatInput({
 
   // Detect @ and / triggers on input change
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    // DALTON-HOOK(automation-effort): editing a draft means an earlier effort pick was for composing, not retrying
+    explicitRetryEffortRef.current = undefined;
+    if (seriesEffortModelRef.current) {
+      seriesEffortModelRef.current = { ...seriesEffortModelRef.current, activeForRetry: false };
+    }
     const val = keepWhole(e.target.value, e.target.selectionStart);
     setMessage(val);
     // DALTON-HOOK(composer-drafts): an input the browser marks as outside any composition ends one whose compositionend never came
@@ -1000,6 +1071,9 @@ function ChatInput({
       // staged attachments / mentions / widget context behind for the next turn.
       // DALTON-HOOK(composer-drafts): clear stored composer draft on successful send
       clearCurrentDraft();
+      // DALTON-HOOK(automation-effort): standalone action commands also clear any pending retry effort pick
+      explicitRetryEffortRef.current = undefined;
+      seriesEffortModelRef.current = undefined;
       resetSlash();
       // DALTON-HOOK(chat-large-upload): cancel any unsent server/staged uploads on standalone action commands
       discardFiles();
@@ -1071,6 +1145,7 @@ function ChatInput({
     );
     // DALTON-HOOK(automation-effort): a normal send consumes any pending retry effort pick
     explicitRetryEffortRef.current = undefined;
+    seriesEffortModelRef.current = undefined;
     // DALTON-HOOK(chat-large-upload): mark sent uploadIds so unmount cleanup keeps them intact
     consumeSentFiles();
     resetSlash();

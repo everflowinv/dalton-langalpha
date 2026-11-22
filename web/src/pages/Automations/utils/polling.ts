@@ -45,6 +45,18 @@ export function isDeliverySettling(run: AutomationExecution, awaitsRecord: boole
   return attempts ? attempts.some((d) => !d.success && d.retrying !== false) : awaitsRecord;
 }
 
+// DALTON-HOOK(execution-delivery-status): keep slow polling when backend marks a failed/partial run as still reconcilable for a late receipt
+export function isExecutionAwaitingReceipt(
+  run: Pick<AutomationExecution, 'delivery_summary'> | null | undefined,
+): boolean {
+  const summary = run?.delivery_summary;
+  if (!summary) return false;
+  if (summary.status === 'delivered' || summary.status === 'retrying' || summary.status === 'skipped') {
+    return false;
+  }
+  return summary.awaiting_receipt === true;
+}
+
 // DALTON-HOOK(execution-delivery-status): poll company script history fast while retrying, slow (30s) while unconfirmed awaiting receipt, and stop on terminal outcomes
 const UNCONFIRMED_DELIVERY_CODES = new Set([
   'delivery_uncertain',
@@ -65,13 +77,22 @@ export function isScriptDeliveryPending(
   return run.notify_status === 'pending_dispatch';
 }
 
+// DALTON-HOOK(execution-delivery-status): prefer backend awaiting_receipt flag over legacy error-code heuristics
 export function isScriptDeliveryAwaitingReceipt(
   run: Pick<ScriptExecutionRead, 'notify_status' | 'delivery_summary'> | null | undefined,
 ): boolean {
-  if (!run || run.notify_status !== 'pending_dispatch' || !run.delivery_summary) return false;
-  if (run.delivery_summary.status === 'delivered' || run.delivery_summary.status === 'retrying') {
+  if (!run || !run.delivery_summary) return false;
+  if (
+    run.delivery_summary.status === 'delivered' ||
+    run.delivery_summary.status === 'retrying' ||
+    run.delivery_summary.status === 'skipped'
+  ) {
     return false;
   }
+  if (typeof run.delivery_summary.awaiting_receipt === 'boolean') {
+    return run.delivery_summary.awaiting_receipt;
+  }
+  if (run.notify_status !== 'pending_dispatch') return false;
   const topCode = (run.delivery_summary.failure_code ?? '').trim().toLowerCase();
   if (topCode && UNCONFIRMED_DELIVERY_CODES.has(topCode)) return true;
   return (run.delivery_summary.targets ?? []).some(

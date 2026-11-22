@@ -1922,3 +1922,92 @@ def test_r2_tracker_loads_only_sibling_usage_sources_and_rejects_version_mismatc
     assert err_r1.returncode != 0
     assert "usage_sources.py 版本不匹配" in err_r1.stderr
     assert "版本为 0，要求 >= 2" in err_r1.stderr
+
+
+def test_unpriced_reference_cost_rounds_after_series_merge_across_efforts() -> None:
+    """Follow-up #6: reference-only estimates for unpriced multi-effort series allocate cents from
+    the merged series total so per-effort displayed reference estimates sum to the series row."""
+    from decimal import Decimal
+    import re
+
+    tracker = _load_tracker()
+
+    def parse_cents(usd_str: str) -> int:
+        return int((Decimal(usd_str.lstrip("$").replace(",", "")) * 100).to_integral_exact())
+
+    custom_series = [
+        {
+            "series_id": "antigravity-oauth:unpriced-series",
+            "series_prefix": "unpriced-series",
+            "display_name": "Unpriced Series",
+            "qualified_display_name": "Unpriced Series (Antigravity)",
+            "vendor": "openai",
+            "variants": {
+                "high": "unpriced-series-high-oauth",
+                "medium": "unpriced-series-medium-oauth",
+                "low": "unpriced-series-low-oauth",
+            },
+        }
+    ]
+
+    for tier_refs, expected_series_usd in (
+        # 3 x $0.004 = $0.012 -> merged $0.01 (per-tier rounding would yield $0.00+$0.00+$0.00=$0.00)
+        ([("high", 0.004), ("medium", 0.004), ("low", 0.004)], "$0.01"),
+        # 2 x $0.014 = $0.028 -> merged $0.03 (per-tier rounding would yield $0.01+$0.01=$0.02)
+        ([("high", 0.014), ("medium", 0.014)], "$0.03"),
+        # 2 x $0.016 = $0.032 -> merged $0.03 (per-tier rounding would yield $0.02+$0.02=$0.04)
+        ([("high", 0.016), ("medium", 0.016)], "$0.03"),
+    ):
+        rows = [
+            {
+                "source": "dalton-prod",
+                "provider": "antigravity-oauth",
+                "model": f"unpriced-series-{effort}-oauth",
+                "dalton_prod": True,
+                "records": 1,
+                "calls": 10,
+                "runs": 1,
+                "fresh": 1000,
+                "cache_write": 0,
+                "cache_read": 0,
+                "output": 200,
+                "cost_usd": None,
+                "unpriced_tokens": 1200,
+                "no_public_price": True,
+                "reference_cost_usd": ref_val,
+                "reference_model": "gpt-ref",
+                "estimated_split": False,
+            }
+            for effort, ref_val in tier_refs
+        ]
+        snap = {
+            "version": "3.1.0",
+            "price_catalog": {"generated": "2026-11-21", "effective_notes": []},
+            "antigravity_series": custom_series,
+            "dalton_prod": {"ok": True, "error": None, "runs": len(rows), "calls": 10 * len(rows), "models": len(rows)},
+            "collector_status": {"ok": True, "fresh": True},
+            "windows": [
+                {
+                    "days": 7.0,
+                    "from": "2026-11-14T00:00:00+00:00",
+                    "to": "2026-11-21T00:00:00+00:00",
+                    "rows": rows,
+                }
+            ],
+        }
+        card = tracker.build_card(tracker.process_usage_stats(snap))
+        series_el = next(
+            el["content"]
+            for el in card["body"]["elements"]
+            if el.get("tag") == "markdown" and "Unpriced Series (Antigravity)" in el.get("content", "")
+            and "· 档位明细:" in el.get("content", "")
+        )
+        m_series = re.search(r"参考价估算 (\$[0-9,]+\.\d{2})", series_el)
+        assert m_series is not None, series_el
+        assert m_series.group(1) == expected_series_usd, series_el
+        bd_line = series_el.split("· 档位明细:", 1)[1]
+        bucket_refs = re.findall(r"无公开价，参考 (\$[0-9,]+\.\d{2})", bd_line)
+        assert len(bucket_refs) == len(tier_refs), bd_line
+        assert sum(parse_cents(u) for u in bucket_refs) == parse_cents(expected_series_usd), (
+            f"Series {expected_series_usd} != buckets {bucket_refs} in {series_el}"
+        )

@@ -994,4 +994,108 @@ describe('round-4 review regressions', () => {
     });
     expect(execReadMock).toHaveBeenCalledTimes(2);
   });
+
+  it('strips synced undelivered excerpt suffix when late receipt transitions delivery_summary to delivered', async () => {
+    await i18n.changeLanguage('zh-CN');
+
+    const lateDeliveredRun: AutomationExecution = {
+      ...makeExecution('exec-late-delivered', 20, {
+        status: 'delivered',
+        total_targets: 1,
+        sent_count: 1,
+        failed_count: 0,
+        retrying_count: 0,
+        awaiting_receipt: false,
+        failure_code: null,
+        failure_reason: null,
+        targets: [
+          {
+            target: 'feishu:chat:oc_market_pm',
+            channel: 'feishu',
+            name: '投研大群',
+            status: 'sent',
+            attempt_count: 3,
+            max_attempts: 3,
+          },
+        ],
+      }),
+      excerpt: '市场晚报已生成\n\n投递状态：已生成但未送达（attempts_exhausted）',
+      delivery_result: null,
+    };
+
+    const autoDelivered = { ...AUTOMATION, last_execution: lateDeliveredRun };
+    vi.mocked(api.listAutomations).mockResolvedValue({ data: { automations: [autoDelivered], total: 1 } } as never);
+    vi.mocked(api.listExecutions).mockResolvedValue({
+      data: { executions: [lateDeliveredRun], has_more: false },
+    } as never);
+    renderWithProviders(<Automations />, { route: '/automations?id=auto-market-pm' });
+
+    const heading = await screen.findByRole('heading', { level: 2, name: '市场晚报' });
+    const pane = heading.closest('article')!;
+    await within(pane).findByRole('table');
+    const reportCard = pane.querySelector('.automation-report') as HTMLElement;
+    expect(reportCard).toHaveTextContent('市场晚报已生成');
+    expect(reportCard).not.toHaveTextContent('已生成但未送达');
+  });
+
+  it('stops polling for all-skipped delivery_summary and slow-polls attempts_exhausted when awaiting_receipt is true', () => {
+    const allSkippedRun = {
+      notify_status: 'pending_dispatch',
+      delivery_summary: {
+        status: 'skipped' as const,
+        total_targets: 0,
+        sent_count: 0,
+        failed_count: 0,
+        retrying_count: 0,
+        awaiting_receipt: false,
+        failure_code: null,
+        failure_reason: null,
+        targets: [],
+      },
+    };
+    const noRowsYetRun = {
+      notify_status: 'pending_dispatch',
+      delivery_summary: null,
+    };
+    const attemptsExhaustedReconcilable = {
+      notify_status: 'pending_dispatch',
+      delivery_summary: {
+        status: 'failed' as const,
+        total_targets: 1,
+        sent_count: 0,
+        failed_count: 1,
+        retrying_count: 0,
+        awaiting_receipt: true,
+        failure_code: 'attempts_exhausted',
+        failure_reason: '多次重试后仍投递失败',
+        targets: [
+          {
+            target: 'feishu:chat:oc_ops',
+            channel: 'feishu',
+            status: 'failed' as const,
+            error_code: 'attempts_exhausted',
+            error_message: '多次重试后仍投递失败',
+          },
+        ],
+      },
+    };
+    const terminalFailedNotReconcilable = {
+      notify_status: 'pending_dispatch',
+      delivery_summary: {
+        status: 'failed' as const,
+        total_targets: 1,
+        sent_count: 0,
+        failed_count: 1,
+        retrying_count: 0,
+        awaiting_receipt: false,
+        failure_code: 'card_limit_exceeded',
+        failure_reason: '卡片超过 30 KB 上限',
+      },
+    };
+
+    expect(scriptDeliveryPollMs([allSkippedRun])).toBe(false);
+    expect(scriptDeliveryPollMs([noRowsYetRun])).toBe(LIVE_POLL_MS);
+    expect(scriptDeliveryPollMs([attemptsExhaustedReconcilable])).toBe(IDLE_POLL_MS);
+    expect(scriptDeliveryPollMs([terminalFailedNotReconcilable])).toBe(false);
+  });
 });

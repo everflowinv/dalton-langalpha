@@ -970,12 +970,22 @@ def _allocate_display_cents(
     target_usd: float,
     ordered_buckets: list[tuple[str, dict[str, Any]]],
     rank_map: dict[str, int],
+    *,
+    cost_field: str = "cost_usd",
+    require_unpriced: bool = False,
 ) -> dict[str, int]:
-    """Allocate the series row's displayed cents across priced effort buckets so their sum equals the series row."""
+    """Allocate the series row's displayed cents across effort buckets so their sum equals the series row."""
     priced = [
-        (bk, Decimal(str(float(bv["cost_usd"]))) * 100, int(bv.get("total_tokens") or 0), rank_map.get(bk, len(EFFORT_BUCKET_ORDER)))
+        (
+            bk,
+            Decimal(str(float(bv[cost_field]))) * 100,
+            int(bv.get("total_tokens") or 0),
+            rank_map.get(bk, len(EFFORT_BUCKET_ORDER)),
+        )
         for bk, bv in ordered_buckets
-        if isinstance(bv, dict) and bv.get("cost_usd") is not None
+        if isinstance(bv, dict)
+        and bv.get(cost_field) is not None
+        and (not require_unpriced or bv.get("cost_usd") is None)
     ]
     if not priced:
         return {}
@@ -1005,6 +1015,7 @@ def _format_effort_breakdown_line(
     effort_breakdown: dict[str, Any] | None,
     *,
     series_cost_usd: float | None = None,
+    series_reference_cost_usd: float | None = None,
 ) -> str | None:
     """Format per-effort breakdown for Antigravity series rows on the Feishu card."""
     if not isinstance(effort_breakdown, dict) or not effort_breakdown:
@@ -1021,6 +1032,28 @@ def _format_effort_breakdown_line(
     allocated_cents = (
         _allocate_display_cents(series_cost_usd, ordered_buckets, rank_map)
         if series_cost_usd is not None
+        else {}
+    )
+    ref_target_usd = series_reference_cost_usd if series_cost_usd is None else None
+    if ref_target_usd is None:
+        unpriced_refs = [
+            float(bv["reference_cost_usd"])
+            for _, bv in ordered_buckets
+            if isinstance(bv, dict)
+            and bv.get("cost_usd") is None
+            and bv.get("reference_cost_usd") is not None
+        ]
+        if unpriced_refs:
+            ref_target_usd = sum(unpriced_refs)
+    allocated_ref_cents = (
+        _allocate_display_cents(
+            ref_target_usd,
+            ordered_buckets,
+            rank_map,
+            cost_field="reference_cost_usd",
+            require_unpriced=True,
+        )
+        if ref_target_usd is not None
         else {}
     )
 
@@ -1042,7 +1075,11 @@ def _format_effort_breakdown_line(
             if unpriced > 0:
                 cost_part += f"，另 {format_tokens(unpriced)} 无公开价"
         elif ref_cost is not None:
-            cost_part = f"无公开价，参考 {format_usd(float(ref_cost))}"
+            if bk in allocated_ref_cents:
+                ref_part = f"${Decimal(allocated_ref_cents[bk]) / Decimal(100):,.2f}"
+            else:
+                ref_part = format_usd(float(ref_cost))
+            cost_part = f"无公开价，参考 {ref_part}"
         else:
             cost_part = "无公开价"
         parts.append(f"{label} {tok_str} ({calls:,} 次, {cost_part})")
@@ -1211,7 +1248,11 @@ def build_card(stats: dict[str, Any]) -> dict[str, Any]:
             f"<font color='grey'>· 参考成本: {cost_disp} ｜ 调用: {calls:,} 次</font>\n"
             f"<font color='grey'>· 构成拆分: 缓存读取 {cr_str} ｜ 缓存写入 {format_tokens(r['cache_write'])} ｜ 新增 {fresh_str} ｜ 输出 {out_str}</font>"
         )
-        effort_line = _format_effort_breakdown_line(r.get("effort_breakdown"), series_cost_usd=cost_val)
+        effort_line = _format_effort_breakdown_line(
+            r.get("effort_breakdown"),
+            series_cost_usd=cost_val,
+            series_reference_cost_usd=r.get("reference_cost_usd"),
+        )
         if effort_line:
             item_text += f"\n<font color='grey'>{effort_line}</font>"
         elements.append({"tag": "markdown", "content": item_text})
@@ -1230,7 +1271,11 @@ def build_card(stats: dict[str, Any]) -> dict[str, Any]:
             tail_line = (
                 f"**{idx}. {model}** <font color='grey'>({prov})</font>: {tok_str} Tokens ｜ {cost_str} ｜ {r['calls']:,} 次调用"
             )
-            effort_line = _format_effort_breakdown_line(r.get("effort_breakdown"), series_cost_usd=r["cost_usd"])
+            effort_line = _format_effort_breakdown_line(
+                r.get("effort_breakdown"),
+                series_cost_usd=r["cost_usd"],
+                series_reference_cost_usd=r.get("reference_cost_usd"),
+            )
             if effort_line:
                 tail_line += f"\n<font color='grey'>  {effort_line}</font>"
             tail_lines.append(tail_line)
