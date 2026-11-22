@@ -472,6 +472,9 @@ ALLOWED_HOOKS=(
   # Per-automation reasoning_effort field (d042), shared write/snapshot/file paths,
   # executor/continuation/wakeup/fallback inheritance, and MoreOptions effort selector.
   "automation-effort"
+  # Chief of Staff settings tools: manage_workspaces update/archive/create(computer_id)
+  # and CoS workspace management prompt guidance.
+  "cos-settings-tools"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

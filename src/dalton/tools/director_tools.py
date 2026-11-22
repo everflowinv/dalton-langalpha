@@ -1523,23 +1523,31 @@ def build_director_tools(
         timezone_name: str | None = None,
         workspace_id: str | None = None,
         ticker: str | None = None,
+        llm_model: str | None = None,
         reasoning_effort: str | None = None,
+        max_failures: int | None = None,
         config: RunnableConfig = None,
     ) -> str:
         """Create, update, pause, resume, or list Dalton (`dalton-*`) automations.
 
+        Supports `cron` and `once` triggers only. For standard price tracking use
+        `dalton_coverage_tracking`; for personal price alerts configure `trigger_config`
+        in the automation file.
+
         Args:
             action: "upsert", "pause", "resume", or "list".
             name: Automation name (must start with `dalton-`, e.g. `dalton-meta-watch`).
-            trigger_type: "cron", "once", or "price".
+            trigger_type: "cron" or "once".
             cron_expression: Standard 5-field cron expression when trigger_type="cron".
-            next_run_at: ISO 8601 datetime when trigger_type="once".
+            next_run_at: ISO 8601 datetime when trigger_type="once"; naive values are interpreted in the automation's timezone.
             instruction: Prompt instruction executed when the automation fires.
             description: Short description of the automation.
-            timezone_name: IANA timezone (defaults to `Asia/Shanghai`).
-            workspace_id: Workspace UUID (defaults to current workspace in config).
+            timezone_name: IANA timezone. Omit on create to use the deployment default; omit on update to keep the existing timezone. Naive `next_run_at` values are interpreted in this timezone.
+            workspace_id: Workspace UUID used to place a new automation or locate an existing one in that workspace (does not move an existing automation; defaults to the current workspace in config).
             ticker: Optional company ticker for naming validation.
-            reasoning_effort: Optional thinking effort override (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Pass `""` or `"default"` to clear back to user/model default; omit on update to keep the current value. Antigravity models encode effort in their model ID suffix and keep this field null.
+            llm_model: Optional model ID override. Pass `""` or `"default"` to clear back to user/model default; omit on update to keep the current value.
+            reasoning_effort: Optional thinking effort override (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Omit on create to inherit user/model default; omit on update to keep the current value, or pass `""` / `"default"` to clear. When specifying `llm_model`, pass an effort supported by that model. Built-in Antigravity models encode effort in the `llm_model` suffix and leave `reasoning_effort` unset.
+            max_failures: Optional consecutive-failure auto-disable limit (integer 1–100; default 3 on create, omit on update to keep the current value).
         """
         configurable = (config or {}).get("configurable") or {}
         user_id = str(configurable.get("user_id") or "").strip()
@@ -1563,11 +1571,20 @@ def build_director_tools(
             "workspace_id": ws_id,
             "ticker": ticker,
         }
+        if llm_model is not None:
+            cleaned_model = llm_model.strip()
+            spec["llm_model"] = (
+                None
+                if cleaned_model.lower() in ("", "default", "clear", "null")
+                else cleaned_model
+            )
         if reasoning_effort is not None:
             cleaned_effort = reasoning_effort.strip().lower()
             spec["reasoning_effort"] = (
                 None if cleaned_effort in ("", "default", "clear", "null") else cleaned_effort
             )
+        if max_failures is not None:
+            spec["max_failures"] = max_failures
         result = await schedule_dalton_automation_helper(
             name,
             spec,

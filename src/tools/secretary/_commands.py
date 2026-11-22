@@ -69,7 +69,8 @@ def hitl_confirm(
 #: actions that do (None for every action).
 _CARDS: dict[str, frozenset[str] | None] = {
     "delegate_to_analyst": None,
-    "manage_workspaces": frozenset({"create", "delete"}),
+    # DALTON-HOOK(cos-settings-tools): archive asks for confirmation on a card too.
+    "manage_workspaces": frozenset({"create", "archive", "delete"}),
     "manage_threads": frozenset({"delete"}),
 }
 
