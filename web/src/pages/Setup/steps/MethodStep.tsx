@@ -174,15 +174,18 @@ export default function MethodStep() {
   const navigate = useNavigate();
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const { providers: configuredProviders, hasAny: hasConfigured } = useConfiguredProviders();
+  // DALTON-HOOK(dalton-setup): surface provider/catalog/credentials read failures with retry on legacy /setup/method
+  const { providers: configuredProviders, hasAny: hasConfigured, unread: configuredUnread } = useConfiguredProviders();
   // DALTON-HOOK(team-credentials): team-shared credentials status
-  const { isShared: isTeamShared, canDisconnect, canManage } = useTeamCredentials();
+  const { isShared: isTeamShared, canDisconnect, canManage, callerTierError } = useTeamCredentials();
   // DALTON-HOOK(dalton-setup): check live Dalton team-model availability via useDaltonTeamModels
   const team = useDaltonTeamModels();
   const allowDisconnect = !isDaltonAuth || canDisconnect;
   // DALTON-HOOK(team-credentials): a non-PM member cannot write the shared
   // credentials, so the method rows lead only to read-only notes for them.
-  const teamManagedByAdmin = isDaltonAuth && isTeamShared && !canManage;
+  // DALTON-HOOK(dalton-setup): keep previously confirmed admin connect access (team.canManage) if a subsequent credentials/status read fails
+  const effectiveCanManage = isDaltonBuild ? team.canManage : canManage;
+  const teamManagedByAdmin = isDaltonAuth && isTeamShared && !effectiveCanManage;
   const { user, isLoading: userLoading } = useUser();
   const [localRedeemed, setLocalRedeemed] = useState(false);
   const hasPlatformAccess = (user?.access_tier ?? -1) >= 0 || localRedeemed;
@@ -261,10 +264,12 @@ export default function MethodStep() {
     }
   }, [invitationCode, queryClient, navigate, t]);
 
-  // DALTON-HOOK(dalton-setup): show load-failure notice with retry when reading team models fails under team sharing;
-  // keep provider connection entries visible for admins so they can still connect another provider
-  const teamUnread = isDaltonBuild && team.shared && team.unread;
-  if (teamUnread && !team.canManage) {
+  // DALTON-HOOK(dalton-setup): show load-failure notice with retry when reading models/providers/credentials fails;
+  // keep provider connection entries visible for admins (including previously confirmed admins on refetch error) / sharing-off users
+  const readFailed = isDaltonBuild && (
+    (team.shared && team.unread) || team.all.unread || configuredUnread || callerTierError
+  );
+  if (readFailed && !effectiveCanManage) {
     return <StepLoadFailed onRetry={team.retry} />;
   }
 
@@ -276,8 +281,8 @@ export default function MethodStep() {
         helper={canSkip ? t('setup.addMoreProviders') : t('setup.methodSubtitle')}
       />
       <div className="flex flex-col gap-4 sm:gap-6">
-      {/* DALTON-HOOK(dalton-setup): inline load-failure notice with retry for admins while preserving connect entries */}
-      {teamUnread && team.canManage && (
+      {/* DALTON-HOOK(dalton-setup): inline load-failure notice with retry for admins / sharing-off users while preserving connect entries */}
+      {readFailed && effectiveCanManage && (
         <div data-testid="setup-load-failed">
           <FlowFailure
             title={t('setup.answers.loadFailed')}
