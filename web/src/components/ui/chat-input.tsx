@@ -720,6 +720,7 @@ function ChatInput({
             ...(ownTuning.fastMode !== null ? { fastModeOverride: ownTuning.fastMode } : {}),
           }
         : {};
+      // DALTON-HOOK(automation-effort): retry submits the variant only when it was picked for this retry
       return {
         model: retryModel,
         reasoningEffort: matchedExplicit ? explicit.effort : null,
