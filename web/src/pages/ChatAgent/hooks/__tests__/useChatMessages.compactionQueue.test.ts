@@ -600,11 +600,15 @@ describe('useChatMessages – queued send during compaction', () => {
     });
   });
 
-  // DALTON-HOOK(antigravity-series): Item 4 — compaction-queued message preserves its captured model & modelPickSeq onto activeTurnModel when flushed in Dalton builds
+  // DALTON-HOOK(antigravity-series): Item 4 + Round 2 Item 1 — compaction-queued message preserves model & modelPickSeq with admitted:false until server metadata confirms run start
   it('exposes the queued message model and modelPickSeq as activeTurnModel when flushing after compaction in Dalton builds', async () => {
     brandMock.isDaltonBuild = true;
     const flushedHang = deferred<{ disconnected: boolean }>();
-    mockSendStream.mockImplementationOnce(async () => flushedHang.promise);
+    let emitFlushed!: OnEvent;
+    mockSendStream.mockImplementationOnce(async (_msg: string, _ws: string, _tid: string | null, opts: { onEvent: OnEvent }) => {
+      emitFlushed = opts.onEvent;
+      return flushedHang.promise;
+    });
 
     const { result } = renderHookWithProviders(() => useChatMessages('ws-test', 'thread-q-seq'));
     act(() => {
@@ -618,7 +622,7 @@ describe('useChatMessages – queued send during compaction', () => {
     });
     expect(result.current.activeTurnModel).toBeNull();
 
-    // Compaction ends -> queued message starts with High (seq 1), NOT any newer Low the user picked meanwhile.
+    // Compaction ends -> queued message starts with High (seq 1), admitted:false before server confirms.
     await act(async () => {
       result.current.setIsCompacting(false);
     });
@@ -626,10 +630,54 @@ describe('useChatMessages – queued send during compaction', () => {
     expect(result.current.activeTurnModel).toEqual({
       model: 'gemini-4-neon-high-oauth',
       pickSeq: 1,
+      admitted: false,
     });
     expect((mockSendStream.mock.calls[0][3] as { llmModel?: string | null }).llmModel).toBe('gemini-4-neon-high-oauth');
 
+    // Server sends metadata confirming run started -> admitted flips true.
+    act(() => {
+      emitFlushed({ event: 'metadata', thread_id: 'thread-q-seq', run_id: 'run-q-1' });
+    });
+    await waitFor(() => expect(result.current.activeTurnModel).toEqual({
+      model: 'gemini-4-neon-high-oauth',
+      pickSeq: 1,
+      admitted: true,
+    }));
+
     flushedHang.resolve({ disconnected: false });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(result.current.activeTurnModel).toBeNull();
+  });
+
+  // DALTON-HOOK(antigravity-series): Round 2 Item 1 — a send refused before run admission (e.g. 402 budget check) never marks activeTurnModel admitted
+  it('keeps activeTurnModel unadmitted when a send is refused before starting a turn in Dalton builds', async () => {
+    brandMock.isDaltonBuild = true;
+    const budgetError = Object.assign(new Error('Insufficient credits'), { status: 402 });
+    const pendingRefusal = deferred<never>();
+    mockSendStream.mockImplementationOnce(async () => pendingRefusal.promise);
+
+    const { result } = renderHookWithProviders(() => useChatMessages('ws-test', 'thread-refuse-1'));
+    let sendPromise!: Promise<boolean>;
+    act(() => {
+      sendPromise = result.current.handleSendMessage('check budget', null, null, {
+        model: 'gemini-4-neon-high-oauth',
+        modelPickSeq: 7,
+      });
+    });
+    await waitFor(() => expect(result.current.isLoading).toBe(true));
+    expect(result.current.activeTurnModel).toEqual({
+      model: 'gemini-4-neon-high-oauth',
+      pickSeq: 7,
+      admitted: false,
+    });
+
+    await act(async () => {
+      pendingRefusal.promise.catch(() => {});
+      // Reject with 402 before any metadata frame.
+      mockSendStream.mockRejectedValueOnce(budgetError);
+      (pendingRefusal as unknown as { resolve: (v: unknown) => void }).resolve(Promise.reject(budgetError));
+      expect(await sendPromise).toBe(false);
+    });
     await waitFor(() => expect(result.current.isLoading).toBe(false));
     expect(result.current.activeTurnModel).toBeNull();
   });

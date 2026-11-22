@@ -110,6 +110,7 @@ vi.mock('@/hooks/useSharedWorkspaces', () => ({
   },
 }));
 
+// DALTON-HOOK(antigravity-series): mock getFeatures and useUser for Dalton permission-resolution tests
 vi.mock('@/api/features', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/api/features')>();
   return {
@@ -2021,22 +2022,25 @@ describe('useThreadModel', () => {
       expect(shared.result.current.model).toBe('gemini-4-neon-low-oauth');
       shared.unmount();
 
-      // DALTON-HOOK(antigravity-series): personal thread — saved Low must also survive a queued High turn finishing with row High
+      // DALTON-HOOK(antigravity-series): Round 2 Item 3 — personal thread: saved Low survives queued High turn, re-PATCHes Low to the row, and never jumps back to High when sending the next message with Low
       mocks.sharedEntry = null;
       mocks.updateThread
         .mockResolvedValueOnce(row('gemini-4-neon-high-oauth'))
+        .mockResolvedValueOnce(row('gemini-4-neon-low-oauth'))
         .mockResolvedValueOnce(row('gemini-4-neon-low-oauth'));
       const personal = setup({ workspaceId: 'ws-personal' }, row('gemini-4-neon-medium-oauth'));
       await act(async () => { await personal.result.current.pickModel('gemini-4-neon-high-oauth'); });
       const personalHighSeq = personal.result.current.sendModelSeq;
       await act(async () => { await personal.result.current.pickModel('gemini-4-neon-low-oauth'); });
+      const personalLowSeq = personal.result.current.sendModelSeq;
       expect(personal.result.current.sendModel).toBe('gemini-4-neon-low-oauth');
 
+      // Queued message 1 starts and is admitted with High -> server row moves to High.
       personal.rerender({
         threadId: THREAD,
         isLoading: true,
         workspaceId: 'ws-personal',
-        activeTurnModel: { model: 'gemini-4-neon-high-oauth', pickSeq: personalHighSeq },
+        activeTurnModel: { model: 'gemini-4-neon-high-oauth', pickSeq: personalHighSeq, admitted: true },
       });
       const personalReread = deferred<Thread>();
       mocks.getThread.mockReturnValueOnce(personalReread.promise);
@@ -2050,8 +2054,123 @@ describe('useThreadModel', () => {
         personalReread.resolve(row('gemini-4-neon-high-oauth'));
         await personalReread.promise;
       });
+      // turnEndCheck re-persists Low onto the personal thread row and keeps UI & sendModel on Low.
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledTimes(3));
+      expect(mocks.updateThread).toHaveBeenLastCalledWith(THREAD, { llm_model: 'gemini-4-neon-low-oauth' });
       expect(personal.result.current.model).toBe('gemini-4-neon-low-oauth');
       expect(personal.result.current.sendModel).toBe('gemini-4-neon-low-oauth');
+
+      // Now simulate user sending message 2 with Low even if cached row temporarily still reads High:
+      // starting message 2 (unadmitted, then refused before admission) must NEVER jump back to High!
+      act(() => {
+        personal.queryClient.setQueryData(queryKeys.threads.detail(THREAD), row('gemini-4-neon-high-oauth'));
+      });
+      personal.rerender({
+        threadId: THREAD,
+        isLoading: true,
+        workspaceId: 'ws-personal',
+        activeTurnModel: { model: 'gemini-4-neon-low-oauth', pickSeq: personalLowSeq, admitted: false },
+      });
+      expect(personal.result.current.model).toBe('gemini-4-neon-low-oauth');
+      expect(personal.result.current.sendModel).toBe('gemini-4-neon-low-oauth');
+
+      // Message 2 is admitted with Low and finishes -> UI stays Low and sendModel clears.
+      personal.rerender({
+        threadId: THREAD,
+        isLoading: true,
+        workspaceId: 'ws-personal',
+        activeTurnModel: { model: 'gemini-4-neon-low-oauth', pickSeq: personalLowSeq, admitted: true },
+      });
+      const lowTurnReread = deferred<Thread>();
+      mocks.getThread.mockReturnValueOnce(lowTurnReread.promise);
+      personal.rerender({
+        threadId: THREAD,
+        isLoading: false,
+        workspaceId: 'ws-personal',
+        activeTurnModel: null,
+      });
+      await act(async () => {
+        lowTurnReread.resolve(row('gemini-4-neon-low-oauth'));
+        await lowTurnReread.promise;
+      });
+      await waitFor(() => expect(personal.result.current.sendModel).toBeNull());
+      expect(personal.result.current.model).toBe('gemini-4-neon-low-oauth');
+    });
+
+    // DALTON-HOOK(antigravity-series): Round 2 Item 1 — a send refused before server run admission (e.g. 402 budget check) must NOT clear a shared thread manual pick
+    it('keeps a shared thread model pick unsent when a send is refused before server admission, clearing it only after a later admitted turn', async () => {
+      mocks.seriesCatalog = NEON_CATALOG;
+      mocks.rawMetadata = NEON_RAW_META;
+      mocks.catalogModelNames = new Set([
+        'model-default',
+        'gemini-4-neon-low-oauth',
+        'gemini-4-neon-medium-oauth',
+        'gemini-4-neon-high-oauth',
+      ]);
+      mocks.sharedEntry = { workspace: { workspace_id: 'ws-shared' } };
+
+      const { result, rerender } = setup(
+        { workspaceId: 'ws-shared' },
+        row('gemini-4-neon-medium-oauth'),
+      );
+
+      act(() => { void result.current.pickModel('gemini-4-neon-high-oauth'); });
+      const highSeq = result.current.sendModelSeq;
+      expect(result.current.model).toBe('gemini-4-neon-high-oauth');
+      expect(result.current.sendModel).toBe('gemini-4-neon-high-oauth');
+
+      // Send starts (admitted: false) and is refused before server starts a run (e.g. budget 402).
+      rerender({
+        threadId: THREAD,
+        isLoading: true,
+        workspaceId: 'ws-shared',
+        activeTurnModel: { model: 'gemini-4-neon-high-oauth', pickSeq: highSeq, admitted: false },
+      });
+      const refusedReread = deferred<Thread>();
+      mocks.getThread.mockReturnValueOnce(refusedReread.promise);
+      rerender({
+        threadId: THREAD,
+        isLoading: false,
+        workspaceId: 'ws-shared',
+        activeTurnModel: null,
+      });
+      await act(async () => {
+        refusedReread.resolve(row('gemini-4-neon-medium-oauth'));
+        await refusedReread.promise;
+      });
+
+      // High MUST remain selected & queued for the user's resend (not reverted to server Medium).
+      expect(result.current.model).toBe('gemini-4-neon-high-oauth');
+      expect(result.current.sendModel).toBe('gemini-4-neon-high-oauth');
+      expect(result.current.sendModelSeq).toBe(highSeq);
+
+      // User resends the restored draft; this time server admits the run (admitted: true).
+      rerender({
+        threadId: THREAD,
+        isLoading: true,
+        workspaceId: 'ws-shared',
+        activeTurnModel: { model: 'gemini-4-neon-high-oauth', pickSeq: highSeq, admitted: false },
+      });
+      rerender({
+        threadId: THREAD,
+        isLoading: true,
+        workspaceId: 'ws-shared',
+        activeTurnModel: { model: 'gemini-4-neon-high-oauth', pickSeq: highSeq, admitted: true },
+      });
+      const admittedReread = deferred<Thread>();
+      mocks.getThread.mockReturnValueOnce(admittedReread.promise);
+      rerender({
+        threadId: THREAD,
+        isLoading: false,
+        workspaceId: 'ws-shared',
+        activeTurnModel: null,
+      });
+      await act(async () => {
+        admittedReread.resolve(row('gemini-4-neon-high-oauth'));
+        await admittedReread.promise;
+      });
+      await waitFor(() => expect(result.current.sendModel).toBeNull());
+      expect(result.current.model).toBe('gemini-4-neon-high-oauth');
     });
 
     // DALTON-HOOK(antigravity-series): Item 5 — if the first turn-end detail read fails and a later read returns another tab's Low, the already-sent High must unpin and follow Low

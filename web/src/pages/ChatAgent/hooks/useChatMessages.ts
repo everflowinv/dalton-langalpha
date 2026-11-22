@@ -243,8 +243,8 @@ export function useChatMessages(
     return workspaceId ? getStoredThreadId(workspaceId) : '__default__';
   });
   const [isLoading, setIsLoading] = useState(false);
-  // DALTON-HOOK(antigravity-series): track the exact model & pick sequence carried by the active turn so queued sends never clear a newer unsent pick
-  const [activeTurnModel, setActiveTurnModel] = useState<{ model: string | null; pickSeq: number | null } | null>(null);
+  // DALTON-HOOK(antigravity-series): track the exact model, pick sequence, and server admission status of the active turn so refused sends never clear a pick and queued sends never clear a newer unsent pick
+  const [activeTurnModel, setActiveTurnModel] = useState<{ model: string | null; pickSeq: number | null; admitted: boolean } | null>(null);
   useEffect(() => {
     if (!isLoading) setActiveTurnModel(null);
   }, [isLoading]);
@@ -3078,9 +3078,15 @@ export function useChatMessages(
       });
     }
 
-    // DALTON-HOOK(antigravity-series): record the exact model & pick sequence starting this turn
+    // DALTON-HOOK(antigravity-series): record the exact model & pick sequence starting this turn (admitted flips true only once the server confirms the run started)
+    const confirmActiveTurnModel = () => {
+      if (!isDaltonBuild) return;
+      setActiveTurnModel((prev) => (
+        prev && !prev.admitted ? { ...prev, admitted: true } : prev
+      ));
+    };
     if (isDaltonBuild) {
-      setActiveTurnModel({ model: model || null, pickSeq: modelPickSeq ?? null });
+      setActiveTurnModel({ model: model || null, pickSeq: modelPickSeq ?? null, admitted: false });
     }
     setIsLoading(true);
     setMessageError(null);
@@ -3198,6 +3204,8 @@ export function useChatMessages(
             || ((event.event === 'error' || event.event === 'retry') && event.recovery && typeof event.run_id === 'string'))
         ) {
           notifyAccepted();
+          // DALTON-HOOK(antigravity-series): mark this turn's model pick as consumed only once the server confirms this request started a run (not when merged as a steer into another run)
+          if (event.event !== 'steering_accepted') confirmActiveTurnModel();
         }
         // Only a run of this send's own spends what the hint said, and its
         // closing frame says what the next send summarizes. A send refused or
@@ -3345,13 +3353,14 @@ export function useChatMessages(
           // 409 duplicate_request: an earlier copy of this send was already
           // accepted (its response was lost) — adopt that run instead of
           // erroring; the reconnect owns finalization from here.
-          if (
-            retryFailedDuplicate(err, assistantMessageId, sendRequest(message, additionalContext, { subagentsAllowed, keepFullContext, artifactComments: commentSend, chartViews }), { model, reasoningEffort, fastMode }, requestKey)
-            || adoptDuplicateRun(err, assistantMessageId, requestKey)
-          ) {
+          // DALTON-HOOK(antigravity-series): forward modelPickSeq on duplicate-request retry and confirm admission when adopting an already-started run (preserving retryFailedDuplicate short-circuit order)
+          const retriedDuplicate = retryFailedDuplicate(err, assistantMessageId, sendRequest(message, additionalContext, { subagentsAllowed, keepFullContext, artifactComments: commentSend, chartViews }), { model, ...(isDaltonBuild ? { modelPickSeq } : {}), reasoningEffort, fastMode }, requestKey);
+          const adoptedDuplicate = !retriedDuplicate && adoptDuplicateRun(err, assistantMessageId, requestKey);
+          if (retriedDuplicate || adoptedDuplicate) {
             wasDisconnected = true;
             // DALTON-HOOK(composer-drafts): the adopted duplicate was already accepted server-side
             notifyAccepted();
+            if (adoptedDuplicate) confirmActiveTurnModel();
             return true;
           }
           admission.unadmit();
@@ -3554,14 +3563,6 @@ export function useChatMessages(
     setMessages((prev) => appendMessage(prev, assistantMessage));
     currentMessageRef.current = assistantMessageId;
 
-    // An answer runs what the composer shows now: the model, effort and speed
-    // are the thread's own picks, which may have changed since the send that
-    // asked. With no composer mounted, the last send's.
-    const resumeOpts: ModelOptions = readComposerOptions?.() ?? lastModelOptionsRef.current;
-    // DALTON-HOOK(antigravity-series): record the exact model & pick sequence starting this resumed turn
-    if (isDaltonBuild) {
-      setActiveTurnModel({ model: resumeOpts.model || null, pickSeq: resumeOpts.modelPickSeq ?? null });
-    }
     setIsLoading(true);
     setMessageError(null);
     // New-run boundary like send/edit/regenerate: a pre-interrupt fallback
@@ -3593,8 +3594,15 @@ export function useChatMessages(
       `hitl|${threadId}|${JSON.stringify(hitlResponse)}`,
     );
     let wasDisconnected = false;
-    // DALTON-HOOK(antigravity-series): reuse resumeOpts read before setIsLoading(true) for activeTurnModel tracking
+    // An answer runs what the composer shows now: the model, effort and speed
+    // are the thread's own picks, which may have changed since the send that
+    // asked. With no composer mounted, the last send's.
+    const resumeOpts: ModelOptions = readComposerOptions?.() ?? lastModelOptionsRef.current;
     const { model, reasoningEffort, fastMode } = resumeOpts;
+    // DALTON-HOOK(antigravity-series): record the resumed turn's model & pick sequence in Dalton builds, confirming only once onRunIdResolved proves admission
+    if (isDaltonBuild) {
+      setActiveTurnModel({ model: model || null, pickSeq: resumeOpts.modelPickSeq ?? null, admitted: false });
+    }
     try {
       const result = await sendHitlResponse(hitlResponse, workspaceId, threadId, {
         onEvent: processEvent,
@@ -3613,6 +3621,9 @@ export function useChatMessages(
           // rather than left to the `finally` because this is the first moment
           // "Resumed" is true, and the wait is visible on the card.
           admitted = true;
+          if (isDaltonBuild) {
+            setActiveTurnModel((prev) => (prev && !prev.admitted ? { ...prev, admitted: true } : prev));
+          }
           settleResume(true);
         },
         signal: abortController.signal,
@@ -3849,9 +3860,15 @@ export function useChatMessages(
     // Edit/regenerate/retry are chat activity — bump like a fresh send.
     bumpThreadNavOrder(workspaceId, threadIdRef.current);
 
-    // DALTON-HOOK(antigravity-series): record the exact model & pick sequence starting this checkpoint/fork/retry turn
+    // DALTON-HOOK(antigravity-series): record the exact model & pick sequence starting this checkpoint/fork/retry turn (admitted flips true once the server confirms run start)
+    const confirmCheckpointTurnModel = () => {
+      if (!isDaltonBuild) return;
+      setActiveTurnModel((prev) => (
+        prev && !prev.admitted ? { ...prev, admitted: true } : prev
+      ));
+    };
     if (isDaltonBuild) {
-      setActiveTurnModel({ model: modelOptions.model || null, pickSeq: modelOptions.modelPickSeq ?? null });
+      setActiveTurnModel({ model: modelOptions.model || null, pickSeq: modelOptions.modelPickSeq ?? null, admitted: false });
     }
     setIsLoading(true);
     setMessageError(null);
@@ -4042,6 +4059,8 @@ export function useChatMessages(
             || ((event.event === 'error' || event.event === 'retry') && event.recovery && typeof event.run_id === 'string'))
         ) {
           relayAccepted();
+          // DALTON-HOOK(antigravity-series): mark checkpoint/fork/retry turn pick as consumed once the server starts its run
+          if (event.event !== 'steering_accepted') confirmCheckpointTurnModel();
         }
         // As for a send: the hint goes once the run this request starts does.
         if (event.event === 'metadata' && !isSubagentEvent(event)) spendNextSummary();
@@ -4154,11 +4173,15 @@ export function useChatMessages(
       // accepted (its response was lost) — adopt that run instead of erroring.
       // Another attempt adopting a run asks again if that run goes without a word.
       const askAgain = rerun && ((bubbleId: string) => (settleRetry(DROPPED_BEFORE_RUN, bubbleId, rerun.spent, modelOptions, request, requestKey, forkCut, plainSend ? admission?.unstarted() ?? null : null) ? 'resending' as const : 'failed' as const));
-      if (retryFailedDuplicate(err, assistantMessageId, request, modelOptions, requestKey, rerun?.spent ?? 0) || adoptDuplicateRun(err, assistantMessageId, requestKey, askAgain || undefined)) {
+      // DALTON-HOOK(antigravity-series): confirm checkpoint turn admission when adopting an already-started duplicate run (preserving retryFailedDuplicate short-circuit order)
+      const retriedCheckpointDuplicate = retryFailedDuplicate(err, assistantMessageId, request, modelOptions, requestKey, rerun?.spent ?? 0);
+      const adoptedCheckpointDuplicate = !retriedCheckpointDuplicate && adoptDuplicateRun(err, assistantMessageId, requestKey, askAgain || undefined);
+      if (retriedCheckpointDuplicate || adoptedCheckpointDuplicate) {
         wasDisconnected = true;
         // DALTON-HOOK(composer-drafts): the adopted duplicate is the server
         // holding the resent copy — the original send's draft settles sent.
         relayAccepted();
+        if (adoptedCheckpointDuplicate) confirmCheckpointTurnModel();
         return;
       }
       if (recoverRefusedFork(err)) return;
@@ -4338,14 +4361,14 @@ export function useChatMessages(
     }
 
     // Immediate visual feedback: truncate, show edited message + loading placeholder.
-    // DALTON-HOOK(antigravity-series): record the exact model & pick sequence starting this edit turn
-    if (isDaltonBuild) {
-      setActiveTurnModel({ model: modelOptions.model || null, pickSeq: modelOptions.modelPickSeq ?? null });
-    }
-    setIsLoading(true);
-    setMessageError(null);
-    setFallbackSuggestion(null);
-    const edited = createUserMessage(newContent, turnIndex);
+      // DALTON-HOOK(antigravity-series): record the exact model & pick sequence starting this edit turn (admitted flips true in streamFromCheckpoint once run starts)
+      if (isDaltonBuild) {
+        setActiveTurnModel({ model: modelOptions.model || null, pickSeq: modelOptions.modelPickSeq ?? null, admitted: false });
+      }
+      setIsLoading(true);
+      setMessageError(null);
+      setFallbackSuggestion(null);
+      const edited = createUserMessage(newContent, turnIndex);
     // DALTON-HOOK(fork-message-identifiers): each fork owns a distinct reply bubble.
     const assistantId = `assistant-${randomUUID()}`;
     setMessages((prev) => [
@@ -4408,9 +4431,9 @@ export function useChatMessages(
 
     // Immediate visual feedback: truncate at the assistant message, show loading placeholder.
     const cut: ForkCut = { kind: 'regenerate', transcript, draft: null };
-    // DALTON-HOOK(antigravity-series): record the exact model & pick sequence starting this regenerate turn
+    // DALTON-HOOK(antigravity-series): record the exact model & pick sequence starting this regenerate turn (admitted flips true in streamFromCheckpoint once run starts)
     if (isDaltonBuild) {
-      setActiveTurnModel({ model: modelOptions.model || null, pickSeq: modelOptions.modelPickSeq ?? null });
+      setActiveTurnModel({ model: modelOptions.model || null, pickSeq: modelOptions.modelPickSeq ?? null, admitted: false });
     }
     setIsLoading(true);
     setMessageError(null);
