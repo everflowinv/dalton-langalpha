@@ -599,7 +599,8 @@ def summarize_execution_delivery(
                 "awaiting_receipt": False,
                 "error_code": eff_code,
                 "error_message": reason_zh,
-                "attempt_count": _safe_int(raw.get("attempt_count"), 1 if target_status != "retrying" else 0),
+                # A delivery_result row exists only after at least one finish attempt.
+                "attempt_count": _safe_int(raw.get("attempt_count"), 1),
                 "max_attempts": bounded_max,
             }
         )
@@ -1048,7 +1049,7 @@ def format_execution_delivery_note(
             for item in raw_targets
             if isinstance(item, Mapping)
             and str(item.get("status") or "").strip().lower() == "failed"
-            and item.get("awaiting_receipt") is False
+            and not bool(item.get("awaiting_receipt"))
         ]
         if confirmed_failed:
             first_confirmed = confirmed_failed[0]
@@ -1100,9 +1101,12 @@ def format_execution_delivery_note(
             if isinstance(item, Mapping)
             and str(item.get("status") or "").strip().lower() == "retrying"
         ]
+        # First send only while no target has been tried yet: every target is still
+        # retrying with an explicit attempt_count of 0 (a missing count is a retry).
+        mapped_targets = [item for item in raw_targets if isinstance(item, Mapping)]
         is_first_send = total_targets == 0 or (
-            bool(retrying_targets)
-            # A missing attempt_count (a gateway retry stored as `retrying`) is not a first send.
+            bool(mapped_targets)
+            and len(retrying_targets) == len(mapped_targets)
             and all(
                 item.get("attempt_count") is not None
                 and _safe_int(item.get("attempt_count"), 0) == 0

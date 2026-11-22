@@ -2410,3 +2410,23 @@ def test_gateway_retry_without_attempt_count_reads_as_retrying_not_first_send() 
     run = {"status": "completed", "delivery_summary": summary}
     assert eds.format_execution_delivery_note(run, lang="zh") == "任务已完成，系统正在重试投递"
     assert eds.format_execution_delivery_note(run, lang="en") == "finished · retrying delivery"
+
+
+def test_one_target_sent_and_one_pending_reads_as_retrying_not_first_send() -> None:
+    summary = {
+        "status": "retrying",
+        "total_targets": 2,
+        "targets": [
+            {"channel": "feishu", "status": "sent", "attempt_count": 1},
+            {"channel": "discord", "status": "retrying", "attempt_count": 0},
+        ],
+    }
+    run = {"status": "completed", "delivery_summary": summary}
+    assert eds.format_execution_delivery_note(run, lang="zh") == "任务已完成，系统正在重试投递"
+
+
+def test_delivery_target_model_keeps_awaiting_receipt() -> None:
+    from src.server.models.automation import ExecutionDeliveryTarget
+
+    target = ExecutionDeliveryTarget(status="failed", awaiting_receipt=True)
+    assert target.model_dump()["awaiting_receipt"] is True
