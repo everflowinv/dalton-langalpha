@@ -406,7 +406,7 @@ async def test_owner_enables_workspace_team_memory_mounts_all_three(
     # 3) System prompt includes the conditional tool_guide sentence and the data map card row
     prompt = PromptLoader().get_system_prompt(role="analyst")
     assert "团队记忆可用时（以本轮运行时说明为准）" in prompt
-    assert "先查团队历史（`conversation_search`）并说明观点变化" in prompt
+    assert "回答公司或主题问题前先用 `conversation_search` 核查团队既有观点、假设和决定，并说明观点变化" in prompt
     assert "归档统计：" in prompt
     assert "**1542**" in prompt
 
@@ -755,7 +755,7 @@ async def test_home_turn_follows_user_level_switch(
         )
     }
     assert tools_on == tools_off
-    assert "先查团队历史（`conversation_search`）并说明观点变化" in cos_prompt_static
+    assert "回答公司或主题问题前先用 `conversation_search` 核查团队既有观点、假设和决定，并说明观点变化" in cos_prompt_static
     assert "团队记忆可用时（以本轮运行时说明为准）" in cos_prompt_static
     assert "归档统计：" in cos_prompt_static
 

@@ -68,7 +68,7 @@ Only after the interview questions in Steps 2–4 are answered (or if the user e
 
 ## Structured Profile Schema (`.agents/user/profile/`)
 
-All field schemas and allowed enum values follow `.agents/user/profile/README.md` (validated server-side on save; invalid values return `NOT SAVED`). Save only information the user explicitly provided — never invent unasked keys (`investor_type`, `experience`, `help_with`, `familiar_instruments`, `tone`, …), and condense free-text fields (`risk_tolerance`, `analysis_focus`) from the user's own words. Set `onboarding_completed: true` in `user.json` only in Step 5.
+All field schemas and allowed enum values follow `.agents/user/profile/README.md` (validated server-side on save; invalid values return `NOT SAVED`). Save only information the user explicitly provided — never invent unasked keys (`investor_type`, `experience`, `help_with`, `familiar_instruments`, `tone`, …), and condense free-text fields (`risk_tolerance`, `analysis_focus`) from the user's own words. If the user only provides a holding ticker or portfolio weight without a share count, write `quantity: 0` in `portfolio.json` and record the weight details in `notes`. Set `onboarding_completed: true` in `user.json` only in Step 5.
 
 Minimal `preference.json` example (include only keys answered):
 

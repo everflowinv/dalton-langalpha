@@ -41,9 +41,9 @@ In a chat the user sees what you send, not your updates between tool calls.
 | Math | Not rendered | Not rendered | As written |
 | One message holds | About 28 KB a card (some 9,000 Chinese characters), then it is split; tables split it sooner | 2,000 characters, then it is split | Prefer concise text messages |
 | Files | Images (PNG, JPEG, GIF, WebP, BMP, TIFF) up to 10 MB show as images; other files go as files, up to 20 MB | 10 together, 20 MB each or the server's lower limit | Supported as attachments via direct message |
-| `reply: true` | No effect | Works in server channels | Direct messages only |
+| `reply: true` | No effect | Works in server channels | No effect (ordinary direct messages only; no quoted reply) |
 
 - **Feishu**: each message is a card. An image written in Markdown with a public web address shows as a picture in it.
 - **Discord**: underline is `__text__` and a spoiler is `||text||`. Mentions you write don't notify anyone.
-- **Personal WeChat**: direct messages only (`weixin:@me`); group chats are not supported.
+- **Personal WeChat**: ordinary direct messages only (`weixin:@me`); group chats are not supported, and `reply: true` does not produce a quoted reply.
 - **Every app**: a workspace path written as a link does not open in a chat. Attach the file.

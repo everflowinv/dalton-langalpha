@@ -199,15 +199,22 @@ def test_several_brokerages_read_as_one_list_in_the_block_and_in_a_row():
     assert line in snapshot.fields()["Trading permission"]
 
 
+# DALTON-HOOK(prompt-audit-text): current Dalton build hides Trading settings; assert unavailable-entry wording
 @pytest.mark.parametrize("level", list(TradingPermission))
 def test_every_level_links_where_the_user_changes_it(level):
-    # The agent hands this to the user, often outside the app, so it is the
-    # absolute address rather than the path the web app links with.
+    # Current Dalton build hides the Trading settings section, so the prompt must
+    # state that no trading-permission settings entry is provided rather than
+    # pointing to a non-existent settings page.
     profile = _profile(_resolved(moomoo=_plan("moomoo", level)))
-    place = f"Settings > Preferences > Trading permission ({TRADING_SETTINGS_URL})"
-    assert TRADING_SETTINGS_URL.endswith("/settings?tab=preferences#trading-permission")
-    assert place in _section(profile)
-    assert place in ProfileSnapshot(user_profile=profile).fields()["Trading permission"]
+    unavailable_note = "this build does not provide a trading-permission settings page（当前版本不提供交易权限设置入口）"
+    section = _section(profile)
+    snapshot_field = ProfileSnapshot(user_profile=profile).fields()["Trading permission"]
+    assert unavailable_note in section
+    assert unavailable_note in snapshot_field
+    assert "Settings > Preferences > Trading permission" not in section
+    assert "Settings > Trading > Trading permission" not in section
+    assert TRADING_SETTINGS_URL not in section
+    assert TRADING_SETTINGS_URL not in snapshot_field
 
 
 # ---------------------------------------------------------------------------

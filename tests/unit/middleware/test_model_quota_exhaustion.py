@@ -2475,10 +2475,14 @@ async def test_cooldown_extension_syncs_refusal_until_across_redis_and_local(
     assert store[expected_key]["expires_at"] == pytest.approx(exp_30m.timestamp())
     assert store[expected_key]["refusal"]["until"] == exp_30m.isoformat()
 
+    exp_30m_hkt = (
+        exp_30m.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M") + " HKT"
+    )
     pre_msg_1 = await check_oauth_quota_cooldown(client_a)
-    assert pre_msg_1 is not None
-    assert "gemini-4-neon-high-oauth 的订阅额度已用完" in pre_msg_1
-    assert "同一 Antigravity 账户下，该厂商的模型共用冷却；请选择其他厂商的可用模型，或等恢复后再试" in pre_msg_1
+    assert pre_msg_1 == (
+        f"gemini-4-neon-high-oauth 的订阅额度已用完，预计 {exp_30m_hkt} 恢复；"
+        "同一 Antigravity 账户下，该厂商的模型共用冷却；请选择其他厂商的可用模型，或等恢复后再试"
+    )
 
     scope_key = mw_local_1._quota_scope_key("gemini-4-neon-high-oauth", client_a)
     local_exc_1, _ = mw_local_1._build_benched_refusal(
@@ -2527,10 +2531,14 @@ async def test_cooldown_extension_syncs_refusal_until_across_redis_and_local(
     assert store[expected_key]["expires_at"] == pytest.approx(exp_2h.timestamp())
     assert store[expected_key]["refusal"]["until"] == exp_2h.isoformat()
 
+    exp_2h_hkt = (
+        exp_2h.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M") + " HKT"
+    )
     pre_msg_2 = await check_oauth_quota_cooldown(client_a)
-    assert pre_msg_2 is not None
-    assert "gemini-4-neon-high-oauth 的订阅额度已用完" in pre_msg_2
-    assert "同一 Antigravity 账户下，该厂商的模型共用冷却；请选择其他厂商的可用模型，或等恢复后再试" in pre_msg_2
+    assert pre_msg_2 == (
+        f"gemini-4-neon-high-oauth 的订阅额度已用完，预计 {exp_2h_hkt} 恢复；"
+        "同一 Antigravity 账户下，该厂商的模型共用冷却；请选择其他厂商的可用模型，或等恢复后再试"
+    )
 
     local_exc_2, _ = mw_local_2._build_benched_refusal(
         "gemini-4-neon-high-oauth", mw_local_2._quota_exhausted[scope_key]

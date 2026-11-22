@@ -168,7 +168,7 @@ python3 .agents/skills/dalton-vip-news-alert/scripts/vip_news_alert.py \
 筛选规则：
 
 - wire 和 `x_search` 只保留 `start_iso` 到 `end_iso` 之间的条目，两端都包含。刚好 24 小时前的留下，再早一秒的丢掉。没有时间、时间无法解析的丢掉。纯日期按 UTC 零点理解。没有时区的时钟时间按 UTC 理解。正文为空的 wire 推文，只要时间在窗口内，仍参加关键词归人。
-- 网页和视频：有可解析时间且落在窗口外的丢掉。没有可解析时间的保留，并标 `time_unverified: true`。`WebSearch` 的 `start_date` 和 `end_date` 仅向搜索服务提示优先日期，不是硬过滤；对 `time_unverified` 的条目，报告纳入前须在取字幕或读页面时核对原网页或视频的发布时间。能确认早于窗口的，不要写进卡片；无法核实时标记时间未确认，写进卡片时不要写成“今天发生”。
+- 网页和视频：有可解析时间且落在窗口外的丢掉。没有可解析时间的保留，并标 `time_unverified: true`。`WebSearch` 的 `start_date` 和 `end_date` 仅向搜索服务提示优先日期，不是硬过滤；所有拟纳入报告的网页和视频（无论是否标 `time_unverified`）都须在取字幕或读页面时核对原网页或视频的发布时间。能确认早于窗口的，不要写进卡片；无法核实时标记时间未确认，写进卡片时不要写成“今天发生”。
 - 去重顺序是 wire、视频、网页、`x_search`。先出现的留下。同一 status id、同一规范 URL、或同一标题哈希只留一条。X 和 YouTube 链接会先收成规范形式。网页结果里的 youtube.com 和 youtu.be 链接归入该人物的视频组，标题保留，随后走取字幕流程。
 - `state/vip-news-alert/seen.json` 里未过期的 URL 哈希和标题哈希也会丢掉。超过 7 天的记录不挡新条目。这一步只读不写。
 - wire 用关键词归人，名单顺序先命中先归入。一条同时含多个人物关键词时，只出现在更靠前的那一位下面。匹配用正文前 500 个字符。网页留在检索的那位人物下。视频留在检索的那位人物下。这两类都不因为缺少关键词被丢掉。
@@ -188,7 +188,7 @@ WebFetch(url=VIDEO_URL, prompt=FETCH_PROMPT)
 
 抽取器把字幕放在页面 markdown 的 Transcript 章节。`WebFetch` 返回的是按 prompt 抽出的文本，没有单独的字幕字段。返回 `NO_TRANSCRIPT`，或正文写明 No transcript available，或没有字幕正文时，这条视频没有 transcript，照常继续，不要编字幕。
 
-带 `time_unverified` 的网页和视频，报告纳入前须在取字幕或读页面时核对原网页或视频的发布时间（`WebSearch` 的 `start_date` 和 `end_date` 仅提示优先日期，不是硬过滤）。能确认早于窗口的，不要写进卡片；无法核实时标记时间未确认，写进卡片时不要写成“今天发生”。
+所有拟纳入报告的网页和视频（不只限带 `time_unverified` 的条目）都须在取字幕或读页面时核对原网页或视频的发布时间（`WebSearch` 的 `start_date` 和 `end_date` 仅提示优先日期，不是硬过滤）。能确认早于窗口的，不要写进卡片；无法核实时标记时间未确认，写进卡片时不要写成“今天发生”。
 
 然后对筛选结果做这些判断：
 
