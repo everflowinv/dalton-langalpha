@@ -11,8 +11,10 @@ collect.py — 每晚 thesis 增量包采集与状态提交脚本（PS.11）
        跨快照比较先按真实财报期间（period_end）对齐，期间滚动/缺期间信息不算修正，
        对齐结果见 deltas["period_alignment"] 并在 packet.md 披露
      - 检索未在 seen.json 中的六个内部来源（company-wiki, guidepoint, funda-ai, sales-notes, tmtb, alphaengine）与 SEC filing（前推2天）；
-       AlphaEngine 按"覆盖边界"窗口采集（窗口起点 = ae_covered_until，翻页达上限
-       未扫完时把 {window, cursor, query} 续采状态写进 packet 的 ae_state）
+       AlphaEngine 按包含式覆盖边界（ae_covered_until）采集：待扫起点为
+       covered_until + 1 天，待扫超 7 个自然日先跳至 until - 6 天；先用最多
+       MAX_CURSOR_PAGES - 1 次请求试整段（含 3 天回看），未扫完或上游总量超限
+       时按自然日从旧到新切分推进，跨轮只记日期边界，不跨轮保存 cursor
      - 写入 <workspace_dir>/research/tracker/<run_id>/packet.json 与 packet.md
      - 注意：collect 阶段绝不修改 seen.json
 
@@ -20,9 +22,8 @@ collect.py — 每晚 thesis 增量包采集与状态提交脚本（PS.11）
      - 读取 <workspace_dir>/research/tracker/<run_id>/packet.json
      - 将本轮所有新文档/公告/帖子 ID 并入 <workspace_dir>/research/tracker/seen.json
      - 更新 <workspace_dir>/research/tracker/last_run.json，含 AlphaEngine 状态：
-       ae_covered_until（已完整覆盖到的日期，只在窗口完整扫完时推进，与全局
-       until 解耦——没扫完的区间永远落在下一轮窗口里）与 ae_resume（未扫完时
-       的 {window, cursor, query} 续采状态；本轮未运行 AE 时原样保留上一份）
+       ae_covered_until（包含式已扫完日期边界，按整段或逐日推进，与全局 until 解耦；
+       本轮未运行或无进展时保留原边界；跨轮续采不再保存 cursor，ae_resume 固定为 null）
      - 追加一行记录到 <workspace_dir>/research/tracker/updates.log
 
   3. status --workspace-dir <DIR> [--ticker <TICKER>]
@@ -858,6 +859,14 @@ def build_guidepoint_query(meta: dict[str, Any]) -> str:
     return " ".join(parts) or ticker
 
 
+# 预算单位：MAX_CURSOR_PAGES 是采集脚本每轮向 bridge 发出的检索请求数上限；
+# 每次请求 limit 固定为 AE_PAGE_LIMIT（20）。一次 bridge 请求在 MCP 侧通常对应
+# 一页上游请求，去重过滤后可能多翻。
+MAX_CURSOR_PAGES = 5
+AE_PAGE_LIMIT = 20
+MAX_AE_BACKLOG_DAYS = 7
+
+
 def build_internal_route_request(
     route: str,
     meta: dict[str, Any],
@@ -900,7 +909,7 @@ def build_internal_route_request(
                 "query": str(meta.get("name") or meta.get("ticker") or ""),
                 "start": ae_start,
                 "end": until,
-                "limit": 20,
+                "limit": AE_PAGE_LIMIT,
                 "params": {"sort": "relevance"},
             },
         )
@@ -932,9 +941,6 @@ def build_sec_filing_request(ticker: str, form: str, limit: int = 5) -> tuple[st
             "limit": limit,
         },
     )
-
-
-MAX_CURSOR_PAGES = 5
 
 
 def _extract_route_page_info(data: Any) -> dict[str, Any]:
@@ -1248,42 +1254,223 @@ def _is_cursor_invalid_error(res: dict[str, Any], data: dict[str, Any]) -> bool:
     return "已失效或过期" in text or "保持与上一页完全相同的" in text
 
 
+def _coerce_iso_day(raw: Any) -> str | None:
+    """将日期值规范化为 YYYY-MM-DD；非法值返回 None。"""
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()[:10]
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(s).isoformat()
+    except ValueError:
+        return None
+
+
+def _day_shift(day_str: str, delta_days: int) -> str:
+    """对 YYYY-MM-DD 日期字符串增减天数。"""
+    return (date.fromisoformat(day_str) + timedelta(days=delta_days)).isoformat()
+
+
+def _migrate_ae_covered_until(
+    ae_covered_until: Any,
+    ae_resume: Any,
+) -> str | None:
+    """统一迁移覆盖边界（包含式：这一天及之前都已扫完）。
+
+    旧格式状态含 ``resume.window.since``（尚未扫过的包含式起点）时，先换算为
+    ``since - 1 天`` 再与现有 ``ae_covered_until`` 取较早者，旧 cursor 一律丢弃。"""
+    candidates: list[str] = []
+    cov = _coerce_iso_day(ae_covered_until)
+    if cov:
+        candidates.append(cov)
+    if isinstance(ae_resume, dict):
+        rwin = ae_resume.get("window")
+        if isinstance(rwin, dict):
+            rsince = _coerce_iso_day(rwin.get("since"))
+            if rsince:
+                candidates.append(_day_shift(rsince, -1))
+    return min(candidates) if candidates else None
+
+
+def _normalize_ae_boundary(
+    ae_covered_until: str | None,
+    ae_resume: dict[str, Any] | None,
+    fallback_inclusive_since: str,
+) -> str:
+    """解析 AlphaEngine 包含式覆盖边界 ``covered_until``。
+
+    ``ae_covered_until`` 与旧 ``ae_resume.window.since - 1 天`` 取较早者；
+    首次运行无上述状态时，将包含式起点 ``fallback_inclusive_since`` 换算为
+    ``since - 1 天``，使后续统一按 ``start = covered_until + 1 天`` 处理。"""
+    migrated = _migrate_ae_covered_until(ae_covered_until, ae_resume)
+    if migrated:
+        return migrated
+    since_day = _coerce_iso_day(fallback_inclusive_since)
+    if since_day:
+        return _day_shift(since_day, -1)
+    return str(fallback_inclusive_since)
+
+
+def _iter_ae_subwindows(start: str, until: str) -> list[tuple[str, str, int]]:
+    """生成按日扫描的子窗口列表 ``(sub_since, sub_until, lookback_days)``。
+
+    第一个子窗口为 ``[start - 3 天, start]``（把 3 天回看并进来，``lookback_days=3``），
+    之后每个子窗口为单个自然日 ``[d, d]``（``lookback_days=0``），从旧到新到 ``until``。"""
+    start_d = date.fromisoformat(start)
+    end_d = date.fromisoformat(until)
+    if start_d > end_d:
+        return []
+    span = (end_d - start_d).days
+    out: list[tuple[str, str, int]] = [(start, start, 3)]
+    for offset in range(1, span + 1):
+        d = (start_d + timedelta(days=offset)).isoformat()
+        out.append((d, d, 0))
+    return out
+
+
+def _extract_stale_or_cursor_unavailable(
+    res: dict[str, Any],
+    data: dict[str, Any],
+) -> str | None:
+    """检测 bridge 旧缓存兜底（``stale: true`` / ``cursor_unavailable``），返回原因串或 None。"""
+
+    def _visit(obj: Any) -> str | None:
+        if isinstance(obj, dict):
+            if obj.get("stale") is True:
+                return "stale"
+            cur_unavail = obj.get("cursor_unavailable")
+            if cur_unavail not in (None, False, ""):
+                return f"cursor_unavailable={cur_unavail}"
+            bc = obj.get("_bridge_cache")
+            if isinstance(bc, dict) and (
+                bc.get("stale") is True
+                or str(bc.get("status") or "").strip().lower() == "stale"
+            ):
+                return "stale"
+            sc = obj.get("structuredContent")
+            found = _visit(sc)
+            if found:
+                return found
+            inner = obj.get("data")
+            found = _visit(inner)
+            if found:
+                return found
+            content = obj.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                        try:
+                            parsed = json.loads(block["text"])
+                        except (ValueError, TypeError):
+                            continue
+                        found = _visit(parsed)
+                        if found:
+                            return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = _visit(item)
+                if found:
+                    return found
+        return None
+
+    return _visit(res) or _visit(data)
+
+
+def _ae_item_doc_id(item: dict[str, Any]) -> str | None:
+    raw = item.get("doc_id") or item.get("document_id") or item.get("id")
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    return s if s.startswith("alphaengine:") else f"alphaengine:{s}"
+
+
+_AE_STALE_KEY = "_ae_from_stale_cache"
+
+
+def _dedupe_ae_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按规范化 doc_id 去重 AlphaEngine 返回条目：位置取首次出现处，内容取最后一次正常取得的版本
+    （重扫或后续子窗口取得的条目更新，例如补齐了摘要）。过期缓存里的条目（带 ``_AE_STALE_KEY``）
+    只补充尚未取得的文档，不覆盖正常取得的版本。返回前去掉该标记。"""
+    deduped: list[dict[str, Any]] = []
+    index_by_id: dict[str, int] = {}
+    for item in items:
+        did = _ae_item_doc_id(item)
+        if did is None:
+            deduped.append(item)
+            continue
+        if did in index_by_id:
+            idx = index_by_id[did]
+            if item.get(_AE_STALE_KEY) and not deduped[idx].get(_AE_STALE_KEY):
+                continue
+            deduped[idx] = item
+            continue
+        index_by_id[did] = len(deduped)
+        deduped.append(item)
+    return [
+        {k: v for k, v in it.items() if k != _AE_STALE_KEY} if isinstance(it, dict) and _AE_STALE_KEY in it else it
+        for it in deduped
+    ]
+
+
 def _scan_alphaengine_pages(
     meta: dict[str, Any],
     since: str,
     until: str,
-    start_cursor: str | None = None,
+    *,
     budget: int = MAX_CURSOR_PAGES,
+    lookback_days: int = 3,
+    early_exit_total_limit: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """跑一轮 AlphaEngine 游标翻页，返回 (items, scan)。
+    """在同一轮内执行 AlphaEngine 游标翻页，返回 (items, scan)。
 
-    ``budget`` 是本段扫描的页数上限（调用方在"先续扫原窗口、再扫新窗口"的两段
-    式采集里分配总预算，全轮仍受 MAX_CURSOR_PAGES 约束）。``start_cursor``
-    只能与签发它的原窗口一起使用（调用方负责原样重放）。游标失效
-    （e_cursor_expired / e_cursor_filter_mismatch）时：预算尚有余量则丢弃
-    cursor 从窗口起点重扫（已取页作废）；预算已尽则保持未完成——已取页照常
-    入包、resume 无 cursor（下轮从窗口起点重扫）。seen 去重由调用方负责。
-    scan 含 ok/completed/incomplete/pages/has_more/cursor/status/error/
-    incomplete_reason/total_upstream/cursor_invalid_restart。"""
+    每个首页请求都带 ``params.fresh=True``：采集要的就是最新结果，而 bridge 的缓存
+    可能用更大 ``limit`` 截取出 ``has_more=true`` 却没有 cursor 的首页，使翻页无法继续。
+    本轮内任何一次游标失效都记入 ``scan["cursor_error"]``（与是否重扫无关）。
+
+    cursor 仅在本轮连续翻页内使用，不跨轮复用。``lookback_days=3`` 保留
+    ``build_internal_route_request`` 的 3 天回看；单日子窗口传 ``lookback_days=0``。
+    以 bridge 返回的 ``ok`` 为准：``ok: false`` 一律视为失败（不含同轮游标失效处理）；
+    真正的空结果应为 ``ok: true`` 加空列表。
+    同一轮翻页中若游标失效（e_cursor_expired / e_cursor_filter_mismatch）：
+    尚未重扫且预算有余则带 ``params.fresh=True`` 穿透 bridge 缓存从第 1 页重扫；
+    预算已尽或重扫后再次游标失效则保留已取结果、绝不写入 ``scan["error"]``，
+    仅把具体失效原因写进 ``incomplete_reason``；凡发生过游标失效重扫的窗口，
+    ``budget_exhausted`` 恒为 False（不视为因正常预算耗尽而越过）。
+    响应带 ``stale: true`` 或 ``cursor_unavailable`` 视为取数失败：保留已取条目入包，
+    不视为扫完。若指定 ``early_exit_total_limit`` 且首页 ``total_upstream`` 超出该上限
+    且仍有更多页，立即停止整段扫描并保留第 1 页结果。"""
     budget = max(0, min(int(budget), MAX_CURSOR_PAGES))
     base_tool_name, base_req_args = build_internal_route_request("alphaengine", meta, since, until)
+    if lookback_days != 3:
+        base_req_args["start"] = (date.fromisoformat(since) - timedelta(days=lookback_days)).isoformat()
     items: list[dict[str, Any]] = []
-    cursor: str | None = start_cursor
+    cursor: str | None = None
     pages_fetched = 0
     ok = True
     err_msg: str | None = None
     status_val: Any = "ok"
     incomplete = False
     incomplete_reason: str | None = None
-    last_has_more = start_cursor is not None
+    last_has_more = False
     total_upstream: Any = None
     cursor_invalid_restart = False
+    cursor_invalid_detail: str | None = None
+    cursor_error: str | None = None
+    stale_hit = False
+    stale_reason_val: str | None = None
+    early_exit = False
+    budget_exhausted = False
 
     while pages_fetched < budget:
         req_args = json.loads(json.dumps(base_req_args))
         sent_cursor = cursor
         if sent_cursor:
             req_args.setdefault("params", {})["cursor"] = sent_cursor
+        else:
+            req_args.setdefault("params", {})["fresh"] = True
         res = call_bridge_jsonrpc(base_tool_name, req_args)
         pages_fetched += 1
         data = res.get("data") if isinstance(res.get("data"), dict) else {}
@@ -1296,66 +1483,103 @@ def _scan_alphaengine_pages(
         if page_info.get("total_upstream") is not None:
             total_upstream = page_info.get("total_upstream")
 
-        if not page_ok and _is_bridge_no_match(res, data):
-            # 无匹配（或中间空页）视为上游已正常响应
-            page_ok = True
-            page_err = None
-            page_status = "empty" if not page_has_more else "ok"
-
         if not page_ok:
-            if sent_cursor and _is_cursor_invalid_error(res, data) and not cursor_invalid_restart:
-                if pages_fetched >= budget:
-                    # 预算已尽：本轮不再重扫——保持未完成，已取页照常入包，
-                    # cursor 丢弃（下轮从窗口起点重扫，seen 去重兜底）。
-                    ok = True
-                    err_msg = str(page_err or page_status or "unknown_error")
-                    status_val = "incomplete"
-                    incomplete = True
+            if sent_cursor and _is_cursor_invalid_error(res, data):
+                expiry_detail = str(page_err or page_status or "cursor_invalid")
+                cursor_error = expiry_detail
+                if not cursor_invalid_restart and pages_fetched < budget:
+                    # 尚未重扫且预算尚有余量：丢弃失效 cursor，带 fresh=True 从第 1 页重扫
+                    cursor_invalid_restart = True
+                    cursor_invalid_detail = expiry_detail
+                    # 已取条目保留（调用方按 doc_id 去重），边界仍按重扫结果决定
                     cursor = None
-                    incomplete_reason = (
-                        f"未完成: 第 {pages_fetched} 页游标失效（{err_msg}），"
-                        "本轮预算已尽，下轮从窗口起点重扫"
-                    )
-                    break
-                # 预算尚有余量：丢弃 cursor，从窗口起点重扫（本轮总预算不重置），
-                # 已取页作废，seen 去重兜底。
-                cursor_invalid_restart = True
-                items = []
-                cursor = None
-                last_has_more = False
+                    last_has_more = False
+                    ok = True
+                    err_msg = None
+                    status_val = "ok"
+                    incomplete = False
+                    incomplete_reason = None
+                    continue
+                # 末页游标失效，或重扫后再次游标失效：任何情况下都不写入 scan["error"]
                 ok = True
                 err_msg = None
-                status_val = "ok"
-                incomplete = False
-                incomplete_reason = None
-                continue
+                status_val = "incomplete"
+                incomplete = True
+                cursor = None
+                if cursor_invalid_restart:
+                    incomplete_reason = (
+                        f"游标失效重扫后第 {pages_fetched} 页再次游标失效（{expiry_detail}）"
+                    )
+                else:
+                    incomplete_reason = (
+                        f"第 {pages_fetched} 页游标失效（{expiry_detail}），翻页预算已用完"
+                    )
+                break
             ok = False
             err_msg = str(page_err or page_status or "unknown_error")
             status_val = page_status or "error"
-            if pages_fetched > 1 or last_has_more:
-                incomplete = True
-                incomplete_reason = f"未完成: 第 {pages_fetched} 页取数失败（{err_msg}）"
+            incomplete = True
+            incomplete_reason = f"未完成: 第 {pages_fetched} 页取数失败（{err_msg}）"
             break
 
+        stale_flag = _extract_stale_or_cursor_unavailable(res, data)
+        if stale_flag is not None:
+            page_items = [
+                {**it, _AE_STALE_KEY: True} if isinstance(it, dict) else it for it in page_items
+            ]
         items.extend(page_items)
-        status_val = page_status or "ok"
         last_has_more = page_has_more
         cursor = page_cursor
+
+        if stale_flag is not None:
+            ok = False
+            stale_hit = True
+            stale_reason_val = stale_flag
+            err_msg = f"返回过期缓存数据（{stale_flag}）"
+            status_val = "incomplete"
+            incomplete = True
+            incomplete_reason = (
+                f"未完成: 第 {pages_fetched} 页返回过期缓存数据（{stale_flag}），不推进覆盖边界"
+            )
+            break
+
+        status_val = page_status or "ok"
 
         if not page_has_more:
             break
 
         if not page_cursor:
             incomplete = True
-            incomplete_reason = "未完成: 上游返回 has_more=true 但缺少下一页 cursor"
+            incomplete_reason = "上游返回 has_more=true 但缺少下一页游标（cursor）"
+            status_val = "incomplete"
+            break
+
+        if (
+            early_exit_total_limit is not None
+            and isinstance(total_upstream, (int, float))
+            and total_upstream > early_exit_total_limit
+        ):
+            early_exit = True
+            incomplete = True
+            incomplete_reason = (
+                f"上游共 {int(total_upstream)} 条，单轮翻页预算内无法扫完"
+            )
             status_val = "incomplete"
             break
 
         if pages_fetched >= budget:
+            # 发生过游标失效重扫的窗口不算“因正常翻页预算用完而扫不完”
+            budget_exhausted = cursor_error is None
             incomplete = True
-            incomplete_reason = (
-                f"未完成: 已达本轮翻页预算（{budget} 页）但 has_more 仍为 true"
-            )
+            if cursor_invalid_restart:
+                incomplete_reason = (
+                    f"游标失效重扫（{cursor_invalid_detail}）后已用完翻页预算（{budget} 页），"
+                    "仍有下一页（has_more=true）"
+                )
+            else:
+                incomplete_reason = (
+                    f"已用完翻页预算（{budget} 页），仍有下一页（has_more=true）"
+                )
             status_val = "incomplete"
             break
 
@@ -1368,14 +1592,335 @@ def _scan_alphaengine_pages(
         "cursor": cursor,
         "status": "incomplete" if incomplete else status_val,
         "error": err_msg,
+        "stale": stale_hit,
+        "early_exit": early_exit,
+        "budget_exhausted": budget_exhausted,
     }
+    if stale_reason_val:
+        scan["stale_reason"] = stale_reason_val
     if cursor_invalid_restart:
         scan["cursor_invalid_restart"] = True
+    if cursor_error:
+        scan["cursor_error"] = cursor_error
     if total_upstream is not None:
         scan["total_upstream"] = total_upstream
     if incomplete_reason:
         scan["incomplete_reason"] = incomplete_reason
     return items, scan
+
+
+def _collect_alphaengine_window(
+    meta: dict[str, Any],
+    since: str,
+    until: str,
+    ae_covered_until: str | None = None,
+    ae_resume: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """按包含式覆盖边界与两步按日切分策略采集 AlphaEngine，返回 (items, ae_status_entry)。
+
+    1. 统一日期语义：``covered_until`` 表示“这一天及之前都已扫完”；本轮待扫起点
+       ``start = covered_until + 1 天``（首次运行的 ``since`` 与旧 ``resume.window.since``
+       先换算为 ``起点 - 1 天``）。
+    2. 积压上限 7 个自然日：若 ``start < until - 6 天``，跳至 ``until - 6 天``，
+       ``skipped_backlog = {since: 原 start, until: 新 start - 1 天}``，仅在本轮确有
+       进展（``ran=True``）时写入状态与 packet。
+    3. 已追平 ``until`` 的同日重跑（``covered_until >= until``）：只做整段回看
+       ``[until - 3, until]``（预算 ``MAX_CURSOR_PAGES - 1``，保留首页总数判断），
+       扫不完如实标未完成、边界不动。
+    4. 第一步整段扫描 ``[start - 3, until]`` 预算为 ``MAX_CURSOR_PAGES - 1``（4），
+       保证按日阶段至少留 1 次请求；若首页 ``total_upstream > MAX_CURSOR_PAGES * AE_PAGE_LIMIT``
+       立即转第二步。仅 1 个待扫日（``start == until``）时整段窗口即首子窗口，直接给满预算。
+    5. 第二步按日从旧到新扫描：首子窗口 ``[start - 3, start]``，后续 ``[d, d]``。
+       仅在因正常翻页预算用完（响应正常、非旧缓存、未发生游标失效重扫）且本轮尚未
+       推进过任何一天时越过该子窗口。"""
+    orig_covered = _normalize_ae_boundary(ae_covered_until, ae_resume, since)
+    is_same_day_rerun = orig_covered >= until
+    full_window_budget = max(1, MAX_CURSOR_PAGES - 1)
+
+    items: list[dict[str, Any]] = []
+    scans: list[tuple[tuple[str, str], dict[str, Any]]] = []
+    pages_total = 0
+
+    if is_same_day_rerun:
+        # 已追平 until 的同日重跑：只做回看扫描，预算 MAX_CURSOR_PAGES - 1 且保留首页总数判断
+        full_items, full_scan = _scan_alphaengine_pages(
+            meta,
+            until,
+            until,
+            budget=full_window_budget,
+            lookback_days=3,
+            early_exit_total_limit=MAX_CURSOR_PAGES * AE_PAGE_LIMIT,
+        )
+        items.extend(full_items)
+        pages_total += int(full_scan.get("pages") or 0)
+        scans.append(((until, until), full_scan))
+
+        items = _dedupe_ae_items(items)
+        ok = bool(full_scan["ok"])
+        incomplete = bool(full_scan["incomplete"])
+        err_msg = full_scan.get("error")
+        if ok and incomplete:
+            lookback_start = _day_shift(until, -3)
+            detail = str(full_scan.get("incomplete_reason") or f"已用完翻页预算（{full_window_budget} 页）")
+            incomplete_reason: str | None = (
+                f"未完成: 同日重跑的 3 天回看窗口 {lookback_start} 至 {until} 未扫完（{detail}），"
+                f"覆盖边界维持 {orig_covered}"
+            )
+        else:
+            incomplete_reason = full_scan.get("incomplete_reason") or (
+                f"未完成: 取数失败（{err_msg}）" if (not ok and err_msg) else None
+            )
+        same_day_cursor_error = full_scan.get("cursor_error")
+        if same_day_cursor_error:
+            note = f"游标失效（{same_day_cursor_error}）"
+            if incomplete_reason and note not in incomplete_reason:
+                incomplete_reason = f"{incomplete_reason}；本轮发生过{note}"
+            if err_msg and note not in err_msg:
+                err_msg = f"{err_msg}；本轮发生过{note}"
+
+        ran = bool(ok)
+        ae_state: dict[str, Any] = {
+            "ran": ran,
+            "covered_until": orig_covered,
+            "resume": None,
+        }
+        status_val = "incomplete" if incomplete else (full_scan.get("status") or "ok")
+        ae_status_entry: dict[str, Any] = {
+            "query": meta["name"],
+            "ok": ok,
+            "completed": bool(ok and not incomplete),
+            "incomplete": incomplete,
+            "pages": pages_total,
+            "has_more": bool(full_scan.get("has_more")),
+            "cursor": full_scan.get("cursor"),
+            "returned": len(items),
+            "status": status_val,
+            "error": err_msg,
+            "ae_state": ae_state,
+        }
+        if full_scan.get("cursor_invalid_restart"):
+            ae_status_entry["cursor_invalid_restart"] = True
+        if full_scan.get("total_upstream") is not None:
+            ae_status_entry["total_upstream"] = full_scan["total_upstream"]
+        if incomplete_reason:
+            ae_status_entry["incomplete_reason"] = incomplete_reason
+        return items, ae_status_entry
+
+    orig_start = _day_shift(orig_covered, 1)
+    min_allowed_start = _day_shift(until, -(MAX_AE_BACKLOG_DAYS - 1))
+    skipped_backlog: dict[str, str] | None = None
+    start = orig_start
+    if start < min_allowed_start:
+        start = min_allowed_start
+        skipped_backlog = {"since": orig_start, "until": _day_shift(start, -1)}
+    boundary = _day_shift(start, -1)
+
+    covered = boundary
+    partial_days: list[tuple[str, str]] = []
+    failed_day: tuple[str, str] | None = None
+    stopped_day: tuple[str, str] | None = None
+
+    # 第一步：整段扫描 [start - 3 天, until]。
+    # 待扫不止 1 天时预算为 MAX_CURSOR_PAGES - 1（4），确保按日阶段至少留 1 次请求，
+    # 即使上游缺 total_upstream 或偏低也能切分推进；若首页 total_upstream 超限立即转第二步。
+    # 待扫仅 1 天（start == until）时整段窗口即首子窗口 [start - 3, start]，直接给满预算。
+    step1_budget = full_window_budget if start < until else MAX_CURSOR_PAGES
+    early_limit = (MAX_CURSOR_PAGES * AE_PAGE_LIMIT) if start < until else None
+    full_items, full_scan = _scan_alphaengine_pages(
+        meta,
+        start,
+        until,
+        budget=step1_budget,
+        lookback_days=3,
+        early_exit_total_limit=early_limit,
+    )
+    items.extend(full_items)
+    pages_total += int(full_scan.get("pages") or 0)
+    scans.append(((start, until), full_scan))
+
+    if full_scan["completed"]:
+        covered = until
+    elif full_scan["ok"] and not full_scan["stale"]:
+        if start == until:
+            # 仅 1 个待扫日且整段窗口 [start - 3, start] 已用完全部预算、响应正常、非旧缓存、未游标重扫
+            if full_scan["budget_exhausted"]:
+                covered = start
+                detail = str(full_scan.get("incomplete_reason") or f"已用完翻页预算（{MAX_CURSOR_PAGES} 页）")
+                partial_days.append((start, detail))
+            else:
+                detail = str(full_scan.get("incomplete_reason") or "未用完翻页预算即停止")
+                stopped_day = (start, detail)
+        elif pages_total < MAX_CURSOR_PAGES:
+            # 第二步：按日扫描，从旧到新，用本轮剩余预算（至少 1 次）
+            for sub_since, sub_until, sub_lookback in _iter_ae_subwindows(start, until):
+                remaining = MAX_CURSOR_PAGES - pages_total
+                if remaining <= 0:
+                    break
+                d_items, d_scan = _scan_alphaengine_pages(
+                    meta,
+                    sub_since,
+                    sub_until,
+                    budget=remaining,
+                    lookback_days=sub_lookback,
+                )
+                items.extend(d_items)
+                pages_total += int(d_scan.get("pages") or 0)
+                scans.append(((sub_since, sub_until), d_scan))
+                if not d_scan["ok"] or d_scan["stale"]:
+                    failed_day = (
+                        sub_until,
+                        str(d_scan.get("error") or d_scan.get("incomplete_reason") or d_scan.get("status") or "unknown_error"),
+                    )
+                    break
+                if d_scan["completed"]:
+                    covered = max(covered, sub_until)
+                    continue
+                # 子窗口未扫完：
+                # 仅在确实因正常翻页预算用完（用掉全部剩余页数、响应正常、非旧缓存、未游标重扫）
+                # 且本轮尚未推进过任何一天时，才收下已取结果并把 covered_until 推进过该子窗口；
+                # 其他情况停在已推进边界留给下一轮。
+                # 本轮整段阶段发生过游标失效重扫时，剩余预算是被重扫吃掉的，不算正常用完。
+                round_had_restart = bool(full_scan.get("cursor_error"))
+                if d_scan["budget_exhausted"] and covered == boundary and not round_had_restart:
+                    covered = max(covered, sub_until)
+                    detail = str(d_scan.get("incomplete_reason") or f"已用完剩余翻页预算（{remaining} 页）")
+                    partial_days.append((sub_until, detail))
+                else:
+                    detail = str(d_scan.get("incomplete_reason") or f"单日 {sub_until} 未扫完")
+                    stopped_day = (sub_until, detail)
+                break
+
+    items = _dedupe_ae_items(items)
+    ok = all(bool(s.get("ok")) for _, s in scans)
+    err_msg = next((s.get("error") for _, s in reversed(scans) if s.get("error")), None)
+
+    # 仅在确实推进了至少一天（covered > boundary）时视为本轮有进展（ran=True）；
+    # 毫无进展的失败/旧缓存/未推进轮维持原边界 orig_covered，不写入 skipped_backlog。
+    ran = covered > boundary
+    effective_covered = covered if ran else orig_covered
+
+    cursor_note = next(
+        (f"游标失效（{s['cursor_error']}）" for _, s in scans if s.get("cursor_error")),
+        None,
+    )
+
+    incomplete_reason = None
+    if partial_days:
+        day_str, detail = partial_days[0]
+        if covered < until:
+            next_start = _day_shift(covered, 1)
+            incomplete_reason = (
+                f"未完成: 单日 {day_str} 未扫完（{detail}），"
+                f"保留已取结果，并将覆盖边界越过该日推进至 {covered}"
+                f"（该日剩余文档只可能在之后的 3 天回看中再次查到），"
+                f"未扫日期 {next_start} 至 {until} 留待下一轮续采"
+            )
+        else:
+            incomplete_reason = (
+                f"未完成: 单日 {day_str} 未扫完（{detail}），"
+                f"保留已取结果，并将覆盖边界越过该日推进至 {covered}"
+                "（该日剩余文档只可能在之后的 3 天回看中再次查到）"
+            )
+    elif failed_day is not None:
+        f_day, f_err = failed_day
+        next_start = _day_shift(effective_covered, 1)
+        if ran:
+            incomplete_reason = (
+                f"未完成: 单日 {f_day} 取数失败（{f_err}），"
+                f"覆盖边界已推进至 {effective_covered}，未扫日期 {next_start} 至 {until} 留待下一轮续采"
+            )
+        else:
+            incomplete_reason = (
+                f"未完成: 单日 {f_day} 取数失败（{f_err}），覆盖边界维持 {effective_covered}"
+            )
+    elif stopped_day is not None:
+        s_day, s_detail = stopped_day
+        next_start = _day_shift(effective_covered, 1)
+        if ran:
+            incomplete_reason = (
+                f"未完成: 单日 {s_day} 未扫完（{s_detail}），"
+                f"覆盖边界已推进至 {effective_covered}，未扫日期 {next_start} 至 {until} 留待下一轮续采"
+            )
+        else:
+            incomplete_reason = (
+                f"未完成: 单日 {s_day} 未扫完（{s_detail}），覆盖边界维持 {effective_covered}"
+            )
+    elif ok and covered < until:
+        next_start = _day_shift(effective_covered, 1)
+        if ran:
+            cause = (
+                f"已用完本轮翻页预算（{MAX_CURSOR_PAGES} 页；其间发生过{cursor_note}）"
+                if cursor_note
+                else f"已用完本轮翻页预算（{MAX_CURSOR_PAGES} 页）"
+            )
+            incomplete_reason = (
+                f"未完成: {cause}，"
+                f"覆盖边界已推进至 {effective_covered}，未扫日期 {next_start} 至 {until} 留待下一轮续采"
+            )
+        else:
+            detail = (
+                cursor_note
+                or full_scan.get("incomplete_reason")
+                or f"已用完本轮翻页预算（{MAX_CURSOR_PAGES} 页）"
+            )
+            incomplete_reason = (
+                f"未完成: 检索窗口 {_day_shift(start, -3)} 至 {until}（含 3 天回看）未扫完（{detail}），"
+                f"覆盖边界维持 {effective_covered}"
+            )
+    elif not ok:
+        incomplete_reason = full_scan.get("incomplete_reason") or (
+            f"未完成: 取数失败（{err_msg}）" if err_msg else None
+        )
+
+    if cursor_note and incomplete_reason and cursor_note not in incomplete_reason:
+        incomplete_reason = f"{incomplete_reason}；本轮发生过{cursor_note}"
+    if cursor_note and err_msg and cursor_note not in err_msg:
+        err_msg = f"{err_msg}；本轮发生过{cursor_note}"
+
+    incomplete = bool(
+        partial_days
+        or failed_day is not None
+        or stopped_day is not None
+        or (ok and covered < until)
+        or (not ok and (full_scan.get("incomplete") or bool(incomplete_reason)))
+    )
+    status_val = "incomplete" if incomplete else next(
+        (s.get("status") for _, s in reversed(scans) if s.get("status")), "ok"
+    )
+    total_upstream = next(
+        (s.get("total_upstream") for _, s in reversed(scans) if s.get("total_upstream") is not None),
+        None,
+    )
+    last_scan = scans[-1][1] if scans else {}
+
+    ae_state = {
+        "ran": ran,
+        "covered_until": effective_covered,
+        "resume": None,
+    }
+
+    ae_status_entry = {
+        "query": meta["name"],
+        "ok": ok,
+        "completed": bool(ok and not incomplete),
+        "incomplete": incomplete,
+        "pages": pages_total,
+        "has_more": bool(last_scan.get("has_more")),
+        "cursor": last_scan.get("cursor"),
+        "returned": len(items),
+        "status": status_val,
+        "error": err_msg,
+        "ae_state": ae_state,
+    }
+    if any(s.get("cursor_invalid_restart") for _, s in scans):
+        ae_status_entry["cursor_invalid_restart"] = True
+    if ran and skipped_backlog is not None:
+        ae_status_entry["skipped_backlog"] = skipped_backlog
+    if total_upstream is not None:
+        ae_status_entry["total_upstream"] = total_upstream
+    if incomplete_reason:
+        ae_status_entry["incomplete_reason"] = incomplete_reason
+    return items, ae_status_entry
 
 
 def collect_internal_and_ae(
@@ -1389,12 +1934,11 @@ def collect_internal_and_ae(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """采集六个内部研究来源（company-wiki, guidepoint, funda-ai, sales-notes, tmtb, alphaengine）新增文档。
 
-    AlphaEngine 的窗口与进度按"覆盖边界"模型运行：本轮窗口起点 =
-    ``ae_covered_until``（已完整覆盖到的日期；``build_internal_route_request``
-    内部再前推 3 天安全回看，seen 去重），终点 = 本轮 ``until``。窗口没扫完时
-    边界不动，未扫区间因此永远落在下一轮窗口里；上一轮留下的 ``ae_resume``
-    （cursor + 窗口 + 查询词）在窗口起点与查询词一致时从 cursor 续扫，否则丢弃
-    cursor 从窗口起点重扫。"""
+    AlphaEngine 按包含式覆盖边界与两步按日切分模型运行：待扫起点 =
+    ``ae_covered_until + 1 天``（首次运行的 ``since`` 与旧 ``ae_resume.window.since``
+    先换算为 ``起点 - 1 天``，忽略旧 cursor；待扫超 7 天跳至 ``until - 6``），先给满
+    预算试整段（含 3 天回看，seen 去重），总量超限时按自然日从旧到新推进；跨轮仅
+    持久化包含式日期边界 ``covered_until``。"""
     internal_new: dict[str, Any] = {}
     internal_status: dict[str, Any] = {}
     ae_new: dict[str, Any] = {}
@@ -1525,12 +2069,12 @@ def collect_internal_and_ae(
                 }
 
     if skip_ae:
-        # 本轮没跑 AE：把本轮起算用的覆盖边界与上一份续采状态原样带回 commit
-        # （旧格式状态首次迁移时固化由旧 until 推出的初始边界，不得写 null）。
+        # 本轮没跑 AE：把归一化后的覆盖边界原样带回 commit，旧 cursor 一律丢弃
+        # （旧格式状态首次迁移时固化由旧 until 或 resume.window.since 推出的边界，不得写 null）。
         skipped_state = {
             "ran": False,
-            "covered_until": str(ae_covered_until or since),
-            "resume": ae_resume if isinstance(ae_resume, dict) else None,
+            "covered_until": _normalize_ae_boundary(ae_covered_until, ae_resume, since),
+            "resume": None,
         }
         ae_status.append({"skipped": "--no-ae", "ok": True, "ae_state": skipped_state})
         internal_status["alphaengine"] = {
@@ -1540,124 +2084,15 @@ def collect_internal_and_ae(
             "ae_state": skipped_state,
         }
     else:
-        # 覆盖边界 C：本轮窗口 = [C, 本轮 until]（route 构造内部再前推 3 天安全
-        # 回看，seen 去重）；边界只在窗口完整扫完时推进，与全局 last_run.until
-        # 解耦——没扫完的区间永远落在下一轮窗口里。
-        boundary = min(str(ae_covered_until or since), until)
-        # cursor 只对签发它的那组筛选条件有效（evidence-and-sources.md §15）：
-        # 续采必须原样重放签发窗口 {since, until} + 查询词，不能换成本轮 until，
-        # 否则上游返回 e_cursor_filter_mismatch。查询词变化则 cursor 作废。
-        resume_window: tuple[str, str] | None = None
-        resume_cursor: str | None = None
-        if isinstance(ae_resume, dict) and str(ae_resume.get("query") or "") == str(
-            meta.get("name") or ""
-        ):
-            rwin = ae_resume.get("window") if isinstance(ae_resume.get("window"), dict) else {}
-            if rwin.get("since") and rwin.get("until"):
-                resume_window = (str(rwin["since"]), str(rwin["until"]))
-                raw_cur = ae_resume.get("cursor")
-                resume_cursor = str(raw_cur) if raw_cur else None
-
-        # 两段式：先续扫签发 cursor 的原窗口；原窗口完整扫完且预算有余量时，
-        # 再扫新窗口 [推进后的边界, 本轮 until]，否则新窗口留到下一轮。
-        items: list[dict[str, Any]] = []
-        scans: list[tuple[tuple[str, str], dict[str, Any]]] = []
-        pages_total = 0
-        covered = boundary
-        resume_out: dict[str, Any] | None = None
-        deferred_reason: str | None = None
-        queue: list[tuple[str, str, str | None]] = []
-        if resume_window is not None:
-            queue.append((resume_window[0], resume_window[1], resume_cursor))
-        else:
-            queue.append((boundary, until, None))
-        while queue:
-            w_since, w_until, w_cursor = queue.pop(0)
-            w_items, scan = _scan_alphaengine_pages(
-                meta,
-                w_since,
-                w_until,
-                start_cursor=w_cursor,
-                budget=MAX_CURSOR_PAGES - pages_total,
-            )
-            items.extend(w_items)
-            pages_total += int(scan.get("pages") or 0)
-            scans.append(((w_since, w_until), scan))
-            if not scan["completed"]:
-                # 未扫完：进度停在已扫到的位置——resume 保留本段窗口（cursor 为
-                # None 表示下轮从该窗口起点重扫）。
-                resume_out = {
-                    "window": {"since": w_since, "until": w_until},
-                    "cursor": scan.get("cursor"),
-                    "query": meta["name"],
-                }
-                break
-            covered = max(covered, w_until)
-            if resume_window is not None and w_until < until and pages_total < MAX_CURSOR_PAGES:
-                # 原窗口扫完、预算有余：追扫新窗口（起点 = 推进后的边界）。
-                queue.append((covered, until, None))
-                resume_window = None  # 只追加一次
-
-        ok = all(bool(s.get("ok")) for _, s in scans)
-        # 原窗口续扫完成但新窗口因预算耗尽未扫（covered < until）：同样未完成，
-        # 新窗口留到下一轮（resume=None，下轮窗口从推进后的边界起算）。
-        incomplete = resume_out is not None or covered < until
-        if incomplete and resume_out is None:
-            deferred_reason = (
-                f"未完成: 原窗口已扫完、本轮预算已尽，新窗口 [{covered}, {until}] 留待下轮"
-            )
-        err_msg = next((s.get("error") for _, s in reversed(scans) if s.get("error")), None)
-        incomplete_reason = next(
-            (s.get("incomplete_reason") for _, s in reversed(scans) if s.get("incomplete_reason")),
-            deferred_reason,
+        items, ae_status_entry = _collect_alphaengine_window(
+            meta,
+            since,
+            until,
+            ae_covered_until=ae_covered_until,
+            ae_resume=ae_resume,
         )
-        status_val = "incomplete" if incomplete else next(
-            (s.get("status") for _, s in reversed(scans) if s.get("status")), "ok"
-        )
-        total_upstream = next(
-            (s.get("total_upstream") for _, s in reversed(scans) if s.get("total_upstream") is not None),
-            None,
-        )
-        last_scan = scans[-1][1] if scans else {}
-
-        # 毫无进展的失败轮（首页即失败且窗口起点=终点一类）与 skip 同样处理：
-        # 带回本轮起算用的边界与上一份续采状态——旧格式状态首次迁移时固化，
-        # 不留 null（codex r2 #3）。
-        ran = bool(ok or incomplete)
-        ae_state: dict[str, Any] = {"ran": ran}
-        if ran:
-            ae_state["covered_until"] = covered
-            ae_state["resume"] = resume_out
-        else:
-            ae_state["covered_until"] = boundary
-            ae_state["resume"] = ae_resume if isinstance(ae_resume, dict) else None
-
-        ae_status_entry: dict[str, Any] = {
-            "query": meta["name"],
-            "ok": ok,
-            "completed": bool(ok and not incomplete),
-            "incomplete": incomplete,
-            "pages": pages_total,
-            "has_more": bool(last_scan.get("has_more")),
-            "cursor": last_scan.get("cursor"),
-            "returned": len(items),
-            "status": status_val,
-            "error": err_msg,
-            "ae_state": ae_state,
-        }
-        if resume_cursor is not None:
-            ae_status_entry["resumed_from_cursor"] = resume_cursor
-        if any(s.get("cursor_invalid_restart") for _, s in scans):
-            ae_status_entry["cursor_invalid_restart"] = True
-        int_ae_entry: dict[str, Any] = dict(ae_status_entry)
-        if total_upstream is not None:
-            ae_status_entry["total_upstream"] = total_upstream
-            int_ae_entry["total_upstream"] = total_upstream
-        if incomplete_reason:
-            ae_status_entry["incomplete_reason"] = incomplete_reason
-            int_ae_entry["incomplete_reason"] = incomplete_reason
         ae_status.append(ae_status_entry)
-        internal_status["alphaengine"] = int_ae_entry
+        internal_status["alphaengine"] = dict(ae_status_entry)
 
         for r in items:
             doc_id = r.get("doc_id") or r.get("document_id") or r.get("id")
@@ -1865,27 +2300,31 @@ def render_packet_md(pk: dict[str, Any]) -> str:
     if isinstance(ae_st_entry, dict) and not ae_st_entry.get("ok", False):
         lines.append(f"- ⚠️ **alphaengine 本轮取数失败（{ae_st_entry.get('error') or ae_st_entry.get('status') or 'unknown_error'}）**")
     ae_state = ae_st_entry.get("ae_state") if isinstance(ae_st_entry, dict) else None
-    ae_resume_out = (
-        ae_state.get("resume") if isinstance(ae_state, dict) and isinstance(ae_state.get("resume"), dict) else None
+    skipped_backlog = (
+        ae_st_entry.get("skipped_backlog")
+        if isinstance(ae_st_entry, dict) and isinstance(ae_st_entry.get("skipped_backlog"), dict)
+        else None
     )
-    if isinstance(ae_resume_out, dict):
-        rwin = ae_resume_out.get("window") if isinstance(ae_resume_out.get("window"), dict) else {}
-        cur = ae_resume_out.get("cursor")
-        cur_part = (
-            f"已扫至 cursor `{cur}` 之后仍有更多文档" if cur else "无有效 cursor（本轮游标失效或首页即失败）"
+    if skipped_backlog and skipped_backlog.get("since") and skipped_backlog.get("until"):
+        until_skip = _coerce_iso_day(skipped_backlog.get("until"))
+        actual_start = _day_shift(until_skip, 1) if until_skip else skipped_backlog["until"]
+        lines.append(
+            f"- **更早的积压已跳过**：{skipped_backlog['since']} 至 {skipped_backlog['until']} "
+            f"超出 {MAX_AE_BACKLOG_DAYS} 天积压上限，本轮实际从 {actual_start} 起扫"
+        )
+    if isinstance(ae_st_entry, dict) and _is_source_status_incomplete(ae_st_entry):
+        covered_str = (
+            ae_state.get("covered_until") if isinstance(ae_state, dict) and ae_state.get("covered_until") else "?"
+        )
+        reason_str = (
+            ae_st_entry.get("incomplete_reason")
+            or (f"取数失败（{ae_st_entry.get('error')}）" if ae_st_entry.get("error") else None)
+            or "未完成"
         )
         lines.append(
-            f"- ⚠️ **alphaengine 本轮未扫完**：窗口 {rwin.get('since')} 至 {rwin.get('until')} "
-            f"{cur_part}；覆盖边界停在 "
-            f"{ae_state.get('covered_until') if isinstance(ae_state, dict) else '?'}，"
-            "下轮窗口仍从该边界起算并优先从 cursor 续扫（游标只对签发它的原窗口有效，"
-            "失效或失配则从窗口起点重扫），未扫区间的文档不会丢；"
-            "本轮报告必须披露该来源不完整，不得当作'本轮无新文档'"
-        )
-    elif isinstance(ae_st_entry, dict) and ae_st_entry.get("resumed_from_cursor"):
-        lines.append(
-            f"- **续采完成**：从上一轮 cursor `{ae_st_entry.get('resumed_from_cursor')}` "
-            "续扫，窗口已完整覆盖"
+            f"- ⚠️ **alphaengine 本轮未扫完**：{reason_str}；"
+            f"当前覆盖边界为 {covered_str}，下一轮从覆盖边界继续；"
+            "本轮报告必须披露该来源不完整，不得当作“本轮无新文档”"
         )
     ae_new = ae_obj.get("new") or {}
     if ae_new:
@@ -1929,14 +2368,15 @@ def latest_previous_snapshot(consensus_dir: Path, current_file: Path, last_run_h
 
 
 def _ae_state_of(last_run: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
-    """读 last_run.json 里 AlphaEngine 的（覆盖边界, 续采状态）。
+    """读 last_run.json 里 AlphaEngine 的（包含式覆盖边界, None）。
 
-    覆盖边界 ``ae_covered_until`` 是已完整扫完的日期（不含未扫完窗口）；旧状态
-    文件没有该键时由调用方以旧 ``until`` 兜底。``ae_resume`` 为 None 表示没有
-    待续采的游标。"""
-    covered = last_run.get("ae_covered_until")
-    resume = last_run.get("ae_resume") if isinstance(last_run.get("ae_resume"), dict) else None
-    return (str(covered) if covered else None), resume
+    覆盖边界 ``ae_covered_until`` 表示这一天及之前都已扫完；旧状态文件含
+    ``ae_resume.window.since``（包含式未扫起点）时先换算为 ``since - 1 天`` 再与
+    ``ae_covered_until`` 取较早者，并一律丢弃 cursor。两者均无时返回 (None, None)。"""
+    return _migrate_ae_covered_until(
+        last_run.get("ae_covered_until"),
+        last_run.get("ae_resume"),
+    ), None
 
 
 def cmd_collect(args: argparse.Namespace) -> int:
@@ -1993,11 +2433,12 @@ def cmd_collect(args: argparse.Namespace) -> int:
 
     prev_snap = latest_previous_snapshot(P["consensus"], snap_path, last_run.get("snapshot_file"), ws_dir)
 
-    # 2. 检索内部库、AlphaEngine、SEC；AlphaEngine 按"覆盖边界"窗口采集：
-    #    窗口起点 = ae_covered_until（旧状态文件没有该键时以旧 until 兜底）
+    # 2. 检索内部库、AlphaEngine、SEC；AlphaEngine 按包含式覆盖边界采集：
+    #    有旧状态时优先用迁移后的 ae_covered_until（无则以旧 last_run.until 兜底），
+    #    首次运行传 None，由 _normalize_ae_boundary 将包含式 since 换算为 since - 1 天。
     ae_covered_until, ae_resume_prev = _ae_state_of(last_run)
     if not ae_covered_until:
-        ae_covered_until = str(last_run.get("until") or since)
+        ae_covered_until = _coerce_iso_day(last_run.get("until"))
     internal_data, ae_data = collect_internal_and_ae(
         meta,
         since,
@@ -2048,8 +2489,9 @@ def cmd_collect(args: argparse.Namespace) -> int:
         "all_sources_ok": all_sources_ok,
         "failed_sources": failed_sources,
         "short_circuit_eligible": short_circuit_eligible,
-        # AE 覆盖边界与续采状态：ran=false（--no-ae / 首页即失败）时 commit 原样
-        # 保留上一份状态；代理在报告里须按 packet.md 的披露说明该来源本轮不完整。
+        # AE 覆盖边界状态：ran=false（--no-ae / 未推进任何日期的失败或旧缓存轮）时
+        # ae_state 带回迁移后的原覆盖边界（不写入跳过积压、不存 cursor），由 commit
+        # 固化到 last_run.json；未扫完时代理须按 packet.md 披露该来源不完整。
         "ae_state": ae_state,
         "internal_status": internal_data["status"],
         "internal": internal_data,
@@ -2115,23 +2557,18 @@ def cmd_commit(args: argparse.Namespace) -> int:
     dump_json(P["seen"], sorted(seen))
 
     committed_at = now_et().isoformat()
-    # AE 状态：packet 的 ae_state 总是携带本轮结算值（ran=false 的跳过轮/失败轮
-    # 也带回本轮起算用的覆盖边界与上一份续采状态——旧格式状态首次迁移时固化，
-    # 不写 null）；只有旧 packet（无 ae_state）才从上一份 last_run 原样保留。
+    # AE 状态：统一按迁移规则从 packet.ae_state 解析包含式覆盖边界（兼容升级前生成
+    # 的带 resume.window.since/cursor 的旧 packet.json：取 covered_until 与
+    # resume.window.since - 1 天 较早者并丢弃 cursor）；若旧 packet 缺失 ae_state，
+    # 回退从上一份 last_run.json 迁移。ae_resume 固定写 None。
     ae_state = pk.get("ae_state") if isinstance(pk.get("ae_state"), dict) else {}
-    if ae_state.get("covered_until"):
-        ae_covered_until = ae_state.get("covered_until")
-        ae_resume_out = (
-            ae_state.get("resume") if isinstance(ae_state.get("resume"), dict) else None
-        )
-    else:
+    ae_covered_until = _migrate_ae_covered_until(
+        ae_state.get("covered_until"),
+        ae_state.get("resume"),
+    )
+    if not ae_covered_until:
         prev_last_run = load_json(P["last_run"], {})
-        ae_covered_until = prev_last_run.get("ae_covered_until")
-        ae_resume_out = (
-            prev_last_run.get("ae_resume")
-            if isinstance(prev_last_run.get("ae_resume"), dict)
-            else None
-        )
+        ae_covered_until, _ = _ae_state_of(prev_last_run)
     last_run_obj = {
         "ticker": pk.get("ticker") or args.ticker,
         "run_id": args.run_id,
@@ -2141,11 +2578,10 @@ def cmd_commit(args: argparse.Namespace) -> int:
         "snapshot_file": pk.get("snapshot_file"),
         "material": args.material,
         "summary": args.summary.strip(),
-        # AlphaEngine 覆盖边界（只在窗口完整扫完时推进，与全局 until 解耦）与
-        # 未扫完时的续采状态（cursor 绑定签发它的原窗口）；旧状态文件没有这
-        # 两个键时 collect 以旧 until 兜底并在首轮固化。
+        # AlphaEngine 覆盖边界（按整段或逐日推进，与全局 until 解耦）；跨轮续采
+        # 不再保存 cursor，ae_resume 固定为 None。
         "ae_covered_until": ae_covered_until,
-        "ae_resume": ae_resume_out,
+        "ae_resume": None,
     }
     dump_json(P["last_run"], last_run_obj)
 

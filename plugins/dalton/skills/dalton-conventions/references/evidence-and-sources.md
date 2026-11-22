@@ -188,7 +188,7 @@
    - 无关键词时默认 `sort="newest"`（也允许显式 `sort="relevance"`）；**一旦传入有效关键词（顶层 `query`、`params.query` 或 `ticker` 折叠后的关键词），只允许 `sort="relevance"`**（传 `"newest"` 会报 `E_QUERY_SORT`）。
 2. **按关键词、标题检索与行业筛选（不依赖上游公司/地区/自选标签）**：
    - 按公司检索统一使用关键词 `query`（公司名 + ticker），必要时配合标题检索 `params={"search_in": "title"}`；机构会议浏览用 `meeting_scope` + 日期（`start`/`end`）+ 关键词 `query`；文档搜索按行业过滤用 `params.industry_names`（旧名 `industries`、`companies` 已废弃；`industry_ids` 仅用于录制任务 `list_recording_tasks`）。
-   - 文档搜索统一用 `params.cursor` 翻页（直到 `has_more=false`）：`search_in="title"` 可以翻页，续页时必须保持相同的 `search_in`、`query`、日期与其他筛选条件，只加 `cursor`（否则报 `E_CURSOR_FILTER_MISMATCH`）；不能在 `search_library` 上传 `page` 或 `pages`。
+   - 文档搜索统一用 `params.cursor`（游标）翻页（直到 `has_more=false`）：`search_in="title"` 可以翻页，继续翻页时必须保持相同的 `search_in`、`query`、日期与其他筛选条件，只加 `cursor`（否则报 `E_CURSOR_FILTER_MISMATCH`）；不能在 `search_library` 中传 `page` 或 `pages`。游标由 MCP（模型上下文协议）按约 15 分钟有效期和筛选条件校验；采集脚本只在同一轮内使用游标，跨轮按日期从覆盖边界续采。
 3. **查录制中 / 失败的任务与状态**：
    - 用 `operation="list_recording_tasks"` 查询机构或个人录制任务列表（参数：`params={"meeting_scope": "institution"|"personal", "page": 1, "limit": 100, "date_from": ..., "date_to": ..., "query": ...}`，可选 `industry_ids`、`source_ids`、`states`；分页用 `page`/`next_page`，日期按成对 `date_from`/`date_to` 传且支持未来排期日期，不套用历史文档截断到今天的规则）。
    - 用 `operation="get_recording_status"`（可选 `params={"meeting_scope": "institution"|"personal"}`）查当前正在录制的任务状态，或用 `operation="get_recording_task"`（必传 `params={"roadshow_id": ...}`）查单个录制任务详情。
