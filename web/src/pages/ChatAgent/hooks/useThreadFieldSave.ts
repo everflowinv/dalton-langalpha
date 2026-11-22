@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from '@/components/ui/use-toast';
+// DALTON-HOOK(antigravity-series): gate chained extraUpdates rollback preservation to Dalton builds
+import { isDaltonBuild } from '@/config/brand';
 import { queryKeys } from '@/lib/queryKeys';
 import { threadFieldMutationKey, type ThreadField } from '@/lib/threadFieldMutations';
 import type { Thread } from '@/types/api';
@@ -34,6 +36,21 @@ type Known<F extends ThreadField> = {
   value: Thread[F];
   extra?: Partial<Thread>;
 } | null;
+
+// DALTON-HOOK(antigravity-series): track server-confirmed reasoning_effort per QueryClient+thread while serialized llm_model/reasoning_effort PATCHes are in flight in Dalton builds
+const confirmedEffortByClient = new WeakMap<
+  ReturnType<typeof useQueryClient>,
+  Map<string, Thread['reasoning_effort']>
+>();
+
+function getConfirmedEffortMap(qc: ReturnType<typeof useQueryClient>) {
+  let map = confirmedEffortByClient.get(qc);
+  if (!map) {
+    map = new Map<string, Thread['reasoning_effort']>();
+    confirmedEffortByClient.set(qc, map);
+  }
+  return map;
+}
 
 /**
  * Saves one field of a thread row the way a composer needs it. The cached
@@ -70,9 +87,15 @@ export function useThreadFieldSave<F extends ThreadField>({
   // cancelled, or a stale mark its optimistic write cleared.
   const interruptedRef = useRef(new Set<string>());
 
+  // DALTON-HOOK(antigravity-series): serialize llm_model and reasoning_effort PATCHes on the same thread in Dalton builds so Antigravity's atomic reasoning_effort: null never races a reasoning_effort PATCH
+  const isModelOrEffortField = field === 'llm_model' || field === 'reasoning_effort';
+  const scopeId = isDaltonBuild && isModelOrEffortField
+    ? `thread-field:model-effort:${threadId ?? ''}`
+    : `thread-field:${field}:${threadId ?? ''}`;
+
   const { mutateAsync } = useMutation({
     mutationKey: threadFieldMutationKey(threadId ?? '', field),
-    scope: { id: `thread-field:${field}:${threadId ?? ''}` },
+    scope: { id: scopeId },
     mutationFn: ({ threadId: id, value, extraUpdates }: ThreadFieldSave<FieldValue<F>>) => (
       // DALTON-HOOK(antigravity-series): merge extraUpdates into the same single PATCH request
       updateThread(id, { [field]: value, ...(extraUpdates ?? {}) } as ThreadUpdates)
@@ -83,14 +106,37 @@ export function useThreadFieldSave<F extends ThreadField>({
       // count and the snapshot. This save already counts, so 1 means no other
       // is out and the cached row is the server's.
       const cached = queryClient.getQueryData<Thread>(key);
+      const effortMap = isDaltonBuild && isModelOrEffortField ? getConfirmedEffortMap(queryClient) : null;
+      const modelEffortCount = effortMap
+        ? queryClient.isMutating({ mutationKey: threadFieldMutationKey(id, 'llm_model') })
+          + queryClient.isMutating({ mutationKey: threadFieldMutationKey(id, 'reasoning_effort') })
+        : 0;
+      if (effortMap && cached && modelEffortCount === 1) {
+        effortMap.set(id, cached.reasoning_effort);
+      }
       const extraPrev: Partial<Thread> | undefined = cached && extraUpdates
         ? Object.fromEntries(
-            Object.keys(extraUpdates).map((k) => [k, cached[k as keyof Thread]]),
+            Object.keys(extraUpdates).map((k) => [
+              k,
+              k === 'reasoning_effort' && effortMap?.has(id) ? effortMap.get(id) : cached[k as keyof Thread],
+            ]),
           ) as Partial<Thread>
         : undefined;
-      const previous: Known<F> = cached ? { value: cached[field], ...(extraPrev ? { extra: extraPrev } : {}) } : null;
+      const fieldPrev = field === 'reasoning_effort' && effortMap?.has(id)
+        ? (effortMap.get(id) as Thread[F])
+        : cached?.[field];
+      const previous: Known<F> = cached ? { value: fieldPrev, ...(extraPrev ? { extra: extraPrev } : {}) } : null;
       if (queryClient.isMutating({ mutationKey: threadFieldMutationKey(id, field) }) === 1) {
         confirmedRef.current.set(id, previous);
+      } else if (isDaltonBuild && extraPrev && confirmedRef.current.has(id)) {
+        // DALTON-HOOK(antigravity-series): when a chained save introduces extraUpdates (e.g. Antigravity clearing reasoning_effort behind a non-Antigravity pick), preserve the pre-optimistic extra field value on confirmedRef
+        const existing = confirmedRef.current.get(id);
+        if (existing) {
+          confirmedRef.current.set(id, {
+            ...existing,
+            extra: { ...extraPrev, ...(existing.extra ?? {}) },
+          });
+        }
       }
       // A read in flight was asked before this save and would land over it.
       // It may carry other fields too, so it is asked again once the save
@@ -105,6 +151,7 @@ export function useThreadFieldSave<F extends ThreadField>({
       return { previous };
     },
     onSuccess: (saved, { threadId: id, value, extraUpdates }) => {
+      const priorExtra = isDaltonBuild ? confirmedRef.current.get(id)?.extra : undefined;
       const extraSaved: Partial<Thread> | undefined = saved && extraUpdates
         ? Object.fromEntries(
             Object.keys(extraUpdates).map((k) => [
@@ -113,7 +160,30 @@ export function useThreadFieldSave<F extends ThreadField>({
             ]),
           ) as Partial<Thread>
         : (extraUpdates as Partial<Thread> | undefined);
-      confirmedRef.current.set(id, { value: answered(saved, value), ...(extraSaved ? { extra: extraSaved } : {}) });
+      // DALTON-HOOK(antigravity-series): keep prior confirmed extra fields (refreshed from saved when present) across chained saves and advance shared confirmedEffort
+      const mergedExtra: Partial<Thread> | undefined = isDaltonBuild && priorExtra
+        ? {
+            ...Object.fromEntries(
+              Object.keys(priorExtra).map((k) => [
+                k,
+                saved && saved[k as keyof Thread] !== undefined ? saved[k as keyof Thread] : priorExtra[k as keyof Thread],
+              ]),
+            ) as Partial<Thread>,
+            ...(extraSaved ?? {}),
+          }
+        : extraSaved;
+      const confirmedValue = answered(saved, value);
+      if (isDaltonBuild && isModelOrEffortField) {
+        const effortMap = getConfirmedEffortMap(queryClient);
+        if (field === 'reasoning_effort') {
+          effortMap.set(id, confirmedValue as Thread['reasoning_effort']);
+        } else if (mergedExtra && 'reasoning_effort' in mergedExtra) {
+          effortMap.set(id, mergedExtra.reasoning_effort);
+        } else if (saved && saved.reasoning_effort !== undefined) {
+          effortMap.set(id, saved.reasoning_effort);
+        }
+      }
+      confirmedRef.current.set(id, { value: confirmedValue, ...(mergedExtra ? { extra: mergedExtra } : {}) });
       if (saved) onSaved?.(saved);
     },
     onError: (_error, save, context) => {
@@ -123,41 +193,79 @@ export function useThreadFieldSave<F extends ThreadField>({
       // stands in only when the chain began in another mount.
       const confirmed = confirmedRef.current;
       const restored = confirmed.has(save.threadId) ? confirmed.get(save.threadId) : context?.previous;
-      // DALTON-HOOK(antigravity-series): only roll back extraUpdates fields that still hold this save's optimistic value, preserving concurrent user updates
-      if (restored) {
+      // DALTON-HOOK(antigravity-series): respect serialized peer llm_model/reasoning_effort mutations and use latest confirmedEffort on rollback
+      const effortMap = isDaltonBuild && isModelOrEffortField ? getConfirmedEffortMap(queryClient) : null;
+      const modelOut = isDaltonBuild && field === 'reasoning_effort'
+        && queryClient.isMutating({ mutationKey: threadFieldMutationKey(save.threadId, 'llm_model') }) > 0;
+      const effortOut = isDaltonBuild && field === 'llm_model'
+        && queryClient.isMutating({ mutationKey: threadFieldMutationKey(save.threadId, 'reasoning_effort') }) > 0;
+      if (restored && !modelOut) {
         const currentRow = queryClient.getQueryData<Thread>(queryKeys.threads.detail(save.threadId));
-        const safeExtra = restored.extra && save.extraUpdates && currentRow
+        const restoredValue = field === 'reasoning_effort' && effortMap?.has(save.threadId)
+          ? (effortMap.get(save.threadId) as Thread[F])
+          : restored.value;
+        let restoredExtra = restored.extra;
+        if (restoredExtra && 'reasoning_effort' in restoredExtra && effortMap?.has(save.threadId)) {
+          restoredExtra = { ...restoredExtra, reasoning_effort: effortMap.get(save.threadId) };
+        }
+        const safeExtra = restoredExtra && save.extraUpdates && currentRow
           ? Object.fromEntries(
-              Object.entries(restored.extra).filter(
-                ([k]) => currentRow[k as keyof Thread] === save.extraUpdates?.[k as keyof ThreadUpdates],
+              Object.entries(restoredExtra).filter(
+                ([k]) => !(effortOut && k === 'reasoning_effort')
+                  && currentRow[k as keyof Thread] === save.extraUpdates?.[k as keyof ThreadUpdates],
               ),
             ) as Partial<Thread>
-          : restored.extra;
-        writeField(save.threadId, restored.value, safeExtra);
+          : restoredExtra && effortOut
+            ? Object.fromEntries(Object.entries(restoredExtra).filter(([k]) => k !== 'reasoning_effort')) as Partial<Thread>
+            : restoredExtra;
+        writeField(save.threadId, restoredValue, safeExtra);
       }
       if (shownThreadRef.current === save.threadId) onFailed(save);
       toast({ description: failedMessage, variant: 'destructive' });
     },
     onSettled: (saved, error, { threadId: id, value, extraUpdates }) => {
       if (queryClient.isMutating({ mutationKey: threadFieldMutationKey(id, field) }) !== 1) return;
+      // DALTON-HOOK(antigravity-series): read confirmedRef before deleting so a later non-Antigravity save clears any earlier failed mutation's optimistic extraUpdates
+      const settledConfirmed = isDaltonBuild ? confirmedRef.current.get(id) : undefined;
       confirmedRef.current.delete(id);
+      const modelOut = isDaltonBuild && field === 'reasoning_effort'
+        && queryClient.isMutating({ mutationKey: threadFieldMutationKey(id, 'llm_model') }) > 0;
+      const effortOut = isDaltonBuild && field === 'llm_model'
+        && queryClient.isMutating({ mutationKey: threadFieldMutationKey(id, 'reasoning_effort') }) > 0;
+      if (isDaltonBuild && isModelOrEffortField && !modelOut && !effortOut) {
+        getConfirmedEffortMap(queryClient).delete(id);
+      }
       const interrupted = interruptedRef.current.delete(id);
       const key = queryKeys.threads.detail(id);
       // Marked stale while the save was out, by the lifecycle feed reporting a
       // change made elsewhere or by a turn ending. Read before the write
       // below, which clears it.
       const marked = queryClient.getQueryState(key)?.isInvalidated ?? false;
-      // DALTON-HOOK(antigravity-series): preserve confirmed extraUpdates on settled cache write
-      if (!error) {
-        const extraApplied: Partial<Thread> | undefined = extraUpdates
-          ? Object.fromEntries(
-              Object.keys(extraUpdates).map((k) => [
-                k,
-                saved && saved[k as keyof Thread] !== undefined
-                  ? saved[k as keyof Thread]
-                  : extraUpdates[k as keyof ThreadUpdates],
-              ]),
-            ) as Partial<Thread>
+      // DALTON-HOOK(antigravity-series): preserve confirmed extraUpdates and prior confirmed extra fields (cleaning up earlier failed optimistic writes), without clobbering a queued peer mutation
+      if (!error && !modelOut) {
+        const extraKeys = new Set<string>([
+          ...(extraUpdates ? Object.keys(extraUpdates) : []),
+          ...(isDaltonBuild && settledConfirmed?.extra ? Object.keys(settledConfirmed.extra) : []),
+        ]);
+        const extraEntries: Array<[string, unknown]> = [];
+        for (const k of extraKeys) {
+          if (effortOut && k === 'reasoning_effort') continue;
+          const fromSaved = saved && saved[k as keyof Thread] !== undefined ? saved[k as keyof Thread] : undefined;
+          const fromUpdates = extraUpdates && extraUpdates[k as keyof ThreadUpdates] !== undefined
+            ? extraUpdates[k as keyof ThreadUpdates]
+            : undefined;
+          const fromConfirmed = settledConfirmed?.extra && k in settledConfirmed.extra
+            ? settledConfirmed.extra[k as keyof Thread]
+            : undefined;
+          const resolved = fromSaved !== undefined
+            ? fromSaved
+            : fromUpdates !== undefined
+              ? fromUpdates
+              : fromConfirmed;
+          if (resolved !== undefined) extraEntries.push([k, resolved]);
+        }
+        const extraApplied: Partial<Thread> | undefined = extraEntries.length > 0
+          ? (Object.fromEntries(extraEntries) as Partial<Thread>)
           : undefined;
         writeField(id, answered(saved, value), extraApplied);
       }

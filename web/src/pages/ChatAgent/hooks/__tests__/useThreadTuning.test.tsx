@@ -367,5 +367,51 @@ describe('useThreadTuning', () => {
       expect(mocks.updateThread).not.toHaveBeenCalled();
       expect(userFailedView.result.current.tuning.reasoningEffort).toBe('high');
     });
+
+    // DALTON-HOOK(antigravity-series): Item 6 — switching effort or fast mode back to cached values while permission is unresolved must still persist the explicit pick once confirmed personal
+    it('persists effort and fast-mode picks switched back to stale cached values while shared list is unresolved once confirmed personal', async () => {
+      mocks.isDaltonBuild = true;
+      mocks.sharedEnabled = true;
+      mocks.sharedWorkspaces = undefined;
+      mocks.sharedError = false;
+
+      mocks.updateThread
+        .mockResolvedValueOnce(row({ reasoning_effort: 'low', fast_mode: false }))
+        .mockResolvedValueOnce(row({ reasoning_effort: 'low', fast_mode: false }));
+
+      const { result, rerender, queryClient } = setup(
+        { workspaceId: 'ws-personal' },
+        row({ reasoning_effort: 'low', fast_mode: false }),
+      );
+
+      // User changes effort & fast mode away from cache, then explicitly switches back to cached values while shared list is still loading.
+      await act(async () => {
+        await result.current.setReasoningEffort('high');
+        await result.current.setFastMode(true);
+        await result.current.setReasoningEffort('low');
+        await result.current.setFastMode(false);
+      });
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+      expect(result.current.tuning).toEqual({ reasoningEffort: 'low', fastMode: false });
+
+      // Even if a mid-wait detail update lands from another tab with different values, the user's unsaved explicit picks win.
+      act(() => {
+        queryClient.setQueryData(
+          queryKeys.threads.detail(THREAD),
+          row({ reasoning_effort: 'medium', fast_mode: true }),
+        );
+      });
+      expect(result.current.tuning).toEqual({ reasoningEffort: 'low', fastMode: false });
+
+      // Shared workspace list resolves confirming personal -> both explicit picks flush via PATCH.
+      mocks.sharedWorkspaces = [];
+      rerender({ threadId: THREAD, workspaceId: 'ws-personal' });
+
+      await waitFor(() => {
+        expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, { reasoning_effort: 'low' });
+        expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, { fast_mode: false });
+      });
+      expect(mocks.updateThread).toHaveBeenCalledTimes(2);
+    });
   });
 });

@@ -13,8 +13,16 @@ const state = vi.hoisted(() => ({
   flag: true,
   account: { organization: { id: 'org-1', name: 'Northfield' } as { id: string; name: string } | null, suspended: false },
   list: vi.fn(),
+  // DALTON-HOOK(antigravity-series): toggle isDaltonBuild to test unknown-on-first-read-failure vs upstream parity
+  isDaltonBuild: false,
 }));
 
+vi.mock('@/config/brand', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/config/brand')>()),
+  get isDaltonBuild() {
+    return state.isDaltonBuild;
+  },
+}));
 vi.mock('../useFeatures', () => ({ useFeatureEnabled: () => state.flag }));
 vi.mock('../useAccount', () => ({ useAccount: () => state.account }));
 vi.mock('@/api/sharedWorkspaces', () => ({
@@ -28,6 +36,8 @@ vi.mock('@/api/sharedWorkspaces', () => ({
 }));
 
 import { useSharedEntry, useSharedWorkspacesEnabled } from '../useSharedWorkspaces';
+// DALTON-HOOK(antigravity-series): use canonical queryKeys for shared-workspaces error/retry assertions
+import { queryKeys } from '@/lib/queryKeys';
 
 const entry = {
   workspace: { workspace_id: 'ws-shared', name: 'Q4 earnings review' },
@@ -44,6 +54,8 @@ beforeEach(() => {
   state.account = { organization: { id: 'org-1', name: 'Northfield' }, suspended: false };
   state.list.mockReset();
   state.list.mockResolvedValue({ workspaces: [entry], can_create: true });
+  // DALTON-HOOK(antigravity-series): reset brand build flag between tests
+  state.isDaltonBuild = false;
 });
 
 describe('useSharedWorkspacesEnabled', () => {
@@ -76,5 +88,32 @@ describe('useSharedEntry', () => {
     const { result } = renderHook(() => useSharedEntry('ws-shared'), { wrapper });
     expect(result.current).toBeNull();
     expect(state.list).not.toHaveBeenCalled();
+  });
+
+  // DALTON-HOOK(antigravity-series): Item 3 — treat first shared-list read failure as unknown (undefined) in Dalton builds until retry succeeds, while non-Dalton keeps upstream null
+  it('treats first-read failure as unknown (undefined) in Dalton builds until retry succeeds, and stays null in non-Dalton builds', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const sharedWrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+
+    state.isDaltonBuild = true;
+    state.list.mockRejectedValueOnce(new Error('network 500'));
+    const dalton = renderHook(() => useSharedEntry('ws-shared'), { wrapper: sharedWrapper });
+    await waitFor(() => expect(state.list).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(client.getQueryState(queryKeys.sharedWorkspaces.list())?.status).toBe('error'));
+    expect(dalton.result.current).toBeUndefined();
+
+    // Retry succeeds -> resolves to the shared entry.
+    state.list.mockResolvedValueOnce({ workspaces: [entry], can_create: true });
+    await client.refetchQueries({ queryKey: queryKeys.sharedWorkspaces.list() });
+    await waitFor(() => expect(dalton.result.current).toEqual(entry));
+    dalton.unmount();
+
+    // Non-Dalton build keeps exact upstream behavior (returns null on error).
+    state.isDaltonBuild = false;
+    state.list.mockRejectedValueOnce(new Error('network 500'));
+    const upstream = renderHook(() => useSharedEntry('ws-shared'), { wrapper });
+    await waitFor(() => expect(upstream.result.current).toBeNull());
   });
 });

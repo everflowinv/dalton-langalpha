@@ -1,4 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+// DALTON-HOOK(antigravity-series): treat first shared-list read failure as unknown in Dalton builds
+import { isDaltonBuild } from '@/config/brand';
 import { queryKeys } from '@/lib/queryKeys';
 import {
   addMember, createSharedWorkspace, getMembers, getTeam, listSharedWorkspaces, removeMember, setEveryone, setMemberRole, setShareOut, setTeam,
@@ -39,10 +41,11 @@ export function useSharedWorkspaces() {
 /** The shared entry for a workspace the caller reaches as a member; null for
  *  a personal workspace (and for every workspace with the feature off), and
  *  undefined while the list is read. */
+// DALTON-HOOK(antigravity-series): treat first-read failure with no cached shared list as unknown in Dalton builds
 export function useSharedEntry(workspaceId: string | null | undefined): SharedWorkspaceEntry | null | undefined {
   const { data, enabled, isLoading } = useSharedWorkspaces();
   if (!enabled || !workspaceId) return null;
-  if (isLoading && !data) return undefined;
+  if ((isLoading || isDaltonBuild) && !data) return undefined;
   return data?.workspaces.find((e) => e.workspace.workspace_id === workspaceId) ?? null;
 }
 

@@ -110,6 +110,7 @@ vi.mock('@/hooks/useSharedWorkspaces', () => ({
   },
 }));
 
+// DALTON-HOOK(antigravity-series): mock getFeatures and useUser for Dalton permission-resolution tests
 vi.mock('@/api/features', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/api/features')>();
   return {
@@ -1777,6 +1778,444 @@ describe('useThreadModel', () => {
       });
       expect(mocks.updateThread).toHaveBeenCalledTimes(2);
       expect(mocks.updateThread).toHaveBeenLastCalledWith(THREAD, { llm_model: 'model-beta' });
+    });
+
+    // DALTON-HOOK(antigravity-series): Item 1 — pre-id pick on first turn survives detail readback and keeps sendModel until saved on personal & unresolved workspaces
+    it('preserves a pre-id pick across first-turn detail readback on personal and unresolved workspaces without dropping sendModel before save settles', async () => {
+      mocks.seriesCatalog = NEON_CATALOG;
+      mocks.rawMetadata = NEON_RAW_META;
+      mocks.catalogModelNames = new Set([
+        'model-default',
+        'gemini-4-neon-low-oauth',
+        'gemini-4-neon-medium-oauth',
+        'gemini-4-neon-high-oauth',
+      ]);
+      mocks.sharedEntry = null;
+
+      const patchDeferred = deferred<Thread>();
+      mocks.updateThread.mockReturnValueOnce(patchDeferred.promise);
+      const qcPersonal = createTestQueryClient();
+      const personal = setup(
+        { threadId: '__default__', isLoading: false, workspaceId: 'ws-personal' },
+        null,
+        qcPersonal,
+      );
+
+      await act(async () => { await personal.result.current.pickModel('gemini-4-neon-medium-oauth'); });
+      personal.rerender({ threadId: '__default__', isLoading: true, workspaceId: 'ws-personal' });
+      // User changes choice before thread ID arrives.
+      await act(async () => { await personal.result.current.pickModel('gemini-4-neon-high-oauth'); });
+      expect(personal.result.current.model).toBe('gemini-4-neon-high-oauth');
+      expect(personal.result.current.sendModel).toBe('gemini-4-neon-high-oauth');
+
+      // Thread ID arrives with first-send model + saved effort; turn ends while reread is in flight.
+      const firstRow = {
+        thread_id: THREAD,
+        llm_model: 'gemini-4-neon-medium-oauth',
+        reasoning_effort: 'high',
+      } as unknown as Thread;
+      mocks.server = firstRow;
+      personal.rerender({ threadId: THREAD, isLoading: true, workspaceId: 'ws-personal' });
+      await waitFor(() => expect(qcPersonal.isFetching()).toBe(0));
+
+      const turnEndReread = deferred<Thread>();
+      mocks.getThread.mockReturnValueOnce(turnEndReread.promise);
+      personal.rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-personal' });
+      // DALTON-HOOK(antigravity-series): sendModel must NOT be cleared at turn end while pre-id pick awaits reread & PATCH
+      expect(personal.result.current.model).toBe('gemini-4-neon-high-oauth');
+      expect(personal.result.current.sendModel).toBe('gemini-4-neon-high-oauth');
+
+      await act(async () => {
+        turnEndReread.resolve(firstRow);
+        await turnEndReread.promise;
+      });
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, {
+        llm_model: 'gemini-4-neon-high-oauth',
+        reasoning_effort: null,
+      }));
+      await act(async () => {
+        patchDeferred.resolve({ thread_id: THREAD, llm_model: 'gemini-4-neon-high-oauth', reasoning_effort: null } as unknown as Thread);
+      });
+      expect(personal.result.current.model).toBe('gemini-4-neon-high-oauth');
+      personal.unmount();
+
+      // DALTON-HOOK(antigravity-series): unresolved workspace preserves pre-id pick across reread without PATCH, then flushes once confirmed personal
+      mocks.sharedEntry = undefined;
+      mocks.updateThread.mockResolvedValueOnce(row('gemini-4-neon-high-oauth'));
+      const qcUnresolved = createTestQueryClient();
+      const unresolved = setup(
+        { threadId: '__default__', isLoading: false, workspaceId: 'ws-personal' },
+        null,
+        qcUnresolved,
+      );
+      await act(async () => { await unresolved.result.current.pickModel('gemini-4-neon-medium-oauth'); });
+      unresolved.rerender({ threadId: '__default__', isLoading: true, workspaceId: 'ws-personal' });
+      await act(async () => { await unresolved.result.current.pickModel('gemini-4-neon-high-oauth'); });
+      mocks.server = row('gemini-4-neon-medium-oauth');
+      unresolved.rerender({ threadId: THREAD, isLoading: true, workspaceId: 'ws-personal' });
+      await waitFor(() => expect(qcUnresolved.isFetching()).toBe(0));
+
+      const unresolvedReread = deferred<Thread>();
+      mocks.getThread.mockReturnValueOnce(unresolvedReread.promise);
+      unresolved.rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-personal' });
+      await act(async () => {
+        unresolvedReread.resolve(row('gemini-4-neon-medium-oauth'));
+        await unresolvedReread.promise;
+      });
+      expect(mocks.updateThread).toHaveBeenCalledTimes(1);
+      expect(unresolved.result.current.model).toBe('gemini-4-neon-high-oauth');
+      expect(unresolved.result.current.sendModel).toBe('gemini-4-neon-high-oauth');
+
+      mocks.sharedEntry = null;
+      unresolved.rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-personal' });
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledTimes(2));
+      expect(unresolved.result.current.model).toBe('gemini-4-neon-high-oauth');
+    });
+
+    // DALTON-HOOK(antigravity-series): Item 2 — after an applied local pick on a shared thread is confirmed (even via structural sharing / same cached value), Tab B updates must not be overridden
+    it('yields to another tab detail update on a shared thread after the applied local pick is sent and confirmed via dataUpdatedAt', async () => {
+      mocks.seriesCatalog = NEON_CATALOG;
+      mocks.rawMetadata = NEON_RAW_META;
+      mocks.catalogModelNames = new Set([
+        'model-default',
+        'gemini-4-neon-low-oauth',
+        'gemini-4-neon-medium-oauth',
+        'gemini-4-neon-high-oauth',
+      ]);
+      mocks.sharedEntry = { workspace: { workspace_id: 'ws-shared' } };
+
+      const { result, rerender, queryClient } = setup(
+        { workspaceId: 'ws-shared' },
+        row('gemini-4-neon-high-oauth'),
+      );
+
+      // Tab A explicitly switches Low -> High (matching cached High), then sends.
+      act(() => {
+        void result.current.pickModel('gemini-4-neon-low-oauth');
+        void result.current.pickModel('gemini-4-neon-high-oauth');
+      });
+      expect(result.current.sendModel).toBe('gemini-4-neon-high-oauth');
+
+      rerender({ threadId: THREAD, isLoading: true, workspaceId: 'ws-shared' });
+      mocks.server = row('gemini-4-neon-high-oauth');
+      rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-shared' });
+      await waitFor(() => expect(result.current.sendModel).toBeNull());
+
+      // Tab B later sends with Low -> Tab A must follow Low instead of pinning High.
+      act(() => {
+        queryClient.setQueryData(queryKeys.threads.detail(THREAD), row('gemini-4-neon-low-oauth'));
+      });
+      await waitFor(() => expect(result.current.model).toBe('gemini-4-neon-low-oauth'));
+      expect(result.current.sendModel).toBeNull();
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+    });
+
+    // DALTON-HOOK(antigravity-series): Item 3 — shared-list first-read failure defers PATCH until retry succeeds, then skips PATCH (shared) or flushes PATCH (personal)
+    it('defers PATCH on first shared-list read failure and decides only after retry succeeds (shared skips, personal flushes)', async () => {
+      mocks.seriesCatalog = NEON_CATALOG;
+      mocks.rawMetadata = NEON_RAW_META;
+      mocks.catalogModelNames = new Set([
+        'model-default',
+        'gemini-4-neon-low-oauth',
+        'gemini-4-neon-medium-oauth',
+        'gemini-4-neon-high-oauth',
+      ]);
+
+      // Case 1: first read fails, retry confirms shared -> zero PATCHes, local pick kept.
+      mocks.sharedEntry = undefined;
+      mocks.sharedError = true;
+      const sharedView = setup({ workspaceId: 'ws-shared' }, row('gemini-4-neon-medium-oauth'));
+      act(() => { void sharedView.result.current.pickModel('gemini-4-neon-high-oauth'); });
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+
+      mocks.sharedEntry = { workspace: { workspace_id: 'ws-shared' } };
+      mocks.sharedError = false;
+      sharedView.rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-shared' });
+      await act(async () => {});
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+      expect(sharedView.result.current.model).toBe('gemini-4-neon-high-oauth');
+      expect(sharedView.result.current.sendModel).toBe('gemini-4-neon-high-oauth');
+      sharedView.unmount();
+
+      // DALTON-HOOK(antigravity-series): Case 2 — first read fails, retry confirms personal -> flushes deferred PATCH
+      mocks.sharedEntry = undefined;
+      mocks.sharedError = true;
+      mocks.updateThread.mockResolvedValueOnce(row('gemini-4-neon-high-oauth'));
+      const personalView = setup({ workspaceId: 'ws-personal' }, row('gemini-4-neon-medium-oauth'));
+      act(() => { void personalView.result.current.pickModel('gemini-4-neon-high-oauth'); });
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+
+      mocks.sharedEntry = null;
+      mocks.sharedError = false;
+      personalView.rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-personal' });
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, { llm_model: 'gemini-4-neon-high-oauth' }));
+      expect(personalView.result.current.model).toBe('gemini-4-neon-high-oauth');
+    });
+
+    // DALTON-HOOK(antigravity-series): Item 4 — a queued message sent with High must NOT clear an unsent Low picked before the queued turn started (shared & personal)
+    it('does not clear an unsent Low pick when a queued message sent with High finishes its turn, clearing Low only after Low is sent', async () => {
+      mocks.seriesCatalog = NEON_CATALOG;
+      mocks.rawMetadata = NEON_RAW_META;
+      mocks.catalogModelNames = new Set([
+        'model-default',
+        'gemini-4-neon-low-oauth',
+        'gemini-4-neon-medium-oauth',
+        'gemini-4-neon-high-oauth',
+      ]);
+
+      // Shared thread: user picks High (queued), then picks Low before queued High starts.
+      mocks.sharedEntry = { workspace: { workspace_id: 'ws-shared' } };
+      const shared = setup({ workspaceId: 'ws-shared' }, row('gemini-4-neon-medium-oauth'));
+      act(() => { void shared.result.current.pickModel('gemini-4-neon-high-oauth'); });
+      const highSeq = shared.result.current.sendModelSeq;
+      expect(highSeq).not.toBeNull();
+
+      act(() => { void shared.result.current.pickModel('gemini-4-neon-low-oauth'); });
+      const lowSeq = shared.result.current.sendModelSeq;
+      expect(lowSeq).not.toBe(highSeq);
+      expect(shared.result.current.model).toBe('gemini-4-neon-low-oauth');
+      expect(shared.result.current.sendModel).toBe('gemini-4-neon-low-oauth');
+
+      // Queued message starts with High (highSeq) and ends with server row updated to High.
+      shared.rerender({
+        threadId: THREAD,
+        isLoading: true,
+        workspaceId: 'ws-shared',
+        activeTurnModel: { model: 'gemini-4-neon-high-oauth', pickSeq: highSeq },
+      });
+      const highReread = deferred<Thread>();
+      mocks.getThread.mockReturnValueOnce(highReread.promise);
+      shared.rerender({
+        threadId: THREAD,
+        isLoading: false,
+        workspaceId: 'ws-shared',
+        activeTurnModel: null,
+      });
+      await act(async () => {
+        highReread.resolve(row('gemini-4-neon-high-oauth'));
+        await highReread.promise;
+      });
+      // DALTON-HOOK(antigravity-series): unsent Low survives High turn-end reread
+      expect(shared.result.current.model).toBe('gemini-4-neon-low-oauth');
+      expect(shared.result.current.sendModel).toBe('gemini-4-neon-low-oauth');
+
+      // Next turn actually sends Low (lowSeq) -> turn end clears Low.
+      shared.rerender({
+        threadId: THREAD,
+        isLoading: true,
+        workspaceId: 'ws-shared',
+        activeTurnModel: { model: 'gemini-4-neon-low-oauth', pickSeq: lowSeq },
+      });
+      const lowReread = deferred<Thread>();
+      mocks.getThread.mockReturnValueOnce(lowReread.promise);
+      shared.rerender({
+        threadId: THREAD,
+        isLoading: false,
+        workspaceId: 'ws-shared',
+        activeTurnModel: null,
+      });
+      await act(async () => {
+        lowReread.resolve(row('gemini-4-neon-low-oauth'));
+        await lowReread.promise;
+      });
+      await waitFor(() => expect(shared.result.current.sendModel).toBeNull());
+      expect(shared.result.current.model).toBe('gemini-4-neon-low-oauth');
+      shared.unmount();
+
+      // DALTON-HOOK(antigravity-series): Round 2 Item 3 — personal thread: saved Low survives queued High turn, re-PATCHes Low to the row, and never jumps back to High when sending the next message with Low
+      mocks.sharedEntry = null;
+      mocks.updateThread
+        .mockResolvedValueOnce(row('gemini-4-neon-high-oauth'))
+        .mockResolvedValueOnce(row('gemini-4-neon-low-oauth'))
+        .mockResolvedValueOnce(row('gemini-4-neon-low-oauth'));
+      const personal = setup({ workspaceId: 'ws-personal' }, row('gemini-4-neon-medium-oauth'));
+      await act(async () => { await personal.result.current.pickModel('gemini-4-neon-high-oauth'); });
+      const personalHighSeq = personal.result.current.sendModelSeq;
+      await act(async () => { await personal.result.current.pickModel('gemini-4-neon-low-oauth'); });
+      const personalLowSeq = personal.result.current.sendModelSeq;
+      expect(personal.result.current.sendModel).toBe('gemini-4-neon-low-oauth');
+
+      // Queued message 1 starts and is admitted with High -> server row moves to High.
+      personal.rerender({
+        threadId: THREAD,
+        isLoading: true,
+        workspaceId: 'ws-personal',
+        activeTurnModel: { model: 'gemini-4-neon-high-oauth', pickSeq: personalHighSeq, admitted: true },
+      });
+      const personalReread = deferred<Thread>();
+      mocks.getThread.mockReturnValueOnce(personalReread.promise);
+      personal.rerender({
+        threadId: THREAD,
+        isLoading: false,
+        workspaceId: 'ws-personal',
+        activeTurnModel: null,
+      });
+      await act(async () => {
+        personalReread.resolve(row('gemini-4-neon-high-oauth'));
+        await personalReread.promise;
+      });
+      // turnEndCheck re-persists Low onto the personal thread row and keeps UI & sendModel on Low.
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledTimes(3));
+      expect(mocks.updateThread).toHaveBeenLastCalledWith(THREAD, { llm_model: 'gemini-4-neon-low-oauth' });
+      expect(personal.result.current.model).toBe('gemini-4-neon-low-oauth');
+      expect(personal.result.current.sendModel).toBe('gemini-4-neon-low-oauth');
+
+      // Now simulate user sending message 2 with Low even if cached row temporarily still reads High:
+      // starting message 2 (unadmitted, then refused before admission) must NEVER jump back to High!
+      act(() => {
+        personal.queryClient.setQueryData(queryKeys.threads.detail(THREAD), row('gemini-4-neon-high-oauth'));
+      });
+      personal.rerender({
+        threadId: THREAD,
+        isLoading: true,
+        workspaceId: 'ws-personal',
+        activeTurnModel: { model: 'gemini-4-neon-low-oauth', pickSeq: personalLowSeq, admitted: false },
+      });
+      expect(personal.result.current.model).toBe('gemini-4-neon-low-oauth');
+      expect(personal.result.current.sendModel).toBe('gemini-4-neon-low-oauth');
+
+      // Message 2 is admitted with Low and finishes -> UI stays Low and sendModel clears.
+      personal.rerender({
+        threadId: THREAD,
+        isLoading: true,
+        workspaceId: 'ws-personal',
+        activeTurnModel: { model: 'gemini-4-neon-low-oauth', pickSeq: personalLowSeq, admitted: true },
+      });
+      const lowTurnReread = deferred<Thread>();
+      mocks.getThread.mockReturnValueOnce(lowTurnReread.promise);
+      personal.rerender({
+        threadId: THREAD,
+        isLoading: false,
+        workspaceId: 'ws-personal',
+        activeTurnModel: null,
+      });
+      await act(async () => {
+        lowTurnReread.resolve(row('gemini-4-neon-low-oauth'));
+        await lowTurnReread.promise;
+      });
+      await waitFor(() => expect(personal.result.current.sendModel).toBeNull());
+      expect(personal.result.current.model).toBe('gemini-4-neon-low-oauth');
+    });
+
+    // DALTON-HOOK(antigravity-series): Round 2 Item 1 — a send refused before server run admission (e.g. 402 budget check) must NOT clear a shared thread manual pick
+    it('keeps a shared thread model pick unsent when a send is refused before server admission, clearing it only after a later admitted turn', async () => {
+      mocks.seriesCatalog = NEON_CATALOG;
+      mocks.rawMetadata = NEON_RAW_META;
+      mocks.catalogModelNames = new Set([
+        'model-default',
+        'gemini-4-neon-low-oauth',
+        'gemini-4-neon-medium-oauth',
+        'gemini-4-neon-high-oauth',
+      ]);
+      mocks.sharedEntry = { workspace: { workspace_id: 'ws-shared' } };
+
+      const { result, rerender } = setup(
+        { workspaceId: 'ws-shared' },
+        row('gemini-4-neon-medium-oauth'),
+      );
+
+      act(() => { void result.current.pickModel('gemini-4-neon-high-oauth'); });
+      const highSeq = result.current.sendModelSeq;
+      expect(result.current.model).toBe('gemini-4-neon-high-oauth');
+      expect(result.current.sendModel).toBe('gemini-4-neon-high-oauth');
+
+      // Send starts (admitted: false) and is refused before server starts a run (e.g. budget 402).
+      rerender({
+        threadId: THREAD,
+        isLoading: true,
+        workspaceId: 'ws-shared',
+        activeTurnModel: { model: 'gemini-4-neon-high-oauth', pickSeq: highSeq, admitted: false },
+      });
+      const refusedReread = deferred<Thread>();
+      mocks.getThread.mockReturnValueOnce(refusedReread.promise);
+      rerender({
+        threadId: THREAD,
+        isLoading: false,
+        workspaceId: 'ws-shared',
+        activeTurnModel: null,
+      });
+      await act(async () => {
+        refusedReread.resolve(row('gemini-4-neon-medium-oauth'));
+        await refusedReread.promise;
+      });
+
+      // High MUST remain selected & queued for the user's resend (not reverted to server Medium).
+      expect(result.current.model).toBe('gemini-4-neon-high-oauth');
+      expect(result.current.sendModel).toBe('gemini-4-neon-high-oauth');
+      expect(result.current.sendModelSeq).toBe(highSeq);
+
+      // User resends the restored draft; this time server admits the run (admitted: true).
+      rerender({
+        threadId: THREAD,
+        isLoading: true,
+        workspaceId: 'ws-shared',
+        activeTurnModel: { model: 'gemini-4-neon-high-oauth', pickSeq: highSeq, admitted: false },
+      });
+      rerender({
+        threadId: THREAD,
+        isLoading: true,
+        workspaceId: 'ws-shared',
+        activeTurnModel: { model: 'gemini-4-neon-high-oauth', pickSeq: highSeq, admitted: true },
+      });
+      const admittedReread = deferred<Thread>();
+      mocks.getThread.mockReturnValueOnce(admittedReread.promise);
+      rerender({
+        threadId: THREAD,
+        isLoading: false,
+        workspaceId: 'ws-shared',
+        activeTurnModel: null,
+      });
+      await act(async () => {
+        admittedReread.resolve(row('gemini-4-neon-high-oauth'));
+        await admittedReread.promise;
+      });
+      await waitFor(() => expect(result.current.sendModel).toBeNull());
+      expect(result.current.model).toBe('gemini-4-neon-high-oauth');
+    });
+
+    // DALTON-HOOK(antigravity-series): Item 5 — if the first turn-end detail read fails and a later read returns another tab's Low, the already-sent High must unpin and follow Low
+    it('unpins a sent High pick when the first turn-end detail read fails and a subsequent detail read returns another tab Low', async () => {
+      mocks.seriesCatalog = NEON_CATALOG;
+      mocks.rawMetadata = NEON_RAW_META;
+      mocks.catalogModelNames = new Set([
+        'model-default',
+        'gemini-4-neon-low-oauth',
+        'gemini-4-neon-medium-oauth',
+        'gemini-4-neon-high-oauth',
+      ]);
+      mocks.sharedEntry = { workspace: { workspace_id: 'ws-shared' } };
+
+      const { result, rerender, queryClient } = setup(
+        { workspaceId: 'ws-shared' },
+        row('gemini-4-neon-medium-oauth'),
+      );
+
+      // Tab A picks High and sends a turn.
+      act(() => { void result.current.pickModel('gemini-4-neon-high-oauth'); });
+      expect(result.current.model).toBe('gemini-4-neon-high-oauth');
+      expect(result.current.sendModel).toBe('gemini-4-neon-high-oauth');
+
+      rerender({ threadId: THREAD, isLoading: true, workspaceId: 'ws-shared' });
+
+      // Turn ends; FIRST detail read FAILS -> High stays held while no fresh read has succeeded yet.
+      const failedReread = deferred<Thread>();
+      mocks.getThread.mockReturnValueOnce(failedReread.promise);
+      rerender({ threadId: THREAD, isLoading: false, workspaceId: 'ws-shared' });
+      await act(async () => {
+        failedReread.reject(failure());
+        await failedReread.promise.catch(() => {});
+      });
+      await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+      expect(result.current.model).toBe('gemini-4-neon-high-oauth');
+
+      // DALTON-HOOK(antigravity-series): SECOND detail read succeeds with Tab B's Low -> High unpins and composer follows Low
+      mocks.getThread.mockResolvedValueOnce(row('gemini-4-neon-low-oauth'));
+      await act(async () => {
+        await queryClient.refetchQueries({ queryKey: queryKeys.threads.detail(THREAD) });
+      });
+      await waitFor(() => expect(result.current.model).toBe('gemini-4-neon-low-oauth'));
+      expect(result.current.sendModel).toBeNull();
+      expect(mocks.updateThread).not.toHaveBeenCalled();
     });
   });
 });

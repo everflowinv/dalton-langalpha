@@ -154,6 +154,8 @@ export interface FallbackSuggestion {
 /** Model options for send/edit/regenerate. */
 interface ModelOptions {
   model?: string | null;
+  // DALTON-HOOK(antigravity-series): monotonic sequence of the local manual model pick carried by this send (Dalton builds only)
+  modelPickSeq?: number | null;
   reasoningEffort?: string | null;
   fastMode?: boolean | null;
   /**
