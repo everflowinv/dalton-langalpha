@@ -273,16 +273,6 @@ async def _folder_ready_result(
 # --- DALTON-HOOK(workspace-folder-ready): end ---
 
 
-def _http_error_message(exc: Any) -> str:
-    """Human-readable refusal text from an ``HTTPException``."""
-    detail = getattr(exc, "detail", None)
-    if isinstance(detail, dict):
-        return str(detail.get("message") or detail.get("detail") or detail)
-    if detail:
-        return str(detail)
-    return str(exc)
-
-
 async def workspaces_create(
     user_id: str,
     name: str | None,
@@ -296,8 +286,6 @@ async def workspaces_create(
     ticker: str | None = None,
     display_name: str | None = None,
     skip_coverage_suggestion: bool = False,
-    # DALTON-HOOK(cos-settings-tools): optional target computer for create
-    computer_id: str | None = None,
 ) -> Command:
     """Create a new workspace, once the user confirms unless ``preapproved``.
 
@@ -309,25 +297,6 @@ async def workspaces_create(
         return error_command(
             "name is required for create action", tool_call_id
         )
-
-    # --- DALTON-HOOK(cos-settings-tools): begin ---
-    target_computer_id = (
-        computer_id.strip() if isinstance(computer_id, str) and computer_id.strip() else None
-    )
-    target_computer_name: str | None = None
-    if target_computer_id is not None:
-        from src.server.services.computer_errors import ComputerNotFoundError
-        from src.server.services.workspace_manager import WorkspaceManager
-        from src.tools.secretary.utils import spoken_computer_name
-
-        try:
-            chosen_computer = await WorkspaceManager._chosen_computer(
-                user_id, target_computer_id
-            )
-        except ComputerNotFoundError:
-            return error_command("Computer not found", tool_call_id)
-        target_computer_name = spoken_computer_name(chosen_computer.get("name"))
-    # --- DALTON-HOOK(cos-settings-tools): end ---
 
     # --- DALTON-HOOK(workspace-dedup): begin ---
     from src.dalton.coverage.dedup import find_existing_company_workspace
@@ -397,14 +366,10 @@ async def workspaces_create(
 
     if not preapproved:
         holder, confirmed = await duplicate_workspace(user_id, name)
-        payload: dict[str, Any] = {
+        payload = {
             "workspace_name": name,
             "workspace_description": description or "",
         }
-        # DALTON-HOOK(cos-settings-tools): show target computer name on the confirmation card
-        if target_computer_id is not None:
-            payload["computer_id"] = target_computer_id
-            payload["computer_name"] = target_computer_name
         if holder is not None:
             payload["duplicate_workspace_name"] = holder.get("name")
             payload["duplicate_workspace_id"] = str(holder.get("workspace_id"))
@@ -455,32 +420,23 @@ async def workspaces_create(
         WorkspaceNameInvalid,
         WorkspaceNameTaken,
     )
-    from src.server.services.computer_errors import (
-        ComputerNotFoundError,
-        ComputerPreparingError,
-    )
+    from src.server.services.computer_errors import ComputerPreparingError
 
     try:
         from src.server.services.workspace_manager import WorkspaceManager
 
         workspace_manager = WorkspaceManager.get_instance()
-        create_kwargs: dict[str, Any] = {
-            "user_id": user_id,
-            "name": name,
-            "description": description,
-        }
-        if target_computer_id is not None:
-            create_kwargs["computer_id"] = target_computer_id
-        workspace = await workspace_manager.create_workspace(**create_kwargs)
+        workspace = await workspace_manager.create_workspace(
+            user_id=user_id,
+            name=name,
+            description=description,
+        )
 
-        result: dict[str, Any] = {
+        result = {
             "success": True,
             "workspace_id": str(workspace["workspace_id"]),
             "workspace_name": workspace["name"],
         }
-        if target_computer_id is not None:
-            result["computer_id"] = str(workspace.get("computer_id") or target_computer_id)
-            result["computer_name"] = target_computer_name
         # --- DALTON-HOOK(workspace-dedup): begin ---
         if wants_coverage:
             from src.dalton.coverage.units import auto_register_workspace_coverage_unit
@@ -526,8 +482,6 @@ async def workspaces_create(
         return error_command(f"{e} {hint}", tool_call_id)
     except WorkspaceNameInvalid as e:
         return error_command(str(e), tool_call_id)
-    except ComputerNotFoundError:
-        return error_command("Computer not found", tool_call_id)
     except ComputerPreparingError:
         return error_command(
             "The user's computer is still being prepared, so no workspace can "
@@ -540,6 +494,16 @@ async def workspaces_create(
 
 
 # --- DALTON-HOOK(cos-settings-tools): begin ---
+def _http_error_message(exc: Any) -> str:
+    """Human-readable refusal text from an ``HTTPException``."""
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, dict):
+        return str(detail.get("message") or detail.get("detail") or detail)
+    if detail:
+        return str(detail)
+    return str(exc)
+
+
 async def workspaces_update(
     user_id: str,
     workspace_id: str | None,
@@ -558,6 +522,7 @@ async def workspaces_update(
         )
 
     from fastapi import HTTPException
+    from pydantic import ValidationError
     from src.server.database.home_workspace import is_reserved_row
     from src.server.database.workspace import (
         get_workspace,
@@ -568,8 +533,17 @@ async def workspaces_update(
         WorkspaceNameInvalid,
         WorkspaceNameTaken,
     )
+    from src.server.models.workspace import WorkspaceUpdate
     from src.server.services.shared_workspaces.access import workspace_access
     from src.server.services.shared_workspaces.feed import publish_workspace_changed
+
+    try:
+        validated = WorkspaceUpdate(name=name, description=description)
+    except ValidationError as exc:
+        err = exc.errors()[0]
+        loc = ".".join(str(part) for part in err.get("loc") or ())
+        msg = err.get("msg") or str(exc)
+        return error_command(f"{loc}: {msg}" if loc else msg, tool_call_id)
 
     try:
         workspace = await get_workspace(workspace_id)
@@ -581,15 +555,21 @@ async def workspaces_update(
         return error_command("failed to update workspace", tool_call_id)
 
     reserved = is_reserved_row(workspace)
-    if reserved and name is not None and name != workspace.get("name"):
+    if (
+        reserved
+        and validated.name is not None
+        and validated.name != workspace.get("name")
+    ):
         return error_command("Home can't be renamed.", tool_call_id)
-    effective_name = None if (reserved and name == workspace.get("name")) else name
+    effective_name = (
+        None if (reserved and validated.name == workspace.get("name")) else validated.name
+    )
 
     try:
         updated = await db_update_workspace(
             workspace_id=workspace_id,
             name=effective_name,
-            description=description,
+            description=validated.description,
         )
         if not updated:
             return error_command("Workspace not found", tool_call_id)
@@ -623,105 +603,6 @@ async def workspaces_update(
     except Exception as e:
         logger.error(f"Failed to update workspace {workspace_id}: {e}")
         return error_command("failed to update workspace", tool_call_id)
-
-
-async def _workspaces_archive(
-    user_id: str, workspace_id: str | None, tool_call_id: str
-) -> Command:
-    """Archive a stopped workspace's computer with HITL confirmation."""
-    if not workspace_id:
-        return error_command(
-            "workspace_id is required for archive action", tool_call_id
-        )
-
-    from fastapi import HTTPException
-    from src.server.database.home_workspace import is_reserved_row
-    from src.server.database.workspace import (
-        get_live_workspace_folders_for_computer,
-        get_workspace,
-    )
-    from src.server.database.workspace_names import HOME_STAND_IN_FOLDER
-    from src.server.services.shared_workspaces.access import workspace_access
-
-    try:
-        workspace = await get_workspace(workspace_id)
-        await workspace_access(workspace, user_id, manage=True)
-    except HTTPException as exc:
-        return error_command(_http_error_message(exc), tool_call_id)
-    except Exception as e:
-        logger.error(f"Failed to verify workspace access for archive: {e}")
-        return error_command("failed to archive workspace", tool_call_id)
-
-    # Refused before the card, so the user is never asked to approve archiving Home.
-    if is_reserved_row(workspace):
-        return error_command("Home cannot be archived.", tool_call_id)
-
-    computer_id = str(workspace.get("computer_id") or "").strip() or None
-    affected_workspaces: list[dict[str, str]] = []
-    if computer_id:
-        try:
-            rows = await get_live_workspace_folders_for_computer(computer_id)
-        except Exception as e:
-            logger.warning(
-                f"Could not list sibling workspaces for computer {computer_id}: {e}"
-            )
-            rows = []
-        for row in rows:
-            if str(row.get("dir_name") or "") == HOME_STAND_IN_FOLDER:
-                continue
-            affected_workspaces.append(
-                {
-                    "workspace_id": str(row.get("workspace_id") or ""),
-                    "name": str(row.get("name") or ""),
-                }
-            )
-    if not affected_workspaces:
-        affected_workspaces = [
-            {
-                "workspace_id": str(workspace.get("workspace_id") or workspace_id),
-                "name": str(workspace.get("name") or ""),
-            }
-        ]
-    affected_names = [w["name"] for w in affected_workspaces if w.get("name")]
-
-    confirm_payload: dict[str, Any] = {
-        "workspace_id": workspace_id,
-        "workspace_name": workspace.get("name"),
-        "affected_workspaces": affected_workspaces,
-        "affected_workspace_names": affected_names,
-    }
-    if computer_id:
-        confirm_payload["computer_id"] = computer_id
-    if workspace.get("computer_name"):
-        confirm_payload["computer_name"] = workspace.get("computer_name")
-
-    approved, _ = hitl_confirm("archive_workspace", confirm_payload)
-    if not approved:
-        return decline_command(
-            "User declined workspace archive.", tool_call_id
-        )
-
-    from src.server.services.computer_usage.causes import computer_cause
-    from src.server.services.workspace_manager import WorkspaceManager
-
-    try:
-        workspace_manager = WorkspaceManager.get_instance()
-        with computer_cause("archive"):
-            await workspace_manager.archive_workspace(workspace_id)
-        return success_command(
-            {
-                "success": True,
-                "workspace_id": workspace_id,
-                "status": "stopped",
-                "affected_workspaces": affected_workspaces,
-            },
-            tool_call_id,
-        )
-    except (RuntimeError, ValueError) as e:
-        return error_command(str(e), tool_call_id)
-    except Exception as e:
-        logger.error(f"Failed to archive workspace {workspace_id}: {e}")
-        return error_command("failed to archive workspace", tool_call_id)
 # --- DALTON-HOOK(cos-settings-tools): end ---
 
 

@@ -1204,6 +1204,30 @@ async def schedule_dalton_automation_helper(
         if resolved_action != "upsert":
             return {"ok": False, "error": f"不支持的 action: {resolved_action}"}
 
+        max_failures_in_spec = (
+            "max_failures" in merged_spec and merged_spec.get("max_failures") is not None
+        )
+        validated_max_failures: int | None = None
+        if max_failures_in_spec:
+            raw_max_failures = merged_spec.get("max_failures")
+            if isinstance(raw_max_failures, bool) or not isinstance(raw_max_failures, int):
+                msg = "max_failures must be an integer between 1 and 100."
+                if via_rest:
+                    raise HTTPException(status_code=422, detail=msg)
+                return {"ok": False, "error": "invalid_max_failures", "message": msg}
+            from pydantic import ValidationError
+            from src.server.models.automation import AutomationUpdate
+
+            try:
+                validated_max_failures = AutomationUpdate(
+                    max_failures=raw_max_failures
+                ).max_failures
+            except ValidationError as exc:
+                msg = f"Invalid max_failures: {exc.errors()[0]['msg']}"
+                if via_rest:
+                    raise HTTPException(status_code=422, detail=msg) from None
+                return {"ok": False, "error": "invalid_max_failures", "message": msg}
+
         instruction = merged_spec.get("instruction") or merged_spec.get("prompt")
         if not instruction and not existing:
             return {"ok": False, "error": "新建任务必须提供 `instruction`。"}
@@ -1248,8 +1272,6 @@ async def schedule_dalton_automation_helper(
             _reconcile_reasoning_effort,
             _replaced_by_tracker_refusal,
             _safe_model_pref,
-            check_claude_code_hosted,
-            check_model,
         )
 
         effort_in_spec = "reasoning_effort" in merged_spec
@@ -1260,99 +1282,11 @@ async def schedule_dalton_automation_helper(
         model_in_spec = "llm_model" in merged_spec
         spec_llm_model = merged_spec.get("llm_model")
         if isinstance(spec_llm_model, str):
-            cleaned_model = spec_llm_model.strip()
-            spec_llm_model = (
-                None
-                if cleaned_model.lower() in ("", "default", "clear", "null")
-                else cleaned_model
-            )
-        if model_in_spec and spec_llm_model is not None and len(spec_llm_model) > 100:
-            msg = "llm_model must be at most 100 characters."
-            if via_rest:
-                raise HTTPException(status_code=422, detail=msg)
-            return {"ok": False, "error": "invalid_llm_model", "message": msg}
-
-        max_failures_in_spec = (
-            "max_failures" in merged_spec and merged_spec.get("max_failures") is not None
-        )
-        validated_max_failures: int | None = None
-        if max_failures_in_spec:
-            raw_max_failures = merged_spec.get("max_failures")
-            if isinstance(raw_max_failures, bool) or not isinstance(raw_max_failures, int):
-                msg = "max_failures must be an integer between 1 and 100."
-                if via_rest:
-                    raise HTTPException(status_code=422, detail=msg)
-                return {"ok": False, "error": "invalid_max_failures", "message": msg}
-            from pydantic import ValidationError
-            from src.server.models.automation import AutomationUpdate
-
-            try:
-                validated_max_failures = AutomationUpdate(
-                    max_failures=raw_max_failures
-                ).max_failures
-            except ValidationError as exc:
-                msg = f"Invalid max_failures: {exc.errors()[0]['msg']}"
-                if via_rest:
-                    raise HTTPException(status_code=422, detail=msg) from None
-                return {"ok": False, "error": "invalid_max_failures", "message": msg}
-
+            spec_llm_model = spec_llm_model.strip() or None
         # Load user model_pref before DB writes if model or effort reconciliation needs it.
         pref_for_effort: dict[str, Any] | None = None
         if effort_in_spec or model_in_spec or existing is None:
             pref_for_effort = await _safe_model_pref(task_owner, None)
-
-        async def _validate_llm_model_for_target(
-            model_name: str | None,
-            target_ws: str | None,
-            *,
-            check_name: bool,
-        ) -> tuple[tuple[str, dict[str, Any]] | None, dict[str, Any] | None]:
-            classified_pair: tuple[str, dict[str, Any]] | None = None
-            if check_name and model_name:
-                try:
-                    classified_pair = await check_model(
-                        task_owner, model_name, pref_for_effort
-                    )
-                except AutomationRefusal as exc:
-                    if via_rest:
-                        raise
-                    return None, {
-                        "ok": False,
-                        "error": "invalid_llm_model",
-                        "message": str(exc),
-                    }
-                entry = classified_pair[1] if isinstance(classified_pair[1], dict) else {}
-                provider = str(entry.get("provider") or "").strip()
-                parent_provider = str(entry.get("parent_provider") or "").strip() or None
-                if provider:
-                    from src.dalton.llm.providers import (
-                        ProviderDisabledError,
-                        ensure_provider_enabled,
-                    )
-
-                    try:
-                        ensure_provider_enabled(provider, parent_provider=parent_provider)
-                    except ProviderDisabledError as exc:
-                        if via_rest:
-                            raise HTTPException(status_code=403, detail=str(exc)) from None
-                        return None, {
-                            "ok": False,
-                            "error": "invalid_llm_model",
-                            "message": str(exc),
-                        }
-            try:
-                await check_claude_code_hosted(
-                    task_owner, model_name, target_ws, active_conn, pref_for_effort
-                )
-            except AutomationRefusal as exc:
-                if via_rest:
-                    raise
-                return None, {
-                    "ok": False,
-                    "error": "invalid_llm_model",
-                    "message": str(exc),
-                }
-            return classified_pair, None
 
         if existing:
             if (replaced_refusal := _replaced_by_tracker_refusal(existing)) is not None:
@@ -1437,20 +1371,7 @@ async def schedule_dalton_automation_helper(
                 patch["status"] = explicit_status
             if validated_max_failures is not None:
                 patch["max_failures"] = validated_max_failures
-            classified_for_update: tuple[str, dict[str, Any]] | None = None
             if model_in_spec:
-                model_changed = spec_llm_model != existing.get("llm_model")
-                if model_changed:
-                    target_ws_for_model = (
-                        str(existing.get("workspace_id") or ws_id or "").strip() or None
-                    )
-                    classified_for_update, model_err = await _validate_llm_model_for_target(
-                        spec_llm_model,
-                        target_ws_for_model,
-                        check_name=bool(spec_llm_model),
-                    )
-                    if model_err is not None:
-                        return model_err
                 patch["llm_model"] = spec_llm_model
             target_model_for_effort = (
                 patch["llm_model"] if model_in_spec else existing.get("llm_model")
@@ -1465,7 +1386,6 @@ async def schedule_dalton_automation_helper(
                         stored_effort=existing.get("reasoning_effort"),
                         is_create=False,
                         model_pref=pref_for_effort,
-                        classified=classified_for_update,
                         model_changed=(
                             model_in_spec
                             and target_model_for_effort != existing.get("llm_model")
@@ -1657,15 +1577,6 @@ async def schedule_dalton_automation_helper(
                 conn=active_conn,
             )
             create_llm_model = spec_llm_model if model_in_spec else None
-            classified_for_create: tuple[str, dict[str, Any]] | None = None
-            if model_in_spec:
-                classified_for_create, model_err = await _validate_llm_model_for_target(
-                    create_llm_model,
-                    ws_id,
-                    check_name=bool(create_llm_model),
-                )
-                if model_err is not None:
-                    return model_err
             try:
                 _, create_reasoning_effort = await _reconcile_reasoning_effort(
                     task_owner,
@@ -1675,7 +1586,6 @@ async def schedule_dalton_automation_helper(
                     stored_effort=None,
                     is_create=True,
                     model_pref=pref_for_effort,
-                    classified=classified_for_create,
                 )
             except AutomationRefusal as exc:
                 if via_rest:

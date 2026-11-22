@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from fastapi import HTTPException
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
+from pydantic import StrictInt
 
 from src.dalton.auth import (
     resolve_caller_home_workspace_id,
@@ -1523,9 +1524,8 @@ def build_director_tools(
         timezone_name: str | None = None,
         workspace_id: str | None = None,
         ticker: str | None = None,
-        llm_model: str | None = None,
         reasoning_effort: str | None = None,
-        max_failures: int | None = None,
+        max_failures: StrictInt | None = None,
         config: RunnableConfig = None,
     ) -> str:
         """Create, update, pause, resume, or list Dalton (`dalton-*`) automations.
@@ -1545,8 +1545,7 @@ def build_director_tools(
             timezone_name: IANA timezone. Omit on create to use the deployment default; omit on update to keep the existing timezone. Naive `next_run_at` values are interpreted in this timezone.
             workspace_id: Workspace UUID used to place a new automation or locate an existing one in that workspace (does not move an existing automation; defaults to the current workspace in config).
             ticker: Optional company ticker for naming validation.
-            llm_model: Optional model ID override. Pass `""` or `"default"` to clear back to user/model default; omit on update to keep the current value.
-            reasoning_effort: Optional thinking effort override (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Omit on create to inherit user/model default; omit on update to keep the current value, or pass `""` / `"default"` to clear. When specifying `llm_model`, pass an effort supported by that model. Built-in Antigravity models encode effort in the `llm_model` suffix and leave `reasoning_effort` unset.
+            reasoning_effort: Optional thinking effort override (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Omit on create to inherit user/model default; omit on update to keep the current value, or pass `""` / `"default"` to clear. Built-in Antigravity effort is determined by the task's model ID; change the model in the automation's settings.
             max_failures: Optional consecutive-failure auto-disable limit (integer 1–100; default 3 on create, omit on update to keep the current value).
         """
         configurable = (config or {}).get("configurable") or {}
@@ -1571,13 +1570,6 @@ def build_director_tools(
             "workspace_id": ws_id,
             "ticker": ticker,
         }
-        if llm_model is not None:
-            cleaned_model = llm_model.strip()
-            spec["llm_model"] = (
-                None
-                if cleaned_model.lower() in ("", "default", "clear", "null")
-                else cleaned_model
-            )
         if reasoning_effort is not None:
             cleaned_effort = reasoning_effort.strip().lower()
             spec["reasoning_effort"] = (

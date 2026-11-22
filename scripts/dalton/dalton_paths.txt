@@ -538,5 +538,5 @@ tests/unit/dalton/test_automation_reasoning_effort.py
 tests/unit/dalton/test_automation_effort_inheritance.py
 tests/unit/dalton/test_backfill_opus_automation_effort.py
 web/src/pages/Setup/answers/__tests__/daltonTeamModelsCheck.test.ts
-# Chief of Staff settings tools (manage_workspaces update/archive/create(computer_id)) tests.
+# Chief of Staff settings tools (manage_workspaces update) tests.
 tests/unit/tools/secretary/test_workspace_settings_tools.py
