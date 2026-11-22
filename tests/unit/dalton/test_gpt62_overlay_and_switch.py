@@ -42,11 +42,11 @@ def test_gpt62_models_from_upstream_manifest_keep_notional_and_retire_61() -> No
     overlay_provider_models = (overlay_data.get("providers") or {}).get("models") or {}
     dalton_meta = overlay_mod.load_dalton_meta()
 
-    for key, expected_provider, expected_model_id, expected_speed in (
-        ("gpt-6.2-astra", "openai", "gpt-6.2-astra", 3),
-        ("gpt-6.2-sol", "openai", "gpt-6.2-sol", 3),
-        ("gpt-6.2-astra-oauth", "codex-oauth", "gpt-6.2-astra", 3),
-        ("gpt-6.2-sol-oauth", "codex-oauth", "gpt-6.2-sol", 3),
+    for key, expected_provider, expected_model_id, expected_speed, expected_intelligence in (
+        ("gpt-6.2-astra", "openai", "gpt-6.2-astra", 2, 5),
+        ("gpt-6.2-sol", "openai", "gpt-6.2-sol", 3, 4),
+        ("gpt-6.2-astra-oauth", "codex-oauth", "gpt-6.2-astra", 2, 5),
+        ("gpt-6.2-sol-oauth", "codex-oauth", "gpt-6.2-sol", 3, 4),
     ):
         assert key in upstream_models, f"{key} should be provided by upstream manifest"
         assert key not in overlay_models, f"{key} should not duplicate upstream in overlay"
@@ -57,7 +57,8 @@ def test_gpt62_models_from_upstream_manifest_keep_notional_and_retire_61() -> No
         assert entry["provider"] == expected_provider
         assert entry["model_id"] == expected_model_id
         assert entry["speed"] == expected_speed
-        assert entry["intelligence"] == 5
+        assert entry["intelligence"] == expected_intelligence
+        assert entry["plain_language"] == 3
         assert entry["context"] == 1050000
         assert entry["input_modalities"] == ["text", "image", "pdf"]
         assert entry["reasoning"]["efforts"] == ["low", "medium", "high", "xhigh", "max"]

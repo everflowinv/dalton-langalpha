@@ -2089,18 +2089,18 @@ def test_gemini_4_overlay_models_default_to_expansive_compaction_and_user_pref_o
 
 
 def test_antigravity_gemini_ratings_inherited_in_overlay_and_catalog(monkeypatch):
-    """Antigravity Gemini entries carry intelligence & speed inherited from their direct Gemini manifest entries."""
+    """Antigravity Gemini entries carry intelligence, speed, and plain_language from their direct Gemini entries."""
     monkeypatch.setattr(LLM, "_model_config", None)
     mc = LLM.get_model_config()
     catalog = mc.get_model_metadata()
     overlay_models = (load_overlay_data(NATIVE_OVERLAY_PATH) or {}).get("models") or {}
 
     expected_by_prefix = {
-        "gemini-4-neon-": (5, 4),
-        "gemini-4-carbon-": (5, 3),
-        "gemini-4-hydrogen-": (4, 5),
+        "gemini-4-neon-": (4, 4, 5),
+        "gemini-4-carbon-": (5, 3, 5),
+        "gemini-4-hydrogen-": (4, 5, None),
     }
-    for prefix, (exp_int, exp_spd) in expected_by_prefix.items():
+    for prefix, (exp_int, exp_spd, exp_pln) in expected_by_prefix.items():
         matched = [
             k
             for k, v in overlay_models.items()
@@ -2114,21 +2114,40 @@ def test_antigravity_gemini_ratings_inherited_in_overlay_and_catalog(monkeypatch
             assert overlay_models[key]["speed"] == exp_spd, key
             assert catalog[key]["intelligence"] == exp_int, key
             assert catalog[key]["speed"] == exp_spd, key
+            if exp_pln is not None:
+                assert overlay_models[key]["plain_language"] == exp_pln, key
+                assert catalog[key]["plain_language"] == exp_pln, key
+            else:
+                assert "plain_language" not in overlay_models[key], key
+                assert "plain_language" not in catalog[key], key
 
-    # Existing explicit Argon ratings remain preserved
+    # Existing explicit Argon ratings remain preserved (and have no plain_language)
     assert overlay_models["gemini-4-argon-low-oauth"]["intelligence"] == 5
     assert overlay_models["gemini-4-argon-low-oauth"]["speed"] == 3
     assert overlay_models["gemini-4-argon-high-oauth"]["speed"] == 2
+    assert "plain_language" not in overlay_models["gemini-4-argon-low-oauth"]
 
 
 def test_inherit_antigravity_gemini_ratings_leaves_non_antigravity_unchanged():
-    """Rating inheritance fills missing ratings on antigravity-oauth Gemini entries only."""
+    """Rating inheritance fills missing ratings (including plain_language) on antigravity-oauth Gemini entries only."""
     from src.dalton.llm.overlay import inherit_antigravity_gemini_ratings
 
     catalog: dict[str, Any] = {
-        "gemini-4-neon": {"provider": "gemini", "model_id": "gemini-4-neon", "intelligence": 5, "speed": 4},
+        "gemini-4-neon": {
+            "provider": "gemini",
+            "model_id": "gemini-4-neon",
+            "intelligence": 4,
+            "speed": 4,
+            "plain_language": 5,
+        },
         "gemini-4-argon": {"provider": "gemini", "model_id": "gemini-4-argon", "intelligence": 5, "speed": 3},
         "gemini-4-neon-high-oauth": {"provider": "antigravity-oauth", "model_id": "gemini-4-neon-high"},
+        "gemini-4-neon-explicit-oauth": {
+            "provider": "antigravity-oauth",
+            "model_id": "gemini-4-neon-low",
+            "intelligence": 5,
+            "plain_language": 2,
+        },
         "gemini-4-argon-high-oauth": {
             "provider": "antigravity-oauth",
             "model_id": "gemini-4-argon-high",
@@ -2142,19 +2161,174 @@ def test_inherit_antigravity_gemini_ratings_leaves_non_antigravity_unchanged():
     }
 
     updated = inherit_antigravity_gemini_ratings(catalog)
-    assert updated == 1
-    assert catalog["gemini-4-neon-high-oauth"]["intelligence"] == 5
+    assert updated == 2
+    assert catalog["gemini-4-neon-high-oauth"]["intelligence"] == 4
     assert catalog["gemini-4-neon-high-oauth"]["speed"] == 4
-    # Explicit speed=2 on argon-high is NOT overwritten by direct speed=3
+    assert catalog["gemini-4-neon-high-oauth"]["plain_language"] == 5
+    # Explicit values take precedence over inherited values; only missing speed is filled
+    assert catalog["gemini-4-neon-explicit-oauth"]["intelligence"] == 5
+    assert catalog["gemini-4-neon-explicit-oauth"]["speed"] == 4
+    assert catalog["gemini-4-neon-explicit-oauth"]["plain_language"] == 2
+    # Explicit speed=2 on argon-high is NOT overwritten by direct speed=3; no plain_language on argon
     assert catalog["gemini-4-argon-high-oauth"]["intelligence"] == 5
     assert catalog["gemini-4-argon-high-oauth"]["speed"] == 2
+    assert "plain_language" not in catalog["gemini-4-argon-high-oauth"]
     # Non-Antigravity entries remain untouched
-    assert "intelligence" not in catalog["gemini-4-neon-custom"]
-    assert "speed" not in catalog["gemini-4-neon-custom"]
-    assert "intelligence" not in catalog["muse-ember-1.0-oauth"]
-    assert "speed" not in catalog["muse-ember-1.0-oauth"]
-    assert "intelligence" not in catalog["gpt-6.2-astra-oauth"]
-    assert "speed" not in catalog["gpt-6.2-astra-oauth"]
+    for key in ("gemini-4-neon-custom", "muse-ember-1.0-oauth", "gpt-6.2-astra-oauth"):
+        assert "intelligence" not in catalog[key]
+        assert "speed" not in catalog[key]
+        assert "plain_language" not in catalog[key]
+
+
+def test_five_onboarding_series_ratings_and_metadata_plain_language(monkeypatch):
+    """Static overlay (native_overlay.json only, without runtime sync file) carries exact calibrated
+    intelligence/speed/plain_language ratings for all 19 entries across the 5 onboarding series,
+    and get_model_metadata() surfaces plain_language only for rated models."""
+    from src.dalton.llm import overlay as overlay_mod
+
+    monkeypatch.setattr(overlay_mod, "OVERLAY_SOURCES", [("native", NATIVE_OVERLAY_PATH)])
+    monkeypatch.setattr(LLM, "_model_config", None)
+    mc = LLM.get_model_config()
+    metadata = mc.get_model_metadata()
+
+    expected_ratings: dict[str, tuple[int, int, int]] = {
+        # Gemini 4 Neon: intelligence=4, speed=4, plain_language=5
+        "gemini-4-neon": (4, 4, 5),
+        "gemini-4-neon-low-oauth": (4, 4, 5),
+        "gemini-4-neon-medium-oauth": (4, 4, 5),
+        "gemini-4-neon-high-oauth": (4, 4, 5),
+        "gemini-4-neon-xhigh-oauth": (4, 4, 5),
+        # Gemini 4 Carbon: intelligence=5, speed=3, plain_language=5
+        "gemini-4-carbon": (5, 3, 5),
+        "gemini-4-carbon-low-oauth": (5, 3, 5),
+        "gemini-4-carbon-medium-oauth": (5, 3, 5),
+        "gemini-4-carbon-high-oauth": (5, 3, 5),
+        # Claude Opus 5.5: intelligence=5, speed unchanged (3; high-oauth=2), plain_language=4
+        "claude-opus-5-5": (5, 3, 4),
+        "claude-opus-5-5-oauth": (5, 3, 4),
+        "claude-opus-5-5-code": (5, 3, 4),
+        "claude-opus-5-5-low-oauth": (5, 3, 4),
+        "claude-opus-5-5-medium-oauth": (5, 3, 4),
+        "claude-opus-5-5-high-oauth": (5, 2, 4),
+        # GPT-6.2 Astra: intelligence=5, speed=2, plain_language=3
+        "gpt-6.2-astra": (5, 2, 3),
+        "gpt-6.2-astra-oauth": (5, 2, 3),
+        # GPT-6.2 Sol: intelligence=4, speed=3, plain_language=3
+        "gpt-6.2-sol": (4, 3, 3),
+        "gpt-6.2-sol-oauth": (4, 3, 3),
+    }
+
+    series_prefixes = (
+        "gemini-4-neon",
+        "gemini-4-carbon",
+        "claude-opus-5-5",
+        "gpt-6.2-astra",
+        "gpt-6.2-sol",
+    )
+    discovered = {
+        k
+        for k, v in mc.llm_config.items()
+        if isinstance(v, dict)
+        and any(k.startswith(p) or str(v.get("model_id") or "").startswith(p) for p in series_prefixes)
+    }
+    assert discovered == set(expected_ratings), f"Series keys drifted: {discovered ^ set(expected_ratings)}"
+
+    for key, (exp_int, exp_spd, exp_pln) in expected_ratings.items():
+        entry = mc.get_model_config(key)
+        assert entry is not None, key
+        assert entry["intelligence"] == exp_int, key
+        assert entry["speed"] == exp_spd, key
+        assert entry["plain_language"] == exp_pln, key
+        if key in metadata:
+            assert metadata[key]["intelligence"] == exp_int, key
+            assert metadata[key]["speed"] == exp_spd, key
+            assert metadata[key]["plain_language"] == exp_pln, key
+
+    # All 5 Dalton setup candidates are listed and surface plain_language via get_model_metadata().
+    for candidate in (
+        "gemini-4-neon-high-oauth",
+        "gemini-4-carbon-medium-oauth",
+        "claude-opus-5-5-oauth",
+        "claude-opus-5-5-medium-oauth",
+        "gpt-6.2-astra-oauth",
+        "gpt-6.2-sol-oauth",
+    ):
+        assert candidate in metadata, candidate
+        assert metadata[candidate]["plain_language"] == expected_ratings[candidate][2], candidate
+
+    # Non-five-series models must not carry plain_language.
+    for other in ("gemini-4-hydrogen-low-oauth", "gemini-4-argon-low-oauth", "claude-sonnet-5-5-oauth", "grok-4.7-oauth"):
+        entry = mc.get_model_config(other)
+        assert entry is not None, other
+        assert "plain_language" not in entry, other
+        if other in metadata:
+            assert "plain_language" not in metadata[other], other
+
+
+def test_runtime_sync_antigravity_gemini_inherits_static_overlay_ratings(tmp_path, monkeypatch):
+    """A runtime-synced Antigravity Gemini variant inherits calibrated intelligence/speed/plain_language
+    from the static overlay's direct Gemini entry while keeping explicit ratings intact."""
+    from src.dalton.llm import overlay as overlay_mod
+
+    runtime_sync_path = tmp_path / "native_sync_overlay.json"
+    runtime_sync_path.write_text(
+        json.dumps(
+            {
+                "schema": "dalton-native-sync-overlay/1",
+                "models": {
+                    "gemini-4-neon-minimal-oauth": {
+                        "model_id": "gemini-4-neon-minimal",
+                        "provider": "antigravity-oauth",
+                        "visible": True,
+                    },
+                    "gemini-4-carbon-xhigh-oauth": {
+                        "model_id": "gemini-4-carbon-xhigh",
+                        "provider": "antigravity-oauth",
+                        "visible": True,
+                        "speed": 2,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        overlay_mod,
+        "OVERLAY_SOURCES",
+        [("native", NATIVE_OVERLAY_PATH), ("native_sync", runtime_sync_path)],
+    )
+    monkeypatch.setattr(LLM, "_model_config", None)
+    mc = LLM.get_model_config()
+
+    neon_min = mc.get_model_config("gemini-4-neon-minimal-oauth")
+    assert neon_min is not None
+    assert neon_min["intelligence"] == 4
+    assert neon_min["speed"] == 4
+    assert neon_min["plain_language"] == 5
+
+    carbon_xhigh = mc.get_model_config("gemini-4-carbon-xhigh-oauth")
+    assert carbon_xhigh is not None
+    assert carbon_xhigh["intelligence"] == 5
+    # Explicit speed=2 wins over inherited direct speed=3; missing plain_language is inherited.
+    assert carbon_xhigh["speed"] == 2
+    assert carbon_xhigh["plain_language"] == 5
+
+
+def test_agent_config_dalton_merged_fallback_order(monkeypatch):
+    """Merged agent_config.yaml + agent_config.dalton.yaml defines the exact 6-model default fallback chain."""
+    from ptc_agent.config.file_utils import load_yaml_config
+
+    monkeypatch.setenv("APP_ENV", "dalton")
+    merged = load_yaml_config(str(REPO_ROOT / "agent_config.yaml"), use_cache=False)
+    assert (merged.get("llm") or {}).get("fallback") == [
+        "gemini-4-neon-high-oauth",
+        "claude-opus-5-5-oauth",
+        "gpt-6.2-sol-oauth",
+        "grok-4.7-oauth",
+        "muse-wonder-1.0-oauth",
+        "deepseek-flash",
+    ]
+
 
 
 

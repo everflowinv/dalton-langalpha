@@ -32,7 +32,7 @@ from src.server.services.llm.availability import (
     raise_oauth_reauth_required,
 )
 from src.server.services.llm.clients import subscription_route
-from src.server.services.llm.config import resolve_llm_config
+from src.server.services.llm.config import deployment_llm, resolve_llm_config
 from src.server.services.llm.user_models import ModelSource
 from src.server.utils.pg_sanitize import normalize_uuid
 
@@ -213,11 +213,21 @@ async def resolve_with_subscription_fallback(
     model_resolves_fn: Callable[[dict[str, Any], str], bool] = model_resolves,
     failed_subject: str | None = None,
 ) -> tuple[Any, dict[str, Any]]:
-    """Try each usable model in ``prefs['fallback_models']`` not on *failed_provider*.
+    """Try each usable fallback model not on *failed_provider*.
+
+    Uses the user's saved ``prefs['fallback_models']`` when present (an explicit
+    empty list ``[]`` disables fallback). When the user has never saved
+    ``fallback_models`` (missing key or ``None``), falls back to the merged
+    deployment default ``llm.fallback``.
 
     Raises *exc_to_raise* if no fallback candidate can serve the turn.
     """
-    candidates = prefs.get("fallback_models")
+    saved_candidates = prefs.get("fallback_models")
+    if saved_candidates is None:
+        llm_cfg = deployment_llm()
+        candidates = list(llm_cfg.fallback) if llm_cfg and llm_cfg.fallback else []
+    else:
+        candidates = saved_candidates
     if not isinstance(candidates, list) or not candidates:
         raise exc_to_raise
 

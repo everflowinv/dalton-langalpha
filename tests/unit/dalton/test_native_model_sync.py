@@ -568,11 +568,13 @@ def test_native_catalog_build_entries_antigravity_gemini_inherits_direct_ratings
     models_out, _ = build_overlay_entries(added, llm_config, meta_map)
 
     neon_min = models_out["gemini-4-neon-minimal-oauth"]
-    assert neon_min["intelligence"] == 5
+    assert neon_min["intelligence"] == 4
     assert neon_min["speed"] == 4
+    assert neon_min["plain_language"] == 5
     codex_entry = models_out["gpt-6.9-sol-oauth"]
     assert "intelligence" not in codex_entry
     assert "speed" not in codex_entry
+    assert "plain_language" not in codex_entry
 
 
 def test_native_catalog_build_entries_write_xai_capability_fields(monkeypatch):
