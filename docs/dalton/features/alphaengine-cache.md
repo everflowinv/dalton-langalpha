@@ -36,19 +36,22 @@
 
 ### 3.1 工具说明规则
 
-在 `scripts/dalton/research_runtime/config/data_sources.json`（`alphaengine.rules`）、`plugins/dalton_data/plugin.json` 及 bridge 工具描述中统一写入规则：
+在 `scripts/dalton/research_runtime/config/data_sources.json`（`alphaengine.rules` / `transcript.rules`）、`plugins/dalton_data/plugin.json` 及 bridge 工具描述中统一写入规则：
 
-> 单家公司检索一次完成：检索一家公司时，把中英文公司名和股票代码用空格隔开写在同一个查询里，从返回列表挑选文档；已有结果时从现有列表筛选，报错时切换备用数据源；不同公司或新主题照常各自检索。
+> 单家公司检索一次完成：检索一家公司时，把中英文公司名和股票代码用空格隔开写在同一个查询里，从返回列表挑选文档；已有结果时从现有列表筛选，报错时切换备用数据源；不同公司或新主题照常各自检索。AlphaEngine 按实际向上游请求的页数计检索额度，命中短时缓存不计；每页至少请求 20 条（`limit` 超过 20 时按 `limit` 请求，去重或筛选后不足 `limit` 条时会自动翻页，单次最多 5 页）。先用 `limit` 20 以内，不够再翻页，不要一次要 50 条再只看前几条。
+>
+> 查业绩会转写时把 `start` / `end` 收窄到业绩会前后几天，避免日期范围过宽导致连续翻页。
 
 ### 3.2 会话级 30 分钟软提醒（`AlphaEngineCompanySearchTracker`）
 
-- **内存滑动窗口**：计数保存在 bridge 进程内存中，按会话（优先取 `thread`，缺省回退 `workspace`）维护 30 分钟滑动窗口（`COMPANY_SEARCH_WINDOW_S = 1800` 秒），过期自动清理且落盘零持久化。
+- **内存滑动窗口与条目上限**：状态仅保存在单进程 bridge 内存中，按会话（优先取 `thread`，缺省回退 `workspace`）维护 30 分钟滑动窗口（`COMPANY_SEARCH_WINDOW_S = 1800` 秒），每次调用（含失败与无会话请求）均先按时间清理并受条目上限约束：同公司签名记录、同词历史、文档清单三类各自跨会话最多 `COMPANY_SEARCH_MAX_ENTRIES = 5000` 条（三类合计最多 15,000 条），超出时淘汰最旧条目，不落盘。同一 `(会话, 公司)` 下每个查询签名仅保留最近一次时间戳，每个会话仅保留提示所需的最少信息（时间、返回条数、每家公司最多 10 条文档的 `doc_id` / 标题 / 日期）。提示计算与查询日志写入相互独立异常隔离：提示计算异常仅记 warning 并降级为不附提示；查询日志写入异常仅记 warning，有意保留已算出的 `advice` / `advice_previous_docs` 正常返回，二者均不影响检索结果返回和台账记录。
 - **公司识别口径**：基于 `plugins/dalton/skills/dalton-daily-filing-alert/watchlist*.txt`、各行业 `universe.json` 与核心中英文别名表（`extract_companies_from_search`）匹配 `query` 与 `ticker`：
   - 纯 ASCII 股票代码严格区分大小写（仅认大写，例如 `NVDA` 命中而 `nvda` 不计入）。
   - 与常见英文词重名的代码（如 `APP`、`AI`、`ON`、`NOW`、`ALL`、`CAN`、`IT`、`META`、`UBER`、`SNOW`、`PATH`、`CARS`、`FAST`、`REAL`、`LOVE`、`OPEN`、`PLAY`、`TEAM`、`BOX`、`LIFE`、`ARM`、`FUN`、`COST`、`SHOP`、`SPOT`、`DASH`、`CART`、`BOX` 等）单独裸写时不触发，仅在查询同时包含该公司其他名称（如 `AppLovin`、`Meta Platforms`）或明确代码写法（`$APP`、`APP US`、`APP.O`）时命中。
-  - 无法识别出公司的纯主题词跳过公司计数，不触发提醒和排行。
-- **软提醒触发条件**：同一会话在 30 分钟内对同一家公司发起第 3 次及以上、且检索关键词与此前不同的请求时，检索正常执行并返回全部结果，同时在返回对象附加 `advice` 字段：
-  `本会话已有这家公司的检索结果（共 N 次），请先从之前的结果中挑选；需要新主题时再检索`。
+  - 无法识别出公司的纯主题词跳过公司计数，不触发同公司提醒（但仍受同词重搜提醒覆盖）；调用方未写 `query`（仅传 `ticker`）的请求不参与同词判断，纯 `ticker` 的 `transcript` 请求跳过同公司计数但已返回的团队文档仍记入同公司文档清单。
+- **同词重搜提醒（只提示、不拦截）**：同一会话 30 分钟内对调用方原始传入的同一规范化查询词（跨 `search_library` 与 `transcript`，忽略日期、条数、排序、筛选差异，且不以 bridge 折叠后的 `ticker` 充当查询词）再次发起非翻页检索（不带 `cursor`）时（`transcript` 忽略主题词、返回带 `query_ignored` 时，这个主题词不算本次查询词，不参与同词提醒），检索照常执行并返回全部结果，在返回对象附加 `advice`：`本会话 {N} 分钟前已用相同查询词检索过（上次返回 {M} 条）；请先从现有结果中挑选，确实需要不同时间段或更多结果时再检索`（不足 1 分钟写“不到 1 分钟前”）。缓存命中同样计入“上次检索”；命中 `_is_personal_scope_request` 的个人会议请求完全不进入同词历史，既不记录也不触发同词提醒。
+- **同公司多次检索提醒与已有文档清单**：沿用原有同公司计数口径（含失败、`mode=plan`、个人会议与带查询词的续页刷新时间），同一会话 30 分钟内对同一家公司发起第 3 次及以上且为**新查询词**的检索时，在返回对象附加 `advice`，并将本会话此前该公司检索已返回的文档清单放在独立字段 `advice_previous_docs`（每条含 `doc_id`、`title`、`date`，去重、按最近一次返回排序、最多 10 条），并在 `advice` 中指向 `advice_previous_docs`。个人会议范围的请求（`_is_personal_scope_request`）不记录文档清单。
+- **同时触发优先级与 `route="all"` 透传**：同词重搜与同公司多次检索分开判断；两者同时满足时仅附一条 `advice`（同词重搜优先，括号内附“，此前返回的文档见 `advice_previous_docs`”），`advice_previous_docs` 照常附带；`route="all"` 的 AlphaEngine 子腿将 `advice` 与 `advice_previous_docs` 同时附在顶层及 `payload["alphaengine"]`。
 
 ## 4. 上游保护（检索熔断）与失败兜底
 
