@@ -776,7 +776,6 @@ async def schedule_dalton_automation_helper(
                 "status": r.get("status"),
                 "llm_model": r.get("llm_model"),
                 "reasoning_effort": r.get("reasoning_effort"),
-                "max_failures": r.get("max_failures"),
             }
             for r in rows
             if str(r.get("name") or "").startswith("dalton-")
@@ -1204,30 +1203,6 @@ async def schedule_dalton_automation_helper(
         if resolved_action != "upsert":
             return {"ok": False, "error": f"不支持的 action: {resolved_action}"}
 
-        max_failures_in_spec = (
-            "max_failures" in merged_spec and merged_spec.get("max_failures") is not None
-        )
-        validated_max_failures: int | None = None
-        if max_failures_in_spec:
-            raw_max_failures = merged_spec.get("max_failures")
-            if isinstance(raw_max_failures, bool) or not isinstance(raw_max_failures, int):
-                msg = "max_failures must be an integer between 1 and 100."
-                if via_rest:
-                    raise HTTPException(status_code=422, detail=msg)
-                return {"ok": False, "error": "invalid_max_failures", "message": msg}
-            from pydantic import ValidationError
-            from src.server.models.automation import AutomationUpdate
-
-            try:
-                validated_max_failures = AutomationUpdate(
-                    max_failures=raw_max_failures
-                ).max_failures
-            except ValidationError as exc:
-                msg = f"Invalid max_failures: {exc.errors()[0]['msg']}"
-                if via_rest:
-                    raise HTTPException(status_code=422, detail=msg) from None
-                return {"ok": False, "error": "invalid_max_failures", "message": msg}
-
         instruction = merged_spec.get("instruction") or merged_spec.get("prompt")
         if not instruction and not existing:
             return {"ok": False, "error": "新建任务必须提供 `instruction`。"}
@@ -1369,8 +1344,6 @@ async def schedule_dalton_automation_helper(
                 patch["metadata"] = merged_meta
             if explicit_status:
                 patch["status"] = explicit_status
-            if validated_max_failures is not None:
-                patch["max_failures"] = validated_max_failures
             if model_in_spec:
                 patch["llm_model"] = spec_llm_model
             target_model_for_effort = (
@@ -1600,8 +1573,6 @@ async def schedule_dalton_automation_helper(
                 create_kw["status"] = explicit_status
             if create_reasoning_effort is not None:
                 create_kw["reasoning_effort"] = create_reasoning_effort
-            if validated_max_failures is not None:
-                create_kw["max_failures"] = validated_max_failures
             create_audit_payload = (
                 create_report_change.build_audit_entry()
                 if create_report_change is not None

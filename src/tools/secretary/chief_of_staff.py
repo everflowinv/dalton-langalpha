@@ -92,7 +92,7 @@ async def chief_of_staff_workspaces(
     Args:
         action: "list", "create", "update", "delete", "list_files", "read_file", "copy_file", or "write_file". Call "delete" only when the user explicitly asks; verify the workspace name first and wait for confirmation.
         name: Workspace name; required for "create", optional for "update". Renaming a workspace also changes its folder name on its computer; Home cannot be renamed.
-        description: What the workspace is for (up to 1,000 characters); optional for "create" and "update".
+        description: What the workspace is for; optional for "create" and "update" (an "update" keeps it to 1,000 characters).
         workspace_id: Target workspace ID; required for "update", "delete", "list_files", "read_file", "copy_file", and "write_file". Home cannot be deleted.
         path: Relative directory or file path INSIDE workspace_id's own folder (sources/x.md, not DASH/sources/x.md); optional prefix for "list_files", required for "read_file", "copy_file" and "write_file". Workspace folders sit beside Home (../<folder>), never inside it — a path starting with a workspace folder name is refused, because it would silently land in the wrong workspace.
         content: Full UTF-8 text to write; required for "write_file" (requires "rw" access).

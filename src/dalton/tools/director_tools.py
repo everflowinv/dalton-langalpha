@@ -12,7 +12,6 @@ from typing import Any, Mapping
 from fastapi import HTTPException
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
-from pydantic import StrictInt
 
 from src.dalton.auth import (
     resolve_caller_home_workspace_id,
@@ -1525,7 +1524,6 @@ def build_director_tools(
         workspace_id: str | None = None,
         ticker: str | None = None,
         reasoning_effort: str | None = None,
-        max_failures: StrictInt | None = None,
         config: RunnableConfig = None,
     ) -> str:
         """Create, update, pause, resume, or list Dalton (`dalton-*`) automations.
@@ -1546,7 +1544,6 @@ def build_director_tools(
             workspace_id: Workspace UUID used to place a new automation or locate an existing one in that workspace (does not move an existing automation; defaults to the current workspace in config).
             ticker: Optional company ticker for naming validation.
             reasoning_effort: Optional thinking effort override (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Omit on create to inherit user/model default; omit on update to keep the current value, or pass `""` / `"default"` to clear. Built-in Antigravity effort is determined by the task's model ID; change the model in the automation's settings.
-            max_failures: Optional consecutive-failure auto-disable limit (integer 1–100; default 3 on create, omit on update to keep the current value).
         """
         configurable = (config or {}).get("configurable") or {}
         user_id = str(configurable.get("user_id") or "").strip()
@@ -1554,6 +1551,19 @@ def build_director_tools(
             raise ValueError("user_id is required")
         caller_ws_id = str(configurable.get("workspace_id") or "").strip() or None
         ws_id = workspace_id if workspace_id is not None else caller_ws_id
+        if str(trigger_type or "").strip().lower() == "price":
+            # This tool cannot pass a price condition, and the price monitor skips a task
+            # without one, so refuse instead of saving a task that never fires.
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "price_trigger_unsupported",
+                    "message": "dalton_schedule_automation supports cron and once only. "
+                    "Use dalton_coverage_tracking for standard price tracking, or set "
+                    "trigger_config in the automation file for a personal price alert.",
+                },
+                ensure_ascii=False,
+            )
         # Only the caller's own timezone goes down: the helper applies the default when
         # creating, and an update that names none keeps the task's stored timezone.
         tz = timezone_name or None
@@ -1575,8 +1585,6 @@ def build_director_tools(
             spec["reasoning_effort"] = (
                 None if cleaned_effort in ("", "default", "clear", "null") else cleaned_effort
             )
-        if max_failures is not None:
-            spec["max_failures"] = max_failures
         result = await schedule_dalton_automation_helper(
             name,
             spec,
