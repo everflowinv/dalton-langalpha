@@ -31,18 +31,103 @@ import type { PlatformModelsResponse } from '@/types/platform';
 const MODELS_STALE_MS = 5 * 60_000;
 const PROVIDER_MODELS_STALE_MS = 10 * 60_000;
 
+// DALTON-HOOK(dalton-setup): track per-generation refreshed providers and client-wide in-flight forced refreshes
 interface RefreshTracker {
   gen: number;
   providers: Set<string>;
-  inFlight: Map<string, symbol>;
 }
 
 const retryGenerationByClient = new WeakMap<QueryClient, number>();
 const refreshedProvidersByClient = new WeakMap<QueryClient, RefreshTracker>();
+const inFlightRefreshByClient = new WeakMap<QueryClient, Map<string, Promise<AvailableModels>>>();
 
-/** Mark an explicit user retry so the next shared availability check refreshes server-cached provider lists. */
-export function bumpDaltonTeamModelsRetry(queryClient: QueryClient): void {
-  retryGenerationByClient.set(queryClient, (retryGenerationByClient.get(queryClient) ?? 0) + 1);
+/** Mark an explicit user retry so the next availability check refreshes server-cached provider lists. */
+export function bumpDaltonTeamModelsRetry(queryClient: QueryClient): number {
+  const next = (retryGenerationByClient.get(queryClient) ?? 0) + 1;
+  retryGenerationByClient.set(queryClient, next);
+  return next;
+}
+
+function getOrCreateRefreshTracker(queryClient: QueryClient, retryGeneration: number): RefreshTracker | undefined {
+  if (retryGeneration <= 0) return undefined;
+  let tracker = refreshedProvidersByClient.get(queryClient);
+  if (!tracker || tracker.gen !== retryGeneration) {
+    tracker = { gen: retryGeneration, providers: new Set<string>() };
+    refreshedProvidersByClient.set(queryClient, tracker);
+  }
+  return tracker;
+}
+
+function getOrCreateInFlightMap(queryClient: QueryClient): Map<string, Promise<AvailableModels>> {
+  let map = inFlightRefreshByClient.get(queryClient);
+  if (!map) {
+    map = new Map<string, Promise<AvailableModels>>();
+    inFlightRefreshByClient.set(queryClient, map);
+  }
+  return map;
+}
+
+/**
+ * DALTON-HOOK(dalton-setup): cancel any in-flight normal provider list request and force-refresh with `?refresh=1`.
+ * In-flight forced refreshes are tracked per QueryClient (across retry generations) and registered
+ * synchronously before `await cancelQueries`, so consecutive retry clicks reuse the in-flight forced
+ * refresh instead of cancelling it or joining a non-refresh request. A throttled `cached: true`
+ * response is never marked as refreshed so a later retry can re-attempt once the cooldown clears.
+ */
+export async function forceRefreshProviderAvailableModels(
+  queryClient: QueryClient,
+  provider: string,
+  retryGeneration: number,
+): Promise<AvailableModels> {
+  const whole = queryKeys.providerModels.available(provider, '');
+  const tracker = getOrCreateRefreshTracker(queryClient, retryGeneration);
+  const inFlight = getOrCreateInFlightMap(queryClient);
+  const existing = inFlight.get(provider);
+  if (existing) {
+    const data = await existing;
+    if (!data.cached && tracker && refreshedProvidersByClient.get(queryClient) === tracker) {
+      tracker.providers.add(provider);
+    }
+    return data;
+  }
+
+  const run = (async (): Promise<AvailableModels> => {
+    await queryClient.cancelQueries({ queryKey: whole, exact: true });
+    let forcedRan = false;
+    const data = await queryClient.fetchQuery<AvailableModels>({
+      queryKey: whole,
+      queryFn: ({ signal }) => {
+        forcedRan = true;
+        return getProviderAvailableModels(provider, { refresh: true, signal });
+      },
+      staleTime: 0,
+      retry: false,
+    });
+    // DALTON-HOOK(dalton-setup): the forced response replaces the list, so drop per-search caches;
+    // mark the provider refreshed only when the server answered live (not its rate-limited cache)
+    if (forcedRan) {
+      queryClient.removeQueries({
+        queryKey: queryKeys.providerModels.availableFor(provider),
+        predicate: (q) => q.queryKey.at(-1) !== whole.at(-1),
+      });
+      if (!data.cached) {
+        const latestTracker = refreshedProvidersByClient.get(queryClient);
+        if (latestTracker && latestTracker.gen >= retryGeneration) {
+          latestTracker.providers.add(provider);
+        }
+      }
+    }
+    return data;
+  })();
+
+  inFlight.set(provider, run);
+  try {
+    return await run;
+  } finally {
+    if (inFlight.get(provider) === run) {
+      inFlight.delete(provider);
+    }
+  }
 }
 
 /**
@@ -203,50 +288,21 @@ export async function checkDaltonTeamModelsAvailable({
     .filter((p) => (p.access_type === 'oauth' ? ownSignIns && p.state === 'connected' : !isPlatformMode || byokEnabled))
     .map((p) => p.provider);
 
-  let refreshed = refreshedProvidersByClient.get(queryClient);
-  if (retryGeneration > 0 && (!refreshed || refreshed.gen !== retryGeneration)) {
-    refreshed = { gen: retryGeneration, providers: new Set<string>(), inFlight: new Map<string, symbol>() };
-    refreshedProvidersByClient.set(queryClient, refreshed);
-  }
+  // DALTON-HOOK(dalton-setup): force-refresh unrefreshed providers via client-wide in-flight deduplication
+  const refreshed = getOrCreateRefreshTracker(queryClient, retryGeneration);
 
   const settled = await Promise.allSettled(
     listedProviders.map(async (provider) => {
       const shouldRefresh = retryGeneration > 0 && !refreshed?.providers.has(provider);
-      const whole = queryKeys.providerModels.available(provider, '');
-      const tracker = shouldRefresh ? refreshed : undefined;
-      let forcedToken: symbol | null = null;
-      if (shouldRefresh && tracker && !tracker.inFlight.has(provider)) {
-        await queryClient.cancelQueries({ queryKey: whole, exact: true });
-        forcedToken = Symbol(provider);
-        tracker.inFlight.set(provider, forcedToken);
+      if (shouldRefresh) {
+        return forceRefreshProviderAvailableModels(queryClient, provider, retryGeneration);
       }
-      let forcedRan = false;
-      try {
-        const data = await queryClient.fetchQuery<AvailableModels>({
-          queryKey: whole,
-          queryFn: ({ signal }) => {
-            if (shouldRefresh) forcedRan = true;
-            return getProviderAvailableModels(provider, {
-              ...(shouldRefresh ? { refresh: true } : {}),
-              signal,
-            });
-          },
-          staleTime: shouldRefresh ? 0 : PROVIDER_MODELS_STALE_MS,
-          retry: false,
-        });
-        if (shouldRefresh && forcedRan && refreshedProvidersByClient.get(queryClient) === tracker) {
-          tracker?.providers.add(provider);
-          queryClient.removeQueries({
-            queryKey: queryKeys.providerModels.availableFor(provider),
-            predicate: (q) => q.queryKey.at(-1) !== whole.at(-1),
-          });
-        }
-        return data;
-      } finally {
-        if (forcedToken && tracker?.inFlight.get(provider) === forcedToken) {
-          tracker.inFlight.delete(provider);
-        }
-      }
+      return queryClient.fetchQuery<AvailableModels>({
+        queryKey: queryKeys.providerModels.available(provider, ''),
+        queryFn: ({ signal }) => getProviderAvailableModels(provider, { signal }),
+        staleTime: PROVIDER_MODELS_STALE_MS,
+        retry: false,
+      });
     }),
   );
 

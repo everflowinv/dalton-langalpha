@@ -1,24 +1,74 @@
+// DALTON-HOOK(dalton-setup): unified Dalton team-model availability hook and forced-refresh retry
 import { useCallback, useContext, useMemo } from 'react';
-import { useQueries, useQueryClient } from '@tanstack/react-query';
+import { useQueries, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { getProviderAvailableModels } from '@/api/model';
+import { SUBSCRIPTIONS, subscriptionKey, type OAuthStatus } from '@/api/oauth';
+import type { ByokProvider } from '@/components/model/types';
 import { isDaltonBuild } from '@/config/brand';
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { hasAvailableDaltonModels } from '@/config/daltonSetup';
+import { isPlatformMode } from '@/config/hostMode';
 import { AuthContext } from '@/contexts/AuthContext';
 import { useAccount } from '@/hooks/useAccount';
 import { useAllModels, type UseAllModelsResult } from '@/hooks/useAllModels';
 import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
-import { useTeamCredentials } from '@/hooks/useTeamCredentials';
+import { useTeamCredentials, type TeamCredentialsStatus } from '@/hooks/useTeamCredentials';
+import { allows, RULE } from '@/lib/accountRules';
 import { queryKeys } from '@/lib/queryKeys';
+import type { AccountPolicy } from '@/types/api';
 import {
   bumpDaltonTeamModelsRetry,
   collectRejectedProviders,
+  forceRefreshProviderAvailableModels,
   REJECTED_CREDENTIAL_REASONS,
 } from './daltonTeamModelsCheck';
 import { useDaltonTeamModelsAvailable } from './useTeamModelsAvailable';
 
 const STALE_MS = 10 * 60_000;
 const EMPTY_PROVIDERS: readonly string[] = [];
+
+/**
+ * DALTON-HOOK(dalton-setup): derive the current list of connected providers whose available-models list
+ * should be force-refreshed after `invalidateQueries` settles, so Retry also
+ * picks up providers that were newly connected or recovered from an initial
+ * status-read failure instead of relying on a stale pre-retry closure.
+ */
+function resolvePostRetryListedProviders(
+  queryClient: QueryClient,
+  fallbackListed: readonly string[],
+  policy: AccountPolicy | null,
+): string[] {
+  const apiKeysData = queryClient.getQueryData<{ providers?: unknown; byok_enabled?: unknown }>(
+    queryKeys.user.apiKeys(),
+  );
+  const oauthStatuses = SUBSCRIPTIONS.map((s) => ({
+    provider: s.provider,
+    status: queryClient.getQueryData<OAuthStatus>(queryKeys.oauth.status(subscriptionKey(s.provider))),
+  }));
+  const hasCache = apiKeysData !== undefined || oauthStatuses.some((entry) => entry.status !== undefined);
+  if (!hasCache) {
+    return [...fallbackListed];
+  }
+
+  // DALTON-HOOK(dalton-setup): mirror useAllModels listedProviders filter on refreshed cache
+  const byokEnabled = apiKeysData?.byok_enabled === true && allows(policy, RULE.ownApiKeys);
+  const ownSignIns = allows(policy, RULE.ownSubscriptions);
+  const out = new Set<string>();
+
+  const rows = Array.isArray(apiKeysData?.providers) ? (apiKeysData.providers as ByokProvider[]) : [];
+  for (const p of rows) {
+    if (!p.has_key || p.withdrawn || p.is_custom || p.access_type === 'local') continue;
+    if (!isPlatformMode || byokEnabled) {
+      out.add(p.provider);
+    }
+  }
+  for (const { provider, status } of oauthStatuses) {
+    if (ownSignIns && status?.connected && status.state === 'connected') {
+      out.add(provider);
+    }
+  }
+  return [...out];
+}
 
 export { REJECTED_CREDENTIAL_REASONS };
 
@@ -56,7 +106,12 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
   const queryClient = useQueryClient();
   const userId = useContext(AuthContext)?.userId ?? null;
   const useSharedQuery = isDaltonBuild && isDaltonAuth && Boolean(userId);
-  const { isShared, callerTierPending, canManage } = useTeamCredentials();
+  // DALTON-HOOK(dalton-setup): preserve previously confirmed admin identity (is_pm: true) if a subsequent credentials/status read fails
+  const { isShared, callerTierPending, canManage, callerTierError } = useTeamCredentials();
+  const cachedCreds = useSharedQuery && callerTierError && !canManage
+    ? (queryClient.getQueryData(queryKeys.dalton.credentialsStatus(userId)) as TeamCredentialsStatus | undefined)
+    : undefined;
+  const effectiveCanManage = canManage || Boolean(cachedCreds?.is_pm);
   const { providers, byokEnabled, isLoading: providersLoading, unread: providersUnread } = useConfiguredProviders({
     enabled: useSharedQuery,
   });
@@ -91,13 +146,15 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
     [localShared, listedProviders, providerResults, keyCandidates],
   );
 
+  // DALTON-HOOK(dalton-setup): invalidate all queries behind team/all.unread (including features & Claude Code status) and force-refresh providers
   const retry = useCallback(() => {
-    bumpDaltonTeamModelsRetry(queryClient);
+    const retryGen = bumpDaltonTeamModelsRetry(queryClient);
     void Promise.all([
       queryClient.invalidateQueries({ queryKey: queryKeys.dalton.credentialsStatus(userId) }),
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all }),
       queryClient.invalidateQueries({ queryKey: queryKeys.user.apiKeys() }),
       queryClient.invalidateQueries({ queryKey: queryKeys.oauth.all }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.features.all }),
       queryClient.invalidateQueries({ queryKey: queryKeys.user.preferences() }),
     ]).then(async () => {
       const credsStatus = useSharedQuery
@@ -107,32 +164,16 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
         await queryClient.refetchQueries({ queryKey: [...queryKeys.dalton.all, 'team-models-available'] });
         return;
       }
-      // Personal credentials (sharing off / status unread) or local fallback path:
-      // cancel any in-flight normal provider list request and force-refresh with `?refresh=1`.
+      // DALTON-HOOK(dalton-setup): personal credentials (sharing off / status unread) or local fallback path —
+      // read refreshed connected providers from cache, cancel any in-flight normal provider list request, and force-refresh with `?refresh=1`.
+      const refreshTargets = resolvePostRetryListedProviders(queryClient, listedProviders, policy);
       await Promise.allSettled(
-        listedProviders.map(async (provider) => {
-          const whole = queryKeys.providerModels.available(provider, '');
-          await queryClient.cancelQueries({ queryKey: whole, exact: true });
-          let forcedRan = false;
-          await queryClient.fetchQuery({
-            queryKey: whole,
-            queryFn: ({ signal }) => {
-              forcedRan = true;
-              return getProviderAvailableModels(provider, { refresh: true, signal });
-            },
-            staleTime: 0,
-            retry: false,
-          });
-          if (forcedRan) {
-            queryClient.removeQueries({
-              queryKey: queryKeys.providerModels.availableFor(provider),
-              predicate: (q) => q.queryKey.at(-1) !== whole.at(-1),
-            });
-          }
-        }),
+        refreshTargets.map((provider) =>
+          forceRefreshProviderAvailableModels(queryClient, provider, retryGen),
+        ),
       );
     });
-  }, [queryClient, userId, useSharedQuery, listedProviders]);
+  }, [queryClient, userId, useSharedQuery, listedProviders, policy]);
 
   if (useSharedQuery) {
     return {
@@ -141,7 +182,7 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
       empty: sharedAvailability.empty,
       isLoading: sharedAvailability.isLoading,
       unread: sharedAvailability.unread,
-      canManage,
+      canManage: effectiveCanManage,
       callerTierPending,
       rejectedProviders: sharedAvailability.rejectedProviders,
       retry,
