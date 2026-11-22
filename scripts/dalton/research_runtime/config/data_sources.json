@@ -182,7 +182,7 @@
       ],
       "tool": "mcp__alphaengine__search_library",
       "rules": [
-        "单家公司检索一次完成：检索一家公司时，把中英文公司名和股票代码用空格隔开写在同一个查询里，从返回列表挑选文档；已有结果时从现有列表筛选，报错时切换备用数据源；不同公司或新主题照常各自检索。",
+        "单家公司检索一次完成：检索一家公司时，把中英文公司名和股票代码用空格隔开写在同一个查询里，从返回列表挑选文档；已有结果时从现有列表筛选，报错时切换备用数据源；不同公司或新主题照常各自检索。AlphaEngine 按实际向上游请求的页数计检索额度，命中短时缓存不计；每页至少请求 20 条（`limit` 超过 20 时按 `limit` 请求，去重或筛选后不足 `limit` 条时会自动翻页，单次最多 5 页）。先用 `limit` 20 以内，不够再翻页，不要一次要 50 条再只看前几条。",
         "关键词主题用 sort=relevance；无关键词列表可用 sort=newest。日期用 date_from/date_to，结果保留 publish_time 和 rank_date。",
         "本机构录制用 params.meeting_scope=institution（或 document_categories=[institution_meetings]）；个人录制用 personal。来源券商 source_names 与录制归属不同。",
         "search_library 按 cursor 翻页至 has_more=false；机构会议按 rank_date 排序，返回 document_code=summary，保留 institution_meeting_flag/type_show_name。",
@@ -251,6 +251,7 @@
       "rules": [
         "返回电话会清单（doc_id、标题、日期、company_call 或 broker_callback），正文用 alphaengine get_document 读，只读需要的期次（全文有额度）。",
         "只给 ticker 时先解析成公司名再检索；中文公司用 query 传中文名，可用 | 分隔多个名称（如 腾讯|Tencent）。默认近 400 天，旧季度用 start/end。",
+        "查业绩会转写时把 `start` / `end` 收窄到业绩会前后几天，避免日期范围过宽导致连续翻页。",
         "ASR 稿须标注转写误差、截掉末尾重复段；与业绩新闻稿分开。按 cursor 最多扫描10页；coverage.complete=false 时不得声称全量或最新。roic.ai 已停用，无自动兜底。"
       ],
       "health": "not_probed"

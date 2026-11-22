@@ -20,7 +20,7 @@ import sqlite3
 import threading
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -1573,6 +1573,8 @@ class AlphaEngineSearchCircuitBreaker:
 # ---------------------------------------------------------------------------
 
 COMPANY_SEARCH_WINDOW_S = 30 * 60.0
+MAX_PREVIOUS_DOCS = 10
+COMPANY_SEARCH_MAX_ENTRIES = 5000
 QUERY_LOG_RETENTION_DAYS = 7
 
 # Core aliases for `watchlist.txt` / `watchlist_cn_hk.txt` plus dual-listed links.
@@ -1997,23 +1999,100 @@ def extract_companies_from_search(
     return found
 
 
-class AlphaEngineCompanySearchTracker:
-    """In-memory per-session company search counter with 30-minute sliding TTL.
+@dataclass(frozen=True)
+class SearchAdviceResult:
+    """Outcome of evaluating session search advice for a single AlphaEngine search."""
 
-    Tracks distinct query signatures per `(session_key, company_id)`. On the 3rd+
-    distinct-keyword search for the same company within 30 minutes, emits a soft
-    `advice` message without blocking or delaying the search.
+    companies: list[str]
+    advice: str | None = None
+    previous_docs: list[dict[str, str]] = field(default_factory=list)
+    advice_kind: str = ""
+
+
+def extract_search_result_docs(
+    payload: dict[str, Any] | None,
+    *,
+    op: str = OP_SEARCH_LIBRARY,
+) -> tuple[int, list[dict[str, str]]]:
+    """Extract `(result_count, compact_docs)` from a search or fan-out payload.
+
+    Each doc summary keeps only `doc_id`, `title`, and `date` (deduped in order).
+    """
+    if not isinstance(payload, dict):
+        return 0, []
+    op_lower = str(op or "").strip().lower()
+    norm_op = OP_TRANSCRIPT if op_lower in (OP_TRANSCRIPT, "transcript") else OP_SEARCH_LIBRARY
+    container, list_key, _ = _locate_search_results_containers(payload, op=norm_op)
+    raw_items = container.get(list_key) if container and list_key else None
+    if not isinstance(raw_items, list):
+        fallback_count = payload.get("count")
+        if isinstance(fallback_count, int) and not isinstance(fallback_count, bool):
+            return max(0, fallback_count), []
+        return 0, []
+
+    docs: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        raw_doc_id = str(
+            item.get("doc_id")
+            or item.get("id")
+            or item.get("document_id")
+            or ""
+        ).strip()
+        if raw_doc_id.startswith("alphaengine:"):
+            raw_doc_id = raw_doc_id[len("alphaengine:") :].strip()
+        if not raw_doc_id or raw_doc_id in seen_ids:
+            continue
+        seen_ids.add(raw_doc_id)
+        title = str(item.get("title") or "").strip()[:200]
+        raw_date = (
+            item.get("publish_time")
+            or item.get("rank_date")
+            or item.get("published_at")
+            or item.get("date")
+            or ""
+        )
+        doc_date = normalize_date_to_day(raw_date)
+        docs.append({"doc_id": raw_doc_id, "title": title, "date": doc_date})
+
+    return len(raw_items), docs
+
+
+_UNSET: Any = object()
+
+
+class AlphaEngineCompanySearchTracker:
+    """In-memory per-session search advice tracker with 30-minute sliding TTL and global cap.
+
+    Tracks:
+    1. Repeated normalized caller-written query signatures per `(session_key, query_sig)`
+       across `search_library` and `transcript` for non-pagination, non-personal searches
+       (ignoring date/limit/sort/filter differences), emitting a soft repeat-query `advice`
+       with elapsed minutes and prior result count.
+    2. Distinct query signatures (`sig -> last_ts`) and previously returned doc
+       summaries (up to `MAX_PREVIOUS_DOCS`, deduped, most-recently-returned first)
+       per `(session_key, company_id)`. On the 3rd+ distinct new-keyword search for
+       the same company within 30 minutes, attaches `previous_docs`
+       (`advice_previous_docs`) and a soft `advice`. When both triggers fire
+       simultaneously, repeat-query `advice` takes precedence while `previous_docs`
+       is still returned.
     """
 
     def __init__(
         self,
         *,
         window_s: float = COMPANY_SEARCH_WINDOW_S,
+        max_entries: int = COMPANY_SEARCH_MAX_ENTRIES,
         now_fn: Callable[[], float] | None = None,
     ) -> None:
         self._window_s = max(1.0, float(window_s))
+        self._max_entries = max(1, int(max_entries))
         self._now_fn = now_fn or time.monotonic
-        self._records: dict[tuple[str, str], list[tuple[float, str]]] = {}
+        self._records: dict[tuple[str, str], dict[str, float]] = {}
+        self._query_history: dict[tuple[str, str], tuple[float, int]] = {}
+        self._company_docs: dict[tuple[str, str], list[tuple[float, dict[str, str]]]] = {}
 
     @staticmethod
     def resolve_session_key(caller_identity: dict[str, Any] | None) -> str:
@@ -2041,17 +2120,299 @@ class AlphaEngineCompanySearchTracker:
         kw_sorted = ",".join(sorted(set(kw_parts)))
         return f"{q_v4}||{kw_sorted}"
 
+    @staticmethod
+    def _format_repeat_advice(
+        elapsed_s: float,
+        prev_count: int,
+        *,
+        has_previous_docs: bool = False,
+    ) -> str:
+        if elapsed_s < 60.0:
+            ago_phrase = "不到 1 分钟前"
+        else:
+            ago_phrase = f" {int(round(elapsed_s / 60.0))} 分钟前"
+        prev_docs_note = (
+            "，此前返回的文档见 `advice_previous_docs`" if has_previous_docs else ""
+        )
+        return (
+            f"本会话{ago_phrase}已用相同查询词检索过（上次返回 {prev_count} 条{prev_docs_note}）；"
+            "请先从现有结果中挑选，确实需要不同时间段或更多结果时再检索"
+        )
+
     def _prune(self, now: float) -> None:
         cutoff = now - self._window_s
-        empty_keys: list[tuple[str, str]] = []
-        for k, entries in self._records.items():
-            kept = [(ts, sig) for ts, sig in entries if ts > cutoff]
+        for k, sig_map in list(self._records.items()):
+            kept = {sig: ts for sig, ts in sig_map.items() if ts > cutoff}
             if kept:
                 self._records[k] = kept
             else:
-                empty_keys.append(k)
-        for k in empty_keys:
-            self._records.pop(k, None)
+                self._records.pop(k, None)
+
+        expired_q_keys = [
+            qk for qk, (ts, _) in self._query_history.items() if ts <= cutoff
+        ]
+        for qk in expired_q_keys:
+            self._query_history.pop(qk, None)
+
+        for dk, doc_entries in list(self._company_docs.items()):
+            kept_docs = [(ts, d) for ts, d in doc_entries if ts > cutoff]
+            if kept_docs:
+                self._company_docs[dk] = kept_docs
+            else:
+                self._company_docs.pop(dk, None)
+
+    def _enforce_caps(self) -> None:
+        """Cap each of the three record kinds (company signatures, repeat-query history,
+        returned docs) at ``max_entries`` across all sessions, evicting the oldest."""
+        cap = self._max_entries
+
+        if len(self._query_history) > cap:
+            excess = len(self._query_history) - cap
+            oldest_q = sorted(self._query_history.items(), key=lambda kv: kv[1][0])[:excess]
+            for qk, _ in oldest_q:
+                self._query_history.pop(qk, None)
+
+        total_sig_records = sum(len(sig_map) for sig_map in self._records.values())
+        if total_sig_records > cap:
+            excess = total_sig_records - cap
+            all_sigs = [
+                (ts, key, sig)
+                for key, sig_map in self._records.items()
+                for sig, ts in sig_map.items()
+            ]
+            all_sigs.sort(key=lambda item: item[0])
+            for _, key, sig in all_sigs[:excess]:
+                sig_map = self._records.get(key)
+                if sig_map is not None:
+                    sig_map.pop(sig, None)
+                    if not sig_map:
+                        self._records.pop(key, None)
+
+        total_doc_records = sum(len(entries) for entries in self._company_docs.values())
+        if total_doc_records > cap:
+            excess = total_doc_records - cap
+            all_docs = [
+                (ts, idx, key, doc["doc_id"])
+                for key, entries in self._company_docs.items()
+                for idx, (ts, doc) in enumerate(entries)
+            ]
+            # Evict oldest timestamp first (and lower priority tail entries on ties).
+            all_docs.sort(key=lambda item: (item[0], -item[1]))
+            evict_per_key: dict[tuple[str, str], set[str]] = {}
+            for _, _, key, did in all_docs[:excess]:
+                evict_per_key.setdefault(key, set()).add(did)
+            for key, evict_ids in evict_per_key.items():
+                entries = self._company_docs.get(key)
+                if entries is None:
+                    continue
+                kept = [(ts, d) for ts, d in entries if d["doc_id"] not in evict_ids]
+                if kept:
+                    self._company_docs[key] = kept
+                else:
+                    self._company_docs.pop(key, None)
+
+    def _record_company_docs(
+        self,
+        *,
+        session_key: str,
+        companies: list[str],
+        returned_docs: list[dict[str, str]] | None,
+        now: float,
+    ) -> None:
+        if not companies or not returned_docs:
+            return
+        batch_docs: list[dict[str, str]] = []
+        batch_seen: set[str] = set()
+        for raw_d in returned_docs:
+            if not isinstance(raw_d, dict):
+                continue
+            did = str(raw_d.get("doc_id") or "").strip()
+            if not did or did in batch_seen:
+                continue
+            batch_seen.add(did)
+            batch_docs.append(
+                {
+                    "doc_id": did,
+                    "title": str(raw_d.get("title") or "").strip()[:200],
+                    "date": str(raw_d.get("date") or "").strip(),
+                }
+            )
+            if len(batch_docs) >= MAX_PREVIOUS_DOCS:
+                break
+        if not batch_docs:
+            return
+        for comp in companies:
+            key = (session_key, comp)
+            existing = self._company_docs.get(key, [])
+            merged: list[tuple[float, dict[str, str]]] = [
+                (now, dict(d)) for d in batch_docs
+            ]
+            seen_ids = {d["doc_id"] for d in batch_docs}
+            for ts, old_d in existing:
+                if len(merged) >= MAX_PREVIOUS_DOCS:
+                    break
+                if old_d["doc_id"] in seen_ids:
+                    continue
+                seen_ids.add(old_d["doc_id"])
+                merged.append((ts, old_d))
+            self._company_docs[key] = merged
+
+    def _collect_previous_docs(
+        self,
+        *,
+        session_key: str,
+        companies: list[str],
+    ) -> list[dict[str, str]]:
+        candidates: list[tuple[float, int, dict[str, str]]] = []
+        order_idx = 0
+        for comp in companies:
+            for ts, doc in self._company_docs.get((session_key, comp), []):
+                candidates.append((ts, order_idx, doc))
+                order_idx += 1
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        previous_docs: list[dict[str, str]] = []
+        seen_ids: set[str] = set()
+        for _, _, doc in candidates:
+            did = doc["doc_id"]
+            if did in seen_ids:
+                continue
+            seen_ids.add(did)
+            previous_docs.append(dict(doc))
+            if len(previous_docs) >= MAX_PREVIOUS_DOCS:
+                break
+        return previous_docs
+
+    def record_and_evaluate(
+        self,
+        *,
+        caller_identity: dict[str, Any] | None,
+        query: Any,
+        keywords: Any = None,
+        ticker: Any = "",
+        raw_query: Any = _UNSET,
+        operation: str = "search_library",
+        has_cursor: bool = False,
+        ok: bool = True,
+        result_count: int | None = None,
+        returned_docs: list[dict[str, str]] | None = None,
+        is_personal: bool = False,
+        record_docs: bool = True,
+        mode: str = "fetch",
+    ) -> SearchAdviceResult:
+        """Record search outcome and evaluate soft repeat-query / company advice."""
+        del operation  # Repeat-query tracking shares (session_key, repeat_sig) across ops.
+        now = self._now_fn()
+        self._prune(now)
+
+        companies = extract_companies_from_search(query, keywords, ticker)
+        session_key = self.resolve_session_key(caller_identity)
+        if not session_key:
+            return SearchAdviceResult(companies=companies)
+
+        eff_mode = str(mode or "").strip().lower() or "fetch"
+        allow_docs = ok and record_docs and not is_personal and eff_mode != "plan"
+        sig = self.build_query_signature(query, keywords)
+        eff_raw_query = query if raw_query is _UNSET else raw_query
+        repeat_sig = self.build_query_signature(eff_raw_query, keywords)
+
+        if sig == "||":
+            # Ticker-only searches (e.g. `transcript` with no query) skip company
+            # counting and repeat-query history, but still record returned team docs.
+            if allow_docs:
+                self._record_company_docs(
+                    session_key=session_key,
+                    companies=companies,
+                    returned_docs=returned_docs,
+                    now=now,
+                )
+                self._enforce_caps()
+            return SearchAdviceResult(companies=companies)
+
+        # 1. Repeat-query check: uses caller's raw query before ticker folding,
+        #    and skips cursor pagination, personal scope, failed, and plan calls.
+        prev_q: tuple[float, int] | None = None
+        if (
+            ok
+            and not has_cursor
+            and not is_personal
+            and eff_mode != "plan"
+            and repeat_sig != "||"
+        ):
+            q_key = (session_key, repeat_sig)
+            prev_q = self._query_history.get(q_key)
+            eff_count = (
+                max(0, int(result_count))
+                if result_count is not None
+                else len(returned_docs or [])
+            )
+            self._query_history[q_key] = (now, eff_count)
+
+        # 2. Company multi-search check: preserves original counting for failed, plan,
+        #    personal, and cursor continuation requests (refreshing last_ts), and
+        #    triggers only on a new distinct query signature when distinct count >= 3.
+        max_distinct = 0
+        company_triggered = False
+        triggered_companies: list[str] = []
+        for comp in companies:
+            key = (session_key, comp)
+            sig_map = self._records.setdefault(key, {})
+            is_new_keyword = sig not in sig_map
+            sig_map[sig] = now
+            distinct_now = len(sig_map)
+            if is_new_keyword and distinct_now >= 3:
+                company_triggered = True
+                triggered_companies.append(comp)
+                if distinct_now > max_distinct:
+                    max_distinct = distinct_now
+
+        previous_docs = (
+            self._collect_previous_docs(
+                session_key=session_key, companies=triggered_companies
+            )
+            if company_triggered
+            else []
+        )
+
+        if allow_docs:
+            self._record_company_docs(
+                session_key=session_key,
+                companies=companies,
+                returned_docs=returned_docs,
+                now=now,
+            )
+
+        self._enforce_caps()
+
+        advice: str | None = None
+        advice_kind = ""
+        if prev_q is not None:
+            prev_ts, prev_count = prev_q
+            elapsed_s = max(0.0, now - prev_ts)
+            advice = self._format_repeat_advice(
+                elapsed_s,
+                prev_count,
+                has_previous_docs=bool(previous_docs),
+            )
+            advice_kind = "repeat_query"
+        elif company_triggered:
+            if previous_docs:
+                advice = (
+                    f"请先从现有结果中挑选（本会话已检索这家公司 {max_distinct} 次，"
+                    "此前返回的文档见 `advice_previous_docs`）；需要新主题时再检索"
+                )
+            else:
+                advice = (
+                    f"请先从现有结果中挑选（本会话已检索这家公司 {max_distinct} 次）；"
+                    "需要新主题时再检索"
+                )
+            advice_kind = "company_multi"
+
+        return SearchAdviceResult(
+            companies=companies,
+            advice=advice,
+            previous_docs=previous_docs,
+            advice_kind=advice_kind,
+        )
 
     def record_and_check(
         self,
@@ -2060,42 +2421,33 @@ class AlphaEngineCompanySearchTracker:
         query: Any,
         keywords: Any = None,
         ticker: Any = "",
+        raw_query: Any = _UNSET,
+        operation: str = "search_library",
+        has_cursor: bool = False,
+        ok: bool = True,
+        result_count: int | None = None,
+        returned_docs: list[dict[str, str]] | None = None,
+        is_personal: bool = False,
+        record_docs: bool = True,
+        mode: str = "fetch",
     ) -> tuple[list[str], str | None]:
-        """Record recognized company searches and return `(companies, advice_or_none)`."""
-        companies = extract_companies_from_search(query, keywords, ticker)
-        if not companies:
-            return [], None
-        session_key = self.resolve_session_key(caller_identity)
-        if not session_key:
-            return companies, None
-
-        now = self._now_fn()
-        self._prune(now)
-        sig = self.build_query_signature(query, keywords)
-        if sig == "||":
-            return companies, None
-
-        max_distinct = 0
-        triggered = False
-        for comp in companies:
-            key = (session_key, comp)
-            entries = self._records.setdefault(key, [])
-            prior_sigs = {s for _, s in entries}
-            is_new_keyword = sig not in prior_sigs
-            entries.append((now, sig))
-            distinct_now = len(prior_sigs | {sig})
-            if is_new_keyword and distinct_now >= 3:
-                triggered = True
-                if distinct_now > max_distinct:
-                    max_distinct = distinct_now
-
-        if not triggered:
-            return companies, None
-        advice = (
-            f"请先从现有结果中挑选（本会话已检索这家公司 {max_distinct} 次）；"
-            "需要新主题时再检索"
+        """Record search and return `(companies, advice_or_none)`."""
+        res = self.record_and_evaluate(
+            caller_identity=caller_identity,
+            query=query,
+            keywords=keywords,
+            ticker=ticker,
+            raw_query=raw_query,
+            operation=operation,
+            has_cursor=has_cursor,
+            ok=ok,
+            result_count=result_count,
+            returned_docs=returned_docs,
+            is_personal=is_personal,
+            record_docs=record_docs,
+            mode=mode,
         )
-        return companies, advice
+        return res.companies, res.advice
 
 
 # ---------------------------------------------------------------------------
@@ -2177,7 +2529,7 @@ class AlphaEngineTeamQueryLogger:
                     pass
                 self._cleanup_old_files(today_str)
                 return True
-            except OSError as exc:
+            except (OSError, TypeError, ValueError) as exc:
                 logger.warning("Failed to write alphaengine query log: %s", type(exc).__name__)
                 return False
 

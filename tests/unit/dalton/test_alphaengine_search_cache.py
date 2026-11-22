@@ -52,6 +52,10 @@ def _make_bridge(
         str(tmp_path / "alphaengine_usage.jsonl"),
     )
     monkeypatch.setenv(
+        "DALTON_ALPHAENGINE_QUERY_LOG_DIR",
+        str(tmp_path / "alphaengine_search_queries"),
+    )
+    monkeypatch.setenv(
         "DALTON_BRIDGE_USAGE_FILE",
         str(tmp_path / "bridge-usage.json"),
     )
@@ -3369,7 +3373,7 @@ async def test_p2_r2_company_search_soft_advice_and_non_blocking(
     )
     assert "advice" not in json.loads(r2["result"]["content"][0]["text"])
 
-    # Exact repeat of #2 (same keyword) -> hits cache, no advice because keyword is NOT different
+    # Exact repeat of #2 (same keyword) -> hits cache, triggers repeat-query advice (NOT company-multi)
     r2_repeat = await asyncio.wait_for(
         bridge.handle_tools_call(
             "adv-2-rep",
@@ -3378,9 +3382,13 @@ async def test_p2_r2_company_search_soft_advice_and_non_blocking(
         ),
         timeout=5.0,
     )
-    assert "advice" not in json.loads(r2_repeat["result"]["content"][0]["text"])
+    b2_rep = json.loads(r2_repeat["result"]["content"][0]["text"])
+    assert "相同查询词检索过" in b2_rep["advice"]
+    assert "上次返回 2 条" in b2_rep["advice"]
+    assert "已检索这家公司" not in b2_rep["advice"]
+    assert "advice_previous_docs" not in b2_rep
 
-    # 3rd distinct keyword for NVDA within 30m -> executes normally AND returns advice!
+    # 3rd distinct keyword for NVDA within 30m -> executes normally AND returns company advice + previous docs!
     r3 = await asyncio.wait_for(
         bridge.handle_tools_call(
             "adv-3",
@@ -3392,7 +3400,12 @@ async def test_p2_r2_company_search_soft_advice_and_non_blocking(
     b3 = json.loads(r3["result"]["content"][0]["text"])
     assert b3["ok"] is True
     assert len(b3["data"]["structuredContent"]["results"]) == 2
-    assert "请先从现有结果中挑选（本会话已检索这家公司 3 次）；需要新主题时再检索" == b3["advice"]
+    assert (
+        "请先从现有结果中挑选（本会话已检索这家公司 3 次，此前返回的文档见 `advice_previous_docs`）；需要新主题时再检索"
+        == b3["advice"]
+    )
+    assert len(b3["advice_previous_docs"]) == 2
+    assert set(b3["advice_previous_docs"][0].keys()) == {"doc_id", "title", "date"}
 
     # Different company (TSM / 台积电) -> independent counter, no advice!
     r_tsm = await asyncio.wait_for(
@@ -3645,26 +3658,38 @@ async def test_p2_r2_single_company_search_rule_in_docs_plugin_and_catalog(
     )
     ae_entry = next(r for r in ds_json["routes"] if r["id"] == "alphaengine")
     assert rb.ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE in ae_entry["rules"]
+    assert "AlphaEngine 按实际向上游请求的页数计检索额度，命中短时缓存不计" in rb.ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE
+    assert "每页至少请求 20 条" in rb.ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE
+    assert "先用 `limit` 20 以内" in rb.ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE
+    tr_entry = next(r for r in ds_json["routes"] if r["id"] == "transcript")
+    assert rb.TRANSCRIPT_DATE_WINDOW_RULE in tr_entry["rules"]
+    assert rb.TRANSCRIPT_DATE_WINDOW_RULE not in rb.TRANSCRIPT_CATALOG_RULE
 
     plugin_json = json.loads((repo_root / "plugins/dalton_data/plugin.json").read_text(encoding="utf-8"))
     srv_inst = plugin_json["extensions"]["ai.langalpha"]["servers"]["researchdata"]["instruction"]
     assert srv_inst == rb.build_researchdata_plugin_instruction()
     assert rb.ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE in srv_inst
+    assert rb.TRANSCRIPT_DATE_WINDOW_RULE in srv_inst
 
-    # Verify catalog() response carries the rule on alphaengine route too
+    # Verify catalog() response against REAL registry routes carries each rule exactly once
     bridge = _make_bridge(tmp_path, monkeypatch)
 
     async def _cat_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
         return [
             _mcp_reply(
                 requests[0]["id"],
-                {"ok": True, "routes": [{"id": "alphaengine", "rules": []}]},
+                {
+                    "ok": True,
+                    "routes": [
+                        dict(ae_entry),
+                        dict(tr_entry),
+                    ],
+                },
             )
         ]
 
-    monkeypatch.setattr(
-        bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_cat_rpc)
-    )
+    rpc_double = create_autospec(bridge._run_stdio_rpc, side_effect=_cat_rpc)
+    monkeypatch.setattr(bridge, "_run_stdio_rpc", rpc_double)
     resp = await asyncio.wait_for(
         bridge.handle_tools_call(
             "cat-ae", {"name": "catalog", "arguments": {"route": "alphaengine"}}
@@ -3672,7 +3697,33 @@ async def test_p2_r2_single_company_search_rule_in_docs_plugin_and_catalog(
         timeout=5.0,
     )
     cat_body = json.loads(resp["result"]["content"][0]["text"])
-    assert rb.ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE in cat_body["routes"][0]["rules"]
+    ae_rules = cat_body["routes"][0]["rules"]
+    assert sum(rule.count(rb.ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE) for rule in ae_rules) == 1
+
+    resp_tr = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "cat-tr", {"name": "catalog", "arguments": {"route": "transcript"}}
+        ),
+        timeout=5.0,
+    )
+    cat_tr_body = json.loads(resp_tr["result"]["content"][0]["text"])
+    tr_rules = cat_tr_body["routes"][0]["rules"]
+    assert sum(rule.count(rb.TRANSCRIPT_DATE_WINDOW_RULE) for rule in tr_rules) == 1
+    assert rb.TRANSCRIPT_CATALOG_RULE in tr_rules
+
+    # Also verify empty/synthetic rules still receive TRANSCRIPT_DATE_WINDOW_RULE exactly once
+    async def _cat_empty_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        return [_mcp_reply(requests[0]["id"], {"ok": True, "routes": [{"id": "transcript", "rules": []}]})]
+
+    rpc_double.side_effect = _cat_empty_rpc
+    resp_tr_empty = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "cat-tr-empty", {"name": "catalog", "arguments": {"route": "transcript"}}
+        ),
+        timeout=5.0,
+    )
+    tr_empty_rules = json.loads(resp_tr_empty["result"]["content"][0]["text"])["routes"][0]["rules"]
+    assert sum(rule.count(rb.TRANSCRIPT_DATE_WINDOW_RULE) for rule in tr_empty_rules) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -4836,3 +4887,1063 @@ def test_a_sliced_page_replaces_the_upstream_paging_note() -> None:
     sliced = ae_cache.slice_cached_payload(payload, op=ae_cache.OP_SEARCH_LIBRARY, target_limit=10)
     assert sliced["data"]["structuredContent"]["pagination_note"] == ae_cache.SLICED_CACHE_NOTE
     assert not ae_cache.payload_has_live_cursor(sliced, op=ae_cache.OP_SEARCH_LIBRARY)
+
+
+# ---------------------------------------------------------------------------
+# Search advice enhancements: repeat query, previous docs list, priority, personal scope
+# ---------------------------------------------------------------------------
+
+
+def _make_clock_double(initial: float) -> tuple[list[float], Any]:
+    box = [float(initial)]
+
+    def _now() -> float:
+        return box[0]
+
+    return box, create_autospec(_now, side_effect=_now)
+
+
+@pytest.mark.asyncio
+async def test_ae_repeat_query_advice_dates_limit_cursor_ttl_session_and_cache_hit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _make_bridge(tmp_path, monkeypatch)
+    mono_box, clock_double = _make_clock_double(1000.0)
+    bridge._ae_company_tracker = ae_cache.AlphaEngineCompanySearchTracker(
+        now_fn=clock_double
+    )
+
+    next_payloads: list[dict[str, Any]] = []
+    forwarded_args: list[dict[str, Any]] = []
+
+    async def _fake_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        req = requests[0]
+        forwarded_args.append(dict(req["params"]["arguments"]))
+        payload = next_payloads.pop(0) if next_payloads else _ae_results_payload(4, has_more=True, cursor="ae1:p2")
+        return [_mcp_reply(req["id"], payload)]
+
+    monkeypatch.setattr(
+        bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_fake_rpc)
+    )
+
+    caller_a = {"user": "u1", "workspace": "ws1", "thread": "th-rep-a"}
+    caller_b = {"user": "u2", "workspace": "ws2", "thread": "th-rep-b"}
+
+    # 1. First search (topic query without company) returns 7 results -> no advice
+    p1 = _ae_results_payload(7, has_more=True, cursor="ae1:c1", prefix="t1_")
+    next_payloads.append(p1)
+    r1 = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "rep-1",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": "AI Agent 商业化",
+                    "start": "2026-10-01",
+                    "end": "2026-11-10",
+                    "limit": 10,
+                },
+            },
+            caller_identity=caller_a,
+        ),
+        timeout=5.0,
+    )
+    b1 = json.loads(r1["result"]["content"][0]["text"])
+    assert "advice" not in b1
+    assert b1["data"]["structuredContent"]["results"] == p1["data"]["structuredContent"]["results"]
+
+    # 2. 5 minutes later, same normalized query with different date & limit -> unified repeat advice (no paging instructions)
+    mono_box[0] += 5 * 60
+    p2 = _ae_results_payload(12, has_more=False, cursor=None, prefix="t2_")
+    next_payloads.append(p2)
+    r2 = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "rep-2",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": "  ａｉ   agent  商业化 ",
+                    "start": "2026-09-01",
+                    "end": "2026-11-15",
+                    "limit": 20,
+                },
+            },
+            caller_identity=caller_a,
+        ),
+        timeout=5.0,
+    )
+    b2 = json.loads(r2["result"]["content"][0]["text"])
+    assert b2["ok"] is True
+    assert b2["data"]["structuredContent"]["results"] == p2["data"]["structuredContent"]["results"]
+    assert (
+        b2["advice"]
+        == "本会话 5 分钟前已用相同查询词检索过（上次返回 7 条）；请先从现有结果中挑选，确实需要不同时间段或更多结果时再检索"
+    )
+    assert "cursor" not in b2["advice"]
+    assert "continuation_params" not in b2["advice"]
+
+    # 3. Cursor pagination with same date window does NOT trigger repeat advice, forwards exact filters,
+    #    AND refreshes company record timestamp when a company query is paged!
+    mono_box[0] += 60
+    p_cur = _ae_results_payload(5, has_more=False, prefix="t3_")
+    next_payloads.append(p_cur)
+    r_cur = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "rep-cursor",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": "AI Agent 商业化",
+                    "start": "2026-10-01",
+                    "end": "2026-11-10",
+                    "limit": 10,
+                    "params": {"cursor": "ae1:c1"},
+                },
+            },
+            caller_identity=caller_a,
+        ),
+        timeout=5.0,
+    )
+    b_cur = json.loads(r_cur["result"]["content"][0]["text"])
+    assert "advice" not in b_cur
+    assert b_cur["data"]["structuredContent"]["results"] == p_cur["data"]["structuredContent"]["results"]
+    assert forwarded_args[-1]["start"] == "2026-10-01"
+    assert forwarded_args[-1]["end"] == "2026-11-10"
+    assert forwarded_args[-1]["limit"] == 10
+    assert forwarded_args[-1]["params"]["cursor"] == "ae1:c1"
+
+    # Verify cursor continuation refreshes company signature timestamp in _records (without triggering repeat advice)
+    p_nv1 = _ae_results_payload(2, has_more=True, cursor="ae1:nv_p2", prefix="nv1_")
+    next_payloads.append(p_nv1)
+    await bridge.handle_tools_call(
+        "rep-nv1",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "alphaengine",
+                "operation": "search_library",
+                "query": "NVDA Blackwell",
+                "start": "2026-10-01",
+                "end": "2026-11-10",
+                "limit": 10,
+            },
+        },
+        caller_identity=caller_a,
+    )
+    t_before_cursor = bridge._ae_company_tracker._records[("thread:th-rep-a", "NVDA")]["nvda blackwell||"]
+    mono_box[0] += 120.0
+    p_nv_cur = _ae_results_payload(2, has_more=False, prefix="nv2_")
+    next_payloads.append(p_nv_cur)
+    r_nv_cur = await bridge.handle_tools_call(
+        "rep-nv-cur",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "alphaengine",
+                "operation": "search_library",
+                "query": "NVDA Blackwell",
+                "start": "2026-10-01",
+                "end": "2026-11-10",
+                "limit": 10,
+                "params": {"cursor": "ae1:nv_p2"},
+            },
+        },
+        caller_identity=caller_a,
+    )
+    assert "advice" not in json.loads(r_nv_cur["result"]["content"][0]["text"])
+    t_after_cursor = bridge._ae_company_tracker._records[("thread:th-rep-a", "NVDA")]["nvda blackwell||"]
+    assert t_after_cursor == t_before_cursor + 120.0
+
+    # 4. Different session (caller_b) hits team cache on exact params of #1 -> no advice,
+    #    AND that cache hit IS recorded as caller_b's "previous search"!
+    r_b1 = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "rep-b1",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": "AI Agent 商业化",
+                    "start": "2026-10-01",
+                    "end": "2026-11-10",
+                    "limit": 10,
+                },
+            },
+            caller_identity=caller_b,
+        ),
+        timeout=5.0,
+    )
+    b_b1 = json.loads(r_b1["result"]["content"][0]["text"])
+    assert b_b1["_bridge_cache"]["status"] == "hit"
+    assert "advice" not in b_b1
+    assert b_b1["data"]["structuredContent"]["results"] == p1["data"]["structuredContent"]["results"]
+
+    # 3 minutes later, caller_b searches same query with different limit -> triggers repeat advice using cache hit count (7)!
+    mono_box[0] += 3 * 60
+    p_b2 = _ae_results_payload(15, has_more=False, prefix="b2_")
+    next_payloads.append(p_b2)
+    r_b2 = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "rep-b2",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": "AI Agent 商业化",
+                    "start": "2026-10-01",
+                    "end": "2026-11-10",
+                    "limit": 25,
+                },
+            },
+            caller_identity=caller_b,
+        ),
+        timeout=5.0,
+    )
+    b_b2 = json.loads(r_b2["result"]["content"][0]["text"])
+    assert b_b2["data"]["structuredContent"]["results"] == p_b2["data"]["structuredContent"]["results"]
+    assert (
+        b_b2["advice"]
+        == "本会话 3 分钟前已用相同查询词检索过（上次返回 7 条）；请先从现有结果中挑选，确实需要不同时间段或更多结果时再检索"
+    )
+
+    # 5. Cross-operation repeat (transcript -> search_library) shares (session, raw_query_sig)
+    caller_tr = {"user": "u3", "workspace": "ws3", "thread": "th-tr-cross"}
+    tr_partial = _transcript_payload(3, complete=False, pages_scanned=10)
+    next_payloads.append(tr_partial)
+    r_tr1 = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "rep-tr1",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "transcript",
+                    "ticker": "00700",
+                    "query": "腾讯|Tencent",
+                    "start": "2026-01-01",
+                    "end": "2026-11-10",
+                    "limit": 4,
+                },
+            },
+            caller_identity=caller_tr,
+        ),
+        timeout=5.0,
+    )
+    assert "advice" not in json.loads(r_tr1["result"]["content"][0]["text"])
+
+    mono_box[0] += 4 * 60
+    p_sl_after_tr = _ae_results_payload(5, has_more=False, prefix="sltr_")
+    next_payloads.append(p_sl_after_tr)
+    r_sl_after_tr = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "rep-sl-after-tr",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": "腾讯|Tencent",
+                    "start": "2026-06-01",
+                    "end": "2026-11-10",
+                    "limit": 10,
+                },
+            },
+            caller_identity=caller_tr,
+        ),
+        timeout=5.0,
+    )
+    b_sl_after_tr = json.loads(r_sl_after_tr["result"]["content"][0]["text"])
+    assert (
+        b_sl_after_tr["advice"]
+        == "本会话 4 分钟前已用相同查询词检索过（上次返回 3 条）；请先从现有结果中挑选，确实需要不同时间段或更多结果时再检索"
+    )
+
+    # 6. Caller-omitted query (pure ticker folded by bridge on alphaengine, or pure-ticker transcript):
+    #    - Never participates in repeat-query history/advice!
+    #    - Pure-ticker transcript STILL records returned team docs into company doc list!
+    caller_tk = {"user": "u4", "workspace": "ws4", "thread": "th-pure-ticker"}
+    next_payloads.append(_ae_results_payload(2, prefix="tk1_"))
+    r_tk1 = await bridge.handle_tools_call(
+        "rep-tk1",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "alphaengine",
+                "operation": "search_library",
+                "ticker": "AMD",
+                "start": "2026-10-01",
+                "end": "2026-11-10",
+            },
+        },
+        caller_identity=caller_tk,
+    )
+    assert "advice" not in json.loads(r_tk1["result"]["content"][0]["text"])
+    mono_box[0] += 60.0
+    next_payloads.append(_ae_results_payload(3, prefix="tk2_"))
+    r_tk2 = await bridge.handle_tools_call(
+        "rep-tk2",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "alphaengine",
+                "operation": "search_library",
+                "ticker": "AMD",
+                "start": "2026-09-01",
+                "end": "2026-11-10",
+            },
+        },
+        caller_identity=caller_tk,
+    )
+    assert "advice" not in json.loads(r_tk2["result"]["content"][0]["text"])
+
+    # Pure-ticker transcript records returned team docs for META even though it skips company count & repeat history
+    next_payloads.append(_transcript_payload(2, complete=True, pages_scanned=1))
+    r_meta_tr = await bridge.handle_tools_call(
+        "rep-meta-tr",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "transcript",
+                "ticker": "META",
+                "start": "2026-10-01",
+                "end": "2026-11-10",
+            },
+        },
+        caller_identity=caller_tk,
+    )
+    assert "advice" not in json.loads(r_meta_tr["result"]["content"][0]["text"])
+    # Repeat pure-ticker transcript with different date -> still no repeat advice
+    mono_box[0] += 60.0
+    next_payloads.append(_transcript_payload(1, complete=True, pages_scanned=1))
+    r_meta_tr2 = await bridge.handle_tools_call(
+        "rep-meta-tr2",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "transcript",
+                "ticker": "META",
+                "start": "2026-09-01",
+                "end": "2026-11-10",
+            },
+        },
+        caller_identity=caller_tk,
+    )
+    assert "advice" not in json.loads(r_meta_tr2["result"]["content"][0]["text"])
+    # Now 3 distinct query searches for META -> advice_previous_docs includes the transcript docs from pure-ticker call!
+    for idx, q in enumerate(("Meta Platforms Reels", "Facebook Ads", "$META CapEx")):
+        mono_box[0] += 10.0
+        next_payloads.append(_ae_results_payload(1, prefix=f"meta_q{idx}_"))
+        r_mq = await bridge.handle_tools_call(
+            f"rep-meta-q-{idx}",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": q,
+                },
+            },
+            caller_identity=caller_tk,
+        )
+        b_mq = json.loads(r_mq["result"]["content"][0]["text"])
+        if idx < 2:
+            assert "advice" not in b_mq
+        else:
+            assert "已检索这家公司 3 次" in b_mq["advice"]
+            doc_ids = [d["doc_id"] for d in b_mq["advice_previous_docs"]]
+            assert "tr_1" in doc_ids and "tr_2" in doc_ids
+
+    # 7. After 30 minutes TTL expires -> no repeat advice
+    mono_box[0] += 31 * 60
+    p_exp = _ae_results_payload(3, has_more=False, prefix="exp_")
+    next_payloads.append(p_exp)
+    r_exp = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "rep-exp",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": "AI Agent 商业化",
+                    "start": "2026-07-01",
+                    "end": "2026-11-15",
+                    "limit": 5,
+                },
+            },
+            caller_identity=caller_a,
+        ),
+        timeout=5.0,
+    )
+    b_exp = json.loads(r_exp["result"]["content"][0]["text"])
+    assert "advice" not in b_exp
+    assert b_exp["data"]["structuredContent"]["results"] == p_exp["data"]["structuredContent"]["results"]
+
+
+@pytest.mark.asyncio
+async def test_ae_company_previous_docs_dedup_order_cap_and_combined_priority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _make_bridge(tmp_path, monkeypatch)
+    mono_box, clock_double = _make_clock_double(2000.0)
+    bridge._ae_company_tracker = ae_cache.AlphaEngineCompanySearchTracker(
+        now_fn=clock_double
+    )
+
+    def _custom_payload(
+        docs: list[tuple[str, str, str]], *, cursor: str | None = None
+    ) -> dict[str, Any]:
+        items = [
+            {"doc_id": did, "title": title, "publish_time": dt, "source_name": "Broker"}
+            for did, title, dt in docs
+        ]
+        return {
+            "ok": True,
+            "data": {
+                "structuredContent": {
+                    "results": items,
+                    "returned": len(items),
+                    "has_more": bool(cursor),
+                    "cursor": cursor,
+                    "total_upstream": len(items),
+                    "filters": {},
+                }
+            },
+        }
+
+    p_c1 = _custom_payload(
+        [(f"d{i}", f"NVDA Note {i}", f"2026-11-0{i}") for i in range(1, 7)],
+        cursor="ae1:nvda_p2",
+    )
+    p_c2 = _custom_payload(
+        [
+            ("d5", "NVDA Note 5", "2026-11-05 09:30:00"),
+            ("d6", "NVDA Note 6", "2026-11-06"),
+            ("d7", "NVDA Note 7", "2026-11-07"),
+            ("d8", "NVDA Note 8", "2026-11-08"),
+            ("d9", "NVDA Note 9", "2026-11-09"),
+            ("d10", "NVDA Note 10", "2026-11-10"),
+            ("d11", "NVDA Note 11", "2026-11-11"),
+            ("d12", "NVDA Note 12", "2026-11-12"),
+        ]
+    )
+    p_c3 = _custom_payload(
+        [("d13", "Blackwell Rack", "2026-11-13"), ("d14", "Blackwell CoWoS", "2026-11-14")]
+    )
+    p_c4 = _custom_payload([("d15", "NVDA Follow-up", "2026-11-15")])
+
+    # Second sequence for simultaneous repeat-query + company-3+ (new keyword for TSM!)
+    p_s1 = _custom_payload([("s1", "Foundry Overview", "2026-11-01")], cursor="ae1:s1_p2")
+    p_s2 = _custom_payload([("t1", "TSMC CoWoS", "2026-11-02"), ("t2", "TSMC Packaging", "2026-11-03")])
+    p_s3 = _custom_payload([("t3", "TSMC 2nm Yield", "2026-11-04")])
+    p_s4 = _transcript_payload(2, complete=True, pages_scanned=1)
+
+    batches: list[dict[str, Any]] = [p_c1, p_c2, p_c3, p_c4, p_s1, p_s2, p_s3, p_s4]
+
+    async def _fake_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        return [_mcp_reply(requests[0]["id"], batches.pop(0))]
+
+    monkeypatch.setattr(
+        bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_fake_rpc)
+    )
+    caller = {"user": "u1", "workspace": "ws1", "thread": "th-docs"}
+
+    # Call 1 & Call 2 -> no advice
+    await bridge.handle_tools_call(
+        "c1",
+        {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "NVDA", "limit": 6}},
+        caller_identity=caller,
+    )
+    mono_box[0] += 120.0
+    await bridge.handle_tools_call(
+        "c2",
+        {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "英伟达 算力", "limit": 8}},
+        caller_identity=caller,
+    )
+
+    # Call 3 -> 3rd distinct new-keyword search for NVDA: company advice + advice_previous_docs (deduped, <=10, most recent first)
+    mono_box[0] += 120.0
+    r3 = await bridge.handle_tools_call(
+        "c3",
+        {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "Nvidia Blackwell", "limit": 5}},
+        caller_identity=caller,
+    )
+    b3 = json.loads(r3["result"]["content"][0]["text"])
+    assert "advice_previous_docs" in b3["advice"]
+    assert "已检索这家公司 3 次" in b3["advice"]
+    assert b3["data"]["structuredContent"]["results"] == p_c3["data"]["structuredContent"]["results"]
+
+    prev3 = b3["advice_previous_docs"]
+    assert len(prev3) == 10
+    assert [d["doc_id"] for d in prev3] == ["d5", "d6", "d7", "d8", "d9", "d10", "d11", "d12", "d1", "d2"]
+    assert prev3[0] == {"doc_id": "d5", "title": "NVDA Note 5", "date": "2026-11-05"}
+    assert len({d["doc_id"] for d in prev3}) == 10
+
+    # Call 4 -> repeats Call 1 ("NVDA") with different date/limit: NOT a new keyword for NVDA,
+    # so ONLY repeat-query advice fires (is_new_keyword restored) and NO advice_previous_docs!
+    mono_box[0] += 120.0
+    r4 = await bridge.handle_tools_call(
+        "c4",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "alphaengine",
+                "operation": "search_library",
+                "query": "NVDA",
+                "start": "2026-01-01",
+                "limit": 15,
+            },
+        },
+        caller_identity=caller,
+    )
+    b4 = json.loads(r4["result"]["content"][0]["text"])
+    assert (
+        b4["advice"]
+        == "本会话 6 分钟前已用相同查询词检索过（上次返回 6 条）；请先从现有结果中挑选，确实需要不同时间段或更多结果时再检索"
+    )
+    assert "advice_previous_docs" not in b4
+    assert b4["data"]["structuredContent"]["results"] == p_c4["data"]["structuredContent"]["results"]
+
+    # Simultaneous trigger: repeat-query AND company 3rd new distinct keyword!
+    caller_both = {"user": "u2", "workspace": "ws2", "thread": "th-both"}
+    await bridge.handle_tools_call(
+        "both-1",
+        {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "台湾积体电路", "limit": 5}},
+        caller_identity=caller_both,
+    )
+    mono_box[0] += 60.0
+    await bridge.handle_tools_call(
+        "both-2",
+        {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "TSMC CoWoS", "limit": 5}},
+        caller_identity=caller_both,
+    )
+    mono_box[0] += 60.0
+    await bridge.handle_tools_call(
+        "both-3",
+        {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "台积电 2nm", "limit": 5}},
+        caller_identity=caller_both,
+    )
+    mono_box[0] += 60.0
+    r_both = await bridge.handle_tools_call(
+        "both-4",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "transcript",
+                "ticker": "TSM",
+                "query": "台湾积体电路",
+                "start": "2026-10-01",
+                "end": "2026-11-10",
+            },
+        },
+        caller_identity=caller_both,
+    )
+    b_both = json.loads(r_both["result"]["content"][0]["text"])
+    assert (
+        b_both["advice"]
+        == "本会话 3 分钟前已用相同查询词检索过（上次返回 1 条，此前返回的文档见 `advice_previous_docs`）；请先从现有结果中挑选，确实需要不同时间段或更多结果时再检索"
+    )
+    assert [d["doc_id"] for d in b_both["advice_previous_docs"]] == ["t3", "t1", "t2"]
+
+    # Failed and mode="plan" requests STILL count toward company distinct-keyword count (restored old behavior)
+    tracker = ae_cache.AlphaEngineCompanySearchTracker(now_fn=clock_double)
+    c_fail = {"user": "u3", "workspace": "ws3", "thread": "th-fail-plan"}
+    r_f1 = tracker.record_and_evaluate(caller_identity=c_fail, query="NVDA fail", ok=False)
+    r_f2 = tracker.record_and_evaluate(caller_identity=c_fail, query="英伟达 plan", mode="plan", ok=True)
+    r_f3 = tracker.record_and_evaluate(caller_identity=c_fail, query="Nvidia Blackwell", ok=True)
+    assert r_f1.advice is None
+    assert r_f2.advice is None
+    assert r_f3.advice is not None and "已检索这家公司 3 次" in r_f3.advice
+
+
+@pytest.mark.asyncio
+async def test_ae_personal_scope_does_not_record_previous_docs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _make_bridge(tmp_path, monkeypatch)
+    mono_box, clock_double = _make_clock_double(3000.0)
+    bridge._ae_company_tracker = ae_cache.AlphaEngineCompanySearchTracker(
+        now_fn=clock_double
+    )
+    seq = 0
+    forwarded: list[dict[str, Any]] = []
+    expected_by_seq: dict[int, list[dict[str, Any]]] = {}
+
+    async def _fake_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        nonlocal seq
+        seq += 1
+        req = requests[0]
+        forwarded.append(dict(req["params"]["arguments"]))
+        payload = _ae_results_payload(2, prefix=f"p{seq}_")
+        expected_by_seq[seq] = list(payload["data"]["structuredContent"]["results"])
+        return [_mcp_reply(req["id"], payload)]
+
+    monkeypatch.setattr(
+        bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_fake_rpc)
+    )
+    caller = {"user": "alice", "workspace": "ws-p", "thread": "th-pers-docs"}
+
+    # Calls 1 & 2 are personal-scope (using upstream-valid params) -> must NOT record doc list!
+    r1 = await bridge.handle_tools_call(
+        "ps-1",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "alphaengine",
+                "operation": "search_library",
+                "query": "NVDA 1on1",
+                "params": {"meeting_scope": "personal"},
+            },
+        },
+        caller_identity=caller,
+    )
+    assert json.loads(r1["result"]["content"][0]["text"])["data"]["structuredContent"]["results"] == expected_by_seq[1]
+    assert forwarded[-1]["params"]["meeting_scope"] == "personal"
+
+    r2 = await bridge.handle_tools_call(
+        "ps-2",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "alphaengine",
+                "operation": "search_library",
+                "query": "英伟达 私人会议",
+                "params": {"meeting_scope": "institution", "own_reservations_only": True},
+            },
+        },
+        caller_identity=caller,
+    )
+    assert json.loads(r2["result"]["content"][0]["text"])["data"]["structuredContent"]["results"] == expected_by_seq[2]
+    assert forwarded[-1]["params"]["meeting_scope"] == "institution"
+    assert forwarded[-1]["params"]["own_reservations_only"] is True
+
+    # Call 3 is team-scope (3rd distinct for NVDA) -> company advice fires, NO personal docs leaked!
+    r3 = await bridge.handle_tools_call(
+        "ps-3",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "alphaengine",
+                "operation": "search_library",
+                "query": "Nvidia Blackwell",
+            },
+        },
+        caller_identity=caller,
+    )
+    b3 = json.loads(r3["result"]["content"][0]["text"])
+    assert b3["data"]["structuredContent"]["results"] == expected_by_seq[3]
+    assert "已检索这家公司 3 次" in b3["advice"]
+    assert "advice_previous_docs" not in b3
+    assert "advice_previous_docs" not in b3["advice"]
+
+    # Call 4 is team-scope (4th distinct for NVDA) -> ONLY Call 3's team docs appear, never Call 1/2's personal docs!
+    r4 = await bridge.handle_tools_call(
+        "ps-4",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "alphaengine",
+                "operation": "search_library",
+                "query": "NVDA Rubin",
+            },
+        },
+        caller_identity=caller,
+    )
+    b4 = json.loads(r4["result"]["content"][0]["text"])
+    assert b4["data"]["structuredContent"]["results"] == expected_by_seq[4]
+    assert [d["doc_id"] for d in b4["advice_previous_docs"]] == ["p3_0001", "p3_0002"]
+
+    # Shared thread privacy: personal search by alice MUST NOT trigger repeat-query advice for bob (or vice versa)!
+    alice_shared = {"user": "alice", "workspace": "ws-shared", "thread": "th-shared-pers"}
+    bob_shared = {"user": "bob", "workspace": "ws-shared", "thread": "th-shared-pers"}
+    r_sh1 = await bridge.handle_tools_call(
+        "ps-shared-1",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "alphaengine",
+                "operation": "search_library",
+                "query": "私密会谈纪要",
+                "params": {"meeting_scope": "personal"},
+            },
+        },
+        caller_identity=alice_shared,
+    )
+    assert "advice" not in json.loads(r_sh1["result"]["content"][0]["text"])
+
+    mono_box[0] += 60.0
+    r_sh2 = await bridge.handle_tools_call(
+        "ps-shared-2",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "alphaengine",
+                "operation": "search_library",
+                "query": "私密会谈纪要",
+            },
+        },
+        caller_identity=bob_shared,
+    )
+    assert "advice" not in json.loads(r_sh2["result"]["content"][0]["text"])
+
+    # Conversely, alice doing a personal search after bob's normal search ALSO must not trigger repeat-query advice
+    mono_box[0] += 60.0
+    r_sh3 = await bridge.handle_tools_call(
+        "ps-shared-3",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "alphaengine",
+                "operation": "search_library",
+                "query": "私密会谈纪要",
+                "params": {"meeting_scope": "personal"},
+            },
+        },
+        caller_identity=alice_shared,
+    )
+    assert "advice" not in json.loads(r_sh3["result"]["content"][0]["text"])
+
+
+@pytest.mark.asyncio
+async def test_ae_all_route_fanout_attaches_repeat_advice_and_previous_docs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _make_bridge(tmp_path, monkeypatch)
+    mono_box, clock_double = _make_clock_double(4000.0)
+    bridge._ae_company_tracker = ae_cache.AlphaEngineCompanySearchTracker(
+        now_fn=clock_double
+    )
+    ae_seq = 0
+    ae_forwarded: list[dict[str, Any]] = []
+
+    async def _fanout_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        nonlocal ae_seq
+        req = requests[0]
+        route = req["params"]["arguments"].get("route")
+        if route == "alphaengine":
+            ae_seq += 1
+            ae_forwarded.append(dict(req["params"]["arguments"]))
+            return [
+                _mcp_reply(
+                    req["id"],
+                    _ae_results_payload(2, has_more=False, prefix=f"fan{ae_seq}_"),
+                )
+            ]
+        if route == "guidepoint":
+            return [_mcp_reply(req["id"], {"ok": True, "data": {"structuredContent": {"data": []}}})]
+        return [
+            _mcp_reply(
+                req["id"],
+                {"ok": True, "status": "ok", "results": [], "source_status": {"sales-notes": {"ok": True, "count": 0}}},
+            )
+        ]
+
+    monkeypatch.setattr(
+        bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_fanout_rpc)
+    )
+    caller = {"user": "u1", "workspace": "ws-all", "thread": "th-all-adv"}
+
+    # 1. Direct search_library #1 & #2 for TSMC
+    await bridge.handle_tools_call(
+        "f-1",
+        {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "TSMC"}},
+        caller_identity=caller,
+    )
+    mono_box[0] += 60.0
+    await bridge.handle_tools_call(
+        "f-2",
+        {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "台积电 CoWoS"}},
+        caller_identity=caller,
+    )
+    # 2. route="all" #3 for TSMC -> attaches company advice + advice_previous_docs on top-level & alphaengine section
+    mono_box[0] += 60.0
+    r3 = await bridge.handle_tools_call(
+        "f-3",
+        {"name": "research", "arguments": {"route": "all", "operation": "search", "query": "TSM 2nm"}},
+        caller_identity=caller,
+    )
+    b3 = json.loads(r3["result"]["content"][0]["text"])
+    assert "已检索这家公司 3 次" in b3["advice"]
+    assert b3["alphaengine"]["advice"] == b3["advice"]
+    assert [d["doc_id"] for d in b3["advice_previous_docs"]] == ["fan2_0001", "fan2_0002", "fan1_0001", "fan1_0002"]
+    assert b3["alphaengine"]["advice_previous_docs"] == b3["advice_previous_docs"]
+    assert b3["alphaengine"]["count"] == 2
+    assert [r["doc_id"] for r in b3["alphaengine"]["results"]] == ["fan3_0001", "fan3_0002"]
+
+    # 3. route="all" repeating "TSMC" with different date & limit -> unified repeat-query advice
+    mono_box[0] += 180.0
+    r4 = await bridge.handle_tools_call(
+        "f-4",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "all",
+                "operation": "search",
+                "query": "TSMC",
+                "start": "2026-01-01",
+                "limit": 10,
+            },
+        },
+        caller_identity=caller,
+    )
+    b4 = json.loads(r4["result"]["content"][0]["text"])
+    assert (
+        b4["advice"]
+        == "本会话 5 分钟前已用相同查询词检索过（上次返回 2 条）；请先从现有结果中挑选，确实需要不同时间段或更多结果时再检索"
+    )
+    assert b4["alphaengine"]["advice"] == b4["advice"]
+    assert "advice_previous_docs" not in b4
+    assert [r["doc_id"] for r in b4["alphaengine"]["results"]] == ["fan4_0001", "fan4_0002"]
+    assert ae_forwarded[-1]["limit"] == 10
+
+
+@pytest.mark.asyncio
+async def test_ae_advice_and_query_log_exception_isolation_direct_and_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _make_bridge(tmp_path, monkeypatch)
+    mono_box, clock_double = _make_clock_double(5000.0)
+    bridge._ae_company_tracker = ae_cache.AlphaEngineCompanySearchTracker(
+        now_fn=clock_double
+    )
+    caller = {"user": "u1", "workspace": "ws-iso", "thread": "th-iso"}
+    p_direct = _ae_results_payload(2, prefix="iso_d_")
+    p_all = _ae_results_payload(2, prefix="iso_a_")
+    expected_direct_items = p_direct["data"]["structuredContent"]["results"]
+    expected_all_core = [
+        (it["doc_id"], it["title"], it["publish_time"], it["source_name"])
+        for it in p_all["data"]["structuredContent"]["results"]
+    ]
+
+    async def _fake_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        req = requests[0]
+        route = req["params"]["arguments"].get("route")
+        if route == "alphaengine":
+            q = str(req["params"]["arguments"].get("query") or "")
+            return [_mcp_reply(req["id"], p_all if "ALL" in q else p_direct)]
+        if route == "guidepoint":
+            return [_mcp_reply(req["id"], {"ok": True, "data": {"structuredContent": {"data": []}}})]
+        return [
+            _mcp_reply(
+                req["id"],
+                {"ok": True, "status": "ok", "results": [], "source_status": {"sales-notes": {"ok": True, "count": 0}}},
+            )
+        ]
+
+    monkeypatch.setattr(
+        bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_fake_rpc)
+    )
+
+    def _assert_all_results_intact(body: dict[str, Any]) -> None:
+        assert body["ok"] is True
+        ae_res = body["alphaengine"]["results"]
+        assert body["alphaengine"]["count"] == len(expected_all_core)
+        assert [
+            (x["doc_id"], x["title"], x["publish_time"], x["source_name"]) for x in ae_res
+        ] == expected_all_core
+
+    # Case 1: extract_search_result_docs raises -> both direct and route="all" return full results + write ledger
+    orig_extract = ae_cache.extract_search_result_docs
+    monkeypatch.setattr(
+        ae_cache,
+        "extract_search_result_docs",
+        create_autospec(orig_extract, side_effect=RuntimeError("extract boom")),
+    )
+    r_d1 = await bridge.handle_tools_call(
+        "iso-d1",
+        {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "NVDA D1"}},
+        caller_identity=caller,
+    )
+    b_d1 = json.loads(r_d1["result"]["content"][0]["text"])
+    assert b_d1["ok"] is True
+    assert b_d1["data"]["structuredContent"]["results"] == expected_direct_items
+    assert "advice" not in b_d1
+
+    r_a1 = await bridge.handle_tools_call(
+        "iso-a1",
+        {"name": "research", "arguments": {"route": "all", "operation": "search", "query": "NVDA ALL1"}},
+        caller_identity=caller,
+    )
+    b_a1 = json.loads(r_a1["result"]["content"][0]["text"])
+    _assert_all_results_intact(b_a1)
+    assert "advice" not in b_a1
+    monkeypatch.setattr(ae_cache, "extract_search_result_docs", orig_extract)
+
+    # Case 2: tracker.record_and_evaluate raises -> both direct and route="all" return full results + write ledger
+    tracker = bridge._get_ae_company_tracker()
+    orig_eval = tracker.record_and_evaluate
+    monkeypatch.setattr(
+        tracker,
+        "record_and_evaluate",
+        create_autospec(orig_eval, side_effect=RuntimeError("tracker boom")),
+    )
+    r_d2 = await bridge.handle_tools_call(
+        "iso-d2",
+        {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "NVDA D2"}},
+        caller_identity=caller,
+    )
+    b_d2 = json.loads(r_d2["result"]["content"][0]["text"])
+    assert b_d2["ok"] is True
+    assert b_d2["data"]["structuredContent"]["results"] == expected_direct_items
+    assert "advice" not in b_d2
+
+    r_a2 = await bridge.handle_tools_call(
+        "iso-a2",
+        {"name": "research", "arguments": {"route": "all", "operation": "search", "query": "NVDA ALL2"}},
+        caller_identity=caller,
+    )
+    b_a2 = json.loads(r_a2["result"]["content"][0]["text"])
+    _assert_all_results_intact(b_a2)
+    assert "advice" not in b_a2
+    monkeypatch.setattr(tracker, "record_and_evaluate", orig_eval)
+
+    # Seed one normal search so Case 3 can verify advice is INTENTIONALLY preserved when query logging fails!
+    await bridge.handle_tools_call(
+        "iso-seed",
+        {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "NVDA LOGFAIL"}},
+        caller_identity=caller,
+    )
+    mono_box[0] += 120.0
+
+    # Case 3: query_logger.log raises -> both direct and route="all" STILL return full results,
+    #         STILL return computed advice, AND STILL write usage ledger!
+    q_logger = bridge._get_ae_query_logger()
+    orig_log = q_logger.log
+    monkeypatch.setattr(
+        q_logger,
+        "log",
+        create_autospec(orig_log, side_effect=RuntimeError("log boom")),
+    )
+    r_d3 = await bridge.handle_tools_call(
+        "iso-d3",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "alphaengine",
+                "operation": "search_library",
+                "query": "NVDA LOGFAIL",
+                "start": "2026-01-01",
+            },
+        },
+        caller_identity=caller,
+    )
+    b_d3 = json.loads(r_d3["result"]["content"][0]["text"])
+    assert b_d3["ok"] is True
+    assert b_d3["data"]["structuredContent"]["results"] == expected_direct_items
+    assert "2 分钟前" in b_d3["advice"]
+
+    mono_box[0] += 60.0
+    r_a3 = await bridge.handle_tools_call(
+        "iso-a3",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "all",
+                "operation": "search",
+                "query": "NVDA LOGFAIL ALL",
+                "start": "2026-01-01",
+            },
+        },
+        caller_identity=caller,
+    )
+    b_a3 = json.loads(r_a3["result"]["content"][0]["text"])
+    _assert_all_results_intact(b_a3)
+
+    # Repeat the route="all" query while query_logger.log still fails -> advice preserved on both top-level and alphaengine!
+    mono_box[0] += 60.0
+    r_a4 = await bridge.handle_tools_call(
+        "iso-a4",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "all",
+                "operation": "search",
+                "query": "NVDA LOGFAIL ALL",
+                "start": "2026-02-01",
+            },
+        },
+        caller_identity=caller,
+    )
+    b_a4 = json.loads(r_a4["result"]["content"][0]["text"])
+    _assert_all_results_intact(b_a4)
+    assert "1 分钟前" in b_a4["advice"]
+    assert b_a4["alphaengine"]["advice"] == b_a4["advice"]
+    monkeypatch.setattr(q_logger, "log", orig_log)
+
+    # Case 4: AlphaEngineTeamQueryLogger.log_sync catches json.dumps TypeError cleanly
+    assert q_logger.log_sync({"bad": object()}) is False
+
+    # All 8 searches (4 direct + 4 route="all") recorded into the usage ledger with accurate counts!
+    ledger_entries = usage_report.load_entries([bridge.cfg.alphaengine_usage_file])
+    assert len(ledger_entries) == 8
+    assert all(
+        e["ok"] is True and e["operation"] == "search_library" and e["count"] == 2
+        for e in ledger_entries
+    )
+
+
+def test_ae_tracker_bounded_memory_dedup_sigs_and_prune_on_failed_or_no_session() -> None:
+    mono_box, clock_double = _make_clock_double(1000.0)
+    tracker = ae_cache.AlphaEngineCompanySearchTracker(
+        window_s=1800.0,
+        max_entries=4,
+        now_fn=clock_double,
+    )
+    caller_a = {"user": "u1", "workspace": "ws1", "thread": "th-mem-a"}
+    caller_b = {"user": "u2", "workspace": "ws2", "thread": "th-mem-b"}
+
+    # 1. Repeated same signature under (session, company) keeps ONE timestamp entry (no list growth)
+    for step in range(5):
+        mono_box[0] += 10.0
+        tracker.record_and_evaluate(
+            caller_identity=caller_a,
+            query="NVDA CapEx",
+            result_count=2,
+            returned_docs=[{"doc_id": f"doc_{step}", "title": "T", "date": "2026-11-10"}],
+        )
+    sig_map = tracker._records[("thread:th-mem-a", "NVDA")]
+    assert isinstance(sig_map, dict)
+    assert len(sig_map) == 1
+    assert sig_map["nvda capex||"] == mono_box[0]
+
+    # 2. Each record kind is capped at max_entries=4 across all sessions; oldest evicted first.
+    #    Session A already has 1 sig ("nvda capex||"); add 2 more for Session A (=3), then 2 for Session B (=5 > 4).
+    for q in ("NVDA Blackwell", "英伟达 算力"):
+        mono_box[0] += 10.0
+        tracker.record_and_evaluate(
+            caller_identity=caller_a,
+            query=q,
+            result_count=1,
+            returned_docs=[{"doc_id": f"a_{q}", "title": "T", "date": "2026-11-10"}],
+        )
+    for idx, q in enumerate(("TSMC CoWoS", "台积电 2nm")):
+        mono_box[0] += 10.0
+        tracker.record_and_evaluate(
+            caller_identity=caller_b,
+            query=q,
+            result_count=1,
+            returned_docs=[{"doc_id": f"b_{idx}", "title": "T", "date": "2026-11-10"}],
+        )
+    total_sig_records = sum(len(m) for m in tracker._records.values())
+    total_doc_records = sum(len(v) for v in tracker._company_docs.values())
+    assert total_sig_records == 4
+    assert len(tracker._query_history) == 4
+    assert total_doc_records == 4
+    # Oldest entry from Session A ("nvda capex||") was evicted by newer Session B entries
+    assert "nvda capex||" not in tracker._records[("thread:th-mem-a", "NVDA")]
+    assert ("thread:th-mem-a", "nvda capex||") not in tracker._query_history
+    assert ("thread:th-mem-b", "TSM") in tracker._records
+
+    # 3. Expiration pruning runs even on sessionless or failed calls
+    mono_box[0] += 1801.0
+    tracker.record_and_evaluate(caller_identity=None, query="anything", ok=False)
+    assert tracker._records == {}
+    assert tracker._query_history == {}
+    assert tracker._company_docs == {}
