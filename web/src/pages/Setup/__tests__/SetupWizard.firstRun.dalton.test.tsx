@@ -35,6 +35,10 @@ interface ServerState {
   metadataExtra: Record<string, Record<string, unknown>>;
   credentialsStatusFailCount: number;
   modelsFailCount: number;
+  // DALTON-HOOK(dalton-setup): allow simulating /api/v1/features & /api/v1/claude-code/status failures
+  featuresFailCount: number;
+  claudeCodeRuntimeEnabled: boolean;
+  claudeCodeStatusFailCount: number;
   antigravityModelsOverride: string[] | null;
   connectedOAuthProviders: string[] | null;
   oauthFailPaths: string[];
@@ -69,6 +73,10 @@ const makeInitialState = (): ServerState => ({
   metadataExtra: {},
   credentialsStatusFailCount: 0,
   modelsFailCount: 0,
+  // DALTON-HOOK(dalton-setup): defaults for features & claude-code status failure simulation
+  featuresFailCount: 0,
+  claudeCodeRuntimeEnabled: false,
+  claudeCodeStatusFailCount: 0,
   antigravityModelsOverride: null,
   connectedOAuthProviders: null,
   oauthFailPaths: [],
@@ -348,10 +356,29 @@ vi.mock('@/api/client', async (importOriginal) => {
         cached: false,
       } as T);
     }
+    // DALTON-HOOK(dalton-setup): simulate /api/v1/features and /api/v1/claude-code/status read failures for Retry tests
     if (url === '/api/v1/features') {
-      return ok({ features: [{ key: 'claude_code_runtime', enabled: false }] } as T);
+      if (s.featuresFailCount > 0) {
+        s.featuresFailCount -= 1;
+        throw new ApiError('Request failed with status code 500', 'ERR_BAD_RESPONSE', {
+          data: { detail: 'features read failed' },
+          status: 500,
+          statusText: 'Internal Server Error',
+          headers: {},
+        });
+      }
+      return ok({ features: [{ key: 'claude_code_runtime', enabled: s.claudeCodeRuntimeEnabled }] } as T);
     }
     if (url === '/api/v1/claude-code/status') {
+      if (s.claudeCodeStatusFailCount > 0) {
+        s.claudeCodeStatusFailCount -= 1;
+        throw new ApiError('Request failed with status code 500', 'ERR_BAD_RESPONSE', {
+          data: { detail: 'claude code status failed' },
+          status: 500,
+          statusText: 'Internal Server Error',
+          headers: {},
+        });
+      }
       return ok({ enabled: false, state: 'off', email: null, expires_at: null } as T);
     }
     if (url === '/api/v1/claude-code/setup') {
@@ -1404,6 +1431,7 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     });
   }, 15_000);
 
+  // DALTON-HOOK(dalton-setup): leftover-1 sharing-off Retry discovers newly connected provider and sends refresh=1
   it('(leftover-1) sharing-off Retry discovers newly connected provider after invalidation and force-refreshes with refresh=1', async () => {
     const user = userEvent.setup();
     server.state.teamSharingEnabled = false;
@@ -1446,6 +1474,7 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     server.state.progress.models = 'langalpha_models';
     server.state.progress.runs_on = 'cloud';
 
+    // DALTON-HOOK(dalton-setup): verify empty state before connecting Antigravity, then Retry sends refresh=1
     renderRealWizardApp('/setup/default');
     expect(await screen.findByTestId('setup-default-team-models-empty', {}, { timeout: 5000 })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
@@ -1465,6 +1494,7 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     expect(screen.getByRole('button', { name: 'Continue' })).toBeEnabled();
   }, 15_000);
 
+  // DALTON-HOOK(dalton-setup): leftover-2 sharing-off with only off-list API key models on /setup/default and /setup/defaults
   it('(leftover-2) sharing-off with only off-list API key models shows contact-admin + Retry on /setup/default and refuses to save on /setup/defaults', async () => {
     server.state.teamSharingEnabled = false;
     server.state.teamModelsConfigured = false;
@@ -1485,6 +1515,7 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     server.state.progress.models = 'langalpha_models';
     server.state.progress.runs_on = 'cloud';
 
+    // DALTON-HOOK(dalton-setup): verify /setup/default and legacy /setup/defaults both show contact-admin + Retry and block saving
     renderRealWizardApp('/setup/default');
     const defaultEmpty = await screen.findByTestId('setup-default-team-models-empty', {}, { timeout: 5000 });
     expect(defaultEmpty).toHaveTextContent(/contact your administrator/i);
@@ -1507,6 +1538,7 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     expect(server.lastPreferencesPut).toBeNull();
   }, 15_000);
 
+  // DALTON-HOOK(dalton-setup): leftover-3 legacy /setup/method surfaces Retry while preserving connect entries on read failures
   it('(leftover-3) legacy /setup/method shows Retry while preserving connect entries on read failures with sharing off or credentials status failure', async () => {
     const user = userEvent.setup();
     server.state.teamSharingEnabled = false;
@@ -1522,7 +1554,7 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     await user.click(screen.getByRole('button', { name: 'Try again' }));
     await waitFor(() => expect(screen.queryByTestId('setup-load-failed')).toBeNull(), { timeout: 5000 });
 
-    // Also when /api/v1/dalton/credentials/status itself fails (useTeamCredentials retries once):
+    // Also when /api/v1/dalton/credentials/status fails on initial cold read:
     cleanup();
     server.state.teamSharingEnabled = true;
     server.state.callerTier = 'admin';
@@ -1537,6 +1569,82 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     await waitFor(() => expect(screen.queryByTestId('setup-load-failed')).toBeNull(), { timeout: 5000 });
   }, 15_000);
 
+  // DALTON-HOOK(dalton-setup): leftover-r2-features-retry verifies Retry re-fetches failed /api/v1/features and /api/v1/claude-code/status queries
+  it('(leftover-r2-features-retry) Retry re-fetches failed /api/v1/features and /api/v1/claude-code/status queries across /setup/method, /setup/default, and /setup/defaults', async () => {
+    const user = userEvent.setup();
+    server.state.callerTier = 'admin';
+    server.state.featuresFailCount = 99;
+
+    renderRealWizardApp('/setup/method');
+    expect(await screen.findByTestId('setup-load-failed', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Sign in to Google Antigravity, ChatGPT or Grok/i })).toBeInTheDocument();
+
+    server.state.featuresFailCount = 0;
+    await user.click(screen.getByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(screen.queryByTestId('setup-load-failed')).toBeNull(), { timeout: 5000 });
+
+    // Also when claude_code_runtime is enabled and /api/v1/claude-code/status fails on /setup/defaults:
+    cleanup();
+    server.state.claudeCodeRuntimeEnabled = true;
+    server.state.claudeCodeStatusFailCount = 99;
+    renderRealWizardApp('/setup/defaults');
+    expect(await screen.findByTestId('setup-load-failed', {}, { timeout: 5000 })).toBeInTheDocument();
+
+    server.state.claudeCodeStatusFailCount = 0;
+    await user.click(screen.getByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(screen.queryByTestId('setup-load-failed')).toBeNull(), { timeout: 5000 });
+    expect(await screen.findByLabelText(/Background model/i, {}, { timeout: 5000 })).toBeInTheDocument();
+
+    // DALTON-HOOK(dalton-setup): also verify /setup/default recovers from /api/v1/features failure via Try again
+    cleanup();
+    server.state.featuresFailCount = 99;
+    server.state.claudeCodeRuntimeEnabled = false;
+    server.state.progress.models = 'langalpha_models';
+    server.state.progress.runs_on = 'cloud';
+    renderRealWizardApp('/setup/default');
+    expect(await screen.findByTestId('setup-load-failed', {}, { timeout: 5000 })).toBeInTheDocument();
+
+    server.state.featuresFailCount = 0;
+    await user.click(screen.getByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(screen.queryByTestId('setup-load-failed')).toBeNull(), { timeout: 5000 });
+    expect(await screen.findByRole('radio', { name: /Gemini 4 Neon/i }, { timeout: 5000 })).toBeChecked();
+  }, 15_000);
+
+  // DALTON-HOOK(dalton-setup): leftover-r2-admin-hot-cache verifies confirmed admin keeps connect entries when credentials/status later fails
+  it('(leftover-r2-admin-hot-cache) legacy /setup/method keeps admin connect entries when credentials/status succeeds first and fails on a subsequent refetch', async () => {
+    const user = userEvent.setup();
+    server.state.teamSharingEnabled = true;
+    server.state.callerTier = 'admin';
+    // Initial oauth failure surfaces the Retry button while credentials/status succeeds and caches is_pm: true.
+    server.state.oauthFailPaths = ['/api/v1/oauth/codex/status'];
+
+    renderRealWizardApp('/setup/method');
+    expect(await screen.findByTestId('setup-load-failed', {}, { timeout: 5000 })).toBeInTheDocument();
+    // Wait until credentials/status has actually succeeded and populated the cache (admin hint visible).
+    expect(await screen.findByText(/团队共用/, {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Sign in to Google Antigravity, ChatGPT or Grok/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /API key/i })).toBeInTheDocument();
+
+    // Subsequent refetch: oauth recovers, but credentials/status now fails (exceeding useTeamCredentials retry: 1).
+    // Cached data still has enabled: true and is_pm: true; admin connect entries must remain visible alongside Retry.
+    server.state.oauthFailPaths = [];
+    server.state.credentialsStatusFailCount = 99;
+    await user.click(screen.getByRole('button', { name: 'Try again' }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-load-failed')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Sign in to Google Antigravity, ChatGPT or Grok/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /API key/i })).toBeInTheDocument();
+    }, { timeout: 5000 });
+
+    // DALTON-HOOK(dalton-setup): clicking Try again once credentials/status recovers clears the inline failure banner
+    server.state.credentialsStatusFailCount = 0;
+    await user.click(screen.getByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(screen.queryByTestId('setup-load-failed')).toBeNull(), { timeout: 5000 });
+    expect(screen.getByRole('button', { name: /Sign in to Google Antigravity, ChatGPT or Grok/i })).toBeInTheDocument();
+  }, 15_000);
+
+  // DALTON-HOOK(dalton-setup): leftover-4 legacy /setup/defaults dropdown/saved alignment and out-of-candidate normalization
   it('(leftover-4) legacy /setup/defaults aligns background/advanced dropdown options with saved variants and normalizes out-of-candidate saved defaults', async () => {
     const user = userEvent.setup();
     server.state.antigravityModelsOverride = [
@@ -1569,7 +1677,7 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     expect(neonOption?.textContent).toContain('Gemini 4 Neon');
     expect(neonOption?.textContent).not.toMatch(/\bHigh\b/i);
 
-    // Out-of-candidate saved primary & background normalize to curated Neon High + Hydrogen Low
+    // DALTON-HOOK(dalton-setup): out-of-candidate saved primary & background normalize to curated Neon High + Hydrogen Low
     cleanup();
     server.state.antigravityModelsOverride = [
       'gemini-4-neon-high-oauth',
@@ -1589,6 +1697,7 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
       expect(bgSelectNorm.value).toBe('gemini-4-hydrogen-low-oauth');
     }, { timeout: 5000 });
 
+    // DALTON-HOOK(dalton-setup): verify Continue persists normalized Neon High + Hydrogen Low defaults
     await user.click(screen.getByRole('button', { name: 'Continue' }));
     await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/setup/ready'), { timeout: 5000 });
     expect(server.lastPreferencesPut).toEqual({

@@ -211,6 +211,7 @@ describe('daltonTeamModelsCheck forced retry', () => {
     qc.clear();
   });
 
+  // DALTON-HOOK(dalton-setup): concurrent retries on the same generation share one refresh=1 request and abort non-refresh
   it('deduplicates concurrent retry checks on the same generation while cancelling an in-flight non-refresh request', async () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     let normalSignal: AbortSignal | undefined;
@@ -243,8 +244,8 @@ describe('daltonTeamModelsCheck forced retry', () => {
     expect(calls).toEqual([{ refresh: false }]);
     expect(normalSignal?.aborted).toBe(false);
 
+    // DALTON-HOOK(dalton-setup): fire two overlapping checks on the same retry generation
     bumpDaltonTeamModelsRetry(qc);
-    // Fire two overlapping availability checks for the same retry generation.
     const first = checkDaltonTeamModelsAvailable({
       queryClient: qc,
       providers: PROVIDERS,
@@ -271,6 +272,120 @@ describe('daltonTeamModelsCheck forced retry', () => {
     // Exactly one refresh=1 request was sent; the second concurrent caller never cancelled it or reused the non-refresh request.
     expect(calls).toEqual([{ refresh: false }, { refresh: true }]);
     await normalFetch;
+    qc.clear();
+  });
+
+  // DALTON-HOOK(dalton-setup): consecutive retry clicks (new retry generation) share the in-flight refresh=1 without cancelling it
+  it('reuses an in-flight forced refresh across consecutive retry clicks without cancelling it', async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let resolveForced!: (v: AvailableModels) => void;
+    let forcedSignal: AbortSignal | undefined;
+    const calls: Array<{ refresh: boolean }> = [];
+
+    h.getProviderAvailableModels.mockImplementation((_provider, opts) => {
+      const refresh = Boolean(opts?.refresh);
+      calls.push({ refresh });
+      forcedSignal = opts?.signal;
+      return new Promise<AvailableModels>((resolve) => {
+        resolveForced = resolve;
+      });
+    });
+
+    // First click starts refresh=1 (generation 1)
+    bumpDaltonTeamModelsRetry(qc);
+    const first = checkDaltonTeamModelsAvailable({
+      queryClient: qc,
+      providers: PROVIDERS,
+      byokEnabled: false,
+      providersUnread: false,
+      policy: null,
+    });
+    await vi.waitFor(() => expect(calls).toEqual([{ refresh: true }]));
+    expect(forcedSignal?.aborted).toBe(false);
+
+    // DALTON-HOOK(dalton-setup): second rapid click bumps generation 2 while gen 1 refresh=1 is still in-flight
+    bumpDaltonTeamModelsRetry(qc);
+    const second = checkDaltonTeamModelsAvailable({
+      queryClient: qc,
+      providers: PROVIDERS,
+      byokEnabled: false,
+      providersUnread: false,
+      policy: null,
+    });
+
+    // Must NOT abort the first forced refresh or send a second refresh=1 request
+    await Promise.resolve();
+    expect(forcedSignal?.aborted).toBe(false);
+    expect(calls).toEqual([{ refresh: true }]);
+
+    resolveForced(freshReady());
+    const [res1, res2] = await Promise.all([first, second]);
+    expect(res1.available).toBe(true);
+    expect(res2.available).toBe(true);
+    expect(calls).toEqual([{ refresh: true }]);
+
+    // Subsequent check in generation 2 reuses the freshly resolved live result without another refresh=1
+    const followUp = await checkDaltonTeamModelsAvailable({
+      queryClient: qc,
+      providers: PROVIDERS,
+      byokEnabled: false,
+      providersUnread: false,
+      policy: null,
+    });
+    expect(followUp.available).toBe(true);
+    expect(calls).toEqual([{ refresh: true }]);
+    qc.clear();
+  });
+
+  // DALTON-HOOK(dalton-setup): throttled server response (cached: true) must NOT mark provider as refreshed
+  it('does not mark a provider as refreshed when refresh=1 returns a server-throttled cached: true response', async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const calls: Array<{ refresh: boolean }> = [];
+    let attempt = 0;
+
+    h.getProviderAvailableModels.mockImplementation((_provider, opts) => {
+      const refresh = Boolean(opts?.refresh);
+      calls.push({ refresh });
+      attempt += 1;
+      // Attempt 1 hits backend 10s throttle -> server answers stale list with cached: true
+      if (attempt === 1) {
+        return Promise.resolve(staleMissing());
+      }
+      return Promise.resolve(freshReady());
+    });
+
+    bumpDaltonTeamModelsRetry(qc);
+    const throttled = await checkDaltonTeamModelsAvailable({
+      queryClient: qc,
+      providers: PROVIDERS,
+      byokEnabled: false,
+      providersUnread: false,
+      policy: null,
+    });
+    expect(throttled.available).toBe(false);
+    expect(calls).toEqual([{ refresh: true }]);
+
+    // DALTON-HOOK(dalton-setup): because cached: true was not marked refreshed, next check still sends refresh=1
+    const live = await checkDaltonTeamModelsAvailable({
+      queryClient: qc,
+      providers: PROVIDERS,
+      byokEnabled: false,
+      providersUnread: false,
+      policy: null,
+    });
+    expect(live.available).toBe(true);
+    expect(calls).toEqual([{ refresh: true }, { refresh: true }]);
+
+    // Once a live (cached: false) response lands, provider IS marked refreshed and follow-up reuses it
+    const cached = await checkDaltonTeamModelsAvailable({
+      queryClient: qc,
+      providers: PROVIDERS,
+      byokEnabled: false,
+      providersUnread: false,
+      policy: null,
+    });
+    expect(cached.available).toBe(true);
+    expect(calls).toEqual([{ refresh: true }, { refresh: true }]);
     qc.clear();
   });
 });
