@@ -3,7 +3,7 @@ import { infiniteQueryOptions, useInfiniteQuery } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import type { AutomationRun } from '@/types/automation';
 import { isRunLive } from '../utils/status';
-import { IDLE_POLL_MS, isDeliverySettling, pollMs } from '../utils/polling';
+import { IDLE_POLL_MS, isDeliverySettling, isExecutionAwaitingReceipt, pollMs } from '../utils/polling'; // DALTON-HOOK(execution-delivery-status)
 import { listRecentRuns, type RunFeedPage } from '../utils/api';
 
 const PAGE_SIZE = 25;
@@ -47,7 +47,11 @@ export function useRecentRuns(delivers: (automationId: string) => boolean) {
       const settling = pages.some((p) =>
         p.executions.some((r) => isDeliverySettling(r, delivers(r.automation_id))),
       );
-      if (pages.length > 1) return settling ? IDLE_POLL_MS : false;
+      // DALTON-HOOK(execution-delivery-status): keep slow (30s) polling past page 1 while any run awaits a late receipt
+      const awaitingReceipt = pages.some((p) =>
+        p.executions.some((r) => isExecutionAwaitingReceipt(r)),
+      );
+      if (pages.length > 1) return settling || awaitingReceipt ? IDLE_POLL_MS : false;
       return pollMs(settling || !!pages[0]?.executions.some((r) => isRunLive(r.status)));
     },
     refetchIntervalInBackground: false,

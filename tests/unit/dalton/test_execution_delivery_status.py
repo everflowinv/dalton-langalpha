@@ -498,6 +498,61 @@ def test_cos_activity_renders_all_five_delivery_states() -> None:
     assert "- 13:30 Plain Task, finished: No delivery configured" in lines
 
 
+def test_cos_activity_strips_stale_delivery_suffix_for_delivered_and_skipped() -> None:
+    zone = ZoneInfo("Asia/Shanghai")
+    runs = [
+        {
+            "automation_name": "晚间研报",
+            "status": "completed",
+            "excerpt": "晚报已生成\n投递状态：已生成但未送达（通道短暂超时）",
+            "completed_at": _utc(5, 0),
+            "delivery_summary": {
+                "status": "delivered",
+                "total_targets": 1,
+                "sent_count": 1,
+                "failed_count": 0,
+                "retrying_count": 0,
+            },
+        },
+        {
+            "automation_name": "跳过投递任务",
+            "status": "completed",
+            "excerpt": "晨报已生成 投递状态：已生成但未送达（已跳过）",
+            "completed_at": _utc(5, 10),
+            "delivery_summary": {
+                "status": "skipped",
+                "total_targets": 1,
+                "sent_count": 0,
+                "failed_count": 0,
+                "retrying_count": 0,
+                "skipped_count": 1,
+            },
+        },
+        {
+            "automation_name": "无摘要任务",
+            "status": "completed",
+            "excerpt": "普通报告 投递状态：已生成但未送达（手工备注）",
+            "completed_at": _utc(5, 20),
+            "delivery_summary": None,
+        },
+    ]
+
+    rendered = activity.render_activity(
+        workspaces=[],
+        workspace_total=0,
+        threads=[],
+        runs=runs,
+        holdings=[],
+        home_id="home-1",
+        zone=zone,
+        today=date(2026, 11, 20),
+    )
+    lines = rendered.splitlines()
+    assert "- 13:00 晚间研报, finished: 晚报已生成" in lines
+    assert "- 13:10 跳过投递任务, finished: 晨报已生成" in lines
+    assert "- 13:20 无摘要任务, finished: 普通报告 投递状态：已生成但未送达（手工备注）" in lines
+
+
 def test_system_jobs_summarize_last_execution_five_states() -> None:
     base = {"status": "completed", "completed_at": "2026-11-20T13:13:00Z", "excerpt": "市场晚报摘要"}
 

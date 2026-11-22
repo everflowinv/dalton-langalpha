@@ -119,6 +119,40 @@ if not cur_exp or cur_exp <= now then
     redis.call('set', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
     return 1
 end
+local function epoch_to_iso(ts)
+    -- DALTON-HOOK(antigravity-series): format UTC ISO-8601 timestamp in Redis Lua without os.date
+    local sec = math.floor(ts)
+    local us = math.floor((ts - sec) * 1000000 + 0.5)
+    if us >= 1000000 then
+        sec = sec + 1
+        us = us - 1000000
+    end
+    local tod = sec % 86400
+    local z = math.floor((sec - tod) / 86400) + 719468
+    local era = math.floor((z >= 0 and z or z - 146096) / 146097)
+    local doe = z - era * 146097
+    local yoe = math.floor((doe - math.floor(doe / 1460) + math.floor(doe / 36524) - math.floor(doe / 146096)) / 365)
+    local y = yoe + era * 400
+    local doy = doe - (365 * yoe + math.floor(yoe / 4) - math.floor(yoe / 100))
+    local mp = math.floor((5 * doy + 2) / 153)
+    local d = doy - math.floor((153 * mp + 2) / 5) + 1
+    local m = mp + (mp < 10 and 3 or -9)
+    if m <= 2 then y = y + 1 end
+    local hh = math.floor(tod / 3600)
+    local mm = math.floor((tod % 3600) / 60)
+    local ss = tod % 60
+    if us > 0 then
+        return string.format('%04d-%02d-%02dT%02d:%02d:%02d.%06d+00:00', y, m, d, hh, mm, ss, us)
+    end
+    return string.format('%04d-%02d-%02dT%02d:%02d:%02d+00:00', y, m, d, hh, mm, ss)
+end
+local function sync_refusal_until(tbl, eff_exp)
+    -- DALTON-HOOK(antigravity-series): keep refusal.until aligned when cooldown expires_at is extended
+    local ref = tbl['refusal']
+    if type(ref) == 'table' and (ref['until'] ~= nil or ref['reason'] == 'plan_limit') then
+        ref['until'] = epoch_to_iso(eff_exp)
+    end
+end
 local function reason_rank(tbl)
     -- DALTON-HOOK(antigravity-series): rank refusal severity inside atomic Lua upsert
     local ref = tbl['refusal']
@@ -143,6 +177,7 @@ if inc_rank < cur_rank then
         return 0
     end
     cur['expires_at'] = inc_exp
+    sync_refusal_until(cur, inc_exp)
     local ttl = math.max(1, math.ceil(inc_exp - now))
     redis.call('set', KEYS[1], cjson.encode(cur), 'EX', ttl)
     return 1
@@ -153,6 +188,9 @@ end
 local inc = cjson.decode(ARGV[1])
 local eff_exp = math.max(cur_exp, inc_exp)
 inc['expires_at'] = eff_exp
+if eff_exp > inc_exp then
+    sync_refusal_until(inc, eff_exp)
+end
 local ttl = math.max(1, math.ceil(eff_exp - now))
 redis.call('set', KEYS[1], cjson.encode(inc), 'EX', ttl)
 return 1
@@ -186,6 +224,39 @@ def _extract_exc_refusal_reason(exc: BaseException) -> str | None:  # DALTON-HOO
     return ref.reason if ref is not None else None
 
 
+def _sync_refusal_dict_until(  # DALTON-HOOK(antigravity-series)
+    payload: dict[str, Any], expires_at: float
+) -> None:
+    """Keep embedded ``refusal.until`` aligned when a cooldown record's ``expires_at`` is extended."""
+    ref = payload.get("refusal")
+    if not isinstance(ref, dict):
+        return
+    if ref.get("until") is not None or ref.get("reason") == "plan_limit":
+        updated_ref = dict(ref)
+        updated_ref["until"] = datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat()
+        payload["refusal"] = updated_ref
+
+
+def _with_synced_refusal_until(  # DALTON-HOOK(antigravity-series)
+    refusal: Any, expires_at: float
+) -> Any:
+    """Return ``refusal`` with ``until`` advanced to ``expires_at`` when cooldown is extended."""
+    from src.llms.provider_errors import ProviderRefusal
+
+    if not isinstance(refusal, ProviderRefusal):
+        return refusal
+    if refusal.until is None and refusal.reason != "plan_limit":
+        return refusal
+    if refusal.until is not None and refusal.until.timestamp() >= expires_at:
+        return refusal
+    return ProviderRefusal(
+        refusal.reason,
+        tier=refusal.tier,
+        window=refusal.window,
+        until=datetime.fromtimestamp(expires_at, tz=timezone.utc),
+    )
+
+
 def _merge_quota_redis_payload(  # DALTON-HOOK(antigravity-series)
     existing: Any,
     incoming_payload: dict[str, Any],
@@ -205,6 +276,7 @@ def _merge_quota_redis_payload(  # DALTON-HOOK(antigravity-series)
     if cur_exp <= now:
         return incoming_ttl_s, incoming_payload
 
+    # DALTON-HOOK(antigravity-series): preserve higher severity and later expiry with synced refusal.until
     cur_rank = _cooldown_reason_rank(_extract_cooldown_record_reason(existing))
     inc_rank = _cooldown_reason_rank(_extract_cooldown_record_reason(incoming_payload))
     raw_inc_exp = incoming_payload.get("expires_at")
@@ -219,6 +291,7 @@ def _merge_quota_redis_payload(  # DALTON-HOOK(antigravity-series)
             return None
         merged = dict(existing)
         merged["expires_at"] = inc_exp
+        _sync_refusal_dict_until(merged, inc_exp)
         return max(1, math.ceil(inc_exp - now)), merged
 
     if inc_rank == cur_rank and inc_exp <= cur_exp:
@@ -227,6 +300,8 @@ def _merge_quota_redis_payload(  # DALTON-HOOK(antigravity-series)
     eff_exp = max(cur_exp, inc_exp)
     merged = dict(incoming_payload)
     merged["expires_at"] = eff_exp
+    if eff_exp > inc_exp:
+        _sync_refusal_dict_until(merged, eff_exp)
     return max(1, math.ceil(eff_exp - now)), merged
 
 
@@ -1568,6 +1643,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
             )
         benched = self._quota_exhausted.get(scope_key)
         if benched is not None and now_mono < benched[0]:
+            # DALTON-HOOK(antigravity-series): merge local cooldown without shortening, downgrading, or desyncing refusal.until
             existing_mono, existing_exc = benched
             existing_rank = _cooldown_reason_rank(_extract_exc_refusal_reason(existing_exc))
             incoming_reason = (
@@ -1588,16 +1664,20 @@ class ModelResilienceMiddleware(AgentMiddleware):
                         or float(frozen_expires_at) > float(existing_exc.expires_at)
                     )
                 ):
+                    new_exp = float(frozen_expires_at)
                     updated_existing = _RemoteQuotaExhaustedError(
                         str(existing_exc),
                         existing_exc.status_code,
-                        expires_at=float(frozen_expires_at),
-                        provider_refusal=existing_exc.provider_refusal,
+                        expires_at=new_exp,
+                        provider_refusal=_with_synced_refusal_until(
+                            existing_exc.provider_refusal, new_exp
+                        ),
                     )
                 self._quota_exhausted[scope_key] = (incoming_mono, updated_existing)
                 return
             if incoming_rank == existing_rank and incoming_mono <= existing_mono:
                 return
+            # DALTON-HOOK(antigravity-series): keep later expires_at and sync upgraded provider_refusal.until
             eff_mono = max(existing_mono, incoming_mono)
             if (
                 isinstance(cached, _RemoteQuotaExhaustedError)
@@ -1608,11 +1688,14 @@ class ModelResilienceMiddleware(AgentMiddleware):
                     or float(existing_exc.expires_at) > float(cached.expires_at)
                 )
             ):
+                eff_exp = float(existing_exc.expires_at)
                 cached = _RemoteQuotaExhaustedError(
                     str(cached),
                     cached.status_code,
-                    expires_at=float(existing_exc.expires_at),
-                    provider_refusal=cached.provider_refusal,
+                    expires_at=eff_exp,
+                    provider_refusal=_with_synced_refusal_until(
+                        cached.provider_refusal, eff_exp
+                    ),
                 )
             self._quota_exhausted[scope_key] = (eff_mono, cached)
             return

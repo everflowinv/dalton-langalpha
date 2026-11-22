@@ -459,13 +459,25 @@ function ChatInput({
   // one the composer holds them, following Settings until touched.
   const [ownTuning, setOwnTuning] = useState<{ reasoningEffort: string | null; fastMode: boolean | null }>(FOLLOWS_SETTINGS);
   // DALTON-HOOK(automation-effort): tracks an explicit effort pick made specifically for the active retry target
+  // Also tracks Antigravity series-effort variant switches so an unsent draft effort pick does not submit llm_model on a later retry.
   const explicitRetryEffortRef = useRef<{ targetId: string | null; effort: string | null } | undefined>(undefined);
+  const seriesEffortModelRef = useRef<{ model: string; targetId: string | null; activeForRetry: boolean } | undefined>(undefined);
   useEffect(() => {
     explicitRetryEffortRef.current = undefined;
-  }, [draftKey, retryTargetId]);
+    seriesEffortModelRef.current = undefined;
+  }, [draftKey]);
+  useEffect(() => {
+    explicitRetryEffortRef.current = undefined;
+    if (seriesEffortModelRef.current) {
+      seriesEffortModelRef.current = { ...seriesEffortModelRef.current, activeForRetry: false };
+    }
+  }, [retryTargetId]);
   useEffect(() => {
     if (isLoading) {
       explicitRetryEffortRef.current = undefined;
+      if (seriesEffortModelRef.current) {
+        seriesEffortModelRef.current = { ...seriesEffortModelRef.current, activeForRetry: false };
+      }
     }
   }, [isLoading]);
   const tuning = hostTuning === undefined ? ownTuning : hostTuning;
@@ -510,6 +522,7 @@ function ChatInput({
     if (model === pillModel) return;
     // DALTON-HOOK(automation-effort): switching model invalidates any earlier retry effort pick
     explicitRetryEffortRef.current = undefined;
+    seriesEffortModelRef.current = undefined;
     if (hostModel === undefined) setOwnModel(model);
     else onPickModel?.(model);
     // DALTON-HOOK(antigravity-series): reset local composer reasoningEffort when picking an Antigravity variant
@@ -677,7 +690,7 @@ function ChatInput({
         ...ownOverrides,
       };
     },
-    // DALTON-HOOK(automation-effort): omit saved composer effort on retry unless explicitly picked for this retry
+    // DALTON-HOOK(automation-effort): omit saved composer effort (and unsent Antigravity effort variant) on retry unless explicitly picked for this retry
     getRetryModelOptions() {
       const explicit = explicitRetryEffortRef.current;
       explicitRetryEffortRef.current = undefined;
@@ -687,6 +700,20 @@ function ChatInput({
         && (retryTargetId === undefined
           ? explicit.targetId === null
           : retryTargetId !== null && explicit.targetId === retryTargetId);
+      const seriesPick = seriesEffortModelRef.current;
+      let retryModel = sentModel;
+      if (seriesPick && sentModel && seriesPick.model === sentModel) {
+        const matchedSeriesRetry =
+          seriesPick.activeForRetry
+          && !isLoading
+          && (retryTargetId === undefined
+            ? seriesPick.targetId === null
+            : retryTargetId !== null && seriesPick.targetId === retryTargetId);
+        seriesEffortModelRef.current = { ...seriesPick, activeForRetry: false };
+        if (!matchedSeriesRetry) {
+          retryModel = null;
+        }
+      }
       const retryOwnOverrides = hostTuning === undefined
         ? {
             ...(matchedExplicit && explicit.effort !== null ? { reasoningEffortOverride: explicit.effort } : {}),
@@ -694,7 +721,7 @@ function ChatInput({
           }
         : {};
       return {
-        model: sentModel,
+        model: retryModel,
         reasoningEffort: matchedExplicit ? explicit.effort : null,
         fastMode: resolvedFastMode,
         marketWatch: effectiveMarketWatch,
@@ -848,13 +875,20 @@ function ChatInput({
     if (pillSeriesMatch) {
       if (!effort) return;
       const targetKey = pillSelectableSeries?.variants[effort] ?? pillSeriesMatch.series.variants[effort];
-      if (!targetKey || targetKey === pillModel) return;
+      if (!targetKey) return;
+      // DALTON-HOOK(automation-effort): bind Antigravity series-effort variant switch to the active retry target
+      seriesEffortModelRef.current = {
+        model: targetKey,
+        targetId: retryTargetId ?? null,
+        activeForRetry: !isLoading && retryTargetId !== null,
+      };
+      explicitRetryEffortRef.current = undefined;
+      if (targetKey === pillModel) return;
       if (hostModel === undefined) setOwnModel(targetKey);
       else onPickModel?.(targetKey);
       if (hostTuning === undefined) {
         setOwnTuning((prev) => ({ ...prev, reasoningEffort: null }));
       }
-      explicitRetryEffortRef.current = undefined;
       return;
     }
     // DALTON-HOOK(automation-effort): mark explicit effort pick only for the current active retry target
@@ -990,6 +1024,9 @@ function ChatInput({
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     // DALTON-HOOK(automation-effort): editing a draft means an earlier effort pick was for composing, not retrying
     explicitRetryEffortRef.current = undefined;
+    if (seriesEffortModelRef.current) {
+      seriesEffortModelRef.current = { ...seriesEffortModelRef.current, activeForRetry: false };
+    }
     const val = keepWhole(e.target.value, e.target.selectionStart);
     setMessage(val);
     // DALTON-HOOK(composer-drafts): an input the browser marks as outside any composition ends one whose compositionend never came
@@ -1035,6 +1072,7 @@ function ChatInput({
       clearCurrentDraft();
       // DALTON-HOOK(automation-effort): standalone action commands also clear any pending retry effort pick
       explicitRetryEffortRef.current = undefined;
+      seriesEffortModelRef.current = undefined;
       resetSlash();
       // DALTON-HOOK(chat-large-upload): cancel any unsent server/staged uploads on standalone action commands
       discardFiles();
@@ -1106,6 +1144,7 @@ function ChatInput({
     );
     // DALTON-HOOK(automation-effort): a normal send consumes any pending retry effort pick
     explicitRetryEffortRef.current = undefined;
+    seriesEffortModelRef.current = undefined;
     // DALTON-HOOK(chat-large-upload): mark sent uploadIds so unmount cleanup keeps them intact
     consumeSentFiles();
     resetSlash();

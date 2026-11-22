@@ -16,6 +16,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import ChatInput, { type ChatInputHandle } from '../chat-input';
 import type { ThreadTuning } from '../chat-input.types';
 import { ChatInputRegistry, ContextBus } from '@/lib/contextBus';
+// DALTON-HOOK(automation-effort): Antigravity series catalog fixture for retry effort-variant tests
+import { buildSelectableAntigravitySeries, buildSeriesCatalog } from '@/lib/antigravitySeries';
 import { queryKeys } from '@/lib/queryKeys';
 
 vi.mock('@/pages/ChatAgent/utils/api', () => ({
@@ -29,18 +31,68 @@ const mocks = vi.hoisted(() => ({
   mutate: vi.fn(),
 }));
 
+// DALTON-HOOK(automation-effort): Antigravity series catalog and metadata used by series-effort retry tests
+const AG_SERIES_CATALOG = buildSeriesCatalog([
+  {
+    series_id: 'antigravity-oauth:gemini-4-neon',
+    series_prefix: 'gemini-4-neon',
+    provider: 'antigravity-oauth',
+    display_name: 'Gemini 4 Neon',
+    qualified_display_name: 'Gemini 4 Neon (Antigravity)',
+    default_effort: 'high',
+    default_model: 'gemini-4-neon-high-oauth',
+    efforts: ['low', 'medium', 'high'],
+    variants: {
+      low: 'gemini-4-neon-low-oauth',
+      medium: 'gemini-4-neon-medium-oauth',
+      high: 'gemini-4-neon-high-oauth',
+    },
+  },
+]);
+const AG_MODELS = {
+  'antigravity-oauth': {
+    display_name: 'Google Antigravity',
+    models: [
+      'gemini-4-neon-low-oauth',
+      'gemini-4-neon-medium-oauth',
+      'gemini-4-neon-high-oauth',
+      'gemini-4-carbon-medium-oauth',
+    ],
+  },
+};
+// DALTON-HOOK(automation-effort): metadata for Antigravity series variants alongside default test model
+const AG_RAW_METADATA = {
+  'model-default': { sdk: 'codex', reasoning_efforts: ['low', 'medium', 'high'], reasoning_effort_default: 'medium' },
+  'gemini-4-neon-low-oauth': { provider: 'antigravity-oauth', reasoning_efforts: ['low'] },
+  'gemini-4-neon-medium-oauth': { provider: 'antigravity-oauth', reasoning_efforts: ['medium'] },
+  'gemini-4-neon-high-oauth': { provider: 'antigravity-oauth', reasoning_efforts: ['high'] },
+  'gemini-4-carbon-medium-oauth': { provider: 'antigravity-oauth', reasoning_efforts: ['medium'] },
+};
+
 vi.mock('@/hooks/usePreferences', () => ({
   usePreferences: () => ({ preferences: mocks.preferences, isLoading: false, isLoaded: true }),
 }));
 
 vi.mock('@/hooks/useAllModels', () => ({
   useAllModels: () => ({
-    models: {},
+    models: AG_MODELS,
     payers: {},
-    validModelNames: new Set(['model-default']),
-    metadata: {
-      'model-default': { sdk: 'codex', reasoning_efforts: ['low', 'medium', 'high'], reasoning_effort_default: 'medium' },
-    },
+    // DALTON-HOOK(automation-effort): expose Antigravity series variants for series-effort retry tests
+    validModelNames: new Set([
+      'model-default',
+      'gemini-4-neon-low-oauth',
+      'gemini-4-neon-medium-oauth',
+      'gemini-4-neon-high-oauth',
+      'gemini-4-carbon-medium-oauth',
+    ]),
+    metadata: AG_RAW_METADATA,
+    rawApiResponse: { model_metadata: AG_RAW_METADATA },
+    seriesCatalog: AG_SERIES_CATALOG,
+    selectableSeries: buildSelectableAntigravitySeries(AG_SERIES_CATALOG, AG_MODELS, {
+      rawMetadata: AG_RAW_METADATA,
+      customModels: [],
+    }),
+    customModels: [],
     isLoading: false,
     systemDefaults: { default_model: 'model-default' },
     offPlanModels: new Set(),
@@ -59,7 +111,12 @@ vi.mock('../use-toast', () => ({
 // The menu's own rendering is pinned in chatInputModelMenu's tests; this one
 // reads the props it is handed and reaches the same handlers its options call.
 vi.mock('../chat-input.modelMenu', () => ({
-  ChatInputModelMenu: () => null,
+  // DALTON-HOOK(automation-effort): expose model-menu pick button to distinguish model pick from effort pick
+  ChatInputModelMenu: ({ onSelectModel }: { onSelectModel?: (model: string) => void }) => (
+    <button type="button" onClick={() => onSelectModel?.('gemini-4-carbon-medium-oauth')}>
+      pick-model-carbon
+    </button>
+  ),
   ChatInputEffortMenu: ({ reasoningEffort, defaultEffort, fastMode, onReasoningEffortChange, onFastModeChange }: {
     reasoningEffort: string | null;
     defaultEffort: string | null;
@@ -88,19 +145,35 @@ interface TreeProps {
   onPickReasoningEffort?: (effort: string | null) => void;
   onPickFastMode?: (fast: boolean | null) => void;
   inputRef?: React.Ref<ChatInputHandle>;
-  // DALTON-HOOK(automation-effort): pass active retry target id into ChatInput
+  // DALTON-HOOK(automation-effort): pass active retry target id and host model props into ChatInput
   retryTargetId?: string | null;
+  model?: string;
+  sendModel?: string | null;
+  onPickModel?: (model: string) => void;
 }
 
-function tree({ onSend = vi.fn(), tuning, onPickReasoningEffort, onPickFastMode, inputRef, retryTargetId }: TreeProps = {}) {
+function tree({
+  onSend = vi.fn(),
+  tuning,
+  onPickReasoningEffort,
+  onPickFastMode,
+  inputRef,
+  retryTargetId,
+  model = 'model-default',
+  sendModel,
+  onPickModel,
+}: TreeProps = {}) {
   queryClient.setQueryData(queryKeys.user.preferences(), mocks.preferences);
+  // DALTON-HOOK(automation-effort): wire retryTargetId and host model props into ChatInput
   return (
     <QueryClientProvider client={queryClient}>
       <MemoryRouter>
         <ChatInput
           ref={inputRef}
           onSend={onSend}
-          model="model-default"
+          model={model}
+          sendModel={sendModel}
+          onPickModel={onPickModel}
           tuning={tuning}
           onPickReasoningEffort={onPickReasoningEffort}
           onPickFastMode={onPickFastMode}
@@ -274,6 +347,7 @@ describe('ChatInput: the thread owns its effort and fast mode', () => {
     }));
     expect(inputRef.current?.getRetryModelOptions?.().reasoningEffort).toBeNull();
 
+    // DALTON-HOOK(automation-effort): switching retry targets or typing into draft invalidates earlier retry effort pick
     // 2) Pick effort on err-run-1, never retry -> a newer failure err-run-2 arrives -> retry omits it
     fireEvent.click(screen.getByText('pick-high'));
     rerender(tree({
@@ -294,5 +368,57 @@ describe('ChatInput: the thread owns its effort and fast mode', () => {
     fireEvent.click(screen.getByText('pick-high'));
     expect(inputRef.current?.getRetryModelOptions?.().reasoningEffort).toBe('high');
     expect(inputRef.current?.getRetryModelOptions?.().reasoningEffort).toBeNull();
+  });
+
+  // DALTON-HOOK(automation-effort): unsent Antigravity effort variant switch does not submit llm_model on later automation retry
+  it('omits unsent Antigravity effort variant model on automation retry unless explicitly picked for that retry', () => {
+    const onSend = vi.fn();
+    const inputRef = createRef<ChatInputHandle>();
+    let hostModel = 'gemini-4-neon-medium-oauth';
+    let hostSendModel: string | null = null;
+    const onPickModel = vi.fn((next: string) => {
+      hostModel = next;
+      hostSendModel = next;
+    });
+
+    const renderWithHost = (retryTargetId: string | null) => tree({
+      onSend,
+      inputRef,
+      model: hostModel,
+      sendModel: hostSendModel,
+      onPickModel,
+      tuning: { reasoningEffort: null, fastMode: false },
+      retryTargetId,
+    });
+
+    const { rerender } = render(renderWithHost(null));
+
+    // DALTON-HOOK(automation-effort): 1) switch Antigravity effort before failure without sending -> later retry omits llm_model
+    fireEvent.click(screen.getByText('pick-high'));
+    expect(onPickModel).toHaveBeenCalledWith('gemini-4-neon-high-oauth');
+    rerender(renderWithHost('err-ag-1'));
+    expect(inputRef.current?.getModelOptions().model).toBe('gemini-4-neon-high-oauth');
+    expect(inputRef.current?.getRetryModelOptions?.().model).toBeNull();
+
+    // 2) Switch Antigravity effort on err-ag-1, never retry -> newer failure err-ag-2 arrives -> retry omits llm_model
+    fireEvent.click(screen.getByText('pick-high'));
+    rerender(renderWithHost('err-ag-2'));
+    expect(inputRef.current?.getRetryModelOptions?.().model).toBeNull();
+
+    // 3) Switch Antigravity effort on err-ag-2, then type into draft -> retry omits llm_model
+    fireEvent.click(screen.getByText('pick-high'));
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'unsent draft' } });
+    expect(inputRef.current?.getRetryModelOptions?.().model).toBeNull();
+
+    // DALTON-HOOK(automation-effort): 4) explicit Antigravity effort pick for active retry submits variant once, then omits it
+    fireEvent.click(screen.getByText('pick-high'));
+    expect(inputRef.current?.getRetryModelOptions?.().model).toBe('gemini-4-neon-high-oauth');
+    expect(inputRef.current?.getRetryModelOptions?.().model).toBeNull();
+
+    // 5) Explicit model-menu switch (not effort switch) still submits the picked model on retry
+    fireEvent.click(screen.getByText('pick-model-carbon'));
+    expect(onPickModel).toHaveBeenLastCalledWith('gemini-4-carbon-medium-oauth');
+    rerender(renderWithHost('err-ag-2'));
+    expect(inputRef.current?.getRetryModelOptions?.().model).toBe('gemini-4-carbon-medium-oauth');
   });
 });

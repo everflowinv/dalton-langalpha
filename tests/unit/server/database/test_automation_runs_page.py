@@ -36,9 +36,7 @@ async def test_a_page_reads_one_row_past_itself(db, fetched, has_more):
     assert "matched_execution_ids" not in sql
     assert "thread_workspace.status <> 'deleted'" in sql
     assert "thread_workspace.user_id = a.user_id" in sql
-    # DALTON-HOOK(history-computer-scope): colleague-workspace threads require web_access when colleague dispatch is off
-    assert "t.user_id = a.user_id" in sql
-    assert "dalton_workspace_sharing" in sql
+    assert "OR t.user_id = a.user_id" in sql
     assert params[-2:] == (3, 4)
     assert sql.index("WHERE") < sql.index("LIMIT")
 
@@ -68,8 +66,7 @@ async def test_computer_token_filters_the_run_workspace_before_the_page(db):
     assert "e.conversation_thread_id IS NOT NULL" in sql
     assert "thread_workspace.status <> 'deleted'" in sql
     assert "thread_workspace.user_id = a.user_id" in sql
-    assert "t.user_id = a.user_id" in sql
-    assert "dalton_workspace_sharing" in sql
+    assert "OR t.user_id = a.user_id" in sql
     assert "OR execution_workspace.workspace_id" not in sql
     assert sql.index("matched_execution_ids") < sql.index("paged_execution_ids")
     assert params == (

@@ -2378,6 +2378,183 @@ async def test_cooldown_write_does_not_shorten_or_downgrade_active_redis_record(
 
 
 @pytest.mark.asyncio
+async def test_cooldown_extension_syncs_refusal_until_across_redis_and_local(
+    no_sleep, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extending cooldown expires_at during Redis/local merge must sync refusal.until
+    so check_oauth_quota_cooldown, _build_benched_refusal, and plan_limit_detail all
+    report the effective cooldown deadline."""
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    from unittest.mock import create_autospec
+
+    import httpx
+    import openai
+
+    from ptc_agent.agent.middleware.model_resilience import (
+        _UPSERT_QUOTA_COOLDOWN_LUA,
+        check_oauth_quota_cooldown,
+        format_quota_cooldown_message,
+    )
+    from ptc_agent.config.agent import CredentialPayer
+    from src.llms import provider_errors as pe_mod
+    from src.server.services.runs.stream_errors import error_event_data, plan_limit_detail
+    from src.utils.cache.redis_cache import RedisCacheClient
+
+    assert "sync_refusal_until" in _UPSERT_QUOTA_COOLDOWN_LUA
+    assert "epoch_to_iso" in _UPSERT_QUOTA_COOLDOWN_LUA
+
+    t0_dt = datetime(2026, 11, 21, 5, 0, 0, tzinfo=timezone.utc)
+    clock = {"dt": t0_dt, "mono": 8000.0}
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["dt"] if tz is not None else clock["dt"].replace(tzinfo=None)
+
+    monkeypatch.setattr(pe_mod, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(
+        "ptc_agent.agent.middleware.model_resilience.time.time",
+        lambda: clock["dt"].timestamp(),
+    )
+    monkeypatch.setattr(
+        "ptc_agent.agent.middleware.model_resilience.time.monotonic",
+        lambda: clock["mono"],
+    )
+    monkeypatch.setattr("src.dalton.credentials.get_team_credential_holder_id", lambda: None)
+
+    store: dict[str, dict] = {}
+    cache = create_autospec(RedisCacheClient, instance=True)
+
+    async def fake_get(key: str):
+        val = store.get(key)
+        return dict(val) if isinstance(val, dict) else val
+
+    async def fake_set(key: str, value: dict, ttl=None):
+        store[key] = dict(value)
+        return True
+
+    cache.get.side_effect = fake_get
+    cache.set.side_effect = fake_set
+    monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: cache)
+
+    client_a = _make_antigravity_client(
+        "gemini-4-neon-high-oauth", user_id="u-sync", credential_id="cred-sync"
+    )
+    client_b = _make_antigravity_client(
+        "gemini-4-neon-medium-oauth", user_id="u-sync", credential_id="cred-sync"
+    )
+    ag_cfg = SimpleNamespace(
+        credential_source="oauth",
+        credential_payer=CredentialPayer(payer="subscription", account="Antigravity"),
+    )
+    expected_key = "dalton:quota_exhausted:u-sync:antigravity-oauth:vendor:google:cred-sync"
+    req_http = httpx.Request("POST", "https://example.invalid/v1/models")
+
+    async def must_not_call(req):
+        raise AssertionError("Should skip upstream while cooled down")
+
+    # Scenario 1: 30m rate_limited followed by 10m plan_limit -> plan_limit kept at 30m deadline.
+    mw_local_1 = _make_middleware(client_a, [])
+    rate_limit_30m = openai.RateLimitError(
+        "Error code: 429 - rate limit exceeded",
+        response=httpx.Response(429, request=req_http, headers={"Retry-After": "1800"}),
+        body={"error": {"code": "rate_limit_exceeded", "message": "rate limit exceeded"}},
+    )
+    plan_limit_10m = _refusal("Individual quota reached. Resets in 10m0s.", 429)
+
+    await mw_local_1._aremember_quota_exhausted(
+        "gemini-4-neon-medium-oauth", 1800.0, rate_limit_30m, client_b, now_epoch=clock["dt"].timestamp()
+    )
+    await mw_local_1._aremember_quota_exhausted(
+        "gemini-4-neon-high-oauth", 600.0, plan_limit_10m, client_a, now_epoch=clock["dt"].timestamp()
+    )
+
+    exp_30m = t0_dt + timedelta(seconds=1800)
+    assert store[expected_key]["refusal"]["reason"] == "plan_limit"
+    assert store[expected_key]["expires_at"] == pytest.approx(exp_30m.timestamp())
+    assert store[expected_key]["refusal"]["until"] == exp_30m.isoformat()
+
+    pre_msg_1 = await check_oauth_quota_cooldown(client_a)
+    assert pre_msg_1 == format_quota_cooldown_message("gemini-4-neon-high-oauth", exp_30m.timestamp())
+
+    scope_key = mw_local_1._quota_scope_key("gemini-4-neon-high-oauth", client_a)
+    local_exc_1, _ = mw_local_1._build_benched_refusal(
+        "gemini-4-neon-high-oauth", mw_local_1._quota_exhausted[scope_key]
+    )
+    assert str(local_exc_1) == format_quota_cooldown_message(
+        "gemini-4-neon-high-oauth", exp_30m.timestamp()
+    )
+    assert plan_limit_detail(pe_mod.read_refusal(local_exc_1), ag_cfg.credential_payer)[
+        "until"
+    ] == exp_30m.isoformat()
+    with pytest.raises(Exception) as local_call_exc_1:
+        await mw_local_1.awrap_model_call(_FakeRequest(client_a), must_not_call)
+    assert error_event_data(
+        "th-1", str(local_call_exc_1.value), exc=local_call_exc_1.value, config=ag_cfg
+    )["plan_limit"]["until"] == exp_30m.isoformat()
+
+    mw_fresh_1 = _make_middleware(client_a, [])
+    with pytest.raises(Exception) as redis_exc_1:
+        await mw_fresh_1.awrap_model_call(_FakeRequest(client_a), must_not_call)
+    assert plan_limit_detail(pe_mod.read_refusal(redis_exc_1.value), ag_cfg.credential_payer)[
+        "until"
+    ] == exp_30m.isoformat()
+    assert error_event_data(
+        "th-1", str(redis_exc_1.value), exc=redis_exc_1.value, config=ag_cfg
+    )["plan_limit"]["until"] == exp_30m.isoformat()
+
+    # Scenario 2: 10m plan_limit followed by 2h rate_limited -> plan_limit extended to 2h deadline.
+    store.clear()
+    mw_local_2 = _make_middleware(client_a, [])
+    rate_limit_2h = openai.RateLimitError(
+        "Error code: 429 - rate limit exceeded",
+        response=httpx.Response(429, request=req_http, headers={"Retry-After": "7200"}),
+        body={"error": {"code": "rate_limit_exceeded", "message": "rate limit exceeded"}},
+    )
+
+    await mw_local_2._aremember_quota_exhausted(
+        "gemini-4-neon-high-oauth", 600.0, plan_limit_10m, client_a, now_epoch=clock["dt"].timestamp()
+    )
+    await mw_local_2._aremember_quota_exhausted(
+        "gemini-4-neon-medium-oauth", 7200.0, rate_limit_2h, client_b, now_epoch=clock["dt"].timestamp()
+    )
+
+    exp_2h = t0_dt + timedelta(seconds=7200)
+    assert store[expected_key]["refusal"]["reason"] == "plan_limit"
+    assert store[expected_key]["expires_at"] == pytest.approx(exp_2h.timestamp())
+    assert store[expected_key]["refusal"]["until"] == exp_2h.isoformat()
+
+    pre_msg_2 = await check_oauth_quota_cooldown(client_a)
+    assert pre_msg_2 == format_quota_cooldown_message("gemini-4-neon-high-oauth", exp_2h.timestamp())
+
+    local_exc_2, _ = mw_local_2._build_benched_refusal(
+        "gemini-4-neon-high-oauth", mw_local_2._quota_exhausted[scope_key]
+    )
+    assert str(local_exc_2) == format_quota_cooldown_message(
+        "gemini-4-neon-high-oauth", exp_2h.timestamp()
+    )
+    assert plan_limit_detail(pe_mod.read_refusal(local_exc_2), ag_cfg.credential_payer)[
+        "until"
+    ] == exp_2h.isoformat()
+    with pytest.raises(Exception) as local_call_exc_2:
+        await mw_local_2.awrap_model_call(_FakeRequest(client_a), must_not_call)
+    assert error_event_data(
+        "th-2", str(local_call_exc_2.value), exc=local_call_exc_2.value, config=ag_cfg
+    )["plan_limit"]["until"] == exp_2h.isoformat()
+
+    mw_fresh_2 = _make_middleware(client_a, [])
+    with pytest.raises(Exception) as redis_exc_2:
+        await mw_fresh_2.awrap_model_call(_FakeRequest(client_a), must_not_call)
+    assert plan_limit_detail(pe_mod.read_refusal(redis_exc_2.value), ag_cfg.credential_payer)[
+        "until"
+    ] == exp_2h.isoformat()
+    assert error_event_data(
+        "th-2", str(redis_exc_2.value), exc=redis_exc_2.value, config=ag_cfg
+    )["plan_limit"]["until"] == exp_2h.isoformat()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("resets_in_seconds", "retry_after", "expected_seconds"),
     [
