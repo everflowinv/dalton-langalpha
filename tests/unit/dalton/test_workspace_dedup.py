@@ -6156,10 +6156,10 @@ async def test_dedup_journal_stores_usage_cost_status_without_reason_or_suggesti
     )
     monkeypatch.setattr(
         complete_mod,
-        "compute_call_costs",
+        "compute_call_costs_detailed",
         create_autospec(
-            complete_mod.compute_call_costs,
-            return_value=(Decimal("0"), Decimal("0.0012")),
+            complete_mod.compute_call_costs_detailed,
+            return_value=(Decimal("0"), Decimal("0.0012"), False, []),
         ),
     )
 

@@ -139,7 +139,11 @@ async def test_a_cancel_ends_the_wait_and_the_turn_through_its_terminal(ready):
     wm = _hung_workspace_manager(ready=ready)
     events, fail_open_run, run_end = await _turn(wm, _local_stop)
     assert events[-1] == RUN_END
-    assert fail_open_run.await_args.kwargs == {"status": "cancelled", "metadata": None}
+    assert fail_open_run.await_args.kwargs == {
+        "status": "cancelled",
+        "metadata": None,
+        "no_model_calls": True,  # DALTON-HOOK(budget)
+    }
     run_end.assert_awaited_once_with("t-1", "r-1", "cancelled", stopped_by=None)
     # The provider call is abandoned, and the wait leaves nothing behind.
     assert wm[2].is_set()
@@ -287,7 +291,9 @@ async def test_the_drain_ends_the_wait_and_leaves_the_turn_to_the_next_process(
     )
     assert events[-1] == RUN_END
     assert fail_open_run.await_args.kwargs == {
-        "status": "cancelled", "metadata": DRAIN_STOP,
+        "status": "cancelled",
+        "metadata": DRAIN_STOP,
+        "no_model_calls": True,  # DALTON-HOOK(budget)
     }
     run_end.assert_awaited_once_with("t-1", "r-1", "cancelled", stopped_by=None)
     assert wm[2].is_set()
@@ -438,7 +444,11 @@ async def test_a_suspensions_stop_ends_the_wait_as_the_suspensions():
     # the row (tests/integration/test_suspension_stop_db.py).
     assert request.await_args.kwargs == {"thread_id": "t-1", "by": "suspension"}
     assert events[-1] == RUN_END
-    assert fail_open_run.await_args.kwargs == {"status": "cancelled", "metadata": None}
+    assert fail_open_run.await_args.kwargs == {
+        "status": "cancelled",
+        "metadata": None,
+        "no_model_calls": True,  # DALTON-HOOK(budget)
+    }
     # This finalize returns no stamped row, so the close names no stopper;
     # the drain test above reads it from a stamped one.
     run_end.assert_awaited_once_with("t-1", "r-1", "cancelled", stopped_by=None)
