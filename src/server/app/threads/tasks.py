@@ -4,7 +4,7 @@ from contextlib import aclosing
 from typing import Annotated, Optional
 
 
-from fastapi import Header, Path, Query
+from fastapi import Header, Path, Query, Request
 from fastapi.responses import StreamingResponse
 
 from src.server.dependencies.principal import ReadUserId, RunUserId
@@ -126,6 +126,7 @@ async def stream_subagent_task(
         None, description="Last received event ID for reconnect"
     ),
     last_event_id_header: Optional[str] = Header(None, alias="Last-Event-ID"),
+    request: Request = None,
 ):
     """Stream a single subagent's content events (message_chunk, tool_calls, etc.).
 
@@ -134,6 +135,7 @@ async def stream_subagent_task(
     (v1-identical wire shape); pre-ledger tasks fall back to the v1 reader.
     """
     watch = ThreadWatch.of(thread_id, x_user_id, await thread_access(thread_id, x_user_id))
+    from src.dalton.auth.dispatch import wrap_local_sse_stream  # DALTON-HOOK(standalone-core): recheck local session <=30s on subagent task stream
     from src.server.handlers.chat.task_run_sse_reader import stream_task_run_sse
 
     if last_event_id is None and last_event_id_header is not None:
@@ -155,7 +157,7 @@ async def stream_subagent_task(
                 yield frame
 
     return StreamingResponse(
-        frames if watch is None else watched(),
+        wrap_local_sse_stream(frames if watch is None else watched(), request, x_user_id),  # DALTON-HOOK(standalone-core): terminate subagent task stream on local session revocation
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )

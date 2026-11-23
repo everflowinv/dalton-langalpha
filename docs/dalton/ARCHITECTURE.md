@@ -9,7 +9,7 @@ Dalton 用配置覆盖（overlay）和 `DALTON-HOOK` 挂在上游前后端之上
 Dalton 靠**配置叠加 + 目录隔离 + Hook 标记守卫**三层边界，保住持续同步上游的能力：
 
 - **配置叠加（YAML Overlay）**：设好环境变量 `APP_ENV=dalton` 后，配置读取器（`src/ptc_agent/config/file_utils.py:load_yaml_config`）会自动把 `agent_config.dalton.yaml` 和 `config.dalton.yaml` 叠在根目录基准配置 `agent_config.yaml`、`config.yaml` 上。YAML 映射按层级合并，列表则整体替换（比如 `config.dalton.yaml` 里的 `market_data.providers` 会完整换掉上游默认链）。编排叠加用 `docker-compose.yml` 配 `docker-compose.dalton.yml`。Dalton 专属行为默认值收在 `src/dalton/dalton.yaml`，通过 `src/dalton/settings.py:get_dalton_config` 读取。
-- **目录所有权（`dalton_paths.txt`）**：`scripts/dalton/dalton_paths.txt` 登记了所有 Dalton 独占的文件和目录，比如 `src/dalton/`、`plugins/dalton/`、`plugins/dalton_data/`、`scripts/dalton/`、`config/dalton/`、`deploy/dalton/`、`docs/dalton/`、`web/src/pages/Settings/panels/dalton/`、`web/src/components/dalton/` 等。这些路径里不用标 `DALTON-HOOK`。
+- **目录所有权（`dalton_paths.txt`）**：`scripts/dalton/dalton_paths.txt` 登记了所有 Dalton 独占的文件和目录，比如 `src/dalton/`、`plugins/dalton/`、`plugins/dalton_data/`、`plugins/dalton_sec/`、`scripts/dalton/`、`config/dalton/`、`deploy/dalton/`、`docs/dalton/`、`web/src/pages/Settings/panels/dalton/`、`web/src/components/dalton/` 等。这些路径里不用标 `DALTON-HOOK`。
 - **上游文件挂载（`DALTON-HOOK`）**：改到非独占上游文件时，要在改动行上下 ±25 行内标上 `# DALTON-HOOK(<id>)`（前端用 JS/TS 注释形式），而且 `<id>` 必须在 `scripts/dalton/check_hooks.sh:ALLOWED_HOOKS` 白名单里。`scripts/dalton/check_hooks.sh --strict --audit` 以 `git merge-base HEAD upstream/main` 为基准，校验全部改动和必需的关键 hook（`P0_REQUIRED_HOOKS`），同时拦住对上游受保护模型清单和基础配置的修改。
 
 ## 2. 模块地图（`src/dalton/*`）
@@ -59,7 +59,7 @@ FastAPI backend (127.0.0.1:8000, APP_ENV=dalton)
    ├── 网页抓取：→ crawler 容器 (:crawl 网络, X-Service-Token 鉴权)
    ├── 消息投递：→ dalton-channel-gateway (127.0.0.1:8962) → 飞书 / Discord / 微信
    └── 智能体引擎 (PTCAgent / Docker Sandbox)
-          ├── stdio MCP：plugins/dalton_data/dalton_sec_mcp_server.py (SEC EDGAR)
+          ├── stdio MCP：plugins/dalton_sec/dalton_sec_mcp_server.py (SEC EDGAR)
           └── HTTP MCP：→ host.docker.internal:8960 (researchdata_bridge.py)
                              ├── AlphaEngine SQLite WAL 缓存 + 单飞合并
                              └── 雪球 / 社区 / 外部研报 / 宿主机受控脚本执行

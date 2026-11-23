@@ -26,11 +26,12 @@ from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any
+from typing import Any, TypeVar
 
 from src.dalton.profile import DeploymentProfile, resolve_profile
 
 logger = logging.getLogger(__name__)
+_ServerT = TypeVar("_ServerT")
 
 # Sentinel marking core-universal tools, routes, and background loops that do
 # not require any optional capability.
@@ -479,6 +480,26 @@ def require_capability(*caps: CapabilityId) -> None:
             )
 
 
+def require_subscription_oauth_enabled() -> None:
+    """Raise HTTP 404 when Dalton is enabled and ``native_oauth_sync`` is disabled.
+
+    Gates upstream subscription OAuth endpoints (``/api/v1/oauth/{codex,claude,grok}/*``)
+    in Core deployments where subscription sign-ins are disabled and all ``*-oauth``
+    models are pruned from the catalog. When Dalton is disabled (upstream OSS),
+    returns without error so upstream behavior is unchanged.
+    """
+    from fastapi import HTTPException
+    from src.dalton.settings import is_dalton_enabled
+
+    if not is_dalton_enabled():
+        return
+    if not has_capability(CapabilityId.NATIVE_OAUTH_SYNC):
+        raise HTTPException(
+            status_code=404,
+            detail="Subscription OAuth sign-in is disabled in this deployment",
+        )
+
+
 def require_capability_dep(*caps: CapabilityId) -> Callable[[], None]:
     """Return a FastAPI ``Depends(...)`` guard enforcing ``require_capability(*caps)``."""
 
@@ -577,6 +598,8 @@ MCP_SERVER_CAPABILITY_MAP: Mapping[str, CapabilityId | None] = MappingProxyType(
         "dalton_sec": CORE_CAPABILITY,
         "price_data": CORE_CAPABILITY,
         "fundamentals": CORE_CAPABILITY,
+        "macro": CORE_CAPABILITY,
+        "options": CORE_CAPABILITY,
         "yf_price": CORE_CAPABILITY,
         "yf_fundamentals": CORE_CAPABILITY,
         "yf_analysis": CORE_CAPABILITY,
@@ -587,6 +610,92 @@ MCP_SERVER_CAPABILITY_MAP: Mapping[str, CapabilityId | None] = MappingProxyType(
         "firecrawl": CORE_CAPABILITY,
     }
 )
+
+# Canonical bundled plugin registry: every shipped package under `plugins/`
+# must be explicitly classified as CORE_CAPABILITY (None) or a CapabilityId.
+BUNDLED_PLUGIN_CAPABILITY_MAP: Mapping[str, CapabilityId | None] = MappingProxyType(
+    {
+        "alternative-data": CORE_CAPABILITY,
+        "dalton": CORE_CAPABILITY,
+        "dalton-data": CapabilityId.RESEARCHDATA_BRIDGE,
+        "dalton-sec": CORE_CAPABILITY,
+        "firecrawl": CORE_CAPABILITY,
+        "langalpha-deliverables": CORE_CAPABILITY,
+        "langalpha-market-data": CORE_CAPABILITY,
+        "langalpha-research": CORE_CAPABILITY,
+        "langalpha-service": CORE_CAPABILITY,
+        "yfinance": CORE_CAPABILITY,
+    }
+)
+
+
+def is_mcp_server_enabled_by_capability(
+    server_name: str | None,
+    *,
+    capabilities: frozenset[CapabilityId] | None = None,
+) -> bool:
+    """Return True iff the named MCP server has no disabled capability requirement."""
+    cleaned = str(server_name or "").strip()
+    if not cleaned:
+        return True
+    req = MCP_SERVER_CAPABILITY_MAP.get(cleaned)
+    if req is None:
+        return True
+    active = effective_capabilities() if capabilities is None else capabilities
+    return req in active
+
+
+def is_bundled_plugin_enabled_by_capability(
+    bundle_name: str | None,
+    *,
+    capabilities: frozenset[CapabilityId] | None = None,
+) -> bool:
+    """Return True iff the named bundled plugin has no disabled capability requirement.
+
+    Accepts both manifest names (``dalton-data``) and directory names
+    (``dalton_data``) so raw directory reads and API lookups always agree.
+    """
+    cleaned = str(bundle_name or "").strip()
+    if not cleaned:
+        return True
+    req = BUNDLED_PLUGIN_CAPABILITY_MAP.get(cleaned)
+    if req is None and "_" in cleaned:
+        req = BUNDLED_PLUGIN_CAPABILITY_MAP.get(cleaned.replace("_", "-"))
+    if req is None:
+        return True
+    active = effective_capabilities() if capabilities is None else capabilities
+    return req in active
+
+
+def filter_mcp_servers_by_capability(
+    servers: Iterable[_ServerT],
+    *,
+    capabilities: frozenset[CapabilityId] | None = None,
+) -> list[_ServerT]:
+    """Filter MCPServerConfig objects to those whose required capability is enabled."""
+    active = effective_capabilities() if capabilities is None else capabilities
+    return [
+        srv
+        for srv in servers
+        if is_mcp_server_enabled_by_capability(getattr(srv, "name", None), capabilities=active)
+    ]
+
+
+def filter_mcp_server_dicts_by_capability(
+    servers: Iterable[Mapping[str, Any]] | None,
+    *,
+    capabilities: frozenset[CapabilityId] | None = None,
+) -> list[Mapping[str, Any]]:
+    """Filter raw YAML ``mcp.servers`` entries before merge/validation."""
+    if not servers:
+        return []
+    active = effective_capabilities() if capabilities is None else capabilities
+    return [
+        srv
+        for srv in servers
+        if not isinstance(srv, Mapping)
+        or is_mcp_server_enabled_by_capability(srv.get("name"), capabilities=active)
+    ]
 
 
 def filter_reconnectable_builtin_mcp(failed_servers: Iterable[str] | None) -> set[str]:
@@ -718,6 +827,7 @@ BACKGROUND_LOOP_REGISTRY: Mapping[str, CapabilityId | None] = MappingProxyType(
         "NewsRefreshService": CORE_CAPABILITY,
         "ProvenanceGCService": CORE_CAPABILITY,
         "WorkspaceFileGCService": CORE_CAPABILITY,
+        "SetupSettings": CORE_CAPABILITY,
     }
 )
 

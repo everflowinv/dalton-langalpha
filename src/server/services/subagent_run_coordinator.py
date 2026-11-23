@@ -103,6 +103,8 @@ class SubagentRunCoordinator:
         cli_computer: Optional[str] = None,
         spending_run_id: Optional[str] = None,
         model_override: Optional[str] = None,
+        workflow_driver: bool = False,  # DALTON-HOOK(budget)
+        workflow_driver_run_id: Optional[str] = None,  # DALTON-HOOK(budget)
     ) -> str:
         """Bear the run row (in_progress) and open its v2 stream; returns the
         new task_run_id. ``model`` is the model the run will use, given only
@@ -176,6 +178,12 @@ class SubagentRunCoordinator:
                 cli_computer=cli_computer if claude_code else None,
                 spending_run_id=spending_run_id,
                 model_override=model_override,
+                **({"workflow_driver": True} if workflow_driver else {}),  # DALTON-HOOK(budget)
+                **(
+                    {"workflow_driver_run_id": workflow_driver_run_id}
+                    if workflow_driver_run_id
+                    else {}
+                ),  # DALTON-HOOK(budget)
             )
         except sr_db.ClaudeCodeCapError as e:
             from src.server.services.claude_code.hosted import cli_cap_refusal

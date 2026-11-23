@@ -80,6 +80,8 @@ async def _save(cache, key: str, raw, user_id: str, provider: str, tokens: Token
             if not await cache.claim(key, raw):
                 return False
             await store_tokens(user_id, provider, tokens, conn=conn)
+    except HTTPException:  # DALTON-HOOK(standalone-core): preserve 403/503 from transactional credential guard instead of turning into 500
+        raise
     except Exception:
         logger.exception(f"[oauth] Saving {provider} tokens failed for user_id={user_id}")
         raise _fail(500, "save_failed", "The account could not be saved. Start again.", retryable=False)
@@ -92,6 +94,10 @@ async def _save(cache, key: str, raw, user_id: str, provider: str, tokens: Token
 
 
 def _subscription(key: str) -> str:
+    # DALTON-HOOK(standalone-core): return 404 for subscription OAuth routes when native_oauth_sync is disabled
+    from src.dalton.capabilities import require_subscription_oauth_enabled
+
+    require_subscription_oauth_enabled()
     provider = f"{key}-oauth"
     if provider not in SUBSCRIPTIONS:
         raise HTTPException(status_code=404, detail="Not Found")
@@ -120,6 +126,10 @@ _DEVICE_FLOWS = {"codex": codex_oauth.DEVICE_FLOW}
 
 
 def _device_flow(key: str) -> DeviceFlow:
+    # DALTON-HOOK(standalone-core): return 404 for device-flow subscription OAuth when native_oauth_sync is disabled
+    from src.dalton.capabilities import require_subscription_oauth_enabled
+
+    require_subscription_oauth_enabled()
     if key not in _DEVICE_FLOWS:
         raise HTTPException(status_code=404, detail="Not Found")
     return _DEVICE_FLOWS[key]
@@ -365,6 +375,10 @@ async def claude_initiate(user_id: CurrentUserId):
     The frontend opens it in a new tab; once the user authorizes, Anthropic's
     page shows a code they paste back via POST /claude/callback.
     """
+    # DALTON-HOOK(standalone-core): return 404 when native_oauth_sync is disabled
+    from src.dalton.capabilities import require_subscription_oauth_enabled
+
+    require_subscription_oauth_enabled()
     # DALTON-HOOK(team-credentials): connecting writes the shared credential;
     # checked before the flow key is written to Redis.
     from src.dalton.credentials import require_credential_write_admin
@@ -388,6 +402,10 @@ async def claude_callback(user_id: CurrentUserId, body: ClaudeCallbackRequest):
     second waits instead, and answers as the first did when that one connected
     this same sign-in.
     """
+    # DALTON-HOOK(standalone-core): return 404 when native_oauth_sync is disabled
+    from src.dalton.capabilities import require_subscription_oauth_enabled
+
+    require_subscription_oauth_enabled()
     # DALTON-HOOK(team-credentials): the paste is where the authorization
     # becomes the stored credential, so the writer is re-checked here, not
     # only at initiate — before the callback lock or any exchange/save.

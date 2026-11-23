@@ -13,8 +13,6 @@ import logging
 from dataclasses import dataclass
 from typing import Literal
 
-from psycopg.rows import dict_row
-
 from src.server.database.mcp_config_version import bump_user_versions
 from src.server.database.pool import get_db_connection
 
@@ -33,17 +31,16 @@ class AccountDisables:
 
 async def list_account_disables(user_id: str, *, conn=None) -> AccountDisables:
     """Everything this account has switched off, split by kind."""
-    async with get_db_connection(conn) as db:
-        async with db.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                "SELECT kind, name FROM user_mcp_builtin_disables WHERE user_id = %s",
-                (user_id,),
-            )
-            rows = await cur.fetchall()
-    return AccountDisables(
-        servers=frozenset(r["name"] for r in rows if r["kind"] == "server"),
-        bundles=frozenset(r["name"] for r in rows if r["kind"] == "bundle"),
+    # DALTON-HOOK(standalone-core): read disables and d045 overrides atomically in one transaction
+    from src.dalton.database.plugin_disable_overrides import (
+        read_account_disables_atomic,
     )
+
+    async with get_db_connection(conn) as db:
+        servers, effective_bundles = await read_account_disables_atomic(
+            db, user_id, in_existing_tx=conn is not None
+        )
+    return AccountDisables(servers=servers, bundles=effective_bundles)
 
 
 async def set_account_disable(
@@ -56,9 +53,16 @@ async def set_account_disable(
     grant set away rather than write a stale one, so the bump has to become
     visible at the instant the disable does.
     """
+    # DALTON-HOOK(standalone-core): serialize (user_id, bundle) toggles & sync d045 overrides
+    from src.dalton.database.plugin_disable_overrides import (
+        acquire_bundle_toggle_lock_in_tx,
+        sync_plugin_disable_override_in_tx,
+    )
+
     async with get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor() as cur:
+                await acquire_bundle_toggle_lock_in_tx(cur, user_id, kind, name)
                 if disabled:
                     await cur.execute(
                         """
@@ -76,6 +80,9 @@ async def set_account_disable(
                         """,
                         (user_id, kind, name),
                     )
+                await sync_plugin_disable_override_in_tx(
+                    cur, user_id, kind, name, disabled=disabled
+                )
                 await bump_user_versions(cur, user_id)
                 logger.info(
                     f"[account_disables] set user_id={user_id} kind={kind} "

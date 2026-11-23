@@ -218,6 +218,12 @@ async def verify_jwt_token(
         reject_company_system_auth(resolved)
         return resolved
     if HOST_MODE == "oss":
+        # DALTON-HOOK(standalone-core): dispatch local/invalid Dalton auth modes before upstream OSS owner check
+        from src.dalton.auth.dispatch import dispatch_oss_jwt_user_id
+        from src.dalton.settings import get_dalton_auth_mode
+
+        if get_dalton_auth_mode() != "oss":
+            return await dispatch_oss_jwt_user_id(credentials, local_dev_user_id=LOCAL_DEV_USER_ID)
         owner_requests.refuse_unless_owner(request.scope)
         reject_company_system_auth(LOCAL_DEV_USER_ID)
         return LOCAL_DEV_USER_ID
@@ -246,6 +252,12 @@ async def get_current_auth_info(
         reject_company_system_auth(info.user_id)
         return info
     if HOST_MODE == "oss":
+        # DALTON-HOOK(standalone-core): dispatch local/invalid Dalton auth modes before upstream OSS owner check
+        from src.dalton.auth.dispatch import dispatch_oss_auth_info
+        from src.dalton.settings import get_dalton_auth_mode
+
+        if get_dalton_auth_mode() != "oss":
+            return await dispatch_oss_auth_info(credentials, local_dev_user_id=LOCAL_DEV_USER_ID)
         owner_requests.refuse_unless_owner(request.scope)
         reject_company_system_auth(LOCAL_DEV_USER_ID)
         return AuthInfo(user_id=LOCAL_DEV_USER_ID)

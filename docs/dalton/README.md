@@ -40,5 +40,6 @@
 
 - [config/dalton/README.md](../../config/dalton/README.md)：标准化公司覆盖名单 `coverage.yaml` 的维护与生成说明。
 - [scripts/dalton/ops/README.md](../../scripts/dalton/ops/README.md)：GitHub 配置加密备份和 Google Drive 流式加密备份运维手册。
-- [plugins/dalton_data/README.md](../../plugins/dalton_data/README.md)：Dalton 投研 MCP 插件（`researchdata` HTTP 桥接与 `dalton_sec` EDGAR stdio 服务）。
+- [plugins/dalton_data/README.md](../../plugins/dalton_data/README.md)：Dalton 投研 MCP 插件（`researchdata` HTTP 桥接）。
+- [plugins/dalton_sec/README.md](../../plugins/dalton_sec/README.md)：公开美股 SEC EDGAR XBRL 财报 MCP 插件（`dalton_sec` stdio 服务，Apache-2.0）。
 - [integrations/dalton-channel-gateway/README.md](../../integrations/dalton-channel-gateway/README.md)：多渠道接入网关（飞书、Discord、微信）与原生命令菜单注册说明。

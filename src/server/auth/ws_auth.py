@@ -47,6 +47,12 @@ async def authenticate_websocket(websocket: WebSocket) -> str:
             raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid or expired token")
         return ws_uid
     if HOST_MODE == "oss":
+        # DALTON-HOOK(standalone-core): dispatch local/invalid Dalton auth modes before upstream OSS owner check
+        from src.dalton.auth.dispatch import dispatch_oss_websocket
+        from src.dalton.settings import get_dalton_auth_mode
+
+        if get_dalton_auth_mode() != "oss":
+            return await dispatch_oss_websocket(websocket, local_dev_user_id=LOCAL_DEV_USER_ID)
         if not owner_requests.is_owner(websocket.scope):
             reason = owner_requests.REFUSAL
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=reason)

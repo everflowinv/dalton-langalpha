@@ -349,8 +349,10 @@ async def lifespan(app: FastAPI):
 
     # Auto-provision local dev user when Supabase auth is disabled
     from src.config.settings import HOST_MODE, LOCAL_DEV_USER_ID
+    # DALTON-HOOK(standalone-core): validate auth mode across all HOST_MODE values, seed bootstrap token, and gate local-dev-user provisioning
+    from src.dalton.auth.bootstrap import run_auth_db_startup_hook
 
-    if HOST_MODE == "oss":
+    if await run_auth_db_startup_hook(HOST_MODE, logger):
         from src.server.database.user import get_user, create_user_from_auth
 
         # Only provision if name is missing or user doesn't exist

@@ -723,16 +723,130 @@ def get_supabase_publishable_key() -> str:
     return os.getenv("SUPABASE_PUBLISHABLE_KEY", SUPABASE_PUBLISHABLE_KEY).strip()
 
 
+VALID_DALTON_AUTH_MODES: frozenset[str] = frozenset({"local", "supabase", "oss"})
+MIN_JWT_SIGNING_SECRET_BYTES: int = 32
+MIN_TRANSCRIPTION_TICKET_SECRET_BYTES: int = 32
+
+
 def get_dalton_auth_mode() -> str:
-    """Return ``DALTON_AUTH_MODE`` normalized to lowercase (default ``oss``, optional ``supabase``)."""
-    raw = os.getenv("DALTON_AUTH_MODE", "oss").strip().lower()
-    return raw or "oss"
+    """Return ``DALTON_AUTH_MODE`` normalized to lowercase.
+
+    Defaults to ``local`` under ``DALTON_PROFILE=core`` and ``oss`` under Everflow.
+    """
+    raw = os.getenv("DALTON_AUTH_MODE")
+    if raw is not None and raw.strip():
+        return raw.strip().lower()
+    if resolve_profile() is DeploymentProfile.CORE:
+        return "local"
+    return "oss"
+
+
+def get_jwt_signing_secret() -> str:
+    """Return ``JWT_SIGNING_SECRET`` from environment (stripped, empty if unset)."""
+    return os.getenv("JWT_SIGNING_SECRET", "").strip()
+
+
+def get_dalton_trusted_proxy_hops() -> int:
+    """Return number of trusted reverse-proxy hops for ``X-Forwarded-For`` (default ``0`` = peer IP only)."""
+    raw = os.getenv("DALTON_TRUSTED_PROXY_HOPS", "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def get_dalton_auth_cookie_secure_mode() -> str:
+    """Return cookie ``Secure`` policy: ``'true'``, ``'false'``, or ``'auto'`` (default)."""
+    raw = os.getenv("DALTON_AUTH_COOKIE_SECURE", "").strip().lower()
+    if raw in ("1", "true", "yes", "always"):
+        return "true"
+    if raw in ("0", "false", "no", "never"):
+        return "false"
+    return "auto"
+
+
+def is_core_oss_auth_explicitly_allowed() -> bool:
+    """Return True when ``DALTON_ALLOW_DEV_OSS_AUTH`` explicitly permits ``oss`` under core profile."""
+    return os.getenv("DALTON_ALLOW_DEV_OSS_AUTH", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def validate_dalton_auth_config() -> str:
+    """Fail-closed startup validation for ``DALTON_AUTH_MODE`` (Standalone Core §4.2 #1).
+
+    Raises :class:`DaltonStartupConfigError` with remediation instructions when:
+    - ``DALTON_AUTH_MODE`` is not in ``{"local", "supabase", "oss"}``;
+    - ``HOST_MODE=platform`` is combined with ``DALTON_AUTH_MODE=local``;
+    - ``DALTON_AUTH_MODE=local`` lacks a ``JWT_SIGNING_SECRET`` of at least 32 bytes;
+    - ``DALTON_AUTH_MODE=local`` has transcription enabled without a dedicated
+      ``DALTON_TRANSCRIPTION_TICKET_SECRET`` (>= 32 bytes);
+    - ``DALTON_PROFILE=core`` uses ``DALTON_AUTH_MODE=oss`` without
+      ``DALTON_ALLOW_DEV_OSS_AUTH=1``.
+    """
+    from src.config import settings as app_settings
+    from src.dalton.profile import DaltonStartupConfigError
+
+    profile = resolve_profile()
+    mode = get_dalton_auth_mode()
+    if mode not in VALID_DALTON_AUTH_MODES:
+        raise DaltonStartupConfigError(
+            f"Invalid DALTON_AUTH_MODE={mode!r}. "
+            "Supported values are 'local', 'supabase', and 'oss'. "
+            "Set DALTON_AUTH_MODE=local for standalone core deployments, "
+            "DALTON_AUTH_MODE=supabase for Everflow, or DALTON_AUTH_MODE=oss for local dev."
+        )
+    if app_settings.HOST_MODE == "platform" and mode == "local":
+        raise DaltonStartupConfigError(
+            "Invalid auth configuration: DALTON_AUTH_MODE=local cannot be combined "
+            "with HOST_MODE=platform. Set HOST_MODE=oss for standalone local auth, "
+            "or unset DALTON_AUTH_MODE when running in platform mode."
+        )
+    if mode == "local":
+        secret_bytes = len(get_jwt_signing_secret().encode("utf-8"))
+        if secret_bytes < MIN_JWT_SIGNING_SECRET_BYTES:
+            raise DaltonStartupConfigError(
+                f"DALTON_AUTH_MODE=local requires JWT_SIGNING_SECRET with at least "
+                f"{MIN_JWT_SIGNING_SECRET_BYTES} bytes (got {secret_bytes}). "
+                "Generate one with `openssl rand -hex 32` and set JWT_SIGNING_SECRET in .env."
+            )
+        transcription_flag = os.getenv("DALTON_TRANSCRIPTION_ENABLED", "").strip().lower()
+        if transcription_flag in ("1", "true", "yes", "on"):
+            ticket_secret_bytes = len(
+                get_dalton_transcription_ticket_secret().encode("utf-8")
+            )
+            if ticket_secret_bytes < MIN_TRANSCRIPTION_TICKET_SECRET_BYTES:
+                raise DaltonStartupConfigError(
+                    "DALTON_AUTH_MODE=local with DALTON_TRANSCRIPTION_ENABLED=true requires "
+                    f"a dedicated DALTON_TRANSCRIPTION_TICKET_SECRET of at least "
+                    f"{MIN_TRANSCRIPTION_TICKET_SECRET_BYTES} bytes (got {ticket_secret_bytes}). "
+                    "Generate one with `openssl rand -hex 32`."
+                )
+    if profile is DeploymentProfile.CORE and mode == "oss":
+        if not is_core_oss_auth_explicitly_allowed():
+            raise DaltonStartupConfigError(
+                "DALTON_AUTH_MODE=oss (passwordless local-dev-user) is refused under "
+                "DALTON_PROFILE=core. Set DALTON_AUTH_MODE=local (the core default), "
+                "or set DALTON_ALLOW_DEV_OSS_AUTH=1 explicitly for local development/CI."
+            )
+    return mode
 
 
 def get_dalton_allowed_emails() -> frozenset[str]:
     """Return lowercase email allowlist parsed from ``DALTON_ALLOWED_EMAILS`` (comma-separated)."""
     raw = os.getenv("DALTON_ALLOWED_EMAILS", "")
     return frozenset(e.strip().lower() for e in raw.split(",") if e.strip())
+
+
+def is_dalton_local_auth_enabled() -> bool:
+    """Whether Dalton local account authentication is active in OSS mode."""
+    from src.config import settings as app_settings
+
+    return app_settings.HOST_MODE == "oss" and get_dalton_auth_mode() == "local"
 
 
 def is_dalton_supabase_auth_enabled() -> bool:
@@ -967,14 +1081,21 @@ def get_dalton_transcription_ticket_secret() -> str:
 
 
 def get_dalton_transcription_ticket_hmac_key() -> bytes | None:
-    """Derive the HMAC-SHA256 signing key for per-job transcription tickets."""
-    seed = (
-        get_dalton_transcription_ticket_secret()
-        or get_internal_service_token()
-        or get_dalton_bridge_admin_token()
-    )
-    if not seed and not is_dalton_supabase_auth_enabled():
-        seed = f"dalton-local-dev-transcription-ticket-seed:{LOCAL_DEV_USER_ID}"
+    """Derive the HMAC-SHA256 signing key for per-job transcription tickets.
+
+    - ``local`` mode requires a dedicated ``DALTON_TRANSCRIPTION_TICKET_SECRET`` (no fallback).
+    - Predictable dev seed fallback is kept ONLY in explicit ``oss`` development mode.
+    """
+    if is_dalton_local_auth_enabled():
+        seed = get_dalton_transcription_ticket_secret()
+    else:
+        seed = (
+            get_dalton_transcription_ticket_secret()
+            or get_internal_service_token()
+            or get_dalton_bridge_admin_token()
+        )
+        if not seed and get_dalton_auth_mode() == "oss":
+            seed = f"dalton-local-dev-transcription-ticket-seed:{LOCAL_DEV_USER_ID}"
     if not seed:
         return None
     return hmac.new(

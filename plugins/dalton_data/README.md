@@ -7,5 +7,4 @@ Provides Dalton investment research MCP servers for LangAlpha (configured in `pl
    - Exposes routed research (`research`: `alphaengine`, `guidepoint`, `transcript`, `company-wiki`, `sales-notes`, `tmtb`, `funda-ai`, `all`), finance (`finance`: `sec`, `estimates`, `cn-hk`), macro (`macro`: `fred`, `treasury`, `market-regime`), community (`community`: `xueqiu`, `employee`, `last30days`, `x-timeline`), and `catalog` tools, plus AlphaEngine team SQLite WAL caching (v4 keys), singleflight coalescing, dual-quota accounting, and same-query/repeated-company soft hints (see [alphaengine-cache.md](../../docs/dalton/features/alphaengine-cache.md)).
    - Appends `_declared_sources` to `tools/call` payloads so Dalton Provenance middleware emits structured `sec_filing`, `research_doc`, and `data_api` source cards.
 
-2. **`dalton_sec`** (`type: "stdio"` via `uv run python plugins/dalton_data/dalton_sec_mcp_server.py`):
-   Self-contained SEC EDGAR XBRL facts server (`SEC_USER_AGENT`) with deterministic period normalization (`get_company_facts` and `list_filings`), supporting calendar/fiscal quarters, annual, YTD (`H1`/`9M`), derived Q4 (`FY - 9M` for flow concepts), trailing series, and restatement selection (`as_reported` vs `latest`).
+> Note: Public SEC EDGAR XBRL facts (`dalton_sec`) now ship in the standalone Apache-2.0 plugin `plugins/dalton_sec/`.

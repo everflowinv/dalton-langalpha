@@ -638,6 +638,13 @@ class WorkflowDriver:
                     owner_task_id=self.wf_task_id,
                     base_configurable=self.spec.base_configurable,
                     time_limit=self._child_time_limit(),
+                    # DALTON-HOOK(budget): link workflow child runs to this
+                    # driver's task_run_id in subagent_runs.replay_facts.
+                    **(
+                        {"workflow_driver_run_id": self.spec.run_task.task_run_id}
+                        if self.spec.run_task.task_run_id
+                        else {}
+                    ),
                 )
                 await self._emitter.emit(
                     "child_started",

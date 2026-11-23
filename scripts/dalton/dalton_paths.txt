@@ -1,5 +1,6 @@
 plugins/dalton/
 plugins/dalton_data/
+plugins/dalton_sec/
 src/dalton/
 workflows/
 scripts/dalton/
@@ -9,6 +10,7 @@ docs/dalton/
 tests/unit/dalton/
 tests/integration/dalton/
 tests/fixtures/dalton/
+tests/standalone/
 tests/unit/mcp_servers/fixtures/dalton_sec/
 tests/unit/mcp_servers/test_dalton_sec_periods.py
 tests/unit/server/services/test_bringup_owner_check.py
@@ -547,3 +549,10 @@ tests/unit/tools/secretary/test_workspace_settings_tools.py
 # Standalone Core Batch 1a: on-demand WebSearch registration & search provider availability tests.
 tests/unit/ptc_agent/agent/test_web_search_registration.py
 tests/unit/tools/web/test_search_availability.py
+# Standalone Core Batch 4a: local auth backend, bootstrap, sessions, roles, CLI, migration d047, and unit tests.
+src/dalton/migrations/versions/d047_local_auth_and_roles.py
+src/dalton/auth/
+tests/unit/dalton/test_local_auth_entrypoints.py
+tests/unit/dalton/test_local_auth_sessions_bootstrap.py
+tests/unit/dalton/test_local_auth_roles_credentials_cli.py
+tests/unit/dalton/test_d047_local_auth_migration.py

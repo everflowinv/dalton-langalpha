@@ -17,7 +17,7 @@ from psycopg.rows import dict_row
 from src.server.database.pool import get_db_connection
 from src.server.database.sql_fences import advisory_key
 from src.server.database.encryption import get_encryption_key as _get_encryption_key
-from src.dalton.credentials import credential_user_id  # DALTON-HOOK(team-credentials): resolve shared team credential holder
+from src.dalton.credentials import credential_user_id, credential_write_tx, resolve_credential_write_holder  # DALTON-HOOK(team-credentials): resolve shared team credential holder (standalone-core transactional write check)
 
 logger = logging.getLogger(__name__)
 
@@ -79,9 +79,10 @@ async def set_byok_enabled(user_id: str, enabled: bool, conn=None) -> bool:
     Returns:
         The new byok_enabled value.
     """
-    actor_user_id, user_id = user_id, credential_user_id(user_id)  # DALTON-HOOK(team-credentials): write BYOK toggle on team credential holder
-    async with get_db_connection(conn) as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
+    actor_user_id = user_id
+    async with get_db_connection(conn) as db, credential_write_tx(db, external_conn=conn):  # DALTON-HOOK(standalone-core): hold transaction across holder/admin lock and write
+        user_id = await resolve_credential_write_holder(actor_user_id, conn=db)  # DALTON-HOOK(standalone-core): pin team holder and admin role inside write transaction
+        async with db.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 "UPDATE users SET byok_enabled = %s, updated_at = NOW() WHERE user_id = %s RETURNING byok_enabled",
                 (enabled, user_id),
@@ -97,10 +98,11 @@ async def upsert_api_key(
     """
     Insert or update a single provider key (encrypted) and optional base_url.
     """
-    actor_user_id, user_id = user_id, credential_user_id(user_id)  # DALTON-HOOK(team-credentials): write API key to team credential holder
+    actor_user_id = user_id
     enc_key = _get_encryption_key()
-    async with get_db_connection(conn) as conn:
-        async with conn.cursor() as cur:
+    async with get_db_connection(conn) as db, credential_write_tx(db, external_conn=conn):  # DALTON-HOOK(standalone-core): hold transaction across holder/admin lock and write
+        user_id = await resolve_credential_write_holder(actor_user_id, conn=db)  # DALTON-HOOK(standalone-core): pin team holder and admin role inside write transaction
+        async with db.cursor() as cur:
             await cur.execute(
                 """
                 INSERT INTO user_api_keys (user_id, provider, api_key, base_url, created_at, updated_at)
@@ -119,9 +121,10 @@ async def delete_api_key(user_id: str, provider: str, conn=None) -> None:
     """
     Remove one provider key.
     """
-    actor_user_id, user_id = user_id, credential_user_id(user_id)  # DALTON-HOOK(team-credentials): delete API key from team credential holder
-    async with get_db_connection(conn) as conn:
-        async with conn.cursor() as cur:
+    actor_user_id = user_id
+    async with get_db_connection(conn) as db, credential_write_tx(db, external_conn=conn):  # DALTON-HOOK(standalone-core): hold transaction across holder/admin lock and delete
+        user_id = await resolve_credential_write_holder(actor_user_id, conn=db, for_disconnect=True)  # DALTON-HOOK(standalone-core): pin team holder and admin role inside delete transaction
+        async with db.cursor() as cur:
             await cur.execute(
                 "DELETE FROM user_api_keys WHERE user_id = %s AND provider = %s",
                 (user_id, provider),
@@ -243,9 +246,10 @@ async def invalidate_byok_cache(user_id: str) -> None:
 async def update_base_url(user_id: str, provider: str, base_url: str | None, conn=None) -> bool:
     """Update base_url on an existing API key row; False, and nothing
     written, when there is none."""
-    actor_user_id, user_id = user_id, credential_user_id(user_id)  # DALTON-HOOK(team-credentials): update base_url on team credential holder
-    async with get_db_connection(conn) as conn:
-        async with conn.cursor() as cur:
+    actor_user_id = user_id
+    async with get_db_connection(conn) as db, credential_write_tx(db, external_conn=conn):  # DALTON-HOOK(standalone-core): hold transaction across holder/admin lock and update
+        user_id = await resolve_credential_write_holder(actor_user_id, conn=db)  # DALTON-HOOK(standalone-core): pin team holder and admin role inside base_url write transaction
+        async with db.cursor() as cur:
             await cur.execute(
                 "UPDATE user_api_keys SET base_url = %s, updated_at = NOW() "
                 "WHERE user_id = %s AND provider = %s",
