@@ -565,6 +565,12 @@ async def set_plugin_enabled_endpoint(
         await _refuse_unconnected_servers(user_id, name)
     row = await set_plugin_enabled(user_id, name, body.enabled)
     if row is None:
+        # DALTON-HOOK(standalone-core): refuse toggling a capability-disabled bundled plugin (404)
+        from src.dalton.database.plugin_disable_overrides import (
+            ensure_bundled_plugin_capability,
+        )
+
+        ensure_bundled_plugin_capability(name)
         if name not in bundled_names():
             # A disable outlives the name it was written against: rename a
             # bundle between releases and the live list no longer answers to

@@ -38,7 +38,8 @@ _ENTRYPOINT_SERVERS = {
     "yf_analysis_mcp_server": "yfinance",
     "yf_fundamentals_mcp_server": "yfinance",
     "scrape_mcp_server": "alternative_data",
-    "dalton_sec_mcp_server": "dalton_data",
+    # DALTON-HOOK(standalone-core): dalton_sec ships in its own open-source plugin bundle
+    "dalton_sec_mcp_server": "dalton_sec",
 }
 
 

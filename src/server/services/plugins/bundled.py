@@ -56,7 +56,14 @@ def _text(value: object) -> str | None:
 
 
 def _server_names(bundle: Bundle) -> list[str]:
-    return [name for name in bundle.servers if isinstance(name, str)]
+    # DALTON-HOOK(standalone-core): omit capability-disabled MCP servers from bundle components
+    from src.dalton.capabilities import is_mcp_server_enabled_by_capability
+
+    return [
+        name
+        for name in bundle.servers
+        if isinstance(name, str) and is_mcp_server_enabled_by_capability(name)
+    ]
 
 
 def _skill_names(bundle: Bundle) -> tuple[list[str], bool]:
@@ -302,6 +309,11 @@ def _info(
     name = _name(bundle)
     if name is None:
         logger.warning("bundled plugin: %s has no usable name", bundle.path)
+        return None
+    # DALTON-HOOK(standalone-core): omit capability-disabled bundles from plugin listing
+    from src.dalton.capabilities import is_bundled_plugin_enabled_by_capability
+
+    if not is_bundled_plugin_enabled_by_capability(name):
         return None
     author = manifest.get("author")
     keywords = manifest.get("keywords")

@@ -550,7 +550,7 @@ async def default_market_quote_probe(*, timeout_s: float = DEFAULT_ITEM_TIMEOUT_
 
 async def default_sec_filings_probe(*, timeout_s: float = DEFAULT_ITEM_TIMEOUT_S) -> dict[str, Any]:
     """Minimal real probe for `sec_filings` (`dalton_sec.list_filings`)."""
-    from plugins.dalton_data.dalton_sec_mcp_server import list_filings
+    from plugins.dalton_sec.dalton_sec_mcp_server import list_filings
 
     res = await asyncio.wait_for(
         asyncio.to_thread(list_filings, "NVDA", "10-K,10-Q", 1),

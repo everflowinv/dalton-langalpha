@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dalton-sec",
+  "version": "0.1.0",
+  "description": "Public SEC EDGAR XBRL financial facts and filing discovery with deterministic period normalization and restatement selection.",
+  "author": {
+    "name": "Dalton"
+  },
+  "license": "Apache-2.0",
+  "extensions": {
+    "ai.langalpha": {
+      "servers": {
+        "dalton_sec": {
+          "description": "SEC EDGAR XBRL facts with deterministic period normalization (calendar/fiscal quarter, annual, YTD, derived Q4, trailing) and restatement selection.",
+          "tool_exposure_mode": "summary",
+          "instruction": "Use `get_company_facts(ticker, concepts, period)` for exact quarterly/annual/YTD/derived Q4/trailing SEC XBRL numbers with explicit `restatement` (`as_reported` vs `latest`) and `accession_no` provenance. Use `list_filings(ticker)` to list recent 10-K/10-Q/20-F/6-K filings."
+        }
+      }
+    }
+  }
+}

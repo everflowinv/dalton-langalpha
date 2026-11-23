@@ -20,7 +20,7 @@ from src.tools.secretary.chief_of_staff import CHIEF_OF_STAFF_TOOLS
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SKILLS_ROOT = REPO_ROOT / "plugins" / "dalton" / "skills"
-SEC_MCP_PATH = REPO_ROOT / "plugins" / "dalton_data" / "dalton_sec_mcp_server.py"
+SEC_MCP_PATH = REPO_ROOT / "plugins" / "dalton_sec" / "dalton_sec_mcp_server.py"
 BRIDGE_DIR = REPO_ROOT / "scripts" / "dalton"
 
 BATCH2_SKILL_DIRS: frozenset[str] = frozenset(

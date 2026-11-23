@@ -1,4 +1,4 @@
-"""Unit tests for `plugins/dalton_data/dalton_sec_mcp_server.py` (Rules R1–R10).
+"""Unit tests for `plugins/dalton_sec/dalton_sec_mcp_server.py` (Rules R1–R10).
 
 Uses compact real SEC EDGAR companyfacts fixtures under
 `tests/unit/mcp_servers/fixtures/dalton_sec/`.
@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from plugins.dalton_data import dalton_sec_mcp_server as ds
+from plugins.dalton_sec import dalton_sec_mcp_server as ds
 from src.dalton.provenance.declared_sources import expand_declared_sources
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "dalton_sec"

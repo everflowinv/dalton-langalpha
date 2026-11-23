@@ -1012,7 +1012,7 @@
       "args": [
         "run",
         "python",
-        "plugins/dalton_data/dalton_sec_mcp_server.py"
+        "plugins/dalton_sec/dalton_sec_mcp_server.py"
       ],
       "call_timeout_s": null,
       "command": "uv",
