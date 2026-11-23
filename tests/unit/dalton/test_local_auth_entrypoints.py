@@ -89,6 +89,13 @@ def _make_websocket(
     ws = create_autospec(WebSocket, instance=True)
     ws.headers = Headers(headers or {})
     ws.query_params = QueryParams(query or {})
+    ws.scope = {
+        "type": "websocket",
+        "headers": [
+            (k.lower().encode("latin-1"), v.encode("latin-1"))
+            for k, v in (headers or {}).items()
+        ],
+    }
     ws.state = SimpleNamespace()
     return ws
 
@@ -312,8 +319,8 @@ class TestUnifiedBackendEntrypoints:
         assert await get_current_user_id(request=req, credentials=None) == LOCAL_DEV_USER_ID
         assert await get_user_id_any_state(request=req, credentials=None) == LOCAL_DEV_USER_ID
         assert await get_optional_user_id(request=req, credentials=None) == LOCAL_DEV_USER_ID
-        assert await verify_jwt_token(credentials=None) == LOCAL_DEV_USER_ID
-        assert (await get_current_auth_info(credentials=None)).user_id == LOCAL_DEV_USER_ID
+        assert await verify_jwt_token(request=req, credentials=None) == LOCAL_DEV_USER_ID
+        assert (await get_current_auth_info(request=req, credentials=None)).user_id == LOCAL_DEV_USER_ID
         assert await authenticate_websocket(ws) == LOCAL_DEV_USER_ID
 
     @pytest.mark.asyncio
@@ -371,15 +378,15 @@ class TestUnifiedBackendEntrypoints:
                 assert exc.value.status_code == 401
             for fn in (verify_jwt_token, get_current_auth_info):
                 with pytest.raises(HTTPException) as exc:
-                    await fn(credentials=creds)
+                    await fn(request=req, credentials=creds)
                 assert exc.value.status_code == 401
 
         # 3. Valid token with active DB session -> passes everywhere
         assert await get_current_user_id(request=req, credentials=valid_creds) == TEST_USER_ID
         assert await get_user_id_any_state(request=req, credentials=valid_creds) == TEST_USER_ID
         assert await get_optional_user_id(request=req, credentials=valid_creds) == TEST_USER_ID
-        assert await verify_jwt_token(credentials=valid_creds) == TEST_USER_ID
-        assert await get_current_auth_info(credentials=valid_creds) == AuthInfo(
+        assert await verify_jwt_token(request=req, credentials=valid_creds) == TEST_USER_ID
+        assert await get_current_auth_info(request=req, credentials=valid_creds) == AuthInfo(
             user_id=TEST_USER_ID, auth_provider="local"
         )
         assert session_check.await_count == 5
@@ -392,7 +399,7 @@ class TestUnifiedBackendEntrypoints:
             assert exc_rev.value.status_code == 401
         for fn in (verify_jwt_token, get_current_auth_info):
             with pytest.raises(HTTPException) as exc_rev2:
-                await fn(credentials=valid_creds)
+                await fn(request=req, credentials=valid_creds)
             assert exc_rev2.value.status_code == 401
         ws_revoked = _make_websocket(headers={"authorization": f"Bearer {valid_token}"})
         with pytest.raises(WebSocketException) as exc_ws_rev:
@@ -480,12 +487,63 @@ class TestUnifiedBackendEntrypoints:
 
         assert await get_current_user_id(request=req, credentials=creds) == TEST_USER_ID
         assert await get_optional_user_id(request=req, credentials=creds) == TEST_USER_ID
-        assert await verify_jwt_token(credentials=creds) == TEST_USER_ID
-        assert await get_current_auth_info(credentials=creds) == sb_info
+        assert await verify_jwt_token(request=req, credentials=creds) == TEST_USER_ID
+        assert await get_current_auth_info(request=req, credentials=creds) == sb_info
         assert await authenticate_websocket(ws) == TEST_USER_ID
         assert mock_verify_bearer.await_count == 3
         mock_verify_opt.assert_awaited_once()
         mock_ws.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["local", "supabase"])
+    async def test_owner_header_alone_never_signs_in_under_dalton_auth(
+        self, monkeypatch: pytest.MonkeyPatch, mode: str
+    ) -> None:
+        """Upstream's owner fallback must stay behind Dalton auth: a request
+        carrying only the desktop owner secret, with no JWT, is refused."""
+        from src.server.auth import owner_requests
+
+        secret = "owner-secret-for-test"
+        monkeypatch.setenv(owner_requests.OWNER_SECRET_ENV, secret)
+        monkeypatch.setenv("DALTON_AUTH_MODE", mode)
+        monkeypatch.setattr(api_utils, "HOST_MODE", "oss")
+        monkeypatch.setattr(jwt_bearer, "HOST_MODE", "oss")
+        if mode == "local":
+            monkeypatch.setenv("JWT_SIGNING_SECRET", TEST_JWT_SECRET)
+        else:
+            monkeypatch.setattr(app_settings, "SUPABASE_URL", "https://example.supabase.co")
+            refuse = HTTPException(status_code=401, detail="missing bearer")
+            monkeypatch.setattr(
+                dalton_auth,
+                "verify_dalton_bearer",
+                create_autospec(dalton_auth.verify_dalton_bearer, side_effect=refuse),
+            )
+            monkeypatch.setattr(
+                dalton_auth,
+                "authenticate_dalton_websocket",
+                create_autospec(
+                    dalton_auth.authenticate_dalton_websocket,
+                    side_effect=WebSocketException(code=1008),
+                ),
+            )
+
+        owner_headers = {owner_requests.OWNER_HEADER: secret}
+        req = _make_request(owner_headers)
+        req.scope = {
+            "state": {},
+            "headers": [(owner_requests.OWNER_HEADER.encode(), secret.encode())],
+        }
+        assert owner_requests.is_owner(req.scope) is True
+
+        for entry in (get_current_user_id, get_user_id_any_state, verify_jwt_token):
+            with pytest.raises(HTTPException) as refused:
+                await entry(request=req, credentials=None)
+            assert refused.value.status_code == 401
+        with pytest.raises(HTTPException) as refused_info:
+            await get_current_auth_info(request=req, credentials=None)
+        assert refused_info.value.status_code == 401
+        with pytest.raises(WebSocketException):
+            await authenticate_websocket(_make_websocket(headers=owner_headers))
 
     def test_sse_service_flags_background_dispatch_and_routes_enforce_local_auth(
         self, monkeypatch: pytest.MonkeyPatch

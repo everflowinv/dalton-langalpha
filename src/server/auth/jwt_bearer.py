@@ -19,10 +19,11 @@ from dataclasses import dataclass
 
 import jwt
 from jwt import PyJWK, PyJWKClient
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from src.config.settings import HOST_MODE, LOCAL_DEV_USER_ID, SUPABASE_URL
+from src.server.auth import owner_requests
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +197,7 @@ async def _decode_token(token: str) -> AuthInfo:
 
 
 async def verify_jwt_token(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> str:
     """FastAPI dependency — extracts Bearer token via HTTPBearer and verifies it.
@@ -216,9 +218,15 @@ async def verify_jwt_token(
         reject_company_system_auth(resolved)
         return resolved
     if HOST_MODE == "oss":
-        # DALTON-HOOK(standalone-core): dispatch OSS/local Bearer JWT verification
+        # DALTON-HOOK(standalone-core): dispatch local/invalid Dalton auth modes before upstream OSS owner check
         from src.dalton.auth.dispatch import dispatch_oss_jwt_user_id
-        return await dispatch_oss_jwt_user_id(credentials, local_dev_user_id=LOCAL_DEV_USER_ID)
+        from src.dalton.settings import get_dalton_auth_mode
+
+        if get_dalton_auth_mode() != "oss":
+            return await dispatch_oss_jwt_user_id(credentials, local_dev_user_id=LOCAL_DEV_USER_ID)
+        owner_requests.refuse_unless_owner(request.scope)
+        reject_company_system_auth(LOCAL_DEV_USER_ID)
+        return LOCAL_DEV_USER_ID
     if credentials is None:
         raise HTTPException(status_code=401, detail="Missing Bearer token")
     resolved = (await _decode_token(credentials.credentials)).user_id
@@ -227,6 +235,7 @@ async def verify_jwt_token(
 
 
 async def get_current_auth_info(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> AuthInfo:
     """FastAPI dependency — returns both ``user_id`` and ``auth_provider``.
@@ -243,9 +252,15 @@ async def get_current_auth_info(
         reject_company_system_auth(info.user_id)
         return info
     if HOST_MODE == "oss":
-        # DALTON-HOOK(standalone-core): dispatch OSS/local AuthInfo verification
+        # DALTON-HOOK(standalone-core): dispatch local/invalid Dalton auth modes before upstream OSS owner check
         from src.dalton.auth.dispatch import dispatch_oss_auth_info
-        return await dispatch_oss_auth_info(credentials, local_dev_user_id=LOCAL_DEV_USER_ID)
+        from src.dalton.settings import get_dalton_auth_mode
+
+        if get_dalton_auth_mode() != "oss":
+            return await dispatch_oss_auth_info(credentials, local_dev_user_id=LOCAL_DEV_USER_ID)
+        owner_requests.refuse_unless_owner(request.scope)
+        reject_company_system_auth(LOCAL_DEV_USER_ID)
+        return AuthInfo(user_id=LOCAL_DEV_USER_ID)
     if credentials is None:
         raise HTTPException(status_code=401, detail="Missing Bearer token")
     info = await _decode_token(credentials.credentials)

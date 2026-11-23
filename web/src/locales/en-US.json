@@ -42,7 +42,8 @@
       "inPlace": "{{name}} is back in its place.",
       "dropped": "{{name}} was dropped over {{over}}.",
       "cancelled": "Moving {{name}} was cancelled."
-    }
+    },
+    "infoAbout": "About {{name}}"
   },
   "auth": {
     "login": "Sign in",
@@ -257,7 +258,52 @@
     "experiments": "Experiments",
     "experimentsIntro": "Early-access features still in development. Turn one on to enable it for your account. You can switch it off at any time.",
     "experimentsEmpty": "No experiments are available right now.",
-    "experimentTradeoff": "<lead>Trade-off:</lead> <text/>",
+    "features": {
+      "onByDefault": "On by default",
+      "offByDefault": "Off by default",
+      "needs": "Needs {{name}}",
+      "preview": "Preview",
+      "defaultLabel": "Default",
+      "costLabel": "Cost",
+      "on": "On",
+      "off": "Off",
+      "isOn": "{{name}} is on",
+      "isOff": "{{name}} is off",
+      "onIf": {
+        "opt_in": "Turn it on if",
+        "opt_out": "Keep it on if"
+      },
+      "offIf": {
+        "opt_in": "Leave it off if",
+        "opt_out": "Turn it off if"
+      },
+      "groups": {
+        "chat": {
+          "title": "In the chat",
+          "description": "What you see while the agent works."
+        },
+        "tools": {
+          "title": "Tools",
+          "description": "What the agent can use beyond its built-in research tools."
+        },
+        "autonomy": {
+          "title": "Working on its own",
+          "description": "When the agent may start a turn without a message from you."
+        },
+        "long_threads": {
+          "title": "Long threads",
+          "description": "How the agent keeps its place as a thread grows long."
+        },
+        "dashboard": {
+          "title": "Dashboard",
+          "description": "What your dashboard shows."
+        },
+        "other": {
+          "title": "More",
+          "description": "More features you can try."
+        }
+      }
+    },
     "theme": "Theme",
     "dark": "Dark",
     "light": "Light",
@@ -281,6 +327,10 @@
     "streamingModeDesc": "Show text as it arrives, or reveal one paragraph at a time.",
     "streamingModeToken": "Continuous",
     "streamingModeParagraph": "By paragraph",
+    "composerTray": "Running work",
+    "composerTrayDesc": "Where the plan, tasks and wakeups show while the agent works: as chips above the composer, or in a strip inside it.",
+    "composerTrayAbove": "Above",
+    "composerTrayInside": "Inside",
     "toolCallLayout": "Tool calls",
     "toolCallLayoutDesc": "Show each step as a row, or try the new status line: one line that names the current step.",
     "toolCallLayoutRows": "Rows",
@@ -331,6 +381,8 @@
     "outputFormat": "Output format",
     "subagentsDefault": "Subagents",
     "subagentsDefaultDesc": "Let the agent hand work to subagents. Threads follow this unless you switch one the other way in its chat input.",
+    "ownContext": "Use my preferences and memory in shared workspaces",
+    "ownContextDesc": "On your own messages in a shared workspace, the agent follows your answer preferences and can read your memory. In a conversation shared with the workspace, its answers are visible to the workspace's members.",
     "resetPreferences": "Reset preferences",
     "resetConfirmMsg": "This will clear all your preferences: risk tolerance, investment style, agent settings, your default models and other model settings (custom models and providers, quick-access models, per-model settings), and your dashboard layout. Conversations keep the models they use. You can set everything up again anytime in Settings or via the agent. Are you sure?",
     "resetting": "Resetting...",
@@ -596,7 +648,15 @@
       "personal": "Personal",
       "team": "Team Management"
     },
+    "server": {
+      "location": "Where the agent runs",
+      "locationDesc": "A change applies to new computers. Computers you already have stay where they are.",
+      "marketDataDesc": "Yahoo Finance needs no key. A key adds more data.",
+      "webSearchDesc": "The agent searches with the provider you pick here.",
+      "keysReach": "A saved key applies on this server right away, while Docker and cloud computers you already have keep the keys they were created with, and a computer on this machine picks up a change at its next start."
+    },
     "section": {
+      "server": "Server",
       "account": "Account",
       "preferences": "Investing Profile",
       "plan": "Plan & Usage",
@@ -606,6 +666,7 @@
       "artifacts": "Artifacts",
       "desktop": "Desktop app",
       "agent": "Agent",
+      "computers": "Computers",
       "model": "Models",
       "integrations": "Messaging & Channels",
       "trading": "Trading",
@@ -617,6 +678,7 @@
       "teamChannels": "Team Channels & Ops"
     },
     "definition": {
+      "server": "Where the agent runs and the vendor keys this server holds.",
       "account": "Your name, photo and sign-in.",
       "preferences": "What you told the agent about how you invest, so its research fits you.",
       "plan": "Your plan, your credits and billing, managed in your {{brand}} account.",
@@ -626,6 +688,7 @@
       "artifacts": "Defaults for your comments on the files the agent makes.",
       "desktop": "Notifications, the menu bar and how the app starts on this computer.",
       "agent": "How the agent answers, what it may do without asking, and how it searches the web.",
+      "computers": "The machines your workspaces run on, and how each one is set up.",
       "model": "The models you can reach and the ones the agent runs on.",
       "integrations": "Talk to your agent from your chat apps, and manage the apps signed in with your account.",
       "trading": "How far the agent may go with orders at your brokerages.",
@@ -893,7 +956,11 @@
       "goToTeamModels": "Go to team model settings",
       "statusUnavailable": "Could not load team credentials status right now. Refresh to try again."
     },
-    "daltonAuthOnly": "This page is only available in Everflow Team Edition."
+    "daltonAuthOnly": "This page is only available in Everflow Team Edition.",
+    "computers": {
+      "list": "Your computers",
+      "loadFailed": "Couldn't load your computers."
+    }
   },
   "dashboard": {
     "failedOnboarding": "Failed to set up onboarding. Please try again.",
@@ -1884,6 +1951,8 @@
       "dockerDesc": "Runs on this machine",
       "sshDesc": "Any Linux server or Mac",
       "sshLabel": "Your machine (SSH)",
+      "localLabel": "This computer",
+      "localDesc": "The agent runs on this machine as you, with no isolation",
       "capReached": "Limit reached"
     },
     "largerSlot": {
@@ -2012,6 +2081,39 @@
       "retinaFallback": "Retina needs 2 or more CPUs, so this computer uses Sharp.",
       "hint": "Sharper is clearer and uses more bandwidth. It applies the next time the browser opens.",
       "failed": "Couldn't change the live view quality"
+    },
+    "browserWindow": {
+      "label": "Show as a window",
+      "onHint": "The browser also opens as a window on this Mac, where you can watch and use it, and stays open until you close it. It applies the next time the browser opens.",
+      "offHint": "The browser shows only in the Browser tab. Turn this on to also see it as a window on this Mac. It applies the next time the browser opens.",
+      "failed": "Couldn't change the browser window"
+    },
+    "browserSignins": {
+      "label": "Keep sign-ins",
+      "offHint": "The browser forgets every site when it closes. Turn this on to sign in once in the Browser tab and stay signed in for every thread on this computer. It applies the next time the browser opens.",
+      "onHint": "Sites you sign in to in the Browser tab stay signed in, for every thread on this computer. Turning this off signs out of all of them.",
+      "signOut": "Sign out of every site",
+      "signedOut": "Signed out of every site",
+      "signOutWaits": "Saved, but this computer didn't answer",
+      "signOutWaitsHint": "Its browser signs out of every site the next time the computer is used.",
+      "failed": "Couldn't change kept sign-ins",
+      "import": {
+        "title": "Bring in sign-ins",
+        "hint": "Copy your sign-ins from another browser on this computer, so the agent can use them too. That browser stays as it is.",
+        "bring": "Bring in",
+        "bringing": "Bringing in…",
+        "askHint": "If this computer asks to use your keychain or keyring, allow it.",
+        "done": "Brought in sign-ins from {{name}}",
+        "count": "{{cookies}} cookies",
+        "countSkipped": "{{cookies}} cookies, {{skipped}} couldn't be read",
+        "keychain": "Couldn't unlock {{name}}'s sign-ins. Allow it when this computer asks for your password, or connect it with the desktop app so it can ask.",
+        "notKept": "The browser opened before sign-ins were kept. Try again once it closes.",
+        "lowMemory": "This computer is short on memory, so the browser can't open. Try again later.",
+        "notRunning": "The computer isn't running.",
+        "notFound": "{{name}} is no longer on this computer.",
+        "failed": "Couldn't bring in sign-ins.",
+        "listFailed": "Couldn't list the browsers on this computer."
+      }
     },
     "filesBackup": {
       "label": "Back up files",
@@ -2447,6 +2549,8 @@
     "attachmentsTooMany": "Not attached: attachments in one message cannot exceed {{max}} in total (including screenshots).",
     "contextPanel": {
       "trigger": "Context window, {{percent}} used",
+      "triggerDue": "Context window, {{percent}} used. Earlier messages will be summarized before your next one.",
+      "triggerDueUncounted": "Context window. Earlier messages will be summarized before your next one.",
       "title": "Context",
       "used": "{{used}} / {{threshold}} used ({{percent}})",
       "compactAt": "Compact at",
@@ -2512,6 +2616,10 @@
     "backToWorkflow": "Back to workflow",
     "backToMain": "Back to main",
     "scrollToTop": "Scroll to the top of the conversation",
+    "forkedFrom": "Forked from {{title}}",
+    "forkedFromDeleted": "Forked from a deleted chat",
+    "forkFailed": "Couldn't open a new chat from here. Try again.",
+    "forkTitle": "{{title}} (fork)",
     "reconnecting": "Reconnecting…",
     "offlineHistoryLoad": "You are offline, so this conversation could not be refreshed. It will catch up when your connection returns.",
     "jumpToLatest": {
@@ -2691,7 +2799,9 @@
       "reportIssue": "Report issue",
       "feedbackSubmitted": "Feedback submitted",
       "regenerate": "Regenerate response",
-      "retry": "Retry"
+      "retry": "Retry",
+      "forkFromHere": "Fork from here",
+      "editInNewChat": "Edit in new chat"
     },
     "turnFiles": {
       "open": "Open",
@@ -2716,7 +2826,7 @@
       "offline": "Not running",
       "private": "Private · only the owner can open it"
     },
-    "modelTroubleSuggestion": "{{from}} is having trouble — this answer came from {{to}}",
+    "modelTroubleSuggestion": "{{from}} is having trouble, so this answer came from {{to}}.",
     "switchToModel": "Switch to {{model}}",
     "switchToModelPaid": "Switch to {{model}} ({{payer}})",
     "threadSubagents": {
@@ -2729,6 +2839,8 @@
       "pickFailed": "Couldn't change this thread's model",
       "retired": "{{model}} is no longer available. This thread now uses {{fallback}}.",
       "lapsed": "Your {{account}} sign-in has expired. Reconnect it to use {{model}}.",
+      "notConnected": "Your {{account}} plan isn't connected. Connect it to use {{model}}, or pick another model.",
+      "connect": "Connect",
       "offer": "This thread uses {{model}}. New threads start on {{defaultModel}}.",
       "handoff": "OpenAI compacted part of this thread into a summary only its models can read. The previous model is writing it out for {{model}}, so your next message may take a little longer to start.",
       "brief": "Handing this thread's context to {{model}} so it can pick up where it left off. Your next message may take a little longer to start.",
@@ -2737,11 +2849,13 @@
     "backgroundTasksRunning": "Background tasks are still running",
     "taskReportBackPending": "Waiting for subagent results to report back",
     "tray": {
-      "tasks_one": "{{count}} task",
-      "tasks_other": "{{count}} tasks",
-      "tasksRunning_one": "{{count}} task · {{running}} running",
-      "tasksRunning_other": "{{count}} tasks · {{running}} running",
-      "tasksHeading": "From this thread",
+      "tasks_one": "{{count}} subagent",
+      "tasks_other": "{{count}} subagents",
+      "tasksRunning_one": "{{count}} subagent · {{running}} running",
+      "tasksRunning_other": "{{count}} subagents · {{running}} running",
+      "tasksHeading": "Subagents in this thread",
+      "commands_one": "{{count}} command",
+      "commands_other": "{{count}} commands",
       "commandsHeading": "Running in the background",
       "show": "Show this thread's work"
     },
@@ -2905,6 +3019,7 @@
       "finishedUnfinished": "Reported back, background work unfinished"
     },
     "marketWatch": {
+      "live": "Live",
       "watching": "Watching {{symbols}}",
       "chipTitle": "Live prices for the tickers the agent is watching",
       "chipTitleUpdated": "Live prices for watched tickers — updated {{time}}",
@@ -2931,12 +3046,18 @@
       "generic": "Price alert"
     },
     "wakeups": {
+      "chipShort_one": "{{time}}",
+      "chipShort_other": "{{count}} · {{time}}",
       "chip_one": "1 wakeup · {{time}}",
       "chip_other": "{{count}} wakeups · next {{time}}",
       "chipTitle": "Wakeups the agent set in this thread. Open to cancel any of them.",
       "panelTitle": "Wakeups",
       "panelEmpty": "No wakeups in this thread.",
       "cancel": "Cancel",
+      "distance": "last trade {{price}} · {{away}} to go",
+      "distanceToTarget": "goes off at {{target}} · last trade {{price}} · {{away}} to go",
+      "distanceReached": "last trade {{price}} · at its level",
+      "away": "{{away}} away",
       "cancelAll": "Cancel all",
       "cancelling": "Cancelling…",
       "cancelLabel": "Cancel the wakeup {{label}}",
@@ -3136,6 +3257,20 @@
       "taskCostUnmeasured": "Not measured at this level. Costs no more than the level above.",
       "taskCostHeader": "Cost per task",
       "taskCostNote": "A rough estimate of how a typical task's cost changes with effort, compared with the default level.",
+      "reasoning": "Reasoning",
+      "defaultLevel": "Default: {{level}}",
+      "nothingToTune": "Nothing to tune on this model",
+      "apiPrice": "API price per 1M tokens",
+      "apiPriceValue": "{{input}} in · {{output}} out",
+      "taskCostVsDefault": "About {{value}}× the default level's cost per task",
+      "taskCostVsDefaultAtMost": "At most {{value}}× the default level's cost per task",
+      "costMarksNote": "Roughly what a typical task costs on each model at its standard level, from $ to $$$$$. Hover the marks for the figure.",
+      "costMarksMeasuredAtLevel": "About {{value}}× {{model}} at {{level}}",
+      "costMarksMeasured": "About {{value}}× {{model}}",
+      "costMarksBoundAtLevel": "At most {{value}}× {{model}} at {{level}}. This model's default level was not measured, so this is an upper bound",
+      "costMarksBound": "At most {{value}}× {{model}}. This model's default level was not measured, so this is an upper bound",
+      "costMarksEstimate": "Estimated from the API price, not yet measured on tasks",
+      "costBaselineFallback": "the reference model",
       "claudeCodeRejected": "Claude refused your setup token. Add a new one in Settings to use this model",
       "claudeCodeNeedsOwnComputer": "Runs only on workspaces on your own computers",
       "claudeCodePolicyBlocked": "Your organization's Claude Code policy keeps it from running on this computer",
@@ -3283,6 +3418,9 @@
       "skipped": "Your next message will include the whole conversation, which costs more.",
       "undo": "Undo"
     },
+    "composerNotice": {
+      "notNow": "Not now"
+    },
     "claudeCode": {
       "off": {
         "account": "Claude Code is off for your account. Turn it on in Settings under Model access, or pick another model.",
@@ -3298,6 +3436,30 @@
         "needs_bigger_computer_plan": "Claude Code runs on Medium or larger cloud computers, and this workspace's computer is smaller. Change its spec or upgrade your {{brand}} plan, or choose to run Claude Code on your own computers in Settings under Model access.",
         "needs_bigger_computer_plan_home": "Claude Code runs on Medium or larger cloud computers, and Home's computer is smaller. Change its spec or upgrade your {{brand}} plan, or choose to run Claude Code on your own computers in Settings under Model access."
       }
+    },
+    "status": {
+      "openPanel": "Open Status",
+      "openPanelMore": "Open Status · {{count}} more",
+      "openInPanel": "Show in Status",
+      "needsYou": "Needs you",
+      "awaitingAnswer": "The agent is waiting for your answer",
+      "workingNow": "Working now",
+      "done": "Done",
+      "subagent": "Subagent",
+      "analyst": "Analyst",
+      "analystIn": "Analyst in {{workspace}}",
+      "subagentOfType": "{{type}} subagent"
+    },
+    "plan": {
+      "label": "Plan",
+      "heading": "Plan · {{progress}}",
+      "headingRunning": "step {{current}} of {{total}}",
+      "headingSettled": "{{done}} of {{total}} done",
+      "notDone": "not done",
+      "waiting": "waiting",
+      "stepDone": "done",
+      "stepRunning": "in progress",
+      "stepPending": "not started"
     }
   },
   "context": {
@@ -3421,6 +3583,13 @@
     "metaPages_one": "1 page",
     "metaPages_other": "{{count}} pages",
     "newTab": "New tab",
+    "emptyTab": "New tab",
+    "tabMenu": {
+      "close": "Close",
+      "closeOthers": "Close others",
+      "closeToRight": "Close to the right",
+      "closeAll": "Close all"
+    },
     "back": "Back",
     "forward": "Forward",
     "noFilesYet": "No files yet",
@@ -3453,7 +3622,12 @@
       "outdatedTitle": "This computer doesn't have the browser",
       "outdatedBody": "It was built before the browser shipped. A new computer has it.",
       "unavailableTitle": "No browser on this computer",
-      "unavailableBody": "The browser runs on cloud computers, and this is a machine you connected yourself.",
+      "unavailableBody": "The agent's browser can't run on this computer.",
+      "noChromeTitle": "No browser for the agent on this computer",
+      "noChromeBody": "The agent uses Chrome, Edge, Brave or Chromium if one is installed here. Install one, or get Chrome for Testing (about 300 MB), which only the agent uses.",
+      "getChrome": "Get Chrome for Testing",
+      "installingTitle": "Downloading Chrome for Testing",
+      "installingBody": "This takes a few minutes. The browser opens here once it's done.",
       "failedTitle": "The live view couldn't connect",
       "failedBody": "The browser may still be running on the computer.",
       "retry": "Try again",
@@ -3560,6 +3734,10 @@
       "too_large": "Too large to back up here. Move or split it.",
       "too_large_sized": "Too large to back up here ({{size}}). Move or split it.",
       "path_too_long": "Its path is too long to back up. Shorten its folder names.",
+      "bad_name": "Its name isn't valid text, so it can't be backed up. Rename it.",
+      "history_too_large": "Its Git history is too large to back up. The files are backed up; push the history to keep it.",
+      "history_too_large_sized": "Its Git history is too large to back up ({{size}}). The files are backed up; push the history to keep it.",
+      "history_held": "A file in its Git history couldn't be backed up this time, so the history keeps its last complete backup.",
       "changed": "Changed while saving. The next backup retries.",
       "unreadable": "Couldn't be read in the sandbox. Check its permissions.",
       "failed": "Didn't upload. The next backup retries."
@@ -4768,7 +4946,8 @@
         "stage": "Stage order",
         "unstage": "Remove staged order",
         "exercise": "Exercise option",
-        "cancelExercise": "Cancel exercise"
+        "cancelExercise": "Cancel exercise",
+        "watch": "Watch order"
       },
       "orderField": {
         "quantity": "Quantity",
@@ -4956,6 +5135,75 @@
     }
   },
   "setup": {
+    "computer": {
+      "title": "Where should your agent run?",
+      "localTitle": "This computer",
+      "localDesc": "No Docker or cloud account needed. The agent runs as you on this machine and can read and change your files.",
+      "localWarning": "Not isolated: anything the agent runs has the same access you do.",
+      "installTitle": "What to install",
+      "installHelp": "Installed on this machine the first time the agent starts here.",
+      "groupSize": "{{download}} download, {{disk}} on disk",
+      "installTotal": "With these: {{download}} to download, {{disk}} on disk.",
+      "required": "Required",
+      "groupCore": "Core",
+      "groupCoreDesc": "Python and the data libraries the agent always needs.",
+      "groupBrowsing": "Browsing",
+      "groupBrowsingDesc": "Reading web pages, scraping and video transcripts.",
+      "groupDocuments": "Documents",
+      "groupDocumentsDesc": "Reading and writing Word, PowerPoint, Excel and PDF files.",
+      "groupChromium": "Chromium",
+      "groupChromiumDesc": "A browser of the agent's own. Without it, the agent uses Chrome, Chromium, Edge or Brave if this machine has one.",
+      "dockerTitle": "Docker",
+      "dockerDesc": "Isolated in a container on this machine.",
+      "dockerFound": "Docker is running.",
+      "dockerMissing": "Docker isn't answering on this machine. Install it or start it, then check again.",
+      "dockerStillDown": "Docker still isn't answering. Install it or start it, then check again.",
+      "dockerCheck": "Check again",
+      "dockerInstall": "Install Docker",
+      "dockerNotOffered": "Not offered here: a container on this system can't reach the app's server. Pick another option.",
+      "cloudTitle": "Cloud VM",
+      "cloudDesc": "Isolated on Daytona or E2B, with your own key. Your files live with that vendor.",
+      "cloudReach": "Without a public address for this server, the file mount, connectors and the la CLI don't work.",
+      "cloudVendor": "Cloud vendor",
+      "cloudKey": "{{vendor}} API key",
+      "cloudKeyMissing": "Add a {{vendor}} API key to run there, or pick another option.",
+      "environment": "Set on the server: {{provider}}. Change it there."
+    },
+    "services": {
+      "marketData": "Market data",
+      "optional": "Optional",
+      "yahooTitle": "Yahoo Finance",
+      "yahooDesc": "Works with no key: prices, fundamentals, analyst data and screening.",
+      "fmpDesc": "Optional. Adds fundamentals and macro data. Has a free tier.",
+      "webSearch": "Web search",
+      "searchProvider": "Provider",
+      "searchNone": "Skip for now",
+      "searchProviderHasKey": "{{provider}} (key added)",
+      "searchKey": "{{provider}} API key",
+      "searchOff": "Web search stays off until a key is added.",
+      "fetchToggle": "Page reading",
+      "fetchDesc": "The built-in reader needs no key. Firecrawl can read pages in its place and adds site crawling."
+    },
+    "key": {
+      "getKey": "Get a key",
+      "testRefused": "The key was refused.",
+      "testPlan": "The key's plan has run out or does not include this.",
+      "testRateLimited": "Rate limited, so the key could not be checked yet.",
+      "testTimeout": "No answer within 10 seconds.",
+      "testUnreachable": "The vendor could not be reached.",
+      "testUnusable": "This is not a usable key.",
+      "testNone": "This key has no test.",
+      "testStatus": "The vendor answered with status {{status}}.",
+      "environment": "Set on the server, so it is read-only here.",
+      "replace": "Replace",
+      "remove": "Remove"
+    },
+    "errors": {
+      "noEncryptionKey": "Saving needs BYOK_ENCRYPTION_KEY set on the server.",
+      "saveFailed": "Could not save. Try again.",
+      "statusFailed": "Could not read this server's setup.",
+      "tryAgain": "Try again"
+    },
     "capabilities": "Capabilities",
     "brandedHeader": "Configure your LLM providers",
     "securityNote": "Your API keys are encrypted and never shared",
@@ -5176,10 +5424,12 @@
         "teamModels": "Team models",
         "cloud": "Cloud computer",
         "serverComputer": "This server's computer",
+        "thisComputer": "This computer",
         "own_computer": "Your computer"
       },
       "rail": {
         "use": "Your use",
+        "server": "Server",
         "computer": "Computer",
         "model": "Model",
         "default": "Default"
@@ -5198,11 +5448,17 @@
         "claudeCodeDesc": "Pro or Max. Claude Code runs on your plan, with {{brand}}'s tools.",
         "subscription": "Another subscription or an API key",
         "subscriptionDesc": "ChatGPT, Grok, a coding plan, or a key from any provider.",
+        "anyKey": "+ any API key",
         "serverModels": "Models this server provides",
         "serverModelsDesc": "The models your administrator set up.",
         "whereLabel": "Where should your tasks run?",
         "serverComputer": "On a computer this server runs",
         "serverComputerDesc": "Keeps working when your computer is off.",
+        "thisComputer": "On this computer",
+        "thisComputerDesc": "Runs while this computer is awake and {{brand}} is open.",
+        "hostedPitch": "Need it working while your computer is off? The hosted version runs it in the cloud, with nothing to set up.",
+        "hostedApp": "Get the hosted app",
+        "hostedCompare": "Hosted or self-hosted?",
         "homeStays": "Home stays on this Mac. Move it in Settings.",
         "own": "On your own computer",
         "ownDesc": "Your Mac, or any Mac or Linux computer over SSH.",
@@ -5376,6 +5632,11 @@
       "note": "Either way, the browser tab and this app show the same progress.",
       "inBrowser": "I'll finish in the browser",
       "here": "Continue here"
+    },
+    "server": {
+      "title": "Set up this server",
+      "helper": "Where it runs agent code, and the services its tools use. You answer this once for everyone on this server, and can change it later in Settings.",
+      "helperKeys": "The services its tools use. You answer this once for everyone on this server, and can change it later in Settings."
     }
   },
   "marketView": {
@@ -6384,7 +6645,8 @@
       "stage": "Stage",
       "unstage": "Unstage",
       "exercise": "Exercise",
-      "cancel_exercise": "Cancel exercise"
+      "cancel_exercise": "Cancel exercise",
+      "watch": "Watched"
     },
     "side": {
       "buy": "Buy",
@@ -8156,7 +8418,7 @@
         "changing": "It's changing to Medium now.",
         "ownInstead": "Or run Claude Code on your own computers: your Mac with Remote control, or a computer over SSH.",
         "row": "Claude Code runs on Medium or larger cloud computers.",
-        "rowResize": "Claude Code runs on Medium or larger. Changing it restarts it for a few minutes.",
+        "rowResize": "Changing it restarts it for a few minutes.",
         "rowPlan": "Claude Code runs on Medium or larger, and Medium isn't on your plan.",
         "rowResizing": "Changing to Medium. Claude Code runs here once it's done."
       },
@@ -9871,6 +10133,10 @@
       "submit": "Create",
       "creating": "Creating…",
       "teamHint": "Everyone in the team can open it, beside the people you list."
+    },
+    "memberContext": {
+      "label": "Members' own context",
+      "body": "On each member's own messages, the agent also uses their answer preferences and can read their personal memory. It never changes their memory. In a conversation shared with the workspace, everyone here sees what the agent writes."
     },
     "members": {
       "open": "People",

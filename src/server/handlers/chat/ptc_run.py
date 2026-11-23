@@ -26,7 +26,12 @@ from src.server.app import setup
 from src.server.database.conversation.threads_read import (
     read_thread_subagents_allowed,
 )
+from src.server.services.shared_workspaces.member_context import (
+    for_turn as member_context_for_turn,
+    replaced_turn_typed,
+)
 from src.server.services.shared_workspaces.turn import TurnIdentity
+from src.server.services.forks.carry import ForkTurnStart
 from src.server.database.workspace import update_workspace_activity
 from src.server.services.commands.mirror import mirror_computer
 from src.server.services.computer_disk import TURN_MEASURE_MIN_INTERVAL_SECONDS
@@ -73,6 +78,7 @@ from src.server.services.chat_attachment_turns import (
     resolve_turn_attachments,
 )
 from src.server.database.conversation.queries import set_run_query_metadata
+from src.server.database.conversation.senders import UNTYPED_KEY
 from src.server.utils.multimodal_context import (
     build_attachment_metadata,
     drop_gone_metadata,
@@ -82,6 +88,7 @@ from ptc_agent.agent.graph import build_ptc_graph_with_session
 from src.server.services.home_placement import HomeTurnStart
 from ptc_agent.agent.middleware.compaction.brief import BRIEF_CONFIG_KEY
 from ptc_agent.agent.middleware.credit_gate import run_with_credit_gate
+from ptc_agent.agent.transcript.sender import escape_unrecorded
 
 from .request_prep import (
     DISPATCH_STARTED_MARKER,
@@ -308,6 +315,7 @@ async def astream_ptc_workflow(
                 status_code=503,
                 detail="PTC Agent not initialized. Check server startup logs.",
             )
+        identity.refuse_other_roles(request)
 
         # =====================================================================
         # Admission gate
@@ -420,6 +428,9 @@ async def astream_ptc_workflow(
                     if dispatched or request.steer_only
                     else await ThreadMutationRunner.get_instance().holding_verb(thread_id)
                 )
+                # Who wrote this send, fixed now: the turn it opens and the steer
+                # it may become both name them by it.
+                written_by = await identity.message_sender(request)
                 # Admit a fresh turn, steer the running one, or 409 — see
                 # ``wait_or_steer``; who may steer at all is ``steer_allowed``.
                 # DALTON-HOOK(chat-large-upload): carry full ordered attachments and claim key on steers
@@ -442,6 +453,7 @@ async def astream_ptc_workflow(
                     ),
                     artifact_comments=request.artifact_comments,
                     shared=identity.shared,
+                    written_by=written_by,
                     checked_computer_id=request.checked_computer_id,
                     additional_context=(
                         None if request.hitl_response else request.additional_context
@@ -516,7 +528,10 @@ async def astream_ptc_workflow(
                         thread_id, prior.retried
                     )
                 disk_free_mb, disk_known = await read_disk_notice(runs_in)
-                user_profile = await identity.profile()
+                # Read once: the prompt states only what ``stated`` keeps, and a
+                # shared turn's member context reads the rest.
+                own_profile = await identity.own_profile()
+                user_profile = identity.stated(own_profile)
                 # DALTON-HOOK(i18n): a user with no saved users.locale gets the Dalton default (zh-CN), matching the web UI
                 from src.dalton.user_locale import with_default_locale
 
@@ -524,6 +539,7 @@ async def astream_ptc_workflow(
                 home = await HomeTurnStart.read(
                     user_id, route, retry=bool(request.retry_of_run_id)
                 )
+                fork_start = ForkTurnStart.read(prior_thread.fork, request, prior_thread.title)
                 turn_context = build_turn_context(
                     request,
                     prior_thread,
@@ -727,6 +743,14 @@ async def astream_ptc_workflow(
                             str(_fb_exec_id), conn=conn
                         )
 
+                # Before START, which writes an edited or regenerated turn's query
+                # row anew, without the origin that tells whether a person typed it.
+                replaced_typed = await replaced_turn_typed(identity, request, thread_id)
+                if replaced_typed is False:
+                    # A retry of this attempt reads the row START writes, not the
+                    # turn it replaced.
+                    query_metadata[UNTYPED_KEY] = True
+
                 run_handle = await begin_run(
                     request,
                     scope=scope,
@@ -929,6 +953,12 @@ async def astream_ptc_workflow(
         from src.server.services.thread_agent import AgentInputs
         from src.server.services.wakeups.cancel_notice import ThreadCancelNotices
 
+        # The member's own context, on a shared turn they typed where it may
+        # reach them.
+        member_context = await member_context_for_turn(
+            identity, request, written_by, own_profile,
+            thread_id=thread_id, replaced_typed=replaced_typed,
+        )
         # What shapes the prompt and the tools, read as a call between turns
         # reads it. Its project is resolved once and used three times: the
         # agent build mounts the workspace's memory off it, the post-turn
@@ -944,10 +974,23 @@ async def astream_ptc_workflow(
             user_profile=user_profile,
             workspace_owner_id=workspace_owner_id,
             acting_for=workspace_id,
+            member_context=member_context,
         )
         project = inputs.project
         # One relay session per directly bound server, held for the run.
         direct_mcp = inputs.direct_mcp
+        # A fork's first message: its scratchpad is seeded before the agent
+        # reads it, the fork is titled after it, and its row says so.
+        turn_context = await fork_start.begin(
+            turn_context,
+            sandbox=session.sandbox,
+            layout=session.sandbox.workspace(project) if session.sandbox and project else None,
+            scratchpad=config.feature_enabled("scratchpad"),
+            thread_id=thread_id,
+            user_id=user_id,
+            message=user_input,
+            timezone=request.timezone,
+        )
 
         # DALTON-HOOK(chat-large-upload): ensure retained chat uploads exist on disk for future turns
         if session and session.sandbox:
@@ -1098,7 +1141,9 @@ async def astream_ptc_workflow(
             # Structured HITL resume payload.
             # Pydantic validates this into HITLResponse models, but LangChain's
             # HumanInTheLoopMiddleware expects plain dicts (subscriptable).
-            resume_payload = serialize_hitl_response_map(request.hitl_response)
+            resume_payload = serialize_hitl_response_map(
+                request.hitl_response, escape=escape_unrecorded if identity.shared else None
+            )
             input_state = Command(
                 resume=resume_payload,
                 # None for a resume that was not credit-paused, which is what
@@ -1154,6 +1199,9 @@ async def astream_ptc_workflow(
                 build_chart_selection_reminder(chart_selections),
             ],
         )
+
+        if inline_target is not None and written_by is not None:
+            written_by.stamp(inline_target)
 
         # =====================================================================
         # Save user request to system thread directory (non-critical)

@@ -4,28 +4,47 @@
  * The 201 body below is the live one from `POST /api/v1/workspaces` on :8060,
  * which came back in 4.5ms already `running` because its computer was up.
  */
+import { useState } from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Mock } from 'vitest';
 import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { useLocation } from 'react-router';
+import { Route, Routes, useLocation, useNavigate } from 'react-router';
 
 import { renderWithProviders } from '@/test/utils';
+import { runAuthResets } from '@/lib/authResets';
 import { queryKeys } from '@/lib/queryKeys';
+import { FallbackComputersHost } from '@/components/CreateWorkspaceHost';
 
-vi.mock('../../hooks/computerPanelStore', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../hooks/computerPanelStore')>()),
-  openComputersPanel: vi.fn(),
+// DALTON-HOOK(settings-reorg): toggle isDaltonBuild and spy on openComputersPanel while preserving real store state
+const brandMock = vi.hoisted(() => ({ isDaltonBuild: false }));
+vi.mock('@/config/brand', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/config/brand')>()),
+  get isDaltonBuild() {
+    return brandMock.isDaltonBuild;
+  },
 }));
 
-vi.mock('../../utils/api', () => ({
-  getComputers: vi.fn(),
-  getComputerProviders: vi.fn(),
-  uploadWorkspaceFile: vi.fn(),
-  startWorkspace: vi.fn(),
-  formatApiErrorDetail: (err: unknown) =>
-    (err as { message?: string })?.message ?? 'Request failed',
-}));
+vi.mock('../../hooks/computerPanelStore', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../hooks/computerPanelStore')>();
+  return {
+    ...actual,
+    openComputersPanel: vi.fn(actual.openComputersPanel),
+  };
+});
+
+// DALTON-HOOK(settings-reorg): provide full Computers dialog API stubs so real FallbackComputersHost & ComputersDialogHost can render
+vi.mock('@/hooks/useUser', () => ({ useUser: () => ({ user: null, isLoading: false, isError: false }) }));
+
+vi.mock('../../utils/api', async () => {
+  const { computersApi } = await import('./computersDialogApi');
+  return {
+    ...(await computersApi()),
+    uploadWorkspaceFile: vi.fn(),
+    startWorkspace: vi.fn(),
+    setComputerSpec: vi.fn(),
+  };
+});
 
 // DALTON-HOOK(workspace-dedup): mock toast and useDaltonCoverageUnits gate for coverage registration UX
 vi.mock('@/components/ui/use-toast', () => ({
@@ -39,7 +58,12 @@ vi.mock('@/lib/dalton/coverage', async (importOriginal) => ({
 import { toast } from '@/components/ui/use-toast';
 import { useDaltonCoverageUnits } from '@/lib/dalton/coverage';
 import { getComputerProviders, getComputers, startWorkspace, uploadWorkspaceFile } from '../../utils/api';
-import { openComputersPanel } from '../../hooks/computerPanelStore';
+import {
+  closeComputersPanel,
+  computersHostMounted,
+  openComputersPanel,
+} from '../../hooks/computerPanelStore';
+import ComputersDialogHost from '../ComputersDialogHost';
 import CreateWorkspaceModal from '../CreateWorkspaceModal';
 
 const mockUpload = uploadWorkspaceFile as Mock;
@@ -87,6 +111,9 @@ const SECOND = machine(SECOND_ID, 'Second machine', { status: 'stopped' });
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // DALTON-HOOK(settings-reorg): reset brand flag, computer panel store, and outcome watch between tests
+  brandMock.isDaltonBuild = false;
+  runAuthResets();
   vi.mocked(startWorkspace).mockResolvedValue({ workspace_id: LIVE_CREATED.workspace_id, status: 'running' });
   mockGetComputers.mockResolvedValue({ computers: [PRIMARY], total: 1 });
   mockProviders.mockResolvedValue({ providers: [{ kind: 'daytona', is_default: true, allowed: null }] });
@@ -102,10 +129,17 @@ function Path() {
   return <span data-testid="path">{useLocation().pathname}</span>;
 }
 
-function setup(onCreate: Mock, onComplete = vi.fn(), onClose = vi.fn()) {
+function setup(
+  onCreate: Mock,
+  onComplete = vi.fn(),
+  onClose = vi.fn(),
+  options: { route?: string; withFallbackHost?: boolean } = {},
+) {
   const { queryClient } = renderWithProviders(
     <>
       <Path />
+      {/* DALTON-HOOK(settings-reorg): render real FallbackComputersHost when exercising Dalton in-place opening */}
+      {options.withFallbackHost && <FallbackComputersHost />}
       <CreateWorkspaceModal
         isOpen
         onClose={onClose}
@@ -113,6 +147,8 @@ function setup(onCreate: Mock, onComplete = vi.fn(), onClose = vi.fn()) {
         onComplete={onComplete}
       />
     </>,
+    // DALTON-HOOK(settings-reorg): pass initial route to verify in-place dialog does not leave the current page
+    options.route ? { route: options.route } : undefined,
   );
   return { onComplete, onClose, queryClient };
 }
@@ -434,6 +470,10 @@ describe('CreateWorkspaceModal, a computer still being prepared', () => {
   });
 
   it('offers to add a computer when the user has none and none is built for them', async () => {
+    // DALTON-HOOK(settings-reorg): Dalton hides Settings' Computers section, so
+    // clicking "Add a computer" mounts the real FallbackComputersHost in place
+    // on /dashboard and closing the dialog leaves the user on /dashboard.
+    brandMock.isDaltonBuild = true;
     const user = userEvent.setup();
     mockGetComputers.mockResolvedValue({ computers: [], total: 0 });
     const onCreate = vi.fn().mockRejectedValue(
@@ -444,7 +484,10 @@ describe('CreateWorkspaceModal, a computer still being prepared', () => {
         },
       }),
     );
-    const { onClose } = setup(onCreate);
+    const { onClose } = setup(onCreate, vi.fn(), vi.fn(), {
+      route: '/dashboard',
+      withFallbackHost: true,
+    });
 
     await user.type(screen.getByPlaceholderText(/name/i), 'First');
     await user.click(screen.getByRole('button', { name: /^create$/i }));
@@ -454,10 +497,143 @@ describe('CreateWorkspaceModal, a computer still being prepared', () => {
     expect(screen.queryByText('Add a computer first.')).not.toBeInTheDocument();
     await user.click(within(card).getByRole('button', { name: 'Add a computer' }));
     expect(onClose).toHaveBeenCalled();
+    // DALTON-HOOK(settings-reorg): assert real FallbackComputersHost opens and closes in place on /dashboard
     expect(openComputersPanel).toHaveBeenCalledWith({ view: 'create' });
-    // No page here shows the Computers dialog, so it opens on chat's now
-    // rather than unasked on whichever page shows one next.
+    const form = await screen.findByRole('dialog', { name: 'New computer' });
+    expect(screen.getByTestId('path')).toHaveTextContent('/dashboard');
+
+    await user.click(within(form).getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', { name: 'New computer' })).not.toBeInTheDocument();
+      expect(screen.queryByText('Computers', { selector: 'h3' })).not.toBeInTheDocument();
+    });
+    expect(screen.getByTestId('path')).toHaveTextContent('/dashboard');
+  });
+
+  // DALTON-HOOK(settings-reorg): navigating back from /dashboard to /chat while FallbackComputersHost holds an open dialog must yield to /chat's page host with only one dialog shown
+  it('yields FallbackComputersHost to the page host on browser back from dashboard to chat', async () => {
+    brandMock.isDaltonBuild = true;
+    const user = userEvent.setup();
+    mockGetComputers.mockResolvedValue({ computers: [], total: 0 });
+    const onCreate = vi.fn().mockRejectedValue(
+      Object.assign(new Error('Request failed with status code 409'), {
+        response: {
+          status: 409,
+          data: { detail: { code: 'needs_computer', message: 'Add a computer first.' } },
+        },
+      }),
+    );
+
+    let nav!: ReturnType<typeof useNavigate>;
+    function NavCapture() {
+      nav = useNavigate();
+      return null;
+    }
+    function DashboardPage() {
+      const [open, setOpen] = useState(true);
+      return (
+        <CreateWorkspaceModal
+          isOpen={open}
+          onClose={() => setOpen(false)}
+          onCreate={onCreate}
+          onComplete={vi.fn()}
+        />
+      );
+    }
+
+    renderWithProviders(
+      <>
+        <NavCapture />
+        <Path />
+        <Routes>
+          <Route path="/chat" element={<ComputersDialogHost />} />
+          <Route path="/dashboard" element={<DashboardPage />} />
+        </Routes>
+        <FallbackComputersHost />
+      </>,
+      { route: '/chat' },
+    );
+
     expect(screen.getByTestId('path')).toHaveTextContent('/chat');
+    act(() => {
+      nav('/dashboard');
+    });
+    expect(screen.getByTestId('path')).toHaveTextContent('/dashboard');
+
+    await user.type(screen.getByPlaceholderText(/name/i), 'First');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+    const card = await screen.findByRole('alert');
+    await user.click(within(card).getByRole('button', { name: 'Add a computer' }));
+
+    expect(await screen.findByRole('dialog', { name: 'New computer' })).toBeInTheDocument();
+    expect(screen.getByTestId('path')).toHaveTextContent('/dashboard');
+
+    // Simulate browser Back from /dashboard -> /chat: FallbackComputersHost yields to /chat's ComputersDialogHost.
+    act(() => {
+      nav(-1);
+    });
+    expect(screen.getByTestId('path')).toHaveTextContent('/chat');
+    await waitFor(() => {
+      expect(screen.getAllByRole('dialog', { name: 'New computer' })).toHaveLength(1);
+      expect(screen.getAllByText('Computers', { selector: 'h3' })).toHaveLength(1);
+    });
+  });
+
+  // DALTON-HOOK(settings-reorg): keep FallbackComputersHost mounted after closing the dialog until background preparation finishes and announces its toast
+  it('keeps FallbackComputersHost mounted on dashboard until background preparation finishes and toasts', async () => {
+    brandMock.isDaltonBuild = true;
+    const preparing = machine(PRIMARY_ID, 'Alpha Research', {
+      status: 'starting',
+      provider_ref: null,
+      is_primary: true,
+    });
+    const ready = machine(PRIMARY_ID, 'Alpha Research', {
+      status: 'running',
+      provider_ref: 'sandbox-ready-1',
+      is_primary: true,
+    });
+    mockGetComputers.mockResolvedValue({ computers: [preparing], total: 1 });
+
+    const { queryClient } = renderWithProviders(
+      <>
+        <Path />
+        <FallbackComputersHost />
+      </>,
+      { route: '/dashboard' },
+    );
+
+    act(() => openComputersPanel({ view: 'list' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Computers' });
+    expect(dialog).toBeInTheDocument();
+    // Wait for the initial computers list to load and ComputersDialogHost's outcome-watch effect
+    // to record the preparing machine before closing the dialog.
+    expect(await within(dialog).findByText('Alpha Research')).toBeInTheDocument();
+    await act(async () => {});
+
+    // Closing the dialog while preparation is still running must keep the fallback host mounted.
+    act(() => closeComputersPanel());
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', { name: 'Computers' })).not.toBeInTheDocument();
+    });
+    expect(computersHostMounted()).toBe(true);
+
+    // Once preparation settles to running, the fallback host announces the toast and then unmounts.
+    mockGetComputers.mockResolvedValue({ computers: [ready], total: 1 });
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.computers.lists() });
+    });
+
+    await waitFor(() => {
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: expect.stringContaining('Alpha Research'),
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(computersHostMounted()).toBe(false);
+    });
+    expect(screen.getByTestId('path')).toHaveTextContent('/dashboard');
   });
 
   it("offers the computer whose backup is off when that is why Home can't live anywhere", async () => {
@@ -484,7 +660,8 @@ describe('CreateWorkspaceModal, a computer still being prepared', () => {
     );
     await user.click(within(card).getByRole('button', { name: 'Open Office Mac' }));
     expect(onClose).toHaveBeenCalled();
-    expect(openComputersPanel).toHaveBeenCalledWith({ view: 'details', computerId: SECOND_ID });
+    expect(openComputersPanel).toHaveBeenCalledWith({ view: 'details', computerId: SECOND_ID, returnTo: 'settings' });
+    expect(screen.getByTestId('path')).toHaveTextContent('/settings');
   });
 });
 

@@ -16,7 +16,7 @@ external.
 from __future__ import annotations
 
 import logging
-from typing import Literal
+from typing import Any, Literal
 
 from src.dalton.company_identity import (
     COMPANY_SYSTEM_EMAIL,
@@ -50,7 +50,7 @@ def is_internal_tier(user_tier: str | None) -> bool:
     return (user_tier or "").strip().lower() in ("admin", "internal")
 
 
-async def get_user_tier(user_id: str | None) -> UserTier:
+async def get_user_tier(user_id: str | None, *, conn: Any = None) -> UserTier:
     """Resolve a user's access tier; never raises, never returns a wider tier on failure."""
     uid = str(user_id or "").strip()
     if not uid:
@@ -85,7 +85,7 @@ async def get_user_tier(user_id: str | None) -> UserTier:
     try:
         from src.server.database.user import get_user
 
-        user = await get_user(uid)
+        user = await get_user(uid, conn=conn) if conn is not None else await get_user(uid)
         email = str((user or {}).get("email") or "").strip().lower()
         if email and email in get_dalton_allowed_emails():
             return "internal"
@@ -98,7 +98,7 @@ async def get_user_tier(user_id: str | None) -> UserTier:
     return "external"
 
 
-async def is_internal_or_admin(user_id: str | None) -> bool:
+async def is_internal_or_admin(user_id: str | None, *, conn: Any = None) -> bool:
     """Return True when ``user_id`` resolves to ``admin`` or ``internal`` tier.
 
     Fails closed to ``external`` (``False``) on missing user_id or any error
@@ -108,7 +108,7 @@ async def is_internal_or_admin(user_id: str | None) -> bool:
     if not uid:
         return False
     try:
-        tier = await get_user_tier(uid)
+        tier = await get_user_tier(uid, conn=conn) if conn is not None else await get_user_tier(uid)
     except Exception as exc:
         logger.warning(
             "is_internal_or_admin tier check failed for user_id=%s (treated as external): %s",
@@ -119,7 +119,7 @@ async def is_internal_or_admin(user_id: str | None) -> bool:
     return tier in ("admin", "internal")
 
 
-async def classify_owner_tier(owner_id: str | None) -> OwnerTier:
+async def classify_owner_tier(owner_id: str | None, *, conn: Any = None) -> OwnerTier:
     """Strictly classify a *resource owner* for isolation decisions.
 
     ``get_user_tier`` fails closed to ``external`` — the safe answer for a
@@ -163,7 +163,7 @@ async def classify_owner_tier(owner_id: str | None) -> OwnerTier:
     try:
         from src.server.database.user import get_user
 
-        user = await get_user(uid)
+        user = await get_user(uid, conn=conn) if conn is not None else await get_user(uid)
         email = str((user or {}).get("email") or "").strip().lower()
         if not email:
             return "unknown"

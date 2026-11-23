@@ -127,8 +127,12 @@ export interface FeatureState {
   key: string;
   label: string;
   description: string;
-  /** Honest cost of opting in to an experimental feature, null when none. */
-  tradeoffs: string | null;
+  /** The Experiments group it is listed under; the web app names and orders them. */
+  category?: FeatureCategory | null;
+  /** Still changing: behavior and pricing may move under it. */
+  preview?: boolean;
+  /** What Experiments shows a user deciding whether to keep it. */
+  guide?: FeatureGuide | null;
   enabled: boolean;
   gate: 'none' | 'opt_in' | 'opt_out' | 'plan' | 'grant';
   min_tier: number | null;
@@ -138,6 +142,23 @@ export interface FeatureState {
   home?: 'model_access' | null;
   /** The account's organization decides it, so an override is refused. */
   set_by_organization?: boolean;
+  /** Features this one depends on: it is off wherever any of them is. */
+  requires?: string[];
+}
+
+export type FeatureCategory = 'chat' | 'tools' | 'autonomy' | 'long_threads' | 'dashboard';
+
+export interface FeatureGuide {
+  /** Finish "Turn it on if" / "Leave it off if" (or "Keep it on if" / "Turn
+   *  it off if" for an opt-out feature), so each starts in lower case. */
+  on_if: string;
+  off_if: string;
+  /** The price at a glance, set beside the default. */
+  cost: string | null;
+  /** What holds whichever way it is set. */
+  good_to_know: string | null;
+  /** What switching it loses, shown on the row beside its switch. */
+  caution: string | null;
 }
 
 // --- Workspace ---
@@ -365,6 +386,24 @@ export interface Computer {
   /** A remove waiting on Home's move off it (`home_to`), or how one ended
    *  without the computer going. */
   removal?: ComputerRemoval | null;
+  /** What its browser is set to. Absent from an older server. */
+  browser?: ComputerBrowser;
+}
+
+/** How sharply the computer's live browser view is drawn. */
+export type BrowserQuality = 'light' | 'standard' | 'sharp' | 'retina';
+
+/** What a computer's browser is set to, as its machine is handed it. */
+export interface ComputerBrowser {
+  /** Null follows the computer's size. */
+  quality: BrowserQuality | null;
+  /** Sites stay signed in between the browser's starts; never on a computer
+   *  holding shared workspaces. */
+  signins: boolean;
+  /** It also shows as a window on the Mac's screen. */
+  window: boolean;
+  /** The computer can show one: a Mac under remote control. */
+  window_available: boolean;
 }
 
 /** Why the server did not carry out what its owner asked of a computer, in its own sentence. */
@@ -834,8 +873,39 @@ export type ReportSource =
       chart_layers?: PublishedLayer[] | null;
     };
 
+/**
+ * Where a fork cuts its source: `through_turn` keeps the turn and its reply,
+ * `before_turn` stops short of it and hands the turn's message back as
+ * `prefill` for the user to send again.
+ */
+export type ThreadForkCut = 'through_turn' | 'before_turn';
+
+/** `metadata.fork` on a thread copied from another. */
+export interface ThreadForkOrigin {
+  kind: string;
+  /** The source thread. */
+  thread_id: string;
+  cut: ThreadForkCut;
+  turn_index: number;
+  /** The source's checkpoint the copy was cut at. */
+  checkpoint_id: string | null;
+  /** When the copy was made. */
+  at: string;
+  /** The title the fork was made with, which its first message retitles from; not the source's. */
+  title: string | null;
+  /** Finished subagent task runs carried over. */
+  tasks: number;
+  /** Whether the source's scratchpad was copied too. */
+  copy_scratchpad: boolean;
+  /** The user who made the fork. */
+  by: string;
+  /** Set once the fork's first turn carried its scratchpad and notice; absent on older rows. */
+  carried_at?: string | null;
+}
+
 export interface ThreadMetadata {
   origin?: ThreadOrigin;
+  fork?: ThreadForkOrigin;
   [key: string]: unknown;
 }
 
@@ -1036,7 +1106,15 @@ export interface WriteFileResponse {
   size: number;
 }
 
-export type UnsavedReason = 'too_large' | 'path_too_long' | 'unreadable' | 'changed' | 'failed';
+export type UnsavedReason =
+  | 'too_large'
+  | 'path_too_long'
+  | 'bad_name'
+  | 'unreadable'
+  | 'changed'
+  | 'failed'
+  | 'history_too_large'
+  | 'history_held';
 
 export interface UnsavedFile {
   path: string;

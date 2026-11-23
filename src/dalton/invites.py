@@ -80,10 +80,15 @@ def record_team_member_cached(
 async def _fetch_db_member_emails_live(
     *,
     cache: dict[str, float] | None = None,
+    conn: Any = None,
 ) -> set[str]:
     """Query `dalton_members` directly and populate positive cache entries for found emails."""
     try:
-        emails = await members_db.list_member_emails()
+        emails = (
+            await members_db.list_member_emails(conn=conn)
+            if conn is not None
+            else await members_db.list_member_emails()
+        )
     except RuntimeError as exc:
         if "pool is not open" in str(exc):
             return set()
@@ -116,6 +121,7 @@ async def is_team_member(
     *,
     bypass_cache: bool = False,
     cache: dict[str, float] | None = None,
+    conn: Any = None,
 ) -> bool:
     """Return True if `email` belongs to `DALTON_ALLOWED_EMAILS` or `dalton_members`.
 
@@ -137,7 +143,11 @@ async def is_team_member(
                 return True
             target_cache.pop(normalized, None)
 
-    db_emails = await _fetch_db_member_emails_live(cache=target_cache)
+    db_emails = (
+        await _fetch_db_member_emails_live(cache=target_cache, conn=conn)
+        if conn is not None
+        else await _fetch_db_member_emails_live(cache=target_cache)
+    )
     return normalized in db_emails
 
 
@@ -149,11 +159,15 @@ def is_invite_pm(user_id: str | None) -> bool:
     return uid in set(get_configured_pm_user_ids())
 
 
-async def get_user_tier(user_id: str | None) -> str:
+async def get_user_tier(user_id: str | None, *, conn: Any = None) -> str:
     """Return the caller's access tier (`admin`, `internal`, or `external`)."""
     from src.dalton.access_tiers import get_user_tier as _get_user_tier
 
-    return await _get_user_tier(user_id)
+    return (
+        await _get_user_tier(user_id, conn=conn)
+        if conn is not None
+        else await _get_user_tier(user_id)
+    )
 
 
 async def require_pm_for_invites(user_id: str | None) -> tuple[str, str]:

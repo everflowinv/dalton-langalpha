@@ -32,6 +32,7 @@ from src.llms.claude_code import another_model_replied_last, last_reply_index
 
 if TYPE_CHECKING:
     from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from ptc_agent.agent.tools.plan import PlanStepDict
     from ptc_agent.agent.transcript import Window
     from ptc_agent.agent.transcript.store import TranscriptTarget
 
@@ -206,14 +207,17 @@ async def digest_brief(
     transcript: TranscriptTarget | None,
     window: Window,
     notes_dir: str | None = None,
+    plan: Sequence[PlanStepDict] = (),
+    shared: bool = False,
 ) -> HandOffBrief | None:
     """The brief put together without a model, for a turn no model could
-    write one for: each request and the last reply to it
-    (``server_summary``), pointing at the transcript, which keeps the rest,
-    where the file tools reach it. None when no brief is due."""
+    write one for: each request and the last reply to it, and ``plan``, the
+    plan in state (``server_summary``), pointing at the transcript, which
+    keeps the rest, where the file tools reach it. None when no brief is due.
+    ``shared`` names each member there as a shared thread's calls do."""
     return await _rendered(
         messages, None, backend=backend, workspace_id=workspace_id, transcript=transcript,
-        window=window, notes_dir=notes_dir,
+        window=window, notes_dir=notes_dir, plan=plan, shared=shared,
     )
 
 
@@ -226,13 +230,14 @@ async def thread_brief(
     transcript: TranscriptTarget | None,
     window: Window,
     notes_dir: str | None = None,
+    shared: bool = False,
 ) -> HandOffBrief | None:
     """The thread itself as a brief, fitted to ``room`` tokens
     (``thread_summary``), for a turn that keeps one without its text
-    (``kept``). None when no brief is due."""
+    (``kept``). None when no brief is due. ``shared`` as ``digest_brief``."""
     return await _rendered(
         messages, room, backend=backend, workspace_id=workspace_id, transcript=transcript,
-        window=window, notes_dir=notes_dir,
+        window=window, notes_dir=notes_dir, shared=shared,
     )
 
 
@@ -245,6 +250,8 @@ async def _rendered(
     transcript: TranscriptTarget | None,
     window: Window,
     notes_dir: str | None,
+    plan: Sequence[PlanStepDict] = (),
+    shared: bool = False,
 ) -> HandOffBrief | None:
     from ptc_agent.agent.middleware.compaction.compact import build_summary_event
     from ptc_agent.agent.middleware.compaction.notes import anotes_pointer
@@ -261,9 +268,11 @@ async def _rendered(
     )
     turns = TranscriptTurns.of(exported, messages, window=window) if exported else None
     summary = (
-        thread_summary(to_summarize, turns=turns, limit=room, counter=count_tokens_claude)
+        thread_summary(to_summarize, turns=turns, limit=room, counter=count_tokens_claude, shared=shared)
         if room is not None
-        else server_summary(to_summarize, [], raw_messages=messages, turns=turns, window=window)
+        else server_summary(
+            to_summarize, raw_messages=messages, turns=turns, window=window, plan=plan, shared=shared
+        )
     )
     event = build_summary_event(
         summary,

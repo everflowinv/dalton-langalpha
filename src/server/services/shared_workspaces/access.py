@@ -269,7 +269,9 @@ async def workspace_access(
     )
 
 
-async def _dalton_external_outside(meta: dict[str, Any], caller: str) -> bool:
+async def _dalton_external_outside(
+    meta: dict[str, Any], caller: str, *, conn: Any = None
+) -> bool:
     """Under Dalton auth, whether an external member is asking about a thread
     that is not theirs in their own workspace: such a thread answers 404 like
     no thread, so its id says nothing (the rule ``require_thread_owner`` keeps)."""
@@ -279,7 +281,12 @@ async def _dalton_external_outside(meta: dict[str, Any], caller: str) -> bool:
         return False
     from src.dalton.sharing import get_user_tier
 
-    if await get_user_tier(caller) != "external":
+    tier = (
+        await get_user_tier(caller, conn=conn)
+        if conn is not None
+        else await get_user_tier(caller)
+    )
+    if tier != "external":
         return False
     if str(meta.get("user_id")) != str(caller):
         return True
@@ -293,6 +300,8 @@ async def thread_access(
     *,
     manage: bool = False,
     meta: Optional[dict[str, Any]] = None,
+    # DALTON-HOOK(colleague-dispatch): reuse caller's transaction connection when provided
+    conn: Any = None,
 ) -> Access:
     """:func:`workspace_access` for the workspace a thread is in, and in a
     shared workspace the thread's own rule: shared with the workspace, or
@@ -301,12 +310,20 @@ async def thread_access(
     not reach answers as no thread at all, so its id says nothing. ``meta``
     is a ``get_thread_auth_meta`` read the caller already holds."""
     if meta is None:
-        meta = await conversation_db.get_thread_auth_meta(thread_id)
+        meta = (
+            await conversation_db.get_thread_auth_meta(thread_id, conn=conn)
+            if conn is not None
+            else await conversation_db.get_thread_auth_meta(thread_id)
+        )
     if meta is None:
         raise _not_found("Thread")
     owner = meta["user_id"]
     # DALTON-HOOK(colleague-dispatch): external members never learn of foreign threads (404, not 403), as require_thread_owner
-    if await _dalton_external_outside(meta, caller):
+    if (
+        await _dalton_external_outside(meta, caller, conn=conn)
+        if conn is not None
+        else await _dalton_external_outside(meta, caller)
+    ):
         raise _not_found("Thread")
     if owner == caller:
         return Access(caller)

@@ -321,19 +321,21 @@ async def create_user_from_auth(
             return dict(result)
 
 
-async def get_user(user_id: str) -> Optional[Dict[str, Any]]:
+# DALTON-HOOK(colleague-dispatch): allow callers holding a transaction to reuse their connection
+async def get_user(user_id: str, *, conn: Any = None) -> Optional[Dict[str, Any]]:
     """
     Get user by ID.
 
     Args:
         user_id: User ID
+        conn: Optional existing DB connection to reuse within a transaction
 
     Returns:
         User dict or None if not found
     """
     # DALTON-HOOK(team-credentials): resolve credential status (has_api_key / has_oauth_token) from holder only
     cred_user_id = credential_user_id(user_id)
-    async with get_db_connection() as conn:
+    async with get_db_connection(conn) as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             if cred_user_id != user_id:
                 await cur.execute("""

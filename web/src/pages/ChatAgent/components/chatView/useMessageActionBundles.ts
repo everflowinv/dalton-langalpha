@@ -53,6 +53,7 @@ export interface MessageActionSources {
   onEditMessage: (messageId: string, content: string, modelOptions?: ModelOptions) => unknown;
   onRegenerate: (messageId: string, modelOptions?: ModelOptions) => unknown;
   onRetry: (modelOptions?: ModelOptions) => unknown;
+  onForkFromTurn: Action<'onForkFromTurn'>;
   /** Created once by the session, so already identity-stable. */
   editDrafts: EditDraftStore;
   onSendMessage: (text: string) => unknown;
@@ -109,6 +110,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
       src.chatInputRef.current?.getRetryModelOptions?.()
       ?? src.chatInputRef.current?.getModelOptions?.(),
     ));
+  const stableForkFromTurn = useStableHandler(src.onForkFromTurn);
   const editDrafts = src.editDrafts;
   // Feedback handlers close over the stored ratings, so their raw identity
   // churns on every load/submit; wrap them or a single thumbs click would
@@ -166,6 +168,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
           onEditMessage: stableEditMessage,
           onRegenerate: stableRegenerate,
           onRetry: stableRetry,
+          onForkFromTurn: stableForkFromTurn,
           editDrafts,
           onThumbUp: stableThumbUp,
           onThumbDown: stableThumbDown,
@@ -181,7 +184,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
     stableRejectCreateWorkspace, stableApproveStartQuestion, stableRejectStartQuestion,
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
     stableRejectSecretaryAction, stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
-    stableEditMessage, stableRegenerate, stableRetry, editDrafts,
+    stableEditMessage, stableRegenerate, stableRetry, stableForkFromTurn, editDrafts,
     stableThumbUp, stableThumbDown, stableThumbDownFollowUp, stableSendMessage, publishAllowed, src.reportThreadId, src.feedbackLoading, // DALTON-HOOK(external-share-guard)
   ]);
 

@@ -13,6 +13,8 @@ import type { useTranslation } from 'react-i18next';
 
 import type { Computer, ComputerStatus } from '@/types/api';
 
+import { providerManagesSpec } from '../components/providerUi';
+
 type Translate = ReturnType<typeof useTranslation>['t'];
 
 /** How a status is drawn. `live` is the only one that animates. */
@@ -145,17 +147,6 @@ export function takesWorkspaces(computer: Pick<Computer, 'status' | 'provider_re
 }
 
 /**
- * Whether the computer has a browser the panel can show. A machine the user
- * brings over SSH runs none of ours, so it has no Browser tab, no quality
- * setting and no "Open in agent browser". A member of a `shared` workspace is
- * not sent its computer, but a shared workspace only ever runs on one of the
- * deployment's own computers, which all have one.
- */
-export function hasBrowser(computer: Pick<Computer, 'kind'> | null | undefined, shared = false): boolean {
-  return computer ? computer.kind !== 'ssh' : shared;
-}
-
-/**
  * A machine the user brought whose tunnel is down: asleep or offline, so
  * nothing can be laid on it, Home included, until it connects again.
  */
@@ -221,10 +212,11 @@ export function prepareStepLabel(
   const index = stage == null ? 0 : prepareStageIndex(stage);
   if (index < 0) return null;
   const step = PREPARE_STAGES[index];
-  // A machine the user brings has no sandbox made for it: its first step
-  // lays out the folder and installs the runtime there.
+  // A whole machine (one the user brings, or the server's own) has no
+  // sandbox made for it: its first step lays out the folder and installs the
+  // runtime there.
   const label =
-    kind === 'ssh' && step.stage === 'sandbox'
+    kind != null && !providerManagesSpec(kind) && step.stage === 'sandbox'
       ? t('computer.prepare.runtime', 'Installing the runtime')
       : t(step.labelKey, step.fallback);
   return t('computer.prepare.step', '{{step}} ({{index}} of {{total}})', {

@@ -3,10 +3,9 @@ import { useIsMutating, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/components/ui/use-toast';
 import { isModelAvailable, resolveComposerModel } from '@/components/ui/chat-input.models'; // DALTON-HOOK(ui-model-pick)
-import type { SubscriptionProvider } from '@/api/oauth';
 import type { Thread } from '@/types/api';
 import { useAllModels } from '@/hooks/useAllModels';
-import { useLapsedSignIn } from '@/hooks/useLapsedSignIn';
+import { useLapsedSignIn, type SignInGap } from '@/hooks/useLapsedSignIn';
 // DALTON-HOOK(antigravity-series): inspect series membership & resolve thread write permissions before issuing PATCH (Dalton builds only)
 import { isDaltonBuild } from '@/config/brand';
 import { useThreadWriteAccess } from '@/lib/dalton/useThreadWriteAccess';
@@ -36,10 +35,9 @@ export interface RetiredModel {
   fallback: string;
 }
 
-/** The composer's model, on a subscription whose sign-in has to be renewed. */
-export interface LapsedSignIn {
+/** The composer's model, on a subscription whose sign-in cannot run it. */
+export interface LapsedSignIn extends SignInGap {
   model: string;
-  provider: SubscriptionProvider;
 }
 
 /** The account's Default, a Claude Code model a Chief of Staff turn cannot
@@ -850,6 +848,8 @@ export function useThreadModel({
     setOffered(null);
     if (liveThreadId) userSessionStorage.setItem(OFFER_DISMISSED_PREFIX + liveThreadId, '1');
   }, [liveThreadId]);
+  // Running out answers nothing, so the next pick on the thread offers again.
+  const expireOffer = useCallback(() => setOffered(null), []);
 
   // Named only once there is a default to name beside it, and never when the
   // default is the retired model too: the row would promise a move that the
@@ -857,8 +857,8 @@ export function useThreadModel({
   const retired: RetiredModel | null = retiredName && startsOn && retiredName !== startsOn
     ? { model: retiredName, fallback: startsOn }
     : null;
-  const lapsedProvider = lapsedOf(model);
-  const lapsed: LapsedSignIn | null = model && lapsedProvider ? { model, provider: lapsedProvider } : null;
+  const gap = lapsedOf(model);
+  const lapsed: LapsedSignIn | null = model && gap ? { model, ...gap } : null;
   const offer: DefaultModelOffer | null = offered && offered === model && defaultModel && offered !== defaultModel
     ? { model: offered, defaultModel }
     : null;
@@ -879,5 +879,5 @@ export function useThreadModel({
   const sendModelSeq = nextManualPick !== null && nextManualPick.model === model ? nextManualPick.seq : null;
 
   // DALTON-HOOK(colleague-dispatch): expose thread detail record so ChatView can inspect thread_user_id / dispatched_by
-  return { model, sendModel, sendModelSeq, retired, lapsed, offer, heldDefault, pickModel, dismissOffer, thread };
+  return { model, sendModel, sendModelSeq, retired, lapsed, offer, heldDefault, pickModel, dismissOffer, expireOffer, thread };
 }

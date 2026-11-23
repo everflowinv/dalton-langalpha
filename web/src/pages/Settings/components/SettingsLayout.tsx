@@ -20,6 +20,7 @@ export function SettingsGroup({
 }: {
   // DALTON-HOOK(settings-section): a settings hash, including personal channel bindings, scrolls to this group
   // DALTON-HOOK(settings-reorg): allow cards wrapped in SettingsGroup to pass data-testid directly
+  /** The search's anchor, for a group whose rows come and go. */
   id?: string;
   title?: string;
   description?: ReactNode;
@@ -52,6 +53,7 @@ export function SettingsGroup({
 
 export function SettingRow({
   id,
+  className,
   label,
   description,
   labelId,
@@ -62,6 +64,8 @@ export function SettingRow({
 }: {
   /** The anchor the settings search jumps to. */
   id?: string;
+  /** For what the row's place in its list asks of it, such as an indent. */
+  className?: string;
   label: ReactNode;
   description?: ReactNode;
   /** Names the control by the row's label, for a group or switch. */
@@ -75,7 +79,7 @@ export function SettingRow({
   children?: ReactNode;
 }) {
   return (
-    <div id={id} className={cn('settings-row', wide && 'is-wide', inline && 'is-inline')}>
+    <div id={id} className={cn('settings-row', wide && 'is-wide', inline && 'is-inline', className)}>
       <div className="settings-row-text">
         {htmlFor ? (
           <label htmlFor={htmlFor} id={labelId} className="settings-row-label">{label}</label>

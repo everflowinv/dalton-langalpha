@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 from uuid import uuid4
 
 from ptc_agent.core.sandbox.providers import (
+    MACHINE_KINDS,
     PROVIDER_KINDS,
     builds_computers,
     provider_class,
@@ -60,7 +61,7 @@ from src.server.database.workspace import (
 )
 from src.server.models.computer import CLAIMABLE_FOR_START, ComputerStatus
 from src.server.services.computer_start_failure import record_start_failure
-from src.server.services import activity, browser_quality
+from src.server.services import activity, browser_settings
 from src.server.services.activity import Action
 from src.server.services.account import refuse_machine_use
 from src.server.services.computer_usage.events import note_start_path
@@ -179,6 +180,12 @@ class MachineLifecycleMixin:
             settings = self._provider_settings(kind, provider_config)
             if resource_tier is not None and resource_tier not in settings.resource_tiers:
                 raise UnknownResourceTier("Unknown resource tier")
+
+        async def roots_of_kind() -> list[str]:
+            computers = await get_computers_for_user(user_id)
+            return [str(c.get("root_dir")) for c in computers if c.get("kind") == kind]
+
+        root_dir = root_dir or await provider_class(kind).default_root_dir(roots_of_kind)
 
         async def insert(chosen: str) -> Dict[str, Any]:
             return await create_computer(
@@ -831,9 +838,9 @@ class MachineLifecycleMixin:
                     origin_workspace_id=computer.get("origin_workspace_id"),
                 ),
             )
-            # A bare start syncs no project, so the quality is handed here
-            # rather than left to the next project sync.
-            await self._keep_browser_quality(binding, session.sandbox)
+            # A bare start syncs no project, so the browser settings are
+            # handed here rather than left to the next project sync.
+            await self._keep_browser_settings(binding, session.sandbox)
 
             restored_projects: list[ComputerBinding] = []
             if not reconnected:
@@ -910,15 +917,11 @@ class MachineLifecycleMixin:
                 )
 
             self._put_session(computer_id, session)
-            # A quality saved while the machine was starting found it not yet
-            # running and was left for the start, which handed its own older
-            # row above; the row it published is the current one.
-            await self._keep_browser_quality(
-                replace(
-                    binding,
-                    browser_quality=browser_quality.chosen(published),
-                    browser_quality_rev=browser_quality.revision(published),
-                ),
+            # A browser setting saved while the machine was starting found it
+            # not yet running and was left for the start, which handed its own
+            # older row above; the row it published is the current one.
+            await self._keep_browser_settings(
+                replace(binding, browser=browser_settings.read(published)),
                 session.sandbox,
             )
             # Each restore above cleared its completeness flag for a sandbox
@@ -1029,14 +1032,14 @@ class MachineLifecycleMixin:
             )
 
     def _read_machine_facts_soon(self, computer_id: str, kind: str, runtime: Any) -> None:
-        """Read what a machine the user brings says of itself (its system and
-        hardware) and keep it for its details. Off the start's path, since only
+        """Read what a whole machine (``MACHINE_KINDS``) says of itself (its
+        system and hardware) and keep it for its details. Off the start's path, since only
         the Computers dialog reads it; a failure keeps the last reading."""
         from ptc_agent.core.sandbox.providers.ssh import MACHINE_FACTS_SCRIPT, read_machine
         from src.server.database.computer import record_machine_facts
-        from src.server.services.ssh_computers import SSH_KIND, machine_config
+        from src.server.services.ssh_computers import machine_config
 
-        if kind != SSH_KIND:
+        if kind not in MACHINE_KINDS:
             return
 
         async def read() -> None:
@@ -1094,6 +1097,11 @@ class MachineLifecycleMixin:
             elif status == ComputerStatus.RUNNING:
                 live = self._machine_session_if_live(computer)
                 if live is not None:
+                    # As every acquire does, so a save that did not reach the
+                    # machine is handed here; free once it has them.
+                    await self._keep_browser_settings(
+                        self._binding_from_computer("", computer), live.sandbox
+                    )
                     return live
                 # A running row with no local handle needs a reconnect, which
                 # _build_machine_session re-CASes from 'running'.
@@ -1261,8 +1269,10 @@ class MachineLifecycleMixin:
             return computer
         return await get_computer(computer_id)
 
-    async def stop_computer(self, computer_id: str) -> Optional[Dict[str, Any]]:
-        return await self._stop_machine(computer_id)
+    async def stop_computer(
+        self, computer_id: str, *, back_up: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        return await self._stop_machine(computer_id, back_up=back_up)
 
     async def archive_computer(self, computer_id: str) -> Optional[Dict[str, Any]]:
         return await self._archive_machine(computer_id)

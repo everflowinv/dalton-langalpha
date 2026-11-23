@@ -157,8 +157,9 @@ must render the same at both levels.
   would become prompt text about itself. The keys of
   `STRUCTURED_PREFERENCES["agent_preference"]`
   (`src/server/models/profile_vocabulary.py`) are the knobs that may:
-  `render_user_profile` hands the template each one whose value is in its
-  vocabulary as `agent_steering`, which selects the main agent's paragraphs
+  `answer_preferences` (`middleware/runtime_context/profile.py`) hands the
+  template each one whose value is in its vocabulary as `preferences.steering`,
+  which selects the main agent's paragraphs
   (the `output_format` ranking one ordered list of formats),
   and prints the rest. A subagent gets none of the paragraphs, and
   `research_depth` is worded for the role, because the Chief of Staff's
@@ -183,7 +184,11 @@ must render the same at both levels.
   Subagents are bound no order tools, so their copy of the profile drops it.
   Beside it, `trading_asks_on` names the brokerages (by server) whose switch
   still asks at a level that skips approval, so the rule does not tell the
-  model those orders go straight out.
+  model those orders go straight out, and `trading_order_skill` (set in
+  `agent.py` from the user's skill switch, not from this turn's bound tools)
+  adds the one pointer to the order-execution skill. It rides this block
+  rather than the static prompt so a thread pinned before the user connected
+  a brokerage still gets it, as a row.
 - **The static prompt excludes every per-request value.** The clock, the user's
   identity, the surface this turn is running on, and anything that changes
   between turns are rendered from `templates/envelope/` and appended after the

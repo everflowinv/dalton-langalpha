@@ -827,6 +827,7 @@ BACKGROUND_LOOP_REGISTRY: Mapping[str, CapabilityId | None] = MappingProxyType(
         "NewsRefreshService": CORE_CAPABILITY,
         "ProvenanceGCService": CORE_CAPABILITY,
         "WorkspaceFileGCService": CORE_CAPABILITY,
+        "SetupSettings": CORE_CAPABILITY,
     }
 )
 

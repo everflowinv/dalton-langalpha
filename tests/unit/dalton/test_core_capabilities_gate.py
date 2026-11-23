@@ -936,6 +936,7 @@ def _scan_setup_py_background_loops_full() -> list[tuple[int, str]]:
         "insight_service_inst": "InsightService",
         "news_refresh": "NewsRefreshService",
         "provenance_gc": "ProvenanceGCService",
+        "setup_settings": "SetupSettings",
     }
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
