@@ -802,6 +802,21 @@
     ],
     "workflow_child_timeout": 1800
   },
+  "insight_surface": {
+    "matches_default_prompt": true,
+    "system_prompt": "You research financial markets for a market brief. Use WebSearch for news and current events, WebFetch to read a page in full, and the market-data and SEC tools for prices, company data and filings. Report only what your sources support.",
+    "tools": [
+      "WebFetch",
+      "WebSearch",
+      "get_company_overview",
+      "get_daily_prices",
+      "get_market_overview",
+      "get_options_chain",
+      "get_quote",
+      "get_sec_filing",
+      "screen_stocks"
+    ]
+  },
   "main_tools_analyst": [
     "AskUserQuestion",
     "Bash",
@@ -832,6 +847,7 @@
     "dalton_report_delivery",
     "dalton_schedule_automation",
     "dalton_system_jobs",
+    "direct_market_note",
     "feishu_append",
     "feishu_create_doc",
     "feishu_grant_access",
@@ -900,6 +916,7 @@
     "dalton_system_jobs",
     "dalton_watch_event",
     "delegate_to_analyst",
+    "direct_market_note",
     "feishu_append",
     "feishu_create_doc",
     "feishu_grant_access",
