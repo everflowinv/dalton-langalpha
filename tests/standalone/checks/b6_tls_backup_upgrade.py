@@ -29,14 +29,21 @@ Verifies on a running Standalone Core (`auth: oss`) stack:
      produces AES-256 encrypted `env.enc` with PBKDF2 params recorded in `manifest.json`;
      `--retain` prunes older backups cleanly.
 4. `scripts/standalone/restore.sh` restores onto a brand-new empty stack AND
-   exercises `--replace-data`:
-   - Decrypts `env.enc` into `.env` (mode 0600), restores DB, MinIO objects, and Caddy CA.
+   exercises the switch-bucket-name design (`--replace-data`, failure atomicity, rollback):
+   - Decrypts `env.enc` into `.env` (mode 0600), restores objects into a brand-new
+     `<bucket>-r<YYYYmmddHHMMSS>` bucket, updates `.env` bucket variables at the
+     single commit point, restores DB and Caddy CA.
    - Non-empty guard without `--replace-data` fails with `--replace-data` hint while
      the live restored instance continues serving HTTPS 200.
    - Table row counts, sentinel thread row, real SSE `/messages/replay` assistant text,
      sentinel MinIO object SHA-256 & `ContentType`, and Caddy CA fingerprint all match.
-   - Running `--replace-data` after mutating DB + uploading a stray MinIO object restores
-     the exact backup state, removes the stray object, and preserves `<db>_pre_restore_<ts>`.
+   - Simulated mid-restore failure (failing `migrate`) leaves `.env`, database name/data,
+     and the original MinIO bucket completely unchanged (and cleans up temp resources).
+   - Running `--replace-data` switches the app to a new `<bucket>-r<ts>` bucket for both
+     reads and writes while leaving the original bucket's object count and contents
+     untouched, and preserves `.env.pre-restore-<ts>` and `<db>_pre_restore_<ts>`.
+   - Rolling back `.env` and database name restores access to all pre-restore data and
+     the original bucket.
 5. `scripts/standalone/upgrade.sh` performs a same-version rolling upgrade from a
    release tarball: backs up with the old `backup.sh`, tags `pre-upgrade-<ts>` images,
    snapshots `.upgrade-backup/<ts>/`, replaces services, converges with `up -d`, and
@@ -118,12 +125,13 @@ def _https_request(
     context: ssl.SSLContext,
     headers: dict[str, str] | None = None,
     json_body: Any = None,
+    data: bytes | None = None,
     timeout: float = 30.0,
 ) -> _lib.HttpResponse:
     req_headers: dict[str, str] = {"Host": f"{server_hostname}:{port}"}
     if headers:
         req_headers.update(headers)
-    payload: bytes | None = None
+    payload: bytes | None = data
     if json_body is not None:
         payload = json.dumps(json_body, ensure_ascii=False).encode("utf-8")
         if not any(k.lower() == "content-type" for k in req_headers):
@@ -354,6 +362,7 @@ def check_init_tls_modes(ctx: _lib.ComposeContext) -> None:
                 "DALTON_CADDY_HOST": "[::1]",
                 "DALTON_EDGE_HTTP_PORT": "18080",
                 "DALTON_EDGE_HTTPS_PORT": "18443",
+                "COMPOSE_FILE": "docker-compose.yml:docker-compose.core.yml:deploy/standalone/docker-compose.tls.ipv6.yml",
                 "PUBLIC_APP_URL": "https://[::1]:18443",
             },
         ),
@@ -503,6 +512,11 @@ def check_loopback_ports_caddy_adapt_and_custom_tls(ctx: _lib.ComposeContext) ->
             assert ":18443" in proc.stdout, (
                 "Loopback auto mode HTTP->HTTPS redirect must include host port :18443"
             )
+        if domain == "[::1]" and https_port == "18443":
+            assert (
+                "[{http.regexp.ipv6_host.1}]:18443" in proc.stdout
+                or "[{re.ipv6_host.1}]:18443" in proc.stdout
+            ), f"IPv6 HTTP->HTTPS redirect must preserve brackets around IPv6 host: {proc.stdout[-800:]}"
     log("2b OK (`caddy adapt` passed for loopback, internal, IPv6 internal, auto, loopback auto :18443, and custom).")
 
     # 2c. Start `custom` mode once with an ephemeral self-signed certificate and complete strict handshake
@@ -938,7 +952,7 @@ def _count_minio_objects(
     bucket: str | None = None,
 ) -> int:
     script = (
-        "import os, re, boto3\n"
+        "import os, boto3\n"
         "from botocore.config import Config\n"
         "def _e(*ks, d=''):\n"
         "    for k in ks:\n"
@@ -951,16 +965,13 @@ def _count_minio_objects(
         "region_name=_e('DALTON_CHAT_UPLOAD_STORAGE_REGION', d='us-east-1'), "
         "config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}))\n"
         f"target_bucket = {bucket!r}\n"
-        "skip_re = re.compile(r'-(?:pre-)?restore-\\d{14}$')\n"
+        "if target_bucket is None:\n"
+        "    target_bucket = _e('DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME', 'STORAGE_BUCKET_NAME', d='chat-uploads')\n"
         "total = 0\n"
-        "for b in c.list_buckets().get('Buckets', []):\n"
-        "    name = b['Name']\n"
-        "    if target_bucket is not None:\n"
-        "        if name != target_bucket: continue\n"
-        "    elif skip_re.search(name):\n"
-        "        continue\n"
-        "    for page in c.get_paginator('list_objects_v2').paginate(Bucket=name):\n"
-        "        total += len(page.get('Contents', []))\n"
+        "for page in c.get_paginator('list_objects_v2').paginate(Bucket=target_bucket):\n"
+        "    for entry in page.get('Contents', []):\n"
+        "        if entry['Key'] != '.dalton-restore.json':\n"
+        "            total += 1\n"
         "print(total)\n"
     )
     proc = subprocess.run(
@@ -973,6 +984,166 @@ def _count_minio_objects(
         timeout=60,
     )
     return int(proc.stdout.strip().splitlines()[-1])
+
+
+def _snapshot_bucket_objects(
+    compose_cmd: list[str],
+    cwd: Path,
+    bucket: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> dict[str, tuple[int, str, str]]:
+    """Return ``{key: (size, sha256, content_type)}`` for every user object in ``bucket``."""
+    script = (
+        "import hashlib, json, os, boto3\n"
+        "from botocore.config import Config\n"
+        "def _e(*ks, d=''):\n"
+        "    for k in ks:\n"
+        "        v = (os.getenv(k) or '').strip()\n"
+        "        if v: return v\n"
+        "    return d\n"
+        "c = boto3.client('s3', endpoint_url=_e('DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL', d='http://minio:9000'), "
+        "aws_access_key_id=_e('DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID', 'MINIO_ROOT_USER'), "
+        "aws_secret_access_key=_e('DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY', 'MINIO_ROOT_PASSWORD'), "
+        "region_name=_e('DALTON_CHAT_UPLOAD_STORAGE_REGION', d='us-east-1'), "
+        "config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}))\n"
+        f"bucket = {bucket!r}\n"
+        "out = {}\n"
+        "for page in c.get_paginator('list_objects_v2').paginate(Bucket=bucket):\n"
+        "    for entry in page.get('Contents', []):\n"
+        "        key = entry['Key']\n"
+        "        if key == '.dalton-restore.json':\n"
+        "            continue\n"
+        "        resp = c.get_object(Bucket=bucket, Key=key)\n"
+        "        h = hashlib.sha256()\n"
+        "        sz = 0\n"
+        "        for ch in resp['Body'].iter_chunks(chunk_size=1024 * 1024):\n"
+        "            if ch:\n"
+        "                h.update(ch)\n"
+        "                sz += len(ch)\n"
+        "        resp['Body'].close()\n"
+        "        out[key] = [sz, h.hexdigest(), resp.get('ContentType') or '']\n"
+        "print(json.dumps(out))\n"
+    )
+    proc = subprocess.run(
+        [*compose_cmd, "exec", "-T", "backend", "uv", "run", "--no-sync", "python", "-c", script],
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    raw = json.loads(proc.stdout.strip().splitlines()[-1])
+    return {k: (int(v[0]), str(v[1]), str(v[2])) for k, v in raw.items()}
+
+
+def _backend_active_bucket(
+    compose_cmd: list[str],
+    cwd: Path,
+    *,
+    env: dict[str, str] | None = None,
+) -> str:
+    proc = subprocess.run(
+        [
+            *compose_cmd,
+            "exec",
+            "-T",
+            "backend",
+            "uv",
+            "run",
+            "--no-sync",
+            "python",
+            "-c",
+            "import os; print(os.getenv('DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME', ''))",
+        ],
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return proc.stdout.strip().splitlines()[-1]
+
+
+def _list_databases(
+    compose_cmd: list[str],
+    cwd: Path,
+    db_user: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> list[str]:
+    proc = subprocess.run(
+        [
+            *compose_cmd,
+            "exec",
+            "-T",
+            "postgres",
+            "psql",
+            "-U",
+            db_user,
+            "-d",
+            "template1",
+            "-Atqc",
+            "SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY datname;",
+        ],
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _https_upload_chat_file(
+    server_hostname: str,
+    port: int,
+    ssl_ctx: ssl.SSLContext,
+    workspace_id: str,
+    filename: str,
+    payload: bytes,
+) -> tuple[str, str]:
+    """Upload a file via the live HTTPS chat-uploads API; return ``(upload_id, sha256)``."""
+    payload_sha = hashlib.sha256(payload).hexdigest()
+    init_resp = _https_request(
+        "POST",
+        server_hostname,
+        port,
+        "/api/v1/dalton/chat-uploads",
+        context=ssl_ctx,
+        json_body={
+            "workspace_id": workspace_id,
+            "filename": filename,
+            "size_bytes": len(payload),
+            "mime_type": "text/plain",
+            "sha256": payload_sha,
+        },
+    )
+    assert init_resp.status == 200, f"HTTPS init upload failed: {init_resp.status} {init_resp.text}"
+    upload_id = init_resp.json()["upload_id"]
+    part_resp = _https_request(
+        "PUT",
+        server_hostname,
+        port,
+        f"/api/v1/dalton/chat-uploads/{upload_id}/parts/1",
+        context=ssl_ctx,
+        headers={"Content-Type": "text/plain", "X-Part-Sha256": payload_sha},
+        data=payload,
+    )
+    assert part_resp.status == 200, f"HTTPS upload part failed: {part_resp.status} {part_resp.text}"
+    comp_resp = _https_request(
+        "POST",
+        server_hostname,
+        port,
+        f"/api/v1/dalton/chat-uploads/{upload_id}/complete",
+        context=ssl_ctx,
+        json_body={"sha256": payload_sha},
+    )
+    assert comp_resp.status == 200, f"HTTPS complete upload failed: {comp_resp.status} {comp_resp.text}"
+    return upload_id, payload_sha
 
 
 def _list_minio_buckets(
@@ -1047,40 +1218,6 @@ def _fetch_minio_object_sha_and_ct(
     )
     payload = json.loads(proc.stdout.strip().splitlines()[-1])
     return str(payload["sha256"]), str(payload["content_type"])
-
-
-def _put_stray_minio_object(
-    compose_cmd: list[str],
-    cwd: Path,
-    bucket: str,
-    key: str,
-    *,
-    env: dict[str, str] | None = None,
-) -> None:
-    script = (
-        "import os, boto3\n"
-        "from botocore.config import Config\n"
-        "def _e(*ks, d=''):\n"
-        "    for k in ks:\n"
-        "        v = (os.getenv(k) or '').strip()\n"
-        "        if v: return v\n"
-        "    return d\n"
-        "c = boto3.client('s3', endpoint_url=_e('DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL', d='http://minio:9000'), "
-        "aws_access_key_id=_e('DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID', 'MINIO_ROOT_USER'), "
-        "aws_secret_access_key=_e('DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY', 'MINIO_ROOT_PASSWORD'), "
-        "region_name=_e('DALTON_CHAT_UPLOAD_STORAGE_REGION', d='us-east-1'), "
-        "config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}))\n"
-        f"c.put_object(Bucket={bucket!r}, Key={key!r}, Body=b'stray-object-to-prune', ContentType='text/plain')\n"
-    )
-    subprocess.run(
-        [*compose_cmd, "exec", "-T", "backend", "uv", "run", "--no-sync", "python", "-c", script],
-        cwd=str(cwd),
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=60,
-    )
 
 
 def check_backup_script(
@@ -1331,6 +1468,13 @@ def check_restore_on_clean_stack(
             assert (restored_env_file.stat().st_mode & 0o777) == 0o600, (
                 f"Restored .env permissions should be 0600, got {oct(restored_env_file.stat().st_mode & 0o777)}"
             )
+            bucket_r1 = _lib.load_env_file(restored_env_file).get("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME", "")
+            assert bucket_r1.startswith(f"{sentinel['bucket']}-r"), (
+                f"Expected restore.sh to switch DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME to <bucket>-r<ts>, got {bucket_r1!r}"
+            )
+            assert _backend_active_bucket(restore_compose_cmd, restore_dir, env=restore_env) == bucket_r1, (
+                f"Running backend bucket does not match restored .env ({bucket_r1!r})"
+            )
 
             # Confirm the restored postgres container is distinct from the source stack
             orig_pg_cid = _container_id(ctx, "postgres")
@@ -1391,7 +1535,7 @@ def check_restore_on_clean_stack(
                     timeout=120,
                 )
                 assert guard_proc.returncode != 0, (
-                    "restore.sh MUST refuse to overwrite a non-empty database without --replace-data!"
+                    "restore.sh MUST refuse to replace a non-empty database without --replace-data!"
                 )
                 guard_output = (guard_proc.stdout or "") + "\n" + (guard_proc.stderr or "")
                 assert "--replace-data" in guard_output, (
@@ -1455,17 +1599,17 @@ def check_restore_on_clean_stack(
                     f"  expected={sentinel['replay_text']!r}\n  got={restored_replay_text!r}"
                 )
 
-                # 5d. Verify MinIO object count AND fetch sentinel object by SHA-256 + ContentType
+                # 5d. Verify new active bucket object count AND sentinel object SHA-256 + ContentType
                 restored_minio_count = _count_minio_objects(
-                    restore_compose_cmd, restore_dir, env=restore_env
+                    restore_compose_cmd, restore_dir, env=restore_env, bucket=bucket_r1
                 )
                 assert restored_minio_count == orig_minio_count, (
-                    f"Restored MinIO object count mismatch: {restored_minio_count} != {orig_minio_count}"
+                    f"Restored MinIO object count mismatch in {bucket_r1!r}: {restored_minio_count} != {orig_minio_count}"
                 )
                 got_sha, got_ct = _fetch_minio_object_sha_and_ct(
                     restore_compose_cmd,
                     restore_dir,
-                    sentinel["bucket"],
+                    bucket_r1,
                     sentinel["object_key"],
                     env=restore_env,
                 )
@@ -1476,25 +1620,128 @@ def check_restore_on_clean_stack(
                     f"Sentinel object ContentType not preserved: got {got_ct!r}, expected 'text/plain'"
                 )
 
-                # 5e. Mutate DB + add stray MinIO object, then exercise `--replace-data`
+                # 5e. Mutate live state (new workspace + real chat upload into bucket_r1), then
+                #     simulate mid-restore failure (migration failure) and verify .env, DB name/data,
+                #     and original bucket_r1 are ALL completely unchanged.
                 extra_ws = _https_request(
                     "POST",
                     "localhost",
                     restore_https_port,
                     "/api/v1/workspaces",
                     context=ssl_ctx,
-                    json_body={"name": "b6-extra-to-overwrite"},
+                    json_body={"name": "b6-pre-replace-ws"},
                 )
                 assert extra_ws.status == 201, f"Failed to create extra workspace: {extra_ws.status}"
-                _put_stray_minio_object(
-                    restore_compose_cmd,
-                    restore_dir,
-                    sentinel["bucket"],
-                    "chat-uploads/b6-stray-to-prune.txt",
-                    env=restore_env,
+                extra_ws_id = extra_ws.json()["workspace_id"]
+                pre_replace_payload = b"DALTON_B6_PRE_REPLACE_ORIGINAL_UPLOAD\n" * 64
+                pre_upload_id, pre_upload_sha = _https_upload_chat_file(
+                    "localhost",
+                    restore_https_port,
+                    ssl_ctx,
+                    extra_ws_id,
+                    "b6_pre_replace_upload.txt",
+                    pre_replace_payload,
                 )
-                assert _count_minio_objects(restore_compose_cmd, restore_dir, env=restore_env) == orig_minio_count + 1
+                pre_upload_key = subprocess.check_output(
+                    [
+                        *restore_compose_cmd,
+                        "exec",
+                        "-T",
+                        "postgres",
+                        "psql",
+                        "-U",
+                        ctx.db_user,
+                        "-d",
+                        ctx.db_name,
+                        "-Atqc",
+                        f"SELECT object_key FROM dalton_chat_file_uploads WHERE upload_id = '{pre_upload_id}';",
+                    ],
+                    cwd=str(restore_dir),
+                    env=restore_env,
+                    text=True,
+                    timeout=30,
+                ).strip()
+                assert pre_upload_key, "Failed to resolve object_key for pre-replace upload"
 
+                env_before_fail = restored_env_file.read_bytes()
+                dbs_before_fail = _list_databases(
+                    restore_compose_cmd, restore_dir, ctx.db_user, env=restore_env
+                )
+                counts_before_fail = _snapshot_table_counts(
+                    restore_compose_cmd, restore_dir, ctx.db_user, ctx.db_name, env=restore_env
+                )
+                buckets_before_fail = _list_minio_buckets(
+                    restore_compose_cmd, restore_dir, env=restore_env
+                )
+                bucket_r1_snapshot = _snapshot_bucket_objects(
+                    restore_compose_cmd, restore_dir, bucket_r1, env=restore_env
+                )
+                assert pre_upload_key in bucket_r1_snapshot, (
+                    f"Pre-replace upload {pre_upload_key!r} not found in active bucket {bucket_r1!r}"
+                )
+                assert len(bucket_r1_snapshot) == orig_minio_count + 1
+
+                fail_migrate_yml = restore_dir / "docker-compose.fail-migrate.yml"
+                fail_migrate_yml.write_text(
+                    "services:\n"
+                    "  migrate:\n"
+                    "    command: !override [\"bash\", \"-c\", \"echo '[migrate] simulated mid-restore failure' >&2; exit 42\"]\n",
+                    encoding="utf-8",
+                )
+                try:
+                    fail_proc = _run_cmd(
+                        [
+                            "bash",
+                            str(restore_dir / "scripts" / "standalone" / "restore.sh"),
+                            "--backup-dir",
+                            str(backup_dir),
+                            "--work-dir",
+                            str(restore_dir),
+                            "--compose-files",
+                            f"{restore_compose_files}:{fail_migrate_yml}",
+                            "--replace-data",
+                            "--skip-edge-build",
+                        ],
+                        cwd=restore_dir,
+                        env=restore_env,
+                        check=False,
+                        redact_env=ctx.env,
+                        timeout=300,
+                    )
+                    assert fail_proc.returncode != 0, "Expected simulated migration failure to abort restore.sh!"
+                finally:
+                    fail_migrate_yml.unlink(missing_ok=True)
+
+                assert restored_env_file.read_bytes() == env_before_fail, (
+                    "Mid-restore failure MUST NOT modify .env!"
+                )
+                assert not list(restore_dir.glob(".env.pre-restore-*")), (
+                    "Mid-restore failure before commit should not leave .env.pre-restore-* behind!"
+                )
+                assert (
+                    _list_databases(restore_compose_cmd, restore_dir, ctx.db_user, env=restore_env)
+                    == dbs_before_fail
+                ), "Mid-restore failure MUST NOT change DB names or leave staging DBs behind!"
+                assert (
+                    _snapshot_table_counts(
+                        restore_compose_cmd, restore_dir, ctx.db_user, ctx.db_name, env=restore_env
+                    )
+                    == counts_before_fail
+                ), "Mid-restore failure MUST NOT alter live DB contents!"
+                assert (
+                    _snapshot_bucket_objects(restore_compose_cmd, restore_dir, bucket_r1, env=restore_env)
+                    == bucket_r1_snapshot
+                ), "Mid-restore failure MUST NOT alter original MinIO bucket!"
+                assert (
+                    _list_minio_buckets(restore_compose_cmd, restore_dir, env=restore_env)
+                    == buckets_before_fail
+                ), "Mid-restore failure MUST clean up temporary restore bucket(s)!"
+                log("5e OK (mid-restore migration failure left .env, DB names/data, and original bucket untouched).")
+
+                # 5f. Real `--replace-data`: switches app to a new bucket <bucket>-r<ts2>,
+                #     leaves original bucket_r1 object count & contents completely untouched,
+                #     and preserves .env.pre-restore-<ts> + <db>_pre_restore_<ts>.
+                time.sleep(1.1)
                 _run_cmd(
                     [
                         "bash",
@@ -1513,30 +1760,120 @@ def check_restore_on_clean_stack(
                     redact_env=ctx.env,
                     timeout=360,
                 )
+                _wait_for_https_ready(
+                    "localhost", restore_https_port, "/api/v1/auth/cli", context=ssl_ctx, timeout=90.0
+                )
+
+                bucket_r2 = _lib.load_env_file(restored_env_file).get("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME", "")
+                assert bucket_r2.startswith(f"{sentinel['bucket']}-r") and bucket_r2 != bucket_r1, (
+                    f"Expected --replace-data to switch to a fresh bucket, got {bucket_r2!r} (prev {bucket_r1!r})"
+                )
+                assert _backend_active_bucket(restore_compose_cmd, restore_dir, env=restore_env) == bucket_r2, (
+                    f"Running backend did not switch to new bucket {bucket_r2!r}"
+                )
+
+                pre_env_backups = sorted(restore_dir.glob(".env.pre-restore-*"))
+                assert len(pre_env_backups) == 1, f"Expected 1 .env.pre-restore-* file, got {pre_env_backups}"
+                assert (pre_env_backups[0].stat().st_mode & 0o777) == 0o600
+                assert pre_env_backups[0].read_bytes() == env_before_fail, (
+                    ".env.pre-restore-* content does not match pre-restore .env!"
+                )
+
                 post_replace_counts = _snapshot_table_counts(
                     restore_compose_cmd, restore_dir, ctx.db_user, ctx.db_name, env=restore_env
                 )
                 assert post_replace_counts == orig_counts, (
                     f"--replace-data DB counts mismatch: {post_replace_counts} != {orig_counts}"
                 )
-                post_replace_minio = _count_minio_objects(
-                    restore_compose_cmd, restore_dir, env=restore_env
-                )
-                assert post_replace_minio == orig_minio_count, (
-                    f"--replace-data did not reconcile stray MinIO object: {post_replace_minio} != {orig_minio_count}"
-                )
+                assert (
+                    _count_minio_objects(restore_compose_cmd, restore_dir, env=restore_env, bucket=bucket_r2)
+                    == orig_minio_count
+                ), f"New bucket {bucket_r2!r} object count mismatch"
                 got_sha_2, got_ct_2 = _fetch_minio_object_sha_and_ct(
                     restore_compose_cmd,
                     restore_dir,
-                    sentinel["bucket"],
+                    bucket_r2,
                     sentinel["object_key"],
                     env=restore_env,
                 )
                 assert got_sha_2 == sentinel["payload_sha"] and got_ct_2 == "text/plain"
 
-                # Confirm pre-restore database AND pre-restore MinIO bucket were preserved,
-                # and no temporary staging bucket remains
-                pre_dbs = subprocess.check_output(
+                # Verify app writes go to NEW bucket_r2 and original bucket_r1 stays untouched
+                post_write_payload = b"DALTON_B6_POST_RESTORE_WRITE_TO_NEW_BUCKET\n" * 32
+                post_upload_id, post_upload_sha = _https_upload_chat_file(
+                    "localhost",
+                    restore_https_port,
+                    ssl_ctx,
+                    sentinel["workspace_id"],
+                    "b6_post_restore_new_bucket.txt",
+                    post_write_payload,
+                )
+                post_upload_key = subprocess.check_output(
+                    [
+                        *restore_compose_cmd,
+                        "exec",
+                        "-T",
+                        "postgres",
+                        "psql",
+                        "-U",
+                        ctx.db_user,
+                        "-d",
+                        ctx.db_name,
+                        "-Atqc",
+                        f"SELECT object_key FROM dalton_chat_file_uploads WHERE upload_id = '{post_upload_id}';",
+                    ],
+                    cwd=str(restore_dir),
+                    env=restore_env,
+                    text=True,
+                    timeout=30,
+                ).strip()
+                got_new_sha, _got_new_ct = _fetch_minio_object_sha_and_ct(
+                    restore_compose_cmd, restore_dir, bucket_r2, post_upload_key, env=restore_env
+                )
+                assert got_new_sha == post_upload_sha, (
+                    f"Post-restore write did not land in new bucket {bucket_r2!r}!"
+                )
+                assert (
+                    _snapshot_bucket_objects(restore_compose_cmd, restore_dir, bucket_r1, env=restore_env)
+                    == bucket_r1_snapshot
+                ), f"Original bucket {bucket_r1!r} object count or contents changed after restore!"
+
+                pre_dbs = [
+                    d
+                    for d in _list_databases(restore_compose_cmd, restore_dir, ctx.db_user, env=restore_env)
+                    if "_pre_restore_" in d
+                ]
+                assert len(pre_dbs) == 1, f"Expected 1 preserved <db>_pre_restore_<ts>, got {pre_dbs}"
+                pre_db_name = pre_dbs[0]
+                log(
+                    f"5f OK (--replace-data switched app to new bucket {bucket_r2!r}; "
+                    f"original bucket {bucket_r1!r} untouched; preserved DB {pre_db_name!r})."
+                )
+
+                # 5g. Rollback: restore .env.pre-restore-* and rename <db>_pre_restore_<ts> back,
+                #     restart, and verify original data & original bucket_r1 are readable again.
+                _run_cmd(
+                    [*restore_compose_cmd, "stop", "backend", "crawler", "edge"],
+                    cwd=restore_dir,
+                    env=restore_env,
+                    redact_env=ctx.env,
+                    timeout=120,
+                )
+                shutil.copy2(pre_env_backups[0], restored_env_file)
+                os.chmod(restored_env_file, 0o600)
+                rollback_sql = (
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    f"WHERE datname IN ('{ctx.db_name}', '{pre_db_name}') AND pid <> pg_backend_pid();\n"
+                    "DO $$ BEGIN FOR i IN 1..30 LOOP "
+                    "EXIT WHEN NOT EXISTS (SELECT 1 FROM pg_stat_activity "
+                    f"WHERE datname IN ('{ctx.db_name}', '{pre_db_name}') AND pid <> pg_backend_pid()); "
+                    "PERFORM pg_sleep(0.1); END LOOP; END $$;\n"
+                    "BEGIN;\n"
+                    f'ALTER DATABASE "{ctx.db_name}" RENAME TO "{ctx.db_name}_abandoned_rollback";\n'
+                    f'ALTER DATABASE "{pre_db_name}" RENAME TO "{ctx.db_name}";\n'
+                    "COMMIT;\n"
+                )
+                subprocess.run(
                     [
                         *restore_compose_cmd,
                         "exec",
@@ -1547,31 +1884,71 @@ def check_restore_on_clean_stack(
                         ctx.db_user,
                         "-d",
                         "template1",
+                        "-v",
+                        "ON_ERROR_STOP=1",
+                    ],
+                    input=rollback_sql,
+                    cwd=str(restore_dir),
+                    env=restore_env,
+                    text=True,
+                    check=True,
+                    timeout=60,
+                )
+                _run_cmd(
+                    [*restore_compose_cmd, "up", "-d"],
+                    cwd=restore_dir,
+                    env=restore_env,
+                    redact_env=ctx.env,
+                    timeout=180,
+                )
+                _wait_for_https_ready(
+                    "localhost", restore_https_port, "/api/v1/auth/cli", context=ssl_ctx, timeout=90.0
+                )
+
+                assert _backend_active_bucket(restore_compose_cmd, restore_dir, env=restore_env) == bucket_r1, (
+                    f"Rollback did not switch backend back to original bucket {bucket_r1!r}"
+                )
+                rb_ws_resp = _https_request(
+                    "GET", "localhost", restore_https_port, "/api/v1/workspaces", context=ssl_ctx
+                )
+                assert rb_ws_resp.status == 200
+                rb_ws_payload = rb_ws_resp.json()
+                rb_ws_list = (
+                    rb_ws_payload if isinstance(rb_ws_payload, list) else rb_ws_payload.get("workspaces", [])
+                )
+                rb_ws_ids = {w.get("workspace_id") for w in rb_ws_list if isinstance(w, dict)}
+                assert extra_ws_id in rb_ws_ids, (
+                    f"Rollback missing pre-restore workspace {extra_ws_id!r}: {rb_ws_ids}"
+                )
+                rb_upload_key = subprocess.check_output(
+                    [
+                        *restore_compose_cmd,
+                        "exec",
+                        "-T",
+                        "postgres",
+                        "psql",
+                        "-U",
+                        ctx.db_user,
+                        "-d",
+                        ctx.db_name,
                         "-Atqc",
-                        "SELECT datname FROM pg_database WHERE datname LIKE '%_pre_restore_%';",
+                        f"SELECT object_key FROM dalton_chat_file_uploads WHERE upload_id = '{pre_upload_id}';",
                     ],
                     cwd=str(restore_dir),
                     env=restore_env,
                     text=True,
                     timeout=30,
                 ).strip()
-                assert pre_dbs, "Expected --replace-data to preserve original DB as <db>_pre_restore_<ts>"
-
-                all_buckets = _list_minio_buckets(restore_compose_cmd, restore_dir, env=restore_env)
-                pre_buckets = [b for b in all_buckets if "-pre-restore-" in b]
-                temp_buckets = [b for b in all_buckets if "-restore-" in b and "-pre-restore-" not in b]
-                assert pre_buckets, (
-                    f"Expected --replace-data to preserve original MinIO bucket as <bucket>-pre-restore-<ts>, got {all_buckets}"
+                assert rb_upload_key == pre_upload_key, (
+                    f"Rollback missing pre-restore upload record {pre_upload_id!r}"
                 )
-                assert not temp_buckets, (
-                    f"Temporary MinIO staging bucket(s) should be removed after switchover, got {temp_buckets}"
+                rb_sha, rb_ct = _fetch_minio_object_sha_and_ct(
+                    restore_compose_cmd, restore_dir, bucket_r1, rb_upload_key, env=restore_env
                 )
-                pre_bucket_count = _count_minio_objects(
-                    restore_compose_cmd, restore_dir, env=restore_env, bucket=pre_buckets[0]
+                assert rb_sha == pre_upload_sha and rb_ct == "text/plain", (
+                    f"Rollback pre-restore upload object mismatch: {(rb_sha, rb_ct)!r}"
                 )
-                assert pre_bucket_count == orig_minio_count + 1, (
-                    f"Expected preserved pre-restore bucket {pre_buckets[0]!r} to contain {orig_minio_count + 1} objects, got {pre_bucket_count}"
-                )
+                log("5g OK (rollback restored .env + original DB and confirmed original workspace & bucket data).")
             finally:
                 restored_ca_path.unlink(missing_ok=True)
         finally:
@@ -1585,8 +1962,8 @@ def check_restore_on_clean_stack(
             )
 
     log(
-        f"5/6 OK (clean-stack restore matched {len(orig_counts)} tables, real replay text, "
-        f"sentinel SHA-256 + ContentType, Caddy CA, non-empty guard, and --replace-data swap & reconciliation)."
+        f"5/6 OK (switch-bucket restore verified: clean restore, mid-restore failure atomicity, "
+        f"new-bucket read/write with untouched original bucket, and full rollback)."
     )
 
 

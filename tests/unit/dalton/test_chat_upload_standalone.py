@@ -1443,8 +1443,10 @@ class TestSandboxNetworkAndInitScript:
             assert "0.0.0.0" not in env_bind_text
             assert "Rewrote DALTON_EDGE_TLS_BIND" in res_bind.stderr
 
-        # 6. IPv6 loopback (--domain ::1 --tls-mode internal) binds to [::1] and passes [::1] to Caddy
+        # 6. IPv6 loopback (--domain ::1 --tls-mode internal) selects docker-compose.tls.ipv6.yml and passes [::1] to Caddy
         inst_v6_tls, init_v6_tls = self._stage_init_install(tmp_path, "inst-v6-internal")
+        (inst_v6_tls / ".env").write_text("DALTON_TRUSTED_PROXIES=10.0.0.0/8\n", encoding="utf-8")
+        (inst_v6_tls / ".env").chmod(0o600)
         subprocess.run(
             [
                 "bash",
@@ -1465,13 +1467,24 @@ class TestSandboxNetworkAndInitScript:
         v6_env_text = (inst_v6_tls / ".env").read_text(encoding="utf-8")
         assert "DALTON_EDGE_TLS_BIND=[::1]\n" in v6_env_text
         assert "DALTON_CADDY_HOST=[::1]\n" in v6_env_text
+        assert "COMPOSE_FILE=docker-compose.yml:docker-compose.core.yml:deploy/standalone/docker-compose.tls.ipv6.yml\n" in v6_env_text
         assert "PUBLIC_APP_URL=https://[::1]:18443\n" in v6_env_text
+        assert "DALTON_TRUSTED_PROXIES=" not in v6_env_text
 
-        # 7. auto.caddy imports dalton_http_redirect; docker-compose.tls.yml defaults bind to 127.0.0.1
+        # 7. Hardcoded loopback binds (no bind env interpolation before Batch 4b) & IPv6 redirect preserves brackets
         auto_caddy = (REPO_ROOT / "deploy/standalone/modes/auto.caddy").read_text(encoding="utf-8")
         assert "import dalton_http_redirect" in auto_caddy
+        caddyfile = (REPO_ROOT / "deploy/standalone/Caddyfile").read_text(encoding="utf-8")
+        assert "vars_regexp ipv6_host {http.request.host}" in caddyfile
+        assert "https://[{re.ipv6_host.1}]" in caddyfile
         tls_compose = (REPO_ROOT / "deploy/standalone/docker-compose.tls.yml").read_text(encoding="utf-8")
-        assert "${DALTON_EDGE_TLS_BIND:-127.0.0.1}" in tls_compose
+        assert '"127.0.0.1:${DALTON_EDGE_HTTP_PORT:-18080}:80"' in tls_compose
+        assert '"127.0.0.1:${DALTON_EDGE_HTTPS_PORT:-18443}:443"' in tls_compose
+        assert "DALTON_EDGE_TLS_BIND" not in tls_compose
+        tls_ipv6_compose = (REPO_ROOT / "deploy/standalone/docker-compose.tls.ipv6.yml").read_text(encoding="utf-8")
+        assert '"[::1]:${DALTON_EDGE_HTTP_PORT:-18080}:80"' in tls_ipv6_compose
+        assert '"[::1]:${DALTON_EDGE_HTTPS_PORT:-18443}:443"' in tls_ipv6_compose
+        assert "DALTON_EDGE_TLS_BIND" not in tls_ipv6_compose
 
         # 8. Standalone images are pinned by digest
         edge_df = (REPO_ROOT / "deploy/standalone/Dockerfile.edge").read_text(encoding="utf-8")
@@ -1814,27 +1827,95 @@ class TestSandboxNetworkAndInitScript:
         assert "NEW_RELEASE_BACKUP_INVOKED" in res_first_upg.stderr
         assert "Do NOT run restore.sh --replace-data" in res_first_upg.stderr
 
-        # restore.sh DeleteObjects response error check fails when S3 returns partial Errors,
-        # AND every embedded Python block inside restore.sh compiles cleanly.
+        # restore.sh switch-bucket-name design, single commit point, project-based lock,
+        # checked DeleteObjects in failure cleanup, and embedded Python compilation.
+        import hashlib as _hashlib
         import re as _re
+        from botocore.exceptions import ClientError
 
         restore_text = (REPO_ROOT / "scripts/standalone/restore.sh").read_text(encoding="utf-8")
+        assert "read_env_var()" not in restore_text, "restore.sh must read .env files strictly via read_env_file_var"
         assert 'resp.get("Errors")' in restore_text
         assert "ALTER DATABASE" in restore_text and "BEGIN;" in restore_text and "COMMIT;" in restore_text
-        assert "-restore-" in restore_text and "-pre-restore-" in restore_text
+        assert "${XDG_RUNTIME_DIR:-/tmp}/dalton-${LOCK_PROJECT}.restore.lock" in restore_text
+        assert ".env.pre-restore-" in restore_text
         assert "caddy-pre-restore-" in restore_text
+        assert "PRESERVED_BUCKET" not in restore_text, "Old preserved-bucket overwrite logic must be removed from restore.sh"
+        assert "MINIO_SWITCH_PY" not in restore_text, "Old live-bucket overwrite switch logic must be removed from restore.sh"
+        assert "extra_keys" not in restore_text, "Old manifest extra-object deletion logic must be removed from restore.sh"
 
-        for var_name in ("cleanup_py", "MINIO_PREFLIGHT_PY", "MINIO_STAGE_PY", "MINIO_SWITCH_PY", "MISSING_CHECK_PY"):
+        # Restore lock is keyed by COMPOSE_PROJECT_NAME under ${XDG_RUNTIME_DIR:-/tmp}/dalton-<project>.restore.lock
+        # even when invoked from different deployment directories.
+        xdg_dir = tmp_path / "xdg-runtime"
+        xdg_dir.mkdir()
+        shared_proj = "shared-proj-lock"
+        pre_lock = xdg_dir / f"dalton-{shared_proj}.restore.lock"
+        pre_lock.mkdir()
+        (pre_lock / "pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+        lock_work_b = tmp_path / "work-dir-b"
+        lock_work_b.mkdir()
+        (lock_work_b / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        (lock_work_b / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (lock_work_b / ".env").write_text(
+            f"COMPOSE_PROJECT_NAME={shared_proj}\nDB_HOST=external-pg.corp.internal\n",
+            encoding="utf-8",
+        )
+        # Stale PID in the project-keyed lock is automatically cleaned up so restore proceeds to DB_HOST guard
+        (pre_lock / "pid").write_text("999999\n", encoding="utf-8")
+        lock_env = os.environ.copy()
+        lock_env["XDG_RUNTIME_DIR"] = str(xdg_dir)
+        res_proj_lock = subprocess.run(
+            [
+                "bash",
+                str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                "--work-dir",
+                str(lock_work_b),
+                "--backup-dir",
+                str(backup_stub),
+            ],
+            env=lock_env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_proj_lock.returncode != 0
+        assert f"Removing stale restore lock {pre_lock}" in res_proj_lock.stderr
+        assert "External PostgreSQL detected" in res_proj_lock.stderr
+        assert not pre_lock.exists(), "restore.sh must release its project-keyed lock on exit"
+
+        for var_name in ("cleanup_py", "MINIO_PREFLIGHT_PY", "MINIO_RESTORE_PY", "MISSING_CHECK_PY"):
             m = _re.search(rf"{var_name}='\n(.*?)\n'", restore_text, flags=_re.DOTALL)
             assert m, f"Missing embedded Python block {var_name} in restore.sh"
             compile(m.group(1), f"restore.sh:{var_name}", "exec")
 
-        # Execute the real delete_keys_checked function extracted from MINIO_SWITCH_PY with a mock client
-        switch_src = _re.search(r"MINIO_SWITCH_PY='\n(.*?)\n'", restore_text, flags=_re.DOTALL)
-        assert switch_src is not None
+        # Execute derive_restore_bucket_name extracted from MINIO_RESTORE_PY
+        restore_py_src = _re.search(r"MINIO_RESTORE_PY='\n(.*?)\n'", restore_text, flags=_re.DOTALL)
+        assert restore_py_src is not None
+        derive_match = _re.search(
+            r"(def derive_restore_bucket_name\(.*?\n    return f\"\{prefix\}\{tail\}\"\n)",
+            restore_py_src.group(1),
+            flags=_re.DOTALL,
+        )
+        assert derive_match is not None
+        derive_ns: dict[str, Any] = {"hashlib": _hashlib}
+        exec(derive_match.group(1), derive_ns)
+        derive_fn = derive_ns["derive_restore_bucket_name"]
+        ts = "20261123170000"
+        assert derive_fn("chat-uploads", ts) == f"chat-uploads-r{ts}"
+        long_a = "a" * 55 + "-1"
+        long_b = "a" * 55 + "-2"
+        out_a = derive_fn(long_a, ts)
+        out_b = derive_fn(long_b, ts)
+        assert len(out_a) <= 63 and len(out_b) <= 63
+        assert out_a != out_b, "Two long bucket names sharing a prefix must produce distinct restore bucket names"
+        assert out_a.endswith(f"-r{ts}") and out_b.endswith(f"-r{ts}")
+
+        # Execute delete_keys_checked extracted from cleanup_py with a mock client returning Errors
+        cleanup_src = _re.search(r"cleanup_py='\n(.*?)\n'", restore_text, flags=_re.DOTALL)
+        assert cleanup_src is not None
         fn_match = _re.search(
             r"(def delete_keys_checked\(.*?\n    return deleted\n)",
-            switch_src.group(1),
+            cleanup_src.group(1),
             flags=_re.DOTALL,
         )
         assert fn_match is not None
@@ -1846,7 +1927,132 @@ class TestSandboxNetworkAndInitScript:
                     "Errors": [{"Key": "bad-key", "Code": "AccessDenied", "Message": "denied"}],
                 }
 
-        ns: dict[str, Any] = {"client": _ErrS3()}
+        ns: dict[str, Any] = {}
         exec(fn_match.group(1), ns)
         with pytest.raises(RuntimeError, match="DeleteObjects failed.*bad-key.*AccessDenied"):
-            ns["delete_keys_checked"]("chat-uploads", ["bad-key"])
+            ns["delete_keys_checked"](_ErrS3(), "chat-uploads-r20261123170000", ["bad-key"])
+
+        # backup.sh identifies restore-created buckets by tag or .dalton-restore.json (never suffix regex)
+        backup_text = (REPO_ROOT / "scripts/standalone/backup.sh").read_text(encoding="utf-8")
+        assert "restore_bucket_re" not in backup_text
+        is_restore_match = _re.search(
+            r"(def is_restore_created_bucket\(.*?\n    return False\n)",
+            backup_text,
+            flags=_re.DOTALL,
+        )
+        assert is_restore_match is not None
+        b_ns: dict[str, Any] = {
+            "ClientError": ClientError,
+            "RESTORE_TAG_KEY": "dalton-restore",
+            "RESTORE_MARKER_KEY": ".dalton-restore.json",
+        }
+        exec(is_restore_match.group(1), b_ns)
+        is_restore_fn = b_ns["is_restore_created_bucket"]
+
+        class _FakeBackupS3:
+            def __init__(self, tags: dict[str, list[dict[str, str]]], markers: set[str]) -> None:
+                self._tags = tags
+                self._markers = markers
+
+            def get_bucket_tagging(self, *, Bucket: str) -> dict[str, Any]:
+                if Bucket not in self._tags:
+                    raise ClientError({"Error": {"Code": "NoSuchTagSet"}}, "GetBucketTagging")
+                return {"TagSet": self._tags[Bucket]}
+
+            def head_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
+                if (Bucket, Key) not in self._markers:
+                    raise ClientError({"Error": {"Code": "404"}}, "HeadObject")
+                return {}
+
+        fake_s3 = _FakeBackupS3(
+            tags={"chat-uploads-r20261123170000": [{"Key": "dalton-restore", "Value": "true"}]},
+            markers={("legacy-marker-bucket", ".dalton-restore.json")},
+        )
+        assert is_restore_fn(fake_s3, "reports-restore-20260101120000") is False
+        assert is_restore_fn(fake_s3, "chat-uploads-r20261123170000") is True
+        assert is_restore_fn(fake_s3, "legacy-marker-bucket") is True
+
+        # upgrade.sh rollback hint only suggests `restore.sh --replace-data` after migrate actually starts
+        for scenario, migrate_body, expect_restore_hint in (
+            (
+                "fail-before-container-start",
+                'echo "Error response from daemon: network not found" >&2; exit 1',
+                False,
+            ),
+            (
+                "fail-after-migrate-log",
+                'echo "[migrate] Running upstream database migrations..."; echo "SQL syntax error" >&2; exit 1',
+                True,
+            ),
+        ):
+            sc_root = tmp_path / f"upg-{scenario}"
+            uwork = sc_root / "work"
+            urel = sc_root / "rel"
+            ubak = sc_root / "bak-out"
+            fake_bin = sc_root / "bin"
+            for d in (
+                uwork / "scripts/standalone",
+                uwork / "deploy/standalone",
+                urel / "scripts/standalone",
+                urel / "deploy/standalone",
+                ubak,
+                fake_bin,
+            ):
+                d.mkdir(parents=True, exist_ok=True)
+            for target_dir in (uwork, urel):
+                for req in (
+                    "docker-compose.yml",
+                    "docker-compose.core.yml",
+                    "scripts/standalone/migrate.sh",
+                    "scripts/standalone/restore.sh",
+                    "deploy/standalone/Caddyfile",
+                ):
+                    (target_dir / req).write_text("stub\n", encoding="utf-8")
+            (uwork / ".env").write_text("DB_HOST=postgres\nDB_USER=postgres\nDB_NAME=postgres\n", encoding="utf-8")
+            fake_bak_dir = ubak / "dalton-backup-20260101-000000Z-abc123"
+            fake_bak_dir.mkdir()
+            backup_stub_script = (
+                "#!/usr/bin/env bash\n"
+                f"printf '  Backup directory : %s\\n' '{fake_bak_dir}'\n"
+            )
+            (uwork / "scripts/standalone/backup.sh").write_text(backup_stub_script, encoding="utf-8")
+            (urel / "scripts/standalone/backup.sh").write_text(backup_stub_script, encoding="utf-8")
+            docker_stub = fake_bin / "docker"
+            docker_stub.write_text(
+                "#!/usr/bin/env bash\n"
+                'if [[ "$*" == *" images -q "* ]]; then echo "img123"; exit 0; fi\n'
+                'if [[ "$1" == "tag" ]]; then exit 0; fi\n'
+                'if [[ "$*" == *" psql "* ]]; then echo "rev1"; exit 0; fi\n'
+                f'if [[ "$*" == *" run --rm migrate"* ]]; then {migrate_body}; fi\n'
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            docker_stub.chmod(0o755)
+            stub_env = os.environ.copy()
+            stub_env["PATH"] = f"{fake_bin}:{stub_env.get('PATH', '')}"
+            res_sc = subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts/standalone/upgrade.sh"),
+                    "--work-dir",
+                    str(uwork),
+                    "--release-dir",
+                    str(urel),
+                    "--backup-dir",
+                    str(ubak),
+                    "--skip-build",
+                ],
+                env=stub_env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert res_sc.returncode != 0, f"{scenario}: expected upgrade.sh to fail"
+            if expect_restore_hint:
+                assert "--replace-data" in res_sc.stderr and "Do NOT run restore.sh --replace-data" not in res_sc.stderr, (
+                    f"{scenario}: expected restore.sh --replace-data hint, got:\n{res_sc.stderr}"
+                )
+            else:
+                assert "Do NOT run restore.sh --replace-data" in res_sc.stderr, (
+                    f"{scenario}: pre-start failure must NOT suggest restore.sh --replace-data, got:\n{res_sc.stderr}"
+                )

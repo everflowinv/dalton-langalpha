@@ -256,6 +256,7 @@ if [[ "$DB_HOST" != "postgres" ]]; then
   exit 1
 fi
 
+DOMAIN="$(read_env_var "DOMAIN" "localhost")"
 TLS_MODE="$(read_env_var "DALTON_TLS_MODE" "loopback")"
 
 if [[ -z "$BACKUP_OUTPUT_DIR" ]]; then
@@ -271,6 +272,8 @@ if [[ -z "$COMPOSE_FILES_RAW" ]]; then
   env_compose_file="$(read_env_var "COMPOSE_FILE" "")"
   if [[ -n "$env_compose_file" ]]; then
     COMPOSE_FILES_RAW="$env_compose_file"
+  elif [[ "$TLS_MODE" != "loopback" && "$DOMAIN" == *:* && -f "${WORK_DIR}/deploy/standalone/docker-compose.tls.ipv6.yml" ]]; then
+    COMPOSE_FILES_RAW="${WORK_DIR}/docker-compose.yml:${WORK_DIR}/docker-compose.core.yml:${WORK_DIR}/deploy/standalone/docker-compose.tls.ipv6.yml"
   elif [[ "$TLS_MODE" != "loopback" && -f "${WORK_DIR}/deploy/standalone/docker-compose.tls.yml" ]]; then
     COMPOSE_FILES_RAW="${WORK_DIR}/docker-compose.yml:${WORK_DIR}/docker-compose.core.yml:${WORK_DIR}/deploy/standalone/docker-compose.tls.yml"
   else
@@ -332,6 +335,7 @@ DB_MIGRATED=0
 
 STAGE_RELEASE=""
 PRE_UPGRADE_BACKUP=""
+MIGRATE_LOG=""
 UPGRADE_SUCCEEDED=0
 
 print_rollback_steps() {
@@ -421,6 +425,9 @@ print_rollback_steps() {
 
 cleanup() {
   local rc=$?
+  if [[ -n "$MIGRATE_LOG" && -f "$MIGRATE_LOG" ]]; then
+    rm -f "$MIGRATE_LOG"
+  fi
   if [[ -n "$STAGE_RELEASE" && -d "$STAGE_RELEASE" ]]; then
     rm -rf "$STAGE_RELEASE"
   fi
@@ -592,8 +599,37 @@ else
 fi
 
 info "Running new version database migrations..."
+MIG_DB_USER="$(read_env_file_var "$ENV_FILE" "DB_USER" "postgres")"
+MIG_DB_NAME="$(read_env_file_var "$ENV_FILE" "DB_NAME" "postgres")"
+PRE_MIGRATE_UP="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -Atqc "SELECT version_num FROM alembic_version;" 2>/dev/null | tr -d '\r\n' || true)"
+PRE_MIGRATE_DA="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -Atqc "SELECT version_num FROM alembic_version_dalton;" 2>/dev/null | tr -d '\r\n' || true)"
+
+MIGRATE_LOG="$(mktemp)"
+chmod 600 "$MIGRATE_LOG"
+set +e
+compose_cmd run --rm migrate 2>&1 | tee "$MIGRATE_LOG"
+MIGRATE_RC="${PIPESTATUS[0]}"
+set -e
+
+# Only mark DB_MIGRATED=1 if the migrate container actually started and ran
+# (evidenced by migrate.sh's first `[migrate]` log line or an Alembic version table change).
+if grep -q '\[migrate\]' "$MIGRATE_LOG" 2>/dev/null; then
+  DB_MIGRATED=1
+else
+  POST_MIGRATE_UP="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -Atqc "SELECT version_num FROM alembic_version;" 2>/dev/null | tr -d '\r\n' || true)"
+  POST_MIGRATE_DA="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -Atqc "SELECT version_num FROM alembic_version_dalton;" 2>/dev/null | tr -d '\r\n' || true)"
+  if [[ ( -n "$POST_MIGRATE_UP" && "$POST_MIGRATE_UP" != "$PRE_MIGRATE_UP" ) || ( -n "$POST_MIGRATE_DA" && "$POST_MIGRATE_DA" != "$PRE_MIGRATE_DA" ) ]]; then
+    DB_MIGRATED=1
+  fi
+fi
+rm -f "$MIGRATE_LOG"
+MIGRATE_LOG=""
+
+if [[ "$MIGRATE_RC" -ne 0 ]]; then
+  err "Database migrations failed (exit ${MIGRATE_RC})."
+  exit "$MIGRATE_RC"
+fi
 DB_MIGRATED=1
-compose_cmd run --rm migrate
 compose_cmd run --rm minio-init
 ok "Database migrations and bucket check succeeded."
 

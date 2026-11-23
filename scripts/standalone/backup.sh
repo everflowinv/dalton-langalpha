@@ -207,6 +207,13 @@ read_env_var() {
   read_env_file_var "$ENV_FILE" "$key" "$default_val"
 }
 
+sanitize_project_name() {
+  local raw="$1"
+  local cleaned
+  cleaned="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/-/g; s/^[^a-z0-9]+//; s/[-_]+$//')"
+  printf '%s' "${cleaned:-dalton-core}"
+}
+
 # External PostgreSQL guard: this script only operates on Compose-managed `postgres`.
 DB_HOST="$(read_env_var "DB_HOST" "postgres")"
 if [[ "$DB_HOST" != "postgres" ]]; then
@@ -217,7 +224,11 @@ fi
 
 DB_USER="$(read_env_var "DB_USER" "postgres")"
 DB_NAME="$(read_env_var "DB_NAME" "postgres")"
-PROJECT_NAME="$(read_env_var "COMPOSE_PROJECT_NAME" "$(basename "$WORK_DIR")")"
+PROJECT_NAME="$(read_env_var "COMPOSE_PROJECT_NAME" "")"
+if [[ -z "$PROJECT_NAME" ]]; then
+  PROJECT_NAME="$(sanitize_project_name "$(basename "$WORK_DIR")")"
+fi
+DOMAIN="$(read_env_var "DOMAIN" "localhost")"
 TLS_MODE="$(read_env_var "DALTON_TLS_MODE" "loopback")"
 
 if [[ -z "$OUTPUT_DIR" ]]; then
@@ -233,6 +244,8 @@ if [[ -z "$COMPOSE_FILES_RAW" ]]; then
   env_compose_file="$(read_env_var "COMPOSE_FILE" "")"
   if [[ -n "$env_compose_file" ]]; then
     COMPOSE_FILES_RAW="$env_compose_file"
+  elif [[ "$TLS_MODE" != "loopback" && "$DOMAIN" == *:* && -f "${WORK_DIR}/deploy/standalone/docker-compose.tls.ipv6.yml" ]]; then
+    COMPOSE_FILES_RAW="${WORK_DIR}/docker-compose.yml:${WORK_DIR}/docker-compose.core.yml:${WORK_DIR}/deploy/standalone/docker-compose.tls.ipv6.yml"
   elif [[ "$TLS_MODE" != "loopback" && -f "${WORK_DIR}/deploy/standalone/docker-compose.tls.yml" ]]; then
     COMPOSE_FILES_RAW="${WORK_DIR}/docker-compose.yml:${WORK_DIR}/docker-compose.core.yml:${WORK_DIR}/deploy/standalone/docker-compose.tls.yml"
   else
@@ -403,7 +416,6 @@ import hashlib
 import io
 import json
 import os
-import re
 import sys
 import tarfile
 
@@ -412,6 +424,16 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 CHUNK_BYTES = 1024 * 1024  # 1 MiB streaming chunks
+RESTORE_MARKER_KEY = ".dalton-restore.json"
+RESTORE_TAG_KEY = "dalton-restore"
+BUCKET_ENV_VARS = (
+    "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME",
+    "DALTON_ASR_STORAGE_BUCKET_NAME",
+    "STORAGE_BUCKET_NAME",
+    "S3_BUCKET_NAME",
+    "OSS_BUCKET_NAME",
+    "R2_BUCKET_NAME",
+)
 
 
 def _env(primary: str, *fallbacks: str, default: str = "") -> str:
@@ -420,6 +442,37 @@ def _env(primary: str, *fallbacks: str, default: str = "") -> str:
         if val:
             return val
     return default
+
+
+def is_restore_created_bucket(s3_client, bucket_name: str) -> bool:
+    """Identify restore-created buckets via bucket tag or .dalton-restore.json marker (never name suffix)."""
+    try:
+        tag_resp = s3_client.get_bucket_tagging(Bucket=bucket_name)
+        for tag in tag_resp.get("TagSet") or []:
+            if tag.get("Key") == RESTORE_TAG_KEY and str(tag.get("Value", "")).lower() == "true":
+                return True
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0) or 0)
+        if code not in (
+            "NoSuchTagSet",
+            "NoSuchTagSetError",
+            "404",
+            "NotFound",
+            "NotImplemented",
+            "MethodNotAllowed",
+        ) and status not in (404, 405, 501):
+            raise
+
+    try:
+        s3_client.head_object(Bucket=bucket_name, Key=RESTORE_MARKER_KEY)
+        return True
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0) or 0)
+        if code not in ("404", "NoSuchKey", "NotFound") and status != 404:
+            raise
+    return False
 
 
 class _HashingStream:
@@ -498,17 +551,36 @@ except (ClientError, BotoCoreError) as exc:
     sys.exit(1)
 
 all_buckets = sorted(b["Name"] for b in resp.get("Buckets", []) if b.get("Name"))
-restore_bucket_re = re.compile(r"-(?:pre-)?restore-\d{14}$")
-skipped_buckets = [b for b in all_buckets if restore_bucket_re.search(b)]
-buckets = [b for b in all_buckets if not restore_bucket_re.search(b)]
+
+# Collect every bucket currently configured for the application so backups always
+# include all active buckets — even if an active bucket was created by a prior restore.
+configured_var_buckets: dict[str, str] = {}
+for var_name in BUCKET_ENV_VARS:
+    val = (os.getenv(var_name) or "").strip()
+    if val:
+        configured_var_buckets[var_name] = val
+if "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME" not in configured_var_buckets and default_bucket:
+    configured_var_buckets["DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME"] = default_bucket
+active_buckets = set(configured_var_buckets.values())
+
+buckets: list[str] = []
+skipped_buckets: list[str] = []
+for b in all_buckets:
+    if b in active_buckets:
+        buckets.append(b)
+    elif is_restore_created_bucket(client, b):
+        skipped_buckets.append(b)
+    else:
+        buckets.append(b)
+
 if skipped_buckets:
     print(
-        f"[backup] INFO: Skipping temporary/preserved restore bucket(s): {', '.join(skipped_buckets)}",
+        f"[backup] INFO: Skipping inactive restore-created bucket(s): {', '.join(skipped_buckets)}",
         file=sys.stderr,
     )
 if default_bucket and default_bucket not in buckets:
     print(
-        f"ERROR: Expected default bucket '{default_bucket}' not present in list_buckets() output ({buckets}).",
+        f"ERROR: Expected active bucket '{default_bucket}' not present in list_buckets() output ({buckets}).",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -522,6 +594,8 @@ with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz", format=tarfile.PAX_FOR
         for page in paginator.paginate(Bucket=bucket):
             for entry in page.get("Contents", []):
                 key = entry["Key"]
+                if key == RESTORE_MARKER_KEY:
+                    continue
                 obj = client.get_object(Bucket=bucket, Key=key)
                 body = obj["Body"]
                 try:
@@ -565,6 +639,8 @@ with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz", format=tarfile.PAX_FOR
     manifest_raw = json.dumps(
         {
             "buckets": buckets,
+            "primary_bucket": default_bucket,
+            "var_buckets": {k: v for k, v in configured_var_buckets.items() if v in buckets},
             "bucket_count": len(buckets),
             "object_count": len(manifest_objects),
             "total_bytes": total_bytes,

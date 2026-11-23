@@ -51,8 +51,23 @@
 
 # HTTP (:80) -> HTTPS redirect that preserves a non-default host HTTPS port
 # (e.g. 18443 in loopback HTTPS mode) while omitting :443 on standard deployments.
+# IPv6 literals are explicitly re-bracketed because Caddy's {http.request.host}
+# strips brackets when Host carries a port (e.g. [::1]:18080 -> ::1).
 (dalton_http_redirect) {
 	import dalton_access_log
+	@ipv6_non_default_https_port {
+		vars_regexp ipv6_host {http.request.host} ^\[?([^\[\]]*:[^\[\]]+)\]?$
+		expression `"{$DALTON_EDGE_HTTPS_PORT:443}" != "443" && "{$DALTON_EDGE_HTTPS_PORT:443}" != ""`
+	}
+	handle @ipv6_non_default_https_port {
+		redir https://[{re.ipv6_host.1}]:{$DALTON_EDGE_HTTPS_PORT:443}{uri} permanent
+	}
+	@ipv6_default_https_port {
+		vars_regexp ipv6_host_def {http.request.host} ^\[?([^\[\]]*:[^\[\]]+)\]?$
+	}
+	handle @ipv6_default_https_port {
+		redir https://[{re.ipv6_host_def.1}]{uri} permanent
+	}
 	@non_default_https_port expression `"{$DALTON_EDGE_HTTPS_PORT:443}" != "443" && "{$DALTON_EDGE_HTTPS_PORT:443}" != ""`
 	handle @non_default_https_port {
 		redir https://{host}:{$DALTON_EDGE_HTTPS_PORT:443}{uri} permanent

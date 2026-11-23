@@ -787,15 +787,21 @@ main() {
   # Single source of truth: docker-compose.core.yml derives DALTON_TRUSTED_PROXIES
   # directly from DALTON_CORE_INTERNAL_SUBNET so the two never drift.
   set_env_if_empty "DALTON_CORE_INTERNAL_SUBNET" "$DEFAULT_CORE_INTERNAL_SUBNET" || true
+  remove_env_key "DALTON_TRUSTED_PROXIES"
   set_env_if_empty "DALTON_TRUSTED_PROXY_HOPS" "1" || true
   set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL" "http://minio:9000" || true
   set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME" "chat-uploads" || true
   set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_REGION" "us-east-1" || true
   set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE" "path" || true
 
-  local edge_port tls_bind http_port https_port public_url invite_domain cert_dir compose_file
+  local edge_port tls_bind http_port https_port public_url invite_domain cert_dir compose_file tls_overlay_file
   edge_port="$(get_env_value "DALTON_EDGE_PORT")"
   edge_port="${edge_port:-8088}"
+  if [[ "$domain" == *:* ]]; then
+    tls_overlay_file="deploy/standalone/docker-compose.tls.ipv6.yml"
+  else
+    tls_overlay_file="deploy/standalone/docker-compose.tls.yml"
+  fi
 
   case "$tls_mode" in
     loopback)
@@ -806,12 +812,13 @@ main() {
       compose_file="docker-compose.yml:docker-compose.core.yml"
       ;;
     internal|auto|custom)
-      # Before Batch 4b ships local sign-in, all published addresses must stay loopback.
+      # Before Batch 4b ships local sign-in, all published addresses stay hardcoded
+      # to 127.0.0.1 (or [::1] via docker-compose.tls.ipv6.yml) in the Compose files.
       tls_bind="$loopback_bind"
       http_port="18080"
       https_port="18443"
       public_url="https://${url_host}:${https_port}"
-      compose_file="docker-compose.yml:docker-compose.core.yml:deploy/standalone/docker-compose.tls.yml"
+      compose_file="docker-compose.yml:docker-compose.core.yml:${tls_overlay_file}"
       ;;
   esac
 
@@ -924,7 +931,7 @@ main() {
 
   local compose_start_cmd="docker compose -f docker-compose.yml -f docker-compose.core.yml up -d"
   if [[ "$tls_mode" != "loopback" ]]; then
-    compose_start_cmd="docker compose -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml up -d"
+    compose_start_cmd="docker compose -f docker-compose.yml -f docker-compose.core.yml -f ${tls_overlay_file} up -d"
   fi
 
   printf "\n== Next Steps ==\n"
