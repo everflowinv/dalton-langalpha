@@ -14,6 +14,21 @@ CONFIG="$REPO_ROOT/agent_config.yaml"
 ENV_FILE="$REPO_ROOT/.env"
 ENV_EXAMPLE="$REPO_ROOT/.env.example"
 
+# DALTON-HOOK(standalone-core): when running in standalone core profile
+# (APP_ENV=core or DALTON_PROFILE=core in process env or .env), target
+# agent_config.core.yaml and .env.core.example so edits take effect under the
+# core overlay and leave upstream agent_config.yaml untouched.
+_IS_CORE_PROFILE=0
+if [ "${APP_ENV:-}" = "core" ] || [ "${DALTON_PROFILE:-}" = "core" ]; then
+    _IS_CORE_PROFILE=1
+elif [ -f "$ENV_FILE" ] && grep -Eq '^(APP_ENV|DALTON_PROFILE)=core[[:space:]]*$' "$ENV_FILE" 2>/dev/null; then
+    _IS_CORE_PROFILE=1
+fi
+if [ "$_IS_CORE_PROFILE" -eq 1 ]; then
+    [ -f "$REPO_ROOT/agent_config.core.yaml" ] && CONFIG="$REPO_ROOT/agent_config.core.yaml"
+    [ -f "$REPO_ROOT/.env.core.example" ] && ENV_EXAMPLE="$REPO_ROOT/.env.core.example"
+fi
+
 header()  { printf "\n${BOLD}${CYAN}── %s ──${NC}\n\n" "$1"; }
 success() { printf "  ${GREEN}✓${NC} %s\n" "$1"; }
 info()    { printf "  ${DIM}%s${NC}\n" "$1"; }
@@ -578,17 +593,24 @@ fi
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
+# DALTON-HOOK(standalone-core): display the active config file and core compose command when in core profile.
 header "Done"
+_CONFIG_DISPLAY="$(basename "$CONFIG")"
 printf "  Files updated:\n"
 printf "    ${DIM}.env${NC}               API keys and service settings\n"
-printf "    ${DIM}agent_config.yaml${NC}  LLM models, MCP servers, search provider\n"
+printf "    ${DIM}%-18s${NC} LLM models, MCP servers, search provider\n" "$_CONFIG_DISPLAY"
 printf "\n"
 printf "  Next steps:\n"
-printf "    ${BOLD}make up${NC}            Start the full stack\n"
+if [ "$_IS_CORE_PROFILE" -eq 1 ]; then
+    printf "    ${BOLD}docker compose -f docker-compose.yml -f docker-compose.core.yml up -d${NC}\n"
+    printf "                       Start the Standalone Core stack\n"
+else
+    printf "    ${BOLD}make up${NC}            Start the full stack\n"
+fi
 printf "    ${BOLD}make help${NC}          See all available commands\n"
 printf "\n"
 printf "  Want more models or features? Edit these files:\n"
 printf "    ${DIM}.env${NC}               Add API keys for additional providers\n"
-printf "    ${DIM}agent_config.yaml${NC}  Add fallback models, enable MCP servers, tune settings\n"
+printf "    ${DIM}%-18s${NC} Add fallback models, enable MCP servers, tune settings\n" "$_CONFIG_DISPLAY"
 printf "    ${DIM}src/llms/manifest/${NC}  See all configured models or add custom ones\n"
 printf "\n"

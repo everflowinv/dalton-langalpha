@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+# Standalone Core initializer (environment checks + secret generation).
+#
+# Responsibilities:
+#   1. Check Docker Engine (>= 24.0), Docker Compose (>= 2.24.4), memory (>= 8 GB
+#      recommended), and free disk (>= 30 GB recommended).
+#   2. Print the /var/run/docker.sock security & permissions notice.
+#   3. Create/update .env from .env.core.example, generating all required secrets
+#      with `openssl rand -hex 32` without overwriting existing non-empty values,
+#      and ensuring APP_ENV=core / DALTON_PROFILE=core.
+#   4. Hand interactive LLM / financial-data / web-search setup off to `make config`.
+#
+# Usage:
+#   bash scripts/standalone/init.sh
+#   bash scripts/standalone/init.sh --non-interactive --domain localhost
+#   bash scripts/standalone/init.sh --domain dalton.example.com --env-file /path/to/.env
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ENV_FILE="${REPO_ROOT}/.env"
+ENV_EXAMPLE="${REPO_ROOT}/.env.core.example"
+
+NON_INTERACTIVE=0
+DOMAIN_ARG=""
+
+usage() {
+  cat <<'EOF'
+Usage: bash scripts/standalone/init.sh [OPTIONS]
+
+Options:
+  --non-interactive       Do not prompt; use defaults / flags / existing .env values.
+  --domain <host>         Target domain (e.g. localhost or dalton.example.com).
+  --env-file <path>       Path to .env file (default: <repo>/.env).
+  -h, --help              Show this help message.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --non-interactive)
+      NON_INTERACTIVE=1
+      shift
+      ;;
+    --domain)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "ERROR: --domain requires a value" >&2
+        exit 2
+      fi
+      DOMAIN_ARG="$2"
+      shift 2
+      ;;
+    --domain=*)
+      DOMAIN_ARG="${1#--domain=}"
+      shift
+      ;;
+    --env-file)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "ERROR: --env-file requires a path" >&2
+        exit 2
+      fi
+      ENV_FILE="$2"
+      shift 2
+      ;;
+    --env-file=*)
+      ENV_FILE="${1#--env-file=}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "ERROR: Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+info()  { printf "  [INFO] %s\n" "$1"; }
+ok()    { printf "  [OK]   %s\n" "$1"; }
+warn()  { printf "  [WARN] %s\n" "$1" >&2; }
+err()   { printf "  [ERR]  %s\n" "$1" >&2; }
+
+version_ge() {
+  # Compare dotted numeric versions: returns 0 if $1 >= $2.
+  local v1="$1" v2="$2"
+  local IFS=.
+  local -a a1 a2
+  read -r -a a1 <<< "$v1"
+  read -r -a a2 <<< "$v2"
+  local i max="${#a1[@]}"
+  if (( ${#a2[@]} > max )); then max="${#a2[@]}"; fi
+  for (( i = 0; i < max; i++ )); do
+    local n1="${a1[i]:-0}" n2="${a2[i]:-0}"
+    n1="${n1%%[^0-9]*}"; n2="${n2%%[^0-9]*}"
+    n1="${n1:-0}"; n2="${n2:-0}"
+    if (( 10#$n1 > 10#$n2 )); then return 0; fi
+    if (( 10#$n1 < 10#$n2 )); then return 1; fi
+  done
+  return 0
+}
+
+check_environment() {
+  printf "\n== Environment Checks ==\n"
+
+  # 1. openssl
+  if command -v openssl >/dev/null 2>&1; then
+    ok "openssl found ($(openssl version 2>/dev/null || echo 'ok'))"
+  else
+    err "openssl is required to generate cryptographic secrets."
+    exit 1
+  fi
+
+  # 2. Docker Engine (>= 24.0)
+  if command -v docker >/dev/null 2>&1; then
+    local docker_ver_raw docker_ver
+    docker_ver_raw="$(docker --version 2>/dev/null || true)"
+    docker_ver="$(printf '%s' "$docker_ver_raw" | sed -nE 's/.*version ([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/p' | head -n 1)"
+    if [[ -n "$docker_ver" ]]; then
+      if version_ge "$docker_ver" "24.0.0"; then
+        ok "Docker Engine ${docker_ver} (>= 24.0)"
+      else
+        warn "Docker Engine ${docker_ver} detected; >= 24.0 is recommended."
+      fi
+    else
+      warn "Docker found, but could not parse version from: ${docker_ver_raw}"
+    fi
+  else
+    warn "Docker CLI not found in PATH — install Docker Engine >= 24.0 before starting services."
+  fi
+
+  # 3. Docker Compose (>= 2.24.4 for !reset / !override)
+  if command -v docker >/dev/null 2>&1; then
+    local compose_raw compose_ver
+    compose_raw="$(docker compose version --short 2>/dev/null || docker compose version 2>/dev/null || true)"
+    compose_ver="$(printf '%s' "$compose_raw" | sed -nE 's/.*v?([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n 1)"
+    if [[ -n "$compose_ver" ]]; then
+      if version_ge "$compose_ver" "2.24.4"; then
+        ok "Docker Compose v${compose_ver} (>= v2.24.4)"
+      else
+        warn "Docker Compose v${compose_ver} detected; >= v2.24.4 is required for !reset / !override."
+      fi
+    else
+      warn "Docker Compose v2 plugin not detected; install docker-compose-plugin >= v2.24.4."
+    fi
+  fi
+
+  # 4. System memory (>= 8 GB recommended)
+  local mem_gb=""
+  if [[ -r /proc/meminfo ]]; then
+    local mem_kb
+    mem_kb="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+    if [[ -n "$mem_kb" && "$mem_kb" =~ ^[0-9]+$ ]]; then
+      mem_gb="$(( (mem_kb + 524288) / 1048576 ))"
+    fi
+  elif command -v sysctl >/dev/null 2>&1; then
+    local mem_bytes
+    mem_bytes="$(sysctl -n hw.memsize 2>/dev/null || true)"
+    if [[ -n "$mem_bytes" && "$mem_bytes" =~ ^[0-9]+$ ]]; then
+      mem_gb="$(( (mem_bytes + 536870912) / 1073741824 ))"
+    fi
+  fi
+  if [[ -n "$mem_gb" ]]; then
+    if (( mem_gb >= 8 )); then
+      ok "Memory: ~${mem_gb} GiB (>= 8 GiB recommended)"
+    else
+      warn "Memory: ~${mem_gb} GiB detected (< 8 GiB recommended for backend + sandboxes)."
+    fi
+  else
+    info "Memory: could not determine total RAM on this host."
+  fi
+
+  # 5. Free disk space (>= 30 GB recommended)
+  local target_dir
+  target_dir="$(dirname "$ENV_FILE")"
+  [[ -d "$target_dir" ]] || target_dir="$REPO_ROOT"
+  local free_kb free_gb
+  free_kb="$(df -Pk "$target_dir" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+  if [[ -n "$free_kb" && "$free_kb" =~ ^[0-9]+$ ]]; then
+    free_gb="$(( free_kb / 1048576 ))"
+    if (( free_gb >= 30 )); then
+      ok "Free disk space: ${free_gb} GiB (>= 30 GiB recommended)"
+    else
+      warn "Free disk space: ${free_gb} GiB (< 30 GiB recommended for images + sandboxes)."
+    fi
+  else
+    info "Disk space: could not determine free disk on ${target_dir}."
+  fi
+}
+
+print_docker_sock_notice() {
+  printf "\n== Docker Socket Security & Permission Notice ==\n"
+  cat <<'EOF'
+  Standalone Core mounts /var/run/docker.sock into the `backend` container
+  (Docker-outside-of-Docker) so it can create and reap isolated code sandboxes
+  on the dedicated `sandbox-net` network.
+
+  - Security boundary: holding /var/run/docker.sock is equivalent to host Docker
+    daemon control. For production, deploy on a dedicated Linux host or VM
+    reserved for Dalton (or configure a remote sandbox provider).
+  - Permissions: make sure the user running `docker compose` can access
+    /var/run/docker.sock (e.g. `sudo usermod -aG docker "$USER"` then re-login),
+    or set DOCKER_HOST_SOCKET in .env for rootless Docker.
+EOF
+}
+
+get_env_value() {
+  local key="$1"
+  [[ -f "$ENV_FILE" ]] || return 0
+  local line
+  line="$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -n 1 || true)"
+  printf '%s' "${line#*=}"
+}
+
+write_env_key() {
+  local key="$1" val="$2"
+  local tmp="${ENV_FILE}.tmp.$$"
+  if grep -qE "^${key}=" "$ENV_FILE" 2>/dev/null; then
+    awk -v k="$key" -v v="$val" '
+      BEGIN { replaced = 0 }
+      index($0, k "=") == 1 {
+        print k "=" v
+        replaced = 1
+        next
+      }
+      { print }
+      END {
+        if (!replaced) print k "=" v
+      }
+    ' "$ENV_FILE" > "$tmp"
+    mv "$tmp" "$ENV_FILE"
+  else
+    printf '%s=%s\n' "$key" "$val" >> "$ENV_FILE"
+  fi
+}
+
+set_env_if_empty() {
+  local key="$1" val="$2"
+  local cur
+  cur="$(get_env_value "$key")"
+  if [[ -n "$cur" ]]; then
+    return 1
+  fi
+  write_env_key "$key" "$val"
+  return 0
+}
+
+gen_hex_secret() {
+  openssl rand -hex 32
+}
+
+main() {
+  printf "\nDalton Standalone Core Initialization\n"
+  check_environment
+  print_docker_sock_notice
+
+  printf "\n== Configuring %s ==\n" "$ENV_FILE"
+  mkdir -p "$(dirname "$ENV_FILE")"
+  if [[ ! -f "$ENV_FILE" ]]; then
+    if [[ -f "$ENV_EXAMPLE" ]]; then
+      cp "$ENV_EXAMPLE" "$ENV_FILE"
+      ok "Created ${ENV_FILE} from $(basename "$ENV_EXAMPLE")"
+    else
+      : > "$ENV_FILE"
+      ok "Created empty ${ENV_FILE}"
+    fi
+  else
+    info "Updating existing ${ENV_FILE} (existing non-empty values will be preserved)"
+  fi
+  chmod 600 "$ENV_FILE" 2>/dev/null || true
+
+  # Resolve target domain
+  local existing_domain domain
+  existing_domain="$(get_env_value "DOMAIN")"
+  if [[ -n "$DOMAIN_ARG" ]]; then
+    domain="$DOMAIN_ARG"
+    write_env_key "DOMAIN" "$domain"
+  elif [[ -n "$existing_domain" ]]; then
+    domain="$existing_domain"
+  elif [[ "$NON_INTERACTIVE" -eq 1 ]]; then
+    domain="localhost"
+    write_env_key "DOMAIN" "$domain"
+  else
+    read -r -p "  Target domain (use 'localhost' for loopback trial) [localhost]: " domain
+    domain="${domain:-localhost}"
+    write_env_key "DOMAIN" "$domain"
+  fi
+  ok "DOMAIN=${domain}"
+
+  # Ensure Standalone Core profile & networking defaults (without clobbering existing values)
+  set_env_if_empty "APP_ENV" "core" || true
+  set_env_if_empty "DALTON_PROFILE" "core" || true
+  set_env_if_empty "HOST_MODE" "oss" || true
+  set_env_if_empty "SANDBOX_PROVIDER" "docker" || true
+  set_env_if_empty "EGRESS_RELAY_BASE_URL" "http://backend:8000" || true
+  set_env_if_empty "BRAND_NAME" "Dalton" || true
+  set_env_if_empty "VITE_BRAND_NAME" "Dalton" || true
+  set_env_if_empty "VITE_BRAND_MARK" "langalpha" || true
+  set_env_if_empty "VITE_DALTON_UI" "true" || true
+  set_env_if_empty "DALTON_TIMEZONE" "UTC" || true
+  set_env_if_empty "DALTON_EDGE_PORT" "8088" || true
+  set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL" "http://minio:9000" || true
+  set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME" "chat-uploads" || true
+  set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_REGION" "us-east-1" || true
+  set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE" "path" || true
+
+  local edge_port
+  edge_port="$(get_env_value "DALTON_EDGE_PORT")"
+  edge_port="${edge_port:-8088}"
+
+  if [[ "$domain" == "localhost" || "$domain" == "127.0.0.1" ]]; then
+    set_env_if_empty "PUBLIC_APP_URL" "http://127.0.0.1:${edge_port}" || true
+    set_env_if_empty "SERVER_BASE_URL" "http://127.0.0.1:${edge_port}" || true
+    set_env_if_empty "DALTON_INVITE_EMAIL_DOMAIN" "team.dalton.local" || true
+  else
+    set_env_if_empty "PUBLIC_APP_URL" "https://${domain}" || true
+    set_env_if_empty "SERVER_BASE_URL" "https://${domain}" || true
+    set_env_if_empty "DALTON_INVITE_EMAIL_DOMAIN" "team.${domain}" || true
+  fi
+
+  # Generate all secrets with `openssl rand -hex 32` without overwriting existing values.
+  local generated=()
+  local secret_keys=(
+    "DB_PASSWORD"
+    "REDIS_PASSWORD"
+    "MINIO_ROOT_USER"
+    "MINIO_ROOT_PASSWORD"
+    "INTERNAL_SERVICE_TOKEN"
+    "BYOK_ENCRYPTION_KEY"
+    "EGRESS_RELAY_SECRET"
+    "JWT_SIGNING_SECRET"
+    "BOOTSTRAP_SETUP_TOKEN"
+  )
+
+  local key new_val bootstrap_generated=""
+  for key in "${secret_keys[@]}"; do
+    local cur
+    cur="$(get_env_value "$key")"
+    # Treat obvious placeholder dev values as unset so they are replaced safely.
+    if [[ -z "$cur" || "$cur" == "langalpha-local-dev-encryption-key" ]]; then
+      new_val="$(gen_hex_secret)"
+      write_env_key "$key" "$new_val"
+      generated+=("$key")
+      if [[ "$key" == "BOOTSTRAP_SETUP_TOKEN" ]]; then
+        bootstrap_generated="$new_val"
+      fi
+    fi
+  done
+
+  # Mirror MinIO root credentials into DALTON_CHAT_UPLOAD_STORAGE_* when unset.
+  local minio_user minio_pass
+  minio_user="$(get_env_value "MINIO_ROOT_USER")"
+  minio_pass="$(get_env_value "MINIO_ROOT_PASSWORD")"
+  set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID" "$minio_user" || true
+  set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY" "$minio_pass" || true
+
+  if (( ${#generated[@]} > 0 )); then
+    ok "Generated secrets (${#generated[@]}): ${generated[*]}"
+  else
+    info "All secrets already present in ${ENV_FILE}; nothing overwritten."
+  fi
+
+  if [[ -n "$bootstrap_generated" && "$NON_INTERACTIVE" -eq 0 ]]; then
+    printf "\n  First-admin bootstrap token (saved in .env as BOOTSTRAP_SETUP_TOKEN):\n"
+    printf "    %s\n" "$bootstrap_generated"
+  fi
+
+  printf "\n== Next Steps ==\n"
+  if [[ "$NON_INTERACTIVE" -eq 0 ]]; then
+    cat <<'EOF'
+  1. Configure LLM provider keys, optional financial data (FMP), and optional
+     web search/fetch keys via the interactive setup wizard:
+       make config
+
+  2. Optional: set SEC_USER_AGENT="Dalton <your-email@example.com>" in .env
+     for SEC EDGAR compliance identification.
+
+  3. Start the Standalone Core stack:
+       docker compose -f docker-compose.yml -f docker-compose.core.yml up -d
+
+  4. Open the web UI at http://127.0.0.1:8088 (loopback mode).
+EOF
+  else
+    info "Non-interactive initialization complete (APP_ENV=core, DOMAIN=${domain})."
+    info "Start the stack with: docker compose -f docker-compose.yml -f docker-compose.core.yml up -d"
+  fi
+}
+
+main "$@"

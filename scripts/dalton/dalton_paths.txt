@@ -547,3 +547,8 @@ tests/unit/tools/secretary/test_workspace_settings_tools.py
 # Standalone Core Batch 1a: on-demand WebSearch registration & search provider availability tests.
 tests/unit/ptc_agent/agent/test_web_search_registration.py
 tests/unit/tools/web/test_search_availability.py
+# Standalone Core Batch 1b: compose overlay, env template, standalone Caddy/edge & init scripts.
+docker-compose.core.yml
+.env.core.example
+deploy/standalone/
+scripts/standalone/

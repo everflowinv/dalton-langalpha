@@ -1,0 +1,66 @@
+# Multi-stage Standalone Core edge image:
+#   1. Build the React/Vite frontend bundle (without reading web/.env.dalton or requiring Supabase)
+#   2. Build the static Astro/Starlight /help documentation bundle
+#   3. Serve both from /srv inside the official Caddy image (caddy:2.9.1-alpine)
+
+FROM node:24-alpine AS web-builder
+WORKDIR /web
+
+COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
+COPY web/patches/ patches/
+RUN npm install -g "$(node -p 'require("./package.json").packageManager')"
+# Plain install without BuildKit cache mounts so classic builders also succeed.
+RUN pnpm install --frozen-lockfile
+
+COPY web/ .
+# Never inherit Everflow's web/.env.dalton or any host-local web/.env* overrides.
+RUN rm -f .env .env.*
+
+ARG VITE_HOST_MODE="oss"
+ARG VITE_BRAND_NAME="Dalton"
+ARG VITE_BRAND_MARK="langalpha"
+ARG VITE_DALTON_UI="true"
+ARG VITE_DALTON_AUTH=""
+ARG VITE_DALTON_INVITE_EMAIL_DOMAIN=""
+ARG VITE_API_BASE_URL=""
+ARG DOCS_SITE_ORIGIN=""
+
+ENV VITE_HOST_MODE=${VITE_HOST_MODE}
+ENV VITE_BRAND_NAME=${VITE_BRAND_NAME}
+ENV VITE_BRAND_MARK=${VITE_BRAND_MARK}
+ENV VITE_DALTON_UI=${VITE_DALTON_UI}
+ENV VITE_DALTON_AUTH=${VITE_DALTON_AUTH}
+ENV VITE_DALTON_INVITE_EMAIL_DOMAIN=${VITE_DALTON_INVITE_EMAIL_DOMAIN}
+ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
+ENV DOCS_SITE_ORIGIN=${DOCS_SITE_ORIGIN}
+
+RUN pnpm run build \
+    && test -s dist/index.html \
+    && test -s dist/version.json \
+    && test -d dist/assets
+
+FROM node:24-alpine AS docs-builder
+WORKDIR /docs
+
+COPY web/package.json /tmp/web-package.json
+RUN npm install -g "$(node -p 'require("/tmp/web-package.json").packageManager')" \
+    && rm -f /tmp/web-package.json
+
+COPY docs-site/package.json docs-site/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+
+COPY docs-site/astro.config.mjs ./
+COPY docs-site/src/ src/
+COPY docs-site/public/ public/
+
+ARG DOCS_SITE_ORIGIN=""
+ENV DOCS_SITE_ORIGIN=${DOCS_SITE_ORIGIN}
+
+RUN pnpm run build \
+    && test -s dist/index.html
+
+FROM caddy:2.9.1-alpine
+
+COPY --from=web-builder /web/dist /srv
+COPY --from=docs-builder /docs/dist /srv/help
+RUN chmod -R a+rX,go-w /srv

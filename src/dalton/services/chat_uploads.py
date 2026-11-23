@@ -20,9 +20,11 @@ import hmac
 import json
 import logging
 import math
+import os
 import posixpath
 import re
 import shlex
+import time
 from typing import Any, TypeVar
 import uuid
 
@@ -31,19 +33,24 @@ from fastapi import HTTPException
 from ptc_agent.core.paths import WorkspaceLayout, lexical_path
 from ptc_agent.core.project_context import ProjectContext, current_project
 from ptc_agent.core.sandbox.retry import RetryPolicy
+from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton import chat_upload_storage as storage
 from src.dalton.database import chat_uploads as db
+from src.dalton.profile import is_core_profile
 from src.dalton.settings import (
     get_chat_upload_part_idle_timeout_s,
     get_chat_upload_part_total_timeout_s,
     get_dalton_settings,
+    get_internal_service_token,
     is_chat_upload_cleanup_enabled,
+    is_dalton_supabase_auth_enabled,
 )
 from src.server.database import chat_attachments as chat_attachments_db
 from src.server.database.blob_keys import RELAY_MAX_BYTES
 from src.server.database.home_workspace import get_home_workspace_id, is_home_id, is_home_row
 from src.server.services import chat_attachments as chat_attachments_svc
 from src.server.services.computer_disk import CRITICAL_FREE_BYTES, disk_command, parse_df
+from src.server.services.egress.reachability import effective_relay_base_url
 from src.server.services.persistence.transfer import (
     held_bytes_budget,
     pull_direct,
@@ -84,8 +91,337 @@ _FALLBACK_CHUNK_BYTES = 4 * _MIB
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_CHAR_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
+# Short-lived, single-object HMAC token parameters for the core-profile sandbox
+# download relay (`GET /api/v1/dalton/chat-uploads/sandbox-object/{token}`).
+SANDBOX_OBJECT_TOKEN_TYP = "dalton_chat_upload_sandbox_obj"
+DEFAULT_SANDBOX_OBJECT_TOKEN_TTL_S = 900
+MAX_SANDBOX_OBJECT_TOKEN_TTL_S = 1800
+_SANDBOX_OBJECT_HMAC_PURPOSE = b"dalton-chat-upload-sandbox-object-v1"
+_STREAM_EOF = object()
+
 # Bounds concurrent in-flight 8 MiB part buffers in one backend worker process.
 _PART_UPLOAD_SEMAPHORE = asyncio.Semaphore(6)
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(encoded: str) -> bytes:
+    padded = encoded + "=" * (-len(encoded) % 4)
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def _get_sandbox_object_hmac_key() -> bytes | None:
+    """Derive a dedicated HMAC-SHA256 signing key for sandbox object download tokens."""
+    seed = (
+        (os.getenv("DALTON_CHAT_UPLOAD_SIGNING_SECRET") or "").strip()
+        or get_internal_service_token()
+        or (os.getenv("BYOK_ENCRYPTION_KEY") or "").strip()
+        or (os.getenv("JWT_SIGNING_SECRET") or "").strip()
+    )
+    if not seed and not is_dalton_supabase_auth_enabled():
+        seed = f"dalton-local-dev-chat-upload-relay-seed:{LOCAL_DEV_USER_ID}"
+    if not seed:
+        return None
+    return hmac.new(
+        seed.encode("utf-8"),
+        _SANDBOX_OBJECT_HMAC_PURPOSE,
+        hashlib.sha256,
+    ).digest()
+
+
+def mint_sandbox_object_token(
+    *,
+    upload_id: str,
+    workspace_id: str,
+    object_key: str,
+    size_bytes: int,
+    sha256_hex: str,
+    ttl_s: int = DEFAULT_SANDBOX_OBJECT_TOKEN_TTL_S,
+    now_ts: int | None = None,
+) -> tuple[str, int]:
+    """Mint a short-lived, single-object HMAC-SHA256 download token for a sandbox."""
+    hmac_key = _get_sandbox_object_hmac_key()
+    if not hmac_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Chat upload sandbox relay signing key is not configured",
+        )
+    uid = str(upload_id or "").strip()
+    ws = str(workspace_id or "").strip()
+    key = str(object_key or "").strip()
+    digest = str(sha256_hex or "").strip().lower()
+    size = int(size_bytes)
+    if not uid or not ws:
+        raise ValueError("upload_id and workspace_id are required")
+    if not storage.is_chat_upload_key(key) or not storage.is_chat_upload_key_for_workspace(key, ws):
+        raise ValueError(f"Refusing non-workspace chat upload key: {key!r}")
+    if size < 1:
+        raise ValueError("size_bytes must be positive")
+    if not _SHA256_RE.match(digest):
+        raise ValueError("sha256_hex must be a 64-char lowercase hex digest")
+
+    iat = int(now_ts if now_ts is not None else time.time())
+    clamped_ttl = max(1, min(int(ttl_s), MAX_SANDBOX_OBJECT_TOKEN_TTL_S))
+    exp = iat + clamped_ttl
+    payload = {
+        "v": 1,
+        "typ": SANDBOX_OBJECT_TOKEN_TYP,
+        "uid": uid,
+        "ws": ws,
+        "key": key,
+        "size": size,
+        "sha256": digest,
+        "iat": iat,
+        "exp": exp,
+    }
+    payload_bytes = json.dumps(
+        payload, separators=(",", ":"), sort_keys=True, ensure_ascii=False
+    ).encode("utf-8")
+    payload_b64 = _b64url_encode(payload_bytes)
+    sig = hmac.new(hmac_key, payload_b64.encode("ascii"), hashlib.sha256).digest()
+    return f"{payload_b64}.{_b64url_encode(sig)}", exp
+
+
+def verify_sandbox_object_token(
+    token: str,
+    *,
+    expected_upload_id: str | None = None,
+    expected_object_key: str | None = None,
+    now_ts: int | None = None,
+) -> dict[str, Any]:
+    """Verify HMAC signature, expiry, and single-object claims of a sandbox download token."""
+    hmac_key = _get_sandbox_object_hmac_key()
+    if not hmac_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Chat upload sandbox relay signing key is not configured",
+        )
+    cleaned = str(token or "").strip()
+    parts = cleaned.split(".")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise HTTPException(status_code=401, detail="Invalid sandbox download token")
+
+    payload_b64, sig_b64 = parts[0], parts[1]
+    expected_sig = hmac.new(
+        hmac_key, payload_b64.encode("ascii"), hashlib.sha256
+    ).digest()
+    try:
+        supplied_sig = _b64url_decode(sig_b64)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=401, detail="Invalid sandbox download token signature"
+        ) from exc
+    if not hmac.compare_digest(supplied_sig, expected_sig):
+        raise HTTPException(
+            status_code=401, detail="Invalid sandbox download token signature"
+        )
+
+    try:
+        claims = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=401, detail="Malformed sandbox download token payload"
+        ) from exc
+
+    if (
+        not isinstance(claims, dict)
+        or claims.get("v") != 1
+        or claims.get("typ") != SANDBOX_OBJECT_TOKEN_TYP
+    ):
+        raise HTTPException(
+            status_code=401, detail="Unsupported sandbox download token"
+        )
+
+    iat = claims.get("iat")
+    exp = claims.get("exp")
+    if (
+        not isinstance(iat, int)
+        or isinstance(iat, bool)
+        or not isinstance(exp, int)
+        or isinstance(exp, bool)
+        or exp <= iat
+        or (exp - iat) > MAX_SANDBOX_OBJECT_TOKEN_TTL_S + 60
+    ):
+        raise HTTPException(status_code=401, detail="Invalid sandbox download token window")
+
+    now = int(now_ts if now_ts is not None else time.time())
+    if now >= exp:
+        raise HTTPException(status_code=401, detail="Sandbox download token expired")
+
+    uid = str(claims.get("uid") or "").strip()
+    ws = str(claims.get("ws") or "").strip()
+    key = str(claims.get("key") or "").strip()
+    sha256_hex = str(claims.get("sha256") or "").strip().lower()
+    size = claims.get("size")
+    if (
+        not uid
+        or not ws
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 1
+        or not _SHA256_RE.match(sha256_hex)
+    ):
+        raise HTTPException(status_code=401, detail="Malformed sandbox download token claims")
+    if not storage.is_chat_upload_key(key) or not storage.is_chat_upload_key_for_workspace(key, ws):
+        raise HTTPException(status_code=403, detail="Sandbox download token object scope denied")
+
+    if expected_upload_id is not None and uid != str(expected_upload_id).strip():
+        raise HTTPException(status_code=403, detail="Sandbox download token upload mismatch")
+    if expected_object_key is not None and key != str(expected_object_key).strip():
+        raise HTTPException(status_code=403, detail="Sandbox download token object mismatch")
+
+    return {
+        "uid": uid,
+        "ws": ws,
+        "key": key,
+        "size": size,
+        "sha256": sha256_hex,
+        "iat": iat,
+        "exp": exp,
+    }
+
+
+def _sandbox_provider_name(sandbox: Any) -> str:
+    config = getattr(sandbox, "config", None)
+    section = getattr(config, "sandbox", None)
+    provider = getattr(section, "provider", None)
+    return provider if isinstance(provider, str) and provider else "docker"
+
+
+def build_sandbox_object_relay_url(
+    *,
+    sandbox: Any,
+    upload_id: str,
+    workspace_id: str,
+    object_key: str,
+    size_bytes: int,
+    sha256_hex: str,
+    expires_in: int = DEFAULT_SANDBOX_OBJECT_TOKEN_TTL_S,
+    now_ts: int | None = None,
+) -> str | None:
+    """Build the backend relay URL a core-profile sandbox pulls via ``sandbox-net``."""
+    provider = _sandbox_provider_name(sandbox)
+    base_url = (
+        (os.getenv("EGRESS_RELAY_BASE_URL") or "").strip().rstrip("/")
+        or effective_relay_base_url(provider).rstrip("/")
+    )
+    if not base_url:
+        return None
+    try:
+        token, _ = mint_sandbox_object_token(
+            upload_id=upload_id,
+            workspace_id=workspace_id,
+            object_key=object_key,
+            size_bytes=size_bytes,
+            sha256_hex=sha256_hex,
+            ttl_s=expires_in,
+            now_ts=now_ts,
+        )
+    except Exception as exc:
+        logger.error("Failed to mint sandbox relay token for %s: %s", object_key, exc)
+        return None
+    return f"{base_url}/api/v1/dalton/chat-uploads/sandbox-object/{token}"
+
+
+async def prepare_sandbox_object_download(
+    token: str,
+    *,
+    now_ts: int | None = None,
+) -> tuple[dict[str, Any], AsyncIterator[bytes]]:
+    """Validate a single-object sandbox token against the DB row and open a verified byte stream."""
+    _ensure_feature_ready()
+    claims = verify_sandbox_object_token(token, now_ts=now_ts)
+    uid = claims["uid"]
+    ws = claims["ws"]
+    object_key = claims["key"]
+    expected_size = int(claims["size"])
+    expected_sha256 = claims["sha256"]
+
+    row = await db.get_upload(uid)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Chat upload not found")
+    if row.get("cleaned_at") is not None or row.get("state") != "ready":
+        raise HTTPException(status_code=410, detail="Attachment has expired or was removed")
+
+    # Enforce strict single-object / cross-object binding against the persisted ledger row.
+    if (
+        str(row.get("workspace_id") or "") != ws
+        or str(row.get("object_key") or "") != object_key
+        or int(row.get("size_bytes") or 0) != expected_size
+        or not hmac.compare_digest(
+            str(row.get("actual_sha256") or "").strip().lower(),
+            expected_sha256,
+        )
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Sandbox download token does not match target upload object",
+        )
+
+    if not await db.is_upload_retained_for_recovery(uid, ws):
+        raise HTTPException(status_code=410, detail="Attachment has expired or was removed")
+
+    # Open the object store iterator and read the first chunk before committing HTTP 200
+    # headers so a missing/unreadable backing object returns 404/502 cleanly.
+    it = storage.iter_stored_object_chunks(object_key)
+    try:
+        first_chunk = await asyncio.to_thread(next, it, _STREAM_EOF)
+    except Exception as exc:
+        try:
+            await asyncio.to_thread(it.close)
+        except Exception:
+            pass
+        logger.error("Failed to open stored object %s for sandbox relay: %s", object_key, exc)
+        raise HTTPException(status_code=404, detail="Stored chat upload object unavailable") from exc
+
+    if first_chunk is _STREAM_EOF:
+        try:
+            await asyncio.to_thread(it.close)
+        except Exception:
+            pass
+        raise HTTPException(status_code=404, detail="Stored chat upload object is empty")
+
+    async def _verified_stream() -> AsyncIterator[bytes]:
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            chunk = first_chunk
+            while chunk is not _STREAM_EOF:
+                assert isinstance(chunk, (bytes, bytearray))
+                data = bytes(chunk)
+                total += len(data)
+                if total > expected_size:
+                    raise RuntimeError(
+                        f"Sandbox relay object {object_key} exceeded expected size "
+                        f"({total} > {expected_size})"
+                    )
+                digest.update(data)
+                yield data
+                chunk = await asyncio.to_thread(next, it, _STREAM_EOF)
+            actual_sha = digest.hexdigest()
+            if total != expected_size or not hmac.compare_digest(actual_sha, expected_sha256):
+                raise RuntimeError(
+                    f"Sandbox relay integrity mismatch for {object_key}: "
+                    f"size={total}/{expected_size}, sha256={actual_sha}/{expected_sha256}"
+                )
+        finally:
+            try:
+                await asyncio.to_thread(it.close)
+            except Exception:
+                pass
+
+    return (
+        {
+            "upload_id": uid,
+            "workspace_id": ws,
+            "object_key": object_key,
+            "size_bytes": expected_size,
+            "sha256": expected_sha256,
+        },
+        _verified_stream(),
+    )
 
 
 def _ensure_feature_ready() -> None:
@@ -3020,11 +3356,26 @@ async def _place_row_in_sandbox(
 
     placed = False
     if can_direct and sha256_hex:
-        signed_url = await asyncio.to_thread(
-            storage.sign_download_url,
-            object_key,
-            expires_in=transfer_timeout_s(size_bytes) + 300,
-        )
+        ttl_s = transfer_timeout_s(size_bytes) + 300
+        if is_core_profile():
+            # Standalone Core: sandboxes live on isolated `sandbox-net` with no
+            # direct MinIO access; pull through the backend's short-lived HMAC
+            # streaming relay and verify SHA-256 on both sides.
+            signed_url = build_sandbox_object_relay_url(
+                sandbox=sandbox,
+                upload_id=uid,
+                workspace_id=row_ws_id,
+                object_key=object_key,
+                size_bytes=size_bytes,
+                sha256_hex=sha256_hex,
+                expires_in=ttl_s,
+            )
+        else:
+            signed_url = await asyncio.to_thread(
+                storage.sign_download_url,
+                object_key,
+                expires_in=ttl_s,
+            )
         if signed_url:
             grant_path = ""
             lock_path = ""

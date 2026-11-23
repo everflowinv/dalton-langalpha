@@ -1,0 +1,160 @@
+# Dalton Standalone Core edge gateway (Batch 1 initial loopback HTTP edition).
+# Caddy listens on :8088 inside the container; docker-compose.core.yml publishes
+# only 127.0.0.1:8088 on the host. Automatic HTTPS / custom TLS arrives in Batch 6.
+{
+	auto_https off
+	admin off
+}
+
+:8088 {
+	root * /srv
+	encode zstd gzip
+
+	# Redact ?token=<jwt> in access logs (e.g. WebSocket handshakes)
+	# while preserving non-sensitive query parameters for troubleshooting.
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>uri query {
+					replace token REDACTED
+				}
+			}
+		}
+	}
+
+	# Baseline security response headers.
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "SAMEORIGIN"
+		-Server
+	}
+
+	# Optional site-block snippets (e.g. CI header-stripping probe routes).
+	import /etc/caddy/extra/*.caddy
+
+	# 0. History replay (/api/v1/threads/<id>/messages/replay) is a finite SSE
+	# response that can run to 10+ MB on a long thread. Compress regardless of
+	# the first flushed event's size while applying the same internal-header
+	# stripping as the general backend route below.
+	@history_replay path_regexp history_replay ^/api/v1/threads/[^/]+/messages/replay$
+	handle @history_replay {
+		request_header -X-Service-Token
+		request_header -X-User-Id
+		encode {
+			zstd
+			gzip
+			minimum_length 1
+			match {
+				header Content-Type text/event-stream*
+			}
+		}
+		reverse_proxy backend:8000 {
+			header_up -X-Service-Token
+			header_up -X-User-Id
+			flush_interval -1
+		}
+	}
+
+	# 1. Reverse proxy /api/* and /ws/* to backend:8000.
+	# Strip external X-Service-Token and X-User-Id headers so the internal
+	# service-token channel cannot be invoked through the edge gateway.
+	# flush_interval -1 disables response buffering for SSE; WebSocket upgrades are native.
+	@backend_routes path /api/* /ws/*
+	handle @backend_routes {
+		request_header -X-Service-Token
+		request_header -X-User-Id
+		reverse_proxy backend:8000 {
+			header_up -X-Service-Token
+			header_up -X-User-Id
+			flush_interval -1
+		}
+	}
+
+	# 2. Build version manifest (/version.json): never cached, never SPA-fallback.
+	@version_manifest {
+		method GET HEAD
+		path /version.json
+	}
+	handle @version_manifest {
+		header Cache-Control "no-cache, no-store, must-revalidate"
+		file_server
+	}
+
+	# 3. Hashed build assets (/assets/*): long-cached when present, real 404 when absent.
+	@static_assets {
+		method GET HEAD
+		path /assets/*
+	}
+	handle @static_assets {
+		@asset_exists file
+		header @asset_exists Cache-Control "public, max-age=31536000, immutable"
+		file_server
+	}
+
+	# 4. Reject backend-only root endpoints outside /api/* and /ws/* with 404.
+	@blocked_paths path /health /health/* /docs /docs/* /redoc /redoc/* /openapi.json /metrics /metrics/*
+	handle @blocked_paths {
+		respond 404
+	}
+
+	# 5. Static documentation site (/help, /help/*):
+	#    hashed assets under /help/_astro/* are long-cached; HTML is never cached;
+	#    missing paths return HTTP 404 with /help/404.html instead of the app SPA.
+	@help_assets {
+		method GET HEAD
+		path /help/_astro/*
+	}
+	handle @help_assets {
+		@help_asset_exists file
+		header @help_asset_exists Cache-Control "public, max-age=31536000, immutable"
+		file_server
+	}
+
+	@help_docs {
+		method GET HEAD
+		path /help /help/*
+	}
+	handle @help_docs {
+		route {
+			try_files {path}/index.html {path} {path}.html
+			@help_html path *.html
+			header @help_html Cache-Control "no-cache, no-store, must-revalidate"
+			file_server
+		}
+	}
+
+	handle_errors {
+		@help_404 {
+			expression {err.status_code} == 404
+			path /help /help/*
+			not path /help/_astro/*
+		}
+		handle @help_404 {
+			header Cache-Control "no-cache, no-store, must-revalidate"
+			rewrite * /help/404.html
+			file_server
+		}
+	}
+
+	# 6. SPA static files & index.html fallback (GET/HEAD only; index.html is never cached).
+	@spa_read {
+		method GET HEAD
+	}
+	handle @spa_read {
+		route {
+			rewrite / /index.html
+			try_files {path} /index.html
+			@index_doc path /index.html
+			header @index_doc Cache-Control "no-cache, no-store, must-revalidate"
+			file_server
+		}
+	}
+
+	# 7. All other paths / methods outside /api/*, /ws/*, and static GET/HEAD return 404.
+	handle {
+		respond 404
+	}
+}

@@ -10,6 +10,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.dalton.services.chat_uploads import (
@@ -17,6 +18,7 @@ from src.dalton.services.chat_uploads import (
     complete_chat_upload,
     get_chat_upload_status,
     initiate_chat_upload,
+    prepare_sandbox_object_download,
     receive_chat_upload_part,
 )
 from src.dalton.settings import get_dalton_settings
@@ -98,6 +100,23 @@ async def complete_chat_upload_endpoint(
         upload_id=upload_id,
         user_id=user_id,
         expected_sha256=payload.sha256 if payload else None,
+    )
+
+
+@router.get("/sandbox-object/{token}")
+@handle_api_exceptions("stream chat upload object for sandbox", logger)
+async def download_sandbox_chat_upload_endpoint(
+    token: str,
+) -> StreamingResponse:
+    meta, stream = await prepare_sandbox_object_download(token)
+    return StreamingResponse(
+        stream,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Length": str(meta["size_bytes"]),
+            "X-Content-SHA256": str(meta["sha256"]),
+            "Cache-Control": "no-store",
+        },
     )
 
 
