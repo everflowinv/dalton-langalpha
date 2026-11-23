@@ -370,6 +370,7 @@ class ProvenanceMiddleware(AgentMiddleware):
             "x_search": self._extract_web_search,  # DALTON-HOOK(x-search-openclaw)
             "WebFetch": self._extract_web_fetch,
             "get_sec_filing": self._extract_sec_filing,
+            "colleague_workspace": self._extract_colleague_workspace,  # DALTON-HOOK(colleague-access)
             "Read": self._extract_file_read,
             # Glob is pure path enumeration (a directory listing), not data the
             # analysis rests on, so it is intentionally NOT tracked. Read (content
@@ -720,6 +721,76 @@ class ProvenanceMiddleware(AgentMiddleware):
                 # Body = the same per-item value that produced result_sha256.
                 result_body=body,
             )
+
+    # DALTON-HOOK(colleague-access): record redacted provenance summary for analyst colleague_workspace reads/copies
+    def _extract_colleague_workspace(
+        self, request: Any, result: Any
+    ) -> Iterator[ProvenanceSource]:
+        import json
+
+        raw_content: Any = None
+        update = getattr(result, "update", None)
+        if isinstance(update, dict):
+            msgs = update.get("messages")
+            if isinstance(msgs, list) and msgs:
+                raw_content = getattr(msgs[0], "content", None)
+        else:
+            raw_content = getattr(result, "content", result)
+        if not isinstance(raw_content, str):
+            return
+        try:
+            payload = json.loads(raw_content)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            return
+        args = request.tool_call.get("args") or {}
+        action = str(args.get("action") or "").strip().lower()
+        if action not in ("read_file", "copy_file", "read_thread"):
+            return
+        if action == "read_file":
+            ws_id = str(payload.get("workspace_id") or args.get("workspace_id") or "")
+            path = str(payload.get("path") or args.get("path") or "")
+            identifier = f"colleague_workspace:{ws_id}/{path}" if ws_id else path
+            title = path or ws_id or "colleague_workspace"
+            summary_obj: Any = payload.get("content") or ""
+        elif action == "copy_file":
+            src = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+            src_ws = str(src.get("workspace_id") or args.get("workspace_id") or "")
+            src_path = str(src.get("path") or args.get("path") or "")
+            identifier = f"colleague_workspace:{src_ws}/{src_path}" if src_ws else src_path
+            title = src_path or src_ws or "colleague_workspace"
+            summary_obj = {
+                "source": src,
+                "dest_path": payload.get("path"),
+                "size": payload.get("size"),
+            }
+        else:
+            tid = str(payload.get("thread_id") or args.get("thread_id") or "")
+            identifier = f"colleague_thread:{tid}" if tid else "colleague_thread"
+            title = f"thread:{tid}" if tid else "colleague_thread"
+            summary_obj = payload.get("text") or ""
+
+        if not identifier:
+            return
+        if isinstance(summary_obj, str) and self._redactor is not None:
+            summary_obj = self._redactor.redact(summary_obj)
+        sha256, size, snippet, body = fingerprint_result_with_body(summary_obj)
+        yield ProvenanceSource(
+            record_id=_new_id(),
+            source_type="colleague_workspace",
+            identifier=identifier,
+            timestamp=now_iso(),
+            title=title,
+            detail=action,
+            provider="colleague_workspace",
+            tool_call_id=request.tool_call.get("id"),
+            args=redact_args(args),
+            result_sha256=sha256,
+            result_size=size,
+            result_snippet=snippet,
+            result_body=body,
+        )
 
     def _extract_web_fetch(
         self, request: Any, result: Any

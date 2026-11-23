@@ -917,6 +917,33 @@ def get_dalton_operator_llm_endpoints() -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
+def is_dalton_sharing_auth_enabled() -> bool:
+    """Whether colleague workspace sharing & cross-workspace agent access is active.
+
+    Requires ``CapabilityId.COLLEAGUE_SHARING`` and Dalton multi-user auth
+    (``supabase``, or ``local`` now that Batch 4b wires ``dalton_user_roles``
+    and ``require_team_reader``).
+    """
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.COLLEAGUE_SHARING):
+        return False
+    return is_dalton_auth_enabled()
+
+
+def is_dalton_multiuser_auth_enabled() -> bool:
+    """Whether multi-user authentication (Supabase or local multi-user) is active.
+
+    Used for public share link & artifact publish role checks independent of
+    the colleague workspace sharing capability switch.
+    """
+    if is_dalton_supabase_auth_enabled():
+        return True
+    from src.config import settings as app_settings
+
+    return app_settings.HOST_MODE == "oss" and get_dalton_auth_mode() == "local"
+
+
 def get_disabled_providers() -> set[str]:
     """Return disabled provider IDs from `DALTON_DISABLED_PROVIDERS` or `dalton.yaml` (L17, P0N.8)."""
     env_raw = os.getenv("DALTON_DISABLED_PROVIDERS")

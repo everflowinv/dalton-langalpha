@@ -632,8 +632,11 @@ class LocalRunExecutor:
             from src.server.services.runs.coordinator import RunCoordinator
 
             for handle in dead_handles:
+                # DALTON-HOOK(budget): task had already entered executor and may have invoked LLMs; stay conservative.
                 await RunCoordinator.get_instance().fail_open_run(
-                    handle, "worker task died without finalizing (abandoned cleanup)"
+                    handle,
+                    "worker task died without finalizing (abandoned cleanup)",
+                    no_model_calls=False,
                 )
 
         if to_remove:

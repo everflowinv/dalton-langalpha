@@ -566,6 +566,16 @@ def create_feishu_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         user_id, err = await _require_authenticated_user(config)
         if err is not None:
             return err
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        if is_dalton_sharing_auth_enabled():
+            from src.dalton.colleague_outbound_guard import (
+                OUTBOUND_GUARD_REFUSAL_MESSAGE,
+                is_run_outbound_blocked,
+            )
+
+            if await is_run_outbound_blocked(config):
+                return _error_payload(OUTBOUND_GUARD_REFUSAL_MESSAGE, error="colleague_outbound_blocked")
         tier = await get_user_tier(user_id)
         if tier == "external":
             return _error_payload(EXTERNAL_READ_ONLY_MESSAGE, error="external_write_forbidden")
@@ -603,6 +613,16 @@ def create_feishu_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         user_id, err = await _require_authenticated_user(config)
         if err is not None:
             return err
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        if is_dalton_sharing_auth_enabled():
+            from src.dalton.colleague_outbound_guard import (
+                OUTBOUND_GUARD_REFUSAL_MESSAGE,
+                is_run_outbound_blocked,
+            )
+
+            if await is_run_outbound_blocked(config):
+                return _error_payload(OUTBOUND_GUARD_REFUSAL_MESSAGE, error="colleague_outbound_blocked")
         tier = await get_user_tier(user_id)
         if tier == "external":
             return _error_payload(EXTERNAL_READ_ONLY_MESSAGE, error="external_write_forbidden")
@@ -633,6 +653,16 @@ def create_feishu_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         user_id, err = await _require_authenticated_user(config)
         if err is not None:
             return err
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        if is_dalton_sharing_auth_enabled():
+            from src.dalton.colleague_outbound_guard import (
+                OUTBOUND_GUARD_REFUSAL_MESSAGE,
+                is_run_outbound_blocked,
+            )
+
+            if await is_run_outbound_blocked(config):
+                return _error_payload(OUTBOUND_GUARD_REFUSAL_MESSAGE, error="colleague_outbound_blocked")
         tier = await get_user_tier(user_id)
         if tier == "external":
             return _error_payload(EXTERNAL_READ_ONLY_MESSAGE, error="external_write_forbidden")

@@ -217,6 +217,9 @@ export interface Workspace {
   // DALTON-HOOK(colleague-dispatch): effective web access level and master switch for colleague workspace
   effective_web_access?: 'owner' | 'rw' | 'ro' | 'thread_only' | string | null;
   colleague_dispatch_enabled?: boolean | null;
+  // DALTON-HOOK(colleague-access): read-only auto-publish pause flag & CAS token for PublishDialog
+  auto_publish_paused?: boolean;
+  auto_publish_pause_token?: string | null;
   // DALTON-HOOK(workspace-dedup): coverage unit auto-registration outcome on create
   coverage_unit?: Record<string, unknown> | null;
   coverage_unit_warning?: string | null;

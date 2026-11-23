@@ -82,12 +82,40 @@ async def get_monitor_by_artifact_endpoint(
     return {"monitor": monitor}
 
 
+from src.dalton.colleague_outbound_guard import (
+    NON_SESSION_CLEAR_FORBIDDEN_DETAIL,
+    is_interactive_owner_session,
+)
+
+
+def _interactive_session_for_clear(
+    request: Request, user_id: CurrentUserId
+) -> bool:
+    from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+    if not is_dalton_sharing_auth_enabled():
+        return False
+    return is_interactive_owner_session(request, expected_user_id=user_id)
+
+
 @router.post("")
 @handle_api_exceptions("publish workspace monitor", logger)
 async def publish_monitor_endpoint(
-    body: PublishMonitorRequest, user_id: CurrentUserId
+    body: PublishMonitorRequest,
+    user_id: CurrentUserId,
+    interactive_session: bool = Depends(_interactive_session_for_clear),
 ) -> dict[str, Any]:
-    return await monitor_service.publish_workspace_monitor(body, caller_id=user_id)
+    from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+    sharing_auth_enabled = is_dalton_sharing_auth_enabled()
+    can_clear_pause = sharing_auth_enabled and interactive_session is True
+    if sharing_auth_enabled and body.confirm_pause_token and not can_clear_pause:
+        raise HTTPException(
+            status_code=403, detail=NON_SESSION_CLEAR_FORBIDDEN_DETAIL
+        )
+    return await monitor_service.publish_workspace_monitor(
+        body, caller_id=user_id, allow_clear_pause=can_clear_pause
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -281,10 +309,21 @@ async def update_monitor_endpoint(
 @router.post("/{slug}/republish")
 @handle_api_exceptions("republish workspace monitor", logger)
 async def republish_monitor_endpoint(
-    slug: str, body: RepublishMonitorRequest, user_id: CurrentUserId
+    slug: str,
+    body: RepublishMonitorRequest,
+    user_id: CurrentUserId,
+    interactive_session: bool = Depends(_interactive_session_for_clear),
 ) -> dict[str, Any]:
+    from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+    sharing_auth_enabled = is_dalton_sharing_auth_enabled()
+    can_clear_pause = sharing_auth_enabled and interactive_session is True
+    if sharing_auth_enabled and body.confirm_pause_token and not can_clear_pause:
+        raise HTTPException(
+            status_code=403, detail=NON_SESSION_CLEAR_FORBIDDEN_DETAIL
+        )
     return await monitor_service.republish_workspace_monitor(
-        slug, body, caller_id=user_id
+        slug, body, caller_id=user_id, allow_clear_pause=can_clear_pause
     )
 
 

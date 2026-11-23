@@ -715,6 +715,7 @@ async def commit_monitor_publish_tx(
     loaded_files: list[str] | None = None,
     left_out_files: list[str] | None = None,
     verify_public_authority: Callable[[str], Awaitable[None]] | None = None,
+    reject_if_pending_outbound_confirm: bool = False,
 ) -> tuple[MonitorRecord, PublishResult]:
     """Upsert monitor metadata/members, verify public admin inside lock, reconcile share_links, cut, and record version."""
     clean_members = list(
@@ -729,6 +730,19 @@ async def commit_monitor_publish_tx(
                 )
                 if read_basis is not None:
                     read_basis.check(locked)
+                if reject_if_pending_outbound_confirm:
+                    from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+                    if is_dalton_sharing_auth_enabled():
+                        from src.dalton.colleague_outbound_guard import (
+                            WorkspaceAutoPublishPaused,
+                            is_workspace_pending_outbound_confirm_in_cur,
+                        )
+
+                        if await is_workspace_pending_outbound_confirm_in_cur(
+                            cur, locked.workspace_id
+                        ):
+                            raise WorkspaceAutoPublishPaused(locked.workspace_id)
 
                 await cur.execute(
                     """
@@ -986,6 +1000,8 @@ async def commit_monitor_version_tx(
     run_id: str | None = None,
     new_owner_user_id: str | None = None,
     verify_public_authority: Callable[[str], Awaitable[None]] | None = None,
+    check_pending_outbound_confirm: bool = False,
+    reject_if_pending_outbound_confirm: bool = False,
 ) -> tuple[MonitorRecord, PublishResult | None, bool]:
     """Lock ``share_links`` + ``dalton_monitors``, re-read visibility, dedup ``run_id``, and cut atomically."""
     async with get_db_connection() as conn:
@@ -1010,6 +1026,25 @@ async def commit_monitor_version_tx(
                 row = await cur.fetchone()
                 if row is None:
                     raise LookupError(f"Monitor {monitor_id} not found")
+
+                if check_pending_outbound_confirm or reject_if_pending_outbound_confirm:
+                    from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+                    if is_dalton_sharing_auth_enabled():
+                        from src.dalton.colleague_outbound_guard import (
+                            WorkspaceAutoPublishPaused,
+                            is_workspace_pending_outbound_confirm_in_cur,
+                        )
+
+                        if await is_workspace_pending_outbound_confirm_in_cur(
+                            cur, locked.workspace_id
+                        ):
+                            if reject_if_pending_outbound_confirm:
+                                raise WorkspaceAutoPublishPaused(locked.workspace_id)
+                            existing = await _select_monitor_in_cur(cur, monitor_id)
+                            if existing is None:
+                                raise LookupError(f"Monitor {monitor_id} not found")
+                            return existing, None, False
 
                 dedup_mon = await _reserve_monitor_publish_run_in_cur(
                     cur, monitor_id=monitor_id, run_id=run_id

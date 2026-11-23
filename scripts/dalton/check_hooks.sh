@@ -184,6 +184,9 @@ ALLOWED_HOOKS=(
   "sandbox-caller-identity"
   # Colleague workspace task dispatch & questioning (d020)
   "colleague-dispatch"
+  # Colleague agent access: analyst colleague_workspace, UTF-8 text copy,
+  # cross-user read-only routes/LiveFS, outbound guard & capability gate
+  "colleague-access"
   # B5/D1: crawler.browser_concurrency's code default drops 6→2, sized for
   # the 4 GB backend container (~400 MB per stealth browser, ~0.7–0.8 GB for
   # the server process itself; 6 browsers took it to 3.99/4 GB during the

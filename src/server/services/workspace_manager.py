@@ -38,7 +38,7 @@ from src.server.database.workspace import (
     ACTIVE_WORK_DELETE_REFUSAL,
     MOVING_DELETE_REFUSAL,
     PUBLISHED_REPORTS_DELETE_REFUSAL,  # DALTON-HOOK(workspace-delete-guard)
-    SERVER_OWNED_CONFIG_KEYS,
+    server_owned_config_keys,  # DALTON-HOOK(colleague-access)
     WorkspaceBoundToCoverageUnitError,  # DALTON-HOOK(coverage-units)
     WorkspaceBusyError,
     WorkspaceHasPublishedReportsError,  # DALTON-HOOK(workspace-delete-guard)
@@ -190,6 +190,8 @@ class WorkspaceManager(ComputerManager):
             raise ComputerPreparingError("Computer is still being prepared")
         computer_id = str(computer["computer_id"])
 
+        # DALTON-HOOK(colleague-access): strip pending_outbound_confirm on create when colleague sharing auth is enabled
+        _owned_config_keys = server_owned_config_keys()
         workspace = await create_workspace_on_computer(
             user_id,
             name,
@@ -198,7 +200,7 @@ class WorkspaceManager(ComputerManager):
             config={
                 key: value
                 for key, value in (config or {}).items()
-                if key not in SERVER_OWNED_CONFIG_KEYS
+                if key not in _owned_config_keys
             },
         )
         if workspace is None:

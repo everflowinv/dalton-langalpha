@@ -5,7 +5,7 @@ import { Loader } from '@/components/ui/loader';
 import { GRANT_RENEW_MARGIN_MS, MIN_RENEW_INTERVAL_MS, msUntilRenewal } from '@/lib/expiry';
 import { queryKeys } from '@/lib/queryKeys';
 import { useAuth } from '../../contexts/AuthContext';
-import { apiErrorObject, apiErrorStatus, retryUnlessClientError } from '@/api/errors';
+import { apiErrorObject, apiErrorStatus, retryUnlessClientError } from '@/api/errors'; // DALTON-HOOK(colleague-access)
 import { isHtmlFile } from '../ChatAgent/utils/filePaths';
 import { getSharedMetadata, type ShareMetadata } from './api';
 import ShareUnavailable from './ShareUnavailable';
@@ -96,7 +96,13 @@ export default function SharePage(): React.ReactElement {
     // would mint a new grant and reload the page the owner is reading.
     refetchOnWindowFocus: (query) => followsLink(query.state.data) || renewalDelay(query.state) === 0,
     refetchOnReconnect: (query) => followsLink(query.state.data) || renewalDelay(query.state) === 0,
-    retry: retryUnlessClientError,
+    // DALTON-HOOK(colleague-access): skip auto-retry on 503 auto_publish_paused so visitor sees readable pause copy immediately
+    retry: (failureCount, err) => {
+      if (apiErrorStatus(err) === 503 && apiErrorObject(err)?.code === 'auto_publish_paused') {
+        return false;
+      }
+      return retryUnlessClientError(failureCount, err);
+    },
   });
 
   const title = metadata.data ? titleOf(metadata.data) : '';
@@ -115,10 +121,21 @@ export default function SharePage(): React.ReactElement {
   // A link that opens to members only, asked for signed out.
   const membersOnly = metadata.isError && apiErrorStatus(metadata.error) === 401
     && apiErrorObject(metadata.error)?.type === 'members_only';
+  // DALTON-HOOK(colleague-access): legacy shared link paused pending owner confirmation (HTTP 503)
+  const paused = metadata.isError && apiErrorStatus(metadata.error) === 503
+    && apiErrorObject(metadata.error)?.code === 'auto_publish_paused';
   if (!data || ((gone || membersOnly) && followsLink(data))) {
     if (!metadata.isError) return <Loading />;
     if (gone) return <ShareUnavailable />;
     if (membersOnly) return <ShareUnavailable variant="membersOnly" />;
+    if (paused) {
+      return (
+        <ShareUnavailable
+          variant="paused"
+          onRetry={() => void metadata.refetch()}
+        />
+      );
+    }
     return <ShareUnavailable variant="failed" onRetry={() => void metadata.refetch()} />;
   }
 

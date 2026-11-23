@@ -214,6 +214,8 @@ class RunOutcome:
     # Sandbox path -> URL of the images the run's saved text still names,
     # captured as it ended.
     images: Dict[str, str] = field(default_factory=dict)
+    # DALTON-HOOK(budget): proven zero LLM calls during this run so finalize may stamp usage_settled_at without a usage row.
+    no_model_calls: bool = field(default=False, kw_only=True)
 
 
 @asynccontextmanager
@@ -792,6 +794,19 @@ async def finalize_run(
                                     WHEN COALESCE(metadata->>%s, '') = 'true'
                                         THEN '{"cancelled_by_user": false}'::jsonb
                                     ELSE '{"cancelled_by_user": true}'::jsonb
+                                END
+                                -- DALTON-HOOK(budget): stamp terminal timestamp for bounded abandoned-settle grace and persist proven zero-model-calls verdict alongside it.
+                                || CASE
+                                    WHEN %s THEN jsonb_build_object(
+                                        'dalton_finalized_at',
+                                        to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+                                        'dalton_no_model_calls',
+                                        true
+                                    )
+                                    ELSE jsonb_build_object(
+                                        'dalton_finalized_at',
+                                        to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+                                    )
                                 END) - CASE
                                     WHEN cancel_requested_at IS NOT NULL THEN %s::text
                                     ELSE ''
@@ -799,15 +814,13 @@ async def finalize_run(
                             warnings = %s,
                             errors = %s,
                             execution_time = %s,
-                            -- The turn's own usage (when any) is inserted by
-                            -- usage_writer inside this same transaction, so the
-                            -- terminal CAS is also the billing settle for the
-                            -- row: its heartbeated in-flight spend stops
-                            -- counting the instant the real usage row exists.
-                            -- Subagent spend settles on subagent_runs rows,
-                            -- never here — a tail-draining child keeps counting
-                            -- on its own row after this parent settles.
-                            usage_settled_at = NOW(),
+                            -- DALTON-HOOK(budget): stamp usage_settled_at upfront only when
+                            -- zero model calls are proven; otherwise wait until usage_writer
+                            -- runs and verify a turn usage row exists in conversation_usages.
+                            usage_settled_at = CASE
+                                WHEN %s THEN NOW()
+                                ELSE usage_settled_at
+                            END,
                             -- DALTON-HOOK(chat-large-upload): merge replay_facts so mid-turn failed_steers survive finalize_run
                             replay_facts = NULLIF(
                                 COALESCE(replay_facts, '{}'::jsonb)
@@ -823,10 +836,12 @@ async def finalize_run(
                             status,
                             SafeJson(run_metadata),
                             SUSPENSION_STOP_META,
+                            bool(outcome.no_model_calls),  # DALTON-HOOK(budget)
                             RESTART_INTERRUPTED_META,
                             outcome.warnings or [],
                             outcome.errors or [],
                             outcome.execution_time,
+                            bool(outcome.no_model_calls),  # DALTON-HOOK(budget)
                             SafeJson(replay_facts) if replay_facts else None,
                             run_id,
                         ),
@@ -887,6 +902,44 @@ async def finalize_run(
 
                 if usage_writer is not None:
                     await usage_writer(conn, final_status)
+
+                # DALTON-HOOK(budget): stamp usage_settled_at only when a turn usage row with
+                # recorded model calls exists in conversation_usages (or zero model calls were
+                # proven upfront). Missing usage leaves usage_settled_at NULL so budget keeps
+                # the conservative reservation floor.
+                if run_row.get("usage_settled_at") is None:
+                    async with conn.cursor(row_factory=dict_row) as cur:
+                        await cur.execute(
+                            """
+                            UPDATE conversation_responses
+                            SET usage_settled_at = NOW()
+                            WHERE conversation_response_id = %s
+                              AND usage_settled_at IS NULL
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM conversation_usages cu
+                                  WHERE cu.conversation_response_id = %s
+                                    AND cu.msg_type = 'ptc'
+                                    AND cu.token_usage IS NOT NULL
+                                    AND jsonb_typeof(cu.token_usage::jsonb -> 'per_call_costs') = 'array'
+                                    AND jsonb_array_length(cu.token_usage::jsonb -> 'per_call_costs') > 0
+                              )
+                            RETURNING usage_settled_at
+                            """,
+                            (run_id, run_id),
+                        )
+                        stamped_row = await cur.fetchone()
+                    if stamped_row is not None:
+                        run_row["usage_settled_at"] = stamped_row["usage_settled_at"]
+                    else:
+                        logger.warning(
+                            "[turn_lifecycle] Skipping usage_settled_at stamp for run=%s "
+                            "thread=%s status=%s: no turn usage row exists and zero model "
+                            "calls could not be proven; budget reservation floor retained",
+                            run_id,
+                            thread_id,
+                            final_status,
+                        )
 
                 # I5: every finalize path — fail_open, error funnels, sweep,
                 # fallback — gets its terminal effects derived from the row's

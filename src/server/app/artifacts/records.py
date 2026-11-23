@@ -14,7 +14,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request  # DALTON-HOOK(colleague-access)
 
 from src.server.app.artifacts.models import (
     ArtifactGrantResponse,
@@ -253,7 +253,8 @@ async def _require_non_external_for_publish(user_id: str) -> None:
 async def _require_admin_for_public_publish(user_id: str) -> None:
     from src.dalton import access_tiers as _access_tiers
     from src.dalton import sharing as _dalton_sharing
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    # DALTON-HOOK(colleague-access): separate multi-user auth check from colleague sharing switch.
+    from src.dalton.settings import is_dalton_multiuser_auth_enabled
     from src.server.app import share_links as _share_links
 
     if _share_links.get_user_tier is not _default_get_user_tier:
@@ -264,7 +265,7 @@ async def _require_admin_for_public_publish(user_id: str) -> None:
         tier_fn = _dalton_sharing.get_user_tier
     else:
         tier_fn = _default_get_user_tier
-    if not is_dalton_supabase_auth_enabled() and tier_fn is _default_get_user_tier:
+    if not is_dalton_multiuser_auth_enabled() and tier_fn is _default_get_user_tier:
         return
     if await tier_fn(user_id) != "admin":
         raise HTTPException(
@@ -537,9 +538,25 @@ async def _status(
     )
 
 
+# DALTON-HOOK(colleague-access): only interactive web sessions (never service tokens) may clear workspace auto-publish pause
+def _interactive_session_for_artifact_publish(
+    request: Request, x_user_id: CurrentUserId
+) -> bool:
+    from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+    if not is_dalton_sharing_auth_enabled():
+        return False
+    from src.dalton.colleague_outbound_guard import is_interactive_owner_session
+
+    return is_interactive_owner_session(request, expected_user_id=x_user_id)
+
+
 @router.post("/{artifact_id}/publish", response_model=PublishResponse)
 async def publish_artifact(
-    artifact_id: str, body: PublishRequest, x_user_id: CurrentUserId
+    artifact_id: str,
+    body: PublishRequest,
+    x_user_id: CurrentUserId,
+    interactive_session: bool = Depends(_interactive_session_for_artifact_publish),
 ) -> PublishResponse:
     """Share the file and cut a version from the list the owner reviewed.
 
@@ -575,6 +592,15 @@ async def publish_artifact(
             )
     else:
         await refuse_public_link_of(owner_id)
+    # DALTON-HOOK(colleague-access): only interactive web owner session clears pause with CAS confirm_pause_token
+    from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+    can_clear_pause = is_dalton_sharing_auth_enabled() and interactive_session is True
+    if is_dalton_sharing_auth_enabled() and body.confirm_pause_token and not can_clear_pause:
+        from src.dalton.colleague_outbound_guard import NON_SESSION_CLEAR_FORBIDDEN_DETAIL
+
+        raise HTTPException(status_code=403, detail=NON_SESSION_CLEAR_FORBIDDEN_DETAIL)
+    clear_pause_out: dict[str, Any] = {}
     with db_errors(), _snapshot_errors():
         result = await snapshot.publish(
             artifact,
@@ -586,6 +612,9 @@ async def publish_artifact(
             loaded=tuple(body.loaded),
             earlier=tuple(body.earlier),
             reviewed_page=body.page_sha256,
+            allow_clear_pause=can_clear_pause,
+            confirm_pause_token=body.confirm_pause_token,
+            clear_pause_out=clear_pause_out,
         )
     version = await artifacts_db.get_version(artifact.artifact_id, result.seq)
     if version is None:
@@ -594,6 +623,9 @@ async def publish_artifact(
         artifact=await _response(result.artifact, owner_id, x_user_id),
         version=ArtifactVersionResponse.model_validate(version),
         cut=result.cut,
+        auto_publish_paused=bool(clear_pause_out.get("auto_publish_paused", False)),
+        auto_publish_pause_token=clear_pause_out.get("auto_publish_pause_token"),
+        auto_publish_pause_notice=clear_pause_out.get("auto_publish_pause_notice"),
     )
 
 

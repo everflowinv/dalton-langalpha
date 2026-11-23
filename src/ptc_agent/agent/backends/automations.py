@@ -7,11 +7,8 @@ and turns a save of its file into a create, update or delete.
 from __future__ import annotations
 
 from ptc_agent.agent.backends.db_json_folder import DbJsonFolderRoute
-from ptc_agent.agent.backends.db_json_route import README_FILE, Stored, UserDataValidationError
-from ptc_agent.agent.backends.langgraph_store import ReadOnlyStoreError
-from ptc_agent.agent.backends.sandbox import SandboxBackend
+from ptc_agent.agent.backends.db_json_route import README_FILE
 from ptc_agent.core.paths import SandboxLayout
-from ptc_agent.core.sandbox.livefs_mount import CallContext
 from src.server.services.automations import file
 
 __all__ = ["README_FILE", "AutomationsBackend"]
@@ -225,55 +222,11 @@ class AutomationsBackend(DbJsonFolderRoute):
         "Manage automations via the Automations page."
     )
     # DALTON-HOOK(coverage-units): disable cross-user direct automation file writes (use dalton_schedule_automation)
+    # DALTON-HOOK(colleague-access): cross_user_read_only enforcement lives in base DbJsonRoute / DbJsonFolderRoute
     _CROSS_USER_READ_ONLY_MSG = (
         "Direct writes to .agents/user/automations/ are disabled in cross-user shared workspaces. "
         "Use the dalton_schedule_automation tool instead so automations stay under the lead analyst's ownership."
     )
-
-    def __init__(
-        self,
-        *,
-        user_id: str,
-        call: CallContext,
-        sandbox_backend: SandboxBackend,
-        root_prefix: str,
-        cross_user_read_only: bool = False,
-    ) -> None:
-        super().__init__(
-            user_id=user_id,
-            call=call,
-            sandbox_backend=sandbox_backend,
-            root_prefix=root_prefix,
-        )
-        self._cross_user_read_only = bool(cross_user_read_only)
-
-    def _read_only(self, filename: str | None) -> bool:
-        if self._cross_user_read_only:
-            return True
-        return super()._read_only(filename)
-
-    def is_writable(self, file_path: str) -> bool:
-        if self._cross_user_read_only:
-            return False
-        return super().is_writable(file_path)
-
-    def _unwritable(self, file_path: str, filename: str | None) -> UserDataValidationError:
-        if self._cross_user_read_only:
-            name = filename or file_path.rsplit("/", 1)[-1] or README_FILE
-            return self._refusal("constraint_error", name, self._CROSS_USER_READ_ONLY_MSG)
-        return super()._unwritable(file_path, filename)
-
-    async def adelete_versioned(
-        self, file_path: str, version: str | None = None
-    ) -> Stored | None:
-        if self._cross_user_read_only:
-            raise ReadOnlyStoreError(self._CROSS_USER_READ_ONLY_MSG)
-        return await super().adelete_versioned(file_path, version)
-
-    async def arename_versioned(self, file_path: str, to: str) -> str | None:
-        if self._cross_user_read_only:
-            raise ReadOnlyStoreError(self._CROSS_USER_READ_ONLY_MSG)
-        return await super().arename_versioned(file_path, to)
 
     @classmethod
     def file_named(cls, name: str) -> file.AutomationFile | None:
