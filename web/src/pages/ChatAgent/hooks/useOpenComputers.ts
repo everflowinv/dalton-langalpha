@@ -3,6 +3,8 @@
  * its host: a refusal's way out, in a banner or in the New workspace dialog.
  */
 import { useNavigate } from 'react-router';
+// DALTON-HOOK(settings-reorg): Dalton hides Settings' Computers section, so open the dialog in place instead of navigating there.
+import { isDaltonBuild } from '@/config/brand';
 
 import { COMPUTERS_SETTINGS_URL, computersHostMounted, openComputersPanel, type ComputersPanelView } from './computerPanelStore';
 
@@ -16,7 +18,7 @@ import { COMPUTERS_SETTINGS_URL, computersHostMounted, openComputersPanel, type 
 export function useOpenComputers(): (panel: ComputersPanelView) => void {
   const navigate = useNavigate();
   return (panel) => {
-    if (computersHostMounted()) {
+    if (computersHostMounted() || isDaltonBuild) {
       openComputersPanel(panel);
       return;
     }

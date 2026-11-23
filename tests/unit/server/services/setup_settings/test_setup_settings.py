@@ -367,15 +367,27 @@ class TestRefresh:
 
 
 class TestSelfHostedOnly:
-    def test_the_server_mounts_it_only_when_self_hosted(self):
+    # DALTON-HOOK(dalton-auth): these tests pin upstream non-Dalton self-hosted behavior
+    @pytest.fixture(autouse=True)
+    def _upstream_non_dalton(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DALTON_ENABLED", "0")
+
+    def test_the_server_mounts_it_only_when_self_hosted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
         from src.server.app.setup import app
         from src.server.services import setup_settings
 
         paths = {getattr(route, "path", None) for route in app.routes}
         assert setup_settings.self_hosted()
-        assert "/api/v1/setup/status" in paths
         with patch("src.config.settings.HOST_MODE", "platform"):
             assert not setup_settings.self_hosted()
+        # DALTON-HOOK(dalton-auth): under Dalton's default enabled=true config,
+        # setup.py evaluates self_hosted() as False at import time and keeps
+        # /api/v1/setup/* unmounted.
+        monkeypatch.delenv("DALTON_ENABLED", raising=False)
+        assert not setup_settings.self_hosted()
+        assert "/api/v1/setup/status" not in paths
 
     @pytest.mark.asyncio
     async def test_a_hosted_server_reads_no_saved_settings(self):

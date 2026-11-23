@@ -26,10 +26,10 @@ from src.server.services.setup_settings.key_test import try_key
 def _owner_only(request: Request) -> None:
     """These routes have no caller to check, being the deployment's own, and a
     container on the machine must not set the keys every computer gets."""
-    # DALTON-HOOK(dalton-auth): defense in depth — refuse these routes under any Dalton sign-in mode
-    from src.dalton.settings import get_dalton_auth_mode
+    # DALTON-HOOK(dalton-auth): defense in depth — refuse these routes under any Dalton deployment or sign-in mode
+    from src.dalton.settings import get_dalton_auth_mode, is_dalton_enabled
 
-    if get_dalton_auth_mode() != "oss":
+    if is_dalton_enabled() or get_dalton_auth_mode() != "oss":
         raise HTTPException(status_code=403, detail="Deployment setup is disabled")
     owner_requests.refuse_unless_owner(request.scope)
 

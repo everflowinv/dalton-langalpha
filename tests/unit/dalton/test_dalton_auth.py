@@ -286,10 +286,30 @@ class TestSwitchOnDaltonSupabaseAuth:
         # Local accounts (the standalone core install) keep them off as well.
         monkeypatch.setenv("DALTON_AUTH_MODE", "local")
         assert self_hosted() is False
-        with pytest.raises(HTTPException):
+        with pytest.raises(HTTPException) as exc_local:
             _owner_only(_make_request())
+        assert exc_local.value.status_code == 403
 
-        # Switching Dalton auth off restores upstream OSS self_hosted() behavior.
+        # Any Dalton deployment (including APP_ENV=dalton + DALTON_AUTH_MODE=oss dev config)
+        # keeps upstream deployment setup routes disabled.
+        monkeypatch.setenv("APP_ENV", "dalton")
+        monkeypatch.setenv("DALTON_ENABLED", "1")
+        monkeypatch.setenv("DALTON_AUTH_MODE", "oss")
+        assert self_hosted() is False
+        with pytest.raises(HTTPException) as exc_dalton_oss:
+            _owner_only(_make_request())
+        assert exc_dalton_oss.value.status_code == 403
+
+        # Also when DALTON_AUTH_MODE is unset under a Dalton deployment.
+        monkeypatch.delenv("DALTON_AUTH_MODE", raising=False)
+        assert self_hosted() is False
+        with pytest.raises(HTTPException) as exc_dalton_unset:
+            _owner_only(_make_request())
+        assert exc_dalton_unset.value.status_code == 403
+
+        # Pure upstream OSS (Dalton disabled + oss auth mode) restores upstream self_hosted().
+        monkeypatch.setenv("APP_ENV", "")
+        monkeypatch.setenv("DALTON_ENABLED", "0")
         monkeypatch.setenv("DALTON_AUTH_MODE", "oss")
         assert self_hosted() is True
         _owner_only(_make_request())

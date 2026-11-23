@@ -23,10 +23,14 @@ if TYPE_CHECKING:
 def self_hosted() -> bool:
     from src.config.settings import HOST_MODE
     # DALTON-HOOK(dalton-auth): the setup routes trust whoever reaches them, so
-    # they stay off under any Dalton sign-in (Supabase now, local accounts later).
-    from src.dalton.settings import get_dalton_auth_mode
+    # they stay off under any Dalton deployment (even OSS dev config) or sign-in mode.
+    from src.dalton.settings import get_dalton_auth_mode, is_dalton_enabled
 
-    return HOST_MODE == "oss" and get_dalton_auth_mode() == "oss"
+    return (
+        HOST_MODE == "oss"
+        and not is_dalton_enabled()
+        and get_dalton_auth_mode() == "oss"
+    )
 
 
 async def boot() -> ConfigReading:

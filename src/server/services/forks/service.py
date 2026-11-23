@@ -50,9 +50,53 @@ class ForkResult:
     prefill: Optional[str]
 
 
+# DALTON-HOOK(colleague-dispatch): verify caller still has write permission on a colleague's workspace before forking
+async def check_colleague_workspace_write(
+    source: dict[str, Any] | None, caller: str, *, conn: Any = None
+) -> None:
+    """Enforce Dalton colleague workspace write access when forking in a foreign workspace.
+
+    A colleague who started a thread in another user's workspace owns the
+    thread row (``t.user_id == caller``), so ``thread_access`` alone lets them
+    through even after workspace sharing is downgraded to read-only or revoked.
+    Matches the colleague admission rule in ``turn_runtime.requested_workspace``.
+    """
+    if not source:
+        return
+    ws_owner = source.get("workspace_owner_id")
+    if not ws_owner or is_holder(ws_owner) or str(ws_owner) == str(caller):
+        return
+
+    from fastapi import HTTPException
+
+    from src.dalton.settings import (
+        is_colleague_dispatch_enabled,
+        is_dalton_supabase_auth_enabled,
+    )
+
+    workspace_id = str(source["workspace_id"])
+    if is_dalton_supabase_auth_enabled():
+        from src.dalton.sharing import require_workspace_access
+
+        if not is_colleague_dispatch_enabled():
+            await require_workspace_access(
+                workspace_id, caller, channel="web", need="read", conn=conn
+            )
+            raise HTTPException(status_code=403, detail="该功能尚未开放")
+        await require_workspace_access(
+            workspace_id, caller, channel="web", need="write", conn=conn
+        )
+    else:
+        from src.server.services.shared_workspaces.access import workspace_access
+
+        await workspace_access(workspace_id, caller)
+
+
 async def fork_thread(req: ForkRequest) -> ForkResult:
     source = await threads_read.get_thread_auth_meta(req.source_thread_id)
     await thread_access(req.source_thread_id, req.user_id, meta=source)
+    # DALTON-HOOK(colleague-dispatch): reject fork before copying when caller lost write access to a colleague's workspace
+    await check_colleague_workspace_write(source, req.user_id)
     snapshot = await take_snapshot(req.source_thread_id, req.cut, req.kind)
     subagents_allowed = await threads_read.read_thread_subagents_allowed(req.source_thread_id)
 
@@ -80,11 +124,16 @@ async def fork_thread(req: ForkRequest) -> ForkResult:
                 # while its maker can still read the source: its starter may
                 # have made it private since the copy began.
                 await thread_fork.hold_thread_row(conn, req.source_thread_id)
+                fresh_source = await threads_read.get_thread_auth_meta(
+                    req.source_thread_id, conn=conn
+                )
                 await thread_access(
                     req.source_thread_id,
                     req.user_id,
-                    meta=await threads_read.get_thread_auth_meta(req.source_thread_id, conn=conn),
+                    meta=fresh_source,
                 )
+                # DALTON-HOOK(colleague-dispatch): re-check colleague workspace write access before committing
+                await check_colleague_workspace_write(fresh_source, req.user_id, conn=conn)
         except BaseException:
             if copied_apart:
                 await _drop_unclaimed(thread_id)
@@ -183,6 +232,25 @@ async def _write_thread(
         at=datetime.now(UTC),
         by=req.user_id,
     )
+    # DALTON-HOOK(colleague-dispatch): record actual starter user_id (and dispatched_by metadata in a colleague's workspace), matching create_thread_endpoint
+    ws_owner_id = (
+        str(source["workspace_owner_id"])
+        if source.get("workspace_owner_id")
+        else None
+    )
+    metadata = lineage.as_metadata()
+    if (
+        ws_owner_id
+        and not is_holder(ws_owner_id)
+        and ws_owner_id != str(req.user_id)
+    ):
+        from src.dalton.sharing import build_dispatched_by_meta
+
+        dispatched_by = await build_dispatched_by_meta(
+            req.user_id, ws_owner_id, channel="web"
+        )
+        if dispatched_by is not None:
+            metadata["dispatched_by"] = dispatched_by
     await create_thread(
         conversation_thread_id=thread_id,
         workspace_id=str(source["workspace_id"]),
@@ -190,10 +258,12 @@ async def _write_thread(
         msg_type=source.get("msg_type") or "ptc",
         title=title,
         platform=req.platform,
-        metadata=lineage.as_metadata(),
+        metadata=metadata,
         subagents_allowed=subagents_allowed,
         reasoning_effort=source.get("reasoning_effort"),
         fast_mode=source.get("fast_mode"),
+        # DALTON-HOOK(colleague-dispatch): record actual starter user_id on non-holder forks
+        user_id=None if is_holder(source["user_id"]) else req.user_id,
         created_by=created_by,
         conn=conn,
     )

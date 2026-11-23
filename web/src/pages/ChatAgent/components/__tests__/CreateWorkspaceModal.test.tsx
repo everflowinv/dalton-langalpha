@@ -13,10 +13,22 @@ import { useLocation } from 'react-router';
 import { renderWithProviders } from '@/test/utils';
 import { queryKeys } from '@/lib/queryKeys';
 
-vi.mock('../../hooks/computerPanelStore', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../hooks/computerPanelStore')>()),
-  openComputersPanel: vi.fn(),
+// DALTON-HOOK(settings-reorg): toggle isDaltonBuild and spy on openComputersPanel while preserving real store state
+const brandMock = vi.hoisted(() => ({ isDaltonBuild: false }));
+vi.mock('@/config/brand', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/config/brand')>()),
+  get isDaltonBuild() {
+    return brandMock.isDaltonBuild;
+  },
 }));
+
+vi.mock('../../hooks/computerPanelStore', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../hooks/computerPanelStore')>();
+  return {
+    ...actual,
+    openComputersPanel: vi.fn(actual.openComputersPanel),
+  };
+});
 
 vi.mock('../../utils/api', () => ({
   getComputers: vi.fn(),
@@ -39,7 +51,11 @@ vi.mock('@/lib/dalton/coverage', async (importOriginal) => ({
 import { toast } from '@/components/ui/use-toast';
 import { useDaltonCoverageUnits } from '@/lib/dalton/coverage';
 import { getComputerProviders, getComputers, startWorkspace, uploadWorkspaceFile } from '../../utils/api';
-import { openComputersPanel } from '../../hooks/computerPanelStore';
+import {
+  closeComputersPanel,
+  openComputersPanel,
+  useComputersPanel,
+} from '../../hooks/computerPanelStore';
 import CreateWorkspaceModal from '../CreateWorkspaceModal';
 
 const mockUpload = uploadWorkspaceFile as Mock;
@@ -87,6 +103,9 @@ const SECOND = machine(SECOND_ID, 'Second machine', { status: 'stopped' });
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // DALTON-HOOK(settings-reorg): reset brand flag and computer panel store between tests
+  brandMock.isDaltonBuild = false;
+  closeComputersPanel();
   vi.mocked(startWorkspace).mockResolvedValue({ workspace_id: LIVE_CREATED.workspace_id, status: 'running' });
   mockGetComputers.mockResolvedValue({ computers: [PRIMARY], total: 1 });
   mockProviders.mockResolvedValue({ providers: [{ kind: 'daytona', is_default: true, allowed: null }] });
@@ -102,10 +121,28 @@ function Path() {
   return <span data-testid="path">{useLocation().pathname}</span>;
 }
 
-function setup(onCreate: Mock, onComplete = vi.fn(), onClose = vi.fn()) {
+// DALTON-HOOK(settings-reorg): lightweight in-place dialog observer for computerPanelStore
+function InPlaceComputersDialogProbe() {
+  const { panel } = useComputersPanel();
+  if (!panel) return null;
+  return (
+    <div role="dialog" aria-label="Computers dialog">
+      <span data-testid="computers-panel-view">{panel.view}</span>
+      <button type="button" onClick={closeComputersPanel}>Close computers</button>
+    </div>
+  );
+}
+
+function setup(
+  onCreate: Mock,
+  onComplete = vi.fn(),
+  onClose = vi.fn(),
+  options: { route?: string; withComputersProbe?: boolean } = {},
+) {
   const { queryClient } = renderWithProviders(
     <>
       <Path />
+      {options.withComputersProbe && <InPlaceComputersDialogProbe />}
       <CreateWorkspaceModal
         isOpen
         onClose={onClose}
@@ -113,6 +150,8 @@ function setup(onCreate: Mock, onComplete = vi.fn(), onClose = vi.fn()) {
         onComplete={onComplete}
       />
     </>,
+    // DALTON-HOOK(settings-reorg): pass initial route to verify in-place dialog does not leave the current page
+    options.route ? { route: options.route } : undefined,
   );
   return { onComplete, onClose, queryClient };
 }
@@ -434,6 +473,10 @@ describe('CreateWorkspaceModal, a computer still being prepared', () => {
   });
 
   it('offers to add a computer when the user has none and none is built for them', async () => {
+    // DALTON-HOOK(settings-reorg): Dalton hides Settings' Computers section, so
+    // clicking "Add a computer" opens the dialog in place on the current page
+    // and closing it leaves the user on the original page.
+    brandMock.isDaltonBuild = true;
     const user = userEvent.setup();
     mockGetComputers.mockResolvedValue({ computers: [], total: 0 });
     const onCreate = vi.fn().mockRejectedValue(
@@ -444,7 +487,10 @@ describe('CreateWorkspaceModal, a computer still being prepared', () => {
         },
       }),
     );
-    const { onClose } = setup(onCreate);
+    const { onClose } = setup(onCreate, vi.fn(), vi.fn(), {
+      route: '/dashboard',
+      withComputersProbe: true,
+    });
 
     await user.type(screen.getByPlaceholderText(/name/i), 'First');
     await user.click(screen.getByRole('button', { name: /^create$/i }));
@@ -454,11 +500,15 @@ describe('CreateWorkspaceModal, a computer still being prepared', () => {
     expect(screen.queryByText('Add a computer first.')).not.toBeInTheDocument();
     await user.click(within(card).getByRole('button', { name: 'Add a computer' }));
     expect(onClose).toHaveBeenCalled();
-    expect(openComputersPanel).toHaveBeenCalledWith({ view: 'create', returnTo: 'settings' });
-    // No page here shows the Computers dialog, so it opens on Settings'
-    // Computers section now, and closes onto its list, rather than unasked
-    // on whichever page shows one next.
-    expect(screen.getByTestId('path')).toHaveTextContent('/settings');
+    // DALTON-HOOK(settings-reorg): assert in-place Computers dialog stays on the original page before and after closing
+    expect(openComputersPanel).toHaveBeenCalledWith({ view: 'create' });
+    expect(screen.getByRole('dialog', { name: 'Computers dialog' })).toBeInTheDocument();
+    expect(screen.getByTestId('computers-panel-view')).toHaveTextContent('create');
+    expect(screen.getByTestId('path')).toHaveTextContent('/dashboard');
+
+    await user.click(screen.getByRole('button', { name: 'Close computers' }));
+    expect(screen.queryByRole('dialog', { name: 'Computers dialog' })).not.toBeInTheDocument();
+    expect(screen.getByTestId('path')).toHaveTextContent('/dashboard');
   });
 
   it("offers the computer whose backup is off when that is why Home can't live anywhere", async () => {
@@ -486,6 +536,7 @@ describe('CreateWorkspaceModal, a computer still being prepared', () => {
     await user.click(within(card).getByRole('button', { name: 'Open Office Mac' }));
     expect(onClose).toHaveBeenCalled();
     expect(openComputersPanel).toHaveBeenCalledWith({ view: 'details', computerId: SECOND_ID, returnTo: 'settings' });
+    expect(screen.getByTestId('path')).toHaveTextContent('/settings');
   });
 });
 

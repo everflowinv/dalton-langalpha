@@ -1,11 +1,38 @@
-import { Suspense, createContext, lazy, useCallback, useContext, useState, type ReactNode } from 'react';
+import { Suspense, createContext, lazy, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router';
+// DALTON-HOOK(settings-reorg): mount ComputersDialogHost lazily in place when a Dalton page without its own host opens the Computers dialog.
+import { isDaltonBuild } from '@/config/brand';
+import { computersHostMounted, useComputersPanel } from '@/pages/ChatAgent/hooks/computerPanelStore';
 import { useCreateWorkspace } from '@/pages/ChatAgent/hooks/useCreateWorkspace';
 import type { Workspace } from '@/types/api';
 
 const CreateWorkspaceModal = lazy(() => import('@/pages/ChatAgent/components/CreateWorkspaceModal'));
+const ComputersDialogHost = lazy(() => import('@/pages/ChatAgent/components/ComputersDialogHost'));
 
 const OpenCreateWorkspace = createContext<(() => void) | null>(null);
+
+// DALTON-HOOK(settings-reorg): fallback Computers host for pages without their own ComputersDialogHost so closing leaves the user on the original page.
+function FallbackComputersHost() {
+  const { panel, specComputerId } = useComputersPanel();
+  const [active, setActive] = useState(false);
+  const open = Boolean(panel || specComputerId);
+
+  useEffect(() => {
+    if (!isDaltonBuild) return;
+    if (open && !computersHostMounted()) {
+      setActive(true);
+    } else if (!open && active) {
+      setActive(false);
+    }
+  }, [open, active]);
+
+  if (!active) return null;
+  return (
+    <Suspense fallback={null}>
+      <ComputersDialogHost />
+    </Suspense>
+  );
+}
 
 /**
  * The app shell's "New workspace" dialog, which opens the workspace once made.
@@ -30,6 +57,8 @@ export function CreateWorkspaceHost({ children }: { children: ReactNode }) {
           <CreateWorkspaceModal isOpen onClose={() => setOpen(false)} onCreate={createWorkspace} onComplete={openCreated} />
         </Suspense>
       )}
+      {/* DALTON-HOOK(settings-reorg): render ComputersDialogHost in place on pages without their own host */}
+      <FallbackComputersHost />
     </OpenCreateWorkspace.Provider>
   );
 }

@@ -54,6 +54,10 @@ async def _admit(thread_id: str, user_id: str, platform: Optional[str]) -> None:
 
     meta = await threads_read.get_thread_auth_meta(thread_id)
     await thread_access(thread_id, user_id, meta=meta)
+    # DALTON-HOOK(colleague-dispatch): verify write permission on colleague's workspace before credit check
+    from src.server.services.forks.service import check_colleague_workspace_write
+
+    await check_colleague_workspace_write(meta, user_id)
     identity = await TurnIdentity.of(user_id, str(meta["user_id"]))
     await enforce_credit_limit(
         identity.recorded_as, byok=(await own_access(user_id)).any, surface=platform

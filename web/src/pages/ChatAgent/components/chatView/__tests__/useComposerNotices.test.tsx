@@ -13,6 +13,8 @@ import { fireEvent, screen } from '@testing-library/react';
 import type { ClaudeCodePlan, ClaudeCodePlanHeld, ClaudeCodePlanWindow } from '@/api/model';
 import type { PlanOut } from '@/lib/claudeCodePlan';
 import { queryKeys } from '@/lib/queryKeys';
+// DALTON-HOOK(antigravity-series): verify Antigravity series · effort labels in composer notices
+import { ANTIGRAVITY_PROVIDER, buildSeriesCatalog, type AntigravitySeriesCatalog } from '@/lib/antigravitySeries';
 import { createTestQueryClient, renderWithProviders } from '@/test/utils';
 import type { FallbackSuggestion } from '../../../session/types';
 import type { useThreadModel } from '../../../hooks/useThreadModel';
@@ -23,6 +25,8 @@ const h = vi.hoisted(() => ({
   planOut: 'stop' as PlanOut,
   meter: undefined as { credential: { kind: 'saved' } | null; checkAfter: number | null } | undefined,
   steps: 'none' as 'pending' | 'none',
+  seriesCatalog: undefined as AntigravitySeriesCatalog | undefined,
+  rawMetadata: undefined as Record<string, { provider?: string; display_name?: string }> | undefined,
 }));
 
 vi.mock('@/hooks/useAllModels', () => ({
@@ -32,7 +36,12 @@ vi.mock('@/hooks/useAllModels', () => ({
       'claude-sonnet-5-5-code': { provider: 'claude-code', sdk: 'claude-code', display_name: 'Sonnet Code' },
       'model-alpha': { provider: 'openai', display_name: 'Alpha' },
       'model-beta': { provider: 'openai', display_name: 'Beta' },
+      // DALTON-HOOK(antigravity-series): Antigravity variants and optional series catalog/raw metadata overrides
+      'gemini-4-neon-high-oauth': { provider: 'antigravity-oauth', display_name: 'Gemini 4 Neon High (Antigravity)' },
+      'gemini-4-neon-xhigh-oauth': { provider: 'antigravity-oauth', display_name: 'Gemini 4 Neon XHigh (Antigravity)' },
     },
+    ...(h.seriesCatalog ? { seriesCatalog: h.seriesCatalog } : {}),
+    ...(h.rawMetadata ? { rawApiResponse: { model_metadata: h.rawMetadata } } : {}),
   }),
 }));
 vi.mock('@/hooks/useWorkspaceClaudeCode', () => ({
@@ -109,6 +118,9 @@ beforeEach(() => {
   h.planOut = 'stop';
   h.meter = { credential: { kind: 'saved' }, checkAfter: null };
   h.steps = 'none';
+  // DALTON-HOOK(antigravity-series): reset optional Antigravity catalog overrides between tests
+  h.seriesCatalog = undefined;
+  h.rawMetadata = undefined;
 });
 
 describe('the model notice', () => {
@@ -155,6 +167,47 @@ describe('the model notice', () => {
     h.steps = 'pending';
     show(<Notices model={threadModel('model-alpha', held)} chiefOfStaff />);
     expect(screen.getByRole('button', { name: 'Set up Claude Code' })).toBeTruthy();
+  });
+
+  // DALTON-HOOK(antigravity-series): format Antigravity variant keys as Series · Effort in composer notices
+  it('formats Antigravity models as series name and effort in the default-model offer', () => {
+    h.seriesCatalog = buildSeriesCatalog([
+      {
+        series_id: 'antigravity-oauth:gemini-4-neon',
+        series_prefix: 'gemini-4-neon',
+        provider: ANTIGRAVITY_PROVIDER,
+        display_name: 'Gemini 4 Neon',
+        qualified_display_name: 'Gemini 4 Neon (Antigravity)',
+        default_effort: 'high',
+        default_model: 'gemini-4-neon-high-oauth',
+        efforts: ['high', 'xhigh'],
+        variants: {
+          high: 'gemini-4-neon-high-oauth',
+          xhigh: 'gemini-4-neon-xhigh-oauth',
+        },
+      },
+    ]);
+    h.rawMetadata = {
+      'gemini-4-neon-high-oauth': { provider: ANTIGRAVITY_PROVIDER },
+      'gemini-4-neon-xhigh-oauth': { provider: ANTIGRAVITY_PROVIDER },
+    };
+
+    show(
+      <Notices
+        model={threadModel('gemini-4-neon-xhigh-oauth', {
+          offer: {
+            model: 'gemini-4-neon-xhigh-oauth',
+            defaultModel: 'gemini-4-neon-high-oauth',
+          },
+        })}
+      />,
+    );
+
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'This thread uses Gemini 4 Neon · Extra High. New threads start on Gemini 4 Neon · High.',
+    );
+    expect(screen.getByRole('button', { name: 'Make Gemini 4 Neon · Extra High my default' })).toBeTruthy();
+    expect(screen.queryByText(/Gemini 4 Neon XHigh/)).toBeNull();
   });
 });
 
