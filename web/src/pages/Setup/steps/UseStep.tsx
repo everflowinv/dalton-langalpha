@@ -1,3 +1,4 @@
+import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { useId, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
@@ -277,9 +278,11 @@ function UseForm() {
             onSelect={setRunsOn}
             mark={<AnswerTile>{inDesktopApp ? <Laptop aria-hidden="true" strokeWidth={1.5} /> : <Cloud aria-hidden="true" strokeWidth={1.5} />}</AnswerTile>}
             title={t(inDesktopApp ? 'setup.answers.use.thisComputer' : 'setup.answers.use.serverComputer')}
-            detail={t(inDesktopApp ? 'setup.answers.use.thisComputerDesc' : 'setup.answers.use.serverComputerDesc')}
+            // DALTON-HOOK(brand-name): the desktop line names the product through the brand
+            detail={t(inDesktopApp ? 'setup.answers.use.thisComputerDesc' : 'setup.answers.use.serverComputerDesc', { brand: BRAND_NAME })}
           />
-          {inDesktopApp && (
+          {/* DALTON-HOOK(brand-name): the upstream hosted-service pitch stays out of Dalton builds */}
+          {inDesktopApp && !isDaltonBuild && (
             <SetupNote icon={<Cloud />}>
               {t('setup.answers.use.hostedPitch')}
               <span className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1">

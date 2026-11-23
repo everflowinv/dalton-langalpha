@@ -130,14 +130,16 @@ describe('UseStep', () => {
     renderStep();
     expect(screen.getByRole('radio', { name: /On this computer/ })).toBeChecked();
     expect(screen.queryByText(/Keeps working when your computer is off/)).toBeNull();
-    expect(screen.getByRole('link', { name: /Get the LangAlpha.ai app/ })).toHaveAttribute('href', DESKTOP_DOWNLOAD_URL);
+    // DALTON-HOOK(brand-name): the Setup strings carry no upstream brand
+    expect(screen.getByRole('link', { name: /Get the hosted app/ })).toHaveAttribute('href', DESKTOP_DOWNLOAD_URL);
     expect(screen.getByRole('link', { name: /Hosted or self-hosted/ })).toHaveAttribute('href', HOSTED_OR_SELF_HOSTED_URL);
   });
 
   it('on a self-hosted server, keeps the answer that it runs while your computer is off, with no pitch', () => {
     renderStep();
     expect(screen.getByRole('radio', { name: /On a computer this server runs/ })).toBeChecked();
-    expect(screen.queryByRole('link', { name: /Get the LangAlpha.ai app/ })).toBeNull();
+    // DALTON-HOOK(brand-name): the Setup strings carry no upstream brand
+    expect(screen.queryByRole('link', { name: /Get the hosted app/ })).toBeNull();
   });
 
   it('says nothing where Home is on a cloud computer or none', () => {
