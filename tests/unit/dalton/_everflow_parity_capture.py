@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import json
 import os
 import sys
@@ -40,7 +41,7 @@ if str(REPO_ROOT / "src") not in sys.path:
 
 from langchain.agents import create_agent as langchain_create_agent
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
-from langchain_core.tools import tool
+from langchain_core.tools import BaseTool
 
 from ptc_agent.agent import agent as agent_mod
 from ptc_agent.agent import graph as graph_mod
@@ -158,95 +159,91 @@ def _normalize_repo_path(value: Any) -> Any:
     return value
 
 
-def _make_fixed_mcp_tools(config: AgentConfig) -> dict[str, list[MCPToolInfo]]:
-    """Deterministic MCPToolInfo fixtures for enabled servers so formatter renders real docs."""
-    catalog: dict[str, list[MCPToolInfo]] = {
-        "price_data": [
-            MCPToolInfo(
-                name="get_stock_data",
-                description="Fetch OHLCV historical prices and quote metrics for a ticker.",
-                input_schema={
-                    "type": "object",
-                    "properties": {
-                        "symbol": {"type": "string", "description": "Ticker symbol"},
-                        "interval": {
-                            "type": "string",
-                            "description": "Bar interval",
-                            "default": "1day",
-                        },
-                    },
-                    "required": ["symbol"],
-                },
-                server_name="price_data",
-            ),
-        ],
-        "fundamentals": [
-            MCPToolInfo(
-                name="get_financial_statements",
-                description="Retrieve quarterly or annual financial statements.",
-                input_schema={
-                    "type": "object",
-                    "properties": {
-                        "symbol": {"type": "string", "description": "Ticker symbol"},
-                        "period": {"type": "string", "default": "annual"},
-                    },
-                    "required": ["symbol"],
-                },
-                server_name="fundamentals",
-            ),
-        ],
-        "dalton_sec": [
-            MCPToolInfo(
-                name="get_sec_company_facts",
-                description="Read structured SEC EDGAR XBRL facts for a US issuer.",
-                input_schema={
-                    "type": "object",
-                    "properties": {
-                        "ticker": {"type": "string", "description": "US ticker symbol"},
-                    },
-                    "required": ["ticker"],
-                },
-                server_name="dalton_sec",
-            ),
-        ],
-        "researchdata": [
-            MCPToolInfo(
-                name="search_research",
-                description="Search institutional research documents, transcripts, and notes.",
-                input_schema={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query"},
-                    },
-                    "required": ["query"],
-                },
-                server_name="researchdata",
-            ),
-        ],
-    }
-    enabled_names = {s.name for s in config.mcp.servers if s.enabled}
-    return {name: tools for name, tools in catalog.items() if name in enabled_names}
+async def _load_real_mcp_tools(config: AgentConfig) -> dict[str, list[MCPToolInfo]]:
+    """Read real tool names, descriptions, and schemas from builtin MCP server modules in-process.
+
+    No subprocesses and no network calls:
+    - Stdio builtin servers under ``plugins/`` are imported directly and queried
+      via ``await module.mcp.list_tools()``.
+    - ``researchdata`` (HTTP bridge) is queried via the canonical in-process
+      ``researchdata_mcp.tool_catalog()`` definition.
+    """
+    loaded: dict[str, list[MCPToolInfo]] = {}
+    for srv in config.mcp.servers:
+        if not srv.enabled:
+            continue
+        script = next(
+            (a for a in (srv.args or []) if isinstance(a, str) and a.endswith(".py")),
+            None,
+        )
+        if script and script.startswith("plugins/"):
+            module_name = script[:-3].replace("/", ".")
+            module = importlib.import_module(module_name)
+            raw_tools = await module.mcp.list_tools()
+            loaded[srv.name] = [
+                MCPToolInfo(
+                    name=t.name,
+                    description=t.description or "",
+                    input_schema=(
+                        getattr(t, "input_schema", None)
+                        or getattr(t, "inputSchema", None)
+                        or {}
+                    ),
+                    server_name=srv.name,
+                )
+                for t in raw_tools
+            ]
+        elif srv.name == "researchdata":
+            rd_scripts_dir = str(
+                (REPO_ROOT / "scripts" / "dalton" / "research_runtime" / "scripts").resolve()
+            )
+            if rd_scripts_dir not in sys.path:
+                sys.path.insert(0, rd_scripts_dir)
+            rd_mod = importlib.import_module("researchdata_mcp")
+            loaded[srv.name] = [
+                MCPToolInfo(
+                    name=str(entry["name"]),
+                    description=str(entry.get("description") or ""),
+                    input_schema=dict(entry.get("inputSchema") or {}),
+                    server_name=srv.name,
+                )
+                for entry in rd_mod.tool_catalog()
+            ]
+    return loaded
 
 
 def _make_direct_mcp_double() -> Any:
-    """Create a deterministic ``DirectToolSet`` double with one stamped direct tool."""
+    """Create a ``DirectToolSet`` double backed by real tools from ``src/tools/market_data/tool.py``."""
+    from src.server.services.egress.direct_tools import direct_tool_name
 
-    @tool("direct_market_note")
-    def _direct_market_note(symbol: str) -> str:
-        """Read a directly-bound market note for a ticker."""
-        return symbol
-
-    _direct_market_note.metadata = {
-        METADATA_KEY: {
-            "server": "researchdata",
-            "tool": "direct_market_note",
-            "approval": False,
-            "sandboxed": True,
-        }
-    }
+    market_module = importlib.import_module("src.tools.market_data.tool")
+    direct_tools: list[BaseTool] = []
+    for obj in vars(market_module).values():
+        if not isinstance(obj, BaseTool):
+            continue
+        fn = getattr(obj, "coroutine", None) or getattr(obj, "func", None)
+        if fn is None or fn.__module__ != market_module.__name__:
+            continue
+        stamped = obj.model_copy(
+            update={
+                "name": direct_tool_name("market_data", obj.name),
+                "metadata": {
+                    **(obj.metadata or {}),
+                    METADATA_KEY: {
+                        "server": "market_data",
+                        "tool": obj.name,
+                        "approval": False,
+                        "sandboxed": False,
+                    },
+                },
+            }
+        )
+        direct_tools.append(stamped)
+    direct_tools.sort(key=lambda t: t.name)
+    assert direct_tools, "Expected real direct market tools from src/tools/market_data/tool.py"
 
     direct_mcp = create_autospec(DirectToolSet, instance=True)
-    direct_mcp.tools = [_direct_market_note]
+    direct_mcp.tools = direct_tools
     direct_mcp.check.return_value = None
     return direct_mcp
 
@@ -284,7 +281,7 @@ async def _capture_production_graph_surface(
         return real_task_middleware(subagents, *args, **kwargs)
 
     core_cfg = config.to_core_config()
-    fixed_mcp_tools = _make_fixed_mcp_tools(config)
+    real_mcp_tools = await _load_real_mcp_tools(config)
 
     sandbox = create_autospec(PTCSandbox, instance=True)
     sandbox.config = core_cfg
@@ -300,8 +297,8 @@ async def _capture_production_graph_surface(
     mcp_registry = create_autospec(MCPRegistry, instance=True)
     mcp_registry.config = core_cfg
     mcp_registry.connectors = {}
-    mcp_registry.tools_by_server = fixed_mcp_tools
-    mcp_registry.get_all_tools.return_value = fixed_mcp_tools
+    mcp_registry.tools_by_server = real_mcp_tools
+    mcp_registry.get_all_tools.return_value = real_mcp_tools
 
     session = create_autospec(Session, instance=True)
     session.sandbox = sandbox
