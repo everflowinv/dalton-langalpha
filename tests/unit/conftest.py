@@ -187,6 +187,10 @@ def _config_caches_follow_the_test():
     yield
     if _state() != before:
         config_core.clear_config_cache()
+        # Reload under the restored environment, so the next test finds the caches
+        # warm (some tests patch os.getenv wholesale and must not trigger a reload).
+        with contextlib.suppress(Exception):
+            config_core.load_infrastructure_config()
 
 
 _CACHED_LOADER: list = []
