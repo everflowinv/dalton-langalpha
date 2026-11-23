@@ -2128,3 +2128,16 @@ class TestBackendCapabilityPruning:
         assert res_br_off["ok"] is False
         assert res_br_off["error_code"] == "capability_disabled"
         assert http_guard.call_count == 0
+
+
+@pytest.fixture(autouse=True)
+def _drop_profile_config_caches_after_test():
+    """These tests switch APP_ENV / DALTON_PROFILE and reload config; monkeypatch
+    restores the env afterwards but not the config caches, so a later test in the
+    same worker would read the Dalton or core overlay. Clear them on the way out."""
+    yield
+    from src.config.core import clear_config_cache as _clear_config_cache
+    from src.dalton.settings import get_dalton_config as _get_dalton_config
+
+    _clear_config_cache()
+    _get_dalton_config.cache_clear()
