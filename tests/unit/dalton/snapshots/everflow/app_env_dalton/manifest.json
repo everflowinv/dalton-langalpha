@@ -1,0 +1,1349 @@
+{
+  "agent_config_switches": {
+    "fetch_chain": [
+      "inhouse",
+      "firecrawl"
+    ],
+    "llm": {
+      "background": "gemini-4-neon-low-oauth",
+      "compaction": null,
+      "fallback": [
+        "gemini-4-neon-high-oauth",
+        "claude-opus-5-5-oauth",
+        "gpt-6.2-sol-oauth",
+        "grok-4.7-oauth",
+        "muse-wonder-1.0-oauth",
+        "deepseek-flash"
+      ],
+      "fetch": null,
+      "name": "claude-opus-5-5-oauth"
+    },
+    "sandbox_offered_providers": [],
+    "sandbox_provider": "docker",
+    "search_api": "gemini_grounding",
+    "subagents_definition_models": {
+      "data-prep": "grok-4.7-oauth",
+      "general-purpose": "grok-4.7-oauth",
+      "research": "grok-4.7-oauth"
+    },
+    "subagents_enabled": [
+      "general-purpose",
+      "research",
+      "data-prep",
+      "equity-analyst",
+      "report-builder"
+    ],
+    "x_search_enabled": true
+  },
+  "app_env": "dalton",
+  "dalton_config": {
+    "artifact_publishing": {
+      "enabled": false
+    },
+    "autonomy": {
+      "backoff": {
+        "base_hours": 24.0,
+        "max_days": 30.0
+      },
+      "data_health_timeout_s": 600.0,
+      "enabled": true,
+      "est_cost_by_kind": {
+        "bullbear": 2.5,
+        "earnings_deep": 6.0,
+        "earnings_flash": 1.2,
+        "earnings_preview": 2.5,
+        "filing_review": 1.5,
+        "full_coverage": 12.0,
+        "initial_coverage": 4.5,
+        "question_followup": 1.5,
+        "stock_move": 1.2,
+        "thesis_delta": 1.0,
+        "topic_research": 5.0,
+        "weekly_review": 4.0
+      },
+      "event_reserve_ratio": 0.2,
+      "min_wake_usd": 0.5,
+      "preflight_timeout_s": 45.0,
+      "preflight_timeout_streak": 3,
+      "reserve_for_events_usd": 5.0,
+      "timezone": "Asia/Shanghai",
+      "vendor_quota_alert_ratio": 0.8
+    },
+    "budget": {
+      "admission_floor_usd": 0.25,
+      "default_daily_cap_usd": 100.0,
+      "default_task_cap_usd": null,
+      "lease_ttl_seconds": 300,
+      "reserve_chunk_usd": 1.0,
+      "timezone": "Asia/Shanghai"
+    },
+    "chat_uploads": {
+      "cleanup_enabled": true,
+      "part_read_idle_timeout_s": 30.0,
+      "part_read_total_timeout_s": 180.0
+    },
+    "colleague_dispatch": {
+      "enabled": false
+    },
+    "computer_cli_tokens": {
+      "enabled": false
+    },
+    "configured_pm_user_ids": [],
+    "conversations": {
+      "agents": [
+        "main",
+        "chem",
+        "marco"
+      ],
+      "cursors_file": "var/dalton/conversations/cursors.json",
+      "default_backfill_days": 14,
+      "embedding_dimensions": 3072,
+      "embedding_model": "gemini-embedding-2-preview",
+      "embedding_model_preferred": "gemini-embedding-2-preview",
+      "enabled": true,
+      "export_cursors_file": "var/dalton/conversations/export_cursors.json",
+      "extract_concurrency": 1,
+      "extractor_fallback_model": "gemini-4-argon-medium-oauth",
+      "extractor_model": "deepseek-flash",
+      "hourly_token_budget": 5000000,
+      "inbox_dir": "var/dalton/conversations/inbox",
+      "max_segment_chars": 6000,
+      "max_segment_events": 25,
+      "max_segment_gap_minutes": 30,
+      "prompt_version": "conv_card_v2_3",
+      "rate_limit_initial_backoff_seconds": 30.0,
+      "rate_limit_max_backoff_seconds": 900.0,
+      "recency_floor": 0.7,
+      "recency_half_life_days": 180.0,
+      "segment_deadline_s": 600.0
+    },
+    "coverage_units": {
+      "enabled": true
+    },
+    "credentials": {
+      "sharing": "team"
+    },
+    "data_jobs": {
+      "enabled": true,
+      "min_free_mem_mb": 1280
+    },
+    "enabled": true,
+    "internal_llm": {
+      "allowed_models": [
+        "gemini-4-hydrogen-high-oauth",
+        "gemini-4-argon-medium-oauth",
+        "gpt-6.2-sol-oauth"
+      ]
+    },
+    "knowledge": {
+      "enabled": true,
+      "max_doc_bytes": 1048576
+    },
+    "mandate": {
+      "anchor_stale_days": 14,
+      "anchor_stale_move": 0.15,
+      "call_hurdle_annual": 0.15,
+      "long_hurdle_annual": 0.15,
+      "max_adverse_move_act_now": 0.25,
+      "max_entry_distance": 0.25,
+      "min_total_return": 0.1,
+      "short_hurdle_annual": 0.2
+    },
+    "models": {
+      "assist_fallback_model": [
+        "deepseek-flash"
+      ],
+      "assist_model": "gemini-4-hydrogen-low-oauth",
+      "disabled_providers": [],
+      "probe_models": {
+        "antigravity-oauth": "gemini-4-hydrogen-low-oauth",
+        "claude-oauth": "claude-sonnet-5-5-oauth",
+        "codex-oauth": "gpt-6.2-sol-oauth",
+        "deepseek": "deepseek-flash",
+        "gemini": "gemini-4-neon",
+        "muse-oauth": "muse-spark-1.3-oauth",
+        "openai": "gpt-6-luna",
+        "xai": "grok-4.7",
+        "xai-oauth": "grok-4.7-oauth",
+        "z-ai": "glm-5.3-flash",
+        "z-ai-cn-coding": "glm-5.3-flash-plan"
+      }
+    },
+    "network": {
+      "fake_ip_cidrs": [
+        "198.18.0.0/15"
+      ],
+      "fake_ip_real_resolver": [
+        "https://1.1.1.1/dns-query",
+        "https://dns.google/resolve"
+      ]
+    },
+    "pm_user_ids": [
+      "local-dev-user"
+    ],
+    "problem_reports": {
+      "enabled": false
+    },
+    "publish": {
+      "approval_ttl_hours": 168,
+      "audit_concurrency": 4,
+      "audit_fallback_models": [
+        "gpt-6.2-sol-oauth",
+        "claude-opus-5-5-oauth"
+      ],
+      "audit_model": "gemini-4-neon-medium-oauth",
+      "audit_prompt_version": "audit_v1",
+      "audit_timeout_s": 300.0,
+      "audit_total_timeout_s": 1800.0,
+      "consensus_providers": [
+        "estimates:",
+        "yf_analysis"
+      ],
+      "enabled": true,
+      "language_model": "",
+      "max_file_bytes": 20971520,
+      "prompt_version": "audit_v1",
+      "reviewer_models": [
+        "gpt-6.2-sol-oauth",
+        "gemini-4-argon-high-oauth",
+        "grok-4.7-oauth",
+        "claude-opus-5-5-oauth"
+      ]
+    },
+    "timezone": "Asia/Shanghai"
+  },
+  "dalton_skills_visibility": {
+    "dalton-13f-tracker": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": []
+    },
+    "dalton-agenda": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
+    "dalton-ai-app-weekly-monitor": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": []
+    },
+    "dalton-ai-finance-daily": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": []
+    },
+    "dalton-bdc-analyst": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": []
+    },
+    "dalton-bullbear": {
+      "command": "bullbear",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions",
+        "run-workflow"
+      ]
+    },
+    "dalton-bullbear-tracker": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-thesis-delta",
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
+    "dalton-call": {
+      "command": "dalton-call",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
+    "dalton-china-consumer-weekly": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": []
+    },
+    "dalton-company-background": {
+      "command": "dalton-company-background",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
+    "dalton-conventions": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "research-conventions"
+      ]
+    },
+    "dalton-ct-semi-sentiment": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": []
+    },
+    "dalton-daily-filing-alert": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-bullbear-tracker"
+      ]
+    },
+    "dalton-earnings-calendar": {
+      "command": "dalton-earnings-calendar",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
+    "dalton-earnings-deep": {
+      "command": "dalton-earnings-deep",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions",
+        "run-workflow"
+      ]
+    },
+    "dalton-earnings-flash": {
+      "command": "dalton-earnings-flash",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
+    "dalton-earnings-preview": {
+      "command": "dalton-earnings-preview",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
+    "dalton-filing-review": {
+      "command": "dalton-filing-review",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
+    "dalton-financial-lenses": {
+      "command": "dalton-financial-lenses",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
+    "dalton-full-coverage": {
+      "command": "full-coverage",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions",
+        "run-workflow"
+      ]
+    },
+    "dalton-global-consumer-weekly": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": []
+    },
+    "dalton-humanoid-robot-weekly": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-bullbear-tracker"
+      ]
+    },
+    "dalton-init-company": {
+      "command": "dalton-init-company",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
+    "dalton-init-sector": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions",
+        "dalton-knowledge"
+      ]
+    },
+    "dalton-initial-coverage": {
+      "command": "initial-coverage",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions",
+        "run-workflow"
+      ]
+    },
+    "dalton-knowledge": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
+    "dalton-language": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": []
+    },
+    "dalton-mark-weekly-newenergy": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": []
+    },
+    "dalton-market-digest": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": []
+    },
+    "dalton-onboarding": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": true,
+      "in_list_skills": false,
+      "in_sandbox": false,
+      "requires": []
+    },
+    "dalton-option-put-skew": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": []
+    },
+    "dalton-pm-qa": {
+      "command": "pm-qa",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
+    "dalton-podcast-weekly": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": []
+    },
+    "dalton-publish": {
+      "command": "dalton-publish",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
+    "dalton-research-director": {
+      "command": "dalton-director",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
+    "dalton-richard-coverage-weekly": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": []
+    },
+    "dalton-richard-earnings": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": []
+    },
+    "dalton-sector-delta": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions",
+        "dalton-knowledge",
+        "dalton-agenda"
+      ]
+    },
+    "dalton-short-screen": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": []
+    },
+    "dalton-stock-move": {
+      "command": "dalton-stock-move",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
+    "dalton-thesis-delta": {
+      "command": "dalton-thesis-delta",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
+    "dalton-tmeet-weekly-minutes": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": []
+    },
+    "dalton-tob-industry-weekly": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": []
+    },
+    "dalton-topic-research": {
+      "command": "topic-research",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions",
+        "run-workflow"
+      ]
+    },
+    "dalton-transcript-polish": {
+      "command": "transcribe",
+      "enabled_in_registry": true,
+      "hidden": true,
+      "in_list_skills": false,
+      "in_sandbox": false,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
+    "dalton-us-weekly-movers": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-bullbear-tracker"
+      ]
+    },
+    "dalton-vip-news-alert": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-bullbear-tracker"
+      ]
+    },
+    "dalton-weekly-review": {
+      "command": "weekly-review",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions",
+        "run-workflow"
+      ]
+    },
+    "dalton-weekly-trend-impact-scan": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": []
+    },
+    "dalton-wiki-auto-ingest": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
+    "dalton-x-accounts-daily": {
+      "command": null,
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-bullbear-tracker"
+      ]
+    }
+  },
+  "infra_switches": {
+    "features": {
+      "browser": {
+        "enabled": false,
+        "gate": null,
+        "min_tier": null
+      },
+      "claude_code_runtime": {
+        "enabled": false,
+        "gate": null,
+        "min_tier": null
+      },
+      "claude_oauth": {
+        "enabled": true,
+        "gate": "none",
+        "min_tier": null
+      },
+      "market_watch": {
+        "enabled": false,
+        "gate": "opt_in",
+        "min_tier": null
+      },
+      "org_connectors": {
+        "enabled": false,
+        "gate": null,
+        "min_tier": null
+      },
+      "org_library": {
+        "enabled": false,
+        "gate": null,
+        "min_tier": null
+      },
+      "scratchpad": {
+        "enabled": false,
+        "gate": null,
+        "min_tier": null
+      },
+      "shared_workspaces": {
+        "enabled": false,
+        "gate": null,
+        "min_tier": null
+      },
+      "teams": {
+        "enabled": false,
+        "gate": null,
+        "min_tier": null
+      },
+      "wakeups": {
+        "enabled": false,
+        "gate": null,
+        "min_tier": null
+      }
+    },
+    "market_data_providers": [
+      {
+        "daily_markets": null,
+        "intraday_markets": null,
+        "markets": [
+          "us"
+        ],
+        "name": "ginlix-data",
+        "snapshot_markets": null
+      },
+      {
+        "daily_markets": null,
+        "intraday_markets": [],
+        "markets": [
+          "cn"
+        ],
+        "name": "tushare",
+        "snapshot_markets": [
+          "cn"
+        ]
+      },
+      {
+        "daily_markets": null,
+        "intraday_markets": [
+          "non-us"
+        ],
+        "markets": [],
+        "name": "yfinance",
+        "snapshot_markets": null
+      },
+      {
+        "daily_markets": null,
+        "intraday_markets": null,
+        "markets": [
+          "all"
+        ],
+        "name": "yfinance",
+        "snapshot_markets": null
+      },
+      {
+        "daily_markets": null,
+        "intraday_markets": null,
+        "markets": [
+          "all"
+        ],
+        "name": "fmp",
+        "snapshot_markets": null
+      }
+    ],
+    "mcp_descriptions_enabled": false,
+    "news_data_providers": [
+      {
+        "daily_markets": null,
+        "intraday_markets": null,
+        "markets": [
+          "all"
+        ],
+        "name": "ginlix-data",
+        "snapshot_markets": null
+      },
+      {
+        "daily_markets": null,
+        "intraday_markets": null,
+        "markets": [
+          "all"
+        ],
+        "name": "yfinance",
+        "snapshot_markets": null
+      },
+      {
+        "daily_markets": null,
+        "intraday_markets": null,
+        "markets": [
+          "all"
+        ],
+        "name": "fmp",
+        "snapshot_markets": null
+      }
+    ],
+    "workflow_child_timeout": 5400
+  },
+  "main_tools_analyst": [
+    "AskUserQuestion",
+    "Bash",
+    "Edit",
+    "ExecuteCode",
+    "GetPreviewUrl",
+    "Glob",
+    "Grep",
+    "Read",
+    "RunWorkflow",
+    "ShowWidget",
+    "TaskOutput",
+    "ThreadStatus",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+    "ai_finance_prepare",
+    "ai_finance_read",
+    "ai_finance_report",
+    "ai_finance_signals",
+    "automation_report",
+    "check_draft",
+    "check_language",
+    "conversation_search",
+    "dalton_check_done",
+    "dalton_coverage_tracking",
+    "dalton_notify_settings",
+    "dalton_report_delivery",
+    "dalton_schedule_automation",
+    "dalton_system_jobs",
+    "feishu_append",
+    "feishu_create_doc",
+    "feishu_grant_access",
+    "feishu_list_wiki",
+    "feishu_read",
+    "get_company_overview",
+    "get_daily_prices",
+    "get_market_overview",
+    "get_options_chain",
+    "get_quote",
+    "get_sec_filing",
+    "ingest_company_wiki",
+    "ingest_research",
+    "ingest_sales_note",
+    "knowledge_append_verdict",
+    "knowledge_read",
+    "knowledge_update",
+    "manage_chart_layers",
+    "market_digest_inputs",
+    "market_digest_output",
+    "podcast_weekly_read",
+    "podcast_weekly_write",
+    "publish_report",
+    "report_issue",
+    "screen_stocks",
+    "switch_thread_model",
+    "x_search"
+  ],
+  "main_tools_chief_of_staff": [
+    "AskUserQuestion",
+    "Bash",
+    "Edit",
+    "ExecuteCode",
+    "GetPreviewUrl",
+    "Glob",
+    "Grep",
+    "Read",
+    "RunWorkflow",
+    "ShowWidget",
+    "TaskOutput",
+    "ThreadStatus",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+    "agent_output",
+    "ai_finance_prepare",
+    "ai_finance_read",
+    "ai_finance_report",
+    "ai_finance_signals",
+    "automation_report",
+    "check_language",
+    "conversation_search",
+    "dalton_agenda_note",
+    "dalton_check_done",
+    "dalton_coverage",
+    "dalton_coverage_board",
+    "dalton_coverage_tracking",
+    "dalton_coverage_unit",
+    "dalton_cross_unit_request",
+    "dalton_notify_settings",
+    "dalton_publish_earnings_calendar",
+    "dalton_record_plan",
+    "dalton_report_delivery",
+    "dalton_resolve_signals",
+    "dalton_schedule_automation",
+    "dalton_system_jobs",
+    "dalton_watch_event",
+    "delegate_to_analyst",
+    "feishu_append",
+    "feishu_create_doc",
+    "feishu_grant_access",
+    "feishu_list_wiki",
+    "feishu_read",
+    "get_company_overview",
+    "get_daily_prices",
+    "get_market_overview",
+    "get_options_chain",
+    "get_quote",
+    "get_sec_filing",
+    "ingest_company_wiki",
+    "ingest_research",
+    "ingest_sales_note",
+    "knowledge_append_verdict",
+    "knowledge_read",
+    "knowledge_update",
+    "manage_chart_layers",
+    "manage_threads",
+    "manage_workspaces",
+    "market_digest_inputs",
+    "market_digest_output",
+    "podcast_weekly_read",
+    "podcast_weekly_write",
+    "report_issue",
+    "screen_stocks",
+    "switch_thread_model",
+    "x_search"
+  ],
+  "mcp_servers": [
+    {
+      "args": [
+        "run",
+        "python",
+        "plugins/alternative_data/x_mcp_server.py"
+      ],
+      "call_timeout_s": null,
+      "command": "uv",
+      "enabled": true,
+      "env_keys": [],
+      "header_keys": [],
+      "name": "x_api",
+      "source": "builtin",
+      "tool_exposure_mode": "summary",
+      "transport": "stdio",
+      "url": null
+    },
+    {
+      "args": [
+        "run",
+        "python",
+        "plugins/alternative_data/scrape_mcp_server.py"
+      ],
+      "call_timeout_s": null,
+      "command": "uv",
+      "enabled": true,
+      "env_keys": [],
+      "header_keys": [],
+      "name": "scrape",
+      "source": "builtin",
+      "tool_exposure_mode": "summary",
+      "transport": "stdio",
+      "url": null
+    },
+    {
+      "args": [],
+      "call_timeout_s": 625.0,
+      "command": null,
+      "enabled": true,
+      "env_keys": [],
+      "header_keys": [
+        "Authorization"
+      ],
+      "name": "researchdata",
+      "source": "builtin",
+      "tool_exposure_mode": "detailed",
+      "transport": "http",
+      "url": "${DALTON_RESEARCHDATA_URL}"
+    },
+    {
+      "args": [
+        "run",
+        "python",
+        "plugins/dalton_data/dalton_sec_mcp_server.py"
+      ],
+      "call_timeout_s": null,
+      "command": "uv",
+      "enabled": true,
+      "env_keys": [
+        "SEC_USER_AGENT"
+      ],
+      "header_keys": [],
+      "name": "dalton_sec",
+      "source": "builtin",
+      "tool_exposure_mode": "summary",
+      "transport": "stdio",
+      "url": null
+    },
+    {
+      "args": [],
+      "call_timeout_s": null,
+      "command": null,
+      "enabled": false,
+      "env_keys": [],
+      "header_keys": [
+        "Authorization"
+      ],
+      "name": "firecrawl",
+      "source": "builtin",
+      "tool_exposure_mode": "summary",
+      "transport": "http",
+      "url": "https://mcp.firecrawl.dev/v2/mcp"
+    },
+    {
+      "args": [
+        "run",
+        "python",
+        "plugins/langalpha_market_data/price_data_mcp_server.py"
+      ],
+      "call_timeout_s": null,
+      "command": "uv",
+      "enabled": true,
+      "env_keys": [
+        "FMP_API_KEY",
+        "GINLIX_DATA_URL"
+      ],
+      "header_keys": [],
+      "name": "price_data",
+      "source": "builtin",
+      "tool_exposure_mode": "detailed",
+      "transport": "stdio",
+      "url": null
+    },
+    {
+      "args": [
+        "run",
+        "python",
+        "plugins/langalpha_market_data/fundamentals_mcp_server.py"
+      ],
+      "call_timeout_s": null,
+      "command": "uv",
+      "enabled": true,
+      "env_keys": [
+        "FMP_API_KEY",
+        "GINLIX_DATA_URL"
+      ],
+      "header_keys": [],
+      "name": "fundamentals",
+      "source": "builtin",
+      "tool_exposure_mode": "summary",
+      "transport": "stdio",
+      "url": null
+    },
+    {
+      "args": [
+        "run",
+        "python",
+        "plugins/langalpha_market_data/macro_mcp_server.py"
+      ],
+      "call_timeout_s": null,
+      "command": "uv",
+      "enabled": true,
+      "env_keys": [
+        "FMP_API_KEY"
+      ],
+      "header_keys": [],
+      "name": "macro",
+      "source": "builtin",
+      "tool_exposure_mode": "summary",
+      "transport": "stdio",
+      "url": null
+    },
+    {
+      "args": [
+        "run",
+        "python",
+        "plugins/langalpha_market_data/options_mcp_server.py"
+      ],
+      "call_timeout_s": null,
+      "command": "uv",
+      "enabled": true,
+      "env_keys": [
+        "GINLIX_DATA_URL"
+      ],
+      "header_keys": [],
+      "name": "options",
+      "source": "builtin",
+      "tool_exposure_mode": "summary",
+      "transport": "stdio",
+      "url": null
+    },
+    {
+      "args": [
+        "run",
+        "python",
+        "plugins/yfinance/yf_price_mcp_server.py"
+      ],
+      "call_timeout_s": null,
+      "command": "uv",
+      "enabled": true,
+      "env_keys": [],
+      "header_keys": [],
+      "name": "yf_price",
+      "source": "builtin",
+      "tool_exposure_mode": "summary",
+      "transport": "stdio",
+      "url": null
+    },
+    {
+      "args": [
+        "run",
+        "python",
+        "plugins/yfinance/yf_market_mcp_server.py"
+      ],
+      "call_timeout_s": null,
+      "command": "uv",
+      "enabled": true,
+      "env_keys": [],
+      "header_keys": [],
+      "name": "yf_market",
+      "source": "builtin",
+      "tool_exposure_mode": "summary",
+      "transport": "stdio",
+      "url": null
+    },
+    {
+      "args": [
+        "run",
+        "python",
+        "plugins/yfinance/yf_fundamentals_mcp_server.py"
+      ],
+      "call_timeout_s": null,
+      "command": "uv",
+      "enabled": true,
+      "env_keys": [],
+      "header_keys": [],
+      "name": "yf_fundamentals",
+      "source": "builtin",
+      "tool_exposure_mode": "summary",
+      "transport": "stdio",
+      "url": null
+    },
+    {
+      "args": [
+        "run",
+        "python",
+        "plugins/yfinance/yf_analysis_mcp_server.py"
+      ],
+      "call_timeout_s": null,
+      "command": "uv",
+      "enabled": true,
+      "env_keys": [],
+      "header_keys": [],
+      "name": "yf_analysis",
+      "source": "builtin",
+      "tool_exposure_mode": "summary",
+      "transport": "stdio",
+      "url": null
+    }
+  ],
+  "subagent_tools_analyst": {
+    "data-prep": [
+      "Bash",
+      "Edit",
+      "ExecuteCode",
+      "Glob",
+      "Grep",
+      "Read",
+      "Write",
+      "get_company_overview",
+      "get_daily_prices",
+      "get_market_overview",
+      "get_options_chain",
+      "get_quote",
+      "get_sec_filing",
+      "screen_stocks"
+    ],
+    "equity-analyst": [
+      "Bash",
+      "Edit",
+      "ExecuteCode",
+      "Glob",
+      "Grep",
+      "Read",
+      "WebFetch",
+      "WebSearch",
+      "Write",
+      "get_company_overview",
+      "get_daily_prices",
+      "get_market_overview",
+      "get_options_chain",
+      "get_quote",
+      "get_sec_filing",
+      "screen_stocks",
+      "x_search"
+    ],
+    "general-purpose": [
+      "Bash",
+      "Edit",
+      "ExecuteCode",
+      "Glob",
+      "Grep",
+      "Read",
+      "WebFetch",
+      "WebSearch",
+      "Write",
+      "check_language",
+      "get_company_overview",
+      "get_daily_prices",
+      "get_market_overview",
+      "get_options_chain",
+      "get_quote",
+      "get_sec_filing",
+      "screen_stocks",
+      "x_search"
+    ],
+    "report-builder": [
+      "Bash",
+      "Edit",
+      "ExecuteCode",
+      "Glob",
+      "Grep",
+      "Read",
+      "Write"
+    ],
+    "research": [
+      "Edit",
+      "Glob",
+      "Grep",
+      "Read",
+      "WebFetch",
+      "WebSearch",
+      "Write",
+      "x_search"
+    ]
+  },
+  "subagent_tools_chief_of_staff": {
+    "data-prep": [
+      "Bash",
+      "Edit",
+      "ExecuteCode",
+      "Glob",
+      "Grep",
+      "Read",
+      "Write",
+      "get_company_overview",
+      "get_daily_prices",
+      "get_market_overview",
+      "get_options_chain",
+      "get_quote",
+      "get_sec_filing",
+      "screen_stocks"
+    ],
+    "general-purpose": [
+      "Bash",
+      "Edit",
+      "ExecuteCode",
+      "Glob",
+      "Grep",
+      "Read",
+      "WebFetch",
+      "WebSearch",
+      "Write",
+      "get_company_overview",
+      "get_daily_prices",
+      "get_market_overview",
+      "get_options_chain",
+      "get_quote",
+      "get_sec_filing",
+      "screen_stocks",
+      "x_search"
+    ],
+    "report-builder": [
+      "Bash",
+      "Edit",
+      "ExecuteCode",
+      "Glob",
+      "Grep",
+      "Read",
+      "Write"
+    ],
+    "research": [
+      "Edit",
+      "Glob",
+      "Grep",
+      "Read",
+      "WebFetch",
+      "WebSearch",
+      "Write",
+      "x_search"
+    ]
+  }
+}

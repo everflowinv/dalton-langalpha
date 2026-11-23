@@ -21,11 +21,14 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.config.env import HOST_IP, LOCAL_DEV_USER_ID
 from src.config.settings import HOST_MODE
+from src.dalton.profile import DeploymentProfile, resolve_profile
 
 logger = logging.getLogger(__name__)
 
 DALTON_YAML_PATH = Path(__file__).resolve().parent / "dalton.yaml"
+DALTON_CORE_YAML_PATH = Path(__file__).resolve().parent / "dalton.core.yaml"
 REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_SEC_USER_AGENT = "DaltonResearch sec-contact@example.com"
 
 
 class DaltonModelsConfig(BaseModel):
@@ -472,27 +475,75 @@ def get_configured_pm_user_ids() -> list[str]:
     return list(get_dalton_config().configured_pm_user_ids)
 
 
-@lru_cache(maxsize=1)
-def _load_base_dalton_config() -> DaltonConfig:
-    """Load and cache ``src/dalton/dalton.yaml``."""
+def _merge_dalton_yaml(
+    base: dict[str, Any],
+    overlay: dict[str, Any],
+    *,
+    path: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Deep-merge ``dalton.core.yaml`` over ``dalton.yaml``.
+
+    Nested mappings merge key-by-key, lists replace outright, and
+    ``models.probe_models`` replaces wholesale so core clears Everflow's
+    ``*-oauth`` probe entries cleanly.
+    """
+    merged = dict(base)
+    for key, value in overlay.items():
+        cur_path = (*path, key)
+        if value is None:
+            continue
+        if cur_path == ("models", "probe_models") and isinstance(value, dict):
+            merged[key] = dict(value)
+        elif isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_dalton_yaml(merged[key], value, path=cur_path)
+        else:
+            merged[key] = value
+    return merged
+
+
+@lru_cache(maxsize=4)
+def _load_profile_dalton_config(profile: DeploymentProfile) -> DaltonConfig:
+    """Load and cache ``src/dalton/dalton.yaml`` (plus ``dalton.core.yaml`` in core profile)."""
     if not DALTON_YAML_PATH.exists():
         return DaltonConfig()
     raw: dict[str, Any] = yaml.safe_load(DALTON_YAML_PATH.read_text(encoding="utf-8")) or {}
+    if profile is DeploymentProfile.CORE and DALTON_CORE_YAML_PATH.exists():
+        core_raw = yaml.safe_load(DALTON_CORE_YAML_PATH.read_text(encoding="utf-8")) or {}
+        if not isinstance(core_raw, dict):
+            raise ValueError(f"{DALTON_CORE_YAML_PATH} must be a mapping of config keys")
+        raw = _merge_dalton_yaml(raw, core_raw)
     return DaltonConfig.model_validate(raw)
 
 
+def _load_base_dalton_config() -> DaltonConfig:
+    """Return the cached file config for the active profile.
+
+    Kept argument-free because tests replace it to inject a base config.
+    """
+    return _load_profile_dalton_config(resolve_profile())
+
+
 def get_dalton_config() -> DaltonConfig:
-    """Return DaltonConfig with ``DALTON_PM_USER_IDS`` override applied when set (L39)."""
+    """Return DaltonConfig for the active profile with runtime env overrides applied (L39)."""
+    profile = resolve_profile()
     base = _load_base_dalton_config()
+    updates: dict[str, Any] = {}
     env_pm = _parse_env_pm_user_ids()
     if env_pm is not None:
-        return base.model_copy(
-            update={"pm_user_ids": env_pm, "configured_pm_user_ids": env_pm}
-        )
+        updates["pm_user_ids"] = env_pm
+        updates["configured_pm_user_ids"] = env_pm
+    if profile is DeploymentProfile.CORE:
+        env_tz = os.getenv("DALTON_TIMEZONE", "").strip()
+        if env_tz:
+            updates["timezone"] = env_tz
+            updates["budget"] = base.budget.model_copy(update={"timezone": env_tz})
+            updates["autonomy"] = base.autonomy.model_copy(update={"timezone": env_tz})
+    if updates:
+        return base.model_copy(update=updates)
     return base
 
 
-get_dalton_config.cache_clear = _load_base_dalton_config.cache_clear  # type: ignore[attr-defined]
+get_dalton_config.cache_clear = _load_profile_dalton_config.cache_clear  # type: ignore[attr-defined]
 
 
 get_dalton_settings = get_dalton_config
@@ -675,7 +726,8 @@ def get_fake_ip_real_resolvers() -> list[str]:
 
 
 def log_dalton_startup_warnings() -> None:
-    """Log prominent startup warnings if budget gate or APP_ENV=dalton is not active (G1.4, G7.1)."""
+    """Log prominent startup warnings for budget gate, Everflow APP_ENV, and SEC identity."""
+    profile = resolve_profile()
     if not is_dalton_enabled():
         return
     if not is_budget_gate_enabled():
@@ -685,12 +737,23 @@ def log_dalton_startup_warnings() -> None:
             HOST_MODE,
             os.getenv("DALTON_BUDGET_GATE", ""),
         )
-    app_env = os.getenv("APP_ENV", "").strip()
-    if app_env != "dalton":
+    if profile is DeploymentProfile.EVERFLOW:
+        app_env = os.getenv("APP_ENV", "").strip()
+        if app_env != "dalton":
+            logger.warning(
+                "DALTON WARNING (G7.1): APP_ENV=%r is not 'dalton'. "
+                "agent_config.dalton.yaml is not active and MCP call_timeout_s will fall back to 65s!",
+                app_env,
+            )
+    if not (
+        os.getenv("SEC_USER_AGENT", "").strip()
+        or os.getenv("EDGAR_IDENTITY", "").strip()
+    ):
         logger.warning(
-            "DALTON WARNING (G7.1): APP_ENV=%r is not 'dalton'. "
-            "agent_config.dalton.yaml is not active and MCP call_timeout_s will fall back to 65s!",
-            app_env,
+            "DALTON WARNING: Neither SEC_USER_AGENT nor EDGAR_IDENTITY is set. "
+            "Falling back to neutral placeholder %r; configure SEC_USER_AGENT "
+            "(or EDGAR_IDENTITY) as '<Organization> <contact_email>' for SEC EDGAR fair-access compliance.",
+            DEFAULT_SEC_USER_AGENT,
         )
 
 
@@ -1175,11 +1238,11 @@ def get_dalton_bridge_embed_url(host: str | None = None) -> str:
 
 
 def get_sec_user_agent() -> str:
-    """Return ``SEC_USER_AGENT`` from environment with a compliant fallback."""
+    """Return ``SEC_USER_AGENT`` / ``EDGAR_IDENTITY`` from env, or a neutral placeholder."""
     return (
         os.getenv("SEC_USER_AGENT", "").strip()
         or os.getenv("EDGAR_IDENTITY", "").strip()
-        or "DaltonResearch research@everflowinv.com"
+        or DEFAULT_SEC_USER_AGENT
     )
 
 

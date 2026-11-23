@@ -1,0 +1,64 @@
+# Standalone Core behavioral overlay (APP_ENV=core / DALTON_PROFILE=core)
+# Applied over src/dalton/dalton.yaml by src/dalton/settings.py.
+# Disables Everflow-specific subsystems, clears all private *-oauth model
+# names, removes host fake-IP proxy exemptions, and defaults timezone to UTC
+# (overridable via DALTON_TIMEZONE).
+
+enabled: true
+timezone: "UTC"
+
+colleague_dispatch:
+  enabled: false
+
+computer_cli_tokens:
+  enabled: false
+
+# Standalone Core ships interactive monitor/artifact publishing enabled by default
+# while src/dalton/dalton.yaml keeps the Everflow code default (false) unchanged.
+artifact_publishing:
+  enabled: true
+
+problem_reports:
+  enabled: false
+
+coverage_units:
+  enabled: true
+
+data_jobs:
+  enabled: false
+
+network:
+  fake_ip_cidrs: []
+
+models:
+  disabled_providers: []
+  assist_model: ""
+  assist_fallback_model: []
+  probe_models:
+    xai: "grok-4.7"
+    deepseek: "deepseek-flash"
+    z-ai: "glm-5.3-flash"
+    openai: "gpt-6-luna"
+    gemini: "gemini-4-neon"
+
+budget:
+  timezone: "UTC"
+
+publish:
+  reviewer_models: []
+  audit_model: ""
+  language_model: ""
+  audit_fallback_models: []
+
+autonomy:
+  enabled: true
+  timezone: "UTC"
+
+conversations:
+  enabled: false
+  extractor_model: ""
+  extractor_fallback_model: ""
+  agents: []
+
+internal_llm:
+  allowed_models: []

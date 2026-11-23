@@ -517,11 +517,20 @@ class SubagentCompiler:
         ):
             main = (config.search_api, config.search_depth)
             pair = (defn.search_provider or main[0], defn.search_depth or main[1])
-            if pair != main:
-                search = self._search_tools.get(pair)
+            # DALTON-HOOK(standalone-core): skip per-subagent WebSearch override when unavailable
+            from src.dalton.web_search_spec import resolve_web_search_provider_for_agent
+
+            effective_provider = resolve_web_search_provider_for_agent(
+                pair[0], fallback_any=defn.search_provider is None
+            )
+            if effective_provider is not None and (effective_provider, pair[1]) != main:
+                resolved_pair = (effective_provider, pair[1])
+                search = self._search_tools.get(resolved_pair)
                 if search is None:
-                    search = self._make_search_tool(provider=pair[0], depth=pair[1])
-                    self._search_tools[pair] = search
+                    search = self._make_search_tool(
+                        provider=resolved_pair[0], depth=resolved_pair[1]
+                    )
+                    self._search_tools[resolved_pair] = search
                 own[search.name] = search
         if self._make_sandbox_tools is not None and (
             "execute_code" in defn.tools or "bash" in defn.tools

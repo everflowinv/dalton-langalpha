@@ -477,6 +477,9 @@ ALLOWED_HOOKS=(
   "prompt-audit-text"
   # Chief of Staff settings tools: manage_workspaces update and CoS workspace management prompt guidance.
   "cos-settings-tools"
+  # Standalone Core Batch 1a: unified profile resolution (everflow vs core) and
+  # on-demand WebSearch registration when a search provider is available.
+  "standalone-core"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
