@@ -338,8 +338,9 @@ def _check_bootstrap_and_sessions(ctx: _lib.ComposeContext) -> tuple[str, str, s
         headers={"Authorization": f"Bearer {admin_token}"},
     )
     _assert(
-        me_resp.status == 200 and me_resp.json().get("user_id") == admin_uid,
-        f"Expected 200 on /users/me for bootstrapped admin, got {me_resp.status}",
+        me_resp.status == 200
+        and (me_resp.json().get("user") or {}).get("user_id") == admin_uid,
+        f"Expected 200 with the bootstrapped admin on /users/me, got {me_resp.status}: {me_resp.text}",
     )
 
     # Refresh cookie rotation: cookie 1 -> cookie 2 (distinct) -> cookie 3 (distinct)
