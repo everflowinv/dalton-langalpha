@@ -364,6 +364,13 @@ async def handle_workflow_error(
         if not (run_handle.workspace_id and run_handle.recorded_as):
             records = None
             tools = None
+        # DALTON-HOOK(budget): prove zero model calls when failure happened before tracking init or before any LLM start.
+        if token_callback is None:
+            no_model_calls = True
+        elif hasattr(token_callback, "llm_calls_started"):
+            no_model_calls = token_callback.llm_calls_started() == 0
+        else:
+            no_model_calls = False
         try:
             result = await protected_finalize(
                 RunCoordinator.get_instance().finalize_run(
@@ -375,6 +382,7 @@ async def handle_workflow_error(
                         execution_time=time.time() - start_time,
                         per_call_records=records,
                         tool_usage=tools,
+                        no_model_calls=no_model_calls,  # DALTON-HOOK(budget)
                     ),
                 ),
                 label=run_handle.run_id,
@@ -440,8 +448,12 @@ async def handle_workflow_error(
         # releases the durable slot here, so it doesn't leak until the
         # stale-run sweep.
         if run_handle is not None:
+            # DALTON-HOOK(budget): scope.handed_off is False here; admission conflict fired before executor handoff.
             await RunCoordinator.get_instance().fail_open_run(
-                run_handle, "admission conflict after START", status="cancelled"
+                run_handle,
+                "admission conflict after START",
+                status="cancelled",
+                no_model_calls=True,
             )
         # The guard above already proved e.detail is a dict whose "code" is in
         # ADMISSION_CONFLICT_CODES (truthy), so no re-checking is needed here.

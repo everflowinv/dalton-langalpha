@@ -112,40 +112,33 @@ async def settle_task_run(task_run_id: str, *, conn) -> bool:
         return cur.rowcount >= 1
 
 
-async def settle_abandoned(kind: RunKind) -> int:
-    """Degraded settle: stamp terminal-but-unsettled rows no settle path reaches.
+async def _has_dalton_reservations_table(cur: Any) -> bool:
+    """Return True only when Dalton is enabled and `dalton_budget_reservations` exists
+    in the connection's active schema.
 
-    The two lanes need different proof that none is coming. A terminal response
-    row is proof on its own — finalize stamps the settle in the same CAS, so
-    anything caught here was finalized by code predating the stamp. A terminal
-    task run is not, whatever status it carries: the collector claims by
-    ownership rather than status, so a row it is about to bill is
-    indistinguishable from one whose parent died before collecting. So that
-    lane needs two proofs rather than one, and both are the same grace read
-    against different clocks: the collector is spawned only once the PARENT
-    turn goes terminal, so its chance starts at whichever came later, the
-    child's own finalization or the parent's. The child's age alone cannot see
-    that — a subagent that finishes early under a long turn would be stamped
-    billed 30 minutes later and drop out of the in-flight aggregate for the
-    rest of that turn, understating the balance every admission in the window
-    is measured against. The parent's status alone cannot see it either: a
-    child that finished long before its parent satisfies its own grace already,
-    so a bare "parent is not in_progress" opens the moment the parent commits,
-    which is the moment BEFORE the collector it spawns has inserted anything.
-    Hence the parent's terminal instant, and hence ``usage_settled_at`` for it:
-    the finalize CAS stamps that in the same statement that turns the row
-    terminal, and it is the only timestamp the response table keeps. A parent
-    finalized by pre-gate code carries none, which reads as "chance not started"
-    and holds the child until the run lane above stamps it — a grace later than
-    strictly needed, in the direction that cannot overstate anyone's balance.
-
-    ``user_id IS NOT NULL`` is what lets this use the partial in-flight index
-    rather than scanning the table: the index carries that predicate, so
-    without it here the planner cannot prove the index covers every matching
-    row. It costs nothing to add, because an owner-less row is exactly the row
-    this sweep exists to keep out of a per-user aggregate that can never see
-    it anyway. On a healthy ledger the scan touches nothing.
+    DALTON-HOOK(budget): upstream-only deployments (Dalton disabled or only upstream
+    migrations applied) lack `dalton_budget_reservations`; fall back to the verbatim
+    upstream sweep so abandoned settlement never fails with UndefinedTable or alters
+    upstream-only settlement timing.
     """
+    from src.dalton.settings import is_dalton_enabled
+
+    if not is_dalton_enabled():
+        return False
+    await cur.execute(
+        "SELECT to_regclass('dalton_budget_reservations') AS reg"  # resolved by search_path, like the queries that use it
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return False
+    if isinstance(row, dict):
+        return row.get("reg") is not None
+    return bool(row and row[0] is not None)
+
+
+async def _settle_abandoned_upstream(cur: Any, kind: RunKind) -> int:
+    # DALTON-HOOK(budget): Verbatim upstream/main:src/server/database/runs/credit_ledger.py:149-180
+    # used unchanged whenever Dalton is disabled or `dalton_budget_reservations` is absent.
     table, _ = _TABLES[kind]
     guard = (
         f"""
@@ -164,15 +157,160 @@ async def settle_abandoned(kind: RunKind) -> int:
         if kind == "task"
         else ""
     )
-    async with pool.get_db_connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                f"""
+    await cur.execute(
+        f"""
                 UPDATE {table}
                 SET usage_settled_at = NOW()
                 WHERE usage_settled_at IS NULL
                   AND in_flight_credits > 0
                   AND user_id IS NOT NULL
+                  AND status != 'in_progress'
+                  {guard}
+                """
+    )
+    return cur.rowcount
+
+
+async def settle_abandoned(kind: RunKind) -> int:
+    """Degraded settle: stamp terminal-but-unsettled rows no settle path reaches.
+
+    The two lanes need different proof that none is coming. A terminal response
+    row waits out ``_ABANDONED_SETTLE_GRACE`` from its own terminal timestamp
+    (``metadata->>'dalton_finalized_at'`` when present, falling back to
+    ``created_at + execution_time``). A terminal task run needs its own grace
+    (``finalized_at`` older than ``_ABANDONED_SETTLE_GRACE``) and a billing-
+    settled parent (``usage_settled_at IS NOT NULL``); when the parent carries
+    ``metadata->>'dalton_finalized_at'``, that parent terminal timestamp must
+    also be past ``_ABANDONED_SETTLE_GRACE``, while legacy parents without
+    ``dalton_finalized_at`` let each child's own ``finalized_at`` govern its
+    grace instead of restarting a 30-minute clock from ``usage_settled_at``.
+
+    DALTON-HOOK(budget): when Dalton is disabled or ``dalton_budget_reservations``
+    does not exist in the connection's active schema, this runs the verbatim
+    upstream sweep unchanged. When Dalton is enabled and the reservations table
+    exists, scope is restricted to rows that carry in-flight platform spend
+    (``in_flight_credits > 0 AND user_id IS NOT NULL``), rows finalized after
+    this deploy (``metadata->>'dalton_finalized_at'``), or rows backed by a
+    budget reservation (``dalton_budget_reservations.reserved_usd IS NOT NULL``;
+    for direct tasks via ``parent_run_id`` and for workflow internal children
+    via ``workflow_driver_run_id`` -> owning parent response). Pre-deploy
+    unreserved historical rows with zero in-flight credits (including historical
+    workflow internal children) are never touched. The existing partial
+    in-flight indexes (``ix_responses_in_flight_by_user`` and
+    ``ix_subagent_runs_in_flight_by_user``) cover only the ``in_flight_credits >
+    0 AND user_id IS NOT NULL`` branch; covering the zero-credit BYOK/OAuth
+    post-deploy branches without a table scan requires dedicated partial
+    indexes on unsettled rows.
+    """
+    table, _ = _TABLES[kind]
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            # DALTON-HOOK(budget): use the extended Dalton sweep only when Dalton is enabled
+            # and `dalton_budget_reservations` exists; otherwise run the verbatim upstream sweep.
+            if not await _has_dalton_reservations_table(cur):
+                return await _settle_abandoned_upstream(cur, kind)
+            if kind == "task":
+                # DALTON-HOOK(budget): treat platform (in_flight_credits > 0) and BYOK (in_flight_credits = 0)
+                # rows alike within the scoped set (in-flight credits, dalton_finalized_at, or
+                # dalton_budget_reservations.reserved_usd IS NOT NULL) so historical unreserved rows
+                # (including historical workflow internal children) are untouched.
+                # Direct task rows require a settled parent (usage_settled_at IS NOT NULL); parents with
+                # dalton_finalized_at also wait out their own 30m terminal grace, while legacy parents
+                # without dalton_finalized_at let each child's own finalized_at govern its grace.
+                # RunWorkflow driver rows remain unstamped so budget reconciliation verifies workflow children.
+                guard = f"""
+                  AND finalized_at < NOW() - INTERVAL '{_ABANDONED_SETTLE_GRACE}'
+                  AND NOT (
+                      cause = 'init'
+                      AND COALESCE(replay_facts @> '{{"workflow_driver": true}}'::jsonb, FALSE)
+                  )
+                  AND (
+                      (in_flight_credits > 0 AND user_id IS NOT NULL)
+                      OR EXISTS (
+                          SELECT 1
+                          FROM conversation_responses r_scope
+                          WHERE r_scope.conversation_response_id = {table}.parent_run_id
+                            AND (
+                                (r_scope.metadata->>'dalton_finalized_at') ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T'
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM dalton_budget_reservations br
+                                    WHERE br.run_ref = r_scope.conversation_response_id
+                                      AND br.reserved_usd IS NOT NULL
+                                )
+                            )
+                      )
+                      OR (
+                          {table}.parent_run_id IS NULL
+                          AND ({table}.replay_facts->>'workflow_driver_run_id') IS NOT NULL
+                          AND EXISTS (
+                              SELECT 1
+                              FROM subagent_runs drv
+                              JOIN conversation_responses r_wf
+                                ON r_wf.conversation_response_id = drv.parent_run_id
+                              WHERE drv.thread_id = {table}.thread_id
+                                AND drv.task_run_id::text = {table}.replay_facts->>'workflow_driver_run_id'
+                                AND r_wf.status != 'in_progress'
+                                AND r_wf.usage_settled_at IS NOT NULL
+                                AND (
+                                    (r_wf.metadata->>'dalton_finalized_at') ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T'
+                                    OR EXISTS (
+                                        SELECT 1
+                                        FROM dalton_budget_reservations br
+                                        WHERE br.run_ref = r_wf.conversation_response_id
+                                          AND br.reserved_usd IS NOT NULL
+                                    )
+                                )
+                                AND CASE
+                                    WHEN (r_wf.metadata->>'dalton_finalized_at') ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T'
+                                    THEN (r_wf.metadata->>'dalton_finalized_at')::timestamptz < NOW() - INTERVAL '{_ABANDONED_SETTLE_GRACE}'
+                                    ELSE TRUE
+                                END
+                          )
+                      )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM conversation_responses r
+                      WHERE r.conversation_response_id = {table}.parent_run_id
+                        AND (
+                            r.status = 'in_progress'
+                            OR r.usage_settled_at IS NULL
+                            OR CASE
+                                WHEN (r.metadata->>'dalton_finalized_at') ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T'
+                                THEN (r.metadata->>'dalton_finalized_at')::timestamptz > NOW() - INTERVAL '{_ABANDONED_SETTLE_GRACE}'
+                                ELSE FALSE
+                            END
+                        )
+                  )
+                """
+            else:
+                # DALTON-HOOK(budget): scope response fallback sweep to in-flight, post-deploy dalton_finalized_at,
+                # or reserved rows so historical unreserved rows are untouched.
+                guard = f"""
+                  AND (
+                      (in_flight_credits > 0 AND user_id IS NOT NULL)
+                      OR (metadata->>'dalton_finalized_at') ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T'
+                      OR EXISTS (
+                          SELECT 1
+                          FROM dalton_budget_reservations br
+                          WHERE br.run_ref = {table}.conversation_response_id
+                            AND br.reserved_usd IS NOT NULL
+                      )
+                  )
+                  AND COALESCE(
+                      CASE
+                          WHEN (metadata->>'dalton_finalized_at') ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T'
+                          THEN (metadata->>'dalton_finalized_at')::timestamptz
+                          ELSE NULL
+                      END,
+                      created_at + make_interval(secs => GREATEST(COALESCE(execution_time, 0), 0))
+                  ) < NOW() - INTERVAL '{_ABANDONED_SETTLE_GRACE}'
+                """
+            await cur.execute(
+                f"""
+                UPDATE {table}
+                SET usage_settled_at = NOW()
+                WHERE usage_settled_at IS NULL
                   AND status != 'in_progress'
                   {guard}
                 """

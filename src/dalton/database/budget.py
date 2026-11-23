@@ -9,9 +9,21 @@ from typing import Any
 
 from psycopg.rows import dict_row
 
+from src.dalton.settings import get_dalton_settings
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
+
+
+def _conservative_pricing_floor_usd() -> Decimal:
+    """Return the conservative USD floor retained when a cash call's pricing cannot be resolved."""
+    try:
+        floor = get_dalton_settings().budget.admission_floor_usd
+        if floor is not None and Decimal(str(floor)) > Decimal("0"):
+            return Decimal(str(floor)).quantize(Decimal("0.000001"))
+    except Exception:
+        pass
+    return Decimal("0.250000")
 
 
 async def acquire_budget_advisory_lock(conn: Any, user_id: str, budget_day: date) -> None:
@@ -174,7 +186,7 @@ async def release_reservation(
             """,
             (run_ref, generation, generation),
         )
-        return cur.rowcount or 0
+        return int(getattr(cur, "rowcount", 0) or 0)
 
 
 async def lookup_run_context(conn: Any, run_ref: str) -> tuple[str | None, str | None]:
@@ -234,10 +246,250 @@ async def resolve_effective_task_cap(
     return default_task_cap_usd
 
 
-# Mirrors `src.server.database.runs.credit_ledger._ABANDONED_SETTLE_GRACE` (upstream sweep only stamps `in_flight_credits > 0` rows).
+# Mirrors `src.server.database.runs.credit_ledger._ABANDONED_SETTLE_GRACE`.
 _ABANDONED_SETTLE_GRACE = "30 minutes"
 # Late subagent usage rows arrive within milliseconds to minutes; 2 days covers midnight rollover without scanning all historical settled rows on every admission.
 _LATE_USAGE_RATCHET_WINDOW = "2 days"
+
+# Effective terminal timestamp on `conversation_responses`: prefers `metadata->>'dalton_finalized_at'`
+# stamped by `finalize_run`, falling back to `created_at + execution_time` for legacy or seeded rows.
+_RESPONSE_FINALIZED_AT_SQL = """COALESCE(
+    CASE
+        WHEN (cr.metadata->>'dalton_finalized_at') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+        THEN (cr.metadata->>'dalton_finalized_at')::timestamptz
+        ELSE NULL
+    END,
+    cr.created_at + make_interval(secs => GREATEST(COALESCE(cr.execution_time, 0), 0))
+)"""
+
+_HAS_PTC_USAGE_EXISTS_SQL = """EXISTS (
+    SELECT 1
+    FROM conversation_usages pcu
+    WHERE pcu.conversation_response_id = cr.conversation_response_id
+      AND pcu.msg_type = 'ptc'
+      AND pcu.token_usage IS NOT NULL
+      AND jsonb_typeof(pcu.token_usage::jsonb -> 'per_call_costs') = 'array'
+      AND jsonb_array_length(pcu.token_usage::jsonb -> 'per_call_costs') > 0
+)"""
+
+_PROVEN_NO_MODEL_CALLS_SQL = (
+    """COALESCE(cr.metadata @> '{"dalton_no_model_calls": true}'::jsonb, FALSE)"""
+)
+
+# Parent grace check when `usage_settled_at` is already stamped:
+# - Post-deploy rows with `dalton_finalized_at` wait 30m from `dalton_finalized_at` so a
+#   fallback stamp on `usage_settled_at` never restarts a second 30m window.
+# - Legacy rows without `dalton_finalized_at` do not start a 30m clock from `usage_settled_at`;
+#   each unsettled child's grace is measured solely from its own `sr.finalized_at`.
+_PARENT_SETTLED_GRACE_PASSED_SQL = f"""CASE
+    WHEN (cr.metadata->>'dalton_finalized_at') ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T'
+    THEN (cr.metadata->>'dalton_finalized_at')::timestamptz < NOW() - INTERVAL '{_ABANDONED_SETTLE_GRACE}'
+    ELSE TRUE
+END"""
+
+# A direct subagent resumed within the same parent turn merges usage from all its same-parent
+# executions into a single `msg_type='task'` usage row stamped with the latest `task_run_id`
+# (`middleware.py:473`, `subagent_usage.py:145`), while `settle_task_run` stamps `usage_settled_at`
+# across the whole `predecessor_run_id` chain. Treat a chain under `r.run_ref` as having usage
+# whenever any execution on that same-parent resume chain (linked by `predecessor_run_id` or same
+# `(thread_id, task_id)`) has a matching `task` usage row on `r.run_ref`.
+_DIRECT_SUBAGENT_CHAIN_HAS_USAGE_SQL = """EXISTS (
+    WITH RECURSIVE chain AS (
+        SELECT sr.task_run_id, sr.predecessor_run_id, sr.parent_run_id, sr.thread_id, sr.task_id
+      UNION
+        SELECT s.task_run_id, s.predecessor_run_id, s.parent_run_id, s.thread_id, s.task_id
+        FROM subagent_runs s
+        JOIN chain c
+          ON s.parent_run_id = c.parent_run_id
+         AND (
+             s.predecessor_run_id = c.task_run_id
+             OR s.task_run_id = c.predecessor_run_id
+             OR (s.thread_id = c.thread_id AND s.task_id = c.task_id)
+         )
+    )
+    SELECT 1
+    FROM chain c
+    JOIN conversation_usages scu
+      ON scu.conversation_response_id = r.run_ref
+     AND scu.msg_type = 'task'
+     AND scu.token_usage IS NOT NULL
+     AND scu.token_usage::jsonb ->> 'task_run_id' = c.task_run_id::text
+)"""
+
+_ALL_USAGE_PRICING_COMPLETE_SQL = """COALESCE(
+    BOOL_AND(
+        cu.conversation_usage_id IS NULL
+        OR (
+            (
+                NOT COALESCE(cu.is_byok, FALSE)
+                OR (
+                    cu.token_usage IS NOT NULL
+                    AND COALESCE(jsonb_typeof(cu.token_usage::jsonb -> 'per_call_costs') = 'array', FALSE)
+                )
+            )
+            AND NOT COALESCE(cu.token_usage::jsonb @> '{"pricing_failed": true}'::jsonb, FALSE)
+            AND NOT (
+                cu.token_usage IS NOT NULL
+                AND jsonb_typeof(cu.token_usage::jsonb -> 'per_call_costs') = 'array'
+                AND EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements(cu.token_usage::jsonb -> 'per_call_costs') c
+                    WHERE COALESCE(c @> '{"pricing_failed": true}'::jsonb, FALSE)
+                )
+            )
+        )
+    ),
+    FALSE
+)"""
+
+
+async def _dalton_reservations_table_exists(cur: Any) -> bool:
+    """Return True when `dalton_budget_reservations` is present in the connection's active schema."""
+    await cur.execute(
+        "SELECT to_regclass('dalton_budget_reservations') AS reg"  # resolved by search_path, like the queries that use it
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return False
+    if isinstance(row, dict):
+        return row.get("reg") is not None
+    return bool(row and row[0] is not None)
+
+
+async def settle_abandoned_runs_without_ptc_sql(
+    conn: Any,
+    rate: Decimal,
+    *,
+    user_id: str | None = None,
+    check_table_exists: bool = True,
+) -> int:
+    """Bounded fallback settlement for terminal runs past `_ABANDONED_SETTLE_GRACE` with no `ptc` usage row.
+
+    Skipped cleanly (returns 0) when Dalton is disabled or when `dalton_budget_reservations`
+    has not been migrated in an upstream-only deployment.
+
+    Treats platform (`in_flight_credits > 0`) and BYOK (`in_flight_credits = 0`) runs identically:
+    1. Stamps `conversation_responses.usage_settled_at = NOW()` (scoped to in-flight, post-deploy
+       `dalton_finalized_at`, or reserved rows so historical unreserved rows are untouched) so
+       rows never hang indefinitely and child `subagent_runs` abandoned settlement can proceed.
+    2. Settles matching open/released `dalton_budget_reservations`:
+       - Runs with proven zero model calls (`metadata @> '{"dalton_no_model_calls": true}'`),
+         complete pricing on any tool/task usage rows, and complete direct-subagent usage settle
+         at actual `usage_usd` without applying the `reserved_usd` floor.
+       - All other runs without a `ptc` usage row settle conservatively at
+         `GREATEST(reserved_usd, observed_usd, usage_usd)` without releasing `reserved_usd`.
+    """
+    from src.dalton.settings import is_dalton_enabled
+
+    if not is_dalton_enabled():
+        return 0
+    async with conn.cursor() as cur:
+        if check_table_exists and not await _dalton_reservations_table_exists(cur):
+            return 0
+        await cur.execute(
+            f"""
+            WITH abandoned_no_ptc_parents AS (
+                UPDATE conversation_responses cr
+                SET usage_settled_at = NOW()
+                WHERE cr.usage_settled_at IS NULL
+                  AND cr.status != 'in_progress'
+                  AND (
+                      %s::text IS NULL
+                      OR cr.user_id = %s
+                      OR EXISTS (
+                          SELECT 1
+                          FROM dalton_budget_reservations r
+                          WHERE r.run_ref = cr.conversation_response_id
+                            AND r.user_id = %s
+                      )
+                  )
+                  AND (
+                      (cr.in_flight_credits > 0 AND cr.user_id IS NOT NULL)
+                      OR (cr.metadata->>'dalton_finalized_at') ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T'
+                      OR EXISTS (
+                          SELECT 1
+                          FROM dalton_budget_reservations br
+                          WHERE br.run_ref = cr.conversation_response_id
+                            AND br.reserved_usd IS NOT NULL
+                      )
+                  )
+                  AND {_RESPONSE_FINALIZED_AT_SQL} < NOW() - INTERVAL '{_ABANDONED_SETTLE_GRACE}'
+                  AND NOT {_HAS_PTC_USAGE_EXISTS_SQL}
+                RETURNING cr.conversation_response_id
+            ),
+            abandoned_no_ptc_usage AS (
+                SELECT
+                    r.reservation_id,
+                    r.run_ref,
+                    COALESCE(
+                        SUM(dalton_cash_usd(cu.token_usage::jsonb, cu.total_credits, cu.infrastructure_credits, %s)),
+                        0
+                    ) AS usage_usd,
+                    BOOL_OR({_PROVEN_NO_MODEL_CALLS_SQL}) AS proven_no_model_calls,
+                    {_ALL_USAGE_PRICING_COMPLETE_SQL} AS all_usage_pricing_complete,
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM subagent_runs sr
+                        WHERE sr.parent_run_id = r.run_ref
+                          AND NOT {_DIRECT_SUBAGENT_CHAIN_HAS_USAGE_SQL}
+                    ) AS all_direct_subagents_have_usage
+                FROM dalton_budget_reservations r
+                JOIN conversation_responses cr
+                    ON cr.conversation_response_id = r.run_ref
+                LEFT JOIN conversation_usages cu
+                    ON cu.conversation_response_id = r.run_ref
+                WHERE (%s::text IS NULL OR r.user_id = %s)
+                  AND r.state IN ('open', 'released')
+                  AND cr.status != 'in_progress'
+                  AND (
+                      cr.usage_settled_at IS NOT NULL
+                      OR cr.conversation_response_id IN (
+                          SELECT conversation_response_id FROM abandoned_no_ptc_parents
+                      )
+                  )
+                  AND {_RESPONSE_FINALIZED_AT_SQL} < NOW() - INTERVAL '{_ABANDONED_SETTLE_GRACE}'
+                  AND NOT {_HAS_PTC_USAGE_EXISTS_SQL}
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM subagent_runs sr
+                      WHERE sr.parent_run_id = r.run_ref
+                        AND (
+                            sr.status = 'in_progress'
+                            OR (
+                                sr.usage_settled_at IS NULL
+                                AND (
+                                    sr.finalized_at IS NULL
+                                    OR sr.finalized_at >= NOW() - INTERVAL '{_ABANDONED_SETTLE_GRACE}'
+                                )
+                            )
+                        )
+                  )
+                GROUP BY r.reservation_id, r.run_ref
+            )
+            UPDATE dalton_budget_reservations r
+            SET state = 'settled',
+                settled_at = NOW(),
+                settled_usd = CASE
+                    WHEN fu.proven_no_model_calls
+                     AND fu.all_usage_pricing_complete
+                     AND fu.all_direct_subagents_have_usage
+                    THEN fu.usage_usd
+                    ELSE GREATEST(r.reserved_usd, r.observed_usd, fu.usage_usd)
+                END,
+                settle_source = CASE
+                    WHEN fu.proven_no_model_calls
+                     AND fu.all_usage_pricing_complete
+                     AND fu.all_direct_subagents_have_usage
+                    THEN 'usage'
+                    ELSE 'conservative'
+                END
+            FROM abandoned_no_ptc_usage fu
+            WHERE r.reservation_id = fu.reservation_id
+              AND r.state IN ('open', 'released')
+            """,
+            (user_id, user_id, user_id, rate, user_id, user_id),
+        )
+        return int(getattr(cur, "rowcount", 0) or 0)
 
 
 async def reconcile_reservations_sql(
@@ -253,8 +505,12 @@ async def reconcile_reservations_sql(
     async with conn.cursor() as cur:
         # 1. Settle completed runs once parent and all child subagent runs are billing-settled.
         # Upstream terminal status does not imply billing-settled (`subagent_runs` finalizes before collector inserts `task` usage and stamps `usage_settled_at`).
+        # Keep the conservative `reserved_usd` floor whenever:
+        #   - any usage row on `r.run_ref` is degraded (`is_byok` without a `per_call_costs` array) or marked `pricing_failed`, OR
+        #   - no parent `ptc` usage row with non-empty `per_call_costs` exists AND the run was not proven to have zero model calls (`metadata.dalton_no_model_calls = true`), OR
+        #   - any direct subagent's same-parent resume chain has no `task` usage row on `r.run_ref`.
         await cur.execute(
-            """
+            f"""
             WITH run_usage AS (
                 SELECT
                     r.reservation_id,
@@ -263,7 +519,23 @@ async def reconcile_reservations_sql(
                         SUM(dalton_cash_usd(cu.token_usage::jsonb, cu.total_credits, cu.infrastructure_credits, %s)),
                         0
                     ) AS usage_usd,
-                    COUNT(cu.conversation_usage_id) AS usage_rows
+                    COUNT(cu.conversation_usage_id) AS usage_rows,
+                    COALESCE(
+                        BOOL_OR(
+                            cu.msg_type = 'ptc'
+                            AND cu.token_usage IS NOT NULL
+                            AND jsonb_typeof(cu.token_usage::jsonb -> 'per_call_costs') = 'array'
+                            AND jsonb_array_length(cu.token_usage::jsonb -> 'per_call_costs') > 0
+                        ),
+                        FALSE
+                    ) AS has_ptc_usage,
+                    {_ALL_USAGE_PRICING_COMPLETE_SQL} AS all_usage_pricing_complete,
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM subagent_runs sr
+                        WHERE sr.parent_run_id = r.run_ref
+                          AND NOT {_DIRECT_SUBAGENT_CHAIN_HAS_USAGE_SQL}
+                    ) AS all_direct_subagents_have_usage
                 FROM dalton_budget_reservations r
                 LEFT JOIN conversation_usages cu
                     ON cu.conversation_response_id = r.run_ref
@@ -274,14 +546,26 @@ async def reconcile_reservations_sql(
             UPDATE dalton_budget_reservations r
             SET state = 'settled',
                 settled_at = NOW(),
-                settled_usd = ru.usage_usd,
-                settle_source = 'usage'
+                settled_usd = CASE
+                    WHEN ru.all_usage_pricing_complete
+                     AND (ru.has_ptc_usage OR {_PROVEN_NO_MODEL_CALLS_SQL})
+                     AND ru.all_direct_subagents_have_usage
+                    THEN ru.usage_usd
+                    ELSE GREATEST(r.reserved_usd, r.observed_usd, ru.usage_usd)
+                END,
+                settle_source = CASE
+                    WHEN ru.all_usage_pricing_complete
+                     AND (ru.has_ptc_usage OR {_PROVEN_NO_MODEL_CALLS_SQL})
+                     AND ru.all_direct_subagents_have_usage
+                    THEN 'usage'
+                    ELSE 'conservative'
+                END
             FROM run_usage ru,
                  conversation_responses cr
             WHERE r.reservation_id = ru.reservation_id
               AND cr.conversation_response_id = r.run_ref
               AND cr.usage_settled_at IS NOT NULL
-              AND ru.usage_rows > 0
+              AND (ru.usage_rows > 0 OR {_PROVEN_NO_MODEL_CALLS_SQL})
               AND r.state IN ('open', 'released')
               AND NOT EXISTS (
                   SELECT 1 FROM subagent_runs sr
@@ -294,12 +578,12 @@ async def reconcile_reservations_sql(
 
         # 2. Settle runs with abandoned unsettled subagent runs after the 30m grace window.
         # Terminal status does not imply billing-settled, and upstream `settle_abandoned` skips zero-credit rows (`in_flight_credits = 0`) if a collector crashes.
-        # Mirrors upstream's dual-clock guard (both parent `usage_settled_at` and child `finalized_at` older than 30m) because the collector starts only after the parent run reaches terminal state.
+        # Mirrors upstream's dual-clock guard (both parent terminal instant and child `finalized_at` older than 30m, with parent already settled) because the collector starts only after the parent run reaches terminal state.
         # Finished RunWorkflow driver rows (`cause = 'init'` and `replay_facts @> '{"workflow_driver": true}'`) never make LLM/tool calls of their own and therefore never receive `usage_settled_at`. Drop the conservative `reserved_usd` floor ONLY when usage is proven complete:
-        #   (a) every non-workflow direct subagent under `r.run_ref` is billing-settled AND has a `conversation_usages` (`msg_type='task'`) row matching its `task_run_id` (so a `settle_abandoned` stamp without a usage row stays conservative);
+        #   (a) every non-workflow direct subagent under `r.run_ref` is billing-settled AND its same-parent resume chain has a `conversation_usages` (`msg_type='task'`) row on `r.run_ref` (so a `settle_abandoned` stamp without a usage row stays conservative);
         #   (b) every workflow internal child linked via `replay_facts @> '{"workflow_driver_run_id": <driver task_run_id>}'` is finished AND has a `conversation_usages` (`msg_type='task'`) row matching its `task_run_id`;
-        #   (c) every `is_byok` usage row on `r.run_ref` carries a JSON array `per_call_costs` (pricing-failure degraded rows stay conservative);
-        #   (d) `usage_rows > 0`, and even then never settle below `observed_usd`.
+        #   (c) every `is_byok` usage row on `r.run_ref` carries a JSON array `per_call_costs` AND no usage row or per-call record on `r.run_ref` is marked `pricing_failed: true` (degraded and pricing-failed rows stay conservative);
+        #   (d) a parent `ptc` usage row with non-empty `per_call_costs` exists (`has_ptc_usage`) with `usage_rows > 0`, OR the run was proven to have zero model calls (`dalton_no_model_calls: true`), and even then never settle below `observed_usd`.
         await cur.execute(
             f"""
             WITH abandoned_usage AS (
@@ -312,16 +596,15 @@ async def reconcile_reservations_sql(
                     ) AS usage_usd,
                     COUNT(cu.conversation_usage_id) AS usage_rows,
                     COALESCE(
-                        BOOL_AND(
-                            cu.conversation_usage_id IS NULL
-                            OR NOT COALESCE(cu.is_byok, FALSE)
-                            OR (
-                                cu.token_usage IS NOT NULL
-                                AND COALESCE(jsonb_typeof(cu.token_usage::jsonb -> 'per_call_costs') = 'array', FALSE)
-                            )
+                        BOOL_OR(
+                            cu.msg_type = 'ptc'
+                            AND cu.token_usage IS NOT NULL
+                            AND jsonb_typeof(cu.token_usage::jsonb -> 'per_call_costs') = 'array'
+                            AND jsonb_array_length(cu.token_usage::jsonb -> 'per_call_costs') > 0
                         ),
                         FALSE
-                    ) AS all_byok_have_per_call_costs,
+                    ) AS has_ptc_usage,
+                    {_ALL_USAGE_PRICING_COMPLETE_SQL} AS all_byok_have_per_call_costs,
                     NOT EXISTS (
                         SELECT 1 FROM subagent_runs sr
                         WHERE sr.parent_run_id = r.run_ref
@@ -332,13 +615,7 @@ async def reconcile_reservations_sql(
                           )
                           AND (
                               sr.usage_settled_at IS NULL
-                              OR NOT EXISTS (
-                                  SELECT 1 FROM conversation_usages scu
-                                  WHERE scu.conversation_response_id = r.run_ref
-                                    AND scu.msg_type = 'task'
-                                    AND scu.token_usage IS NOT NULL
-                                    AND scu.token_usage::jsonb ->> 'task_run_id' = sr.task_run_id::text
-                              )
+                              OR NOT {_DIRECT_SUBAGENT_CHAIN_HAS_USAGE_SQL}
                           )
                     ) AS all_direct_subagents_settled_with_usage,
                     NOT EXISTS (
@@ -377,7 +654,8 @@ async def reconcile_reservations_sql(
             SET state = 'settled',
                 settled_at = NOW(),
                 settled_usd = CASE
-                    WHEN au.usage_rows > 0
+                    WHEN (au.usage_rows > 0 OR {_PROVEN_NO_MODEL_CALLS_SQL})
+                     AND (au.has_ptc_usage OR {_PROVEN_NO_MODEL_CALLS_SQL})
                      AND au.all_byok_have_per_call_costs
                      AND au.all_direct_subagents_settled_with_usage
                      AND au.all_workflow_children_accounted
@@ -385,7 +663,8 @@ async def reconcile_reservations_sql(
                     ELSE GREATEST(r.reserved_usd, r.observed_usd, au.usage_usd)
                 END,
                 settle_source = CASE
-                    WHEN au.usage_rows > 0
+                    WHEN (au.usage_rows > 0 OR {_PROVEN_NO_MODEL_CALLS_SQL})
+                     AND (au.has_ptc_usage OR {_PROVEN_NO_MODEL_CALLS_SQL})
                      AND au.all_byok_have_per_call_costs
                      AND au.all_direct_subagents_settled_with_usage
                      AND au.all_workflow_children_accounted
@@ -398,7 +677,7 @@ async def reconcile_reservations_sql(
             WHERE r.reservation_id = au.reservation_id
               AND cr.conversation_response_id = r.run_ref
               AND cr.usage_settled_at IS NOT NULL
-              AND cr.usage_settled_at < NOW() - INTERVAL '{_ABANDONED_SETTLE_GRACE}'
+              AND {_PARENT_SETTLED_GRACE_PASSED_SQL}
               AND r.state IN ('open', 'released')
               AND NOT EXISTS (
                   SELECT 1 FROM subagent_runs sr
@@ -422,6 +701,15 @@ async def reconcile_reservations_sql(
               )
             """,
             (rate, user_id),
+        )
+
+        # 2b. Bounded fallback settlement for terminal runs past `_ABANDONED_SETTLE_GRACE`
+        # still lacking a parent `ptc` usage row (crash recovery, dispatch reconcile, all calls errored,
+        # or unmetered `stream_usage=False`). Stamps `conversation_responses.usage_settled_at` for
+        # platform and BYOK (`in_flight_credits=0`) rows alike and settles reservations conservatively
+        # at `GREATEST(reserved_usd, observed_usd, usage_usd)` without releasing `reserved_usd`.
+        await settle_abandoned_runs_without_ptc_sql(
+            conn, rate, user_id=user_id, check_table_exists=False
         )
 
         # 3. Expire stale open leases conservatively (never release).
@@ -562,25 +850,88 @@ async def fetch_unreserved_usage_today(
     day_start_utc: datetime,
     day_end_utc: datetime,
     rate: Decimal,
+    *,
+    conservative_floor_usd: Decimal | None = None,
 ) -> Decimal:
-    """Sum `dalton_cash_usd(...)` for today's `conversation_usages` not tied to any reservation."""
+    """Sum cash USD for today's `conversation_usages` not tied to any reservation.
+
+    Rows carrying `pricing_failed` add one conservative floor (`admission_floor_usd`) per
+    pricing-failed call, matching the provider breakdown and journal cash rules so the daily
+    budget gate `spent_usd` never undercounts unpriced unreserved calls as $0.
+    """
+    floor_usd = (
+        conservative_floor_usd
+        if conservative_floor_usd is not None
+        else _conservative_pricing_floor_usd()
+    )
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
             SELECT COALESCE(
-                SUM(dalton_cash_usd(cu.token_usage::jsonb, cu.total_credits, cu.infrastructure_credits, %s)),
+                SUM(
+                    CASE
+                        WHEN u.token_usage IS NOT NULL
+                         AND jsonb_typeof(u.token_usage::jsonb -> 'per_call_costs') = 'array'
+                         AND jsonb_array_length(u.token_usage::jsonb -> 'per_call_costs') > 0
+                        THEN u.cash_usd + COALESCE((
+                            SELECT SUM(
+                                GREATEST(
+                                    %s::numeric - GREATEST(COALESCE(NULLIF(c->>'cost', '')::numeric, 0), 0),
+                                    0
+                                )
+                            )
+                            FROM jsonb_array_elements(u.token_usage::jsonb -> 'per_call_costs') c
+                            WHERE COALESCE(c @> '{"pricing_failed": true}'::jsonb, FALSE)
+                               OR (
+                                   COALESCE(u.token_usage::jsonb @> '{"pricing_failed": true}'::jsonb, FALSE)
+                                   AND NOT EXISTS (
+                                       SELECT 1
+                                       FROM jsonb_array_elements(u.token_usage::jsonb -> 'per_call_costs') c2
+                                       WHERE COALESCE(c2 @> '{"pricing_failed": true}'::jsonb, FALSE)
+                                   )
+                                   AND COALESCE(c->>'billing_type', 'platform') <> 'oauth'
+                                   AND COALESCE(NULLIF(c->>'cost', '')::numeric, 0) <= 0
+                                   AND (
+                                       NOT (
+                                           jsonb_typeof(u.token_usage::jsonb -> 'pricing_failed_models') = 'array'
+                                           AND jsonb_array_length(u.token_usage::jsonb -> 'pricing_failed_models') > 0
+                                       )
+                                       OR EXISTS (
+                                           SELECT 1
+                                           FROM jsonb_array_elements_text(u.token_usage::jsonb -> 'pricing_failed_models') fm(name)
+                                           WHERE fm.name = COALESCE(c->>'model_name', '')
+                                       )
+                                   )
+                               )
+                        ), 0)
+                        WHEN u.token_usage IS NOT NULL
+                         AND COALESCE(u.token_usage::jsonb @> '{"pricing_failed": true}'::jsonb, FALSE)
+                        THEN GREATEST(%s::numeric, u.cash_usd)
+                        ELSE u.cash_usd
+                    END
+                ),
                 0
             ) AS unreserved_usd
-            FROM conversation_usages cu
-            WHERE cu.user_id = %s
-              AND cu.created_at >= %s
-              AND cu.created_at < %s
-              AND NOT EXISTS (
-                  SELECT 1 FROM dalton_budget_reservations r
-                  WHERE r.run_ref = cu.conversation_response_id
-              )
+            FROM (
+                SELECT
+                    cu.token_usage,
+                    dalton_cash_usd(
+                        cu.token_usage::jsonb,
+                        cu.total_credits,
+                        cu.infrastructure_credits,
+                        %s
+                    ) AS cash_usd
+                FROM conversation_usages cu
+                WHERE cu.user_id = %s
+                  AND cu.created_at >= %s
+                  AND cu.created_at < %s
+                  AND NOT EXISTS (
+                      SELECT 1 FROM dalton_budget_reservations r
+                      WHERE r.run_ref = cu.conversation_response_id
+                  )
+            ) u
             """,
-            (rate, user_id, day_start_utc, day_end_utc),
+            (floor_usd, floor_usd, rate, user_id, day_start_utc, day_end_utc),
         )
         row = await cur.fetchone()
         return Decimal(str((row or {}).get("unreserved_usd") or "0"))

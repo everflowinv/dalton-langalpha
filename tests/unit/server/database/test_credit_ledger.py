@@ -122,8 +122,11 @@ async def test_the_heartbeat_binds_exact_decimal_not_float(
 async def test_a_task_sweep_waits_out_the_grace_and_a_response_sweep_does_not(
     mock_connection, mock_cursor
 ):
-    """A terminal response proves no settle is coming; a terminal task run does
-    not, because the collector may still be about to claim it."""
+    """DALTON-HOOK(budget): Without `dalton_budget_reservations` (upstream mode),
+    task sweeps wait 30m while response sweeps do not. With Dalton enabled and
+    `dalton_budget_reservations` present (Dalton mode), both wait out the 30m grace
+    (responses from `dalton_finalized_at`, falling back to `created_at + execution_time`)."""
+    # Upstream mode (default mock_cursor.fetchone returns None -> no Dalton table).
     with _pool_of(mock_connection):
         await credit_ledger.settle_abandoned("task")
         task_sql = _sql(mock_cursor)
@@ -132,8 +135,28 @@ async def test_a_task_sweep_waits_out_the_grace_and_a_response_sweep_does_not(
 
     assert "finalized_at < NOW() - INTERVAL '30 minutes'" in task_sql
     assert "INTERVAL" not in run_sql
+    assert "dalton_finalized_at" not in run_sql
     assert "UPDATE subagent_runs" in task_sql
     assert "UPDATE conversation_responses" in run_sql
+
+    # Dalton mode (Dalton enabled + dalton_budget_reservations present).
+    mock_cursor.fetchone = AsyncMock(
+        return_value={"reg": "public.dalton_budget_reservations"}
+    )
+    with _pool_of(mock_connection), patch(
+        "src.dalton.settings.is_dalton_enabled", return_value=True
+    ):
+        await credit_ledger.settle_abandoned("task")
+        dalton_task_sql = _sql(mock_cursor)
+        await credit_ledger.settle_abandoned("run")
+        dalton_run_sql = _sql(mock_cursor)
+
+    assert "finalized_at < NOW() - INTERVAL '30 minutes'" in dalton_task_sql
+    assert "< NOW() - INTERVAL '30 minutes'" in dalton_run_sql
+    assert "dalton_finalized_at" in dalton_run_sql
+    assert "dalton_budget_reservations" in dalton_run_sql
+    assert "UPDATE subagent_runs" in dalton_task_sql
+    assert "UPDATE conversation_responses" in dalton_run_sql
 
 
 @pytest.mark.asyncio
@@ -308,23 +331,35 @@ async def test_a_task_sweep_leaves_rows_whose_parent_turn_is_still_live(
 async def test_a_task_sweep_waits_out_the_grace_from_the_parent_going_terminal(
     mock_connection, mock_cursor
 ):
-    """The parent's STATUS is not enough, only the instant it changed.
-
-    A child that finished long before its parent has already served its own
-    grace, so a bare "parent is not in_progress" opens the instant the parent
-    commits — which is before the collector that commit spawns has inserted
-    anything. The sweep would stamp the row settled out from under a collector
-    about to bill it. The parent's ``usage_settled_at`` is the terminal instant
-    (the finalize CAS stamps it in the same statement) and NULL on a parent
-    finalized by pre-gate code, which must read as "chance not started" rather
-    than as "chance over".
-    """
+    """DALTON-HOOK(budget): Both modes require a billing-settled parent
+    (`r.usage_settled_at IS NULL` blocks). Without `dalton_budget_reservations`
+    (upstream mode), parent grace is measured from `r.usage_settled_at`. With
+    Dalton enabled and `dalton_budget_reservations` present (Dalton mode),
+    parent grace is measured from `dalton_finalized_at` rather than
+    `r.usage_settled_at` so a fallback stamp on the parent never restarts a
+    second 30-minute wait."""
+    # Upstream mode (no Dalton reservations table).
     with _pool_of(mock_connection):
         await credit_ledger.settle_abandoned("task")
 
-    sql = " ".join(_executable(_sql(mock_cursor)).split())
-    assert "r.usage_settled_at IS NULL" in sql
-    assert "r.usage_settled_at > NOW() - INTERVAL '30 minutes'" in sql
+    upstream_sql = " ".join(_executable(_sql(mock_cursor)).split())
+    assert "r.usage_settled_at IS NULL" in upstream_sql
+    assert "r.usage_settled_at > NOW() - INTERVAL '30 minutes'" in upstream_sql
+    assert "dalton_finalized_at" not in upstream_sql
+
+    # Dalton mode (Dalton enabled + dalton_budget_reservations present).
+    mock_cursor.fetchone = AsyncMock(
+        return_value={"reg": "public.dalton_budget_reservations"}
+    )
+    with _pool_of(mock_connection), patch(
+        "src.dalton.settings.is_dalton_enabled", return_value=True
+    ):
+        await credit_ledger.settle_abandoned("task")
+
+    dalton_sql = " ".join(_executable(_sql(mock_cursor)).split())
+    assert "r.usage_settled_at IS NULL" in dalton_sql
+    assert "(r.metadata->>'dalton_finalized_at')::timestamptz > NOW() - INTERVAL '30 minutes'" in dalton_sql
+    assert "r.usage_settled_at > NOW() - INTERVAL '30 minutes'" not in dalton_sql
 
 
 @pytest.mark.asyncio

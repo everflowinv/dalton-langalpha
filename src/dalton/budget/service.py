@@ -32,6 +32,7 @@ from src.dalton.database.budget import (
 from src.dalton.database.llm_journal import (
     count_unknown_usage_in_row,
     fetch_journal_rows_in_window,
+    is_pricing_failed_journal_row,
 )
 from src.dalton.llm.notional_pricing import (
     build_notional_price_index,
@@ -122,6 +123,41 @@ def _is_subscription_model(
     return is_sub
 
 
+def _conservative_pricing_floor_usd() -> Decimal:
+    """Return the conservative USD floor retained when a cash call's pricing cannot be resolved."""
+    try:
+        floor = get_dalton_settings().budget.admission_floor_usd
+        if floor is not None and Decimal(str(floor)) > Decimal("0"):
+            return Decimal(str(floor)).quantize(Decimal("0.000001"))
+    except Exception:
+        pass
+    return Decimal("0.250000")
+
+
+def _call_pricing_failed(call: dict[str, Any], token_usage: dict[str, Any]) -> bool:
+    """Return True when a `per_call_costs` entry represents a cash pricing lookup failure."""
+    if call.get("pricing_failed") is True:
+        return True
+    if token_usage.get("pricing_failed") is True:
+        # When per-call `pricing_failed` flags are present on this row, trust them
+        # instead of retroactively flagging succeeded calls that share the same model name.
+        per_call = token_usage.get("per_call_costs")
+        if isinstance(per_call, list) and any(
+            isinstance(c, dict) and c.get("pricing_failed") is True for c in per_call
+        ):
+            return False
+        if (
+            str(call.get("billing_type") or "platform") == "oauth"
+            or Decimal(str(call.get("cost") or "0")) > Decimal("0")
+        ):
+            return False
+        failed_models = token_usage.get("pricing_failed_models")
+        if isinstance(failed_models, list) and failed_models:
+            return str(call.get("model_name") or "") in failed_models
+        return True
+    return False
+
+
 def compute_subscription_notional_usd(token_usage_rows: list[dict[str, Any]]) -> Decimal:
     """Estimate nominal USD consumed today by subscription (`pricing_type=='subscription'`) and OAuth models."""
     idx = _notional_price_index()
@@ -134,6 +170,8 @@ def compute_subscription_notional_usd(token_usage_rows: list[dict[str, Any]]) ->
         if isinstance(per_call, list) and per_call:
             for c in per_call:
                 if not isinstance(c, dict):
+                    continue
+                if _call_pricing_failed(c, tu):
                     continue
                 m_name = str(c.get("model_name") or "unknown")
                 b_type = str(c.get("billing_type") or "platform")
@@ -174,10 +212,21 @@ def compute_subscription_notional_usd(token_usage_rows: list[dict[str, Any]]) ->
         by_model = tu.get("by_model")
         if not isinstance(by_model, dict):
             continue
+        failed_models = (
+            set(tu.get("pricing_failed_models") or [])
+            if tu.get("pricing_failed") is True
+            and isinstance(tu.get("pricing_failed_models"), list)
+            else set()
+        )
         for model_name, stats in by_model.items():
             if not isinstance(stats, dict):
                 continue
             m_name = str(model_name)
+            if tu.get("pricing_failed") is True and (
+                (failed_models and m_name in failed_models)
+                or (not failed_models and float(stats.get("total_cost") or 0.0) == 0.0)
+            ):
+                continue
             rates_list = stats.get("rates") or []
             has_oauth_rate = any(
                 isinstance(r, dict) and r.get("billing_type") == "oauth"
@@ -276,8 +325,14 @@ def compute_provider_breakdown(
                 "notional_usd": Decimal("0"),
                 "calls": 0,
                 "unknown_usage_calls": 0,
+                "pricing_failed_calls": 0,
+                "pricing_failed_models": [],
             }
         return buckets[prov]
+
+    def _note_pricing_failed_model(bucket: dict[str, Any], name: str) -> None:
+        if name and name not in bucket["pricing_failed_models"]:
+            bucket["pricing_failed_models"].append(name)
 
     for row in token_usage_rows:
         tu = row.get("token_usage")
@@ -292,13 +347,18 @@ def compute_provider_breakdown(
                 b_type = str(c.get("billing_type") or "platform")
                 stamped_id = c.get("pricing_model_id")
                 stamped_provider = c.get("pricing_provider")
-                is_sub = _is_subscription_model(
-                    m_name,
-                    b_type,
-                    pricing_model_id=stamped_id,
-                    pricing_provider=stamped_provider,
-                    cost=c.get("cost"),
-                    notional_cost=c.get("notional_cost"),
+                is_pricing_failed = _call_pricing_failed(c, tu)
+                is_sub = (
+                    False
+                    if is_pricing_failed
+                    else _is_subscription_model(
+                        m_name,
+                        b_type,
+                        pricing_model_id=stamped_id,
+                        pricing_provider=stamped_provider,
+                        cost=c.get("cost"),
+                        notional_cost=c.get("notional_cost"),
+                    )
                 )
                 prov = _resolve_provider_for_model(
                     m_name,
@@ -309,7 +369,13 @@ def compute_provider_breakdown(
                 b = _ensure(prov)
                 b["calls"] += 1
                 cost_dec = Decimal(str(c.get("cost") or "0"))
-                if is_sub:
+                if is_pricing_failed:
+                    b["pricing_failed_calls"] += 1
+                    b["unknown_usage_calls"] += 1
+                    _note_pricing_failed_model(b, m_name)
+                    # Do not count a pricing-failed call below the conservative floor.
+                    b["cash_usd"] += max(cost_dec, _conservative_pricing_floor_usd())
+                elif is_sub:
                     if "notional_cost" in c and c["notional_cost"] is not None:
                         b["notional_usd"] += Decimal(str(c["notional_cost"]))
                     elif cost_dec > Decimal("0"):
@@ -341,33 +407,54 @@ def compute_provider_breakdown(
         cash_val = Decimal(str(j.get("cash_usd") or "0"))
         notional_val = Decimal(str(j.get("notional_usd") or "0"))
         unknown_cnt = count_unknown_usage_in_row(j)
+        j_usage = j.get("usage") if isinstance(j.get("usage"), dict) else {}
+        j_pricing_failed = is_pricing_failed_journal_row(j)
         if (
             j.get("state") not in ("done", "indeterminate")
             and cash_val <= Decimal("0")
             and notional_val <= Decimal("0")
             and unknown_cnt <= 0
+            and not j_pricing_failed
         ):
             continue
         m_name = str(j.get("model_key") or "unknown")
         b_type = str(j.get("billing_type") or "platform")
-        j_prov = str(j.get("provider") or "") or None
-        is_sub = _is_subscription_model(
-            m_name,
-            b_type,
-            pricing_provider=j_prov,
-            cost=cash_val,
-            notional_cost=notional_val if "notional_usd" in j else None,
+        j_prov = str(j.get("provider") or j_usage.get("pricing_provider") or "") or None
+        j_pid = str(j_usage.get("pricing_model_id") or "") or None
+        is_sub = (
+            False
+            if j_pricing_failed
+            else _is_subscription_model(
+                m_name,
+                b_type,
+                pricing_model_id=j_pid,
+                pricing_provider=j_prov,
+                cost=cash_val,
+                notional_cost=notional_val if "notional_usd" in j else None,
+            )
         )
         prov = _resolve_provider_for_model(
             m_name,
             "oauth" if is_sub else b_type,
+            pricing_model_id=j_pid,
             pricing_provider=j_prov,
         )
         b = _ensure(prov)
         b["calls"] += 1
         if unknown_cnt > 0:
             b["unknown_usage_calls"] += unknown_cnt
-        if is_sub:
+        if j_pricing_failed:
+            b["pricing_failed_calls"] += 1
+            if unknown_cnt <= 0:
+                b["unknown_usage_calls"] += 1
+            failed_list = j_usage.get("pricing_failed_models")
+            if isinstance(failed_list, list) and failed_list:
+                for fm in failed_list:
+                    _note_pricing_failed_model(b, str(fm))
+            else:
+                _note_pricing_failed_model(b, m_name)
+            b["cash_usd"] += max(cash_val, _conservative_pricing_floor_usd())
+        elif is_sub:
             b["notional_usd"] += notional_val if notional_val > Decimal("0") else cash_val
         else:
             b["cash_usd"] += cash_val
@@ -382,6 +469,10 @@ def compute_provider_breakdown(
         }
         if vals["unknown_usage_calls"] > 0:
             entry["unknown_usage_calls"] = int(vals["unknown_usage_calls"])
+        if vals["pricing_failed_calls"] > 0:
+            entry["pricing_failed"] = True
+            entry["pricing_failed_calls"] = int(vals["pricing_failed_calls"])
+            entry["pricing_failed_models"] = list(vals["pricing_failed_models"])
         out[prov] = entry
     return out
 
@@ -470,6 +561,7 @@ async def reconcile_and_summarize_day(
             Decimal(str(j.get("notional_usd") or "0"))
             for j in journal_rows
             if isinstance(j, dict)
+            and not is_pricing_failed_journal_row(j)
             and (
                 j.get("state") in ("done", "indeterminate")
                 or Decimal(str(j.get("notional_usd") or "0")) > Decimal("0")
