@@ -687,6 +687,10 @@ class ComposeContext:
         if not raw_ids:
             raise RuntimeError(f"No image ID returned by `docker compose images -q {service}`")
         image_id = raw_ids[0]
+        # `compose images -q` prints the bare 64-hex ID; `docker save` rejects that
+        # form as a repository name and needs the digest-qualified `sha256:` form.
+        if len(image_id) == 64 and all(c in "0123456789abcdef" for c in image_id):
+            image_id = f"sha256:{image_id}"
         with tempfile.TemporaryDirectory(prefix=f"scan-{service}-") as tmpdir:
             tar_path = Path(tmpdir) / f"{service}.tar"
             proc = subprocess.run(
