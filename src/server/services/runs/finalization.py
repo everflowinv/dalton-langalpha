@@ -218,6 +218,14 @@ async def assemble_finalize_artifacts(
         per_call_records = None
         tool_usage = None
 
+    # DALTON-HOOK(budget): prove zero model calls only when the turn's token tracker observed 0 LLM starts.
+    token_callback = metadata.get("token_callback")
+    no_model_calls = (
+        token_callback is not None
+        and hasattr(token_callback, "llm_calls_started")
+        and token_callback.llm_calls_started() == 0
+    )
+
     return RunOutcome(
         status=status,
         interrupt_reason=interrupt_reason,
@@ -226,6 +234,7 @@ async def assemble_finalize_artifacts(
         execution_time=execution_time,
         per_call_records=per_call_records,
         tool_usage=tool_usage,
+        no_model_calls=no_model_calls,  # DALTON-HOOK(budget)
         record=await _producer_record(key, handler, stop_events, status),
         images=await _turn_images(key, metadata, handler),
     )

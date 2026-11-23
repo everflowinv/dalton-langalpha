@@ -197,12 +197,113 @@ def compute_invocation_id_and_hash(
     return f"lj1:{inv_digest}", request_hash
 
 
-def compute_call_costs(
+def _conservative_pricing_floor_usd() -> Decimal:
+    """Return the conservative USD floor retained when a one-shot cash call's pricing cannot be resolved."""
+    try:
+        floor = get_dalton_settings().budget.admission_floor_usd
+        if floor is not None and Decimal(str(floor)) > Decimal("0"):
+            return Decimal(str(floor)).quantize(Decimal("0.000001"))
+    except Exception:
+        pass
+    return Decimal("0.250000")
+
+
+async def _resolve_model_pricing_identity(
+    model_key: str,
+    *,
+    user_id: str | None,
+    ignore_custom_models: bool = False,
+) -> tuple[str, str, str | None, str | None]:
+    """Resolve `(billing_type, provider, pricing_model_id, pricing_provider)` using the chat path's
+    model classification and custom-model routing helpers (`user_models.classify_model`,
+    `user_models.route_custom_entry`, `clients.subscription_route`, `resolve_pricing_identity`)."""
+    billing_type, provider = resolve_model_billing_and_provider(model_key)
+    key = (model_key or "").strip()
+    if not key:
+        return billing_type, provider, None, None
+
+    from src.llms.pricing_utils import is_subscription_provider, resolve_pricing_identity
+
+    if user_id:
+        try:
+            from src.llms.llm import LLM as LLMFactory
+            from src.server.services.llm import clients as llm_clients
+            from src.server.services.llm import user_models
+
+            source, entry = await user_models.classify_model(
+                user_id,
+                key,
+                ignore_custom_models=ignore_custom_models,
+            )
+            if source == user_models.ModelSource.UNKNOWN and not ignore_custom_models:
+                cp_entry = await llm_clients._custom_provider_model(user_id, key)
+                if cp_entry is not None:
+                    source, entry = user_models.ModelSource.CUSTOM, cp_entry
+
+            if source == user_models.ModelSource.CUSTOM and isinstance(entry, dict):
+                mc = LLMFactory.get_model_config()
+                entry_provider = str(entry.get("provider") or "").strip()
+                routed_entry = entry
+                cp_cfg = None
+                if entry_provider:
+                    cp_cfg = await user_models.get_custom_provider_config(user_id, entry_provider)
+                    if cp_cfg and isinstance(cp_cfg.get("parent_provider"), str):
+                        routed_entry = user_models.route_custom_entry(entry, cp_cfg, mc)
+
+                pricing_model_id = str(routed_entry.get("model_id") or key).strip()
+                routed_provider = str(routed_entry.get("provider") or "").strip()
+                pricing_provider: str | None = routed_provider or None
+                if cp_cfg and pricing_provider and pricing_provider not in mc.flat_providers:
+                    parent_prov = str(cp_cfg.get("parent_provider") or "").strip()
+                    if parent_prov:
+                        pricing_provider = parent_prov
+
+                sub_route = llm_clients.subscription_route(key, mc, custom_entry=routed_entry)
+                if (
+                    sub_route is not None
+                    or is_subscription_provider(provider=pricing_provider, model_config=mc)
+                    or _is_subscription_model(
+                        key,
+                        "",
+                        pricing_model_id=pricing_model_id,
+                        pricing_provider=pricing_provider,
+                    )
+                ):
+                    resolved_billing = "oauth"
+                else:
+                    resolved_billing = "byok"
+
+                resolved_provider = pricing_provider or routed_provider or provider
+                return resolved_billing, resolved_provider, pricing_model_id, pricing_provider
+        except Exception as exc:
+            logger.debug(
+                "[DaltonComplete] custom model resolution fell back to manifest lookup for %r: %s",
+                key,
+                exc,
+            )
+
+    resolved_prov, resolved_pid = resolve_pricing_identity(key, billing_type=billing_type)
+    eff_provider = provider if provider != "unknown" else (resolved_prov or "unknown")
+    eff_pricing_provider = resolved_prov or (eff_provider if eff_provider != "unknown" else None)
+    eff_pricing_model_id = resolved_pid if resolved_pid != key or resolved_prov else None
+    return billing_type, eff_provider, eff_pricing_model_id, eff_pricing_provider
+
+
+def compute_call_costs_detailed(
     model_key: str,
     billing_type: str,
     token_usage: dict[str, Any] | None,
-) -> tuple[Decimal, Decimal]:
-    """Compute `(cash_usd, notional_usd)` for a single LLM invocation (or its per-attempt calls)."""
+    *,
+    pricing_model_id: str | None = None,
+    pricing_provider: str | None = None,
+) -> tuple[Decimal, Decimal, bool, list[str]]:
+    """Compute `(cash_usd, notional_usd, pricing_failed, pricing_failed_models)` for an LLM call.
+
+    Resolves custom models via `pricing_model_id` / `pricing_provider` (the same identity stamped
+    on chat clients) before calling `calculate_cost_from_per_call_records`. When a non-subscription
+    call with reported token usage still fails pricing lookup, marks `pricing_failed=True` and
+    retains the conservative floor (`admission_floor_usd`).
+    """
     from src.dalton.llm.notional_pricing import (
         build_notional_price_index,
         calculate_notional_cost,
@@ -236,22 +337,37 @@ def compute_call_costs(
             }
         ]
 
+    has_tokens = has_reported_token_usage(usage)
     calc_cost = Decimal("0")
     calc_notional: Decimal | None = None
+    pricing_failed = False
+    pricing_failed_models: list[str] = []
     try:
         from src.utils.tracking.core import calculate_cost_from_per_call_records
 
-        res = calculate_cost_from_per_call_records(
-            [
-                {
-                    "model_name": model_key,
-                    "usage": dict(cu),
-                    "billing_type": billing_type,
-                }
-                for cu in call_usages
-            ]
-        )
+        records_for_pricing: list[dict[str, Any]] = []
+        for cu in call_usages:
+            rec: dict[str, Any] = {
+                "model_name": model_key,
+                "usage": dict(cu),
+                "billing_type": billing_type,
+            }
+            if pricing_model_id:
+                rec["pricing_model_id"] = pricing_model_id
+            if pricing_provider:
+                rec["pricing_provider"] = pricing_provider
+            records_for_pricing.append(rec)
+
+        res = calculate_cost_from_per_call_records(records_for_pricing)
         calc_cost = Decimal(str(res.get("total_cost") or "0")).quantize(Decimal("0.000001"))
+        if res.get("pricing_failed") is True:
+            pricing_failed = True
+            raw_failed = res.get("pricing_failed_models")
+            pricing_failed_models = (
+                [str(m) for m in raw_failed]
+                if isinstance(raw_failed, list) and raw_failed
+                else [model_key]
+            )
         per_call = res.get("per_call_costs") or []
         if per_call and all(
             isinstance(c, dict) and c.get("notional_cost") is not None for c in per_call
@@ -262,15 +378,38 @@ def compute_call_costs(
             ).quantize(Decimal("0.000001"))
     except Exception as exc:
         logger.debug("[DaltonComplete] calculate_cost_from_per_call_records failed: %s", exc)
+        if has_tokens:
+            pricing_failed = True
+            pricing_failed_models = [model_key]
 
     is_sub = (
         billing_type == "oauth"
-        or _is_subscription_model(model_key, billing_type)
-        or is_subscription_model(model_key, billing_type)
+        or _is_subscription_model(
+            model_key,
+            billing_type,
+            pricing_model_id=pricing_model_id,
+            pricing_provider=pricing_provider,
+            cost=calc_cost,
+            notional_cost=calc_notional,
+        )
+        or (
+            is_subscription_model(
+                model_key,
+                billing_type,
+                pricing_model_id=pricing_model_id,
+                pricing_provider=pricing_provider,
+            )
+            and not (calc_cost > Decimal("0") and (calc_notional is None or calc_notional == Decimal("0")))
+        )
     )
     if is_sub:
         idx = build_notional_price_index(overlay_loader=load_overlay_data)
-        card = resolve_notional_card(model_key, index=idx)
+        card = resolve_notional_card(
+            model_key,
+            pricing_model_id=pricing_model_id,
+            pricing_provider=pricing_provider,
+            index=idx,
+        )
         if card is not None:
             total_notional = Decimal("0")
             for cu in call_usages:
@@ -283,14 +422,144 @@ def compute_call_costs(
                     cache_1h_tokens=cu["cache_1h_tokens"],
                 )
                 total_notional += Decimal(str(usd))
-            return Decimal("0"), total_notional.quantize(Decimal("0.000001"))
+            return Decimal("0"), total_notional.quantize(Decimal("0.000001")), False, []
         if calc_notional is not None and calc_notional > Decimal("0"):
-            return Decimal("0"), calc_notional
+            return Decimal("0"), calc_notional, False, []
         if calc_cost > Decimal("0"):
-            return Decimal("0"), calc_cost
-        return Decimal("0"), Decimal("0")
+            return Decimal("0"), calc_cost, False, []
+        return Decimal("0"), Decimal("0"), False, []
 
-    return calc_cost, Decimal("0")
+    if pricing_failed and has_tokens:
+        floor_usd = _conservative_pricing_floor_usd()
+        return max(calc_cost, floor_usd), Decimal("0"), True, pricing_failed_models or [model_key]
+
+    return calc_cost, Decimal("0"), False, []
+
+
+def compute_call_costs(
+    model_key: str,
+    billing_type: str,
+    token_usage: dict[str, Any] | None,
+) -> tuple[Decimal, Decimal]:
+    """Compute `(cash_usd, notional_usd)` for a single LLM invocation (or its per-attempt calls)."""
+    cash_usd, notional_usd, _, _ = compute_call_costs_detailed(
+        model_key,
+        billing_type,
+        token_usage,
+    )
+    return cash_usd, notional_usd
+
+
+def _apply_actual_client_identity(
+    collected_usages: Any,
+    *,
+    provider: str,
+    billing_type: str,
+    pricing_model_id: str | None,
+    pricing_provider: str | None,
+) -> tuple[str, str, str | None, str | None]:
+    """Override upfront claim guesses with the actual client identity captured in
+    `collected_usages` (on success, cancellation, and failure alike).
+
+    When per-call records span multiple distinct providers/identities (e.g. a fallback
+    across providers), keep the top-level journal `provider` / `billing_type` intact
+    instead of overwriting it with the last call's identity; each call record carries
+    its own pricing identity into `dalton_llm_journal_attempts`.
+    """
+    raw_records = getattr(collected_usages, "call_records", None)
+    if isinstance(raw_records, list) and raw_records:
+        pprovs = {
+            str(rec["pricing_provider"])
+            for rec in raw_records
+            if isinstance(rec, dict)
+            and isinstance(rec.get("pricing_provider"), str)
+            and rec["pricing_provider"]
+        }
+        pids = {
+            str(rec["pricing_model_id"])
+            for rec in raw_records
+            if isinstance(rec, dict)
+            and isinstance(rec.get("pricing_model_id"), str)
+            and rec["pricing_model_id"]
+        }
+        btypes = {
+            str(rec["billing_type"])
+            for rec in raw_records
+            if isinstance(rec, dict)
+            and isinstance(rec.get("billing_type"), str)
+            and rec["billing_type"]
+        }
+        if len(pprovs) == 1:
+            only_pprov = next(iter(pprovs))
+            eff_pprov: str | None = only_pprov
+            eff_provider = only_pprov
+        elif len(pprovs) > 1:
+            # Mixed providers across per-call records: do not overwrite top-level journal provider.
+            eff_pprov = None
+            eff_provider = provider
+        else:
+            eff_pprov = pricing_provider
+            eff_provider = provider
+
+        if len(pids) == 1:
+            eff_pid: str | None = next(iter(pids))
+        elif len(pids) > 1:
+            eff_pid = None
+        else:
+            eff_pid = pricing_model_id
+
+        if len(btypes) == 1:
+            eff_btype = next(iter(btypes))
+        else:
+            eff_btype = billing_type
+
+        return eff_provider, eff_btype, eff_pid, eff_pprov
+
+    actual_pid = getattr(collected_usages, "pricing_model_id", None)
+    actual_pprov = getattr(collected_usages, "pricing_provider", None)
+    actual_btype = getattr(collected_usages, "billing_type", None)
+
+    eff_pid = actual_pid if isinstance(actual_pid, str) and actual_pid else pricing_model_id
+    eff_pprov = actual_pprov if isinstance(actual_pprov, str) and actual_pprov else pricing_provider
+    eff_provider = actual_pprov if isinstance(actual_pprov, str) and actual_pprov else provider
+    eff_btype = actual_btype if isinstance(actual_btype, str) and actual_btype else billing_type
+    return eff_provider, eff_btype, eff_pid, eff_pprov
+
+
+def _price_complete_usage(
+    model_key: str,
+    billing_type: str,
+    usage_dict: dict[str, Any],
+    *,
+    pricing_model_id: str | None = None,
+    pricing_provider: str | None = None,
+) -> tuple[Decimal, Decimal, bool, list[str]]:
+    """Compute costs and stamp pricing identity / failure markers onto ``usage_dict`` in place."""
+    if pricing_model_id:
+        usage_dict["pricing_model_id"] = pricing_model_id
+    if pricing_provider:
+        usage_dict["pricing_provider"] = pricing_provider
+    cash_d, notional_d, failed, failed_models = compute_call_costs_detailed(
+        model_key,
+        billing_type,
+        usage_dict,
+        pricing_model_id=pricing_model_id,
+        pricing_provider=pricing_provider,
+    )
+    if failed:
+        floor_usd = _conservative_pricing_floor_usd()
+        usage_dict["pricing_failed"] = True
+        usage_dict["pricing_failed_models"] = list(failed_models)
+        usage_dict["conservative_floor_usd"] = float(floor_usd)
+        logger.warning(
+            "[DaltonComplete] Pricing lookup failed for model=%r (pricing_id=%r, provider=%r); "
+            "retaining conservative floor $%.4f",
+            model_key,
+            pricing_model_id,
+            pricing_provider,
+            float(floor_usd),
+        )
+    return cash_d, notional_d, failed, failed_models
 
 
 _NUMERIC_USAGE_KEYS: tuple[str, ...] = (
@@ -383,6 +652,8 @@ def _build_attempt_call_records(
     fallback_unknown_calls: int,
     fallback_occurred_at: datetime | None,
     credential_holder: str | None = None,
+    pricing_model_id: str | None = None,
+    pricing_provider: str | None = None,
 ) -> tuple[list[dict[str, Any]], Decimal, Decimal]:
     """Convert per-request records captured by `make_api_call` into per-request ledger rows
     with each request's own `occurred_at` (send timestamp) and per-request cost."""
@@ -405,8 +676,19 @@ def _build_attempt_call_records(
         if rec_outcome_raw == "in_flight" and rec_unknown == 0 and not rec_has_usage:
             rec_unknown = 1
 
+        rec_pid = rec.get("pricing_model_id") or pricing_model_id
+        rec_pprov = rec.get("pricing_provider") or pricing_provider
+        rec_btype = rec.get("billing_type") or billing_type
+        rec_pricing_failed = False
+        rec_failed_models: list[str] = []
         if rec_has_usage:
-            c_i, n_i = compute_call_costs(effective_model, billing_type, rec_usage)
+            c_i, n_i, rec_pricing_failed, rec_failed_models = compute_call_costs_detailed(
+                effective_model,
+                rec_btype,
+                rec_usage,
+                pricing_model_id=rec_pid,
+                pricing_provider=rec_pprov,
+            )
         else:
             c_i, n_i = Decimal("0"), Decimal("0")
         total_cash += c_i
@@ -414,6 +696,14 @@ def _build_attempt_call_records(
 
         if credential_holder:
             rec_usage.setdefault("credential_user_id", credential_holder)
+        if rec_pid:
+            rec_usage["pricing_model_id"] = rec_pid
+        if rec_pprov:
+            rec_usage["pricing_provider"] = rec_pprov
+        if rec_pricing_failed:
+            rec_usage["pricing_failed"] = True
+            rec_usage["pricing_failed_models"] = rec_failed_models
+            rec_usage["conservative_floor_usd"] = float(_conservative_pricing_floor_usd())
         rec_usage["usage_known"] = rec_unknown == 0
         rec_usage["unknown_usage_calls"] = rec_unknown
 
@@ -440,6 +730,8 @@ def _build_attempt_call_records(
         out.append(
             {
                 "call_seq": idx,
+                "provider": rec_pprov,
+                "billing_type": rec_btype,
                 "outcome": row_outcome,
                 "error_kind": row_error_kind,
                 "usage": rec_usage,
@@ -522,6 +814,18 @@ def _merge_attempt_usage(
         merged["credential_user_id"] = prior["credential_user_id"]
     elif not preserve_credential_holder:
         merged.pop("credential_user_id", None)
+    if prior.get("pricing_failed") is True or current.get("pricing_failed") is True:
+        merged["pricing_failed"] = True
+        merged_failed_models: list[str] = []
+        for src in (prior, current):
+            raw_fm = src.get("pricing_failed_models")
+            if isinstance(raw_fm, list):
+                for m in raw_fm:
+                    ms = str(m)
+                    if ms and ms not in merged_failed_models:
+                        merged_failed_models.append(ms)
+        if merged_failed_models:
+            merged["pricing_failed_models"] = merged_failed_models
     return merged
 
 
@@ -1048,7 +1352,23 @@ async def _dalton_complete_impl(
             f"默认模型未配置（slot={slot}，请在 agent_config.dalton.yaml / dalton.yaml 中配置或显式传入 model）"
         )
 
-    billing_type, provider = resolve_model_billing_and_provider(effective_model)
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    eff_user_id = str(user_id).strip()
+    if credential_user_id is _UNSET:
+        llm_user_id: str | None = user_id
+    elif credential_user_id is None:
+        llm_user_id = None
+    else:
+        llm_user_id = str(credential_user_id).strip() or None
+
+    billing_type, provider, pricing_model_id, pricing_provider = (
+        await _resolve_model_pricing_identity(
+            effective_model,
+            user_id=llm_user_id,
+            ignore_custom_models=ignore_custom_models,
+        )
+    )
     if scope_ref:
         eff_scope = scope_ref
     else:
@@ -1071,15 +1391,6 @@ async def _dalton_complete_impl(
         slot=slot,
     )
     inv_id = invocation_id or computed_inv_id
-    if not user_id or not str(user_id).strip():
-        raise ValueError("user_id is required")
-    eff_user_id = str(user_id).strip()
-    if credential_user_id is _UNSET:
-        llm_user_id: str | None = user_id
-    elif credential_user_id is None:
-        llm_user_id = None
-    else:
-        llm_user_id = str(credential_user_id).strip() or None
 
     # 1. Inspect journal first so cached replays (`done`) and indeterminate/in-flight states
     #    return immediately without charging or re-sending.
@@ -1386,8 +1697,19 @@ async def _dalton_complete_impl(
                 usage_dict.setdefault("credential_user_id", _resolve_credential_user_id(eff_user_id))
         elif llm_user_id and llm_user_id != eff_user_id:
             usage_dict.setdefault("credential_user_id", llm_user_id)
-        cash_dec, notional_dec = compute_call_costs(
-            effective_model, billing_type, usage_dict
+        provider, billing_type, pricing_model_id, pricing_provider = _apply_actual_client_identity(
+            collected_usages,
+            provider=provider,
+            billing_type=billing_type,
+            pricing_model_id=pricing_model_id,
+            pricing_provider=pricing_provider,
+        )
+        cash_dec, notional_dec, _, _ = _price_complete_usage(
+            effective_model,
+            billing_type,
+            usage_dict,
+            pricing_model_id=pricing_model_id,
+            pricing_provider=pricing_provider,
         )
         db_resp, parsed_data, text_val = _serialize_response_payload(out_obj)
         journal_resp = (
@@ -1415,10 +1737,29 @@ async def _dalton_complete_impl(
             fallback_unknown_calls=attempt_unknown_calls,
             fallback_occurred_at=attempt_started_at,
             credential_holder=cred_holder,
+            pricing_model_id=pricing_model_id,
+            pricing_provider=pricing_provider,
         )
         if done_call_records:
             cash_dec = per_call_cash
             notional_dec = per_call_notional
+            if any(
+                isinstance(r.get("usage"), dict) and r["usage"].get("pricing_failed") is True
+                for r in done_call_records
+            ):
+                usage_dict["pricing_failed"] = True
+                failed_m: list[str] = list(usage_dict.get("pricing_failed_models") or [])
+                for r in done_call_records:
+                    ru = r.get("usage")
+                    if isinstance(ru, dict) and isinstance(ru.get("pricing_failed_models"), list):
+                        for fm in ru["pricing_failed_models"]:
+                            if fm not in failed_m:
+                                failed_m.append(fm)
+                usage_dict["pricing_failed_models"] = failed_m or [effective_model]
+            else:
+                usage_dict.pop("pricing_failed", None)
+                usage_dict.pop("pricing_failed_models", None)
+                usage_dict.pop("conservative_floor_usd", None)
         merged_prior = attempt > 1 and has_reported_token_usage(claimed_row.get("usage"))
         journal_usage = (
             _merge_attempt_usage(
@@ -1470,6 +1811,13 @@ async def _dalton_complete_impl(
             attempt=attempt,
         )
     except asyncio.CancelledError as cancel_exc:
+        provider, billing_type, pricing_model_id, pricing_provider = _apply_actual_client_identity(
+            collected_usages,
+            provider=provider,
+            billing_type=billing_type,
+            pricing_model_id=pricing_model_id,
+            pricing_provider=pricing_provider,
+        )
         if not skip_journal:
             try:
                 if not llm_call_completed:
@@ -1484,8 +1832,12 @@ async def _dalton_complete_impl(
                                 )
                         elif llm_user_id and llm_user_id != eff_user_id:
                             usage_dict.setdefault("credential_user_id", llm_user_id)
-                        cash_dec, notional_dec = compute_call_costs(
-                            effective_model, billing_type, usage_dict
+                        cash_dec, notional_dec, _, _ = _price_complete_usage(
+                            effective_model,
+                            billing_type,
+                            usage_dict,
+                            pricing_model_id=pricing_model_id,
+                            pricing_provider=pricing_provider,
                         )
 
                 has_usage = has_reported_token_usage(usage_dict)
@@ -1519,6 +1871,10 @@ async def _dalton_complete_impl(
                 merged_prior_cancel = False
                 if cancel_state == "indeterminate" or has_usage or final_attempt_unknown:
                     attempt_cancel_usage = dict(usage_dict)
+                    if pricing_model_id:
+                        attempt_cancel_usage["pricing_model_id"] = pricing_model_id
+                    if pricing_provider:
+                        attempt_cancel_usage["pricing_provider"] = pricing_provider
                     attempt_cancel_usage["usage_known"] = not final_attempt_unknown
                     attempt_cancel_usage["unknown_usage_calls"] = attempt_unknown_calls
                     merged_prior_cancel = attempt > 1 and has_reported_token_usage(
@@ -1551,15 +1907,30 @@ async def _dalton_complete_impl(
                     fallback_unknown_calls=attempt_unknown_calls,
                     fallback_occurred_at=attempt_started_at,
                     credential_holder=cred_holder,
+                    pricing_model_id=pricing_model_id,
+                    pricing_provider=pricing_provider,
                 )
                 if cancel_call_records:
                     cash_dec = per_call_cash
                     notional_dec = per_call_notional
+                    if not any(
+                        isinstance(r.get("usage"), dict) and r["usage"].get("pricing_failed") is True
+                        for r in cancel_call_records
+                    ):
+                        for u_blob in (attempt_cancel_usage, journal_cancel_usage):
+                            if isinstance(u_blob, dict):
+                                u_blob.pop("pricing_failed", None)
+                                u_blob.pop("pricing_failed_models", None)
+                                u_blob.pop("conservative_floor_usd", None)
 
                 extra_cancel_kwargs: dict[str, Any] = {
                     "usage_known": not final_attempt_unknown,
                     "unknown_usage_calls": attempt_unknown_calls,
                 }
+                if provider:
+                    extra_cancel_kwargs["provider"] = provider
+                if billing_type:
+                    extra_cancel_kwargs["billing_type"] = billing_type
                 if llm_user_id is None:
                     extra_cancel_kwargs["stamp_credential_holder"] = False
                 if merged_prior_cancel or (attempt > 1 and attempt_cancel_usage is not None):
@@ -1596,6 +1967,13 @@ async def _dalton_complete_impl(
     except Exception as exc:
         from src.dalton.llm.providers.xai_grok.client import get_stream_progress
 
+        provider, billing_type, pricing_model_id, pricing_provider = _apply_actual_client_identity(
+            collected_usages,
+            provider=provider,
+            billing_type=billing_type,
+            pricing_model_id=pricing_model_id,
+            pricing_provider=pricing_provider,
+        )
         if llm_call_completed:
             target_state = "indeterminate"
             error_kind = "post_call_error"
@@ -1613,8 +1991,12 @@ async def _dalton_complete_impl(
                         )
                 elif llm_user_id and llm_user_id != eff_user_id:
                     usage_dict.setdefault("credential_user_id", llm_user_id)
-                cash_dec, notional_dec = compute_call_costs(
-                    effective_model, billing_type, usage_dict
+                cash_dec, notional_dec, _, _ = _price_complete_usage(
+                    effective_model,
+                    billing_type,
+                    usage_dict,
+                    pricing_model_id=pricing_model_id,
+                    pricing_provider=pricing_provider,
                 )
                 if target_state == "failed":
                     target_state = "indeterminate"
@@ -1675,6 +2057,10 @@ async def _dalton_complete_impl(
         merged_prior_fail = False
         if target_state == "indeterminate" or has_usage or final_attempt_unknown:
             attempt_fail_usage = dict(usage_dict)
+            if pricing_model_id:
+                attempt_fail_usage["pricing_model_id"] = pricing_model_id
+            if pricing_provider:
+                attempt_fail_usage["pricing_provider"] = pricing_provider
             attempt_fail_usage["usage_known"] = not final_attempt_unknown
             attempt_fail_usage["unknown_usage_calls"] = attempt_unknown_calls
             attempt_fail_usage["stream_started"] = stream_started
@@ -1707,10 +2093,21 @@ async def _dalton_complete_impl(
             fallback_unknown_calls=attempt_unknown_calls,
             fallback_occurred_at=attempt_started_at,
             credential_holder=cred_holder,
+            pricing_model_id=pricing_model_id,
+            pricing_provider=pricing_provider,
         )
         if fail_call_records:
             cash_dec = per_call_cash
             notional_dec = per_call_notional
+            if not any(
+                isinstance(r.get("usage"), dict) and r["usage"].get("pricing_failed") is True
+                for r in fail_call_records
+            ):
+                for u_blob in (attempt_fail_usage, journal_fail_usage):
+                    if isinstance(u_blob, dict):
+                        u_blob.pop("pricing_failed", None)
+                        u_blob.pop("pricing_failed_models", None)
+                        u_blob.pop("conservative_floor_usd", None)
 
         safe_msg = sanitize_error_text(exc, max_len=240)
         if provider == "muse-oauth" and error_kind == "auth_expired":
@@ -1723,6 +2120,10 @@ async def _dalton_complete_impl(
                     "usage_known": not final_attempt_unknown,
                     "unknown_usage_calls": attempt_unknown_calls,
                 }
+                if provider:
+                    extra_fail_kwargs["provider"] = provider
+                if billing_type:
+                    extra_fail_kwargs["billing_type"] = billing_type
                 if llm_user_id is None:
                     extra_fail_kwargs["stamp_credential_holder"] = False
                 if merged_prior_fail or (attempt > 1 and attempt_fail_usage is not None):

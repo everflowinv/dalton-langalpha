@@ -505,6 +505,7 @@ class RunCoordinator:
         *,
         status: str = "error",
         metadata: Optional[Dict[str, Any]] = None,
+        no_model_calls: bool = False,  # DALTON-HOOK(budget)
     ) -> Optional[FinalizeResult]:
         """Guarantee-finalize for paths that die between START and execution.
 
@@ -522,6 +523,8 @@ class RunCoordinator:
             metadata=metadata or {},
             errors=[error_message],
             execution_time=(datetime.now(timezone.utc) - handle.started_at).total_seconds(),
+            # DALTON-HOOK(budget): caller explicitly passes no_model_calls (True only before executor handoff; conservative False otherwise).
+            no_model_calls=no_model_calls,
         )
 
         async def _finalize() -> Optional[FinalizeResult]:

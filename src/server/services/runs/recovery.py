@@ -817,6 +817,31 @@ class RecoveryScanner:
         try:
             settled["responses"] = await credit_ledger.settle_abandoned("run")
             settled["task_runs"] = await credit_ledger.settle_abandoned("task")
+            # DALTON-HOOK(budget): conservatively settle abandoned budget reservations for
+            # terminal runs past _ABANDONED_SETTLE_GRACE that never persisted a `ptc` usage row.
+            # Only runs when Dalton is enabled; missing Dalton tables skip cleanly inside the SQL helper.
+            from src.dalton.settings import is_dalton_enabled
+
+            if is_dalton_enabled():
+                try:
+                    from decimal import Decimal
+
+                    from src.config.env import USD_TO_CREDITS_RATE
+                    from src.dalton.database.budget import (
+                        settle_abandoned_runs_without_ptc_sql,
+                    )
+                    from src.server.database.pool import get_db_connection
+
+                    async with get_db_connection() as conn:
+                        async with conn.transaction():
+                            await settle_abandoned_runs_without_ptc_sql(
+                                conn, Decimal(str(USD_TO_CREDITS_RATE))
+                            )
+                except Exception:
+                    logger.warning(
+                        "[RecoveryScanner] dalton abandoned reservation fallback settle failed",
+                        exc_info=True,
+                    )
             if settled["responses"] or settled["task_runs"]:
                 logger.warning(
                     f"[RecoveryScanner] degraded-settled abandoned usage: "
