@@ -239,25 +239,27 @@ PY
   fi
 }
 
-read_env_var() {
-  local key="$1" default_val="${2:-}"
-  if [[ -n "${!key:-}" ]]; then
-    printf '%s' "${!key}"
-    return 0
-  fi
-  read_env_file_var "$ENV_FILE" "$key" "$default_val"
+sanitize_project_name() {
+  local raw="$1"
+  local cleaned
+  cleaned="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/-/g; s/^[^a-z0-9]+//; s/[-_]+$//')"
+  printf '%s' "${cleaned:-dalton-core}"
 }
 
-# External PostgreSQL guard: refuse non-Compose databases before modifying anything.
-DB_HOST="$(read_env_var "DB_HOST" "postgres")"
+# Read deployment settings strictly from .env (never shell environment).
+DB_HOST="$(read_env_file_var "$ENV_FILE" "DB_HOST" "postgres")"
 if [[ "$DB_HOST" != "postgres" ]]; then
   err "External PostgreSQL detected (DB_HOST='${DB_HOST}'; expected Compose-managed 'postgres')."
   err "upgrade.sh requires Compose-managed PostgreSQL for pre-upgrade backup and rollback. For external databases, back up with pg_dump and upgrade manually."
   exit 1
 fi
 
-DOMAIN="$(read_env_var "DOMAIN" "localhost")"
-TLS_MODE="$(read_env_var "DALTON_TLS_MODE" "loopback")"
+PROJECT_NAME="$(read_env_file_var "$ENV_FILE" "COMPOSE_PROJECT_NAME" "")"
+if [[ -z "$PROJECT_NAME" ]]; then
+  PROJECT_NAME="$(sanitize_project_name "$(basename "$WORK_DIR")")"
+fi
+DOMAIN="$(read_env_file_var "$ENV_FILE" "DOMAIN" "localhost")"
+TLS_MODE="$(read_env_file_var "$ENV_FILE" "DALTON_TLS_MODE" "loopback")"
 
 if [[ -z "$BACKUP_OUTPUT_DIR" ]]; then
   BACKUP_OUTPUT_DIR="${WORK_DIR}/backups"
@@ -269,7 +271,7 @@ fi
 BACKUP_OUTPUT_DIR="$(cd "$BACKUP_OUTPUT_DIR" && pwd)"
 
 if [[ -z "$COMPOSE_FILES_RAW" ]]; then
-  env_compose_file="$(read_env_var "COMPOSE_FILE" "")"
+  env_compose_file="$(read_env_file_var "$ENV_FILE" "COMPOSE_FILE" "")"
   if [[ -n "$env_compose_file" ]]; then
     COMPOSE_FILES_RAW="$env_compose_file"
   elif [[ "$TLS_MODE" != "loopback" && "$DOMAIN" == *:* && -f "${WORK_DIR}/deploy/standalone/docker-compose.tls.ipv6.yml" ]]; then
@@ -282,7 +284,7 @@ if [[ -z "$COMPOSE_FILES_RAW" ]]; then
 fi
 
 IFS=':' read -r -a COMPOSE_FILES_ARR <<< "$COMPOSE_FILES_RAW"
-COMPOSE_ARGS=(--project-directory "$WORK_DIR")
+COMPOSE_FILE_ARGS=()
 NORMALIZED_COMPOSE_FILES=()
 for cf in "${COMPOSE_FILES_ARR[@]}"; do
   [[ -z "$cf" ]] && continue
@@ -293,13 +295,62 @@ for cf in "${COMPOSE_FILES_ARR[@]}"; do
     err "Compose file not found: ${cf}"
     exit 1
   fi
-  COMPOSE_ARGS+=(-f "$cf")
+  COMPOSE_FILE_ARGS+=(-f "$cf")
   NORMALIZED_COMPOSE_FILES+=("$cf")
 done
 COMPOSE_FILES_JOINED="$(IFS=':'; echo "${NORMALIZED_COMPOSE_FILES[*]}")"
+COMPOSE_PRINT_ARGS=(-p "$PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE")
+
+# Unset .env keys, compose-interpolated keys, and COMPOSE_*/DB_* variables so
+# shell exports never shadow .env (ensuring migrate and psql share the same DB_NAME).
+ENV_UNSET_ARGS=()
+while IFS= read -r env_key; do
+  [[ -n "$env_key" ]] && ENV_UNSET_ARGS+=(-u "$env_key")
+done < <(python3 - "$ENV_FILE" "${NORMALIZED_COMPOSE_FILES[@]}" <<'PY'
+import re, sys
+
+env_path = sys.argv[1]
+compose_files = sys.argv[2:]
+line_re = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*[=:]")
+interp_re = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)")
+seen: set[str] = set()
+for key in (
+    "COMPOSE_PROJECT_NAME",
+    "COMPOSE_FILE",
+    "COMPOSE_PROFILES",
+    "DB_HOST",
+    "DB_PORT",
+    "DB_USER",
+    "DB_PASSWORD",
+    "DB_NAME",
+):
+    seen.add(key)
+    print(key)
+with open(env_path, encoding="utf-8") as fh:
+    for raw in fh:
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        m = line_re.match(raw)
+        if not m:
+            continue
+        key = m.group(1)
+        if key != "PATH" and key not in seen:
+            seen.add(key)
+            print(key)
+for cf in compose_files:
+    with open(cf, encoding="utf-8") as fh:
+        text = fh.read()
+    for m in interp_re.finditer(text):
+        key = m.group(1)
+        if key != "PATH" and key not in seen:
+            seen.add(key)
+            print(key)
+PY
+)
 
 compose_cmd() {
-  docker compose "${COMPOSE_ARGS[@]}" "$@"
+  env "${ENV_UNSET_ARGS[@]}" docker compose -p "$PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" --project-directory "$WORK_DIR" "$@"
 }
 
 if [[ -n "$RELEASE_TAR" && ! -f "$RELEASE_TAR" ]]; then
@@ -320,8 +371,8 @@ if [[ -f "${WORK_DIR}/.release_git_sha" ]]; then
   PREV_RELEASE_SHA="$(tr -d '[:space:]' < "${WORK_DIR}/.release_git_sha")"
 fi
 
-BACKEND_IMAGE="$(read_env_var "DALTON_BACKEND_IMAGE" "dalton-core-backend:local")"
-EDGE_IMAGE="$(read_env_var "DALTON_EDGE_IMAGE" "dalton-core-edge:local")"
+BACKEND_IMAGE="$(read_env_file_var "$ENV_FILE" "DALTON_BACKEND_IMAGE" "dalton-core-backend:local")"
+EDGE_IMAGE="$(read_env_file_var "$ENV_FILE" "DALTON_EDGE_IMAGE" "dalton-core-edge:local")"
 BACKEND_REPO="${BACKEND_IMAGE%:*}"
 EDGE_REPO="${EDGE_IMAGE%:*}"
 
@@ -331,11 +382,11 @@ PRE_CRAWLER_TAG=""
 SNAPSHOT_CREATED=0
 FILES_REPLACED=0
 IMAGES_BUILT=0
-# Migration state determined strictly by comparing successfully read pre- and
-# post-migration Alembic versions:
-#   "before"   - migration not started or both pre/post versions read cleanly and unchanged
+# Migration state:
+#   "before"   - failure occurred strictly BEFORE `migrate` was invoked
 #   "migrated" - both pre/post versions read cleanly and at least one version changed
-#   "unknown"  - failed to read pre-migration and/or post-migration version (check manually)
+#   "unknown"  - `migrate` was invoked and either pre/post versions could not be read
+#                OR versions stayed identical (partial DDL e.g. autocommit_block may have run)
 MIGRATION_STATE="before"
 PRE_MIGRATE_UP=""
 PRE_MIGRATE_DA=""
@@ -356,7 +407,7 @@ print_rollback_steps() {
     fi
     printf "  Do NOT wipe volumes or restore data; your running stack and data were not changed.\n" >&2
     printf "  Inspect the error above and check:\n" >&2
-    printf "    %s\n" "$(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" ps)" >&2
+    printf "    %s\n" "$(fmt_cmd docker compose "${COMPOSE_PRINT_ARGS[@]}" ps)" >&2
     printf "=========================================================================\n" >&2
     return 0
   fi
@@ -377,14 +428,14 @@ print_rollback_steps() {
     printf "        reset-and-restore steps in %s.\n" "$MANUAL_OVERWRITE_REF" >&2
     printf "        Writes acknowledged after the pre-upgrade backup are not in that backup.\n\n" >&2
   elif [[ "$MIGRATION_STATE" == "unknown" ]]; then
-    printf "  NOTE: Database migration state is UNCERTAIN (failed to read Alembic versions before and/or after migrate).\n" >&2
+    printf "  NOTE: Database migration state is UNCERTAIN (migrate was started, and Alembic versions were unreadable or unchanged — partial DDL such as autocommit_block may still have committed).\n" >&2
     printf "        Do NOT assume migrations already ran and do NOT wipe volumes yet.\n" >&2
-    printf "        First manually check current Alembic versions and compare with %s/manifest.json:\n" "${PRE_UPGRADE_BACKUP:-<pre-upgrade-backup>}" >&2
-    printf "          %s\n" "$(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" exec -T postgres psql -U "${MIG_DB_USER:-postgres}" -d "${MIG_DB_NAME:-postgres}" -Atqc "SELECT 'upstream=' || version_num FROM alembic_version UNION ALL SELECT 'dalton=' || version_num FROM alembic_version_dalton;")" >&2
-    printf "        - If both versions match manifest.json (unchanged): only restore release files & image tags and run 'docker compose up -d' (do NOT touch data).\n" >&2
-    printf "        - If either version changed: restore release files & image tags, then follow %s.\n\n" "$MANUAL_OVERWRITE_REF" >&2
+    printf "        First manually check current Alembic versions and schema objects, and compare with %s/manifest.json:\n" "${PRE_UPGRADE_BACKUP:-<pre-upgrade-backup>}" >&2
+    printf "          %s\n" "$(fmt_cmd docker compose "${COMPOSE_PRINT_ARGS[@]}" exec -T postgres psql -U "${MIG_DB_USER:-postgres}" -d "${MIG_DB_NAME:-postgres}" -Atqc "SELECT 'upstream=' || version_num FROM alembic_version UNION ALL SELECT 'dalton=' || version_num FROM alembic_version_dalton;")" >&2
+    printf "        - If both versions match manifest.json and no partial DDL broke the old code: only restore release files & image tags and run '%s' (do NOT touch data).\n" "$(fmt_cmd docker compose "${COMPOSE_PRINT_ARGS[@]}" up -d)" >&2
+    printf "        - If either version or schema changed incompatibly: restore release files & image tags, then follow %s.\n\n" "$MANUAL_OVERWRITE_REF" >&2
   else
-    printf "  NOTE: Failure occurred BEFORE database schema versions changed. Do NOT wipe volumes or restore data\n" >&2
+    printf "  NOTE: Failure occurred BEFORE database migrations started. Do NOT wipe volumes or restore data\n" >&2
     printf "        (only restore release files and container image tags so writes made after the backup are kept).\n\n" >&2
   fi
 
@@ -437,19 +488,21 @@ print_rollback_steps() {
     fi
     printf "    %d. Follow %s to reset and restore from the pre-upgrade backup:\n" "$step_no" "$MANUAL_OVERWRITE_REF" >&2
     printf "         a) Verify backup integrity: (cd %s && sha256sum -c SHA256SUMS)\n" "$(printf '%q' "$PRE_UPGRADE_BACKUP")" >&2
-    printf "         b) List and confirm this project's container volumes, then run:\n" >&2
-    printf "            %s\n" "$(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" down -v)" >&2
+    printf "         b) List and confirm ALL volumes belonging to project '%s':\n" "$PROJECT_NAME" >&2
+    printf "            %s\n" "$(fmt_cmd docker volume ls --filter "label=com.docker.compose.project=${PROJECT_NAME}")" >&2
+    printf "            Then remove this project's containers and volumes:\n" >&2
+    printf "            %s\n" "$(fmt_cmd docker compose "${COMPOSE_PRINT_ARGS[@]}" down -v)" >&2
     printf "         c) Restore into the now-empty instance:\n" >&2
     printf "            %s\n" "$(fmt_cmd "${restore_cmd[@]}")" >&2
     step_no=$(( step_no + 1 ))
   elif [[ "$MIGRATION_STATE" == "before" ]]; then
     printf "    %d. Restart services with the restored files and image tags (without touching data):\n" "$step_no" >&2
-    printf "         %s\n" "$(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" up -d)" >&2
+    printf "         %s\n" "$(fmt_cmd docker compose "${COMPOSE_PRINT_ARGS[@]}" up -d)" >&2
     step_no=$(( step_no + 1 ))
   fi
   printf "    %d. Check service status and logs:\n" "$step_no" >&2
-  printf "         %s\n" "$(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" ps)" >&2
-  printf "         %s\n" "$(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" logs --tail=100 backend edge)" >&2
+  printf "         %s\n" "$(fmt_cmd docker compose "${COMPOSE_PRINT_ARGS[@]}" ps)" >&2
+  printf "         %s\n" "$(fmt_cmd docker compose "${COMPOSE_PRINT_ARGS[@]}" logs --tail=100 backend edge)" >&2
   printf "=========================================================================\n" >&2
 }
 
@@ -618,8 +671,7 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
   info "Building updated service images (migrate, backend, crawler, edge)..."
   IMAGES_BUILT=1
   build_sha="${NEW_RELEASE_SHA:-standalone}"
-  BUILD_GIT_SHA="$build_sha" BUILD_GIT_DIRTY="false" \
-    compose_cmd build "${BUILD_ARGS[@]}" migrate backend crawler edge
+  compose_cmd build --build-arg "BUILD_GIT_SHA=${build_sha}" --build-arg "BUILD_GIT_DIRTY=false" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} migrate backend crawler edge
   ok "Updated images built."
 else
   info "Skipping image build (--skip-build)."
@@ -627,10 +679,10 @@ fi
 
 read_alembic_versions() {
   local up da
-  if ! up="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "SELECT version_num FROM alembic_version;" 2>/dev/null)"; then
+  if ! up="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "SELECT version_num FROM alembic_version ORDER BY version_num;" 2>/dev/null)"; then
     return 1
   fi
-  if ! da="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "SELECT version_num FROM alembic_version_dalton;" 2>/dev/null)"; then
+  if ! da="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "SELECT version_num FROM alembic_version_dalton ORDER BY version_num;" 2>/dev/null)"; then
     return 1
   fi
   up="$(printf '%s' "$up" | tr -d '[:space:]')"
@@ -665,16 +717,14 @@ else
   warn "Could not read Alembic schema versions after running migrate."
 fi
 
-# Determine migration state strictly from successfully read pre- and post-migration versions:
-# - If pre-migration or post-migration version could not be read -> "unknown" (do not assume migrated).
-# - If both succeeded and either version changed -> "migrated".
-# - If both succeeded and both versions are identical -> "before".
-if [[ "$PRE_MIGRATE_OK" -ne 1 || "$POST_MIGRATE_OK" -ne 1 ]]; then
-  MIGRATION_STATE="unknown"
-elif [[ "$POST_MIGRATE_UP" != "$PRE_MIGRATE_UP" || "$POST_MIGRATE_DA" != "$PRE_MIGRATE_DA" ]]; then
+# Determine migration state once `migrate` has been invoked:
+# - If both pre/post versions read cleanly and either changed -> "migrated".
+# - Otherwise (unreadable OR unchanged — partial DDL e.g. autocommit_block may
+#   have committed before version_num advanced) -> "unknown" (require manual check).
+if [[ "$PRE_MIGRATE_OK" -eq 1 && "$POST_MIGRATE_OK" -eq 1 && ( "$POST_MIGRATE_UP" != "$PRE_MIGRATE_UP" || "$POST_MIGRATE_DA" != "$PRE_MIGRATE_DA" ) ]]; then
   MIGRATION_STATE="migrated"
 else
-  MIGRATION_STATE="before"
+  MIGRATION_STATE="unknown"
 fi
 
 if [[ "$MIGRATE_RC" -ne 0 ]]; then
@@ -711,13 +761,13 @@ info "Running plain 'docker compose up -d' to converge all services..."
 compose_cmd up -d
 ok "All services converged."
 
-# Post-upgrade health & schema verification (same edge probe criteria as restore.sh)
-DB_USER="$(read_env_var "DB_USER" "postgres")"
-DB_NAME="$(read_env_var "DB_NAME" "postgres")"
-DOMAIN="$(read_env_var "DOMAIN" "localhost")"
-TLS_MODE="$(read_env_var "DALTON_TLS_MODE" "loopback")"
-EDGE_PORT="$(read_env_var "DALTON_EDGE_PORT" "8088")"
-EDGE_HTTPS_PORT="$(read_env_var "DALTON_EDGE_HTTPS_PORT" "18443")"
+# Post-upgrade health & schema verification (strictly from .env, same DB_NAME as migrate)
+DB_USER="$(read_env_file_var "$ENV_FILE" "DB_USER" "postgres")"
+DB_NAME="$(read_env_file_var "$ENV_FILE" "DB_NAME" "postgres")"
+DOMAIN="$(read_env_file_var "$ENV_FILE" "DOMAIN" "localhost")"
+TLS_MODE="$(read_env_file_var "$ENV_FILE" "DALTON_TLS_MODE" "loopback")"
+EDGE_PORT="$(read_env_file_var "$ENV_FILE" "DALTON_EDGE_PORT" "8088")"
+EDGE_HTTPS_PORT="$(read_env_file_var "$ENV_FILE" "DALTON_EDGE_HTTPS_PORT" "18443")"
 
 if ! compose_cmd ps --status running --services | grep -qx "edge"; then
   err "Edge container is not running after upgrade."
@@ -783,8 +833,8 @@ if [[ "$edge_ok" -ne 1 ]]; then
 fi
 ok "Edge gateway probe passed (mode=${TLS_MODE})."
 
-UPSTREAM_VER="$(compose_cmd exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -Atqc "SELECT version_num FROM alembic_version;" | tr -d '\r\n')"
-DALTON_VER="$(compose_cmd exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -Atqc "SELECT version_num FROM alembic_version_dalton;" | tr -d '\r\n')"
+UPSTREAM_VER="$(compose_cmd exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -Atqc "SELECT version_num FROM alembic_version ORDER BY version_num;" | tr -d '\r\n')"
+DALTON_VER="$(compose_cmd exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -Atqc "SELECT version_num FROM alembic_version_dalton ORDER BY version_num;" | tr -d '\r\n')"
 ok "Schema versions at head (upstream=${UPSTREAM_VER}, dalton=${DALTON_VER})."
 
 UPGRADE_SUCCEEDED=1
@@ -798,5 +848,5 @@ printf "  Pre-upgrade tags : backend=%s edge=%s crawler=%s\n" \
 printf "  Schema versions  : upstream=%s, dalton=%s\n" "$UPSTREAM_VER" "$DALTON_VER"
 printf "  Edge TLS mode    : %s\n" "$TLS_MODE"
 printf "\n  Next steps:\n"
-printf "  - Verify running containers: %s\n" "$(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" ps)"
+printf "  - Verify running containers: %s\n" "$(fmt_cmd docker compose "${COMPOSE_PRINT_ARGS[@]}" ps)"
 printf "  - Keep %s and %s until you confirm normal operation.\n" "$PRE_UPGRADE_BACKUP" "$SNAPSHOT_DIR"

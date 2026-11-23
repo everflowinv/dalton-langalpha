@@ -10,6 +10,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -2096,27 +2097,41 @@ class TestSandboxNetworkAndInitScript:
         assert is_restore_fn(fake_s3, "chat-uploads-r20261123170000") is True
         assert is_restore_fn(fake_s3, "legacy-marker-bucket") is True
 
-        # upgrade.sh rollback hint relies strictly on comparing successfully read pre/post Alembic versions:
-        #   - unchanged versions -> restore files & images only (do NOT wipe volumes)
-        #   - changed versions   -> point to manual §6.2 steps (`down -v` + `restore.sh`, no `--replace-data`)
-        #   - unreadable pre-migration version -> UNCERTAIN (prompt manual version check first)
-        for scenario, psql_behavior, migrate_body, expected_mode in (
+        # upgrade.sh rollback hint:
+        #   - failure strictly before migrate runs -> restore files & images only (do NOT wipe volumes)
+        #   - changed versions                     -> point to manual §6.2 steps (`docker volume ls --filter ...` + `docker compose -p ... down -v`)
+        #   - unchanged OR unreadable versions after migrate started -> UNCERTAIN (prompt manual check first)
+        for scenario, psql_behavior, migrate_body, build_body, extra_upg_flags, expected_mode in (
+            (
+                "fail-before-migrate",
+                'echo "rev1"; exit 0',
+                "exit 0",
+                'echo "build failed" >&2; exit 1',
+                [],
+                "before",
+            ),
             (
                 "fail-versions-unchanged",
                 'echo "rev1"; exit 0',
                 'echo "[migrate] Waiting for PostgreSQL..."; echo "connection refused" >&2; exit 1',
-                "before",
+                "exit 0",
+                ["--skip-build"],
+                "unknown",
             ),
             (
                 "fail-versions-changed",
                 'state_f="${UPG_STATE_FILE}"; if [[ -f "$state_f" ]]; then echo "rev2"; else echo "rev1"; fi; exit 0',
                 'touch "${UPG_STATE_FILE}"; echo "[migrate] partial upgrade failed" >&2; exit 1',
+                "exit 0",
+                ["--skip-build"],
                 "migrated",
             ),
             (
                 "fail-pre-version-unreadable",
                 'state_f="${UPG_STATE_FILE}"; if [[ -f "$state_f" ]]; then echo "rev1"; exit 0; else exit 1; fi',
                 'touch "${UPG_STATE_FILE}"; echo "migrate failed" >&2; exit 1',
+                "exit 0",
+                ["--skip-build"],
                 "unknown",
             ),
         ):
@@ -2143,7 +2158,10 @@ class TestSandboxNetworkAndInitScript:
                     "deploy/standalone/Caddyfile",
                 ):
                     (target_dir / req).write_text("stub\n", encoding="utf-8")
-            (uwork / ".env").write_text("DB_HOST=postgres\nDB_USER=postgres\nDB_NAME=postgres\n", encoding="utf-8")
+            (uwork / ".env").write_text(
+                "COMPOSE_PROJECT_NAME=upg-proj-from-file\nDB_HOST=postgres\nDB_USER=postgres\nDB_NAME=file_db\n",
+                encoding="utf-8",
+            )
             fake_bak_dir = ubak / "dalton-backup-20260101-000000Z-abc123"
             fake_bak_dir.mkdir()
             backup_stub_script = (
@@ -2152,13 +2170,15 @@ class TestSandboxNetworkAndInitScript:
             )
             (uwork / "scripts/standalone/backup.sh").write_text(backup_stub_script, encoding="utf-8")
             (urel / "scripts/standalone/backup.sh").write_text(backup_stub_script, encoding="utf-8")
+            seen_migrate_env = sc_root / "seen_migrate.txt"
             docker_stub = fake_bin / "docker"
             docker_stub.write_text(
                 "#!/usr/bin/env bash\n"
                 'if [[ "$*" == *" images -q "* ]]; then echo "img123"; exit 0; fi\n'
                 'if [[ "$1" == "tag" ]]; then exit 0; fi\n'
+                f'if [[ "$*" == *" build "* ]]; then {build_body}; fi\n'
                 f'if [[ "$*" == *" psql "* ]]; then {psql_behavior}; fi\n'
-                f'if [[ "$*" == *" run --rm migrate"* ]]; then {migrate_body}; fi\n'
+                f'if [[ "$*" == *" run --rm migrate"* ]]; then printf "DB_NAME=%s\\nARGS=%s\\n" "${{DB_NAME:-UNSET}}" "$*" > "{seen_migrate_env}"; {migrate_body}; fi\n'
                 "exit 0\n",
                 encoding="utf-8",
             )
@@ -2166,6 +2186,8 @@ class TestSandboxNetworkAndInitScript:
             stub_env = os.environ.copy()
             stub_env["PATH"] = f"{fake_bin}:{stub_env.get('PATH', '')}"
             stub_env["UPG_STATE_FILE"] = str(sc_root / "migrated.flag")
+            stub_env["COMPOSE_PROJECT_NAME"] = "shell-poison-proj"
+            stub_env["DB_NAME"] = "shell_poison_db"
             res_sc = subprocess.run(
                 [
                     "bash",
@@ -2176,7 +2198,7 @@ class TestSandboxNetworkAndInitScript:
                     str(urel),
                     "--backup-dir",
                     str(ubak),
-                    "--skip-build",
+                    *extra_upg_flags,
                 ],
                 env=stub_env,
                 capture_output=True,
@@ -2187,9 +2209,20 @@ class TestSandboxNetworkAndInitScript:
             assert "--replace-data" not in res_sc.stderr, (
                 f"{scenario}: upgrade.sh must never reference removed --replace-data:\n{res_sc.stderr}"
             )
+            assert "-p upg-proj-from-file" in res_sc.stderr and "--env-file" in res_sc.stderr, (
+                f"{scenario}: upgrade.sh rollback commands must specify -p <project> and --env-file from .env:\n{res_sc.stderr}"
+            )
+            assert "shell-poison-proj" not in res_sc.stderr
+            if seen_migrate_env.is_file():
+                m_seen = seen_migrate_env.read_text(encoding="utf-8")
+                assert "DB_NAME=UNSET\n" in m_seen, f"{scenario}: shell DB_NAME was not unset before migrate: {m_seen!r}"
+                assert "-p upg-proj-from-file" in m_seen and "--env-file" in m_seen
             if expected_mode == "migrated":
                 assert "STANDALONE-DEPLOY.md" in res_sc.stderr and "down -v" in res_sc.stderr, (
                     f"{scenario}: expected manual §6.2 reset-and-restore guide, got:\n{res_sc.stderr}"
+                )
+                assert "docker volume ls --filter label=com.docker.compose.project=upg-proj-from-file" in res_sc.stderr, (
+                    f"{scenario}: expected full volume list command before down -v, got:\n{res_sc.stderr}"
                 )
             elif expected_mode == "unknown":
                 assert "UNCERTAIN" in res_sc.stderr and "Do NOT assume migrations already ran" in res_sc.stderr, (
@@ -2199,3 +2232,456 @@ class TestSandboxNetworkAndInitScript:
                 assert "Do NOT wipe volumes or restore data" in res_sc.stderr, (
                     f"{scenario}: pre-migration failure must not suggest wiping data, got:\n{res_sc.stderr}"
                 )
+
+    def test_b6_r6_restore_guards_storage_config_and_flock_stderr(self, tmp_path: Path) -> None:
+        """Offline verification for Batch 6 R6 fixes (1-7): whole-instance PG empty check,
+        bucket/key-prefix check, effective app storage rules & --skip-minio, explicit -p compose,
+        flock stderr preservation, mid-restore failure hint, and .env.tmp-* decrypt prefix."""
+        import tarfile as _tarfile
+
+        def _make_minio_backup(
+            name: str,
+            *,
+            primary_bucket: str = "chat-uploads",
+            primary_key_prefix: str = "",
+            targets: dict[str, dict[str, str]] | None = None,
+            env_content: str | None = None,
+            pass_file: Path | None = None,
+        ) -> Path:
+            bdir = tmp_path / name
+            bdir.mkdir(parents=True, exist_ok=True)
+            (bdir / "postgres.dump").write_bytes(b"PGDMP")
+            manifest_targets = targets if targets is not None else {
+                "chat_upload": {"bucket": primary_bucket, "key_prefix": primary_key_prefix}
+            }
+            mm = {
+                "buckets": [primary_bucket] if primary_bucket else [],
+                "primary_bucket": primary_bucket,
+                "primary_key_prefix": primary_key_prefix,
+                "targets": manifest_targets,
+                "var_buckets": {"DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME": primary_bucket} if primary_bucket else {},
+                "bucket_count": 1 if primary_bucket else 0,
+                "object_count": 0,
+                "total_bytes": 0,
+                "objects": [],
+            }
+            raw_mm = json.dumps(mm).encode("utf-8")
+            with _tarfile.open(bdir / "minio-objects.tar.gz", "w:gz") as tf:
+                import io as _io
+
+                ti = _tarfile.TarInfo(name="_minio_manifest.json")
+                ti.size = len(raw_mm)
+                tf.addfile(ti, _io.BytesIO(raw_mm))
+            top_manifest: dict[str, Any] = {
+                "schema_version": 2,
+                "minio": {
+                    "file": "minio-objects.tar.gz",
+                    "primary_bucket": primary_bucket,
+                    "primary_key_prefix": primary_key_prefix,
+                    "targets": manifest_targets,
+                    "bucket_count": mm["bucket_count"],
+                    "object_count": 0,
+                    "total_bytes": 0,
+                },
+                "env_backup": "excluded",
+                "env_encryption": None,
+            }
+            if env_content is not None and pass_file is not None:
+                plain = tmp_path / f"{name}.plain.env"
+                plain.write_text(env_content, encoding="utf-8")
+                subprocess.run(
+                    [
+                        "openssl",
+                        "enc",
+                        "-aes-256-cbc",
+                        "-pbkdf2",
+                        "-md",
+                        "sha256",
+                        "-iter",
+                        "10000",
+                        "-salt",
+                        "-in",
+                        str(plain),
+                        "-out",
+                        str(bdir / "env.enc"),
+                        "-pass",
+                        f"file:{pass_file}",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    timeout=15,
+                )
+                top_manifest["env_backup"] = "encrypted"
+                top_manifest["env_encryption"] = {
+                    "cipher": "aes-256-cbc",
+                    "kdf": "pbkdf2",
+                    "digest": "sha256",
+                    "iterations": 10000,
+                }
+            (bdir / "manifest.json").write_text(json.dumps(top_manifest), encoding="utf-8")
+            return bdir
+
+        def _make_work(name: str, env_text: str, *, include_agent_yaml: bool = True) -> Path:
+            w = tmp_path / name
+            w.mkdir(parents=True, exist_ok=True)
+            (w / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+            (w / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+            if include_agent_yaml:
+                (w / "agent_config.yaml").write_text('storage:\n  provider: "s3"\n', encoding="utf-8")
+            (w / ".env").write_text(env_text, encoding="utf-8")
+            return w
+
+        # 1. Req 3: YAML default storage.provider="s3" when STORAGE_PROVIDER is unset:
+        #    chat-uploads on MinIO + S3_BUCKET_NAME on default AWS S3 MUST be rejected
+        #    by BOTH backup.sh and restore.sh.
+        w_aws_split = _make_work(
+            "work-aws-split",
+            f"COMPOSE_PROJECT_NAME=r6-aws-split-{os.getpid()}\n"
+            "DB_HOST=postgres\n"
+            "MINIO_ROOT_USER=dalton\n"
+            "MINIO_ROOT_PASSWORD=secretpass\n"
+            "S3_BUCKET_NAME=my-aws-bucket\n",
+        )
+        bak_default = _make_minio_backup("bak-default")
+        res_bak_split = subprocess.run(
+            ["bash", str(REPO_ROOT / "scripts/standalone/backup.sh"), "--work-dir", str(w_aws_split)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_bak_split.returncode != 0
+        assert "Multiple object storage services" in res_bak_split.stderr
+
+        lock_split = Path(f"/tmp/dalton-r6-aws-split-{os.getpid()}.restore.lock")
+        try:
+            res_res_split = subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir",
+                    str(w_aws_split),
+                    "--backup-dir",
+                    str(bak_default),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_res_split.returncode != 0
+            assert "Multiple object storage services" in res_res_split.stderr
+        finally:
+            if lock_split.is_dir():
+                lock_split.rmdir()
+            elif lock_split.exists():
+                lock_split.unlink()
+
+        # 2. Req 3: --skip-minio refused when object storage is configured, allowed ONLY when none is configured.
+        w_has_minio = _make_work(
+            "work-has-minio",
+            f"COMPOSE_PROJECT_NAME=r6-skip-refuse-{os.getpid()}\n"
+            "DB_HOST=postgres\n"
+            "MINIO_ROOT_USER=dalton\n"
+            "MINIO_ROOT_PASSWORD=secretpass\n",
+        )
+        lock_skip = Path(f"/tmp/dalton-r6-skip-refuse-{os.getpid()}.restore.lock")
+        try:
+            res_skip_refuse = subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir",
+                    str(w_has_minio),
+                    "--backup-dir",
+                    str(bak_default),
+                    "--skip-minio",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_skip_refuse.returncode != 0
+            assert "--skip-minio" in res_skip_refuse.stderr
+        finally:
+            if lock_skip.is_dir():
+                lock_skip.rmdir()
+            elif lock_skip.exists():
+                lock_skip.unlink()
+
+        w_no_storage = _make_work(
+            "work-no-storage",
+            f"COMPOSE_PROJECT_NAME=r6-skip-ok-{os.getpid()}\n"
+            "DB_HOST=postgres\n"
+            "DB_USER=postgres\n"
+            "DB_PASSWORD=postgres\n",
+        )
+        res_skip_ok = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts/standalone/storage_config.py"),
+                "check-env",
+                "--env-file",
+                str(w_no_storage / ".env"),
+                "--work-dir",
+                str(w_no_storage),
+                "--require-none-for-skip-minio",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_skip_ok.returncode == 0, f"--skip-minio should be allowed when no storage is configured: {res_skip_ok.stderr}"
+
+        # 3. Req 2: Bucket name mismatch AND key prefix mismatch refused BEFORE touching Docker or .env
+        for mismatch_case, env_extra in (
+            ("bucket", "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME=different-bucket\n"),
+            ("prefix", "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME=chat-uploads\nDALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX=wrong-prefix\n"),
+        ):
+            proj_m = f"r6-mismatch-{mismatch_case}-{os.getpid()}"
+            wm = _make_work(
+                f"work-mismatch-{mismatch_case}",
+                f"COMPOSE_PROJECT_NAME={proj_m}\n"
+                "DB_HOST=postgres\n"
+                "MINIO_ROOT_USER=dalton\n"
+                "MINIO_ROOT_PASSWORD=secretpass\n"
+                + env_extra,
+            )
+            lock_m = Path(f"/tmp/dalton-{proj_m}.restore.lock")
+            try:
+                res_m = subprocess.run(
+                    [
+                        "bash",
+                        str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                        "--work-dir",
+                        str(wm),
+                        "--backup-dir",
+                        str(bak_default),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                assert res_m.returncode != 0
+                assert "--replace-env" in res_m.stderr
+                assert "先改 .env 让两者一致" in res_m.stderr
+            finally:
+                if lock_m.is_dir():
+                    lock_m.rmdir()
+                elif lock_m.exists():
+                    lock_m.unlink()
+
+        # 4. Req 1 + Req 5: With `flock` on PATH, non-empty other DB in pg_database refuses restore
+        #    and stderr MUST preserve BOTH the refusal reason AND STANDALONE-DEPLOY.md (`down -v`).
+        fake_bin = tmp_path / "r6-fake-bin"
+        fake_bin.mkdir()
+        fake_flock = fake_bin / "flock"
+        fake_flock.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        fake_flock.chmod(0o755)
+
+        fake_docker_seen = tmp_path / "r6-docker-args.log"
+        fake_docker = fake_bin / "docker"
+        fake_docker.write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "%s\\n" "$*" >> "{fake_docker_seen}"\n'
+            'if [[ "$*" == *" ps --status running --services"* ]]; then echo "postgres"; exit 0; fi\n'
+            'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
+            'if [[ "$*" == *"FROM pg_database"* ]]; then printf "other_app_db\\npostgres\\n"; exit 0; fi\n'
+            'if [[ "$*" == *" -d other_app_db "* ]]; then printf "1\\t0\\t0\\n"; exit 0; fi\n'
+            'if [[ "$*" == *" -d postgres "* ]]; then printf "0\\t0\\t0\\n"; exit 0; fi\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_docker.chmod(0o755)
+
+        proj_flock = f"r6-flock-nonempty-{os.getpid()}"
+        w_flock = _make_work(
+            "work-flock-nonempty",
+            f"COMPOSE_PROJECT_NAME={proj_flock}\n"
+            "DB_HOST=postgres\n"
+            "DB_USER=postgres\n"
+            "DB_PASSWORD=secretpg\n"
+            "DB_NAME=postgres\n"
+            "MINIO_ROOT_USER=dalton\n"
+            "MINIO_ROOT_PASSWORD=secretpass\n",
+        )
+        flock_env = os.environ.copy()
+        flock_env["PATH"] = f"{fake_bin}:{flock_env.get('PATH', '')}"
+        flock_env["COMPOSE_PROJECT_NAME"] = "shell-poison-must-not-appear"
+        lock_flock = Path(f"/tmp/dalton-{proj_flock}.restore.lock")
+        try:
+            res_flock = subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir",
+                    str(w_flock),
+                    "--backup-dir",
+                    str(bak_default),
+                ],
+                env=flock_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_flock.returncode != 0
+            assert "other_app_db" in res_flock.stderr, f"stderr swallowed or missing DB name: {res_flock.stderr!r}"
+            assert "STANDALONE-DEPLOY.md" in res_flock.stderr, f"stderr missing manual path: {res_flock.stderr!r}"
+            assert "down -v" in res_flock.stderr, f"stderr missing down -v: {res_flock.stderr!r}"
+            assert f"label=com.docker.compose.project={proj_flock}" in res_flock.stderr
+            docker_calls = fake_docker_seen.read_text(encoding="utf-8")
+            assert f"compose -p {proj_flock} " in docker_calls
+            assert "shell-poison-must-not-appear" not in docker_calls
+            assert "pg_proc" in docker_calls and "pg_type" in docker_calls
+        finally:
+            if lock_flock.is_dir():
+                lock_flock.rmdir()
+            elif lock_flock.exists():
+                lock_flock.unlink()
+
+        # 5. Req 6 + Req 7.1: Mid-restore failure after writing .env prints half-restored hint,
+        #    and decrypt temp file uses .env.tmp-* prefix without self-deletion.
+        pass_f = tmp_path / "r6.pass"
+        pass_f.write_text("r6-test-passphrase-123456\n", encoding="utf-8")
+        pass_f.chmod(0o600)
+        proj_mid = f"r6-mid-fail-{os.getpid()}"
+        env_mid_text = (
+            f"COMPOSE_PROJECT_NAME={proj_mid}\n"
+            "DB_HOST=postgres\n"
+            "DB_USER=postgres\n"
+            "DB_PASSWORD=secretpg\n"
+            "DB_NAME=postgres\n"
+        )
+        bak_mid = _make_minio_backup(
+            "bak-mid-fail",
+            primary_bucket="",
+            targets={},
+            env_content=env_mid_text,
+            pass_file=pass_f,
+        )
+        w_mid = tmp_path / "work-mid-fail"
+        w_mid.mkdir()
+        (w_mid / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_mid / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_mid / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
+        stale_dec = w_mid / ".env.tmp-decrypt-stale1"
+        stale_dec.write_text("STALE=1\n", encoding="utf-8")
+
+        fake_bin_mid = tmp_path / "r6-fake-bin-mid"
+        fake_bin_mid.mkdir()
+        (fake_bin_mid / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (fake_bin_mid / "flock").chmod(0o755)
+        fake_docker_mid = fake_bin_mid / "docker"
+        fake_docker_mid.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [[ "$*" == *" ps --status running --services"* ]]; then echo "postgres"; exit 0; fi\n'
+            'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
+            'if [[ "$*" == *"FROM pg_database"* ]]; then echo "postgres"; exit 0; fi\n'
+            'if [[ "$*" == *" -d postgres "* && "$*" == *"pg_class"* ]]; then printf "0\\t0\\t0\\n"; exit 0; fi\n'
+            'if [[ "$*" == *" pg_restore "* ]]; then echo "simulated pg_restore failure" >&2; exit 1; fi\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_docker_mid.chmod(0o755)
+        mid_env = os.environ.copy()
+        mid_env["PATH"] = f"{fake_bin_mid}:{mid_env.get('PATH', '')}"
+        lock_mid = Path(f"/tmp/dalton-{proj_mid}.restore.lock")
+        try:
+            res_mid = subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir",
+                    str(w_mid),
+                    "--backup-dir",
+                    str(bak_mid),
+                    "--env-passphrase-file",
+                    str(pass_f),
+                    "--skip-minio",
+                    "--skip-caddy",
+                    "--skip-edge-build",
+                ],
+                env=mid_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_mid.returncode != 0
+            assert not stale_dec.exists(), "Stale .env.tmp-decrypt-* must be cleaned up on next run"
+            assert (w_mid / ".env").is_file(), ".env should have been written before pg_restore failed"
+            assert not list(w_mid.glob(".env.tmp-*")), "No leftover .env.tmp-* files after clean exit"
+            assert "半成品" in res_mid.stderr and "down -v" in res_mid.stderr and "STANDALONE-DEPLOY.md" in res_mid.stderr, (
+                f"Mid-restore failure should print half-restored recovery hint, got:\n{res_mid.stderr}"
+            )
+            assert "NOT modified" in res_mid.stderr
+        finally:
+            if lock_mid.is_dir():
+                lock_mid.rmdir()
+            elif lock_mid.exists():
+                lock_mid.unlink()
+
+        # 6. Req 1: PostgreSQL superuser credential connection failure refuses restore and explains why.
+        fake_bin_pgfail = tmp_path / "r6-fake-bin-pgfail"
+        fake_bin_pgfail.mkdir()
+        (fake_bin_pgfail / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (fake_bin_pgfail / "flock").chmod(0o755)
+        fake_docker_pgfail = fake_bin_pgfail / "docker"
+        fake_docker_pgfail.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [[ "$*" == *" ps --status running --services"* ]]; then echo "postgres"; exit 0; fi\n'
+            'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "psql: error: FATAL: password authentication failed for user postgres" >&2; exit 2; fi\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_docker_pgfail.chmod(0o755)
+        proj_pgfail = f"r6-pgfail-{os.getpid()}"
+        w_pgfail = _make_work(
+            "work-pgfail",
+            f"COMPOSE_PROJECT_NAME={proj_pgfail}\n"
+            "DB_HOST=postgres\n"
+            "DB_USER=postgres\n"
+            "DB_PASSWORD=wrongpass\n"
+            "DB_NAME=postgres\n"
+            "MINIO_ROOT_USER=dalton\n"
+            "MINIO_ROOT_PASSWORD=secretpass\n",
+        )
+        pgfail_env = os.environ.copy()
+        pgfail_env["PATH"] = f"{fake_bin_pgfail}:{pgfail_env.get('PATH', '')}"
+        lock_pgfail = Path(f"/tmp/dalton-{proj_pgfail}.restore.lock")
+        try:
+            res_pgfail = subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir",
+                    str(w_pgfail),
+                    "--backup-dir",
+                    str(bak_default),
+                ],
+                env=pgfail_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_pgfail.returncode != 0
+            assert "Failed to connect to target PostgreSQL instance" in res_pgfail.stderr
+            assert "password authentication failed" in res_pgfail.stderr
+            assert "wrongpass" not in res_pgfail.stderr, "DB_PASSWORD must never be leaked to stderr"
+        finally:
+            if lock_pgfail.is_dir():
+                lock_pgfail.rmdir()
+            elif lock_pgfail.exists():
+                lock_pgfail.unlink()
+
+        # Verify restore.sh has zero `exec 9... 2>/dev/null` and MISSING_CHECK_PY exits 1 on missing objects
+        restore_src = (REPO_ROOT / "scripts/standalone/restore.sh").read_text(encoding="utf-8")
+        assert not any(
+            "2>/dev/null" in ln for ln in restore_src.splitlines() if "exec 9" in ln
+        ), "restore.sh must never use `exec 9... 2>/dev/null`"
+        assert "dalton-restore-env." not in restore_src
+        assert ".env.tmp-decrypt-" in restore_src
+        assert "sys.exit(1)" in restore_src.split("MISSING_CHECK_PY='", 1)[1].split("'\n", 1)[0]

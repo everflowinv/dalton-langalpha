@@ -198,15 +198,6 @@ PY
   fi
 }
 
-read_env_var() {
-  local key="$1" default_val="${2:-}"
-  if [[ -n "${!key:-}" ]]; then
-    printf '%s' "${!key}"
-    return 0
-  fi
-  read_env_file_var "$ENV_FILE" "$key" "$default_val"
-}
-
 sanitize_project_name() {
   local raw="$1"
   local cleaned
@@ -214,102 +205,31 @@ sanitize_project_name() {
   printf '%s' "${cleaned:-dalton-core}"
 }
 
-# External PostgreSQL guard: this script only operates on Compose-managed `postgres`.
-DB_HOST="$(read_env_var "DB_HOST" "postgres")"
+# External PostgreSQL guard: strictly read from .env (never shell environment).
+DB_HOST="$(read_env_file_var "$ENV_FILE" "DB_HOST" "postgres")"
 if [[ "$DB_HOST" != "postgres" ]]; then
   err "External PostgreSQL detected (DB_HOST='${DB_HOST}'; expected Compose-managed 'postgres')."
   err "backup.sh only backs up the Compose-managed PostgreSQL container. For external databases, run pg_dump directly against your database host."
   exit 1
 fi
 
-# Single object storage guard (v1): fail fast if configured buckets point to
-# multiple distinct object storage services/endpoints.
-if ! python3 - "$ENV_FILE" <<'PY'
-import re, sys
-
-env_path = sys.argv[1]
-line_re = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*([=:])(.*)$")
-env_map: dict[str, str] = {}
-with open(env_path, encoding="utf-8") as fh:
-    for raw in fh:
-        stripped = raw.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        m = line_re.match(raw.rstrip("\r\n"))
-        if not m:
-            continue
-        val = m.group(3).strip()
-        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
-            val = val[1:-1]
-        elif val and val[0] not in ("'", '"'):
-            val = re.split(r"\s+#", val, maxsplit=1)[0].strip()
-        env_map[m.group(1)] = val
-
-def _get(*keys: str, default: str = "") -> str:
-    for k in keys:
-        v = (env_map.get(k) or "").strip()
-        if v:
-            return v
-    return default
-
-def _norm_ep(url: str) -> str:
-    return (url or "").strip().rstrip("/").lower()
-
-primary_ep = _norm_ep(_get("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL", "STORAGE_ENDPOINT_URL", default="http://minio:9000"))
-conflicts: list[str] = []
-
-asr_ep = _norm_ep(_get("DALTON_ASR_STORAGE_ENDPOINT_URL"))
-if asr_ep and asr_ep != primary_ep:
-    conflicts.append(f"DALTON_ASR_STORAGE_ENDPOINT_URL={asr_ep!r} != primary {primary_ep!r}")
-
-storage_provider = _get("STORAGE_PROVIDER", default="none").lower()
-storage_ep = _norm_ep(_get("STORAGE_ENDPOINT_URL"))
-s3_ep = _norm_ep(_get("S3_ENDPOINT_URL"))
-s3_bucket = _get("STORAGE_BUCKET_NAME", "S3_BUCKET_NAME")
-if storage_ep and storage_ep != primary_ep:
-    conflicts.append(f"STORAGE_ENDPOINT_URL={storage_ep!r} != primary {primary_ep!r}")
-if s3_ep and s3_ep != primary_ep:
-    conflicts.append(f"S3_ENDPOINT_URL={s3_ep!r} != primary {primary_ep!r}")
-if s3_bucket and not storage_ep and not s3_ep and storage_provider != "none":
-    conflicts.append(f"STORAGE/S3 bucket {s3_bucket!r} uses default AWS S3 endpoint != primary {primary_ep!r}")
-
-oss_ep = _norm_ep(_get("OSS_ENDPOINT"))
-oss_bucket = _get("OSS_BUCKET_NAME")
-if storage_provider == "oss" or oss_ep or oss_bucket:
-    if not oss_ep or oss_ep != primary_ep:
-        conflicts.append(f"OSS storage ({oss_ep or 'default OSS endpoint'}) != primary {primary_ep!r}")
-
-r2_ep = _norm_ep(_get("R2_ENDPOINT_URL"))
-r2_bucket = _get("R2_BUCKET_NAME")
-r2_acct = _get("R2_ACCOUNT_ID")
-if r2_ep and r2_ep != primary_ep:
-    conflicts.append(f"R2_ENDPOINT_URL={r2_ep!r} != primary {primary_ep!r}")
-elif (r2_bucket or r2_acct) and not r2_ep:
-    conflicts.append(f"R2 storage ({r2_bucket or r2_acct}) != primary {primary_ep!r}")
-
-if conflicts:
-    print(
-        "[backup] ERROR: Multiple object storage services detected: " + "; ".join(conflicts),
-        file=sys.stderr,
-    )
-    print(
-        "[backup] ERROR: v1 only supports a single object storage service; configure all application buckets on the same storage service.",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-PY
-then
+# Single object storage guard (v1): resolve effective chat_upload, ASR, and general
+# storage using the application's actual config rules (including agent_config.yaml).
+if ! python3 "${SCRIPT_DIR}/storage_config.py" check-env \
+    --env-file "$ENV_FILE" \
+    --work-dir "$WORK_DIR" \
+    --caller backup; then
   exit 1
 fi
 
-DB_USER="$(read_env_var "DB_USER" "postgres")"
-DB_NAME="$(read_env_var "DB_NAME" "postgres")"
-PROJECT_NAME="$(read_env_var "COMPOSE_PROJECT_NAME" "")"
+DB_USER="$(read_env_file_var "$ENV_FILE" "DB_USER" "postgres")"
+DB_NAME="$(read_env_file_var "$ENV_FILE" "DB_NAME" "postgres")"
+PROJECT_NAME="$(read_env_file_var "$ENV_FILE" "COMPOSE_PROJECT_NAME" "")"
 if [[ -z "$PROJECT_NAME" ]]; then
   PROJECT_NAME="$(sanitize_project_name "$(basename "$WORK_DIR")")"
 fi
-DOMAIN="$(read_env_var "DOMAIN" "localhost")"
-TLS_MODE="$(read_env_var "DALTON_TLS_MODE" "loopback")"
+DOMAIN="$(read_env_file_var "$ENV_FILE" "DOMAIN" "localhost")"
+TLS_MODE="$(read_env_file_var "$ENV_FILE" "DALTON_TLS_MODE" "loopback")"
 
 if [[ -z "$OUTPUT_DIR" ]]; then
   OUTPUT_DIR="${WORK_DIR}/backups"
@@ -321,7 +241,7 @@ fi
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 
 if [[ -z "$COMPOSE_FILES_RAW" ]]; then
-  env_compose_file="$(read_env_var "COMPOSE_FILE" "")"
+  env_compose_file="$(read_env_file_var "$ENV_FILE" "COMPOSE_FILE" "")"
   if [[ -n "$env_compose_file" ]]; then
     COMPOSE_FILES_RAW="$env_compose_file"
   elif [[ "$TLS_MODE" != "loopback" && "$DOMAIN" == *:* && -f "${WORK_DIR}/deploy/standalone/docker-compose.tls.ipv6.yml" ]]; then
@@ -334,7 +254,8 @@ if [[ -z "$COMPOSE_FILES_RAW" ]]; then
 fi
 
 IFS=':' read -r -a COMPOSE_FILES_ARR <<< "$COMPOSE_FILES_RAW"
-COMPOSE_ARGS=(--project-directory "$WORK_DIR")
+COMPOSE_FILE_ARGS=()
+RESOLVED_COMPOSE_FILES=()
 for cf in "${COMPOSE_FILES_ARR[@]}"; do
   [[ -z "$cf" ]] && continue
   if [[ "$cf" != /* ]]; then
@@ -344,11 +265,60 @@ for cf in "${COMPOSE_FILES_ARR[@]}"; do
     err "Compose file not found: ${cf}"
     exit 1
   fi
-  COMPOSE_ARGS+=(-f "$cf")
+  COMPOSE_FILE_ARGS+=(-f "$cf")
+  RESOLVED_COMPOSE_FILES+=("$cf")
 done
 
+# Unset .env keys, compose-interpolated keys, and COMPOSE_* variables so shell
+# exports never shadow .env or shift project/DB selection.
+ENV_UNSET_ARGS=()
+while IFS= read -r env_key; do
+  [[ -n "$env_key" ]] && ENV_UNSET_ARGS+=(-u "$env_key")
+done < <(python3 - "$ENV_FILE" "${RESOLVED_COMPOSE_FILES[@]}" <<'PY'
+import re, sys
+
+env_path = sys.argv[1]
+compose_files = sys.argv[2:]
+line_re = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*[=:]")
+interp_re = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)")
+seen: set[str] = set()
+for key in (
+    "COMPOSE_PROJECT_NAME",
+    "COMPOSE_FILE",
+    "COMPOSE_PROFILES",
+    "DB_HOST",
+    "DB_PORT",
+    "DB_USER",
+    "DB_PASSWORD",
+    "DB_NAME",
+):
+    seen.add(key)
+    print(key)
+with open(env_path, encoding="utf-8") as fh:
+    for raw in fh:
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        m = line_re.match(raw)
+        if not m:
+            continue
+        key = m.group(1)
+        if key != "PATH" and key not in seen:
+            seen.add(key)
+            print(key)
+for cf in compose_files:
+    with open(cf, encoding="utf-8") as fh:
+        text = fh.read()
+    for m in interp_re.finditer(text):
+        key = m.group(1)
+        if key != "PATH" and key not in seen:
+            seen.add(key)
+            print(key)
+PY
+)
+
 compose_cmd() {
-  docker compose "${COMPOSE_ARGS[@]}" "$@"
+  env "${ENV_UNSET_ARGS[@]}" docker compose -p "$PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" --project-directory "$WORK_DIR" "$@"
 }
 
 sha256_file() {
@@ -581,43 +551,130 @@ def _norm_ep(url: str) -> str:
     return (url or "").strip().rstrip("/").lower()
 
 
-def validate_single_object_storage(primary_endpoint: str) -> None:
-    """Reject configurations whose application buckets span multiple object storage services (v1)."""
-    primary_ep = _norm_ep(primary_endpoint)
-    conflicts: list[str] = []
+def _norm_prefix(raw: str) -> str:
+    return (raw or "").strip().strip("/")
 
-    asr_ep = _norm_ep(_env("DALTON_ASR_STORAGE_ENDPOINT_URL"))
-    if asr_ep and asr_ep != primary_ep:
-        conflicts.append(f"DALTON_ASR_STORAGE_ENDPOINT_URL={asr_ep!r} != primary {primary_ep!r}")
 
-    storage_provider = _env("STORAGE_PROVIDER", default="none").lower()
-    storage_ep = _norm_ep(_env("STORAGE_ENDPOINT_URL"))
-    s3_ep = _norm_ep(_env("S3_ENDPOINT_URL"))
-    s3_bucket = _env("STORAGE_BUCKET_NAME", "S3_BUCKET_NAME")
-    if storage_ep and storage_ep != primary_ep:
-        conflicts.append(f"STORAGE_ENDPOINT_URL={storage_ep!r} != primary {primary_ep!r}")
-    if s3_ep and s3_ep != primary_ep:
-        conflicts.append(f"S3_ENDPOINT_URL={s3_ep!r} != primary {primary_ep!r}")
-    if s3_bucket and not storage_ep and not s3_ep and storage_provider != "none":
-        conflicts.append(f"STORAGE/S3 bucket {s3_bucket!r} uses default AWS S3 endpoint != primary {primary_ep!r}")
+def _read_yaml_storage_provider() -> tuple[str | None, bool]:
+    """Read `storage.provider` from agent_config.yaml (+ overlay), matching `src/utils/storage/__init__.py`."""
+    from pathlib import Path
 
-    oss_ep = _norm_ep(_env("OSS_ENDPOINT"))
-    oss_bucket = _env("OSS_BUCKET_NAME")
-    if storage_provider == "oss" or oss_ep or oss_bucket:
-        if not oss_ep or oss_ep != primary_ep:
-            conflicts.append(f"OSS storage ({oss_ep or 'default OSS endpoint'}) != primary {primary_ep!r}")
+    try:
+        import yaml  # type: ignore[import-not-found]
+    except Exception:
+        yaml = None
 
-    r2_ep = _norm_ep(_env("R2_ENDPOINT_URL"))
-    r2_bucket = _env("R2_BUCKET_NAME")
-    r2_acct = _env("R2_ACCOUNT_ID")
-    if r2_ep and r2_ep != primary_ep:
-        conflicts.append(f"R2_ENDPOINT_URL={r2_ep!r} != primary {primary_ep!r}")
-    elif (r2_bucket or r2_acct) and not r2_ep:
-        conflicts.append(f"R2 storage ({r2_bucket or r2_acct}) != primary {primary_ep!r}")
+    def _from_file(path: Path) -> str | None:
+        if not path.is_file():
+            return None
+        if yaml is not None:
+            try:
+                data = yaml.safe_load(path.read_text(encoding="utf-8"))
+            except Exception:
+                data = None
+            if isinstance(data, dict):
+                st = data.get("storage")
+                if isinstance(st, dict):
+                    val = st.get("provider")
+                    if val is not None and str(val).strip() != "":
+                        return str(val).strip().lower()
+        return None
 
-    if conflicts:
+    base = None
+    ptc_cfg = (os.getenv("PTC_CONFIG_FILE") or "").strip()
+    if ptc_cfg and Path(ptc_cfg).is_file():
+        base = Path(ptc_cfg)
+    else:
+        for cand in (Path("/app/agent_config.yaml"), Path("agent_config.yaml")):
+            if cand.is_file():
+                base = cand
+                break
+    if base is None:
+        return None, False
+
+    provider = _from_file(base)
+    app_env = (os.getenv("APP_ENV") or os.getenv("DALTON_PROFILE") or "core").strip()
+    overlay = base.with_name(f"{base.stem}.{app_env}{base.suffix}")
+    if overlay.is_file():
+        ov_provider = _from_file(overlay)
+        if ov_provider is not None:
+            provider = ov_provider
+    return provider, True
+
+
+def resolve_runtime_storage_targets() -> dict[str, dict[str, str]]:
+    """Resolve effective storage targets for chat_upload, asr, and general storage and verify single-service invariant."""
+    targets: dict[str, dict[str, str]] = {}
+
+    asr_ep = _norm_ep(os.getenv("DALTON_ASR_STORAGE_ENDPOINT_URL") or "")
+    asr_bucket = (os.getenv("DALTON_ASR_STORAGE_BUCKET_NAME") or "").strip()
+    asr_ak = (os.getenv("DALTON_ASR_STORAGE_ACCESS_KEY_ID") or "").strip()
+    asr_sk = (os.getenv("DALTON_ASR_STORAGE_SECRET_ACCESS_KEY") or "").strip()
+    asr_prefix = _norm_prefix(os.getenv("DALTON_ASR_STORAGE_KEY_PREFIX") or "")
+    asr_target: dict[str, str] | None = None
+    if asr_ep or (asr_bucket and asr_ak and asr_sk):
+        asr_target = {
+            "service_id": f"s3:{asr_ep}" if asr_ep else "s3:asr-unset-endpoint",
+            "endpoint": asr_ep,
+            "bucket": asr_bucket,
+            "key_prefix": asr_prefix,
+        }
+        targets["asr"] = asr_target
+
+    chat_ep = _norm_ep(os.getenv("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL") or "")
+    chat_bucket = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME") or "").strip()
+    chat_ak = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID") or "").strip()
+    chat_sk = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY") or "").strip()
+    if chat_ep and chat_bucket and chat_ak and chat_sk:
+        targets["chat_upload"] = {
+            "service_id": f"s3:{chat_ep}",
+            "endpoint": chat_ep,
+            "bucket": chat_bucket,
+            "key_prefix": _norm_prefix(os.getenv("DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX") or ""),
+        }
+    elif asr_target is not None:
+        targets["chat_upload"] = dict(asr_target)
+
+    yaml_provider, yaml_found = _read_yaml_storage_provider()
+    env_provider = (os.getenv("STORAGE_PROVIDER") or "").strip().lower()
+    if yaml_found:
+        raw_provider = yaml_provider if yaml_provider else (env_provider or "none")
+    else:
+        raw_provider = env_provider if env_provider else "s3"
+
+    gen_prefix = _norm_prefix(os.getenv("STORAGE_KEY_PREFIX") or "")
+    if raw_provider == "oss":
+        oss_bucket = (os.getenv("OSS_BUCKET_NAME") or "").strip()
+        if oss_bucket:
+            oss_ep = _norm_ep(os.getenv("OSS_ENDPOINT") or "")
+            oss_region = (os.getenv("OSS_REGION") or "").strip().lower()
+            oss_id = oss_ep or (f"default-oss:{oss_region}" if oss_region else "default-oss")
+            targets["general"] = {
+                "service_id": f"oss:{oss_id}",
+                "endpoint": oss_ep,
+                "bucket": oss_bucket,
+                "key_prefix": gen_prefix,
+            }
+    elif raw_provider != "none":
+        s3_bucket = (os.getenv("STORAGE_BUCKET_NAME") or os.getenv("S3_BUCKET_NAME") or "").strip()
+        if s3_bucket:
+            s3_ep = _norm_ep(os.getenv("STORAGE_ENDPOINT_URL") or os.getenv("S3_ENDPOINT_URL") or "")
+            s3_region = (os.getenv("STORAGE_REGION") or os.getenv("S3_REGION") or "us-east-1").strip().lower()
+            targets["general"] = {
+                "service_id": f"s3:{s3_ep}" if s3_ep else f"s3:aws-s3-default:{s3_region}",
+                "endpoint": s3_ep,
+                "bucket": s3_bucket,
+                "key_prefix": gen_prefix,
+            }
+
+    distinct_services = sorted({t["service_id"] for t in targets.values()})
+    if len(distinct_services) > 1:
+        details = ", ".join(
+            f"{name}={t['service_id']} (bucket={t['bucket'] or '<unset>'})"
+            for name, t in targets.items()
+        )
         print(
-            "ERROR: Multiple object storage services detected: " + "; ".join(conflicts),
+            f"ERROR: Multiple object storage services detected: {details}",
             file=sys.stderr,
         )
         print(
@@ -626,18 +683,24 @@ def validate_single_object_storage(primary_endpoint: str) -> None:
         )
         sys.exit(1)
 
+    return targets
 
+
+runtime_targets = resolve_runtime_storage_targets()
 endpoint = _env(
     "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL",
     "STORAGE_ENDPOINT_URL",
     default="http://minio:9000",
 ).rstrip("/")
-validate_single_object_storage(endpoint)
-default_bucket = _env(
-    "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME",
-    "STORAGE_BUCKET_NAME",
-    default="chat-uploads",
+default_bucket = (
+    (runtime_targets.get("chat_upload") or {}).get("bucket")
+    or _env(
+        "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME",
+        "STORAGE_BUCKET_NAME",
+        default="chat-uploads",
+    )
 )
+default_key_prefix = (runtime_targets.get("chat_upload") or {}).get("key_prefix", "")
 access_key = _env(
     "DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID",
     "MINIO_ROOT_USER",
@@ -693,6 +756,9 @@ for var_name in BUCKET_ENV_VARS:
 if "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME" not in configured_var_buckets and default_bucket:
     configured_var_buckets["DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME"] = default_bucket
 active_buckets = set(configured_var_buckets.values())
+for t in runtime_targets.values():
+    if t.get("bucket"):
+        active_buckets.add(t["bucket"])
 
 buckets: list[str] = []
 skipped_buckets: list[str] = []
@@ -771,6 +837,11 @@ with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz", format=tarfile.PAX_FOR
         {
             "buckets": buckets,
             "primary_bucket": default_bucket,
+            "primary_key_prefix": default_key_prefix,
+            "targets": {
+                name: {"bucket": t["bucket"], "key_prefix": t["key_prefix"]}
+                for name, t in runtime_targets.items()
+            },
             "var_buckets": {k: v for k, v in configured_var_buckets.items() if v in buckets},
             "bucket_count": len(buckets),
             "object_count": len(manifest_objects),
@@ -786,10 +857,11 @@ with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz", format=tarfile.PAX_FOR
     tf.addfile(minfo, io.BytesIO(manifest_raw))
 PY
 
-MINIO_MANIFEST_JSON="$(tar -xOzf "${STAGE_DIR}/minio-objects.tar.gz" _minio_manifest.json)"
-MINIO_BUCKET_COUNT="$(printf '%s' "$MINIO_MANIFEST_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["bucket_count"])')"
-MINIO_OBJECT_COUNT="$(printf '%s' "$MINIO_MANIFEST_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["object_count"])')"
-MINIO_TOTAL_BYTES="$(printf '%s' "$MINIO_MANIFEST_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["total_bytes"])')"
+MINIO_MANIFEST_FILE="${STAGE_DIR}/.minio-manifest.tmp.json"
+tar -xOzf "${STAGE_DIR}/minio-objects.tar.gz" _minio_manifest.json > "$MINIO_MANIFEST_FILE"
+MINIO_BUCKET_COUNT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["bucket_count"])' "$MINIO_MANIFEST_FILE")"
+MINIO_OBJECT_COUNT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["object_count"])' "$MINIO_MANIFEST_FILE")"
+MINIO_TOTAL_BYTES="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["total_bytes"])' "$MINIO_MANIFEST_FILE")"
 
 if [[ "$VERIFY" -eq 1 ]]; then
   ARCHIVED_OBJECT_COUNT="$(tar -tzf "${STAGE_DIR}/minio-objects.tar.gz" | awk '/^objects\// && !/\/$/ { c++ } END { print c+0 }')"
@@ -842,6 +914,7 @@ if [[ -f "${WORK_DIR}/.release_git_sha" ]]; then
 fi
 
 python3 - "${STAGE_DIR}/manifest.json" \
+  "$MINIO_MANIFEST_FILE" \
   "$TIMESTAMP" \
   "$RELEASE_SHA" \
   "$PROJECT_NAME" \
@@ -863,6 +936,7 @@ import json, sys
 
 (
     out_path,
+    minio_manifest_path,
     ts,
     release_sha,
     compose_project,
@@ -882,6 +956,9 @@ import json, sys
     env_iter,
 ) = sys.argv[1:]
 
+with open(minio_manifest_path, encoding="utf-8") as mfh:
+    minio_meta = json.load(mfh)
+
 manifest = {
     "schema_version": 2,
     "created_at_utc": ts,
@@ -898,6 +975,9 @@ manifest = {
     },
     "minio": {
         "file": "minio-objects.tar.gz",
+        "primary_bucket": minio_meta.get("primary_bucket") or None,
+        "primary_key_prefix": minio_meta.get("primary_key_prefix") or "",
+        "targets": minio_meta.get("targets") or {},
         "bucket_count": int(minio_buckets),
         "object_count": int(minio_objects),
         "total_bytes": int(minio_bytes),
@@ -924,6 +1004,7 @@ with open(out_path, "w", encoding="utf-8") as fh:
     json.dump(manifest, fh, ensure_ascii=False, indent=2)
     fh.write("\n")
 PY
+rm -f "$MINIO_MANIFEST_FILE"
 chmod 600 "${STAGE_DIR}/manifest.json"
 
 # Write SHA256SUMS for every artifact in the backup directory

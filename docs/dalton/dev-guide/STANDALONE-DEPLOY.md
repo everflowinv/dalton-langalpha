@@ -92,17 +92,18 @@ make config
 
 ### 第 4 步：启动核心服务栈并核验状态
 
-`init.sh` 已将所需编排文件写入 `.env` 中的 `COMPOSE_FILE`，直接运行即可（或显式传入对应的 `-f` 参数）：
+为避免被当前 shell 中导出的 `COMPOSE_PROJECT_NAME` / `COMPOSE_FILE` 等变量劫持到其他部署实例，本手册所有 `docker compose` 命令均显式指定 `-p <项目名> -f <文件>... --env-file .env`，其中 `<项目名>` 从当前目录 `.env` 的 `COMPOSE_PROJECT_NAME` 读取（默认由 `init.sh` 写入 `dalton-core`，不读 shell 环境变量）：
 
 ```bash
-# 使用 .env 中的 COMPOSE_FILE 启动
-docker compose up -d
+cd /opt/dalton
+PROJECT_NAME="$(python3 -c 'import re; m=[re.match(r"^\s*(?:export\s+)?COMPOSE_PROJECT_NAME\s*[=:]\s*[\"'"'"']?([^\"'"'"'#\s]+)", l) for l in open(".env")]; vals=[x.group(1) for x in m if x]; print(vals[-1] if vals else "")')"
+test -n "$PROJECT_NAME"
 
-# 显式命令（回环 HTTP 模式）
-docker compose -f docker-compose.yml -f docker-compose.core.yml up -d
+# 回环 HTTP 模式
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d
 
-# 显式命令（启用 HTTPS 模式）
-docker compose -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml up -d
+# 启用 HTTPS 模式（IPv6 回环替换为 deploy/standalone/docker-compose.tls.ipv6.yml）
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d
 ```
 
 启动流程按顺序完成：
@@ -111,11 +112,11 @@ docker compose -f docker-compose.yml -f docker-compose.core.yml -f deploy/standa
 3. 运行一次性容器 `migrate` 通过 PostgreSQL 咨询锁串行执行上游与 Dalton 两条 Alembic（数据库表结构迁移工具）迁移链至最新版本；
 4. 启动 `backend`、`crawler` 与 `edge`。
 
-查看所有服务状态与后端健康检查：
+查看所有服务状态与后端健康检查（启用 HTTPS 时一并加上 `-f deploy/standalone/docker-compose.tls.yml`）：
 
 ```bash
-docker compose ps
-docker compose exec -T backend curl -sf http://127.0.0.1:8000/health
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env ps
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec -T backend curl -sf http://127.0.0.1:8000/health
 ```
 
 ---
@@ -132,7 +133,7 @@ docker volume ls --filter name=dalton-caddy-data
 
 ```bash
 bash scripts/standalone/init.sh --domain localhost
-docker compose -f docker-compose.yml -f docker-compose.core.yml up -d
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d
 ```
 
 此模式仅发布 `127.0.0.1:8088`（通过 `http://127.0.0.1:8088` 访问，或从本地电脑通过 `ssh -L 8088:127.0.0.1:8088 user@server` 转发访问），宿主机 80/443 端口保持空闲。
@@ -144,13 +145,13 @@ docker compose -f docker-compose.yml -f docker-compose.core.yml up -d
 ```bash
 # 本机回环 HTTPS（仅绑定 127.0.0.1:18080 与 127.0.0.1:18443，HTTP 跳转自动携带 18443 端口并启用 HSTS）
 bash scripts/standalone/init.sh --domain localhost --tls-mode internal
-docker compose -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml up -d
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d
 ```
 
 启动 `edge` 后，导出 Caddy 内部 CA（证书颁发机构）根证书并导入客户端或操作系统的受信任根证书库：
 
 ```bash
-docker compose exec -T edge \
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env exec -T edge \
   cat /data/caddy/pki/authorities/local/root.crt > dalton-local-ca.crt
 ```
 
@@ -163,7 +164,7 @@ bash scripts/standalone/init.sh \
   --domain localhost \
   --tls-mode custom \
   --tls-cert-dir /etc/dalton/certs
-docker compose -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml up -d --no-deps --force-recreate edge
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d --no-deps --force-recreate edge
 ```
 
 > **自有证书备份与健康探测**：`backup.sh` 仅归档 Caddy 的 `/data` 卷，请单独做好 `DALTON_TLS_CERT_DIR`（含 `cert.pem` 与 `key.pem`）的备份与恢复。若证书由企业内部 CA 签发，在执行 `restore.sh` 和 `upgrade.sh` 时传入 `--ca-file <企业CA根证书.pem>` 完成 HTTPS 校验。
@@ -191,10 +192,10 @@ DALTON_AUTH_MODE=local
 VITE_DALTON_AUTH=local
 ```
 
-修改 `VITE_DALTON_AUTH` 后重新构建并启动 `edge` 与 `backend`：
+修改 `VITE_DALTON_AUTH` 后重新构建并启动 `edge` 与 `backend`（启用 HTTPS 时加上 `-f deploy/standalone/docker-compose.tls.yml`）：
 
 ```bash
-docker compose up -d --build edge backend
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d --build edge backend
 ```
 
 ### 4.2 创建首位管理员
@@ -209,19 +210,19 @@ docker compose up -d --build edge backend
 
 ### 4.3 管理员运维命令行工具
 
-当自举口令过期、连续输错 5 次触发锁定，或管理员忘记密码时，直接在服务器上通过容器内的运维 CLI（命令行界面）处理：
+当自举口令过期、连续输错 5 次触发锁定，或管理员忘记密码时，直接在服务器上通过容器内的运维 CLI（命令行界面）处理（`<项目名>` 从 `.env` 读取，启用 HTTPS 时加上 `-f deploy/standalone/docker-compose.tls.yml`）：
 
 ```bash
 # 重新签发 24 小时有效的自举口令（仅在尚未完成自举前有效）
-docker compose exec -T backend \
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec -T backend \
   uv run --no-sync python -m src.dalton.auth.cli reissue-bootstrap-token
 
 # 重置指定账号密码并立即撤销该账号全部既有登录会话
-docker compose exec backend \
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec backend \
   uv run --no-sync python -m src.dalton.auth.cli reset-password --email admin@example.com
 
 # 为已有用户授予管理员角色
-docker compose exec -T backend \
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec -T backend \
   uv run --no-sync python -m src.dalton.auth.cli grant-admin --email member@example.com
 ```
 
@@ -241,7 +242,7 @@ Dalton 核心版采用 BYOK（Bring Your Own Key，自带模型密钥）模式�
 - **方式 B（命令行向导）**：在服务器上运行 `make config`，按提示填写环境变量与默认模型，然后重启后端生效：
   ```bash
   make config
-  docker compose restart backend
+  docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env restart backend
   ```
 
 ### 5.2 企业内网模型网关白名单
@@ -275,12 +276,12 @@ DALTON_OPERATOR_LLM_ENDPOINTS=https://llm-gateway.corp.internal/v1
 `scripts/standalone/backup.sh` 在服务在线运行时完成以下四项归档，并执行 `pg_restore --list` 校验、MinIO 流式分块打包与 `SHA256SUMS`（安全散列算法 256 位校验清单）生成：
 
 1. PostgreSQL 逻辑备份 `postgres.dump`（单一事务快照，同时包含上游与 Dalton 两条迁移链）；
-2. MinIO 对象归档 `minio-objects.tar.gz`（按块流式读写并增量计算逐文件 SHA-256，保留 `ContentType`）：v1 仅支持**单一对象存储服务**——如果 `.env` 或容器环境中配置的应用存储桶分布在多个不同的对象存储服务/地址上（例如聊天上传与 ASR / S3 / OSS / R2 指向不同服务），`backup.sh` 会直接报错退出；
+2. MinIO 对象归档 `minio-objects.tar.gz`（按块流式读写并增量计算逐文件 SHA-256，保留 `ContentType`，同时在清单中记录有效桶名与键前缀）：v1 仅支持**单一对象存储服务**——脚本按应用实际生效的配置加载逻辑（结合 `agent_config.yaml` 默认值与 `.env`）分别解析聊天上传、ASR 与通用存储，只要指向不同的存储服务（例如聊天上传走 MinIO，而通用存储通过 `S3_BUCKET_NAME` 指向默认 AWS S3 或 OSS），`backup.sh` 与 `restore.sh` 都会直接报错退出；
 3. Caddy 证书与内部 CA 数据归档 `caddy-data.tar.gz`；
 4. `.env` 密钥文件：传入 `--env-passphrase-file` 时使用 OpenSSL AES-256-CBC + PBKDF2（参数写入 `manifest.json`，整体完整性由 `SHA256SUMS` 校验）加密生成 `env.enc`。
 
 > **一致性与私钥保管边界**：
-> - **在线一致性窗口**：数据库 `postgres.dump` 是单一时刻的一致快照，MinIO 对象枚举紧随其后执行。在此窗口内被删除的对象可能缺失于对象归档中；恢复时 `restore.sh` 会核对并报告数据库中引用了但对象存储缺失的条目。
+> - **在线一致性窗口**：数据库 `postgres.dump` 是单一时刻的一致快照，MinIO 对象枚举紧随其后执行。在此窗口内被删除或写入尚未完成的对象可能缺失于对象归档中；恢复后若发现数据库引用了但对象存储中缺失的对象，`restore.sh` 会直接失败退出并提示在线备份的时间窗口。
 > - **私钥保护**：`caddy-data.tar.gz` 包含 Caddy 的 TLS 私钥与内部 CA 私钥，同步至异地备份存储时请对整个备份目录采取加密与最小权限控制。使用 `custom` 模式时，请同时单独备份 `DALTON_TLS_CERT_DIR`。
 
 #### 准备执行账号、口令文件与备份目录（统一部署身份）
@@ -332,10 +333,10 @@ crontab -e
 
 v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不提供原地替换已有数据的路径）：
 1. 校验备份目录内的 `SHA256SUMS`、`manifest.json` 与对象归档清单；
-2. 准备目标 `.env`（**只读文件内容，不读 shell 环境变量**；传入 `--replace-env` 时对 `COMPOSE_PROJECT_NAME` 做**逐字比较**，不做规范化），在固定路径 `/tmp/dalton-<项目名>.restore.lock` 上加锁（优先使用 `flock`，无 `flock` 时退化为 `mkdir` 原子锁；不会按 PID 自动清理遗留锁，如遇残留锁需由管理员确认无并发恢复后手动删除），清理上次异常中断残留的 `.env.tmp-*`，并校验外部库拦截、数据库标识符与 Compose 文件；
-3. 检查目标实例必须为空：数据库内不能有任何非系统 schema 的对象，对象存储内不能有任何桶（或只能有 `minio_init` 刚创建、尚无任何对象的空桶），否则直接拒绝并指向下方"在已有实例上覆盖恢复"步骤；同时用 `pg_restore --list` 校验备份文件。确认全部通过后，若配置来自 `env.enc`，再通过临时文件 `.env.tmp-*` + `chmod` + 原子 `mv` 写入正式 `.env`（即使在写入瞬间遭遇 `kill -9`，最多残留一个 `.env.tmp-*`，下次运行自动清理）；
-4. 调用所有 `docker compose` 命令前，先通过 `env -u` 清除 `.env` 中出现的全部键（及 `COMPOSE_PROJECT_NAME`、`COMPOSE_FILE`），防止 shell 里导出的旧变量覆盖 `.env` 文件；
-5. 直接向正式对象存储的原桶名写入对象（流式上传并读回校验大小、SHA-256 与 `ContentType`），直接向正式数据库恢复 `postgres.dump` 并执行 `migrate`，核对数据库引用对象；
+2. 准备目标 `.env`（**只读文件内容，不读 shell 环境变量**；解密 `env.enc` 产生的临时文件统一使用 `.env.tmp-*` 前缀，便于下次运行自动清理；传入 `--replace-env` 时对 `COMPOSE_PROJECT_NAME` 做**逐字比较**，不做规范化），在固定路径 `/tmp/dalton-<项目名>.restore.lock` 上加锁（优先使用 `flock`，无 `flock` 时退化为 `mkdir` 原子锁；不会按 PID 自动清理遗留锁，如遇残留锁需由管理员确认无并发恢复后手动删除），清理上次异常中断残留的 `.env.tmp-*`，并校验外部库拦截、数据库标识符、应用实际生效的单一对象存储约束（`--skip-minio` 仅在应用的确未配置任何对象存储时允许使用）、备份清单与目标 `.env` 的**桶名和键前缀一致性**（不一致即在写入任何数据前停止，提示先改 `.env` 让两者一致或使用 `--replace-env`）与 Compose 文件；
+3. 检查**整个目标 PostgreSQL 实例**与对象存储必须为空：使用目标/备份 `.env` 中的超级用户凭据经 TCP 连接 PostgreSQL（连不上或非超级用户直接拒绝并说明原因），通过 `pg_database` 列出全部非模板库（排除 `template0`、`template1`，包含 `postgres` 库在内），逐库检查非系统 schema 下 `pg_class` 全部关系及 `pg_proc` / `pg_type` 用户定义函数与类型，只要任意一个库不空即拒绝并指向下方"在已有实例上覆盖恢复"步骤；对象存储内不能有任何桶（或只能有 `minio_init` 刚创建、尚无任何对象的空桶）；同时用 `pg_restore --list` 校验备份文件。确认全部通过后，若配置来自 `env.enc`，再通过临时文件 `.env.tmp-*` + `chmod` + 原子 `mv` 写入正式 `.env`（即使在写入瞬间遭遇 `kill -9`，最多残留一个 `.env.tmp-*`，下次运行自动清理）；
+4. 调用所有 `docker compose` 命令时均显式指定 `-p <项目名> -f <文件>... --env-file <.env>`，并提前通过 `env -u` 清除 `.env` 与编排文件中引用的键（及 `COMPOSE_PROJECT_NAME`、`COMPOSE_FILE`、`COMPOSE_PROFILES`），防止 shell 里导出的旧变量覆盖 `.env` 文件；
+5. 直接向正式对象存储的原桶名写入对象（流式上传并读回校验大小、SHA-256 与 `ContentType`），直接向正式数据库恢复 `postgres.dump` 并执行 `migrate`，再逐条核对数据库引用对象（若发现数据库引用了但对象存储缺失的对象，则直接失败退出并提示在线备份的时间窗口）；
 6. 若 `.env` 来自备份则重建 `edge` 镜像（除非传入 `--skip-edge-build`），恢复 Caddy `/data`，最后启动全套服务并执行健康探测与双链版本核验。
 
 #### 空机恢复步骤
@@ -355,7 +356,7 @@ v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不�
      --backup-dir /var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3
    ```
    > - 如果目标目录已有一份 `.env` 且目标实例为空，需要用备份内的 `env.enc` 替换该 `.env`，附加 `--replace-env`（要求新旧 `.env` 中的 `COMPOSE_PROJECT_NAME` 逐字一致，先校验目标为空后再原子写入）。
-   > - 若使用已有 `.env` 而未用 `env.enc` 覆盖，请确认其中的 `BYOK_ENCRYPTION_KEY` 与备份同期原件一致，否则已保存的模型密钥将无法解密。使用企业自有证书（`custom`）模式时，提前恢复 `DALTON_TLS_CERT_DIR` 并可附加 `--ca-file <企业CA.pem>`。
+   > - 若使用已有 `.env` 而未用 `env.enc` 覆盖，请确认其中的对象存储桶名、键前缀与 `BYOK_ENCRYPTION_KEY` 均与备份同期原件一致（桶名或键前缀不一致会在写入前被直接拒绝，可先改 `.env` 让两者一致，或使用 `--replace-env`）。使用企业自有证书（`custom`）模式时，提前恢复 `DALTON_TLS_CERT_DIR` 并可附加 `--ca-file <企业CA.pem>`。
 3. 恢复完成后，提前构建代码沙箱镜像以消除首次对话等待：
    ```bash
    docker build -f Dockerfile.sandbox --build-arg INSTALL_AGENT_BROWSER=0 -t langalpha-sandbox:latest .
@@ -363,9 +364,9 @@ v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不�
 
 #### 在已有实例上覆盖恢复（含升级迁移后回滚）
 
-> **危险操作警告**：下列第 2 步的 `docker compose down -v` **会永久删除当前实例的数据库、对象存储、缓存与证书卷中的所有当前数据**，且无法撤回。执行前**必须**先完成第 1 步，确认手里有一份校验通过且完整可用的备份！
+> **危险操作警告**：下列第 2 步的 `docker compose -p "${PROJECT_NAME}" ... down -v` **会永久删除当前实例的数据库、对象存储、缓存与证书卷中的所有当前数据**，且无法撤回。执行前**必须**先完成第 1 步，确认手里有一份校验通过且完整可用的备份！
 
-如果需要用备份覆盖已有数据的实例（包括升级执行数据库迁移后需要回滚到升级前状态），请按以下人工步骤依次操作（以下以部署目录 `/opt/dalton`、备份目录 `/var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3` 为例；若旧部署的 `.env` 中尚未写入 `COMPOSE_FILE`，请在所有 `docker compose` 命令中显式加上 `-f docker-compose.yml -f docker-compose.core.yml`，启用 TLS 时一并加上 `-f deploy/standalone/docker-compose.tls.yml`）：
+如果需要用备份覆盖已有数据的实例（包括升级执行数据库迁移后需要回滚到升级前状态），请按以下人工步骤依次操作（以下以部署目录 `/opt/dalton`、备份目录 `/var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3` 为例；启用 HTTPS 时在所有 `docker compose` 命令中一并加上 `-f deploy/standalone/docker-compose.tls.yml`，IPv6 回环加上 `-f deploy/standalone/docker-compose.tls.ipv6.yml`）：
 
 1. **确认有一份校验通过的备份**：检查 `backup.sh` 输出中是否包含 PostgreSQL、MinIO、Caddy 的 `OK: ... verified` 校验结果与 `== Backup Complete ==`，并在备份目录中重新核验 `SHA256SUMS`：
    ```bash
@@ -373,24 +374,24 @@ v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不�
    sha256sum -c SHA256SUMS
    cat manifest.json
    ```
-   确认全部文件返回 `OK`、`postgres.dump` 与 `minio-objects.tar.gz` 完整存在，且同期 `.env`（或 `env.enc` 与口令文件）可用。
+   确认全部文件返回 `OK`、`postgres.dump` 与 `minio-objects.tar.gz` 完整存在，且同期 `.env`（或 `env.enc` 与口令文件）可用；若打算保留当前 `.env`，请先核对 `manifest.json` 里的桶名与键前缀是否与 `.env` 一致。
 
-2. **列出并确认本项目的实际卷名后，执行 `docker compose down -v` 删除本项目的卷**（仅删除当前项目的容器与数据卷，保留 `/opt/dalton/.env` 与发行文件）：
+2. **从 `.env` 读取项目名，列出该项目下的完整卷清单并人工确认后，执行 `down -v` 删除本项目的卷**（仅删除当前项目的容器与数据卷，保留 `/opt/dalton/.env` 与发行文件）：
    ```bash
    cd /opt/dalton
 
-   # 从本项目的容器里读取实际挂载的具名卷并列出，请逐项人工确认全部属于当前项目
-   CONTAINER_IDS="$(docker compose ps -aq)"
-   if [ -n "$CONTAINER_IDS" ]; then
-     docker inspect --format '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\n"}}{{end}}{{end}}' $CONTAINER_IDS | sort -u
-   else
-     PROJECT_NAME="$(docker compose config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')"
-     docker volume ls -q --filter "label=com.docker.compose.project=${PROJECT_NAME}" | sort -u
-   fi
+   # 严格从 .env 读取项目名（不读 shell 环境变量）
+   PROJECT_NAME="$(python3 -c 'import re; m=[re.match(r"^\s*(?:export\s+)?COMPOSE_PROJECT_NAME\s*[=:]\s*[\"'"'"']?([^\"'"'"'#\s]+)", l) for l in open(".env")]; vals=[x.group(1) for x in m if x]; print(vals[-1] if vals else "")')"
+   test -n "$PROJECT_NAME"
+   echo "目标项目名: ${PROJECT_NAME}"
+
+   # 按项目标签列出完整卷清单（包含已移除容器残留的数据卷），请逐项人工确认
+   docker volume ls --filter "label=com.docker.compose.project=${PROJECT_NAME}"
    ```
-   **请仔细核对上面输出的卷名列表**，确认这些卷均属于当前要重置的项目且第 1 步备份已校验通过，然后删除本项目的容器与卷：
+   **请仔细核对上面输出的完整卷清单**，确认每一个卷均属于当前要重置的项目且第 1 步备份已校验通过，然后显式指定项目与 `.env` 删除容器与卷：
    ```bash
-   docker compose down -v
+   # 回环 HTTP 模式（启用 HTTPS 时额外加上 -f deploy/standalone/docker-compose.tls.yml）
+   docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env down -v
    ```
 
 3. **使用 `restore.sh` 恢复到这个空实例**：
@@ -408,12 +409,21 @@ v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不�
    #   --replace-env
    ```
 
+#### 恢复中途失败的处理
+
+如果 `restore.sh` 在**写入 `.env`（或开始写入对象/数据库）之后**的任何一步失败（例如对象上传中断、`pg_restore` / `migrate` 报错、DB 对象引用核对发现缺失、容器启动或健康探测失败），目标实例会处于**半成品**状态——此时直接重跑 `restore.sh` 会被空实例守卫拒绝。
+
+**备份目录本身只读、完全不受影响。** 请直接按上方 §6.2「在已有实例上覆盖恢复」的第 2–3 步处理：
+1. 用 `docker volume ls --filter "label=com.docker.compose.project=${PROJECT_NAME}"` 确认本项目的完整卷清单；
+2. 执行 `docker compose -p "${PROJECT_NAME}" -f <文件>... --env-file .env down -v` 清理半成品实例；
+3. 排查并修正导致上次失败的原因后，重新运行 `restore.sh` 完成恢复。
+
 #### 恢复后的确认方法
 
-1. 检查容器状态与桶配置：
+1. 检查容器状态与桶配置（`<项目名>` 从 `.env` 读取，启用 HTTPS 时加上 `-f deploy/standalone/docker-compose.tls.yml`）：
    ```bash
    cd /opt/dalton
-   docker compose ps
+   docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env ps
    grep -E '^DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME=' .env
    ```
 2. 打开 Web UI，确认历史工作区、对话线程回放与既有上传文件均可正常打开与下载，并尝试上传一个新文件验证对象存储可写。
@@ -425,7 +435,7 @@ v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不�
 1. 先在临时目录解压并校验新版本发行包（不修改部署目录）；
 2. 调用**旧版** `scripts/standalone/backup.sh` 完成全量在线备份（若从早期 Batch 1 / `#480` 首次升级且旧目录尚无 `backup.sh`，则自动调用新发行包内的 `backup.sh` 备份旧栈）；
 3. 为旧版 `backend`、`edge`、`crawler` 镜像打上 `pre-upgrade-<时间戳>` 标签，并将旧版发行文件快照保存到 `.upgrade-backup/<时间戳>/`；
-4. 替换部署目录中的发行文件（保留 `.env`、`backups/`、`.upgrade-backup/`、`.restore-backup/`、`deploy/standalone/certs/` 与 `deploy/standalone/extra/`），构建新镜像、执行 `migrate` 与 `minio-init`、滚动替换 `backend`（等待 `/health` 通过）、`crawler` 与 `edge`，最后执行一次普通 `docker compose up -d` 收敛全部服务，并完成健康探测与双链版本核验。
+4. 替换部署目录中的发行文件（保留 `.env`、`backups/`、`.upgrade-backup/`、`.restore-backup/`、`deploy/standalone/certs/` 与 `deploy/standalone/extra/`），构建新镜像、执行 `migrate` 与 `minio-init`、滚动替换 `backend`（等待 `/health` 通过）、`crawler` 与 `edge`，最后执行一次普通 `docker compose -p <项目名> -f <文件>... --env-file .env up -d` 收敛全部服务，并完成健康探测与双链版本核验。
 
 #### 从 `#480`（Batch 1）首次升级与 Redis 7.4 → Valkey 8 卷迁移
 
@@ -447,21 +457,23 @@ bash scripts/standalone/backup.sh \
   --output-dir /var/backups/dalton \
   --env-passphrase-file /etc/dalton/backup.pass
 
-# 3. 从旧项目的 redis 容器获取实际挂载的 /data 卷名，停机归档并校验成功后，再删除该卷
+# 3. 从 .env 读取旧项目名，获取旧项目 redis 容器挂载的 /data 卷名，停机归档并校验成功后，再删除该卷
 cd /opt/dalton
-REDIS_CID="$(docker compose -f docker-compose.yml -f docker-compose.core.yml ps -aq redis | head -n 1)"
+PROJECT_NAME="$(python3 -c 'import re; m=[re.match(r"^\s*(?:export\s+)?COMPOSE_PROJECT_NAME\s*[=:]\s*[\"'"'"']?([^\"'"'"'#\s]+)", l) for l in open(".env")]; vals=[x.group(1) for x in m if x]; print(vals[-1] if vals else "")')"
+PROJECT_NAME="${PROJECT_NAME:-$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/-/g')}"
+REDIS_CID="$(docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env ps -aq redis | head -n 1)"
 REDIS_VOL="$(docker inspect --format '{{range .Mounts}}{{if and (eq .Type "volume") (eq .Destination "/data")}}{{.Name}}{{end}}{{end}}' "$REDIS_CID")"
 REDIS_IMAGE="$(docker inspect --format '{{.Config.Image}}' "$REDIS_CID")"
-echo "旧项目 Redis 卷名: ${REDIS_VOL}"
+echo "旧项目 (${PROJECT_NAME}) Redis 卷名: ${REDIS_VOL}"
 
 REDIS_ARCHIVE="/var/backups/dalton/redis-pre-valkey-$(date -u +%Y%m%d-%H%M%SZ).tar.gz"
 test -n "$REDIS_CID" && test -n "$REDIS_VOL" && \
-  docker compose -f docker-compose.yml -f docker-compose.core.yml stop redis && \
+  docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env stop redis && \
   docker run --rm -v "${REDIS_VOL}:/data:ro" --entrypoint /bin/sh "$REDIS_IMAGE" -c 'tar -czf - -C /data .' > "$REDIS_ARCHIVE" && \
   chmod 600 "$REDIS_ARCHIVE" && \
   test -s "$REDIS_ARCHIVE" && \
   tar -tzf "$REDIS_ARCHIVE" >/dev/null && \
-  docker compose -f docker-compose.yml -f docker-compose.core.yml rm -f redis && \
+  docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env rm -f redis && \
   docker volume rm "$REDIS_VOL"
 
 # 4. 在新包目录里运行 upgrade.sh 完成升级（Valkey 8 会自动创建全新的 RDB v11 数据卷）
@@ -489,13 +501,13 @@ bash scripts/standalone/upgrade.sh \
 
 #### 升级失败回滚
 
-当任意步骤失败时，脚本以迁移前后**都成功读到**的 Alembic 版本号（`alembic_version` 与 `alembic_version_dalton`）比较结果为准，按以下三种情况输出对应的 shell 转义回滚指引（携带实际使用的 `--compose-files`）：
-- **迁移之前失败（或迁移前后版本号均成功读到且未发生变化）**：数据库表结构未被改动，不需要动数据（避免丢弃备份后的新写入）；脚本仅提示使用 `rsync -a --delete`（排除 `.env`、`backups/`、`.upgrade-backup/`、`.restore-backup/`、`certs/`、`extra/`）还原旧发行文件、恢复 `pre-upgrade-<时间戳>` 镜像标签并重启服务；
+当任意步骤失败时，脚本输出的所有 `docker compose` 命令均显式携带 `-p <项目名> -f <文件>... --env-file <.env>`，并按以下三种情况给出对应的 shell 转义回滚指引：
+- **迁移尚未开始就失败**（备份、解压、文件替换或镜像构建阶段失败）：数据库表结构未被改动，不需要动数据（避免丢弃备份后的新写入）；脚本仅提示使用 `rsync -a --delete`（排除 `.env`、`backups/`、`.upgrade-backup/`、`.restore-backup/`、`certs/`、`extra/`）还原旧发行文件、恢复 `pre-upgrade-<时间戳>` 镜像标签并重启服务；
 - **迁移之后失败（迁移前后版本号均成功读到且至少一条迁移链版本已变化）**：依次提示：
   1. 使用 `rsync -a --delete`（带上述排除项）从 `.upgrade-backup/<时间戳>/` 还原旧版发行文件；
   2. 通过 `docker tag <镜像>:pre-upgrade-<时间戳> <镜像>:local` 恢复旧版容器镜像标签；
-  3. 按上文 §6.2「在已有实例上覆盖恢复（含升级迁移后回滚）」的人工步骤操作：先核验升级前备份，再列出并确认本项目卷名后执行 `docker compose down -v`，最后用 `restore.sh --skip-edge-build` 恢复到空实例；
-- **迁移状态不确定（迁移前或迁移后未能读到版本号）**：脚本**不会**直接认定"已迁移"或提示清空数据卷，而是提示先人工查询当前 `alembic_version` / `alembic_version_dalton` 并与升级前备份的 `manifest.json` 核对：版本号一致则只还原文件与镜像，版本号已变再按 §6.2 人工步骤恢复。
+  3. 按上文 §6.2「在已有实例上覆盖恢复（含升级迁移后回滚）」的人工步骤操作：先核验升级前备份，再用 `docker volume ls --filter label=com.docker.compose.project=<项目名>` 列出并确认本项目完整卷清单后执行 `docker compose -p <项目名> -f <文件>... --env-file <.env> down -v`，最后用 `restore.sh --skip-edge-build` 恢复到空实例；
+- **迁移状态不确定（`migrate` 已启动后，迁移前或迁移后未能读到版本号，或者前后版本号相同）**：由于部分迁移会在 `autocommit_block()` 前提交 DDL，版本号未变化也不足以保证表结构完全未改动；脚本**不会**直接认定"未改动"或"已迁移"，而是提示先人工查询当前 `alembic_version` / `alembic_version_dalton` 及表结构并与升级前备份的 `manifest.json` 核对，确认无不兼容改动则只还原文件与镜像，否则按 §6.2 人工步骤恢复。
 
 ---
 
@@ -516,7 +528,7 @@ DALTON_MINIO_IMAGE=public.ecr.aws/chainguard/minio@sha256:e70b2b1e74d79457f80871
 修改 `.env` 后重新拉起 `minio` 服务：
 
 ```bash
-docker compose up -d minio
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d minio
 ```
 
 ### 7.2 公网 HTTPS 证书签发失败（Batch 4b 公网部署）
@@ -526,7 +538,7 @@ docker compose up -d minio
 3. 核对宿主机 80/443 端口未被其他进程占用：`ss -tlnp | grep -E ':80 |:443 '`。
 4. 查看边缘网关实时日志定位具体原因：
    ```bash
-   docker compose logs --tail=100 edge
+   docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env logs --tail=100 edge
    ```
 
 ### 7.3 首次对话等待时间较长
@@ -544,7 +556,7 @@ docker image inspect langalpha-sandbox:latest >/dev/null && echo "已就绪"
 在服务器执行 `reissue-bootstrap-token` 重置失败计数并生成新的 24 小时有效口令：
 
 ```bash
-docker compose exec -T backend \
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec -T backend \
   uv run --no-sync python -m src.dalton.auth.cli reissue-bootstrap-token
 ```
 
@@ -553,7 +565,7 @@ docker compose exec -T backend \
 在服务器执行 `reset-password` 交互式设置新密码（命令同时撤销所有旧会话）：
 
 ```bash
-docker compose exec backend \
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec backend \
   uv run --no-sync python -m src.dalton.auth.cli reset-password --email <管理员邮箱>
 ```
 

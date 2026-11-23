@@ -9,8 +9,11 @@
 #      acquires `/tmp/dalton-<project>.restore.lock` (`flock`, or `mkdir` fallback
 #      without PID-based auto-cleanup), cleans leftover `.env.tmp-*` files, and
 #      runs static preflight checks (external DB guard, identifiers, Compose files).
-#   3. Verifies the target instance is empty (0 non-system schema DB objects;
-#      0 MinIO buckets or only the empty `minio_init` bucket) and validates
+#   3. Verifies the entire PostgreSQL instance is empty (all non-template DBs
+#      in `pg_database` including `postgres` checked over TCP with superuser
+#      credentials for non-system `pg_class`, `pg_proc`, and `pg_type` objects;
+#      object storage has 0 buckets or only the empty `minio_init` bucket),
+#      verifies backup bucket/key-prefix parity against `.env`, and validates
 #      `pg_restore --list`. Refuses non-empty targets and points to the manual
 #      reset-and-restore procedure in `docs/dalton/dev-guide/STANDALONE-DEPLOY.md` (§6.2).
 #      Only after validation succeeds, atomically writes `.env` via `.env.tmp-*` + `mv`.
@@ -163,10 +166,18 @@ fmt_cmd() {
 }
 
 print_non_empty_manual_hint() {
+  local proj="${COMPOSE_PROJECT:-<project>}"
+  local down_cmd="docker compose -p ${proj} -f docker-compose.yml -f docker-compose.core.yml --env-file ${ENV_FILE} down -v"
+  if [[ -n "$COMPOSE_PROJECT" && "${#COMPOSE_FILE_ARGS[@]}" -gt 0 ]]; then
+    down_cmd="$(fmt_cmd docker compose -p "$COMPOSE_PROJECT" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" down -v)"
+  fi
   err "restore.sh only restores into an empty target instance."
   err "To overwrite an existing instance (or roll back after a database migration), follow ${MANUAL_OVERWRITE_REF}:"
   err "  1. Confirm you have a verified backup (check backup.sh verification output and SHA256SUMS)."
-  err "  2. Inspect and confirm this project's actual container volumes, then run 'docker compose down -v' (deletes current data)."
+  err "  2. List and confirm ALL volumes belonging to project '${proj}':"
+  err "       $(fmt_cmd docker volume ls --filter "label=com.docker.compose.project=${proj}")"
+  err "     Then remove this project's containers and volumes (deletes current data):"
+  err "       ${down_cmd}"
   err "  3. Re-run restore.sh against the now-empty instance."
 }
 
@@ -244,6 +255,11 @@ PY
 RESTORE_LOCK_PATH=""
 RESTORE_LOCK_MODE=""
 RESTORE_LOCK_HELD=0
+COMPOSE_PROJECT=""
+COMPOSE_FILE_ARGS=()
+STORAGE_ANY_CONFIGURED=1
+MUTATION_STARTED=0
+RESTORE_SUCCEEDED=0
 ENV_FILE="${WORK_DIR}/.env"
 ENV_EXISTED_BEFORE=0
 ORIG_ENV_MODE="600"
@@ -267,13 +283,23 @@ acquire_restore_lock() {
       err "  rmdir $(printf '%q' "$RESTORE_LOCK_PATH")"
       exit 1
     fi
-    if ! exec 9>"$RESTORE_LOCK_PATH" 2>/dev/null; then
+    # Redirect stderr ONLY while opening fd 9; restore fd 2 immediately so script
+    # error output is never swallowed.
+    local lock_open_ok=1
+    exec 8>&2
+    exec 2>/dev/null
+    if ! exec 9>"$RESTORE_LOCK_PATH"; then
+      lock_open_ok=0
+    fi
+    exec 2>&8
+    exec 8>&-
+    if [[ "$lock_open_ok" -ne 1 ]]; then
       err "Cannot open restore lock file: ${RESTORE_LOCK_PATH}"
       err "Confirm no restore.sh process is running for project '${LOCK_PROJECT}' and check permissions, then remove it manually if stale."
       exit 1
     fi
     if ! flock -n 9; then
-      exec 9>&- 2>/dev/null || true
+      exec 9>&-
       err "Another restore is already running for project '${LOCK_PROJECT}' (lock held: ${RESTORE_LOCK_PATH})."
       err "If you believe this lock is stale, confirm no restore.sh process is running and remove it manually:"
       err "  rm -f $(printf '%q' "$RESTORE_LOCK_PATH")"
@@ -300,7 +326,7 @@ release_restore_lock() {
   fi
   if [[ "$RESTORE_LOCK_MODE" == "flock" ]]; then
     flock -u 9 2>/dev/null || true
-    exec 9>&- 2>/dev/null || true
+    exec 9>&-
   elif [[ "$RESTORE_LOCK_MODE" == "mkdir" && -n "$RESTORE_LOCK_PATH" && -d "$RESTORE_LOCK_PATH" ]]; then
     rmdir "$RESTORE_LOCK_PATH" 2>/dev/null || true
   fi
@@ -308,6 +334,7 @@ release_restore_lock() {
 }
 
 cleanup() {
+  local rc=$?
   if [[ -n "$ENV_WRITE_TMP" && -f "$ENV_WRITE_TMP" ]]; then
     rm -f "$ENV_WRITE_TMP"
   fi
@@ -321,6 +348,18 @@ cleanup() {
     rm -f "$MINIO_MANIFEST_TMP"
   fi
   release_restore_lock
+  if [[ "$rc" -ne 0 && "$RESTORE_SUCCEEDED" -ne 1 && "$MUTATION_STARTED" -eq 1 ]]; then
+    local proj="${COMPOSE_PROJECT:-<project>}"
+    local down_cmd="docker compose -p ${proj} -f docker-compose.yml -f docker-compose.core.yml --env-file ${ENV_FILE} down -v"
+    if [[ -n "$COMPOSE_PROJECT" && "${#COMPOSE_FILE_ARGS[@]}" -gt 0 ]]; then
+      down_cmd="$(fmt_cmd docker compose -p "$COMPOSE_PROJECT" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" down -v)"
+    fi
+    err "Restore failed after writing .env or modifying target state; the instance is now in a partial/half-restored state (半成品)."
+    err "Your backup directory (${BACKUP_DIR}) was NOT modified."
+    err "Follow ${MANUAL_OVERWRITE_REF} to confirm volumes and reset before re-running restore.sh:"
+    err "  $(fmt_cmd docker volume ls --filter "label=com.docker.compose.project=${proj}")"
+    err "  ${down_cmd}"
+  fi
 }
 trap cleanup EXIT
 
@@ -374,7 +413,7 @@ PY
   )
 fi
 
-if [[ "$SKIP_MINIO" -eq 0 && -f "${BACKUP_DIR}/minio-objects.tar.gz" ]]; then
+if [[ -f "${BACKUP_DIR}/minio-objects.tar.gz" ]]; then
   MINIO_MANIFEST_TMP="$(mktemp)"
   chmod 600 "$MINIO_MANIFEST_TMP"
   if ! tar -xOzf "${BACKUP_DIR}/minio-objects.tar.gz" _minio_manifest.json > "$MINIO_MANIFEST_TMP"; then
@@ -392,7 +431,7 @@ if [[ -f "${BACKUP_DIR}/env.enc" && -n "$ENV_PASSPHRASE_FILE" ]]; then
   fi
   if [[ "$ENV_EXISTED_BEFORE" -eq 0 || "$REPLACE_ENV" -eq 1 ]]; then
     info "2/7 Decrypting env.enc for preflight validation (${ENV_CIPHER}/${ENV_KDF}/${ENV_KDF_DIGEST}/${ENV_KDF_ITER})..."
-    STAGED_ENV_TMP="$(mktemp "${TMPDIR:-/tmp}/dalton-restore-env.XXXXXX")"
+    STAGED_ENV_TMP="$(mktemp "${WORK_DIR}/.env.tmp-decrypt-XXXXXX")"
     chmod 600 "$STAGED_ENV_TMP"
     if ! openssl enc -d "-${ENV_CIPHER}" -pbkdf2 -md "${ENV_KDF_DIGEST}" -iter "${ENV_KDF_ITER}" \
         -in "${BACKUP_DIR}/env.enc" \
@@ -441,12 +480,20 @@ if [[ ! "$LOCK_PROJECT" =~ ^[a-zA-Z0-9._-]+$ || "$LOCK_PROJECT" == "." || "$LOCK
   err "Invalid COMPOSE_PROJECT_NAME '${LOCK_PROJECT}': must match ^[a-zA-Z0-9._-]+$."
   exit 1
 fi
+COMPOSE_PROJECT="$LOCK_PROJECT"
 RESTORE_LOCK_PATH="/tmp/dalton-${LOCK_PROJECT}.restore.lock"
 acquire_restore_lock
 
-# Clean up any leftover .env.tmp-* from a prior kill -9 (safe under project lock)
+# Clean up any leftover .env.tmp-* from a prior kill -9 (safe under project lock;
+# never remove the current run's own decrypted STAGED_ENV_TMP).
+STALE_ENV_TMPS=()
 shopt -s nullglob
-STALE_ENV_TMPS=("${WORK_DIR}"/.env.tmp-*)
+for tmpf in "${WORK_DIR}"/.env.tmp-*; do
+  if [[ -n "$STAGED_ENV_TMP" && "$tmpf" == "$STAGED_ENV_TMP" ]]; then
+    continue
+  fi
+  STALE_ENV_TMPS+=("$tmpf")
+done
 shopt -u nullglob
 if (( ${#STALE_ENV_TMPS[@]} > 0 )); then
   warn "Removing leftover temporary .env file(s) from a previously interrupted restore: ${STALE_ENV_TMPS[*]}"
@@ -475,6 +522,7 @@ validate_db_identifiers() {
 
 # Read all target configuration strictly from CANDIDATE_ENV (never shell environment)
 CFG_DB_USER="$(read_env_file_var "$CANDIDATE_ENV" "DB_USER" "postgres")"
+CFG_DB_PASSWORD="$(read_env_file_var "$CANDIDATE_ENV" "DB_PASSWORD" "postgres")"
 CFG_DB_NAME="$(read_env_file_var "$CANDIDATE_ENV" "DB_NAME" "postgres")"
 CFG_DOMAIN="$(read_env_file_var "$CANDIDATE_ENV" "DOMAIN" "localhost")"
 CFG_TLS_MODE="$(read_env_file_var "$CANDIDATE_ENV" "DALTON_TLS_MODE" "loopback")"
@@ -482,6 +530,53 @@ CFG_EDGE_PORT="$(read_env_file_var "$CANDIDATE_ENV" "DALTON_EDGE_PORT" "8088")"
 CFG_EDGE_HTTPS_PORT="$(read_env_file_var "$CANDIDATE_ENV" "DALTON_EDGE_HTTPS_PORT" "18443")"
 CFG_CHAT_BUCKET="$(read_env_file_var "$CANDIDATE_ENV" "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME" "chat-uploads")"
 validate_db_identifiers "$CFG_DB_USER" "$CFG_DB_NAME"
+
+# Validate effective object storage configuration using application rules (chat_upload,
+# ASR, general storage + agent_config.yaml), enforce single-service invariant, and
+# allow --skip-minio ONLY when no object storage is configured.
+STORAGE_CHECK_ARGS=(
+  python3 "${SCRIPT_DIR}/storage_config.py" check-env
+  --env-file "$CANDIDATE_ENV"
+  --work-dir "$WORK_DIR"
+  --caller restore
+  --json
+)
+if [[ "$SKIP_MINIO" -eq 1 ]]; then
+  STORAGE_CHECK_ARGS+=(--require-none-for-skip-minio)
+fi
+if ! STORAGE_CFG_JSON="$("${STORAGE_CHECK_ARGS[@]}")"; then
+  exit 1
+fi
+IFS=$'\t' read -r STORAGE_ANY_CONFIGURED RESOLVED_PRIMARY_BUCKET < <(
+  printf '%s' "$STORAGE_CFG_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print(("1" if d.get("any_configured") else "0") + "\t" + (d.get("primary_bucket") or ""))
+'
+)
+if [[ -n "$RESOLVED_PRIMARY_BUCKET" ]]; then
+  CFG_CHAT_BUCKET="$RESOLVED_PRIMARY_BUCKET"
+fi
+
+# Before touching Docker, .env, or any data, verify bucket name(s) and key prefix(es)
+# in the backup manifest match the candidate .env that will be used.
+if [[ "$STORAGE_ANY_CONFIGURED" -eq 1 && ( -n "$MINIO_MANIFEST_TMP" || -f "${BACKUP_DIR}/manifest.json" ) ]]; then
+  CMP_ARGS=(
+    python3 "${SCRIPT_DIR}/storage_config.py" compare-backup
+    --env-file "$CANDIDATE_ENV"
+    --work-dir "$WORK_DIR"
+    --caller restore
+  )
+  if [[ -n "$MINIO_MANIFEST_TMP" && -f "$MINIO_MANIFEST_TMP" ]]; then
+    CMP_ARGS+=(--minio-manifest "$MINIO_MANIFEST_TMP")
+  fi
+  if [[ -f "${BACKUP_DIR}/manifest.json" ]]; then
+    CMP_ARGS+=(--backup-manifest "${BACKUP_DIR}/manifest.json")
+  fi
+  if ! "${CMP_ARGS[@]}"; then
+    exit 1
+  fi
+fi
 
 # Build Compose file list from CANDIDATE_ENV
 if [[ -z "$COMPOSE_FILES_RAW" ]]; then
@@ -498,7 +593,7 @@ if [[ -z "$COMPOSE_FILES_RAW" ]]; then
 fi
 
 IFS=':' read -r -a COMPOSE_FILES_ARR <<< "$COMPOSE_FILES_RAW"
-COMPOSE_ARGS=(--project-directory "$WORK_DIR")
+COMPOSE_FILE_ARGS=()
 RESOLVED_COMPOSE_FILES=()
 for cf in "${COMPOSE_FILES_ARR[@]}"; do
   [[ -z "$cf" ]] && continue
@@ -509,31 +604,57 @@ for cf in "${COMPOSE_FILES_ARR[@]}"; do
     err "Compose file not found: ${cf}"
     exit 1
   fi
-  COMPOSE_ARGS+=(-f "$cf")
+  COMPOSE_FILE_ARGS+=(-f "$cf")
   RESOLVED_COMPOSE_FILES+=("$cf")
 done
 
-# Collect every variable key appearing in CANDIDATE_ENV (plus COMPOSE_PROJECT_NAME
-# and COMPOSE_FILE) so every `docker compose` call unsets them via `env -u`.
+# Collect every variable key appearing in CANDIDATE_ENV, existing .env, and
+# compose file interpolations (plus COMPOSE_PROJECT_NAME, COMPOSE_FILE,
+# COMPOSE_PROFILES) so every `docker compose` call unsets them via `env -u`.
 ENV_UNSET_ARGS=()
 while IFS= read -r env_key; do
   [[ -n "$env_key" ]] && ENV_UNSET_ARGS+=(-u "$env_key")
-done < <(python3 - "$CANDIDATE_ENV" <<'PY'
-import re, sys
+done < <(python3 - "$CANDIDATE_ENV" "$ENV_FILE" "${RESOLVED_COMPOSE_FILES[@]}" <<'PY'
+import os, re, sys
 
+cand_env, orig_env = sys.argv[1], sys.argv[2]
+compose_files = sys.argv[3:]
 line_re = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*[=:]")
+interp_re = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)")
 seen: set[str] = set()
-for key in ("COMPOSE_PROJECT_NAME", "COMPOSE_FILE"):
+for key in (
+    "COMPOSE_PROJECT_NAME",
+    "COMPOSE_FILE",
+    "COMPOSE_PROFILES",
+    "DB_HOST",
+    "DB_PORT",
+    "DB_USER",
+    "DB_PASSWORD",
+    "DB_NAME",
+):
     seen.add(key)
     print(key)
-with open(sys.argv[1], encoding="utf-8") as fh:
-    for raw in fh:
-        stripped = raw.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        m = line_re.match(raw)
-        if not m:
-            continue
+for env_path in (cand_env, orig_env):
+    if not env_path or not os.path.isfile(env_path):
+        continue
+    with open(env_path, encoding="utf-8") as fh:
+        for raw in fh:
+            stripped = raw.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            m = line_re.match(raw)
+            if not m:
+                continue
+            key = m.group(1)
+            if key == "PATH":
+                continue
+            if key not in seen:
+                seen.add(key)
+                print(key)
+for cf in compose_files:
+    with open(cf, encoding="utf-8") as fh:
+        text = fh.read()
+    for m in interp_re.finditer(text):
         key = m.group(1)
         if key == "PATH":
             continue
@@ -608,9 +729,9 @@ fi
 ACTIVE_COMPOSE_ENV="$CANDIDATE_ENV"
 compose_cmd() {
   if [[ -n "$PREFLIGHT_COMPOSE_OVERRIDE" && -f "$PREFLIGHT_COMPOSE_OVERRIDE" ]]; then
-    env "${ENV_UNSET_ARGS[@]}" docker compose --env-file "$ACTIVE_COMPOSE_ENV" "${COMPOSE_ARGS[@]}" -f "$PREFLIGHT_COMPOSE_OVERRIDE" "$@"
+    env "${ENV_UNSET_ARGS[@]}" docker compose -p "$COMPOSE_PROJECT" "${COMPOSE_FILE_ARGS[@]}" -f "$PREFLIGHT_COMPOSE_OVERRIDE" --env-file "$ACTIVE_COMPOSE_ENV" --project-directory "$WORK_DIR" "$@"
   else
-    env "${ENV_UNSET_ARGS[@]}" docker compose --env-file "$ACTIVE_COMPOSE_ENV" "${COMPOSE_ARGS[@]}" "$@"
+    env "${ENV_UNSET_ARGS[@]}" docker compose -p "$COMPOSE_PROJECT" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ACTIVE_COMPOSE_ENV" --project-directory "$WORK_DIR" "$@"
   fi
 }
 
@@ -619,7 +740,8 @@ service_is_running() {
   compose_cmd ps --status running --services 2>/dev/null | grep -qx "$svc"
 }
 
-# Step 3: Verify target DB and MinIO are empty, validate postgres.dump, then atomically write .env.
+# Step 3: Verify entire target PostgreSQL instance and object storage are empty,
+# validate postgres.dump, then atomically write .env.
 info "3/7 Verifying target instance is empty and validating postgres.dump..."
 if ! service_is_running postgres; then
   compose_cmd up -d postgres
@@ -628,7 +750,7 @@ fi
 info "Waiting for PostgreSQL to become ready..."
 pg_ready=0
 for _ in $(seq 1 60); do
-  if compose_cmd exec -T postgres pg_isready -U "$CFG_DB_USER" -d template1 -q >/dev/null 2>&1; then
+  if compose_cmd exec -T postgres pg_isready -h 127.0.0.1 -p 5432 -U "$CFG_DB_USER" -d template1 -q >/dev/null 2>&1; then
     pg_ready=1
     break
   fi
@@ -645,30 +767,92 @@ if ! compose_cmd exec -T postgres pg_restore --list < "${BACKUP_DIR}/postgres.du
   exit 1
 fi
 
-DB_EXISTS="$(compose_cmd exec -T postgres psql -U "$CFG_DB_USER" -d template1 -Atqc \
-  "SELECT 1 FROM pg_database WHERE datname = '${CFG_DB_NAME}';" | tr -d '[:space:]')"
-if [[ "$DB_EXISTS" == "1" ]]; then
-  DB_EXISTS=1
-  DB_OBJECT_COUNT="$(compose_cmd exec -T postgres psql -U "$CFG_DB_USER" -d "$CFG_DB_NAME" -Atqc \
-    "SELECT COUNT(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%' AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f');" \
-    | tr -d '[:space:]')"
-  if [[ -z "$DB_OBJECT_COUNT" || ! "$DB_OBJECT_COUNT" =~ ^[0-9]+$ ]]; then
-    err "Could not inspect target database '${CFG_DB_NAME}'."
-    exit 1
-  fi
-else
-  DB_EXISTS=0
-  DB_OBJECT_COUNT=0
-fi
-
-if (( DB_OBJECT_COUNT > 0 )); then
-  err "Target database '${CFG_DB_NAME}' is NOT empty (${DB_OBJECT_COUNT} object(s) in non-system schemas)."
-  print_non_empty_manual_hint
+# Whole-instance PostgreSQL empty check using the candidate/backup superuser
+# credentials over TCP (rejects credential mismatches and non-superusers).
+set +e
+PG_SUPER_CHECK="$(compose_cmd exec -T -e PGPASSWORD="$CFG_DB_PASSWORD" postgres \
+  psql -h 127.0.0.1 -p 5432 -U "$CFG_DB_USER" -d template1 -v ON_ERROR_STOP=1 -Atqc \
+  "SELECT current_setting('is_superuser');" 2>&1)"
+PG_SUPER_RC=$?
+set -e
+if [[ "$PG_SUPER_RC" -ne 0 ]]; then
+  err "Failed to connect to target PostgreSQL instance as '${CFG_DB_USER}' using the superuser credentials from the target/backup .env:"
+  err "  ${PG_SUPER_CHECK}"
+  err "If this PostgreSQL volume was initialized with different credentials, follow ${MANUAL_OVERWRITE_REF} to reset it first."
   exit 1
 fi
-ok "Confirmed target database '${CFG_DB_NAME}' is empty."
+PG_SUPER_VAL="$(printf '%s' "$PG_SUPER_CHECK" | tr -d '[:space:]')"
+if [[ "$PG_SUPER_VAL" != "on" ]]; then
+  err "PostgreSQL user '${CFG_DB_USER}' is not a superuser (is_superuser='${PG_SUPER_VAL}'). Superuser credentials are required to inspect every database in the PostgreSQL instance."
+  exit 1
+fi
 
-if [[ "$SKIP_MINIO" -eq 0 && -f "${BACKUP_DIR}/minio-objects.tar.gz" ]]; then
+set +e
+PG_ALL_DBS_RAW="$(compose_cmd exec -T -e PGPASSWORD="$CFG_DB_PASSWORD" postgres \
+  psql -h 127.0.0.1 -p 5432 -U "$CFG_DB_USER" -d template1 -v ON_ERROR_STOP=1 -Atqc \
+  "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname NOT IN ('template0', 'template1') ORDER BY datname;" 2>&1)"
+PG_ALL_DBS_RC=$?
+set -e
+if [[ "$PG_ALL_DBS_RC" -ne 0 ]]; then
+  err "Failed to enumerate non-template databases from pg_database: ${PG_ALL_DBS_RAW}"
+  exit 1
+fi
+
+DB_EXISTS=0
+CHECKED_DBS=()
+PG_EMPTY_SQL="SELECT \
+  (SELECT COUNT(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+   WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+     AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'), \
+  (SELECT COUNT(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+   WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+     AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'), \
+  (SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+   WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+     AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%');"
+
+while IFS= read -r db_name; do
+  db_name="$(printf '%s' "$db_name" | tr -d '\r')"
+  [[ -z "$db_name" ]] && continue
+  CHECKED_DBS+=("$db_name")
+  if [[ "$db_name" == "$CFG_DB_NAME" ]]; then
+    DB_EXISTS=1
+  fi
+  set +e
+  db_counts_raw="$(compose_cmd exec -T -e PGPASSWORD="$CFG_DB_PASSWORD" postgres \
+    psql -h 127.0.0.1 -p 5432 -U "$CFG_DB_USER" -d "$db_name" -v ON_ERROR_STOP=1 -F $'\t' -Atqc \
+    "$PG_EMPTY_SQL" 2>&1)"
+  db_counts_rc=$?
+  set -e
+  if [[ "$db_counts_rc" -ne 0 ]]; then
+    err "Failed to connect to or inspect PostgreSQL database '${db_name}': ${db_counts_raw}"
+    exit 1
+  fi
+  db_counts_line="$(printf '%s' "$db_counts_raw" | tr -d '\r' | tail -n 1)"
+  IFS=$'\t' read -r rel_cnt proc_cnt type_cnt <<< "$db_counts_line"
+  if [[ ! "$rel_cnt" =~ ^[0-9]+$ || ! "$proc_cnt" =~ ^[0-9]+$ || ! "$type_cnt" =~ ^[0-9]+$ ]]; then
+    err "Could not parse user-object counts for PostgreSQL database '${db_name}' (got '${db_counts_line}')."
+    exit 1
+  fi
+  total_cnt=$(( rel_cnt + proc_cnt + type_cnt ))
+  if (( total_cnt > 0 )); then
+    err "Target PostgreSQL database '${db_name}' is NOT empty (${total_cnt} user object(s): relations=${rel_cnt}, functions=${proc_cnt}, types=${type_cnt})."
+    print_non_empty_manual_hint
+    exit 1
+  fi
+done <<< "$PG_ALL_DBS_RAW"
+
+if (( ${#CHECKED_DBS[@]} == 0 )); then
+  err "pg_database returned zero non-template databases; refusing restore."
+  exit 1
+fi
+ok "Confirmed entire PostgreSQL instance is empty across ${#CHECKED_DBS[@]} non-template database(s): ${CHECKED_DBS[*]}."
+
+if [[ "$SKIP_MINIO" -eq 0 && "$STORAGE_ANY_CONFIGURED" -eq 1 ]]; then
+  if [[ ! -f "${BACKUP_DIR}/minio-objects.tar.gz" ]]; then
+    err "Application has object storage configured, but backup is missing ${BACKUP_DIR}/minio-objects.tar.gz."
+    exit 1
+  fi
   if ! service_is_running minio; then
     compose_cmd up -d minio
   fi
@@ -763,7 +947,8 @@ print("EMPTY")
   ok "Confirmed target object storage is empty (no objects; only empty minio-init bucket allowed)."
 fi
 
-# Preflight passed: atomically write .env when restored from env.enc
+# Preflight passed: mark mutation boundary before atomically writing .env or data.
+MUTATION_STARTED=1
 if [[ "$ENV_FROM_BACKUP" -eq 1 ]]; then
   ENV_WRITE_TMP="$(mktemp "${WORK_DIR}/.env.tmp-XXXXXX")"
   cp "$CANDIDATE_ENV" "$ENV_WRITE_TMP"
@@ -789,7 +974,7 @@ fi
 compose_cmd up -d postgres redis minio
 
 # Step 4: Restore MinIO objects directly into original bucket name(s) with read-back verification
-if [[ "$SKIP_MINIO" -eq 0 && -f "${BACKUP_DIR}/minio-objects.tar.gz" ]]; then
+if [[ "$SKIP_MINIO" -eq 0 && "$STORAGE_ANY_CONFIGURED" -eq 1 && -f "${BACKUP_DIR}/minio-objects.tar.gz" ]]; then
   info "4/7 Restoring MinIO objects into original bucket(s) with read-back verification..."
 
   MINIO_RESTORE_PY='
@@ -1034,11 +1219,13 @@ fi
 # Step 5: Restore PostgreSQL directly into official database, run migrations, and verify DB object references
 info "5/7 Restoring PostgreSQL directly into '${CFG_DB_NAME}' and running migrations..."
 if [[ "$DB_EXISTS" -eq 0 ]]; then
-  compose_cmd exec -T postgres psql -U "$CFG_DB_USER" -d template1 -v ON_ERROR_STOP=1 \
+  compose_cmd exec -T -e PGPASSWORD="$CFG_DB_PASSWORD" postgres \
+    psql -h 127.0.0.1 -p 5432 -U "$CFG_DB_USER" -d template1 -v ON_ERROR_STOP=1 \
     -c "CREATE DATABASE \"${CFG_DB_NAME}\" OWNER \"${CFG_DB_USER}\";"
 fi
 
-compose_cmd exec -T postgres pg_restore \
+compose_cmd exec -T -e PGPASSWORD="$CFG_DB_PASSWORD" postgres pg_restore \
+  -h 127.0.0.1 -p 5432 \
   -U "$CFG_DB_USER" \
   -d "$CFG_DB_NAME" \
   --no-owner \
@@ -1050,19 +1237,21 @@ info "Running migrations against '${CFG_DB_NAME}'..."
 compose_cmd run --rm migrate
 ok "Database '${CFG_DB_NAME}' migrated to current heads."
 
-# Report any DB-referenced objects missing in MinIO (warning only; online backup consistency window)
-if [[ "$SKIP_MINIO" -eq 0 ]]; then
+# Verify every DB-referenced object exists in object storage; fail if any object is missing.
+if [[ "$SKIP_MINIO" -eq 0 && "$STORAGE_ANY_CONFIGURED" -eq 1 ]]; then
   DB_OBJ_REFS=""
-  has_chat_uploads="$(compose_cmd exec -T postgres psql -U "$CFG_DB_USER" -d "$CFG_DB_NAME" -Atqc \
-    "SELECT to_regclass('public.dalton_chat_file_uploads');" 2>/dev/null | tr -d '[:space:]' || true)"
+  has_chat_uploads="$(compose_cmd exec -T -e PGPASSWORD="$CFG_DB_PASSWORD" postgres \
+    psql -h 127.0.0.1 -p 5432 -U "$CFG_DB_USER" -d "$CFG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc \
+    "SELECT to_regclass('public.dalton_chat_file_uploads');" | tr -d '[:space:]')"
   if [[ -n "$has_chat_uploads" ]]; then
-    DB_OBJ_REFS="$(compose_cmd exec -T postgres psql -U "$CFG_DB_USER" -d "$CFG_DB_NAME" -Atqc "
+    DB_OBJ_REFS="$(compose_cmd exec -T -e PGPASSWORD="$CFG_DB_PASSWORD" postgres \
+      psql -h 127.0.0.1 -p 5432 -U "$CFG_DB_USER" -d "$CFG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "
       SELECT 'chat_upload' || E'\t' || upload_id || E'\t' || object_key
       FROM dalton_chat_file_uploads
       WHERE cleaned_at IS NULL
         AND state IN ('ready', 'completing', 'uploading')
         AND object_key IS NOT NULL AND object_key <> '';
-    " 2>/dev/null || true)"
+    ")"
   fi
   if [[ -n "$DB_OBJ_REFS" ]]; then
     MISSING_CHECK_PY='
@@ -1079,13 +1268,31 @@ def _env(primary: str, *fallbacks: str, default: str = "") -> str:
             return val
     return default
 
-endpoint = _env("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL", "STORAGE_ENDPOINT_URL", default="http://minio:9000").rstrip("/")
-bucket = _env("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME", "STORAGE_BUCKET_NAME", default="chat-uploads")
-prefix = _env("DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX", default="").strip("/")
-access_key = _env("DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID", "MINIO_ROOT_USER", "STORAGE_ACCESS_KEY_ID")
-secret_key = _env("DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY", "MINIO_ROOT_PASSWORD", "STORAGE_SECRET_ACCESS_KEY")
-region = _env("DALTON_CHAT_UPLOAD_STORAGE_REGION", "STORAGE_REGION", default="us-east-1")
-addressing_style = _env("DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE", "STORAGE_ADDRESSING_STYLE", default="path").lower()
+dedicated_ok = all(
+    (os.getenv(k) or "").strip()
+    for k in (
+        "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL",
+        "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME",
+        "DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID",
+        "DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY",
+    )
+)
+if dedicated_ok:
+    endpoint = _env("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL").rstrip("/")
+    bucket = _env("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME")
+    prefix = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX") or "").strip().strip("/")
+    access_key = _env("DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID")
+    secret_key = _env("DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY")
+    region = _env("DALTON_CHAT_UPLOAD_STORAGE_REGION", "DALTON_ASR_STORAGE_REGION", default="us-east-1")
+    addressing_style = _env("DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE", "DALTON_ASR_STORAGE_ADDRESSING_STYLE", default="path").lower()
+else:
+    endpoint = _env("DALTON_ASR_STORAGE_ENDPOINT_URL", "STORAGE_ENDPOINT_URL", default="http://minio:9000").rstrip("/")
+    bucket = _env("DALTON_ASR_STORAGE_BUCKET_NAME", "STORAGE_BUCKET_NAME", default="chat-uploads")
+    prefix = (os.getenv("DALTON_ASR_STORAGE_KEY_PREFIX") or "").strip().strip("/")
+    access_key = _env("DALTON_ASR_STORAGE_ACCESS_KEY_ID", "MINIO_ROOT_USER", "STORAGE_ACCESS_KEY_ID")
+    secret_key = _env("DALTON_ASR_STORAGE_SECRET_ACCESS_KEY", "MINIO_ROOT_PASSWORD", "STORAGE_SECRET_ACCESS_KEY")
+    region = _env("DALTON_ASR_STORAGE_REGION", "STORAGE_REGION", default="us-east-1")
+    addressing_style = _env("DALTON_ASR_STORAGE_ADDRESSING_STYLE", "STORAGE_ADDRESSING_STYLE", default="path").lower()
 
 client = boto3.client(
     "s3",
@@ -1121,14 +1328,19 @@ for line in sys.stdin:
         missing.append(f"{kind}:{ref_id} -> {bucket}/{full_key}")
 
 if missing:
-    print(f"[restore] WARN: {len(missing)}/{checked} DB-referenced object(s) missing from MinIO:", file=sys.stderr)
+    print(f"[restore] ERROR: {len(missing)}/{checked} DB-referenced object(s) missing from object storage:", file=sys.stderr)
     for item in missing:
-        print(f"[restore] WARN:   missing: {item}", file=sys.stderr)
+        print(f"[restore] ERROR:   missing: {item}", file=sys.stderr)
+    print(
+        "[restore] ERROR: Note on online backup consistency window: backup.sh snapshots PostgreSQL first and streams object storage immediately afterward; objects deleted or still in flight during that online backup window (or an inconsistent bucket/key prefix) can leave DB references missing from object storage.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 else:
     print(f"[restore] OK: All {checked} DB-referenced object(s) present in MinIO bucket {bucket!r}.")
 '
     printf '%s\n' "$DB_OBJ_REFS" | compose_cmd run --rm -T --no-deps minio-init \
-      uv run --no-sync python -c "$MISSING_CHECK_PY" || warn "Could not complete DB-to-MinIO reference check."
+      uv run --no-sync python -c "$MISSING_CHECK_PY"
   else
     ok "No active DB object references to verify."
   fi
@@ -1169,7 +1381,7 @@ for _ in $(seq 1 60); do
 done
 if [[ "$backend_healthy" -ne 1 ]]; then
   err "Backend did not pass /health within 120s."
-  err "Inspect logs with: $(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" logs --tail=100 backend)"
+  err "Inspect logs with: $(fmt_cmd docker compose -p "$COMPOSE_PROJECT" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" logs --tail=100 backend)"
   exit 1
 fi
 ok "Backend /health passed."
@@ -1254,9 +1466,11 @@ if [[ "$edge_ok" -ne 1 ]]; then
 fi
 ok "Edge gateway probe passed (mode=${CFG_TLS_MODE})."
 
-RESTORED_UP="$(compose_cmd exec -T postgres psql -U "$CFG_DB_USER" -d "$CFG_DB_NAME" -Atqc "SELECT version_num FROM alembic_version;" | tr -d '\r\n')"
-RESTORED_DA="$(compose_cmd exec -T postgres psql -U "$CFG_DB_USER" -d "$CFG_DB_NAME" -Atqc "SELECT version_num FROM alembic_version_dalton;" | tr -d '\r\n')"
+RESTORED_UP="$(compose_cmd exec -T -e PGPASSWORD="$CFG_DB_PASSWORD" postgres psql -h 127.0.0.1 -p 5432 -U "$CFG_DB_USER" -d "$CFG_DB_NAME" -Atqc "SELECT version_num FROM alembic_version ORDER BY version_num;" | tr -d '\r\n')"
+RESTORED_DA="$(compose_cmd exec -T -e PGPASSWORD="$CFG_DB_PASSWORD" postgres psql -h 127.0.0.1 -p 5432 -U "$CFG_DB_USER" -d "$CFG_DB_NAME" -Atqc "SELECT version_num FROM alembic_version_dalton ORDER BY version_num;" | tr -d '\r\n')"
 ok "Migrations verified at head (upstream=${RESTORED_UP}, dalton=${RESTORED_DA})."
+
+RESTORE_SUCCEEDED=1
 
 printf "\n== Restore Complete ==\n"
 printf "  Restored from    : %s\n" "$BACKUP_DIR"
@@ -1264,5 +1478,5 @@ printf "  Database         : %s (upstream=%s, dalton=%s)\n" "$CFG_DB_NAME" "$RES
 printf "  Active bucket    : %s\n" "$CFG_CHAT_BUCKET"
 printf "  Edge TLS mode    : %s\n" "$CFG_TLS_MODE"
 printf "\n  Next steps:\n"
-printf "  - Verify service status: %s\n" "$(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" ps)"
+printf "  - Verify service status: %s\n" "$(fmt_cmd docker compose -p "$COMPOSE_PROJECT" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" ps)"
 printf "  - Open the web UI and confirm your workspaces, threads, and uploaded files are visible.\n"

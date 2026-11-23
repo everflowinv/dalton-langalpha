@@ -1203,6 +1203,7 @@ def _prepare_clean_restore_dir(src_work_dir: Path, dst_dir: Path) -> None:
         "docker-compose.yml",
         "docker-compose.core.yml",
         "Dockerfile.sandbox",
+        "agent_config.yaml",
         "agent_config.core.yaml",
         "config.core.yaml",
     ):
@@ -1512,6 +1513,8 @@ def check_restore_on_clean_stack(
         restore_compose_cmd = [
             "docker",
             "compose",
+            "-p",
+            restore_project,
             "--project-directory",
             str(restore_dir),
             "-f",
@@ -1636,9 +1639,12 @@ def check_restore_on_clean_stack(
                 assert guard_proc.returncode != 0, (
                     "restore.sh MUST refuse to restore into a non-empty instance!"
                 )
-                guard_output = (guard_proc.stdout or "") + "\n" + (guard_proc.stderr or "")
-                assert "STANDALONE-DEPLOY.md" in guard_output and "down -v" in guard_output, (
-                    f"Non-empty refusal should point to manual steps in STANDALONE-DEPLOY.md (down -v), got:\n{guard_output[-800:]}"
+                guard_stderr = guard_proc.stderr or ""
+                assert "NOT empty" in guard_stderr, (
+                    f"Non-empty refusal stderr must contain refusal reason, got:\n{guard_stderr[-800:]}"
+                )
+                assert "STANDALONE-DEPLOY.md" in guard_stderr and "down -v" in guard_stderr, (
+                    f"Non-empty refusal stderr should point to manual steps in STANDALONE-DEPLOY.md (down -v), got:\n{guard_stderr[-800:]}"
                 )
                 still_live = _https_request(
                     "GET", "localhost", restore_https_port, "/api/v1/auth/cli", context=ssl_ctx
@@ -1652,10 +1658,10 @@ def check_restore_on_clean_stack(
                 assert still_ws.status == 200, (
                     f"Restored instance /workspaces failed after refused restore: HTTP {still_ws.status}"
                 )
-                log("5b OK (non-empty instance refused with manual link and remained live).")
+                log("5b OK (non-empty instance refused with manual link on stderr and remained live).")
 
-                # 5c. Follow manual §6.2 steps: mutate live data, inspect project container volumes,
-                #     run `docker compose down -v`, and re-run restore.sh (with --replace-env) cleanly.
+                # 5c. Follow manual §6.2 steps: mutate live data, inspect full project volume list
+                #     via `docker volume ls --filter label=com.docker.compose.project=...`, and run `down -v`.
                 extra_ws = _https_request(
                     "POST",
                     "localhost",
@@ -1670,18 +1676,229 @@ def check_restore_on_clean_stack(
                     restore_compose_cmd, restore_dir, env=restore_env
                 )
                 assert project_vols, "Expected project containers to report mounted Docker volumes"
-                assert all(v.startswith(f"{restore_project}_") for v in project_vols), (
-                    f"Unexpected volume names outside project {restore_project!r}: {project_vols}"
+                labeled_vols = sorted(
+                    v.strip()
+                    for v in subprocess.check_output(
+                        [
+                            "docker",
+                            "volume",
+                            "ls",
+                            "-q",
+                            "--filter",
+                            f"label=com.docker.compose.project={restore_project}",
+                        ],
+                        text=True,
+                        timeout=30,
+                    ).splitlines()
+                    if v.strip()
+                )
+                assert set(project_vols).issubset(set(labeled_vols)), (
+                    f"Project volume label filter missed mounted volumes: mounted={project_vols}, labeled={labeled_vols}"
+                )
+                assert all(v.startswith(f"{restore_project}_") for v in labeled_vols), (
+                    f"Unexpected volume names outside project {restore_project!r}: {labeled_vols}"
                 )
 
                 _run_cmd(
-                    [*restore_compose_cmd, "down", "-v"],
+                    [*restore_compose_cmd, "--env-file", str(restored_env_file), "down", "-v"],
                     cwd=restore_dir,
                     env=restore_env,
                     redact_env=ctx.env,
                     timeout=120,
                 )
 
+                # 5d. Bucket name mismatch guard: changing the chat upload bucket in target .env
+                #     must cause restore.sh to refuse BEFORE writing any data.
+                saved_env_text = restored_env_file.read_text(encoding="utf-8")
+                mismatched_env_text = _rewrite_env_keys(
+                    saved_env_text,
+                    {"DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME": "mismatched-bucket-b6-ci"},
+                )
+                restored_env_file.write_text(mismatched_env_text, encoding="utf-8")
+                os.chmod(restored_env_file, 0o600)
+                try:
+                    bucket_mismatch_proc = _run_cmd(
+                        [
+                            "bash",
+                            str(restore_dir / "scripts" / "standalone" / "restore.sh"),
+                            "--backup-dir",
+                            str(restore_backup_dir),
+                            "--work-dir",
+                            str(restore_dir),
+                            "--compose-files",
+                            restore_compose_files,
+                            "--skip-edge-build",
+                        ],
+                        cwd=restore_dir,
+                        env=restore_sh_env,
+                        check=False,
+                        redact_env=ctx.env,
+                        timeout=120,
+                    )
+                    assert bucket_mismatch_proc.returncode != 0, (
+                        "restore.sh MUST refuse when target .env bucket name mismatches backup manifest!"
+                    )
+                    bm_stderr = bucket_mismatch_proc.stderr or ""
+                    assert "bucket" in bm_stderr.lower() and "--replace-env" in bm_stderr, (
+                        f"Bucket mismatch refusal should explain mismatch and mention --replace-env, got:\n{bm_stderr[-800:]}"
+                    )
+                finally:
+                    restored_env_file.write_text(saved_env_text, encoding="utf-8")
+                    os.chmod(restored_env_file, 0o600)
+                log("5d OK (bucket name mismatch in target .env refused before writing data).")
+
+                # 5e. Whole-instance PostgreSQL empty guard: when target DB_NAME is empty,
+                #     another non-empty database in the same PostgreSQL instance MUST still
+                #     cause restore.sh to refuse and leave that database untouched.
+                _run_cmd(
+                    [*restore_compose_cmd, "--env-file", str(restored_env_file), "up", "-d", "postgres"],
+                    cwd=restore_dir,
+                    env=restore_env,
+                    redact_env=ctx.env,
+                    timeout=120,
+                )
+                pg_ready_other = False
+                for _ in range(45):
+                    r_ready = subprocess.run(
+                        [
+                            *restore_compose_cmd,
+                            "--env-file",
+                            str(restored_env_file),
+                            "exec",
+                            "-T",
+                            "postgres",
+                            "pg_isready",
+                            "-h",
+                            "127.0.0.1",
+                            "-p",
+                            "5432",
+                            "-U",
+                            ctx.db_user,
+                            "-d",
+                            "template1",
+                            "-q",
+                        ],
+                        cwd=str(restore_dir),
+                        env=restore_env,
+                        capture_output=True,
+                        check=False,
+                        timeout=15,
+                    )
+                    if r_ready.returncode == 0:
+                        pg_ready_other = True
+                        break
+                    time.sleep(2)
+                assert pg_ready_other, "Postgres in isolated restore stack did not become ready for other-DB guard check"
+
+                other_db = "other_app_db"
+                _run_cmd(
+                    [
+                        *restore_compose_cmd,
+                        "--env-file",
+                        str(restored_env_file),
+                        "exec",
+                        "-T",
+                        "postgres",
+                        "psql",
+                        "-U",
+                        ctx.db_user,
+                        "-d",
+                        "template1",
+                        "-v",
+                        "ON_ERROR_STOP=1",
+                        "-c",
+                        f'CREATE DATABASE "{other_db}";',
+                    ],
+                    cwd=restore_dir,
+                    env=restore_env,
+                    redact_env=ctx.env,
+                    timeout=30,
+                )
+                _run_cmd(
+                    [
+                        *restore_compose_cmd,
+                        "--env-file",
+                        str(restored_env_file),
+                        "exec",
+                        "-T",
+                        "postgres",
+                        "psql",
+                        "-U",
+                        ctx.db_user,
+                        "-d",
+                        other_db,
+                        "-v",
+                        "ON_ERROR_STOP=1",
+                        "-c",
+                        "CREATE TABLE keep_me(id int); INSERT INTO keep_me VALUES (42);",
+                    ],
+                    cwd=restore_dir,
+                    env=restore_env,
+                    redact_env=ctx.env,
+                    timeout=30,
+                )
+
+                other_db_proc = _run_cmd(
+                    [
+                        "bash",
+                        str(restore_dir / "scripts" / "standalone" / "restore.sh"),
+                        "--backup-dir",
+                        str(restore_backup_dir),
+                        "--work-dir",
+                        str(restore_dir),
+                        "--compose-files",
+                        restore_compose_files,
+                        "--env-passphrase-file",
+                        str(passphrase_file),
+                        "--replace-env",
+                        "--skip-edge-build",
+                    ],
+                    cwd=restore_dir,
+                    env=restore_sh_env,
+                    check=False,
+                    redact_env=ctx.env,
+                    timeout=120,
+                )
+                assert other_db_proc.returncode != 0, (
+                    "restore.sh MUST refuse when another database in the same PostgreSQL instance has data!"
+                )
+                odb_stderr = other_db_proc.stderr or ""
+                assert other_db in odb_stderr and "STANDALONE-DEPLOY.md" in odb_stderr and "down -v" in odb_stderr, (
+                    f"Other-DB refusal stderr should name {other_db!r} and point to STANDALONE-DEPLOY.md (down -v), got:\n{odb_stderr[-800:]}"
+                )
+                kept_val = subprocess.check_output(
+                    [
+                        *restore_compose_cmd,
+                        "--env-file",
+                        str(restored_env_file),
+                        "exec",
+                        "-T",
+                        "postgres",
+                        "psql",
+                        "-U",
+                        ctx.db_user,
+                        "-d",
+                        other_db,
+                        "-Atqc",
+                        "SELECT id FROM keep_me;",
+                    ],
+                    cwd=str(restore_dir),
+                    env=restore_env,
+                    text=True,
+                    timeout=30,
+                ).strip()
+                assert kept_val == "42", f"Refused restore modified {other_db}: got {kept_val!r}"
+
+                _run_cmd(
+                    [*restore_compose_cmd, "--env-file", str(restored_env_file), "down", "-v"],
+                    cwd=restore_dir,
+                    env=restore_env,
+                    redact_env=ctx.env,
+                    timeout=120,
+                )
+                log("5e OK (another non-empty database in the same PostgreSQL instance refused restore and stayed intact).")
+
+                # 5f. Re-run restore.sh (with --replace-env) cleanly into the empty instance.
                 _run_cmd(
                     [
                         "bash",
@@ -1726,7 +1943,7 @@ def check_restore_on_clean_stack(
                     orig_minio_count,
                     sentinel,
                 )
-                log("5c OK (manual down -v followed by restore.sh succeeded with identical data).")
+                log("5f OK (manual down -v followed by restore.sh succeeded with identical data).")
             finally:
                 restored_ca_path.unlink(missing_ok=True)
         finally:
