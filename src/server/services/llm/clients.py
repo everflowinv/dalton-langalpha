@@ -177,7 +177,14 @@ async def _custom_provider_model(
     }
 
 
-async def _egress_kwargs(model_name: str, base_url: str | None, params: dict | None = None) -> dict:
+async def _egress_kwargs(
+    model_name: str,
+    base_url: str | None,
+    params: dict | None = None,
+    *,
+    user_id: str | None = None,
+    team_base_url: bool = False,
+) -> dict:
     """``egress_transport=`` for a client on the user's own key that goes where
     the user pointed it, in platform mode.
 
@@ -191,7 +198,16 @@ async def _egress_kwargs(model_name: str, base_url: str | None, params: dict | N
 
     if not egress.enforced():
         return {}
-    urls = egress.user_endpoints(base_url, params)
+    # DALTON-HOOK(standalone-core): exempt admin-configured team models in core local auth
+    from src.dalton.llm.egress_policy import (
+        is_admin_llm_egress_exempt,
+        is_team_shared_base_url_exempt,
+    )
+
+    if await is_admin_llm_egress_exempt(user_id):
+        return {}
+    effective_base_url = None if (team_base_url and is_team_shared_base_url_exempt()) else base_url
+    urls = egress.user_endpoints(effective_base_url, params)
     await egress.refuse_model_endpoints(model_name, urls, params)
     if not urls and not egress.connection_params(params):
         return {}
@@ -403,7 +419,14 @@ async def resolve_byok_llm_client(
             cache_key=cache_key,
             reasoning_effort=reasoning_effort,
             **_tier_kwargs(service_tier, route.provider),
-            **await _egress_kwargs(model_name, route.base_url, route.custom_config.get("parameters")),
+            # DALTON-HOOK(standalone-core): team-shared base_url is admin-configured; still enforce member params
+            **await _egress_kwargs(
+                model_name,
+                route.base_url,
+                route.custom_config.get("parameters"),
+                user_id=user_id,
+                team_base_url=True,
+            ),
         )
 
     logger.debug(
@@ -418,7 +441,10 @@ async def resolve_byok_llm_client(
         reasoning_effort=reasoning_effort,
         cache_key=cache_key,
         **_tier_kwargs(service_tier, route.provider),
-        **await _egress_kwargs(model_name, route.base_url),
+        # DALTON-HOOK(standalone-core): team-shared base_url is admin-configured
+        **await _egress_kwargs(
+            model_name, route.base_url, user_id=user_id, team_base_url=True
+        ),
     )
 
 

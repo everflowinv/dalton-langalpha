@@ -282,8 +282,15 @@ async def available_models(user_id: str, provider: str, *, refresh: bool = False
     catalog_read = asyncio.create_task(_gateway_catalog(info))
     try:
         # A list on a base URL the user saved goes out as a key test does.
+        # DALTON-HOOK(standalone-core): admin-managed team credential base_url is exempt in core local auth
+        from src.dalton.llm.egress_policy import is_team_shared_base_url_exempt
+
         try:
-            transport = await egress.user_endpoint_transport(cred.base_url)
+            transport = (
+                None
+                if is_team_shared_base_url_exempt()
+                else await egress.user_endpoint_transport(cred.base_url)
+            )
         except egress.EndpointRefused as e:
             raise ListFetchError(ENDPOINT_REFUSED) from e
         models = normalize(req.shape, await fetch_list(req, transport=transport))

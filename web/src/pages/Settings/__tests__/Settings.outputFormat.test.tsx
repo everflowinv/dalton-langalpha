@@ -42,6 +42,10 @@ vi.mock('@/config/daltonAuth', () => ({
   get isDaltonAuth() {
     return h.daltonAuth;
   },
+  isDaltonLocalAuth: false,
+  get isDaltonSupabaseAuth() {
+    return h.daltonAuth;
+  },
 }));
 
 // DALTON-HOOK(hide-experiments): stub useFeatures so ExperimentsTab renders without network

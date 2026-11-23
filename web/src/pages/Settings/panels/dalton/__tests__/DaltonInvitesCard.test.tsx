@@ -20,6 +20,8 @@ const h = vi.hoisted(() => ({
 
 vi.mock('@/config/daltonAuth', () => ({
   isDaltonAuth: true,
+  isDaltonLocalAuth: false,
+  isDaltonSupabaseAuth: true,
 }));
 
 vi.mock('@/hooks/useTeamCredentials', () => ({

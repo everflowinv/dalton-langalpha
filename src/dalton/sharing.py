@@ -34,6 +34,8 @@ from src.dalton.settings import (
     get_dalton_allowed_emails,
     get_dalton_settings,
     is_colleague_dispatch_enabled,
+    is_dalton_auth_enabled,
+    is_dalton_local_auth_enabled,
     is_dalton_supabase_auth_enabled,
 )
 from src.server.database import conversation as conv_db
@@ -90,11 +92,11 @@ class OwnerTierUnavailable(HTTPException):
 
 
 def _classify_owner_row_tier(owner_id: str | None, owner_email: Any) -> str:
-    """Classify a workspace owner from the row's joined email, with exactly the
-    ``classify_owner_tier`` rules (PM -> admin, allowlisted email -> internal,
-    everything else -> external); a missing email or any failing roster read
-    is ``unknown`` so list loops skip the row instead of applying an isolation
-    rule to a guess."""
+    """Classify a workspace owner from the row's joined email (or ``dalton_user_roles`` in ``local`` mode)."""
+    if is_dalton_local_auth_enabled():
+        from src.dalton.access_tiers import classify_owner_tier_sync
+
+        return classify_owner_tier_sync(owner_id, owner_email)
     uid = str(owner_id or "").strip()
     if not uid:
         return "unknown"
@@ -103,14 +105,16 @@ def _classify_owner_row_tier(owner_id: str | None, owner_email: Any) -> str:
     try:
         if is_invite_pm(uid):
             return "admin"
-        email = str(owner_email or "").strip().lower()
-        if not email:
-            return "unknown"
+    except Exception:
+        return "unknown"
+    email = str(owner_email or "").strip().lower()
+    if not email:
+        return "unknown"
+    try:
         if email in get_dalton_allowed_emails():
             return "internal"
         return "external"
     except Exception:
-        # A single unclassifiable row must not fail the whole listing.
         return "unknown"
 
 
@@ -153,8 +157,9 @@ def can_edit_workspace_sharing(
         return False
     if owner_id and uid == owner_id:
         return True
-    pm_ids = get_dalton_settings().pm_user_ids
-    return uid in pm_ids
+    from src.dalton.access_tiers import is_admin_user_sync
+
+    return is_admin_user_sync(uid, include_config_defaults=True)
 
 
 async def get_workspace_sharing(
@@ -767,15 +772,23 @@ async def resolve_turn_team_memory_enabled(
 
 
 async def require_team_reader(user_id: str | None) -> str:
-    """Verify caller is authenticated and in DALTON_ALLOWED_EMAILS when Dalton auth is on.
+    """Verify caller is authenticated and a team member when Dalton multi-user auth is on.
 
     Raises:
         HTTPException(401): Missing or empty user_id.
-        HTTPException(403): Caller is not in DALTON_ALLOWED_EMAILS.
+        HTTPException(403): Caller is not a team member (``dalton_user_roles`` in ``local`` mode,
+            ``DALTON_ALLOWED_EMAILS ∪ dalton_members`` in ``supabase`` mode).
     """
     uid = (user_id or "").strip()
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
+
+    if is_dalton_local_auth_enabled():
+        from src.dalton.access_tiers import is_team_member_user
+
+        if await is_team_member_user(uid):
+            return uid
+        raise HTTPException(status_code=403, detail="Forbidden")
 
     if not is_dalton_supabase_auth_enabled():
         return uid
@@ -873,7 +886,7 @@ async def require_workspace_access(
     if not ws:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    if not is_dalton_supabase_auth_enabled():
+    if not is_dalton_auth_enabled():
         auth_api.require_workspace_owner(ws, user_id=uid)
         ws["_caller_web_access"] = "owner"
         ws["_caller_cos_access"] = "owner"
@@ -1001,7 +1014,7 @@ async def require_thread_access(
         raise ValueError(f"Unsupported need: {need!r}")
     cleaned_channel = str(channel or "web").strip().lower()
 
-    if not is_dalton_supabase_auth_enabled():
+    if not is_dalton_auth_enabled():
         if owner_id is not None:
             if owner_id != uid:
                 raise HTTPException(status_code=403, detail="Forbidden")
@@ -1625,7 +1638,7 @@ async def is_wakeup_notice_revoked(
     conn: Any = None,
 ) -> bool:
     """Return True when ``wakeup_id`` belongs to a colleague thread whose origin channel write access has been revoked."""
-    if not is_dalton_supabase_auth_enabled():
+    if not is_dalton_auth_enabled():
         return False
     tid = str(thread_id or "").strip()
     wid = str(wakeup_id or "").strip()
@@ -2099,7 +2112,7 @@ resolve_verified_tail_turn = verify_server_tail_turn
 # DALTON-HOOK(coverage-units): accept optional snapshot connection for REPEATABLE READ readers.
 async def list_team_workspaces(current_user_id: str, *, conn: Any = None) -> list[dict[str, Any]]:
     """Return colleagues' visible web workspaces grouped by user, excluding caller's own, Home, and hidden workspaces."""
-    if not is_dalton_supabase_auth_enabled():
+    if not is_dalton_auth_enabled():
         return []
 
     uid = await require_team_reader(current_user_id)
@@ -2286,7 +2299,7 @@ async def list_colleague_cos_workspaces(
     current_user_id: str,
 ) -> list[dict[str, Any]]:
     """Return colleagues' Chief of Staff visible workspaces (``cos_access`` in ``('ro', 'rw')``)."""
-    if not is_dalton_supabase_auth_enabled():
+    if not is_dalton_auth_enabled():
         return []
 
     try:

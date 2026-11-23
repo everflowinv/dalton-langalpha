@@ -91,6 +91,10 @@ vi.mock('@/config/daltonAuth', () => ({
   get isDaltonAuth() {
     return daltonAuthState.isDaltonAuth;
   },
+  isDaltonLocalAuth: false,
+  get isDaltonSupabaseAuth() {
+    return daltonAuthState.isDaltonAuth;
+  },
 }));
 
 // Dynamic import so mocks and env stubs are applied first

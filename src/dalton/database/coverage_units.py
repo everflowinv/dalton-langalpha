@@ -694,7 +694,7 @@ async def insert_coverage_unit(
     first, verifies write permission / non-Home / non-historical-duplicate, and
     sets ``lead_analyst_user_id = owner_user_id = target_ws.user_id``.
     """
-    from src.dalton.invites import is_invite_pm
+    from src.dalton.access_tiers import is_admin_user
     from src.dalton.settings import is_coverage_units_enabled
 
     eff_ticker_key = (
@@ -706,7 +706,7 @@ async def insert_coverage_unit(
     eff_lead = str(lead_analyst_user_id or actor_uid).strip()
     eff_owner = eff_lead
     target_ws = str(workspace_id).strip() if workspace_id else None
-    is_pm = is_invite_pm(actor_uid)
+    is_pm = await is_admin_user(actor_uid, conn=conn)
 
     async def _run_in_tx(c: Any) -> dict[str, Any]:
         nonlocal eff_lead, eff_owner
@@ -827,12 +827,12 @@ async def set_coverage_unit_status(
     previous_out: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Set `status` on a unit (archive/reactivate) after checking workspace write or lead/PM."""
-    from src.dalton.invites import is_invite_pm
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.access_tiers import is_admin_user
+    from src.dalton.settings import is_dalton_auth_enabled
 
     actor_uid = str(owner_user_id or "").strip()
-    is_pm = is_invite_pm(actor_uid)
-    eff_pm = is_pm and is_dalton_supabase_auth_enabled()
+    is_pm = await is_admin_user(actor_uid, conn=conn)
+    eff_pm = is_pm and is_dalton_auth_enabled()
 
     async def _run_in_tx(c: Any) -> dict[str, Any] | None:
         if status == "archived":
@@ -976,13 +976,13 @@ async def bind_coverage_unit_workspace(
     Lock order: unit row ``FOR UPDATE`` -> sorted ``{old_ws, target_ws} FOR UPDATE``
     -> sorted sector advisory locks. Rebinding to a different workspace is refused (409).
     """
-    from src.dalton.invites import is_invite_pm
-    from src.dalton.settings import is_coverage_units_enabled, is_dalton_supabase_auth_enabled
+    from src.dalton.access_tiers import is_admin_user
+    from src.dalton.settings import is_coverage_units_enabled, is_dalton_auth_enabled
 
     actor_uid = str(owner_user_id or "").strip()
     target_req = _norm_uuid(workspace_id)
-    is_pm = is_invite_pm(actor_uid)
-    eff_pm = is_pm and is_dalton_supabase_auth_enabled()
+    is_pm = await is_admin_user(actor_uid, conn=conn)
+    eff_pm = is_pm and is_dalton_auth_enabled()
 
     async def _run_in_tx(c: Any) -> dict[str, Any]:
         async with c.cursor(row_factory=dict_row) as cur:
@@ -1134,12 +1134,12 @@ async def unbind_coverage_unit_workspace(
     previous_out: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Clear a unit's workspace binding after checking workspace write or lead/PM and zero active tracking."""
-    from src.dalton.invites import is_invite_pm
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.access_tiers import is_admin_user
+    from src.dalton.settings import is_dalton_auth_enabled
 
     actor_uid = str(owner_user_id or "").strip()
-    is_pm = is_invite_pm(actor_uid)
-    eff_pm = is_pm and is_dalton_supabase_auth_enabled()
+    is_pm = await is_admin_user(actor_uid, conn=conn)
+    eff_pm = is_pm and is_dalton_auth_enabled()
 
     async def _run_in_tx(c: Any) -> dict[str, Any] | None:
         await _precheck_blocking_before_unit_lock(

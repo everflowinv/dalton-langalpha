@@ -861,6 +861,17 @@ def is_dalton_supabase_auth_enabled() -> bool:
     return app_settings.HOST_MODE == "oss" and get_dalton_auth_mode() == "supabase"
 
 
+def is_dalton_auth_enabled() -> bool:
+    """Whether Dalton multi-user authentication (``supabase`` or ``local``) is active in OSS mode."""
+    return is_dalton_supabase_auth_enabled() or is_dalton_local_auth_enabled()
+
+
+def get_dalton_operator_llm_endpoints() -> tuple[str, ...]:
+    """Return operator-allowlisted LLM base URLs from ``DALTON_OPERATOR_LLM_ENDPOINTS`` (comma-separated)."""
+    raw = os.getenv("DALTON_OPERATOR_LLM_ENDPOINTS", "")
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
 def get_disabled_providers() -> set[str]:
     """Return disabled provider IDs from `DALTON_DISABLED_PROVIDERS` or `dalton.yaml` (L17, P0N.8)."""
     env_raw = os.getenv("DALTON_DISABLED_PROVIDERS")

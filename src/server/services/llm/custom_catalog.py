@@ -226,7 +226,12 @@ def validate_custom_models(
                 ) from exc
 
 
-async def refuse_custom_model_endpoints(custom_models: list, stored: list | None = None) -> None:
+async def refuse_custom_model_endpoints(
+    custom_models: list,
+    stored: list | None = None,
+    *,
+    user_id: str | None = None,
+) -> None:
     """Refuse a subscription's model that sets an endpoint or connection, its
     token being for its own provider only, and, in platform mode, a custom
     model whose parameters point its client somewhere the server must not
@@ -257,6 +262,11 @@ async def refuse_custom_model_endpoints(custom_models: list, stored: list | None
                 detail=f"custom_models[{idx}]: a subscription's model cannot set an endpoint or connection.",
             )
     if not egress.enforced():
+        return
+    # DALTON-HOOK(standalone-core): exempt administrator-configured team models in core local auth
+    from src.dalton.llm.egress_policy import is_admin_llm_egress_exempt
+
+    if await is_admin_llm_egress_exempt(user_id):
         return
     to_check: list[tuple[int, str]] = []
     for idx, cm in changed:

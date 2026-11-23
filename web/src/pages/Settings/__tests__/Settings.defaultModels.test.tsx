@@ -199,6 +199,10 @@ vi.mock('@/config/daltonAuth', () => ({
   get isDaltonAuth() {
     return h.daltonAuth;
   },
+  isDaltonLocalAuth: false,
+  get isDaltonSupabaseAuth() {
+    return h.daltonAuth;
+  },
 }));
 
 // DALTON-HOOK(team-credentials): the model-access panel reads the shared-credential hint

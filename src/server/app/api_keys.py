@@ -261,11 +261,18 @@ class UpdateApiKeysRequest(BaseModel):
         return v
 
 
-async def _refuse_base_urls(base_urls: Dict[str, Optional[str]]) -> None:
+async def _refuse_base_urls(
+    base_urls: Dict[str, Optional[str]], *, user_id: str | None = None
+) -> None:
     """Refuse, in platform mode, a base URL the server must not dial."""
     from src.server.services.llm import egress
 
     if not egress.enforced():
+        return
+    # DALTON-HOOK(standalone-core): exempt administrator-configured team model endpoints in core local auth
+    from src.dalton.llm.egress_policy import is_admin_llm_egress_exempt
+
+    if await is_admin_llm_egress_exempt(user_id):
         return
     reasons = await egress.save_refusals(base_urls.values())
     for provider, url in base_urls.items():
@@ -335,7 +342,8 @@ async def update_api_keys(body: UpdateApiKeysRequest, user_id: CurrentUserId):
                 detail=f"Unsupported provider: {provider}.",
             )
     if body.base_urls:
-        await _refuse_base_urls(body.base_urls)
+        # DALTON-HOOK(standalone-core): pass caller user_id so admin team-model saves bypass member egress block
+        await _refuse_base_urls(body.base_urls, user_id=user_id)
 
     # All or nothing, so a failed write leaves the keys as they were.
     redirected: list[str] = []
@@ -446,11 +454,18 @@ class TestApiKeyRequest(BaseModel):
         return key_probe.probe_url(v)
 
 
-async def _user_endpoint_transport(base_url: str | None):
+async def _user_endpoint_transport(
+    base_url: str | None, *, user_id: str | None = None
+):
     """The transport a request to a user's endpoint goes out on; a URL the
     egress policy refuses is a 400."""
     from src.server.services.llm import egress
 
+    # DALTON-HOOK(standalone-core): exempt administrator team-model probes/discovery in core local auth
+    from src.dalton.llm.egress_policy import is_admin_llm_egress_exempt
+
+    if await is_admin_llm_egress_exempt(user_id):
+        return None
     try:
         return await egress.user_endpoint_transport(base_url)
     except EndpointRefused as e:
@@ -492,7 +507,10 @@ async def test_api_key(body: TestApiKeyRequest, user_id: CurrentUserId):
     if not provider_info:
         provider_info = mc.get_provider_info(custom["parent_provider"])
 
-    transport = await _user_endpoint_transport(body.base_url or provider_info.get("base_url"))
+    # DALTON-HOOK(standalone-core): pass caller user_id for admin team-model egress exemption
+    transport = await _user_endpoint_transport(
+        body.base_url or provider_info.get("base_url"), user_id=user_id
+    )
     try:
         return await key_probe.check_key(
             body.provider, provider_info, body.api_key, body.base_url, transport=transport
@@ -546,7 +564,8 @@ async def list_provider_models(provider: str, user_id: CurrentUserId):
     if not base_url:
         raise HTTPException(status_code=400, detail="No base URL configured for provider")
 
-    transport = await _user_endpoint_transport(base_url)
+    # DALTON-HOOK(standalone-core): pass caller user_id for admin team-model egress exemption
+    transport = await _user_endpoint_transport(base_url, user_id=user_id)
 
     # Minimal auth — local providers generally don't require it
     api_key = None
@@ -659,7 +678,8 @@ async def list_endpoint_models(body: EndpointModelsRequest, user_id: CurrentUser
             headers={"Retry-After": "60"},
         )
 
-    transport = await _user_endpoint_transport(body.base_url)
+    # DALTON-HOOK(standalone-core): pass caller user_id for admin team-model egress exemption
+    transport = await _user_endpoint_transport(body.base_url, user_id=user_id)
     return await pm.endpoint_models(body.api_format, body.base_url, body.api_key, transport=transport)
 
 

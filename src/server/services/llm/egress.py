@@ -107,7 +107,12 @@ _SETTINGS_LINK = {"url": "/settings?tab=model", "label": "Open Settings"}
 def enforced() -> bool:
     from src.config import settings
 
-    return settings.HOST_MODE == "platform"
+    if settings.HOST_MODE == "platform":
+        return True
+    # DALTON-HOOK(standalone-core): enforce LLM egress checks in standalone core multi-user mode
+    from src.dalton.llm.egress_policy import is_core_llm_egress_enforced
+
+    return is_core_llm_egress_enforced()
 
 
 def is_operator_endpoint(url: str) -> bool:
@@ -118,6 +123,11 @@ def is_operator_endpoint(url: str) -> bool:
     host, and platform routes because no user key is ever meant for them, so a
     user naming either gets the same check as any other URL.
     """
+    # DALTON-HOOK(standalone-core): allowlist deployer-configured LLM endpoints via DALTON_OPERATOR_LLM_ENDPOINTS
+    from src.dalton.llm.egress_policy import is_operator_allowlisted_endpoint
+
+    if is_operator_allowlisted_endpoint(url):
+        return True
     from src.llms.llm import LLM
 
     return any(

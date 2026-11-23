@@ -26,11 +26,30 @@ from src.dalton.database.coverage_units import (
     load_active_units_by_workspace,
 )
 from src.dalton.invites import is_invite_pm
-from src.dalton.settings import is_dalton_supabase_auth_enabled
+from src.dalton.settings import (
+    is_dalton_local_auth_enabled,
+    is_dalton_supabase_auth_enabled,
+)
 from src.server.database.home_workspace import is_reserved_row
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
+
+
+def _is_multiuser_auth_enabled() -> bool:
+    """Return True when Dalton multi-user auth (``local`` or ``supabase``) is enabled."""
+    return is_dalton_local_auth_enabled() or is_dalton_supabase_auth_enabled()
+
+
+async def _is_coverage_pm(user_id: str | None) -> bool:
+    """Return True when ``user_id`` is a coverage admin for the active auth mode."""
+    if user_id is None:
+        return False
+    if is_dalton_local_auth_enabled():
+        from src.dalton.access_tiers import is_admin_user
+
+        return await is_admin_user(user_id)
+    return is_invite_pm(user_id)
 
 
 @asynccontextmanager
@@ -267,7 +286,7 @@ def _compute_unit_action_flags(
     actor_has_ws_write: bool | None = None,
 ) -> dict[str, bool]:
     supabase_auth = (
-        is_dalton_supabase_auth_enabled()
+        _is_multiuser_auth_enabled()
         if supabase_auth_enabled is None
         else bool(supabase_auth_enabled)
     )
@@ -357,8 +376,8 @@ async def build_units_view(
     """
     from src.dalton.database.sector_members import fetch_members_for_sectors
 
-    supabase_auth = is_dalton_supabase_auth_enabled()
-    is_pm = is_invite_pm(user_id) if user_id is not None else False
+    supabase_auth = _is_multiuser_auth_enabled()
+    is_pm = await _is_coverage_pm(user_id)
     eff_pm = is_pm and supabase_auth
     own_auto_ws = {
         str(a.get("workspace_id") or "")
@@ -888,8 +907,8 @@ async def build_unit_detail(user_id: str, unit_id: str) -> dict[str, Any]:
     )
 
     uid = str(user_id or "").strip()
-    supabase_auth = is_dalton_supabase_auth_enabled()
-    is_pm = is_invite_pm(uid)
+    supabase_auth = _is_multiuser_auth_enabled()
+    is_pm = await _is_coverage_pm(uid)
     eff_pm = is_pm and supabase_auth
 
     async with _repeatable_read_conn() as snap_conn:

@@ -4,7 +4,8 @@
  * Package-internal — the barrel does not re-export streamFetch/postSSEStream.
  */
 import { api } from '@/api/client';
-import { getAuthHeaders } from '@/lib/authToken';
+import { isDaltonLocalAuth } from '@/config/daltonAuth'; // DALTON-HOOK(standalone-core): single 401 token refresh & retry for SSE streams in local auth mode
+import { bearerTokenOf, getAuthHeaders, refreshAccessToken } from '@/lib/authToken';
 import { holdReload } from '@/lib/reloadHolds';
 import { RUN_STREAM_BEAT_MS, watchStreamSilence, type StreamSilenceWatch } from '@/lib/streamSilence';
 import { noteIfSuspended } from '@/lib/accountSuspension';
@@ -86,6 +87,16 @@ export async function streamFetch(
   let res: Response;
   try {
     res = await fetch(`${baseURL}${url}`, opts);
+    // DALTON-HOOK(standalone-core): refresh once via cookie and retry SSE request on 401 in local auth mode
+    if (isDaltonLocalAuth && res.status === 401) {
+      const hdrs = new Headers(opts.headers);
+      const refused = bearerTokenOf(hdrs.get('Authorization'));
+      const refreshed = await refreshAccessToken(refused);
+      if (refreshed) {
+        hdrs.set('Authorization', `Bearer ${refreshed}`);
+        res = await fetch(`${baseURL}${url}`, { ...opts, headers: hdrs });
+      }
+    }
   } catch (error: unknown) {
     // An AbortController.abort() during the initial fetch (e.g. the user hit
     // stop before the response headers arrived) surfaces as AbortError (a

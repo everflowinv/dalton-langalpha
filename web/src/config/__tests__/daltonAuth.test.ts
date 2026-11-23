@@ -40,6 +40,23 @@ describe('daltonAuth config', () => {
     expect(isDaltonAuth).toBe(true);
   });
 
+  it('enables isDaltonLocalAuth and isDaltonAuth when VITE_DALTON_AUTH=local without Supabase env vars', async () => {
+    vi.stubEnv('VITE_DALTON_AUTH', 'local');
+    vi.stubEnv('VITE_SUPABASE_URL', '');
+    vi.stubEnv('VITE_SUPABASE_PUBLISHABLE_KEY', '');
+
+    const {
+      DALTON_AUTH_MODE,
+      isDaltonAuth,
+      isDaltonLocalAuth,
+      isDaltonSupabaseAuth,
+    } = await loadDaltonAuth();
+    expect(DALTON_AUTH_MODE).toBe('local');
+    expect(isDaltonLocalAuth).toBe(true);
+    expect(isDaltonSupabaseAuth).toBe(false);
+    expect(isDaltonAuth).toBe(true);
+  });
+
   it('keeps APP_ENTRY_PATH="/" in OSS mode so unauthenticated routes redirect to LoginPage at "/"', async () => {
     vi.stubEnv('VITE_HOST_MODE', 'oss');
     vi.stubEnv('VITE_DALTON_AUTH', 'supabase');

@@ -51,7 +51,6 @@ from src.dalton.llm.model_prefs import (
 )
 from src.llms.preferences import TuningError
 from src.dalton.settings import (
-    get_configured_pm_user_ids,
     get_dalton_bridge_admin_token,
     get_dalton_bridge_base_url,
     get_dalton_config,
@@ -103,20 +102,34 @@ _TRACKING_STATUS_TO_JOB_STATUS: dict[str, str] = {
 
 
 def is_pm_user(user_id: str) -> bool:
-    """Return True if ``user_id`` is a configured PM user."""
-    uid = str(user_id or "").strip()
-    if not uid:
-        return False
-    return uid in get_dalton_config().pm_user_ids
+    """Return True if ``user_id`` is an administrator (``dalton_user_roles`` in ``local`` mode, ``pm_user_ids`` otherwise)."""
+    from src.dalton.access_tiers import is_admin_user_sync
+
+    return is_admin_user_sync(user_id, include_config_defaults=True)
+
+
+async def is_pm_user_async(user_id: str) -> bool:
+    """Async administrator check via ``access_tiers.is_admin_user``."""
+    from src.dalton.access_tiers import is_admin_user
+
+    return await is_admin_user(user_id, include_config_defaults=True)
 
 
 def require_pm_user(user_id: str) -> None:
-    """Raise ``PermissionError`` if Dalton is disabled or ``user_id`` is not in ``pm_user_ids``."""
+    """Raise ``PermissionError`` if Dalton is disabled or ``user_id`` is not an administrator."""
     cfg = get_dalton_config()
     if not cfg.enabled:
         raise PermissionError("Dalton mode disabled")
-    uid = str(user_id or "").strip()
-    if not uid or uid not in cfg.pm_user_ids:
+    if not is_pm_user(user_id):
+        raise PermissionError("Only PM users may perform this action")
+
+
+async def require_pm_user_async(user_id: str) -> None:
+    """Async counterpart of :func:`require_pm_user`."""
+    cfg = get_dalton_config()
+    if not cfg.enabled:
+        raise PermissionError("Dalton mode disabled")
+    if not await is_pm_user_async(user_id):
         raise PermissionError("Only PM users may perform this action")
 
 
@@ -1008,10 +1021,11 @@ async def _read_pm_data_notify_routes_map(
     *,
     conn: Any = None,
 ) -> dict[str, list[str]]:
-    pm_ids = get_configured_pm_user_ids()
-    if not pm_ids:
+    from src.dalton.access_tiers import get_primary_admin_user_id
+
+    pm_uid = await get_primary_admin_user_id(conn=conn)
+    if not pm_uid:
         return {}
-    pm_uid = pm_ids[0]
     try:
         if conn is not None:
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -1491,10 +1505,11 @@ async def rollback_data_task_config(
     if scope != "data":
         raise ValueError(f"仅公司公共数据任务支持按版本链回退: {job_key}")
 
-    pm_ids = get_configured_pm_user_ids()
-    if not pm_ids:
+    from src.dalton.access_tiers import get_primary_admin_user_id
+
+    pm_user_id = await get_primary_admin_user_id()
+    if not pm_user_id:
         raise RuntimeError("未配置首位管理员 DALTON_PM_USER_IDS，无法操作数据任务")
-    pm_user_id = pm_ids[0]
 
     manifest_entry = _get_data_tasks_manifest_map()[target]
     now_iso = datetime.now(UTC).isoformat()
@@ -2353,10 +2368,11 @@ async def toggle_system_job(
             if timezone is not None
             else None
         )
-        pm_ids = get_configured_pm_user_ids()
-        if not pm_ids:
+        from src.dalton.access_tiers import get_primary_admin_user_id
+
+        pm_user_id = await get_primary_admin_user_id()
+        if not pm_user_id:
             raise RuntimeError("未配置首位管理员 DALTON_PM_USER_IDS，无法操作数据任务")
-        pm_user_id = pm_ids[0]
         manifest_entry = _get_data_tasks_manifest_map()[target]
         now_iso = datetime.now(UTC).isoformat()
         route_key = f"data:{target}"
@@ -2829,8 +2845,10 @@ async def run_system_job_now(
         actor_uid = str(actor_user_id if actor_user_id is not None else uid).strip()
         if not actor_uid or await get_user_tier(actor_uid) not in ("admin", "internal"):
             raise PermissionError("仅内部成员可操作公司公共数据任务")
-        pm_ids = get_configured_pm_user_ids()
-        if not pm_ids:
+        from src.dalton.access_tiers import get_primary_admin_user_id
+
+        primary_admin = await get_primary_admin_user_id()
+        if not primary_admin:
             raise RuntimeError("未配置首位管理员 DALTON_PM_USER_IDS，无法操作数据任务")
         manifest_entry = _get_data_tasks_manifest_map()[target]
         now_utc = datetime.now(UTC)

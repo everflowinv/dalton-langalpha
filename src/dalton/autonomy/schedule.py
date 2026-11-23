@@ -664,17 +664,24 @@ async def schedule_dalton_automation_helper(
     is_home_target = False
     ws_row: dict[str, Any] | None = None
     unit_probe: dict[str, Any] | None = None
+    from src.dalton.access_tiers import is_admin_user
     from src.dalton.autonomy.system_jobs import is_pm_user
     from src.dalton.database.coverage_units import get_active_unit_by_workspace
     from src.dalton.settings import (
         is_coverage_units_enabled,
-        is_dalton_supabase_auth_enabled,
+        is_dalton_auth_enabled,
+        is_dalton_local_auth_enabled,
     )
     from src.dalton.sharing import ColleagueAccessRevokedError
 
     units_on = is_coverage_units_enabled()
-    supabase_auth_on = is_dalton_supabase_auth_enabled()
-    caller_is_pm = bool(units_on and supabase_auth_on and is_pm_user(user_id))
+    auth_on = is_dalton_auth_enabled()
+    caller_is_admin = (
+        await is_admin_user(user_id, include_config_defaults=True)
+        if is_dalton_local_auth_enabled()
+        else is_pm_user(user_id)
+    )
+    caller_is_pm = bool(units_on and auth_on and caller_is_admin)
 
     if resolved_action == "list":
         if ws_id_str and ws_id_str.lower() != "home":
@@ -796,9 +803,7 @@ async def schedule_dalton_automation_helper(
                 "error": "forbidden_scope",
                 "message": "公司分析师只能操作当前工作区的任务，禁止操作 Home 全局任务。",
             }
-        from src.dalton.autonomy.system_jobs import is_pm_user
-
-        if resolved_name != "dalton-earnings-calendar" and not is_pm_user(user_id):
+        if resolved_name != "dalton-earnings-calendar" and not caller_is_admin:
             return {
                 "ok": False,
                 "error": "forbidden_pm",
@@ -1070,11 +1075,9 @@ async def schedule_dalton_automation_helper(
                         "error": "forbidden_scope",
                         "message": "公司分析师只能操作当前工作区的任务，禁止操作 Home 全局任务。",
                     }
-                from src.dalton.autonomy.system_jobs import is_pm_user
-
                 if (
                     str(existing.get("name") or "") != "dalton-earnings-calendar"
-                    and not is_pm_user(user_id)
+                    and not caller_is_admin
                 ):
                     return {
                         "ok": False,
