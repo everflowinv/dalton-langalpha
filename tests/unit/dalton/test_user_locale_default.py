@@ -44,6 +44,6 @@ def test_ptc_run_applies_default_to_prompt_profile():
     from src.server.handlers.chat import ptc_run
 
     src = inspect.getsource(ptc_run)
-    # upstream #822 reads profile via TurnIdentity.profile(); anchor on that call
-    i = src.index("await identity.profile()")
+    # upstream #860 reads own_profile once and derives user_profile via identity.stated(own_profile)
+    i = src.index("user_profile = identity.stated(own_profile)")
     assert "user_profile = with_default_locale(user_profile)" in src[i : i + 400]

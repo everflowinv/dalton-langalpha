@@ -24,7 +24,8 @@ vi.mock('../useAllModels', () => ({
     metadata: {
       'gpt-x': { provider: 'codex-oauth' },
       'claude-x': { provider: 'claude-oauth' },
-      'grok-x': { provider: 'grok-oauth' },
+      // DALTON-HOOK(native-oauth-ui): Dalton replaces upstream grok-oauth with xai-oauth in SUBSCRIPTIONS
+      'grok-x': { provider: 'xai-oauth' },
       'gpt-keyed': { provider: 'openai' },
     },
   }),
@@ -42,7 +43,8 @@ describe('useLapsedSignIn', () => {
   it('names an expired sign-in and a missing one, and nothing else', () => {
     const { result } = renderHook(() => useLapsedSignIn());
     expect(result.current('gpt-x')).toEqual({ provider: 'codex-oauth', reason: 'expired' });
-    expect(result.current('grok-x')).toEqual({ provider: 'grok-oauth', reason: 'missing' });
+    // DALTON-HOOK(native-oauth-ui): match xai-oauth from Dalton's SUBSCRIPTIONS registry
+    expect(result.current('grok-x')).toEqual({ provider: 'xai-oauth', reason: 'missing' });
     expect(result.current('claude-x')).toBeNull();
     expect(result.current('gpt-keyed')).toBeNull();
     expect(result.current('unknown')).toBeNull();

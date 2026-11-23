@@ -47,6 +47,9 @@ vi.mock('@/config/daltonAuth', () => ({
 // DALTON-HOOK(hide-experiments): stub useFeatures so ExperimentsTab renders without network
 vi.mock('@/hooks/useFeatures', () => ({
   useFeatures: () => ({ data: [], isLoading: false }),
+  isFeatureEnabled: (features: Array<{ key: string; enabled: boolean }> | undefined, key: string) =>
+    features?.find((f) => f.key === key)?.enabled ?? false,
+  useFeatureEnabled: () => false,
   useSetFeatureOverride: () => ({ mutateAsync: vi.fn() }),
 }));
 

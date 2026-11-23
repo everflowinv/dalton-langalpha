@@ -399,7 +399,8 @@ class TestAPersonalWorkspaceIsUntouched:
             "## Financial Context",
             "| `.agents/user/profile/portfolio.json` |",
             "- Portfolio: 3 holding(s)",
-            "## Automations\n\nThe user's scheduled and price-triggered automations live in `.agents/user/automations/`",
+            # DALTON-HOOK(prompt-audit-text): user_profile.md.j2 uses Dalton Chinese Automations guidance
+            "## Automations\n\n个人自动化任务（定时或价格触发）通过 `.agents/user/automations/`",
             "## Subagents\n\nYour subagents are set up in `.agents/user/agents/`",
         ):
             assert section in block

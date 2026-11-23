@@ -3290,6 +3290,7 @@
     "modelSelector": {
       "manageModels": "管理模型",
       "setUpModel": "设置模型",
+      "reasoningEffort": "推理强度",
       "effortNone": "关闭",
       "effortMinimal": "极简",
       "effortLow": "低",

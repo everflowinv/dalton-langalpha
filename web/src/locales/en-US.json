@@ -3225,6 +3225,7 @@
     "modelSelector": {
       "manageModels": "Manage models",
       "setUpModel": "Set up a model",
+      "reasoningEffort": "Effort",
       "effortNone": "Off",
       "effortMinimal": "Minimal",
       "effortLow": "Low",

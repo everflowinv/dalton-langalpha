@@ -1021,11 +1021,8 @@ describe('Dalton Team Sharing', () => {
         kind="memo"
         workspaceId="ws-richard-1"
         target={{ kind: 'memo', key: 'memo.md', seq: 3 }}
-        threadId={null}
-        isActive={false}
         onTargetMemoHandled={onStoreMemoHandled}
         onOpenFile={null}
-        marketWatch={null}
         teamReadOnly={true}
       />,
     );

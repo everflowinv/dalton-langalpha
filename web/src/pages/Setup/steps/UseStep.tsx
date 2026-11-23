@@ -283,7 +283,10 @@ function UseForm() {
             <SetupNote icon={<Cloud />}>
               {t('setup.answers.use.hostedPitch')}
               <span className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1">
-                <PitchLink href={DESKTOP_DOWNLOAD_URL}>{t('setup.answers.use.hostedApp')}</PitchLink>
+                {/* DALTON-HOOK(help): DESKTOP_DOWNLOAD_URL is null in Dalton builds */}
+                {DESKTOP_DOWNLOAD_URL && (
+                  <PitchLink href={DESKTOP_DOWNLOAD_URL}>{t('setup.answers.use.hostedApp')}</PitchLink>
+                )}
                 <PitchLink href={HOSTED_OR_SELF_HOSTED_URL}>{t('setup.answers.use.hostedCompare')}</PitchLink>
               </span>
             </SetupNote>
