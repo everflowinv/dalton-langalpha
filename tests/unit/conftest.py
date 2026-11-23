@@ -163,3 +163,34 @@ def shipped_skill_md():
         raise AssertionError(f"no bundle ships a {name!r} skill")
 
     return find
+
+
+@pytest.fixture(autouse=True)
+def _config_caches_follow_the_test():
+    """A test that loads config (often after switching APP_ENV / DALTON_PROFILE)
+    leaves the result cached: the infrastructure config and the YAML file cache are
+    not keyed by profile. monkeypatch restores the environment but not the caches,
+    so a later test in the same worker would read that overlay. Clear them whenever
+    this test loaded config; tests that load nothing pay nothing.
+    """
+    import src.config.core as config_core
+    from ptc_agent.config import file_utils
+
+    if not _CACHED_LOADER:
+        # The lru_cache-wrapped loader as first imported, before any test patches it.
+        _CACHED_LOADER.append(config_core.load_infrastructure_config)
+
+    def _state() -> tuple[int, int]:
+        return (_CACHED_LOADER[0].cache_info().misses, len(file_utils._config_cache))
+
+    before = _state()
+    yield
+    if _state() != before:
+        config_core.clear_config_cache()
+        # Reload under the restored environment, so the next test finds the caches
+        # warm (some tests patch os.getenv wholesale and must not trigger a reload).
+        with contextlib.suppress(Exception):
+            config_core.load_infrastructure_config()
+
+
+_CACHED_LOADER: list = []
