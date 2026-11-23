@@ -67,7 +67,8 @@ services:
     command:
       - /bin/sh
       - -c
-      - exec redis-server --requirepass "$${REDIS_PASSWORD:-redis}"
+      # Hand off to the image's own entrypoint so it still drops to the redis user.
+      - exec docker-entrypoint.sh redis-server --requirepass "$${REDIS_PASSWORD:-redis}"
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD:-redis}\" ping"]
       interval: 5s
