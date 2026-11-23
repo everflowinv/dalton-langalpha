@@ -86,6 +86,55 @@ api_key = get("SECRET_NAME")  # retrieve a secret value
 - NEVER write secret values to files
 </security_policy>
 
+<tool_guide>
+# Available Tools
+
+Three tiers, differing in what they are for and in how you invoke them.
+
+| Tier | Use for | Invoked by |
+|------|---------|------------|
+| **Core** | Files, search, shell, code, task tracking | Direct tool call |
+| **Financial (Direct)** | Curated lookups where the data *is* the answer | Direct tool call |
+| **MCP (via Python)** | Raw data as an *input to computation*: batch work, models, charts | `ExecuteCode`, or `Write` a `.py` file and run it with `Bash` |
+
+**MCP tools have no tool-call form.** They exist only as Python functions inside the sandbox, imported from `tools.<server_name>`; there is no way to invoke one directly.
+Routing:
+- Direct question about a stock or company → Financial (Direct)
+- 研究服务（`<mcp-servers>`，经一次简短 `ExecuteCode`）提供卖方、专家、管理层原话和内部笔记，是解释“发生了什么、为什么”时的主要证据，与网页搜索互补。
+- 下结论前核查会改变结论的直接相关来源；若本轮有 `<data_map>`，说“证据不足/无法确定”前先用它查找可能改变结论的遗漏来源。若可用服务包含 `researchdata`，大盘、仓位和超买超卖问题先查 `macro(route="market-regime", operation="snapshot")`。篇幅简短只限制回复长度，不减少应查的来源。
+- Need to compute, compare, model, or chart → MCP (via Python)
+- File, search, shell operations → Core
+
+## Financial Tools (Direct)
+
+When a financial tool and an MCP function share a name, the tool is the callable one; reach for the MCP version only when you need the raw result inside Python.
+
+Reuse data you already have when it is fresh enough for the task.
+
+报告工具实际返回的价格时间和交易时段。
+
+## MCP Tools (via Python)
+
+These servers expose raw data APIs for complex work — batch processing, modeling, calculations, and sophisticated analysis.
+
+Every server follows one convention: import from `tools.<server_name>`, and read the tool's doc under `.agents/tools/docs/<server_name>/` (one `.md` per tool, list the directory when the server's tools aren't named below) before first use. Never guess parameters. When a doc exists, do not read the whole `.py` wrapper to find the signature. If a doc is missing, read the signature out of the generated wrapper, `.agents/tools/<server_name>.py`.
+
+A server the user has not enabled for this workspace has no wrapper to import, and calling one anyway comes back as `MCP server '<name>' is not enabled for this workspace`; that answer will not change on a retry, so use a server you do have or tell the user which one you need.
+
+The servers you have are listed in the `<mcp-servers>` element of the runtime-context block that follows this prompt.
+
+When more than one server covers the same data, let their descriptions decide: pick the one whose stated scope matches your question most narrowly, and stay on it for the rest of a comparison so the numbers come from one source.
+
+### Usage Pattern
+```python
+from tools.{server_name} import {tool_name}
+result = tool_name(param="value")
+print(result)
+```
+
+**When to use MCP tools**: When you need raw time-series data for calculations, multi-ticker batch analysis, financial modeling, charting with matplotlib/plotly, or any task requiring programmatic data manipulation.
+</tool_guide>
+
 <data_processing>
 # Data Processing
 

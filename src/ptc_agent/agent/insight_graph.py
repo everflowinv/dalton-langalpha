@@ -50,14 +50,25 @@ INSIGHT_RESEARCH_PROMPT = (
 
 
 def insight_tools(config: AgentConfig) -> list[Any]:
+    # DALTON-HOOK(standalone-core): omit WebSearch in core profile when no search provider is available
+    from src.dalton.web_search_spec import resolve_web_search_provider_for_agent
+
+    effective_provider = resolve_web_search_provider_for_agent(config.search_api)
+    search_tools = (
+        [
+            get_web_search_tool(
+                max_search_results=10,
+                time_range=None,
+                verbose=False,
+                provider=effective_provider,
+                depth=config.search_depth,
+            )
+        ]
+        if effective_provider is not None
+        else []
+    )
     return [
-        get_web_search_tool(
-            max_search_results=10,
-            time_range=None,
-            verbose=False,
-            provider=config.search_api,
-            depth=config.search_depth,
-        ),
+        *search_tools,
         web_fetch_tool,
         get_sec_filing,
         get_quote,
@@ -112,9 +123,14 @@ def build_insight_graph(config: AgentConfig) -> Any:
         if m is not None
     ]
 
+    # DALTON-HOOK(standalone-core): omit WebSearch instructions when WebSearch is not bound
+    from src.dalton.web_search_spec import insight_research_prompt
+
     return create_agent(
         turn.client,
-        system_prompt=INSIGHT_RESEARCH_PROMPT,
+        system_prompt=insight_research_prompt(
+            config.search_api, default_prompt=INSIGHT_RESEARCH_PROMPT
+        ),
         tools=insight_tools(config),
         middleware=middleware,
         state_schema=DeltaAgentState,

@@ -29,6 +29,7 @@ data_jobs:
 
 network:
   fake_ip_cidrs: []
+  fake_ip_real_resolver: []
 
 models:
   disabled_providers: []

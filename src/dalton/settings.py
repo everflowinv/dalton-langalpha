@@ -22,13 +22,16 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from src.config.env import HOST_IP, LOCAL_DEV_USER_ID
 from src.config.settings import HOST_MODE
 from src.dalton.profile import DeploymentProfile, resolve_profile
+from src.dalton.sec_identity import (
+    DEFAULT_SEC_USER_AGENT as DEFAULT_SEC_USER_AGENT,
+    resolve_sec_user_agent,
+)
 
 logger = logging.getLogger(__name__)
 
 DALTON_YAML_PATH = Path(__file__).resolve().parent / "dalton.yaml"
 DALTON_CORE_YAML_PATH = Path(__file__).resolve().parent / "dalton.core.yaml"
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_SEC_USER_AGENT = "DaltonResearch sec-contact@example.com"
 
 
 class DaltonModelsConfig(BaseModel):
@@ -727,9 +730,9 @@ def get_fake_ip_real_resolvers() -> list[str]:
 
 def log_dalton_startup_warnings() -> None:
     """Log prominent startup warnings for budget gate, Everflow APP_ENV, and SEC identity."""
-    profile = resolve_profile()
     if not is_dalton_enabled():
         return
+    profile = resolve_profile()
     if not is_budget_gate_enabled():
         logger.warning(
             "DALTON WARNING (G1.4): Local daily USD budget gate is NOT enabled "
@@ -745,15 +748,13 @@ def log_dalton_startup_warnings() -> None:
                 "agent_config.dalton.yaml is not active and MCP call_timeout_s will fall back to 65s!",
                 app_env,
             )
-    if not (
-        os.getenv("SEC_USER_AGENT", "").strip()
-        or os.getenv("EDGAR_IDENTITY", "").strip()
-    ):
+    sec_identity, sec_configured = resolve_sec_user_agent()
+    if not sec_configured:
         logger.warning(
             "DALTON WARNING: Neither SEC_USER_AGENT nor EDGAR_IDENTITY is set. "
             "Falling back to neutral placeholder %r; configure SEC_USER_AGENT "
             "(or EDGAR_IDENTITY) as '<Organization> <contact_email>' for SEC EDGAR fair-access compliance.",
-            DEFAULT_SEC_USER_AGENT,
+            sec_identity,
         )
 
 
@@ -1239,11 +1240,7 @@ def get_dalton_bridge_embed_url(host: str | None = None) -> str:
 
 def get_sec_user_agent() -> str:
     """Return ``SEC_USER_AGENT`` / ``EDGAR_IDENTITY`` from env, or a neutral placeholder."""
-    return (
-        os.getenv("SEC_USER_AGENT", "").strip()
-        or os.getenv("EDGAR_IDENTITY", "").strip()
-        or DEFAULT_SEC_USER_AGENT
-    )
+    return resolve_sec_user_agent()[0]
 
 
 def parse_home_workspace_aliases(raw: str | None) -> dict[str, str]:

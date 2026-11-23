@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from enum import StrEnum
+from typing import Any
 
 
 class DeploymentProfile(StrEnum):
@@ -117,3 +118,33 @@ def resolve_yaml_overlay_env(
 def is_core_profile() -> bool:
     """Return ``True`` when the active deployment profile is ``core``."""
     return resolve_profile() is DeploymentProfile.CORE
+
+
+def apply_core_yaml_overrides(
+    merged: dict[str, Any],
+    overlay: dict[str, Any],
+    *,
+    overlay_env: str,
+) -> dict[str, Any]:
+    """Apply core-only wholesale dict replacements after key-by-key ``_deep_merge``.
+
+    ``_deep_merge`` merges nested dicts key-by-key, so ``subagents.definitions: {}``
+    in ``agent_config.core.yaml`` would otherwise inherit keys if the base file
+    ever added definitions. In ``core`` overlay mode, specifying
+    ``subagents.definitions`` replaces the merged mapping outright.
+    """
+    if overlay_env != DeploymentProfile.CORE.value:
+        return merged
+    overlay_subagents = overlay.get("subagents")
+    if (
+        isinstance(overlay_subagents, dict)
+        and "definitions" in overlay_subagents
+        and isinstance(overlay_subagents["definitions"], dict)
+        and isinstance(merged.get("subagents"), dict)
+    ):
+        updated = dict(merged)
+        subagents = dict(updated["subagents"])
+        subagents["definitions"] = dict(overlay_subagents["definitions"])
+        updated["subagents"] = subagents
+        return updated
+    return merged

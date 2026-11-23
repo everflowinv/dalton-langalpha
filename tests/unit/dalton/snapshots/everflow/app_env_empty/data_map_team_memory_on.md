@@ -1,7 +1,7 @@
 ## Dalton 数据地图
 ### 1. 直接工具与对话归档
-- `conversation_search`(团队对话归档|未体检):团队过往事实、预测、假设、观点、问题、决定、待办卡片及原话，查既有看法并对比变化。
-- 归档统计：未统计。
+- `conversation_search`(团队对话归档|未体检):团队过往事实、预测、假设、观点、问题、决定、待办卡片及原话，查既有看法并对比变化(仅团队记忆开启时可用)。
+  - 归档统计：未统计（仅在团队记忆开启时可用 `conversation_search` 查 fact/estimate/model_assumption/opinion/question/decision/todo 卡片）。
 - `WebSearch`(全网新闻|未体检):公开媒体报道、突发新闻与监管动态，查盘前盘后催化与公开事件。
 - `market_quotes`(行情与K线|未体检|`get_quote/get_daily_prices/get_market_overview`):美/港/A股及指数报价与日K；期货/大宗(NQ=F、ES=F、CL=F、GC=F)、^TNX与VIX(延迟15分)；extended_hours=True含美股盘外分时。
 - `company_options_screener`(公司与期权选股|未体检|`get_company_overview/get_options_chain/screen_stocks`):公司基本面快照、美股期权链及选股，用于公司画像与期权波动。

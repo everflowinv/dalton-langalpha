@@ -4,6 +4,10 @@
 # define the complete standalone chains: key-free yfinance first, optional FMP
 # fallback (no ginlix-data or tushare).
 
+# NOTE (Batch 1a -> Batch 2): src/data_client/registry.py reads market_data.providers
+# and news_data.providers directly, whereas plugins/langalpha_market_data/price_data_mcp_server.py
+# currently still instantiates its own ginlix-first client order (falling back to yfinance/fmp
+# when GINLIX_DATA_URL is absent). Unifying/gating the price MCP server is scheduled for Batch 2.
 market_data:
   providers:
     - name: yfinance

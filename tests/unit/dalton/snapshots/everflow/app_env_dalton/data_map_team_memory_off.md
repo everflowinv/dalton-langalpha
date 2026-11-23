@@ -1,8 +1,8 @@
 ## Dalton 数据地图
 ### 1. 直接工具与对话归档
 - `WebSearch`(全网新闻|未体检):公开媒体报道、突发新闻与监管动态，查盘前盘后催化与公开事件。
-- `x_search`(X社媒检索|未体检):X实时讨论、管理层/KOL发言与第一反应，查情绪与传闻。
-- `market_quotes`(行情与K线|未体检|`get_quote/get_daily_prices/get_market_overview`):美/港/A股及指数报价与日K；期货/大宗、^TNX与VIX；extended_hours=True含美股盘外分时。
+- `x_search`(X社媒检索|未体检):X实时讨论、管理层/KOL发言与第一反应(只引带链接帖)，查情绪与传闻。
+- `market_quotes`(行情与K线|未体检|`get_quote/get_daily_prices/get_market_overview`):美/港/A股及指数报价与日K；期货/大宗(NQ=F、ES=F、CL=F、GC=F)、^TNX与VIX(延迟15分)；extended_hours=True含美股盘外分时。
 - `company_options_screener`(公司与期权选股|未体检|`get_company_overview/get_options_chain/screen_stocks`):公司基本面快照、美股期权链及选股，用于公司画像与期权波动。
 - `sec_filings`(SEC XBRL与报表|未体检|`get_sec_filing`):美股报表原文直接查 `get_sec_filing`；归一化XBRL财务事实(含重述)经 `ExecuteCode` 调用 `tools.dalton_sec.get_company_facts`。
 
