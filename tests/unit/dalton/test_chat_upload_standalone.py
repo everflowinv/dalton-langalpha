@@ -25,12 +25,15 @@ from ptc_agent.config.file_utils import load_yaml_config
 from ptc_agent.config.loaders import load_from_dict
 from ptc_agent.core.paths import WorkspaceLayout
 from ptc_agent.core.sandbox import wsfiles_transfer_runtime as transfer_rt
+from ptc_agent.core.sandbox.providers import docker as docker_provider_mod
 from ptc_agent.core.sandbox.providers.docker import DockerProvider
 from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 from src.dalton import chat_upload_storage as storage
 from src.dalton import transcription_storage as asr_storage
 from src.dalton.app.chat_uploads import (
     router as chat_uploads_router,
+)
+from src.dalton.app.chat_uploads import (
     sandbox_relay_router,
 )
 from src.dalton.database import chat_uploads as db_chat_uploads
@@ -721,11 +724,11 @@ class TestSandboxNetworkAndInitScript:
             raise RuntimeError("stop-after-capture")
 
         mock_get_client = create_autospec(provider._get_client, return_value=object())
-        mock_ensure_image = create_autospec(provider._ensure_image, return_value=None)
+        mock_ensure_image = create_autospec(docker_provider_mod.ensure_image, return_value=None)
         mock_start_new = create_autospec(provider._start_new, side_effect=_fake_start_new)
         with (
             patch.object(provider, "_get_client", mock_get_client),
-            patch.object(provider, "_ensure_image", mock_ensure_image),
+            patch.object(docker_provider_mod, "ensure_image", mock_ensure_image),
             patch.object(provider, "_start_new", mock_start_new),
         ):
             with pytest.raises(RuntimeError, match="stop-after-capture"):
@@ -748,11 +751,11 @@ class TestSandboxNetworkAndInitScript:
                 raise RuntimeError("stop-after-capture")
 
             mock_get_client = create_autospec(provider._get_client, return_value=object())
-            mock_ensure_image = create_autospec(provider._ensure_image, return_value=None)
+            mock_ensure_image = create_autospec(docker_provider_mod.ensure_image, return_value=None)
             mock_start_new = create_autospec(provider._start_new, side_effect=_fake_start_new)
             with (
                 patch.object(provider, "_get_client", mock_get_client),
-                patch.object(provider, "_ensure_image", mock_ensure_image),
+                patch.object(docker_provider_mod, "ensure_image", mock_ensure_image),
                 patch.object(provider, "_start_new", mock_start_new),
             ):
                 with pytest.raises(RuntimeError, match="stop-after-capture"):
@@ -786,11 +789,11 @@ class TestSandboxNetworkAndInitScript:
                 raise RuntimeError("stop-after-capture")
 
             mock_get_client = create_autospec(provider._get_client, return_value=object())
-            mock_ensure_image = create_autospec(provider._ensure_image, return_value=None)
+            mock_ensure_image = create_autospec(docker_provider_mod.ensure_image, return_value=None)
             mock_start_new = create_autospec(provider._start_new, side_effect=_fake_start_new)
             with (
                 patch.object(provider, "_get_client", mock_get_client),
-                patch.object(provider, "_ensure_image", mock_ensure_image),
+                patch.object(docker_provider_mod, "ensure_image", mock_ensure_image),
                 patch.object(provider, "_start_new", mock_start_new),
             ):
                 with pytest.raises(RuntimeError, match="stop-after-capture"):
