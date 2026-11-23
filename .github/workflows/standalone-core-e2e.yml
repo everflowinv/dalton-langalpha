@@ -91,7 +91,7 @@ jobs:
       - name: Initialize standalone core environment
         working-directory: /tmp/dalton-core-dist
         run: |
-          bash scripts/standalone/init.sh --non-interactive --domain localhost
+          bash scripts/standalone/init.sh --non-interactive --domain localhost --skip-sandbox-build
 
       - name: Build standalone core images from clean export
         working-directory: /tmp/dalton-core-dist
@@ -120,6 +120,8 @@ jobs:
           context: /tmp/dalton-core-dist
           file: /tmp/dalton-core-dist/Dockerfile.sandbox
           tags: langalpha-sandbox:latest
+          build-args: |
+            INSTALL_AGENT_BROWSER=0
           load: true
           cache-from: type=gha,scope=core-sandbox
           cache-to: type=gha,mode=max,scope=core-sandbox

@@ -25,6 +25,7 @@ ENV_EXAMPLE="${REPO_ROOT}/.env.core.example"
 
 NON_INTERACTIVE=0
 DOMAIN_ARG=""
+BUILD_SANDBOX=1
 
 usage() {
   cat <<'EOF'
@@ -34,6 +35,8 @@ Options:
   --non-interactive       Do not prompt; use defaults / flags / existing .env values.
   --domain <host>         Target domain (e.g. localhost or dalton.example.com).
   --env-file <path>       Path to .env file (default: <repo>/.env).
+  --skip-sandbox-build    Leave the code sandbox image unbuilt (build it later with
+                          docker build -f Dockerfile.sandbox --build-arg INSTALL_AGENT_BROWSER=0 -t langalpha-sandbox:latest .).
   -h, --help              Show this help message.
 EOF
 }
@@ -42,6 +45,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --non-interactive)
       NON_INTERACTIVE=1
+      shift
+      ;;
+    --skip-sandbox-build)
+      BUILD_SANDBOX=0
       shift
       ;;
     --domain)
@@ -400,6 +407,25 @@ main() {
   if [[ -n "$bootstrap_generated" && "$NON_INTERACTIVE" -eq 0 ]]; then
     printf "\n  First-admin bootstrap token (saved in .env as BOOTSTRAP_SETUP_TOKEN):\n"
     printf "    %s\n" "$bootstrap_generated"
+  fi
+
+  # The Docker provider starts every code sandbox from langalpha-sandbox:latest.
+  # Building it here keeps the first chat from waiting 20-40 minutes for an
+  # on-demand build. The core install keeps the agent browser off, so the image
+  # is built without it.
+  if [[ "$BUILD_SANDBOX" -eq 1 ]]; then
+    if docker image inspect langalpha-sandbox:latest >/dev/null 2>&1; then
+      info "Sandbox image langalpha-sandbox:latest already present; skipping build."
+    else
+      info "Building the code sandbox image (first build takes 20-40 minutes)..."
+      if docker build -f "${REPO_ROOT}/Dockerfile.sandbox" \
+          --build-arg INSTALL_AGENT_BROWSER=0 \
+          -t langalpha-sandbox:latest "${REPO_ROOT}"; then
+        ok "Built langalpha-sandbox:latest."
+      else
+        warn "Sandbox image build failed; rerun: docker build -f Dockerfile.sandbox --build-arg INSTALL_AGENT_BROWSER=0 -t langalpha-sandbox:latest ."
+      fi
+    fi
   fi
 
   printf "\n== Next Steps ==\n"
