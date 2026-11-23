@@ -1,0 +1,12 @@
+# Standalone Core TLS port overlay (DALTON_TLS_MODE=internal | auto | custom).
+#
+# Loopback HTTP mode (default) uses docker-compose.yml + docker-compose.core.yml
+# alone and publishes only 127.0.0.1:${DALTON_EDGE_PORT:-8088}. Include this
+# overlay whenever HTTPS is enabled so host HTTP (:80 / :18080) and HTTPS
+# (:443 / :18443) ports are published cleanly without occupying extra ports in
+# loopback HTTP mode.
+services:
+  edge:
+    ports: !override
+      - "${DALTON_EDGE_TLS_BIND:-127.0.0.1}:${DALTON_EDGE_HTTP_PORT:-18080}:80"
+      - "${DALTON_EDGE_TLS_BIND:-127.0.0.1}:${DALTON_EDGE_HTTPS_PORT:-18443}:443"

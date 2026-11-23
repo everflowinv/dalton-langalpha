@@ -220,6 +220,7 @@ ALLOWLIST_OPTIONAL=(
   "docker-compose.core.yml"
   ".env.core.example"
   "NOTICE"
+  "docs/dalton/dev-guide/STANDALONE-DEPLOY.md"
   "deploy/standalone"
   "scripts/standalone"
   "plugins/dalton_sec"

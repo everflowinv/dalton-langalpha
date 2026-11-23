@@ -36,7 +36,16 @@ services:
 
   redis:
     profiles: !reset []
+    # Valkey 8 (BSD-3-Clause, drop-in Redis protocol replacement) pinned by digest.
+    # Service name and REDIS_* env vars remain unchanged for backend compatibility.
+    image: ${DALTON_VALKEY_IMAGE:-valkey/valkey:8-alpine@sha256:a038175878d66b9d274fbf8be73c0305e93798b83917647f167e18cef3c71eec}
+    command: ["valkey-server", "--requirepass", "${REDIS_PASSWORD:-redis}"]
     ports: !reset []
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${REDIS_PASSWORD:-redis}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     networks:
       - core_internal
 
@@ -163,6 +172,8 @@ services:
       REDIS_URL: "${REDIS_URL:-redis://:${REDIS_PASSWORD:-redis}@redis:6379/0}"
       PUBLIC_APP_URL: ${PUBLIC_APP_URL:-http://127.0.0.1:${DALTON_EDGE_PORT:-8088}}
       SERVER_BASE_URL: ${SERVER_BASE_URL:-http://127.0.0.1:${DALTON_EDGE_PORT:-8088}}
+      DALTON_TRUSTED_PROXIES: ${DALTON_TRUSTED_PROXIES:-${DALTON_CORE_INTERNAL_SUBNET:-172.31.250.0/24}}
+      DALTON_TRUSTED_PROXY_HOPS: ${DALTON_TRUSTED_PROXY_HOPS:-1}
       EGRESS_RELAY_BASE_URL: ${EGRESS_RELAY_BASE_URL:-http://backend:8000}
       SANDBOX_PROVIDER: ${SANDBOX_PROVIDER:-docker}
       SANDBOX_DOCKER_NETWORK: ${SANDBOX_DOCKER_NETWORK:-${COMPOSE_PROJECT_NAME:-dalton-core}_sandbox}
@@ -218,11 +229,19 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+      DALTON_TLS_MODE: ${DALTON_TLS_MODE:-loopback}
+      DALTON_EDGE_HTTPS_PORT: ${DALTON_EDGE_HTTPS_PORT:-18443}
     ports:
       - "127.0.0.1:${DALTON_EDGE_PORT:-8088}:8088"
     volumes:
       - ./deploy/standalone/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./deploy/standalone/modes:/etc/caddy/modes:ro
+      - ${DALTON_TLS_CERT_DIR:-./deploy/standalone/certs}:/etc/caddy/certs:ro
       - ./deploy/standalone/extra:/etc/caddy/extra:ro
+      - dalton-caddy-data:/data
+      - dalton-caddy-config:/config
     networks:
       - core_internal
 
@@ -236,7 +255,10 @@ services:
     ports: !reset []
 
 networks:
-  core_internal: {}
+  core_internal:
+    ipam:
+      config:
+        - subnet: ${DALTON_CORE_INTERNAL_SUBNET:-172.31.250.0/24}
   sandbox-net:
     # Per-instance network name shared with backend's SANDBOX_DOCKER_NETWORK
     # (read by DockerProvider in src/ptc_agent/core/sandbox/providers/docker.py).
@@ -246,3 +268,5 @@ networks:
 volumes:
   dalton-minio-data:
   dalton-backend-var:
+  dalton-caddy-data:
+  dalton-caddy-config:

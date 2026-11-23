@@ -1,0 +1,2 @@
+# Place custom TLS certificate chain (cert.pem) and private key (key.pem) here
+# when using DALTON_TLS_MODE=custom, or set DALTON_TLS_CERT_DIR in .env.

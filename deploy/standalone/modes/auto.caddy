@@ -1,0 +1,8 @@
+# Automatic HTTPS mode for public domains (DALTON_TLS_MODE=auto).
+# Caddy obtains and renews a publicly-trusted ACME certificate automatically.
+# Requires inbound TCP ports 80 (ACME HTTP-01 + HTTP->HTTPS redirect) and 443 (HTTPS)
+# to be reachable from the public internet with DNS pointing to this host.
+{$DOMAIN} {
+	import dalton_site_common
+	header Strict-Transport-Security "max-age=31536000"
+}

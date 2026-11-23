@@ -25,6 +25,7 @@ from ptc_agent.config.file_utils import load_yaml_config
 from ptc_agent.config.loaders import load_from_dict
 from ptc_agent.core.paths import WorkspaceLayout
 from ptc_agent.core.sandbox import wsfiles_transfer_runtime as transfer_rt
+from ptc_agent.core.sandbox.providers import docker as docker_provider_mod
 from ptc_agent.core.sandbox.providers.docker import DockerProvider
 from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 from src.dalton import chat_upload_storage as storage
@@ -33,6 +34,7 @@ from src.dalton.app.chat_uploads import (
     router as chat_uploads_router,
     sandbox_relay_router,
 )
+from src.dalton.auth import sessions as local_auth_sessions
 from src.dalton.database import chat_uploads as db_chat_uploads
 from src.dalton.services import chat_uploads as svc
 from src.dalton.settings import get_dalton_config
@@ -721,11 +723,11 @@ class TestSandboxNetworkAndInitScript:
             raise RuntimeError("stop-after-capture")
 
         mock_get_client = create_autospec(provider._get_client, return_value=object())
-        mock_ensure_image = create_autospec(provider._ensure_image, return_value=None)
+        mock_ensure_image = create_autospec(docker_provider_mod.ensure_image, return_value=None)
         mock_start_new = create_autospec(provider._start_new, side_effect=_fake_start_new)
         with (
             patch.object(provider, "_get_client", mock_get_client),
-            patch.object(provider, "_ensure_image", mock_ensure_image),
+            patch.object(docker_provider_mod, "ensure_image", mock_ensure_image),
             patch.object(provider, "_start_new", mock_start_new),
         ):
             with pytest.raises(RuntimeError, match="stop-after-capture"):
@@ -748,11 +750,11 @@ class TestSandboxNetworkAndInitScript:
                 raise RuntimeError("stop-after-capture")
 
             mock_get_client = create_autospec(provider._get_client, return_value=object())
-            mock_ensure_image = create_autospec(provider._ensure_image, return_value=None)
+            mock_ensure_image = create_autospec(docker_provider_mod.ensure_image, return_value=None)
             mock_start_new = create_autospec(provider._start_new, side_effect=_fake_start_new)
             with (
                 patch.object(provider, "_get_client", mock_get_client),
-                patch.object(provider, "_ensure_image", mock_ensure_image),
+                patch.object(docker_provider_mod, "ensure_image", mock_ensure_image),
                 patch.object(provider, "_start_new", mock_start_new),
             ):
                 with pytest.raises(RuntimeError, match="stop-after-capture"):
@@ -786,11 +788,11 @@ class TestSandboxNetworkAndInitScript:
                 raise RuntimeError("stop-after-capture")
 
             mock_get_client = create_autospec(provider._get_client, return_value=object())
-            mock_ensure_image = create_autospec(provider._ensure_image, return_value=None)
+            mock_ensure_image = create_autospec(docker_provider_mod.ensure_image, return_value=None)
             mock_start_new = create_autospec(provider._start_new, side_effect=_fake_start_new)
             with (
                 patch.object(provider, "_get_client", mock_get_client),
-                patch.object(provider, "_ensure_image", mock_ensure_image),
+                patch.object(docker_provider_mod, "ensure_image", mock_ensure_image),
                 patch.object(provider, "_start_new", mock_start_new),
             ):
                 with pytest.raises(RuntimeError, match="stop-after-capture"):
@@ -1185,3 +1187,268 @@ class TestSandboxNetworkAndInitScript:
             mock_boto_fail = create_autospec(boto3.client, return_value=s3_fail)
             with patch.object(boto3, "client", mock_boto_fail):
                 assert minio_init.main() == 1, f"Expected non-zero exit for {err_code}"
+
+    def test_edge_forwarded_request_extracts_real_client_ip_from_core_internal_subnet(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Decision 2: core_internal subnet is pinned & trusted so edge-forwarded XFF yields real client IP."""
+        from types import SimpleNamespace
+
+        # 1. Verify .env.core.example, docker-compose.core.yml, and init.sh wire the same default subnet
+        compose_text = (REPO_ROOT / "docker-compose.core.yml").read_text(encoding="utf-8")
+        assert "${DALTON_CORE_INTERNAL_SUBNET:-172.31.250.0/24}" in compose_text
+        assert "DALTON_TRUSTED_PROXIES:" in compose_text
+        assert "DALTON_TRUSTED_PROXY_HOPS:" in compose_text
+
+        env_example_text = (REPO_ROOT / ".env.core.example").read_text(encoding="utf-8")
+        assert "DALTON_CORE_INTERNAL_SUBNET=172.31.250.0/24" in env_example_text
+        assert "DALTON_TRUSTED_PROXIES=172.31.250.0/24" in env_example_text
+        assert "DALTON_TRUSTED_PROXY_HOPS=1" in env_example_text
+
+        install_dir, init_script = self._stage_init_install(tmp_path, "inst-trusted-proxy")
+        subprocess.run(
+            [
+                "bash",
+                str(init_script),
+                "--non-interactive",
+                "--domain",
+                "localhost",
+                "--skip-sandbox-build",
+            ],
+            env=self._make_fake_docker_env(tmp_path, "28.0.1"),
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        env_map: dict[str, str] = {}
+        for line in (install_dir / ".env").read_text(encoding="utf-8").splitlines():
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env_map[k.strip()] = v.strip()
+        assert env_map["DALTON_CORE_INTERNAL_SUBNET"] == "172.31.250.0/24"
+        assert env_map["DALTON_TRUSTED_PROXIES"] == "172.31.250.0/24"
+        assert env_map["DALTON_TRUSTED_PROXY_HOPS"] == "1"
+
+        # 2. Verify extract_client_ip extracts real client IP when forwarded from Caddy edge in core_internal
+        monkeypatch.setenv("DALTON_TRUSTED_PROXIES", env_map["DALTON_TRUSTED_PROXIES"])
+        monkeypatch.setenv("DALTON_TRUSTED_PROXY_HOPS", env_map["DALTON_TRUSTED_PROXY_HOPS"])
+
+        edge_req = SimpleNamespace(
+            client=SimpleNamespace(host="172.31.250.10"),
+            headers={"x-forwarded-for": "198.51.100.42"},
+        )
+        assert local_auth_sessions.extract_client_ip(edge_req) == "198.51.100.42"
+
+        # Client-spoofed leftmost IP is ignored; rightmost hop added by Caddy wins
+        spoofed_req = SimpleNamespace(
+            client=SimpleNamespace(host="172.31.250.10"),
+            headers={"x-forwarded-for": "203.0.113.1, 198.51.100.42"},
+        )
+        assert local_auth_sessions.extract_client_ip(spoofed_req) == "198.51.100.42"
+
+        # Untrusted peer outside core_internal cannot spoof X-Forwarded-For
+        untrusted_req = SimpleNamespace(
+            client=SimpleNamespace(host="10.99.0.5"),
+            headers={"x-forwarded-for": "198.51.100.42"},
+        )
+        assert local_auth_sessions.extract_client_ip(untrusted_req) == "10.99.0.5"
+
+    def test_init_b6r2_domain_port_tls_mode_validation_and_mode_preservation(
+        self, tmp_path: Path
+    ) -> None:
+        env = self._make_fake_docker_env(tmp_path, "28.0.1")
+
+        # 1. Domain with port or illegal chars is rejected (Decision 8)
+        for bad_domain in (
+            "https://localhost:8443/",
+            "localhost:8088",
+            "[::1]:8443",
+            "bad host!",
+            "https://dalton.example.com:8443/path",
+        ):
+            _, init_bad = self._stage_init_install(tmp_path, f"inst-bad-{uuid.uuid4().hex[:6]}")
+            res_bad = subprocess.run(
+                [
+                    "bash",
+                    str(init_bad),
+                    "--non-interactive",
+                    "--domain",
+                    bad_domain,
+                    "--skip-sandbox-build",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_bad.returncode == 2, f"Expected exit 2 for bad domain {bad_domain!r}: {res_bad.stderr}"
+
+        # 2. Loopback + --tls-mode auto stays bound to 127.0.0.1 (Decision 1)
+        inst_auto, init_auto = self._stage_init_install(tmp_path, "inst-loopback-auto")
+        res_auto = subprocess.run(
+            [
+                "bash",
+                str(init_auto),
+                "--non-interactive",
+                "--domain",
+                "localhost",
+                "--tls-mode",
+                "auto",
+                "--skip-sandbox-build",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        assert res_auto.returncode == 0
+        auto_env = (inst_auto / ".env").read_text(encoding="utf-8")
+        assert "DALTON_EDGE_TLS_BIND=127.0.0.1\n" in auto_env
+        assert "COMPOSE_FILE=docker-compose.yml:docker-compose.core.yml:deploy/standalone/docker-compose.tls.yml\n" in auto_env
+
+        # 3. Existing .env with invalid DALTON_TLS_MODE is rejected on rerun (Decision 1)
+        inst_invalid_mode, init_invalid_mode = self._stage_init_install(tmp_path, "inst-invalid-tls")
+        (inst_invalid_mode / ".env").write_text(
+            "DOMAIN=localhost\nDALTON_TLS_MODE=bogus\n", encoding="utf-8"
+        )
+        (inst_invalid_mode / ".env").chmod(0o600)
+        res_inv = subprocess.run(
+            ["bash", str(init_invalid_mode), "--non-interactive", "--skip-sandbox-build"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_inv.returncode == 2
+        assert "bogus" in res_inv.stderr
+
+        # 4. Existing .env permissions (e.g. 0640) are preserved when init.sh updates it
+        inst_perm, init_perm = self._stage_init_install(tmp_path, "inst-perm-keep")
+        env_perm = inst_perm / ".env"
+        env_perm.write_text("DOMAIN=localhost\nDALTON_TLS_MODE=loopback\n", encoding="utf-8")
+        env_perm.chmod(0o640)
+        subprocess.run(
+            [
+                "bash",
+                str(init_perm),
+                "--non-interactive",
+                "--domain",
+                "127.0.0.1",
+                "--skip-sandbox-build",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        assert stat.S_IMODE(env_perm.stat().st_mode) == 0o640
+
+    def test_ops_scripts_external_db_guard_retain_validation_and_replace_flags(
+        self, tmp_path: Path
+    ) -> None:
+        """Offline checks for Decision 4 (external DB guard), Decision 5 (split flags), Decision 10 (--retain)."""
+        work = tmp_path / "ops-work"
+        work.mkdir()
+        (work / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        (work / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (work / ".env").write_text("DB_HOST=external-pg.corp.internal\n", encoding="utf-8")
+        backup_stub = tmp_path / "bak-stub"
+        backup_stub.mkdir()
+        (backup_stub / "postgres.dump").write_bytes(b"PGDMP")
+
+        # External DB refused by backup.sh, restore.sh, and upgrade.sh
+        res_bak = subprocess.run(
+            ["bash", str(REPO_ROOT / "scripts/standalone/backup.sh"), "--work-dir", str(work)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_bak.returncode != 0
+        assert "pg_dump" in res_bak.stderr
+
+        res_res = subprocess.run(
+            [
+                "bash",
+                str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                "--work-dir",
+                str(work),
+                "--backup-dir",
+                str(backup_stub),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_res.returncode != 0
+        assert "pg_restore" in res_res.stderr
+
+        rel_dir = tmp_path / "rel-stub"
+        rel_dir.mkdir()
+        res_upg = subprocess.run(
+            [
+                "bash",
+                str(REPO_ROOT / "scripts/standalone/upgrade.sh"),
+                "--work-dir",
+                str(work),
+                "--release-dir",
+                str(rel_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_upg.returncode != 0
+        assert "pg_dump" in res_upg.stderr
+
+        # backup.sh accepts leading-zero decimal --retain 08 (fails later at external DB, not octal error)
+        res_oct = subprocess.run(
+            [
+                "bash",
+                str(REPO_ROOT / "scripts/standalone/backup.sh"),
+                "--work-dir",
+                str(work),
+                "--retain",
+                "08",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert "octal" not in res_oct.stderr.lower()
+        assert "pg_dump" in res_oct.stderr
+
+        # backup.sh rejects --retain above upper bound
+        res_cap = subprocess.run(
+            [
+                "bash",
+                str(REPO_ROOT / "scripts/standalone/backup.sh"),
+                "--work-dir",
+                str(work),
+                "--retain",
+                "99999",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_cap.returncode == 2
+
+        # restore.sh rejects removed --force and points to --replace-data / --replace-env
+        res_force = subprocess.run(
+            [
+                "bash",
+                str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                "--backup-dir",
+                str(backup_stub),
+                "--force",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_force.returncode == 2
+        assert "--replace-data" in res_force.stderr
+        assert "--replace-env" in res_force.stderr

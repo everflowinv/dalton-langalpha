@@ -1,0 +1,125 @@
+Dalton Standalone Core — Third-Party Open-Source Notices
+========================================================
+
+This distribution is derived from LangAlpha (https://github.com/ginlix-ai/langalpha),
+licensed under the Apache License, Version 2.0:
+
+  Copyright 2025 Ginlix AI
+  Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The bundled public SEC EDGAR plugin (`plugins/dalton_sec/`) is licensed under
+the Apache License, Version 2.0.
+
+This distribution incorporates or depends on third-party open-source software
+components. Their respective copyright notices and licenses apply to each
+component. Exact pinned versions are recorded in `pyproject.toml`, `uv.lock`,
+`web/package.json`, `web/pnpm-lock.yaml`, `docs-site/package.json`, and the
+Dockerfiles under `deploy/` and `scripts/dalton/`.
+
+--------------------------------------------------------------------------------
+1. Container Runtime & Infrastructure Components
+--------------------------------------------------------------------------------
+
+- Caddy (`caddy:2.9.1-alpine`, `deploy/standalone/Dockerfile.edge`) — Apache License 2.0
+  Source: https://github.com/caddyserver/caddy/tree/v2.9.1
+  License: https://github.com/caddyserver/caddy/blob/v2.9.1/LICENSE
+- PostgreSQL (`postgres:18`, `scripts/dalton/Dockerfile.postgres`) — PostgreSQL License
+  Source: https://github.com/postgres/postgres
+  License: https://www.postgresql.org/about/licence/
+- pgvector (`postgresql-18-pgvector`, `scripts/dalton/Dockerfile.postgres`) — PostgreSQL License
+  Source: https://github.com/pgvector/pgvector
+  License: https://github.com/pgvector/pgvector/blob/master/LICENSE
+- Valkey (`valkey/valkey:8-alpine@sha256:a038175878d66b9d274fbf8be73c0305e93798b83917647f167e18cef3c71eec`, `docker-compose.core.yml`, service name `redis`) — BSD-3-Clause License
+  Source: https://github.com/valkey-io/valkey
+  License: https://github.com/valkey-io/valkey/blob/unstable/COPYING
+- MinIO (`cgr.dev/chainguard/minio@sha256:e70b2b1e74d79457f808710483bd726ff364529ca30736eaa15a6ab547d3a5a7`, `docker-compose.core.yml`, overridable via `DALTON_MINIO_IMAGE`) — GNU Affero General Public License v3.0 (AGPL-3.0)
+  Upstream Source: https://github.com/minio/minio
+  License: https://github.com/minio/minio/blob/master/LICENSE
+  Container Image Source: https://images.chainguard.dev/directory/image/minio/overview
+- tini (installed in `scripts/dalton/Dockerfile.dalton`) — MIT License
+  Source: https://github.com/krallin/tini
+- Python 3.13 (`python:3.13-slim`, `scripts/dalton/Dockerfile.dalton`) — Python Software Foundation License v2 (PSF-2.0)
+  Source: https://github.com/python/cpython
+- Node.js (`node:24-alpine`, build-time only in `deploy/standalone/Dockerfile.edge`) — MIT License
+  Source: https://github.com/nodejs/node
+- uv (build/runtime package manager in `scripts/dalton/Dockerfile.dalton`) — Dual-licensed under Apache License 2.0 / MIT License
+  Source: https://github.com/astral-sh/uv
+
+--------------------------------------------------------------------------------
+2. Backend Python Dependencies (selected major packages)
+--------------------------------------------------------------------------------
+
+- FastAPI — MIT License
+- Uvicorn — BSD-3-Clause License
+- Pydantic — MIT License
+- Starlette — BSD-3-Clause License
+- LangChain / langchain-core / langchain-openai / langchain-anthropic /
+  langchain-google-genai / langchain-deepseek / langchain-openrouter — MIT License
+- LangGraph / langgraph-checkpoint-postgres — MIT License
+- DeepAgents — MIT License
+- Model Context Protocol Python SDK (`mcp`) — MIT License
+- psycopg — GNU Lesser General Public License v3.0 (LGPL-3.0)
+- SQLAlchemy — MIT License
+- Alembic — MIT License
+- redis-py — MIT License
+- httpx — BSD-3-Clause License
+- boto3 / botocore — Apache License 2.0
+- PyJWT — MIT License
+- cryptography — Dual-licensed under Apache License 2.0 / BSD-3-Clause License
+- pandas — BSD-3-Clause License
+- NumPy — BSD-3-Clause License
+- SciPy — BSD-3-Clause License
+- scikit-learn — BSD-3-Clause License
+- statsmodels — BSD-3-Clause License
+- Matplotlib — PSF-based License
+- Seaborn — BSD-3-Clause License
+- Plotly — MIT License
+- yfinance — Apache License 2.0
+- edgartools — MIT License
+- trafilatura — Apache License 2.0
+- pdfplumber — MIT License
+- pypdf — BSD-3-Clause License
+- Playwright / Patchright — Apache License 2.0
+- Scrapling — BSD-3-Clause License
+- Jinja2 — BSD-3-Clause License
+- structlog — Dual-licensed under Apache License 2.0 / MIT License
+- aiodocker — Apache License 2.0
+- asyncssh — Eclipse Public License 2.0 (EPL-2.0) / GPL-2.0+
+- google-re2 — BSD-3-Clause License
+- OpenTelemetry API — Apache License 2.0
+
+--------------------------------------------------------------------------------
+3. Frontend & Documentation Dependencies (selected major packages)
+--------------------------------------------------------------------------------
+
+- React / React DOM — MIT License
+- Vite — MIT License
+- TypeScript — Apache License 2.0
+- Tailwind CSS — MIT License
+- TanStack React Query — MIT License
+- React Router — MIT License
+- Radix UI primitives — MIT License
+- React Aria Components — Apache License 2.0
+- Framer Motion — MIT License
+- Lucide React — ISC License
+- Zod — MIT License
+- i18next / react-i18next — MIT License
+- Monaco Editor — MIT License
+- Mermaid — MIT License
+- KaTeX — MIT License
+- Recharts — MIT License
+- TradingView Lightweight Charts — Apache License 2.0
+- PDF.js (`pdfjs-dist`) — Apache License 2.0
+- ExcelJS — MIT License
+- JSZip — Dual-licensed under MIT License / GPL-3.0
+- Astro / Starlight (`docs-site/`) — MIT License
+
+--------------------------------------------------------------------------------
+4. License Texts & Source Availability
+--------------------------------------------------------------------------------
+
+The full text of the Apache License, Version 2.0 is provided in the `LICENSE`
+file at the root of this distribution. Third-party license metadata for all
+installed Python and JavaScript packages is preserved inside the built container
+environments and lockfiles (`uv.lock`, `web/pnpm-lock.yaml`,
+`docs-site/pnpm-lock.yaml`).
