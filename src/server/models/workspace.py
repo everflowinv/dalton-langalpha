@@ -275,6 +275,15 @@ class WorkspaceResponse(BaseModel):
         None,
         description="Whether colleague workspace task dispatch and chat messaging are enabled",
     )
+    # DALTON-HOOK(colleague-access): read-only auto-publish pause state and CAS token (never exposes internal run_id).
+    auto_publish_paused: bool = Field(
+        False,
+        description="Whether automatic publishing is paused pending owner confirmation after colleague access",
+    )
+    auto_publish_pause_token: Optional[str] = Field(
+        None,
+        description="Opaque pause token for CAS confirmation when clearing workspace auto-publish pause",
+    )
     # DALTON-HOOK(workspace-dedup): coverage unit auto-registration outcome and non-fatal warning on create.
     coverage_unit: Optional[Dict[str, Any]] = Field(
         None,

@@ -69,6 +69,17 @@ def create_report_delivery_tools() -> list[BaseTool]:
             )
 
         act = str(action or "").strip().lower()
+        if act in ("set", "clear"):
+            from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+            if is_dalton_sharing_auth_enabled():
+                from src.dalton.colleague_outbound_guard import (
+                    OUTBOUND_GUARD_REFUSAL_MESSAGE,
+                    is_run_outbound_blocked,
+                )
+
+                if await is_run_outbound_blocked(config):
+                    return _json_error("colleague_outbound_blocked", OUTBOUND_GUARD_REFUSAL_MESSAGE)
         try:
             if act == "get":
                 res = await get_report_delivery_config(

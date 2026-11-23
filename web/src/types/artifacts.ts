@@ -149,6 +149,8 @@ export interface PublishArtifactRequest {
   earlier: readonly string[];
   /** `ArtifactStatus.page_sha256` of the list reviewed. */
   page_sha256?: string;
+  // DALTON-HOOK(colleague-access): CAS pause token for resuming workspace auto-publish
+  confirm_pause_token?: string | null;
 }
 
 export interface PublishArtifactResponse {
@@ -157,6 +159,10 @@ export interface PublishArtifactResponse {
   version: ArtifactVersion;
   /** False when the files equal the latest version's. */
   cut: boolean;
+  // DALTON-HOOK(colleague-access): retained pause state & notice from server
+  auto_publish_paused?: boolean;
+  auto_publish_pause_token?: string | null;
+  auto_publish_pause_notice?: string | null;
 }
 
 /**

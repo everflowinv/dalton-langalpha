@@ -17,6 +17,7 @@ export interface TeamCredentialsStatus {
   can_disconnect: boolean;
   can_invite?: boolean;
   caller_tier?: 'admin' | 'internal' | 'external' | string | null;
+  colleague_sharing_enabled?: boolean;
 }
 
 export function useTeamCredentials(): {
@@ -36,6 +37,7 @@ export function useTeamCredentials(): {
    * the tier is simply unset, and callers keep the non-Dalton behavior.
    */
   callerTierError: boolean;
+  colleagueSharingEnabled?: boolean;
 } {
   const { userId } = useAuth();
 
@@ -63,6 +65,7 @@ export function useTeamCredentials(): {
       callerTier: null,
       callerTierPending: false,
       callerTierError: false,
+      colleagueSharingEnabled: false,
     };
   }
   const isShared = Boolean(data?.enabled);
@@ -84,5 +87,6 @@ export function useTeamCredentials(): {
     callerTier,
     callerTierPending: Boolean(userId) && isLoading,
     callerTierError,
+    colleagueSharingEnabled: !isError && Boolean(data?.colleague_sharing_enabled),
   };
 }

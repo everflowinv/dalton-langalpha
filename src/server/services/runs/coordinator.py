@@ -899,6 +899,16 @@ class RunCoordinator:
         workspace_id, user_id = meta.get("workspace_id"), meta.get("user_id")
         if not workspace_id or not user_id:
             return
+        # DALTON-HOOK(colleague-access): skip auto keep_updated for outbound-blocked analyst turns (workspace pending_outbound_confirm was already stamped when the turn entered blocked state)
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        if is_dalton_sharing_auth_enabled():
+            from src.dalton.colleague_outbound_guard import (
+                is_run_row_outbound_blocked,
+            )
+
+            if is_run_row_outbound_blocked(run):
+                return
         try:
             from src.server.services.artifacts.snapshot import keep_updated_after_turn
 

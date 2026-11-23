@@ -74,6 +74,9 @@ class DbJsonFolderRoute(DbJsonRoute):
     # --- write ---
 
     def _unwritable(self, file_path: str, filename: str | None) -> UserDataValidationError:
+        # DALTON-HOOK(colleague-access): propagate cross-user read-only refusal from base route
+        if self._cross_user_read_only:
+            return super()._unwritable(file_path, filename)
         if filename == README_FILE:
             return self._readme_refusal(file_path)
         if filename in self.read_only_files:
@@ -92,6 +95,9 @@ class DbJsonFolderRoute(DbJsonRoute):
     # --- file mount ---
 
     def is_writable(self, file_path: str) -> bool:
+        # DALTON-HOOK(colleague-access): lock folder and entries read-only on cross-user turns
+        if self._cross_user_read_only:
+            return False
         if file_path.rstrip("/") == self._root_prefix.rstrip("/"):
             return True
         return super().is_writable(file_path)
@@ -100,6 +106,9 @@ class DbJsonFolderRoute(DbJsonRoute):
         """Delete the file through the mount, only at ``version`` when given:
         the report, or None where no file is. Raises ``ReadOnlyStoreError``
         for the README."""
+        # DALTON-HOOK(colleague-access): refuse delete on cross-user read-only folder routes
+        if self._cross_user_read_only:
+            raise ReadOnlyStoreError(self._CROSS_USER_READ_ONLY_MSG)
         filename = self._filename(file_path)
         if filename is None:
             return None
@@ -145,6 +154,9 @@ class DbJsonFolderRoute(DbJsonRoute):
         it: the report, or None where no file is. Refuses a ``to`` where a
         file is (``exists``) or no file may be, and raises
         ``ReadOnlyStoreError`` for the README."""
+        # DALTON-HOOK(colleague-access): refuse rename on cross-user read-only folder routes
+        if self._cross_user_read_only:
+            raise ReadOnlyStoreError(self._CROSS_USER_READ_ONLY_MSG)
         filename = self._filename(file_path)
         if filename is None:
             return None

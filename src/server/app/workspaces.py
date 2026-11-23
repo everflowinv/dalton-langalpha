@@ -185,6 +185,28 @@ async def _workspace_action_errors(action: str, workspace_id: str):
 
 def workspace_response(workspace: dict) -> WorkspaceResponse:
     computer_id = workspace.get("computer_id")
+    # DALTON-HOOK(colleague-access): expose read-only auto-publish pause flag & CAS token without leaking run_id via config.
+    from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+    auto_publish_paused = False
+    auto_publish_pause_token: str | None = None
+    raw_config = workspace.get("config")
+    public_config = raw_config
+    from src.dalton.colleague_outbound_guard import (
+        PENDING_OUTBOUND_CONFIRM_CONFIG_KEY,
+        get_workspace_pause_state,
+    )
+
+    if is_dalton_sharing_auth_enabled():
+        auto_publish_paused, auto_publish_pause_token = get_workspace_pause_state(workspace)
+    # A marker left from before the switch was turned off still holds a run id
+    # and token, so it never leaves the server either way.
+    if isinstance(raw_config, dict) and PENDING_OUTBOUND_CONFIRM_CONFIG_KEY in raw_config:
+        public_config = {
+            k: v
+            for k, v in raw_config.items()
+            if k != PENDING_OUTBOUND_CONFIRM_CONFIG_KEY
+        }
     return WorkspaceResponse(
         workspace_id=str(workspace["workspace_id"]),
         user_id=workspace["user_id"],
@@ -203,7 +225,7 @@ def workspace_response(workspace: dict) -> WorkspaceResponse:
         updated_at=workspace["updated_at"],
         last_activity_at=workspace.get("last_activity_at"),
         stopped_at=workspace.get("stopped_at"),
-        config=workspace.get("config"),
+        config=public_config,
         is_pinned=workspace.get("is_pinned", False),
         sort_order=workspace.get("sort_order", 0),
         resource_tier=workspace.get("resource_tier", "standard"),
@@ -214,6 +236,9 @@ def workspace_response(workspace: dict) -> WorkspaceResponse:
         # DALTON-HOOK(colleague-dispatch): pass caller's effective_web_access and colleague_dispatch_enabled.
         effective_web_access=workspace.get("effective_web_access"),
         colleague_dispatch_enabled=workspace.get("colleague_dispatch_enabled"),
+        # DALTON-HOOK(colleague-access): expose read-only auto-publish pause fields for web UI confirmation.
+        auto_publish_paused=auto_publish_paused,
+        auto_publish_pause_token=auto_publish_pause_token,
         # DALTON-HOOK(workspace-dedup): pass optional coverage unit registration outcome on create.
         coverage_unit=workspace.get("coverage_unit"),
         coverage_unit_warning=workspace.get("coverage_unit_warning"),

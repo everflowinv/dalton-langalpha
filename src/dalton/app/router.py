@@ -397,11 +397,15 @@ async def get_budget_today_endpoint(user_id: CurrentUserId) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-@router.get("/workspaces/team")
+@router.get(
+    "/workspaces/team",
+    dependencies=[Depends(require_capability_dep(CapabilityId.COLLEAGUE_SHARING))],
+)
 @handle_api_exceptions("list team workspaces", logger)
 async def list_team_workspaces_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    require_capability(CapabilityId.COLLEAGUE_SHARING)
     from src.dalton.access_tiers import get_user_tier
     from src.dalton.settings import is_colleague_dispatch_enabled
     from src.dalton.sharing import list_team_workspaces
@@ -416,12 +420,16 @@ async def list_team_workspaces_endpoint(
     }
 
 
-@router.get("/workspaces/{workspace_id}/sharing")
+@router.get(
+    "/workspaces/{workspace_id}/sharing",
+    dependencies=[Depends(require_capability_dep(CapabilityId.COLLEAGUE_SHARING))],
+)
 @handle_api_exceptions("get workspace sharing settings", logger)
 async def get_workspace_sharing_endpoint(
     workspace_id: str,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    require_capability(CapabilityId.COLLEAGUE_SHARING)
     from src.server.database.home_workspace import is_home_row
     from src.dalton.access_tiers import classify_owner_tier, get_user_tier
     from src.dalton.settings import (
@@ -545,13 +553,17 @@ async def get_workspace_sharing_endpoint(
     }
 
 
-@router.put("/workspaces/{workspace_id}/sharing")
+@router.put(
+    "/workspaces/{workspace_id}/sharing",
+    dependencies=[Depends(require_capability_dep(CapabilityId.COLLEAGUE_SHARING))],
+)
 @handle_api_exceptions("update workspace sharing settings", logger)
 async def update_workspace_sharing_endpoint(
     workspace_id: str,
     body: WorkspaceSharingUpdateRequest,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    require_capability(CapabilityId.COLLEAGUE_SHARING)
     from src.server.database.home_workspace import is_home_row
     from src.dalton.settings import (
         is_colleague_dispatch_enabled,
@@ -890,11 +902,15 @@ async def update_workspace_settings_endpoint(
     }
 
 
-@router.get("/sharing/user-settings")
+@router.get(
+    "/sharing/user-settings",
+    dependencies=[Depends(require_capability_dep(CapabilityId.COLLEAGUE_SHARING))],
+)
 @handle_api_exceptions("get user cos sharing settings", logger)
 async def get_user_sharing_settings_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    require_capability(CapabilityId.COLLEAGUE_SHARING)
     from src.dalton.access_tiers import get_user_tier
     from src.dalton.settings import (
         is_colleague_dispatch_enabled,
@@ -931,12 +947,16 @@ async def get_user_sharing_settings_endpoint(
     }
 
 
-@router.put("/sharing/user-settings")
+@router.put(
+    "/sharing/user-settings",
+    dependencies=[Depends(require_capability_dep(CapabilityId.COLLEAGUE_SHARING))],
+)
 @handle_api_exceptions("update user cos sharing settings", logger)
 async def update_user_sharing_settings_endpoint(
     body: UserSharingUpdateRequest,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    require_capability(CapabilityId.COLLEAGUE_SHARING)
     from src.dalton.access_tiers import get_user_tier
     from src.dalton.settings import (
         is_colleague_dispatch_enabled,
@@ -1059,7 +1079,7 @@ async def get_team_credentials_status_endpoint(
         is_team_credential_sharing_enabled,
     )
     from src.dalton.invites import get_user_tier
-    from src.dalton.settings import get_dalton_config
+    from src.dalton.settings import get_dalton_config, is_dalton_sharing_auth_enabled
 
     cfg = get_dalton_config()
     enabled = is_team_credential_sharing_enabled()
@@ -1074,6 +1094,7 @@ async def get_team_credentials_status_endpoint(
         "can_disconnect": can_disconnect,
         "can_invite": caller_tier in ("admin", "internal"),
         "caller_tier": caller_tier,
+        "colleague_sharing_enabled": is_dalton_sharing_auth_enabled(),
     }
 
 

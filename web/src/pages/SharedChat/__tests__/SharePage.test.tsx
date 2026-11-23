@@ -255,6 +255,34 @@ describe('SharePage', () => {
     await waitFor(() => expect(mockMetadata).toHaveBeenCalledTimes(4));
   }, 15_000);
 
+  // DALTON-HOOK(colleague-access): 503 auto_publish_paused shows localized pause copy instead of generic load failure
+  it('shows the localized pause copy on 503 auto_publish_paused instead of generic load failure', async () => {
+    mockMetadata.mockRejectedValue(
+      Object.assign(new Error('Shared link not found (503)'), {
+        response: {
+          status: 503,
+          data: {
+            detail: {
+              code: 'auto_publish_paused',
+            },
+          },
+        },
+      }),
+    );
+    const user = userEvent.setup();
+    renderAt(`/a/${CODE}`);
+
+    expect(
+      await screen.findByText('Temporarily unavailable, please try again later'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Couldn't load this link")).not.toBeInTheDocument();
+    expect(mockMetadata).toHaveBeenCalledTimes(1);
+
+    mockMetadata.mockResolvedValue(visitor());
+    await user.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(await screen.findByTestId('visitor-view')).toBeInTheDocument();
+  });
+
   describe('renews a signed credential on its own expiry', () => {
     beforeEach(() => {
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });

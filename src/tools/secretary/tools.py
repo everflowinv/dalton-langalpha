@@ -91,12 +91,13 @@ async def workspaces_list(user_id: str, tool_call_id: str) -> Command:
         payload: dict[str, object] = {"success": True, "workspaces": rows}
         # --- DALTON-HOOK(workspace-sharing-settings): begin ---
         # DALTON-HOOK(colleague-dispatch): adjust colleague_workspaces_note when colleague_dispatch is enabled.
+        # DALTON-HOOK(colleague-access): gate on is_dalton_sharing_auth_enabled() and document UTF-8 text copy_file & analyst colleague_workspace.
         from src.dalton.settings import (
             is_colleague_dispatch_enabled,
-            is_dalton_supabase_auth_enabled,
+            is_dalton_sharing_auth_enabled,
         )
 
-        if is_dalton_supabase_auth_enabled():
+        if is_dalton_sharing_auth_enabled():
             from src.dalton.sharing import list_colleague_cos_workspaces
 
             colleague_list = await list_colleague_cos_workspaces(user_id)
@@ -104,23 +105,28 @@ async def workspaces_list(user_id: str, tool_call_id: str) -> Command:
             if colleague_list:
                 if is_colleague_dispatch_enabled():
                     payload["colleague_workspaces_note"] = (
-                        "同事共享的工作区：access 为 rw 时可用 list_files / read_file / "
-                        "write_file，也可用 delegate_to_analyst 向该工作区的分析师派发任务；"
-                        "access 为 ro（read_only=true）时只能用 list_files / read_file 读取，"
-                        "不能向只读工作区派发任务。read_file 只读文本；要取工作区里的二进制"
-                        "文件（Excel、PDF 等），用 copy_file 拷到 Home 后再发送。"
+                        "同事的工作区：access（访问权限）为 rw（可读写）时，可用 "
+                        "list_files、read_file、write_file、copy_file，也可用 "
+                        "delegate_to_analyst 向该工作区的分析师派发任务；为 ro（只读）时，"
+                        "仅可用 list_files、read_file 读取或用 copy_file 复制出来（派发任务仅限 "
+                        "rw 工作区）。copy_file 可将 50 MB 以内的办公文档、PDF（便携式文档）或图片等"
+                        "二进制文件，以及 5 MB 以内的 UTF-8（通用字符编码）文本文件原样复制到 "
+                        "Home（个人主页）或用户自己的工作区；派发任务时若需分析师取用同事的工作区中的资料，"
+                        '可在任务说明中提示其调用 colleague_workspace（含 colleague_workspace(action="copy_file")）。'
                     )
                 else:
                     # Said here, where the model reads the list it is about to
                     # route by: promising a dispatch into one of these was the
                     # incident, and dispatch refuses them.
                     payload["colleague_workspaces_note"] = (
-                        "同事共享的工作区当前只能读取（list_files / read_file；rw 时可 "
-                        "write_file 写文件；二进制文件用 copy_file 拷到 Home），"
-                        "delegate_to_analyst 不能向同事的工作区派发"
-                        "任务（会被拒绝）。要在同事工作区里做的事：用 manage_workspaces"
-                        '(action="create") 在用户自己名下新建工作区，再把任务派发给它的'
-                        "分析师。"
+                        "同事的工作区：可用 list_files、read_file 读取，或用 copy_file 将 "
+                        "50 MB 以内的办公文档、PDF（便携式文档）、图片等二进制文件及 5 MB 以内的 "
+                        "UTF-8（通用字符编码）文本文件原样复制到 Home（个人主页）或用户自己的工作区；"
+                        "access（访问权限）为 rw（可读写）时还可用 write_file 写文件。"
+                        "当前部署下 delegate_to_analyst 不能向同事的工作区派发任务；"
+                        '如需基于同事的工作区开展分析，请用 manage_workspaces(action="create") '
+                        "在用户自己名下新建工作区并派发给其分析师，并在任务说明中提示分析师调用 "
+                        'colleague_workspace（含 colleague_workspace(action="copy_file")）取用资料。'
                     )
         # --- DALTON-HOOK(workspace-sharing-settings): end ---
         content = json.dumps(payload, default=str)
@@ -1272,12 +1278,32 @@ async def workspace_file_write_cos(
 # deck, and safely under the mirror's 100 MB serving cap, so a copy never
 # buffers more than the file routes already do.
 _COS_COPY_MAX_BYTES = 50 * 1024 * 1024
+# DALTON-HOOK(colleague-access): UTF-8 whitelisted text copy cap (5 MB) and allowed extensions
+_COS_COPY_TEXT_MAX_BYTES = 5 * 1024 * 1024
 _COS_ZIP_MEMBER_MAX_BYTES = 50 * 1024 * 1024
 _COS_ZIP_TOTAL_MAX_BYTES = 100 * 1024 * 1024
 _COS_ZIP_CONTAINER_EXTENSIONS = frozenset({".xlsx", ".xlsm", ".docx", ".pptx"})
 _COS_LEGACY_OFFICE_EXTENSIONS = frozenset({".xls", ".doc", ".ppt"})
 _COS_IMAGE_EXTENSIONS = frozenset(
     {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
+)
+_COS_TEXT_COPY_EXTENSIONS = frozenset(
+    {
+        ".md",
+        ".markdown",
+        ".txt",
+        ".csv",
+        ".tsv",
+        ".json",
+        ".jsonl",
+        ".yaml",
+        ".yml",
+        ".py",
+        ".sql",
+        ".html",
+        ".xml",
+        ".log",
+    }
 )
 _COS_COPY_ALLOWED_EXTENSIONS = (
     _COS_ZIP_CONTAINER_EXTENSIONS
@@ -1311,10 +1337,11 @@ _COS_ARCHIVE_SIGNATURES = (
     b"\x28\xb5\x2f\xfd",
 )
 _COS_COPY_UNSUPPORTED_ERROR = (
-    "copy_file only supports binary Office (.xlsx, .xlsm, .docx, .pptx, .xls, "
-    ".doc, .ppt), PDF (.pdf), and image (.png, .jpg, .jpeg, .gif, .webp, .bmp, "
-    ".tiff) files; archives, pickle/database, audio/video, and text files are "
-    "refused — read text files with read_file instead"
+    "copy_file supports binary Office (.xlsx, .xlsm, .docx, .pptx, .xls, "
+    ".doc, .ppt), PDF (.pdf), and image (.png, .jpg, .jpeg, .gif, .webp, "
+    ".bmp, .tiff) files up to 50 MB, and UTF-8 text files (.md, .markdown, "
+    ".txt, .csv, .tsv, .json, .jsonl, .yaml, .yml, .py, .sql, .html, .xml, "
+    ".log) up to 5 MB. Use read_file to read other text files."
 )
 _COS_FORMAT_MISMATCH_ERROR = "文件内容和扩展名不一致，不能拷贝"
 _COS_PDF_UNREADABLE_ERROR = "无法检查这个 PDF 的内容，不能拷贝"
@@ -1355,15 +1382,73 @@ def _cos_read_channel_max_bytes(sandbox: Any) -> int:
     return _exec_read_max(getattr(sandbox, "runtime", None))
 
 
-def _is_allowed_copy_extension(file_path: str) -> bool:
-    """Only extensions in ``_COS_COPY_ALLOWED_EXTENSIONS`` (Office, PDF, and
-    common images) may use ``copy_file``; archives, pickle/database, audio/video,
-    and any text format (including GBK/UTF-16 ``.csv``, ``.log``, ``.md``) are
-    refused."""
+# DALTON-HOOK(colleague-access): support both binary Office/PDF/image (<=50 MB) and whitelisted strict UTF-8 text (<=5 MB) copy
+def _is_allowed_binary_copy_extension(file_path: str) -> bool:
     import os
 
     _, ext = os.path.splitext(file_path)
     return ext.lower() in _COS_COPY_ALLOWED_EXTENSIONS
+
+
+def _is_allowed_text_copy_extension(file_path: str) -> bool:
+    import os
+
+    _, ext = os.path.splitext(file_path)
+    return ext.lower() in _COS_TEXT_COPY_EXTENSIONS
+
+
+def _is_allowed_copy_extension(file_path: str) -> bool:
+    """Allow binary Office/PDF/image files (<=50 MB) and whitelisted UTF-8 text files (<=5 MB)."""
+    return _is_allowed_binary_copy_extension(file_path) or _is_allowed_text_copy_extension(file_path)
+
+
+def _copy_max_bytes_for_path(file_path: str) -> tuple[int, str]:
+    """Return ``(max_bytes, human_label)`` for a copyable file path."""
+    if _is_allowed_text_copy_extension(file_path):
+        return _COS_COPY_TEXT_MAX_BYTES, "5 MB"
+    return _COS_COPY_MAX_BYTES, "50 MB"
+
+
+def _scan_copy_text_for_secrets(
+    content: bytes,
+    vault_secrets: dict[str, str] | None,
+) -> str | None:
+    """Validate strict UTF-8 text (<=5 MB, no NUL) and run dual secret scans.
+
+    Rejects:
+    - files larger than 5 MB;
+    - files containing NUL bytes (catches UTF-16 with ASCII or binary masquerading as text);
+    - files that fail strict ``utf-8-sig`` decoding (catches GBK / UTF-16 BOM / malformed bytes);
+    - decoded text flagged by ``get_redactor().redact(..., vault_secrets=vault_secrets)``;
+    - raw bytes containing any source-owner vault secret (len >= ``MIN_REDACT_SECRET_LEN``)
+      encoded in ``utf-8``, ``utf-16-le``, or ``utf-16-be``.
+    """
+    from src.server.utils.secret_redactor import MIN_REDACT_SECRET_LEN, get_redactor
+
+    if len(content) > _COS_COPY_TEXT_MAX_BYTES:
+        return (
+            f"File is {len(content)} bytes; the UTF-8 text copy limit is "
+            f"{_COS_COPY_TEXT_MAX_BYTES} bytes (5 MB)."
+        )
+    if b"\x00" in content:
+        return "copy_file 仅支持 UTF-8（通用字符编码）文本文件；该文件含 NUL（空字节）或采用其他编码，请改用 read_file 读取文本。"
+    try:
+        decoded = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return "copy_file 仅支持 UTF-8（通用字符编码）文本文件；该文件采用其他编码，请改用 read_file 读取文本。"
+
+    if get_redactor().redact(decoded, vault_secrets=vault_secrets) != decoded:
+        return "文件含有密钥或该工作区主人的凭据，无法原样复制；请改用 read_file 读取脱敏后的内容。"
+
+    for raw_val in (vault_secrets or {}).values():
+        if not isinstance(raw_val, str) or len(raw_val) < MIN_REDACT_SECRET_LEN:
+            continue
+        for enc in _SECRET_SCAN_ENCODINGS:
+            encoded = raw_val.encode(enc)
+            if encoded and encoded in content:
+                return "文件含有该工作区主人的凭据，无法原样复制；请改用 read_file 读取脱敏后的内容。"
+
+    return None
 
 
 def _has_archive_signature(buf: bytes) -> bool:
@@ -1748,39 +1833,30 @@ def _scan_copy_bytes_in_child(
 ) -> str | None:
     """Entry point for the heavy-compute child; a memory blow-up refuses the copy."""
     try:
+        # DALTON-HOOK(colleague-access): dispatch whitelisted text extensions to strict UTF-8 + dual secret scan
+        if _is_allowed_text_copy_extension(file_path):
+            return _scan_copy_text_for_secrets(content, vault_secrets)
         return _scan_copy_bytes_for_secrets(file_path, content, vault_secrets)
     except MemoryError:
         return _COS_SCAN_FAILED_ERROR
 
 
-
-async def workspace_file_copy_cos(
-    user_id: str,
-    workspace_id: str | None,
-    path: str | None,
+# DALTON-HOOK(colleague-access): shared server-side copy engine used by CoS and analyst colleague_workspace
+async def _workspace_file_copy_server(
+    *,
+    source_workspace_id: str,
+    path: str,
+    dest_workspace_id: str,
+    dest_owner_id: str,
     dest_path: str | None,
     tool_call_id: str,
-    dest_workspace_id: str | None = None,
+    require_dest_owner_user_id: str | None = None,
 ) -> Command:
-    """Copy an allowed binary file (Office, PDF, or image) out of a workspace into Home, or another of the user's own workspaces.
+    """Copy an allowed binary (<=50 MB) or strict UTF-8 text (<=5 MB) file server-side.
 
-    ``read_file`` answers text only, so without this a shared workbook or PDF
-    the Chief of Staff can see is one it cannot hand to the user. Only Office
-    (``.xlsx``, ``.xlsm``, ``.docx``, ``.pptx``, ``.xls``, ``.doc``, ``.ppt``),
-    PDF (``.pdf``), and image (``.png``, ``.jpg``, ``.jpeg``, ``.gif``,
-    ``.webp``, ``.bmp``, ``.tiff``) files up to 50 MB are accepted; archives,
-    pickle/database, audio/video, and text files are refused (text always goes
-    through ``read_file``). The copy is a copy: the source is never touched,
-    and what lands is a separate file.
+    Caller must have already verified source read authorization and destination
+    write authorization before calling this helper.
     """
-    if not workspace_id:
-        return error_command("workspace_id is required for copy_file", tool_call_id)
-    if not path:
-        return error_command("path is required for copy_file", tool_call_id)
-    if err := await verify_workspace_owner(
-        workspace_id, user_id, tool_call_id, need="read"
-    ):
-        return err
     try:
         from fastapi import HTTPException
         from src.server.app.workspace_files._shared import (
@@ -1788,7 +1864,6 @@ async def workspace_file_copy_cos(
             http_file_bytes,
         )
         from src.server.app.workspace_files.crud import _read_contained_target
-        from src.server.database.home_workspace import get_home_workspace_id
         from src.server.database.workspace import get_workspace
         from src.server.models.workspace import served_from_mirror
         from src.server.services.persistence.file import FilePersistenceService
@@ -1806,7 +1881,7 @@ async def workspace_file_copy_cos(
             get_vault_secrets_for_redaction,
         )
 
-        ws = await get_workspace(workspace_id)
+        ws = await get_workspace(source_workspace_id)
         if not ws:
             return error_command("workspace not found", tool_call_id)
         work_dir = owner_work_dir(ws)
@@ -1815,23 +1890,24 @@ async def workspace_file_copy_cos(
         if not normalized_path or _is_non_owner_blocked_path(normalized_path):
             return error_command("file not found", tool_call_id)
 
-        owner_id = str(ws.get("user_id") or user_id)
+        owner_id = str(ws.get("user_id") or dest_owner_id)
         if served_from_mirror(ws.get("status")):
             file_record = await FilePersistenceService.get_file_content(
-                workspace_id, normalized_path
+                source_workspace_id, normalized_path
             )
             if not file_record:
                 return error_command("file not found", tool_call_id)
             if not _is_allowed_copy_extension(normalized_path):
                 return error_command(_COS_COPY_UNSUPPORTED_ERROR, tool_call_id)
+            max_bytes, max_label = _copy_max_bytes_for_path(normalized_path)
             try:
                 size = int(file_record.get("file_size") or 0)
             except (TypeError, ValueError):
                 size = 0
-            if size > _COS_COPY_MAX_BYTES:
+            if size > max_bytes:
                 return error_command(
                     f"File is {size} bytes; the copy limit is "
-                    f"{_COS_COPY_MAX_BYTES} bytes (50 MB).",
+                    f"{max_bytes} bytes ({max_label}).",
                     tool_call_id,
                 )
             try:
@@ -1840,19 +1916,19 @@ async def workspace_file_copy_cos(
                 return error_command(
                     f"cannot read the source file: {e.detail}", tool_call_id
                 )
-            if len(content) > _COS_COPY_MAX_BYTES:
+            if len(content) > max_bytes:
                 # file_size can be missing or 0 on the record; the bytes just
                 # read are the authority then.
                 return error_command(
                     f"File is {len(content)} bytes; the copy limit is "
-                    f"{_COS_COPY_MAX_BYTES} bytes (50 MB).",
+                    f"{max_bytes} bytes ({max_label}).",
                     tool_call_id,
                 )
             source_client_path = normalized_path
         else:
             if not _is_allowed_copy_extension(normalized_path):
                 return error_command(_COS_COPY_UNSUPPORTED_ERROR, tool_call_id)
-            async with acquire_sandbox_to_change(workspace_id, owner_id) as (
+            async with acquire_sandbox_to_change(source_workspace_id, owner_id) as (
                 sandbox,
                 live_ws,
             ):
@@ -1877,12 +1953,13 @@ async def workspace_file_copy_cos(
             source_client_path = _to_client_path(sandbox, normalized, work_dir)
             if _is_non_owner_blocked_path(source_client_path):
                 return error_command("file not found", tool_call_id)
-            if not _is_allowed_copy_extension(normalized):
+            if not _is_allowed_copy_extension(source_client_path):
                 return error_command(_COS_COPY_UNSUPPORTED_ERROR, tool_call_id)
-            if len(raw_bytes) > _COS_COPY_MAX_BYTES:
+            max_bytes, max_label = _copy_max_bytes_for_path(source_client_path)
+            if len(raw_bytes) > max_bytes:
                 return error_command(
                     f"File is {len(raw_bytes)} bytes; the copy limit is "
-                    f"{_COS_COPY_MAX_BYTES} bytes (50 MB).",
+                    f"{max_bytes} bytes ({max_label}).",
                     tool_call_id,
                 )
             content = raw_bytes
@@ -1913,27 +1990,35 @@ async def workspace_file_copy_cos(
         if secret_err:
             return error_command(secret_err, tool_call_id)
 
-        # The destination is always the user's own: Home by default (where
-        # send_message picks files up without a workspace_id), or a workspace
-        # the copy names. A colleague's workspace is not a destination — a
-        # write there goes through write_file, with its own access check.
-        dest_id = (dest_workspace_id or "").strip() or get_home_workspace_id(user_id)
-        dest_ws = await get_workspace(dest_id)
-        if not dest_ws or str(dest_ws.get("user_id")) != user_id:
+        dest_ws = await get_workspace(dest_workspace_id)
+        if not dest_ws:
+            return error_command(
+                "destination must be Home or one of the user's own workspaces"
+                if require_dest_owner_user_id is not None
+                else "destination workspace not found",
+                tool_call_id,
+            )
+        if (
+            require_dest_owner_user_id is not None
+            and str(dest_ws.get("user_id")) != require_dest_owner_user_id
+        ):
             return error_command(
                 "destination must be Home or one of the user's own workspaces",
                 tool_call_id,
             )
+        effective_dest_owner = str(dest_ws.get("user_id") or dest_owner_id)
         dest_name = (dest_path or "").strip().lstrip("/") or (
-            f"shared/{normalized_path.rsplit('/', 1)[-1]}"
+            f"shared/{source_client_path.rsplit('/', 1)[-1]}"
         )
         if served_from_mirror(dest_ws.get("status")):
             return error_command(
-                f"Cannot copy into {dest_ws.get('name') or dest_id} — it is "
+                f"Cannot copy into {dest_ws.get('name') or dest_workspace_id} — it is "
                 f"{dest_ws.get('status')}. Wait for it to be running.",
                 tool_call_id,
             )
-        async with acquire_sandbox_to_change(dest_id, user_id) as (
+        async with acquire_sandbox_to_change(
+            dest_workspace_id, effective_dest_owner
+        ) as (
             dest_sandbox,
             dest_live_ws,
         ):
@@ -1959,17 +2044,22 @@ async def workspace_file_copy_cos(
             dest_abs = await contained_target(
                 dest_sandbox, dest_rel, dest_work_dir, dest_previous
             )
-            ok = await dest_sandbox.aupload_file_bytes(dest_abs, content)
             dest_client_path = _to_client_path(
                 dest_sandbox, dest_abs, dest_work_dir
             )
+            if not dest_client_path or _is_non_owner_blocked_path(dest_client_path):
+                return error_command(
+                    "403 Forbidden: Cannot copy into system, hidden, or virtual paths",
+                    tool_call_id,
+                )
+            ok = await dest_sandbox.aupload_file_bytes(dest_abs, content)
         if not ok:
             return error_command("Copy failed", tool_call_id)
         return success_command(
             {
                 "success": True,
-                "source": {"workspace_id": workspace_id, "path": source_client_path},
-                "workspace_id": dest_id,
+                "source": {"workspace_id": source_workspace_id, "path": source_client_path},
+                "workspace_id": dest_workspace_id,
                 "path": dest_client_path,
                 "folder_path": dest_work_dir.rstrip("/"),
                 "size": len(content),
@@ -1979,4 +2069,35 @@ async def workspace_file_copy_cos(
     except Exception as e:
         logger.error(f"Failed to copy workspace file for CoS: {e}")
         return error_command("failed to copy workspace file", tool_call_id)
+
+
+async def workspace_file_copy_cos(
+    user_id: str,
+    workspace_id: str | None,
+    path: str | None,
+    dest_path: str | None,
+    tool_call_id: str,
+    dest_workspace_id: str | None = None,
+) -> Command:
+    """Copy an allowed binary (<=50 MB) or strict UTF-8 text (<=5 MB) file into Home or another of the user's own workspaces."""
+    if not workspace_id:
+        return error_command("workspace_id is required for copy_file", tool_call_id)
+    if not path:
+        return error_command("path is required for copy_file", tool_call_id)
+    if err := await verify_workspace_owner(
+        workspace_id, user_id, tool_call_id, need="read"
+    ):
+        return err
+    from src.server.database.home_workspace import get_home_workspace_id
+
+    dest_id = (dest_workspace_id or "").strip() or get_home_workspace_id(user_id)
+    return await _workspace_file_copy_server(
+        source_workspace_id=workspace_id,
+        path=path,
+        dest_workspace_id=dest_id,
+        dest_owner_id=user_id,
+        dest_path=dest_path,
+        tool_call_id=tool_call_id,
+        require_dest_owner_user_id=user_id,
+    )
 # --- DALTON-HOOK(workspace-sharing-settings): end ---

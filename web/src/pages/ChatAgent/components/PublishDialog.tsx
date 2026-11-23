@@ -24,6 +24,7 @@ import { queryKeys } from '@/lib/queryKeys';
 import { useCopyShareLink } from '@/hooks/useCopyShareLink';
 import { useLocale } from '@/hooks/useLocale';
 import { useTeamCredentials } from '@/hooks/useTeamCredentials';
+import { useWorkspace } from '@/hooks/useWorkspace'; // DALTON-HOOK(colleague-access): read workspace auto-publish pause state & token
 import {
   useArtifactPublishing,
   useArtifactStatus,
@@ -357,7 +358,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   const qc = useQueryClient();
   const root = useWorkspaceFolders()?.rootDir;
   // DALTON-HOOK(monitors): caller tier gates 4-tier visibility (external=own only, admin=public allowed)
-  const { callerTier } = useTeamCredentials();
+  const { callerTier, colleagueSharingEnabled = false } = useTeamCredentials();
   const isExternal = callerTier === 'external';
   const isAdmin = callerTier === 'admin' || !isDaltonAuth;
 
@@ -397,6 +398,53 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   const [publishingMonitor, setPublishingMonitor] = useState(false);
   const [copiedPermalink, setCopiedPermalink] = useState(false);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
+  // DALTON-HOOK(colleague-access): read workspace auto-publish pause state & CAS token only when colleague sharing is enabled
+  const trackAutoPublishPause = !unshareOnly && colleagueSharingEnabled;
+  const workspaceQuery = useWorkspace(trackAutoPublishPause ? workspaceId : null);
+  const refetchWorkspace = workspaceQuery.refetch;
+  useEffect(() => {
+    if (trackAutoPublishPause && workspaceId && refetchWorkspace) {
+      void refetchWorkspace();
+    }
+  }, [trackAutoPublishPause, workspaceId, refetchWorkspace]);
+  const workspaceSnapshotRef = useRef<{
+    data: typeof workspaceQuery.data;
+    updatedAt: number;
+  }>({ data: workspaceQuery.data, updatedAt: workspaceQuery.dataUpdatedAt ?? 0 });
+  workspaceSnapshotRef.current = {
+    data: workspaceQuery.data,
+    updatedAt: workspaceQuery.dataUpdatedAt ?? 0,
+  };
+  const [pauseOverride, setPauseOverride] = useState<{
+    paused: boolean;
+    token: string | null;
+    notice: string | null;
+    baseData: typeof workspaceQuery.data;
+    baseUpdatedAt: number;
+  } | null>(null);
+  const workspaceRefreshedAfterOverride =
+    pauseOverride !== null &&
+    ((workspaceQuery.dataUpdatedAt ?? 0) > pauseOverride.baseUpdatedAt ||
+      workspaceQuery.data !== pauseOverride.baseData);
+  const pauseOverrideActive = pauseOverride !== null && !workspaceRefreshedAfterOverride;
+  const autoPublishPaused = trackAutoPublishPause
+    ? (pauseOverrideActive
+        ? pauseOverride.paused
+        : Boolean(workspaceQuery.data?.auto_publish_paused))
+    : false;
+  const autoPublishPauseToken = trackAutoPublishPause
+    ? (pauseOverrideActive
+        ? pauseOverride.token
+        : (workspaceQuery.data?.auto_publish_pause_token ?? null))
+    : null;
+  const autoPublishPauseNotice =
+    trackAutoPublishPause &&
+    autoPublishPaused &&
+    pauseOverride?.notice &&
+    (pauseOverrideActive ||
+      workspaceQuery.data?.auto_publish_pause_token === pauseOverride.token)
+      ? pauseOverride.notice
+      : null;
 
   const busy = publishingMonitor || unshare.isPending || keepUpdated.isPending || audienceChange.isPending;
   useEffect(() => {
@@ -493,6 +541,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
     setOutcome(null);
     setPublishingMonitor(true);
     try {
+      // DALTON-HOOK(colleague-access): include CAS confirm_pause_token and surface server pause notice
       const result = await publishMonitor({
         workspace_id: workspaceId,
         path: artifact.path,
@@ -506,11 +555,36 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
         loaded: loads.now,
         earlier: loads.earlier,
         page_sha256: status?.page_sha256 ?? undefined,
+        ...(trackAutoPublishPause && autoPublishPauseToken
+          ? { confirm_pause_token: autoPublishPauseToken }
+          : {}),
       });
+      const snapshotAtResponse = workspaceSnapshotRef.current;
       setLabel('');
       qc.setQueryData(queryKeys.daltonMonitors.byArtifact(artifact.artifact_id), result.monitor);
       void qc.invalidateQueries({ queryKey: queryKeys.daltonMonitors.all });
       void qc.invalidateQueries({ queryKey: queryKeys.artifacts.pathsIn(workspaceId) });
+      if (trackAutoPublishPause) {
+        void qc.invalidateQueries({ queryKey: queryKeys.workspaces.detail(workspaceId) });
+        void qc.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
+        if (result.auto_publish_paused) {
+          setPauseOverride({
+            paused: true,
+            token: result.auto_publish_pause_token ?? null,
+            notice: result.auto_publish_pause_notice ?? null,
+            baseData: snapshotAtResponse.data,
+            baseUpdatedAt: snapshotAtResponse.updatedAt,
+          });
+        } else {
+          setPauseOverride({
+            paused: false,
+            token: null,
+            notice: null,
+            baseData: snapshotAtResponse.data,
+            baseUpdatedAt: snapshotAtResponse.updatedAt,
+          });
+        }
+      }
       if (result.cut === false) {
         setOutcome({ kind: 'unchanged', seq: result.monitor.published_seq });
       } else {
@@ -828,27 +902,37 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
           {/* DALTON-HOOK(external-share-guard): keep-updated is the owner's */}
           {!unshareOnly && !blocked && (
           <div
-            className="flex items-center justify-between gap-3 px-3 py-2.5"
+            className="flex flex-col gap-1.5 px-3 py-2.5"
             style={{ borderColor: 'var(--color-border-muted)' }}
           >
-            <div className="flex flex-col min-w-0">
-              <span className="text-sm" style={{ color: 'var(--color-text-primary)' }}>
-                {t('monitors.dialog.keepUpdated')}
-              </span>
-              <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-                {t('monitors.dialog.keepUpdatedHint')}
-              </span>
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex flex-col min-w-0">
+                <span className="text-sm" style={{ color: 'var(--color-text-primary)' }}>
+                  {t('monitors.dialog.keepUpdated')}
+                </span>
+                <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                  {t('monitors.dialog.keepUpdatedHint')}
+                </span>
+              </div>
+              {keepUpdated.isPending
+                ? <Loader size={16} className="text-(--color-text-tertiary)" />
+                : (
+                  <ToggleSwitch
+                    checked={keepOn}
+                    onChange={toggleKeep}
+                    disabled={!artifact || busy || (shared && lockedOut)}
+                    ariaLabel={t('monitors.dialog.keepUpdated')}
+                  />
+                )}
             </div>
-            {keepUpdated.isPending
-              ? <Loader size={16} className="text-(--color-text-tertiary)" />
-              : (
-                <ToggleSwitch
-                  checked={keepOn}
-                  onChange={toggleKeep}
-                  disabled={!artifact || busy || (shared && lockedOut)}
-                  ariaLabel={t('monitors.dialog.keepUpdated')}
-                />
-              )}
+            {/* DALTON-HOOK(colleague-access): show auto-publish pause guidance under keep-updated toggle */}
+            {autoPublishPaused && (
+              <p className="text-xs" role="status" style={{ color: 'var(--color-warning)' }}>
+                {t('monitors.dialog.autoPublishPausedHint', {
+                  action: monitorPublished ? t('publish.update') : t('publish.publish'),
+                })}
+              </p>
+            )}
           </div>
           )}
         </div>
@@ -859,6 +943,12 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
         {!unshareOnly && latestSeq > 0 && <VersionList artifactId={artifact?.artifact_id} />}
 
         {/* Notices, about the list and the last attempt */}
+        {/* DALTON-HOOK(colleague-access): display server auto_publish_pause_notice when pause stays active */}
+        {autoPublishPauseNotice && (
+          <p className="text-xs" role="status" style={{ color: 'var(--color-warning)' }}>
+            {autoPublishPauseNotice}
+          </p>
+        )}
         {outcome?.kind === 'conflict' && (
           <p className="text-xs" role="status" style={{ color: 'var(--color-warning)' }}>
             {t('publish.filesChanged')}

@@ -47,7 +47,11 @@ from src.server.services.shared_workspaces.access import member_or_404, workspac
 from src.server.services.shared_workspaces.share_out import refuse_link_change
 from src.server.services.workspace_files import reached_workspace_on_computer
 from src.dalton.access_tiers import get_user_tier as _default_get_user_tier
-from src.dalton.settings import is_dalton_supabase_auth_enabled
+# DALTON-HOOK(colleague-access): separate multi-user auth check from colleague sharing switch.
+from src.dalton.settings import (
+    is_dalton_multiuser_auth_enabled,
+    is_dalton_supabase_auth_enabled as _default_is_dalton_supabase_auth_enabled,
+)
 from src.server.utils.api import CurrentUserId
 
 # DALTON-HOOK(external-share-guard): external members cannot make a file
@@ -56,6 +60,7 @@ from src.server.utils.api import CurrentUserId
 # this helper; stopping a share (below) stays open to everyone.
 EXTERNAL_SHARE_FORBIDDEN_DETAIL = "外部成员不能创建公开分享链接"
 get_user_tier = _default_get_user_tier
+is_dalton_supabase_auth_enabled = _default_is_dalton_supabase_auth_enabled
 
 
 async def require_non_external_for_share(user_id: str | None) -> None:
@@ -71,7 +76,12 @@ async def require_non_external_for_share(user_id: str | None) -> None:
         tier_fn = _dalton_sharing.get_user_tier
     else:
         tier_fn = _default_get_user_tier
-    if not is_dalton_supabase_auth_enabled() and tier_fn is _default_get_user_tier:
+    multiuser_on = (
+        bool(is_dalton_supabase_auth_enabled())
+        if is_dalton_supabase_auth_enabled is not _default_is_dalton_supabase_auth_enabled
+        else is_dalton_multiuser_auth_enabled()
+    )
+    if not multiuser_on and tier_fn is _default_get_user_tier:
         return
     if await tier_fn(user_id) == "external":
         raise HTTPException(

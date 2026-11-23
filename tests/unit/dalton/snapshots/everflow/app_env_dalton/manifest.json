@@ -895,6 +895,7 @@
     "automation_report",
     "check_draft",
     "check_language",
+    "colleague_workspace",
     "conversation_search",
     "dalton_check_done",
     "dalton_coverage_tracking",

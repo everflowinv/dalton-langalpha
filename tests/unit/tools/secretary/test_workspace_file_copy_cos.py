@@ -343,19 +343,17 @@ async def test_oversize_file_is_refused_with_the_limit(
 
 
 @pytest.mark.asyncio
-async def test_mirror_text_file_copy_is_refused_nothing_written(
+async def test_mirror_non_whitelisted_file_copy_is_refused_nothing_written(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A text file is never byte-copied: the copy would bypass read_file's
-    redaction for the source user. Refused with the read_file hint, and the
-    bytes are not even fetched."""
+    """Non-whitelisted extensions (such as .sh) are refused before bytes are fetched."""
     sandbox = _install(monkeypatch, source_row=COLLEAGUE_ROW)
 
     from src.server.app.workspace_files import _shared
     from src.server.services.persistence import file as persistence_file
 
     record = {
-        "path": "logs/ANT_run.log",
+        "path": "scripts/run.sh",
         "is_binary": False,
         "file_size": 120,
     }
@@ -369,42 +367,42 @@ async def test_mirror_text_file_copy_is_refused_nothing_written(
             )
         ),
     )
-    http_bytes = create_autospec(_shared.http_file_bytes, return_value=b"log")
+    http_bytes = create_autospec(_shared.http_file_bytes, return_value=b"echo hi")
     monkeypatch.setattr(_shared, "http_file_bytes", http_bytes)
 
     command = await workspace_file_copy_cos(
         user_id="u-1",
         workspace_id="ws-anthropic",
-        path="logs/ANT_run.log",
+        path="scripts/run.sh",
         dest_path=None,
         tool_call_id="tc-copy-6",
     )
     payload = _payload(command)
     assert payload.get("success") is False
-    assert "read_file" in payload.get("error", "")
+    assert "UTF-8" in payload.get("error", "")
     assert "binary" in payload.get("error", "")
     http_bytes.assert_not_called()
     sandbox.aupload_file_bytes.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_live_text_file_copy_is_refused_nothing_written(
+async def test_live_non_whitelisted_file_copy_is_refused_nothing_written(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Same refusal on the live path: a .md source is refused by extension
-    (the read_file criterion) before anything is written."""
+    """Same refusal on the live path: a non-whitelisted .sh source is refused
+    by extension before anything is written."""
     sandbox = _install(monkeypatch, source_row={**COLLEAGUE_ROW, "status": "running"})
 
     command = await workspace_file_copy_cos(
         user_id="u-1",
         workspace_id="ws-anthropic",
-        path="cash_model/ANT_cash_memo.md",
+        path="cash_model/run.sh",
         dest_path=None,
         tool_call_id="tc-copy-7",
     )
     payload = _payload(command)
     assert payload.get("success") is False
-    assert "read_file" in payload.get("error", "")
+    assert "UTF-8" in payload.get("error", "")
     sandbox.aupload_file_bytes.assert_not_called()
 
 
@@ -629,8 +627,7 @@ async def test_gbk_csv_is_refused_on_mirror_and_live_nothing_written(
     )
     payload = _payload(cmd)
     assert payload.get("success") is False
-    assert "read_file" in payload.get("error", "")
-    http_bytes.assert_not_called()
+    assert "UTF-8" in payload.get("error", "")
     sandbox.aupload_file_bytes.assert_not_called()
 
 
