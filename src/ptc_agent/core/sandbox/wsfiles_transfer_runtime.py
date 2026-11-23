@@ -1306,13 +1306,24 @@ def _release_temp_ownership(path: str) -> None:
             os.close(lock_fd)
 
 
-def _download_to_temp(url: str, parent: str, timeout_s: float) -> tuple[str, str, int, int]:
+# DALTON-HOOK(standalone-core): allow per-item request headers (e.g. X-Dalton-Relay-Token)
+# so download tokens travel in headers instead of URL paths / access logs.
+def _download_to_temp(
+    url: str,
+    parent: str,
+    timeout_s: float,
+    headers: dict[str, str] | None = None,
+) -> tuple[str, str, int, int]:
     """GET ``url`` into a temp file beside the target; returns (temp, sha256, bytes, http)."""
     tmp = _create_owned_temp_file(parent)
     try:
         h = hashlib.sha256()
         n = 0
-        resp = _request("GET", url, timeout_s)
+        resp = (
+            _request("GET", url, timeout_s, headers=headers)
+            if headers
+            else _request("GET", url, timeout_s)
+        )
         try:
             for chunk in iter(lambda: resp.read(_CHUNK), b""):
                 h.update(chunk)
@@ -1586,13 +1597,24 @@ def _pull_file(
     # Held until the verified bytes are renamed into place: until then the
     # temp and whatever it is replacing are both on disk. The temp goes at
     # the workspace root, the one place the scan skips the prefix.
+    # DALTON-HOOK(standalone-core): forward optional per-item HTTP headers on GET downloads.
+    raw_headers = item.get("headers")
+    req_headers: dict[str, str] | None = (
+        {str(k): str(v) for k, v in raw_headers.items()}
+        if isinstance(raw_headers, dict) and raw_headers
+        else None
+    )
     with budget.hold(expected_size):
         last: dict[str, Any] | None = None
         for attempt in range(_MAX_ATTEMPTS):
             if attempt:
                 time.sleep(_BACKOFF_S[min(attempt - 1, len(_BACKOFF_S) - 1)])
             try:
-                tmp, digest, n, status = _download_to_temp(url, root, timeout_s)
+                tmp, digest, n, status = (
+                    _download_to_temp(url, root, timeout_s, headers=req_headers)
+                    if req_headers
+                    else _download_to_temp(url, root, timeout_s)
+                )
             except Exception as exc:
                 last, retry = _classify(exc)
                 if not retry:

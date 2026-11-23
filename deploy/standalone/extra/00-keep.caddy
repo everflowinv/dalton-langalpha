@@ -1,0 +1,2 @@
+# Optional Caddy site-block route snippets (*.caddy) imported by deploy/standalone/Caddyfile.
+# Kept non-empty so git tracks this directory and `import /etc/caddy/extra/*.caddy` always matches.

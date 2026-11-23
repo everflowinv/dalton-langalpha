@@ -14,21 +14,73 @@ CONFIG="$REPO_ROOT/agent_config.yaml"
 ENV_FILE="$REPO_ROOT/.env"
 ENV_EXAMPLE="$REPO_ROOT/.env.example"
 
+# DALTON-HOOK(standalone-core): when running in standalone core profile
+# (APP_ENV=core or DALTON_PROFILE=core in process env or .env), target
+# agent_config.core.yaml and .env.core.example so edits take effect under the
+# core overlay and leave upstream agent_config.yaml untouched.
+_IS_CORE_PROFILE=0
+if [ "${APP_ENV:-}" = "core" ] || [ "${DALTON_PROFILE:-}" = "core" ]; then
+    _IS_CORE_PROFILE=1
+elif [ -f "$ENV_FILE" ] && grep -Eq '^(APP_ENV|DALTON_PROFILE)=core[[:space:]]*$' "$ENV_FILE" 2>/dev/null; then
+    _IS_CORE_PROFILE=1
+fi
+if [ "$_IS_CORE_PROFILE" -eq 1 ]; then
+    [ -f "$REPO_ROOT/agent_config.core.yaml" ] && CONFIG="$REPO_ROOT/agent_config.core.yaml"
+    [ -f "$REPO_ROOT/.env.core.example" ] && ENV_EXAMPLE="$REPO_ROOT/.env.core.example"
+fi
+
 header()  { printf "\n${BOLD}${CYAN}── %s ──${NC}\n\n" "$1"; }
 success() { printf "  ${GREEN}✓${NC} %s\n" "$1"; }
 info()    { printf "  ${DIM}%s${NC}\n" "$1"; }
 
 # --- Helpers ----------------------------------------------------------------
 
+# DALTON-HOOK(standalone-core): create temp files via mktemp under umask 077 and
+# preserve existing .env permissions (e.g. 0600) across atomic replacement.
 set_env() {
     local key="$1" val="$2"
+    local orig_mode="" env_dir tmp
+    # Write through a symlinked .env to its target so the link stays and the
+    # target keeps its own mode.
+    if [ -L "$ENV_FILE" ]; then
+        local link_target
+        link_target="$ENV_FILE"
+        local hops=0
+        while [ -L "$link_target" ] && [ "$hops" -lt 16 ]; do
+            local next
+            next="$(readlink "$link_target")"
+            case "$next" in
+                /*) link_target="$next" ;;
+                *) link_target="$(dirname "$link_target")/$next" ;;
+            esac
+            hops=$((hops + 1))
+        done
+        if [ -L "$link_target" ]; then
+            echo "  .env is a chain of more than 16 symlinks; resolve it and re-run." >&2
+            return 1
+        fi
+        if [ -n "$link_target" ]; then
+            local ENV_FILE="$link_target"
+        fi
+    fi
+    if [ -f "$ENV_FILE" ]; then
+        orig_mode="$(stat -c '%a' "$ENV_FILE" 2>/dev/null || stat -f '%Lp' "$ENV_FILE" 2>/dev/null || true)"
+    fi
+    env_dir="$(dirname "$ENV_FILE")"
+    tmp="$( (umask 077 && mktemp "${env_dir}/.env.tmp.XXXXXX") )"
     if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
         # Portable sed -i (works on macOS + Linux)
-        local tmp="${ENV_FILE}.tmp.$$"
-        sed "s|^${key}=.*|${key}=${val}|" "$ENV_FILE" > "$tmp" && mv "$tmp" "$ENV_FILE"
+        sed "s|^${key}=.*|${key}=${val}|" "$ENV_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
     else
-        echo "${key}=${val}" >> "$ENV_FILE"
+        if [ -f "$ENV_FILE" ]; then
+            cat "$ENV_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+        fi
+        printf '%s=%s\n' "$key" "$val" >> "$tmp" || { rm -f "$tmp"; return 1; }
     fi
+    if [ -n "$orig_mode" ]; then
+        chmod "$orig_mode" "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+    mv "$tmp" "$ENV_FILE"
 }
 
 # Set a server's enabled flag. The shipped servers are declared in plugins/, so
@@ -238,9 +290,13 @@ printf "${DIM}Configures .env and agent_config.yaml for your setup.${NC}\n"
 printf "${DIM}Re-run anytime — previous values will be overwritten.${NC}\n"
 
 # Create .env if needed
+# DALTON-HOOK(standalone-core): seed .env via mktemp under umask 077 so secrets
+# are never written to a world-readable file.
 if [ ! -f "$ENV_FILE" ]; then
-    cp "$ENV_EXAMPLE" "$ENV_FILE"
-    success "Created .env from .env.example"
+    _env_seed_tmp="$( (umask 077 && mktemp "$(dirname "$ENV_FILE")/.env.tmp.XXXXXX") )"
+    cat "$ENV_EXAMPLE" > "$_env_seed_tmp" || { rm -f "$_env_seed_tmp"; exit 1; }
+    mv "$_env_seed_tmp" "$ENV_FILE"
+    success "Created .env from $(basename "$ENV_EXAMPLE")"
 fi
 
 # ---------------------------------------------------------------------------
@@ -606,17 +662,24 @@ fi
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
+# DALTON-HOOK(standalone-core): display the active config file and core compose command when in core profile.
 header "Done"
+_CONFIG_DISPLAY="$(basename "$CONFIG")"
 printf "  Files updated:\n"
 printf "    ${DIM}.env${NC}               API keys and service settings\n"
-printf "    ${DIM}agent_config.yaml${NC}  LLM models, MCP servers, search provider\n"
+printf "    ${DIM}%-18s${NC} LLM models, MCP servers, search provider\n" "$_CONFIG_DISPLAY"
 printf "\n"
 printf "  Next steps:\n"
-printf "    ${BOLD}make up${NC}            Start the full stack\n"
+if [ "$_IS_CORE_PROFILE" -eq 1 ]; then
+    printf "    ${BOLD}docker compose -f docker-compose.yml -f docker-compose.core.yml up -d${NC}\n"
+    printf "                       Start the Standalone Core stack\n"
+else
+    printf "    ${BOLD}make up${NC}            Start the full stack\n"
+fi
 printf "    ${BOLD}make help${NC}          See all available commands\n"
 printf "\n"
 printf "  Want more models or features? Edit these files:\n"
 printf "    ${DIM}.env${NC}               Add API keys for additional providers\n"
-printf "    ${DIM}agent_config.yaml${NC}  Add fallback models, enable MCP servers, tune settings\n"
+printf "    ${DIM}%-18s${NC} Add fallback models, enable MCP servers, tune settings\n" "$_CONFIG_DISPLAY"
 printf "    ${DIM}src/llms/manifest/${NC}  See all configured models or add custom ones\n"
 printf "\n"
