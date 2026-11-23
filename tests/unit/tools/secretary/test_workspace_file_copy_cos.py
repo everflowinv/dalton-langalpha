@@ -258,7 +258,7 @@ async def test_mirror_binary_copy_lands_in_home_shared(
     }
     assert sandbox.aupload_file_bytes.call_count == 1
     tmp_path, uploaded_bytes = sandbox.aupload_file_bytes.call_args.args
-    assert tmp_path.startswith("/root/Home/.wsfiles-copy-")
+    assert tmp_path.startswith("/root/Home/.agents/tmp/colleague-copy-")
     assert uploaded_bytes == XLSX_BYTES
     mv_cmd = sandbox.execute_bash_command.call_args.kwargs["command"]
     assert tmp_path in mv_cmd and "/root/Home/shared/Anthropic_sheet.xlsx" in mv_cmd
@@ -285,7 +285,7 @@ async def test_live_sandbox_binary_copy_uses_read_contained_target(
     assert payload["path"] == "anthropic/ANT_cash_model.xlsx"
     assert sandbox.aupload_file_bytes.call_count == 1
     tmp_path, uploaded_bytes = sandbox.aupload_file_bytes.call_args.args
-    assert tmp_path.startswith("/root/Home/.wsfiles-copy-")
+    assert tmp_path.startswith("/root/Home/.agents/tmp/colleague-copy-")
     assert uploaded_bytes == XLSX_BYTES
     mv_cmd = sandbox.execute_bash_command.call_args.kwargs["command"]
     assert tmp_path in mv_cmd and "/root/Home/anthropic/ANT_cash_model.xlsx" in mv_cmd
@@ -1000,7 +1000,7 @@ async def test_flate_compressed_pdf_with_secret_is_refused_and_clean_pdf_copies(
     assert payload_ok.get("success") is True, payload_ok
     assert sandbox.aupload_file_bytes.call_count == 1
     tmp_path, uploaded_bytes = sandbox.aupload_file_bytes.call_args.args
-    assert tmp_path.startswith("/root/Home/.wsfiles-copy-")
+    assert tmp_path.startswith("/root/Home/.agents/tmp/colleague-copy-")
     assert uploaded_bytes == clean_pdf
     mv_cmd = sandbox.execute_bash_command.call_args.kwargs["command"]
     assert tmp_path in mv_cmd and "/root/Home/shared/flate_clean.pdf" in mv_cmd

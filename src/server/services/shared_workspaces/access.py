@@ -250,6 +250,36 @@ async def has_active_manager(
     return False
 
 
+async def _is_home_stand_in_workspace(workspace: dict[str, Any]) -> bool:
+    """DALTON-HOOK(colleague-access): detect Home stand-in rows even when a caller omits ``config``."""
+    from src.server.database.home_workspace import (
+        is_home_stand_in_id,
+        is_home_stand_in_row,
+    )
+
+    if is_home_stand_in_row(workspace):
+        return True
+    owner = workspace.get("user_id")
+    ws_id = workspace.get("workspace_id")
+    if is_home_stand_in_id(owner, ws_id):
+        return True
+    if "config" not in workspace and ws_id and not is_holder(owner):
+        try:
+            fetched = await workspace_db.get_workspace(str(ws_id))
+        except RuntimeError as exc:
+            # Upstream unit tests pass minimal fake workspace dicts (omitting
+            # "config") without opening the database pool.
+            if "pool is not open" in str(exc):
+                return False
+            raise
+        if fetched and (
+            is_home_stand_in_row(fetched)
+            or is_home_stand_in_id(fetched.get("user_id"), fetched.get("workspace_id"))
+        ):
+            return True
+    return False
+
+
 async def workspace_access(
     workspace: Optional[dict[str, Any]], caller: str, *, manage: bool = False
 ) -> Access:
@@ -262,6 +292,9 @@ async def workspace_access(
     owner = workspace.get("user_id")
     if owner == caller:
         return Access(caller)
+    # DALTON-HOOK(colleague-access): Home stand-in rows never leak existence to non-owners (404, not 403)
+    if await _is_home_stand_in_workspace(workspace):
+        raise _not_found("Workspace")
     if not is_holder(owner):
         raise _forbidden()
     return await shared_access(

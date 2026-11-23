@@ -322,7 +322,7 @@ class TestStrictUtf8TextCopy:
         assert payload_ok["size"] == len(raw_with_bom)
         assert dest_sandbox.aupload_file_bytes.await_count == 1
         tmp_path, uploaded_bytes = dest_sandbox.aupload_file_bytes.await_args.args
-        assert tmp_path.startswith("/home/workspace/.wsfiles-copy-")
+        assert tmp_path.startswith("/home/workspace/.agents/tmp/colleague-copy-")
         assert uploaded_bytes == raw_with_bom
         mv_cmd = dest_sandbox.execute_bash_command.await_args.kwargs["command"]
         assert tmp_path in mv_cmd and "/home/workspace/shared/memo.md" in mv_cmd

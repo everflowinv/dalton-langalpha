@@ -82,7 +82,7 @@ async def chief_of_staff_workspaces(
     when the workspace's access is "rw". "read_file" returns text only — for a binary file
     (Excel, PDF, images) use "copy_file" to copy it into Home, then send it from there or link
     it by the returned folder_path.
-    Limits: "copy_file" copies binary Office (.xlsx, .xlsm, .docx, .pptx, .xls, .doc, .ppt),
+    Limits: "copy_file" copies binary Office (.xlsx, .docx, .pptx, .xls, .doc, .ppt),
     PDF (.pdf), and image (.png, .jpg, .jpeg, .gif, .webp, .bmp, .tiff) files up to 50 MB,
     as well as strict UTF-8 text files (.md, .markdown, .txt, .csv, .tsv, .json, .jsonl,
     .yaml, .yml, .py, .sql, .html, .xml, .log) up to 5 MB; archives, pickle/database,

@@ -26,8 +26,11 @@ Every item covers both denied cases and normal-sharing-works cases using
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import logging
+import struct
 import zipfile
 from contextlib import asynccontextmanager
 from typing import Any
@@ -38,6 +41,7 @@ from fastapi import HTTPException
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
+from ptc_agent.core.paths import BACKUP_EXCLUDE_AGENT_SUBDIRS, SandboxLayout
 from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 from src.dalton import access_tiers as access_tiers_mod
 from src.dalton import auth as dalton_auth_mod
@@ -49,15 +53,19 @@ from src.dalton.database import knowledge as db_knowledge_mod
 from src.dalton.database import verdicts as db_verdicts_mod
 from src.dalton.tools import colleague_workspace_tools as cw_mod
 from src.dalton.tools import knowledge_tools as kt_mod
+from src.server.app import workspaces as workspaces_app_mod
 from src.server.app.workspace_files import _shared as ws_shared_mod
 from src.server.app.workspace_files import backup_reads as backup_reads_mod
 from src.server.app.workspace_files import crud as ws_files_crud_mod
 from src.server.database import conversation as conv_db_mod
 from src.server.database import workspace as ws_db_mod
 from src.server.database.conversation import threads_read as threads_read_mod
+from src.server.dependencies.principal import Principal
 from src.server.services import served_paths as served_paths_mod
 from src.server.services import workspace_files as ws_files_svc_mod
 from src.server.services.persistence import file as persistence_file_mod
+from src.server.services.persistence import transfer as transfer_mod
+from src.server.services.shared_workspaces import access as shared_access_mod
 from src.server.services.workspace_file_containment import ContainedFile
 from src.server.utils import secret_redactor as redactor_mod
 from src.server.utils.secret_redactor import SecretRedactor
@@ -244,9 +252,13 @@ def _patch_sharing_env(
         )
 
 
-def _make_ooxml_zip(members: dict[str, bytes | str]) -> bytes:
+def _make_ooxml_zip(
+    members: dict[str, bytes | str],
+    *,
+    compression: int = zipfile.ZIP_DEFLATED,
+) -> bytes:
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(buf, "w", compression=compression) as zf:
         if "[Content_Types].xml" not in members:
             zf.writestr(
                 "[Content_Types].xml",
@@ -255,6 +267,57 @@ def _make_ooxml_zip(members: dict[str, bytes | str]) -> bytes:
         for name, data in members.items():
             zf.writestr(name, data)
     return buf.getvalue()
+
+
+def _make_ole2_bytes(
+    entries: list[tuple[str, int]],
+    *,
+    extra_body: bytes = b"",
+) -> bytes:
+    """Build a valid minimal OLE2 Compound Document with the given directory entries.
+
+    Each entry is ``(name, etype)`` where ``etype=1`` is a storage and ``etype=2``
+    is a stream. Optional ``extra_body`` bytes are stored in an extra data sector
+    so clean documents can carry ordinary UTF-16LE text (e.g. ``Macros``/``VBA``)
+    without creating a VBA directory entry.
+    """
+    all_entries = [("Root Entry", 5), *entries]
+    assert len(all_entries) <= 4, "helper supports up to 3 child entries"
+    extra_sectors = (len(extra_body) + 511) // 512 if extra_body else 0
+
+    header = bytearray(512)
+    header[0:8] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+    struct.pack_into("<HHHH", header, 24, 0x003E, 0x0003, 0xFFFE, 9)
+    struct.pack_into("<H", header, 32, 6)
+    struct.pack_into("<iiiiiiii", header, 44, 1, 1, 0, 4096, -2, 0, -2, 0)
+    difat = [0] + [-1] * 108
+    struct.pack_into("<109i", header, 76, *difat)
+
+    fat = bytearray(512)
+    fat_entries = [-3, -2] + [-1] * 126
+    for i in range(extra_sectors):
+        sec_idx = 2 + i
+        fat_entries[sec_idx] = (sec_idx + 1) if (i + 1 < extra_sectors) else -2
+    struct.pack_into("<128i", fat, 0, *fat_entries)
+
+    dir_buf = bytearray(512)
+    for idx, (name, etype) in enumerate(all_entries):
+        off = idx * 128
+        raw_name = name.encode("utf-16-le") + b"\x00\x00"
+        dir_buf[off : off + len(raw_name)] = raw_name
+        cbufsize = len(raw_name)
+        left_did = -1
+        right_did = idx + 1 if (idx >= 1 and idx + 1 < len(all_entries)) else -1
+        root_did = 1 if (idx == 0 and len(all_entries) > 1) else -1
+        first_sid = 2 if (idx == 1 and extra_sectors > 0) else -2
+        tot_size = len(extra_body) if (idx == 1 and extra_sectors > 0) else 0
+        struct.pack_into(
+            "<HBBiii", dir_buf, off + 64, cbufsize, etype, 1, left_did, right_did, root_did
+        )
+        struct.pack_into("<ii", dir_buf, off + 116, first_sid, tot_size)
+
+    padded_body = extra_body + b"\x00" * (extra_sectors * 512 - len(extra_body))
+    return bytes(header + fat + dir_buf + padded_body)
 
 
 def _make_minimal_png() -> bytes:
@@ -636,6 +699,155 @@ class TestHomeStandInRefusal:
         # Unused import reference check: cos_mod.agent_output delegates to verify_thread_owner
         assert callable(cos_mod.agent_output.coroutine)
 
+    @pytest.mark.asyncio
+    async def test_workspace_routes_hide_stand_in_and_authorize_before_home_delete_check(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from starlette.requests import Request
+        from src.server.database.home_workspace import get_home_workspace_id
+
+        owner_home_id = get_home_workspace_id(OWNER_ID)
+        owner_home_row = {
+            **NORMAL_SHARED_WS_ROW,
+            "workspace_id": owner_home_id,
+            "name": "Home",
+            "dir_name": "Home",
+            "config": {},
+        }
+        ws_map = {
+            STAND_IN_WS_ID: STAND_IN_WS_ROW,
+            NORMAL_WS_ID: NORMAL_SHARED_WS_ROW,
+            owner_home_id: owner_home_row,
+        }
+        get_ws_mock = create_autospec(
+            ws_db_mod.get_workspace,
+            side_effect=lambda ws_id, **kw: (
+                dict(ws_map[str(ws_id)]) if str(ws_id) in ws_map else None
+            ),
+        )
+        monkeypatch.setattr(workspaces_app_mod, "db_get_workspace", get_ws_mock)
+        monkeypatch.setattr(ws_db_mod, "get_workspace", get_ws_mock)
+        monkeypatch.setattr(shared_access_mod.workspace_db, "get_workspace", get_ws_mock)
+
+        # 1) /events (workspaces.py:533): stand-in returns same 404 as missing
+        with pytest.raises(HTTPException) as exc_ev_missing:
+            await workspaces_app_mod.workspace_status_events(MISSING_WS_ID, COLLEAGUE_ID)
+        with pytest.raises(HTTPException) as exc_ev_standin:
+            await workspaces_app_mod.workspace_status_events(STAND_IN_WS_ID, COLLEAGUE_ID)
+        assert exc_ev_standin.value.status_code == exc_ev_missing.value.status_code == 404
+        assert exc_ev_standin.value.detail == exc_ev_missing.value.detail
+
+        # 2) GET /move (workspaces.py:1172): stand-in returns same 404 as missing
+        with pytest.raises(HTTPException) as exc_mv_missing:
+            await workspaces_app_mod.get_workspace_move(MISSING_WS_ID, COLLEAGUE_ID)
+        with pytest.raises(HTTPException) as exc_mv_standin:
+            await workspaces_app_mod.get_workspace_move(STAND_IN_WS_ID, COLLEAGUE_ID)
+        assert exc_mv_standin.value.status_code == exc_mv_missing.value.status_code == 404
+        assert exc_mv_standin.value.detail == exc_mv_missing.value.detail
+
+        # 3) DELETE /{workspace_id} (workspaces.py:1293): authorize BEFORE "Cannot delete Home"
+        req = create_autospec(Request, instance=True)
+        colleague_principal = Principal(user_id=COLLEAGUE_ID, auth="session")
+        owner_principal = Principal(user_id=OWNER_ID, auth="session")
+
+        with pytest.raises(HTTPException) as exc_del_missing:
+            await workspaces_app_mod.delete_workspace(MISSING_WS_ID, colleague_principal, req)
+        with pytest.raises(HTTPException) as exc_del_standin:
+            await workspaces_app_mod.delete_workspace(STAND_IN_WS_ID, colleague_principal, req)
+        assert exc_del_standin.value.status_code == exc_del_missing.value.status_code == 404
+        assert exc_del_standin.value.detail == exc_del_missing.value.detail
+
+        # Non-owner deleting regular Home gets 403 Forbidden (not 400 Cannot delete Home)
+        with pytest.raises(HTTPException) as exc_del_home_colleague:
+            await workspaces_app_mod.delete_workspace(owner_home_id, colleague_principal, req)
+        assert exc_del_home_colleague.value.status_code == 403
+
+        # Owner deleting own Home or own stand-in still gets 400 Cannot delete Home
+        for own_reserved_id in (owner_home_id, STAND_IN_WS_ID):
+            with pytest.raises(HTTPException) as exc_del_own:
+                await workspaces_app_mod.delete_workspace(own_reserved_id, owner_principal, req)
+            assert exc_del_own.value.status_code == 400
+            assert exc_del_own.value.detail == "Cannot delete Home"
+
+    @pytest.mark.asyncio
+    async def test_partial_dict_missing_config_queries_db_and_thread_access_hides_stand_in(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ws_map = {
+            STAND_IN_WS_ID: STAND_IN_WS_ROW,
+            NORMAL_WS_ID: NORMAL_SHARED_WS_ROW,
+        }
+        orig_dispatch_enabled = dalton_settings_mod.is_colleague_dispatch_enabled
+        _patch_sharing_env(monkeypatch, ws_map, cos_access="rw", web_access="hidden")
+        monkeypatch.setattr(
+            sharing_mod,
+            "is_colleague_dispatch_enabled",
+            create_autospec(orig_dispatch_enabled, return_value=True),
+        )
+
+        # Partial dict omitting "config" must query DB and still return 404 (not assume non-stand-in)
+        partial_stand_in = {
+            "workspace_id": STAND_IN_WS_ID,
+            "user_id": OWNER_ID,
+            "status": "running",
+        }
+        with pytest.raises(HTTPException) as exc_partial_sharing:
+            await sharing_mod.require_workspace_access(
+                partial_stand_in, COLLEAGUE_ID, channel="cos", need="read"
+            )
+        assert exc_partial_sharing.value.status_code == 404
+        assert exc_partial_sharing.value.detail == "Workspace not found"
+
+        with pytest.raises(HTTPException) as exc_partial_generic:
+            await shared_access_mod.workspace_access(partial_stand_in, COLLEAGUE_ID)
+        assert exc_partial_generic.value.status_code == 404
+        assert exc_partial_generic.value.detail == "Workspace not found"
+
+        # Pre-existing cross-user thread in owner's Home stand-in: web thread-initiator fast path
+        # MUST NOT bypass workspace ownership / stand-in check, and returns "Thread not found".
+        async def _thread_meta(tid: str, **kw: Any) -> dict[str, Any] | None:
+            if tid == "t-standin-cross":
+                return {
+                    "workspace_id": STAND_IN_WS_ID,
+                    "workspace_owner_id": OWNER_ID,
+                    "user_id": COLLEAGUE_ID,
+                    "thread_user_id": COLLEAGUE_ID,
+                }
+            if tid == "t-hidden-normal":
+                return {
+                    "workspace_id": NORMAL_WS_ID,
+                    "workspace_owner_id": OWNER_ID,
+                    "user_id": OWNER_ID,
+                    "thread_user_id": OWNER_ID,
+                }
+            return None
+
+        monkeypatch.setattr(
+            conv_db_mod,
+            "get_thread_auth_meta",
+            create_autospec(conv_db_mod.get_thread_auth_meta, side_effect=_thread_meta),
+        )
+
+        with pytest.raises(HTTPException) as exc_missing_t:
+            await sharing_mod.require_thread_access(
+                "t-does-not-exist", COLLEAGUE_ID, channel="web", need="read"
+            )
+        with pytest.raises(HTTPException) as exc_standin_web_t:
+            await sharing_mod.require_thread_access(
+                "t-standin-cross", COLLEAGUE_ID, channel="web", need="read"
+            )
+        with pytest.raises(HTTPException) as exc_hidden_ws_t:
+            await sharing_mod.require_thread_access(
+                "t-hidden-normal", COLLEAGUE_ID, channel="web", need="read"
+            )
+        assert exc_missing_t.value.status_code == 404
+        assert exc_missing_t.value.detail == "Thread not found"
+        assert exc_standin_web_t.value.status_code == 404
+        assert exc_standin_web_t.value.detail == "Thread not found"
+        # Invisible workspace in require_thread_access normalizes 404 detail to "Thread not found"
+        assert exc_hidden_ws_t.value.status_code == 404
+        assert exc_hidden_ws_t.value.detail == "Thread not found"
+
 
 # ===========================================================================
 # 2. Unified sensitive path filter across CoS, Analyst, and Web non-owner routes
@@ -667,6 +879,15 @@ class TestUnifiedSensitivePathFilter:
             "keys/id_ed25519",
             "gcp/credentials.json",
             "gcp/credentials_prod.json",
+            "aws_credentials.json",
+            "gcp-credentials.json",
+            "secret.json",
+            "token.json",
+            "deploy_key",
+            "prod_private_key.yaml",
+            "api_TOKEN.yml",
+            "service_secret.toml",
+            "backup_id_ed25519",
             "auth/client_secret_app.json",
             "auth/service_account.json",
             "secrets.yaml",
@@ -674,6 +895,8 @@ class TestUnifiedSensitivePathFilter:
             "cert.p12",
             "cert.pfx",
             "putty.ppk",
+            ".agents/shared/guide.md",
+            ".agents/tmp/colleague-copy-1234",
         ],
     )
     def test_sensitive_paths_blocked_by_shared_classifier(self, blocked_path: str) -> None:
@@ -685,28 +908,28 @@ class TestUnifiedSensitivePathFilter:
         [
             "reports/q3_summary.md",
             "notes/key_drivers.md",
+            "notes/tokenomics_analysis.md",
             "data/company.json",
             "models/NVDA_DCF.xlsx",
             "shared/valuation_key_points.txt",
             "work/task1/output.html",
+            ".",
+            "./",
         ],
     )
-    def test_normal_research_paths_allowed_by_shared_classifier(self, allowed_path: str) -> None:
+    def test_normal_research_paths_and_dot_root_allowed_by_shared_classifier(
+        self, allowed_path: str
+    ) -> None:
         assert served_paths_mod.is_non_owner_sensitive_path(allowed_path) is False
         assert ws_shared_mod._is_non_owner_blocked_path(allowed_path) is False
 
-    def test_explicit_agents_shared_prefix_carveout_allows_normal_and_blocks_sensitive(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(
-            served_paths_mod,
-            "_NON_OWNER_SHARED_AGENTS_PREFIXES",
-            (".agents/shared",),
-        )
-        assert served_paths_mod.is_non_owner_sensitive_path(".agents/shared/guide.md") is False
-        assert served_paths_mod.is_non_owner_sensitive_path(".agents/shared/.env") is True
-        assert served_paths_mod.is_non_owner_sensitive_path(".agents/shared/private.key") is True
+    def test_agents_has_no_non_owner_shared_carveout_and_dot_root_allowed(self) -> None:
+        assert not hasattr(served_paths_mod, "_NON_OWNER_SHARED_AGENTS_PREFIXES")
+        assert served_paths_mod.is_non_owner_sensitive_path(".agents/shared/guide.md") is True
+        assert ws_shared_mod._is_non_owner_blocked_path(".agents/shared/guide.md") is True
         assert served_paths_mod.is_non_owner_sensitive_path(".agents/memory/private.md") is True
+        assert served_paths_mod.is_non_owner_sensitive_path(".") is False
+        assert ws_shared_mod._is_non_owner_blocked_path(".") is False
 
     @pytest.mark.asyncio
     async def test_cos_analyst_and_web_backup_share_same_sensitive_path_filter(
@@ -939,10 +1162,17 @@ class TestCopyFileRevocationAtomicity:
         dest_sandbox.execute_bash_command.return_value = {"success": True, "exit_code": 0}
 
         @asynccontextmanager
-        async def _acquire(ws_id: str, owner_id: str):
+        async def _acquire(ws_id: str, owner_id: str, cause: Any = "files"):
             yield dest_sandbox, dest_row
 
-        monkeypatch.setattr(ws_files_svc_mod, "acquire_sandbox_to_change", _acquire)
+        monkeypatch.setattr(
+            ws_files_svc_mod,
+            "acquire_sandbox_to_change",
+            create_autospec(
+                ws_files_svc_mod.acquire_sandbox_to_change,
+                side_effect=_acquire,
+            ),
+        )
         monkeypatch.setattr(
             ws_files_svc_mod,
             "owner_work_dir",
@@ -1007,15 +1237,16 @@ class TestCopyFileRevocationAtomicity:
         payload = _cmd_payload(cmd)
         assert payload == {"success": False, "error": "workspace not found"}
         assert verify_mock.await_count == 2
-        # Uploaded ONLY to temp file, never directly to dest
+        # Uploaded ONLY to temp file under .agents/tmp/colleague-copy-*, never directly to dest
         assert dest_sandbox.aupload_file_bytes.await_count == 1
         tmp_path, uploaded = dest_sandbox.aupload_file_bytes.await_args.args
-        assert tmp_path.startswith("/home/workspace/Home/.wsfiles-copy-")
+        assert tmp_path.startswith("/home/workspace/Home/.agents/tmp/colleague-copy-")
         assert uploaded == raw
-        # Only rm -f on temp file ran; mv never ran
+        # 1st cmd prepares dirs (mkdir -p), 2nd cmd removes temp file; mv never ran
         cmds = [c.kwargs["command"] for c in dest_sandbox.execute_bash_command.await_args_list]
-        assert len(cmds) == 1
-        assert cmds[0].startswith("rm -f -- ") and tmp_path in cmds[0]
+        assert len(cmds) == 2
+        assert cmds[0].startswith("mkdir -p -- ")
+        assert cmds[1].startswith("rm -f -- ") and tmp_path in cmds[1]
         assert not any("mv " in c for c in cmds)
 
     @pytest.mark.asyncio
@@ -1024,12 +1255,32 @@ class TestCopyFileRevocationAtomicity:
     ) -> None:
         raw = b"# Shared Research Note\n"
         dest_sandbox = self._setup_copy_env(monkeypatch, file_bytes=raw)
+        events: list[str] = []
+
+        async def _record_verify(*args: Any, **kwargs: Any) -> Any:
+            events.append("verify_source")
+            return None
+
+        async def _record_upload(*args: Any, **kwargs: Any) -> bool:
+            events.append("upload")
+            return True
+
+        async def _record_bash(*, command: str, timeout: int = 30) -> dict[str, Any]:
+            if command.startswith("mkdir -p -- "):
+                events.append("mkdir")
+            elif "mv -T" in command:
+                events.append("mv")
+            elif command.startswith("rm -f -- "):
+                events.append("rm")
+            return {"success": True, "exit_code": 0}
 
         verify_mock = create_autospec(
             sec_tools_mod.verify_workspace_owner,
-            side_effect=[None, None],
+            side_effect=_record_verify,
         )
         monkeypatch.setattr(sec_tools_mod, "verify_workspace_owner", verify_mock)
+        dest_sandbox.aupload_file_bytes.side_effect = _record_upload
+        dest_sandbox.execute_bash_command.side_effect = _record_bash
 
         cmd = await sec_tools_mod.workspace_file_copy_cos(
             user_id=COLLEAGUE_ID,
@@ -1042,11 +1293,99 @@ class TestCopyFileRevocationAtomicity:
         assert payload["success"] is True
         assert payload["path"] == "shared/report.md"
         assert verify_mock.await_count == 2
+        # Order: initial verify -> mkdir -> upload -> recheck right before mv -T -> mv
+        assert events == ["verify_source", "mkdir", "upload", "verify_source", "mv"]
         tmp_path = dest_sandbox.aupload_file_bytes.await_args.args[0]
+        assert tmp_path.startswith("/home/workspace/Home/.agents/tmp/colleague-copy-")
         cmds = [c.kwargs["command"] for c in dest_sandbox.execute_bash_command.await_args_list]
-        assert len(cmds) == 1
-        assert "mv -f -- " in cmds[0]
-        assert tmp_path in cmds[0] and "/home/workspace/Home/shared/report.md" in cmds[0]
+        assert len(cmds) == 2
+        assert cmds[0].startswith("mkdir -p -- ")
+        assert "test ! -d " in cmds[1] and "mv -T -f -- " in cmds[1]
+        assert tmp_path in cmds[1] and "/home/workspace/Home/shared/report.md" in cmds[1]
+
+    @pytest.mark.asyncio
+    async def test_cos_copy_to_own_workspace_allows_dotdir_regression(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression (R2 item 6): non-owner path filter must not tighten owner's own copy destination."""
+        raw = b"# Internal Draft Summary\n"
+        self._setup_copy_env(monkeypatch, file_bytes=raw)
+        verify_mock = create_autospec(
+            sec_tools_mod.verify_workspace_owner,
+            side_effect=[None, None],
+        )
+        monkeypatch.setattr(sec_tools_mod, "verify_workspace_owner", verify_mock)
+
+        cmd = await sec_tools_mod.workspace_file_copy_cos(
+            user_id=COLLEAGUE_ID,
+            workspace_id=NORMAL_WS_ID,
+            path="notes/report.md",
+            dest_path=".reports/summary.md",
+            tool_call_id="tc-own-dotdir",
+        )
+        payload = _cmd_payload(cmd)
+        assert payload["success"] is True
+        assert payload["path"] == ".reports/summary.md"
+
+    @pytest.mark.asyncio
+    async def test_staging_cleanup_on_upload_error_cancel_and_warns_on_rm_failure(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        raw = b"# Staging Cleanup Test\n"
+        dest_sandbox = self._setup_copy_env(monkeypatch, file_bytes=raw)
+        monkeypatch.setattr(
+            sec_tools_mod,
+            "verify_workspace_owner",
+            create_autospec(sec_tools_mod.verify_workspace_owner, return_value=None),
+        )
+
+        # 1) Staging path excluded from panel (even include_system=True) and backups
+        sample_staging = f"{SandboxLayout.TMP_DIR}/colleague-copy-abc123"
+        assert served_paths_mod.is_always_hidden_path(sample_staging) is True
+        assert served_paths_mod.panel_lists_stored_file(
+            sample_staging, include_system=True, include_hidden=True
+        ) is False
+        assert SandboxLayout.TMP_DIR in BACKUP_EXCLUDE_AGENT_SUBDIRS
+        assert SandboxLayout.TMP_DIR in transfer_mod.EXCLUDE_REL_DIRS
+
+        # 2) Upload raises RuntimeError + rm returns non-zero -> cleanup runs AND logs warning
+        dest_sandbox.aupload_file_bytes.side_effect = RuntimeError("upload boom")
+        dest_sandbox.execute_bash_command.side_effect = [
+            {"success": True, "exit_code": 0},  # mkdir
+            {"success": False, "exit_code": 1},  # rm fails
+        ]
+        with caplog.at_level(logging.WARNING):
+            cmd = await sec_tools_mod.workspace_file_copy_cos(
+                user_id=COLLEAGUE_ID,
+                workspace_id=NORMAL_WS_ID,
+                path="notes/report.md",
+                dest_path="shared/report.md",
+                tool_call_id="tc-upload-err",
+            )
+        assert _cmd_payload(cmd)["success"] is False
+        cmds = [c.kwargs["command"] for c in dest_sandbox.execute_bash_command.await_args_list]
+        assert len(cmds) == 2 and cmds[1].startswith("rm -f -- ")
+        assert any("Failed to remove temp copy file" in r.message for r in caplog.records)
+
+        # 3) Upload cancelled (asyncio.CancelledError) -> cleanup still runs before propagating
+        dest_sandbox.execute_bash_command.reset_mock()
+        dest_sandbox.execute_bash_command.side_effect = [
+            {"success": True, "exit_code": 0},  # mkdir
+            {"success": True, "exit_code": 0},  # rm
+        ]
+        dest_sandbox.aupload_file_bytes.side_effect = asyncio.CancelledError()
+        with pytest.raises(asyncio.CancelledError):
+            await sec_tools_mod.workspace_file_copy_cos(
+                user_id=COLLEAGUE_ID,
+                workspace_id=NORMAL_WS_ID,
+                path="notes/report.md",
+                dest_path="shared/report.md",
+                tool_call_id="tc-upload-cancel",
+            )
+        cmds_cancel = [
+            c.kwargs["command"] for c in dest_sandbox.execute_bash_command.await_args_list
+        ]
+        assert len(cmds_cancel) == 2 and cmds_cancel[1].startswith("rm -f -- ")
 
     @pytest.mark.asyncio
     async def test_analyst_copy_file_revoked_before_commit_deletes_temp_and_normal_commits(
@@ -1076,7 +1415,7 @@ class TestCopyFileRevocationAtomicity:
             }
         }
 
-        # Denied: revoked between initial check and commit re-check
+        # Denied: source revoked between initial check and commit re-check
         orig_dual = cw_mod._dual_verify_workspace
         dual_revoke = create_autospec(
             orig_dual,
@@ -1096,10 +1435,13 @@ class TestCopyFileRevocationAtomicity:
         assert _cmd_payload(cmd_revoked) == {"success": False, "error": "workspace not found"}
         assert dual_revoke.await_count == 2
         tmp_path = dest_sandbox.aupload_file_bytes.await_args.args[0]
+        assert tmp_path.startswith("/home/workspace/Semis/.agents/tmp/colleague-copy-")
         cmds = [c.kwargs["command"] for c in dest_sandbox.execute_bash_command.await_args_list]
-        assert len(cmds) == 1 and cmds[0].startswith("rm -f -- ") and tmp_path in cmds[0]
+        assert len(cmds) == 2
+        assert cmds[0].startswith("mkdir -p -- ")
+        assert cmds[1].startswith("rm -f -- ") and tmp_path in cmds[1]
 
-        # Normal sharing works: both checks succeed -> atomic rename commits
+        # Normal sharing works: both checks succeed -> atomic rename commits via mv -T
         dest_sandbox.aupload_file_bytes.reset_mock()
         dest_sandbox.execute_bash_command.reset_mock()
         dual_ok = create_autospec(orig_dual, side_effect=[None, None])
@@ -1116,7 +1458,82 @@ class TestCopyFileRevocationAtomicity:
         assert payload_ok["path"] == "shared/report.md"
         assert dual_ok.await_count == 2
         cmds_ok = [c.kwargs["command"] for c in dest_sandbox.execute_bash_command.await_args_list]
-        assert len(cmds_ok) == 1 and "mv -f -- " in cmds_ok[0]
+        assert len(cmds_ok) == 2
+        assert cmds_ok[0].startswith("mkdir -p -- ")
+        assert "test ! -d " in cmds_ok[1] and "mv -T -f -- " in cmds_ok[1]
+
+    @pytest.mark.asyncio
+    async def test_analyst_copy_file_dest_write_revoked_right_before_rename_deletes_temp(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw = b"# Analyst Dest Revoke Note\n"
+        cross_dest_row = {
+            **COLLEAGUE_CUR_WS_ROW,
+            "user_id": OWNER_ID,
+        }
+        dest_sandbox = self._setup_copy_env(
+            monkeypatch, file_bytes=raw, dest_row=cross_dest_row
+        )
+        monkeypatch.setattr(
+            dalton_settings_mod,
+            "is_dalton_sharing_auth_enabled",
+            create_autospec(dalton_settings_mod.is_dalton_sharing_auth_enabled, return_value=True),
+        )
+        monkeypatch.setattr(
+            cw_mod,
+            "mark_run_outbound_blocked",
+            create_autospec(cw_mod.mark_run_outbound_blocked, return_value=True),
+        )
+        monkeypatch.setattr(
+            cw_mod,
+            "get_user_tier",
+            create_autospec(cw_mod.get_user_tier, return_value="internal"),
+        )
+        monkeypatch.setattr(
+            cw_mod,
+            "classify_owner_tier",
+            create_autospec(cw_mod.classify_owner_tier, return_value="internal"),
+        )
+        monkeypatch.setattr(
+            cw_mod,
+            "_dual_verify_workspace",
+            create_autospec(cw_mod._dual_verify_workspace, side_effect=[None, None]),
+        )
+        # 1st require_workspace_access (initial dest write check) passes;
+        # 2nd (pre-rename dest write recheck) raises 403; 3rd (read check) passes -> read-only error
+        req_dest_mock = create_autospec(
+            cw_mod.require_workspace_access,
+            side_effect=[
+                cross_dest_row,
+                HTTPException(status_code=403, detail="Forbidden"),
+                cross_dest_row,
+            ],
+        )
+        monkeypatch.setattr(cw_mod, "require_workspace_access", req_dest_mock)
+        cw_tool = cw_mod.create_colleague_workspace_tools()[0]
+        cross_cfg = {
+            "configurable": {
+                "user_id": COLLEAGUE_ID,
+                "workspace_id": CUR_WS_ID,
+                "workspace_owner_id": OWNER_ID,
+                "origin_channel": "web",
+            }
+        }
+        cmd_dest_revoked = await _invoke_tool(
+            cw_tool,
+            {"action": "copy_file", "workspace_id": NORMAL_WS_ID, "path": "notes/report.md"},
+            config=cross_cfg,
+            call_id="tc-a-dest-revoked",
+        )
+        assert _cmd_payload(cmd_dest_revoked)["success"] is False
+        assert "只读权限" in _cmd_payload(cmd_dest_revoked)["error"]
+        cmds_dest = [
+            c.kwargs["command"] for c in dest_sandbox.execute_bash_command.await_args_list
+        ]
+        assert len(cmds_dest) == 2
+        assert cmds_dest[0].startswith("mkdir -p -- ")
+        assert cmds_dest[1].startswith("rm -f -- ")
+        assert not any("mv " in c for c in cmds_dest)
 
 
 # ===========================================================================
@@ -1262,10 +1679,17 @@ class TestBinaryCopySecretChecks:
         dest_sandbox = create_autospec(PTCSandbox, instance=True)
 
         @asynccontextmanager
-        async def _acquire(ws_id: str, owner_id: str):
+        async def _acquire(ws_id: str, owner_id: str, cause: Any = "files"):
             yield dest_sandbox, ws_map[str(ws_id)]
 
-        monkeypatch.setattr(ws_files_svc_mod, "acquire_sandbox_to_change", _acquire)
+        monkeypatch.setattr(
+            ws_files_svc_mod,
+            "acquire_sandbox_to_change",
+            create_autospec(
+                ws_files_svc_mod.acquire_sandbox_to_change,
+                side_effect=_acquire,
+            ),
+        )
         monkeypatch.setattr(
             ws_files_crud_mod,
             "_read_contained_target",
@@ -1287,3 +1711,93 @@ class TestBinaryCopySecretChecks:
             assert payload["success"] is False
             assert payload["error"] == sec_tools_mod._COS_MACRO_OFFICE_REFUSED_ERROR
         dest_sandbox.aupload_file_bytes.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("filename", "clean_stream", "macro_entry"),
+        [
+            ("legacy.xls", "Workbook", ("_VBA_PROJECT_CUR", 1)),
+            ("legacy.doc", "WordDocument", ("Macros", 1)),
+            ("legacy.ppt", "PowerPoint Document", ("VBA", 1)),
+        ],
+    )
+    def test_legacy_ole_office_macro_refused_and_macro_free_allowed(
+        self,
+        filename: str,
+        clean_stream: str,
+        macro_entry: tuple[str, int],
+    ) -> None:
+        # Clean OLE file (even with body text mentioning "Macros" / "VBA") is allowed
+        clean_ole = _make_ole2_bytes(
+            [(clean_stream, 2)],
+            extra_body="Macroeconomics and VBA discussion".encode("utf-16-le"),
+        )
+        assert sec_tools_mod._scan_copy_bytes_for_secrets(filename, clean_ole, {}) is None
+
+        # Macro-bearing OLE file is refused with the macro error
+        macro_ole = _make_ole2_bytes([(clean_stream, 2), macro_entry])
+        err = sec_tools_mod._scan_copy_bytes_for_secrets(filename, macro_ole, {})
+        assert err == sec_tools_mod._COS_MACRO_OFFICE_REFUSED_ERROR
+
+    def test_legacy_ole_utf16le_fallback_catches_macro_in_truncated_container(self) -> None:
+        truncated_macro = (
+            sec_tools_mod._OLE_HEADER
+            + b"\x00" * 64
+            + "_VBA_PROJECT".encode("utf-16-le")
+            + b"\x00\x00"
+        )
+        assert (
+            sec_tools_mod._scan_copy_bytes_for_secrets("broken.xls", truncated_macro, {})
+            == sec_tools_mod._COS_MACRO_OFFICE_REFUSED_ERROR
+        )
+
+    def test_ooxml_resource_limits_compression_members_streaming_bytes_and_non_xml_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        redactor = SecretRedactor.__new__(SecretRedactor)
+        redactor._secrets = [("GLOBAL_SECRET_KEY", "platform-nonxml-secret-555555")]
+        monkeypatch.setattr(
+            redactor_mod,
+            "get_redactor",
+            create_autospec(redactor_mod.get_redactor, return_value=redactor),
+        )
+
+        # 1) Stored & Deflated allowed; BZIP2 & LZMA refused
+        stored = _make_ooxml_zip({"xl/workbook.xml": "<w/>"}, compression=zipfile.ZIP_STORED)
+        deflated = _make_ooxml_zip({"xl/workbook.xml": "<w/>"}, compression=zipfile.ZIP_DEFLATED)
+        assert sec_tools_mod._scan_copy_bytes_for_secrets("ok.xlsx", stored, {}) is None
+        assert sec_tools_mod._scan_copy_bytes_for_secrets("ok.xlsx", deflated, {}) is None
+
+        for bad_comp in (zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA):
+            bad_zip = _make_ooxml_zip({"xl/workbook.xml": "<w/>"}, compression=bad_comp)
+            err = sec_tools_mod._scan_copy_bytes_for_secrets("bad.xlsx", bad_zip, {})
+            assert err is not None and "压缩方式" in err
+
+        # 2) Member count > 2000 refused
+        many_members = {f"xl/m{i}.xml": "<a/>" for i in range(2001)}
+        too_many_zip = _make_ooxml_zip(many_members)
+        err_members = sec_tools_mod._scan_copy_bytes_for_secrets("many.xlsx", too_many_zip, {})
+        assert err_members is not None and "成员数量" in err_members
+
+        # 3) Actual decompressed total > cap stops & refuses (use small cap via monkeypatch)
+        monkeypatch.setattr(sec_tools_mod, "_COS_ZIP_TOTAL_MAX_BYTES", 200_000)
+        monkeypatch.setattr(sec_tools_mod, "_COS_ZIP_MEMBER_MAX_BYTES", 150_000)
+        over_total_zip = _make_ooxml_zip(
+            {"xl/a.xml": "A" * 120_000, "xl/b.xml": "B" * 120_000}
+        )
+        err_total = sec_tools_mod._scan_copy_bytes_for_secrets("bomb.xlsx", over_total_zip, {})
+        assert err_total is not None and "解压总量" in err_total
+
+        # 4) Non-XML UTF-8 text member also checked with known-secret redactor
+        dirty_non_xml = _make_ooxml_zip(
+            {
+                "xl/workbook.xml": "<workbook/>",
+                "docProps/custom_note.txt": "key=platform-nonxml-secret-555555",
+            }
+        )
+        err_non_xml = sec_tools_mod._scan_copy_bytes_for_secrets("note.xlsx", dirty_non_xml, {})
+        assert err_non_xml is not None and ("密钥" in err_non_xml or "凭据" in err_non_xml)
+
+        # Tool docstrings no longer advertise .xlsm as supported
+        assert ".xlsm" not in (cos_mod.chief_of_staff_workspaces.description or "")
+        cw_tool = cw_mod.create_colleague_workspace_tools()[0]
+        assert ".xlsm" not in (cw_tool.description or "")

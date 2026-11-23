@@ -51,10 +51,10 @@ def is_hidden_path(client_path: str) -> bool:
 
 
 # --- DALTON-HOOK(colleague-access): begin ---
-# Explicitly shared subpaths under ``.agents/`` that remain visible to
-# non-owners (empty by default: all ``.agents/`` paths stay blocked unless
-# explicitly opted in here).
-_NON_OWNER_SHARED_AGENTS_PREFIXES: tuple[str, ...] = ()
+# Staging prefix for server-side copy_file temp files under ``.agents/tmp/``.
+# Kept out of the file panel (even with include_system=True) and backups, and
+# isolated from the transfer runtime's root ``.wsfiles-*`` orphan sweep.
+COPY_STAGING_PREFIX: str = f"{SandboxLayout.TMP_DIR}/colleague-copy-"
 
 _NON_OWNER_SENSITIVE_SUFFIXES: tuple[str, ...] = (
     ".pem",
@@ -80,6 +80,21 @@ _NON_OWNER_SENSITIVE_JSON_PREFIXES: tuple[str, ...] = (
     "service_account",
     "service-account",
 )
+_NON_OWNER_SENSITIVE_CONFIG_SUFFIXES: tuple[str, ...] = (
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+)
+_NON_OWNER_SENSITIVE_SUBSTRINGS: tuple[str, ...] = (
+    "credential",
+    "secret",
+    "token",
+    "private_key",
+    "deploy_key",
+    "id_rsa",
+    "id_ed25519",
+)
 _NON_OWNER_SENSITIVE_EXACT_BASENAMES: frozenset[str] = frozenset(
     {
         ".env",
@@ -102,7 +117,7 @@ def _is_non_owner_sensitive_basename(basename: str) -> bool:
     lower = basename.strip().lower()
     if not lower:
         return True
-    if lower == ".env" or lower.startswith(".env."):
+    if lower == ".env" or lower.startswith(".env.") or ".env." in lower:
         return True
     if lower in _NON_OWNER_SENSITIVE_EXACT_BASENAMES:
         return True
@@ -114,6 +129,17 @@ def _is_non_owner_sensitive_basename(basename: str) -> bool:
         lower.startswith(prefix) for prefix in _NON_OWNER_SENSITIVE_JSON_PREFIXES
     ):
         return True
+    is_config_or_extensionless = (
+        "." not in lower
+        or lower.endswith(_NON_OWNER_SENSITIVE_CONFIG_SUFFIXES)
+        or lower.startswith(".env")
+        or lower.endswith(".env")
+        or ".env." in lower
+    )
+    if is_config_or_extensionless and any(
+        sub in lower for sub in _NON_OWNER_SENSITIVE_SUBSTRINGS
+    ):
+        return True
     return False
 
 
@@ -121,27 +147,30 @@ def is_non_owner_sensitive_path(client_path: str) -> bool:
     """Unified path filter shared by Chief of Staff, Analyst, and Web non-owner routes.
 
     Blocks:
-    - empty / root / parent-traversal (``..``) paths;
-    - always-hidden and ``_internal`` / system paths;
+    - empty / parent-traversal (``..``) paths (standalone ``.`` is treated as the
+      workspace root directory and allowed);
+    - always-hidden and ``_internal`` / system paths (``.agents/`` is never
+      shared with non-owners);
     - ``.env``, ``.env.*``, and ``*.env`` files anywhere in the path;
-    - dot-prefixed hidden files or directories at any depth (except any path
-      under an explicitly shared ``.agents/`` prefix in
-      ``_NON_OWNER_SHARED_AGENTS_PREFIXES``, whose own descendants still cannot
-      be dot-prefixed or sensitive);
-    - credential / key filenames (``*.pem``, ``*.key``, ``id_rsa*``,
-      ``credentials*.json``, etc.).
+    - dot-prefixed hidden files or directories at any depth;
+    - credential / key / secret filenames (``*.pem``, ``*.key``, ``id_rsa*``,
+      ``*.json``/``*.yaml``/``*.yml``/``*.toml``/``.env*`` or extensionless
+      files containing ``credential``, ``secret``, ``token``, ``private_key``,
+      ``deploy_key``, ``id_rsa``, or ``id_ed25519``).
     """
     if not client_path:
         return True
     cleaned = client_path.replace("\\", "/").strip("/")
     if not cleaned:
         return True
+    if cleaned == ".":
+        return False
     raw_parts = [part for part in cleaned.split("/") if part != ""]
     if not raw_parts or ".." in raw_parts:
         return True
     parts = [part for part in raw_parts if part != "."]
     if not parts:
-        return True
+        return False
 
     normalized = "/".join(parts)
     with_slash = f"{normalized}/"
@@ -153,24 +182,10 @@ def is_non_owner_sensitive_path(client_path: str) -> bool:
     ):
         return True
 
-    shared_agents_tail: list[str] | None = None
-    for allowed_prefix in _NON_OWNER_SHARED_AGENTS_PREFIXES:
-        norm_prefix = allowed_prefix.strip("/")
-        if not norm_prefix:
-            continue
-        if normalized == norm_prefix or normalized.startswith(f"{norm_prefix}/"):
-            tail = normalized[len(norm_prefix) :].strip("/")
-            shared_agents_tail = tail.split("/") if tail else []
-            break
-
-    if shared_agents_tail is None:
-        if with_slash.startswith(SYSTEM_DIR_PREFIXES):
-            return True
-        if any(part.startswith(".") for part in parts):
-            return True
-    else:
-        if any(part.startswith(".") for part in shared_agents_tail):
-            return True
+    if with_slash.startswith(SYSTEM_DIR_PREFIXES):
+        return True
+    if any(part.startswith(".") for part in parts):
+        return True
 
     if _is_non_owner_sensitive_basename(parts[-1]):
         return True
@@ -182,9 +197,12 @@ def is_non_owner_sensitive_path(client_path: str) -> bool:
 def _is_transient_path(normalized: str) -> bool:
     # A transfer's partial or staged file, whose bytes are not yet the file
     # they will become; one a user edits or removes fails the transfer.
-    return normalized.rfind("/") == 0 and normalized[1:].startswith(
+    if normalized.rfind("/") == 0 and normalized[1:].startswith(
         TRANSIENT_ROOT_PREFIX
-    )
+    ):
+        return True
+    # DALTON-HOOK(colleague-access): hide copy_file staging temp files under .agents/tmp/
+    return normalized.startswith(f"/{COPY_STAGING_PREFIX}")
 
 
 def is_always_hidden_path(client_path: str) -> bool:

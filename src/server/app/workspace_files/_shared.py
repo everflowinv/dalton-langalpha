@@ -45,6 +45,7 @@ from src.server.services.workspace_file_containment import normalize_requested_p
 from src.server.services.served_paths import (
     SYSTEM_DIR_PREFIXES,
     is_always_hidden_path,
+    is_hidden_path,
     # DALTON-HOOK(colleague-access): unified non-owner sensitive path classifier
     is_non_owner_sensitive_path,
 )
@@ -338,19 +339,45 @@ def _is_system_path(client_path: str) -> bool:
 
 
 # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-# DALTON-HOOK(colleague-access): delegate non-owner sensitive/dotfile/credential checks to served_paths.is_non_owner_sensitive_path
+# DALTON-HOOK(colleague-access): split owner-baseline system/hidden/virtual gate from non-owner sensitive path gate
+def _is_protected_workspace_path(client_path: str) -> bool:
+    """True when a relative workspace path is always-hidden, _internal, system, or virtual.
+
+    Applied to owner-scoped server-side file operations so owners retain normal
+    access to their own dotfiles/dotdirs (e.g. ``.reports/summary.md``) while
+    still protecting system, ``_internal``, and virtual paths.
+    """
+    if not client_path:
+        return True
+    cleaned = client_path.replace("\\", "/").strip("/")
+    if not cleaned:
+        return True
+    if cleaned == ".":
+        return False
+    with_slash = f"{cleaned}/"
+    return (
+        is_always_hidden_path(cleaned)
+        or is_hidden_path(cleaned)
+        or with_slash.startswith(_HIDDEN_DIR_PREFIXES)
+        or _is_system_path(cleaned)
+        or with_slash.startswith(SYSTEM_DIR_PREFIXES)
+        or _is_virtual_dir(cleaned)
+        or bool(_virtual_file(cleaned))
+    )
+
+
 def _is_non_owner_blocked_path(client_path: str) -> bool:
     """True when a relative workspace path is hidden, system, virtual, or sensitive for a colleague."""
     if not client_path:
         return True
-    cleaned = client_path.strip("/")
+    cleaned = client_path.replace("\\", "/").strip("/")
     if not cleaned:
         return True
+    if cleaned == ".":
+        return False
     return (
-        is_non_owner_sensitive_path(cleaned)
-        or _is_system_path(cleaned)
-        or _is_virtual_dir(cleaned)
-        or bool(_virtual_file(cleaned))
+        _is_protected_workspace_path(cleaned)
+        or is_non_owner_sensitive_path(cleaned)
     )
 # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
