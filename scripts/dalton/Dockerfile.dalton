@@ -49,8 +49,11 @@ RUN if [ "$INSTALL_OBSERVABILITY" = "true" ]; then \
         uv sync --frozen --no-dev; \
     fi
 
-RUN uv run patchright install --with-deps chromium \
-    && uv run scrapling install
+ARG INSTALL_BROWSER_CRAWLER=true
+RUN if [ "$INSTALL_BROWSER_CRAWLER" = "true" ]; then \
+        uv run patchright install --with-deps chromium \
+        && uv run scrapling install; \
+    fi
 
 # Install git + OC-1 data-task APT packages (poppler-utils, fonts-noto-cjk) at image build time
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -98,8 +101,12 @@ RUN if [ -z "$BUILD_GIT_SHA" ] || [ "$BUILD_GIT_SHA" = "unknown" ]; then \
     fi \
     && printf '%s\n' "$BUILD_GIT_SHA" | cut -c1-8 > /app/.build_git_sha \
     && printf '%s\n' "$BUILD_GIT_DIRTY" > /app/.build_git_dirty \
-    && find server.py config.yaml config.dalton.yaml agent_config.yaml agent_config.dalton.yaml alembic.ini \
-            config/dalton libs/market-protocol libs/chartkit libs/edgar-engine src scripts migrations mcp_servers plugins workflows \
+    && set -- \
+    && for p in server.py config.yaml config.dalton.yaml config.core.yaml agent_config.yaml agent_config.dalton.yaml agent_config.core.yaml alembic.ini \
+            config/dalton libs/market-protocol libs/chartkit libs/edgar-engine src scripts migrations mcp_servers plugins workflows; do \
+        if [ -e "$p" ]; then set -- "$@" "$p"; fi; \
+    done \
+    && find "$@" \
             -type f ! -path 'libs/chartkit/chartkit/render/*' ! -path '*/__pycache__/*' ! -path '*/.pytest_cache/*' ! -path '*/.ruff_cache/*' ! -name '*.pyc' ! -name '*.pyo' ! -name '.DS_Store' -print0 \
        | sort -z \
        | xargs -0 sha256sum > /app/.build_files.sha256

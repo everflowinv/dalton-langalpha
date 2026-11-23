@@ -12,7 +12,6 @@ from typing import Any, Sequence, Union
 
 from alembic import op
 
-from src.dalton.autonomy.classification import build_research_tracking_sql_predicate
 from src.dalton.company_identity import (
     COMPANY_SYSTEM_USER_ID,
     ensure_company_system_identity_sync,
@@ -22,6 +21,66 @@ revision: str = "d035"
 down_revision: Union[str, None] = "d031"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
+
+
+def build_research_tracking_sql_predicate(alias: str = "a") -> str:
+    """Research-tracking predicate frozen as of this migration (commit b3adadab6).
+
+    The live version in ``src.dalton.autonomy.classification`` later reads
+    ``dalton_coverage_units.lead_analyst_user_id``, which d041 adds; importing it
+    here broke d035 on an empty database, where d041 has not run yet.
+    """
+    kinds_sql = ", ".join(
+        f"'{k}'"
+        for k in sorted(
+            {
+                "company_watch", "weekly_delta", "price_move", "earnings_tm3",
+                "earnings_t0", "earnings_tp1", "sector_watch", "sector_delta", "calendar",
+            }
+        )
+    )
+    excluded_sql = ", ".join(
+        f"'{n}'"
+        for n in sorted(
+            {
+                "dalton-director-daily", "dalton-director-weekly",
+                "dalton-data-health", "dalton-earnings-calendar",
+            }
+        )
+    )
+    return f"""(
+        {alias}.user_id <> 'system:dalton-company'
+        AND (
+            {alias}.name = 'dalton-earnings-calendar'
+            OR COALESCE({alias}.metadata->>'dalton_kind', '') IN ({kinds_sql})
+            OR (
+                {alias}.name ~ '^dalton-[a-z0-9._-]+-'
+                AND {alias}.name NOT IN ({excluded_sql})
+                AND {alias}.workspace_id IS NOT NULL
+                AND (
+                    EXISTS (
+                        SELECT 1
+                        FROM dalton_coverage_units u
+                        WHERE u.workspace_id = {alias}.workspace_id
+                          AND u.owner_user_id = {alias}.user_id
+                          AND u.kind IN ('company', 'sector')
+                          AND u.status = 'active'
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM workspaces w
+                        JOIN dalton_coverage c
+                          ON c.user_id = {alias}.user_id
+                         AND NULLIF(BTRIM(c.ticker), '') IS NOT NULL
+                         AND starts_with(LOWER({alias}.name), 'dalton-' || LOWER(BTRIM(c.ticker)) || '-')
+                        WHERE w.workspace_id = {alias}.workspace_id
+                          AND w.user_id = {alias}.user_id
+                          AND w.status NOT IN ('deleted', 'unbound')
+                    )
+                )
+            )
+        )
+    )"""
 
 _REQUIRED_UPSTREAM_TABLES: tuple[str, ...] = (
     "public.users",

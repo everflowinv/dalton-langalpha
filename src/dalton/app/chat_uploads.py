@@ -9,14 +9,18 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.dalton.profile import is_core_profile
 from src.dalton.services.chat_uploads import (
+    SANDBOX_OBJECT_TOKEN_HEADER,
     cancel_chat_upload,
     complete_chat_upload,
     get_chat_upload_status,
     initiate_chat_upload,
+    prepare_sandbox_object_download,
     receive_chat_upload_part,
 )
 from src.dalton.settings import get_dalton_settings
@@ -30,10 +34,23 @@ def _require_dalton_enabled() -> None:
         raise HTTPException(status_code=404, detail="Dalton mode disabled")
 
 
+def _require_core_profile() -> None:
+    if not is_core_profile():
+        raise HTTPException(status_code=404, detail="Not found")
+
+
 router = APIRouter(
     prefix="/api/v1/dalton/chat-uploads",
     tags=["Dalton Chat Uploads"],
     dependencies=[Depends(_require_dalton_enabled)],
+)
+
+# Mounted only in standalone core profile (`src/dalton/app/__init__.py`) and blocked
+# at the edge gateway; Everflow never registers or exposes this route.
+sandbox_relay_router = APIRouter(
+    prefix="/api/v1/dalton/chat-uploads",
+    tags=["Dalton Chat Uploads Sandbox Relay"],
+    dependencies=[Depends(_require_dalton_enabled), Depends(_require_core_profile)],
 )
 
 
@@ -98,6 +115,28 @@ async def complete_chat_upload_endpoint(
         upload_id=upload_id,
         user_id=user_id,
         expected_sha256=payload.sha256 if payload else None,
+    )
+
+
+@sandbox_relay_router.get("/sandbox-object")
+@handle_api_exceptions("stream chat upload object for sandbox", logger)
+async def download_sandbox_chat_upload_endpoint(
+    relay_token: str | None = Header(default=None, alias=SANDBOX_OBJECT_TOKEN_HEADER),
+) -> StreamingResponse:
+    if not relay_token or not relay_token.strip():
+        raise HTTPException(
+            status_code=401,
+            detail=f"Missing {SANDBOX_OBJECT_TOKEN_HEADER} header",
+        )
+    meta, stream = await prepare_sandbox_object_download(relay_token)
+    return StreamingResponse(
+        stream,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Length": str(meta["size_bytes"]),
+            "X-Content-SHA256": str(meta["sha256"]),
+            "Cache-Control": "no-store",
+        },
     )
 
 
