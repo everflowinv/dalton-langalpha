@@ -184,9 +184,10 @@ flowchart LR
 3. **一键拉起核心服务栈**
    ```bash
    # 仅叠加基础编排与自包含的 docker-compose.core.yml（无需引用 docker-compose.dalton.yml）
-   docker compose -f docker-compose.yml -f docker-compose.core.yml up -d
+   docker compose -f docker-compose.yml -f docker-compose.core.yml up -d --build
    ```
    - 先运行 `postgres`（`scripts/dalton/Dockerfile.postgres`）、`redis`、由 `docker-compose.core.yml` 完整定义的 `minio` 与桶初始化，再由一次性 `migrate` 容器串行跑完上游与 Dalton 双链 `head` 迁移，随后启动接入 `sandbox-net` 的双进程 `backend`、`crawler` 以及挂载核心 `deploy/standalone/Caddyfile` 与静态 `/srv` 的 `edge`。
+   - **切换认证模式后需重建 `edge`**：`VITE_DALTON_AUTH` 作为普通构建参数（`ARG`）在前端构建期注入并参与构建缓存计算；修改 `.env` 中的 `DALTON_AUTH_MODE` / `VITE_DALTON_AUTH`（例如从 `oss` 切到 `local`）后，须执行 `docker compose -f docker-compose.yml -f docker-compose.core.yml up -d --build edge` 重建 `edge` 镜像与容器，使前端同步切换认证模式。
 4. **浏览器创建首个管理员并发起第一次研究对话**
    - 打开 `https://<DOMAIN>`（或本机 SSH 端口转发 `http://127.0.0.1:8088`），在 `/setup/admin` 页面输入终端打印的一次性自举口令、管理员邮箱/用户名与登录密码完成建号（口令当即永久作废）；
    - 在引导页填入任意模型 API Key（或已加入管理员白名单的内网模型网关地址 + Key），新建工作区、上传财报或 CSV 数据文件、完成带沙箱计算的首轮流式问答。

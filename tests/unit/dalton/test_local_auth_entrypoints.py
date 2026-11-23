@@ -1056,7 +1056,6 @@ class TestLocalWsTicketAndSameOriginStartup:
         from types import SimpleNamespace
         from fastapi import WebSocketException
         from src.dalton.auth import dispatch as dispatch_mod, tokens as tokens_mod
-        from src.utils.cache import redis_cache
 
         monkeypatch.setenv("HOST_MODE", "oss")
         monkeypatch.setenv("DALTON_AUTH_MODE", "local")
@@ -1081,8 +1080,12 @@ class TestLocalWsTicketAndSameOriginStartup:
                 seen_jti_keys[key] = ex
                 return True
 
-        fake_cache = SimpleNamespace(enabled=True, client=_FakeRedisClient())
-        monkeypatch.setattr(redis_cache, "get_cache_client", lambda: fake_cache)
+        redis_holder: list[Any] = [_FakeRedisClient()]
+
+        async def _fake_ws_redis() -> Any:
+            return redis_holder[0]
+
+        monkeypatch.setattr(dispatch_mod, "_get_ws_ticket_redis_client", _fake_ws_redis)
 
         ticket, _ = tokens_mod.issue_local_ws_ticket(user_id="u-ws", session_id="sid-ws")
         jwt_tok, _ = tokens_mod.issue_local_access_token(user_id="u-ws", session_id="sid-ws")
@@ -1114,14 +1117,14 @@ class TestLocalWsTicketAndSameOriginStartup:
 
         # 1c. Unavailable Redis fails closed with 1008
         fresh_ticket, _ = tokens_mod.issue_local_ws_ticket(user_id="u-ws", session_id="sid-ws")
-        fake_cache.client = None
+        redis_holder[0] = None
         ws_no_redis = _FakeWS({"ticket": fresh_ticket})
         with pytest.raises(WebSocketException) as exc_no_redis:
             await dispatch_mod.dispatch_oss_websocket(
                 ws_no_redis, local_dev_user_id="local-dev-user"
             )
         assert exc_no_redis.value.code == 1008
-        fake_cache.client = _FakeRedisClient()
+        redis_holder[0] = _FakeRedisClient()
 
         # 2. Access JWT passed via ?ticket= is rejected with 1008
         ws_bad = _FakeWS({"ticket": jwt_tok})
@@ -1137,6 +1140,75 @@ class TestLocalWsTicketAndSameOriginStartup:
                 ws_bearer_ticket, local_dev_user_id="local-dev-user"
             )
         assert exc_bt.value.code == 1008
+
+    @pytest.mark.asyncio
+    async def test_ws_ticket_redis_independent_of_cache_toggle_and_rechecks_expiry_before_jti(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.auth import dispatch as dispatch_mod, tokens as tokens_mod
+        from src.utils.cache.redis_cache import RedisCacheClient
+
+        monkeypatch.setenv("HOST_MODE", "oss")
+        monkeypatch.setenv("DALTON_AUTH_MODE", "local")
+        monkeypatch.setenv("JWT_SIGNING_SECRET", "s" * 48)
+        monkeypatch.setenv("REDIS_CACHE_ENABLED", "false")
+        monkeypatch.setenv("REDIS_URL", "redis://127.0.0.1:6399/2")
+
+        # 1. Even with REDIS_CACHE_ENABLED=false, the dedicated WS-ticket Redis client initializes.
+        cache_client = RedisCacheClient()
+        assert cache_client.enabled is False
+
+        ws_redis = await dispatch_mod._get_ws_ticket_redis_client()
+        try:
+            assert ws_redis is not None
+            conn_kwargs = ws_redis.connection_pool.connection_kwargs
+            assert conn_kwargs.get("host") == "127.0.0.1"
+            assert conn_kwargs.get("port") == 6399
+            assert conn_kwargs.get("db") == 2
+        finally:
+            await dispatch_mod.close_ws_ticket_redis_client()
+
+        # 2. If the ticket expires while waiting on DB session validation, reject with 401
+        #    BEFORE calling Redis SET NX EX (never clamp remaining_ttl up to 1s).
+        issued_now = int(time.time())
+        ticket, _ = tokens_mod.issue_local_ws_ticket(
+            user_id="u-exp",
+            session_id="sid-exp",
+            ttl_seconds=2,
+            now=issued_now,
+        )
+        redis_set_called = False
+
+        class _GuardRedis:
+            async def set(self, *_a: Any, **_kw: Any) -> bool:
+                nonlocal redis_set_called
+                redis_set_called = True
+                return True
+
+        async def _guard_redis_client() -> Any:
+            return _GuardRedis()
+
+        clock_box = [float(issued_now + 1)]
+
+        async def _slow_session_check(*, user_id: str, session_id: str) -> None:
+            # Advance clock past ticket.expires_at (issued_now + 2) while in DB check
+            clock_box[0] = float(issued_now + 3)
+
+        monkeypatch.setattr(dispatch_mod, "_get_ws_ticket_redis_client", _guard_redis_client)
+        monkeypatch.setattr(dispatch_mod, "_refuse_holder", lambda _u: None)
+        monkeypatch.setattr(
+            dispatch_mod,
+            "verify_local_session_active",
+            create_autospec(dispatch_mod.verify_local_session_active, side_effect=_slow_session_check),
+        )
+        monkeypatch.setattr(tokens_mod.time, "time", lambda: clock_box[0])
+        monkeypatch.setattr(dispatch_mod.time, "time", lambda: clock_box[0])
+
+        with pytest.raises(HTTPException) as exc_exp:
+            await dispatch_mod._verify_local_ws_ticket_and_session(ticket)
+        assert exc_exp.value.status_code == 401
+        assert "expired" in str(exc_exp.value.detail).lower()
+        assert redis_set_called is False
 
     def test_uvicorn_handshake_log_filter_redacts_ws_ticket_and_token_query(self) -> None:
         from src.config.logging_config import _SENSITIVE_QUERY_LOG_FILTER

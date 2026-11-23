@@ -91,4 +91,5 @@
 - **仅支持前端与 API 同源部署**：`DALTON_AUTH_MODE=local` 使用 `HttpOnly; SameSite=Lax; Path=/api/v1/dalton/auth` 刷新 Cookie 并在刷新/登出接口强制校验请求 `Origin`，前端与 `/api/*`、`/ws/*` 必须经由同一反向代理（如 `edge` Caddy 网关）在同一源下提供服务。
 - **启动强校验**：后端启动执行 `validate_dalton_auth_config()` 时，若同时配置了前端地址（`DALTON_FRONTEND_URL` / `PUBLIC_APP_URL` / `FRONTEND_URL`）与 API 地址（`SERVER_BASE_URL` / `VITE_API_BASE_URL`）且二者协议、主机或有效端口不一致，将直接拒绝启动并报错。
 - **浏览器 WebSocket 短期票据**：本地登录模式下，浏览器端不再在 WebSocket URL 中传递访问 JWT，而是先调用 `POST /api/v1/dalton/auth/local/ws-ticket` 换取 60 秒有效的 HMAC 签名票据并通过 `?ticket=<ws_ticket>` 完成握手；反向代理访问日志需同时脱敏 `token` 与 `ticket` 查询参数。
+- **切换认证模式后必须重建 `edge`**：`VITE_DALTON_AUTH` 作为非机密构建参数（`ARG`）在镜像构建期编译进前端静态包并参与构建缓存计算。修改 `.env` 中的 `DALTON_AUTH_MODE` / `VITE_DALTON_AUTH`（如从 `oss` 切换至 `local`）后，必须重新构建并更新 `edge` 容器（例如 `docker compose -f docker-compose.yml -f docker-compose.core.yml up -d --build edge`，或显式传入与 `.env` 一致的 `--build-arg VITE_DALTON_AUTH=...`），否则旧前端静态包仍会沿用原认证模式。
 

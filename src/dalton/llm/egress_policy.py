@@ -238,7 +238,7 @@ async def get_saved_team_endpoints() -> dict[str, AddressClass]:
                     if r and r.get("base_url") and str(r["base_url"]).strip()
                 ]
                 await cur.execute(
-                    "SELECT other_preference->%s AS url_classes "
+                    "SELECT other_preference->%s::text AS url_classes "
                     "FROM user_preferences WHERE user_id = %s",
                     (_TEAM_BASE_URL_CLASSES_PREF_KEY, holder_id),
                 )
@@ -304,15 +304,15 @@ async def record_saved_team_base_url_classes(
                 VALUES (
                     gen_random_uuid(),
                     %s,
-                    jsonb_build_object(%s, %s::jsonb),
+                    jsonb_build_object(%s::text, %s::jsonb),
                     NOW(),
                     NOW()
                 )
                 ON CONFLICT (user_id) DO UPDATE
                 SET other_preference = jsonb_set(
                     COALESCE(user_preferences.other_preference, '{}'::jsonb),
-                    ARRAY[%s],
-                    COALESCE(user_preferences.other_preference->%s, '{}'::jsonb) || %s::jsonb,
+                    ARRAY[%s::text],
+                    COALESCE(user_preferences.other_preference->%s::text, '{}'::jsonb) || %s::jsonb,
                     true
                 ),
                 updated_at = NOW()

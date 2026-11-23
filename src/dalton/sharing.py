@@ -14,7 +14,7 @@ workspace is never reachable from another member's Chief of Staff.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextvars import ContextVar
 from typing import Any
 
@@ -239,6 +239,79 @@ async def get_workspace_sharing(
             else updated_at
         ),
     }
+
+
+async def get_workspaces_sharing_batch(
+    workspace_ids: Iterable[str],
+    *,
+    conn: Any = None,
+) -> dict[str, dict[str, Any]]:
+    """Batch-fetch ``dalton_workspace_sharing`` rows for multiple workspaces in one query.
+
+    Missing rows default to ``cos_access=DEFAULT_COS_ACCESS`` and
+    ``web_access=DEFAULT_WEB_ACCESS`` (identical to :func:`get_workspace_sharing`).
+    """
+    unique_ids = sorted({str(wid or "").strip() for wid in workspace_ids if str(wid or "").strip()})
+    if not unique_ids:
+        return {}
+
+    result: dict[str, dict[str, Any]] = {
+        wid: {
+            "workspace_id": wid,
+            "cos_access": DEFAULT_COS_ACCESS,
+            "web_access": DEFAULT_WEB_ACCESS,
+            "updated_by": None,
+            "updated_at": None,
+        }
+        for wid in unique_ids
+    }
+
+    try:
+        async with get_db_connection(conn) as owned_conn:
+            async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT workspace_id::text AS workspace_id, cos_access, web_access, updated_by, updated_at
+                    FROM dalton_workspace_sharing
+                    WHERE workspace_id = ANY(%s::uuid[])
+                    """,
+                    (unique_ids,),
+                )
+                rows = await cur.fetchall()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Failed to batch-read dalton_workspace_sharing (%d workspaces): %s",
+            len(unique_ids),
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Workspace sharing settings unavailable",
+        ) from exc
+
+    for row in rows or []:
+        wid = str(row.get("workspace_id") or "").strip()
+        if not wid:
+            continue
+        updated_at = row.get("updated_at")
+        result[wid] = {
+            "workspace_id": wid,
+            "cos_access": _normalize_access_level(
+                row.get("cos_access"), DEFAULT_COS_ACCESS
+            ),
+            "web_access": _normalize_access_level(
+                row.get("web_access"), DEFAULT_WEB_ACCESS
+            ),
+            "updated_by": row.get("updated_by"),
+            "updated_at": (
+                updated_at.isoformat()
+                if hasattr(updated_at, "isoformat")
+                else updated_at
+            ),
+        }
+    return result
 
 
 async def upsert_workspace_sharing(
@@ -849,6 +922,73 @@ async def require_team_reader(user_id: str | None, *, conn: Any = None) -> str:
         raise HTTPException(status_code=403, detail="Forbidden")
 
     return uid
+
+
+async def batch_check_team_readers(
+    user_ids: Iterable[str],
+    *,
+    conn: Any = None,
+) -> set[str]:
+    """Batch-verify which ``user_ids`` satisfy :func:`require_team_reader` in one query.
+
+    Avoids per-owner N+1 user/membership queries when evaluating workspace write access
+    across a list of coverage units.
+    """
+    unique_ids = sorted({str(u or "").strip() for u in user_ids if str(u or "").strip()})
+    if not unique_ids:
+        return set()
+
+    if is_dalton_local_auth_enabled():
+        from src.dalton.auth.roles import get_user_roles_batch
+
+        roles = (
+            await get_user_roles_batch(unique_ids, conn=conn)
+            if conn is not None
+            else await get_user_roles_batch(unique_ids)
+        )
+        return {uid for uid, role in roles.items() if role is not None}
+
+    if not is_dalton_supabase_auth_enabled():
+        return set(unique_ids)
+
+    allowed_emails = (
+        await get_team_member_emails(conn=conn)
+        if conn is not None
+        else await get_team_member_emails()
+    )
+    try:
+        async with get_db_connection(conn) as owned_conn:
+            async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT
+                        u.user_id,
+                        LOWER(BTRIM(u.email)) AS email,
+                        EXISTS (
+                            SELECT 1 FROM dalton_members dm
+                            WHERE dm.email = LOWER(BTRIM(u.email))
+                        ) AS in_members
+                    FROM users u
+                    WHERE u.user_id = ANY(%s::text[])
+                    """,
+                    (unique_ids,),
+                )
+                rows = await cur.fetchall()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Failed to batch-verify team readers (%d users): %s", len(unique_ids), exc)
+        raise HTTPException(
+            status_code=503, detail="Team reader verification unavailable"
+        ) from exc
+
+    valid: set[str] = set()
+    for row in rows or []:
+        uid = str(row.get("user_id") or "").strip()
+        email = str(row.get("email") or "").strip().lower()
+        if uid and email and (email in allowed_emails or bool(row.get("in_members"))):
+            valid.add(uid)
+    return valid
 
 
 async def require_workspace_access(

@@ -230,19 +230,57 @@ get_env_value() {
 get_env_value_any() {
   local key="$1"
   [[ -f "$ENV_FILE" ]] || return 0
+  # Parse `.env` following Docker Compose env-file syntax:
+  # - ignores blank lines and `#` comments, strips CR (`\r`), supports `export`
+  # - accepts both `KEY=value` and `KEY: value` assignments
+  # - preserves `#` inside single/double quotes and strips unquoted inline `#` comments
   awk -v k="$key" '
+    function parse_val(s,    q, out, i, n, ch, nxt) {
+      sub(/^[[:space:]]+/, "", s)
+      if (s == "") return ""
+      q = substr(s, 1, 1)
+      if (q == "\"") {
+        out = ""
+        n = length(s)
+        for (i = 2; i <= n; i++) {
+          ch = substr(s, i, 1)
+          if (ch == "\\" && i < n) {
+            nxt = substr(s, i + 1, 1)
+            out = out nxt
+            i++
+          } else if (ch == "\"") {
+            return out
+          } else {
+            out = out ch
+          }
+        }
+        return out
+      }
+      if (q == "\047") {
+        n = index(substr(s, 2), "\047")
+        if (n > 0) {
+          return substr(s, 2, n - 1)
+        }
+        return substr(s, 2)
+      }
+      if (substr(s, 1, 1) == "#") return ""
+      sub(/[[:space:]]+#.*$/, "", s)
+      sub(/[[:space:]]+$/, "", s)
+      return s
+    }
     {
       line = $0
+      sub(/\r$/, "", line)
       sub(/^[[:space:]]+/, "", line)
+      if (line == "" || substr(line, 1, 1) == "#") next
       if (line ~ /^export[[:space:]]+/) {
         sub(/^export[[:space:]]+/, "", line)
       }
       if (substr(line, 1, length(k)) == k) {
         rest = substr(line, length(k) + 1)
         if (rest ~ /^[[:space:]]*[=:]/) {
-          sub(/^[[:space:]]*[=:][[:space:]]*/, "", rest)
-          sub(/[[:space:]]+$/, "", rest)
-          val = rest
+          sub(/^[[:space:]]*[=:]/, "", rest)
+          val = parse_val(rest)
         }
       }
     }
@@ -583,9 +621,12 @@ main() {
     fi
   fi
 
+  local vite_auth
+  vite_auth="$(get_env_value_any "VITE_DALTON_AUTH")"
+
   printf "\n== Next Steps ==\n"
   if [[ "$NON_INTERACTIVE" -eq 0 ]]; then
-    cat <<'EOF'
+    cat <<EOF
   1. Configure LLM provider keys, optional financial data (FMP), and optional
      web search/fetch keys via the interactive setup wizard:
        make config
@@ -593,13 +634,17 @@ main() {
   2. Optional: set SEC_USER_AGENT="Dalton <your-email@example.com>" in .env
      for SEC EDGAR compliance identification.
 
-  3. Start the Standalone Core stack:
+  3. Build edge with VITE_DALTON_AUTH from .env and start the Standalone Core stack:
+       docker compose -f docker-compose.yml -f docker-compose.core.yml build --build-arg VITE_DALTON_AUTH="${vite_auth}" edge
        docker compose -f docker-compose.yml -f docker-compose.core.yml up -d
+     (Whenever you switch DALTON_AUTH_MODE / VITE_DALTON_AUTH in .env, rebuild edge
+      so the frontend bundle picks up the new authentication mode.)
 
   4. Open the web UI at http://127.0.0.1:8088 (loopback mode).
 EOF
   else
-    info "Non-interactive initialization complete (APP_ENV=core, DOMAIN=${domain})."
+    info "Non-interactive initialization complete (APP_ENV=core, DOMAIN=${domain}, VITE_DALTON_AUTH=${vite_auth:-<empty>})."
+    info "Build edge with: docker compose -f docker-compose.yml -f docker-compose.core.yml build --build-arg VITE_DALTON_AUTH=${vite_auth} edge"
     info "Start the stack with: docker compose -f docker-compose.yml -f docker-compose.core.yml up -d"
   fi
 }

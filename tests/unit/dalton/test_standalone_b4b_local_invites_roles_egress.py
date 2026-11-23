@@ -1165,3 +1165,306 @@ def test_b4_local_auth_check_script_header_and_stdlib_only():
     forbidden = {"httpx", "psycopg", "psycopg2", "asyncpg", "aiohttp", "requests", "websockets"}
     assert imported_roots.isdisjoint(forbidden), f"Forbidden imports found: {imported_roots & forbidden}"
     assert "_lib" in imported_roots
+
+
+# ---------------------------------------------------------------------------
+# 6. Round 5 fixes: typed jsonb_build_object key, edge ARG cache & compose env_file
+#    secrets, init.sh Compose .env parsing, and batched board write checks
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_egress_record_sql_casts_jsonb_build_object_key_to_text(monkeypatch):
+    """R5 Item 1: jsonb_build_object key parameter is explicitly typed as %s::text."""
+    from src.dalton import credentials as creds_mod
+
+    monkeypatch.setenv("HOST_MODE", "oss")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "local")
+    monkeypatch.setattr(
+        creds_mod,
+        "get_team_credential_holder_id_async",
+        create_autospec(creds_mod.get_team_credential_holder_id_async, return_value="holder-1"),
+    )
+
+    cur = _FakeAsyncCursor()
+    conn = _FakeAsyncConn(cur)
+    await egress_policy.record_saved_team_base_url_classes(
+        {"https://team-public.example.com/v1": "public"},
+        conn=conn,
+    )
+    assert len(cur.executed) == 1
+    sql_text = cur.executed[0][0]
+    assert "jsonb_build_object(%s::text, %s::jsonb)" in sql_text
+    assert "ARRAY[%s::text]" in sql_text
+    assert "other_preference->%s::text" in sql_text
+
+
+def test_edge_build_arg_compose_secrets_and_init_dotenv_parsing(tmp_path: Path):
+    """R5 Items 2 & 3:
+    - Dockerfile.edge uses plain ARG/ENV VITE_DALTON_AUTH (no BuildKit secret mount).
+    - docker-compose.core.yml passes VITE_DALTON_AUTH as build arg, aligns ssh-gateway
+      BYOK_ENCRYPTION_KEY via env_file, and never ${...}-interpolates secrets anywhere.
+    - init.sh get_env_value_any parses Compose .env syntax (inline # comments, KEY: val, quotes, CRLF).
+    """
+    dockerfile_edge = (REPO_ROOT / "deploy" / "standalone" / "Dockerfile.edge").read_text(
+        encoding="utf-8"
+    )
+    assert 'ARG VITE_DALTON_AUTH=""' in dockerfile_edge
+    assert "ENV VITE_DALTON_AUTH=${VITE_DALTON_AUTH}" in dockerfile_edge
+    assert "--mount=type=secret" not in dockerfile_edge
+    assert "core_env" not in dockerfile_edge
+
+    compose_core = (REPO_ROOT / "docker-compose.core.yml").read_text(encoding="utf-8")
+    assert "VITE_DALTON_AUTH: ${VITE_DALTON_AUTH:-}" in compose_core
+    assert "core_env" not in compose_core
+    assert "ssh-gateway:" in compose_core
+    import re
+
+    for secret_key in (
+        "BYOK_ENCRYPTION_KEY",
+        "DB_PASSWORD",
+        "REDIS_PASSWORD",
+        "MINIO_ROOT_USER",
+        "MINIO_ROOT_PASSWORD",
+        "DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID",
+        "DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY",
+        "DALTON_CHAT_UPLOAD_SIGNING_SECRET",
+        "INTERNAL_SERVICE_TOKEN",
+        "JWT_SIGNING_SECRET",
+        "BOOTSTRAP_SETUP_TOKEN",
+        "EGRESS_RELAY_SECRET",
+    ):
+        # Allow runtime shell `$$` inside container commands/entrypoints, forbid Compose `${...}`
+        assert not re.search(rf"(?<!\$)\$\{{{secret_key}\b", compose_core), (
+            f"docker-compose.core.yml must not Compose-interpolate secret {secret_key}"
+        )
+
+    # Verify init.sh get_env_value_any parses Compose .env syntax accurately
+    init_sh = REPO_ROOT / "scripts" / "standalone" / "init.sh"
+    env_file = tmp_path / ".env"
+    env_file.write_bytes(
+        (
+            "# leading comment\r\n"
+            "VITE_DALTON_AUTH=local # Enable sign-in\r\n"
+            "COLON_KEY: local # colon syntax with inline comment\r\n"
+            'QUOTED_DOUBLE: "local # kept" # trailing comment\r\n'
+            "export QUOTED_SINGLE = 'local # kept' # trailing comment\r\n"
+            "COMMENT_ONLY=# empty value\r\n"
+            "RESET_ME=first\r\n"
+            "RESET_ME=\r\n"
+        ).encode("utf-8")
+    )
+    probe_script = (
+        "set -euo pipefail\n"
+        f'ENV_FILE="{env_file}"\n'
+        f'eval "$(awk \'/^get_env_value_any\\(\\) \\{{/ {{p=1}} p {{print}} p && /^\\}}/ {{p=0}}\' "{init_sh}")"\n'
+        'printf "A=[%s]\\n" "$(get_env_value_any VITE_DALTON_AUTH)"\n'
+        'printf "B=[%s]\\n" "$(get_env_value_any COLON_KEY)"\n'
+        'printf "C=[%s]\\n" "$(get_env_value_any QUOTED_DOUBLE)"\n'
+        'printf "D=[%s]\\n" "$(get_env_value_any QUOTED_SINGLE)"\n'
+        'printf "E=[%s]\\n" "$(get_env_value_any COMMENT_ONLY)"\n'
+        'printf "F=[%s]\\n" "$(get_env_value_any RESET_ME)"\n'
+    )
+    res = subprocess.run(
+        ["bash", "-c", probe_script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=True,
+    )
+    assert res.stdout.splitlines() == [
+        "A=[local]",
+        "B=[local]",
+        "C=[local # kept]",
+        "D=[local # kept]",
+        "E=[]",
+        "F=[]",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_build_units_view_batches_non_admin_write_checks_by_owner(monkeypatch):
+    """R5 Item 5b: build_units_view batches non-admin write checks by owner/workspace (O(1) calls)."""
+    from src.dalton import sharing as sharing_mod
+    from src.dalton.auth import roles as local_roles
+    from src.dalton.autonomy import units_view
+    from src.dalton.database import coverage_units, sector_members
+
+    monkeypatch.setenv("HOST_MODE", "oss")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "local")
+
+    # Guard: per-row single-workspace write check must NOT be called inside build_units_view loop!
+    per_row_forbidden = create_autospec(
+        coverage_units.can_write_bound_unit_workspace,
+        side_effect=AssertionError("build_units_view must batch write checks instead of per-row calls"),
+    )
+    monkeypatch.setattr(units_view, "can_write_bound_unit_workspace", per_row_forbidden)
+
+    rows = [
+        {
+            "unit_id": "u-rw-1",
+            "kind": "company",
+            "owner_user_id": "owner-a",
+            "created_by_user_id": "owner-a",
+            "lead_analyst_user_id": "owner-a",
+            "slug": "aapl",
+            "display_name": "Apple",
+            "workspace_id": "ws-rw-1",
+            "ticker": "AAPL",
+            "workspace_owner_id": "owner-a",
+            "workspace_status": "active",
+            "workspace_config": {},
+        },
+        {
+            "unit_id": "u-ro-2",
+            "kind": "company",
+            "owner_user_id": "owner-a",
+            "created_by_user_id": "owner-a",
+            "lead_analyst_user_id": "owner-a",
+            "slug": "msft",
+            "display_name": "Microsoft",
+            "workspace_id": "ws-ro-2",
+            "ticker": "MSFT",
+            "workspace_owner_id": "owner-a",
+            "workspace_status": "active",
+            "workspace_config": {},
+        },
+        {
+            "unit_id": "u-rw-3",
+            "kind": "company",
+            "owner_user_id": "owner-b",
+            "created_by_user_id": "owner-b",
+            "lead_analyst_user_id": "owner-b",
+            "slug": "nvda",
+            "display_name": "NVIDIA",
+            "workspace_id": "ws-rw-3",
+            "ticker": "NVDA",
+            "workspace_owner_id": "owner-b",
+            "workspace_status": "active",
+            "workspace_config": {},
+        },
+        {
+            "unit_id": "u-ext-4",
+            "kind": "company",
+            "owner_user_id": "owner-ext",
+            "created_by_user_id": "owner-ext",
+            "lead_analyst_user_id": "owner-ext",
+            "slug": "tsla",
+            "display_name": "Tesla",
+            "workspace_id": "ws-ext-4",
+            "ticker": "TSLA",
+            "workspace_owner_id": "owner-ext",
+            "workspace_status": "active",
+            "workspace_config": {},
+        },
+    ]
+
+    class _MultiRowCursor:
+        def __init__(self):
+            self.calls = 0
+
+        async def execute(self, sql, params=None):
+            self.calls += 1
+
+        async def fetchall(self):
+            return list(rows) if self.calls == 1 else []
+
+    sentinel_conn = _FakeAsyncConn(_MultiRowCursor())
+    role_map = {
+        "viewer-1": "internal",
+        "owner-a": "internal",
+        "owner-b": "internal",
+        "owner-ext": "external",
+    }
+
+    async def _fake_get_role(uid, *, conn=None):
+        assert conn is sentinel_conn
+        return role_map.get(uid)
+
+    batch_role_calls: list[tuple[str, ...]] = []
+
+    async def _fake_roles_batch(uids, *, conn=None):
+        assert conn is sentinel_conn
+        key = tuple(sorted(set(uids)))
+        batch_role_calls.append(key)
+        return {u: role_map.get(u) for u in key}
+
+    caller_reader_calls: list[str] = []
+
+    async def _fake_req_reader(uid, *, conn=None):
+        assert conn is sentinel_conn
+        caller_reader_calls.append(uid)
+        return uid
+
+    batch_reader_calls: list[tuple[str, ...]] = []
+
+    async def _fake_batch_readers(uids, *, conn=None):
+        assert conn is sentinel_conn
+        key = tuple(sorted(set(uids)))
+        batch_reader_calls.append(key)
+        return set(key)
+
+    batch_sharing_calls: list[tuple[str, ...]] = []
+
+    async def _fake_batch_sharing(ws_ids, *, conn=None):
+        assert conn is sentinel_conn
+        key = tuple(sorted(set(ws_ids)))
+        batch_sharing_calls.append(key)
+        return {
+            "ws-rw-1": {"workspace_id": "ws-rw-1", "web_access": "rw", "cos_access": "rw"},
+            "ws-ro-2": {"workspace_id": "ws-ro-2", "web_access": "ro", "cos_access": "rw"},
+            "ws-rw-3": {"workspace_id": "ws-rw-3", "web_access": "rw", "cos_access": "rw"},
+        }
+
+    monkeypatch.setattr(local_roles, "get_user_role", create_autospec(local_roles.get_user_role, side_effect=_fake_get_role))
+    monkeypatch.setattr(local_roles, "get_user_roles_batch", create_autospec(local_roles.get_user_roles_batch, side_effect=_fake_roles_batch))
+    monkeypatch.setattr(sharing_mod, "require_team_reader", create_autospec(sharing_mod.require_team_reader, side_effect=_fake_req_reader))
+    monkeypatch.setattr(sharing_mod, "batch_check_team_readers", create_autospec(sharing_mod.batch_check_team_readers, side_effect=_fake_batch_readers))
+    monkeypatch.setattr(sharing_mod, "get_workspaces_sharing_batch", create_autospec(sharing_mod.get_workspaces_sharing_batch, side_effect=_fake_batch_sharing))
+    monkeypatch.setattr(
+        units_view,
+        "_load_colleague_workspace_state",
+        create_autospec(
+            units_view._load_colleague_workspace_state,
+            return_value=(
+                {
+                    "ws-rw-1": (True, True),
+                    "ws-ro-2": (True, True),
+                    "ws-rw-3": (True, True),
+                    "ws-ext-4": (True, False),
+                },
+                {
+                    "ws-rw-1": "rw",
+                    "ws-ro-2": "ro",
+                    "ws-rw-3": "rw",
+                    "ws-ext-4": "rw",
+                },
+                [],
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        sector_members,
+        "fetch_members_for_sectors",
+        create_autospec(sector_members.fetch_members_for_sectors, return_value=[]),
+    )
+
+    out = await units_view.build_units_view("viewer-1", {}, conn=sentinel_conn)
+    by_unit = {row["unit_id"]: row for row in out}
+
+    assert by_unit["u-rw-1"]["can_unbind"] is True
+    assert by_unit["u-rw-1"]["can_archive"] is True
+    assert by_unit["u-ro-2"]["can_unbind"] is False
+    assert by_unit["u-ro-2"]["can_archive"] is False
+    assert by_unit["u-rw-3"]["can_unbind"] is True
+    assert by_unit["u-rw-3"]["can_archive"] is True
+    # External-owned bound unit is never writable by colleagues even when web_access=rw
+    assert by_unit["u-ext-4"]["can_unbind"] is False
+    assert by_unit["u-ext-4"]["can_archive"] is False
+
+    # Batched O(1) checks across all 4 rows / 3 owners (never per-row!)
+    assert caller_reader_calls == ["viewer-1"]
+    assert batch_role_calls == [("owner-a", "owner-b", "owner-ext")]
+    assert batch_reader_calls == [("owner-a", "owner-b")]
+    assert batch_sharing_calls == [("ws-ro-2", "ws-rw-1", "ws-rw-3")]
+    per_row_forbidden.assert_not_called()

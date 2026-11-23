@@ -36,38 +36,10 @@ ENV VITE_DALTON_INVITE_EMAIL_DOMAIN=${VITE_DALTON_INVITE_EMAIL_DOMAIN}
 ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
 ENV DOCS_SITE_ORIGIN=${DOCS_SITE_ORIGIN}
 
-# Read VITE_DALTON_AUTH directly from the mounted `.env` build secret when built
-# via docker-compose.core.yml so exported host shell variables can never override
-# `.env`. Only the single VITE_DALTON_AUTH value is extracted; `.env` is never
-# copied into the build context or any image layer.
-RUN --mount=type=secret,id=core_env,target=/run/secrets/core_env,required=false \
-    set -eu; \
-    if [ -f /run/secrets/core_env ]; then \
-      env_auth="$(awk ' \
-        { \
-          line = $0; \
-          sub(/\r$/, "", line); \
-          sub(/^[[:space:]]+/, "", line); \
-          if (line ~ /^(#|$)/) next; \
-          sub(/^export[[:space:]]+/, "", line); \
-          if (substr(line, 1, 16) == "VITE_DALTON_AUTH") { \
-            rest = substr(line, 17); \
-            if (rest ~ /^[[:space:]]*=/) { \
-              sub(/^[[:space:]]*=[[:space:]]*/, "", rest); \
-              sub(/[[:space:]]*$/, "", rest); \
-              if ((substr(rest, 1, 1) == "\"" && substr(rest, length(rest), 1) == "\"") || \
-                  (substr(rest, 1, 1) == "\047" && substr(rest, length(rest), 1) == "\047")) { \
-                rest = substr(rest, 2, length(rest) - 2); \
-              } \
-              val = rest; \
-            } \
-          } \
-        } \
-        END { print val } \
-      ' /run/secrets/core_env)"; \
-      export VITE_DALTON_AUTH="$env_auth"; \
-    fi; \
-    pnpm run build \
+# VITE_DALTON_AUTH is passed as a regular (non-secret) build ARG / ENV above so
+# switching authentication modes invalidates the frontend build cache automatically
+# whenever edge is rebuilt.
+RUN pnpm run build \
     && test -s dist/index.html \
     && test -s dist/version.json \
     && test -d dist/assets

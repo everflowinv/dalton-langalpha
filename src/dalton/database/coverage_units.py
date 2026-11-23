@@ -43,7 +43,7 @@ and automation scheduling/execution:
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 from uuid import UUID
 
@@ -288,6 +288,152 @@ async def can_write_bound_unit_workspace(
         return True
     except ValueError:
         return False
+
+
+async def can_write_bound_unit_workspaces_batch(
+    ws_rows: Sequence[Mapping[str, Any]],
+    user_id: str | None,
+    *,
+    is_pm: bool = False,
+    conn: Any = None,
+    owner_tiers: Mapping[str, str] | None = None,
+) -> dict[str, bool]:
+    """Batch-evaluate :func:`can_write_bound_unit_workspace` across many bound workspaces.
+
+    Enforces the exact same authorization rules as ``_require_ws_write`` and
+    ``require_workspace_access(channel="web", need="write")``, while querying caller
+    membership/tier once, owner tiers/membership in batches by owner, and workspace
+    sharing rows in one batch query instead of repeating ~5 queries per row.
+    """
+    from src.dalton.access_tiers import classify_owner_tiers_batch, get_user_tier
+    from src.dalton.sharing import (
+        batch_check_team_readers,
+        get_workspaces_sharing_batch,
+        require_team_reader,
+    )
+    from src.server.database.home_workspace import is_reserved_row
+
+    uid = str(user_id or "").strip()
+    if not uid or not ws_rows:
+        return {}
+
+    multiuser_auth = is_coverage_multiuser_auth_enabled()
+    result: dict[str, bool] = {}
+    pending: list[tuple[str, str, dict[str, Any]]] = []
+    seen_ws: set[str] = set()
+
+    for raw in ws_rows:
+        ws = dict(raw)
+        ws_id = str(ws.get("workspace_id") or "").strip()
+        if not ws_id or ws_id in seen_ws:
+            continue
+        seen_ws.add(ws_id)
+
+        status = str(ws.get("status") or "")
+        if (
+            status == "deleted"
+            or is_reserved_row(ws)
+            or bool(ws.get("is_home"))
+            or status == "unbound"
+        ):
+            result[ws_id] = False
+            continue
+
+        ws_owner = str(ws.get("user_id") or "").strip()
+        if not ws_owner:
+            result[ws_id] = False
+            continue
+        if ws_owner == uid:
+            result[ws_id] = True
+            continue
+        if not multiuser_auth:
+            result[ws_id] = False
+            continue
+
+        pending.append((ws_id, ws_owner, ws))
+
+    if not pending:
+        return result
+
+    resolved_owner_tiers: dict[str, str] = dict(owner_tiers or {})
+    missing_owners = sorted(
+        {owner for _, owner, _ in pending if owner not in resolved_owner_tiers}
+    )
+    if missing_owners:
+        resolved_owner_tiers.update(
+            await classify_owner_tiers_batch(missing_owners, conn=conn)
+        )
+
+    need_sharing_check: list[tuple[str, str]] = []
+    for ws_id, ws_owner, _ws in pending:
+        owner_tier = resolved_owner_tiers.get(ws_owner)
+        if owner_tier in (None, "unknown", "external", "company"):
+            result[ws_id] = False
+            continue
+        if pm_can_write_bound_workspace(
+            actor_user_id=uid,
+            workspace_owner_id=ws_owner,
+            workspace_owner_tier=owner_tier,
+            is_pm=is_pm,
+            multiuser_auth_enabled=True,
+        ):
+            result[ws_id] = True
+            continue
+        need_sharing_check.append((ws_id, ws_owner))
+
+    if not need_sharing_check:
+        return result
+
+    # Caller team membership & tier are checked once for the entire batch.
+    try:
+        if conn is not None:
+            await require_team_reader(uid, conn=conn)
+            caller_tier = await get_user_tier(uid, conn=conn)
+        else:
+            await require_team_reader(uid)
+            caller_tier = await get_user_tier(uid)
+    except HTTPException:
+        for ws_id, _ in need_sharing_check:
+            result[ws_id] = False
+        return result
+
+    if caller_tier in ("external", "company"):
+        for ws_id, _ in need_sharing_check:
+            result[ws_id] = False
+        return result
+
+    # Owner team membership is checked once in batch by unique owner.
+    unique_owners = sorted({owner for _, owner in need_sharing_check})
+    try:
+        valid_owners = await batch_check_team_readers(unique_owners, conn=conn)
+    except HTTPException:
+        for ws_id, _ in need_sharing_check:
+            result[ws_id] = False
+        return result
+
+    eligible_ws_ids: list[str] = []
+    for ws_id, ws_owner in need_sharing_check:
+        if ws_owner not in valid_owners:
+            result[ws_id] = False
+        else:
+            eligible_ws_ids.append(ws_id)
+
+    if not eligible_ws_ids:
+        return result
+
+    # Workspace web_access is checked once in batch for all remaining workspaces.
+    try:
+        sharing_by_ws = await get_workspaces_sharing_batch(eligible_ws_ids, conn=conn)
+    except HTTPException:
+        for ws_id in eligible_ws_ids:
+            result[ws_id] = False
+        return result
+
+    for ws_id in eligible_ws_ids:
+        sharing = sharing_by_ws.get(ws_id) or {}
+        result[ws_id] = str(sharing.get("web_access") or "").strip().lower() == "rw"
+
+    return result
 
 
 def compute_unit_action_flags(

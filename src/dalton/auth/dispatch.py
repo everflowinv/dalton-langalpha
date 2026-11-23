@@ -43,6 +43,97 @@ DEFAULT_WS_SESSION_RECHECK_SECONDS = 30.0
 DEFAULT_SSE_SESSION_RECHECK_SECONDS = 30.0
 WS_TICKET_JTI_REDIS_PREFIX = "dalton:local:ws_ticket:jti:"
 
+# Dedicated Redis client/pool for one-time WS ticket replay protection,
+# completely independent of the optional `REDIS_CACHE_ENABLED` cache toggle.
+_ws_ticket_redis_client: Any = None
+_ws_ticket_redis_pool: Any = None
+_ws_ticket_redis_key: tuple[str, int] | None = None
+
+
+def _resolve_ws_ticket_redis_url() -> str:
+    """Resolve the Redis URL for WS ticket replay checks (ignores REDIS_CACHE_ENABLED)."""
+    from src.config.settings import get_nested_config
+
+    return (
+        get_nested_config("redis.url")
+        or os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    )
+
+
+async def _get_ws_ticket_redis_client() -> Any:
+    """Return a Redis client for WS ticket replay protection, independent of ``REDIS_CACHE_ENABLED``."""
+    global _ws_ticket_redis_client, _ws_ticket_redis_pool, _ws_ticket_redis_key
+
+    url = _resolve_ws_ticket_redis_url()
+    loop_id = id(asyncio.get_running_loop())
+    key = (url, loop_id)
+    if _ws_ticket_redis_client is not None and _ws_ticket_redis_key == key:
+        return _ws_ticket_redis_client
+
+    import redis.asyncio as async_redis
+    from redis.asyncio.connection import BlockingConnectionPool
+
+    from src.config.settings import (
+        get_redis_max_connections,
+        get_redis_pool_timeout,
+        get_redis_socket_connect_timeout,
+        get_redis_socket_timeout,
+    )
+
+    try:
+        pool = BlockingConnectionPool.from_url(
+            url,
+            max_connections=max(4, min(16, get_redis_max_connections())),
+            timeout=get_redis_pool_timeout(),
+            socket_timeout=get_redis_socket_timeout(),
+            socket_connect_timeout=get_redis_socket_connect_timeout(),
+            decode_responses=False,
+            health_check_interval=30,
+        )
+        client = async_redis.Redis(connection_pool=pool)
+    except Exception as exc:
+        logger.warning(
+            "Failed to initialize WebSocket ticket Redis client (fail-closed 503): %s",
+            type(exc).__name__,
+        )
+        return None
+
+    old_client, old_pool = _ws_ticket_redis_client, _ws_ticket_redis_pool
+    _ws_ticket_redis_pool = pool
+    _ws_ticket_redis_client = client
+    _ws_ticket_redis_key = key
+
+    if old_client is not None:
+        try:
+            await old_client.aclose()
+        except Exception:
+            pass
+    if old_pool is not None:
+        try:
+            await old_pool.disconnect()
+        except Exception:
+            pass
+
+    return client
+
+
+async def close_ws_ticket_redis_client() -> None:
+    """Close the dedicated WS-ticket Redis client and pool (best-effort)."""
+    global _ws_ticket_redis_client, _ws_ticket_redis_pool, _ws_ticket_redis_key
+    client, _ws_ticket_redis_client = _ws_ticket_redis_client, None
+    pool, _ws_ticket_redis_pool = _ws_ticket_redis_pool, None
+    _ws_ticket_redis_key = None
+    if client is not None:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+    if pool is not None:
+        try:
+            await pool.disconnect()
+        except Exception:
+            pass
+
 _SENSITIVE_QUERY_PARAM_RE = re.compile(
     r"([?&](?:ticket|token)=)[^&\s\"'<>#]+",
     re.IGNORECASE,
@@ -366,22 +457,24 @@ async def _consume_ws_ticket_jti(
 ) -> None:
     """Atomically claim a one-time WebSocket ticket ``jti`` in Redis (60s max TTL).
 
-    Fails closed (503) if Redis is unavailable and rejects replays with 401.
+    Uses a dedicated Redis connection independent of ``REDIS_CACHE_ENABLED``.
+    Fails closed (503) if Redis is unavailable and rejects expired or replayed
+    tickets with 401.
     """
     cleaned = str(jti or "").strip()
     if not cleaned:
         raise HTTPException(status_code=401, detail="Missing WebSocket ticket jti")
-    from src.utils.cache.redis_cache import get_cache_client
-
-    cache = get_cache_client()
-    client = getattr(cache, "client", None) if getattr(cache, "enabled", False) else None
+    remaining = int(ttl_seconds)
+    if remaining <= 0:
+        raise HTTPException(status_code=401, detail="WebSocket ticket expired")
+    client = await _get_ws_ticket_redis_client()
     if client is None:
         raise HTTPException(
             status_code=503,
             detail="WebSocket ticket replay protection unavailable",
         )
     key = f"{WS_TICKET_JTI_REDIS_PREFIX}{cleaned}"
-    ttl = max(1, min(WS_TICKET_TTL_SECONDS, int(ttl_seconds)))
+    ttl = min(WS_TICKET_TTL_SECONDS, remaining)
     try:
         claimed = await client.set(key, "1", nx=True, ex=ttl)
     except Exception as exc:
@@ -405,9 +498,10 @@ async def _verify_local_ws_ticket_and_session(ticket: str) -> LocalAccessClaims:
     await verify_local_session_active(
         user_id=claims.user_id, session_id=claims.session_id
     )
-    remaining_ttl = max(
-        1, min(WS_TICKET_TTL_SECONDS, claims.expires_at - int(time.time()))
-    )
+    remaining = claims.expires_at - int(time.time())
+    if remaining <= 0:
+        raise HTTPException(status_code=401, detail="WebSocket ticket expired")
+    remaining_ttl = min(WS_TICKET_TTL_SECONDS, remaining)
     await _consume_ws_ticket_jti(claims.jti, ttl_seconds=remaining_ttl)
     return claims
 

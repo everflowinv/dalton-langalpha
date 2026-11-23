@@ -21,6 +21,7 @@ from psycopg.rows import dict_row
 from src.dalton.coverage.identity import is_historical_duplicate_workspace
 from src.dalton.database.coverage_units import (
     can_write_bound_unit_workspace,
+    can_write_bound_unit_workspaces_batch,
     compute_unit_action_flags,
     get_coverage_unit,
     is_coverage_multiuser_auth_enabled,
@@ -470,6 +471,7 @@ async def build_units_view(
             company_ws_by_unit = await _load_company_bindings(ucur, member_rows)
 
         ws_owner_tiers: dict[str, str] = {}
+        ws_write_map: dict[str, bool] | None = None
         if user_id is not None and supabase_auth:
             non_self_ws_owners = sorted(
                 {
@@ -486,6 +488,28 @@ async def build_units_view(
 
                 ws_owner_tiers = dict(
                     await classify_owner_tiers_batch(non_self_ws_owners, conn=uconn)
+                )
+
+            if is_dalton_supabase_auth_enabled is _default_is_dalton_supabase_auth_enabled:
+                non_self_ws_rows = [
+                    {
+                        "workspace_id": str(u.get("workspace_id") or ""),
+                        "user_id": str(u.get("workspace_owner_id") or ""),
+                        "status": str(u.get("workspace_status") or ""),
+                        "config": u.get("workspace_config"),
+                    }
+                    for u in unit_rows
+                    if u.get("workspace_id")
+                    and str(u.get("workspace_status") or "") != "deleted"
+                    and str(u.get("workspace_owner_id") or "").strip()
+                    and str(u.get("workspace_owner_id") or "").strip() != str(user_id)
+                ]
+                ws_write_map = await can_write_bound_unit_workspaces_batch(
+                    non_self_ws_rows,
+                    str(user_id),
+                    is_pm=is_pm,
+                    conn=uconn,
+                    owner_tiers=ws_owner_tiers,
                 )
 
         for u in unit_rows:
@@ -544,23 +568,8 @@ async def build_units_view(
             if ws_id is not None and ws_active and user_id is not None:
                 if ws_owner == str(user_id):
                     actor_has_ws_write = True
-                elif supabase_auth:
-                    ws_row_for_check = {
-                        "workspace_id": ws_id,
-                        "user_id": ws_owner,
-                        "status": ws_status,
-                        "config": u.get("workspace_config"),
-                    }
-                    if is_dalton_supabase_auth_enabled is _default_is_dalton_supabase_auth_enabled:
-                        actor_has_ws_write = await can_write_bound_unit_workspace(
-                            ws_row_for_check,
-                            str(user_id),
-                            is_pm=is_pm,
-                            conn=uconn,
-                            owner_tiers=ws_owner_tiers,
-                        )
-                    else:
-                        actor_has_ws_write = None
+                elif supabase_auth and ws_write_map is not None:
+                    actor_has_ws_write = ws_write_map.get(ws_id, False)
 
             flags = _compute_unit_action_flags(
                 user_id=user_id,

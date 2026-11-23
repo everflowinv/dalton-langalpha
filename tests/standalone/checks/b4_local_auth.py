@@ -281,8 +281,8 @@ def _check_bootstrap_and_sessions(ctx: _lib.ComposeContext) -> tuple[str, str, s
         },
     )
     _assert(
-        wrong_resp.status == 403,
-        f"Expected 403 for wrong bootstrap token, got {wrong_resp.status}",
+        wrong_resp.status == 401,
+        f"Expected 401 for wrong bootstrap token (bootstrap.py rejects it as unauthenticated), got {wrong_resp.status}",
     )
 
     # Valid bootstrap creates first admin
