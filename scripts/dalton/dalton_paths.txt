@@ -1,5 +1,6 @@
 plugins/dalton/
 plugins/dalton_data/
+plugins/dalton_sec/
 src/dalton/
 workflows/
 scripts/dalton/
@@ -9,6 +10,7 @@ docs/dalton/
 tests/unit/dalton/
 tests/integration/dalton/
 tests/fixtures/dalton/
+tests/standalone/
 tests/unit/mcp_servers/fixtures/dalton_sec/
 tests/unit/mcp_servers/test_dalton_sec_periods.py
 tests/unit/server/services/test_bringup_owner_check.py

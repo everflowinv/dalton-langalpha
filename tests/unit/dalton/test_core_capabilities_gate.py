@@ -38,9 +38,11 @@ from src.dalton.autonomy import system_jobs as system_jobs_mod
 from src.dalton.autonomy.probes import cnhk as cnhk_mod
 from src.dalton.capabilities import (
     BACKGROUND_LOOP_REGISTRY,
+    BUNDLED_PLUGIN_CAPABILITY_MAP,
     CAPABILITY_SPECS,
     CORE_CAPABILITY,
     DALTON_ROUTE_CAPABILITY_REGISTRY,
+    MCP_SERVER_CAPABILITY_MAP,
     CapabilityId,
     capabilities_fingerprint,
     disabled_channel_names,
@@ -2128,6 +2130,82 @@ class TestBackendCapabilityPruning:
         assert res_br_off["ok"] is False
         assert res_br_off["error_code"] == "capability_disabled"
         assert http_guard.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# 10. Anti-leakage gate #4 (Batch 2b): Bundled plugins & MCP servers registry
+# ---------------------------------------------------------------------------
+
+
+class TestBundledPluginsAndMcpRegistrationGate:
+    def test_every_shipped_bundle_and_mcp_server_is_registered_with_capability(self) -> None:
+        plugins_dir = REPO_ROOT / "plugins"
+        disk_bundle_names: set[str] = set()
+        disk_server_names: set[str] = set()
+
+        for bundle_dir in sorted(p for p in plugins_dir.iterdir() if p.is_dir() and not p.name.startswith((".", "_"))):
+            manifest = json.loads((bundle_dir / "plugin.json").read_text(encoding="utf-8"))
+            bname = manifest.get("name")
+            assert isinstance(bname, str) and bname, f"{bundle_dir.name}/plugin.json missing name"
+            disk_bundle_names.add(bname)
+
+            mcp_path = bundle_dir / "mcp.json"
+            if mcp_path.is_file():
+                mcp_doc = json.loads(mcp_path.read_text(encoding="utf-8"))
+                disk_server_names.update((mcp_doc.get("mcpServers") or {}).keys())
+
+        unregistered_bundles = sorted(disk_bundle_names - set(BUNDLED_PLUGIN_CAPABILITY_MAP.keys()))
+        assert not unregistered_bundles, (
+            "Unregistered bundled plugin(s) — add each to "
+            "src/dalton/capabilities.py::BUNDLED_PLUGIN_CAPABILITY_MAP: "
+            + ", ".join(unregistered_bundles)
+        )
+        stale_bundles = sorted(set(BUNDLED_PLUGIN_CAPABILITY_MAP.keys()) - disk_bundle_names)
+        assert not stale_bundles, f"Stale entry(ies) in BUNDLED_PLUGIN_CAPABILITY_MAP: {stale_bundles}"
+
+        unregistered_servers = sorted(disk_server_names - set(MCP_SERVER_CAPABILITY_MAP.keys()))
+        assert not unregistered_servers, (
+            "Unregistered bundled MCP server(s) — add each to "
+            "src/dalton/capabilities.py::MCP_SERVER_CAPABILITY_MAP: "
+            + ", ".join(unregistered_servers)
+        )
+
+        # Independent proprietary check: dalton-data & researchdata may never be marked CORE_CAPABILITY
+        assert BUNDLED_PLUGIN_CAPABILITY_MAP["dalton-data"] is CapabilityId.RESEARCHDATA_BRIDGE
+        assert BUNDLED_PLUGIN_CAPABILITY_MAP["dalton-sec"] is CORE_CAPABILITY
+        assert MCP_SERVER_CAPABILITY_MAP["researchdata"] is CapabilityId.RESEARCHDATA_BRIDGE
+        assert MCP_SERVER_CAPABILITY_MAP["dalton_sec"] is CORE_CAPABILITY
+
+    @pytest.mark.parametrize(
+        ("app_env", "dalton_profile"),
+        [("core", None), ("", "core")],
+    )
+    def test_core_profile_hides_dalton_data_and_researchdata_across_config_and_plugins(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        app_env: str,
+        dalton_profile: str | None,
+    ) -> None:
+        from ptc_agent.config.plugins import bundled_mcp_servers, bundles
+        from src.server.services.plugins.bundled import bundled_names, component_owners
+
+        _clean_cap_env(monkeypatch, app_env=app_env, dalton_profile=dalton_profile)
+
+        bundle_dir_names = {b.name for b in bundles()}
+        assert "dalton_data" not in bundle_dir_names
+        assert "dalton_sec" in bundle_dir_names
+
+        api_names = bundled_names()
+        assert "dalton-data" not in api_names
+        assert "dalton-sec" in api_names
+
+        server_names = {s.name for s in bundled_mcp_servers()}
+        assert "researchdata" not in server_names
+        assert "dalton_sec" in server_names
+
+        owners = component_owners()
+        assert "researchdata" not in owners.servers
+        assert owners.servers.get("dalton_sec") == "dalton-sec"
 
 
 @pytest.fixture(autouse=True)

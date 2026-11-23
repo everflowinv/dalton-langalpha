@@ -166,10 +166,20 @@ def bundles() -> list[Bundle]:
     Plugins page shows an edited manifest immediately; the MCP server set
     still does not move, because its caller composes it once at startup.
     """
+    # DALTON-HOOK(standalone-core): exclude bundled plugins whose required capability is disabled
+    from src.dalton.capabilities import is_bundled_plugin_enabled_by_capability
+
     out: list[Bundle] = []
     for path in _bundle_dirs():
         manifest, manifest_ok = _read_json(path / "plugin.json")
         manifest = manifest or {}
+        cap_key = (
+            manifest.get("name")
+            if isinstance(manifest.get("name"), str) and manifest.get("name")
+            else path.name
+        )
+        if not is_bundled_plugin_enabled_by_capability(cap_key):
+            continue
         declared, servers_ok = _read_json(path / "mcp.json")
         entries = (declared or {}).get("mcpServers")
         out.append(
@@ -271,6 +281,9 @@ def bundled_mcp_servers() -> list[MCPServerConfig]:
     Never raises: a bundle whose manifests are unreadable is skipped with a
     log line rather than taking the process down at startup.
     """
+    # DALTON-HOOK(standalone-core): exclude bundled MCP servers whose required capability is disabled
+    from src.dalton.capabilities import is_mcp_server_enabled_by_capability
+
     servers: list[MCPServerConfig] = []
     staged: dict[str, str] = {}
     claimed_names: dict[str, str] = {}
@@ -278,6 +291,8 @@ def bundled_mcp_servers() -> list[MCPServerConfig]:
         metas = _server_metas(bundle.namespace, bundle.name)
         for key, entry in bundle.servers.items():
             if not isinstance(key, str) or not isinstance(entry, dict):
+                continue
+            if not is_mcp_server_enabled_by_capability(key):
                 continue
             meta = metas.get(key, ServerMeta())
             if meta is None:

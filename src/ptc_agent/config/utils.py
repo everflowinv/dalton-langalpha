@@ -237,11 +237,17 @@ def create_mcp_config(data: dict[str, Any]) -> MCPConfig:
     # ignored so a config file can't mark one as an (untrusted) workspace
     # server. ``headers`` passes through as a model field (built-ins may
     # declare http/sse headers too).
+    # DALTON-HOOK(standalone-core): filter YAML and merged MCP servers by active capabilities
+    from src.dalton.capabilities import (
+        filter_mcp_server_dicts_by_capability,
+        filter_mcp_servers_by_capability,
+    )
+
     mcp_servers = bundled_mcp_servers()
     bundled = len(mcp_servers)
     overridden = 0
     index = {s.name: i for i, s in enumerate(mcp_servers)}
-    for server in data.get("servers") or []:
+    for server in filter_mcp_server_dicts_by_capability(data.get("servers")):
         fields = {k: v for k, v in server.items() if k != "source"}
         position = index.get(fields.get("name"))
         if position is None:
@@ -258,6 +264,7 @@ def create_mcp_config(data: dict[str, Any]) -> MCPConfig:
             "agent_config.yaml overrides bundled MCP server %r: %s",
             base.name, ", ".join(sorted(k for k in fields if k != "name")) or "nothing",
         )
+    mcp_servers = filter_mcp_servers_by_capability(mcp_servers)
     logger.info(
         "MCP servers configured: %d (%d bundled, %d added, %d overridden)",
         len(mcp_servers), bundled, len(mcp_servers) - bundled, overridden,

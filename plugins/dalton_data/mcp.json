@@ -7,18 +7,6 @@
       "headers": {
         "Authorization": "Bearer ${DALTON_BRIDGE_TOKEN}"
       }
-    },
-    "dalton_sec": {
-      "type": "stdio",
-      "command": "uv",
-      "args": [
-        "run",
-        "python",
-        "plugins/dalton_data/dalton_sec_mcp_server.py"
-      ],
-      "env": {
-        "SEC_USER_AGENT": "${SEC_USER_AGENT}"
-      }
     }
   }
 }
