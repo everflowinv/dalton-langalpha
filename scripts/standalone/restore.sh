@@ -41,6 +41,8 @@ WORK_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BACKUP_DIR=""
 ENV_PASSPHRASE_FILE="${DALTON_BACKUP_PASSPHRASE_FILE:-}"
 COMPOSE_FILES_RAW=""
+PROJECT_NAME_ARG=""
+PROJECT_NAME_EXPLICIT=0
 CA_FILE=""
 REPLACE_ENV=0
 SKIP_EDGE_BUILD=0
@@ -65,6 +67,8 @@ Options:
                               (or set DALTON_BACKUP_PASSPHRASE_FILE).
   --compose-files <f1:f2>     Colon-separated Docker Compose files
                               (default: from target .env COMPOSE_FILE / DALTON_TLS_MODE).
+  --project-name <name>       Explicit Docker Compose project name (overrides .env
+                              COMPOSE_PROJECT_NAME and work-dir basename).
   --ca-file <path>            CA certificate PEM file used to verify HTTPS in custom/auto mode.
   --replace-env               Allow replacing an existing <work-dir>/.env from env.enc on an
                               empty target instance (validated before atomic rename).
@@ -107,6 +111,24 @@ while [[ $# -gt 0 ]]; do
       ;;
     --compose-files=*)
       COMPOSE_FILES_RAW="${1#--compose-files=}"
+      shift
+      ;;
+    --project-name)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "ERROR: --project-name requires a non-empty value." >&2
+        exit 2
+      fi
+      PROJECT_NAME_ARG="$2"
+      PROJECT_NAME_EXPLICIT=1
+      shift 2
+      ;;
+    --project-name=*)
+      PROJECT_NAME_ARG="${1#--project-name=}"
+      if [[ -z "$PROJECT_NAME_ARG" ]]; then
+        echo "ERROR: --project-name requires a non-empty value." >&2
+        exit 2
+      fi
+      PROJECT_NAME_EXPLICIT=1
       shift
       ;;
     --ca-file)
@@ -180,6 +202,19 @@ print_non_empty_manual_hint() {
   err "       ${down_cmd}"
   err "  3. Re-run restore.sh against the now-empty instance."
 }
+
+validate_project_name() {
+  local name="$1"
+  local LC_ALL=C
+  if [[ -z "$name" || "$name" == *$'\n'* || ! "$name" =~ ^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$ ]]; then
+    err "Invalid --project-name '${name}': must match ^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$ (lowercase ASCII letters, digits, hyphens, underscores; must start and end with a letter or digit)."
+    exit 2
+  fi
+}
+
+if [[ "$PROJECT_NAME_EXPLICIT" -eq 1 ]]; then
+  validate_project_name "$PROJECT_NAME_ARG"
+fi
 
 if [[ -z "$BACKUP_DIR" ]]; then
   err "--backup-dir is required."
@@ -476,13 +511,17 @@ if [[ "$ENV_EXISTED_BEFORE" -eq 1 && "$ENV_FROM_BACKUP" -eq 1 ]]; then
 fi
 
 # Acquire fixed-path project restore lock at /tmp/dalton-<project>.restore.lock
-LOCK_PROJECT="$(read_env_file_var "$CANDIDATE_ENV" "COMPOSE_PROJECT_NAME" "")"
-if [[ -z "$LOCK_PROJECT" ]]; then
-  LOCK_PROJECT="$(basename "$WORK_DIR")"
-fi
-if [[ ! "$LOCK_PROJECT" =~ ^[a-zA-Z0-9._-]+$ || "$LOCK_PROJECT" == "." || "$LOCK_PROJECT" == ".." ]]; then
-  err "Invalid COMPOSE_PROJECT_NAME '${LOCK_PROJECT}': must match ^[a-zA-Z0-9._-]+$."
-  exit 1
+if [[ "$PROJECT_NAME_EXPLICIT" -eq 1 ]]; then
+  LOCK_PROJECT="$PROJECT_NAME_ARG"
+else
+  LOCK_PROJECT="$(read_env_file_var "$CANDIDATE_ENV" "COMPOSE_PROJECT_NAME" "")"
+  if [[ -z "$LOCK_PROJECT" ]]; then
+    LOCK_PROJECT="$(basename "$WORK_DIR")"
+  fi
+  if [[ ! "$LOCK_PROJECT" =~ ^[a-zA-Z0-9._-]+$ || "$LOCK_PROJECT" == "." || "$LOCK_PROJECT" == ".." ]]; then
+    err "Invalid COMPOSE_PROJECT_NAME '${LOCK_PROJECT}': must match ^[a-zA-Z0-9._-]+$."
+    exit 1
+  fi
 fi
 COMPOSE_PROJECT="$LOCK_PROJECT"
 RESTORE_LOCK_PATH="/tmp/dalton-${LOCK_PROJECT}.restore.lock"

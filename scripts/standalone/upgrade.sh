@@ -34,6 +34,8 @@ RETAIN=7
 RETAIN_MAX=3650
 ENV_PASSPHRASE_FILE="${DALTON_BACKUP_PASSPHRASE_FILE:-}"
 COMPOSE_FILES_RAW=""
+PROJECT_NAME_ARG=""
+PROJECT_NAME_EXPLICIT=0
 CA_FILE=""
 SKIP_BUILD=0
 BUILD_ARGS=()
@@ -51,6 +53,8 @@ Options:
   --env-passphrase-file <f>   Passphrase file passed to backup.sh to encrypt .env into env.enc.
   --compose-files <f1:f2>     Colon-separated Docker Compose files
                               (default: from .env COMPOSE_FILE / DALTON_TLS_MODE).
+  --project-name <name>       Explicit Docker Compose project name (overrides .env
+                              COMPOSE_PROJECT_NAME and work-dir basename).
   --ca-file <path>            CA certificate PEM file used to verify HTTPS in custom/auto mode.
   --build-arg <KEY=VAL>       Extra --build-arg passed to `docker compose build` (repeatable).
   --skip-build                Skip `docker compose build` (use when new images are already loaded).
@@ -116,6 +120,24 @@ while [[ $# -gt 0 ]]; do
       COMPOSE_FILES_RAW="${1#--compose-files=}"
       shift
       ;;
+    --project-name)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "ERROR: --project-name requires a non-empty value." >&2
+        exit 2
+      fi
+      PROJECT_NAME_ARG="$2"
+      PROJECT_NAME_EXPLICIT=1
+      shift 2
+      ;;
+    --project-name=*)
+      PROJECT_NAME_ARG="${1#--project-name=}"
+      if [[ -z "$PROJECT_NAME_ARG" ]]; then
+        echo "ERROR: --project-name requires a non-empty value." >&2
+        exit 2
+      fi
+      PROJECT_NAME_EXPLICIT=1
+      shift
+      ;;
     --ca-file)
       CA_FILE="$2"
       shift 2
@@ -163,6 +185,19 @@ fmt_cmd() {
   done
   printf '%s' "$out"
 }
+
+validate_project_name() {
+  local name="$1"
+  local LC_ALL=C
+  if [[ -z "$name" || "$name" == *$'\n'* || ! "$name" =~ ^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$ ]]; then
+    err "Invalid --project-name '${name}': must match ^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$ (lowercase ASCII letters, digits, hyphens, underscores; must start and end with a letter or digit)."
+    exit 2
+  fi
+}
+
+if [[ "$PROJECT_NAME_EXPLICIT" -eq 1 ]]; then
+  validate_project_name "$PROJECT_NAME_ARG"
+fi
 
 if [[ -n "$RELEASE_TAR" && -n "$RELEASE_DIR" ]]; then
   err "Specify only one of --release-tar or --release-dir."
@@ -254,9 +289,13 @@ if [[ "$DB_HOST" != "postgres" ]]; then
   exit 1
 fi
 
-PROJECT_NAME="$(read_env_file_var "$ENV_FILE" "COMPOSE_PROJECT_NAME" "")"
-if [[ -z "$PROJECT_NAME" ]]; then
-  PROJECT_NAME="$(sanitize_project_name "$(basename "$WORK_DIR")")"
+if [[ "$PROJECT_NAME_EXPLICIT" -eq 1 ]]; then
+  PROJECT_NAME="$PROJECT_NAME_ARG"
+else
+  PROJECT_NAME="$(read_env_file_var "$ENV_FILE" "COMPOSE_PROJECT_NAME" "")"
+  if [[ -z "$PROJECT_NAME" ]]; then
+    PROJECT_NAME="$(sanitize_project_name "$(basename "$WORK_DIR")")"
+  fi
 fi
 DOMAIN="$(read_env_file_var "$ENV_FILE" "DOMAIN" "localhost")"
 TLS_MODE="$(read_env_file_var "$ENV_FILE" "DALTON_TLS_MODE" "loopback")"
@@ -483,6 +522,9 @@ print_rollback_steps() {
       --compose-files "$COMPOSE_FILES_JOINED"
       --skip-edge-build
     )
+    if [[ "$PROJECT_NAME_EXPLICIT" -eq 1 ]]; then
+      restore_cmd+=(--project-name "$PROJECT_NAME")
+    fi
     if [[ -n "$CA_FILE" ]]; then
       restore_cmd+=(--ca-file "$CA_FILE")
     fi
@@ -565,6 +607,7 @@ BACKUP_CMD=(
   --output-dir "$BACKUP_OUTPUT_DIR"
   --retain "$RETAIN"
   --compose-files "$COMPOSE_FILES_JOINED"
+  --project-name "$PROJECT_NAME"
 )
 if [[ -n "$ENV_PASSPHRASE_FILE" ]]; then
   BACKUP_CMD+=(--env-passphrase-file "$ENV_PASSPHRASE_FILE")

@@ -2903,3 +2903,260 @@ class TestSandboxNetworkAndInitScript:
         assert "state IN ('ready', 'completing')" in restore_src
         assert "state IN ('ready', 'completing', 'uploading')" not in restore_src
         assert "sys.exit(1)" in restore_src.split("MISSING_CHECK_PY='", 1)[1].split("'\n", 1)[0]
+
+    def test_b6_r8_explicit_project_name_priority_and_validation(self, tmp_path: Path) -> None:
+        """Offline verification for Batch 6 R8: --project-name priority (--project-name > .env > dir),
+        shell COMPOSE_PROJECT_NAME still ignored, validation with sanitize_project_name rules, and
+        upgrade.sh forwarding --project-name to backup.sh."""
+        bak_stub = tmp_path / "bak-stub"
+        bak_stub.mkdir()
+        (bak_stub / "postgres.dump").write_bytes(b"PGDMP")
+
+        rel_stub = tmp_path / "rel-stub"
+        (rel_stub / "scripts/standalone").mkdir(parents=True)
+        (rel_stub / "deploy/standalone").mkdir(parents=True)
+        for req in (
+            "docker-compose.yml",
+            "docker-compose.core.yml",
+            "scripts/standalone/migrate.sh",
+            "scripts/standalone/backup.sh",
+            "scripts/standalone/restore.sh",
+            "deploy/standalone/Caddyfile",
+        ):
+            (rel_stub / req).write_text("stub\n", encoding="utf-8")
+
+        work_base = tmp_path / "work-r8"
+        work_base.mkdir()
+        (work_base / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        (work_base / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (work_base / ".env").write_text(
+            "COMPOSE_PROJECT_NAME=proj-from-env\nDB_HOST=postgres\n",
+            encoding="utf-8",
+        )
+
+        # 1. Invalid --project-name values and missing argument are rejected with exit 2 by all 3 scripts
+        invalid_names = (
+            "",
+            "UpperCase",
+            "-leading",
+            "_leading",
+            "trailing-",
+            "trailing_",
+            "bad.dot",
+            "bad/slash",
+            "bad space",
+            "../escape",
+        )
+        script_base_args = (
+            ("backup.sh", ["--work-dir", str(work_base)]),
+            ("upgrade.sh", ["--work-dir", str(work_base), "--release-dir", str(rel_stub)]),
+            ("restore.sh", ["--work-dir", str(work_base), "--backup-dir", str(bak_stub)]),
+        )
+        for script_name, base_args in script_base_args:
+            script_path = str(REPO_ROOT / "scripts/standalone" / script_name)
+            res_missing = subprocess.run(
+                ["bash", script_path, *base_args, "--project-name"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_missing.returncode == 2, (
+                f"{script_name} should exit 2 when --project-name has no value: {res_missing.stderr}"
+            )
+            for bad in invalid_names:
+                for flag_args in (["--project-name", bad], [f"--project-name={bad}"]):
+                    res_bad = subprocess.run(
+                        ["bash", script_path, *base_args, *flag_args],
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                    )
+                    assert res_bad.returncode == 2, (
+                        f"{script_name} must reject invalid {flag_args!r} with exit 2 "
+                        f"(got rc={res_bad.returncode}, stderr={res_bad.stderr!r})"
+                    )
+
+        # 2. backup.sh: --project-name > .env > dir basename; shell COMPOSE_PROJECT_NAME is always ignored
+        bak_bin = tmp_path / "r8-bak-bin"
+        bak_bin.mkdir()
+        bak_docker_log = tmp_path / "r8-bak-docker.log"
+        (bak_bin / "docker").write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "ENV_PROJ=%s|ARGS=%s\\n" "${{COMPOSE_PROJECT_NAME:-UNSET}}" "$*" > "{bak_docker_log}"\n'
+            "exit 99\n",
+            encoding="utf-8",
+        )
+        (bak_bin / "docker").chmod(0o755)
+        bak_env = os.environ.copy()
+        bak_env["PATH"] = f"{bak_bin}:{bak_env.get('PATH', '')}"
+        bak_env["COMPOSE_PROJECT_NAME"] = "shell-poison-proj"
+
+        # 2a. Explicit --project-name overrides .env and shell env (both space and `=` forms)
+        for flag_args, want_proj in (
+            (["--project-name", "cli-bak-proj-1"], "cli-bak-proj-1"),
+            (["--project-name=cli_bak_proj_2"], "cli_bak_proj_2"),
+        ):
+            bak_docker_log.unlink(missing_ok=True)
+            subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts/standalone/backup.sh"),
+                    "--work-dir",
+                    str(work_base),
+                    *flag_args,
+                ],
+                env=bak_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            logged = bak_docker_log.read_text(encoding="utf-8")
+            assert "ENV_PROJ=UNSET|" in logged, f"backup.sh leaked shell COMPOSE_PROJECT_NAME: {logged!r}"
+            assert f"compose -p {want_proj} " in logged, f"backup.sh did not use {want_proj!r}: {logged!r}"
+            assert "proj-from-env" not in logged and "shell-poison-proj" not in logged
+
+        # 2b. Without --project-name, .env wins over shell env; without .env key, sanitized dir name wins
+        bak_docker_log.unlink(missing_ok=True)
+        subprocess.run(
+            ["bash", str(REPO_ROOT / "scripts/standalone/backup.sh"), "--work-dir", str(work_base)],
+            env=bak_env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        logged_env = bak_docker_log.read_text(encoding="utf-8")
+        assert "ENV_PROJ=UNSET|" in logged_env
+        assert "compose -p proj-from-env " in logged_env
+        assert "shell-poison-proj" not in logged_env
+
+        work_dir_fallback = tmp_path / "My_Fallback.Dir"
+        work_dir_fallback.mkdir()
+        (work_dir_fallback / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        (work_dir_fallback / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (work_dir_fallback / ".env").write_text("DB_HOST=postgres\n", encoding="utf-8")
+        bak_docker_log.unlink(missing_ok=True)
+        subprocess.run(
+            ["bash", str(REPO_ROOT / "scripts/standalone/backup.sh"), "--work-dir", str(work_dir_fallback)],
+            env=bak_env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        logged_dir = bak_docker_log.read_text(encoding="utf-8")
+        assert "compose -p my_fallback-dir " in logged_dir
+        assert "shell-poison-proj" not in logged_dir
+
+        # 3. upgrade.sh: --project-name overrides .env & shell env and is forwarded to backup.sh
+        #    (both when calling existing WORK_DIR/backup.sh and new-package RELEASE_SRC/backup.sh)
+        for case_name, has_old_backup, extra_upg_flags, want_proj in (
+            ("explicit-new-pkg", False, ["--project-name", "cli-upg-proj-1"], "cli-upg-proj-1"),
+            ("explicit-existing-bak", True, ["--project-name=cli_upg_proj_2"], "cli_upg_proj_2"),
+            ("from-env-new-pkg", False, [], "proj-from-env"),
+        ):
+            croot = tmp_path / f"r8-upg-{case_name}"
+            uwork = croot / "work"
+            urel = croot / "rel"
+            ubak = croot / "bak"
+            uwork.mkdir(parents=True)
+            (urel / "scripts/standalone").mkdir(parents=True)
+            (urel / "deploy/standalone").mkdir(parents=True)
+            ubak.mkdir()
+            for req in (
+                "docker-compose.yml",
+                "docker-compose.core.yml",
+                "scripts/standalone/migrate.sh",
+                "scripts/standalone/restore.sh",
+                "deploy/standalone/Caddyfile",
+            ):
+                (urel / req).write_text("stub\n", encoding="utf-8")
+            (uwork / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+            (uwork / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+            (uwork / ".env").write_text(
+                "COMPOSE_PROJECT_NAME=proj-from-env\nDB_HOST=postgres\n",
+                encoding="utf-8",
+            )
+            seen_backup_args = croot / "seen_backup_args.txt"
+            backup_capture = (
+                "#!/usr/bin/env bash\n"
+                f'printf "%s\\n" "$*" > "{seen_backup_args}"\n'
+                "exit 1\n"
+            )
+            (urel / "scripts/standalone/backup.sh").write_text(backup_capture, encoding="utf-8")
+            if has_old_backup:
+                (uwork / "scripts/standalone").mkdir(parents=True)
+                (uwork / "scripts/standalone/backup.sh").write_text(backup_capture, encoding="utf-8")
+            upg_env = os.environ.copy()
+            upg_env["COMPOSE_PROJECT_NAME"] = "shell-poison-proj"
+            res_u = subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts/standalone/upgrade.sh"),
+                    "--work-dir",
+                    str(uwork),
+                    "--release-dir",
+                    str(urel),
+                    "--backup-dir",
+                    str(ubak),
+                    *extra_upg_flags,
+                ],
+                env=upg_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_u.returncode != 0
+            captured = seen_backup_args.read_text(encoding="utf-8")
+            assert f"--project-name {want_proj}" in captured, (
+                f"{case_name}: upgrade.sh did not pass --project-name {want_proj!r} to backup.sh: {captured!r}"
+            )
+            assert f"-p {want_proj} " in res_u.stderr, (
+                f"{case_name}: upgrade.sh rollback command did not use -p {want_proj!r}: {res_u.stderr!r}"
+            )
+            assert "shell-poison-proj" not in captured and "shell-poison-proj" not in res_u.stderr
+
+        # 4. restore.sh: --project-name overrides .env and shell env for lock path and docker compose -p
+        res_bin = tmp_path / "r8-res-bin"
+        res_bin.mkdir()
+        res_docker_log = tmp_path / "r8-res-docker.log"
+        (res_bin / "docker").write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "ENV_PROJ=%s|ARGS=%s\\n" "${{COMPOSE_PROJECT_NAME:-UNSET}}" "$*" > "{res_docker_log}"\n'
+            "exit 99\n",
+            encoding="utf-8",
+        )
+        (res_bin / "docker").chmod(0o755)
+        res_env = os.environ.copy()
+        res_env["PATH"] = f"{res_bin}:{res_env.get('PATH', '')}"
+        res_env["COMPOSE_PROJECT_NAME"] = "shell-poison-proj"
+
+        for flag_args, want_proj in (
+            (["--project-name", f"cli-res-proj-{os.getpid()}"], f"cli-res-proj-{os.getpid()}"),
+            ([f"--project-name=cli_res_proj_eq_{os.getpid()}"], f"cli_res_proj_eq_{os.getpid()}"),
+        ):
+            lock_p = Path(f"/tmp/dalton-{want_proj}.restore.lock")
+            res_docker_log.unlink(missing_ok=True)
+            try:
+                subprocess.run(
+                    [
+                        "bash",
+                        str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                        "--work-dir",
+                        str(work_base),
+                        "--backup-dir",
+                        str(bak_stub),
+                        *flag_args,
+                    ],
+                    env=res_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                logged_r = res_docker_log.read_text(encoding="utf-8")
+                assert "ENV_PROJ=UNSET|" in logged_r, f"restore.sh leaked shell COMPOSE_PROJECT_NAME: {logged_r!r}"
+                assert f"compose -p {want_proj} " in logged_r, f"restore.sh did not use {want_proj!r}: {logged_r!r}"
+                assert "proj-from-env" not in logged_r and "shell-poison-proj" not in logged_r
+            finally:
+                if lock_p.is_dir():
+                    lock_p.rmdir()
+                elif lock_p.exists():
+                    lock_p.unlink()

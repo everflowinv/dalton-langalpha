@@ -32,6 +32,8 @@ RETAIN_MAX=3650
 ENV_PASSPHRASE_FILE="${DALTON_BACKUP_PASSPHRASE_FILE:-}"
 COMPOSE_FILES_RAW=""
 COMPOSE_FILES_EXPLICIT=0
+PROJECT_NAME_ARG=""
+PROJECT_NAME_EXPLICIT=0
 VERIFY=1
 
 ENV_CIPHER="aes-256-cbc"
@@ -55,6 +57,8 @@ Options:
                               Without this option, .env is excluded from the backup directory.
   --compose-files <f1:f2>     Colon-separated Docker Compose files
                               (default: from .env COMPOSE_FILE / DALTON_TLS_MODE).
+  --project-name <name>       Explicit Docker Compose project name (overrides .env
+                              COMPOSE_PROJECT_NAME and work-dir basename).
   --no-verify                 Skip post-backup verification checks (not recommended).
   -h, --help                  Show this help message.
 EOF
@@ -104,6 +108,24 @@ while [[ $# -gt 0 ]]; do
       COMPOSE_FILES_EXPLICIT=1
       shift
       ;;
+    --project-name)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "ERROR: --project-name requires a non-empty value." >&2
+        exit 2
+      fi
+      PROJECT_NAME_ARG="$2"
+      PROJECT_NAME_EXPLICIT=1
+      shift 2
+      ;;
+    --project-name=*)
+      PROJECT_NAME_ARG="${1#--project-name=}"
+      if [[ -z "$PROJECT_NAME_ARG" ]]; then
+        echo "ERROR: --project-name requires a non-empty value." >&2
+        exit 2
+      fi
+      PROJECT_NAME_EXPLICIT=1
+      shift
+      ;;
     --no-verify)
       VERIFY=0
       shift
@@ -135,6 +157,19 @@ fmt_cmd() {
   done
   printf '%s' "$out"
 }
+
+validate_project_name() {
+  local name="$1"
+  local LC_ALL=C
+  if [[ -z "$name" || "$name" == *$'\n'* || ! "$name" =~ ^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$ ]]; then
+    err "Invalid --project-name '${name}': must match ^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$ (lowercase ASCII letters, digits, hyphens, underscores; must start and end with a letter or digit)."
+    exit 2
+  fi
+}
+
+if [[ "$PROJECT_NAME_EXPLICIT" -eq 1 ]]; then
+  validate_project_name "$PROJECT_NAME_ARG"
+fi
 
 if ! [[ "$RETAIN" =~ ^[0-9]+$ ]]; then
   err "--retain must be a non-negative integer (got '${RETAIN}')."
@@ -224,9 +259,13 @@ fi
 
 DB_USER="$(read_env_file_var "$ENV_FILE" "DB_USER" "postgres")"
 DB_NAME="$(read_env_file_var "$ENV_FILE" "DB_NAME" "postgres")"
-PROJECT_NAME="$(read_env_file_var "$ENV_FILE" "COMPOSE_PROJECT_NAME" "")"
-if [[ -z "$PROJECT_NAME" ]]; then
-  PROJECT_NAME="$(sanitize_project_name "$(basename "$WORK_DIR")")"
+if [[ "$PROJECT_NAME_EXPLICIT" -eq 1 ]]; then
+  PROJECT_NAME="$PROJECT_NAME_ARG"
+else
+  PROJECT_NAME="$(read_env_file_var "$ENV_FILE" "COMPOSE_PROJECT_NAME" "")"
+  if [[ -z "$PROJECT_NAME" ]]; then
+    PROJECT_NAME="$(sanitize_project_name "$(basename "$WORK_DIR")")"
+  fi
 fi
 DOMAIN="$(read_env_file_var "$ENV_FILE" "DOMAIN" "localhost")"
 TLS_MODE="$(read_env_file_var "$ENV_FILE" "DALTON_TLS_MODE" "loopback")"
@@ -1120,6 +1159,9 @@ release_publish_lock
 RESTORE_HINT_ARGS=(bash scripts/standalone/restore.sh --work-dir "$WORK_DIR" --backup-dir "$FINAL_DIR")
 if [[ "$COMPOSE_FILES_EXPLICIT" -eq 1 ]]; then
   RESTORE_HINT_ARGS+=(--compose-files "$COMPOSE_FILES_RAW")
+fi
+if [[ "$PROJECT_NAME_EXPLICIT" -eq 1 ]]; then
+  RESTORE_HINT_ARGS+=(--project-name "$PROJECT_NAME")
 fi
 
 printf "\n== Backup Complete ==\n"

@@ -1086,6 +1086,8 @@ def check_backup_script(
     log("4/6 Verifying scripts/standalone/backup.sh (streaming hot backup, PBKDF2 manifest, retention)...")
     backup_script = ctx.work_dir / "scripts" / "standalone" / "backup.sh"
     compose_files_str = ":".join(str(p) for p in _tls_compose_files(ctx))
+    project_name = os.environ["COMPOSE_PROJECT_NAME"]
+    assert project_name, "COMPOSE_PROJECT_NAME must be set by run_checks.sh"
 
     # 4a. Backup without passphrase file -> plaintext .env MUST NOT be in backup dir
     _run_cmd(
@@ -1100,6 +1102,8 @@ def check_backup_script(
             "2",
             "--compose-files",
             compose_files_str,
+            "--project-name",
+            project_name,
         ],
         cwd=ctx.work_dir,
         redact_env=ctx.env,
@@ -1112,6 +1116,9 @@ def check_backup_script(
     assert not (b1 / "env.enc").exists(), "env.enc should not exist without passphrase file!"
     m1 = json.loads((b1 / "manifest.json").read_text(encoding="utf-8"))
     assert m1["env_backup"] == "excluded", f"Expected env_backup='excluded', got {m1}"
+    assert m1.get("compose_project") == project_name, (
+        f"Expected manifest compose_project={project_name!r}, got {m1.get('compose_project')!r}"
+    )
 
     time.sleep(1.1)
 
@@ -1128,6 +1135,8 @@ def check_backup_script(
             "2",
             "--compose-files",
             compose_files_str,
+            "--project-name",
+            project_name,
         ],
         cwd=ctx.work_dir,
         redact_env=ctx.env,
@@ -1150,6 +1159,8 @@ def check_backup_script(
             str(passphrase_file),
             "--compose-files",
             compose_files_str,
+            "--project-name",
+            project_name,
         ],
         cwd=ctx.work_dir,
         redact_env=ctx.env,
@@ -1659,6 +1670,8 @@ def check_restore_on_clean_stack(
                         str(restore_dir),
                         "--compose-files",
                         restore_compose_files,
+                        "--project-name",
+                        restore_project,
                         "--skip-edge-build",
                     ],
                     cwd=restore_dir,
@@ -1690,6 +1703,58 @@ def check_restore_on_clean_stack(
                     f"Restored instance /workspaces failed after refused restore: HTTP {still_ws.status}"
                 )
                 log("5b OK (non-empty instance refused with manual link on stderr and remained live).")
+
+                # 5b2. Explicit --project-name overrides both .env COMPOSE_PROJECT_NAME and shell env.
+                saved_env_for_proj = restored_env_file.read_text(encoding="utf-8")
+                restored_env_file.write_text(
+                    _rewrite_env_keys(
+                        saved_env_for_proj,
+                        {"COMPOSE_PROJECT_NAME": "wrong_env_project_must_be_overridden"},
+                    ),
+                    encoding="utf-8",
+                )
+                os.chmod(restored_env_file, 0o600)
+                try:
+                    explicit_proj_proc = _run_cmd(
+                        [
+                            "bash",
+                            str(restore_dir / "scripts" / "standalone" / "restore.sh"),
+                            "--backup-dir",
+                            str(restore_backup_dir),
+                            "--work-dir",
+                            str(restore_dir),
+                            "--compose-files",
+                            restore_compose_files,
+                            "--project-name",
+                            restore_project,
+                            "--skip-edge-build",
+                        ],
+                        cwd=restore_dir,
+                        env=restore_sh_env,
+                        check=False,
+                        redact_env=ctx.env,
+                        timeout=120,
+                    )
+                    assert explicit_proj_proc.returncode != 0, (
+                        "restore.sh --project-name should target the running non-empty restore_project and refuse!"
+                    )
+                    ep_stderr = explicit_proj_proc.stderr or ""
+                    assert "NOT empty" in ep_stderr, (
+                        f"Expected --project-name to inspect non-empty {restore_project!r}, got:\n{ep_stderr[-800:]}"
+                    )
+                    assert f"label=com.docker.compose.project={restore_project}" in ep_stderr, (
+                        f"Expected stderr to reference explicit project {restore_project!r}, got:\n{ep_stderr[-800:]}"
+                    )
+                    assert "wrong_env_project_must_be_overridden" not in ep_stderr, (
+                        f"restore.sh used .env project instead of --project-name:\n{ep_stderr[-800:]}"
+                    )
+                    assert "wrong_shell_project_must_be_ignored" not in ep_stderr, (
+                        f"restore.sh used shell project instead of --project-name:\n{ep_stderr[-800:]}"
+                    )
+                finally:
+                    restored_env_file.write_text(saved_env_for_proj, encoding="utf-8")
+                    os.chmod(restored_env_file, 0o600)
+                log("5b2 OK (explicit --project-name overrides both .env and shell COMPOSE_PROJECT_NAME).")
 
                 # 5c. Follow manual §6.2 steps: mutate live data, inspect full project volume list
                 #     via `docker volume ls --filter label=com.docker.compose.project=...`, and run `down -v`.
@@ -1758,6 +1823,8 @@ def check_restore_on_clean_stack(
                             str(restore_dir),
                             "--compose-files",
                             restore_compose_files,
+                            "--project-name",
+                            restore_project,
                             "--skip-edge-build",
                         ],
                         cwd=restore_dir,
@@ -1800,6 +1867,8 @@ def check_restore_on_clean_stack(
                         str(restore_dir),
                         "--compose-files",
                         f"{restore_compose_files}:{override_compose}",
+                        "--project-name",
+                        restore_project,
                         "--skip-edge-build",
                     ],
                     cwd=restore_dir,
@@ -1918,6 +1987,8 @@ def check_restore_on_clean_stack(
                         str(restore_dir),
                         "--compose-files",
                         restore_compose_files,
+                        "--project-name",
+                        restore_project,
                         "--env-passphrase-file",
                         str(passphrase_file),
                         "--replace-env",
@@ -1988,6 +2059,8 @@ def check_restore_on_clean_stack(
                         str(restore_dir),
                         "--compose-files",
                         restore_compose_files,
+                        "--project-name",
+                        restore_project,
                         "--env-passphrase-file",
                         str(passphrase_file),
                         "--replace-env",
@@ -2068,6 +2141,8 @@ def check_upgrade_same_version(
     log("6/6 Verifying scripts/standalone/upgrade.sh (old-backup-first, pre-upgrade tags & snapshot, rolling upgrade)...")
     tls_context = _tls_ctx(ctx)
     compose_files_str = ":".join(str(p) for p in tls_context.compose_files)
+    project_name = os.environ["COMPOSE_PROJECT_NAME"]
+    assert project_name, "COMPOSE_PROJECT_NAME must be set by run_checks.sh"
     pre_backend_cid = _container_id(tls_context, "backend")
     pre_edge_cid = _container_id(tls_context, "edge")
 
@@ -2093,6 +2168,8 @@ def check_upgrade_same_version(
                     str(upgrade_backups),
                     "--compose-files",
                     compose_files_str,
+                    "--project-name",
+                    project_name,
                     "--skip-build",
                 ],
                 cwd=ctx.work_dir,
@@ -2100,11 +2177,16 @@ def check_upgrade_same_version(
                 timeout=360,
             )
 
-            # Confirm pre-upgrade backup was created
+            # Confirm pre-upgrade backup was created with the explicit project name
             pre_backups = sorted(p for p in upgrade_backups.glob("dalton-backup-*") if p.is_dir())
             assert len(pre_backups) == 1, f"Expected 1 pre-upgrade backup, got {pre_backups}"
             assert (pre_backups[0] / "postgres.dump").is_file()
             assert (pre_backups[0] / "manifest.json").is_file()
+            pre_manifest = json.loads((pre_backups[0] / "manifest.json").read_text(encoding="utf-8"))
+            assert pre_manifest.get("compose_project") == project_name, (
+                f"Expected pre-upgrade backup compose_project={project_name!r}, "
+                f"got {pre_manifest.get('compose_project')!r}"
+            )
 
         # Confirm release snapshot directory & pre-upgrade-* image tags were created
         new_snaps = (set(snapshot_root.iterdir()) if snapshot_root.is_dir() else set()) - existing_snaps

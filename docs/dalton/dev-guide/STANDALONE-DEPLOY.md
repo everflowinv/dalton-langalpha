@@ -313,7 +313,8 @@ bash scripts/standalone/backup.sh \
 常用参数：
 - `--output-dir <目录>`：备份父目录，每次发布加锁生成 `dalton-backup-YYYYMMDD-HHMMSSZ-<随机后缀>` 子目录（默认 `<部署目录>/backups`）；
 - `--retain <N>`：成功校验后保留当前实例最近 N 份有效备份（默认 `7`，`0` 表示全部保留，上限 `3650`）；
-- `--env-passphrase-file <文件>`：对 `.env` 加密生成 `env.enc`（也可通过环境变量 `DALTON_BACKUP_PASSPHRASE_FILE` 指定）。
+- `--env-passphrase-file <文件>`：对 `.env` 加密生成 `env.enc`（也可通过环境变量 `DALTON_BACKUP_PASSPHRASE_FILE` 指定）；
+- `--project-name <项目名>`：显式指定 Docker Compose 项目名（优先级高于 `.env` 中的 `COMPOSE_PROJECT_NAME` 与部署目录名）。
 
 #### 配置每日定时自动备份（cron，使用同一部署账号）
 
@@ -357,6 +358,7 @@ v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不�
    ```
    > - 如果目标目录已有一份 `.env` 且目标实例为空，需要用备份内的 `env.enc` 替换该 `.env`，附加 `--replace-env`（要求新旧 `.env` 中的 `COMPOSE_PROJECT_NAME` 逐字一致，先校验目标为空后再原子写入）。
    > - 若使用已有 `.env` 而未用 `env.enc` 覆盖，请确认其中的对象存储桶名、键前缀与 `BYOK_ENCRYPTION_KEY` 均与备份同期原件一致（桶名或键前缀不一致会在写入前被直接拒绝，可先改 `.env` 让两者一致，或使用 `--replace-env`）。使用企业自有证书（`custom`）模式时，提前恢复 `DALTON_TLS_CERT_DIR` 并可附加 `--ca-file <企业CA.pem>`。
+   > - 如需显式指定目标实例的 Docker Compose 项目名，可附加 `--project-name <项目名>`（优先级高于 `.env` 中的 `COMPOSE_PROJECT_NAME` 与部署目录名）。
 3. 恢复完成后，提前构建代码沙箱镜像以消除首次对话等待：
    ```bash
    docker build -f Dockerfile.sandbox --build-arg INSTALL_AGENT_BROWSER=0 -t langalpha-sandbox:latest .
@@ -504,7 +506,7 @@ bash scripts/standalone/upgrade.sh \
   --env-passphrase-file /etc/dalton/backup.pass
 ```
 
-使用企业自有证书（`custom`）模式时，可附加 `--ca-file <企业CA.pem>` 完成升级后 HTTPS 探测。
+使用企业自有证书（`custom`）模式时，可附加 `--ca-file <企业CA.pem>` 完成升级后 HTTPS 探测。如需显式指定目标实例的 Docker Compose 项目名，可附加 `--project-name <项目名>`（优先级高于 `.env` 中的 `COMPOSE_PROJECT_NAME` 与部署目录名，并会透传给升级前调用的 `backup.sh`）。
 
 #### 升级失败回滚
 
