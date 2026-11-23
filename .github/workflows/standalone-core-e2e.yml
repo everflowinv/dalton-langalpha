@@ -107,6 +107,17 @@ jobs:
             build --build-arg INSTALL_BROWSER_CRAWLER=false
           df -h
 
+      - name: Build the sandbox image the core install runs agent code in
+        working-directory: /tmp/dalton-core-dist
+        # The Docker provider starts sandboxes from `langalpha-sandbox:latest`
+        # (agent_config.yaml sandbox.docker.image). Without it the first turn
+        # builds it on demand and the check's stream times out waiting.
+        run: |
+          start=$(date +%s)
+          docker build -f Dockerfile.sandbox -t langalpha-sandbox:latest .
+          echo "sandbox image built in $(( $(date +%s) - start ))s"
+          df -h
+
       - name: Run standalone acceptance checks (grouped by auth mode)
         working-directory: /tmp/dalton-core-dist
         run: |
