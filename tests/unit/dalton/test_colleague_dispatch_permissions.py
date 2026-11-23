@@ -111,13 +111,13 @@ def _setup_roles(
         "u-external": "external",
     }
 
-    async def _fake_get_user_tier(uid: str) -> str:
+    async def _fake_get_user_tier(uid: str, *, conn: Any = None) -> str:
         return tier_by_uid.get(str(uid), "external")
 
-    async def _fake_classify_owner_tier(owner_id: str | None) -> str:
+    async def _fake_classify_owner_tier(owner_id: str | None, *, conn: Any = None) -> str:
         return tier_by_uid.get(str(owner_id or ""), "external")
 
-    async def _fake_is_team_member(email: str | None) -> bool:
+    async def _fake_is_team_member(email: str | None, *, conn: Any = None) -> bool:
         return str(email or "").lower() in {
             "chao.yu@dalton.test",
             "richard.lu@dalton.test",
