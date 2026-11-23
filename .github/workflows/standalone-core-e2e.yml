@@ -59,7 +59,7 @@ jobs:
   standalone-core-e2e:
     name: Clean Linux Standalone Core E2E
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
@@ -107,16 +107,22 @@ jobs:
             build --build-arg INSTALL_BROWSER_CRAWLER=false
           df -h
 
+      - name: Set up Docker Buildx for the cached sandbox build
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
       - name: Build the sandbox image the core install runs agent code in
-        working-directory: /tmp/dalton-core-dist
         # The Docker provider starts sandboxes from `langalpha-sandbox:latest`
         # (agent_config.yaml sandbox.docker.image). Without it the first turn
-        # builds it on demand and the check's stream times out waiting.
-        run: |
-          start=$(date +%s)
-          docker build -f Dockerfile.sandbox -t langalpha-sandbox:latest .
-          echo "sandbox image built in $(( $(date +%s) - start ))s"
-          df -h
+        # builds it on demand and the check's stream times out waiting. The
+        # layers are cached between runs, since a cold build takes 20-40 minutes.
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: /tmp/dalton-core-dist
+          file: /tmp/dalton-core-dist/Dockerfile.sandbox
+          tags: langalpha-sandbox:latest
+          load: true
+          cache-from: type=gha,scope=core-sandbox
+          cache-to: type=gha,mode=max,scope=core-sandbox
 
       - name: Run standalone acceptance checks (grouped by auth mode)
         working-directory: /tmp/dalton-core-dist
