@@ -1000,6 +1000,7 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("chat_uploads.py", "create_chat_upload_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "upload_chat_part_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "complete_chat_upload_endpoint"): CORE_CAPABILITY,
+        ("chat_uploads.py", "download_sandbox_chat_upload_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "get_chat_upload_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "cancel_chat_upload_endpoint"): CORE_CAPABILITY,
     }
