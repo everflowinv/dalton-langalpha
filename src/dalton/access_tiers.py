@@ -131,7 +131,10 @@ def _fetch_local_primary_admin_sync() -> str | None:
         with psycopg.connect(get_db_connection_string(), connect_timeout=3) as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT holder_user_id FROM dalton_credential_holder WHERE singleton_id = 1"
+                    "SELECT h.holder_user_id "
+                    "FROM dalton_credential_holder h "
+                    "JOIN dalton_user_roles r ON r.user_id = h.holder_user_id "
+                    "WHERE h.singleton_id = 1 AND r.tier = 'admin'"
                 )
                 holder = cur.fetchone()
                 if holder and holder[0] and str(holder[0]).strip():
@@ -289,11 +292,12 @@ async def get_primary_admin_user_id(*, conn: Any = None) -> str | None:
         try:
             from src.dalton.auth.roles import (
                 get_credential_holder_id,
+                get_user_role,
                 list_admin_user_ids as _list_local_admins,
             )
 
             holder = await get_credential_holder_id(conn=conn)
-            if holder:
+            if holder and await get_user_role(holder, conn=conn) == "admin":
                 return holder
             admins = await _list_local_admins(conn=conn)
             return admins[0] if admins else None
@@ -350,13 +354,17 @@ async def is_team_member_user(
         try:
             from src.server.database.user import get_user
 
-            user = await get_user(uid)
+            user = await get_user(uid, conn=conn) if conn is not None else await get_user(uid)
             resolved_email = str((user or {}).get("email") or "").strip().lower()
         except Exception:
             resolved_email = ""
     if not resolved_email:
         return False
-    return await is_team_member(resolved_email)
+    return (
+        await is_team_member(resolved_email, conn=conn)
+        if conn is not None
+        else await is_team_member(resolved_email)
+    )
 
 
 def classify_owner_tier_sync(owner_id: str | None, owner_email: Any = None) -> OwnerTier:
@@ -382,7 +390,7 @@ def classify_owner_tier_sync(owner_id: str | None, owner_email: Any = None) -> O
         return "unknown"
 
 
-async def get_user_tier(user_id: str | None) -> UserTier:
+async def get_user_tier(user_id: str | None, *, conn: Any = None) -> UserTier:
     """Resolve a user's access tier; never raises, never returns a wider tier on failure."""
     uid = str(user_id or "").strip()
     if not uid:
@@ -393,7 +401,7 @@ async def get_user_tier(user_id: str | None) -> UserTier:
         try:
             from src.dalton.auth.roles import get_user_role
 
-            role = await get_user_role(uid)
+            role = await get_user_role(uid, conn=conn) if conn is not None else await get_user_role(uid)
             if role in ("admin", "internal", "external"):
                 return role
         except Exception as exc:
@@ -417,7 +425,7 @@ async def get_user_tier(user_id: str | None) -> UserTier:
     try:
         from src.server.database.user import get_user
 
-        user = await get_user(uid)
+        user = await get_user(uid, conn=conn) if conn is not None else await get_user(uid)
         email = str((user or {}).get("email") or "").strip().lower()
         if email and email in get_dalton_allowed_emails():
             return "internal"
@@ -430,7 +438,7 @@ async def get_user_tier(user_id: str | None) -> UserTier:
     return "external"
 
 
-async def is_internal_or_admin(user_id: str | None) -> bool:
+async def is_internal_or_admin(user_id: str | None, *, conn: Any = None) -> bool:
     """Return True when ``user_id`` resolves to ``admin`` or ``internal`` tier.
 
     Fails closed to ``external`` (``False``) on missing user_id or any error
@@ -440,7 +448,7 @@ async def is_internal_or_admin(user_id: str | None) -> bool:
     if not uid:
         return False
     try:
-        tier = await get_user_tier(uid)
+        tier = await get_user_tier(uid, conn=conn) if conn is not None else await get_user_tier(uid)
     except Exception as exc:
         logger.warning(
             "is_internal_or_admin tier check failed for user_id=%s (treated as external): %s",
@@ -451,7 +459,7 @@ async def is_internal_or_admin(user_id: str | None) -> bool:
     return tier in ("admin", "internal")
 
 
-async def classify_owner_tier(owner_id: str | None) -> OwnerTier:
+async def classify_owner_tier(owner_id: str | None, *, conn: Any = None) -> OwnerTier:
     """Strictly classify a *resource owner* for isolation decisions.
 
     ``get_user_tier`` fails closed to ``external`` — the safe answer for a
@@ -472,7 +480,7 @@ async def classify_owner_tier(owner_id: str | None) -> OwnerTier:
         try:
             from src.dalton.auth.roles import get_user_role
 
-            role = await get_user_role(uid)
+            role = await get_user_role(uid, conn=conn) if conn is not None else await get_user_role(uid)
             if role in ("admin", "internal", "external"):
                 return role
         except Exception as exc:
@@ -495,7 +503,7 @@ async def classify_owner_tier(owner_id: str | None) -> OwnerTier:
     try:
         from src.server.database.user import get_user
 
-        user = await get_user(uid)
+        user = await get_user(uid, conn=conn) if conn is not None else await get_user(uid)
         email = str((user or {}).get("email") or "").strip().lower()
         if not email:
             return "unknown"

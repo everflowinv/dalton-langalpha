@@ -10,8 +10,11 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import ipaddress
+import json
 import os
 import secrets
 import time
@@ -34,6 +37,8 @@ from src.dalton.settings import (
 
 LOCAL_JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_TTL_SECONDS = 15 * 60  # 15 minutes
+WS_TICKET_TTL_SECONDS = 60  # 60 seconds
+WS_TICKET_HMAC_DOMAIN = b"dalton-local-ws-ticket-v1"
 DEFAULT_REFRESH_SESSION_TTL_DAYS = 14
 REFRESH_COOKIE_NAME = "dalton_refresh_token"
 REFRESH_COOKIE_PATH = "/api/v1/dalton/auth"
@@ -148,6 +153,141 @@ def decode_local_access_token(token: str) -> LocalAccessClaims:
         session_id=sid.strip(),
         issued_at=int(iat),
         expires_at=int(exp),
+    )
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(encoded: str) -> bytes:
+    pad = "=" * ((4 - len(encoded) % 4) % 4)
+    return base64.urlsafe_b64decode(encoded + pad)
+
+
+def _ws_ticket_hmac_key() -> bytes:
+    secret = _require_signing_secret()
+    return hmac.new(
+        secret.encode("utf-8"), WS_TICKET_HMAC_DOMAIN, hashlib.sha256
+    ).digest()
+
+
+def issue_local_ws_ticket(
+    *,
+    user_id: str,
+    session_id: str,
+    ttl_seconds: int = WS_TICKET_TTL_SECONDS,
+    now: int | None = None,
+) -> tuple[str, int]:
+    """Mint a short-lived HMAC-SHA256 WebSocket handshake ticket (default 60s TTL).
+
+    Uses a 2-segment ``<b64url_payload>.<b64url_sig>`` format with a domain-separated
+    HMAC key derived from ``JWT_SIGNING_SECRET`` so access JWTs and WS tickets can
+    never be confused for one another.
+    """
+    uid = str(user_id or "").strip()
+    sid = str(session_id or "").strip()
+    if not uid or not sid:
+        raise ValueError("user_id and session_id are required to issue a WS ticket")
+    reject_company_system_auth(uid)
+
+    hmac_key = _ws_ticket_hmac_key()
+    ttl = max(1, min(WS_TICKET_TTL_SECONDS, int(ttl_seconds)))
+    issued_at = int(time.time()) if now is None else int(now)
+    expires_at = issued_at + ttl
+    payload = {
+        "v": 1,
+        "typ": "ws_ticket",
+        "sub": uid,
+        "sid": sid,
+        "iat": issued_at,
+        "exp": expires_at,
+    }
+    payload_bytes = json.dumps(
+        payload, separators=(",", ":"), sort_keys=True, ensure_ascii=False
+    ).encode("utf-8")
+    payload_b64 = _b64url_encode(payload_bytes)
+    sig = hmac.new(hmac_key, payload_b64.encode("ascii"), hashlib.sha256).digest()
+    sig_b64 = _b64url_encode(sig)
+    return f"{payload_b64}.{sig_b64}", ttl
+
+
+def verify_local_ws_ticket(
+    ticket: str,
+    *,
+    now: int | None = None,
+) -> LocalAccessClaims:
+    """Verify a short-lived HMAC-SHA256 WebSocket handshake ticket.
+
+    Raises:
+        HTTPException(503): if ``JWT_SIGNING_SECRET`` is missing or shorter than 32 bytes.
+        HTTPException(401): if ticket is missing, malformed, has an invalid signature,
+            expired, wrong type/version, or names the company system user.
+    """
+    cleaned = str(ticket or "").strip()
+    if not cleaned:
+        raise HTTPException(status_code=401, detail="Missing WebSocket ticket")
+
+    hmac_key = _ws_ticket_hmac_key()
+    parts = cleaned.split(".")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise HTTPException(status_code=401, detail="Invalid WebSocket ticket")
+
+    payload_b64, sig_b64 = parts[0], parts[1]
+    expected_sig = hmac.new(
+        hmac_key, payload_b64.encode("ascii"), hashlib.sha256
+    ).digest()
+    try:
+        supplied_sig = _b64url_decode(sig_b64)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=401, detail="Invalid WebSocket ticket signature"
+        ) from exc
+
+    if not hmac.compare_digest(supplied_sig, expected_sig):
+        raise HTTPException(
+            status_code=401, detail="Invalid WebSocket ticket signature"
+        )
+
+    try:
+        payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=401, detail="Malformed WebSocket ticket payload"
+        ) from exc
+
+    if (
+        not isinstance(payload, dict)
+        or payload.get("v") != 1
+        or payload.get("typ") != "ws_ticket"
+    ):
+        raise HTTPException(status_code=401, detail="Invalid WebSocket ticket type")
+
+    sub = payload.get("sub")
+    sid = payload.get("sid")
+    iat = payload.get("iat")
+    exp = payload.get("exp")
+    if (
+        not isinstance(sub, str)
+        or not sub.strip()
+        or not isinstance(sid, str)
+        or not sid.strip()
+        or not isinstance(iat, int)
+        or not isinstance(exp, int)
+    ):
+        raise HTTPException(status_code=401, detail="Invalid WebSocket ticket claims")
+
+    now_ts = int(time.time()) if now is None else int(now)
+    if exp <= now_ts:
+        raise HTTPException(status_code=401, detail="WebSocket ticket expired")
+
+    user_id = sub.strip()
+    reject_company_system_auth(user_id)
+    return LocalAccessClaims(
+        user_id=user_id,
+        session_id=sid.strip(),
+        issued_at=iat,
+        expires_at=exp,
     )
 
 

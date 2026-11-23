@@ -1,5 +1,7 @@
 import { useMemo, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query'; // DALTON-HOOK(standalone-core)
 import { useTranslation } from 'react-i18next';
+import { probeDaltonCustomProviderModels } from '@/config/daltonSetup'; // DALTON-HOOK(standalone-core)
 import { useUpdateApiKeys } from '@/hooks/useApiKeys';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useReadStoredPreferences } from '@/hooks/useStoredPreferences';
@@ -33,6 +35,7 @@ const ENTERED_URL = /^https?:\/\/\S+$/i;
  */
 export function useCustomProviderForm() {
   const { t } = useTranslation();
+  const queryClient = useQueryClient(); // DALTON-HOOK(standalone-core)
   const { preferences } = usePreferences();
   const readStored = useReadStoredPreferences();
   const updatePreferences = useUpdatePreferences();
@@ -46,6 +49,8 @@ export function useCustomProviderForm() {
   const [apiKey, setApiKey] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // DALTON-HOOK(standalone-core): format/tool-probe hint returned by Core key test on save
+  const [probeHint, setProbeHint] = useState<string | null>(null);
   // Unchecked rather than checked, so a model the next list adds starts picked.
   const [unpicked, setUnpicked] = useState<ReadonlySet<string>>(new Set());
   const [manualOpen, setManualOpen] = useState(false);
@@ -103,6 +108,7 @@ export function useCustomProviderForm() {
     }
     setSaving(true);
     setError(null);
+    setProbeHint(null);
 
     const format = API_FORMATS.find((f) => f.value === apiFormat);
     const provider: CustomProviderEntry = { name: slug, parent_provider: format?.parent ?? 'openai' };
@@ -139,7 +145,14 @@ export function useCustomProviderForm() {
         base_urls: { [slug]: baseUrl.trim() },
       });
       unsaved = false;
+      // DALTON-HOOK(standalone-core): probe selected custom models for tool-calling capability in Core and surface format hints
+      const hint = await probeDaltonCustomProviderModels(queryClient, slug, apiKey.trim(), baseUrl.trim(), batch);
       await refresh(slug);
+      if (hint) {
+        setProbeHint(hint);
+        setSaving(false);
+        return null;
+      }
     } catch (e) {
       // A refused key leaves no definition behind: its models would be listed
       // with nothing to run them on. Only this provider goes back, onto what
@@ -173,6 +186,7 @@ export function useCustomProviderForm() {
   // A refusal is about what was sent, so it goes once the user changes it.
   const edited = (set: (value: string) => void) => (value: string) => {
     setError(null);
+    setProbeHint(null);
     set(value);
   };
 
@@ -203,6 +217,7 @@ export function useCustomProviderForm() {
     save,
     saving,
     error,
+    probeHint,
   };
 }
 

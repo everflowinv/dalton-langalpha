@@ -390,7 +390,7 @@ function AuthenticatedShell() {
       <ThreadLifecycleFeed />
       {/* One prompt at a time: the agent's command requests first, then vendor terms. */}
       <CliApprovalHost fallback={(held) => <VendorTermsHost held={held} />} />
-      <WarmHome />
+      <WarmHome setupRunning={onboarding.kind === 'answers'} />
       {onWelcome ? (
         // Full screen and none of the app's chrome: the flow is the page.
         // The hosts below stay, since a brokerage connect it starts asks for
@@ -585,6 +585,7 @@ function App() {
         </Suspense>
       } />
       <Route path="/*" element={
+        /* DALTON-HOOK(standalone-core): redirect unauthenticated users to bootstrap or login target */
         isLoggedIn ? <SuspendedGate><AuthenticatedShell /></SuspendedGate> : <Navigate to={unauthenticatedTarget} replace />
       } />
     </Routes>

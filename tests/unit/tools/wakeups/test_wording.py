@@ -35,3 +35,24 @@ def test_cancel_rows_and_quiet_hint_are_the_approved_strings():
     # DALTON-HOOK(wake-reply-language): the reply-language line is approved
     # wording too.
     assert wording.WAKE_REPLY_LANGUAGE == approved.WAKE_REPLY_LANGUAGE
+
+
+def test_placement_lines_are_the_approved_templates():
+    assert wording.PLACED_LINES == approved.PLACED_LINES
+    assert wording.PLACED_AT_AVG == approved.PLACED_AT_AVG
+    assert wording.PLACED_WATCH == approved.PLACED_WATCH
+
+
+# DALTON-HOOK(hide-trading): pin no-trading schedule_wakeup wording without order / watch_elsewhere
+def test_no_trading_tool_doc_and_trigger_fields_omit_orders():
+    assert wording.SCHEDULE_WAKEUP_DOC_NO_TRADING == approved.SCHEDULE_WAKEUP_DOC_NO_TRADING
+    assert wording.TRIGGER_MODEL_DOC_NO_TRADING == approved.TRIGGER_MODEL_DOC_NO_TRADING
+    assert "order" not in wording.TRIGGER_FIELDS_NO_TRADING
+    assert set(wording.TRIGGER_FIELDS_NO_TRADING) == {
+        "label",
+        "at",
+        "cron",
+        "until",
+        "timezone",
+        "price",
+    }

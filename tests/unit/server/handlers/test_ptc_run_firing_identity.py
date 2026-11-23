@@ -8,6 +8,7 @@ from unittest.mock import create_autospec, patch
 
 import pytest
 
+from ptc_agent.config.agent import AgentConfig
 from ptc_agent.core.session import Session
 from src.server.handlers.chat import ptc_run, request_prep
 from src.server.models.chat import ChatRequest
@@ -48,16 +49,16 @@ async def _capture_graph_config(
         timezone="UTC",
         locale="en-US",
     )
-    config = SimpleNamespace(
-        llm=SimpleNamespace(name="claude-test"),
-        subagents=SimpleNamespace(enabled=False),
-        claude_code_admitted=None,
-        claude_code=False,
-        user_skill_dir=None,
-        disabled_skills=set(),
-        withheld_skills=set(),
-        filesystem=SimpleNamespace(enabled_tools=None),
-    )
+    config = create_autospec(AgentConfig, instance=True)
+    config.llm = SimpleNamespace(name="claude-test")
+    config.subagents = SimpleNamespace(enabled=False)
+    config.claude_code_admitted = None
+    config.claude_code = False
+    config.user_skill_dir = None
+    config.disabled_skills = set()
+    config.withheld_skills = set()
+    config.filesystem = SimpleNamespace(enabled_tools=None)
+    config.feature_enabled.return_value = False
 
     session_mock = create_autospec(Session, instance=True)
     session_mock.sandbox = None

@@ -1,0 +1,11 @@
+# CI-only probe route mounted into edge at /etc/caddy/extra/ci-probe.caddy
+# by docker-compose.ci.yml. Reuses the exact shared stripping snippets from
+# deploy/standalone/Caddyfile (never duplicates rules) so tests validate the
+# single source of truth used by /api/*, /ws/*, and /messages/replay.
+@ci_probe path /__probe /__probe/*
+handle @ci_probe {
+	import strip_internal_request_headers
+	reverse_proxy header-echo:8098 {
+		import strip_internal_upstream_headers
+	}
+}

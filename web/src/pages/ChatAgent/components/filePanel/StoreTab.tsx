@@ -1,6 +1,5 @@
 import React, { Suspense, useCallback, useEffect } from 'react';
 import type { OpenFileHandler } from '../../utils/fileLocation';
-import type { MarketWatchState } from '../../session/marketWatchEvents';
 import type { PanelTarget } from './types';
 
 const MemoryPanel = React.lazy(() => import('../MemoryPanel'));
@@ -15,21 +14,18 @@ interface StoreTabProps {
   onTargetMemoryHandled?: (seq?: number) => void;
   onTargetMemoHandled?: (seq?: number) => void;
   onOpenFile: OpenFileHandler | null;
-  marketWatch: MarketWatchState | null;
   // DALTON-HOOK(team-sharing): prevent mounting viewer's personal MemoPanel in colleague mirror mode
   teamReadOnly?: boolean;
-  /** The thread whose wakeups the status tab lists, and whether its chat is in front. */
-  threadId: string | null;
-  isActive: boolean;
 }
 
 /**
  * The body of a memory, memo or status tab: the store's own panel, or the
- * live watch and the thread's wakeups. A memory or memo target is not consumed on arrival like a
- * file's: the body selects the entry once the store's list resolves, and says
+ * chat's thread status. A memory or memo target is not consumed on arrival
+ * like a file's: the body selects the entry once the store's list resolves, and says
  * so then, naming the ask it had so a later one is not cleared with it.
  */
-export function StoreTab({ kind, workspaceId, target, onTargetMemoryHandled, onTargetMemoHandled, onOpenFile, marketWatch, threadId, isActive, teamReadOnly = false }: StoreTabProps): React.ReactElement {
+// DALTON-HOOK(team-sharing): accept teamReadOnly prop to block personal MemoPanel
+export function StoreTab({ kind, workspaceId, target, onTargetMemoryHandled, onTargetMemoHandled, onOpenFile, teamReadOnly = false }: StoreTabProps): React.ReactElement {
   const onOpen = onOpenFile ?? undefined;
   // Stable per ask: the bodies keep these in effect deps.
   const seq = target?.seq;
@@ -76,7 +72,7 @@ export function StoreTab({ kind, workspaceId, target, onTargetMemoryHandled, onT
           />
         );
       case 'status':
-        return <StatusPanel marketWatch={marketWatch} threadId={threadId} active={isActive} />;
+        return <StatusPanel />;
       default:
         return kind satisfies never;
     }

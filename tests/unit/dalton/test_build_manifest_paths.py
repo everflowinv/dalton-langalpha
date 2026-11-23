@@ -11,8 +11,8 @@ ROOT = Path(__file__).resolve().parents[3]
 
 def _manifest_find_roots() -> list[str]:
     text = (ROOT / "scripts/dalton/Dockerfile.dalton").read_text(encoding="utf-8")
-    match = re.search(r"&& find (.*?) -type f", text, re.DOTALL)
-    assert match, "manifest find command not found in Dockerfile.dalton"
+    match = re.search(r"for p in (.*?); do", text, re.DOTALL)
+    assert match, "manifest path loop not found in Dockerfile.dalton"
     return match.group(1).replace("\\\n", " ").split()
 
 

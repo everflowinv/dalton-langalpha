@@ -8,7 +8,7 @@ import {
   type AvailableModels,
   type ModelsResponse,
 } from '@/api/model';
-import { hasAvailableDaltonModels } from '@/config/daltonSetup';
+import { applyDaltonProviderToolProbes, hasAvailableDaltonModels } from '@/config/daltonSetup';
 import { isPlatformMode } from '@/config/hostMode';
 import type { ConfiguredProvider } from '@/hooks/useConfiguredProviders';
 import {
@@ -360,8 +360,18 @@ export async function checkDaltonTeamModelsAvailable({
       )
     : payers;
 
+  // DALTON-HOOK(standalone-core): overlay Core recorded tool-calling probe verdicts before availability gating
+  const effectiveMetadata = applyDaltonProviderToolProbes(visible.metadata, configuredProviders, customModels);
+
   return {
-    available: hasAvailableDaltonModels(offered, visible.metadata, offeredPayers, true, rejectedProviders),
+    available: hasAvailableDaltonModels(
+      offered,
+      effectiveMetadata,
+      offeredPayers,
+      true,
+      rejectedProviders,
+      modelsData.dalton_profile,
+    ),
     rejectedProviders,
   };
 }

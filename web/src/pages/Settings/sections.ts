@@ -9,12 +9,13 @@ import {
   MessageSquare,
   PieChart,
   Plug,
+  Server,
   ServerCog,
   SlidersHorizontal,
   Users,
   Wallet,
 } from 'lucide-react';
-import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
+import { BRAND_NAME, isDaltonBuild } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(settings-reorg)
 import { isPlatformMode } from '@/config/hostMode';
 import { canDesktopSettings } from '@/lib/desktop';
@@ -66,6 +67,8 @@ export interface SectionMeta {
   daltonAuthOnly?: boolean;
   /** Rendered only when the coverage units feature flag is enabled. */
   coverageUnitsOnly?: boolean;
+  /** What a hosted server's operator decides, so only a self-hosted build shows it. */
+  selfHostedOnly?: boolean;
 }
 
 // DALTON-HOOK(settings-reorg): Personal vs Team Management groups & minTier section metadata
@@ -80,7 +83,10 @@ export const SECTIONS = {
   preferences: { labelKey: 'settings.section.preferences', descKey: 'settings.sectionDesc.preferences', icon: PieChart },
   general: { labelKey: 'settings.section.general', descKey: 'settings.sectionDesc.general', icon: SlidersHorizontal },
   chat: { labelKey: 'settings.section.chat', descKey: 'settings.sectionDesc.chat', icon: MessageSquare },
+  // The glyph the workspace gallery's computer menu names them by.
+  computers: { labelKey: 'settings.section.computers', descKey: 'settings.definition.computers', icon: Server },
   model: { labelKey: 'settings.section.model', descKey: 'settings.sectionDesc.model', icon: Cpu },
+  server: { labelKey: 'settings.section.server', descKey: 'settings.definition.server', icon: ServerCog, selfHostedOnly: true },
   budget: { labelKey: 'settings.section.budget', descKey: 'settings.sectionDesc.budget', icon: Wallet },
   integrations: { labelKey: 'settings.section.integrations', descKey: 'settings.sectionDesc.integrations', icon: Plug },
   coverage: { labelKey: 'settings.section.coverage', descKey: 'settings.sectionDesc.coverage', icon: Layers, coverageUnitsOnly: true },
@@ -112,10 +118,12 @@ export function sectionShown(
 ): boolean {
   // DALTON-HOOK(hide-trading): Dalton does not expose live brokerage trading in Settings
   // DALTON-HOOK(hide-experiments): Dalton does not expose experimental labs in Settings
-  // DALTON-HOOK(settings-reorg): enforce minTier & coverageUnitsOnly across rail, search, and palette
+  // DALTON-HOOK(settings-reorg): hide Computers and self-hosted Server sections in Dalton builds; enforce minTier & coverageUnitsOnly across rail, search, and palette
   if (section === 'trading' || section === 'experiments') return false;
+  if ((section === 'computers' || section === 'server') && isDaltonBuild) return false;
   const meta: SectionMeta = SECTIONS[section];
   if (meta.desktopOnly && !canDesktopSettings()) return false;
+  if (meta.selfHostedOnly && isPlatformMode) return false;
   if (meta.platformOnly && !isPlatformMode) return false;
   if (meta.daltonAuthOnly && !isDaltonAuth) return false;
   if (meta.minTier && !tierSatisfies(ctx?.callerTier, meta.minTier)) return false;
@@ -126,7 +134,7 @@ export function sectionShown(
 export const GROUPS: readonly { labelKey: string; sections: readonly Section[] }[] = [
   {
     labelKey: 'settings.group.personal',
-    sections: ['account', 'preferences', 'general', 'chat', 'model', 'budget', 'integrations', 'coverage'],
+    sections: ['account', 'preferences', 'general', 'chat', 'computers', 'model', 'server', 'budget', 'integrations', 'coverage'],
   },
   {
     labelKey: 'settings.group.team',
@@ -141,6 +149,11 @@ export interface SettingEntry {
   descKey?: string;
   desktopOnly?: boolean;
   advanced?: boolean;
+  /** Drawn only while this feature flag is on, so only found then. */
+  feature?: string;
+  /** Other names the search finds this row by, though the row does not show
+   *  them: rows drawn only some of the time beside it, so a search never opens
+   *  on a row that is not there, or the name of the group the row sits in. */
   alsoKeys?: readonly string[];
   // DALTON-HOOK(settings-section): bilingual search terms and card-level visibility predicate
   keywords?: string;
@@ -180,6 +193,7 @@ export const SETTINGS = {
   streamingMode: { section: 'chat', anchor: 'response-delivery', labelKey: 'settings.streamingMode', descKey: 'settings.streamingModeDesc' },
   toolCallLayout: { section: 'chat', anchor: 'tool-calls', labelKey: 'settings.toolCallLayout', descKey: 'settings.toolCallLayoutDesc' },
   turnEndScroll: { section: 'chat', anchor: 'turn-end', labelKey: 'settings.turnEndScroll', descKey: 'settings.turnEndScrollDesc' },
+  composerTray: { section: 'chat', anchor: 'composer-tray', labelKey: 'settings.composerTray', descKey: 'settings.composerTrayDesc' },
   voiceInput: { section: 'chat', anchor: 'voice-input', labelKey: 'settings.voiceInput', descKey: 'settings.voiceInputDesc' },
   // DALTON-HOOK(settings-section): bilingual search keywords for artifacts & output settings
   commentDestination: { section: 'chat', anchor: 'comment-destination', labelKey: 'settings.artifacts.destination', descKey: 'settings.artifacts.destinationDesc', keywords: '评论去向 comment destination' },
@@ -189,13 +203,31 @@ export const SETTINGS = {
   researchDepth: { section: 'chat', anchor: 'research-depth', labelKey: 'settings.researchDepth', descKey: 'settings.researchDepthDesc' },
   reachingOut: { section: 'chat', anchor: 'reaching-out', labelKey: 'settings.reachingOut', descKey: 'settings.reachingOutDesc' },
   subagents: { section: 'chat', anchor: 'subagents', labelKey: 'settings.subagentsDefault', descKey: 'settings.subagentsDefaultDesc' },
+  ownContext: { section: 'chat', anchor: 'own-context', labelKey: 'settings.ownContext', descKey: 'settings.ownContextDesc', feature: 'shared_workspaces_member_context' },
   approveHandoffs: { section: 'chat', anchor: 'approve-handoffs', labelKey: 'settings.autoApproveHandoffs', descKey: 'settings.autoApproveHandoffsDesc' },
   approveWorkspaces: { section: 'chat', anchor: 'approve-workspaces', labelKey: 'settings.autoApproveWorkspaceCreation', descKey: 'settings.autoApproveWorkspaceCreationDesc' },
   searchProvider: { section: 'chat', anchor: 'search-provider', labelKey: 'settings.searchProvider', descKey: 'settings.searchProviderDesc', alsoKeys: ['settings.searchDepth'] },
   daltonCosSharing: { section: 'chat', anchor: 'dalton-cos-sharing', labelKey: 'settings.dalton.cosSharingLabel', descKey: 'settings.dalton.cosSharingDesc', keywords: '研究总监 工作区协同共享 允许同事的研究总监向我的工作区派活 chief of staff sharing colleague dispatch', visibleWhen: canShowDaltonCosSharingCard },
   // DALTON-HOOK(team-memory-toggle): Home Team Memory user-level setting entry
   daltonHomeTeamMemory: { section: 'chat', anchor: 'dalton-home-team-memory', labelKey: 'settings.dalton.homeTeamMemoryLabel', descKey: 'settings.dalton.homeTeamMemoryDesc', keywords: '团队记忆 团队历史研究记录 对话记录 team memory conversation archive', visibleWhen: canShowDaltonHomeTeamMemoryCard },
-
+  // A machine's own settings are in the Computers panel each row opens, so
+  // the list is what a search for one of them lands on.
+  computers: {
+    section: 'computers',
+    anchor: 'computers',
+    labelKey: 'settings.computers.list',
+    descKey: 'computer.computersDesc',
+    alsoKeys: [
+      'computer.card.spec',
+      'computer.card.storage',
+      'computer.alwaysOn',
+      'computer.filesBackup.label',
+      'computer.browserQuality.label',
+      'computer.makePrimary.button',
+      'computer.rename',
+    ],
+  },
+  newComputer: { section: 'computers', anchor: 'new-computer', labelKey: 'computer.newComputer' },
   modelAccess: { section: 'model', anchor: 'model-access', labelKey: 'modelAccess.title', descKey: 'modelAccess.description' },
   defaultModels: { section: 'model', anchor: 'default-models', labelKey: 'settings.defaultModels', descKey: 'settings.defaultModelsDesc', keywords: '系统默认模型 默认模型 default models' },
   defaultModelScope: { section: 'model', anchor: 'default-model-scope', labelKey: 'settings.defaultModelChange.scopeLabel', descKey: 'settings.defaultModelChange.scopeDesc' },
@@ -204,6 +236,9 @@ export const SETTINGS = {
   accountDefaults: { section: 'model', anchor: 'account-defaults', labelKey: 'settings.modelTuning.sectionDefaults', advanced: true },
   perModel: { section: 'model', anchor: 'per-model', labelKey: 'settings.modelTuning.perModel', descKey: 'settings.modelTuning.perModelDesc', advanced: true },
   routing: { section: 'model', anchor: 'routing', labelKey: 'settings.modelTuning.sectionRouting', descKey: 'settings.fallbackModels', advanced: true, keywords: '模型路由 备选模型 fallback routing' },
+  agentLocation: { section: 'server', anchor: 'agent-location', labelKey: 'settings.server.location', descKey: 'settings.server.locationDesc' },
+  marketDataKeys: { section: 'server', anchor: 'market-data', labelKey: 'setup.services.marketData', descKey: 'settings.server.marketDataDesc' },
+  webSearchKeys: { section: 'server', anchor: 'web-search', labelKey: 'setup.services.webSearch', descKey: 'settings.server.webSearchDesc' },
   // DALTON-HOOK(settings-section): register Dalton model routing under Personal -> Models advanced disclosure
   daltonRouting: { section: 'model', anchor: 'dalton-routing', labelKey: 'settings.modelTuning.daltonHeading', descKey: 'settings.dalton.routingDesc', advanced: true, keywords: '后台任务模型 模型路由 核验 审校 复核 model routing audit reviewer assist extract' },
   daltonAuditModel: { section: 'model', anchor: 'dalton-audit-model', labelKey: 'settings.modelTuning.daltonAuditModel', descKey: 'settings.modelTuning.daltonAuditModelDesc', advanced: true, keywords: '数据核验模型 审计模型 figure audit model' },
@@ -240,7 +275,6 @@ export const SETTINGS = {
   daltonFeishuGroups: { section: 'teamChannels', anchor: 'dalton-feishu-groups', labelKey: 'settings.dalton.feishuGroupsLabel', descKey: 'settings.dalton.feishuGroupsDesc', keywords: '飞书群 团队群 群聊绑定 feishu groups' },
   daltonDiscordChannels: { section: 'teamChannels', anchor: 'dalton-discord-channels', labelKey: 'settings.dalton.discordChannelsLabel', descKey: 'settings.dalton.discordChannelsDesc', keywords: 'Discord 频道 团队频道 群报告 频道绑定 discord channels', visibleWhen: canShowDaltonDiscordChannelsCard },
   daltonSystemJobs: { section: 'teamChannels', anchor: 'dalton-system-jobs', labelKey: 'settings.dalton.systemJobsLabel', descKey: 'settings.dalton.systemJobsDesc', keywords: '自动巡检 团队公共任务 知识库同步 研报增量扫描 公司近况巡检 system jobs cron' },
-
   tradingPermission: { section: 'trading', anchor: TRADING_PERMISSION_ANCHOR, labelKey: 'settings.tradingPermission.title', descKey: 'settings.tradingPermission.desc' },
   experiments: { section: 'experiments', anchor: 'experiments', labelKey: 'settings.experiments', descKey: 'settings.experimentsIntro' },
 } satisfies Record<string, SettingEntry>;
@@ -285,10 +319,12 @@ export function settingAt(hash: string): SettingEntry | undefined {
 export function searchableSettings(
   desktop: boolean,
   ctx?: DaltonSettingVisibilityContext | null,
+  featureOn: (key: string) => boolean = () => true,
 ): SettingEntry[] {
   return ENTRIES.filter(
     (entry) =>
       (desktop || !entry.desktopOnly) &&
+      (!entry.feature || featureOn(entry.feature)) &&
       sectionShown(entry.section, ctx) &&
       (!entry.visibleWhen || entry.visibleWhen(ctx)),
   );

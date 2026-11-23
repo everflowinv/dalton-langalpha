@@ -5,7 +5,8 @@
  */
 import { api } from '@/api/client';
 import { isDaltonLocalAuth } from '@/config/daltonAuth'; // DALTON-HOOK(standalone-core): single 401 token refresh & retry for SSE streams in local auth mode
-import { bearerTokenOf, getAuthHeaders, refreshAccessToken } from '@/lib/authToken';
+import { authSessionCheck } from '@/lib/authResets'; // DALTON-HOOK(standalone-core): verify session identity before SSE 401 retry
+import { authGeneration, bearerTokenOf, getAuthHeaders, refreshAccessToken } from '@/lib/authToken';
 import { holdReload } from '@/lib/reloadHolds';
 import { RUN_STREAM_BEAT_MS, watchStreamSilence, type StreamSilenceWatch } from '@/lib/streamSilence';
 import { noteIfSuspended } from '@/lib/accountSuspension';
@@ -84,17 +85,24 @@ export async function streamFetch(
   // For a stream whose server keeps it alive; a replay just ends.
   keptAlive?: KeptAlive,
 ): Promise<StreamResult> {
+  // DALTON-HOOK(standalone-core): snapshot session identity so 401 SSE retry never replays under another user
+  const sameSession = authSessionCheck();
+  const initialToken = bearerTokenOf(new Headers(opts.headers).get('Authorization'));
+  const sentAs = initialToken ? authGeneration() : undefined;
   let res: Response;
   try {
     res = await fetch(`${baseURL}${url}`, opts);
     // DALTON-HOOK(standalone-core): refresh once via cookie and retry SSE request on 401 in local auth mode
     if (isDaltonLocalAuth && res.status === 401) {
-      const hdrs = new Headers(opts.headers);
-      const refused = bearerTokenOf(hdrs.get('Authorization'));
-      const refreshed = await refreshAccessToken(refused);
-      if (refreshed) {
-        hdrs.set('Authorization', `Bearer ${refreshed}`);
-        res = await fetch(`${baseURL}${url}`, { ...opts, headers: hdrs });
+      const sameAccount = () => sameSession() && (sentAs === undefined || sentAs === authGeneration());
+      if (sameAccount()) {
+        const hdrs = new Headers(opts.headers);
+        const refused = bearerTokenOf(hdrs.get('Authorization'));
+        const refreshed = await refreshAccessToken(refused);
+        if (refreshed && sameAccount()) {
+          hdrs.set('Authorization', `Bearer ${refreshed}`);
+          res = await fetch(`${baseURL}${url}`, { ...opts, headers: hdrs });
+        }
       }
     }
   } catch (error: unknown) {
@@ -264,7 +272,12 @@ export async function postSSEStream(
   const release = holdReload();
   let runLocation: string | null = null;
   try {
+    // DALTON-HOOK(standalone-core): abort send if account switched while fetching auth headers
+    const sameSession = authSessionCheck();
     const authHeaders = await getAuthHeaders();
+    if (isDaltonLocalAuth && !sameSession()) {
+      return { disconnected: false, aborted: true, contentLocation: null };
+    }
     // A retransmit that raced past the route's duplicate check is refused in
     // the stream, by the same answer the route gives as a 409. It reaches the
     // caller as that 409, so one recovery handles both: the stream's turn is

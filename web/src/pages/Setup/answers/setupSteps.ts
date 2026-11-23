@@ -2,12 +2,14 @@
  * Which setup steps the two onboarding answers call for, and which one comes
  * next. Pure, so the gate, the wizard's rail and its resume read one rule.
  *
- * Setup runs only what the answers need, in this order: a computer of the
- * user's own when tasks run on one and none is connected yet, then the model
+ * Setup runs only what the answers need, in this order: on a self-hosted
+ * server not set up yet, the server's own step (where it runs agent code, the
+ * keys its tools use); a computer of the user's own when tasks run on one and
+ * none is connected yet; then the model
  * (Claude Code's setup token, or a subscription or key; nothing for the
  * deployment's own models), then the default model.
  */
-import type { OnboardingModels, OnboardingProgress, OnboardingRunsOn, OnboardingSetupStep } from '@/api/onboarding';
+import type { OnboardingModels, OnboardingProgress, OnboardingProgressPatch, OnboardingRunsOn, OnboardingSetupStep } from '@/api/onboarding';
 // DALTON-HOOK(dalton-setup): Dalton builds never require the Claude Code model step and only advance from /setup/model on curated-candidate subscriptions
 import { isDaltonBuild } from '@/config/brand';
 import { WELCOME_PATH } from '@/pages/Onboarding/welcome/paths';
@@ -21,15 +23,23 @@ export const DALTON_CURATED_PROVIDERS: ReadonlySet<string> = new Set([
 
 export type ModelsAnswer = OnboardingModels;
 export type RunsOnAnswer = OnboardingRunsOn;
-export type SetupStep = OnboardingSetupStep;
+/** The account's steps, which its onboarding record keeps, and `server`, the
+ *  deployment's, which the server's setup status keeps instead: it is
+ *  answered once for every account there. */
+export type SetupStep = OnboardingSetupStep | 'server';
 
 export interface SetupAnswers {
   models: ModelsAnswer;
   runsOn: RunsOnAnswer;
 }
 
+/** Where the server's own step stands: `owed` until it is answered, `done`
+ *  after, null where there is none (hosted, or a server set up before it). */
+export type ServerStepState = 'owed' | 'done' | null;
+
 export interface SetupFacts {
   answers: SetupAnswers;
+  server: ServerStepState;
   /** A computer of the user's own is connected; a paired this Mac counts. */
   ownComputer: boolean;
   /** Home lives on a cloud computer, the primary. */
@@ -46,6 +56,7 @@ export interface SetupFacts {
 }
 
 export const SETUP_STEP_PATHS: Readonly<Record<SetupStep, string>> = {
+  server: '/setup/server',
   computer: '/setup/computer',
   model: '/setup/model',
   default: '/setup/default',
@@ -85,8 +96,14 @@ export const needsModelStep = (answers: SetupAnswers, teamModelsAvailable = fals
  * already in place stays on it as a finished one (`nextSetupStep` goes past
  * it), so connecting a computer never changes the rail under the user.
  */
-export function setupRail(answers: SetupAnswers, teamModelsAvailable = false): SetupStep[] {
+// DALTON-HOOK(dalton-setup): accept optional teamModelsAvailable beside server step state
+export function setupRail(
+  answers: SetupAnswers,
+  server: ServerStepState = null,
+  teamModelsAvailable = false,
+): SetupStep[] {
   return [
+    ...(server ? (['server'] as const) : []),
     ...(answers.runsOn === 'own_computer' ? (['computer'] as const) : []),
     ...(needsModelStep(answers, teamModelsAvailable) ? (['model'] as const) : []),
     'default',
@@ -100,14 +117,28 @@ export function setupRail(answers: SetupAnswers, teamModelsAvailable = false): S
  */
 export function nextSetupStep(facts: SetupFacts): SetupStep | 'done' {
   if (facts.lastStep === 'default') return 'done';
+  // DALTON-HOOK(dalton-setup): Dalton never sends accounts through the single-user OSS server step; resolve legacy answers against live team-model availability
+  if (!isDaltonBuild && facts.server === 'owed') return 'server';
   const { runsOn } = facts.answers;
-  // DALTON-HOOK(dalton-setup): resolve legacy answers against live team-model availability
   const models = effectiveModelsAnswer(facts.answers.models, !!facts.teamModelsAvailable);
   // One already connected while Home is on the cloud is offered as Home once.
   if (runsOn === 'own_computer' && (!facts.ownComputer || (facts.homeOnCloud && facts.lastStep === null))) return 'computer';
   if (!isDaltonBuild && models === 'claude_code' && !facts.claudeCodeToken) return 'model';
   if (models === 'subscription_or_key' && !facts.providerConnected) return 'model';
   return 'default';
+}
+
+/**
+ * What finishing `step` writes to the account's record: the step, and on the
+ * last one that setup is done. Nothing for the server's own step, which the
+ * server's setup status keeps (the step saves it there itself).
+ */
+export function stepRecord(step: SetupStep): OnboardingProgressPatch | null {
+  switch (step) {
+    case 'server': return null;
+    case 'default': return { setup_step: 'default', setup_completed: true };
+    default: return { setup_step: step };
+  }
 }
 
 /** The step before `step` on the rail, for Back; null on the first. */

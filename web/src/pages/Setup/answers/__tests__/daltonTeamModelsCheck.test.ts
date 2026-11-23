@@ -9,7 +9,7 @@ const h = vi.hoisted(() => ({
   getProviderAvailableModels: vi.fn<
     (provider: string, options?: { refresh?: boolean; signal?: AbortSignal }) => Promise<AvailableModels>
   >(),
-  getPreferences: vi.fn(async () => ({})),
+  getPreferences: vi.fn<() => Promise<Record<string, unknown>>>(async () => ({})),
 }));
 
 vi.mock('@/config/hostMode', () => ({
@@ -387,5 +387,198 @@ describe('daltonTeamModelsCheck forced retry', () => {
     expect(cached.available).toBe(true);
     expect(calls).toEqual([{ refresh: true }, { refresh: true }]);
     qc.clear();
+  });
+});
+
+// DALTON-HOOK(standalone-core): Core vs Everflow availability gating in daltonTeamModelsCheck
+describe('daltonTeamModelsCheck standalone-core profile support', () => {
+  const byokAndGatewayResponse = (daltonProfile: 'core' | 'everflow'): ModelsResponse => ({
+    models: {
+      openai: {
+        display_name: 'OpenAI',
+        models: ['gpt-5', 'o1-text-only'],
+      },
+    },
+    model_metadata: {
+      'gpt-5': { provider: 'openai', access_type: 'api_key', intelligence: 5, speed: 3, tool_calling: true },
+      'o1-text-only': { provider: 'openai', access_type: 'api_key', tool_calling: false },
+    },
+    provider_catalog: [
+      {
+        provider: 'openai',
+        display_name: 'OpenAI',
+        access_type: 'api_key',
+        brand_key: 'openai',
+        byok_eligible: true,
+      },
+    ],
+    system_defaults: {},
+    compaction_profiles: {} as ModelsResponse['compaction_profiles'],
+    search_providers: {} as ModelsResponse['search_providers'],
+    key_candidates: {},
+    dalton_profile: daltonProfile,
+  });
+
+  const byokProviders = [
+    {
+      provider: 'openai',
+      display_name: 'OpenAI',
+      access_type: 'api_key' as const,
+      state: 'connected' as const,
+      masked_key: 'sk-...1234',
+    },
+  ];
+
+  it('reports available=true in Core profile for BYOK models when no curated -oauth models exist, and false in Everflow', async () => {
+    const qcCore = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    h.getAvailableModels.mockResolvedValueOnce(byokAndGatewayResponse('core'));
+    h.getProviderAvailableModels.mockResolvedValueOnce({
+      provider: 'openai',
+      status: 'ok',
+      fetched_at: null,
+      ready: ['gpt-5'],
+      missing: [],
+      context_windows: {},
+      others: [],
+      total: 1,
+      cached: false,
+    });
+
+    const coreRes = await checkDaltonTeamModelsAvailable({
+      queryClient: qcCore,
+      providers: byokProviders,
+      byokEnabled: true,
+      providersUnread: false,
+      policy: null,
+    });
+    expect(coreRes.available).toBe(true);
+    qcCore.clear();
+
+    const qcEverflow = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    h.getAvailableModels.mockResolvedValueOnce(byokAndGatewayResponse('everflow'));
+    h.getProviderAvailableModels.mockResolvedValueOnce({
+      provider: 'openai',
+      status: 'ok',
+      fetched_at: null,
+      ready: ['gpt-5'],
+      missing: [],
+      context_windows: {},
+      others: [],
+      total: 1,
+      cached: false,
+    });
+
+    const efRes = await checkDaltonTeamModelsAvailable({
+      queryClient: qcEverflow,
+      providers: byokProviders,
+      byokEnabled: true,
+      providersUnread: false,
+      policy: null,
+    });
+    expect(efRes.available).toBe(false);
+    qcEverflow.clear();
+  });
+
+  it('requires verified tool-calling evidence in Core: unverified custom gateway is unavailable until probed, verified is available, text-only is rejected', async () => {
+    // 1. Unverified custom gateway (no tool_calling verdict on model or provider) -> not confirmed available.
+    const qcUnverified = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    h.getAvailableModels.mockResolvedValueOnce({
+      ...byokAndGatewayResponse('core'),
+      models: {},
+      model_metadata: {},
+    });
+    h.getPreferences.mockResolvedValueOnce({
+      model_preference: {
+        custom_providers: [
+          { name: 'acme-gateway', parent_provider: 'openai', base_url: 'https://llm.acme.test/v1' },
+        ],
+        custom_models: [
+          { name: 'acme-custom-v1', model_id: 'corp-1', provider: 'acme-gateway' },
+        ],
+      },
+    });
+    const unverifiedRes = await checkDaltonTeamModelsAvailable({
+      queryClient: qcUnverified,
+      providers: [
+        {
+          provider: 'acme-gateway',
+          display_name: 'Acme Gateway',
+          access_type: 'api_key' as const,
+          is_custom: true,
+          state: 'connected' as const,
+          masked_key: 'sk-...gw',
+        },
+      ],
+      byokEnabled: true,
+      providersUnread: false,
+      policy: null,
+    });
+    expect(unverifiedRes.available).toBe(false);
+    qcUnverified.clear();
+
+    // 2. Probed custom gateway (provider carries recorded tool_calling: true) -> available.
+    const qcCustom = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    h.getAvailableModels.mockResolvedValueOnce({
+      ...byokAndGatewayResponse('core'),
+      models: {},
+      model_metadata: {},
+    });
+    h.getPreferences.mockResolvedValueOnce({
+      model_preference: {
+        custom_providers: [
+          { name: 'acme-gateway', parent_provider: 'openai', base_url: 'https://llm.acme.test/v1' },
+        ],
+        custom_models: [
+          { name: 'acme-custom-v1', model_id: 'corp-1', provider: 'acme-gateway' },
+        ],
+      },
+    });
+
+    const customRes = await checkDaltonTeamModelsAvailable({
+      queryClient: qcCustom,
+      providers: [
+        {
+          provider: 'acme-gateway',
+          display_name: 'Acme Gateway',
+          access_type: 'api_key' as const,
+          is_custom: true,
+          state: 'connected' as const,
+          masked_key: 'sk-...gw',
+          tool_calling_models: { 'corp-1': true },
+        },
+      ],
+      byokEnabled: true,
+      providersUnread: false,
+      policy: null,
+    });
+    expect(customRes.available).toBe(true);
+    qcCustom.clear();
+
+    const qcTextOnly = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    h.getAvailableModels.mockResolvedValueOnce({
+      ...byokAndGatewayResponse('core'),
+      models: { openai: { display_name: 'OpenAI', models: ['o1-text-only'] } },
+    });
+    h.getProviderAvailableModels.mockResolvedValueOnce({
+      provider: 'openai',
+      status: 'ok',
+      fetched_at: null,
+      ready: ['o1-text-only'],
+      missing: [],
+      context_windows: {},
+      others: [],
+      total: 1,
+      cached: false,
+    });
+
+    const textOnlyRes = await checkDaltonTeamModelsAvailable({
+      queryClient: qcTextOnly,
+      providers: byokProviders,
+      byokEnabled: true,
+      providersUnread: false,
+      policy: null,
+    });
+    expect(textOnlyRes.available).toBe(false);
+    qcTextOnly.clear();
   });
 });

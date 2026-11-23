@@ -289,21 +289,22 @@ describe('turn fold — the bubble reads the turn\'s liveness, not its own', () 
     expect(landed.container.querySelector('.turn-file-card')).not.toBeNull();
   });
 
-  /** The row is always mounted to reserve its height; `inert` is what hides it. */
-  const actionsHidden = (c: HTMLElement) => {
-    const copy = c.querySelector('button[title="chat.actions.copyMessage"]');
-    expect(copy).not.toBeNull();
-    return copy!.closest('[aria-hidden]')?.getAttribute('aria-hidden') === 'true';
+  /** A button within reach: drawn, in a row that is not hidden. */
+  const reachable = (c: HTMLElement, title: string) => {
+    const button = c.querySelector(`button[title="${title}"]`);
+    return !!button && button.closest('[aria-hidden]')?.getAttribute('aria-hidden') !== 'true';
   };
 
   it('keeps rating and regenerate out of reach until the task lands', () => {
     // Rating an answer a running task can still change asks about a reply that
     // does not exist yet, and regenerate would race the task.
     const running = renderList(withDeliverable(true), false, { onRegenerate: vi.fn(), onThumbUp: vi.fn() });
-    expect(actionsHidden(running.container)).toBe(true);
+    expect(reachable(running.container, 'chat.actions.goodResponse')).toBe(false);
+    expect(reachable(running.container, 'chat.actions.regenerate')).toBe(false);
 
     const landed = renderList(withDeliverable(false), false, { onRegenerate: vi.fn(), onThumbUp: vi.fn() });
-    expect(actionsHidden(landed.container)).toBe(false);
+    expect(reachable(landed.container, 'chat.actions.goodResponse')).toBe(true);
+    expect(reachable(landed.container, 'chat.actions.regenerate')).toBe(true);
   });
 });
 
@@ -367,7 +368,7 @@ describe('turn fold — which of a turn\'s texts read as its answer', () => {
       timestamp: new Date('2026-11-20T15:40:02.000Z'), isStreaming: false,
       completedAt: Date.parse('2026-11-20T15:41:00.000Z'),
       contentSegments: segments, reasoningProcesses: {},
-      toolCallProcesses: { 'tc-0': call('WebSearch'), 'tc-1': call('TodoWrite'), 'tc-2': call('ExecuteCode') },
+      toolCallProcesses: { 'tc-0': call('WebSearch'), 'tc-1': call('UpdatePlan'), 'tc-2': call('ExecuteCode') },
       ...extra,
     },
   ];
@@ -401,15 +402,13 @@ describe('turn fold — which of a turn\'s texts read as its answer', () => {
     expect(foldState(container)).toBe('process');
   });
 
-  it('keeps a short closing answer the agent ticked its todo list after', () => {
+  it('keeps a short closing answer the agent ticked its plan after', () => {
     const { container, getByText } = renderList(turn([
       { type: 'text', content: 'Checking the tape.', order: 0 },
       { type: 'tool_call', order: 1, toolCallId: 'tc-0' },
       { type: 'text', content: 'The first is cheaper on earnings.', order: 2 },
       { type: 'tool_call', order: 3, toolCallId: 'tc-1' },
-      // The list the call draws, as the stream and the replay both write it.
-      { type: 'todo_list', order: 4, todoListId: 'tl-1' },
-    ], { todoListProcesses: { 'tl-1': { todos: [{ content: 'Compare', status: 'completed' }], total: 1, completed: 1, in_progress: 0, pending: 0, order: 4 } } }));
+    ]));
 
     expect(foldState(container)).toBe('collapsed');
     expect(getByText('The first is cheaper on earnings.')).toBeInTheDocument();

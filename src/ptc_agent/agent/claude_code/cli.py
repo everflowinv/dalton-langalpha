@@ -28,7 +28,7 @@ from claude_agent_sdk import (
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
 
-from ptc_agent.agent.claude_code.launcher import Launcher, Prepared
+from ptc_agent.agent.claude_code.launcher import Launcher, Prepared, session_thread_key
 from ptc_agent.agent.claude_code.mid_turn import AfterTool, BeforeTool, Waits
 from ptc_agent.agent.claude_code.plan import PlanWatch
 from ptc_agent.agent.claude_code.session import CheckpointSessionStore, SessionPin, SessionRecords
@@ -96,6 +96,9 @@ class RuntimeSpec:
     waits: Waits = _never
     #: The results that end the turn (a quiet wake turn's), after which the CLI stops.
     ends_turn: Callable[[ToolMessage], bool] = _never
+    #: A shared workspace's turn, whose unrecorded user messages are escaped
+    #: as the API path's naming step escapes them (``name_senders``).
+    shared: bool = False
 
     @property
     def catalog_model(self) -> str:
@@ -417,12 +420,14 @@ async def launch(
     """
     session_id = (records or {}).get("session_id")
     entries = with_transcript((records or {}).get("entries") or [], transcript_note)
+    # A resumed session runs where it began, under a fork's source's key too.
+    cwd_key = session_thread_key(entries, thread_key) if session_id else thread_key
     prepared = await launcher.prepare(
-        thread_key, session_id, entries, identity=identity, system_prompt=pin["system_prompt"],
+        cwd_key, session_id, entries, identity=identity, system_prompt=pin["system_prompt"],
     )
     client: ClaudeSDKClient | None = None
     try:
-        after_tool = AfterTool(results, send=lambda text: client.query(text), plan=plan)
+        after_tool = AfterTool(results, send=lambda text: client.query(text), plan=plan, shared=spec.shared)
         options = options_for(
             spec, pin=pin, server=build_tool_server(pin["tools"], results), store=store, session_id=session_id,
             prepared=prepared, after_tool=after_tool, before_tool=before_tool, compact_at=compact_at,

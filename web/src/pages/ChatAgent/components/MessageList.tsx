@@ -6,7 +6,11 @@ import { NotificationDivider } from './messageList/NotificationDivider';
 import { WakeupRow } from './messageList/WakeupRow';
 import { QuietChecksRow } from './messageList/QuietChecksRow';
 import { MessageBubble } from './messageList/MessageBubble';
+import { SharedThreadContext } from './messageList/SharedThreadContext';
+import { bubbleSender, continuesSender, type BubbleSender } from '../session/sharedThread';
 import { TurnFold } from './messageList/TurnFold';
+import { AgentPlan } from './messageList/AgentPlan';
+import type { ShownPlan } from './messageList/requestPlans';
 import { holdsAnswerText, projectMessageContent, visibleProjection } from './messageList/contentProjection';
 import { useMessageActions } from './messageList/MessageActionsContext';
 import { isReportRow, opensTurn } from './messageList/messagePredicates';
@@ -28,6 +32,9 @@ import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
 import type { FeedbackResult, FoldState, MessageRecord } from './messageList/types';
 
 const NO_QUIET_ENDS: ReadonlyMap<number, QuietEnd> = new Map();
+/** Between messages of one member's run: the action row under each already
+ *  spaces them, so the list's own gap would hold them a message apart. */
+const RUN_GAP: React.CSSProperties = { marginTop: 8 };
 
 /** What the fold row for one backend turn needs to know about it. */
 interface TurnFoldInfo {
@@ -136,9 +143,17 @@ interface MessageListProps {
   /** The turns this view has drawn running, kept by the view so they outlive
    *  the list (see `useTurnPresentation`). */
   ranHere?: Set<number>;
+  /** Each request's plan, drawn under the message that asked for it, by
+   *  message id (`threadPlans`): the host leaves out the one its tray shows. */
+  plans?: ReadonlyMap<string, ShownPlan>;
 }
 
-function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagentView, readOnly, allowFiles, feedbackByTurn, dispatcherContext, starting, ranHere: rememberedRanHere }: MessageListProps): React.ReactElement | null {
+interface HeldTranscript {
+  messages: MessageRecord[];
+  plans?: ReadonlyMap<string, ShownPlan>;
+}
+
+function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagentView, readOnly, allowFiles, feedbackByTurn, dispatcherContext, starting, ranHere: rememberedRanHere, plans: latestPlans }: MessageListProps): React.ReactElement | null {
   // A history load writes the transcript an event at a time as its response
   // arrives. Drawn as it went, a finished turn showed its work open above no
   // answer and then folded it away once the answer and its end landed. The
@@ -146,11 +161,13 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
   // commit holds the whole transcript (loadConversationHistory's reveal). A
   // list that mounts mid-load (main shown again while the thread loads) drew
   // nothing before it, and what the load has written so far is the half it
-  // must not show, so it holds nothing, which draws the skeleton.
-  const [held, setHeld] = React.useState<MessageRecord[] | null>(() => (isLoadingHistory ? [] : null));
-  if (isLoadingHistory && held === null) setHeld(latest);
+  // must not show, so it holds nothing, which draws the skeleton. The plans
+  // are held with it, since they are read off the messages being rewritten.
+  const [held, setHeld] = React.useState<HeldTranscript | null>(() => (isLoadingHistory ? { messages: [] } : null));
+  if (isLoadingHistory && held === null) setHeld({ messages: latest, plans: latestPlans });
   if (!isLoadingHistory && held !== null) setHeld(null);
-  const messages = isLoadingHistory ? held ?? latest : latest;
+  const messages = isLoadingHistory ? held?.messages ?? latest : latest;
+  const plans = isLoadingHistory && held ? held.plans : latestPlans;
   const isMobile = useIsMobile();
   const { onOpenFile } = useMessageActions();
   // The deck keeps the workspace's own notes file out on every surface; its
@@ -350,6 +367,26 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
   }, [visible, turned, turnTails, replyEnds, live, running, ranHere, project, filesByTurn, onOpenFile, readOnly, allowFiles, quietEnds]);
 
   const items = React.useMemo(() => planQuietChecks(visible, quietEnds), [visible, quietEnds]);
+  // In a shared workspace's thread, the entries that carry on another
+  // member's run of messages, read against the entry drawn just above. A
+  // plan drawn under a message ends the run, since it sits between.
+  const sharedView = React.useContext(SharedThreadContext);
+  const continuing = React.useMemo(() => {
+    const runs = new Set<number>();
+    if (!sharedView) return runs;
+    let above: BubbleSender | undefined;
+    for (const item of items) {
+      if (item.kind !== 'entry') {
+        above = undefined;
+        continue;
+      }
+      const { message } = visible[item.index];
+      const sender = bubbleSender(sharedView, message as ChatMessage);
+      if (continuesSender(above, sender)) runs.add(item.index);
+      above = plans?.has(message.id as string) ? undefined : sender;
+    }
+    return runs;
+  }, [items, visible, sharedView, plans]);
 
   // Empty state - show when no messages exist (hidden in subagent view)
   if (messages.length === 0) {
@@ -469,14 +506,18 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
           allowFiles,
           isMobile,
           dispatcherContext,
+          continuesSender: continuing.has(i),
         };
+        const plan = plans?.get(message.id as string);
         // Every bubble gets the wrapper from its first paint: a turn's row comes
         // with its first assistant bubble, and switching a bubble from bare to
         // wrapped at the same key would remount it.
         // The row and the answer it heads are one item of the list's rhythm, so
         // the gap between them is the row's own margin, not the list's.
+        // A run of one member's messages sits closer together than the
+        // list's rhythm, as a group chat stacks them.
         return (
-          <div key={message.id as string}>
+          <div key={message.id as string} style={continuing.has(i) ? RUN_GAP : undefined}>
             {info && turnIndex !== null && info.rowPos === i && (
               <TurnFold
                 state={fold}
@@ -488,6 +529,11 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
               />
             )}
             <MessageBubble {...bubbleProps} />
+            {plan && (
+              <div className={isMobile ? 'mt-4' : 'mt-6'}>
+                <AgentPlan {...plan} heading />
+              </div>
+            )}
           </div>
         );
       })}

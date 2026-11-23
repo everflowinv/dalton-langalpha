@@ -6,7 +6,8 @@
  * warnings in the gallery and in a chat. So the dialog mounts once at the root
  * and every opener writes here instead of threading callbacks down.
  */
-import { useEffect, useSyncExternalStore } from 'react';
+// DALTON-HOOK(settings-reorg): useLayoutEffect keeps page-level host registration synchronous so FallbackComputersHost yields without a double-dialog frame
+import { useEffect, useLayoutEffect, useSyncExternalStore } from 'react';
 
 import { registerAuthReset } from '@/lib/authResets';
 import type { ResourceTier } from '@/types/api';
@@ -18,11 +19,24 @@ import { createValueStore } from '@/lib/valueStore';
  * the middle; one machine's details; or the New computer form, which is then
  * the destination (its cancel closes the panel too), with This Mac picked on
  * it when `pick` says so.
+ *
+ * `returnTo` names what the panel was opened from when that is where the
+ * reader goes back to: Settings' Computers section, which lists the machines
+ * itself, or Claude Code's view, which lists those it runs on. The panel then
+ * holds one machine or the form, and leaving either closes it onto that
+ * place rather than going to the rail.
  */
 export type ComputersPanelView =
-  | { view: 'list'; computerId?: string | null }
-  | { view: 'details'; computerId: string }
-  | { view: 'create'; pick?: 'thisMac' };
+  // The list is the rail itself, so it has nothing to return to.
+  | { view: 'list'; computerId?: string | null; returnTo?: never }
+  | { view: 'details'; computerId: string; returnTo?: ComputersReturn }
+  | { view: 'create'; pick?: 'thisMac'; returnTo?: ComputersReturn };
+
+/** Where the panel closes back to, in place of its rail. */
+export type ComputersReturn = 'settings' | 'claudeCode';
+
+/** Settings' Computers section, which lists the machines and mounts the panel. */
+export const COMPUTERS_SETTINGS_URL = '/settings?tab=computers';
 
 export interface ComputersPanelState {
   /** The Computers dialog, null when closed. */
@@ -106,22 +120,49 @@ export function closeComputerSpec() {
  *  is one tab. */
 interface ComputersHost {
   planInPlace: boolean;
+  // DALTON-HOOK(settings-reorg): distinguish shell-level FallbackComputersHost from page-level hosts
+  fallback?: boolean;
 }
 
 // The mounted hosts. A request made where none is mounted (a composer on the
 // dashboard) would show nothing, then open unasked on the next page that
 // mounts one.
 const hosts: ComputersHost[] = [];
+// DALTON-HOOK(settings-reorg): reactive count of mounted page-level hosts so FallbackComputersHost yields immediately on route change
+const pageHosts = createValueStore<number>(0);
 
 /** Registers the calling host while it stays mounted. */
-export function useComputersHost(planInPlace: boolean) {
-  useEffect(() => {
-    const host = { planInPlace };
+export function useComputersHost(planInPlace: boolean, fallback = false) {
+  useLayoutEffect(() => {
+    const host: ComputersHost = { planInPlace, fallback };
     hosts.push(host);
+    if (!fallback) pageHosts.set(pageHosts.get() + 1);
     return () => {
-      hosts.splice(hosts.indexOf(host), 1);
+      const idx = hosts.indexOf(host);
+      if (idx >= 0) hosts.splice(idx, 1);
+      if (!fallback) pageHosts.set(Math.max(0, pageHosts.get() - 1));
     };
-  }, [planInPlace]);
+  }, [planInPlace, fallback]);
+}
+
+/** Whether a page-level (non-fallback) ComputersDialogHost is mounted. */
+// DALTON-HOOK(settings-reorg): lets FallbackComputersHost yield synchronously when a page mounts its own host
+export function usePageComputersHostMounted(): boolean {
+  return useSyncExternalStore(pageHosts.subscribe, () => pageHosts.get() > 0);
+}
+
+/**
+ * Closes the dialogs as the page that hosts them goes, since a back gesture
+ * skips their own close: left open, they would come back on the next page with
+ * a host, and hold the stale-build reload until then. A panel opened for
+ * Settings is left by every other page, as its opener navigates there from
+ * that page (Getting started) and Settings shows it.
+ */
+export function useCloseComputersOnLeave(page: 'settings' | 'other' = 'other') {
+  useEffect(() => () => {
+    if (page === 'settings' || store.get().panel?.returnTo !== 'settings') closeComputersPanel();
+    closeComputerSpec();
+  }, [page]);
 }
 
 /** Whether a page that shows the computer dialogs is mounted. */

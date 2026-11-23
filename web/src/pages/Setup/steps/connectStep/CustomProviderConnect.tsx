@@ -129,6 +129,17 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
             value={form.apiKey}
             onChange={form.setApiKey}
           />
+          {/* DALTON-HOOK(standalone-core): display Core format/tool-probe hint returned on custom provider save */}
+          {form.probeHint && (
+            <p
+              role="status"
+              data-testid="api-key-test-hint"
+              className="text-xs"
+              style={{ color: 'var(--color-warning)' }}
+            >
+              {form.probeHint}
+            </p>
+          )}
         </div>
 
         <section className="flex flex-col gap-3" aria-live="polite">

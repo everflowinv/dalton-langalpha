@@ -776,6 +776,26 @@ def is_core_oss_auth_explicitly_allowed() -> bool:
     )
 
 
+def _parse_http_origin_tuple(raw: str) -> tuple[str, str, int] | None:
+    """Parse an http(s) URL into ``(scheme, lowercase_host, effective_port)``."""
+    from urllib.parse import urlparse
+
+    cleaned = str(raw or "").strip()
+    if not cleaned:
+        return None
+    parsed = urlparse(cleaned)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    if scheme not in ("http", "https") or not host:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    effective_port = port if port is not None else (443 if scheme == "https" else 80)
+    return (scheme, host, effective_port)
+
+
 def validate_dalton_auth_config() -> str:
     """Fail-closed startup validation for ``DALTON_AUTH_MODE`` (Standalone Core §4.2 #1).
 
@@ -783,6 +803,7 @@ def validate_dalton_auth_config() -> str:
     - ``DALTON_AUTH_MODE`` is not in ``{"local", "supabase", "oss"}``;
     - ``HOST_MODE=platform`` is combined with ``DALTON_AUTH_MODE=local``;
     - ``DALTON_AUTH_MODE=local`` lacks a ``JWT_SIGNING_SECRET`` of at least 32 bytes;
+    - ``DALTON_AUTH_MODE=local`` has cross-origin frontend and API URLs configured;
     - ``DALTON_AUTH_MODE=local`` has transcription enabled without a dedicated
       ``DALTON_TRANSCRIPTION_TICKET_SECRET`` (>= 32 bytes);
     - ``DALTON_PROFILE=core`` uses ``DALTON_AUTH_MODE=oss`` without
@@ -814,6 +835,30 @@ def validate_dalton_auth_config() -> str:
                 f"{MIN_JWT_SIGNING_SECRET_BYTES} bytes (got {secret_bytes}). "
                 "Generate one with `openssl rand -hex 32` and set JWT_SIGNING_SECRET in .env."
             )
+        # Local auth uses an HttpOnly SameSite=Lax refresh cookie + strict Origin check,
+        # so the web frontend and backend API must be served from the same origin.
+        api_candidates: list[tuple[str, str, tuple[str, str, int]]] = []
+        for api_key in ("SERVER_BASE_URL", "VITE_API_BASE_URL"):
+            raw_api = os.getenv(api_key, "").strip()
+            api_origin = _parse_http_origin_tuple(raw_api)
+            if api_origin is not None:
+                api_candidates.append((api_key, raw_api, api_origin))
+        frontend_candidates: list[tuple[str, str, tuple[str, str, int]]] = []
+        for fe_key in ("DALTON_FRONTEND_URL", "PUBLIC_APP_URL", "FRONTEND_URL"):
+            raw_fe = os.getenv(fe_key, "").strip()
+            fe_origin = _parse_http_origin_tuple(raw_fe)
+            if fe_origin is not None:
+                frontend_candidates.append((fe_key, raw_fe, fe_origin))
+        for fe_key, raw_fe, fe_origin in frontend_candidates:
+            for api_key, raw_api, api_origin in api_candidates:
+                if fe_origin != api_origin:
+                    raise DaltonStartupConfigError(
+                        "DALTON_AUTH_MODE=local only supports same-origin frontend and API "
+                        f"deployments ({fe_key}={raw_fe!r} conflicts with {api_key}={raw_api!r}). "
+                        "Serve both the frontend and /api/* behind the same origin (for example "
+                        "via Caddy edge gateway) and align PUBLIC_APP_URL / DALTON_FRONTEND_URL "
+                        "with SERVER_BASE_URL."
+                    )
         transcription_flag = os.getenv("DALTON_TRANSCRIPTION_ENABLED", "").strip().lower()
         if transcription_flag in ("1", "true", "yes", "on"):
             ticket_secret_bytes = len(

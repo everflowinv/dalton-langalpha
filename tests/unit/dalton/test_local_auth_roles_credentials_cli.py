@@ -90,6 +90,17 @@ class FakeRolesAndCliDB:
                         if db.holder_user_id is not None:
                             cur._rows = [{"holder_user_id": db.holder_user_id}]
                         return cur
+                    if "INSERT INTO dalton_credential_holder" in sql:
+                        db.holder_user_id = p[0]
+                        cur._rows = [
+                            {
+                                "singleton_id": 1,
+                                "holder_user_id": p[0],
+                                "updated_by": p[1],
+                                "updated_at": None,
+                            }
+                        ]
+                        return cur
                     if "INSERT INTO user_api_keys" in sql:
                         db.write_tx_depths.append(("api_key_upsert", db.tx_depth))
                         db.api_keys_written.append((p[0], p[1]))
@@ -696,3 +707,43 @@ asyncio.run = _hooked_run
         assert proc_notty.returncode == 1
         assert "--password-stdin" in proc_notty.stderr
         assert log_file.read_text(encoding="utf-8").splitlines() == ["pool_open", "pool_close"]
+
+
+@pytest.mark.asyncio
+async def test_primary_admin_verifies_admin_role_and_holder_demotion_is_refused(monkeypatch):
+    """Item 10: get_primary_admin checks holder is still admin; demoting holder is refused (409)."""
+    from src.dalton import access_tiers
+    from src.dalton.auth import roles as roles_mod
+
+    monkeypatch.setenv("HOST_MODE", "oss")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "local")
+
+    fake_db = FakeRolesAndCliDB()
+    fake_db.roles[ADMIN_1] = {"user_id": ADMIN_1, "tier": "admin", "granted_by": None}
+    fake_db.roles[ADMIN_2] = {"user_id": ADMIN_2, "tier": "admin", "granted_by": None}
+    fake_db.holder_user_id = ADMIN_1
+    monkeypatch.setattr(roles_mod, "get_db_connection", fake_db.make_get_db_connection())
+
+    # 1. Demoting or deleting current credential holder is refused (409) even with another admin present
+    with pytest.raises(roles_mod.CredentialHolderProtectedError) as exc_demote:
+        await roles_mod.set_user_role(ADMIN_1, "internal")
+    assert exc_demote.value.status_code == 409
+    assert "transfer credential holder" in str(exc_demote.value.detail).lower()
+
+    with pytest.raises(roles_mod.CredentialHolderProtectedError) as exc_delete:
+        await roles_mod.delete_user_role(ADMIN_1)
+    assert exc_delete.value.status_code == 409
+
+    # 2. After transferring holder to admin-2, demoting admin-1 succeeds
+    await roles_mod.set_credential_holder_id(ADMIN_2)
+    await roles_mod.set_user_role(ADMIN_1, "internal")
+    assert await roles_mod.get_user_role(ADMIN_1) == "internal"
+
+    # 3. If holder row somehow points to a non-admin (e.g. out-of-band DB drift),
+    #    get_primary_admin_user_id verifies current role and falls back to an active admin.
+    fake_db.holder_user_id = ADMIN_1  # now tier == "internal"
+    assert await access_tiers.get_primary_admin_user_id() == ADMIN_2
+
+    # And when holder IS an admin, get_primary_admin_user_id returns holder
+    fake_db.holder_user_id = ADMIN_2
+    assert await access_tiers.get_primary_admin_user_id() == ADMIN_2

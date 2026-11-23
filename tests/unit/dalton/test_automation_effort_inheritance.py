@@ -188,7 +188,7 @@ async def test_wakeup_inherits_creator_automation_effort_not_other_running_task_
         USER,
         THREAD,
         TurnRoute(workspace_id=WS, owner_id=USER, role="analyst"),
-        identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER, org_id=None),
+        identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER),
         thread={"reasoning_effort": "low"},
         is_byok=False,
     )
@@ -358,7 +358,7 @@ async def test_explicit_model_retry_still_inherits_first_turn_effort_and_propaga
         USER,
         THREAD,
         TurnRoute(workspace_id=WS, owner_id=USER, role="analyst"),
-        identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER, org_id=None),
+        identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER),
         thread={"reasoning_effort": "low"},
         is_byok=False,
     )
@@ -474,7 +474,7 @@ async def test_subscription_fallback_inherits_effort_for_multi_tier_and_clamps_a
             USER,
             THREAD,
             TurnRoute(workspace_id=WS, owner_id=USER, role="analyst"),
-            identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER, org_id=None),
+            identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER),
             thread={"reasoning_effort": "max"},
             is_byok=False,
         )
@@ -593,7 +593,7 @@ async def test_normal_user_retry_inherits_first_turn_effort_even_with_explicit_m
         USER,
         THREAD,
         TurnRoute(workspace_id=WS, owner_id=USER, role="analyst"),
-        identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER, org_id=None),
+        identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER),
         thread={"reasoning_effort": "low"},
         is_byok=False,
     )
@@ -663,7 +663,7 @@ async def test_normal_user_retry_inherits_first_turn_effort_even_with_explicit_m
         USER,
         THREAD,
         TurnRoute(workspace_id=WS, owner_id=USER, role="analyst"),
-        identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER, org_id=None),
+        identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER),
         thread={"reasoning_effort": "low"},
         is_byok=False,
     )
@@ -742,7 +742,7 @@ async def test_unattributed_legacy_wakeup_does_not_inherit_other_running_automat
         USER,
         THREAD,
         TurnRoute(workspace_id=WS, owner_id=USER, role="analyst"),
-        identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER, org_id=None),
+        identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER),
         thread={"reasoning_effort": "high"},
         is_byok=False,
     )
@@ -1123,7 +1123,7 @@ async def test_follow_default_automation_on_persistent_thread_overrides_stale_th
         USER,
         THREAD,
         TurnRoute(workspace_id=WS, owner_id=USER, role="analyst"),
-        identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER, org_id=None),
+        identity=TurnIdentity(sender=USER, owner=USER, recorded_as=USER),
         thread={"reasoning_effort": "low"},
         is_byok=False,
     )

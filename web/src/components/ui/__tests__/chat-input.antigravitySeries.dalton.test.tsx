@@ -159,7 +159,7 @@ describe('ChatInput Antigravity series collapsing & effort pill', () => {
     h.removeManyFavorites.mockReset();
   });
 
-  it('displays saved gemini-4-neon-medium-oauth as "Gemini 4 Neon" + "Medium" and switches variant via effort menu', () => {
+  it('displays saved gemini-4-neon-medium-oauth as "Gemini 4 Neon" + "Medium" and switches variant via unified picker tuning pane', () => {
     const onPickModel = vi.fn();
     const { container, rerender } = renderComposer({
       model: 'gemini-4-neon-medium-oauth',
@@ -168,10 +168,9 @@ describe('ChatInput Antigravity series collapsing & effort pill', () => {
     });
 
     const modelPill = container.querySelector('button[data-pill="model"]')!;
-    const effortPill = container.querySelector('button[data-pill="effort"]')!;
+    expect(container.querySelector('[data-pill="effort"]')).toBeNull();
     expect(modelPill).toHaveTextContent('Gemini 4 Neon');
-    expect(modelPill).not.toHaveTextContent('Medium');
-    expect(effortPill).toHaveTextContent('Medium');
+    expect(modelPill).toHaveTextContent('Medium');
 
     // Open model picker: Favorites + In thread collapses Neon to 1 row
     fireEvent.click(modelPill);
@@ -190,26 +189,25 @@ describe('ChatInput Antigravity series collapsing & effort pill', () => {
     expect(within(dialog).getAllByText('Gemini 4 Carbon')).toHaveLength(1);
     expect(within(dialog).getAllByText('GPT-OSS 120B')).toHaveLength(1);
 
-    // Clicking already-selected Gemini 4 Neon keeps current suffix (no-op)
+    // Clicking already-selected Gemini 4 Neon keeps current suffix (no-op) and closes picker
     fireEvent.click(within(dialog).getByRole('row', { name: /Gemini 4 Neon/ }));
     expect(onPickModel).not.toHaveBeenCalled();
 
-    // Re-open and pick Gemini 4 Carbon -> picks Carbon's default_effort (medium)
+    // Re-open and pick Gemini 4 Carbon -> picks Carbon's default_effort (medium) and keeps picker open for tuning
     fireEvent.click(modelPill);
     const dialog2 = screen.getByRole('dialog');
     fireEvent.click(within(dialog2).getByRole('radio', { name: 'Google Antigravity' }));
     fireEvent.click(within(dialog2).getByRole('row', { name: /Gemini 4 Carbon/ }));
     expect(onPickModel).toHaveBeenCalledWith('gemini-4-carbon-medium-oauth');
 
-    // Open effort menu on Neon Medium -> Default badge on High, clicking High writes neon-high
-    fireEvent.click(effortPill);
-    const menu = screen.getByRole('menu');
+    // Tuning pane in the open picker shows Neon Medium -> Default badge on High, clicking High writes neon-high
+    const menu = within(dialog2).getByRole('menu', { name: 'Reasoning' });
     const highItem = within(menu).getByRole('menuitemradio', { name: /^High/i });
     expect(highItem).toHaveTextContent('Default');
     fireEvent.click(highItem);
     expect(onPickModel).toHaveBeenCalledWith('gemini-4-neon-high-oauth');
 
-    // Single-effort GPT-OSS 120B hides the effort pill
+    // Single-effort GPT-OSS 120B hides the effort readout on the pill
     rerender(
       <QueryClientProvider client={new QueryClient()}>
         <MemoryRouter>
@@ -217,8 +215,9 @@ describe('ChatInput Antigravity series collapsing & effort pill', () => {
         </MemoryRouter>
       </QueryClientProvider>,
     );
-    expect(container.querySelector('button[data-pill="model"]')).toHaveTextContent('GPT-OSS 120B');
-    expect(container.querySelector('button[data-pill="effort"]')).toBeNull();
+    const singlePill = container.querySelector('button[data-pill="model"]')!;
+    expect(singlePill).toHaveTextContent('GPT-OSS 120B');
+    expect(singlePill).not.toHaveTextContent('Medium');
   });
 
   it('does not collapse a same-named custom model into the Antigravity series', () => {
@@ -256,17 +255,16 @@ describe('ChatInput Antigravity series collapsing & effort pill', () => {
     });
 
     const modelPill = container.querySelector('button[data-pill="model"]')!;
-    const effortPill = container.querySelector('[data-pill="effort"]')!;
     expect(modelPill).toHaveTextContent('Gemini 4 Neon');
-    expect(effortPill).not.toBeNull();
-    expect(effortPill.tagName).toBe('SPAN');
-    expect(effortPill).toHaveAttribute('data-readonly', 'true');
-    expect(effortPill).toHaveTextContent('Medium');
-    expect(effortPill).not.toHaveAttribute('aria-haspopup');
+    expect(modelPill).toHaveTextContent('Medium');
 
-    // Clicking the read-only effort indicator opens no menu and fires no callbacks
-    fireEvent.click(effortPill);
-    expect(screen.queryByRole('menu')).toBeNull();
+    // Opening the picker shows the stored effort read-only without any clickable level menu
+    fireEvent.click(modelPill);
+    const dialog = screen.getByRole('dialog');
+    const readOnlyPane = dialog.querySelector('[data-readonly="true"]');
+    expect(readOnlyPane).not.toBeNull();
+    expect(readOnlyPane).toHaveTextContent('Medium');
+    expect(within(dialog).queryByRole('menu', { name: 'Reasoning' })).toBeNull();
     expect(onPickModel).not.toHaveBeenCalled();
     expect(onPickReasoningEffort).not.toHaveBeenCalled();
 
@@ -278,7 +276,9 @@ describe('ChatInput Antigravity series collapsing & effort pill', () => {
         </MemoryRouter>
       </QueryClientProvider>,
     );
-    expect(container.querySelector('[data-pill="effort"]')).toBeNull();
+    const singlePill = container.querySelector('button[data-pill="model"]')!;
+    expect(singlePill).toHaveTextContent('GPT-OSS 120B');
+    expect(singlePill).not.toHaveTextContent('Medium');
   });
 
   it('does not count a same-name custom model into series favorites and does not remove it when unfavoriting the series', () => {

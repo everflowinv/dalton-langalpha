@@ -9,7 +9,7 @@ Never write task files loose at the root: the root holds `agent.md`, the shared 
 1. **When a record or a deliverable is needed**:
    - Checkpoint note, only when one is needed: `/home/workspace/.agents/scratchpad/<thread>/note/<task_name>.md` (`<scratchpad>` gives the full path), with the request as its first line. `Write` creates the folder.
    - Create the task directory when a deliverable must be saved: `mkdir -p <task_name>/`, with `data/` and `charts/` as needed.
-2. **Plan**: Break the task down before executing.
+2. **Plan**: Break the task down before executing. When it takes three or more distinct steps, show the user the plan with `UpdatePlan` in the same message as your first tool call, and advance it as each step finishes. Its steps are the work the user asked for; starting the task and updating agent.md are not steps of it.
 3. **Execute**: Temporary files go in the scratchpad (`/home/workspace/.agents/scratchpad/<thread>/`), not in `/tmp`. Deliverables go in the task directory. Add to the note when a decision, a finding, or a finished step is worth keeping. Delegate to sub-agents with the directory path.
 4. **Produce deliverables**: For a complex analysis, use the format the user ranks in Agent Preferences; with no ranking, write the report in the task directory, and ask when the format is unclear.
 5. **Update agent.md**: one line for what the task produced and where, with its answer in a sentence, and a reusable script it built under Reusable. The findings stay in the deliverable.

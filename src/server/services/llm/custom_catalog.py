@@ -226,6 +226,7 @@ def validate_custom_models(
                 ) from exc
 
 
+# DALTON-HOOK(standalone-core): accept optional user_id keyword while enforcing address-based egress policy for all callers
 async def refuse_custom_model_endpoints(
     custom_models: list,
     stored: list | None = None,
@@ -243,6 +244,7 @@ async def refuse_custom_model_endpoints(
     otherwise block every later change. Such an entry is still refused, or
     held, where its client is built.
     """
+    del user_id
     from src.server.services.llm import egress
     from src.server.services.llm.availability import on_subscription
 
@@ -263,11 +265,6 @@ async def refuse_custom_model_endpoints(
             )
     if not egress.enforced():
         return
-    # DALTON-HOOK(standalone-core): exempt administrator-configured team models in core local auth
-    from src.dalton.llm.egress_policy import is_admin_llm_egress_exempt
-
-    if await is_admin_llm_egress_exempt(user_id):
-        return
     to_check: list[tuple[int, str]] = []
     for idx, cm in changed:
         params = cm.get("parameters")
@@ -277,6 +274,25 @@ async def refuse_custom_model_endpoints(
                 detail=f"custom_models[{idx}]: parameters.{key} cannot be set. Remove it.",
             )
         to_check.extend((idx, url) for url in egress.parameter_urls(params))
+    # DALTON-HOOK(standalone-core): enforce address-based egress rules in core local auth (no identity exemption)
+    from src.dalton.llm.egress_policy import (
+        check_core_endpoint_refusal,
+        get_saved_team_endpoints,
+        is_core_llm_egress_enforced,
+    )
+
+    if is_core_llm_egress_enforced():
+        saved_team = await get_saved_team_endpoints()
+        for idx, url in to_check:
+            reason, _ = await check_core_endpoint_refusal(
+                url, require_resolution=True, saved_team_endpoints=saved_team
+            )
+            if reason:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"custom_models[{idx}]: the base URL in parameters cannot be used: {reason}",
+                )
+        return
     reasons = await egress.save_refusals(url for _, url in to_check)
     for idx, url in to_check:
         if reasons[url]:

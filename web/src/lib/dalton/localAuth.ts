@@ -49,6 +49,11 @@ export interface LocalChangePasswordResponse {
   sessions_revoked: number;
 }
 
+export interface LocalWsTicketResponse {
+  ticket: string;
+  expires_in: number;
+}
+
 export class LocalAuthError extends Error {
   status: number;
   code: string | null;
@@ -161,15 +166,36 @@ export async function localRefresh(retryOnConflict = true): Promise<LocalRefresh
 }
 
 export async function localLogout(): Promise<void> {
+  let res: Response;
   try {
-    await fetch(`${baseURL}/api/v1/dalton/auth/local/logout`, {
+    res = await fetch(`${baseURL}/api/v1/dalton/auth/local/logout`, {
       method: 'POST',
       credentials: 'include',
       headers: { Accept: 'application/json' },
     });
   } catch {
-    /* local state still clears even if the network call fails */
+    throw new LocalAuthError('登出未完成，请重试', 0);
   }
+  // 401 means the server session is already absent/revoked and the cookie was cleared.
+  if (!res.ok && res.status !== 401) {
+    throw new LocalAuthError('登出未完成，请重试', res.status);
+  }
+}
+
+export async function fetchLocalWsTicket(accessToken: string): Promise<LocalWsTicketResponse> {
+  const res = await fetch(`${baseURL}/api/v1/dalton/auth/local/ws-ticket`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      Accept: 'application/json',
+      ...bearerHeaderFor(accessToken),
+    },
+  });
+  if (!res.ok) {
+    const detail = await readErrorMessage(res, `WebSocket ticket request failed (${res.status})`);
+    throw new LocalAuthError(detail, res.status);
+  }
+  return (await res.json()) as LocalWsTicketResponse;
 }
 
 export async function localChangePassword(

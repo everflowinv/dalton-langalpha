@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { lazy, Suspense, useEffect, useRef } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router';
 import { useScrollMemory } from '@/lib/scrollMemory';
 import { useUser } from '@/hooks/useUser';
@@ -12,6 +12,7 @@ import { AccountPanel } from './panels/AccountPanel';
 import { InvestingProfilePanel } from './panels/InvestingProfilePanel';
 import { GeneralPanel } from './panels/GeneralPanel';
 import { ChatPanel } from './panels/ChatPanel';
+import { ComputersPanel } from './panels/ComputersPanel';
 import { ModelsPanel } from './panels/ModelsPanel';
 import { IntegrationsPanel } from './panels/IntegrationsPanel';
 // DALTON-HOOK(settings-reorg): consolidated Dalton settings panels & permission guards
@@ -23,6 +24,7 @@ import { DaltonTeamOpsPanel } from './panels/dalton/DaltonTeamOpsPanel';
 import { DaltonInlineNotice } from '@/components/dalton/primitives';
 import { SettingsRail, useDaltonSettingsVisibility } from './components/SettingsRail';
 import ComputersDialogHost from '@/pages/ChatAgent/components/ComputersDialogHost';
+import { useCloseComputersOnLeave } from '@/pages/ChatAgent/hooks/computerPanelStore';
 import {
   readSection,
   resolveRequestedSection,
@@ -34,6 +36,9 @@ import {
 } from './sections';
 import '@/styles/pageRail.css';
 import './Settings.css';
+
+// A self-hosted server's own settings, which a hosted build never opens.
+const ServerPanel = lazy(() => import('./panels/ServerPanel'));
 
 /** A section's rows while the account is read on a cold load: a name and a
  *  line under it on the left, the control on the right, as the rows lay theirs
@@ -63,8 +68,10 @@ function SectionBody({ section }: { section: Section }) {
     case 'preferences': return <InvestingProfilePanel />;
     case 'general': return <GeneralPanel />;
     case 'chat': return <ChatPanel />;
+    case 'computers': return <ComputersPanel />;
     case 'model': return <ModelsPanel />;
     case 'budget': return <DaltonBudgetPanel />;
+    case 'server': return <Suspense fallback={<SettingsSkeleton />}><ServerPanel /></Suspense>;
     case 'integrations': return <IntegrationsPanel />;
     case 'coverage': return <DaltonCoveragePanel />;
     case 'teamModels': return <DaltonTeamModelsPanel />;
@@ -83,6 +90,7 @@ function SectionBody({ section }: { section: Section }) {
  * jumped to, which is brought into view and marked for a moment.
  */
 function Settings() {
+  useCloseComputersOnLeave('settings');
   const [searchParams] = useSearchParams();
   const location = useLocation();
   const navigate = useNavigate();
@@ -159,11 +167,13 @@ function Settings() {
       marked = target;
       target.scrollIntoView?.({ block: 'center' });
       if (focusSetting) {
-        // The control a row names as its own, else in a group of choices the
-        // one picked now, else the first control. A body with none of its
+        // The row itself where it is the control, else the control it names
+        // as its own, else in a group of choices the one picked now, else
+        // the first control. A body with none of its
         // own, like the investing answers, hands focus to its group's action.
         const control = 'input, select, button, a[href], [tabindex]:not([tabindex="-1"])';
-        (target.querySelector<HTMLElement>('[data-search-focus]')
+        ((target.matches(control) ? target : null)
+          ?? target.querySelector<HTMLElement>('[data-search-focus]')
           ?? target.querySelector<HTMLElement>('input:checked')
           ?? target.querySelector<HTMLElement>(control)
           ?? target.closest('.settings-group')?.querySelector<HTMLElement>(control))
@@ -226,8 +236,9 @@ function Settings() {
           </div>
         </div>
       </div>
-      {/* Change spec, opened over Claude Code's view in Model access, so
-          the user stays where they started while the computer resizes. */}
+      {/* The Computers panel, opened from the Computers section's rows, and
+          Change spec, opened over Claude Code's view in Model access, so the
+          user stays where they started while the computer changes. */}
       <ComputersDialogHost overSheet planInPlace />
     </div>
   );

@@ -163,7 +163,7 @@ flowchart LR
 - **浏览器、后端、沙箱三视角地址契约**：
   1. **浏览器视角**：仅访问单一入口 `https://<DOMAIN>`（或本机回环试用 `http://127.0.0.1:8088`）。聊天大文件分片直接上传至同源后端接口 `/api/v1/dalton/chat-uploads/*`（`web/src/lib/dalton/chatUploadClient.ts:328`），无需向公网暴露 MinIO 端口。
   2. **后端容器视角**：在 Compose 内部专用网络 `core_internal` 上连接 `postgres:5432`、`redis:6379`、`minio:9000` 与 `crawler:8100`。`src/dalton/chat_upload_storage.py` 独立读取 `DALTON_CHAT_UPLOAD_STORAGE_*`，由一次性桶初始化步骤自动建好 `chat-uploads` 存储桶。
-  3. **沙箱专用网络 `sandbox-net`、中继下载与分阶段网页预览**：核心安装在 `docker-compose.core.yml` 中新建专用 Docker 网络 `sandbox-net`，并将 `agent_config.core.yaml` 的 `sandbox.docker.network_mode` 设为 `"sandbox-net"`（`src/ptc_agent/config/core.py:492`）：仅 `backend` 与 `langalpha-sandbox` 接入 `sandbox-net`，而 `postgres`、`redis`、`minio` 仅留在 `core_internal` 网络，从拓扑上彻底阻断沙箱访问数据库、缓存与对象存储。通过配置 `EGRESS_RELAY_BASE_URL=http://backend:8000`，沙箱使用该网络内的后端服务名直接访问出口中继、LiveFS（`src/server/services/livefs/mount.py:350`）以及后端受控文件下载中继（在 `src/dalton/app/chat_uploads.py` 新增单对象短时效 HMAC 签名流接口 `GET /api/v1/dalton/chat-uploads/sandbox-object/{token}`，供 `chat_uploads.py:3022` `pull_direct` 下载并校验 SHA-256），完全摆脱对 `host.docker.internal` 的依赖。工作区沙箱网页预览（Preview）在 **Batch 1** 先在运行器本机通过宿主机回环动态端口验证；面向远程客户浏览器的预览访问（接入 `src/server/services/preview_capabilities.py:395-425` 预览代理能力，经 `deploy/standalone/Caddyfile` 按预览子域名或受控路径转发）安排在 **Batch 6** 交付验收。
+  3. **沙箱专用网络 `sandbox-net`、中继下载与分阶段网页预览**：核心安装在 `docker-compose.core.yml` 中新建按安装实例区分的专用 Docker 网络（由 `SANDBOX_DOCKER_NETWORK` 统一指定，默认 `${COMPOSE_PROJECT_NAME}_sandbox`；Compose 与 `DockerProvider` 共用同一变量，默认按**一台主机部署一套核心栈**规划，多套并行需各自配置独立的 `COMPOSE_PROJECT_NAME`、`SANDBOX_DOCKER_NETWORK` 与 `DALTON_EDGE_PORT`）：仅 `backend` 与 `langalpha-sandbox` 接入该网络，而 `postgres`、`redis`、`minio` 仅留在 `core_internal` 网络，从拓扑上彻底阻断沙箱访问数据库、缓存与对象存储。通过配置 `EGRESS_RELAY_BASE_URL=http://backend:8000`，沙箱使用该网络内的后端服务名直接访问出口中继、LiveFS（`src/server/services/livefs/mount.py:350`）以及后端受控文件下载中继（仅在核心形态注册、边缘网关禁止转发、令牌通过 `X-Dalton-Relay-Token` 请求头传递的 `GET /api/v1/dalton/chat-uploads/sandbox-object` 接口，供 `chat_uploads.py` `pull_direct` 下载并校验 SHA-256），完全摆脱对 `host.docker.internal` 的依赖。工作区沙箱网页预览（Preview）在 **Batch 1** 先在运行器本机通过宿主机回环动态端口验证；面向远程客户浏览器的预览访问（接入 `src/server/services/preview_capabilities.py:395-425` 预览代理能力，经 `deploy/standalone/Caddyfile` 按预览子域名或受控路径转发）安排在 **Batch 6** 交付验收。试用形态下，沙箱可以访问后端 API；Batch 4b 上线本地登录后，会以 `auth: local` 复核沙箱在没有凭据时能调用哪些接口。
 - **客户可见的 `docker.sock` 权限边界说明**（同步印在安装文档首屏与 `init.sh` 执行提示中）：
   - 核心安装采用 DooD（Docker-outside-of-Docker，容器挂载宿主机套接字管理兄弟容器的方式）按需创建与回收代码沙箱，`backend` 容器需挂载 `/var/run/docker.sock`。持有该套接字等价于拥有宿主机 Docker 守护进程级控制权；因此生产环境应部署在**专用于运行 Dalton 的独立 Linux 云主机或虚拟机**上（也可配置对接独立沙箱宿主机或远程沙箱提供方）。
 
@@ -178,7 +178,7 @@ flowchart LR
    ```bash
    bash scripts/standalone/init.sh
    ```
-   - 校验 Docker Engine（≥ 24.0）、Docker Compose（≥ v2.24.4）、内存（建议 ≥ 8 GB）与磁盘（≥ 30 GB），打印 `docker.sock` 独占主机安全提示；
+   - 校验 Docker Engine（≥ 28.0，确保宿主机 `127.0.0.1` 回环端口发布不被同二层网络邻机访问）、Docker Compose（≥ v2.24.4）、内存（建议 ≥ 8 GB）与磁盘（≥ 30 GB），打印 `docker.sock` 独占主机安全提示（默认一台主机部署一套核心栈）；
    - 自动用 `openssl rand -hex 32` 生成数据库密码、Redis 密码、MinIO 密钥、`INTERNAL_SERVICE_TOKEN`、`BYOK_ENCRYPTION_KEY`、本地登录签名密钥 `JWT_SIGNING_SECRET` 及带 24 小时有效期的管理员自举口令 `BOOTSTRAP_SETUP_TOKEN`；
    - 提示填入 `DOMAIN`（公网域名走 ACME〔自动证书管理环境协议〕自动签发 HTTPS 证书；企业内网域名可指定自有 TLS 证书；填 `localhost` 时仅绑定本机回环 `127.0.0.1:8088` 供单机试用）。
 3. **一键拉起核心服务栈**

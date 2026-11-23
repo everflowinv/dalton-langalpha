@@ -279,3 +279,4 @@ Dalton 和普通的 AI 问答有三点不同：
 - 系统架构与模块地图：[docs/dalton/ARCHITECTURE.md](docs/dalton/ARCHITECTURE.md)
 - 运维与生产部署手册：[docs/dalton/OPERATIONS.md](docs/dalton/OPERATIONS.md)
 - Dalton 构建在开源项目 LangAlpha 之上，上游的说明见 [README.zh-CN.md](README.zh-CN.md) 或 [ginlix-ai/langalpha](https://github.com/ginlix-ai/langalpha)。
+- 上游 LangAlpha 亦支持开源自部署：可使用 macOS / Linux 开源桌面端（内置服务与数据库，选择 **Run on this computer**，Windows 端连接已有服务）或从源码通过 `make up` 以 Docker 启动；首次运行会引导配置智能体运行位置、依赖与模型/数据/搜索密钥，后续可在 **Settings** 或 `make config` 中修改（Dalton 生产部署不启用该单人自部署向导，改用团队运维配置）。

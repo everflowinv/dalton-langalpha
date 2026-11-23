@@ -26,7 +26,14 @@ import {
 import { computerOutcomeWatch, reduceComputerOutcomes } from '../hooks/computerOutcomes';
 import { takePrepareFailures } from '../hooks/computerPreparation';
 import { useComputerActions } from '../hooks/useComputerActions';
-import { invalidateMachine, invalidateMachineStorage, useComputerProviders, useComputers } from '../hooks/useComputers';
+import {
+  invalidateMachine,
+  invalidateMachineStorage,
+  useComputerProviders,
+  useComputers,
+  // DALTON-HOOK(settings-reorg): run status fan-out when mounted as FallbackComputersHost on a page without ChatAgent
+  useComputerStatusFanout,
+} from '../hooks/useComputers';
 import { useTierQuota } from '../hooks/useTierQuota';
 import { useResizeParam } from '../hooks/useMediumAction';
 import ChangeSpecDialog from './ChangeSpecDialog';
@@ -38,23 +45,31 @@ import { WorkspaceMoveOutcomes } from './WorkspaceMoveOutcomes';
 
 /**
  * `currentWorkspaceId` is the workspace the page shows, which a computer's
- * removal can delete. `overSheet`: the page opens Change spec over a sheet
- * of its own, which steps back for it, as the Computers panel does.
+ * removal can delete. `overSheet`: the page opens Change spec, and the
+ * Computers panel from Claude Code's view, over a sheet of its own, which
+ * steps back for them.
  * `planInPlace`: the page holds nothing a new tab would save, so the plan
  * page opens in this tab and the way back is one tab.
  *
  * A page that mounts it also takes `RESIZE_PARAM` off its address
  * (`useResizeParam`).
  */
-function ComputersDialogHost({ currentWorkspaceId = null, overSheet = false, planInPlace = false }: {
+// DALTON-HOOK(settings-reorg): subscribe to transitional computer SSE streams while acting as the fallback host
+function FallbackStatusFanout() {
+  useComputerStatusFanout();
+  return null;
+}
+
+function ComputersDialogHost({ currentWorkspaceId = null, overSheet = false, planInPlace = false, fallback = false }: {
   currentWorkspaceId?: string | null;
   overSheet?: boolean;
   planInPlace?: boolean;
+  fallback?: boolean;
 }) {
   const { t } = useTranslation();
   const locale = useLocale();
   const queryClient = useQueryClient();
-  useComputersHost(planInPlace);
+  useComputersHost(planInPlace, fallback);
   useResizeParam();
   // Change spec belongs to the page that opened it: left open, the next page
   // with a host (Settings, then a chat) would show it unasked.
@@ -179,6 +194,8 @@ function ComputersDialogHost({ currentWorkspaceId = null, overSheet = false, pla
 
   return (
     <>
+      {/* DALTON-HOOK(settings-reorg): keep transitional preparation/start streams alive on pages without ChatAgent */}
+      {fallback && <FallbackStatusFanout />}
       <ComputersDialog
         panel={panel}
         opening={opening}
@@ -187,6 +204,9 @@ function ComputersDialogHost({ currentWorkspaceId = null, overSheet = false, pla
         // Computers panel's place until it closes.
         covered={!!specTarget}
         currentWorkspaceId={currentWorkspaceId}
+        // Claude Code's view is a sheet where the page has one (Settings),
+        // and steps back for the panel as it does for Change spec.
+        stacked={overSheet && panel?.returnTo === 'claudeCode'}
       />
       <ChangeSpecDialog
         target={specTarget}

@@ -107,8 +107,9 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
   // From the slot models, so the fill never lands on a conversation-only
   // model (Claude Code); the user may still pick one.
   // DALTON-HOOK(dalton-setup): enforce curated 5 primary candidates & live catalog membership in Dalton builds; non-Dalton preserves upstream behavior
-  const curatedModels = filterDaltonCuratedModels(visibleModels, isDaltonBuild);
-  const curatedSlotModels = filterDaltonCuratedModels(visibleSlotModels, isDaltonBuild);
+  // DALTON-HOOK(standalone-core): pass runtime dalton_profile & metadata so Core unlocks BYOK/custom models
+  const curatedModels = filterDaltonCuratedModels(visibleModels, isDaltonBuild, { profile: rawApiResponse?.dalton_profile, metadata });
+  const curatedSlotModels = filterDaltonCuratedModels(visibleSlotModels, isDaltonBuild, { profile: rawApiResponse?.dalton_profile, metadata });
   const availablePrimary = Object.values(curatedModels).flatMap((p) => p.models ?? []);
   const fillable = Object.values(visibleSlotModels).flatMap((p) => p.models ?? []);
   const curatedSlotFillable = Object.values(curatedSlotModels).flatMap((p) => p.models ?? []);

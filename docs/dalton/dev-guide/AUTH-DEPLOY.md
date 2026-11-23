@@ -84,3 +84,11 @@
 - 邀请注册通过服务端 `SUPABASE_SECRET_KEY` 调用 Admin API（`email_confirm: true`）创建用户，无需开放公开注册，后端启动与鉴权时的 `/auth/v1/settings` fail-closed 安全检查保持不变。
 - 团队成员判定为 `DALTON_ALLOWED_EMAILS ∪ dalton_members`，原有环境变量白名单中的邮箱无需迁移即可继续使用。
 
+---
+
+## 7. 独立核心本地登录（`DALTON_AUTH_MODE=local`）同源部署约束
+
+- **仅支持前端与 API 同源部署**：`DALTON_AUTH_MODE=local` 使用 `HttpOnly; SameSite=Lax; Path=/api/v1/dalton/auth` 刷新 Cookie 并在刷新/登出接口强制校验请求 `Origin`，前端与 `/api/*`、`/ws/*` 必须经由同一反向代理（如 `edge` Caddy 网关）在同一源下提供服务。
+- **启动强校验**：后端启动执行 `validate_dalton_auth_config()` 时，若同时配置了前端地址（`DALTON_FRONTEND_URL` / `PUBLIC_APP_URL` / `FRONTEND_URL`）与 API 地址（`SERVER_BASE_URL` / `VITE_API_BASE_URL`）且二者协议、主机或有效端口不一致，将直接拒绝启动并报错。
+- **浏览器 WebSocket 短期票据**：本地登录模式下，浏览器端不再在 WebSocket URL 中传递访问 JWT，而是先调用 `POST /api/v1/dalton/auth/local/ws-ticket` 换取 60 秒有效的 HMAC 签名票据并通过 `?ticket=<ws_ticket>` 完成握手；反向代理访问日志需同时脱敏 `token` 与 `ticket` 查询参数。
+

@@ -22,12 +22,22 @@ VALID_ROLE_TIERS: frozenset[str] = frozenset({"admin", "internal", "external"})
 LAST_ADMIN_PROTECTED_DETAIL = (
     "Cannot demote or remove the last remaining administrator"
 )
+CREDENTIAL_HOLDER_PROTECTED_DETAIL = (
+    "Cannot demote or remove the current team credential holder; transfer credential holder first"
+)
 
 
 class LastAdminProtectedError(HTTPException):
     """Raised (HTTP 409) when a write would leave zero active administrators."""
 
     def __init__(self, detail: str = LAST_ADMIN_PROTECTED_DETAIL) -> None:
+        super().__init__(status_code=409, detail=detail)
+
+
+class CredentialHolderProtectedError(HTTPException):
+    """Raised (HTTP 409) when attempting to demote or remove the active credential holder."""
+
+    def __init__(self, detail: str = CREDENTIAL_HOLDER_PROTECTED_DETAIL) -> None:
         super().__init__(status_code=409, detail=detail)
 
 
@@ -117,6 +127,13 @@ async def set_user_role(
                 admin_ids = {str(r["user_id"]).strip() for r in admin_rows}
                 if uid in admin_ids and len(admin_ids) <= 1:
                     raise LastAdminProtectedError()
+                await cur.execute(
+                    "SELECT holder_user_id FROM dalton_credential_holder "
+                    "WHERE singleton_id = 1 FOR SHARE"
+                )
+                holder_row = await cur.fetchone()
+                if holder_row and str(holder_row.get("holder_user_id") or "").strip() == uid:
+                    raise CredentialHolderProtectedError()
 
             await cur.execute(
                 """
@@ -163,6 +180,13 @@ async def delete_user_role(user_id: str, *, conn: Any = None) -> bool:
             admin_ids = {str(r["user_id"]).strip() for r in admin_rows}
             if uid in admin_ids and len(admin_ids) <= 1:
                 raise LastAdminProtectedError()
+            await cur.execute(
+                "SELECT holder_user_id FROM dalton_credential_holder "
+                "WHERE singleton_id = 1 FOR SHARE"
+            )
+            holder_row = await cur.fetchone()
+            if holder_row and str(holder_row.get("holder_user_id") or "").strip() == uid:
+                raise CredentialHolderProtectedError()
 
             await cur.execute(
                 "DELETE FROM dalton_user_roles WHERE user_id = %s RETURNING user_id",

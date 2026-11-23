@@ -23,7 +23,11 @@ from fastapi import HTTPException, Request, WebSocket, WebSocketException, statu
 from fastapi.security import HTTPAuthorizationCredentials
 
 from src.dalton.auth.sessions import verify_local_session_active
-from src.dalton.auth.tokens import LocalAccessClaims, decode_local_access_token
+from src.dalton.auth.tokens import (
+    LocalAccessClaims,
+    decode_local_access_token,
+    verify_local_ws_ticket,
+)
 from src.dalton.company_identity import (
     is_company_system_user,
     reject_company_system_auth,
@@ -325,6 +329,17 @@ async def _verify_local_token_and_session(token: str) -> LocalAccessClaims:
     return claims
 
 
+async def _verify_local_ws_ticket_and_session(ticket: str) -> LocalAccessClaims:
+    """Verify a short-lived HMAC WebSocket ticket and its backing session row in Postgres."""
+    claims = verify_local_ws_ticket(ticket)
+    reject_company_system_auth(claims.user_id)
+    _refuse_holder(claims.user_id)
+    await verify_local_session_active(
+        user_id=claims.user_id, session_id=claims.session_id
+    )
+    return claims
+
+
 def is_service_token_rejected_by_dalton_auth(configured_token: str | None) -> bool:
     """Unified service-token policy for ``src/server/utils/api.py:_service_token_user_id``.
 
@@ -498,13 +513,16 @@ async def dispatch_oss_websocket(
         )
 
     token: str | None = None
+    ticket: str | None = None
     auth_header = websocket.headers.get("authorization", "")
     if auth_header.lower().startswith("bearer "):
         token = auth_header[7:].strip()
-    if not token and _allow_ws_query_token():
-        token = websocket.query_params.get("token")
-
     if not token:
+        ticket = (websocket.query_params.get("ticket") or "").strip() or None
+    if not token and not ticket and _allow_ws_query_token():
+        token = (websocket.query_params.get("token") or "").strip() or None
+
+    if not token and not ticket:
         await websocket.close(
             code=status.WS_1008_POLICY_VIOLATION, reason="Missing auth token"
         )
@@ -513,7 +531,10 @@ async def dispatch_oss_websocket(
         )
 
     try:
-        claims = await _verify_local_token_and_session(token)
+        if ticket is not None:
+            claims = await _verify_local_ws_ticket_and_session(ticket)
+        else:
+            claims = await _verify_local_token_and_session(token or "")
         if is_company_system_user(claims.user_id):
             raise HTTPException(status_code=401, detail="Invalid token")
         ws_state = getattr(websocket, "state", None)

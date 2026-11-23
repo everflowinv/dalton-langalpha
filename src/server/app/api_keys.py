@@ -223,7 +223,9 @@ async def get_api_keys(user_id: CurrentUserId):
     being used: they stay listed, to remove, and a turn runs as if they were
     not there. Null means the policy is unknown for now.
     """
-    return await _keys_view(user_id, await _get_custom_providers(user_id))
+    view = await _keys_view(user_id, await _get_custom_providers(user_id))
+    # DALTON-HOOK(standalone-core): attach recorded Core tool-calling probe verdicts per provider/model
+    return await __import__("src.dalton.llm.tool_probe", fromlist=["attach_tool_probe_results"]).attach_tool_probe_results(user_id, view)
 
 
 class UpdateApiKeysRequest(BaseModel):
@@ -263,17 +265,37 @@ class UpdateApiKeysRequest(BaseModel):
 
 async def _refuse_base_urls(
     base_urls: Dict[str, Optional[str]], *, user_id: str | None = None
-) -> None:
+) -> dict[str, str]:
     """Refuse, in platform mode, a base URL the server must not dial."""
+    del user_id
     from src.server.services.llm import egress
 
     if not egress.enforced():
-        return
-    # DALTON-HOOK(standalone-core): exempt administrator-configured team model endpoints in core local auth
-    from src.dalton.llm.egress_policy import is_admin_llm_egress_exempt
+        return {}
+    # DALTON-HOOK(standalone-core): enforce address-based egress rules (saved team base_url or operator allowlist only; never exempt by identity)
+    from src.dalton.llm.egress_policy import (
+        check_core_endpoint_refusal,
+        get_saved_team_endpoints,
+        is_core_llm_egress_enforced,
+    )
 
-    if await is_admin_llm_egress_exempt(user_id):
-        return
+    if is_core_llm_egress_enforced():
+        saved_team = await get_saved_team_endpoints()
+        resolved_classes: dict[str, str] = {}
+        for provider, url in base_urls.items():
+            if not url:
+                continue
+            reason, addr_class = await check_core_endpoint_refusal(
+                url, require_resolution=True, saved_team_endpoints=saved_team
+            )
+            if reason:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Base URL for {provider} cannot be used: {reason}",
+                )
+            if addr_class in ("public", "private"):
+                resolved_classes[url] = addr_class
+        return resolved_classes
     reasons = await egress.save_refusals(base_urls.values())
     for provider, url in base_urls.items():
         if url and reasons[url]:
@@ -281,6 +303,7 @@ async def _refuse_base_urls(
                 status_code=400,
                 detail=f"Base URL for {provider} cannot be used: {reasons[url]}",
             )
+    return {}
 
 
 def _get_allowed_providers(custom_providers: list) -> set[str]:
@@ -341,9 +364,10 @@ async def update_api_keys(body: UpdateApiKeysRequest, user_id: CurrentUserId):
                 status_code=400,
                 detail=f"Unsupported provider: {provider}.",
             )
+    resolved_url_classes: dict[str, str] = {}
     if body.base_urls:
-        # DALTON-HOOK(standalone-core): pass caller user_id so admin team-model saves bypass member egress block
-        await _refuse_base_urls(body.base_urls, user_id=user_id)
+        # DALTON-HOOK(standalone-core): check base URLs by address rules and capture resolved address class for team URL pinning
+        resolved_url_classes = await _refuse_base_urls(body.base_urls, user_id=user_id) or {}
 
     # All or nothing, so a failed write leaves the keys as they were.
     redirected: list[str] = []
@@ -378,6 +402,12 @@ async def update_api_keys(body: UpdateApiKeysRequest, user_id: CurrentUserId):
                 # Update base_url on existing key row
                 if await update_base_url(user_id, provider, url, conn=conn):
                     redirected.append(provider)
+
+        # DALTON-HOOK(standalone-core): persist resolved address class (public/private) for saved team base_urls
+        if resolved_url_classes:
+            from src.dalton.llm.egress_policy import record_saved_team_base_url_classes
+
+            await record_saved_team_base_url_classes(resolved_url_classes, conn=conn)
 
     # Invalidate cached BYOK status so the next chat picks up key changes
     await invalidate_byok_cache(user_id)
@@ -442,6 +472,9 @@ class TestApiKeyRequest(BaseModel):
     provider: str
     api_key: str = ""
     base_url: Optional[str] = None
+    # DALTON-HOOK(standalone-core): optional model id(s) for Core structured tool-calling probe
+    model: Optional[str] = None
+    models: Optional[list[str]] = None
 
     @field_validator("api_key")
     @classmethod
@@ -459,13 +492,10 @@ async def _user_endpoint_transport(
 ):
     """The transport a request to a user's endpoint goes out on; a URL the
     egress policy refuses is a 400."""
+    del user_id
     from src.server.services.llm import egress
 
-    # DALTON-HOOK(standalone-core): exempt administrator team-model probes/discovery in core local auth
-    from src.dalton.llm.egress_policy import is_admin_llm_egress_exempt
-
-    if await is_admin_llm_egress_exempt(user_id):
-        return None
+    # DALTON-HOOK(standalone-core): address-based egress transport (never exempt by admin identity)
     try:
         return await egress.user_endpoint_transport(base_url)
     except EndpointRefused as e:
@@ -512,9 +542,16 @@ async def test_api_key(body: TestApiKeyRequest, user_id: CurrentUserId):
         body.base_url or provider_info.get("base_url"), user_id=user_id
     )
     try:
-        return await key_probe.check_key(
-            body.provider, provider_info, body.api_key, body.base_url, transport=transport
-        )
+        # DALTON-HOOK(standalone-core): keep HeldTransport open across /models, key check, and Core tool probe, closing once at end
+        _tp = __import__("src.dalton.llm.tool_probe", fromlist=["core_key_test_transport_scope", "core_key_probe_options", "probe_tool_calling_for_key_test"])
+        async with _tp.core_key_test_transport_scope(transport) as scoped_transport:
+            core_probe_opts = _tp.core_key_probe_options(body.model, body.models, provider_info, custom)
+            result = await key_probe.check_key(
+                body.provider, provider_info, body.api_key, body.base_url, transport=scoped_transport, **core_probe_opts
+            )
+            return await _tp.probe_tool_calling_for_key_test(
+                user_id=user_id, provider=body.provider, provider_info=provider_info, api_key=body.api_key, base_url=body.base_url, check_result=result, model=body.model, models=body.models, custom_provider_entry=custom, transport=scoped_transport,
+            )
     except key_probe.ProbeTimedOut:
         raise HTTPException(
             status_code=504,
@@ -741,7 +778,10 @@ async def list_models():
             }
             for provider, model_list in models.items()
         },
-        "model_metadata": config.get_model_metadata(),
+        # DALTON-HOOK(standalone-core): mark text-only models so core setup excludes non-tool models
+        "model_metadata": __import__(
+            "src.dalton.llm.role_policy", fromlist=["annotate_model_metadata_tool_calling"]
+        ).annotate_model_metadata_tool_calling(config.get_model_metadata()),
         "system_defaults": {
             # One source with the default-model reassignment on preference
             # writes, so "threads on the old default" means what the composer showed.
@@ -774,4 +814,8 @@ async def list_models():
         "antigravity_series": __import__(
             "src.dalton.llm.antigravity_series", fromlist=["build_antigravity_series_catalog"]
         ).build_antigravity_series_catalog(config),
+        # DALTON-HOOK(standalone-core): expose deployment profile (everflow vs core) for setup wizard gating
+        "dalton_profile": __import__(
+            "src.dalton.profile", fromlist=["resolve_profile"]
+        ).resolve_profile().value,
     }

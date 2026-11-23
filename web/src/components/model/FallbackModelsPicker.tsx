@@ -327,7 +327,7 @@ export function FallbackModelsPicker({
                   return (
                     <div
                       key={selectable.seriesId}
-                      className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-md text-xs"
+                      className="flex items-center justify-between gap-2 px-2 row-inset rounded-md text-xs"
                       style={{
                         backgroundColor: anySelected ? "var(--color-accent-soft)" : "transparent",
                       }}

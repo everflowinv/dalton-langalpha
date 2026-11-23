@@ -23,22 +23,28 @@ from src.dalton.database.coverage_units import (
     _require_ws_write,
     compute_unit_action_flags,
     get_coverage_unit,
+    is_coverage_multiuser_auth_enabled,
     load_active_units_by_workspace,
 )
 from src.dalton.invites import is_invite_pm
 from src.dalton.settings import (
     is_dalton_local_auth_enabled,
-    is_dalton_supabase_auth_enabled,
+    is_dalton_supabase_auth_enabled as _default_is_dalton_supabase_auth_enabled,
 )
 from src.server.database.home_workspace import is_reserved_row
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
+# Preserved as a module attribute so Everflow unit tests that monkeypatch
+# `units_view.is_dalton_supabase_auth_enabled` continue to work unchanged.
+is_dalton_supabase_auth_enabled = _default_is_dalton_supabase_auth_enabled
 
 
 def _is_multiuser_auth_enabled() -> bool:
-    """Return True when Dalton multi-user auth (``local`` or ``supabase``) is enabled."""
-    return is_dalton_local_auth_enabled() or is_dalton_supabase_auth_enabled()
+    """Delegate to the single-source predicate shared with ``coverage_units._require_ws_write``."""
+    if is_dalton_supabase_auth_enabled is not _default_is_dalton_supabase_auth_enabled:
+        return bool(is_dalton_supabase_auth_enabled()) or is_dalton_local_auth_enabled()
+    return is_coverage_multiuser_auth_enabled()
 
 
 async def _is_coverage_pm(user_id: str | None) -> bool:

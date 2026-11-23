@@ -19,6 +19,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from src.config.settings import HOST_MODE, LOCAL_DEV_USER_ID
 from src.observability.private_errors import failure
+from src.server.auth import owner_requests
 from src.server.auth.jwt_bearer import _decode_token
 
 # Type variable for generic return type preservation
@@ -185,9 +186,17 @@ async def get_user_id_any_state(
         return resolved
 
     if HOST_MODE == "oss":
-        # DALTON-HOOK(standalone-core): dispatch OSS/local auth mode; only explicit oss returns local-dev-user
+        # DALTON-HOOK(standalone-core): dispatch local/invalid Dalton auth modes before upstream OSS owner check
         from src.dalton.auth.dispatch import dispatch_oss_user_id
-        return await dispatch_oss_user_id(request, credentials, local_dev_user_id=LOCAL_DEV_USER_ID)
+        from src.dalton.settings import get_dalton_auth_mode
+
+        if get_dalton_auth_mode() != "oss":
+            return await dispatch_oss_user_id(request, credentials, local_dev_user_id=LOCAL_DEV_USER_ID)
+        owner_requests.refuse_unless_owner(request.scope)
+        # DALTON-HOOK(company-automations): refuse company system identity even in local OSS mode
+        reject_company_system_auth(LOCAL_DEV_USER_ID)
+        note_caller(request, LOCAL_DEV_USER_ID, "session")
+        return LOCAL_DEV_USER_ID
 
     if credentials is None:
         raise HTTPException(status_code=401, detail="Missing authentication")
@@ -272,9 +281,23 @@ async def get_optional_user_id(
             reject_company_system_auth(user_id)
             refuse_holder_credential(user_id)
         elif HOST_MODE == "oss":
-            # DALTON-HOOK(standalone-core): dispatch optional auth in OSS/local mode (absent -> None, invalid -> 401)
+            # DALTON-HOOK(standalone-core): dispatch local/invalid Dalton auth modes before upstream OSS owner check
             from src.dalton.auth.dispatch import dispatch_oss_optional_user_id
-            user_id = await dispatch_oss_optional_user_id(request, credentials, local_dev_user_id=LOCAL_DEV_USER_ID)
+            from src.dalton.settings import get_dalton_auth_mode
+
+            if get_dalton_auth_mode() != "oss":
+                user_id = await dispatch_oss_optional_user_id(
+                    request, credentials, local_dev_user_id=LOCAL_DEV_USER_ID
+                )
+            elif owner_requests.is_owner(request.scope):
+                reject_company_system_auth(LOCAL_DEV_USER_ID)
+                user_id = LOCAL_DEV_USER_ID
+            elif credentials is None:
+                return None
+            else:
+                user_id = (await _decode_token(credentials.credentials)).user_id
+                reject_company_system_auth(user_id)
+                refuse_holder_credential(user_id)
         elif credentials is None:
             return None
         else:

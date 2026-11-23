@@ -8,6 +8,7 @@ import { useTranslation } from 'react-i18next';
 import { AlertCircle, Cloud, House, Laptop, Lock } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
+import { ToggleSwitch } from '@/components/ui/switch';
 import { cn } from '@/lib/utils';
 import type { Computer, ComputerStartFailure } from '@/types/api';
 
@@ -59,6 +60,31 @@ export interface MachineActions {
   removeClaudeCodeToken: () => void;
 }
 
+/** The pills for what a machine is to the account: its primary, or Home's stand-in. */
+export function RolePills({ computer }: { computer: Computer }) {
+  const { t } = useTranslation();
+  return (
+    <>
+      {computer.is_primary && (
+        <Pill icon={House} title={t('computer.primaryBadgeTitle', 'New workspaces are created on this computer')}>
+          {t('computer.primaryBadge', 'Primary')}
+        </Pill>
+      )}
+      {computer.stands_in_for_home && (
+        <Pill
+          icon={Cloud}
+          title={t(
+            'computer.standInBadgeTitle',
+            "The Chief of Staff works here while your primary computer can't be reached, so this computer stays even with no workspaces. You can still remove it.",
+          )}
+        >
+          {t('computer.standInBadge', 'Stands in for Home')}
+        </Pill>
+      )}
+    </>
+  );
+}
+
 interface MachineFrameProps {
   computer: Computer;
   index: number;
@@ -94,22 +120,7 @@ export function MachineFrame({ computer, index, thisMac, inert, onOpen }: Machin
       br={
         (computer.is_primary || computer.stands_in_for_home || thisMac) && (
           <>
-            {computer.is_primary && (
-              <Pill icon={House} title={t('computer.primaryBadgeTitle', 'New workspaces are created on this computer')}>
-                {t('computer.primaryBadge', 'Primary')}
-              </Pill>
-            )}
-            {computer.stands_in_for_home && (
-              <Pill
-                icon={Cloud}
-                title={t(
-                  'computer.standInBadgeTitle',
-                  "The Chief of Staff works here while your primary computer can't be reached, so this computer stays even with no workspaces. You can still remove it.",
-                )}
-              >
-                {t('computer.standInBadge', 'Stands in for Home')}
-              </Pill>
-            )}
+            <RolePills computer={computer} />
             {thisMac && <Pill icon={Laptop}>{t('computer.remoteControl.thisMacBadge', 'This Mac')}</Pill>}
           </>
         )
@@ -322,6 +333,53 @@ export function PowerButton({ computer, actions }: { computer: Computer; actions
     >
       {t('computer.start', 'Start')}
     </Button>
+  );
+}
+
+interface ToggleRowProps {
+  label: string;
+  checked: boolean;
+  onChange: () => void;
+  disabled?: boolean;
+  /** The line that explains the switch, read with it. */
+  describedBy?: string;
+}
+
+/** A switch as a label and value row of a `computer-card-spec` list. */
+export function ToggleRow({ label, checked, onChange, disabled, describedBy }: ToggleRowProps) {
+  return (
+    <div>
+      <dt>{label}</dt>
+      <dd>
+        <ToggleSwitch
+          checked={checked}
+          onChange={onChange}
+          disabled={disabled}
+          ariaLabel={label}
+          ariaDescribedBy={describedBy}
+        />
+      </dd>
+    </div>
+  );
+}
+
+/** One setting of the computer's, as a section of the details: its switch,
+ *  the hint under it, and anything that goes with it after. */
+export function SettingToggle({ label, checked, onChange, disabled, hint, children }: Omit<ToggleRowProps, 'describedBy'> & {
+  hint: ReactNode;
+  children?: ReactNode;
+}) {
+  const hintId = useId();
+  return (
+    <section className="computer-details-group">
+      <dl className="computer-card-spec mt-0">
+        <ToggleRow label={label} checked={checked} onChange={onChange} disabled={disabled} describedBy={hintId} />
+      </dl>
+      <p id={hintId} className="mt-1.5 text-[12px]" style={{ color: 'var(--color-text-secondary)' }}>
+        {hint}
+      </p>
+      {children}
+    </section>
   );
 }
 

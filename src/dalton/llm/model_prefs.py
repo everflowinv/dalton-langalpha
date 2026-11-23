@@ -18,6 +18,7 @@ import re
 from typing import Any, TypeVar
 
 from src.dalton.credentials import get_team_credential_holder_id
+from src.dalton.profile import is_core_profile
 from src.dalton.settings import get_assist_fallback_models, get_dalton_settings
 from src.llms.preferences import TuningError
 from src.server.database.user import get_user_preferences
@@ -413,7 +414,13 @@ async def dalton_model_pref(user_id: str | None, key: str) -> Any:
 async def resolve_dalton_audit_model(user_id: str | None = None) -> str:
     """Resolve the figure audit primary model for ``user_id`` (empty string if unconfigured)."""
     val = await dalton_model_pref(user_id, "dalton_audit_model")
-    return str(val).strip() if isinstance(val, str) else ""
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    if is_core_profile():
+        from src.dalton.llm.role_policy import resolve_effective_role_model
+
+        return await resolve_effective_role_model(role="audit", user_id=user_id)
+    return ""
 
 
 async def resolve_dalton_audit_fallback_models(user_id: str | None = None) -> list[str]:
@@ -433,13 +440,25 @@ async def resolve_dalton_audit_timeout_s(user_id: str | None = None) -> int | fl
 async def resolve_dalton_language_model(user_id: str | None = None) -> str:
     """Resolve the language-review model for ``user_id`` (empty string if unconfigured)."""
     val = await dalton_model_pref(user_id, "dalton_language_model")
-    return str(val).strip() if isinstance(val, str) else ""
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    if is_core_profile():
+        from src.dalton.llm.role_policy import resolve_effective_role_model
+
+        return await resolve_effective_role_model(role="language", user_id=user_id)
+    return ""
 
 
 async def resolve_dalton_assist_model(user_id: str | None = None) -> str:
     """Resolve the auxiliary JSON task (assist) primary model for ``user_id``."""
     val = await dalton_model_pref(user_id, "dalton_assist_model")
-    return str(val).strip() if isinstance(val, str) else ""
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    if is_core_profile():
+        from src.dalton.llm.role_policy import resolve_effective_role_model
+
+        return await resolve_effective_role_model(role="assist", user_id=user_id)
+    return ""
 
 
 async def resolve_dalton_assist_fallback_models(user_id: str | None = None) -> list[str]:
@@ -457,7 +476,13 @@ async def resolve_dalton_reviewer_models(user_id: str | None = None) -> list[str
 async def resolve_dalton_extract_model(user_id: str | None = None) -> str:
     """Resolve the conversation archive extraction model for ``user_id``."""
     val = await dalton_model_pref(user_id, "dalton_extract_model")
-    return str(val).strip() if isinstance(val, str) else ""
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    if is_core_profile():
+        from src.dalton.llm.role_policy import resolve_effective_role_model
+
+        return await resolve_effective_role_model(role="extract", user_id=user_id)
+    return ""
 
 
 async def resolve_dalton_notify_enabled(user_id: str | None = None) -> bool:

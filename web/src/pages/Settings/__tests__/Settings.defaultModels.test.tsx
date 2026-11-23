@@ -199,6 +199,7 @@ vi.mock('@/config/daltonAuth', () => ({
   get isDaltonAuth() {
     return h.daltonAuth;
   },
+  // DALTON-HOOK(standalone-core): default local auth flag off in Settings defaultModels tests
   isDaltonLocalAuth: false,
   get isDaltonSupabaseAuth() {
     return h.daltonAuth;

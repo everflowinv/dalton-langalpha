@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
 from src.dalton.auth.bootstrap import bootstrap_first_admin, get_bootstrap_status
+from src.dalton.auth.dispatch import _read_local_session_from_request
 from src.dalton.auth.sessions import (
     authenticate_local_login,
     change_local_password,
@@ -26,6 +27,7 @@ from src.dalton.auth.sessions import (
 from src.dalton.auth.tokens import (
     REFRESH_COOKIE_NAME,
     clear_refresh_cookie,
+    issue_local_ws_ticket,
     set_refresh_cookie,
     verify_cookie_csrf_origin,
 )
@@ -189,6 +191,28 @@ async def local_change_password(
     return {
         "status": "password_changed",
         "sessions_revoked": revoked_count,
+    }
+
+
+@local_auth_router.post("/ws-ticket")
+async def local_ws_ticket(
+    request: Request,
+    user_id: CurrentUserId,
+) -> dict[str, object]:
+    """Mint a 60-second HMAC-signed WebSocket handshake ticket bound to the caller's active session."""
+    session_id = _read_local_session_from_request(request)
+    if not session_id:
+        raise HTTPException(
+            status_code=401,
+            detail="Active local session is required to issue a WebSocket ticket",
+        )
+    ticket, expires_in = issue_local_ws_ticket(
+        user_id=user_id,
+        session_id=session_id,
+    )
+    return {
+        "ticket": ticket,
+        "expires_in": expires_in,
     }
 
 

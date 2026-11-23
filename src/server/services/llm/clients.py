@@ -194,20 +194,38 @@ async def _egress_kwargs(
     so the user is told why instead of a call failing. So are Vertex keys in the
     parameters, even beside an operator's endpoint, which they would replace.
     """
+    del user_id, team_base_url
     from . import egress
 
     if not egress.enforced():
         return {}
-    # DALTON-HOOK(standalone-core): exempt admin-configured team models in core local auth
+    # DALTON-HOOK(standalone-core): enforce address-based egress rules, DNS pinning (locked to saved class for team URLs), and no-redirect on ALL model requests in core local auth
     from src.dalton.llm.egress_policy import (
-        is_admin_llm_egress_exempt,
-        is_team_shared_base_url_exempt,
+        check_core_endpoint_refusal,
+        get_saved_team_endpoints,
+        is_core_llm_egress_enforced,
     )
 
-    if await is_admin_llm_egress_exempt(user_id):
-        return {}
-    effective_base_url = None if (team_base_url and is_team_shared_base_url_exempt()) else base_url
-    urls = egress.user_endpoints(effective_base_url, params)
+    if is_core_llm_egress_enforced():
+        for key in (*egress.connection_params(params), *egress.vertex_params(params)):
+            raise egress._model_refusal(
+                f"Model '{model_name}' cannot be used: parameters.{key} cannot be set. Remove it."
+            )
+        saved_team = await get_saved_team_endpoints()
+        candidate_urls = [u for u in (base_url, *egress.parameter_urls(params)) if u]
+        for url in dict.fromkeys(candidate_urls):
+            reason, _ = await check_core_endpoint_refusal(
+                url,
+                require_resolution=False,
+                saved_team_endpoints=saved_team,
+            )
+            if reason:
+                raise egress._model_refusal(
+                    f"The base URL for model '{model_name}' cannot be used: {reason}"
+                )
+        return {"egress_transport": egress.core_sdk_transport_factory(saved_team)}
+
+    urls = egress.user_endpoints(base_url, params)
     await egress.refuse_model_endpoints(model_name, urls, params)
     if not urls and not egress.connection_params(params):
         return {}
@@ -563,6 +581,8 @@ async def resolve_oauth_llm_client(
             reasoning_effort=reasoning_effort,
             cache_key=cache_key,
             **_tier_kwargs(service_tier, provider),
+            # DALTON-HOOK(standalone-core): enforce no-redirect pinned transport on all model requests in core local auth
+            **await _egress_kwargs(model_name, None),
         )
     # DALTON-HOOK(oauth-dispatch): remember how the client was built, so a 401 mid-turn
     # (token outlived by a long turn) can rebuild it with a fresh token
@@ -684,6 +704,8 @@ async def resolve_model_client(
             client = create_llm(
                 model_name, reasoning_effort=reasoning_effort, cache_key=cache_key,
                 **_tier_kwargs(service_tier, entry.get("provider")),
+                # DALTON-HOOK(standalone-core): enforce no-redirect pinned transport on all model requests in core local auth
+                **await _egress_kwargs(model_name, None),
             )
         except MissingProviderKeyError as exc:
             # Built eagerly only because an effort was asked for. Without a

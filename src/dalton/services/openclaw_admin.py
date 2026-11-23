@@ -31,6 +31,8 @@ DOCKER_MANIFEST_WATCHED_PATHS: tuple[str, ...] = (
     "config.dalton.yaml",
     "agent_config.yaml",
     "agent_config.dalton.yaml",
+    "config.core.yaml",
+    "agent_config.core.yaml",
     "alembic.ini",
     "config/dalton",
     "libs/market-protocol",

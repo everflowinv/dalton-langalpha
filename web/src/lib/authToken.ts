@@ -312,8 +312,13 @@ async function renewLocalFromCookie(
       localAuthExpiredHandler?.();
       return null;
     }
-    const uid = parseJwtSubject(refreshed.access_token) ?? startedFor;
-    publishLocalToken(refreshed.access_token, uid, refreshed.expires_in);
+    const parsedSub = parseJwtSubject(refreshed.access_token);
+    if (!parsedSub || (startedFor !== null && parsedSub !== startedFor)) {
+      clearAuthToken();
+      localAuthExpiredHandler?.();
+      return null;
+    }
+    publishLocalToken(refreshed.access_token, parsedSub, refreshed.expires_in);
     lastRenewAt = Date.now();
     return tokenIfStill(startedFor);
   } catch {

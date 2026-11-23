@@ -1,18 +1,36 @@
 // DALTON-HOOK(dalton-setup): unit tests for Dalton setup candidate list and background defaults
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  applyDaltonProviderToolProbes,
   DALTON_BACKGROUND_MODEL,
   DALTON_BACKGROUND_SERIES,
   DALTON_DEFAULT_MODEL,
   DALTON_SETUP_CANDIDATES,
   filterDaltonCuratedModels,
+  getDaltonModelStepConfig,
   hasAvailableDaltonModels,
+  isCoreDaltonProfile,
+  isDaltonAllowedModel,
+  isDaltonAllowedSystemBackground,
+  isDaltonCuratedOnly,
+  isDaltonSetupProviderAllowed,
+  isDaltonToolCallingConfirmed,
+  isDaltonToolCallingUnverified,
+  pickDaltonConnectedDefault,
+  resolveDaltonConfirmedSetupModels,
+  resolveDaltonProfile,
+  resolveDaltonRecommendedBackground,
   resolveDaltonSeriesDefaultModel,
   resolveDaltonSetupCandidates,
+  resolveDaltonSetupModels,
 } from '@/config/daltonSetup';
 import { buildSeriesCatalog } from '@/lib/antigravitySeries';
 import { defaultChoices } from '../defaultChoices';
 import { DALTON_CURATED_PROVIDERS } from '../setupSteps';
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 describe('daltonSetup candidate list & background defaults', () => {
   it('uses neon-high as default and hydrogen-low as recommended background', () => {
@@ -244,5 +262,340 @@ describe('daltonSetup candidate list & background defaults', () => {
     expect(DALTON_CURATED_PROVIDERS.has('openai')).toBe(false);
     expect(DALTON_CURATED_PROVIDERS.has('xai-oauth')).toBe(false);
     expect(DALTON_CURATED_PROVIDERS.has('muse-oauth')).toBe(false);
+  });
+});
+
+// DALTON-HOOK(standalone-core): profile-aware setup unlocking (Core vs Everflow)
+describe('standalone-core profile gating in daltonSetup', () => {
+  it('resolves deployment profile from runtime field with VITE_DALTON_PROFILE fallback (never from brand)', () => {
+    vi.stubEnv('VITE_DALTON_PROFILE', '');
+    expect(resolveDaltonProfile()).toBe('everflow');
+    expect(isCoreDaltonProfile()).toBe(false);
+    expect(isDaltonCuratedOnly(true)).toBe(true);
+    expect(isDaltonSetupProviderAllowed('openai', DALTON_CURATED_PROVIDERS)).toBe(false);
+
+    expect(resolveDaltonProfile('core')).toBe('core');
+    expect(isCoreDaltonProfile('core')).toBe(true);
+    expect(isDaltonCuratedOnly(true, 'core')).toBe(false);
+    expect(isDaltonSetupProviderAllowed('openai', DALTON_CURATED_PROVIDERS, 'core')).toBe(true);
+    expect(isDaltonSetupProviderAllowed('my-gateway', DALTON_CURATED_PROVIDERS, 'core')).toBe(true);
+
+    // Build-time fallback when runtime dalton_profile is omitted.
+    vi.stubEnv('VITE_DALTON_PROFILE', 'core');
+    expect(resolveDaltonProfile()).toBe('core');
+    expect(isCoreDaltonProfile()).toBe(true);
+    // Explicit runtime 'everflow' overrides build-time env.
+    expect(resolveDaltonProfile('everflow')).toBe('everflow');
+    expect(isCoreDaltonProfile('everflow')).toBe(false);
+  });
+
+  it('unlocks connected BYOK and custom OpenAI-compatible tool-calling models in Core when curated 5 are absent, and never auto-selects unverified models', () => {
+    const groups = {
+      openai: { display_name: 'OpenAI', models: ['gpt-5-mini', 'gpt-5', 'o1-text-only'] },
+      'acme-gateway': { display_name: 'Acme Gateway', models: ['acme-custom-v1'] },
+    };
+    const meta = {
+      'gpt-5': { provider: 'openai', intelligence: 5, speed: 3, tool_calling: true },
+      'gpt-5-mini': { provider: 'openai', intelligence: 3, speed: 5, tool_calling: true },
+      'o1-text-only': { provider: 'openai', intelligence: 5, speed: 4, tool_calling: false },
+      'acme-custom-v1': { provider: 'acme-gateway', is_custom_model: true }, // unverified (tool_calling omitted)
+    };
+    const payers = {
+      'gpt-5': 'own_key' as const,
+      'gpt-5-mini': 'own_key' as const,
+      'o1-text-only': 'own_key' as const,
+      'acme-custom-v1': 'own_key' as const,
+    };
+
+    // Everflow: stays empty / unavailable.
+    expect(filterDaltonCuratedModels(groups, true, { profile: 'everflow', metadata: meta })).toEqual({});
+    expect(hasAvailableDaltonModels(groups, meta, payers, true, undefined, 'everflow')).toBe(false);
+    expect(pickDaltonConnectedDefault(['gpt-5', 'acme-custom-v1'], meta, 'everflow')).toBeNull();
+
+    // Core: exposes confirmed models ahead of unverified models (excluding text-only),
+    // and auto-selects only confirmed tool-calling models.
+    const filteredCore = filterDaltonCuratedModels(groups, true, { profile: 'core', metadata: meta });
+    expect(Object.keys(filteredCore)).toEqual(['openai', 'acme-gateway']);
+    expect(filteredCore.openai?.models).toEqual(['gpt-5', 'gpt-5-mini']);
+    expect(filteredCore['acme-gateway']?.models).toEqual(['acme-custom-v1']);
+    expect(hasAvailableDaltonModels(groups, meta, payers, true, undefined, 'core')).toBe(true);
+    expect(resolveDaltonSetupModels(['acme-custom-v1', 'gpt-5-mini', 'gpt-5', 'o1-text-only'], {
+      profile: 'core',
+      metadata: meta,
+    })).toEqual(['gpt-5', 'gpt-5-mini', 'acme-custom-v1']);
+    expect(resolveDaltonConfirmedSetupModels(['acme-custom-v1', 'gpt-5-mini', 'gpt-5', 'o1-text-only'], {
+      profile: 'core',
+      metadata: meta,
+    })).toEqual(['gpt-5', 'gpt-5-mini']);
+    expect(pickDaltonConnectedDefault(['acme-custom-v1', 'gpt-5-mini', 'gpt-5', 'o1-text-only'], meta, 'core')).toBe('gpt-5');
+
+    const choices = defaultChoices({
+      models: 'subscription_or_key',
+      offered: groups,
+      slotModels: ['gpt-5-mini', 'gpt-5', 'acme-custom-v1'],
+      payers,
+      ownProviders: ['openai', 'acme-gateway'],
+      metadata: meta,
+      customModels: [{ name: 'acme-custom-v1', model_id: 'corp-1', provider: 'acme-gateway' }],
+      connectionOf: (p) => p,
+      systemDefault: null,
+      systemBackground: null,
+      preferred: null,
+      dalton: true,
+      daltonProfile: 'core',
+    });
+    expect(choices.list).toEqual(['gpt-5', 'gpt-5-mini', 'acme-custom-v1']);
+    expect(choices.initial).toBe('gpt-5');
+    expect(choices.recommended).toEqual({
+      primary: 'gpt-5',
+      primaryWhy: 'strongest',
+      background: 'gpt-5-mini',
+      backgroundWhy: 'fastest',
+    });
+  });
+
+  it('lists unverified custom gateway models without auto-selecting them until probed, and promotes them once verified', () => {
+    const customGroups = {
+      'acme-gateway': { display_name: 'Acme Gateway', models: ['acme-custom-v1'] },
+    };
+    const unverifiedMeta = {
+      'acme-custom-v1': { provider: 'acme-gateway', model_id: 'corp-1', is_custom_model: true },
+    };
+    const customPayers = { 'acme-custom-v1': 'own_key' as const };
+    const customModels = [{ name: 'acme-custom-v1', model_id: 'corp-1', provider: 'acme-gateway' }];
+
+    // Unverified custom model is NOT treated as confirmed tool-calling and is NOT auto-selected.
+    expect(isDaltonToolCallingUnverified(unverifiedMeta['acme-custom-v1'])).toBe(true);
+    expect(isDaltonToolCallingConfirmed(unverifiedMeta['acme-custom-v1'])).toBe(false);
+    expect(hasAvailableDaltonModels(customGroups, unverifiedMeta, customPayers, true, undefined, 'core')).toBe(false);
+    expect(pickDaltonConnectedDefault(['acme-custom-v1'], unverifiedMeta, 'core')).toBeNull();
+    const unverifiedChoices = defaultChoices({
+      models: 'subscription_or_key',
+      offered: customGroups,
+      slotModels: ['acme-custom-v1'],
+      payers: customPayers,
+      ownProviders: ['acme-gateway'],
+      metadata: unverifiedMeta,
+      customModels,
+      connectionOf: (p) => p,
+      systemDefault: null,
+      systemBackground: null,
+      preferred: null,
+      dalton: true,
+      daltonProfile: 'core',
+    });
+    expect(unverifiedChoices.list).toEqual(['acme-custom-v1']);
+    expect(unverifiedChoices.initial).toBeNull();
+    expect(unverifiedChoices.recommended.primary).toBeNull();
+
+    // Once /api/v1/keys/test probe records per-model tool_calling_models, ONLY the probed model
+    // becomes confirmed while unprobed sibling models on the same provider remain unverified.
+    const twoCustomMeta = {
+      'acme-custom-v1': { provider: 'acme-gateway', model_id: 'corp-1', is_custom_model: true },
+      'acme-custom-v2': { provider: 'acme-gateway', model_id: 'corp-2', is_custom_model: true },
+    };
+    const twoCustomModels = [
+      { name: 'acme-custom-v1', model_id: 'corp-1', provider: 'acme-gateway' },
+      { name: 'acme-custom-v2', model_id: 'corp-2', provider: 'acme-gateway' },
+    ];
+    const probedMeta = applyDaltonProviderToolProbes(
+      twoCustomMeta,
+      [
+        {
+          provider: 'acme-gateway',
+          display_name: 'Acme Gateway',
+          access_type: 'api_key',
+          is_custom: true,
+          tool_calling_models: { 'corp-1': true },
+        },
+      ],
+      twoCustomModels,
+    );
+    expect(isDaltonToolCallingConfirmed(probedMeta['acme-custom-v1'])).toBe(true);
+    expect(isDaltonToolCallingUnverified(probedMeta['acme-custom-v2'])).toBe(true);
+    expect(hasAvailableDaltonModels(customGroups, probedMeta, customPayers, true, undefined, 'core')).toBe(true);
+    const verifiedChoices = defaultChoices({
+      models: 'subscription_or_key',
+      offered: customGroups,
+      slotModels: ['acme-custom-v1'],
+      payers: customPayers,
+      ownProviders: ['acme-gateway'],
+      metadata: probedMeta,
+      customModels,
+      connectionOf: (p) => p,
+      systemDefault: null,
+      systemBackground: null,
+      preferred: null,
+      dalton: true,
+      daltonProfile: 'core',
+    });
+    expect(verifiedChoices.list).toEqual(['acme-custom-v1']);
+    expect(verifiedChoices.initial).toBe('acme-custom-v1');
+    expect(verifiedChoices.recommended).toEqual({
+      primary: 'acme-custom-v1',
+      primaryWhy: null,
+      background: 'acme-custom-v1',
+      backgroundWhy: 'only',
+    });
+
+    // When the only connected model is explicitly text-only, Core excludes it completely.
+    const textOnlyGroups = { openai: { display_name: 'OpenAI', models: ['text-only-m'] } };
+    const textOnlyMeta = { 'text-only-m': { provider: 'openai', tool_calling: false } };
+    const textOnlyPayers = { 'text-only-m': 'own_key' as const };
+    expect(hasAvailableDaltonModels(textOnlyGroups, textOnlyMeta, textOnlyPayers, true, undefined, 'core')).toBe(false);
+    expect(filterDaltonCuratedModels(textOnlyGroups, true, { profile: 'core', metadata: textOnlyMeta })).toEqual({});
+  });
+
+  it('keeps curated candidates unchanged in Everflow even if metadata flags tool_calling=false, while Core filters and aligns list/recommended/background pools', () => {
+    const mixedGroups = {
+      openai: { display_name: 'OpenAI', models: ['gpt-5'] },
+      'codex-oauth': { display_name: 'Codex', models: ['gpt-6.2-sol-oauth'] },
+      'antigravity-oauth': { display_name: 'Antigravity', models: ['gemini-4-neon-high-oauth', 'gemini-4-hydrogen-low-oauth'] },
+    };
+    const meta = {
+      'gemini-4-neon-high-oauth': { provider: 'antigravity-oauth', tool_calling: true },
+      'gemini-4-hydrogen-low-oauth': { provider: 'antigravity-oauth', tool_calling: false },
+      'gpt-6.2-sol-oauth': { provider: 'codex-oauth', tool_calling: false },
+      'gpt-5': { provider: 'openai', tool_calling: true },
+    };
+    // Everflow preserves its original 5 curated rules (does not drop gpt-6.2-sol-oauth).
+    const efCurated = filterDaltonCuratedModels(mixedGroups, true, { profile: 'everflow', metadata: meta });
+    expect(Object.values(efCurated).flatMap((g) => g.models ?? [])).toEqual([
+      'gemini-4-neon-high-oauth',
+      'gpt-6.2-sol-oauth',
+    ]);
+
+    // Core drops tool_calling === false curated model and excludes tool_calling === false Hydrogen from background.
+    const coreCurated = filterDaltonCuratedModels(mixedGroups, true, { profile: 'core', metadata: meta });
+    expect(Object.keys(coreCurated)).toEqual(['antigravity-oauth']);
+    expect(Object.values(coreCurated).flatMap((g) => g.models ?? [])).toEqual(['gemini-4-neon-high-oauth']);
+
+    const coreChoices = defaultChoices({
+      models: 'subscription_or_key',
+      offered: mixedGroups,
+      slotModels: ['gemini-4-neon-high-oauth', 'gemini-4-hydrogen-low-oauth', 'gpt-5'],
+      payers: {
+        'gemini-4-neon-high-oauth': 'subscription:antigravity-oauth',
+        'gemini-4-hydrogen-low-oauth': 'subscription:antigravity-oauth',
+        'gpt-6.2-sol-oauth': 'subscription:codex-oauth',
+        'gpt-5': 'own_key',
+      },
+      ownProviders: ['antigravity-oauth', 'codex-oauth', 'openai'],
+      metadata: meta,
+      customModels: [],
+      connectionOf: (p) => p,
+      systemDefault: null,
+      systemBackground: null,
+      preferred: null,
+      dalton: true,
+      daltonProfile: 'core',
+    });
+    expect(coreChoices.recommended.background).not.toBe('gemini-4-hydrogen-low-oauth');
+    expect(coreChoices.list).toContain(coreChoices.initial);
+
+    // Core: when curated candidate has unknown tool_calling and custom model is verified,
+    // both displayed list and recommended/initial come from the SAME pool (verified custom model is listed & picked).
+    const unverifiedCuratedChoices = defaultChoices({
+      models: 'subscription_or_key',
+      offered: {
+        'antigravity-oauth': { models: ['gemini-4-neon-high-oauth'] },
+        'acme-gateway': { models: ['acme-verified'] },
+      },
+      slotModels: ['gemini-4-neon-high-oauth', 'acme-verified'],
+      payers: { 'gemini-4-neon-high-oauth': 'subscription:antigravity-oauth', 'acme-verified': 'own_key' },
+      ownProviders: ['antigravity-oauth', 'acme-gateway'],
+      metadata: {
+        'gemini-4-neon-high-oauth': { provider: 'antigravity-oauth' },
+        'acme-verified': { provider: 'acme-gateway', tool_calling: true },
+      },
+      customModels: [{ name: 'acme-verified', model_id: 'corp-1', provider: 'acme-gateway' }],
+      connectionOf: (p) => p,
+      systemDefault: null,
+      systemBackground: null,
+      preferred: null,
+      dalton: true,
+      daltonProfile: 'core',
+    });
+    expect(unverifiedCuratedChoices.list).toEqual(['acme-verified', 'gemini-4-neon-high-oauth']);
+    expect(unverifiedCuratedChoices.initial).toBe('acme-verified');
+    expect(unverifiedCuratedChoices.recommended.primary).toBe('acme-verified');
+    expect(unverifiedCuratedChoices.list).toContain(unverifiedCuratedChoices.recommended.primary);
+  });
+
+  it('computes ModelStep control configuration centrally via getDaltonModelStepConfig', () => {
+    const efCfg = getDaltonModelStepConfig({
+      dalton: true,
+      daltonProfile: 'everflow',
+      ownKeys: true,
+      configured: new Set(['openai']),
+      curatedProviders: DALTON_CURATED_PROVIDERS,
+    });
+    expect(efCfg.curatedOnly).toBe(true);
+    expect(efCfg.showPlanGroups).toBe(false);
+    expect(efCfg.showApiKeyLink).toBe(false);
+    expect(efCfg.allowedSignIns).toBe(DALTON_CURATED_PROVIDERS);
+    expect(efCfg.canContinue).toBe(false);
+
+    const coreCfg = getDaltonModelStepConfig({
+      dalton: true,
+      daltonProfile: 'core',
+      ownKeys: true,
+      configured: new Set(['openai']),
+      curatedProviders: DALTON_CURATED_PROVIDERS,
+    });
+    expect(coreCfg.curatedOnly).toBe(false);
+    expect(coreCfg.showPlanGroups).toBe(true);
+    expect(coreCfg.showApiKeyLink).toBe(true);
+    expect(coreCfg.allowedSignIns).toBeUndefined();
+    expect(coreCfg.canContinue).toBe(true);
+  });
+
+  it('matches per-model probe verdicts strictly by model_id even when model names and model_ids cross-collide', () => {
+    const collidingMeta = {
+      'alias-a': { provider: 'acme-gateway', model_id: 'corp-1', is_custom_model: true },
+      'corp-1': { provider: 'acme-gateway', model_id: 'corp-2', is_custom_model: true },
+    };
+    const collidingCustomModels = [
+      { name: 'alias-a', model_id: 'corp-1', provider: 'acme-gateway' },
+      { name: 'corp-1', model_id: 'corp-2', provider: 'acme-gateway' },
+    ];
+    const applied = applyDaltonProviderToolProbes(
+      collidingMeta,
+      [
+        {
+          provider: 'acme-gateway',
+          display_name: 'Acme Gateway',
+          access_type: 'api_key',
+          is_custom: true,
+          tool_calling_models: { 'corp-1': true },
+        },
+      ],
+      collidingCustomModels,
+    );
+    // Only alias-a (model_id=corp-1) is confirmed; corp-1 (model_id=corp-2) must stay unverified!
+    expect(isDaltonToolCallingConfirmed(applied['alias-a'])).toBe(true);
+    expect(isDaltonToolCallingUnverified(applied['corp-1'])).toBe(true);
+    expect(pickDaltonConnectedDefault(['corp-1'], applied, 'core')).toBeNull();
+    expect(pickDaltonConnectedDefault(['corp-1', 'alias-a'], applied, 'core')).toBe('alias-a');
+  });
+
+  it('requires confirmed tool-calling for Core deployment background and never auto-selects Auto when filtered background is null', () => {
+    const textOnlyBgMeta = { provider: 'openai', tool_calling: false };
+    const unverifiedBgMeta = { provider: 'openai' };
+    const verifiedBgMeta = { provider: 'openai', tool_calling: true };
+
+    // Core: deployment background requires tool_calling === true.
+    expect(isDaltonAllowedSystemBackground(textOnlyBgMeta, 'own_key', undefined, 'core')).toBe(false);
+    expect(isDaltonAllowedSystemBackground(unverifiedBgMeta, 'own_key', undefined, 'core')).toBe(false);
+    expect(isDaltonAllowedSystemBackground(verifiedBgMeta, 'own_key', undefined, 'core')).toBe(true);
+    // Core: when filtered recommended.background is null, do NOT fall back to __auto__.
+    expect(resolveDaltonRecommendedBackground(null, 'gpt-6-luna', '__auto__', true, 'core')).toBe('');
+    expect(resolveDaltonRecommendedBackground('gpt-6-luna', 'gpt-6-luna', '__auto__', true, 'core')).toBe('gpt-6-luna');
+
+    // Everflow: keeps exact original behavior.
+    expect(isDaltonAllowedSystemBackground(textOnlyBgMeta, 'own_key', undefined, 'everflow')).toBe(
+      isDaltonAllowedModel(textOnlyBgMeta, 'own_key', undefined),
+    );
+    expect(resolveDaltonRecommendedBackground(null, 'gemini-4-hydrogen-low-oauth', '__auto__', true, 'everflow')).toBe('__auto__');
   });
 });

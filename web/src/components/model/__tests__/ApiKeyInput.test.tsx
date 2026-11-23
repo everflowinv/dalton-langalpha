@@ -93,4 +93,22 @@ describe('ApiKeyInput', () => {
     expect(errorEl).toBeInTheDocument();
     expect(errorEl).toHaveTextContent('Please enter an API key');
   });
+
+  // DALTON-HOOK(standalone-core): show Core format/tool-probe hint returned by /api/v1/keys/test
+  it('displays tool_calling_hint when key test succeeds with a Responses format mismatch hint', async () => {
+    const hint = '网关只支持 Responses 接口，请在提供商设置里打开 Responses 格式';
+    const onTest = vi.fn().mockResolvedValue({
+      success: true,
+      model: 'resp-only-1',
+      latency_ms: 120,
+      tool_calling: null,
+      tool_calling_hint: hint,
+    });
+
+    render(<ApiKeyInput {...defaultProps} value="sk-resp1234567890" onTest={onTest} />);
+    fireEvent.click(screen.getByRole('button', { name: /test/i }));
+
+    const hintEl = await screen.findByTestId('api-key-test-hint');
+    expect(hintEl).toHaveTextContent(hint);
+  });
 });

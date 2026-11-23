@@ -39,11 +39,18 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.execute(
         """
-        UPDATE dalton_invites SET tier = 'internal' WHERE tier = 'admin';
+        UPDATE dalton_invites
+           SET revoked_at = NOW()
+         WHERE tier = 'admin'
+           AND used_at IS NULL
+           AND revoked_at IS NULL;
         ALTER TABLE dalton_invites
             DROP CONSTRAINT IF EXISTS ck_dalton_invites_tier;
         ALTER TABLE dalton_invites
             ADD CONSTRAINT ck_dalton_invites_tier
-            CHECK (tier IN ('internal', 'external'));
+            CHECK (
+                tier IN ('internal', 'external')
+                OR (tier = 'admin' AND (used_at IS NOT NULL OR revoked_at IS NOT NULL))
+            );
         """
     )

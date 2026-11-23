@@ -22,6 +22,8 @@ export interface ModelMetadataEntry {
   speed?: number;
   // DALTON-HOOK(llm-overlay): surface plain_language 1 to 5 rating from Dalton overlay; absent = not rated.
   plain_language?: number;
+  // DALTON-HOOK(standalone-core): false when the model is text-only and cannot invoke tools
+  tool_calling?: boolean;
   /** Numeric tier for platform-served access. Absent = 0. */
   tier?: number;
   /** OAuth-plan allowlist — the connected subscription's plan_type must be
@@ -47,6 +49,17 @@ export interface ModelMetadataEntry {
    *  of the models API's `task_cost_baseline`; "any" for a model measured
    *  without a level. Absent = never measured. */
   task_cost?: Record<string, TaskCost>;
+  /** For a model with no `task_cost`, its list price as a multiple of the
+   *  baseline model's, on the same scale. Absent = measured, or no price. */
+  task_cost_estimate?: number;
+  /** List price in USD per million tokens. Absent = no price known. */
+  pricing?: { input: number; output: number };
+}
+
+/** The model and level every `task_cost` figure is a multiple of. */
+export interface TaskCostBaseline {
+  model: string;
+  effort: string;
 }
 
 export interface TaskCost {
@@ -425,24 +438,40 @@ export function withCustomModels(
   const metadata: Record<string, ModelMetadataEntry> = { ...rawMetadata };
   for (const cm of customModels) {
     const sdk = sdkOf(cm.provider);
+    const shadowed = metadata[cm.name];
     const {
       display_name: _shadowedLabel,
       native_compaction: _shadowedNative,
+      pricing,
+      task_cost: measured,
+      task_cost_estimate: estimate,
+      // DALTON-HOOK(standalone-core): never inherit catalog tool_calling onto a custom model without explicit verification
+      tool_calling: _shadowedToolCalling,
       ...declared
-    } = metadata[cm.name] ?? {
+    } = shadowed ?? {
       provider: cm.provider,
       is_custom_model: true,
       ...(sdk ? { sdk } : {}),
       ...gatewayTuning(cm, rawMetadata, gateway),
     };
     const ladder = declaredLadder(cm);
+    // A price is its provider's, and so is a cost per task, measured or
+    // estimated: reached through another provider (a proxy, a reseller), the
+    // same model may cost anything, and another model id is another model.
+    const sameModel = !!shadowed && shadowed.provider === cm.provider
+      && (cm.model_id || cm.name) === (shadowed.model_id ?? cm.name);
     metadata[cm.name] = {
       ...declared,
+      ...(sameModel && pricing ? { pricing } : {}),
+      ...(sameModel && measured ? { task_cost: measured } : {}),
+      ...(sameModel && estimate !== undefined ? { task_cost_estimate: estimate } : {}),
       ...('efforts' in ladder ? { reasoning_efforts: ladder.efforts } : {}),
       ...('effortDefault' in ladder ? { reasoning_effort_default: ladder.effortDefault } : {}),
       ...('prompt_guidance' in cm ? { prompt_guidance: cm.prompt_guidance } : {}),
       ...('compaction_profile' in cm ? { compaction_profile: cm.compaction_profile } : {}),
       ...(cm.display_name ? { display_name: cm.display_name } : {}),
+      // DALTON-HOOK(standalone-core): preserve explicit/probed tool_calling on custom models
+      ...(typeof cm.tool_calling === 'boolean' ? { tool_calling: cm.tool_calling } : {}),
     };
   }
   return metadata;

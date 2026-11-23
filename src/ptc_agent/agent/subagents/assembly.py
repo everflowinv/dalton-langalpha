@@ -9,7 +9,7 @@ again on that model.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from ptc_agent.agent.context_stack import SubagentContext
@@ -39,7 +39,6 @@ def subagent_compiler(
     filesystem: list[Any],
     web: list[Any],
     finance: list[Any],
-    todo: list[Any],
     search_tool: Callable[..., Any],
     sandbox_tools: Callable[[frozenset[str]], list[Any]],
     turn_context: TurnContext | None,
@@ -54,6 +53,8 @@ def subagent_compiler(
     scratchpad: str | None,
     research_writing_enabled: bool = False,  # DALTON-HOOK(research-writing)
     model: str = "",
+    prompt_vars: Mapping[str, bool] | None = None,
+    shared: bool = False,
 ) -> SubagentCompiler:
     """What compiles the turn's subagents into the specs ``SubAgentMiddleware``
     takes (``create_subagents``), and one of them again on a model a Task
@@ -65,6 +66,10 @@ def subagent_compiler(
     each subagent's baseline narrows to what its definition reaches.
     ``skill_registry`` is the build's, less the skills no subagent gets.
     ``model`` is the turn's model label, stated by a subagent that runs it.
+    ``prompt_vars`` are the main agent's (``IdentityGates.prompt_vars``), so
+    a subagent's prompt points at no more of the person's own than the main
+    agent's does. ``shared`` is a shared workspace's build, whose baselines
+    name nobody (``SubagentContext``).
     """
     tool_sets: dict[str, list[Any]] = {
         "execute_code": [execute_code],
@@ -73,7 +78,9 @@ def subagent_compiler(
         "web_search": web,
         "finance": finance,
         "think": [think_tool],
-        "todo": todo,
+        # Binds nothing: the plan is the main agent's, and the name stays so
+        # an operator's subagent that still lists it is not an unknown set.
+        "todo": [],
     }
     return SubagentCompiler(
         sandbox=sandbox,
@@ -88,6 +95,7 @@ def subagent_compiler(
         project=project,
         search_tool=search_tool,
         sandbox_tools=sandbox_tools,
+        prompt_vars=prompt_vars,
         context=SubagentContext.build(
             turn_context=turn_context,
             user_profile=user_profile,
@@ -96,6 +104,7 @@ def subagent_compiler(
             skills=skills,
             scratchpad=scratchpad,
             model=model,
+            shared=shared,
         ),
         research_writing_enabled=research_writing_enabled,  # DALTON-HOOK(research-writing)
     )

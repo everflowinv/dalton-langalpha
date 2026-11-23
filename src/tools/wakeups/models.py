@@ -14,9 +14,12 @@ from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
 from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from src.tools.wakeups.wording import (
+    ORDER_TARGET_FIELDS,
     PRICE_PCT_FROM,
     TRIGGER_FIELDS,
+    TRIGGER_FIELDS_NO_TRADING,  # DALTON-HOOK(hide-trading)
     TRIGGER_MODEL_DOC,
+    TRIGGER_MODEL_DOC_NO_TRADING,  # DALTON-HOOK(hide-trading)
 )
 
 
@@ -43,6 +46,16 @@ class PriceTarget(BaseModel):
     )
 
 
+class OrderTarget(BaseModel):
+    """An order placed outside this conversation, such as in the user's own account."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(description=ORDER_TARGET_FIELDS["id"])
+    brokerage: str = Field(description=ORDER_TARGET_FIELDS["brokerage"])
+    account: str = Field(description=ORDER_TARGET_FIELDS["account"])
+
+
 _FIELD_TYPES = {
     "label": Optional[str],
     "at": Optional[str],
@@ -50,7 +63,7 @@ _FIELD_TYPES = {
     "until": Optional[str],
     "timezone": Optional[str],
     "price": Optional[PriceTarget],
-    "order": Optional[str],
+    "order": Optional[Union[str, OrderTarget]],
 }
 # A new wording key must come with a type, or the schema silently drops it.
 assert list(TRIGGER_FIELDS) == list(_FIELD_TYPES), list(TRIGGER_FIELDS)
@@ -81,6 +94,33 @@ class ScheduleWakeupArgs(BaseModel):
     """Arguments of `schedule_wakeup`; every one optional, none described."""
 
     triggers: Optional[list[WakeupTrigger]] = None  # type: ignore[valid-type]
+    cancel: Optional[Union[list[str], str]] = None
+    quiet: Optional[str] = None
+
+
+# DALTON-HOOK(hide-trading): trigger and argument schemas without order / OrderTarget when trading is closed
+WakeupTriggerNoTrading = create_model(
+    "WakeupTrigger",
+    __config__=ConfigDict(extra="forbid"),
+    __doc__=TRIGGER_MODEL_DOC_NO_TRADING,
+    **{
+        key: (
+            _FIELD_TYPES[key],
+            Field(
+                default=None,
+                description=TRIGGER_FIELDS_NO_TRADING[key],
+                **({"max_length": LABEL_MAX} if key == "label" else {}),
+            ),
+        )
+        for key in TRIGGER_FIELDS_NO_TRADING
+    },
+)
+
+
+class ScheduleWakeupArgsNoTrading(BaseModel):
+    """Arguments of `schedule_wakeup`; every one optional, none described."""
+
+    triggers: Optional[list[WakeupTriggerNoTrading]] = None  # type: ignore[valid-type]
     cancel: Optional[Union[list[str], str]] = None
     quiet: Optional[str] = None
 

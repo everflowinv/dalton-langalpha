@@ -158,6 +158,13 @@ class _WorkspaceAccessError(ValueError):
         self.unit_error_code = code
 
 
+def is_coverage_multiuser_auth_enabled() -> bool:
+    """Single-source multi-user auth predicate shared by coverage write enforcement and UI action flags."""
+    from src.dalton.settings import is_dalton_auth_enabled
+
+    return is_dalton_auth_enabled()
+
+
 async def _require_ws_write(
     ws_row: dict[str, Any],
     user_id: str,
@@ -167,7 +174,6 @@ async def _require_ws_write(
 ) -> None:
     """Enforce ``channel='web', need='write'`` inside a locked transaction."""
     from src.dalton.access_tiers import classify_owner_tier
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
     from src.dalton.sharing import require_workspace_access
     from src.server.database.home_workspace import is_reserved_row
 
@@ -183,10 +189,10 @@ async def _require_ws_write(
 
     ws_owner = str(ws_row.get("user_id") or "").strip()
     uid = str(user_id or "").strip()
-    supabase_auth = is_dalton_supabase_auth_enabled()
+    multiuser_auth = is_coverage_multiuser_auth_enabled()
 
-    if supabase_auth and ws_owner and ws_owner != uid:
-        owner_tier = await classify_owner_tier(ws_owner)
+    if multiuser_auth and ws_owner and ws_owner != uid:
+        owner_tier = await classify_owner_tier(ws_owner, conn=conn)
         if owner_tier == "unknown":
             raise _WorkspaceAccessError(
                 "workspace does not exist or is hidden", code="workspace_hidden"
@@ -197,7 +203,7 @@ async def _require_ws_write(
             )
 
     # Closed-auth deployments only allow the workspace owner (even explicit PM).
-    if is_pm and supabase_auth:
+    if is_pm and multiuser_auth:
         return
 
     try:
@@ -214,7 +220,7 @@ async def _require_ws_write(
             raise _WorkspaceAccessError(
                 "workspace does not exist or is hidden", code="workspace_hidden"
             ) from exc
-        if not supabase_auth and ws_owner and ws_owner != uid:
+        if not multiuser_auth and ws_owner and ws_owner != uid:
             raise _WorkspaceAccessError(
                 "workspace belongs to another user", code="workspace_not_owned"
             ) from exc

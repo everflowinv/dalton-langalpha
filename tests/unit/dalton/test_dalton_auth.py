@@ -72,6 +72,10 @@ def _make_request(headers: dict[str, str] | None = None) -> Request:
     req = create_autospec(Request, instance=True)
     req.__len__.return_value = 1
     req.headers = Headers(headers or {})
+    req.scope = {
+        "type": "http",
+        "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in (headers or {}).items()],
+    }
     return req
 
 
@@ -82,6 +86,10 @@ def _make_websocket(
     ws = create_autospec(WebSocket, instance=True)
     ws.headers = Headers(headers or {})
     ws.query_params = QueryParams(query or {})
+    ws.scope = {
+        "type": "websocket",
+        "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in (headers or {}).items()],
+    }
     return ws
 
 
@@ -144,8 +152,8 @@ class TestSwitchOffPreservesOssBehavior:
         req = _make_request()
         ws = _make_websocket()
 
-        assert await verify_jwt_token(credentials=None) == LOCAL_DEV_USER_ID
-        auth_info = await get_current_auth_info(credentials=None)
+        assert await verify_jwt_token(request=req, credentials=None) == LOCAL_DEV_USER_ID
+        auth_info = await get_current_auth_info(request=req, credentials=None)
         assert auth_info.user_id == LOCAL_DEV_USER_ID
         assert await get_current_user_id(request=req, credentials=None) == LOCAL_DEV_USER_ID
         assert await get_optional_user_id(request=req, credentials=None) == LOCAL_DEV_USER_ID
@@ -246,11 +254,11 @@ class TestSwitchOnDaltonSupabaseAuth:
         assert exc_info.value.status_code == 401
 
         with pytest.raises(HTTPException) as exc_info2:
-            await verify_jwt_token(credentials=None)
+            await verify_jwt_token(request=req, credentials=None)
         assert exc_info2.value.status_code == 401
 
         with pytest.raises(HTTPException) as exc_info3:
-            await get_current_auth_info(credentials=None)
+            await get_current_auth_info(request=req, credentials=None)
         assert exc_info3.value.status_code == 401
 
         # Optional user id returns None when credentials are omitted without invoking remote readiness check
@@ -259,6 +267,52 @@ class TestSwitchOnDaltonSupabaseAuth:
         assert await get_optional_user_id(request=req, credentials=None) is None
         assert await verify_dalton_optional_bearer(None) is None
         dalton_auth._fetch_supabase_auth_settings.assert_not_called()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_dalton_supabase_auth_disables_self_hosted_setup_routes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.server.app.deployment_setup import _owner_only
+        from src.server.services.setup_settings import self_hosted
+
+        # Under DALTON_AUTH_MODE=supabase (even with HOST_MODE=oss and no owner secret),
+        # self-hosted setup routes must not mount and _owner_only must fail closed (403).
+        monkeypatch.delenv("LANGALPHA_OWNER_SECRET", raising=False)
+        assert self_hosted() is False
+        with pytest.raises(HTTPException) as exc_info:
+            _owner_only(_make_request())
+        assert exc_info.value.status_code == 403
+
+        # Local accounts (the standalone core install) keep them off as well.
+        monkeypatch.setenv("DALTON_AUTH_MODE", "local")
+        assert self_hosted() is False
+        with pytest.raises(HTTPException) as exc_local:
+            _owner_only(_make_request())
+        assert exc_local.value.status_code == 403
+
+        # Any Dalton deployment (including APP_ENV=dalton + DALTON_AUTH_MODE=oss dev config)
+        # keeps upstream deployment setup routes disabled.
+        monkeypatch.setenv("APP_ENV", "dalton")
+        monkeypatch.setenv("DALTON_ENABLED", "1")
+        monkeypatch.setenv("DALTON_AUTH_MODE", "oss")
+        assert self_hosted() is False
+        with pytest.raises(HTTPException) as exc_dalton_oss:
+            _owner_only(_make_request())
+        assert exc_dalton_oss.value.status_code == 403
+
+        # Also when DALTON_AUTH_MODE is unset under a Dalton deployment.
+        monkeypatch.delenv("DALTON_AUTH_MODE", raising=False)
+        assert self_hosted() is False
+        with pytest.raises(HTTPException) as exc_dalton_unset:
+            _owner_only(_make_request())
+        assert exc_dalton_unset.value.status_code == 403
+
+        # Pure upstream OSS (Dalton disabled + oss auth mode) restores upstream self_hosted().
+        monkeypatch.setenv("APP_ENV", "")
+        monkeypatch.setenv("DALTON_ENABLED", "0")
+        monkeypatch.setenv("DALTON_AUTH_MODE", "oss")
+        assert self_hosted() is True
+        _owner_only(_make_request())
 
     @pytest.mark.asyncio
     async def test_invalid_token_returns_401(
@@ -321,8 +375,8 @@ class TestSwitchOnDaltonSupabaseAuth:
 
         assert await get_current_user_id(request=req, credentials=creds) == "user-uuid-42"
         assert await get_optional_user_id(request=req, credentials=creds) == "user-uuid-42"
-        assert await verify_jwt_token(credentials=creds) == "user-uuid-42"
-        info = await get_current_auth_info(credentials=creds)
+        assert await verify_jwt_token(request=req, credentials=creds) == "user-uuid-42"
+        info = await get_current_auth_info(request=req, credentials=creds)
         assert info.user_id == "user-uuid-42"
         assert getattr(info, "email", None) == "analyst1@dalton.org"
 
@@ -542,8 +596,8 @@ class TestSwitchOnDaltonSupabaseAuth:
         for call in (
             lambda: get_current_user_id(request=req, credentials=None),
             lambda: get_optional_user_id(request=req, credentials=creds),
-            lambda: verify_jwt_token(credentials=None),
-            lambda: get_current_auth_info(credentials=None),
+            lambda: verify_jwt_token(request=req, credentials=None),
+            lambda: get_current_auth_info(request=req, credentials=None),
         ):
             with pytest.raises(HTTPException) as exc_info:
                 await call()
@@ -677,8 +731,9 @@ class TestSwitchOnDaltonSupabaseAuth:
         decode_mock.return_value = AuthInfo(user_id="attacker-uuid", auth_provider="email")
         monkeypatch.setattr(jwt_bearer, "_decode_token", decode_mock)
 
+        req = _make_request()
         creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=raw_token)
-        auth_info = await get_current_auth_info(credentials=creds)
+        auth_info = await get_current_auth_info(request=req, credentials=creds)
 
         mock_get_user = create_autospec(users_app.db_get_user, return_value=None)
         mock_find_by_email = create_autospec(users_app.find_user_by_email)

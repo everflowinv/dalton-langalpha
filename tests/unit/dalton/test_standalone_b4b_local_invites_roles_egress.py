@@ -491,12 +491,16 @@ async def test_egress_blocks_private_loopback_metadata_and_mixed_dns_rebinding(m
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", port)),
         ]
 
-    monkeypatch.setattr(socket, "getaddrinfo", _mixed_dns)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        create_autospec(socket.getaddrinfo, side_effect=_mixed_dns),
+    )
     assert await egress.endpoint_refusal("https://dual-record.example.com/v1") == egress.PRIVATE_ADDRESS
 
 
 @pytest.mark.asyncio
-async def test_egress_operator_allowlist_and_path_boundary(monkeypatch):
+async def test_egress_operator_allowlist_canonical_path_and_traversal_blocked(monkeypatch):
     monkeypatch.setenv("HOST_MODE", "oss")
     monkeypatch.setenv("DALTON_AUTH_MODE", "local")
     monkeypatch.setenv(
@@ -511,7 +515,24 @@ async def test_egress_operator_allowlist_and_path_boundary(monkeypatch):
     )
     # Path-segment boundary prevents prefix confusion (`/v1evil` must NOT match `/v1`)
     assert egress_policy.is_operator_allowlisted_endpoint("http://fake-llm:8099/v1evil") is False
+    # Canonical normalization blocks dot-segment traversal out of allowlisted path
+    assert (
+        egress_policy.is_operator_allowlisted_endpoint("http://fake-llm:8099/v1/../admin")
+        is False
+    )
+    assert (
+        egress_policy.is_operator_allowlisted_endpoint("http://fake-llm:8099/v1/%2e%2e/admin")
+        is False
+    )
+    assert (
+        egress_policy.is_operator_allowlisted_endpoint("http://fake-llm:8099/v1/./models")
+        is True
+    )
+    # Default port normalization works (https://...:443 == https://...)
+    monkeypatch.setenv("DALTON_OPERATOR_LLM_ENDPOINTS", "https://gw.internal/v1")
+    assert egress_policy.is_operator_allowlisted_endpoint("https://gw.internal:443/v1/models") is True
     # Wrong port / scheme / userinfo rejected
+    monkeypatch.setenv("DALTON_OPERATOR_LLM_ENDPOINTS", "http://fake-llm:8099/v1")
     assert egress_policy.is_operator_allowlisted_endpoint("http://fake-llm:9000/v1") is False
     assert egress_policy.is_operator_allowlisted_endpoint("https://fake-llm:8099/v1") is False
     assert (
@@ -522,98 +543,250 @@ async def test_egress_operator_allowlist_and_path_boundary(monkeypatch):
     monkeypatch.setattr(
         socket,
         "getaddrinfo",
-        lambda host, port, *_args, **_kwargs: [
-            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("172.20.0.9", port))
-        ],
+        create_autospec(
+            socket.getaddrinfo,
+            side_effect=lambda host, port, *_args, **_kwargs: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("172.20.0.9", port))
+            ],
+        ),
     )
     assert await egress.endpoint_refusal("http://fake-llm:8099/v1/models") is None
+    assert await egress.endpoint_refusal("http://fake-llm:8099/v1/../secret") == egress.PRIVATE_ADDRESS
     assert await egress.endpoint_refusal("http://fake-llm:8099/v1evil") == egress.PRIVATE_ADDRESS
 
 
 @pytest.mark.asyncio
-async def test_api_keys_and_custom_catalog_exempt_admin_but_block_member_in_local_mode(monkeypatch):
+async def test_egress_exemption_is_address_based_not_admin_identity(monkeypatch):
+    """Admins have NO identity bypass; only operator allowlist or saved team endpoints exempt private IPs."""
     monkeypatch.setenv("HOST_MODE", "oss")
     monkeypatch.setenv("DALTON_AUTH_MODE", "local")
     monkeypatch.delenv("DALTON_OPERATOR_LLM_ENDPOINTS", raising=False)
+    egress_policy.clear_local_team_url_classes()
 
     monkeypatch.setattr(
-        access_tiers,
-        "is_admin_user",
-        create_autospec(
-            access_tiers.is_admin_user,
-            side_effect=lambda uid, **_kw: uid == "admin-1",
-        ),
+        egress_policy,
+        "get_saved_team_endpoints",
+        create_autospec(egress_policy.get_saved_team_endpoints, return_value={}),
     )
 
     from src.server.app import api_keys
     from src.server.services.llm import custom_catalog
 
-    # Non-admin member is blocked (400)
-    with pytest.raises(HTTPException) as exc_member:
-        await api_keys._user_endpoint_transport("http://127.0.0.1:8000/v1", user_id="member-1")
-    assert exc_member.value.status_code == 400
+    # Both member AND admin are refused on non-allowlisted, non-team private/metadata URLs
+    for uid in ("member-1", "admin-1"):
+        with pytest.raises(HTTPException) as exc_key_test:
+            await api_keys._user_endpoint_transport("http://127.0.0.1:8000/v1", user_id=uid)
+        assert exc_key_test.value.status_code == 400
 
-    custom_list = [
-        {
-            "name": "member-private-model",
-            "provider": "openai",
-            "parameters": {"base_url": "http://169.254.169.254/v1"},
-        }
-    ]
-    with pytest.raises(HTTPException) as exc_catalog:
-        await custom_catalog.refuse_custom_model_endpoints(custom_list, user_id="member-1")
-    assert exc_catalog.value.status_code == 400
+        custom_list = [
+            {
+                "name": "private-model",
+                "provider": "openai",
+                "parameters": {"base_url": "http://169.254.169.254/v1"},
+            }
+        ]
+        with pytest.raises(HTTPException) as exc_catalog:
+            await custom_catalog.refuse_custom_model_endpoints(custom_list, user_id=uid)
+        assert exc_catalog.value.status_code == 400
 
-    # Admin is exempt for team model configuration
-    assert await api_keys._user_endpoint_transport("http://127.0.0.1:8000/v1", user_id="admin-1") is None
-    await custom_catalog.refuse_custom_model_endpoints(custom_list, user_id="admin-1")
+    # Operator-allowlisted URL passes AND still returns a DNS-pinning transport (never None)
+    monkeypatch.setenv("DALTON_OPERATOR_LLM_ENDPOINTS", "http://127.0.0.1:8099/v1")
+    transport = await api_keys._user_endpoint_transport("http://127.0.0.1:8099/v1", user_id="admin-1")
+    assert transport is not None
+    await custom_catalog.refuse_custom_model_endpoints(
+        [{"name": "ok-model", "provider": "openai", "parameters": {"base_url": "http://127.0.0.1:8099/v1"}}],
+        user_id="member-1",
+    )
 
 
 @pytest.mark.asyncio
-async def test_clients_egress_kwargs_exempts_team_shared_base_url_but_checks_member_params(
-    monkeypatch,
-):
+async def test_clients_egress_pins_saved_team_address_class_and_disables_redirects(monkeypatch):
+    """Saved team base_url locks its saved address class (public vs private) and always pins DNS."""
     monkeypatch.setenv("HOST_MODE", "oss")
     monkeypatch.setenv("DALTON_AUTH_MODE", "local")
-    monkeypatch.setenv("DALTON_CREDENTIAL_SHARING", "team")
     monkeypatch.delenv("DALTON_OPERATOR_LLM_ENDPOINTS", raising=False)
+    egress_policy.clear_local_team_url_classes()
 
+    saved_private = {
+        egress_policy.canonical_url_key("http://team-gw.internal:8000/v1"): "private",
+        egress_policy.canonical_url_key("https://team-public.example.com/v1"): "public",
+    }
     monkeypatch.setattr(
-        access_tiers,
-        "is_admin_user",
-        create_autospec(access_tiers.is_admin_user, return_value=False),
+        egress_policy,
+        "get_saved_team_endpoints",
+        create_autospec(egress_policy.get_saved_team_endpoints, return_value=saved_private),
     )
 
-    from src.dalton import credentials as dalton_credentials
+    # DNS resolves team-gw.internal to private IP, team-public.example.com to public IP
+    def _fake_dns(host, port, *_args, **_kwargs):
+        if host == "team-gw.internal":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.10.0.5", port))]
+        if host == "team-public.example.com":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", port))]
 
-    monkeypatch.setattr(
-        dalton_credentials,
-        "is_team_credential_sharing_enabled",
-        create_autospec(dalton_credentials.is_team_credential_sharing_enabled, return_value=True),
-    )
+    dns_mock = create_autospec(socket.getaddrinfo, side_effect=_fake_dns)
+    monkeypatch.setattr(socket, "getaddrinfo", dns_mock)
 
     from src.server.services.llm import clients
 
-    # Team-shared base_url (configured by admin) passes without egress transport
-    kwargs = await clients._egress_kwargs(
+    # 1. Saved private team endpoint passes validation AND still receives a DNS-pinning factory
+    kwargs_priv = await clients._egress_kwargs(
         "team-model",
-        "http://127.0.0.1:8000/v1",
+        "http://team-gw.internal:8000/v1",
         {},
         user_id="member-1",
         team_base_url=True,
     )
-    assert kwargs == {}
+    assert "egress_transport" in kwargs_priv and callable(kwargs_priv["egress_transport"])
 
-    # Member-supplied parameters URL still blocked (HTTPException 400 base_url_blocked)
+    # Verify policy routing locks each URL to its saved address class
+    assert (
+        egress_policy.ip_policy_for_request_url(
+            "http://team-gw.internal:8000/v1/responses",
+            saved_team_endpoints=saved_private,
+        )
+        == "private"
+    )
+    assert (
+        egress_policy.ip_policy_for_request_url(
+            "https://team-public.example.com/v1/responses",
+            saved_team_endpoints=saved_private,
+        )
+        == "public"
+    )
+    # Path traversal out of saved team prefix falls back to strict "public"
+    assert (
+        egress_policy.ip_policy_for_request_url(
+            "http://team-gw.internal:8000/v1/../admin",
+            saved_team_endpoints=saved_private,
+        )
+        == "public"
+    )
+
+    # 2. If a team URL saved as "public" rebinds to a private IP, connect-time pinning refuses it!
+    dns_mock.side_effect = lambda host, port, *_args, **_kwargs: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", port))
+    ]
+    reason_rebind, _ = await egress_policy.check_core_endpoint_refusal(
+        "https://team-public.example.com/v1/responses",
+        saved_team_endpoints=saved_private,
+    )
+    assert reason_rebind == egress.PRIVATE_ADDRESS
+
+    # And at connect time, PolicyHeldTransport routes team-gw.internal to ip_policy="private"
+    # which rejects a public IP (enforcing saved address-class lock).
+    import httpx
+
+    dns_mock.side_effect = lambda host, port, *_args, **_kwargs: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))
+    ]
+    transport = egress.core_http_transport(saved_team_endpoints=saved_private)
+    with pytest.raises(egress.EndpointRefused):
+        await transport.handle_async_request(
+            httpx.Request("POST", "http://team-gw.internal:8000/v1/responses")
+        )
+    await transport.aclose()
+
+    # 3. Member-supplied parameters URL targeting metadata IP is refused (400)
     with pytest.raises(HTTPException) as exc_member_param:
         await clients._egress_kwargs(
             "team-model",
-            "http://127.0.0.1:8000/v1",
+            "http://team-gw.internal:8000/v1",
             {"base_url": "http://169.254.169.254/latest/meta-data/"},
             user_id="member-1",
             team_base_url=True,
         )
     assert exc_member_param.value.status_code == 400
+
+    # 4. Even platform/default model with no custom base_url gets egress_transport in local mode
+    #    so LLM._hold_params_to_egress enforces follow_redirects=False on all model requests.
+    kwargs_default = await clients._egress_kwargs("gpt-4o", None)
+    assert "egress_transport" in kwargs_default and callable(kwargs_default["egress_transport"])
+
+
+@pytest.mark.asyncio
+async def test_supabase_invite_summary_omits_tier_while_local_includes_tier(monkeypatch):
+    """Item 11: Everflow Supabase invite summaries preserve exact response shape without `tier`."""
+    from src.dalton import invites as invites_mod
+
+    row = {
+        "invite_id": "inv-1",
+        "tier": "external",
+        "created_at": datetime.now(timezone.utc),
+        "expires_at": datetime.now(timezone.utc) + timedelta(days=7),
+        "used_at": None,
+        "revoked_at": None,
+        "used_by_username": None,
+        "used_by_email": None,
+    }
+    monkeypatch.setenv("HOST_MODE", "oss")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    supa_summary = invites_mod._format_invite_summary(row)
+    assert "tier" not in supa_summary
+
+    monkeypatch.setenv("DALTON_AUTH_MODE", "local")
+    local_summary = invites_mod._format_invite_summary(row)
+    assert local_summary["tier"] == "external"
+
+
+@pytest.mark.asyncio
+async def test_coverage_units_action_flags_match_write_permission_in_local_mode(monkeypatch):
+    """Item 8: units_view action flags and coverage_units._require_ws_write share one multi-user auth helper."""
+    from src.dalton.autonomy import units_view
+    from src.dalton.database import coverage_units
+
+    monkeypatch.setenv("HOST_MODE", "oss")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "local")
+
+    assert coverage_units.is_coverage_multiuser_auth_enabled() is True
+    assert units_view._is_multiuser_auth_enabled() is True
+
+    # PM on colleague's internal workspace: flags say can_unbind/can_archive == True,
+    # and _require_ws_write ALSO permits write in local mode (previously only checked supabase auth).
+    flags = units_view._compute_unit_action_flags(
+        user_id="admin-1",
+        lead_uid="analyst-1",
+        created_by_uid="analyst-1",
+        ws_id="ws-1",
+        ws_active=True,
+        ws_owner="analyst-1",
+        readable=True,
+        web_level="ro",
+        is_pm=True,
+    )
+    assert flags == {"can_bind": False, "can_unbind": True, "can_archive": True}
+
+    classify_mock = create_autospec(access_tiers.classify_owner_tier, return_value="internal")
+    monkeypatch.setattr(access_tiers, "classify_owner_tier", classify_mock)
+    # Must not raise for PM in local mode on internal colleague's workspace
+    await coverage_units._require_ws_write(
+        {"workspace_id": "ws-1", "user_id": "analyst-1", "status": "active", "is_home": False},
+        "admin-1",
+        is_pm=True,
+    )
+
+    # External owner's workspace is still refused even for PM
+    classify_mock.return_value = "external"
+    with pytest.raises(coverage_units._WorkspaceAccessError) as exc_ext:
+        await coverage_units._require_ws_write(
+            {"workspace_id": "ws-2", "user_id": "ext-1", "status": "active", "is_home": False},
+            "admin-1",
+            is_pm=True,
+        )
+    assert "belongs to another user" in str(exc_ext.value)
+
+
+def test_d048_downgrade_revokes_pending_admin_and_preserves_historical_audit():
+    """Item 9: d048 downgrade SQL revokes unused admin invites and keeps historical admin rows."""
+    mig_path = REPO_ROOT / "src" / "dalton" / "migrations" / "versions" / "d048_invite_admin_tier.py"
+    src = mig_path.read_text(encoding="utf-8")
+    assert "SET revoked_at = NOW()" in src
+    assert "tier = 'admin'" in src
+    assert "used_at IS NULL" in src
+    assert "revoked_at IS NULL" in src
+    assert "used_at IS NOT NULL OR revoked_at IS NOT NULL" in src
+    assert "SET tier = 'internal'" not in src
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +799,8 @@ def test_b4_local_auth_check_script_header_and_stdlib_only():
     source = script_path.read_text(encoding="utf-8")
     first_lines = source.splitlines()[:25]
     assert any(line.strip() == "# auth: local" for line in first_lines)
+    assert "hasattr(" not in source, "Migration head check must not skip via hasattr"
+    assert "/health" not in source, "Edge Caddy blocks /health with 404; poll bootstrap/status instead"
 
     tree = ast.parse(source, filename=str(script_path))
     imported_roots: set[str] = set()

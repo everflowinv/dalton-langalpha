@@ -15,6 +15,8 @@ export interface ByokProvider {
   use_response_api?: boolean;
   /** Stored for a provider the catalog no longer has: listed only to be removed. */
   withdrawn?: boolean;
+  // DALTON-HOOK(standalone-core): Core recorded per-model structured tool-calling probe verdicts
+  tool_calling_models?: Record<string, boolean>;
 }
 
 export type SdkType = 'openai' | 'anthropic' | 'gemini' | 'codex' | 'deepseek' | 'openrouter' | 'qwq' | 'dashscope';
@@ -90,6 +92,8 @@ export interface CustomModelEntry {
   prompt_guidance?: string;
   /** The name a gateway's catalog gives the model, shown in place of `name`. */
   display_name?: string;
+  // DALTON-HOOK(standalone-core): explicit or probed tool-calling support on custom models
+  tool_calling?: boolean;
 }
 
 export interface CustomModelFormState {

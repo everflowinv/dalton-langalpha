@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import type { AuthResponse } from '@supabase/supabase-js';
 import { AuthContext, type AuthContextValue } from '@/contexts/AuthContext';
+import { toast } from '@/components/ui/use-toast';
 import {
   clearAuthToken,
   getAccessToken,
@@ -128,7 +129,15 @@ export function LocalAuthProvider({ children }: { children: React.ReactNode }) {
   );
 
   const logout = useCallback(async () => {
-    await localLogout();
+    try {
+      await localLogout();
+    } catch {
+      toast({
+        variant: 'destructive',
+        title: '登出未完成，请重试',
+      });
+      return;
+    }
     clearLocalSessionState();
   }, [clearLocalSessionState]);
 

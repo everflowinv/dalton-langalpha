@@ -23,7 +23,9 @@ from src.config import settings
 from src.config.features import (
     FEATURES,
     USER_CONTROLLABLE_GATES,
+    FeatureCategory,
     FeatureGate,
+    FeatureGuide,
     effective_flags,
     has_plan_gated_features,
     org_value,
@@ -53,7 +55,10 @@ class FeatureState(BaseModel):
     key: str
     label: str
     description: str
-    tradeoffs: str | None = None
+    #: How Experiments lists it, and what it shows a user deciding (``FeatureSpec``).
+    category: FeatureCategory | None = None
+    preview: bool = False
+    guide: FeatureGuide | None = None
     enabled: bool
     gate: Literal["none", "opt_in", "opt_out", "plan", "grant"]
     min_tier: int | None = None
@@ -161,6 +166,20 @@ async def user_feature_enabled(user_id: str, key: str) -> bool:
     return (await effective_flags_for_user(user_id)).get(key, False)
 
 
+async def user_feature_enabled_or(user_id: str, key: str, *, on_error: bool) -> bool:
+    """:func:`user_feature_enabled` for a caller that has to act either way:
+    a failed read answers ``on_error``, which the caller picks by which
+    mistake costs less, running what the user turned off or skipping what
+    they left on."""
+    try:
+        return await user_feature_enabled(user_id, key)
+    except Exception:
+        logger.warning(
+            "[Features] %s read failed; taking it as %s", key, on_error, exc_info=True
+        )
+        return on_error
+
+
 async def feature_enabled_for_account(
     user_id: str, key: str, account: Account | None
 ) -> bool:
@@ -179,14 +198,19 @@ class Member:
     policy: Policy
 
 
-async def org_member(user_id: str, feature: str | None = None) -> Member | None:
+async def org_member(
+    user_id: str, feature: str | None = None, *, recheck: bool = False
+) -> Member | None:
     """The user as an active member of an organization that allows ``teams``,
     with ``feature`` on for them when one is named. None for an account in no
     organization, a suspended one, the feature off, and with the door shut,
-    which reads nothing. Raises the 503 while the account cannot be read."""
+    which reads nothing. Raises the 503 while the account cannot be read.
+    ``recheck`` asks the auth service past the cached entry, for a grant
+    about to be acted on (``read_standing``), and counts only its answer: the
+    last one on record standing in for it raises the 503 too."""
     if not membership.teams_door_open():
         return None
-    standing = await accounts.read_standing(user_id)
+    standing = await accounts.read_standing(user_id, recheck=recheck, answered_only=recheck)
     account = standing.account
     if account is None:
         raise accounts.AccountUnknown()
@@ -224,7 +248,9 @@ async def list_user_features(user_id: str) -> list[FeatureState]:
                 key=key,
                 label=spec.label,
                 description=spec.description,
-                tradeoffs=spec.tradeoffs,
+                category=spec.category,
+                preview=spec.preview,
+                guide=spec.guide,
                 enabled=resolved[key],
                 gate=flag.gate.value,
                 min_tier=flag.min_tier,

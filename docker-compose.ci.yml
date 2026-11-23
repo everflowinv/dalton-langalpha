@@ -1,0 +1,98 @@
+# CI overlay for standalone core E2E verification.
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.core.yml -f docker-compose.ci.yml up -d
+#
+# Adds two lightweight stdlib-only Python containers on `core_internal`:
+# - `fake-llm`: deterministic OpenAI Responses API fake (`http://fake-llm:8099/v1`)
+# - `header-echo`: HTTP header echo probe behind Caddy `/__probe/*`
+#
+# `CI_REPO_ROOT` defaults to `.` when run from the repository root and is set
+# by `tests/standalone/run_checks.sh` when testing against an exported clean
+# package directory so no test files need to be copied into the release dir.
+
+services:
+  fake-llm:
+    image: python:3.13-slim
+    restart: unless-stopped
+    command:
+      - python
+      - -u
+      - /fakes/fake_openai_server.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8099"
+    environment:
+      FAKE_LLM_MODEL: ${FAKE_LLM_MODEL:-gpt-6-luna}
+      FAKE_LLM_CHUNK_DELAY_S: ${FAKE_LLM_CHUNK_DELAY_S:-0.25}
+    volumes:
+      - ${CI_REPO_ROOT:-.}/tests/fakes:/fakes:ro
+    networks:
+      - core_internal
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; r = urllib.request.urlopen('http://127.0.0.1:8099/health', timeout=2); assert r.status == 200"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  header-echo:
+    image: python:3.13-slim
+    restart: unless-stopped
+    command:
+      - python
+      - -u
+      - /fakes/header_echo.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8098"
+    volumes:
+      - ${CI_REPO_ROOT:-.}/tests/fakes:/fakes:ro
+    networks:
+      - core_internal
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; r = urllib.request.urlopen('http://127.0.0.1:8098/health', timeout=2); assert r.status == 200"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  edge:
+    depends_on:
+      header-echo:
+        condition: service_healthy
+    volumes:
+      # Same target as the core extra dir, so it replaces that mount; a file mount
+      # inside the read-only extra dir cannot create its mount point.
+      - ${CI_REPO_ROOT:-.}/tests/standalone/caddy:/etc/caddy/extra:ro
+
+  backend:
+    depends_on:
+      fake-llm:
+        condition: service_healthy
+    environment:
+      # Operator allowlist for private/internal LLM endpoints (enforced in Batch 4+
+      # egress checks; declared here from Batch 1 so CI stays consistent across batches).
+      DALTON_OPERATOR_LLM_ENDPOINTS: ${DALTON_OPERATOR_LLM_ENDPOINTS:-http://fake-llm:8099/v1}
+      DALTON_AUTH_COOKIE_SECURE: ${DALTON_AUTH_COOKIE_SECURE:-}
+      GINLIX_DATA_URL: ${CI_GINLIX_DATA_URL:-}
+      FAKE_LLM_BASE_URL: http://fake-llm:8099/v1
+      FAKE_LLM_MODEL: ${FAKE_LLM_MODEL:-gpt-6-luna}
+      # Ensure no external search provider API keys leak into CI runs so
+      # core-mode WebSearch omission (with WebFetch retained) is exercised cleanly.
+      TAVILY_API_KEY: ""
+      SERPER_API_KEY: ""
+      BOCHA_API_KEY: ""
+      EXA_API_KEY: ""
+      PARALLEL_API_KEY: ""
+      DEEPSEEK_API_KEY: ""
+      GEMINI_API_KEY: ""

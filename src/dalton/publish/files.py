@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from src.dalton.knowledge.paths import PUBLISHED_DIR
+from src.dalton.profile import is_core_profile
 from src.dalton.settings import get_dalton_config
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,17 @@ def compute_bundle_sha256(
     return h.hexdigest()
 
 
+def format_review_mode_banner_parts(review_mode: str | None) -> tuple[str, str]:
+    """Return ``(field_label, mode_description)`` for the archived publication banner."""
+    if review_mode == "cross_family":
+        return "独立审稿", "跨家族独立审稿"
+    if review_mode == "single_family":
+        return "同家族复审", "同家族复审"
+    if review_mode == "unknown_family":
+        return "模型复审", "未知家族复审"
+    return "审稿", "历史记录未标注模式"
+
+
 def prepend_publication_banner(
     draft_markdown: str,
     *,
@@ -40,6 +52,7 @@ def prepend_publication_banner(
     reviewer_family: str,
     publication_id: str,
     thesis_version_no: int | None = None,
+    review_mode: str | None = None,
 ) -> str:
     """Prepend an immutable publication metadata header block to the published Markdown."""
     thesis_line = (
@@ -47,12 +60,20 @@ def prepend_publication_banner(
         if thesis_version_no is not None
         else ""
     )
+    if is_core_profile():
+        review_label, review_mode_desc = format_review_mode_banner_parts(review_mode)
+        review_line = (
+            f"> - **{review_label}**：`{reviewer_model}`"
+            f"（`{reviewer_family}` · {review_mode_desc}）· 通过"
+        )
+    else:
+        review_line = f"> - **独立审稿**：`{reviewer_model}`（`{reviewer_family}`）· 通过"
     banner = (
         f"<!-- dalton:publication id={publication_id} date={published_date} -->\n"
         f"> **正式发布研究成果（Official Publication）** — `{publication_id}`\n"
         f"> - **标题**：{title}（`{kind}`）\n"
         f"> - **批准人**：{approver_user_id} · {approved_at}\n"
-        f"> - **独立审稿**：`{reviewer_model}`（`{reviewer_family}`）· 通过"
+        f"{review_line}"
         f"{thesis_line}\n\n"
     )
     return banner + draft_markdown

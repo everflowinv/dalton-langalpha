@@ -91,6 +91,7 @@ vi.mock('@/config/daltonAuth', () => ({
   get isDaltonAuth() {
     return daltonAuthState.isDaltonAuth;
   },
+  // DALTON-HOOK(standalone-core): default local auth flag off in Supabase AuthContext tests
   isDaltonLocalAuth: false,
   get isDaltonSupabaseAuth() {
     return daltonAuthState.isDaltonAuth;

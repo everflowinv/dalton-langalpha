@@ -92,7 +92,6 @@ export interface HistoryRuntime {
   workspaceId: string;
   threadId: string;
   t: Translate;
-  updateTodoListCard: ((todoData: Record<string, unknown>, isNew?: boolean) => void) | null;
   // stable (setters)
   setMessages: SetMessages;
   setIsLoadingHistory: React.Dispatch<React.SetStateAction<boolean>>;

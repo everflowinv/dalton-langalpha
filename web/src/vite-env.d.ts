@@ -19,6 +19,8 @@ interface ImportMetaEnv {
   readonly VITE_PRIVACY_URL?: string;
   readonly VITE_BRAND_NAME?: string; // DALTON-HOOK(brand-name)
   readonly VITE_BRAND_MARK?: 'langalpha' | 'everflow'; // DALTON-HOOK(brand-name)
+  readonly VITE_DALTON_UI?: string; // DALTON-HOOK(standalone-core)
+  readonly VITE_DALTON_PROFILE?: 'everflow' | 'core'; // DALTON-HOOK(standalone-core)
 }
 
 /** The installed monaco-editor release, from `scripts/monaco-version.ts`. */
