@@ -1191,19 +1191,51 @@ class TestSandboxNetworkAndInitScript:
     def test_edge_forwarded_request_extracts_real_client_ip_from_core_internal_subnet(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Decision 2: core_internal subnet is pinned & trusted so edge-forwarded XFF yields real client IP."""
+        """Decision 2 + r3 #6: DALTON_TRUSTED_PROXIES derives from DALTON_CORE_INTERNAL_SUBNET so changing subnet keeps both aligned."""
+        import re
         from types import SimpleNamespace
+        import yaml
 
-        # 1. Verify .env.core.example, docker-compose.core.yml, and init.sh wire the same default subnet
-        compose_text = (REPO_ROOT / "docker-compose.core.yml").read_text(encoding="utf-8")
-        assert "${DALTON_CORE_INTERNAL_SUBNET:-172.31.250.0/24}" in compose_text
-        assert "DALTON_TRUSTED_PROXIES:" in compose_text
-        assert "DALTON_TRUSTED_PROXY_HOPS:" in compose_text
+        # 1. Verify .env.core.example, docker-compose.core.yml, and init.sh use a single subnet source
+        class _ComposeSafeLoader(yaml.SafeLoader):
+            pass
+
+        def _passthrough_tag(loader: yaml.SafeLoader, node: yaml.Node) -> Any:
+            if isinstance(node, yaml.MappingNode):
+                return loader.construct_mapping(node)
+            if isinstance(node, yaml.SequenceNode):
+                return loader.construct_sequence(node)
+            return loader.construct_scalar(node)
+
+        _ComposeSafeLoader.add_constructor("!reset", _passthrough_tag)
+        _ComposeSafeLoader.add_constructor("!override", _passthrough_tag)
+
+        compose_raw = (REPO_ROOT / "docker-compose.core.yml").read_text(encoding="utf-8")
+        compose_cfg = yaml.load(compose_raw, Loader=_ComposeSafeLoader)
+        net_subnet_expr = compose_cfg["networks"]["core_internal"]["ipam"]["config"][0]["subnet"]
+        backend_trusted_expr = compose_cfg["services"]["backend"]["environment"]["DALTON_TRUSTED_PROXIES"]
+        assert net_subnet_expr == "${DALTON_CORE_INTERNAL_SUBNET:-172.31.250.0/24}"
+        assert backend_trusted_expr == "${DALTON_CORE_INTERNAL_SUBNET:-172.31.250.0/24}"
+        assert "DALTON_TRUSTED_PROXY_HOPS" in compose_cfg["services"]["backend"]["environment"]
 
         env_example_text = (REPO_ROOT / ".env.core.example").read_text(encoding="utf-8")
         assert "DALTON_CORE_INTERNAL_SUBNET=172.31.250.0/24" in env_example_text
-        assert "DALTON_TRUSTED_PROXIES=172.31.250.0/24" in env_example_text
+        assert "DALTON_TRUSTED_PROXIES=" not in env_example_text
         assert "DALTON_TRUSTED_PROXY_HOPS=1" in env_example_text
+
+        def _parse_env(path: Path) -> dict[str, str]:
+            out: dict[str, str] = {}
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    out[k.strip()] = v.strip()
+            return out
+
+        def _resolve_compose_expr(expr: str, env_map: dict[str, str]) -> str:
+            m = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-([^}]*)\}", expr)
+            assert m, f"Unexpected compose expression: {expr!r}"
+            var_name, default_val = m.group(1), m.group(2)
+            return env_map.get(var_name) or default_val
 
         install_dir, init_script = self._stage_init_install(tmp_path, "inst-trusted-proxy")
         subprocess.run(
@@ -1221,17 +1253,17 @@ class TestSandboxNetworkAndInitScript:
             check=True,
             timeout=30,
         )
-        env_map: dict[str, str] = {}
-        for line in (install_dir / ".env").read_text(encoding="utf-8").splitlines():
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                env_map[k.strip()] = v.strip()
+        env_map = _parse_env(install_dir / ".env")
         assert env_map["DALTON_CORE_INTERNAL_SUBNET"] == "172.31.250.0/24"
-        assert env_map["DALTON_TRUSTED_PROXIES"] == "172.31.250.0/24"
+        assert "DALTON_TRUSTED_PROXIES" not in env_map
         assert env_map["DALTON_TRUSTED_PROXY_HOPS"] == "1"
 
+        resolved_net = _resolve_compose_expr(net_subnet_expr, env_map)
+        resolved_trusted = _resolve_compose_expr(backend_trusted_expr, env_map)
+        assert resolved_net == resolved_trusted == "172.31.250.0/24"
+
         # 2. Verify extract_client_ip extracts real client IP when forwarded from Caddy edge in core_internal
-        monkeypatch.setenv("DALTON_TRUSTED_PROXIES", env_map["DALTON_TRUSTED_PROXIES"])
+        monkeypatch.setenv("DALTON_TRUSTED_PROXIES", resolved_trusted)
         monkeypatch.setenv("DALTON_TRUSTED_PROXY_HOPS", env_map["DALTON_TRUSTED_PROXY_HOPS"])
 
         edge_req = SimpleNamespace(
@@ -1253,6 +1285,43 @@ class TestSandboxNetworkAndInitScript:
             headers={"x-forwarded-for": "198.51.100.42"},
         )
         assert local_auth_sessions.extract_client_ip(untrusted_req) == "10.99.0.5"
+
+        # 3. Override DALTON_CORE_INTERNAL_SUBNET and re-run init.sh: both Compose sites stay identical
+        custom_subnet = "10.200.50.0/24"
+        env_path = install_dir / ".env"
+        env_path.write_text(
+            env_path.read_text(encoding="utf-8").replace(
+                "DALTON_CORE_INTERNAL_SUBNET=172.31.250.0/24",
+                f"DALTON_CORE_INTERNAL_SUBNET={custom_subnet}",
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(
+            ["bash", str(init_script), "--non-interactive", "--skip-sandbox-build"],
+            env=self._make_fake_docker_env(tmp_path, "28.0.1"),
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        env_map_2 = _parse_env(env_path)
+        assert env_map_2["DALTON_CORE_INTERNAL_SUBNET"] == custom_subnet
+        assert "DALTON_TRUSTED_PROXIES" not in env_map_2
+        resolved_net_2 = _resolve_compose_expr(net_subnet_expr, env_map_2)
+        resolved_trusted_2 = _resolve_compose_expr(backend_trusted_expr, env_map_2)
+        assert resolved_net_2 == resolved_trusted_2 == custom_subnet
+
+        monkeypatch.setenv("DALTON_TRUSTED_PROXIES", resolved_trusted_2)
+        new_edge_req = SimpleNamespace(
+            client=SimpleNamespace(host="10.200.50.10"),
+            headers={"x-forwarded-for": "198.51.100.99"},
+        )
+        assert local_auth_sessions.extract_client_ip(new_edge_req) == "198.51.100.99"
+        old_subnet_req = SimpleNamespace(
+            client=SimpleNamespace(host="172.31.250.10"),
+            headers={"x-forwarded-for": "198.51.100.99"},
+        )
+        assert local_auth_sessions.extract_client_ip(old_subnet_req) == "172.31.250.10"
 
     def test_init_b6r2_domain_port_tls_mode_validation_and_mode_preservation(
         self, tmp_path: Path
@@ -1345,6 +1414,75 @@ class TestSandboxNetworkAndInitScript:
             timeout=30,
         )
         assert stat.S_IMODE(env_perm.stat().st_mode) == 0o640
+
+        # 5. Pre-existing non-loopback bind address is ALWAYS rewritten to 127.0.0.1 even with no flags
+        for variant_idx, bind_line in enumerate(
+            (
+                "DALTON_EDGE_TLS_BIND=0.0.0.0",
+                "  export DALTON_EDGE_TLS_BIND = 0.0.0.0",
+                "DALTON_EDGE_TLS_BIND: 0.0.0.0",
+            )
+        ):
+            inst_bind, init_bind = self._stage_init_install(tmp_path, f"inst-rewrite-bind-{variant_idx}")
+            env_bind = inst_bind / ".env"
+            env_bind.write_text(
+                f"DOMAIN=localhost\nDALTON_TLS_MODE=auto\n{bind_line}\n",
+                encoding="utf-8",
+            )
+            env_bind.chmod(0o600)
+            res_bind = subprocess.run(
+                ["bash", str(init_bind), "--non-interactive", "--skip-sandbox-build"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
+            env_bind_text = env_bind.read_text(encoding="utf-8")
+            assert "DALTON_EDGE_TLS_BIND=127.0.0.1\n" in env_bind_text
+            assert "0.0.0.0" not in env_bind_text
+            assert "Rewrote DALTON_EDGE_TLS_BIND" in res_bind.stderr
+
+        # 6. IPv6 loopback (--domain ::1 --tls-mode internal) binds to [::1] and passes [::1] to Caddy
+        inst_v6_tls, init_v6_tls = self._stage_init_install(tmp_path, "inst-v6-internal")
+        subprocess.run(
+            [
+                "bash",
+                str(init_v6_tls),
+                "--non-interactive",
+                "--domain",
+                "::1",
+                "--tls-mode",
+                "internal",
+                "--skip-sandbox-build",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        v6_env_text = (inst_v6_tls / ".env").read_text(encoding="utf-8")
+        assert "DALTON_EDGE_TLS_BIND=[::1]\n" in v6_env_text
+        assert "DALTON_CADDY_HOST=[::1]\n" in v6_env_text
+        assert "PUBLIC_APP_URL=https://[::1]:18443\n" in v6_env_text
+
+        # 7. auto.caddy imports dalton_http_redirect; docker-compose.tls.yml defaults bind to 127.0.0.1
+        auto_caddy = (REPO_ROOT / "deploy/standalone/modes/auto.caddy").read_text(encoding="utf-8")
+        assert "import dalton_http_redirect" in auto_caddy
+        tls_compose = (REPO_ROOT / "deploy/standalone/docker-compose.tls.yml").read_text(encoding="utf-8")
+        assert "${DALTON_EDGE_TLS_BIND:-127.0.0.1}" in tls_compose
+
+        # 8. Standalone images are pinned by digest
+        edge_df = (REPO_ROOT / "deploy/standalone/Dockerfile.edge").read_text(encoding="utf-8")
+        for line in edge_df.splitlines():
+            if line.strip().startswith("FROM "):
+                assert "@sha256:" in line, f"Dockerfile.edge base image not pinned by digest: {line}"
+        core_compose = (REPO_ROOT / "docker-compose.core.yml").read_text(encoding="utf-8")
+        assert "valkey/valkey:8-alpine@sha256:" in core_compose
+        assert "cgr.dev/chainguard/minio@sha256:" in core_compose
+        env_example = (REPO_ROOT / ".env.core.example").read_text(encoding="utf-8")
+        assert "public.ecr.aws/chainguard/minio:latest" not in env_example
 
     def test_ops_scripts_external_db_guard_retain_validation_and_replace_flags(
         self, tmp_path: Path
@@ -1452,3 +1590,263 @@ class TestSandboxNetworkAndInitScript:
         assert res_force.returncode == 2
         assert "--replace-data" in res_force.stderr
         assert "--replace-env" in res_force.stderr
+
+        # Compose .env syntax variants (export, leading space, KEY =, KEY:) are recognized for DB_HOST
+        for variant_idx, db_host_line in enumerate(
+            (
+                "export DB_HOST=external-pg.corp.internal",
+                "   DB_HOST = external-pg.corp.internal # prod",
+                "DB_HOST: external-pg.corp.internal",
+            )
+        ):
+            vwork = tmp_path / f"ops-env-var-{variant_idx}"
+            vwork.mkdir()
+            (vwork / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+            (vwork / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+            (vwork / ".env").write_text(f"{db_host_line}\n", encoding="utf-8")
+            for script_name, extra in (
+                ("backup.sh", []),
+                ("restore.sh", ["--backup-dir", str(backup_stub)]),
+                ("upgrade.sh", ["--release-dir", str(rel_dir)]),
+            ):
+                vres = subprocess.run(
+                    ["bash", str(REPO_ROOT / "scripts/standalone" / script_name), "--work-dir", str(vwork), *extra],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                assert vres.returncode != 0, f"{script_name} missed external DB in {db_host_line!r}"
+                assert "External PostgreSQL detected" in vres.stderr, (
+                    f"{script_name} unexpected stderr for {db_host_line!r}: {vres.stderr}"
+                )
+
+        # --retain rejects 64-bit integer wraparound overflow (18446744073709551617 -> 1) before arithmetic
+        for script_name, extra in (
+            ("backup.sh", ["--work-dir", str(work)]),
+            ("upgrade.sh", ["--work-dir", str(work), "--release-dir", str(rel_dir)]),
+        ):
+            res_ovf = subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts/standalone" / script_name),
+                    *extra,
+                    "--retain",
+                    "18446744073709551617",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_ovf.returncode == 2, f"{script_name} did not reject overflow --retain: {res_ovf.stderr}"
+
+        # restore.sh --replace-env stages env.enc and leaves existing .env untouched on external DB or project mismatch
+        pass_file = tmp_path / "restore.pass"
+        pass_file.write_text("test-passphrase-0123456789\n", encoding="utf-8")
+        pass_file.chmod(0o600)
+
+        def _make_enc_backup(name: str, env_content: str, manifest_proj: str) -> Path:
+            bdir = tmp_path / name
+            bdir.mkdir()
+            (bdir / "postgres.dump").write_bytes(b"PGDMP")
+            plain = tmp_path / f"{name}.plain.env"
+            plain.write_text(env_content, encoding="utf-8")
+            subprocess.run(
+                [
+                    "openssl",
+                    "enc",
+                    "-aes-256-cbc",
+                    "-pbkdf2",
+                    "-md",
+                    "sha256",
+                    "-iter",
+                    "10000",
+                    "-salt",
+                    "-in",
+                    str(plain),
+                    "-out",
+                    str(bdir / "env.enc"),
+                    "-pass",
+                    f"file:{pass_file}",
+                ],
+                check=True,
+                capture_output=True,
+                timeout=15,
+            )
+            (bdir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "compose_project": manifest_proj,
+                        "env_backup": "encrypted",
+                        "env_encryption": {
+                            "cipher": "aes-256-cbc",
+                            "kdf": "pbkdf2",
+                            "digest": "sha256",
+                            "iterations": 10000,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return bdir
+
+        rwork = tmp_path / "restore-stage-work"
+        rwork.mkdir()
+        (rwork / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        (rwork / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        orig_env_text = "COMPOSE_PROJECT_NAME=proj-current\nDB_HOST=postgres\nSENTINEL=keep-me\n"
+        (rwork / ".env").write_text(orig_env_text, encoding="utf-8")
+
+        bak_mismatch = _make_enc_backup(
+            "bak-proj-mismatch",
+            "COMPOSE_PROJECT_NAME=proj-other\nDB_HOST=postgres\nSENTINEL=clobbered\n",
+            "proj-other",
+        )
+        res_mismatch = subprocess.run(
+            [
+                "bash",
+                str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                "--work-dir",
+                str(rwork),
+                "--backup-dir",
+                str(bak_mismatch),
+                "--env-passphrase-file",
+                str(pass_file),
+                "--replace-env",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_mismatch.returncode != 0
+        assert "COMPOSE_PROJECT_NAME" in res_mismatch.stderr
+        assert (rwork / ".env").read_text(encoding="utf-8") == orig_env_text
+
+        bak_ext_db = _make_enc_backup(
+            "bak-ext-db",
+            "COMPOSE_PROJECT_NAME=proj-current\nDB_HOST: external-rds.corp.internal\nSENTINEL=clobbered\n",
+            "proj-current",
+        )
+        res_ext_env = subprocess.run(
+            [
+                "bash",
+                str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                "--work-dir",
+                str(rwork),
+                "--backup-dir",
+                str(bak_ext_db),
+                "--env-passphrase-file",
+                str(pass_file),
+                "--replace-env",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_ext_env.returncode != 0
+        assert "External PostgreSQL" in res_ext_env.stderr
+        assert (rwork / ".env").read_text(encoding="utf-8") == orig_env_text
+
+        # backup.sh PID lock automatically cleans up a stale lock left by a dead PID
+        lock_parent = tmp_path / "lock-test"
+        lock_parent.mkdir()
+        stale_lock = lock_parent / ".dalton-backup.lock"
+        stale_lock.mkdir()
+        (stale_lock / "pid").write_text("999999\n", encoding="utf-8")
+        backup_sh = REPO_ROOT / "scripts/standalone/backup.sh"
+        lock_driver = (
+            "set -euo pipefail\n"
+            'warn() { printf "[backup] WARN: %s\\n" "$1" >&2; }\n'
+            'err()  { printf "[backup] ERROR: %s\\n" "$1" >&2; }\n'
+            f'LOCK_DIR="{stale_lock}"\n'
+            "LOCK_HELD=0\n"
+            f'eval "$(awk \'/^pid_is_alive\\(\\) \\{{/ {{p=1}} p {{print}} p && /^release_publish_lock\\(\\) \\{{/ {{r=1}} r && /^\\}}/ {{exit}}\' "{backup_sh}")"\n'
+            "acquire_publish_lock\n"
+            'test "$(cat "$LOCK_DIR/pid")" = "$$"\n'
+            "release_publish_lock\n"
+            'test ! -d "$LOCK_DIR"\n'
+        )
+        res_lock = subprocess.run(
+            ["bash", "-c", lock_driver],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_lock.returncode == 0, f"Stale PID lock cleanup failed: {res_lock.stderr}"
+        assert "Removing stale backup lock" in res_lock.stderr
+
+        # upgrade.sh falls back to new release's backup.sh when old WORK_DIR has none (#480 first upgrade)
+        # AND pre-migration failure does NOT suggest `restore.sh --replace-data`
+        old_work = tmp_path / "old-480-work"
+        old_work.mkdir()
+        (old_work / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        (old_work / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (old_work / ".env").write_text("DB_HOST=postgres\n", encoding="utf-8")
+        new_rel = tmp_path / "new-release"
+        (new_rel / "scripts" / "standalone").mkdir(parents=True)
+        (new_rel / "deploy" / "standalone").mkdir(parents=True)
+        for req in (
+            "docker-compose.yml",
+            "docker-compose.core.yml",
+            "scripts/standalone/migrate.sh",
+            "scripts/standalone/restore.sh",
+            "deploy/standalone/Caddyfile",
+        ):
+            (new_rel / req).write_text("stub\n", encoding="utf-8")
+        (new_rel / "scripts" / "standalone" / "backup.sh").write_text(
+            "#!/usr/bin/env bash\necho 'NEW_RELEASE_BACKUP_INVOKED' >&2\nexit 1\n",
+            encoding="utf-8",
+        )
+        res_first_upg = subprocess.run(
+            [
+                "bash",
+                str(REPO_ROOT / "scripts/standalone/upgrade.sh"),
+                "--work-dir",
+                str(old_work),
+                "--release-dir",
+                str(new_rel),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_first_upg.returncode != 0
+        assert "NEW_RELEASE_BACKUP_INVOKED" in res_first_upg.stderr
+        assert "Do NOT run restore.sh --replace-data" in res_first_upg.stderr
+
+        # restore.sh DeleteObjects response error check fails when S3 returns partial Errors,
+        # AND every embedded Python block inside restore.sh compiles cleanly.
+        import re as _re
+
+        restore_text = (REPO_ROOT / "scripts/standalone/restore.sh").read_text(encoding="utf-8")
+        assert 'resp.get("Errors")' in restore_text
+        assert "ALTER DATABASE" in restore_text and "BEGIN;" in restore_text and "COMMIT;" in restore_text
+        assert "-restore-" in restore_text and "-pre-restore-" in restore_text
+        assert "caddy-pre-restore-" in restore_text
+
+        for var_name in ("cleanup_py", "MINIO_PREFLIGHT_PY", "MINIO_STAGE_PY", "MINIO_SWITCH_PY", "MISSING_CHECK_PY"):
+            m = _re.search(rf"{var_name}='\n(.*?)\n'", restore_text, flags=_re.DOTALL)
+            assert m, f"Missing embedded Python block {var_name} in restore.sh"
+            compile(m.group(1), f"restore.sh:{var_name}", "exec")
+
+        # Execute the real delete_keys_checked function extracted from MINIO_SWITCH_PY with a mock client
+        switch_src = _re.search(r"MINIO_SWITCH_PY='\n(.*?)\n'", restore_text, flags=_re.DOTALL)
+        assert switch_src is not None
+        fn_match = _re.search(
+            r"(def delete_keys_checked\(.*?\n    return deleted\n)",
+            switch_src.group(1),
+            flags=_re.DOTALL,
+        )
+        assert fn_match is not None
+
+        class _ErrS3:
+            def delete_objects(self, *, Bucket: str, Delete: dict[str, Any]) -> dict[str, Any]:
+                return {
+                    "Deleted": [],
+                    "Errors": [{"Key": "bad-key", "Code": "AccessDenied", "Message": "denied"}],
+                }
+
+        ns: dict[str, Any] = {"client": _ErrS3()}
+        exec(fn_match.group(1), ns)
+        with pytest.raises(RuntimeError, match="DeleteObjects failed.*bad-key.*AccessDenied"):
+            ns["delete_keys_checked"]("chat-uploads", ["bad-key"])

@@ -140,7 +140,14 @@ if ! [[ "$RETAIN" =~ ^[0-9]+$ ]]; then
   err "--retain must be a non-negative integer (got '${RETAIN}')."
   exit 2
 fi
-RETAIN=$((10#$RETAIN))
+# Check decimal string bounds BEFORE Bash 64-bit arithmetic conversion to prevent overflow wrap.
+RETAIN_STRIPPED="${RETAIN#"${RETAIN%%[!0]*}"}"
+RETAIN_STRIPPED="${RETAIN_STRIPPED:-0}"
+if (( ${#RETAIN_STRIPPED} > ${#RETAIN_MAX} )); then
+  err "--retain exceeds maximum allowed value of ${RETAIN_MAX} (got '${RETAIN}')."
+  exit 2
+fi
+RETAIN=$((10#$RETAIN_STRIPPED))
 if (( RETAIN > RETAIN_MAX )); then
   err "--retain exceeds maximum allowed value of ${RETAIN_MAX} (got ${RETAIN})."
   exit 2
@@ -153,27 +160,51 @@ if [[ ! -f "$ENV_FILE" ]]; then
   exit 1
 fi
 
+read_env_file_var() {
+  local env_path="$1" key="$2" default_val="${3:-}"
+  if [[ ! -f "$env_path" ]]; then
+    printf '%s' "$default_val"
+    return 0
+  fi
+  local val
+  val="$(python3 - "$env_path" "$key" <<'PY'
+import re, sys
+
+env_path, target_key = sys.argv[1], sys.argv[2]
+line_re = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*([=:])(.*)$")
+found = None
+with open(env_path, encoding="utf-8") as fh:
+    for raw in fh:
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        m = line_re.match(raw.rstrip("\r\n"))
+        if not m or m.group(1) != target_key:
+            continue
+        val = m.group(3).strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        elif val and val[0] not in ("'", '"'):
+            val = re.split(r"\s+#", val, maxsplit=1)[0].strip()
+        found = val
+if found is not None:
+    sys.stdout.write(found)
+PY
+)"
+  if [[ -n "$val" ]]; then
+    printf '%s' "$val"
+  else
+    printf '%s' "$default_val"
+  fi
+}
+
 read_env_var() {
   local key="$1" default_val="${2:-}"
   if [[ -n "${!key:-}" ]]; then
     printf '%s' "${!key}"
     return 0
   fi
-  local line val
-  line="$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -n 1 || true)"
-  val="${line#*=}"
-  if [[ "$val" == \"*\" && "$val" == *\" ]]; then
-    val="${val#\"}"
-    val="${val%\"}"
-  elif [[ "$val" == \'*\' && "$val" == *\' ]]; then
-    val="${val#\'}"
-    val="${val%\'}"
-  fi
-  if [[ -n "$val" ]]; then
-    printf '%s' "$val"
-  else
-    printf '%s' "$default_val"
-  fi
+  read_env_file_var "$ENV_FILE" "$key" "$default_val"
 }
 
 # External PostgreSQL guard: this script only operates on Compose-managed `postgres`.
@@ -256,9 +287,44 @@ chmod 700 "$STAGE_DIR"
 LOCK_DIR="${OUTPUT_DIR}/.dalton-backup.lock"
 LOCK_HELD=0
 
+pid_is_alive() {
+  local pid="$1"
+  [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 1
+  if kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  if ps -p "$pid" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
 acquire_publish_lock() {
   local waited=0
+  local missing_pid_waited=0
   while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    local pid_file="${LOCK_DIR}/pid"
+    if [[ -f "$pid_file" ]]; then
+      local lock_pid
+      lock_pid="$(tr -d '[:space:]' < "$pid_file" 2>/dev/null || true)"
+      if [[ -n "$lock_pid" && "$lock_pid" =~ ^[0-9]+$ ]]; then
+        if ! pid_is_alive "$lock_pid"; then
+          warn "Removing stale backup lock ${LOCK_DIR} left by dead PID ${lock_pid}."
+          rm -f "$pid_file" 2>/dev/null || true
+          rmdir "$LOCK_DIR" 2>/dev/null || true
+          continue
+        fi
+        missing_pid_waited=0
+      fi
+    else
+      missing_pid_waited=$(( missing_pid_waited + 1 ))
+      if (( missing_pid_waited >= 5 )); then
+        warn "Removing stale backup lock ${LOCK_DIR} (missing PID file)."
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+        missing_pid_waited=0
+        continue
+      fi
+    fi
     if (( waited >= 60 )); then
       err "Timed out waiting for backup publish lock: ${LOCK_DIR}"
       exit 1
@@ -266,12 +332,20 @@ acquire_publish_lock() {
     sleep 1
     waited=$(( waited + 1 ))
   done
+  printf '%s\n' "$$" > "${LOCK_DIR}/pid"
   LOCK_HELD=1
 }
 
 release_publish_lock() {
   if [[ "$LOCK_HELD" -eq 1 && -d "$LOCK_DIR" ]]; then
-    rmdir "$LOCK_DIR" 2>/dev/null || true
+    local lock_pid=""
+    if [[ -f "${LOCK_DIR}/pid" ]]; then
+      lock_pid="$(tr -d '[:space:]' < "${LOCK_DIR}/pid" 2>/dev/null || true)"
+    fi
+    if [[ -z "$lock_pid" || "$lock_pid" == "$$" ]]; then
+      rm -f "${LOCK_DIR}/pid" 2>/dev/null || true
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
     LOCK_HELD=0
   fi
 }
@@ -329,6 +403,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import sys
 import tarfile
 
@@ -422,7 +497,15 @@ except (ClientError, BotoCoreError) as exc:
     print(f"ERROR: Failed to list MinIO buckets: {exc}", file=sys.stderr)
     sys.exit(1)
 
-buckets = sorted(b["Name"] for b in resp.get("Buckets", []) if b.get("Name"))
+all_buckets = sorted(b["Name"] for b in resp.get("Buckets", []) if b.get("Name"))
+restore_bucket_re = re.compile(r"-(?:pre-)?restore-\d{14}$")
+skipped_buckets = [b for b in all_buckets if restore_bucket_re.search(b)]
+buckets = [b for b in all_buckets if not restore_bucket_re.search(b)]
+if skipped_buckets:
+    print(
+        f"[backup] INFO: Skipping temporary/preserved restore bucket(s): {', '.join(skipped_buckets)}",
+        file=sys.stderr,
+    )
 if default_bucket and default_bucket not in buckets:
     print(
         f"ERROR: Expected default bucket '{default_bucket}' not present in list_buckets() output ({buckets}).",

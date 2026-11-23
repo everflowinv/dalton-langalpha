@@ -177,7 +177,14 @@ if ! [[ "$RETAIN" =~ ^[0-9]+$ ]]; then
   err "--retain must be a non-negative integer (got '${RETAIN}')."
   exit 2
 fi
-RETAIN=$((10#$RETAIN))
+# Check decimal string bounds BEFORE Bash 64-bit arithmetic conversion to prevent overflow wrap.
+RETAIN_STRIPPED="${RETAIN#"${RETAIN%%[!0]*}"}"
+RETAIN_STRIPPED="${RETAIN_STRIPPED:-0}"
+if (( ${#RETAIN_STRIPPED} > ${#RETAIN_MAX} )); then
+  err "--retain exceeds maximum allowed value of ${RETAIN_MAX} (got '${RETAIN}')."
+  exit 2
+fi
+RETAIN=$((10#$RETAIN_STRIPPED))
 if (( RETAIN > RETAIN_MAX )); then
   err "--retain exceeds maximum allowed value of ${RETAIN_MAX} (got ${RETAIN})."
   exit 2
@@ -194,27 +201,51 @@ if [[ ! -f "$ENV_FILE" ]]; then
   exit 1
 fi
 
+read_env_file_var() {
+  local env_path="$1" key="$2" default_val="${3:-}"
+  if [[ ! -f "$env_path" ]]; then
+    printf '%s' "$default_val"
+    return 0
+  fi
+  local val
+  val="$(python3 - "$env_path" "$key" <<'PY'
+import re, sys
+
+env_path, target_key = sys.argv[1], sys.argv[2]
+line_re = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*([=:])(.*)$")
+found = None
+with open(env_path, encoding="utf-8") as fh:
+    for raw in fh:
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        m = line_re.match(raw.rstrip("\r\n"))
+        if not m or m.group(1) != target_key:
+            continue
+        val = m.group(3).strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        elif val and val[0] not in ("'", '"'):
+            val = re.split(r"\s+#", val, maxsplit=1)[0].strip()
+        found = val
+if found is not None:
+    sys.stdout.write(found)
+PY
+)"
+  if [[ -n "$val" ]]; then
+    printf '%s' "$val"
+  else
+    printf '%s' "$default_val"
+  fi
+}
+
 read_env_var() {
   local key="$1" default_val="${2:-}"
   if [[ -n "${!key:-}" ]]; then
     printf '%s' "${!key}"
     return 0
   fi
-  local line val
-  line="$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -n 1 || true)"
-  val="${line#*=}"
-  if [[ "$val" == \"*\" && "$val" == *\" ]]; then
-    val="${val#\"}"
-    val="${val%\"}"
-  elif [[ "$val" == \'*\' && "$val" == *\' ]]; then
-    val="${val#\'}"
-    val="${val%\'}"
-  fi
-  if [[ -n "$val" ]]; then
-    printf '%s' "$val"
-  else
-    printf '%s' "$default_val"
-  fi
+  read_env_file_var "$ENV_FILE" "$key" "$default_val"
 }
 
 # External PostgreSQL guard: refuse non-Compose databases before modifying anything.
@@ -295,6 +326,9 @@ PRE_BACKEND_TAG=""
 PRE_EDGE_TAG=""
 PRE_CRAWLER_TAG=""
 SNAPSHOT_CREATED=0
+FILES_REPLACED=0
+IMAGES_BUILT=0
+DB_MIGRATED=0
 
 STAGE_RELEASE=""
 PRE_UPGRADE_BACKUP=""
@@ -302,34 +336,68 @@ UPGRADE_SUCCEEDED=0
 
 print_rollback_steps() {
   printf "\n==================== UPGRADE FAILED — ROLLBACK GUIDE ====================\n" >&2
+  if [[ "$FILES_REPLACED" -eq 0 && "$IMAGES_BUILT" -eq 0 && "$DB_MIGRATED" -eq 0 ]]; then
+    printf "  Failure occurred BEFORE release files, container images, or the database were modified.\n" >&2
+    if [[ -n "$PRE_UPGRADE_BACKUP" && -d "$PRE_UPGRADE_BACKUP" ]]; then
+      printf "  Pre-upgrade backup : %s (no restore required)\n" "$PRE_UPGRADE_BACKUP" >&2
+    fi
+    printf "  Do NOT run restore.sh --replace-data; your running stack and data were not changed.\n" >&2
+    printf "  Inspect the error above and check:\n" >&2
+    printf "    %s\n" "$(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" ps)" >&2
+    printf "=========================================================================\n" >&2
+    return 0
+  fi
+
   if [[ -n "$PRE_UPGRADE_BACKUP" && -d "$PRE_UPGRADE_BACKUP" ]]; then
     printf "  Pre-upgrade backup : %s\n" "$PRE_UPGRADE_BACKUP" >&2
-    if [[ "$SNAPSHOT_CREATED" -eq 1 && -d "$SNAPSHOT_DIR" ]]; then
-      printf "  Release snapshot   : %s\n" "$SNAPSHOT_DIR" >&2
+  fi
+  if [[ "$SNAPSHOT_CREATED" -eq 1 && -d "$SNAPSHOT_DIR" ]]; then
+    printf "  Release snapshot   : %s\n" "$SNAPSHOT_DIR" >&2
+  fi
+  if [[ "$DB_MIGRATED" -eq 1 ]]; then
+    printf "  NOTE: Database migrations had already started. Writes acknowledged after the pre-upgrade backup are not in that backup.\n\n" >&2
+  else
+    printf "  NOTE: Failure occurred BEFORE database migrations ran. Do NOT run restore.sh --replace-data\n" >&2
+    printf "        (doing so would discard writes made after the backup even though the database was untouched).\n\n" >&2
+  fi
+
+  printf "  To roll back safely:\n" >&2
+  local step_no=1
+  if [[ "$FILES_REPLACED" -eq 1 && "$SNAPSHOT_CREATED" -eq 1 && -d "$SNAPSHOT_DIR" ]]; then
+    local rsync_cmd=(
+      rsync -a --delete
+      --exclude=/.env
+      --exclude=/backups
+      --exclude=/.upgrade-backup
+      --exclude=/.restore-backup
+      --exclude=/ci-artifacts
+      --exclude=/.git
+      --exclude=/deploy/standalone/certs
+      --exclude=/deploy/standalone/extra
+    )
+    if [[ "$DB_MIGRATED" -eq 1 && ! -f "${SNAPSHOT_DIR}/scripts/standalone/restore.sh" ]]; then
+      rsync_cmd+=(--exclude=/scripts/standalone/restore.sh)
     fi
-    printf "  NOTE: Writes acknowledged after the pre-upgrade backup are not in that backup.\n\n" >&2
-    printf "  To roll back safely:\n" >&2
-    local step_no=1
-    if [[ "$SNAPSHOT_CREATED" -eq 1 && -d "$SNAPSHOT_DIR" ]]; then
-      printf "    %d. Restore the previous release files (keeps .env, backups, certs, and extra snippets):\n" "$step_no" >&2
-      printf "         %s | %s\n" \
-        "$(fmt_cmd tar -cf - -C "$SNAPSHOT_DIR" .)" \
-        "$(fmt_cmd tar -xf - -C "$WORK_DIR")" >&2
-      step_no=$(( step_no + 1 ))
+    rsync_cmd+=("${SNAPSHOT_DIR}/" "${WORK_DIR}/")
+    printf "    %d. Restore the previous release files (removes files newly added by the failed release;\n" "$step_no" >&2
+    printf "       preserves .env, backups, .upgrade-backup, .restore-backup, certs, and extra snippets):\n" >&2
+    printf "         %s\n" "$(fmt_cmd "${rsync_cmd[@]}")" >&2
+    step_no=$(( step_no + 1 ))
+  fi
+  if [[ -n "$PRE_BACKEND_TAG" || -n "$PRE_EDGE_TAG" || -n "$PRE_CRAWLER_TAG" ]]; then
+    printf "    %d. Restore the pre-upgrade container image tags:\n" "$step_no" >&2
+    if [[ -n "$PRE_BACKEND_TAG" ]]; then
+      printf "         %s\n" "$(fmt_cmd docker tag "$PRE_BACKEND_TAG" "$BACKEND_IMAGE")" >&2
     fi
-    if [[ -n "$PRE_BACKEND_TAG" || -n "$PRE_EDGE_TAG" || -n "$PRE_CRAWLER_TAG" ]]; then
-      printf "    %d. Restore the pre-upgrade container image tags:\n" "$step_no" >&2
-      if [[ -n "$PRE_BACKEND_TAG" ]]; then
-        printf "         %s\n" "$(fmt_cmd docker tag "$PRE_BACKEND_TAG" "$BACKEND_IMAGE")" >&2
-      fi
-      if [[ -n "$PRE_EDGE_TAG" ]]; then
-        printf "         %s\n" "$(fmt_cmd docker tag "$PRE_EDGE_TAG" "$EDGE_IMAGE")" >&2
-      fi
-      if [[ -n "$PRE_CRAWLER_TAG" && "$PRE_CRAWLER_TAG" != "$PRE_BACKEND_TAG" ]]; then
-        printf "         # Crawler image tag preserved at: %s\n" "$PRE_CRAWLER_TAG" >&2
-      fi
-      step_no=$(( step_no + 1 ))
+    if [[ -n "$PRE_EDGE_TAG" ]]; then
+      printf "         %s\n" "$(fmt_cmd docker tag "$PRE_EDGE_TAG" "$EDGE_IMAGE")" >&2
     fi
+    if [[ -n "$PRE_CRAWLER_TAG" && "$PRE_CRAWLER_TAG" != "$PRE_BACKEND_TAG" ]]; then
+      printf "         # Crawler image tag preserved at: %s\n" "$PRE_CRAWLER_TAG" >&2
+    fi
+    step_no=$(( step_no + 1 ))
+  fi
+  if [[ "$DB_MIGRATED" -eq 1 && -n "$PRE_UPGRADE_BACKUP" && -d "$PRE_UPGRADE_BACKUP" ]]; then
     local restore_cmd=(
       bash "${WORK_DIR}/scripts/standalone/restore.sh"
       --work-dir "$WORK_DIR"
@@ -344,15 +412,10 @@ print_rollback_steps() {
     printf "    %d. Restore the pre-upgrade database, MinIO objects, and Caddy data:\n" "$step_no" >&2
     printf "         %s\n" "$(fmt_cmd "${restore_cmd[@]}")" >&2
     step_no=$(( step_no + 1 ))
-    printf "    %d. Check service status and logs:\n" "$step_no" >&2
-    printf "         %s\n" "$(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" ps)" >&2
-    printf "         %s\n" "$(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" logs --tail=100 backend edge)" >&2
-  else
-    printf "  Failure occurred before a pre-upgrade backup was completed.\n" >&2
-    printf "  Release files, database, and running containers were not modified.\n" >&2
-    printf "  Inspect the error above and check:\n" >&2
-    printf "    %s\n" "$(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" ps)" >&2
   fi
+  printf "    %d. Check service status and logs:\n" "$step_no" >&2
+  printf "         %s\n" "$(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" ps)" >&2
+  printf "         %s\n" "$(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" logs --tail=100 backend edge)" >&2
   printf "=========================================================================\n" >&2
 }
 
@@ -367,10 +430,50 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Step 1: Take a full zero-downtime pre-upgrade backup using the OLD backup.sh
-info "1/4 Running pre-upgrade backup using existing scripts/standalone/backup.sh..."
+# Pre-stage and validate the new release package in a temporary directory BEFORE running
+# backup or modifying WORK_DIR (also supplies backup.sh on first upgrade from Batch 1 / #480).
+info "Staging and validating new release package before backing up or modifying ${WORK_DIR}..."
+RELEASE_SRC=""
+if [[ -n "$RELEASE_TAR" ]]; then
+  STAGE_RELEASE="$(mktemp -d)"
+  tar -xzf "$RELEASE_TAR" -C "$STAGE_RELEASE"
+  if [[ -f "${STAGE_RELEASE}/docker-compose.core.yml" ]]; then
+    RELEASE_SRC="$STAGE_RELEASE"
+  else
+    shopt -s nullglob
+    top_dirs=("${STAGE_RELEASE}"/*/)
+    shopt -u nullglob
+    if [[ "${#top_dirs[@]}" -eq 1 && -f "${top_dirs[0]}docker-compose.core.yml" ]]; then
+      RELEASE_SRC="${top_dirs[0]%/}"
+    else
+      err "Invalid release tarball: docker-compose.core.yml not found at archive root."
+      exit 1
+    fi
+  fi
+else
+  RELEASE_SRC="$(cd "$RELEASE_DIR" && pwd)"
+fi
+
+for req in docker-compose.yml docker-compose.core.yml scripts/standalone/migrate.sh scripts/standalone/backup.sh scripts/standalone/restore.sh deploy/standalone/Caddyfile; do
+  if [[ ! -f "${RELEASE_SRC}/${req}" ]]; then
+    err "Release package is missing required file: ${req}"
+    exit 1
+  fi
+done
+ok "Validated new release package."
+
+# Step 1: Take a full zero-downtime pre-upgrade backup using the OLD backup.sh when present,
+# or fall back to the new release package's backup.sh on first upgrade from Batch 1 (#480).
+BACKUP_SCRIPT=""
+if [[ -f "${WORK_DIR}/scripts/standalone/backup.sh" ]]; then
+  BACKUP_SCRIPT="${WORK_DIR}/scripts/standalone/backup.sh"
+  info "1/4 Running pre-upgrade backup using existing scripts/standalone/backup.sh..."
+else
+  BACKUP_SCRIPT="${RELEASE_SRC}/scripts/standalone/backup.sh"
+  info "1/4 Existing deployment has no scripts/standalone/backup.sh (first upgrade from #480); running backup.sh from the new release package against the old stack..."
+fi
 BACKUP_CMD=(
-  bash "${WORK_DIR}/scripts/standalone/backup.sh"
+  bash "$BACKUP_SCRIPT"
   --work-dir "$WORK_DIR"
   --output-dir "$BACKUP_OUTPUT_DIR"
   --retain "$RETAIN"
@@ -424,6 +527,8 @@ chmod 700 "$SNAPSHOT_DIR"
     --exclude='backups' \
     --exclude='./.upgrade-backup' \
     --exclude='.upgrade-backup' \
+    --exclude='./.restore-backup' \
+    --exclude='.restore-backup' \
     --exclude='./ci-artifacts' \
     --exclude='ci-artifacts' \
     --exclude='./.git' \
@@ -437,37 +542,10 @@ chmod 700 "$SNAPSHOT_DIR"
 SNAPSHOT_CREATED=1
 ok "Snapshotted previous release files to ${SNAPSHOT_DIR}."
 
-# Step 3: Extract new release into a temporary directory, validate, then replace WORK_DIR
-info "3/4 Staging and validating new release package before replacing ${WORK_DIR}..."
-RELEASE_SRC=""
-if [[ -n "$RELEASE_TAR" ]]; then
-  STAGE_RELEASE="$(mktemp -d)"
-  tar -xzf "$RELEASE_TAR" -C "$STAGE_RELEASE"
-  if [[ -f "${STAGE_RELEASE}/docker-compose.core.yml" ]]; then
-    RELEASE_SRC="$STAGE_RELEASE"
-  else
-    shopt -s nullglob
-    top_dirs=("${STAGE_RELEASE}"/*/)
-    shopt -u nullglob
-    if [[ "${#top_dirs[@]}" -eq 1 && -f "${top_dirs[0]}docker-compose.core.yml" ]]; then
-      RELEASE_SRC="${top_dirs[0]%/}"
-    else
-      err "Invalid release tarball: docker-compose.core.yml not found at archive root."
-      exit 1
-    fi
-  fi
-else
-  RELEASE_SRC="$(cd "$RELEASE_DIR" && pwd)"
-fi
-
-for req in docker-compose.yml docker-compose.core.yml scripts/standalone/migrate.sh scripts/standalone/backup.sh scripts/standalone/restore.sh deploy/standalone/Caddyfile; do
-  if [[ ! -f "${RELEASE_SRC}/${req}" ]]; then
-    err "Release package is missing required file: ${req}"
-    exit 1
-  fi
-done
-
+# Step 3: Replace release files in WORK_DIR from validated RELEASE_SRC
+info "3/4 Applying validated new release files to ${WORK_DIR}..."
 if [[ "$RELEASE_SRC" != "$WORK_DIR" ]]; then
+  FILES_REPLACED=1
   (
     cd "$RELEASE_SRC"
     tar -cf - \
@@ -477,6 +555,8 @@ if [[ "$RELEASE_SRC" != "$WORK_DIR" ]]; then
       --exclude='backups' \
       --exclude='./.upgrade-backup' \
       --exclude='.upgrade-backup' \
+      --exclude='./.restore-backup' \
+      --exclude='.restore-backup' \
       --exclude='./ci-artifacts' \
       --exclude='ci-artifacts' \
       --exclude='./.git' \
@@ -488,7 +568,7 @@ if [[ "$RELEASE_SRC" != "$WORK_DIR" ]]; then
       .
   ) | tar -xf - -C "$WORK_DIR"
   mkdir -p "${WORK_DIR}/deploy/standalone/certs" "${WORK_DIR}/deploy/standalone/extra"
-  ok "Replaced release files in ${WORK_DIR} (.env, backups, .upgrade-backup, certs, and extra snippets preserved)."
+  ok "Replaced release files in ${WORK_DIR} (.env, backups, .upgrade-backup, .restore-backup, certs, and extra snippets preserved)."
 else
   info "Release directory is already ${WORK_DIR}; continuing in place."
 fi
@@ -502,6 +582,7 @@ fi
 info "4/4 Building, migrating, replacing services, and verifying health..."
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   info "Building updated service images (migrate, backend, crawler, edge)..."
+  IMAGES_BUILT=1
   build_sha="${NEW_RELEASE_SHA:-standalone}"
   BUILD_GIT_SHA="$build_sha" BUILD_GIT_DIRTY="false" \
     compose_cmd build "${BUILD_ARGS[@]}" migrate backend crawler edge
@@ -511,6 +592,7 @@ else
 fi
 
 info "Running new version database migrations..."
+DB_MIGRATED=1
 compose_cmd run --rm migrate
 compose_cmd run --rm minio-init
 ok "Database migrations and bucket check succeeded."
@@ -555,6 +637,17 @@ if ! compose_cmd ps --status running --services | grep -qx "edge"; then
   exit 1
 fi
 
+probe_domain="${DOMAIN#[}"
+probe_domain="${probe_domain%]}"
+probe_url_host="$probe_domain"
+probe_connect_ip="127.0.0.1"
+probe_curl_extra=()
+if [[ "$probe_domain" == *:* ]]; then
+  probe_url_host="[${probe_domain}]"
+  probe_connect_ip="[${probe_domain}]"
+  probe_curl_extra=(-g)
+fi
+
 edge_ok=0
 if [[ "$TLS_MODE" == "loopback" ]]; then
   for _ in $(seq 1 30); do
@@ -568,8 +661,8 @@ elif [[ "$TLS_MODE" == "internal" ]]; then
   tmp_ca="$(mktemp)"
   for _ in $(seq 1 30); do
     if compose_cmd exec -T edge cat /data/caddy/pki/authorities/local/root.crt > "$tmp_ca" 2>/dev/null && [[ -s "$tmp_ca" ]]; then
-      if curl -sf --cacert "$tmp_ca" --resolve "${DOMAIN}:${EDGE_HTTPS_PORT}:127.0.0.1" \
-          "https://${DOMAIN}:${EDGE_HTTPS_PORT}/api/v1/auth/cli" >/dev/null 2>&1; then
+      if curl -sf "${probe_curl_extra[@]}" --cacert "$tmp_ca" --resolve "${probe_url_host}:${EDGE_HTTPS_PORT}:${probe_connect_ip}" \
+          "https://${probe_url_host}:${EDGE_HTTPS_PORT}/api/v1/auth/cli" >/dev/null 2>&1; then
         edge_ok=1
         break
       fi
@@ -583,8 +676,8 @@ else
     curl_ca_args=(--cacert "$CA_FILE")
   fi
   for _ in $(seq 1 30); do
-    if curl -sf "${curl_ca_args[@]}" --resolve "${DOMAIN}:${EDGE_HTTPS_PORT}:127.0.0.1" \
-        "https://${DOMAIN}:${EDGE_HTTPS_PORT}/api/v1/auth/cli" >/dev/null 2>&1; then
+    if curl -sf "${probe_curl_extra[@]}" "${curl_ca_args[@]}" --resolve "${probe_url_host}:${EDGE_HTTPS_PORT}:${probe_connect_ip}" \
+        "https://${probe_url_host}:${EDGE_HTTPS_PORT}/api/v1/auth/cli" >/dev/null 2>&1; then
       edge_ok=1
       break
     fi

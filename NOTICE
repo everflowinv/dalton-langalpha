@@ -20,7 +20,7 @@ Dockerfiles under `deploy/` and `scripts/dalton/`.
 1. Container Runtime & Infrastructure Components
 --------------------------------------------------------------------------------
 
-- Caddy (`caddy:2.9.1-alpine`, `deploy/standalone/Dockerfile.edge`) — Apache License 2.0
+- Caddy (`caddy:2.9.1-alpine@sha256:b4e3952384eb9524a887633ce65c752dd7c71314d2c2acf98cd5c715aaa534f0`, `deploy/standalone/Dockerfile.edge`) — Apache License 2.0
   Source: https://github.com/caddyserver/caddy/tree/v2.9.1
   License: https://github.com/caddyserver/caddy/blob/v2.9.1/LICENSE
 - PostgreSQL (`postgres:18`, `scripts/dalton/Dockerfile.postgres`) — PostgreSQL License
@@ -31,7 +31,7 @@ Dockerfiles under `deploy/` and `scripts/dalton/`.
   License: https://github.com/pgvector/pgvector/blob/master/LICENSE
 - Valkey (`valkey/valkey:8-alpine@sha256:a038175878d66b9d274fbf8be73c0305e93798b83917647f167e18cef3c71eec`, `docker-compose.core.yml`, service name `redis`) — BSD-3-Clause License
   Source: https://github.com/valkey-io/valkey
-  License: https://github.com/valkey-io/valkey/blob/unstable/COPYING
+  License: https://github.com/valkey-io/valkey/blob/8.1/COPYING
 - MinIO (`cgr.dev/chainguard/minio@sha256:e70b2b1e74d79457f808710483bd726ff364529ca30736eaa15a6ab547d3a5a7`, `docker-compose.core.yml`, overridable via `DALTON_MINIO_IMAGE`) — GNU Affero General Public License v3.0 (AGPL-3.0)
   Upstream Source: https://github.com/minio/minio
   License: https://github.com/minio/minio/blob/master/LICENSE
@@ -40,7 +40,7 @@ Dockerfiles under `deploy/` and `scripts/dalton/`.
   Source: https://github.com/krallin/tini
 - Python 3.13 (`python:3.13-slim`, `scripts/dalton/Dockerfile.dalton`) — Python Software Foundation License v2 (PSF-2.0)
   Source: https://github.com/python/cpython
-- Node.js (`node:24-alpine`, build-time only in `deploy/standalone/Dockerfile.edge`) — MIT License
+- Node.js (`node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85`, build-time only in `deploy/standalone/Dockerfile.edge`) — MIT License
   Source: https://github.com/nodejs/node
 - uv (build/runtime package manager in `scripts/dalton/Dockerfile.dalton`) — Dual-licensed under Apache License 2.0 / MIT License
   Source: https://github.com/astral-sh/uv

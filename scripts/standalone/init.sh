@@ -450,9 +450,34 @@ EOF
 get_env_value() {
   local key="$1"
   [[ -f "$ENV_FILE" ]] || return 0
-  local line
-  line="$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -n 1 || true)"
-  printf '%s' "${line#*=}"
+  awk -v k="$key" '
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      sub(/^[[:space:]]+/, "", line)
+      if (line == "" || substr(line, 1, 1) == "#") next
+      if (line ~ /^export[[:space:]]+/) {
+        sub(/^export[[:space:]]+/, "", line)
+      }
+      if (substr(line, 1, length(k)) != k) next
+      rest = substr(line, length(k) + 1)
+      if (rest !~ /^[[:space:]]*[=:]/) next
+      sub(/^[[:space:]]*[=:][[:space:]]*/, "", rest)
+      first = substr(rest, 1, 1)
+      last = substr(rest, length(rest), 1)
+      if (length(rest) >= 2 && first == last && (first == "\"" || first == "\047")) {
+        rest = substr(rest, 2, length(rest) - 2)
+      } else {
+        sub(/[[:space:]]+#.*$/, "", rest)
+        sub(/[[:space:]]+$/, "", rest)
+      }
+      val = rest
+      found = 1
+    }
+    END {
+      if (found) printf "%s", val
+    }
+  ' "$ENV_FILE"
 }
 
 get_file_mode() {
@@ -475,23 +500,69 @@ write_env_key() {
   fi
   tmp="$(mktemp "${env_dir}/.env.tmp.XXXXXX")"
   chmod 600 "$tmp"
-  if grep -qE "^${key}=" "$ENV_FILE" 2>/dev/null; then
+  if [[ -f "$ENV_FILE" ]]; then
     awk -v k="$key" -v v="$val" '
       BEGIN { replaced = 0 }
-      index($0, k "=") == 1 {
-        print k "=" v
-        replaced = 1
-        next
+      {
+        line = $0
+        sub(/\r$/, "", line)
+        trimmed = line
+        sub(/^[[:space:]]+/, "", trimmed)
+        if (trimmed ~ /^export[[:space:]]+/) {
+          sub(/^export[[:space:]]+/, "", trimmed)
+        }
+        if (substr(trimmed, 1, length(k)) == k) {
+          rest = substr(trimmed, length(k) + 1)
+          if (rest ~ /^[[:space:]]*[=:]/) {
+            if (!replaced) {
+              print k "=" v
+              replaced = 1
+            }
+            next
+          }
+        }
+        print $0
       }
-      { print }
       END {
         if (!replaced) print k "=" v
       }
     ' "$ENV_FILE" > "$tmp"
   else
-    cat "$ENV_FILE" > "$tmp"
-    printf '%s=%s\n' "$key" "$val" >> "$tmp"
+    printf '%s=%s\n' "$key" "$val" > "$tmp"
   fi
+  chmod "$orig_mode" "$tmp"
+  mv "$tmp" "$ENV_FILE"
+}
+
+remove_env_key() {
+  local key="$1"
+  [[ -f "$ENV_FILE" ]] || return 0
+  if [[ -z "$(get_env_value "$key")" ]] && ! grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*[=:]" "$ENV_FILE" 2>/dev/null; then
+    return 0
+  fi
+  local env_dir tmp orig_mode="600"
+  env_dir="$(dirname "$ENV_FILE")"
+  orig_mode="$(get_file_mode "$ENV_FILE")"
+  tmp="$(mktemp "${env_dir}/.env.tmp.XXXXXX")"
+  chmod 600 "$tmp"
+  awk -v k="$key" '
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      trimmed = line
+      sub(/^[[:space:]]+/, "", trimmed)
+      if (trimmed ~ /^export[[:space:]]+/) {
+        sub(/^export[[:space:]]+/, "", trimmed)
+      }
+      if (substr(trimmed, 1, length(k)) == k) {
+        rest = substr(trimmed, length(k) + 1)
+        if (rest ~ /^[[:space:]]*[=:]/) {
+          next
+        }
+      }
+      print $0
+    }
+  ' "$ENV_FILE" > "$tmp"
   chmod "$orig_mode" "$tmp"
   mv "$tmp" "$ENV_FILE"
 }
@@ -675,8 +746,17 @@ main() {
     tls_mode="$existing_tls_mode"
   fi
 
+  local url_host loopback_bind
+  if [[ "$domain" == *:* ]]; then
+    url_host="[${domain}]"
+    loopback_bind="[${domain}]"
+  else
+    url_host="$domain"
+    loopback_bind="127.0.0.1"
+  fi
+
   if [[ "$tls_mode" == "auto" && "$domain_class" != "public" ]]; then
-    warn "DALTON_TLS_MODE=auto selected for loopback/non-public host '${domain}'; binding stays on 127.0.0.1."
+    warn "DALTON_TLS_MODE=auto selected for loopback/non-public host '${domain}'; binding enforced to ${loopback_bind}."
   fi
 
   local force_network_update=0
@@ -704,47 +784,33 @@ main() {
   set_env_if_empty "VITE_DALTON_UI" "true" || true
   set_env_if_empty "DALTON_TIMEZONE" "UTC" || true
   set_env_if_empty "DALTON_EDGE_PORT" "8088" || true
+  # Single source of truth: docker-compose.core.yml derives DALTON_TRUSTED_PROXIES
+  # directly from DALTON_CORE_INTERNAL_SUBNET so the two never drift.
   set_env_if_empty "DALTON_CORE_INTERNAL_SUBNET" "$DEFAULT_CORE_INTERNAL_SUBNET" || true
-  local core_subnet
-  core_subnet="$(get_env_value "DALTON_CORE_INTERNAL_SUBNET")"
-  core_subnet="${core_subnet:-$DEFAULT_CORE_INTERNAL_SUBNET}"
-  set_env_if_empty "DALTON_TRUSTED_PROXIES" "$core_subnet" || true
   set_env_if_empty "DALTON_TRUSTED_PROXY_HOPS" "1" || true
   set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL" "http://minio:9000" || true
   set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME" "chat-uploads" || true
   set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_REGION" "us-east-1" || true
   set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE" "path" || true
 
-  local edge_port tls_bind http_port https_port public_url url_host invite_domain cert_dir compose_file
+  local edge_port tls_bind http_port https_port public_url invite_domain cert_dir compose_file
   edge_port="$(get_env_value "DALTON_EDGE_PORT")"
   edge_port="${edge_port:-8088}"
 
-  if [[ "$domain" == *:* ]]; then
-    url_host="[${domain}]"
-  else
-    url_host="$domain"
-  fi
-
   case "$tls_mode" in
     loopback)
-      tls_bind="127.0.0.1"
+      tls_bind="$loopback_bind"
       http_port="18080"
       https_port="18443"
       public_url="http://127.0.0.1:${edge_port}"
       compose_file="docker-compose.yml:docker-compose.core.yml"
       ;;
     internal|auto|custom)
-      if [[ "$domain_class" == "loopback" ]]; then
-        tls_bind="127.0.0.1"
-        http_port="18080"
-        https_port="18443"
-        public_url="https://${url_host}:${https_port}"
-      else
-        tls_bind="0.0.0.0"
-        http_port="80"
-        https_port="443"
-        public_url="https://${url_host}"
-      fi
+      # Before Batch 4b ships local sign-in, all published addresses must stay loopback.
+      tls_bind="$loopback_bind"
+      http_port="18080"
+      https_port="18443"
+      public_url="https://${url_host}:${https_port}"
       compose_file="docker-compose.yml:docker-compose.core.yml:deploy/standalone/docker-compose.tls.yml"
       ;;
   esac
@@ -756,7 +822,22 @@ main() {
   fi
 
   set_env_maybe_override "$force_network_update" "DALTON_TLS_MODE" "$tls_mode"
-  set_env_maybe_override "$force_network_update" "DALTON_EDGE_TLS_BIND" "$tls_bind"
+  # Before Batch 4b ships local sign-in, always rewrite the listen/bind address in .env
+  # to the loopback address (127.0.0.1 or [::1]) on every init.sh run regardless of any
+  # pre-existing value (e.g. 0.0.0.0) so no passwordless stack can publish externally.
+  local existing_tls_bind
+  existing_tls_bind="$(get_env_value "DALTON_EDGE_TLS_BIND")"
+  write_env_key "DALTON_EDGE_TLS_BIND" "$tls_bind"
+  if [[ -n "$existing_tls_bind" && "$existing_tls_bind" != "$tls_bind" ]]; then
+    warn "Rewrote DALTON_EDGE_TLS_BIND from '${existing_tls_bind}' to '${tls_bind}' (before Batch 4b, only loopback listening addresses are permitted)."
+  else
+    info "Enforced loopback listen address DALTON_EDGE_TLS_BIND=${tls_bind} (before Batch 4b, only loopback addresses are published)."
+  fi
+  if [[ "$domain" == *:* ]]; then
+    write_env_key "DALTON_CADDY_HOST" "$url_host"
+  else
+    remove_env_key "DALTON_CADDY_HOST"
+  fi
   set_env_maybe_override "$force_network_update" "DALTON_EDGE_HTTP_PORT" "$http_port"
   set_env_maybe_override "$force_network_update" "DALTON_EDGE_HTTPS_PORT" "$https_port"
   set_env_maybe_override "$force_network_update" "COMPOSE_FILE" "$compose_file"
@@ -772,7 +853,13 @@ main() {
   cert_dir="$(get_env_value "DALTON_TLS_CERT_DIR")"
   cert_dir="${cert_dir:-./deploy/standalone/certs}"
 
-  ok "DALTON_TLS_MODE=${tls_mode} (bind=${tls_bind}, http=${http_port}, https=${https_port})"
+  local actual_tls_mode actual_tls_bind actual_http_port actual_https_port actual_public_url
+  actual_tls_mode="$(get_env_value "DALTON_TLS_MODE")"
+  actual_tls_bind="$(get_env_value "DALTON_EDGE_TLS_BIND")"
+  actual_http_port="$(get_env_value "DALTON_EDGE_HTTP_PORT")"
+  actual_https_port="$(get_env_value "DALTON_EDGE_HTTPS_PORT")"
+  actual_public_url="$(get_env_value "PUBLIC_APP_URL")"
+  ok "DALTON_TLS_MODE=${actual_tls_mode:-$tls_mode} (bind=${actual_tls_bind:-$tls_bind}, http=${actual_http_port:-$http_port}, https=${actual_https_port:-$https_port}, url=${actual_public_url:-$public_url})"
 
   # Generate all secrets with `openssl rand -hex 32` without overwriting existing values.
   local generated=()

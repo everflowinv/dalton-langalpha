@@ -69,7 +69,7 @@ _lib = importlib.import_module("_lib")
 
 LOCAL_DEV_USER = "local-dev-user"
 PROBE_EDGE_USER = "probe-edge-user"
-FAKE_MODEL_NAME = os.environ.get("FAKE_LLM_MODEL", "gpt-6-luna")
+FAKE_MODEL_NAME = _lib.FAKE_MODEL_NAME
 SENTINEL_WORKSPACE_NAME = "b6-verify-workspace"
 SENTINEL_CHAT_PROMPT = "Hello Dalton B6 backup restore sentinel check!"
 SENTINEL_UPLOAD_FILENAME = "b6_sentinel_object.txt"
@@ -324,7 +324,7 @@ def check_init_tls_modes(ctx: _lib.ComposeContext) -> None:
                 "DOMAIN": "localhost",
                 "DALTON_TLS_MODE": "loopback",
                 "DALTON_EDGE_TLS_BIND": "127.0.0.1",
-                "DALTON_TRUSTED_PROXIES": "172.31.250.0/24",
+                "DALTON_CORE_INTERNAL_SUBNET": "172.31.250.0/24",
                 "DALTON_TRUSTED_PROXY_HOPS": "1",
                 "COMPOSE_FILE": "docker-compose.yml:docker-compose.core.yml",
                 "PUBLIC_APP_URL": "http://127.0.0.1:8088",
@@ -342,6 +342,19 @@ def check_init_tls_modes(ctx: _lib.ComposeContext) -> None:
                 "COMPOSE_FILE": "docker-compose.yml:docker-compose.core.yml:deploy/standalone/docker-compose.tls.yml",
                 "PUBLIC_APP_URL": "https://localhost:18443",
                 "DALTON_INVITE_EMAIL_DOMAIN": "team.dalton.local",
+            },
+        ),
+        (
+            "loopback-ipv6-internal",
+            ["--domain", "::1", "--tls-mode", "internal"],
+            {
+                "DOMAIN": "::1",
+                "DALTON_TLS_MODE": "internal",
+                "DALTON_EDGE_TLS_BIND": "[::1]",
+                "DALTON_CADDY_HOST": "[::1]",
+                "DALTON_EDGE_HTTP_PORT": "18080",
+                "DALTON_EDGE_HTTPS_PORT": "18443",
+                "PUBLIC_APP_URL": "https://[::1]:18443",
             },
         ),
         (
@@ -376,6 +389,9 @@ def check_init_tls_modes(ctx: _lib.ComposeContext) -> None:
             )
             env_path = case_dir / ".env"
             parsed = _lib.load_env_file(env_path)
+            assert "DALTON_TRUSTED_PROXIES" not in parsed, (
+                "init.sh must not hardcode DALTON_TRUSTED_PROXIES (derived from DALTON_CORE_INTERNAL_SUBNET in compose)"
+            )
             for key, want in expected.items():
                 got = parsed.get(key)
                 assert got == want, (
@@ -388,6 +404,24 @@ def check_init_tls_modes(ctx: _lib.ComposeContext) -> None:
                     assert secret_val not in combined_out, (
                         f"init.sh leaked {secret_key} to stdout/stderr!"
                     )
+
+        # Pre-existing non-loopback listen address must be rewritten to 127.0.0.1 even with no flags
+        stale_dir = tmp_root / "rewrite-stale-bind"
+        init_stale = _stage_init_dir(ctx.work_dir, stale_dir)
+        stale_env = stale_dir / ".env"
+        stale_env.write_text(
+            "DOMAIN=localhost\nDALTON_TLS_MODE=auto\nDALTON_EDGE_TLS_BIND=0.0.0.0\n",
+            encoding="utf-8",
+        )
+        os.chmod(stale_env, 0o600)
+        _run_cmd(
+            ["bash", str(init_stale), "--non-interactive", "--skip-sandbox-build"],
+            cwd=stale_dir,
+            timeout=60,
+        )
+        assert _lib.load_env_file(stale_env).get("DALTON_EDGE_TLS_BIND") == "127.0.0.1", (
+            "init.sh must always rewrite pre-existing DALTON_EDGE_TLS_BIND to 127.0.0.1 before Batch 4b"
+        )
 
         # Public domain must be rejected until Batch 4b ships
         pub_dir = tmp_root / "reject-public"
@@ -429,11 +463,13 @@ def check_loopback_ports_caddy_adapt_and_custom_tls(ctx: _lib.ComposeContext) ->
         f"Expected single 127.0.0.1 -> 8088/tcp binding in loopback mode, got {loopback_bindings}"
     )
 
-    # 2b. Run `caddy adapt` for all four modes inside the edge container
+    # 2b. Run `caddy adapt` for all four modes (including loopback auto & IPv6 internal)
     adapt_cases = (
         ("loopback", "localhost", "18443"),
         ("internal", "localhost", "18443"),
+        ("internal", "[::1]", "18443"),
         ("auto", "dalton.example.com", "443"),
+        ("auto", "localhost", "18443"),
         ("custom", "localhost", "18443"),
     )
     for mode, domain, https_port in adapt_cases:
@@ -463,7 +499,11 @@ def check_loopback_ports_caddy_adapt_and_custom_tls(ctx: _lib.ComposeContext) ->
         assert "apps" in adapted and "http" in adapted["apps"], (
             f"caddy adapt output for mode={mode} missing apps.http"
         )
-    log("2b OK (`caddy adapt` passed for loopback, internal, auto, and custom).")
+        if mode == "auto" and https_port == "18443":
+            assert ":18443" in proc.stdout, (
+                "Loopback auto mode HTTP->HTTPS redirect must include host port :18443"
+            )
+    log("2b OK (`caddy adapt` passed for loopback, internal, IPv6 internal, auto, loopback auto :18443, and custom).")
 
     # 2c. Start `custom` mode once with an ephemeral self-signed certificate and complete strict handshake
     env_file = ctx.work_dir / ".env"
@@ -558,6 +598,8 @@ def seed_sentinel_data(ctx: _lib.ComposeContext) -> dict[str, str]:
         ON CONFLICT (user_id) DO NOTHING;
         """
     )
+    # Configure the CI fake Responses API provider/model via HTTP API (self-contained & idempotent).
+    _lib.configure_fake_llm_model(ctx, model_name=FAKE_MODEL_NAME)
 
     ws_resp = _lib.http_request(
         "POST",
@@ -893,9 +935,10 @@ def _count_minio_objects(
     cwd: Path,
     *,
     env: dict[str, str] | None = None,
+    bucket: str | None = None,
 ) -> int:
     script = (
-        "import os, boto3\n"
+        "import os, re, boto3\n"
         "from botocore.config import Config\n"
         "def _e(*ks, d=''):\n"
         "    for k in ks:\n"
@@ -907,9 +950,16 @@ def _count_minio_objects(
         "aws_secret_access_key=_e('DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY', 'MINIO_ROOT_PASSWORD'), "
         "region_name=_e('DALTON_CHAT_UPLOAD_STORAGE_REGION', d='us-east-1'), "
         "config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}))\n"
+        f"target_bucket = {bucket!r}\n"
+        "skip_re = re.compile(r'-(?:pre-)?restore-\\d{14}$')\n"
         "total = 0\n"
         "for b in c.list_buckets().get('Buckets', []):\n"
-        "    for page in c.get_paginator('list_objects_v2').paginate(Bucket=b['Name']):\n"
+        "    name = b['Name']\n"
+        "    if target_bucket is not None:\n"
+        "        if name != target_bucket: continue\n"
+        "    elif skip_re.search(name):\n"
+        "        continue\n"
+        "    for page in c.get_paginator('list_objects_v2').paginate(Bucket=name):\n"
         "        total += len(page.get('Contents', []))\n"
         "print(total)\n"
     )
@@ -923,6 +973,39 @@ def _count_minio_objects(
         timeout=60,
     )
     return int(proc.stdout.strip().splitlines()[-1])
+
+
+def _list_minio_buckets(
+    compose_cmd: list[str],
+    cwd: Path,
+    *,
+    env: dict[str, str] | None = None,
+) -> list[str]:
+    script = (
+        "import json, os, boto3\n"
+        "from botocore.config import Config\n"
+        "def _e(*ks, d=''):\n"
+        "    for k in ks:\n"
+        "        v = (os.getenv(k) or '').strip()\n"
+        "        if v: return v\n"
+        "    return d\n"
+        "c = boto3.client('s3', endpoint_url=_e('DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL', d='http://minio:9000'), "
+        "aws_access_key_id=_e('DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID', 'MINIO_ROOT_USER'), "
+        "aws_secret_access_key=_e('DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY', 'MINIO_ROOT_PASSWORD'), "
+        "region_name=_e('DALTON_CHAT_UPLOAD_STORAGE_REGION', d='us-east-1'), "
+        "config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}))\n"
+        "print(json.dumps(sorted(b['Name'] for b in c.list_buckets().get('Buckets', []) if b.get('Name'))))\n"
+    )
+    proc = subprocess.run(
+        [*compose_cmd, "exec", "-T", "backend", "uv", "run", "--no-sync", "python", "-c", script],
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    return list(json.loads(proc.stdout.strip().splitlines()[-1]))
 
 
 def _fetch_minio_object_sha_and_ct(
@@ -1201,7 +1284,6 @@ def check_restore_on_clean_stack(
                 "COMPOSE_PROJECT_NAME": restore_project,
                 "SANDBOX_DOCKER_NETWORK": f"{restore_project}_sandbox",
                 "DALTON_CORE_INTERNAL_SUBNET": "172.31.251.0/24",
-                "DALTON_TRUSTED_PROXIES": "172.31.251.0/24",
                 "DALTON_EDGE_PORT": str(restore_edge_port),
                 "DALTON_EDGE_HTTP_PORT": str(restore_http_port),
                 "DALTON_EDGE_HTTPS_PORT": str(restore_https_port),
@@ -1452,7 +1534,8 @@ def check_restore_on_clean_stack(
                 )
                 assert got_sha_2 == sentinel["payload_sha"] and got_ct_2 == "text/plain"
 
-                # Confirm pre-restore database was preserved
+                # Confirm pre-restore database AND pre-restore MinIO bucket were preserved,
+                # and no temporary staging bucket remains
                 pre_dbs = subprocess.check_output(
                     [
                         *restore_compose_cmd,
@@ -1473,6 +1556,22 @@ def check_restore_on_clean_stack(
                     timeout=30,
                 ).strip()
                 assert pre_dbs, "Expected --replace-data to preserve original DB as <db>_pre_restore_<ts>"
+
+                all_buckets = _list_minio_buckets(restore_compose_cmd, restore_dir, env=restore_env)
+                pre_buckets = [b for b in all_buckets if "-pre-restore-" in b]
+                temp_buckets = [b for b in all_buckets if "-restore-" in b and "-pre-restore-" not in b]
+                assert pre_buckets, (
+                    f"Expected --replace-data to preserve original MinIO bucket as <bucket>-pre-restore-<ts>, got {all_buckets}"
+                )
+                assert not temp_buckets, (
+                    f"Temporary MinIO staging bucket(s) should be removed after switchover, got {temp_buckets}"
+                )
+                pre_bucket_count = _count_minio_objects(
+                    restore_compose_cmd, restore_dir, env=restore_env, bucket=pre_buckets[0]
+                )
+                assert pre_bucket_count == orig_minio_count + 1, (
+                    f"Expected preserved pre-restore bucket {pre_buckets[0]!r} to contain {orig_minio_count + 1} objects, got {pre_bucket_count}"
+                )
             finally:
                 restored_ca_path.unlink(missing_ok=True)
         finally:
@@ -1493,7 +1592,7 @@ def check_restore_on_clean_stack(
 
 def _build_same_version_release_tar(work_dir: Path, tar_path: Path) -> None:
     """Create a release tarball of ``work_dir`` excluding operator runtime state."""
-    skip_top = {".env", "backups", ".upgrade-backup", "ci-artifacts", ".git"}
+    skip_top = {".env", "backups", ".upgrade-backup", ".restore-backup", "ci-artifacts", ".git"}
 
     def _filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
         norm = info.name.lstrip("./")

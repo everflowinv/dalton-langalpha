@@ -172,7 +172,8 @@ services:
       REDIS_URL: "${REDIS_URL:-redis://:${REDIS_PASSWORD:-redis}@redis:6379/0}"
       PUBLIC_APP_URL: ${PUBLIC_APP_URL:-http://127.0.0.1:${DALTON_EDGE_PORT:-8088}}
       SERVER_BASE_URL: ${SERVER_BASE_URL:-http://127.0.0.1:${DALTON_EDGE_PORT:-8088}}
-      DALTON_TRUSTED_PROXIES: ${DALTON_TRUSTED_PROXIES:-${DALTON_CORE_INTERNAL_SUBNET:-172.31.250.0/24}}
+      # Always derived from DALTON_CORE_INTERNAL_SUBNET so network IPAM and trusted proxies never drift.
+      DALTON_TRUSTED_PROXIES: ${DALTON_CORE_INTERNAL_SUBNET:-172.31.250.0/24}
       DALTON_TRUSTED_PROXY_HOPS: ${DALTON_TRUSTED_PROXY_HOPS:-1}
       EGRESS_RELAY_BASE_URL: ${EGRESS_RELAY_BASE_URL:-http://backend:8000}
       SANDBOX_PROVIDER: ${SANDBOX_PROVIDER:-docker}
@@ -230,7 +231,7 @@ services:
       backend:
         condition: service_healthy
     environment:
-      DOMAIN: ${DOMAIN:-localhost}
+      DOMAIN: ${DALTON_CADDY_HOST:-${DOMAIN:-localhost}}
       DALTON_TLS_MODE: ${DALTON_TLS_MODE:-loopback}
       DALTON_EDGE_HTTPS_PORT: ${DALTON_EDGE_HTTPS_PORT:-18443}
     ports:
