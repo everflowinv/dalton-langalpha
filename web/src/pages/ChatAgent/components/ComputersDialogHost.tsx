@@ -26,7 +26,14 @@ import {
 import { computerOutcomeWatch, reduceComputerOutcomes } from '../hooks/computerOutcomes';
 import { takePrepareFailures } from '../hooks/computerPreparation';
 import { useComputerActions } from '../hooks/useComputerActions';
-import { invalidateMachine, invalidateMachineStorage, useComputerProviders, useComputers } from '../hooks/useComputers';
+import {
+  invalidateMachine,
+  invalidateMachineStorage,
+  useComputerProviders,
+  useComputers,
+  // DALTON-HOOK(settings-reorg): run status fan-out when mounted as FallbackComputersHost on a page without ChatAgent
+  useComputerStatusFanout,
+} from '../hooks/useComputers';
 import { useTierQuota } from '../hooks/useTierQuota';
 import { useResizeParam } from '../hooks/useMediumAction';
 import ChangeSpecDialog from './ChangeSpecDialog';
@@ -47,15 +54,22 @@ import { WorkspaceMoveOutcomes } from './WorkspaceMoveOutcomes';
  * A page that mounts it also takes `RESIZE_PARAM` off its address
  * (`useResizeParam`).
  */
-function ComputersDialogHost({ currentWorkspaceId = null, overSheet = false, planInPlace = false }: {
+// DALTON-HOOK(settings-reorg): subscribe to transitional computer SSE streams while acting as the fallback host
+function FallbackStatusFanout() {
+  useComputerStatusFanout();
+  return null;
+}
+
+function ComputersDialogHost({ currentWorkspaceId = null, overSheet = false, planInPlace = false, fallback = false }: {
   currentWorkspaceId?: string | null;
   overSheet?: boolean;
   planInPlace?: boolean;
+  fallback?: boolean;
 }) {
   const { t } = useTranslation();
   const locale = useLocale();
   const queryClient = useQueryClient();
-  useComputersHost(planInPlace);
+  useComputersHost(planInPlace, fallback);
   useResizeParam();
   // Change spec belongs to the page that opened it: left open, the next page
   // with a host (Settings, then a chat) would show it unasked.
@@ -180,6 +194,8 @@ function ComputersDialogHost({ currentWorkspaceId = null, overSheet = false, pla
 
   return (
     <>
+      {/* DALTON-HOOK(settings-reorg): keep transitional preparation/start streams alive on pages without ChatAgent */}
+      {fallback && <FallbackStatusFanout />}
       <ComputersDialog
         panel={panel}
         opening={opening}

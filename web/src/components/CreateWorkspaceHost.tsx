@@ -1,8 +1,11 @@
-import { Suspense, createContext, lazy, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
+import { Suspense, createContext, lazy, useCallback, useContext, useState, useSyncExternalStore, type ReactNode } from 'react';
 import { useNavigate } from 'react-router';
+import { useIsMutating } from '@tanstack/react-query';
 // DALTON-HOOK(settings-reorg): mount ComputersDialogHost lazily in place when a Dalton page without its own host opens the Computers dialog.
 import { isDaltonBuild } from '@/config/brand';
-import { computersHostMounted, useComputersPanel } from '@/pages/ChatAgent/hooks/computerPanelStore';
+import { computerOutcomeWatch } from '@/pages/ChatAgent/hooks/computerOutcomes';
+import { useComputersPanel, usePageComputersHostMounted } from '@/pages/ChatAgent/hooks/computerPanelStore';
+import { CREATE_COMPUTER_MUTATION_KEY } from '@/pages/ChatAgent/hooks/useComputers';
 import { useCreateWorkspace } from '@/pages/ChatAgent/hooks/useCreateWorkspace';
 import type { Workspace } from '@/types/api';
 
@@ -11,25 +14,28 @@ const ComputersDialogHost = lazy(() => import('@/pages/ChatAgent/components/Comp
 
 const OpenCreateWorkspace = createContext<(() => void) | null>(null);
 
-// DALTON-HOOK(settings-reorg): fallback Computers host for pages without their own ComputersDialogHost so closing leaves the user on the original page.
-function FallbackComputersHost() {
+// DALTON-HOOK(settings-reorg): fallback Computers host for pages without their own ComputersDialogHost.
+// Yields immediately when a page-level host mounts (e.g. browser back to /chat) so two dialogs never
+// appear, and stays mounted after dialog close while background preparation or spec changes settle so
+// completion toasts still fire on the current page.
+export function FallbackComputersHost() {
+  const hasPageHost = usePageComputersHostMounted();
   const { panel, specComputerId } = useComputersPanel();
-  const [active, setActive] = useState(false);
+  const outcomeWatch = useSyncExternalStore(
+    computerOutcomeWatch.subscribe,
+    computerOutcomeWatch.get,
+  );
+  const creatingComputer = useIsMutating({ mutationKey: CREATE_COMPUTER_MUTATION_KEY }) > 0;
+
+  if (!isDaltonBuild || hasPageHost) return null;
   const open = Boolean(panel || specComputerId);
+  const watchingBackground =
+    creatingComputer || outcomeWatch.preparing.size > 0 || outcomeWatch.specChanges.size > 0;
+  if (!open && !watchingBackground) return null;
 
-  useEffect(() => {
-    if (!isDaltonBuild) return;
-    if (open && !computersHostMounted()) {
-      setActive(true);
-    } else if (!open && active) {
-      setActive(false);
-    }
-  }, [open, active]);
-
-  if (!active) return null;
   return (
     <Suspense fallback={null}>
-      <ComputersDialogHost />
+      <ComputersDialogHost fallback />
     </Suspense>
   );
 }

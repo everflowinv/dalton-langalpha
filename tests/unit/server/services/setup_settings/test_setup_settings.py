@@ -372,22 +372,45 @@ class TestSelfHostedOnly:
     def _upstream_non_dalton(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("DALTON_ENABLED", "0")
 
-    def test_the_server_mounts_it_only_when_self_hosted(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
-        from src.server.app.setup import app
+    def test_the_server_mounts_it_only_when_self_hosted(self):
+        import subprocess
+        import sys
+
         from src.server.services import setup_settings
 
-        paths = {getattr(route, "path", None) for route in app.routes}
         assert setup_settings.self_hosted()
         with patch("src.config.settings.HOST_MODE", "platform"):
             assert not setup_settings.self_hosted()
-        # DALTON-HOOK(dalton-auth): under Dalton's default enabled=true config,
-        # setup.py evaluates self_hosted() as False at import time and keeps
-        # /api/v1/setup/* unmounted.
-        monkeypatch.delenv("DALTON_ENABLED", raising=False)
-        assert not setup_settings.self_hosted()
-        assert "/api/v1/setup/status" not in paths
+
+        # DALTON-HOOK(dalton-auth): rebuild src.server.app.setup in clean processes
+        # under both non-Dalton OSS and Dalton OSS configs instead of reusing
+        # module-import routes from whichever env happened to import setup.py first.
+        repo_root = Path(__file__).resolve().parents[5]
+        probe = (
+            "from src.server.app.setup import app; "
+            "print('/api/v1/setup/status' in {getattr(r, 'path', None) for r in app.routes})"
+        )
+
+        def _mounted_with(extra_env: dict[str, str]) -> bool:
+            env = {
+                **os.environ,
+                "HOST_MODE": "oss",
+                "DALTON_AUTH_MODE": "oss",
+                "APP_ENV": "",
+                **extra_env,
+            }
+            proc = subprocess.run(
+                [sys.executable, "-c", probe],
+                cwd=str(repo_root),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return proc.stdout.strip().splitlines()[-1] == "True"
+
+        assert _mounted_with({"DALTON_ENABLED": "0"}) is True
+        assert _mounted_with({"DALTON_ENABLED": "1", "APP_ENV": "dalton"}) is False
 
     @pytest.mark.asyncio
     async def test_a_hosted_server_reads_no_saved_settings(self):

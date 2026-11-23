@@ -525,3 +525,210 @@ async def test_fork_admit_rejects_revoked_colleague_before_credit_gate(
 
     assert exc_info.value.status_code == 404
     enforce_credit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_colleague_fork_succeeds_with_single_connection_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a DB pool of size 1, a colleague with rw access can fork their thread
+    without deadlocking/timing out on a second pool checkout inside the fork
+    transaction."""
+    import psycopg.pq
+
+    from src.config import settings as app_settings
+    from src.dalton import invites as dalton_invites
+    from src.server.database import pool as db_pool
+
+    colleague_email = "colleague@example.com"
+    owner_email = "owner@example.com"
+    monkeypatch.setattr(app_settings, "HOST_MODE", "oss")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    monkeypatch.setenv("DALTON_ALLOWED_EMAILS", f"{owner_email},{colleague_email}")
+    monkeypatch.setenv("DALTON_COLLEAGUE_DISPATCH_ENABLED", "1")
+    dalton_invites.invalidate_team_members_cache()
+
+    source_meta = _colleague_source_meta()
+    users_by_id = {
+        COLLEAGUE_ID: {
+            "user_id": COLLEAGUE_ID,
+            "email": colleague_email,
+            "name": "Colleague User",
+        },
+        OWNER_ID: {
+            "user_id": OWNER_ID,
+            "email": owner_email,
+            "name": "Owner User",
+        },
+    }
+    workspace_row = {
+        "workspace_id": WORKSPACE_ID,
+        "user_id": OWNER_ID,
+        "name": "Owner Workspace",
+        "status": "running",
+        "is_home": False,
+        "config": {},
+    }
+    sharing_row = {
+        "workspace_id": WORKSPACE_ID,
+        "cos_access": "rw",
+        "web_access": "rw",
+        "updated_by": OWNER_ID,
+        "updated_at": None,
+    }
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self._one: Any = None
+            self._all: list[Any] = []
+
+        async def __aenter__(self) -> _FakeCursor:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            norm = " ".join(sql.lower().split())
+            if "from conversation_threads" in norm and "join workspaces" in norm:
+                self._one = dict(source_meta)
+            elif "from users" in norm:
+                uid = str(params[-1]) if params else ""
+                self._one = dict(users_by_id[uid]) if uid in users_by_id else None
+            elif "from workspaces" in norm:
+                self._one = dict(workspace_row)
+            elif "from dalton_workspace_sharing" in norm:
+                self._one = dict(sharing_row)
+            elif "from dalton_members" in norm:
+                self._all = []
+            else:
+                self._one = None
+                self._all = []
+
+        async def fetchone(self) -> Any:
+            return self._one
+
+        async def fetchall(self) -> list[Any]:
+            return list(self._all)
+
+    class _FakeConnInfo:
+        transaction_status = psycopg.pq.TransactionStatus.IDLE
+
+    class _SingleSlotConn:
+        info = _FakeConnInfo()
+
+        def cursor(self, **kwargs: Any) -> _FakeCursor:
+            return _FakeCursor()
+
+        @asynccontextmanager
+        async def transaction(self):
+            yield self
+
+    class _SingleSlotPool:
+        closed = False
+
+        def __init__(self) -> None:
+            self.in_use = 0
+            self.max_concurrent = 0
+
+        @asynccontextmanager
+        async def connection(self, timeout: float = 10):
+            if self.in_use >= 1:
+                raise TimeoutError(
+                    "Single-connection pool exhausted: nested connection checkout inside transaction"
+                )
+            self.in_use += 1
+            self.max_concurrent = max(self.max_concurrent, self.in_use)
+            try:
+                yield _SingleSlotConn()
+            finally:
+                self.in_use -= 1
+
+    single_pool = _SingleSlotPool()
+    monkeypatch.setattr(
+        db_pool,
+        "get_or_create_pool",
+        create_autospec(db_pool.get_or_create_pool, return_value=single_pool),
+    )
+
+    create_thr = create_autospec(fork_service.create_thread, return_value={"thread_index": 2})
+
+    with (
+        patch.object(
+            threads_read,
+            "read_thread_subagents_allowed",
+            create_autospec(threads_read.read_thread_subagents_allowed, return_value=None),
+        ),
+        patch.object(
+            fork_service,
+            "take_snapshot",
+            create_autospec(fork_service.take_snapshot, return_value=_make_snapshot()),
+        ),
+        patch.object(
+            fork_service,
+            "_plan",
+            create_autospec(fork_service._plan, return_value=_make_plan()),
+        ),
+        patch.object(
+            writer_guard,
+            "guard_enabled",
+            create_autospec(writer_guard.guard_enabled, return_value=True),
+        ),
+        patch.object(
+            fork_service,
+            "_hold_source",
+            create_autospec(fork_service._hold_source, return_value=None),
+        ),
+        patch.object(
+            thread_fork,
+            "check_source",
+            create_autospec(thread_fork.check_source, return_value=None),
+        ),
+        patch.object(
+            fork_service,
+            "_copy_chains",
+            create_autospec(fork_service._copy_chains, return_value=None),
+        ),
+        patch.object(fork_service, "create_thread", create_thr),
+        patch.object(
+            thread_fork,
+            "write_ledger",
+            create_autospec(thread_fork.write_ledger, return_value=1),
+        ),
+        patch.object(
+            thread_fork,
+            "finish_thread",
+            create_autospec(thread_fork.finish_thread, return_value=None),
+        ),
+        patch.object(
+            thread_fork,
+            "hold_thread_row",
+            create_autospec(thread_fork.hold_thread_row, return_value=None),
+        ),
+        patch.object(
+            fork_service,
+            "_after_commit",
+            create_autospec(fork_service._after_commit, return_value=None),
+        ),
+    ):
+        result = await fork_service.fork_thread(
+            ForkRequest(
+                source_thread_id=SOURCE_THREAD_ID,
+                cut=ThroughTurn(0),
+                user_id=COLLEAGUE_ID,
+                platform="web",
+            )
+        )
+
+    assert result.turns_copied == 1
+    assert single_pool.max_concurrent == 1
+    assert single_pool.in_use == 0
+    create_thr.assert_awaited_once()
+    kwargs = create_thr.await_args.kwargs
+    assert kwargs["user_id"] == COLLEAGUE_ID
+    assert kwargs["metadata"]["dispatched_by"] == {
+        "user_id": COLLEAGUE_ID,
+        "name": "Colleague User",
+        "email": colleague_email,
+        "channel": "web",
+    }

@@ -89,7 +89,7 @@ async def check_colleague_workspace_write(
     else:
         from src.server.services.shared_workspaces.access import workspace_access
 
-        await workspace_access(workspace_id, caller)
+        await workspace_access({"workspace_id": workspace_id, "user_id": ws_owner}, caller)
 
 
 async def fork_thread(req: ForkRequest) -> ForkResult:
@@ -131,6 +131,7 @@ async def fork_thread(req: ForkRequest) -> ForkResult:
                     req.source_thread_id,
                     req.user_id,
                     meta=fresh_source,
+                    conn=conn,
                 )
                 # DALTON-HOOK(colleague-dispatch): re-check colleague workspace write access before committing
                 await check_colleague_workspace_write(fresh_source, req.user_id, conn=conn)
@@ -247,7 +248,7 @@ async def _write_thread(
         from src.dalton.sharing import build_dispatched_by_meta
 
         dispatched_by = await build_dispatched_by_meta(
-            req.user_id, ws_owner_id, channel="web"
+            req.user_id, ws_owner_id, channel="web", conn=conn
         )
         if dispatched_by is not None:
             metadata["dispatched_by"] = dispatched_by
