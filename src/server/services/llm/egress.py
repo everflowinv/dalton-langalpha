@@ -617,7 +617,30 @@ _HeldHttpx = _held_transport_class(httpx, httpcore)
 _HeldHttpx2 = _held_transport_class(httpx2, httpcore2)
 
 
-# DALTON-HOOK(standalone-core): policy-routing pinned transport that inspects the actual normalized request URL and isolates pools per IP policy
+# DALTON-HOOK(standalone-core): policy-routing pinned transport that inspects the actual wire request URL and reuses cached pools per (family, IP policy)
+@functools.cache
+def _core_sdk_policy_transport(family: str, ip_policy: str):
+    """Cached shared held transport for one ``(SDK family, ip_policy)`` pair.
+
+    Avoids allocating 3 transports (6 httpcore pools) on every client build in local
+    mode while strictly isolating pools across ``public``, ``private``, and ``any``.
+    """
+    if ip_policy not in ("public", "private", "any"):
+        raise ValueError(f"Unsupported IP policy {ip_policy!r}")
+    if family == "openai":
+        return _HeldHttpx2(_OpenAIEndpointRefused, shared=True, ip_policy=ip_policy)
+    if family == "anthropic":
+        return _HeldHttpx(_AnthropicEndpointRefused, shared=True, ip_policy=ip_policy)
+    if family == "gemini":
+        if os.environ.get("GOOGLE_GENAI_HTTP_CLIENT", "").strip().lower() == "httpx":
+            return _HeldHttpx(EndpointRefused, shared=True, ip_policy=ip_policy)
+        return _HeldHttpx2(EndpointRefused, shared=True, ip_policy=ip_policy)
+    if family == "openrouter":
+        return _HeldHttpx(EndpointRefused, shared=True, ip_policy=ip_policy)
+    raise ValueError(f"No held transport for SDK family {family!r}")
+
+
+# DALTON-HOOK(standalone-core): per-request policy wrapper routing to cached per-policy held transports
 def _policy_transport_class(hx: Any, held_cls: type) -> type:
     class PolicyHeldTransport(hx.BaseTransport, hx.AsyncBaseTransport):
         def __init__(
@@ -626,14 +649,13 @@ def _policy_transport_class(hx: Any, held_cls: type) -> type:
             *,
             saved_team_endpoints: Mapping[str, str] | None = None,
             shared: bool = False,
+            transport_for_policy: Any = None,
         ) -> None:
             self._refused = refused
             self._shared = shared
             self._saved_team_endpoints = dict(saved_team_endpoints or {})
-            self._transports = {
-                policy: held_cls(refused, shared=shared, ip_policy=policy)
-                for policy in ("public", "private", "any")
-            }
+            self._transport_for_policy = transport_for_policy
+            self._transports: dict[str, Any] = {}
 
         def _select(self, request: Any):
             from src.dalton.llm.egress_policy import ip_policy_for_request_url
@@ -642,7 +664,13 @@ def _policy_transport_class(hx: Any, held_cls: type) -> type:
                 str(request.url),
                 saved_team_endpoints=self._saved_team_endpoints,
             )
-            return self._transports[policy]
+            if self._transport_for_policy is not None:
+                return self._transport_for_policy(policy)
+            transport = self._transports.get(policy)
+            if transport is None:
+                transport = held_cls(self._refused, shared=self._shared, ip_policy=policy)
+                self._transports[policy] = transport
+            return transport
 
         def handle_request(self, request):
             return self._select(request).handle_request(request)
@@ -668,27 +696,51 @@ _PolicyHeldHttpx2 = _policy_transport_class(httpx2, _HeldHttpx2)
 
 
 def core_http_transport(saved_team_endpoints: Mapping[str, str] | None = None):
-    """DALTON-HOOK(standalone-core): per-request pinned httpx transport enforcing normalized URL & address-class rules."""
+    """DALTON-HOOK(standalone-core): per-request pinned httpx transport enforcing wire URL & address-class rules."""
     return _PolicyHeldHttpx(EndpointRefused, saved_team_endpoints=saved_team_endpoints)
 
 
 def core_sdk_transport_factory(saved_team_endpoints: Mapping[str, str] | None = None):
-    """DALTON-HOOK(standalone-core): SDK transport factory pinning all core local-auth model traffic."""
-    frozen_saved = tuple(sorted((saved_team_endpoints or {}).items()))
+    """DALTON-HOOK(standalone-core): SDK transport factory pinning all core local-auth model traffic using cached policy transports."""
+    saved_map = dict(saved_team_endpoints or {})
 
-    @functools.cache
     def _build(family: str):
-        saved_map = dict(frozen_saved)
+        provider_for_policy = functools.partial(_core_sdk_policy_transport, family)
         if family == "openai":
-            return _PolicyHeldHttpx2(_OpenAIEndpointRefused, saved_team_endpoints=saved_map, shared=True)
+            return _PolicyHeldHttpx2(
+                _OpenAIEndpointRefused,
+                saved_team_endpoints=saved_map,
+                shared=True,
+                transport_for_policy=provider_for_policy,
+            )
         if family == "anthropic":
-            return _PolicyHeldHttpx(_AnthropicEndpointRefused, saved_team_endpoints=saved_map, shared=True)
+            return _PolicyHeldHttpx(
+                _AnthropicEndpointRefused,
+                saved_team_endpoints=saved_map,
+                shared=True,
+                transport_for_policy=provider_for_policy,
+            )
         if family == "gemini":
             if os.environ.get("GOOGLE_GENAI_HTTP_CLIENT", "").strip().lower() == "httpx":
-                return _PolicyHeldHttpx(EndpointRefused, saved_team_endpoints=saved_map, shared=True)
-            return _PolicyHeldHttpx2(EndpointRefused, saved_team_endpoints=saved_map, shared=True)
+                return _PolicyHeldHttpx(
+                    EndpointRefused,
+                    saved_team_endpoints=saved_map,
+                    shared=True,
+                    transport_for_policy=provider_for_policy,
+                )
+            return _PolicyHeldHttpx2(
+                EndpointRefused,
+                saved_team_endpoints=saved_map,
+                shared=True,
+                transport_for_policy=provider_for_policy,
+            )
         if family == "openrouter":
-            return _PolicyHeldHttpx(EndpointRefused, saved_team_endpoints=saved_map, shared=True)
+            return _PolicyHeldHttpx(
+                EndpointRefused,
+                saved_team_endpoints=saved_map,
+                shared=True,
+                transport_for_policy=provider_for_policy,
+            )
         raise ValueError(f"No held transport for SDK family {family!r}")
 
     return _build

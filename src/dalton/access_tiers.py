@@ -16,6 +16,7 @@ external.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from typing import Any, Literal
 
 from src.dalton import settings as dalton_settings
@@ -43,6 +44,7 @@ __all__ = [
     "UserTier",
     "classify_owner_tier",
     "classify_owner_tier_sync",
+    "classify_owner_tiers_batch",
     "get_primary_admin_user_id",
     "get_primary_admin_user_id_sync",
     "get_user_tier",
@@ -517,3 +519,54 @@ async def classify_owner_tier(owner_id: str | None, *, conn: Any = None) -> Owne
             type(exc).__name__,
         )
         return "unknown"
+
+
+async def classify_owner_tiers_batch(
+    owner_ids: Iterable[str | None],
+    *,
+    conn: Any = None,
+) -> dict[str, OwnerTier]:
+    """Batch-classify resource owners asynchronously without per-row sync DB queries.
+
+    In ``local`` auth mode, fetches all requested users from ``dalton_user_roles`` in a
+    single async query (reusing ``conn`` when provided). Missing rows or DB failures
+    resolve fail-closed to ``'unknown'``.
+    """
+    result: dict[str, OwnerTier] = {}
+    to_query: list[str] = []
+    for raw in owner_ids:
+        uid = str(raw or "").strip()
+        if not uid or uid in result:
+            continue
+        if is_company_system_user(uid):
+            result[uid] = "company"
+        else:
+            to_query.append(uid)
+    if not to_query:
+        return result
+    if is_dalton_local_auth_enabled():
+        try:
+            from src.dalton.auth.roles import get_user_roles_batch
+
+            roles = (
+                await get_user_roles_batch(to_query, conn=conn)
+                if conn is not None
+                else await get_user_roles_batch(to_query)
+            )
+        except Exception as exc:
+            logger.warning(
+                "classify_owner_tiers_batch local role lookup failed (treated as unknown): %s",
+                type(exc).__name__,
+            )
+            roles = {}
+        for uid in to_query:
+            role = roles.get(uid)
+            result[uid] = role if role in ("admin", "internal", "external") else "unknown"
+        return result
+    for uid in to_query:
+        result[uid] = (
+            await classify_owner_tier(uid, conn=conn)
+            if conn is not None
+            else await classify_owner_tier(uid)
+        )
+    return result

@@ -18,11 +18,11 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
-import posixpath
 from collections.abc import Iterable, Mapping
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
+import httpx
 from psycopg.rows import dict_row
 
 from src.dalton.settings import (
@@ -42,9 +42,6 @@ AddressClass = Literal["public", "private"]
 IPPolicy = Literal["public", "private", "any"]
 
 _TEAM_BASE_URL_CLASSES_PREF_KEY = "dalton_team_base_url_classes"
-# In-process mirror keyed by team holder user_id -> {canonical_url_key: "public"|"private"}.
-# Used as a fallback when user_preferences cannot be updated in isolated unit tests.
-_LOCAL_TEAM_URL_CLASSES: dict[str, dict[str, AddressClass]] = {}
 
 _ENCODED_TRAVERSAL_MARKERS = ("%2e", "%2f", "%5c")
 
@@ -66,12 +63,12 @@ def _expand_host_ip(raw_url: str) -> str:
 
 
 def canonicalize_endpoint(raw_url: str) -> tuple[str, str, int, str] | None:
-    """Parse and canonicalize an http(s) URL into ``(scheme, host, port, norm_path)``.
+    """Parse and canonicalize an http(s) URL into ``(scheme, host, port, wire_path)``.
 
-    Resolves ``.`` and ``..`` segments and duplicate slashes so allowlist and saved
-    team-endpoint comparisons always match the normalized request target that HTTP
-    clients send on the wire. Rejects userinfo, backslashes, control characters, and
-    percent-encoded dot/slash traversal sequences.
+    Uses HTTPX's own RFC 3986 path normalization (``httpx.URL.raw_path``) so dot-segments
+    are resolved identically to what HTTPX sends on the wire while duplicate slashes
+    (``//``) are preserved verbatim and never silently collapsed. Rejects userinfo,
+    backslashes, control characters, and percent-encoded dot/slash traversal sequences.
     """
     cleaned = _expand_host_ip(str(raw_url or "").strip())
     if not cleaned:
@@ -100,19 +97,22 @@ def canonicalize_endpoint(raw_url: str) -> tuple[str, str, int, str] | None:
     if any(marker in lowered_path for marker in _ENCODED_TRAVERSAL_MARKERS):
         return None
 
-    if raw_path:
-        norm = posixpath.normpath("/" + raw_path.lstrip("/"))
-        # posixpath.normpath("//a") preserves leading double-slash per POSIX; collapse it.
-        if norm.startswith("//"):
-            norm = "/" + norm.lstrip("/")
-        path = "" if norm == "/" else norm.rstrip("/")
-    else:
+    try:
+        wire_path = httpx.URL(cleaned).raw_path.split(b"?", 1)[0].decode("latin-1")
+    except (httpx.InvalidURL, ValueError):
+        return None
+
+    if wire_path == "/":
         path = ""
+    elif wire_path.endswith("/") and not wire_path.endswith("//"):
+        path = wire_path[:-1]
+    else:
+        path = wire_path
     return scheme, host, port, path
 
 
 def canonical_url_key(raw_url: str) -> str | None:
-    """Return a canonical ``scheme://host:port/norm_path`` string key, or ``None``."""
+    """Return a canonical ``scheme://host:port/wire_path`` string key, or ``None``."""
     parsed = canonicalize_endpoint(raw_url)
     if parsed is None:
         return None
@@ -122,7 +122,7 @@ def canonical_url_key(raw_url: str) -> str | None:
 
 
 def endpoint_matches_prefix(url: str, allowed_url: str) -> bool:
-    """Return True when ``url`` matches ``allowed_url`` on canonical scheme/host/port/path."""
+    """Return True when ``url`` matches ``allowed_url`` on scheme/host/port and HTTPX wire path."""
     candidate = canonicalize_endpoint(url)
     allowed = canonicalize_endpoint(allowed_url)
     if candidate is None or allowed is None:
@@ -132,8 +132,10 @@ def endpoint_matches_prefix(url: str, allowed_url: str) -> bool:
     if (c_scheme, c_host, c_port) != (a_scheme, a_host, a_port):
         return False
     if not a_path:
-        return True
-    return c_path == a_path or c_path.startswith(f"{a_path}/")
+        return not c_path.startswith("//")
+    return c_path == a_path or (
+        c_path.startswith(f"{a_path}/") and not c_path.startswith(f"{a_path}//")
+    )
 
 
 def is_operator_allowlisted_endpoint(url: str) -> bool:
@@ -198,8 +200,8 @@ async def get_saved_team_endpoints() -> dict[str, AddressClass]:
     """Return ``{canonical_url_key: address_class}`` for all saved team credential base URLs.
 
     Active only in ``local`` auth mode when team credential sharing is enabled.
-    Reads ``user_api_keys.base_url`` and recorded address classes from the team holder's
-    ``user_preferences.other_preference`` (merged with in-process mirror).
+    Reads ``user_api_keys.base_url`` and recorded address classes strictly from PostgreSQL
+    (``user_preferences.other_preference``), with no in-process mirror.
     """
     if not is_dalton_local_auth_enabled():
         return {}
@@ -216,7 +218,7 @@ async def get_saved_team_endpoints() -> dict[str, AddressClass]:
     if not holder_id:
         return {}
 
-    recorded: dict[str, AddressClass] = dict(_LOCAL_TEAM_URL_CLASSES.get(holder_id, {}))
+    recorded: dict[str, AddressClass] = {}
     base_urls: list[str] = []
 
     try:
@@ -248,10 +250,11 @@ async def get_saved_team_endpoints() -> dict[str, AddressClass]:
                         if ck and v in ("public", "private"):
                             recorded[ck] = v  # type: ignore[assignment]
     except Exception as exc:
-        logger.debug(
-            "get_saved_team_endpoints DB lookup unavailable (using in-process mirror): %s",
+        logger.warning(
+            "get_saved_team_endpoints DB lookup failed (fail-closed empty): %s",
             type(exc).__name__,
         )
+        return {}
 
     result: dict[str, AddressClass] = {}
     for url in base_urls:
@@ -267,15 +270,16 @@ async def record_saved_team_base_url_classes(
     *,
     conn: Any = None,
 ) -> None:
-    """Persist the resolved address class (``'public'`` or ``'private'``) for saved team base URLs."""
+    """Persist the resolved address class (``'public'`` or ``'private'``) for saved team base URLs.
+
+    PostgreSQL is the single source of truth (no in-process mirror). Raises on lookup or
+    write failure so the caller's save transaction fails loudly instead of silently skipping.
+    """
     if not is_dalton_local_auth_enabled() or not url_classes:
         return
-    try:
-        from src.dalton.credentials import get_team_credential_holder_id_async
+    from src.dalton.credentials import get_team_credential_holder_id_async
 
-        holder_id = await get_team_credential_holder_id_async(conn=conn)
-    except Exception:
-        return
+    holder_id = await get_team_credential_holder_id_async(conn=conn)
     if not holder_id:
         return
 
@@ -287,38 +291,41 @@ async def record_saved_team_base_url_classes(
     if not normalized:
         return
 
-    _LOCAL_TEAM_URL_CLASSES.setdefault(holder_id, {}).update(normalized)
+    from src.server.database.pool import get_db_connection
 
-    try:
-        from src.server.database.pool import get_db_connection
-
-        payload_json = json.dumps(normalized)
-        async with get_db_connection(conn) as db:
-            async with db.cursor() as cur:
-                await cur.execute(
-                    """
-                    UPDATE user_preferences
-                    SET other_preference = jsonb_set(
-                        COALESCE(other_preference, '{}'::jsonb),
-                        ARRAY[%s],
-                        COALESCE(other_preference->%s, '{}'::jsonb) || %s::jsonb,
-                        true
-                    ),
-                    updated_at = NOW()
-                    WHERE user_id = %s
-                    """,
-                    (
-                        _TEAM_BASE_URL_CLASSES_PREF_KEY,
-                        _TEAM_BASE_URL_CLASSES_PREF_KEY,
-                        payload_json,
-                        holder_id,
-                    ),
+    payload_json = json.dumps(normalized)
+    async with get_db_connection(conn) as db:
+        async with db.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO user_preferences (
+                    user_preference_id, user_id, other_preference, created_at, updated_at
                 )
-    except Exception as exc:
-        logger.debug(
-            "record_saved_team_base_url_classes DB write skipped: %s",
-            type(exc).__name__,
-        )
+                VALUES (
+                    gen_random_uuid(),
+                    %s,
+                    jsonb_build_object(%s, %s::jsonb),
+                    NOW(),
+                    NOW()
+                )
+                ON CONFLICT (user_id) DO UPDATE
+                SET other_preference = jsonb_set(
+                    COALESCE(user_preferences.other_preference, '{}'::jsonb),
+                    ARRAY[%s],
+                    COALESCE(user_preferences.other_preference->%s, '{}'::jsonb) || %s::jsonb,
+                    true
+                ),
+                updated_at = NOW()
+                """,
+                (
+                    holder_id,
+                    _TEAM_BASE_URL_CLASSES_PREF_KEY,
+                    payload_json,
+                    _TEAM_BASE_URL_CLASSES_PREF_KEY,
+                    _TEAM_BASE_URL_CLASSES_PREF_KEY,
+                    payload_json,
+                ),
+            )
 
 
 def match_saved_team_endpoint(
@@ -348,20 +355,23 @@ def ip_policy_for_request_url(
 ) -> IPPolicy:
     """Resolve the connect-time IP policy for an outgoing model request URL.
 
-    - ``'any'``: URL matches ``DALTON_OPERATOR_LLM_ENDPOINTS`` (allows private or public,
-      still rejects mixed public+private and pins the resolved IP).
-    - ``'private'``: URL matches a saved team credential ``base_url`` whose saved address
-      class was ``'private'`` (pins to non-global IPs only).
-    - ``'public'``: everything else, including saved team URLs that resolved to public IPs
-      when saved, admin key-test URLs, and admin custom-model parameter URLs.
+    Precedence:
+    1. Saved team credential ``base_url`` takes priority over the deployer allowlist:
+       if ``url`` matches a saved team endpoint, locks strictly to its saved address
+       class (``'public'`` or ``'private'``), even if the same URL also appears in
+       ``DALTON_OPERATOR_LLM_ENDPOINTS``.
+    2. ``DALTON_OPERATOR_LLM_ENDPOINTS`` relaxes only URLs that have NO saved team
+       record, returning ``'any'`` (allows uniform private or uniform public, still
+       rejects mixed public+private and pins the resolved IP).
+    3. Everything else returns ``'public'``.
     """
     if canonicalize_endpoint(url) is None:
         return "public"
+    saved_cls = match_saved_team_endpoint(url, saved_team_endpoints)
+    if saved_cls in ("public", "private"):
+        return saved_cls
     if is_operator_allowlisted_endpoint(url):
         return "any"
-    saved_cls = match_saved_team_endpoint(url, saved_team_endpoints)
-    if saved_cls == "private":
-        return "private"
     return "public"
 
 
@@ -438,11 +448,6 @@ async def check_core_endpoint_refusal(
     return None, addr_class
 
 
-def clear_local_team_url_classes() -> None:
-    """Clear the in-process team URL address-class mirror (for unit test isolation)."""
-    _LOCAL_TEAM_URL_CLASSES.clear()
-
-
 __all__ = [
     "AddressClass",
     "IPPolicy",
@@ -450,7 +455,6 @@ __all__ = [
     "canonicalize_endpoint",
     "check_core_endpoint_refusal",
     "classify_ips",
-    "clear_local_team_url_classes",
     "endpoint_matches_prefix",
     "get_saved_team_endpoints",
     "ip_policy_for_request_url",

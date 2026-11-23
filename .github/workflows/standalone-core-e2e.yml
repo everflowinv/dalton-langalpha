@@ -119,7 +119,7 @@ jobs:
           cache-from: type=gha,scope=core-sandbox
           cache-to: type=gha,mode=max,scope=core-sandbox
 
-      - name: Run standalone acceptance checks (auth: oss)
+      - name: "Run standalone acceptance checks (auth: oss)"
         working-directory: /tmp/dalton-core-dist
         run: |
           bash tests/standalone/run_checks.sh \
@@ -129,7 +129,7 @@ jobs:
             --ci-compose /tmp/dalton-core-dist/docker-compose.ci.yml \
             --artifacts-dir /tmp/standalone-artifacts
 
-      - name: Run standalone acceptance checks (auth: local)
+      - name: "Run standalone acceptance checks (auth: local)"
         working-directory: /tmp/dalton-core-dist
         run: |
           bash tests/standalone/run_checks.sh \

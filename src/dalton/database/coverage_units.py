@@ -165,12 +165,38 @@ def is_coverage_multiuser_auth_enabled() -> bool:
     return is_dalton_auth_enabled()
 
 
+def pm_can_write_bound_workspace(
+    *,
+    actor_user_id: str | None,
+    workspace_owner_id: str | None,
+    workspace_owner_tier: str | None,
+    is_pm: bool,
+    multiuser_auth_enabled: bool,
+) -> bool:
+    """Single-source predicate for whether PM privilege grants write on a bound workspace.
+
+    Shared by ``_require_ws_write`` and ``compute_unit_action_flags`` so UI flags and write
+    enforcement can never drift when a workspace owner's tier changes (e.g. demotion from
+    ``internal`` to ``external``).
+    """
+    if not (is_pm and multiuser_auth_enabled):
+        return False
+    actor_uid = str(actor_user_id or "").strip()
+    ws_owner = str(workspace_owner_id or "").strip()
+    if not actor_uid:
+        return False
+    if not ws_owner or ws_owner == actor_uid:
+        return True
+    return str(workspace_owner_tier or "").strip().lower() in ("admin", "internal")
+
+
 async def _require_ws_write(
     ws_row: dict[str, Any],
     user_id: str,
     *,
     is_pm: bool = False,
     conn: Any = None,
+    owner_tiers: Mapping[str, str] | None = None,
 ) -> None:
     """Enforce ``channel='web', need='write'`` inside a locked transaction."""
     from src.dalton.access_tiers import classify_owner_tier
@@ -191,8 +217,12 @@ async def _require_ws_write(
     uid = str(user_id or "").strip()
     multiuser_auth = is_coverage_multiuser_auth_enabled()
 
+    owner_tier: str | None = None
     if multiuser_auth and ws_owner and ws_owner != uid:
-        owner_tier = await classify_owner_tier(ws_owner, conn=conn)
+        if owner_tiers is not None and ws_owner in owner_tiers:
+            owner_tier = owner_tiers[ws_owner]
+        else:
+            owner_tier = await classify_owner_tier(ws_owner, conn=conn)
         if owner_tier == "unknown":
             raise _WorkspaceAccessError(
                 "workspace does not exist or is hidden", code="workspace_hidden"
@@ -203,7 +233,13 @@ async def _require_ws_write(
             )
 
     # Closed-auth deployments only allow the workspace owner (even explicit PM).
-    if is_pm and multiuser_auth:
+    if pm_can_write_bound_workspace(
+        actor_user_id=uid,
+        workspace_owner_id=ws_owner,
+        workspace_owner_tier=owner_tier,
+        is_pm=is_pm,
+        multiuser_auth_enabled=multiuser_auth,
+    ):
         return
 
     try:
@@ -229,6 +265,31 @@ async def _require_ws_write(
         ) from exc
 
 
+async def can_write_bound_unit_workspace(
+    ws_row: Mapping[str, Any] | None,
+    user_id: str | None,
+    *,
+    is_pm: bool = False,
+    conn: Any = None,
+    owner_tiers: Mapping[str, str] | None = None,
+) -> bool:
+    """Return True iff ``_require_ws_write`` permits ``user_id`` to write ``ws_row``."""
+    uid = str(user_id or "").strip()
+    if not uid or ws_row is None:
+        return False
+    try:
+        await _require_ws_write(
+            dict(ws_row),
+            uid,
+            is_pm=is_pm,
+            conn=conn,
+            owner_tiers=owner_tiers,
+        )
+        return True
+    except ValueError:
+        return False
+
+
 def compute_unit_action_flags(
     *,
     actor_user_id: str | None,
@@ -240,9 +301,9 @@ def compute_unit_action_flags(
     actor_has_ws_write: bool,
     is_pm: bool,
     supabase_auth_enabled: bool,
+    workspace_owner_tier: str | None = None,
 ) -> dict[str, bool]:
     """Single-source action authorization flags matching write-path enforcement."""
-    del workspace_owner_id
     if not actor_user_id:
         return {
             "can_bind": False,
@@ -270,7 +331,14 @@ def compute_unit_action_flags(
             "can_archive": can_recover,
         }
 
-    can_write_old = bool(actor_has_ws_write or eff_pm)
+    pm_ws_write = pm_can_write_bound_workspace(
+        actor_user_id=actor_uid,
+        workspace_owner_id=workspace_owner_id,
+        workspace_owner_tier=workspace_owner_tier,
+        is_pm=is_pm,
+        multiuser_auth_enabled=supabase_auth_enabled,
+    )
+    can_write_old = bool(actor_has_ws_write or pm_ws_write)
     return {
         "can_bind": False,
         "can_unbind": can_write_old,

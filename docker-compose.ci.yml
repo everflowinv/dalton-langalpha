@@ -80,6 +80,10 @@ services:
       fake-llm:
         condition: service_healthy
     environment:
+      # CI check groups toggle between `oss` and `local` against one initialized `.env`
+      # (docker-compose.core.yml intentionally keeps auth keys strictly in `env_file: .env`).
+      DALTON_AUTH_MODE: ${DALTON_AUTH_MODE:-oss}
+      DALTON_ALLOW_DEV_OSS_AUTH: ${DALTON_ALLOW_DEV_OSS_AUTH:-}
       # Operator allowlist for private/internal LLM endpoints (enforced in Batch 4+
       # egress checks; declared here from Batch 1 so CI stays consistent across batches).
       DALTON_OPERATOR_LLM_ENDPOINTS: ${DALTON_OPERATOR_LLM_ENDPOINTS:-http://fake-llm:8099/v1}

@@ -118,18 +118,34 @@ async def _fetch_db_member_emails_live(
     return normalized_set
 
 
-async def get_team_member_emails(*, bypass_cache: bool = False) -> set[str]:
+async def get_team_member_emails(
+    *,
+    bypass_cache: bool = False,
+    conn: Any = None,
+) -> set[str]:
     """Return the union ``DALTON_ALLOWED_EMAILS ∪ dalton_members`` (or local role users in ``local`` mode)."""
     if is_dalton_local_auth_enabled():
         try:
-            role_emails = await members_db.list_local_role_member_emails()
+            role_emails = (
+                await members_db.list_local_role_member_emails(conn=conn)
+                if conn is not None
+                else await members_db.list_local_role_member_emails()
+            )
         except Exception as exc:
             logger.debug("Failed to query local role member emails: %s", exc)
             role_emails = set()
-        db_emails = await _fetch_db_member_emails_live()
+        db_emails = (
+            await _fetch_db_member_emails_live(conn=conn)
+            if conn is not None
+            else await _fetch_db_member_emails_live()
+        )
         return role_emails | db_emails
     env_emails = set(get_dalton_allowed_emails())
-    db_emails = await _fetch_db_member_emails_live()
+    db_emails = (
+        await _fetch_db_member_emails_live(conn=conn)
+        if conn is not None
+        else await _fetch_db_member_emails_live()
+    )
     return env_emails | db_emails
 
 
@@ -152,12 +168,20 @@ async def is_team_member(
         return False
     if is_dalton_local_auth_enabled():
         try:
-            role_emails = await members_db.list_local_role_member_emails()
+            role_emails = (
+                await members_db.list_local_role_member_emails(conn=conn)
+                if conn is not None
+                else await members_db.list_local_role_member_emails()
+            )
             if normalized in role_emails:
                 return True
         except Exception as exc:
             logger.debug("Failed to query local role member emails: %s", exc)
-        db_emails = await _fetch_db_member_emails_live(cache=cache)
+        db_emails = (
+            await _fetch_db_member_emails_live(cache=cache, conn=conn)
+            if conn is not None
+            else await _fetch_db_member_emails_live(cache=cache)
+        )
         return normalized in db_emails
     if normalized in get_dalton_allowed_emails():
         return True

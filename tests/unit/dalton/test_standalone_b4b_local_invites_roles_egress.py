@@ -528,6 +528,32 @@ async def test_egress_operator_allowlist_canonical_path_and_traversal_blocked(mo
         egress_policy.is_operator_allowlisted_endpoint("http://fake-llm:8099/v1/./models")
         is True
     )
+    # Duplicate slashes (`//`) are NOT collapsed — matches the exact path HTTPX sends on the wire
+    assert (
+        egress_policy.is_operator_allowlisted_endpoint("http://fake-llm:8099//v1/models")
+        is False
+    )
+    assert (
+        egress_policy.is_operator_allowlisted_endpoint("http://fake-llm:8099/v1//models")
+        is False
+    )
+    assert (
+        egress_policy.is_operator_allowlisted_endpoint("http://fake-llm:8099/v1//")
+        is False
+    )
+    assert (
+        egress_policy.is_operator_allowlisted_endpoint("https://internal-gateway.local:8443/openai//chat")
+        is False
+    )
+    monkeypatch.setenv("DALTON_OPERATOR_LLM_ENDPOINTS", "http://fake-llm:8099/openai/v1")
+    assert (
+        egress_policy.is_operator_allowlisted_endpoint("http://fake-llm:8099/openai//v1/models")
+        is False
+    )
+    assert (
+        egress_policy.is_operator_allowlisted_endpoint("http://fake-llm:8099/openai/v1/models")
+        is True
+    )
     # Default port normalization works (https://...:443 == https://...)
     monkeypatch.setenv("DALTON_OPERATOR_LLM_ENDPOINTS", "https://gw.internal/v1")
     assert egress_policy.is_operator_allowlisted_endpoint("https://gw.internal:443/v1/models") is True
@@ -551,6 +577,8 @@ async def test_egress_operator_allowlist_canonical_path_and_traversal_blocked(mo
         ),
     )
     assert await egress.endpoint_refusal("http://fake-llm:8099/v1/models") is None
+    assert await egress.endpoint_refusal("http://fake-llm:8099//v1/models") == egress.PRIVATE_ADDRESS
+    assert await egress.endpoint_refusal("http://fake-llm:8099/v1//models") == egress.PRIVATE_ADDRESS
     assert await egress.endpoint_refusal("http://fake-llm:8099/v1/../secret") == egress.PRIVATE_ADDRESS
     assert await egress.endpoint_refusal("http://fake-llm:8099/v1evil") == egress.PRIVATE_ADDRESS
 
@@ -561,7 +589,6 @@ async def test_egress_exemption_is_address_based_not_admin_identity(monkeypatch)
     monkeypatch.setenv("HOST_MODE", "oss")
     monkeypatch.setenv("DALTON_AUTH_MODE", "local")
     monkeypatch.delenv("DALTON_OPERATOR_LLM_ENDPOINTS", raising=False)
-    egress_policy.clear_local_team_url_classes()
 
     monkeypatch.setattr(
         egress_policy,
@@ -628,7 +655,6 @@ async def test_clients_egress_pins_saved_team_address_class_and_disables_redirec
     monkeypatch.setenv("HOST_MODE", "oss")
     monkeypatch.setenv("DALTON_AUTH_MODE", "local")
     monkeypatch.delenv("DALTON_OPERATOR_LLM_ENDPOINTS", raising=False)
-    egress_policy.clear_local_team_url_classes()
 
     saved_private = {
         egress_policy.canonical_url_key("http://team-gw.internal:8000/v1"): "private",
@@ -729,6 +755,120 @@ async def test_clients_egress_pins_saved_team_address_class_and_disables_redirec
 
 
 @pytest.mark.asyncio
+async def test_egress_saved_team_class_overrides_operator_allowlist_and_reuses_policy_pools(
+    monkeypatch,
+):
+    """Items 2, 3 & 10c:
+    - Saved team address class (public or private) takes precedence over DALTON_OPERATOR_LLM_ENDPOINTS.
+    - No in-process mirror exists for team URL classes; DB write failures raise loudly.
+    - core_sdk_transport_factory reuses cached HeldTransport pools per (family, ip_policy).
+    """
+    import httpx
+
+    monkeypatch.setenv("HOST_MODE", "oss")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "local")
+    monkeypatch.setenv(
+        "DALTON_OPERATOR_LLM_ENDPOINTS",
+        "https://team-public.example.com/v1,http://team-gw.internal:8000/v1,http://allow-only.internal:8099/v1",
+    )
+
+    # Item 3: no in-process mirror attribute
+    assert not hasattr(egress_policy, "_LOCAL_TEAM_URL_CLASSES")
+    assert not hasattr(egress_policy, "clear_local_team_url_classes")
+
+    saved_team = {
+        egress_policy.canonical_url_key("https://team-public.example.com/v1"): "public",
+        egress_policy.canonical_url_key("http://team-gw.internal:8000/v1"): "private",
+    }
+
+    # Item 2: team URL saved as "public" stays "public" even when also in DALTON_OPERATOR_LLM_ENDPOINTS
+    assert (
+        egress_policy.ip_policy_for_request_url(
+            "https://team-public.example.com/v1/responses",
+            saved_team_endpoints=saved_team,
+        )
+        == "public"
+    )
+    # Team URL saved as "private" stays "private" even when also in DALTON_OPERATOR_LLM_ENDPOINTS
+    assert (
+        egress_policy.ip_policy_for_request_url(
+            "http://team-gw.internal:8000/v1/responses",
+            saved_team_endpoints=saved_team,
+        )
+        == "private"
+    )
+    # Allowlist relaxes ONLY URLs that have NO saved team record
+    assert (
+        egress_policy.ip_policy_for_request_url(
+            "http://allow-only.internal:8099/v1/responses",
+            saved_team_endpoints=saved_team,
+        )
+        == "any"
+    )
+
+    # DNS rebinding a "public" team URL (that is also allowlisted!) to a private IP is REFUSED
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        create_autospec(
+            socket.getaddrinfo,
+            side_effect=lambda host, port, *_a, **_kw: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.8", port))
+            ],
+        ),
+    )
+    reason_pub_rebind, _ = await egress_policy.check_core_endpoint_refusal(
+        "https://team-public.example.com/v1/responses",
+        saved_team_endpoints=saved_team,
+    )
+    assert reason_pub_rebind == egress.PRIVATE_ADDRESS
+
+    # Connect-time transport also refuses the rebound "public" team URL despite allowlist overlap
+    transport = egress.core_http_transport(saved_team_endpoints=saved_team)
+    with pytest.raises(egress.EndpointRefused):
+        await transport.handle_async_request(
+            httpx.Request("POST", "https://team-public.example.com/v1/responses")
+        )
+    await transport.aclose()
+
+    # Item 3: DB write failure in record_saved_team_base_url_classes raises instead of silently skipping
+    from src.dalton import credentials as creds_mod
+
+    monkeypatch.setattr(
+        creds_mod,
+        "get_team_credential_holder_id_async",
+        create_autospec(creds_mod.get_team_credential_holder_id_async, return_value="holder-1"),
+    )
+
+    class _FailingCursor:
+        async def execute(self, *_a, **_kw):
+            raise RuntimeError("db write failed")
+
+    class _FailingConn:
+        @asynccontextmanager
+        async def cursor(self, **_kw):
+            yield _FailingCursor()
+
+    with pytest.raises(RuntimeError, match="db write failed"):
+        await egress_policy.record_saved_team_base_url_classes(
+            {"https://team-public.example.com/v1": "public"},
+            conn=_FailingConn(),
+        )
+
+    # Item 10c: core_sdk_transport_factory reuses cached per-(family, ip_policy) HeldTransport pools
+    t1 = egress.core_sdk_transport_factory(saved_team)("openai")
+    t2 = egress.core_sdk_transport_factory(saved_team)("openai")
+    req_pub = httpx.Request("POST", "https://team-public.example.com/v1/responses")
+    req_priv = httpx.Request("POST", "http://team-gw.internal:8000/v1/responses")
+    req_any = httpx.Request("POST", "http://allow-only.internal:8099/v1/responses")
+    assert t1._select(req_pub) is t2._select(req_pub)
+    assert t1._select(req_priv) is t2._select(req_priv)
+    assert t1._select(req_any) is t2._select(req_any)
+    assert t1._select(req_pub) is not t1._select(req_priv)
+    assert t1._select(req_priv) is not t1._select(req_any)
+
+
+@pytest.mark.asyncio
 async def test_supabase_invite_summary_omits_tier_while_local_includes_tier(monkeypatch):
     """Item 11: Everflow Supabase invite summaries preserve exact response shape without `tier`."""
     from src.dalton import invites as invites_mod
@@ -755,7 +895,7 @@ async def test_supabase_invite_summary_omits_tier_while_local_includes_tier(monk
 
 @pytest.mark.asyncio
 async def test_coverage_units_action_flags_match_write_permission_in_local_mode(monkeypatch):
-    """Item 8: units_view action flags and coverage_units._require_ws_write share one multi-user auth helper."""
+    """Item 9: units_view action flags and coverage_units._require_ws_write share one owner-tier rule."""
     from src.dalton.autonomy import units_view
     from src.dalton.database import coverage_units
 
@@ -765,9 +905,14 @@ async def test_coverage_units_action_flags_match_write_permission_in_local_mode(
     assert coverage_units.is_coverage_multiuser_auth_enabled() is True
     assert units_view._is_multiuser_auth_enabled() is True
 
-    # PM on colleague's internal workspace: flags say can_unbind/can_archive == True,
-    # and _require_ws_write ALSO permits write in local mode (previously only checked supabase auth).
-    flags = units_view._compute_unit_action_flags(
+    # 1. PM viewing bound unit owned by an internal member:
+    #    flags say can_unbind/can_archive == True AND write is allowed.
+    ws_row = {"workspace_id": "ws-1", "user_id": "analyst-1", "status": "active", "is_home": False}
+    classify_mock = create_autospec(access_tiers.classify_owner_tier, return_value="internal")
+    monkeypatch.setattr(access_tiers, "classify_owner_tier", classify_mock)
+
+    assert await coverage_units.can_write_bound_unit_workspace(ws_row, "admin-1", is_pm=True) is True
+    flags_internal = units_view._compute_unit_action_flags(
         user_id="admin-1",
         lead_uid="analyst-1",
         created_by_uid="analyst-1",
@@ -777,27 +922,210 @@ async def test_coverage_units_action_flags_match_write_permission_in_local_mode(
         readable=True,
         web_level="ro",
         is_pm=True,
+        workspace_owner_tier="internal",
     )
-    assert flags == {"can_bind": False, "can_unbind": True, "can_archive": True}
+    assert flags_internal == {"can_bind": False, "can_unbind": True, "can_archive": True}
+    await coverage_units._require_ws_write(ws_row, "admin-1", is_pm=True)
 
-    classify_mock = create_autospec(access_tiers.classify_owner_tier, return_value="internal")
-    monkeypatch.setattr(access_tiers, "classify_owner_tier", classify_mock)
-    # Must not raise for PM in local mode on internal colleague's workspace
-    await coverage_units._require_ws_write(
-        {"workspace_id": "ws-1", "user_id": "analyst-1", "status": "active", "is_home": False},
-        "admin-1",
-        is_pm=True,
-    )
-
-    # External owner's workspace is still refused even for PM
+    # 2. Member is demoted to external: BOTH action flags become False AND write is refused!
     classify_mock.return_value = "external"
+    assert await coverage_units.can_write_bound_unit_workspace(ws_row, "admin-1", is_pm=True) is False
+    flags_demoted = units_view._compute_unit_action_flags(
+        user_id="admin-1",
+        lead_uid="analyst-1",
+        created_by_uid="analyst-1",
+        ws_id="ws-1",
+        ws_active=True,
+        ws_owner="analyst-1",
+        readable=True,
+        web_level="rw",
+        is_pm=True,
+        workspace_owner_tier="external",
+    )
+    assert flags_demoted == {"can_bind": False, "can_unbind": False, "can_archive": False}
     with pytest.raises(coverage_units._WorkspaceAccessError) as exc_ext:
-        await coverage_units._require_ws_write(
-            {"workspace_id": "ws-2", "user_id": "ext-1", "status": "active", "is_home": False},
-            "admin-1",
-            is_pm=True,
-        )
+        await coverage_units._require_ws_write(ws_row, "admin-1", is_pm=True)
     assert "belongs to another user" in str(exc_ext.value)
+
+    # 3. End-to-end build_units_view with conn forwarding (Items 7 & 9):
+    #    admin viewing a bound unit whose owner was demoted to external sees can_unbind/can_archive=False
+    #    and reuses the caller's conn without opening extra connections.
+    from src.dalton.auth import roles as local_roles
+    from src.dalton.database import sector_members
+
+    class _BoardCursor:
+        def __init__(self):
+            self.calls = 0
+
+        async def execute(self, sql, params=None):
+            self.calls += 1
+
+        async def fetchall(self):
+            if self.calls == 1:
+                return [
+                    {
+                        "unit_id": "unit-1",
+                        "kind": "company",
+                        "owner_user_id": "analyst-1",
+                        "created_by_user_id": "analyst-1",
+                        "lead_analyst_user_id": "analyst-1",
+                        "slug": "aapl",
+                        "display_name": "Apple",
+                        "workspace_id": "ws-1",
+                        "ticker": "AAPL",
+                        "workspace_owner_id": "analyst-1",
+                        "workspace_status": "active",
+                        "workspace_config": {},
+                    }
+                ]
+            return []
+
+    sentinel_conn = _FakeAsyncConn(_BoardCursor())
+    seen_conns: list[object] = []
+
+    async def _fake_get_role(uid, *, conn=None):
+        seen_conns.append(conn)
+        return "admin" if uid == "admin-1" else "external"
+
+    async def _fake_roles_batch(uids, *, conn=None):
+        seen_conns.append(conn)
+        return {u: ("admin" if u == "admin-1" else "external") for u in uids}
+
+    monkeypatch.setattr(local_roles, "get_user_role", create_autospec(local_roles.get_user_role, side_effect=_fake_get_role))
+    monkeypatch.setattr(local_roles, "get_user_roles_batch", create_autospec(local_roles.get_user_roles_batch, side_effect=_fake_roles_batch))
+    monkeypatch.setattr(
+        units_view,
+        "_load_colleague_workspace_state",
+        create_autospec(
+            units_view._load_colleague_workspace_state,
+            return_value=({"ws-1": (True, False)}, {"ws-1": "rw"}, []),
+        ),
+    )
+    monkeypatch.setattr(
+        sector_members,
+        "fetch_members_for_sectors",
+        create_autospec(sector_members.fetch_members_for_sectors, return_value=[]),
+    )
+
+    view_rows = await units_view.build_units_view("admin-1", {}, conn=sentinel_conn)
+    assert len(view_rows) == 1
+    assert view_rows[0]["can_unbind"] is False
+    assert view_rows[0]["can_archive"] is False
+    assert seen_conns and all(c is sentinel_conn for c in seen_conns)
+
+
+@pytest.mark.asyncio
+async def test_sharing_list_team_workspaces_forwards_conn_and_batches_local_roles_async(monkeypatch):
+    """Items 7 & 8: list_team_workspaces forwards caller's conn and batch-loads roles asynchronously (no sync DB calls)."""
+    from src.dalton import sharing as sharing_mod
+    from src.dalton.auth import roles as local_roles
+
+    monkeypatch.setenv("HOST_MODE", "oss")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "local")
+
+    # Guard: sync role fetcher must NEVER be called on the async list path!
+    sync_forbidden = create_autospec(
+        access_tiers._fetch_local_role_sync,
+        side_effect=AssertionError("sync _fetch_local_role_sync must not run on async list path"),
+    )
+    monkeypatch.setattr(access_tiers, "_fetch_local_role_sync", sync_forbidden)
+
+    ws_rows = [
+        {
+            "workspace_id": "ws-int",
+            "user_id": "u-internal",
+            "name": "Internal WS",
+            "description": "",
+            "status": "active",
+            "config": {},
+            "created_at": None,
+            "updated_at": None,
+            "last_activity_at": None,
+            "owner_email": "int@team.local",
+            "owner_name": "Internal",
+            "owner_avatar_url": None,
+            "web_access": "ro",
+            "cos_access": "rw",
+        },
+        {
+            "workspace_id": "ws-ext",
+            "user_id": "u-external",
+            "name": "External WS",
+            "description": "",
+            "status": "active",
+            "config": {},
+            "created_at": None,
+            "updated_at": None,
+            "last_activity_at": None,
+            "owner_email": "ext@team.local",
+            "owner_name": "External",
+            "owner_avatar_url": None,
+            "web_access": "ro",
+            "cos_access": "rw",
+        },
+    ]
+
+    class _ListCursor:
+        async def execute(self, sql, params=None):
+            return None
+
+        async def fetchall(self):
+            return list(ws_rows)
+
+    sentinel_conn = _FakeAsyncConn(_ListCursor())
+    forwarded_conns: dict[str, object] = {}
+
+    async def _fake_req_reader(uid, *, conn=None):
+        forwarded_conns["require_team_reader"] = conn
+        return uid
+
+    async def _fake_get_tier(uid, *, conn=None):
+        forwarded_conns["get_user_tier"] = conn
+        return "admin"
+
+    async def _fake_emails(*, bypass_cache=False, conn=None):
+        forwarded_conns["get_team_member_emails"] = conn
+        return {"int@team.local", "ext@team.local"}
+
+    async def _fake_is_member(email, *, bypass_cache=False, cache=None, conn=None):
+        forwarded_conns["is_team_member"] = conn
+        return True
+
+    batch_calls: list[tuple[tuple[str, ...], object]] = []
+
+    async def _fake_batch_roles(uids, *, conn=None):
+        batch_calls.append((tuple(sorted(uids)), conn))
+        return {"u-internal": "internal", "u-external": "external"}
+
+    monkeypatch.setattr(sharing_mod, "require_team_reader", create_autospec(sharing_mod.require_team_reader, side_effect=_fake_req_reader))
+    monkeypatch.setattr(sharing_mod, "get_user_tier", create_autospec(sharing_mod.get_user_tier, side_effect=_fake_get_tier))
+    monkeypatch.setattr(sharing_mod, "get_team_member_emails", create_autospec(sharing_mod.get_team_member_emails, side_effect=_fake_emails))
+    monkeypatch.setattr(sharing_mod, "is_team_member", create_autospec(sharing_mod.is_team_member, side_effect=_fake_is_member))
+    monkeypatch.setattr(local_roles, "get_user_roles_batch", create_autospec(local_roles.get_user_roles_batch, side_effect=_fake_batch_roles))
+
+    # Guard: get_db_connection must reuse sentinel_conn (not open a new pool connection)
+    @asynccontextmanager
+    async def _fake_get_db(conn=None):
+        assert conn is sentinel_conn
+        yield conn
+
+    monkeypatch.setattr(sharing_mod, "get_db_connection", _fake_get_db)
+
+    members = await sharing_mod.list_team_workspaces("admin-1", conn=sentinel_conn)
+    assert len(members) == 2
+    by_uid = {m["user_id"]: m for m in members}
+    assert by_uid["u-internal"]["workspaces"][0]["cos_access"] == "rw"
+    assert by_uid["u-external"]["workspaces"][0]["cos_access"] == "hidden"
+
+    # Exactly ONE batch async role query on sentinel_conn, ZERO sync queries
+    assert batch_calls == [(("u-external", "u-internal"), sentinel_conn)]
+    sync_forbidden.assert_not_called()
+    assert forwarded_conns == {
+        "require_team_reader": sentinel_conn,
+        "get_user_tier": sentinel_conn,
+        "get_team_member_emails": sentinel_conn,
+        "is_team_member": sentinel_conn,
+    }
 
 
 def test_d048_downgrade_revokes_pending_admin_and_preserves_historical_audit():

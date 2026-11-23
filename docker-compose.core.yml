@@ -151,23 +151,21 @@ services:
       - "${BACKEND_WORKERS:-2}"
     oom_score_adj: -500
     shm_size: "1gb"
-    environment:
+    env_file: .env
+    # !override drops upstream docker-compose.yml's shell-interpolated BYOK_ENCRYPTION_KEY
+    # and keeps all auth mode / secret / origin keys strictly sourced from `env_file: .env`
+    # so exported host shell variables can never override `.env`.
+    environment: !override
       # ptc_agent lives under src/; set it explicitly instead of relying on the venv .pth.
       PYTHONPATH: /app/src
       APP_ENV: core
       DALTON_PROFILE: core
-      HOST_MODE: ${HOST_MODE:-oss}
-      DALTON_AUTH_MODE: ${DALTON_AUTH_MODE:-oss}
-      DALTON_ALLOW_DEV_OSS_AUTH: ${DALTON_ALLOW_DEV_OSS_AUTH:-}
       DB_HOST: ${DB_HOST:-postgres}
       REDIS_URL: "${REDIS_URL:-redis://:${REDIS_PASSWORD:-redis}@redis:6379/0}"
-      PUBLIC_APP_URL: ${PUBLIC_APP_URL:-http://127.0.0.1:${DALTON_EDGE_PORT:-8088}}
-      SERVER_BASE_URL: ${SERVER_BASE_URL:-http://127.0.0.1:${DALTON_EDGE_PORT:-8088}}
       EGRESS_RELAY_BASE_URL: ${EGRESS_RELAY_BASE_URL:-http://backend:8000}
       SANDBOX_PROVIDER: ${SANDBOX_PROVIDER:-docker}
       SANDBOX_DOCKER_NETWORK: ${SANDBOX_DOCKER_NETWORK:-${COMPOSE_PROJECT_NAME:-dalton-core}_sandbox}
       DALTON_BACKEND_VAR_DIR: /app/var/dalton
-      DALTON_CHAT_UPLOAD_SIGNING_SECRET: ${DALTON_CHAT_UPLOAD_SIGNING_SECRET:-}
       DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL: ${DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL:-http://minio:9000}
       DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME: ${DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME:-chat-uploads}
       DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID: ${DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID:-${MINIO_ROOT_USER:-}}
@@ -193,10 +191,10 @@ services:
     shm_size: "1gb"
     pids_limit: 512
     restart: unless-stopped
+    env_file: .env
     environment:
       # ptc_agent lives under src/; set it explicitly instead of relying on the venv .pth.
       PYTHONPATH: /app/src
-      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-}
       APP_ENV: core
       DALTON_PROFILE: core
     networks:
@@ -206,11 +204,15 @@ services:
     build:
       context: .
       dockerfile: deploy/standalone/Dockerfile.edge
+      # Mount `.env` transiently at build time so `Dockerfile.edge` reads
+      # `VITE_DALTON_AUTH` directly from `.env` (never overridden by shell env
+      # and never copied into any image layer).
+      secrets:
+        - core_env
       args:
         VITE_BRAND_NAME: ${VITE_BRAND_NAME:-${BRAND_NAME:-Dalton}}
         VITE_BRAND_MARK: ${VITE_BRAND_MARK:-langalpha}
         VITE_DALTON_UI: ${VITE_DALTON_UI:-true}
-        VITE_DALTON_AUTH: ${VITE_DALTON_AUTH:-}
         VITE_DALTON_INVITE_EMAIL_DOMAIN: ${VITE_DALTON_INVITE_EMAIL_DOMAIN:-${DALTON_INVITE_EMAIL_DOMAIN:-}}
         DOCS_SITE_ORIGIN: ${DOCS_SITE_ORIGIN:-${PUBLIC_APP_URL:-}}
     image: ${DALTON_EDGE_IMAGE:-dalton-core-edge:local}
@@ -246,3 +248,7 @@ networks:
 volumes:
   dalton-minio-data:
   dalton-backend-var:
+
+secrets:
+  core_env:
+    file: .env

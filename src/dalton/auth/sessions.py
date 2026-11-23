@@ -937,17 +937,22 @@ async def refresh_local_session(
     )
 
 
-LogoutRevocationOutcome = Literal["revoked", "expired_noop", "not_found"]
+LogoutRevocationOutcome = Literal["revoked", "expired_noop", "not_found", "mismatch"]
 
 
 async def revoke_session_for_logout(
     raw_refresh_token: str | None,
     *,
+    expected_user_id: str | None = None,
+    expected_session_id: str | None = None,
     reason: str = "logout",
     now: datetime | None = None,
 ) -> LogoutRevocationOutcome:
     """Revoke the session identified by ``raw_refresh_token`` using its stable ``session_id`` (``sid``).
 
+    - If ``expected_user_id`` (or ``expected_session_id``) is supplied and does NOT match the
+      cookie session's owner (or ``session_id``), returns ``"mismatch"`` WITHOUT revoking any
+      session so a stale tab from account A cannot revoke account B's active session.
     - Current refresh token in ``dalton_local_sessions``: revokes by ``session_id`` under the
       per-account advisory lock (``"revoked"`` or ``"not_found"`` if already revoked).
     - Rotated historical token in ``dalton_local_refresh_tokens``: ONLY revokes if the historical
@@ -959,6 +964,8 @@ async def revoke_session_for_logout(
     token = str(raw_refresh_token or "").strip()
     if not token:
         return "not_found"
+    exp_uid = str(expected_user_id or "").strip() or None
+    exp_sid = str(expected_session_id or "").strip() or None
     token_hash = hash_refresh_token(token)
     async with get_db_connection() as conn:
         async with conn.transaction():
@@ -981,6 +988,10 @@ async def revoke_session_for_logout(
 
                 session_id = str(row["session_id"])
                 user_id = str(row["user_id"]).strip()
+                if (exp_uid is not None and user_id != exp_uid) or (
+                    exp_sid is not None and session_id != exp_sid
+                ):
+                    return "mismatch"
                 await cur.execute(
                     "SELECT pg_advisory_xact_lock(%s)",
                     (account_advisory_lock_key(user_id),),
@@ -1003,6 +1014,12 @@ async def revoke_session_for_logout(
                             return "not_found"
                         row = hist_row
                         from_history = True
+                        session_id = str(row["session_id"])
+                        user_id = str(row["user_id"]).strip()
+                        if (exp_uid is not None and user_id != exp_uid) or (
+                            exp_sid is not None and session_id != exp_sid
+                        ):
+                            return "mismatch"
                 if from_history:
                     hist_expires_at = _as_utc(row.get("expires_at"))
                     if hist_expires_at is None or hist_expires_at <= ts:

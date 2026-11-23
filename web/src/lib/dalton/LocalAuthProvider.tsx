@@ -22,6 +22,7 @@ import {
   localLogin,
   localLogout,
   localRefresh,
+  LocalAuthError,
   parseJwtSubject,
   type BootstrapAdminPayload,
 } from './localAuth';
@@ -130,8 +131,15 @@ export function LocalAuthProvider({ children }: { children: React.ReactNode }) {
 
   const logout = useCallback(async () => {
     try {
-      await localLogout();
-    } catch {
+      await localLogout(userId);
+    } catch (err) {
+      if (err instanceof LocalAuthError && err.status === 409) {
+        toast({
+          variant: 'destructive',
+          title: '另一个标签页已切换账号，请刷新',
+        });
+        return;
+      }
       toast({
         variant: 'destructive',
         title: '登出未完成，请重试',
@@ -139,7 +147,7 @@ export function LocalAuthProvider({ children }: { children: React.ReactNode }) {
       return;
     }
     clearLocalSessionState();
-  }, [clearLocalSessionState]);
+  }, [clearLocalSessionState, userId]);
 
   const changePassword = useCallback(
     async (currentPassword: string, newPassword: string) => {

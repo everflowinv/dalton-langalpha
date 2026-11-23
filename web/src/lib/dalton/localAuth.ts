@@ -165,16 +165,28 @@ export async function localRefresh(retryOnConflict = true): Promise<LocalRefresh
   return (await res.json()) as LocalRefreshResponse;
 }
 
-export async function localLogout(): Promise<void> {
+export async function localLogout(expectedSub?: string | null): Promise<void> {
+  const trimmedSub = expectedSub?.trim() || '';
   let res: Response;
   try {
-    res = await fetch(`${baseURL}/api/v1/dalton/auth/local/logout`, {
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    const init: RequestInit = {
       method: 'POST',
       credentials: 'include',
-      headers: { Accept: 'application/json' },
-    });
+      headers,
+    };
+    if (trimmedSub) {
+      headers['Content-Type'] = 'application/json';
+      init.body = JSON.stringify({ sub: trimmedSub });
+    }
+    res = await fetch(`${baseURL}/api/v1/dalton/auth/local/logout`, init);
   } catch {
     throw new LocalAuthError('登出未完成，请重试', 0);
+  }
+  if (res.status === 409) {
+    throw new LocalAuthError('另一个标签页已切换账号，请刷新', 409, {
+      code: 'account_switched',
+    });
   }
   // 401 means the server session is already absent/revoked and the cookie was cleared.
   if (!res.ok && res.status !== 401) {

@@ -47,12 +47,13 @@ REFRESH_TOKEN_ENTROPY_BYTES = 48
 
 @dataclass(frozen=True)
 class LocalAccessClaims:
-    """Verified claims extracted from a local HS256 access JWT."""
+    """Verified claims extracted from a local HS256 access JWT or WebSocket ticket."""
 
     user_id: str
     session_id: str
     issued_at: int
     expires_at: int
+    jti: str = ""
 
 
 def get_refresh_session_ttl_seconds() -> int:
@@ -195,11 +196,13 @@ def issue_local_ws_ticket(
     ttl = max(1, min(WS_TICKET_TTL_SECONDS, int(ttl_seconds)))
     issued_at = int(time.time()) if now is None else int(now)
     expires_at = issued_at + ttl
+    jti = secrets.token_urlsafe(18)
     payload = {
         "v": 1,
         "typ": "ws_ticket",
         "sub": uid,
         "sid": sid,
+        "jti": jti,
         "iat": issued_at,
         "exp": expires_at,
     }
@@ -265,6 +268,7 @@ def verify_local_ws_ticket(
 
     sub = payload.get("sub")
     sid = payload.get("sid")
+    jti = payload.get("jti")
     iat = payload.get("iat")
     exp = payload.get("exp")
     if (
@@ -272,6 +276,8 @@ def verify_local_ws_ticket(
         or not sub.strip()
         or not isinstance(sid, str)
         or not sid.strip()
+        or not isinstance(jti, str)
+        or not jti.strip()
         or not isinstance(iat, int)
         or not isinstance(exp, int)
     ):
@@ -288,6 +294,7 @@ def verify_local_ws_ticket(
         session_id=sid.strip(),
         issued_at=iat,
         expires_at=exp,
+        jti=jti.strip(),
     )
 
 

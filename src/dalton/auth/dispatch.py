@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
@@ -24,6 +25,7 @@ from fastapi.security import HTTPAuthorizationCredentials
 
 from src.dalton.auth.sessions import verify_local_session_active
 from src.dalton.auth.tokens import (
+    WS_TICKET_TTL_SECONDS,
     LocalAccessClaims,
     decode_local_access_token,
     verify_local_ws_ticket,
@@ -39,6 +41,34 @@ logger = logging.getLogger(__name__)
 MAX_SESSION_RECHECK_SECONDS = 30.0
 DEFAULT_WS_SESSION_RECHECK_SECONDS = 30.0
 DEFAULT_SSE_SESSION_RECHECK_SECONDS = 30.0
+WS_TICKET_JTI_REDIS_PREFIX = "dalton:local:ws_ticket:jti:"
+
+_SENSITIVE_QUERY_PARAM_RE = re.compile(
+    r"([?&](?:ticket|token)=)[^&\s\"'<>#]+",
+    re.IGNORECASE,
+)
+
+
+def redact_sensitive_query_params(value: Any) -> Any:
+    """Redact ``ticket=`` and ``token=`` query values from log strings."""
+    if not isinstance(value, str) or "?" not in value:
+        return value
+    return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1REDACTED", value)
+
+
+class SensitiveQueryLogFilter(logging.Filter):
+    """Redact WebSocket ``ticket`` / ``token`` query values in Uvicorn handshake and access logs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = redact_sensitive_query_params(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(redact_sensitive_query_params(arg) for arg in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {
+                k: redact_sensitive_query_params(v) for k, v in record.args.items()
+            }
+        return True
 
 
 def _refuse_holder(user_id: str | None) -> None:
@@ -329,14 +359,56 @@ async def _verify_local_token_and_session(token: str) -> LocalAccessClaims:
     return claims
 
 
+async def _consume_ws_ticket_jti(
+    jti: str,
+    *,
+    ttl_seconds: int = WS_TICKET_TTL_SECONDS,
+) -> None:
+    """Atomically claim a one-time WebSocket ticket ``jti`` in Redis (60s max TTL).
+
+    Fails closed (503) if Redis is unavailable and rejects replays with 401.
+    """
+    cleaned = str(jti or "").strip()
+    if not cleaned:
+        raise HTTPException(status_code=401, detail="Missing WebSocket ticket jti")
+    from src.utils.cache.redis_cache import get_cache_client
+
+    cache = get_cache_client()
+    client = getattr(cache, "client", None) if getattr(cache, "enabled", False) else None
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="WebSocket ticket replay protection unavailable",
+        )
+    key = f"{WS_TICKET_JTI_REDIS_PREFIX}{cleaned}"
+    ttl = max(1, min(WS_TICKET_TTL_SECONDS, int(ttl_seconds)))
+    try:
+        claimed = await client.set(key, "1", nx=True, ex=ttl)
+    except Exception as exc:
+        logger.warning(
+            "Failed to record WebSocket ticket jti in Redis (fail-closed 503): %s",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="WebSocket ticket replay protection unavailable",
+        ) from exc
+    if not claimed:
+        raise HTTPException(status_code=401, detail="WebSocket ticket already used")
+
+
 async def _verify_local_ws_ticket_and_session(ticket: str) -> LocalAccessClaims:
-    """Verify a short-lived HMAC WebSocket ticket and its backing session row in Postgres."""
+    """Verify a short-lived HMAC WebSocket ticket, its backing session in Postgres, and consume its one-time jti."""
     claims = verify_local_ws_ticket(ticket)
     reject_company_system_auth(claims.user_id)
     _refuse_holder(claims.user_id)
     await verify_local_session_active(
         user_id=claims.user_id, session_id=claims.session_id
     )
+    remaining_ttl = max(
+        1, min(WS_TICKET_TTL_SECONDS, claims.expires_at - int(time.time()))
+    )
+    await _consume_ws_ticket_jti(claims.jti, ttl_seconds=remaining_ttl)
     return claims
 
 

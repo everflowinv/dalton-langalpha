@@ -1018,12 +1018,19 @@ class TestLocalWsTicketAndSameOriginStartup:
             session_id="sid-ws-1",
             now=now,
         )
+        ticket2, _ = tokens_mod.issue_local_ws_ticket(
+            user_id="user-ws-1",
+            session_id="sid-ws-1",
+            now=now,
+        )
         assert ttl == 60
         assert len(ticket.split(".")) == 2
 
         claims = tokens_mod.verify_local_ws_ticket(ticket, now=now + 59)
+        claims2 = tokens_mod.verify_local_ws_ticket(ticket2, now=now + 59)
         assert claims.user_id == "user-ws-1"
         assert claims.session_id == "sid-ws-1"
+        assert claims.jti and claims2.jti and claims.jti != claims2.jti
 
         # Expired at +60s
         with pytest.raises(HTTPException) as exc_exp:
@@ -1043,10 +1050,13 @@ class TestLocalWsTicketAndSameOriginStartup:
         assert exc_ticket_as_jwt.value.status_code == 401
 
     @pytest.mark.asyncio
-    async def test_websocket_dispatch_accepts_ws_ticket_and_rejects_jwt_as_ticket(self, monkeypatch):
+    async def test_websocket_dispatch_accepts_ws_ticket_once_and_rejects_replay_and_jwt(
+        self, monkeypatch
+    ):
         from types import SimpleNamespace
         from fastapi import WebSocketException
         from src.dalton.auth import dispatch as dispatch_mod, tokens as tokens_mod
+        from src.utils.cache import redis_cache
 
         monkeypatch.setenv("HOST_MODE", "oss")
         monkeypatch.setenv("DALTON_AUTH_MODE", "local")
@@ -1059,6 +1069,20 @@ class TestLocalWsTicketAndSameOriginStartup:
             create_autospec(dispatch_mod.verify_local_session_active, return_value=None),
         )
         monkeypatch.setattr(dispatch_mod, "_refuse_holder", lambda _u: None)
+
+        seen_jti_keys: dict[str, int] = {}
+
+        class _FakeRedisClient:
+            async def set(self, key: str, value: str, *, nx: bool = False, ex: int | None = None):
+                assert nx is True
+                assert ex is not None and 1 <= ex <= 60
+                if key in seen_jti_keys:
+                    return False
+                seen_jti_keys[key] = ex
+                return True
+
+        fake_cache = SimpleNamespace(enabled=True, client=_FakeRedisClient())
+        monkeypatch.setattr(redis_cache, "get_cache_client", lambda: fake_cache)
 
         ticket, _ = tokens_mod.issue_local_ws_ticket(user_id="u-ws", session_id="sid-ws")
         jwt_tok, _ = tokens_mod.issue_local_access_token(user_id="u-ws", session_id="sid-ws")
@@ -1073,12 +1097,31 @@ class TestLocalWsTicketAndSameOriginStartup:
             async def close(self, code: int = 1000, reason: str = "") -> None:
                 self.closed_code = code
 
-        # 1. Valid ?ticket= succeeds and stamps ws.state
+        # 1. Valid ?ticket= succeeds once and records its jti in Redis with <=60s TTL
         ws_ok = _FakeWS({"ticket": ticket})
         uid = await dispatch_mod.dispatch_oss_websocket(ws_ok, local_dev_user_id="local-dev-user")
         assert uid == "u-ws"
         assert ws_ok.state.local_user_id == "u-ws"
         assert ws_ok.state.local_session_id == "sid-ws"
+        assert len(seen_jti_keys) == 1
+
+        # 1b. Replaying the same one-time ticket is rejected with 1008
+        ws_replay = _FakeWS({"ticket": ticket})
+        with pytest.raises(WebSocketException) as exc_replay:
+            await dispatch_mod.dispatch_oss_websocket(ws_replay, local_dev_user_id="local-dev-user")
+        assert exc_replay.value.code == 1008
+        assert ws_replay.closed_code == 1008
+
+        # 1c. Unavailable Redis fails closed with 1008
+        fresh_ticket, _ = tokens_mod.issue_local_ws_ticket(user_id="u-ws", session_id="sid-ws")
+        fake_cache.client = None
+        ws_no_redis = _FakeWS({"ticket": fresh_ticket})
+        with pytest.raises(WebSocketException) as exc_no_redis:
+            await dispatch_mod.dispatch_oss_websocket(
+                ws_no_redis, local_dev_user_id="local-dev-user"
+            )
+        assert exc_no_redis.value.code == 1008
+        fake_cache.client = _FakeRedisClient()
 
         # 2. Access JWT passed via ?ticket= is rejected with 1008
         ws_bad = _FakeWS({"ticket": jwt_tok})
@@ -1094,6 +1137,84 @@ class TestLocalWsTicketAndSameOriginStartup:
                 ws_bearer_ticket, local_dev_user_id="local-dev-user"
             )
         assert exc_bt.value.code == 1008
+
+    def test_uvicorn_handshake_log_filter_redacts_ws_ticket_and_token_query(self) -> None:
+        from src.config.logging_config import _SENSITIVE_QUERY_LOG_FILTER
+
+        raw_ticket = "eyJ2IjoxLCJzdWIiOiJ1LTEifQ.supersecretHMACsig"
+        rec = logging.LogRecord(
+            name="uvicorn.error",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg='%s - "WebSocket %s" [accepted]',
+            args=("127.0.0.1:54321", f"/ws/v1/market-data/aggregates/stock?ticket={raw_ticket}&foo=bar"),
+            exc_info=None,
+        )
+        assert _SENSITIVE_QUERY_LOG_FILTER.filter(rec) is True
+        formatted = rec.getMessage()
+        assert raw_ticket not in formatted
+        assert "ticket=REDACTED" in formatted
+        assert "foo=bar" in formatted
+
+        rec_msg = logging.LogRecord(
+            name="uvicorn.error",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg=f'GET /ws/v1/stream?token={raw_ticket}',
+            args=(),
+            exc_info=None,
+        )
+        assert _SENSITIVE_QUERY_LOG_FILTER.filter(rec_msg) is True
+        assert raw_ticket not in rec_msg.getMessage()
+        assert "token=REDACTED" in rec_msg.getMessage()
+
+    def test_logout_refuses_cross_account_stale_tab_with_409_and_keeps_cookie(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.auth import local_router as lr_mod
+
+        monkeypatch.setenv("DALTON_AUTH_MODE", "local")
+        monkeypatch.setenv("JWT_SIGNING_SECRET", TEST_JWT_SECRET)
+
+        revoke_mock = create_autospec(
+            lr_mod.revoke_session_for_logout,
+            return_value="mismatch",
+        )
+        monkeypatch.setattr(lr_mod, "revoke_session_for_logout", revoke_mock)
+
+        app = FastAPI()
+        app.include_router(lr_mod.local_auth_router)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp_mismatch = client.post(
+            "/api/v1/dalton/auth/local/logout",
+            json={"sub": TEST_USER_ID},
+            cookies={"dalton_refresh_token": "cookie-for-user-b"},
+            headers={"Origin": "http://testserver"},
+        )
+        assert resp_mismatch.status_code == 409
+        # Must NOT clear user B's refresh cookie on 409!
+        assert "set-cookie" not in {k.lower() for k in resp_mismatch.headers.keys()}
+        revoke_mock.assert_awaited_once_with(
+            "cookie-for-user-b",
+            expected_user_id=TEST_USER_ID,
+            expected_session_id=None,
+            reason="logout",
+        )
+
+        # Matching sub revokes and clears cookie
+        revoke_mock.reset_mock()
+        revoke_mock.return_value = "revoked"
+        resp_ok = client.post(
+            "/api/v1/dalton/auth/local/logout",
+            json={"sub": TEST_USER_ID},
+            cookies={"dalton_refresh_token": "cookie-for-user-a"},
+            headers={"Origin": "http://testserver"},
+        )
+        assert resp_ok.status_code == 200
+        assert "set-cookie" in {k.lower() for k in resp_ok.headers.keys()}
 
     def test_validate_dalton_auth_config_requires_same_origin_in_local_mode(self, monkeypatch):
         from src.dalton.profile import DaltonStartupConfigError

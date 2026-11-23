@@ -7,6 +7,7 @@ admin remains) under transactional row locks.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from typing import Any, Literal
 
 from fastapi import HTTPException
@@ -76,6 +77,36 @@ async def get_user_role(user_id: str, *, conn: Any = None) -> RoleTier | None:
     if tier in VALID_ROLE_TIERS:
         return tier  # type: ignore[return-value]
     return None
+
+
+async def get_user_roles_batch(
+    user_ids: Iterable[str],
+    *,
+    conn: Any = None,
+) -> dict[str, RoleTier]:
+    """Batch-read ``dalton_user_roles.tier`` for ``user_ids`` in a single async query."""
+    cleaned = sorted({str(u or "").strip() for u in user_ids if str(u or "").strip()})
+    if not cleaned:
+        return {}
+    sql = "SELECT user_id, tier FROM dalton_user_roles WHERE user_id = ANY(%s)"
+    if conn is not None:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(sql, (cleaned,))
+            rows = await cur.fetchall()
+    else:
+        async with get_db_connection() as db_conn:
+            async with db_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(sql, (cleaned,))
+                rows = await cur.fetchall()
+    out: dict[str, RoleTier] = {}
+    for row in rows or []:
+        if not row:
+            continue
+        uid = str(row.get("user_id") or "").strip()
+        tier = str(row.get("tier") or "").strip().lower()
+        if uid and tier in VALID_ROLE_TIERS:
+            out[uid] = tier  # type: ignore[assignment]
+    return out
 
 
 async def list_admin_user_ids(*, conn: Any = None) -> list[str]:

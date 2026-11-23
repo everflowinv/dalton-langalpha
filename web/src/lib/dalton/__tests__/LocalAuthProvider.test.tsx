@@ -78,6 +78,32 @@ describe('LocalAuthProvider logout error handling', () => {
     expect(result.current.isLoggedIn).toBe(true);
     expect(result.current.userId).toBe('u-local-1');
 
+    // Server returns 409 on stale-tab cross-account logout -> specific toast shown, state preserved
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: 'Active cookie session belongs to another account' }), {
+        status: 409,
+      }),
+    );
+    await act(async () => {
+      await result.current.logout();
+    });
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      '/api/v1/dalton/auth/local/logout',
+      expect.objectContaining({
+        method: 'POST',
+        credentials: 'include',
+        body: JSON.stringify({ sub: 'u-local-1' }),
+      }),
+    );
+    expect(mockToast).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        variant: 'destructive',
+        title: '另一个标签页已切换账号，请刷新',
+      }),
+    );
+    expect(result.current.isLoggedIn).toBe(true);
+    expect(result.current.userId).toBe('u-local-1');
+
     // Retry succeeds -> local state clears
     fetchMock.mockResolvedValueOnce(
       new Response(JSON.stringify({ status: 'logged_out' }), { status: 200 }),

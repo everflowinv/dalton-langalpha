@@ -170,6 +170,28 @@ describe('localAuth HTTP client', () => {
     // 401 means session is already revoked on server -> treat as completed
     fetchMock.mockResolvedValueOnce(new Response(null, { status: 401 }));
     await expect(localLogout()).resolves.toBeUndefined();
+
+    // 409 means another tab switched account -> throw specific account_switched error and send sub
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: 'Active cookie session belongs to another account' }), {
+        status: 409,
+      }),
+    );
+    await expect(localLogout('user-a')).rejects.toMatchObject({
+      name: 'LocalAuthError',
+      message: '另一个标签页已切换账号，请刷新',
+      status: 409,
+      code: 'account_switched',
+    });
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      '/api/v1/dalton/auth/local/logout',
+      expect.objectContaining({
+        method: 'POST',
+        credentials: 'include',
+        headers: expect.objectContaining({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ sub: 'user-a' }),
+      }),
+    );
   });
 
   it('fetches short-lived HMAC WebSocket ticket via /api/v1/dalton/auth/local/ws-ticket', async () => {

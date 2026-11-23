@@ -2160,14 +2160,27 @@ async def list_team_workspaces(current_user_id: str, *, conn: Any = None) -> lis
     if not is_dalton_auth_enabled():
         return []
 
-    uid = await require_team_reader(current_user_id)
+    uid = (
+        await require_team_reader(current_user_id, conn=conn)
+        if conn is not None
+        else await require_team_reader(current_user_id)
+    )
     # Fully isolated environment: external members see no colleague workspace.
-    caller_tier = await get_user_tier(uid)
+    caller_tier = (
+        await get_user_tier(uid, conn=conn)
+        if conn is not None
+        else await get_user_tier(uid)
+    )
     if caller_tier in ("external", "company"):
         return []
-    allowed_emails = sorted(await get_team_member_emails())
+    allowed_emails = sorted(
+        await get_team_member_emails(conn=conn)
+        if conn is not None
+        else await get_team_member_emails()
+    )
 
     dispatch_enabled = is_colleague_dispatch_enabled()
+    owner_tiers: dict[str, str] = {}
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.cursor(row_factory=dict_row) as cur:
             if dispatch_enabled:
@@ -2251,10 +2264,20 @@ async def list_team_workspaces(current_user_id: str, *, conn: Any = None) -> lis
                     (uid, allowed_emails),
                 )
             rows = [dict(r) for r in await cur.fetchall()]
+        if is_dalton_local_auth_enabled() and rows:
+            from src.dalton.access_tiers import classify_owner_tiers_batch
+
+            owner_ids = [
+                str(r["user_id"])
+                for r in rows
+                if not (is_reserved_row(r) or bool(r.get("is_home")))
+            ]
+            owner_tiers = dict(
+                await classify_owner_tiers_batch(owner_ids, conn=owned_conn)
+            )
 
     grouped: dict[str, dict[str, Any]] = {}
     default_cos = "rw" if dispatch_enabled else DEFAULT_COS_ACCESS
-    owner_tiers: dict[str, str] = {}
     for row in rows:
         if is_reserved_row(row) or bool(row.get("is_home")):
             continue
@@ -2285,7 +2308,12 @@ async def list_team_workspaces(current_user_id: str, *, conn: Any = None) -> lis
             cos_access = _normalize_access_level(row.get("cos_access"), default_cos)
 
         owner_email = str(row.get("owner_email") or "").strip()
-        if not await is_team_member(owner_email):
+        member_ok = (
+            await is_team_member(owner_email, conn=conn)
+            if conn is not None
+            else await is_team_member(owner_email)
+        )
+        if not member_ok:
             continue
         owner_display = _display_name(row.get("owner_name"), owner_email)
         member = grouped.get(owner_uid)
@@ -2359,6 +2387,7 @@ async def list_colleague_cos_workspaces(
     allowed_emails = sorted(await get_team_member_emails())
 
     dispatch_enabled = is_colleague_dispatch_enabled()
+    owner_tiers: dict[str, str] = {}
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             if dispatch_enabled:
@@ -2440,13 +2469,24 @@ async def list_colleague_cos_workspaces(
                     (uid, allowed_emails),
                 )
             rows = [dict(r) for r in await cur.fetchall()]
+        if is_dalton_local_auth_enabled() and rows:
+            from src.dalton.access_tiers import classify_owner_tiers_batch
+
+            owner_ids = [
+                str(r["user_id"])
+                for r in rows
+                if not (is_reserved_row(r) or bool(r.get("is_home")))
+            ]
+            owner_tiers = dict(
+                await classify_owner_tiers_batch(owner_ids, conn=conn)
+            )
 
     items: list[dict[str, Any]] = []
     # An external-owned workspace never appears in another member's Chief of
-    # Staff list, whatever its sharing row says. The owner tier is classified
-    # from the joined email (no per-owner lookup).
+    # Staff list, whatever its sharing row says. In local mode owner tiers are
+    # batch-loaded above via one async query; in Supabase mode classified from
+    # the joined email (no per-owner lookup).
     default_cos = "rw" if dispatch_enabled else DEFAULT_COS_ACCESS
-    owner_tiers: dict[str, str] = {}
     for row in rows:
         if is_reserved_row(row) or bool(row.get("is_home")):
             continue
