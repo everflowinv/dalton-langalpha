@@ -275,7 +275,7 @@ DALTON_OPERATOR_LLM_ENDPOINTS=https://llm-gateway.corp.internal/v1
 `scripts/standalone/backup.sh` 在服务在线运行时完成以下四项归档，并执行 `pg_restore --list` 校验、MinIO 流式分块打包与 `SHA256SUMS`（安全散列算法 256 位校验清单）生成：
 
 1. PostgreSQL 逻辑备份 `postgres.dump`（单一事务快照，同时包含上游与 Dalton 两条迁移链）；
-2. MinIO 对象归档 `minio-objects.tar.gz`（按块流式读写并增量计算逐文件 SHA-256，保留 `ContentType`）：始终包含应用当前配置使用的所有桶（即便该桶是由历史恢复切换而来），仅跳过未在使用的历史恢复桶（通过桶标签 `dalton-restore=true` 或 `.dalton-restore.json` 标记对象识别，不再靠桶名后缀猜测）；
+2. MinIO 对象归档 `minio-objects.tar.gz`（按块流式读写并增量计算逐文件 SHA-256，保留 `ContentType`）：v1 仅支持**单一对象存储服务**——如果 `.env` 或容器环境中配置的应用存储桶分布在多个不同的对象存储服务/地址上（例如聊天上传与 ASR / S3 / OSS / R2 指向不同服务），`backup.sh` 会直接报错退出；
 3. Caddy 证书与内部 CA 数据归档 `caddy-data.tar.gz`；
 4. `.env` 密钥文件：传入 `--env-passphrase-file` 时使用 OpenSSL AES-256-CBC + PBKDF2（参数写入 `manifest.json`，整体完整性由 `SHA256SUMS` 校验）加密生成 `env.enc`。
 
@@ -328,24 +328,24 @@ crontab -e
 30 2 * * * cd /opt/dalton && /usr/bin/env bash scripts/standalone/backup.sh --output-dir /var/backups/dalton --retain 14 --env-passphrase-file /etc/dalton/backup.pass >> /var/log/dalton/backup.log 2>&1
 ```
 
-### 6.2 在全新主机或已有实例上正式恢复
+### 6.2 正式恢复（仅支持空目标实例）
 
-`scripts/standalone/restore.sh` 采用**切换名字、绝不覆盖原数据、单一提交点**的恢复设计：
-1. 校验 `SHA256SUMS` 与 `manifest.json`；
-2. 将目标 `.env` 写入临时文件（传入 `--replace-env` 或空机时解密 `env.enc`，否则复制现有 `.env`），按 `COMPOSE_PROJECT_NAME` 加恢复锁（`${XDG_RUNTIME_DIR:-/tmp}/dalton-<项目名>.restore.lock`），所有前置检查（项目名一致性、外部数据库拦截、Compose 文件列表、目标库/桶非空检查）均使用**新配置**的值；
-3. 将对象写入**全新桶** `<桶名>-r<YYYYmmddHHMMSS>`（超长时使用 `<截断前缀>-<短哈希>-r<时间戳>` 保证唯一；创建前先确认该名字不存在，并写入 `dalton-restore=true` 标签或 `.dalton-restore.json` 标记），读回校验大小、SHA-256 与 `ContentType`，再把临时 `.env` 中所有指向对应桶的变量更新为新桶名——**原桶完全不动**（不复制、不覆盖、不删除）；
-4. 将数据库恢复到临时库 `<库名>_restore_<时间戳>` 并完成迁移；
-5. **唯一提交点**：确认对象与数据库全部就绪后，停止应用容器，将旧 `.env` 复制保留为 `.env.pre-restore-<时间戳>`，再同时执行单事务数据库改名（`<库名>` → `<库名>_pre_restore_<时间戳>`、`<库名>_restore_<时间戳>` → `<库名>`）与 `.env` 原子替换；在此之前任一步失败，均不改 `.env`、不改数据库名、不动原桶，并自动清理本次创建的临时桶与临时库；
-6. 恢复 Caddy `/data`（清空前先归档并校验）、核对数据库引用对象、启动全部服务并执行健康探测。
+v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不提供原地替换已有数据的路径）：
+1. 校验备份目录内的 `SHA256SUMS`、`manifest.json` 与对象归档清单；
+2. 准备目标 `.env`（**只读文件内容，不读 shell 环境变量**；传入 `--replace-env` 时对 `COMPOSE_PROJECT_NAME` 做**逐字比较**，不做规范化），在固定路径 `/tmp/dalton-<项目名>.restore.lock` 上加锁（优先使用 `flock`，无 `flock` 时退化为 `mkdir` 原子锁；不会按 PID 自动清理遗留锁，如遇残留锁需由管理员确认无并发恢复后手动删除），清理上次异常中断残留的 `.env.tmp-*`，并校验外部库拦截、数据库标识符与 Compose 文件；
+3. 检查目标实例必须为空：数据库内不能有任何非系统 schema 的对象，对象存储内不能有任何桶（或只能有 `minio_init` 刚创建、尚无任何对象的空桶），否则直接拒绝并指向下方"在已有实例上覆盖恢复"步骤；同时用 `pg_restore --list` 校验备份文件。确认全部通过后，若配置来自 `env.enc`，再通过临时文件 `.env.tmp-*` + `chmod` + 原子 `mv` 写入正式 `.env`（即使在写入瞬间遭遇 `kill -9`，最多残留一个 `.env.tmp-*`，下次运行自动清理）；
+4. 调用所有 `docker compose` 命令前，先通过 `env -u` 清除 `.env` 中出现的全部键（及 `COMPOSE_PROJECT_NAME`、`COMPOSE_FILE`），防止 shell 里导出的旧变量覆盖 `.env` 文件；
+5. 直接向正式对象存储的原桶名写入对象（流式上传并读回校验大小、SHA-256 与 `ContentType`），直接向正式数据库恢复 `postgres.dump` 并执行 `migrate`，核对数据库引用对象；
+6. 若 `.env` 来自备份则重建 `edge` 镜像（除非传入 `--skip-edge-build`），恢复 Caddy `/data`，最后启动全套服务并执行健康探测与双链版本核验。
 
-#### 空机恢复步骤（先恢复 `.env`，再构建镜像）
+#### 空机恢复步骤
 
-1. 在新服务器上解压对应（或更新）版本的发行包至 `/opt/dalton`，并将备份目录拷入本机（例如 `/var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3`）。
-2. 执行恢复（`restore.sh` 会在解密 `.env` 后自动重建 `edge` 镜像以匹配其中的品牌与认证参数，并将 `.env` 中的对象存储桶名切换为新创建的 `<桶名>-r<时间戳>`）：
+1. 在新服务器上解压对应（或更新）版本的发行包至 `/opt/dalton`，并将校验通过的备份目录拷入本机（例如 `/var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3`）。
+2. 执行恢复（直接写进正式库与备份中的原桶名）：
    ```bash
    cd /opt/dalton
 
-   # 方式 A：备份目录含 env.enc，传入口令文件自动还原 .env 并恢复全部数据
+   # 方式 A：备份目录含 env.enc，传入口令文件自动校验并原子写入 .env 后恢复全部数据
    bash scripts/standalone/restore.sh \
      --backup-dir /var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3 \
      --env-passphrase-file /etc/dalton/backup.pass
@@ -354,122 +354,69 @@ crontab -e
    bash scripts/standalone/restore.sh \
      --backup-dir /var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3
    ```
-   > 若使用已有 `.env` 而未用备份内的 `env.enc` 覆盖，请确认其中的 `BYOK_ENCRYPTION_KEY` 与备份同期原件一致，否则已保存的模型密钥将无法解密。使用企业自有证书（`custom`）模式时，提前恢复 `DALTON_TLS_CERT_DIR` 并可附加 `--ca-file <企业CA.pem>`。
+   > - 如果目标目录已有一份 `.env` 且目标实例为空，需要用备份内的 `env.enc` 替换该 `.env`，附加 `--replace-env`（要求新旧 `.env` 中的 `COMPOSE_PROJECT_NAME` 逐字一致，先校验目标为空后再原子写入）。
+   > - 若使用已有 `.env` 而未用 `env.enc` 覆盖，请确认其中的 `BYOK_ENCRYPTION_KEY` 与备份同期原件一致，否则已保存的模型密钥将无法解密。使用企业自有证书（`custom`）模式时，提前恢复 `DALTON_TLS_CERT_DIR` 并可附加 `--ca-file <企业CA.pem>`。
 3. 恢复完成后，提前构建代码沙箱镜像以消除首次对话等待：
    ```bash
    docker build -f Dockerfile.sandbox --build-arg INSTALL_AGENT_BROWSER=0 -t langalpha-sandbox:latest .
    ```
 
-#### 在已有数据的实例上切换恢复
+#### 在已有实例上覆盖恢复（含升级迁移后回滚）
 
-`restore.sh` 按 `COMPOSE_PROJECT_NAME` 在 `${XDG_RUNTIME_DIR:-/tmp}/dalton-<项目名>.restore.lock` 加锁（跨目录操作同一项目同样互斥），并将数据切换与配置替换分为两个显式授权参数：
-- `--replace-data`：允许在非空数据库与非空对象存储上执行切换恢复（原库保留为 `<库名>_pre_restore_<时间戳>`，原桶完全不动，原 `.env` 保留为 `.env.pre-restore-<时间戳>`）；
-- `--replace-env`：允许以备份中的 `env.enc` 作为新配置来源（所有前置检查均按新配置执行，同样在唯一提交点与数据库改名一起生效；项目名不一致或指向外部库时直接拒绝，原 `.env` 不变）。
+> **危险操作警告**：下列第 2 步的 `docker compose down -v` **会永久删除当前实例的数据库、对象存储、缓存与证书卷中的所有当前数据**，且无法撤回。执行前**必须**先完成第 1 步，确认手里有一份校验通过且完整可用的备份！
 
-```bash
-bash scripts/standalone/restore.sh \
-  --backup-dir /var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3 \
-  --replace-data
-```
+如果需要用备份覆盖已有数据的实例（包括升级执行数据库迁移后需要回滚到升级前状态），请按以下人工步骤依次操作（以下以部署目录 `/opt/dalton`、备份目录 `/var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3` 为例；若旧部署的 `.env` 中尚未写入 `COMPOSE_FILE`，请在所有 `docker compose` 命令中显式加上 `-f docker-compose.yml -f docker-compose.core.yml`，启用 TLS 时一并加上 `-f deploy/standalone/docker-compose.tls.yml`）：
+
+1. **确认有一份校验通过的备份**：检查 `backup.sh` 输出中是否包含 PostgreSQL、MinIO、Caddy 的 `OK: ... verified` 校验结果与 `== Backup Complete ==`，并在备份目录中重新核验 `SHA256SUMS`：
+   ```bash
+   cd /var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3
+   sha256sum -c SHA256SUMS
+   cat manifest.json
+   ```
+   确认全部文件返回 `OK`、`postgres.dump` 与 `minio-objects.tar.gz` 完整存在，且同期 `.env`（或 `env.enc` 与口令文件）可用。
+
+2. **列出并确认本项目的实际卷名后，执行 `docker compose down -v` 删除本项目的卷**（仅删除当前项目的容器与数据卷，保留 `/opt/dalton/.env` 与发行文件）：
+   ```bash
+   cd /opt/dalton
+
+   # 从本项目的容器里读取实际挂载的具名卷并列出，请逐项人工确认全部属于当前项目
+   CONTAINER_IDS="$(docker compose ps -aq)"
+   if [ -n "$CONTAINER_IDS" ]; then
+     docker inspect --format '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\n"}}{{end}}{{end}}' $CONTAINER_IDS | sort -u
+   else
+     PROJECT_NAME="$(docker compose config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')"
+     docker volume ls -q --filter "label=com.docker.compose.project=${PROJECT_NAME}" | sort -u
+   fi
+   ```
+   **请仔细核对上面输出的卷名列表**，确认这些卷均属于当前要重置的项目且第 1 步备份已校验通过，然后删除本项目的容器与卷：
+   ```bash
+   docker compose down -v
+   ```
+
+3. **使用 `restore.sh` 恢复到这个空实例**：
+   ```bash
+   cd /opt/dalton
+
+   # 使用当前目录保留的 .env 恢复数据
+   bash scripts/standalone/restore.sh \
+     --backup-dir /var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3
+
+   # 如需同时用备份中的 env.enc 替换当前 .env，附加 --env-passphrase-file 与 --replace-env
+   # bash scripts/standalone/restore.sh \
+   #   --backup-dir /var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3 \
+   #   --env-passphrase-file /etc/dalton/backup.pass \
+   #   --replace-env
+   ```
 
 #### 恢复后的确认方法
 
-1. 检查容器状态与新桶配置：
+1. 检查容器状态与桶配置：
    ```bash
    cd /opt/dalton
    docker compose ps
    grep -E '^DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME=' .env
    ```
-2. 打开 Web UI，确认历史工作区、对话线程回放与既有上传文件均可正常打开与下载，并尝试上传一个新文件验证新桶可写。
-
-#### 恢复后回滚到恢复前状态
-
-由于原数据库、原桶与原 `.env` 均完整保留，若需撤销本次恢复，直接将 `.env` 与数据库名改回原值并重启即可：
-
-```bash
-cd /opt/dalton
-
-# 1. 停止应用容器
-docker compose stop backend crawler edge
-
-# 2. 还原恢复前保存的 .env（自动切回原桶名）
-cp -p .env.pre-restore-<时间戳> .env
-chmod 600 .env
-
-# 3. 在单个事务内将原库改回正式库名（将 <库名> 与 <时间戳> 替换为实际值）
-docker compose exec -T postgres psql -U postgres -d template1 -v ON_ERROR_STOP=1 <<'SQL'
-SELECT pg_terminate_backend(pid)
-  FROM pg_stat_activity
- WHERE datname IN ('<库名>', '<库名>_pre_restore_<时间戳>')
-   AND pid <> pg_backend_pid();
-BEGIN;
-ALTER DATABASE "<库名>" RENAME TO "<库名>_abandoned_<时间戳>";
-ALTER DATABASE "<库名>_pre_restore_<时间戳>" RENAME TO "<库名>";
-COMMIT;
-SQL
-
-# 4. 重启服务栈并核验原数据与原上传文件
-docker compose up -d
-docker compose ps
-```
-
-#### 确认无误后清理旧库与旧桶
-
-确认恢复结果正常且无需回滚后，按脚本末尾打印的命令手动清理旧库、旧桶（原桶）、旧 `.env` 副本与旧 Caddy 归档：
-
-```bash
-cd /opt/dalton
-
-# 1. 删除保留的原数据库
-docker compose exec -T postgres psql -U postgres -d template1 \
-  -c 'DROP DATABASE "<库名>_pre_restore_<时间戳>";'
-
-# 2. 列出所有桶并核对当前 .env 正在使用的桶名（切勿误删当前活动桶！）
-grep -E 'BUCKET_NAME=' .env
-docker compose exec -T backend uv run --no-sync python - <<'PY'
-import os, boto3
-from botocore.config import Config
-
-client = boto3.client(
-    "s3",
-    endpoint_url=os.getenv("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL", "http://minio:9000"),
-    aws_access_key_id=os.getenv("DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID") or os.getenv("MINIO_ROOT_USER"),
-    aws_secret_access_key=os.getenv("DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY") or os.getenv("MINIO_ROOT_PASSWORD"),
-    region_name=os.getenv("DALTON_CHAT_UPLOAD_STORAGE_REGION", "us-east-1"),
-    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
-)
-for b in sorted(x["Name"] for x in client.list_buckets().get("Buckets", [])):
-    print(b)
-PY
-
-# 3. 确认旧桶名无误后，清空并删除指定旧桶（逐项检查 DeleteObjects 错误）
-docker compose exec -T backend uv run --no-sync python - "<旧桶名>" <<'PY'
-import os, sys, boto3
-from botocore.config import Config
-
-bucket = sys.argv[1]
-client = boto3.client(
-    "s3",
-    endpoint_url=os.getenv("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL", "http://minio:9000"),
-    aws_access_key_id=os.getenv("DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID") or os.getenv("MINIO_ROOT_USER"),
-    aws_secret_access_key=os.getenv("DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY") or os.getenv("MINIO_ROOT_PASSWORD"),
-    region_name=os.getenv("DALTON_CHAT_UPLOAD_STORAGE_REGION", "us-east-1"),
-    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
-)
-for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket):
-    objs = [{"Key": o["Key"]} for o in page.get("Contents", [])]
-    if objs:
-        resp = client.delete_objects(Bucket=bucket, Delete={"Objects": objs, "Quiet": False})
-        if resp.get("Errors"):
-            raise SystemExit(f"DeleteObjects failed: {resp['Errors']}")
-client.delete_bucket(Bucket=bucket)
-print(f"Deleted old bucket: {bucket}")
-PY
-
-# 4. 清理旧 .env 副本与旧 Caddy 备份归档（如有）
-rm -f /opt/dalton/.env.pre-restore-<时间戳>
-rm -f /opt/dalton/.restore-backup/caddy-pre-restore-<时间戳>.tar.gz
-```
+2. 打开 Web UI，确认历史工作区、对话线程回放与既有上传文件均可正常打开与下载，并尝试上传一个新文件验证对象存储可写。
 
 ### 6.3 平滑升级与回滚
 
@@ -500,15 +447,22 @@ bash scripts/standalone/backup.sh \
   --output-dir /var/backups/dalton \
   --env-passphrase-file /etc/dalton/backup.pass
 
-# 3. 停止旧 Redis 7.4 容器，先备份旧 Redis 数据卷，再移除旧容器与旧卷
+# 3. 从旧项目的 redis 容器获取实际挂载的 /data 卷名，停机归档并校验成功后，再删除该卷
 cd /opt/dalton
-docker compose stop redis
-docker compose run --rm -T --no-deps --entrypoint /bin/sh redis \
-  -c 'tar -czf - -C /data .' > "/var/backups/dalton/redis-pre-valkey-$(date -u +%Y%m%d-%H%M%SZ).tar.gz"
-docker compose rm -f redis
-REDIS_VOL="$(docker volume ls -q --filter name=langalpha-redis-data | head -n 1)"
-test -n "$REDIS_VOL"
-docker volume rm "$REDIS_VOL"
+REDIS_CID="$(docker compose -f docker-compose.yml -f docker-compose.core.yml ps -aq redis | head -n 1)"
+REDIS_VOL="$(docker inspect --format '{{range .Mounts}}{{if and (eq .Type "volume") (eq .Destination "/data")}}{{.Name}}{{end}}{{end}}' "$REDIS_CID")"
+REDIS_IMAGE="$(docker inspect --format '{{.Config.Image}}' "$REDIS_CID")"
+echo "旧项目 Redis 卷名: ${REDIS_VOL}"
+
+REDIS_ARCHIVE="/var/backups/dalton/redis-pre-valkey-$(date -u +%Y%m%d-%H%M%SZ).tar.gz"
+test -n "$REDIS_CID" && test -n "$REDIS_VOL" && \
+  docker compose -f docker-compose.yml -f docker-compose.core.yml stop redis && \
+  docker run --rm -v "${REDIS_VOL}:/data:ro" --entrypoint /bin/sh "$REDIS_IMAGE" -c 'tar -czf - -C /data .' > "$REDIS_ARCHIVE" && \
+  chmod 600 "$REDIS_ARCHIVE" && \
+  test -s "$REDIS_ARCHIVE" && \
+  tar -tzf "$REDIS_ARCHIVE" >/dev/null && \
+  docker compose -f docker-compose.yml -f docker-compose.core.yml rm -f redis && \
+  docker volume rm "$REDIS_VOL"
 
 # 4. 在新包目录里运行 upgrade.sh 完成升级（Valkey 8 会自动创建全新的 RDB v11 数据卷）
 cd /tmp/dalton-core-new
@@ -535,12 +489,13 @@ bash scripts/standalone/upgrade.sh \
 
 #### 升级失败回滚
 
-当任意步骤失败时，脚本会根据失败发生的阶段输出对应的 shell 转义回滚命令（携带实际使用的 `--compose-files`）：
-- **在迁移容器真正开始执行之前失败**（如发行包校验、镜像构建，或 `docker compose run migrate` 在启动迁移容器前因网络/镜像问题失败）：数据库尚未被改动，脚本**不会**提示执行 `restore.sh --replace-data`（避免误回退备份后的新写入），仅提示使用 `rsync -a --delete`（排除 `.env`、`backups/`、`.upgrade-backup/`、`.restore-backup/`、`certs/`、`extra/`）还原旧发行文件并恢复 `pre-upgrade-<时间戳>` 镜像标签；
-- **在迁移容器启动并输出第一条 `[migrate]` 日志或迁移版本表发生变化之后失败**：依次提示：
+当任意步骤失败时，脚本以迁移前后**都成功读到**的 Alembic 版本号（`alembic_version` 与 `alembic_version_dalton`）比较结果为准，按以下三种情况输出对应的 shell 转义回滚指引（携带实际使用的 `--compose-files`）：
+- **迁移之前失败（或迁移前后版本号均成功读到且未发生变化）**：数据库表结构未被改动，不需要动数据（避免丢弃备份后的新写入）；脚本仅提示使用 `rsync -a --delete`（排除 `.env`、`backups/`、`.upgrade-backup/`、`.restore-backup/`、`certs/`、`extra/`）还原旧发行文件、恢复 `pre-upgrade-<时间戳>` 镜像标签并重启服务；
+- **迁移之后失败（迁移前后版本号均成功读到且至少一条迁移链版本已变化）**：依次提示：
   1. 使用 `rsync -a --delete`（带上述排除项）从 `.upgrade-backup/<时间戳>/` 还原旧版发行文件；
   2. 通过 `docker tag <镜像>:pre-upgrade-<时间戳> <镜像>:local` 恢复旧版容器镜像标签；
-  3. 使用升级前备份目录执行 `restore.sh --replace-data --skip-edge-build` 恢复数据库、切换新桶并恢复 Caddy 数据。
+  3. 按上文 §6.2「在已有实例上覆盖恢复（含升级迁移后回滚）」的人工步骤操作：先核验升级前备份，再列出并确认本项目卷名后执行 `docker compose down -v`，最后用 `restore.sh --skip-edge-build` 恢复到空实例；
+- **迁移状态不确定（迁移前或迁移后未能读到版本号）**：脚本**不会**直接认定"已迁移"或提示清空数据卷，而是提示先人工查询当前 `alembic_version` / `alembic_version_dalton` 并与升级前备份的 `manifest.json` 核对：版本号一致则只还原文件与镜像，版本号已变再按 §6.2 人工步骤恢复。
 
 ---
 

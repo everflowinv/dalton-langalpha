@@ -28,22 +28,18 @@ Verifies on a running Standalone Core (`auth: oss`) stack:
    - Plaintext `.env` is never placed in backup folders; `--env-passphrase-file`
      produces AES-256 encrypted `env.enc` with PBKDF2 params recorded in `manifest.json`;
      `--retain` prunes older backups cleanly.
-4. `scripts/standalone/restore.sh` restores onto a brand-new empty stack AND
-   exercises the switch-bucket-name design (`--replace-data`, failure atomicity, rollback):
-   - Decrypts `env.enc` into `.env` (mode 0600), restores objects into a brand-new
-     `<bucket>-r<YYYYmmddHHMMSS>` bucket, updates `.env` bucket variables at the
-     single commit point, restores DB and Caddy CA.
-   - Non-empty guard without `--replace-data` fails with `--replace-data` hint while
-     the live restored instance continues serving HTTPS 200.
+4. `scripts/standalone/restore.sh` (v1: empty target instance only):
+   - Decrypts `env.enc` into `.env` (mode 0600) only after target-empty preflight
+     passes, unsets all `.env` keys via `env -u` before every `docker compose` call,
+     restores objects directly into original bucket name(s), restores DB directly
+     into the official database, and restores Caddy CA.
    - Table row counts, sentinel thread row, real SSE `/messages/replay` assistant text,
      sentinel MinIO object SHA-256 & `ContentType`, and Caddy CA fingerprint all match.
-   - Simulated mid-restore failure (failing `migrate`) leaves `.env`, database name/data,
-     and the original MinIO bucket completely unchanged (and cleans up temp resources).
-   - Running `--replace-data` switches the app to a new `<bucket>-r<ts>` bucket for both
-     reads and writes while leaving the original bucket's object count and contents
-     untouched, and preserves `.env.pre-restore-<ts>` and `<db>_pre_restore_<ts>`.
-   - Rolling back `.env` and database name restores access to all pre-restore data and
-     the original bucket.
+   - Re-running `restore.sh` against a non-empty instance is refused with a pointer
+     to `STANDALONE-DEPLOY.md` (`down -v`) while the live instance continues serving
+     HTTPS 200.
+   - Following the manual reset steps (inspect project container volumes ->
+     `docker compose down -v`) and re-running `restore.sh` succeeds with identical data.
 5. `scripts/standalone/upgrade.sh` performs a same-version rolling upgrade from a
    release tarball: backs up with the old `backup.sh`, tags `pre-upgrade-<ts>` images,
    snapshots `.upgrade-backup/<ts>/`, replaces services, converges with `up -d`, and
@@ -986,58 +982,6 @@ def _count_minio_objects(
     return int(proc.stdout.strip().splitlines()[-1])
 
 
-def _snapshot_bucket_objects(
-    compose_cmd: list[str],
-    cwd: Path,
-    bucket: str,
-    *,
-    env: dict[str, str] | None = None,
-) -> dict[str, tuple[int, str, str]]:
-    """Return ``{key: (size, sha256, content_type)}`` for every user object in ``bucket``."""
-    script = (
-        "import hashlib, json, os, boto3\n"
-        "from botocore.config import Config\n"
-        "def _e(*ks, d=''):\n"
-        "    for k in ks:\n"
-        "        v = (os.getenv(k) or '').strip()\n"
-        "        if v: return v\n"
-        "    return d\n"
-        "c = boto3.client('s3', endpoint_url=_e('DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL', d='http://minio:9000'), "
-        "aws_access_key_id=_e('DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID', 'MINIO_ROOT_USER'), "
-        "aws_secret_access_key=_e('DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY', 'MINIO_ROOT_PASSWORD'), "
-        "region_name=_e('DALTON_CHAT_UPLOAD_STORAGE_REGION', d='us-east-1'), "
-        "config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}))\n"
-        f"bucket = {bucket!r}\n"
-        "out = {}\n"
-        "for page in c.get_paginator('list_objects_v2').paginate(Bucket=bucket):\n"
-        "    for entry in page.get('Contents', []):\n"
-        "        key = entry['Key']\n"
-        "        if key == '.dalton-restore.json':\n"
-        "            continue\n"
-        "        resp = c.get_object(Bucket=bucket, Key=key)\n"
-        "        h = hashlib.sha256()\n"
-        "        sz = 0\n"
-        "        for ch in resp['Body'].iter_chunks(chunk_size=1024 * 1024):\n"
-        "            if ch:\n"
-        "                h.update(ch)\n"
-        "                sz += len(ch)\n"
-        "        resp['Body'].close()\n"
-        "        out[key] = [sz, h.hexdigest(), resp.get('ContentType') or '']\n"
-        "print(json.dumps(out))\n"
-    )
-    proc = subprocess.run(
-        [*compose_cmd, "exec", "-T", "backend", "uv", "run", "--no-sync", "python", "-c", script],
-        cwd=str(cwd),
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=60,
-    )
-    raw = json.loads(proc.stdout.strip().splitlines()[-1])
-    return {k: (int(v[0]), str(v[1]), str(v[2])) for k, v in raw.items()}
-
-
 def _backend_active_bucket(
     compose_cmd: list[str],
     cwd: Path,
@@ -1065,118 +1009,6 @@ def _backend_active_bucket(
         timeout=30,
     )
     return proc.stdout.strip().splitlines()[-1]
-
-
-def _list_databases(
-    compose_cmd: list[str],
-    cwd: Path,
-    db_user: str,
-    *,
-    env: dict[str, str] | None = None,
-) -> list[str]:
-    proc = subprocess.run(
-        [
-            *compose_cmd,
-            "exec",
-            "-T",
-            "postgres",
-            "psql",
-            "-U",
-            db_user,
-            "-d",
-            "template1",
-            "-Atqc",
-            "SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY datname;",
-        ],
-        cwd=str(cwd),
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=30,
-    )
-    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-
-
-def _https_upload_chat_file(
-    server_hostname: str,
-    port: int,
-    ssl_ctx: ssl.SSLContext,
-    workspace_id: str,
-    filename: str,
-    payload: bytes,
-) -> tuple[str, str]:
-    """Upload a file via the live HTTPS chat-uploads API; return ``(upload_id, sha256)``."""
-    payload_sha = hashlib.sha256(payload).hexdigest()
-    init_resp = _https_request(
-        "POST",
-        server_hostname,
-        port,
-        "/api/v1/dalton/chat-uploads",
-        context=ssl_ctx,
-        json_body={
-            "workspace_id": workspace_id,
-            "filename": filename,
-            "size_bytes": len(payload),
-            "mime_type": "text/plain",
-            "sha256": payload_sha,
-        },
-    )
-    assert init_resp.status == 200, f"HTTPS init upload failed: {init_resp.status} {init_resp.text}"
-    upload_id = init_resp.json()["upload_id"]
-    part_resp = _https_request(
-        "PUT",
-        server_hostname,
-        port,
-        f"/api/v1/dalton/chat-uploads/{upload_id}/parts/1",
-        context=ssl_ctx,
-        headers={"Content-Type": "text/plain", "X-Part-Sha256": payload_sha},
-        data=payload,
-    )
-    assert part_resp.status == 200, f"HTTPS upload part failed: {part_resp.status} {part_resp.text}"
-    comp_resp = _https_request(
-        "POST",
-        server_hostname,
-        port,
-        f"/api/v1/dalton/chat-uploads/{upload_id}/complete",
-        context=ssl_ctx,
-        json_body={"sha256": payload_sha},
-    )
-    assert comp_resp.status == 200, f"HTTPS complete upload failed: {comp_resp.status} {comp_resp.text}"
-    return upload_id, payload_sha
-
-
-def _list_minio_buckets(
-    compose_cmd: list[str],
-    cwd: Path,
-    *,
-    env: dict[str, str] | None = None,
-) -> list[str]:
-    script = (
-        "import json, os, boto3\n"
-        "from botocore.config import Config\n"
-        "def _e(*ks, d=''):\n"
-        "    for k in ks:\n"
-        "        v = (os.getenv(k) or '').strip()\n"
-        "        if v: return v\n"
-        "    return d\n"
-        "c = boto3.client('s3', endpoint_url=_e('DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL', d='http://minio:9000'), "
-        "aws_access_key_id=_e('DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID', 'MINIO_ROOT_USER'), "
-        "aws_secret_access_key=_e('DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY', 'MINIO_ROOT_PASSWORD'), "
-        "region_name=_e('DALTON_CHAT_UPLOAD_STORAGE_REGION', d='us-east-1'), "
-        "config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}))\n"
-        "print(json.dumps(sorted(b['Name'] for b in c.list_buckets().get('Buckets', []) if b.get('Name'))))\n"
-    )
-    proc = subprocess.run(
-        [*compose_cmd, "exec", "-T", "backend", "uv", "run", "--no-sync", "python", "-c", script],
-        cwd=str(cwd),
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=60,
-    )
-    return list(json.loads(proc.stdout.strip().splitlines()[-1]))
 
 
 def _fetch_minio_object_sha_and_ct(
@@ -1384,6 +1216,235 @@ def _prepare_clean_restore_dir(src_work_dir: Path, dst_dir: Path) -> None:
             shutil.copytree(src, dst, dirs_exist_ok=True)
 
 
+def _rewrite_env_keys(raw_env: str, overrides: dict[str, str]) -> str:
+    """Replace or append KEY=VAL lines in a `.env` file while preserving all other entries."""
+    replaced: set[str] = set()
+    out: list[str] = []
+    for line in raw_env.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            key_part = stripped.removeprefix("export ").strip()
+            for sep in ("=", ":"):
+                if sep in key_part:
+                    k = key_part.split(sep, 1)[0].strip()
+                    if k in overrides:
+                        if k not in replaced:
+                            out.append(f"{k}={overrides[k]}\n")
+                            replaced.add(k)
+                        break
+            else:
+                out.append(line)
+            continue
+        out.append(line)
+    if out and not out[-1].endswith("\n"):
+        out[-1] = out[-1] + "\n"
+    for k, v in overrides.items():
+        if k not in replaced:
+            out.append(f"{k}={v}\n")
+    return "".join(out)
+
+
+def _make_isolated_restore_backup(
+    src_backup_dir: Path,
+    dst_backup_dir: Path,
+    src_env_path: Path,
+    passphrase_file: Path,
+    overrides: dict[str, str],
+) -> None:
+    """Verify original env.enc decrypts to src_env_path, then create a parallel-safe backup copy.
+
+    Because `restore.sh` strictly reads `.env` and runs `env -u` on all `.env` keys before every
+    `docker compose` call, running a restored stack alongside the still-live source stack in CI
+    requires isolated project name / subnet / ports inside `env.enc` itself while keeping
+    `postgres.dump`, `minio-objects.tar.gz`, `caddy-data.tar.gz`, and all secrets identical.
+    """
+    manifest = json.loads((src_backup_dir / "manifest.json").read_text(encoding="utf-8"))
+    enc = manifest.get("env_encryption") or {}
+    cipher = str(enc.get("cipher") or "aes-256-cbc")
+    digest = str(enc.get("digest") or "sha256")
+    iters = str(int(enc.get("iterations") or 600000))
+
+    decrypted = subprocess.check_output(
+        [
+            "openssl",
+            "enc",
+            "-d",
+            f"-{cipher}",
+            "-pbkdf2",
+            "-md",
+            digest,
+            "-iter",
+            iters,
+            "-in",
+            str(src_backup_dir / "env.enc"),
+            "-pass",
+            f"file:{passphrase_file}",
+        ],
+        timeout=30,
+    )
+    assert decrypted == src_env_path.read_bytes(), (
+        "Decrypted env.enc from backup does not match source .env byte-for-byte!"
+    )
+
+    shutil.copytree(src_backup_dir, dst_backup_dir)
+    isolated_env_text = _rewrite_env_keys(decrypted.decode("utf-8"), overrides)
+    plain_tmp = dst_backup_dir / ".isolated.plain.tmp"
+    try:
+        plain_tmp.write_text(isolated_env_text, encoding="utf-8")
+        os.chmod(plain_tmp, 0o600)
+        subprocess.run(
+            [
+                "openssl",
+                "enc",
+                f"-{cipher}",
+                "-pbkdf2",
+                "-md",
+                digest,
+                "-iter",
+                iters,
+                "-salt",
+                "-in",
+                str(plain_tmp),
+                "-out",
+                str(dst_backup_dir / "env.enc"),
+                "-pass",
+                f"file:{passphrase_file}",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        os.chmod(dst_backup_dir / "env.enc", 0o600)
+    finally:
+        plain_tmp.unlink(missing_ok=True)
+
+    # Refresh env.enc entry in SHA256SUMS while keeping all other artifact digests intact.
+    new_env_sha = hashlib.sha256((dst_backup_dir / "env.enc").read_bytes()).hexdigest()
+    sums_path = dst_backup_dir / "SHA256SUMS"
+    new_lines: list[str] = []
+    for line in sums_path.read_text(encoding="utf-8").splitlines():
+        if line.endswith("  env.enc"):
+            new_lines.append(f"{new_env_sha}  env.enc")
+        else:
+            new_lines.append(line)
+    sums_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    os.chmod(sums_path, 0o600)
+
+
+def _list_project_container_volumes(
+    compose_cmd: list[str],
+    cwd: Path,
+    *,
+    env: dict[str, str] | None = None,
+) -> list[str]:
+    """Mirror the manual step: resolve actual mounted volume names from this project's containers."""
+    cids = [
+        line.strip()
+        for line in subprocess.check_output(
+            [*compose_cmd, "ps", "-aq"],
+            cwd=str(cwd),
+            env=env,
+            text=True,
+            timeout=30,
+        ).splitlines()
+        if line.strip()
+    ]
+    if not cids:
+        return []
+    out = subprocess.check_output(
+        [
+            "docker",
+            "inspect",
+            "--format",
+            '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\\n"}}{{end}}{{end}}',
+            *cids,
+        ],
+        text=True,
+        timeout=30,
+    )
+    return sorted({line.strip() for line in out.splitlines() if line.strip()})
+
+
+def _verify_restored_data(
+    restore_compose_cmd: list[str],
+    restore_dir: Path,
+    restore_env: dict[str, str],
+    restore_https_port: int,
+    ssl_ctx: ssl.SSLContext,
+    db_user: str,
+    db_name: str,
+    orig_counts: dict[str, int],
+    orig_thread_row: str,
+    orig_minio_count: int,
+    sentinel: dict[str, str],
+) -> None:
+    """Assert restored DB row counts, known thread + SSE replay, and MinIO object SHA-256."""
+    restored_counts = _snapshot_table_counts(
+        restore_compose_cmd, restore_dir, db_user, db_name, env=restore_env
+    )
+    assert restored_counts == orig_counts, (
+        f"Restored table row counts mismatch!\n  original={orig_counts}\n  restored={restored_counts}"
+    )
+    restored_thread_row = _query_thread_row(
+        restore_compose_cmd, restore_dir, db_user, db_name, sentinel["thread_id"], env=restore_env
+    )
+    assert restored_thread_row == orig_thread_row, (
+        f"Restored known thread row mismatch: {restored_thread_row!r} != {orig_thread_row!r}"
+    )
+
+    ws_resp = _https_request(
+        "GET", "localhost", restore_https_port, "/api/v1/workspaces", context=ssl_ctx
+    )
+    assert ws_resp.status == 200, f"Restored GET /workspaces failed: {ws_resp.status}"
+    ws_payload = ws_resp.json()
+    ws_list = ws_payload if isinstance(ws_payload, list) else ws_payload.get("workspaces", [])
+    ws_ids = {w.get("workspace_id") for w in ws_list if isinstance(w, dict)}
+    assert sentinel["workspace_id"] in ws_ids, (
+        f"Restored /workspaces missing sentinel workspace {sentinel['workspace_id']!r}: {ws_ids}"
+    )
+
+    replay_resp = _https_request(
+        "GET",
+        "localhost",
+        restore_https_port,
+        f"/api/v1/threads/{sentinel['thread_id']}/messages/replay",
+        context=ssl_ctx,
+    )
+    assert replay_resp.status == 200, (
+        f"Restored thread replay failed: {replay_resp.status} {replay_resp.text[:300]}"
+    )
+    restored_replay_events = _parse_sse_bytes(replay_resp.body)
+    assert "replay_done" in [e.event for e in restored_replay_events], (
+        "Restored thread replay missing replay_done event"
+    )
+    restored_replay_text = _lib.extract_assistant_text(restored_replay_events).strip()
+    assert restored_replay_text == sentinel["replay_text"], (
+        f"Restored replay text mismatch!\n"
+        f"  expected={sentinel['replay_text']!r}\n  got={restored_replay_text!r}"
+    )
+
+    restored_minio_count = _count_minio_objects(
+        restore_compose_cmd, restore_dir, env=restore_env, bucket=sentinel["bucket"]
+    )
+    assert restored_minio_count == orig_minio_count, (
+        f"Restored MinIO object count mismatch in {sentinel['bucket']!r}: "
+        f"{restored_minio_count} != {orig_minio_count}"
+    )
+    got_sha, got_ct = _fetch_minio_object_sha_and_ct(
+        restore_compose_cmd,
+        restore_dir,
+        sentinel["bucket"],
+        sentinel["object_key"],
+        env=restore_env,
+    )
+    assert got_sha == sentinel["payload_sha"], (
+        f"Sentinel object SHA-256 mismatch: {got_sha!r} != {sentinel['payload_sha']!r}"
+    )
+    assert got_ct == "text/plain", (
+        f"Sentinel object ContentType not preserved: got {got_ct!r}, expected 'text/plain'"
+    )
+
+
 def check_restore_on_clean_stack(
     ctx: _lib.ComposeContext,
     backup_dir: Path,
@@ -1391,7 +1452,7 @@ def check_restore_on_clean_stack(
     sentinel: dict[str, str],
     orig_ca_pem: bytes,
 ) -> None:
-    log("5/6 Verifying scripts/standalone/restore.sh (clean stack, non-empty guard, replay/SHA verify & --replace-data)...")
+    log("5/6 Verifying scripts/standalone/restore.sh (empty-instance restore, non-empty refusal, manual down -v + re-restore)...")
     orig_counts = _snapshot_table_counts(ctx.compose_cmd(), ctx.work_dir, ctx.db_user, ctx.db_name)
     orig_thread_row = _query_thread_row(
         ctx.compose_cmd(), ctx.work_dir, ctx.db_user, ctx.db_name, sentinel["thread_id"]
@@ -1406,27 +1467,46 @@ def check_restore_on_clean_stack(
     restore_https_port = 18543
 
     with tempfile.TemporaryDirectory(prefix="b6-restore-stack-") as tmpdir:
-        restore_dir = Path(tmpdir) / "stack"
+        tmp_root = Path(tmpdir)
+        restore_dir = tmp_root / "stack"
+        restore_backup_dir = tmp_root / "backup-isolated"
         _prepare_clean_restore_dir(ctx.work_dir, restore_dir)
         assert not (restore_dir / ".env").exists(), "Restore target dir should start without .env"
+
+        isolated_overrides = {
+            "COMPOSE_PROJECT_NAME": restore_project,
+            "SANDBOX_DOCKER_NETWORK": f"{restore_project}_sandbox",
+            "DALTON_CORE_INTERNAL_SUBNET": "172.31.251.0/24",
+            "DALTON_EDGE_PORT": str(restore_edge_port),
+            "DALTON_EDGE_HTTP_PORT": str(restore_http_port),
+            "DALTON_EDGE_HTTPS_PORT": str(restore_https_port),
+            "DALTON_AUTH_MODE": "oss",
+            "DALTON_ALLOW_DEV_OSS_AUTH": "1",
+            "HOST_MODE": "oss",
+        }
+        _make_isolated_restore_backup(
+            backup_dir,
+            restore_backup_dir,
+            ctx.work_dir / ".env",
+            passphrase_file,
+            isolated_overrides,
+        )
 
         restore_compose_files = (
             f"{restore_dir / 'docker-compose.yml'}:"
             f"{restore_dir / 'docker-compose.core.yml'}:"
             f"{restore_dir / 'deploy' / 'standalone' / 'docker-compose.tls.yml'}"
         )
+        # Environment for our direct `docker compose` assertions on the restored stack
         restore_env = os.environ.copy()
-        restore_env.update(
+        restore_env.update(isolated_overrides)
+        # Poisoned shell env passed to `restore.sh` to verify `env -u` isolates `.env` from shell exports
+        restore_sh_env = os.environ.copy()
+        restore_sh_env.update(
             {
-                "COMPOSE_PROJECT_NAME": restore_project,
-                "SANDBOX_DOCKER_NETWORK": f"{restore_project}_sandbox",
-                "DALTON_CORE_INTERNAL_SUBNET": "172.31.251.0/24",
-                "DALTON_EDGE_PORT": str(restore_edge_port),
-                "DALTON_EDGE_HTTP_PORT": str(restore_http_port),
-                "DALTON_EDGE_HTTPS_PORT": str(restore_https_port),
-                "DALTON_AUTH_MODE": "oss",
-                "DALTON_ALLOW_DEV_OSS_AUTH": "1",
-                "HOST_MODE": "oss",
+                "COMPOSE_PROJECT_NAME": "wrong_shell_project_must_be_ignored",
+                "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME": "wrong-shell-bucket-must-be-ignored",
+                "DALTON_EDGE_HTTPS_PORT": "19999",
             }
         )
         restore_compose_cmd = [
@@ -1443,13 +1523,13 @@ def check_restore_on_clean_stack(
         ]
 
         try:
-            # 5a. Restore onto the brand-new empty stack (decrypting env.enc)
+            # 5a. Restore onto the brand-new empty stack (decrypting env.enc atomically)
             _run_cmd(
                 [
                     "bash",
                     str(restore_dir / "scripts" / "standalone" / "restore.sh"),
                     "--backup-dir",
-                    str(backup_dir),
+                    str(restore_backup_dir),
                     "--work-dir",
                     str(restore_dir),
                     "--compose-files",
@@ -1459,21 +1539,26 @@ def check_restore_on_clean_stack(
                     "--skip-edge-build",
                 ],
                 cwd=restore_dir,
-                env=restore_env,
+                env=restore_sh_env,
                 redact_env=ctx.env,
                 timeout=360,
             )
             restored_env_file = restore_dir / ".env"
-            assert restored_env_file.is_file(), "restore.sh did not decrypt .env"
+            assert restored_env_file.is_file(), "restore.sh did not write .env"
             assert (restored_env_file.stat().st_mode & 0o777) == 0o600, (
                 f"Restored .env permissions should be 0600, got {oct(restored_env_file.stat().st_mode & 0o777)}"
             )
-            bucket_r1 = _lib.load_env_file(restored_env_file).get("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME", "")
-            assert bucket_r1.startswith(f"{sentinel['bucket']}-r"), (
-                f"Expected restore.sh to switch DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME to <bucket>-r<ts>, got {bucket_r1!r}"
+            assert not list(restore_dir.glob(".env.tmp-*")), (
+                "restore.sh left behind temporary .env.tmp-* file(s)"
             )
-            assert _backend_active_bucket(restore_compose_cmd, restore_dir, env=restore_env) == bucket_r1, (
-                f"Running backend bucket does not match restored .env ({bucket_r1!r})"
+            restored_bucket = _lib.load_env_file(restored_env_file).get(
+                "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME", ""
+            )
+            assert restored_bucket == sentinel["bucket"], (
+                f"Expected restore.sh to preserve original bucket {sentinel['bucket']!r}, got {restored_bucket!r}"
+            )
+            assert _backend_active_bucket(restore_compose_cmd, restore_dir, env=restore_env) == sentinel["bucket"], (
+                f"Running backend bucket does not match original bucket {sentinel['bucket']!r}"
             )
 
             # Confirm the restored postgres container is distinct from the source stack
@@ -1493,7 +1578,6 @@ def check_restore_on_clean_stack(
                 f"Restored postgres container must be distinct from source ({restored_pg_cid} vs {orig_pg_cid})"
             )
 
-            # Prepare TLS context against restored Caddy internal CA
             restored_ca_pem = _wait_for_caddy_internal_ca(
                 restore_compose_cmd, restore_dir, env=restore_env, timeout=60.0
             )
@@ -1514,14 +1598,29 @@ def check_restore_on_clean_stack(
                     "localhost", restore_https_port, "/api/v1/auth/cli", context=ssl_ctx, timeout=90.0
                 )
 
-                # 5b. Non-empty DB safety guard: re-running WITHOUT --replace-data MUST fail
-                #     mentioning `--replace-data` AND leave the restored instance serving HTTPS 200.
+                _verify_restored_data(
+                    restore_compose_cmd,
+                    restore_dir,
+                    restore_env,
+                    restore_https_port,
+                    ssl_ctx,
+                    ctx.db_user,
+                    ctx.db_name,
+                    orig_counts,
+                    orig_thread_row,
+                    orig_minio_count,
+                    sentinel,
+                )
+                log("5a OK (clean empty-instance restore verified: row counts, known thread replay, MinIO SHA-256, Caddy CA).")
+
+                # 5b. Non-empty instance guard: re-running restore.sh MUST be refused,
+                #     point to STANDALONE-DEPLOY.md (`down -v`), and leave the instance serving HTTPS 200.
                 guard_proc = _run_cmd(
                     [
                         "bash",
                         str(restore_dir / "scripts" / "standalone" / "restore.sh"),
                         "--backup-dir",
-                        str(backup_dir),
+                        str(restore_backup_dir),
                         "--work-dir",
                         str(restore_dir),
                         "--compose-files",
@@ -1529,17 +1628,17 @@ def check_restore_on_clean_stack(
                         "--skip-edge-build",
                     ],
                     cwd=restore_dir,
-                    env=restore_env,
+                    env=restore_sh_env,
                     check=False,
                     redact_env=ctx.env,
                     timeout=120,
                 )
                 assert guard_proc.returncode != 0, (
-                    "restore.sh MUST refuse to replace a non-empty database without --replace-data!"
+                    "restore.sh MUST refuse to restore into a non-empty instance!"
                 )
                 guard_output = (guard_proc.stdout or "") + "\n" + (guard_proc.stderr or "")
-                assert "--replace-data" in guard_output, (
-                    f"Non-empty guard error should mention '--replace-data', got:\n{guard_output[-800:]}"
+                assert "STANDALONE-DEPLOY.md" in guard_output and "down -v" in guard_output, (
+                    f"Non-empty refusal should point to manual steps in STANDALONE-DEPLOY.md (down -v), got:\n{guard_output[-800:]}"
                 )
                 still_live = _https_request(
                     "GET", "localhost", restore_https_port, "/api/v1/auth/cli", context=ssl_ctx
@@ -1547,408 +1646,87 @@ def check_restore_on_clean_stack(
                 assert still_live.status == 200, (
                     f"Restored instance stopped serving after refused restore: HTTP {still_live.status}"
                 )
-
-                # 5c. Compare table row counts, known thread row, and real SSE replay content
-                restored_counts = _snapshot_table_counts(
-                    restore_compose_cmd, restore_dir, ctx.db_user, ctx.db_name, env=restore_env
-                )
-                assert restored_counts == orig_counts, (
-                    f"Restored table row counts mismatch!\n"
-                    f"  original={orig_counts}\n  restored={restored_counts}"
-                )
-                restored_thread_row = _query_thread_row(
-                    restore_compose_cmd,
-                    restore_dir,
-                    ctx.db_user,
-                    ctx.db_name,
-                    sentinel["thread_id"],
-                    env=restore_env,
-                )
-                assert restored_thread_row == orig_thread_row, (
-                    f"Restored known thread row mismatch: {restored_thread_row!r} != {orig_thread_row!r}"
-                )
-
-                ws_resp = _https_request(
+                still_ws = _https_request(
                     "GET", "localhost", restore_https_port, "/api/v1/workspaces", context=ssl_ctx
                 )
-                assert ws_resp.status == 200, f"Restored GET /workspaces failed: {ws_resp.status}"
-                ws_payload = ws_resp.json()
-                ws_list = ws_payload if isinstance(ws_payload, list) else ws_payload.get("workspaces", [])
-                ws_ids = {w.get("workspace_id") for w in ws_list if isinstance(w, dict)}
-                assert sentinel["workspace_id"] in ws_ids, (
-                    f"Restored /workspaces missing sentinel workspace {sentinel['workspace_id']!r}: {ws_ids}"
+                assert still_ws.status == 200, (
+                    f"Restored instance /workspaces failed after refused restore: HTTP {still_ws.status}"
                 )
+                log("5b OK (non-empty instance refused with manual link and remained live).")
 
-                replay_resp = _https_request(
-                    "GET",
-                    "localhost",
-                    restore_https_port,
-                    f"/api/v1/threads/{sentinel['thread_id']}/messages/replay",
-                    context=ssl_ctx,
-                )
-                assert replay_resp.status == 200, (
-                    f"Restored thread replay failed: {replay_resp.status} {replay_resp.text[:300]}"
-                )
-                restored_replay_events = _parse_sse_bytes(replay_resp.body)
-                assert "replay_done" in [e.event for e in restored_replay_events], (
-                    "Restored thread replay missing replay_done event"
-                )
-                restored_replay_text = _lib.extract_assistant_text(restored_replay_events).strip()
-                assert restored_replay_text == sentinel["replay_text"], (
-                    f"Restored replay text mismatch!\n"
-                    f"  expected={sentinel['replay_text']!r}\n  got={restored_replay_text!r}"
-                )
-
-                # 5d. Verify new active bucket object count AND sentinel object SHA-256 + ContentType
-                restored_minio_count = _count_minio_objects(
-                    restore_compose_cmd, restore_dir, env=restore_env, bucket=bucket_r1
-                )
-                assert restored_minio_count == orig_minio_count, (
-                    f"Restored MinIO object count mismatch in {bucket_r1!r}: {restored_minio_count} != {orig_minio_count}"
-                )
-                got_sha, got_ct = _fetch_minio_object_sha_and_ct(
-                    restore_compose_cmd,
-                    restore_dir,
-                    bucket_r1,
-                    sentinel["object_key"],
-                    env=restore_env,
-                )
-                assert got_sha == sentinel["payload_sha"], (
-                    f"Sentinel object SHA-256 mismatch: {got_sha!r} != {sentinel['payload_sha']!r}"
-                )
-                assert got_ct == "text/plain", (
-                    f"Sentinel object ContentType not preserved: got {got_ct!r}, expected 'text/plain'"
-                )
-
-                # 5e. Mutate live state (new workspace + real chat upload into bucket_r1), then
-                #     simulate mid-restore failure (migration failure) and verify .env, DB name/data,
-                #     and original bucket_r1 are ALL completely unchanged.
+                # 5c. Follow manual §6.2 steps: mutate live data, inspect project container volumes,
+                #     run `docker compose down -v`, and re-run restore.sh (with --replace-env) cleanly.
                 extra_ws = _https_request(
                     "POST",
                     "localhost",
                     restore_https_port,
                     "/api/v1/workspaces",
                     context=ssl_ctx,
-                    json_body={"name": "b6-pre-replace-ws"},
+                    json_body={"name": "b6-pre-down-v-ws"},
                 )
-                assert extra_ws.status == 201, f"Failed to create extra workspace: {extra_ws.status}"
-                extra_ws_id = extra_ws.json()["workspace_id"]
-                pre_replace_payload = b"DALTON_B6_PRE_REPLACE_ORIGINAL_UPLOAD\n" * 64
-                pre_upload_id, pre_upload_sha = _https_upload_chat_file(
-                    "localhost",
-                    restore_https_port,
-                    ssl_ctx,
-                    extra_ws_id,
-                    "b6_pre_replace_upload.txt",
-                    pre_replace_payload,
-                )
-                pre_upload_key = subprocess.check_output(
-                    [
-                        *restore_compose_cmd,
-                        "exec",
-                        "-T",
-                        "postgres",
-                        "psql",
-                        "-U",
-                        ctx.db_user,
-                        "-d",
-                        ctx.db_name,
-                        "-Atqc",
-                        f"SELECT object_key FROM dalton_chat_file_uploads WHERE upload_id = '{pre_upload_id}';",
-                    ],
-                    cwd=str(restore_dir),
-                    env=restore_env,
-                    text=True,
-                    timeout=30,
-                ).strip()
-                assert pre_upload_key, "Failed to resolve object_key for pre-replace upload"
+                assert extra_ws.status == 201, f"Failed to create extra workspace before down -v: {extra_ws.status}"
 
-                env_before_fail = restored_env_file.read_bytes()
-                dbs_before_fail = _list_databases(
-                    restore_compose_cmd, restore_dir, ctx.db_user, env=restore_env
-                )
-                counts_before_fail = _snapshot_table_counts(
-                    restore_compose_cmd, restore_dir, ctx.db_user, ctx.db_name, env=restore_env
-                )
-                buckets_before_fail = _list_minio_buckets(
+                project_vols = _list_project_container_volumes(
                     restore_compose_cmd, restore_dir, env=restore_env
                 )
-                bucket_r1_snapshot = _snapshot_bucket_objects(
-                    restore_compose_cmd, restore_dir, bucket_r1, env=restore_env
+                assert project_vols, "Expected project containers to report mounted Docker volumes"
+                assert all(v.startswith(f"{restore_project}_") for v in project_vols), (
+                    f"Unexpected volume names outside project {restore_project!r}: {project_vols}"
                 )
-                assert pre_upload_key in bucket_r1_snapshot, (
-                    f"Pre-replace upload {pre_upload_key!r} not found in active bucket {bucket_r1!r}"
-                )
-                assert len(bucket_r1_snapshot) == orig_minio_count + 1
 
-                fail_migrate_yml = restore_dir / "docker-compose.fail-migrate.yml"
-                fail_migrate_yml.write_text(
-                    "services:\n"
-                    "  migrate:\n"
-                    "    command: !override [\"bash\", \"-c\", \"echo '[migrate] simulated mid-restore failure' >&2; exit 42\"]\n",
-                    encoding="utf-8",
-                )
-                try:
-                    fail_proc = _run_cmd(
-                        [
-                            "bash",
-                            str(restore_dir / "scripts" / "standalone" / "restore.sh"),
-                            "--backup-dir",
-                            str(backup_dir),
-                            "--work-dir",
-                            str(restore_dir),
-                            "--compose-files",
-                            f"{restore_compose_files}:{fail_migrate_yml}",
-                            "--replace-data",
-                            "--skip-edge-build",
-                        ],
-                        cwd=restore_dir,
-                        env=restore_env,
-                        check=False,
-                        redact_env=ctx.env,
-                        timeout=300,
-                    )
-                    assert fail_proc.returncode != 0, "Expected simulated migration failure to abort restore.sh!"
-                finally:
-                    fail_migrate_yml.unlink(missing_ok=True)
-
-                assert restored_env_file.read_bytes() == env_before_fail, (
-                    "Mid-restore failure MUST NOT modify .env!"
-                )
-                assert not list(restore_dir.glob(".env.pre-restore-*")), (
-                    "Mid-restore failure before commit should not leave .env.pre-restore-* behind!"
-                )
-                assert (
-                    _list_databases(restore_compose_cmd, restore_dir, ctx.db_user, env=restore_env)
-                    == dbs_before_fail
-                ), "Mid-restore failure MUST NOT change DB names or leave staging DBs behind!"
-                assert (
-                    _snapshot_table_counts(
-                        restore_compose_cmd, restore_dir, ctx.db_user, ctx.db_name, env=restore_env
-                    )
-                    == counts_before_fail
-                ), "Mid-restore failure MUST NOT alter live DB contents!"
-                assert (
-                    _snapshot_bucket_objects(restore_compose_cmd, restore_dir, bucket_r1, env=restore_env)
-                    == bucket_r1_snapshot
-                ), "Mid-restore failure MUST NOT alter original MinIO bucket!"
-                assert (
-                    _list_minio_buckets(restore_compose_cmd, restore_dir, env=restore_env)
-                    == buckets_before_fail
-                ), "Mid-restore failure MUST clean up temporary restore bucket(s)!"
-                log("5e OK (mid-restore migration failure left .env, DB names/data, and original bucket untouched).")
-
-                # 5f. Real `--replace-data`: switches app to a new bucket <bucket>-r<ts2>,
-                #     leaves original bucket_r1 object count & contents completely untouched,
-                #     and preserves .env.pre-restore-<ts> + <db>_pre_restore_<ts>.
-                time.sleep(1.1)
                 _run_cmd(
-                    [
-                        "bash",
-                        str(restore_dir / "scripts" / "standalone" / "restore.sh"),
-                        "--backup-dir",
-                        str(backup_dir),
-                        "--work-dir",
-                        str(restore_dir),
-                        "--compose-files",
-                        restore_compose_files,
-                        "--replace-data",
-                        "--skip-edge-build",
-                    ],
-                    cwd=restore_dir,
-                    env=restore_env,
-                    redact_env=ctx.env,
-                    timeout=360,
-                )
-                _wait_for_https_ready(
-                    "localhost", restore_https_port, "/api/v1/auth/cli", context=ssl_ctx, timeout=90.0
-                )
-
-                bucket_r2 = _lib.load_env_file(restored_env_file).get("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME", "")
-                assert bucket_r2.startswith(f"{sentinel['bucket']}-r") and bucket_r2 != bucket_r1, (
-                    f"Expected --replace-data to switch to a fresh bucket, got {bucket_r2!r} (prev {bucket_r1!r})"
-                )
-                assert _backend_active_bucket(restore_compose_cmd, restore_dir, env=restore_env) == bucket_r2, (
-                    f"Running backend did not switch to new bucket {bucket_r2!r}"
-                )
-
-                pre_env_backups = sorted(restore_dir.glob(".env.pre-restore-*"))
-                assert len(pre_env_backups) == 1, f"Expected 1 .env.pre-restore-* file, got {pre_env_backups}"
-                assert (pre_env_backups[0].stat().st_mode & 0o777) == 0o600
-                assert pre_env_backups[0].read_bytes() == env_before_fail, (
-                    ".env.pre-restore-* content does not match pre-restore .env!"
-                )
-
-                post_replace_counts = _snapshot_table_counts(
-                    restore_compose_cmd, restore_dir, ctx.db_user, ctx.db_name, env=restore_env
-                )
-                assert post_replace_counts == orig_counts, (
-                    f"--replace-data DB counts mismatch: {post_replace_counts} != {orig_counts}"
-                )
-                assert (
-                    _count_minio_objects(restore_compose_cmd, restore_dir, env=restore_env, bucket=bucket_r2)
-                    == orig_minio_count
-                ), f"New bucket {bucket_r2!r} object count mismatch"
-                got_sha_2, got_ct_2 = _fetch_minio_object_sha_and_ct(
-                    restore_compose_cmd,
-                    restore_dir,
-                    bucket_r2,
-                    sentinel["object_key"],
-                    env=restore_env,
-                )
-                assert got_sha_2 == sentinel["payload_sha"] and got_ct_2 == "text/plain"
-
-                # Verify app writes go to NEW bucket_r2 and original bucket_r1 stays untouched
-                post_write_payload = b"DALTON_B6_POST_RESTORE_WRITE_TO_NEW_BUCKET\n" * 32
-                post_upload_id, post_upload_sha = _https_upload_chat_file(
-                    "localhost",
-                    restore_https_port,
-                    ssl_ctx,
-                    sentinel["workspace_id"],
-                    "b6_post_restore_new_bucket.txt",
-                    post_write_payload,
-                )
-                post_upload_key = subprocess.check_output(
-                    [
-                        *restore_compose_cmd,
-                        "exec",
-                        "-T",
-                        "postgres",
-                        "psql",
-                        "-U",
-                        ctx.db_user,
-                        "-d",
-                        ctx.db_name,
-                        "-Atqc",
-                        f"SELECT object_key FROM dalton_chat_file_uploads WHERE upload_id = '{post_upload_id}';",
-                    ],
-                    cwd=str(restore_dir),
-                    env=restore_env,
-                    text=True,
-                    timeout=30,
-                ).strip()
-                got_new_sha, _got_new_ct = _fetch_minio_object_sha_and_ct(
-                    restore_compose_cmd, restore_dir, bucket_r2, post_upload_key, env=restore_env
-                )
-                assert got_new_sha == post_upload_sha, (
-                    f"Post-restore write did not land in new bucket {bucket_r2!r}!"
-                )
-                assert (
-                    _snapshot_bucket_objects(restore_compose_cmd, restore_dir, bucket_r1, env=restore_env)
-                    == bucket_r1_snapshot
-                ), f"Original bucket {bucket_r1!r} object count or contents changed after restore!"
-
-                pre_dbs = [
-                    d
-                    for d in _list_databases(restore_compose_cmd, restore_dir, ctx.db_user, env=restore_env)
-                    if "_pre_restore_" in d
-                ]
-                assert len(pre_dbs) == 1, f"Expected 1 preserved <db>_pre_restore_<ts>, got {pre_dbs}"
-                pre_db_name = pre_dbs[0]
-                log(
-                    f"5f OK (--replace-data switched app to new bucket {bucket_r2!r}; "
-                    f"original bucket {bucket_r1!r} untouched; preserved DB {pre_db_name!r})."
-                )
-
-                # 5g. Rollback: restore .env.pre-restore-* and rename <db>_pre_restore_<ts> back,
-                #     restart, and verify original data & original bucket_r1 are readable again.
-                _run_cmd(
-                    [*restore_compose_cmd, "stop", "backend", "crawler", "edge"],
+                    [*restore_compose_cmd, "down", "-v"],
                     cwd=restore_dir,
                     env=restore_env,
                     redact_env=ctx.env,
                     timeout=120,
                 )
-                shutil.copy2(pre_env_backups[0], restored_env_file)
-                os.chmod(restored_env_file, 0o600)
-                rollback_sql = (
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                    f"WHERE datname IN ('{ctx.db_name}', '{pre_db_name}') AND pid <> pg_backend_pid();\n"
-                    "DO $$ BEGIN FOR i IN 1..30 LOOP "
-                    "EXIT WHEN NOT EXISTS (SELECT 1 FROM pg_stat_activity "
-                    f"WHERE datname IN ('{ctx.db_name}', '{pre_db_name}') AND pid <> pg_backend_pid()); "
-                    "PERFORM pg_sleep(0.1); END LOOP; END $$;\n"
-                    "BEGIN;\n"
-                    f'ALTER DATABASE "{ctx.db_name}" RENAME TO "{ctx.db_name}_abandoned_rollback";\n'
-                    f'ALTER DATABASE "{pre_db_name}" RENAME TO "{ctx.db_name}";\n'
-                    "COMMIT;\n"
-                )
-                subprocess.run(
-                    [
-                        *restore_compose_cmd,
-                        "exec",
-                        "-T",
-                        "postgres",
-                        "psql",
-                        "-U",
-                        ctx.db_user,
-                        "-d",
-                        "template1",
-                        "-v",
-                        "ON_ERROR_STOP=1",
-                    ],
-                    input=rollback_sql,
-                    cwd=str(restore_dir),
-                    env=restore_env,
-                    text=True,
-                    check=True,
-                    timeout=60,
-                )
+
                 _run_cmd(
-                    [*restore_compose_cmd, "up", "-d"],
+                    [
+                        "bash",
+                        str(restore_dir / "scripts" / "standalone" / "restore.sh"),
+                        "--backup-dir",
+                        str(restore_backup_dir),
+                        "--work-dir",
+                        str(restore_dir),
+                        "--compose-files",
+                        restore_compose_files,
+                        "--env-passphrase-file",
+                        str(passphrase_file),
+                        "--replace-env",
+                        "--skip-edge-build",
+                    ],
                     cwd=restore_dir,
-                    env=restore_env,
+                    env=restore_sh_env,
                     redact_env=ctx.env,
-                    timeout=180,
+                    timeout=360,
+                )
+
+                restored_ca_pem_2 = _wait_for_caddy_internal_ca(
+                    restore_compose_cmd, restore_dir, env=restore_env, timeout=60.0
+                )
+                assert hashlib.sha256(restored_ca_pem_2).hexdigest() == orig_ca_sha, (
+                    "Caddy CA root.crt SHA-256 mismatch after manual down -v + restore!"
                 )
                 _wait_for_https_ready(
                     "localhost", restore_https_port, "/api/v1/auth/cli", context=ssl_ctx, timeout=90.0
                 )
-
-                assert _backend_active_bucket(restore_compose_cmd, restore_dir, env=restore_env) == bucket_r1, (
-                    f"Rollback did not switch backend back to original bucket {bucket_r1!r}"
+                assert _backend_active_bucket(restore_compose_cmd, restore_dir, env=restore_env) == sentinel["bucket"]
+                _verify_restored_data(
+                    restore_compose_cmd,
+                    restore_dir,
+                    restore_env,
+                    restore_https_port,
+                    ssl_ctx,
+                    ctx.db_user,
+                    ctx.db_name,
+                    orig_counts,
+                    orig_thread_row,
+                    orig_minio_count,
+                    sentinel,
                 )
-                rb_ws_resp = _https_request(
-                    "GET", "localhost", restore_https_port, "/api/v1/workspaces", context=ssl_ctx
-                )
-                assert rb_ws_resp.status == 200
-                rb_ws_payload = rb_ws_resp.json()
-                rb_ws_list = (
-                    rb_ws_payload if isinstance(rb_ws_payload, list) else rb_ws_payload.get("workspaces", [])
-                )
-                rb_ws_ids = {w.get("workspace_id") for w in rb_ws_list if isinstance(w, dict)}
-                assert extra_ws_id in rb_ws_ids, (
-                    f"Rollback missing pre-restore workspace {extra_ws_id!r}: {rb_ws_ids}"
-                )
-                rb_upload_key = subprocess.check_output(
-                    [
-                        *restore_compose_cmd,
-                        "exec",
-                        "-T",
-                        "postgres",
-                        "psql",
-                        "-U",
-                        ctx.db_user,
-                        "-d",
-                        ctx.db_name,
-                        "-Atqc",
-                        f"SELECT object_key FROM dalton_chat_file_uploads WHERE upload_id = '{pre_upload_id}';",
-                    ],
-                    cwd=str(restore_dir),
-                    env=restore_env,
-                    text=True,
-                    timeout=30,
-                ).strip()
-                assert rb_upload_key == pre_upload_key, (
-                    f"Rollback missing pre-restore upload record {pre_upload_id!r}"
-                )
-                rb_sha, rb_ct = _fetch_minio_object_sha_and_ct(
-                    restore_compose_cmd, restore_dir, bucket_r1, rb_upload_key, env=restore_env
-                )
-                assert rb_sha == pre_upload_sha and rb_ct == "text/plain", (
-                    f"Rollback pre-restore upload object mismatch: {(rb_sha, rb_ct)!r}"
-                )
-                log("5g OK (rollback restored .env + original DB and confirmed original workspace & bucket data).")
+                log("5c OK (manual down -v followed by restore.sh succeeded with identical data).")
             finally:
                 restored_ca_path.unlink(missing_ok=True)
         finally:
@@ -1962,8 +1740,8 @@ def check_restore_on_clean_stack(
             )
 
     log(
-        f"5/6 OK (switch-bucket restore verified: clean restore, mid-restore failure atomicity, "
-        f"new-bucket read/write with untouched original bucket, and full rollback)."
+        "5/6 OK (empty-instance restore verified: data consistency, non-empty refusal with live service, "
+        "and manual down -v + re-restore)."
     )
 
 

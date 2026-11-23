@@ -331,21 +331,30 @@ PRE_CRAWLER_TAG=""
 SNAPSHOT_CREATED=0
 FILES_REPLACED=0
 IMAGES_BUILT=0
-DB_MIGRATED=0
+# Migration state determined strictly by comparing successfully read pre- and
+# post-migration Alembic versions:
+#   "before"   - migration not started or both pre/post versions read cleanly and unchanged
+#   "migrated" - both pre/post versions read cleanly and at least one version changed
+#   "unknown"  - failed to read pre-migration and/or post-migration version (check manually)
+MIGRATION_STATE="before"
+PRE_MIGRATE_UP=""
+PRE_MIGRATE_DA=""
+POST_MIGRATE_UP=""
+POST_MIGRATE_DA=""
 
 STAGE_RELEASE=""
 PRE_UPGRADE_BACKUP=""
-MIGRATE_LOG=""
 UPGRADE_SUCCEEDED=0
+MANUAL_OVERWRITE_REF="docs/dalton/dev-guide/STANDALONE-DEPLOY.md (§6.2 在已有实例上覆盖恢复)"
 
 print_rollback_steps() {
   printf "\n==================== UPGRADE FAILED — ROLLBACK GUIDE ====================\n" >&2
-  if [[ "$FILES_REPLACED" -eq 0 && "$IMAGES_BUILT" -eq 0 && "$DB_MIGRATED" -eq 0 ]]; then
+  if [[ "$FILES_REPLACED" -eq 0 && "$IMAGES_BUILT" -eq 0 && "$MIGRATION_STATE" == "before" ]]; then
     printf "  Failure occurred BEFORE release files, container images, or the database were modified.\n" >&2
     if [[ -n "$PRE_UPGRADE_BACKUP" && -d "$PRE_UPGRADE_BACKUP" ]]; then
-      printf "  Pre-upgrade backup : %s (no restore required)\n" "$PRE_UPGRADE_BACKUP" >&2
+      printf "  Pre-upgrade backup : %s (no data restore required)\n" "$PRE_UPGRADE_BACKUP" >&2
     fi
-    printf "  Do NOT run restore.sh --replace-data; your running stack and data were not changed.\n" >&2
+    printf "  Do NOT wipe volumes or restore data; your running stack and data were not changed.\n" >&2
     printf "  Inspect the error above and check:\n" >&2
     printf "    %s\n" "$(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" ps)" >&2
     printf "=========================================================================\n" >&2
@@ -358,11 +367,25 @@ print_rollback_steps() {
   if [[ "$SNAPSHOT_CREATED" -eq 1 && -d "$SNAPSHOT_DIR" ]]; then
     printf "  Release snapshot   : %s\n" "$SNAPSHOT_DIR" >&2
   fi
-  if [[ "$DB_MIGRATED" -eq 1 ]]; then
-    printf "  NOTE: Database migrations had already started. Writes acknowledged after the pre-upgrade backup are not in that backup.\n\n" >&2
+
+  if [[ "$MIGRATION_STATE" == "migrated" ]]; then
+    printf "  NOTE: Database schema versions changed during migration\n" >&2
+    printf "        (upstream: %s -> %s, dalton: %s -> %s).\n" \
+      "${PRE_MIGRATE_UP:-unknown}" "${POST_MIGRATE_UP:-unknown}" \
+      "${PRE_MIGRATE_DA:-unknown}" "${POST_MIGRATE_DA:-unknown}" >&2
+    printf "        Rolling back requires restoring release files/images AND following the manual\n" >&2
+    printf "        reset-and-restore steps in %s.\n" "$MANUAL_OVERWRITE_REF" >&2
+    printf "        Writes acknowledged after the pre-upgrade backup are not in that backup.\n\n" >&2
+  elif [[ "$MIGRATION_STATE" == "unknown" ]]; then
+    printf "  NOTE: Database migration state is UNCERTAIN (failed to read Alembic versions before and/or after migrate).\n" >&2
+    printf "        Do NOT assume migrations already ran and do NOT wipe volumes yet.\n" >&2
+    printf "        First manually check current Alembic versions and compare with %s/manifest.json:\n" "${PRE_UPGRADE_BACKUP:-<pre-upgrade-backup>}" >&2
+    printf "          %s\n" "$(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" exec -T postgres psql -U "${MIG_DB_USER:-postgres}" -d "${MIG_DB_NAME:-postgres}" -Atqc "SELECT 'upstream=' || version_num FROM alembic_version UNION ALL SELECT 'dalton=' || version_num FROM alembic_version_dalton;")" >&2
+    printf "        - If both versions match manifest.json (unchanged): only restore release files & image tags and run 'docker compose up -d' (do NOT touch data).\n" >&2
+    printf "        - If either version changed: restore release files & image tags, then follow %s.\n\n" "$MANUAL_OVERWRITE_REF" >&2
   else
-    printf "  NOTE: Failure occurred BEFORE database migrations ran. Do NOT run restore.sh --replace-data\n" >&2
-    printf "        (doing so would discard writes made after the backup even though the database was untouched).\n\n" >&2
+    printf "  NOTE: Failure occurred BEFORE database schema versions changed. Do NOT wipe volumes or restore data\n" >&2
+    printf "        (only restore release files and container image tags so writes made after the backup are kept).\n\n" >&2
   fi
 
   printf "  To roll back safely:\n" >&2
@@ -379,7 +402,7 @@ print_rollback_steps() {
       --exclude=/deploy/standalone/certs
       --exclude=/deploy/standalone/extra
     )
-    if [[ "$DB_MIGRATED" -eq 1 && ! -f "${SNAPSHOT_DIR}/scripts/standalone/restore.sh" ]]; then
+    if [[ "$MIGRATION_STATE" != "before" && ! -f "${SNAPSHOT_DIR}/scripts/standalone/restore.sh" ]]; then
       rsync_cmd+=(--exclude=/scripts/standalone/restore.sh)
     fi
     rsync_cmd+=("${SNAPSHOT_DIR}/" "${WORK_DIR}/")
@@ -401,20 +424,27 @@ print_rollback_steps() {
     fi
     step_no=$(( step_no + 1 ))
   fi
-  if [[ "$DB_MIGRATED" -eq 1 && -n "$PRE_UPGRADE_BACKUP" && -d "$PRE_UPGRADE_BACKUP" ]]; then
+  if [[ "$MIGRATION_STATE" == "migrated" && -n "$PRE_UPGRADE_BACKUP" && -d "$PRE_UPGRADE_BACKUP" ]]; then
     local restore_cmd=(
       bash "${WORK_DIR}/scripts/standalone/restore.sh"
       --work-dir "$WORK_DIR"
       --backup-dir "$PRE_UPGRADE_BACKUP"
       --compose-files "$COMPOSE_FILES_JOINED"
-      --replace-data
       --skip-edge-build
     )
     if [[ -n "$CA_FILE" ]]; then
       restore_cmd+=(--ca-file "$CA_FILE")
     fi
-    printf "    %d. Restore the pre-upgrade database, MinIO objects, and Caddy data:\n" "$step_no" >&2
-    printf "         %s\n" "$(fmt_cmd "${restore_cmd[@]}")" >&2
+    printf "    %d. Follow %s to reset and restore from the pre-upgrade backup:\n" "$step_no" "$MANUAL_OVERWRITE_REF" >&2
+    printf "         a) Verify backup integrity: (cd %s && sha256sum -c SHA256SUMS)\n" "$(printf '%q' "$PRE_UPGRADE_BACKUP")" >&2
+    printf "         b) List and confirm this project's container volumes, then run:\n" >&2
+    printf "            %s\n" "$(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" down -v)" >&2
+    printf "         c) Restore into the now-empty instance:\n" >&2
+    printf "            %s\n" "$(fmt_cmd "${restore_cmd[@]}")" >&2
+    step_no=$(( step_no + 1 ))
+  elif [[ "$MIGRATION_STATE" == "before" ]]; then
+    printf "    %d. Restart services with the restored files and image tags (without touching data):\n" "$step_no" >&2
+    printf "         %s\n" "$(fmt_cmd docker compose "${COMPOSE_ARGS[@]}" up -d)" >&2
     step_no=$(( step_no + 1 ))
   fi
   printf "    %d. Check service status and logs:\n" "$step_no" >&2
@@ -425,9 +455,6 @@ print_rollback_steps() {
 
 cleanup() {
   local rc=$?
-  if [[ -n "$MIGRATE_LOG" && -f "$MIGRATE_LOG" ]]; then
-    rm -f "$MIGRATE_LOG"
-  fi
   if [[ -n "$STAGE_RELEASE" && -d "$STAGE_RELEASE" ]]; then
     rm -rf "$STAGE_RELEASE"
   fi
@@ -598,38 +625,62 @@ else
   info "Skipping image build (--skip-build)."
 fi
 
+read_alembic_versions() {
+  local up da
+  if ! up="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "SELECT version_num FROM alembic_version;" 2>/dev/null)"; then
+    return 1
+  fi
+  if ! da="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "SELECT version_num FROM alembic_version_dalton;" 2>/dev/null)"; then
+    return 1
+  fi
+  up="$(printf '%s' "$up" | tr -d '[:space:]')"
+  da="$(printf '%s' "$da" | tr -d '[:space:]')"
+  if [[ -z "$up" || -z "$da" ]]; then
+    return 1
+  fi
+  printf '%s\t%s\n' "$up" "$da"
+}
+
 info "Running new version database migrations..."
 MIG_DB_USER="$(read_env_file_var "$ENV_FILE" "DB_USER" "postgres")"
 MIG_DB_NAME="$(read_env_file_var "$ENV_FILE" "DB_NAME" "postgres")"
-PRE_MIGRATE_UP="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -Atqc "SELECT version_num FROM alembic_version;" 2>/dev/null | tr -d '\r\n' || true)"
-PRE_MIGRATE_DA="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -Atqc "SELECT version_num FROM alembic_version_dalton;" 2>/dev/null | tr -d '\r\n' || true)"
+PRE_MIGRATE_OK=0
+if pre_vers="$(read_alembic_versions)"; then
+  IFS=$'\t' read -r PRE_MIGRATE_UP PRE_MIGRATE_DA <<< "$pre_vers"
+  PRE_MIGRATE_OK=1
+else
+  warn "Could not read Alembic schema versions before running migrate."
+fi
 
-MIGRATE_LOG="$(mktemp)"
-chmod 600 "$MIGRATE_LOG"
 set +e
-compose_cmd run --rm migrate 2>&1 | tee "$MIGRATE_LOG"
-MIGRATE_RC="${PIPESTATUS[0]}"
+compose_cmd run --rm migrate
+MIGRATE_RC=$?
 set -e
 
-# Only mark DB_MIGRATED=1 if the migrate container actually started and ran
-# (evidenced by migrate.sh's first `[migrate]` log line or an Alembic version table change).
-if grep -q '\[migrate\]' "$MIGRATE_LOG" 2>/dev/null; then
-  DB_MIGRATED=1
+POST_MIGRATE_OK=0
+if post_vers="$(read_alembic_versions)"; then
+  IFS=$'\t' read -r POST_MIGRATE_UP POST_MIGRATE_DA <<< "$post_vers"
+  POST_MIGRATE_OK=1
 else
-  POST_MIGRATE_UP="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -Atqc "SELECT version_num FROM alembic_version;" 2>/dev/null | tr -d '\r\n' || true)"
-  POST_MIGRATE_DA="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -Atqc "SELECT version_num FROM alembic_version_dalton;" 2>/dev/null | tr -d '\r\n' || true)"
-  if [[ ( -n "$POST_MIGRATE_UP" && "$POST_MIGRATE_UP" != "$PRE_MIGRATE_UP" ) || ( -n "$POST_MIGRATE_DA" && "$POST_MIGRATE_DA" != "$PRE_MIGRATE_DA" ) ]]; then
-    DB_MIGRATED=1
-  fi
+  warn "Could not read Alembic schema versions after running migrate."
 fi
-rm -f "$MIGRATE_LOG"
-MIGRATE_LOG=""
+
+# Determine migration state strictly from successfully read pre- and post-migration versions:
+# - If pre-migration or post-migration version could not be read -> "unknown" (do not assume migrated).
+# - If both succeeded and either version changed -> "migrated".
+# - If both succeeded and both versions are identical -> "before".
+if [[ "$PRE_MIGRATE_OK" -ne 1 || "$POST_MIGRATE_OK" -ne 1 ]]; then
+  MIGRATION_STATE="unknown"
+elif [[ "$POST_MIGRATE_UP" != "$PRE_MIGRATE_UP" || "$POST_MIGRATE_DA" != "$PRE_MIGRATE_DA" ]]; then
+  MIGRATION_STATE="migrated"
+else
+  MIGRATION_STATE="before"
+fi
 
 if [[ "$MIGRATE_RC" -ne 0 ]]; then
   err "Database migrations failed (exit ${MIGRATE_RC})."
   exit "$MIGRATE_RC"
 fi
-DB_MIGRATED=1
 compose_cmd run --rm minio-init
 ok "Database migrations and bucket check succeeded."
 

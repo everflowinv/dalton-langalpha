@@ -222,6 +222,86 @@ if [[ "$DB_HOST" != "postgres" ]]; then
   exit 1
 fi
 
+# Single object storage guard (v1): fail fast if configured buckets point to
+# multiple distinct object storage services/endpoints.
+if ! python3 - "$ENV_FILE" <<'PY'
+import re, sys
+
+env_path = sys.argv[1]
+line_re = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*([=:])(.*)$")
+env_map: dict[str, str] = {}
+with open(env_path, encoding="utf-8") as fh:
+    for raw in fh:
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        m = line_re.match(raw.rstrip("\r\n"))
+        if not m:
+            continue
+        val = m.group(3).strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        elif val and val[0] not in ("'", '"'):
+            val = re.split(r"\s+#", val, maxsplit=1)[0].strip()
+        env_map[m.group(1)] = val
+
+def _get(*keys: str, default: str = "") -> str:
+    for k in keys:
+        v = (env_map.get(k) or "").strip()
+        if v:
+            return v
+    return default
+
+def _norm_ep(url: str) -> str:
+    return (url or "").strip().rstrip("/").lower()
+
+primary_ep = _norm_ep(_get("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL", "STORAGE_ENDPOINT_URL", default="http://minio:9000"))
+conflicts: list[str] = []
+
+asr_ep = _norm_ep(_get("DALTON_ASR_STORAGE_ENDPOINT_URL"))
+if asr_ep and asr_ep != primary_ep:
+    conflicts.append(f"DALTON_ASR_STORAGE_ENDPOINT_URL={asr_ep!r} != primary {primary_ep!r}")
+
+storage_provider = _get("STORAGE_PROVIDER", default="none").lower()
+storage_ep = _norm_ep(_get("STORAGE_ENDPOINT_URL"))
+s3_ep = _norm_ep(_get("S3_ENDPOINT_URL"))
+s3_bucket = _get("STORAGE_BUCKET_NAME", "S3_BUCKET_NAME")
+if storage_ep and storage_ep != primary_ep:
+    conflicts.append(f"STORAGE_ENDPOINT_URL={storage_ep!r} != primary {primary_ep!r}")
+if s3_ep and s3_ep != primary_ep:
+    conflicts.append(f"S3_ENDPOINT_URL={s3_ep!r} != primary {primary_ep!r}")
+if s3_bucket and not storage_ep and not s3_ep and storage_provider != "none":
+    conflicts.append(f"STORAGE/S3 bucket {s3_bucket!r} uses default AWS S3 endpoint != primary {primary_ep!r}")
+
+oss_ep = _norm_ep(_get("OSS_ENDPOINT"))
+oss_bucket = _get("OSS_BUCKET_NAME")
+if storage_provider == "oss" or oss_ep or oss_bucket:
+    if not oss_ep or oss_ep != primary_ep:
+        conflicts.append(f"OSS storage ({oss_ep or 'default OSS endpoint'}) != primary {primary_ep!r}")
+
+r2_ep = _norm_ep(_get("R2_ENDPOINT_URL"))
+r2_bucket = _get("R2_BUCKET_NAME")
+r2_acct = _get("R2_ACCOUNT_ID")
+if r2_ep and r2_ep != primary_ep:
+    conflicts.append(f"R2_ENDPOINT_URL={r2_ep!r} != primary {primary_ep!r}")
+elif (r2_bucket or r2_acct) and not r2_ep:
+    conflicts.append(f"R2 storage ({r2_bucket or r2_acct}) != primary {primary_ep!r}")
+
+if conflicts:
+    print(
+        "[backup] ERROR: Multiple object storage services detected: " + "; ".join(conflicts),
+        file=sys.stderr,
+    )
+    print(
+        "[backup] ERROR: v1 only supports a single object storage service; configure all application buckets on the same storage service.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
+then
+  exit 1
+fi
+
 DB_USER="$(read_env_var "DB_USER" "postgres")"
 DB_NAME="$(read_env_var "DB_NAME" "postgres")"
 PROJECT_NAME="$(read_env_var "COMPOSE_PROJECT_NAME" "")"
@@ -497,11 +577,62 @@ class _HashingStream:
         return chunk
 
 
+def _norm_ep(url: str) -> str:
+    return (url or "").strip().rstrip("/").lower()
+
+
+def validate_single_object_storage(primary_endpoint: str) -> None:
+    """Reject configurations whose application buckets span multiple object storage services (v1)."""
+    primary_ep = _norm_ep(primary_endpoint)
+    conflicts: list[str] = []
+
+    asr_ep = _norm_ep(_env("DALTON_ASR_STORAGE_ENDPOINT_URL"))
+    if asr_ep and asr_ep != primary_ep:
+        conflicts.append(f"DALTON_ASR_STORAGE_ENDPOINT_URL={asr_ep!r} != primary {primary_ep!r}")
+
+    storage_provider = _env("STORAGE_PROVIDER", default="none").lower()
+    storage_ep = _norm_ep(_env("STORAGE_ENDPOINT_URL"))
+    s3_ep = _norm_ep(_env("S3_ENDPOINT_URL"))
+    s3_bucket = _env("STORAGE_BUCKET_NAME", "S3_BUCKET_NAME")
+    if storage_ep and storage_ep != primary_ep:
+        conflicts.append(f"STORAGE_ENDPOINT_URL={storage_ep!r} != primary {primary_ep!r}")
+    if s3_ep and s3_ep != primary_ep:
+        conflicts.append(f"S3_ENDPOINT_URL={s3_ep!r} != primary {primary_ep!r}")
+    if s3_bucket and not storage_ep and not s3_ep and storage_provider != "none":
+        conflicts.append(f"STORAGE/S3 bucket {s3_bucket!r} uses default AWS S3 endpoint != primary {primary_ep!r}")
+
+    oss_ep = _norm_ep(_env("OSS_ENDPOINT"))
+    oss_bucket = _env("OSS_BUCKET_NAME")
+    if storage_provider == "oss" or oss_ep or oss_bucket:
+        if not oss_ep or oss_ep != primary_ep:
+            conflicts.append(f"OSS storage ({oss_ep or 'default OSS endpoint'}) != primary {primary_ep!r}")
+
+    r2_ep = _norm_ep(_env("R2_ENDPOINT_URL"))
+    r2_bucket = _env("R2_BUCKET_NAME")
+    r2_acct = _env("R2_ACCOUNT_ID")
+    if r2_ep and r2_ep != primary_ep:
+        conflicts.append(f"R2_ENDPOINT_URL={r2_ep!r} != primary {primary_ep!r}")
+    elif (r2_bucket or r2_acct) and not r2_ep:
+        conflicts.append(f"R2 storage ({r2_bucket or r2_acct}) != primary {primary_ep!r}")
+
+    if conflicts:
+        print(
+            "ERROR: Multiple object storage services detected: " + "; ".join(conflicts),
+            file=sys.stderr,
+        )
+        print(
+            "ERROR: v1 only supports a single object storage service; configure all application buckets on the same storage service.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 endpoint = _env(
     "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL",
     "STORAGE_ENDPOINT_URL",
     default="http://minio:9000",
 ).rstrip("/")
+validate_single_object_storage(endpoint)
 default_bucket = _env(
     "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME",
     "STORAGE_BUCKET_NAME",

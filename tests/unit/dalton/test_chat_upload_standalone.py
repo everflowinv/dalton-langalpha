@@ -1587,7 +1587,7 @@ class TestSandboxNetworkAndInitScript:
         )
         assert res_cap.returncode == 2
 
-        # restore.sh rejects removed --force and points to --replace-data / --replace-env
+        # restore.sh rejects removed --force and --replace-data (v1 is empty-target-only)
         res_force = subprocess.run(
             [
                 "bash",
@@ -1601,8 +1601,46 @@ class TestSandboxNetworkAndInitScript:
             timeout=15,
         )
         assert res_force.returncode == 2
-        assert "--replace-data" in res_force.stderr
+        assert "--replace-data" not in res_force.stderr
         assert "--replace-env" in res_force.stderr
+        assert "STANDALONE-DEPLOY.md" in res_force.stderr
+
+        res_replace_data = subprocess.run(
+            [
+                "bash",
+                str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                "--backup-dir",
+                str(backup_stub),
+                "--replace-data",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_replace_data.returncode == 2
+
+        # backup.sh rejects multiple distinct object storage services (v1 single object storage only)
+        multi_s3_work = tmp_path / "ops-multi-storage"
+        multi_s3_work.mkdir()
+        (multi_s3_work / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        (multi_s3_work / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (multi_s3_work / ".env").write_text(
+            "DB_HOST=postgres\n"
+            "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL=http://minio-chat:9000\n"
+            "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME=shared-bucket\n"
+            "DALTON_ASR_STORAGE_ENDPOINT_URL=http://minio-asr:9000\n"
+            "DALTON_ASR_STORAGE_BUCKET_NAME=shared-bucket\n",
+            encoding="utf-8",
+        )
+        res_multi_s3 = subprocess.run(
+            ["bash", str(REPO_ROOT / "scripts/standalone/backup.sh"), "--work-dir", str(multi_s3_work)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_multi_s3.returncode != 0
+        assert "Multiple object storage services" in res_multi_s3.stderr
+        assert "v1 only supports a single object storage service" in res_multi_s3.stderr
 
         # Compose .env syntax variants (export, leading space, KEY =, KEY:) are recognized for DB_HOST
         for variant_idx, db_host_line in enumerate(
@@ -1760,6 +1798,74 @@ class TestSandboxNetworkAndInitScript:
         assert "External PostgreSQL" in res_ext_env.stderr
         assert (rwork / ".env").read_text(encoding="utf-8") == orig_env_text
 
+        # Verbatim COMPOSE_PROJECT_NAME check rejects `dalton-` vs `dalton_` (no normalization)
+        rwork_dash = tmp_path / "restore-verbatim-proj"
+        rwork_dash.mkdir()
+        (rwork_dash / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        (rwork_dash / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        dash_env_text = "COMPOSE_PROJECT_NAME=dalton-\nDB_HOST=postgres\nSENTINEL=keep-dash\n"
+        (rwork_dash / ".env").write_text(dash_env_text, encoding="utf-8")
+        bak_underscore = _make_enc_backup(
+            "bak-proj-underscore",
+            "COMPOSE_PROJECT_NAME=dalton_\nDB_HOST=postgres\nSENTINEL=clobbered\n",
+            "dalton_",
+        )
+        res_verbatim = subprocess.run(
+            [
+                "bash",
+                str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                "--work-dir",
+                str(rwork_dash),
+                "--backup-dir",
+                str(bak_underscore),
+                "--env-passphrase-file",
+                str(pass_file),
+                "--replace-env",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_verbatim.returncode != 0
+        assert "COMPOSE_PROJECT_NAME mismatch" in res_verbatim.stderr
+        assert (rwork_dash / ".env").read_text(encoding="utf-8") == dash_env_text
+
+        # Stale .env.tmp-* left by a killed run is cleaned up after lock acquisition
+        stale_tmp_work = tmp_path / "restore-stale-tmp"
+        stale_tmp_work.mkdir()
+        (stale_tmp_work / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        (stale_tmp_work / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        stale_proj = f"stale-tmp-{os.getpid()}"
+        (stale_tmp_work / ".env").write_text(
+            f"COMPOSE_PROJECT_NAME={stale_proj}\nDB_HOST=external-pg.corp.internal\n",
+            encoding="utf-8",
+        )
+        leftover_tmp = stale_tmp_work / ".env.tmp-deadbeef"
+        leftover_tmp.write_text("LEFTOVER=1\n", encoding="utf-8")
+        stale_lock_path = Path(f"/tmp/dalton-{stale_proj}.restore.lock")
+        try:
+            res_stale_tmp = subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir",
+                    str(stale_tmp_work),
+                    "--backup-dir",
+                    str(backup_stub),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_stale_tmp.returncode != 0
+            assert "External PostgreSQL detected" in res_stale_tmp.stderr
+            assert not leftover_tmp.exists(), "restore.sh must clean up leftover .env.tmp-* files"
+        finally:
+            if stale_lock_path.is_dir():
+                stale_lock_path.rmdir()
+            elif stale_lock_path.exists():
+                stale_lock_path.unlink()
+
         # backup.sh PID lock automatically cleans up a stale lock left by a dead PID
         lock_parent = tmp_path / "lock-test"
         lock_parent.mkdir()
@@ -1789,7 +1895,7 @@ class TestSandboxNetworkAndInitScript:
         assert "Removing stale backup lock" in res_lock.stderr
 
         # upgrade.sh falls back to new release's backup.sh when old WORK_DIR has none (#480 first upgrade)
-        # AND pre-migration failure does NOT suggest `restore.sh --replace-data`
+        # AND pre-migration failure tells operator NOT to wipe volumes or restore data
         old_work = tmp_path / "old-480-work"
         old_work.mkdir()
         (old_work / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
@@ -1825,33 +1931,32 @@ class TestSandboxNetworkAndInitScript:
         )
         assert res_first_upg.returncode != 0
         assert "NEW_RELEASE_BACKUP_INVOKED" in res_first_upg.stderr
-        assert "Do NOT run restore.sh --replace-data" in res_first_upg.stderr
+        assert "Do NOT wipe volumes or restore data" in res_first_upg.stderr
+        assert "--replace-data" not in res_first_upg.stderr
 
-        # restore.sh switch-bucket-name design, single commit point, project-based lock,
-        # checked DeleteObjects in failure cleanup, and embedded Python compilation.
-        import hashlib as _hashlib
+        # restore.sh v1 empty-target-only invariants, fixed /tmp lock, env -u isolation,
+        # no in-place replacement logic, and embedded Python compilation.
         import re as _re
         from botocore.exceptions import ClientError
 
         restore_text = (REPO_ROOT / "scripts/standalone/restore.sh").read_text(encoding="utf-8")
         assert "read_env_var()" not in restore_text, "restore.sh must read .env files strictly via read_env_file_var"
-        assert 'resp.get("Errors")' in restore_text
-        assert "ALTER DATABASE" in restore_text and "BEGIN;" in restore_text and "COMMIT;" in restore_text
-        assert "${XDG_RUNTIME_DIR:-/tmp}/dalton-${LOCK_PROJECT}.restore.lock" in restore_text
-        assert ".env.pre-restore-" in restore_text
-        assert "caddy-pre-restore-" in restore_text
-        assert "PRESERVED_BUCKET" not in restore_text, "Old preserved-bucket overwrite logic must be removed from restore.sh"
-        assert "MINIO_SWITCH_PY" not in restore_text, "Old live-bucket overwrite switch logic must be removed from restore.sh"
-        assert "extra_keys" not in restore_text, "Old manifest extra-object deletion logic must be removed from restore.sh"
+        assert "sanitize_project_name" not in restore_text, "restore.sh must compare COMPOSE_PROJECT_NAME verbatim"
+        assert "--replace-data" not in restore_text, "restore.sh must remove --replace-data"
+        assert "ALTER DATABASE" not in restore_text, "restore.sh must remove DB rename / swap logic"
+        assert "_pre_restore_" not in restore_text, "restore.sh must remove preserved DB logic"
+        assert ".env.pre-restore-" not in restore_text, "restore.sh must remove pre-restore .env copy logic"
+        assert "derive_restore_bucket_name" not in restore_text, "restore.sh must restore into original bucket names"
+        assert "pid_is_alive" not in restore_text, "restore.sh must not auto-clean locks by PID"
+        assert "/tmp/dalton-${LOCK_PROJECT}.restore.lock" in restore_text
+        assert "XDG_RUNTIME_DIR" not in restore_text, "restore lock path must be fixed under /tmp"
+        assert 'env "${ENV_UNSET_ARGS[@]}" docker compose' in restore_text
 
-        # Restore lock is keyed by COMPOSE_PROJECT_NAME under ${XDG_RUNTIME_DIR:-/tmp}/dalton-<project>.restore.lock
-        # even when invoked from different deployment directories.
+        # Fixed /tmp/dalton-<project>.restore.lock ignores XDG_RUNTIME_DIR and NEVER auto-removes stale locks
         xdg_dir = tmp_path / "xdg-runtime"
         xdg_dir.mkdir()
-        shared_proj = "shared-proj-lock"
-        pre_lock = xdg_dir / f"dalton-{shared_proj}.restore.lock"
-        pre_lock.mkdir()
-        (pre_lock / "pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+        shared_proj = f"shared-proj-lock-{os.getpid()}"
+        fixed_lock = Path(f"/tmp/dalton-{shared_proj}.restore.lock")
         lock_work_b = tmp_path / "work-dir-b"
         lock_work_b.mkdir()
         (lock_work_b / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
@@ -1860,77 +1965,96 @@ class TestSandboxNetworkAndInitScript:
             f"COMPOSE_PROJECT_NAME={shared_proj}\nDB_HOST=external-pg.corp.internal\n",
             encoding="utf-8",
         )
-        # Stale PID in the project-keyed lock is automatically cleaned up so restore proceeds to DB_HOST guard
-        (pre_lock / "pid").write_text("999999\n", encoding="utf-8")
         lock_env = os.environ.copy()
         lock_env["XDG_RUNTIME_DIR"] = str(xdg_dir)
-        res_proj_lock = subprocess.run(
-            [
-                "bash",
-                str(REPO_ROOT / "scripts/standalone/restore.sh"),
-                "--work-dir",
-                str(lock_work_b),
-                "--backup-dir",
-                str(backup_stub),
-            ],
-            env=lock_env,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        assert res_proj_lock.returncode != 0
-        assert f"Removing stale restore lock {pre_lock}" in res_proj_lock.stderr
-        assert "External PostgreSQL detected" in res_proj_lock.stderr
-        assert not pre_lock.exists(), "restore.sh must release its project-keyed lock on exit"
+        try:
+            # Pre-create lock directory: restore.sh must refuse and instruct manual removal (never delete it)
+            if fixed_lock.is_dir():
+                fixed_lock.rmdir()
+            elif fixed_lock.exists():
+                fixed_lock.unlink()
+            fixed_lock.mkdir()
+            res_proj_lock = subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir",
+                    str(lock_work_b),
+                    "--backup-dir",
+                    str(backup_stub),
+                ],
+                env=lock_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_proj_lock.returncode != 0
+            assert str(fixed_lock) in res_proj_lock.stderr
+            assert "manually" in res_proj_lock.stderr.lower()
+            assert fixed_lock.is_dir(), "restore.sh must NOT auto-remove an existing lock"
+            assert not list(xdg_dir.iterdir()), "restore.sh must ignore XDG_RUNTIME_DIR for lock path"
+        finally:
+            if fixed_lock.is_dir():
+                fixed_lock.rmdir()
+            elif fixed_lock.exists():
+                fixed_lock.unlink()
 
-        for var_name in ("cleanup_py", "MINIO_PREFLIGHT_PY", "MINIO_RESTORE_PY", "MISSING_CHECK_PY"):
+        for var_name in ("MINIO_PREFLIGHT_PY", "MINIO_RESTORE_PY", "MISSING_CHECK_PY"):
             m = _re.search(rf"{var_name}='\n(.*?)\n'", restore_text, flags=_re.DOTALL)
             assert m, f"Missing embedded Python block {var_name} in restore.sh"
             compile(m.group(1), f"restore.sh:{var_name}", "exec")
 
-        # Execute derive_restore_bucket_name extracted from MINIO_RESTORE_PY
-        restore_py_src = _re.search(r"MINIO_RESTORE_PY='\n(.*?)\n'", restore_text, flags=_re.DOTALL)
-        assert restore_py_src is not None
-        derive_match = _re.search(
-            r"(def derive_restore_bucket_name\(.*?\n    return f\"\{prefix\}\{tail\}\"\n)",
-            restore_py_src.group(1),
-            flags=_re.DOTALL,
+        # Verify `env -u` strips exported shell variables matching keys in `.env` before invoking `docker compose`
+        env_u_work = tmp_path / "restore-env-unset"
+        env_u_work.mkdir()
+        (env_u_work / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        (env_u_work / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        env_u_proj = f"env-unset-{os.getpid()}"
+        (env_u_work / ".env").write_text(
+            f"COMPOSE_PROJECT_NAME={env_u_proj}\n"
+            "DB_HOST=postgres\n"
+            "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME=file-bucket\n",
+            encoding="utf-8",
         )
-        assert derive_match is not None
-        derive_ns: dict[str, Any] = {"hashlib": _hashlib}
-        exec(derive_match.group(1), derive_ns)
-        derive_fn = derive_ns["derive_restore_bucket_name"]
-        ts = "20261123170000"
-        assert derive_fn("chat-uploads", ts) == f"chat-uploads-r{ts}"
-        long_a = "a" * 55 + "-1"
-        long_b = "a" * 55 + "-2"
-        out_a = derive_fn(long_a, ts)
-        out_b = derive_fn(long_b, ts)
-        assert len(out_a) <= 63 and len(out_b) <= 63
-        assert out_a != out_b, "Two long bucket names sharing a prefix must produce distinct restore bucket names"
-        assert out_a.endswith(f"-r{ts}") and out_b.endswith(f"-r{ts}")
-
-        # Execute delete_keys_checked extracted from cleanup_py with a mock client returning Errors
-        cleanup_src = _re.search(r"cleanup_py='\n(.*?)\n'", restore_text, flags=_re.DOTALL)
-        assert cleanup_src is not None
-        fn_match = _re.search(
-            r"(def delete_keys_checked\(.*?\n    return deleted\n)",
-            cleanup_src.group(1),
-            flags=_re.DOTALL,
+        fake_docker_dir = tmp_path / "fake-docker-bin"
+        fake_docker_dir.mkdir()
+        env_dump_file = tmp_path / "docker-seen-env.txt"
+        fake_docker = fake_docker_dir / "docker"
+        fake_docker.write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "BUCKET=%s\\nPROJ=%s\\n" "${{DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME:-UNSET}}" "${{COMPOSE_PROJECT_NAME:-UNSET}}" > "{env_dump_file}"\n'
+            "exit 99\n",
+            encoding="utf-8",
         )
-        assert fn_match is not None
-
-        class _ErrS3:
-            def delete_objects(self, *, Bucket: str, Delete: dict[str, Any]) -> dict[str, Any]:
-                return {
-                    "Deleted": [],
-                    "Errors": [{"Key": "bad-key", "Code": "AccessDenied", "Message": "denied"}],
-                }
-
-        ns: dict[str, Any] = {}
-        exec(fn_match.group(1), ns)
-        with pytest.raises(RuntimeError, match="DeleteObjects failed.*bad-key.*AccessDenied"):
-            ns["delete_keys_checked"](_ErrS3(), "chat-uploads-r20261123170000", ["bad-key"])
+        fake_docker.chmod(0o755)
+        poison_env = os.environ.copy()
+        poison_env["PATH"] = f"{fake_docker_dir}:{poison_env.get('PATH', '')}"
+        poison_env["DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME"] = "shell-poison-bucket"
+        poison_env["COMPOSE_PROJECT_NAME"] = "shell-poison-project"
+        env_u_lock = Path(f"/tmp/dalton-{env_u_proj}.restore.lock")
+        try:
+            subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir",
+                    str(env_u_work),
+                    "--backup-dir",
+                    str(backup_stub),
+                ],
+                env=poison_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            seen = env_dump_file.read_text(encoding="utf-8")
+            assert "BUCKET=UNSET\n" in seen, f"Shell bucket env was not unset via env -u: {seen!r}"
+            assert "PROJ=UNSET\n" in seen, f"Shell COMPOSE_PROJECT_NAME was not unset via env -u: {seen!r}"
+        finally:
+            if env_u_lock.is_dir():
+                env_u_lock.rmdir()
+            elif env_u_lock.exists():
+                env_u_lock.unlink()
 
         # backup.sh identifies restore-created buckets by tag or .dalton-restore.json (never suffix regex)
         backup_text = (REPO_ROOT / "scripts/standalone/backup.sh").read_text(encoding="utf-8")
@@ -1972,17 +2096,28 @@ class TestSandboxNetworkAndInitScript:
         assert is_restore_fn(fake_s3, "chat-uploads-r20261123170000") is True
         assert is_restore_fn(fake_s3, "legacy-marker-bucket") is True
 
-        # upgrade.sh rollback hint only suggests `restore.sh --replace-data` after migrate actually starts
-        for scenario, migrate_body, expect_restore_hint in (
+        # upgrade.sh rollback hint relies strictly on comparing successfully read pre/post Alembic versions:
+        #   - unchanged versions -> restore files & images only (do NOT wipe volumes)
+        #   - changed versions   -> point to manual §6.2 steps (`down -v` + `restore.sh`, no `--replace-data`)
+        #   - unreadable pre-migration version -> UNCERTAIN (prompt manual version check first)
+        for scenario, psql_behavior, migrate_body, expected_mode in (
             (
-                "fail-before-container-start",
-                'echo "Error response from daemon: network not found" >&2; exit 1',
-                False,
+                "fail-versions-unchanged",
+                'echo "rev1"; exit 0',
+                'echo "[migrate] Waiting for PostgreSQL..."; echo "connection refused" >&2; exit 1',
+                "before",
             ),
             (
-                "fail-after-migrate-log",
-                'echo "[migrate] Running upstream database migrations..."; echo "SQL syntax error" >&2; exit 1',
-                True,
+                "fail-versions-changed",
+                'state_f="${UPG_STATE_FILE}"; if [[ -f "$state_f" ]]; then echo "rev2"; else echo "rev1"; fi; exit 0',
+                'touch "${UPG_STATE_FILE}"; echo "[migrate] partial upgrade failed" >&2; exit 1',
+                "migrated",
+            ),
+            (
+                "fail-pre-version-unreadable",
+                'state_f="${UPG_STATE_FILE}"; if [[ -f "$state_f" ]]; then echo "rev1"; exit 0; else exit 1; fi',
+                'touch "${UPG_STATE_FILE}"; echo "migrate failed" >&2; exit 1',
+                "unknown",
             ),
         ):
             sc_root = tmp_path / f"upg-{scenario}"
@@ -2022,7 +2157,7 @@ class TestSandboxNetworkAndInitScript:
                 "#!/usr/bin/env bash\n"
                 'if [[ "$*" == *" images -q "* ]]; then echo "img123"; exit 0; fi\n'
                 'if [[ "$1" == "tag" ]]; then exit 0; fi\n'
-                'if [[ "$*" == *" psql "* ]]; then echo "rev1"; exit 0; fi\n'
+                f'if [[ "$*" == *" psql "* ]]; then {psql_behavior}; fi\n'
                 f'if [[ "$*" == *" run --rm migrate"* ]]; then {migrate_body}; fi\n'
                 "exit 0\n",
                 encoding="utf-8",
@@ -2030,6 +2165,7 @@ class TestSandboxNetworkAndInitScript:
             docker_stub.chmod(0o755)
             stub_env = os.environ.copy()
             stub_env["PATH"] = f"{fake_bin}:{stub_env.get('PATH', '')}"
+            stub_env["UPG_STATE_FILE"] = str(sc_root / "migrated.flag")
             res_sc = subprocess.run(
                 [
                     "bash",
@@ -2048,11 +2184,18 @@ class TestSandboxNetworkAndInitScript:
                 timeout=30,
             )
             assert res_sc.returncode != 0, f"{scenario}: expected upgrade.sh to fail"
-            if expect_restore_hint:
-                assert "--replace-data" in res_sc.stderr and "Do NOT run restore.sh --replace-data" not in res_sc.stderr, (
-                    f"{scenario}: expected restore.sh --replace-data hint, got:\n{res_sc.stderr}"
+            assert "--replace-data" not in res_sc.stderr, (
+                f"{scenario}: upgrade.sh must never reference removed --replace-data:\n{res_sc.stderr}"
+            )
+            if expected_mode == "migrated":
+                assert "STANDALONE-DEPLOY.md" in res_sc.stderr and "down -v" in res_sc.stderr, (
+                    f"{scenario}: expected manual §6.2 reset-and-restore guide, got:\n{res_sc.stderr}"
+                )
+            elif expected_mode == "unknown":
+                assert "UNCERTAIN" in res_sc.stderr and "Do NOT assume migrations already ran" in res_sc.stderr, (
+                    f"{scenario}: expected uncertain-state manual version check guide, got:\n{res_sc.stderr}"
                 )
             else:
-                assert "Do NOT run restore.sh --replace-data" in res_sc.stderr, (
-                    f"{scenario}: pre-start failure must NOT suggest restore.sh --replace-data, got:\n{res_sc.stderr}"
+                assert "Do NOT wipe volumes or restore data" in res_sc.stderr, (
+                    f"{scenario}: pre-migration failure must not suggest wiping data, got:\n{res_sc.stderr}"
                 )
