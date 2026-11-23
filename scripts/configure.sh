@@ -55,6 +55,10 @@ set_env() {
             esac
             hops=$((hops + 1))
         done
+        if [ -L "$link_target" ]; then
+            echo "  .env is a chain of more than 16 symlinks; resolve it and re-run." >&2
+            return 1
+        fi
         if [ -n "$link_target" ]; then
             local ENV_FILE="$link_target"
         fi

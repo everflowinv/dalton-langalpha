@@ -1025,6 +1025,25 @@ class TestSandboxNetworkAndInitScript:
         assert res_quoted.returncode != 0
         assert "免密单机试用" in res_quoted.stderr
 
+        # Compose prefers an exported shell value, and drops a trailing comment.
+        for name, env_text, shell_mode in (
+            ("inst-shell-oss", "DALTON_AUTH_MODE=local\n", "oss"),
+            ("inst-comment-oss", "DALTON_AUTH_MODE='oss' # trial\n", None),
+        ):
+            inst_case, init_case = self._stage_init_install(tmp_path, name)
+            (inst_case / ".env").write_text(env_text)
+            case_env = self._make_fake_docker_env(tmp_path, "28.0.1")
+            case_env.pop("DALTON_AUTH_MODE", None)
+            if shell_mode is not None:
+                case_env["DALTON_AUTH_MODE"] = shell_mode
+            res_case = subprocess.run(
+                ["bash", str(init_case), "--non-interactive", "--domain",
+                 "dalton.example.com", "--skip-sandbox-build"],
+                env=case_env, capture_output=True, text=True, timeout=15,
+            )
+            assert res_case.returncode != 0, name
+            assert "免密单机试用" in res_case.stderr, name
+
         # 4. Docker server < 28.0 or unreachable fails in --non-interactive
         for ver in ("27.5.1", None):
             _, init_old = self._stage_init_install(tmp_path, f"inst-old-{ver or 'none'}")
