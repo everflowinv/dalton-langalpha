@@ -1024,6 +1024,18 @@ class TestSandboxNetworkAndInitScript:
             assert res_case.returncode != 0, name
             assert "免密单机试用" in res_case.stderr, name
 
+        # 3c. A public DOMAIN already in .env, with no --domain, is refused too.
+        inst_prev, init_prev = self._stage_init_install(tmp_path, "inst-env-domain")
+        (inst_prev / ".env").write_text("DOMAIN=dalton.example.com\n")
+        res_prev = subprocess.run(
+            ["bash", str(init_prev), "--non-interactive", "--skip-sandbox-build"],
+            env=self._make_fake_docker_env(tmp_path, "28.0.1"),
+            capture_output=True, text=True, timeout=15,
+        )
+        assert res_prev.returncode != 0
+        assert "免密单机试用" in res_prev.stderr
+        assert "dalton.example.com" in res_prev.stderr
+
         # 4. Docker server < 28.0 or unreachable fails in --non-interactive
         for ver in ("27.5.1", None):
             _, init_old = self._stage_init_install(tmp_path, f"inst-old-{ver or 'none'}")

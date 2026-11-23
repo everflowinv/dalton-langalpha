@@ -32,7 +32,8 @@ Usage: bash scripts/standalone/init.sh [OPTIONS]
 
 Options:
   --non-interactive       Do not prompt; use defaults / flags / existing .env values.
-  --domain <host>         Target domain (use 'localhost' for single-machine trial).
+  --domain <host>         localhost, 127.0.0.1 or ::1 (the default). A public domain
+                          is accepted once local sign-in ships (Batch 4b).
   --skip-sandbox-build    Leave the code sandbox image unbuilt (build it later with
                           docker build -f Dockerfile.sandbox --build-arg INSTALL_AGENT_BROWSER=0 -t langalpha-sandbox:latest .).
   -h, --help              Show this help message.
@@ -288,7 +289,7 @@ validate_domain_for_auth() {
   # so it installs on a loopback address only. Batch 4b's init writes the
   # local auth mode itself before it accepts a public domain.
   if ! is_loopback_domain "$domain_val"; then
-    err "当前核心版是免密单机试用，请先用 localhost 安装；正式对外部署等本地登录（Batch 4b）上线后再配置域名。"
+    err "当前核心版是免密单机试用，请先用 localhost 安装；正式对外部署等本地登录（Batch 4b）上线后再配置域名。（读到的域名：'${domain_val}'；.env 里请写成单独一行 DOMAIN=localhost，不加引号。）"
     exit 1
   fi
 }
