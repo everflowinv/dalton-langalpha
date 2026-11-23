@@ -21,6 +21,7 @@ done
 exec uv run --no-sync python - <<'PY'
 import os
 import subprocess
+import time
 import sys
 
 import psycopg
@@ -45,7 +46,14 @@ def run_step(label: str, cmd: list[str]) -> None:
 with psycopg.connect(**conninfo, autocommit=True) as conn:
     with conn.cursor() as cur:
         print("[migrate] Acquiring PostgreSQL migration advisory lock...", flush=True)
-        cur.execute("SELECT pg_advisory_lock(%s)", (LOCK_KEY,))
+        # Poll instead of blocking in pg_advisory_lock: a backend waiting inside that
+        # statement holds a snapshot, and the migrations' CREATE INDEX CONCURRENTLY
+        # waits for every such snapshot, so two concurrent runs would deadlock.
+        while True:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (LOCK_KEY,))
+            if cur.fetchone()[0]:
+                break
+            time.sleep(1)
     try:
         run_step("Running upstream database migrations", ["uv", "run", "--no-sync", "alembic", "upgrade", "head"])
         dalton_ini = "src/dalton/alembic.ini"
