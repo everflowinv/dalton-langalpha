@@ -603,7 +603,12 @@ describe('CreateWorkspaceModal, a computer still being prepared', () => {
     );
 
     act(() => openComputersPanel({ view: 'list' }));
-    expect(await screen.findByRole('dialog', { name: 'Computers' })).toBeInTheDocument();
+    const dialog = await screen.findByRole('dialog', { name: 'Computers' });
+    expect(dialog).toBeInTheDocument();
+    // Wait for the initial computers list to load and ComputersDialogHost's outcome-watch effect
+    // to record the preparing machine before closing the dialog.
+    expect(await within(dialog).findByText('Alpha Research')).toBeInTheDocument();
+    await act(async () => {});
 
     // Closing the dialog while preparation is still running must keep the fallback host mounted.
     act(() => closeComputersPanel());
