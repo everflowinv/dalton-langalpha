@@ -297,7 +297,7 @@ validate_domain_for_auth() {
   for mode in "$file_mode" "${DALTON_AUTH_MODE-__unset__}"; do
     [[ "$mode" == "__unset__" ]] && continue
     # Read the value the way Compose does: drop a trailing comment, then quotes.
-    mode="$(printf '%s' "$mode" | sed -E "s/[[:space:]]+#.*$//; s/^[[:space:]]*[\"']?//; s/[\"']?[[:space:]]*$//" | tr '[:upper:]' '[:lower:]')"
+    mode="$(printf '%s' "$mode" | sed -E "s/[[:space:]]+#.*$//; s/^[[:space:]]*[\"']?//; s/[\"']?[[:space:]]*$//" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
     if [[ -z "$mode" || "$mode" == "oss" ]]; then
       err "当前核心版是免密单机试用，请先用 localhost 安装；正式对外部署等本地登录（Batch 4b）上线后再配置域名。"
       exit 1

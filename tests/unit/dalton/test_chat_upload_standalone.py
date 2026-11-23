@@ -1029,6 +1029,8 @@ class TestSandboxNetworkAndInitScript:
         for name, env_text, shell_mode in (
             ("inst-shell-oss", "DALTON_AUTH_MODE=local\n", "oss"),
             ("inst-comment-oss", "DALTON_AUTH_MODE='oss' # trial\n", None),
+            ("inst-bare-comment-oss", "DALTON_AUTH_MODE=oss # trial\n", None),
+            ("inst-inner-space-oss", "DALTON_AUTH_MODE=' oss '\n", None),
         ):
             inst_case, init_case = self._stage_init_install(tmp_path, name)
             (inst_case / ".env").write_text(env_text)
@@ -1118,6 +1120,37 @@ class TestSandboxNetworkAndInitScript:
         content = env_path.read_text(encoding="utf-8")
         assert "EXISTING_KEY=updated-value" in content
         assert "NEW_SECRET_KEY=new-secret" in content
+
+    def test_configure_set_env_writes_through_a_relative_symlink(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "real.env"
+        target.write_text("EXISTING_KEY=old\n", encoding="utf-8")
+        target.chmod(0o640)
+        link = tmp_path / ".env"
+        link.symlink_to("real.env")
+
+        configure_sh = REPO_ROOT / "scripts/configure.sh"
+        script = (
+            "set -euo pipefail\n"
+            f'ENV_FILE="{link}"\n'
+            f'eval "$(awk \'/^set_env\\(\\) \\{{/ {{p=1}} p {{print}} p && /^\\}}/ {{exit}}\' "{configure_sh}")"\n'
+            'set_env EXISTING_KEY "updated"\n'
+            'set_env NEW_KEY "added"\n'
+        )
+        subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=15,
+            preexec_fn=lambda: os.umask(0o022),
+        )
+        assert link.is_symlink()
+        assert stat.S_IMODE(target.stat().st_mode) == 0o640
+        content = target.read_text(encoding="utf-8")
+        assert "EXISTING_KEY=updated" in content
+        assert "NEW_KEY=added" in content
 
     def test_minio_init_fails_on_bucket_policy_error_except_no_such_policy(
         self, monkeypatch: pytest.MonkeyPatch
