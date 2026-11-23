@@ -15,7 +15,7 @@ import {
   Users,
   Wallet,
 } from 'lucide-react';
-import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
+import { BRAND_NAME, isDaltonBuild } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(settings-reorg)
 import { isPlatformMode } from '@/config/hostMode';
 import { canDesktopSettings } from '@/lib/desktop';
@@ -115,8 +115,9 @@ export function sectionShown(
 ): boolean {
   // DALTON-HOOK(hide-trading): Dalton does not expose live brokerage trading in Settings
   // DALTON-HOOK(hide-experiments): Dalton does not expose experimental labs in Settings
-  // DALTON-HOOK(settings-reorg): enforce minTier & coverageUnitsOnly across rail, search, and palette
+  // DALTON-HOOK(settings-reorg): hide Computers section in Dalton builds; enforce minTier & coverageUnitsOnly across rail, search, and palette
   if (section === 'trading' || section === 'experiments') return false;
+  if (section === 'computers' && isDaltonBuild) return false;
   const meta: SectionMeta = SECTIONS[section];
   if (meta.desktopOnly && !canDesktopSettings()) return false;
   if (meta.platformOnly && !isPlatformMode) return false;
@@ -183,6 +184,7 @@ export const SETTINGS = {
   streamingMode: { section: 'chat', anchor: 'response-delivery', labelKey: 'settings.streamingMode', descKey: 'settings.streamingModeDesc' },
   toolCallLayout: { section: 'chat', anchor: 'tool-calls', labelKey: 'settings.toolCallLayout', descKey: 'settings.toolCallLayoutDesc' },
   turnEndScroll: { section: 'chat', anchor: 'turn-end', labelKey: 'settings.turnEndScroll', descKey: 'settings.turnEndScrollDesc' },
+  composerTray: { section: 'chat', anchor: 'composer-tray', labelKey: 'settings.composerTray', descKey: 'settings.composerTrayDesc' },
   voiceInput: { section: 'chat', anchor: 'voice-input', labelKey: 'settings.voiceInput', descKey: 'settings.voiceInputDesc' },
   // DALTON-HOOK(settings-section): bilingual search keywords for artifacts & output settings
   commentDestination: { section: 'chat', anchor: 'comment-destination', labelKey: 'settings.artifacts.destination', descKey: 'settings.artifacts.destinationDesc', keywords: '评论去向 comment destination' },

@@ -29,7 +29,26 @@ SCHEDULE_WAKEUP_DOC = (
     "A wakeup that fires while you are working arrives in this turn; otherwise it starts a new turn here with no user message. When that turn finds nothing the user needs to hear, end it with quiet instead of replying. Cancel your own wakeups once their goal is met, such as an entry taken or an order done."
 )
 
+# DALTON-HOOK(hide-trading): model-facing wakeup tool wording without brokerage order references
+SCHEDULE_WAKEUP_DOC_NO_TRADING = (
+    "Come back to this conversation later, or when something happens, to carry on a task whose next step you already know: at a time, on a repeating schedule, or on a price move. Call with no arguments to see what is pending.\n"
+    "\n"
+    "A wakeup carries nothing but what fired, so before you end the turn tell the user what you set, when it stops, and what you will do when it fires; that reply is what you will pick up from. It is not for background tasks or hand-offs, which report back on their own. At most 20 can be pending in a conversation; a series counts as one.\n"
+    "\n"
+    "Args:\n"
+    "    triggers: Wakeups to set.\n"
+    '    cancel: Ids of wakeups to cancel, or "all".\n'
+    "    quiet: End a turn that a wakeup started, without a reply: one short line on what you checked and found, shown to the user in the list of quiet checks.\n"
+    "\n"
+    "Returns:\n"
+    "    What is pending afterwards: each wakeup's id (for cancel; the user knows it by its label), what it waits for, and when it next fires and stops or lapses.\n"
+    "\n"
+    "A wakeup that fires while you are working arrives in this turn; otherwise it starts a new turn here with no user message. When that turn finds nothing the user needs to hear, end it with quiet instead of replying. Cancel your own wakeups once their goal is met."
+)
+
 TRIGGER_MODEL_DOC = "Set exactly one of at, cron, price, order."
+# DALTON-HOOK(hide-trading): trigger schema doc without order
+TRIGGER_MODEL_DOC_NO_TRADING = "Set exactly one of at, cron, price."
 
 PRICE_PCT_FROM = 'Only with pct_up or pct_down: measure from "now", the price when you set it, instead of the previous close. For US stocks, the previous close during after-hours trading is still the one before that day\'s session, and once trading ends it is that day\'s close.'
 
@@ -42,6 +61,8 @@ TRIGGER_FIELDS = {
     "price": "Fire when a price level or % move hits; US stocks can also hit on pre-market and after-hours trades. It lasts through its market's next full session; shortly before it lapses unhit you are woken to set it again or let it go.",
     "order": "Fire when this order first fills, even partly, or ends unfilled. For an order you placed in this conversation, its id from the brokerage's reply. For one placed elsewhere, such as in the user's own account, an object naming where you read it. It lasts until the order ends, at most 7 days.",
 }
+# DALTON-HOOK(hide-trading): trigger fields without order when trading is closed
+TRIGGER_FIELDS_NO_TRADING = {k: v for k, v in TRIGGER_FIELDS.items() if k != "order"}
 
 ORDER_TARGET_FIELDS = {
     "id": "The order's id as the brokerage's order list shows it.",

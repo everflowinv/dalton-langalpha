@@ -2,6 +2,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { ChevronRight, Plus } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
+import { isDaltonBuild } from '@/config/brand'; // DALTON-HOOK(dalton-setup)
 import { Loader } from '@/components/ui/loader';
 import type { Computer } from '@/types/api';
 import { computerIdentity, ComputerBadge } from '@/pages/ChatAgent/components/ComputerBadge';
@@ -28,7 +29,8 @@ export function ComputersPanel() {
   const copy = useSettingCopy();
   const queryClient = useQueryClient();
   const { data, isLoading, isError, refetch } = useComputers();
-  const thisMac = useThisMac({ enabled: true });
+  // DALTON-HOOK(dalton-setup): never probe local Mac in Dalton builds
+  const thisMac = useThisMac({ enabled: !isDaltonBuild });
   const { data: providerData } = useComputerProviders({ enabled: true });
   const computers = liveComputers(data?.computers);
   const list = copy(SETTINGS.computers);

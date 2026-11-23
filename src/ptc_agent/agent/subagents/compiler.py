@@ -80,7 +80,6 @@ def subagent_template_vars(
     thread_id: str = _STAND_IN,
     files_mounted: bool = True,
     market_watch: bool = True,
-    todo: bool = True,
     research_writing: bool = False,  # DALTON-HOOK(research-writing)
 ) -> dict[str, Any]:
     """What a subagent's templates read beside the loader's path table.
@@ -95,14 +94,14 @@ def subagent_template_vars(
     return {
         "current_time": current_time,
         "thread_id": thread_id,
-        **_tool_gates(defn, market_watch=market_watch, todo=todo),
+        **_tool_gates(defn, market_watch=market_watch),
         **guidance_template_vars(guidance),
         "files_mounted": files_mounted,
         "research_writing_enabled": research_writing,  # DALTON-HOOK(research-writing)
     }
 
 
-def _tool_gates(defn: SubagentDefinition, *, market_watch: bool, todo: bool) -> dict[str, bool]:
+def _tool_gates(defn: SubagentDefinition, *, market_watch: bool) -> dict[str, bool]:
     """Which tool tiers this subagent's prompt is allowed to advertise.
 
     The tool guide is shared, the tool sets are not: report-builder binds
@@ -115,7 +114,6 @@ def _tool_gates(defn: SubagentDefinition, *, market_watch: bool, todo: bool) -> 
     bound = set(defn.tools)
     return {
         "market_watch_enabled": market_watch and "finance" in bound,
-        "todo_enabled": "todo" in bound and todo,
         "show_widget_enabled": "show_widget" in bound,
         "chart_annotation_enabled": False,
         "conversation_search_enabled": False,  # DALTON-HOOK(team-memory-toggle)
@@ -302,7 +300,6 @@ class SubagentCompiler:
                 market_watch=(
                     self._config is not None and self._config.feature_enabled("market_watch")
                 ),
-                todo=bool(self._tool_sets.get("todo")),
                 research_writing=self._research_writing_enabled,  # DALTON-HOOK(research-writing)
             )
             # Resolve the turn's own folder so workspace_paths renders it

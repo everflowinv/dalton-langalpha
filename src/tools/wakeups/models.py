@@ -17,7 +17,9 @@ from src.tools.wakeups.wording import (
     ORDER_TARGET_FIELDS,
     PRICE_PCT_FROM,
     TRIGGER_FIELDS,
+    TRIGGER_FIELDS_NO_TRADING,  # DALTON-HOOK(hide-trading)
     TRIGGER_MODEL_DOC,
+    TRIGGER_MODEL_DOC_NO_TRADING,  # DALTON-HOOK(hide-trading)
 )
 
 
@@ -92,6 +94,33 @@ class ScheduleWakeupArgs(BaseModel):
     """Arguments of `schedule_wakeup`; every one optional, none described."""
 
     triggers: Optional[list[WakeupTrigger]] = None  # type: ignore[valid-type]
+    cancel: Optional[Union[list[str], str]] = None
+    quiet: Optional[str] = None
+
+
+# DALTON-HOOK(hide-trading): trigger and argument schemas without order / OrderTarget when trading is closed
+WakeupTriggerNoTrading = create_model(
+    "WakeupTrigger",
+    __config__=ConfigDict(extra="forbid"),
+    __doc__=TRIGGER_MODEL_DOC_NO_TRADING,
+    **{
+        key: (
+            _FIELD_TYPES[key],
+            Field(
+                default=None,
+                description=TRIGGER_FIELDS_NO_TRADING[key],
+                **({"max_length": LABEL_MAX} if key == "label" else {}),
+            ),
+        )
+        for key in TRIGGER_FIELDS_NO_TRADING
+    },
+)
+
+
+class ScheduleWakeupArgsNoTrading(BaseModel):
+    """Arguments of `schedule_wakeup`; every one optional, none described."""
+
+    triggers: Optional[list[WakeupTriggerNoTrading]] = None  # type: ignore[valid-type]
     cancel: Optional[Union[list[str], str]] = None
     quiet: Optional[str] = None
 

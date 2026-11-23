@@ -282,6 +282,10 @@
     "streamingModeDesc": "Show text as it arrives, or reveal one paragraph at a time.",
     "streamingModeToken": "Continuous",
     "streamingModeParagraph": "By paragraph",
+    "composerTray": "Running work",
+    "composerTrayDesc": "Where the plan, tasks and wakeups show while the agent works: as chips above the composer, or in a strip inside it.",
+    "composerTrayAbove": "Above",
+    "composerTrayInside": "Inside",
     "toolCallLayout": "Tool calls",
     "toolCallLayoutDesc": "Show each step as a row, or try the new status line: one line that names the current step.",
     "toolCallLayoutRows": "Rows",
@@ -2020,6 +2024,39 @@
       "hint": "Sharper is clearer and uses more bandwidth. It applies the next time the browser opens.",
       "failed": "Couldn't change the live view quality"
     },
+    "browserWindow": {
+      "label": "Show as a window",
+      "onHint": "The browser also opens as a window on this Mac, where you can watch and use it, and stays open until you close it. It applies the next time the browser opens.",
+      "offHint": "The browser shows only in the Browser tab. Turn this on to also see it as a window on this Mac. It applies the next time the browser opens.",
+      "failed": "Couldn't change the browser window"
+    },
+    "browserSignins": {
+      "label": "Keep sign-ins",
+      "offHint": "The browser forgets every site when it closes. Turn this on to sign in once in the Browser tab and stay signed in for every thread on this computer. It applies the next time the browser opens.",
+      "onHint": "Sites you sign in to in the Browser tab stay signed in, for every thread on this computer. Turning this off signs out of all of them.",
+      "signOut": "Sign out of every site",
+      "signedOut": "Signed out of every site",
+      "signOutWaits": "Saved, but this computer didn't answer",
+      "signOutWaitsHint": "Its browser signs out of every site the next time the computer is used.",
+      "failed": "Couldn't change kept sign-ins",
+      "import": {
+        "title": "Bring in sign-ins",
+        "hint": "Copy your sign-ins from another browser on this computer, so the agent can use them too. That browser stays as it is.",
+        "bring": "Bring in",
+        "bringing": "Bringing in…",
+        "askHint": "If this computer asks to use your keychain or keyring, allow it.",
+        "done": "Brought in sign-ins from {{name}}",
+        "count": "{{cookies}} cookies",
+        "countSkipped": "{{cookies}} cookies, {{skipped}} couldn't be read",
+        "keychain": "Couldn't unlock {{name}}'s sign-ins. Allow it when this computer asks for your password, or connect it with the desktop app so it can ask.",
+        "notKept": "The browser opened before sign-ins were kept. Try again once it closes.",
+        "lowMemory": "This computer is short on memory, so the browser can't open. Try again later.",
+        "notRunning": "The computer isn't running.",
+        "notFound": "{{name}} is no longer on this computer.",
+        "failed": "Couldn't bring in sign-ins.",
+        "listFailed": "Couldn't list the browsers on this computer."
+      }
+    },
     "filesBackup": {
       "label": "Back up files",
       "offTitle": "Stop backing up files?",
@@ -2750,11 +2787,13 @@
     "backgroundTasksRunning": "Background tasks are still running",
     "taskReportBackPending": "Waiting for subagent results to report back",
     "tray": {
-      "tasks_one": "{{count}} task",
-      "tasks_other": "{{count}} tasks",
-      "tasksRunning_one": "{{count}} task · {{running}} running",
-      "tasksRunning_other": "{{count}} tasks · {{running}} running",
-      "tasksHeading": "From this thread",
+      "tasks_one": "{{count}} subagent",
+      "tasks_other": "{{count}} subagents",
+      "tasksRunning_one": "{{count}} subagent · {{running}} running",
+      "tasksRunning_other": "{{count}} subagents · {{running}} running",
+      "tasksHeading": "Subagents in this thread",
+      "commands_one": "{{count}} command",
+      "commands_other": "{{count}} commands",
       "commandsHeading": "Running in the background",
       "show": "Show this thread's work"
     },
@@ -2918,6 +2957,7 @@
       "finishedUnfinished": "Reported back, background work unfinished"
     },
     "marketWatch": {
+      "live": "Live",
       "watching": "Watching {{symbols}}",
       "chipTitle": "Live prices for the tickers the agent is watching",
       "chipTitleUpdated": "Live prices for watched tickers — updated {{time}}",
@@ -2944,12 +2984,18 @@
       "generic": "Price alert"
     },
     "wakeups": {
+      "chipShort_one": "{{time}}",
+      "chipShort_other": "{{count}} · {{time}}",
       "chip_one": "1 wakeup · {{time}}",
       "chip_other": "{{count}} wakeups · next {{time}}",
       "chipTitle": "Wakeups the agent set in this thread. Open to cancel any of them.",
       "panelTitle": "Wakeups",
       "panelEmpty": "No wakeups in this thread.",
       "cancel": "Cancel",
+      "distance": "last trade {{price}} · {{away}} to go",
+      "distanceToTarget": "goes off at {{target}} · last trade {{price}} · {{away}} to go",
+      "distanceReached": "last trade {{price}} · at its level",
+      "away": "{{away}} away",
       "cancelAll": "Cancel all",
       "cancelling": "Cancelling…",
       "cancelLabel": "Cancel the wakeup {{label}}",
@@ -3311,6 +3357,30 @@
         "needs_bigger_computer_plan": "Claude Code runs on Medium or larger cloud computers, and this workspace's computer is smaller. Change its spec or upgrade your {{brand}} plan, or choose to run Claude Code on your own computers in Settings under Model access.",
         "needs_bigger_computer_plan_home": "Claude Code runs on Medium or larger cloud computers, and Home's computer is smaller. Change its spec or upgrade your {{brand}} plan, or choose to run Claude Code on your own computers in Settings under Model access."
       }
+    },
+    "status": {
+      "openPanel": "Open Status",
+      "openPanelMore": "Open Status · {{count}} more",
+      "openInPanel": "Show in Status",
+      "needsYou": "Needs you",
+      "awaitingAnswer": "The agent is waiting for your answer",
+      "workingNow": "Working now",
+      "done": "Done",
+      "subagent": "Subagent",
+      "analyst": "Analyst",
+      "analystIn": "Analyst in {{workspace}}",
+      "subagentOfType": "{{type}} subagent"
+    },
+    "plan": {
+      "label": "Plan",
+      "heading": "Plan · {{progress}}",
+      "headingRunning": "step {{current}} of {{total}}",
+      "headingSettled": "{{done}} of {{total}} done",
+      "notDone": "not done",
+      "waiting": "waiting",
+      "stepDone": "done",
+      "stepRunning": "in progress",
+      "stepPending": "not started"
     }
   },
   "context": {
@@ -3466,7 +3536,12 @@
       "outdatedTitle": "This computer doesn't have the browser",
       "outdatedBody": "It was built before the browser shipped. A new computer has it.",
       "unavailableTitle": "No browser on this computer",
-      "unavailableBody": "The browser runs on cloud computers, and this is a machine you connected yourself.",
+      "unavailableBody": "The agent's browser can't run on this computer.",
+      "noChromeTitle": "No browser for the agent on this computer",
+      "noChromeBody": "The agent uses Chrome, Edge, Brave or Chromium if one is installed here. Install one, or get Chrome for Testing (about 300 MB), which only the agent uses.",
+      "getChrome": "Get Chrome for Testing",
+      "installingTitle": "Downloading Chrome for Testing",
+      "installingBody": "This takes a few minutes. The browser opens here once it's done.",
       "failedTitle": "The live view couldn't connect",
       "failedBody": "The browser may still be running on the computer.",
       "retry": "Try again",

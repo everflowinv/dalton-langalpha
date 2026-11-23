@@ -225,6 +225,9 @@ export interface ChatInputProps {
   draftKey?: string;
   // DALTON-HOOK(automation-effort): failed reply id currently eligible for Retry (null when no failed reply is retryable)
   retryTargetId?: string | null;
+  /** A strip the host draws across the top of the box, ruled off from the
+   *  rest (the chat view's tray, for a reader who keeps it inside). */
+  header?: React.ReactNode;
   /**
    * Context the host gathers above the text box, ruled off from it (the chat
    * view's queued file comments). The host owns what it holds and what a send
@@ -298,6 +301,7 @@ function ChatInput({
   draftKey,
   // DALTON-HOOK(automation-effort): failed reply id currently eligible for Retry (null when no failed reply is retryable)
   retryTargetId,
+  header = null,
   deck = null,
   ref,
 }: ChatInputProps & { ref?: React.Ref<ChatInputHandle> }) {
@@ -1384,6 +1388,7 @@ function ChatInput({
         }}
       >
         {isListening && <VoiceOverlay />}
+        {header}
         <div className="flex flex-col px-3 pt-3 pb-2 gap-2">
 
           {/* The deck folds, and the column's gap below it cannot: a gap lands

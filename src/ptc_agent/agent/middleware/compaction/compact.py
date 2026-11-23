@@ -93,6 +93,7 @@ from ptc_agent.agent.middleware.thinking_binding import (
     without_thinking,
 )
 from ptc_agent.agent.transcript import TranscriptTarget, Window
+from ptc_agent.agent.tools.plan import PlanStepDict
 from ptc_agent.config.agent import CredentialSource
 from ptc_agent.agent.transcript.pointer import (
     TranscriptTurns,
@@ -257,6 +258,7 @@ class Summarizer:
         carried: bool = False,
         own_only: bool = False,
         brief_room: int | None = None,
+        plan: Sequence[PlanStepDict] = (),
     ) -> Compaction:
         """Summarize ``view`` before ``cutoff``, ``messages`` being the
         agent's checkpoint list (what ``window`` trimmed of it aside), by
@@ -273,6 +275,7 @@ class Summarizer:
         summary is written, and the summary names them after its pointer.
         ``progress`` hears how much of the summary has been written.
         ``carried`` says the step it ends on is sent after it (see ``carry``).
+        ``plan`` is the plan in state, which the server's digest lists.
 
         A ``brief_room`` makes it a brief for a model that keeps a session of
         its own: no model is tried past this one, and when it writes none the
@@ -310,10 +313,10 @@ class Summarizer:
             else functools.partial(
                 server_summary,
                 to_summarize,
-                preserved,
                 raw_messages=messages,
                 turns=turns,
                 window=window,
+                plan=plan,
             )
         )
         try:
@@ -456,7 +459,8 @@ async def compact_messages(
     scratchpad feature is on.
 
     Tier 1 has no part here: what it would trim is in the stretch the summary
-    replaces.
+    replaces. Nor does the plan: the next turn may open a new request, which
+    starts with none.
 
     Raises:
         ValueError: If the view leaves nothing to summarize.
