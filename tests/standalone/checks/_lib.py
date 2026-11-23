@@ -6,7 +6,7 @@ Uses Python standard library only so checks run on a bare Linux CI runner
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 import http.client
@@ -394,11 +394,11 @@ def _resolve_tar_member(
     return None
 
 
-def _scan_opened_docker_save_tar(
+def _visit_opened_docker_save_tar(
     outer: tarfile.TarFile,
-    forbidden_substrings: Sequence[str],
-) -> tuple[list[str], int]:
-    """Read ``manifest.json`` and inspect every declared layer strictly.
+    visitor: Callable[[str, tarfile.TarFile, tarfile.TarInfo], None],
+) -> int:
+    """Read ``manifest.json`` and visit every member of every declared layer strictly.
 
     Raises :class:`RuntimeError` if ``manifest.json`` is missing/invalid,
     declares 0 layers, references a missing layer, or contains an unparseable
@@ -438,7 +438,6 @@ def _scan_opened_docker_save_tar(
     if not declared_layers:
         raise RuntimeError("docker save manifest.json declared 0 layers")
 
-    hits: list[str] = []
     scanned = 0
     for layer_name in declared_layers:
         layer_member = _resolve_tar_member(members_by_name, layer_name)
@@ -454,10 +453,7 @@ def _scan_opened_docker_save_tar(
         try:
             with tarfile.open(fileobj=extracted, mode="r|*") as layer_tar:
                 for lmember in layer_tar:
-                    norm = lmember.name.lstrip("./")
-                    for forbidden in forbidden_substrings:
-                        if forbidden in norm:
-                            hits.append(f"{layer_name}:{norm}")
+                    visitor(layer_name, layer_tar, lmember)
         except (tarfile.TarError, EOFError, OSError) as exc:
             raise RuntimeError(
                 f"Failed to parse declared layer {layer_name!r}: {exc}"
@@ -466,6 +462,36 @@ def _scan_opened_docker_save_tar(
 
     if scanned == 0:
         raise RuntimeError("Scanned 0 image layers")
+    return scanned
+
+
+def visit_docker_save_tar(
+    tar_path: Path,
+    visitor: Callable[[str, tarfile.TarFile, tarfile.TarInfo], None],
+) -> int:
+    """Visit every member across all ``manifest.json`` layers of an on-disk ``docker save`` tar."""
+    with tarfile.open(tar_path, mode="r:*") as outer:
+        return _visit_opened_docker_save_tar(outer, visitor)
+
+
+def _scan_opened_docker_save_tar(
+    outer: tarfile.TarFile,
+    forbidden_substrings: Sequence[str],
+) -> tuple[list[str], int]:
+    """Read ``manifest.json`` and inspect every declared layer strictly."""
+    hits: list[str] = []
+
+    def _check_member(
+        layer_name: str,
+        _layer_tar: tarfile.TarFile,
+        lmember: tarfile.TarInfo,
+    ) -> None:
+        norm = lmember.name.lstrip("./")
+        for forbidden in forbidden_substrings:
+            if forbidden in norm:
+                hits.append(f"{layer_name}:{norm}")
+
+    scanned = _visit_opened_docker_save_tar(outer, _check_member)
     return sorted(set(hits)), scanned
 
 
@@ -673,12 +699,9 @@ class ComposeContext:
         )
         return output_path
 
-    def scan_service_image_layers(
-        self,
-        service: str,
-        forbidden_substrings: Sequence[str],
-    ) -> tuple[list[str], int]:
-        """Run ``docker save -o <tmp.tar>`` on a service's image and scan every manifest layer."""
+    @contextmanager
+    def saved_service_image_tar(self, service: str) -> Iterator[Path]:
+        """Run ``docker save -o <tmp.tar>`` on a service's image and yield the tar path."""
         raw_ids = [
             line.strip()
             for line in self.compose("images", "-q", service).stdout.decode("utf-8").splitlines()
@@ -696,6 +719,7 @@ class ComposeContext:
             proc = subprocess.run(
                 ["docker", "save", "-o", str(tar_path), image_id],
                 capture_output=True,
+                check=False,
             )
             if proc.returncode != 0:
                 stderr = _redact_secrets_text(
@@ -704,4 +728,13 @@ class ComposeContext:
                 raise RuntimeError(
                     f"docker save failed for service {service} (rc={proc.returncode}): {stderr[-1000:]}"
                 )
+            yield tar_path
+
+    def scan_service_image_layers(
+        self,
+        service: str,
+        forbidden_substrings: Sequence[str],
+    ) -> tuple[list[str], int]:
+        """Run ``docker save -o <tmp.tar>`` on a service's image and scan every manifest layer."""
+        with self.saved_service_image_tar(service) as tar_path:
             return scan_tar_file_for_paths(tar_path, forbidden_substrings)
