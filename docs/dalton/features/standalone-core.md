@@ -1,7 +1,7 @@
 # 独立核心版本设计方案（产品化第 ① 阶段）
 
 > **基线快照**：分支 `design/standalone-core`（基于 `fb8f2bdaa`）  
-> **文档状态**：设计待审阅（待用户确认第 8 节的 5 项决策后进入分批开发）
+> **文档状态**：已按双模型代码审查（codex `gpt-6.2-sol` + `grok 4.7`）与用户 6 项定案修订完成，可直接按第 6 节启动开发
 
 ---
 
@@ -9,30 +9,36 @@
 
 ### 1. 做什么
 
-把当前只能在 Everflow 这台 Mac 上运行的 Dalton 系统，整理成**同一份代码仓库下的两种安装方式**：
+把当前绑定在 Everflow 这台 Mac 上运行的 Dalton 系统，整理成**同一份代码仓库下的两种安装形态（Profile，安装形态配置档）**：
 
-- **核心安装（`DALTON_PROFILE=core`）**：面向新客户。在一台全新的 Linux 服务器上，从空数据库开始，客户只需填入**自己的域名、首个管理员账号和模型 API Key（Application Programming Interface Key，应用编程接口密钥）**，即可一键启动服务，完成新建工作区、流式对话、代码沙箱分析、上传文件、查看图表与报告。所有专属商业数据源、宿主机桥接程序、飞书/微信/Discord 渠道和本机定时采集任务默认留空；凡未安装的能力，在智能体工具列表、系统提示词、技能目录、设置页和定时任务中统一隐去，全程零报错运行。
-- **Everflow 安装（`DALTON_PROFILE=everflow`）**：面向我们现有的 Mac 生产环境。默认开启全部既有数据源、宿主机桥接、团队权限与渠道推送，每一步开发都保证现有生产环境功能完整、数据原地保留、无需停机迁移。
+- **核心安装（`DALTON_PROFILE=core`，对应 `APP_ENV=core`）**：面向外部客户。在一台全新的 Linux 服务器上，从空数据库开始，客户只需填入**自己的域名、首个管理员账号密码和至少 1 个模型 API Key（Application Programming Interface Key，应用编程接口密钥）**，即可拉起全套容器服务，完成新建工作区、流式对话、代码沙箱分析、分片上传大文件、查看监控看板并完成研报审校发布。所有专属商业数据源、宿主机桥接程序、飞书/微信/Discord 渠道和本机定时采集任务默认关闭；凡未安装的能力，在合并后的工具配置、插件目录、技能注册与正文、研究工作流、系统提示词、设置页、帮助站和后台任务中全链路隐去，直接调用相关接口亦明确拒绝，全程零报错运行。
+- **Everflow 安装（`DALTON_PROFILE=everflow`，对应 `APP_ENV=dalton` 或未设置 `APP_ENV`）**：面向我们现有的 Mac 生产环境与本地测试。原样保留全部既有数据源、宿主机桥接、Supabase（开源身份认证与后端云平台）团队登录、权限顺序、模型策略与发布脚本，任何一批改动均保证现网功能完整、数据原地保留、零停机迁移。
 
-本阶段（第 ① 阶段）聚焦“脱离单台 Mac 独立跑起来 + 未装能力干净隐去”，同时把能力开关注册点抽象成统一接口，为第 ② 阶段把 AlphaEngine、公司资料库（company wiki）等正式拆成独立插件包预留直接替换位。
+本阶段（第 ① 阶段）聚焦“脱离单台 Mac 独立跑起来 + 未装能力端到端干净隐去 + 交付干净发行产物”，能力开关随部署静态固定；第 ② 阶段再将 AlphaEngine、公司资料库（company wiki）等拆为可独立安装的连接器并设计跨进程在线热更新。
 
 ### 2. 分几批、大概多少人周
 
-全部工作拆成 **7 个独立开发批次（Batch 1 – Batch 7）**。每批改动均控制在开发代理（agy Neon High）单轮可高质量完成的规模，支持独立代码审查（codex `gpt-6.2-sol` + `grok 4.7`）、独立合入主分支并独立发布现网：
+全部工作按“每批完成后系统可独立运行、可独立合并主分支、可独立部署现网、且同一文件只在一个批次内修改”的原则，重排为 **6 个独立开发批次（Batch 1 – Batch 6）**，单批规模适配开发代理（agy Neon High）单轮高质量交付并经双模型（codex `gpt-6.2-sol` + `grok 4.7`）审查：
 
-- **总体工期估算**：按推荐的“自带本地账号登录”方案计，合计 **43–57 人日（约 8.5–11.5 人周）**；若沿用外部 Supabase（托管式开源认证与后端云平台）服务则缩减至 **38–50 人日（约 7.5–10 人周）**，若首版直接做企业单点登录则约 **45–59 人日（约 9–12 人周）**。
-- **最快见效节点**：**Batch 1（6–8 人日）**完成后，GitHub Actions（GitHub 托管的自动化持续集成运行器）就能在全新 Ubuntu Linux 环境上从空数据库跑通安装与假模型对话。
-- **客户盲测节点**：**Batch 5** 完成后、**Batch 6** 期间，在一台干净的 Linux 云主机上由独立 AI 代理扮演新客户按文档从零盲装，暴露出的体验卡点当批修完。
+- **总体工期估算**：计入全入口鉴权改造、双进程（`--workers 2`）一致性验证、已运行沙箱受管文件清理、二十余份可见技能正文与工作流去专有化改写、单模型发布链路改造、升级恢复验证及盲测修复后，合计 **51–70 人日（约 10–14 人周）**。
+- **各批节奏概览**：
+  1. **Batch 1（9–12 人日）**：先建 Everflow 基线快照测试，交付核心配置叠加层、Compose（多容器编排工具）覆盖文件、最小安装与干净打包脚本、Responses API（OpenAI 新一代结构化响应与工具流式接口）假模型服务，跑通 GitHub Actions（GitHub 托管的自动化持续集成运行器）空库安装与产物层检查；
+  2. **Batch 2（8–11 人日）**：建立统一能力注册表，拆出独立开源插件 `dalton_sec`，完成 MCP（Model Context Protocol，模型上下文协议）合并配置、直接工具、API 路由、通知投递与后台协程的后端端到端裁剪；
+  3. **Batch 3（9–12 人日）**：完成技能按名加载拦截、沙箱受管技能清理、可见技能正文与 6 个工作流改写、提示词/数据地图缓存隔离、前端设置页/监控面板/`/help` 帮助站裁剪及全量文本门禁；
+  4. **Batch 4（10–14 人日）**：新增独立角色表与凭据持有人表，统一全部认证入口分派，落地 `DALTON_AUTH_MODE=local` 本地密码登录、永久自举锁、单事务邀请兑换与运维密码重置；
+  5. **Batch 5（7–10 人日）**：开启自定义模型地址出站防护，解除首次模型引导对私有 OAuth（Open Authorization，开放授权协议）模型的锁定，打通单模型/未知家族正式审校与研报发布；
+  6. **Batch 6（8–11 人日）**：交付自动 HTTPS 边缘网关配置、备份/恢复/平滑升级脚本与部署手册，基于打包脚本导出的干净产物完成干净云主机 AI 盲装验收并封版。
 
-### 3. 需要用户拍板的 5 件事（详见第 8.2 节）
+### 3. 用户已定事项（共 6 项，直接照此执行）
 
-| 编号 | 决策事项 | 推荐选项 |
+| 编号 | 已定事项 | 执行口径 |
 |---|---|---|
-| **决策 1** | 核心安装的默认登录方式 | **推荐方案 B：自带轻量本地账号（邮箱/用户名 + 密码 + 首个管理员网页引导 + 邀请链接）**，同时保留 `supabase` 模式供 Everflow 现网照常运行；企业 OIDC（OpenID Connect，开放身份认证单点登录）按后续客户需求追加（+4–6 人日）。 |
-| **决策 2** | 核心安装的默认品牌与助手名称 | **推荐：支持 `.env` 配置 `BRAND_NAME`；客户未填时默认展示中性名 `Dalton`**（助手与平台同名，既脱离 `Everflow` 公司品牌，也保持独立产品辨识度）。 |
-| **决策 3** | 投研知识层、三情景赔率卡与发布审校是否保留在核心版 | **推荐：保留**。这套投研工作流纯运行在容器与数据库内，是核心产品差异化价值；把固定收益门槛保留为可配参数，审校模型改为自动适配客户已配模型。 |
-| **决策 4** | 公开美股财报工具 `dalton_sec` 的归属 | **推荐：从专有包 `plugins/dalton_data/` 拆入独立开源包 `plugins/dalton_sec/`（Apache-2.0 许可证）并随核心安装默认启用**，让客户开箱即有免费的美股财报核验能力。 |
-| **决策 5** | 对外交付时是否用打包脚本物理剔除专有目录 | **推荐：同意**。开发主仓保持全量代码同源维护；对外交付时通过脚本导出纯净发行包，剥离 `plugins/dalton_data/`、宿主机桥接及 Everflow 内部运维脚本。 |
+| **已定 1** | 登录方案 | 核心安装默认使用自带本地账号（`DALTON_AUTH_MODE=local`）；Everflow 继续使用 Supabase（`DALTON_AUTH_MODE=supabase`）；企业 OIDC（OpenID Connect，开放身份认证单点登录协议）留待后续阶段按需追加。 |
+| **已定 2** | 默认品牌 | 核心安装默认品牌名为 **`Dalton`**，客户可通过环境变量 `BRAND_NAME` 自定义修改。 |
+| **已定 3** | 投研核心骨架 | 完整保留投研知识层（`knowledge`）、三情景估值卡（`underwriting`）和正式发布审校（`publish`），单模型部署下审校自动复用客户已配模型并记录单家族模式。 |
+| **已定 4** | `dalton_sec` 财报插件 | 将公开美股财报工具 `dalton_sec` 拆为独立开源插件 `plugins/dalton_sec/`（`Apache-2.0` 许可证）并在核心安装默认开启，同时兼容现有的按插件包禁用记录。 |
+| **已定 5** | 交付导出干净包 | 主仓库始终只维护一套代码；对外交付与盲测统一通过打包脚本按允许清单选择源码文件与构建产物，零独立补丁维护成本。 |
+| **已定 6** | 主仓库保持公开 | 主仓库保持公开状态，GitHub Actions 照常使用公开托管运行器且零读取仓库 Secrets（机密变量）。如实记录：公开仓库与 Git 历史中本来就包含专有源码，打包脚本只决定客户交付物与发行镜像里带哪些内容。 |
 
 ---
 
@@ -40,386 +46,383 @@
 
 ### 1.0 代码规模核对基线（基于 `fb8f2bdaa` 实测）
 
-经对当前分支源码重新统计，关键规模指标如下：
-
-- **Dalton 独占目录规模**：`src/dalton/` 共 **315 个文件**（22 个子目录与 24 个顶层模块）；`plugins/dalton/` 共 **347 个文件、51 份 `SKILL.md`**；`plugins/dalton_data/` 共 **5 个文件**；`scripts/dalton/` 共 **258 个文件、14 份 `launchd` 服务配置（`.plist` / `.plist.template`）**；`integrations/dalton-channel-gateway/` 共 **109 个文件**；前端 `web/` 下带 Dalton 或 Monitor 命名的文件共 **119 个**（含 `web/src/pages/Settings/panels/dalton/` 42 个、`web/src/lib/dalton/` 13 个、`web/src/components/dalton/` 7 个）。
+- **Dalton 独占目录规模**：`src/dalton/` 共 **315 个文件**（22 个子目录与 24 个顶层模块）；`plugins/dalton/` 共 **347 个文件、51 份 `SKILL.md`**；`plugins/dalton_data/` 共 **5 个文件**；`scripts/dalton/` 共 **258 个文件、14 份 `launchd`（macOS 系统后台常驻与定时调度服务）配置（`.plist` / `.plist.template`）**；`integrations/dalton-channel-gateway/` 共 **109 个文件**；前端 `web/` 下带 Dalton 或 Monitor 命名的文件共 **119 个**（含 `web/src/pages/Settings/panels/dalton/` 42 个、`web/src/lib/dalton/` 13 个、`web/src/components/dalton/` 7 个）。
 - **宿主机桥接单文件体量**：`scripts/dalton/researchdata_bridge.py` 当前共 **26,636 行**。
-- **上游文件挂载点（`DALTON-HOOK`）**：全仓共 **1,068 个文件、5,425 个匹配行**；与上游共同祖先 `e524325a9` 的文件交集为 **891 个上游文件、4,921 个匹配行**（分目录：`web/` 380 文件 / 2,043 行，`src/server/` 172 文件 / 1,268 行，`tests/` 149 文件 / 485 行，`src/ptc_agent/` 106 文件 / 665 行，`src/tools/` 30 文件 / 187 行，`other` 20 文件 / 60 行，`src/data_client/` 14 文件 / 89 行，`plugins/` 12 文件 / 65 行，`src/llms/` 8 文件 / 59 行）。`scripts/dalton/check_hooks.sh` 的 `ALLOWED_HOOKS` 白名单登记了 **182 个**钩子 ID，非文档源码实际引用 **181 个**（本克隆本地 `upstream/main` 领先共同祖先 **18** 个提交，Dalton 分支领先 **1,370** 个提交）。
-- **数据库双迁移链**：上游 `migrations/versions/*.py` 共 **146 个脚本**（最新版本号 `147`）；Dalton `src/dalton/migrations/versions/*.py` 共 **43 个脚本**（`d001`–`d044`，无 `d034`），其中 **6 个迁移直接新增或修改了上游表的列、约束或索引**，另有 **1 个迁移向上游密钥表写入记录并外键引用上游表**。
+- **上游文件挂载点（`DALTON-HOOK`，Dalton 在上游源码中标注的差异挂载点注释）**：全仓共 **1,068 个文件、5,425 个匹配行**；与上游共同祖先 `e524325a9` 的文件交集为 **891 个上游文件、4,921 个匹配行**（分目录：`web/` 380 文件 / 2,043 行，`src/server/` 172 文件 / 1,268 行，`tests/` 149 文件 / 485 行，`src/ptc_agent/` 106 文件 / 665 行，`src/tools/` 30 文件 / 187 行，`other` 20 文件 / 60 行，`src/data_client/` 14 文件 / 89 行，`plugins/` 12 文件 / 65 行，`src/llms/` 8 文件 / 59 行）。`scripts/dalton/check_hooks.sh` 的 `ALLOWED_HOOKS` 白名单登记了 **182 个**钩子 ID，非文档源码实际引用 **181 个**（本克隆本地 `upstream/main` 领先共同祖先 **18** 个提交，Dalton 分支领先 **1,370** 个提交）。
+- **数据库双迁移链**：上游 `migrations/versions/*.py` 共 **146 个脚本**（头节点 `147`）；Dalton `src/dalton/migrations/versions/*.py` 共 **43 个脚本**（`d001`–`d044`，缺省 `d034` 号，非线性段为 `d031 -> d035 -> d036 -> d032 -> d033 -> d037..d044`）。其中 **6 个迁移直接新增或修改了上游表的列、约束或索引**（`d004`、`d020`、`d035`、`d041`、`d042`、`d043`），**1 个迁移（`d038`）外键引用上游 `share_links(artifact_id)` 并向上游 `server_keys` 表写入记录**，另有 **3 个迁移的自有表外键引用上游 `workspaces` 表**（`d018`、`d028` 为级联删除，`d030` 为置空）。
+- **公开仓库现状说明**：当前公开 GitHub 仓库及历史提交中已存在标注 `Proprietary`（专有）的 `plugins/dalton_data/plugin.json`、桥接源码与含内部账号的历史脚本；本设计保持公开仓库开发与无密钥 CI 运行，通过打包脚本严格控制对外交付包和发行容器镜像的文件范围。
 
-以下按 6 个维度逐项列出耦合位置、现有职责及核心安装的处理方式（处理标签统一分为：**没装时隐藏**、**改成可配置**、**核心剥离/停用**、**拆包保留**、**留到第 ②/③ 阶段插件化**）。
+以下按 6 个维度列出具体耦合项、现状代码行号与核心安装处理方式（分类标签：**没装时隐藏**、**改成可配置**、**核心剥离/停用**、**拆包保留**、**留到第 ②/③ 阶段插件化**）。
 
 ### 1.1 宿主机桥接程序及依赖它的工具、路由与定时任务
 
 | 位置（文件:行号 或目录） | 当前用途与本机耦合点 | 核心安装处理方式 |
 |---|---|---|
-| `scripts/dalton/researchdata_bridge.py:1-26636`（HTTP〔超文本传输协议〕路由分发位于 `:25375-26135`） | 运行在 Mac 宿主机 `127.0.0.1:8960` 的巨石守护进程。除 `/mcp`（`:25456`）商业研究检索外，同时承载 `/embed`（`:25375,:25626` 向量嵌入）、`/jobs/ops`（`:25645` 宿主机备份/看门狗状态）、`/notify`（`:25659` 卡片推送）、`/wiki/ingest`（`:25679`）、`/sales-notes/ingest`（`:25703`）、`/feishu/*`（`:25728` 飞书文档与知识库代理）、`/transcriptions/*`（`:25773` 火山引擎 Seed-ASR〔Automatic Speech Recognition，自动语音识别〕转写）、`/internal/market-digest/*`（`:25384,:25894-25927`）、`/internal/ai-finance/*`（`:25388-25392,:25958-26051`）及 `/internal/data-tasks/host-run`（`:26129` 宿主机定时任务执行）。 | **核心剥离/停用 + 留到第 ② 阶段拆分**：核心安装仅启动 Linux 容器内服务；所有指向 `:8960` 的客户端入口通过统一能力开关按配置启停，默认保持静默关闭。 |
-| `plugins/dalton_data/mcp.json:4-23`、`plugins/dalton_data/plugin.json:9-23` | 整包许可证标为 `Proprietary`（专有），同时声明了两台 MCP（Model Context Protocol，模型上下文协议）服务器：`researchdata`（HTTP 连接 `${DALTON_RESEARCHDATA_URL}`）和 `dalton_sec`（stdio〔标准输入输出本地子进程通道〕服务器，调用公开美国证监会 SEC EDGAR 接口提取 XBRL〔可扩展商业报告语言〕财报数据）。当 `DALTON_RESEARCHDATA_URL` 为空时，`src/server/app/setup.py:950-959` 会启动 `mcp-builtin-reconnect` 后台协程持续尝试重连。 | **拆包保留 + 没装时隐藏**：将 `dalton_sec` 迁入独立开源插件目录 `plugins/dalton_sec/`（`Apache-2.0`）并在核心安装默认开启；`plugins/dalton_data/` 仅保留 `researchdata`，在 `src/ptc_agent/config/plugins.py:268-330` 按能力开关筛选加载，核心安装直接跳过登记。 |
-| `scripts/dalton/research_runtime/`（含 `scripts/data_gateway.py:39-97`、`scripts/research_library.py:38`、`scripts/guidepoint_mcp_oauth.py:1`、`skills/company-wiki/scripts/company_wiki_cli.py:87`、`scripts/tmtb_alphaengine_sync.py:4`、`scripts/sales_notes_store.py:1`、`scripts/funda_ai.py:43`） | 宿主机研究数据子系统：AlphaEngine MCP（`127.0.0.1:8950`，依赖 macOS 钥匙串 `security` 命令与桌面客户端登录态，见 `docs/dalton/OPERATIONS.md:168,192`）、Guidepoint 代理（`127.0.0.1:8943` 与本地 OAuth〔开放授权〕回调 `:8942`）及本地 SQLite（轻量单文件数据库）四库检索。 | **留到第 ②/③ 阶段插件化**：核心安装跳过该目录；第 ② 阶段起按“客户自带供应商授权”拆为独立可选连接器。 |
-| `integrations/dalton-channel-gateway/`（109 个文件）与 `src/dalton/settings.py:1071-1101`、`src/dalton/app/channels_router.py:43-46`、`src/dalton/notify/dispatch.py:43` | 运行在宿主机 `127.0.0.1:8962` 的 TypeScript 多渠道网关，处理飞书卡片/群聊、Discord 私信/频道与个人微信 iLink 扫码接入。 | **没装时隐藏 + 留到第 ③ 阶段插件化**：核心安装默认关闭渠道网关能力，仅在启用对应渠道时渲染前端绑定卡片与通知目标选择器；渠道容器化放到第 ③ 阶段。 |
-| `src/dalton/tools/__init__.py:78-362` 及对应工具模块（`feishu_tools.py:69`、`wiki_tools.py:225`、`ingest_tools.py:72`、`market_digest_tools.py`、`ai_finance_*_tools.py`、`podcast_weekly_tools.py`、`notify_tools.py`、`automation_report_tools.py`、`report_delivery_tools.py`） | 当前 `build_dalton_tools()` 在 `settings.enabled=True` 时，直接向主智能体挂载 `ingest_company_wiki`（`:225,:315`）、`ingest_sales_note` / `ingest_research`（`:239,:328`）和 5 个 `feishu_*` 工具（`:150-156`），并对内部成员挂载 `market_digest_*`、`ai_finance_*`、`podcast_weekly_*`、`dalton_notify_settings` 等内部桥接工具（`:78-149`）。其中 `prepare_transcription`（`:258,:348`）已实现按开关挂载。 | **没装时隐藏**：参照 `is_transcription_enabled()` 的做法，把所有桥接与渠道工具绑定到统一能力注册表，仅在对应能力启用时挂载到智能体工具列表。 |
-| `src/dalton/services/transcriptions.py:66,910` 与 `src/server/app/setup.py:909-919` | 录音转写后台 5 分钟对账协程与票据签发服务，依赖 MinIO（开源对象存储服务）与宿主机桥接 `/transcriptions/*` 转发火山 Seed-ASR。 | **没装时隐藏**：核心安装默认关闭 `transcription` 能力，跳过 `setup.py:915` 协程启动、隐藏 `/transcribe` 技能与 `prepare_transcription` 工具。 |
-| `src/dalton/data_jobs/manifest.yaml:1-1070`（42 项任务：7 项 `runner: "host"`、35 项 `runner: "container"`）、`host_runner.py:1`、`container_runner.py:34`、`src/server/app/setup.py:921-931` | 确定性定时数据任务层：宿主机任务含 SSH（Secure Shell，远程安全登录协议）远程触发 Windows 机器拉取 Bloomberg 数据（`T1`/`T29`，`:5-26`）、Token 周报（`T61`）等；容器任务把 `var/dalton/openclaw-data` 挂载到容器内 `/Users/everflow/.openclaw/workspace` 跑内部看板脚本。 | **没装时隐藏**：核心安装将 `data_jobs.enabled` 默认设为 `false`，`setup.py:927` 跳过启动调度循环，设置页与自动化页隐去预设脚本任务。 |
-| `src/dalton/monitors/data_job_registry.py:28-39` 与 `scripts/dalton/monitor_feeds/run_feeds.py` | 将 6 项内部数据任务（情绪看板、A 股盘中、港股动量等）绑定到监控面板自动发布，并由宿主机 `FeedDaemon` 60 秒轮询写入实时快照。 | **拆包保留 + 没装时隐藏**：保留监控面板平台（`src/dalton/monitors/`）供客户发布工作区生成的交互式 HTML 看板（核心安装默认开启 `artifact_publishing.enabled: true`）；当 `data_jobs` 未安装时隐藏内部数据任务绑定项。 |
-| `src/dalton/data_map/health.py:1-102` 与 `src/server/app/setup.py:900-907` | 后端启动时自动触发 `run_startup_health_check_once()`，探测桥接 `researchdata` 全部子路由、`x_search`、`dalton_conversation_cards` 等健康态。 | **改成可配置 + 没装时隐藏**：健康检查改为仅探测能力注册表中“已启用”的数据源（核心安装只探测行情接口、`dalton_sec` 与客户已配的网页搜索）。 |
+| `scripts/dalton/researchdata_bridge.py:1-26636`（HTTP〔Hypertext Transfer Protocol，超文本传输协议〕路由分发位于 `:25375-26135`） | 运行在 Mac 宿主机 `127.0.0.1:8960` 的守护进程，承载 `/mcp`（`:25456` 商业研究检索）、`/embed`（`:25375,:25626` 向量嵌入）、`/jobs/ops`（`:25645` 宿主机备份与看门狗状态）、`/notify`（`:25659` 卡片推送）、`/wiki/ingest`（`:25679`）、`/sales-notes/ingest`（`:25703`）、`/feishu/*`（`:25728` 飞书代理）、`/transcriptions/*`（`:25773` 火山 Seed-ASR〔Automatic Speech Recognition，自动语音识别〕转写）、`/internal/market-digest/*`（`:25384,:25894-25927`）、`/internal/ai-finance/*`（`:25388-25392,:25958-26051`）及 `/internal/data-tasks/host-run`（`:26129`）。且 `src/dalton/settings.py:1057-1068,1173-1174` 在未显式配置 URL 时会自动回退合成 `http://<host>:8960`。 | **核心剥离/停用 + 留到第 ② 阶段拆分**：核心安装把桥接默认 URL 改为空字符串 `""`，所有客户端调用前先查统一能力开关，默认静默关闭；对外交付包与核心镜像剔除该文件。 |
+| `plugins/dalton_data/mcp.json:4-23`、`plugins/dalton_data/plugin.json:9-23`、`src/ptc_agent/config/file_utils.py:41-65`、`src/server/app/setup.py:948-959` | 整包标为 `Proprietary`，同时捆绑了 `researchdata`（HTTP 连接 `${DALTON_RESEARCHDATA_URL}`）和 `dalton_sec`（stdio〔标准输入输出本地子进程通道〕服务器，调用公开 SEC EDGAR〔美国证券交易委员会企业电子信息披露系统〕提取 XBRL〔可扩展商业报告语言〕财报事实）。当环境变量缺失时，`substitute_env_vars()`（`file_utils.py:41-65`）保留原字面量 `${DALTON_RESEARCHDATA_URL}`，导致启动连接失败进入 `booted_registry.failed_builtin_remote`，进而触发 `setup.py:948-959` 启动 `mcp-builtin-reconnect` 后台重连循环。 | **拆包保留 + 没装时隐藏**：将 `dalton_sec` 迁入独立开源插件 `plugins/dalton_sec/`（`Apache-2.0`）并在核心安装默认开启，同时在 `src/server/services/plugins/bundled.py:217-246` 兼容原有的按包禁用记录；在合并后有效 MCP 配置（`src/ptc_agent/config/utils.py:240-255`）与插件目录（`bundled.py:58-113,327-346`）两处同步过滤未装服务。 |
+| `scripts/dalton/research_runtime/`（含 `scripts/data_gateway.py:39-97`、`scripts/research_library.py:38`、`scripts/guidepoint_mcp_oauth.py:1`、`skills/company-wiki/scripts/company_wiki_cli.py:87`、`scripts/tmtb_alphaengine_sync.py:4`、`scripts/sales_notes_store.py:1`、`scripts/funda_ai.py:43`） | 宿主机研究数据子系统：AlphaEngine MCP（`127.0.0.1:8950`，依赖 macOS 钥匙串 `security` 命令与桌面客户端登录态，见 `docs/dalton/OPERATIONS.md:168,192`）、Guidepoint 代理（`127.0.0.1:8943` 与本地回调 `:8942`）及本地 SQLite（轻量级单文件关系型数据库）四库检索。 | **留到第 ②/③ 阶段插件化**：核心安装跳过并从对外交付包剔除该目录；第 ② 阶段起按“客户自带授权”拆为独立连接器。 |
+| `integrations/dalton-channel-gateway/`（109 个文件）与 `src/dalton/settings.py:1071-1101`、`src/dalton/app/channels_router.py:43,1031`、`src/dalton/notify/channel_transport.py:27-28,159,490`、`src/dalton/notify/dispatch.py:31-42` | 宿主机 `127.0.0.1:8962` 的 TypeScript 渠道网关（飞书、Discord、微信 iLink）；`channels_router.py:1031` 与 `settings.py:1071-1101` 在缺省时回退到 `http://127.0.0.1:8962`。 | **没装时隐藏 + 留到第 ③ 阶段插件化**：核心安装将渠道网关默认地址改为空字符串并关闭渠道能力；直接访问 `/channels/*`、`/notify/test`（`src/dalton/app/router.py:2575`）与 `/feishu/*`（`router.py:2413`）统一返回能力未启用状态码。 |
+| `src/dalton/tools/__init__.py:78-362` 及具体工具工厂（`feishu_tools.py:423`、`wiki_tools.py:484`、`ingest_tools.py:72`、`issue_tools.py`、`market_digest_tools.py`、`ai_finance_*_tools.py`、`podcast_weekly_tools.py`、`notify_tools.py`、`automation_report_tools.py`、`report_delivery_tools.py`） | `build_dalton_tools()` 在 `settings.enabled=True` 时挂载 `ingest_company_wiki`（`__init__.py:225,315`）、`ingest_sales_note` / `ingest_research`（`:239,328`）、5 个 `feishu_*` 工具（`:150-156`）、内部问题上报 `report_issue`（`:158-162`）以及 `market_digest_*`、`ai_finance_*`、`podcast_weekly_*`、`dalton_notify_settings` 等桥接工具（`:78-149`）。 | **没装时隐藏**：将全部工具（含 `report_issue`）收敛到声明式能力映射表，仅在对应能力启用时挂载进智能体工具列表。 |
+| `src/dalton/services/transcriptions.py:66,2543-2571,2688` 与 `src/server/app/setup.py:909-919`、`src/dalton/app/transcriptions.py` | 录音转写 5 分钟对账循环（间隔常量在 `:66`，开关判定 `is_transcription_reconciliation_enabled` 在 `:2560`，主循环 `run_transcription_reconciliation_loop` 在 `:2688`），依赖专用对象存储与桥接 `/transcriptions/*`。 | **没装时隐藏**：转写能力显式依赖 `researchdata_bridge` 与转写存储配置；核心安装默认关闭，跳过 `setup.py:915` 协程启动、隐藏相关技能/工具并拦截转写路由。 |
+| `src/dalton/data_jobs/manifest.yaml:1-1070`（清单共 42 项任务：7 项 `runner: "host"`、35 项 `runner: "container"`；单项数据库初始状态见 `d029_data_tasks.py:64-66` 默认 `enabled: false`）、`runner_wrapper.py:44,322`、`container_runner.py:48,54-58,192`、`src/server/app/setup.py:921-931`、`src/dalton/app/router.py:1944` | 确定性定时数据任务调度器（`dalton.yaml:41` 默认开启总调度开关 `data_jobs.enabled: true`）：宿主机任务含 SSH（Secure Shell，远程安全登录协议）触发外部机器拉取 Bloomberg 数据；容器任务使用 `runner_wrapper.py:44` 定义的 `/Users/everflow/.openclaw/workspace` 工作目录与 `container_runner.py:192` 的 `HOME=/Users/everflow`。 | **没装时隐藏**：核心安装在 `dalton.core.yaml` 将 `data_jobs.enabled` 设为 `false`，跳过 `setup.py:927` 调度循环，拦截 `POST /system-jobs/{key}/run`（`router.py:1944`），隐藏预设数据任务视图；Everflow 保持总开关开启且单项沿用数据库既有启停状态。 |
+| `src/dalton/monitors/data_job_registry.py:28-39`、`scripts/dalton/monitor_feeds/run_feeds.py`、`src/dalton/dalton.yaml:26` | 将 6 项内部数据任务绑定到监控面板自动刷新，`dalton.yaml:26` 提交的 `artifact_publishing.enabled` 代码默认值为 `false`（Everflow 现网通过环境变量开启）。 | **拆包保留 + 没装时隐藏**：保留监控面板能力供客户发布工作区生成的交互式 HTML（HyperText Markup Language，超文本标记语言）看板；`dalton.yaml` 基准默认值保持 `false` 不动，仅在 `dalton.core.yaml` 中设为 `true`，且当 `data_jobs` 关闭时隐藏内部数据任务绑定源。 |
+| `src/dalton/data_map/health.py:1343` 与 `src/server/app/setup.py:900-907` | 后端启动时调用 `run_startup_health_check_once()`（`health.py:1343`），探测桥接子路由、`x_search` 与对话归档表健康态。 | **改成可配置 + 没装时隐藏**：启动体检仅探测当前能力注册表中已启用的数据源。 |
 
-### 1.2 launchd 定时任务、看门狗、备份与部署脚本
-
-| 位置（文件:行号 或目录） | 当前用途与本机耦合点 | 核心安装处理方式 |
-|---|---|---|
-| `scripts/dalton/launchd/*.plist.template`（6 份）、`scripts/dalton/ops/launchd/*.plist.template`（3 份）、`scripts/dalton/ops/prod/launchd/*.plist.template`（4 份）、`scripts/dalton/monitor_feeds/com.dalton.monitor-feeds.plist`（1 份），共 **14 份** | macOS 专用的 `launchd`（macOS 系统后台常驻与定时调度服务）配置，托管 Colima 虚拟机、桥接、渠道网关、AlphaEngine、Guidepoint、用量采集、看门狗与三层备份，且依赖宿主机系统时区为 `Asia/Shanghai`。 | **核心剥离/停用**：原样保留在 `scripts/dalton/` 供 Everflow 安装继续使用；Linux 核心安装直接依靠 Docker Compose（多容器编排工具）的 `restart: unless-stopped` 与容器内置 `healthcheck` 实现进程自愈。 |
-| `scripts/dalton/ops/prod/deploy_main.sh:1-73`、`wait_backend_idle.sh`、`watchdog.sh`、`colima_launch.sh`、`portwatch.sh` | Everflow 生产发布与巡检脚本：写死快进合并 `origin/dalton/main`、归档日志到 `~/Library/Logs/Dalton/containers`（`:16`）、调用 `launchctl` 触发 `com.dalton.pg-backup`、强制前端带 `--require-supabase` 构建（`:62`）。 | **核心剥离 + 新增通用脚本**：原脚本不动以保护 Everflow 生产发布；面向 Linux 客户新增 `scripts/standalone/{init,upgrade,backup,restore}.sh` 标准脚本集。 |
-| `scripts/dalton/ops/dalton_config_git_backup.sh`、`dalton_db_offsite.sh`、`dalton_data_backup.sh`（见 `docs/dalton/OPERATIONS.md:341-345,413`） | 三层异地灾备：强依赖外置固态盘 `/Volumes/EveSSD` 生成 SQLite 快照、`rclone` 上传 Google Drive `DaltonBackup/` 以及推送私人 GitHub 配置仓库。 | **核心剥离 + 新增通用脚本**：核心安装提供无路径绑定的 `scripts/standalone/backup.sh`（导出一致性 PostgreSQL `.dump` 与对象存储归档到指定本地目录或兼容 S3〔Simple Storage Service，通用对象存储接口〕存储桶）。 |
-| `scripts/dalton/docker_build_backend.sh:12-25`、`scripts/dalton/Dockerfile.dalton:89-105` | 构建后端镜像时强制校验宿主机 `git rev-parse` 注入 `BUILD_GIT_SHA` / `BUILD_GIT_DIRTY`，并扫描绑定挂载目录生成 `/app/.build_files.sha256` 指纹供 `/api/v1/dalton/openclaw/health` 核验。 | **改成可配置**：核心安装采用自包含生产镜像（代码打入镜像内，无需宿主机挂载 `./src`），支持在构建时自动填入版本标签，脱离客户端宿主机 Git 工作树。 |
-| `scripts/dalton/build_frontend_prod.sh:14-44` | 默认加载 `web/.env.dalton`（注入 `Everflow` 品牌）并在 `--require-supabase` 下校验 Supabase 变量，同时构建静态帮助站 `docs-site/` 到 `web/dist/help/`。 | **改成可配置**：在核心安装的容器化多阶段构建中直接编译前端静态包，按客户 `.env` 注入品牌名与认证模式，无需客户宿主机安装 Node.js 或 `pnpm`。 |
-
-### 1.3 写死的路径、账号、固定 ID、域名、品牌与模型账号
+### 1.2 `launchd` 定时任务、看门狗、备份与部署脚本
 
 | 位置（文件:行号 或目录） | 当前用途与本机耦合点 | 核心安装处理方式 |
 |---|---|---|
-| `/Users/everflow/.openclaw/workspace`（`src/dalton/data_jobs/manifest.yaml` 56 处、`container_runner.py:34`、`runner_wrapper.py`、`d029_data_tasks.py`、`scripts/dalton/data_assets/scripts/sentiment_dashboard_digest.sh:11`） | 早期 OpenClaw 迁移遗留的工作目录路径，容器内通过挂载把 `var/dalton/openclaw-data` 映射到该 Mac 用户路径。 | **没装时隐藏 + 改成可配置**：核心安装关闭 `data_jobs` 后不触发任何该路径挂载；同时把 `manifest.py` 默认工作目录提取为环境变量可覆盖常量。 |
-| `/opt/homebrew/bin/*` 与 `~/Library/*`（`scripts/dalton/Dockerfile.dalton:62-64`、`scripts/dalton/ops/*`、`scripts/dalton/researchdata_bridge.py` 等 60 余处脚本引用） | macOS Homebrew 二进制路径与用户目录（日志、缓存、用量 SQLite 账本 `~/Library/Application Support/Everflow/...`）。 | **核心剥离/改成可配置**：核心容器镜像使用标准 `/app/.venv/bin/python` 与容器卷 `/app/var/dalton`；宿主机专属脚本仅在 Everflow 安装运行。 |
-| `src/dalton/company_identity.py:18-20`（`COMPANY_SYSTEM_USER_ID = "system:dalton-company"`、`company-system@dalton.internal`、`Dalton Company System`） | 公司级共享自动化任务的非人类系统属主行（在迁移 `d035:204` 写入 `automations_company_owner_check` 约束，且 `reject_company_system_auth` 禁止外部令牌登录该账号）。 | **保留内部标识 + 显示名可配置**：`system:dalton-company` 是纯内部数据库主键且禁止外部登录，保留该内部键值可完全兼容 `d035` 约束；将展示名称改为跟随客户 `BRAND_NAME`。 |
-| `DALTON_PM_USER_IDS`（`src/dalton/settings.py:418,456-473`、`src/dalton/credentials.py:60`、`src/dalton/autonomy/system_jobs.py:105-121`） | 通过 `.env` 逗号分隔写死管理员 UUID（通用唯一识别码），且 `DALTON_PM_USER_IDS[0]` 作为全团队模型凭据唯一持有人。新部署若沿用此机制，会出现“必须先建用户查到 UUID → 再改 `.env` 重建容器”的鸡生蛋死锁。 | **改成数据库动态驱动（兼容环境变量）**：将管理员判定与团队凭据持有人解析改为**数据库 `dalton_members(tier='admin')` ∪ `DALTON_PM_USER_IDS`**；首个管理员在网页引导创建时自动写入数据库并成为默认凭据持有人，Everflow 现有环境变量配置无缝兼容。 |
-| `SEC_USER_AGENT` 兜底值（`src/dalton/settings.py:1177-1183`） | 未配 `SEC_USER_AGENT` 与 `EDGAR_IDENTITY` 时，默认回退到 `"DaltonResearch research@everflowinv.com"`。 | **改成可配置**：`init.sh` 引导用管理员邮箱自动生成合规 `SEC_USER_AGENT`（如 `<Brand> <admin_email>`）；代码兜底改为中性占位并在启动日志提示配置，杜绝向美国证监会发送 Everflow 邮箱。 |
-| 历史一次性运维/实机脚本中的固定 ID（`scripts/dalton/migrate_owner_identity.py:54-55` `richard.lu@everflowinv.com`、`rebind_workspaces_to_primary.py:87-88` 主计算机 UUID、`realrun/_common.py:58-63` 四个公司工作区 UUID） | 单用户时期向 Supabase 迁移及内部实机验收专用脚本，运行期主服务不调用。 | **核心剥离**：归入内部历史运维脚本，核心安装容器与对外发行包不执行、不打包这些文件。 |
-| 邀请合成邮箱域 `team.dalton.local`（`src/dalton/settings.py:1257`、`web/src/config/daltonAuth.ts:15`） | 受邀成员用纯用户名注册时拼接的内部邮箱后缀。 | **改成可配置**：`init.sh` 自动将默认后缀设为 `team.<客户域名>`（本地模式支持直接用邮箱或用户名登录）。 |
-| 代理虚拟网段 `network.fake_ip_cidrs: ["198.18.0.0/15"]`（`src/dalton/dalton.yaml:52-60`） | 适配 Everflow 这台 Mac 宿主机透明代理的 Fake-IP（代理返回的虚拟占位 IP）模式，命中后会额外向 `1.1.1.1` / `dns.google` 发 DoH（DNS over HTTPS，加密域名解析）核验真实地址。 | **改成可配置**：在 `dalton.core.yaml` 中默认设为空列表 `[]`，使标准 Linux 云主机直接走系统 DNS 与常规私网防护，避免受限内网因连不上外部 DoH 而误拦正常网页抓取。 |
-| 边缘网关 `deploy/dalton/Caddyfile:1-6` 与 `scripts/dalton/check_public_edge.sh:1-25` | 假定前端流量已由宿主机 Tailscale Funnel `:8443` 终止 TLS（加密传输层），因此写死 `auto_https off` 并仅监听回环 `:8088`。 | **改成可配置**：新增 `deploy/standalone/Caddyfile`，读取客户 `.env` 的 `DOMAIN`：填入正式域名时由 Caddy（支持自动管理 HTTPS 证书的反向代理服务器）自动签发并续期 Let's Encrypt HTTPS 证书（监听 `80`/`443`）；填入 `localhost` 或内网地址时自动以 HTTP 模式启动。 |
-| 品牌与前端功能开关混绑（`web/.env.dalton`、`web/src/config/brand.ts:12-21`、`web/src/config/supportLinks.ts:40-44`、`src/ptc_agent/agent/prompts/templates/system.md.j2:1`、`src/server/app/share_pages.py:29`） | `brand.ts:21` 写死 `isDaltonBuild = BRAND_MARK === 'everflow'`，把“是否启用 Dalton 前端交互特性”和“是否显示 Everflow 商标”绑死在一起；一旦客户改掉 `VITE_BRAND_MARK`，线程权限与模型选择逻辑就会退回未适配分支。同时系统提示词首行写死 `Everflow's investment research agent`。 | **解耦品牌与特性开关**：将 `isDaltonBuild` 改为独立的构建/运行期特性标志（核心安装与 Everflow 安装均为 `true`），而视觉品牌（`BRAND_NAME`、Logo、Favicon、提示词平台名、分享降级页文案）独立读取客户配置，默认回退中性名 `Dalton`。 |
-| **【新核查出的关键阻塞点】模型配置全绑定私有 OAuth 且首次设置向导硬锁死**（`agent_config.dalton.yaml:10-25,58-66`、`src/dalton/dalton.yaml:65-81,106-120`、**`web/src/config/daltonSetup.ts:35-41,66-89,197-210`**） | 1) 后端默认主模型、子智能体、辅助模型与审稿候选列表全部写死 `*-oauth`（`claude-opus-5-5-oauth`、`gemini-4-neon-high-oauth`、`grok-4.7-oauth`、`muse-wonder-1.0-oauth`）；<br>2) **前端 `daltonSetup.ts:35-41` 的 `DALTON_SETUP_CANDIDATES` 仅列了 5 个 `-oauth` 模型，且 `:66-89` 与 `:197-210` 在找不到这 5 个 OAuth 模型时直接返回空对象 `{}` 与 `available: false`**——导致新客户哪怕填好了有效的 OpenAI / Anthropic / Gemini / DeepSeek API Key，首次进入 `/setup/default` 也会被拦死，无法完成初始化！ | **解除硬锁 + 动态跟随可用模型**：核心安装的 `agent_config.core.yaml` 与 `dalton.core.yaml` 清空预设 `*-oauth` 模型名；前端 `daltonSetup.ts` 在核心模式下当精选列表无命中时，自动回退展示客户已接通的全部支持工具调用（tool-calling）的模型（含 BYOK〔Bring Your Own Key，自带密钥〕及自定义 OpenAI 兼容网关模型）；后端辅助模型与审校模型未单独指定时自动复用客户主模型/后台模型。 |
+| `scripts/dalton/launchd/*.plist.template`（6 份）、`scripts/dalton/ops/launchd/*.plist.template`（3 份）、`scripts/dalton/ops/prod/launchd/*.plist.template`（4 份）、`scripts/dalton/monitor_feeds/com.dalton.monitor-feeds.plist`（1 份），共 **14 份** | macOS 专用 `launchd` 配置，托管 Colima 虚拟机、桥接、渠道网关、AlphaEngine、Guidepoint、用量采集、看门狗与三层备份。 | **核心剥离/停用**：原样保留供 Everflow 使用；Linux 核心安装通过 Docker Compose 的 `restart: unless-stopped` 与容器内置 `healthcheck` 自愈，并在打包产物中剔除 `.plist*`。 |
+| `scripts/dalton/ops/prod/deploy_main.sh:1-947`、`wait_backend_idle.sh`、`watchdog.sh`、`colima_launch.sh`、`portwatch.sh` | Everflow 生产发布脚本（共 947 行）：日志目录写死 `~/Library/Logs/Dalton/containers`（`:16`）、重启后端并在容器入口执行迁移（`:509`）、前端构建强制传 `--require-supabase`（`:709`、`:867`）。 | **原脚本零改动 + 新增通用脚本**：`deploy_main.sh` 一行不改；面向 Linux 客户新增 `scripts/standalone/{init,upgrade,backup,restore,package_release}.sh`。 |
+| `scripts/dalton/ops/dalton_config_git_backup.sh`、`dalton_db_offsite.sh`、`dalton_data_backup.sh`（见 `docs/dalton/OPERATIONS.md:341-345,413`） | 依赖外置盘 `/Volumes/EveSSD`、`rclone` 上传 Google Drive `DaltonBackup/` 与私有配置仓库。 | **核心剥离 + 新增通用脚本**：`scripts/standalone/backup.sh` 与 `restore.sh` 支持导出/恢复一致性 PostgreSQL 备份与 MinIO（兼容 S3 协议的开源对象存储服务）对象归档到任意指定本地目录或兼容 S3（Simple Storage Service，通用对象存储接口协议）存储桶。 |
+| `scripts/dalton/docker_build_backend.sh:12-25`、`scripts/dalton/Dockerfile.dalton:66-109` | `Dockerfile.dalton:66-81` 整目录复制 `scripts/`、`plugins/` 与 `config/dalton/`，并在构建时读取 Git 元信息生成 `/app/.build_files.sha256`。 | **复用构建定义 + 干净上下文**：复用 `Dockerfile.dalton` 与启动入口，核心发行构建以 `package_release.sh` 导出的白名单目录作为构建上下文（物理排除专有插件与内部运维脚本），支持构建参数注入版本号。 |
+| `scripts/dalton/build_frontend_prod.sh:14-44` | 默认加载 `web/.env.dalton`（`Everflow` 品牌）并在 `--require-supabase` 下校验 Supabase 变量，同时编译静态帮助站 `docs-site/` 到 `web/dist/help/`。 | **改成可配置**：核心镜像构建阶段按 `.env` 注入 `BRAND_NAME`、`VITE_DALTON_UI=true` 与 `VITE_DALTON_AUTH=local`，并编译剔除 `everflow/` 专属目录后的帮助站。 |
 
-### 1.4 默认假定专属数据源存在的提示词、skill、工具说明、设置页、自动任务模板
+### 1.3 写死的路径、账号、固定 ID、域名、品牌、存储、网络与模型策略
+
+| 位置（文件:行号 或目录） | 当前用途与本机耦合点 | 核心安装处理方式 |
+|---|---|---|
+| `/Users/everflow/.openclaw/workspace` 与 `HOME=/Users/everflow`（`src/dalton/data_jobs/runner_wrapper.py:44,322`、`container_runner.py:48,54-58,192`、`manifest.yaml` 56 处、`d029_data_tasks.py`） | 数据任务容器运行器默认将宿主机数据目录映射到 `/Users/everflow/.openclaw/workspace` 并设置 `HOME=/Users/everflow`。 | **没装时隐藏 + 改成可配置**：核心安装关闭 `data_jobs`；同时将 `runner_wrapper.py:44` 默认工作目录提取为环境变量可覆盖路径。 |
+| `/opt/homebrew/bin/*` 与 `~/Library/*`（`scripts/dalton/Dockerfile.dalton:62-64`、`scripts/dalton/ops/*`、`scripts/dalton/researchdata_bridge.py`） | macOS Homebrew 二进制路径与用户目录日志/账本路径。 | **核心剥离/改成可配置**：核心容器统一使用 `/app/.venv/bin/python` 与 `/app/var/dalton`。 |
+| `src/dalton/company_identity.py:18-20`（`system:dalton-company`） | 公司级自动化任务的非人类系统属主（受 `d035:204` 检查约束保护且禁止外部令牌登录）。 | **保留内部主键 + 显示名跟随 `BRAND_NAME`**：完全兼容 `d035` 约束。 |
+| **管理员角色、邀请与模型凭据持有人**（`src/dalton/migrations/versions/d016_members_and_invites.py:16-38`、`src/dalton/access_tiers.py:1-8,53-120`、`src/dalton/credentials.py:35-99`、`src/dalton/invites.py:144-176,357-391,689-820`、`src/dalton/autonomy/system_jobs.py:105-120`） | 1) `d016` 的 `dalton_members` 表以 `email` 为主键，仅有 `email, username, source, invited_by_user_id, created_at` 五列，无 `user_id` 也无 `tier` 列；<br>2) 管理员判定 `is_invite_pm` 只认环境变量 `DALTON_PM_USER_IDS`（UUID〔通用唯一识别码〕列表）；<br>3) `credentials.py:35-45` 在非 Supabase 模式下直接返回 `None`，开启时固定取 `DALTON_PM_USER_IDS[0]` 为凭据持有人；<br>4) `invites.py:170-176` 未配 Supabase Admin 密钥时直接返回 `503`。 | **分别独立建模 + 按认证模式隔离**：在迁移 `d045` 新增按 `users.user_id` 关联的角色表 `dalton_user_roles` 与显式单行持有人表 `dalton_credential_holder`；`local` 模式使用新表判定权限与共享凭据归属，并在本地单事务内完成邀请建号；`supabase` 模式（Everflow）原样保持 `DALTON_PM_USER_IDS` 顺序与现有凭据归属。 |
+| `SEC_USER_AGENT` 兜底值（`src/dalton/settings.py:1177-1183`） | 缺省回退 `"DaltonResearch research@everflowinv.com"`。 | **改成可配置**：`init.sh` 引导生成 `<Brand> <admin_email>`；代码兜底改为中性占位并在日志提示。 |
+| 历史一次性脚本中的内部账号与固定 ID（`scripts/dalton/migrate_owner_identity.py:54-55`、`rebind_workspaces_to_primary.py:87-88`、`realrun/_common.py:58-63`） | 历史单机迁移与内部实机脚本硬编码邮箱与工作区 UUID。 | **核心剥离**：`package_release.sh` 白名单排除这些历史脚本。 |
+| 邀请合成邮箱后缀 `team.dalton.local`（`src/dalton/settings.py:1257`、`web/src/config/daltonAuth.ts:15`） | 纯用户名受邀注册时拼接的合成域。 | **改成可配置**：`init.sh` 自动设为 `team.<客户域名>`。 |
+| 代理虚拟网段 `network.fake_ip_cidrs: ["198.18.0.0/15"]` 与时区 `Asia/Shanghai`（`src/dalton/dalton.yaml:3,52-60,91`） | 适配 Everflow Mac 宿主机透明代理 Fake-IP（虚拟占位 IP 地址）并发起外部 DoH（DNS over HTTPS，加密域名解析）校验；全局与预算日界时区固定为 `Asia/Shanghai`。 | **改成可配置**：`dalton.core.yaml` 将 `fake_ip_cidrs` 设为空列表 `[]`，时区与预算日界默认读取 `DALTON_TIMEZONE`（缺省 `UTC`）。 |
+| **自定义模型 URL 出站信任边界**（`src/server/app/api_keys.py:460-499,643-663`、`src/server/services/llm/egress.py:107-127,193-234,618-631`） | `/api/v1/keys/test` 与自定义模型发现接受登录用户提交的 `base_url`，而现有私网/回环 SSRF（Server-Side Request Forgery，服务端请求伪造）拦截仅在 `HOST_MODE=platform` 生效；核心多用户模式运行在 `HOST_MODE=oss` 下，普通成员提交内网地址会由后端直接发起请求。 | **开启多用户出站限制 + 部署者白名单**：在 `DALTON_PROFILE=core`（`DALTON_AUTH_MODE=local`）下对模型试连、发现、保存与实际推理统一启用 `llm/egress.py` 私网/元数据地址拦截，同时提供环境变量 `DALTON_OPERATOR_LLM_ENDPOINTS` 供管理员显式放行客户内网模型网关或 CI 假模型地址。 |
+| **聊天大文件对象存储与沙箱网络耦合**（`web/src/lib/dalton/chatUploadClient.ts:328`、`src/dalton/chat_upload_storage.py:25-27,61-79,128-139`、`src/ptc_agent/config/core.py:492`、`src/server/services/egress/reachability.py:45-64`、`src/server/services/livefs/mount.py:350`） | 聊天分片由浏览器上传至后端 `/api/v1/dalton/chat-uploads/*`，后端写入对象存储并签发沙箱下载 URL，但 `chat_upload_storage.py` 当前直接复用语音转写的 `DALTON_ASR_STORAGE_*` 配置；同时沙箱默认运行在 Docker `bridge` 网络，通过宿主机网关与 `EGRESS_RELAY_BASE_URL` 回连后端与 LiveFS（向沙箱挂载实时文件的虚拟文件系统服务）。 | **解耦存储配置 + 明确三视角网络**：`chat_upload_storage.py` 优先读取独立的 `DALTON_CHAT_UPLOAD_STORAGE_*`（Everflow 未设时回退 `DALTON_ASR_STORAGE_*`），启动时自动初始化存储桶，保留后端分片上传；明确配置浏览器、后端、沙箱三套可达地址并隔离沙箱对数据库/Redis/`docker.sock` 的访问。 |
+| 边缘网关 `deploy/dalton/Caddyfile:1-6,64-75` | 假定前置 Tailscale Funnel 终止 TLS（Transport Layer Security，传输层加密协议），配置 `auto_https off` 并仅监听 `:8088`。 | **改成可配置**：新增 `deploy/standalone/Caddyfile`，公网与企业内网多用户部署统一启用 HTTPS（Caddy〔支持自动管理 HTTPS 证书的反向代理服务器〕自动签发证书或加载内网证书），纯 HTTP 试用仅绑定本机回环 `127.0.0.1:8088`。 |
+| 品牌与前端特性标志混绑（`web/src/config/brand.ts:12-21`、`src/ptc_agent/agent/prompts/templates/system.md.j2:1`、`src/server/app/share_pages.py:29`） | `brand.ts:21` 写死 `isDaltonBuild = BRAND_MARK === 'everflow'`；若直接改成必填新变量，Everflow 现网 `deploy_main.sh:709,867` 在未改构建环境时会丢失 Dalton 界面分支。 | **向后兼容解耦**：新增 `VITE_DALTON_UI`，缺省未设置时保持 `BRAND_MARK === 'everflow'` 为 `true`（`deploy_main.sh` 零改动），核心镜像构建时显式注入 `VITE_DALTON_UI=true` 与 `BRAND_NAME`（默认 `Dalton`）。 |
+| **私有 OAuth 模型目录、首次引导锁定与单模型正式发布拦截**（`src/dalton/llm/overlay.py:20-35`、`agent_config.dalton.yaml:10-24,58-66`、`web/src/config/daltonSetup.ts:35-41,66-89,197-210`、`src/dalton/publish/review.py:224-256,345-396`、`src/dalton/publish/audit.py:1548-1549`） | 1) `overlay.py:20-35` 无条件把 `native_overlay.json`（含 `grok-4.7-oauth` 等）合并进模型目录；<br>2) `daltonSetup.ts:35-41` 的 `DALTON_SETUP_CANDIDATES` 固定写死 5 个模型（`gemini-4-neon-high-oauth`、`gemini-4-carbon-medium-oauth`、`claude-opus-5-5-oauth`、`gpt-6.2-astra-oauth`、`gpt-6.2-sol-oauth`；另有 `grok-4.7-oauth` 与 `muse-wonder-1.0-oauth` 位于 `agent_config.dalton.yaml:18-24,58-66`），无命中时 `:66-89` 与 `:197-210` 返回空目录和 `available: false`；<br>3) 正式发布在 `publish/review.py:345-386` 遇到单一厂商家族或自定义网关 `family_of() == "unknown"` 时返回 `status="unavailable"`，数字核验在 `publish/audit.py:1548-1549` 缺少独立 `audit_model` 时直接抛错。 | **全链路打通 BYOK（Bring Your Own Key，客户自带模型密钥）**：核心模式关闭 `native_oauth_sync` 时跳过 `*-oauth` 私有目录注入；`daltonSetup.ts` 在精选列表为空时自动展示客户已接通且支持工具调用的全部模型；`assist`、`audit`、`language` 与 `publish/review.py` 共享同一有效模型解析器，单家族或 `unknown` 家族时复用客户已配主模型完成审校并在发布记录写入 `review_mode: "single_family" \| "unknown_family"`（Everflow 维持异族审稿）。 |
+
+### 1.4 默认假定专属数据源存在的提示词、技能正文、工作流、设置页、帮助站与任务模板
 
 | 位置（文件:行号 或目录） | 当前用途与专属假设 | 核心安装处理方式 |
 |---|---|---|
-| 系统提示词工具指南 `src/ptc_agent/agent/prompts/templates/components/tool_guide.md.j2:23-35` 与加载器 `src/ptc_agent/agent/prompts/loader.py:132-150` | 无条件向系统提示词写入“研究服务提供卖方、专家、管理层原话和内部笔记”、“大盘问题先查 `macro(route="market-regime")`”，并每次注入 `<data_map>`。 | **没装时隐藏**：上述段落按能力注册表条件渲染；未装 `researchdata_bridge` 时，提示词只保留通用金融工具、公开 SEC、网页搜索与代码沙箱指引。 |
-| 数据地图配置与渲染器 `src/dalton/data_map/sources.yaml:12-151`、`src/dalton/data_map/builder.py:300-360,472-490` | 缓存未命中或无桥接时，静态回退逻辑会把 `alphaengine`、`guidepoint`、`transcript`、`company-wiki`、`sales-notes`、`tmtb`、`funda-ai`、`gcal` 等 18 条内部路由全部标成 `未体检` 拼进提示词，误导模型去调用不存在的 `tools.researchdata`。 | **没装时隐藏**：在 `sources.yaml` 为每条路由标注所需 `capability`；`builder.py` 渲染前先过滤掉未安装能力的路由与第 2 节标题，确保未装的数据源在 `<data_map>` 中零出现。 |
-| 51 项内置技能 `plugins/dalton/skills/*` 与注册表 `src/ptc_agent/agent/middleware/skills/dalton_registry.py:70-166` | 51 个技能中，约 22 个是强绑内部数据源或特定分析师个人的定时简报技能（如 `dalton-ai-finance-daily`、`dalton-market-digest`、`dalton-tmeet-weekly-minutes`、`dalton-richard-earnings`、`dalton-richard-coverage-weekly`、`dalton-mark-weekly-newenergy`、`dalton-wiki-auto-ingest`、`dalton-podcast-weekly`、`dalton-transcript-polish` 等）；核心方法论 `plugins/dalton/skills/dalton-conventions/SKILL.md:75-94` 还写入了 Everflow 内部对专家访谈/Guidepoint 的合规放行声明（“2026-10-18 owner 确认可用、Guidepoint ≤20 词”）和飞书文档读写指引。 | **没装时隐藏 + 通用化剥离**：在 `_DALTON_SKILL_SPECS` 中为每个技能声明依赖的能力键，未满足的技能在核心安装自动设为 `hidden=True` 并跳过向沙箱 `.agents/skills/` 同步；将 `dalton-conventions/SKILL.md` 中的专有合规背书与内部源速查抽到独立参考文件，仅在对应能力启用时注入，保留通用三情景估值与五词结论骨架。 |
-| 设置页分组与卡片 `web/src/pages/Settings/sections.ts:77-94,195-243` 及 `web/src/pages/Settings/panels/dalton/*`（42 个文件） | 包含大量专属卡片：飞书/Discord 绑定（`:225`）、个人微信绑定（`:226`）、通知目标（`:224`）、飞书知识空间读取范围（`:237`）、团队微信机器人（`:239`）、飞书团队群（`:240`）、Discord 频道（`:241`）、宿主机/公共系统任务看板（`:242`）、原生 OAuth 目录同步（`:234`）、历史团队对话记忆开关（`:197`）。 | **没装时隐藏**：前端接入后端能力清单接口，`sections.ts` 的 `sectionShown` 与各条目 `visibleWhen` 统一校验能力开关；核心安装下未启用渠道与归档时，上述专属卡片及空的 `teamChannels` 分组自动隐藏，保留个人资料、通用外观、对话、模型、预算、覆盖结构与团队成员/共享模型管理。 |
-| 自动任务报告模板 `src/dalton/database/automation_reports.py:87-110`、系统任务视图 `src/dalton/autonomy/system_jobs.py:76-96`、默认覆盖表 `config/dalton/coverage.yaml:1-80` | 硬编码 26 个内部报告 `REPORT_PROFILES`（要求飞书卡片目标与 Discord 失败告警目标）、宿主机运维任务条目（`ops-db-backup`、`ops-backend-watchdog`）以及 Everflow 的 105 家跟踪公司名单（Core 27 + Watch 78）。 | **没装时隐藏 + 空初始态**：核心安装下默认覆盖名单为空（客户自行添加标的），`system_jobs.py` 按能力隐去 `DEFAULT_OPS_JOBS` 宿主机项，用户创建的定时研究任务结果直接保存在平台内（后续接入渠道插件后再开放群推送配置）。 |
+| 系统提示词各模板与自动化说明：`tool_guide.md.j2:23-35`、`chief_of_staff.md.j2:54`、`working_with_the_user.md.j2:38-54`、`src/ptc_agent/agent/backends/automations.py:43-56,154`、`src/ptc_agent/agent/prompts/loader.py:132-150` | `tool_guide.md.j2` 虽在 `:30` 对 `<data_map>` 做了 `{% if dalton_data_map %}` 判断且 `:24` 写明“若可用服务包含 `researchdata`”，但该提示句与研究服务描述仍无条件渲染进提示词；此外 `chief_of_staff.md.j2:54`、`working_with_the_user.md.j2:38-54` 与工作区自动化生成说明 `automations.py:43-56,154` 均直接提及系统运维任务或飞书/Discord/微信通知渠道。 | **没装时隐藏**：上述所有模板段落与自动化 `README` 生成器统一接入能力判定；未启用桥接、系统任务或渠道时，直接省略对应句段。 |
+| 数据地图配置、回退备注与按日缓存：`src/dalton/data_map/sources.yaml:12-151`、`src/dalton/data_map/builder.py:300-360,472-490,545-585` | 1) 静态回退将 18 条桥接路由标为 `未体检`；<br>2) `sources.yaml:142-151` 的 `unavailable_sources` 在 `:148` 引用 `dalton-13f-tracker`、在 `:151` 提示“从 `alphaengine/funda-ai/guidepoint` 查二手引述”；<br>3) `builder.py:545-585` 从 `dalton_data_map_cache` 按日期直接读取已渲染好的文本，仅改 `merge_catalog_routes()` 会漏掉缓存读取路径。 | **全路径过滤 + 缓存指纹隔离**：在 `sources.yaml` 的 `catalog_routes` 与 `unavailable_sources` 同步标注能力要求（核心模式下 `:148,:151` 使用纯公开源表述）；`dalton_data_map_cache` 查询与写入键拼入当前能力集合哈希指纹，杜绝配置切换后读到旧缓存。 |
+| 51 项内置技能（`plugins/dalton/skills/**`）、技能解析器（`src/ptc_agent/agent/middleware/skills/registry.py:523-569`、`dalton_registry.py:70-166`）与 6 个研究工作流（`workflows/*`） | 1) `dalton_registry.py:166` 在模块导入时静态生成技能表，且 `registry.py:523-569` 的 `get_skill()` 仍允许按名称直接加载 `hidden=True` 的技能；<br>2) 核心可见技能如 `dalton-conventions/SKILL.md`（`:48,77-83,87-93` 及 `references/`）和多个通用分析技能正文、以及 `workflows/` 下 6 个工作流（`initial-coverage`、`full-coverage`、`earnings-deep-update`、`bullbear-doc`、`topic-research`、`weekly-coverage-review`）全文穿插 `researchdata`、Guidepoint、飞书与内部合规背书。 | **拦截加载 + 清理沙箱 + 改写正文**：技能注册改为按当前部署能力动态计算，未启用技能在 `get_skill()` 直接返回空并在沙箱同步时移除已存在的受管目录；将 22 个专属简报/转写技能整棵关闭，对其余约 29 个核心可见技能的 `SKILL.md`、`references/` 与 6 个 `workflows/` 逐一剥离专有源调用，拆成纯公开数据与知识层通用正文。 |
+| 设置页卡片、设置搜索索引与静态帮助站：`web/src/pages/Settings/sections.ts:77-94,195-243,316-328`、`panels/dalton/*`、`docs-site/src/content/docs/everflow/` | 设置页搜索索引（`sections.ts:316-328`）会检索设置条目关键字；前端 `/help`（由 `docs-site/` 构建）独立包含 `everflow/` 下的专有数据源、飞书/微信渠道与内部设置文档。 | **没装时隐藏**：设置分组、条目与设置搜索列表统一过 `useCapabilities()` 过滤；`docs-site/` 在核心构建模式下排除 `everflow/` 专属章节并替换品牌词，确保 `/help` 索引与正文零专有残留。 |
+| 自动任务报告模板 `src/dalton/database/automation_reports.py:87-138`、系统任务 `src/dalton/autonomy/system_jobs.py:76-96,242-260`、默认覆盖名单 `config/dalton/coverage.yaml:14-3048` | `automation_reports.py` 定义了 20 个静态报告配置（`:87-109`）加 6 个动态多空跟踪配置（`:113-138`）；`system_jobs.py:242-260` 的 `_fetch_ops_jobs()` 会直接向桥接请求 `/jobs/ops`；`coverage.yaml` 在 `:14-19` 声明 27+78 计数并在 `:20-3048` 列出 105 家跟踪公司。 | **没装时隐藏 + 空初始态**：核心安装下 `_fetch_ops_jobs()` 在桥接关闭时直接返回空列表，关闭内部简报报告模板，默认覆盖名单初始化为空列表供客户自行添加标的。 |
 
 ### 1.5 `config.dalton.yaml`、`APP_ENV=dalton` 等配置分层
 
-| 位置（文件:行号 或目录） | 当前机制与局限 | 核心安装处理方式 |
+| 位置（文件:行号 或目录） | 当前机制与耦合点 | 核心安装处理方式 |
 |---|---|---|
-| `src/ptc_agent/config/file_utils.py:230-255`、`config.dalton.yaml:1-125`、`agent_config.dalton.yaml:1-107` | 当 `APP_ENV=dalton` 时在基准 `config.yaml` / `agent_config.yaml` 之上叠加 `*.dalton.yaml`（字典递归合并、列表整体替换）。但 `agent_config.dalton.yaml` 同时混放了“通用合理配置（Docker 沙箱、关闭内置远程浏览器、爬虫独立容器）”与“Everflow 私有配置（`*-oauth` 模型链、`researchdata` 超时、`gemini_grounding` 搜索、`x_search: true`）”。 | **新增 `core` 叠加层**：Everflow 安装保持 `APP_ENV=dalton` 一字不动；核心安装使用 `APP_ENV=core`，新增 `config.core.yaml` 与 `agent_config.core.yaml`——保留安全与容器配置（Docker 沙箱、关闭内置浏览器与交易、独立 `crawler` 容器），清空私有 OAuth 模型名，搜索默认设为免密钥可用的内置方案（客户填入搜索引擎或 Gemini Key 后自动升级）。 |
-| `src/dalton/dalton.yaml:1-179`、`src/dalton/settings.py:27,476-492`、`src/dalton/llm/role_policy.py:349-358` | `settings.py` 固定只读 `src/dalton/dalton.yaml`，忽略 `APP_ENV`；且 `role_policy.py:349` 在 `APP_ENV` 为空时仍强行合并 `agent_config.dalton.yaml`。导致 Fake-IP、`data_jobs.enabled: true`、`conversations.enabled: true` 与 `*-oauth` 审稿/辅助模型在任何环境都生效。 | **引入 `DALTON_PROFILE` 叠加**：在 `settings.py` 增加 `DALTON_PROFILE`（`APP_ENV=dalton` 时默认 `everflow`；`APP_ENV=core` 时默认 `core`）。当 `DALTON_PROFILE=core` 时，在 `dalton.yaml` 之上自动合并 `src/dalton/dalton.core.yaml`（关闭专属能力开关、清空 Fake-IP 与私有模型名、开启 `artifact_publishing` 供工作区看板使用），并修正 `role_policy.py` 按当前 `APP_ENV` 加载对应叠加文件。 |
-| `docker-compose.yml` + `docker-compose.dalton.yml:45,51-66` | `docker-compose.dalton.yml:45` 将 `REDIS_URL` 硬编码为容器内 `redis:6379`，且大量依赖宿主机源码目录读写挂载与预构建好的 `./web/dist`。 | **独立核心编排文件**：新增自包含的 `docker-compose.core.yml`，保留 `docker-compose.dalton.yml` 专供 Everflow 宿主机开发与生产使用，互不干扰。 |
+| `config.yaml:264-288`、`config.dalton.yaml:1-125`、`agent_config.dalton.yaml:1-107`、`src/tools/web/fetch.py:42`、`src/tools/web/search.py:32-35` | 1) 上游基准 `config.yaml:264-288` 将 `ginlix-data` 和 `tushare` 排在美股与 A 股行情及新闻链首位，`APP_ENV=core` 跳过 `config.dalton.yaml` 后若未整表替换列表，行情会优先请求未配置的 `ginlix-data`；<br>2) `inhouse` 是免密钥网页正文抓取器（`fetch.py:42`），而网页搜索 `WebSearch`（`search.py:32-35`）需对应搜索引擎或模型搜索密钥。 | **完整替换核心叠加层**：新建 `config.core.yaml`（整表替换 `market_data.providers` 与 `news_data.providers` 为公开免密钥 `yfinance` 优先、客户配置 FMP 后自动启用增强；网页抓取默认 `inhouse`，网页搜索在未配搜索密钥时自动静默关闭 `WebSearch` 工具，填入 Tavily/Serper/Gemini Key 后自动开启）与 `agent_config.core.yaml`（清空 `*-oauth` 模型名，保留 Docker 沙箱与 `crawler` 容器配置）。 |
+| `src/dalton/dalton.yaml:1-179`、`src/dalton/settings.py:27,476-492,688-693`、`src/dalton/llm/role_policy.py:339-358`、`tests/conftest.py` | 现有单元测试（`tests/conftest.py`）与部分宿主机脚本将 `APP_ENV` 设为空字符串 `""`，依赖 `role_policy.py:345-358` 在空 `APP_ENV` 下加载 Dalton 配置；而 `dalton.yaml` 默认开启了 `conversations.enabled: true` 与 `data_jobs.enabled: true`。 | **严格兼容空 `APP_ENV`**：规定 **`APP_ENV` 未设置（`""`）与 `APP_ENV=dalton` 均解析为 `DALTON_PROFILE=everflow`**；唯有 `APP_ENV=core` 或显式设置 `DALTON_PROFILE=core` 时才叠加 `src/dalton/dalton.core.yaml`（逐项关闭专有能力开关、设默认时区为 `UTC`、开启 `artifact_publishing`）；若同时出现 `APP_ENV=dalton` 与 `DALTON_PROFILE=core` 冲突配置，启动直接报错退出。 |
+| `docker-compose.yml:69-111` + `docker-compose.dalton.yml:11-65` | `docker-compose.dalton.yml` 面向 Everflow 宿主机开发与生产，挂载本地源码目录与 `./web/dist`。 | **Compose 覆盖复用（单一服务定义源）**：核心安装复用基准 `docker-compose.yml`、镜像构建文件与迁移脚本，仅将核心安装差异（`dalton-postgres:18-pgvector` 构建、一次性 `migrate` 服务、环境变量与可选服务）写入覆盖文件 `docker-compose.core.yml`，避免维护两套平行编排栈。 |
 
-### 1.6 两条迁移链在空库上从头跑的情况，以及改到上游表的 Dalton 迁移
+### 1.6 两条迁移链在空库上从头跑的情况，以及触及上游表的 Dalton 迁移
 
-#### （1）空库从零执行现状核验
+#### （1）空库从零执行、并发控制与升级保证
 
-启动入口 `scripts/dalton/docker_entrypoint_dalton.sh:15-21` 按固定顺序依次通过 Alembic（数据库表结构版本迁移工具）执行：
-1. 上游迁移链：`uv run alembic upgrade head`（`migrations/versions/`，共 146 个脚本，头节点 `147_shared_workspace_team`，版本记录在 `alembic_version` 表）；
-2. Dalton 迁移链：`uv run alembic -c src/dalton/alembic.ini upgrade head`（`src/dalton/migrations/versions/`，共 43 个脚本，头节点 `d044_llm_journal_attempts`，非线性段 `d031 -> d035 -> d036 -> d032 -> d033 -> d037..d044`，版本记录在 `alembic_version_dalton` 表）。
+容器迁移命令按固定顺序依次通过 Alembic（数据库表结构版本迁移工具）执行上游 `migrations/versions/`（146 个脚本，头节点 `147`）与 Dalton `src/dalton/migrations/versions/`（43 个脚本，头节点 `d044`）：
 
-经逐一核查全部 43 个 Dalton 迁移脚本，**在空数据库上从头跑通需满足两个硬前提**（满足后保留全部历史迁移即可一次性跑通）：
-- **前提 A（数据库扩展依赖）**：`d009_conversation_archive.py:21-22` 执行 `CREATE EXTENSION IF NOT EXISTS vector` 与 `pg_trgm`，`d030_channel_gateway.py:22` 执行 `CREATE EXTENSION IF NOT EXISTS pgcrypto`（且后续 `d038_monitors.py:109` 依赖 `gen_random_bytes(32)`）。因此核心安装的 PostgreSQL 容器**统一采用预装 `pgvector`（PostgreSQL 向量检索扩展）的 PostgreSQL 18 镜像**（复用 `scripts/dalton/Dockerfile.postgres` 或官方 `pgvector/pgvector:pg18`）。
-- **前提 B（严格先后顺序）**：`d035_company_automations.py:62-68` 在升级开头显式校验 `public.users`、`public.workspaces`、`public.automations` 三张上游表已存在，因此任何初始化脚本都必须先跑完上游 `upgrade head` 再跑 Dalton `upgrade head`。
+1. **数据库镜像与角色权限**：`d009_conversation_archive.py:21-22` 执行 `CREATE EXTENSION IF NOT EXISTS vector` 与 `pg_trgm`，`d030_channel_gateway.py:22` 执行 `CREATE EXTENSION IF NOT EXISTS pgcrypto`（`d038_monitors.py:109` 依赖 `gen_random_bytes(32)`）。核心安装**固定使用仓库已有的 `scripts/dalton/Dockerfile.postgres`（构建为 `dalton-postgres:18-pgvector`）**，初始化数据库角色具备 `CREATE EXTENSION` 权限。
+2. **前置表顺序保证**：`d035_company_automations.py:62-68` 显式校验 `public.users`、`public.workspaces`、`public.automations` 已存在，必须先完成上游 `upgrade head` 再跑 Dalton `upgrade head`。
+3. **一次性独立迁移服务（避免多容器竞态）**：`d020:212-227` 与 `d043:61-73` 包含脱离事务块的 `autocommit_block()` + `CREATE INDEX CONCURRENTLY` 操作，现有 `docker_entrypoint_dalton.sh:15-21` 无跨容器串行锁。因此核心编排新增一次性 `migrate` 服务（内部同时加 PostgreSQL 咨询锁），在 `migrate` 成功退出（`service_completed_successfully`）后才启动多进程 `backend`（`--workers 2`）。
+4. **发布重启与向后兼容迁移分离验证**：Everflow 现网 `deploy_main.sh:509` 会在重启后端时执行迁移，而客户平滑升级要求新迁移满足“扩展—收缩（Expand-Contract）”兼容原则（迁移执行期间上一发行版后端进程仍可正常读写），第 5 节分别针对这两种场景做自动化验证。
 
-#### （2）触及上游表的 Dalton 迁移完整清单（代码复核修正：6 个结构/索引变更 + 1 个密钥写入/外键 + 3 个纯外键）
+#### （2）触及上游表的 Dalton 迁移完整分类清单（6 个表结构/索引变更 + 1 个外键与密钥写入 + 3 个工作区外键）
 
-前期调研仅统计出 4 个改上游表的迁移，本次全量扫描 SQL 与动态拼接代码后，核实完整清单如下：
-
-| 迁移脚本与行号 | 触及的上游表 | 具体变更内容 | 核心安装处理策略 |
-|---|---|---|---|
-| `d004_provenance_locator.py:17-20` | `provenance_records` | `ALTER TABLE` 新增可空列 `dalton_source_url`、`dalton_as_of`。 | **原样保留**（支撑研报与 SEC 来源精确定位，纯增量可空列，不影响上游读写）。 |
-| **`d020_colleague_dispatch_threads.py:58,161-176,195,216,224`**（调研漏计：使用 `f"ALTER TABLE {table}"` 动态语句） | `conversation_threads`、`wakeups` | 给 `conversation_threads` 新增可空列 `user_id`、批量回填属主并建 2 个并发索引（`idx_conversation_threads_user_updated`、`idx_conversation_threads_ws_user`）；给 `wakeups` 新增可空列 `created_by_run_id`。内部已带 `information_schema.columns` 幂等判断。 | **原样保留**（支撑多成员工作区线程归属隔离，空库执行耗时 < 50ms）。 |
-| `d035_company_automations.py:82,155-285` | `users`、`automations` | 向 `users` 插入系统行 `system:dalton-company`；给 `automations` 新增 12 列（`scope`、`notify_enabled`、`notify_routes`、`config_version`、`deleted_at` 等）与 8 个 `CHECK` 约束，将上游唯一索引 `idx_automations_user_file_name` 替换为 `WHERE deleted_at IS NULL` 部分唯一索引，并新建 `idx_automations_scope_deleted`。 | **原样保留**（支撑自动化软删除、版本历史与公司级任务，核心安装直接复用这套增强能力）。 |
-| `d038_monitors.py:28,108-111` | `share_links`、`server_keys` | `dalton_monitors.artifact_id` 外键引用 `share_links(artifact_id)`；并执行 `INSERT INTO server_keys (name, secret) VALUES ('monitor_grant', gen_random_bytes(32))` 写入面板签名密钥。 | **原样保留**（支撑工作区 HTML 监控看板安全授权访问）。 |
-| `d041_team_coverage_units.py:532-535` | `automation_executions` | `ALTER TABLE` 新增可空列 `coverage_unit_id`、`coverage_unit_version`。 | **原样保留**（纯可空扩展列，支持覆盖单元关联）。 |
-| `d042_automation_reasoning_effort.py:43-50` | `automations` | `ALTER TABLE` 新增可空列 `reasoning_effort` 及枚举 `CHECK` 约束。 | **原样保留**（支持定时任务思考强度配置）。 |
-| **`d043_automation_executions_thread_index.py:24-33`**（调研漏计：跨行 `CREATE INDEX CONCURRENTLY`） | `automation_executions`、`automations` | 新建并发索引 `idx_automation_executions_thread_created` 与 `idx_automations_user_workspace`。 | **原样保留**（纯查询加速索引，空库瞬间完成）。 |
-| `d018:22`、`d028:22`、`d030:84,100` | `workspaces` | 自有表 `dalton_workspace_sharing`、`dalton_workspace_settings`、`dalton_channel_*` 通过 `REFERENCES workspaces(workspace_id)` 建立级联外键。 | **原样保留**（未开启对应能力时表为空，零运行开销，且日后安装插件时无需停机补跑旧迁移）。 |
+| 类别 | 迁移脚本与行号 | 触及的上游表 | 具体变更与前置依赖 | 核心安装处理策略 |
+|---|---|---|---|---|
+| **表结构 / 索引变更（6 个）** | `d004_provenance_locator.py:17-20` | `provenance_records` | 新增可空列 `dalton_source_url`、`dalton_as_of`。 | **原样保留**（支撑 SEC 与研报来源定位）。 |
+| 同上 | `d020_colleague_dispatch_threads.py:58,161-176,195,216,224` | `conversation_threads`、`wakeups` | 动态 `ALTER TABLE` 新增可空列 `conversation_threads.user_id`、`wakeups.created_by_run_id`，并在事务外并发创建 `idx_conversation_threads_user_updated`、`idx_conversation_threads_ws_user`。 | **原样保留**（支撑多成员线程归属隔离）。 |
+| 同上 | `d035_company_automations.py:82,155-285` | `users`、`automations` | 向 `users` 写入系统行 `system:dalton-company`；给 `automations` 新增 12 列与 8 个约束，将唯一索引替换为 `WHERE deleted_at IS NULL` 部分唯一索引并新建 `idx_automations_scope_deleted`。 | **原样保留**（支撑公司级自动化与版本软删除）。 |
+| 同上 | `d041_team_coverage_units.py:532-535` | `automation_executions` | 新增可空列 `coverage_unit_id`、`coverage_unit_version`。 | **原样保留**（支撑覆盖单元执行关联）。 |
+| 同上 | `d042_automation_reasoning_effort.py:43-50` | `automations` | 新增可空列 `reasoning_effort` 与枚举 `CHECK` 约束。 | **原样保留**（支撑定时任务推理强度设置）。 |
+| 同上 | `d043_automation_executions_thread_index.py:24-33,61-73` | `automation_executions`、`automations` | 在 `autocommit_block()` 中并发创建 `idx_automation_executions_thread_created` 与 `idx_automations_user_workspace`。 | **原样保留**（由一次性 `migrate` 服务串行执行）。 |
+| **外键 + 密钥表写入（1 个）** | `d038_monitors.py:28,108-111` | `share_links`、`server_keys` | `dalton_monitors.artifact_id` 外键引用 `share_links(artifact_id)`（依赖上游 `101_artifacts.py:116-120` 建立的唯一约束）；向 `server_keys` 插入 `monitor_grant` 签名密钥。 | **原样保留**（支撑监控看板授权访问）。 |
+| **工作区外键引用（3 个）** | `d018:22`、`d028:22`、`d030:84,100` | `workspaces` | `d018`（`dalton_workspace_sharing`）与 `d028`（`dalton_workspace_settings`）使用 `ON DELETE CASCADE` 级联删除；`d030`（`dalton_channel_conversations` 与 `dalton_channel_bindings`）两处外键使用 `ON DELETE SET NULL`。 | **原样保留**（未启用能力对应表为空，零运行开销）。 |
 
 ---
 
-## 2. 目标形态：客户从零安装的架构与体验
+## 2. 目标形态：客户从零安装的架构、网络边界与安全自举
 
-### 2.1 核心安装组件架构图
+### 2.1 核心安装组件架构、三视角网络与 `docker.sock` 权限说明
 
-核心安装全部运行在单台 Linux 主机的 Docker 容器网络中，脱离任何外部宿主机守护进程与专有账号：
+核心安装通过 `docker-compose.yml` + `docker-compose.core.yml` 覆盖编排运行在单台 Linux 主机上：
 
 ```mermaid
 flowchart LR
-    User["客户浏览器"] -->|"HTTPS :443 (或本地 :8088)"| Edge["edge 容器 (Caddy)<br/>静态托管前端 + 自动证书 + 剥离内部头"]
-    Edge -->|"/api/* 与 /ws/*"| Backend["backend 容器 (FastAPI + PTCAgent)<br/>APP_ENV=core / DALTON_PROFILE=core"]
-    Backend --> PG[("postgres 容器<br/>pgvector:pg18<br/>双迁移链 147 + d044")]
-    Backend --> Redis[("redis 容器<br/>SSE 流缓冲与并发锁")]
-    Backend --> MinIO[("minio 容器<br/>聊天大文件与产物存储")]
-    Backend -->|"隔离网络 crawl"| Crawler["crawler 容器<br/>受限内存网页抓取"]
-    Backend -->|"docker.sock 按需启停"| Sandbox["langalpha-sandbox 容器<br/>Python 代码执行 + dalton_sec + 行情 MCP"]
-    Backend -->|"HTTPS / API Key"| LLM["客户自配模型服务<br/>(OpenAI / Anthropic / Gemini / DeepSeek / 自定义网关)"]
+    User["客户浏览器"] -->|"HTTPS :443<br/>(或本机回环 HTTP 127.0.0.1:8088)"| Edge["edge 容器 (Caddy)<br/>静态前端 + /help + 自动证书 + 剥离内部头"]
+    Edge -->|"/api/* 与 /ws/*"| Backend["backend 容器 (--workers 2)<br/>APP_ENV=core / DALTON_PROFILE=core"]
+    Migrate["migrate 一次性容器<br/>咨询锁串行跑完 147 + d045"] -.->|"完成后退出"| Backend
+    Backend --> PG[("postgres 容器<br/>scripts/dalton/Dockerfile.postgres<br/>(dalton-postgres:18-pgvector)")]
+    Backend --> Redis[("redis 容器<br/>SSE 流缓冲与调度锁")]
+    Backend --> MinIO[("minio 容器<br/>chat-uploads 与产物桶")]
+    Backend -->|"受限抓取网络"| Crawler["crawler 容器"]
+    Backend -->|"挂载 docker.sock 启停"| Sandbox["langalpha-sandbox 容器<br/>Python 执行 + dalton_sec + 行情"]
+    Sandbox -->|"host.docker.internal 经中继端口"| Backend
+    Backend -->|"出站私网拦截 + 白名单"| LLM["客户自配模型服务 / 网关"]
 ```
 
-### 2.2 从 `git clone` 到发出第一条消息的 4 步流程
+- **浏览器、后端、沙箱三视角地址契约**：
+  1. **浏览器视角**：仅访问单一入口 `https://<DOMAIN>`（或本机回环试用 `http://127.0.0.1:8088`）。聊天大文件分片直接上传至同源后端接口 `/api/v1/dalton/chat-uploads/*`（`web/src/lib/dalton/chatUploadClient.ts:328`），无需向公网暴露 MinIO 端口。
+  2. **后端容器视角**：在 Compose 内部专用网络 `core_internal` 上连接 `postgres:5432`、`redis:6379`、`minio:9000` 与 `crawler:8100`。`src/dalton/chat_upload_storage.py` 独立读取 `DALTON_CHAT_UPLOAD_STORAGE_*`，由一次性桶初始化步骤自动建好 `chat-uploads` 存储桶。
+  3. **沙箱容器视角**：`langalpha-sandbox` 运行在独立的 Docker `bridge` 沙箱网络上（`src/ptc_agent/config/core.py:492`），不加入 `core_internal` 网络，从而隔离对 `postgres`、`redis`、MinIO 管理口和宿主机 `docker.sock` 的网络访问；沙箱仅通过显式配置的宿主机网关中继地址（`EGRESS_RELAY_BASE_URL` 绑定宿主机网桥 IP 的受控端口，见 `src/server/services/egress/reachability.py:45-64` 与 `src/server/services/livefs/mount.py:350`）访问后端出口中继、LiveFS 文件挂载与后端签发的对象下载通道。
+- **客户可见的 `docker.sock` 权限边界说明**（同步印在安装文档首屏与 `init.sh` 执行提示中）：
+  - 核心安装采用 DooD（Docker-outside-of-Docker，容器挂载宿主机套接字管理兄弟容器的方式）按需创建与回收代码沙箱，`backend` 容器需挂载 `/var/run/docker.sock`。持有该套接字等价于拥有宿主机 Docker 守护进程级控制权；因此生产环境应部署在**专用于运行 Dalton 的独立 Linux 云主机或虚拟机**上（也可配置对接独立沙箱宿主机或远程沙箱提供方）。
 
-面向客户的完整冷启动路径控制在 **3 条终端命令 + 1 次浏览器引导**：
+### 2.2 从获取发行包到发出第一条消息的 4 步流程
 
-1. **拉取代码**
+1. **获取干净发行包（或克隆仓库后导出干净目录）**
    ```bash
-   git clone https://github.com/<org>/<repo>.git dalton && cd dalton
+   # 客户交付场景直接解压干净源码发行包；开发验证场景从当前提交导出干净包：
+   tar xzf dalton-core-<version>.tar.gz && cd dalton-core-<version>
    ```
-2. **运行初始化脚本（自动体检环境并生成密钥）**
+2. **运行初始化脚本（自动体检环境并生成全套随机密钥）**
    ```bash
    bash scripts/standalone/init.sh
    ```
-   - 脚本检查 Docker Engine（≥ 24.0）、Docker Compose（≥ v2.24.4）、可用内存（建议 ≥ 8 GB）与磁盘空间（≥ 30 GB）；
-   - 自动用 `openssl rand -hex 32` 生成数据库密码、Redis 密码、MinIO 密钥、`INTERNAL_SERVICE_TOKEN`、`BYOK_ENCRYPTION_KEY`、本地登录签名密钥 `JWT_SIGNING_SECRET` 及一次性管理员自举口令 `BOOTSTRAP_SETUP_TOKEN`；
-   - 仅提示客户输入 `DOMAIN`（如 `research.client.com`，本地试用直接回车用 `localhost`）和可选的模型 API Key（也可留到网页引导再填）。
+   - 校验 Docker Engine（≥ 24.0）、Docker Compose（≥ v2.24.4）、内存（建议 ≥ 8 GB）与磁盘（≥ 30 GB），打印 `docker.sock` 独占主机安全提示；
+   - 自动用 `openssl rand -hex 32` 生成数据库密码、Redis 密码、MinIO 密钥、`INTERNAL_SERVICE_TOKEN`、`BYOK_ENCRYPTION_KEY`、本地登录签名密钥 `JWT_SIGNING_SECRET` 及带 24 小时有效期的管理员自举口令 `BOOTSTRAP_SETUP_TOKEN`；
+   - 提示填入 `DOMAIN`（公网域名走 ACME〔自动证书管理环境协议〕自动签发 HTTPS 证书；企业内网域名可指定自有 TLS 证书；填 `localhost` 时仅绑定本机回环 `127.0.0.1:8088` 供单机试用）。
 3. **一键拉起核心服务栈**
    ```bash
-   docker compose -f docker-compose.core.yml up -d
+   docker compose -f docker-compose.yml -f docker-compose.core.yml up -d
    ```
-   - 自动拉取或构建容器镜像，等待数据库就绪，按顺序跑完上游 `147` 与 Dalton `d044+` 迁移，启动 `postgres`、`redis`、`minio`、`crawler`、`backend` 与 `edge`；
-   - 终端打印访问地址与一次性 `BOOTSTRAP_SETUP_TOKEN`。
-4. **浏览器创建首个管理员并发起第一次对话**
-   - 打开 `https://<DOMAIN>`（或 `http://localhost:8088`），系统检测到尚无管理员，自动进入 **`/setup/admin` 首次管理员创建页**；
-   - 输入刚打印的一次性自举口令、管理员邮箱/姓名与登录密码，点击完成即自动登录；
-   - 若第 2 步未填模型 API Key，在紧随其后的连接步骤填入任意一家模型 Key（或 OpenAI 兼容网关地址 + Key），系统自动将其选为团队默认模型；
-   - 进入首页新建工作区（如 `AAPL`），上传一份 PDF 或直接提问，收到首条流式分析回复。
+   - 先运行 `postgres`（`scripts/dalton/Dockerfile.postgres`）、`redis`、`minio` 与桶初始化，再由一次性 `migrate` 容器串行跑完上游 `147` 与 Dalton `d045` 迁移，随后启动双进程 `backend`、`crawler` 与 `edge`。
+4. **浏览器创建首个管理员并发起第一次研究对话**
+   - 打开 `https://<DOMAIN>`（或本机 SSH 端口转发 `http://127.0.0.1:8088`），在 `/setup/admin` 页面输入终端打印的一次性自举口令、管理员邮箱/用户名与登录密码完成建号（口令当即永久作废）；
+   - 在引导页填入任意模型 API Key（或已加入管理员白名单的内网模型网关地址 + Key），新建工作区、上传财报或 CSV 数据文件、完成带沙箱计算的首轮流式问答。
 
-### 2.3 客户需要填写的配置项清单（极简原则）
-
-除下表前 2 项外，其余所有密码、内部通信令牌与安全参数全部由 `init.sh` 自动生成：
+### 2.3 客户需要填写的配置项清单
 
 | 配置项 | 是否必填 | 填写位置 | 说明 |
 |---|---|---|---|
-| `DOMAIN` | **必填**（默认 `localhost`） | `init.sh` 或 `.env` | 填正式公网域名时 Caddy 自动申请 HTTPS 证书；填 `localhost` 或内网 IP 时走 HTTP。 |
-| 首个管理员账号 + 密码 | **必填** | 浏览器 `/setup/admin` 页面 | 首次启动在网页端输入，配合终端输出的一次性自举口令完成创建。 |
-| 至少 1 个模型凭据 | **必填**（二选一位置） | `.env`（如 `OPENAI_API_KEY`）或网页 `/setup` 向导 | 支持 OpenAI、Anthropic、Google Gemini、DeepSeek、xAI、智谱或任意 OpenAI 兼容接口（`base_url` + Key）。 |
-| `BRAND_NAME` | 可选（默认 `Dalton`） | `.env` | 客户自定义平台显示名称（用于网页标题、导航与提示词自我介绍）。 |
-| `SEC_USER_AGENT` | 可选（默认由管理员邮箱拼装） | `.env` | 美国证监会 EDGAR 接口要求的访问标识（格式：`机构名 联系邮箱`），`/setup/admin` 创建管理员后若未显式配置可自动采用管理员邮箱。 |
-| `TAVILY_API_KEY` / `SERPER_API_KEY` / `FIRECRAWL_API_KEY` | 可选 | `.env` 或设置页 | 增强外网新闻搜索与反爬网页抓取；未填时默认使用免密钥内置抓取器（`inhouse`）与公开行情接口（`yfinance`）。 |
+| `DOMAIN` | **必填**（本机试用填 `localhost`） | `init.sh` 或 `.env` | 公网/内网多用户部署统一走 HTTPS（支持自动签发证书或挂载自有证书路径 `TLS_CERT_FILE` / `TLS_KEY_FILE`）；`localhost` 模式仅监听 `127.0.0.1:8088`，杜绝明文 HTTP 在内网或公网传输密码与口令。 |
+| 首个管理员账号 + 密码 | **必填** | 浏览器 `/setup/admin` | 配合终端输出的一次性 `BOOTSTRAP_SETUP_TOKEN` 创建首个管理员。 |
+| 至少 1 个模型凭据 | **必填** | `.env` 或网页 `/setup` 向导 | 支持官方模型提供商 API Key 或自定义 OpenAI 兼容模型（若自定义网关位于企业私网，管理员在 `.env` 配置 `DALTON_OPERATOR_LLM_ENDPOINTS` 显式放行）。 |
+| `BRAND_NAME` | 可选（默认 `Dalton`） | `.env` | 自定义网页标题、导航品牌名与智能体自我介绍名称。 |
+| `DALTON_TIMEZONE` | 可选（默认 `UTC`） | `.env` | 部署默认时区与团队日预算结算时区（如 `Asia/Shanghai`、`America/New_York`）。 |
+| `SEC_USER_AGENT` | 可选（自动由管理员邮箱合成） | `.env` | 访问公开 SEC EDGAR 财报接口的合规标识（格式：`<BRAND_NAME> <admin_email>`）。 |
+| `TAVILY_API_KEY` / `SERPER_API_KEY` / `FMP_API_KEY` | 可选 | `.env` 或设置页 | 填入搜索密钥后自动启用 `WebSearch` 外网搜索；未填时默认使用免密钥 `inhouse` 网页抓取、`yfinance` 行情与 `dalton_sec` 财报工具。 |
 
-### 2.4 首个管理员的产生与防抢注机制
+### 2.4 首个管理员永久自举锁、会话安全与运维恢复机制
 
-为彻底消除现有架构中“必须先去外部认证系统建号查 UUID，再回头手改 `.env` 里的 `DALTON_PM_USER_IDS` 并重建容器”的割裂流程，首个管理员采用**数据库自举锁**产生：
-
-1. **自举状态判定**：当数据库 `dalton_members` 表中不存在 `tier = 'admin'` 的记录且 `.env` 未显式锁定 `DALTON_PM_USER_IDS` 时，`GET /api/v1/dalton/bootstrap/status` 返回 `{"needs_admin_setup": true}`，前端路由自动将未登录用户引导至 `/setup/admin`。
-2. **一次性口令防公网抢注**：`POST /api/v1/dalton/bootstrap/admin` 强制校验请求体中的 `bootstrap_token` 与服务端环境变量 `BOOTSTRAP_SETUP_TOKEN`（常量时间比对 `hmac.compare_digest`）。公网部署从容器启动到管理员打开网页的窗口期内，外部扫描器因没有服务器终端口令，无法抢注管理员。
-3. **单事务原子落库与永久关门**：校验通过后，后端获取 PostgreSQL 事务级咨询锁（Advisory Lock），再次确认 `admin` 数量为 0，在单事务内写入 `users`、密码凭据表与 `dalton_members(tier='admin')`。一旦提交成功，`/bootstrap/admin` 永久返回 `409 Conflict`；该管理员自动成为团队模型凭据默认持有人，后续新成员统一由管理员在“设置 → 团队管理 → 成员与权限”生成 7 天有效的一次性邀请链接（`{PUBLIC_APP_URL}/invite#{token}`）加入。
-4. **外部认证模式兼容**：若客户选用 OIDC 或 Supabase 模式，支持在 `.env` 配置 `INITIAL_ADMIN_EMAIL=admin@client.com`；该邮箱首次完成验签登录时，后端自动在 `dalton_members` 中将其登记为 `admin`。
+1. **同一事务永久封存自举状态（防删号重开）**：
+   - 新增单行状态表 `dalton_bootstrap_state (singleton_id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (singleton_id = 1), completed_at TIMESTAMPTZ NOT NULL, completed_by_user_id TEXT NOT NULL)`。
+   - `POST /api/v1/dalton/bootstrap/admin` 获取 PostgreSQL 事务级咨询锁后，先确认 `dalton_bootstrap_state` 为空，再校验口令仍在 24 小时有效期内且累计失败次数未超上限（默认最多 5 次失败即锁定接口，需在服务器执行 CLI 重新签发），并用常量时间比对 `hmac.compare_digest`（HMAC，基于哈希的消息认证码）核验 `bootstrap_token`。
+   - 校验通过后，在**同一数据库事务**中原子写入 `users`、`dalton_local_credentials`（`Argon2id`〔抗硬件暴力破解的现代密码哈希算法〕）、`dalton_user_roles(tier='admin')`、`dalton_credential_holder(holder_user_id=...)` 与 `dalton_bootstrap_state`，同时清空服务端缓存中的口令有效态。自此以后，即便管理员列表发生任何变动，`dalton_bootstrap_state` 非空即永久拒绝 `/bootstrap/admin`（返回 `409 Conflict`）。
+2. **最后一位管理员保护与服务器端密码重置恢复**：
+   - 在角色变更与成员移除接口中加行锁检查：当系统中处于有效状态的 `admin` 仅剩 1 人时，拒绝将其降权或删除（返回 `409 Conflict`）。
+   - 提供仅限宿主机管理员在容器内执行的运维恢复命令：`docker compose exec backend uv run python -m src.dalton.auth.cli reset-password --email <email>`（以及紧急提权 `--grant-admin`），解决管理员遗忘密码后的恢复闭环。
+3. **登录限速、刷新会话轮换与 Cookie 安全属性**：
+   - 本地密码登录接口 `/api/v1/dalton/auth/local/login` 按来源 IP 与账号双维度限速（连续失败触发退避冷却）。
+   - 短期访问令牌采用 `JWT_SIGNING_SECRET` 签发的 JWT（JSON Web Token，JSON 网络签名令牌）；刷新会话存于 `dalton_local_sessions`，每次刷新执行令牌轮换（Rotation）并支持服务端单会话或全账号即时撤销（密码修改或管理员踢出时立即失效全部旧会话）。
+   - 会话 Cookie 固定设置 `HttpOnly; SameSite=Lax; Path=/api/v1/dalton/auth`，在 HTTPS 部署下强制附加 `Secure` 属性。后续阶段接入外部企业身份源时，首个管理员自举将严格绑定可信发行方（`iss`）与已验签主体标识（`sub`）。
 
 ---
 
 ## 3. “没装就不出现”的统一机制（Capability Registry）
 
-### 3.1 单一权威源设计：`src/dalton/capabilities.py`
+### 3.1 部署期固定能力注册表、优先级与依赖规则：`src/dalton/capabilities.py`
 
-新建 `src/dalton/capabilities.py` 作为全栈唯一的“能力是否已安装”判定入口。所有模块只问 `has_capability(cap_id)`，不再各自散落读取环境变量或猜测端口：
+新建 `src/dalton/capabilities.py` 作为全栈唯一的能力启停判定源：
 
 ```python
-# src/dalton/capabilities.py 核心概念结构
 class CapabilityId(StrEnum):
-    RESEARCHDATA_BRIDGE = "researchdata_bridge"   # 宿主机研究桥接总开关
-    ALPHAENGINE         = "alphaengine"           # 卖方研报与纪要（第 ② 阶段独立插件）
-    GUIDEPOINT          = "guidepoint"            # 专家访谈库（第 ③ 阶段独立插件）
-    COMPANY_WIKI        = "company_wiki"          # 基金内部 Wiki 读写（第 ② 阶段独立插件）
-    SALES_NOTES         = "sales_notes"           # 销售笔记库与入库（第 ③ 阶段独立插件）
-    TMTB                = "tmtb"                  # TMT 收盘总结（第 ③ 阶段独立插件）
-    FUNDA_AI            = "funda_ai"              # FUNDA AI 研究库（第 ③ 阶段独立插件）
-    FEISHU_DOCS         = "feishu_docs"           # 飞书文档/知识空间读写工具与权限页
-    CHANNEL_FEISHU      = "channel_feishu"        # 飞书消息卡片、群聊与账号绑定
-    CHANNEL_DISCORD     = "channel_discord"       # Discord 私信与团队频道绑定
-    CHANNEL_WEIXIN      = "channel_weixin"        # 微信个人号与团队机器人扫码绑定
-    TRANSCRIPTION       = "transcription"         # 火山 Seed-ASR 录音转写与校对技能
-    CONVERSATION_ARCHIVE= "conversation_archive"  # 历史团队对话归档卡片检索
-    DATA_JOBS           = "data_jobs"             # 确定性定时数据采集任务与关联看板
-    FUND_AUTOMATIONS    = "fund_automations"      # Everflow 内部 26 类定时简报模板与工具
-    NATIVE_OAUTH_SYNC   = "native_oauth_sync"     # Everflow 私有订阅模型目录同步面板
+    RESEARCHDATA_BRIDGE  = "researchdata_bridge"   # 宿主机研究桥接总开关
+    ALPHAENGINE          = "alphaengine"           # 卖方研报与纪要（依赖 researchdata_bridge）
+    GUIDEPOINT           = "guidepoint"            # 专家访谈库（依赖 researchdata_bridge）
+    COMPANY_WIKI         = "company_wiki"          # 内部 Wiki 读写（依赖 researchdata_bridge）
+    SALES_NOTES          = "sales_notes"           # 销售笔记检索与入库（依赖 researchdata_bridge）
+    TMTB                 = "tmtb"                  # TMT 总结库（依赖 researchdata_bridge）
+    FUNDA_AI             = "funda_ai"              # FUNDA AI 研究库（依赖 researchdata_bridge）
+    FEISHU_DOCS          = "feishu_docs"           # 飞书文档/知识空间读写（依赖 researchdata_bridge）
+    TRANSCRIPTION        = "transcription"         # 语音转写（依赖 researchdata_bridge + 转写专用存储）
+    CHANNEL_GATEWAY      = "channel_gateway"       # 多渠道网关总开关
+    CHANNEL_FEISHU       = "channel_feishu"        # 飞书卡片与群绑定（依赖 channel_gateway）
+    CHANNEL_DISCORD      = "channel_discord"       # Discord 频道与私信（依赖 channel_gateway）
+    CHANNEL_WEIXIN       = "channel_weixin"        # 微信扫码与机器人绑定（依赖 channel_gateway）
+    CONVERSATION_ARCHIVE = "conversation_archive"  # 历史团队对话归档检索
+    DATA_JOBS            = "data_jobs"             # 确定性定时数据采集任务与看板源
+    FUND_AUTOMATIONS     = "fund_automations"      # 内部定时简报模板、市场摘要与播客周报工具
+    PROBLEM_REPORTS      = "problem_reports"       # 内部运行问题工单上报工具（report_issue）
+    NATIVE_OAUTH_SYNC    = "native_oauth_sync"     # 私有订阅 OAuth 模型目录与同步面板
 ```
 
-- **配置来源与多进程安全**：能力状态由 `src/dalton/dalton.yaml`（按 `DALTON_PROFILE` 叠加 `dalton.core.yaml`）及显式环境变量（`DALTON_CAP_<NAME>=true|false`，并兼容现存的 `DALTON_TRANSCRIPTION_ENABLED`、`DALTON_DATA_JOBS_ENABLED`、`DALTON_RESEARCHDATA_URL` 等变量）纯函数解析得出，不在进程内存保存可变跨请求状态，严格符合多进程后端（`--workers N`）规范。
-- **第 ① 阶段与第 ② 阶段无缝衔接**：第 ① 阶段 `has_capability("alphaengine")` 从部署配置读取静态开关；进入第 ② 阶段将 AlphaEngine 和 Company Wiki 拆成可上传/可独立安装的插件包时，只需把 `capabilities.py` 内部对应枚举项的判定逻辑切换为查询数据库“已安装且已启用的插件注册表”，下方六个消费层无需改动业务代码。
+- **首阶段部署静态固定与多进程一致性**：第 ① 阶段所有能力开关随容器部署配置静态确定（修改能力需重启后端容器），`effective_capabilities()` 通过纯函数计算并产出确定性的 `capabilities_fingerprint()` 短哈希，天然保证 `--workers 2` 多进程间视图一致；后台定时循环继续复用现有的 PostgreSQL / Redis 分布式锁。第 ② 阶段引入在线插件热安装时，将另行设计跨进程配置广播、已建立的 MCP 连接撤销（`src/ptc_agent/core/mcp_registry.py:841-879`）与在线沙箱热同步。
+- **配置优先级（由高到低）**：
+  1. 显式新环境变量 `DALTON_CAP_<CAPABILITY_ID>=true|false`；
+  2. 兼容既有专用环境变量（`DALTON_TRANSCRIPTION_ENABLED`、`DALTON_DATA_JOBS_ENABLED`、`DALTON_RESEARCHDATA_URL` 等）；
+  3. 当前 `DALTON_PROFILE` 合并后的 YAML 配置（`everflow` 读 `dalton.yaml`；`core` 读 `dalton.yaml` + `dalton.core.yaml`）。
+- **显式依赖求值**：父能力未满足时子能力自动判定为关闭——例如 `researchdata_bridge` 关闭（或桥接 URL 为空）时，`alphaengine`、`guidepoint`、`company_wiki`、`sales_notes`、`tmtb`、`funda_ai`、`feishu_docs` 与 `transcription` 全部自动关闭；`transcription` 还额外要求 `is_transcription_storage_configured()` 为真；`channel_gateway` 关闭时三个渠道子能力全部关闭。
 
-### 3.2 一处声明、六处自动裁剪
+### 3.2 一处声明、八层全入口裁剪与拦截
 
 ```mermaid
 flowchart TD
-    Cap["src/dalton/capabilities.py<br/>统一能力注册表 (Single Source of Truth)"]
-    Cap --> C1["1. MCP 服务器加载<br/>src/ptc_agent/config/plugins.py<br/>跳过未装 bundle 服务器，零重连刷屏"]
-    Cap --> C2["2. 智能体直接工具<br/>src/dalton/tools/__init__.py<br/>未装能力对应工具不挂载进 LLM schema"]
-    Cap --> C3["3. 技能注册与沙箱同步<br/>dalton_registry.py<br/>未满足 required_capabilities 的技能隐藏且不同步沙箱"]
-    Cap --> C4["4. 提示词与数据地图<br/>loader.py / tool_guide.md.j2 / sources.yaml<br/>裁剪内部路由与专有合规话术，不标'未体检'而是不出现"]
-    Cap --> C5["5. 后台协程与定时任务<br/>setup.py / system_jobs.py / health.py<br/>不启动未装调度器，不探测未装数据源"]
-    Cap --> C6["6. 前端导航与设置页<br/>GET /api/v1/dalton/capabilities -> useCapabilities()<br/>隐藏未装渠道卡片、飞书范围、系统宿主机任务"]
+    Cap["src/dalton/capabilities.py<br/>部署期能力集合 + 依赖图 + 指纹"]
+    Cap --> L1["1. MCP 合并配置与插件目录<br/>config/plugins.py + config/utils.py + services/plugins/bundled.py"]
+    Cap --> L2["2. 智能体直接工具与模型目录叠加<br/>dalton/tools/__init__.py + dalton/llm/overlay.py"]
+    Cap --> L3["3. 技能解析、按名加载与运行中沙箱清理<br/>skills/registry.py + dalton_registry.py"]
+    Cap --> L4["4. 可见技能正文、引用文件与研究工作流<br/>plugins/dalton/skills/** + workflows/**"]
+    Cap --> L5["5. 系统提示词、自动化说明与数据地图缓存<br/>loader.py + *.md.j2 + automations.py + data_map/builder.py"]
+    Cap --> L6["6. 生命周期协程、健康体检与系统任务执行<br/>setup.py + health.py + system_jobs.py"]
+    Cap --> L7["7. 通知投递与后端直接 API 路由守卫<br/>notify/* + router.py + channels_router.py + transcriptions.py"]
+    Cap --> L8["8. 前端设置页、搜索索引、监控源与 /help 帮助站<br/>useCapabilities() + Settings/sections.ts + Monitors + docs-site/"]
 ```
 
-各消费层的具体执行规则：
-1. **MCP 服务器层（`plugins.py`）**：在 `plugin.json` 的 `extensions["ai.langalpha"].servers.<key>` 中支持可选字段 `"capability": "researchdata_bridge"`；`bundled_mcp_servers()` 遇到未启用能力直接跳过，沙箱不生成 `tools.researchdata` 包装文件，后端也不发起连接探测。
-2. **LangChain 直接工具层（`src/dalton/tools/__init__.py`）**：把所有工具构造函数收敛为一张声明式注册表 `(builder_fn, roles, min_tier, required_capability)`，核心安装下自动只挂载知识层（`knowledge_*`）、发布审校（`check_draft`/`check_language`/`publish_report`/`dalton_check_done`）、研究总监协同与日程（`dalton_coverage*`/`dalton_schedule_automation`）、监控面板（`dalton_monitor`）和对话切模型（`switch_thread_model`），其余内部桥接/飞书/转写/简报工具全部不挂载。
-3. **技能层（`dalton_registry.py`）**：将 `_DALTON_SKILL_SPECS` 每项扩充为 `(name, command, requires, required_capabilities)`；核心安装下 20 余个内部简报与转写技能自动归入隐藏态且不复制到工作区沙箱。
-4. **提示词与 `<data_map>` 层（`sources.yaml`、`builder.py`、`tool_guide.md.j2`）**：`sources.yaml` 每条路由增加 `capability` 字段；未安装能力的路由在 `merge_catalog_routes()` 阶段直接剔除（当所有第 2 节桥接路由均剔除时，连第 2 节小标题一并省去）。
-5. **生命周期与健康探测层（`setup.py`、`health.py`、`system_jobs.py`）**：`setup.py` 按能力决定是否启动 `data_jobs` 与 `transcriptions` 后台循环；`health.py` 只对已安装数据源发探测请求；`system_jobs.py` 隐去宿主机运维条目。
-6. **前端界面层（`GET /api/v1/dalton/capabilities` → `web/src/hooks/useCapabilities.ts`）**：后端返回已启用能力数组与公开品牌信息；前端与 `useFeatures.ts` 保持相同的默认关闭（Fail-Closed，加载完成前默认视为未启用，防止专属卡片闪烁）策略，驱动 `Settings/sections.ts` 隐藏飞书/微信/Discord 绑定卡片、原生模型同步卡片、团队历史记忆卡片及整个空的 `teamChannels` 分组。
+1. **MCP 合并后有效配置与插件目录层**：不仅在 `src/ptc_agent/config/plugins.py` 过滤内置声明，还在 YAML 合并完成后的有效服务器生成点 `src/ptc_agent/config/utils.py:240-255` 二次校验能力，防止配置文件重新带入未启用服务；同时在 `src/server/services/plugins/bundled.py:58-113,327-346` 过滤插件目录列表，使前端插件页零展示未安装的专有包 `dalton-data`。
+2. **直接工具与私有模型目录层**：`src/dalton/tools/__init__.py` 按能力裁剪全部桥接、飞书、转写、简报与 `report_issue` 工具；`src/dalton/llm/overlay.py:20-35` 在 `native_oauth_sync` 关闭时跳过加载私有 `*-oauth` 模型条目。
+3. **技能解析、调用拦截与沙箱清理层**：移除 `dalton_registry.py:166` 在导入时固化技能表的做法，改为在 `src/ptc_agent/agent/middleware/skills/registry.py:523-569` 的技能枚举与按名读取 `get_skill()` 中实时校验能力——未启用技能按名请求直接返回 `None` 拒绝加载；沙箱同步逻辑在对账 `.agents/skills/` 时主动删除已关闭能力的受管技能目录，确保已运行沙箱中也无残留文件。
+4. **可见技能正文与研究工作流层**：将 22 个专属技能绑定对应能力键并在核心安装整棵关闭；对保留的约 29 个核心方法论与分析技能（含 `dalton-conventions/SKILL.md` 及其 `references/`）及 `workflows/` 下全部 6 个工作流进行正文重构，把专有源检索、Guidepoint 字数背书和飞书同步拆入仅在对应能力开启时才挂载的扩展技能/参考片段，核心可见正文只含公开行情、SEC 财报、网页与公司知识层指引。
+5. **提示词、自动化说明与数据地图缓存层**：`tool_guide.md.j2:23-35`、`chief_of_staff.md.j2:54`、`working_with_the_user.md.j2:38-54` 与 `automations.py:43-56,154` 按能力条件渲染；`sources.yaml` 的 `catalog_routes` 与 `unavailable_sources`（`:142-151`）同步按能力过滤，`data_map/builder.py:545-585` 的数据库缓存读写以 `(cache_date, capabilities_fingerprint)` 隔离。
+6. **后台协程与系统任务层**：`setup.py:900-959` 按能力启停体检、转写对账与数据任务循环；`system_jobs.py:242-260` 的 `_fetch_ops_jobs()` 在 `researchdata_bridge` 关闭时直接返回空列表，零 `:8960` 请求。
+7. **通知投递与 API 路由直接拦截层**：`notify/dispatch.py`、`notify/channel_transport.py` 以及 `router.py:1944`（`system-jobs/{key}/run`）、`router.py:2413`（`/feishu/*`）、`router.py:2575`（`/notify/test`）、`channels_router.py`、`transcriptions.py`、`oauth_native.py` 挂载统一能力依赖守卫 `require_capability(...)`，能力关闭时直接访问 API 立即返回 `404` / `403` 明确拒绝。
+8. **前端设置、搜索索引与 `/help` 帮助站层**：`GET /api/v1/dalton/capabilities` 返回已启用能力集合与品牌名；前端 `useCapabilities()` 采用加载前默认关闭策略，统一裁剪设置页分组、设置搜索索引（`sections.ts:316-328`）和监控面板数据源选择器；`docs-site/` 构建在核心模式下排除 `src/content/docs/everflow/` 全部专有文档。
 
-### 3.3 Everflow 安装如何保持全部开启
+### 3.3 Everflow 安装零改动保障与 `dalton_sec` 禁用兼容
 
-- 在 `src/dalton/dalton.yaml`（基准配置，对应 `DALTON_PROFILE=everflow`）中，现有 Everflow 已投产的能力全部保持默认启用；且当 `APP_ENV=dalton` 且未显式指定 `DALTON_PROFILE` 时，`settings.py` 自动将 `DALTON_PROFILE` 设为 `everflow`。
-- 因此，**Everflow 生产环境的 `.env`、启动命令与 `deploy_main.sh` 无需修改任何一行参数**，升级后所有桥接工具、51 个技能、飞书/微信/Discord 渠道和 42 项数据任务照常全量开启。
+1. **环境变量与空值完全向后兼容**：`APP_ENV=""`（未设置）与 `APP_ENV="dalton"` 一律解析为 `DALTON_PROFILE=everflow`，保持现有 `dalton.yaml`、`config.dalton.yaml`、`agent_config.dalton.yaml` 的全部生效值（含 42 项数据任务清单、单项数据库启停状态、转写默认需显式开启与存储就绪、`artifact_publishing` 基准值及模型角色选择）。
+2. **前端构建标志向后兼容**：`web/src/config/brand.ts` 在 `VITE_DALTON_UI` 未设置时自动沿用 `BRAND_MARK === 'everflow'` 判定，Everflow 现网 `web/.env.dalton` 与 `deploy_main.sh` 零修改。
+3. **`dalton_sec` 拆包后的禁用记录兼容**：在 `src/server/services/plugins/bundled.py:217-246` 读取用户/工作区内置插件禁用记录（`user_mcp_builtin_disables`）时，支持插件自身的 `dalton-sec` 禁用键，同时对拆包前已写入的旧键 `dalton-data:dalton_sec`（或整包禁用且未显式重开 `dalton-sec` 的历史记录）做兼容映射，确保现有用户的禁用偏好原样延续。
+4. **改代码前先锁快照**：在 Batch 1 动手调整任何配置或裁剪逻辑前，先建立 `tests/unit/dalton/test_everflow_profile_parity.py`，锁死 `APP_ENV=dalton` 与 `APP_ENV=""` 下的完整工具名集合、51 个技能可见性、合并后 MCP 服务器、`<data_map>` 渲染快照、默认开关值与插件禁用行为。
 
-### 3.4 防止未来新增功能漏掉规则的双重自动门禁
+### 3.4 防止新增功能漏网的全量文本与调用门禁
 
-为杜绝后续开发中有人新增了一个内部工具、技能或设置项却忘记绑能力开关，在单元测试中加入两条强制静态与运行期门禁（随每次 PR 的 `pr_baseline.sh` 与 GitHub Actions 自动执行）：
-
-1. **显式分类完整性检查（白名单登记制）**：单测自动扫描 `src/dalton/tools/*.py` 导出的全部 `BaseTool` 名称、`plugins/dalton/skills/*/SKILL.md` 目录名、`src/dalton/data_map/sources.yaml` 路由键以及 `web/src/pages/Settings/sections.ts` 中的 `dalton*` 设置项。每一项都必须在注册表中显式标记为 `CORE`（核心通用能力）或至少一个 `CapabilityId`；凡出现未归类的新增条目，测试直接失败并报出具体名称。
-2. **核心模式黑名单零残留断言**：在测试进程内以 `APP_ENV=core`、`DALTON_PROFILE=core` 构造完整工具列表、可见技能列表、渲染后的主/子智能体系统提示词及 `<data_map>` 文本，用正则扫描专属词表（`researchdata`、`alphaengine`、`guidepoint`、`sales-notes`、`tmtb`、`funda-ai`、`feishu`、`weixin`、`seed-asr`、`Everflow` 等），任何一处命中即判定门禁失败。
+在 `tests/unit/dalton/test_core_capabilities_gate.py` 中建立三项强制自动化检查（纳入每次 PR 基线）：
+1. **显式登记完整性检查**：扫描 `src/dalton/tools/*.py` 全部工具、内置插件包、`plugins/dalton/skills/*`、`workflows/*`、`sources.yaml`（含 `unavailable_sources`）及 `Settings/sections.ts` 条目，强制每项显式归属 `CORE` 或具体 `CapabilityId`。
+2. **全量可见文本黑名单扫描**：在 `APP_ENV=core` 下扫描主/子智能体渲染后提示词、`<data_map>`（缓存读写双路径）、**全部可见技能的 `SKILL.md` 正文及其 `references/**` 全文**、`workflows/**` 全文、`automations.py` 生成的说明文本、设置页搜索词索引（`settingSearchText`）以及核心模式构建出的 `/help` 静态页面产物，断言 `researchdata`、`alphaengine`、`guidepoint`、`sales-notes`、`tmtb`、`funda-ai`、`feishu`、`weixin`、`seed-asr`、`dalton-13f-tracker`、`Everflow` 出现次数全为 **0**。
+3. **关闭态直接调用拒绝测试**：在 `APP_ENV=core` 下直接调用已隐藏技能名（`get_skill`）和已关闭能力的 API 路由（`/system-jobs/.../run`、`/feishu/*`、`/notify/test`、`/channels/*`、`/transcriptions/*`），断言全部被明确拒绝且零发起 `:8960` / `:8962` 网络连接。
 
 ---
 
-## 4. 登录认证方案对比与推荐
+## 4. 认证架构与角色、凭据持有人模型（已定采用本地账号）
 
-当前系统支持两种认证状态：上游默认免登录开发态（`HOST_MODE=oss` 且 `DALTON_AUTH_MODE=oss`，所有请求归属固定单用户 `local-dev-user`，无密码保护，仅限本机开发）与 Dalton 团队 Supabase 认证（`DALTON_AUTH_MODE=supabase`，见 `src/dalton/auth.py` 与 `docs/dalton/dev-guide/AUTH-DEPLOY.md`）。面向客户公网或企业内网从零部署，三种候选登录方案对比如下：
+### 4.1 三种登录方案复盘与已定结论
 
-| 对比维度 | 方案 A：继续要求客户配 Supabase | **方案 B（推荐）：自带轻量本地账号（`local`）** | 方案 C：企业 OIDC 单点登录（`oidc`） |
+| 对比维度 | 方案 A：外部 Supabase（`supabase`） | **已定核心默认：自带本地账号（`local`）** | 方案 C：企业单点登录（`oidc`，后续阶段） |
 |---|---|---|---|
-| **核心做法** | 沿用现有 `DALTON_AUTH_MODE=supabase`，要求客户自行注册境外 Supabase Cloud 项目（并手工关闭公开注册、开启邮箱确认、配置 `SUPABASE_URL` / `PUBLISHABLE_KEY` / `SECRET_KEY`），或在客户服务器额外部署整套自托管 Supabase 容器群。 | 在 `src/dalton/auth/` 新增 `local` 模式：利用现有 PostgreSQL 存密码哈希（`Argon2id`），后端用自动生成的签名密钥签发短期 JWT（JSON Web Token，加密登录令牌）与安全刷新 Cookie；复用现有登录页（邮箱/用户名 + 密码）、首个管理员 `/setup/admin` 引导和 7 天有效的一次性邀请链接。 | 后端实现标准 OIDC（OpenID Connect，开放身份认证协议）授权码 + PKCE（防授权码拦截机制）登录与 JWKS（公钥集合）验签，对接客户已有的 Okta、Microsoft Entra ID（原 Azure AD）、Keycloak 或飞书企业身份源。 |
-| **客户安装复杂度** | **高**。客户不仅要跨平台配 3 个密钥和 3 个安全开关（配漏一个整站返回 `503`），若处在内网或受金融合规限制无法连境外 Supabase Cloud，自建全套 Supabase 需额外维护 10 个左右微服务容器。 | **极低（真正开箱即用）**。零外部账号依赖、支持纯内网环境；客户启动容器后直接在网页设置管理员密码，发邀请链接即可拉同事进团队。 | **中高**。客户 IT 管理员需先在企业身份平台注册应用、配回调地址与用户组声明（Group Claim），再填回 `.env`；没有现成统一身份平台的中小买方团队无法直接试用。 |
-| **自动化测试友好度** | 公开 GitHub Actions 需另写假 JWKS 服务模拟云端鉴权。 | **极高**。GitHub Actions 直接走真实注册管理员、密码登录、Cookie 刷新与邀请建号全套生产代码路径。 | 需在 CI（Continuous Integration，持续集成流水线）中额外启动模拟 OIDC 提供方（如 `mock-oidc` 容器）测试回调流。 |
-| **预估开发工作量** | **1–2 人日**（仅去掉 `DALTON_PM_USER_IDS` 写死并补充配置向导）。 | **6–9 人日（约 1.2–1.8 人周）**（含独立凭据表迁移、登录/刷新/登出/改密接口、首个管理员自举锁、邀请对接与前端本地会话适配）。 | **8–12 人日（约 1.5–2.5 人周）**；若先做好方案 B 的本地会话底座，后续追加 OIDC 仅需 **4–6 人日**。 |
-| **对 Everflow 现网影响** | 零影响。 | **零影响**。通过 `DALTON_AUTH_MODE=local \| supabase \| oss` 分支隔离，Everflow 现网保持 `DALTON_AUTH_MODE=supabase` 与 `VITE_DALTON_AUTH=supabase`，现有 JWT 验签、白名单、邀请与会话 Cookie 一行不改。 | 零影响（独立认证分支）。 |
+| **核心形态** | 依赖外部 Supabase Cloud 或自建约 10 个认证微服务容器。 | 利用现有 PostgreSQL 存储 `Argon2id` 密码哈希与刷新会话，后端签发短期 JWT，自带 `/setup/admin` 永久自举锁与本地单事务邀请链接。 | 标准 OIDC 授权码 + PKCE（授权码防拦截校验机制）与 JWKS（JSON 网络公钥集合）验签。 |
+| **工程工作量** | 1–2 人日（客户部署门槛高）。 | **10–14 人日**（含全入口统一认证分派、独立角色与持有人表迁移、会话轮换撤销、限速与前端适配）。 | 在 `local` 会话底座上追加约 **4–6 人日**。 |
+| **已定边界** | **Everflow 现网继续使用**，代码路径原样保留。 | **核心安装默认启用**，零外部平台依赖，支持 GitHub Actions 全真验收。 | 留待后续企业客户明确提出单点登录需求时追加。 |
 
-### 推荐结论
+### 4.2 全入口统一认证分派（消除 `HOST_MODE=oss` 免密穿透）
 
-**第 ① 阶段推荐采用「方案 B（自带轻量本地账号）作为核心安装默认 + 完整保留方案 A（Supabase）供 Everflow 现网运行」；将认证模块抽象为清晰的模式接口，待第 ② 阶段遇到明确要求对接企业统一账号的机构客户时，再花 4–6 人日追加方案 C（OIDC）。**
+现有代码在 `src/server/auth/jwt_bearer.py:214-220,244-246`、`src/server/utils/api.py:178-191,265-277`、`src/server/auth/ws_auth.py:37-53` 以及前端 `web/src/contexts/AuthContext.tsx:89-96` 中，只要 `is_dalton_supabase_auth_enabled()` 为假且 `HOST_MODE == "oss"`，就会直接返回免密账号 `local-dev-user`。为彻底封堵该穿透路径，执行以下统一改造：
 
-理由：第 ① 阶段的核心验收标准是“不需要外部平台账号，客户填自己的域名、管理员账号和模型 Key 就能从空库跑起来”，方案 B 是唯一能同时满足**客户零外部依赖一键启动**、**支持多成员团队协作与邀请**、以及**GitHub Actions 零机密全真测试**的方案，且工期可控。
+1. **启动期严格校验（Fail-Closed，异常即拒绝）**：在 `src/dalton/settings.py:617-638` 统一定义 `DALTON_AUTH_MODE in {"local", "supabase", "oss"}`。当 `DALTON_PROFILE=core` 时，默认值为 `local`；若遇到未知认证模式、`DALTON_AUTH_MODE=local` 缺少合格长度的 `JWT_SIGNING_SECRET`，或在非显式开发/单测标记下误设 `oss`，后端进程在启动阶段直接报错退出。
+2. **六类鉴权入口统一先按 `DALTON_AUTH_MODE` 分派（仅显式 `DALTON_AUTH_MODE=oss` 才走开发免密）**：
+   - 标准 HTTP 依赖：`src/server/utils/api.py`（`get_current_user_id`、`get_user_id_any_state`）；
+   - 可选鉴权依赖：`src/server/utils/api.py`（`get_optional_user_id`：无令牌返回 `None` 匿名态，携带无效或过期令牌返回 `401`，绝不落入 `local-dev-user`）；
+   - 直接 JWT 依赖：`src/server/auth/jwt_bearer.py`（`verify_jwt_token`、`get_current_auth_info`）；
+   - WebSocket（全双工长连接通信协议）握手：`src/server/auth/ws_auth.py`（`authenticate_websocket`，无有效令牌以 `1008` 策略码关闭连接）；
+   - SSE（Server-Sent Events，服务端单向事件流）流式对话、断线重连与历史重放：`src/server/app/threads/messaging.py:1246-1290,1341-1522`（全程校验 Bearer 令牌与线程归属）；
+   - 前端令牌获取：`web/src/config/daltonAuth.ts`、`web/src/contexts/AuthContext.tsx`、`web/src/api/client.ts` 与 `web/src/pages/ChatAgent/utils/api/transport.ts` 在 `VITE_DALTON_AUTH=local` 时挂载 `LocalAuthProvider`，从本地登录态获取访问令牌并在 `401` 时自动调用刷新接口或跳转 `/login`。
+
+### 4.3 管理员角色、团队成员与模型凭据持有人独立建模
+
+在迁移 `d045_local_auth_and_roles.py` 中新建清晰解耦的表结构（全部以稳定的 `users.user_id` 关联，不动历史 `d016` 的 `dalton_members` 表结构）：
+
+1. **角色权限表 `dalton_user_roles`**：`(user_id TEXT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE, tier TEXT NOT NULL CHECK (tier IN ('admin', 'internal', 'external')), granted_by TEXT, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ)`。`local` 模式下 `access_tiers.py`、`invites.py:is_invite_pm` 与 `system_jobs.py` 统一从该表读取角色。
+2. **显式团队凭据持有人表 `dalton_credential_holder`**：`(singleton_id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (singleton_id = 1), holder_user_id TEXT NOT NULL REFERENCES users(user_id), updated_by TEXT, updated_at TIMESTAMPTZ)`。首个管理员自举时写入为初始持有人；后续若需交接管理员，通过专门的“转移团队凭据持有人”事务同步迁移已存团队密钥与共享模型偏好，避免因管理员增减导致已配模型凭据悬空。Everflow 的 `supabase` 模式在 `credentials.py:35-99` 中原样保持 `DALTON_PM_USER_IDS[0]` 规则不变。
+3. **本地模式单事务邀请兑换**：在 `src/dalton/invites.py` 为 `local` 模式实现原生数据库兑换路径——受邀人提交用户名/邮箱与密码时，在同一事务内锁定并核销 `dalton_invites` 令牌、创建 `users` 行、写入 `dalton_local_credentials` 密码哈希及 `dalton_user_roles`（按邀请指定的 `internal` 或 `external` 等级），全程脱离 Supabase Admin API。
 
 ---
 
 ## 5. 测试方案
 
-### 5.1 GitHub Actions 全新 Linux 从零安装测试
+### 5.1 GitHub Actions 全新 Linux 从零安装与干净产物验收
 
-新增独立工作流 `.github/workflows/standalone-core-e2e.yml`，在 GitHub 托管的公开 `ubuntu-latest` 运行器上模拟一台刚拿到手的干净 Linux 服务器。
+工作流 `.github/workflows/standalone-core-e2e.yml` 运行在公开 `ubuntu-latest` 运行器上，声明 `permissions: contents: read`，零读取仓库 Secrets：
 
-#### （1）公开仓库零凭据安全设计与假模型实现
+1. **从同一提交导出干净包并构建检查**：
+   - 第 1 步先运行 `bash scripts/standalone/package_release.sh --output /tmp/dalton-core-dist`，在干净目录外移走原工作树，**后续镜像构建与服务启动全部基于导出的干净包执行**；
+   - 自动扫描导出目录、Docker 构建产物及导出镜像各层（`docker image history` 与容器根文件系统清单），断言 `plugins/dalton_data/`、`researchdata_bridge.py`、`research_runtime/`、历史迁移运维脚本、`Proprietary` 声明及内部邮箱/固定 UUID 出现次数均为 **0**。
+2. **走自定义模型路径与真实 Responses API 的确定性假模型（`tests/fakes/fake_openai_server.py`）**：
+   - 鉴于内置 `openai` 提供商在 `src/llms/manifest/providers.json:832-838` 中写死了 `base_url: "https://api.openai.com/v1"` 且开启 `use_response_api: true`（`src/llms/llm.py:747-751` 直接使用清单地址），假模型接入**统一走仓库原生支持的自定义模型提供商路径（`base_url_override` 设为 `http://fake-llm:8099/v1`）**，通过 `DALTON_OPERATOR_LLM_ENDPOINTS=http://fake-llm:8099/v1` 列入部署者出站白名单，并绑定目录中支持工具调用且带完整定价的型号配置。
+   - `fake-llm` 严格校验客户端请求体，完整实现 `GET /v1/models` 与 `POST /v1/responses` 的 Responses API 流式 SSE 事件序列（`response.created`、`response.output_item.added`、`response.function_call_arguments.delta`、`response.output_text.delta`、`response.completed` 含真实 `usage` 令牌统计）：第 1 轮输出带合法 `call_id` 与 `code` 参数的 `ExecuteCode` 工具调用（匹配 `src/ptc_agent/agent/tools/code_execution.py:140-148,239-245`），第 2 轮解析沙箱返回的真实标准输出生成最终流式回答。
+3. **8 项端到端硬验收指标**：
+   - **迁移与双进程启动**：一次性 `migrate` 容器跑通空库 `147 + d045`（及一次模拟中断后幂等重跑），`backend` 以 `--workers 2` 健康就绪；镜像固定具体版本标签，并准备无外部凭据的本地构建回退；
+   - **真实令牌边缘剥离验证**：取出当次运行生成的**真实有效** `INTERNAL_SERVICE_TOKEN` 与真实用户 ID，验证直连后端容器 `:8000/api/v1/users/me` 返回 `200`，而携带同一有效令牌经 Caddy `edge`（`:8088/api/v1/users/me`）访问返回 `401`（证明 Caddy 确实剥离了内部服务头）；
+   - **全入口未登录拒绝验证**：在 `DALTON_AUTH_MODE=local` 下，不带令牌及携带伪造令牌访问 `/api/v1/users/me`、可选鉴权接口、WebSocket 握手均返回 `401` / `1008`；两个不同测试用户互相访问对方私有工作区/线程均被拒绝；
+   - **首个管理员自举与永久关门**：经 Playwright（跨浏览器端到端自动化测试框架）完成 `/setup/admin` 自举登录、连接 `fake-llm` 自定义模型，验证再次请求 `/bootstrap/admin` 与尝试降权唯一管理员均返回 `409`；兑换一条本地邀请链接创建第 2 名成员并登录成功；
+   - **沙箱代码执行、运行中断线重连、完成后重放与账本记账（四项独立断言）**：发起触发 `ExecuteCode` 的长流式对话，① 验证 Docker 沙箱真实算出结果；② 在流式输出中途主动断开 SSE 连接并带 `last_event_id` 重连运行中流接口（`messaging.py:1341-1522`），断言事件无丢失续传完成；③ 对话结束后刷新页面调用历史重放接口（`messaging.py:1246-1290`），断言重放结果一致；④ 查询数据库 `dalton_llm_journal` 与预算账本表，断言令牌用量与费用记录已准确落库；
+   - **分片文件上传与沙箱读取 + LiveFS 校验**：通过前端分片上传接口上传大于单分片阈值的测试文件至 MinIO `chat-uploads` 桶，验证沙箱容器经受控中继成功拉取文件、LiveFS 挂载正常且沙箱向 `postgres:5432` / `redis:6379` 的直连探测被网络层阻断；
+   - **单模型研报审校发布闭环**：仅配置 `fake-llm` 单一自定义模型（`family_of == "unknown"`），执行草稿数字核验与正式发布，验证发布成功且发布记录中正确写入单家族/未知家族模式标记；
+   - **全栈专属能力零残留**：检查后端双进程日志、接口响应、页面 DOM（Document Object Model，网页文档对象模型）、设置搜索与 `/help` 页面，确认零桥接重连日志、零专有词命中。
+   - **运行时长管理**：命中 GHCR（GitHub Container Registry，GitHub 容器镜像仓库）/ Actions 构建缓存时目标约 8–12 分钟，冷构建上限设 `timeout-minutes: 35`，具体耗时在 Batch 1 首次跑通后按实测校准。
 
-- **零真实密钥**：工作流声明最小只读权限 `permissions: contents: read`，**不读取任何仓库 Secrets**；测试所用的数据库密码、内部服务令牌、自举口令全部在运行器当次步骤中用 `openssl rand -hex 32` 临时生成，测试模型 Key 固定写明文占位符 `sk-fake-ci-only-not-a-secret`，公开日志无任何敏感信息风险。
-- **确定性假模型容器（`tests/fakes/fake_openai_server.py`）**：
-  - 实现一个约 150 行的轻量 HTTP 服务，随测试 Compose 栈以 `fake-llm` 容器启动，监听内部地址 `http://fake-llm:8099/v1`；
-  - 完整实现 OpenAI 标准协议接口（`GET /v1/models`、`POST /v1/chat/completions` 与 `POST /v1/responses` 的流式 SSE〔Server-Sent Events，服务端事件流〕输出）；
-  - 根据用户输入中的确定性测试指令返回预设行为：普通问候直接流式返回文本；包含代码计算请求时，第 1 轮返回 `ExecuteCode` 工具调用（在真实 Docker 沙箱中执行 Python 代码），第 2 轮读取沙箱执行输出并汇总成最终回答；包含上传附件时，读取工作区文件并返回文件行数与校验值；
-  - 后端容器通过仓库原生已支持的 `OPENAI_BASE_URL=http://fake-llm:8099/v1`（见 `src/llms/endpoints.py:30` 与 `src/llms/operator_channel.py:275`）连接该容器，**业务代码零测试特例分支**，完整覆盖真实模型客户端、流式事件编解码、Redis 重连缓冲、LangGraph 检查点持久化与美元预算记账链路。
+### 5.2 Everflow 安装回归保护与升级恢复验证
 
-#### （2）流水线执行步骤与 6 项验收检查
+1. **前置快照 + 全量基线必过**：每批 PR 必须通过 `bash scripts/dalton/pr_baseline.sh --baseline-only` 与 Batch 1 建立的 `test_everflow_profile_parity.py`（同时覆盖 `APP_ENV=dalton` 与 `APP_ENV=""`）。
+2. **常规重启发布与在线兼容迁移分开验证**：
+   - Everflow 现网发布继续按 `deploy_main.sh` 验证重启迁移与 4 步实机体检（`/health`、`/openclaw/health`、`check_bridge.sh`、`check_public_edge.sh`）；
+   - 客户升级验证在 CI 中拉起上一批次/上一标签数据库快照与旧版后端容器，先执行新版 `migrate` 容器，断言旧版后端在迁移完成后仍能正常处理请求，再滚动切换到新版后端并执行一次 `backup.sh` → `restore.sh` 全量恢复核验。
 
-| 步骤 | 执行动作 | 验收通过标准 |
-|---|---|---|
-| **1. 初始化与拉起服务** | 运行 `bash scripts/standalone/init.sh --domain localhost --non-interactive`，拉取 GHCR（GitHub Container Registry，GitHub 容器镜像仓库）沙箱缓存镜像，启动 `docker compose -f docker-compose.core.yml`（叠加挂载 `fake-llm` 服务）。 | 所有容器（`postgres`、`redis`、`minio`、`crawler`、`backend`、`edge`、`fake-llm`）在 90 秒内进入 `healthy` / `running` 状态。 |
-| **2. 空库双链迁移与健康检查** | 查询数据库 `alembic_version` 与 `alembic_version_dalton`；运行边缘安全自检。 | 两条迁移链均停在最新 `head`；后端 `/health` 返回 `200`；经 Caddy 访问 `/`、`/version.json` 返回 `200`，伪造 `X-Service-Token` 访问 `/api/v1/users/me` 返回 `401`（请求头已被边缘层剥离）。 |
-| **3. 注册首个管理员** | 使用 Playwright（无头浏览器自动化测试工具）打开 `/setup/admin`，填入当次生成的 `BOOTSTRAP_SETUP_TOKEN`、管理员邮箱与密码完成初始化，并在引导页连接 `fake-llm` 模型。随后再次调用 `/api/v1/dalton/bootstrap/admin`。 | 首次提交成功登录并进入主界面，`dalton_members` 表生成 `tier='admin'` 记录；二次抢注请求返回 `409` 拒绝。 |
-| **4. 新建工作区与沙箱对话一轮** | 在网页新建工作区 `ACME`，发送一条触发沙箱 Python 计算的消息并等待回复完成；刷新页面触发历史重放。 | Docker 成功拉起 `langalpha-sandbox` 容器执行代码，聊天区完整渲染工具调用卡片与最终流式答案，刷新页面后历史回放与流式结果一致。 |
-| **5. 上传文件并在对话中读取** | 在聊天输入框上传一份示例 CSV 文件（另覆盖一次分片大文件上传接口验证 MinIO 通路），发送消息要求智能体核对文件内容。 | 文件成功落入工作区目录，智能体执行代码读出真实行数与字段内容并在回复中正确返回。 |
-| **6. 专属能力零出现断言** | 检查 `backend` 容器全量启动与运行日志；用 API 与 Playwright 巡检工具列表、技能目录、系统提示词、设置页各分组与自动化页面。 | 后端日志零 `:8960`/`:8962` 重连报错；接口与页面 DOM（Document Object Model，网页文档对象模型）中 `alphaengine`、`guidepoint`、`researchdata`、`feishu`、`weixin`、`sales-notes`、`tmtb`、`funda-ai` 及宿主机备份/看门狗条目出现次数全部为 **0**，浏览器控制台零未捕获错误。 |
+### 5.3 干净云主机 AI 盲装测试（基于打包导出产物）
 
-#### （3）预计运行时长
-
-- **日常 PR 常规运行（命中镜像层与依赖缓存）**：**约 6–9 分钟**（Checkout 与环境准备 ~1.5 分钟、后端与前端镜像增量构建 + 拉取沙箱镜像 ~2.5 分钟、空库迁移与服务就绪 ~1 分钟、Playwright 全链路验收 ~2–3 分钟）。
-- **无缓存冷构建或修改 `Dockerfile.sandbox` 时**：**约 18–24 分钟**（设 `timeout-minutes: 30` 上限保护）。
-
-### 5.2 Everflow 安装的回归保护
-
-每一批代码合并前与部署后，通过三道防线确保现有 Mac 生产环境不受任何影响：
-
-1. **现有全量基线门禁必过**：每批 PR 强制跑通 `bash scripts/dalton/pr_baseline.sh --baseline-only`（含 `check_hooks.sh --strict --audit`、后端全量单元测试、前端 TypeScript 类型检查 + Vitest 单元测试、以及 `check-critical-path.mjs` 首屏 gzip ≤ 562 KiB 体积门禁）。
-2. **Everflow 模式快照锁定单测**：在 `tests/unit/dalton/test_everflow_profile_parity.py` 中固定断言：当 `APP_ENV=dalton`（默认 `DALTON_PROFILE=everflow`）时，主智能体与研究总监挂载的工具集合、51 个技能的可见性、`bundled_mcp_servers` 列表以及 `<data_map>` 路由集合与基线快照逐项一致，防止任何能力裁剪误伤 Everflow 模式。
-3. **每批合并后独立发布现网并执行 4 步实机体检**：按 `scripts/dalton/ops/prod/deploy_main.sh` 发布到生产 Mac 后，依次核验 `GET /health`、`GET /api/v1/dalton/openclaw/health`、`bash scripts/dalton/check_bridge.sh`（确认宿主机桥接与声明来源正常）及 `bash scripts/dalton/check_public_edge.sh`。
-
-### 5.3 人工 / AI 代理探索盲测（扮演新客户从零安装）
-
-- **执行时机**：安排在 **Batch 5 合并完成后、Batch 6 收尾阶段**执行（此时核心安装的全部功能裁剪、本地登录与安装脚本初稿均已就绪，盲测发现的文档缺漏与脚本边缘问题直接在 Batch 6 内闭环修复，再进入 Batch 7 封版）。
-- **测试环境准备清单**：
-  1. **干净的云端 Linux 主机**：1 台全新的 Ubuntu 24.04 LTS 云服务器（规格建议 4 vCPU / 16 GB 内存 / 80 GB SSD，无任何 Everflow 历史配置、无代理 Fake-IP，开放公网 `22`/`80`/`443` 端口）；
-  2. **独立测试域名**：1 个已配置 A 记录指向该云主机公网 IP 的二级域名（实测真实公网 DNS、Caddy 自动签发 Let's Encrypt 证书与 HTTPS Cookie 行为）；
-  3. **独立低限额模型 Key**：1 个专门新建、设好 $5 消费上限的商业模型 API Key（与生产凭据完全隔离）；
-  4. **无上下文盲测规则**：启动一个全新的 AI 代理会话，**只提供公开 GitHub 仓库地址、客户安装文档路径、云主机 SSH 登录凭据、测试域名与那 1 个模型 Key**（绝不提供内部架构文档或维护者提示），要求它扮演客户工程师从零完成部署、注册管理员、新建公司工作区、上传一份财报文件并完成带数据核验的研究问答，原样记录全程所有报错、耗时与卡壳步骤作为验收整改单。
+- **执行节点**：在 **Batch 5 合并完成后、Batch 6 内**执行。
+- **输入物严格对齐真实客户交付**：先从当前提交运行 `package_release.sh` 生成干净源码压缩包与干净容器镜像，在全新的 Ubuntu 24.04 云主机（配真实二级域名解析以实测公网 HTTPS 与 `Secure` Cookie）上，启动一个零内部上下文的独立 AI 代理会话，**只给该干净发行包、其中附带的 `STANDALONE-DEPLOY.md` 安装手册、SSH 凭据、测试域名与 1 个 $5 限额商业模型 Key**，要求其独立完成部署、建管理员、发邀请、建工作区、上传财报并发布一份审校报告，暴露的所有卡点在 Batch 6 当批修完。
 
 ---
 
-## 6. 分批开发计划
-
-所有批次均按 **agy Neon High 单轮可独立交付 + codex（`gpt-6.2-sol`）与 `grok 4.7` 双模型审查 + 可独立合并与部署现网** 的粒度切分：
+## 6. 分批开发计划（零文件重叠、每批可独立运行与合入）
 
 ```mermaid
 flowchart LR
-    B1["Batch 1 (6-8人日)<br/>配置分层 + 假模型<br/>跑通 GitHub Actions 空库安装"] --> B2["Batch 2 (7-9人日)<br/>能力注册表 + 拆出 dalton_sec<br/>裁剪工具/MCP/后台协程"]
-    B1 --> B4["Batch 4 (6-8人日)<br/>解锁非 OAuth 模型引导<br/>动态数据库管理员"]
-    B2 --> B3["Batch 3 (6-8人日)<br/>裁剪提示词/数据地图/51技能<br/>品牌与特性开关解耦"]
-    B3 --> B5["Batch 5 (9-12人日)<br/>前端设置/监控按能力隐藏<br/>本地账号登录 + 首管理员自举"]
-    B4 --> B5
-    B5 --> B6["Batch 6 (5-7人日)<br/>一键安装/备份脚本 + 自动 HTTPS<br/>干净云主机 AI 盲测与修复"]
-    B6 --> B7["Batch 7 (4-5人日)<br/>许可证清理 + 纯净打包脚本<br/>升级演练与第①阶段封版"]
+    B1["Batch 1 (9-12人日)<br/>Everflow 快照锁死 + 核心覆盖层<br/>干净打包脚本 + 空库 CI 首通"] --> B2["Batch 2 (8-11人日)<br/>能力注册表 + 拆出 dalton_sec<br/>MCP/工具/路由/任务端到端裁剪"]
+    B2 --> B3["Batch 3 (9-12人日)<br/>技能正文与工作流改写 + 数据地图缓存<br/>前端设置/监控/帮助站裁剪与门禁"]
+    B3 --> B4["Batch 4 (10-14人日)<br/>独立角色与凭据持有人表 + 全入口鉴权<br/>本地账号/永久自举锁/邀请与恢复"]
+    B4 --> B5["Batch 5 (7-10人日)<br/>自定义模型出站防护 + 解锁模型引导<br/>单模型/未知家族正式审校与发布"]
+    B5 --> B6["Batch 6 (8-11人日)<br/>自动 HTTPS + 备份/恢复/升级脚本<br/>导出产物云主机盲测修复与封版"]
 ```
 
-| 批次 | 核心目标 | 主要改动文件 / 目录 | 验收方式 | 预估工作量 | 前置依赖 |
+| 批次 | 核心目标 | 本批独占改动文件 / 目录（跨批零重叠） | 独立运行与合入验收标准 | 预估工作量 | 前置依赖 |
 |---|---|---|---|---:|---|
-| **Batch 1：最小可运行闭环与 GitHub Actions 空库首通** | 引入 `DALTON_PROFILE=everflow \| core` 与 `APP_ENV=core` 叠加层；提供自包含 `docker-compose.core.yml` 与 OpenAI 兼容假模型容器；在免登录开发态下率先跑通 GitHub Actions 全新 Ubuntu 空库双链迁移与首轮沙箱对话。 | `src/dalton/settings.py`、`src/dalton/llm/role_policy.py`、`src/dalton/dalton.core.yaml`（新建）、`config.core.yaml`（新建）、`agent_config.core.yaml`（新建）、`docker-compose.core.yml`（新建）、`tests/fakes/fake_openai_server.py`（新建）、`.github/workflows/standalone-core-e2e.yml`（新建） | GitHub Actions 在空库上跑通 `147 + d044` 迁移、`/health`、新建工作区与假模型代码沙箱对话一轮；`pr_baseline.sh` 全绿，Everflow 现网部署无变化。 | **6–8 人日** | 无（第 1 批） |
-| **Batch 2：统一能力注册表、拆出 `dalton_sec` 与后端裁剪** | 建立 `src/dalton/capabilities.py` 与 `/api/v1/dalton/capabilities` 接口；将公开美股财报工具拆至 `plugins/dalton_sec/`；按能力裁剪 `researchdata` MCP、全部桥接/飞书/Wiki/简报工具、`setup.py` 后台协程、健康探针与系统任务，并加上防漏网单测门禁。 | `src/dalton/capabilities.py`（新建）、`src/dalton/app/router.py`、`plugins/dalton_sec/`（新建）、`plugins/dalton_data/{mcp,plugin}.json`、`src/ptc_agent/config/plugins.py`、`src/dalton/tools/__init__.py`、`src/dalton/data_map/health.py`、`src/dalton/autonomy/system_jobs.py`、`src/server/app/setup.py`、`tests/unit/dalton/test_core_capabilities_gate.py`（新建） | 防漏网门禁单测与 Everflow 快照一致性单测双绿；CI E2E 确认后端启动零桥接重连报错、智能体仅见核心工具与 `dalton_sec`。 | **7–9 人日** | Batch 1 |
-| **Batch 3：提示词、数据地图、技能包裁剪与品牌参数化** | 让 `<tool_guide>`、`<data_map>` 与 51 个技能按能力注册表自动隐藏未装项；剥离 `dalton-conventions` 中的专有合规声明；拆开前端 `isDaltonBuild` 与 `BRAND_NAME` / `BRAND_MARK` 耦合；核心模式默认空覆盖名单。 | `src/dalton/data_map/{sources.yaml,builder.py}`、`src/ptc_agent/agent/prompts/loader.py`、`src/ptc_agent/agent/prompts/templates/{system.md.j2,components/tool_guide.md.j2}`、`src/ptc_agent/agent/middleware/skills/dalton_registry.py`、`plugins/dalton/skills/dalton-conventions/SKILL.md`、`src/server/app/share_pages.py`、`web/src/config/brand.ts`、`src/dalton/coverage/` | 核心模式渲染出的主/子智能体提示词与可见技能中专属词命中数为 **0**；自定义 `BRAND_NAME` 在前后端一致生效；前端首屏体积预算过检。 | **6–8 人日** | Batch 2 |
-| **Batch 4：解锁 API Key 首次模型引导与动态管理员机制** | 解除 `daltonSetup.ts` 仅允许 5 个私有 `-oauth` 模型的限制，使任意 API Key 或自定义网关模型均可完成 `/setup` 引导；辅助/审校槽位支持自动跟随客户已配模型；管理员与团队共享凭据持有人改为优先读取数据库 `dalton_members(tier='admin')`（兼容 `DALTON_PM_USER_IDS`）。 | `web/src/config/daltonSetup.ts`、`web/src/pages/Setup/answers/daltonTeamModelsCheck.ts`、`src/dalton/access_tiers.py`、`src/dalton/credentials.py`、`src/dalton/autonomy/system_jobs.py`、`src/dalton/llm/{assist.py,role_policy.py}` | 单测与前端集成测试确认仅配置单个 API Key（零 OAuth）即可顺畅走完首次引导、模型选择、工作区判重与正式审校；Everflow 现网管理员权限不变。 | **6–8 人日** | Batch 1（可与 Batch 2/3 并行） |
-| **Batch 5：前端设置页裁剪 + 本地登录与首个管理员自举** | 前端设置页、监控面板与侧栏接入 `useCapabilities()` 隐藏未装渠道和运维卡片；实现 `DALTON_AUTH_MODE=local` 轻量本地密码认证、`/setup/admin` 首个管理员一次性口令自举与邀请链接建号，补齐 GitHub Actions 全部 6 项 Playwright 端到端验收。 | `src/dalton/migrations/versions/d045_local_auth.py`（新建独立表）、`src/dalton/auth/`、`src/dalton/invites.py`、`web/src/hooks/useCapabilities.ts`（新建）、`web/src/contexts/AuthContext.tsx`、`web/src/pages/{Login,Setup,Settings,Monitors}/`、`.github/workflows/standalone-core-e2e.yml` | GitHub Actions 全套 6 项 E2E（含管理员自举、二次抢注拦截、建工作区、对话、上传文件、页面零专属残留）全绿；Everflow `supabase` 模式回归测试通过。 | **9–12 人日**（若选方案 A 约 4–5 人日） | Batch 2、Batch 3、Batch 4 |
-| **Batch 6：安装/备份/升级脚本、自动 HTTPS 与云主机盲测** | 交付 `scripts/standalone/{init,backup,restore,upgrade}.sh`、`deploy/standalone/Caddyfile`（支持客户域名自动 HTTPS 与本地 HTTP 切换）及客户安装手册；在干净的 Ubuntu 云主机上执行 AI 代理扮演新客户盲测并修复全部卡点。 | `scripts/standalone/`（新建目录）、`deploy/standalone/Caddyfile`（新建）、`docker-compose.core.yml`、`docs/dalton/dev-guide/STANDALONE-DEPLOY.md`（新建）及盲测问题修补点 | 独立 AI 代理在干净云主机仅凭公开仓库和安装文档一次走通 HTTPS 访问、建管理员、配模型、对话与上传文件，并完成一次备份恢复实测。 | **5–7 人日** | Batch 5 |
-| **Batch 7：许可证清查、纯净发行打包与第 ① 阶段封版** | 梳理 Apache-2.0 `LICENSE` 与 `NOTICE`；提供对外纯净发行打包脚本（自动剥离专有目录与历史内部运维脚本）；完成从上一标签平滑升级演练与发版检查单。 | `NOTICE`、`plugins/dalton_sec/plugin.json`、`scripts/standalone/package_release.sh`（新建）、发版文档 | 导出的纯净包中扫描 `Proprietary`、Everflow 私密邮箱/固定 UUID 命中数为 **0**；原地 `upgrade.sh` 升级成功；核心安装与 Everflow 安装全门禁绿灯。 | **4–5 人日** | Batch 6 |
+| **Batch 1：空库安装底座、Everflow 快照与干净产物 CI 首通** | 先建 `APP_ENV=dalton` 与空 `APP_ENV` 快照单测锁死现网行为；实现 `DALTON_PROFILE` 配置叠加、完整行情/新闻替换链、聊天大文件存储解耦、Compose 覆盖编排（含 `Dockerfile.postgres` 与一次性 `migrate` 服务）、最小 `init.sh`、`package_release.sh` 及 Responses API 假模型，跑通从导出干净包启动的空库 CI。 | `tests/unit/dalton/test_everflow_profile_parity.py`（新建）、`src/dalton/settings.py`、`config.core.yaml`（新建）、`agent_config.core.yaml`（新建）、`src/dalton/dalton.core.yaml`（新建）、`src/dalton/chat_upload_storage.py`、`docker-compose.core.yml`（新建）、`scripts/standalone/init.sh`（新建）、`scripts/standalone/package_release.sh`（新建）、`tests/fakes/fake_openai_server.py`（新建）、`.github/workflows/standalone-core-e2e.yml`（新建） | 导出包与镜像层扫描专有文件为 **0**；CI 在显式开发态下跑通空库 `147 + d044` 迁移、双 worker 启动、真实令牌边缘剥离、沙箱执行、运行中 SSE 断线重连、完成后重放、账本记账与分片大文件上传；Everflow 快照与基线测试全绿。 | **9–12 人日** | 无（第 1 批） |
+| **Batch 2：能力注册表、`dalton_sec` 拆包与后端端到端裁剪** | 交付 `capabilities.py`（含优先级与依赖图）；拆出独立开源插件 `plugins/dalton_sec/` 并兼容旧禁用记录；在合并后有效 MCP 配置、插件目录、直接工具（含 `report_issue`）、模型目录叠加、后台协程、体检、系统任务、通知投递与直接 API 路由全面接入能力拦截。 | `src/dalton/capabilities.py`（新建）、`plugins/dalton_sec/`（新建）、`plugins/dalton_data/{mcp,plugin}.json`、`src/ptc_agent/config/{plugins.py,utils.py}`、`src/server/services/plugins/bundled.py`、`src/dalton/tools/__init__.py`、`src/server/app/setup.py`、`src/dalton/data_map/health.py`、`src/dalton/autonomy/system_jobs.py`、`src/dalton/notify/{dispatch.py,channel_transport.py}`、`src/dalton/app/{router.py,channels_router.py,transcriptions.py,oauth_native.py}`、`src/dalton/llm/overlay.py` | 双 worker 下核心模式零桥接/网关请求、插件列表仅含公开插件与 `dalton_sec`、直接请求未启用 API 路由全部返回 `404`/`403`；Everflow 快照测试与旧禁用兼容测试全绿。 | **8–11 人日** | Batch 1 |
+| **Batch 3：技能正文/工作流改写、提示词/缓存隔离与前端/帮助站裁剪** | 拦截未启用技能按名加载并清理已运行沙箱中的受管技能目录；完成约 29 个核心可见技能正文/`references/` 与 6 个研究工作流的去专有源改写；隔离 `<data_map>` 数据库缓存并清理 `unavailable_sources`；完成提示词、自动化说明、品牌开关兼容解耦、设置页及搜索、监控源与 `/help` 帮助站裁剪，落地全量门禁。 | `src/ptc_agent/agent/middleware/skills/{registry.py,dalton_registry.py}`、`plugins/dalton/skills/**`、`workflows/**`、`src/dalton/data_map/{sources.yaml,builder.py}`、`src/ptc_agent/agent/prompts/loader.py`、`src/ptc_agent/agent/prompts/templates/{system.md.j2,components/tool_guide.md.j2,components/chief_of_staff.md.j2,components/working_with_the_user.md.j2}`、`src/ptc_agent/agent/backends/automations.py`、`src/server/app/share_pages.py`、`src/dalton/coverage/`、`web/src/config/brand.ts`、`web/src/hooks/useCapabilities.ts`（新建）、`web/src/pages/Settings/{sections.ts,panels/dalton/**}`、`web/src/pages/Monitors/**`、`docs-site/**`、`tests/unit/dalton/test_core_capabilities_gate.py`（新建） | 全量可见文本（提示词、缓存数据地图、技能正文与引用、工作流、设置搜索、`/help` 产物）专有词命中数为 **0**；已运行沙箱同步后无未装技能残留；`deploy_main.sh` 零改动且前端体积门禁过检。 | **9–12 人日** | Batch 2 |
+| **Batch 4：独立角色与持有人建模、全入口鉴权与本地登录自举** | 交付 `d045` 角色表、凭据持有人表、密码会话表与永久自举状态表；统一 HTTP、可选鉴权、直接 JWT、WebSocket、SSE 与前端令牌分派；完成 `local` 登录限速、会话轮换撤销、永久自举锁、末位管理员保护、本地单事务邀请兑换与运维 CLI 密码重置。 | `src/dalton/migrations/versions/d045_local_auth_and_roles.py`（新建）、`src/dalton/auth/`（由 `src/dalton/auth.py` 拆包扩展）、`src/server/utils/api.py`、`src/server/auth/{jwt_bearer.py,ws_auth.py}`、`src/dalton/{access_tiers.py,credentials.py,invites.py}`、`web/src/config/daltonAuth.ts`、`web/src/contexts/AuthContext.tsx`、`web/src/api/client.ts`、`web/src/pages/ChatAgent/utils/api/transport.ts`、`web/src/pages/Login/**`、`web/src/pages/Setup/AdminBootstrapStep.tsx`（新建）、`tests/unit/dalton/test_local_auth_entrypoints.py`（新建） | `local` 模式无令牌访问 `/api/v1/users/me`、可选鉴权坏令牌、无令牌 WebSocket 均返回 `401`/`1008`；跨用户工作区隔离成立；自举完成后删改数据仍永久 `409`；本地邀请、持有人转移与 CLI 重置密码实测通过；Everflow `supabase` 模式与 PM 顺序零变化。 | **10–14 人日** | Batch 3 |
+| **Batch 5：自定义模型出站防护、模型引导解锁与单模型正式发布** | 为核心多用户模式开启自定义模型 URL 出站私网拦截与部署者白名单；解除 `daltonSetup.ts` 对 5 个私有 `-oauth` 模型的锁定；统一辅助、数字核验、语言审校与正式审稿的有效模型解析，打通单家族与 `unknown` 家族模型的正式研报发布并将模式写入发布记录。 | `src/server/services/llm/egress.py`、`src/server/app/api_keys.py`、`src/dalton/llm/{role_policy.py,assist.py}`、`src/dalton/publish/{review.py,audit.py}`、`web/src/config/daltonSetup.ts`、`web/src/pages/Setup/answers/daltonTeamModelsCheck.ts`、`tests/unit/dalton/test_core_publish_single_family.py`（新建） | 普通成员提交内网模型 URL 在试连/发现/保存/推理四处均被拦截，部署者白名单网关正常放行；单把 API Key 或自定义网关模型可走完 `/setup`、草稿核验与正式研报发布；Everflow 维持异族审稿规则。 | **7–10 人日** | Batch 4 |
+| **Batch 6：自动 HTTPS、备份/恢复/平滑升级、云主机盲测与封版** | 交付公网/内网 HTTPS 与回环 HTTP 边缘网关配置、备份/恢复/平滑升级脚本、开源声明与完整部署手册；执行上一版本在线兼容升级演练、备份恢复演练，以及基于 `package_release.sh` 导出产物的干净云主机 AI 盲装测试与收尾修复。 | `deploy/standalone/Caddyfile`（新建）、`scripts/standalone/{backup.sh,restore.sh,upgrade.sh}`（新建）、`NOTICE`、`docs/dalton/dev-guide/STANDALONE-DEPLOY.md`（新建）及盲测体验修补点 | 独立 AI 代理仅凭导出的干净发行包与部署文档在公网 HTTPS 云主机一次装通并完成研究发布；上一版本平滑升级与备份恢复校验全绿；双形态全部门禁通过。 | **8–11 人日** | Batch 5 |
 
-- **合计预估工期**：**43–57 人日（按单人全栈开发口径约 8.5–11.5 人周）**。
+- **重新核算后的总工期**：**51–70 人日（按单人全栈口径约 10–14 人周）**。
 
 ---
 
 ## 7. 对上游同步（`git merge upstream/main`）的影响与控制策略
 
-### 7.1 总体影响判断：短期微增极窄接缝，中长期显著降低同步冲突
+### 7.1 实际触碰面核算与中长期收益
 
-1. **短期（第 ① 阶段合入期）**：90% 以上的新增与重构代码落在 `scripts/dalton/dalton_paths.txt` 登记的 Dalton 独占路径内（`src/dalton/`、`config.core.yaml`、`agent_config.core.yaml`、`docker-compose.core.yml`、`scripts/standalone/`、`web/src/config/`、`plugins/dalton_sec/`）。仅需在 `src/ptc_agent/config/plugins.py` 等 2–3 处上游文件增加单行能力过滤调用，新增钩子 ID 可收敛为 **1 个（`core-capabilities`）**。
-2. **中长期（完成后每次追上游同步）**：**冲突率与人工排障成本都会下降**：
-   - 把散落在提示词模板和设置页里的内部源判断统一收进 `src/dalton/capabilities.py` 后，上游调整提示词措辞或新增通用工具时，合并只需保留单行委托调用；
-   - 新增的 GitHub Actions `standalone-core-e2e` 不依赖外部商业密钥即可在每次同步 PR 上自动实跑 Linux + PostgreSQL + Redis + Docker 沙箱全链路，上游改动一旦影响启动、迁移或流式协议，几分钟内即可自动捕获。
+1. **短期上游文件触碰范围（如实核算）**：绝大部分业务逻辑位于 `scripts/dalton/dalton_paths.txt` 登记的 Dalton 独占路径内；按照第 6 节的完整改造范围，需在 **约 12–15 个非独占上游文件**中增加或调整薄委托挂载点（集中在合并配置 `config/{plugins,utils}.py`、插件目录 `bundled.py`、技能解析 `skills/registry.py`、4 份提示词模板与 `automations.py`、3 个认证入口 `api.py`/`jwt_bearer.py`/`ws_auth.py`、模型出站校验 `llm/egress.py` + `api_keys.py`、前端 `AuthContext.tsx` + `brand.ts`），统一归口在 2 个清晰的钩子 ID（`core-capabilities`、`local-auth`）下并登记进 `check_hooks.sh`。
+2. **中长期同步收益**：
+   - 将原先散落在提示词、技能与设置页中的硬编码判断统一收敛为对 `src/dalton/capabilities.py` 和 `src/dalton/auth/` 的单函数调用后，上游重构提示词或鉴权上下文时只需保留单行委托；
+   - `standalone-core-e2e.yml` 零外部密钥即可在每次上游同步 PR 上实跑完整 Linux 容器栈、双迁移链、SSE 重连与沙箱执行，第一时间捕获上游协议变更。
 
 ### 7.2 四条硬性控制规则
 
-1. **坚守 4 个受保护上游文件零改动**：`src/llms/manifest/models.json`、`src/llms/manifest/providers.json`、`agent_config.yaml`、`config.yaml` 保持与上游字节级一致（由 `scripts/dalton/check_hooks.sh:704` 自动拦截），核心安装配置全部走 `*.core.yaml` 叠加。
-2. **薄接缝原则**：凡必须触碰非独占上游文件时，只写一行导入与函数调用（如 `if not should_load_bundled_server(...): continue`），具体判断逻辑一律放在 `src/dalton/` 或 `web/src/lib/dalton/` 内。
-3. **冻结对上游表的结构修改**：保留已发布的 `d004`/`d020`/`d035`/`d038`/`d041`/`d042`/`d043` 迁移不动；自 `d045` 起的新增迁移（如本地认证凭据表）一律只建 `dalton_*` 独立表，避免与上游 `148+` 迁移产生列名或锁冲突。
-4. **保持清晰的发行版边界**：鉴于上游自身的团队与组织连接器（`teams` / `org_connectors` / `org_library`）强绑定其闭源 `AUTH_SERVICE_URL`，在 `config.core.yaml` 中同 `config.dalton.yaml` 一样保持这四项为 `false`，产品交付独立推进，不依赖上游合入团队层 PR。
+1. **坚守 4 个受保护上游基准文件零改动**：`src/llms/manifest/models.json`、`src/llms/manifest/providers.json`、`agent_config.yaml`、`config.yaml` 保持与上游字节级一致（由 `scripts/dalton/check_hooks.sh:704` 自动守卫），行情链、时区与模型覆盖全部放入 `*.core.yaml`。
+2. **薄接缝委托原则**：非独占上游文件中每个挂载点控制在 1–5 行函数调用，禁止在上游文件内直接堆砌多分支业务逻辑。
+3. **冻结对上游表的结构修改**：保留既有 `d004`/`d020`/`d035`/`d038`/`d041`/`d042`/`d043` 不动；自 `d045` 起的新增迁移只创建 `dalton_*` 自有表并满足向后兼容扩展原则。
+4. **复用统一构建与编排底座**：通过 `docker-compose.core.yml` 覆盖 `docker-compose.yml`，复用同一套 `Dockerfile.dalton`、`Dockerfile.postgres` 与迁移入口，`package_release.sh` 只按允许清单筛选文件和产物，始终保持单一代码源。
 
 ---
 
-## 8. 风险清单与待用户决定的问题
+## 8. 风险清单与用户已定事项
 
-### 8.1 主要风险与应对措施
+### 8.1 主要风险与工程应对措施
 
-| 风险项 | 具体表现 | 应对措施 |
+| 风险项 | 具体表现 | 工程应对措施 |
 |---|---|---|
-| **1. Everflow 现网回归风险** | 裁剪专属工具或调整默认配置时，若开关默认值写反，可能导致现网生产环境丢失某项内部工具或定时任务。 | `APP_ENV=dalton` 自动绑定 `DALTON_PROFILE=everflow`（现网无需改 `.env`）；在 Batch 2 建立 `everflow` 模式工具/技能/提示词全量快照对比单测，每批部署后跑完 4 步实机核查再推进下一批。 |
-| **2. 单一模型 Key 与多家族审稿规则冲突** | 现有正式报告发布流程（`src/dalton/llm/role_policy.py:587-603`）要求审稿模型与主模型分属不同厂商家族；而新客户首次安装通常只填 1 家模型（如仅填 `OPENAI_API_KEY`）。 | 在核心模式下调整策略：当客户已接通 ≥ 2 个模型家族时继续执行异族独立复核；当仅配置单一家族时，数字核验与语言审校自动复用该可用模型并在审阅摘要中注明“单家族模式”，保证全流程顺畅可用。 |
-| **3. 大文件上传在单域名下的浏览器直传兼容** | 聊天大文件上传（`d033`）使用对象存储分片预签名 URL；若 MinIO 仅绑容器内网地址，客户浏览器无法直接访问 `http://minio:9000`。 | 在 `deploy/standalone/Caddyfile` 中通过同源路径（如 `/_storage/*`）受控反代本地 MinIO 分片上传请求并自动对齐 `STORAGE_BROWSER_ENDPOINT_URL`，让客户只需配 1 个主域名即可完成大文件直传。 |
-| **4. 公开仓库 CI 运行时长与镜像拉取抖动** | 每次从零编译 `Dockerfile.sandbox` 耗时超过 20 分钟，容易拖慢日常 PR 反馈。 | 在 GitHub Actions 中使用 Docker Buildx 注册表缓存（`type=gha` / GHCR 缓存），仅在 `Dockerfile.sandbox` 或依赖锁变更时重打沙箱层，常规运行控制在 6–9 分钟。 |
-| **5. 专有代码与内部信息随源码流出** | 当前仓库内的 `plugins/dalton_data/` 声明为 `Proprietary`，部分历史运维脚本含内部邮箱与旧工作区 UUID。 | 第 ① 阶段在 Batch 7 提供 `package_release.sh` 导出纯净客户发行包与独立容器镜像；第 ② 阶段将专有连接器正式迁入独立私有仓库。 |
+| **1. 公开仓库与历史提交已含专有源码** | 主仓库保持公开，Git 仓库与历史提交中客观存在 `plugins/dalton_data/`、`researchdata_bridge.py` 及含内部邮箱/UUID 的历史运维脚本；工作流只读权限仅限制令牌写操作，公众仍可读取公开仓源码。 | 文档如实记录该现状边界；所有对外客户分发包、核心容器镜像及 AI 盲测统一由 `package_release.sh` 按白名单导出构建，并在 Batch 1 起用自动化检查确保交付产物与镜像各层零专有文件、启动路径零导入已剔除目录；第 ② 阶段再将商业连接器物理拆入独立私有仓。 |
+| **2. 本地认证在 `HOST_MODE=oss` 下的免密穿透风险** | 漏改任一鉴权入口（如可选鉴权、直接 JWT 依赖或 WebSocket）都会使未带令牌请求落入 `local-dev-user`。 | 在 Batch 4 将全部 6 类前后端认证入口统一改为先按 `DALTON_AUTH_MODE` 分派，仅显式 `oss` 开放开发免密，核心模式缺密钥直接拒绝启动，并用全入口匿名 `401` 与跨用户隔离单测锁死。 |
+| **3. 多用户自定义模型 URL 触发内网探测（SSRF）** | 普通登录成员若可提交任意内网 `base_url` 测试连接，可借后端容器探测宿主机或内网服务。 | 在核心多用户模式下全面启用 `llm/egress.py` 私网与元数据地址拦截（覆盖试连、发现、保存、推理），客户自有内网模型网关统一由部署管理员通过 `DALTON_OPERATOR_LLM_ENDPOINTS` 显式配置。 |
+| **4. 宿主挂载 `docker.sock` 的容器逃逸权限面** | `backend` 通过挂载 `/var/run/docker.sock` 管理代码沙箱，具备宿主机级 Docker 控制权。 | 在部署手册与 `init.sh` 显著位置向客户说明该权限边界，建议独占 Linux 虚拟机部署；同时将沙箱容器置于隔离网桥，阻断其访问数据库、Redis 与套接字。 |
+| **5. Everflow 现网回归与缓存串味风险** | 空 `APP_ENV` 行为变化、前端标志缺省值变更或数据地图缓存未带能力指纹，可能影响现网或单测。 | Batch 1 首步先锁死 `APP_ENV=dalton` 与 `APP_ENV=""` 全量快照测试；`VITE_DALTON_UI` 缺省兼容 `everflow`；`dalton_data_map_cache` 按能力指纹隔离并在双 worker 下验证。 |
+| **6. 单模型或自定义网关下研报发布受阻** | 客户只配一把 Key 或使用自定义网关（模型家族识别为 `unknown`）时，原异族审稿逻辑会拒绝发布。 | 在 Batch 5 改造 `publish/review.py` 与 `publish/audit.py`，核心模式下单家族或未知家族自动复用已配主模型完成审校并在发布记录留痕，Everflow 保持异族强审校。 |
 
-### 8.2 待用户拍板的 5 个问题（附推荐选项）
+### 8.2 已定事项（用户已拍板，不再讨论）
 
-请逐条确认以下决策，确认后即可按第 6 节启动 Batch 1 开发：
-
-1. **核心安装的登录方案（对应已定决定 5）**
-   - 选项 1（**推荐**）：采用 **方案 B（自带轻量本地账号 `DALTON_AUTH_MODE=local` 作为核心安装默认）**，同时完整保留 `supabase` 模式供 Everflow 现网继续运行；企业 OIDC 单点登录留待后续有明确机构客户需求时追加（+4–6 人日）。
-   - 选项 2：继续只支持 Supabase（`DALTON_AUTH_MODE=supabase`），要求新客户自行申请境外 Supabase Cloud 或自建 Supabase 容器群（省 5–7 人日，但客户部署门槛高）。
-   - 选项 3：第 ① 阶段同时交付本地账号 + OIDC 单点登录（工期增加 4–6 人日）。
-
-2. **核心安装的默认品牌名称**
-   - 选项 1（**推荐**）：支持客户在 `.env` 自定义 `BRAND_NAME`；未填时默认使用 **`Dalton`**（助手与平台统一叫 `Dalton`，去除 `Everflow` 字样，也不回退为上游 `LangAlpha`）。
-   - 选项 2：客户未填 `BRAND_NAME` 时回退显示 `LangAlpha`。
-
-3. **Dalton 投研知识层、三情景赔率卡与发布审校是否保留在核心安装中**
-   - 选项 1（**推荐**）：**保留**。公司知识层版本管理、三情景估值推导与草稿数字/语言审校全部运行在容器与 PostgreSQL 内，无任何专有数据耦合，能直接体现产品核心投研能力（将其中的年化回报门槛保持为可改配置，审校模型自动适配客户已配模型）。
-   - 选项 2：核心安装关闭知识层与发布门（`knowledge.enabled: false`、`publish.enabled: false`），退回纯通用聊天工作区。
-
-4. **公开美股财报工具 `dalton_sec` 的拆分与默认启用**
-   - 选项 1（**推荐**）：在 Batch 2 将 `dalton_sec` 从专有的 `plugins/dalton_data/` 拆入独立开源目录 **`plugins/dalton_sec/`（Apache-2.0）**，并在核心安装默认开启，让客户无需购买任何商业数据源即可核验美股官方 XBRL 财报。
-   - 选项 2：暂不拆分，核心安装仅保留上游基础 `get_sec_filing` 直接工具。
-
-5. **对外交付时的纯净包物理裁剪**
-   - 选项 1（**推荐**）：在 Batch 7 提供 `scripts/standalone/package_release.sh`，在向客户交付源码包或构建对外镜像时，**物理剔除** `plugins/dalton_data/`、`scripts/dalton/researchdata_bridge.py`、`scripts/dalton/research_runtime/` 及 Everflow 内部运维脚本（我们自己的主仓库保留全量代码不变）。
-   - 选项 2：第 ① 阶段直接以完整公开仓库原样交付，等到第 ② 阶段拆独立插件仓库时再做物理隔离。
+1. **登录方案（已定）**：核心安装使用自带本地账号（`DALTON_AUTH_MODE=local`），Everflow 继续使用 Supabase（`DALTON_AUTH_MODE=supabase`）；企业单点登录（OIDC）以后再加。
+2. **默认品牌（已定）**：默认品牌名称为 **`Dalton`**，客户可通过 `BRAND_NAME` 自定义修改。
+3. **投研核心能力范围（已定）**：保留投研知识层、三情景估值卡和正式发布审校。
+4. **公开美股财报插件（已定）**：`dalton_sec` 拆为独立开源插件（`plugins/dalton_sec/`，`Apache-2.0`）并在核心安装默认开启，同时保留现有的按插件包禁用语义。
+5. **干净交付产物导出（已定）**：对外交付时导出干净包；主仓库始终只有一套代码，打包脚本只按允许清单选择文件和构建产物，零额外补丁维护。
+6. **主仓库公开策略（已定）**：仓库保持公开，维持现有可见性；GitHub Actions 照常使用公开托管运行器且零读取仓库 Secrets。公开仓库和 Git 历史中本来就有专有源码，打包脚本只决定对外交付物与发行镜像里包含哪些内容。
