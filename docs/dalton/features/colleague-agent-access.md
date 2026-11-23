@@ -51,7 +51,12 @@
 1. **文本文件接受条件与双重密钥检查**：
    - **白名单扩展名**：仅接受 `.md`、`.markdown`、`.txt`、`.csv`、`.tsv`、`.json`、`.jsonl`、`.yaml`、`.yml`、`.py`、`.sql`、`.html`、`.xml`、`.log`（大小写无关）；运行态沙箱读取后对解析出的实际源路径 `source_client_path`（`tools.py:1877`）再次执行 `_is_non_owner_blocked_path` 与扩展名复核；
    - **严格编码与大小**：单文件 `<= 5 MB`（`5 * 1024 * 1024` 字节），原始字节**不含 `NUL`（`b"\x00"`）**且通过**严格 UTF-8 解码**（`raw_bytes.decode("utf-8-sig")`，允许带 BOM〔Byte Order Mark，字节顺序标记〕）；UTF-16 等其他编码或含空字节文件直接拒绝并说明原因；
-   - **解码文本 + 多编码原始字节密钥检查**：加载源工作区所有者 `vault_secrets`，① 对解码后的字符串运行 `get_redactor().redact(text, vault_secrets=vault_secrets) != text`（检查平台密钥、令牌与保险库密钥）；② 复用 `tools.py:1343,1580` 二进制扫描做法，将 `vault_secrets`（长度 `>= MIN_REDACT_SECRET_LEN`）按 `("utf-8", "utf-16-le", "utf-16-be")` 编码后在原始字节中检索。任一命中即拒绝复制并说明原因；均未命中则服务端将原始 `raw_bytes` 逐字节写入目标沙箱（二进制 Office/PDF〔Portable Document Format，便携式文档格式〕/图片保持现有 50 MB 扫描规则不变）。
+   - **解码文本 + 多编码原始字节密钥检查**：加载源工作区所有者 `vault_secrets`，① 对解码后的字符串运行 `get_redactor().redact(text, vault_secrets=vault_secrets) != text`（检查平台密钥、令牌与保险库密钥）；② 复用 `tools.py:1343,1580` 二进制扫描做法，将 `vault_secrets`（长度 `>= MIN_REDACT_SECRET_LEN`）按 `("utf-8", "utf-16-le", "utf-16-be")` 编码后在原始字节中检索。任一命中即拒绝复制并说明原因；均未命中则服务端将原始 `raw_bytes` 逐字节写入目标沙箱。
+   - **二进制文件密钥检查与边界**：
+     - **带宏的 Office 文件一律拒绝**：`.xlsm`、`.docm`、`.pptm`、`.xlam`（以及伪装为无宏扩展名但内嵌 `vbaProject.bin` 的 OOXML 容器）一律拒绝复制并给出说明，防止宏项目夹带无法核验的凭据或代码；
+     - **OOXML 文档（`.docx`、`.xlsx`、`.pptx`）XML 已知密钥检查**：解压后对全部 `.xml` / `.rels` 成员（含 XML 实体反转义）执行与文本复制相同的 `get_redactor().redact(..., vault_secrets=vault_secrets)` 已知密钥检查及多编码保险库凭据检查；
+     - **图片与扫描版 PDF 照常允许复制**：图片（`.png`、`.jpg`、`.jpeg`、`.gif`、`.webp`、`.bmp`、`.tiff`）及纯图片扫描版 PDF 无法检查像素中的文字内容，照常允许通过 `copy_file` 复制（PDF 仍照常执行文本层、对象流、注释与附件扫描，并受页数/流解压量/子进程超时与内存上限约束）。
+   - **撤销共享防落盘（临时文件 + 复核 + 原子改名）**：研究总监与分析师的 `copy_file` 均先将字节写入目标工作区的临时文件（`.wsfiles-copy-*`），落盘完成后在提交前**再复核一次**源端共享权限，复核通过才原子改名为正式目标路径；复核失败或改名异常时立即删除临时文件，目标路径不落盘。
 2. **目的地分流与解析后路径校验**：研究总监保持落入本人 `Home` 或本人工作区；分析师固定落入 `W_cur`（默认 `shared/<filename>`），以 `B` 身份 `acquire_sandbox_to_change(W_cur, B)`，经 `normalize_requested_path`、`_is_non_owner_blocked_path`、`_sibling_folder_named`、`contained_target` 解析出 `dest_abs` 后，**对 `to_client_path(dest_sandbox, dest_abs, dest_work_dir)` 再次执行 `_is_non_owner_blocked_path`**（防符号链接覆盖受保护文件），再调 `aupload_file_bytes` 写入。
 
 ### 3.3 链接识别与来源标注

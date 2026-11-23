@@ -40,13 +40,13 @@ from src.server.services.persistence.resolve import (
 )
 from src.server.services.workspace_file_containment import normalize_requested_path
 # Upstream #666 moved the path-classification helpers into
-# services/served_paths; the aliased names below keep the DALTON-HOOK
-# (workspace-sharing-settings) colleague gate reading the same rules.
+# services/served_paths; the DALTON-HOOK (colleague-access) colleague gate
+# delegates sensitive/hidden path checks there.
 from src.server.services.served_paths import (
     SYSTEM_DIR_PREFIXES,
     is_always_hidden_path,
-    is_always_hidden_path as _is_always_hidden_path,
-    is_hidden_path as _is_hidden_path,
+    # DALTON-HOOK(colleague-access): unified non-owner sensitive path classifier
+    is_non_owner_sensitive_path,
 )
 from ptc_agent.core.paths import HIDDEN_DIR_NAMES
 from src.server.services.thread_folders import ThreadFolderGate
@@ -338,20 +338,17 @@ def _is_system_path(client_path: str) -> bool:
 
 
 # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+# DALTON-HOOK(colleague-access): delegate non-owner sensitive/dotfile/credential checks to served_paths.is_non_owner_sensitive_path
 def _is_non_owner_blocked_path(client_path: str) -> bool:
-    """True when a relative workspace path is hidden, system, or virtual for a colleague."""
+    """True when a relative workspace path is hidden, system, virtual, or sensitive for a colleague."""
     if not client_path:
         return True
     cleaned = client_path.strip("/")
     if not cleaned:
         return True
-    with_slash = f"{cleaned}/"
     return (
-        _is_always_hidden_path(cleaned)
-        or _is_hidden_path(cleaned)
-        or with_slash.startswith(_HIDDEN_DIR_PREFIXES)
+        is_non_owner_sensitive_path(cleaned)
         or _is_system_path(cleaned)
-        or with_slash.startswith(SYSTEM_DIR_PREFIXES)
         or _is_virtual_dir(cleaned)
         or bool(_virtual_file(cleaned))
     )

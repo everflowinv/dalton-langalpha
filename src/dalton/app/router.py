@@ -430,7 +430,7 @@ async def get_workspace_sharing_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     require_capability(CapabilityId.COLLEAGUE_SHARING)
-    from src.server.database.home_workspace import is_home_row
+    from src.server.database.home_workspace import is_home_stand_in_row, is_reserved_row
     from src.dalton.access_tiers import classify_owner_tier, get_user_tier
     from src.dalton.settings import (
         is_colleague_dispatch_enabled,
@@ -456,8 +456,10 @@ async def get_workspace_sharing_endpoint(
     if ws is None or ws.get("status") == "deleted":
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    is_home = is_home_row(ws) or bool(ws.get("is_home"))
     owner_id = str(ws.get("user_id") or "").strip()
+    if is_home_stand_in_row(ws) and owner_id != uid:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    is_home = is_reserved_row(ws) or bool(ws.get("is_home"))
 
     # Classify the owner exactly once per request, before the Home branch and
     # any can_edit decision, so isolation and the owner_external flag can
@@ -564,7 +566,7 @@ async def update_workspace_sharing_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     require_capability(CapabilityId.COLLEAGUE_SHARING)
-    from src.server.database.home_workspace import is_home_row
+    from src.server.database.home_workspace import is_home_stand_in_row, is_reserved_row
     from src.dalton.settings import (
         is_colleague_dispatch_enabled,
         is_dalton_supabase_auth_enabled,
@@ -590,8 +592,10 @@ async def update_workspace_sharing_endpoint(
     if ws is None or ws.get("status") == "deleted":
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    is_home = is_home_row(ws) or bool(ws.get("is_home"))
     owner_id = str(ws.get("user_id") or "").strip()
+    if is_home_stand_in_row(ws) and owner_id != uid:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    is_home = is_reserved_row(ws) or bool(ws.get("is_home"))
 
     # Classify the owner exactly once per request and reuse the result below:
     # a non-owner external caller always gets 404 (Home included); internal
@@ -711,7 +715,7 @@ async def get_workspace_settings_endpoint(
         require_workspace_access,
     )
     from src.server.database import workspace as ws_db
-    from src.server.database.home_workspace import is_home_row
+    from src.server.database.home_workspace import is_home_stand_in_row, is_reserved_row
 
     uid = str(user_id or "").strip()
     if not uid:
@@ -725,8 +729,10 @@ async def get_workspace_settings_endpoint(
     if ws is None or ws.get("status") == "deleted":
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    is_home = is_home_row(ws) or bool(ws.get("is_home"))
     owner_id = str(ws.get("user_id") or "").strip()
+    if is_home_stand_in_row(ws) and owner_id != uid:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    is_home = is_reserved_row(ws) or bool(ws.get("is_home"))
 
     owner_tier: str | None = None
     if is_dalton_supabase_auth_enabled() and owner_id and owner_id != uid:
@@ -823,7 +829,7 @@ async def update_workspace_settings_endpoint(
         upsert_workspace_settings,
     )
     from src.server.database import workspace as ws_db
-    from src.server.database.home_workspace import is_home_row
+    from src.server.database.home_workspace import is_home_stand_in_row, is_reserved_row
 
     uid = str(user_id or "").strip()
     if not uid:
@@ -837,8 +843,10 @@ async def update_workspace_settings_endpoint(
     if ws is None or ws.get("status") == "deleted":
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    is_home = is_home_row(ws) or bool(ws.get("is_home"))
     owner_id = str(ws.get("user_id") or "").strip()
+    if is_home_stand_in_row(ws) and owner_id != uid:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    is_home = is_reserved_row(ws) or bool(ws.get("is_home"))
 
     owner_tier: str | None = None
     if is_dalton_supabase_auth_enabled() and owner_id and owner_id != uid:

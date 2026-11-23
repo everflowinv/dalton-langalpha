@@ -9,8 +9,12 @@ import io
 import json
 import logging
 import os
+import posixpath
 import re
+import shlex
 import sys
+import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from langchain_core.messages import ToolMessage
@@ -1282,7 +1286,14 @@ _COS_COPY_MAX_BYTES = 50 * 1024 * 1024
 _COS_COPY_TEXT_MAX_BYTES = 5 * 1024 * 1024
 _COS_ZIP_MEMBER_MAX_BYTES = 50 * 1024 * 1024
 _COS_ZIP_TOTAL_MAX_BYTES = 100 * 1024 * 1024
-_COS_ZIP_CONTAINER_EXTENSIONS = frozenset({".xlsx", ".xlsm", ".docx", ".pptx"})
+# DALTON-HOOK(colleague-access): refuse macro-enabled Office formats and scan OOXML XML parts with the text secret redactor
+_COS_MACRO_OFFICE_EXTENSIONS = frozenset({".xlsm", ".docm", ".pptm", ".xlam"})
+_COS_MACRO_OFFICE_REFUSED_ERROR = (
+    "带宏的 Office 文件（.xlsm、.docm、.pptm、.xlam）不支持通过 copy_file 复制，"
+    "因为宏项目可能包含无法安全核验的代码或凭据；请另存为无宏格式（.xlsx、.docx、.pptx）后再复制。"
+)
+_COS_ZIP_CONTAINER_EXTENSIONS = frozenset({".xlsx", ".docx", ".pptx"})
+_COS_OOXML_XML_EXTENSIONS = frozenset({".xml", ".rels"})
 _COS_LEGACY_OFFICE_EXTENSIONS = frozenset({".xls", ".doc", ".ppt"})
 _COS_IMAGE_EXTENSIONS = frozenset(
     {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
@@ -1337,7 +1348,7 @@ _COS_ARCHIVE_SIGNATURES = (
     b"\x28\xb5\x2f\xfd",
 )
 _COS_COPY_UNSUPPORTED_ERROR = (
-    "copy_file supports binary Office (.xlsx, .xlsm, .docx, .pptx, .xls, "
+    "copy_file supports binary Office (.xlsx, .docx, .pptx, .xls, "
     ".doc, .ppt), PDF (.pdf), and image (.png, .jpg, .jpeg, .gif, .webp, "
     ".bmp, .tiff) files up to 50 MB, and UTF-8 text files (.md, .markdown, "
     ".txt, .csv, .tsv, .json, .jsonl, .yaml, .yml, .py, .sql, .html, .xml, "
@@ -1359,11 +1370,12 @@ _COS_SCAN_MAX_RSS_BYTES = 1536 * 1024 * 1024
 _COS_PDF_STREAM_TOTAL_MAX_BYTES = 100 * 1024 * 1024
 _COS_SCAN_FAILED_ERROR = "文件内容检查没有完成，不能拷贝"
 _COS_PDF_IMAGE_CODECS = frozenset({"/DCTDecode", "/JPXDecode", "/JBIG2Decode", "/CCITTFaxDecode"})
-# Macro projects and ActiveX controls are OLE parts every .xlsm or form-bearing
-# document carries; they are scanned as raw bytes. Embedded objects
-# (embeddings/oleObject*.bin) wrap whole other files and are refused.
+# DALTON-HOOK(colleague-access): refuse VBA macro projects inside OOXML containers; keep ActiveX raw-scanned.
+_COS_OOXML_VBA_MACRO_PART = re.compile(
+    r"(xl|word|ppt)/vbaProject\.bin", re.IGNORECASE
+)
 _COS_OOXML_OLE_RAW_SCAN_PARTS = re.compile(
-    r"(xl|word|ppt)/(vbaProject\.bin|activeX/activeX\d+\.bin)", re.IGNORECASE
+    r"(xl|word|ppt)/activeX/activeX\d+\.bin", re.IGNORECASE
 )
 _COS_OOXML_MAX_RECURSION_DEPTH = 2
 _OLE_HEADER = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
@@ -1383,16 +1395,17 @@ def _cos_read_channel_max_bytes(sandbox: Any) -> int:
 
 
 # DALTON-HOOK(colleague-access): support both binary Office/PDF/image (<=50 MB) and whitelisted strict UTF-8 text (<=5 MB) copy
-def _is_allowed_binary_copy_extension(file_path: str) -> bool:
-    import os
+def _is_macro_office_extension(file_path: str) -> bool:
+    _, ext = os.path.splitext(file_path)
+    return ext.lower() in _COS_MACRO_OFFICE_EXTENSIONS
 
+
+def _is_allowed_binary_copy_extension(file_path: str) -> bool:
     _, ext = os.path.splitext(file_path)
     return ext.lower() in _COS_COPY_ALLOWED_EXTENSIONS
 
 
 def _is_allowed_text_copy_extension(file_path: str) -> bool:
-    import os
-
     _, ext = os.path.splitext(file_path)
     return ext.lower() in _COS_TEXT_COPY_EXTENSIONS
 
@@ -1648,10 +1661,13 @@ def _scan_copy_bytes_for_secrets(
     已知限制：使用自定义字体编码、没有 ToUnicode 映射的 PDF，pypdf 也提取不出原文，扫描覆盖不到。
     """
     import html
-    import io
-    import os
     import zipfile
-    from src.server.utils.secret_redactor import MIN_REDACT_SECRET_LEN
+    from src.server.utils.secret_redactor import MIN_REDACT_SECRET_LEN, get_redactor
+
+    _, ext = os.path.splitext(file_path)
+    ext_lower = ext.lower()
+    if ext_lower in _COS_MACRO_OFFICE_EXTENSIONS:
+        return _COS_MACRO_OFFICE_REFUSED_ERROR
 
     if format_err := _validate_copy_file_format(file_path, content):
         return format_err
@@ -1688,11 +1704,26 @@ def _scan_copy_bytes_for_secrets(
                     return True
         return False
 
+    def _hits_xml_known_secrets(buf: bytes) -> bool:
+        """Apply the same known-secret redactor check used for text copies to OOXML XML parts."""
+        decode_encodings = (
+            ("utf-8", "utf-16-le", "utf-16-be")
+            if b"\x00" in buf
+            else ("utf-8",)
+        )
+        redactor = get_redactor()
+        for enc in decode_encodings:
+            text = buf.decode(enc, errors="ignore")
+            if redactor.redact(text, vault_secrets=vault_secrets) != text:
+                return True
+            if "&" in text:
+                unescaped = html.unescape(text)
+                if redactor.redact(unescaped, vault_secrets=vault_secrets) != unescaped:
+                    return True
+        return False
+
     if _hits_secret_bytes(content):
         return "文件里含有源用户的凭据，不能拷贝"
-
-    _, ext = os.path.splitext(file_path)
-    ext_lower = ext.lower()
 
     if ext_lower in _COS_ZIP_CONTAINER_EXTENSIONS:
         uncompressed_state = {"total": 0}
@@ -1705,6 +1736,10 @@ def _scan_copy_bytes_for_secrets(
                             continue
                         _, member_ext = os.path.splitext(info.filename)
                         member_ext_lower = member_ext.lower()
+                        if member_ext_lower in _COS_MACRO_OFFICE_EXTENSIONS:
+                            return _COS_MACRO_OFFICE_REFUSED_ERROR
+                        if _COS_OOXML_VBA_MACRO_PART.fullmatch(info.filename):
+                            return _COS_MACRO_OFFICE_REFUSED_ERROR
                         if member_ext_lower in _COS_NESTED_ARCHIVE_EXTENSIONS:
                             return "压缩容器内嵌压缩包，不能拷贝"
                         if info.file_size > _COS_ZIP_MEMBER_MAX_BYTES:
@@ -1724,6 +1759,10 @@ def _scan_copy_bytes_for_secrets(
                             if _hits_secret_bytes(member_bytes):
                                 return "文件里含有源用户的凭据，不能拷贝"
                             continue
+                        if member_ext_lower in _COS_OOXML_XML_EXTENSIONS and _hits_xml_known_secrets(
+                            member_bytes
+                        ):
+                            return "文件里含有密钥或源用户的凭据，不能拷贝"
                         if _hits_secret_with_xml_unescape(member_bytes):
                             return "文件里含有源用户的凭据，不能拷贝"
                         if (
@@ -1841,6 +1880,27 @@ def _scan_copy_bytes_in_child(
         return _COS_SCAN_FAILED_ERROR
 
 
+# DALTON-HOOK(colleague-access): atomic temp-file stage + source recheck helpers for copy_file
+def _bash_succeeded(res: Any) -> bool:
+    if not isinstance(res, dict):
+        return False
+    if "exit_code" in res:
+        try:
+            return int(res["exit_code"]) == 0
+        except (TypeError, ValueError):
+            return False
+    return bool(res.get("success"))
+
+
+async def _remove_temp_copy_file(sandbox: Any, tmp_abs: str) -> None:
+    try:
+        await sandbox.execute_bash_command(
+            command=f"rm -f -- {shlex.quote(tmp_abs)}", timeout=15
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to remove temp copy file {tmp_abs}: {exc}")
+
+
 # DALTON-HOOK(colleague-access): shared server-side copy engine used by CoS and analyst colleague_workspace
 async def _workspace_file_copy_server(
     *,
@@ -1851,6 +1911,7 @@ async def _workspace_file_copy_server(
     dest_path: str | None,
     tool_call_id: str,
     require_dest_owner_user_id: str | None = None,
+    recheck_source_access: Callable[[], Awaitable[Command | None]] | None = None,
 ) -> Command:
     """Copy an allowed binary (<=50 MB) or strict UTF-8 text (<=5 MB) file server-side.
 
@@ -1897,6 +1958,8 @@ async def _workspace_file_copy_server(
             )
             if not file_record:
                 return error_command("file not found", tool_call_id)
+            if _is_macro_office_extension(normalized_path):
+                return error_command(_COS_MACRO_OFFICE_REFUSED_ERROR, tool_call_id)
             if not _is_allowed_copy_extension(normalized_path):
                 return error_command(_COS_COPY_UNSUPPORTED_ERROR, tool_call_id)
             max_bytes, max_label = _copy_max_bytes_for_path(normalized_path)
@@ -1926,6 +1989,8 @@ async def _workspace_file_copy_server(
                 )
             source_client_path = normalized_path
         else:
+            if _is_macro_office_extension(normalized_path):
+                return error_command(_COS_MACRO_OFFICE_REFUSED_ERROR, tool_call_id)
             if not _is_allowed_copy_extension(normalized_path):
                 return error_command(_COS_COPY_UNSUPPORTED_ERROR, tool_call_id)
             async with acquire_sandbox_to_change(source_workspace_id, owner_id) as (
@@ -1953,6 +2018,8 @@ async def _workspace_file_copy_server(
             source_client_path = _to_client_path(sandbox, normalized, work_dir)
             if _is_non_owner_blocked_path(source_client_path):
                 return error_command("file not found", tool_call_id)
+            if _is_macro_office_extension(source_client_path):
+                return error_command(_COS_MACRO_OFFICE_REFUSED_ERROR, tool_call_id)
             if not _is_allowed_copy_extension(source_client_path):
                 return error_command(_COS_COPY_UNSUPPORTED_ERROR, tool_call_id)
             max_bytes, max_label = _copy_max_bytes_for_path(source_client_path)
@@ -2052,9 +2119,39 @@ async def _workspace_file_copy_server(
                     "403 Forbidden: Cannot copy into system, hidden, or virtual paths",
                     tool_call_id,
                 )
-            ok = await dest_sandbox.aupload_file_bytes(dest_abs, content)
-        if not ok:
-            return error_command("Copy failed", tool_call_id)
+            # DALTON-HOOK(colleague-access): write to a transient temp file first, re-verify source
+            # sharing permission before atomic rename, and remove the temp file on any refusal/failure.
+            from ptc_agent.core.paths import TRANSIENT_ROOT_PREFIX
+
+            tmp_abs = (
+                f"{dest_work_dir.rstrip('/')}/"
+                f"{TRANSIENT_ROOT_PREFIX}copy-{uuid.uuid4().hex}"
+            )
+            ok = await dest_sandbox.aupload_file_bytes(tmp_abs, content)
+            if not ok:
+                await _remove_temp_copy_file(dest_sandbox, tmp_abs)
+                return error_command("Copy failed", tool_call_id)
+            committed = False
+            try:
+                if recheck_source_access is not None:
+                    recheck_err = await recheck_source_access()
+                    if recheck_err is not None:
+                        return recheck_err
+                dest_parent = posixpath.dirname(dest_abs)
+                mv_cmd = (
+                    f"test ! -d {shlex.quote(dest_abs)} && "
+                    f"mkdir -p -- {shlex.quote(dest_parent)} && "
+                    f"mv -f -- {shlex.quote(tmp_abs)} {shlex.quote(dest_abs)}"
+                )
+                mv_res = await dest_sandbox.execute_bash_command(
+                    command=mv_cmd, timeout=30
+                )
+                if not _bash_succeeded(mv_res):
+                    return error_command("Copy failed", tool_call_id)
+                committed = True
+            finally:
+                if not committed:
+                    await _remove_temp_copy_file(dest_sandbox, tmp_abs)
         return success_command(
             {
                 "success": True,
@@ -2091,6 +2188,12 @@ async def workspace_file_copy_cos(
     from src.server.database.home_workspace import get_home_workspace_id
 
     dest_id = (dest_workspace_id or "").strip() or get_home_workspace_id(user_id)
+
+    async def _recheck_source_access() -> Command | None:
+        return await verify_workspace_owner(
+            workspace_id, user_id, tool_call_id, need="read"
+        )
+
     return await _workspace_file_copy_server(
         source_workspace_id=workspace_id,
         path=path,
@@ -2099,5 +2202,6 @@ async def workspace_file_copy_cos(
         dest_path=dest_path,
         tool_call_id=tool_call_id,
         require_dest_owner_user_id=user_id,
+        recheck_source_access=_recheck_source_access,
     )
 # --- DALTON-HOOK(workspace-sharing-settings): end ---

@@ -642,6 +642,7 @@ async def get_workspace(workspace_id: str, x_user_id: ReadUserId):
                             )
                         if (
                             workspace is not None
+                            and not is_reserved_row(workspace)
                             and not is_holder(workspace.get("user_id"))
                             and str(workspace.get("user_id") or "") != str(x_user_id)
                             and await user_has_threads_in_workspace(workspace_id, x_user_id)

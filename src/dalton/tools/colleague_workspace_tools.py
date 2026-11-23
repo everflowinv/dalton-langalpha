@@ -378,7 +378,7 @@ def create_colleague_workspace_tools() -> list[BaseTool]:
             )
 
         cur_ws = await get_workspace(w_cur)
-        if not cur_ws or cur_ws.get("status") in ("deleted", "unbound"):
+        if not cur_ws or cur_ws.get("status") in ("deleted", "unbound") or is_reserved_row(cur_ws):
             return error_command("workspace not found", tool_call_id)
 
         owner_b = str(
@@ -672,6 +672,14 @@ def create_colleague_workspace_tools() -> list[BaseTool]:
             config, role="analyst", workspace_id=w_cur
         ):
             return error_command(OUTBOUND_GUARD_PERSIST_ERROR, tool_call_id)
+        async def _recheck_source_access() -> Command | None:
+            refreshed = await get_workspace(target_ws_id)
+            if _is_disallowed_target_workspace(refreshed):
+                return error_command("workspace not found", tool_call_id)
+            return await _dual_verify_workspace(
+                target_ws_id, identities, tool_call_id, need="read"
+            )
+
         return await _workspace_file_copy_server(
             source_workspace_id=target_ws_id,
             path=path,
@@ -680,6 +688,7 @@ def create_colleague_workspace_tools() -> list[BaseTool]:
             dest_path=dest_path,
             tool_call_id=tool_call_id,
             require_dest_owner_user_id=None,
+            recheck_source_access=_recheck_source_access,
         )
 
     return [colleague_workspace]

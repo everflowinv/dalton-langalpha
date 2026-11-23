@@ -53,7 +53,10 @@ def _sharing_auth_enabled() -> bool:
 from src.server.database import conversation as conv_db
 from src.server.database import user as user_db
 from src.server.database import workspace as ws_db
-from src.server.database.home_workspace import is_home_row, is_reserved_row
+from src.server.database.home_workspace import (
+    is_home_stand_in_row,
+    is_reserved_row,
+)
 from src.server.database.pool import get_db_connection
 from src.server.utils import api as auth_api
 
@@ -157,7 +160,7 @@ def can_edit_workspace_sharing(
     if not uid:
         return False
     if (
-        is_home_row(workspace)
+        is_reserved_row(workspace)
         or bool(workspace.get("is_home"))
         or workspace.get("status") in ("unbound", "deleted")
     ):
@@ -479,7 +482,7 @@ def can_edit_workspace_settings(
     if not uid:
         return False
     if (
-        is_home_row(workspace)
+        is_reserved_row(workspace)
         or bool(workspace.get("is_home"))
         or workspace.get("status") in ("unbound", "deleted")
     ):
@@ -900,13 +903,16 @@ async def require_workspace_access(
     if not ws:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
+    owner_id = str(ws.get("user_id") or "").strip()
+    if owner_id != uid and is_home_stand_in_row(ws):
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
     if not _sharing_auth_enabled():
         auth_api.require_workspace_owner(ws, user_id=uid)
         ws["_caller_web_access"] = "owner"
         ws["_caller_cos_access"] = "owner"
         return ws
 
-    owner_id = str(ws.get("user_id") or "").strip()
     if not owner_id:
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -951,7 +957,7 @@ async def require_workspace_access(
         raise HTTPException(status_code=403, detail="Forbidden")
     if owner_tier == "external":
         if (
-            is_home_row(ws)
+            is_reserved_row(ws)
             or bool(ws.get("is_home"))
             or ws.get("status") in ("unbound", "deleted")
         ):
@@ -959,9 +965,9 @@ async def require_workspace_access(
         if cleaned_channel == "cos":
             raise HTTPException(status_code=404, detail="Workspace not found")
 
-    # Personal Home workspaces and deleted/unbound workspaces are never shared with colleagues.
+    # Personal Home workspaces (and Home stand-ins) and deleted/unbound workspaces are never shared with colleagues.
     if (
-        is_home_row(ws)
+        is_reserved_row(ws)
         or bool(ws.get("is_home"))
         or ws.get("status") in ("unbound", "deleted")
     ):
@@ -1101,7 +1107,9 @@ async def require_thread_access(
                 if isinstance(resolved_workspace_id, dict)
                 else await ws_db.get_workspace(str(resolved_workspace_id))
             )
-            if not ws_obj or ws_obj.get("status") in ("unbound", "deleted"):
+            if ws_obj and is_home_stand_in_row(ws_obj):
+                raise HTTPException(status_code=404, detail="Thread not found")
+            if not ws_obj or is_reserved_row(ws_obj) or ws_obj.get("status") in ("unbound", "deleted"):
                 raise HTTPException(status_code=403, detail="Forbidden")
             return thread_owner
         if cleaned_need == "read":
@@ -1129,7 +1137,9 @@ async def require_thread_access(
                 if isinstance(resolved_workspace_id, dict)
                 else await ws_db.get_workspace(str(resolved_workspace_id))
             )
-            if not ws_obj or ws_obj.get("status") in ("unbound", "deleted"):
+            if ws_obj and is_home_stand_in_row(ws_obj):
+                raise HTTPException(status_code=404, detail="Thread not found") from exc
+            if not ws_obj or is_reserved_row(ws_obj) or ws_obj.get("status") in ("unbound", "deleted"):
                 raise HTTPException(status_code=403, detail="Forbidden") from exc
             raise HTTPException(
                 status_code=403,

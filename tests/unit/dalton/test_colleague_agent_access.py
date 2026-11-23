@@ -268,6 +268,7 @@ class TestStrictUtf8TextCopy:
 
         dest_sandbox = create_autospec(PTCSandbox, instance=True)
         dest_sandbox.aupload_file_bytes.return_value = True
+        dest_sandbox.execute_bash_command.return_value = {"success": True, "exit_code": 0}
 
         @asynccontextmanager
         async def _acquire(ws_id: str, owner_id: str):
@@ -319,9 +320,12 @@ class TestStrictUtf8TextCopy:
         payload_ok = _cmd_payload(cmd_ok)
         assert payload_ok["success"] is True
         assert payload_ok["size"] == len(raw_with_bom)
-        dest_sandbox.aupload_file_bytes.assert_awaited_once_with(
-            "/home/workspace/shared/memo.md", raw_with_bom
-        )
+        assert dest_sandbox.aupload_file_bytes.await_count == 1
+        tmp_path, uploaded_bytes = dest_sandbox.aupload_file_bytes.await_args.args
+        assert tmp_path.startswith("/home/workspace/.wsfiles-copy-")
+        assert uploaded_bytes == raw_with_bom
+        mv_cmd = dest_sandbox.execute_bash_command.await_args.kwargs["command"]
+        assert tmp_path in mv_cmd and "/home/workspace/shared/memo.md" in mv_cmd
 
         # Case B: post-resolution symlink resolves into blocked path -> refused before upload
         dest_sandbox.aupload_file_bytes.reset_mock()

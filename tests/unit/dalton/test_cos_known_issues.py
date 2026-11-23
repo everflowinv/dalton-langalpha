@@ -1,0 +1,1289 @@
+"""Unit tests for Chief of Staff known permission issues (#1-#4).
+
+Every item covers both denied cases and normal-sharing-works cases using
+``create_autospec`` test doubles:
+1. Home stand-in workspace (``config.home_stand_in``) rejected uniformly with
+   the same "not found" error as a non-existent workspace/thread across all
+   non-owner entry points (CoS tools, ``colleague_workspace``, file & thread
+   listings, knowledge read, sharing/settings routes), while normal shared
+   workspaces continue to work.
+2. Unified sensitive path filter (``served_paths.is_non_owner_sensitive_path``
+   / ``_shared._is_non_owner_blocked_path``) shared across Chief of Staff,
+   Analyst ``colleague_workspace``, and Web non-owner file routes for ``.env``,
+   ``.env.*``, hidden dotfiles/dirs (except explicit ``.agents/`` shared
+   prefixes), and key/credential filenames (``*.pem``, ``*.key``, ``id_rsa*``,
+   ``credentials*.json``, etc.), while normal shared files work.
+3. Copy-file revocation safety: stages to a transient temp file, re-verifies
+   source sharing permission before atomic rename, and removes the temp file
+   without landing the final file when revoked mid-copy (CoS & Analyst),
+   while normal shared copies commit atomically.
+4. Binary copy secret checks: refuses macro-enabled Office files
+   (``.xlsm``, ``.docm``, ``.pptm``, ``.xlam`` and embedded ``vbaProject.bin``)
+   with an explanation; runs the same text known-secret redactor on unzipped
+   OOXML XML parts (``.docx``, ``.xlsx``, ``.pptx``); and allows clean OOXML,
+   images, and scanned image-only PDFs normally.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import zipfile
+from contextlib import asynccontextmanager
+from typing import Any
+from unittest.mock import create_autospec
+
+import pytest
+from fastapi import HTTPException
+from langchain_core.messages import ToolMessage
+from langgraph.types import Command
+
+from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+from src.dalton import access_tiers as access_tiers_mod
+from src.dalton import auth as dalton_auth_mod
+from src.dalton import colleague_outbound_guard as guard_mod
+from src.dalton import settings as dalton_settings_mod
+from src.dalton import sharing as sharing_mod
+from src.dalton.app import router as dalton_router_mod
+from src.dalton.database import knowledge as db_knowledge_mod
+from src.dalton.database import verdicts as db_verdicts_mod
+from src.dalton.tools import colleague_workspace_tools as cw_mod
+from src.dalton.tools import knowledge_tools as kt_mod
+from src.server.app.workspace_files import _shared as ws_shared_mod
+from src.server.app.workspace_files import backup_reads as backup_reads_mod
+from src.server.app.workspace_files import crud as ws_files_crud_mod
+from src.server.database import conversation as conv_db_mod
+from src.server.database import workspace as ws_db_mod
+from src.server.database.conversation import threads_read as threads_read_mod
+from src.server.services import served_paths as served_paths_mod
+from src.server.services import workspace_files as ws_files_svc_mod
+from src.server.services.persistence import file as persistence_file_mod
+from src.server.services.workspace_file_containment import ContainedFile
+from src.server.utils import secret_redactor as redactor_mod
+from src.server.utils.secret_redactor import SecretRedactor
+from src.tools.secretary import _commands as sec_commands_mod
+from src.tools.secretary import chief_of_staff as cos_mod
+from src.tools.secretary import tools as sec_tools_mod
+
+
+OWNER_ID = "user-owner"
+COLLEAGUE_ID = "user-colleague"
+STAND_IN_WS_ID = "11111111-1111-5111-8111-111111111111"
+NORMAL_WS_ID = "22222222-2222-5222-8222-222222222222"
+MISSING_WS_ID = "33333333-3333-5333-8333-333333333333"
+CUR_WS_ID = "44444444-4444-5444-8444-444444444444"
+HOME_WS_ID = "55555555-5555-5555-8555-555555555555"
+
+STAND_IN_WS_ROW: dict[str, Any] = {
+    "workspace_id": STAND_IN_WS_ID,
+    "user_id": OWNER_ID,
+    "name": "Home Stand-In",
+    "dir_name": "Home",
+    "status": "stopped",
+    "config": {"home_stand_in": True},
+    "computer_id": "comp-owner",
+    "computer_root_dir": "/home/workspace",
+}
+
+NORMAL_SHARED_WS_ROW: dict[str, Any] = {
+    "workspace_id": NORMAL_WS_ID,
+    "user_id": OWNER_ID,
+    "name": "NVDA Deep Dive",
+    "dir_name": "NVDA",
+    "status": "stopped",
+    "config": {},
+    "computer_id": "comp-owner",
+    "computer_root_dir": "/home/workspace",
+}
+
+COLLEAGUE_HOME_ROW: dict[str, Any] = {
+    "workspace_id": HOME_WS_ID,
+    "user_id": COLLEAGUE_ID,
+    "name": "Home",
+    "dir_name": "Home",
+    "status": "running",
+    "config": {},
+    "computer_id": "comp-colleague",
+    "computer_root_dir": "/home/workspace",
+}
+
+COLLEAGUE_CUR_WS_ROW: dict[str, Any] = {
+    "workspace_id": CUR_WS_ID,
+    "user_id": COLLEAGUE_ID,
+    "name": "Semis Tracker",
+    "dir_name": "Semis",
+    "status": "running",
+    "config": {},
+    "computer_id": "comp-colleague",
+    "computer_root_dir": "/home/workspace",
+}
+
+
+def _cmd_payload(cmd: Command) -> dict[str, Any]:
+    msg = cmd.update["messages"][0]
+    assert isinstance(msg, ToolMessage)
+    return json.loads(msg.content)
+
+
+async def _invoke_tool(
+    tool_obj: Any,
+    args: dict[str, Any],
+    *,
+    config: dict[str, Any],
+    call_id: str = "tc-1",
+) -> Any:
+    return await tool_obj.ainvoke(
+        {"name": tool_obj.name, "args": args, "id": call_id, "type": "tool_call"},
+        config=config,
+    )
+
+
+def _patch_sharing_env(
+    monkeypatch: pytest.MonkeyPatch,
+    ws_map: dict[str, dict[str, Any]],
+    *,
+    cos_access: str = "rw",
+    web_access: str = "ro",
+    pm_ids: tuple[str, ...] = (),
+) -> None:
+    """Wire sharing & auth helpers so ``OWNER_ID`` shares normal workspaces to ``COLLEAGUE_ID``."""
+    monkeypatch.setattr(
+        dalton_settings_mod,
+        "is_dalton_sharing_auth_enabled",
+        create_autospec(dalton_settings_mod.is_dalton_sharing_auth_enabled, return_value=True),
+    )
+    monkeypatch.setattr(
+        dalton_settings_mod,
+        "is_dalton_supabase_auth_enabled",
+        create_autospec(dalton_settings_mod.is_dalton_supabase_auth_enabled, return_value=True),
+    )
+    monkeypatch.setattr(
+        dalton_auth_mod,
+        "is_dalton_supabase_auth_enabled",
+        create_autospec(dalton_auth_mod.is_dalton_supabase_auth_enabled, return_value=True),
+    )
+    monkeypatch.setattr(
+        dalton_settings_mod,
+        "is_colleague_dispatch_enabled",
+        create_autospec(dalton_settings_mod.is_colleague_dispatch_enabled, return_value=False),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "_sharing_auth_enabled",
+        create_autospec(sharing_mod._sharing_auth_enabled, return_value=True),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "is_colleague_dispatch_enabled",
+        create_autospec(sharing_mod.is_colleague_dispatch_enabled, return_value=False),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_team_reader",
+        create_autospec(
+            sharing_mod.require_team_reader,
+            side_effect=lambda uid, **kw: str(uid),
+        ),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "get_user_tier",
+        create_autospec(sharing_mod.get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "classify_owner_tier",
+        create_autospec(sharing_mod.classify_owner_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(access_tiers_mod.get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "classify_owner_tier",
+        create_autospec(access_tiers_mod.classify_owner_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "get_workspace_sharing",
+        create_autospec(
+            sharing_mod.get_workspace_sharing,
+            return_value={
+                "workspace_id": NORMAL_WS_ID,
+                "cos_access": cos_access,
+                "web_access": web_access,
+                "updated_by": OWNER_ID,
+                "updated_at": None,
+            },
+        ),
+    )
+    get_ws_mock = create_autospec(
+        ws_db_mod.get_workspace,
+        side_effect=lambda ws_id, **kw: (
+            dict(ws_map[str(ws_id)]) if str(ws_id) in ws_map else None
+        ),
+    )
+    monkeypatch.setattr(ws_db_mod, "get_workspace", get_ws_mock)
+    monkeypatch.setattr(ws_files_crud_mod, "db_get_workspace", get_ws_mock)
+    if pm_ids:
+        orig_get_settings = dalton_router_mod.get_dalton_settings
+        fake_settings = orig_get_settings().model_copy(
+            update={"pm_user_ids": frozenset(pm_ids)}
+        )
+        monkeypatch.setattr(
+            dalton_router_mod,
+            "get_dalton_settings",
+            create_autospec(orig_get_settings, return_value=fake_settings),
+        )
+        monkeypatch.setattr(
+            sharing_mod,
+            "get_dalton_settings",
+            create_autospec(sharing_mod.get_dalton_settings, return_value=fake_settings),
+        )
+
+
+def _make_ooxml_zip(members: dict[str, bytes | str]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        if "[Content_Types].xml" not in members:
+            zf.writestr(
+                "[Content_Types].xml",
+                '<?xml version="1.0" encoding="UTF-8"?><Types/>',
+            )
+        for name, data in members.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def _make_minimal_png() -> bytes:
+    return b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + b"\x00" * 32
+
+
+def _make_scanned_image_pdf() -> bytes:
+    """Minimal valid PDF with one blank/image-style page and no extractable text."""
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+# ===========================================================================
+# 1. Home stand-in (config.home_stand_in) uniform refusal vs normal sharing
+# ===========================================================================
+
+
+class TestHomeStandInRefusal:
+    @pytest.mark.asyncio
+    async def test_require_workspace_access_and_sharing_routes_hide_stand_in_like_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ws_map = {
+            STAND_IN_WS_ID: STAND_IN_WS_ROW,
+            NORMAL_WS_ID: NORMAL_SHARED_WS_ROW,
+        }
+        _patch_sharing_env(monkeypatch, ws_map, pm_ids=(COLLEAGUE_ID,))
+
+        # Denied: non-owner (even PM!) accessing stand-in gets exact same 404 as missing
+        with pytest.raises(HTTPException) as exc_missing:
+            await sharing_mod.require_workspace_access(
+                MISSING_WS_ID, COLLEAGUE_ID, channel="cos", need="read"
+            )
+        with pytest.raises(HTTPException) as exc_stand_in_cos:
+            await sharing_mod.require_workspace_access(
+                STAND_IN_WS_ID, COLLEAGUE_ID, channel="cos", need="read"
+            )
+        with pytest.raises(HTTPException) as exc_stand_in_web:
+            await sharing_mod.require_workspace_access(
+                STAND_IN_WS_ID, COLLEAGUE_ID, channel="web", need="read"
+            )
+        assert exc_stand_in_cos.value.status_code == exc_missing.value.status_code == 404
+        assert exc_stand_in_cos.value.detail == exc_missing.value.detail
+        assert exc_stand_in_web.value.status_code == 404
+        assert exc_stand_in_web.value.detail == exc_missing.value.detail
+
+        # Denied: can_edit helpers reject stand-in even for owner/PM
+        assert sharing_mod.can_edit_workspace_sharing(STAND_IN_WS_ROW, COLLEAGUE_ID) is False
+        assert sharing_mod.can_edit_workspace_sharing(STAND_IN_WS_ROW, OWNER_ID) is False
+        assert sharing_mod.can_edit_workspace_settings(STAND_IN_WS_ROW, OWNER_ID) is False
+
+        # Denied: sharing & settings REST endpoints return 404 for non-owner (including PM)
+        for endpoint, args in (
+            (dalton_router_mod.get_workspace_sharing_endpoint, (STAND_IN_WS_ID, COLLEAGUE_ID)),
+            (
+                dalton_router_mod.update_workspace_sharing_endpoint,
+                (
+                    STAND_IN_WS_ID,
+                    dalton_router_mod.WorkspaceSharingUpdateRequest(web_access="ro"),
+                    COLLEAGUE_ID,
+                ),
+            ),
+            (dalton_router_mod.get_workspace_settings_endpoint, (STAND_IN_WS_ID, COLLEAGUE_ID)),
+            (
+                dalton_router_mod.update_workspace_settings_endpoint,
+                (
+                    STAND_IN_WS_ID,
+                    dalton_router_mod.WorkspaceSettingsUpdateRequest(team_memory_enabled=True),
+                    COLLEAGUE_ID,
+                ),
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc_ep:
+                await endpoint(*args)
+            assert exc_ep.value.status_code == 404
+            assert exc_ep.value.detail == "Workspace not found"
+
+        # Normal sharing works: colleague reads normal shared workspace & owner still accesses own stand-in
+        ws_ok = await sharing_mod.require_workspace_access(
+            NORMAL_WS_ID, COLLEAGUE_ID, channel="cos", need="read"
+        )
+        assert ws_ok["workspace_id"] == NORMAL_WS_ID
+        own_stand_in = await sharing_mod.require_workspace_access(
+            STAND_IN_WS_ID, OWNER_ID, channel="web", need="read"
+        )
+        assert own_stand_in["workspace_id"] == STAND_IN_WS_ID
+
+    @pytest.mark.asyncio
+    async def test_cos_tools_colleague_workspace_and_knowledge_read_refuse_stand_in_and_allow_normal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        orig_supabase_auth_enabled = dalton_auth_mod.is_dalton_supabase_auth_enabled
+        ws_map = {
+            STAND_IN_WS_ID: STAND_IN_WS_ROW,
+            NORMAL_WS_ID: NORMAL_SHARED_WS_ROW,
+            CUR_WS_ID: COLLEAGUE_CUR_WS_ROW,
+            HOME_WS_ID: COLLEAGUE_HOME_ROW,
+        }
+        _patch_sharing_env(monkeypatch, ws_map, cos_access="ro", web_access="ro")
+
+        monkeypatch.setattr(
+            persistence_file_mod.FilePersistenceService,
+            "get_file_tree",
+            staticmethod(
+                create_autospec(
+                    persistence_file_mod.FilePersistenceService.get_file_tree,
+                    return_value=[{"path": "reports/q3.md"}],
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            persistence_file_mod.FilePersistenceService,
+            "get_file_content",
+            staticmethod(
+                create_autospec(
+                    persistence_file_mod.FilePersistenceService.get_file_content,
+                    return_value={
+                        "path": "reports/q3.md",
+                        "is_binary": False,
+                        "file_size": 12,
+                    },
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            ws_shared_mod,
+            "http_file_text",
+            create_autospec(ws_shared_mod.http_file_text, return_value="# Q3 Report"),
+        )
+        monkeypatch.setattr(
+            redactor_mod,
+            "get_vault_secrets_for_redaction",
+            create_autospec(redactor_mod.get_vault_secrets_for_redaction, return_value={}),
+        )
+        monkeypatch.setattr(
+            threads_read_mod,
+            "get_workspace_threads",
+            create_autospec(
+                threads_read_mod.get_workspace_threads,
+                return_value=([{"conversation_thread_id": "t-normal", "title": "Q3", "current_status": "idle"}], 1),
+            ),
+        )
+        monkeypatch.setattr(
+            threads_read_mod,
+            "get_thread_owner_id",
+            create_autospec(
+                threads_read_mod.get_thread_owner_id,
+                side_effect=lambda tid: None if tid == "t-missing" else OWNER_ID,
+            ),
+        )
+
+        async def _thread_meta(tid: str, **kw: Any) -> dict[str, Any] | None:
+            if tid == "t-stand-in":
+                return {
+                    "workspace_id": STAND_IN_WS_ID,
+                    "workspace_owner_id": OWNER_ID,
+                    "user_id": OWNER_ID,
+                    "thread_user_id": OWNER_ID,
+                }
+            if tid == "t-normal":
+                return {
+                    "workspace_id": NORMAL_WS_ID,
+                    "workspace_owner_id": OWNER_ID,
+                    "user_id": OWNER_ID,
+                    "thread_user_id": OWNER_ID,
+                }
+            return None
+
+        monkeypatch.setattr(
+            threads_read_mod,
+            "get_thread_auth_meta",
+            create_autospec(threads_read_mod.get_thread_auth_meta, side_effect=_thread_meta),
+        )
+        monkeypatch.setattr(
+            conv_db_mod,
+            "get_thread_auth_meta",
+            create_autospec(conv_db_mod.get_thread_auth_meta, side_effect=_thread_meta),
+        )
+        monkeypatch.setattr(
+            cw_mod,
+            "get_thread_auth_meta",
+            create_autospec(cw_mod.get_thread_auth_meta, side_effect=_thread_meta),
+        )
+        monkeypatch.setattr(
+            cw_mod,
+            "get_workspace",
+            create_autospec(
+                cw_mod.get_workspace,
+                side_effect=lambda ws_id: dict(ws_map[str(ws_id)]) if str(ws_id) in ws_map else None,
+            ),
+        )
+        monkeypatch.setattr(
+            guard_mod,
+            "mark_run_outbound_blocked",
+            create_autospec(guard_mod.mark_run_outbound_blocked, return_value=True),
+        )
+        monkeypatch.setattr(
+            cw_mod,
+            "mark_run_outbound_blocked",
+            create_autospec(cw_mod.mark_run_outbound_blocked, return_value=True),
+        )
+
+        # 1) CoS list_files / read_file / threads_list / verify_thread_owner refuse stand-in identically to missing
+        p_missing_list = _cmd_payload(
+            await sec_tools_mod.workspace_files_list_cos(COLLEAGUE_ID, MISSING_WS_ID, None, "tc-1")
+        )
+        p_standin_list = _cmd_payload(
+            await sec_tools_mod.workspace_files_list_cos(COLLEAGUE_ID, STAND_IN_WS_ID, None, "tc-2")
+        )
+        assert p_standin_list == p_missing_list == {"success": False, "error": "workspace not found"}
+
+        p_standin_read = _cmd_payload(
+            await sec_tools_mod.workspace_file_read_cos(COLLEAGUE_ID, STAND_IN_WS_ID, "reports/q3.md", "tc-3")
+        )
+        assert p_standin_read == {"success": False, "error": "workspace not found"}
+
+        p_standin_threads = _cmd_payload(
+            await sec_tools_mod.threads_list(COLLEAGUE_ID, STAND_IN_WS_ID, "tc-4")
+        )
+        assert p_standin_threads == {"success": False, "error": "workspace not found"}
+
+        err_missing_thread = await sec_commands_mod.verify_thread_owner("t-missing", COLLEAGUE_ID, "tc-5")
+        err_standin_thread = await sec_commands_mod.verify_thread_owner("t-stand-in", COLLEAGUE_ID, "tc-6")
+        assert err_standin_thread is not None and err_missing_thread is not None
+        assert _cmd_payload(err_standin_thread) == _cmd_payload(err_missing_thread)
+
+        # Normal CoS sharing works
+        p_ok_list = _cmd_payload(
+            await sec_tools_mod.workspace_files_list_cos(COLLEAGUE_ID, NORMAL_WS_ID, None, "tc-7")
+        )
+        assert p_ok_list["success"] is True
+        assert p_ok_list["files"] == ["reports/q3.md"]
+        p_ok_read = _cmd_payload(
+            await sec_tools_mod.workspace_file_read_cos(COLLEAGUE_ID, NORMAL_WS_ID, "reports/q3.md", "tc-8")
+        )
+        assert p_ok_read["success"] is True and "# Q3 Report" in p_ok_read["content"]
+        p_ok_threads = _cmd_payload(
+            await sec_tools_mod.threads_list(COLLEAGUE_ID, NORMAL_WS_ID, "tc-9")
+        )
+        assert p_ok_threads["success"] is True and len(p_ok_threads["threads"]) == 1
+        assert await sec_commands_mod.verify_thread_owner("t-normal", COLLEAGUE_ID, "tc-10") is None
+
+        # 2) Analyst colleague_workspace refuses stand-in identically to missing, allows normal shared workspace
+        cw_tool = cw_mod.create_colleague_workspace_tools()[0]
+        analyst_cfg = {
+            "configurable": {
+                "user_id": COLLEAGUE_ID,
+                "workspace_id": CUR_WS_ID,
+                "workspace_owner_id": COLLEAGUE_ID,
+                "origin_channel": "web",
+            }
+        }
+        p_cw_standin = _cmd_payload(
+            await _invoke_tool(
+                cw_tool,
+                {"action": "list_files", "workspace_id": STAND_IN_WS_ID},
+                config=analyst_cfg,
+            )
+        )
+        p_cw_missing = _cmd_payload(
+            await _invoke_tool(
+                cw_tool,
+                {"action": "list_files", "workspace_id": MISSING_WS_ID},
+                config=analyst_cfg,
+            )
+        )
+        assert p_cw_standin == p_cw_missing == {"success": False, "error": "workspace not found"}
+
+        p_cw_thread_standin = _cmd_payload(
+            await _invoke_tool(
+                cw_tool,
+                {"action": "read_thread", "thread_id": "t-stand-in"},
+                config=analyst_cfg,
+            )
+        )
+        assert p_cw_thread_standin == {"success": False, "error": "thread not found"}
+
+        p_cw_normal = _cmd_payload(
+            await _invoke_tool(
+                cw_tool,
+                {"action": "list_files", "workspace_id": NORMAL_WS_ID},
+                config=analyst_cfg,
+            )
+        )
+        assert p_cw_normal["success"] is True and p_cw_normal["count"] == 1
+
+        # 3) knowledge_read (both CoS and Analyst) refuses stand-in with same 404 as missing, allows normal
+        monkeypatch.setattr(
+            db_knowledge_mod,
+            "latest_valid_version",
+            create_autospec(
+                db_knowledge_mod.latest_valid_version,
+                return_value={"version_no": 2, "content": {"summary": "NVDA thesis"}},
+            ),
+        )
+        monkeypatch.setattr(
+            db_knowledge_mod,
+            "latest_version",
+            create_autospec(
+                db_knowledge_mod.latest_version,
+                return_value={"version_no": 2, "content": {"summary": "NVDA thesis"}},
+            ),
+        )
+        monkeypatch.setattr(
+            db_verdicts_mod,
+            "list_verdicts",
+            create_autospec(db_verdicts_mod.list_verdicts, return_value=[]),
+        )
+
+        cos_k_read = kt_mod.create_knowledge_tools(None, role="chief_of_staff")[2]
+        cos_cfg = {"configurable": {"user_id": COLLEAGUE_ID, "workspace_id": HOME_WS_ID}}
+        with pytest.raises(HTTPException) as exc_k_missing:
+            await _invoke_tool(
+                cos_k_read,
+                {"workspace_id": MISSING_WS_ID, "doc": "thesis"},
+                config=cos_cfg,
+            )
+        with pytest.raises(HTTPException) as exc_k_standin:
+            await _invoke_tool(
+                cos_k_read,
+                {"workspace_id": STAND_IN_WS_ID, "doc": "thesis"},
+                config=cos_cfg,
+            )
+        assert exc_k_standin.value.status_code == exc_k_missing.value.status_code == 404
+
+        raw_k_ok = await _invoke_tool(
+            cos_k_read,
+            {"workspace_id": NORMAL_WS_ID, "doc": "thesis"},
+            config=cos_cfg,
+        )
+        assert json.loads(raw_k_ok.content)["ok"] is True
+
+        analyst_k_read = kt_mod.create_knowledge_tools(None, role="analyst")[2]
+        with pytest.raises(HTTPException) as exc_ak_standin:
+            await _invoke_tool(
+                analyst_k_read,
+                {"workspace_id": STAND_IN_WS_ID, "doc": "thesis"},
+                config=analyst_cfg,
+            )
+        assert exc_ak_standin.value.status_code == 404
+        raw_ak_ok = await _invoke_tool(
+            analyst_k_read,
+            {"workspace_id": NORMAL_WS_ID, "doc": "thesis"},
+            config=analyst_cfg,
+        )
+        assert "NVDA thesis" in raw_ak_ok.content
+
+        # 4) Web files & threads list endpoints refuse stand-in with 404
+        with pytest.raises(HTTPException) as exc_wf_standin:
+            await ws_files_crud_mod.list_workspace_files(
+                workspace_id=STAND_IN_WS_ID,
+                x_user_id=COLLEAGUE_ID,
+                path=".",
+                include_system=False,
+                pattern="**/*",
+                wait_for_sandbox=False,
+                auto_start=False,
+                backup_ok=True,
+            )
+        assert exc_wf_standin.value.status_code == 404
+
+        # Verify dalton_auth.verify_workspace_access also rejects stand-in with exact 404 when auth off
+        monkeypatch.setattr(
+            dalton_auth_mod,
+            "is_dalton_supabase_auth_enabled",
+            create_autospec(orig_supabase_auth_enabled, return_value=False),
+        )
+        with pytest.raises(HTTPException) as exc_auth_standin:
+            await dalton_auth_mod.verify_workspace_access(
+                STAND_IN_WS_ID, COLLEAGUE_ID, need="read", channel="cos"
+            )
+        assert exc_auth_standin.value.status_code == 404
+        assert exc_auth_standin.value.detail == f"Workspace '{STAND_IN_WS_ID}' not found"
+        # Unused import reference check: cos_mod.agent_output delegates to verify_thread_owner
+        assert callable(cos_mod.agent_output.coroutine)
+
+
+# ===========================================================================
+# 2. Unified sensitive path filter across CoS, Analyst, and Web non-owner routes
+# ===========================================================================
+
+
+class TestUnifiedSensitivePathFilter:
+    @pytest.mark.parametrize(
+        "blocked_path",
+        [
+            ".env",
+            ".env.local",
+            ".env.production",
+            "config/.env",
+            "config/.env.staging",
+            "prod.env",
+            ".hidden",
+            "reports/.secret.md",
+            ".ssh/id_rsa",
+            ".aws/credentials",
+            "sub/.hidden_dir/readme.md",
+            ".agents/memory/notes.md",
+            ".agents/skills/foo/SKILL.md",
+            "certs/server.pem",
+            "tls/PRIVATE.KEY",
+            "keys/id_rsa",
+            "keys/id_rsa.pub",
+            "keys/id_rsa_prod",
+            "keys/id_ed25519",
+            "gcp/credentials.json",
+            "gcp/credentials_prod.json",
+            "auth/client_secret_app.json",
+            "auth/service_account.json",
+            "secrets.yaml",
+            "secrets.json",
+            "cert.p12",
+            "cert.pfx",
+            "putty.ppk",
+        ],
+    )
+    def test_sensitive_paths_blocked_by_shared_classifier(self, blocked_path: str) -> None:
+        assert served_paths_mod.is_non_owner_sensitive_path(blocked_path) is True
+        assert ws_shared_mod._is_non_owner_blocked_path(blocked_path) is True
+
+    @pytest.mark.parametrize(
+        "allowed_path",
+        [
+            "reports/q3_summary.md",
+            "notes/key_drivers.md",
+            "data/company.json",
+            "models/NVDA_DCF.xlsx",
+            "shared/valuation_key_points.txt",
+            "work/task1/output.html",
+        ],
+    )
+    def test_normal_research_paths_allowed_by_shared_classifier(self, allowed_path: str) -> None:
+        assert served_paths_mod.is_non_owner_sensitive_path(allowed_path) is False
+        assert ws_shared_mod._is_non_owner_blocked_path(allowed_path) is False
+
+    def test_explicit_agents_shared_prefix_carveout_allows_normal_and_blocks_sensitive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            served_paths_mod,
+            "_NON_OWNER_SHARED_AGENTS_PREFIXES",
+            (".agents/shared",),
+        )
+        assert served_paths_mod.is_non_owner_sensitive_path(".agents/shared/guide.md") is False
+        assert served_paths_mod.is_non_owner_sensitive_path(".agents/shared/.env") is True
+        assert served_paths_mod.is_non_owner_sensitive_path(".agents/shared/private.key") is True
+        assert served_paths_mod.is_non_owner_sensitive_path(".agents/memory/private.md") is True
+
+    @pytest.mark.asyncio
+    async def test_cos_analyst_and_web_backup_share_same_sensitive_path_filter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ws_map = {
+            NORMAL_WS_ID: NORMAL_SHARED_WS_ROW,
+            CUR_WS_ID: COLLEAGUE_CUR_WS_ROW,
+            HOME_WS_ID: COLLEAGUE_HOME_ROW,
+        }
+        _patch_sharing_env(monkeypatch, ws_map, cos_access="ro", web_access="ro")
+
+        tree = [
+            {"path": "reports/q3.md"},
+            {"path": "notes/key_drivers.md"},
+            {"path": ".env"},
+            {"path": ".env.production"},
+            {"path": "sub/.hidden.txt"},
+            {"path": "certs/api.pem"},
+            {"path": "certs/tls.key"},
+            {"path": "keys/id_rsa"},
+            {"path": "gcp/credentials_prod.json"},
+            {"path": ".agents/memory/secret.md"},
+        ]
+        monkeypatch.setattr(
+            persistence_file_mod.FilePersistenceService,
+            "get_file_tree",
+            staticmethod(
+                create_autospec(
+                    persistence_file_mod.FilePersistenceService.get_file_tree,
+                    return_value=tree,
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            persistence_file_mod.FilePersistenceService,
+            "get_file_content",
+            staticmethod(
+                create_autospec(
+                    persistence_file_mod.FilePersistenceService.get_file_content,
+                    side_effect=lambda ws_id, path: {
+                        "path": path,
+                        "is_binary": False,
+                        "file_size": 10,
+                    },
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            ws_shared_mod,
+            "http_file_text",
+            create_autospec(ws_shared_mod.http_file_text, return_value="normal text"),
+        )
+        monkeypatch.setattr(
+            redactor_mod,
+            "get_vault_secrets_for_redaction",
+            create_autospec(redactor_mod.get_vault_secrets_for_redaction, return_value={}),
+        )
+        monkeypatch.setattr(
+            cw_mod,
+            "get_workspace",
+            create_autospec(
+                cw_mod.get_workspace,
+                side_effect=lambda ws_id: dict(ws_map[str(ws_id)]) if str(ws_id) in ws_map else None,
+            ),
+        )
+        monkeypatch.setattr(
+            cw_mod,
+            "mark_run_outbound_blocked",
+            create_autospec(cw_mod.mark_run_outbound_blocked, return_value=True),
+        )
+
+        # 1) CoS list_files / read_file / copy_file
+        cos_list = _cmd_payload(
+            await sec_tools_mod.workspace_files_list_cos(COLLEAGUE_ID, NORMAL_WS_ID, None, "tc-1")
+        )
+        assert cos_list["success"] is True
+        assert cos_list["files"] == ["reports/q3.md", "notes/key_drivers.md"]
+
+        for sensitive in (".env", ".env.production", "sub/.hidden.txt", "certs/api.pem", "keys/id_rsa", "gcp/credentials_prod.json"):
+            read_p = _cmd_payload(
+                await sec_tools_mod.workspace_file_read_cos(COLLEAGUE_ID, NORMAL_WS_ID, sensitive, "tc-r")
+            )
+            assert read_p == {"success": False, "error": "file not found"}
+            copy_p = _cmd_payload(
+                await sec_tools_mod.workspace_file_copy_cos(COLLEAGUE_ID, NORMAL_WS_ID, sensitive, None, "tc-c")
+            )
+            assert copy_p == {"success": False, "error": "file not found"}
+
+        # 2) Analyst colleague_workspace list_files / read_file / copy_file
+        cw_tool = cw_mod.create_colleague_workspace_tools()[0]
+        analyst_cfg = {
+            "configurable": {
+                "user_id": COLLEAGUE_ID,
+                "workspace_id": CUR_WS_ID,
+                "workspace_owner_id": COLLEAGUE_ID,
+                "origin_channel": "web",
+            }
+        }
+        cw_list = _cmd_payload(
+            await _invoke_tool(
+                cw_tool,
+                {"action": "list_files", "workspace_id": NORMAL_WS_ID},
+                config=analyst_cfg,
+            )
+        )
+        assert cw_list["success"] is True
+        assert cw_list["count"] == 2
+        assert all(".env" not in entry and "credentials" not in entry and "id_rsa" not in entry for entry in cw_list["files"])
+
+        for sensitive in (".env", "certs/tls.key", "gcp/credentials_prod.json"):
+            cw_read = _cmd_payload(
+                await _invoke_tool(
+                    cw_tool,
+                    {"action": "read_file", "workspace_id": NORMAL_WS_ID, "path": sensitive},
+                    config=analyst_cfg,
+                )
+            )
+            assert cw_read == {"success": False, "error": "file not found"}
+            cw_copy = _cmd_payload(
+                await _invoke_tool(
+                    cw_tool,
+                    {"action": "copy_file", "workspace_id": NORMAL_WS_ID, "path": sensitive},
+                    config=analyst_cfg,
+                )
+            )
+            assert cw_copy == {"success": False, "error": "file not found"}
+
+        # Normal read still succeeds for both CoS and Analyst
+        assert _cmd_payload(
+            await sec_tools_mod.workspace_file_read_cos(COLLEAGUE_ID, NORMAL_WS_ID, "notes/key_drivers.md", "tc-ok")
+        )["success"] is True
+        assert _cmd_payload(
+            await _invoke_tool(
+                cw_tool,
+                {"action": "read_file", "workspace_id": NORMAL_WS_ID, "path": "notes/key_drivers.md"},
+                config=analyst_cfg,
+            )
+        )["success"] is True
+
+        # 3) Web backup_listing & read_from_backup non-owner path filter
+        web_files = await backup_reads_mod.backup_listing(
+            NORMAL_WS_ID, ".", False, "/home/workspace/NVDA", (), is_non_owner_reader=True
+        )
+        assert web_files == ["reports/q3.md", "notes/key_drivers.md"]
+        with pytest.raises(HTTPException) as exc_web_read:
+            await backup_reads_mod.read_from_backup(
+                NORMAL_WS_ID,
+                NORMAL_SHARED_WS_ROW,
+                ".env.production",
+                "/home/workspace/NVDA",
+                (),
+                0,
+                100,
+                True,
+                is_non_owner_reader=True,
+            )
+        assert exc_web_read.value.status_code == 404
+
+
+# ===========================================================================
+# 3. Copy-file atomic temp write + source re-check + cleanup on revocation
+# ===========================================================================
+
+
+class TestCopyFileRevocationAtomicity:
+    def _setup_copy_env(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        file_bytes: bytes,
+        file_path: str = "notes/report.md",
+        dest_row: dict[str, Any] = COLLEAGUE_HOME_ROW,
+    ) -> PTCSandbox:
+        ws_map = {
+            NORMAL_WS_ID: NORMAL_SHARED_WS_ROW,
+            dest_row["workspace_id"]: dest_row,
+        }
+        monkeypatch.setattr(
+            ws_db_mod,
+            "get_workspace",
+            create_autospec(
+                ws_db_mod.get_workspace,
+                side_effect=lambda ws_id: dict(ws_map[str(ws_id)]) if str(ws_id) in ws_map else None,
+            ),
+        )
+        monkeypatch.setattr(
+            cw_mod,
+            "get_workspace",
+            create_autospec(
+                cw_mod.get_workspace,
+                side_effect=lambda ws_id: dict(ws_map[str(ws_id)]) if str(ws_id) in ws_map else None,
+            ),
+        )
+        monkeypatch.setattr(
+            persistence_file_mod.FilePersistenceService,
+            "get_file_content",
+            staticmethod(
+                create_autospec(
+                    persistence_file_mod.FilePersistenceService.get_file_content,
+                    return_value={
+                        "path": file_path,
+                        "is_binary": False,
+                        "file_size": len(file_bytes),
+                    },
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            ws_shared_mod,
+            "http_file_bytes",
+            create_autospec(ws_shared_mod.http_file_bytes, return_value=file_bytes),
+        )
+        monkeypatch.setattr(
+            redactor_mod,
+            "get_vault_secrets_for_redaction",
+            create_autospec(redactor_mod.get_vault_secrets_for_redaction, return_value={}),
+        )
+
+        import src.server.database.home_workspace as home_ws_mod
+
+        monkeypatch.setattr(
+            home_ws_mod,
+            "get_home_workspace_id",
+            create_autospec(home_ws_mod.get_home_workspace_id, return_value=HOME_WS_ID),
+        )
+
+        dest_sandbox = create_autospec(PTCSandbox, instance=True)
+        dest_sandbox.aupload_file_bytes.return_value = True
+        dest_sandbox.execute_bash_command.return_value = {"success": True, "exit_code": 0}
+
+        @asynccontextmanager
+        async def _acquire(ws_id: str, owner_id: str):
+            yield dest_sandbox, dest_row
+
+        monkeypatch.setattr(ws_files_svc_mod, "acquire_sandbox_to_change", _acquire)
+        monkeypatch.setattr(
+            ws_files_svc_mod,
+            "owner_work_dir",
+            create_autospec(
+                ws_files_svc_mod.owner_work_dir,
+                return_value=f"/home/workspace/{dest_row['dir_name']}",
+            ),
+        )
+        monkeypatch.setattr(
+            ws_files_svc_mod,
+            "previous_dir_names_of",
+            create_autospec(ws_files_svc_mod.previous_dir_names_of, return_value=()),
+        )
+        monkeypatch.setattr(
+            sec_tools_mod,
+            "_sibling_folder_named",
+            create_autospec(sec_tools_mod._sibling_folder_named, return_value=None),
+        )
+
+        async def _contained(sb: Any, rel: str, wd: str, prev=()):
+            return f"{wd.rstrip('/')}/{rel.lstrip('/')}"
+
+        monkeypatch.setattr(
+            ws_files_svc_mod,
+            "contained_target",
+            create_autospec(ws_files_svc_mod.contained_target, side_effect=_contained),
+        )
+        monkeypatch.setattr(
+            ws_files_svc_mod,
+            "to_client_path",
+            create_autospec(
+                ws_files_svc_mod.to_client_path,
+                side_effect=lambda sb, abs_p, wd: abs_p[len(wd.rstrip("/")) + 1 :],
+            ),
+        )
+        return dest_sandbox
+
+    @pytest.mark.asyncio
+    async def test_cos_copy_file_revoked_before_commit_deletes_temp_and_never_renames(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw = b"# Shared Research Note\n"
+        dest_sandbox = self._setup_copy_env(monkeypatch, file_bytes=raw)
+
+        # Denied: 1st verify passes, 2nd verify (after staging temp file) fails because sharing was revoked
+        verify_mock = create_autospec(
+            sec_tools_mod.verify_workspace_owner,
+            side_effect=[
+                None,
+                sec_commands_mod.error_command("workspace not found", "tc-revoke"),
+            ],
+        )
+        monkeypatch.setattr(sec_tools_mod, "verify_workspace_owner", verify_mock)
+
+        cmd = await sec_tools_mod.workspace_file_copy_cos(
+            user_id=COLLEAGUE_ID,
+            workspace_id=NORMAL_WS_ID,
+            path="notes/report.md",
+            dest_path="shared/report.md",
+            tool_call_id="tc-revoke",
+        )
+        payload = _cmd_payload(cmd)
+        assert payload == {"success": False, "error": "workspace not found"}
+        assert verify_mock.await_count == 2
+        # Uploaded ONLY to temp file, never directly to dest
+        assert dest_sandbox.aupload_file_bytes.await_count == 1
+        tmp_path, uploaded = dest_sandbox.aupload_file_bytes.await_args.args
+        assert tmp_path.startswith("/home/workspace/Home/.wsfiles-copy-")
+        assert uploaded == raw
+        # Only rm -f on temp file ran; mv never ran
+        cmds = [c.kwargs["command"] for c in dest_sandbox.execute_bash_command.await_args_list]
+        assert len(cmds) == 1
+        assert cmds[0].startswith("rm -f -- ") and tmp_path in cmds[0]
+        assert not any("mv " in c for c in cmds)
+
+    @pytest.mark.asyncio
+    async def test_cos_copy_file_normal_sharing_commits_via_atomic_rename(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw = b"# Shared Research Note\n"
+        dest_sandbox = self._setup_copy_env(monkeypatch, file_bytes=raw)
+
+        verify_mock = create_autospec(
+            sec_tools_mod.verify_workspace_owner,
+            side_effect=[None, None],
+        )
+        monkeypatch.setattr(sec_tools_mod, "verify_workspace_owner", verify_mock)
+
+        cmd = await sec_tools_mod.workspace_file_copy_cos(
+            user_id=COLLEAGUE_ID,
+            workspace_id=NORMAL_WS_ID,
+            path="notes/report.md",
+            dest_path="shared/report.md",
+            tool_call_id="tc-ok",
+        )
+        payload = _cmd_payload(cmd)
+        assert payload["success"] is True
+        assert payload["path"] == "shared/report.md"
+        assert verify_mock.await_count == 2
+        tmp_path = dest_sandbox.aupload_file_bytes.await_args.args[0]
+        cmds = [c.kwargs["command"] for c in dest_sandbox.execute_bash_command.await_args_list]
+        assert len(cmds) == 1
+        assert "mv -f -- " in cmds[0]
+        assert tmp_path in cmds[0] and "/home/workspace/Home/shared/report.md" in cmds[0]
+
+    @pytest.mark.asyncio
+    async def test_analyst_copy_file_revoked_before_commit_deletes_temp_and_normal_commits(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw = b"# Analyst Copy Note\n"
+        dest_sandbox = self._setup_copy_env(
+            monkeypatch, file_bytes=raw, dest_row=COLLEAGUE_CUR_WS_ROW
+        )
+        monkeypatch.setattr(
+            dalton_settings_mod,
+            "is_dalton_sharing_auth_enabled",
+            create_autospec(dalton_settings_mod.is_dalton_sharing_auth_enabled, return_value=True),
+        )
+        monkeypatch.setattr(
+            cw_mod,
+            "mark_run_outbound_blocked",
+            create_autospec(cw_mod.mark_run_outbound_blocked, return_value=True),
+        )
+        cw_tool = cw_mod.create_colleague_workspace_tools()[0]
+        analyst_cfg = {
+            "configurable": {
+                "user_id": COLLEAGUE_ID,
+                "workspace_id": CUR_WS_ID,
+                "workspace_owner_id": COLLEAGUE_ID,
+                "origin_channel": "web",
+            }
+        }
+
+        # Denied: revoked between initial check and commit re-check
+        orig_dual = cw_mod._dual_verify_workspace
+        dual_revoke = create_autospec(
+            orig_dual,
+            side_effect=[
+                None,
+                sec_commands_mod.error_command("workspace not found", "tc-a1"),
+            ],
+        )
+        monkeypatch.setattr(cw_mod, "_dual_verify_workspace", dual_revoke)
+
+        cmd_revoked = await _invoke_tool(
+            cw_tool,
+            {"action": "copy_file", "workspace_id": NORMAL_WS_ID, "path": "notes/report.md"},
+            config=analyst_cfg,
+            call_id="tc-a1",
+        )
+        assert _cmd_payload(cmd_revoked) == {"success": False, "error": "workspace not found"}
+        assert dual_revoke.await_count == 2
+        tmp_path = dest_sandbox.aupload_file_bytes.await_args.args[0]
+        cmds = [c.kwargs["command"] for c in dest_sandbox.execute_bash_command.await_args_list]
+        assert len(cmds) == 1 and cmds[0].startswith("rm -f -- ") and tmp_path in cmds[0]
+
+        # Normal sharing works: both checks succeed -> atomic rename commits
+        dest_sandbox.aupload_file_bytes.reset_mock()
+        dest_sandbox.execute_bash_command.reset_mock()
+        dual_ok = create_autospec(orig_dual, side_effect=[None, None])
+        monkeypatch.setattr(cw_mod, "_dual_verify_workspace", dual_ok)
+
+        cmd_ok = await _invoke_tool(
+            cw_tool,
+            {"action": "copy_file", "workspace_id": NORMAL_WS_ID, "path": "notes/report.md"},
+            config=analyst_cfg,
+            call_id="tc-a2",
+        )
+        payload_ok = _cmd_payload(cmd_ok)
+        assert payload_ok["success"] is True
+        assert payload_ok["path"] == "shared/report.md"
+        assert dual_ok.await_count == 2
+        cmds_ok = [c.kwargs["command"] for c in dest_sandbox.execute_bash_command.await_args_list]
+        assert len(cmds_ok) == 1 and "mv -f -- " in cmds_ok[0]
+
+
+# ===========================================================================
+# 4. Binary copy secret checks (macro Office refusal, OOXML XML scan, images/PDF)
+# ===========================================================================
+
+
+class TestBinaryCopySecretChecks:
+    @pytest.mark.parametrize(
+        "macro_file",
+        ["model.xlsm", "MODEL.XLSM", "memo.docm", "deck.pptm", "addin.xlam"],
+    )
+    def test_macro_office_files_always_refused_with_explanation(
+        self, macro_file: str
+    ) -> None:
+        clean_zip = _make_ooxml_zip({"xl/workbook.xml": "<workbook/>"})
+        err = sec_tools_mod._scan_copy_bytes_for_secrets(macro_file, clean_zip, {})
+        assert err == sec_tools_mod._COS_MACRO_OFFICE_REFUSED_ERROR
+        assert "带宏" in err
+        assert sec_tools_mod._is_allowed_copy_extension(macro_file) is False
+
+    def test_disguised_xlsx_carrying_vba_macro_project_is_refused(self) -> None:
+        ole_vba = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 128
+        disguised = _make_ooxml_zip(
+            {"xl/workbook.xml": "<workbook/>", "xl/vbaProject.bin": ole_vba}
+        )
+        err = sec_tools_mod._scan_copy_bytes_for_secrets("model.xlsx", disguised, {})
+        assert err == sec_tools_mod._COS_MACRO_OFFICE_REFUSED_ERROR
+
+    @pytest.mark.parametrize(
+        ("filename", "xml_member", "secret_text"),
+        [
+            (
+                "memo.docx",
+                "word/document.xml",
+                "<w:document><w:t>token=gxsa_live_token_1234567890</w:t></w:document>",
+            ),
+            (
+                "model.xlsx",
+                "xl/sharedStrings.xml",
+                "<sst><si><t>sk-ant-oat01-secretSetupToken12345</t></si></sst>",
+            ),
+            (
+                "deck.pptx",
+                "ppt/slides/slide1.xml",
+                "<p:sld><a:t>escaped=gxsa&#95;escaped&#95;token12345</a:t></p:sld>",
+            ),
+        ],
+    )
+    def test_ooxml_xml_parts_checked_with_same_known_secret_redactor_as_text(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        filename: str,
+        xml_member: str,
+        secret_text: str,
+    ) -> None:
+        # Even with empty vault_secrets={}, known platform/sandbox/setup tokens in XML are rejected
+        redactor = SecretRedactor.__new__(SecretRedactor)
+        redactor._secrets = [("GLOBAL_API_KEY", "platform-global-secret-xyz")]
+        monkeypatch.setattr(
+            redactor_mod,
+            "get_redactor",
+            create_autospec(redactor_mod.get_redactor, return_value=redactor),
+        )
+        ooxml = _make_ooxml_zip({xml_member: secret_text})
+        err = sec_tools_mod._scan_copy_bytes_for_secrets(filename, ooxml, {})
+        assert err is not None
+        assert "密钥" in err or "凭据" in err
+
+    def test_ooxml_xml_global_platform_secret_refused_and_clean_files_allowed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        redactor = SecretRedactor.__new__(SecretRedactor)
+        redactor._secrets = [("MCP_FMP_KEY", "fmp-platform-secret-987654321")]
+        monkeypatch.setattr(
+            redactor_mod,
+            "get_redactor",
+            create_autospec(redactor_mod.get_redactor, return_value=redactor),
+        )
+
+        # Denied: global platform secret inside .xlsx XML even when vault_secrets is empty
+        dirty_xlsx = _make_ooxml_zip(
+            {"xl/sharedStrings.xml": "<sst><si><t>fmp-platform-secret-987654321</t></si></sst>"}
+        )
+        assert sec_tools_mod._scan_copy_bytes_for_secrets("model.xlsx", dirty_xlsx, {}) is not None
+
+        # Normal sharing works: clean .docx, .xlsx, .pptx, PNG image, and scanned-style PDF all pass
+        for clean_name, member in (
+            ("memo.docx", "word/document.xml"),
+            ("model.xlsx", "xl/sharedStrings.xml"),
+            ("deck.pptx", "ppt/slides/slide1.xml"),
+        ):
+            clean_ooxml = _make_ooxml_zip({member: "<root><t>NVDA Q3 FY26 revenue $35.1B</t></root>"})
+            assert sec_tools_mod._scan_copy_bytes_for_secrets(clean_name, clean_ooxml, {}) is None
+
+        assert sec_tools_mod._scan_copy_bytes_for_secrets("chart.png", _make_minimal_png(), {}) is None
+
+        import resource
+        import sys
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        peak_bytes = peak if sys.platform == "darwin" else peak * 1024
+        monkeypatch.setattr(
+            sec_tools_mod,
+            "_COS_SCAN_MAX_RSS_BYTES",
+            peak_bytes + sec_tools_mod._COS_SCAN_MAX_RSS_BYTES,
+        )
+        assert (
+            sec_tools_mod._scan_copy_bytes_for_secrets(
+                "scanned.pdf", _make_scanned_image_pdf(), {}
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_cos_copy_file_refuses_macro_office_before_upload(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ws_map = {
+            NORMAL_WS_ID: {**NORMAL_SHARED_WS_ROW, "status": "running"},
+            HOME_WS_ID: COLLEAGUE_HOME_ROW,
+        }
+        monkeypatch.setattr(
+            sec_tools_mod,
+            "verify_workspace_owner",
+            create_autospec(sec_tools_mod.verify_workspace_owner, return_value=None),
+        )
+        monkeypatch.setattr(
+            ws_db_mod,
+            "get_workspace",
+            create_autospec(
+                ws_db_mod.get_workspace,
+                side_effect=lambda ws_id: dict(ws_map[str(ws_id)]) if str(ws_id) in ws_map else None,
+            ),
+        )
+        import src.server.database.home_workspace as home_ws_mod
+
+        monkeypatch.setattr(
+            home_ws_mod,
+            "get_home_workspace_id",
+            create_autospec(home_ws_mod.get_home_workspace_id, return_value=HOME_WS_ID),
+        )
+        dest_sandbox = create_autospec(PTCSandbox, instance=True)
+
+        @asynccontextmanager
+        async def _acquire(ws_id: str, owner_id: str):
+            yield dest_sandbox, ws_map[str(ws_id)]
+
+        monkeypatch.setattr(ws_files_svc_mod, "acquire_sandbox_to_change", _acquire)
+        monkeypatch.setattr(
+            ws_files_crud_mod,
+            "_read_contained_target",
+            create_autospec(
+                ws_files_crud_mod._read_contained_target,
+                return_value=ContainedFile("/home/workspace/NVDA/model.xlsm", 10, b"PK\x03\x04"),
+            ),
+        )
+
+        for ext in (".xlsm", ".docm", ".pptm", ".xlam"):
+            cmd = await sec_tools_mod.workspace_file_copy_cos(
+                user_id=COLLEAGUE_ID,
+                workspace_id=NORMAL_WS_ID,
+                path=f"models/book{ext}",
+                dest_path=None,
+                tool_call_id="tc-macro",
+            )
+            payload = _cmd_payload(cmd)
+            assert payload["success"] is False
+            assert payload["error"] == sec_tools_mod._COS_MACRO_OFFICE_REFUSED_ERROR
+        dest_sandbox.aupload_file_bytes.assert_not_called()
