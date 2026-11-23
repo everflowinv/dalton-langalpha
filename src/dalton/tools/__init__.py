@@ -1,17 +1,497 @@
-"""Unified Dalton tool builder (`build_dalton_tools`) for main agents (PK.4, PK.11, PK.15, PK.19)."""
+"""Unified declarative Dalton tool registry and builder (`build_dalton_tools`) for main agents (PK.4, PK.11, PK.15, PK.19)."""
 
 from __future__ import annotations
 
+import importlib
 import logging
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from langchain_core.tools import BaseTool
 
+from src.dalton.capabilities import (
+    CORE_CAPABILITY,
+    CapabilityId,
+    effective_capabilities,
+)
 from src.dalton.settings import get_dalton_settings
 from src.dalton.tools.coverage_tools import build_coverage_tools
 from src.dalton.tools.director_tools import build_director_tools
 
 logger = logging.getLogger(__name__)
+
+ToolRole = Literal["analyst", "chief_of_staff"]
+ToolMinTier = Literal["any", "non_external", "internal"]
+ToolKwargMode = Literal[
+    "none",
+    "filesystem",
+    "allow_home",
+    "fs_and_allow_home",
+    "role_and_fs",
+    "role",
+    "fs_and_cos_role",
+]
+
+_ALL_ROLES: frozenset[str] = frozenset({"analyst", "chief_of_staff"})
+_COS_ONLY: frozenset[str] = frozenset({"chief_of_staff"})
+_ANALYST_ONLY: frozenset[str] = frozenset({"analyst"})
+
+
+@dataclass(frozen=True)
+class DaltonToolRegistration:
+    """Declarative registration entry for one Dalton tool factory."""
+
+    id: str
+    module: str
+    builder_name: str
+    tool_names: tuple[str, ...]
+    roles: frozenset[str]
+    min_tier: ToolMinTier
+    capability: CapabilityId | None
+    description: str
+    kwarg_mode: ToolKwargMode = "none"
+    single_tool: bool = False
+    setting_gate: str | None = None
+    swallow_errors: bool = True
+
+
+# Canonical ordered registry of every Dalton tool factory under `src/dalton/tools/`.
+# Order matches the existing Everflow mounting order so Everflow tool lists stay
+# byte-identical. Every tool exported from `src/dalton/tools/*.py` must be listed
+# here with either `CORE_CAPABILITY` (None) or a specific `CapabilityId`.
+DALTON_TOOL_REGISTRY: tuple[DaltonToolRegistration, ...] = (
+    # --- Internal/admin tools mounted for both roles ---
+    DaltonToolRegistration(
+        id="notify_tools",
+        module="src.dalton.tools.notify_tools",
+        builder_name="create_notify_tools",
+        tool_names=("dalton_notify_settings",),
+        roles=_ALL_ROLES,
+        min_tier="non_external",
+        capability=CapabilityId.CHANNEL_GATEWAY,
+        description="飞书/Discord 个人与群推送通知设置",
+    ),
+    DaltonToolRegistration(
+        id="automation_report_tools",
+        module="src.dalton.tools.automation_report_tools",
+        builder_name="create_automation_report_tools",
+        tool_names=("automation_report",),
+        roles=_ALL_ROLES,
+        min_tier="non_external",
+        capability=CapabilityId.FUND_AUTOMATIONS,
+        description="内部定时简报卡片/文本提交与状态查询",
+    ),
+    DaltonToolRegistration(
+        id="report_delivery_tools",
+        module="src.dalton.tools.report_delivery_tools",
+        builder_name="create_report_delivery_tools",
+        tool_names=("dalton_report_delivery",),
+        roles=_ALL_ROLES,
+        min_tier="non_external",
+        capability=CapabilityId.FUND_AUTOMATIONS,
+        description="内部定时简报发送对象（report_profile）自助配置",
+    ),
+    DaltonToolRegistration(
+        id="market_digest_tools",
+        module="src.dalton.tools.market_digest_tools",
+        builder_name="create_market_digest_tools",
+        tool_names=("market_digest_inputs",),
+        roles=_ALL_ROLES,
+        min_tier="non_external",
+        capability=CapabilityId.FUND_AUTOMATIONS,
+        description="内部市场摘要批次输入读取",
+    ),
+    DaltonToolRegistration(
+        id="market_digest_output_tools",
+        module="src.dalton.tools.market_digest_output_tools",
+        builder_name="create_market_digest_output_tools",
+        tool_names=("market_digest_output",),
+        roles=_ALL_ROLES,
+        min_tier="non_external",
+        capability=CapabilityId.FUND_AUTOMATIONS,
+        description="内部市场摘要输出提交",
+    ),
+    DaltonToolRegistration(
+        id="ai_finance_inputs_tools",
+        module="src.dalton.tools.ai_finance_inputs_tools",
+        builder_name="create_ai_finance_inputs_tools",
+        tool_names=("ai_finance_prepare", "ai_finance_read"),
+        roles=_ALL_ROLES,
+        min_tier="non_external",
+        capability=CapabilityId.FUND_AUTOMATIONS,
+        description="内部 AI Finance 日报数据准备与读取",
+    ),
+    DaltonToolRegistration(
+        id="ai_finance_signals_tools",
+        module="src.dalton.tools.ai_finance_signals_tools",
+        builder_name="create_ai_finance_signals_tools",
+        tool_names=("ai_finance_signals",),
+        roles=_ALL_ROLES,
+        min_tier="non_external",
+        capability=CapabilityId.FUND_AUTOMATIONS,
+        description="内部 AI Finance 信号管理",
+    ),
+    DaltonToolRegistration(
+        id="ai_finance_report_tools",
+        module="src.dalton.tools.ai_finance_report_tools",
+        builder_name="create_ai_finance_report_tools",
+        tool_names=("ai_finance_report",),
+        roles=_ALL_ROLES,
+        min_tier="non_external",
+        capability=CapabilityId.FUND_AUTOMATIONS,
+        description="内部 AI Finance 日报提交",
+    ),
+    DaltonToolRegistration(
+        id="podcast_weekly_tools",
+        module="src.dalton.tools.podcast_weekly_tools",
+        builder_name="create_podcast_weekly_tools",
+        tool_names=("podcast_weekly_read", "podcast_weekly_write"),
+        roles=_ALL_ROLES,
+        min_tier="non_external",
+        capability=CapabilityId.FUND_AUTOMATIONS,
+        description="内部播客周报读写",
+        kwarg_mode="filesystem",
+    ),
+    # --- Shared Dalton tools mounted for both roles ---
+    DaltonToolRegistration(
+        id="feishu_tools",
+        module="src.dalton.tools.feishu_tools",
+        builder_name="create_feishu_tools",
+        tool_names=(
+            "feishu_read",
+            "feishu_list_wiki",
+            "feishu_create_doc",
+            "feishu_append",
+            "feishu_grant_access",
+        ),
+        roles=_ALL_ROLES,
+        min_tier="any",
+        capability=CapabilityId.FEISHU_DOCS,
+        description="飞书文档与知识空间读写",
+        kwarg_mode="filesystem",
+        setting_gate="dalton_enabled",
+    ),
+    DaltonToolRegistration(
+        id="issue_tools",
+        module="src.dalton.tools.issue_tools",
+        builder_name="create_issue_tools",
+        tool_names=("report_issue",),
+        roles=_ALL_ROLES,
+        min_tier="any",
+        capability=CapabilityId.PROBLEM_REPORTS,
+        description="内部运行问题工单上报工具（report_issue）",
+        setting_gate="dalton_enabled",
+    ),
+    DaltonToolRegistration(
+        id="thread_model_tools",
+        module="src.dalton.tools.thread_model_tools",
+        builder_name="create_thread_model_tools",
+        tool_names=("switch_thread_model",),
+        roles=_ALL_ROLES,
+        min_tier="any",
+        capability=CORE_CAPABILITY,
+        description="核心：当前线程模型切换",
+    ),
+    DaltonToolRegistration(
+        id="monitor_tools",
+        module="src.dalton.tools.monitor_tools",
+        builder_name="create_monitor_tools",
+        tool_names=("dalton_monitor",),
+        roles=_ALL_ROLES,
+        min_tier="any",
+        capability=CORE_CAPABILITY,
+        description="核心：工作区交互式监控面板发布与更新",
+        kwarg_mode="allow_home",
+        setting_gate="artifact_publishing",
+    ),
+    # --- Chief of Staff role tools ---
+    DaltonToolRegistration(
+        id="knowledge_tools_cos",
+        module="src.dalton.tools.knowledge_tools",
+        builder_name="create_knowledge_tools",
+        tool_names=("knowledge_update", "knowledge_append_verdict", "knowledge_read"),
+        roles=_COS_ONLY,
+        min_tier="any",
+        capability=CORE_CAPABILITY,
+        description="核心：公司与行业投研知识层读写",
+        kwarg_mode="filesystem",
+        setting_gate="knowledge",
+    ),
+    DaltonToolRegistration(
+        id="director_tools_cos",
+        module="src.dalton.tools.director_tools",
+        builder_name="build_director_tools",
+        tool_names=(
+            "dalton_coverage_board",
+            "dalton_record_plan",
+            "dalton_cross_unit_request",
+            "dalton_coverage_unit",
+            "dalton_agenda_note",
+            "dalton_watch_event",
+            "dalton_resolve_signals",
+            "dalton_publish_earnings_calendar",
+            "dalton_schedule_automation",
+            "dalton_coverage_tracking",
+            "dalton_system_jobs",
+        ),
+        roles=_COS_ONLY,
+        min_tier="any",
+        capability=CORE_CAPABILITY,
+        description="核心：研究总监看板、覆盖单元、追踪与系统任务工具",
+        kwarg_mode="role_and_fs",
+        setting_gate="autonomy",
+        swallow_errors=False,
+    ),
+    DaltonToolRegistration(
+        id="coverage_tools_cos",
+        module="src.dalton.tools.coverage_tools",
+        builder_name="build_coverage_tools",
+        tool_names=("dalton_coverage",),
+        roles=_COS_ONLY,
+        min_tier="any",
+        capability=CORE_CAPABILITY,
+        description="核心：用户覆盖标的名单管理",
+        kwarg_mode="role",
+        setting_gate="autonomy",
+        swallow_errors=False,
+    ),
+    DaltonToolRegistration(
+        id="conversation_tools_cos",
+        module="src.dalton.tools.conversation_tools",
+        builder_name="create_conversation_tools",
+        tool_names=("conversation_search",),
+        roles=_COS_ONLY,
+        min_tier="internal",
+        capability=CapabilityId.CONVERSATION_ARCHIVE,
+        description="历史团队对话归档检索",
+        kwarg_mode="role",
+    ),
+    DaltonToolRegistration(
+        id="language_tools_cos",
+        module="src.dalton.tools.publish_tools",
+        builder_name="create_language_tools",
+        tool_names=("check_language",),
+        roles=_COS_ONLY,
+        min_tier="any",
+        capability=CORE_CAPABILITY,
+        description="核心：研究文稿语言审校",
+        kwarg_mode="filesystem",
+        setting_gate="publish",
+    ),
+    DaltonToolRegistration(
+        id="check_done_tools_cos",
+        module="src.dalton.tools.check_done_tools",
+        builder_name="create_check_done_tools",
+        tool_names=("dalton_check_done",),
+        roles=_COS_ONLY,
+        min_tier="any",
+        capability=CORE_CAPABILITY,
+        description="核心：研究总监工作流闭环检查",
+        kwarg_mode="fs_and_cos_role",
+        setting_gate="knowledge_or_autonomy",
+    ),
+    # --- Analyst role tools ---
+    DaltonToolRegistration(
+        id="knowledge_tools_analyst",
+        module="src.dalton.tools.knowledge_tools",
+        builder_name="create_knowledge_tools",
+        tool_names=("knowledge_update", "knowledge_append_verdict", "knowledge_read"),
+        roles=_ANALYST_ONLY,
+        min_tier="any",
+        capability=CORE_CAPABILITY,
+        description="核心：公司与行业投研知识层读写",
+        kwarg_mode="filesystem",
+        setting_gate="knowledge",
+    ),
+    DaltonToolRegistration(
+        id="check_done_tools_analyst",
+        module="src.dalton.tools.check_done_tools",
+        builder_name="create_check_done_tools",
+        tool_names=("dalton_check_done",),
+        roles=_ANALYST_ONLY,
+        min_tier="any",
+        capability=CORE_CAPABILITY,
+        description="核心：分析师工作流闭环检查",
+        kwarg_mode="filesystem",
+        setting_gate="knowledge",
+    ),
+    DaltonToolRegistration(
+        id="publish_tools_analyst",
+        module="src.dalton.tools.publish_tools",
+        builder_name="create_publish_tools",
+        tool_names=("check_draft", "check_language", "publish_report"),
+        roles=_ANALYST_ONLY,
+        min_tier="any",
+        capability=CORE_CAPABILITY,
+        description="核心：研报数字核验、语言审校与正式发布",
+        kwarg_mode="filesystem",
+        setting_gate="publish",
+    ),
+    DaltonToolRegistration(
+        id="director_tools_analyst",
+        module="src.dalton.tools.director_tools",
+        builder_name="build_director_tools",
+        tool_names=(
+            "dalton_schedule_automation",
+            "dalton_coverage_tracking",
+            "dalton_system_jobs",
+        ),
+        roles=_ANALYST_ONLY,
+        min_tier="any",
+        capability=CORE_CAPABILITY,
+        description="核心：分析师自动化调度、覆盖追踪与系统任务工具",
+        kwarg_mode="role_and_fs",
+        setting_gate="autonomy",
+        swallow_errors=False,
+    ),
+    DaltonToolRegistration(
+        id="conversation_tools_analyst",
+        module="src.dalton.tools.conversation_tools",
+        builder_name="create_conversation_tools",
+        tool_names=("conversation_search",),
+        roles=_ANALYST_ONLY,
+        min_tier="internal",
+        capability=CapabilityId.CONVERSATION_ARCHIVE,
+        description="历史团队对话归档检索",
+        kwarg_mode="role",
+    ),
+    # --- Bridge-backed ingest & transcription tools (both roles) ---
+    DaltonToolRegistration(
+        id="wiki_tools",
+        module="src.dalton.tools.wiki_tools",
+        builder_name="build_ingest_company_wiki_tool",
+        tool_names=("ingest_company_wiki",),
+        roles=_ALL_ROLES,
+        min_tier="any",
+        capability=CapabilityId.COMPANY_WIKI,
+        description="内部公司资料库（Wiki）入库",
+        kwarg_mode="fs_and_allow_home",
+        single_tool=True,
+    ),
+    DaltonToolRegistration(
+        id="ingest_sales_note_tool",
+        module="src.dalton.tools.ingest_tools",
+        builder_name="build_ingest_sales_note_tool",
+        tool_names=("ingest_sales_note",),
+        roles=_ALL_ROLES,
+        min_tier="any",
+        capability=CapabilityId.SALES_NOTES,
+        description="销售笔记入库",
+        kwarg_mode="fs_and_allow_home",
+        single_tool=True,
+    ),
+    DaltonToolRegistration(
+        id="ingest_research_tool",
+        module="src.dalton.tools.ingest_tools",
+        builder_name="build_ingest_research_tool",
+        tool_names=("ingest_research",),
+        roles=_ALL_ROLES,
+        min_tier="any",
+        capability=CapabilityId.RESEARCHDATA_BRIDGE,
+        description="研究资料统一入库路由（Wiki / 销售笔记）",
+        kwarg_mode="fs_and_allow_home",
+        single_tool=True,
+    ),
+    DaltonToolRegistration(
+        id="transcription_tools",
+        module="src.dalton.tools.transcription_tools",
+        builder_name="build_prepare_transcription_tool",
+        tool_names=("prepare_transcription",),
+        roles=_ALL_ROLES,
+        min_tier="any",
+        capability=CapabilityId.TRANSCRIPTION,
+        description="录音音频转写任务准备",
+        kwarg_mode="fs_and_allow_home",
+        single_tool=True,
+        setting_gate="transcription",
+    ),
+)
+
+
+def _passes_setting_gate(
+    gate: str | None,
+    *,
+    settings: Any,
+    artifact_publishing_on: bool,
+    transcription_on: bool,
+) -> bool:
+    if gate is None:
+        return True
+    if gate == "dalton_enabled":
+        return bool(settings.enabled)
+    if gate == "artifact_publishing":
+        return bool(settings.enabled and artifact_publishing_on)
+    if gate == "knowledge":
+        return bool(settings.knowledge.enabled)
+    if gate == "autonomy":
+        return bool(settings.autonomy.enabled)
+    if gate == "conversations":
+        return bool(settings.conversations.enabled)
+    if gate == "publish":
+        return bool(settings.publish.enabled)
+    if gate == "knowledge_or_autonomy":
+        return bool(settings.knowledge.enabled or settings.autonomy.enabled)
+    if gate == "transcription":
+        return bool(transcription_on)
+    raise ValueError(f"Unknown Dalton tool setting_gate: {gate!r}")
+
+
+def _passes_tier_gate(
+    min_tier: ToolMinTier,
+    *,
+    tier_mounts_internal_tools: bool,
+    tier_mounts_conversation_search: bool,
+) -> bool:
+    if min_tier == "any":
+        return True
+    if min_tier == "non_external":
+        return tier_mounts_internal_tools
+    if min_tier == "internal":
+        return tier_mounts_conversation_search
+    raise ValueError(f"Unknown Dalton tool min_tier: {min_tier!r}")
+
+
+def _resolve_builder(entry: DaltonToolRegistration) -> Any:
+    if entry.builder_name == "build_director_tools" and entry.module == "src.dalton.tools.director_tools":
+        return build_director_tools
+    if entry.builder_name == "build_coverage_tools" and entry.module == "src.dalton.tools.coverage_tools":
+        return build_coverage_tools
+    mod = importlib.import_module(entry.module)
+    return getattr(mod, entry.builder_name)
+
+
+def _invoke_tool_builder(
+    entry: DaltonToolRegistration,
+    *,
+    role: str,
+    filesystem_backend: Any,
+) -> list[BaseTool]:
+    builder = _resolve_builder(entry)
+    allow_home = role == "chief_of_staff"
+
+    if entry.kwarg_mode == "none":
+        built = builder()
+    elif entry.kwarg_mode == "filesystem":
+        built = builder(filesystem_backend=filesystem_backend)
+    elif entry.kwarg_mode == "allow_home":
+        built = builder(allow_home_workspace=allow_home)
+    elif entry.kwarg_mode == "fs_and_allow_home":
+        built = builder(
+            filesystem_backend=filesystem_backend,
+            allow_home_workspace=allow_home,
+        )
+    elif entry.kwarg_mode == "role_and_fs":
+        built = builder(role=role, filesystem_backend=filesystem_backend)
+    elif entry.kwarg_mode == "role":
+        built = builder(role=role)
+    elif entry.kwarg_mode == "fs_and_cos_role":
+        built = builder(filesystem_backend=filesystem_backend, role="chief_of_staff")
+    else:
+        raise ValueError(f"Unknown kwarg_mode: {entry.kwarg_mode!r}")
+
+    if entry.single_tool:
+        return [built]
+    return list(built)
 
 
 def build_dalton_tools(
@@ -22,31 +502,16 @@ def build_dalton_tools(
     user_tier: str | None = None,
     team_memory_enabled: bool = False,
 ) -> list[BaseTool]:
-    """Return role-appropriate Dalton tools to bind onto the main agent (`DALTON-HOOK(dalton-tools)`).
+    """Return role- and capability-appropriate Dalton tools for the main agent (`DALTON-HOOK(dalton-tools)`).
 
-    - `chief_of_staff` (Home / Research Director):
-      `dalton_coverage_board`, `dalton_record_plan`, `dalton_cross_unit_request` (coverage_units.enabled only), `dalton_coverage_unit` (coverage_units.enabled only), `dalton_agenda_note`, `dalton_watch_event`, `dalton_resolve_signals`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `dalton_coverage`, `dalton_notify_settings` (internal/admin only), `dalton_report_delivery` (internal/admin only), `automation_report` (internal/admin only), `market_digest_inputs` and `market_digest_output` (internal/admin only), `ai_finance_prepare`, `ai_finance_read`, `ai_finance_signals`, and `ai_finance_report` (internal/admin only), `podcast_weekly_read` and `podcast_weekly_write` (internal/admin only), `conversation_search` (internal/admin only), `check_language`, `ingest_company_wiki`, `dalton_check_done` (weekly-coverage-review, dalton-earnings-calendar only), `dalton_monitor` (when `DALTON_ARTIFACT_PUBLISHING_ENABLED`), `switch_thread_model`, `feishu_read`, `feishu_list_wiki`, `feishu_create_doc`, `feishu_append`, `feishu_grant_access`
-    - `analyst` (Company workspace):
-      `knowledge_update`, `knowledge_append_verdict`, `dalton_check_done`, `check_draft`, `check_language`, `publish_report`, `ingest_company_wiki`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `dalton_notify_settings` (internal/admin only), `dalton_report_delivery` (internal/admin only), `automation_report` (internal/admin only), `market_digest_inputs` and `market_digest_output` (internal/admin only), `ai_finance_prepare`, `ai_finance_read`, `ai_finance_signals`, and `ai_finance_report` (internal/admin only), `podcast_weekly_read` and `podcast_weekly_write` (internal/admin only), `conversation_search` (internal/admin only), `dalton_monitor` (when `DALTON_ARTIFACT_PUBLISHING_ENABLED`), `switch_thread_model`, `feishu_read`, `feishu_list_wiki`, `feishu_create_doc`, `feishu_append`, `feishu_grant_access`
-
-    ``user_tier`` ("admin" | "internal" | "external") withholds
-    ``conversation_search``, ``dalton_notify_settings``, ``dalton_report_delivery``,
-    ``automation_report``, ``market_digest_inputs``, ``market_digest_output``,
-    ``ai_finance_prepare``, ``ai_finance_read``, ``ai_finance_signals``,
-    ``ai_finance_report``, ``podcast_weekly_read``, and
-    ``podcast_weekly_write`` from external
-    members, who would only reach their per-call refusal. None leaves the
-    tools mounted (the refusal stays the second line of defense for builds
-    without a resolved tier).
+    Tools are declared in :data:`DALTON_TOOL_REGISTRY` with their factory,
+    allowed roles, minimum caller tier, and required :class:`CapabilityId`
+    (or ``None`` for core-universal tools). Tools whose capability is disabled
+    in the active deployment are never mounted.
 
     ``team_memory_enabled`` is kept for signature compatibility; top-level tool
     mounting follows deployment/tier availability only so switching the user
-    toggle never changes the top-level tool list. Per-turn enforcement uses the
-    runtime notice and ``conversation_search``'s execution-time check.
-
-    ``prepare_transcription`` mounts only when ``is_transcription_enabled()``
-    is true (``DALTON_TRANSCRIPTION_ENABLED`` on and storage configured); with
-    the master switch off the agent never sees a tool it cannot run.
+    toggle never changes the top-level tool list.
     """
     _ = team_memory_enabled
     from src.dalton.access_tiers import is_internal_tier
@@ -64,300 +529,65 @@ def build_dalton_tools(
     if not is_enabled:
         return []
 
-    tools: list[BaseTool] = []
-
-    # The team conversation archive and Feishu group push settings are
-    # internal/admin-only; an external member's every call would be refused at
-    # run time, so the tools are not mounted for them in the first place
-    # ("external" is also what a failed tier lookup resolves to — fail closed
-    # on mounting). Company-system turns keep non-conversation internal tools,
-    # while conversation_search stays restricted to internal/admin tiers.
-    tier_mounts_internal_tools = user_tier is None or user_tier != "external"
-    tier_mounts_conversation_search = user_tier is None or is_internal_tier(user_tier)
-
-    if tier_mounts_internal_tools:
-        try:
-            from src.dalton.tools.notify_tools import create_notify_tools
-
-            tools.extend(create_notify_tools())
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] notify_tools not loaded: %s", e)
-
-        try:
-            from src.dalton.tools.automation_report_tools import (
-                create_automation_report_tools,
-            )
-
-            tools.extend(create_automation_report_tools())
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] automation_report_tools not loaded: %s", e)
-
-        try:
-            from src.dalton.tools.report_delivery_tools import (
-                create_report_delivery_tools,
-            )
-
-            tools.extend(create_report_delivery_tools())
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] report_delivery_tools not loaded: %s", e)
-
-        try:
-            from src.dalton.tools.market_digest_tools import create_market_digest_tools
-
-            from src.dalton.tools.market_digest_output_tools import create_market_digest_output_tools
-
-            tools.extend(create_market_digest_tools())
-            tools.extend(create_market_digest_output_tools())
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] market_digest_tools not loaded: %s", e)
-
-        try:
-            from src.dalton.tools.ai_finance_inputs_tools import (
-                create_ai_finance_inputs_tools,
-            )
-
-            tools.extend(create_ai_finance_inputs_tools())
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] ai_finance_inputs_tools not loaded: %s", e)
-
-        try:
-            from src.dalton.tools.ai_finance_signals_tools import (
-                create_ai_finance_signals_tools,
-            )
-
-            tools.extend(create_ai_finance_signals_tools())
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] ai_finance_signals_tools not loaded: %s", e)
-
-        try:
-            from src.dalton.tools.ai_finance_report_tools import (
-                create_ai_finance_report_tools,
-            )
-
-            tools.extend(create_ai_finance_report_tools())
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] ai_finance_report_tools not loaded: %s", e)
-
-        try:
-            from src.dalton.tools.podcast_weekly_tools import (
-                create_podcast_weekly_tools,
-            )
-
-            tools.extend(create_podcast_weekly_tools(filesystem_backend=filesystem_backend))
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] podcast_weekly_tools not loaded: %s", e)
-
-    if settings.enabled:
-        try:
-            from src.dalton.tools.feishu_tools import create_feishu_tools
-
-            tools.extend(create_feishu_tools(filesystem_backend=filesystem_backend))
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] feishu_tools not loaded: %s", e)
-
-        # E3: the controlled bug-report inbox — internal only, never GitHub.
-        try:
-            from src.dalton.tools.issue_tools import create_issue_tools
-
-            tools.extend(create_issue_tools())
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] issue_tools not loaded: %s", e)
-
-    try:
-        from src.dalton.tools.thread_model_tools import create_thread_model_tools
-
-        tools.extend(create_thread_model_tools())
-    except Exception as e:
-        logger.debug("[DALTON_TOOLS] thread_model_tools not loaded: %s", e)
-
-    if settings.enabled and is_artifact_publishing_enabled():
-        try:
-            from src.dalton.tools.monitor_tools import create_monitor_tools
-
-            tools.extend(
-                create_monitor_tools(allow_home_workspace=(role == "chief_of_staff"))
-            )
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] monitor_tools not loaded: %s", e)
-
-    if role == "chief_of_staff":
-        if settings.knowledge.enabled:
-            try:
-                from src.dalton.tools.knowledge_tools import create_knowledge_tools
-
-                tools.extend(
-                    create_knowledge_tools(filesystem_backend=filesystem_backend)
-                )
-            except Exception as e:
-                logger.debug("[DALTON_TOOLS] knowledge_tools not loaded: %s", e)
-        if settings.autonomy.enabled:
-            tools.extend(build_director_tools(role=role, filesystem_backend=filesystem_backend))
-            tools.extend(build_coverage_tools(role=role))
-        # DALTON-HOOK(team-memory-toggle): mount conversation_search from deployment/tier availability only (not personal toggle)
-        if settings.conversations.enabled and tier_mounts_conversation_search:
-            try:
-                from src.dalton.tools.conversation_tools import create_conversation_tools
-
-                tools.extend(create_conversation_tools(role="chief_of_staff"))
-            except Exception as e:
-                logger.debug("[DALTON_TOOLS] conversation_tools not loaded: %s", e)
-        if settings.publish.enabled:
-            try:
-                from src.dalton.tools.publish_tools import create_language_tools
-
-                tools.extend(create_language_tools(filesystem_backend=filesystem_backend))
-            except Exception as e:
-                logger.debug("[DALTON_TOOLS] language_tools not loaded: %s", e)
-        if settings.knowledge.enabled or settings.autonomy.enabled:
-            try:
-                # Home runs only the weekly review and earnings calendar: only
-                # their contracts are checkable here (the role restriction lives in the tool).
-                from src.dalton.tools.check_done_tools import create_check_done_tools
-
-                tools.extend(
-                    create_check_done_tools(
-                        filesystem_backend=filesystem_backend, role="chief_of_staff"
-                    )
-                )
-            except Exception as e:
-                logger.debug("[DALTON_TOOLS] check_done_tools not loaded: %s", e)
-        try:
-            from src.dalton.tools.wiki_tools import build_ingest_company_wiki_tool
-
-            tools.append(
-                build_ingest_company_wiki_tool(
-                    filesystem_backend=filesystem_backend,
-                    allow_home_workspace=True,
-                )
-            )
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] wiki_tools not loaded: %s", e)
-        # D1: the sales-notes ingest and the unified router. Internal only —
-        # both refuse external members per call, and are mounted under the
-        # same gate as the wiki ingest.
-        try:
-            from src.dalton.tools.ingest_tools import (
-                build_ingest_research_tool,
-                build_ingest_sales_note_tool,
-            )
-
-            tools.append(
-                build_ingest_sales_note_tool(
-                    filesystem_backend=filesystem_backend,
-                    allow_home_workspace=True,
-                )
-            )
-            tools.append(
-                build_ingest_research_tool(
-                    filesystem_backend=filesystem_backend,
-                    allow_home_workspace=True,
-                )
-            )
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] ingest_tools not loaded: %s", e)
-        if is_transcription_enabled():
-            try:
-                from src.dalton.tools.transcription_tools import (
-                    build_prepare_transcription_tool,
-                )
-
-                tools.append(
-                    build_prepare_transcription_tool(
-                        filesystem_backend=filesystem_backend,
-                        allow_home_workspace=True,
-                    )
-                )
-            except Exception as e:
-                logger.debug("[DALTON_TOOLS] transcription_tools not loaded: %s", e)
-        return tools
-
-    # Analyst workspace tools
-    if settings.knowledge.enabled:
-        try:
-            from src.dalton.tools.knowledge_tools import create_knowledge_tools
-
-            tools.extend(create_knowledge_tools(filesystem_backend=filesystem_backend))
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] knowledge_tools not loaded: %s", e)
-
-        try:
-            # dalton_check_done rides the knowledge gate: its closing checks
-            # read the knowledge version table and verdicts.
-            from src.dalton.tools.check_done_tools import create_check_done_tools
-
-            tools.extend(
-                create_check_done_tools(filesystem_backend=filesystem_backend)
-            )
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] check_done_tools not loaded: %s", e)
-
-    if settings.publish.enabled:
-        try:
-            from src.dalton.tools.publish_tools import create_publish_tools
-
-            tools.extend(create_publish_tools(filesystem_backend=filesystem_backend))
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] publish_tools not loaded: %s", e)
-
-    if settings.autonomy.enabled:
-        tools.extend(build_director_tools(role=role, filesystem_backend=filesystem_backend))
+    active_role = "chief_of_staff" if role == "chief_of_staff" else "analyst"
+    active_caps = effective_capabilities(
+        dalton_enabled=True,
+        conversations_enabled=bool(settings.conversations.enabled),
+        data_jobs_enabled=bool(settings.data_jobs.enabled),
+    )
 
     # DALTON-HOOK(team-memory-toggle): mount conversation_search from deployment/tier availability only (not personal toggle)
-    if settings.conversations.enabled and tier_mounts_conversation_search:
-        try:
-            from src.dalton.tools.conversation_tools import create_conversation_tools
+    tier_mounts_internal_tools = user_tier is None or user_tier != "external"
+    tier_mounts_conversation_search = user_tier is None or is_internal_tier(user_tier)
+    artifact_publishing_on = is_artifact_publishing_enabled()
+    transcription_on = is_transcription_enabled()
 
-            tools.extend(create_conversation_tools(role=role))
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] conversation_tools not loaded: %s", e)
-
-    try:
-        from src.dalton.tools.wiki_tools import build_ingest_company_wiki_tool
-
-        tools.append(
-            build_ingest_company_wiki_tool(
-                filesystem_backend=filesystem_backend,
-                allow_home_workspace=False,
-            )
-        )
-    except Exception as e:
-        logger.debug("[DALTON_TOOLS] wiki_tools not loaded: %s", e)
-
-    # D1: sales-notes ingest and the unified router (analyst workspaces).
-    try:
-        from src.dalton.tools.ingest_tools import (
-            build_ingest_research_tool,
-            build_ingest_sales_note_tool,
-        )
-
-        tools.append(
-            build_ingest_sales_note_tool(
-                filesystem_backend=filesystem_backend,
-                allow_home_workspace=False,
-            )
-        )
-        tools.append(
-            build_ingest_research_tool(
-                filesystem_backend=filesystem_backend,
-                allow_home_workspace=False,
-            )
-        )
-    except Exception as e:
-        logger.debug("[DALTON_TOOLS] ingest_tools not loaded: %s", e)
-
-    if is_transcription_enabled():
-        try:
-            from src.dalton.tools.transcription_tools import (
-                build_prepare_transcription_tool,
-            )
-
-            tools.append(
-                build_prepare_transcription_tool(
+    tools: list[BaseTool] = []
+    for entry in DALTON_TOOL_REGISTRY:
+        if active_role not in entry.roles:
+            continue
+        if not _passes_tier_gate(
+            entry.min_tier,
+            tier_mounts_internal_tools=tier_mounts_internal_tools,
+            tier_mounts_conversation_search=tier_mounts_conversation_search,
+        ):
+            continue
+        if entry.capability is not None and entry.capability not in active_caps:
+            continue
+        if not _passes_setting_gate(
+            entry.setting_gate,
+            settings=settings,
+            artifact_publishing_on=artifact_publishing_on,
+            transcription_on=transcription_on,
+        ):
+            continue
+        if entry.swallow_errors:
+            try:
+                tools.extend(
+                    _invoke_tool_builder(
+                        entry,
+                        role=role,
+                        filesystem_backend=filesystem_backend,
+                    )
+                )
+            except Exception as e:
+                logger.debug("[DALTON_TOOLS] %s not loaded: %s", entry.id, e)
+        else:
+            tools.extend(
+                _invoke_tool_builder(
+                    entry,
+                    role=role,
                     filesystem_backend=filesystem_backend,
-                    allow_home_workspace=False,
                 )
             )
-        except Exception as e:
-            logger.debug("[DALTON_TOOLS] transcription_tools not loaded: %s", e)
 
     return tools
+
+
+__all__ = [
+    "DALTON_TOOL_REGISTRY",
+    "DaltonToolRegistration",
+    "build_coverage_tools",
+    "build_dalton_tools",
+    "build_director_tools",
+]

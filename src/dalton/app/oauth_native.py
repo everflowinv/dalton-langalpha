@@ -19,9 +19,10 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from src.dalton.capabilities import CapabilityId, require_capability_dep
 from src.dalton.credentials import require_credential_write_admin
 from src.dalton.llm.providers.antigravity.oauth import (
     ANTIGRAVITY_PROVIDER,
@@ -57,7 +58,11 @@ from src.server.utils.api import CurrentUserId
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/v1/oauth", tags=["Dalton OAuth"])
+router = APIRouter(
+    prefix="/api/v1/oauth",
+    tags=["Dalton OAuth"],
+    dependencies=[Depends(require_capability_dep(CapabilityId.NATIVE_OAUTH_SYNC))],
+)
 
 
 async def _dalton_oauth_status(user_id: str, provider: str) -> dict:

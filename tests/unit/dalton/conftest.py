@@ -21,6 +21,15 @@ import pytest
 from src.dalton.heavy_compute import run_in_heavy_subprocess
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--update-everflow-snapshots",
+        action="store_true",
+        default=False,
+        help="Regenerate Everflow profile parity snapshot baselines under tests/unit/dalton/snapshots/everflow/.",
+    )
+
+
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",

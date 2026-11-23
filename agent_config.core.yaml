@@ -1,0 +1,43 @@
+# =============================================================================
+# STANDALONE CORE AGENT CONFIGURATION OVERLAY (APP_ENV=core / DALTON_PROFILE=core)
+# =============================================================================
+# Applied over agent_config.yaml via src/ptc_agent/config/file_utils.py.
+# Keeps zero private *-oauth model names, defaults web fetch to key-free
+# in-house fetching, and disables Everflow-only x_search and Firecrawl MCP.
+
+llm:
+  name: "claude-opus-5-5"
+  background: "claude-sonnet-5-5"
+  compaction: ""
+  fetch: ""
+  fallback: []
+
+sandbox:
+  provider: "docker"
+  offered_providers: []
+  docker:
+    memory_limit: "3g"
+    cpu_count: 2.0
+    auto_stop_interval: 3000
+
+mcp:
+  servers:
+    - name: "price_data"
+      enabled: true
+    - name: "firecrawl"
+      enabled: false
+
+subagents:
+  definitions: {}
+
+# WebSearch is registered only when a search provider API key is configured
+# (e.g. TAVILY_API_KEY, SERPER_API_KEY). WebFetch remains available via inhouse.
+search_api: "tavily"
+
+x_search:
+  enabled: false
+
+fetch_chain: ["inhouse"]
+
+compaction:
+  cold_compact_tokens: 0

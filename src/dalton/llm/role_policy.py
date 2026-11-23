@@ -9,6 +9,12 @@ from typing import Any
 
 from src.dalton.llm.model_family import infer_family_from_model_id
 from src.dalton.llm.overlay import load_dalton_meta
+from src.dalton.profile import (
+    DaltonStartupConfigError,
+    DeploymentProfile,
+    ProfileConfigError,
+    resolve_profile,
+)
 from src.dalton.settings import get_disabled_providers
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -304,10 +310,6 @@ async def select_independent_reviewer(
     )
 
 
-class DaltonStartupConfigError(RuntimeError):
-    """Fatal Dalton startup configuration or schema migration error (P0J.J3)."""
-
-
 class RolePolicyError(DaltonStartupConfigError):
     """Raised when a forbidden model (e.g. contributor OAuth variant, L21) is assigned to any role."""
 
@@ -320,6 +322,8 @@ def _load_default_agent_config() -> dict[str, Any]:
         find_config_file,
         load_yaml_config,
     )
+
+    profile = resolve_profile()
 
     explicit_env_path = os.getenv("PTC_CONFIG_FILE", "").strip()
     if explicit_env_path and not Path(explicit_env_path).is_file():
@@ -343,10 +347,16 @@ def _load_default_agent_config() -> dict[str, Any]:
                 f"Agent configuration '{cfg_path}' must parse to a mapping, got {type(loaded).__name__}."
             )
         # Upstream load_yaml_config only overlays agent_config.<APP_ENV>.yaml when APP_ENV is set.
-        # In Dalton local dev or CLI invocations where APP_ENV may be unset while Dalton is enabled,
+        # In Everflow local dev or CLI invocations where APP_ENV may be unset while Dalton is enabled,
         # we still overlay agent_config.dalton.yaml so startup role-policy enforcement always checks
-        # the effective Dalton role assignments rather than the upstream base defaults.
-        if not os.getenv("APP_ENV", "").strip() and cfg_path.name == AGENT_CONFIG_FILE:
+        # the effective Everflow role assignments rather than the upstream base defaults.
+        # In core profile, load_yaml_config already overlaid agent_config.core.yaml regardless of
+        # whether APP_ENV=core or DALTON_PROFILE=core was used.
+        if (
+            profile is DeploymentProfile.EVERFLOW
+            and not os.getenv("APP_ENV", "").strip()
+            and cfg_path.name == AGENT_CONFIG_FILE
+        ):
             dalton_overlay = cfg_path.with_name(f"{cfg_path.stem}.dalton{cfg_path.suffix}")
             if dalton_overlay.is_file():
                 overlay_cfg = _read_yaml(dalton_overlay)
@@ -357,7 +367,7 @@ def _load_default_agent_config() -> dict[str, Any]:
                     )
                 loaded = _deep_merge(loaded, overlay_cfg)
         return loaded
-    except DaltonStartupConfigError:
+    except (DaltonStartupConfigError, ProfileConfigError):
         raise
     except Exception as exc:
         raise DaltonStartupConfigError(

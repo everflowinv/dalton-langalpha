@@ -182,6 +182,10 @@ def classify_cnhk_priority(title: str, category: str = "") -> str:
 
 
 def _resolve_bridge_url() -> str:
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
+        return ""
     bridge_url = os.environ.get("DALTON_BRIDGE_MCP_URL") or ""
     if not bridge_url:
         token = os.environ.get("DALTON_BRIDGE_TOKEN") or ""

@@ -464,6 +464,10 @@ async def _post(
         return _Http("error", "request_invalid")
     if len(encoded) > _MAX_REQUEST_BYTES:
         return _Http("error", "request_too_large")
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
+        return _Http("error", "capability_disabled")
     base = get_dalton_bridge_base_url().strip().rstrip("/")
     token = get_dalton_bridge_admin_token().strip()
     if not token or not base.startswith(("http://", "https://")):

@@ -33,6 +33,8 @@ if os.environ.get("LANGALPHA_TEST_TRACING") != "1":
 # never layers a gitignored overlay such as ``config.development.yaml`` over
 # the committed YAML: tests run on the configuration CI runs on.
 os.environ["APP_ENV"] = ""
+# DALTON-HOOK(standalone-core): pin DALTON_PROFILE empty so host shell/env never shifts unit tests into core mode
+os.environ["DALTON_PROFILE"] = ""
 
 
 # ---------------------------------------------------------------------------

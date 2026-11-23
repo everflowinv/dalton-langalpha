@@ -142,7 +142,16 @@ async def embed_texts_via_bridge(
         default_model = get_dalton_settings().conversations.embedding_model_preferred
         return [], default_model
 
-    url = embed_url or get_dalton_bridge_embed_url()
+    if embed_url:
+        url = embed_url
+    else:
+        from src.dalton.capabilities import CapabilityId, has_capability
+
+        if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
+            raise RuntimeError("researchdata_bridge capability is disabled")
+        url = get_dalton_bridge_embed_url()
+        if not url:
+            raise RuntimeError("Host bridge /embed URL is not configured")
     token = bridge_token if bridge_token is not None else get_dalton_bridge_admin_token()
     model_used = get_dalton_settings().conversations.embedding_model_preferred
     all_vecs: list[list[float]] = []

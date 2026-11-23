@@ -838,7 +838,7 @@ HEAL_MAX_DELAY_S = 60.0
 HEAL_JITTER = 0.2
 
 
-async def reconnect_builtin_remote() -> None:
+async def reconnect_builtin_remote(server_names: Any = None) -> None:  # DALTON-HOOK(standalone-core)
     """Reconnect this worker's failed built-in remote servers, each on its own.
 
     A server that answers is published as it would have been at boot: its
@@ -848,10 +848,13 @@ async def reconnect_builtin_remote() -> None:
     usually the other side's deployment and fixing it should not need this
     process restarted.
     """
+    from src.dalton.capabilities import filter_reconnect_targets  # DALTON-HOOK(standalone-core)
+
     registry = get_global_registry()
     if registry is None or not registry.failed_builtin_remote:
         return
-    configs = [s for s in registry.config.mcp.servers if s.name in registry.failed_builtin_remote]
+    targets = filter_reconnect_targets(registry.failed_builtin_remote, server_names)
+    configs = [s for s in registry.config.mcp.servers if s.name in targets]
     try:
         async with asyncio.TaskGroup() as group:
             for config in configs:

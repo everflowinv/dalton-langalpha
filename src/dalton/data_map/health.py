@@ -170,18 +170,26 @@ def extract_latest_date(payload: Any) -> str | None:
 
 
 def resolve_researchdata_endpoint_and_token() -> tuple[str, str, set[str]]:
-    """Resolve the researchdata MCP HTTP endpoint, auth token, and handoff routes via `src/dalton/settings.py`."""
-    url = get_dalton_researchdata_url()
-    if not url:
-        port = os.getenv("DALTON_BRIDGE_PORT", "8960").strip() or "8960"
-        url = f"http://{HOST_IP}:{port}/mcp"
-    token = get_dalton_bridge_token()
+    """Resolve the researchdata MCP HTTP endpoint, auth token, and handoff routes via `src/dalton/settings.py`.
+
+    Returns empty URL and token (without synthesizing ``:8960``) when
+    ``researchdata_bridge`` capability is disabled.
+    """
+    from src.dalton.capabilities import CapabilityId, has_capability
+
     spec = load_sources_spec()
     handoff = {
         str(r).strip()
         for r in (spec.get("handoff_filtered_routes") or [])
         if str(r).strip()
     }
+    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
+        return "", "", handoff
+    url = get_dalton_researchdata_url()
+    if not url:
+        port = os.getenv("DALTON_BRIDGE_PORT", "8960").strip() or "8960"
+        url = f"http://{HOST_IP}:{port}/mcp"
+    token = get_dalton_bridge_token()
     return url, token, handoff
 
 
@@ -272,8 +280,14 @@ async def default_bridge_rpc_call(
     timeout_s: float = DEFAULT_ITEM_TIMEOUT_S,
 ) -> dict[str, Any]:
     """Call `researchdata` MCP bridge over HTTP JSON-RPC and return the parsed tool payload."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
+        raise RuntimeError("researchdata_bridge capability is disabled")
     clamped_timeout = clamp_timeout_s(timeout_s)
     url, token, _ = resolve_researchdata_endpoint_and_token()
+    if not url:
+        raise RuntimeError("researchdata bridge URL is not configured")
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -751,58 +765,78 @@ async def _execute_probes(
     probe_sec_filings: Callable[..., Any] | None,
     probe_conv: Callable[..., Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None, set[str]]:
+    from src.dalton.capabilities import (
+        CapabilityId,
+        effective_capabilities,
+        is_bridge_route_enabled,
+    )
+    from src.dalton.data_map.builder import _configured_x_search_enabled
+    from src.dalton.profile import is_core_profile
+    from src.dalton.web_search_spec import resolve_web_search_provider_for_agent
+
+    active_caps = effective_capabilities()
+    bridge_enabled = CapabilityId.RESEARCHDATA_BRIDGE in active_caps
     sem = asyncio.Semaphore(clamped_concurrency)
     spec = load_sources_spec()
     _, _, handoff_routes = resolve_researchdata_endpoint_and_token()
 
-    # 1. Discover routes via catalog() (with fallback to sources.yaml routes if catalog fails)
+    # 1. Discover routes via catalog() only when researchdata_bridge is enabled
     catalog_routes: list[dict[str, Any]] | None = None
-    try:
-        cat_payload = await asyncio.wait_for(
-            call_bridge("catalog", {}, timeout_s=min(15.0, clamped_timeout)),
-            timeout=min(15.0, clamped_timeout),
-        )
-        raw_routes = cat_payload.get("routes") if isinstance(cat_payload, Mapping) else None
-        if isinstance(raw_routes, list):
-            catalog_routes = [
-                dict(r)
-                for r in raw_routes
-                if isinstance(r, Mapping)
-                and str(r.get("id") or "").strip()
-                and str(r.get("id") or "").strip() not in handoff_routes
-                and (
-                    str(r.get("kind") or "").strip().lower() not in ("agent_tool", "skill")
-                    or str(r.get("id") or "").strip() in BRIDGE_COMMUNITY_ROUTES
-                )
-            ]
-    except Exception as exc:
-        logger.warning(
-            "catalog() discovery failed during health check (%s); falling back to sources.yaml routes",
-            type(exc).__name__,
-        )
-        catalog_routes = None
-
-    yaml_routes = (
-        dict(spec.get("catalog_routes") or {})
-        if isinstance(spec.get("catalog_routes"), Mapping)
-        else {}
-    )
     routes_to_probe: list[tuple[str, str]] = []
-    if catalog_routes is not None:
-        for r in catalog_routes:
-            rid = str(r.get("id") or "").strip()
-            cat = str(
-                r.get("category")
-                or (yaml_routes.get(rid) or {}).get("category")
-                or "research"
-            ).strip()
-            if rid and rid not in handoff_routes:
-                routes_to_probe.append((rid, cat))
+    if bridge_enabled:
+        try:
+            cat_payload = await asyncio.wait_for(
+                call_bridge("catalog", {}, timeout_s=min(15.0, clamped_timeout)),
+                timeout=min(15.0, clamped_timeout),
+            )
+            raw_routes = cat_payload.get("routes") if isinstance(cat_payload, Mapping) else None
+            if isinstance(raw_routes, list):
+                catalog_routes = [
+                    dict(r)
+                    for r in raw_routes
+                    if isinstance(r, Mapping)
+                    and str(r.get("id") or "").strip()
+                    and str(r.get("id") or "").strip() not in handoff_routes
+                    and is_bridge_route_enabled(str(r.get("id") or "").strip(), capabilities=active_caps)
+                    and (
+                        str(r.get("kind") or "").strip().lower() not in ("agent_tool", "skill")
+                        or str(r.get("id") or "").strip() in BRIDGE_COMMUNITY_ROUTES
+                    )
+                ]
+        except Exception as exc:
+            logger.warning(
+                "catalog() discovery failed during health check (%s); falling back to sources.yaml routes",
+                type(exc).__name__,
+            )
+            catalog_routes = None
+
+        yaml_routes = (
+            dict(spec.get("catalog_routes") or {})
+            if isinstance(spec.get("catalog_routes"), Mapping)
+            else {}
+        )
+        if catalog_routes is not None:
+            for r in catalog_routes:
+                rid = str(r.get("id") or "").strip()
+                cat = str(
+                    r.get("category")
+                    or (yaml_routes.get(rid) or {}).get("category")
+                    or "research"
+                ).strip()
+                if rid and rid not in handoff_routes and is_bridge_route_enabled(rid, capabilities=active_caps):
+                    routes_to_probe.append((rid, cat))
+        else:
+            for rid, entry in yaml_routes.items():
+                rid_s = str(rid).strip()
+                if (
+                    rid_s
+                    and rid_s not in handoff_routes
+                    and isinstance(entry, Mapping)
+                    and is_bridge_route_enabled(rid_s, capabilities=active_caps)
+                ):
+                    routes_to_probe.append((rid_s, str(entry.get("category") or "research").strip()))
     else:
-        for rid, entry in yaml_routes.items():
-            rid_s = str(rid).strip()
-            if rid_s and rid_s not in handoff_routes and isinstance(entry, Mapping):
-                routes_to_probe.append((rid_s, str(entry.get("category") or "research").strip()))
+        catalog_routes = []
 
     # 2. Schedule all probes with bounded concurrency and per-item timeout <= 60s
     tasks: list[asyncio.Task[dict[str, Any]]] = []
@@ -978,28 +1012,30 @@ async def _execute_probes(
             )
         )
 
-    tasks.append(
-        asyncio.create_task(
-            _run_single_probe(
-                "web_search",
-                "web",
-                lambda: probe_web(timeout_s=clamped_timeout),
-                sem=sem,
-                timeout_s=clamped_timeout,
+    if resolve_web_search_provider_for_agent() is not None:
+        tasks.append(
+            asyncio.create_task(
+                _run_single_probe(
+                    "web_search",
+                    "web",
+                    lambda: probe_web(timeout_s=clamped_timeout),
+                    sem=sem,
+                    timeout_s=clamped_timeout,
+                )
             )
         )
-    )
-    tasks.append(
-        asyncio.create_task(
-            _run_single_probe(
-                "x_search",
-                "social",
-                lambda: probe_x(timeout_s=clamped_timeout),
-                sem=sem,
-                timeout_s=clamped_timeout,
+    if not is_core_profile() or _configured_x_search_enabled():
+        tasks.append(
+            asyncio.create_task(
+                _run_single_probe(
+                    "x_search",
+                    "social",
+                    lambda: probe_x(timeout_s=clamped_timeout),
+                    sem=sem,
+                    timeout_s=clamped_timeout,
+                )
             )
         )
-    )
     tasks.append(
         asyncio.create_task(
             _run_single_probe(
@@ -1023,17 +1059,18 @@ async def _execute_probes(
                 )
             )
         )
-    tasks.append(
-        asyncio.create_task(
-            _run_single_probe(
-                "conversation_search",
-                "memory",
-                probe_conv,
-                sem=sem,
-                timeout_s=clamped_timeout,
+    if CapabilityId.CONVERSATION_ARCHIVE in active_caps:
+        tasks.append(
+            asyncio.create_task(
+                _run_single_probe(
+                    "conversation_search",
+                    "memory",
+                    probe_conv,
+                    sem=sem,
+                    timeout_s=clamped_timeout,
+                )
             )
         )
-    )
 
     probe_results: list[dict[str, Any]] = list(await asyncio.gather(*tasks))
     if all_route_requested:
@@ -1187,33 +1224,36 @@ async def run_all_health_checks(
         )
 
         data_task_health: dict[str, Any] | None = None
-        try:
-            data_task_health = await check_data_task_runs_health(conn=conn)
-            if isinstance(data_task_health, Mapping):
+        from src.dalton.capabilities import CapabilityId, has_capability
+
+        if has_capability(CapabilityId.DATA_JOBS):
+            try:
+                data_task_health = await check_data_task_runs_health(conn=conn)
+                if isinstance(data_task_health, Mapping):
+                    probe_results.append(dict(data_task_health))
+            except Exception as exc:
+                err_cls = type(exc).__name__
+                sanitized_msg = sanitize_health_text(str(exc), max_len=80)
+                err_type = (
+                    f"{err_cls}:{sanitized_msg}"
+                    if sanitized_msg and sanitized_msg != err_cls
+                    else err_cls
+                )
+                data_task_health = {
+                    "ok": False,
+                    "source_id": "data_tasks",
+                    "category": "data_tasks",
+                    "status": "unavailable",
+                    "has_anomalies": True,
+                    "failed_count": 0,
+                    "failed_tasks": [],
+                    "anomalies": [],
+                    "latency_ms": 0,
+                    "latest_date": None,
+                    "error_type": sanitize_health_text(err_type, max_len=64),
+                    "detail": {"reason": sanitized_msg or err_cls},
+                }
                 probe_results.append(dict(data_task_health))
-        except Exception as exc:
-            err_cls = type(exc).__name__
-            sanitized_msg = sanitize_health_text(str(exc), max_len=80)
-            err_type = (
-                f"{err_cls}:{sanitized_msg}"
-                if sanitized_msg and sanitized_msg != err_cls
-                else err_cls
-            )
-            data_task_health = {
-                "ok": False,
-                "source_id": "data_tasks",
-                "category": "data_tasks",
-                "status": "unavailable",
-                "has_anomalies": True,
-                "failed_count": 0,
-                "failed_tasks": [],
-                "anomalies": [],
-                "latency_ms": 0,
-                "latest_date": None,
-                "error_type": sanitize_health_text(err_type, max_len=64),
-                "detail": {"reason": sanitized_msg or err_cls},
-            }
-            probe_results.append(dict(data_task_health))
 
         refreshed_map: dict[str, Any] | None = None
         if persist:

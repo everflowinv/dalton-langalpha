@@ -40,10 +40,10 @@ from .types import EIGHT_K_FORMS, PERIODIC_FORMS
 
 logger = logging.getLogger(__name__)
 
-if not os.getenv("EDGAR_IDENTITY"):
-    logger.warning("EDGAR_IDENTITY is not set: SEC asks every client to name itself with a name and an email "
-                   "(\"Jane Doe jane@example.com\"), and may block requests without one")
-    os.environ["EDGAR_IDENTITY"] = "OpenSource user@example.com"
+# DALTON-HOOK(standalone-core): unify SEC_USER_AGENT / EDGAR_IDENTITY resolution with Dalton settings
+from src.dalton.sec_identity import ensure_edgar_identity_env
+
+ensure_edgar_identity_env(logger)
 
 #: EDGAR's recent page holds at least the last year or this many filings, so a page this long that starts within
 #: the 8-K window may not reach back to its start.

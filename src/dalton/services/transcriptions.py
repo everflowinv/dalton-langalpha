@@ -458,11 +458,23 @@ def _bridge_admin_headers() -> dict[str, str]:
     }
 
 
+def _require_transcription_bridge_url() -> str:
+    """Return the host bridge base URL for transcription calls, failing closed when disabled."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
+        raise RuntimeError("researchdata_bridge capability is disabled")
+    bridge_url = get_dalton_bridge_base_url().rstrip("/")
+    if not bridge_url:
+        raise RuntimeError("researchdata bridge URL is not configured")
+    return bridge_url
+
+
 async def call_bridge_submit_transcription(
     payload: dict[str, Any],
 ) -> tuple[int, dict[str, Any]]:
     """POST `payload` to `{bridge_url}/transcriptions` using the bridge admin token."""
-    bridge_url = get_dalton_bridge_base_url().rstrip("/")
+    bridge_url = _require_transcription_bridge_url()
     headers = _bridge_admin_headers()
     async with httpx.AsyncClient(
         timeout=BRIDGE_TRANSCRIPTION_TIMEOUT_S, trust_env=False
@@ -477,7 +489,7 @@ async def call_bridge_get_transcription(
     job_id: str,
 ) -> tuple[int, dict[str, Any]]:
     """GET `{bridge_url}/transcriptions/{job_id}` using the bridge admin token."""
-    bridge_url = get_dalton_bridge_base_url().rstrip("/")
+    bridge_url = _require_transcription_bridge_url()
     headers = _bridge_admin_headers()
     async with httpx.AsyncClient(
         timeout=BRIDGE_TRANSCRIPTION_TIMEOUT_S, trust_env=False
@@ -492,7 +504,7 @@ async def call_bridge_get_transcription_result(
     job_id: str,
 ) -> tuple[int, dict[str, Any]]:
     """GET `{bridge_url}/transcriptions/{job_id}/result` using the bridge admin token."""
-    bridge_url = get_dalton_bridge_base_url().rstrip("/")
+    bridge_url = _require_transcription_bridge_url()
     headers = _bridge_admin_headers()
     async with httpx.AsyncClient(
         timeout=BRIDGE_TRANSCRIPTION_TIMEOUT_S, trust_env=False
@@ -507,7 +519,7 @@ async def open_bridge_raw_result_stream(
     job_id: str,
 ) -> tuple[int, dict[str, Any] | AsyncIterator[bytes]]:
     """Open a streaming GET to `{bridge_url}/transcriptions/{job_id}/result/raw` using the bridge admin token."""
-    bridge_url = get_dalton_bridge_base_url().rstrip("/")
+    bridge_url = _require_transcription_bridge_url()
     headers = _bridge_admin_headers()
     client = httpx.AsyncClient(
         timeout=BRIDGE_TRANSCRIPTION_TIMEOUT_S, trust_env=False
@@ -557,7 +569,7 @@ async def call_bridge_action_transcription(
     """POST `{bridge_url}/transcriptions/{job_id}/{action}` (`retry` or `cancel`)."""
     if action not in ("retry", "cancel"):
         raise ValueError(f"Unsupported bridge transcription action: {action!r}")
-    bridge_url = get_dalton_bridge_base_url().rstrip("/")
+    bridge_url = _require_transcription_bridge_url()
     headers = _bridge_admin_headers()
     async with httpx.AsyncClient(
         timeout=BRIDGE_TRANSCRIPTION_TIMEOUT_S, trust_env=False
@@ -2541,20 +2553,19 @@ async def cancel_transcription_job(
 
 
 def is_transcription_enabled() -> bool:
-    """Return True only when the transcription master switch is on and the transcription store is configured.
+    """Return True only when the transcription capability is active (bridge + storage + switch).
 
-    `DALTON_TRANSCRIPTION_ENABLED` defaults to off; only "1"/"true"/"yes"/"on"
-    (case-insensitive) turn it on. The store is the transcription-only
-    `DALTON_ASR_STORAGE_*` configuration (`src/dalton/transcription_storage.py`);
-    the global `STORAGE_*` object store stays out of the decision and remains
-    off in production. Production must configure the transcription MinIO and
-    the Volcengine ASR/TOS credentials and verify them before any transcription
-    surface (tool, skill, API, reconciliation) becomes visible.
+    Delegates to :func:`src.dalton.capabilities.effective_capabilities` so
+    ``DALTON_CAP_TRANSCRIPTION``, ``DALTON_TRANSCRIPTION_ENABLED``,
+    ``researchdata_bridge`` dependency, and dedicated ``DALTON_ASR_STORAGE_*``
+    storage are all evaluated consistently.
     """
-    flag = os.getenv("DALTON_TRANSCRIPTION_ENABLED", "").strip().lower()
-    if flag not in ("1", "true", "yes", "on"):
-        return False
-    return is_transcription_storage_configured()
+    from src.dalton.capabilities import CapabilityId, effective_capabilities
+
+    caps = effective_capabilities(
+        transcription_storage_configured=is_transcription_storage_configured(),
+    )
+    return CapabilityId.TRANSCRIPTION in caps
 
 
 def is_transcription_reconciliation_enabled() -> bool:

@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.dalton.app.channels_router import require_channel_service_token
+from src.dalton.capabilities import CapabilityId, require_capability_dep
 from src.dalton.data_jobs.notification_payloads import (
     DataTaskArtifactError,
     DataTaskArtifactNotFoundError,
@@ -31,7 +32,9 @@ _NO_STORE_HEADERS: dict[str, str] = {
 data_task_notifications_router = APIRouter(
     prefix="/channels/internal/data-task-notifications",
     tags=["Dalton Channel Data Task Notifications"],
-    dependencies=[Depends(require_channel_service_token)],
+    dependencies=[
+        Depends(require_capability_dep(CapabilityId.CHANNEL_GATEWAY)),
+    ],
 )
 
 
@@ -50,7 +53,13 @@ class DedicatedFeishuVaultCredentialsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-@data_task_notifications_router.post("/feishu-credentials")
+@data_task_notifications_router.post(
+    "/feishu-credentials",
+    dependencies=[
+        Depends(require_capability_dep(CapabilityId.CHANNEL_FEISHU)),
+        Depends(require_channel_service_token),
+    ],
+)
 async def internal_dedicated_feishu_vault_credentials_endpoint(
     request: Request,
     _body: DedicatedFeishuVaultCredentialsRequest | None = Body(default=None),
@@ -95,7 +104,13 @@ async def internal_dedicated_feishu_vault_credentials_endpoint(
     )
 
 
-@data_task_notifications_router.post("/plan")
+@data_task_notifications_router.post(
+    "/plan",
+    dependencies=[
+        Depends(require_capability_dep(CapabilityId.DATA_JOBS)),
+        Depends(require_channel_service_token),
+    ],
+)
 async def internal_data_task_notification_plan_endpoint(
     body: DataTaskNotificationPlanRequest,
 ) -> dict[str, Any]:
@@ -106,7 +121,13 @@ async def internal_data_task_notification_plan_endpoint(
     )
 
 
-@data_task_notifications_router.get("/runs/{run_id}/artifacts/{artifact_id}")
+@data_task_notifications_router.get(
+    "/runs/{run_id}/artifacts/{artifact_id}",
+    dependencies=[
+        Depends(require_capability_dep(CapabilityId.DATA_JOBS)),
+        Depends(require_channel_service_token),
+    ],
+)
 async def internal_data_task_run_artifact_endpoint(
     run_id: str,
     artifact_id: str,

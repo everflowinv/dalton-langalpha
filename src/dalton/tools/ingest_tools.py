@@ -71,7 +71,21 @@ async def get_workspace_auto_ingest(workspace_id: str) -> bool:
 
 async def call_bridge_sales_notes_ingest(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     """POST `payload` to `{bridge_url}/sales-notes/ingest` with the admin token."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.SALES_NOTES):
+        return 503, {
+            "ok": False,
+            "status": "capability_disabled",
+            "error": "sales_notes capability is disabled.",
+        }
     bridge_url = get_dalton_bridge_base_url().rstrip("/")
+    if not bridge_url:
+        return 503, {
+            "ok": False,
+            "status": "config_error",
+            "error": "researchdata bridge URL is not configured on backend.",
+        }
     admin_token = get_dalton_bridge_admin_token()
     if not admin_token:
         return 500, {

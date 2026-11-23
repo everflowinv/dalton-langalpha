@@ -4,7 +4,9 @@ from typing import Optional
 
 from src.config.tool_settings import get_search_api
 from src.dalton.web_search_spec import (  # DALTON-HOOK(web-search-gemini)
+    has_available_search_provider as _dalton_has_available_search_provider,  # DALTON-HOOK(standalone-core)
     register_gemini_grounding_search_builder,
+    resolve_available_search_provider as _dalton_resolve_available_search_provider,  # DALTON-HOOK(standalone-core)
 )
 from src.observability import TOOL_PROVIDER
 from src.tools.decorators import create_logged_tool
@@ -35,6 +37,33 @@ _PROVIDER_BUILDERS = register_gemini_grounding_search_builder(  # DALTON-HOOK(we
         for name in ("tavily", "serper", "bocha", "exa", "parallel", "deepseek")
     },
 )
+
+
+# DALTON-HOOK(standalone-core): query whether the active config has a usable search provider
+def resolve_available_search_provider(
+    provider: Optional[str] = None,
+    *,
+    fallback_any: bool = True,
+) -> Optional[str]:
+    """Return an available search provider name for the current config, or ``None``."""
+    return _dalton_resolve_available_search_provider(
+        provider=provider,
+        builders=_PROVIDER_BUILDERS,
+        fallback_any=fallback_any,
+    )
+
+
+def has_available_search_provider(
+    provider: Optional[str] = None,
+    *,
+    fallback_any: bool = True,
+) -> bool:
+    """Return ``True`` when the current config has at least one usable search provider."""
+    return _dalton_has_available_search_provider(
+        provider=provider,
+        builders=_PROVIDER_BUILDERS,
+        fallback_any=fallback_any,
+    )
 
 
 def get_web_search_tool(

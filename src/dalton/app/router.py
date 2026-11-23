@@ -11,7 +11,7 @@ import os
 import time
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from src.dalton.budget.service import (
@@ -20,6 +20,12 @@ from src.dalton.budget.service import (
     put_scoped_task_cap,
     remove_scoped_task_cap,
     save_budget_settings,
+)
+from src.dalton.capabilities import (
+    CapabilityId,
+    get_capabilities_payload,
+    require_capability,
+    require_capability_dep,
 )
 from src.dalton.services.native_admin import (
     get_native_status,
@@ -181,6 +187,17 @@ async def _verify_workspace_access(workspace_id: str, user_id: str) -> dict[str,
 # ---------------------------------------------------------------------------
 
 
+@router.get("/capabilities")
+@handle_api_exceptions("get dalton capabilities", logger)
+async def get_capabilities_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    """Read-only deployment capability set and public brand metadata for the frontend."""
+    _ = user_id
+    _require_dalton_enabled()
+    return get_capabilities_payload()
+
+
 @router.get("/openclaw/health")
 @handle_api_exceptions("probe openclaw health", logger)
 async def get_openclaw_health_endpoint(
@@ -206,50 +223,69 @@ async def get_browser_memory_diagnostics_endpoint(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/native-models/status")
+@router.get(
+    "/native-models/status",
+    dependencies=[Depends(require_capability_dep(CapabilityId.NATIVE_OAUTH_SYNC))],
+)
 @handle_api_exceptions("get native models status", logger)
 async def get_native_models_status_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
-    _require_dalton_enabled()
+    require_capability(CapabilityId.NATIVE_OAUTH_SYNC)
     return await get_native_status()
 
 
-@router.post("/native-models/check")
+@router.post(
+    "/native-models/check",
+    dependencies=[Depends(require_capability_dep(CapabilityId.NATIVE_OAUTH_SYNC))],
+)
 @handle_api_exceptions("check native provider models", logger)
 async def check_native_models_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    require_capability(CapabilityId.NATIVE_OAUTH_SYNC)
     _require_pm_user(user_id)
     return await run_native_check(user_id=user_id)
 
 
-@router.post("/native-models/sync")
+@router.post(
+    "/native-models/sync",
+    dependencies=[Depends(require_capability_dep(CapabilityId.NATIVE_OAUTH_SYNC))],
+)
 @handle_api_exceptions("sync native provider models", logger)
 async def sync_native_models_endpoint(
     body: NativeModelSyncRequest,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    require_capability(CapabilityId.NATIVE_OAUTH_SYNC)
     _require_pm_user(user_id)
     return await run_native_sync(user_id=user_id, model_keys=body.models)
 
 
-@router.post("/native-models/retire")
+@router.post(
+    "/native-models/retire",
+    dependencies=[Depends(require_capability_dep(CapabilityId.NATIVE_OAUTH_SYNC))],
+)
 @handle_api_exceptions("retire native provider models", logger)
 async def retire_native_models_endpoint(
     body: NativeModelKeysRequest,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    require_capability(CapabilityId.NATIVE_OAUTH_SYNC)
     _require_pm_user(user_id)
     return await run_native_retire(user_id=user_id, model_keys=body.keys)
 
 
-@router.post("/native-models/restore")
+@router.post(
+    "/native-models/restore",
+    dependencies=[Depends(require_capability_dep(CapabilityId.NATIVE_OAUTH_SYNC))],
+)
 @handle_api_exceptions("restore retired native models", logger)
 async def restore_native_models_endpoint(
     body: NativeModelKeysRequest,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    require_capability(CapabilityId.NATIVE_OAUTH_SYNC)
     _require_pm_user(user_id)
     return await run_native_restore(user_id=user_id, model_keys=body.keys)
 
@@ -1769,12 +1805,19 @@ async def _authorize_system_job_mutation(key: str, user_id: str) -> str:
     )
     from src.dalton.settings import get_configured_pm_user_ids
 
+    cleaned_key_lower = str(key or "").strip().lower()
+    if cleaned_key_lower.startswith("data:"):
+        require_capability(CapabilityId.DATA_JOBS)
+    elif cleaned_key_lower.startswith(("ops-", "ops:")):
+        require_capability(CapabilityId.RESEARCHDATA_BRIDGE)
+
     try:
         scope, target = classify_system_job_key(key)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if scope == "data":
+        require_capability(CapabilityId.DATA_JOBS)
         if await get_user_tier(str(user_id).strip()) not in ("admin", "internal"):
             raise HTTPException(
                 status_code=403,
@@ -1788,7 +1831,11 @@ async def _authorize_system_job_mutation(key: str, user_id: str) -> str:
             )
         return pm_ids[0]
 
-    if scope in ("ops", "home", "host"):
+    if scope == "ops":
+        require_capability(CapabilityId.RESEARCHDATA_BRIDGE)
+        return str(user_id).strip()
+
+    if scope in ("home", "host"):
         return str(user_id).strip()
 
     if scope == "sector":
@@ -2369,7 +2416,7 @@ class FeishuReadScopesUpdateRequest(BaseModel):
 
 def _require_feishu_admin(user_id: str | None) -> str:
     """Require a PM user (`DALTON_PM_USER_IDS`) for read-scope and space-list management."""
-    _require_dalton_enabled()
+    require_capability(CapabilityId.FEISHU_DOCS)
     from src.dalton.invites import is_invite_pm
 
     uid = str(user_id or "").strip()
@@ -2380,7 +2427,10 @@ def _require_feishu_admin(user_id: str | None) -> str:
     return uid
 
 
-@router.get("/feishu/read-scopes")
+@router.get(
+    "/feishu/read-scopes",
+    dependencies=[Depends(require_capability_dep(CapabilityId.FEISHU_DOCS))],
+)
 @handle_api_exceptions("list dalton feishu read scopes", logger)
 async def list_feishu_read_scopes_endpoint(
     user_id: CurrentUserId,
@@ -2391,7 +2441,10 @@ async def list_feishu_read_scopes_endpoint(
     return {"scopes": await list_read_scopes()}
 
 
-@router.put("/feishu/read-scopes")
+@router.put(
+    "/feishu/read-scopes",
+    dependencies=[Depends(require_capability_dep(CapabilityId.FEISHU_DOCS))],
+)
 @handle_api_exceptions("update dalton feishu read scopes", logger)
 async def update_feishu_read_scopes_endpoint(
     body: FeishuReadScopesUpdateRequest,
@@ -2410,7 +2463,10 @@ async def update_feishu_read_scopes_endpoint(
     return {"scopes": scopes}
 
 
-@router.get("/feishu/spaces")
+@router.get(
+    "/feishu/spaces",
+    dependencies=[Depends(require_capability_dep(CapabilityId.FEISHU_DOCS))],
+)
 @handle_api_exceptions("list dalton feishu wiki spaces", logger)
 async def list_feishu_spaces_endpoint(
     user_id: CurrentUserId,
@@ -2467,11 +2523,15 @@ async def _resolve_feishu_bot_name() -> str | None:
     return app_name
 
 
-@router.get("/notify/feishu-bot")
+@router.get(
+    "/notify/feishu-bot",
+    dependencies=[Depends(require_capability_dep(CapabilityId.CHANNEL_FEISHU))],
+)
 @handle_api_exceptions("get dalton notify feishu bot", logger)
 async def dalton_notify_feishu_bot_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    require_capability(CapabilityId.CHANNEL_FEISHU)
     # notify-routes: the name exists for the Feishu group card; group discovery
     # is restricted to internal/admin members, so this matches it.
     await _require_notify_admin(user_id)
@@ -2505,11 +2565,15 @@ async def _require_notify_tier_admin(user_id: str | None) -> str:
     return uid
 
 
-@router.get("/notify/feishu-groups")
+@router.get(
+    "/notify/feishu-groups",
+    dependencies=[Depends(require_capability_dep(CapabilityId.CHANNEL_FEISHU))],
+)
 @handle_api_exceptions("get dalton notify feishu groups", logger)
 async def dalton_notify_feishu_groups_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    require_capability(CapabilityId.CHANNEL_FEISHU)
     await _require_notify_admin(user_id)
     from src.dalton.notify.groups import FeishuGroupsUnavailable, discover_feishu_notify_groups
 
@@ -2524,12 +2588,16 @@ class DaltonDiscordChannelVerifyRequest(BaseModel):
     channel_id: str = Field(min_length=1, max_length=64)
 
 
-@router.post("/notify/discord-channels/verify")
+@router.post(
+    "/notify/discord-channels/verify",
+    dependencies=[Depends(require_capability_dep(CapabilityId.CHANNEL_DISCORD))],
+)
 @handle_api_exceptions("verify dalton notify discord channel", logger)
 async def dalton_notify_discord_channel_verify_endpoint(
     body: DaltonDiscordChannelVerifyRequest,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    require_capability(CapabilityId.CHANNEL_DISCORD)
     await _require_notify_tier_admin(user_id)
     from src.dalton.database import data_task_notifications as dtn_db
 
@@ -2572,13 +2640,16 @@ async def dalton_notify_discord_channel_verify_endpoint(
     }
 
 
-@router.post("/notify/test")
+@router.post(
+    "/notify/test",
+    dependencies=[Depends(require_capability_dep(CapabilityId.CHANNEL_GATEWAY))],
+)
 @handle_api_exceptions("send dalton notify test", logger)
 async def dalton_notify_test_endpoint(
     body: DaltonNotifyTestRequest,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
-    _require_dalton_enabled()
+    require_capability(CapabilityId.CHANNEL_GATEWAY)
     from src.dalton.notify.dispatch import send_dalton_notify_test
 
     return await send_dalton_notify_test(user_id, body.target)
