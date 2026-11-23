@@ -52,6 +52,11 @@ RUN pnpm install --frozen-lockfile
 COPY docs-site/astro.config.mjs ./
 COPY docs-site/src/ src/
 COPY docs-site/public/ public/
+# The docs build hook checks the app's help links against these frontend files
+# (docs-site/src/integrations/site-artifacts.mjs reads them from <repo>/web).
+COPY web/src/config/supportLinks.ts /web/src/config/supportLinks.ts
+COPY web/src/lib/claudeCode.ts /web/src/lib/claudeCode.ts
+COPY web/src/components/Sidebar/AccountMenu.tsx /web/src/components/Sidebar/AccountMenu.tsx
 
 ARG DOCS_SITE_ORIGIN=""
 ENV DOCS_SITE_ORIGIN=${DOCS_SITE_ORIGIN}
