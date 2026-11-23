@@ -45,7 +45,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -212,7 +212,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "7e4229669527421603b3edd662881f9aa56297554f0db69dcf42b4ef1b2e6c56",
+   "system_prompt_sha256": "0dd7fde2f7f0c04f13dec8172513fe45cabb16bef3a1eaebfd40f9ae8b6f6231",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -329,7 +329,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -506,7 +506,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "86fc7281ddcedc6ab0f46b513c1f6cb242c2cb45e04372af80bbf5576efb014b",
+   "system_prompt_sha256": "1182e4a58f6158f4b159e935d86591870c0d75b54066936bf64285f3074abb3a",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -673,7 +673,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "de351a91302dcf5c43ea47fbfcd14b78bb23b0133618d4a23e6b7c22be7132e0",
+   "system_prompt_sha256": "37198c9d2420ca72241c0c1c17e45d160047ea4fed16fc2491d25fb28c1488cc",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -790,7 +790,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "86fc7281ddcedc6ab0f46b513c1f6cb242c2cb45e04372af80bbf5576efb014b",
+   "system_prompt_sha256": "1182e4a58f6158f4b159e935d86591870c0d75b54066936bf64285f3074abb3a",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -967,7 +967,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -1134,7 +1134,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "7e4229669527421603b3edd662881f9aa56297554f0db69dcf42b4ef1b2e6c56",
+   "system_prompt_sha256": "0dd7fde2f7f0c04f13dec8172513fe45cabb16bef3a1eaebfd40f9ae8b6f6231",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -1251,7 +1251,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -1428,7 +1428,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -1595,7 +1595,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "7e4229669527421603b3edd662881f9aa56297554f0db69dcf42b4ef1b2e6c56",
+   "system_prompt_sha256": "0dd7fde2f7f0c04f13dec8172513fe45cabb16bef3a1eaebfd40f9ae8b6f6231",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -1712,7 +1712,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -1889,7 +1889,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "86fc7281ddcedc6ab0f46b513c1f6cb242c2cb45e04372af80bbf5576efb014b",
+   "system_prompt_sha256": "1182e4a58f6158f4b159e935d86591870c0d75b54066936bf64285f3074abb3a",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -2051,7 +2051,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "86fc7281ddcedc6ab0f46b513c1f6cb242c2cb45e04372af80bbf5576efb014b",
+   "system_prompt_sha256": "1182e4a58f6158f4b159e935d86591870c0d75b54066936bf64285f3074abb3a",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -2223,7 +2223,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -2395,7 +2395,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -2567,7 +2567,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -2739,7 +2739,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -2905,7 +2905,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -3071,7 +3071,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -3237,7 +3237,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -3403,7 +3403,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "86fc7281ddcedc6ab0f46b513c1f6cb242c2cb45e04372af80bbf5576efb014b",
+   "system_prompt_sha256": "1182e4a58f6158f4b159e935d86591870c0d75b54066936bf64285f3074abb3a",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -3570,7 +3570,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "86fc7281ddcedc6ab0f46b513c1f6cb242c2cb45e04372af80bbf5576efb014b",
+   "system_prompt_sha256": "1182e4a58f6158f4b159e935d86591870c0d75b54066936bf64285f3074abb3a",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -3739,7 +3739,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -3906,7 +3906,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -4075,7 +4075,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -4242,7 +4242,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -4411,7 +4411,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -4578,7 +4578,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -4747,7 +4747,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "86fc7281ddcedc6ab0f46b513c1f6cb242c2cb45e04372af80bbf5576efb014b",
+   "system_prompt_sha256": "1182e4a58f6158f4b159e935d86591870c0d75b54066936bf64285f3074abb3a",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -4918,7 +4918,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "86fc7281ddcedc6ab0f46b513c1f6cb242c2cb45e04372af80bbf5576efb014b",
+   "system_prompt_sha256": "1182e4a58f6158f4b159e935d86591870c0d75b54066936bf64285f3074abb3a",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -5086,7 +5086,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "86fc7281ddcedc6ab0f46b513c1f6cb242c2cb45e04372af80bbf5576efb014b",
+   "system_prompt_sha256": "1182e4a58f6158f4b159e935d86591870c0d75b54066936bf64285f3074abb3a",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -5260,7 +5260,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "86fc7281ddcedc6ab0f46b513c1f6cb242c2cb45e04372af80bbf5576efb014b",
+   "system_prompt_sha256": "1182e4a58f6158f4b159e935d86591870c0d75b54066936bf64285f3074abb3a",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -5429,7 +5429,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -5588,7 +5588,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -5752,7 +5752,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -5911,7 +5911,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -6075,7 +6075,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "86fc7281ddcedc6ab0f46b513c1f6cb242c2cb45e04372af80bbf5576efb014b",
+   "system_prompt_sha256": "1182e4a58f6158f4b159e935d86591870c0d75b54066936bf64285f3074abb3a",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -6234,7 +6234,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "86fc7281ddcedc6ab0f46b513c1f6cb242c2cb45e04372af80bbf5576efb014b",
+   "system_prompt_sha256": "1182e4a58f6158f4b159e935d86591870c0d75b54066936bf64285f3074abb3a",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -6393,7 +6393,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "86fc7281ddcedc6ab0f46b513c1f6cb242c2cb45e04372af80bbf5576efb014b",
+   "system_prompt_sha256": "1182e4a58f6158f4b159e935d86591870c0d75b54066936bf64285f3074abb3a",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -6557,7 +6557,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "86fc7281ddcedc6ab0f46b513c1f6cb242c2cb45e04372af80bbf5576efb014b",
+   "system_prompt_sha256": "1182e4a58f6158f4b159e935d86591870c0d75b54066936bf64285f3074abb3a",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -6721,7 +6721,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "86fc7281ddcedc6ab0f46b513c1f6cb242c2cb45e04372af80bbf5576efb014b",
+   "system_prompt_sha256": "1182e4a58f6158f4b159e935d86591870c0d75b54066936bf64285f3074abb3a",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -6885,7 +6885,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "86fc7281ddcedc6ab0f46b513c1f6cb242c2cb45e04372af80bbf5576efb014b",
+   "system_prompt_sha256": "1182e4a58f6158f4b159e935d86591870c0d75b54066936bf64285f3074abb3a",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -7049,7 +7049,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -7213,7 +7213,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "cf54acf4578b66ec54d5af586aca4a2135e3f935e70c89d52b4ce274d69aa529",
+   "system_prompt_sha256": "449a6634bf4f459572bbaf7ce16b23f23a5b27caa44342b83eede5386b9e361e",
    "tools": [
     "AskUserQuestion",
     "Bash",

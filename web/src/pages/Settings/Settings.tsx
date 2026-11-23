@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { lazy, Suspense, useEffect, useRef } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router';
 import { useScrollMemory } from '@/lib/scrollMemory';
 import { useUser } from '@/hooks/useUser';
@@ -37,6 +37,9 @@ import {
 import '@/styles/pageRail.css';
 import './Settings.css';
 
+// A self-hosted server's own settings, which a hosted build never opens.
+const ServerPanel = lazy(() => import('./panels/ServerPanel'));
+
 /** A section's rows while the account is read on a cold load: a name and a
  *  line under it on the left, the control on the right, as the rows lay theirs
  *  out. */
@@ -68,6 +71,7 @@ function SectionBody({ section }: { section: Section }) {
     case 'computers': return <ComputersPanel />;
     case 'model': return <ModelsPanel />;
     case 'budget': return <DaltonBudgetPanel />;
+    case 'server': return <Suspense fallback={<SettingsSkeleton />}><ServerPanel /></Suspense>;
     case 'integrations': return <IntegrationsPanel />;
     case 'coverage': return <DaltonCoveragePanel />;
     case 'teamModels': return <DaltonTeamModelsPanel />;

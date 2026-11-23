@@ -258,7 +258,52 @@
     "experiments": "Experiments",
     "experimentsIntro": "Early-access features still in development. Turn one on to enable it for your account. You can switch it off at any time.",
     "experimentsEmpty": "No experiments are available right now.",
-    "experimentTradeoff": "<lead>Trade-off:</lead> <text/>",
+    "features": {
+      "onByDefault": "On by default",
+      "offByDefault": "Off by default",
+      "needs": "Needs {{name}}",
+      "preview": "Preview",
+      "defaultLabel": "Default",
+      "costLabel": "Cost",
+      "on": "On",
+      "off": "Off",
+      "isOn": "{{name}} is on",
+      "isOff": "{{name}} is off",
+      "onIf": {
+        "opt_in": "Turn it on if",
+        "opt_out": "Keep it on if"
+      },
+      "offIf": {
+        "opt_in": "Leave it off if",
+        "opt_out": "Turn it off if"
+      },
+      "groups": {
+        "chat": {
+          "title": "In the chat",
+          "description": "What you see while the agent works."
+        },
+        "tools": {
+          "title": "Tools",
+          "description": "What the agent can use beyond its built-in research tools."
+        },
+        "autonomy": {
+          "title": "Working on its own",
+          "description": "When the agent may start a turn without a message from you."
+        },
+        "long_threads": {
+          "title": "Long threads",
+          "description": "How the agent keeps its place as a thread grows long."
+        },
+        "dashboard": {
+          "title": "Dashboard",
+          "description": "What your dashboard shows."
+        },
+        "other": {
+          "title": "More",
+          "description": "More features you can try."
+        }
+      }
+    },
     "theme": "Theme",
     "dark": "Dark",
     "light": "Light",
@@ -336,6 +381,8 @@
     "outputFormat": "Output format",
     "subagentsDefault": "Subagents",
     "subagentsDefaultDesc": "Let the agent hand work to subagents. Threads follow this unless you switch one the other way in its chat input.",
+    "ownContext": "Use my preferences and memory in shared workspaces",
+    "ownContextDesc": "On your own messages in a shared workspace, the agent follows your answer preferences and can read your memory. In a conversation shared with the workspace, its answers are visible to the workspace's members.",
     "resetPreferences": "Reset preferences",
     "resetConfirmMsg": "This will clear all your preferences: risk tolerance, investment style, agent settings, your default models and other model settings (custom models and providers, quick-access models, per-model settings), and your dashboard layout. Conversations keep the models they use. You can set everything up again anytime in Settings or via the agent. Are you sure?",
     "resetting": "Resetting...",
@@ -601,7 +648,15 @@
       "personal": "Personal",
       "team": "Team Management"
     },
+    "server": {
+      "location": "Where the agent runs",
+      "locationDesc": "A change applies to new computers. Computers you already have stay where they are.",
+      "marketDataDesc": "Yahoo Finance needs no key. A key adds more data.",
+      "webSearchDesc": "The agent searches with the provider you pick here.",
+      "keysReach": "A saved key applies on this server right away, while Docker and cloud computers you already have keep the keys they were created with, and a computer on this machine picks up a change at its next start."
+    },
     "section": {
+      "server": "Server",
       "account": "Account",
       "preferences": "Investing Profile",
       "plan": "Plan & Usage",
@@ -623,6 +678,7 @@
       "teamChannels": "Team Channels & Ops"
     },
     "definition": {
+      "server": "Where the agent runs and the vendor keys this server holds.",
       "account": "Your name, photo and sign-in.",
       "preferences": "What you told the agent about how you invest, so its research fits you.",
       "plan": "Your plan, your credits and billing, managed in your {{brand}} account.",
@@ -1895,6 +1951,8 @@
       "dockerDesc": "Runs on this machine",
       "sshDesc": "Any Linux server or Mac",
       "sshLabel": "Your machine (SSH)",
+      "localLabel": "This computer",
+      "localDesc": "The agent runs on this machine as you, with no isolation",
       "capReached": "Limit reached"
     },
     "largerSlot": {
@@ -2491,6 +2549,8 @@
     "attachmentsTooMany": "Not attached: attachments in one message cannot exceed {{max}} in total (including screenshots).",
     "contextPanel": {
       "trigger": "Context window, {{percent}} used",
+      "triggerDue": "Context window, {{percent}} used. Earlier messages will be summarized before your next one.",
+      "triggerDueUncounted": "Context window. Earlier messages will be summarized before your next one.",
       "title": "Context",
       "used": "{{used}} / {{threshold}} used ({{percent}})",
       "compactAt": "Compact at",
@@ -2766,7 +2826,7 @@
       "offline": "Not running",
       "private": "Private · only the owner can open it"
     },
-    "modelTroubleSuggestion": "{{from}} is having trouble — this answer came from {{to}}",
+    "modelTroubleSuggestion": "{{from}} is having trouble, so this answer came from {{to}}.",
     "switchToModel": "Switch to {{model}}",
     "switchToModelPaid": "Switch to {{model}} ({{payer}})",
     "threadSubagents": {
@@ -2779,6 +2839,8 @@
       "pickFailed": "Couldn't change this thread's model",
       "retired": "{{model}} is no longer available. This thread now uses {{fallback}}.",
       "lapsed": "Your {{account}} sign-in has expired. Reconnect it to use {{model}}.",
+      "notConnected": "Your {{account}} plan isn't connected. Connect it to use {{model}}, or pick another model.",
+      "connect": "Connect",
       "offer": "This thread uses {{model}}. New threads start on {{defaultModel}}.",
       "handoff": "OpenAI compacted part of this thread into a summary only its models can read. The previous model is writing it out for {{model}}, so your next message may take a little longer to start.",
       "brief": "Handing this thread's context to {{model}} so it can pick up where it left off. Your next message may take a little longer to start.",
@@ -3163,7 +3225,6 @@
     "modelSelector": {
       "manageModels": "Manage models",
       "setUpModel": "Set up a model",
-      "reasoningEffort": "Effort",
       "effortNone": "Off",
       "effortMinimal": "Minimal",
       "effortLow": "Low",
@@ -3195,6 +3256,20 @@
       "taskCostUnmeasured": "Not measured at this level. Costs no more than the level above.",
       "taskCostHeader": "Cost per task",
       "taskCostNote": "A rough estimate of how a typical task's cost changes with effort, compared with the default level.",
+      "reasoning": "Reasoning",
+      "defaultLevel": "Default: {{level}}",
+      "nothingToTune": "Nothing to tune on this model",
+      "apiPrice": "API price per 1M tokens",
+      "apiPriceValue": "{{input}} in · {{output}} out",
+      "taskCostVsDefault": "About {{value}}× the default level's cost per task",
+      "taskCostVsDefaultAtMost": "At most {{value}}× the default level's cost per task",
+      "costMarksNote": "Roughly what a typical task costs on each model at its standard level, from $ to $$$$$. Hover the marks for the figure.",
+      "costMarksMeasuredAtLevel": "About {{value}}× {{model}} at {{level}}",
+      "costMarksMeasured": "About {{value}}× {{model}}",
+      "costMarksBoundAtLevel": "At most {{value}}× {{model}} at {{level}}. This model's default level was not measured, so this is an upper bound",
+      "costMarksBound": "At most {{value}}× {{model}}. This model's default level was not measured, so this is an upper bound",
+      "costMarksEstimate": "Estimated from the API price, not yet measured on tasks",
+      "costBaselineFallback": "the reference model",
       "claudeCodeRejected": "Claude refused your setup token. Add a new one in Settings to use this model",
       "claudeCodeNeedsOwnComputer": "Runs only on workspaces on your own computers",
       "claudeCodePolicyBlocked": "Your organization's Claude Code policy keeps it from running on this computer",
@@ -3341,6 +3416,9 @@
       "skipHint": "Send the whole conversation instead. It costs more.",
       "skipped": "Your next message will include the whole conversation, which costs more.",
       "undo": "Undo"
+    },
+    "composerNotice": {
+      "notNow": "Not now"
     },
     "claudeCode": {
       "off": {
@@ -3504,6 +3582,13 @@
     "metaPages_one": "1 page",
     "metaPages_other": "{{count}} pages",
     "newTab": "New tab",
+    "emptyTab": "New tab",
+    "tabMenu": {
+      "close": "Close",
+      "closeOthers": "Close others",
+      "closeToRight": "Close to the right",
+      "closeAll": "Close all"
+    },
     "back": "Back",
     "forward": "Forward",
     "noFilesYet": "No files yet",
@@ -3648,6 +3733,10 @@
       "too_large": "Too large to back up here. Move or split it.",
       "too_large_sized": "Too large to back up here ({{size}}). Move or split it.",
       "path_too_long": "Its path is too long to back up. Shorten its folder names.",
+      "bad_name": "Its name isn't valid text, so it can't be backed up. Rename it.",
+      "history_too_large": "Its Git history is too large to back up. The files are backed up; push the history to keep it.",
+      "history_too_large_sized": "Its Git history is too large to back up ({{size}}). The files are backed up; push the history to keep it.",
+      "history_held": "A file in its Git history couldn't be backed up this time, so the history keeps its last complete backup.",
       "changed": "Changed while saving. The next backup retries.",
       "unreadable": "Couldn't be read in the sandbox. Check its permissions.",
       "failed": "Didn't upload. The next backup retries."
@@ -5045,6 +5134,75 @@
     }
   },
   "setup": {
+    "computer": {
+      "title": "Where should your agent run?",
+      "localTitle": "This computer",
+      "localDesc": "No Docker or cloud account needed. The agent runs as you on this machine and can read and change your files.",
+      "localWarning": "Not isolated: anything the agent runs has the same access you do.",
+      "installTitle": "What to install",
+      "installHelp": "Installed on this machine the first time the agent starts here.",
+      "groupSize": "{{download}} download, {{disk}} on disk",
+      "installTotal": "With these: {{download}} to download, {{disk}} on disk.",
+      "required": "Required",
+      "groupCore": "Core",
+      "groupCoreDesc": "Python and the data libraries the agent always needs.",
+      "groupBrowsing": "Browsing",
+      "groupBrowsingDesc": "Reading web pages, scraping and video transcripts.",
+      "groupDocuments": "Documents",
+      "groupDocumentsDesc": "Reading and writing Word, PowerPoint, Excel and PDF files.",
+      "groupChromium": "Chromium",
+      "groupChromiumDesc": "A browser of the agent's own. Without it, the agent uses Chrome, Chromium, Edge or Brave if this machine has one.",
+      "dockerTitle": "Docker",
+      "dockerDesc": "Isolated in a container on this machine.",
+      "dockerFound": "Docker is running.",
+      "dockerMissing": "Docker isn't answering on this machine. Install it or start it, then check again.",
+      "dockerStillDown": "Docker still isn't answering. Install it or start it, then check again.",
+      "dockerCheck": "Check again",
+      "dockerInstall": "Install Docker",
+      "dockerNotOffered": "Not offered here: a container on this system can't reach the app's server. Pick another option.",
+      "cloudTitle": "Cloud VM",
+      "cloudDesc": "Isolated on Daytona or E2B, with your own key. Your files live with that vendor.",
+      "cloudReach": "Without a public address for this server, the file mount, connectors and the la CLI don't work.",
+      "cloudVendor": "Cloud vendor",
+      "cloudKey": "{{vendor}} API key",
+      "cloudKeyMissing": "Add a {{vendor}} API key to run there, or pick another option.",
+      "environment": "Set on the server: {{provider}}. Change it there."
+    },
+    "services": {
+      "marketData": "Market data",
+      "optional": "Optional",
+      "yahooTitle": "Yahoo Finance",
+      "yahooDesc": "Works with no key: prices, fundamentals, analyst data and screening.",
+      "fmpDesc": "Optional. Adds fundamentals and macro data. Has a free tier.",
+      "webSearch": "Web search",
+      "searchProvider": "Provider",
+      "searchNone": "Skip for now",
+      "searchProviderHasKey": "{{provider}} (key added)",
+      "searchKey": "{{provider}} API key",
+      "searchOff": "Web search stays off until a key is added.",
+      "fetchToggle": "Page reading",
+      "fetchDesc": "The built-in reader needs no key. Firecrawl can read pages in its place and adds site crawling."
+    },
+    "key": {
+      "getKey": "Get a key",
+      "testRefused": "The key was refused.",
+      "testPlan": "The key's plan has run out or does not include this.",
+      "testRateLimited": "Rate limited, so the key could not be checked yet.",
+      "testTimeout": "No answer within 10 seconds.",
+      "testUnreachable": "The vendor could not be reached.",
+      "testUnusable": "This is not a usable key.",
+      "testNone": "This key has no test.",
+      "testStatus": "The vendor answered with status {{status}}.",
+      "environment": "Set on the server, so it is read-only here.",
+      "replace": "Replace",
+      "remove": "Remove"
+    },
+    "errors": {
+      "noEncryptionKey": "Saving needs BYOK_ENCRYPTION_KEY set on the server.",
+      "saveFailed": "Could not save. Try again.",
+      "statusFailed": "Could not read this server's setup.",
+      "tryAgain": "Try again"
+    },
     "capabilities": "Capabilities",
     "brandedHeader": "Configure your LLM providers",
     "securityNote": "Your API keys are encrypted and never shared",
@@ -5265,10 +5423,12 @@
         "teamModels": "Team models",
         "cloud": "Cloud computer",
         "serverComputer": "This server's computer",
+        "thisComputer": "This computer",
         "own_computer": "Your computer"
       },
       "rail": {
         "use": "Your use",
+        "server": "Server",
         "computer": "Computer",
         "model": "Model",
         "default": "Default"
@@ -5287,11 +5447,17 @@
         "claudeCodeDesc": "Pro or Max. Claude Code runs on your plan, with {{brand}}'s tools.",
         "subscription": "Another subscription or an API key",
         "subscriptionDesc": "ChatGPT, Grok, a coding plan, or a key from any provider.",
+        "anyKey": "+ any API key",
         "serverModels": "Models this server provides",
         "serverModelsDesc": "The models your administrator set up.",
         "whereLabel": "Where should your tasks run?",
         "serverComputer": "On a computer this server runs",
         "serverComputerDesc": "Keeps working when your computer is off.",
+        "thisComputer": "On this computer",
+        "thisComputerDesc": "Runs while this computer is awake and LangAlpha is open.",
+        "hostedPitch": "Need it working while your computer is off? LangAlpha.ai runs it in the cloud, with nothing to set up.",
+        "hostedApp": "Get the LangAlpha.ai app",
+        "hostedCompare": "Hosted or self-hosted?",
         "homeStays": "Home stays on this Mac. Move it in Settings.",
         "own": "On your own computer",
         "ownDesc": "Your Mac, or any Mac or Linux computer over SSH.",
@@ -5463,6 +5629,11 @@
       "note": "Either way, the browser tab and this app show the same progress.",
       "inBrowser": "I'll finish in the browser",
       "here": "Continue here"
+    },
+    "server": {
+      "title": "Set up this server",
+      "helper": "Where it runs agent code, and the services its tools use. You answer this once for everyone on this server, and can change it later in Settings.",
+      "helperKeys": "The services its tools use. You answer this once for everyone on this server, and can change it later in Settings."
     }
   },
   "marketView": {
@@ -9950,6 +10121,10 @@
       "submit": "Create",
       "creating": "Creating…",
       "teamHint": "Everyone in the team can open it, beside the people you list."
+    },
+    "memberContext": {
+      "label": "Members' own context",
+      "body": "On each member's own messages, the agent also uses their answer preferences and can read their personal memory. It never changes their memory. In a conversation shared with the workspace, everyone here sees what the agent writes."
     },
     "members": {
       "open": "People",

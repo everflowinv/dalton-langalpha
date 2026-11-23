@@ -473,11 +473,8 @@ async def test_docker_provider_ensure_image_passes_install_browser_buildarg(
 
         import aiodocker
         import aiodocker.images
-        from ptc_agent.config.core import DockerConfig
+        from ptc_agent.core.sandbox.providers._docker_image import ensure_image
 
-        provider = DockerProvider(
-            DockerConfig(image="test-sandbox:latest"), working_dir="/home/workspace"
-        )
         mock_images = create_autospec(aiodocker.images.DockerImages, instance=True)
         mock_images.inspect.side_effect = Exception("missing image")
 
@@ -491,7 +488,7 @@ async def test_docker_provider_ensure_image_passes_install_browser_buildarg(
         mock_client = create_autospec(aiodocker.Docker, instance=True)
         mock_client.images = mock_images
 
-        await provider._ensure_image(mock_client)
+        await ensure_image(mock_client, "test-sandbox:latest")
         assert captured["buildargs"] == {"INSTALL_AGENT_BROWSER": expected_arg}
     finally:
         clear_config_cache()

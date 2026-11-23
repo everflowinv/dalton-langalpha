@@ -7,6 +7,7 @@ import { useTheme } from '@/contexts/ThemeContext';
 import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(colleague-dispatch)
 import { useAllWorkspaces } from '@/hooks/useAllWorkspaces';
 import { useAppearance } from '@/hooks/useAppearance';
+import { isFeatureEnabled, useFeatures } from '@/hooks/useFeatures';
 import { useSkills } from '@/hooks/useSkills';
 import { useWorkspaceLabel } from '@/hooks/useWorkspaceLabel';
 import { isDesktopShell } from '@/lib/desktop';
@@ -39,6 +40,7 @@ export function useLocalSources(v: Verbs) {
   const { theme } = useTheme();
   const { pickTheme } = useAppearance();
   const reportSaveFailure = useSaveFailureToast();
+  const features = useFeatures().data;
   const openCreateWorkspace = useOpenCreateWorkspace();
   // DALTON-HOOK(colleague-dispatch): palette search and new-thread actions follow the sidebar's workspace permissions
   // DALTON-HOOK(external-share-guard): an isolated external member does not see colleague workspaces
@@ -123,7 +125,11 @@ export function useLocalSources(v: Verbs) {
 
   // DALTON-HOOK(settings-section): same card visibility as the settings rail
   // DALTON-HOOK(hide-trading): trading settings stay out through sectionShown
-  const settings = searchableSettings(isDesktopShell(), daltonVisibility).map((entry): PaletteItem => {
+  const settings = searchableSettings(
+    isDesktopShell(),
+    daltonVisibility,
+    (key) => isFeatureEnabled(features, key),
+  ).map((entry): PaletteItem => {
     const section = SECTIONS[entry.section];
     return {
       id: `setting:${entry.anchor}`,

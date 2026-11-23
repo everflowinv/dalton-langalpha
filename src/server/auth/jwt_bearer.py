@@ -19,10 +19,11 @@ from dataclasses import dataclass
 
 import jwt
 from jwt import PyJWK, PyJWKClient
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from src.config.settings import HOST_MODE, LOCAL_DEV_USER_ID, SUPABASE_URL
+from src.server.auth import owner_requests
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +197,7 @@ async def _decode_token(token: str) -> AuthInfo:
 
 
 async def verify_jwt_token(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> str:
     """FastAPI dependency — extracts Bearer token via HTTPBearer and verifies it.
@@ -216,6 +218,7 @@ async def verify_jwt_token(
         reject_company_system_auth(resolved)
         return resolved
     if HOST_MODE == "oss":
+        owner_requests.refuse_unless_owner(request.scope)
         reject_company_system_auth(LOCAL_DEV_USER_ID)
         return LOCAL_DEV_USER_ID
     if credentials is None:
@@ -226,6 +229,7 @@ async def verify_jwt_token(
 
 
 async def get_current_auth_info(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> AuthInfo:
     """FastAPI dependency — returns both ``user_id`` and ``auth_provider``.
@@ -242,6 +246,7 @@ async def get_current_auth_info(
         reject_company_system_auth(info.user_id)
         return info
     if HOST_MODE == "oss":
+        owner_requests.refuse_unless_owner(request.scope)
         reject_company_system_auth(LOCAL_DEV_USER_ID)
         return AuthInfo(user_id=LOCAL_DEV_USER_ID)
     if credentials is None:

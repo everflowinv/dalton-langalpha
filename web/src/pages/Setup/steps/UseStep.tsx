@@ -2,11 +2,11 @@ import { useId, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 // DALTON-HOOK(dalton-setup): Dalton build & team credentials imports
-import { ChevronRight, Cloud, KeyRound, Laptop, Server } from 'lucide-react';
+import { ChevronRight, Cloud, ExternalLink, Laptop, Server } from 'lucide-react';
 import { isDaltonBuild } from '@/config/brand';
 import { WizardSection, WizardStepHeader } from '@/components/ui/wizard';
 import { ExternalRedirect } from '@/components/ExternalRedirect';
-import { ONBOARDING_USE_URL } from '@/config/supportLinks';
+import { DESKTOP_DOWNLOAD_URL, HOSTED_OR_SELF_HOSTED_URL, ONBOARDING_USE_URL } from '@/config/supportLinks';
 import { useClaudeCodeSetup } from '@/hooks/useClaudeCode';
 import { useComputerProviders, useComputers } from '@/pages/ChatAgent/hooks/useComputers';
 import { useProviderGate } from '@/pages/ChatAgent/hooks/useProviderGate';
@@ -15,12 +15,69 @@ import { useUser } from '@/hooks/useUser';
 import { CLAUDE_CODE } from '@/lib/claudeCode';
 import { llmProviderArt } from '@/lib/brandArt';
 import { BrandMark } from '@/pages/ChatAgent/components/mcp/BrandMark';
+import { cn } from '@/lib/utils';
 import { SetupFooter } from '../SetupFooter';
-import { AnswerOption, RowButton, SetupNote, StepError, StepLoadFailed, StepLoading } from '../answers/parts';
+import { AnswerOption, AnswerTile, RowButton, SetupNote, StepError, StepLoadFailed, StepLoading } from '../answers/parts';
 import { homeMachine } from '../answers/useSetupFacts';
 import { useDaltonTeamModels } from '../answers/useTeamModels';
 import { useOnboardingProgress } from '@/hooks/useOnboardingProgress';
 import { readAnswers, type ModelsAnswer, type RunsOnAnswer } from '../answers/setupSteps';
+import { useInDesktopApp } from '@/hooks/useServerSetup';
+
+// The subscriptions and coding plans the subscription card takes, in the order
+// people know them, and the three of them its tile holds, one a coding plan.
+const MAKERS = ['openai', 'xai', 'moonshot', 'z-ai', 'minimax', 'opencode-go'] as const;
+const STACKED = ['openai', 'xai', 'opencode-go'] as const;
+
+/** Grey and quiet at rest, in their own colours on a hovered or picked card. */
+const QUIET_MARK = 'opacity-55 grayscale transition-[opacity,filter] group-hover:opacity-100 group-hover:grayscale-0 group-has-checked:opacity-100 group-has-checked:grayscale-0';
+
+/** Three makers' marks overlapping in the 40px a tile takes, so the titles still line up. */
+function MarkStack() {
+  const spots = ['left-0 top-0.5 z-10', 'left-[18px] top-0.5 z-10', 'left-[9px] top-[18px]'];
+  return (
+    <span className="relative block h-10 w-10">
+      {STACKED.map((id, i) => (
+        <span
+          key={id}
+          className={cn('absolute grid h-[22px] w-[22px] place-items-center rounded-full', spots[i])}
+          style={{ background: 'var(--color-bg-card)', boxShadow: '0 0 0 1.5px var(--color-bg-card), inset 0 0 0 1px var(--color-border-default)' }}
+        >
+          <BrandMark name={id} art={llmProviderArt(id)} className={cn('h-[13px] w-[13px]', QUIET_MARK)} />
+        </span>
+      ))}
+    </span>
+  );
+}
+
+/** A link out of the app, from the note that offers the hosted edition. */
+function PitchLink({ href, children }: { href: string; children: string }) {
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="inline-flex items-center gap-1 font-medium text-(--color-text-primary) underline-offset-2 hover:underline"
+    >
+      {children}
+      <ExternalLink aria-hidden="true" className="h-3 w-3" />
+    </a>
+  );
+}
+
+/** The subscription card's line as the makers' marks, then any key. The marks
+ *  are pictures only, so the sentence they stand for is kept for a screen reader. */
+function MarkRow({ label, more }: { label: string; more: string }) {
+  return (
+    <>
+      <span aria-hidden="true" className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
+        {MAKERS.map((id) => <BrandMark key={id} name={id} art={llmProviderArt(id)} className={cn('h-4 w-4', QUIET_MARK)} />)}
+        <span className="text-[0.8125rem]" style={{ color: 'var(--color-text-secondary)' }}>{more}</span>
+      </span>
+      <span className="sr-only">{label}</span>
+    </>
+  );
+}
 
 /**
  * Self-hosted: the onboarding questions, asked here. Claude Code, the
@@ -75,6 +132,9 @@ function UseForm() {
   // Said only of a Mac paired through the app (its helper), which is what
   // the line names; an SSH host holding Home gets no line.
   const homeOnMac = !isDaltonBuild && !!homeMachine(computers.data?.computers ?? [])?.ssh?.helper;
+  // In the desktop app the server is this computer, so "keeps working when
+  // your computer is off" would be untrue, whatever runs the agent.
+  const { inDesktopApp, isLoading: desktopLoading } = useInDesktopApp();
   // With no own computer to offer, the server's is the only answer. In Dalton, cloud is always the default.
   const pickedRunsOn = runsOn ?? savedRunsOn ?? (providers.data && (isDaltonBuild || !ownOffered) ? 'cloud' : null);
 
@@ -117,7 +177,8 @@ function UseForm() {
     (!isDaltonBuild && claudeCodeLoading) ||
     (isDaltonBuild && team.isLoading) ||
     providers.isLoading ||
-    computers.isLoading
+    computers.isLoading ||
+    (!isDaltonBuild && desktopLoading)
   ) {
     return <StepLoading />;
   }
@@ -188,9 +249,9 @@ function UseForm() {
               value="subscription_or_key"
               checked={pickedModels === 'subscription_or_key'}
               onSelect={setModels}
-              mark={<KeyRound aria-hidden="true" className="h-4 w-4" />}
+              mark={<MarkStack />}
               title={t('setup.answers.use.subscription')}
-              detail={t('setup.answers.use.subscriptionDesc')}
+              detail={<MarkRow label={t('setup.answers.use.subscriptionDesc')} more={t('setup.answers.use.anyKey')} />}
             />
             {/* DALTON-HOOK(dalton-setup): personal choices wrapper ends here */}
             {serverModels && (
@@ -199,7 +260,7 @@ function UseForm() {
                 value="langalpha_models"
                 checked={pickedModels === 'langalpha_models'}
                 onSelect={setModels}
-                mark={<Server aria-hidden="true" className="h-4 w-4" />}
+                mark={<AnswerTile><Server aria-hidden="true" strokeWidth={1.5} /></AnswerTile>}
                 title={t('setup.answers.use.serverModels')}
                 detail={t('setup.answers.use.serverModelsDesc')}
               />
@@ -214,10 +275,19 @@ function UseForm() {
             value="cloud"
             checked={pickedRunsOn === 'cloud'}
             onSelect={setRunsOn}
-            mark={<Cloud aria-hidden="true" className="h-4 w-4" />}
-            title={t('setup.answers.use.serverComputer')}
-            detail={t('setup.answers.use.serverComputerDesc')}
+            mark={<AnswerTile>{inDesktopApp ? <Laptop aria-hidden="true" strokeWidth={1.5} /> : <Cloud aria-hidden="true" strokeWidth={1.5} />}</AnswerTile>}
+            title={t(inDesktopApp ? 'setup.answers.use.thisComputer' : 'setup.answers.use.serverComputer')}
+            detail={t(inDesktopApp ? 'setup.answers.use.thisComputerDesc' : 'setup.answers.use.serverComputerDesc')}
           />
+          {inDesktopApp && (
+            <SetupNote icon={<Cloud />}>
+              {t('setup.answers.use.hostedPitch')}
+              <span className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1">
+                <PitchLink href={DESKTOP_DOWNLOAD_URL}>{t('setup.answers.use.hostedApp')}</PitchLink>
+                <PitchLink href={HOSTED_OR_SELF_HOSTED_URL}>{t('setup.answers.use.hostedCompare')}</PitchLink>
+              </span>
+            </SetupNote>
+          )}
           {pickedRunsOn === 'cloud' && homeOnMac && <SetupNote>{t('setup.answers.use.homeStays')}</SetupNote>}
           {showOwnComputerOption && !isDaltonBuild && (
             <AnswerOption
@@ -225,7 +295,7 @@ function UseForm() {
               value="own_computer"
               checked={pickedRunsOn === 'own_computer'}
               onSelect={setRunsOn}
-              mark={<Laptop aria-hidden="true" className="h-4 w-4" />}
+              mark={<AnswerTile><Laptop aria-hidden="true" strokeWidth={1.5} /></AnswerTile>}
               title={t('setup.answers.use.own')}
               detail={t('setup.answers.use.ownDesc')}
             />
