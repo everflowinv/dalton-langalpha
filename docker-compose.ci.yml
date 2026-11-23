@@ -71,7 +71,9 @@ services:
       header-echo:
         condition: service_healthy
     volumes:
-      - ${CI_REPO_ROOT:-.}/tests/standalone/caddy/ci-probe.caddy:/etc/caddy/extra/ci-probe.caddy:ro
+      # Same target as the core extra dir, so it replaces that mount; a file mount
+      # inside the read-only extra dir cannot create its mount point.
+      - ${CI_REPO_ROOT:-.}/tests/standalone/caddy:/etc/caddy/extra:ro
 
   backend:
     depends_on:
