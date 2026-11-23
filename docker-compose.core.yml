@@ -36,21 +36,23 @@ services:
     oom_score_adj: -500
     env_file: .env
     # !override drops upstream docker-compose.yml's shell-interpolated POSTGRES_PASSWORD
-    # so DB_PASSWORD comes strictly from `env_file: .env` and is mapped at container start.
+    # so DB_USER / DB_PASSWORD / DB_NAME come strictly from `env_file: .env` and are
+    # mapped at container start. POSTGRES_* lines in .env are ignored, so the database,
+    # migrate and backend always use the same credentials.
     entrypoint:
       - /bin/sh
       - -c
       - |
-        export POSTGRES_USER="$${POSTGRES_USER:-$${DB_USER:-postgres}}"
-        export POSTGRES_PASSWORD="$${POSTGRES_PASSWORD:-$${DB_PASSWORD:-postgres}}"
-        export POSTGRES_DB="$${POSTGRES_DB:-$${DB_NAME:-postgres}}"
+        export POSTGRES_USER="$${DB_USER:-postgres}"
+        export POSTGRES_PASSWORD="$${DB_PASSWORD:-postgres}"
+        export POSTGRES_DB="$${DB_NAME:-postgres}"
         exec docker-entrypoint.sh "$$@"
       - --
     command: ["postgres"]
     environment: !override
       PGDATA: /var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER:-$${DB_USER:-postgres}}\" -d \"$${POSTGRES_DB:-$${DB_NAME:-postgres}}\""]
+      test: ["CMD-SHELL", "pg_isready -U \"$${DB_USER:-postgres}\" -d \"$${DB_NAME:-postgres}\""]
       interval: 5s
       timeout: 3s
       retries: 10
