@@ -8,9 +8,11 @@
 #   bash scripts/standalone/package_release.sh --ref HEAD --include-ci --output /tmp/dist --report /tmp/scan.txt
 set -euo pipefail
 
+CALLER_PWD="$PWD"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 GIT_REF="HEAD"
 OUTPUT_DIR=""
+OUTPUT_SET=0
 TAR_PATH=""
 REPORT_PATH=""
 INCLUDE_CI=0
@@ -42,8 +44,18 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --output)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --output requires a directory path" >&2
+        exit 2
+      fi
       OUTPUT_DIR="$2"
+      OUTPUT_SET=1
       shift 2
+      ;;
+    --output=*)
+      OUTPUT_DIR="${1#--output=}"
+      OUTPUT_SET=1
+      shift
       ;;
     --tar)
       TAR_PATH="$2"
@@ -69,10 +81,63 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$OUTPUT_DIR" && -z "$TAR_PATH" ]]; then
+if [[ "$OUTPUT_SET" -eq 0 && -z "$TAR_PATH" ]]; then
   echo "ERROR: Provide at least one of --output <dir> or --tar <file.tar.gz>" >&2
   usage >&2
   exit 2
+fi
+
+OUTPUT_DIR_ABS=""
+if [[ "$OUTPUT_SET" -eq 1 ]]; then
+  OUTPUT_DIR_ABS="$(python3 - "$OUTPUT_DIR" "$CALLER_PWD" "$REPO_ROOT" "${HOME:-}" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+raw_out, caller_pwd, repo_root, home_dir = sys.argv[1:5]
+if not raw_out or not raw_out.strip():
+    print("ERROR: --output must not be empty", file=sys.stderr)
+    sys.exit(2)
+
+raw_stripped = raw_out.strip()
+if raw_stripped in (".", "./", "/"):
+    print(f"ERROR: Refusing unsafe --output directory: {raw_out!r}", file=sys.stderr)
+    sys.exit(2)
+
+base_pwd = Path(caller_pwd).resolve()
+candidate = Path(raw_stripped)
+if not candidate.is_absolute():
+    candidate = base_pwd / candidate
+target = candidate.resolve(strict=False)
+
+protected_roots = [Path("/"), base_pwd, Path(repo_root).resolve()]
+if home_dir:
+    protected_roots.append(Path(home_dir).resolve())
+
+forbidden: set[Path] = set()
+for root in protected_roots:
+    forbidden.add(root)
+    forbidden.update(root.parents)
+
+if target in forbidden:
+    print(
+        f"ERROR: Refusing unsafe --output directory {str(target)!r} "
+        "(cannot be '.', '/', repository root, $HOME, or any of their parent directories)",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+if os.path.lexists(str(target)):
+    print(
+        f"ERROR: Output directory already exists: {str(target)!r} "
+        "(refusing to overwrite existing path)",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+print(str(target))
+PY
+)"
 fi
 
 cd "$REPO_ROOT"
@@ -194,8 +259,12 @@ if [[ "$INCLUDE_CI" -eq 1 ]]; then
 fi
 
 STAGE_DIR="$(mktemp -d)"
+SIBLING_TMP=""
 cleanup() {
   rm -rf "$STAGE_DIR"
+  if [[ -n "$SIBLING_TMP" && -e "$SIBLING_TMP" ]]; then
+    rm -rf "$SIBLING_TMP"
+  fi
 }
 trap cleanup EXIT
 
@@ -267,11 +336,19 @@ if [[ -n "$REPORT_PATH" ]]; then
   cp "$SCAN_OUTPUT" "$REPORT_PATH"
 fi
 
-if [[ -n "$OUTPUT_DIR" ]]; then
-  rm -rf "$OUTPUT_DIR"
-  mkdir -p "$(dirname "$OUTPUT_DIR")"
-  cp -a "$EXPORT_ROOT" "$OUTPUT_DIR"
-  echo "[package_release] Exported clean release directory: ${OUTPUT_DIR}"
+if [[ -n "$OUTPUT_DIR_ABS" ]]; then
+  out_parent="$(dirname "$OUTPUT_DIR_ABS")"
+  out_base="$(basename "$OUTPUT_DIR_ABS")"
+  mkdir -p "$out_parent"
+  SIBLING_TMP="$(mktemp -d "${out_parent}/.${out_base}.tmp.XXXXXX")"
+  tar -cf - -C "$EXPORT_ROOT" . | tar -xf - -C "$SIBLING_TMP"
+  if [[ -e "$OUTPUT_DIR_ABS" || -L "$OUTPUT_DIR_ABS" ]]; then
+    echo "ERROR: Output directory already exists: ${OUTPUT_DIR_ABS}" >&2
+    exit 1
+  fi
+  mv "$SIBLING_TMP" "$OUTPUT_DIR_ABS"
+  SIBLING_TMP=""
+  echo "[package_release] Exported clean release directory: ${OUTPUT_DIR_ABS}"
 fi
 
 if [[ -n "$TAR_PATH" ]]; then

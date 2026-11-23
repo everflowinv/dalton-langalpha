@@ -103,8 +103,18 @@ def main() -> int:
         client.delete_bucket_policy(Bucket=bucket)
     except ClientError as exc:
         code = str(exc.response.get("Error", {}).get("Code", ""))
-        if code not in ("NoSuchBucketPolicy", "404", "MethodNotAllowed", "NotImplemented"):
-            print(f"[minio-init] WARN clearing bucket policy on '{bucket}': {exc}", file=sys.stderr)
+        if code != "NoSuchBucketPolicy":
+            print(
+                f"[minio-init] ERROR clearing bucket policy on '{bucket}': {exc}",
+                file=sys.stderr,
+            )
+            return 1
+    except Exception as exc:
+        print(
+            f"[minio-init] ERROR clearing bucket policy on '{bucket}': {exc}",
+            file=sys.stderr,
+        )
+        return 1
 
     client.head_bucket(Bucket=bucket)
     print(f"[minio-init] Verified private bucket '{bucket}' at {endpoint}.", flush=True)

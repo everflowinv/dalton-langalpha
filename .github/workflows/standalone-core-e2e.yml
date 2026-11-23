@@ -30,15 +30,8 @@ on:
       - "workflows/**"
       - "web/**"
       - "docs-site/**"
-      - "src/dalton/migrations/**"
-      - "src/dalton/profile.py"
-      - "src/dalton/settings.py"
-      - "src/dalton/dalton.core.yaml"
-      - "src/dalton/capabilities.py"
-      - "src/dalton/auth/**"
-      - "src/dalton/chat_upload_storage.py"
-      - "src/dalton/app/**"
-      - "src/dalton/services/chat_uploads.py"
+      - "src/config/**"
+      - "src/dalton/**"
       - "src/ptc_agent/config/**"
       - "src/ptc_agent/agent/**"
       - "src/ptc_agent/core/sandbox/**"
@@ -159,11 +152,14 @@ jobs:
           print("[secret_scan] OK: 0 generated secrets found in /tmp/standalone-artifacts.")
           PY
 
-      - name: Upload logs, scan report, and baseline DB snapshot
+      - name: Upload logs and scan report
         if: always() && steps.secret_scan.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: standalone-core-e2e-artifacts
-          path: /tmp/standalone-artifacts
+          path: |
+            /tmp/standalone-artifacts
+            !/tmp/standalone-artifacts/baseline-b1-oss.dump
+            !/tmp/standalone-artifacts/**/*.dump
           if-no-files-found: warn
           retention-days: 14

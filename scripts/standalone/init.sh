@@ -15,7 +15,6 @@
 # Usage:
 #   bash scripts/standalone/init.sh
 #   bash scripts/standalone/init.sh --non-interactive --domain localhost
-#   bash scripts/standalone/init.sh --domain dalton.example.com --env-file /path/to/.env
 set -euo pipefail
 umask 077
 
@@ -33,8 +32,7 @@ Usage: bash scripts/standalone/init.sh [OPTIONS]
 
 Options:
   --non-interactive       Do not prompt; use defaults / flags / existing .env values.
-  --domain <host>         Target domain (e.g. localhost or dalton.example.com).
-  --env-file <path>       Path to .env file (default: <repo>/.env).
+  --domain <host>         Target domain (use 'localhost' for single-machine trial).
   --skip-sandbox-build    Leave the code sandbox image unbuilt (build it later with
                           docker build -f Dockerfile.sandbox --build-arg INSTALL_AGENT_BROWSER=0 -t langalpha-sandbox:latest .).
   -h, --help              Show this help message.
@@ -61,18 +59,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --domain=*)
       DOMAIN_ARG="${1#--domain=}"
-      shift
-      ;;
-    --env-file)
-      if [[ $# -lt 2 || -z "${2:-}" ]]; then
-        echo "ERROR: --env-file requires a path" >&2
-        exit 2
-      fi
-      ENV_FILE="$2"
-      shift 2
-      ;;
-    --env-file=*)
-      ENV_FILE="${1#--env-file=}"
       shift
       ;;
     -h|--help)
@@ -122,22 +108,37 @@ check_environment() {
     exit 1
   fi
 
-  # 2. Docker Engine (>= 28.0 — required for reliable 127.0.0.1 loopback port isolation)
+  # 2. Docker Engine server (>= 28.0 — required for reliable 127.0.0.1 loopback port isolation)
+  local docker_check_msg=""
   if command -v docker >/dev/null 2>&1; then
     local docker_ver_raw docker_ver
-    docker_ver_raw="$(docker --version 2>/dev/null || true)"
-    docker_ver="$(printf '%s' "$docker_ver_raw" | sed -nE 's/.*version ([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/p' | head -n 1)"
+    docker_ver_raw="$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
+    docker_ver="$(printf '%s' "$docker_ver_raw" | sed -nE 's/^v?([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/p' | head -n 1)"
     if [[ -n "$docker_ver" ]]; then
       if version_ge "$docker_ver" "28.0.0"; then
-        ok "Docker Engine ${docker_ver} (>= 28.0)"
+        ok "Docker Engine server ${docker_ver} (>= 28.0)"
       else
-        warn "Docker Engine ${docker_ver} detected; >= 28.0 is required for reliable 127.0.0.1 loopback port isolation (older versions may allow L2 neighbors to reach loopback-published ports)."
+        docker_check_msg="Docker Engine server ${docker_ver} detected; >= 28.0 is required for reliable 127.0.0.1 loopback port isolation (older versions may allow L2 neighbors to reach loopback-published ports)."
       fi
     else
-      warn "Docker found, but could not parse version from: ${docker_ver_raw}"
+      docker_check_msg="Could not confirm Docker Engine server version via 'docker version --format {{.Server.Version}}' (>= 28.0 required; ensure the Docker daemon is running and accessible)."
     fi
   else
-    warn "Docker CLI not found in PATH — install Docker Engine >= 28.0 before starting services."
+    docker_check_msg="Docker CLI not found in PATH — cannot confirm Docker Engine server version >= 28.0."
+  fi
+  if [[ -n "$docker_check_msg" ]]; then
+    if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
+      err "$docker_check_msg"
+      exit 1
+    else
+      warn "$docker_check_msg"
+      local docker_confirm=""
+      read -r -p "  Docker Engine server >= 28.0 could not be verified. Type 'yes' to continue anyway: " docker_confirm || true
+      if [[ "$docker_confirm" != "yes" ]]; then
+        err "Aborted: Docker Engine server >= 28.0 is required."
+        exit 1
+      fi
+    fi
   fi
 
   # 3. Docker Compose (>= 2.24.4 for !reset / !override)
@@ -275,8 +276,29 @@ sanitize_project_name() {
   printf '%s' "$cleaned"
 }
 
+is_loopback_domain() {
+  local d
+  d="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  [[ "$d" == "localhost" || "$d" == "127.0.0.1" || "$d" == "::1" ]]
+}
+
+validate_domain_for_auth() {
+  local domain_val="$1"
+  local auth_mode
+  auth_mode="${DALTON_AUTH_MODE:-$(get_env_value "DALTON_AUTH_MODE")}"
+  auth_mode="${auth_mode:-oss}"
+  auth_mode="$(printf '%s' "$auth_mode" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$auth_mode" == "oss" ]] && ! is_loopback_domain "$domain_val"; then
+    err "当前核心版是免密单机试用，请先用 localhost 安装；正式对外部署等本地登录（Batch 4b）上线后再配置域名。"
+    exit 1
+  fi
+}
+
 main() {
   printf "\nDalton Standalone Core Initialization\n"
+  if [[ -n "$DOMAIN_ARG" ]]; then
+    validate_domain_for_auth "$DOMAIN_ARG"
+  fi
   check_environment
   print_docker_sock_notice
 
@@ -306,15 +328,19 @@ main() {
   existing_domain="$(get_env_value "DOMAIN")"
   if [[ -n "$DOMAIN_ARG" ]]; then
     domain="$DOMAIN_ARG"
+    validate_domain_for_auth "$domain"
     write_env_key "DOMAIN" "$domain"
   elif [[ -n "$existing_domain" ]]; then
     domain="$existing_domain"
+    validate_domain_for_auth "$domain"
   elif [[ "$NON_INTERACTIVE" -eq 1 ]]; then
     domain="localhost"
+    validate_domain_for_auth "$domain"
     write_env_key "DOMAIN" "$domain"
   else
     read -r -p "  Target domain (use 'localhost' for loopback trial) [localhost]: " domain
     domain="${domain:-localhost}"
+    validate_domain_for_auth "$domain"
     write_env_key "DOMAIN" "$domain"
   fi
   ok "DOMAIN=${domain}"
@@ -348,7 +374,7 @@ main() {
   edge_port="$(get_env_value "DALTON_EDGE_PORT")"
   edge_port="${edge_port:-8088}"
 
-  if [[ "$domain" == "localhost" || "$domain" == "127.0.0.1" ]]; then
+  if is_loopback_domain "$domain"; then
     set_env_if_empty "PUBLIC_APP_URL" "http://127.0.0.1:${edge_port}" || true
     set_env_if_empty "SERVER_BASE_URL" "http://127.0.0.1:${edge_port}" || true
     set_env_if_empty "DALTON_INVITE_EMAIL_DOMAIN" "team.dalton.local" || true

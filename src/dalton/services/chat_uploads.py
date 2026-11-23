@@ -88,6 +88,7 @@ CLEANUP_BATCH_LIMIT = 25
 _FALLBACK_CHUNK_BYTES = 4 * _MIB
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_CHAR_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_B64URL_RE = re.compile(r"\A[A-Za-z0-9_-]+\Z")
 
 # Short-lived, single-object HMAC token parameters for the core-profile sandbox
 # download relay (`GET /api/v1/dalton/chat-uploads/sandbox-object`, token passed in
@@ -233,10 +234,12 @@ def verify_sandbox_object_token(
         raise HTTPException(status_code=401, detail="Invalid sandbox download token")
 
     payload_b64, sig_b64 = parts[0], parts[1]
-    expected_sig = hmac.new(
-        hmac_key, payload_b64.encode("ascii"), hashlib.sha256
-    ).digest()
+    if not _B64URL_RE.fullmatch(payload_b64) or not _B64URL_RE.fullmatch(sig_b64):
+        raise HTTPException(status_code=401, detail="Invalid sandbox download token")
     try:
+        expected_sig = hmac.new(
+            hmac_key, payload_b64.encode("ascii"), hashlib.sha256
+        ).digest()
         supplied_sig = _b64url_decode(sig_b64)
     except Exception as exc:
         raise HTTPException(

@@ -29,6 +29,7 @@ def build_research_tracking_sql_predicate(alias: str = "a") -> str:
     The live version in ``src.dalton.autonomy.classification`` later reads
     ``dalton_coverage_units.lead_analyst_user_id``, which d041 adds; importing it
     here broke d035 on an empty database, where d041 has not run yet.
+    与已部署版本仅在空白、大小写异常的行上有差别，对空库等价。
     """
     kinds_sql = ", ".join(
         f"'{k}'"

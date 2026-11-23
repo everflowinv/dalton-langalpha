@@ -950,7 +950,11 @@ print("NET_ISOLATION_OK=true")
         if line.strip()
     ]
     assert sandbox_cids, "Expected at least one running langalpha-sandbox container"
-    expected_sandbox_net = ctx.env.get("SANDBOX_DOCKER_NETWORK") or ""
+    expected_sandbox_net = (
+        os.environ.get("SANDBOX_DOCKER_NETWORK")
+        or ctx.env.get("SANDBOX_DOCKER_NETWORK")
+        or ""
+    )
     for scid in sandbox_cids:
         raw_nets = subprocess.check_output(
             [

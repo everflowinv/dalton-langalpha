@@ -37,68 +37,102 @@ _CLIENT_KEY: tuple[str, str, str, str, str] | None = None
 _CLIENT: Any | None = None
 _SIGNING_CLIENT_KEY: tuple[str, str, str, str, str] | None = None
 _SIGNING_CLIENT: Any | None = None
+_PARTIAL_ENV_WARNED_MISSING: tuple[str, ...] | None = None
 
 
 def _has_dedicated_env() -> bool:
-    """True when any primary ``DALTON_CHAT_UPLOAD_STORAGE_*`` env var is configured."""
-    return any(bool((os.getenv(name) or "").strip()) for name in _DEDICATED_PRIMARY_ENV_VARS)
+    """True only when all four primary ``DALTON_CHAT_UPLOAD_STORAGE_*`` env vars are set.
+
+    When only a subset is configured, logs a warning listing the missing variable
+    names (never their values) and falls back as a whole to ``DALTON_ASR_STORAGE_*``.
+    """
+    global _PARTIAL_ENV_WARNED_MISSING
+    present = [
+        name for name in _DEDICATED_PRIMARY_ENV_VARS if (os.getenv(name) or "").strip()
+    ]
+    if len(present) == len(_DEDICATED_PRIMARY_ENV_VARS):
+        _PARTIAL_ENV_WARNED_MISSING = None
+        return True
+    if present:
+        missing = tuple(
+            name for name in _DEDICATED_PRIMARY_ENV_VARS if name not in present
+        )
+        if _PARTIAL_ENV_WARNED_MISSING != missing:
+            _PARTIAL_ENV_WARNED_MISSING = missing
+            logger.warning(
+                "Incomplete DALTON_CHAT_UPLOAD_STORAGE_* configuration "
+                "(missing: %s); falling back to DALTON_ASR_STORAGE_*",
+                ", ".join(missing),
+            )
+        return False
+    _PARTIAL_ENV_WARNED_MISSING = None
+    return False
 
 
 def _endpoint_url() -> str:
-    explicit = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL") or "").strip().rstrip("/")
-    return explicit or _store._endpoint_url()
+    if _has_dedicated_env():
+        return (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL") or "").strip().rstrip("/")
+    return _store._endpoint_url()
 
 
 def signing_endpoint_url() -> str:
     """Endpoint URL used when presigning direct download URLs (Everflow profile)."""
-    explicit = (
-        os.getenv("DALTON_CHAT_UPLOAD_STORAGE_SIGNING_ENDPOINT_URL") or ""
-    ).strip().rstrip("/")
-    if explicit:
-        return explicit
-    dedicated_ep = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL") or "").strip().rstrip("/")
-    if dedicated_ep:
-        return dedicated_ep
+    if _has_dedicated_env():
+        explicit = (
+            os.getenv("DALTON_CHAT_UPLOAD_STORAGE_SIGNING_ENDPOINT_URL") or ""
+        ).strip().rstrip("/")
+        if explicit:
+            return explicit
+        return _endpoint_url()
     return _store.signing_endpoint_url()
 
 
 def _bucket_name() -> str:
-    explicit = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME") or "").strip()
-    return explicit or _store._bucket_name()
+    if _has_dedicated_env():
+        return (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME") or "").strip()
+    return _store._bucket_name()
 
 
 def _access_key_id() -> str:
-    explicit = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID") or "").strip()
-    return explicit or _store._access_key_id()
+    if _has_dedicated_env():
+        return (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID") or "").strip()
+    return _store._access_key_id()
 
 
 def _secret_access_key() -> str:
-    explicit = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY") or "").strip()
-    return explicit or _store._secret_access_key()
+    if _has_dedicated_env():
+        return (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY") or "").strip()
+    return _store._secret_access_key()
 
 
 def _region() -> str:
-    explicit = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_REGION") or "").strip()
-    return explicit or _store._region()
+    if _has_dedicated_env():
+        explicit = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_REGION") or "").strip()
+        if explicit:
+            return explicit
+    return _store._region()
 
 
 def _addressing_style() -> str:
-    explicit = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE") or "").strip().lower()
-    return explicit or _store._addressing_style()
+    if _has_dedicated_env():
+        explicit = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE") or "").strip().lower()
+        if explicit:
+            return explicit
+    return _store._addressing_style()
 
 
 def _key_prefix() -> str:
-    if "DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX" in os.environ:
-        raw = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX") or "").strip().strip("/")
-        return f"{raw}/" if raw else ""
     if _has_dedicated_env():
+        if "DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX" in os.environ:
+            raw = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX") or "").strip().strip("/")
+            return f"{raw}/" if raw else ""
         return ""
     return _store._key_prefix()
 
 
 def resolve_full_key(object_key: str) -> str:
     """Resolve the full object key inside the active bucket, applying any configured prefix."""
-    if not _has_dedicated_env() and "DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX" not in os.environ:
+    if not _has_dedicated_env():
         return _store.resolve_full_key(object_key)
     cleaned = str(object_key or "").strip().lstrip("/")
     prefix = _key_prefix()
@@ -148,9 +182,7 @@ def _get_client() -> Any:
 
 
 def _get_signing_client() -> Any:
-    if not _has_dedicated_env() and not (
-        os.getenv("DALTON_CHAT_UPLOAD_STORAGE_SIGNING_ENDPOINT_URL") or ""
-    ).strip():
+    if not _has_dedicated_env():
         return _store._get_signing_client()
     global _SIGNING_CLIENT, _SIGNING_CLIENT_KEY
     cfg = (
@@ -170,25 +202,21 @@ def _get_signing_client() -> Any:
 
 
 def _reset_clients_for_test() -> None:
-    """Drop cached S3 clients (test-only helper)."""
-    global _CLIENT, _CLIENT_KEY, _SIGNING_CLIENT, _SIGNING_CLIENT_KEY
+    """Drop cached S3 clients and partial-config warning state (test-only helper)."""
+    global _CLIENT, _CLIENT_KEY, _SIGNING_CLIENT, _SIGNING_CLIENT_KEY, _PARTIAL_ENV_WARNED_MISSING
     with _CLIENT_LOCK:
         _CLIENT = None
         _CLIENT_KEY = None
         _SIGNING_CLIENT = None
         _SIGNING_CLIENT_KEY = None
+        _PARTIAL_ENV_WARNED_MISSING = None
 
 
 def is_chat_upload_storage_configured() -> bool:
     """True when chat upload storage (``DALTON_CHAT_UPLOAD_STORAGE_*`` or fallback ``DALTON_ASR_STORAGE_*``) is configured."""
-    if not _has_dedicated_env():
-        return _store.is_transcription_storage_configured()
-    return bool(
-        _endpoint_url()
-        and _bucket_name()
-        and _access_key_id()
-        and _secret_access_key()
-    )
+    if _has_dedicated_env():
+        return True
+    return _store.is_transcription_storage_configured()
 
 
 def build_chat_upload_key(workspace_id: str, upload_id: str, safe_filename: str) -> str:

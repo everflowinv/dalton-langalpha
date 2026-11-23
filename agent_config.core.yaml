@@ -19,7 +19,7 @@ sandbox:
     memory_limit: "3g"
     cpu_count: 2.0
     auto_stop_interval: 3000
-    network_mode: "sandbox-net"
+    network_mode: "sandbox-net"  # Fallback only; actual per-instance network name is determined by SANDBOX_DOCKER_NETWORK
 
 mcp:
   servers:

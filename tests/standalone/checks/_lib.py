@@ -524,12 +524,14 @@ class ComposeContext:
         compose_files: Sequence[Path],
         artifacts_dir: Path,
         edge_url: str = "http://127.0.0.1:8088",
+        project_name: str | None = None,
     ) -> None:
         self.work_dir = work_dir.resolve()
         self.compose_files = [Path(p).resolve() for p in compose_files]
         self.artifacts_dir = artifacts_dir.resolve()
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.edge_url = edge_url.rstrip("/")
+        self.project_name = (project_name or "").strip() or None
         self.env = load_env_file(self.work_dir / ".env")
 
     @classmethod
@@ -548,11 +550,13 @@ class ComposeContext:
             os.environ.get("STANDALONE_ARTIFACTS_DIR", str(work_dir / "ci-artifacts"))
         )
         edge_url = os.environ.get("STANDALONE_EDGE_URL", "http://127.0.0.1:8088")
+        project_name = os.environ.get("COMPOSE_PROJECT_NAME") or None
         return cls(
             work_dir=work_dir,
             compose_files=compose_files,
             artifacts_dir=artifacts_dir,
             edge_url=edge_url,
+            project_name=project_name,
         )
 
     @property
@@ -575,7 +579,10 @@ class ComposeContext:
         return token
 
     def compose_cmd(self, *args: str) -> list[str]:
-        cmd = ["docker", "compose", "--project-directory", str(self.work_dir)]
+        cmd = ["docker", "compose"]
+        if self.project_name:
+            cmd.extend(["-p", self.project_name])
+        cmd.extend(["--project-directory", str(self.work_dir)])
         for cf in self.compose_files:
             cmd.extend(["-f", str(cf)])
         cmd.extend(args)

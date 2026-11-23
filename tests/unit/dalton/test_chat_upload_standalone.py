@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib
+import importlib.util
 import json
 import os
 import stat
@@ -153,6 +154,48 @@ class TestChatUploadStorageDecoupling:
         assert storage._bucket_name() == "dalton-asr"
         assert storage.resolve_full_key("chat-uploads/ws/u/a.pdf") == "everflow/chat-uploads/ws/u/a.pdf"
 
+    def test_partial_dedicated_env_warns_without_values_and_falls_back_to_asr(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _clear_storage_env(monkeypatch)
+        monkeypatch.setenv("DALTON_ASR_STORAGE_ENDPOINT_URL", "http://asr-minio:9000")
+        monkeypatch.setenv(
+            "DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL", "http://host.docker.internal:9000"
+        )
+        monkeypatch.setenv("DALTON_ASR_STORAGE_BUCKET_NAME", "asr-bucket")
+        monkeypatch.setenv("DALTON_ASR_STORAGE_ACCESS_KEY_ID", "asr-key")
+        monkeypatch.setenv("DALTON_ASR_STORAGE_SECRET_ACCESS_KEY", "asr-secret")
+        monkeypatch.setenv("DALTON_ASR_STORAGE_KEY_PREFIX", "everflow")
+
+        # Set only 2 of the 4 required DALTON_CHAT_UPLOAD_STORAGE_* primary vars
+        partial_endpoint = "http://partial-chat-minio:9000"
+        partial_access = "super-secret-partial-access-key-999"
+        monkeypatch.setenv("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL", partial_endpoint)
+        monkeypatch.setenv("DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID", partial_access)
+        monkeypatch.setenv("DALTON_CHAT_UPLOAD_STORAGE_REGION", "eu-west-1")
+        monkeypatch.setenv("DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX", "partial-prefix")
+
+        with caplog.at_level("WARNING", logger=storage.logger.name):
+            assert storage.is_chat_upload_storage_configured() is True
+            assert storage._endpoint_url() == "http://asr-minio:9000"
+            assert storage.signing_endpoint_url() == "http://host.docker.internal:9000"
+            assert storage._bucket_name() == "asr-bucket"
+            assert storage._access_key_id() == "asr-key"
+            assert storage._secret_access_key() == "asr-secret"
+            assert storage.resolve_full_key("chat-uploads/ws/u/a.pdf") == "everflow/chat-uploads/ws/u/a.pdf"
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME" in warnings[0]
+        assert "DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY" in warnings[0]
+        assert partial_endpoint not in warnings[0]
+        assert partial_access not in warnings[0]
+
+        # When ASR fallback is also absent, partial dedicated env is treated as unconfigured
+        _clear_storage_env(monkeypatch)
+        monkeypatch.setenv("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL", partial_endpoint)
+        assert storage.is_chat_upload_storage_configured() is False
+
 
 class TestSandboxObjectRelayTokensAndEndpoint:
     """Short-lived, single-object HMAC header token validation and streaming endpoint tests."""
@@ -271,6 +314,25 @@ class TestSandboxObjectRelayTokensAndEndpoint:
         with pytest.raises(HTTPException) as bad_exc:
             svc.verify_sandbox_object_token("not-a-valid-token", now_ts=now)
         assert bad_exc.value.status_code == 401
+
+    def test_rejects_non_ascii_and_non_b64url_token_segments_with_401(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _clear_signing_env(monkeypatch)
+        monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "test-internal-secret-0123456789abcdef")
+        now = int(time.time())
+
+        for malformed in (
+            "中文载荷.validSig1234",
+            "héllo_payload.validSig1234",
+            "validPayload.中文签名",
+            "bad+char.validSig1234",
+            "validPayload.bad/char",
+            "validPayload.a",
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                svc.verify_sandbox_object_token(malformed, now_ts=now)
+            assert exc_info.value.status_code == 401, f"Expected 401 for {malformed!r}"
 
     def test_rejects_cross_object_use_in_verifier(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _clear_signing_env(monkeypatch)
@@ -669,21 +731,140 @@ class TestSandboxNetworkAndInitScript:
             with pytest.raises(RuntimeError, match="stop-after-capture"):
                 await provider.create()
         assert captured_cfg["HostConfig"]["NetworkMode"] == "custom-inst_sandbox"
+        assert "ExtraHosts" not in captured_cfg["HostConfig"]
+
+    @pytest.mark.asyncio
+    async def test_docker_provider_omits_host_gateway_only_when_core_and_sandbox_network_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _capture_host_config() -> dict[str, Any]:
+            provider = DockerProvider(DockerConfig(network_mode="sandbox-net"))
+            captured: dict[str, Any] = {}
+
+            async def _fake_start_new(
+                client: Any, container_config: dict[str, Any], name: str, sizing: Any
+            ) -> Any:
+                captured.update(container_config["HostConfig"])
+                raise RuntimeError("stop-after-capture")
+
+            mock_get_client = create_autospec(provider._get_client, return_value=object())
+            mock_ensure_image = create_autospec(provider._ensure_image, return_value=None)
+            mock_start_new = create_autospec(provider._start_new, side_effect=_fake_start_new)
+            with (
+                patch.object(provider, "_get_client", mock_get_client),
+                patch.object(provider, "_ensure_image", mock_ensure_image),
+                patch.object(provider, "_start_new", mock_start_new),
+            ):
+                with pytest.raises(RuntimeError, match="stop-after-capture"):
+                    await provider.create()
+            return captured
+
+        # Core profile + SANDBOX_DOCKER_NETWORK set -> no host.docker.internal alias
+        monkeypatch.delenv("APP_ENV", raising=False)
+        monkeypatch.setenv("DALTON_PROFILE", "core")
+        monkeypatch.setenv("SANDBOX_DOCKER_NETWORK", "dalton-core_sandbox")
+        core_with_net = await _capture_host_config()
+        assert "ExtraHosts" not in core_with_net
+
+        # Core profile WITHOUT SANDBOX_DOCKER_NETWORK -> host.docker.internal preserved
+        monkeypatch.delenv("SANDBOX_DOCKER_NETWORK", raising=False)
+        core_without_net = await _capture_host_config()
+        assert core_without_net["ExtraHosts"] == ["host.docker.internal:host-gateway"]
+
+    @pytest.mark.asyncio
+    async def test_docker_provider_keeps_host_gateway_in_everflow_profile(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _capture_host_config() -> dict[str, Any]:
+            provider = DockerProvider(DockerConfig(network_mode="bridge"))
+            captured: dict[str, Any] = {}
+
+            async def _fake_start_new(
+                client: Any, container_config: dict[str, Any], name: str, sizing: Any
+            ) -> Any:
+                captured.update(container_config["HostConfig"])
+                raise RuntimeError("stop-after-capture")
+
+            mock_get_client = create_autospec(provider._get_client, return_value=object())
+            mock_ensure_image = create_autospec(provider._ensure_image, return_value=None)
+            mock_start_new = create_autospec(provider._start_new, side_effect=_fake_start_new)
+            with (
+                patch.object(provider, "_get_client", mock_get_client),
+                patch.object(provider, "_ensure_image", mock_ensure_image),
+                patch.object(provider, "_start_new", mock_start_new),
+            ):
+                with pytest.raises(RuntimeError, match="stop-after-capture"):
+                    await provider.create()
+            return captured
+
+        monkeypatch.setenv("APP_ENV", "dalton")
+        monkeypatch.delenv("DALTON_PROFILE", raising=False)
+        monkeypatch.delenv("SANDBOX_DOCKER_NETWORK", raising=False)
+        ef_default = await _capture_host_config()
+        assert ef_default["ExtraHosts"] == ["host.docker.internal:host-gateway"]
+
+        # Even if SANDBOX_DOCKER_NETWORK is set in Everflow, host.docker.internal stays intact
+        monkeypatch.setenv("SANDBOX_DOCKER_NETWORK", "ef_sandbox")
+        ef_with_net = await _capture_host_config()
+        assert ef_with_net["ExtraHosts"] == ["host.docker.internal:host-gateway"]
+
+    @staticmethod
+    def _stage_init_install(tmp_path: Path, name: str = "my-core-inst") -> tuple[Path, Path]:
+        install_dir = tmp_path / name
+        script_dir = install_dir / "scripts" / "standalone"
+        script_dir.mkdir(parents=True)
+        init_copy = script_dir / "init.sh"
+        init_copy.write_text(
+            (REPO_ROOT / "scripts/standalone/init.sh").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        init_copy.chmod(0o755)
+        (install_dir / ".env.core.example").write_text(
+            (REPO_ROOT / ".env.core.example").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        return install_dir, init_copy
+
+    @staticmethod
+    def _make_fake_docker_env(tmp_path: Path, server_version: str | None) -> dict[str, str]:
+        fake_bin = tmp_path / f"fake-bin-{uuid.uuid4().hex[:8]}"
+        fake_bin.mkdir()
+        docker_shim = fake_bin / "docker"
+        if server_version is None:
+            docker_shim.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        else:
+            docker_shim.write_text(
+                "#!/usr/bin/env bash\n"
+                'if [[ "$1" == "version" ]]; then\n'
+                f'  echo "{server_version}"\n'
+                "  exit 0\n"
+                "fi\n"
+                'if [[ "$1" == "compose" && "$2" == "version" ]]; then\n'
+                '  echo "2.30.0"\n'
+                "  exit 0\n"
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+        docker_shim.chmod(0o755)
+        env = dict(os.environ)
+        env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+        env.pop("DALTON_AUTH_MODE", None)
+        return env
 
     def test_init_script_enforces_0600_permissions_on_first_run_and_rerun(
         self, tmp_path: Path
     ) -> None:
-        install_dir = tmp_path / "my-core-inst"
-        install_dir.mkdir()
+        install_dir, init_script = self._stage_init_install(tmp_path)
         env_path = install_dir / ".env"
+        env = self._make_fake_docker_env(tmp_path, "28.0.1")
         cmd = [
             "bash",
-            str(REPO_ROOT / "scripts/standalone/init.sh"),
+            str(init_script),
             "--non-interactive",
             "--domain",
             "localhost",
-            "--env-file",
-            str(env_path),
+            "--skip-sandbox-build",
         ]
 
         # Run under permissive caller umask 022 to prove init.sh enforces 0600 itself
@@ -692,9 +873,11 @@ class TestSandboxNetworkAndInitScript:
 
         res1 = subprocess.run(
             cmd,
+            env=env,
             capture_output=True,
             text=True,
             check=True,
+            timeout=30,
             preexec_fn=_set_permissive_umask,
         )
         assert "docker.sock" in res1.stdout
@@ -738,24 +921,201 @@ class TestSandboxNetworkAndInitScript:
         assert first["DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID"] == first["MINIO_ROOT_USER"]
         assert first["DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY"] == first["MINIO_ROOT_PASSWORD"]
 
-        # Re-run (rewriting DOMAIN to force write_env_key temp-file replace) under umask 022
+        # Re-run (rewriting DOMAIN to another loopback host to force write_env_key temp-file replace)
         subprocess.run(
             [
                 "bash",
-                str(REPO_ROOT / "scripts/standalone/init.sh"),
+                str(init_script),
                 "--non-interactive",
                 "--domain",
-                "dalton.example.com",
-                "--env-file",
-                str(env_path),
+                "127.0.0.1",
+                "--skip-sandbox-build",
             ],
+            env=env,
             capture_output=True,
             text=True,
             check=True,
+            timeout=30,
             preexec_fn=_set_permissive_umask,
         )
         assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
         second = _parse_env(env_path)
-        assert second["DOMAIN"] == "dalton.example.com"
+        assert second["DOMAIN"] == "127.0.0.1"
         for key in secret_keys:
             assert second[key] == first[key], f"{key} must not be overwritten on re-run"
+
+    def test_init_script_docker_server_version_domain_guard_and_removed_env_file_flag(
+        self, tmp_path: Path
+    ) -> None:
+        # 1. --env-file flag is removed
+        _, init_removed = self._stage_init_install(tmp_path, "inst-removed-flag")
+        res_flag = subprocess.run(
+            ["bash", str(init_removed), "--env-file", str(tmp_path / "custom.env")],
+            env=self._make_fake_docker_env(tmp_path, "28.0.1"),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_flag.returncode == 2
+        assert "Unknown argument" in res_flag.stderr
+
+        # 2. Public domain with oss auth is rejected with exact message
+        inst_domain, init_domain = self._stage_init_install(tmp_path, "inst-domain")
+        res_domain = subprocess.run(
+            [
+                "bash",
+                str(init_domain),
+                "--non-interactive",
+                "--domain",
+                "dalton.example.com",
+                "--skip-sandbox-build",
+            ],
+            env=self._make_fake_docker_env(tmp_path, "28.0.1"),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_domain.returncode != 0
+        assert (
+            "当前核心版是免密单机试用，请先用 localhost 安装；正式对外部署等本地登录（Batch 4b）上线后再配置域名。"
+            in res_domain.stderr
+        )
+        assert not (inst_domain / ".env").exists()
+
+        # 3. ::1 is allowed as loopback under oss auth
+        inst_v6, init_v6 = self._stage_init_install(tmp_path, "inst-v6")
+        res_v6 = subprocess.run(
+            [
+                "bash",
+                str(init_v6),
+                "--non-interactive",
+                "--domain",
+                "::1",
+                "--skip-sandbox-build",
+            ],
+            env=self._make_fake_docker_env(tmp_path, "28.0.1"),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert res_v6.returncode == 0
+        assert (inst_v6 / ".env").is_file()
+
+        # 4. Docker server < 28.0 or unreachable fails in --non-interactive
+        for ver in ("27.5.1", None):
+            _, init_old = self._stage_init_install(tmp_path, f"inst-old-{ver or 'none'}")
+            res_old = subprocess.run(
+                [
+                    "bash",
+                    str(init_old),
+                    "--non-interactive",
+                    "--domain",
+                    "localhost",
+                    "--skip-sandbox-build",
+                ],
+                env=self._make_fake_docker_env(tmp_path, ver),
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_old.returncode != 0
+
+        # 5. Interactive mode with Docker server < 28.0 rejects non-'yes' and accepts 'yes'
+        _, init_int_no = self._stage_init_install(tmp_path, "inst-int-no")
+        res_int_no = subprocess.run(
+            ["bash", str(init_int_no), "--domain", "localhost", "--skip-sandbox-build"],
+            env=self._make_fake_docker_env(tmp_path, "27.5.1"),
+            input="no\n",
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_int_no.returncode != 0
+
+        inst_int_yes, init_int_yes = self._stage_init_install(tmp_path, "inst-int-yes")
+        res_int_yes = subprocess.run(
+            ["bash", str(init_int_yes), "--domain", "localhost", "--skip-sandbox-build"],
+            env=self._make_fake_docker_env(tmp_path, "27.5.1"),
+            input="yes\n",
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert res_int_yes.returncode == 0
+        assert (inst_int_yes / ".env").is_file()
+
+    def test_configure_set_env_preserves_0600_under_permissive_umask(
+        self, tmp_path: Path
+    ) -> None:
+        env_path = tmp_path / ".env"
+        env_path.write_text("DB_PASSWORD=topsecret\nEXISTING_KEY=old\n", encoding="utf-8")
+        env_path.chmod(0o600)
+
+        configure_sh = REPO_ROOT / "scripts/configure.sh"
+        script = (
+            "set -euo pipefail\n"
+            f'ENV_FILE="{env_path}"\n'
+            f'eval "$(awk \'/^set_env\\(\\) \\{{/ {{p=1}} p {{print}} p && /^\\}}/ {{exit}}\' "{configure_sh}")"\n'
+            'set_env EXISTING_KEY "updated-value"\n'
+            'set_env NEW_SECRET_KEY "new-secret"\n'
+        )
+
+        def _set_permissive_umask() -> None:
+            os.umask(0o022)
+
+        subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=15,
+            preexec_fn=_set_permissive_umask,
+        )
+        assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+        content = env_path.read_text(encoding="utf-8")
+        assert "EXISTING_KEY=updated-value" in content
+        assert "NEW_SECRET_KEY=new-secret" in content
+
+    def test_minio_init_fails_on_bucket_policy_error_except_no_such_policy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import boto3
+        from botocore.exceptions import ClientError
+
+        spec = importlib.util.spec_from_file_location(
+            "minio_init_mod", REPO_ROOT / "scripts/standalone/minio_init.py"
+        )
+        assert spec and spec.loader
+        minio_init = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(minio_init)
+
+        monkeypatch.setenv("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL", "http://minio:9000")
+        monkeypatch.setenv("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME", "chat-uploads")
+        monkeypatch.setenv("DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID", "minio-user")
+        monkeypatch.setenv("DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY", "minio-pass")
+
+        class _S3ClientProto:
+            def head_bucket(self, *, Bucket: str) -> dict[str, Any]: ...
+            def create_bucket(self, **kwargs: Any) -> dict[str, Any]: ...
+            def delete_bucket_policy(self, *, Bucket: str) -> dict[str, Any]: ...
+
+        # 1. NoSuchBucketPolicy -> exit 0
+        s3_no_policy = create_autospec(_S3ClientProto, instance=True)
+        s3_no_policy.delete_bucket_policy.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchBucketPolicy", "Message": "none"}},
+            "DeleteBucketPolicy",
+        )
+        mock_boto_ok = create_autospec(boto3.client, return_value=s3_no_policy)
+        with patch.object(boto3, "client", mock_boto_ok):
+            assert minio_init.main() == 0
+
+        # 2. Other policy errors (AccessDenied, MethodNotAllowed, 404) -> exit non-zero
+        for err_code in ("AccessDenied", "MethodNotAllowed", "NotImplemented", "404"):
+            s3_fail = create_autospec(_S3ClientProto, instance=True)
+            s3_fail.delete_bucket_policy.side_effect = ClientError(
+                {"Error": {"Code": err_code, "Message": "failed"}},
+                "DeleteBucketPolicy",
+            )
+            mock_boto_fail = create_autospec(boto3.client, return_value=s3_fail)
+            with patch.object(boto3, "client", mock_boto_fail):
+                assert minio_init.main() == 1, f"Expected non-zero exit for {err_code}"

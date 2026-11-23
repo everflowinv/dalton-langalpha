@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tarfile
@@ -401,3 +402,119 @@ def test_package_release_exports_clean_allowlist_and_include_ci_option(
     ):
         assert (ci_out / expected_ci).exists(), f"Missing CI export file: {expected_ci}"
     assert not (ci_out / "plugins/dalton_data").exists()
+
+
+def test_package_release_rejects_existing_and_unsafe_output_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "README.md").write_text("ok\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True, timeout=15)
+    subprocess.run(
+        ["git", "config", "user.email", "ci@example.com"], cwd=str(repo), check=True, timeout=15
+    )
+    subprocess.run(["git", "config", "user.name", "CI"], cwd=str(repo), check=True, timeout=15)
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True, timeout=15)
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=str(repo), check=True, timeout=15)
+
+    # 1. Existing target directory is refused and untouched
+    existing = tmp_path / "existing-dist"
+    existing.mkdir()
+    sentinel = existing / "keep.txt"
+    sentinel.write_text("do-not-delete\n", encoding="utf-8")
+    res_exists = subprocess.run(
+        ["bash", str(PACKAGE_SCRIPT), "--repo", str(repo), "--output", str(existing)],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert res_exists.returncode != 0
+    assert "already exists" in res_exists.stderr.lower()
+    assert sentinel.read_text(encoding="utf-8") == "do-not-delete\n"
+
+    # 2. Unsafe paths: empty, '.', '/', repo root, $HOME, and their parents
+    fake_home = tmp_path / "home_parent" / "fake_home"
+    fake_home.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    for unsafe in (
+        "",
+        ".",
+        "/",
+        str(repo),
+        str(repo.parent),
+        str(fake_home),
+        str(fake_home.parent),
+    ):
+        res = subprocess.run(
+            ["bash", str(PACKAGE_SCRIPT), "--repo", str(repo), "--output", unsafe],
+            cwd=str(tmp_path),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res.returncode != 0, f"package_release.sh must reject unsafe --output={unsafe!r}"
+
+
+def test_run_checks_refuses_existing_project_containers_or_volumes(tmp_path: Path) -> None:
+    work_dir = tmp_path / "work"
+    checks_dir = tmp_path / "checks"
+    artifacts_dir = tmp_path / "artifacts"
+    fake_bin = tmp_path / "bin"
+    for d in (work_dir, checks_dir, artifacts_dir, fake_bin):
+        d.mkdir()
+
+    for name in ("docker-compose.yml", "docker-compose.core.yml", "docker-compose.ci.yml"):
+        (work_dir / name).write_text("services: {}\n", encoding="utf-8")
+    (work_dir / ".env").write_text("APP_ENV=core\n", encoding="utf-8")
+    (checks_dir / "_lib.py").write_text(
+        (CHECKS_DIR / "_lib.py").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (checks_dir / "b1_stub.py").write_text("# auth: oss\n", encoding="utf-8")
+
+    call_log = tmp_path / "docker_calls.log"
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "$@" >> "{call_log}"\n'
+        'if [[ "$1" == "ps" ]]; then\n'
+        '  echo "deadbeef1234"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [[ "$1" == "volume" ]]; then\n'
+        "  exit 0\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+
+    res = subprocess.run(
+        [
+            "bash",
+            str(REPO_ROOT / "tests/standalone/run_checks.sh"),
+            "--work-dir",
+            str(work_dir),
+            "--checks-dir",
+            str(checks_dir),
+            "--ci-compose",
+            str(work_dir / "docker-compose.ci.yml"),
+            "--artifacts-dir",
+            str(artifacts_dir),
+            "--project-name",
+            "existing-prod-stack",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert res.returncode != 0
+    assert "existing-prod-stack" in res.stderr
+    logged = call_log.read_text(encoding="utf-8")
+    assert "down" not in logged, f"run_checks.sh must never call compose down on existing project: {logged}"

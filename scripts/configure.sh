@@ -35,15 +35,29 @@ info()    { printf "  ${DIM}%s${NC}\n" "$1"; }
 
 # --- Helpers ----------------------------------------------------------------
 
+# DALTON-HOOK(standalone-core): create temp files via mktemp under umask 077 and
+# preserve existing .env permissions (e.g. 0600) across atomic replacement.
 set_env() {
     local key="$1" val="$2"
+    local orig_mode="" env_dir tmp
+    if [ -f "$ENV_FILE" ]; then
+        orig_mode="$(stat -c '%a' "$ENV_FILE" 2>/dev/null || stat -f '%Lp' "$ENV_FILE" 2>/dev/null || true)"
+    fi
+    env_dir="$(dirname "$ENV_FILE")"
+    tmp="$( (umask 077 && mktemp "${env_dir}/.env.tmp.XXXXXX") )"
     if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
         # Portable sed -i (works on macOS + Linux)
-        local tmp="${ENV_FILE}.tmp.$$"
-        sed "s|^${key}=.*|${key}=${val}|" "$ENV_FILE" > "$tmp" && mv "$tmp" "$ENV_FILE"
+        sed "s|^${key}=.*|${key}=${val}|" "$ENV_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
     else
-        echo "${key}=${val}" >> "$ENV_FILE"
+        if [ -f "$ENV_FILE" ]; then
+            cat "$ENV_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+        fi
+        printf '%s=%s\n' "$key" "$val" >> "$tmp" || { rm -f "$tmp"; return 1; }
     fi
+    if [ -n "$orig_mode" ]; then
+        chmod "$orig_mode" "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+    mv "$tmp" "$ENV_FILE"
 }
 
 # Toggle MCP server enabled flag by name
@@ -225,9 +239,13 @@ printf "${DIM}Configures .env and agent_config.yaml for your setup.${NC}\n"
 printf "${DIM}Re-run anytime — previous values will be overwritten.${NC}\n"
 
 # Create .env if needed
+# DALTON-HOOK(standalone-core): seed .env via mktemp under umask 077 so secrets
+# are never written to a world-readable file.
 if [ ! -f "$ENV_FILE" ]; then
-    cp "$ENV_EXAMPLE" "$ENV_FILE"
-    success "Created .env from .env.example"
+    _env_seed_tmp="$( (umask 077 && mktemp "$(dirname "$ENV_FILE")/.env.tmp.XXXXXX") )"
+    cat "$ENV_EXAMPLE" > "$_env_seed_tmp" || { rm -f "$_env_seed_tmp"; exit 1; }
+    mv "$_env_seed_tmp" "$ENV_FILE"
+    success "Created .env from $(basename "$ENV_EXAMPLE")"
 fi
 
 # ---------------------------------------------------------------------------

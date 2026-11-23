@@ -752,10 +752,8 @@ class DockerProvider(SandboxProvider):
         # DALTON-HOOK(standalone-core): let SANDBOX_DOCKER_NETWORK override
         # sandbox.docker.network_mode so Compose and DockerProvider share the
         # same per-instance sandbox network name (e.g. `${COMPOSE_PROJECT_NAME}_sandbox`).
-        network_mode = (
-            os.getenv("SANDBOX_DOCKER_NETWORK", "").strip()
-            or self._config.network_mode
-        )
+        sandbox_network = os.getenv("SANDBOX_DOCKER_NETWORK", "").strip()
+        network_mode = sandbox_network or self._config.network_mode
 
         # Build container config
         host_config: dict[str, Any] = {
@@ -771,7 +769,14 @@ class DockerProvider(SandboxProvider):
         # host.docker.internal resolves natively on Docker Desktop but not on
         # Linux bridge networks; pin it so the egress relay's default base URL
         # (see services/egress/reachability.py) works on both.
-        if network_mode != "none":
+        # DALTON-HOOK(standalone-core): when running in the core profile with a
+        # dedicated SANDBOX_DOCKER_NETWORK, sandboxes talk to backend over that
+        # network (http://backend:8000) and must not receive a host-gateway alias;
+        # Everflow keeps host.docker.internal to reach its host-side bridge.
+        from src.dalton.profile import is_core_profile
+
+        omit_host_gateway = bool(sandbox_network) and is_core_profile()
+        if network_mode != "none" and not omit_host_gateway:
             host_config["ExtraHosts"] = ["host.docker.internal:host-gateway"]
 
         # Publish proxy ports so preview URLs are reachable from the host.
