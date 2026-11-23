@@ -346,4 +346,58 @@ describe('PublishApprovalCard', () => {
       '部分数字标注未完成'
     );
   });
+
+  it('keeps Everflow original reviewer label with no review_mode badge, and renders review_mode labels & badges in Core', async () => {
+    await i18n.changeLanguage('zh-CN');
+    const makeState = (
+      reviewMode?: string | null,
+      showReviewMode?: boolean,
+    ): ToolApprovalState => ({
+      status: 'pending',
+      toolName: 'mcp__dalton-publish__publish_report',
+      server: 'dalton-publish',
+      tool: 'publish_report',
+      actionIndex: 0,
+      actionCount: 1,
+      args: {
+        request_id: 'req-mode-1',
+        ticker: 'ACME',
+        title: 'ACME Q3 复盘',
+        kind: 'earnings_review',
+        reviewer: {
+          model: 'gpt-6.2-astra',
+          family: 'openai-gpt',
+          verdict: 'pass',
+          ...(reviewMode !== undefined ? { review_mode: reviewMode } : {}),
+          ...(showReviewMode ? { show_review_mode: true } : {}),
+        },
+      },
+    });
+
+    // Everflow (show_review_mode unset): original "独立审稿" with no mode badge (both new and legacy).
+    const { rerender } = render(<PublishApprovalCard data={makeState('cross_family', false)} />);
+    expect(screen.getByTestId('publish-reviewer-label')).toHaveTextContent('独立审稿');
+    expect(screen.queryByTestId('publish-review-mode')).not.toBeInTheDocument();
+
+    rerender(<PublishApprovalCard data={makeState(undefined, false)} />);
+    expect(screen.getByTestId('publish-reviewer-label')).toHaveTextContent('独立审稿');
+    expect(screen.queryByTestId('publish-review-mode')).not.toBeInTheDocument();
+
+    // Core (show_review_mode: true): explicit label & badge for all 3 modes + legacy missing.
+    rerender(<PublishApprovalCard data={makeState('cross_family', true)} />);
+    expect(screen.getByTestId('publish-reviewer-label')).toHaveTextContent('独立审稿');
+    expect(screen.getByTestId('publish-review-mode')).toHaveTextContent('跨家族独立审稿');
+
+    rerender(<PublishApprovalCard data={makeState('single_family', true)} />);
+    expect(screen.getByTestId('publish-reviewer-label')).toHaveTextContent('同家族复审');
+    expect(screen.getByTestId('publish-review-mode')).toHaveTextContent('同家族复审');
+
+    rerender(<PublishApprovalCard data={makeState('unknown_family', true)} />);
+    expect(screen.getByTestId('publish-reviewer-label')).toHaveTextContent('模型复审');
+    expect(screen.getByTestId('publish-review-mode')).toHaveTextContent('未知家族复审');
+
+    rerender(<PublishApprovalCard data={makeState(undefined, true)} />);
+    expect(screen.getByTestId('publish-reviewer-label')).toHaveTextContent('审稿记录');
+    expect(screen.getByTestId('publish-review-mode')).toHaveTextContent('历史记录（未标注模式）');
+  });
 });

@@ -251,4 +251,35 @@ describe('brand configuration (VITE_BRAND_NAME & VITE_BRAND_MARK)', () => {
     expect(i18n.t('workspace.welcomeTitle')).toBe('欢迎使用 Everflow');
     expect(i18n.t('shareLink.goToLangAlpha')).toBe('前往 Everflow');
   });
+
+  // DALTON-HOOK(standalone-core): decouple Dalton UI flag (VITE_DALTON_UI) from BRAND_MARK
+  it('enables isDaltonBuild via VITE_DALTON_UI=true even under neutral brand mark, and disables via VITE_DALTON_UI=false', async () => {
+    vi.stubEnv('VITE_BRAND_NAME', '');
+    vi.stubEnv('VITE_BRAND_MARK', '');
+    vi.stubEnv('VITE_DALTON_UI', 'true');
+    vi.resetModules();
+
+    const neutralCore = await import('@/config/brand');
+    expect(neutralCore.BRAND_NAME).toBe('LangAlpha');
+    expect(neutralCore.BRAND_MARK).toBe('langalpha');
+    expect(neutralCore.isDaltonBuild).toBe(true);
+
+    vi.stubEnv('VITE_BRAND_NAME', 'Everflow');
+    vi.stubEnv('VITE_BRAND_MARK', 'everflow');
+    vi.stubEnv('VITE_DALTON_UI', 'false');
+    vi.resetModules();
+
+    const forcedOff = await import('@/config/brand');
+    expect(forcedOff.BRAND_MARK).toBe('everflow');
+    expect(forcedOff.isDaltonBuild).toBe(false);
+
+    vi.stubEnv('VITE_BRAND_NAME', 'Everflow');
+    vi.stubEnv('VITE_BRAND_MARK', 'everflow');
+    vi.stubEnv('VITE_DALTON_UI', '');
+    vi.resetModules();
+
+    const legacyEverflow = await import('@/config/brand');
+    expect(legacyEverflow.BRAND_MARK).toBe('everflow');
+    expect(legacyEverflow.isDaltonBuild).toBe(true);
+  });
 });

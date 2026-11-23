@@ -5,20 +5,40 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from src.dalton.llm.model_family import infer_family_from_model_id
-from src.dalton.llm.overlay import load_dalton_meta
+from src.dalton.llm.overlay import current_overlay_stamp, load_dalton_meta
 from src.dalton.profile import (
     DaltonStartupConfigError,
     DeploymentProfile,
     ProfileConfigError,
+    is_core_profile,
     resolve_profile,
 )
 from src.dalton.settings import get_disabled_providers
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 LATEST_NATIVE_SMOKE_PATH = REPO_ROOT / "var" / "dalton" / "smoke" / "latest_native.json"
+
+# Single-vendor first-party provider groups whose upstream model family can be
+# verified when no custom endpoint override is active. Multi-vendor gateways
+# (e.g. OpenRouter, custom OpenAI-compatible endpoints, local servers) are
+# intentionally omitted so they classify as "unknown".
+_FIRST_PARTY_PROVIDER_FAMILIES: dict[str, str] = {
+    "anthropic": "anthropic-claude",
+    "openai": "openai-gpt",
+    "gemini": "google-gemini",
+    "xai": "xai-grok",
+    "deepseek": "deepseek",
+    "z-ai": "zai-glm",
+    "dashscope": "alibaba-qwen",
+    "moonshot": "moonshot-kimi",
+    "minimax": "minimax",
+}
+
+_CAPABILITY_CACHE_KEY: tuple[str | None, str] | None = None
+_CAPABILITY_CACHE_VALUE: tuple[dict[str, dict[str, Any]], dict[str, Any], dict[str, bool]] | None = None
 
 _OAUTH_PROVIDER_TOKEN_KEYS: dict[str, str] = {
     "claude-oauth": "claude-oauth",
@@ -29,17 +49,96 @@ _OAUTH_PROVIDER_TOKEN_KEYS: dict[str, str] = {
 }
 
 
+def _file_stat_stamp(path: Path) -> str:
+    try:
+        st = os.stat(path)
+        return f"{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        return "-"
+
+
+def _load_tool_capability_snapshot() -> tuple[
+    dict[str, dict[str, Any]],
+    dict[str, Any],
+    dict[str, bool],
+]:
+    """Load and cache `(dalton_meta, latest_native_smoke, resolved_tool_calling)` by catalog version.
+
+    Avoids re-reading overlay and smoke JSON files per model key on `/api/v1/models`
+    requests (reads disk at most once per `(overlay_stamp, smoke_stat)` change).
+    """
+    global _CAPABILITY_CACHE_KEY, _CAPABILITY_CACHE_VALUE
+    cache_key = (current_overlay_stamp(), _file_stat_stamp(LATEST_NATIVE_SMOKE_PATH))
+    if _CAPABILITY_CACHE_KEY == cache_key and _CAPABILITY_CACHE_VALUE is not None:
+        return _CAPABILITY_CACHE_VALUE
+
+    meta_map = load_dalton_meta()
+    native_smoke = _load_latest_native_smoke()
+    resolved: dict[str, bool] = {}
+
+    for key, meta in meta_map.items():
+        if isinstance(meta, dict) and isinstance(meta.get("tool_calling"), bool):
+            resolved[key] = meta["tool_calling"]
+
+    for key, smoke_entry in native_smoke.items():
+        if not isinstance(smoke_entry, dict):
+            continue
+        checks = smoke_entry.get("checks") or {}
+        if not isinstance(checks, dict):
+            continue
+        n3 = checks.get("N3")
+        if n3 == "fail":
+            resolved[key] = False
+        elif n3 == "pass" and key not in resolved:
+            resolved[key] = True
+
+    _CAPABILITY_CACHE_KEY = cache_key
+    _CAPABILITY_CACHE_VALUE = (meta_map, native_smoke, resolved)
+    return _CAPABILITY_CACHE_VALUE
+
+
+def clear_tool_capability_cache() -> None:
+    """Clear the cached overlay/smoke capability snapshot (test helper)."""
+    global _CAPABILITY_CACHE_KEY, _CAPABILITY_CACHE_VALUE
+    _CAPABILITY_CACHE_KEY = None
+    _CAPABILITY_CACHE_VALUE = None
+
+
 def _merged_model_entry(model_key: str) -> dict[str, Any] | None:
     """Return the merged `ModelConfig.get_model_config(model_key)` entry if present."""
     try:
-        from src.llms.llm import ModelConfig
+        from src.llms.llm import LLM as LLMFactory
 
-        entry = ModelConfig.get_model_config(model_key)
+        entry = LLMFactory.get_model_config().get_model_config(model_key)
         if isinstance(entry, dict):
             return entry
     except Exception:
         pass
     return None
+
+
+def _normalized_url(url: str | None) -> str:
+    return (url or "").strip().rstrip("/").lower()
+
+
+def _has_custom_endpoint_override(
+    provider_name: str,
+    provider_info: dict[str, Any] | None,
+    base_urls: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(base_urls, dict) or not provider_name:
+        return False
+    override = _normalized_url(
+        base_urls.get(provider_name) if isinstance(base_urls.get(provider_name), str) else None
+    )
+    if not override:
+        return False
+    default_url = _normalized_url(
+        (provider_info or {}).get("base_url")
+        if isinstance((provider_info or {}).get("base_url"), str)
+        else None
+    )
+    return override != default_url
 
 
 def family_of(model_key: str | None) -> str:
@@ -58,7 +157,7 @@ def family_of(model_key: str | None) -> str:
         return "unknown"
 
     # 1. Explicit dalton_meta family
-    meta_map = load_dalton_meta()
+    meta_map, _, _ = _load_tool_capability_snapshot()
     if key in meta_map and isinstance(meta_map[key], dict):
         fam = meta_map[key].get("family")
         if fam and str(fam) != "unknown":
@@ -75,6 +174,143 @@ def family_of(model_key: str | None) -> str:
 
     # 3. Key itself
     return infer_family_from_model_id(key)
+
+
+def _find_custom_model_entry(
+    model_pref: dict[str, Any] | None,
+    model_key: str,
+) -> dict[str, Any] | None:
+    """Return the user-defined ``custom_models`` entry matching ``model_key``, or ``None``."""
+    if not isinstance(model_pref, dict):
+        return None
+    custom_list = model_pref.get("custom_models")
+    if not isinstance(custom_list, list):
+        return None
+    for entry in custom_list:
+        if isinstance(entry, dict) and str(entry.get("name") or "").strip() == model_key:
+            return entry
+    return None
+
+
+def family_of_for_config(
+    model_key: str | None,
+    *,
+    model_pref: dict[str, Any] | None = None,
+    base_urls: dict[str, Any] | None = None,
+) -> str:
+    """Resolve model family from actual inference configuration rather than alias names.
+
+    - For user ``custom_models`` entries, inspects the actual provider and ``model_id``:
+      custom providers / OpenAI-compatible gateways, custom ``base_url`` overrides, and
+      multi-vendor aggregators cannot be independently verified and always classify as
+      ``'unknown'`` (preventing alias-name spoofing).
+    - For built-in catalog models, an active custom ``base_url`` override on the model's
+      provider also classifies as ``'unknown'``; otherwise delegates to :func:`family_of`.
+    """
+    if not model_key or not str(model_key).strip():
+        return "unknown"
+    key = str(model_key).strip()
+
+    from src.llms.llm import LLM as LLMFactory
+    from src.server.services.llm import user_models
+
+    mc = LLMFactory.get_model_config()
+
+    cm = _find_custom_model_entry(model_pref, key)
+    if isinstance(cm, dict):
+        provider_name = str(cm.get("provider") or "").strip()
+        model_id = str(cm.get("model_id") or "").strip()
+        if not provider_name:
+            return "unknown"
+        # User-defined custom provider / gateway endpoint: upstream vendor cannot be verified.
+        if user_models.custom_provider(model_pref, provider_name) is not None:
+            return "unknown"
+        prov_info = mc.get_provider_info(provider_name) or {}
+        if not prov_info:
+            return "unknown"
+        if _has_custom_endpoint_override(provider_name, prov_info, base_urls):
+            return "unknown"
+        parent_group = str(prov_info.get("parent_provider") or provider_name).strip().lower()
+        expected_family = _FIRST_PARTY_PROVIDER_FAMILIES.get(parent_group)
+        if not expected_family:
+            return "unknown"
+        inferred = infer_family_from_model_id(model_id)
+        return expected_family if inferred == expected_family else "unknown"
+
+    mcfg = mc.get_model_config(key)
+    if isinstance(mcfg, dict):
+        provider_name = str(mcfg.get("provider") or "").strip()
+        prov_info = mc.get_provider_info(provider_name) or {}
+        if _has_custom_endpoint_override(provider_name, prov_info, base_urls):
+            return "unknown"
+        return family_of(key)
+
+    return family_of(key)
+
+
+async def _load_execution_inference_state(
+    user_id: str | None,
+) -> tuple[str, dict[str, Any] | None, dict[str, str], dict[str, str]]:
+    """Load `(exec_user_id, model_pref, api_keys_map, base_urls_map)` for the calling/credential user."""
+    from src.dalton.credentials import credential_user_id
+    from src.dalton.llm.model_prefs import _read_user_model_preference_map
+
+    uid = (user_id or "").strip()
+    exec_uid = credential_user_id(uid) if uid else ""
+    if not exec_uid:
+        return "", None, {}, {}
+
+    mp_raw = await _read_user_model_preference_map(exec_uid)
+    model_pref = dict(mp_raw) if isinstance(mp_raw, dict) else None
+
+    keys_map: dict[str, str] = {}
+    base_urls: dict[str, str] = {}
+    try:
+        from src.server.database.api_keys import get_user_api_keys
+
+        rows = await get_user_api_keys(exec_uid)
+        if isinstance(rows, dict):
+            raw_keys = rows.get("keys")
+            if isinstance(raw_keys, dict):
+                keys_map = {str(p): str(v) for p, v in raw_keys.items() if v}
+            else:
+                keys_map = {
+                    str(k): str(v)
+                    for k, v in rows.items()
+                    if k not in ("byok_enabled", "keys", "base_urls") and v
+                }
+            raw_urls = rows.get("base_urls")
+            if isinstance(raw_urls, dict):
+                base_urls = {str(p): str(v) for p, v in raw_urls.items() if isinstance(v, str) and v.strip()}
+    except Exception:
+        pass
+
+    return exec_uid, model_pref, keys_map, base_urls
+
+
+async def resolve_model_family(
+    model_key: str | None,
+    *,
+    user_id: str | None = None,
+    model_pref: dict[str, Any] | None = None,
+    base_urls: dict[str, Any] | None = None,
+) -> str:
+    """Async config-aware model family resolver (Standalone Core only).
+
+    In Everflow profile, restores the original name-based :func:`family_of`
+    behavior without consulting user/holder inference preferences.
+    """
+    if not model_key or not str(model_key).strip():
+        return "unknown"
+    if not is_core_profile():
+        return family_of(model_key)
+    eff_pref = model_pref
+    eff_urls = base_urls
+    if eff_pref is None and user_id:
+        _, eff_pref, _, loaded_urls = await _load_execution_inference_state(user_id)
+        if eff_urls is None:
+            eff_urls = loaded_urls
+    return family_of_for_config(model_key, model_pref=eff_pref, base_urls=eff_urls)
 
 
 def _load_latest_native_smoke() -> dict[str, Any]:
@@ -95,20 +331,8 @@ def is_text_only(model_key: str | None) -> bool:
     if not key:
         return False
 
-    meta_map = load_dalton_meta()
-    if key in meta_map and isinstance(meta_map[key], dict):
-        if "tool_calling" in meta_map[key] and not bool(meta_map[key]["tool_calling"]):
-            return True
-
-    # Check latest_native.json smoke results (N3 == "fail" -> text-only)
-    native_smoke = _load_latest_native_smoke()
-    smoke_entry = native_smoke.get(key)
-    if isinstance(smoke_entry, dict):
-        checks = smoke_entry.get("checks") or {}
-        if isinstance(checks, dict) and checks.get("N3") == "fail":
-            return True
-
-    return False
+    _, _, resolved_cap = _load_tool_capability_snapshot()
+    return resolved_cap.get(key) is False
 
 
 def is_forbidden_for_roles(model_key: str | None) -> bool:
@@ -116,13 +340,429 @@ def is_forbidden_for_roles(model_key: str | None) -> bool:
     if not model_key:
         return False
     key = str(model_key).strip()
-    meta_map = load_dalton_meta()
+    meta_map, _, _ = _load_tool_capability_snapshot()
     meta = meta_map.get(key)
     if isinstance(meta, dict) and bool(meta.get("forbidden_for_roles")):
         return True
     if "contributor" in key.lower():
         return True
     return False
+
+
+def annotate_model_metadata_tool_calling(
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach evidence-backed ``tool_calling`` booleans to ``/api/v1/models`` metadata.
+
+    Reads the cached overlay/smoke capability snapshot at most once per catalog
+    version (zero per-model disk reads). Models with explicit evidence in the
+    manifest, ``dalton_meta``, or smoke checks receive ``tool_calling: True/False``
+    (smoke ``N3 == "fail"`` always overrides to ``False``). Models with no
+    recorded evidence omit ``tool_calling`` so callers treat them as unverified
+    rather than assuming support.
+    """
+    if not isinstance(metadata, dict):
+        return metadata
+    _, native_smoke, resolved_cap = _load_tool_capability_snapshot()
+    out: dict[str, Any] = {}
+    changed = False
+    for model_key, entry in metadata.items():
+        if not isinstance(entry, dict):
+            out[model_key] = entry
+            continue
+        smoke_entry = native_smoke.get(model_key)
+        smoke_checks = smoke_entry.get("checks") if isinstance(smoke_entry, dict) else None
+        smoke_failed = isinstance(smoke_checks, dict) and smoke_checks.get("N3") == "fail"
+
+        if smoke_failed:
+            if entry.get("tool_calling") is not False:
+                updated = dict(entry)
+                updated["tool_calling"] = False
+                out[model_key] = updated
+                changed = True
+            else:
+                out[model_key] = entry
+            continue
+
+        if isinstance(entry.get("tool_calling"), bool):
+            out[model_key] = entry
+            continue
+
+        cap = resolved_cap.get(model_key)
+        if isinstance(cap, bool):
+            updated = dict(entry)
+            updated["tool_calling"] = cap
+            out[model_key] = updated
+            changed = True
+        else:
+            out[model_key] = entry
+    return out if changed else metadata
+
+
+_ROLE_PREF_SPEC: dict[str, tuple[str, Literal["primary", "background"]]] = {
+    "assist": ("dalton_assist_model", "background"),
+    "extract": ("dalton_extract_model", "background"),
+    "conversation_extract": ("dalton_extract_model", "background"),
+    "audit": ("dalton_audit_model", "primary"),
+    "language": ("dalton_language_model", "primary"),
+    "reviewer": ("dalton_reviewer_models", "primary"),
+}
+
+
+def _validate_role_candidate(role: str, candidate: str) -> str:
+    cand = candidate.strip()
+    if is_forbidden_for_roles(cand):
+        raise RolePolicyError(
+            f"角色 {role} 配置了禁用变体 {cand}（contributor 变体可能用于训练，L21 严禁用于任何基金研究角色）。"
+        )
+    return cand
+
+
+def _extract_candidate_strings(raw: Any) -> list[str]:
+    if isinstance(raw, str) and raw.strip():
+        return [raw.strip()]
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if isinstance(item, str) and item.strip()]
+    return []
+
+
+def _custom_model_is_usable(
+    cm: dict[str, Any],
+    *,
+    model_pref: dict[str, Any] | None,
+    keys_map: dict[str, str],
+    base_urls: dict[str, str],
+    disabled_providers: set[str],
+) -> bool:
+    """Return True when a user ``custom_models`` entry can actually run under the execution account."""
+    from src.llms.llm import LLM as LLMFactory
+    from src.server.services.llm import user_models
+
+    name = str(cm.get("name") or "").strip()
+    provider_name = str(cm.get("provider") or "").strip()
+    if not name or not provider_name or is_forbidden_for_roles(name):
+        return False
+    if provider_name in disabled_providers:
+        return False
+
+    mc = LLMFactory.get_model_config()
+    custom_prov = user_models.custom_provider(model_pref, provider_name)
+    if custom_prov is not None:
+        parent = str(custom_prov.get("parent_provider") or "").strip()
+        if parent in disabled_providers:
+            return False
+        parent_info = mc.get_provider_info(parent) or {}
+        if not parent_info:
+            return False
+        # Custom provider works if an API key or custom base_url is configured (keyless local gateways allowed).
+        return bool(keys_map.get(provider_name) or base_urls.get(provider_name))
+
+    prov_info = mc.get_provider_info(provider_name) or {}
+    if not prov_info:
+        return False
+    parent = str(prov_info.get("parent_provider") or "").strip()
+    if parent and parent in disabled_providers:
+        return False
+    access_type = str(prov_info.get("access_type") or "")
+    if access_type == "local":
+        return bool(base_urls.get(provider_name) or prov_info.get("base_url"))
+    env_key = str(prov_info.get("env_key") or "")
+    if not env_key:
+        return True
+    has_env = bool(os.environ.get(env_key, "").strip())
+    has_byok = bool(keys_map.get(provider_name) or (parent and keys_map.get(parent)))
+    return has_env or has_byok
+
+
+async def usable_custom_models_for_user(
+    user_id: str | None,
+    *,
+    excluded: set[str] | None = None,
+) -> list[str]:
+    """Return usable ``custom_models`` names under ``user_id``'s execution/credential account."""
+    exec_uid, exec_mp, keys_map, base_urls = await _load_execution_inference_state(user_id)
+    if not exec_uid or not isinstance(exec_mp, dict):
+        return []
+    custom_list = exec_mp.get("custom_models")
+    if not isinstance(custom_list, list):
+        return []
+    disabled = get_disabled_providers()
+    out: list[str] = []
+    seen: set[str] = set()
+    for cm in custom_list:
+        if not isinstance(cm, dict):
+            continue
+        name = str(cm.get("name") or "").strip()
+        if not name or name in seen or (excluded and name in excluded):
+            continue
+        if _custom_model_is_usable(
+            cm,
+            model_pref=exec_mp,
+            keys_map=keys_map,
+            base_urls=base_urls,
+            disabled_providers=disabled,
+        ):
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+async def _pick_first_usable_core_candidate(
+    role: str,
+    candidates: list[str],
+    *,
+    exec_uid: str,
+    exec_mp: dict[str, Any] | None,
+    keys_map: dict[str, str],
+    base_urls: dict[str, str],
+    excluded: set[str] | None = None,
+) -> str:
+    """Walk ``candidates`` in order, skipping forbidden/stale/unavailable entries.
+
+    Reuses normal inference resolution (``model_resolves`` + ``explain_model_availability`` /
+    custom provider credential check) under ``exec_uid``. Raises :class:`RolePolicyError`
+    only when at least one candidate was forbidden and NO usable candidate remained.
+    """
+    from src.server.services.llm.availability import model_resolves
+
+    disabled = get_disabled_providers()
+    avail_map: dict[str, dict[str, Any]] | None = None
+    saw_forbidden: str | None = None
+    seen: set[str] = set()
+
+    for raw in candidates:
+        cand = str(raw or "").strip()
+        if not cand or cand in seen or (excluded and cand in excluded):
+            continue
+        seen.add(cand)
+
+        if is_forbidden_for_roles(cand):
+            if saw_forbidden is None:
+                saw_forbidden = cand
+            continue
+
+        # Check normal inference resolution under the execution account.
+        if not model_resolves(exec_mp or {}, cand):
+            continue
+
+        # Custom model under the execution account takes precedence over catalog.
+        cm = _find_custom_model_entry(exec_mp, cand)
+        if isinstance(cm, dict):
+            if _custom_model_is_usable(
+                cm,
+                model_pref=exec_mp,
+                keys_map=keys_map,
+                base_urls=base_urls,
+                disabled_providers=disabled,
+            ):
+                return cand
+            continue
+
+        # System catalog model: verify provider/credential availability under exec_uid.
+        if exec_uid:
+            if avail_map is None:
+                try:
+                    avail_map = await explain_model_availability(user_id=exec_uid)
+                except Exception:
+                    avail_map = {}
+            info = avail_map.get(cand)
+            if isinstance(info, dict) and info.get("available"):
+                return cand
+            continue
+
+        # No execution user_id (deployment-only path): verify catalog entry not disabled/hidden.
+        mcfg = _merged_model_entry(cand)
+        if isinstance(mcfg, dict):
+            if mcfg.get("visible") is False:
+                continue
+            prov = str(mcfg.get("provider") or "")
+            if prov and prov in disabled:
+                continue
+            return cand
+
+    if saw_forbidden is not None:
+        raise RolePolicyError(
+            f"角色 {role} 配置了禁用变体 {saw_forbidden}（contributor 变体可能用于训练，L21 严禁用于任何基金研究角色），且无其他可用候选模型。"
+        )
+    return ""
+
+
+async def resolve_customer_configured_model(
+    user_id: str | None = None,
+    *,
+    prefer_slot: Literal["primary", "background"] = "primary",
+    deployment_only: bool = False,
+    excluded: set[str] | None = None,
+) -> str:
+    """Resolve the customer's configured primary, background, or custom model (Core profile).
+
+    Never falls back to upstream ``agent_config`` defaults: when customer preferences
+    are empty or ``deployment_only=True``, returns ``""``.
+    """
+    if deployment_only:
+        return ""
+
+    from src.dalton.llm.model_prefs import _read_user_model_preference_map
+
+    uid = (user_id or "").strip()
+    exec_uid, exec_mp, keys_map, base_urls = await _load_execution_inference_state(uid)
+    caller_mp: dict[str, Any] | None = None
+    if uid and uid != exec_uid:
+        raw_caller = await _read_user_model_preference_map(uid)
+        caller_mp = dict(raw_caller) if isinstance(raw_caller, dict) else None
+    elif uid == exec_uid:
+        caller_mp = exec_mp
+
+    slot_keys = (
+        ("preferred_background_model", "preferred_model")
+        if prefer_slot == "background"
+        else ("preferred_model", "preferred_background_model")
+    )
+    candidates: list[str] = []
+    for mp in (caller_mp, exec_mp):
+        if not isinstance(mp, dict):
+            continue
+        for sk in slot_keys:
+            candidates.extend(_extract_candidate_strings(mp.get(sk)))
+
+    # Custom models defined under the execution account (resolved where dalton_complete runs).
+    if isinstance(exec_mp, dict):
+        custom_list = exec_mp.get("custom_models")
+        if isinstance(custom_list, list):
+            for entry in custom_list:
+                if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                    candidates.append(entry["name"].strip())
+
+    if not candidates:
+        return ""
+
+    return await _pick_first_usable_core_candidate(
+        prefer_slot,
+        candidates,
+        exec_uid=exec_uid,
+        exec_mp=exec_mp,
+        keys_map=keys_map,
+        base_urls=base_urls,
+        excluded=excluded,
+    )
+
+
+async def resolve_effective_role_model(
+    role: str = "assist",
+    explicit_model: str | None = None,
+    *,
+    user_id: str | None = None,
+    deployment_only: bool = False,
+    excluded: set[str] | None = None,
+) -> str:
+    """Unified effective model resolution for assist, audit, language, extract, and reviewer roles.
+
+    - **Everflow profile**: preserves existing ``explicit -> dalton_model_default/dalton_model_pref``
+      precedence and returns ``""`` when unconfigured.
+    - **Standalone Core profile** (``is_core_profile()``):
+      - When ``deployment_only=True``, reads ONLY deployment config (``dalton.core.yaml``),
+        skipping forbidden contributor candidates, and returns ``""`` when empty (never falls
+        back to upstream ``agent_config`` defaults).
+      - Otherwise walks ``role config -> user default (primary/background + custom models) ->
+        deployment default`` sequentially, verifying each candidate via normal inference
+        availability under the execution/credential account, skipping stale/unavailable or
+        forbidden contributor candidates, and returning ``""`` when nothing is configured.
+    """
+    if explicit_model and explicit_model.strip():
+        return _validate_role_candidate(role, explicit_model)
+
+    from src.dalton.llm.model_prefs import (
+        _read_user_model_preference_map,
+        dalton_model_default,
+        dalton_model_pref,
+    )
+
+    pref_key, prefer_slot = _ROLE_PREF_SPEC.get(
+        role, ("dalton_assist_model", "background")
+    )
+
+    if not is_core_profile():
+        val = (
+            dalton_model_default(pref_key)
+            if deployment_only
+            else await dalton_model_pref(user_id, pref_key)
+        )
+        items = _extract_candidate_strings(val)
+        if items:
+            return _validate_role_candidate(role, items[0])
+        return ""
+
+    # Standalone Core profile: deployment-only callers read ONLY dalton.core.yaml
+    # (never user prefs, never upstream agent_config Claude defaults).
+    if deployment_only:
+        deploy_candidates = _extract_candidate_strings(dalton_model_default(pref_key))
+        if role == "language":
+            deploy_candidates.extend(
+                _extract_candidate_strings(dalton_model_default("dalton_audit_model"))
+            )
+        if not deploy_candidates:
+            return ""
+        return await _pick_first_usable_core_candidate(
+            role,
+            deploy_candidates,
+            exec_uid="",
+            exec_mp=None,
+            keys_map={},
+            base_urls={},
+            excluded=excluded,
+        )
+
+    uid = (user_id or "").strip()
+    exec_uid, exec_mp, keys_map, base_urls = await _load_execution_inference_state(uid)
+    caller_mp: dict[str, Any] | None = None
+    if uid and uid != exec_uid:
+        raw_caller = await _read_user_model_preference_map(uid)
+        caller_mp = dict(raw_caller) if isinstance(raw_caller, dict) else None
+    elif uid == exec_uid:
+        caller_mp = exec_mp
+
+    candidates: list[str] = []
+
+    # 1. Role config: caller pref -> execution/holder pref -> deployment dalton.core.yaml
+    role_keys = (pref_key, "dalton_audit_model") if role == "language" else (pref_key,)
+    for rk in role_keys:
+        if isinstance(caller_mp, dict):
+            candidates.extend(_extract_candidate_strings(caller_mp.get(rk)))
+        if isinstance(exec_mp, dict) and exec_mp is not caller_mp:
+            candidates.extend(_extract_candidate_strings(exec_mp.get(rk)))
+        candidates.extend(_extract_candidate_strings(dalton_model_default(rk)))
+
+    # 2. User default: preferred slot -> other slot -> custom models under execution account
+    slot_keys = (
+        ("preferred_background_model", "preferred_model")
+        if prefer_slot == "background"
+        else ("preferred_model", "preferred_background_model")
+    )
+    for mp in (caller_mp, exec_mp):
+        if not isinstance(mp, dict):
+            continue
+        for sk in slot_keys:
+            candidates.extend(_extract_candidate_strings(mp.get(sk)))
+
+    if isinstance(exec_mp, dict):
+        custom_list = exec_mp.get("custom_models")
+        if isinstance(custom_list, list):
+            for entry in custom_list:
+                if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                    candidates.append(entry["name"].strip())
+
+    if not candidates:
+        return ""
+
+    return await _pick_first_usable_core_candidate(
+        role,
+        candidates,
+        exec_uid=exec_uid,
+        exec_mp=exec_mp,
+        keys_map=keys_map,
+        base_urls=base_urls,
+        excluded=excluded,
+    )
 
 
 async def explain_model_availability(
@@ -594,7 +1234,9 @@ def check_roles(
                 }
             )
 
-    if lead_model:
+    core_mode = is_core_profile()
+
+    if lead_model and not core_mode:
         chosen_reviewer = _select_independent_reviewer_from_candidates(
             lead_model,
             eff_reviewer_models,
@@ -613,10 +1255,11 @@ def check_roles(
             )
 
     # Number audit chain (publish.audit_model + audit_fallback_models): same
-    # contributor ban as every role, and it must be configured at all.
+    # contributor ban as every role, and it must be configured at all in Everflow
+    # (in Core profile, an unset audit_model follows the customer's configured model).
     pub_cfg = get_dalton_settings().publish
     audit_chain = [m for m in [pub_cfg.audit_model, *pub_cfg.audit_fallback_models] if m and m.strip()]
-    if not (pub_cfg.audit_model or "").strip():
+    if not (pub_cfg.audit_model or "").strip() and not core_mode:
         warnings.append(
             {
                 "code": "audit_model_missing",
@@ -648,25 +1291,26 @@ def check_roles(
                 }
             )
 
-    for fb_m in assist_fb_models:
-        fb_fam = family_of(fb_m)
-        if fb_fam == "unknown":
-            continue
-        for rev_cand in eff_reviewer_models:
-            if family_of(rev_cand) == fb_fam:
-                warnings.append(
-                    {
-                        "code": "assist_fallback_same_family",
-                        "role": "assist_fallback",
-                        "model": fb_m,
-                        "message": (
-                            f"assist 备选模型 {fb_m} 与审稿候选模型 {rev_cand} "
-                            f"同属家族 {fb_fam}（违反 L20 跨家族独立原则）。"
-                        ),
-                        "link": "/settings?tab=model",
-                    }
-                )
-                break
+    if not core_mode:
+        for fb_m in assist_fb_models:
+            fb_fam = family_of(fb_m)
+            if fb_fam == "unknown":
+                continue
+            for rev_cand in eff_reviewer_models:
+                if family_of(rev_cand) == fb_fam:
+                    warnings.append(
+                        {
+                            "code": "assist_fallback_same_family",
+                            "role": "assist_fallback",
+                            "model": fb_m,
+                            "message": (
+                                f"assist 备选模型 {fb_m} 与审稿候选模型 {rev_cand} "
+                                f"同属家族 {fb_fam}（违反 L20 跨家族独立原则）。"
+                            ),
+                            "link": "/settings?tab=model",
+                        }
+                    )
+                    break
 
     return warnings
 

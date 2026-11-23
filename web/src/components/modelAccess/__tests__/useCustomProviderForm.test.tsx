@@ -18,6 +18,8 @@ const h = vi.hoisted(() => ({
   updateApiKeys: vi.fn(async (_payload: unknown): Promise<unknown> => {
     throw new Error('refused');
   }),
+  probeHint: null as string | null,
+  reads: [] as unknown[],
 }));
 
 // Stored by the time the key is refused: this save's provider, and another
@@ -35,13 +37,15 @@ const stored = {
   ],
 };
 
+vi.mock('@/config/daltonSetup', () => ({
+  probeDaltonCustomProviderModels: vi.fn(async () => h.probeHint),
+}));
 vi.mock('@/hooks/usePreferences', () => ({
   usePreferences: () => ({ preferences: { model_preference: before } }),
 }));
 // The save reads before writing, then again before taking its provider back.
-const reads = [{ model_preference: before }, { model_preference: stored }];
 vi.mock('@/hooks/useStoredPreferences', () => ({
-  useReadStoredPreferences: () => async () => reads.shift(),
+  useReadStoredPreferences: () => async () => h.reads.shift(),
 }));
 vi.mock('@/hooks/useUpdatePreferences', () => ({ useUpdatePreferences: () => ({ mutateAsync: h.updatePreferences }) }));
 vi.mock('@/hooks/useApiKeys', () => ({ useUpdateApiKeys: () => ({ mutateAsync: h.updateApiKeys }) }));
@@ -60,6 +64,11 @@ import { useCustomProviderForm } from '../useCustomProviderForm';
 
 describe('useCustomProviderForm', () => {
   it('takes the provider back out when its key is refused', async () => {
+    h.updatePreferences.mockClear();
+    h.updateApiKeys.mockImplementation(async () => { throw new Error('refused'); });
+    h.probeHint = null;
+    h.reads = [{ model_preference: before }, { model_preference: stored }];
+
     const { result } = renderHookWithProviders(() => useCustomProviderForm());
     act(() => {
       result.current.setName('My Gateway');
@@ -75,5 +84,31 @@ describe('useCustomProviderForm', () => {
       custom_providers: [before.custom_providers[0], stored.custom_providers[2]],
       custom_models: [before.custom_models[0], stored.custom_models[2]],
     } });
+  });
+
+  // DALTON-HOOK(standalone-core): surface Core format hint on custom provider save without silently advancing
+  it('surfaces probeHint and stays on form when Core probe returns a Responses format mismatch hint', async () => {
+    const hint = '网关只支持 Responses 接口，请在提供商设置里打开 Responses 格式';
+    h.updatePreferences.mockClear();
+    h.updateApiKeys.mockImplementation(async () => ({}));
+    h.probeHint = hint;
+    h.reads = [{ model_preference: before }];
+
+    const { result } = renderHookWithProviders(() => useCustomProviderForm());
+    act(() => {
+      result.current.setName('Resp Gateway');
+      result.current.setBaseUrl('https://resp.example/v1');
+      result.current.setApiKey('sk-resp');
+    });
+    let saved: string | null = 'unset';
+    await act(async () => { saved = await result.current.save(); });
+
+    expect(saved).toBeNull();
+    expect(result.current.saving).toBe(false);
+    expect(result.current.probeHint).toBe(hint);
+
+    // Switching API format clears the stale format hint.
+    act(() => { result.current.setApiFormat('openai-responses'); });
+    expect(result.current.probeHint).toBeNull();
   });
 });

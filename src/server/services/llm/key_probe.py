@@ -112,9 +112,17 @@ def _base(info: dict, base_url: str | None, default: str) -> str:
 
 
 async def _test_anthropic_key(
-    api_key: str, model: str, info: dict, base_url: str | None, timeout: float, transport=None
+    api_key: str,
+    model: str,
+    info: dict,
+    base_url: str | None,
+    timeout: float,
+    transport=None,
+    *,
+    # DALTON-HOOK(standalone-core): optional Core override for unsupported /models status codes
+    absent_list_statuses: tuple[int, ...] | None = None,
 ) -> dict:
-    listed = await _listed(info, api_key, base_url, timeout, transport, absent=(404, 405, 422))
+    listed = await _listed(info, api_key, base_url, timeout, transport, absent=absent_list_statuses or (404, 405, 422))
     if listed is not None:
         return listed
     from src.llms.endpoints import anthropic_sdk_base_url
@@ -129,24 +137,63 @@ async def _test_anthropic_key(
 
 
 async def _test_openai_key(
-    api_key: str, model: str, info: dict, base_url: str | None, timeout: float, transport=None
+    api_key: str,
+    model: str,
+    info: dict,
+    base_url: str | None,
+    timeout: float,
+    transport=None,
+    *,
+    # DALTON-HOOK(standalone-core): optional Core overrides for unsupported /models and Responses-only gateways
+    absent_list_statuses: tuple[int, ...] | None = None,
+    use_response_api: bool | None = None,
 ) -> dict:
-    listed = await _listed(info, api_key, base_url, timeout, transport)
+    listed = await _listed(info, api_key, base_url, timeout, transport, absent=absent_list_statuses or (404, 405))
     if listed is not None:
         return listed
     base = _base(info, base_url, "https://api.openai.com/v1")
+    headers = {"Authorization": f"Bearer {api_key}", "content-type": "application/json"}
+    if use_response_api is True:
+        resp = await _send(
+            "POST", f"{base}/responses", timeout, transport,
+            json={"model": model, "input": "hi", "max_output_tokens": 16},
+            headers=headers,
+        )
+        return {**_inferred(resp, model), "used_response_api": True}
     resp = await _send(
         "POST", f"{base}/chat/completions", timeout, transport,
         json={"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]},
-        headers={"Authorization": f"Bearer {api_key}", "content-type": "application/json"},
+        headers=headers,
     )
+    if use_response_api is False and resp.status_code in (404, 405, 501):
+        resp = await _send(
+            "POST", f"{base}/responses", timeout, transport,
+            json={"model": model, "input": "hi", "max_output_tokens": 16},
+            headers=headers,
+        )
+        inferred = _inferred(resp, model)
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and (isinstance(body.get("output"), list) or body.get("object") == "response"):
+            return {**inferred, "used_response_api": True}
+        return inferred
     return _inferred(resp, model)
 
 
 async def _test_gemini_key(
-    api_key: str, model: str, info: dict, base_url: str | None, timeout: float, transport=None
+    api_key: str,
+    model: str,
+    info: dict,
+    base_url: str | None,
+    timeout: float,
+    transport=None,
+    *,
+    # DALTON-HOOK(standalone-core): optional Core override for unsupported /models status codes
+    absent_list_statuses: tuple[int, ...] | None = None,
 ) -> dict:
-    listed = await _listed(info, api_key, base_url, timeout, transport)
+    listed = await _listed(info, api_key, base_url, timeout, transport, absent=absent_list_statuses or (404, 405))
     if listed is not None:
         return listed
     base = _base(info, base_url, "https://generativelanguage.googleapis.com")
@@ -188,7 +235,16 @@ def openrouter_key_credits(payload: dict) -> dict:
 
 
 async def _test_openrouter_key(
-    api_key: str, model: str, info: dict, base_url: str | None, timeout: float, transport=None
+    api_key: str,
+    model: str,
+    info: dict,
+    base_url: str | None,
+    timeout: float,
+    transport=None,
+    *,
+    # DALTON-HOOK(standalone-core): forward optional Core overrides for custom hosts using OpenRouter as parent
+    absent_list_statuses: tuple[int, ...] | None = None,
+    use_response_api: bool | None = None,
 ) -> dict:
     """Test an OpenRouter key against ``GET /key``.
 
@@ -203,7 +259,16 @@ async def _test_openrouter_key(
     host = (httpx.URL(base).host or "").lower()
     if host != _OPENROUTER_HOST and not host.endswith(f".{_OPENROUTER_HOST}"):
         openai_info = {**info, "sdk": "openai", "parent_provider": None}
-        return await _test_openai_key(api_key, model, openai_info, base_url, timeout, transport=transport)
+        return await _test_openai_key(
+            api_key,
+            model,
+            openai_info,
+            base_url,
+            timeout,
+            transport=transport,
+            absent_list_statuses=absent_list_statuses,
+            use_response_api=use_response_api,
+        )
     resp = await _send("GET", f"{base}/key", timeout, transport, headers={"Authorization": f"Bearer {api_key}"})
     resp.raise_for_status()
     return {"models_found": None, "model": "", "credits": openrouter_key_credits(resp.json())}
@@ -219,7 +284,16 @@ _SDK_TEST_DISPATCH: dict[str, tuple] = {
 
 
 async def check_key(
-    provider: str, info: dict, api_key: str, base_url: str | None, *, transport: Any = None
+    provider: str,
+    info: dict,
+    api_key: str,
+    base_url: str | None,
+    *,
+    transport: Any = None,
+    # DALTON-HOOK(standalone-core): allow Core key test to supply selected model, unsupported /models statuses, and Responses API mode
+    probe_model: str | None = None,
+    absent_list_statuses: tuple[int, ...] | None = None,
+    use_response_api: bool | None = None,
 ) -> dict:
     """``POST /keys/test``'s answer for a key to ``provider``, described by ``info``.
 
@@ -241,6 +315,9 @@ async def check_key(
     listed = manifest_models.get(provider) or manifest_models.get(mc.models_from(provider)) or []
     if listed:
         model = listed[0].get("id", model)
+    # DALTON-HOOK(standalone-core): honor caller-selected model when testing a gateway without /models
+    if probe_model and probe_model.strip():
+        model = probe_model.strip()
 
     start = time.monotonic()
 
@@ -253,11 +330,20 @@ async def check_key(
     def refused(message: str, status: int) -> dict:
         return failed(sanitize_error(message) if message else f"HTTP {status}")
 
+    # DALTON-HOOK(standalone-core): forward Core-only kwargs without altering Everflow/upstream dispatch signature
+    test_kwargs: dict[str, Any] = {"transport": transport}
+    if absent_list_statuses is not None and test_fn in (
+        _test_openai_key, _test_anthropic_key, _test_gemini_key, _test_openrouter_key
+    ):
+        test_kwargs["absent_list_statuses"] = absent_list_statuses
+    if use_response_api is not None and test_fn in (_test_openai_key, _test_openrouter_key):
+        test_kwargs["use_response_api"] = use_response_api
+
     try:
         # One deadline for the whole test: a list that answers 404 is followed
         # by a second request, and each read is only bounded per operation.
         result = await asyncio.wait_for(
-            test_fn(api_key, model, info, base_url, TEST_TIMEOUT_S, transport=transport),
+            test_fn(api_key, model, info, base_url, TEST_TIMEOUT_S, **test_kwargs),
             TEST_TIMEOUT_S,
         )
     except (httpx.TimeoutException, TimeoutError) as e:
@@ -285,4 +371,7 @@ async def check_key(
     }
     if result.get("credits") is not None:
         response["credits"] = result["credits"]
+    # DALTON-HOOK(standalone-core): propagate Responses API fallback signal to Core tool probe
+    if result.get("used_response_api"):
+        response["used_response_api"] = True
     return response
