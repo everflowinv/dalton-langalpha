@@ -242,14 +242,15 @@ def _direct_backend_http(
     """Call backend on container loopback reading ``INTERNAL_SERVICE_TOKEN`` from container env."""
     body_json = json.dumps(json_body, ensure_ascii=False) if json_body is not None else ""
     script = (
-        "import json, os, urllib.error, urllib.request; "
-        f"body = {body_json!r}.encode('utf-8') if {bool(body_json)!r} else None; "
+        "import json, os, urllib.error, urllib.request\n"
+        f"body = {body_json!r}.encode('utf-8') if {bool(body_json)!r} else None\n"
         "headers = {"
         "'X-Service-Token': os.environ['INTERNAL_SERVICE_TOKEN'], "
         f"'X-User-Id': {user_id!r}"
-        "}; "
-        "if body is not None: headers['Content-Type'] = 'application/json'\n"
-        f"req = urllib.request.Request('http://127.0.0.1:8000{path}', data=body, headers=headers, method={method!r}); "
+        "}\n"
+        "if body is not None:\n"
+        "    headers['Content-Type'] = 'application/json'\n"
+        f"req = urllib.request.Request('http://127.0.0.1:8000{path}', data=body, headers=headers, method={method!r})\n"
         "try:\n"
         "    resp = urllib.request.urlopen(req, timeout=20)\n"
         "    print(resp.status)\n"
@@ -658,8 +659,8 @@ def check_fake_model_four_flows_and_usage(
 
     # Trigger one real Dalton journaled LLM call scoped to this thread and verify dalton_llm_journal
     journal_script = (
-        "import asyncio; "
-        "from src.dalton.llm.complete import dalton_complete; "
+        "import asyncio\n"
+        "from src.dalton.llm.complete import dalton_complete\n"
         "async def run():\n"
         "    res = await dalton_complete(\n"
         f"        user_id={LOCAL_DEV_USER!r},\n"
