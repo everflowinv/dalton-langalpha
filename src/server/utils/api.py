@@ -60,9 +60,9 @@ def _service_token_user_id(request: Request) -> tuple[bool, Optional[str]]:
     """
     if not _SERVICE_TOKEN:
         return False, None
-    # DALTON-HOOK(dalton-auth): require >=32-char service token when Dalton auth is enabled
-    from src.dalton.auth import is_dalton_service_token_valid, is_dalton_supabase_auth_enabled
-    if is_dalton_supabase_auth_enabled() and not is_dalton_service_token_valid(_SERVICE_TOKEN):
+    # DALTON-HOOK(standalone-core): unified service-token minimum length check across Dalton auth modes
+    from src.dalton.auth.dispatch import is_service_token_rejected_by_dalton_auth
+    if is_service_token_rejected_by_dalton_auth(_SERVICE_TOKEN):
         return False, None
     token = request.headers.get("X-Service-Token")
     if not token:
@@ -185,10 +185,9 @@ async def get_user_id_any_state(
         return resolved
 
     if HOST_MODE == "oss":
-        # DALTON-HOOK(company-automations): refuse company system identity even in local OSS mode
-        reject_company_system_auth(LOCAL_DEV_USER_ID)
-        note_caller(request, LOCAL_DEV_USER_ID, "session")
-        return LOCAL_DEV_USER_ID
+        # DALTON-HOOK(standalone-core): dispatch OSS/local auth mode; only explicit oss returns local-dev-user
+        from src.dalton.auth.dispatch import dispatch_oss_user_id
+        return await dispatch_oss_user_id(request, credentials, local_dev_user_id=LOCAL_DEV_USER_ID)
 
     if credentials is None:
         raise HTTPException(status_code=401, detail="Missing authentication")
@@ -273,8 +272,9 @@ async def get_optional_user_id(
             reject_company_system_auth(user_id)
             refuse_holder_credential(user_id)
         elif HOST_MODE == "oss":
-            reject_company_system_auth(LOCAL_DEV_USER_ID)
-            user_id = LOCAL_DEV_USER_ID
+            # DALTON-HOOK(standalone-core): dispatch optional auth in OSS/local mode (absent -> None, invalid -> 401)
+            from src.dalton.auth.dispatch import dispatch_oss_optional_user_id
+            user_id = await dispatch_oss_optional_user_id(request, credentials, local_dev_user_id=LOCAL_DEV_USER_ID)
         elif credentials is None:
             return None
         else:

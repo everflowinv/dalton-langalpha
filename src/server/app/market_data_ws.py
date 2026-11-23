@@ -462,6 +462,9 @@ async def ws_market_data_proxy(
     connection_keys: set[str] = set()
     _msg_count = 0
     disconnected = asyncio.Event()
+    # DALTON-HOOK(standalone-core): close active local-auth WebSocket when session is revoked
+    from src.dalton.auth.dispatch import check_ws_local_session_or_close, start_ws_session_revocation_watch
+    _ws_session_watch = start_ws_session_revocation_watch(websocket, disconnected)
 
     async def on_message(raw_msg: str, bar: Optional[dict]) -> None:
         """Callback from MarketDataFeed — forward to frontend client."""
@@ -521,6 +524,11 @@ async def ws_market_data_proxy(
                 _disconnect_reason = "server_error"
                 break
 
+            # DALTON-HOOK(standalone-core): re-verify local session on each incoming WS message
+            if not await check_ws_local_session_or_close(websocket):
+                _disconnect_reason = "session_revoked"
+                break
+
             # Parse client subscribe/unsubscribe and route through handle
             try:
                 parsed = json.loads(msg)
@@ -541,6 +549,9 @@ async def ws_market_data_proxy(
             except (json.JSONDecodeError, TypeError):
                 pass
     finally:
+        # DALTON-HOOK(standalone-core): stop local-auth session revocation watcher on WS teardown
+        if _ws_session_watch is not None:
+            _ws_session_watch.cancel()
         # Unregister consumer
         await handle.close()
 

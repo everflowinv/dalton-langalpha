@@ -46,10 +46,9 @@ async def authenticate_websocket(websocket: WebSocket) -> str:
             raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid or expired token")
         return ws_uid
     if HOST_MODE == "oss":
-        if is_company_system_user(LOCAL_DEV_USER_ID):
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid or expired token")
-            raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid or expired token")
-        return LOCAL_DEV_USER_ID
+        # DALTON-HOOK(standalone-core): dispatch OSS/local WebSocket auth (1008 on missing/invalid local token)
+        from src.dalton.auth.dispatch import dispatch_oss_websocket
+        return await dispatch_oss_websocket(websocket, local_dev_user_id=LOCAL_DEV_USER_ID)
 
     # 1. Try Authorization header
     token: str | None = None

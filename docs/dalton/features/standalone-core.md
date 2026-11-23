@@ -202,6 +202,9 @@ flowchart LR
 | `DALTON_TIMEZONE` | 可选（默认 `UTC`） | `.env` | 部署默认时区与团队日预算结算时区（如 `Asia/Shanghai`、`America/New_York`）。 |
 | `SEC_USER_AGENT` | 可选（自动由管理员邮箱合成） | `.env` | 访问公开 SEC EDGAR 财报接口的合规标识（格式：`<BRAND_NAME> <admin_email>`）。 |
 | `TAVILY_API_KEY` / `SERPER_API_KEY` / `FMP_API_KEY` | 可选 | `.env` 或设置页 | 填入搜索密钥后自动启用 `WebSearch` 外网搜索；未填时默认使用免密钥 `inhouse` 网页抓取、`yfinance` 行情与 `dalton_sec` 财报工具。 |
+| `DALTON_TRUSTED_PROXY_HOPS` / `DALTON_TRUSTED_PROXIES` | 经反向代理部署时必填 | `.env` | 登录按 IP 限速的反向代理跳数（默认 `0`，仅取直连对端 IP）与可信代理网段（逗号分隔 CIDR，如 Docker Compose `edge` 容器所在的 `core_internal` 网段 `172.16.0.0/12` 或宿主机本机 `127.0.0.1/32`）。单层 `edge` 容器部署设为 `DALTON_TRUSTED_PROXY_HOPS=1`；当转发链条数少于配置跳数时回退直连对端地址，防止客户端伪造 `X-Forwarded-For`。 |
+| `DALTON_AUTH_COOKIE_SECURE` | 可选（`local` 默认 `true`） | `.env` | `local` 模式下刷新令牌 Cookie 默认强制附加 `Secure` 属性；仅在纯本机 HTTP 调试场景下显式设置 `DALTON_AUTH_COOKIE_SECURE=false` 才允许去掉 `Secure`。 |
+| `DALTON_WS_ALLOW_QUERY_TOKEN` | 可选（默认 `false`） | `.env` | `local` 模式下默认禁止通过 WebSocket 查询串（`?token=...`）传递访问令牌，仅接受 `Authorization: Bearer`；仅在显式配置 `true` 时开放兼容。 |
 
 ### 2.4 首个管理员永久自举锁、会话安全与运维恢复机制
 

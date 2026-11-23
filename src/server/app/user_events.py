@@ -39,8 +39,10 @@ import json
 import logging
 import time
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
+
+from src.dalton.auth.dispatch import create_local_sse_session_watch  # DALTON-HOOK(standalone-core): recheck local session on established SSE stream
 
 from src.server.database.conversation import get_thread_lifecycle_rows
 from src.server.database.conversation.viewer_threads import shared_lifecycle_rows
@@ -139,9 +141,10 @@ async def _pending_vendor_terms(user_id: str) -> list[str]:
 
 
 @router.get("/thread-events")
-async def user_thread_events(x_user_id: CurrentUserId):
+async def user_thread_events(x_user_id: CurrentUserId, request: Request = None):
     """SSE feed of the user's thread lifecycle (see module docstring)."""
     user_id = x_user_id
+    local_sse_watch = create_local_sse_session_watch(request, user_id)  # DALTON-HOOK(standalone-core): verify local session before pushing or every 30s
 
     async def event_generator():
         started = time.monotonic()
@@ -230,6 +233,8 @@ async def user_thread_events(x_user_id: CurrentUserId):
             for frame in await shared.on_event(payload.get("data") or {}):
                 yield lifecycle_frame(frame)
 
+        if local_sse_watch and not await local_sse_watch.ok(force=True):  # DALTON-HOOK(standalone-core): stop stream on local session revocation
+            return
         yield await snapshot_frame(force=True)
 
         while time.monotonic() - started < _MAX_DURATION_S:
@@ -237,6 +242,8 @@ async def user_thread_events(x_user_id: CurrentUserId):
             resubscribe = False
             async with subscribe() as wait:
                 if wait is not None:
+                    if local_sse_watch and not await local_sse_watch.ok(force=True):  # DALTON-HOOK(standalone-core): stop stream on local session revocation
+                        return
                     # Gapless attach: a publish between the snapshot read and
                     # the SUBSCRIBE would otherwise be lost — re-read.
                     event = await snapshot_frame()
@@ -249,6 +256,8 @@ async def user_thread_events(x_user_id: CurrentUserId):
                             max(0.5, next_reconcile - time.monotonic()),
                         )
                         kind, payload = await wait(timeout)
+                        if local_sse_watch and not await local_sse_watch.ok(force=(kind == "message")):  # DALTON-HOOK(standalone-core): recheck local session before pushing or every 30s
+                            return
                         # Reconcile BEFORE the message fast-path: sustained
                         # sub-timeout arrivals (parallel subagent settles)
                         # would otherwise starve the 30s backstop — the very
@@ -293,6 +302,8 @@ async def user_thread_events(x_user_id: CurrentUserId):
             if remaining <= 0:
                 break
             await asyncio.sleep(min(_RECONCILE_S, remaining))
+            if local_sse_watch and not await local_sse_watch.ok(force=True):  # DALTON-HOOK(standalone-core): stop stream on local session revocation
+                return
             await rebound()
             async for event in reconcile_frames():
                 yield event

@@ -80,6 +80,8 @@ async def _save(cache, key: str, raw, user_id: str, provider: str, tokens: Token
             if not await cache.claim(key, raw):
                 return False
             await store_tokens(user_id, provider, tokens, conn=conn)
+    except HTTPException:  # DALTON-HOOK(standalone-core): preserve 403/503 from transactional credential guard instead of turning into 500
+        raise
     except Exception:
         logger.exception(f"[oauth] Saving {provider} tokens failed for user_id={user_id}")
         raise _fail(500, "save_failed", "The account could not be saved. Start again.", retryable=False)

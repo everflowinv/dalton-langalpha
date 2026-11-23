@@ -24,7 +24,7 @@ from src.dalton.company_identity import (
     is_company_system_user,
 )
 from src.dalton.invites import is_invite_pm
-from src.dalton.settings import get_dalton_allowed_emails
+from src.dalton.settings import get_dalton_allowed_emails, is_dalton_local_auth_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,20 @@ async def get_user_tier(user_id: str | None) -> UserTier:
         return "external"
     if is_company_system_user(uid):
         return "company"
+    if is_dalton_local_auth_enabled():
+        try:
+            from src.dalton.auth.roles import get_user_role
+
+            role = await get_user_role(uid)
+            if role in ("admin", "internal", "external"):
+                return role
+        except Exception as exc:
+            logger.warning(
+                "get_user_tier local role lookup failed for user_id=%s (treated as external): %s",
+                uid,
+                type(exc).__name__,
+            )
+        return "external"
     try:
         if is_invite_pm(uid):
             return "admin"
@@ -122,6 +136,20 @@ async def classify_owner_tier(owner_id: str | None) -> OwnerTier:
         return "unknown"
     if is_company_system_user(uid):
         return "company"
+    if is_dalton_local_auth_enabled():
+        try:
+            from src.dalton.auth.roles import get_user_role
+
+            role = await get_user_role(uid)
+            if role in ("admin", "internal", "external"):
+                return role
+        except Exception as exc:
+            logger.warning(
+                "classify_owner_tier local role lookup failed for user_id=%s (treated as unknown): %s",
+                uid,
+                type(exc).__name__,
+            )
+        return "unknown"
     try:
         if is_invite_pm(uid):
             return "admin"
