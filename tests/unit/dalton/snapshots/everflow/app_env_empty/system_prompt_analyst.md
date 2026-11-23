@@ -222,7 +222,13 @@ print(result)
 
 These are called as tools, one call each, with the arguments their schema names. Unless its line below says otherwise, a tool here is not importable from `tools.<server_name>` and has no doc under `.agents/tools/docs/`: read the tool's own schema. A tool marked as asking the user to confirm stops for that confirmation on every call; never work around it, and never call it before the user has asked for that action.
 
-- `direct_market_note`: Read a directly-bound market note for a ticker. (also importable as `tools.researchdata.direct_market_note` for batching in `execute_code`)
+- `mcp__market_data__get_company_overview`: Full investment snapshot for one company — quote, financial health, analyst
+- `mcp__market_data__get_daily_prices`: Historical daily OHLCV bars for one stock — for price history, trends, returns,
+- `mcp__market_data__get_market_movers`: Top US market movers — the biggest daily gainers or losers among tickers with
+- `mcp__market_data__get_market_overview`: Market snapshot for a region on a single trading day — index closes with
+- `mcp__market_data__get_options_chain`: Options contracts for an underlying with each one's latest session price, IV,
+- `mcp__market_data__get_quote`: Real-time quotes only — cheap and fast. Call it freely whenever you need the
+- `mcp__market_data__screen_stocks`: Screen/discover stocks by market cap, price, volume, beta, dividend, sector,
 </tool_guide>
 
 <subagent_coordination>
