@@ -6,6 +6,7 @@ import asyncio
 import contextvars
 import copy
 import hashlib
+import json
 import logging
 import posixpath
 import re
@@ -40,6 +41,7 @@ from src.dalton.publish.audit import (
 )
 from src.dalton.publish.files import (
     compute_bundle_sha256,
+    format_review_mode_banner_parts,
     prepend_publication_banner,
     write_published_bundle,
 )
@@ -364,6 +366,71 @@ async def _check_unrecalculated_models(
                 f"模型未重算：{missing_cnt} 个公式没有缓存值，请运行 `python .agents/skills/xlsx/scripts/recalc.py {xp}` 后再发布"
             )
     return warnings_out
+
+
+_SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+async def _verify_core_two_round_language_review(
+    backend: Any,
+    draft_path: str,
+    draft_text: str,
+) -> str | None:
+    """Verify two completed ``check_language`` rounds with round 2 matching ``draft_text``.
+
+    Enforced only in Standalone Core profile before formal review so Core
+    single-family publications still complete two rounds of language review on
+    the exact final draft. Returns ``None`` when valid, else an error message.
+    """
+    if backend is None:
+        return (
+            f"缺少语言审查记录 {draft_path}.language.json；"
+            "请对草稿完成 check_language(round=1) 与 check_language(round=2) 后再送审。"
+        )
+    json_path = f"{draft_path}.language.json"
+    try:
+        raw_text = await backend.aread_text(json_path)
+    except Exception as exc:
+        return f"语言审查记录读取出错（{json_path}：{exc}），无法核对，请重试。"
+    if not raw_text:
+        return (
+            f"缺少语言审查记录 {json_path}；下一步：对 {draft_path} 调用 "
+            "check_language(round=1) 并按清单修改，内容定稿后再调用 check_language(round=2)。"
+        )
+    try:
+        doc = json.loads(raw_text)
+    except ValueError:
+        return f"语言审查记录不可解析（{json_path}），请重跑 check_language。"
+    rounds = doc.get("rounds") if isinstance(doc, dict) else None
+    if not isinstance(rounds, list):
+        return f"语言审查记录结构异常（{json_path}，缺 rounds 数组），请重跑 check_language。"
+    round1 = next(
+        (r for r in rounds if isinstance(r, dict) and r.get("round") == 1), None
+    )
+    round2 = next(
+        (r for r in reversed(rounds) if isinstance(r, dict) and r.get("round") == 2),
+        None,
+    )
+    if round1 is None or round2 is None:
+        missing_round = "1" if round1 is None else "2"
+        return (
+            f"{draft_path} 的语言审查记录 {json_path} 缺少第 {missing_round} 轮；"
+            "请完成第 1 轮与第 2 轮 check_language 后再送审。"
+        )
+    last2_sha = round2.get("draft_sha256")
+    if not isinstance(last2_sha, str) or not _SHA256_HEX_RE.match(last2_sha):
+        return (
+            f"{draft_path} 的语言审查第 2 轮记录里没有 64 位十六进制草稿哈希"
+            f"（{json_path}），请重跑 check_language(round=2)。"
+        )
+    current_sha = hashlib.sha256(draft_text.encode("utf-8")).hexdigest()
+    if last2_sha.lower() != current_sha.lower():
+        return (
+            f"第 2 轮语言审查针对的是旧草稿：{json_path} 最后一条第 2 轮记录哈希 "
+            f"{last2_sha[:12]}…，当前 {draft_path} 哈希 {current_sha[:12]}…；"
+            "请对当前终稿再调用一次 check_language(round=2) 复核后再送审。"
+        )
+    return None
 
 
 async def _verify_referenced_model_sha256s(
@@ -1975,6 +2042,22 @@ async def _run_publish_state_machine(
                 "audit": row.get("audit"),
                 "message": _prefix_with_audit_summary(row, model_sha_err),
             }
+        # Standalone Core publish requires two completed check_language rounds with
+        # round 2 matching the current final draft before entering formal review.
+        # Everflow keeps its existing flow unchanged.
+        from src.dalton.profile import is_core_profile
+
+        if is_core_profile():
+            lang_err = await _verify_core_two_round_language_review(
+                backend, draft_path, draft_text
+            )
+            if lang_err:
+                return {
+                    "ok": False,
+                    "status": status,
+                    "audit": row.get("audit"),
+                    "message": _prefix_with_audit_summary(row, lang_err),
+                }
         thesis_md = await backend.aread_text(RENDERED["thesis"]) or ""
         debate_md = await backend.aread_text(RENDERED["debate"]) or ""
         mgmt_md = await backend.aread_text(RENDERED["management"]) or ""
@@ -2212,6 +2295,10 @@ async def _run_publish_state_machine(
             "llm_verified_items": llm_verified_items,
             "incidental_items": incidental_items,
         }
+        from src.dalton.profile import is_core_profile as _is_core_profile
+
+        core_profile = _is_core_profile()
+        review_mode = review_info.get("review_mode")
         reviewer_payload = {
             "model": review_info.get("model", "reviewer"),
             "family": review_info.get("family", ""),
@@ -2221,11 +2308,22 @@ async def _run_publish_state_machine(
             or review_info.get("reasons")
             or review_info.get("must_fix")
             or [],
+            **({"review_mode": review_mode} if review_mode else {}),
+            **({"show_review_mode": True} if core_profile else {}),
         }
         audit_summary_str = format_audit_summary_from_dict(audit_info)
-        reviewer_summary_str = (
-            f"通过 · {reviewer_payload['model']} （{reviewer_payload['family']}）"
-        )
+        if core_profile:
+            _, review_mode_desc = format_review_mode_banner_parts(
+                review_mode if isinstance(review_mode, str) else None
+            )
+            reviewer_summary_str = (
+                f"通过 · {reviewer_payload['model']} "
+                f"（{reviewer_payload['family']} · {review_mode_desc}）"
+            )
+        else:
+            reviewer_summary_str = (
+                f"通过 · {reviewer_payload['model']} （{reviewer_payload['family']}）"
+            )
         thesis_ver_str = (
             f"v{approved_thesis_version_no}"
             if updates_thesis and approved_thesis_version_no
@@ -2534,6 +2632,11 @@ async def _run_publish_state_machine(
             reviewer_family=str(review_info.get("family") or "independent"),
             publication_id=req_id,
             thesis_version_no=approved_thesis_version_no if updates_thesis else None,
+            review_mode=(
+                str(review_info["review_mode"])
+                if review_info.get("review_mode")
+                else None
+            ),
         )
 
         files_meta, file_blobs, file_notes = await write_published_bundle(
@@ -2572,6 +2675,11 @@ async def _run_publish_state_machine(
                     "verdict": review_info.get("verdict", "pass"),
                     "reasons": review_info.get("reasons") or [],
                     "reviewed_at": review_info.get("reviewed_at") or approved_at_iso,
+                    **(
+                        {"review_mode": review_info["review_mode"]}
+                        if review_info.get("review_mode")
+                        else {}
+                    ),
                 },
                 approver_user_id=approver,
                 approved_at=now_dt,

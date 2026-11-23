@@ -1,6 +1,8 @@
 /* eslint-disable react-refresh/only-export-components -- the form's hook and its fields belong together */
 import { useId, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query'; // DALTON-HOOK(standalone-core)
 import { useTranslation } from 'react-i18next';
+import { resolveDaltonKeyTestModel } from '@/config/daltonSetup'; // DALTON-HOOK(standalone-core)
 import { Input } from '@/components/ui/input';
 import { ApiKeyInput } from '@/components/model/ApiKeyInput';
 import { isOwnKey, type ConfiguredProvider } from '@/hooks/useConfiguredProviders';
@@ -30,6 +32,7 @@ function refusalText(err: unknown, fallback: string): string {
  */
 export function useApiKeyForm(option: KeyOption, configured: readonly ConfiguredProvider[]) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient(); // DALTON-HOOK(standalone-core)
   const updateApiKeys = useUpdateApiKeys();
   const refresh = useRefreshAfterAccessChange();
   const pruneReplaced = usePruneReplacedRegions();
@@ -140,7 +143,9 @@ export function useApiKeyForm(option: KeyOption, configured: readonly Configured
 
   const runTest = async (_provider: string, key: string) => {
     try {
-      return await testApiKey(option.provider, key, baseUrl.trim() || undefined);
+      // DALTON-HOOK(standalone-core): pass selected model id for Core structured tool-calling probe
+      const model = resolveDaltonKeyTestModel(queryClient, option.provider, option.models_from);
+      return await testApiKey(option.provider, key, baseUrl.trim() || undefined, model);
     } catch (err) {
       return { success: false, error: refusalText(err, t('setup.testFailed')) };
     }

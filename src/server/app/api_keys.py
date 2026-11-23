@@ -223,7 +223,9 @@ async def get_api_keys(user_id: CurrentUserId):
     being used: they stay listed, to remove, and a turn runs as if they were
     not there. Null means the policy is unknown for now.
     """
-    return await _keys_view(user_id, await _get_custom_providers(user_id))
+    view = await _keys_view(user_id, await _get_custom_providers(user_id))
+    # DALTON-HOOK(standalone-core): attach recorded Core tool-calling probe verdicts per provider/model
+    return await __import__("src.dalton.llm.tool_probe", fromlist=["attach_tool_probe_results"]).attach_tool_probe_results(user_id, view)
 
 
 class UpdateApiKeysRequest(BaseModel):
@@ -434,6 +436,9 @@ class TestApiKeyRequest(BaseModel):
     provider: str
     api_key: str = ""
     base_url: Optional[str] = None
+    # DALTON-HOOK(standalone-core): optional model id(s) for Core structured tool-calling probe
+    model: Optional[str] = None
+    models: Optional[list[str]] = None
 
     @field_validator("api_key")
     @classmethod
@@ -494,9 +499,16 @@ async def test_api_key(body: TestApiKeyRequest, user_id: CurrentUserId):
 
     transport = await _user_endpoint_transport(body.base_url or provider_info.get("base_url"))
     try:
-        return await key_probe.check_key(
-            body.provider, provider_info, body.api_key, body.base_url, transport=transport
-        )
+        # DALTON-HOOK(standalone-core): keep HeldTransport open across /models, key check, and Core tool probe, closing once at end
+        _tp = __import__("src.dalton.llm.tool_probe", fromlist=["core_key_test_transport_scope", "core_key_probe_options", "probe_tool_calling_for_key_test"])
+        async with _tp.core_key_test_transport_scope(transport) as scoped_transport:
+            core_probe_opts = _tp.core_key_probe_options(body.model, body.models, provider_info, custom)
+            result = await key_probe.check_key(
+                body.provider, provider_info, body.api_key, body.base_url, transport=scoped_transport, **core_probe_opts
+            )
+            return await _tp.probe_tool_calling_for_key_test(
+                user_id=user_id, provider=body.provider, provider_info=provider_info, api_key=body.api_key, base_url=body.base_url, check_result=result, model=body.model, models=body.models, custom_provider_entry=custom, transport=scoped_transport,
+            )
     except key_probe.ProbeTimedOut:
         raise HTTPException(
             status_code=504,
@@ -721,7 +733,10 @@ async def list_models():
             }
             for provider, model_list in models.items()
         },
-        "model_metadata": config.get_model_metadata(),
+        # DALTON-HOOK(standalone-core): mark text-only models so core setup excludes non-tool models
+        "model_metadata": __import__(
+            "src.dalton.llm.role_policy", fromlist=["annotate_model_metadata_tool_calling"]
+        ).annotate_model_metadata_tool_calling(config.get_model_metadata()),
         "system_defaults": {
             # One source with the default-model reassignment on preference
             # writes, so "threads on the old default" means what the composer showed.
@@ -754,4 +769,8 @@ async def list_models():
         "antigravity_series": __import__(
             "src.dalton.llm.antigravity_series", fromlist=["build_antigravity_series_catalog"]
         ).build_antigravity_series_catalog(config),
+        # DALTON-HOOK(standalone-core): expose deployment profile (everflow vs core) for setup wizard gating
+        "dalton_profile": __import__(
+            "src.dalton.profile", fromlist=["resolve_profile"]
+        ).resolve_profile().value,
     }

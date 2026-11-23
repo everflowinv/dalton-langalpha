@@ -22,6 +22,8 @@ export interface ModelMetadataEntry {
   speed?: number;
   // DALTON-HOOK(llm-overlay): surface plain_language 1 to 5 rating from Dalton overlay; absent = not rated.
   plain_language?: number;
+  // DALTON-HOOK(standalone-core): false when the model is text-only and cannot invoke tools
+  tool_calling?: boolean;
   /** Numeric tier for platform-served access. Absent = 0. */
   tier?: number;
   /** OAuth-plan allowlist — the connected subscription's plan_type must be
@@ -443,6 +445,8 @@ export function withCustomModels(
       pricing,
       task_cost: measured,
       task_cost_estimate: estimate,
+      // DALTON-HOOK(standalone-core): never inherit catalog tool_calling onto a custom model without explicit verification
+      tool_calling: _shadowedToolCalling,
       ...declared
     } = shadowed ?? {
       provider: cm.provider,
@@ -466,6 +470,8 @@ export function withCustomModels(
       ...('prompt_guidance' in cm ? { prompt_guidance: cm.prompt_guidance } : {}),
       ...('compaction_profile' in cm ? { compaction_profile: cm.compaction_profile } : {}),
       ...(cm.display_name ? { display_name: cm.display_name } : {}),
+      // DALTON-HOOK(standalone-core): preserve explicit/probed tool_calling on custom models
+      ...(typeof cm.tool_calling === 'boolean' ? { tool_calling: cm.tool_calling } : {}),
     };
   }
   return metadata;

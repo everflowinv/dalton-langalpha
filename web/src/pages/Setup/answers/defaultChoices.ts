@@ -17,9 +17,11 @@ import {
   DALTON_BACKGROUND_SERIES,
   DALTON_DEFAULT_MODEL,
   DALTON_DEFAULT_SERIES,
+  filterDaltonCoreSlotModels,
   isDaltonAllowedModel,
+  resolveDaltonConfirmedSetupModels,
   resolveDaltonSeriesDefaultModel,
-  resolveDaltonSetupCandidates,
+  resolveDaltonSetupModels,
 } from '@/config/daltonSetup';
 import {
   inspectSavedAntigravityModel,
@@ -33,7 +35,8 @@ import type { ModelsAnswer } from './setupSteps';
 /** How many models the step lists; the rest are in Settings. */
 export const DEFAULT_CHOICES_SHOWN = 5;
 
-export type RatedMetadata = Record<string, { sdk?: string; model_id?: string; provider?: string; intelligence?: number; speed?: number } | undefined>;
+// DALTON-HOOK(standalone-core): carry optional tool_calling flag for Core setup fallback filtering
+export type RatedMetadata = Record<string, { sdk?: string; model_id?: string; provider?: string; intelligence?: number; speed?: number; tool_calling?: boolean } | undefined>;
 
 export interface DefaultChoicesInput {
   models: ModelsAnswer;
@@ -53,6 +56,8 @@ export interface DefaultChoicesInput {
   preferred: string | null;
   // DALTON-HOOK(dalton-setup): Dalton mode recommends Neon & Hydrogen without credits or Claude Code
   dalton?: boolean;
+  // DALTON-HOOK(standalone-core): active deployment profile (everflow vs core) for setup fallback
+  daltonProfile?: string | null;
   // DALTON-HOOK(antigravity-series): series catalog & selectable series for collapsing onboarding candidates
   seriesCatalog?: AntigravitySeriesCatalog;
   selectableSeries?: readonly SelectableAntigravitySeries[];
@@ -149,7 +154,14 @@ const RULES: Record<ModelsAnswer, {
       // DALTON-HOOK(dalton-setup): prefer Hydrogen low variant for background in Dalton deployments
       // DALTON-HOOK(antigravity-series): resolve Hydrogen -low variant via antigravity_series
       if (input.dalton) {
-        const allowedSlots = input.slotModels.filter((m) => daltonAllowed(input, m));
+        // DALTON-HOOK(standalone-core): in Core, filter Background candidates to confirmed tool-calling models
+        const allowedSlots = filterDaltonCoreSlotModels(
+          input.slotModels.filter((m) => daltonAllowed(input, m)),
+          input.metadata,
+          true,
+          input.daltonProfile,
+        );
+        const bgPool = filterDaltonCoreSlotModels(pool, input.metadata, true, input.daltonProfile);
         const daltonBg = resolveDaltonSeriesDefaultModel(DALTON_BACKGROUND_SERIES, allowedSlots, {
           seriesCatalog: input.seriesCatalog,
           selectableSeries: input.selectableSeries,
@@ -159,10 +171,10 @@ const RULES: Record<ModelsAnswer, {
         if (daltonBg) {
           return { background: daltonBg, backgroundWhy: 'daltonRecommended' };
         }
-        if (input.systemBackground && input.slotModels.includes(input.systemBackground) && daltonAllowed(input, input.systemBackground)) {
+        if (input.systemBackground && allowedSlots.includes(input.systemBackground) && daltonAllowed(input, input.systemBackground)) {
           return { background: input.systemBackground, backgroundWhy: 'daltonRecommended' };
         }
-        return fastestOtherPick(input, pool, primary);
+        return fastestOtherPick({ ...input, slotModels: allowedSlots }, bgPool, primary);
       }
       return input.systemBackground && input.slotModels.includes(input.systemBackground)
         && platformServed(input, input.systemBackground)
@@ -197,7 +209,14 @@ const RULES: Record<ModelsAnswer, {
         : strongestPick(input, pool);
     },
     background: (input, pool, primary) => {
-      const allowedSlots = input.slotModels.filter((m) => daltonAllowed(input, m));
+      // DALTON-HOOK(standalone-core): in Core, filter Background candidates to confirmed tool-calling models
+      const allowedSlots = filterDaltonCoreSlotModels(
+        input.slotModels.filter((m) => daltonAllowed(input, m)),
+        input.metadata,
+        !!input.dalton,
+        input.daltonProfile,
+      );
+      const bgPool = filterDaltonCoreSlotModels(pool, input.metadata, !!input.dalton, input.daltonProfile);
       const daltonBg = input.dalton
         ? resolveDaltonSeriesDefaultModel(DALTON_BACKGROUND_SERIES, allowedSlots, {
             seriesCatalog: input.seriesCatalog,
@@ -208,7 +227,7 @@ const RULES: Record<ModelsAnswer, {
         : null;
       return daltonBg
         ? { background: daltonBg, backgroundWhy: 'daltonRecommended' }
-        : fastestOtherPick(input, pool, primary);
+        : fastestOtherPick(input.dalton ? { ...input, slotModels: allowedSlots } : input, bgPool, primary);
     },
   },
 };
@@ -282,7 +301,13 @@ export function defaultChoices(input: DefaultChoicesInput): DefaultChoices {
   pool = collapsedPool;
 
   // DALTON-HOOK(dalton-setup): Dalton /setup/default shows only the fixed 5 curated candidates in order (never falls back to uncurated models)
-  const curated = input.dalton ? resolveDaltonSetupCandidates(rawPool) : null;
+  // DALTON-HOOK(standalone-core): Core profile lists connected non-rejected models (unverified labeled, never auto-selected); default picks come only from confirmed tool-calling models
+  const curated = input.dalton
+    ? resolveDaltonSetupModels(rawPool, { profile: input.daltonProfile, metadata: input.metadata }, pool)
+    : null;
+  const confirmedCurated = input.dalton
+    ? resolveDaltonConfirmedSetupModels(rawPool, { profile: input.daltonProfile, metadata: input.metadata }, pool)
+    : null;
 
   // DALTON-HOOK(antigravity-series): preserve saved suffixed variant while keeping 1 card per series
   const sameAs = (a: string, b: string | null) => a === b || sameAntigravitySeries(a, b, seriesOpts);
@@ -295,7 +320,10 @@ export function defaultChoices(input: DefaultChoicesInput): DefaultChoices {
         recommended: { primary: null, primaryWhy: null, background: null, backgroundWhy: null },
       };
     }
-    const recommended = recommend(input, curated, pool, effectiveAnswer);
+    const recommendPool = confirmedCurated ?? curated;
+    const recommended = recommendPool.length > 0
+      ? recommend(input, recommendPool, pool, effectiveAnswer)
+      : { primary: null, primaryWhy: null, background: null, backgroundWhy: null };
     const saved = canKeepPreferred && input.preferred && rawPool.includes(input.preferred)
       && curated.some((m) => sameAs(m, input.preferred))
       ? input.preferred : null;

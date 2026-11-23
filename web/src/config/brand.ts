@@ -14,11 +14,20 @@ export const BRAND_MARK: BrandMarkKind =
     ? 'everflow'
     : 'langalpha';
 
+const _rawDaltonUi = (import.meta.env.VITE_DALTON_UI as string | undefined)?.trim().toLowerCase();
+
 /**
- * Whether this is a Dalton build. Gates the product decisions the roadmap
- * keeps on Dalton's side of the fork (the onboarding entry among them).
+ * Whether this is a Dalton UI build. Controlled explicitly by `VITE_DALTON_UI`
+ * (`true`/`1` enables, `false`/`0` disables); when unset, preserves the legacy
+ * `BRAND_MARK === 'everflow'` default so Everflow builds stay identical while
+ * neutral-brand Standalone Core builds decouple Dalton UI from the brand mark.
  */
-export const isDaltonBuild: boolean = BRAND_MARK === 'everflow';
+export const isDaltonBuild: boolean =
+  _rawDaltonUi === 'true' || _rawDaltonUi === '1'
+    ? true
+    : _rawDaltonUi === 'false' || _rawDaltonUi === '0'
+      ? false
+      : BRAND_MARK === 'everflow';
 
 /**
  * Resolved favicon path for the active brand mark and theme.

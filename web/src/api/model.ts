@@ -41,6 +41,8 @@ export interface ModelsResponse {
   antigravity_series?: AntigravitySeriesEntry[];
   /** What every `task_cost` figure is a multiple of; null without figures. */
   task_cost_baseline?: TaskCostBaseline | null;
+  // DALTON-HOOK(standalone-core): expose deployment profile (everflow vs core) for setup wizard gating
+  dalton_profile?: 'everflow' | 'core';
 }
 
 export async function getAvailableModels(): Promise<ModelsResponse> {
@@ -421,6 +423,12 @@ export interface TestResult {
   models_found?: number;
   latency_ms?: number;
   error?: string;
+  // DALTON-HOOK(standalone-core): Core structured tool-calling probe result from /api/v1/keys/test
+  tool_calling?: boolean | null;
+  tool_calling_model?: string;
+  tool_calling_models?: Record<string, boolean | null>;
+  tool_calling_error?: string;
+  tool_calling_hint?: string;
   /** OpenRouter only: what the key may still spend, in USD. */
   credits?: {
     limit: number | null;
@@ -433,11 +441,20 @@ export interface TestResult {
 
 /** Checks a key against the provider before it is saved. A refusal by the
  *  provider resolves `success: false`; only our own route failing throws. */
-export async function testApiKey(provider: string, apiKey: string, baseUrl?: string): Promise<TestResult> {
+export async function testApiKey(
+  provider: string,
+  apiKey: string,
+  baseUrl?: string,
+  // DALTON-HOOK(standalone-core): optional model id(s) for Core structured tool-calling probe
+  model?: string,
+  models?: readonly string[],
+): Promise<TestResult> {
   const { data } = await api.post('/api/v1/keys/test', {
     provider,
     api_key: apiKey,
     base_url: baseUrl || undefined,
+    ...(model ? { model } : {}),
+    ...(models && models.length > 0 ? { models } : {}),
   });
   return data as TestResult;
 }

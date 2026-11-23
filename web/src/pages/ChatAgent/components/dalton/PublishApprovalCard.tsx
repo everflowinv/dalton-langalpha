@@ -9,6 +9,7 @@ import { Loader } from '@/components/ui/loader';
 // Direct module imports: the primitives barrel also re-exports the
 // confirm dialog, which would pull its animation library onto first load.
 import { DaltonInlineNotice } from '@/components/dalton/primitives/DaltonStatusBadge';
+import { isCoreDaltonProfile } from '@/config/daltonSetup';
 import { TWEEN } from '@/lib/motion'; // DALTON-HOOK(publish-card): house motion vocabulary replaces the literal tween
 import type { ToolApprovalState } from '@/types/chat';
 import { SettledStep } from '../SettledStep';
@@ -95,6 +96,8 @@ interface ReviewerPayload {
   verdict?: string;
   summary?: string;
   points?: string[];
+  review_mode?: 'cross_family' | 'single_family' | 'unknown_family' | string | null;
+  show_review_mode?: boolean;
 }
 
 const KNOWN_REPORT_KINDS = new Set([
@@ -199,6 +202,28 @@ export function PublishApprovalCard({
       ? t('dalton.publish.verdictPass')
       : revObj.verdict
     : '';
+  const reviewMode = revObj?.review_mode ?? null;
+  // Standalone Core displays explicit review_mode label & badge (including legacy missing records);
+  // Everflow keeps its exact original "独立审稿" row label with no mode badge.
+  const showReviewMode = Boolean(revObj?.show_review_mode) || isCoreDaltonProfile(args?.dalton_profile as string | undefined);
+  const reviewerRowLabel = !showReviewMode
+    ? t('dalton.publish.reviewerLabel')
+    : reviewMode === 'cross_family'
+      ? t('dalton.publish.reviewerLabel')
+      : reviewMode === 'single_family'
+        ? t('dalton.publish.reviewerLabelSelf')
+        : reviewMode === 'unknown_family'
+          ? t('dalton.publish.reviewerLabelUnknown')
+          : t('dalton.publish.reviewerLabelLegacy');
+  const reviewModeBadge = !showReviewMode
+    ? null
+    : reviewMode === 'cross_family'
+      ? t('dalton.publish.reviewMode.cross_family')
+      : reviewMode === 'single_family'
+        ? t('dalton.publish.reviewMode.single_family')
+        : reviewMode === 'unknown_family'
+          ? t('dalton.publish.reviewMode.unknown_family')
+          : t('dalton.publish.reviewMode.legacy');
   const reviewerSummary = revObj
     ? `${verdictLabel}${revObj.model ? ` · ${revObj.model}` : ''}`
     : String(args?.reviewer_summary ?? args?.reviewer ?? args?.['独立审稿'] ?? '');
@@ -346,8 +371,25 @@ export function PublishApprovalCard({
       )}
       {reviewerSummary && (
         <div className="flex items-center justify-between gap-2">
-          <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.reviewerLabel')}</span>
-          <span>{reviewerSummary}</span>
+          <span style={{ color: 'var(--color-text-tertiary)' }} data-testid="publish-reviewer-label">
+            {reviewerRowLabel}
+          </span>
+          <span className="flex flex-wrap items-center justify-end gap-1.5">
+            <span>{reviewerSummary}</span>
+            {reviewModeBadge && (
+              <span
+                data-testid="publish-review-mode"
+                className="rounded px-1.5 py-0.5 text-[10px]"
+                style={{
+                  backgroundColor: 'var(--color-bg-subtle)',
+                  border: '1px solid var(--color-border-muted)',
+                  color: 'var(--color-text-tertiary)',
+                }}
+              >
+                {reviewModeBadge}
+              </span>
+            )}
+          </span>
         </div>
       )}
       {revObj?.summary && (

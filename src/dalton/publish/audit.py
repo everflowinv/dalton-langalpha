@@ -44,6 +44,7 @@ from src.dalton.llm.model_prefs import (
     resolve_dalton_audit_model,
     resolve_dalton_audit_timeout_s,
 )
+from src.dalton.profile import is_core_profile
 from src.dalton.settings import get_dalton_audit_cache_hmac_key, get_dalton_config
 
 try:
@@ -487,6 +488,16 @@ _CANONICAL_UNIT_TOKEN_RE = re.compile(
 
 
 
+async def _resolve_effective_audit_model(user_id: str) -> str:
+    """Resolve the effective audit model, falling back to customer's model in Core profile."""
+    model = (await resolve_dalton_audit_model(user_id)).strip()
+    if model or not is_core_profile():
+        return model
+    from src.dalton.llm.role_policy import resolve_effective_role_model
+
+    return (await resolve_effective_role_model(role="audit", user_id=user_id)).strip()
+
+
 async def resolve_audit_config_fingerprint(
     user_id: str,
     *,
@@ -502,7 +513,7 @@ async def resolve_audit_config_fingerprint(
     return compute_audit_config_fingerprint(
         use_llm_judge=use_llm_judge,
         prompt_version=prompt_version,
-        audit_model=await resolve_dalton_audit_model(user_id),
+        audit_model=await _resolve_effective_audit_model(user_id),
         audit_fallback_models=await resolve_dalton_audit_fallback_models(user_id),
         audit_timeout_s=float(await resolve_dalton_audit_timeout_s(user_id)),
     )
@@ -935,7 +946,7 @@ async def judge_figures_batch_with_llm(
         "from inside `quote` that names the metric. "
         f"3) Only return `exempt` if the draft `sentence` itself explicitly contains one of: {_EXEMPT_MARKERS_PROMPT}."
     )
-    audit_model = await resolve_dalton_audit_model(user_id)
+    audit_model = await _resolve_effective_audit_model(user_id)
     audit_fallback_models = await resolve_dalton_audit_fallback_models(user_id)
     audit_timeout_s = await resolve_dalton_audit_timeout_s(user_id)
     res = await assist_json(
@@ -1545,7 +1556,7 @@ async def aaudit_draft(
         if cached is not None:
             return cached
     pub = get_dalton_config().publish
-    if use_llm_judge and not (await resolve_dalton_audit_model(user_id)).strip():
+    if use_llm_judge and not (await _resolve_effective_audit_model(user_id)).strip():
         raise ValueError("数字核验未配置模型：请在 dalton.yaml 的 publish.audit_model 指定。")
     eff_model, _eff_fallbacks, eff_prompt_ver, cfg_sha = config_fp
     # One budget for the whole audit. A caller-supplied deadline (started by
