@@ -18,10 +18,16 @@ import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(antigravity-series): series-only display & hide effort pickers in onboarding
 import { isDaltonBuild } from '@/config/brand';
 import {
+  applyDaltonProviderToolProbes,
   filterDaltonCuratedModels,
   filterDaltonPayers,
   filterDaltonProviderModels,
+  isCoreDaltonProfile,
   isDaltonAllowedModel,
+  isDaltonAllowedSystemBackground,
+  isDaltonToolCallingUnverified,
+  resolveDaltonRecommendedBackground,
+  resolveDaltonRecommendedBackgroundLabel,
 } from '@/config/daltonSetup';
 import { formatAntigravityVariantLabel, sameAntigravitySeries } from '@/lib/antigravitySeries';
 import { isDesktopShell } from '@/lib/desktop';
@@ -86,13 +92,18 @@ export default function DefaultStep() {
   const visiblePayers = filterDaltonPayers(payers, isDaltonBuild);
   const visibleModels = filterDaltonProviderModels(models, metadata, payers, isDaltonBuild, team.rejectedProviders);
   const visibleSlotModels = filterDaltonProviderModels(slotModels, metadata, payers, isDaltonBuild, team.rejectedProviders);
+  // DALTON-HOOK(standalone-core): merge Core recorded tool-calling probe verdicts before choosing defaults
+  const effectiveMetadata = isDaltonBuild
+    ? applyDaltonProviderToolProbes(metadata, providers, customModels)
+    : metadata;
   const rawSystemDefault = systemDefaults?.default_model ?? null;
   const rawSystemBackground = systemDefaults?.background_model ?? null;
   const allowedSystemDefault = rawSystemDefault
-    && (!isDaltonBuild || isDaltonAllowedModel(metadata[rawSystemDefault], payers[rawSystemDefault], team.rejectedProviders))
+    && (!isDaltonBuild || isDaltonAllowedModel(effectiveMetadata[rawSystemDefault], payers[rawSystemDefault], team.rejectedProviders))
     ? rawSystemDefault : null;
+  // DALTON-HOOK(standalone-core): Core requires confirmed tool-calling support for deployment background model
   const allowedSystemBackground = rawSystemBackground
-    && (!isDaltonBuild || isDaltonAllowedModel(metadata[rawSystemBackground], payers[rawSystemBackground], team.rejectedProviders))
+    && (!isDaltonBuild || isDaltonAllowedSystemBackground(effectiveMetadata[rawSystemBackground], payers[rawSystemBackground], team.rejectedProviders, all.rawApiResponse?.dalton_profile))
     ? rawSystemBackground : null;
   const choices = defaultChoices({
     models: effectiveModels,
@@ -103,7 +114,7 @@ export default function DefaultStep() {
     ownProviders: providers.filter((p) => p.masked_key !== SERVER_KEY && p.state !== 'needs_reauth'
       && (p.access_type === 'oauth' ? allows(policy, RULE.ownSubscriptions)
         : allows(policy, RULE.ownApiKeys) && (!isPlatformMode || byokEnabled))).map((p) => p.provider),
-    metadata,
+    metadata: effectiveMetadata,
     customModels,
     connectionOf,
     systemDefault: allowedSystemDefault,
@@ -111,7 +122,9 @@ export default function DefaultStep() {
     preferred: saved.preferred_model ?? null,
     // DALTON-HOOK(dalton-setup): pass dalton build flag and team state into DefaultForm
     // DALTON-HOOK(antigravity-series): pass seriesCatalog & selectableSeries into defaultChoices
+    // DALTON-HOOK(standalone-core): pass runtime dalton_profile so Core unlocks BYOK/custom models
     dalton: isDaltonBuild,
+    daltonProfile: all.rawApiResponse?.dalton_profile,
     seriesCatalog: all.seriesCatalog,
     selectableSeries: all.selectableSeries,
   });
@@ -127,6 +140,7 @@ export default function DefaultStep() {
       all={all}
       team={team}
       effectiveModels={effectiveModels}
+      effectiveMetadata={effectiveMetadata}
     />
   );
 }
@@ -152,6 +166,7 @@ function DefaultForm({
   all,
   team,
   effectiveModels,
+  effectiveMetadata,
 }: {
   flow: Flow;
   choices: DefaultChoices;
@@ -159,6 +174,7 @@ function DefaultForm({
   all: DaltonTeamModelsState['all'];
   team: DaltonTeamModelsState;
   effectiveModels: ModelsAnswer;
+  effectiveMetadata: Record<string, ModelMetadataEntry>;
 }) {
   const { t } = useTranslation();
   const copy = useModelSlotCopy();
@@ -176,11 +192,18 @@ function DefaultForm({
   // Background as Settings holds it: a model, or Auto (the deployment's, which
   // `background_follows` keeps beside a saved primary).
   // DALTON-HOOK(dalton-setup): disallow Auto background when deployment background requires credits, Claude Code, or rejected credentials
+  // DALTON-HOOK(standalone-core): Core requires confirmed tool-calling for deployment background and never auto-selects Auto when filtered background is null
   const rawSystemBackground = systemDefaults?.background_model ?? null;
   const systemBackground = rawSystemBackground
-    && (!isDaltonBuild || isDaltonAllowedModel(metadata[rawSystemBackground], payers[rawSystemBackground], team.rejectedProviders))
+    && (!isDaltonBuild || isDaltonAllowedSystemBackground(effectiveMetadata[rawSystemBackground], payers[rawSystemBackground], team.rejectedProviders, rawApiResponse?.dalton_profile))
     ? rawSystemBackground : null;
-  const recommendedBackground = recommended.background ?? (systemBackground ? BACKGROUND_AUTO : '');
+  const recommendedBackground = resolveDaltonRecommendedBackground(
+    recommended.background,
+    systemBackground,
+    BACKGROUND_AUTO,
+    isDaltonBuild,
+    rawApiResponse?.dalton_profile,
+  );
   // A saved Background confirmed not to run any more (retired, or a plan
   // that lost it) starts on the recommended one instead; one only unlisted
   // while a read failed or loads is kept.
@@ -277,8 +300,23 @@ function DefaultForm({
   // DALTON-HOOK(antigravity-series): display Antigravity models purely as series names without effort suffix
   const name = (m: string) =>
     formatAntigravityVariantLabel(m, seriesOpts) ?? getModelDisplayName(m, metadata);
-  const curatedCustomizeModels = filterDaltonCuratedModels(visibleSlotModels, isDaltonBuild);
+  // DALTON-HOOK(standalone-core): pass runtime dalton_profile & effectiveMetadata so Core unlocks BYOK/custom models
+  const curatedCustomizeModels = filterDaltonCuratedModels(visibleSlotModels, isDaltonBuild, {
+    profile: rawApiResponse?.dalton_profile,
+    metadata: effectiveMetadata,
+  });
   const deploymentBackground = systemBackground ? t('settings.autoModel', { model: name(systemBackground) }) : undefined;
+  // DALTON-HOOK(standalone-core): Core Recommended card & Customize placeholder show "Follows primary model" when recommended.background is null
+  const isCoreProfile = isDaltonBuild && isCoreDaltonProfile(rawApiResponse?.dalton_profile);
+  const backgroundFollowsPrimaryLabel = t('setup.answers.default.backgroundFollowsPrimary');
+  const recommendedBackgroundLabel = resolveDaltonRecommendedBackgroundLabel(
+    recommended.background,
+    name,
+    deploymentBackground,
+    backgroundFollowsPrimaryLabel,
+    isDaltonBuild,
+    rawApiResponse?.dalton_profile,
+  );
   const onRecommended = primary === recommended.primary && background === recommendedBackground;
   // Self-hosted runs it on the token the server saved, wherever the turn is.
   const target = flow.tokenTarget;
@@ -433,15 +471,19 @@ function DefaultForm({
                     <span style={{ color: 'var(--color-text-secondary)' }}>{t(`setup.answers.default.why.${recommended.primaryWhy}`)}</span>
                   )}
                 </dd>
-                {(recommended.background || deploymentBackground) && (
+                {recommendedBackgroundLabel && (
                   <>
                     <dt style={{ color: 'var(--color-text-tertiary)' }}>{copy.background.label}</dt>
                     <dd className="flex flex-col gap-0.5">
-                      <span className="font-medium" style={{ color: 'var(--color-text-primary)' }}>
+                      <span
+                        className="font-medium"
+                        style={{ color: 'var(--color-text-primary)' }}
+                        data-testid="setup-recommended-background"
+                      >
                         {/* DALTON-HOOK(antigravity-series): pure series name without effort suffix */}
-                        {recommended.background ? name(recommended.background) : deploymentBackground}
+                        {recommendedBackgroundLabel}
                       </span>
-                      {recommended.backgroundWhy && (
+                      {recommended.backgroundWhy && (recommended.background || !isCoreProfile) && (
                         <span style={{ color: 'var(--color-text-secondary)' }}>
                           {t(`setup.answers.default.why.${recommended.backgroundWhy}Background`, {
                             model: systemBackground ? name(systemBackground) : '',
@@ -459,12 +501,21 @@ function DefaultForm({
             {choices.list.map((m) => {
               const isPrimaryCard = m === primary || sameAntigravitySeries(m, primary, seriesOpts);
               const isRecommendedCard = recommended.primary === m || sameAntigravitySeries(m, recommended.primary, seriesOpts);
+              // DALTON-HOOK(standalone-core): label Core models whose tool-calling capability is not yet verified
+              const isUnverifiedToolCalling = isDaltonBuild
+                && isCoreDaltonProfile(rawApiResponse?.dalton_profile)
+                && isDaltonToolCallingUnverified(effectiveMetadata[m]);
               return (
                 <PickCard key={m} name={groupName} value={m} checked={isPrimaryCard} onSelect={setPrimary}>
                   <span className="flex min-w-0 flex-1 flex-col gap-1">
                     <span className="flex flex-wrap items-center gap-2 text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
                       {name(m)}
                       {isRecommendedCard && <NameTag>{t('setup.answers.default.recommended')}</NameTag>}
+                      {isUnverifiedToolCalling && (
+                        <span data-testid="setup-model-unverified-tool-calling">
+                          <NameTag>{t('setup.answers.default.toolCallingUnverified')}</NameTag>
+                        </span>
+                      )}
                     </span>
                     <Ratings meta={metadata[m]} />
                     {isPrimaryCard && where && <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{where}</span>}
@@ -506,7 +557,7 @@ function DefaultForm({
                       models={visibleSlotModels}
                       missingLabel={name}
                       nameOf={isDaltonBuild ? name : undefined}
-                      placeholder={copy.background.placeholder}
+                      placeholder={isCoreProfile ? backgroundFollowsPrimaryLabel : copy.background.placeholder}
                       autoOption={deploymentBackground ? { value: BACKGROUND_AUTO, label: deploymentBackground } : undefined}
                       payers={visiblePayers}
                       metadata={metadata}

@@ -10,9 +10,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, StrictInt
 
+from src.dalton.profile import is_core_profile
 from src.dalton.settings import REPO_ROOT
 
 logger = logging.getLogger(__name__)
+
+ReviewMode = Literal["cross_family", "single_family", "unknown_family"]
 
 REVIEWER_AGENT_PATH = REPO_ROOT / "plugins" / "dalton" / "agents" / "dalton-reviewer.md"
 
@@ -142,16 +145,20 @@ class ReviewResult:
     # The sha256 of the exact draft text that was sent for review — computed
     # and stamped by this caller, never taken from the model's reply.
     draft_sha256: str | None = None
+    review_mode: ReviewMode | None = None
 
     def to_dict(self) -> dict[str, Any]:
         if self.status != "done" or self.verdict is None:
-            return {
+            payload: dict[str, Any] = {
                 "status": self.status,
                 "model": self.model,
                 "family": self.family,
                 "verdict": "unavailable",
                 "reason": self.reason or "No cross-family reviewer model available",
             }
+            if self.review_mode is not None:
+                payload["review_mode"] = self.review_mode
+            return payload
         # must_fix forces revise at minimum, but never downgrades a block.
         effective_verdict = (
             self.verdict.verdict
@@ -163,7 +170,7 @@ class ReviewResult:
         ]
         if not points and self.verdict.summary:
             points = [self.verdict.summary]
-        return {
+        out: dict[str, Any] = {
             "status": "done",
             "model": self.model,
             "family": self.family,
@@ -183,6 +190,9 @@ class ReviewResult:
                 .replace("+00:00", "Z")
             ),
         }
+        if self.review_mode is not None:
+            out["review_mode"] = self.review_mode
+        return out
 
 
 def family_of(model_key: str | None) -> str:
@@ -218,41 +228,208 @@ def family_of(model_key: str | None) -> str:
     return "unknown"
 
 
+def classify_review_mode(
+    author_model: str | None,
+    reviewer_model: str | None,
+    *,
+    author_family: str | None = None,
+    reviewer_family: str | None = None,
+) -> ReviewMode:
+    """Classify the review independence mode recorded on publication metadata."""
+    a_fam = author_family if author_family is not None else family_of(author_model)
+    r_fam = reviewer_family if reviewer_family is not None else family_of(reviewer_model)
+    if a_fam == "unknown" or r_fam == "unknown":
+        return "unknown_family"
+    if r_fam != a_fam:
+        return "cross_family"
+    return "single_family"
+
+
+async def _resolve_family_with_user_config(
+    model_key: str | None,
+    *,
+    user_id: str | None = None,
+    model_pref: dict[str, Any] | None = None,
+    base_urls: dict[str, Any] | None = None,
+) -> str:
+    """Resolve model family from actual inference config in Core; restore pure ``family_of`` in Everflow."""
+    if not model_key or not str(model_key).strip():
+        return "unknown"
+    if not is_core_profile():
+        return family_of(model_key)
+    try:
+        from src.dalton.llm.role_policy import family_of_for_config, resolve_model_family
+
+        if model_pref is not None or base_urls is not None:
+            return family_of_for_config(
+                model_key, model_pref=model_pref, base_urls=base_urls
+            )
+        if user_id:
+            return await resolve_model_family(model_key, user_id=user_id)
+    except Exception:
+        pass
+    return family_of(model_key)
+
+
+def _is_usable_core_fallback(
+    candidate: str | None,
+    *,
+    available_models: set[str] | None = None,
+    excluded: set[str] | None = None,
+) -> bool:
+    if not candidate or not str(candidate).strip():
+        return False
+    cand = str(candidate).strip()
+    if excluded and cand in excluded:
+        return False
+    from src.dalton.llm.role_policy import _merged_model_entry, is_forbidden_for_roles
+    from src.dalton.settings import get_disabled_providers
+
+    if is_forbidden_for_roles(cand):
+        return False
+    mcfg = _merged_model_entry(cand)
+    if isinstance(mcfg, dict):
+        if mcfg.get("visible") is False:
+            return False
+        prov = str(mcfg.get("provider") or "")
+        if prov and prov in get_disabled_providers():
+            return False
+    if available_models is not None and cand not in available_models:
+        return False
+    return True
+
+
 async def pick_reviewer_model(
     author_model: str | None,
     *,
     candidates: list[str] | None = None,
     available_models: set[str] | None = None,
     user_id: str | None = None,
+    excluded_models: set[str] | None = None,
 ) -> str | None:
     """Pick the first candidate reviewer model whose family differs from ``author_model`` (PK.10 / G3.2).
 
-    Refuses selection (returns ``None``) if ``author_model`` is ``None`` or ``family_of(author_model) == 'unknown'``.
+    Excludes ``excluded_models`` BEFORE selecting candidates so retries always move on
+    to untried models. Uses actual inference configuration (custom providers / base URLs)
+    when resolving model families so unverifiable custom gateways classify as ``unknown``.
+
+    In Everflow profile, refuses selection (returns ``None``) if ``author_model`` is
+    ``None`` or its resolved family is ``'unknown'`` or no distinct-family candidate is
+    available.
+
+    In Standalone Core profile (``is_core_profile()``), prefers a verified cross-family
+    candidate when available, and otherwise falls back to an untried usable candidate,
+    ``author_model``, or the customer's configured/custom models.
     """
-    author_family = family_of(author_model)
-    if not author_model or author_family == "unknown":
-        return None
+    excluded = {str(m).strip() for m in (excluded_models or set()) if str(m).strip()}
+    core_mode = is_core_profile()
+    model_pref: dict[str, Any] | None = None
+    base_urls: dict[str, Any] | None = None
+    if core_mode and user_id:
+        try:
+            from src.dalton.llm.role_policy import _load_execution_inference_state
 
-    from src.dalton.llm.role_policy import select_independent_reviewer
+            _, model_pref, _, base_urls = await _load_execution_inference_state(user_id)
+        except Exception:
+            pass
 
-    chosen = await select_independent_reviewer(
-        str(author_model),
-        candidates,
-        require_tool_calling=False,
-        available_models=available_models,
-        user_id=user_id,
+    author_family = await _resolve_family_with_user_config(
+        author_model, user_id=user_id, model_pref=model_pref, base_urls=base_urls
     )
-    if chosen and family_of(chosen) not in ("unknown", author_family):
-        return chosen
 
-    if candidates is not None:
-        candidate_list = list(candidates)
-        if available_models is not None:
-            candidate_list = [c for c in candidate_list if c in available_models]
+    filtered_explicit: list[str] | None = (
+        [c for c in candidates if str(c).strip() and str(c).strip() not in excluded]
+        if candidates is not None
+        else None
+    )
+
+    if author_model and author_family != "unknown":
+        candidate_list: list[str]
+        if filtered_explicit is not None:
+            candidate_list = list(filtered_explicit)
+        else:
+            from src.dalton.llm.model_prefs import dalton_model_pref
+
+            resolved_cands = await dalton_model_pref(user_id, "dalton_reviewer_models")
+            candidate_list = [
+                str(c).strip()
+                for c in (resolved_cands if isinstance(resolved_cands, list) else [])
+                if str(c).strip() and str(c).strip() not in excluded
+            ]
+
+        if core_mode and user_id:
+            try:
+                from src.dalton.llm.role_policy import usable_custom_models_for_user
+
+                for cm_name in await usable_custom_models_for_user(
+                    user_id, excluded=excluded
+                ):
+                    if cm_name not in candidate_list:
+                        candidate_list.append(cm_name)
+            except Exception:
+                pass
+
         for cand in candidate_list:
-            cand_family = family_of(cand)
+            if not _is_usable_core_fallback(
+                cand, available_models=available_models, excluded=excluded
+            ):
+                continue
+            cand_family = await _resolve_family_with_user_config(
+                cand, user_id=user_id, model_pref=model_pref, base_urls=base_urls
+            )
             if cand_family != "unknown" and cand_family != author_family:
                 return cand
+
+    if not core_mode:
+        return None
+
+    # Standalone Core fallback: prefer any untried usable configured reviewer candidate,
+    # then reuse author_model, then customer's configured / custom models.
+    fallback_candidates: list[str] = []
+    if filtered_explicit is not None:
+        fallback_candidates.extend(filtered_explicit)
+    else:
+        from src.dalton.llm.model_prefs import dalton_model_pref
+
+        resolved_cands = await dalton_model_pref(user_id, "dalton_reviewer_models")
+        if isinstance(resolved_cands, list):
+            fallback_candidates.extend(
+                str(c).strip()
+                for c in resolved_cands
+                if str(c).strip() and str(c).strip() not in excluded
+            )
+
+    for cand in fallback_candidates:
+        if _is_usable_core_fallback(
+            cand, available_models=available_models, excluded=excluded
+        ):
+            return str(cand).strip()
+
+    if _is_usable_core_fallback(
+        author_model, available_models=available_models, excluded=excluded
+    ):
+        return str(author_model).strip()
+
+    from src.dalton.llm.role_policy import (
+        resolve_effective_role_model,
+        usable_custom_models_for_user,
+    )
+
+    configured = await resolve_effective_role_model(
+        role="reviewer", user_id=user_id, excluded=excluded
+    )
+    if _is_usable_core_fallback(
+        configured, available_models=available_models, excluded=excluded
+    ):
+        return configured.strip()
+
+    if user_id:
+        for cm_name in await usable_custom_models_for_user(user_id, excluded=excluded):
+            if _is_usable_core_fallback(
+                cm_name, available_models=available_models, excluded=excluded
+            ):
+                return cm_name
+
     return None
 
 
@@ -341,8 +518,21 @@ async def run_review(
     if not user_id or not str(user_id).strip():
         raise ValueError("user_id is required")
     user_id = str(user_id).strip()
-    author_family = family_of(author_model)
-    if not author_model or author_family == "unknown":
+    core_mode = is_core_profile()
+    model_pref: dict[str, Any] | None = None
+    base_urls: dict[str, Any] | None = None
+    if core_mode:
+        try:
+            from src.dalton.llm.role_policy import _load_execution_inference_state
+
+            _, model_pref, _, base_urls = await _load_execution_inference_state(user_id)
+        except Exception:
+            pass
+
+    author_family = await _resolve_family_with_user_config(
+        author_model, user_id=user_id, model_pref=model_pref, base_urls=base_urls
+    )
+    if not core_mode and (not author_model or author_family == "unknown"):
         return ReviewResult(
             status="unavailable",
             reason=(
@@ -354,6 +544,7 @@ async def run_review(
     eff_available = available_models
     if eff_available is None and candidates is None and user_id:
         try:
+            from src.dalton.llm.role_policy import usable_custom_models_for_user
             from src.dalton.services.provider_status import explain_model_availability
 
             avail_map = await explain_model_availability(user_id=user_id)
@@ -362,6 +553,19 @@ async def run_review(
                 for k, v in avail_map.items()
                 if isinstance(v, dict) and v.get("available")
             }
+            if core_mode:
+                usable_custom = await usable_custom_models_for_user(user_id)
+                avail_set.update(usable_custom)
+                # When user preferences are absent (e.g. unit test mocks), keep an
+                # unlisted custom author_model eligible if explain_model_availability
+                # returned a non-empty manifest set.
+                if (
+                    avail_set
+                    and author_model
+                    and author_model not in avail_map
+                    and model_pref is None
+                ):
+                    avail_set.add(author_model)
             if avail_set:
                 eff_available = avail_set
         except Exception:
@@ -376,13 +580,26 @@ async def run_review(
         available_models=eff_available,
         user_id=user_id,
     )
-    if not model or family_of(model) == author_family:
+    model_family = (
+        await _resolve_family_with_user_config(
+            model, user_id=user_id, model_pref=model_pref, base_urls=base_urls
+        )
+        if model
+        else "unknown"
+    )
+    if not core_mode:
+        if not model or model_family in ("unknown", author_family):
+            return ReviewResult(
+                status="unavailable",
+                reason=(
+                    f"无法发布：缺少与作者模型（{author_model} / "
+                    f"{author_family}）不同家族的可用审稿模型"
+                ),
+            )
+    elif not model:
         return ReviewResult(
             status="unavailable",
-            reason=(
-                f"无法发布：缺少与作者模型（{author_model} / "
-                f"{author_family}）不同家族的可用审稿模型"
-            ),
+            reason=f"无法发布：未找到可用的审稿模型（作者模型：{author_model or 'None'}）",
         )
 
     system_prompt = load_agent_body("dalton-reviewer")
@@ -393,8 +610,20 @@ async def run_review(
     user_prompt = render_review_input(bundle, draft_sha256=draft_sha)
 
     last_failure: ReviewResult | None = None
-    while model and family_of(model) != author_family:
-        cand_family = family_of(model)
+    tried_models: set[str] = set()
+    while model and model not in tried_models:
+        cand_family = await _resolve_family_with_user_config(
+            model, user_id=user_id, model_pref=model_pref, base_urls=base_urls
+        )
+        if not core_mode and cand_family in ("unknown", author_family):
+            break
+        tried_models.add(model)
+        review_mode = classify_review_mode(
+            author_model,
+            model,
+            author_family=author_family,
+            reviewer_family=cand_family,
+        )
         if remaining_candidates is None:
             from src.dalton.llm.model_prefs import dalton_model_pref
 
@@ -402,9 +631,21 @@ async def run_review(
             remaining_candidates = (
                 list(resolved_cands) if isinstance(resolved_cands, list) else []
             )
-        remaining_candidates = [
-            c for c in remaining_candidates if c != model and family_of(c) != cand_family
-        ]
+        if not core_mode:
+            next_pool: list[str] = []
+            for c in remaining_candidates:
+                if c == model or c in tried_models:
+                    continue
+                c_fam = await _resolve_family_with_user_config(
+                    c, user_id=user_id, model_pref=model_pref, base_urls=base_urls
+                )
+                if c_fam != cand_family:
+                    next_pool.append(c)
+            remaining_candidates = next_pool
+        else:
+            remaining_candidates = [
+                c for c in remaining_candidates if c != model and c not in tried_models
+            ]
         try:
             from src.dalton.llm.complete import dalton_complete
 
@@ -429,6 +670,7 @@ async def run_review(
                     model=model,
                     family=cand_family,
                     reason=f"独立审稿调用失败：{comp.error or comp.status}",
+                    review_mode=review_mode,
                 )
             else:
                 verdict_obj = comp.data
@@ -461,6 +703,7 @@ async def run_review(
                     verdict=verdict_obj,
                     usage=usage,
                     draft_sha256=draft_sha,
+                    review_mode=review_mode,
                 )
         except Exception as e:
             logger.warning("Independent review call failed on model %s: %s", model, e)
@@ -469,14 +712,19 @@ async def run_review(
                 model=model,
                 family=cand_family,
                 reason=f"独立审稿调用失败：{e}",
+                review_mode=review_mode,
             )
 
-        model = await pick_reviewer_model(
+        next_model = await pick_reviewer_model(
             author_model,
             candidates=remaining_candidates,
             available_models=eff_available,
             user_id=user_id,
+            excluded_models=tried_models,
         )
+        if next_model in tried_models:
+            next_model = None
+        model = next_model
 
     assert last_failure is not None
     return last_failure

@@ -183,6 +183,17 @@ export function ApiKeyInput({
           )}
         </p>
       )}
+      {/* DALTON-HOOK(standalone-core): display Core format/tool-probe hint returned by /api/v1/keys/test */}
+      {testState === "success" && testResult?.tool_calling_hint && (
+        <p
+          role="status"
+          data-testid="api-key-test-hint"
+          className="text-xs"
+          style={{ color: "var(--color-warning)" }}
+        >
+          {testResult.tool_calling_hint}
+        </p>
+      )}
       {credits && credits.remaining != null && (
         <p className="text-xs" style={{ color: "var(--color-text-secondary)", fontVariantNumeric: "tabular-nums" }}>
           {credits.limit != null

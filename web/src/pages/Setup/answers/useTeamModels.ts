@@ -6,7 +6,7 @@ import { SUBSCRIPTIONS, subscriptionKey, type OAuthStatus } from '@/api/oauth';
 import type { ByokProvider } from '@/components/model/types';
 import { isDaltonBuild } from '@/config/brand';
 import { isDaltonAuth } from '@/config/daltonAuth';
-import { hasAvailableDaltonModels } from '@/config/daltonSetup';
+import { hasAvailableDaltonModels, type DaltonDeploymentProfile } from '@/config/daltonSetup';
 import { isPlatformMode } from '@/config/hostMode';
 import { AuthContext } from '@/contexts/AuthContext';
 import { useAccount } from '@/hooks/useAccount';
@@ -87,6 +87,8 @@ export interface DaltonTeamModelsState {
   callerTierPending: boolean;
   /** Providers whose team credentials were explicitly rejected by the vendor. */
   rejectedProviders: ReadonlySet<string>;
+  /** Active deployment profile reported by `/api/v1/models` (`everflow` | `core`). */
+  daltonProfile?: DaltonDeploymentProfile;
   retry: () => void;
   all: UseAllModelsResult;
 }
@@ -175,23 +177,29 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
     });
   }, [queryClient, userId, useSharedQuery, listedProviders, policy]);
 
+  const daltonProfile = all.rawApiResponse?.dalton_profile ?? sharedAvailability.daltonProfile;
+  // DALTON-HOOK(standalone-core): wait for /api/v1/models catalog read before deciding Dalton profile
+  const catalogPending = isDaltonBuild && all.isLoading;
+  const catalogUnread = isDaltonBuild && !all.isLoading && all.unread;
+
   if (useSharedQuery) {
     return {
       shared: sharedAvailability.shared,
       available: sharedAvailability.available,
       empty: sharedAvailability.empty,
-      isLoading: sharedAvailability.isLoading,
-      unread: sharedAvailability.unread,
+      isLoading: sharedAvailability.isLoading || catalogPending,
+      unread: sharedAvailability.unread || catalogUnread,
       canManage: effectiveCanManage,
       callerTierPending,
       rejectedProviders: sharedAvailability.rejectedProviders,
+      daltonProfile,
       retry,
       all,
     };
   }
 
-  const isLoading = isDaltonBuild && (callerTierPending || (localShared && (all.isLoading || listsLoading)));
-  const unread = localShared && !all.isLoading && !listsLoading && all.unread;
+  const isLoading = isDaltonBuild && (callerTierPending || catalogPending || (localShared && (all.isLoading || listsLoading)));
+  const unread = catalogUnread || (localShared && !all.isLoading && !listsLoading && all.unread);
   const available = localShared
     && !callerTierPending
     && !all.isLoading
@@ -203,6 +211,7 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
       all.payers ?? {},
       true,
       localRejectedProviders,
+      daltonProfile,
     );
   const empty = localShared && !callerTierPending && !all.isLoading && !listsLoading && !all.unread && !available;
 
@@ -215,6 +224,7 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
     canManage,
     callerTierPending,
     rejectedProviders: localRejectedProviders,
+    daltonProfile,
     retry,
     all,
   };

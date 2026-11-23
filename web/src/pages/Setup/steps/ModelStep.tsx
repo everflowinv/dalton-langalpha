@@ -9,7 +9,9 @@ import { AccessRow } from '@/components/modelAccess/AccessRow';
 import { Group } from '@/components/modelAccess/parts';
 import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(dalton-setup): Dalton build & unified team-model availability check
+// DALTON-HOOK(standalone-core): delegate profile & control config to Dalton helper
 import { isDaltonBuild } from '@/config/brand';
+import { getDaltonModelStepConfig } from '@/config/daltonSetup';
 import { DALTON_CURATED_PROVIDERS, effectiveModelsAnswer } from '../answers/setupSteps';
 import { useDaltonTeamModels } from '../answers/useTeamModels';
 import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
@@ -44,7 +46,8 @@ export default function ModelStep() {
   // DALTON-HOOK(dalton-setup): use the same team-model availability check as nextSetupStep and DefaultStep
   const team = useDaltonTeamModels();
   if (flow.isLoading || (isDaltonBuild && team.isLoading)) return <StepLoading />;
-  if (isDaltonBuild && team.shared && team.unread) return <StepLoadFailed onRetry={team.retry} />;
+  // DALTON-HOOK(standalone-core): surface /api/v1/models read failure to retry UI rather than guessing profile
+  if (isDaltonBuild && team.unread) return <StepLoadFailed onRetry={team.retry} />;
   if (!flow.answers) return <Navigate to="/setup" replace />;
   const effectiveModels = effectiveModelsAnswer(flow.answers.models, team.available);
   if (isDaltonBuild && team.available) return <Navigate to="/setup/default" replace />;
@@ -65,7 +68,7 @@ export default function ModelStep() {
   }
   if (isDaltonBuild && effectiveModels === 'claude_code') return <Navigate to="/setup/use" replace />;
   if (effectiveModels === 'langalpha_models') return <Navigate to="/setup/default" replace />;
-  if (effectiveModels !== 'claude_code') return <SubscriptionStep flow={flow} teamModelsAvailable={team.available} />;
+  if (effectiveModels !== 'claude_code') return <SubscriptionStep flow={flow} teamModelsAvailable={team.available} daltonProfile={team.daltonProfile} />;
   switch (step.kind) {
     case 'loading':
       return <StepLoading />;
@@ -252,7 +255,8 @@ function ClaudeCodeTokenStep({ flow, askConsent }: { flow: Flow; askConsent: boo
 }
 
 // DALTON-HOOK(dalton-setup): pass teamModelsAvailable to AnswersStrip
-function SubscriptionStep({ flow, teamModelsAvailable }: { flow: Flow; teamModelsAvailable: boolean }) {
+// DALTON-HOOK(standalone-core): pass daltonProfile to Dalton helper for Core/Everflow control config
+function SubscriptionStep({ flow, teamModelsAvailable, daltonProfile }: { flow: Flow; teamModelsAvailable: boolean; daltonProfile?: string | null }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
@@ -269,6 +273,14 @@ function SubscriptionStep({ flow, teamModelsAvailable }: { flow: Flow; teamModel
   // subscriptions rule, coding plans and keys under the keys rule.
   const { policy } = useAccount();
   const ownKeys = allows(policy, RULE.ownApiKeys);
+  // DALTON-HOOK(standalone-core): resolve planGroups/apiKey/signIn/continue policy from Dalton helper
+  const daltonStep = getDaltonModelStepConfig({
+    dalton: isDaltonBuild,
+    daltonProfile,
+    ownKeys,
+    configured,
+    curatedProviders: DALTON_CURATED_PROVIDERS,
+  });
 
   // Back from a connect page with what it connected: that becomes the
   // default once it is decided (`settled`), its models listed and its own
@@ -290,19 +302,20 @@ function SubscriptionStep({ flow, teamModelsAvailable }: { flow: Flow; teamModel
       {flow.first && flow.answers && <AnswersStrip answers={flow.answers} teamModelsAvailable={teamModelsAvailable} />}
       <WizardStepHeader titleId={headingId} title={t('setup.answers.model.subTitle')} helper={t('setup.answers.model.subLead')} />
       {/* DALTON-HOOK(dalton-setup): in Dalton, offer only subscriptions that can supply the 5 curated candidates and gate Continue on them */}
+      {/* DALTON-HOOK(standalone-core): controls driven by getDaltonModelStepConfig */}
       {/* The legacy Claude sign-in is left to Settings: Claude Code is an answer of its own (in Dalton, Claude Code is hidden so Claude OAuth is offered). */}
       <SubscriptionChoices
-        planGroups={!isDaltonBuild && ownKeys ? planGroups : []}
+        planGroups={daltonStep.showPlanGroups ? planGroups : []}
         configured={configured}
         claudeSignIn={isDaltonBuild}
-        allowedSignIns={isDaltonBuild ? DALTON_CURATED_PROVIDERS : undefined}
+        allowedSignIns={daltonStep.allowedSignIns}
         signIns={allows(policy, RULE.ownSubscriptions)}
         onPickSignIn={(provider) => goOn({
           method: 'oauth', list: 'oauth', provider, displayName: t(`modelAccess.${subscriptionKey(provider)}.name`), modelsFrom: provider,
         })}
         onPickPlan={pickKeyGroup('oauth')}
       />
-      {!isDaltonBuild && ownKeys && (
+      {daltonStep.showApiKeyLink && (
         <button
           type="button"
           data-testid="setup-sub-api-key"
@@ -316,13 +329,14 @@ function SubscriptionStep({ flow, teamModelsAvailable }: { flow: Flow; teamModel
       {defaultFailed && <StepError quiet>{t('setup.answers.model.saveDefaultFailed')}</StepError>}
       {flow.finishFailed && <StepError>{t('setup.answers.saveFailed')}</StepError>}
       {/* DALTON-HOOK(dalton-setup): in Dalton, require a curated-candidate subscription before advancing to /setup/default */}
+      {/* DALTON-HOOK(standalone-core): continue gate delegated to getDaltonModelStepConfig */}
       <SetupFooter
         back={flow.back ? { label: t('setup.back'), onClick: flow.back } : null}
         primary={{
           label: t('setup.continue'),
           onClick: () => void flow.finish(),
           disabled: !flow.facts?.providerConnected
-            || (isDaltonBuild && ![...configured].some((p) => DALTON_CURATED_PROVIDERS.has(p)))
+            || !daltonStep.canContinue
             || flow.finishing
             || defaults.saving
             || !!justConnected,

@@ -16,8 +16,9 @@ import { useProviderCatalog } from '@/hooks/useProviderCatalog';
 import type { ConnectionOf } from '@/lib/providerCatalog';
 import type { CustomModelEntry } from '@/components/model/types';
 // DALTON-HOOK(dalton-setup): never auto-save a default outside the 5 curated candidates in Dalton
+// DALTON-HOOK(standalone-core): unlock BYOK/custom connected default in Core profile when curated 5 are absent
 import { isDaltonBuild } from '@/config/brand';
-import { resolveDaltonSetupCandidates } from '@/config/daltonSetup';
+import { applyDaltonProviderToolProbes, pickDaltonConnectedDefault } from '@/config/daltonSetup';
 import { strongestModel, type RatedMetadata } from './defaultChoices';
 
 /** The model a provider just connected starts on, the one the default step
@@ -32,21 +33,27 @@ export function connectedModel(
   accountDefault: string | null,
   customModels: readonly CustomModelEntry[],
   connectionOf: ConnectionOf,
+  daltonProfile?: string | null,
 ): string | null {
   const offered = listedFor(provider, models, metadata, customModels, connectionOf);
   if (provider === CLAUDE_CODE) return claudeCodeStartModel(offered, metadata, accountDefault);
   // DALTON-HOOK(dalton-setup): restrict auto-saved connected default to the 5 curated candidates
+  // DALTON-HOOK(standalone-core): Core profile falls back to connected tool-calling models
   if (isDaltonBuild) {
-    return resolveDaltonSetupCandidates(offered)[0] ?? null;
+    return pickDaltonConnectedDefault(offered, metadata, daltonProfile);
   }
   return strongestModel(offered, metadata)?.model ?? offered[0] ?? null;
 }
 
 export function useSaveConnectedDefault() {
-  const { models, metadata, customModels, isLoading, listedProviders } = useAllModels();
-  const { configuredSet } = useConfiguredProviders();
+  const { models, metadata, customModels, isLoading, listedProviders, rawApiResponse } = useAllModels();
+  const { providers, configuredSet } = useConfiguredProviders();
   const { connectionOf } = useProviderCatalog();
   const accountDefault = useDefaultModel();
+  // DALTON-HOOK(standalone-core): merge Core recorded tool-calling probe verdicts into metadata
+  const effectiveMetadata = isDaltonBuild
+    ? applyDaltonProviderToolProbes(metadata, providers, customModels)
+    : metadata;
   const update = useUpdatePreferences();
   const queryClient = useQueryClient();
   // A list read ending re-renders the reader, whose `settled` reads it, even
@@ -80,7 +87,7 @@ export function useSaveConnectedDefault() {
   const modelFor = (provider: string) =>
     !settled(provider) || (provider !== CLAUDE_CODE && !listRead(provider))
       ? null
-      : connectedModel(provider, models, metadata, accountDefault, customModels, connectionOf);
+      : connectedModel(provider, models, effectiveMetadata, accountDefault, customModels, connectionOf, rawApiResponse?.dalton_profile);
   /** Resolves whether a default was saved. */
   const save = async (model: string): Promise<boolean> => {
     try {

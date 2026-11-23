@@ -42,6 +42,8 @@ export interface ConfiguredProvider {
   /** A provider the user defined (`custom_providers`), not a catalog one. */
   is_custom?: boolean;
   parent_provider?: string;
+  // DALTON-HOOK(standalone-core): Core recorded per-model structured tool-calling probe verdicts
+  tool_calling_models?: Record<string, boolean>;
 }
 
 function statusQuery(provider: SubscriptionProvider) {
@@ -92,6 +94,8 @@ export function useConfiguredProviders({ enabled = true }: { enabled?: boolean }
       masked_key: p.masked_key ?? null,
       is_custom: p.is_custom === true,
       ...(p.parent_provider ? { parent_provider: p.parent_provider } : {}),
+      // DALTON-HOOK(standalone-core): forward Core recorded per-model structured tool-calling probe verdicts
+      ...(p.tool_calling_models ? { tool_calling_models: p.tool_calling_models } : {}),
     });
     const keys = rows.filter((p) => !p.withdrawn).map(asConnection);
     const subscriptions = SUBSCRIPTIONS.flatMap((s, i): ConfiguredProvider[] => {

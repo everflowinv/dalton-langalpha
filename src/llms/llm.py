@@ -375,6 +375,8 @@ class ModelConfig:
                 "intelligence",
                 # DALTON-HOOK(llm-overlay): surface plain_language editorial rating from Dalton overlay
                 "plain_language",
+                # DALTON-HOOK(standalone-core): surface explicit tool_calling capability from manifest/overlay
+                "tool_calling",
                 "context",
                 "input_modalities",
             ):

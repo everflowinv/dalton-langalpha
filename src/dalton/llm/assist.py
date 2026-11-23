@@ -77,36 +77,30 @@ async def resolve_assist_model(
     user_id: str | None = None,
     deployment_only: bool = False,
 ) -> str:
-    """Resolve model key for `role` (default `'assist'`) via `dalton_model_pref` or `dalton.yaml`.
+    """Resolve model key for ``role`` (default ``'assist'``) via the unified effective model resolver.
 
     Priority:
-    1. `explicit_model` if provided
-    2. If `deployment_only=True`: `dalton_model_default(<pref_key>)` (`dalton.yaml` only, ignoring user/holder prefs)
-    3. Otherwise `dalton_model_pref(user_id, <pref_key>)` (user -> team PM holder -> `dalton.yaml` default:
-       - `assist` -> `dalton_assist_model` (default `models.assist_model`)
-       - `extract` / `conversation_extract` -> `dalton_extract_model` (default `conversations.extractor_model`)
-       - `audit` -> `dalton_audit_model` (default `publish.audit_model`))
+    1. ``explicit_model`` if provided
+    2. If ``deployment_only=True``: ``dalton_model_default(<pref_key>)`` (``dalton.yaml`` only, ignoring user/holder prefs)
+    3. Otherwise ``dalton_model_pref(user_id, <pref_key>)`` (user -> team PM holder -> ``dalton.yaml`` default:
+       - ``assist`` -> ``dalton_assist_model`` (default ``models.assist_model``)
+       - ``extract`` / ``conversation_extract`` -> ``dalton_extract_model`` (default ``conversations.extractor_model``)
+       - ``audit`` -> ``dalton_audit_model`` (default ``publish.audit_model``)
+       - ``language`` -> ``dalton_language_model`` (default ``publish.language_model`` / ``publish.audit_model``))
+    4. In Standalone Core profile (``is_core_profile()``), falls back to the customer's
+       configured primary or background model when no role-specific model is set.
 
-    Returns `""` when unconfigured so the caller can report that no model is configured.
-    Raises `RolePolicyError` if the resolved model is marked `forbidden_for_roles` (L21).
+    Returns ``""`` when unconfigured so the caller can report that no model is configured.
+    Raises ``RolePolicyError`` if the resolved model is marked ``forbidden_for_roles`` (L21).
     """
-    if explicit_model and explicit_model.strip():
-        return _validate_assist_candidate(role, explicit_model)
+    from src.dalton.llm.role_policy import resolve_effective_role_model
 
-    if role == "audit":
-        pref_key = "dalton_audit_model"
-    elif role in ("extract", "conversation_extract"):
-        pref_key = "dalton_extract_model"
-    else:
-        pref_key = "dalton_assist_model"
-    val = (
-        dalton_model_default(pref_key)
-        if deployment_only
-        else await dalton_model_pref(user_id, pref_key)
+    return await resolve_effective_role_model(
+        role=role,
+        explicit_model=explicit_model,
+        user_id=user_id,
+        deployment_only=deployment_only,
     )
-    if isinstance(val, str) and val.strip():
-        return _validate_assist_candidate(role, val)
-    return ""
 
 
 async def resolve_assist_fallback_models(
