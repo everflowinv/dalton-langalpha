@@ -411,6 +411,10 @@ def create_run_workflow_tool(
                     description=description,
                     launch_tool_call_id=launch_tool_call_id,
                     parent_run_id=run_task.spawned_run_id,
+                    # DALTON-HOOK(budget): mark RunWorkflow driver rows in
+                    # subagent_runs.replay_facts so budget reconciliation can
+                    # exclude finished drivers without trusting subagent_type.
+                    workflow_driver=True,
                 )
             except TaskRunRefused as refusal:
                 run_task.mark_never_started(refusal.settle_reason)

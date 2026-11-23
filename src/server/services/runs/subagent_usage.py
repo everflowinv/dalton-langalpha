@@ -142,6 +142,11 @@ async def _persist_takes(
                 usage_service._token_usage["task_id"] = task.task_id
                 usage_service._token_usage["agent_id"] = task.agent_id
                 usage_service._token_usage["subagent_type"] = task.subagent_type
+                # DALTON-HOOK(budget): stamp exact task_run_id on task usage
+                # rows so budget reconciliation can verify per-run usage
+                # completeness instead of trusting usage_settled_at alone.
+                if take.settle_run_id:
+                    usage_service._token_usage["task_run_id"] = str(take.settle_run_id)
 
             # DALTON-HOOK(subagent-usage-status): the resolved terminal state
             # rides the row (completed only when the run really completed).

@@ -292,9 +292,14 @@ async def reconcile_reservations_sql(
             (rate, user_id),
         )
 
-        # 2. Conservatively settle runs with abandoned unsettled subagent runs after the 30m grace window.
-        # Terminal status does not imply billing-settled, and upstream `settle_abandoned` skips BYOK rows (`in_flight_credits = 0`) if a collector crashes.
+        # 2. Settle runs with abandoned unsettled subagent runs after the 30m grace window.
+        # Terminal status does not imply billing-settled, and upstream `settle_abandoned` skips zero-credit rows (`in_flight_credits = 0`) if a collector crashes.
         # Mirrors upstream's dual-clock guard (both parent `usage_settled_at` and child `finalized_at` older than 30m) because the collector starts only after the parent run reaches terminal state.
+        # Finished RunWorkflow driver rows (`cause = 'init'` and `replay_facts @> '{"workflow_driver": true}'`) never make LLM/tool calls of their own and therefore never receive `usage_settled_at`. Drop the conservative `reserved_usd` floor ONLY when usage is proven complete:
+        #   (a) every non-workflow direct subagent under `r.run_ref` is billing-settled AND has a `conversation_usages` (`msg_type='task'`) row matching its `task_run_id` (so a `settle_abandoned` stamp without a usage row stays conservative);
+        #   (b) every workflow internal child linked via `replay_facts @> '{"workflow_driver_run_id": <driver task_run_id>}'` is finished AND has a `conversation_usages` (`msg_type='task'`) row matching its `task_run_id`;
+        #   (c) every `is_byok` usage row on `r.run_ref` carries a JSON array `per_call_costs` (pricing-failure degraded rows stay conservative);
+        #   (d) `usage_rows > 0`, and even then never settle below `observed_usd`.
         await cur.execute(
             f"""
             WITH abandoned_usage AS (
@@ -304,7 +309,63 @@ async def reconcile_reservations_sql(
                     COALESCE(
                         SUM(dalton_cash_usd(cu.token_usage::jsonb, cu.total_credits, cu.infrastructure_credits, %s)),
                         0
-                    ) AS usage_usd
+                    ) AS usage_usd,
+                    COUNT(cu.conversation_usage_id) AS usage_rows,
+                    COALESCE(
+                        BOOL_AND(
+                            cu.conversation_usage_id IS NULL
+                            OR NOT COALESCE(cu.is_byok, FALSE)
+                            OR (
+                                cu.token_usage IS NOT NULL
+                                AND COALESCE(jsonb_typeof(cu.token_usage::jsonb -> 'per_call_costs') = 'array', FALSE)
+                            )
+                        ),
+                        FALSE
+                    ) AS all_byok_have_per_call_costs,
+                    NOT EXISTS (
+                        SELECT 1 FROM subagent_runs sr
+                        WHERE sr.parent_run_id = r.run_ref
+                          AND NOT (
+                              sr.status != 'in_progress'
+                              AND sr.cause = 'init'
+                              AND COALESCE(sr.replay_facts @> '{{"workflow_driver": true}}'::jsonb, FALSE)
+                          )
+                          AND (
+                              sr.usage_settled_at IS NULL
+                              OR NOT EXISTS (
+                                  SELECT 1 FROM conversation_usages scu
+                                  WHERE scu.conversation_response_id = r.run_ref
+                                    AND scu.msg_type = 'task'
+                                    AND scu.token_usage IS NOT NULL
+                                    AND scu.token_usage::jsonb ->> 'task_run_id' = sr.task_run_id::text
+                              )
+                          )
+                    ) AS all_direct_subagents_settled_with_usage,
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM subagent_runs drv
+                        JOIN subagent_runs child
+                            ON child.thread_id = drv.thread_id
+                           AND child.parent_run_id IS NULL
+                           AND child.replay_facts @> jsonb_build_object(
+                               'workflow_driver_run_id',
+                               drv.task_run_id::text
+                           )
+                        WHERE drv.parent_run_id = r.run_ref
+                          AND drv.status != 'in_progress'
+                          AND drv.cause = 'init'
+                          AND COALESCE(drv.replay_facts @> '{{"workflow_driver": true}}'::jsonb, FALSE)
+                          AND (
+                              child.status = 'in_progress'
+                              OR NOT EXISTS (
+                                  SELECT 1 FROM conversation_usages ccu
+                                  WHERE ccu.conversation_response_id = r.run_ref
+                                    AND ccu.msg_type = 'task'
+                                    AND ccu.token_usage IS NOT NULL
+                                    AND ccu.token_usage::jsonb ->> 'task_run_id' = child.task_run_id::text
+                              )
+                          )
+                    ) AS all_workflow_children_accounted
                 FROM dalton_budget_reservations r
                 LEFT JOIN conversation_usages cu
                     ON cu.conversation_response_id = r.run_ref
@@ -315,8 +376,23 @@ async def reconcile_reservations_sql(
             UPDATE dalton_budget_reservations r
             SET state = 'settled',
                 settled_at = NOW(),
-                settled_usd = GREATEST(r.reserved_usd, r.observed_usd, au.usage_usd),
-                settle_source = 'conservative'
+                settled_usd = CASE
+                    WHEN au.usage_rows > 0
+                     AND au.all_byok_have_per_call_costs
+                     AND au.all_direct_subagents_settled_with_usage
+                     AND au.all_workflow_children_accounted
+                    THEN GREATEST(r.observed_usd, au.usage_usd)
+                    ELSE GREATEST(r.reserved_usd, r.observed_usd, au.usage_usd)
+                END,
+                settle_source = CASE
+                    WHEN au.usage_rows > 0
+                     AND au.all_byok_have_per_call_costs
+                     AND au.all_direct_subagents_settled_with_usage
+                     AND au.all_workflow_children_accounted
+                     AND au.usage_usd >= r.observed_usd
+                    THEN 'usage'
+                    ELSE 'conservative'
+                END
             FROM abandoned_usage au,
                  conversation_responses cr
             WHERE r.reservation_id = au.reservation_id

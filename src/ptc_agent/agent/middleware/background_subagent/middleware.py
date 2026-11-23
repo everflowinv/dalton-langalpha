@@ -249,6 +249,8 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
         launch_tool_call_id: str,
         parent_run_id: str | None,
         acquire_fence: bool = True,
+        workflow_driver: bool = False,  # DALTON-HOOK(budget)
+        workflow_driver_run_id: str | None = None,  # DALTON-HOOK(budget)
     ) -> str:
         """Fence the task's namespace and bear its ledger row — everything an
         execution owes before its first spawn side effect. Returns the
@@ -301,6 +303,12 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
                 # one that launched it, which a workflow's child (no parent)
                 # carries too.
                 spending_run_id=parent_run_id or task.spawned_run_id,
+                **({"workflow_driver": True} if workflow_driver else {}),  # DALTON-HOOK(budget)
+                **(
+                    {"workflow_driver_run_id": workflow_driver_run_id}
+                    if workflow_driver_run_id
+                    else {}
+                ),  # DALTON-HOOK(budget)
             )
         except TaskRunRejected as e:
             logger.warning(

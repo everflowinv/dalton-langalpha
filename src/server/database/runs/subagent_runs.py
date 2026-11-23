@@ -152,6 +152,8 @@ async def start_task_run(
     cli_computer: Optional[str] = None,
     spending_run_id: Optional[str] = None,
     model_override: Optional[str] = None,
+    workflow_driver: bool = False,  # DALTON-HOOK(budget)
+    workflow_driver_run_id: Optional[str] = None,  # DALTON-HOOK(budget)
     conn=None,
 ) -> Dict[str, Any]:
     """The task-run START transaction: task upsert + in_progress run row +
@@ -195,6 +197,12 @@ async def start_task_run(
         **({"claude_code": True} if claude_code else {}),
         **(STORED_TURN if stored_token else {}),
         **({CLI_COMPUTER: cli_computer} if cli_computer else {}),
+        **({"workflow_driver": True} if workflow_driver else {}),  # DALTON-HOOK(budget)
+        **(
+            {"workflow_driver_run_id": str(workflow_driver_run_id)}
+            if workflow_driver_run_id
+            else {}
+        ),  # DALTON-HOOK(budget)
     }
 
     try:

@@ -480,6 +480,10 @@ ALLOWED_HOOKS=(
   # Standalone Core Batch 1a: unified profile resolution (everflow vs core) and
   # on-demand WebSearch registration when a search provider is available.
   "standalone-core"
+  # Durable workflow_driver / workflow_driver_run_id markers in subagent_runs.replay_facts
+  # and task_run_id on subagent conversation_usages rows so Dalton budget reconciliation
+  # drops the conservative floor only when every child's usage is confirmed persisted.
+  "budget"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
