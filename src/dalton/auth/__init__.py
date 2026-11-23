@@ -1,8 +1,8 @@
-"""Dalton Supabase authentication and email allowlist enforcement for OSS mode.
+"""Dalton authentication package (Supabase + standalone local account auth).
 
-Keeps ``HOST_MODE=oss`` intact (preserving LocalBudgetPort, ``.env`` provider keys,
-and non-commercial behavior) while verifying Supabase Bearer JWTs via upstream
-``_decode_token`` and enforcing ``DALTON_ALLOWED_EMAILS`` (fail-closed when empty).
+Preserves the full ``src.dalton.auth`` module surface for Everflow Supabase auth
+and exports unified startup validation, local auth, roles, sessions, bootstrap,
+and backend entry-point dispatch.
 """
 
 from __future__ import annotations
@@ -23,8 +23,11 @@ from fastapi.security import HTTPAuthorizationCredentials
 from src.dalton.invites import is_team_member
 from src.dalton.settings import (
     get_dalton_allowed_emails,
+    get_dalton_auth_mode,
     get_supabase_publishable_key,
+    is_dalton_local_auth_enabled,
     is_dalton_supabase_auth_enabled,
+    validate_dalton_auth_config,
 )
 from src.server.auth import jwt_bearer
 from src.server.auth.jwt_bearer import AuthInfo
@@ -540,14 +543,34 @@ async def resolve_caller_home_workspace_id(user_id: str) -> str:
 async def log_dalton_auth_startup_if_enabled(
     target_logger: logging.Logger | None = None,
 ) -> bool:
-    """Log Dalton Supabase auth startup status; returns True when Dalton auth is active."""
+    """Validate ``DALTON_AUTH_MODE`` at startup and log auth status.
+
+    Returns True when Dalton auth (``supabase`` or ``local``) is active, False for ``oss``.
+    Raises :class:`DaltonStartupConfigError` on invalid auth mode configuration.
+    """
     global _auth_settings_cache
+    validate_dalton_auth_config()
+
+    log = target_logger or logger
+    if is_dalton_local_auth_enabled():
+        svc_token = os.getenv("INTERNAL_SERVICE_TOKEN", "").strip()
+        if not is_dalton_service_token_valid(svc_token):
+            log.warning(
+                "HOST_MODE=oss, DALTON_AUTH_MODE=local: INTERNAL_SERVICE_TOKEN is empty "
+                "or shorter than %d characters (len=%d); service-token requests will be rejected.",
+                MIN_SERVICE_TOKEN_LEN,
+                len(svc_token),
+            )
+        log.info(
+            "HOST_MODE=oss, DALTON_AUTH_MODE=local: Dalton local account authentication is enabled."
+        )
+        return True
+
     if not is_dalton_supabase_auth_enabled():
         return False
 
     from src.config import settings as app_settings
 
-    log = target_logger or logger
     _auth_settings_cache = None
     has_error = False
 
@@ -602,6 +625,8 @@ async def log_dalton_auth_startup_if_enabled(
 __all__ = [
     "MIN_SERVICE_TOKEN_LEN",
     "authenticate_dalton_websocket",
+    "get_dalton_auth_mode",
+    "is_dalton_local_auth_enabled",
     "is_dalton_service_request",
     "is_dalton_service_token_valid",
     "is_dalton_supabase_auth_enabled",
@@ -609,6 +634,7 @@ __all__ = [
     "resolve_caller_home_workspace_id",
     "resolve_dalton_create_user_email",
     "resolve_dalton_sync_email",
+    "validate_dalton_auth_config",
     "verify_dalton_bearer",
     "verify_dalton_optional_bearer",
     "verify_dalton_token",

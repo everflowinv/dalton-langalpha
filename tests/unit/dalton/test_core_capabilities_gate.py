@@ -1155,6 +1155,9 @@ class TestSetupBackgroundLoopsGate:
         """Round 3 Item 3 (codex med 6): execute real setup.lifespan and capture actual asyncio.create_task launches."""
         # A single worker skips the multi-worker writer guard this test does not set up.
         monkeypatch.delenv("LANGALPHA_WORKERS", raising=False)
+        # Core installs sign in with local accounts, whose startup check needs a signing secret.
+        monkeypatch.setenv("JWT_SIGNING_SECRET", "test-signing-secret-0123456789abcdef0123456789")
+        monkeypatch.setenv("DALTON_TRANSCRIPTION_TICKET_SECRET", "test-ticket-secret-0123456789abcdef0123456789")
         fake_conn = create_autospec(psycopg.AsyncConnection, instance=True)
 
         @asynccontextmanager

@@ -216,8 +216,9 @@ async def verify_jwt_token(
         reject_company_system_auth(resolved)
         return resolved
     if HOST_MODE == "oss":
-        reject_company_system_auth(LOCAL_DEV_USER_ID)
-        return LOCAL_DEV_USER_ID
+        # DALTON-HOOK(standalone-core): dispatch OSS/local Bearer JWT verification
+        from src.dalton.auth.dispatch import dispatch_oss_jwt_user_id
+        return await dispatch_oss_jwt_user_id(credentials, local_dev_user_id=LOCAL_DEV_USER_ID)
     if credentials is None:
         raise HTTPException(status_code=401, detail="Missing Bearer token")
     resolved = (await _decode_token(credentials.credentials)).user_id
@@ -242,8 +243,9 @@ async def get_current_auth_info(
         reject_company_system_auth(info.user_id)
         return info
     if HOST_MODE == "oss":
-        reject_company_system_auth(LOCAL_DEV_USER_ID)
-        return AuthInfo(user_id=LOCAL_DEV_USER_ID)
+        # DALTON-HOOK(standalone-core): dispatch OSS/local AuthInfo verification
+        from src.dalton.auth.dispatch import dispatch_oss_auth_info
+        return await dispatch_oss_auth_info(credentials, local_dev_user_id=LOCAL_DEV_USER_ID)
     if credentials is None:
         raise HTTPException(status_code=401, detail="Missing Bearer token")
     info = await _decode_token(credentials.credentials)

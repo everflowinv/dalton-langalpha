@@ -47,11 +47,10 @@ def background_dispatch_requires_token() -> bool:
     Internal background dispatch is rejected with 403 in that state, so callers
     must not fire one. In oss mode the self-dispatch is trusted without a token.
     """
-    # DALTON-HOOK(dalton-auth): require valid INTERNAL_SERVICE_TOKEN for background dispatch when Dalton auth is enabled
-    from src.dalton.auth import is_dalton_service_token_valid, is_dalton_supabase_auth_enabled
-
-    if is_dalton_supabase_auth_enabled():
-        return not is_dalton_service_token_valid(os.environ.get("INTERNAL_SERVICE_TOKEN", ""))
+    # DALTON-HOOK(standalone-core): require valid INTERNAL_SERVICE_TOKEN for background dispatch in supabase & local auth modes
+    from src.dalton.auth.dispatch import background_dispatch_requires_token_override
+    if (override := background_dispatch_requires_token_override()) is not None:
+        return override
     return HOST_MODE != "oss" and not os.environ.get("INTERNAL_SERVICE_TOKEN", "").strip()
 
 

@@ -16,7 +16,7 @@ from psycopg.rows import dict_row
 from src.server.database.pool import get_db_connection
 from src.server.database.encryption import get_encryption_key
 from src.server.database.sql_fences import advisory_key
-from src.dalton.credentials import credential_user_id  # DALTON-HOOK(team-credentials): resolve shared team credential holder
+from src.dalton.credentials import credential_user_id, credential_write_tx, resolve_credential_write_holder  # DALTON-HOOK(team-credentials): resolve shared team credential holder (standalone-core transactional write check)
 
 logger = logging.getLogger(__name__)
 
@@ -79,38 +79,40 @@ async def upsert_oauth_tokens(
     Fresh tokens are a working connection, so this also clears a needs-reauth
     flag: a connect and a successful refresh both come through here.
     """
-    actor_user_id, user_id = user_id, credential_user_id(user_id)  # DALTON-HOOK(team-credentials): write to team credential holder
+    actor_user_id = user_id
     enc_key = get_encryption_key()
-    async with _connection(conn) as db, db.cursor() as cur:
-        await cur.execute(
-            """
-            INSERT INTO user_oauth_tokens
-                (user_id, provider, access_token, refresh_token,
-                 account_id, email, plan_type, expires_at, created_at, updated_at)
-            VALUES
-                (%s, %s, pgp_sym_encrypt(%s, %s), pgp_sym_encrypt(%s, %s),
-                 %s, %s, %s, %s, NOW(), NOW())
-            ON CONFLICT (user_id, provider) DO UPDATE SET
-                access_token  = EXCLUDED.access_token,
-                refresh_token = EXCLUDED.refresh_token,
-                account_id    = EXCLUDED.account_id,
-                email         = EXCLUDED.email,
-                plan_type     = EXCLUDED.plan_type,
-                expires_at    = EXCLUDED.expires_at,
-                needs_reauth_at = NULL,
-                last_error_code = NULL,
-                updated_at    = NOW()
-            """,
-            (
-                user_id, provider,
-                access_token, enc_key,
-                refresh_token, enc_key,
-                account_id, email, plan_type, expires_at,
-            ),
-        )
-        logger.debug(
-            f"[oauth_tokens] upsert user_id={actor_user_id} credential_user_id={user_id} provider={provider}"  # DALTON-HOOK(team-credentials)
-        )
+    async with _connection(conn) as db, credential_write_tx(db, external_conn=conn):  # DALTON-HOOK(standalone-core): hold transaction across holder/admin lock and OAuth upsert
+        user_id = await resolve_credential_write_holder(actor_user_id, conn=db)  # DALTON-HOOK(standalone-core): pin team holder and admin role inside OAuth write transaction
+        async with db.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO user_oauth_tokens
+                    (user_id, provider, access_token, refresh_token,
+                     account_id, email, plan_type, expires_at, created_at, updated_at)
+                VALUES
+                    (%s, %s, pgp_sym_encrypt(%s, %s), pgp_sym_encrypt(%s, %s),
+                     %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (user_id, provider) DO UPDATE SET
+                    access_token  = EXCLUDED.access_token,
+                    refresh_token = EXCLUDED.refresh_token,
+                    account_id    = EXCLUDED.account_id,
+                    email         = EXCLUDED.email,
+                    plan_type     = EXCLUDED.plan_type,
+                    expires_at    = EXCLUDED.expires_at,
+                    needs_reauth_at = NULL,
+                    last_error_code = NULL,
+                    updated_at    = NOW()
+                """,
+                (
+                    user_id, provider,
+                    access_token, enc_key,
+                    refresh_token, enc_key,
+                    account_id, email, plan_type, expires_at,
+                ),
+            )
+            logger.debug(
+                f"[oauth_tokens] upsert user_id={actor_user_id} credential_user_id={user_id} provider={provider}"  # DALTON-HOOK(team-credentials)
+            )
     # A lock holder drops it once its transaction commits.
     if conn is None:
         await invalidate_oauth_active_cache(user_id)
@@ -205,15 +207,17 @@ async def get_oauth_tokens(
 
 async def delete_oauth_tokens(user_id: str, provider: str, conn=None) -> None:
     """Remove OAuth tokens for a provider."""
-    actor_user_id, user_id = user_id, credential_user_id(user_id)  # DALTON-HOOK(team-credentials): delete from team credential holder
-    async with _connection(conn) as db, db.cursor() as cur:
-        await cur.execute(
-            "DELETE FROM user_oauth_tokens WHERE user_id = %s AND provider = %s",
-            (user_id, provider),
-        )
-        logger.info(
-            f"[oauth_tokens] deleted user_id={actor_user_id} credential_user_id={user_id} provider={provider}"  # DALTON-HOOK(team-credentials)
-        )
+    actor_user_id = user_id
+    async with _connection(conn) as db, credential_write_tx(db, external_conn=conn):  # DALTON-HOOK(standalone-core): hold transaction across holder/admin lock and OAuth delete
+        user_id = await resolve_credential_write_holder(actor_user_id, conn=db, for_disconnect=True)  # DALTON-HOOK(standalone-core): pin team holder and admin role inside OAuth delete transaction
+        async with db.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM user_oauth_tokens WHERE user_id = %s AND provider = %s",
+                (user_id, provider),
+            )
+            logger.info(
+                f"[oauth_tokens] deleted user_id={actor_user_id} credential_user_id={user_id} provider={provider}"  # DALTON-HOOK(team-credentials)
+            )
     # A lock holder drops it once its transaction commits.
     if conn is None:
         await invalidate_oauth_active_cache(user_id)

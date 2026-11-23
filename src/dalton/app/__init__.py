@@ -21,5 +21,7 @@ dalton_router.include_router(_transcriptions_router)
 dalton_router.include_router(_chat_uploads_router)
 # DALTON-HOOK(monitors): include monitor panel router on dalton_router
 dalton_router.include_router(_monitors_router)
+from src.dalton.auth.local_router import register_local_auth_routers
+register_local_auth_routers(dalton_router)
 
 __all__ = ["dalton_router"]

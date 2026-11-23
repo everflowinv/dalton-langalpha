@@ -14,7 +14,6 @@ from src.config.settings import get_sse_keepalive_interval
 from src.server.utils.api import (
     CurrentUserId,
     database_unavailable,
-    service_token_matches,
 )
 from src.server.models.chat import ChatRequest
 from src.server.models.workflow import RetryRequest
@@ -349,7 +348,9 @@ def _is_service_request(raw_request: Request | None) -> bool:
     sent = raw_request.headers.get("X-Service-Token", "") if raw_request else ""
     if is_dalton_supabase_auth_enabled():
         return is_dalton_service_request(sent, token)
-    return service_token_matches(sent, token) or (HOST_MODE == "oss" and not token)
+    # DALTON-HOOK(standalone-core): dispatch service-request check for local/oss auth modes
+    from src.dalton.auth.dispatch import dispatch_oss_service_request
+    return dispatch_oss_service_request(sent, token, host_mode=HOST_MODE)
 
 
 # Fields only the server's own requests set. A user's copy would post a system
@@ -548,7 +549,6 @@ async def _handle_send_message(
         # a paying user to set one up sends them to the setup wizard for it.
         # DALTON-HOOK(automation-subscription-fallback): resolve service-auth flags ahead of the flagged-subscription gate
         from src.config.settings import HOST_MODE
-        from src.dalton.auth import is_dalton_supabase_auth_enabled
 
         _req_token = (raw_request.headers.get("X-Service-Token", "") if raw_request else "")
         _svc_token = _get_service_token()
@@ -556,15 +556,10 @@ async def _handle_send_message(
         is_dispatch = bool(
             raw_request and raw_request.headers.get("X-Dispatch") == "background"
         )
-        from_service = (
-            is_internal
-            if is_dalton_supabase_auth_enabled()
-            else service_token_matches(_req_token, _svc_token)
-        ) or is_dispatch
-        is_server_retry = (
-            is_internal
-            if is_dalton_supabase_auth_enabled()
-            else (service_token_matches(_req_token, _svc_token) or is_dispatch)
+        # DALTON-HOOK(standalone-core): reuse unified strict service-token check for from_service and is_server_retry
+        from src.dalton.auth.dispatch import resolve_messaging_service_flags
+        from_service, is_server_retry = resolve_messaging_service_flags(
+            is_internal=is_internal, is_dispatch=is_dispatch, sent_token=_req_token, configured_token=_svc_token
         )
 
         flagged_subscription: tuple[object, str | None] | None = None
@@ -960,15 +955,27 @@ async def _handle_send_message(
     )
 
     if not is_dispatch:
+        from src.dalton.auth.dispatch import make_prestart_chat_cleanup, wrap_local_sse_stream  # DALTON-HOOK(standalone-core): recheck local session <=30s and clean up prestart upload claims on initial reject
         return SetupKeepaliveResponse(
-            end_after_failure_frame(
-                observe_chat_stream(
-                    gen,
-                    model=_model,
+            wrap_local_sse_stream(  # DALTON-HOOK(standalone-core): terminate live chat stream promptly on local session revocation
+                end_after_failure_frame(
+                    observe_chat_stream(
+                        gen,
+                        model=_model,
+                        user_id=user_id,
+                        workspace_id=workspace_id,
+                        thread_id=thread_id,
+                    )
+                ),
+                raw_request,
+                user_id,
+                on_initial_reject=make_prestart_chat_cleanup(  # DALTON-HOOK(standalone-core): release provisional upload claims and burst slot if initial session recheck rejects
                     user_id=user_id,
-                    workspace_id=workspace_id,
-                    thread_id=thread_id,
-                )
+                    upload_claim_key=upload_claim_key,
+                    request_key=request.request_key,
+                    additional_context=request.additional_context,
+                    release_slot=scope.release_slot,
+                ),
             ),
             media_type="text/event-stream",
             headers=sse_headers_with_loc,
@@ -1249,6 +1256,7 @@ async def reconnect_to_stream(
     last_event_id: Optional[int] = Query(None, description="Last received event ID"),
     last_event_id_header: Optional[str] = Header(None, alias="Last-Event-ID"),
     run_id: Optional[str] = Query(None, description="Specific run to reconnect to"),
+    request: Request = None,
 ):
     """Reconnect to a running or completed workflow's SSE stream.
 
@@ -1256,6 +1264,8 @@ async def reconnect_to_stream(
     latest run on the thread (matches the single-turn happy path).
     """
     watch = ThreadWatch.of(thread_id, x_user_id, await thread_access(thread_id, x_user_id))
+    from src.dalton.auth.dispatch import create_local_sse_session_watch  # DALTON-HOOK(standalone-core): recheck local session on established SSE stream
+    local_sse_watch = create_local_sse_session_watch(request, x_user_id)  # DALTON-HOOK(standalone-core): bind local session watch to reconnect stream
     from src.server.handlers.chat import reconnect_to_workflow_stream
     from src.server.handlers.chat.reconnect_admission import classify_reconnect
 
@@ -1281,6 +1291,8 @@ async def reconnect_to_stream(
                 # reconnect then meets the route's refusal.
                 if watch and not await watch.ok():
                     return
+                if local_sse_watch and not await local_sse_watch.ok():  # DALTON-HOOK(standalone-core): stop reconnect stream on local session revocation
+                    return
                 yield event
         except Exception as e:
             logger.error(f"[PTC_RECONNECT] Error: {e}", exc_info=True)
@@ -1296,7 +1308,7 @@ async def reconnect_to_stream(
 
 
 @router.get("/{thread_id}/watch")
-async def watch_thread(thread_id: str, x_user_id: ReadUserId):
+async def watch_thread(thread_id: str, x_user_id: ReadUserId, request: Request = None):
     """Watch for new workflow activity on a thread via SSE + Redis pub/sub.
 
     Opens a lightweight SSE connection that emits a ``workflow_started`` event
@@ -1310,6 +1322,8 @@ async def watch_thread(thread_id: str, x_user_id: ReadUserId):
     to prevent leaked connections from abandoned browser tabs.
     """
     access_watch = ThreadWatch.of(thread_id, x_user_id, await thread_access(thread_id, x_user_id))
+    from src.dalton.auth.dispatch import create_local_sse_session_watch  # DALTON-HOOK(standalone-core): recheck local session on established thread watch SSE
+    local_sse_watch = create_local_sse_session_watch(request, x_user_id)  # DALTON-HOOK(standalone-core): bind local session watch to thread watch
 
     from src.utils.cache.redis_cache import get_cache_client
     from src.server.services.report_back.handoff.core import watch_wakes
@@ -1325,6 +1339,9 @@ async def watch_thread(thread_id: str, x_user_id: ReadUserId):
                 if access_watch and not await access_watch.ok(
                     force=not frame.startswith(": ping")
                 ):
+                    yield "event: timeout\ndata: {}\n\n"
+                    return
+                if local_sse_watch and not await local_sse_watch.ok(force=not frame.startswith(": ping")):  # DALTON-HOOK(standalone-core): stop watch stream on local session revocation
                     yield "event: timeout\ndata: {}\n\n"
                     return
                 yield frame
@@ -2088,6 +2105,7 @@ async def thread_stream_mux_endpoint(
             "by an `attached` control frame"
         ),
     ),
+    request: Request = None,
 ):
     """Multiplexed thread stream: every lane of the thread on one socket.
 
@@ -2100,18 +2118,24 @@ async def thread_stream_mux_endpoint(
         raise HTTPException(
             status_code=400, detail="unsupported stream contract; use contract=v2"
         )
+    from src.dalton.auth.dispatch import wrap_local_sse_stream  # DALTON-HOOK(standalone-core): recheck local session <=30s on multiplexed thread stream
     from src.server.handlers.chat.thread_stream_mux_v2 import (
         parse_mux_cursors_v2,
         stream_thread_mux_v2,
     )
 
     return StreamingResponse(
-        stream_thread_mux_v2(
-            thread_id,
-            parse_mux_cursors_v2(cursors),
-            since_age_s,
-            open_turn=open_turn,
-            watch=ThreadWatch.of(thread_id, x_user_id, access),
+        wrap_local_sse_stream(  # DALTON-HOOK(standalone-core): terminate multiplexed thread stream on local session revocation
+            stream_thread_mux_v2(
+                thread_id,
+                parse_mux_cursors_v2(cursors),
+                since_age_s,
+                open_turn=open_turn,
+                watch=ThreadWatch.of(thread_id, x_user_id, access),
+            ),
+            request,
+            x_user_id,
+            timeout_frame="event: timeout\ndata: {}\n\n",
         ),
         media_type="text/event-stream",
         headers=SSE_HEADERS,

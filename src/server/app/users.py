@@ -142,9 +142,11 @@ async def get_cli_auth():
     from src.server.auth.oauth_resource import oauth_resource_enabled
     from src.server.services.cli_tokens import SCOPES
 
+    from src.dalton.auth.dispatch import is_cli_auth_required  # DALTON-HOOK(standalone-core): report auth_required=True in local auth mode
+
     signs_in = oauth_resource_enabled() and bool(OAUTH_CLI_CLIENT_ID)
     return CliAuthResponse(
-        auth_required=HOST_MODE != "oss",
+        auth_required=is_cli_auth_required(host_mode=HOST_MODE),  # DALTON-HOOK(standalone-core): local mode requires authentication even under HOST_MODE=oss
         issuer=OAUTH_RESOURCE_ISSUER if signs_in else None,
         client_id=OAUTH_CLI_CLIENT_ID if signs_in else None,
         scopes=[] if AUTH_SERVICE_URL else list(SCOPES),
