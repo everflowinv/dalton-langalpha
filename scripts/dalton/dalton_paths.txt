@@ -547,3 +547,10 @@ tests/unit/tools/secretary/test_workspace_settings_tools.py
 # Standalone Core Batch 1a: on-demand WebSearch registration & search provider availability tests.
 tests/unit/ptc_agent/agent/test_web_search_registration.py
 tests/unit/tools/web/test_search_availability.py
+# Standalone Core Batch 1c: fake OpenAI Responses API server, header echo, CI compose,
+# standalone check framework, E2E workflow, and release packaging script.
+docker-compose.ci.yml
+.github/workflows/standalone-core-e2e.yml
+scripts/standalone/
+tests/fakes/
+tests/standalone/

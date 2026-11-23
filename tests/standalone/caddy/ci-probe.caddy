@@ -1,0 +1,13 @@
+# CI-only probe route mounted into edge at /etc/caddy/extra/ci-probe.caddy
+# by docker-compose.ci.yml. Mirrors the exact internal-header stripping rules
+# of deploy/standalone/Caddyfile so tests can assert X-Service-Token and
+# X-User-Id never reach upstream services through the public edge.
+@ci_probe path /__probe /__probe/*
+handle @ci_probe {
+	request_header -X-Service-Token
+	request_header -X-User-Id
+	reverse_proxy header-echo:8098 {
+		header_up -X-Service-Token
+		header_up -X-User-Id
+	}
+}
