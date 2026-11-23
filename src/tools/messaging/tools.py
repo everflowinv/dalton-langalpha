@@ -68,7 +68,9 @@ def messaging_enabled() -> bool:
     Read at build time, per turn, so the tools appear and disappear with the
     deployment's configuration rather than with anything a request says.
     """
-    return bool(env.CHANNEL_GATEWAY_URL and _service_token().strip())
+    from src.dalton.capabilities import is_messaging_gateway_allowed  # DALTON-HOOK(standalone-core)
+
+    return bool(env.CHANNEL_GATEWAY_URL and _service_token().strip() and is_messaging_gateway_allowed())
 
 
 _shared_client: httpx.AsyncClient | None = None
@@ -336,6 +338,10 @@ async def gateway_request(
     status, so a caller with statuses of its own (a version conflict, a list
     of problems) reads them. Raises ``GatewayError`` when no answer came back
     or the gateway refused this server's token."""
+    from src.dalton.capabilities import is_messaging_gateway_allowed  # DALTON-HOOK(standalone-core)
+
+    if not is_messaging_gateway_allowed():
+        raise GatewayError("The messaging service is disabled in this deployment.", delivered_unknown=False)
     headers = {"X-Service-Token": _service_token(), "X-User-Id": str(user_id)}
     url = f"{env.CHANNEL_GATEWAY_URL}{path}"
     try:

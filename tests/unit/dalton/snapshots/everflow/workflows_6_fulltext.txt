@@ -1,0 +1,3947 @@
+===== WORKFLOW: bullbear-doc =====
+--- FILE: bullbear-doc/contract.json ---
+{
+  "name": "bullbear-doc",
+  "description": "bull/bear v4.2 完整成稿的完成契约：准备 + 股东回报支线 + 主稿 + 合并 + 独立审稿 + 修订（对应 dalton-bullbear SKILL 的交付物）。",
+  "draft": "drafts/{as_of}-bullbear.md",
+  "params_required": [
+    "ticker",
+    "workspace_dir",
+    "as_of"
+  ],
+  "stages": [
+    {
+      "name": "准备",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-bullbear/anchors.json",
+          "min_bytes": 50
+        },
+        {
+          "path": "research/{as_of}-bullbear/fincheck.md",
+          "min_bytes": 100
+        },
+        {
+          "path": "research/{as_of}-bullbear/consensus.md",
+          "min_bytes": 100
+        },
+        {
+          "path": "research/{as_of}-bullbear/price.md",
+          "min_bytes": 50
+        }
+      ]
+    },
+    {
+      "name": "股东回报支线",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-bullbear/return.md",
+          "min_bytes": 100
+        },
+        {
+          "path": "research/{as_of}-bullbear/return_appendix.md",
+          "min_bytes": 50
+        },
+        {
+          "path": "research/{as_of}-bullbear/return_summary.md",
+          "min_bytes": 50
+        }
+      ]
+    },
+    {
+      "name": "主稿",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-bullbear/main.md",
+          "min_bytes": 500
+        }
+      ]
+    },
+    {
+      "name": "合并成稿",
+      "artifacts": [
+        {
+          "path": "drafts/{as_of}-bullbear.md",
+          "min_bytes": 500
+        }
+      ],
+      "validators": [
+        {
+          "command": "python .agents/skills/dalton-bullbear/scripts/bb_check.py drafts/{as_of}-bullbear.md",
+          "pass_when": "exit_zero",
+          "description": "v4.2 格式检查 0 WARN"
+        }
+      ]
+    },
+    {
+      "name": "独立审稿与修订",
+      "review": {
+        "agent": "dalton-reviewer",
+        "verdicts": [
+          "pass"
+        ],
+        "manual_sidecar": "research/{as_of}-bullbear/review.json"
+      }
+    }
+  ],
+  "closing": {
+    "knowledge_docs": [
+      "debate",
+      "drivers"
+    ],
+    "knowledge_source": "tool",
+    "verdict_kinds_any": [
+      "NO_CHANGE",
+      "THESIS_STRENGTHENED",
+      "THESIS_WEAKENED",
+      "THESIS_BROKEN",
+      "NEW_THESIS"
+    ],
+    "check_draft": {
+      "draft": "drafts/{as_of}-bullbear.md",
+      "required": false
+    },
+    "language_review": {
+      "draft": "drafts/{as_of}-bullbear.md"
+    }
+  }
+}
+
+--- FILE: bullbear-doc/workflow.js ---
+export const meta = {
+  name: 'bullbear-doc',
+  description: 'Dalton bull/bear v4.2 完整成稿：回报支线 + 主稿 + 格式检查 + 独立审稿',
+}
+
+const W = args.workspace_dir || '.'
+const T = args.ticker
+const C = args.company || T
+const D = args.as_of
+const days = args.research_days || 92
+const runDir = `${W}/research/${D}-bullbear`
+const S = '.agents/skills/dalton-bullbear'
+// A1 同类：SKILL 声明的 market（与可选的 revision_brief 文件路径）随 conv 进
+// 每个子任务。
+const pmAsks = []
+if (args.pm_question) pmAsks.push(String(args.pm_question))
+if (args.revision_brief) pmAsks.push(`本轮必须修正的事项见 ${args.revision_brief}（先读该文件）`)
+const pmSection = pmAsks.length ? ` PM 的问题 / 本轮必须修正的事项：${pmAsks.join('；')}。` : ''
+const conv = `先读 .agents/skills/dalton-conventions/SKILL.md 与 ${S}/SKILL.md、${S}/references/v42-structure.md；市场 ${args.market || 'US'}。${pmSection}`
+
+const PREP_SCHEMA = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+    summary: { type: 'string', minLength: 1 },
+    gaps: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['files', 'summary'],
+}
+
+const FILES_SCHEMA = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+    summary: { type: 'string', minLength: 1 },
+    sha256: { type: 'string', minLength: 64 },
+    gaps: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['files'],
+}
+
+const DRAFT_SCHEMA = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+    summary: { type: 'string', minLength: 1 },
+    warns: { type: 'number' },
+    gaps: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['files', 'summary'],
+}
+
+const VERDICT = {
+  type: 'object',
+  properties: {
+    verdict: { type: 'string', enum: ['pass', 'revise', 'block'] },
+    summary: { type: 'string', minLength: 1 },
+    must_fix: { type: 'array', items: { type: 'string', minLength: 1 } },
+    // items 元素的键（check/result/reason/lines）由 dalton-reviewer 的提示词契约约束，
+    // 结构深度保持在平台 schema_max_depth 限制内（元素键不展开为 schema 节点）。
+    items: { type: 'array', items: { type: 'object' } },
+  },
+  required: ['verdict', 'summary', 'items'],
+}
+
+const HASH = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+  },
+  required: ['files'],
+}
+const verdictOf = (r) => {
+  // pass 但 must_fix 非空按 revise 处理，与服务端 publish/review.py 的规则一致
+  //（提示词第 1 批第 2 轮 #2）。
+  if (r && typeof r === 'object' && r.verdict === 'pass' && Array.isArray(r.must_fix) && r.must_fix.length) {
+    return 'revise'
+  }
+  return r && typeof r === 'object' ? r.verdict : null
+}
+// 审稿结果与 dalton-reviewer 提示词、服务端发布审稿（publish/review.py）同一契约：
+// items 必须逐项覆盖 1–9 项检查；缺项的结果不可作为 verdict 使用（fail-closed）。
+const REVIEW_CHECKS = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+const completeReview = (r) => {
+  if (!r || typeof r !== 'object') return false
+  const items = Array.isArray(r.items) ? r.items : []
+  const done = new Set()
+  for (const it of items) {
+    if (
+      it &&
+      typeof it === 'object' &&
+      Number.isInteger(it.check) &&
+      it.check >= 1 &&
+      it.check <= 9 &&
+      (it.result === 'pass' || it.result === 'revise')
+    ) {
+      done.add(it.check)
+    }
+  }
+  return REVIEW_CHECKS.every((c) => done.has(c))
+}
+const FILES_DRAFT = { ...FILES_SCHEMA, required: ['files', 'sha256'] }
+const FIXED_SCHEMA = {
+  ...DRAFT_SCHEMA,
+  properties: { ...DRAFT_SCHEMA.properties, sha256: { type: 'string', minLength: 64 } },
+  required: ['files', 'summary', 'sha256'],
+}
+const shaOf = (r) =>
+  r && typeof r === 'object' && typeof r.sha256 === 'string' && /^[0-9a-f]{64}$/.test(r.sha256)
+    ? r.sha256
+    : null
+
+// B1：支线产物缺失判定（各 workflow 同一实现；workflow 之间没有共用 js 模块的
+// 机制，改动需同步全部 workflow.js）。子任务返回 null、files/file 为空、或（经
+// 只读核验子任务确认）声明的产物文件不存在/为空（0 字节或只有空白），都算缺失；
+// workflow 自己碰不到文件系统，最后一项由支线核验子任务在盘上确认。
+const branchArtifacts = (v) => {
+  if (v === null || typeof v !== 'object') return []
+  const out = []
+  if (typeof v.file === 'string' && v.file.trim()) out.push(v.file.split('|', 1)[0].trim())
+  for (const f of Array.isArray(v.files) ? v.files : []) {
+    if (typeof f === 'string' && f.trim()) out.push(f.split('|', 1)[0].trim())
+  }
+  return out.filter(Boolean)
+}
+const PROBE_OUT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+  },
+  required: ['files'],
+}
+// 返回每个路径的 "<路径>|ok" / "<路径>|missing"；结果不完整（漏路径、格式不对）
+// 一律算核验失败（fail-closed），返回 null。paths 的每一项可以是路径或
+// [路径, 最小字节数]（契约 min_bytes；缺省 1，即非空白即可）。
+const probeBranchFiles = async (paths) => {
+  const entries = paths.map((p) => (Array.isArray(p) ? p : [p, 1]))
+  const r = await agent(
+    `只读核验以下支线产物文件是否存在、非空白且达到字节数下限（不写任何文件）。逐个执行 bash：f='<路径>'；n=<字节数下限>；test -e "$f" && [ "$(wc -c < "$f")" -ge "$n" ] && [ -n "$(tr -d '[:space:]' < "$f")" ] && echo "$f|ok" || echo "$f|missing"。返回 files 数组：每项为上述一行的原样输出（<路径>|ok 或 <路径>|missing）：\n${entries
+      .map(([p, min]) => `- ${p}（至少 ${min} 字节）`)
+      .join('\n')}`,
+    { agentType: 'dalton-evidence', label: '支线核验', phase: '股东回报支线', schema: PROBE_OUT, checkFiles: false }
+  )
+  if (r === null || typeof r !== 'object' || !Array.isArray(r.files)) return null
+  const answered = new Set()
+  for (const entry of r.files) {
+    if (typeof entry !== 'string') return null
+    const bar = entry.lastIndexOf('|')
+    const path = bar > 0 ? entry.slice(0, bar) : ''
+    const verdict = bar > 0 ? entry.slice(bar + 1) : ''
+    if (!path || (verdict !== 'ok' && verdict !== 'missing')) return null
+    answered.add(path)
+  }
+  if (entries.some(([p]) => !answered.has(p))) return null
+  return r.files
+}
+// B1 共用出口：缺失（含全部缺失）与核验失败都停在主稿之前，文案与审稿 block
+// 一致，主线程补数后用原参数 resume 重跑（已完派发按 journal 复用）。
+const RESUME_HINT = '用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，缺失支线重新派发（其提示词已写明“若目标文件已存在，先读并核对，缺什么补什么”）'
+
+phase('准备')
+const prep = await agent(
+  `${conv}
+为 ${C}（${T}）准备 bull/bear 成稿的底稿，写到 ${runDir}/：
+1) 跑 .agents/skills/dalton-financial-lenses/scripts/anchors.py 锁定市值与汇率 → ${runDir}/anchors.json；
+2) 跑 ${S}/scripts/fincheck.py → ${runDir}/fincheck.md；
+3) 取一致预期快照（存 ${W}/data/consensus/）+ 跑 ${S}/scripts/implied_model.py → ${runDir}/consensus.md；
+4) 价格锚（收盘价、日期、来源）→ ${runDir}/price.md。
+返回各文件路径与一句话摘要。`,
+  { agentType: 'dalton-evidence', label: `${T} 准备`, phase: '准备', schema: PREP_SCHEMA }
+)
+
+phase('股东回报支线')
+const ret =
+  prep === null
+    ? null
+    : await agent(
+        `${conv}
+按 ${S}/references/return-branch.md 与 .agents/skills/dalton-financial-lenses/references/shareholder-return.md 写股东回报第一节（≤40 行）、附录（≤30 行）和 5 条摘要，
+分母统一用 ${runDir}/anchors.json，评分必须用 .agents/skills/dalton-financial-lenses/scripts/return_score.py 计算。
+输出 ${runDir}/return.md、${runDir}/return_appendix.md、${runDir}/return_summary.md。若目标文件已存在，先读并核对，缺什么补什么，不必推倒重写。`,
+        { agentType: 'dalton-evidence', label: `${T} 股东回报`, phase: '股东回报支线', schema: FILES_SCHEMA }
+      )
+
+// B1：contract 把准备四件与股东回报三件都列为必交（min_bytes 见各项）。任一缺失
+// （null、files 为空、或核验发现在盘缺失/过小，含全部缺失）都停在主稿之前，
+// 出口与审稿 block 同一段文案。
+const prepPaths = [
+  [`${runDir}/anchors.json`, 50],
+  [`${runDir}/fincheck.md`, 100],
+  [`${runDir}/consensus.md`, 100],
+  [`${runDir}/price.md`, 50],
+]
+const retPaths = [
+  [`${runDir}/return.md`, 100],
+  [`${runDir}/return_appendix.md`, 50],
+  [`${runDir}/return_summary.md`, 50],
+]
+const gateBranches = [
+  ['准备', prep, prepPaths],
+  ['股东回报', ret, retPaths],
+]
+const gateMissing = gateBranches
+  .filter(([, v]) => branchArtifacts(v).length === 0)
+  .map(([name]) => name)
+const toProbe = gateBranches
+  .filter(([name]) => !gateMissing.includes(name))
+  .flatMap(([, , ps]) => ps)
+if (toProbe.length) {
+  const byPath = new Map(gateBranches.flatMap(([name, , ps]) => ps.map(([p]) => [p, name])))
+  const probe = await probeBranchFiles(toProbe)
+  if (probe === null) {
+    return {
+      ok: false,
+      blocked: '支线核验子任务失败，无法确认支线产物在盘',
+      incomplete: [
+        '支线核验子任务失败（无法确认产物文件存在且非空），已停在主稿之前；请重试或补数后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑',
+      ],
+      resume_hint: '用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，失败支线重新派发',
+    }
+  }
+  for (const entry of probe) {
+    if (!entry.endsWith('|missing')) continue
+    const name = byPath.get(entry.slice(0, -'|missing'.length))
+    if (name && !gateMissing.includes(name)) gateMissing.push(name)
+  }
+}
+if (gateMissing.length) {
+  const absent = gateBranches
+    .filter(([name]) => gateMissing.includes(name))
+    .flatMap(([, , ps]) => ps.map(([p]) => p))
+    .join('、')
+  return {
+    ok: false,
+    blocked: `关键支线缺失：${gateMissing.join('、')}（${absent} 不存在、为空或过小）`,
+    incomplete: [
+      `关键支线缺失：${gateMissing.join('、')}，已停在主稿之前；补齐缺失产物后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用`,
+    ],
+    resume_hint: RESUME_HINT,
+  }
+}
+
+phase('主稿')
+const main = await agent(
+  `${conv}
+写 ${C}（${T}）Bull/Bear Discussion 主稿到 ${runDir}/main.md，严格按 v4.2 结构（${S}/references/v42-structure.md 与 ${S}/references/ai-revenue-rules.md）。
+研究窗口 ${days} 天（截至 ${D}）。股东回报只引用 ${runDir}/return_summary.md，预留 <!-- INSERT:return --> 与 <!-- INSERT:return_appendix --> 占位，不自行重算。
+${args.prior_draft ? `上一版：${args.prior_draft}，“我的判断”有变化要写明原因。` : ''}
+必须检索：内部库（sales-notes、tmtb、funda-ai）、company-wiki（只读）、AlphaEngine（foreign_report、sell_side_comment、meeting_minutes 分开搜）、Guidepoint（英文检索，原话 ≤20 英文词）、最新 filing 与电话会。
+写完跑 python ${S}/scripts/bb_check.py ${runDir}/main.md，直到 0 WARN。`,
+  { agentType: 'general-purpose', label: `${T} 主稿`, phase: '主稿', schema: DRAFT_SCHEMA }
+)
+
+phase('合并与审稿')
+const merged =
+  main === null
+    ? null
+    : await agent(
+        `合并 ${runDir}/main.md 与回报支线文件（把 ${runDir}/return.md 插到 <!-- INSERT:return -->，把 ${runDir}/return_appendix.md 插到 <!-- INSERT:return_appendix -->）→ ${W}/drafts/${D}-bullbear.md，跑 python ${S}/scripts/bb_check.py ${W}/drafts/${D}-bullbear.md 到 0 WARN，计算并返回 ${W}/drafts/${D}-bullbear.md 的 sha256。`,
+        { agentType: 'general-purpose', label: `${T} 合并`, phase: '合并与审稿', schema: FILES_DRAFT }
+      )
+
+const mergedSha = merged === null ? null : shaOf(merged)
+const mergedOk = merged !== null && mergedSha !== null
+
+// 第 1 轮语言审查：合并成稿之后、第一次独立审稿之前（改稿会换哈希，必须先改再送审）。
+const draftPath = `${W}/drafts/${D}-bullbear.md`
+phase('语言审查')
+const lang1 =
+  !mergedOk
+    ? null
+    : await agent(
+        `对 ${draftPath} 做第 1 轮语言审查：调用工具 check_language(draft_path="${draftPath}", round=1)（只标问题），读 ${draftPath}.language.md 清单，按清单逐条修改 ${draftPath}（只改语言表达，不动事实、数字、术语、引用编号与判断强度，不改 <!-- INSERT:… --> 结构；工具报错就不改稿并在 summary 里原样汇报错误）。改完返回 ${draftPath} 的 sha256。`,
+        { agentType: 'general-purpose', label: '语言审查 1', phase: '语言审查', schema: FILES_DRAFT }
+      )
+const lang1Sha = lang1 === null ? null : shaOf(lang1)
+const lang1Failed = mergedOk && lang1Sha === null
+const reviewedSha = lang1Sha || mergedSha
+let review =
+  !mergedOk
+    ? null
+    : await agent(
+        `审阅 ${draftPath}（被审草稿 sha256：${
+          reviewedSha || '未知'
+        }；支线材料在 ${runDir}/，只读不改任何文件）。重点：每个 Debate 的“我的判断”是否有明确立场、改判条件是否可观察；§2 是否把价格走势当共识；§4 修正分层是否能回指一致预期快照。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
+        { agentType: 'dalton-reviewer', label: `${T} 审稿`, phase: '合并与审稿', schema: VERDICT, reviewDraft: draftPath }
+      )
+
+const incomplete = []
+// 审稿结果未覆盖 1–9 项检查时按审稿失败处理（与发布审稿同一契约，fail-closed）。
+if (review !== null && !completeReview(review)) {
+  incomplete.push('审稿结果未覆盖 1–9 项检查，按审稿失败处理')
+  review = null
+}
+if (review && verdictOf(review) === 'block') {
+  incomplete.push(`审稿 block：${review.summary || '存在不可修订级问题'}`)
+  return {
+    ok: false,
+    blocked: review.summary || '审稿 block',
+    draft: `${W}/drafts/${D}-bullbear.md`,
+    failed: [prep, ret, main, merged, review].map((x) => x === null),
+    incomplete,
+    resume_hint:
+      '修订成稿后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发（准备、股东回报支线等）会直接复用，主稿及之后的阶段重新派发',
+  }
+}
+
+phase('修订')
+// revise → 修订 → 复审，最多 2 轮；每个失败出口都写进 incomplete 并停下
+let fixed = null
+let finalReview = review
+let rounds = 0
+let currentSha = reviewedSha
+let reviewPassed = review !== null && verdictOf(review) === 'pass'
+while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
+  rounds += 1
+  fixed = await agent(
+    `先核对 ${W}/drafts/${D}-bullbear.md 的 sha256 是否仍为 ${currentSha || '当前记录值'}（不一致说明审稿后被改动，先标注再修订）。然后按审稿意见做第 ${rounds} 轮修订 ${W}/drafts/${D}-bullbear.md：P0 全改，P1 能改就改，不新增未核实数字；修完再跑 python ${S}/scripts/bb_check.py ${W}/drafts/${D}-bullbear.md 确认 0 WARN。审稿意见如下：\n${JSON.stringify(
+      finalReview
+    )}\n返回改动清单与剩余 P1。`,
+    { agentType: 'general-purpose', label: `${T} 修订 ${rounds}`, phase: '修订', schema: FIXED_SCHEMA }
+  )
+  const fixedSha = fixed === null ? null : shaOf(fixed)
+  if (fixedSha === null) {
+    incomplete.push(`第 ${rounds} 轮修订失败（修订结果或其 sha256 缺失/非法），未复审`)
+    break
+  }
+  currentSha = fixedSha
+  const reReview = await agent(
+    `复审（第 ${rounds} 轮修订后）：审阅 ${W}/drafts/${D}-bullbear.md（被审草稿 sha256：${fixedSha}；支线材料在 ${runDir}/，只读不改任何文件）。重点核对上一轮 must_fix 是否全部解决、bb_check 是否仍 0 WARN。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。上一轮审稿意见：\n${JSON.stringify(
+      finalReview
+    )}`,
+    { agentType: 'dalton-reviewer', label: `${T} 复审 ${rounds}`, phase: '修订', schema: VERDICT, reviewDraft: draftPath }
+  )
+  if (reReview === null) {
+    incomplete.push(`第 ${rounds} 轮复审失败`)
+    break
+  }
+  if (!completeReview(reReview)) {
+    incomplete.push(`第 ${rounds} 轮复审结果未覆盖 1–9 项检查，按复审失败处理`)
+    break
+  }
+  if (verdictOf(reReview) === 'block') {
+    incomplete.push(`复审 block：${reReview.summary || '存在不可修订级问题'}`)
+    break
+  }
+  finalReview = reReview
+}
+reviewPassed = finalReview !== null && verdictOf(finalReview) === 'pass'
+
+// 笔记两轮：一次写完、不再改的准备/支线/主稿笔记同样审两轮——第 1 轮审完按清单改，
+// 第 2 轮复核（改动过的文件再补一次 round=2 确认，绑定终态哈希）。main.md 与
+// return*.md 的内容已并入正式稿，档案副本仍按规则各自两轮。
+const notesReview =
+  !mergedOk || !reviewPassed
+    ? null
+    : await agent(
+        `对本次运行产出、给人读的 .md 笔记逐一做两轮语言审查（规则见 .agents/skills/dalton-language/SKILL.md，只标问题）。每个文件依次：1) 调用工具 check_language(draft_path="<文件>", round=1)，读 <文件>.language.md 清单并按清单修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度，不改 <!-- INSERT:… --> 结构；工具报错就不改稿并在 summary 里原样汇报错误）；2) 调用 check_language(draft_path="<文件>", round=2) 复核；若第 1 轮后改过稿，改完再调用一次 round=2 确认（记录追加在同一 json）。\n文件清单：\n- ${runDir}/fincheck.md\n- ${runDir}/consensus.md\n- ${runDir}/price.md\n- ${runDir}/return.md\n- ${runDir}/return_appendix.md\n- ${runDir}/return_summary.md\n- ${runDir}/main.md\n清单之外本次运行写的其他给人读的 .md 一并同法处理；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/ 下的文件、知识层渲染文件与 .audit/.annotated/.language 侧车不审。返回处理过的文件列表与摘要。`,
+        { agentType: 'general-purpose', label: '笔记语言审查', phase: '修订', schema: PREP_SCHEMA }
+      )
+if (mergedOk && reviewPassed && notesReview === null) {
+  incomplete.push('笔记语言审查失败（准备/支线/主稿笔记未完成两轮语言审查）')
+}
+
+// 第 2 轮语言审查：终稿内容定稿（审稿修订循环结束）之后、提交最后一次审稿之前。
+// 改了稿就再跑一次 round=2 复核，使最后一条第 2 轮记录绑定终稿哈希；哈希有变
+// 则终稿审稿重新绑定独立审稿哈希——语言修改不能让已有 pass 记录失效却无人重审。
+const preLang2Sha = currentSha
+const lang2 =
+  !mergedOk || !reviewPassed
+    ? null
+    : await agent(
+        `对 ${draftPath} 做第 2 轮语言审查：调用工具 check_language(draft_path="${draftPath}", round=2)，读 ${draftPath}.language.md 清单，按清单逐条完成终稿语言修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度，不改 <!-- INSERT:… --> 结构；工具报错就不改稿并在 summary 里原样汇报错误）。若草稿有改动，再调用一次 check_language(draft_path="${draftPath}", round=2) 对终稿复核（记录追加在同一 json），并重跑 python ${S}/scripts/bb_check.py ${draftPath} 确认 0 WARN。返回 ${draftPath} 最终 sha256。`,
+        { agentType: 'general-purpose', label: '语言审查 2', phase: '修订', schema: FIXED_SCHEMA }
+      )
+const lang2Sha = lang2 === null ? null : shaOf(lang2)
+if (mergedOk && reviewPassed && lang2Sha === null) {
+  incomplete.push('语言审查第 2 轮失败（结果或其 sha256 缺失/非法），未做终稿语言修改')
+} else if (mergedOk && reviewPassed && lang2Sha !== preLang2Sha) {
+  currentSha = lang2Sha
+  const finalCheck = await agent(
+    `终稿审稿（语言修改后）：审阅 ${draftPath}（被审草稿 sha256：${lang2Sha}；支线材料在 ${runDir}/，只读不改任何文件）。重点：语言修改未动事实与数字，bb_check 仍 0 WARN，上一轮 must_fix 仍全部解决。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
+    { agentType: 'dalton-reviewer', label: '终稿审稿', phase: '修订', schema: VERDICT, reviewDraft: draftPath }
+  )
+  if (finalCheck === null) {
+    incomplete.push('终稿审稿失败')
+  } else if (!completeReview(finalCheck)) {
+    incomplete.push('终稿审稿结果未覆盖 1–9 项检查，按审稿失败处理')
+    finalReview = null
+  } else {
+    finalReview = finalCheck
+  }
+}
+reviewPassed = finalReview !== null && verdictOf(finalReview) === 'pass'
+
+if (prep === null) incomplete.push('准备阶段失败')
+if (ret === null && prep !== null) incomplete.push('股东回报支线失败')
+if (main === null) incomplete.push('主稿失败')
+if (!mergedOk && main !== null) incomplete.push('合并失败（草稿或其 sha256 缺失/非法）')
+if (review === null && mergedOk) incomplete.push('审稿失败')
+if (lang1Failed) incomplete.push('语言审查第 1 轮失败（结果或其 sha256 缺失/非法），未按清单修改')
+if (!reviewPassed && !incomplete.length) incomplete.push('审稿未最终通过（无 pass 记录）')
+
+phase('产物核验')
+const deliverables = [
+  `${runDir}/anchors.json`,
+  `${runDir}/fincheck.md`,
+  `${runDir}/fincheck.md.language.json`,
+  `${runDir}/consensus.md`,
+  `${runDir}/consensus.md.language.json`,
+  `${runDir}/price.md`,
+  `${runDir}/price.md.language.json`,
+  `${runDir}/return.md`,
+  `${runDir}/return.md.language.json`,
+  `${runDir}/return_appendix.md`,
+  `${runDir}/return_appendix.md.language.json`,
+  `${runDir}/return_summary.md`,
+  `${runDir}/return_summary.md.language.json`,
+  `${runDir}/main.md`,
+  `${runDir}/main.md.language.json`,
+  `${W}/drafts/${D}-bullbear.md`,
+  `${W}/drafts/${D}-bullbear.md.language.json`,
+]
+const check =
+  !mergedOk
+    ? null
+    : await agent(
+        `只读核对以下文件是否存在并计算 sha256（用 bash 的 test -e 与 sha256sum，不写任何文件）：\n${deliverables
+          .map((p) => '- ' + p)
+          .join('\n')}\n返回 files 字符串数组：存在的文件写 “<路径>|<sha256>”，不存在的只写 “<路径>”（不带竖线）。`,
+        { agentType: 'dalton-evidence', label: '产物核验', phase: '产物核验', schema: HASH, checkFiles: false }
+      )
+const SHA_RE = /^[0-9a-f]{64}$/
+const expected = new Set(deliverables)
+const reported = new Set()
+for (const entry of check && Array.isArray(check.files) ? check.files : []) {
+  const bar = entry.indexOf('|')
+  const path = bar > 0 ? entry.slice(0, bar) : ''
+  const sha = bar > 0 ? entry.slice(bar + 1) : ''
+  if (!path || !SHA_RE.test(sha) || !expected.has(path)) {
+    incomplete.push(`产物核验返回无效条目：${entry}`)
+    continue
+  }
+  reported.add(path)
+}
+for (const path of deliverables) {
+  if (!reported.has(path)) incomplete.push(`产物缺失或未报哈希：${path}`)
+}
+if (check === null && mergedOk) incomplete.push('产物核验子任务失败')
+
+return {
+  ok: mergedOk && reviewPassed && incomplete.length === 0,
+  draft: `${W}/drafts/${D}-bullbear.md`,
+  review_verdict: finalReview ? verdictOf(finalReview) : null,
+  review_summary: finalReview && finalReview.summary,
+  language_done: mergedOk && lang1Sha !== null && lang2Sha !== null,
+  revise_rounds: rounds,
+  fixed: fixed && fixed.summary,
+  failed: [prep, ret, main, merged, review].map((x) => x === null),
+  incomplete,
+}
+
+
+===== WORKFLOW: earnings-deep-update =====
+--- FILE: earnings-deep-update/contract.json ---
+{
+  "name": "earnings-deep-update",
+  "description": "财报深度链的完成契约：八节点评 + 模型更新 + 对账校准 + 审稿 + 知识层修订草案（对应 dalton-earnings-deep SKILL 的交付物）。",
+  "draft": "drafts/{release_date}-deep-{quarter}.md",
+  "params_required": [
+    "ticker",
+    "quarter",
+    "workspace_dir",
+    "release_date"
+  ],
+  "stages": [
+    {
+      "name": "八节深度点评",
+      "artifacts": [
+        {
+          "path": "drafts/{release_date}-deep-{quarter}.md",
+          "min_bytes": 500
+        }
+      ]
+    },
+    {
+      "name": "模型更新",
+      "requires_param": "model_path",
+      "artifacts": [
+        {
+          "path": "research/{release_date}-deep-{quarter}/mapping.md",
+          "min_bytes": 50
+        },
+        {
+          "path": "research/{release_date}-deep-{quarter}/model-delta.md",
+          "min_bytes": 50
+        },
+        {
+          "path": "model/{ticker}-model-v*.xlsx",
+          "glob": true,
+          "min_count": 1,
+          "min_bytes": 1000,
+          "modified_on": "today"
+        }
+      ],
+      "validators": [
+        {
+          "command": "python .agents/skills/xlsx/scripts/audit.py \"$(ls model/{ticker}-model-v*.xlsx | sort -V | tail -1)\" --strict",
+          "pass_when": "exit_zero",
+          "description": "对新版本模型做严格审计（audit --strict）"
+        }
+      ]
+    },
+    {
+      "name": "校准与对账",
+      "artifacts": [
+        {
+          "path": "research/{release_date}-deep-{quarter}/thesis-calibration.md",
+          "min_bytes": 100
+        },
+        {
+          "path": "research/{release_date}-deep-{quarter}/management-delta.md",
+          "min_bytes": 50
+        },
+        {
+          "path": "research/{release_date}-deep-{quarter}/reconcile.md",
+          "min_bytes": 50
+        },
+        {
+          "path": "research/{release_date}-deep-{quarter}/reconcile.json",
+          "min_bytes": 10
+        }
+      ]
+    },
+    {
+      "name": "审稿",
+      "review": {
+        "agent": "dalton-reviewer",
+        "verdicts": [
+          "pass"
+        ],
+        "manual_sidecar": "research/{release_date}-deep-{quarter}/review.json"
+      }
+    },
+    {
+      "name": "知识层修订草案",
+      "artifacts": [
+        {
+          "path": "research/{release_date}-deep-{quarter}/knowledge-revision.json",
+          "min_bytes": 50
+        }
+      ]
+    }
+  ],
+  "closing": {
+    "knowledge_docs": [
+      "thesis",
+      "debate",
+      "drivers",
+      "management"
+    ],
+    "knowledge_source": "tool",
+    "verdict_kinds_any": [
+      "NO_CHANGE",
+      "THESIS_STRENGTHENED",
+      "THESIS_WEAKENED",
+      "THESIS_BROKEN",
+      "NEW_THESIS"
+    ],
+    "verdict_trigger": "earnings",
+    "check_draft": {
+      "draft": "drafts/{release_date}-deep-{quarter}.md"
+    },
+    "knowledge_docs_requires_param": {
+      "models": "model_path"
+    },
+    "knowledge_docs_if_json": [
+      {
+        "json": "research/{release_date}-deep-{quarter}/reconcile.json",
+        "when": {
+          "any_gt": [
+            "wrong",
+            "partial"
+          ]
+        },
+        "docs": [
+          "lessons"
+        ]
+      }
+    ],
+    "language_review": {
+      "draft": "drafts/{release_date}-deep-{quarter}.md"
+    },
+    "push_draft": {
+      "path": "research/push/{release_date}-earnings-deep-{quarter}.md"
+    }
+  }
+}
+
+--- FILE: earnings-deep-update/workflow.js ---
+export const meta = {
+  name: 'earnings-deep-update',
+  description: 'Dalton 财报深度链：八节点评 ∥ 模型更新 → thesis 校准 + 前瞻对账 → 审稿 → 知识层修订草案',
+}
+
+const { ticker: T, company: C, quarter: Q, workspace_dir: W } = args
+const D = args.release_date
+const R = `${W}/research/${D}-deep-${Q}`
+const S = '.agents/skills/dalton-earnings-deep'
+const base = `先读 .agents/skills/dalton-conventions/SKILL.md 与 ${S}/SKILL.md；${C || T}（${T}）${Q}，发布日 ${D}。快讯稿在 ${W}/research/ 或 ${W}/drafts/ 下 flash-${Q}。`
+const OUT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+    summary: { type: 'string', minLength: 1 },
+    sha256: { type: 'string', minLength: 64 },
+    gaps: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['files', 'summary'],
+}
+const VERDICT = {
+  type: 'object',
+  properties: {
+    verdict: { type: 'string', enum: ['pass', 'revise', 'block'] },
+    summary: { type: 'string', minLength: 1 },
+    must_fix: { type: 'array', items: { type: 'string', minLength: 1 } },
+    // items 元素的键（check/result/reason/lines）由 dalton-reviewer 的提示词契约约束，
+    // 结构深度保持在平台 schema_max_depth 限制内（元素键不展开为 schema 节点）。
+    items: { type: 'array', items: { type: 'object' } },
+  },
+  required: ['verdict', 'summary', 'items'],
+}
+const HASH = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+  },
+  required: ['files'],
+}
+const verdictOf = (r) => {
+  // pass 但 must_fix 非空按 revise 处理，与服务端 publish/review.py 的规则一致
+  //（提示词第 1 批第 2 轮 #2）。
+  if (r && typeof r === 'object' && r.verdict === 'pass' && Array.isArray(r.must_fix) && r.must_fix.length) {
+    return 'revise'
+  }
+  return r && typeof r === 'object' ? r.verdict : null
+}
+// 审稿结果与 dalton-reviewer 提示词、服务端发布审稿（publish/review.py）同一契约：
+// items 必须逐项覆盖 1–9 项检查；缺项的结果不可作为 verdict 使用（fail-closed）。
+const REVIEW_CHECKS = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+const completeReview = (r) => {
+  if (!r || typeof r !== 'object') return false
+  const items = Array.isArray(r.items) ? r.items : []
+  const done = new Set()
+  for (const it of items) {
+    if (
+      it &&
+      typeof it === 'object' &&
+      Number.isInteger(it.check) &&
+      it.check >= 1 &&
+      it.check <= 9 &&
+      (it.result === 'pass' || it.result === 'revise')
+    ) {
+      done.add(it.check)
+    }
+  }
+  return REVIEW_CHECKS.every((c) => done.has(c))
+}
+const DRAFT_OUT = { ...OUT, required: ['files', 'summary', 'sha256'] }
+const shaOf = (r) =>
+  r && typeof r === 'object' && typeof r.sha256 === 'string' && /^[0-9a-f]{64}$/.test(r.sha256)
+    ? r.sha256
+    : null
+
+phase('深度点评与模型')
+const [report, model] = await parallel([
+  () =>
+    agent(
+      `${base} 按 ${S}/templates/deep.md（首个二级标题为「## 摘要」，后接「业绩与指引」「投资逻辑的验证」「赔率与行动」「跟踪」、按需「附注」及文末「引用」，对账与校准的逐条表格留内部文件、不在正文展开；改判条件只在「跟踪」完整列一次，「赔率与行动」和「摘要」只写决定行动的那一个条件；成稿后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处）与 ${S}/references/eight-sections.md${
+        args.sector_overlay === 'hardware' ? ` 与 ${S}/references/hardware-overlay.md` : ''
+      } 写深度点评到 ${W}/drafts/${D}-deep-${Q}.md；价格反应用 python ${S}/scripts/price_reaction.py；卖方窗口为发布到发布后 3 个交易日。返回成稿路径与 sha256。`,
+      { agentType: 'general-purpose', label: '八节点评', phase: '深度点评与模型', schema: DRAFT_OUT }
+    ),
+  () =>
+    args.model_path
+      ? agent(
+          `${base} 按 .agents/skills/model-update/SKILL.md 更新模型 ${args.model_path}：触发类型 Results；先出映射表到 ${R}/mapping.md，再写入另存的新版本（不覆盖旧版），Change Log 完整；recalc 与 audit --strict 通过；输出 EPS walk 与估值变化到 ${R}/model-delta.md。`,
+          { agentType: 'general-purpose', label: '模型更新', phase: '深度点评与模型', schema: OUT }
+        )
+      : Promise.resolve(null),
+])
+
+// 回报文件里的模型路径（取其版本号最大者）。
+const modelFileIn = (files) => {
+  const found = (Array.isArray(files) ? files : [])
+    .map((f) => {
+      const m = typeof f === 'string' ? f.match(/-model-v(\d+)\.xlsx$/) : null
+      return m ? { path: f, version: Number(m[1]) } : null
+    })
+    .filter(Boolean)
+  return found.length ? found.reduce((a, b) => (b.version > a.version ? b : a)).path : null
+}
+const nextVersion = (p) =>
+  p.replace(/-model-v(\d+)\.xlsx$/, (_, v) => `-model-v${String(Number(v) + 1).padStart(v.length, '0')}.xlsx`)
+const reportedModelPath = model ? modelFileIn(model.files) : null
+
+// 确定性子任务解析磁盘上的最终模型（ls … | sort -V | tail -1）：模型更新后、
+// 每轮修订后（复审前）、循环结束后各一次；校准/审稿/知识草案/核验/返回值只认它。
+const FINAL_MODEL = {
+  type: 'object',
+  properties: {
+    path: { type: 'string', minLength: 1 },
+    sha256: { type: 'string', minLength: 64 },
+  },
+  required: ['path', 'sha256'],
+}
+// Compare model paths relative to the workspace: callers pass workspace_dir
+// either as '.' or as an absolute folder, while the resolver reports model/….
+const normPath = (p) => {
+  if (typeof p !== 'string') return p
+  let s = p.replace(/^\.\//, '')
+  const w = typeof W === 'string' ? W.replace(/\/+$/, '').replace(/^\.\//, '') : ''
+  if (w && w !== '.' && s.startsWith(w + '/')) s = s.slice(w.length + 1)
+  return s.replace(/^\.\//, '')
+}
+const resolveFinalModel = async (label) => {
+  const r = await agent(
+    `在 workspace 里执行：ls model/${T}-model-v*.xlsx 2>/dev/null | sort -V | tail -1，对输出文件计算 sha256sum。只返回 JSON：path（ls 的原样输出）与 sha256（64 位十六进制）。不写任何文件。`,
+    { agentType: 'dalton-evidence', label, phase: '解析最终模型', schema: FINAL_MODEL }
+  )
+  return r && typeof r.path === 'string' && r.path && shaOf(r) ? { path: normPath(r.path), sha256: r.sha256 } : null
+}
+phase('解析最终模型')
+let modelFile = null
+if (args.model_path && report !== null) {
+  const updated = await resolveFinalModel('解析模型（模型更新后）')
+  if (updated === null) {
+    return {
+      ok: false,
+      report: report && `${W}/drafts/${D}-deep-${Q}.md`,
+      model_file: null,
+      incomplete: ['解析最终模型的子任务失败，流程终止'],
+    }
+  }
+  if (reportedModelPath !== null && normPath(reportedModelPath) !== updated.path) {
+    return {
+      ok: false,
+      report: report && `${W}/drafts/${D}-deep-${Q}.md`,
+      model_file: updated.path,
+      incomplete: [
+        `模型更新回报的模型（${reportedModelPath}）与磁盘最大版本（${updated.path}）不一致，最终模型不确定，流程终止`,
+      ],
+    }
+  }
+  modelFile = updated.path
+}
+// 第 1 轮语言审查：八节点评写完之后、校准与第一次独立审稿之前（改稿会换哈希，必须先改再送审）。
+const reportPath = `${W}/drafts/${D}-deep-${Q}.md`
+phase('语言审查')
+const reportSha0 = report === null ? null : shaOf(report)
+const lang1 =
+  reportSha0 === null
+    ? null
+    : await agent(
+        `对 ${reportPath} 做第 1 轮语言审查：调用工具 check_language(draft_path="${reportPath}", round=1)（只标问题），读 ${reportPath}.language.md 清单，按清单逐条修改 ${reportPath}（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）。改完返回 ${reportPath} 的 sha256。`,
+        { agentType: 'general-purpose', label: '语言审查 1', phase: '语言审查', schema: DRAFT_OUT }
+      )
+const lang1Sha = lang1 === null ? null : shaOf(lang1)
+const lang1Failed = reportSha0 !== null && lang1Sha === null
+const reportSha = lang1Sha || reportSha0
+const reportOk = report !== null && reportSha !== null
+let currentSha = reportSha
+
+phase('校准与对账')
+const calib =
+  report === null
+    ? null
+    : await agent(
+        `${base} 按 ${S}/references/calibration.md：
+1) ${
+          args.preview_predictions
+            ? `用 python ${S}/scripts/reconcile.py 对 ${args.preview_predictions} 逐条对账，输出 ${R}/reconcile.md，并把对账计数写成 ${R}/reconcile.json（{"wrong": <错数>, "partial": <部分数>}）；`
+            : `本次财报前无 predictions.json，跳过前瞻对账：仍要生成 ${R}/reconcile.md（写明跳过原因）与 ${R}/reconcile.json（{"wrong": 0, "partial": 0}）；`
+        }
+2) 按第二节的财报后校准规则，对 ${W}/thesis.md 每个支柱给信号与状态，写 ${R}/thesis-calibration.md；
+3) 更新指引兑现记录：本季实际 vs 上季给的指引，判断管理层指引风格是否延续，写 ${R}/management-delta.md；
+4) 把 ${R}/reconcile.md、${R}/thesis-calibration.md、${R}/management-delta.md 的结论各用一两句话写进 ${reportPath} 正文「投资逻辑的验证」节（逐条表格留在内部文件），改完返回 ${reportPath} 新的 sha256。
+材料：${W}/drafts/${D}-deep-${Q}.md${model ? `，${R}/model-delta.md` : ''}${
+          modelFile ? `；最终模型 ${modelFile}（只读）` : ''
+        }。`,
+        { agentType: 'general-purpose', label: '校准与对账', phase: '校准与对账', schema: DRAFT_OUT }
+      )
+const calibSha = shaOf(calib)
+if (calibSha !== null) currentSha = calibSha
+
+phase('审稿')
+let review =
+  calibSha === null
+    ? null
+    : await agent(
+        `审阅 ${reportPath}（被审草稿 sha256：${
+          currentSha || '未知'
+        }）及 ${R}/ 下的对账与校准文件${modelFile ? `、最终模型 ${modelFile}` : ''}（只读不改任何文件）。重点：超预期/低于预期（beat/miss）口径；摘要与各节是否有独立判断；核心论点（thesis）信号是否被价格走势替代；对账是否回避了错判；核对正文「投资逻辑的验证」节是否已各用一两句话准确写入 reconcile.md、thesis-calibration.md、management-delta.md 的结论（逐条表格留在内部文件）。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
+        { agentType: 'dalton-reviewer', label: '审稿', phase: '审稿', schema: VERDICT, reviewDraft: reportPath }
+      )
+
+const incomplete = []
+// 审稿结果未覆盖 1–9 项检查时按审稿失败处理（与发布审稿同一契约，fail-closed）。
+if (review !== null && !completeReview(review)) {
+  incomplete.push('审稿结果未覆盖 1–9 项检查，按审稿失败处理')
+  review = null
+}
+let finalReview = review
+let rounds = 0
+let modelPath = modelFile
+// 提前结束时解析一次磁盘上的模型，作为返回值里的 model_file；没有模型则为 null。
+const resolveOnExit = async () => {
+  if (modelPath === null) return null
+  const r = await resolveFinalModel('解析模型（终止）')
+  if (r === null) incomplete.push('解析最终模型的子任务失败')
+  return r
+}
+// 所有提前返回的出口都经过 finish：返回值里的 model_file 只取传进来的解析结果。
+const finish = (resolved, extra = {}) => ({
+  ok: false,
+  report: report && reportPath,
+  model_delta: model && `${R}/model-delta.md`,
+  model_file: resolved ? resolved.path : null,
+  reconcile: calib && `${R}/reconcile.md`,
+  revise_rounds: rounds,
+  incomplete,
+  ...extra,
+})
+
+if (review && verdictOf(review) === 'block') {
+  incomplete.push(`审稿 block：${review.summary || '存在不可修订级问题'}`)
+  return finish(await resolveOnExit(), {
+    blocked: review.summary || '审稿 block',
+    resume_hint:
+      '修订报告后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，修订之后的阶段重新派发',
+  })
+}
+
+// revise → 修订 → 解析模型 → 复审，最多 2 轮；每个失败出口都写进 incomplete 并停下
+let resolved = null
+while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
+  rounds += 1
+  const target = modelPath === null ? null : nextVersion(modelPath)
+  const modelClause =
+    modelPath === null
+      ? ''
+      : `模型若有改动走 .agents/skills/model-update/SKILL.md，另存为 ${target}，不覆盖旧版本；模型没改就原样沿用 ${modelPath}。不管改没改，都必须在 files 里回报当前模型的路径（另存则报 ${target}，未改则报 ${modelPath}）。`
+  const fixed = await agent(
+    `先核对 ${reportPath} 的 sha256 是否与审稿前（${
+      currentSha || '成稿记录值'
+    }）一致；按审稿意见做第 ${rounds} 轮修订（必改项 must_fix 全改，不新增未核实数字；修订后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处），并核对 ${R}/reconcile.md、${R}/thesis-calibration.md、${R}/management-delta.md 的结论是否已各用一两句话准确写进正文「投资逻辑的验证」节（如有缺漏或偏差一并修正，逐条表格留在内部文件），改完返回新 sha256。${modelClause}审稿意见：\n${JSON.stringify(
+      finalReview
+    )}`,
+    { agentType: 'general-purpose', label: `修订 ${rounds}`, phase: '审稿', schema: DRAFT_OUT }
+  )
+  const fixedSha = shaOf(fixed)
+  if (fixedSha === null) {
+    incomplete.push(`第 ${rounds} 轮修订失败（修订结果或其 sha256 缺失/非法），未复审，流程终止`)
+    return finish(await resolveOnExit())
+  }
+  if (modelPath !== null) {
+    const reportedPath = modelFileIn(fixed.files)
+    if (!reportedPath) {
+      incomplete.push(`第 ${rounds} 轮修订未回报模型路径（模型未改也须回报 ${modelPath}），未复审，流程终止`)
+      return finish(await resolveOnExit())
+    }
+    const disk = await resolveFinalModel(`解析模型（修订 ${rounds}）`)
+    if (disk === null) {
+      incomplete.push(`第 ${rounds} 轮修订后解析模型的子任务失败，未复审，流程终止`)
+      return finish(null)
+    }
+    if (normPath(reportedPath) !== disk.path) {
+      incomplete.push(
+        `第 ${rounds} 轮修订后模型版本不一致：回报 ${reportedPath}，磁盘最大版本 ${disk.path}，最终模型不确定，未复审，流程终止`
+      )
+      return finish(disk)
+    }
+    modelPath = disk.path
+    resolved = disk
+  }
+  currentSha = fixedSha
+  const reReview = await agent(
+    `复审（第 ${rounds} 轮修订后）：审阅 ${reportPath}（被审草稿 sha256：${
+      currentSha
+    }）及 ${R}/ 下的对账与校准文件${
+      modelPath ? `、最终模型 ${modelPath}` : ''
+    }（只读不改任何文件）。重点核对上一轮 must_fix 是否全部解决。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。上一轮审稿意见：\n${JSON.stringify(
+      finalReview
+    )}`,
+    { agentType: 'dalton-reviewer', label: `复审 ${rounds}`, phase: '审稿', schema: VERDICT, reviewDraft: reportPath }
+  )
+  if (reReview === null) {
+    incomplete.push(`第 ${rounds} 轮复审失败，流程终止`)
+    return finish(resolved)
+  }
+  if (!completeReview(reReview)) {
+    incomplete.push(`第 ${rounds} 轮复审结果未覆盖 1–9 项检查，按复审失败处理，流程终止`)
+    return finish(resolved)
+  }
+  if (verdictOf(reReview) === 'block') {
+    incomplete.push(`复审 block：${reReview.summary || '存在不可修订级问题'}，流程终止`)
+    return finish(resolved, {
+      blocked: reReview.summary || '复审 block',
+      resume_hint:
+        '修订报告后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，修订之后的阶段重新派发',
+    })
+  }
+  finalReview = reReview
+}
+let reviewPassed = finalReview !== null && verdictOf(finalReview) === 'pass'
+
+// 笔记两轮：一次写完、不再改的校准/对账笔记同样审两轮——第 1 轮审完按清单改，
+// 第 2 轮复核（改动过的文件再补一次 round=2 确认，绑定终态哈希）。
+const notesReview =
+  !reportOk || !reviewPassed
+    ? null
+    : await agent(
+        `对本次运行产出、给人读的 .md 笔记逐一做两轮语言审查（规则见 .agents/skills/dalton-language/SKILL.md，只标问题）。每个文件依次：1) 调用工具 check_language(draft_path="<文件>", round=1)，读 <文件>.language.md 清单并按清单修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）；2) 调用 check_language(draft_path="<文件>", round=2) 复核；若第 1 轮后改过稿，改完再调用一次 round=2 确认（记录追加在同一 json）。\n文件清单：\n- ${R}/reconcile.md\n- ${R}/thesis-calibration.md\n- ${R}/management-delta.md${
+          args.model_path ? `\n- ${R}/mapping.md\n- ${R}/model-delta.md` : ''
+        }\n清单之外本次运行写的其他给人读的 .md 一并同法处理；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/ 下的文件、知识层渲染文件与 .audit/.annotated/.language 侧车不审。返回处理过的文件列表与摘要。`,
+        { agentType: 'general-purpose', label: '笔记语言审查', phase: '审稿', schema: OUT }
+      )
+if (reportOk && reviewPassed && notesReview === null) {
+  incomplete.push('笔记语言审查失败（校准/对账笔记未完成两轮语言审查）')
+}
+
+// 第 2 轮语言审查：终稿内容定稿（审稿修订循环结束）之后、提交最后一次审稿之前。
+// 改了稿就再跑一次 round=2 复核，使最后一条第 2 轮记录绑定终稿哈希；哈希有变
+// 则终稿审稿重新绑定独立审稿哈希——语言修改不能让已有 pass 记录失效却无人重审。
+const preLang2Sha = currentSha
+const lang2 =
+  !reportOk || !reviewPassed
+    ? null
+    : await agent(
+        `对 ${reportPath} 做第 2 轮语言审查：调用工具 check_language(draft_path="${reportPath}", round=2)，读 ${reportPath}.language.md 清单，按清单逐条完成终稿语言修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）。若草稿有改动，再调用一次 check_language(draft_path="${reportPath}", round=2) 对终稿复核（记录追加在同一 json）。返回 ${reportPath} 最终 sha256。`,
+        { agentType: 'general-purpose', label: '语言审查 2', phase: '审稿', schema: DRAFT_OUT }
+      )
+const lang2Sha = lang2 === null ? null : shaOf(lang2)
+if (reportOk && reviewPassed && lang2Sha === null) {
+  incomplete.push('语言审查第 2 轮失败（结果或其 sha256 缺失/非法），未做终稿语言修改')
+  reviewPassed = false
+} else if (reportOk && reviewPassed && lang2Sha !== preLang2Sha) {
+  currentSha = lang2Sha
+  const finalCheck = await agent(
+    `终稿审稿（语言修改后）：审阅 ${reportPath}（被审草稿 sha256：${lang2Sha}）及 ${R}/ 下的对账与校准文件${modelFile ? `、最终模型 ${modelFile}` : ''}（只读不改任何文件）。重点：语言修改未动事实与数字，上一轮 must_fix 仍全部解决。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
+    { agentType: 'dalton-reviewer', label: '终稿审稿', phase: '审稿', schema: VERDICT, reviewDraft: reportPath }
+  )
+  if (finalCheck === null) {
+    incomplete.push('终稿审稿失败')
+    reviewPassed = false
+  } else if (!completeReview(finalCheck)) {
+    incomplete.push('终稿审稿结果未覆盖 1–9 项检查，按审稿失败处理')
+    reviewPassed = false
+  } else {
+    finalReview = finalCheck
+    reviewPassed = verdictOf(finalCheck) === 'pass'
+  }
+}
+
+// 循环结束后再确认一次：磁盘最大版本必须就是循环里最后确认的 modelPath。
+// 之后的知识草案、核验清单、返回值都只用 finalModel.path。
+let finalModel = null
+if (modelPath !== null) {
+  finalModel = await resolveFinalModel('解析最终模型')
+  if (finalModel === null) {
+    incomplete.push('解析最终模型的子任务失败，流程终止')
+    return finish(null)
+  }
+  if (finalModel.path !== modelPath) {
+    incomplete.push(
+      `最终模型与修订确认的版本（${modelPath}）不一致：磁盘最大版本 ${finalModel.path}，最终模型不确定，流程终止`
+    )
+    return finish(finalModel)
+  }
+}
+
+const kp = await agent(
+  `${base} 先核对 ${reportPath} 的 sha256 是否与修订后（${
+    currentSha || '修订后记录值'
+  }）一致。${finalModel ? `最终模型为 ${finalModel.path}。` : ''}然后汇总 ${R}/ 全部文件与审稿意见（${
+    finalReview ? '见下' : '审稿缺席：只写 NO_CHANGE 以外结论为待审说明，不改核心支柱状态'
+  }），按 PK.2 的 JSON Schema 写知识层修订草案 ${R}/knowledge-revision.json（{doc: {ops, reason, evidence_refs}}）：thesis 支柱信号与证据行、debate 变化、drivers 新读数、management 指引兑现行、lessons（前瞻错判的原因）、models（新模型版本登记，若模型更新失败则写“模型未更新”并排人工跟进）、事件五词终判。\n${
+    finalReview ? JSON.stringify(finalReview) : ''
+  }`,
+  { agentType: 'general-purpose', label: '知识层修订草案', phase: '审稿', schema: OUT }
+)
+
+if (!reportOk) incomplete.push('八节点评失败（草稿或其 sha256 缺失/非法）')
+if (lang1Failed) incomplete.push('语言审查第 1 轮失败（结果或其 sha256 缺失/非法），未按清单修改')
+if (args.model_path && model === null) incomplete.push('模型更新失败（须人工跟进）')
+if (calibSha === null && reportOk) incomplete.push('校准与对账失败（结果或其 sha256 缺失/非法）')
+if (review === null && calibSha !== null) incomplete.push('审稿失败')
+if (!reviewPassed && !incomplete.length) incomplete.push('审稿未最终通过（无 pass 记录）')
+if (kp === null) incomplete.push('知识层修订草案失败')
+
+phase('产物核验')
+const deliverables = [
+  `${W}/drafts/${D}-deep-${Q}.md`,
+  `${W}/drafts/${D}-deep-${Q}.md.language.json`,
+  `${R}/reconcile.md`,
+  `${R}/reconcile.md.language.json`,
+  `${R}/reconcile.json`,
+  `${R}/thesis-calibration.md`,
+  `${R}/thesis-calibration.md.language.json`,
+  `${R}/management-delta.md`,
+  `${R}/management-delta.md.language.json`,
+  `${R}/knowledge-revision.json`,
+]
+if (args.model_path) {
+  deliverables.push(`${R}/mapping.md`, `${R}/mapping.md.language.json`, `${R}/model-delta.md`, `${R}/model-delta.md.language.json`)
+}
+if (finalModel) deliverables.push(finalModel.path)
+const check =
+  !reportOk
+    ? null
+    : await agent(
+        `只读核对以下文件是否存在并计算 sha256（用 bash 的 test -e 与 sha256sum，不写任何文件）。只返回下面列出的文件，一个不能少、不能多、不能夹带其他条目：\n${deliverables
+          .map((p) => '- ' + p)
+          .join('\n')}\n返回 files 字符串数组：存在的文件写 “<路径>|<sha256>”，不存在的只写 “<路径>”（不带竖线）。`,
+        { agentType: 'dalton-evidence', label: '产物核验', phase: '产物核验', schema: HASH, checkFiles: false }
+      )
+const SHA_RE = /^[0-9a-f]{64}$/
+const expected = new Set(deliverables)
+const reported = new Set()
+for (const entry of check && Array.isArray(check.files) ? check.files : []) {
+  const bar = entry.indexOf('|')
+  const path = bar > 0 ? entry.slice(0, bar) : ''
+  const sha = bar > 0 ? entry.slice(bar + 1) : ''
+  if (!path || !SHA_RE.test(sha) || !expected.has(path)) {
+    incomplete.push(`产物核验返回无效条目：${entry}`)
+    continue
+  }
+  reported.add(path)
+}
+for (const path of deliverables) {
+  if (!reported.has(path)) incomplete.push(`产物缺失或未报哈希：${path}`)
+}
+return {
+  ok: reportOk && reviewPassed && incomplete.length === 0,
+  report: report && `${W}/drafts/${D}-deep-${Q}.md`,
+  model_delta: model && `${R}/model-delta.md`,
+  model_file: finalModel ? finalModel.path : null,
+  reconcile: calib && `${R}/reconcile.md`,
+  review_done: finalReview !== null,
+  review_verdict: finalReview && verdictOf(finalReview),
+  language_done: reportOk && lang1Sha !== null && lang2Sha !== null,
+  revise_rounds: rounds,
+  knowledge_revision: kp && `${R}/knowledge-revision.json`,
+  incomplete,
+}
+
+
+===== WORKFLOW: full-coverage =====
+--- FILE: full-coverage/contract.json ---
+{
+  "name": "full-coverage",
+  "description": "完整覆盖的完成契约：数字底表 + 问题清单 + 四支线 + 建模（串行，失败即停）+ 单一写手 memo 成稿 + 语言审查与审稿修订 + 知识层修订草案（对应 dalton-full-coverage SKILL 的交付物）。",
+  "draft": "drafts/{as_of}-memo.md",
+  "params_required": [
+    "ticker",
+    "workspace_dir",
+    "as_of"
+  ],
+  "stages": [
+    {
+      "name": "一手材料与数字底表",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-fc/facts.md",
+          "min_bytes": 500,
+          "end_marker": "<!-- FACTS-LEDGER"
+        }
+      ],
+      "validators": [
+        {
+          "command": "python .agents/skills/dalton-full-coverage/scripts/facts.py check research/{as_of}-fc/facts.md",
+          "pass_when": "exit_zero",
+          "description": "底表必填键齐全"
+        }
+      ]
+    },
+    {
+      "name": "问题清单",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-fc/questions.md",
+          "min_bytes": 200
+        }
+      ],
+      "validators": [
+        {
+          "command": "python .agents/skills/dalton-full-coverage/scripts/research_structure.py validate-agenda research/{as_of}-fc/questions.md",
+          "pass_when": "exit_zero",
+          "description": "问题清单校验通过"
+        }
+      ]
+    },
+    {
+      "name": "取证（A/B/C/D 支线）",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-fc/ea.md",
+          "min_bytes": 200,
+          "end_marker": "<!-- 完成 -->"
+        },
+        {
+          "path": "research/{as_of}-fc/eb.md",
+          "min_bytes": 200,
+          "end_marker": "<!-- 完成 -->"
+        },
+        {
+          "path": "research/{as_of}-fc/ec.md",
+          "min_bytes": 200,
+          "end_marker": "<!-- 完成 -->"
+        },
+        {
+          "path": "research/{as_of}-fc/ed.md",
+          "min_bytes": 200,
+          "end_marker": "<!-- 完成 -->"
+        }
+      ]
+    },
+    {
+      "name": "建模（串行，失败即停）",
+      "artifacts": [
+        {
+          "path": "model/{ticker}-model-v*.xlsx",
+          "glob": true,
+          "min_count": 1,
+          "min_bytes": 1000
+        }
+      ],
+      "validators": [
+        {
+          "command": "python .agents/skills/xlsx/scripts/audit.py \"$(ls model/{ticker}-model-v*.xlsx | sort -V | tail -1)\" --strict",
+          "pass_when": "exit_zero",
+          "description": "对最终版模型（修订后为 v02）做静态审计（audit --strict）"
+        }
+      ]
+    },
+    {
+      "name": "memo 成稿",
+      "artifacts": [
+        {
+          "path": "drafts/{as_of}-memo.md",
+          "min_bytes": 500
+        }
+      ],
+      "validators": [
+        {
+          "command": "python .agents/skills/dalton-full-coverage/scripts/validate_memo.py --mode full drafts/{as_of}-memo.md",
+          "pass_when": "exit_zero",
+          "description": "备忘录全量机械校验 0 FAIL"
+        }
+      ]
+    },
+    {
+      "name": "审模型与独立审稿",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-fc/model-check.md",
+          "min_bytes": 100
+        }
+      ],
+      "review": {
+        "agent": "dalton-reviewer",
+        "verdicts": [
+          "pass"
+        ],
+        "manual_sidecar": "research/{as_of}-fc/review.json"
+      }
+    },
+    {
+      "name": "修订与知识层修订草案",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-fc/knowledge-revision.json",
+          "min_bytes": 50
+        }
+      ]
+    }
+  ],
+  "closing": {
+    "knowledge_docs": [
+      "thesis",
+      "debate",
+      "drivers",
+      "management",
+      "models",
+      "company"
+    ],
+    "knowledge_source": "tool",
+    "verdict_kinds_any": [
+      "THESIS_STRENGTHENED",
+      "THESIS_WEAKENED",
+      "NEW_THESIS",
+      "THESIS_BROKEN",
+      "NO_CHANGE"
+    ],
+    "check_draft": {
+      "draft": "drafts/{as_of}-memo.md"
+    },
+    "language_review": {
+      "draft": "drafts/{as_of}-memo.md"
+    }
+  }
+}
+
+--- FILE: full-coverage/workflow.js ---
+export const meta = {
+  name: 'full-coverage',
+  description:
+    'Dalton 完整覆盖：一手材料与数字底表 → frame → A∥B∥C∥D 取证 → 建模（串行，失败即停）→ 单一写手成稿 → 语言审查（两轮，第 2 轮在终稿上）→ check-model∥独立审稿 → 一轮修订 → 知识层修订草案',
+}
+
+const { ticker: T, company: C, workspace_dir: W, as_of: D } = args
+const R = `${W}/research/${D}-fc`
+const S = '.agents/skills/dalton-full-coverage'
+// A1 同类：SKILL 声明的 market/pm_brief/focus_questions（与可选的 revision_brief
+// 文件路径）随 base 进每个子任务，不只给 frame——取证支线与写作同样要按 PM 的
+// 要求做。
+const pmAsks = []
+if (args.pm_brief) pmAsks.push(String(args.pm_brief))
+if (Array.isArray(args.focus_questions) && args.focus_questions.length)
+  pmAsks.push(`重点问题：${args.focus_questions.join('；')}`)
+if (args.revision_brief) pmAsks.push(`本轮必须修正的事项见 ${args.revision_brief}（先读该文件）`)
+const pmSection = pmAsks.length ? ` PM 的问题 / 本轮必须修正的事项：${pmAsks.join('；')}。` : ''
+const base = `先读 .agents/skills/dalton-conventions/SKILL.md；公司 ${C || T}（${T}），市场 ${args.market || 'US'}，截至 ${D}；数字底表 ${R}/facts.md（目标公司财务与市场数字只取自底表）。${pmSection}`
+const OUT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+    summary: { type: 'string', minLength: 1 },
+    sha256: { type: 'string', minLength: 64 },
+    gaps: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['files', 'summary'],
+}
+const VERDICT = {
+  type: 'object',
+  properties: {
+    verdict: { type: 'string', enum: ['pass', 'revise', 'block'] },
+    summary: { type: 'string', minLength: 1 },
+    must_fix: { type: 'array', items: { type: 'string', minLength: 1 } },
+    // items 元素的键（check/result/reason/lines）由 dalton-reviewer 的提示词契约约束，
+    // 结构深度保持在平台 schema_max_depth 限制内（元素键不展开为 schema 节点）。
+    items: { type: 'array', items: { type: 'object' } },
+  },
+  required: ['verdict', 'summary', 'items'],
+}
+const HASH = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+  },
+  required: ['files'],
+}
+const FINAL_MODEL = {
+  type: 'object',
+  properties: {
+    path: { type: 'string', minLength: 1 },
+    sha256: { type: 'string', minLength: 64 },
+  },
+  required: ['path', 'sha256'],
+}
+// Compare model paths relative to the workspace: callers pass workspace_dir
+// either as '.' or as an absolute folder, while the resolver reports model/….
+const normPath = (p) => {
+  if (typeof p !== 'string') return p
+  let s = p.replace(/^\.\//, '')
+  const w = typeof W === 'string' ? W.replace(/\/+$/, '').replace(/^\.\//, '') : ''
+  if (w && w !== '.' && s.startsWith(w + '/')) s = s.slice(w.length + 1)
+  return s.replace(/^\.\//, '')
+}
+const verdictOf = (r) => {
+  // pass 但 must_fix 非空按 revise 处理，与服务端 publish/review.py 的规则一致
+  //（提示词第 1 批第 2 轮 #2）。
+  if (r && typeof r === 'object' && r.verdict === 'pass' && Array.isArray(r.must_fix) && r.must_fix.length) {
+    return 'revise'
+  }
+  return r && typeof r === 'object' ? r.verdict : null
+}
+// 审稿结果与 dalton-reviewer 提示词、服务端发布审稿（publish/review.py）同一契约：
+// items 必须逐项覆盖 1–9 项检查；缺项的结果不可作为 verdict 使用（fail-closed）。
+const REVIEW_CHECKS = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+const completeReview = (r) => {
+  if (!r || typeof r !== 'object') return false
+  const items = Array.isArray(r.items) ? r.items : []
+  const done = new Set()
+  for (const it of items) {
+    if (
+      it &&
+      typeof it === 'object' &&
+      Number.isInteger(it.check) &&
+      it.check >= 1 &&
+      it.check <= 9 &&
+      (it.result === 'pass' || it.result === 'revise')
+    ) {
+      done.add(it.check)
+    }
+  }
+  return REVIEW_CHECKS.every((c) => done.has(c))
+}
+const DRAFT_OUT = { ...OUT, required: ['files', 'summary', 'sha256'] }
+const shaOf = (r) =>
+  r && typeof r === 'object' && typeof r.sha256 === 'string' && /^[0-9a-f]{64}$/.test(r.sha256)
+    ? r.sha256
+    : null
+
+// B1：支线产物缺失判定（各 workflow 同一实现；workflow 之间没有共用 js 模块的
+// 机制，改动需同步全部 workflow.js）。子任务返回 null、files/file 为空、或（经
+// 只读核验子任务确认）声明的产物文件不存在/为空（0 字节或只有空白），都算缺失；
+// workflow 自己碰不到文件系统，最后一项由支线核验子任务在盘上确认。
+const branchArtifacts = (v) => {
+  if (v === null || typeof v !== 'object') return []
+  const out = []
+  if (typeof v.file === 'string' && v.file.trim()) out.push(v.file.split('|', 1)[0].trim())
+  for (const f of Array.isArray(v.files) ? v.files : []) {
+    if (typeof f === 'string' && f.trim()) out.push(f.split('|', 1)[0].trim())
+  }
+  return out.filter(Boolean)
+}
+const PROBE_OUT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+  },
+  required: ['files'],
+}
+// 返回每个路径的 "<路径>|ok" / "<路径>|missing"；结果不完整（漏路径、格式不对）
+// 一律算核验失败（fail-closed），返回 null。paths 的每一项可以是路径或
+// [路径, 最小字节数]（契约 min_bytes；缺省 1，即非空白即可）。
+const probeBranchFiles = async (paths, phaseName) => {
+  const entries = paths.map((p) => (Array.isArray(p) ? p : [p, 1]))
+  const r = await agent(
+    `只读核验以下支线产物文件是否存在、非空白且达到字节数下限（不写任何文件）。逐个执行 bash：f='<路径>'；n=<字节数下限>；test -e "$f" && [ "$(wc -c < "$f")" -ge "$n" ] && [ -n "$(tr -d '[:space:]' < "$f")" ] && echo "$f|ok" || echo "$f|missing"。返回 files 数组：每项为上述一行的原样输出（<路径>|ok 或 <路径>|missing）：\n${entries
+      .map(([p, min]) => `- ${p}（至少 ${min} 字节）`)
+      .join('\n')}`,
+    { agentType: 'dalton-evidence', label: '支线核验', phase: phaseName, schema: PROBE_OUT, checkFiles: false }
+  )
+  if (r === null || typeof r !== 'object' || !Array.isArray(r.files)) return null
+  const answered = new Set()
+  for (const entry of r.files) {
+    if (typeof entry !== 'string') return null
+    const bar = entry.lastIndexOf('|')
+    const path = bar > 0 ? entry.slice(0, bar) : ''
+    const verdict = bar > 0 ? entry.slice(bar + 1) : ''
+    if (!path || (verdict !== 'ok' && verdict !== 'missing')) return null
+    answered.add(path)
+  }
+  if (entries.some(([p]) => !answered.has(p))) return null
+  return r.files
+}
+// B1 共用出口：缺失（含全部缺失）与核验失败都停在当前阶段之前，文案与审稿
+// block 一致，主线程补数后用原参数 resume 重跑（已完派发按 journal 复用）。
+const RESUME_HINT = '用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，缺失项重新派发'
+const gateBlock = (blocked, incomplete) => ({
+  ok: false,
+  blocked,
+  incomplete: [incomplete],
+  resume_hint: RESUME_HINT,
+})
+
+phase('一手材料与数字底表')
+const facts = await agent(
+  `${base} 按 ${S}/references/facts-ledger.md 建 ${R}/facts.md：读最近 4 份定期报告（${args.form || '10-K'}/10-Q）、4 次电话会、招股书（如有）、内部人交易；按 .agents/skills/dalton-financial-lenses/SKILL.md 做三把镜头；用 .agents/skills/dalton-financial-lenses/scripts/earnings_quality.py 算盈利质量（Sloan 比率、CFO/NI、现金转换周期）；所有必填键用 python ${S}/scripts/facts.py set 写入。若目标文件已存在，先读并核对，缺什么补什么，不必推倒重写。`,
+  { agentType: 'dalton-evidence', label: '数字底表', phase: '一手材料与数字底表', schema: OUT }
+)
+// B1 共用判定：底表 null/空回报、在盘缺失/不足契约下限（facts.md ≥500 字节）、
+// 核验子任务失败三种情形分开报，都停在问题清单之前。核验只看本步询问的路径
+// （回应里可能混有其他派发的条目）。
+{
+  const factsDeclared = branchArtifacts(facts).length > 0
+  const factsProbe = factsDeclared
+    ? await probeBranchFiles([[`${R}/facts.md`, 500]], '一手材料与数字底表')
+    : null
+  if (!factsDeclared) {
+    return gateBlock(
+      '关键支线缺失：数字底表（数字底表子任务未产出或未声明产物）',
+      '关键支线缺失：数字底表，已停在问题清单之前；补齐后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+    )
+  }
+  if (factsProbe === null) {
+    return gateBlock(
+      '支线核验子任务失败，无法确认数字底表在盘',
+      '支线核验子任务失败（无法确认 facts.md 存在且足 500 字节），已停在问题清单之前；请重试或补数后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+    )
+  }
+  const factsVerdict = factsProbe.find((e) => e.startsWith(`${R}/facts.md|`))
+  if (factsVerdict === undefined || !factsVerdict.endsWith('|ok')) {
+    return gateBlock(
+      `关键支线缺失：数字底表（${R}/facts.md 不存在、为空或不足 500 字节）`,
+      '关键支线缺失：数字底表，已停在问题清单之前；补齐后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+    )
+  }
+}
+
+phase('问题清单')
+const frame = await agent(
+  `${base} 按 ${S}/references/frame.md 写 ${R}/questions.md（每问含 A / B / C / D 初始自评档位，只写在底稿、不进备忘录正文）。PM 要求：${args.pm_brief || '无'}；重点问题：${
+    (args.focus_questions || []).join('；') || '默认'
+  }。写完跑 python ${S}/scripts/research_structure.py validate-agenda ${R}/questions.md 到通过。初次覆盖稿与知识层在 ${W}/drafts/ 与 ${W} 根目录。若目标文件已存在，先读并核对，缺什么补什么，不必推倒重写。`,
+  { agentType: 'general-purpose', label: 'frame', phase: '问题清单', schema: OUT }
+)
+// B1 共用判定：问题清单 null/空回报、在盘缺失/过小（契约 questions.md ≥200
+// 字节）、核验子任务失败三种情形分开报，都停在取证之前。核验只看本步询问的
+// 路径（回应里可能混有其他派发的条目）。
+{
+  const frameDeclared = branchArtifacts(frame).length > 0
+  const frameProbe = frameDeclared
+    ? await probeBranchFiles([[`${R}/questions.md`, 200]], '问题清单')
+    : null
+  if (!frameDeclared) {
+    return gateBlock(
+      '关键支线缺失：问题清单 frame（frame 子任务未产出或未声明产物）',
+      '关键支线缺失：问题清单 frame，已停在取证之前；补齐后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+    )
+  }
+  if (frameProbe === null) {
+    return gateBlock(
+      '支线核验子任务失败，无法确认问题清单在盘',
+      '支线核验子任务失败（无法确认 questions.md 存在且足 200 字节），已停在取证之前；请重试或补数后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+    )
+  }
+  const frameVerdict = frameProbe.find((e) => e.startsWith(`${R}/questions.md|`))
+  if (frameVerdict === undefined || !frameVerdict.endsWith('|ok')) {
+    return gateBlock(
+      `关键支线缺失：问题清单 frame（${R}/questions.md 不存在、为空或不足 200 字节）`,
+      '关键支线缺失：问题清单 frame，已停在取证之前；补齐后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+    )
+  }
+}
+
+phase('取证')
+// resume 提示：block 后主线程补数再用原参数 resume，失败支线的子任务会在已补
+// 文件的基础上核对完善，所以每条支线都写明“已存在先核对、缺什么补什么”。
+const RETRY_HINT = '若目标文件已存在，先读并核对，缺什么补什么，不必推倒重写。'
+const branches = [
+  ['a', 'branch-a-industry'],
+  ['b', 'branch-b-sellside-expert'],
+  ['c', 'branch-c-primary'],
+  ['d', 'branch-d-offstreet'],
+]
+const ev = await parallel(
+  branches.map(([k, f]) => () =>
+    agent(
+      `${base} 问题清单 ${R}/questions.md。按 ${S}/references/branch-common.md 与 ${S}/references/${f}.md 取证，写 ${R}/e${k}.md，文件末尾带 <!-- 完成 -->。profile=${
+        args.profile || 'toc'
+      }。${RETRY_HINT}`,
+      { agentType: 'dalton-evidence', label: `支线 ${k.toUpperCase()}`, phase: '取证', schema: OUT }
+    )
+  )
+)
+// B1：contract 把 e{a,b,c,d}.md 都列为必交（全为关键支线）。任一缺失（null、files
+// 为空、或核验发现文件不存在/为空）就停在建模之前，出口与上面共用 gateBlock。
+const evMissing = branches.filter((_, i) => branchArtifacts(ev[i]).length === 0).map(([k]) => k.toUpperCase())
+if (evMissing.length < branches.length) {
+  const toProbe = branches
+    .filter(([k]) => !evMissing.includes(k.toUpperCase()))
+    .map(([k]) => [`${R}/e${k}.md`, 200])
+  const byPath = new Map(branches.map(([k]) => [`${R}/e${k}.md`, k.toUpperCase()]))
+  const probe = toProbe.length ? await probeBranchFiles(toProbe, '取证') : []
+  if (probe === null) {
+    return gateBlock(
+      '支线核验子任务失败，无法确认支线产物在盘',
+      '支线核验子任务失败（无法确认产物文件存在且非空），已停在建模之前；请重试或补数后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+    )
+  }
+  for (const entry of probe) {
+    if (!entry.endsWith('|missing')) continue
+    const key = byPath.get(entry.slice(0, -'|missing'.length))
+    if (key && !evMissing.includes(key)) evMissing.push(key)
+  }
+}
+if (evMissing.length) {
+  return {
+    ...gateBlock(
+      `关键支线缺失：${evMissing.join('、')}（${evMissing.map((k) => `${R}/e${k.toLowerCase()}.md`).join('、')} 不存在或为空）`,
+      `关键支线缺失：${evMissing.join('、')}，已停在建模之前；补齐缺失产物后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用`
+    ),
+    evidence_missing: evMissing,
+  }
+}
+
+// 建模串行在最前、失败即停：估值、三情景与 Street vs House 的数字全部来自模型，
+// 模型不在，后面的写作与审稿都是白跑（3 天运行记录审查发现的问题）。门禁四问：
+// 子任务自检（recalc / audit --strict / Checks）是否回报通过、是否声明了本次的
+// model/<TICKER>-model-vNN.xlsx（规范化后完整路径相等；别的目录或别的公司不算）、
+// 声明的产物是否在盘上、只读探针对它实跑 audit --strict 是否通过（不只信自报）。
+const MODEL_OUT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+    summary: { type: 'string', minLength: 1 },
+    sha256: { type: 'string', minLength: 64 },
+    checks_passed: { type: 'boolean' },
+  },
+  required: ['files', 'summary', 'checks_passed'],
+}
+// 模型路径与版本：解析与“另存为下一版”都以磁盘最新版本为准（第 3 轮 #1）。
+const modelFileIn = (files) => {
+  const found = (Array.isArray(files) ? files : [])
+    .map((f) => {
+      const m = typeof f === 'string' ? f.match(/-model-v(\d+)\.xlsx$/) : null
+      return m ? { path: f, version: Number(m[1]) } : null
+    })
+    .filter(Boolean)
+  return found.length ? found.reduce((a, b) => (b.version > a.version ? b : a)).path : null
+}
+const nextVersion = (p) =>
+  p.replace(/-model-v(\d+)\.xlsx$/, (_, v) => `-model-v${String(Number(v) + 1).padStart(v.length, '0')}.xlsx`)
+const resolveFinalModel = async (label, phaseName = '解析最终模型') => {
+  const r = await agent(
+    `在 workspace 里执行：ls model/${T}-model-v*.xlsx 2>/dev/null | sort -V | tail -1，对输出文件计算 sha256sum。只返回 JSON：path（ls 的原样输出）与 sha256（64 位十六进制）。不写任何文件。`,
+    { agentType: 'dalton-evidence', label, phase: phaseName, schema: FINAL_MODEL }
+  )
+  return r && typeof r.path === 'string' && r.path && shaOf(r) ? { path: normPath(r.path), sha256: r.sha256 } : null
+}
+phase('建模')
+// 只读探针对模型实跑 audit --strict（收尾契约同一条命令），探针结果为门禁依据，
+// 不只信子任务自报的 checks_passed（第 3 轮 #4）。门禁和之后实际使用的模型必须是同一个文件，
+// 所以解析出磁盘最新版本后，若与建模回报的不同，对最新版本再审一次。
+const strictAudit = async (audited, label) => {
+  const modelAudit = await agent(
+    `只读核验（不写任何文件）。执行 bash：f='${audited}'；python .agents/skills/xlsx/scripts/audit.py "$f" --strict >/dev/null 2>&1 && echo "$f|audit_ok" || echo "$f|audit_failed"。返回 files 数组，只含这一行原样输出。`,
+    { agentType: 'dalton-evidence', label, phase: '建模', schema: PROBE_OUT, checkFiles: false }
+  )
+  const auditEntry = modelAudit && Array.isArray(modelAudit.files)
+    ? modelAudit.files.find((e) => typeof e === 'string' && e.startsWith(`${audited}|`))
+    : undefined
+  if (modelAudit === null || auditEntry === undefined) {
+    return gateBlock(
+      '模型审计探针失败，无法确认模型通过 audit --strict',
+      '模型审计探针未回报结果；请重试或修复模型后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+    )
+  }
+  if (!auditEntry.endsWith('|audit_ok')) {
+    return gateBlock(
+      `建模自检未通过（只读探针对 ${audited} 实跑 audit --strict 失败），已停在成稿之前`,
+      '建模自检未通过，已停在成稿之前；修复模型至 audit --strict 通过后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+    )
+  }
+  return null
+}
+let auditedModel = ''
+const model = await agent(
+  `${base} 按 ${S}/references/model-spec.md 建模型 ${W}/model/${T}-model-v01.xlsx（三表 + DCF + comps + Facts/Guidance vs Actual/Street vs House 三页），支线材料 ${R}/e*.md。recalc 与 audit --strict 必须通过，Checks 全 OK。返回 Scenarios 三情景的每股价值与关键驱动；checks_passed 只有在 recalc、audit --strict、Checks 全部通过时才是 true，任一失败或未跑都必须是 false 并在 summary 里写明失败项。若目标文件已存在，先读并核对，缺什么补什么，不必推倒重写。`,
+  { agentType: 'general-purpose', label: '建模', phase: '建模', schema: MODEL_OUT }
+)
+{
+  if (model === null) {
+    return gateBlock(
+      '建模失败（建模子任务未产出结果），已停在成稿之前',
+      '建模失败，已停在成稿之前；补齐模型后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+    )
+  }
+  if (model.checks_passed !== true) {
+    const why = model.summary ? `：${model.summary}` : ''
+    return gateBlock(
+      `建模自检未通过（recalc / audit --strict / Checks 任一失败或未回报${why}），已停在成稿之前`,
+      '建模自检未通过，已停在成稿之前；修复模型（recalc、audit --strict、Checks 全部通过）后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+    )
+  }
+  // 声明产物里必须有规范化后正好等于 model/<TICKER>-model-vNN.xlsx 的文件：
+  // 别的目录（archive/…）、别的公司（AAPL-…）或脚本、报告都不算本次的建模产物（第 3 轮 #3）。
+  const tickerLit = String(T).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const modelPathRe = new RegExp(`^model/${tickerLit}-model-v\\d+\\.xlsx$`)
+  const modelDeclared = branchArtifacts(model).filter((p) => modelPathRe.test(normPath(p)))
+  if (modelDeclared.length === 0) {
+    return gateBlock(
+      `建模失败（未声明本次的模型文件 model/${T}-model-vNN.xlsx；其他目录、其他公司的 xlsx 与脚本、报告都不算建模产物），已停在成稿之前`,
+      '建模失败，已停在成稿之前；在 model/ 目录产出本次公司的模型文件后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+    )
+  }
+  const modelProbe = await probeBranchFiles(
+    modelDeclared.map((p) => [p, 1000]),
+    '建模'
+  )
+  if (modelProbe === null) {
+    return gateBlock(
+      '支线核验子任务失败，无法确认模型在盘',
+      '支线核验子任务失败（无法确认模型文件存在且足 1000 字节），已停在成稿之前；请重试或补数后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+    )
+  }
+  if (!modelProbe.every((e) => e.endsWith('|ok'))) {
+    return gateBlock(
+      `建模失败（声明的模型产物不存在、为空或不足 1000 字节：${modelDeclared.join('、')}）`,
+      '建模失败，已停在成稿之前；补齐模型后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+    )
+  }
+  auditedModel = modelDeclared[0]
+  const auditBlock = await strictAudit(auditedModel, '模型审计')
+  if (auditBlock !== null) return auditBlock
+}
+
+// 写作、审模型、审稿与“另存为下一版”一律基于磁盘最新模型版本（第 3 轮 #1）：resume 时
+// 盘上可能已有上一 run 修订另存的 v02+，仍按 v01 审稿、并指示另存为已存在的 v02 都是错的。
+const initialModel = await resolveFinalModel('解析模型（建模后）', '建模')
+if (initialModel === null) {
+  return gateBlock(
+    '解析最新模型版本的子任务失败，已停在成稿之前',
+    '解析最新模型版本的子任务未回报结果；请重试后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+  )
+}
+let modelPath = initialModel.path
+if (modelPath !== auditedModel) {
+  const latestBlock = await strictAudit(modelPath, '模型审计（最新版本）')
+  if (latestBlock !== null) return latestBlock
+}
+if (modelPath !== normPath(`${W}/model/${T}-model-v01.xlsx`)) {
+  log(`磁盘最新模型版本为 ${modelPath}（可能来自上一 run 的修订另存），写作、审稿与修订都按该版本进行`)
+}
+
+// 一位写手一次成稿：三位写手分段接力会让各段复述上下文，是 DASH memo 重复的成因之一。
+// resume 保护：语言审查、审稿修订或人工补稿都会原位改 drafts/<D>-memo.md，journal 的
+// 产物哈希随之失配、“成稿”会重新派发——所以派发前先探测并校验（第 3 轮 #2）：
+// 通过结构校验的完整稿才当成稿沿用（不重写）；半成品/空文件派写手在已有内容基础上
+// 续写补全（保留已有内容，不推倒重写）；没有文件才从头写成。
+const memoPath = `${W}/drafts/${D}-memo.md`
+phase('成稿')
+const memoProbe = await agent(
+  `只读核验（不写任何文件）。执行 bash：f='${memoPath}'；if ! test -e "$f"; then echo "$f|absent"; elif [ "$(wc -c < "$f")" -ge 500 ] && python ${S}/scripts/validate_memo.py --mode full "$f" >/dev/null 2>&1; then echo "$f|ok|$(sha256sum "$f" | cut -d' ' -f1)"; else echo "$f|incomplete"; fi。返回 files 数组，只含这一行原样输出。`,
+  { agentType: 'dalton-evidence', label: 'memo 探测', phase: '成稿', schema: HASH, checkFiles: false }
+)
+const memoFiles = memoProbe && Array.isArray(memoProbe.files) ? memoProbe.files : null
+if (memoFiles === null) {
+  return gateBlock(
+    'memo 探测子任务失败，无法判断盘上是否已有备忘录',
+    'memo 探测子任务未回报结果；请重试或补数后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+  )
+}
+const memoEntry = memoFiles.find((e) => typeof e === 'string' && e.startsWith(`${memoPath}|`))
+if (memoEntry === undefined) {
+  return gateBlock(
+    `memo 探测结果缺 ${memoPath} 的条目`,
+    'memo 探测子任务的输出不含该路径的“<路径>|ok|<哈希> / incomplete / absent”条目；请重试后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+  )
+}
+const memoTail = memoEntry.slice(memoPath.length + 1)
+const memoCompleteSha = memoTail.startsWith('ok|') && /^[0-9a-f]{64}$/.test(memoTail.slice(3)) ? memoTail.slice(3) : null
+const memoPartial = memoTail === 'incomplete'
+if (memoCompleteSha === null && !memoPartial && memoTail !== 'absent') {
+  return gateBlock(
+    `memo 探测结果无法解析（${memoEntry}）`,
+    'memo 探测条目既不是 ok|<64 位哈希>也不是 incomplete / absent；请重试后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+  )
+}
+const memo = memoCompleteSha
+  ? {
+      files: [memoPath],
+      summary: `盘上已有 ${memoPath} 且结构校验通过（含语言审查或审稿修订），沿用最新稿，不重写`,
+      sha256: memoCompleteSha,
+    }
+  : await agent(
+      `${base} 通读 ${R}/questions.md（12 问研究提纲）、${R}/e*.md（含文末逐题证据小结）、${R}/facts.md 与模型 ${modelPath} 的 Scenarios / Street vs House / Valuation Summary 输出，同步按支线证据更新 ${R}/questions.md 每问的 A / B / C / D 自评档位（只写在底稿、不进备忘录正文），并按 ${S}/references/memo-writing.md（章节顺序：摘要 → 公司与商业模式 → 行业与竞争〔可并入上一节〕→ 业务质量 → 核心投资逻辑与争议 → 财务预测与估值 → 风险 → 管理层 → 跟踪 → 附录 → 引用）一次写成完整备忘录 ${memoPath}${
+        memoPartial
+          ? `。盘上已有 ${memoPath} 的半成品（结构校验未通过）：先读已有内容，保留其中可用的部分，补齐缺失的章节与引用，修到结构完整；不要推倒重写已有内容`
+          : ''
+      }。写给基金经理看：每件事只写一遍、12 问不进正文、计算过程放附录；信息缺口写它对判断的影响，不罗列“未披露”；成稿后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处。跑 python ${S}/scripts/validate_memo.py --mode full ${memoPath} --research-dir ${R} 到 0 FAIL，并返回 ${memoPath} 的 sha256。`,
+      { agentType: 'general-purpose', label: '成稿', phase: '成稿', schema: DRAFT_OUT }
+    )
+const memoSha = shaOf(memo)
+const memoOk = memo !== null && memoSha !== null
+
+// 第 1 轮语言审查：成稿之后、第一次独立审稿之前（改稿会换哈希，必须先改再送审）；
+// 第 2 轮在修订循环结束后的终稿上（见下方“语言审查 2”），两轮与 check_done 契约一致。
+phase('语言审查')
+const lang1 =
+  !memoOk
+    ? null
+    : await agent(
+        `对 ${memoPath} 做语言审查：调用工具 check_language(draft_path="${memoPath}", round=1)（只标问题），读 ${memoPath}.language.md 清单，按清单逐条修改 ${memoPath}（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）。改完跑 python ${S}/scripts/validate_memo.py --mode full ${memoPath} --research-dir ${R} 确认 0 FAIL，并返回 ${memoPath} 的 sha256。`,
+        { agentType: 'general-purpose', label: '语言审查 1', phase: '语言审查', schema: DRAFT_OUT }
+      )
+const lang1Sha = lang1 === null ? null : shaOf(lang1)
+const lang1Failed = memoOk && lang1Sha === null
+const reviewedMemoSha = lang1Sha || memoSha
+
+phase('审模型与审稿')
+const [mcheck, reviewRaw] = await parallel([
+  () =>
+    agent(
+      `按 .agents/skills/check-model/SKILL.md 审 ${modelPath}，只出报告不改模型，报告写 ${R}/model-check.md。`,
+      { agentType: 'general-purpose', label: 'check-model', phase: '审模型与审稿', schema: OUT }
+    ),
+  () =>
+    !memoOk
+      ? Promise.resolve(null)
+      : agent(
+          `审阅 ${memoPath}（被审草稿 sha256：${
+            reviewedMemoSha || '未知'
+          }；问题提纲 ${R}/questions.md，支线 ${R}/e*.md，底表 ${R}/facts.md，模型 ${modelPath}，全部只读，不修改任何文件）。先只凭摘要复述投资论点（立场、赔率、改判条件），并对 ${R}/questions.md 中自评为 C、D 档的问题重点核对，再按章节顺序（摘要 → 公司与商业模式 → 行业与竞争〔可并入上一节〕→ 业务质量 → 核心投资逻辑与争议 → 财务预测与估值 → 风险 → 管理层 → 跟踪 → 附录 → 引用）逐节检查：摘要（含投委会四问）、公司与商业模式、行业与竞争、业务质量（Good Business〔生意质量〕/ Good People〔管理与组织质量〕/ Good Price〔价格与赔率〕三项判断是否各自独立且有证据支撑，综合判断评级表与方向和行动是否一致）、核心投资逻辑与争议、财务预测与估值（估值三角、赔率卡与三层保护）、风险（含一年后亏损 30% 的事前推演是否写出了空方最强版本）、管理层、跟踪、附录、引用。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
+          { agentType: 'dalton-reviewer', label: '独立审稿', phase: '审模型与审稿', schema: VERDICT, reviewDraft: memoPath }
+        ),
+])
+
+const incomplete = []
+// 审稿结果未覆盖 1–9 项检查时按审稿失败处理（与发布审稿同一契约，fail-closed）。
+let review = reviewRaw
+if (review !== null && !completeReview(review)) {
+  incomplete.push('审稿结果未覆盖 1–9 项检查，按审稿失败处理')
+  review = null
+}
+let fix = null
+let finalReview = review
+let rounds = 0
+let currentMemoSha = reviewedMemoSha
+// 提前结束时解析一次磁盘上的模型，作为返回值里的 model（建模门禁保证 model 已在盘）。
+const resolveOnExit = async () => {
+  const r = await resolveFinalModel('解析模型（终止）')
+  if (r === null) incomplete.push('解析最终模型的子任务失败')
+  return r
+}
+// 所有提前返回的出口都经过 finish：返回值里的 model 只取传进来的解析结果。
+const finish = (resolved, extra = {}) => ({
+  ok: false,
+  memo: memoPath,
+  model: resolved ? resolved.path : null,
+  model_check: mcheck && `${R}/model-check.md`,
+  revise_rounds: rounds,
+  incomplete,
+  ...extra,
+})
+
+if (review && verdictOf(review) === 'block') {
+  incomplete.push(`审稿 block：${review.summary || '存在不可修订级问题'}`)
+  return finish(await resolveOnExit(), {
+    blocked: review.summary || '审稿 block',
+    // 人工处理后两条路：resume 继续跑后续阶段（盘上 memo 与模型不会被重写——
+    // 成稿前有 memo 探测、模型按磁盘最新版本识别），或按 SKILL 手动路径收尾。
+    resume_hint:
+      '审稿 block：先人工处理（按 must_fix 修订 memo 与模型、补证据），再选择：① 需要重走审稿/修订/收尾的，用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑（支线、底表、建模等未变产物直接复用；盘上已有的 memo 与模型不会被重写，流程沿用最新稿）；② 只需人工收尾的，按 dalton-full-coverage SKILL 手动降级路径执行，并以 manual=true 调用 dalton_check_done',
+  })
+}
+
+phase('修订')
+// revise → 修订 → 解析模型 → 复审，仅 1 轮（写作流程第 2 批：一轮修订）；
+// 复审仍是 revise 时按“审稿未最终通过”收场，不进第二轮；每个失败出口都写进 incomplete 并停下
+let resolved = null
+while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 1) {
+  rounds += 1
+  const target = nextVersion(modelPath)
+  const modelClause = `模型若有改动走 .agents/skills/model-update/SKILL.md，另存为 ${target}，不覆盖旧版本；模型没改就原样沿用 ${modelPath}。不管改没改，都必须在 files 里回报当前模型的路径（另存则报 ${target}，未改则报 ${modelPath}）`
+  fix = await agent(
+    `${base} 先核对 ${memoPath} 的 sha256 是否与审稿前（${
+      currentMemoSha || '当前记录值'
+    }）一致；按审稿意见与 ${R}/model-check.md 做第 ${rounds} 轮修订（memo 与模型；${modelClause}）。P0 全改，修订后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处；跑 python ${S}/scripts/validate_memo.py --mode full ${memoPath} --research-dir ${R} 到 0 FAIL。审稿意见：\n${JSON.stringify(
+      finalReview
+    )}`,
+    { agentType: 'general-purpose', label: `修订 ${rounds}`, phase: '修订', schema: DRAFT_OUT }
+  )
+  const fixedMemoSha = shaOf(fix)
+  if (fixedMemoSha === null) {
+    incomplete.push(`第 ${rounds} 轮修订失败（修订结果或其 sha256 缺失/非法），未复审，流程终止`)
+    return finish(await resolveOnExit())
+  }
+  {
+    const reportedPath = modelFileIn(fix.files)
+    if (!reportedPath) {
+      incomplete.push(`第 ${rounds} 轮修订未回报模型路径（模型未改也须回报 ${modelPath}），未复审，流程终止`)
+      return finish(await resolveOnExit())
+    }
+    const disk = await resolveFinalModel(`解析模型（修订 ${rounds}）`)
+    if (disk === null) {
+      incomplete.push(`第 ${rounds} 轮修订后解析模型的子任务失败，未复审，流程终止`)
+      return finish(null)
+    }
+    if (normPath(reportedPath) !== disk.path) {
+      incomplete.push(
+        `第 ${rounds} 轮修订后模型版本不一致：回报 ${reportedPath}，磁盘最大版本 ${disk.path}，最终模型不确定，未复审，流程终止`
+      )
+      return finish(disk)
+    }
+    modelPath = disk.path
+    resolved = disk
+  }
+  currentMemoSha = fixedMemoSha
+  const reReview = await agent(
+    `复审（第 ${rounds} 轮修订后）：审阅 ${memoPath}（被审草稿 sha256：${
+      currentMemoSha
+    }；模型 ${modelPath}；${W}/model/*.xlsx 只读不改）。重点核对上一轮 must_fix 是否全部解决。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。上一轮审稿意见：\n${JSON.stringify(
+      finalReview
+    )}`,
+    { agentType: 'dalton-reviewer', label: `复审 ${rounds}`, phase: '修订', schema: VERDICT, reviewDraft: memoPath }
+  )
+  if (reReview === null) {
+    incomplete.push(`第 ${rounds} 轮复审失败，流程终止`)
+    return finish(resolved)
+  }
+  if (!completeReview(reReview)) {
+    incomplete.push(`第 ${rounds} 轮复审结果未覆盖 1–9 项检查，按复审失败处理，流程终止`)
+    return finish(resolved)
+  }
+  if (verdictOf(reReview) === 'block') {
+    incomplete.push(`复审 block：${reReview.summary || '存在不可修订级问题'}，流程终止`)
+    return finish(resolved, {
+      blocked: reReview.summary || '复审 block',
+      resume_hint: RESUME_HINT,
+    })
+  }
+  finalReview = reReview
+}
+let reviewPassed = finalReview !== null && verdictOf(finalReview) === 'pass'
+
+// 笔记两轮：一次写完、不再改的支线/底稿笔记同样审两轮——第 1 轮审完按清单改，
+// 第 2 轮复核（改动过的文件再补一次 round=2 确认，绑定终态哈希）。model-check.md
+// 与首次审稿并行产出，其两轮也在这里补齐。
+const notesReview =
+  !memoOk || !reviewPassed
+    ? null
+    : await agent(
+        `对本次运行产出、给人读的 .md 笔记逐一做两轮语言审查（规则见 .agents/skills/dalton-language/SKILL.md，只标问题）。每个文件依次：1) 调用工具 check_language(draft_path="<文件>", round=1)，读 <文件>.language.md 清单并按清单修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）；2) 调用 check_language(draft_path="<文件>", round=2) 复核；若第 1 轮后改过稿，改完再调用一次 round=2 确认（记录追加在同一 json）。\n文件清单：\n- ${R}/facts.md\n- ${R}/questions.md\n- ${R}/ea.md\n- ${R}/eb.md\n- ${R}/ec.md\n- ${R}/ed.md\n- ${R}/model-check.md\n本次运行清单之外新写的其他给人读的 .md 一并同法处理；只审查以上文件，不审 json/xlsx 等机器文件与 .audit/.annotated/.language 侧车。返回处理过的文件列表与摘要。`,
+        { agentType: 'general-purpose', label: '笔记语言审查', phase: '修订', schema: OUT }
+      )
+if (memoOk && reviewPassed && notesReview === null) {
+  incomplete.push('笔记语言审查失败（支线/底稿笔记未完成两轮语言审查）')
+}
+
+// 第 2 轮语言审查：终稿内容定稿（审稿修订结束）之后。改了稿就再跑一次 round=2 复核，
+// 使最后一条第 2 轮记录绑定终稿哈希；哈希有变则终稿审稿重新绑定——语言修改不能让已有
+// pass 记录失效却无人重审。两轮语言审查与 check_done 的契约（rounds 1+2、末轮哈希=终稿）一致。
+const preLang2Sha = currentMemoSha
+const lang2 =
+  !memoOk || !reviewPassed
+    ? null
+    : await agent(
+        `对 ${memoPath} 做第 2 轮语言审查：调用工具 check_language(draft_path="${memoPath}", round=2)，读 ${memoPath}.language.md 清单，按清单逐条完成终稿语言修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）。若草稿有改动，再调用一次 check_language(draft_path="${memoPath}", round=2) 对终稿复核（记录追加在同一 json），并跑 python ${S}/scripts/validate_memo.py --mode full ${memoPath} --research-dir ${R} 确认 0 FAIL。返回 ${memoPath} 最终 sha256。`,
+        { agentType: 'general-purpose', label: '语言审查 2', phase: '修订', schema: DRAFT_OUT }
+      )
+const lang2Sha = lang2 === null ? null : shaOf(lang2)
+if (memoOk && reviewPassed && lang2Sha === null) {
+  incomplete.push('语言审查第 2 轮失败（结果或其 sha256 缺失/非法），未做终稿语言修改')
+  reviewPassed = false
+} else if (memoOk && reviewPassed && lang2Sha !== preLang2Sha) {
+  currentMemoSha = lang2Sha
+  const finalCheck = await agent(
+    `终稿审稿（语言修改后）：审阅 ${memoPath}（被审草稿 sha256：${lang2Sha}；模型 ${modelPath}；${W}/model/*.xlsx 只读不改）。重点：语言修改未动事实与数字，上一轮 must_fix 仍全部解决，validate_memo 仍 0 FAIL。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
+    { agentType: 'dalton-reviewer', label: '终稿审稿', phase: '修订', schema: VERDICT, reviewDraft: memoPath }
+  )
+  if (finalCheck === null) {
+    incomplete.push('终稿审稿失败')
+    reviewPassed = false
+  } else if (!completeReview(finalCheck)) {
+    incomplete.push('终稿审稿结果未覆盖 1–9 项检查，按审稿失败处理')
+    reviewPassed = false
+  } else {
+    finalReview = finalCheck
+    reviewPassed = verdictOf(finalCheck) === 'pass'
+  }
+}
+
+// 循环结束后再确认一次磁盘上的最终模型：本 run 内做过修订的（rounds > 0），磁盘最大
+// 版本必须就是修订确认的 modelPath（回报与盘不符 = 版本不确定）；本 run 未修订的
+// （rounds === 0，含 resume：上一 run 修订另存的 v02+ 就在盘上），按磁盘最新版本沿用。
+phase('解析最终模型')
+const finalModel = await resolveFinalModel('解析最终模型')
+if (finalModel === null) {
+  incomplete.push('解析最终模型的子任务失败，流程终止')
+  return finish(null)
+}
+if (rounds > 0 && finalModel.path !== normPath(modelPath)) {
+  incomplete.push(
+    `最终模型与修订确认的版本（${modelPath}）不一致：磁盘最大版本 ${finalModel.path}，最终模型不确定，流程终止`
+  )
+  return finish(finalModel)
+}
+if (rounds === 0 && finalModel.path !== normPath(modelPath)) {
+  log(`本 run 未修订模型，磁盘最新版本为 ${finalModel.path}（可能来自上一 run 的修订另存），按最新版本沿用`)
+}
+modelPath = finalModel.path
+
+const kp =
+  !memoOk
+    ? null
+    : await agent(
+        `${base} 先核对 ${memoPath} 的 sha256 是否为修订后哈希（${currentMemoSha || '修订后记录值'}）；最终模型为 ${finalModel.path}；再对比 ${W} 根目录现有知识层，按 PK.2 的 JSON Schema 写知识层修订草案 ${R}/knowledge-revision.json（结构为 {doc: {ops, reason, evidence_refs}}）：每处改动给旧值、新值、原因、证据（引用编号）。管理层指引风格与 C4 历史写入 management 部分；不直接修改 ${W}/data/。`,
+        { agentType: 'general-purpose', label: '知识层修订草案', phase: '修订', schema: OUT }
+      )
+
+// facts / frame / 支线 / 建模的缺失已在前置门禁返回，这里只收写作与审稿阶段的失败。
+if (!memoOk) incomplete.push('memo 成稿失败（草稿或其 sha256 缺失/非法）')
+if (lang1Failed) incomplete.push('语言审查第 1 轮失败（结果或其 sha256 缺失/非法），未按清单修改')
+if (mcheck === null) incomplete.push('check-model 失败')
+if (review === null && memoOk) incomplete.push('独立审稿失败')
+if (!reviewPassed && !incomplete.length) incomplete.push('审稿未最终通过（无 pass 记录）')
+if (kp === null && memoOk) incomplete.push('知识层修订草案失败')
+
+phase('产物核验')
+const deliverables = [
+  `${R}/facts.md`,
+  `${R}/facts.md.language.json`,
+  `${R}/questions.md`,
+  `${R}/questions.md.language.json`,
+  `${R}/ea.md`,
+  `${R}/ea.md.language.json`,
+  `${R}/eb.md`,
+  `${R}/eb.md.language.json`,
+  `${R}/ec.md`,
+  `${R}/ec.md.language.json`,
+  `${R}/ed.md`,
+  `${R}/ed.md.language.json`,
+  finalModel.path,
+  memoPath,
+  `${memoPath}.language.json`,
+  `${R}/model-check.md`,
+  `${R}/model-check.md.language.json`,
+  `${R}/knowledge-revision.json`,
+]
+const check =
+  !memoOk
+    ? null
+    : await agent(
+        `只读核对以下文件是否存在并计算 sha256（用 bash 的 test -e 与 sha256sum，不写任何文件）。只返回下面列出的文件，一个不能少、不能多、不能夹带其他条目：\n${deliverables
+          .map((p) => '- ' + p)
+          .join('\n')}\n返回 files 字符串数组：存在的文件写 “<路径>|<sha256>”，不存在的只写 “<路径>”（不带竖线）。`,
+        { agentType: 'dalton-evidence', label: '产物核验', phase: '产物核验', schema: HASH, checkFiles: false }
+      )
+const SHA_RE = /^[0-9a-f]{64}$/
+const expected = new Set(deliverables)
+const reported = new Set()
+for (const entry of check && Array.isArray(check.files) ? check.files : []) {
+  const bar = entry.indexOf('|')
+  const path = bar > 0 ? entry.slice(0, bar) : ''
+  const sha = bar > 0 ? entry.slice(bar + 1) : ''
+  if (!path || !SHA_RE.test(sha) || !expected.has(path)) {
+    incomplete.push(`产物核验返回无效条目：${entry}`)
+    continue
+  }
+  reported.add(path)
+}
+for (const path of deliverables) {
+  if (!reported.has(path)) incomplete.push(`产物缺失或未报哈希：${path}`)
+}
+
+phase('自动跟踪')
+// The tracking hint follows the run's own completion verdict exactly: an
+// unfinished run must not tell the analyst to switch tracking on.
+const runOk = memoOk && reviewPassed && incomplete.length === 0
+const tracking = runOk
+  ? {
+      action: 'enable',
+      source: 'coverage_finish',
+      tool: 'dalton_coverage_tracking',
+      call: 'dalton_coverage_tracking(action="enable", source="coverage_finish")',
+      respect_user_pause: true,
+    }
+  : {
+      ok: false,
+      skipped: true,
+      reason: !memoOk ? 'memo 未完成' : !reviewPassed ? '审稿未最终通过' : `流程未完成：${incomplete[0]}`,
+    }
+if (runOk) {
+  log(
+    `完整覆盖完成，收尾需调用 dalton_coverage_tracking(action="enable", source="coverage_finish") 开启 ${T} 自动跟踪（若 paused_by_user 则保持关闭）`
+  )
+} else {
+  log(`不开启自动跟踪：${tracking.reason}`)
+}
+
+return {
+  ok: runOk,
+  memo: `${W}/drafts/${D}-memo.md`,
+  model: finalModel.path,
+  review_done: finalReview !== null,
+  review_verdict: finalReview && verdictOf(finalReview),
+  language_done: memoOk && lang1Sha !== null && lang2Sha !== null,
+  revise_rounds: rounds,
+  fix_summary: fix && fix.summary,
+  model_check: mcheck && `${R}/model-check.md`,
+  knowledge_revision: kp && `${R}/knowledge-revision.json`,
+  evidence_missing: evMissing,
+  tracking,
+  incomplete,
+}
+
+
+===== WORKFLOW: initial-coverage =====
+--- FILE: initial-coverage/contract.json ---
+{
+  "name": "initial-coverage",
+  "description": "初次覆盖的完成契约：四支线 + bull/bear 快速版 + 12 问初筛 + 知识层初始化 + 审稿修订（对应 dalton-initial-coverage SKILL 的交付物）。",
+  "draft": "drafts/{as_of}-initial-coverage.md",
+  "params_required": [
+    "ticker",
+    "workspace_dir",
+    "as_of"
+  ],
+  "stages": [
+    {
+      "name": "取证（四支线并行）",
+      "artifacts": [
+        {
+          "path": "drafts/{as_of}-background.md",
+          "min_bytes": 200
+        },
+        {
+          "path": "research/{as_of}-ic/industry.md",
+          "min_bytes": 200
+        },
+        {
+          "path": "research/{as_of}-ic/lenses.json",
+          "min_bytes": 50
+        },
+        {
+          "path": "drafts/{as_of}-lenses.md",
+          "min_bytes": 200
+        },
+        {
+          "path": "research/{as_of}-ic/valuation.md",
+          "min_bytes": 200
+        },
+        {
+          "path": "research/{as_of}-ic/comps.xlsx",
+          "min_bytes": 1000
+        }
+      ]
+    },
+    {
+      "name": "bull/bear 快速版",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-ic/bullbear-quick.md",
+          "min_bytes": 200
+        }
+      ]
+    },
+    {
+      "name": "知识层初始化草案",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-ic/knowledge-proposal.json",
+          "min_bytes": 50
+        },
+        {
+          "path": "research/{as_of}-ic/underwriting-summary.md",
+          "min_bytes": 20
+        }
+      ]
+    },
+    {
+      "name": "12 问初筛成稿",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-ic/questions.md",
+          "min_bytes": 200
+        },
+        {
+          "path": "drafts/{as_of}-initial-coverage.md",
+          "min_bytes": 500
+        }
+      ]
+    },
+    {
+      "name": "独立审稿与修订",
+      "review": {
+        "agent": "dalton-reviewer",
+        "verdicts": [
+          "pass"
+        ],
+        "manual_sidecar": "research/{as_of}-ic/review.json"
+      }
+    }
+  ],
+  "closing": {
+    "knowledge_docs": [
+      "company",
+      "thesis",
+      "debate",
+      "drivers",
+      "management",
+      "agenda"
+    ],
+    "knowledge_source": "tool",
+    "verdict_kinds_any": [
+      "NEW_THESIS"
+    ],
+    "check_draft": {
+      "draft": "drafts/{as_of}-initial-coverage.md",
+      "required": false
+    },
+    "language_review": {
+      "draft": "drafts/{as_of}-initial-coverage.md"
+    }
+  }
+}
+
+--- FILE: initial-coverage/workflow.js ---
+export const meta = {
+  name: 'initial-coverage',
+  description: 'Dalton 初次覆盖：背景∥行业∥财务镜头∥估值历史 → bull/bear 快速版 → 知识层草案 → 12 问初筛 → 审稿',
+}
+
+const { ticker: T, company: C, workspace_dir: W, as_of: D } = args
+const R = `${W}/research/${D}-ic`
+// A1：SKILL 声明的 pm_question/sector（与可选的 revision_brief 文件路径）必须随
+// base 进每个子任务，否则 PM 的问题与上一轮审稿的修正要求到不了任何支线。
+const pmAsks = []
+if (args.pm_question) pmAsks.push(String(args.pm_question))
+if (args.revision_brief) pmAsks.push(`本轮必须修正的事项见 ${args.revision_brief}（先读该文件）`)
+const pmSection = pmAsks.length ? ` PM 的问题 / 本轮必须修正的事项：${pmAsks.join('；')}。` : ''
+const base = `先读 .agents/skills/dalton-conventions/SKILL.md；公司 ${C || T}（${T}），市场 ${args.market || 'US'}${
+  args.sector ? `，所属行业 ${args.sector}` : ''
+}，截至 ${D}。${pmSection}`
+const OUT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+    summary: { type: 'string', minLength: 1 },
+    sha256: { type: 'string', minLength: 64 },
+    gaps: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['files', 'summary'],
+}
+const VERDICT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+    verdict: { type: 'string', enum: ['pass', 'revise', 'block'] },
+    summary: { type: 'string', minLength: 1 },
+    must_fix: { type: 'array', items: { type: 'string', minLength: 1 } },
+    // items 元素的键（check/result/reason/lines）由 dalton-reviewer 的提示词契约约束，
+    // 结构深度保持在平台 schema_max_depth 限制内（元素键不展开为 schema 节点）。
+    items: { type: 'array', items: { type: 'object' } },
+  },
+  required: ['files', 'verdict', 'summary', 'items'],
+}
+const HASH = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+  },
+  required: ['files'],
+}
+const verdictOf = (r) => {
+  // pass 但 must_fix 非空按 revise 处理，与服务端 publish/review.py 的规则一致
+  //（提示词第 1 批第 2 轮 #2）。
+  if (r && typeof r === 'object' && r.verdict === 'pass' && Array.isArray(r.must_fix) && r.must_fix.length) {
+    return 'revise'
+  }
+  return r && typeof r === 'object' ? r.verdict : null
+}
+// 审稿结果与 dalton-reviewer 提示词、服务端发布审稿（publish/review.py）同一契约：
+// items 必须逐项覆盖 1–9 项检查，且 files 必须声明审稿子任务实际读取检查的全部文件。
+const REVIEW_CHECKS = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+const completeReview = (r, expectedFiles = []) => {
+  if (!r || typeof r !== 'object') return false
+  if (!Array.isArray(r.files) || expectedFiles.some((f) => !r.files.includes(f))) return false
+  const items = Array.isArray(r.items) ? r.items : []
+  const done = new Set()
+  for (const it of items) {
+    if (
+      it &&
+      typeof it === 'object' &&
+      Number.isInteger(it.check) &&
+      it.check >= 1 &&
+      it.check <= 9 &&
+      (it.result === 'pass' || it.result === 'revise')
+    ) {
+      done.add(it.check)
+    }
+  }
+  return REVIEW_CHECKS.every((c) => done.has(c))
+}
+const LANG_OUT = {
+  ...OUT,
+  required: ['files', 'summary', 'sha256'],
+}
+const DRAFT_OUT = {
+  ...OUT,
+  properties: {
+    ...OUT.properties,
+    underwriting_version: { type: 'integer', minimum: 1 },
+  },
+  required: ['files', 'summary', 'sha256', 'underwriting_version'],
+}
+const REVISION_OUT = {
+  ...OUT,
+  properties: {
+    ...OUT.properties,
+    needs_reunderwrite: { type: 'boolean' },
+    underwriting_version: { type: 'integer', minimum: 1 },
+  },
+  required: ['files', 'summary', 'sha256', 'needs_reunderwrite', 'underwriting_version'],
+}
+const shaOf = (r) =>
+  r && typeof r === 'object' && typeof r.sha256 === 'string' && /^[0-9a-f]{64}$/.test(r.sha256)
+    ? r.sha256
+    : null
+
+// B1：支线产物缺失判定（各 workflow 同一实现；workflow 之间没有共用 js 模块的
+// 机制，改动需同步全部 workflow.js）。子任务返回 null、files/file 为空、或（经
+// 只读核验子任务确认）声明的产物文件不存在/为空（0 字节或只有空白），都算缺失；
+// workflow 自己碰不到文件系统，最后一项由支线核验子任务在盘上确认。
+const branchArtifacts = (v) => {
+  if (v === null || typeof v !== 'object') return []
+  const out = []
+  if (typeof v.file === 'string' && v.file.trim()) out.push(v.file.split('|', 1)[0].trim())
+  for (const f of Array.isArray(v.files) ? v.files : []) {
+    if (typeof f === 'string' && f.trim()) out.push(f.split('|', 1)[0].trim())
+  }
+  return out.filter(Boolean)
+}
+const PROBE_OUT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+  },
+  required: ['files'],
+}
+const DRAFT_PROBE_OUT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+    draft_content: { type: 'string', minLength: 1 },
+  },
+  required: ['files', 'draft_content'],
+}
+const UW_PROBE_OUT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+    exists: { type: 'boolean' },
+    first_line: { type: 'string', minLength: 1 },
+  },
+  required: ['files', 'exists', 'first_line'],
+}
+const LEGACY_HEADING_RE = /^#{1,3}\s*一、\s*12\s*问初筛/m
+const SAVED_VERSION_RE = /^已保存\s*thesis\s*版本\s*(\d+)(?:$|[；;])/i
+const checkUnderwritingSummary = (u, expectedFiles) => {
+  if (
+    !u ||
+    typeof u !== 'object' ||
+    !Array.isArray(u.files) ||
+    expectedFiles.some((f) => !u.files.includes(f))
+  ) {
+    return { ok: false, reason: 'probe_failed', version: null }
+  }
+  if (!u.exists) return { ok: false, reason: 'missing', version: null }
+  const fl = typeof u.first_line === 'string' ? u.first_line.trim() : ''
+  if (
+    fl.includes('没有保存成功') ||
+    fl.includes('不能写进正文') ||
+    fl.includes('尚未保存')
+  ) {
+    return { ok: false, reason: 'not_saved', version: null }
+  }
+  const m = fl.match(SAVED_VERSION_RE)
+  if (!m) return { ok: false, reason: 'invalid_header', version: null }
+  const version = Number(m[1])
+  if (!Number.isInteger(version) || version < 1) {
+    return { ok: false, reason: 'invalid_header', version: null }
+  }
+  return { ok: true, reason: 'ok', version }
+}
+const verifyUnderwriting = async (label, phaseName, extraFiles = []) => {
+  const summaryFile = `${R}/underwriting-summary.md`
+  const expectedFiles = [summaryFile, ...extraFiles]
+  const filesListJson = JSON.stringify(expectedFiles)
+  const extraReadHint = extraFiles.length
+    ? `并同时读取核对 ${extraFiles.join('、')}，`
+    : ''
+  const probe = await agent(
+    `只读核验赔率摘要 ${summaryFile}（${extraReadHint}不写任何文件）：先读取 ${expectedFiles.join('、')}（若文件不存在则跳过读取），按以下要求返回 JSON：1) \`files\`：固定返回本轮核验的目标文件列表 \`${filesListJson}\`（即使文件不存在也必须原样返回该数组）；2) \`exists\`：${summaryFile} 是否存在且至少 20 字节（\`true\` / \`false\`）；3) \`first_line\`：${summaryFile} 第一个非空行的原样文本（文件不存在或为空时填 \`"none"\`）。`,
+    { agentType: 'dalton-evidence', label, phase: phaseName, schema: UW_PROBE_OUT, checkFiles: false }
+  )
+  return { probe, ...checkUnderwritingSummary(probe, expectedFiles) }
+}
+// 返回每个路径的 "<路径>|ok" / "<路径>|missing"；结果不完整（漏路径、格式不对）
+// 一律算核验失败（fail-closed），返回 null。paths 的每一项可以是路径或
+// [路径, 最小字节数]（契约 min_bytes；缺省 1，即非空白即可）。
+const probeBranchFiles = async (paths) => {
+  const entries = paths.map((p) => (Array.isArray(p) ? p : [p, 1]))
+  const r = await agent(
+    `只读核验以下支线产物文件是否存在、非空白且达到字节数下限（不写任何文件）。逐个执行 bash：f='<路径>'；n=<字节数下限>；test -e "$f" && [ "$(wc -c < "$f")" -ge "$n" ] && [ -n "$(tr -d '[:space:]' < "$f")" ] && echo "$f|ok" || echo "$f|missing"。返回 files 数组：每项为上述一行的原样输出（<路径>|ok 或 <路径>|missing）：\n${entries
+      .map(([p, min]) => `- ${p}（至少 ${min} 字节）`)
+      .join('\n')}`,
+    { agentType: 'dalton-evidence', label: '支线核验', phase: '取证', schema: PROBE_OUT, checkFiles: false }
+  )
+  if (r === null || typeof r !== 'object' || !Array.isArray(r.files)) return null
+  const answered = new Set()
+  for (const entry of r.files) {
+    if (typeof entry !== 'string') return null
+    const bar = entry.lastIndexOf('|')
+    const path = bar > 0 ? entry.slice(0, bar) : ''
+    const verdict = bar > 0 ? entry.slice(bar + 1) : ''
+    if (!path || (verdict !== 'ok' && verdict !== 'missing')) return null
+    answered.add(path)
+  }
+  if (entries.some(([p]) => !answered.has(p))) return null
+  return r.files
+}
+// entries: [[key, 中文名, 产物路径数组], ...]；路径可以是字符串或 [路径, 契约
+// min_bytes]；resultOf 由调用方给出 key→子任务结果。
+const missingBranchesOf = async (entries, resultOf) => {
+  const missing = entries.filter(([k]) => branchArtifacts(resultOf(k)).length === 0).map(([k]) => k)
+  const byPath = new Map(
+    entries.flatMap(([k, , ps]) => ps.map((p) => [(Array.isArray(p) ? p[0] : p), k]))
+  )
+  const toProbe = entries.filter(([k]) => !missing.includes(k)).flatMap(([, , ps]) => ps)
+  if (!toProbe.length) return { missing, probeFailed: false }
+  const probe = await probeBranchFiles(toProbe)
+  if (probe === null) return { missing, probeFailed: true }
+  for (const entry of probe) {
+    if (!entry.endsWith('|missing')) continue
+    const key = byPath.get(entry.slice(0, -'|missing'.length))
+    if (key && !missing.includes(key)) missing.push(key)
+  }
+  return { missing, probeFailed: false }
+}
+
+phase('取证')
+// resume 提示：block 后主线程补数再用原参数 resume，失败支线的子任务会在已补
+// 文件的基础上核对完善，所以每条支线都写明“已存在先核对、缺什么补什么”。
+const RETRY_HINT = '若目标文件已存在，先读并核对，缺什么补什么，不必推倒重写。'
+const [bg, ind, lens, val] = await parallel([
+  () =>
+    agent(
+      `${base} 按 .agents/skills/dalton-company-background/SKILL.md 写 9 段背景稿到 ${W}/drafts/${D}-background.md。${RETRY_HINT}`,
+      { agentType: 'dalton-evidence', label: '公司背景', phase: '取证', schema: OUT }
+    ),
+  () =>
+    agent(
+      `${base} 按 .agents/skills/dalton-initial-coverage/references/branch-industry.md 写行业支线到 ${R}/industry.md。${
+        args.peers && args.peers.length ? '同业候选：' + args.peers.join(',') : ''
+      }${RETRY_HINT}`,
+      { agentType: 'dalton-evidence', label: '行业支线', phase: '取证', schema: OUT }
+    ),
+  () =>
+    agent(
+      `${base} 按 .agents/skills/dalton-financial-lenses/SKILL.md 做三把镜头，JSON 到 ${R}/lenses.json，草稿到 ${W}/drafts/${D}-lenses.md。${RETRY_HINT}`,
+      { agentType: 'dalton-evidence', label: '财务镜头', phase: '取证', schema: OUT }
+    ),
+  // B1 补充：child_timeout 不能按派发覆盖（validate_dispatch 只认
+  // agentType/label/phase/schema，driver 统一用 caps.child_timeout），估值支线
+  // 拆成“取数”“写稿”两次派发，各得一个完整的 child_timeout 窗口；取数产物
+  // 落盘后，resume 时写稿可单独重派。
+  () =>
+    (async () => {
+      const data = await agent(
+        `${base} 按 .agents/skills/dalton-initial-coverage/references/branch-valuation-history.md 只做取数阶段：拉取估值历史分解（股价、EPS、PE）与可比公司财务所需的全部原始数据，连同选定的可比清单与选取理由存 ${R}/valuation-data.json（不写正式稿、不建 xlsx）；已取到的写明来源，取不到的逐条记进 gaps。${RETRY_HINT}`,
+        { agentType: 'dalton-evidence', label: '估值取数', phase: '取证', schema: OUT }
+      )
+      // B1 共用判定：取数返回 null 或没有声明任何产物（空 files）都不派写稿；
+      // 声明了产物还要在盘核验 valuation-data.json 存在且非空（派发本身失败同
+      // 路）。任一失败都返回 null，由统一的支线 block 出口停下。核验只看本步
+      // 询问的那个路径（回应里可能混有其他派发的条目）。
+      if (branchArtifacts(data).length === 0) return null
+      const dataProbe = await probeBranchFiles([[`${R}/valuation-data.json`, 1]])
+      const dataVerdict =
+        dataProbe !== null
+          ? dataProbe.find((e) => e.startsWith(`${R}/valuation-data.json|`))
+          : null
+      if (dataVerdict === null || !dataVerdict.endsWith('|ok')) return null
+      return await agent(
+        `${base} 按 .agents/skills/dalton-initial-coverage/references/branch-valuation-history.md 做写稿阶段：以 ${R}/valuation-data.json 为底（缺的自行补取），写估值历史与可比（含 ln(P1/P0)=ln(EPS1/EPS0)+ln(PE1/PE0) 分解表）到 ${R}/valuation.md，可比表 ${R}/comps.xlsx。${RETRY_HINT}`,
+        { agentType: 'dalton-evidence', label: '估值历史与可比', phase: '取证', schema: OUT }
+      )
+    })(),
+])
+
+// 契约 min_bytes：核验下限按 contract.json 的取证阶段逐项取。
+const BRANCHES = [
+  ['bg', '公司背景', [[`${W}/drafts/${D}-background.md`, 200]]],
+  ['ind', '行业支线', [[`${R}/industry.md`, 200]]],
+  ['lens', '财务镜头', [[`${R}/lenses.json`, 50], [`${W}/drafts/${D}-lenses.md`, 200]]],
+  ['val', '估值历史与可比', [[`${R}/valuation.md`, 200], [`${R}/comps.xlsx`, 1000]]],
+]
+const got = { bg, ind, lens, val }
+const { missing, probeFailed } = await missingBranchesOf(BRANCHES, (k) => got[k])
+const BRANCH_NAME = Object.fromEntries(BRANCHES.map(([k, name]) => [k, name]))
+const BRANCH_PATHS = Object.fromEntries(
+  BRANCHES.map(([k, , ps]) => [k, ps.map((p) => (Array.isArray(p) ? p[0] : p))])
+)
+log(`支线完成 ${BRANCHES.length - missing.length}/4，缺：${missing.join(',') || '无'}`)
+// B1：contract 把四条支线产物都列为必交（全为关键支线，估值在内）。任一缺失
+// （含全部缺失）都停在成稿之前，出口与审稿 block 同一段文案：主线程补数后用
+// 原参数 resume 重跑——已完派发按 journal 复用（label、prompt 哈希与产物哈希
+// 一致才复用，见 RunWorkflow 的 resume 机制）。
+if (probeFailed) {
+  return {
+    ok: false,
+    blocked: '支线核验子任务失败，无法确认支线产物在盘',
+    missing,
+    incomplete: [
+      '支线核验子任务失败（无法确认产物文件存在且非空），已停在成稿之前；请重试或补数后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑',
+    ],
+    resume_hint:
+      '用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，失败支线重新派发',
+  }
+}
+if (missing.length) {
+  const names = missing.map((k) => BRANCH_NAME[k]).join('、')
+  const absent = missing.flatMap((k) => BRANCH_PATHS[k]).join('、')
+  return {
+    ok: false,
+    blocked: `关键支线缺失：${names}（${absent} 不存在或为空）`,
+    missing,
+    incomplete: [
+      `关键支线缺失：${names}，已停在成稿之前；补齐缺失产物后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用`,
+    ],
+    resume_hint:
+      '补齐缺失支线产物后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，缺失支线重新派发（其提示词已写明“若目标文件已存在，先读并核对，缺什么补什么”）',
+  }
+}
+
+phase('bull/bear 快速版')
+const bb = await agent(
+  `${base} 读 ${R}/ 下全部支线文件与 ${W}/drafts/${D}-background.md，按 .agents/skills/dalton-bullbear/SKILL.md 的快速版方法写成文字版到 ${R}/bullbear-quick.md（可补充检索内部库与 AlphaEngine）。缺失支线：${
+    missing.join(',') || '无'
+  }。`,
+  { agentType: 'general-purpose', label: 'bull/bear 快速版', phase: 'bull/bear 快速版', schema: OUT }
+)
+
+const draftPath = `${W}/drafts/${D}-initial-coverage.md`
+const draftProbe = await agent(
+  `只读探测草稿文件 ${draftPath}（不写任何文件）：1) \`files\` 数组固定返回 \`["${draftPath}"]\`（即使文件不存在也必须返回该路径）；2) 若 ${draftPath} 存在且非空，\`draft_content\` 原样返回该文件前 4000 字符文本（保留原始换行）；若文件不存在或为空，\`draft_content\` 填 \`"absent"\`。`,
+  { agentType: 'dalton-evidence', label: '草稿探测', phase: 'bull/bear 快速版', schema: DRAFT_PROBE_OUT, checkFiles: false }
+)
+const isLegacyDraft = Boolean(
+  draftProbe &&
+    Array.isArray(draftProbe.files) &&
+    draftProbe.files.includes(draftPath) &&
+    typeof draftProbe.draft_content === 'string' &&
+    draftProbe.draft_content !== 'absent' &&
+    LEGACY_HEADING_RE.test(draftProbe.draft_content)
+)
+
+let kp = null
+let uwInit = null
+if (!isLegacyDraft) {
+  phase('知识层草案')
+  kp = await agent(
+    `${base} 从 ${R}/ 下全部支线文件（industry.md、lenses.json、valuation.md、bullbear-quick.md）与 ${W}/drafts/${D}-background.md、${W}/drafts/${D}-lenses.md 抽取知识层初始化草案，按知识层 JSON Schema（见 src/dalton/knowledge/schemas/thesis.schema.json、.agents/skills/dalton-knowledge/SKILL.md 与 .agents/skills/dalton-knowledge/references/structured-write-example.md）写入 ${R}/knowledge-proposal.json，顶层结构为 \`{doc: [ops]}\`，可直接传给 \`knowledge_update\`（覆盖 \`company\`、\`thesis\`〔含支柱、\`underwriting\` 三情景赔率卡、\`evidence\`〕、\`debate\`、\`drivers\`、\`management\` 初记、\`agenda\`）。不直接修改 ${W}/data/。${RETRY_HINT}`,
+    { agentType: 'general-purpose', label: '知识层草案', phase: '知识层草案', schema: OUT }
+  )
+  if (kp === null || branchArtifacts(kp).length === 0) {
+    return {
+      ok: false,
+      blocked: `知识层草案失败（未产出 ${R}/knowledge-proposal.json）`,
+      missing,
+      incomplete: [
+        `知识层草案失败（未产出 ${R}/knowledge-proposal.json），已停在成稿之前；请重试或补齐后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑`,
+      ],
+      resume_hint:
+        '补齐知识层草案后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：已完成的四条支线与 bull/bear 快速版会直接复用',
+    }
+  }
+  // 写手动笔前必须先正式写入并锁定赔率数字：主智能体先正式写入 agenda/debate 等跨文档引用，
+  // 再对 thesis 先 dry_run=True 检查、通过后 dry_run=False 正式写入，按固定格式写第一行“已保存 thesis 版本 N”。
+  uwInit = await verifyUnderwriting('赔率摘要核验', '知识层草案')
+  if (uwInit.reason === 'probe_failed') {
+    return {
+      ok: false,
+      blocked: `赔率摘要核验子任务失败，无法确认 ${R}/underwriting-summary.md 状态`,
+      knowledge_proposal: `${R}/knowledge-proposal.json`,
+      missing,
+      incomplete: [
+        `赔率摘要核验子任务失败（无法确认 ${R}/underwriting-summary.md 状态），已停在成稿之前；请用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑`,
+      ],
+      resume_hint:
+        '用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：已完成的四条支线、bull/bear 快速版与知识层草案会直接复用',
+    }
+  }
+  if (!uwInit.ok) {
+    const reasonText =
+      uwInit.reason === 'not_saved'
+        ? `赔率尚未正式保存（${R}/underwriting-summary.md 含“尚未保存”“没有保存成功”或“不能写进正文”，严禁直接续跑）`
+        : uwInit.reason === 'invalid_header'
+          ? `${R}/underwriting-summary.md 第一行缺少固定格式“已保存 thesis 版本 N”`
+          : `${R}/underwriting-summary.md 尚未生成`
+    const pauseInstruction = `请按顺序执行：1) 先把 ${R}/knowledge-proposal.json 中不依赖报告数字的 \`agenda\`、\`debate\`、\`company\`、\`drivers\`、\`management\` 先调用 \`knowledge_update(..., dry_run=True)\` 校验，通过后再调用 \`knowledge_update(..., dry_run=False)\` 正式写入，确保 \`trigger_refs\` 等跨文档引用已落库；2) 再对 \`thesis\` 先调用 \`knowledge_update(doc="thesis", ..., dry_run=True)\` 检查（若返回含“没有保存成功”或“不能写进正文”，须先修正 ${R}/knowledge-proposal.json 重试），确认无误后调用 \`knowledge_update(doc="thesis", ..., dry_run=False)\` 正式写入；3) 按固定格式写入 ${R}/underwriting-summary.md：第一行固定写 \`已保存 thesis 版本 N\`（\`N\` 取自 \`knowledge_update\` 返回的版本号；若 \`house_view.stance\` 为 \`"no_view"\` 且 \`underwriting\` 为空，第一行写 \`已保存 thesis 版本 N；暂不表态，不计算赔率\`），摘要文件首行之后只贴正式保存后的赔率摘要，不要贴试写的返回，然后用启动时的同一组参数 + \`resume=<.progress.json 里的 run_id>\` 续跑`
+    return {
+      ok: false,
+      blocked: `待主智能体锁定赔率摘要（${reasonText}）：${pauseInstruction}`,
+      knowledge_proposal: `${R}/knowledge-proposal.json`,
+      underwriting_summary: `${R}/underwriting-summary.md`,
+      missing,
+      incomplete: [
+        `待主智能体锁定赔率摘要（${reasonText}），已停在成稿之前；${pauseInstruction}`,
+      ],
+      resume_hint: pauseInstruction,
+    }
+  }
+}
+
+phase('12 问初筛')
+const draftPrompt = isLegacyDraft
+  ? `${base} 盘上已有在途旧结构草稿 ${draftPath}：综合 ${R}/ 全部文件及 ${W}/drafts/${D}-background.md、${W}/drafts/${D}-lenses.md 保留旧结构继续完善 ${draftPath}（不要求补写 ${R}/questions.md 与 ${R}/underwriting-summary.md；\`underwriting_version\` 固定填 \`1\`），并返回 ${draftPath} 的 \`sha256\`。缺失支线对应的问题写“缺口：需要什么、已尝试路径”。`
+  : `${base} 按 .agents/skills/dalton-initial-coverage/references/screen-12q.md、.agents/skills/dalton-initial-coverage/templates/questions.md 和 .agents/skills/dalton-initial-coverage/templates/initial-coverage.md，综合 ${R}/ 全部文件（含赔率摘要 ${R}/underwriting-summary.md 与 ${R}/knowledge-proposal.json）及 ${W}/drafts/${D}-background.md、${W}/drafts/${D}-lenses.md，由一位写手按以下步骤成稿：\n1) 先写内部 12 问底稿 ${R}/questions.md：逐题回答 Q1–Q12 并标明归属章节；未取得的数据在对应题目下写明“缺口：需要什么、已尝试路径”。\n2) 再写初次覆盖报告 ${draftPath}：直接采用 ${R}/underwriting-summary.md 中的赔率数字。正文第一个二级标题必须是「## 摘要」（或「## 一页摘要」「## Summary」）；摘要不用粗体标签列清单，表前用四到六段连续论证写清结论与行动分类、行情与流动性、生意怎么赚钱与壁垒在哪、利润率为什么在这个水平、长期趋势与短期噪音怎么区分（哪些变量能持续跟踪、哪些短期波动不比市场多预判）、观察价/买点区间为什么由业务质量上限和相对同业估值上限决定，再放紧凑三情景赔率表、赔率结论与决定行动的那一个关键条件（改判条件与确认/预警/证伪阈值全文只在「## 研究议程与跟踪」节完整列一次，摘要与分歧等其他章节不再展开）。其余章节覆盖「## 公司与商业模式」「## 业务质量初判」（按 method.md §5 与 screen-12q.md 第 3 条，用“维度 | 评级 | 一句理由”三行表给出 Good Business〔生意质量〕、Good People〔管理与组织质量〕、Good Price〔价格与赔率〕评级及一句判断加最关键的一个证据，评级格只填一个词；表下一段写组合对应的方向和行动，以及最需要完整覆盖来核实的一点）「## 核心投资逻辑与主要分歧」（每个分歧用两三段连贯的业务机制论证写到我们的判断为止，不再各写改判条件，不用“多方 / 空方 / 我们的判断”三段对称清单；单列「### 交易角度」小节，覆盖卖方覆盖密度、季度噪音、期权隐含波动率与借券成本、动量与回撤、相对同业性价比，无则写“暂无”；「### 核心投资支柱」小节写每个支柱是什么、现在处于什么状态并指明对应哪条分歧，确认 / 预警 / 证伪阈值只在「## 研究议程与跟踪」完整列一次，不重复展开论据或阈值）「## 估值与赔率」（写清观察价/买点区间的业务质量上限与相对同业估值上限依据，正文退出倍数判断与赔率表一致；公司有可分拆的业务、大额净现金或投资时，补一个分部加总的核对来校验倍数法结论）「## 风险」（只写前面分歧与三层保护中还没覆盖到的损失路径，含“若一年后亏损 30%，最可能怎么发生”的 2–3 条最强空方路径）「## 管理层与资本配置」（含背景与指引风格初判、激励与持股、近一年内部人增减持、资本配置记录各一句）「## 研究议程与跟踪」（完整列出改判条件、各支柱验证阈值与催化剂日历，保留文末英文一句话收尾），按需设「## 附注」，文末为单一「## 引用」。\n3) 正文文风与数字纪律：按章节展开论证，不在正文以标题、加粗或列表逐条列 Q1–Q12；每段先用短句给判断，单句事实数字一般不超过两个；同一组同业倍数比较全文只在一处展开；三情景的价格、倍数、回报列成紧凑小表；「[假设]」写在假设数字所在的那一句或那一格里（核验按句〔句末标点或换行断开，见 dalton-conventions 的 writing.md 第 4 节〕或按表格单元格豁免，标记不传到下一句或相邻格子，段前或表前写一次不够）；会改变结论、确信度或行动的数据缺口在相关判断首次出现处用一句话写清影响，其余正文没有说明过的缺口、口径与来源分歧只放进「## 附注」（正文已就影响说过的缺口不再进附注），同一缺口全文只说明一次；成稿后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处；正文不出现英文字段名、枚举值和内部代号，常见买方英文术语直接用且不建术语替换表。\n4) 返回 JSON：\`files\` 必须声明 \`["${draftPath}", "${R}/questions.md", "${R}/underwriting-summary.md"]\`，\`underwriting_version\` 填入 ${R}/underwriting-summary.md 第一行的版本号 \`N\`，\`sha256\` 填入 ${draftPath} 的 sha256。`
+const draft = await agent(draftPrompt, {
+  agentType: 'general-purpose',
+  label: '初筛成稿',
+  phase: '12 问初筛',
+  schema: DRAFT_OUT,
+})
+
+// The writer reads the payoff summary, so it must declare it: the journal
+// only re-runs a dispatch when a declared file changes.
+const draftDeclaresSummary =
+  isLegacyDraft ||
+  (draft !== null &&
+    Array.isArray(draft.files) &&
+    draft.files.some((f) => typeof f === 'string' && f.replace(/^\.\//, '') === `${R}/underwriting-summary.md`.replace(/^\.\//, '')))
+const draftVersionOk =
+  draft !== null &&
+  draftDeclaresSummary &&
+  Number.isInteger(draft.underwriting_version) &&
+  draft.underwriting_version >= 1
+const draftSha = draftVersionOk ? shaOf(draft) : null
+const draftOk = draft !== null && draftSha !== null
+
+// 第 1 轮语言审查：初稿写完之后、第一次独立审稿之前（改稿会换哈希，必须先改再送审）。
+phase('语言审查')
+const lang1 =
+  !draftOk
+    ? null
+    : await agent(
+        `对 ${draftPath} 做第 1 轮语言审查：调用工具 check_language(draft_path="${draftPath}", round=1)（只标问题），读 ${draftPath}.language.md 清单，按清单逐条修改 ${draftPath}（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）。改完返回 ${draftPath} 的 sha256。`,
+        { agentType: 'general-purpose', label: '语言审查 1', phase: '语言审查', schema: LANG_OUT }
+      )
+const lang1Sha = lang1 === null ? null : shaOf(lang1)
+const lang1Failed = draftOk && lang1Sha === null
+const reviewedSha = lang1Sha || draftSha
+
+if (isLegacyDraft) {
+  phase('知识层草案')
+  kp = await agent(
+    `${base} 从 ${draftPath} 与 ${R}/ 下全部支线文件抽取知识层初始化草案，按知识层 JSON Schema（见 .agents/skills/dalton-knowledge/SKILL.md）写入 ${R}/knowledge-proposal.json，顶层结构为 \`{doc: [ops]}\`，可直接传给 \`knowledge_update\`（覆盖 \`company\`、\`thesis\`、\`debate\`、\`drivers\`、\`management\` 初记、\`agenda\`）。不直接修改 ${W}/data/。`,
+    { agentType: 'general-purpose', label: '知识层草案', phase: '知识层草案', schema: OUT }
+  )
+}
+
+phase('审稿')
+const reviewExpectedFiles = isLegacyDraft
+  ? [draftPath]
+  : [draftPath, `${R}/questions.md`, `${R}/underwriting-summary.md`]
+const reviewFilesHint = JSON.stringify(reviewExpectedFiles)
+const reviewPrompt = isLegacyDraft
+  ? `审阅 ${draftPath}（被审草稿 sha256：${reviewedSha || '未知'}；支线材料在 ${R}/，只读不改文件）。这是在途旧结构买方初次覆盖，按旧结构规则核对草稿内 Q1/Q2/Q3/Q4/Q5/Q7/Q8/Q12 是否有判断、预期差与壁垒判断是否有证据、估值分解是否算对（两项之和等于股价对数变化）、\`## 引用\` 表是否存在且每个 \`[引用N]\` 都能在表里找到，豁免独立 questions.md、新章节结构与赔率摘要要求。按 dalton-reviewer 规范输出 JSON（\`files\` 固定返回 \`${reviewFilesHint}\`；\`verdict\` 为 \`"pass"\` / \`"revise"\` / \`"block"\`；\`items\` 逐项覆盖 1–9 项检查）。`
+  : `审阅 ${draftPath}（被审草稿 sha256：${reviewedSha || '未知'}；内部 12 问底稿 ${R}/questions.md、赔率摘要 ${R}/underwriting-summary.md 与支线材料在 ${R}/，只读不改文件）。这是买方初次覆盖，重点核对：1) ${R}/questions.md 的重点题（Q1–Q5、Q7、Q8、Q12）是否有明确判断与定量证据，并对置信度为“低”的题重点核对；2) 正文第一个二级标题是否为摘要（连贯论证而非粗体标签清单，且只写当前结论与决定行动的那一个关键条件），是否完整覆盖公司与商业模式、业务质量初判（Good Business〔生意质量〕/ Good People〔管理与组织质量〕/ Good Price〔价格与赔率〕三行评级表、组合对应的方向和行动及待完整覆盖核实的一点）、核心投资逻辑与主要分歧（每条分歧写到判断为止；含「交易角度」小节；「核心投资支柱」只写支柱内容与当前状态并指明对应分歧，确认/预警/证伪阈值与改判条件只在「研究议程与跟踪」完整列一次）、估值与赔率（写清观察价/买点区间的业务质量上限与相对同业估值上限依据，正文与赔率表的退出倍数一致，以及适用时的分部加总核对）、风险（含一年后亏损 30% 的最强空方路径事前推演）、管理层与资本配置、研究议程与跟踪，章节无遗漏也无重复展开，附注只放正文未说明过的缺口，正文未逐条列 Q1–Q12、未混入英文字段名或内部代号；3) 预期差是否只是复述共识，壁垒“正在形成还是正在被破坏”是否有证据及可证伪指标，估值分解是否算对（两项之和等于股价对数变化）；4) 摘要与估值章节的赔率数字是否与 ${R}/underwriting-summary.md 完全一致，文末 \`## 引用\` 表是否存在且每个 \`[引用N]\` 都能在表里找到。按 dalton-reviewer 规范输出 JSON（\`files\` 必须声明实际检查的全部文件 \`${reviewFilesHint}\`；\`verdict\` 为 \`"pass"\` / \`"revise"\` / \`"block"\`；\`items\` 逐项覆盖 1–9 项检查）。`
+let review =
+  !draftOk
+    ? null
+    : await agent(reviewPrompt, {
+        agentType: 'dalton-reviewer',
+        label: '审稿',
+        phase: '审稿',
+        schema: VERDICT,
+        reviewDraft: draftPath,
+      })
+
+const incomplete = []
+// 审稿结果未覆盖 1–9 项检查或未声明实际检查的文件时按审稿失败处理（fail-closed）。
+if (review !== null && !completeReview(review, reviewExpectedFiles)) {
+  incomplete.push('审稿结果未覆盖 1–9 项检查或未完整声明检查文件，按审稿失败处理')
+  review = null
+}
+if (review && verdictOf(review) === 'block') {
+  incomplete.push(`审稿 block：${review.summary || '存在不可修订级问题'}`)
+  return {
+    ok: false,
+    blocked: review.summary || '审稿 block',
+    draft: `${W}/drafts/${D}-initial-coverage.md`,
+    missing,
+    incomplete,
+    resume_hint:
+      '修订草稿后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发（四条支线等只读产物）会直接复用，成稿及之后的阶段重新派发',
+  }
+}
+
+// revise → 修订 →（需要改赔率时立刻停下重写版本并更新正文数字）→ 复审，仅 1 轮
+let fix = null
+let finalReview = review
+let rounds = 0
+let currentDraftSha = reviewedSha
+let reviewPassed = review !== null && verdictOf(review) === 'pass'
+while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 1) {
+  rounds += 1
+  const fixPrompt = isLegacyDraft
+    ? `先核对 ${W}/drafts/${D}-initial-coverage.md 的 sha256 是否与审稿前（${currentDraftSha || '当前记录值'}）一致；按审稿意见做第 ${rounds} 轮修订（\`must_fix\` 必改项全部修改，不新增未核实数字；修订后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处；同步修订 ${R}/knowledge-proposal.json，在途旧结构草稿豁免同步 questions.md；\`needs_reunderwrite\` 固定填 \`false\`，\`underwriting_version\` 固定填 \`1\`；改完在 \`sha256\` 返回成稿 sha256）。审稿意见：\n${JSON.stringify(finalReview)}`
+    : `先核对 ${W}/drafts/${D}-initial-coverage.md 的 sha256 是否与审稿前（${currentDraftSha || '当前记录值'}）一致，并读取 ${R}/underwriting-summary.md 将其第一行版本号 \`N\` 填入必填字段 \`underwriting_version\`；按审稿意见做第 ${rounds} 轮修订：\n1) \`must_fix\` 必改项全部修改，不新增未核实数字，修订后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处，并同步修订 ${R}/questions.md 与 ${R}/knowledge-proposal.json。\n2) 若无需改动赔率输入（或已按最新 ${R}/underwriting-summary.md 改好正文赔率数字），将 \`needs_reunderwrite\` 设为 \`false\`；若需改动赔率输入（EPS、倍数、持有期、权重等），先在 ${R}/knowledge-proposal.json 的 \`thesis\` 操作列表里更新写 \`/underwriting\` 的那条操作（或 \`create\` 操作 \`value\` 里的 \`underwriting\`），本次暂不修改正文中的赔率数字，将 \`needs_reunderwrite\` 设为 \`true\`。\n3) \`files\` 必须声明 \`["${draftPath}", "${R}/questions.md", "${R}/underwriting-summary.md", "${R}/knowledge-proposal.json"]\`，并在 \`sha256\` 返回成稿 sha256。\n审稿意见：\n${JSON.stringify(finalReview)}`
+  fix = await agent(fixPrompt, {
+    agentType: 'general-purpose',
+    label: `修订 ${rounds}`,
+    phase: '审稿',
+    schema: REVISION_OUT,
+  })
+  const summaryPath = `${R}/underwriting-summary.md`
+  const normPath = (p) => (typeof p === 'string' ? p.replace(/^\.\//, '') : '')
+  const fixHasSummary =
+    isLegacyDraft ||
+    (fix !== null &&
+      Array.isArray(fix.files) &&
+      fix.files.some((f) => normPath(f) === normPath(summaryPath)))
+  const fixedSha =
+    fix === null ||
+    !fixHasSummary ||
+    typeof fix.needs_reunderwrite !== 'boolean' ||
+    !Number.isInteger(fix.underwriting_version) ||
+    fix.underwriting_version < 1
+      ? null
+      : shaOf(fix)
+  if (fixedSha === null) {
+    incomplete.push(
+      `第 ${rounds} 轮修订失败（修订结果、underwriting-summary.md 文件声明、needs_reunderwrite、underwriting_version 或其 sha256 缺失/非法），未复审`
+    )
+    break
+  }
+  currentDraftSha = fixedSha
+  if (!isLegacyDraft && fix.needs_reunderwrite === true) {
+    const reunderwriteInstruction = `修订子任务发现需要改赔率（\`needs_reunderwrite=true\`，当前修订记录的摘要版本：${fix.underwriting_version}）：请主智能体按 ${R}/knowledge-proposal.json 先将更新过的非 \`thesis\` 依赖文档正式写入（\`dry_run=False\`），再对更新后的 \`thesis\` 先调用 \`knowledge_update(doc="thesis", ..., dry_run=True)\` 检查、通过后调用 \`knowledge_update(doc="thesis", ..., dry_run=False)\` 正式写入新版本，按固定格式更新 ${R}/underwriting-summary.md（第一行固定写 \`已保存 thesis 版本 N\`，\`house_view.stance="no_view"\` 时写 \`已保存 thesis 版本 N；暂不表态，不计算赔率\`，首行之后只贴正式保存后的赔率摘要，不要贴试写的返回），然后用启动时的同一组参数 + \`resume=<.progress.json 里的 run_id>\` 续跑；续跑时声明了该摘要的子任务会自动按新摘要重跑，改好正文数字、将 \`needs_reunderwrite\` 设为 \`false\` 并记录新的 \`underwriting_version\` 后进入复审`
+    return {
+      ok: false,
+      blocked: `待主智能体重写赔率摘要：${reunderwriteInstruction}`,
+      draft: draftPath,
+      knowledge_proposal: `${R}/knowledge-proposal.json`,
+      underwriting_summary: `${R}/underwriting-summary.md`,
+      missing,
+      incomplete: [reunderwriteInstruction],
+      resume_hint: reunderwriteInstruction,
+    }
+  }
+  const reReviewPrompt = isLegacyDraft
+    ? `复审（第 ${rounds} 轮修订后）：审阅 ${W}/drafts/${D}-initial-coverage.md（被审草稿 sha256：${currentDraftSha}；支线材料在 ${R}/，只读不改文件）。重点核对上一轮 \`must_fix\` 是否全部解决（在途旧结构草稿豁免独立 questions.md、新章节结构与赔率摘要一致性要求）。按 dalton-reviewer 规范输出 JSON（\`files\` 固定返回 \`${reviewFilesHint}\`；\`verdict\` 为 \`"pass"\` / \`"revise"\` / \`"block"\`；\`items\` 逐项覆盖 1–9 项检查）。上一轮审稿意见：\n${JSON.stringify(finalReview)}`
+    : `复审（第 ${rounds} 轮修订后）：审阅 ${W}/drafts/${D}-initial-coverage.md（被审草稿 sha256：${currentDraftSha}；内部 12 问底稿 ${R}/questions.md、赔率摘要 ${R}/underwriting-summary.md 与支线材料在 ${R}/，只读不改文件）。重点核对上一轮 \`must_fix\` 是否全部解决，章节是否完整且无重复，正文是否未逐条列 Q1–Q12，摘要与估值章节赔率数字是否与 ${R}/underwriting-summary.md 完全一致。按 dalton-reviewer 规范输出 JSON（\`files\` 必须声明实际检查的全部文件 \`${reviewFilesHint}\`；\`verdict\` 为 \`"pass"\` / \`"revise"\` / \`"block"\`；\`items\` 逐项覆盖 1–9 项检查）。上一轮审稿意见：\n${JSON.stringify(finalReview)}`
+  const reReview = await agent(reReviewPrompt, {
+    agentType: 'dalton-reviewer',
+    label: `复审 ${rounds}`,
+    phase: '审稿',
+    schema: VERDICT,
+    reviewDraft: draftPath,
+  })
+  if (reReview === null) {
+    incomplete.push(`第 ${rounds} 轮复审失败`)
+    break
+  }
+  if (!completeReview(reReview, reviewExpectedFiles)) {
+    incomplete.push(`第 ${rounds} 轮复审结果未覆盖 1–9 项检查或未完整声明检查文件，按复审失败处理`)
+    break
+  }
+  if (verdictOf(reReview) === 'block') {
+    incomplete.push(`复审 block：${reReview.summary || '存在不可修订级问题'}`)
+    break
+  }
+  finalReview = reReview
+}
+reviewPassed = finalReview !== null && verdictOf(finalReview) === 'pass'
+
+// 笔记两轮：一次写完、不再改的支线/背景笔记同样审两轮——第 1 轮审完按清单改，
+// 第 2 轮复核（改动过的文件再补一次 round=2 确认，绑定终态哈希）。
+const noteListLines = [
+  `- ${W}/drafts/${D}-background.md`,
+  `- ${W}/drafts/${D}-lenses.md`,
+  `- ${R}/industry.md`,
+  `- ${R}/valuation.md`,
+  `- ${R}/bullbear-quick.md`,
+  ...(isLegacyDraft ? [] : [`- ${R}/questions.md`]),
+].join('\n')
+const notesReview =
+  !draftOk || !reviewPassed
+    ? null
+    : await agent(
+        `对本次运行产出、给人读的 .md 笔记逐一做两轮语言审查（规则见 .agents/skills/dalton-language/SKILL.md，只标问题）。每个文件依次：1) 调用工具 check_language(draft_path="<文件>", round=1)，读 <文件>.language.md 清单并按清单修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）；2) 调用 check_language(draft_path="<文件>", round=2) 复核；若第 1 轮后改过稿，改完再调用一次 round=2 确认（记录追加在同一 json）。\n文件清单：\n${noteListLines}\n清单之外本次运行写的其他给人读的 .md 一并同法处理；${R}/underwriting-summary.md、json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/ 下的文件、知识层渲染文件与 .audit/.annotated/.language 附属文件不审。返回处理过的文件列表与摘要。`,
+        { agentType: 'general-purpose', label: '笔记语言审查', phase: '审稿', schema: OUT }
+      )
+if (draftOk && reviewPassed && notesReview === null) {
+  incomplete.push('笔记语言审查失败（支线/背景笔记未完成两轮语言审查）')
+}
+
+// 第 2 轮语言审查：终稿内容定稿（审稿修订循环结束）之后、提交最后一次审稿之前。
+// 改了稿就再跑一次 round=2 复核，使最后一条第 2 轮记录绑定终稿哈希；哈希有变
+// 则终稿审稿重新绑定独立审稿哈希——语言修改不能让已有 pass 记录失效却无人重审。
+const preLang2Sha = currentDraftSha
+const lang2 =
+  !draftOk || !reviewPassed
+    ? null
+    : await agent(
+        `对 ${draftPath} 做第 2 轮语言审查：调用工具 check_language(draft_path="${draftPath}", round=2)，读 ${draftPath}.language.md 清单，按清单逐条完成终稿语言修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）。若草稿有改动，再调用一次 check_language(draft_path="${draftPath}", round=2) 对终稿复核（记录追加在同一 json）。返回 ${draftPath} 最终 sha256。`,
+        { agentType: 'general-purpose', label: '语言审查 2', phase: '审稿', schema: LANG_OUT }
+      )
+const lang2Sha = lang2 === null ? null : shaOf(lang2)
+if (draftOk && reviewPassed && lang2Sha === null) {
+  incomplete.push('语言审查第 2 轮失败（结果或其 sha256 缺失/非法），未做终稿语言修改')
+  reviewPassed = false
+} else if (draftOk && reviewPassed) {
+  currentDraftSha = lang2Sha
+  if (!isLegacyDraft) {
+    const finalDraftVersion =
+      fix !== null
+        ? fix.underwriting_version
+        : draft !== null
+          ? draft.underwriting_version
+          : null
+    const uwFinal = await verifyUnderwriting('赔率摘要复核', '审稿', [draftPath])
+    if (uwFinal.reason === 'probe_failed') {
+      incomplete.push(`赔率摘要复核子任务失败（无法确认 ${R}/underwriting-summary.md 版本号）`)
+      reviewPassed = false
+    } else if (!uwFinal.ok || uwFinal.version !== finalDraftVersion) {
+      const mismatchReason = !uwFinal.ok
+        ? `赔率摘要状态异常（${uwFinal.reason}）`
+        : `最终稿记录的 underwriting_version（版本 ${finalDraftVersion}）与 ${R}/underwriting-summary.md 首行版本号（版本 ${uwFinal.version}）不一致`
+      const syncInstruction = `终稿审稿前赔率版本核对未通过（${mismatchReason}）：请主智能体确认 ${R}/underwriting-summary.md 第一行固定写 \`已保存 thesis 版本 N\`（与数据库 \`thesis\` 最新有效版本一致，首行之后只贴正式保存后的赔率摘要，不要贴试写的返回），然后**由主智能体自己**按摘要里的最新赔率改好 ${draftPath}（及 ${R}/questions.md）中的赔率数字——续跑只会重跑声明的文件有变化的子任务，摘要和正文都没变时，续跑会原样复用旧结果、再次停在这里——改完后再用启动时的同一组参数 + \`resume=<.progress.json 里的 run_id>\` 续跑，修订子任务会因正文变化而重跑并记录新的 \`underwriting_version\``
+      return {
+        ok: false,
+        blocked: `待同步正文与赔率摘要版本：${syncInstruction}`,
+        draft: draftPath,
+        knowledge_proposal: `${R}/knowledge-proposal.json`,
+        underwriting_summary: `${R}/underwriting-summary.md`,
+        missing,
+        incomplete: [syncInstruction],
+        resume_hint: syncInstruction,
+      }
+    }
+  }
+  if (reviewPassed && (lang2Sha !== preLang2Sha || rounds > 0)) {
+    const finalReviewPrompt = isLegacyDraft
+      ? `终稿审稿（语言修改后）：审阅 ${draftPath}（被审草稿 sha256：${lang2Sha}；支线材料在 ${R}/，只读不改文件）。重点：语言修改未动事实与数字，上一轮 \`must_fix\` 仍全部解决（在途旧结构草稿豁免独立 questions.md、新章节结构与赔率摘要一致性要求）。按 dalton-reviewer 规范输出 JSON（\`files\` 固定返回 \`${reviewFilesHint}\`；\`verdict\` 为 \`"pass"\` / \`"revise"\` / \`"block"\`；\`items\` 逐项覆盖 1–9 项检查）。`
+      : `终稿审稿（语言修改后）：审阅 ${draftPath}（被审草稿 sha256：${lang2Sha}；内部 12 问底稿 ${R}/questions.md、赔率摘要 ${R}/underwriting-summary.md 与支线材料在 ${R}/，只读不改文件）。重点：语言修改未动事实与数字，上一轮 \`must_fix\` 仍全部解决，摘要与估值章节赔率数字与 ${R}/underwriting-summary.md 完全一致。按 dalton-reviewer 规范输出 JSON（\`files\` 必须声明实际检查的全部文件 \`${reviewFilesHint}\`；\`verdict\` 为 \`"pass"\` / \`"revise"\` / \`"block"\`；\`items\` 逐项覆盖 1–9 项检查）。`
+    const finalCheck = await agent(finalReviewPrompt, {
+      agentType: 'dalton-reviewer',
+      label: '终稿审稿',
+      phase: '审稿',
+      schema: VERDICT,
+      reviewDraft: draftPath,
+    })
+    if (finalCheck === null) {
+      incomplete.push('终稿审稿失败')
+      reviewPassed = false
+    } else if (!completeReview(finalCheck, reviewExpectedFiles)) {
+      incomplete.push('终稿审稿结果未覆盖 1–9 项检查或未完整声明检查文件，按审稿失败处理')
+      finalReview = null
+      reviewPassed = false
+    } else {
+      finalReview = finalCheck
+      reviewPassed = verdictOf(finalCheck) === 'pass'
+    }
+  }
+}
+
+if (missing.length) incomplete.push(`支线失败：${missing.join('、')}`)
+if (lang1Failed) incomplete.push('语言审查第 1 轮失败（结果或其 sha256 缺失/非法），未按清单修改')
+if (!draftOk) incomplete.push('初筛成稿失败（草稿、underwriting-summary.md 文件声明、underwriting_version 或其 sha256 缺失/非法）')
+if (bb === null) incomplete.push('bull/bear 快速版失败')
+if (kp === null) incomplete.push('知识层草案失败')
+if (review === null && draftOk) incomplete.push('审稿失败')
+if (!reviewPassed && !incomplete.length) incomplete.push('审稿未最终通过（无 pass 记录）')
+
+phase('产物核验')
+const deliverables = [
+  `${W}/drafts/${D}-background.md`,
+  `${W}/drafts/${D}-background.md.language.json`,
+  `${R}/industry.md`,
+  `${R}/industry.md.language.json`,
+  `${R}/lenses.json`,
+  `${W}/drafts/${D}-lenses.md`,
+  `${W}/drafts/${D}-lenses.md.language.json`,
+  `${R}/valuation.md`,
+  `${R}/valuation.md.language.json`,
+  `${R}/comps.xlsx`,
+  `${R}/bullbear-quick.md`,
+  `${R}/bullbear-quick.md.language.json`,
+  ...(isLegacyDraft
+    ? []
+    : [
+        `${R}/underwriting-summary.md`,
+        `${R}/questions.md`,
+        `${R}/questions.md.language.json`,
+      ]),
+  `${W}/drafts/${D}-initial-coverage.md`,
+  `${W}/drafts/${D}-initial-coverage.md.language.json`,
+  `${R}/knowledge-proposal.json`,
+]
+const check =
+  !draftOk
+    ? null
+    : await agent(
+        `只读核对以下文件是否存在并计算 sha256（用 bash 的 test -e 与 sha256sum，不写任何文件）：\n${deliverables
+          .map((p) => '- ' + p)
+          .join('\n')}\n返回 files 字符串数组：存在的文件写 “<路径>|<sha256>”，不存在的只写 “<路径>”（不带竖线）。`,
+        { agentType: 'dalton-evidence', label: '产物核验', phase: '产物核验', schema: HASH, checkFiles: false }
+      )
+const SHA_RE = /^[0-9a-f]{64}$/
+const expected = new Set(deliverables)
+const reported = new Set()
+for (const entry of check && Array.isArray(check.files) ? check.files : []) {
+  const bar = entry.indexOf('|')
+  const path = bar > 0 ? entry.slice(0, bar) : ''
+  const sha = bar > 0 ? entry.slice(bar + 1) : ''
+  if (!path || !SHA_RE.test(sha) || !expected.has(path)) {
+    incomplete.push(`产物核验返回无效条目：${entry}`)
+    continue
+  }
+  reported.add(path)
+}
+for (const path of deliverables) {
+  if (!reported.has(path)) incomplete.push(`产物缺失或未报哈希：${path}`)
+}
+if (check === null && draftOk) incomplete.push('产物核验子任务失败')
+
+phase('自动跟踪')
+// The tracking hint follows the run's own completion verdict exactly: an
+// unfinished run must not tell the analyst to switch tracking on.
+const runOk = draftOk && reviewPassed && incomplete.length === 0
+const tracking = runOk
+  ? {
+      action: 'enable',
+      source: 'coverage_finish',
+      tool: 'dalton_coverage_tracking',
+      call: 'dalton_coverage_tracking(action="enable", source="coverage_finish")',
+      respect_user_pause: true,
+    }
+  : {
+      ok: false,
+      skipped: true,
+      reason: !draftOk ? '初筛成稿未完成' : !reviewPassed ? '审稿未最终通过' : `流程未完成：${incomplete[0]}`,
+    }
+if (runOk) {
+  log(
+    `初筛完成，收尾需调用 dalton_coverage_tracking(action="enable", source="coverage_finish") 开启 ${T} 自动跟踪（若 paused_by_user 则保持关闭）`
+  )
+} else {
+  log(`不开启自动跟踪：${tracking.reason}`)
+}
+
+return {
+  ok: runOk,
+  draft: `${W}/drafts/${D}-initial-coverage.md`,
+  knowledge_proposal: kp && `${R}/knowledge-proposal.json`,
+  missing,
+  review_done: finalReview !== null,
+  review_verdict: finalReview && verdictOf(finalReview),
+  language_done: draftOk && lang1Sha !== null && lang2Sha !== null,
+  revise_rounds: rounds,
+  fix_summary: fix && fix.summary,
+  tracking,
+  incomplete,
+}
+
+
+===== WORKFLOW: topic-research =====
+--- FILE: topic-research/contract.json ---
+{
+  "name": "topic-research",
+  "description": "专题研究的完成契约：规划 + 一手 + 分簇取证 + 交叉验证 + 成稿 + 数字核验 + 独立审稿 + 修订（对应 dalton-topic-research SKILL 的交付物）。",
+  "draft": "drafts/{as_of}-topic-{slug}.md",
+  "params_required": [
+    "topic",
+    "slug",
+    "workspace_dir"
+  ],
+  "stages": [
+    {
+      "name": "规划",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-topic-{slug}/plan.md",
+          "min_bytes": 100
+        }
+      ]
+    },
+    {
+      "name": "一手材料",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-topic-{slug}/primary.md",
+          "min_bytes": 100
+        }
+      ]
+    },
+    {
+      "name": "分簇取证",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-topic-{slug}/cluster-*.md",
+          "glob": true,
+          "min_count": 3,
+          "min_bytes": 100
+        },
+        {
+          "path": "research/{as_of}-topic-{slug}/internal-memory.md",
+          "min_bytes": 50
+        },
+        {
+          "path": "research/{as_of}-topic-{slug}/guidepoint.md",
+          "min_bytes": 50
+        }
+      ]
+    },
+    {
+      "name": "交叉验证与盲区",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-topic-{slug}/cross-check.md",
+          "min_bytes": 100,
+          "end_marker": "盲区检查完成"
+        }
+      ]
+    },
+    {
+      "name": "写作与数字核验",
+      "artifacts": [
+        {
+          "path": "drafts/{as_of}-topic-{slug}.md",
+          "min_bytes": 500
+        },
+        {
+          "path": "research/{as_of}-topic-{slug}/number-audit.md",
+          "min_bytes": 50
+        }
+      ],
+      "validators": [
+        {
+          "command": "python .agents/skills/dalton-topic-research/scripts/validate_topic.py --input drafts/{as_of}-topic-{slug}.md --json",
+          "pass_when": "exit_zero",
+          "description": "置信度与引用闭环校验通过"
+        }
+      ]
+    },
+    {
+      "name": "独立审稿与修订",
+      "review": {
+        "agent": "dalton-reviewer",
+        "verdicts": [
+          "pass"
+        ],
+        "manual_sidecar": "research/{as_of}-topic-{slug}/review.json"
+      },
+      "artifacts": [
+        {
+          "path": "research/{as_of}-topic-{slug}/knowledge-revision.json",
+          "min_bytes": 50
+        }
+      ]
+    }
+  ],
+  "closing": {
+    "knowledge_docs_any": [
+      "drivers",
+      "debate"
+    ],
+    "knowledge_docs_if_sector": ["thesis", "agenda", "drivers"],
+    "knowledge_source": "tool",
+    "verdict_kinds_any": [
+      "NO_CHANGE",
+      "THESIS_STRENGTHENED",
+      "THESIS_WEAKENED",
+      "THESIS_BROKEN",
+      "NEW_THESIS"
+    ],
+    "verdict_trigger": "agenda",
+    "language_review": {
+      "draft": "drafts/{as_of}-topic-{slug}.md"
+    }
+  }
+}
+
+--- FILE: topic-research/workflow.js ---
+export const meta = {
+  name: 'topic-research',
+  description: 'Dalton 专题研究：规划 → 一手 → 分簇取证∥内部记忆∥专家 → 交叉验证与盲区 → 写作 → 数字核验 → 独立审稿 → 修订',
+}
+
+const { topic, slug, horizon, workspace_dir: W, as_of: D } = args
+const related = args.related_tickers || []
+const dateTag = D || 'latest'
+const topicSlug = slug || 'topic'
+// 行业分支（sector layer P1）：行业工作区由 Home 以 subject_kind=sector 启动；
+// 不传或传 company 时与既有公司工作区路径完全一致。
+const isSector = args.subject_kind === 'sector'
+const R = `${W}/research/${dateTag}-topic-${topicSlug}`
+const S = '.agents/skills/dalton-topic-research'
+const base = `先读 .agents/skills/dalton-conventions/SKILL.md 与 ${S}/SKILL.md、${S}/references/principles.md；专题：「${topic}」，时间范围：${
+  horizon || '优先近 30 天（6 个月以上标日期，12 个月以上仅作背景）'
+}，相关公司：${related.join(', ') || '见规划'}。基金 wiki 只读，任何阶段不回写 wiki。${
+  isSector
+    ? '本工作区是行业工作区（绑定 sector 覆盖单元）：行业认知从 data/sector.json 与 data/thesis.json、data/drivers.json、data/agenda.json 读（没有 management/company 文档，也不得创建）；成员清单以 data/sector.json 的 members 为准，不给行业编 ticker。'
+    : ''
+}`
+
+// Keep schema nesting depth <= 4 (well within schema_max_depth=5)
+const PLAN_SCHEMA = {
+  type: 'object',
+  properties: {
+    file: { type: 'string' },
+    clusters: { type: 'array', items: { type: 'object' } },
+    questions: { type: 'array', items: { type: 'string' } },
+    summary: { type: 'string', minLength: 1 },
+  },
+  required: ['file', 'clusters', 'questions'],
+}
+
+const OUT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+    summary: { type: 'string', minLength: 1 },
+    sha256: { type: 'string', minLength: 64 },
+    gaps: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['files', 'summary'],
+}
+
+const VERDICT = {
+  type: 'object',
+  properties: {
+    verdict: { type: 'string', enum: ['pass', 'revise', 'block'] },
+    summary: { type: 'string', minLength: 1 },
+    must_fix: { type: 'array', items: { type: 'string', minLength: 1 } },
+    // items 元素的键（check/result/reason/lines）由 dalton-reviewer 的提示词契约约束，
+    // 结构深度保持在平台 schema_max_depth 限制内（元素键不展开为 schema 节点）。
+    items: { type: 'array', items: { type: 'object' } },
+  },
+  required: ['verdict', 'summary', 'items'],
+}
+
+const HASH = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+  },
+  required: ['files'],
+}
+const verdictOf = (r) => {
+  // pass 但 must_fix 非空按 revise 处理，与服务端 publish/review.py 的规则一致
+  //（提示词第 1 批第 2 轮 #2）。
+  if (r && typeof r === 'object' && r.verdict === 'pass' && Array.isArray(r.must_fix) && r.must_fix.length) {
+    return 'revise'
+  }
+  return r && typeof r === 'object' ? r.verdict : null
+}
+// 审稿结果与 dalton-reviewer 提示词、服务端发布审稿（publish/review.py）同一契约：
+// items 必须逐项覆盖 1–9 项检查；缺项的结果不可作为 verdict 使用（fail-closed）。
+const REVIEW_CHECKS = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+const completeReview = (r) => {
+  if (!r || typeof r !== 'object') return false
+  const items = Array.isArray(r.items) ? r.items : []
+  const done = new Set()
+  for (const it of items) {
+    if (
+      it &&
+      typeof it === 'object' &&
+      Number.isInteger(it.check) &&
+      it.check >= 1 &&
+      it.check <= 9 &&
+      (it.result === 'pass' || it.result === 'revise')
+    ) {
+      done.add(it.check)
+    }
+  }
+  return REVIEW_CHECKS.every((c) => done.has(c))
+}
+const DRAFT_OUT = { ...OUT, required: ['files', 'summary', 'sha256'] }
+const shaOf = (r) =>
+  r && typeof r === 'object' && typeof r.sha256 === 'string' && /^[0-9a-f]{64}$/.test(r.sha256)
+    ? r.sha256
+    : null
+
+// B1：支线产物缺失判定（各 workflow 同一实现；workflow 之间没有共用 js 模块的
+// 机制，改动需同步全部 workflow.js）。子任务返回 null、files/file 为空、或（经
+// 只读核验子任务确认）声明的产物文件不存在/为空（0 字节或只有空白），都算缺失；
+// workflow 自己碰不到文件系统，最后一项由支线核验子任务在盘上确认。
+const branchArtifacts = (v) => {
+  if (v === null || typeof v !== 'object') return []
+  const out = []
+  if (typeof v.file === 'string' && v.file.trim()) out.push(v.file.split('|', 1)[0].trim())
+  for (const f of Array.isArray(v.files) ? v.files : []) {
+    if (typeof f === 'string' && f.trim()) out.push(f.split('|', 1)[0].trim())
+  }
+  return out.filter(Boolean)
+}
+const PROBE_OUT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+  },
+  required: ['files'],
+}
+// 返回每个路径的 "<路径>|ok" / "<路径>|missing"；结果不完整（漏路径、格式不对）
+// 一律算核验失败（fail-closed），返回 null。paths 的每一项可以是路径或
+// [路径, 最小字节数]（契约 min_bytes；缺省 1，即非空白即可）。
+const probeBranchFiles = async (paths) => {
+  const entries = paths.map((p) => (Array.isArray(p) ? p : [p, 1]))
+  const r = await agent(
+    `只读核验以下支线产物文件是否存在、非空白且达到字节数下限（不写任何文件）。逐个执行 bash：f='<路径>'；n=<字节数下限>；test -e "$f" && [ "$(wc -c < "$f")" -ge "$n" ] && [ -n "$(tr -d '[:space:]' < "$f")" ] && echo "$f|ok" || echo "$f|missing"。返回 files 数组：每项为上述一行的原样输出（<路径>|ok 或 <路径>|missing）：\n${entries
+      .map(([p, min]) => `- ${p}（至少 ${min} 字节）`)
+      .join('\n')}`,
+    { agentType: 'dalton-evidence', label: '支线核验', phase: '分簇取证', schema: PROBE_OUT, checkFiles: false }
+  )
+  if (r === null || typeof r !== 'object' || !Array.isArray(r.files)) return null
+  const answered = new Set()
+  for (const entry of r.files) {
+    if (typeof entry !== 'string') return null
+    const bar = entry.lastIndexOf('|')
+    const path = bar > 0 ? entry.slice(0, bar) : ''
+    const verdict = bar > 0 ? entry.slice(bar + 1) : ''
+    if (!path || (verdict !== 'ok' && verdict !== 'missing')) return null
+    answered.add(path)
+  }
+  if (entries.some(([p]) => !answered.has(p))) return null
+  return r.files
+}
+// B1 共用出口：缺口凑不满契约底线（含全部缺失）与核验失败都停在交叉验证之前，
+// 文案与审稿 block 一致，主线程补数后用原参数 resume 重跑（已完派发按 journal
+// 复用）。
+const RESUME_HINT = '用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，缺失支线重新派发（其提示词已写明“若目标文件已存在，先读并核对，缺什么补什么”）'
+
+phase('规划')
+const plan = await agent(
+  `${base} 阶段 0 规划：参考 ${S}/references/clusters-investment.md 设计 3–6 个检索簇（每簇含 id, name, queries（5–8 条中英文检索词）、预期信息类型、关键来源、盲区），锁定报告框架与 5–8 个核心问题（${
+    (args.core_questions || []).join('；') || '按主题拆解'
+  }）、预期矛盾与数字核验清单，写 ${R}/plan.md。返回 file、clusters（最多 6 个对象，每项含 id, name, queries）、questions、summary。`,
+  { agentType: 'general-purpose', label: '规划', phase: '规划', schema: PLAN_SCHEMA }
+)
+if (plan === null) {
+  return { ok: false, reason: '专题规划阶段失败', incomplete: ['专题规划阶段失败'] }
+}
+
+phase('一手材料')
+const primary = await agent(
+  `${base} 阶段 0.5 一手材料：规划见 ${R}/plan.md。涉及上市公司（${
+    related.join(', ') || '按规划'
+  }）时读最近定期报告与 8-K 附件、1–2 次电话会、近 6 个月卖方报告；行业/宏观题读 AlphaEngine 行业检索与内部库，写 ${R}/primary.md。若目标文件已存在，先读并核对，缺什么补什么，不必推倒重写。`,
+  { agentType: 'dalton-evidence', label: '一手材料', phase: '一手材料', schema: OUT }
+)
+
+phase('分簇取证')
+const clusters = (plan.clusters || []).slice(0, 6)
+const evTasks = [
+  ...clusters.map((c, idx) => () => {
+    const cid = c.id || `c${idx + 1}`
+    const cname = c.name || `簇 ${idx + 1}`
+    const qs = Array.isArray(c.queries) ? c.queries.join(' / ') : ''
+    return agent(
+      `${base} 阶段 2 分簇取证（${cid}：${cname}）：检索词 [${qs}]。跑完全部检索词，精读 3–5 篇全文；输出 Facts / Direct Quotes / Timeline / Contradictions / 全文摘录 / Sources 到 ${R}/cluster-${cid}.md。`,
+      { agentType: 'dalton-evidence', label: `取证 ${cname}`, phase: '分簇取证', schema: OUT }
+    )
+  }),
+  () =>
+    agent(
+      `${base} 阶段 2 内部记忆检索：检索 researchdata 的 sales-notes、tmtb、funda-ai、company-wiki（只读），英文与中文结合，写 ${R}/internal-memory.md。`,
+      { agentType: 'dalton-evidence', label: '内部记忆', phase: '分簇取证', schema: OUT }
+    ),
+  () =>
+    agent(
+      `${base} 阶段 2 专家纪要检索：用英文检索 Guidepoint 1–2 轮，标专家身份不写姓名，原话引用 ≤20 个英文词并带出处，写 ${R}/guidepoint.md。`,
+      { agentType: 'dalton-evidence', label: '专家纪要', phase: '分簇取证', schema: OUT }
+    ),
+]
+const evResults = await parallel(evTasks)
+
+// B1：contract 要求 primary.md（≥100 字节）、cluster-* ≥3 个（各 ≥100 字节）、
+// internal-memory.md 与 guidepoint.md（各 ≥50 字节）必交。取证子任务返回
+// null/files 为空、或核验发现在盘缺失/过小，都算缺失；凑不满底线（含全部缺失）
+// 停在交叉验证之前，出口与审稿 block 同一段文案。个别簇缺失但底线仍够时不
+// block：缺失簇写进 incomplete、传给写作提示词并在返回值里列出。
+const clusterFiles = clusters.map((c, idx) => `${R}/cluster-${c.id || `c${idx + 1}`}.md`)
+const clusterNames = clusters.map((c, idx) => c.name || `簇 ${idx + 1}`)
+const internalFile = `${R}/internal-memory.md`
+const guidepointFile = `${R}/guidepoint.md`
+const primaryFile = `${R}/primary.md`
+const clusterOnDisk = clusters.map((_, i) => branchArtifacts(evResults[i]).length > 0)
+let internalOnDisk = branchArtifacts(evResults[clusters.length]).length > 0
+let guidepointOnDisk = branchArtifacts(evResults[clusters.length + 1]).length > 0
+let primaryOnDisk = branchArtifacts(primary).length > 0
+// 缺失簇在核验前先按子任务回报算一遍（核验失败的出口要用），核验后再按在盘
+// 结果重算；此后所有出口（取证缺失 block、审稿 block、最终返回）都带上。
+let missingClusters = clusters
+  .map((_, i) => (clusterOnDisk[i] ? null : clusterNames[i]))
+  .filter(Boolean)
+let missingClusterIds = clusters
+  .map((c, i) => (clusterOnDisk[i] ? null : c.id || `c${i + 1}`))
+  .filter(Boolean)
+const toProbe = [
+  ...(primaryOnDisk ? [[primaryFile, 100]] : []),
+  ...clusterFiles.filter((_, i) => clusterOnDisk[i]).map((p) => [p, 100]),
+  ...(internalOnDisk ? [[internalFile, 50]] : []),
+  ...(guidepointOnDisk ? [[guidepointFile, 50]] : []),
+]
+if (toProbe.length) {
+  const probe = await probeBranchFiles(toProbe)
+  if (probe === null) {
+    return {
+      ok: false,
+      blocked: '支线核验子任务失败，无法确认取证产物在盘',
+      incomplete: [
+        `支线核验子任务失败（无法确认产物文件存在且非空；按子任务回报缺失的簇：${
+          missingClusters.join('、') || '无'
+        }），已停在交叉验证之前；请重试或补数后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑`,
+      ],
+      missing_clusters: missingClusterIds,
+      resume_hint: '用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，失败支线重新派发',
+    }
+  }
+  for (const entry of probe) {
+    if (!entry.endsWith('|missing')) continue
+    const path = entry.slice(0, -'|missing'.length)
+    const idx = clusterFiles.indexOf(path)
+    if (idx >= 0) clusterOnDisk[idx] = false
+    else if (path === internalFile) internalOnDisk = false
+    else if (path === guidepointFile) guidepointOnDisk = false
+    else if (path === primaryFile) primaryOnDisk = false
+  }
+  missingClusters = clusters
+    .map((_, i) => (clusterOnDisk[i] ? null : clusterNames[i]))
+    .filter(Boolean)
+  missingClusterIds = clusters
+    .map((c, i) => (clusterOnDisk[i] ? null : c.id || `c${i + 1}`))
+    .filter(Boolean)
+}
+// 底线之外的个别簇缺失：不 block，随报告与返回值交代。
+const presentClusters = clusterOnDisk.filter(Boolean).length
+const topicMissing = []
+if (!primaryOnDisk) topicMissing.push('一手材料')
+if (presentClusters < 3)
+  topicMissing.push(`cluster-*.md 完整产物不足 3 个（现 ${presentClusters} 个）`)
+if (!internalOnDisk) topicMissing.push('内部记忆检索')
+if (!guidepointOnDisk) topicMissing.push('专家纪要检索')
+if (topicMissing.length) {
+  return {
+    ok: false,
+    blocked: `取证支线缺失：${topicMissing.join('、')}`,
+    incomplete: [
+      `取证支线缺失：${topicMissing.join('、')}，已停在交叉验证之前；补齐缺失产物后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用`,
+    ],
+    missing_clusters: missingClusterIds,
+    resume_hint: RESUME_HINT,
+  }
+}
+
+phase('交叉验证与盲区')
+const cross = await agent(
+  `${base} 阶段 3 交叉验证 + 阶段 3.5 盲区检查：读 ${R}/ 下全部取证文件（primary.md、cluster-*.md、internal-memory.md、guidepoint.md），跨簇互证升级置信度（【高】≥3 独立源、【中】2 源、【低】单源）；矛盾保留各方原话（【冲突】），不折中合并；检查盲区并写 ${R}/cross-check.md，结尾写“盲区检查完成”。若仍有必须补查的盲区，放入返回 JSON 的 gaps 数组（最多 2 项）。`,
+  { agentType: 'general-purpose', label: '交叉验证与盲区', phase: '交叉验证与盲区', schema: OUT }
+)
+
+if (cross && Array.isArray(cross.gaps) && cross.gaps.length > 0) {
+  const suppGaps = cross.gaps.slice(0, 2)
+  await parallel(
+    suppGaps.map((g, idx) => () =>
+      agent(
+        `${base} 阶段 3.5 盲区补查 #${idx + 1}：针对盲区「${g}」补充检索一手材料、内部库或 AlphaEngine，写 ${R}/supplement-${
+          idx + 1
+        }.md。`,
+        { agentType: 'dalton-evidence', label: `盲区补查 ${idx + 1}`, phase: '交叉验证与盲区', schema: OUT }
+      )
+    )
+  )
+}
+
+phase('写作与数字核验')
+const draftPath = `${W}/drafts/${dateTag}-topic-${topicSlug}.md`
+const draft = await agent(
+  `${base} 阶段 4 写作：按 ${S}/templates/topic.md 综合 ${R}/ 下全部材料写专题报告到 ${draftPath}（含逐条置信度标签、“对覆盖公司的含义”表、情景推演、信息缺口与局限、数字核验表占位、Sources）${
+    missingClusters.length ? `。缺失簇：${missingClusters.join('、')}，对应内容在“信息缺口与局限”写明缺什么与已尝试路径` : ''
+  }。跑 python ${S}/scripts/validate_topic.py --input ${draftPath} --json 到通过，返回成稿路径与 sha256。`,
+  { agentType: 'general-purpose', label: '专题写作', phase: '写作与数字核验', schema: DRAFT_OUT }
+)
+
+// 第 1 轮语言审查：专题报告写完之后、数字核验与第一次独立审稿之前（改稿会换哈希，必须先改再送审）。
+const draftSha0 = draft === null ? null : shaOf(draft)
+phase('语言审查')
+const lang1 =
+  draftSha0 === null
+    ? null
+    : await agent(
+        `对 ${draftPath} 做第 1 轮语言审查：调用工具 check_language(draft_path="${draftPath}", round=1)（只标问题），读 ${draftPath}.language.md 清单，按清单逐条修改 ${draftPath}（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）。改完跑 python ${S}/scripts/validate_topic.py --input ${draftPath} --json 确认仍通过，返回 ${draftPath} 的 sha256。`,
+        { agentType: 'general-purpose', label: '语言审查 1', phase: '语言审查', schema: DRAFT_OUT }
+      )
+const lang1Sha = lang1 === null ? null : shaOf(lang1)
+const lang1Failed = draftSha0 !== null && lang1Sha === null
+
+const audit =
+  draft === null
+    ? null
+    : await agent(
+        `${base} 阶段 5 数字核验：对 ${draftPath} 里每个关键数字核对 SEC filing（dalton_sec）与行情/一致预期接口（价格、市值、PE、净现金、营收、净利、分红回购、capex），输出 PASS/FAIL 核验表到 ${R}/number-audit.md。`,
+        { agentType: 'dalton-evidence', label: '数字核验', phase: '写作与数字核验', schema: OUT }
+      )
+
+phase('独立审稿与修订')
+const draftSha = lang1Sha || draftSha0
+const draftOk = draft !== null && draftSha !== null
+const reviewRaw =
+  !draftOk
+    ? null
+    : await agent(
+        `审阅 ${draftPath}（被审草稿 sha256：${
+          draftSha || '未知'
+        }）及 ${R}/number-audit.md、${R}/cross-check.md（只读不改文件）。检查：无据断言、逻辑漏洞、盲点、来源偏差、矛盾是否保留原话、低置信度占比是否异常（<15% 提示注水）、对覆盖公司的驱动变量传导是否具体。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block，pass=可发布、block=不得发布；items 逐项覆盖 1–9 项检查）。`,
+        { agentType: 'dalton-reviewer', label: '独立审稿', phase: '独立审稿与修订', schema: VERDICT, reviewDraft: draftPath }
+      )
+
+const incomplete = []
+// 缺失簇信息在取证门就初始化（见 missingClusters/missingClusterIds），所有出口都带上。
+if (missingClusters.length)
+  incomplete.push(`分簇取证失败（${missingClusters.join('、')}），缺口已传给写作并在报告中交代`)
+// 审稿结果未覆盖 1–9 项检查时按审稿失败处理（与发布审稿同一契约，fail-closed）。
+let review = reviewRaw
+if (review !== null && !completeReview(review)) {
+  incomplete.push('审稿结果未覆盖 1–9 项检查，按审稿失败处理')
+  review = null
+}
+if (review && verdictOf(review) === 'block') {
+  incomplete.push(`审稿 block：${review.summary || '存在不可修订级问题'}`)
+  return {
+    ok: false,
+    blocked: review.summary || '审稿 block',
+    draft: draftPath,
+    number_audit: audit && `${R}/number-audit.md`,
+    missing_clusters: missingClusterIds,
+    incomplete,
+    resume_hint:
+      '修订报告后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发（取证支线等）会直接复用，成稿及之后的阶段重新派发',
+  }
+}
+
+// revise → 修订 → 复审，最多 2 轮；每个失败出口都写进 incomplete 并停下。
+// 知识层草案与是否修订无关：pass 路径也要生成。
+let fix = null
+let finalReview = review
+let rounds = 0
+let currentDraftSha = draftSha
+let reviewPassed = review !== null && verdictOf(review) === 'pass'
+while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
+  rounds += 1
+  fix = await agent(
+    `${base} 阶段 7 修订（第 ${rounds} 轮）：先核对 ${draftPath} 的 sha256 是否与审稿前（${
+      currentDraftSha || '当前记录值'
+    }）一致；把 ${R}/number-audit.md 的核验表并入报告（FAIL 项修成正值并标【更正】），按审稿意见修复全部 P0，跑 python ${S}/scripts/validate_topic.py --input ${draftPath} --json 到通过。审稿意见：\n${JSON.stringify(
+      finalReview
+    )}`,
+    { agentType: 'general-purpose', label: `修订 ${rounds}`, phase: '独立审稿与修订', schema: DRAFT_OUT }
+  )
+  const fixedSha = fix === null ? null : shaOf(fix)
+  if (fixedSha === null) {
+    incomplete.push(`第 ${rounds} 轮修订失败（修订结果或其 sha256 缺失/非法），未复审`)
+    break
+  }
+  currentDraftSha = fixedSha
+  const reReview = await agent(
+    `复审（第 ${rounds} 轮修订后）：审阅 ${draftPath}（被审草稿 sha256：${
+      fixedSha
+    }）及 ${R}/number-audit.md、${R}/cross-check.md（只读不改文件）。重点核对上一轮 must_fix 是否全部解决、validate_topic 是否仍通过。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。上一轮审稿意见：\n${JSON.stringify(
+      finalReview
+    )}`,
+    { agentType: 'dalton-reviewer', label: `复审 ${rounds}`, phase: '独立审稿与修订', schema: VERDICT, reviewDraft: draftPath }
+  )
+  if (reReview === null) {
+    incomplete.push(`第 ${rounds} 轮复审失败`)
+    break
+  }
+  if (!completeReview(reReview)) {
+    incomplete.push(`第 ${rounds} 轮复审结果未覆盖 1–9 项检查，按复审失败处理`)
+    break
+  }
+  if (verdictOf(reReview) === 'block') {
+    incomplete.push(`复审 block：${reReview.summary || '存在不可修订级问题'}`)
+    break
+  }
+  finalReview = reReview
+}
+reviewPassed = finalReview !== null && verdictOf(finalReview) === 'pass'
+
+// 笔记两轮：一次写完、不再改的取证/核验笔记同样审两轮——第 1 轮审完按清单改，
+// 第 2 轮复核（改动过的文件再补一次 round=2 确认，绑定终态哈希）。
+const notesReview =
+  !draftOk || !reviewPassed
+    ? null
+    : await agent(
+        `对本次运行产出、给人读的 .md 笔记逐一做两轮语言审查（规则见 .agents/skills/dalton-language/SKILL.md，只标问题）。每个文件依次：1) 调用工具 check_language(draft_path="<文件>", round=1)，读 <文件>.language.md 清单并按清单修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）；2) 调用 check_language(draft_path="<文件>", round=2) 复核；若第 1 轮后改过稿，改完再调用一次 round=2 确认（记录追加在同一 json）。\n文件清单：\n- ${R}/plan.md\n- ${R}/primary.md\n- ${R}/internal-memory.md\n- ${R}/guidepoint.md\n- ${R}/cross-check.md\n- ${R}/number-audit.md\n清单之外本次运行写的其他给人读的 .md 一并同法处理；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/ 下的文件、知识层渲染文件与 .audit/.annotated/.language 侧车不审。返回处理过的文件列表与摘要。`,
+        { agentType: 'general-purpose', label: '笔记语言审查', phase: '独立审稿与修订', schema: OUT }
+      )
+if (draftOk && reviewPassed && notesReview === null) {
+  incomplete.push('笔记语言审查失败（取证/核验笔记未完成两轮语言审查）')
+}
+
+// 第 2 轮语言审查：终稿内容定稿（审稿修订循环结束）之后、提交最后一次审稿之前。
+// 改了稿就再跑一次 round=2 复核，使最后一条第 2 轮记录绑定终稿哈希；哈希有变
+// 则终稿审稿重新绑定独立审稿哈希——语言修改不能让已有 pass 记录失效却无人重审。
+const preLang2Sha = currentDraftSha
+const lang2 =
+  !draftOk || !reviewPassed
+    ? null
+    : await agent(
+        `对 ${draftPath} 做第 2 轮语言审查：调用工具 check_language(draft_path="${draftPath}", round=2)，读 ${draftPath}.language.md 清单，按清单逐条完成终稿语言修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）。若草稿有改动，再调用一次 check_language(draft_path="${draftPath}", round=2) 对终稿复核（记录追加在同一 json），并跑 python ${S}/scripts/validate_topic.py --input ${draftPath} --json 确认仍通过。返回 ${draftPath} 最终 sha256。`,
+        { agentType: 'general-purpose', label: '语言审查 2', phase: '独立审稿与修订', schema: DRAFT_OUT }
+      )
+const lang2Sha = lang2 === null ? null : shaOf(lang2)
+if (draftOk && reviewPassed && lang2Sha === null) {
+  incomplete.push('语言审查第 2 轮失败（结果或其 sha256 缺失/非法），未做终稿语言修改')
+  reviewPassed = false
+} else if (draftOk && reviewPassed && lang2Sha !== preLang2Sha) {
+  currentDraftSha = lang2Sha
+  const finalCheck = await agent(
+    `终稿审稿（语言修改后）：审阅 ${draftPath}（被审草稿 sha256：${lang2Sha}）及 ${R}/number-audit.md、${R}/cross-check.md（只读不改文件）。重点：语言修改未动事实与数字，上一轮 must_fix 仍全部解决。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
+    { agentType: 'dalton-reviewer', label: '终稿审稿', phase: '独立审稿与修订', schema: VERDICT, reviewDraft: draftPath }
+  )
+  if (finalCheck === null) {
+    incomplete.push('终稿审稿失败')
+    reviewPassed = false
+  } else if (!completeReview(finalCheck)) {
+    incomplete.push('终稿审稿结果未覆盖 1–9 项检查，按审稿失败处理')
+    reviewPassed = false
+  } else {
+    finalReview = finalCheck
+    reviewPassed = verdictOf(finalCheck) === 'pass'
+  }
+}
+
+// 知识提案只看最终审稿结论，与中间有没有修订完全无关；修订 prompt 不写这个文件。
+// 行业工作区（isSector）产出行业知识层草案：论点/指标/议程进本工作区，
+// 对成员公司的修改走提案交回 Home（行业观点只把公司标"待复核"，不直接改公司论点）。
+let kp = null
+if (reviewPassed) {
+  kp = await agent(
+    isSector
+      ? `${base} 阶段 7 知识层草案（行业工作区）：按 PK.2 的 JSON Schema 把本行业的知识层修改建议写到 ${R}/knowledge-revision.json（不回写基金 wiki，不直接改 data/）：行业论点进 thesis（支柱/阈值/证据，不写公司目标价）、行业指标进 drivers、行业问题与验证点进 agenda，可含 debate/lessons 与 sector 文档的成员、边界修订；涉及成员公司（${
+          related.join(', ') || '见 data/sector.json 的 members'
+        }）的修改列为跨公司提案，由 Home 转交对应公司分析师，不在本工作区写 company/management。`
+      : `${base} 阶段 7 知识层草案：按 PK.2 的 JSON Schema 将对相关覆盖公司（${
+          related.join(', ') || '报告涉及的覆盖公司'
+        }）的知识层修改建议（drivers、debate、lessons、agenda）写到 ${R}/knowledge-revision.json（不回写基金 wiki，不直接改 data/）。`,
+    { agentType: 'general-purpose', label: '知识层草案', phase: '独立审稿与修订', schema: OUT }
+  )
+}
+
+if (!primaryOnDisk) incomplete.push('一手材料失败')
+if (!internalOnDisk) incomplete.push('内部记忆检索失败')
+if (!guidepointOnDisk) incomplete.push('专家纪要检索失败')
+if (cross === null) incomplete.push('交叉验证与盲区失败')
+if (!draftOk) incomplete.push('专题写作失败（草稿或其 sha256 缺失/非法）')
+if (lang1Failed) incomplete.push('语言审查第 1 轮失败（结果或其 sha256 缺失/非法），未按清单修改')
+if (audit === null && draftOk) incomplete.push('数字核验失败')
+if (review === null && draftOk) incomplete.push('独立审稿失败')
+if (!reviewPassed && !incomplete.length) incomplete.push('审稿未最终通过（无 pass 记录）')
+if (reviewPassed && kp === null) incomplete.push('知识层草案失败')
+
+phase('产物核验')
+const deliverables = [
+  `${R}/plan.md`,
+  `${R}/plan.md.language.json`,
+  `${R}/primary.md`,
+  `${R}/primary.md.language.json`,
+  `${R}/internal-memory.md`,
+  `${R}/internal-memory.md.language.json`,
+  `${R}/guidepoint.md`,
+  `${R}/guidepoint.md.language.json`,
+  `${R}/cross-check.md`,
+  `${R}/cross-check.md.language.json`,
+  draftPath,
+  `${draftPath}.language.json`,
+  `${R}/number-audit.md`,
+  `${R}/number-audit.md.language.json`,
+  `${R}/knowledge-revision.json`,
+]
+const check =
+  !draftOk
+    ? null
+    : await agent(
+        `只读核对以下文件是否存在并计算 sha256（用 bash 的 test -e 与 sha256sum，不写任何文件）：\n${deliverables
+          .map((p) => '- ' + p)
+          .join('\n')}\n返回 files 字符串数组：存在的文件写 “<路径>|<sha256>”，不存在的只写 “<路径>”（不带竖线）。`,
+        { agentType: 'dalton-evidence', label: '产物核验', phase: '产物核验', schema: HASH, checkFiles: false }
+      )
+const SHA_RE = /^[0-9a-f]{64}$/
+const expected = new Set(deliverables)
+const reported = new Set()
+for (const entry of check && Array.isArray(check.files) ? check.files : []) {
+  const bar = entry.indexOf('|')
+  const path = bar > 0 ? entry.slice(0, bar) : ''
+  const sha = bar > 0 ? entry.slice(bar + 1) : ''
+  if (!path || !SHA_RE.test(sha) || !expected.has(path)) {
+    incomplete.push(`产物核验返回无效条目：${entry}`)
+    continue
+  }
+  reported.add(path)
+}
+for (const path of deliverables) {
+  if (!reported.has(path)) incomplete.push(`产物缺失或未报哈希：${path}`)
+}
+if (check === null && draftOk) incomplete.push('产物核验子任务失败')
+
+return {
+  ok: draftOk && reviewPassed && incomplete.length === 0,
+  draft: draftPath,
+  number_audit: audit && `${R}/number-audit.md`,
+  review_done: finalReview !== null,
+  review_verdict: finalReview && verdictOf(finalReview),
+  language_done: draftOk && lang1Sha !== null && lang2Sha !== null,
+  revise_rounds: rounds,
+  knowledge_revision: kp && `${R}/knowledge-revision.json`,
+  missing_clusters: missingClusterIds,
+  incomplete,
+}
+
+
+===== WORKFLOW: weekly-coverage-review =====
+--- FILE: weekly-coverage-review/contract.json ---
+{
+  "name": "weekly-coverage-review",
+  "description": "覆盖周报的完成契约：筛选归因 + Core 逐家 + Watch 命中 + 周会稿（对应 dalton-weekly-review SKILL 的交付物；在 Home 运行，知识层走提案，不要求本工作区知识版本或 verdict）。",
+  "draft": "dalton/drafts/{end}-weekly.md",
+  "params_required": [
+    "home_dir",
+    "end",
+    "coverage_path"
+  ],
+  "stages": [
+    {
+      "name": "筛选与归因",
+      "artifacts": [
+        {
+          "path": "dalton/research/weekly-{end}/screen.json",
+          "min_bytes": 50
+        },
+        {
+          "path": "dalton/research/weekly-{end}/attribution.json",
+          "min_bytes": 50
+        }
+      ]
+    },
+    {
+      "name": "Core 逐家",
+      "artifacts": [
+        {
+          "path": "dalton/research/weekly-{end}/core-{ticker}.md",
+          "derive": {
+            "json": "dalton/research/weekly-{end}/screen.json",
+            "pointer": "core",
+            "field": "ticker"
+          },
+          "min_bytes": 100
+        }
+      ]
+    },
+    {
+      "name": "Watch 命中",
+      "artifacts": [
+        {
+          "path": "dalton/research/weekly-{end}/watch-*.md",
+          "glob": true,
+          "min_count": 1,
+          "min_bytes": 100,
+          "optional": true
+        }
+      ]
+    },
+    {
+      "name": "汇总周会稿",
+      "artifacts": [
+        {
+          "path": "dalton/drafts/{end}-weekly.md",
+          "min_bytes": 500
+        },
+        {
+          "path": "dalton/drafts/{prev_month}-monthly-review.md",
+          "min_bytes": 10,
+          "requires_first_of_month": "end"
+        }
+      ]
+    }
+  ],
+  "closing": {
+    "push_draft": {
+      "path": "research/push/{end}-director-weekly.md"
+    }
+  }
+}
+
+--- FILE: weekly-coverage-review/workflow.js ---
+export const meta = {
+  name: 'weekly-coverage-review',
+  description: 'Dalton 周会：全名单筛选 → Core 逐家并行五源 → Watch 命中定向检索 → EPS vs 倍数归因 → 观点变化汇总 → call',
+}
+
+const { home_dir: K, end: E, coverage_path: L } = args
+const R = `${K}/research/weekly-${E}`
+const S = '.agents/skills/dalton-weekly-review'
+const base = '先读 .agents/skills/dalton-conventions/SKILL.md 与 ' + S + '/SKILL.md。'
+
+// Note: schema_max_depth is 5 (root=1, properties=2, field=3, items=4).
+// Element object keys ({ticker, workspace_dir, held} for core; {ticker, event_hint, workspace_dir} for flagged)
+// are enforced via the prompt contract while keeping schema nesting depth <= 4.
+const SCREEN = {
+  type: 'object',
+  properties: {
+    ok: { type: 'boolean' },
+    base: { type: 'string' },
+    core: { type: 'array', items: { type: 'object' } },
+    flagged: { type: 'array', items: { type: 'object' } },
+    warnings: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['ok', 'core', 'flagged'],
+}
+
+const CO = {
+  type: 'object',
+  properties: {
+    ticker: { type: 'string' },
+    file: { type: 'string' },
+    move_pp: { type: 'number' },
+    excess_pp: { type: 'number' },
+    driver: { type: 'string' },
+    thesis_impact: { type: 'string' },
+    verdict: { type: 'string' },
+    call_candidate: { type: 'boolean' },
+  },
+  required: ['ticker', 'file'],
+}
+
+const HASH = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+  },
+  required: ['files'],
+}
+
+// B1：支线产物缺失判定（各 workflow 同一实现；workflow 之间没有共用 js 模块的
+// 机制，改动需同步全部 workflow.js）。子任务返回 null、或 files/file 为空，都算
+// 该家失败。周会是全名单扫描，单家缺失不 block 整个 run：按既有口径写进 incomplete
+// 与周会稿的“口径与缺口”，产物核验阶段仍会点名缺失文件。
+const branchArtifacts = (v) => {
+  if (v === null || typeof v !== 'object') return []
+  const out = []
+  if (typeof v.file === 'string' && v.file.trim()) out.push(v.file.split('|', 1)[0].trim())
+  for (const f of Array.isArray(v.files) ? v.files : []) {
+    if (typeof f === 'string' && f.trim()) out.push(f.split('|', 1)[0].trim())
+  }
+  return out.filter(Boolean)
+}
+
+phase('筛选与归因')
+const scr = await agent(
+  `${base} 用覆盖名单 ${L}，窗口终点 ${E}：跑 python ${S}/scripts/screen_movers.py 与 python ${S}/scripts/attribution.py，结果写 ${R}/screen.json、${R}/attribution.json。返回 JSON：ok（boolean）、base（窗口起点日期）、core（数组，每项含 ticker, workspace_dir, held）、flagged（Watch 命中数组，每项含 ticker, event_hint, workspace_dir）、warnings（字符串数组）。`,
+  { agentType: 'general-purpose', label: '筛选', phase: '筛选与归因', schema: SCREEN }
+)
+if (scr === null || !scr.ok) {
+  return {
+    ok: false,
+    reason: '筛选失败或数据未更新，不下结论',
+    warnings: scr && scr.warnings,
+    incomplete: ['筛选失败或数据未更新（screen.json 未就绪），本周无法核验产物'],
+  }
+}
+const core = [...scr.core].sort((a, b) => (b.held ? 1 : 0) - (a.held ? 1 : 0))
+// 平台上限：每次运行最多派 64 个子智能体（config.yaml 的 workflow 段）；扣掉筛选 1、
+// 支线核验 1、call 3、周会稿 1、产物核验 1
+const room = Math.max(0, 64 - 7 - core.length)
+const watch = scr.flagged.slice(0, room)
+if (scr.flagged.length > room) {
+  log(
+    `Watch 命中 ${scr.flagged.length} 家，超出平台派发上限，余下 ${
+      scr.flagged.length - room
+    } 家写进“口径与缺口”，下次优先`
+  )
+}
+
+phase('Core 逐家')
+const coreRes = await parallel(
+  core.map((c) => () =>
+    agent(
+      `${base} 公司 ${c.ticker}${c.held ? '（持仓）' : ''}，知识层在 ${c.workspace_dir || `../${c.ticker}`}。按 ${S}/references/core-five-sources.md 做本周（${scr.base} 至 ${E}）五源检索，归因数据见 ${R}/screen.json 与 ${R}/attribution.json。写 ${R}/core-${c.ticker}.md；若有知识层修改建议，写提案 ${R}/proposals/${c.ticker}.json（不直接改公司工作区知识层）。`,
+      { agentType: 'dalton-evidence', label: String(c.ticker), phase: 'Core 逐家', schema: CO }
+    )
+  )
+)
+
+phase('Watch 命中')
+const watchRes = await parallel(
+  watch.map((w) => () =>
+    agent(
+      `${base} Watch 公司 ${w.ticker}（提示：${w.event_hint || '异动命中'}）。按 ${S}/references/watch-rules.md 定向检索，写 ${R}/watch-${w.ticker}.md。`,
+      { agentType: 'dalton-evidence', label: String(w.ticker), phase: 'Watch 命中', schema: CO }
+    )
+  )
+)
+
+// B1 共用判定（在盘核验）：单家文件 core-<T>.md / watch-<T>.md 在盘缺失或不足
+// 契约下限（100 字节）计入失败；核验子任务本身失败不 block 整个名单，只记一条
+// incomplete 并按子任务回报判断。单家失败不派 call。
+phase('汇总与 call')
+const PROBE_OUT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+  },
+  required: ['files'],
+}
+const probeBranchFiles = async (paths) => {
+  const entries = paths.map((p) => (Array.isArray(p) ? p : [p, 1]))
+  const r = await agent(
+    `只读核验以下支线产物文件是否存在、非空白且达到字节数下限（不写任何文件）。逐个执行 bash：f='<路径>'；n=<字节数下限>；test -e "$f" && [ "$(wc -c < "$f")" -ge "$n" ] && [ -n "$(tr -d '[:space:]' < "$f")" ] && echo "$f|ok" || echo "$f|missing"。返回 files 数组：每项为上述一行的原样输出（<路径>|ok 或 <路径>|missing）：\n${entries
+      .map(([p, min]) => `- ${p}（至少 ${min} 字节）`)
+      .join('\n')}`,
+    { agentType: 'dalton-evidence', label: '支线核验', phase: '汇总与 call', schema: PROBE_OUT, checkFiles: false }
+  )
+  if (r === null || typeof r !== 'object' || !Array.isArray(r.files)) return null
+  const answered = new Set()
+  for (const entry of r.files) {
+    if (typeof entry !== 'string') return null
+    const bar = entry.lastIndexOf('|')
+    const path = bar > 0 ? entry.slice(0, bar) : ''
+    const verdict = bar > 0 ? entry.slice(bar + 1) : ''
+    if (!path || (verdict !== 'ok' && verdict !== 'missing')) return null
+    answered.add(path)
+  }
+  if (entries.some(([p]) => !answered.has(p))) return null
+  return r.files
+}
+const corePath = (t) => `${R}/core-${t}.md`
+const watchPath = (t) => `${R}/watch-${t}.md`
+const incomplete = []
+const probeTargets = [
+  ...core.filter((_, i) => branchArtifacts(coreRes[i]).length > 0).map((c) => [corePath(c.ticker), 100]),
+  ...watch.filter((_, i) => branchArtifacts(watchRes[i]).length > 0).map((w) => [watchPath(w.ticker), 100]),
+]
+const offDisk = new Set()
+let probeFailed = false
+if (probeTargets.length) {
+  // 派发本身抛错（如到达平台上限）与核验失败同路处理，不让 run 变 script_error。
+  let probe = null
+  try {
+    probe = await probeBranchFiles(probeTargets)
+  } catch (e) {
+    log(`支线核验派发失败：${e}`)
+    probe = null
+  }
+  if (probe === null) {
+    // 核验失败：公司仍按子任务回报计入名单汇总，但未核实的公司本轮不派
+    // call，并在返回值里标出（unverified_by_probe）。
+    probeFailed = true
+    incomplete.push('支线核验子任务失败（单家文件在盘状态未核实，未核实的公司本轮不派 call）')
+  } else {
+    for (const entry of probe) {
+      if (entry.endsWith('|missing')) offDisk.add(entry.slice(0, -'|missing'.length))
+    }
+  }
+}
+const coreOk = (i) => branchArtifacts(coreRes[i]).length > 0 && !offDisk.has(corePath(core[i].ticker))
+const watchOk = (i) => branchArtifacts(watchRes[i]).length > 0 && !offDisk.has(watchPath(watch[i].ticker))
+const failedCore = core.filter((_, i) => !coreOk(i)).map((c) => c.ticker)
+const failedWatch = watch.filter((_, i) => !watchOk(i)).map((w) => w.ticker)
+
+const okCore = coreRes.filter((_, i) => coreOk(i))
+// call 只派给在盘核验通过的公司：核验失败（probeFailed）时一家都不派。
+const cands = probeFailed
+  ? []
+  : okCore.filter((x) => x.call_candidate).map((x) => x.ticker)
+const calls =
+  cands.length === 0
+    ? []
+    : await parallel(
+        cands.slice(0, 3).map((t) => () => {
+          const c = core.find((y) => y.ticker === t) || { ticker: t, workspace_dir: `../${t}` }
+          return agent(
+            `按 .agents/skills/dalton-call/SKILL.md 对 ${t} 做 conviction 检查（知识层 ${
+              c.workspace_dir || `../${t}`
+            }，本周材料 ${R}/core-${t}.md）。你是子智能体，没有 Dalton 直连工具：知识层与材料用文件读取，只写 ${R}/call-${t}.md，不调用 knowledge_append_verdict、check_draft、publish_report，跳过该 SKILL 的 Step 2.2 和 Step 9。证据门槛不过就输出“暂无高 conviction”及缺什么。`,
+            { agentType: 'general-purpose', label: `call ${t}`, phase: '汇总与 call', schema: CO }
+          )
+        })
+      )
+
+const doc = await agent(
+  `${base} 按 ${S}/templates/weekly.md 汇总 ${R}/ 下全部文件为周会稿 ${K}/drafts/${E}-weekly.md。观点变化部分读各 Core 工作区本周 verdicts.md 与 ${R}/proposals/。Core 失败的公司：${
+    failedCore.join(',') || '无'
+  }，在“口径与缺口”写明。`,
+  { agentType: 'general-purpose', label: '周会稿', phase: '汇总与 call', schema: CO }
+)
+
+if (doc === null) incomplete.push('周会稿失败')
+if (failedCore.length) incomplete.push(`Core 逐家失败：${failedCore.join('、')}`)
+if (failedWatch.length) incomplete.push(`Watch 命中检索失败：${failedWatch.join('、')}`)
+const failedCalls = cands
+  .slice(0, 3)
+  .filter((t) => !calls.some((x) => x && x.ticker === t))
+if (failedCalls.length) incomplete.push(`conviction call 失败：${failedCalls.join('、')}`)
+
+phase('产物核验')
+const deliverables = [
+  `${R}/screen.json`,
+  `${R}/attribution.json`,
+  `${K}/drafts/${E}-weekly.md`,
+  ...core.map((c) => `${R}/core-${c.ticker}.md`),
+  ...watch.map((w) => `${R}/watch-${w.ticker}.md`),
+]
+// 与支线同路处理：派发抛错（如到达平台上限）按 null 计缺失，不让 run 变 script_error。
+let check = null
+try {
+  check = await agent(
+    `只读核对以下文件是否存在并计算 sha256（用 bash 的 test -e 与 sha256sum，不写任何文件）：\n${deliverables
+      .map((p) => '- ' + p)
+      .join('\n')}\n返回 files 字符串数组：存在的文件写 “<路径>|<sha256>”，不存在的只写 “<路径>”（不带竖线）。`,
+    { agentType: 'dalton-evidence', label: '产物核验', phase: '产物核验', schema: HASH, checkFiles: false }
+  )
+} catch (e) {
+  log(`产物核验派发失败：${e}`)
+  check = null
+}
+const SHA_RE = /^[0-9a-f]{64}$/
+const expected = new Set(deliverables)
+const reported = new Set()
+for (const entry of check && Array.isArray(check.files) ? check.files : []) {
+  const bar = entry.indexOf('|')
+  const path = bar > 0 ? entry.slice(0, bar) : ''
+  const sha = bar > 0 ? entry.slice(bar + 1) : ''
+  if (!path || !SHA_RE.test(sha) || !expected.has(path)) {
+    incomplete.push(`产物核验返回无效条目：${entry}`)
+    continue
+  }
+  reported.add(path)
+}
+for (const path of deliverables) {
+  if (!reported.has(path)) incomplete.push(`产物缺失或未报哈希：${path}`)
+}
+if (check === null) incomplete.push('产物核验子任务失败')
+
+return {
+  ok: doc !== null && incomplete.length === 0,
+  draft: `${K}/drafts/${E}-weekly.md`,
+  core_done: okCore.length,
+  core_total: core.length,
+  watch_done: watch.filter((_, i) => watchOk(i)).length,
+  calls: calls.filter((x) => x !== null).map((x) => x.ticker),
+  proposals_dir: `${R}/proposals`,
+  unverified_by_probe: probeFailed
+    ? [...core.map((c) => c.ticker), ...watch.map((w) => w.ticker)]
+    : [],
+  incomplete,
+}
+

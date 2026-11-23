@@ -279,10 +279,15 @@ async def _post_json(
     body: Mapping[str, Any],
     timeout: float,
 ) -> tuple[int, dict[str, Any] | None]:
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
+        return 0, {"ok": False, "code": "capability_disabled"}
     token = get_dalton_bridge_admin_token()
-    if not token:
+    base_url = get_dalton_bridge_base_url().rstrip("/")
+    if not token or not base_url:
         return 0, {"ok": False, "code": "bridge_not_configured"}
-    url = f"{get_dalton_bridge_base_url().rstrip('/')}{path}"
+    url = f"{base_url}{path}"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",

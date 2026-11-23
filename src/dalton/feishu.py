@@ -112,7 +112,13 @@ async def post_bridge_feishu(route: str, body: dict[str, Any]) -> dict[str, Any]
     """
     if route not in FEISHU_ROUTES:
         raise ValueError(f"Unknown feishu bridge route: {route!r}")
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
+        raise FeishuBridgeError("capability_disabled", "researchdata_bridge capability is disabled")
     base_url = get_dalton_bridge_base_url().rstrip("/")
+    if not base_url:
+        raise FeishuBridgeError("bridge_unconfigured", "researchdata bridge URL is not configured")
     token = get_dalton_bridge_admin_token()  # DALTON-HOOK(bridge-admin-token): /feishu/* are admin routes
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if token:

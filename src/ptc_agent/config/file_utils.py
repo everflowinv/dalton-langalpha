@@ -239,7 +239,10 @@ def load_yaml_config(file_path: str, use_cache: bool = True) -> dict[str, Any]:
         logger.warning(f"Configuration file not found: {file_path}")
         return {}
 
-    app_env = os.getenv("APP_ENV", "").strip()
+    # DALTON-HOOK(standalone-core): resolve active YAML overlay via unified profile resolver
+    from src.dalton.profile import apply_core_yaml_overrides, resolve_yaml_overlay_env
+
+    app_env = resolve_yaml_overlay_env()
     cache_key = f"{file_path}|{app_env}"
     if use_cache and cache_key in _config_cache:
         return _config_cache[cache_key]
@@ -258,6 +261,7 @@ def load_yaml_config(file_path: str, use_cache: bool = True) -> dict[str, Any]:
             refuse_renamed_llm_keys(overlay_config, overlay)
             warn_retired_compaction_keys(overlay_config, overlay)
             raw_config = _deep_merge(raw_config, overlay_config)
+            raw_config = apply_core_yaml_overrides(raw_config, overlay_config, overlay_env=app_env)  # DALTON-HOOK(standalone-core)
             logger.info(f"Applied {overlay.name} over {file_path}")
         else:
             logger.warning(f"APP_ENV={app_env} but no {overlay.name} beside {file_path}; using the base file only")

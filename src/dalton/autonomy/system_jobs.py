@@ -223,7 +223,13 @@ async def _call_host_bridge(
     timeout_s: float = 8.0,
 ) -> tuple[int, dict[str, Any] | None]:
     """Call the host-side researchdata bridge with token authentication."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
+        return 503, {"ok": False, "error": "capability_disabled"}
     base_url = get_dalton_bridge_base_url().rstrip("/")
+    if not base_url:
+        return 503, {"ok": False, "error": "bridge_unconfigured"}
     token = get_dalton_bridge_admin_token()
     url = f"{base_url}{path}"
     headers: dict[str, str] = {}
@@ -240,7 +246,11 @@ async def _call_host_bridge(
 
 
 async def _fetch_ops_jobs() -> list[dict[str, Any]]:
-    """Build the ``ops`` scope read-only job entries, falling back to ``unknown`` on error."""
+    """Build the ``ops`` scope read-only job entries, returning ``[]`` when bridge capability is off."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
+        return []
     by_key: dict[str, dict[str, Any]] = {}
     for spec in DEFAULT_OPS_JOBS:
         by_key[spec["key"]] = {
@@ -1928,10 +1938,13 @@ async def list_system_jobs(user_id: str) -> dict[str, Any]:
         for s_unit, s_owner, s_tracking in pending_sector_items
     ]
 
+    from src.dalton.capabilities import CapabilityId, has_capability
+
     ops_jobs = await _fetch_ops_jobs()
 
+    data_jobs_enabled = has_capability(CapabilityId.DATA_JOBS)
     data_jobs: list[dict[str, Any]] = []
-    if is_internal:
+    if is_internal and data_jobs_enabled:
         data_jobs = await _fetch_data_system_jobs()
 
     all_jobs = [*company_jobs, *sector_jobs, *home_jobs, *ops_jobs, *data_jobs]
@@ -1943,7 +1956,7 @@ async def list_system_jobs(user_id: str) -> dict[str, Any]:
     }
     if sector_jobs:
         groups["sector"] = sector_jobs
-    if is_internal:
+    if is_internal and data_jobs_enabled:
         groups["data"] = data_jobs
     payload: dict[str, Any] = {
         "ok": True,
@@ -1994,6 +2007,10 @@ async def get_system_job_status(
     pm = is_pm_user(uid)
     scope, target = classify_system_job_key(key)
     if scope == "data":
+        from src.dalton.capabilities import CapabilityId, has_capability
+
+        if not has_capability(CapabilityId.DATA_JOBS):
+            raise ValueError(f"数据任务能力未启用: {key}")
         if await get_user_tier(uid) not in ("admin", "internal"):
             raise PermissionError("仅内部成员可查看公司公共数据任务")
         job = await _fetch_single_data_system_job(target)
@@ -2308,6 +2325,10 @@ async def toggle_system_job(
         raise PermissionError("运维任务为只读，不支持在系统内开关")
 
     if scope == "data":
+        from src.dalton.capabilities import CapabilityId, has_capability
+
+        if not has_capability(CapabilityId.DATA_JOBS):
+            raise PermissionError("数据任务能力未启用")
         actor_uid = str(actor_user_id if actor_user_id is not None else uid).strip()
         if not actor_uid or await get_user_tier(actor_uid) not in ("admin", "internal"):
             raise PermissionError("仅内部成员可操作公司公共数据任务")
@@ -2801,6 +2822,10 @@ async def run_system_job_now(
         raise PermissionError("运维任务为只读，不支持立即运行")
 
     if scope == "data":
+        from src.dalton.capabilities import CapabilityId, has_capability
+
+        if not has_capability(CapabilityId.DATA_JOBS):
+            raise PermissionError("数据任务能力未启用")
         actor_uid = str(actor_user_id if actor_user_id is not None else uid).strip()
         if not actor_uid or await get_user_tier(actor_uid) not in ("admin", "internal"):
             raise PermissionError("仅内部成员可操作公司公共数据任务")

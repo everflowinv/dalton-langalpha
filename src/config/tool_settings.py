@@ -6,7 +6,6 @@ that read from agent_config.yaml via the shared YAML cache.
 """
 
 import logging
-import os
 import re
 from typing import Any
 
@@ -36,7 +35,10 @@ def _raw_yaml_uses_env_var(key_path: str) -> bool:
         if path is None or not path.is_file():
             return False
         raw = _read_yaml(path)
-        app_env = os.getenv("APP_ENV", "").strip()
+        # DALTON-HOOK(standalone-core): resolve active YAML overlay via unified profile resolver
+        from src.dalton.profile import resolve_yaml_overlay_env
+
+        app_env = resolve_yaml_overlay_env()
         if app_env:
             overlay = path.with_name(f"{path.stem}.{app_env}{path.suffix}")
             if overlay.is_file():

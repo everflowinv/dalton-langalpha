@@ -21,10 +21,16 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.config.env import HOST_IP, LOCAL_DEV_USER_ID
 from src.config.settings import HOST_MODE
+from src.dalton.profile import DeploymentProfile, resolve_profile
+from src.dalton.sec_identity import (
+    DEFAULT_SEC_USER_AGENT as DEFAULT_SEC_USER_AGENT,
+    resolve_sec_user_agent,
+)
 
 logger = logging.getLogger(__name__)
 
 DALTON_YAML_PATH = Path(__file__).resolve().parent / "dalton.yaml"
+DALTON_CORE_YAML_PATH = Path(__file__).resolve().parent / "dalton.core.yaml"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -472,27 +478,121 @@ def get_configured_pm_user_ids() -> list[str]:
     return list(get_dalton_config().configured_pm_user_ids)
 
 
-@lru_cache(maxsize=1)
-def _load_base_dalton_config() -> DaltonConfig:
-    """Load and cache ``src/dalton/dalton.yaml``."""
+def _merge_dalton_yaml(
+    base: dict[str, Any],
+    overlay: dict[str, Any],
+    *,
+    path: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Deep-merge ``dalton.core.yaml`` over ``dalton.yaml``.
+
+    Nested mappings merge key-by-key, lists replace outright, and
+    ``models.probe_models`` replaces wholesale so core clears Everflow's
+    ``*-oauth`` probe entries cleanly.
+    """
+    merged = dict(base)
+    for key, value in overlay.items():
+        cur_path = (*path, key)
+        if value is None:
+            continue
+        if cur_path == ("models", "probe_models") and isinstance(value, dict):
+            merged[key] = dict(value)
+        elif isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_dalton_yaml(merged[key], value, path=cur_path)
+        else:
+            merged[key] = value
+    return merged
+
+
+@lru_cache(maxsize=4)
+def _load_profile_dalton_raw(profile: DeploymentProfile) -> dict[str, Any]:
+    """Load merged raw YAML mapping for ``profile`` without mutating module state."""
     if not DALTON_YAML_PATH.exists():
-        return DaltonConfig()
+        return {}
     raw: dict[str, Any] = yaml.safe_load(DALTON_YAML_PATH.read_text(encoding="utf-8")) or {}
+    if profile is DeploymentProfile.CORE and DALTON_CORE_YAML_PATH.exists():
+        core_raw = yaml.safe_load(DALTON_CORE_YAML_PATH.read_text(encoding="utf-8")) or {}
+        if not isinstance(core_raw, dict):
+            raise ValueError(f"{DALTON_CORE_YAML_PATH} must be a mapping of config keys")
+        raw = _merge_dalton_yaml(raw, core_raw)
+    return raw
+
+
+@lru_cache(maxsize=4)
+def _load_profile_dalton_config(profile: DeploymentProfile) -> DaltonConfig:
+    """Load and cache ``src/dalton/dalton.yaml`` (plus ``dalton.core.yaml`` in core profile)."""
+    raw = _load_profile_dalton_raw(profile)
+    if not raw:
+        return DaltonConfig()
     return DaltonConfig.model_validate(raw)
 
 
+def get_yaml_capabilities(profile: DeploymentProfile | None = None) -> dict[str, bool]:
+    """Return optional ``capabilities:`` boolean overrides from the merged profile YAML.
+
+    Kept outside ``DaltonConfig`` so ``DaltonConfig.model_dump()`` stays
+    byte-identical for Everflow parity while still allowing ``dalton.yaml`` /
+    ``dalton.core.yaml`` to declare capability overrides.
+    """
+    active = resolve_profile() if profile is None else profile
+    raw = _load_profile_dalton_raw(active)
+    caps_raw = raw.get("capabilities")
+    if not isinstance(caps_raw, dict):
+        return {}
+    out: dict[str, bool] = {}
+    for key, val in caps_raw.items():
+        if isinstance(key, str) and isinstance(val, bool):
+            out[key.strip().lower()] = val
+    return out
+
+
+def get_brand_name() -> str:
+    """Return the deployment public brand name (``BRAND_NAME`` env, else ``Dalton`` in core / ``Everflow`` in everflow)."""
+    explicit = os.getenv("BRAND_NAME", "").strip()
+    if explicit:
+        return explicit
+    return "Dalton" if resolve_profile() is DeploymentProfile.CORE else "Everflow"
+
+
+def get_profile_dalton_config(profile: DeploymentProfile) -> DaltonConfig:
+    """Return the file-backed ``DaltonConfig`` for an explicit deployment ``profile``."""
+    return _load_profile_dalton_config(profile)
+
+
+def _load_base_dalton_config() -> DaltonConfig:
+    """Return the cached file config for the active profile.
+
+    Kept argument-free because tests replace it to inject a base config.
+    """
+    return _load_profile_dalton_config(resolve_profile())
+
+
 def get_dalton_config() -> DaltonConfig:
-    """Return DaltonConfig with ``DALTON_PM_USER_IDS`` override applied when set (L39)."""
+    """Return DaltonConfig for the active profile with runtime env overrides applied (L39)."""
+    profile = resolve_profile()
     base = _load_base_dalton_config()
+    updates: dict[str, Any] = {}
     env_pm = _parse_env_pm_user_ids()
     if env_pm is not None:
-        return base.model_copy(
-            update={"pm_user_ids": env_pm, "configured_pm_user_ids": env_pm}
-        )
+        updates["pm_user_ids"] = env_pm
+        updates["configured_pm_user_ids"] = env_pm
+    if profile is DeploymentProfile.CORE:
+        env_tz = os.getenv("DALTON_TIMEZONE", "").strip()
+        if env_tz:
+            updates["timezone"] = env_tz
+            updates["budget"] = base.budget.model_copy(update={"timezone": env_tz})
+            updates["autonomy"] = base.autonomy.model_copy(update={"timezone": env_tz})
+    if updates:
+        return base.model_copy(update=updates)
     return base
 
 
-get_dalton_config.cache_clear = _load_base_dalton_config.cache_clear  # type: ignore[attr-defined]
+def _clear_dalton_config_caches() -> None:
+    _load_profile_dalton_raw.cache_clear()
+    _load_profile_dalton_config.cache_clear()
+
+
+get_dalton_config.cache_clear = _clear_dalton_config_caches  # type: ignore[attr-defined]
 
 
 get_dalton_settings = get_dalton_config
@@ -552,13 +652,22 @@ def is_coverage_units_enabled() -> bool:
 
 
 def is_data_jobs_enabled() -> bool:
-    """Whether the OC-1 deterministic data tasks scheduler loop is enabled (default False)."""
+    """Whether the OC-1 deterministic data tasks scheduler loop is enabled.
+
+    ``DALTON_CAP_DATA_JOBS`` / profile config controls whether the data-jobs
+    feature exists; ``DALTON_DATA_JOBS_ENABLED`` keeps its original meaning of
+    pausing/resuming only the background scheduler loop.
+    """
     if not is_dalton_enabled():
+        return False
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.DATA_JOBS):
         return False
     env_flag = os.getenv("DALTON_DATA_JOBS_ENABLED")
     if env_flag is not None:
         return env_flag.strip().lower() in ("1", "true", "yes", "on")
-    return bool(get_dalton_config().data_jobs.enabled)
+    return True
 
 
 
@@ -675,9 +784,10 @@ def get_fake_ip_real_resolvers() -> list[str]:
 
 
 def log_dalton_startup_warnings() -> None:
-    """Log prominent startup warnings if budget gate or APP_ENV=dalton is not active (G1.4, G7.1)."""
+    """Log prominent startup warnings for budget gate, Everflow APP_ENV, and SEC identity."""
     if not is_dalton_enabled():
         return
+    profile = resolve_profile()
     if not is_budget_gate_enabled():
         logger.warning(
             "DALTON WARNING (G1.4): Local daily USD budget gate is NOT enabled "
@@ -685,12 +795,21 @@ def log_dalton_startup_warnings() -> None:
             HOST_MODE,
             os.getenv("DALTON_BUDGET_GATE", ""),
         )
-    app_env = os.getenv("APP_ENV", "").strip()
-    if app_env != "dalton":
+    if profile is DeploymentProfile.EVERFLOW:
+        app_env = os.getenv("APP_ENV", "").strip()
+        if app_env != "dalton":
+            logger.warning(
+                "DALTON WARNING (G7.1): APP_ENV=%r is not 'dalton'. "
+                "agent_config.dalton.yaml is not active and MCP call_timeout_s will fall back to 65s!",
+                app_env,
+            )
+    sec_identity, sec_configured = resolve_sec_user_agent()
+    if not sec_configured:
         logger.warning(
-            "DALTON WARNING (G7.1): APP_ENV=%r is not 'dalton'. "
-            "agent_config.dalton.yaml is not active and MCP call_timeout_s will fall back to 65s!",
-            app_env,
+            "DALTON WARNING: Neither SEC_USER_AGENT nor EDGAR_IDENTITY is set. "
+            "Falling back to neutral placeholder %r; configure SEC_USER_AGENT "
+            "(or EDGAR_IDENTITY) as '<Organization> <contact_email>' for SEC EDGAR fair-access compliance.",
+            sec_identity,
         )
 
 
@@ -737,7 +856,11 @@ def get_xai_grok_client_version() -> str:
 
 
 def get_dalton_researchdata_url() -> str:
-    """Return ``DALTON_RESEARCHDATA_URL`` from environment (empty string if unset)."""
+    """Return ``DALTON_RESEARCHDATA_URL`` from environment (empty string if unset or capability disabled)."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
+        return ""
     url = os.getenv("DALTON_RESEARCHDATA_URL", "").strip()
     return url.replace("{HOST_IP}", HOST_IP) if url else ""
 
@@ -1055,7 +1178,11 @@ def sanitize_mcp_client_config_server(
 
 
 def get_dalton_bridge_base_url(host: str | None = None) -> str:
-    """Return the host bridge base URL (e.g. ``http://127.0.0.1:8960``) for host job management."""
+    """Return the host bridge base URL (e.g. ``http://127.0.0.1:8960``), or ``""`` when bridge capability is off."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
+        return ""
     resolved_host = host or HOST_IP or "127.0.0.1"
     explicit = os.getenv("DALTON_BRIDGE_URL", "").strip()
     if explicit:
@@ -1069,14 +1196,17 @@ def get_dalton_bridge_base_url(host: str | None = None) -> str:
 
 
 def get_dalton_channel_gateway_url(host: str | None = None) -> str:
-    """Return the Dalton channel gateway base URL, rewriting container loopback to ``HOST_IP``.
+    """Return the Dalton channel gateway base URL, or ``""`` when channel gateway capability is off.
 
     ``dalton-channel-gateway`` binds host loopback (``127.0.0.1:8962`` by default), so a
     backend container whose ``.env`` sets ``CHANNEL_GATEWAY_URL=http://127.0.0.1:8962``
     reaches the host service through ``HOST_IP`` (``host.docker.internal``).
     """
     from urllib.parse import urlparse, urlunparse
+    from src.dalton.capabilities import CapabilityId, has_capability
 
+    if not has_capability(CapabilityId.CHANNEL_GATEWAY):
+        return ""
     in_docker = os.path.exists("/.dockerenv")
     default_host = host or (HOST_IP if in_docker else "127.0.0.1") or "127.0.0.1"
     explicit = os.getenv("CHANNEL_GATEWAY_URL", "").strip()
@@ -1105,8 +1235,13 @@ def notify_via_gateway_enabled() -> bool:
     """Return whether generic automation notifications use the channel gateway.
 
     ``DALTON_NOTIFY_VIA_GATEWAY`` defaults to off. Off keeps ``post_bridge_notify``.
-    On sends newly claimed completion and test rows through the gateway.
+    On sends newly claimed completion and test rows through the gateway. Always
+    False when ``channel_gateway`` capability is disabled.
     """
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.CHANNEL_GATEWAY):
+        return False
     raw = os.getenv("DALTON_NOTIFY_VIA_GATEWAY", "").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
@@ -1158,7 +1293,11 @@ def get_dalton_frontend_url() -> str:
 
 
 def get_dalton_bridge_embed_url(host: str | None = None) -> str:
-    """Return the host bridge `/embed` URL for container-to-host embedding calls."""
+    """Return the host bridge `/embed` URL, or ``""`` when bridge capability is off."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
+        return ""
     resolved_host = host or HOST_IP or "host.docker.internal"
     explicit = os.getenv("DALTON_BRIDGE_EMBED_URL", "").strip()
     if explicit:
@@ -1175,12 +1314,8 @@ def get_dalton_bridge_embed_url(host: str | None = None) -> str:
 
 
 def get_sec_user_agent() -> str:
-    """Return ``SEC_USER_AGENT`` from environment with a compliant fallback."""
-    return (
-        os.getenv("SEC_USER_AGENT", "").strip()
-        or os.getenv("EDGAR_IDENTITY", "").strip()
-        or "DaltonResearch research@everflowinv.com"
-    )
+    """Return ``SEC_USER_AGENT`` / ``EDGAR_IDENTITY`` from env, or a neutral placeholder."""
+    return resolve_sec_user_agent()[0]
 
 
 def parse_home_workspace_aliases(raw: str | None) -> dict[str, str]:

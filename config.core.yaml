@@ -1,0 +1,51 @@
+# STANDALONE CORE INFRASTRUCTURE OVERLAY (APP_ENV=core / DALTON_PROFILE=core)
+# Applied over config.yaml via src/ptc_agent/config/file_utils.py.
+# Lists replace outright, so market_data.providers and news_data.providers
+# define the complete standalone chains: key-free yfinance first, optional FMP
+# fallback (no ginlix-data or tushare).
+
+# NOTE (Batch 1a -> Batch 2): src/data_client/registry.py reads market_data.providers
+# and news_data.providers directly, whereas plugins/langalpha_market_data/price_data_mcp_server.py
+# currently still instantiates its own ginlix-first client order (falling back to yfinance/fmp
+# when GINLIX_DATA_URL is absent). Unifying/gating the price MCP server is scheduled for Batch 2.
+market_data:
+  providers:
+    - name: yfinance
+      markets: [all]         # Free default — no API key required
+    - name: fmp
+      markets: [all]         # Optional enhancement when FMP_API_KEY is configured
+
+news_data:
+  providers:
+    - name: yfinance
+    - name: fmp
+
+subagent_limits:
+  max_running_per_thread: 8
+  max_running_global: 24
+
+features:
+  market_watch:
+    enabled: false
+  wakeups:
+    enabled: false
+  claude_code_runtime:
+    enabled: false
+  scratchpad:
+    enabled: false
+  browser:
+    enabled: false
+  teams:
+    enabled: false
+  shared_workspaces:
+    enabled: false
+  org_connectors:
+    enabled: false
+  org_library:
+    enabled: false
+
+mcp_descriptions:
+  enabled: false
+
+workflow:
+  child_timeout: 5400

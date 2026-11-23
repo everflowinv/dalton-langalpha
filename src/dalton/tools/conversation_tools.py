@@ -122,11 +122,15 @@ def create_conversation_tools(*, role: str | None = None) -> list[BaseTool]:
                 ensure_ascii=False,
             )
 
-        # Re-check the Team Memory toggle at execution time so mid-turn flips
-        # and paths that bypass ToolSurfaceMiddleware (e.g. Claude Code) cannot
-        # query the archive while Team Memory is off.
+        # Re-check capability and Team Memory toggle at execution time so
+        # mid-turn flips and paths that bypass ToolSurfaceMiddleware (e.g.
+        # Claude Code) cannot query the archive while it is off, while an
+        # explicit DALTON_CAP_CONVERSATION_ARCHIVE=true override works even
+        # when the profile YAML default has conversations.enabled=false.
+        from src.dalton.capabilities import CapabilityId, has_capability
+
         eff_role = role or _infer_role(user_id, workspace_id, config)
-        if not await resolve_turn_team_memory_enabled(
+        if not has_capability(CapabilityId.CONVERSATION_ARCHIVE) or not await resolve_turn_team_memory_enabled(
             role=eff_role,
             workspace_id=workspace_id,
             user_id=user_id,

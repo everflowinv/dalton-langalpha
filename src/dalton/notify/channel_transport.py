@@ -108,6 +108,26 @@ async def dispatch_data_task_target_via_gateway(
             ],
         }
 
+    from src.dalton.capabilities import is_channel_target_enabled
+
+    if not is_channel_target_enabled(cleaned_target):
+        return {
+            "ok": False,
+            "status": "failed",
+            "uncertain": False,
+            "status_code": 503,
+            "error_code": "capability_disabled",
+            "results": [
+                {
+                    "target": cleaned_target,
+                    "ok": False,
+                    "status": "failed",
+                    "error": "capability_disabled",
+                    "error_code": "capability_disabled",
+                }
+            ],
+        }
+
     eff_token = (
         service_token if service_token is not None else get_internal_service_token()
     ).strip()
@@ -460,6 +480,26 @@ async def post_automation_gateway_notify(
             error_code="invalid_request",
             status_code=400,
         )
+
+    from src.dalton.capabilities import is_channel_target_enabled
+
+    if not is_channel_target_enabled(cleaned_target):
+        return {
+            "ok": False,
+            "status": "failed",
+            "uncertain": False,
+            "status_code": 503,
+            "error_code": "capability_disabled",
+            "results": [
+                {
+                    "target": cleaned_target,
+                    "ok": False,
+                    "status": "failed",
+                    "error": "capability_disabled",
+                    "error_code": "capability_disabled",
+                }
+            ],
+        }
 
     eff_token = (
         service_token if service_token is not None else get_internal_service_token()

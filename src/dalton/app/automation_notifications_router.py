@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.dalton.app.channels_router import require_channel_service_token
+from src.dalton.capabilities import CapabilityId, require_capability_dep
 from src.dalton.database.automation_notifications import (
     authorize_automation_notification_plan,
 )
@@ -16,7 +17,10 @@ from src.dalton.database.automation_notifications import (
 automation_notifications_router = APIRouter(
     prefix="/channels/internal/automation-notifications",
     tags=["Dalton Channel Automation Notifications"],
-    dependencies=[Depends(require_channel_service_token)],
+    dependencies=[
+        Depends(require_capability_dep(CapabilityId.CHANNEL_GATEWAY)),
+        Depends(require_channel_service_token),
+    ],
 )
 
 
