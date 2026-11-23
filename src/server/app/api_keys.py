@@ -26,6 +26,8 @@ from src.utils.cache.throttle import throttle
 from src.server.database.api_keys import (
     get_user_api_keys,
     get_base_url_for_provider,
+    # DALTON-HOOK(team-credentials): read base_url and api_key together in one query for model discovery
+    get_key_and_base_url_for_provider,
     set_byok_enabled,
     upsert_api_key,
     delete_api_key,
@@ -306,18 +308,22 @@ async def update_api_keys(body: UpdateApiKeysRequest, user_id: CurrentUserId):
     - api_keys: { "openai": "sk-..." } to set, { "openai": null } to delete
     """
     # DALTON-HOOK(team-credentials): validate all credential-admin permissions before any DB or cache writes
+    _base_url_without_key = any(  # DALTON-HOOK(team-credentials)
+        not (body.api_keys and (body.api_keys.get(p) or "").strip())  # DALTON-HOOK(team-credentials)
+        for p in (body.base_urls or {})  # DALTON-HOOK(team-credentials)
+    )  # DALTON-HOOK(team-credentials)
     if (  # DALTON-HOOK(team-credentials)
         body.byok_enabled is False  # DALTON-HOOK(team-credentials)
         or any(not (v or "").strip() for v in (body.api_keys or {}).values())  # DALTON-HOOK(team-credentials)
-        or any(  # DALTON-HOOK(team-credentials)
-            not (body.api_keys and (body.api_keys.get(p) or "").strip())  # DALTON-HOOK(team-credentials)
-            for p in (body.base_urls or {})  # DALTON-HOOK(team-credentials)
-        )  # DALTON-HOOK(team-credentials)
+        or _base_url_without_key  # DALTON-HOOK(team-credentials)
     ):  # DALTON-HOOK(team-credentials)
         from src.dalton.credentials import require_credential_admin  # DALTON-HOOK(team-credentials)
         require_credential_admin(user_id)  # DALTON-HOOK(team-credentials)
     from src.dalton.credentials import require_credential_write_admin  # DALTON-HOOK(team-credentials)
     require_credential_write_admin(user_id)  # DALTON-HOOK(team-credentials)
+    if _base_url_without_key:  # DALTON-HOOK(team-credentials): only the credential holder may modify an existing shared key's base_url
+        from src.dalton.credentials import require_credential_holder  # DALTON-HOOK(team-credentials)
+        require_credential_holder(user_id)  # DALTON-HOOK(team-credentials)
     # Turning keys on, or saving one, is a new connection; removing one is not.
     if body.byok_enabled or any(
         value is not None
@@ -542,31 +548,51 @@ async def list_provider_models(provider: str, user_id: CurrentUserId):
     if not provider_info.get("dynamic_models"):
         raise HTTPException(status_code=400, detail="Provider does not support dynamic model discovery")
 
-    # Resolve base URL (provider default → user override)
+    # Resolve base URL (provider default → user override) and optional API key in one query
     base_url = (provider_info.get("base_url") or "").replace(
         "{HOST_IP}", HOST_IP,
     )
 
-    # Try to read user's stored base_url override — narrow query, no PGP decrypt
+    # DALTON-HOOK(team-credentials): read base_url and api_key together from the same
+    # row; fail closed on DB/decrypt errors only when reading a team-shared credential
+    # (caller is not the holder), preserving the original fallback for the holder and
+    # deployments without team sharing.
+    from src.dalton.credentials import uses_shared_team_credential
+
+    is_shared = uses_shared_team_credential(user_id)
+    stored = None
     try:
-        override = await get_base_url_for_provider(user_id, provider)
-        if override:
-            base_url = override.replace("{HOST_IP}", HOST_IP)
-    except Exception:
-        pass  # DB not available — use provider defaults
+        stored = await get_key_and_base_url_for_provider(user_id, provider)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if is_shared:
+            logger.error(
+                "list_provider_models failed to read stored credentials for %s: %s",
+                provider,
+                exc,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Failed to read provider credentials from database",
+            ) from exc
+        try:
+            override_only = await get_base_url_for_provider(user_id, provider)
+            if override_only:
+                stored = {"base_url": override_only, "api_key": None}
+        except Exception:
+            pass
+
+    override = (stored or {}).get("base_url")
+    if override:
+        base_url = override.replace("{HOST_IP}", HOST_IP)
+    api_key = (stored or {}).get("api_key") or None
 
     if not base_url:
         raise HTTPException(status_code=400, detail="No base URL configured for provider")
 
     transport = await _user_endpoint_transport(base_url)
-
-    # Minimal auth — local providers generally don't require it
-    api_key = None
-    try:
-        from src.server.database.api_keys import get_key_for_provider
-        api_key = await get_key_for_provider(user_id, provider)
-    except Exception:
-        pass  # No key available — proceed without auth
 
     try:
         return {"models": await pm.local_server_models(base_url, api_key, transport=transport)}

@@ -659,29 +659,37 @@ async def test_member_writes_land_on_holder_and_user_status_checks_holder_only(
     assert f"deleted user_id={SECOND_PM_ID} credential_user_id={HOLDER_ID}" in caplog.text
 
     # 4b. BYOK API key upsert, set_byok_enabled, update_base_url, delete_api_key -> writes HOLDER_ID and logs both actor and credential_user_id
-    get_db_conn_key, _, executed_key = _make_autospec_db(
-        fetchone_row={"byok_enabled": True}
-    )
-    monkeypatch.setattr(api_keys_db, "get_db_connection", get_db_conn_key)
+    get_db_conn_upsert, _, executed_upsert = _make_autospec_db(fetchone_row=None)
+    monkeypatch.setattr(api_keys_db, "get_db_connection", get_db_conn_upsert)
     await api_keys_db.upsert_api_key(
         user_id=MEMBER_ID,
         provider="openai",
         api_key="sk-team",
         base_url="https://api.openai.com/v1",
     )
-    assert executed_key[0][1][0] == HOLDER_ID
+    assert executed_upsert[-1][1][0] == HOLDER_ID
     assert f"upsert_key user_id={MEMBER_ID} credential_user_id={HOLDER_ID}" in caplog.text
 
+    get_db_conn_key, _, executed_key = _make_autospec_db(
+        fetchone_row={"byok_enabled": True}
+    )
+    monkeypatch.setattr(api_keys_db, "get_db_connection", get_db_conn_key)
     await api_keys_db.set_byok_enabled(MEMBER_ID, True)
-    assert executed_key[1][1] == (True, HOLDER_ID)
+    assert executed_key[0][1] == (True, HOLDER_ID)
     assert f"set_byok_enabled user_id={MEMBER_ID} credential_user_id={HOLDER_ID}" in caplog.text
 
-    await api_keys_db.update_base_url(SECOND_PM_ID, "openai", "https://pm-proxy.example/v1")
-    assert executed_key[2][1] == ("https://pm-proxy.example/v1", HOLDER_ID, "openai")
-    assert f"update_base_url user_id={SECOND_PM_ID} credential_user_id={HOLDER_ID}" in caplog.text
+    # Non-holder admin cannot modify existing shared key's base_url; only holder can.
+    with pytest.raises(HTTPException) as exc_base_url_403:
+        await api_keys_db.update_base_url(SECOND_PM_ID, "openai", "https://pm-proxy.example/v1")
+    assert exc_base_url_403.value.status_code == 403
+    assert exc_base_url_403.value.detail == cred_mod.TEAM_CREDENTIAL_BASE_URL_FORBIDDEN_DETAIL
+
+    await api_keys_db.update_base_url(HOLDER_ID, "openai", "https://holder-proxy.example/v1")
+    assert executed_key[1][1] == ("https://holder-proxy.example/v1", HOLDER_ID, "openai")
+    assert f"update_base_url user_id={HOLDER_ID} credential_user_id={HOLDER_ID}" in caplog.text
 
     await api_keys_db.delete_api_key(SECOND_PM_ID, "openai")
-    assert executed_key[3][1] == (HOLDER_ID, "openai")
+    assert executed_key[2][1] == (HOLDER_ID, "openai")
     assert f"delete_key user_id={SECOND_PM_ID} credential_user_id={HOLDER_ID}" in caplog.text
 
     # 4c. `user_db.get_user`, `update_user`, `create_user_from_auth` check holder ONLY for has_api_key / has_oauth_token
@@ -927,13 +935,24 @@ async def test_non_pm_delete_and_disconnect_forbidden_while_pm_allowed(
     fake_update_base_url.assert_not_awaited()
     fake_invalidate_byok_cache.assert_awaited_once_with(SECOND_PM_ID)
 
-    res_pm_base_url = await api_keys_app.update_api_keys(
-        body=UpdateApiKeysRequest(base_urls={"openai": "https://pm-gateway.example/v1"}),
-        user_id=SECOND_PM_ID,
+    # Non-holder admin cannot modify an existing shared key's base_url (base_urls-only request -> 403).
+    with pytest.raises(HTTPException) as exc_pm_base_url:
+        await api_keys_app.update_api_keys(
+            body=UpdateApiKeysRequest(base_urls={"openai": "https://pm-gateway.example/v1"}),
+            user_id=SECOND_PM_ID,
+        )
+    assert exc_pm_base_url.value.status_code == 403
+    assert exc_pm_base_url.value.detail == cred_mod.TEAM_CREDENTIAL_BASE_URL_FORBIDDEN_DETAIL
+    fake_update_base_url.assert_not_awaited()
+
+    # The credential holder itself CAN update an existing shared key's base_url.
+    res_holder_base_url = await api_keys_app.update_api_keys(
+        body=UpdateApiKeysRequest(base_urls={"openai": "https://holder-gateway.example/v1"}),
+        user_id=HOLDER_ID,
     )
-    assert res_pm_base_url is not None
+    assert res_holder_base_url is not None
     fake_update_base_url.assert_awaited_once_with(
-        SECOND_PM_ID, "openai", "https://pm-gateway.example/v1", conn=None
+        HOLDER_ID, "openai", "https://holder-gateway.example/v1", conn=None
     )
 
     res_pm_disable = await api_keys_app.update_api_keys(

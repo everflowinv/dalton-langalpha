@@ -12,12 +12,18 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, Optional
 
+from fastapi import HTTPException  # DALTON-HOOK(team-credentials): refuse non-holder base_url modification inside write transaction
 from psycopg.rows import dict_row
 
 from src.server.database.pool import get_db_connection
 from src.server.database.sql_fences import advisory_key
 from src.server.database.encryption import get_encryption_key as _get_encryption_key
-from src.dalton.credentials import credential_user_id, credential_write_tx, resolve_credential_write_holder  # DALTON-HOOK(team-credentials): resolve shared team credential holder (standalone-core transactional write check)
+from src.dalton.credentials import (  # DALTON-HOOK(team-credentials): resolve shared team credential holder (standalone-core transactional write check)
+    TEAM_CREDENTIAL_BASE_URL_FORBIDDEN_DETAIL,
+    credential_user_id,
+    credential_write_tx,
+    resolve_credential_write_holder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +107,27 @@ async def upsert_api_key(
     actor_user_id = user_id
     enc_key = _get_encryption_key()
     async with get_db_connection(conn) as db, credential_write_tx(db, external_conn=conn):  # DALTON-HOOK(standalone-core): hold transaction across holder/admin lock and write
-        user_id = await resolve_credential_write_holder(actor_user_id, conn=db)  # DALTON-HOOK(standalone-core): pin team holder and admin role inside write transaction
+        # DALTON-HOOK(team-credentials): modifying an existing shared key's base_url
+        # (including empty-key base_url writes) is restricted to the credential holder
+        # inside the write transaction.
+        user_id = await resolve_credential_write_holder(
+            actor_user_id,
+            conn=db,
+            require_holder=not (api_key or "").strip(),
+        )  # DALTON-HOOK(standalone-core): pin team holder and admin role inside write transaction
+        if user_id != actor_user_id:
+            async with db.cursor(row_factory=dict_row) as check_cur:
+                await check_cur.execute(
+                    "SELECT base_url FROM user_api_keys "
+                    "WHERE user_id = %s AND provider = %s FOR UPDATE",
+                    (user_id, provider),
+                )
+                existing = await check_cur.fetchone()
+            if existing is not None and (existing.get("base_url") or None) != (base_url or None):
+                raise HTTPException(
+                    status_code=403,
+                    detail=TEAM_CREDENTIAL_BASE_URL_FORBIDDEN_DETAIL,
+                )
         async with db.cursor() as cur:
             await cur.execute(
                 """
@@ -248,7 +274,10 @@ async def update_base_url(user_id: str, provider: str, base_url: str | None, con
     written, when there is none."""
     actor_user_id = user_id
     async with get_db_connection(conn) as db, credential_write_tx(db, external_conn=conn):  # DALTON-HOOK(standalone-core): hold transaction across holder/admin lock and update
-        user_id = await resolve_credential_write_holder(actor_user_id, conn=db)  # DALTON-HOOK(standalone-core): pin team holder and admin role inside base_url write transaction
+        # DALTON-HOOK(team-credentials): only the credential holder may change an existing shared key's base_url
+        user_id = await resolve_credential_write_holder(
+            actor_user_id, conn=db, require_holder=True
+        )  # DALTON-HOOK(standalone-core): pin team holder and admin role inside base_url write transaction
         async with db.cursor() as cur:
             await cur.execute(
                 "UPDATE user_api_keys SET base_url = %s, updated_at = NOW() "
@@ -264,6 +293,31 @@ async def update_base_url(user_id: str, provider: str, base_url: str | None, con
                     f"[api_keys_db] update_base_url user_id={actor_user_id} credential_user_id={user_id} provider={provider}"  # DALTON-HOOK(team-credentials)
                 )
             return cur.rowcount > 0
+
+
+# DALTON-HOOK(team-credentials): single-query read of base_url + decrypted api_key for local model discovery
+async def get_key_and_base_url_for_provider(
+    user_id: str, provider: str
+) -> Optional[Dict[str, Optional[str]]]:
+    """Read both decrypted api_key and base_url for ``provider`` from one row.
+
+    Returns ``{"api_key": str | None, "base_url": str | None}`` or ``None`` when
+    no row exists. Does not filter on ``byok_enabled`` so setup discovery works
+    before BYOK is toggled on.
+    """
+    user_id = credential_user_id(user_id)
+    enc_key = _get_encryption_key()
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT pgp_sym_decrypt(api_key, %s) AS api_key, base_url "
+                "FROM user_api_keys WHERE user_id = %s AND provider = %s",
+                (enc_key, user_id, provider),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return None
+            return {"api_key": row["api_key"], "base_url": row["base_url"]}
 
 
 async def get_base_url_for_provider(user_id: str, provider: str) -> str | None:

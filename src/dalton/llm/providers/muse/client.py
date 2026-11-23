@@ -427,4 +427,8 @@ def build_muse_client(
     if llm.extra_body:
         params["extra_body"] = llm.extra_body
 
+    hold_egress = getattr(llm, "_hold_params_to_egress", None)
+    if callable(hold_egress):
+        hold_egress(params, "openai")
+
     return ChatMuseOpenAI(**params)

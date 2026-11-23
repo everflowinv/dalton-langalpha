@@ -118,23 +118,41 @@ async def _resolve_custom_model_byok(
     """
     provider = custom_config["provider"]
 
+    # DALTON-HOOK(team-credentials): when using a team-shared credential, custom
+    # provider definitions (parent_provider, SDK, use_response_api, default URL)
+    # are always read from the credential holder's custom_providers, never the member's.
+    from src.dalton.credentials import credential_user_id, uses_shared_team_credential
+
+    is_shared = uses_shared_team_credential(user_id)
+    cp_owner_id = credential_user_id(user_id) if is_shared else user_id
+    cp_pref_cache = None if is_shared else _pref_cache
+
+    def _effective_base_url(key_row: dict, fallback_provider: str) -> str | None:
+        raw = key_row.get("base_url")
+        saved = raw.strip() if isinstance(raw, str) and raw.strip() else None
+        return saved or mc.get_provider_info(fallback_provider).get("base_url")
+
     # 1. Model name is itself a custom sub-provider with a key
-    cp_by_name = await user_models.get_custom_provider_config(user_id, model_name, _pref_cache=_pref_cache)
+    cp_by_name = await user_models.get_custom_provider_config(
+        cp_owner_id, model_name, _pref_cache=cp_pref_cache
+    )
     if cp_by_name:
         byok_config = await stored_key(user_id, model_name, _byok_cache=_byok_cache)
         if byok_config:
             parent = cp_by_name["parent_provider"]
-            base_url = byok_config.get("base_url") or mc.get_provider_info(parent).get("base_url")
+            base_url = _effective_base_url(byok_config, parent)
             custom_config = user_models.route_custom_entry(custom_config, cp_by_name, mc)
             return byok_config, base_url, custom_config, model_name
 
-    # 2. Provider field is a custom sub-provider
-    cp_by_provider = await user_models.get_custom_provider_config(user_id, provider, _pref_cache=_pref_cache)
+    # 2. Provider field is a custom sub-provider (DALTON-HOOK(team-credentials): read from cp_owner_id)
+    cp_by_provider = await user_models.get_custom_provider_config(
+        cp_owner_id, provider, _pref_cache=cp_pref_cache
+    )
     if cp_by_provider:
         byok_config = await stored_key(user_id, provider, _byok_cache=_byok_cache)
         if byok_config:
             parent = cp_by_provider["parent_provider"]
-            base_url = byok_config.get("base_url") or mc.get_provider_info(parent).get("base_url")
+            base_url = _effective_base_url(byok_config, parent)  # DALTON-HOOK(team-credentials)
             custom_config = user_models.route_custom_entry(custom_config, cp_by_provider, mc)
             return byok_config, base_url, custom_config, provider
 
@@ -151,7 +169,7 @@ async def _resolve_custom_model_byok(
         # called: a GLM client pointed at an Anthropic-shaped URL fails every
         # request.
         endpoint = call_endpoint(provider, holding, mc, custom=True)
-        base_url = byok_config.get("base_url") or mc.get_provider_info(endpoint).get("base_url")
+        base_url = _effective_base_url(byok_config, endpoint)
         if endpoint != provider:
             custom_config = {**custom_config, "provider": endpoint}
         return byok_config, base_url, custom_config, holding
@@ -165,8 +183,15 @@ async def _custom_provider_model(
     """``model_name`` as a custom model on the user's custom provider of that
     name, or None when it names none: a provider slug picked as the model runs
     on that provider's key, so its key decides whether it runs at all."""
+    # DALTON-HOOK(team-credentials): resolve custom provider definitions from the
+    # credential holder when team sharing is active.
+    from src.dalton.credentials import credential_user_id, uses_shared_team_credential
+
+    is_shared = uses_shared_team_credential(user_id)
+    cp_owner_id = credential_user_id(user_id) if is_shared else user_id
+    cp_pref_cache = None if is_shared else _pref_cache
     cp_config = await user_models.get_custom_provider_config(
-        user_id, model_name, _pref_cache=_pref_cache,
+        cp_owner_id, model_name, _pref_cache=cp_pref_cache,
     )
     if not cp_config:
         return None
@@ -378,7 +403,52 @@ async def resolve_byok_llm_client(
         _byok_cache=_byok_cache,
         **({"ignore_custom_models": True} if ignore_custom_models else {}),
     )
+    # DALTON-HOOK(team-credentials): when the resolved BYOK key belongs to the team
+    # holder rather than the caller, forbid endpoint/connection/header overrides,
+    # require custom provider definitions to come from the holder, pin the endpoint
+    # to the holder's saved base_url or holder parent default, and disable redirects.
+    from src.dalton.credentials import (
+        credential_user_id,
+        enforce_shared_byok_endpoint_policy,
+        uses_shared_team_credential,
+    )
+
+    is_shared_team_cred = uses_shared_team_credential(user_id)
     if route is None:
+        if is_shared_team_cred:
+            # Guard against a member targeting an orphan non-manifest key row
+            # (stored under the holder with no holder custom_provider definition)
+            # via a member-defined custom provider of the same name.
+            candidate_slugs: list[str] = []
+            if source == ModelSource.UNKNOWN:
+                candidate_slugs.append(model_name)
+            elif source == ModelSource.CUSTOM:
+                candidate_slugs.append(model_name)
+                prov = config_entry.get("provider")
+                if isinstance(prov, str) and prov and prov not in candidate_slugs:
+                    candidate_slugs.append(prov)
+            for slug in candidate_slugs:
+                if mc.get_provider_info(slug):
+                    continue
+                member_cp = await user_models.get_custom_provider_config(
+                    user_id, slug, _pref_cache=_pref_cache
+                )
+                if member_cp is None:
+                    continue
+                orphan_key = await stored_key(user_id, slug, _byok_cache=_byok_cache)
+                if orphan_key is not None:
+                    enforce_shared_byok_endpoint_policy(
+                        user_id=user_id,
+                        model_name=model_name,
+                        byok_config=orphan_key,
+                        base_url=orphan_key.get("base_url"),
+                        manifest_base_url=None,
+                        custom_config=config_entry if source == ModelSource.CUSTOM else None,
+                        custom_provider_config=member_cp,
+                        holder_custom_provider_config=None,
+                        require_holder_custom_provider=True,
+                        holding_provider=slug,
+                    )
         if source == ModelSource.CUSTOM:
             # ``resolve_llm_config`` converts this None into an HTTPException
             # for the main-model path, and logs its own warning for custom
@@ -389,6 +459,61 @@ async def resolve_byok_llm_client(
                 f"provider={config_entry['provider']}."
             )
         return None
+
+    if is_shared_team_cred:
+        holder_id = credential_user_id(user_id)
+        is_manifest_holding = bool(route.holding and mc.get_provider_info(route.holding))
+        holder_cp_config = (
+            await user_models.get_custom_provider_config(holder_id, route.holding)
+            if route.custom_config is not None and route.holding
+            else None
+        )
+        member_cp_config = (
+            await user_models.get_custom_provider_config(
+                user_id, route.holding, _pref_cache=_pref_cache
+            )
+            if route.custom_config is not None and route.holding
+            else None
+        )
+        if is_manifest_holding:
+            if holder_cp_config is not None and holder_cp_config.get("parent_provider"):
+                manifest_base_url = mc.get_provider_info(
+                    holder_cp_config["parent_provider"]
+                ).get("base_url")
+            else:
+                endpoint = call_endpoint(
+                    route.provider,
+                    route.holding,
+                    mc,
+                    custom=(route.custom_config is not None),
+                )
+                manifest_base_url = mc.get_provider_info(endpoint).get("base_url")
+        elif holder_cp_config is not None:
+            holder_parent = holder_cp_config.get("parent_provider") or ""
+            if not holder_parent or not mc.get_provider_info(holder_parent):
+                holder_cp_config = None
+                manifest_base_url = None
+            else:
+                manifest_base_url = mc.get_provider_info(holder_parent).get("base_url")
+        else:
+            manifest_base_url = None
+        enforce_shared_byok_endpoint_policy(
+            user_id=user_id,
+            model_name=model_name,
+            byok_config=route.key,
+            base_url=route.base_url,
+            manifest_base_url=manifest_base_url,
+            custom_config=route.custom_config,
+            custom_provider_config=member_cp_config,
+            holder_custom_provider_config=holder_cp_config,
+            require_holder_custom_provider=(
+                route.custom_config is not None and not is_manifest_holding
+            ),
+            holding_provider=route.holding,
+        )
+
+    # DALTON-HOOK(team-credentials): shared-key clients never follow HTTP redirects.
+    shared_client_kwargs = {"follow_redirects": False} if is_shared_team_cred else {}
 
     if route.custom_config is not None:
         if source == ModelSource.CUSTOM:
@@ -404,6 +529,7 @@ async def resolve_byok_llm_client(
             reasoning_effort=reasoning_effort,
             **_tier_kwargs(service_tier, route.provider),
             **await _egress_kwargs(model_name, route.base_url, route.custom_config.get("parameters")),
+            **shared_client_kwargs,
         )
 
     logger.debug(
@@ -419,6 +545,7 @@ async def resolve_byok_llm_client(
         cache_key=cache_key,
         **_tier_kwargs(service_tier, route.provider),
         **await _egress_kwargs(model_name, route.base_url),
+        **shared_client_kwargs,  # DALTON-HOOK(team-credentials)
     )
 
 
@@ -875,6 +1002,41 @@ def _stamp(config, client, prompt_guidance: str | None) -> None:
     )
 
 
+# DALTON-HOOK(team-credentials): log refusal type and model name for subsidiary
+# role/fallback models rejected by endpoint policy while preserving safe fallback.
+def _log_blocked_model_refusal(
+    exc: BaseException,
+    *,
+    scope: str,
+    model: str | None,
+    role: str | None = None,
+) -> bool:
+    from src.dalton.credentials import is_base_url_blocked_exception
+
+    if not is_base_url_blocked_exception(exc):
+        return False
+    detail = exc.detail if isinstance(getattr(exc, "detail", None), dict) else {}
+    refusal_type = detail.get("type") or "base_url_blocked"
+    if role is not None:
+        logger.warning(
+            "[CHAT] Refused %s %s model %s (type=%s), skipping: %s",
+            scope,
+            role,
+            model,
+            refusal_type,
+            detail.get("message") or "",
+        )
+    else:
+        logger.warning(
+            "[CHAT] Refused %s model %s (type=%s), skipping: %s",
+            scope,
+            model,
+            refusal_type,
+            detail.get("message") or "",
+        )
+    return True
+
+
 async def _resolve_role_clients(
     config, user_id: str, roles: list[LLMRole], model_pref: dict,
     # DALTON-HOOK(subagent-model-pin): keep policy optional for legacy callers and unit tests
@@ -942,11 +1104,15 @@ async def _resolve_role_clients(
                 # DALTON-HOOK(workspace-dedup): forward ignore_custom_models to resolve_model_client
                 **({"ignore_custom_models": True} if ignore_custom_models else {}),
             )
-        except Exception:
-            logger.error(
-                "[CHAT] Failed to resolve role %s model %s, skipping",
-                role.key, role.model, exc_info=True,
-            )
+        except Exception as exc:
+            # DALTON-HOOK(team-credentials): log refusal type and model name while keeping safe fallback
+            if not _log_blocked_model_refusal(
+                exc, scope="role", model=role.model, role=role.key
+            ):
+                logger.error(
+                    "[CHAT] Failed to resolve role %s model %s, skipping",
+                    role.key, role.model, exc_info=True,
+                )
             return role, None
 
     # Every role runs the model it names until the main-client fallback below
@@ -1081,11 +1247,15 @@ async def _resolve_fallback_clients(
                 # DALTON-HOOK(workspace-dedup): forward ignore_custom_models to resolve_model_client
                 **({"ignore_custom_models": True} if ignore_custom_models else {}),
             )
-        except Exception:
-            logger.error(
-                "[CHAT] Failed to resolve fallback model %s, skipping",
-                model_name, exc_info=True,
-            )
+        except Exception as exc:
+            # DALTON-HOOK(team-credentials): log refusal type and model name while keeping safe fallback
+            if not _log_blocked_model_refusal(
+                exc, scope="fallback", model=model_name
+            ):
+                logger.error(
+                    "[CHAT] Failed to resolve fallback model %s, skipping",
+                    model_name, exc_info=True,
+                )
             return model_name, None
 
     merged_fallbacks = []

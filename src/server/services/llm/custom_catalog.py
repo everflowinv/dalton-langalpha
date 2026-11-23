@@ -226,7 +226,15 @@ def validate_custom_models(
                 ) from exc
 
 
-async def refuse_custom_model_endpoints(custom_models: list, stored: list | None = None) -> None:
+async def refuse_custom_model_endpoints(
+    custom_models: list,
+    stored: list | None = None,
+    *,
+    # DALTON-HOOK(team-credentials): when team credential sharing is active and
+    # the saver is not the credential holder, refuse endpoint/connection/vertex
+    # parameters regardless of HOST_MODE.
+    user_id: str | None = None,
+) -> None:
     """Refuse a subscription's model that sets an endpoint or connection, its
     token being for its own provider only, and, in platform mode, a custom
     model whose parameters point its client somewhere the server must not
@@ -256,6 +264,42 @@ async def refuse_custom_model_endpoints(custom_models: list, stored: list | None
                 status_code=400,
                 detail=f"custom_models[{idx}]: a subscription's model cannot set an endpoint or connection.",
             )
+    # DALTON-HOOK(team-credentials): non-holder members cannot add or modify custom
+    # models carrying endpoint, connection, Vertex, or routing-header parameters while
+    # team sharing is active; verbatim unchanged legacy entries in the same list are
+    # kept here and still refused at runtime.
+    if user_id:
+        from src.dalton.credentials import (
+            find_disallowed_routing_header_keys,
+            find_disallowed_routing_param_keys,
+            uses_shared_team_credential,
+        )
+
+        if uses_shared_team_credential(user_id):
+            saved_entries = {
+                cm.get("name"): cm for cm in stored or [] if isinstance(cm, dict)
+            }
+            for idx, cm in enumerate(custom_models):
+                if not isinstance(cm, dict):
+                    continue
+                name = cm.get("name")
+                if name in saved_entries and saved_entries[name] == cm:
+                    continue
+                bad_keys = sorted(
+                    {
+                        *find_disallowed_routing_param_keys(cm.get("parameters")),
+                        *find_disallowed_routing_header_keys(cm.get("parameters")),
+                    }
+                )
+                if bad_keys:
+                    keys_str = ", ".join(f"parameters.{k}" for k in bad_keys)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"custom_models[{idx}]: {keys_str} cannot be set while "
+                            "team credential sharing is enabled."
+                        ),
+                    )
     if not egress.enforced():
         return
     to_check: list[tuple[int, str]] = []
@@ -276,7 +320,15 @@ async def refuse_custom_model_endpoints(custom_models: list, stored: list | None
             )
 
 
-def validate_custom_providers(custom_providers: list, stored: dict | None = None) -> None:
+def validate_custom_providers(
+    custom_providers: list,
+    stored: dict | None = None,
+    *,
+    # DALTON-HOOK(team-credentials): when team credential sharing is active and
+    # the saver is not the credential holder, refuse endpoint/connection/vertex
+    # parameters on custom providers.
+    user_id: str | None = None,
+) -> None:
     """Validate custom_providers list before persisting.
 
     The parent check exempts what ``_saved_pairs`` names, for the reason it
@@ -287,6 +339,17 @@ def validate_custom_providers(custom_providers: list, stored: dict | None = None
 
     from src.llms.llm import LLM
     from src.server.services.oauth_providers import SUBSCRIPTIONS
+
+    # DALTON-HOOK(team-credentials): non-holder members cannot save custom providers
+    # carrying endpoint, connection, or Vertex parameters while team sharing is active.
+    check_shared_team_creds = False
+    if user_id:
+        from src.dalton.credentials import (
+            find_disallowed_custom_provider_keys,
+            uses_shared_team_credential,
+        )
+
+        check_shared_team_creds = uses_shared_team_credential(user_id)
 
     mc = LLM.get_model_config()
     builtin = set(mc.get_byok_eligible_providers())
@@ -323,6 +386,19 @@ def validate_custom_providers(custom_providers: list, stored: dict | None = None
         ura = cp.get("use_response_api")
         if ura is not None and not isinstance(ura, bool):
             raise HTTPException(status_code=400, detail=f"custom_providers[{idx}]: use_response_api must be a boolean")
+
+        # DALTON-HOOK(team-credentials): refuse endpoint/connection/vertex keys on custom providers for non-holder members
+        if check_shared_team_creds:
+            bad_keys = find_disallowed_custom_provider_keys(cp)
+            if bad_keys:
+                keys_str = ", ".join(bad_keys)
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"custom_providers[{idx}]: {keys_str} cannot be set while "
+                        "team credential sharing is enabled."
+                    ),
+                )
 
 
 def _saved_pairs(entries: object, field: str) -> set[tuple[str, str]]:
