@@ -42,7 +42,8 @@
       "inPlace": "{{name}} is back in its place.",
       "dropped": "{{name}} was dropped over {{over}}.",
       "cancelled": "Moving {{name}} was cancelled."
-    }
+    },
+    "infoAbout": "About {{name}}"
   },
   "auth": {
     "login": "Sign in",
@@ -606,6 +607,7 @@
       "artifacts": "Artifacts",
       "desktop": "Desktop app",
       "agent": "Agent",
+      "computers": "Computers",
       "model": "Models",
       "integrations": "Messaging & Channels",
       "trading": "Trading",
@@ -626,6 +628,7 @@
       "artifacts": "Defaults for your comments on the files the agent makes.",
       "desktop": "Notifications, the menu bar and how the app starts on this computer.",
       "agent": "How the agent answers, what it may do without asking, and how it searches the web.",
+      "computers": "The machines your workspaces run on, and how each one is set up.",
       "model": "The models you can reach and the ones the agent runs on.",
       "integrations": "Talk to your agent from your chat apps, and manage the apps signed in with your account.",
       "trading": "How far the agent may go with orders at your brokerages.",
@@ -893,7 +896,11 @@
       "goToTeamModels": "Go to team model settings",
       "statusUnavailable": "Could not load team credentials status right now. Refresh to try again."
     },
-    "daltonAuthOnly": "This page is only available in Everflow Team Edition."
+    "daltonAuthOnly": "This page is only available in Everflow Team Edition.",
+    "computers": {
+      "list": "Your computers",
+      "loadFailed": "Couldn't load your computers."
+    }
   },
   "dashboard": {
     "failedOnboarding": "Failed to set up onboarding. Please try again.",
@@ -2512,6 +2519,10 @@
     "backToWorkflow": "Back to workflow",
     "backToMain": "Back to main",
     "scrollToTop": "Scroll to the top of the conversation",
+    "forkedFrom": "Forked from {{title}}",
+    "forkedFromDeleted": "Forked from a deleted chat",
+    "forkFailed": "Couldn't open a new chat from here. Try again.",
+    "forkTitle": "{{title}} (fork)",
     "reconnecting": "Reconnecting…",
     "offlineHistoryLoad": "You are offline, so this conversation could not be refreshed. It will catch up when your connection returns.",
     "jumpToLatest": {
@@ -2691,7 +2702,9 @@
       "reportIssue": "Report issue",
       "feedbackSubmitted": "Feedback submitted",
       "regenerate": "Regenerate response",
-      "retry": "Retry"
+      "retry": "Retry",
+      "forkFromHere": "Fork from here",
+      "editInNewChat": "Edit in new chat"
     },
     "turnFiles": {
       "open": "Open",
@@ -4768,7 +4781,8 @@
         "stage": "Stage order",
         "unstage": "Remove staged order",
         "exercise": "Exercise option",
-        "cancelExercise": "Cancel exercise"
+        "cancelExercise": "Cancel exercise",
+        "watch": "Watch order"
       },
       "orderField": {
         "quantity": "Quantity",
@@ -6382,7 +6396,8 @@
       "stage": "Stage",
       "unstage": "Unstage",
       "exercise": "Exercise",
-      "cancel_exercise": "Cancel exercise"
+      "cancel_exercise": "Cancel exercise",
+      "watch": "Watched"
     },
     "side": {
       "buy": "Buy",
@@ -8154,7 +8169,7 @@
         "changing": "It's changing to Medium now.",
         "ownInstead": "Or run Claude Code on your own computers: your Mac with Remote control, or a computer over SSH.",
         "row": "Claude Code runs on Medium or larger cloud computers.",
-        "rowResize": "Claude Code runs on Medium or larger. Changing it restarts it for a few minutes.",
+        "rowResize": "Changing it restarts it for a few minutes.",
         "rowPlan": "Claude Code runs on Medium or larger, and Medium isn't on your plan.",
         "rowResizing": "Changing to Medium. Claude Code runs here once it's done."
       },

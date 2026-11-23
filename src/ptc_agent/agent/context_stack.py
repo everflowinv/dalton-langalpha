@@ -97,6 +97,7 @@ def build_context_middleware(
             home_back=turn.home_back,
             conversation_search_enabled=conversation_search_enabled,  # DALTON-HOOK(team-memory-toggle)
             claude_code=claude_code,  # DALTON-HOOK(team-memory-toggle)
+            forked=turn.forked,
         ),
         baseline=BaselineContextMiddleware(
             session=session,

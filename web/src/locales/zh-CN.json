@@ -42,7 +42,8 @@
       "inPlace": "{{name}} 回到原位。",
       "dropped": "{{name}} 已放到 {{over}} 的位置。",
       "cancelled": "已取消移动 {{name}}。"
-    }
+    },
+    "infoAbout": "关于“{{name}}”"
   },
   "auth": {
     "login": "登录",
@@ -263,6 +264,11 @@
         "label": "唤醒",
         "description": "让 Agent 自己回到对话里接着完成任务：在指定时间、每隔几分钟、价格变动时，或它下的订单成交时。待触发的唤醒显示在输入框上方和“状态”面板中，随时可以在那里取消。",
         "tradeoffs": "对话空闲时触发的唤醒会自己开始新的一轮，费用和平常一轮相同；如果每 5 分钟检查一次，两小时内最多会有 24 轮。关闭此功能会取消所有待触发的唤醒。"
+      },
+      "order_wakeups": {
+        "label": "订单唤醒",
+        "description": "Agent 下的订单没有立即成交时，会自动设一个唤醒：订单成交、部分成交或未成交结束时，Agent 会回到对话里。你可以在输入框上方随时取消。",
+        "tradeoffs": "对话空闲时，每次成交或结束都会开始新的一轮。关闭后，只有 Agent 自己设了唤醒或你来问，它才会知道订单的结果。"
       },
       "market_watch": {
         "label": "盯盘",
@@ -658,6 +664,7 @@
       "artifacts": "Artifact",
       "desktop": "桌面应用",
       "agent": "行为",
+      "computers": "计算机",
       "model": "模型",
       "integrations": "消息与渠道",
       "trading": "交易",
@@ -678,6 +685,7 @@
       "artifacts": "评论 Agent 生成的文件时的默认设置。",
       "desktop": "这台电脑上的通知、菜单栏，以及应用如何启动。",
       "agent": "Agent 如何作答、哪些操作无需询问，以及如何搜索网页。",
+      "computers": "工作区所在的计算机，以及每台计算机的设置。",
       "model": "你可用的模型，以及 Agent 实际使用的模型。",
       "integrations": "在聊天应用中与你的 Agent 对话，并管理用你的账户登录的应用。",
       "trading": "Agent 在你的券商账户中下单的权限范围。",
@@ -943,7 +951,11 @@
       "goToTeamModels": "前往团队模型配置",
       "statusUnavailable": "团队凭据状态暂时读取不到，请稍后刷新"
     },
-    "daltonAuthOnly": "此页面仅在 Everflow 团队版提供"
+    "daltonAuthOnly": "此页面仅在 Everflow 团队版提供",
+    "computers": {
+      "list": "你的计算机",
+      "loadFailed": "无法加载你的计算机。"
+    }
   },
   "dashboard": {
     "failedOnboarding": "设置失败，请重试。",
@@ -2553,6 +2565,10 @@
     "backToWorkflow": "返回工作流",
     "backToMain": "返回主对话",
     "scrollToTop": "滚动到对话顶部",
+    "forkedFrom": "分叉自 {{title}}",
+    "forkedFromDeleted": "分叉自已删除的对话",
+    "forkFailed": "没能从这里开启新对话，请重试。",
+    "forkTitle": "{{title}}（分叉）",
     "reconnecting": "重新连接中…",
     "offlineHistoryLoad": "网络已断开，无法刷新此对话。恢复连接后会自动同步。",
     "jumpToLatest": {
@@ -2731,7 +2747,9 @@
       "reportIssue": "反馈问题",
       "feedbackSubmitted": "已提交反馈",
       "regenerate": "重新生成回复",
-      "retry": "重试"
+      "retry": "重试",
+      "forkFromHere": "从这里分叉",
+      "editInNewChat": "在新对话中编辑"
     },
     "turnFiles": {
       "open": "打开",
@@ -4761,7 +4779,8 @@
         "stage": "预设订单",
         "unstage": "删除预设订单",
         "exercise": "行权",
-        "cancelExercise": "撤销行权"
+        "cancelExercise": "撤销行权",
+        "watch": "关注订单"
       },
       "orderField": {
         "quantity": "数量",
@@ -6352,7 +6371,8 @@
       "stage": "预设",
       "unstage": "取消预设",
       "exercise": "行权",
-      "cancel_exercise": "取消行权"
+      "cancel_exercise": "取消行权",
+      "watch": "关注中"
     },
     "side": {
       "buy": "买入",
@@ -8069,7 +8089,7 @@
         "changing": "它正在改为中型。",
         "ownInstead": "也可以在你自己的电脑上运行 Claude Code：开启远程控制的 Mac，或通过 SSH 连接的电脑。",
         "row": "Claude Code 只在中型及以上的云端计算机上运行。",
-        "rowResize": "Claude Code 只在中型及以上的计算机上运行。改为中型会让它重启几分钟。",
+        "rowResize": "改为中型会让它重启几分钟。",
         "rowPlan": "Claude Code 只在中型及以上的计算机上运行，而当前套餐不含中型。",
         "rowResizing": "正在改为中型，完成后 Claude Code 即可在此运行。"
       },

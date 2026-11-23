@@ -20,6 +20,7 @@ export function SettingsGroup({
 }: {
   // DALTON-HOOK(settings-section): a settings hash, including personal channel bindings, scrolls to this group
   // DALTON-HOOK(settings-reorg): allow cards wrapped in SettingsGroup to pass data-testid directly
+  /** The search's anchor, for a group whose rows come and go. */
   id?: string;
   title?: string;
   description?: ReactNode;

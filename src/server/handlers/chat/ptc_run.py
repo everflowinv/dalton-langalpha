@@ -27,6 +27,7 @@ from src.server.database.conversation.threads_read import (
     read_thread_subagents_allowed,
 )
 from src.server.services.shared_workspaces.turn import TurnIdentity
+from src.server.services.forks.carry import ForkTurnStart
 from src.server.database.workspace import update_workspace_activity
 from src.server.services.commands.mirror import mirror_computer
 from src.server.services.computer_disk import TURN_MEASURE_MIN_INTERVAL_SECONDS
@@ -524,6 +525,7 @@ async def astream_ptc_workflow(
                 home = await HomeTurnStart.read(
                     user_id, route, retry=bool(request.retry_of_run_id)
                 )
+                fork_start = ForkTurnStart.read(prior_thread.fork, request, prior_thread.title)
                 turn_context = build_turn_context(
                     request,
                     prior_thread,
@@ -948,6 +950,18 @@ async def astream_ptc_workflow(
         project = inputs.project
         # One relay session per directly bound server, held for the run.
         direct_mcp = inputs.direct_mcp
+        # A fork's first message: its scratchpad is seeded before the agent
+        # reads it, the fork is titled after it, and its row says so.
+        turn_context = await fork_start.begin(
+            turn_context,
+            sandbox=session.sandbox,
+            layout=session.sandbox.workspace(project) if session.sandbox and project else None,
+            scratchpad=config.feature_enabled("scratchpad"),
+            thread_id=thread_id,
+            user_id=user_id,
+            message=user_input,
+            timezone=request.timezone,
+        )
 
         # DALTON-HOOK(chat-large-upload): ensure retained chat uploads exist on disk for future turns
         if session and session.sandbox:

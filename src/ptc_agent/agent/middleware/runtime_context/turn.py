@@ -68,7 +68,7 @@ from ptc_agent.agent.middleware.runtime_context.state import (
 )
 from ptc_agent.agent.middleware.runtime_context.surface import Surface, parse_surface
 from ptc_agent.agent.middleware.runtime_context.templates import render_template
-from ptc_agent.agent.middleware.runtime_context.turn_context import HomeAway
+from ptc_agent.agent.middleware.runtime_context.turn_context import ForkNotice, HomeAway
 
 logger = logging.getLogger(__name__)
 
@@ -310,6 +310,8 @@ class TurnContextMiddleware(AgentMiddleware):
         home_back: For a Home turn on Home's own computer, what came back from
             the stand-in; stated after a row that said Home was away, and once
             more, naming the folder, after one that said the copy was not done.
+        forked: On a forked thread's first turn, what the fork carried;
+            stated on that turn's row.
         is_subagent: Whether this stack belongs to a subagent.
     """
 
@@ -329,6 +331,7 @@ class TurnContextMiddleware(AgentMiddleware):
         disk_known: bool = False,
         home_away: HomeAway | None = None,
         home_back: dict[str, Any] | None = None,
+        forked: ForkNotice | None = None,
         is_subagent: bool = False,
         # DALTON-HOOK(team-memory-toggle): per-turn conversation_search availability for durable toggle notices
         conversation_search_enabled: bool | None = None,
@@ -348,6 +351,7 @@ class TurnContextMiddleware(AgentMiddleware):
         self._disk_known = disk_known
         self._home_away = home_away
         self._home_back = home_back
+        self._forked = None if is_subagent else forked
         self._is_subagent = is_subagent
         self._conversation_search_enabled = conversation_search_enabled
         self._claude_code = claude_code
@@ -500,6 +504,7 @@ class TurnContextMiddleware(AgentMiddleware):
                     _last_turn_market(state),
                     disk_recovered=disk_recovered,
                     home_back=home_back,
+                    forked=self._forked,
                 ),
                 provenance=provenance,
                 created_at=now,
@@ -628,6 +633,7 @@ class TurnContextMiddleware(AgentMiddleware):
         *,
         disk_recovered: bool = False,
         home_back: dict[str, Any] | None = None,
+        forked: ForkNotice | None = None,
     ) -> str:
         from ptc_agent.agent.prompts import format_current_time
 
@@ -653,6 +659,7 @@ class TurnContextMiddleware(AgentMiddleware):
             "disk_recovered": disk_recovered,
             "home_away": None if self._is_subagent else self._home_away,
             "home_back": home_back,
+            "forked": forked,
         }
         return render_template("envelope/turn.md.j2", **fields)
 

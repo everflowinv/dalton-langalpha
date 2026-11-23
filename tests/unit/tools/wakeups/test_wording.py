@@ -35,3 +35,9 @@ def test_cancel_rows_and_quiet_hint_are_the_approved_strings():
     # DALTON-HOOK(wake-reply-language): the reply-language line is approved
     # wording too.
     assert wording.WAKE_REPLY_LANGUAGE == approved.WAKE_REPLY_LANGUAGE
+
+
+def test_placement_lines_are_the_approved_templates():
+    assert wording.PLACED_LINES == approved.PLACED_LINES
+    assert wording.PLACED_AT_AVG == approved.PLACED_AT_AVG
+    assert wording.PLACED_WATCH == approved.PLACED_WATCH

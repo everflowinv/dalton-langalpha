@@ -37,6 +37,7 @@ from src.server.contracts.turn_kinds import (
 )
 from src.server.database import conversation as qr_db
 from src.server.database.conversation.threads_write import remember_thread_llm_model
+from src.server.services.forks.model import ForkLineage
 from src.server.services.llm.thread_model import NamedModel
 from src.server.services.runs.pending_input import (
     PENDING_INPUT_KEY,
@@ -426,6 +427,11 @@ class PriorThread(NamedTuple):
     last_run_settled_at: Optional[datetime] = None
     # DALTON-HOOK(agent-switch-model): pending mid-turn model switch marker for pre-run fallback handoff
     pending_model_handoff: Optional[dict[str, Any]] = None
+    # Where a fork came from, for its first turn's carry (``forks.carry``).
+    fork: Optional[ForkLineage] = None
+    # The thread's title, which a fork's first message replaces while it is
+    # still the one the fork was made with.
+    title: Optional[str] = None
 
 
 #: Attempts a notification's surface passes over. An automation's run states
@@ -506,6 +512,8 @@ async def _read_prior_thread(
         ),
         last_run_settled_at=run_settled_at(clock),
         pending_model_handoff=extract_pending_model_handoff(row),
+        fork=ForkLineage.of(row.get("metadata")),
+        title=row.get("title"),
     )
 
 

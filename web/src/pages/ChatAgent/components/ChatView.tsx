@@ -55,7 +55,7 @@ import { useCardState } from '../hooks/useCardState';
 import { useWorkspace } from '@/hooks/useWorkspace';
 import { classifyAgentPath, isSubagentFilePath } from '../utils/agentPaths';
 import { fileArtifactPath } from '../utils/fileArtifact';
-import type { FileOperationArtifactPayload } from '@/types/api';
+import type { FileOperationArtifactPayload, ThreadForkCut } from '@/types/api';
 import { taskIdFromAgentId } from '../utils/agentId';
 import {
   routeStopAction,
@@ -168,6 +168,8 @@ import { useUser } from '@/hooks/useUser';
 import { WorkspaceTrackingToggle } from './dalton/WorkspaceTrackingToggle';
 // DALTON-HOOK(workspace-sharing-settings): per-workspace sharing settings modal in thread top bar
 import { WorkspaceSharingModal } from './dalton/WorkspaceSharingModal';
+import { useForkThread } from './chatView/useForkThread';
+import { ForkedFromLink } from './chatView/ForkedFromLink';
 import { ThreadPrivacyRow } from './chatView/threadPrivacy';
 import { useThreadPrivacy } from './chatView/useThreadPrivacy';
 
@@ -1354,12 +1356,53 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // otherwise the route looks it up.
   const fromThreadId = state?.fromThreadId;
   const fromWorkspaceId = state?.fromWorkspaceId;
-  const openDispatcher = useCallback((dispatcherThreadId: string) => {
+  // Every exit to another thread marks itself intentional as it goes, and
+  // asks the file panel about unsaved drafts first (`leaveToThread`).
+  const goToThread = useCallback((targetThreadId: string, navState: LocationState) => {
     intentionalExitRef.current = true;
-    navigate(`/chat/t/${dispatcherThreadId}`, {
-      state: dispatcherThreadId === fromThreadId && fromWorkspaceId ? { workspaceId: fromWorkspaceId } : {},
-    });
-  }, [navigate, fromThreadId, fromWorkspaceId]);
+    navigate(`/chat/t/${targetThreadId}`, { state: navState });
+  }, [navigate]);
+  const leaveToThread = useCallback((targetThreadId: string, navState: LocationState) => {
+    leaveFiles(() => goToThread(targetThreadId, navState));
+  }, [leaveFiles, goToThread]);
+  const openDispatcher = useCallback((dispatcherThreadId: string) => {
+    leaveToThread(
+      dispatcherThreadId,
+      dispatcherThreadId === fromThreadId && fromWorkspaceId ? { workspaceId: fromWorkspaceId } : {},
+    );
+  }, [leaveToThread, fromThreadId, fromWorkspaceId]);
+
+  // "Fork from here" and "Edit in new chat": a copy of this thread up to a
+  // turn, opened as a new chat while this view is still the one in front. A
+  // view kept mounted after the user moved on leaves the fork in the list.
+  // The file panel is asked before the copy is made, so declining leaves no
+  // fork behind, and asked again on the way out unless the user already
+  // agreed to discard: a draft typed while the copy ran is asked about too.
+  // A copy that waits on its dialog runs without the button's pending state,
+  // which ends when the dialog opens.
+  const forkDiscardAgreedRef = useRef(false);
+  const openFork = useCallback((forkThreadId: string, navState: LocationState) => {
+    if (!isActiveRef.current) return;
+    if (forkDiscardAgreedRef.current) goToThread(forkThreadId, navState);
+    else leaveToThread(forkThreadId, navState);
+  }, [goToThread, leaveToThread]);
+  const forkFromTurn = useForkThread({ threadId: currentThreadId, open: openFork });
+  const handleForkFromTurn = useCallback(
+    (turnIndex: number, cut: ThreadForkCut) => new Promise<void>((resolve) => {
+      // The guard runs this at once when nothing was unsaved, and later only
+      // once the user agreed in its dialog.
+      let inline = true;
+      let went = false;
+      leaveFiles(() => {
+        went = true;
+        forkDiscardAgreedRef.current = !inline;
+        void forkFromTurn(turnIndex, cut).finally(resolve);
+      });
+      inline = false;
+      if (!went) resolve();
+    }),
+    [leaveFiles, forkFromTurn],
+  );
 
   // The file cards' Publish, one dialog for the chat.
   const { onPublishFile, dialog: publishDialog } = usePublishFile(workspaceId || null);
@@ -1408,6 +1451,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     onEditMessage: stableEditMessage,
     onRegenerate: stableRegenerate,
     onRetry: stableRetry,
+    onForkFromTurn: handleForkFromTurn,
     editDrafts,
     onSendMessage: handleSendMessage,
     chatInputRef,
@@ -1782,6 +1826,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             {/* DALTON-HOOK(workspace-sharing-settings): display colleague access banner in top bar */}
             {teamReadOnly.isColleague && (
               <TeamReadOnlyBanner ownerName={teamReadOnly.ownerName} access={teamReadOnly.access} compact />
+            )}
+            {activeAgentId === 'main' && (
+              <ForkedFromLink threadId={currentThreadId} onOpen={leaveToThread} />
             )}
             {isLoadingHistory ? (
               <span className="text-xs whitespace-nowrap" style={{ color: 'var(--color-text-tertiary)' }}>
