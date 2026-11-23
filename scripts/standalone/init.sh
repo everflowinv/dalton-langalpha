@@ -284,8 +284,16 @@ is_loopback_domain() {
 
 validate_domain_for_auth() {
   local domain_val="$1"
-  local auth_mode
-  auth_mode="${DALTON_AUTH_MODE:-$(get_env_value "DALTON_AUTH_MODE")}"
+  local auth_mode=""
+  # The installed stack reads DALTON_AUTH_MODE from .env, so judge by the file
+  # (or the template it will be seeded from), never by this shell's environment.
+  if [[ -f "$ENV_FILE" ]]; then
+    auth_mode="$(get_env_value "DALTON_AUTH_MODE")"
+  elif [[ -f "$ENV_EXAMPLE" ]]; then
+    auth_mode="$(sed -n 's/^DALTON_AUTH_MODE=//p' "$ENV_EXAMPLE" | tail -n 1)"
+  fi
+  # Compose strips surrounding quotes, so compare the unquoted value.
+  auth_mode="$(printf '%s' "$auth_mode" | sed -E "s/^[[:space:]]*[\"']?//; s/[\"']?[[:space:]]*$//")"
   auth_mode="${auth_mode:-oss}"
   auth_mode="$(printf '%s' "$auth_mode" | tr '[:upper:]' '[:lower:]')"
   if [[ "$auth_mode" == "oss" ]] && ! is_loopback_domain "$domain_val"; then

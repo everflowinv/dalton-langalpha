@@ -40,6 +40,25 @@ info()    { printf "  ${DIM}%s${NC}\n" "$1"; }
 set_env() {
     local key="$1" val="$2"
     local orig_mode="" env_dir tmp
+    # Write through a symlinked .env to its target so the link stays and the
+    # target keeps its own mode.
+    if [ -L "$ENV_FILE" ]; then
+        local link_target
+        link_target="$ENV_FILE"
+        local hops=0
+        while [ -L "$link_target" ] && [ "$hops" -lt 16 ]; do
+            local next
+            next="$(readlink "$link_target")"
+            case "$next" in
+                /*) link_target="$next" ;;
+                *) link_target="$(dirname "$link_target")/$next" ;;
+            esac
+            hops=$((hops + 1))
+        done
+        if [ -n "$link_target" ]; then
+            local ENV_FILE="$link_target"
+        fi
+    fi
     if [ -f "$ENV_FILE" ]; then
         orig_mode="$(stat -c '%a' "$ENV_FILE" 2>/dev/null || stat -f '%Lp' "$ENV_FILE" 2>/dev/null || true)"
     fi

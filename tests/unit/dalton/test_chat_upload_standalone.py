@@ -1001,6 +1001,30 @@ class TestSandboxNetworkAndInitScript:
         assert res_v6.returncode == 0
         assert (inst_v6 / ".env").is_file()
 
+        # 3b. The guard reads the auth mode the stack will run with: a stray
+        # shell DALTON_AUTH_MODE and a quoted 'oss' in .env both still refuse.
+        _, init_shell = self._stage_init_install(tmp_path, "inst-shell-auth")
+        shell_env = self._make_fake_docker_env(tmp_path, "28.0.1")
+        shell_env["DALTON_AUTH_MODE"] = "supabase"
+        res_shell = subprocess.run(
+            ["bash", str(init_shell), "--non-interactive", "--domain",
+             "dalton.example.com", "--skip-sandbox-build"],
+            env=shell_env, capture_output=True, text=True, timeout=15,
+        )
+        assert res_shell.returncode != 0
+        assert "免密单机试用" in res_shell.stderr
+
+        inst_quoted, init_quoted = self._stage_init_install(tmp_path, "inst-quoted-auth")
+        (inst_quoted / ".env").write_text("DALTON_AUTH_MODE='oss'\n")
+        res_quoted = subprocess.run(
+            ["bash", str(init_quoted), "--non-interactive", "--domain",
+             "dalton.example.com", "--skip-sandbox-build"],
+            env=self._make_fake_docker_env(tmp_path, "28.0.1"),
+            capture_output=True, text=True, timeout=15,
+        )
+        assert res_quoted.returncode != 0
+        assert "免密单机试用" in res_quoted.stderr
+
         # 4. Docker server < 28.0 or unreachable fails in --non-interactive
         for ver in ("27.5.1", None):
             _, init_old = self._stage_init_install(tmp_path, f"inst-old-{ver or 'none'}")
