@@ -218,6 +218,12 @@ class PTCSandbox:
         return type(self.provider).files_as_command_user
 
     @property
+    def installs_browser(self) -> bool:
+        """Whether this computer's machine sets the agent's browser up itself,
+        as one its owner brought does, rather than having it from the image."""
+        return type(self.provider).installs_browser
+
+    @property
     def recreatable(self) -> bool:
         """Whether the server rebuilds this computer, and so lays its files
         unasked; on one its owner brought, a missing folder is theirs to restore."""
@@ -1184,6 +1190,7 @@ class PTCSandbox:
         disabled_skills: frozenset[str] = frozenset(),
         reusing_sandbox: bool = False,
         force_refresh: bool = False,
+        rebuild_overlay: bool = False,
         project: "ProjectContext | None" = None,
         root_owner_dir_name: str | None = None,
         workspace_dir_names: tuple[str, ...] = (),
@@ -1196,6 +1203,7 @@ class PTCSandbox:
             disabled_skills=disabled_skills,
             reusing_sandbox=reusing_sandbox,
             force_refresh=force_refresh,
+            rebuild_overlay=rebuild_overlay,
             project=project,
             root_owner_dir_name=root_owner_dir_name,
             workspace_dir_names=workspace_dir_names,

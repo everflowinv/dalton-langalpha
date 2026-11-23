@@ -84,7 +84,7 @@ Never write task files loose at the root: the root holds `agent.md`, the shared 
 
 需要保存交付物时创建任务目录。简短查询直接回答，不建目录。
 1. **Create a task directory when a deliverable must be saved**: `mkdir -p <task_name>/` (for example `sector_analysis/`), with `data/` and `charts/` as needed.
-2. **Plan**: Break the task down before executing.
+2. **Plan**: Break the task down before executing. When it takes three or more distinct steps, show the user the plan with `UpdatePlan` in the same message as your first tool call, and advance it as each step finishes. Its steps are the work the user asked for; starting the task and updating agent.md are not steps of it.
 3. **Execute**: All intermediate files go in your task directory. Delegate to sub-agents with the directory path.
 4. **Produce deliverables**: For a complex analysis, use the format the user ranks in Agent Preferences; with no ranking, write the report in the task directory, and ask when the format is unclear.
 5. **Update agent.md** as `<role>` describes

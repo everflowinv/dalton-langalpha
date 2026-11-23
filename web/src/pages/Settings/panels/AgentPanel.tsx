@@ -5,12 +5,14 @@ import { Input } from '@/components/ui/input';
 import { isImeComposing } from '@/lib/ime';
 import { Select } from '@/components/ui/select';
 import { usePreferences } from '@/hooks/usePreferences';
-import { useAllModels } from '@/hooks/useAllModels';
-import { useSearchTierAllows } from '@/hooks/useSearchTierAllows';
+import { useFeatureEnabled } from '@/hooks/useFeatures';
+import { ownContextPatch, readOwnContext } from '@/lib/ownContext';
 import { readSubagentsDefault, subagentsDefaultPatch } from '@/lib/subagentsDefault';
-import { readSearchPreference, searchDepthPatch, searchProviderPatch } from '@/lib/searchPreferences';
+import { searchDepthPatch } from '@/lib/searchPreferences';
 import { OUTPUT_FORMATS, readOutputFormats } from '@/lib/outputFormat';
 import { PROACTIVITY, RESEARCH_DEPTHS, isOneOf } from '@/pages/Onboarding/welcome/profile';
+import { useSearchPreference } from '@/hooks/useSearchPreference';
+import { SearchProviderSelect } from '../components/SearchProviderSelect';
 import { SettingRow, SettingsCardBody, SettingsGroup, ToggleRow } from '../components/SettingsLayout';
 import { useSettingCopy } from '../components/useSettingCopy';
 import { SETTINGS } from '../sections';
@@ -58,8 +60,6 @@ export function AgentPanel() {
   const copy = useSettingCopy();
   const { preferences: prefsData } = usePreferences();
   const write = usePreferenceWrite();
-  const tierAllows = useSearchTierAllows();
-  const { searchProviders } = useAllModels();
   const depthId = useId();
   const outputFormatId = useId();
 
@@ -69,8 +69,10 @@ export function AgentPanel() {
   const proactivity = isOneOf(PROACTIVITY, agentPreference.proactivity) ? agentPreference.proactivity : '';
   const instructions = instructionsOf(agentPreference);
   const subagentsDefault = readSubagentsDefault(prefsData);
-  const search = readSearchPreference(prefsData, searchProviders);
-  const providers = Object.entries(searchProviders ?? {});
+  const memberContextOn = useFeatureEnabled('shared_workspaces_member_context');
+  const ownContext = readOwnContext(prefsData);
+  const search = useSearchPreference();
+  const { tierAllows } = search;
   const providerCopy = copy(SETTINGS.searchProvider);
 
   return (
@@ -130,6 +132,13 @@ export function AgentPanel() {
           checked={subagentsDefault}
           onChange={() => { void write(subagentsDefaultPatch(!subagentsDefault)); }}
         />
+        {memberContextOn && (
+          <ToggleRow
+            {...copy(SETTINGS.ownContext)}
+            checked={ownContext}
+            onChange={() => { void write(ownContextPatch(!ownContext)); }}
+          />
+        )}
       </SettingsGroup>
 
       {instructions.length > 0 && (
@@ -151,25 +160,13 @@ export function AgentPanel() {
       <SettingsGroup title={t('settings.modelTuning.sectionSearch')}>
         <SettingRow
           {...providerCopy}
-          description={providers.some(([, p]) => !tierAllows(p.min_tier))
+          description={search.gated
             ? <>{providerCopy.description} <span>{t('settings.searchProviderUpgradeHint')}</span></>
             : providerCopy.description}
           htmlFor={`${providerCopy.id}-select`}
           wide
         >
-          <Select
-            id={`${providerCopy.id}-select`}
-            value={search.provider}
-            onChange={(e) => { void write(searchProviderPatch(e.target.value, searchProviders)); }}
-            disabled={!providers.some(([, p]) => tierAllows(p.min_tier))}
-          >
-            <option value="">{t('settings.searchProviderDefault')}</option>
-            {providers.map(([value, p]) => (
-              <option key={value} value={value} disabled={!tierAllows(p.min_tier)}>
-                {p.display_name}
-              </option>
-            ))}
-          </Select>
+          <SearchProviderSelect id={`${providerCopy.id}-select`} />
         </SettingRow>
         {search.depths.length > 0 && (
           <SettingRow

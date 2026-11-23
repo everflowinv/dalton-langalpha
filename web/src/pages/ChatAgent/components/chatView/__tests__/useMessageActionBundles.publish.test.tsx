@@ -47,6 +47,7 @@ function sources(overrides: Partial<MessageActionSources> = {}): MessageActionSo
     onEditMessage: noop,
     onRegenerate: noop,
     onRetry: noop,
+    onForkFromTurn: async () => {},
     editDrafts: createEditDraftStore(() => 'th-publish-gate'),
     onSendMessage: noop,
     chatInputRef: { current: null },

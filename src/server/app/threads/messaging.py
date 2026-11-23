@@ -14,6 +14,7 @@ from src.config.settings import get_sse_keepalive_interval
 from src.server.utils.api import (
     CurrentUserId,
     database_unavailable,
+    service_token_matches,
 )
 from src.server.models.chat import ChatRequest
 from src.server.models.workflow import RetryRequest
@@ -339,8 +340,10 @@ async def send_thread_message(
 def _is_service_request(raw_request: Request | None) -> bool:
     """Whether the server sent ``raw_request`` itself: it carries the service
     token, or oss mode has no token configured to check, which trusts the
-    self-dispatch."""
+    self-dispatch, from anything the owner fallback would answer
+    (``owner_requests``)."""
     from src.config.settings import HOST_MODE
+    from src.server.auth.owner_requests import is_owner
     # DALTON-HOOK(dalton-auth): require service token match for self-dispatch when Dalton auth is enabled
     from src.dalton.auth import is_dalton_service_request, is_dalton_supabase_auth_enabled
 
@@ -348,9 +351,14 @@ def _is_service_request(raw_request: Request | None) -> bool:
     sent = raw_request.headers.get("X-Service-Token", "") if raw_request else ""
     if is_dalton_supabase_auth_enabled():
         return is_dalton_service_request(sent, token)
-    # DALTON-HOOK(standalone-core): dispatch service-request check for local/oss auth modes
+    # DALTON-HOOK(standalone-core): dispatch local/invalid Dalton auth modes before upstream OSS owner check
     from src.dalton.auth.dispatch import dispatch_oss_service_request
-    return dispatch_oss_service_request(sent, token, host_mode=HOST_MODE)
+    from src.dalton.settings import get_dalton_auth_mode
+
+    if HOST_MODE == "oss" and get_dalton_auth_mode() != "oss":
+        return dispatch_oss_service_request(sent, token, host_mode=HOST_MODE)
+    trusted = HOST_MODE == "oss" and not token and (raw_request is None or is_owner(raw_request.scope))
+    return service_token_matches(sent, token) or trusted
 
 
 # Fields only the server's own requests set. A user's copy would post a system
@@ -731,6 +739,9 @@ async def _handle_send_message(
         )
         is_colleague_turn = (not is_holder(ws_owner_id)) and ws_owner_id != str(user_id)
         identity = await TurnIdentity.of(user_id, route.owner_id)
+        # Here as well as in the workflow: the stream answers 200 before the
+        # workflow runs, and this refusal is the request's 422.
+        identity.refuse_other_roles(request)
 
         user_input = request.message_text()
 

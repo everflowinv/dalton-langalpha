@@ -294,7 +294,9 @@ def test_subagent_compiler_reuses_parent_resolved_provider_without_duplicate(
     """grok 低 4: when parent already fell back to serper, subagent targeting serper makes no duplicate."""
     _reset_env(monkeypatch, app_env="core", search_keys={"SERPER_API_KEY": "serper-key"})
     config = _load_real_agent_config()
-    assert config.search_api == "tavily"
+    # Upstream now picks the configured provider from the keys present (986a4db38);
+    # pin it so the parent's fallback to serper is the case under test.
+    config.search_api = "tavily"
 
     parent_search = get_web_search_tool(max_search_results=10, provider="serper")
     spy_builder = create_autospec(get_web_search_tool)

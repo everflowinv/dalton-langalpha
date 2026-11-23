@@ -766,7 +766,7 @@ async def resolve_turn_team_memory_enabled(
         return False
 
 
-async def require_team_reader(user_id: str | None) -> str:
+async def require_team_reader(user_id: str | None, *, conn: Any = None) -> str:
     """Verify caller is authenticated and in DALTON_ALLOWED_EMAILS when Dalton auth is on.
 
     Raises:
@@ -783,12 +783,21 @@ async def require_team_reader(user_id: str | None) -> str:
     verified = _verified_token_identity.get()
     if verified is not None and verified[0] == uid:
         verified_email = (verified[1] or "").strip().lower()
-        if await is_team_member(verified_email):
+        is_member = (
+            await is_team_member(verified_email, conn=conn)
+            if conn is not None
+            else await is_team_member(verified_email)
+        )
+        if is_member:
             return uid
         raise HTTPException(status_code=403, detail="Forbidden")
 
     try:
-        user_row = await user_db.get_user(uid)
+        user_row = (
+            await user_db.get_user(uid, conn=conn)
+            if conn is not None
+            else await user_db.get_user(uid)
+        )
     except HTTPException:
         raise
     except Exception as exc:
@@ -801,7 +810,11 @@ async def require_team_reader(user_id: str | None) -> str:
         raise HTTPException(status_code=403, detail="Forbidden")
 
     email = str(user_row.get("email") or "").strip().lower()
-    if not email or not await is_team_member(email):
+    if not email or not (
+        await is_team_member(email, conn=conn)
+        if conn is not None
+        else await is_team_member(email)
+    ):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     return uid
@@ -883,7 +896,10 @@ async def require_workspace_access(
     if not owner_id:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    await require_team_reader(uid)
+    if conn is not None:
+        await require_team_reader(uid, conn=conn)
+    else:
+        await require_team_reader(uid)
 
     if owner_id == uid:
         if ws.get("status") == "deleted":
@@ -895,7 +911,11 @@ async def require_workspace_access(
     # External-member isolation, decided before anything else — the Home
     # 403, the owner membership check, the sharing row — so no caller state
     # or owner-tier failure can leak a colleague workspace's existence.
-    caller_tier = await get_user_tier(uid)
+    caller_tier = (
+        await get_user_tier(uid, conn=conn)
+        if conn is not None
+        else await get_user_tier(uid)
+    )
     if caller_tier == "external":
         if _raise_on_caller_tier_external.get():
             raise HTTPException(
@@ -906,7 +926,11 @@ async def require_workspace_access(
     if caller_tier == "company":
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    owner_tier = await classify_owner_tier(owner_id)
+    owner_tier = (
+        await classify_owner_tier(owner_id, conn=conn)
+        if conn is not None
+        else await classify_owner_tier(owner_id)
+    )
     if owner_tier == "unknown":
         raise OwnerTierUnavailable()
     if owner_tier == "company":
@@ -931,7 +955,10 @@ async def require_workspace_access(
 
     # Resource owner must also be an allowlisted team member.
     try:
-        await require_team_reader(owner_id)
+        if conn is not None:
+            await require_team_reader(owner_id, conn=conn)
+        else:
+            await require_team_reader(owner_id)
     except HTTPException:
         if owner_tier == "external":
             raise HTTPException(status_code=404, detail="Workspace not found")
@@ -1180,6 +1207,7 @@ async def build_dispatched_by_meta(
     channel: str,
     name: str | None = None,
     email: str | None = None,
+    conn: Any = None,
 ) -> dict[str, Any] | None:
     """Build ``metadata['dispatched_by']`` payload when ``user_id != workspace_owner_id``."""
     uid = str(user_id or "").strip()
@@ -1190,7 +1218,11 @@ async def build_dispatched_by_meta(
     resolved_email = email
     if not resolved_name and not resolved_email:
         try:
-            u_row = await user_db.get_user(uid)
+            u_row = (
+                await user_db.get_user(uid, conn=conn)
+                if conn is not None
+                else await user_db.get_user(uid)
+            )
             if u_row:
                 resolved_name = u_row.get("name")
                 resolved_email = u_row.get("email")

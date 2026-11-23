@@ -12,6 +12,7 @@ import { useDaltonCoverageUnits } from '@/lib/dalton/coverage'; // DALTON-HOOK(s
 import { queryKeys } from '@/lib/queryKeys'; // DALTON-HOOK(settings-section)
 import { fetchDaltonChannelBindings } from '../utils/daltonApi'; // DALTON-HOOK(settings-section)
 import { isDesktopShell } from '@/lib/desktop';
+import { isFeatureEnabled, useFeatures } from '@/hooks/useFeatures';
 import { isImeComposing } from '@/lib/ime';
 import { matchesAllWords, queryWords } from '@/lib/textMatch';
 // DALTON-HOOK(settings-section): filter searchable Dalton settings by live card visibility
@@ -111,11 +112,12 @@ export function SettingsRail({ section }: { section: Section }) {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, []);
 
-  // DALTON-HOOK(settings-section): filter searchable settings by card-level permissions
+  // DALTON-HOOK(settings-section): filter searchable settings by card-level permissions and feature flags
   const daltonVisibility = useDaltonSettingsVisibility();
+  const features = useFeatures().data;
   const entries = useMemo(
-    () => searchableSettings(isDesktopShell(), daltonVisibility),
-    [daltonVisibility],
+    () => searchableSettings(isDesktopShell(), daltonVisibility, (key) => isFeatureEnabled(features, key)),
+    [daltonVisibility, features],
   );
   const words = queryWords(query);
   const matches = words.length === 0

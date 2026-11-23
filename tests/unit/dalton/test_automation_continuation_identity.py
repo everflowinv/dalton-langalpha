@@ -94,6 +94,10 @@ class _FakeConn:
         yield
 
 
+
+def _feature_enabled_off(key: str) -> bool:
+    return False
+
 def _pool_patch(target: str, cur: _CapturingCursor):
     @asynccontextmanager
     async def _get_db_connection():
@@ -175,6 +179,8 @@ async def _run_ptc_through_graph_config(
         disabled_skills=frozenset(),
         withheld_skills=frozenset(),
         filesystem=SimpleNamespace(enabled_tools=None),
+        # Upstream #848 reads config.feature_enabled("scratchpad") when a turn starts.
+        feature_enabled=create_autospec(_feature_enabled_off, return_value=False),
     )
     session_mock = create_autospec(Session, instance=True)
     session_mock.sandbox = None
@@ -1069,6 +1075,7 @@ async def test_s1_start_locks_execution_and_takes_over_inside_same_transaction()
             disabled_skills=frozenset(),
             withheld_skills=frozenset(),
             filesystem=SimpleNamespace(enabled_tools=None),
+            feature_enabled=create_autospec(_feature_enabled_off, return_value=False),
         )
         def _capture_cfg(*args, **kwargs):
             cfg = real_build_graph_config(*args, **kwargs)

@@ -198,6 +198,7 @@ vi.mock('@/hooks/useAllModels', () => ({
     systemDefaults: { default_model: 'claude-sonnet', background_model: 'gpt-5' },
     compactionProfiles: null,
     searchProviders: null,
+    taskCostBaseline: null,
     rawApiResponse: null,
     isLoading: false,
     unread: false,

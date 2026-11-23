@@ -110,6 +110,13 @@ NO_USER_CREDENTIAL = {
     ("POST", "/v1/egress/{grant_id}"),
     # A connector sign-in's return, bound to a state its start minted.
     ("GET", "/api/v1/mcp/oauth/callback"),
+    # A self-hosted deployment's own setup, answered for the server rather
+    # than for an account, and mounted on no other kind of server.
+    ("GET", "/api/v1/setup/status"),
+    ("PUT", "/api/v1/setup/keys"),
+    ("POST", "/api/v1/setup/keys/test"),
+    ("PUT", "/api/v1/setup/sandbox"),
+    ("POST", "/api/v1/setup/complete"),
     # A machine's side of pairing; only the owner's gated route adds it.
     ("GET", "/api/v1/computers/ssh/pairings/{token}/script"),
     ("GET", "/api/v1/computers/ssh/pairings/{token}/key"),
@@ -197,6 +204,11 @@ def test_every_route_naming_a_user_passes_the_gate():
     # Every entry is a route, but the ones only some deployments mount.
     assert NO_USER_CREDENTIAL - ungated <= {
         ("WS", "/ws/v1/market-data/aggregates/{market}"),
+        ("GET", "/api/v1/setup/status"),
+        ("PUT", "/api/v1/setup/keys"),
+        ("POST", "/api/v1/setup/keys/test"),
+        ("PUT", "/api/v1/setup/sandbox"),
+        ("POST", "/api/v1/setup/complete"),
     }
 
 
@@ -534,8 +546,8 @@ async def _call(path):
 @pytest.mark.asyncio
 async def test_with_teams_on_a_request_pays_one_cached_read_at_most():
     keys = [
-        "platform_membership:v4:u",
-        "platform_membership:last_known:v4:u",
+        "platform_membership:v5:u",
+        "platform_membership:last_known:v5:u",
         "platform_membership:unreachable:u",
         "platform_membership:epoch:u",
         "platform_membership:suspended:u",

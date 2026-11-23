@@ -3,7 +3,7 @@ import { othersTurnWords } from '@/lib/turnRefusal';
 import { SharedThreadContext } from './messageList/SharedThreadContext';
 import { useSharedThreadView } from '../hooks/useSharedThreadView';
 import { useSharedEntry, useWorkspaceCapabilities } from '@/hooks/useSharedWorkspaces';
-import React, { Suspense, useEffect, useEffectEvent, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
+import React, { Suspense, useEffect, useEffectEvent, useId, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { MessageSelectionQuote } from './selectionQuote/MessageSelectionQuote';
@@ -55,7 +55,7 @@ import { useCardState } from '../hooks/useCardState';
 import { useWorkspace } from '@/hooks/useWorkspace';
 import { classifyAgentPath, isSubagentFilePath } from '../utils/agentPaths';
 import { fileArtifactPath } from '../utils/fileArtifact';
-import type { FileOperationArtifactPayload } from '@/types/api';
+import type { FileOperationArtifactPayload, ThreadForkCut } from '@/types/api';
 import { taskIdFromAgentId } from '../utils/agentId';
 import {
   routeStopAction,
@@ -89,9 +89,13 @@ import { LinkActionsContext } from '../contexts/LinkActionsContext';
 import type { BrowserUse } from '../session/stream/browserUse';
 import { RouteLeaveGuardContext } from '../contexts/RouteLeaveGuardContext';
 import SubagentStatusBar from './SubagentStatusBar';
-import TodoDrawer from './TodoDrawer';
-import { ComposerTray, ReconnectingChip, TrayDock } from './chatView/ComposerTray';
-import { useTrayContents } from './chatView/useTrayContents';
+import { ComposerTray, ComposerTrayStrip } from './chatView/ComposerTray';
+import { ReconnectingChip } from './chatView/trayChips';
+import { TrayDock } from './chatView/trayLiquid';
+import { readComposerTray } from '@/lib/composerTray';
+import { useThreadStatusValue } from './chatView/useThreadStatusValue';
+import { ThreadStatusContext } from './chatView/threadStatus';
+import { ThreadQuotesProvider } from './chatView/threadQuotes';
 import { useHistoryBackfill } from './chatView/useHistoryBackfill';
 import { useFocusTurn } from './chatView/useFocusTurn';
 import { PaletteSearchButton } from '@/components/nav/PaletteSearchButton';
@@ -107,7 +111,6 @@ import { usePublishFile } from './chatView/usePublishFile';
 import { DockTurnStatus } from './chatView/DockTurnStatus';
 import { QueuedCommentDeck } from './artifactComments/QueuedCommentDeck';
 import { useTrayFold } from './chatView/useTrayFold';
-import { useNoticeSlot } from './chatView/useNoticeSlot';
 import { ErrorBanner } from '@/components/ui/error-banner';
 import { motion, AnimatePresence, type PanInfo } from '@/lib/framer';
 import { DURATION, EASE_COLLAPSE, SPRING_FOLD, TWEEN } from '@/lib/motion';
@@ -134,10 +137,8 @@ import type {
   ActionCommand,
   ChatViewProps,
 } from './chatView/types';
-import { TranscriptStatus } from './chatView/TranscriptStatus';
-import { FallbackSuggestionPill } from './chatView/FallbackSuggestionPill';
-import { ThreadOffers } from './chatView/ThreadNotices';
-import { ClaudeCodePlanRow } from './chatView/ClaudeCodePlanRow';
+import { TranscriptStatus, type ThreadNotice } from './chatView/TranscriptStatus';
+import { useComposerNotices } from './chatView/useComposerNotices';
 import { useNextSummary } from '../hooks/useNextSummaryHint';
 import { ChatDiskWarning } from './chatView/ChatDiskWarning';
 import { HomePlacementNotice } from './chatView/HomePlacementNotice';
@@ -151,6 +152,7 @@ import { isTurnOpen, useTranscriptFollow } from './chatView/useTranscriptFollow'
 import { useSubagentTabs } from './chatView/useSubagentTabs';
 import { publishSidebarAgents, clearSidebarAgents } from './sidebarAgentsBridge';
 import { useRightPanel } from './chatView/useRightPanel';
+import { handChatStrips, releaseChatStrips } from './filePanel/freshStrips';
 import { handOffToggleFocus } from './filePanel/panelToggleFocus';
 import { PanelLoadingStrip } from './filePanel/PanelLoadingStrip';
 import { usePanelFiles } from './chatView/usePanelFiles';
@@ -168,6 +170,8 @@ import { useUser } from '@/hooks/useUser';
 import { WorkspaceTrackingToggle } from './dalton/WorkspaceTrackingToggle';
 // DALTON-HOOK(workspace-sharing-settings): per-workspace sharing settings modal in thread top bar
 import { WorkspaceSharingModal } from './dalton/WorkspaceSharingModal';
+import { useForkThread } from './chatView/useForkThread';
+import { ForkedFromLink } from './chatView/ForkedFromLink';
 import { ThreadPrivacyRow } from './chatView/threadPrivacy';
 import { useThreadPrivacy } from './chatView/useThreadPrivacy';
 
@@ -178,6 +182,11 @@ import { useThreadPrivacy } from './chatView/useThreadPrivacy';
 // whole transcript on every frame the composer resized (1.3ms a change on a
 // three-turn thread, against 0.1ms, and growing with the thread).
 const TRANSCRIPT_BOTTOM_PAD = 'pb-[calc(var(--composer-h,0px)+0.5rem)] *:[--composer-h:initial]';
+// The transcript column's width beside the minimap. Inline rather than a
+// second max-w utility, which cn() would merge away with max-w-3xl: that class
+// is the column's mark, which the scroll code (resolveScrollContent) and the
+// e2e probes find it by.
+const BESIDE_MINIMAP: React.CSSProperties = { maxWidth: 'min(48rem, calc(100% - 3rem))' };
 function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName: initialWorkspaceName, isActive = true, onThreadResolved, warmingState = false }: ChatViewProps): React.ReactElement | null {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
@@ -266,13 +275,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const [navPanelVisible, setNavPanelVisible] = useState(false);
   const handleNavMinimize = useCallback(() => setNavPanelVisible(false), []);
 
-  // Floating cards management - extracted to custom hook for better encapsulation
-  // Must be called before useChatMessages since updateTodoListCard and updateSubagentCard are passed to it
+  // Subagent cards. Called before useChatMessages, which writes them.
   const {
     cards,
-    updateTodoListCard,
     updateSubagentCard,
-    finalizePendingTodos,
     clearSubagentCards,
   } = useCardState();
 
@@ -368,14 +374,14 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     browserUseRef.current(use);
   }, []);
 
-  // Chat messages management - receives updateTodoListCard and updateSubagentCard from floating cards hook.
+  // Chat messages management - writes the subagent cards above.
   // Send, edit, regenerate and retry come from useTranscriptFollow below.
   const readComposerOptions = useCallback(() => chatInputRef.current?.getModelOptions?.(), []);
   // Filled by useChatCover below. A send that fails at a file's foot comes
   // back to the box; in the chat it stays on screen with its Retry.
   const coverReads = useChatCoverReads();
   const chat = useChatMessages(workspaceId, threadId, {
-    updateTodoListCard: updateTodoListCard as (todoData: Record<string, unknown>) => void, updateSubagentCard, finalizePendingTodos,
+    updateSubagentCard,
     onFileArtifact: handleFileArtifact, onPreviewUrl: handleOpenPreviewFromStream, onBrowserUse: handleBrowserUseFromStream, clearSubagentCards,
     onWorkspaceCreated: handleWorkspaceCreated, platform: 'web', readComposerOptions, returnsUnsent: coverReads.docked,
   });
@@ -399,8 +405,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     olderHistory: { snapshot: olderHistory, load: loadOlderHistory, backfill: backfillOlderHistory },
     isReconnecting,
     modelStatus,
-    fallbackSuggestion,
-    clearFallbackSuggestion,
     messageError,
     watchCommentSends,
     editDrafts,
@@ -569,15 +573,13 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // to the panel would give every unsent chat in a workspace one shared strip.
   const liveThreadId = currentThreadId || threadId;
   const panelThreadId = liveThreadId && liveThreadId !== '__default__' ? liveThreadId : undefined;
-
-  // Fallback-suggestion pill action: adopt the model that actually answered,
-  // for this thread only. Making it the default is the banner's offer, which
-  // the pick raises like any other.
-  const handleSwitchModel = useCallback((model: string) => {
-    void pickThreadModel(model).then((saved) => {
-      if (saved) clearFallbackSuggestion();
-    });
-  }, [pickThreadModel, clearFallbackSuggestion]);
+  // The host keys this view by chat instance, so this lives as long as the
+  // chat, across the panel's own remounts. What the chat held goes to its
+  // thread once it has one, whether or not the panel is open, and the rest
+  // goes with the chat.
+  const panelChatKey = useId();
+  useEffect(() => () => releaseChatStrips(panelChatKey), [panelChatKey]);
+  useEffect(() => { if (panelThreadId) handChatStrips(panelChatKey, panelThreadId); }, [panelChatKey, panelThreadId]);
 
   // Spinner state merges the in-conversation signal (chat SSE `workspace_status`
   // events, set when this client's message owns the start) with the entry-time
@@ -646,6 +648,16 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   } = scroll;
   // What the next send summarizes first, which every turn the reader starts carries.
   const { summary: summaryHint, starters: summarized } = useNextSummary(chat);
+  // What the composer says about the next send, each on the control it is about.
+  const composerNotices = useComposerNotices({
+    threadId: currentThreadId,
+    threadModel,
+    subagents: threadSubagents,
+    chat,
+    summary: summaryHint,
+    workspaceId,
+    chiefOfStaff: isHome,
+  });
   const { handleSendMessage, handleEditMessage, handleRegenerate, handleRetry } = useTranscriptFollow(
     { ...chat, ...summarized },
     scroll.follow,
@@ -1259,47 +1271,58 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // identity would re-create every inline prop beside it and re-render the panel.
   const openSubagentTaskFromPanel = useStableHandler(handleOpenSubagentTask);
 
+  // The dispatcher's deep-link context for PTC-agent proposal cards. Memoized:
+  // a fresh object per render would defeat the bubble memo in Home.
+  const dispatcherContext = useMemo(
+    () => (isHome && currentThreadId ? { threadId: currentThreadId, workspaceId } : null),
+    [isHome, currentThreadId, workspaceId],
+  );
+
+  // The thread's background commands, read once here for the tray and the
+  // tool cards, which watch this read in the cache.
+  const commands = useThreadCommands(panelThreadId, isActive);
+  // On a phone the file panel covers the chat, so it gives way to the end of
+  // the chat it would otherwise scroll out of sight.
+  const jumpToLatest = () => {
+    if (isMobile && rightPanelType === 'file') {
+      setRightPanelType(null);
+      popPanelHistory();
+    }
+    pinToBottom('smooth');
+  };
+  const { status: threadStatus, plansUnderMessages } = useThreadStatusValue({
+    marketWatch, commands, threadId: panelThreadId ?? null, isActive, cards, taskHistory: subagentHistoryEntries,
+    messages, isLoading: !!isLoading, hasActiveSubagents, reportBackOwed, owedThreads: reportBackOwedThreads,
+    owedKinds: reportBackOwedKinds, isHome, awaitingAnswer: !!pendingInterrupt, from: dispatcherContext,
+    onSelectAgent: handleSelectAgent, onOpenSubagentTask: handleOpenSubagentTask, onOpenCommand: handleToolCallDetailClick,
+    onOpenStatusPanel: handleOpenStatusFromChat, onJumpToLatest: jumpToLatest,
+  });
+  const trayContents = threadStatus.contents;
   // The composer tray, and its fold: while the reader is up in the history the
   // tray folds into the composer's toolbar, on the jump-to-latest pill's
   // signal and until the pill's glide to the end has landed. Clicking the
   // folded dock pours it back out where the reader is, until they scroll on.
-  // The thread's background commands, read once here for the tray and the
-  // tool cards, which watch this read in the cache.
-  const commands = useThreadCommands(panelThreadId, isActive);
-  const trayContents = useTrayContents({
-    marketWatch,
-    commands,
-    threadId: panelThreadId ?? null,
-    isActive,
-    cards,
-    taskHistory: subagentHistoryEntries,
-    messages,
-    isLoading,
-    hasActiveSubagents,
-    reportBackOwed,
-    owedThreads: reportBackOwedThreads,
-    owedKinds: reportBackOwedKinds,
-    isHome,
-  });
-  // A roster task the page only knows from history or its report has no card
-  // yet: open it the way its inline card would, which loads its transcript,
-  // with the words and status the tray shows rather than a card's defaults.
-  const openTaskFromTray = useStableHandler((agentId: string) => {
-    if (cards[`subagent-${agentId}`]) return handleSelectAgent(agentId);
-    const row = trayContents?.tasks?.rows.find((task) => task.id === agentId);
-    handleOpenSubagentTask({ subagentId: agentId, description: row?.description, status: row?.status });
-  });
-  // A notice above the composer takes the tray's place, and the tray waits
-  // in its dock until it goes, as it does while the reader is up.
-  const [attachNotices, noticeShown] = useNoticeSlot();
-  const { phase: trayPhase, trayRef, dockRef: trayDockRef, peek: peekTray } = useTrayFold({
+  // Kept inside the composer as its top strip, the tray has nothing scrolling
+  // under it and nowhere to fold, so the fold sees no tray.
+  const trayInside = readComposerTray(preferences) === 'inside';
+  const floatingTray = trayInside ? null : trayContents;
+  const { phase: trayPhase, trayRef, dockRef: trayDockRef, peek: peekTray, settle: settleTray } = useTrayFold({
     scrolledUp: jumpPill.visible,
     jumping: scroll.jumping,
-    contents: trayContents,
+    contents: floatingTray,
     getScroller: getMainScrollRoot,
     docked: composerDock.docked,
-    covered: noticeShown || !!othersTurn,
+    covered: !!othersTurn,
   });
+  // Where the tray sits: above the composer with its dock in the toolbar, or
+  // as the composer's strip.
+  const tray = floatingTray
+    ? {
+      above: <ComposerTray phase={trayPhase} trayRef={trayRef} dockRef={trayDockRef} onSettled={settleTray} />,
+      dock: <TrayDock ref={trayDockRef} phase={trayPhase} contents={floatingTray} onOpen={peekTray} />,
+      strip: null,
+    }
+    : { above: null, dock: null, strip: trayInside && <ComposerTrayStrip /> };
 
   // Keep the ref in sync so SSE events (via handleOpenPreviewFromStream) use the latest closure
   useLayoutEffect(() => {
@@ -1354,12 +1377,53 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // otherwise the route looks it up.
   const fromThreadId = state?.fromThreadId;
   const fromWorkspaceId = state?.fromWorkspaceId;
-  const openDispatcher = useCallback((dispatcherThreadId: string) => {
+  // Every exit to another thread marks itself intentional as it goes, and
+  // asks the file panel about unsaved drafts first (`leaveToThread`).
+  const goToThread = useCallback((targetThreadId: string, navState: LocationState) => {
     intentionalExitRef.current = true;
-    navigate(`/chat/t/${dispatcherThreadId}`, {
-      state: dispatcherThreadId === fromThreadId && fromWorkspaceId ? { workspaceId: fromWorkspaceId } : {},
-    });
-  }, [navigate, fromThreadId, fromWorkspaceId]);
+    navigate(`/chat/t/${targetThreadId}`, { state: navState });
+  }, [navigate]);
+  const leaveToThread = useCallback((targetThreadId: string, navState: LocationState) => {
+    leaveFiles(() => goToThread(targetThreadId, navState));
+  }, [leaveFiles, goToThread]);
+  const openDispatcher = useCallback((dispatcherThreadId: string) => {
+    leaveToThread(
+      dispatcherThreadId,
+      dispatcherThreadId === fromThreadId && fromWorkspaceId ? { workspaceId: fromWorkspaceId } : {},
+    );
+  }, [leaveToThread, fromThreadId, fromWorkspaceId]);
+
+  // "Fork from here" and "Edit in new chat": a copy of this thread up to a
+  // turn, opened as a new chat while this view is still the one in front. A
+  // view kept mounted after the user moved on leaves the fork in the list.
+  // The file panel is asked before the copy is made, so declining leaves no
+  // fork behind, and asked again on the way out unless the user already
+  // agreed to discard: a draft typed while the copy ran is asked about too.
+  // A copy that waits on its dialog runs without the button's pending state,
+  // which ends when the dialog opens.
+  const forkDiscardAgreedRef = useRef(false);
+  const openFork = useCallback((forkThreadId: string, navState: LocationState) => {
+    if (!isActiveRef.current) return;
+    if (forkDiscardAgreedRef.current) goToThread(forkThreadId, navState);
+    else leaveToThread(forkThreadId, navState);
+  }, [goToThread, leaveToThread]);
+  const forkFromTurn = useForkThread({ threadId: currentThreadId, open: openFork });
+  const handleForkFromTurn = useCallback(
+    (turnIndex: number, cut: ThreadForkCut) => new Promise<void>((resolve) => {
+      // The guard runs this at once when nothing was unsaved, and later only
+      // once the user agreed in its dialog.
+      let inline = true;
+      let went = false;
+      leaveFiles(() => {
+        went = true;
+        forkDiscardAgreedRef.current = !inline;
+        void forkFromTurn(turnIndex, cut).finally(resolve);
+      });
+      inline = false;
+      if (!went) resolve();
+    }),
+    [leaveFiles, forkFromTurn],
+  );
 
   // The file cards' Publish, one dialog for the chat.
   const { onPublishFile, dialog: publishDialog } = usePublishFile(workspaceId || null);
@@ -1408,6 +1472,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     onEditMessage: stableEditMessage,
     onRegenerate: stableRegenerate,
     onRetry: stableRetry,
+    onForkFromTurn: handleForkFromTurn,
     editDrafts,
     onSendMessage: handleSendMessage,
     chatInputRef,
@@ -1415,13 +1480,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     // DALTON-HOOK(colleague-dispatch): also withhold mutation/interactive callbacks on foreign-owned threads
     readOnly: isThreadReadOnly,
   });
-
-  // The dispatcher's deep-link context for PTC-agent proposal cards. Memoized:
-  // a fresh object per render would defeat the bubble memo in Home.
-  const dispatcherContext = useMemo(
-    () => (isHome && currentThreadId ? { threadId: currentThreadId, workspaceId } : null),
-    [isHome, currentThreadId, workspaceId],
-  );
 
 
   // Open a file in the right panel from chat tool calls
@@ -1675,6 +1733,39 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     return () => ro.disconnect();
   }, []);
 
+  // The minimap's turn rail: desktop only, on the main thread, with no panel
+  // beside the chat. The transcript keeps its lines clear of it.
+  const minimapShown = isActive && !isMobile && !rightPanelType && activeAgentId === 'main';
+
+  // About the thread and its computer rather than the next send, so they sit
+  // under the last reply and stay there when the reader scrolls up, instead of
+  // floating over the history with the composer. At a file's foot, where the
+  // transcript is out of view, they come along above the composer. Keyed, so
+  // the transcript can close a row that a condition here takes away.
+  const threadNotices: ThreadNotice[] = [];
+  // A notice is not about the running turn, so it need not wait for it to end.
+  if (messageError && (!isLoading || (typeof messageError === 'object' && messageError.kind === 'notice'))) {
+    threadNotices.push({
+      key: 'error',
+      node: (
+        <ErrorBanner
+          error={messageError}
+          reportThreadId={currentThreadId && currentThreadId !== '__default__' ? currentThreadId : undefined}
+        />
+      ),
+    });
+  }
+  if (isHome) threadNotices.push({ key: 'home', node: <HomePlacementNotice /> });
+  if (workspaceRecord?.computer_id && capabilities.restoreOffer) {
+    threadNotices.push({
+      key: 'restore',
+      node: <ChatRestoreOffer workspaceId={workspaceId} computerId={workspaceRecord.computer_id} listed={!filesLoading} />,
+    });
+  }
+  if (workspaceRecord?.computer_id) {
+    threadNotices.push({ key: 'disk', node: <ChatDiskWarning computerId={workspaceRecord.computer_id} /> });
+  }
+
   // Early return if workspaceId or threadId is missing
   if (!workspaceId || !threadId) {
     return (
@@ -1688,6 +1779,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
   return (
     <ChartComposerContext value={panelChart.composer}>
+    <ThreadStatusContext value={threadStatus}>
+    {/* The tickers the tray follows, priced live for the tray and the panel. */}
+    <ThreadQuotesProvider contents={trayContents} active={isActive}>
     <WorkspaceProvider workspaceId={workspaceId} downloadFile={null} folders={chatFolders}>
     {/* A link in the transcript that changes the route unmounts the file
         panel beside it, so it leaves through the panel's guard like the
@@ -1782,6 +1876,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             {/* DALTON-HOOK(workspace-sharing-settings): display colleague access banner in top bar */}
             {teamReadOnly.isColleague && (
               <TeamReadOnlyBanner ownerName={teamReadOnly.ownerName} access={teamReadOnly.access} compact />
+            )}
+            {activeAgentId === 'main' && (
+              <ForkedFromLink threadId={currentThreadId} onOpen={leaveToThread} />
             )}
             {isLoadingHistory ? (
               <span className="text-xs whitespace-nowrap" style={{ color: 'var(--color-text-tertiary)' }}>
@@ -1905,7 +2002,17 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                     <div className={`${isMobile ? 'px-3 pt-3' : 'px-6 pt-4'} ${TRANSCRIPT_BOTTOM_PAD} flex justify-center`}>
                       {/* clip, not hidden: hidden makes overflow-y auto, and a sent bubble's
                           rise would overflow this column and flash a scrollbar. */}
-                      <div data-transcript-content="" className="w-full max-w-3xl overflow-x-clip">
+                      {/* Beside the minimap the column keeps 48px off each
+                          edge, the rail's 12px inset and 32px width and a
+                          4px gap, so no line runs under its ticks; kept even
+                          on both sides, it stays centred over the composer.
+                          Only a column narrow enough to reach the rail
+                          gives anything up. */}
+                      <div
+                        data-transcript-content=""
+                        className="w-full max-w-3xl overflow-x-clip"
+                        style={minimapShown ? BESIDE_MINIMAP : undefined}
+                      >
                         <OlderHistoryRow
                           getRoot={getMainScrollRoot}
                           status={olderHistory.status}
@@ -1920,6 +2027,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                             <LiveMessageList
                               store={liveMessages}
                               isLoading={isLoading}
+                              plans={plansUnderMessages}
                               isLoadingHistory={isLoadingHistory}
                               starting={awaitingKickoff}
                               feedbackByTurn={feedbackByTurn}
@@ -1943,6 +2051,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                           queuedSend={queuedSend}
                           threadId={feedThreadId}
                           active={isActive}
+                          notices={composerDock.docked ? [] : threadNotices}
+                          noticesDocked={composerDock.docked}
                         />
                         {/* Under a finished reply (hosted only, in one thread, on screen). */}
                         {currentThreadId && currentThreadId !== '__default__' && (
@@ -2040,7 +2150,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                 </div>
               )}
               {/* Minimap TOC — desktop only, when no right panel open */}
-              {isActive && !isMobile && !rightPanelType && activeAgentId === 'main' && (
+              {minimapShown && (
                 <ChatMinimap
                   store={liveMessages}
                   scrollAreaRef={scrollAreaRef}
@@ -2082,8 +2192,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                   reads it. */}
               {/* The stack moves to the foot of a file tab while the chat is
                   out of view (chatView/useComposerDock), as the same elements. */}
-              {/* The rows here that draw a surface (the error, the restore
-                  offer, the disk warning) take the composer's corner, 16 unless
+              {/* The rows here that draw a surface (the thread's notices, at a
+                  file's foot) take the composer's corner, 16 unless
                   the card style says otherwise (--cs-composer-*,
                   styles/cardStyle.css), and set their text in where Soft's
                   rounder corner needs it. The same rows elsewhere keep their own. */}
@@ -2107,49 +2217,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         The thread's status lines are under the last reply
                         instead (data-transcript-status), and what it waits on
                         is chips in the tray. */}
-                    {trayContents && (
-                      <ComposerTray
-                        contents={trayContents}
-                        phase={trayPhase}
-                        trayRef={trayRef}
-                        dockRef={trayDockRef}
-                        from={dispatcherContext}
-                        onOpenTask={openTaskFromTray}
-                        onOpenWatch={handleOpenStatusFromChat}
-                        onOpenCommand={handleToolCallDetailClick}
-                        threadId={panelThreadId ?? null}
-                      />
-                    )}
-                    {/* The notices, in one row so the tray can tell one holds its place. */}
-                    <div ref={attachNotices} hidden={!noticeShown} className="sibling-space-y-3">
-                      {/* A notice is not about the running turn, so it need not wait for it to end. */}
-                      {messageError && (!isLoading || (typeof messageError === 'object' && messageError.kind === 'notice')) && (
-                        <ErrorBanner
-                          error={messageError}
-                          reportThreadId={currentThreadId && currentThreadId !== '__default__' ? currentThreadId : undefined}
-                        />
-                      )}
-                      {isHome && <HomePlacementNotice />}
-                      {workspaceRecord?.computer_id && capabilities.restoreOffer && (
-                        <ChatRestoreOffer
-                          workspaceId={workspaceId}
-                          computerId={workspaceRecord.computer_id}
-                          listed={!filesLoading}
-                        />
-                      )}
-                      {workspaceRecord?.computer_id && (
-                        <ChatDiskWarning computerId={workspaceRecord.computer_id} />
-                      )}
-                      <FallbackSuggestionPill
-                        fallbackSuggestion={fallbackSuggestion}
-                        isLoading={isLoading}
-                        composerModel={threadModel.model}
-                        onSwitchModel={handleSwitchModel}
-                        onDismiss={clearFallbackSuggestion}
-                      />
-                      <ThreadOffers model={threadModel} subagents={threadSubagents} summary={summaryHint} />
-                      <ClaudeCodePlanRow workspaceId={workspaceId} chiefOfStaff={isHome} model={threadModel.model} />
-                    </div>
+                    {tray.above}
+                    {/* Each a row of the stack; one that renders nothing leaves
+                        no element, so it takes no gap. */}
+                    {composerDock.docked && threadNotices.map(({ key, node }) => <React.Fragment key={key}>{node}</React.Fragment>)}
                     <SelectionChips chips={panelChart.chips} />
                     {/* At a file's foot the transcript is out of view, so the
                         turn's progress comes along with the composer. */}
@@ -2164,10 +2235,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       />
                     )}
                     <div data-handoff="composer">
-                      <TodoDrawer
-                        todoData={cards['todo-list-card']?.todoData ?? null}
-                        historyLoading={isLoadingHistory}
-                      />
                       <ChatInput
                         ref={chatInputRef}
                         // DALTON-HOOK(composer-drafts): persist draft per thread or per workspace new chat
@@ -2183,6 +2250,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         isCompacting={!!isCompacting}
                         files={mentionFiles}
                         tokenUsage={tokenUsage}
+                        tokenUsagePending={isLoadingHistory}
                         threadId={panelThreadId}
                         onAction={handleAction}
                         model={threadModel.model}
@@ -2197,13 +2265,11 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         onPickFastMode={threadTuning.setFastMode}
                         selectedWorkspaceId={workspaceId}
                         inHome={isHome}
+                        // DALTON-HOOK(chat-attachment-count): include panel chart captures in composer attachment cap
                         externalAttachmentCount={panelChartImageCount}
-                        toolbarStatus={(privacyChip || trayContents) && (
-                          <>
-                            {privacyChip}
-                            {trayContents && <TrayDock ref={trayDockRef} phase={trayPhase} contents={trayContents} onOpen={peekTray} />}
-                          </>
-                        )}
+                        header={tray.strip}
+                        toolbarStatus={(privacyChip || tray.dock) && <>{privacyChip}{tray.dock}</>}
+                        notices={composerNotices}
                       />
                     </div>
                     {/* Last in the stack: the parent's sibling gap gives every
@@ -2302,6 +2368,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                 <FilePanel
                   workspaceId={panelWorkspaceId}
                   threadId={panelThreadId}
+                  chatKey={panelChatKey}
                   isActive={isActive}
                   onClose={() => { setRightPanelType(null); popPanelHistory(); }}
                   onLeaveGuardChange={handleFilesLeaveGuardChange}
@@ -2313,7 +2380,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                   onOpenInMarketView={handleOpenInMarketView}
                   onOpenSubagentTask={openSubagentTaskFromPanel}
                   transcript={transcript}
-                  marketWatch={marketWatch}
                   onOpenFile={handleOpenFileFromChat}
                   getRecentWritePaths={getRecentWritePaths}
                   files={workspaceFiles}
@@ -2377,6 +2443,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                     <FilePanel
                       workspaceId={panelWorkspaceId}
                       threadId={panelThreadId}
+                      chatKey={panelChatKey}
                       isActive={isActive}
                       onClose={() => { setRightPanelType(null); popPanelHistory(); }}
                       expanded={panelExpanded}
@@ -2391,7 +2458,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       onOpenInMarketView={handleOpenInMarketView}
                       onOpenSubagentTask={openSubagentTaskFromPanel}
                       transcript={transcript}
-                      marketWatch={marketWatch}
                       onOpenFile={handleOpenFileFromChat}
                       getRecentWritePaths={getRecentWritePaths}
                       files={workspaceFiles}
@@ -2430,6 +2496,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     </LinkActionsContext>
     </RouteLeaveGuardContext>
     </WorkspaceProvider>
+    </ThreadQuotesProvider>
+    </ThreadStatusContext>
     </ChartComposerContext>
   );
 }

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useEffectEvent, useId, useMemo, useRef, useState, Suspense } from 'react';
-import { BookMarked, CandlestickChart, FolderTree, Globe, LayoutDashboard, ScrollText, Upload } from 'lucide-react';
+import { Activity, BookMarked, CandlestickChart, FolderTree, Globe, LayoutDashboard, ScrollText, Upload } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
   memoMimeForName,
@@ -77,8 +77,7 @@ import { useCommentUi } from './viewers/html/comments/useCommentUi';
 import { ActiveTabBody } from './filePanel/ActiveTabBody';
 import type { NewTabMenu, PanelLauncher } from './filePanel/panelLaunchers';
 import { useWatchTab } from './filePanel/useWatchTab';
-import type { MarketWatchState } from '../session/marketWatchEvents';
-import { useThreadWakeups } from '../hooks/useWakeups';
+import { useThreadStatus } from './chatView/threadStatus';
 import type { FilesAway } from '../hooks/useWorkspaceFiles';
 import { useComputerAway } from './filePanel/useComputerAway';
 import { RouteLeaveGuardContext, type RouteLeaveGuard } from '../contexts/RouteLeaveGuardContext';
@@ -110,8 +109,6 @@ interface FilePanelProps {
   onTargetHandled?: (seq?: number) => void;
   onTargetMemoryHandled?: (seq?: number) => void;
   onTargetMemoHandled?: (seq?: number) => void;
-  /** The live market watch, which the Status tab follows. */
-  marketWatch?: MarketWatchState | null;
   /** Leaves the panel for the full MarketView page on this symbol. */
   onOpenInMarketView?: ((spec: ChartTabSpec) => void) | null;
   /** Leaves for a subagent's own transcript, from a tool tab showing its task. */
@@ -148,9 +145,13 @@ interface FilePanelProps {
   canDownload?: boolean;
   /** Lock to one file: no tree. */
   singleFileMode?: boolean;
-  /** False keeps the strip in memory only: a panel browsing beside a gallery
-   *  must not write over the strip the workspace's conversations seed from. */
+  /** False keeps the strip in memory only, for the life of this mount: a panel
+   *  browsing beside a gallery is not a conversation's strip. */
   persistTabs?: boolean;
+  /** The chat this panel belongs to, stable for that chat's life. Before its
+   *  first message the strip is held under it, so closing the panel or a
+   *  layout change that remounts it does not lose what the chat opened. */
+  chatKey?: string;
   /** False for a panel mounted off screen (a recently visited thread the chat
    *  keeps warm): it holds its strip but does not save it, since the saved
    *  strip is the one the reader is looking at. */
@@ -191,7 +192,6 @@ function FilePanel({
   onTargetHandled,
   onTargetMemoryHandled,
   onTargetMemoHandled,
-  marketWatch = null,
   onOpenInMarketView = null,
   onOpenSubagentTask = null,
   transcript = null,
@@ -210,6 +210,7 @@ function FilePanel({
   canDownload = true,
   singleFileMode = false,
   persistTabs = true,
+  chatKey,
   isActive = true,
   apiAdapter = null,
   onAddContext = null,
@@ -291,7 +292,7 @@ function FilePanel({
   // this workspace's: pointing the panel at another one starts that
   // workspace's strip rather than leaving these tabs under the new id.
   const persistStrip = !singleFileMode && persistTabs;
-  const tabs = useFileTabs(workspaceId, threadId, { persist: persistStrip, active: isActive });
+  const tabs = useFileTabs(workspaceId, threadId, { persist: persistStrip, active: isActive, chat: chatKey });
   const activeTab = tabs.activeTab;
   // The tree lists the workspace's files, so it sits beside a file or the
   // empty tab and nothing else: a chart, a tool result or an app is its own
@@ -304,10 +305,16 @@ function FilePanel({
   const { data: computer } = useComputer(wsData?.computer_id ?? null);
   const sharedWorkspace = useSharedEntry(workspaceId) != null;
   const browserHere = useBrowserHere(computer, sharedWorkspace);
-  useBrowserView(browserView, workspaceId, wsData?.computer_id ?? null, isActive && activeTab.kind === 'browser' && browserHere);
+  useBrowserView(
+    browserView,
+    workspaceId,
+    wsData?.computer_id ?? null,
+    computer,
+    isActive && activeTab.kind === 'browser' && browserHere,
+  );
   // A Browser tab kept from a computer that had one, or from before the reader
   // turned the browser off, closes once it is known there is none here.
-  const browserGone = useBrowserGone(computer);
+  const browserGone = useBrowserGone();
   const browserTabId = tabs.tabs.find((t) => t.kind === 'browser')?.id ?? null;
   const closeBrowserTab = tabs.closeTab;
   useEffect(() => {
@@ -584,8 +591,10 @@ function FilePanel({
   const [memoSyncing, setMemoSyncing] = useState(false);
   const [memoDiffOpen, setMemoDiffOpen] = useState(false);
 
-  const wakeups = useThreadWakeups(threadId, isActive);
-  useWatchTab(tabs, marketWatch, wakeups);
+  // The chat's status, which the Status tab follows: a market watch, or a
+  // pending wakeup, which fires server-side between turns.
+  const trayContents = useThreadStatus()?.contents;
+  useWatchTab(tabs, !!(trayContents?.watch || trayContents?.wakeups));
 
   // Stable: `retryOpen` is new with every file list and every change mark, and
   // the viewer this reaches should render only for its own file.
@@ -700,33 +709,36 @@ function FilePanel({
 
   // Reads the strip as it is when the close runs, which the discard question
   // can put off while tabs come and go underneath it.
-  const closeTabNow = useStableHandler((id: string) => {
-    const tab = tabs.tabs.find((x) => x.id === id);
-    if (!tab) return;
-    forgetTab(id);
-    if (tab.kind === 'file') {
-      // The marker is what forces a re-read on reopen; the cached bytes must
-      // not outlive it, or a rewrite lands inside the body's fresh window.
-      if (hasChanged(tab.path)) cache.invalidate(tab.path);
-      forgetChanged(tab.path);
+  const closeTabsNow = useStableHandler((ids: readonly string[]) => {
+    const closing = tabs.tabs.filter((x) => ids.includes(x.id));
+    if (!closing.length) return;
+    for (const tab of closing) {
+      forgetTab(tab.id);
+      if (tab.kind === 'file') {
+        // The marker is what forces a re-read on reopen; the cached bytes must
+        // not outlive it, or a rewrite lands inside the body's fresh window.
+        if (hasChanged(tab.path)) cache.invalidate(tab.path);
+        forgetChanged(tab.path);
+      }
     }
     // The last tab takes the panel with it, and the panel reopens on the
     // empty tab rather than on the one just closed. A file still being looked
     // up has no tab yet, so the panel stays for it to land in. Anything else
     // still pending is the closed tab's own, and is dropped.
-    if (tabs.tabs.length <= 1 && !isLookingUp()) {
+    if (closing.length >= tabs.tabs.length && !isLookingUp()) {
       cancelPending();
       tabs.closeOut();
       onClose();
       return;
     }
-    tabs.closeTab(id);
+    tabs.closeTabs(closing.map((x) => x.id));
   });
 
-  const closeTab = useCallback((id: string) => {
-    if (tabHasUnsavedChanges(id)) askDiscard(() => closeTabNow(id));
-    else closeTabNow(id);
-  }, [tabHasUnsavedChanges, askDiscard, closeTabNow]);
+  // One question for the lot, the same one a single dirty tab asks.
+  const closeTabs = useCallback((ids: readonly string[]) => {
+    if (ids.some(tabHasUnsavedChanges)) askDiscard(() => closeTabsNow(ids));
+    else closeTabsNow(ids);
+  }, [tabHasUnsavedChanges, askDiscard, closeTabsNow]);
 
   // A step replaces what the tab shows, so it asks what closing the tab would.
   // Read at the moment it runs: the question can put it off while the strip
@@ -841,11 +853,20 @@ function FilePanel({
     ...liveViews,
   ];
 
+  // The thread's Status is one tab, so picking it again brings that tab
+  // forward. A panel with no thread (the gallery's) has no Status to show.
+  const openStatus = threadId ? () => { cancelPending(); tabs.openStatus(); } : null;
+
   // A right click on the new tab button picks what the tab opens on: the
-  // files, as a plain click gives, a live view, or a running app's tab. Each
-  // one opens beside the tab in front, or on the tab it already has.
+  // files, as a plain click gives, a live view, the thread's Status, or a
+  // running app's tab. Each one opens beside the tab in front, or on the tab
+  // it already has.
   const newTabMenu: NewTabMenu = {
-    kinds: [{ key: 'files', label: t('filePanel.files'), icon: FolderTree, open: newTab }, ...liveViews],
+    kinds: [
+      { key: 'files', label: t('filePanel.files'), icon: FolderTree, open: newTab },
+      ...liveViews,
+      ...(openStatus ? [{ key: 'status', label: t('filePanel.tabs.status'), icon: Activity, open: openStatus }] : []),
+    ],
     apps: previews.previews.map((app) => ({
       key: `app:${app.port}`, label: app.title || `:${app.port}`, icon: LayoutDashboard, open: () => openPreviewTab(app.port),
     })),
@@ -867,7 +888,7 @@ function FilePanel({
         tabs={tabs.tabs}
         activeId={tabs.activeId}
         onActivate={activateTab}
-        onClose={closeTab}
+        onClose={closeTabs}
         onPin={tabs.pinTab}
         transcript={transcript}
         onNewTab={singleFileMode || readOnly ? null : newTab}
@@ -1058,9 +1079,6 @@ function FilePanel({
                 target={target}
                 onTargetMemoryHandled={onTargetMemoryHandled}
                 onTargetMemoHandled={onTargetMemoHandled}
-                marketWatch={marketWatch}
-                threadId={threadId}
-                isActive={isActive}
                 onOpenFile={onOpenFile}
                 onOpenSubagentTask={onOpenSubagentTask}
                 transcript={transcript}

@@ -34,9 +34,11 @@ from src.server.contracts.turn_kinds import (
     ANNOUNCED_KEYS,
     NOTIFICATION_QUERY_TYPES,
     WAKE_QUERY_TYPE,
+    posted_by_server,
 )
 from src.server.database import conversation as qr_db
 from src.server.database.conversation.threads_write import remember_thread_llm_model
+from src.server.services.forks.model import ForkLineage
 from src.server.services.llm.thread_model import NamedModel
 from src.server.services.runs.pending_input import (
     PENDING_INPUT_KEY,
@@ -426,6 +428,11 @@ class PriorThread(NamedTuple):
     last_run_settled_at: Optional[datetime] = None
     # DALTON-HOOK(agent-switch-model): pending mid-turn model switch marker for pre-run fallback handoff
     pending_model_handoff: Optional[dict[str, Any]] = None
+    # Where a fork came from, for its first turn's carry (``forks.carry``).
+    fork: Optional[ForkLineage] = None
+    # The thread's title, which a fork's first message replaces while it is
+    # still the one the fork was made with.
+    title: Optional[str] = None
 
 
 #: Attempts a notification's surface passes over. An automation's run states
@@ -506,6 +513,8 @@ async def _read_prior_thread(
         ),
         last_run_settled_at=run_settled_at(clock),
         pending_model_handoff=extract_pending_model_handoff(row),
+        fork=ForkLineage.of(row.get("metadata")),
+        title=row.get("title"),
     )
 
 
@@ -726,16 +735,8 @@ def build_turn_context(
 
 
 def is_notification_turn(request: ChatRequest) -> bool:
-    """Whether this server posted the turn itself, to report finished background
-    work, a market target's notice or a wakeup that fired.
-
-    A report-back arrives as a system query with no surface of its own, and a
-    wake as a ``market_target`` or ``wakeup`` query. Nobody sent any of them,
-    so it speaks where the thread's last turn did rather than naming a surface.
-    ``query_type`` is stripped from every request that is not the server's own
-    (``threads/messaging.py``), so a client cannot claim one.
-    """
-    return request.query_type in NOTIFICATION_QUERY_TYPES and not request.platform
+    """Whether this server posted the turn itself (``posted_by_server``)."""
+    return posted_by_server(request.query_type, request.platform)
 
 
 def is_unwatched_turn(request: ChatRequest) -> bool:

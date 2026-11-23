@@ -13,6 +13,7 @@ from typing import Any
 
 from src.server.database.conversation.replay_rows import with_replay_facts
 from src.server.database.replay_facts import archived_stream
+from src.server.services.history.replay.legacy import current_row
 from src.server.services.history.replay import items
 from src.server.services.history.replay.lines import Line, line_of
 
@@ -92,7 +93,16 @@ def _stub_items(
     response_id = str(response.get("conversation_response_id")) if response else None
     # A turn still going shows what its run streams; an archive on its row is
     # an earlier attempt's.
-    archived = [] if open_run else archived_stream(response) or []
+    archived = (
+        []
+        if open_run
+        else [
+            row
+            for stored in archived_stream(response) or []
+            if (row := current_row(stored))
+        ]
+    )
+    # DALTON-HOOK(chat-large-upload): include permanently failed steers on stub turns
     failed_items = [
         items._failed_steer_item(thread_id, f) for f in (failed_steers or ())
     ]
