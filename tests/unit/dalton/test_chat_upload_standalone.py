@@ -1031,6 +1031,8 @@ class TestSandboxNetworkAndInitScript:
             ("inst-comment-oss", "DALTON_AUTH_MODE='oss' # trial\n", None),
             ("inst-bare-comment-oss", "DALTON_AUTH_MODE=oss # trial\n", None),
             ("inst-inner-space-oss", "DALTON_AUTH_MODE=' oss '\n", None),
+            ("inst-glued-comment-oss", "DALTON_AUTH_MODE='oss'# trial\n", None),
+            ("inst-expansion", "DALTON_AUTH_MODE=${TRIAL_MODE:-oss}\n", None),
         ):
             inst_case, init_case = self._stage_init_install(tmp_path, name)
             (inst_case / ".env").write_text(env_text)

@@ -296,9 +296,11 @@ validate_domain_for_auth() {
   local mode
   for mode in "$file_mode" "${DALTON_AUTH_MODE-__unset__}"; do
     [[ "$mode" == "__unset__" ]] && continue
-    # Read the value the way Compose does: drop a trailing comment, then quotes.
-    mode="$(printf '%s' "$mode" | sed -E "s/[[:space:]]+#.*$//; s/^[[:space:]]*[\"']?//; s/[\"']?[[:space:]]*$//" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-    if [[ -z "$mode" || "$mode" == "oss" ]]; then
+    # Accept only a value that is plainly "local" or "supabase". Anything else,
+    # including oss, an empty value, comments, quotes in odd places or variable
+    # expansions, is refused rather than second-guessing how Compose reads it.
+    mode="$(printf '%s' "$mode" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')"
+    if [[ "$mode" != "local" && "$mode" != "supabase" ]]; then
       err "当前核心版是免密单机试用，请先用 localhost 安装；正式对外部署等本地登录（Batch 4b）上线后再配置域名。"
       exit 1
     fi
