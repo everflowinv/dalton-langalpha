@@ -15,9 +15,10 @@ import logoOnLight from '../../assets/img/logo-dark.svg';
 
 interface ShareUnavailableProps {
   /** `unavailable` is the uniform 404; `membersOnly` a signed-out visitor of a
-   *  link that opens to members of an organization; `failed` is any other
-   *  error, with a retry. */
-  variant?: 'unavailable' | 'membersOnly' | 'failed';
+   *  link that opens to members of an organization; `paused` a legacy link whose
+   *  workspace auto-publish is paused; `failed` is any other error, with a retry. */
+  // DALTON-HOOK(colleague-access): support paused 503 copy distinct from generic load failure
+  variant?: 'unavailable' | 'membersOnly' | 'paused' | 'failed';
   onRetry?: () => void;
 }
 
@@ -37,7 +38,7 @@ export default function ShareUnavailable({ variant = 'unavailable', onRetry }: S
   const { isLoggedIn, isInitialized } = useAuth();
   const logo = theme === 'light' ? logoOnLight : logoOnDark;
   // DALTON-HOOK(dalton-auth): offer sign-in when Dalton auth is enabled
-  const offerSignIn = variant !== 'failed' && (isPlatformMode || isDaltonAuth) && isInitialized && !isLoggedIn;
+  const offerSignIn = variant !== 'failed' && variant !== 'paused' && (isPlatformMode || isDaltonAuth) && isInitialized && !isLoggedIn;
 
   // The whole link comes back, so an app opened at a page reopens there.
   const signIn = () => {
@@ -53,16 +54,18 @@ export default function ShareUnavailable({ variant = 'unavailable', onRetry }: S
       {BRAND_MARK === 'everflow' ? <BrandMark className="h-8 w-8 opacity-60" /> : <img src={logo} alt="LangAlpha" className="h-8 opacity-60" />} {/* DALTON-HOOK(brand-name) */}
       <h1 className="text-lg font-semibold title-font" style={{ color: 'var(--color-text-primary)' }}>
         {variant === 'failed' ? t('shareLink.loadFailedTitle')
-          : variant === 'membersOnly' ? t('shareLink.membersOnlyTitle') : t('shareLink.unavailableTitle')}
+          : variant === 'paused' ? t('shareLink.pausedTitle')
+            : variant === 'membersOnly' ? t('shareLink.membersOnlyTitle') : t('shareLink.unavailableTitle')}
       </h1>
       <p className="text-sm max-w-sm" style={{ color: 'var(--color-text-secondary)' }}>
         {variant === 'failed'
           ? t('shareLink.loadFailedBody')
-          : variant === 'membersOnly' ? t('shareLink.membersOnlyBody')
-            : offerSignIn ? t('shareLink.unavailableSignInBody') : t('shareLink.unavailableBody')}
+          : variant === 'paused' ? t('shareLink.pausedBody')
+            : variant === 'membersOnly' ? t('shareLink.membersOnlyBody')
+              : offerSignIn ? t('shareLink.unavailableSignInBody') : t('shareLink.unavailableBody')}
       </p>
       <div className="flex items-center gap-3 pt-1">
-        {variant === 'failed' && onRetry && (
+        {(variant === 'failed' || variant === 'paused') && onRetry && (
           <Button type="button" size="sm" onClick={onRetry}>{t('shareLink.retry')}</Button>
         )}
         {offerSignIn && (

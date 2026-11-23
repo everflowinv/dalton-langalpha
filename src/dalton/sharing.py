@@ -34,8 +34,22 @@ from src.dalton.settings import (
     get_dalton_allowed_emails,
     get_dalton_settings,
     is_colleague_dispatch_enabled,
-    is_dalton_supabase_auth_enabled,
+    is_dalton_sharing_auth_enabled,
+    is_dalton_supabase_auth_enabled as _default_is_dalton_supabase_auth_enabled,
 )
+
+is_dalton_supabase_auth_enabled = _default_is_dalton_supabase_auth_enabled
+
+
+def _sharing_auth_enabled() -> bool:
+    """Colleague workspace sharing gate: requires CapabilityId.COLLEAGUE_SHARING + sharing auth."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.COLLEAGUE_SHARING):
+        return False
+    if is_dalton_supabase_auth_enabled is not _default_is_dalton_supabase_auth_enabled:
+        return bool(is_dalton_supabase_auth_enabled())
+    return is_dalton_sharing_auth_enabled()
 from src.server.database import conversation as conv_db
 from src.server.database import user as user_db
 from src.server.database import workspace as ws_db
@@ -886,7 +900,7 @@ async def require_workspace_access(
     if not ws:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    if not is_dalton_supabase_auth_enabled():
+    if not _sharing_auth_enabled():
         auth_api.require_workspace_owner(ws, user_id=uid)
         ws["_caller_web_access"] = "owner"
         ws["_caller_cos_access"] = "owner"
@@ -1028,7 +1042,7 @@ async def require_thread_access(
         raise ValueError(f"Unsupported need: {need!r}")
     cleaned_channel = str(channel or "web").strip().lower()
 
-    if not is_dalton_supabase_auth_enabled():
+    if not _sharing_auth_enabled():
         if owner_id is not None:
             if owner_id != uid:
                 raise HTTPException(status_code=403, detail="Forbidden")
@@ -1657,7 +1671,7 @@ async def is_wakeup_notice_revoked(
     conn: Any = None,
 ) -> bool:
     """Return True when ``wakeup_id`` belongs to a colleague thread whose origin channel write access has been revoked."""
-    if not is_dalton_supabase_auth_enabled():
+    if not _sharing_auth_enabled():
         return False
     tid = str(thread_id or "").strip()
     wid = str(wakeup_id or "").strip()
@@ -2131,7 +2145,7 @@ resolve_verified_tail_turn = verify_server_tail_turn
 # DALTON-HOOK(coverage-units): accept optional snapshot connection for REPEATABLE READ readers.
 async def list_team_workspaces(current_user_id: str, *, conn: Any = None) -> list[dict[str, Any]]:
     """Return colleagues' visible web workspaces grouped by user, excluding caller's own, Home, and hidden workspaces."""
-    if not is_dalton_supabase_auth_enabled():
+    if not _sharing_auth_enabled():
         return []
 
     uid = await require_team_reader(current_user_id)
@@ -2318,7 +2332,7 @@ async def list_colleague_cos_workspaces(
     current_user_id: str,
 ) -> list[dict[str, Any]]:
     """Return colleagues' Chief of Staff visible workspaces (``cos_access`` in ``('ro', 'rw')``)."""
-    if not is_dalton_supabase_auth_enabled():
+    if not _sharing_auth_enabled():
         return []
 
     try:

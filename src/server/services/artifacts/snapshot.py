@@ -93,6 +93,11 @@ class SnapshotUnavailable(Exception):
     """The files cannot be read now."""
 
 
+# DALTON-HOOK(colleague-access): distinct unavailable subclass for legacy links when workspace auto-publish is paused
+class SnapshotAutoPublishPaused(SnapshotUnavailable):
+    """Legacy link first snapshot is paused pending workspace owner confirmation."""
+
+
 class LegacyRefused(Exception):
     """A link shared before versions whose files are past the caps: it gets
     no version until the owner publishes."""
@@ -695,6 +700,10 @@ async def publish(
     earlier: tuple[str, ...] = (),
     reviewed_page: str | None = None,
     actor: str | None = None,
+    # DALTON-HOOK(colleague-access): only web owner manual publish clears pause via CAS confirm_pause_token
+    allow_clear_pause: bool = False,
+    confirm_pause_token: str | None = None,
+    clear_pause_out: dict[str, Any] | None = None,
 ) -> artifacts_db.PublishResult:
     """The owner's Publish or Update: share, and cut a version from the files
     the owner reviewed. ``SnapshotRefused('files_changed')`` carries the list
@@ -734,6 +743,27 @@ async def publish(
         # again, which the owner's review does once it hears of the change.
         raise SnapshotRefused("files_changed", files=snapshot.entries) from None
     await _announce(user_id, snapshot, result)
+    # DALTON-HOOK(colleague-access): only explicit web manual publish by workspace owner may CAS-clear pending_outbound_confirm
+    if allow_clear_pause and (actor is None or str(actor) == str(user_id)):
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        if is_dalton_sharing_auth_enabled():
+            from src.dalton.colleague_outbound_guard import clear_pending_outbound_confirm
+
+            clear_res = await clear_pending_outbound_confirm(
+                artifact.workspace_id,
+                expected_pause_token=confirm_pause_token,
+            )
+            if (
+                clear_pause_out is not None
+                and not clear_res.cleared
+                and clear_res.status != "not_paused"
+            ):
+                clear_pause_out["auto_publish_paused"] = True
+                clear_pause_out["auto_publish_pause_token"] = (
+                    clear_res.current_pause_token
+                )
+                clear_pause_out["auto_publish_pause_notice"] = clear_res.notice
     activity.record(
         actor or user_id, Action.FILE_PUBLISHED, resource=("artifact", artifact.artifact_id),
         workspace_id=artifact.workspace_id,
@@ -841,6 +871,17 @@ async def _read_legacy(artifact: Artifact) -> Artifact:
     workspace = await db_get_workspace(artifact.workspace_id)
     if not workspace:
         raise SnapshotUnavailable("workspace gone")
+    # DALTON-HOOK(colleague-access): block legacy first-open auto-versioning while workspace auto-publish is paused
+    from src.dalton.colleague_outbound_guard import (
+        WorkspaceAutoPublishPaused,
+        is_workspace_pending_outbound_confirm,
+    )
+    from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+    if is_dalton_sharing_auth_enabled() and is_workspace_pending_outbound_confirm(
+        workspace
+    ):
+        raise SnapshotAutoPublishPaused("auto_publish_paused")
     user_id = workspace["user_id"]
     try:
         snapshot = await _capture(
@@ -857,6 +898,8 @@ async def _read_legacy(artifact: Artifact) -> Artifact:
             files=snapshot.files,
             title=snapshot.title,
         )
+    except WorkspaceAutoPublishPaused:
+        raise SnapshotAutoPublishPaused("auto_publish_paused") from None
     except (LeftOutChanged, VersionMoved, SharingChanged):
         # The record moved during the read (a file taken off, a version kept
         # for the owner): the visitor's next view reads it as it is now.
@@ -931,14 +974,51 @@ async def keep_updated_after_turn(*, workspace_id: str, user_id: str) -> None:
         if not kept or workspace.get("status") != "running":
             return
         owner_id = str(workspace["user_id"])
+        # DALTON-HOOK(colleague-access): skip auto keep_updated when workspace has pending_outbound_confirm
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        _sharing_auth_enabled = is_dalton_sharing_auth_enabled()
+        if _sharing_auth_enabled:
+            from src.dalton.colleague_outbound_guard import (
+                is_workspace_pending_outbound_confirm,
+            )
+
+            if is_workspace_pending_outbound_confirm(workspace):
+                logger.info(
+                    "Skipping keep_updated_after_turn for workspace %s: pending_outbound_confirm",
+                    workspace_id,
+                )
+                return
         for artifact in kept:
+            # DALTON-HOOK(colleague-access): re-read workspace pending_outbound_confirm from DB before each artifact publish
+            if _sharing_auth_enabled:
+                from src.dalton.colleague_outbound_guard import (
+                    is_workspace_pending_outbound_confirm,
+                )
+
+                try:
+                    fresh_ws = await db_get_workspace(workspace_id)
+                except Exception:
+                    logger.warning(
+                        "Skipping keep_updated for artifact %s: failed to re-read workspace %s",
+                        artifact.artifact_id,
+                        workspace_id,
+                        exc_info=True,
+                    )
+                    continue
+                if not fresh_ws or is_workspace_pending_outbound_confirm(fresh_ws):
+                    logger.info(
+                        "Skipping keep_updated for artifact %s: pending_outbound_confirm",
+                        artifact.artifact_id,
+                    )
+                    continue
             # DALTON-HOOK(monitors): auto-updating a publicly shared /a/{code}
             # artifact requires the owner to currently be an active admin.
             if artifact.shared and artifact.keep_updated:
                 from src.dalton import access_tiers as _access_tiers
-                from src.dalton.settings import is_dalton_supabase_auth_enabled
+                from src.dalton.settings import is_dalton_multiuser_auth_enabled
 
-                if is_dalton_supabase_auth_enabled():
+                if is_dalton_multiuser_auth_enabled():
                     if await _access_tiers.get_user_tier(owner_id) != "admin":
                         logger.info(
                             "Skipping public keep_updated for artifact %s: owner %s is not admin",
@@ -949,7 +1029,7 @@ async def keep_updated_after_turn(*, workspace_id: str, user_id: str) -> None:
             # One link's failure is its own: a record deleted or refused
             # mid-run must not stop the workspace's other links from updating.
             try:
-                await _keep_one(artifact, owner_id)
+                await _keep_one(artifact, owner_id, check_pending=_sharing_auth_enabled)
             except Exception:
                 logger.warning(
                     "Keeping artifact %s updated failed", artifact.artifact_id, exc_info=True
@@ -1068,9 +1148,11 @@ async def _claim_change_pass(workspace_id: str) -> bool:
         return True
 
 
-async def _keep_one(artifact: Artifact, user_id: str) -> None:
+async def _keep_one(
+    artifact: Artifact, user_id: str, *, check_pending: bool = False
+) -> None:
     try:
-        await _cut_after_turn(artifact, user_id)
+        await _cut_after_turn(artifact, user_id, check_pending=check_pending)
         return
     except VersionMoved:
         # The version that landed during the read may hold files read before
@@ -1080,12 +1162,14 @@ async def _keep_one(artifact: Artifact, user_id: str) -> None:
     if not fresh or not fresh.follows_turns:
         return
     try:
-        await _cut_after_turn(fresh, user_id)
+        await _cut_after_turn(fresh, user_id, check_pending=check_pending)
     except VersionMoved:
         logger.info("Not refreshing artifact %s: VersionMoved", artifact.artifact_id)
 
 
-async def _cut_after_turn(artifact: Artifact, user_id: str) -> None:
+async def _cut_after_turn(
+    artifact: Artifact, user_id: str, *, check_pending: bool = False
+) -> None:
     """One read and cut. ``VersionMoved`` is the caller's to act on."""
     listed = _frozen_list(artifact)
     # A kept record is walked again, since the owner's Dashboard follows the
@@ -1126,6 +1210,31 @@ async def _cut_after_turn(artifact: Artifact, user_id: str) -> None:
             artifact.artifact_id,
         )
         return
+    # DALTON-HOOK(colleague-access): re-read workspace pending_outbound_confirm before blob store + turn_version (which also checks FOR SHARE in-tx)
+    if check_pending:
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        if is_dalton_sharing_auth_enabled():
+            from src.dalton.colleague_outbound_guard import (
+                is_workspace_pending_outbound_confirm,
+            )
+
+            try:
+                latest_ws = await db_get_workspace(artifact.workspace_id)
+            except Exception:
+                logger.warning(
+                    "Not refreshing artifact %s: failed to re-read workspace %s before commit",
+                    artifact.artifact_id,
+                    artifact.workspace_id,
+                    exc_info=True,
+                )
+                return
+            if not latest_ws or is_workspace_pending_outbound_confirm(latest_ws):
+                logger.info(
+                    "Not refreshing artifact %s: pending_outbound_confirm set before commit",
+                    artifact.artifact_id,
+                )
+                return
     # A share or unshare, or a file left out during the read, changes what
     # these bytes may give visitors; the next turn's end looks again.
     try:

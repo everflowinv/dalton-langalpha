@@ -161,10 +161,11 @@ async def _owned_workspace(
         return ws
     # --- DALTON-HOOK(workspace-sharing-settings): begin ---
     # DALTON-HOOK(colleague-dispatch): preserve colleague workspace info on continuation so revoked access is rejected.
+    # DALTON-HOOK(colleague-access): gate colleague workspace resolution on is_dalton_sharing_auth_enabled().
     from fastapi import HTTPException
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.settings import is_dalton_sharing_auth_enabled
 
-    if is_dalton_supabase_auth_enabled():
+    if is_dalton_sharing_auth_enabled():
         from src.dalton.sharing import require_workspace_access
 
         try:

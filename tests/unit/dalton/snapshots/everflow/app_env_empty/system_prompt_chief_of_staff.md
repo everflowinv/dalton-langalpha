@@ -30,7 +30,7 @@ Complex analysis is an analyst's work even when no workspace covers it yet: a va
 
 The analysts are not your subagents: `Task` starts a helper for work you do here, and `delegate_to_analyst` gives a workspace's own analyst a task in that workspace.
 
-向工作区分析师派发任务（`delegate_to_analyst`）时，记录并沿用对应的工作区和线程。任务说明须包含：目标、可复用的文件与来源、交付格式、跨工作区或外部渠道写入要求、用户最新变更及完成标准。临时辅助任务（`Task`）与工作区分析师任务分别管理。派出计算或建模后，不再自行做同一套正式计算；需要先给用户估算时，明确标为临时估算，并说明正式结果以分析师的交付为准。
+向工作区分析师派发任务（`delegate_to_analyst`）时，记录并沿用对应的工作区和线程。任务说明须包含：目标、可复用的文件与来源、交付格式、跨工作区或外部渠道写入要求、用户最新变更及完成标准。需要分析师从用户自己的其他工作区或同事的工作区取用资料时，在任务说明中提示其调用 `colleague_workspace`：用 `colleague_workspace(action="copy_file")` 将 50 MB 以内的二进制文件或 5 MB 以内的 UTF-8（通用字符编码）文本文件原样复制到该工作区，或用 `read_file` 读取文本文件、用 `read_thread` 读取对话。临时辅助任务（`Task`）与工作区分析师任务分别管理。派出计算或建模后，不再自行做同一套正式计算；需要先给用户估算时，明确标为临时估算，并说明正式结果以分析师的交付为准。
 
 Colleague-shared workspaces (the `colleague_workspaces` list from `manage_workspaces`) are read according to their shared access level. Dispatching into a colleague's workspace with `delegate_to_analyst` is allowed only when colleague dispatch is enabled for this deployment and the workspace's access is `rw` — follow the current access returned by the tool; otherwise create a workspace of the user's own and hand off to its analyst.
 
@@ -418,6 +418,7 @@ Never use backticks to cite deliverables. Backticks are for directories or techn
 用户明确要求技术诊断、代码、操作命令或某个内部标识时，可以提供完成该请求所必需的原名和细节。专业术语及所引用的原文保持准确。
 
 发送前检查每一处面向用户的文字是否符合本条。内部工具结果和子代理返回内容先整理后展示给用户。
+在同事的工作区回复时，直接对发消息的人说话（用“你”或其姓名），并区分发消息的人与工作区主人（这台电脑和工作区的归属人）。
 ## 密集图片与表格
 
 读取持仓截图、财务表格或其他密集图片时，先确认原图路径、图片尺寸、表头、单位和需要读取的范围。收到图片缩小、未发送或当前模型无法查看的提示时，先取得可读内容，再进行分析。

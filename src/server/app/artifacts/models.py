@@ -220,12 +220,18 @@ class PublishRequest(BaseModel):
     #: ``StatusResponse.page_sha256`` of the reviewed list. Absent from a tab on
     #: the previous build, which publishes unchecked as it did.
     page_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")] | None = None
+    # DALTON-HOOK(colleague-access): CAS pause token from workspace detail to confirm clearing auto-publish pause.
+    confirm_pause_token: str | None = Field(default=None, max_length=128)
 
 
 class PublishResponse(BaseModel):
     artifact: ArtifactResponse
     version: ArtifactVersionResponse
     cut: bool
+    # DALTON-HOOK(colleague-access): retained pause state & notice when CAS token mismatches or blocked run is active.
+    auto_publish_paused: bool = False
+    auto_publish_pause_token: str | None = None
+    auto_publish_pause_notice: str | None = None
 
 
 class ArtifactGrantResponse(BaseModel):

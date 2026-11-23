@@ -1407,6 +1407,7 @@ def test_chief_of_staff_prompt_non_contradictory() -> None:
         current_time="2026-11-20 12:00 ET",
         subagent_summary="",
         role="chief_of_staff",
+        colleague_sharing_enabled=True,
     )
     assert "only when colleague dispatch is enabled for this deployment and the workspace's access is `rw`" in prompt
     assert "company_workspace_exists" in prompt

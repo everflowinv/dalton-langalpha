@@ -238,7 +238,16 @@ def build_filesystem_backend(
     # before introducing reuse.
     # DALTON-HOOK(colleague-dispatch): computer-mounted store and user-data routes belong to workspace owner
     # DALTON-HOOK(coverage-units): keep caller_user_id so cross-user AutomationsBackend can disable direct file writes
+    # DALTON-HOOK(colleague-access): cross-user turns lock memory, workflows, and all user-data routes read-only
     caller_user_id = user_id
+    is_cross_user = bool(
+        workspace_owner_id
+        and caller_user_id
+        and str(workspace_owner_id) != str(caller_user_id)
+    )
+    cross_user_ro_err = (
+        "Memory and user-owned files are read-only in a colleague's workspace."
+    )
     user_id = workspace_owner_id or user_id
     routes: list[Any] = list(history_routes)
     user_namespace_factory: NamespaceFactory | None = None
@@ -257,6 +266,8 @@ def build_filesystem_backend(
                 namespace_factory=_user_namespace,
                 root_prefix=user_memory,
                 sandbox_backend=backend,
+                read_only=is_cross_user,
+                **({"read_only_error": cross_user_ro_err} if is_cross_user else {}),
                 cache=store_cache,
             )
         )
@@ -273,6 +284,8 @@ def build_filesystem_backend(
                 namespace_factory=_workspace_namespace,
                 root_prefix=workspace_memory,
                 sandbox_backend=backend,
+                read_only=is_cross_user,
+                **({"read_only_error": cross_user_ro_err} if is_cross_user else {}),
                 cache=store_cache,
             )
         )
@@ -317,6 +330,8 @@ def build_filesystem_backend(
                         namespace_factory=_workflow_namespace,
                         root_prefix=workflow_root,
                         sandbox_backend=backend,
+                        read_only=is_cross_user,
+                        **({"read_only_error": cross_user_ro_err} if is_cross_user else {}),
                         cache=store_cache,
                     ),
                     prebuilt_backend=prebuilt_route,
@@ -326,22 +341,13 @@ def build_filesystem_backend(
             routes.append(prebuilt_route)
 
     if gates.user_data:
-        cross_user_automations = bool(
-            workspace_owner_id
-            and caller_user_id
-            and str(workspace_owner_id) != str(caller_user_id)
-        )
         routes.extend(
             route(
                 user_id=user_id,
                 call=call or CallContext(),
                 sandbox_backend=backend,
                 root_prefix=f"{sandbox_root}/{route.directory}/",
-                **(
-                    {"cross_user_read_only": True}
-                    if route is AutomationsBackend and cross_user_automations
-                    else {}
-                ),
+                cross_user_read_only=is_cross_user,
             )
             for route in USER_DATA_ROUTES
         )
@@ -353,6 +359,7 @@ def build_filesystem_backend(
                 call=call or CallContext(),
                 sandbox_backend=backend,
                 root_prefix=f"{sandbox_root}/{ChannelsBackend.directory}/",
+                cross_user_read_only=is_cross_user,
             )
         )
 

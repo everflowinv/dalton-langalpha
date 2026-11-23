@@ -7,6 +7,19 @@ import type { Artifact, ArtifactStatus } from '@/types/api';
 
 const tierState = vi.hoisted(() => ({
   callerTier: 'internal' as 'external' | 'internal' | 'admin',
+  colleagueSharingEnabled: true,
+}));
+
+const workspaceState = vi.hoisted(() => ({
+  data: {
+    status: 'running',
+    name: 'ws-1',
+    auto_publish_paused: false,
+    auto_publish_pause_token: null as string | null,
+  },
+  dataUpdatedAt: 1000,
+  refetch: vi.fn(),
+  requestedIds: [] as Array<string | null | undefined>,
 }));
 
 vi.mock('@/config/daltonAuth', () => ({
@@ -23,6 +36,7 @@ vi.mock('@/hooks/useTeamCredentials', () => ({
     callerTier: tierState.callerTier,
     callerTierPending: false,
     callerTierError: false,
+    colleagueSharingEnabled: tierState.colleagueSharingEnabled,
   }),
 }));
 
@@ -60,7 +74,10 @@ vi.mock('@/pages/ChatAgent/utils/api', async (importOriginal) => {
   };
 });
 vi.mock('@/hooks/useWorkspace', () => ({
-  useWorkspace: () => ({ data: { status: 'running', name: 'ws-1' } }),
+  useWorkspace: (id: string | null | undefined) => {
+    workspaceState.requestedIds.push(id);
+    return workspaceState;
+  },
 }));
 vi.mock('@/contexts/ThemeContext', () => ({
   useTheme: () => ({ theme: 'dark' }),
@@ -168,6 +185,15 @@ const STATUS: ArtifactStatus = {
 describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    tierState.colleagueSharingEnabled = true;
+    workspaceState.data = {
+      status: 'running',
+      name: 'ws-1',
+      auto_publish_paused: false,
+      auto_publish_pause_token: null,
+    };
+    workspaceState.dataUpdatedAt = 1000;
+    workspaceState.requestedIds = [];
     mockEnsure.mockResolvedValue(ARTIFACT);
     mockFind.mockResolvedValue(ARTIFACT);
     mockStatus.mockResolvedValue(STATUS);
@@ -362,5 +388,226 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
     const unshareBtn = await screen.findByRole('button', { name: 'Unshare' });
     await userEvent.click(unshareBtn);
     await waitFor(() => expect(mockUnshare).toHaveBeenCalledWith(ARTIFACT.artifact_id));
+  });
+
+  // DALTON-HOOK(colleague-access): verify auto-publish pause hint, confirm_pause_token submission, and server pause notice
+  it('shows auto-publish paused hint, submits confirm_pause_token, and surfaces auto_publish_pause_notice', async () => {
+    tierState.callerTier = 'internal';
+    workspaceState.data = {
+      status: 'running',
+      name: 'ws-1',
+      auto_publish_paused: true,
+      auto_publish_pause_token: 'tok-pause-1',
+    };
+
+    const notice = '仍有进行中的同事协作轮次，结束后再确认';
+    const publishedMonitor = {
+      monitor_id: 'm-1',
+      slug: 'report',
+      artifact_id: ARTIFACT.artifact_id,
+      artifact_code: ARTIFACT.code,
+      workspace_id: 'ws-1',
+      entry_path: 'results/report.html',
+      owner_user_id: 'u-1',
+      owner_name: 'Alice',
+      owner_email: 'alice@company.com',
+      title: 'report',
+      category: 'other' as const,
+      sort_order: 0,
+      visibility: 'own' as const,
+      member_user_ids: [],
+      published_seq: 1,
+      keep_updated: true,
+      source_kind: 'workspace' as const,
+      source_ref: 'ws-1:results/report.html',
+      acl_revision: 1,
+      last_publish_error: null,
+      last_publish_failed_at: null,
+      data_as_of: null,
+      created_at: '2026-11-16T12:00:00Z',
+      updated_at: '2026-11-16T12:00:00Z',
+      can_manage: true,
+    };
+    mockPublishMonitor.mockImplementationOnce(async () => {
+      mockGetMonitor.mockResolvedValue(publishedMonitor);
+      return {
+        monitor: publishedMonitor,
+        versions: [],
+        monitor_grant: 'm1.tok',
+        frame_base: '/api/v1/dalton/monitors/g/m1.tok/',
+        data_base: '/api/v1/dalton/monitors/g/m1.tok/data',
+        expires_in: 43200,
+        cut: true,
+        auto_publish_paused: true,
+        auto_publish_pause_token: 'tok-pause-2',
+        auto_publish_pause_notice: notice,
+      };
+    });
+
+    renderWithProviders(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
+
+    expect(
+      await screen.findByText(
+        "Auto-update is paused because this workspace read a colleague's content. Review the files and visibility, then click Publish to resume auto-update.",
+      ),
+    ).toBeInTheDocument();
+
+    const publishBtn = screen.getByRole('button', { name: 'Publish' });
+    await waitFor(() => expect(publishBtn).toBeEnabled());
+    await userEvent.click(publishBtn);
+
+    await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(1));
+    expect(mockPublishMonitor.mock.calls[0][0]).toMatchObject({
+      workspace_id: 'ws-1',
+      confirm_pause_token: 'tok-pause-1',
+    });
+    expect(await screen.findByText(notice)).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        "Auto-update is paused because this workspace read a colleague's content. Review the files and visibility, then click Update to resume auto-update.",
+      ),
+    ).toBeInTheDocument();
+
+    // Next publish carries the refreshed token returned by the server and clears the pause hint when resumed
+    const updateBtn = await screen.findByRole('button', { name: 'Update' });
+    await waitFor(() => expect(updateBtn).toBeEnabled());
+    await userEvent.click(updateBtn);
+
+    await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(2));
+    expect(mockPublishMonitor.mock.calls[1][0]).toMatchObject({
+      confirm_pause_token: 'tok-pause-2',
+    });
+    await waitFor(() => {
+      expect(screen.queryByText(notice)).not.toBeInTheDocument();
+      expect(
+        screen.queryByText(
+          "Auto-update is paused because this workspace read a colleague's content. Review the files and visibility, then click Update to resume auto-update.",
+        ),
+      ).not.toBeInTheDocument();
+    });
+  });
+
+  // DALTON-HOOK(colleague-access): when colleague sharing switch is OFF, skip workspace refetch & invalidation
+  it('skips workspace detail fetch, refetch, and workspace query invalidations when colleague sharing is off', async () => {
+    tierState.callerTier = 'internal';
+    tierState.colleagueSharingEnabled = false;
+    workspaceState.data = {
+      status: 'running',
+      name: 'ws-1',
+      auto_publish_paused: true,
+      auto_publish_pause_token: 'tok-stale',
+    };
+
+    const { queryClient } = renderWithProviders(
+      <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+    );
+    const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries');
+
+    const publishBtn = await screen.findByRole('button', { name: 'Publish' });
+    await waitFor(() => expect(publishBtn).toBeEnabled());
+
+    expect(workspaceState.requestedIds.every((id) => id === null)).toBe(true);
+    expect(workspaceState.refetch).not.toHaveBeenCalled();
+    expect(
+      screen.queryByText(/Auto-update is paused because this workspace read a colleague's content/),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(publishBtn);
+    await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(1));
+    expect(mockPublishMonitor.mock.calls[0][0]).not.toHaveProperty('confirm_pause_token');
+
+    const invalidatedRoots = invalidateSpy.mock.calls.map((c) => {
+      const arg = c[0] as { queryKey?: unknown[] } | undefined;
+      return arg?.queryKey?.[0];
+    });
+    expect(invalidatedRoots).not.toContain('workspaces');
+  });
+
+  // DALTON-HOOK(colleague-access): refreshed workspace detail supersedes previous submit pauseOverride
+  it('prefers freshly refetched workspace detail over stale pauseOverride from an earlier submit', async () => {
+    tierState.callerTier = 'internal';
+    tierState.colleagueSharingEnabled = true;
+    workspaceState.data = {
+      status: 'running',
+      name: 'ws-1',
+      auto_publish_paused: true,
+      auto_publish_pause_token: 'tok-1',
+    };
+    workspaceState.dataUpdatedAt = 1000;
+
+    const publishedMonitor = {
+      monitor_id: 'm-1',
+      slug: 'report',
+      artifact_id: ARTIFACT.artifact_id,
+      artifact_code: ARTIFACT.code,
+      workspace_id: 'ws-1',
+      entry_path: 'results/report.html',
+      owner_user_id: 'u-1',
+      owner_name: 'Alice',
+      owner_email: 'alice@company.com',
+      title: 'report',
+      category: 'other' as const,
+      sort_order: 0,
+      visibility: 'own' as const,
+      member_user_ids: [],
+      published_seq: 1,
+      keep_updated: true,
+      source_kind: 'workspace' as const,
+      source_ref: 'ws-1:results/report.html',
+      acl_revision: 1,
+      last_publish_error: null,
+      last_publish_failed_at: null,
+      data_as_of: null,
+      created_at: '2026-11-16T12:00:00Z',
+      updated_at: '2026-11-16T12:00:00Z',
+      can_manage: true,
+    };
+    mockPublishMonitor.mockImplementationOnce(async () => {
+      mockGetMonitor.mockResolvedValue(publishedMonitor);
+      return {
+        monitor: publishedMonitor,
+        versions: [],
+        monitor_grant: 'm1.tok',
+        frame_base: '/api/v1/dalton/monitors/g/m1.tok/',
+        data_base: '/api/v1/dalton/monitors/g/m1.tok/data',
+        expires_in: 43200,
+        cut: true,
+        auto_publish_paused: true,
+        auto_publish_pause_token: 'tok-2',
+        auto_publish_pause_notice: '仍有进行中的同事协作轮次，结束后再确认',
+      };
+    });
+
+    const { rerender } = renderWithProviders(
+      <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+    );
+
+    const publishBtn = await screen.findByRole('button', { name: 'Publish' });
+    await waitFor(() => expect(publishBtn).toBeEnabled());
+    await userEvent.click(publishBtn);
+    expect(await screen.findByText('仍有进行中的同事协作轮次，结束后再确认')).toBeInTheDocument();
+
+    // Another tab clears the pause and this dialog receives a fresher workspace detail
+    workspaceState.data = {
+      status: 'running',
+      name: 'ws-1',
+      auto_publish_paused: false,
+      auto_publish_pause_token: null,
+    };
+    workspaceState.dataUpdatedAt = 2000;
+    rerender(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
+
+    await waitFor(() => {
+      expect(screen.queryByText('仍有进行中的同事协作轮次，结束后再确认')).not.toBeInTheDocument();
+      expect(
+        screen.queryByText(/Auto-update is paused because this workspace read a colleague's content/),
+      ).not.toBeInTheDocument();
+    });
+
+    const updateBtn = await screen.findByRole('button', { name: 'Update' });
+    await waitFor(() => expect(updateBtn).toBeEnabled());
+    await userEvent.click(updateBtn);
+    await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(2));
+    expect(mockPublishMonitor.mock.calls[1][0]).not.toHaveProperty('confirm_pause_token');
   });
 });
