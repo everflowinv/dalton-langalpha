@@ -143,6 +143,7 @@ async def dispatch_background_subagent(
     tool_call_id: str | None = None,
     base_configurable: dict[str, Any] | None = None,
     time_limit: float | None = None,
+    workflow_driver_run_id: str | None = None,  # DALTON-HOOK(budget)
 ) -> BackgroundTask:
     """Register and spawn a background subagent without a Task tool call.
 
@@ -214,6 +215,11 @@ async def dispatch_background_subagent(
                 description=description,
                 launch_tool_call_id=task.tool_call_id,
                 parent_run_id=None,
+                **(
+                    {"workflow_driver_run_id": workflow_driver_run_id}
+                    if workflow_driver_run_id
+                    else {}
+                ),  # DALTON-HOOK(budget)
             )
         except NamespaceUnfenced as refusal:
             task.mark_never_started(refusal.settle_reason)
@@ -307,6 +313,7 @@ class SubagentDispatcher:
         owner_task_id: str | None = None,
         base_configurable: dict[str, Any] | None = None,
         time_limit: float | None = None,
+        workflow_driver_run_id: str | None = None,  # DALTON-HOOK(budget)
     ) -> BackgroundTask:
         return await dispatch_background_subagent(
             self.middleware,
@@ -319,4 +326,5 @@ class SubagentDispatcher:
             owner_task_id=owner_task_id,
             base_configurable=base_configurable,
             time_limit=time_limit,
+            workflow_driver_run_id=workflow_driver_run_id,  # DALTON-HOOK(budget)
         )
