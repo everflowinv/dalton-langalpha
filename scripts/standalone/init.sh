@@ -285,23 +285,36 @@ is_loopback_domain() {
 validate_domain_for_auth() {
   local domain_val="$1"
   is_loopback_domain "$domain_val" && return 0
-  local file_mode=""
-  # Compose takes DALTON_AUTH_MODE from this shell when it is exported there and
-  # from .env otherwise, so a public domain needs neither of them to be "oss".
+  local refusal="当前核心版是免密单机试用，请先用 localhost 安装；正式对外部署等本地登录（Batch 4b）上线后再配置域名。已启用本地登录的，请把 .env 里的设置写成单独一行 DALTON_AUTH_MODE=local（不加引号和注释）。"
+  local source_file=""
   if [[ -f "$ENV_FILE" ]]; then
-    file_mode="$(get_env_value "DALTON_AUTH_MODE")"
+    source_file="$ENV_FILE"
   elif [[ -f "$ENV_EXAMPLE" ]]; then
-    file_mode="$(sed -n 's/^DALTON_AUTH_MODE=//p' "$ENV_EXAMPLE" | tail -n 1)"
+    source_file="$ENV_EXAMPLE"
   fi
-  local mode
-  for mode in "$file_mode" "${DALTON_AUTH_MODE-__unset__}"; do
-    [[ "$mode" == "__unset__" ]] && continue
-    # Accept only a value that is plainly "local" or "supabase". Anything else,
-    # including oss, an empty value, comments, quotes in odd places or variable
-    # expansions, is refused rather than second-guessing how Compose reads it.
-    mode="$(printf '%s' "$mode" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')"
-    if [[ "$mode" != "local" && "$mode" != "supabase" ]]; then
-      err "当前核心版是免密单机试用，请先用 localhost 安装；正式对外部署等本地登录（Batch 4b）上线后再配置域名。"
+  # Compose reads every assignment of the key (leading spaces, `export`, spaces
+  # before `=`, or `KEY: value`) and takes the last; each one must be a bare allowed word, so
+  # nothing Compose could resolve to "oss" passes. A shell export wins over the
+  # file in Compose, so it must pass the same check.
+  local -a values=()
+  local line
+  if [[ -n "$source_file" ]]; then
+    while IFS= read -r line; do
+      values+=("$(printf '%s' "$line" | sed -E 's/^[^=:]*[=:]//')")
+    done < <(grep -E '^[[:space:]]*(export[[:space:]]+)?DALTON_AUTH_MODE[[:space:]]*[=:]' "$source_file" || true)
+  fi
+  if (( ${#values[@]} == 0 )); then
+    err "$refusal"
+    exit 1
+  fi
+  if [[ -n "${DALTON_AUTH_MODE+set}" ]]; then
+    values+=("$DALTON_AUTH_MODE")
+  fi
+  local value
+  for value in "${values[@]}"; do
+    value="${value%$'\r'}"
+    if ! printf '%s' "$value" | grep -qiE '^[[:space:]]*(local|supabase)[[:space:]]*$'; then
+      err "$refusal"
       exit 1
     fi
   done

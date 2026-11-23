@@ -1033,6 +1033,12 @@ class TestSandboxNetworkAndInitScript:
             ("inst-inner-space-oss", "DALTON_AUTH_MODE=' oss '\n", None),
             ("inst-glued-comment-oss", "DALTON_AUTH_MODE='oss'# trial\n", None),
             ("inst-expansion", "DALTON_AUTH_MODE=${TRIAL_MODE:-oss}\n", None),
+            ("inst-named-expansion", "DALTON_AUTH_MODE=${LOCAL}\n", None),
+            ("inst-hidden-spaced", "DALTON_AUTH_MODE=local\nDALTON_AUTH_MODE =oss\n", None),
+            ("inst-hidden-export", "DALTON_AUTH_MODE=local\nexport DALTON_AUTH_MODE=oss\n", None),
+            ("inst-hidden-indented", "DALTON_AUTH_MODE=local\n  DALTON_AUTH_MODE=oss\n", None),
+            ("inst-hidden-colon", "DALTON_AUTH_MODE=local\nDALTON_AUTH_MODE : oss\n", None),
+            ("inst-empty-comment", "DALTON_AUTH_MODE=\"\" # local\n", None),
         ):
             inst_case, init_case = self._stage_init_install(tmp_path, name)
             (inst_case / ".env").write_text(env_text)
@@ -1047,6 +1053,18 @@ class TestSandboxNetworkAndInitScript:
             )
             assert res_case.returncode != 0, name
             assert "免密单机试用" in res_case.stderr, name
+
+        # A bare `local` in .env with no shell override lets a public domain through.
+        inst_ok, init_ok = self._stage_init_install(tmp_path, "inst-local-ok")
+        (inst_ok / ".env").write_text("DALTON_AUTH_MODE=local\n")
+        ok_env = self._make_fake_docker_env(tmp_path, "28.0.1")
+        ok_env.pop("DALTON_AUTH_MODE", None)
+        res_ok = subprocess.run(
+            ["bash", str(init_ok), "--non-interactive", "--domain",
+             "dalton.example.com", "--skip-sandbox-build"],
+            env=ok_env, capture_output=True, text=True, timeout=30,
+        )
+        assert "免密单机试用" not in res_ok.stderr, res_ok.stderr
 
         # 4. Docker server < 28.0 or unreachable fails in --non-interactive
         for ver in ("27.5.1", None):
