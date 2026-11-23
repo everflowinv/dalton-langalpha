@@ -1001,47 +1001,17 @@ class TestSandboxNetworkAndInitScript:
         assert res_v6.returncode == 0
         assert (inst_v6 / ".env").is_file()
 
-        # 3b. The guard reads the auth mode the stack will run with: a stray
-        # shell DALTON_AUTH_MODE and a quoted 'oss' in .env both still refuse.
-        _, init_shell = self._stage_init_install(tmp_path, "inst-shell-auth")
-        shell_env = self._make_fake_docker_env(tmp_path, "28.0.1")
-        shell_env["DALTON_AUTH_MODE"] = "supabase"
-        res_shell = subprocess.run(
-            ["bash", str(init_shell), "--non-interactive", "--domain",
-             "dalton.example.com", "--skip-sandbox-build"],
-            env=shell_env, capture_output=True, text=True, timeout=15,
-        )
-        assert res_shell.returncode != 0
-        assert "免密单机试用" in res_shell.stderr
-
-        inst_quoted, init_quoted = self._stage_init_install(tmp_path, "inst-quoted-auth")
-        (inst_quoted / ".env").write_text("DALTON_AUTH_MODE='oss'\n")
-        res_quoted = subprocess.run(
-            ["bash", str(init_quoted), "--non-interactive", "--domain",
-             "dalton.example.com", "--skip-sandbox-build"],
-            env=self._make_fake_docker_env(tmp_path, "28.0.1"),
-            capture_output=True, text=True, timeout=15,
-        )
-        assert res_quoted.returncode != 0
-        assert "免密单机试用" in res_quoted.stderr
-
-        # Compose prefers an exported shell value, and drops a trailing comment.
+        # 3b. Any non-loopback domain is refused, whatever .env or the shell say,
+        # until Batch 4b writes the local auth mode itself.
         for name, env_text, shell_mode in (
-            ("inst-shell-oss", "DALTON_AUTH_MODE=local\n", "oss"),
-            ("inst-comment-oss", "DALTON_AUTH_MODE='oss' # trial\n", None),
-            ("inst-bare-comment-oss", "DALTON_AUTH_MODE=oss # trial\n", None),
-            ("inst-inner-space-oss", "DALTON_AUTH_MODE=' oss '\n", None),
-            ("inst-glued-comment-oss", "DALTON_AUTH_MODE='oss'# trial\n", None),
-            ("inst-expansion", "DALTON_AUTH_MODE=${TRIAL_MODE:-oss}\n", None),
-            ("inst-named-expansion", "DALTON_AUTH_MODE=${LOCAL}\n", None),
-            ("inst-hidden-spaced", "DALTON_AUTH_MODE=local\nDALTON_AUTH_MODE =oss\n", None),
-            ("inst-hidden-export", "DALTON_AUTH_MODE=local\nexport DALTON_AUTH_MODE=oss\n", None),
-            ("inst-hidden-indented", "DALTON_AUTH_MODE=local\n  DALTON_AUTH_MODE=oss\n", None),
-            ("inst-hidden-colon", "DALTON_AUTH_MODE=local\nDALTON_AUTH_MODE : oss\n", None),
-            ("inst-empty-comment", "DALTON_AUTH_MODE=\"\" # local\n", None),
+            ("inst-shell-supabase", None, "supabase"),
+            ("inst-env-local", "DALTON_AUTH_MODE=local\n", None),
+            ("inst-env-quoted-oss", "DALTON_AUTH_MODE='oss'\n", None),
+            ("inst-env-expansion", "DALTON_AUTH_MODE=${LOCAL}\n", None),
         ):
             inst_case, init_case = self._stage_init_install(tmp_path, name)
-            (inst_case / ".env").write_text(env_text)
+            if env_text is not None:
+                (inst_case / ".env").write_text(env_text)
             case_env = self._make_fake_docker_env(tmp_path, "28.0.1")
             case_env.pop("DALTON_AUTH_MODE", None)
             if shell_mode is not None:
@@ -1053,18 +1023,6 @@ class TestSandboxNetworkAndInitScript:
             )
             assert res_case.returncode != 0, name
             assert "免密单机试用" in res_case.stderr, name
-
-        # A bare `local` in .env with no shell override lets a public domain through.
-        inst_ok, init_ok = self._stage_init_install(tmp_path, "inst-local-ok")
-        (inst_ok / ".env").write_text("DALTON_AUTH_MODE=local\n")
-        ok_env = self._make_fake_docker_env(tmp_path, "28.0.1")
-        ok_env.pop("DALTON_AUTH_MODE", None)
-        res_ok = subprocess.run(
-            ["bash", str(init_ok), "--non-interactive", "--domain",
-             "dalton.example.com", "--skip-sandbox-build"],
-            env=ok_env, capture_output=True, text=True, timeout=30,
-        )
-        assert "免密单机试用" not in res_ok.stderr, res_ok.stderr
 
         # 4. Docker server < 28.0 or unreachable fails in --non-interactive
         for ver in ("27.5.1", None):

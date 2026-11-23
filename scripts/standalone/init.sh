@@ -284,40 +284,13 @@ is_loopback_domain() {
 
 validate_domain_for_auth() {
   local domain_val="$1"
-  is_loopback_domain "$domain_val" && return 0
-  local refusal="当前核心版是免密单机试用，请先用 localhost 安装；正式对外部署等本地登录（Batch 4b）上线后再配置域名。已启用本地登录的，请把 .env 里的设置写成单独一行 DALTON_AUTH_MODE=local（不加引号和注释）。"
-  local source_file=""
-  if [[ -f "$ENV_FILE" ]]; then
-    source_file="$ENV_FILE"
-  elif [[ -f "$ENV_EXAMPLE" ]]; then
-    source_file="$ENV_EXAMPLE"
-  fi
-  # Compose reads every assignment of the key (leading spaces, `export`, spaces
-  # before `=`, or `KEY: value`) and takes the last; each one must be a bare allowed word, so
-  # nothing Compose could resolve to "oss" passes. A shell export wins over the
-  # file in Compose, so it must pass the same check.
-  local -a values=()
-  local line
-  if [[ -n "$source_file" ]]; then
-    while IFS= read -r line; do
-      values+=("$(printf '%s' "$line" | sed -E 's/^[^=:]*[=:]//')")
-    done < <(grep -E '^[[:space:]]*(export[[:space:]]+)?DALTON_AUTH_MODE[[:space:]]*[=:]' "$source_file" || true)
-  fi
-  if (( ${#values[@]} == 0 )); then
-    err "$refusal"
+  # Until local sign-in ships (Batch 4b), a core install has no login screen,
+  # so it installs on a loopback address only. Batch 4b's init writes the
+  # local auth mode itself before it accepts a public domain.
+  if ! is_loopback_domain "$domain_val"; then
+    err "当前核心版是免密单机试用，请先用 localhost 安装；正式对外部署等本地登录（Batch 4b）上线后再配置域名。"
     exit 1
   fi
-  if [[ -n "${DALTON_AUTH_MODE+set}" ]]; then
-    values+=("$DALTON_AUTH_MODE")
-  fi
-  local value
-  for value in "${values[@]}"; do
-    value="${value%$'\r'}"
-    if ! printf '%s' "$value" | grep -qiE '^[[:space:]]*(local|supabase)[[:space:]]*$'; then
-      err "$refusal"
-      exit 1
-    fi
-  done
 }
 
 main() {
