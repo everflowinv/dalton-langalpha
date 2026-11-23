@@ -2,12 +2,14 @@
 # Standalone Core initializer (environment checks + secret generation).
 #
 # Responsibilities:
-#   1. Check Docker Engine (>= 24.0), Docker Compose (>= 2.24.4), memory (>= 8 GB
-#      recommended), and free disk (>= 30 GB recommended).
+#   1. Check Docker Engine (>= 28.0 for reliable 127.0.0.1 loopback port isolation),
+#      Docker Compose (>= 2.24.4), memory (>= 8 GB recommended), and free disk
+#      (>= 30 GB recommended).
 #   2. Print the /var/run/docker.sock security & permissions notice.
-#   3. Create/update .env from .env.core.example, generating all required secrets
-#      with `openssl rand -hex 32` without overwriting existing non-empty values,
-#      and ensuring APP_ENV=core / DALTON_PROFILE=core.
+#   3. Create/update .env (strictly mode 0600) from .env.core.example, generating
+#      all required secrets with `openssl rand -hex 32` without overwriting
+#      existing non-empty values, writing APP_ENV=core / DALTON_PROFILE=core and
+#      per-instance COMPOSE_PROJECT_NAME / SANDBOX_DOCKER_NETWORK.
 #   4. Hand interactive LLM / financial-data / web-search setup off to `make config`.
 #
 # Usage:
@@ -15,6 +17,7 @@
 #   bash scripts/standalone/init.sh --non-interactive --domain localhost
 #   bash scripts/standalone/init.sh --domain dalton.example.com --env-file /path/to/.env
 set -euo pipefail
+umask 077
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENV_FILE="${REPO_ROOT}/.env"
@@ -112,22 +115,22 @@ check_environment() {
     exit 1
   fi
 
-  # 2. Docker Engine (>= 24.0)
+  # 2. Docker Engine (>= 28.0 — required for reliable 127.0.0.1 loopback port isolation)
   if command -v docker >/dev/null 2>&1; then
     local docker_ver_raw docker_ver
     docker_ver_raw="$(docker --version 2>/dev/null || true)"
     docker_ver="$(printf '%s' "$docker_ver_raw" | sed -nE 's/.*version ([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/p' | head -n 1)"
     if [[ -n "$docker_ver" ]]; then
-      if version_ge "$docker_ver" "24.0.0"; then
-        ok "Docker Engine ${docker_ver} (>= 24.0)"
+      if version_ge "$docker_ver" "28.0.0"; then
+        ok "Docker Engine ${docker_ver} (>= 28.0)"
       else
-        warn "Docker Engine ${docker_ver} detected; >= 24.0 is recommended."
+        warn "Docker Engine ${docker_ver} detected; >= 28.0 is required for reliable 127.0.0.1 loopback port isolation (older versions may allow L2 neighbors to reach loopback-published ports)."
       fi
     else
       warn "Docker found, but could not parse version from: ${docker_ver_raw}"
     fi
   else
-    warn "Docker CLI not found in PATH — install Docker Engine >= 24.0 before starting services."
+    warn "Docker CLI not found in PATH — install Docker Engine >= 28.0 before starting services."
   fi
 
   # 3. Docker Compose (>= 2.24.4 for !reset / !override)
@@ -194,11 +197,11 @@ print_docker_sock_notice() {
   cat <<'EOF'
   Standalone Core mounts /var/run/docker.sock into the `backend` container
   (Docker-outside-of-Docker) so it can create and reap isolated code sandboxes
-  on the dedicated `sandbox-net` network.
+  on the dedicated per-instance sandbox network.
 
   - Security boundary: holding /var/run/docker.sock is equivalent to host Docker
-    daemon control. For production, deploy on a dedicated Linux host or VM
-    reserved for Dalton (or configure a remote sandbox provider).
+    daemon control. By default, deploy one Standalone Core stack per dedicated
+    Linux host or VM (Docker Engine >= 28.0 required for loopback port isolation).
   - Permissions: make sure the user running `docker compose` can access
     /var/run/docker.sock (e.g. `sudo usermod -aG docker "$USER"` then re-login),
     or set DOCKER_HOST_SOCKET in .env for rootless Docker.
@@ -215,7 +218,10 @@ get_env_value() {
 
 write_env_key() {
   local key="$1" val="$2"
-  local tmp="${ENV_FILE}.tmp.$$"
+  local env_dir tmp
+  env_dir="$(dirname "$ENV_FILE")"
+  tmp="$(mktemp "${env_dir}/.env.tmp.XXXXXX")"
+  chmod 600 "$tmp"
   if grep -qE "^${key}=" "$ENV_FILE" 2>/dev/null; then
     awk -v k="$key" -v v="$val" '
       BEGIN { replaced = 0 }
@@ -229,10 +235,12 @@ write_env_key() {
         if (!replaced) print k "=" v
       }
     ' "$ENV_FILE" > "$tmp"
-    mv "$tmp" "$ENV_FILE"
   else
-    printf '%s=%s\n' "$key" "$val" >> "$ENV_FILE"
+    cat "$ENV_FILE" > "$tmp"
+    printf '%s=%s\n' "$key" "$val" >> "$tmp"
   fi
+  chmod 600 "$tmp"
+  mv "$tmp" "$ENV_FILE"
 }
 
 set_env_if_empty() {
@@ -250,6 +258,16 @@ gen_hex_secret() {
   openssl rand -hex 32
 }
 
+sanitize_project_name() {
+  local raw="$1"
+  local cleaned
+  cleaned="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/-/g; s/^[^a-z0-9]+//; s/[-_]+$//')"
+  if [[ -z "$cleaned" ]]; then
+    cleaned="dalton-core"
+  fi
+  printf '%s' "$cleaned"
+}
+
 main() {
   printf "\nDalton Standalone Core Initialization\n"
   check_environment
@@ -258,17 +276,23 @@ main() {
   printf "\n== Configuring %s ==\n" "$ENV_FILE"
   mkdir -p "$(dirname "$ENV_FILE")"
   if [[ ! -f "$ENV_FILE" ]]; then
+    local seed_tmp
+    seed_tmp="$(mktemp "$(dirname "$ENV_FILE")/.env.seed.XXXXXX")"
+    chmod 600 "$seed_tmp"
     if [[ -f "$ENV_EXAMPLE" ]]; then
-      cp "$ENV_EXAMPLE" "$ENV_FILE"
+      cat "$ENV_EXAMPLE" > "$seed_tmp"
+      chmod 600 "$seed_tmp"
+      mv "$seed_tmp" "$ENV_FILE"
       ok "Created ${ENV_FILE} from $(basename "$ENV_EXAMPLE")"
     else
-      : > "$ENV_FILE"
+      chmod 600 "$seed_tmp"
+      mv "$seed_tmp" "$ENV_FILE"
       ok "Created empty ${ENV_FILE}"
     fi
   else
+    chmod 600 "$ENV_FILE"
     info "Updating existing ${ENV_FILE} (existing non-empty values will be preserved)"
   fi
-  chmod 600 "$ENV_FILE" 2>/dev/null || true
 
   # Resolve target domain
   local existing_domain domain
@@ -287,6 +311,14 @@ main() {
     write_env_key "DOMAIN" "$domain"
   fi
   ok "DOMAIN=${domain}"
+
+  # Per-instance project & sandbox network name
+  local default_project project_name
+  default_project="$(sanitize_project_name "$(basename "$(cd "$(dirname "$ENV_FILE")" && pwd)")")"
+  set_env_if_empty "COMPOSE_PROJECT_NAME" "$default_project" || true
+  project_name="$(get_env_value "COMPOSE_PROJECT_NAME")"
+  project_name="${project_name:-$default_project}"
+  set_env_if_empty "SANDBOX_DOCKER_NETWORK" "${project_name}_sandbox" || true
 
   # Ensure Standalone Core profile & networking defaults (without clobbering existing values)
   set_env_if_empty "APP_ENV" "core" || true
@@ -326,6 +358,7 @@ main() {
     "REDIS_PASSWORD"
     "MINIO_ROOT_USER"
     "MINIO_ROOT_PASSWORD"
+    "DALTON_CHAT_UPLOAD_SIGNING_SECRET"
     "INTERNAL_SERVICE_TOKEN"
     "BYOK_ENCRYPTION_KEY"
     "EGRESS_RELAY_SECRET"
@@ -354,6 +387,9 @@ main() {
   minio_pass="$(get_env_value "MINIO_ROOT_PASSWORD")"
   set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID" "$minio_user" || true
   set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY" "$minio_pass" || true
+
+  # Enforce strict 0600 permissions after all writes (fail loudly if chmod fails).
+  chmod 600 "$ENV_FILE"
 
   if (( ${#generated[@]} > 0 )); then
     ok "Generated secrets (${#generated[@]}): ${generated[*]}"

@@ -1,17 +1,31 @@
 # Dalton Standalone Core edge gateway (Batch 1 initial loopback HTTP edition).
 # Caddy listens on :8088 inside the container; docker-compose.core.yml publishes
-# only 127.0.0.1:8088 on the host. Automatic HTTPS / custom TLS arrives in Batch 6.
+# only 127.0.0.1:8088 on the host (requires Docker Engine >= 28 for reliable
+# loopback-only host port isolation). Automatic HTTPS / custom TLS arrives in Batch 6.
 {
 	auto_https off
 	admin off
+}
+
+# Shared internal-header stripping snippets imported by /api/*, /ws/*,
+# /api/v1/threads/*/messages/replay, and CI probe routes so every proxied route
+# executes the exact same stripping definition.
+(strip_internal_request_headers) {
+	request_header -X-Service-Token
+	request_header -X-User-Id
+}
+
+(strip_internal_upstream_headers) {
+	header_up -X-Service-Token
+	header_up -X-User-Id
 }
 
 :8088 {
 	root * /srv
 	encode zstd gzip
 
-	# Redact ?token=<jwt> in access logs (e.g. WebSocket handshakes)
-	# while preserving non-sensitive query parameters for troubleshooting.
+	# Redact ?token=<jwt> and delete sensitive authentication / internal headers
+	# from access logs (Caddy logs the original request before header mutation).
 	log {
 		output stdout
 		format filter {
@@ -20,6 +34,11 @@
 				request>uri query {
 					replace token REDACTED
 				}
+				request>headers>X-Service-Token delete
+				request>headers>X-User-Id delete
+				request>headers>X-Dalton-Relay-Token delete
+				request>headers>Authorization delete
+				request>headers>Cookie delete
 			}
 		}
 	}
@@ -35,14 +54,19 @@
 	# Optional site-block snippets (e.g. CI header-stripping probe routes).
 	import /etc/caddy/extra/*.caddy
 
+	# Never expose the sandbox-only chat-upload relay endpoint through the edge;
+	# sandboxes dial http://backend:8000 directly over the isolated sandbox network.
+	@blocked_internal_api path /api/v1/dalton/chat-uploads/sandbox-object /api/v1/dalton/chat-uploads/sandbox-object/*
+	handle @blocked_internal_api {
+		respond 404
+	}
+
 	# 0. History replay (/api/v1/threads/<id>/messages/replay) is a finite SSE
 	# response that can run to 10+ MB on a long thread. Compress regardless of
-	# the first flushed event's size while applying the same internal-header
-	# stripping as the general backend route below.
+	# the first flushed event's size while applying the shared stripping snippets.
 	@history_replay path_regexp history_replay ^/api/v1/threads/[^/]+/messages/replay$
 	handle @history_replay {
-		request_header -X-Service-Token
-		request_header -X-User-Id
+		import strip_internal_request_headers
 		encode {
 			zstd
 			gzip
@@ -52,23 +76,20 @@
 			}
 		}
 		reverse_proxy backend:8000 {
-			header_up -X-Service-Token
-			header_up -X-User-Id
+			import strip_internal_upstream_headers
 			flush_interval -1
 		}
 	}
 
-	# 1. Reverse proxy /api/* and /ws/* to backend:8000.
-	# Strip external X-Service-Token and X-User-Id headers so the internal
-	# service-token channel cannot be invoked through the edge gateway.
+	# 1. Reverse proxy /api/* and /ws/* to backend:8000 using the shared stripping
+	# snippets so external X-Service-Token and X-User-Id headers cannot invoke the
+	# internal service-token channel through the edge gateway.
 	# flush_interval -1 disables response buffering for SSE; WebSocket upgrades are native.
 	@backend_routes path /api/* /ws/*
 	handle @backend_routes {
-		request_header -X-Service-Token
-		request_header -X-User-Id
+		import strip_internal_request_headers
 		reverse_proxy backend:8000 {
-			header_up -X-Service-Token
-			header_up -X-User-Id
+			import strip_internal_upstream_headers
 			flush_interval -1
 		}
 	}

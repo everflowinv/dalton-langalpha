@@ -3,8 +3,10 @@
 #
 # Scans `tests/standalone/checks/b*.py`, groups scripts by their `# auth: <mode>`
 # file header (`oss`, `local`), brings up a clean Docker Compose stack per auth
-# group (migrated to current Alembic heads), runs every matching check script,
-# collects logs/artifacts, and tears the stack down between groups.
+# group (migrated to current Alembic heads), verifies the backend container's
+# active DALTON_AUTH_MODE matches the group, runs every matching check script,
+# collects logs/artifacts (with secret-leak verification), and tears the stack
+# down between groups.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,8 +14,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 WORK_DIR="$PWD"
 CHECKS_DIR="${SCRIPT_DIR}/checks"
-CI_COMPOSE_FILE="${REPO_ROOT}/docker-compose.ci.yml"
-ARTIFACTS_DIR="${WORK_DIR}/ci-artifacts"
+CI_COMPOSE_FILE=""
+ARTIFACTS_DIR=""
 AUTH_FILTER="all"
 KEEP_UP=0
 
@@ -24,7 +26,7 @@ Usage: tests/standalone/run_checks.sh [options]
 Options:
   --work-dir <dir>        Directory with docker-compose.yml, docker-compose.core.yml, .env (default: $PWD)
   --checks-dir <dir>      Directory containing b*.py check scripts (default: tests/standalone/checks)
-  --ci-compose <file>     Path to docker-compose.ci.yml (default: <repo>/docker-compose.ci.yml)
+  --ci-compose <file>     Path to docker-compose.ci.yml (default: <work-dir>/docker-compose.ci.yml)
   --artifacts-dir <dir>   Directory for logs and exported baseline dumps (default: <work-dir>/ci-artifacts)
   --auth <all|oss|local>  Run only the named auth group (default: all)
   --keep-up               Do not tear down the last stack on exit
@@ -72,7 +74,17 @@ done
 
 WORK_DIR="$(cd "$WORK_DIR" && pwd)"
 CHECKS_DIR="$(cd "$CHECKS_DIR" && pwd)"
+if [[ -z "$CI_COMPOSE_FILE" ]]; then
+  if [[ -f "${WORK_DIR}/docker-compose.ci.yml" ]]; then
+    CI_COMPOSE_FILE="${WORK_DIR}/docker-compose.ci.yml"
+  else
+    CI_COMPOSE_FILE="${REPO_ROOT}/docker-compose.ci.yml"
+  fi
+fi
 CI_COMPOSE_FILE="$(cd "$(dirname "$CI_COMPOSE_FILE")" && pwd)/$(basename "$CI_COMPOSE_FILE")"
+if [[ -z "$ARTIFACTS_DIR" ]]; then
+  ARTIFACTS_DIR="${WORK_DIR}/ci-artifacts"
+fi
 mkdir -p "$ARTIFACTS_DIR"
 ARTIFACTS_DIR="$(cd "$ARTIFACTS_DIR" && pwd)"
 
@@ -90,7 +102,6 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # Discover and group check scripts by `# auth: <mode>` header.
 GROUP_MANIFEST="$("$PYTHON_BIN" - "$CHECKS_DIR" "$AUTH_FILTER" <<'PY'
-import json
 import sys
 from pathlib import Path
 
@@ -113,7 +124,9 @@ if [[ -z "$GROUP_MANIFEST" ]]; then
   exit 1
 fi
 
-export CI_REPO_ROOT="$REPO_ROOT"
+# Resolve CI mount root from the directory containing docker-compose.ci.yml so
+# exported `--include-ci` trees are 100% self-contained.
+export CI_REPO_ROOT="$(cd "$(dirname "$CI_COMPOSE_FILE")" && pwd)"
 export STANDALONE_WORK_DIR="$WORK_DIR"
 export STANDALONE_ARTIFACTS_DIR="$ARTIFACTS_DIR"
 export STANDALONE_COMPOSE_FILES="${BASE_COMPOSE}:${CORE_COMPOSE}:${CI_COMPOSE_FILE}"
@@ -140,6 +153,19 @@ collect_logs() {
   echo "[run_checks] Saved stack logs to ${log_file}"
 }
 
+verify_backend_auth_mode() {
+  local expected_mode="$1"
+  local actual_mode
+  actual_mode="$(compose_run exec -T backend uv run --no-sync python -c \
+    "from src.dalton.settings import get_dalton_auth_mode; print(get_dalton_auth_mode())" \
+    | tr -d '\r\n' | tail -n 1)"
+  if [[ "$actual_mode" != "$expected_mode" ]]; then
+    echo "ERROR: Backend DALTON_AUTH_MODE mismatch: expected '${expected_mode}', actual '${actual_mode}'" >&2
+    return 1
+  fi
+  echo "[run_checks] Verified backend active DALTON_AUTH_MODE=${actual_mode}"
+}
+
 OVERALL_RC=0
 
 while IFS=$'\t' read -r auth_mode scripts_rest; do
@@ -152,17 +178,21 @@ while IFS=$'\t' read -r auth_mode scripts_rest; do
   export DALTON_PROFILE="core"
   export DALTON_AUTH_MODE="$auth_mode"
   export STANDALONE_AUTH_MODE="$auth_mode"
-  if [[ "$auth_mode" == "oss" ]]; then
-    export HOST_MODE="oss"
-  else
-    export HOST_MODE="oss"
-  fi
+  export HOST_MODE="oss"
 
   # Guarantee a completely fresh empty database for each auth group.
   compose_run down -v --remove-orphans || true
 
   if ! compose_run up -d; then
     echo "ERROR: Failed to start compose stack for auth=${auth_mode}" >&2
+    collect_logs "$auth_mode"
+    if [[ "$KEEP_UP" -eq 0 ]]; then
+      compose_run down -v --remove-orphans || true
+    fi
+    exit 1
+  fi
+
+  if ! verify_backend_auth_mode "$auth_mode"; then
     collect_logs "$auth_mode"
     if [[ "$KEEP_UP" -eq 0 ]]; then
       compose_run down -v --remove-orphans || true
@@ -193,6 +223,27 @@ while IFS=$'\t' read -r auth_mode scripts_rest; do
     break
   fi
 done <<< "$GROUP_MANIFEST"
+
+# Fail if any collected log/report artifact contains a secret from .env.
+if ! "$PYTHON_BIN" - "$CHECKS_DIR" "$ARTIFACTS_DIR" "${WORK_DIR}/.env" <<'PY'
+from pathlib import Path
+import sys
+
+checks_dir, artifacts_dir, env_path = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+sys.path.insert(0, str(checks_dir))
+import _lib
+
+leaks = _lib.scan_artifacts_for_secrets(artifacts_dir, env_path)
+if leaks:
+    print("ERROR: Secret leak detected in collected artifacts:", file=sys.stderr)
+    for hit in leaks:
+        print(f"  - {hit}", file=sys.stderr)
+    sys.exit(1)
+print("[run_checks] Secret scan passed (0 leaked secrets in artifacts).")
+PY
+then
+  OVERALL_RC=1
+fi
 
 if [[ "$OVERALL_RC" -ne 0 ]]; then
   echo "[run_checks] FAILED (exit=${OVERALL_RC})" >&2

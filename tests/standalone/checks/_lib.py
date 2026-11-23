@@ -14,9 +14,11 @@ import io
 import json
 import os
 from pathlib import Path
+import posixpath
 import re
 import subprocess
 import tarfile
+import tempfile
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -306,35 +308,184 @@ def extract_run_id(events: Sequence[SSEEvent]) -> str | None:
     return None
 
 
+SECRET_ENV_KEYS: tuple[str, ...] = (
+    "DB_PASSWORD",
+    "REDIS_PASSWORD",
+    "MINIO_ROOT_USER",
+    "MINIO_ROOT_PASSWORD",
+    "DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID",
+    "DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY",
+    "DALTON_CHAT_UPLOAD_SIGNING_SECRET",
+    "INTERNAL_SERVICE_TOKEN",
+    "BYOK_ENCRYPTION_KEY",
+    "EGRESS_RELAY_SECRET",
+    "JWT_SIGNING_SECRET",
+    "BOOTSTRAP_SETUP_TOKEN",
+)
+
+
+def _redact_secrets_text(text: str, env: Mapping[str, str]) -> str:
+    redacted = text
+    for key in SECRET_ENV_KEYS:
+        val = (env.get(key) or "").strip()
+        if len(val) >= 12:
+            redacted = redacted.replace(val, f"<REDACTED:{key}>")
+    return redacted
+
+
+def scan_artifacts_for_secrets(
+    artifacts_dir: Path,
+    env_path: Path,
+    *,
+    min_secret_len: int = 12,
+) -> list[str]:
+    """Scan text/log files in ``artifacts_dir`` for any secret values from ``env_path``.
+
+    Never returns or logs the secret value itself — only ``<relpath>: leaked <KEY>``.
+    """
+    env_map = load_env_file(env_path)
+    secrets: list[tuple[str, str]] = []
+    for key in SECRET_ENV_KEYS:
+        val = (env_map.get(key) or "").strip()
+        if len(val) >= min_secret_len:
+            secrets.append((key, val))
+    if not secrets or not artifacts_dir.is_dir():
+        return []
+
+    hits: list[str] = []
+    for path in sorted(artifacts_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        # Skip binary PostgreSQL custom dumps
+        if path.suffix.lower() in (".dump", ".gz", ".tar", ".tgz", ".png", ".jpg"):
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        rel = str(path.relative_to(artifacts_dir))
+        for key, val in secrets:
+            if val in content:
+                hits.append(f"{rel}: leaked {key}")
+    return hits
+
+
+def _resolve_tar_member(
+    members_by_name: Mapping[str, tarfile.TarInfo],
+    raw_name: str,
+) -> tarfile.TarInfo | None:
+    """Resolve a path inside a docker-save tar, following internal symlinks."""
+    current = posixpath.normpath(raw_name.lstrip("./"))
+    for _ in range(8):
+        member = members_by_name.get(current)
+        if member is None:
+            return None
+        if member.issym() or member.islnk():
+            target = member.linkname
+            if not target:
+                return None
+            if target.startswith("/"):
+                current = posixpath.normpath(target.lstrip("/"))
+            else:
+                parent = posixpath.dirname(current)
+                current = posixpath.normpath(posixpath.join(parent, target))
+            continue
+        return member
+    return None
+
+
+def _scan_opened_docker_save_tar(
+    outer: tarfile.TarFile,
+    forbidden_substrings: Sequence[str],
+) -> tuple[list[str], int]:
+    """Read ``manifest.json`` and inspect every declared layer strictly.
+
+    Raises :class:`RuntimeError` if ``manifest.json`` is missing/invalid,
+    declares 0 layers, references a missing layer, or contains an unparseable
+    layer archive.
+    """
+    members_by_name: dict[str, tarfile.TarInfo] = {}
+    for member in outer.getmembers():
+        norm = posixpath.normpath(member.name.lstrip("./"))
+        members_by_name[norm] = member
+
+    manifest_member = _resolve_tar_member(members_by_name, "manifest.json")
+    if manifest_member is None:
+        raise RuntimeError("docker save archive is missing manifest.json")
+    manifest_fp = outer.extractfile(manifest_member)
+    if manifest_fp is None:
+        raise RuntimeError("docker save manifest.json is not a regular file")
+    try:
+        manifest = json.loads(manifest_fp.read().decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Failed to parse docker save manifest.json: {exc}") from exc
+
+    if not isinstance(manifest, list) or not manifest:
+        raise RuntimeError("docker save manifest.json must be a non-empty list")
+
+    declared_layers: list[str] = []
+    for entry in manifest:
+        if not isinstance(entry, dict):
+            raise RuntimeError("Invalid non-object entry in docker save manifest.json")
+        layers = entry.get("Layers")
+        if not isinstance(layers, list):
+            raise RuntimeError("docker save manifest entry is missing Layers list")
+        for layer in layers:
+            if not isinstance(layer, str) or not layer.strip():
+                raise RuntimeError(f"Invalid layer path in manifest.json: {layer!r}")
+            declared_layers.append(layer)
+
+    if not declared_layers:
+        raise RuntimeError("docker save manifest.json declared 0 layers")
+
+    hits: list[str] = []
+    scanned = 0
+    for layer_name in declared_layers:
+        layer_member = _resolve_tar_member(members_by_name, layer_name)
+        if layer_member is None:
+            raise RuntimeError(
+                f"Declared layer {layer_name!r} in manifest.json is missing from archive"
+            )
+        extracted = outer.extractfile(layer_member)
+        if extracted is None:
+            raise RuntimeError(
+                f"Declared layer {layer_name!r} could not be extracted from archive"
+            )
+        try:
+            with tarfile.open(fileobj=extracted, mode="r|*") as layer_tar:
+                for lmember in layer_tar:
+                    norm = lmember.name.lstrip("./")
+                    for forbidden in forbidden_substrings:
+                        if forbidden in norm:
+                            hits.append(f"{layer_name}:{norm}")
+        except (tarfile.TarError, EOFError, OSError) as exc:
+            raise RuntimeError(
+                f"Failed to parse declared layer {layer_name!r}: {exc}"
+            ) from exc
+        scanned += 1
+
+    if scanned == 0:
+        raise RuntimeError("Scanned 0 image layers")
+    return sorted(set(hits)), scanned
+
+
+def scan_tar_file_for_paths(
+    tar_path: Path,
+    forbidden_substrings: Sequence[str],
+) -> tuple[list[str], int]:
+    """Scan an on-disk ``docker save`` archive strictly by ``manifest.json`` layers."""
+    with tarfile.open(tar_path, mode="r:*") as outer:
+        return _scan_opened_docker_save_tar(outer, forbidden_substrings)
+
+
 def scan_tar_stream_for_paths(
     tar_bytes: bytes,
     forbidden_substrings: Sequence[str],
 ) -> list[str]:
-    """Scan a ``docker save`` tar archive, inspecting every nested ``layer.tar``."""
-    hits: list[str] = []
+    """Scan an in-memory ``docker save`` tar archive strictly by ``manifest.json`` layers."""
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:*") as outer:
-        for member in outer.getmembers():
-            if not member.isfile():
-                continue
-            name = member.name
-            is_layer = name.endswith(".tar") or name.endswith(".tar.gz") or "/layer.tar" in name
-            if not is_layer and not name.startswith("blobs/"):
-                continue
-            extracted = outer.extractfile(member)
-            if extracted is None:
-                continue
-            raw_layer = extracted.read()
-            try:
-                with tarfile.open(fileobj=io.BytesIO(raw_layer), mode="r:*") as layer_tar:
-                    for lmember in layer_tar.getmembers():
-                        norm = lmember.name.lstrip("./")
-                        for forbidden in forbidden_substrings:
-                            if forbidden in norm:
-                                hits.append(f"{name}:{norm}")
-            except tarfile.TarError:
-                # Non-tar blob (e.g., OCI JSON config/manifest)
-                continue
-    return sorted(set(hits))
+        hits, _ = _scan_opened_docker_save_tar(outer, forbidden_substrings)
+        return hits
 
 
 class ComposeContext:
@@ -419,10 +570,15 @@ class ComposeContext:
             capture_output=capture_output,
         )
         if check and proc.returncode != 0:
-            stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
-            stdout = (proc.stdout or b"").decode("utf-8", errors="replace")
+            stderr = _redact_secrets_text(
+                (proc.stderr or b"").decode("utf-8", errors="replace"), self.env
+            )
+            stdout = _redact_secrets_text(
+                (proc.stdout or b"").decode("utf-8", errors="replace"), self.env
+            )
+            subcmd = " ".join(args[:2]) if args else "<empty>"
             raise RuntimeError(
-                f"Command failed (rc={proc.returncode}): {' '.join(cmd)}\n"
+                f"docker compose {subcmd} failed (rc={proc.returncode}, args={len(args)})\n"
                 f"STDOUT:\n{stdout[-2000:]}\nSTDERR:\n{stderr[-2000:]}"
             )
         return proc
@@ -521,17 +677,27 @@ class ComposeContext:
         self,
         service: str,
         forbidden_substrings: Sequence[str],
-    ) -> list[str]:
-        """Run ``docker save`` on a service's built image and scan every ``layer.tar``."""
-        image_id = (
-            self.compose("images", "-q", service)
-            .stdout.decode("utf-8")
-            .strip()
-            .splitlines()[0]
-        )
-        saved = subprocess.run(
-            ["docker", "save", image_id],
-            capture_output=True,
-            check=True,
-        )
-        return scan_tar_stream_for_paths(saved.stdout, forbidden_substrings)
+    ) -> tuple[list[str], int]:
+        """Run ``docker save -o <tmp.tar>`` on a service's image and scan every manifest layer."""
+        raw_ids = [
+            line.strip()
+            for line in self.compose("images", "-q", service).stdout.decode("utf-8").splitlines()
+            if line.strip()
+        ]
+        if not raw_ids:
+            raise RuntimeError(f"No image ID returned by `docker compose images -q {service}`")
+        image_id = raw_ids[0]
+        with tempfile.TemporaryDirectory(prefix=f"scan-{service}-") as tmpdir:
+            tar_path = Path(tmpdir) / f"{service}.tar"
+            proc = subprocess.run(
+                ["docker", "save", "-o", str(tar_path), image_id],
+                capture_output=True,
+            )
+            if proc.returncode != 0:
+                stderr = _redact_secrets_text(
+                    (proc.stderr or b"").decode("utf-8", errors="replace"), self.env
+                )
+                raise RuntimeError(
+                    f"docker save failed for service {service} (rc={proc.returncode}): {stderr[-1000:]}"
+                )
+            return scan_tar_file_for_paths(tar_path, forbidden_substrings)

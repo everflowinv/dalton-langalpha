@@ -48,11 +48,18 @@ with psycopg.connect(**conninfo, autocommit=True) as conn:
         cur.execute("SELECT pg_advisory_lock(%s)", (LOCK_KEY,))
     try:
         run_step("Running upstream database migrations", ["uv", "run", "--no-sync", "alembic", "upgrade", "head"])
-        if os.path.isfile("src/dalton/alembic.ini"):
-            run_step(
-                "Running Dalton database migrations (alembic_version_dalton)",
-                ["uv", "run", "--no-sync", "alembic", "-c", "src/dalton/alembic.ini", "upgrade", "head"],
+        dalton_ini = "src/dalton/alembic.ini"
+        if not os.path.isfile(dalton_ini):
+            print(
+                f"[migrate] ERROR: Required Dalton Alembic config not found: {dalton_ini}",
+                file=sys.stderr,
+                flush=True,
             )
+            sys.exit(1)
+        run_step(
+            "Running Dalton database migrations (alembic_version_dalton)",
+            ["uv", "run", "--no-sync", "alembic", "-c", dalton_ini, "upgrade", "head"],
+        )
     finally:
         try:
             with conn.cursor() as cur:

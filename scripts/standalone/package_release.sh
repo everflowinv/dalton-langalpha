@@ -5,7 +5,7 @@
 # Usage:
 #   bash scripts/standalone/package_release.sh --output /tmp/dalton-core-dist
 #   bash scripts/standalone/package_release.sh --ref HEAD --tar /tmp/dalton-core.tar.gz
-#   bash scripts/standalone/package_release.sh --ref HEAD --output /tmp/dist --report /tmp/scan.txt
+#   bash scripts/standalone/package_release.sh --ref HEAD --include-ci --output /tmp/dist --report /tmp/scan.txt
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -13,6 +13,7 @@ GIT_REF="HEAD"
 OUTPUT_DIR=""
 TAR_PATH=""
 REPORT_PATH=""
+INCLUDE_CI=0
 
 usage() {
   cat <<'EOF'
@@ -24,6 +25,8 @@ Options:
   --output <dir>      Export clean release tree into this directory (created fresh)
   --tar <file.tar.gz> Write compressed release tarball to this path
   --report <file>     Also write the proprietary-term scan report to this path
+  --include-ci        Also export CI compose overlay & standalone test harness
+                      (docker-compose.ci.yml, tests/fakes, tests/standalone)
   -h, --help          Show this help
 EOF
 }
@@ -49,6 +52,10 @@ while [[ $# -gt 0 ]]; do
     --report)
       REPORT_PATH="$2"
       shift 2
+      ;;
+    --include-ci)
+      INCLUDE_CI=1
+      shift
       ;;
     -h|--help)
       usage
@@ -96,6 +103,7 @@ COMMIT_SHA="$(git rev-parse "${GIT_REF}^{commit}")"
 ALLOWLIST_REQUIRED=(
   "LICENSE"
   "README.md"
+  "Makefile"
   "pyproject.toml"
   "uv.lock"
   "server.py"
@@ -129,6 +137,7 @@ ALLOWLIST_REQUIRED=(
   "deploy/Dockerfile.backend"
   "deploy/Dockerfile.dev"
   "deploy/Dockerfile.web"
+  "scripts/configure.sh"
   "scripts/docker_entrypoint.sh"
   "scripts/_errors.py"
   "scripts/dalton/Dockerfile.dalton"
@@ -151,6 +160,14 @@ ALLOWLIST_OPTIONAL=(
   "plugins/dalton_sec"
 )
 
+# Exported only when `--include-ci` is explicitly passed so customer release
+# tarballs never ship test fixtures or CI compose overlays.
+ALLOWLIST_CI=(
+  "docker-compose.ci.yml"
+  "tests/fakes"
+  "tests/standalone"
+)
+
 ARCHIVE_PATHS=()
 for path in "${ALLOWLIST_REQUIRED[@]}"; do
   if ! git cat-file -e "${COMMIT_SHA}:${path}" 2>/dev/null; then
@@ -166,6 +183,16 @@ for path in "${ALLOWLIST_OPTIONAL[@]}"; do
   fi
 done
 
+if [[ "$INCLUDE_CI" -eq 1 ]]; then
+  for path in "${ALLOWLIST_CI[@]}"; do
+    if ! git cat-file -e "${COMMIT_SHA}:${path}" 2>/dev/null; then
+      echo "ERROR: Required CI allowlist path missing in ${GIT_REF}: ${path}" >&2
+      exit 1
+    fi
+    ARCHIVE_PATHS+=("$path")
+  done
+fi
+
 STAGE_DIR="$(mktemp -d)"
 cleanup() {
   rm -rf "$STAGE_DIR"
@@ -178,14 +205,16 @@ mkdir -p "$EXPORT_ROOT"
 git archive --format=tar "$COMMIT_SHA" -- "${ARCHIVE_PATHS[@]}" | tar -xf - -C "$EXPORT_ROOT"
 
 # Defense-in-depth post-extract denylist inside allowlisted parent directories
-# (e.g. `web/`, `docs-site/`, `src/`). Never touches the working tree.
+# (e.g. `web/`, `src/`). Never touches the working tree.
+# Note: docs-site/src/content/docs/everflow is intentionally retained in Batch 1
+# because Starlight's sidebar still references those slugs; Batch 3 prunes both
+# the sidebar and the everflow docs pages together.
 DENY_PATHS=(
   "plugins/dalton_data"
   "scripts/dalton/researchdata_bridge.py"
   "scripts/dalton/research_runtime"
   "scripts/dalton/ops"
   "web/.env.dalton"
-  "docs-site/src/content/docs/everflow"
 )
 
 for deny in "${DENY_PATHS[@]}"; do

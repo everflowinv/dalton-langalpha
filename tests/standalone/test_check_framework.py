@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import io
+import json
 from pathlib import Path
 import subprocess
 import tarfile
+from unittest.mock import create_autospec, patch
 
 import pytest
 
@@ -14,6 +16,43 @@ from tests.standalone.checks import _lib
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CHECKS_DIR = REPO_ROOT / "tests" / "standalone" / "checks"
 PACKAGE_SCRIPT = REPO_ROOT / "scripts" / "standalone" / "package_release.sh"
+
+
+def _make_docker_save_tar(
+    layers: list[tuple[str, bytes]],
+    *,
+    manifest_layers: list[str] | None = None,
+    include_manifest: bool = True,
+) -> bytes:
+    outer_buf = io.BytesIO()
+    with tarfile.open(fileobj=outer_buf, mode="w") as outer:
+        if include_manifest:
+            declared = (
+                manifest_layers
+                if manifest_layers is not None
+                else [name for name, _ in layers]
+            )
+            manifest_raw = json.dumps(
+                [{"Config": "config.json", "RepoTags": ["test:latest"], "Layers": declared}]
+            ).encode("utf-8")
+            minfo = tarfile.TarInfo("manifest.json")
+            minfo.size = len(manifest_raw)
+            outer.addfile(minfo, io.BytesIO(manifest_raw))
+        for name, raw in layers:
+            info = tarfile.TarInfo(name)
+            info.size = len(raw)
+            outer.addfile(info, io.BytesIO(raw))
+    return outer_buf.getvalue()
+
+
+def _make_layer_tar(entries: list[tuple[str, bytes]]) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as ltar:
+        for path, data in entries:
+            info = tarfile.TarInfo(path)
+            info.size = len(data)
+            ltar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
 
 
 def test_b1_dev_mode_declares_oss_auth_and_is_discovered() -> None:
@@ -80,45 +119,95 @@ def test_sse_block_parsing_and_extractors() -> None:
     assert _lib.extract_assistant_text([ev1, ev2]) == "Hello world!"
 
 
-def test_scan_tar_stream_inspects_nested_layers() -> None:
-    # Build a synthetic `docker save`-style archive containing two layer tars,
-    # with a forbidden file in layer 1 even though layer 2 deletes/omits it.
-    layer1_buf = io.BytesIO()
-    with tarfile.open(fileobj=layer1_buf, mode="w") as l1:
-        info = tarfile.TarInfo("app/scripts/dalton/researchdata_bridge.py")
-        data = b"secret"
-        info.size = len(data)
-        l1.addfile(info, io.BytesIO(data))
+def test_scan_tar_stream_inspects_nested_layers_strictly(tmp_path: Path) -> None:
+    l1 = _make_layer_tar([("app/scripts/dalton/researchdata_bridge.py", b"secret")])
+    l2 = _make_layer_tar([("app/server.py", b"ok")])
+    archive = _make_docker_save_tar([("layer1/layer.tar", l1), ("layer2/layer.tar", l2)])
 
-    layer2_buf = io.BytesIO()
-    with tarfile.open(fileobj=layer2_buf, mode="w") as l2:
-        info = tarfile.TarInfo("app/server.py")
-        data = b"ok"
-        info.size = len(data)
-        l2.addfile(info, io.BytesIO(data))
-
-    outer_buf = io.BytesIO()
-    with tarfile.open(fileobj=outer_buf, mode="w") as outer:
-        for name, raw in (
-            ("layer1/layer.tar", layer1_buf.getvalue()),
-            ("layer2/layer.tar", layer2_buf.getvalue()),
-        ):
-            info = tarfile.TarInfo(name)
-            info.size = len(raw)
-            outer.addfile(info, io.BytesIO(raw))
-
-    hits = _lib.scan_tar_stream_for_paths(
-        outer_buf.getvalue(),
+    tar_file = tmp_path / "img.tar"
+    tar_file.write_bytes(archive)
+    hits, scanned = _lib.scan_tar_file_for_paths(
+        tar_file,
         ("scripts/dalton/researchdata_bridge.py", "plugins/dalton_data/"),
     )
+    assert scanned == 2
     assert hits == ["layer1/layer.tar:app/scripts/dalton/researchdata_bridge.py"]
 
+    # Stream wrapper matches
+    assert _lib.scan_tar_stream_for_paths(
+        archive, ("scripts/dalton/researchdata_bridge.py",)
+    ) == ["layer1/layer.tar:app/scripts/dalton/researchdata_bridge.py"]
 
-def test_package_release_exports_clean_allowlist_and_excludes_proprietary(
+
+def test_scan_tar_rejects_missing_manifest_zero_layers_missing_layer_and_corrupt_layer() -> None:
+    l1 = _make_layer_tar([("app/server.py", b"ok")])
+
+    # 1. Missing manifest.json
+    no_manifest = _make_docker_save_tar([("layer1/layer.tar", l1)], include_manifest=False)
+    with pytest.raises(RuntimeError, match="missing manifest.json"):
+        _lib.scan_tar_stream_for_paths(no_manifest, ("forbidden",))
+
+    # 2. 0 layers declared
+    zero_layers = _make_docker_save_tar([], manifest_layers=[])
+    with pytest.raises(RuntimeError, match="declared 0 layers"):
+        _lib.scan_tar_stream_for_paths(zero_layers, ("forbidden",))
+
+    # 3. Declared layer missing from archive
+    missing_layer = _make_docker_save_tar([], manifest_layers=["ghost/layer.tar"])
+    with pytest.raises(RuntimeError, match="missing from archive"):
+        _lib.scan_tar_stream_for_paths(missing_layer, ("forbidden",))
+
+    # 4. Declared layer is corrupted / unparseable tar
+    corrupt_layer = _make_docker_save_tar([("bad/layer.tar", b"not-a-valid-tar-archive")])
+    with pytest.raises(RuntimeError, match="Failed to parse declared layer"):
+        _lib.scan_tar_stream_for_paths(corrupt_layer, ("forbidden",))
+
+
+def test_scan_artifacts_for_secrets_and_compose_error_redaction(tmp_path: Path) -> None:
+    secret_val = "abcdef0123456789abcdef0123456789"
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        f"INTERNAL_SERVICE_TOKEN={secret_val}\nDB_PASSWORD=dbsecret0123456789abcdef\n",
+        encoding="utf-8",
+    )
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "clean.txt").write_text("all clear\n", encoding="utf-8")
+    (artifacts / "baseline.dump").write_bytes(secret_val.encode("utf-8"))  # binary dump skipped
+    assert _lib.scan_artifacts_for_secrets(artifacts, env_file) == []
+
+    (artifacts / "compose-logs-oss.txt").write_text(
+        f"GET /api/v1/users/me header={secret_val}\n", encoding="utf-8"
+    )
+    leaks = _lib.scan_artifacts_for_secrets(artifacts, env_file)
+    assert leaks == ["compose-logs-oss.txt: leaked INTERNAL_SERVICE_TOKEN"]
+    assert all(secret_val not in hit for hit in leaks)
+
+    # ComposeContext.compose() must not print full command args or raw secrets on failure
+    ctx = _lib.ComposeContext(
+        work_dir=tmp_path,
+        compose_files=[tmp_path / "docker-compose.yml"],
+        artifacts_dir=artifacts,
+    )
+    fake_proc = subprocess.CompletedProcess(
+        args=["docker", "compose"],
+        returncode=1,
+        stdout=b"",
+        stderr=f"err with {secret_val}".encode("utf-8"),
+    )
+    mock_run = create_autospec(subprocess.run, return_value=fake_proc)
+    with patch.object(subprocess, "run", mock_run):
+        with pytest.raises(RuntimeError) as exc_info:
+            ctx.compose("exec", "-T", "backend", "python", "-c", f"token={secret_val}")
+    msg = str(exc_info.value)
+    assert secret_val not in msg
+    assert "<REDACTED:INTERNAL_SERVICE_TOKEN>" in msg
+    assert "python" not in msg
+
+
+def test_package_release_exports_clean_allowlist_and_include_ci_option(
     tmp_path: Path,
 ) -> None:
-    # Build a self-contained synthetic git repo under tmp_path so the test is
-    # hermetic (no git alternates dependency and zero writes to the workspace).
     repo = tmp_path / "repo"
     repo.mkdir()
 
@@ -127,10 +216,10 @@ def test_package_release_exports_clean_allowlist_and_excludes_proprietary(
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
 
-    # All required allowlist paths + optional core paths
     for rel in (
         "LICENSE",
         "README.md",
+        "Makefile",
         "pyproject.toml",
         "uv.lock",
         "server.py",
@@ -141,6 +230,7 @@ def test_package_release_exports_clean_allowlist_and_excludes_proprietary(
         "agent_config.core.yaml",
         "docker-compose.yml",
         "docker-compose.core.yml",
+        "docker-compose.ci.yml",
         ".env.example",
         ".env.core.example",
         ".dockerignore",
@@ -168,6 +258,7 @@ def test_package_release_exports_clean_allowlist_and_excludes_proprietary(
         "deploy/Dockerfile.dev",
         "deploy/Dockerfile.web",
         "deploy/standalone/Caddyfile",
+        "scripts/configure.sh",
         "scripts/docker_entrypoint.sh",
         "scripts/_errors.py",
         "scripts/dalton/Dockerfile.dalton",
@@ -178,13 +269,14 @@ def test_package_release_exports_clean_allowlist_and_excludes_proprietary(
         "scripts/standalone/init.sh",
         "web/package.json",
         "docs-site/package.json",
+        "docs-site/src/content/docs/everflow/monitors.md",
+        "tests/fakes/fake_openai_server.py",
+        "tests/standalone/run_checks.sh",
     ):
         _touch(rel)
 
-    # Seed a scan-term hit inside an exported file to verify the report catches it
     _touch("src/dalton/settings.py", 'CONTACT = "demo@everflowinv.com"\n')
 
-    # Proprietary / Everflow-only files that MUST be excluded
     for excluded in (
         "plugins/dalton_data/plugin.json",
         "plugins/dalton_data/dalton_sec_mcp_server.py",
@@ -196,7 +288,6 @@ def test_package_release_exports_clean_allowlist_and_excludes_proprietary(
         "src/dalton/nested.dalton.yaml",
         "docker-compose.dalton.yml",
         "web/.env.dalton",
-        "docs-site/src/content/docs/everflow/internal.md",
         "integrations/dalton-channel-gateway/package.json",
         "deploy/dalton/Caddyfile",
     ):
@@ -210,6 +301,7 @@ def test_package_release_exports_clean_allowlist_and_excludes_proprietary(
     subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
     subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=str(repo), check=True)
 
+    # 1. Default release export: includes Makefile, scripts/configure.sh, full docs-site; excludes CI files
     out_dir = tmp_path / "dist"
     tar_path = tmp_path / "dist.tar.gz"
     report_path = tmp_path / "scan.txt"
@@ -236,13 +328,12 @@ def test_package_release_exports_clean_allowlist_and_excludes_proprietary(
     )
     assert "Standalone Core Release Scan Report" in proc.stdout
     assert report_path.is_file()
-    report_text = report_path.read_text(encoding="utf-8")
-    assert "everflowinv" in report_text
-    assert "src/dalton/settings.py" in report_text
+    assert "everflowinv" in report_path.read_text(encoding="utf-8")
     assert tar_path.is_file() and tar_path.stat().st_size > 0
 
-    # Essential core files present
     for expected in (
+        "Makefile",
+        "scripts/configure.sh",
         "server.py",
         "pyproject.toml",
         "docker-compose.yml",
@@ -256,11 +347,15 @@ def test_package_release_exports_clean_allowlist_and_excludes_proprietary(
         "scripts/standalone/init.sh",
         "scripts/dalton/Dockerfile.dalton",
         "scripts/dalton/Dockerfile.postgres",
+        "docs-site/src/content/docs/everflow/monitors.md",
         ".release_git_sha",
     ):
         assert (out_dir / expected).exists(), f"Missing expected core file: {expected}"
 
-    # Excluded proprietary / Everflow paths absent
+    assert not (out_dir / "docker-compose.ci.yml").exists()
+    assert not (out_dir / "tests/fakes").exists()
+    assert not (out_dir / "tests/standalone").exists()
+
     for excluded in (
         "plugins/dalton_data",
         "scripts/dalton/researchdata_bridge.py",
@@ -271,12 +366,38 @@ def test_package_release_exports_clean_allowlist_and_excludes_proprietary(
         "src/dalton/nested.dalton.yaml",
         "docker-compose.dalton.yml",
         "web/.env.dalton",
-        "docs-site/src/content/docs/everflow",
         "integrations/dalton-channel-gateway",
         "deploy/dalton",
     ):
         assert not (out_dir / excluded).exists(), f"Excluded path leaked: {excluded}"
 
-    # No *.dalton.yaml anywhere in exported tree
-    leaked_dalton_yamls = list(out_dir.rglob("*.dalton.yaml"))
-    assert not leaked_dalton_yamls, f"Leaked *.dalton.yaml: {leaked_dalton_yamls}"
+    assert not list(out_dir.rglob("*.dalton.yaml"))
+
+    # 2. Explicit `--include-ci` export also includes docker-compose.ci.yml + tests/fakes + tests/standalone
+    ci_out = tmp_path / "dist-ci"
+    subprocess.run(
+        [
+            "bash",
+            str(PACKAGE_SCRIPT),
+            "--repo",
+            str(repo),
+            "--ref",
+            "HEAD",
+            "--include-ci",
+            "--output",
+            str(ci_out),
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    for expected_ci in (
+        "docker-compose.ci.yml",
+        "tests/fakes/fake_openai_server.py",
+        "tests/standalone/run_checks.sh",
+        "Makefile",
+        "scripts/configure.sh",
+    ):
+        assert (ci_out / expected_ci).exists(), f"Missing CI export file: {expected_ci}"
+    assert not (ci_out / "plugins/dalton_data").exists()

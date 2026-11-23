@@ -150,13 +150,17 @@ services:
     environment:
       APP_ENV: core
       DALTON_PROFILE: core
+      HOST_MODE: ${HOST_MODE:-oss}
+      DALTON_AUTH_MODE: ${DALTON_AUTH_MODE:-oss}
       DB_HOST: ${DB_HOST:-postgres}
       REDIS_URL: "${REDIS_URL:-redis://:${REDIS_PASSWORD:-redis}@redis:6379/0}"
       PUBLIC_APP_URL: ${PUBLIC_APP_URL:-http://127.0.0.1:${DALTON_EDGE_PORT:-8088}}
       SERVER_BASE_URL: ${SERVER_BASE_URL:-http://127.0.0.1:${DALTON_EDGE_PORT:-8088}}
       EGRESS_RELAY_BASE_URL: ${EGRESS_RELAY_BASE_URL:-http://backend:8000}
       SANDBOX_PROVIDER: ${SANDBOX_PROVIDER:-docker}
+      SANDBOX_DOCKER_NETWORK: ${SANDBOX_DOCKER_NETWORK:-${COMPOSE_PROJECT_NAME:-dalton-core}_sandbox}
       DALTON_BACKEND_VAR_DIR: /app/var/dalton
+      DALTON_CHAT_UPLOAD_SIGNING_SECRET: ${DALTON_CHAT_UPLOAD_SIGNING_SECRET:-}
       DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL: ${DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL:-http://minio:9000}
       DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME: ${DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME:-chat-uploads}
       DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID: ${DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID:-${MINIO_ROOT_USER:-}}
@@ -225,9 +229,10 @@ services:
 networks:
   core_internal: {}
   sandbox-net:
-    # Explicit network name so sandbox.docker.network_mode="sandbox-net" in
-    # agent_config.core.yaml resolves regardless of Compose project prefix.
-    name: ${SANDBOX_DOCKER_NETWORK:-sandbox-net}
+    # Per-instance network name shared with backend's SANDBOX_DOCKER_NETWORK
+    # (read by DockerProvider in src/ptc_agent/core/sandbox/providers/docker.py).
+    # Default deployment assumes one standalone core stack per Docker host.
+    name: ${SANDBOX_DOCKER_NETWORK:-${COMPOSE_PROJECT_NAME:-dalton-core}_sandbox}
 
 volumes:
   dalton-minio-data:

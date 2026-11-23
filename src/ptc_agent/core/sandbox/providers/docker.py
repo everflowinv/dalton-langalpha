@@ -749,11 +749,19 @@ class DockerProvider(SandboxProvider):
 
         sizing = self._resolve_tier(tier)
 
+        # DALTON-HOOK(standalone-core): let SANDBOX_DOCKER_NETWORK override
+        # sandbox.docker.network_mode so Compose and DockerProvider share the
+        # same per-instance sandbox network name (e.g. `${COMPOSE_PROJECT_NAME}_sandbox`).
+        network_mode = (
+            os.getenv("SANDBOX_DOCKER_NETWORK", "").strip()
+            or self._config.network_mode
+        )
+
         # Build container config
         host_config: dict[str, Any] = {
             "Memory": sizing.memory_bytes,
             "NanoCpus": int(sizing.cpus * 1e9),
-            "NetworkMode": self._config.network_mode,
+            "NetworkMode": network_mode,
             "AutoRemove": False,  # We manage removal ourselves
             "Init": True,  # tini as PID 1 for zombie reaping
             **_FUSE_HOST_CONFIG,
@@ -763,7 +771,7 @@ class DockerProvider(SandboxProvider):
         # host.docker.internal resolves natively on Docker Desktop but not on
         # Linux bridge networks; pin it so the egress relay's default base URL
         # (see services/egress/reachability.py) works on both.
-        if self._config.network_mode != "none":
+        if network_mode != "none":
             host_config["ExtraHosts"] = ["host.docker.internal:host-gateway"]
 
         # Publish proxy ports so preview URLs are reachable from the host.
