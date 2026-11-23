@@ -3293,10 +3293,17 @@ async def dispatch_data_task_run_notification(
         automation,
     )
 
+    from src.dalton.capabilities import is_channel_target_enabled
+
     valid_targets: list[tuple[str, str]] = []
     for raw_tgt in targets or []:
         ch, cleaned_tgt = _split_target_channel(raw_tgt)
-        if ch and cleaned_tgt and (ch, cleaned_tgt) not in valid_targets:
+        if (
+            ch
+            and cleaned_tgt
+            and is_channel_target_enabled(cleaned_tgt, channel=ch)
+            and (ch, cleaned_tgt) not in valid_targets
+        ):
             valid_targets.append((ch, cleaned_tgt))
 
     use_delivery_db = (

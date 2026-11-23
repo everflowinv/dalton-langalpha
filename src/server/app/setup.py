@@ -957,18 +957,9 @@ async def lifespan(app: FastAPI):
     # in the background, so this worker heals when it answers instead of
     # serving without its tools until a restart. Last, so nothing above can
     # fail startup with the task running.
-    from ptc_agent.core.mcp_registry import get_global_registry, reconnect_builtin_remote
+    from src.dalton.capabilities import start_mcp_builtin_reconnect_task  # DALTON-HOOK(standalone-core)
 
-    mcp_reconnect: asyncio.Task[None] | None = None
-    booted_registry = get_global_registry()
-    if booted_registry is not None and booted_registry.failed_builtin_remote:
-        mcp_reconnect = asyncio.create_task(
-            reconnect_builtin_remote(), name="mcp-builtin-reconnect"
-        )
-        logger.info(
-            "Reconnecting built-in MCP servers in the background: %s",
-            ", ".join(sorted(booted_registry.failed_builtin_remote)),
-        )
+    mcp_reconnect: asyncio.Task[None] | None = start_mcp_builtin_reconnect_task(logger)
 
     # Startup leaves ~700k import-time objects (pydantic schemas, routes,
     # module state) that never die, and every full collection re-walks them

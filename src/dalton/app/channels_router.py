@@ -18,6 +18,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from src.config import env
 from src.dalton.access_tiers import get_user_tier
 from src.dalton.auth import is_dalton_service_request
+from src.dalton.capabilities import (
+    CapabilityId,
+    require_capability,
+    require_capability_dep,
+    require_channel_platform_capability,
+)
 from src.dalton.database.channel_gateway import (
     SUPPORTED_PLATFORMS,
     authorize_and_claim_delivery,
@@ -40,7 +46,11 @@ from src.server.utils.api import CurrentUserId
 
 logger = logging.getLogger(__name__)
 
-channels_router = APIRouter(prefix="/channels", tags=["Dalton Channels"])
+channels_router = APIRouter(
+    prefix="/channels",
+    tags=["Dalton Channels"],
+    dependencies=[Depends(require_capability_dep(CapabilityId.CHANNEL_GATEWAY))],
+)
 
 _GATEWAY_PROXY_TIMEOUT = httpx.Timeout(45.0, connect=5.0)
 _ADMIN_ONLY_WEIXIN_DETAIL = (
@@ -473,6 +483,8 @@ async def internal_bind_code_consume_endpoint(
     request: Request,
 ) -> dict[str, Any]:
     """I-2: Consume a bind code (or revoke on group leak) or unbind a platform."""
+    if str(body.action or "").strip().lower() != "unbind":
+        require_channel_platform_capability(body.platform)
     eff_uid = _resolve_optional_internal_user_id(
         request,
         body.user_id,
@@ -795,7 +807,10 @@ async def internal_automation_runs_finish_endpoint(
 
 @channels_router.get(
     "/internal/weixin-state",
-    dependencies=[Depends(require_channel_service_token)],
+    dependencies=[
+        Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN)),
+        Depends(require_channel_service_token),
+    ],
 )
 async def internal_weixin_state_get_endpoint(
     request: Request,
@@ -814,7 +829,10 @@ async def internal_weixin_state_get_endpoint(
 
 @channels_router.put(
     "/internal/weixin-state",
-    dependencies=[Depends(require_channel_service_token)],
+    dependencies=[
+        Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN)),
+        Depends(require_channel_service_token),
+    ],
 )
 async def internal_weixin_state_put_endpoint(
     body: WeixinStatePutRequest,
@@ -866,6 +884,7 @@ async def web_create_bind_code_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     """§1.5 (1): Generate a 10-minute `DLT-XXXX-XXXX` bind code for the current user."""
+    require_channel_platform_capability(body.platform)
     return await create_bind_code(user_id=user_id, platform=body.platform)
 
 
@@ -955,7 +974,10 @@ async def web_put_channel_settings_endpoint(
         raise
 
 
-@channels_router.post("/discord-channels")
+@channels_router.post(
+    "/discord-channels",
+    dependencies=[Depends(require_capability_dep(CapabilityId.CHANNEL_DISCORD))],
+)
 async def web_mutate_discord_channel_endpoint(
     body: DiscordChannelEntryRequest,
     user_id: CurrentUserId,
@@ -1025,11 +1047,15 @@ async def _proxy_to_gateway_weixin(
     params: dict[str, Any] | None = None,
     json_body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    base_url = (
-        os.getenv("CHANNEL_GATEWAY_URL")
-        or getattr(env, "CHANNEL_GATEWAY_URL", "")
-        or "http://127.0.0.1:8962"
-    ).strip().rstrip("/")
+    from src.dalton.settings import get_dalton_channel_gateway_url
+
+    require_capability(CapabilityId.CHANNEL_GATEWAY, CapabilityId.CHANNEL_WEIXIN)
+    base_url = get_dalton_channel_gateway_url().strip().rstrip("/")
+    if not base_url:
+        raise HTTPException(
+            status_code=503,
+            detail="Channel gateway URL is not configured",
+        )
     token = (
         os.getenv("INTERNAL_SERVICE_TOKEN")
         or getattr(env, "INTERNAL_SERVICE_TOKEN", "")
@@ -1070,7 +1096,10 @@ async def _proxy_to_gateway_weixin(
     return resp.json()
 
 
-@channels_router.post("/weixin/qrcode/start")
+@channels_router.post(
+    "/weixin/qrcode/start",
+    dependencies=[Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN))],
+)
 async def web_weixin_qrcode_start_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
@@ -1085,7 +1114,10 @@ async def web_weixin_qrcode_start_endpoint(
     return _shape_public_weixin_qr_response(raw)
 
 
-@channels_router.get("/weixin/qrcode/wait")
+@channels_router.get(
+    "/weixin/qrcode/wait",
+    dependencies=[Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN))],
+)
 async def web_weixin_qrcode_wait_endpoint(
     user_id: CurrentUserId,
     session_key: str = Query(..., min_length=1),
@@ -1102,7 +1134,10 @@ async def web_weixin_qrcode_wait_endpoint(
     return _shape_public_weixin_qr_response(raw)
 
 
-@channels_router.post("/weixin/qrcode/verify-code")
+@channels_router.post(
+    "/weixin/qrcode/verify-code",
+    dependencies=[Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN))],
+)
 async def web_weixin_qrcode_verify_code_endpoint(
     body: WeixinVerifyCodeRequest,
     user_id: CurrentUserId,

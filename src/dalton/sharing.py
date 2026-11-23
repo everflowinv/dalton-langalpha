@@ -731,8 +731,12 @@ async def resolve_turn_team_memory_enabled(
       ``dalton_workspace_settings.team_memory_enabled`` for ``workspace_id``.
     - Missing row or DB unavailability fails closed to False.
     """
+    from src.dalton.capabilities import CapabilityId, effective_capabilities
+
     settings = get_dalton_settings()
-    if not settings.conversations.enabled:
+    if CapabilityId.CONVERSATION_ARCHIVE not in effective_capabilities(
+        conversations_enabled=settings.conversations.enabled,
+    ):
         return False
     if user_tier is not None and not is_internal_tier(user_tier):
         return False

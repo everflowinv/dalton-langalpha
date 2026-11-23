@@ -31,6 +31,8 @@ web/src/pages/Dashboard/__tests__/ChatInputCard.mobileDraft.test.tsx
 tests/unit/tools/secretary/test_workspace_file_copy_cos.py
 agent_config.dalton.yaml
 config.dalton.yaml
+agent_config.core.yaml
+config.core.yaml
 docker-compose.dalton.yml
 src/ptc_agent/agent/middleware/skills/dalton_registry.py
 web/src/pages/Settings/panels/dalton/
@@ -542,3 +544,6 @@ web/src/pages/Setup/answers/__tests__/daltonTeamModelsCheck.test.ts
 plugins/langalpha_service/skills/langalpha-doc/references/settings-map.md
 # Chief of Staff settings tools (manage_workspaces update) tests.
 tests/unit/tools/secretary/test_workspace_settings_tools.py
+# Standalone Core Batch 1a: on-demand WebSearch registration & search provider availability tests.
+tests/unit/ptc_agent/agent/test_web_search_registration.py
+tests/unit/tools/web/test_search_availability.py

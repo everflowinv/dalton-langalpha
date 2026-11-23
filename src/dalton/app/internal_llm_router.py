@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, create_model
 
 from src.dalton.app.channels_router import require_channel_service_token
+from src.dalton.capabilities import CapabilityId, require_capability_dep
 from src.dalton.llm.complete import dalton_complete
 from src.dalton.settings import get_configured_pm_user_ids, get_dalton_config
 
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 internal_llm_router = APIRouter(
     prefix="/internal/llm",
     tags=["Dalton Internal LLM"],
+    dependencies=[Depends(require_capability_dep(CapabilityId.DATA_JOBS))],
 )
 
 

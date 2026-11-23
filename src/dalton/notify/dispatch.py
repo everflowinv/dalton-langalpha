@@ -1961,14 +1961,49 @@ async def post_bridge_notify(
     HTTP timeout is derived as ``get_feishu_send_card_timeout_s() + 5.0`` (``get_notify_http_timeout_s()``).
     Never logs response bodies or bridge tokens; returns structured status on non-2xx or invalid JSON.
     """
+    from src.dalton.capabilities import (
+        CapabilityId,
+        has_capability,
+        is_channel_target_enabled,
+    )
+
+    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
+        return {
+            "ok": False,
+            "status_code": 503,
+            "error_code": "capability_disabled",
+            "results": [
+                {"target": t, "ok": False, "error": "capability_disabled"}
+                for t in targets
+            ],
+        }
+    allowed_targets = [t for t in targets if is_channel_target_enabled(t)]
+    disabled_targets = [t for t in targets if not is_channel_target_enabled(t)]
+    if not allowed_targets:
+        return {
+            "ok": False,
+            "status_code": 503,
+            "error_code": "capability_disabled",
+            "results": [
+                {"target": t, "ok": False, "error": "capability_disabled"}
+                for t in disabled_targets
+            ],
+        }
     base_url = get_dalton_bridge_base_url().rstrip("/")
+    if not base_url:
+        return {
+            "ok": False,
+            "status_code": 503,
+            "error_code": "bridge_url_unconfigured",
+            "results": [],
+        }
     token = get_dalton_bridge_admin_token()  # DALTON-HOOK(bridge-admin-token): /notify is an admin route
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
         headers["X-Dalton-Bridge-Token"] = token
 
-    body: dict[str, Any] = {"targets": list(targets), "text": text}
+    body: dict[str, Any] = {"targets": list(allowed_targets), "text": text}
     if card is not None:
         body["card"] = card
     if images:
@@ -2008,6 +2043,13 @@ async def post_bridge_notify(
                 "error_code": "invalid_shape",
                 "results": [],
             }
+        if disabled_targets:
+            existing_results = list(data.get("results") or []) if isinstance(data.get("results"), list) else []
+            existing_results.extend(
+                {"target": t, "ok": False, "error": "capability_disabled"}
+                for t in disabled_targets
+            )
+            data = {**data, "results": existing_results}
         return data
 
 
@@ -2035,10 +2077,26 @@ async def send_dalton_notify_test(
     """
     from fastapi import HTTPException
     from src.dalton.access_tiers import is_internal_or_admin
+    from src.dalton.capabilities import (
+        CapabilityId,
+        has_capability,
+        is_channel_target_enabled,
+    )
     from src.dalton.llm import model_prefs as _model_prefs
     from src.dalton.notify import groups as _groups
 
+    if not has_capability(CapabilityId.CHANNEL_GATEWAY):
+        raise HTTPException(
+            status_code=404,
+            detail="Capability 'channel_gateway' is not enabled",
+        )
+
     cleaned = (target or "").strip()
+    if cleaned and not is_channel_target_enabled(cleaned):
+        raise HTTPException(
+            status_code=404,
+            detail="Channel capability for this target is not enabled",
+        )
 
     if _model_prefs.is_dalton_chat_target(cleaned):
         uid = str(user_id or "").strip()
@@ -3247,6 +3305,12 @@ async def retry_failed_notify_deliveries(
     that send page; the same scan inserts its failure notice when the saved
     card delivery is a certain terminal failure. 会传播 ``CancelledError``，其他异常不抛出。
     """
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if post_notify_fn is post_bridge_notify and not has_capability(
+        CapabilityId.CHANNEL_GATEWAY
+    ):
+        return 0
     sent_count = 0
     started_at = time.monotonic()
     uncertain_codes_list = sorted(UNCERTAIN_NOTIFY_ERROR_CODES)
@@ -3286,10 +3350,29 @@ async def retry_failed_notify_deliveries(
             if time.monotonic() - started_at >= max_duration_s:
                 return sent_count
 
+        from src.dalton.capabilities import disabled_channel_names
+
+        disabled_channels = disabled_channel_names()
+        channel_filter_sql = (
+            "\n                      AND LOWER(COALESCE(d.channel, '')) <> ALL(%s)"
+            if disabled_channels
+            else ""
+        )
+        query_params: list[Any] = [
+            max_attempts,
+            uncertain_codes_list,
+            stale_pending_minutes,
+            lookback_hours,
+            max_attempts,
+        ]
+        if disabled_channels:
+            query_params.append(disabled_channels)
+        query_params.append(limit)
+
         async with get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
-                    """
+                    f"""
                     SELECT d.execution_id, d.automation_id, d.user_id,
                            d.channel, d.target, d.status, d.attempt_count,
                            d.error_code,
@@ -3356,18 +3439,11 @@ async def retry_failed_notify_deliveries(
                               'automation_report_failure_alert'
                           )
                           OR d.attempt_count < %s
-                      )
+                      ){channel_filter_sql}
                     ORDER BY d.updated_at ASC, d.created_at ASC
                     LIMIT %s
                     """,
-                    (
-                        max_attempts,
-                        uncertain_codes_list,
-                        stale_pending_minutes,
-                        lookback_hours,
-                        max_attempts,
-                        limit,
-                    ),
+                    tuple(query_params),
                 )
                 candidates = await cur.fetchall()
 
@@ -3705,6 +3781,11 @@ async def retry_failed_notify_deliveries(
                             exec_id,
                             skip_reason or "toggle_off",
                         )
+                    continue
+
+                from src.dalton.capabilities import is_channel_target_enabled
+
+                if not is_channel_target_enabled(tgt, channel=ch):
                     continue
 
                 request_timeout_s = _remaining_retry_request_budget_s(
@@ -4578,6 +4659,10 @@ async def _dispatch_one_saved_report_target(
     target = str(row.get("target") or "").strip()
     if not channel or not target or status in {"sent", "skipped"}:
         return False
+    from src.dalton.capabilities import is_channel_target_enabled
+
+    if not is_channel_target_enabled(target, channel=channel):
+        return False
     if await _reconcile_saved_report_row(reconciler, row, conn):
         return False
     if (
@@ -5066,6 +5151,12 @@ async def on_automation_settled(
     target marks all unfinalized claimed targets as ``failed``. Returns ``True``
     iff at least one target was delivered successfully.
     """
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if post_notify_fn is post_bridge_notify and not has_capability(
+        CapabilityId.CHANNEL_GATEWAY
+    ):
+        return False
     ws_for_verdict = (workspace_id or "").strip() or None
     pending_targets: list[tuple[str, str]] = []
     try:
@@ -5123,6 +5214,12 @@ async def on_automation_settled(
             is_admin_fn=is_admin_fn,
         )
         if not allowed or not targets:
+            return False
+
+        from src.dalton.capabilities import is_channel_target_enabled
+
+        targets = [t for t in targets if is_channel_target_enabled(t)]
+        if not targets:
             return False
 
         if classification is None:

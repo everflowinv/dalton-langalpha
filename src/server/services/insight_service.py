@@ -304,8 +304,12 @@ async def _research(
     if config.llm is None:
         raise ValueError("No LLM configured — set a model in agent_config.yaml or select one in Settings")
 
+    # DALTON-HOOK(standalone-core): align insight instruction with active WebSearch availability
+    from src.dalton.web_search_spec import adapt_insight_user_prompt
+
     graph = build_insight_graph(config)
-    input_state = {"messages": [HumanMessage(content=prompt)]}
+    effective_prompt = adapt_insight_user_prompt(prompt, search_api=config.search_api)
+    input_state = {"messages": [HumanMessage(content=effective_prompt)]}
     # WebFetch reads the user's fetch model from the context, as in a chat
     # turn. The run gets a context of its own because the scheduler runs one
     # brief after another in a single task, and a fetch client set for one
@@ -412,6 +416,15 @@ class InsightService:
                 "[MARKET_INSIGHT] Agent config not initialized — service disabled"
             )
             return
+
+        # DALTON-HOOK(standalone-core): surface when market insights start without WebSearch in core profile
+        from src.dalton.web_search_spec import resolve_web_search_provider_for_agent
+
+        if resolve_web_search_provider_for_agent(setup.agent_config.search_api) is None:
+            logger.info(
+                "[MARKET_INSIGHT] No search provider key configured in core profile — "
+                "running briefs with WebFetch, market-data, and SEC tools only"
+            )
 
         self._shutdown_event.clear()
 

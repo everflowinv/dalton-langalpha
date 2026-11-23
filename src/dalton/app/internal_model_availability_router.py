@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 
 from src.dalton.app.channels_router import require_channel_service_token
+from src.dalton.capabilities import CapabilityId, require_capability_dep
 from src.dalton.services.model_availability_watch import run_model_availability_check
 
 logger = logging.getLogger(__name__)
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 internal_model_availability_router = APIRouter(
     prefix="/internal/model-availability",
     tags=["Dalton Internal Model Availability"],
+    dependencies=[Depends(require_capability_dep(CapabilityId.NATIVE_OAUTH_SYNC))],
 )
 
 

@@ -112,7 +112,19 @@ async def _post_bridge_data_tasks(
     http_timeout_s: float,
 ) -> dict[str, Any]:
     """Call `POST {bridge}{route}` with `DALTON_BRIDGE_ADMIN_TOKEN` (following `src/dalton/feishu.py:84`)."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
+        raise HostBridgeError(
+            "capability_disabled",
+            "researchdata_bridge capability is disabled",
+        )
     base_url = get_dalton_bridge_base_url().rstrip("/")
+    if not base_url:
+        raise HostBridgeError(
+            "bridge_unconfigured",
+            "researchdata bridge URL is not configured",
+        )
     token = get_dalton_bridge_admin_token()  # DALTON-HOOK(data-jobs): /internal/data-tasks/* are admin routes
     if not token:
         raise HostBridgeError(

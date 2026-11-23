@@ -681,10 +681,21 @@ class PTCAgent:
         search_tool = partial(
             get_web_search_tool, max_search_results=10, time_range=None, verbose=False
         )
-        web_search_tool = search_tool(
-            provider=self.config.search_api, depth=self.config.search_depth
+        # DALTON-HOOK(standalone-core): omit WebSearch in core profile when no search provider is available
+        from src.dalton.web_search_spec import resolve_web_search_provider_for_agent
+
+        effective_search_provider = resolve_web_search_provider_for_agent(
+            self.config.search_api
         )
-        shared_tools.append(web_search_tool)
+        web_search_tool = (
+            search_tool(
+                provider=effective_search_provider, depth=self.config.search_depth
+            )
+            if effective_search_provider is not None
+            else None
+        )
+        if web_search_tool is not None:
+            shared_tools.append(web_search_tool)
         shared_tools.append(web_fetch_tool)
         # DALTON-HOOK(x-search-direct): mounted from x_search.enabled, not search_api.
         x_search_tools: list[Any] = []
@@ -908,9 +919,15 @@ class PTCAgent:
                 execute_code=sub_code_tool,
                 bash=sub_bash_tool,
                 filesystem=subagent_filesystem_tools,
-                web=[web_search_tool, web_fetch_tool, *x_search_tools],  # DALTON-HOOK(x-search-direct)
+                # DALTON-HOOK(standalone-core): omit WebSearch from subagent web tools when unavailable
+                web=[
+                    *([web_search_tool] if web_search_tool is not None else []),
+                    web_fetch_tool,
+                    *x_search_tools,
+                ],  # DALTON-HOOK(x-search-direct)
                 finance=finance_tools,
-                search_tool=search_tool,
+                # DALTON-HOOK(standalone-core): disable subagent search override builder when WebSearch is unavailable
+                search_tool=search_tool if web_search_tool is not None else None,
                 sandbox_tools=lambda allowed: [
                     code_tool(allowed_servers=allowed),
                     shell_tool(allowed_servers=allowed),

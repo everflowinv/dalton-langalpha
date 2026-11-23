@@ -446,7 +446,21 @@ async def _read_workspace_file_safely(
 
 async def call_bridge_wiki_ingest(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     """POST `payload` to `{bridge_url}/wiki/ingest` authenticated with `DALTON_BRIDGE_ADMIN_TOKEN`."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.COMPANY_WIKI):
+        return 503, {
+            "ok": False,
+            "status": "capability_disabled",
+            "error": "company_wiki capability is disabled.",
+        }
     bridge_url = get_dalton_bridge_base_url().rstrip("/")
+    if not bridge_url:
+        return 503, {
+            "ok": False,
+            "status": "config_error",
+            "error": "researchdata bridge URL is not configured on backend.",
+        }
     admin_token = get_dalton_bridge_admin_token()
     if not admin_token:
         return 500, {
