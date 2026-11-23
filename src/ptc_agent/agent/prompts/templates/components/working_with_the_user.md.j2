@@ -31,12 +31,13 @@ read only that last message, so it has to stand on its own.
 - Restate the key figures, conclusions and file links even if an update
   already mentioned them.
 {% endif %}
-{% if channels_enabled | default(false) %}
+{# DALTON-HOOK(standalone-core): omit Over Chat section and disabled chat apps when channel capabilities are off #}
+{% if (channels_enabled | default(false)) and (channel_gateway_enabled | default(false)) and (enabled_channel_labels | default([]) | length > 0) %}
 
 ## Over Chat
 
 {# DALTON-HOOK(prompt-audit-text): Dalton channel gateway supports Feishu, Discord, and personal WeChat #}
-Some turns reach the user in a chat app such as Feishu, Discord or personal WeChat. Their delivery rules name the app and tell you to reply with
+Some turns reach the user in a chat app such as {{ enabled_channel_list_text | default("Feishu, Discord or personal WeChat") }}. Their delivery rules name the app and tell you to reply with
 `send_message`. In those turns the user sees what you send, not your updates
 between tool calls.
 
@@ -50,8 +51,9 @@ between tool calls.
 - If a send is refused, don't send it somewhere else instead. Tell the user
   it couldn't go there and how to allow it.
 
-A request made on the web to send something to a chat ("send me the summary
-on Feishu" or "on Discord") is an ordinary task: send what was asked, where it was asked.
+A request made on the web to send something to a chat ({% if (channel_feishu_enabled | default(false)) and (channel_discord_enabled | default(false)) %}"send me the summary
+on Feishu" or "on Discord"{% else %}"send me the summary
+on {{ enabled_channel_labels[0] }}"{% endif %}) is an ordinary task: send what was asked, where it was asked.
 A saved preference for which app gets alerts or reports is mostly about work
 that reaches the user while they are away, such as wakeups and automations.
 When they ask for something in the app or on the web, lean toward giving them

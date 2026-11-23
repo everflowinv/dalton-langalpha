@@ -94,8 +94,57 @@ class PromptLoader:
             **kwargs,  # User can override date if needed
         }
         # DALTON-HOOK(team-memory-toggle): static prompt and data map follow deployment/tier availability and main-agent role only (never subagents, external/company tiers, or personal toggle)
+        # DALTON-HOOK(standalone-core): inject deployment capabilities & brand name for conditional prompt rendering
         from src.dalton.access_tiers import is_internal_tier
-        from src.dalton.settings import get_dalton_settings
+        from src.dalton.capabilities import CapabilityId, effective_capabilities
+        from src.dalton.settings import get_brand_name
+
+        active_caps = effective_capabilities()
+        context.setdefault("brand_name", get_brand_name())
+        context.setdefault(
+            "researchdata_bridge_enabled",
+            CapabilityId.RESEARCHDATA_BRIDGE in active_caps,
+        )
+        context.setdefault(
+            "data_jobs_enabled",
+            CapabilityId.DATA_JOBS in active_caps,
+        )
+        channel_gateway_on = CapabilityId.CHANNEL_GATEWAY in active_caps
+        channel_feishu_on = channel_gateway_on and (
+            CapabilityId.CHANNEL_FEISHU in active_caps
+        )
+        channel_discord_on = channel_gateway_on and (
+            CapabilityId.CHANNEL_DISCORD in active_caps
+        )
+        channel_weixin_on = channel_gateway_on and (
+            CapabilityId.CHANNEL_WEIXIN in active_caps
+        )
+        context.setdefault("channel_gateway_enabled", channel_gateway_on)
+        context.setdefault("channel_feishu_enabled", channel_feishu_on)
+        context.setdefault("channel_discord_enabled", channel_discord_on)
+        context.setdefault("channel_weixin_enabled", channel_weixin_on)
+        enabled_channel_labels = [
+            label
+            for enabled, label in (
+                (channel_feishu_on, "Feishu"),
+                (channel_discord_on, "Discord"),
+                (channel_weixin_on, "personal WeChat"),
+            )
+            if enabled
+        ]
+        context.setdefault("enabled_channel_labels", enabled_channel_labels)
+        if len(enabled_channel_labels) >= 2:
+            channel_list_text = (
+                ", ".join(enabled_channel_labels[:-1])
+                + f" or {enabled_channel_labels[-1]}"
+            )
+        elif len(enabled_channel_labels) == 1:
+            channel_list_text = enabled_channel_labels[0]
+        else:
+            channel_list_text = ""
+        context.setdefault("enabled_channel_list_text", channel_list_text)
+        if not channel_gateway_on or not enabled_channel_labels:
+            context["channels_enabled"] = False
 
         is_subagent_template = (
             template_name == "subagent_base.md.j2"
@@ -105,7 +154,7 @@ class PromptLoader:
         )
         raw_tier = kwargs.get("user_tier")
         tier_allows = raw_tier is None or is_internal_tier(str(raw_tier))
-        deployment_allows = bool(get_dalton_settings().conversations.enabled)
+        deployment_allows = CapabilityId.CONVERSATION_ARCHIVE in active_caps  # DALTON-HOOK(standalone-core)
 
         if is_subagent_template or not tier_allows:
             conversation_search_available = False

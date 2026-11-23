@@ -251,9 +251,30 @@ class SubagentCompiler:
                 model=self._model_label(definition, resolved),
             )
         sections.update(held, security_policy=runs_code)
+        # DALTON-HOOK(standalone-core): assemble capability-conditional markers only on
+        # deployment-shipped subagents (builtins, deployment YAML, bundled plugins) — never
+        # on custom or user-installed plugin subagents.
+        should_assemble = definition.source in ("builtin", "user") or (
+            definition.source == "plugin" and definition.bundled_plugin
+        )
+        if should_assemble:
+            from src.dalton.capabilities import CapabilityId, has_capability
+            from src.dalton.content_assembly import assemble_markdown_text
+
+            assembled_desc = assemble_markdown_text(
+                definition.description,
+                path=f"agents/{definition.name}.md",
+            )
+            if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE) and (
+                "fund research library, wiki, " in assembled_desc
+            ):
+                assembled_desc = assembled_desc.replace("fund research library, wiki, ", "")
+        else:
+            assembled_desc = definition.description
+
         result: dict[str, Any] = {
             "name": definition.name,
-            "description": definition.description,
+            "description": assembled_desc,
             "system_prompt": self._resolve_prompt(definition, sections, guidance=guidance),
             "tools": self._resolve_tools(definition),
         }
@@ -289,8 +310,20 @@ class SubagentCompiler:
 
         # 1. Raw custom prompt — bypass all rendering
         # DALTON-HOOK(subagent-workspace-root): route all three prompt branches to a shared exit.
+        # DALTON-HOOK(standalone-core): assemble capability-conditional fragments only in shipped agent prompts.
+        should_assemble = defn.source in ("builtin", "user") or (
+            defn.source == "plugin" and defn.bundled_plugin
+        )
         if defn.custom_prompt is not None:
-            body = defn.custom_prompt
+            if should_assemble:
+                from src.dalton.content_assembly import assemble_markdown_text
+
+                body = assemble_markdown_text(
+                    defn.custom_prompt,
+                    path=f"agents/{defn.name}.md",
+                )
+            else:
+                body = defn.custom_prompt
         else:
             # Shared template variables
             template_kwargs = subagent_template_vars(
@@ -319,10 +352,20 @@ class SubagentCompiler:
                 body = loader.render(defn.custom_prompt_template, **template_kwargs)
             else:
                 # 3. Base template + role prompt (default path)
+                # DALTON-HOOK(standalone-core): assemble shipped plugin/builtin role_prompt
+                # at compile time so capability toggles never leak raw DALTON_CAP markers.
+                role_prompt = defn.role_prompt
+                if role_prompt and should_assemble:
+                    from src.dalton.content_assembly import assemble_markdown_text
+
+                    role_prompt = assemble_markdown_text(
+                        role_prompt,
+                        path=f"agents/{defn.name}.md",
+                    )
                 body = loader.get_subagent_base_prompt(
                     identity_line=self._identity_line(defn),
                     role_prompt_template=defn.role_prompt_template,
-                    role_prompt=defn.role_prompt,
+                    role_prompt=role_prompt,
                     preloaded_skills_content="",
                     sections=sections,
                     tools_narrowed=defn.tools_narrowed,

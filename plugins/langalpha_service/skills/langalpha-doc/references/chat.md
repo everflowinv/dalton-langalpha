@@ -1,7 +1,7 @@
 # Chat Apps
 
-<!-- DALTON-HOOK(prompt-audit-text): align chat reference to Dalton supported platforms (Feishu, Discord, personal WeChat) -->
-This page applies when you have `send_message` and `list_message_targets`: the user has connected chat apps — Feishu, Discord, or personal WeChat (`weixin:@me`, direct messages only) — and you can message them there. Group chat addresses come from `.agents/user/channels/available.json` or `list_message_targets`.
+<!-- DALTON_CAP:channel_feishu,channel_discord,channel_weixin --><!-- DALTON-HOOK(prompt-audit-text): align chat reference to Dalton supported platforms (Feishu, Discord, personal WeChat) -->
+<!-- /DALTON_CAP -->This page applies when you have `send_message` and `list_message_targets`: the user has connected chat apps<!-- DALTON_CAP:channel_feishu|channel_discord|channel_weixin --> — Feishu, Discord, or personal WeChat (`weixin:@me`, direct messages only) —<!-- /DALTON_CAP --> and you can message them there. Group chat addresses come from `.agents/user/channels/available.json` or `list_message_targets`.
 
 ## Which rules apply
 
@@ -16,7 +16,7 @@ In a chat the user sees what you send, not your updates between tool calls.
 - Keep them posted. Before a long step, or a hand-off whose result comes later, say so and that you will follow up. When the result comes back, send it where the request came from.
 - Write like a colleague answering a message: short and plain, the answer first. Put detail in an attached file, not a long message.
 - If a send is refused, don't send it somewhere else instead. Tell the user it couldn't go there and how to allow it.
-- A request made on the web to send something to a chat ("send me the summary on Feishu" or "on Discord") is an ordinary task: send what was asked, where it was asked.
+- A request made on the web to send something to a chat<!-- DALTON_CAP:channel_feishu|channel_discord --> ("send me the summary on Feishu" or "on Discord")<!-- /DALTON_CAP --> is an ordinary task: send what was asked, where it was asked.
 
 ## How sending works
 
@@ -29,8 +29,8 @@ In a chat the user sees what you send, not your updates between tool calls.
 
 ## What each app shows
 
-<!-- DALTON-HOOK(prompt-audit-text): focus formatting table on Dalton supported apps (Feishu, Discord, personal WeChat) -->
-| What you write | Feishu | Discord | Personal WeChat (`weixin:@me`) |
+<!-- DALTON_CAP:channel_feishu,channel_discord,channel_weixin --><!-- DALTON-HOOK(prompt-audit-text): focus formatting table on Dalton supported apps (Feishu, Discord, personal WeChat) -->
+<!-- /DALTON_CAP --><!-- DALTON_CAP:channel_feishu|channel_discord|channel_weixin -->| What you write | Feishu | Discord | Personal WeChat (`weixin:@me`) |
 |---|---|---|---|
 | Headings | Shown | `#`, `##` and `###` only | Plain text |
 | Bold, italic, strikethrough | Shown | Shown, plus underline and spoilers | Plain text |
@@ -46,4 +46,4 @@ In a chat the user sees what you send, not your updates between tool calls.
 - **Feishu**: each message is a card. An image written in Markdown with a public web address shows as a picture in it.
 - **Discord**: underline is `__text__` and a spoiler is `||text||`. Mentions you write don't notify anyone.
 - **Personal WeChat**: direct messages only (`weixin:@me`); group chats are not supported.
-- **Every app**: a workspace path written as a link does not open in a chat. Attach the file.
+<!-- /DALTON_CAP -->- **Every app**: a workspace path written as a link does not open in a chat. Attach the file.

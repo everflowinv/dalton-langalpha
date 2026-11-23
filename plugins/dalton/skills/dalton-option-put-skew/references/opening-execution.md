@@ -10,7 +10,7 @@
 ## 2. 先核消息，再解释开盘定价
 
 1. 用 `web_search` 的明确日期窗口（`start_date` / `end_date`）定位当天事件，并用 `WebFetch` 读公司公告、投资者关系页面（IR）或可靠通讯社原文，因为搜索摘要不足以确认风险是否仍在发展。
-2. 需要内部交易台观点时，在沙箱中调用 `researchdata.research(route="all", operation="search", query="<ticker> <event>", start="<date>", params={"media": "text"})` 搜索，再按返回的 `document_id` 读取相关正文，因为交易台／销售团队判断与公司官方确认必须分开。
+2. <!-- DALTON_CAP:researchdata_bridge -->需要内部交易台观点时，在沙箱中调用 `researchdata.research(route="all", operation="search", query="<ticker> <event>", start="<date>", params={"media": "text"})` 搜索，再按返回的 `document_id` 读取相关正文，因为交易台／销售团队判断与公司官方确认必须分开。<!-- DALTON_CAP_ELSE -->需要盘前市场情绪与机构解读时，结合 `x_search` 与公开财经报道核查主流市场观点，并将市场评论与公司官方确认明确分开。<!-- /DALTON_CAP -->
 3. 核对到期前的财报和其他已公布事件；先用 `yf.Ticker(ticker).calendar` 定位，再以公司投资者关系页面（IR）公布的日期为准，因为跨事件期权的较高 IV 不能只归因于当天新闻。
 4. 将“隔夜消息会在期权开盘时直接重新定价”与“开盘之后风险可能继续变化”同时写清，因为 IV 不需要等成交量积累，也没有固定的日内峰值时间。
 

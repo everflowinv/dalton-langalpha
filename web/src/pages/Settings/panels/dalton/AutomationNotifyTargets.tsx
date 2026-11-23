@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Check, ChevronDown } from 'lucide-react';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { queryKeys } from '@/lib/queryKeys';
@@ -89,6 +90,8 @@ export function notifyTargetsSelectionLabel(
 export function AutomationNotifyTargets({
   automation,
 }: AutomationNotifyTargetsProps): React.ReactElement | null {
+  const { hasCapability } = useCapabilities();
+  const canNotifyChannels = hasCapability(['channel_gateway', 'channel_feishu', 'channel_discord']);
   const { preferences, isLoading, isLoaded } = usePreferences();
   const updatePreferences = useUpdatePreferences();
   const queryClient = useQueryClient();
@@ -113,7 +116,7 @@ export function AutomationNotifyTargets({
     setSaveError(null);
   }, [automation.automation_id]);
 
-  const prefsReady = Boolean(isLoaded) && !isLoading;
+  const prefsReady = Boolean(isLoaded) && !isLoading && canNotifyChannels;
   const prefs = modelPrefs(preferences);
   const masterEnabled = prefs.dalton_notify_enabled === true;
   const targets = Array.isArray(prefs.dalton_notify_targets)

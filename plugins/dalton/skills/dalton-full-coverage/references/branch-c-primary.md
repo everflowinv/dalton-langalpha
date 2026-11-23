@@ -9,7 +9,7 @@
 ## 产出章节结构（C1–C7，按顺序撰写）
 
 ### C1. 最近 4 份定期报告精读与跨期 Diff（10-K/20-F、10-Q/6-K 及港股/A 股定期报告）
-美股使用 `dalton_sec.list_filings`、`researchdata.finance(route="sec")`（`read-item`、`search-text`、`attachments`）及自带 `get_sec_filing`；港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)`（港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`；查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`；`operation="ask"` 平台财务表仅作二手初值线索，核心数字一律回法定公告核实并引用 `facts.md`）逐期比对最近 4 份定期报告：
+美股使用 `dalton_sec.list_filings`<!-- DALTON_CAP:researchdata_bridge -->、`researchdata.finance(route="sec")`（`read-item`、`search-text`、`attachments`）<!-- DALTON_CAP_ELSE -->、`dalton_sec.get_company_facts`<!-- /DALTON_CAP -->及自带 `get_sec_filing`；港股与 A 股<!-- DALTON_CAP:researchdata_bridge -->调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)`（港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`；查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`；`operation="ask"` 平台财务表仅作二手初值线索，核心数字一律回法定公告核实并引用 `facts.md`）<!-- DALTON_CAP_ELSE -->通过 `web_search` 与 `web_fetch` 检索港交所披露易（`site:hkexnews.hk`）、巨潮资讯网及公司 IR 官网的法定定期报告原文（核心数字一律回法定公告核实并引用 `facts.md`）<!-- /DALTON_CAP -->逐期比对最近 4 份定期报告：
 1. **MD&A 措辞漂移**：管理层对收入增长驱动、利润率变化、资本开支回报的解释口径在过去 4 个季度是否发生微妙变化（例如从强调“新增客户数”转向强调“存量大客户 ARPU”，或停止披露某个曾经高调宣传的运营指标）。
 2. **Risk Factors（风险因素）逐条 Diff**：对比最新定期报告与上一期的 Risk Factors，**重点标出新增条目、删除条目、排序大幅前移或措辞从“可能（may）”升级为“已经（have experienced）”的条目**——这是最具前瞻信息量的法律披露。
 3. **分部披露与口径变更**：分部划分、分部利润定义或成本分摊规则是否发生重述或合并，解释背后的经营意图。
@@ -18,10 +18,12 @@
 
 ### C2. 最近 4 次业绩电话会精读（Prepared Remarks & Q&A）
 - **电话会信源回退链（严格遵守）**：
-  1. 首选调用 `researchdata.research(route="transcript", ticker=T, limit=4)` 获取 `kind="company_call"` 的公司业绩会原文（忽略 `broker_callback` 券商回访）；
+<!-- DALTON_CAP:researchdata_bridge -->  1. 首选调用 `researchdata.research(route="transcript", ticker=T, limit=4)` 获取 `kind="company_call"` 的公司业绩会原文（忽略 `broker_callback` 券商回访）；
   2. 若无匹配，检索公司 IR 官网的 webcast transcript（`web_fetch`）；
   3. 仍无则查 8-K / 6-K 的 `Ex-99` 附件；
-  4. 三条路径均未取得时，如实写 `电话会未覆盖（已尝试路径：…）`，**严禁用业绩新闻稿（Earnings Release）冒充电话会问答**。
+  4. 三条路径均未取得时，如实写 `电话会未覆盖（已尝试路径：…）`，**严禁用业绩新闻稿（Earnings Release）冒充电话会问答**。<!-- DALTON_CAP_ELSE -->  1. 首选通过公司 IR 官网或公开业绩会转写渠道检索完整的 webcast transcript（`web_search` / `web_fetch`）；
+  2. 若无匹配，查 8-K / 6-K 的 `Ex-99` 附件；
+  3. 两条路径均未取得时，如实写 `电话会未覆盖（已尝试路径：…）`，**严禁用业绩新闻稿（Earnings Release）冒充电话会问答**。<!-- /DALTON_CAP -->
 - **必须提取的四项内容**：
   1. **四期指引措辞并排表**：将最近 4 期管理层的定量指引与定性语气（如从“strong visibility”变为“macro headwinds / prudent”）并排展示；
   2. **分析师高频提问计数**：统计哪几个问题在 Q&A 中被多位分析师反复追问（代表市场最担忧的焦点）；
@@ -49,9 +51,9 @@
    - **年度指引修正节奏**：公司通常在哪一个季度（如 Q4 报或 Q1 报）给出全年初始指引，又通常在哪个季度（如 Q2 或 Q3）开始上修或下修全年区间？
 
 ### C5. 重大 8-K/临时公告事件、内部人交易与股权结构变化
-- **8-K / 6-K 及港股/A 股重大临时公告**：过去 12–24 个月的并购重组、大额发债/配售增发、核心高管/CFO/审计师变更、重大诉讼或监管调查（港股与 A 股通过 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=50)` 检索；查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`）。
-- **内部人交易（Form 4 / 144 及港股权益披露 / A 股董监高增减持）**：梳理高管与董事近一年的增减持方向、金额、均价；美股**必须区分属于预先设定的 10b5-1 自动交易计划还是非计划主动买卖（Open Market Purchase / Sale）**；港股与 A 股按单一意图分别调用 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 高管持股", limit=50)` 与 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 限售解禁", limit=50)`，结合法定减持/增持公告及港交所披露易权益披露（DI）核实。
-- **大股东与投票权结构（SC 13D/13G & Proxy / 十大股东）**：创始人投票权比例（AB 股/同股不同权架构）、主要机构股东进出与股权质押情况（港股与 A 股按单一意图分别调用 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 十大股东", limit=50)` 与 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 股权质押", limit=50)` 并回定期报告核实）。
+- **8-K / 6-K 及港股/A 股重大临时公告**：过去 12–24 个月的并购重组、大额发债/配售增发、核心高管/CFO/审计师变更、重大诉讼或监管调查（港股与 A 股<!-- DALTON_CAP:researchdata_bridge -->通过 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=50)` 检索；查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`<!-- DALTON_CAP_ELSE -->通过 `web_search` 检索港交所披露易 `site:hkexnews.hk`、巨潮资讯网与公司 IR 官网公告<!-- /DALTON_CAP -->）。
+- **内部人交易（Form 4 / 144 及港股权益披露 / A 股董监高增减持）**：梳理高管与董事近一年的增减持方向、金额、均价；美股**必须区分属于预先设定的 10b5-1 自动交易计划还是非计划主动买卖（Open Market Purchase / Sale）**；港股与 A 股<!-- DALTON_CAP:researchdata_bridge -->按单一意图分别调用 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 高管持股", limit=50)` 与 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 限售解禁", limit=50)`，结合<!-- DALTON_CAP_ELSE -->通过 `web_search`、定期报告及<!-- /DALTON_CAP -->法定减持/增持公告及港交所披露易权益披露（DI）核实。
+- **大股东与投票权结构（SC 13D/13G & Proxy / 十大股东）**：创始人投票权比例（AB 股/同股不同权架构）、主要机构股东进出与股权质押情况（港股与 A 股<!-- DALTON_CAP:researchdata_bridge -->按单一意图分别调用 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 十大股东", limit=50)` 与 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 股权质押", limit=50)` 并回定期报告核实<!-- DALTON_CAP_ELSE -->回定期报告股东章节及公开权益披露公告核实十大股东与股权质押情况<!-- /DALTON_CAP -->）。
 
 ### C6. 逐题证据小结与缺口
 - 按 `references/branch-common.md` 第四节格式，汇总 Q1–Q5、Q9、Q10、Q12 的一手证据、最强反证与未决缺口。

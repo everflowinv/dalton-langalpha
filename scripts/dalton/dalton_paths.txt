@@ -556,3 +556,13 @@ tests/unit/dalton/test_local_auth_entrypoints.py
 tests/unit/dalton/test_local_auth_sessions_bootstrap.py
 tests/unit/dalton/test_local_auth_roles_credentials_cli.py
 tests/unit/dalton/test_d047_local_auth_migration.py
+# Standalone Core E2E checks (Batch 3+):
+tests/standalone/
+# Standalone Core Batch 3 Part 2: frontend capabilities hook, tests, and docs-site filter
+web/src/hooks/useCapabilities.ts
+web/src/hooks/__tests__/useCapabilities.test.tsx
+web/src/pages/Settings/__tests__/sections.capabilities.test.ts
+web/src/pages/Settings/panels/__tests__/ModelAccessSection.capabilities.test.tsx
+web/src/components/modelAccess/__tests__/SubscriptionChoices.capabilities.test.tsx
+docs-site/src/integrations/profile-filter.mjs
+docs-site/public/favicon-core.svg

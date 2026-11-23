@@ -2,7 +2,7 @@
 
 Multi-worker rule:
 - Never store health or rendered data map state in module-level variables across turns.
-- Durable truth lives in PostgreSQL (`dalton_data_source_health` and `dalton_data_map_cache`).
+- Durable truth lives in PostgreSQL (`dalton_data_source_health` and `dalton_data_map_scoped_cache`).
 - A `ContextVar` carries the turn's pre-fetched markdown from async graph construction into
   synchronous Jinja2 rendering within the same turn; when absent, on cache miss, or when
   PostgreSQL is unreachable/slow, rendering falls back to the static `"未体检"` data map
@@ -23,6 +23,13 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
+from src.dalton.capabilities import (
+    CapabilityId,
+    capabilities_fingerprint as compute_capabilities_fingerprint,
+    effective_capabilities,
+    has_capability,
+    is_bridge_route_enabled,
+)
 from src.dalton.database import data_map as db_data_map
 
 logger = logging.getLogger(__name__)
@@ -146,18 +153,141 @@ def _normalize_rules_text(rules: Any) -> str:
     return ""
 
 
+def _parse_capability_requirement(raw: Any) -> tuple[CapabilityId, ...]:
+    """Normalize a YAML ``capability`` / ``note_capability`` field to a tuple of ``CapabilityId``."""
+    if raw is None:
+        return ()
+    if isinstance(raw, CapabilityId):
+        return (raw,)
+    if isinstance(raw, str):
+        cleaned = raw.strip()
+        return (CapabilityId(cleaned),) if cleaned else ()
+    if isinstance(raw, Sequence) and not isinstance(raw, (bytes, bytearray)):
+        out: list[CapabilityId] = []
+        for item in raw:
+            if isinstance(item, CapabilityId):
+                out.append(item)
+            elif isinstance(item, str) and item.strip():
+                out.append(CapabilityId(item.strip()))
+        return tuple(out)
+    return ()
+
+
+def _capabilities_satisfied(
+    raw_requirement: Any,
+    active_caps: frozenset[CapabilityId],
+) -> bool:
+    req = _parse_capability_requirement(raw_requirement)
+    return all(cap in active_caps for cap in req)
+
+
+def _resolve_unavailable_source_note(
+    item: Mapping[str, Any],
+    active_caps: frozenset[CapabilityId],
+) -> str:
+    """Resolve an ``unavailable_sources`` note according to enabled capabilities."""
+    note_sources = item.get("note_sources")
+    if isinstance(note_sources, Sequence) and not isinstance(note_sources, (str, bytes)):
+        enabled_source_ids: list[str] = []
+        for src in note_sources:
+            if not isinstance(src, Mapping):
+                continue
+            sid = str(src.get("id") or "").strip()
+            if not sid:
+                continue
+            if _capabilities_satisfied(src.get("capability"), active_caps):
+                enabled_source_ids.append(sid)
+        if enabled_source_ids:
+            template = str(item.get("note_template") or "").strip()
+            if template:
+                return template.format(sources="/".join(enabled_source_ids))
+            return str(item.get("note") or "").strip()
+        return str(item.get("fallback_note") or "").strip()
+
+    if "note_capability" in item:
+        if _capabilities_satisfied(item.get("note_capability"), active_caps):
+            return str(item.get("note") or "").strip()
+        return str(item.get("fallback_note") or "").strip()
+
+    return str(item.get("note") or "").strip()
+
+
+def _format_all_route_copy(
+    yaml_entry: Mapping[str, Any],
+    active_caps: frozenset[CapabilityId],
+) -> tuple[str, str]:
+    """Return ``(rules, description)`` for the aggregate ``all`` route.
+
+    Preserves the exact Everflow copy when every sub-source behind ``all`` is
+    enabled, and narrows the wording to enabled sub-sources when only a subset
+    of capabilities is active.
+    """
+    full_all_caps = (
+        CapabilityId.COMPANY_WIKI,
+        CapabilityId.SALES_NOTES,
+        CapabilityId.TMTB,
+        CapabilityId.FUNDA_AI,
+        CapabilityId.ALPHAENGINE,
+        CapabilityId.GUIDEPOINT,
+    )
+    if all(cap in active_caps for cap in full_all_caps):
+        rules = _normalize_rules_text(yaml_entry.get("rules"))
+        desc = str(yaml_entry.get("description") or "").strip() or "未写说明"
+        return rules, desc
+
+    rule_parts: list[str] = []
+    desc_parts: list[str] = []
+    four_libs = (
+        (CapabilityId.COMPANY_WIKI, "company-wiki", "公司资料库"),
+        (CapabilityId.SALES_NOTES, "sales-notes", "销售邮件"),
+        (CapabilityId.TMTB, "tmtb", "TMT总结"),
+        (CapabilityId.FUNDA_AI, "funda-ai", "FUNDA AI"),
+    )
+    enabled_four = [item for item in four_libs if item[0] in active_caps]
+    if len(enabled_four) == 4:
+        rule_parts.append("四库")
+        desc_parts.append("四库")
+    else:
+        for _cap, short_id, label in enabled_four:
+            rule_parts.append(short_id)
+            desc_parts.append(label)
+    if CapabilityId.ALPHAENGINE in active_caps:
+        rule_parts.append("AE")
+        desc_parts.append("卖方研报")
+    if CapabilityId.GUIDEPOINT in active_caps:
+        rule_parts.append("GP")
+        desc_parts.append("专家访谈")
+
+    if not rule_parts:
+        return "仅覆盖当前已启用的桥接子源", "跨已启用研究子源联搜，不确定资料在哪时初筛。"
+
+    rules_prefix = "+".join(rule_parts)
+    if CapabilityId.ALPHAENGINE in active_caps:
+        rules_text = f"{rules_prefix},不含transcript"
+    else:
+        rules_text = rules_prefix
+    desc_text = f"{'/'.join(desc_parts)}联搜，不确定资料在哪时初筛。"
+    return rules_text, desc_text
+
+
 def merge_catalog_routes(
     *,
     catalog_routes: Sequence[Mapping[str, Any]] | None = None,
     handoff_routes: set[str] | frozenset[str] | None = None,
     spec: Mapping[str, Any] | None = None,
+    capabilities: frozenset[CapabilityId] | None = None,
 ) -> list[dict[str, Any]]:
     """Merge live `catalog()` routes with `sources.yaml` descriptions.
 
     - Routes in `handoff_routes` (or with `kind` in `('agent_tool', 'skill')`) are excluded.
+    - Routes whose required capability (or ``researchdata_bridge``) is disabled are excluded.
     - Routes present in `catalog_routes` but absent from `sources.yaml` are still included
-      and marked with `description = "未写说明"`.
+      (when ``researchdata_bridge`` is enabled) and marked with `description = "未写说明"`.
     """
+    active_caps = effective_capabilities() if capabilities is None else capabilities
+    if CapabilityId.RESEARCHDATA_BRIDGE not in active_caps:
+        return []
+
     loaded_spec = dict(spec) if isinstance(spec, Mapping) else load_sources_spec()
     yaml_routes = (
         dict(loaded_spec.get("catalog_routes") or {})
@@ -192,8 +322,14 @@ def merge_catalog_routes(
                 "last30days",
             ):
                 continue
-            seen_ids.add(route_id)
+            if not is_bridge_route_enabled(route_id, capabilities=active_caps):
+                continue
             yaml_entry = yaml_routes.get(route_id)
+            if isinstance(yaml_entry, Mapping) and not _capabilities_satisfied(
+                yaml_entry.get("capability"), active_caps
+            ):
+                continue
+            seen_ids.add(route_id)
             if isinstance(yaml_entry, Mapping):
                 category = str(
                     raw_route.get("category") or yaml_entry.get("category") or "research"
@@ -203,9 +339,12 @@ def merge_catalog_routes(
                 ).strip()
                 call_hint = str(yaml_entry.get("call") or "").strip()
                 cat_rules = _normalize_rules_text(raw_route.get("rules"))[:60]
-                yaml_rules = _normalize_rules_text(yaml_entry.get("rules"))
+                if route_id == "all":
+                    yaml_rules, desc = _format_all_route_copy(yaml_entry, active_caps)
+                else:
+                    yaml_rules = _normalize_rules_text(yaml_entry.get("rules"))
+                    desc = str(yaml_entry.get("description") or "").strip() or "未写说明"
                 rules_text = yaml_rules or cat_rules
-                desc = str(yaml_entry.get("description") or "").strip() or "未写说明"
             else:
                 category = str(raw_route.get("category") or "research").strip()
                 title = str(raw_route.get("title") or route_id).strip()
@@ -227,15 +366,24 @@ def merge_catalog_routes(
             rid = str(route_id).strip()
             if not rid or rid in effective_handoff or not isinstance(raw_entry, Mapping):
                 continue
+            if not is_bridge_route_enabled(rid, capabilities=active_caps):
+                continue
+            if not _capabilities_satisfied(raw_entry.get("capability"), active_caps):
+                continue
             seen_ids.add(rid)
+            if rid == "all":
+                rules_text, desc_text = _format_all_route_copy(raw_entry, active_caps)
+            else:
+                rules_text = _normalize_rules_text(raw_entry.get("rules"))
+                desc_text = str(raw_entry.get("description") or "").strip() or "未写说明"
             merged.append(
                 {
                     "id": rid,
                     "category": str(raw_entry.get("category") or "research").strip(),
                     "title": str(raw_entry.get("title") or rid).strip(),
                     "call": str(raw_entry.get("call") or "").strip(),
-                    "rules": _normalize_rules_text(raw_entry.get("rules")),
-                    "description": str(raw_entry.get("description") or "").strip() or "未写说明",
+                    "rules": rules_text,
+                    "description": desc_text,
                 }
             )
 
@@ -301,15 +449,20 @@ def _build_data_map_lines(
     *,
     routes: list[dict[str, Any]],
     direct_tools: Mapping[str, Any],
-    unavailable_list: Sequence[ Any],
+    unavailable_list: Sequence[Any],
     health_lookup: Mapping[str, Mapping[str, Any]],
     conversation_stats: Mapping[str, Any] | None,
     include_x_search: bool,
     include_top_subjects: bool,
+    active_caps: frozenset[CapabilityId],
 ) -> list[str]:
+    has_conv_cap = CapabilityId.CONVERSATION_ARCHIVE in active_caps
+    section1_heading = (
+        "### 1. 直接工具与对话归档" if has_conv_cap else "### 1. 直接工具"
+    )
     lines: list[str] = [
         "## Dalton 数据地图",
-        "### 1. 直接工具与对话归档",
+        section1_heading,
     ]
 
     for tool_id, raw_tool in direct_tools.items():
@@ -317,6 +470,8 @@ def _build_data_map_lines(
         if not tid or not isinstance(raw_tool, Mapping):
             continue
         if tid == "x_search" and not include_x_search:
+            continue
+        if not _capabilities_satisfied(raw_tool.get("capability"), active_caps):
             continue
         display_id = str(raw_tool.get("display_id") or tid).strip()
         title = str(raw_tool.get("title") or tid).strip()
@@ -330,29 +485,33 @@ def _build_data_map_lines(
                 f"  - {_format_conversation_stats_line(conversation_stats, include_top_subjects=include_top_subjects)}"
             )
 
-    lines.append("")
-    lines.append(
-        "### 2. 研究库与金融/宏观/社区路由（经 `ExecuteCode` 调用 `researchdata` 的 `research`、`finance`、`macro` 或 `community`）"
-    )
+    if routes:
+        lines.append("")
+        lines.append(
+            "### 2. 研究库与金融/宏观/社区路由（经 `ExecuteCode` 调用 `researchdata` 的 `research`、`finance`、`macro` 或 `community`）"
+        )
 
-    for r in routes:
-        rid = r["id"]
-        cat = r["category"]
-        title = r["title"]
-        rules_text = r["rules"]
-        desc = r["description"]
-        st_label = format_health_status(health_lookup.get(rid) or health_lookup.get(f"researchdata:{rid}"))
-        rules_part = f"({rules_text})" if rules_text else ""
-        lines.append(f"- `{rid}`[{cat}/{title}|{st_label}]:{desc}{rules_part}")
+        for r in routes:
+            rid = r["id"]
+            cat = r["category"]
+            title = r["title"]
+            rules_text = r["rules"]
+            desc = r["description"]
+            st_label = format_health_status(health_lookup.get(rid) or health_lookup.get(f"researchdata:{rid}"))
+            rules_part = f"({rules_text})" if rules_text else ""
+            lines.append(f"- `{rid}`[{cat}/{title}|{st_label}]:{desc}{rules_part}")
 
+    unavail_idx = 3 if routes else 2
     lines.append("")
-    lines.append("### 3. 明确没有的数据（切勿以为查过）")
+    lines.append(f"### {unavail_idx}. 明确没有的数据（切勿以为查过）")
     for item in unavailable_list:
         if not isinstance(item, Mapping):
             continue
+        if not _capabilities_satisfied(item.get("capability"), active_caps):
+            continue
         uid = str(item.get("id") or "").strip()
         utitle = str(item.get("title") or uid).strip()
-        unote = str(item.get("note") or "").strip()
+        unote = _resolve_unavailable_source_note(item, active_caps)
         if utitle:
             lines.append(f"- {utitle}:{unote}")
 
@@ -370,6 +529,7 @@ def render_data_map_markdown(
     search_api: str | None = None,
     x_search_enabled: bool | None = None,
     max_tokens: int = MAX_DATA_MAP_TOKENS,
+    capabilities: frozenset[CapabilityId] | None = None,
 ) -> str:
     """Render the compact Dalton Data Map Markdown block (<= `max_tokens`).
 
@@ -378,6 +538,7 @@ def render_data_map_markdown(
     2) Parenthetical remarks/rules on each bullet line until `<= max_tokens`.
     """
     _ = as_of_date  # Title is date-free to keep the static prompt prefix stable.
+    active_caps = effective_capabilities() if capabilities is None else capabilities
     loaded_spec = dict(spec) if isinstance(spec, Mapping) else load_sources_spec()
     health_lookup = dict(health_map) if isinstance(health_map, Mapping) else {}
     include_x = _is_x_search_enabled(search_api, x_search_enabled)
@@ -386,6 +547,7 @@ def render_data_map_markdown(
         catalog_routes=catalog_routes,
         handoff_routes=handoff_routes,
         spec=loaded_spec,
+        capabilities=active_caps,
     )
     direct_tools = (
         dict(loaded_spec.get("direct_tools") or {})
@@ -406,6 +568,7 @@ def render_data_map_markdown(
         conversation_stats=conversation_stats,
         include_x_search=include_x,
         include_top_subjects=True,
+        active_caps=active_caps,
     )
     md = "\n".join(lines).strip()
     if estimate_data_map_tokens(md) <= max_tokens:
@@ -420,6 +583,7 @@ def render_data_map_markdown(
         conversation_stats=conversation_stats,
         include_x_search=include_x,
         include_top_subjects=False,
+        active_caps=active_caps,
     )
     md = "\n".join(lines).strip()
     if estimate_data_map_tokens(md) <= max_tokens:
@@ -475,6 +639,7 @@ def render_static_data_map_markdown(
     search_api: str | None = None,
     x_search_enabled: bool | None = None,
     team_memory_enabled: bool = False,
+    capabilities: frozenset[CapabilityId] | None = None,
 ) -> str:
     """Render the static fallback data map with all sources marked `未体检` (never touches DB or network)."""
     md = render_data_map_markdown(
@@ -485,6 +650,7 @@ def render_static_data_map_markdown(
         spec=spec,
         search_api=search_api,
         x_search_enabled=x_search_enabled,
+        capabilities=capabilities,
     )
     return _apply_team_memory_filter(md, team_memory_enabled)
 
@@ -494,19 +660,28 @@ async def refresh_daily_data_map(
     cache_date: date | None = None,
     catalog_routes: Sequence[Mapping[str, Any]] | None = None,
     handoff_routes: set[str] | frozenset[str] | None = None,
+    capabilities_fingerprint: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
-    """Build today's data map from Postgres health + conversation stats and save it to `dalton_data_map_cache`.
+    """Build today's data map from Postgres health + conversation stats and save it to `dalton_data_map_scoped_cache`.
 
     Called only by the health check task (startup or daily CLI), never on a user turn path.
     """
     target_date = cache_date or today_cache_date()
+    active_caps = effective_capabilities()
+    fp = (
+        capabilities_fingerprint.strip()
+        if isinstance(capabilities_fingerprint, str) and capabilities_fingerprint.strip()
+        else compute_capabilities_fingerprint(active_caps)
+    )
     health_map = await db_data_map.fetch_all_source_health(conn=conn)
-    try:
-        conv_stats: dict[str, Any] | None = await db_data_map.fetch_conversation_archive_stats(conn=conn)
-    except Exception as exc:
-        logger.warning("Failed to fetch conversation archive stats for data map: %s", type(exc).__name__)
-        conv_stats = None
+    conv_stats: dict[str, Any] | None = None
+    if CapabilityId.CONVERSATION_ARCHIVE in active_caps:
+        try:
+            conv_stats = await db_data_map.fetch_conversation_archive_stats(conn=conn)
+        except Exception as exc:
+            logger.warning("Failed to fetch conversation archive stats for data map: %s", type(exc).__name__)
+            conv_stats = None
 
     rendered = render_data_map_markdown(
         catalog_routes=catalog_routes,
@@ -514,10 +689,12 @@ async def refresh_daily_data_map(
         health_map=health_map,
         conversation_stats=conv_stats,
         x_search_enabled=True,
+        capabilities=active_caps,
     )
     token_est = estimate_data_map_tokens(rendered)
     payload: dict[str, Any] = {
         "cache_date": target_date.isoformat(),
+        "capabilities_fingerprint": fp,
         "token_estimate": token_est,
         "health_count": len(health_map),
         "conversation_stats": conv_stats,
@@ -527,14 +704,24 @@ async def refresh_daily_data_map(
     if handoff_routes is not None:
         payload["handoff_routes"] = sorted(str(r) for r in handoff_routes)
 
-    await db_data_map.upsert_cached_data_map(
-        target_date,
-        rendered,
-        payload,
-        conn=conn,
-    )
+    if capabilities_fingerprint is not None:
+        await db_data_map.upsert_cached_data_map(
+            target_date,
+            rendered,
+            payload,
+            capabilities_fingerprint=fp,
+            conn=conn,
+        )
+    else:
+        await db_data_map.upsert_cached_data_map(
+            target_date,
+            rendered,
+            payload,
+            conn=conn,
+        )
     return {
         "cache_date": target_date.isoformat(),
+        "capabilities_fingerprint": fp,
         "rendered_markdown": rendered,
         "token_estimate": token_est,
         "payload": payload,
@@ -549,19 +736,26 @@ async def get_or_build_data_map_markdown(
     x_search_enabled: bool | None = None,
     timeout_s: float = CACHE_READ_TIMEOUT_S,
     team_memory_enabled: bool = False,
+    capabilities_fingerprint: str | None = None,
 ) -> str:
     """Read today's cached data map from Postgres within `timeout_s` (2.0s).
 
     On cache miss, timeout, or any DB error, returns the static `未体检` map without
-    rebuilding, querying archive statistics, or writing to `dalton_data_map_cache`.
+    rebuilding, querying archive statistics, or writing to `dalton_data_map_scoped_cache`.
     `asyncio.CancelledError` always propagates.
     """
     target_date = cache_date or today_cache_date()
     try:
-        cached = await asyncio.wait_for(
-            db_data_map.get_cached_data_map(target_date, conn=conn),
-            timeout=timeout_s,
+        read_coro = (
+            db_data_map.get_cached_data_map(
+                target_date,
+                capabilities_fingerprint=capabilities_fingerprint,
+                conn=conn,
+            )
+            if capabilities_fingerprint is not None
+            else db_data_map.get_cached_data_map(target_date, conn=conn)
         )
+        cached = await asyncio.wait_for(read_coro, timeout=timeout_s)
         if cached and cached.get("rendered_markdown"):
             md = _apply_search_api_filter(
                 str(cached["rendered_markdown"]), search_api, x_search_enabled
@@ -631,9 +825,7 @@ def resolve_prompt_data_map(*, team_memory_enabled: bool | None = None) -> str:
             return _apply_team_memory_filter(current, team_memory_enabled)
         return current
     if team_memory_enabled is None:
-        from src.dalton.settings import get_dalton_settings
-
-        effective = bool(get_dalton_settings().conversations.enabled)
+        effective = has_capability(CapabilityId.CONVERSATION_ARCHIVE)
     else:
         effective = bool(team_memory_enabled)
     return render_static_data_map_markdown(

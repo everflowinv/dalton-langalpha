@@ -47,7 +47,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    )
    ```
    Workflow 不可用时：
-   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按下述 Phase 的顺序手动执行，生成各阶段要求的契约产物文件（`research/<D>-topic-<slug>/plan.md`、`primary.md`、至少 3 个 `cluster-*.md`、`internal-memory.md`、`guidepoint.md`、含 `盲区检查完成` 的 `cross-check.md`、`number-audit.md`、`knowledge-revision.json` 及 `drafts/<D>-topic-<slug>.md`），并逐阶段核对产物。Phase 6 派 `dalton-reviewer` 审稿按三步执行：（1）主智能体先计算草稿的 sha256（`sha256sum drafts/<D>-topic-<slug>.md` 或等价的 Python `hashlib.sha256`）；（2）把该哈希写进派给 `dalton-reviewer` 的提示词；（3）将返回的 JSON（`verdict` / `summary` / `items` 逐项覆盖 1–9 项检查 / `must_fix` / `nice_to_have`，审稿人不回填任何哈希）保存到 `research/<D>-topic-<slug>/review.json`，保存时把第（1）步算出的被审草稿 sha256 写入该 JSON 的 `draft_sha256` 字段（多轮复审时保存最后一轮；改稿后必须重新计算哈希、重新审稿并覆盖）。收尾调用 `dalton_check_done(workflow="topic-research", params={"topic": "<专题名称>", "slug": "<kebab-case-slug>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>", "manual": true})`（不传 `run_id`），审稿据此文件核对。语言审查两轮（顺序不可颠倒，与 workflow 相同）：成稿后先调用 `check_language(draft_path=<草稿>, round=1)` 并按 `<草稿>.language.md` 清单修改（只改语言，不动事实、数字、术语、引用编号与判断强度），再派 `dalton-reviewer` 首次审稿；修订循环结束、终稿内容定稿后调用 `check_language(round=2)` 按清单完成终稿语言修改，草稿有改动就再调用一次 `check_language(round=2)` 对终稿复核，然后做最后一次审稿（pass 的 JSON 存 review.json）与 `check_draft`；第一次审稿就 pass 时：第 2 轮照常执行；改了稿就补一次终稿审稿（pass 的 JSON 覆盖存 review.json），哈希未变则无需重审。本次产出中其他给人读的 .md 笔记（research/ 支线、背景、快讯、异动、公告点评、专题章节等）同样各审两轮：第 1 轮审完按清单改，第 2 轮复核，改过就再跑一次 round=2 确认；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件与 .audit/.annotated/.language 侧车不审。
+   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按下述 Phase 的顺序手动执行，生成各阶段要求的契约产物文件（`research/<D>-topic-<slug>/plan.md`、`primary.md`、至少 3 个 `cluster-*.md`<!-- DALTON_CAP:researchdata_bridge -->、`internal-memory.md`、`guidepoint.md`<!-- /DALTON_CAP -->、含 `盲区检查完成` 的 `cross-check.md`、`number-audit.md`、`knowledge-revision.json` 及 `drafts/<D>-topic-<slug>.md`），并逐阶段核对产物。Phase 6 派 `dalton-reviewer` 审稿按三步执行：（1）主智能体先计算草稿的 sha256（`sha256sum drafts/<D>-topic-<slug>.md` 或等价的 Python `hashlib.sha256`）；（2）把该哈希写进派给 `dalton-reviewer` 的提示词；（3）将返回的 JSON（`verdict` / `summary` / `items` 逐项覆盖 1–9 项检查 / `must_fix` / `nice_to_have`，审稿人不回填任何哈希）保存到 `research/<D>-topic-<slug>/review.json`，保存时把第（1）步算出的被审草稿 sha256 写入该 JSON 的 `draft_sha256` 字段（多轮复审时保存最后一轮；改稿后必须重新计算哈希、重新审稿并覆盖）。收尾调用 `dalton_check_done(workflow="topic-research", params={"topic": "<专题名称>", "slug": "<kebab-case-slug>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>", "manual": true})`（不传 `run_id`），审稿据此文件核对。语言审查两轮（顺序不可颠倒，与 workflow 相同）：成稿后先调用 `check_language(draft_path=<草稿>, round=1)` 并按 `<草稿>.language.md` 清单修改（只改语言，不动事实、数字、术语、引用编号与判断强度），再派 `dalton-reviewer` 首次审稿；修订循环结束、终稿内容定稿后调用 `check_language(round=2)` 按清单完成终稿语言修改，草稿有改动就再调用一次 `check_language(round=2)` 对终稿复核，然后做最后一次审稿（pass 的 JSON 存 review.json）与 `check_draft`；第一次审稿就 pass 时：第 2 轮照常执行；改了稿就补一次终稿审稿（pass 的 JSON 覆盖存 review.json），哈希未变则无需重审。本次产出中其他给人读的 .md 笔记（research/ 支线、背景、快讯、异动、公告点评、专题章节等）同样各审两轮：第 1 轮审完按清单改，第 2 轮复核，改过就再跑一次 round=2 确认；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件与 .audit/.annotated/.language 侧车不审。
    - **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
 
 ---
@@ -56,10 +56,10 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 1. Phase 0 — 研究规划（Research Planning，产出 `research/<D>-topic-<slug>/plan.md`）
 
-1. **先读现有知识层与基金 Wiki（只读）**：
+1. **先读现有知识层<!-- DALTON_CAP:researchdata_bridge -->与基金 Wiki（只读）<!-- /DALTON_CAP -->**：
    - 公司工作区：先读当前工作区的 `thesis.md`、`debate.md`、`drivers.md`、`management.md`、`lessons.md`；若涉及其他覆盖公司，跨目录读取 `../<TICKER>/thesis.md` 与 `drivers.md`。
-   - 行业工作区（`subject_kind=sector`）：先读 `sector.md`（定义、边界与成员清单）、`thesis.md`、`debate.md`、`drivers.md`、`lessons.md`、`agenda.md`；涉及成员公司时按 `.agents/skills/dalton-knowledge/SKILL.md` 的读序跨目录读其公司知识（只读，修改走提案）。
-   - 用 `researchdata.research(route="company-wiki", operation="search", query="<专题关键词>")` 或 `researchdata.research(route="company-wiki", operation="list", params={"company": "<TICKER>"})`（或只读文件检索）查阅共享基金百科 `wiki/` 中已有的行业/技术/供应链条目（**wiki 默认只读，不自动写回 `wiki/`；只有用户明确要求入库〔"入库/存一下/加到 wiki"〕时，按入库流程用 `ingest_company_wiki`**）。
+   - 行业工作区（`subject_kind=sector`）：先读 `sector.md`（定义、边界与成员清单）、`thesis.md`、`debate.md`、`drivers.md`、`lessons.md`、`agenda.md`；涉及成员公司时按 `.agents/skills/dalton-knowledge/SKILL.md` 的读序跨目录读其公司知识（只读，修改走提案）。<!-- DALTON_CAP:researchdata_bridge -->
+   - 用 `researchdata.research(route="company-wiki", operation="search", query="<专题关键词>")` 或 `researchdata.research(route="company-wiki", operation="list", params={"company": "<TICKER>"})`（或只读文件检索）查阅共享基金百科 `wiki/` 中已有的行业/技术/供应链条目（**wiki 默认只读，不自动写回 `wiki/`；只有用户明确要求入库〔"入库/存一下/加到 wiki"〕时，按入库流程用 `ingest_company_wiki`**）。<!-- /DALTON_CAP -->
 2. **拆解 3–6 个信息集群（Clusters）并写入 `research/<D>-topic-<slug>/plan.md`**：
    - 参考 [references/clusters-investment.md](references/clusters-investment.md)。
    - 为每个集群生成 **5–8 条中英文检索词**（含精确机构名、产品代号、供应链术语、时间限定词）。
@@ -70,22 +70,23 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ## 2. Phase 0.5 — 一手锚点采集（Primary Source Anchoring，产出 `research/<D>-topic-<slug>/primary.md`）
 
 在派发并行搜索前，先锁定一手基准数据作为锚点并写入 `research/<D>-topic-<slug>/primary.md`：
-- **公司 / 竞争专题**：拉取相关公司最新 10-K / 10-Q / 20-F（`dalton_sec.list_filings` / `dalton_sec.get_company_facts` 或 `researchdata.finance(route="sec")`）、近 1–2 个季度电话会纪要（`researchdata.research(route="transcript")`）、近 6 个月 AlphaEngine 卖方深度报告（`researchdata.research(route="alphaengine", operation="search_library")`）。
-- **行业 / 技术 / 政策专题**：拉取监管原文、行业协会统计、头部公司披露口径及内部共享资料库（`researchdata.research(route="sales-notes")`、`researchdata.research(route="tmtb")`、`researchdata.research(route="funda-ai")`）。
+- **公司 / 竞争专题**：拉取相关公司最新 10-K / 10-Q / 20-F（`dalton_sec.list_filings` / `dalton_sec.get_company_facts`<!-- DALTON_CAP:researchdata_bridge --> 或 `researchdata.finance(route="sec")`<!-- /DALTON_CAP -->）、近 1–2 个季度电话会纪要（<!-- DALTON_CAP:researchdata_bridge -->`researchdata.research(route="transcript")`<!-- DALTON_CAP_ELSE -->公司 IR 官网或 `web_search` / `web_fetch` 检索公开转写<!-- /DALTON_CAP -->）、近 6 个月<!-- DALTON_CAP:alphaengine --> AlphaEngine 卖方深度报告（`researchdata.research(route="alphaengine", operation="search_library")`）<!-- DALTON_CAP_ELSE -->主流卖方公开点评与深度行业报道（`web_search`）<!-- /DALTON_CAP -->。
+- **行业 / 技术 / 政策专题**：拉取监管原文、行业协会统计、头部公司披露口径<!-- DALTON_CAP:researchdata_bridge -->及内部共享资料库（`researchdata.research(route="sales-notes")`、`researchdata.research(route="tmtb")`、`researchdata.research(route="funda-ai")`）<!-- DALTON_CAP_ELSE -->及权威行业研究报告（`web_search` / `web_fetch`）<!-- /DALTON_CAP -->。
 
 ---
 
-## 3. Phase 2 — 多集群并行证据收集（Parallel Cluster Evidence，产出至少 3 个 `cluster-*.md`、`internal-memory.md`、`guidepoint.md`）
+## 3. Phase 2 — 多集群并行证据收集（Parallel Cluster Evidence，产出至少 3 个 `cluster-*.md`<!-- DALTON_CAP:researchdata_bridge -->、`internal-memory.md`、`guidepoint.md`<!-- /DALTON_CAP -->）
 
-按集群并行派发 3–6 个 `dalton-evidence` 子代理，将各集群证据分别写入 `research/<D>-topic-<slug>/cluster-*.md`（至少 3 个文件，如 `cluster-1.md`…`cluster-5.md`），同时将内部记忆库与专家访谈专项汇总分别写入 `research/<D>-topic-<slug>/internal-memory.md` 和 `research/<D>-topic-<slug>/guidepoint.md`。每个集群遵守以下硬约束：
+按集群并行派发 3–6 个 `dalton-evidence` 子代理，将各集群证据分别写入 `research/<D>-topic-<slug>/cluster-*.md`（至少 3 个文件，如 `cluster-1.md`…`cluster-5.md`）<!-- DALTON_CAP:researchdata_bridge -->，同时将内部记忆库与专家访谈专项汇总分别写入 `research/<D>-topic-<slug>/internal-memory.md` 和 `research/<D>-topic-<slug>/guidepoint.md`<!-- /DALTON_CAP -->。每个集群遵守以下硬约束：
 
 1. **精读全文与港 A 股交叉核对**：
-   - 每个集群在广度搜索（5–8 轮中英查询）后，挑选 **3–5 篇最高质量长文 / 原始文件调用全文读取**（`researchdata.research(route="alphaengine", operation="get_document")`、`web_fetch` 或 SEC 原文 `researchdata.finance(route="sec")`），基于正文全文提取结论。
-   - **港股、A 股公司的财务和经营数字**，必须用 `researchdata.finance(route="cn-hk", ...)` 交叉核对：`ask` 取平台值，`filings` 回公告原文；具体规则直接遵循 `.agents/skills/dalton-conventions/references/evidence-and-sources.md` 的 A/H（`cn-hk`）一节，不重复展开。
-2. **内部记忆库（`internal-memory.md`）、专家网络（`guidepoint.md`）与社区情绪/线索层**：
+   - 每个集群在广度搜索（5–8 轮中英查询）后，挑选 **3–5 篇最高质量长文 / 原始文件调用全文读取**（<!-- DALTON_CAP:alphaengine|researchdata_bridge -->`researchdata.research(route="alphaengine", operation="get_document")`、`web_fetch` 或 SEC 原文 `researchdata.finance(route="sec")`<!-- DALTON_CAP_ELSE -->`web_fetch`、公司 IR 公告或 SEC 原文 `get_sec_filing`<!-- /DALTON_CAP -->），基于正文全文提取结论。
+   - **港股、A 股公司的财务和经营数字**，<!-- DALTON_CAP:researchdata_bridge -->必须用 `researchdata.finance(route="cn-hk", ...)` 交叉核对：`ask` 取平台值，`filings` 回公告原文；具体规则直接遵循 `.agents/skills/dalton-conventions/references/evidence-and-sources.md` 的 A/H（`cn-hk`）一节，不重复展开。<!-- DALTON_CAP_ELSE -->必须通过 `web_search` 与 `web_fetch` 查阅港交所披露易（`site:hkexnews.hk`）、巨潮资讯网及公司 IR 法定公告原文交叉核对。<!-- /DALTON_CAP -->
+<!-- DALTON_CAP:researchdata_bridge -->2. **内部记忆库（`internal-memory.md`）、专家网络（`guidepoint.md`）与社区情绪/线索层**：
    - 检索 `researchdata.research(route="sales-notes")`、`researchdata.research(route="tmtb")`、`researchdata.research(route="funda-ai")`，汇总输出至 `research/<D>-topic-<slug>/internal-memory.md`。
    - 检索 `researchdata.research(route="guidepoint")` 相关专家访谈，汇总输出至 `research/<D>-topic-<slug>/guidepoint.md`。**合规红线：Guidepoint 内容以提炼观点为主，直接引用原文每篇不超过 20 个英文词，不将完整访谈全文贴入报告。**
-   - **社区层（雪球、员工评论、`last30days`）作为情绪和线索层**：对照 `<data_map>`，如果数据地图里有这些路由就调用采集情绪与一线线索；如果没有（或路由不可用），直接写进报告的“未查来源与缺口”。
+   - **社区层（雪球、员工评论、`last30days`）作为情绪和线索层**：对照 `<data_map>`，如果数据地图里有这些路由就调用采集情绪与一线线索；如果没有（或路由不可用），直接写进报告的“未查来源与缺口”。<!-- DALTON_CAP_ELSE -->2. **公开一线访谈与社区情绪/线索层**：
+   - 使用 `web_search`、`web_fetch` 与 `x_search` 检索行业峰会访谈、供应链/客户公开案例及专业投资者社区讨论，作为情绪与一线线索层；对照 `<data_map>` 记录未查来源与缺口。<!-- /DALTON_CAP -->
 3. **结构化证据包与时效性纪律**：
    - **每条数字证据都要同时带“数据所属期”（如 `2026Q2`）和“发布日期”（如 `2026-08-15`）**，并附完整 `[引用N]` 来源（标题、机构/作者、发布日期、URL/doc_id）及原文关键数字。
    - **发布日期超过 6 个月的证据标 `【陈旧】`**：只能作背景，不能作核心论据；用作核心论据之前，必须找到 6 个月内的更新，或者明确写明找不到。
@@ -104,7 +105,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - `【更正】`：修正过往报告或市场流传的错误数据时，必须写明：**原错误值 → 更正后值 → 更正依据**。
    - `【陈旧】`：每条数字证据都必须带“数据所属期”和“发布日期”；发布日期超过 6 个月的证据必须标 `【陈旧】`，只能作背景，不能作核心论据（用作核心论据前必须找到 6 个月内的更新，或写明找不到）。
 2. **Phase 3.5 盲区检查硬门禁**：
-   - 对照 Phase 0 的 5–8 个核心问题逐一核查：是否有问题尚无一手数据？是否有反方最强论据未被检索？是否有发布日期超过 6 个月的陈旧数据未标 `【陈旧】` 或未找 6 个月内更新？港股与 A 股财务/经营数字是否已按 `.agents/skills/dalton-conventions/references/evidence-and-sources.md` 的 A/H 一节通过 `finance(route="cn-hk", ...)`（`ask` + `filings`）交叉核对？
+   - 对照 Phase 0 的 5–8 个核心问题逐一核查：是否有问题尚无一手数据？是否有反方最强论据未被检索？是否有发布日期超过 6 个月的陈旧数据未标 `【陈旧】` 或未找 6 个月内更新？港股与 A 股财务/经营数字是否已按 `.agents/skills/dalton-conventions/references/evidence-and-sources.md` 的 A/H 一节<!-- DALTON_CAP:researchdata_bridge -->通过 `finance(route="cn-hk", ...)`（`ask` + `filings`）<!-- DALTON_CAP_ELSE -->对照法定公告原文<!-- /DALTON_CAP -->交叉核对？
    - **对照 `<data_map>` 盘点未查来源**：写结论之前必须对照 `<data_map>`，在报告“未查来源与缺口”小节列出“相关但未查的来源”并说明原因（含社区层雪球、员工评论、`last30days` 等在数据地图中缺失或未用的情况）。
    - 若存在关键缺口，最多追加派发 **≤2 个补漏 `dalton-evidence` 子代理**定向补齐。
    - 补齐后（或确认无盲区后），必须在 `research/<D>-topic-<slug>/cross-check.md` 末尾明确写下 **`盲区检查完成`**（未写下“盲区检查完成”不得进入 Phase 4 写作）。
@@ -147,9 +148,9 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - 调用 `knowledge_append_verdict`（`trigger.kind="agenda"`）记录本次专题对 thesis 的结论（行业工作区同样沿用五词结论），并通过 `agenda_ops` 关闭已完成的议程项、登记新发现的跟踪项。
 2. **跨工作区更新走提案机制**：
    - 若专题结论涉及其他覆盖公司或行业工作区的成员公司，**不直接跨目录修改其他工作区的 `data/*.json`**，在 `knowledge-revision.json` 中列出跨公司修改提案，并通过 `agenda_ops` 写入 `pm_handoffs`（或由 Home 研究总监通过 `delegate_to_analyst` / `dalton_agenda_note` 分发给对应公司分析师）。行业观点只把成员公司标"待复核"，不自动改公司论点。
-3. **基金 Wiki 默认只读，按需两步入库**：`wiki/` 目录默认只读，不自动写回；只有用户明确要求入库（"入库/存一下/加到 wiki"）时，按两步入库流程调用 `ingest_company_wiki`（先 `confirm=False` 预览并由用户确认，再 `confirm=True` 正式写入；卖方材料不进 wiki）。
-4. **汇报完成前必须过完成契约（`dalton_check_done`）**：
+<!-- DALTON_CAP:researchdata_bridge -->3. **基金 Wiki 默认只读，按需两步入库**：`wiki/` 目录默认只读，不自动写回；只有用户明确要求入库（"入库/存一下/加到 wiki"）时，按两步入库流程调用 `ingest_company_wiki`（先 `confirm=False` 预览并由用户确认，再 `confirm=True` 正式写入；卖方材料不进 wiki）。
+4. <!-- DALTON_CAP_ELSE -->3. <!-- /DALTON_CAP -->**汇报完成前必须过完成契约（`dalton_check_done`）**：
    - 调用 `dalton_check_done(workflow="topic-research", run_id=<`research/<D>-topic-<slug>/.progress.json` 里的 run_id>, params={"topic": "<专题名称>", "slug": "<kebab-case-slug>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>"})`（与启动时的参数一致；行业产物按**工作区覆盖身份**核对——行业工作区加查 thesis/agenda/drivers 的本轮 source=tool 新版本，与 params 里是否带 subject_kind 无关，带了冲突值会被拒绝；未传 `as_of` 时用 `as_of="latest"`）；
    - 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，调用 `dalton_check_done(workflow="topic-research", params={"topic": "<专题名称>", "slug": "<kebab-case-slug>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>", "manual": true})`，审稿结论按 `research/<D>-topic-<slug>/review.json` 核对；
    - `done=false` 时按 `missing` 先补齐再查（缺文件补文件、`validate_topic.py` 修到通过、知识层缺 source=tool 新版本就 `knowledge_update`），补不了的缺项只能汇报"未完成"并列出缺项与原因，不得汇报"完成"。
-5. **发布归档**（完成契约通过后）：当 `dalton-reviewer` 返回 `pass` 且 PM 要求正式发布时，先运行 `check_draft(draft_path="drafts/<D>-topic-<slug>.md")`，再调用 `publish_report(draft_path="drafts/<D>-topic-<slug>.md", title="<专题名称>", kind="topic", slug="<slug>", updates_thesis=False)`。
+<!-- DALTON_CAP:researchdata_bridge -->5. <!-- DALTON_CAP_ELSE -->4. <!-- /DALTON_CAP -->**发布归档**（完成契约通过后）：当 `dalton-reviewer` 返回 `pass` 且 PM 要求正式发布时，先运行 `check_draft(draft_path="drafts/<D>-topic-<slug>.md")`，再调用 `publish_report(draft_path="drafts/<D>-topic-<slug>.md", title="<专题名称>", kind="topic", slug="<slug>", updates_thesis=False)`。

@@ -1224,7 +1224,7 @@ class PTCSandbox:
         local_skill_names: set[str],
         *,
         existing_lock: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> set[str]:  # DALTON-HOOK(standalone-core)
         return await _assets._prune_remote_skills(self, local_skill_names, existing_lock=existing_lock)
 
     async def _upload_skills(
@@ -1234,8 +1234,16 @@ class PTCSandbox:
         manifest: dict[str, Any] | None = None,
         existing_lock: dict[str, Any] | None = None,
         disabled: frozenset[str] = frozenset(),
+        failed_prunes: set[str] | frozenset[str] = frozenset(),  # DALTON-HOOK(standalone-core)
     ) -> tuple[dict[str, Any] | None, set[str]]:
-        return await _assets._upload_skills(self, local_skills_dirs, manifest=manifest, existing_lock=existing_lock, disabled=disabled)
+        return await _assets._upload_skills(
+            self,
+            local_skills_dirs,
+            manifest=manifest,
+            existing_lock=existing_lock,
+            disabled=disabled,
+            failed_prunes=failed_prunes,
+        )
 
 
     # -- mcp_setup --

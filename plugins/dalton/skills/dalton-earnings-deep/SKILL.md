@@ -65,8 +65,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
        --ticker META --release-date 2026-10-28 --timing AMC \
        --benchmarks QQQ,SPY --sector-etf XLC --markdown
      ```
-   - **卖方与独立研究窗口**：检索发布时刻至发布后 3 个交易日内的 AlphaEngine 卖方报告、FUNDA AI 与 TMTB 点评，以及 `[T0, T0+24h)` 的 `sales-notes`。
-   - **证据层级与四类信息标注**：美股遵守 `10-Q/10-K > 8-K EX-99.1 > 新闻稿 > 演示稿 > 电话会` 优先级；港股与 A 股通过 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 调取法定定期报告与业绩公告（港股未覆盖时用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接），`operation="ask"` 平台财务表仅作二手初值，核心数字一律回公告核实，并核对复权、分红、拆股与交易/报表币种；只在电话会口头提及、未写入公告的指引在正文用自然中文说明（如“管理层在电话会上口头表示，未写入公告”）；所有内容严格区分 **事实 / 管理层指引 / 市场预期 / 研究判断**。
+   - **卖方与独立研究窗口**：检索发布时刻至发布后 3 个交易日内的<!-- DALTON_CAP:alphaengine|researchdata_bridge --> AlphaEngine 卖方报告、FUNDA AI 与 TMTB 点评，以及 `[T0, T0+24h)` 的 `sales-notes`<!-- DALTON_CAP_ELSE -->公开卖方点评、机构观点汇总与权威财经报道（使用 `web_search` 与公开财报解读渠道）<!-- /DALTON_CAP -->。
+   - **证据层级与四类信息标注**：美股遵守 `10-Q/10-K > 8-K EX-99.1 > 新闻稿 > 演示稿 > 电话会` 优先级；港股与 A 股<!-- DALTON_CAP:researchdata_bridge -->通过 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 调取法定定期报告与业绩公告（港股未覆盖时用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接），`operation="ask"` 平台财务表仅作二手初值，核心数字一律回公告核实<!-- DALTON_CAP_ELSE -->通过 `web_search` 检索港交所披露易（`site:hkexnews.hk`）、巨潮资讯或交易所官网法定定期报告与业绩公告原文核实核心数字<!-- /DALTON_CAP -->，并核对复权、分红、拆股与交易/报表币种；只在电话会口头提及、未写入公告的指引在正文用自然中文说明（如“管理层在电话会上口头表示，未写入公告”）；所有内容严格区分 **事实 / 管理层指引 / 市场预期 / 研究判断**。
 
 2. **支线 B —— Excel 模型更新（`model_path` 非空时运行）**：
    - 先读 `.agents/skills/model-update/SKILL.md`，触发类型设为 `Results`。

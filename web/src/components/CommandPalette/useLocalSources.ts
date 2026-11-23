@@ -19,7 +19,8 @@ import { resolveNavWorkspacePermissions } from '@/pages/ChatAgent/components/Nav
 import { useSaveFailureToast } from '@/pages/Settings/panels/usePreferenceWrite';
 // DALTON-HOOK(settings-section): palette settings use the rail's card visibility
 import { useDaltonSettingsVisibility } from '@/pages/Settings/components/SettingsRail';
-import { SECTIONS, searchableSettings, settingSearchText } from '@/pages/Settings/sections';
+// DALTON-HOOK(standalone-core): import capability-aware settingLabelKey for palette display & matching
+import { SECTIONS, searchableSettings, settingLabelKey, settingSearchText } from '@/pages/Settings/sections';
 import type { Workspace } from '@/types/api';
 import { runs, type Verbs } from './rows';
 import { usePaletteAccess } from './useVerbs'; // DALTON-HOOK(colleague-dispatch)
@@ -128,8 +129,9 @@ export function useLocalSources(v: Verbs) {
     return {
       id: `setting:${entry.anchor}`,
       icon: section.icon,
-      title: t(entry.labelKey),
-      keywords: settingSearchText(entry, t),
+      // DALTON-HOOK(standalone-core): pass capability visibility context for channel-aware title and search keywords
+      title: t(settingLabelKey(entry, daltonVisibility)),
+      keywords: settingSearchText(entry, t, daltonVisibility),
       meta: `${t('sidebar.settings')} › ${t(section.labelKey)}`,
       actions: [
         runs('open', t('palette.do.open'), section.icon, () =>

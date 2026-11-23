@@ -27,11 +27,15 @@ import HeroImageSlot from '../../components/HeroImageSlot.astro';
 ## <Icon name="rocket" size="1.1rem" class="ef-group-icon" />从这里开始
 
 <CardGrid>
-  <LinkCard
+  {/* DALTON_DOC:everflow */}<LinkCard
     title="Everflow 是什么"
     description="看懂研究总监和工作区分析师怎么分工，以及沙箱如何跑代码、出结论。"
     href="/help/get-started/what-is-everflow/"
-  />
+  />{/* DALTON_DOC_ELSE */}<LinkCard
+    title="Dalton 是什么"
+    description="看懂研究总监和工作区分析师怎么分工，以及沙箱如何跑代码、出结论。"
+    href="/help/get-started/overview/"
+  />{/* /DALTON_DOC */}
   <LinkCard
     title="第一次使用"
     description="从登录账号、首次引导选默认模型、建第一个工作区，到发出提问并打开结果文件。"
@@ -49,7 +53,7 @@ import HeroImageSlot from '../../components/HeroImageSlot.astro';
   />
 </CardGrid>
 
-## <Icon name="star" size="1.1rem" class="ef-group-icon" />Everflow 核心与专有能力
+{/* DALTON_DOC:everflow */}## <Icon name="star" size="1.1rem" class="ef-group-icon" />Everflow 核心与专有能力
 
 <CardGrid>
   <LinkCard
@@ -72,7 +76,30 @@ import HeroImageSlot from '../../components/HeroImageSlot.astro';
     description="逐栏对照「个人设置」和「团队管理」的用途与权限门槛。"
     href="/help/everflow/settings-guide/"
   />
-</CardGrid>
+</CardGrid>{/* DALTON_DOC_ELSE */}## <Icon name="star" size="1.1rem" class="ef-group-icon" />核心能力与工作流
+
+<CardGrid>
+  <LinkCard
+    title="分析师与研究总监"
+    description="看懂全局统筹与工作区分析师如何分工、派活并汇总研究回报。"
+    href="/help/concepts/chief-of-staff-and-analysts/"
+  />
+  <LinkCard
+    title="技能与插件"
+    description="了解内置投研技能、Slash 快捷指令，以及沙箱内的程序化工具调用（PTC）。"
+    href="/help/concepts/skills-and-plugins/"
+  />
+  <LinkCard
+    title="定时任务与后台命令"
+    description="配置按计划、一次性和价格触发的自动化任务，以及长脚本后台执行机制。"
+    href="/help/concepts/automations-wakeups-commands/"
+  />
+  <LinkCard
+    title="模型与额度"
+    description="管理默认主模型、推理强度、自动任务备用链以及每日美元预算上限。"
+    href="/help/concepts/models-and-budgets/"
+  />
+</CardGrid>{/* /DALTON_DOC */}
 
 ## <Icon name="open-book" size="1.1rem" class="ef-group-icon" />场景实战与方案对比
 

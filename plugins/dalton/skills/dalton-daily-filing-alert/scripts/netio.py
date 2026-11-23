@@ -14,14 +14,14 @@ _LAST_REQUEST = 0.0
 def sec_user_agent() -> str:
     """SEC fair-access identity. Prefer the operator's env value.
 
-    The fallback is the same string as ``get_sec_user_agent`` in
-    ``src/dalton/settings.py``. This script cannot import that module.
+    The fallback matches ``DEFAULT_SEC_USER_AGENT`` in
+    ``src/dalton/sec_identity.py``. This script cannot import that module.
     """
     for key in ("EDGAR_IDENTITY", "SEC_USER_AGENT", "DALTON_SEC_USER_AGENT"):
         value = os.environ.get(key, "").strip()
         if value:
             return value
-    return "DaltonResearch research@everflowinv.com"
+    return "DaltonResearch sec-contact@example.com"
 
 
 def sec_headers() -> dict[str, str]:

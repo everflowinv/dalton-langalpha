@@ -96,10 +96,12 @@ function Settings() {
   const { t } = useTranslation();
 
   // DALTON-HOOK(settings-reorg): hold skeleton while tier/coverage permission resolves; redirect unauthorized direct visits cleanly using unified visibility
+  // DALTON-HOOK(standalone-core): hold lightweight skeleton only during Core build initial capability fetch
   const requestedSection = resolveRequestedSection(searchParams, hash);
   const requestedMeta: SectionMeta | undefined = requestedSection ? SECTIONS[requestedSection] : undefined;
   const awaitingTier = Boolean(requestedMeta?.minTier && daltonVisibility.callerTierPending);
   const awaitingCoverage = Boolean(requestedMeta?.coverageUnitsOnly && daltonVisibility.coverageUnitsPending);
+  const awaitingCapabilities = Boolean(daltonVisibility.capabilitiesLoading);
   const unauthorizedDaltonAuth = Boolean(requestedMeta?.daltonAuthOnly && !isDaltonAuth);
   const unauthorizedTier = Boolean(
     requestedMeta?.minTier &&
@@ -118,7 +120,8 @@ function Settings() {
     (awaitingTier || awaitingCoverage) && requestedSection ? requestedSection : section;
   const pageRef = useRef<HTMLDivElement>(null);
   useScrollMemory(pageRef, `page:settings:${displaySection}`);
-  const isLoading = isUserLoading || isPrefsLoading || awaitingTier || awaitingCoverage;
+  const isLoading =
+    isUserLoading || isPrefsLoading || awaitingTier || awaitingCoverage || awaitingCapabilities;
 
   // DALTON-HOOK(settings-reorg): replace unauthorized deep link onto account tab with OSS-specific or tier-specific notice
   useEffect(() => {

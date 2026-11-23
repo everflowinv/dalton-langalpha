@@ -1,13 +1,13 @@
 <!--
 写入者：分析师 agent（取数时）或夜间预检探针（P4）或旧认知迁移脚本（P1.4）
-何时写：每次调用 researchdata.finance(route="estimates", ticker=T) 获取卖方一致预期时
+何时写：每次调用 <!-- DALTON_CAP:researchdata_bridge -->researchdata.finance(route="estimates", ticker=T)<!-- DALTON_CAP_ELSE -->yf_analysis / yfinance 一致预期接口<!-- /DALTON_CAP --> 获取卖方一致预期时
 读写模式：只追加新快照文件（每个时间点一个新 JSON 文件，严禁修改或覆盖历史快照）
 参考规范：P0D-P1 §P0-D.6、PK.1 工作区文件布局
 -->
 
 # 卖方一致预期快照（`data/consensus/`）
 
-Yahoo Finance（`yfinance`）的一致预期接口不提供历史 as-of 查询。为了追踪市场一致预期的修正轨迹（Earnings Revision），每次拉取 `researchdata.finance(route="estimates", ticker="<TICKER>")` 时，必须将返回结果存为本目录下的时间戳快照文件。
+Yahoo Finance（`yfinance`）的一致预期接口不提供历史 as-of 查询。为了追踪市场一致预期的修正轨迹（Earnings Revision），每次拉取 <!-- DALTON_CAP:researchdata_bridge -->`researchdata.finance(route="estimates", ticker="<TICKER>")`<!-- DALTON_CAP_ELSE -->`yf_analysis` / `yfinance` 一致预期数据<!-- /DALTON_CAP --> 时，必须将返回结果存为本目录下的时间戳快照文件。
 
 ## 命名与写入规则
 

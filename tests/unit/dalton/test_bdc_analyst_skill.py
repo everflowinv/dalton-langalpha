@@ -155,8 +155,9 @@ def test_sec_identity_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
 
     ident, source = state_store.resolve_sec_identity()
     assert source == "default"
-    assert ident == "DaltonResearch research@everflowinv.com"
-    assert bdc_analyzer.get_headers() == {"User-Agent": "DaltonResearch research@everflowinv.com"}
+    assert ident == "DaltonResearch sec-contact@example.com"
+    assert "everflowinv" not in ident.lower()
+    assert bdc_analyzer.get_headers() == {"User-Agent": "DaltonResearch sec-contact@example.com"}
 
     monkeypatch.setenv("EDGAR_IDENTITY", "EdgarUser edgar@example.com")
     ident, source = state_store.resolve_sec_identity()

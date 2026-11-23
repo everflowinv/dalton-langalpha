@@ -6,6 +6,7 @@ import { Search, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(settings-section)
 import { useAuth } from '@/contexts/AuthContext'; // DALTON-HOOK(settings-section)
+import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(standalone-core)
 import { useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(settings-section)
 import { useDaltonCoverageUnits } from '@/lib/dalton/coverage'; // DALTON-HOOK(settings-reorg)
 import { queryKeys } from '@/lib/queryKeys'; // DALTON-HOOK(settings-section)
@@ -18,19 +19,28 @@ import {
   useUserCosSharingQuery,
   type DaltonSettingVisibilityContext,
 } from '../panels/dalton/DaltonCosSharingCard';
-import { GROUPS, SECTIONS, searchableSettings, sectionShown, settingSearchText, type Section, type SettingEntry } from '../sections';
+// DALTON-HOOK(standalone-core): import capability-aware settingLabelKey for rendered search titles
+import { GROUPS, SECTIONS, searchableSettings, sectionShown, settingLabelKey, settingSearchText, type Section, type SettingEntry } from '../sections';
 
 // DALTON-HOOK(settings-section): the command palette filters settings with the same card visibility
 // DALTON-HOOK(settings-reorg): fail closed on callerTierError without cos-sharing fallback; keep OSS admin & coverage parity
+// DALTON-HOOK(standalone-core): inject live deployment capabilities and skip channel-bindings fetch when channels are disabled
 export function useDaltonSettingsVisibility(): DaltonSettingVisibilityContext {
   const { userId } = useAuth();
+  const { capabilities, isLoading: capabilitiesLoading, hasCapability } = useCapabilities();
   const { canInvite, isPm, callerTier, callerTierPending, callerTierError } = useTeamCredentials();
   const { data } = useUserCosSharingQuery(isDaltonAuth);
   const { data: coverageData, isLoading: coverageLoading } = useDaltonCoverageUnits(true);
+  const channelsEnabled = hasCapability([
+    'channel_gateway',
+    'channel_feishu',
+    'channel_discord',
+    'channel_weixin',
+  ]);
   const { data: bindingsData, isLoading: bindingsLoading } = useQuery({
     queryKey: queryKeys.dalton.channelBindings(),
     queryFn: fetchDaltonChannelBindings,
-    enabled: Boolean(userId),
+    enabled: Boolean(userId) && channelsEnabled,
     staleTime: 5 * 60_000,
     retry: false,
   });
@@ -40,6 +50,7 @@ export function useDaltonSettingsVisibility(): DaltonSettingVisibilityContext {
   const waitingOnBindingsFallback =
     isDaltonAuth &&
     Boolean(userId) &&
+    channelsEnabled &&
     bindingsLoading &&
     (callerTierError || (!callerTierPending && !callerTier));
   const effectiveTier = isDaltonAuth
@@ -60,6 +71,8 @@ export function useDaltonSettingsVisibility(): DaltonSettingVisibilityContext {
     coverageUnitsEnabled: coverageData?.enabled === true,
     coverageUnitsPending: coverageLoading,
     discordChannelsAdmin,
+    capabilities,
+    capabilitiesLoading,
   };
 }
 
@@ -107,7 +120,7 @@ export function SettingsRail({ section }: { section: Section }) {
   const words = queryWords(query);
   const matches = words.length === 0
     ? []
-    : entries.filter((entry) => matchesAllWords(settingSearchText(entry, t), words));
+    : entries.filter((entry) => matchesAllWords(settingSearchText(entry, t, daltonVisibility), words));
   const searching = words.length > 0;
   const shownActive = Math.min(active, Math.max(matches.length - 1, 0));
 
@@ -202,7 +215,8 @@ export function SettingsRail({ section }: { section: Section }) {
                 >
                   <Icon className="page-rail-icon" aria-hidden />
                   <span className="min-w-0">
-                    <span className="settings-result-name">{t(entry.labelKey)}</span>
+                    {/* DALTON-HOOK(standalone-core): display capability-aware title so disabled channels never appear */}
+                    <span className="settings-result-name">{t(settingLabelKey(entry, daltonVisibility))}</span>
                     <span className="settings-result-section">{t(SECTIONS[entry.section].labelKey)}</span>
                   </span>
                 </div>

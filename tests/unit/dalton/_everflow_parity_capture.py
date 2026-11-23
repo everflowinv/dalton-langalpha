@@ -53,6 +53,7 @@ from ptc_agent.agent.insight_graph import (
 )
 from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import (
     PrebuiltWorkflowRegistry,
+    read_assembled_workflow_file,
 )
 from ptc_agent.agent.middleware.compaction import compact as compact_mod
 from ptc_agent.agent.middleware.direct_mcp import METADATA_KEY, DirectToolSet
@@ -65,7 +66,11 @@ from ptc_agent.agent.middleware.runtime_context.harness_blocks import (
     MCP_SERVERS_BLOCK,
 )
 from ptc_agent.agent.middleware.runtime_context.templates import render_template
-from ptc_agent.agent.middleware.skills.content import load_skill_content, resolve_skill_dir
+from ptc_agent.agent.middleware.skills.content import (
+    load_skill_content,
+    read_assembled_skill_file,
+    resolve_skill_dir,
+)
 from ptc_agent.agent.middleware.skills.dalton_registry import (
     DALTON_SKILL_DEFINITIONS,
     DALTON_SKILLS_DIR,
@@ -537,9 +542,42 @@ def _assemble_all_dalton_skills_fulltext() -> str:
                 if ref_file.suffix.lower() not in _SKILL_REFERENCE_EXTENSIONS:
                     continue
                 parts.append(f"--- FILE: {name}/{rel.as_posix()} ---")
-                parts.append(ref_file.read_text(encoding="utf-8"))
+                parts.append(read_assembled_skill_file(ref_file))
         sections.append("\n".join(parts))
     return "\n\n".join(sections) + "\n"
+
+
+def _assemble_langalpha_doc_fulltext() -> str:
+    """Assemble full text of ``plugins/langalpha_service/skills/langalpha-doc/**``."""
+    doc_root = REPO_ROOT / "plugins" / "langalpha_service" / "skills" / "langalpha-doc"
+    parts = ["===== SKILL: langalpha-doc ====="]
+    for path in sorted(p for p in doc_root.rglob("*") if p.is_file()):
+        rel = path.relative_to(doc_root)
+        if _has_dot_part(rel):
+            continue
+        if path.suffix.lower() not in _SKILL_REFERENCE_EXTENSIONS:
+            continue
+        parts.append(f"--- FILE: langalpha-doc/{rel.as_posix()} ---")
+        parts.append(read_assembled_skill_file(path))
+    return "\n".join(parts) + "\n"
+
+
+def _capture_dalton_evidence_body() -> str:
+    """Load and compile bundled ``dalton-evidence`` via real plugin loader + compiler."""
+    from ptc_agent.agent.subagents.compiler import SubagentCompiler
+    from ptc_agent.agent.subagents.merge import plugin_definition
+    from src.server.services.plugins.bundled import bundled_agent_plans
+    from src.server.services.subagents.view import render_base_body
+
+    plans = [plan for _bundle, plan in bundled_agent_plans() if plan.name == "dalton-evidence"]
+    assert len(plans) == 1, f"Expected bundled dalton-evidence plan, got {plans}"
+    defn = plugin_definition(plans[0].row, bundled=True)
+    body = render_base_body(defn)
+    compiled = SubagentCompiler().compile(defn)
+    assert "DALTON_CAP" not in body
+    assert "DALTON_CAP" not in compiled["system_prompt"]
+    assert body in compiled["system_prompt"]
+    return body + "\n"
 
 
 def _assemble_all_workflows_fulltext() -> str:
@@ -561,7 +599,7 @@ def _assemble_all_workflows_fulltext() -> str:
                 continue
             if path.suffix.lower() not in _WORKFLOW_EXTENSIONS:
                 continue
-            text = script_text if path.name == "workflow.js" else path.read_text(encoding="utf-8")
+            text = script_text if path.name == "workflow.js" else read_assembled_workflow_file(path)
             parts.append(f"--- FILE: {rel.as_posix()} ---")
             parts.append(text)
         sections.append("\n".join(parts))
@@ -716,6 +754,8 @@ async def run_capture(app_env: str) -> dict[str, Any]:
             "data_map_team_memory_on": static_dm_on,
             "data_map_team_memory_off": static_dm_off,
             "skills_51_assembled": _assemble_all_dalton_skills_fulltext(),
+            "langalpha_doc_assembled": _assemble_langalpha_doc_fulltext(),
+            "dalton_evidence_body": _capture_dalton_evidence_body(),
             "workflows_6_fulltext": _assemble_all_workflows_fulltext(),
         }
     finally:

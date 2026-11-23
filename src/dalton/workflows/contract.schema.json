@@ -507,6 +507,26 @@
           },
           "description": "本轮命中 verdict_kinds_any/verdict_trigger 的 verdict 里有 word 不是 NO_CHANGE 时，至少其一须有 source=tool 新版本（stock-move / filing-review 的条件知识更新）。"
         },
+        "material_verdict_requires": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "artifacts": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/artifact"
+              }
+            },
+            "docs_any": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "本轮最新 verdict 表示实质变化（word 非 NO_CHANGE、progress 非 none、或 payoff_assessment.reason=price_crossed_band）时强制要求交付产物与至少一份知识文档更新（核心形态增量任务无 last_run.json 时使用）。"
+        },
         "verdict_payoff_required": {
           "type": "boolean",
           "default": false,

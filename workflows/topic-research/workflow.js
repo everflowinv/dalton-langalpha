@@ -1,6 +1,6 @@
 export const meta = {
   name: 'topic-research',
-  description: 'Dalton 专题研究：规划 → 一手 → 分簇取证∥内部记忆∥专家 → 交叉验证与盲区 → 写作 → 数字核验 → 独立审稿 → 修订',
+  description: 'Dalton 专题研究：规划 → 一手 → 分簇取证/* DALTON_CAP:researchdata_bridge */∥内部记忆/* /DALTON_CAP *//* DALTON_CAP:guidepoint */∥专家/* /DALTON_CAP */ → 交叉验证与盲区 → 写作 → 数字核验 → 独立审稿 → 修订',
 }
 
 const { topic, slug, horizon, workspace_dir: W, as_of: D } = args
@@ -14,7 +14,7 @@ const R = `${W}/research/${dateTag}-topic-${topicSlug}`
 const S = '.agents/skills/dalton-topic-research'
 const base = `先读 .agents/skills/dalton-conventions/SKILL.md 与 ${S}/SKILL.md、${S}/references/principles.md；专题：「${topic}」，时间范围：${
   horizon || '优先近 30 天（6 个月以上标日期，12 个月以上仅作背景）'
-}，相关公司：${related.join(', ') || '见规划'}。基金 wiki 只读，任何阶段不回写 wiki。${
+}，相关公司：${related.join(', ') || '见规划'}。/* DALTON_CAP:company_wiki */基金 wiki 只读，任何阶段不回写 wiki。/* /DALTON_CAP */${
   isSector
     ? '本工作区是行业工作区（绑定 sector 覆盖单元）：行业认知从 data/sector.json 与 data/thesis.json、data/drivers.json、data/agenda.json 读（没有 management/company 文档，也不得创建）；成员清单以 data/sector.json 的 members 为准，不给行业编 ticker。'
     : ''
@@ -162,7 +162,7 @@ phase('一手材料')
 const primary = await agent(
   `${base} 阶段 0.5 一手材料：规划见 ${R}/plan.md。涉及上市公司（${
     related.join(', ') || '按规划'
-  }）时读最近定期报告与 8-K 附件、1–2 次电话会、近 6 个月卖方报告；行业/宏观题读 AlphaEngine 行业检索与内部库，写 ${R}/primary.md。若目标文件已存在，先读并核对，缺什么补什么，不必推倒重写。`,
+  }）时读最近定期报告与 8-K 附件、1–2 次电话会、近 6 个月卖方报告/* DALTON_CAP:alphaengine|researchdata_bridge */；行业/宏观题读 AlphaEngine 行业检索与内部库/* DALTON_CAP_ELSE */；行业/宏观题结合公开行业报告与宏观数据检索/* /DALTON_CAP */，写 ${R}/primary.md。若目标文件已存在，先读并核对，缺什么补什么，不必推倒重写。`,
   { agentType: 'dalton-evidence', label: '一手材料', phase: '一手材料', schema: OUT }
 )
 
@@ -178,33 +178,34 @@ const evTasks = [
       { agentType: 'dalton-evidence', label: `取证 ${cname}`, phase: '分簇取证', schema: OUT }
     )
   }),
-  () =>
+/* DALTON_CAP:researchdata_bridge */  () =>
     agent(
       `${base} 阶段 2 内部记忆检索：检索 researchdata 的 sales-notes、tmtb、funda-ai、company-wiki（只读），英文与中文结合，写 ${R}/internal-memory.md。`,
       { agentType: 'dalton-evidence', label: '内部记忆', phase: '分簇取证', schema: OUT }
     ),
-  () =>
+/* /DALTON_CAP *//* DALTON_CAP:guidepoint */  () =>
     agent(
       `${base} 阶段 2 专家纪要检索：用英文检索 Guidepoint 1–2 轮，标专家身份不写姓名，原话引用 ≤20 个英文词并带出处，写 ${R}/guidepoint.md。`,
       { agentType: 'dalton-evidence', label: '专家纪要', phase: '分簇取证', schema: OUT }
     ),
-]
+/* /DALTON_CAP */]
 const evResults = await parallel(evTasks)
 
-// B1：contract 要求 primary.md（≥100 字节）、cluster-* ≥3 个（各 ≥100 字节）、
-// internal-memory.md 与 guidepoint.md（各 ≥50 字节）必交。取证子任务返回
+// B1：contract 要求 primary.md（≥100 字节）、cluster-* ≥3 个（各 ≥100 字节）/* DALTON_CAP:researchdata_bridge,guidepoint */、
+// internal-memory.md 与 guidepoint.md（各 ≥50 字节）/* /DALTON_CAP */必交。取证子任务返回
 // null/files 为空、或核验发现在盘缺失/过小，都算缺失；凑不满底线（含全部缺失）
 // 停在交叉验证之前，出口与审稿 block 同一段文案。个别簇缺失但底线仍够时不
 // block：缺失簇写进 incomplete、传给写作提示词并在返回值里列出。
 const clusterFiles = clusters.map((c, idx) => `${R}/cluster-${c.id || `c${idx + 1}`}.md`)
 const clusterNames = clusters.map((c, idx) => c.name || `簇 ${idx + 1}`)
-const internalFile = `${R}/internal-memory.md`
-const guidepointFile = `${R}/guidepoint.md`
-const primaryFile = `${R}/primary.md`
+/* DALTON_CAP:researchdata_bridge */const internalFile = `${R}/internal-memory.md`
+/* /DALTON_CAP *//* DALTON_CAP:guidepoint */const guidepointFile = `${R}/guidepoint.md`
+/* /DALTON_CAP */const primaryFile = `${R}/primary.md`
 const clusterOnDisk = clusters.map((_, i) => branchArtifacts(evResults[i]).length > 0)
-let internalOnDisk = branchArtifacts(evResults[clusters.length]).length > 0
-let guidepointOnDisk = branchArtifacts(evResults[clusters.length + 1]).length > 0
-let primaryOnDisk = branchArtifacts(primary).length > 0
+/* DALTON_CAP:researchdata_bridge */let internalOnDisk = branchArtifacts(evResults[clusters.length]).length > 0
+/* /DALTON_CAP *//* DALTON_CAP:guidepoint */let guidepointOnDisk = branchArtifacts(evResults[clusters.length + 1]).length > 0
+/* /DALTON_CAP *//* DALTON_CAP:!researchdata_bridge,guidepoint */guidepointOnDisk = branchArtifacts(evResults[clusters.length]).length > 0
+/* /DALTON_CAP */let primaryOnDisk = branchArtifacts(primary).length > 0
 // 缺失簇在核验前先按子任务回报算一遍（核验失败的出口要用），核验后再按在盘
 // 结果重算；此后所有出口（取证缺失 block、审稿 block、最终返回）都带上。
 let missingClusters = clusters
@@ -216,9 +217,9 @@ let missingClusterIds = clusters
 const toProbe = [
   ...(primaryOnDisk ? [[primaryFile, 100]] : []),
   ...clusterFiles.filter((_, i) => clusterOnDisk[i]).map((p) => [p, 100]),
-  ...(internalOnDisk ? [[internalFile, 50]] : []),
-  ...(guidepointOnDisk ? [[guidepointFile, 50]] : []),
-]
+/* DALTON_CAP:researchdata_bridge */  ...(internalOnDisk ? [[internalFile, 50]] : []),
+/* /DALTON_CAP *//* DALTON_CAP:guidepoint */  ...(guidepointOnDisk ? [[guidepointFile, 50]] : []),
+/* /DALTON_CAP */]
 if (toProbe.length) {
   const probe = await probeBranchFiles(toProbe)
   if (probe === null) {
@@ -239,9 +240,9 @@ if (toProbe.length) {
     const path = entry.slice(0, -'|missing'.length)
     const idx = clusterFiles.indexOf(path)
     if (idx >= 0) clusterOnDisk[idx] = false
-    else if (path === internalFile) internalOnDisk = false
-    else if (path === guidepointFile) guidepointOnDisk = false
-    else if (path === primaryFile) primaryOnDisk = false
+/* DALTON_CAP:researchdata_bridge */    else if (path === internalFile) internalOnDisk = false
+/* /DALTON_CAP *//* DALTON_CAP:guidepoint */    else if (path === guidepointFile) guidepointOnDisk = false
+/* /DALTON_CAP */    else if (path === primaryFile) primaryOnDisk = false
   }
   missingClusters = clusters
     .map((_, i) => (clusterOnDisk[i] ? null : clusterNames[i]))
@@ -256,9 +257,9 @@ const topicMissing = []
 if (!primaryOnDisk) topicMissing.push('一手材料')
 if (presentClusters < 3)
   topicMissing.push(`cluster-*.md 完整产物不足 3 个（现 ${presentClusters} 个）`)
-if (!internalOnDisk) topicMissing.push('内部记忆检索')
-if (!guidepointOnDisk) topicMissing.push('专家纪要检索')
-if (topicMissing.length) {
+/* DALTON_CAP:researchdata_bridge */if (!internalOnDisk) topicMissing.push('内部记忆检索')
+/* /DALTON_CAP *//* DALTON_CAP:guidepoint */if (!guidepointOnDisk) topicMissing.push('专家纪要检索')
+/* /DALTON_CAP */if (topicMissing.length) {
   return {
     ok: false,
     blocked: `取证支线缺失：${topicMissing.join('、')}`,
@@ -272,7 +273,7 @@ if (topicMissing.length) {
 
 phase('交叉验证与盲区')
 const cross = await agent(
-  `${base} 阶段 3 交叉验证 + 阶段 3.5 盲区检查：读 ${R}/ 下全部取证文件（primary.md、cluster-*.md、internal-memory.md、guidepoint.md），跨簇互证升级置信度（【高】≥3 独立源、【中】2 源、【低】单源）；矛盾保留各方原话（【冲突】），不折中合并；检查盲区并写 ${R}/cross-check.md，结尾写“盲区检查完成”。若仍有必须补查的盲区，放入返回 JSON 的 gaps 数组（最多 2 项）。`,
+  `${base} 阶段 3 交叉验证 + 阶段 3.5 盲区检查：读 ${R}/ 下全部取证文件（primary.md、cluster-*.md/* DALTON_CAP:researchdata_bridge */、internal-memory.md/* /DALTON_CAP *//* DALTON_CAP:guidepoint */、guidepoint.md/* /DALTON_CAP */），跨簇互证升级置信度（【高】≥3 独立源、【中】2 源、【低】单源）；矛盾保留各方原话（【冲突】），不折中合并；检查盲区并写 ${R}/cross-check.md，结尾写“盲区检查完成”。若仍有必须补查的盲区，放入返回 JSON 的 gaps 数组（最多 2 项）。`,
   { agentType: 'general-purpose', label: '交叉验证与盲区', phase: '交叉验证与盲区', schema: OUT }
 )
 
@@ -281,7 +282,7 @@ if (cross && Array.isArray(cross.gaps) && cross.gaps.length > 0) {
   await parallel(
     suppGaps.map((g, idx) => () =>
       agent(
-        `${base} 阶段 3.5 盲区补查 #${idx + 1}：针对盲区「${g}」补充检索一手材料、内部库或 AlphaEngine，写 ${R}/supplement-${
+        `${base} 阶段 3.5 盲区补查 #${idx + 1}：针对盲区「${g}」补充检索一手材料/* DALTON_CAP:alphaengine|researchdata_bridge */、内部库或 AlphaEngine/* DALTON_CAP_ELSE */与公开资料/* /DALTON_CAP */，写 ${R}/supplement-${
           idx + 1
         }.md。`,
         { agentType: 'dalton-evidence', label: `盲区补查 ${idx + 1}`, phase: '交叉验证与盲区', schema: OUT }
@@ -410,7 +411,7 @@ const notesReview =
   !draftOk || !reviewPassed
     ? null
     : await agent(
-        `对本次运行产出、给人读的 .md 笔记逐一做两轮语言审查（规则见 .agents/skills/dalton-language/SKILL.md，只标问题）。每个文件依次：1) 调用工具 check_language(draft_path="<文件>", round=1)，读 <文件>.language.md 清单并按清单修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）；2) 调用 check_language(draft_path="<文件>", round=2) 复核；若第 1 轮后改过稿，改完再调用一次 round=2 确认（记录追加在同一 json）。\n文件清单：\n- ${R}/plan.md\n- ${R}/primary.md\n- ${R}/internal-memory.md\n- ${R}/guidepoint.md\n- ${R}/cross-check.md\n- ${R}/number-audit.md\n清单之外本次运行写的其他给人读的 .md 一并同法处理；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/ 下的文件、知识层渲染文件与 .audit/.annotated/.language 侧车不审。返回处理过的文件列表与摘要。`,
+        `对本次运行产出、给人读的 .md 笔记逐一做两轮语言审查（规则见 .agents/skills/dalton-language/SKILL.md，只标问题）。每个文件依次：1) 调用工具 check_language(draft_path="<文件>", round=1)，读 <文件>.language.md 清单并按清单修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）；2) 调用 check_language(draft_path="<文件>", round=2) 复核；若第 1 轮后改过稿，改完再调用一次 round=2 确认（记录追加在同一 json）。\n文件清单：\n- ${R}/plan.md\n- ${R}/primary.md\n/* DALTON_CAP:researchdata_bridge */- ${R}/internal-memory.md\n/* /DALTON_CAP *//* DALTON_CAP:guidepoint */- ${R}/guidepoint.md\n/* /DALTON_CAP */- ${R}/cross-check.md\n- ${R}/number-audit.md\n清单之外本次运行写的其他给人读的 .md 一并同法处理；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/ 下的文件、知识层渲染文件与 .audit/.annotated/.language 侧车不审。返回处理过的文件列表与摘要。`,
         { agentType: 'general-purpose', label: '笔记语言审查', phase: '独立审稿与修订', schema: OUT }
       )
 if (draftOk && reviewPassed && notesReview === null) {
@@ -457,20 +458,20 @@ let kp = null
 if (reviewPassed) {
   kp = await agent(
     isSector
-      ? `${base} 阶段 7 知识层草案（行业工作区）：按 PK.2 的 JSON Schema 把本行业的知识层修改建议写到 ${R}/knowledge-revision.json（不回写基金 wiki，不直接改 data/）：行业论点进 thesis（支柱/阈值/证据，不写公司目标价）、行业指标进 drivers、行业问题与验证点进 agenda，可含 debate/lessons 与 sector 文档的成员、边界修订；涉及成员公司（${
+      ? `${base} 阶段 7 知识层草案（行业工作区）：按 PK.2 的 JSON Schema 把本行业的知识层修改建议写到 ${R}/knowledge-revision.json（/* DALTON_CAP:company_wiki */不回写基金 wiki，/* /DALTON_CAP */不直接改 data/）：行业论点进 thesis（支柱/阈值/证据，不写公司目标价）、行业指标进 drivers、行业问题与验证点进 agenda，可含 debate/lessons 与 sector 文档的成员、边界修订；涉及成员公司（${
           related.join(', ') || '见 data/sector.json 的 members'
         }）的修改列为跨公司提案，由 Home 转交对应公司分析师，不在本工作区写 company/management。`
       : `${base} 阶段 7 知识层草案：按 PK.2 的 JSON Schema 将对相关覆盖公司（${
           related.join(', ') || '报告涉及的覆盖公司'
-        }）的知识层修改建议（drivers、debate、lessons、agenda）写到 ${R}/knowledge-revision.json（不回写基金 wiki，不直接改 data/）。`,
+        }）的知识层修改建议（drivers、debate、lessons、agenda）写到 ${R}/knowledge-revision.json（/* DALTON_CAP:company_wiki */不回写基金 wiki，/* /DALTON_CAP */不直接改 data/）。`,
     { agentType: 'general-purpose', label: '知识层草案', phase: '独立审稿与修订', schema: OUT }
   )
 }
 
 if (!primaryOnDisk) incomplete.push('一手材料失败')
-if (!internalOnDisk) incomplete.push('内部记忆检索失败')
-if (!guidepointOnDisk) incomplete.push('专家纪要检索失败')
-if (cross === null) incomplete.push('交叉验证与盲区失败')
+/* DALTON_CAP:researchdata_bridge */if (!internalOnDisk) incomplete.push('内部记忆检索失败')
+/* /DALTON_CAP *//* DALTON_CAP:guidepoint */if (!guidepointOnDisk) incomplete.push('专家纪要检索失败')
+/* /DALTON_CAP */if (cross === null) incomplete.push('交叉验证与盲区失败')
 if (!draftOk) incomplete.push('专题写作失败（草稿或其 sha256 缺失/非法）')
 if (lang1Failed) incomplete.push('语言审查第 1 轮失败（结果或其 sha256 缺失/非法），未按清单修改')
 if (audit === null && draftOk) incomplete.push('数字核验失败')
@@ -484,11 +485,11 @@ const deliverables = [
   `${R}/plan.md.language.json`,
   `${R}/primary.md`,
   `${R}/primary.md.language.json`,
-  `${R}/internal-memory.md`,
+/* DALTON_CAP:researchdata_bridge */  `${R}/internal-memory.md`,
   `${R}/internal-memory.md.language.json`,
-  `${R}/guidepoint.md`,
+/* /DALTON_CAP *//* DALTON_CAP:guidepoint */  `${R}/guidepoint.md`,
   `${R}/guidepoint.md.language.json`,
-  `${R}/cross-check.md`,
+/* /DALTON_CAP */  `${R}/cross-check.md`,
   `${R}/cross-check.md.language.json`,
   draftPath,
   `${draftPath}.language.json`,

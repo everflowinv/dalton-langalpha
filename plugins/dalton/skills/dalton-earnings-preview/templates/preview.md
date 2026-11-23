@@ -110,15 +110,17 @@
 ### 各渠道检索覆盖表
 
 | 来源通道 | 查询词与时间窗口 | 精读篇数 | 最新文档日期 | 结果状态（找到 / 无相关结果 / 渠道失败） |
-|---|---|---|---|---|
-| AlphaEngine | {公司名 + Ticker，YYYY-MM-DD 至 YYYY-MM-DD} | {N 篇} | {YYYY-MM-DD} | {状态说明} |
+|---|---|---|---|---|<!-- DALTON_CAP:alphaengine -->
+| AlphaEngine | {公司名 + Ticker，YYYY-MM-DD 至 YYYY-MM-DD} | {N 篇} | {YYYY-MM-DD} | {状态说明} |<!-- /DALTON_CAP --><!-- DALTON_CAP:researchdata_bridge -->
 | sales-notes | {公司名 + Ticker，YYYY-MM-DD 至 YYYY-MM-DD} | {N 封} | {YYYY-MM-DD} | {状态说明} |
 | TMTB | {公司名 + Ticker，YYYY-MM-DD 至 YYYY-MM-DD} | {N 篇} | {YYYY-MM-DD} | {状态说明} |
-| FUNDA AI | {公司名 + Ticker，YYYY-MM-DD 至 YYYY-MM-DD} | {N 篇} | {YYYY-MM-DD} | {状态说明} |
+| FUNDA AI | {公司名 + Ticker，YYYY-MM-DD 至 YYYY-MM-DD} | {N 篇} | {YYYY-MM-DD} | {状态说明} |<!-- DALTON_CAP_ELSE -->
+| SEC / 公司 IR 与电话会 | {公司名 + Ticker，YYYY-MM-DD 至 YYYY-MM-DD} | {N 份} | {YYYY-MM-DD} | {状态说明} |
+| 一致预期与公开卖方摘要 | {公司名 + Ticker，YYYY-MM-DD 至 YYYY-MM-DD} | {N 篇} | {YYYY-MM-DD} | {状态说明} |<!-- /DALTON_CAP -->
 | 行业前瞻 | {行业词 + earnings preview，窗口} | {N 篇} | {YYYY-MM-DD} | {状态说明} |
 | 公开 X（一轮） | {公开主题词，90 天窗口至 as-of} | {N 条} | {YYYY-MM-DD} | {状态说明} |
 
 ## 引用
 
-[引用1]: evidence:E-20261023-01 （{来源类型}｜{机构／作者身份}｜《{标题}》｜{YYYY-MM-DD}｜{doc_id / mail:ID / tmtb:ID / funda:ID / SEC URL}，{章节／页码／图片 ID}）
+[引用1]: evidence:E-20261023-01 （{来源类型}｜{机构／作者身份}｜《{标题}》｜{YYYY-MM-DD}｜{<!-- DALTON_CAP:alphaengine|researchdata_bridge -->doc_id / mail:ID / tmtb:ID / funda:ID / SEC URL<!-- DALTON_CAP_ELSE -->SEC accession / 公开来源 URL<!-- /DALTON_CAP -->}，{章节／页码／图片 ID}）
 [引用2]: model:model/META-model-v01.xlsx!DCF!C12 （本方模型｜{模型版本与工作表单元格说明}｜{YYYY-MM-DD}｜model/{TICKER}-model-v01.xlsx）

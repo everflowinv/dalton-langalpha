@@ -20,7 +20,7 @@ description: "Dalton 基金投研方法论总纲：规定覆盖阶段问题、�
   - **结构化写入与报告正文一致**：赔率卡（三情景 `states`、基准股价 `anchor`、权重区间 `weight_bounds`、三层保护 `protection`、胜率裁决 `breakeven_verdict` 等）写入 `thesis.underwriting`；方向（`stance`）、确信度（`conviction`）、行动分类（`actionability`）、限制变量（`binding_constraint`）、双向改判条件（`flip_conditions`）、待验证触发条件引用（`trigger_refs`）、买点价带（`entry_band`）、持有跨度（`horizon_months`）写入 `thesis.house_view`；市场观点与观察（`summary`、`observations`、`positioning`、`figures`）写入 `thesis.market_view`（完整字段路径、枚举值与过检 JSON 样例统一见 `.agents/skills/dalton-knowledge/references/structured-write-example.md`）。调用 `knowledge_update(doc="thesis", ...)` 时先传 `dry_run=True` 查看赔率计算摘要，确认无误再传 `dry_run=False` 正式提交；报告正文保留给人读的赔率卡，数字与 `thesis` 一致，不另算一套。**报告正文和推送正文一律按 `references/writing.md` §2「正文给人读」书写**（不写知识层编号、枚举值、英文字段名、函数/脚本/工具名、文件路径或工具报错原文）。
 - **决策边界**：Dalton 只提供研究观点、三情景估值与仓位建议（sizing recommendation）；正式 house thesis 的批准与实际交易执行均由 PM 决定。
 - **公司研究的工作区路由**：研究某家公司时，产物写在这家公司自己的工作区里。当前线程不在那个工作区时，不要用相对路径把产物写到其他工作区的目录（自动跟踪与完成核对都只认当前工作区）——请让用户切换到那个工作区后再运行，或从研究总监（Home）把任务交给那个工作区的分析师。
-- **外部成员身份限制**：外部成员（按名单固定，界面上不可改）拥有**完全隔离**的环境：**看不到任何别人的工作区**（Chief of Staff 与网页两条通道都一样，访问别人的工作区、线程、文件一律 404，不管主人怎么设置共享）；自己的工作区一切照常，但**仅管理员可查看（只读）**，共享设置不生效。不能写入公司 wiki（`ingest_company_wiki` 会直接拒绝，预览也拒绝）、不能检索团队对话归档（`conversation_search` 拒绝；搜自己的对话用全局搜索 ⌘K）、不能发布正式报告（`publish_report` 拒绝）。工具返回这类拒绝或 404 时，是身份限制不是故障：向用户如实转述原因，不要换参数重试、不要尝试绕过。
+- **外部成员身份限制**：外部成员（按名单固定，界面上不可改）拥有**完全隔离**的环境：**看不到任何别人的工作区**（Chief of Staff 与网页两条通道都一样，访问别人的工作区、线程、文件一律 404，不管主人怎么设置共享）；自己的工作区一切照常，但**仅管理员可查看（只读）**，共享设置不生效。<!-- DALTON_CAP:company_wiki -->不能写入公司 wiki（`ingest_company_wiki` 会直接拒绝，预览也拒绝）、<!-- /DALTON_CAP --><!-- DALTON_CAP:conversation_archive -->不能检索团队对话归档（`conversation_search` 拒绝；搜自己的对话用全局搜索 ⌘K）、<!-- /DALTON_CAP -->不能发布正式报告（`publish_report` 拒绝）。工具返回这类拒绝或 404 时，是身份限制不是故障：向用户如实转述原因，不要换参数重试、不要尝试绕过。
 
 ## 2. 与 `research-conventions` 的关系
 
@@ -45,7 +45,7 @@ Dalton 继承 `.agents/skills/research-conventions/SKILL.md` 的通用投研纪�
 5. **区分来源身份，合并转述链**：公司指引、卖方一致预期、具体机构预测、明确的买方门槛、专家单一来源估计、作者判断必须分开标注；同一份研报被多渠道转述只算一条。
 6. **先量化异动，再找原因**：股价波动先用同组公司（peers）和板块 ETF 分清是板块 beta 还是个股 alpha，再按层级排查原因。
 7. **只写重要变化**：日常跟踪无实质变化就不推送；成稿坚持判断先行，基金研究默认使用中文并保留英文专业术语（用户指定交付语言时按用户要求）。
-8. **诚实汇报边界**：拿不到的数据写"本轮未取得"（不等于"公司未披露"），不用相近口径顶替；会改变结论、确信度或行动的数据缺口，在相关判断第一次出现的地方用一句话写清影响；其余缺口、检索范围和失败原因只放文末 `## 附注`（推送稿写在 `## 来源` 节，用一句人话如"本轮未取得专家访谈：连接超时"），同一缺口全文只说明一次，后文直接使用已经限定过的判断；按任务范围没做、也不影响结论的检查，只记在内部底稿，不写进正文。**`ok: false` 不等于"没有数据"**：调用 `researchdata` 返回 `ok: false` 时，必须按返回中的 `hint` 处理（修正参数、换 `operation` 或换替代数据源重试）；如果仍无法解决，按上述规则在对应位置如实写明取数失败及原因（不在正文或来源节贴工具报错原文），**严禁把 `ok: false` 写成"没有新信息""没有相关信息"或"没有数据"**。真正的"没有匹配"返回 `ok: true` 加空结果并带 `empty_reason`。
+8. **诚实汇报边界**：拿不到的数据写"本轮未取得"（不等于"公司未披露"），不用相近口径顶替；会改变结论、确信度或行动的数据缺口，在相关判断第一次出现的地方用一句话写清影响；其余缺口、检索范围和失败原因只放文末 `## 附注`（推送稿写在 `## 来源` 节，用一句人话如"本轮未取得专家访谈：连接超时"），同一缺口全文只说明一次，后文直接使用已经限定过的判断；按任务范围没做、也不影响结论的检查，只记在内部底稿，不写进正文。<!-- DALTON_CAP:researchdata_bridge -->**`ok: false` 不等于"没有数据"**：调用 `researchdata` 返回 `ok: false` 时，必须按返回中的 `hint` 处理（修正参数、换 `operation` 或换替代数据源重试）；如果仍无法解决，按上述规则在对应位置如实写明取数失败及原因（不在正文或来源节贴工具报错原文），**严禁把 `ok: false` 写成"没有新信息""没有相关信息"或"没有数据"**。真正的"没有匹配"返回 `ok: true` 加空结果并带 `empty_reason`。<!-- DALTON_CAP_ELSE -->**工具报错不等于"没有数据"**：数据工具返回错误或取数失败时，先核对参数或改用替代公开数据源重试；如果仍无法解决，按上述规则在对应位置如实写明取数失败及原因（不在正文或来源节贴工具报错原文），**严禁把取数失败写成"没有新信息""没有相关信息"或"没有数据"**。<!-- /DALTON_CAP -->
 9. **解释类回答的多源印证**：解释类回答的可信度来自不同类型来源的相互印证：事实来源加至少一类解读来源（卖方、专家或管理层原话）；只拿到一类时，在回答里写明缺哪一类；不用一条卖方观点代表市场共识。
 10. **口径一致才能比较**：分别定标的链式指数不是实际份额，不能相加减或直接比较，必须换算到统一分母；预测与一致预期的差额不能写成某几项成本的合计，除非逐项拆分加总后确实相等；写进长期记忆的结论必须先确认口径（份额还是指数、定基还是链式、含税与否），不要把不同口径的数固化成同一口径。
 11. **逐题响应**：用户列出的问题逐条回答，研究不偏离；做不到的题明说。
@@ -74,29 +74,29 @@ Dalton 继承 `.agents/skills/research-conventions/SKILL.md` 的通用投研纪�
 
 ## 5. 合规口径
 
-> 专家访谈、管理层交流（包括转入基金 wiki 的材料）以及 Guidepoint 的检索结果，都已经过用户的合规流程，可以使用（2026-10-15 确认，2026-10-18 owner 再次确认范围包括 Guidepoint）。这包括以公司在职员工口吻发言的专家，以及高管小范围交流。照常使用，不要自行以"重大非公开信息"为由排除。
+<!-- DALTON_CAP:guidepoint|alphaengine|researchdata_bridge -->> 专家访谈、管理层交流（包括转入基金 wiki 的材料）以及 Guidepoint 的检索结果，都已经过用户的合规流程，可以使用（2026-10-15 确认，2026-10-18 owner 再次确认范围包括 Guidepoint）。这包括以公司在职员工口吻发言的专家，以及高管小范围交流。照常使用，不要自行以"重大非公开信息"为由排除。
 >
 > 引用时写日期和专家身份（写身份，不写姓名），并注明可靠性（已证实、被反驳、互相矛盾）。专家给出的经营数字，标为"单一来源估计"，与公司披露和卖方数据分开写。
 >
 > Guidepoint 原文引用不超过 20 个词，并附 `source_attribution`；不得用于 KYC 或合规筛查。
 
-适用范围已定：wiki 里的专家访谈和管理层交流、AlphaEngine 里的专家和调研纪要、Guidepoint 检索结果，一律可用并标专家身份。
+适用范围已定：wiki 里的专家访谈和管理层交流、AlphaEngine 里的专家和调研纪要、Guidepoint 检索结果，一律可用并标专家身份。<!-- DALTON_CAP_ELSE -->> 公开渠道或用户提供的专家访谈、行业会议纪要与管理层交流材料，引用时须写明日期和受访者身份（写身份，不写姓名），并注明可靠性（已证实、被反驳、互相矛盾）。专家给出的经营数字，标为"单一来源估计"，与公司披露和卖方数据分开写。<!-- /DALTON_CAP -->
 
 ## 6. 数据入口速查
 
-- **内部研究与另类数据（`researchdata`）**：各来源提供的证据与 `research` 路由选用规则，统一以 `<mcp-servers>` 中 `researchdata` 的说明与 `.agents/tools/docs/researchdata/research.md`（由 `scripts/dalton/researchdata_bridge.py` 的 `RESEARCH_EVIDENCE_AND_ROUTE_GUIDE` 单一来源生成，并在运行期结合 `catalog()` / `catalog(route=...)`）为准；此外，`finance` 工具支持 `sec`、`estimates`、`cn-hk`，`macro` 工具支持 `fred`、`treasury`、`market-regime`，`community` 工具支持 `xueqiu`、`employee`、`last30days`、`x-timeline`。**第一次调用某个 operation 前先查 `catalog(route=...)`，不要猜参数名或嵌套位置**；每次返回均带 `normalized_params` 展示实际生效的标准参数；遇到 `ok: false` 必须按 `hint` 处理或如实报告数据源取数失败，不得当成"没有数据"。
+<!-- DALTON_CAP:researchdata_bridge -->- **内部研究与另类数据（`researchdata`）**：各来源提供的证据与 `research` 路由选用规则，统一以 `<mcp-servers>` 中 `researchdata` 的说明与 `.agents/tools/docs/researchdata/research.md`（由 `scripts/dalton/researchdata_bridge.py` 的 `RESEARCH_EVIDENCE_AND_ROUTE_GUIDE` 单一来源生成，并在运行期结合 `catalog()` / `catalog(route=...)`）为准；此外，`finance` 工具支持 `sec`、`estimates`、`cn-hk`，`macro` 工具支持 `fred`、`treasury`、`market-regime`，`community` 工具支持 `xueqiu`、`employee`、`last30days`、`x-timeline`。**第一次调用某个 operation 前先查 `catalog(route=...)`，不要猜参数名或嵌套位置**；每次返回均带 `normalized_params` 展示实际生效的标准参数；遇到 `ok: false` 必须按 `hint` 处理或如实报告数据源取数失败，不得当成"没有数据"。<!-- DALTON_CAP_ELSE -->- **公开研究与网络检索（`web_search` / `web_fetch`）**：通过 `web_search` 与 `web_fetch` 检索公开财报电话会纪要、投资者日演示材料、监管公告、行业研究与权威媒体报道，关键事实优先回溯一手披露核实。<!-- /DALTON_CAP -->
 - **一手 SEC 财报与核验（`dalton_sec`）**：美股使用 `get_company_facts`（提取 R1–R10 规范期间与衍生单季值）、`list_filings`（按 accession 列举申报文件并配合脚本核验）。
-- **港股与 A 股公告及数据（`cn-hk`）**：调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=..., start=..., end=..., limit=...)` 获取巨潮资讯（cninfo）A 股/港股公告与 PDF 链接（港股传 5 位纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`；查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`）；调用 `researchdata.finance(route="cn-hk", operation="ask", query=..., limit=...)` 查询行情、资金流、两融、龙虎榜、股东、分红回购、AH 溢价及财务表初值（平台财务表属二手初值，核心财务数字必须回公告原文核实；回报与估值须核对复权、分红、拆股与交易/报表币种）。
+<!-- DALTON_CAP:researchdata_bridge -->- **港股与 A 股公告及数据（`cn-hk`）**：调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=..., start=..., end=..., limit=...)` 获取巨潮资讯（cninfo）A 股/港股公告与 PDF 链接（港股传 5 位纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`；查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`）；调用 `researchdata.finance(route="cn-hk", operation="ask", query=..., limit=...)` 查询行情、资金流、两融、龙虎榜、股东、分红回购、AH 溢价及财务表初值（平台财务表属二手初值，核心财务数字必须回公告原文核实；回报与估值须核对复权、分红、拆股与交易/报表币种）。<!-- DALTON_CAP_ELSE -->- **港股与 A 股公告及数据**：通过 `web_search` 查披露易（`site:hkexnews.hk`）、巨潮资讯（cninfo）及交易所/公司 IR 官网获取定期报告与业绩公告原文；公开行情与财务汇总表仅作初值参考，核心财务数字必须回公告原文核实；回报与估值须核对复权、分红、拆股与交易/报表币种。<!-- /DALTON_CAP -->
 - **行情与历史估值（默认 `yfinance`）**：股价、复权收益率与相对表现默认使用 `yf_price`（配合 `.agents/skills/research-conventions/references/market-data-rules.md` 统一基准日）；历史估值倍数使用 `fundamentals.get_historical_valuation` 或 `yf_fundamentals`。
-- **卖方一致预期（`estimates`）**：调用 `researchdata.finance(route="estimates", ticker=T)`，一律标为 `street_estimate`（写明 `"Yahoo Finance via yfinance"`、`fetched_at`、期间键与分析师人数）。Yahoo 无历史 as-of，每次取数必须保存快照到工作区 `data/consensus/<YYYY-MM-DD_HHMM>.json`（附 `_meta{route, fetched_at, source}`）；其中的 `implied_model` 是模型推导（税率默认取最近一季），必须标为 `model-derived`。
-- **用户上传的 Excel 打不开**：`openpyxl` 加载报错（例如 definedNames 损坏）时，先运行 `python .agents/skills/dalton-conventions/scripts/xlsx_repair.py <文件.xlsx>`。它只删除导致 openpyxl 无法加载的名字，另存为 `<文件名>.repaired.xlsx`，原文件不动；之后改读修复后的文件。
-- **飞书文档读写（`feishu_*`）**：读——用户给了飞书/Lark 链接或要求读取时用 `feishu_read`。写——**只有用户在本次对话里明确要求写到飞书时**才用 `feishu_create_doc` / `feishu_append`；交付物默认留在工作区（`published/` 等），不要主动写飞书，也不要因为"可能有用"就顺手同步。Chief of Staff 把任务交给分析师时，如果用户要求写到飞书，要在委派说明里写明，分析师照做。工具：`feishu_read` 读文档（docx/wiki 链接或 token，超长会截断并标注），`feishu_list_wiki` 找知识空间或节点，`feishu_create_doc` 用 markdown 新建文档，`feishu_append` 在文末追加。**身份限制**：管理员和内部成员可读可写；外部成员只能读，且仅限管理员在设置里开放的知识空间（工具会按调用者身份自动放行或拒绝——返回"外部成员只能读取飞书文档"或"知识空间未开放"时，向用户如实转述，不要尝试绕过）。新建文档只做新建与追加，不覆盖、不删除、不改权限。
+- **卖方一致预期（`estimates`）**：<!-- DALTON_CAP:researchdata_bridge -->调用 `researchdata.finance(route="estimates", ticker=T)`<!-- DALTON_CAP_ELSE -->通过公开市场数据与一致预期工具（如 `yf_fundamentals` 或公开行情接口）获取<!-- /DALTON_CAP -->，一律标为 `street_estimate`（写明 `"Yahoo Finance via yfinance"`、`fetched_at`、期间键与分析师人数）。Yahoo 无历史 as-of，每次取数必须保存快照到工作区 `data/consensus/<YYYY-MM-DD_HHMM>.json`（附 `_meta{route, fetched_at, source}`）；其中的 `implied_model` 是模型推导（税率默认取最近一季），必须标为 `model-derived`。
+- **用户上传的 Excel 打不开**：`openpyxl` 加载报错（例如 definedNames 损坏）时，先运行 `python .agents/skills/dalton-conventions/scripts/xlsx_repair.py <文件.xlsx>`。它只删除导致 openpyxl 无法加载的名字，另存为 `<文件名>.repaired.xlsx`，原文件不动；之后改读修复后的文件。<!-- DALTON_CAP:feishu_docs -->
+- **飞书文档读写（`feishu_*`）**：读——用户给了飞书/Lark 链接或要求读取时用 `feishu_read`。写——**只有用户在本次对话里明确要求写到飞书时**才用 `feishu_create_doc` / `feishu_append`；交付物默认留在工作区（`published/` 等），不要主动写飞书，也不要因为"可能有用"就顺手同步。Chief of Staff 把任务交给分析师时，如果用户要求写到飞书，要在委派说明里写明，分析师照做。工具：`feishu_read` 读文档（docx/wiki 链接或 token，超长会截断并标注），`feishu_list_wiki` 找知识空间或节点，`feishu_create_doc` 用 markdown 新建文档，`feishu_append` 在文末追加。**身份限制**：管理员和内部成员可读可写；外部成员只能读，且仅限管理员在设置里开放的知识空间（工具会按调用者身份自动放行或拒绝——返回"外部成员只能读取飞书文档"或"知识空间未开放"时，向用户如实转述，不要尝试绕过）。新建文档只做新建与追加，不覆盖、不删除、不改权限。<!-- /DALTON_CAP -->
 
 ## 7. 公司知识层读写约定
 
 - **知识层位置与结构**：每个公司工作区（如 `META/`）维护结构化知识文档 `data/{company,thesis,debate,drivers,management,lessons,agenda}.json` 与事件判断表 `dalton_verdicts`，由服务端自动渲染出根目录同名 `.md` 文件及 `verdicts.md`（详见 PK.1 文件布局与 PK.2 Schema）。
-- **受控写入**：修改认知必须调用 `knowledge_update` 或 `knowledge_append_verdict`（PK.4），不得直接手改渲染出的 `.md`（直接改会被记录为 `direct_edit` 并提示合入）；`agent.md` 中的 `<!-- dalton:summary:start (由 knowledge_update 维护，勿手改) -->` 至 `<!-- dalton:summary:end -->` 托管块（PK.6）由工具自动重写，切勿手动编辑。
-- **基金 Wiki 默认只读**：`company-wiki` 默认只读，日常研究发现、论点演进与正式报告均写入本公司工作区知识层及 `published/` 目录；只有用户明确要求入库（"入库/存一下/加到 wiki"）时，按 [references/wiki-ingest.md](references/wiki-ingest.md) 的入库流程用 `ingest_company_wiki`。
+- **受控写入**：修改认知必须调用 `knowledge_update` 或 `knowledge_append_verdict`（PK.4），不得直接手改渲染出的 `.md`（直接改会被记录为 `direct_edit` 并提示合入）；`agent.md` 中的 `<!-- dalton:summary:start (由 knowledge_update 维护，勿手改) -->` 至 `<!-- dalton:summary:end -->` 托管块（PK.6）由工具自动重写，切勿手动编辑。<!-- DALTON_CAP:researchdata_bridge -->
+- **基金 Wiki 默认只读**：`company-wiki` 默认只读，日常研究发现、论点演进与正式报告均写入本公司工作区知识层及 `published/` 目录；只有用户明确要求入库（"入库/存一下/加到 wiki"）时，按 [references/wiki-ingest.md](references/wiki-ingest.md) 的入库流程用 `ingest_company_wiki`。<!-- /DALTON_CAP -->
 - **覆盖名单位置**：覆盖名单由系统按用户维护，通过 Chief of Staff 修改，自动渲染到用户 Home 下的 `../Home/dalton/coverage.yaml`（Home 工作区内为 `dalton/coverage.yaml`）。
 
 ## 8. 自动化推送稿与两轮语言审查约定

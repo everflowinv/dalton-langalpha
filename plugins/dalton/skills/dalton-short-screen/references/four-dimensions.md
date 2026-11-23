@@ -8,7 +8,7 @@
 
 **数据源**：最新 `10-K`（近 2 期）+ 最新 `10-Q`（近 3 期）；外国私人发行人用 `20-F` + `6-K`。
 
-```python
+<!-- DALTON_CAP:researchdata_bridge -->```python
 # 美股本土公司
 researchdata.finance(route="sec", operation="list-filings", ticker="{TICKER}", form="10-K", limit=2)
 researchdata.finance(route="sec", operation="list-filings", ticker="{TICKER}", form="10-Q", limit=3)
@@ -31,7 +31,16 @@ researchdata.finance(route="sec", operation="search-text", ticker="{TICKER}", fo
 
 # 自然语言结构化事实补充
 researchdata.finance(route="sec", operation="smart-facts", ticker="{TICKER}", query="contract assets and contract liabilities last 3 years", limit=10)
-```
+```<!-- DALTON_CAP_ELSE -->```python
+# 美股本土公司
+dalton_sec.list_filings(ticker="{TICKER}", forms="10-K,10-Q", limit=10)
+
+# 外国私人发行人（BABA, PDD, JD, TCOM, BIDU 等）
+dalton_sec.list_filings(ticker="{TICKER}", forms="20-F,6-K", limit=10)
+
+# 结构化三表与 XBRL 事实（MD&A 与附注正文按 accession 从 SEC EDGAR 原文核对）
+dalton_sec.get_company_facts(ticker="{TICKER}")
+```<!-- /DALTON_CAP -->
 
 ### 1. 收入确认政策
 - 是否存在激进收入确认（bill-and-hold、channel stuffing 迹象、提前确认长期合同收入、高度波动的非经常性或事件驱动型收入）。
@@ -97,13 +106,17 @@ researchdata.finance(route="sec", operation="smart-facts", ticker="{TICKER}", qu
 
 **数据源**：最新 `DEF 14A`；外国私人发行人无 `DEF 14A` 时，查最新 `20-F` 的 `Item 6.B`（Compensation）。
 
-```python
+<!-- DALTON_CAP:researchdata_bridge -->```python
 researchdata.finance(route="sec", operation="list-filings", ticker="{TICKER}", form="DEF 14A", limit=2)
 researchdata.finance(route="sec", operation="search-text", ticker="{TICKER}", form="DEF 14A", query="Summary Compensation Table")
 researchdata.finance(route="sec", operation="search-text", ticker="{TICKER}", form="DEF 14A", query="threshold")
 # 外国发行人备用（读取完整 Item 6，再在正文内查找 6.B Compensation 小节）
 researchdata.finance(route="sec", operation="read-item", ticker="{TICKER}", form="20-F", item="6", params={"max_chars": 40000})
-```
+```<!-- DALTON_CAP_ELSE -->```python
+dalton_sec.list_filings(ticker="{TICKER}", forms="DEF 14A", limit=2)
+# 外国发行人备用（按 accession 读取 20-F Item 6.B Compensation 小节）
+dalton_sec.list_filings(ticker="{TICKER}", forms="20-F", limit=2)
+```<!-- /DALTON_CAP -->
 
 ### 必查项目
 1. **CEO / CFO 总薪酬结构**：Base salary、Bonus / Non-equity incentive、Stock awards（PSUs/RSUs）、Option awards、其他薪酬及各项占比。
@@ -132,11 +145,14 @@ researchdata.finance(route="sec", operation="read-item", ticker="{TICKER}", form
 
 **数据源**：最近 2 份 Proxy Statement 董事/高管名单对比 + `8-K`（Item 5.02）+ 两年窗口新闻检索。
 
-```python
+<!-- DALTON_CAP:researchdata_bridge -->```python
 researchdata.finance(route="sec", operation="eight-k", ticker="{TICKER}", limit=20)
 researchdata.finance(route="sec", operation="list-filings", ticker="{TICKER}", form="8-K", limit=20)
 web_search(query='"{COMPANY}" ("executive departure" OR "CFO change" OR "board change" OR "resigned")', start_date="<两年前 YYYY-MM-DD>", end_date="<今天 YYYY-MM-DD>")
-```
+```<!-- DALTON_CAP_ELSE -->```python
+dalton_sec.list_filings(ticker="{TICKER}", forms="8-K", limit=20)
+web_search(query='"{COMPANY}" ("executive departure" OR "CFO change" OR "board change" OR "resigned")', start_date="<两年前 YYYY-MM-DD>", end_date="<今天 YYYY-MM-DD>")
+```<!-- /DALTON_CAP -->
 
 ### 必查项目
 1. **高管变动清单**：过去 2 年离任与新任高管时间表；**CFO、Chief Accounting Officer（CAO）、Controller 离任或频繁更换为重大红旗**，必须逐一核查离任去向与披露原因。
@@ -147,10 +163,10 @@ web_search(query='"{COMPANY}" ("executive departure" OR "CFO change" OR "board c
 
 ## 维度 4：社交媒体、员工、产品口碑、专家访谈与做空数据
 
-**铁律**：**每一条发现必须附带具体来源 URL**（或 Guidepoint 的 `source_attribution.markdown`）；无来源 URL 的发现不得写入报告。
+**铁律**：**每一条发现必须附带具体来源 URL**<!-- DALTON_CAP:guidepoint -->（或 Guidepoint 的 `source_attribution.markdown`）<!-- /DALTON_CAP -->；无来源 URL 的发现不得写入报告。
 
 ### 1. 员工口碑
-```python
+<!-- DALTON_CAP:researchdata_bridge -->```python
 # 默认只调用免费源
 researchdata.community(route="employee", operation="blind", company="{COMPANY}", pages=2)
 researchdata.community(route="employee", operation="summary", company="{COMPANY}", pages=40)
@@ -158,18 +174,27 @@ researchdata.community(route="employee", operation="summary", company="{COMPANY}
 # 公开补充：PayScale / Levels.fyi / WARN 裁员记录
 web_search(query='"{COMPANY}" (Glassdoor OR PayScale OR Levels.fyi OR WARN layoffs)', start_date="<两年前 YYYY-MM-DD>", end_date="<今天 YYYY-MM-DD>")
 ```
-- Blind 第 31 条起正文为锁死占位文本，**只采信评分与前 30 条**。
+- Blind 第 31 条起正文为锁死占位文本，**只采信评分与前 30 条**。<!-- DALTON_CAP_ELSE -->```python
+# 公开职场评价与裁员记录（Blind / Glassdoor / PayScale / Levels.fyi / WARN）
+web_search(query='"{COMPANY}" (Blind OR Glassdoor OR PayScale OR Levels.fyi OR WARN layoffs)', start_date="<两年前 YYYY-MM-DD>", end_date="<今天 YYYY-MM-DD>")
+```<!-- /DALTON_CAP -->
 - 核查：综合评分与趋势、管理层/薪酬/工作量高频投诉词、裁员与冻结调薪记录。
 
 ### 2. 投资者社区与做空机构报告
-```python
+<!-- DALTON_CAP:researchdata_bridge -->```python
 researchdata.community(route="x-timeline", operation="search", query='"{COMPANY}" (fraud OR short OR "red flag")', since="<两年前 YYYY-MM-DD>", until="<今天 YYYY-MM-DD>", count=25)
 web_search(query='"{COMPANY}" (fraud OR short OR "red flag") site:x.com', start_date="<两年前 YYYY-MM-DD>", end_date="<今天 YYYY-MM-DD>")
 researchdata.community(route="last30days", operation="search", query="{COMPANY} {TICKER}", days=30, quick=True)
 web_search(query='"{COMPANY}" ("short report" OR "short thesis") OR "${TICKER}" "short"', start_date="<两年前 YYYY-MM-DD>", end_date="<今天 YYYY-MM-DD>")
 ```
 - X 平台按原帖 status URL 去重并注明发帖日期。
-- `last30days` 仅用于近 30 天 StockTwits / HN / YouTube / 公开新闻情绪参考。
+- `last30days` 仅用于近 30 天 StockTwits / HN / YouTube / 公开新闻情绪参考。<!-- DALTON_CAP_ELSE -->```python
+x_search(query='"{COMPANY}" (fraud OR short OR "red flag")', from_date="<两年前 YYYY-MM-DD>", to_date="<今天 YYYY-MM-DD>")
+web_search(query='"{COMPANY}" (fraud OR short OR "red flag") site:x.com', start_date="<两年前 YYYY-MM-DD>", end_date="<今天 YYYY-MM-DD>")
+web_search(query='"{COMPANY}" ("short report" OR "short thesis") OR "${TICKER}" "short"', start_date="<两年前 YYYY-MM-DD>", end_date="<今天 YYYY-MM-DD>")
+```
+- X 平台按原帖 status URL 去重并注明发帖日期。
+- 可辅以 `web_search` 检索近 30 天 StockTwits / HN / YouTube / 公开社区的情绪参考。<!-- /DALTON_CAP -->
 - **Reddit 当前无通路，报告正文与来源节必须写明「Reddit 未覆盖」**。
 
 ### 3. 负面新闻与监管/诉讼
@@ -181,7 +206,7 @@ web_search(query='"{COMPANY}" ("SEC investigation" OR restatement OR whistleblow
 ### 4. 技术与产品口碑
 - 检索产品迭代速度、技术债务/legacy stack 评价、技术骨干流失、客户重大投诉或产品质量纠纷，每条附来源 URL。
 
-### 5. Guidepoint 专家访谈
+<!-- DALTON_CAP:guidepoint -->### 5. Guidepoint 专家访谈
 ```python
 researchdata.research(
     route="guidepoint",
@@ -193,7 +218,13 @@ researchdata.research(
 ```
 - 重点关注：客户流失/砍单、渠道压货、前员工对管理层与财务文化的真实评价、竞对视角的份额变化。
 - 每条引用附 `source_attribution.markdown`，verbatim 原文引用不超过 20 词。
-- 初次无结果时放宽到行业/主要竞对查 1 次；仍无结果则如实写「Guidepoint 无覆盖」。
+- 初次无结果时放宽到行业/主要竞对查 1 次；仍无结果则如实写「Guidepoint 无覆盖」。<!-- DALTON_CAP_ELSE -->### 5. 产业链与一线从业者公开访谈
+```python
+web_search(query='"{COMPANY}" (customer churn OR channel inventory OR former executive interview OR supply chain)', start_date="<两年前 YYYY-MM-DD>", end_date="<今天 YYYY-MM-DD>")
+```
+- 重点关注：客户流失/砍单、渠道压货、前员工对管理层与财务文化的公开评价、竞对视角的份额变化。
+- 每条引用附具体来源 URL，原话直接引用不超过 3 句。
+- 初次无结果时放宽到行业/主要竞对查 1 次；仍无结果则如实写「公开一线访谈无覆盖」。<!-- /DALTON_CAP -->
 
 ### 6. 做空数据（Short Interest & Short Volume，美股适用）
 ```python

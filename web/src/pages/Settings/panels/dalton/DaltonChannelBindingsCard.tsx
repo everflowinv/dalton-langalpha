@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Check, Copy, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { useLocale } from '@/hooks/useLocale';
 import { useNow } from '@/hooks/useNow';
 import { apiErrorStatus, formatApiErrorDetail } from '@/api/errors';
@@ -69,6 +70,10 @@ export function DaltonChannelBindingsCard() {
   const { t } = useTranslation();
   const locale = useLocale();
   const queryClient = useQueryClient();
+  const { hasCapability } = useCapabilities();
+  const canFeishu = hasCapability('channel_feishu');
+  const canDiscord = hasCapability('channel_discord');
+  const visiblePlatforms = PLATFORMS.filter((p) => (p === 'feishu' ? canFeishu : canDiscord));
 
   const [codes, setCodes] = useState<Partial<Record<BindPlatform, IssuedBindCodeState>>>({});
   const [pendingPlatforms, setPendingPlatforms] = useState<Partial<Record<BindPlatform, boolean>>>({});
@@ -84,6 +89,7 @@ export function DaltonChannelBindingsCard() {
   const bindingsQuery = useQuery({
     queryKey: queryKeys.dalton.channelBindings(),
     queryFn: fetchDaltonChannelBindings,
+    enabled: visiblePlatforms.length > 0,
     retry: false,
   });
 
@@ -215,17 +221,55 @@ export function DaltonChannelBindingsCard() {
   const loadStatus = apiErrorStatus(bindingsQuery.error);
   const loadForbidden = loadStatus === 401 || loadStatus === 403;
 
+  if (visiblePlatforms.length === 0) {
+    return null;
+  }
+
+  const singleChannelLabel =
+    canFeishu && !canDiscord
+      ? t('settings.dalton.channelPlatformFeishu')
+      : !canFeishu && canDiscord
+        ? t('settings.dalton.channelPlatformDiscord')
+        : null;
+  const cardTitle =
+    canFeishu && !canDiscord
+      ? t('settings.dalton.channelBindingsLabelFeishu')
+      : !canFeishu && canDiscord
+        ? t('settings.dalton.channelBindingsLabelDiscord')
+        : t('settings.dalton.channelBindingsLabel');
+  const cardDesc =
+    canFeishu && !canDiscord
+      ? t('settings.dalton.channelBindingsDescFeishu')
+      : !canFeishu && canDiscord
+        ? t('settings.dalton.channelBindingsDescDiscord')
+        : t('settings.dalton.channelBindingsDesc');
+  const refreshLabel = singleChannelLabel
+    ? t('settings.dalton.channelBindingsRefreshGeneric', { channel: singleChannelLabel })
+    : t('settings.dalton.channelBindingsRefresh');
+  const loadingLabel = singleChannelLabel
+    ? t('settings.dalton.channelBindingsLoadingGeneric', { channel: singleChannelLabel })
+    : t('settings.dalton.channelBindingsLoading');
+  const retryLabel = singleChannelLabel
+    ? t('settings.dalton.channelBindingsRetryGeneric', { channel: singleChannelLabel })
+    : t('settings.dalton.channelBindingsRetry');
+  const forbiddenLabel = singleChannelLabel
+    ? t('settings.dalton.channelBindingsForbiddenGeneric', { channel: singleChannelLabel })
+    : t('settings.dalton.channelBindingsForbidden');
+  const loadErrorLabel = singleChannelLabel
+    ? t('settings.dalton.channelBindingsLoadErrorGeneric', { channel: singleChannelLabel })
+    : t('settings.dalton.channelBindingsLoadError');
+
   return (
     <DaltonSettingsCard
       id="dalton-channel-bindings"
       testId="dalton-channel-bindings-card"
-      title={t('settings.dalton.channelBindingsLabel')}
-      description={t('settings.dalton.channelBindingsDesc')}
+      title={cardTitle}
+      description={cardDesc}
       layout="rows"
       action={
         <DaltonRefreshButton
           busy={bindingsQuery.isFetching}
-          label={t('settings.dalton.channelBindingsRefresh')}
+          label={refreshLabel}
           onClick={() => void bindingsQuery.refetch()}
           testId="dalton-channel-bindings-refresh"
         />
@@ -240,7 +284,7 @@ export function DaltonChannelBindingsCard() {
     >
       {bindingsQuery.isLoading ? (
         <div className="p-4">
-          <DaltonLoadingRow label={t('settings.dalton.channelBindingsLoading')} />
+          <DaltonLoadingRow label={loadingLabel} />
         </div>
       ) : bindingsQuery.isError && !bindings ? (
         <div className="p-4">
@@ -256,18 +300,16 @@ export function DaltonChannelBindingsCard() {
                   onClick={() => void bindingsQuery.refetch()}
                 >
                   <RefreshCw className="h-3.5 w-3.5" />
-                  <span>{t('settings.dalton.channelBindingsRetry')}</span>
+                  <span>{retryLabel}</span>
                 </Button>
               ) : undefined
             }
           >
-            {loadForbidden
-              ? t('settings.dalton.channelBindingsForbidden')
-              : t('settings.dalton.channelBindingsLoadError')}
+            {loadForbidden ? forbiddenLabel : loadErrorLabel}
           </DaltonInlineNotice>
         </div>
       ) : (
-        PLATFORMS.map((platform) => {
+        visiblePlatforms.map((platform) => {
           const label =
             platform === 'feishu'
               ? t('settings.dalton.channelPlatformFeishu')

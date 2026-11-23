@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button';
 import { Disclosure } from '@/components/ui/Disclosure';
 import { useLocale } from '@/hooks/useLocale';
 import { isDaltonAuth } from '@/config/daltonAuth';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { formatTimestamp } from '@/lib/format';
 import type { DaltonSystemJobItem, DaltonSystemJobScope } from '@/pages/Settings/utils/daltonApi';
@@ -58,7 +59,9 @@ export function DaltonSystemJobsCard({
   const { t } = useTranslation();
   const locale = useLocale();
   const { isPm, callerTier } = useTeamCredentials();
+  const { hasCapability } = useCapabilities();
   const isAdmin = callerTier === 'admin' || (!isDaltonAuth && isPm);
+  const showOpsJobs = isAdmin && hasCapability('data_jobs');
 
   const jobsQuery = useDaltonSystemJobs(true);
 
@@ -76,8 +79,8 @@ export function DaltonSystemJobsCard({
     [jobs],
   );
   const opsJobs = useMemo(
-    () => (isAdmin ? jobs.filter((job) => OPS_SCOPES.has(job.scope)) : []),
-    [isAdmin, jobs],
+    () => (showOpsJobs ? jobs.filter((job) => OPS_SCOPES.has(job.scope)) : []),
+    [showOpsJobs, jobs],
   );
 
   const toggleLog = (key: string) => {

@@ -15,6 +15,7 @@ from fastapi import HTTPException
 
 from src.config.env import PREVIEW_PROXY_FRAME_ANCESTORS
 from src.dalton.access_tiers import get_user_tier
+from src.dalton.capabilities import CapabilityId, has_capability
 from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID, is_company_system_user
 from src.dalton.monitors import db as monitor_db
 from src.dalton.monitors.data_job_registry import (
@@ -44,6 +45,8 @@ from src.dalton.monitors.models import (
 from src.dalton.monitors.permissions import (
     can_manage_monitor_fields,
     can_view_monitor,
+    is_monitor_capability_enabled,
+    require_monitor_capability,
     require_monitor_view,
     validate_publish_permissions,
 )
@@ -264,7 +267,7 @@ async def _build_monitor_detail_payload(
 async def get_public_monitor_detail(slug: str) -> dict[str, Any]:
     """Return trimmed read-only monitor detail for an anonymous viewer when ``visibility == 'public'``."""
     monitor = await monitor_db.get_monitor_by_slug(slug)
-    if monitor is None or monitor.visibility != "public":
+    if monitor is None or monitor.visibility != "public" or not is_monitor_capability_enabled(monitor):
         raise HTTPException(status_code=404, detail="监控面板不存在")
     serialized = serialize_monitor(monitor, can_manage=False)
     for internal_key in (
@@ -354,6 +357,7 @@ async def get_monitor_detail(slug: str, *, viewer_id: str) -> dict[str, Any]:
     monitor = await monitor_db.get_monitor_by_slug(slug)
     if monitor is None:
         raise HTTPException(status_code=404, detail="监控面板不存在")
+    require_monitor_capability(monitor)
     await require_monitor_view(monitor, viewer_id)
     return await _build_monitor_detail_payload(monitor, viewer_id=viewer_id)
 
@@ -362,7 +366,7 @@ async def get_monitor_by_artifact(
     artifact_id: str, *, viewer_id: str
 ) -> dict[str, Any] | None:
     monitor = await monitor_db.get_monitor_by_artifact_id(artifact_id)
-    if monitor is None:
+    if monitor is None or not is_monitor_capability_enabled(monitor):
         return None
     await require_monitor_view(monitor, viewer_id)
     tier = await get_user_tier(viewer_id)
@@ -373,6 +377,7 @@ async def mint_grant_for_monitor(slug: str, *, viewer_id: str) -> dict[str, Any]
     monitor = await monitor_db.get_monitor_by_slug(slug)
     if monitor is None:
         raise HTTPException(status_code=404, detail="监控面板不存在")
+    require_monitor_capability(monitor)
     await require_monitor_view(monitor, viewer_id)
     grant = await mint_monitor_grant(
         monitor.monitor_id, viewer_id, monitor.acl_revision
@@ -519,6 +524,7 @@ async def update_monitor_settings(
     monitor = await monitor_db.get_monitor_by_slug(slug)
     if monitor is None:
         raise HTTPException(status_code=404, detail="监控面板不存在")
+    require_monitor_capability(monitor)
 
     tier = await get_user_tier(caller_id)
     if not _can_manage_monitor(monitor, caller_id, tier):
@@ -593,6 +599,7 @@ async def republish_workspace_monitor(
     monitor = await monitor_db.get_monitor_by_slug(slug)
     if monitor is None:
         raise HTTPException(status_code=404, detail="监控面板不存在")
+    require_monitor_capability(monitor)
     tier = await get_user_tier(caller_id)
     if not _can_manage_monitor(monitor, caller_id, tier):
         raise HTTPException(status_code=403, detail="无权重新发布此监控面板")
@@ -655,6 +662,7 @@ async def delete_monitor_by_slug(slug: str, *, caller_id: str) -> dict[str, Any]
     monitor = await monitor_db.get_monitor_by_slug(slug)
     if monitor is None:
         raise HTTPException(status_code=404, detail="监控面板不存在")
+    require_monitor_capability(monitor)
     tier = await get_user_tier(caller_id)
     if not _can_manage_monitor(monitor, caller_id, tier):
         raise HTTPException(status_code=403, detail="无权删除此监控面板")
@@ -1010,6 +1018,8 @@ async def republish_data_job_monitor(
     data_root: Path | None = None,
 ) -> dict[str, Any]:
     """Republish registered data-job monitor(s) from their pre-registered host output dir."""
+    if not has_capability(CapabilityId.DATA_JOBS):
+        raise HTTPException(status_code=404, detail="数据任务监控未启用")
     _require_publishing_enabled()
     bindings = get_registered_monitor_bindings(job_key)
     if not bindings:
@@ -1096,6 +1106,8 @@ async def maybe_publish_data_job_monitor(
     data_root: Path | None = None,
 ) -> None:
     """Scheduler post-run hook: republish on success, record failure without touching ``published_seq``."""
+    if not has_capability(CapabilityId.DATA_JOBS):
+        return
     bindings = get_registered_monitor_bindings(job_key)
     if not bindings:
         return
@@ -1142,6 +1154,7 @@ async def _authorize_grant(grant_token: str) -> tuple[MonitorRecord, str]:
     monitor = await monitor_db.get_monitor_by_id(verified.monitor_id)
     if monitor is None:
         raise HTTPException(status_code=404, detail="监控面板不存在")
+    require_monitor_capability(monitor)
 
     # 应用内 grant（/monitors/g/{grant}/*）对停用所有者保守拒绝。匿名公开入口
     # （/monitors/public/{slug}*）只看 visibility == "public"，不随所有者停用下线；
@@ -1243,7 +1256,7 @@ async def serve_public_monitor_file(
 ) -> ServedArtifactFile:
     """Anonymously serve the current published version file when ``visibility == 'public'``."""
     monitor = await monitor_db.get_monitor_by_slug(slug)
-    if monitor is None or monitor.visibility != "public":
+    if monitor is None or monitor.visibility != "public" or not is_monitor_capability_enabled(monitor):
         raise HTTPException(status_code=404, detail="File not found")
     target_path = path or (monitor.entry_path or "")
     if (
@@ -1338,7 +1351,7 @@ async def read_public_monitor_data(
     if not is_valid_data_key(data_key):
         raise HTTPException(status_code=400, detail="Invalid data key")
     monitor = await monitor_db.get_monitor_by_slug(slug)
-    if monitor is None or monitor.visibility != "public":
+    if monitor is None or monitor.visibility != "public" or not is_monitor_capability_enabled(monitor):
         raise HTTPException(status_code=404, detail="Monitor not found")
     return await _read_monitor_data_response(
         monitor, data_key, if_none_match=if_none_match
@@ -1352,6 +1365,8 @@ async def write_monitor_data_internal(
     *,
     as_of: datetime | None = None,
 ) -> dict[str, Any]:
+    if not has_capability(CapabilityId.DATA_JOBS):
+        raise HTTPException(status_code=404, detail="数据任务监控未启用")
     if not is_valid_data_key(data_key):
         raise HTTPException(status_code=400, detail="Invalid data key")
     monitor = await monitor_db.get_monitor_by_slug(slug)

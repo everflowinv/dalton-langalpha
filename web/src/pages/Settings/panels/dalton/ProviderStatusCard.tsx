@@ -1,5 +1,6 @@
 import { useTranslation } from 'react-i18next';
 import { isDaltonAuth } from '@/config/daltonAuth';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { useProviderStatus } from '../../hooks/useProviderStatus';
 import { NativeModelsCard } from './NativeModelsCard';
@@ -16,7 +17,9 @@ import {
 export function ProviderStatusCard() {
   const { t } = useTranslation();
   const { isPm, callerTier } = useTeamCredentials();
+  const { hasCapability } = useCapabilities();
   const isAdmin = callerTier === 'admin' || (!isDaltonAuth && isPm);
+  const showNativeModels = hasCapability('native_oauth_sync');
   const statusQuery = useProviderStatus(true);
 
   const providers = statusQuery.data?.providers ?? [];
@@ -75,7 +78,7 @@ export function ProviderStatusCard() {
         )}
       </DaltonSettingsCard>
 
-      <NativeModelsCard />
+      {showNativeModels && <NativeModelsCard />}
     </div>
   );
 }

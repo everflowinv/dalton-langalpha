@@ -108,7 +108,7 @@
 
 ### 第四节：Earnings revision map（`## 四、Earnings revision map`）
 - 直接引用准备阶段产出的一致预期快照（`consensus.md`）与 `implied_model.py` 结果，不重算：
-  - **一致预期现状**：下一财年 EPS 与收入、7/30/90 天轨迹、近 30 天上调/下调家数、买方预期（whisper，来自 sales-notes / TMTB）。若当期 EPS low-high 区间异常宽或 90 天陡降，核对是否有分析师计入一次性项目（减值、和解、税项）。
+  - **一致预期现状**：下一财年 EPS 与收入、7/30/90 天轨迹、近 30 天上调/下调家数、买方预期（whisper<!-- DALTON_CAP:researchdata_bridge -->，来自 sales-notes / TMTB<!-- DALTON_CAP_ELSE -->，如有公开渠道可查<!-- /DALTON_CAP -->）。若当期 EPS low-high 区间异常宽或 90 天陡降，核对是否有分析师计入一次性项目（减值、和解、税项）。
   - **修正分层**：收入、费用/capex（或利润率）、一次性项目三层各自往哪边修，按对 EPS 影响大小排序。
   - **隐含费用对比**：`[假设] 卖方费用比一致预期隐含空间多 X，对应 EPS 少 Y（快照敏感度）`（此行不要含 `→` 符号）。
 - **驱动变量回指规则**：Revenue、Margin、EPS 三组驱动各 ≤3 条。**凡含 `→` 的行，必须写成 `变量名 → Debate N 短名 → 敏感度（[假设] 变量变动 X 对应收入/EPS 变动 Y）`**（必须带 `Debate N`，不能只写短名）。EPS 驱动只列 revenue/margin 之外的税率、利息、股本、一次性项目。
@@ -117,7 +117,7 @@
 ### 第五节：Catalyst & KPI（`## 五、Catalyst & KPI`）
 - 按 **3 个月 / 6 个月 / 12 个月** 分组：列出 `事件｜日期或窗口｜检验哪个 debate（Debate N 短名）｜bull/bear 兑现阈值（[假设]）`。
 - **KPI**：列 3–5 个核心高频/季报指标，写明当前值（带期间与来源）、bull 区间、bear 区间。
-- **近期财报风险**：若 3 个月内有财报，写清财报日期、过去 4 次财报次日涨跌（来自一致预期快照）、买方持仓/拥挤度（来自 sales-notes / TMTB）、公司通常在哪次财报给下一年指引 → 给出本次财报风险方向与置信度。
+- **近期财报风险**：若 3 个月内有财报，写清财报日期、过去 4 次财报次日涨跌（来自一致预期快照）、买方持仓/拥挤度（<!-- DALTON_CAP:researchdata_bridge -->来自 sales-notes / TMTB<!-- DALTON_CAP_ELSE -->如有公开机构评论或市场数据可查<!-- /DALTON_CAP -->）、公司通常在哪次财报给下一年指引 → 给出本次财报风险方向与置信度。
 - **三层保护与失效条件**：生存（资金链 / 融资需求）｜价值（机制与区间）｜路径（跌到价值区之间会发生什么），各写一句并写明失效条件；遵守 `dalton-conventions/references/risk-reward.md` §6 硬规则——不输出单一"底价"、回购授权不算托底（只认实际股本缩减）、EPS × 倍数后不得再加全部净现金、SBC（股票期权报酬）只算一次、历史低谷倍数须说明为何仍适用、融资需求写"未知"时不得宣称生存保护充分。
 - **非线性检查**：按 `.agents/skills/dalton-conventions/references/nonlinear.md` 的四类检查表逐类核查（倍数 regime〔定价规则〕切换 / driver〔驱动变量〕非线性 / 拥挤持仓 + 催化剂 / 反身性），有信号写判断与证伪点；无信号时一行写明"本轮没有可承保的非线性机会"。
 
@@ -137,14 +137,14 @@
 
 ### 第九节与文末 `## 引用`：股东回报附录与引用
 - 若有 PM 要求的额外专题章节，放在第八节之后、`<!-- INSERT:return_appendix -->` 之前；全文最后依次是「股东回报附录」（`## 九、股东回报附录` 或顺延章节）、`## 附注`（写信源覆盖，必须有）、`## 引用`，`## 引用` 之后不得再有其他章节（不再另设独立的来源章节）。
-- 在 `## 引用` 之前设 `## 附注`，写 **信源覆盖段**（内部研究库、卖方研报与点评、专家访谈纪要、SEC 文件等各来源是否找到材料、实际用了哪些，未取得的用一句人话写明原因；正文判断处已经说明过影响的缺口，这里只写来源状态，不再重复影响；不写命中数之类的计数，附注里的数字同样要过发布核验）；`## 引用` 节只放引用行，每条一行，按序号排列，同时供 `bb_check.py` 与 `numbers.py` 解析（`## 引用` 里的其他文字会被当成正文核验数字）：
+- 在 `## 引用` 之前设 `## 附注`，写 **信源覆盖段**（<!-- DALTON_CAP:researchdata_bridge -->内部研究库、<!-- /DALTON_CAP -->卖方研报与点评、<!-- DALTON_CAP:guidepoint -->专家访谈纪要、<!-- /DALTON_CAP -->SEC 文件等各来源是否找到材料、实际用了哪些，未取得的用一句人话写明原因；正文判断处已经说明过影响的缺口，这里只写来源状态，不再重复影响；不写命中数之类的计数，附注里的数字同样要过发布核验）；`## 引用` 节只放引用行，每条一行，按序号排列，同时供 `bb_check.py` 与 `numbers.py` 解析（`## 引用` 里的其他文字会被当成正文核验数字）：
   ```markdown
   ## 附注
 
-  **信源覆盖**：
-  - 内部研究库：{是否找到相关材料、实际用了哪些；没找到或没取到的用一句人话写原因}
-  - 卖方研报与点评：{同上}
-  - 专家访谈纪要：{同上}
+  **信源覆盖**：<!-- DALTON_CAP:researchdata_bridge -->
+  - 内部研究库：{是否找到相关材料、实际用了哪些；没找到或没取到的用一句人话写原因}<!-- /DALTON_CAP -->
+  - 卖方研报与点评：{同上}<!-- DALTON_CAP:guidepoint -->
+  - 专家访谈纪要：{同上}<!-- /DALTON_CAP -->
   - 一手披露（SEC 文件 / 电话会）：{覆盖了哪几期}
 
   ## 引用
@@ -160,10 +160,10 @@
 
 ## 3. 信源检索清单（主稿阶段必查）
 
-1. **内部库**：`researchdata.research` 查 `sales-notes`、`tmtb`、`funda-ai`、`company-wiki`（公司名、核心产品、capex/费用/指引）。Wiki 中的专家访谈与管理层交流已过合规，标明日期、专家身份（不写姓名）及可靠性后照常引用。
-2. **AlphaEngine**：卖方研报与纪要可用 `params={"document_categories": ["foreign_report", "sell_side_report", "sell_side_comment", "meeting_minutes"], "sort": "relevance"}` 调用 `researchdata.research(route="alphaengine", operation="search_library", query=..., start=..., end=..., params=...)`，本机构会议必须拆成独立调用 `researchdata.research(route="alphaengine", operation="search_library", query=..., start=..., end=..., params={"meeting_scope": "institution", "sort": "relevance"})`（`institution_meetings` / `personal_meetings` 与非会议分类同用会触发 `E_SCOPE_CONFLICT`）；若需细粒度 `type_ids`，必须显式调用 `researchdata.research(route="alphaengine", operation="list_filters", params={"filter_type": "document_types", "document_code": "summary"})`（无参 `list_filters()` 只返回友好 `categories`，不返回 `type_ids`）；重要结论调 `operation="get_document"` 读正文（保留完整字符串 `doc_id` 含 `_inst_` 后缀）。
-3. **Guidepoint**：英文检索（`route="guidepoint", operation="search_library"`），原文引用 ≤20 个英文词并附出处。
-4. **一手披露**：`dalton_sec.list_filings` 与 `researchdata.finance(route="sec")` 读最新定期报告与电话会（`route="transcript"`）。
+<!-- DALTON_CAP:researchdata_bridge -->1. **内部库**：`researchdata.research` 查 `sales-notes`、`tmtb`、`funda-ai`、`company-wiki`（公司名、核心产品、capex/费用/指引）。Wiki 中的专家访谈与管理层交流已过合规，标明日期、专家身份（不写姓名）及可靠性后照常引用。<!-- DALTON_CAP_ELSE -->1. **工作区与公开研究**：检索工作区既有研究文档，并用 `web_search` 检索公司名、核心产品、capex/费用/指引等公开研究与评论。<!-- /DALTON_CAP -->
+<!-- DALTON_CAP:alphaengine -->2. **AlphaEngine**：卖方研报与纪要可用 `params={"document_categories": ["foreign_report", "sell_side_report", "sell_side_comment", "meeting_minutes"], "sort": "relevance"}` 调用 `researchdata.research(route="alphaengine", operation="search_library", query=..., start=..., end=..., params=...)`，本机构会议必须拆成独立调用 `researchdata.research(route="alphaengine", operation="search_library", query=..., start=..., end=..., params={"meeting_scope": "institution", "sort": "relevance"})`（`institution_meetings` / `personal_meetings` 与非会议分类同用会触发 `E_SCOPE_CONFLICT`）；若需细粒度 `type_ids`，必须显式调用 `researchdata.research(route="alphaengine", operation="list_filters", params={"filter_type": "document_types", "document_code": "summary"})`（无参 `list_filters()` 只返回友好 `categories`，不返回 `type_ids`）；重要结论调 `operation="get_document"` 读正文（保留完整字符串 `doc_id` 含 `_inst_` 后缀）。<!-- DALTON_CAP_ELSE -->2. **公开卖方观点与机构会议**：使用 `web_search`、公开财报电话会纪要与投资者日材料检索主流卖方前瞻与预测调整。<!-- /DALTON_CAP -->
+<!-- DALTON_CAP:guidepoint -->3. **Guidepoint**：英文检索（`route="guidepoint", operation="search_library"`），原文引用 ≤20 个英文词并附出处。<!-- DALTON_CAP_ELSE -->3. **公开专家与行业访谈**：通过 `web_search` 检索公开行业访谈、会议实录与产业链反馈，标明日期、来源身份及出处。<!-- /DALTON_CAP -->
+4. **一手披露**：`dalton_sec.list_filings` <!-- DALTON_CAP:researchdata_bridge -->与 `researchdata.finance(route="sec")` 读最新定期报告与电话会（`route="transcript"`）<!-- DALTON_CAP_ELSE -->与 `dalton_sec.get_company_facts` 读最新定期报告，并结合公开财报电话会纪要核对指引与关键数据<!-- /DALTON_CAP -->。
 5. **AI 收入与费用专项**：涉及 AI 商业化或 AI 提效时，按 `references/ai-revenue-rules.md` 执行。
 
 ---

@@ -465,6 +465,28 @@ def build_user_skill_definitions(
     return out
 
 
+def _is_hidden(skill: SkillDefinition) -> bool:
+    """Resolve runtime hidden state for a skill (DALTON-HOOK(standalone-core))."""
+    if skill.name == "dalton-transcript-polish":
+        from .dalton_registry import is_dalton_skill_hidden
+
+        return is_dalton_skill_hidden(skill.name, skill.hidden)
+    return skill.hidden
+
+
+def _resolve_live_skill(skill: SkillDefinition) -> SkillDefinition:
+    """Return *skill* with its dynamic hidden state and assembled description applied (DALTON-HOOK(standalone-core))."""
+    hidden = _is_hidden(skill)
+    description = skill.description
+    if skill.origin != "user":
+        from src.dalton.content_assembly import assemble_markdown_text
+
+        description = assemble_markdown_text(description, path=skill.skill_md_path)
+    if hidden != skill.hidden or description != skill.description:
+        return _dataclasses.replace(skill, hidden=hidden, description=description)
+    return skill
+
+
 def resolve_disabled_skills(disabled: Iterable[str]) -> frozenset[str]:
     """Drop from *disabled* every skill another, undisabled skill declares
     in ``requires``.
@@ -478,10 +500,11 @@ def resolve_disabled_skills(disabled: Iterable[str]) -> frozenset[str]:
     blocked = frozenset(disabled)
     if not blocked:
         return blocked
+    # DALTON-HOOK(standalone-core): capability-disabled skills do not keep required skills alive.
     return blocked - {
         required
         for name, skill in SKILL_REGISTRY.items()
-        if name not in blocked
+        if name not in blocked and _is_enabled(skill)
         for required in skill.requires
     }
 
@@ -534,8 +557,9 @@ def get_skill_registry(
     Returns:
         Dict of skill name to SkillDefinition for enabled skills
     """
+    # DALTON-HOOK(standalone-core): resolve dynamic hidden state & capability gates at lookup time.
     return {
-        name: skill
+        name: _resolve_live_skill(skill)
         for name, skill in SKILL_REGISTRY.items()
         if _is_enabled(skill, feature_resolver)
     }
@@ -550,10 +574,11 @@ def skills_outside_sandbox() -> frozenset[str]:
     sync leaves these out and a summary does not send the agent back to them.
     A name the registry does not know (a user's skill) is never in it.
     """
+    # DALTON-HOOK(standalone-core): include capability-disabled and dynamically hidden skills.
     return frozenset(
         name
         for name, skill in SKILL_REGISTRY.items()
-        if skill.hidden or not _is_enabled(skill)
+        if _is_hidden(skill) or not _is_enabled(skill)
     ) | {
         # DALTON-HOOK(skills-registry): keep Firecrawl's catalog skill out of
         # sandbox sync while Firecrawl's catalog MCP server stays off in Dalton.
@@ -564,9 +589,10 @@ def skills_outside_sandbox() -> frozenset[str]:
 def get_skill(skill_name: str) -> SkillDefinition | None:
     """Get an enabled skill definition by name, or None."""
     skill = SKILL_REGISTRY.get(skill_name)
+    # DALTON-HOOK(standalone-core): refuse load-by-name for capability-disabled skills.
     if skill is None or not _is_enabled(skill):
         return None
-    return skill
+    return _resolve_live_skill(skill)
 
 
 def get_command_to_skill_map() -> dict[str, str]:
@@ -592,17 +618,22 @@ def list_skills() -> list[dict[str, Any]]:
     Returns:
         List of skill info dicts with name, description, and tool count
     """
-    return [
-        {
-            "name": skill.name,
-            "description": skill.description,
-            "tool_count": len(skill.listed_tool_names()),
-            "tools": skill.listed_tool_names(),
-            "command": skill.command,
-        }
-        for skill in SKILL_REGISTRY.values()
-        if _is_enabled(skill) and not skill.hidden
-    ]
+    # DALTON-HOOK(standalone-core): evaluate dynamic hidden, capability gate & description assembly per listing.
+    out: list[dict[str, Any]] = []
+    for skill in SKILL_REGISTRY.values():
+        if not _is_enabled(skill) or _is_hidden(skill):
+            continue
+        live = _resolve_live_skill(skill)
+        out.append(
+            {
+                "name": live.name,
+                "description": live.description,
+                "tool_count": len(live.listed_tool_names()),
+                "tools": live.listed_tool_names(),
+                "command": live.command,
+            }
+        )
+    return out
 
 
 # DALTON-HOOK(skills-registry)

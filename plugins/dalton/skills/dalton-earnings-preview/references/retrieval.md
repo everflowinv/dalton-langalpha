@@ -1,6 +1,6 @@
 # 财报前瞻检索与取证规程（`retrieval.md`）
 
-本文件定义 `dalton-earnings-preview`（PS.8）的证据记录字段、内部研究库四个必查入口、分阶段检索策略、图片核对硬规则、一轮公开 X 检索边界与停止降级规则。
+本文件定义 `dalton-earnings-preview`（PS.8）的证据记录字段、<!-- DALTON_CAP:alphaengine|researchdata_bridge -->内部研究库四个必查入口<!-- DALTON_CAP_ELSE -->多源公开检索入口<!-- /DALTON_CAP -->、分阶段检索策略、图片核对硬规则、一轮公开 X 检索边界与停止降级规则。
 
 ---
 
@@ -9,10 +9,10 @@
 ### 1. 证据笔记必留字段
 
 边查边把已采用的原文短摘和上下文写入 `research/<D>-preview-<季度>/evidence-notes.md`。每条证据记录必须保留以下 12 项字段：
-1. **来源路由（`route`）**：`alphaengine` / `sales-notes` / `tmtb` / `funda-ai` / `estimates` / `sec`（及公开社媒 `x_api.search_posts`）
-2. **原始 ID / URL**：如 `doc_id`、`mail:<ID>`、`tmtb:<ID>`、`funda:<ID>`、SEC accession 或原帖 URL
+1. **来源路由（`route`）**：<!-- DALTON_CAP:alphaengine|researchdata_bridge -->`alphaengine` / `sales-notes` / `tmtb` / `funda-ai` / `estimates` / `sec`<!-- DALTON_CAP_ELSE -->`dalton_sec` / `estimates` / `web_search`<!-- /DALTON_CAP -->（及公开社媒 `x_api.search_posts`）
+2. **原始 ID / URL**：如 <!-- DALTON_CAP:alphaengine|researchdata_bridge -->`doc_id`、`mail:<ID>`、`tmtb:<ID>`、`funda:<ID>`、<!-- /DALTON_CAP -->SEC accession 或原帖 URL
 3. **文件标题**
-4. **作者与真实身份**：区分买方原话、机构 sales 转述买方、机构 sales 个人观点、卖方分析师、独立研究作者（FUNDA AI / TMTB）、公司管理层
+4. **作者与真实身份**：区分买方原话、机构 sales 转述买方、机构 sales 个人观点、卖方分析师、独立研究作者<!-- DALTON_CAP:researchdata_bridge -->（FUNDA AI / TMTB）<!-- /DALTON_CAP -->、公司管理层
 5. **发布日期与时间戳**（必须 `<= as-of` 冻结时刻）
 6. **涉及财季与期间口径**（区分 FY / CY、单季 Q / 累计 YTD / MTD）
 7. **正文定位**：页码、章节标题、表格名、图片 ID 或电话会段落
@@ -26,7 +26,7 @@
 
 ### 2. 检索覆盖记录表
 
-在报告末尾“来源与覆盖”章节逐项列出 **`AlphaEngine`、`sales-notes`、`TMTB`、`FUNDA AI`、`行业前瞻`、`X`** 六个通道的覆盖状态：
+在报告末尾“来源与覆盖”章节逐项列出 <!-- DALTON_CAP:alphaengine|researchdata_bridge -->**`AlphaEngine`、`sales-notes`、`TMTB`、`FUNDA AI`、`行业前瞻`、`X`** 六个通道<!-- DALTON_CAP_ELSE -->**`SEC / 公司 IR`、`一致预期`、`公开卖方与行业前瞻`、`X`** 各通道<!-- /DALTON_CAP -->的覆盖状态：
 - 查询词与时间窗口（`start` 至 `end`）
 - 实际精读篇数
 - 命中的最新文档日期
@@ -36,7 +36,7 @@
 
 ---
 
-## 二、四个内部研究库入口与一致预期接口
+<!-- DALTON_CAP:alphaengine|researchdata_bridge -->## 二、四个内部研究库入口与一致预期接口
 
 在 PTC 沙箱中调用 `researchdata` 前，本线程先调一次 `researchdata.catalog()`。
 
@@ -113,7 +113,11 @@ researchdata.finance(route="estimates", ticker="<TICKER>")
 - **Sales Notes**：默认查原始邮件（排除 TMTB）；`layer="digest"` 仅作定位索引，引用前必须 `read` 回原始邮件 `mail:<ID>` 核实上下文与说话人身份。
 - **TMTB**：本地库代表已入库覆盖；若需补充最新几天的 TMTB，可在 AlphaEngine 中指定 `source_names: ["TMT Breakout"]` 补查，相同文档与本地缓存去重，不重复计票。非 TMT 行业公司若无覆盖如实标注即可，不强凑材料。
 - **FUNDA AI**：属于独立研究来源，观点署名 `FUNDA AI`，**不自动计为卖方一致预期、直接买方证言或公司一手披露**；若与 TMTB、sales 邮件或 AlphaEngine 引用同一份上游数据/研报，只算 **1 条来源链**。原邮件若仅含节选或通知，不得声称已读网页全文。
-- **融合检索辅助**：`route="all", params={"sources": ["sales-notes", "tmtb", "funda-ai"]}` 可用于补充交叉召回，但**不能替代对四个入口的分别检索与覆盖核对**。
+- **融合检索辅助**：`route="all", params={"sources": ["sales-notes", "tmtb", "funda-ai"]}` 可用于补充交叉召回，但**不能替代对四个入口的分别检索与覆盖核对**。<!-- DALTON_CAP_ELSE -->## 二、公开研究与一致预期检索入口
+
+1. **监管披露与公司 IR（`dalton_sec` / `web_search`）**：美股使用 `dalton_sec.list_filings` 与 `dalton_sec.get_company_facts` 读取上季财报与最新指引原文；港股与 A 股使用 `web_search` 查披露易（`site:hkexnews.hk`）、巨潮资讯及公司 IR 官网。
+2. **卖方一致预期与历史财报反应（`estimates`）**：使用公开行情与一致预期工具（如 `yf_fundamentals`、`get_earnings_history`）获取一致预期快照并落盘到 `data/consensus/`。
+3. **卖方前瞻、行业前瞻与高频跟踪（`web_search` / `web_fetch`）**：按“公司名（含常用中英文别名）”与“Ticker”分别检索主流卖方前瞻摘要、行业前瞻、公开电话会纪要及高频行业跟踪数据，优先回溯原始正文核实。<!-- /DALTON_CAP -->
 
 ---
 
@@ -134,14 +138,18 @@ researchdata.finance(route="estimates", ticker="<TICKER>")
 
 ## 四、图片与全文核对硬规则
 
-1. **默认开启图片检索**：`sales-notes`、`tmtb`、`funda-ai` 检索统一带 `params={"media": "all"}`。若正文未命中但关键表格可能在图片里，补查 `params={"media": "images"}`。
+<!-- DALTON_CAP:alphaengine|researchdata_bridge -->1. **默认开启图片检索**：`sales-notes`、`tmtb`、`funda-ai` 检索统一带 `params={"media": "all"}`。若正文未命中但关键表格可能在图片里，补查 `params={"media": "images"}`。
 2. **回读父文档与原图核验**：
    - 调用 `researchdata.research(route=..., operation="read", document="image:<id>")` 获取原图及 `parent_document_id`，必须回读父文档确认发布日期、作者身份与上下文；
    - **所有来自图片表格的数字，必须查看原图逐项核对：正负号、小数点、单位（百万/十亿/bps/%）、期间标签（FY/CY、Q/YTD）**；
    - **严禁直接采信 `description_verified=false` 的自动识图文字描述作为数字证据**；若原图模糊或附件缺失，必须标注缺口，不得盲信文本摘要中的二手数字。
 3. **正文完整分页读取与 `content_field` 字段选择**：
    - 正文 `read` / `get_document` 遇到截断或 `next_offset` 时，必须继续分页读取直至 `complete=true` 或 `next_offset` 为空（`get_document` 返回 `metadata.doc_id`、`complete`、`next_offset`，无顶层 `doc_id` 与 `has_more`）；仅看到标题或搜索摘要出现公司名，绝不等于已读过该机构的观点。
-   - AlphaEngine `get_document` 支持 `params={"doc_id": ..., "content_field": "auto"|"original_text"|"content"|"digest"|"digest_cn"|"main_point"|"question_answer", "offset": 0, "max_chars": 30000}` 按字段独立分页读取（`doc_id` 保留完整字符串含 `_inst_` 后缀；映射：摘要 → `digest`/`digest_cn`，要点 → `main_point`，问答 → `question_answer`，原文/转录 → `original_text`）：当所选字段为空并返回 `warning` 与 `available_content_fields`（字段→字符数映射）时，改传有字符数的合法 `content_field`（如 `original_text`、`digest` 或 `question_answer`）；同一分页序列必须固定同一 `content_field` 按 `next_offset` 续读直到 `complete=true` 或 `next_offset` 为空，并核对 `content_sha256` 一致。
+   - AlphaEngine `get_document` 支持 `params={"doc_id": ..., "content_field": "auto"|"original_text"|"content"|"digest"|"digest_cn"|"main_point"|"question_answer", "offset": 0, "max_chars": 30000}` 按字段独立分页读取（`doc_id` 保留完整字符串含 `_inst_` 后缀；映射：摘要 → `digest`/`digest_cn`，要点 → `main_point`，问答 → `question_answer`，原文/转录 → `original_text`）：当所选字段为空并返回 `warning` 与 `available_content_fields`（字段→字符数映射）时，改传有字符数的合法 `content_field`（如 `original_text`、`digest` 或 `question_answer`）；同一分页序列必须固定同一 `content_field` 按 `next_offset` 续读直到 `complete=true` 或 `next_offset` 为空，并核对 `content_sha256` 一致。<!-- DALTON_CAP_ELSE -->1. **图表与附表原图核验**：
+   - **所有来自图片、PDF 演示稿或图表中的数字，必须查看原图逐项核对：正负号、小数点、单位（百万/十亿/bps/%）、期间标签（FY/CY、Q/YTD）**；
+   - **严禁直接采信未经核对的自动识图文字描述作为数字证据**；若原图模糊或附件缺失，必须标注缺口，不得盲信二手摘要数字。
+2. **正文完整读取**：
+   - 使用 `web_fetch` 或文件读取工具读完目标报告与公告原文，仅看到标题或搜索摘要出现公司名，绝不等于已读过该机构的观点。<!-- /DALTON_CAP -->
 
 ---
 
@@ -154,12 +162,12 @@ researchdata.finance(route="estimates", ticker="<TICKER>")
    - 公开 X 查询词只允许包含公开公司名、ticker、行业术语与公开业务问题；**严禁将内部 sales 邮件原文、私有 buyside bogey 数字或未公开研报段落放入公共搜索框**。
 3. **“一轮”的边界与去重规则**：
    - “一轮”指围绕公司财报预期与核心多空因果链做一次集中检索（必要时对遗漏机制加 1–2 条定向查询），不扩展 Reddit、雪球或员工匿名社区。
-   - 按原帖 URL / status ID 去重，并核查其是否只是转述同一份卖方研报、TMTB 或新闻：若多位 X 作者引用同一份卖方调查，只能表述为“该调查在公开讨论中被广泛传播”，**只能算 1 条原始证据链**。
+   - 按原帖 URL / status ID 去重，并核查其是否只是转述同一份卖方研报<!-- DALTON_CAP:researchdata_bridge -->、TMTB <!-- /DALTON_CAP -->或新闻：若多位 X 作者引用同一份卖方调查，只能表述为“该调查在公开讨论中被广泛传播”，**只能算 1 条原始证据链**。
    - 不凭账号头像或语气把普通发帖人认定为“机构买方”（核实不了背景的一律写“X 作者”）；纯喊单、纯技术图形点位、无业务因果机制的目标价一律剔除。
 
 ---
 
 ## 六、停止与降级规则
 
-- 完成内部四入口分别检索、行业前瞻排查与一轮公开 X 后，即以已核实的证据成稿。
+- 完成<!-- DALTON_CAP:alphaengine|researchdata_bridge -->内部四入口分别检索<!-- DALTON_CAP_ELSE -->核心公开渠道分别检索<!-- /DALTON_CAP -->、行业前瞻排查与一轮公开 X 后，即以已核实的证据成稿。
 - 若存在明确缺口，仅围绕该缺口用可用备用路径补查一次；遇到工具报错、凭证失效或配额告警时，如实记录到“来源与覆盖”章节（区分“无相关结果”与“渠道失败”；表格只登记状态，影响判断的缺口在正文相关判断处说明一次，表格不再重复写影响），不绕过权限、不编造替代数字。

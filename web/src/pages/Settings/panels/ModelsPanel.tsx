@@ -10,6 +10,7 @@ import { Select } from '@/components/ui/select';
 import { SkeletonBar } from '@/components/ui/skeleton';
 import { usePreferences } from '@/hooks/usePreferences';
 import { isDaltonAuth } from '@/config/daltonAuth';
+import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(standalone-core)
 import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { PREFERENCE_MUTATION_KEY, useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { ModelTierConfig } from '@/components/model/ModelTierConfig';
@@ -125,6 +126,7 @@ export function ModelsPanel() {
   const { t } = useTranslation();
   const copy = useSettingCopy();
   const modelSlotCopy = useModelSlotCopy();
+  const { hasCapability } = useCapabilities(); // DALTON-HOOK(standalone-core)
 
   /** Write the keys a control owns, each routed to its own column. */
   const write = useCallback(
@@ -913,22 +915,25 @@ export function ModelsPanel() {
                   />
                 </div>
                 {/* DALTON-HOOK(settings-reorg): extract model selector */}
-                <div id={SETTINGS.daltonExtractModel.anchor}>
-                  <ModelSelector
-                    label={t('settings.modelTuning.daltonExtractModel')}
-                    description={`${t('settings.modelTuning.daltonExtractModelDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_extract_model)}`}
-                    value={daltonExtractModel}
-                    onChange={(v) => write({ dalton_extract_model: v || null })}
-                    models={daltonSystemModels}
-                    placeholder={daltonDefaultHint(hookSystemDefaults?.dalton_extract_model)}
-                    payers={payers}
-                    metadata={modelMetadata}
-                    missingLabel={label}
-                    seriesCatalog={seriesCatalog}
-                    rawMetadata={rawMetadata}
-                    customModels={customModels}
-                  />
-                </div>
+                {/* DALTON-HOOK(standalone-core): hide archive extraction model when conversation_archive is off */}
+                {hasCapability('conversation_archive') && (
+                  <div id={SETTINGS.daltonExtractModel.anchor}>
+                    <ModelSelector
+                      label={t('settings.modelTuning.daltonExtractModel')}
+                      description={`${t('settings.modelTuning.daltonExtractModelDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_extract_model)}`}
+                      value={daltonExtractModel}
+                      onChange={(v) => write({ dalton_extract_model: v || null })}
+                      models={daltonSystemModels}
+                      placeholder={daltonDefaultHint(hookSystemDefaults?.dalton_extract_model)}
+                      payers={payers}
+                      metadata={modelMetadata}
+                      missingLabel={label}
+                      seriesCatalog={seriesCatalog}
+                      rawMetadata={rawMetadata}
+                      customModels={customModels}
+                    />
+                  </div>
+                )}
               </SettingsCardBody>
             </Disclosure>
           </SettingsGroup>

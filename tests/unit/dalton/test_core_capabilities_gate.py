@@ -2222,3 +2222,156 @@ def _drop_profile_config_caches_after_test():
 
     _clear_config_cache()
     _get_dalton_config.cache_clear()
+# 6. Anti-leakage gate #4 (Batch 3 Part 1): skills, sources.yaml, prompts & README
+# ---------------------------------------------------------------------------
+
+
+_B3_PROPRIETARY_BLACKLIST: tuple[str, ...] = (
+    "researchdata",
+    "alphaengine",
+    "guidepoint",
+    "sales-notes",
+    "tmtb",
+    "funda-ai",
+    "feishu",
+    "weixin",
+    "seed-asr",
+    "dalton-13f-tracker",
+    "everflow",
+)
+
+
+class TestBatch3BackendTextAndSkillGates:
+    def test_all_dalton_skills_and_sources_yaml_explicitly_classified(self) -> None:
+        from ptc_agent.agent.middleware.skills import dalton_registry as dr_mod
+        from src.dalton.data_map import builder as dm_builder
+
+        disk_skills = {
+            p.name
+            for p in dr_mod.DALTON_SKILLS_DIR.iterdir()
+            if p.is_dir() and not p.name.startswith(".")
+        }
+        assert set(dr_mod.DALTON_SKILL_CAPABILITY_MAP.keys()) == disk_skills
+
+        spec = dm_builder.load_sources_spec()
+        for sec in ("catalog_routes", "direct_tools"):
+            for k, entry in (spec.get(sec) or {}).items():
+                assert "capability" in entry, f"sources.yaml {sec}.{k} missing capability"
+        for item in spec.get("unavailable_sources") or []:
+            assert "capability" in item, f"sources.yaml unavailable_sources.{item.get('id')} missing capability"
+
+    def test_core_profile_blocks_disabled_skills_and_emits_zero_proprietary_prompt_text(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from ptc_agent.agent.backends.automations import render_automations_readme
+        from ptc_agent.agent.middleware.skills import dalton_registry as dr_mod
+        from ptc_agent.agent.middleware.skills import registry as skill_reg_mod
+        from ptc_agent.agent.prompts.loader import PromptLoader, reset_loader
+        from src.dalton.data_map import builder as dm_builder
+
+        _clean_cap_env(monkeypatch, app_env="core")
+        dm_builder.set_turn_data_map(None)
+        reset_loader()
+
+        # Disabled skills refused on get_skill() and excluded from sandbox sync
+        disabled = dr_mod.disabled_dalton_skills()
+        assert len(disabled) == 22
+        outside = skill_reg_mod.skills_outside_sandbox()
+        for name in disabled:
+            assert skill_reg_mod.get_skill(name) is None
+            assert name in outside
+
+        # Core prompts, <data_map>, and AutomationsBackend README contain 0 blacklisted terms
+        loader = PromptLoader()
+        surfaces = {
+            "system_analyst": loader.get_system_prompt(role="analyst", channels_enabled=True),
+            "system_cos": loader.get_system_prompt(role="chief_of_staff", channels_enabled=True),
+            "static_data_map": dm_builder.render_static_data_map_markdown(team_memory_enabled=True),
+            "automations_readme": render_automations_readme(),
+        }
+        for label, text in surfaces.items():
+            lowered = text.lower()
+            hits = [term for term in _B3_PROPRIETARY_BLACKLIST if term in lowered]
+            assert not hits, f"Core {label} leaked proprietary terms: {hits}"
+
+    def test_core_assembled_skills_and_workflows_have_zero_proprietary_terms_and_compile(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from ptc_agent.agent.middleware.background_subagent.workflow.engine import compile_check
+        from ptc_agent.agent.middleware.skills import dalton_registry as dr_mod
+        from src.dalton.content_assembly import read_assembled_text
+
+        _clean_cap_env(monkeypatch, app_env="core")
+        core_caps = frozenset()
+
+        # All 29 Core-visible Dalton skills assemble cleanly with 0 proprietary hits
+        core_skills = sorted(
+            name for name in dr_mod.DALTON_SKILL_DEFINITIONS
+            if dr_mod.is_dalton_skill_enabled(name)
+        )
+        assert len(core_skills) == 29
+        assert "dalton-13f-tracker" not in core_skills
+        assert "dalton-bullbear-tracker" not in core_skills
+
+        for sk in core_skills:
+            sk_dir = dr_mod.DALTON_SKILLS_DIR / sk
+            for fp in sorted(sk_dir.rglob("*")):
+                if not fp.is_file() or fp.suffix.lower() not in (".md", ".txt", ".json", ".yaml", ".yml"):
+                    continue
+                assembled = read_assembled_text(fp, capabilities=core_caps)
+                assert "DALTON_CAP" not in assembled, f"Unresolved marker in {fp}"
+                lowered = assembled.lower()
+                hits = [term for term in _B3_PROPRIETARY_BLACKLIST if term in lowered]
+                assert not hits, f"Core skill {fp.relative_to(REPO_ROOT)} leaked {hits}"
+
+        # All 6 workflows assemble cleanly, pass compile_check, and contain 0 proprietary hits
+        wf_root = REPO_ROOT / "workflows"
+        for wf_dir in sorted(p for p in wf_root.iterdir() if p.is_dir()):
+            for fp in sorted(wf_dir.rglob("*")):
+                if not fp.is_file() or fp.suffix.lower() not in (".js", ".json", ".md"):
+                    continue
+                assembled = read_assembled_text(fp, capabilities=core_caps)
+                assert "DALTON_CAP" not in assembled, f"Unresolved marker in {fp}"
+                lowered = assembled.lower()
+                hits = [term for term in _B3_PROPRIETARY_BLACKLIST if term in lowered]
+                assert not hits, f"Core workflow {fp.relative_to(REPO_ROOT)} leaked {hits}"
+                if fp.suffix.lower() == ".js":
+                    compile_check(assembled)
+                elif fp.suffix.lower() == ".json":
+                    json.loads(assembled)
+
+    def test_zero_everflowinv_domain_in_code_scripts_and_core_surfaces(self) -> None:
+        from ptc_agent.agent.middleware.skills import dalton_registry as dr_mod
+        from src.dalton.content_assembly import read_assembled_text
+
+        domain_re = re.compile(r"everflowinv\.com", re.IGNORECASE)
+        for root in (
+            REPO_ROOT / "src",
+            REPO_ROOT / "web" / "src",
+            REPO_ROOT / "docs-site" / "src",
+        ):
+            for fp in sorted(root.rglob("*")):
+                if not fp.is_file() or fp.suffix.lower() not in (
+                    ".py", ".ts", ".tsx", ".js", ".mjs", ".md", ".mdx", ".json", ".yaml", ".yml", ".j2", ".astro",
+                ):
+                    continue
+                text = fp.read_text(encoding="utf-8", errors="ignore")
+                assert not domain_re.search(text), (
+                    f"Forbidden internal domain 'everflowinv.com' found in {fp.relative_to(REPO_ROOT)}"
+                )
+
+        # Skill scripts must never hardcode everflowinv.com
+        for fp in sorted(dr_mod.DALTON_SKILLS_DIR.rglob("*.py")):
+            text = fp.read_text(encoding="utf-8", errors="ignore")
+            assert not domain_re.search(text), (
+                f"Forbidden internal domain 'everflowinv.com' in script {fp.relative_to(REPO_ROOT)}"
+            )
+
+        # Core-assembled skill markdown must never contain everflowinv.com
+        for fp in sorted(dr_mod.DALTON_SKILLS_DIR.rglob("*.md")):
+            assembled = read_assembled_text(fp, capabilities=frozenset())
+            assert not domain_re.search(assembled), (
+                f"Forbidden internal domain 'everflowinv.com' in Core skill {fp.relative_to(REPO_ROOT)}"
+            )

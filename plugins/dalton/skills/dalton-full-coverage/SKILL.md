@@ -23,7 +23,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 - `ticker`：规范股票代码（如 `META`、`MSFT`）
 - `company`：公司名称
-- `market`：市场（支持 `US`、`HK`、`CN`；港股与 A 股的一手公告与财务初值通过 `researchdata.finance(route="cn-hk", operation="filings"|"ask", ...)` 获取，平台财务表仅作二手初值线索，核心财务数字必须回法定公告原文核实，港股披露易未覆盖时用 `web_search` 查 `site:hkexnews.hk` 原文链接；回报与估值核对复权、分红、拆股与币种）
+- `market`：市场（支持 `US`、`HK`、`CN`；<!-- DALTON_CAP:researchdata_bridge -->港股与 A 股的一手公告与财务初值通过 `researchdata.finance(route="cn-hk", operation="filings"|"ask", ...)` 获取，平台财务表仅作二手初值线索，核心财务数字必须回法定公告原文核实，港股披露易未覆盖时用 `web_search` 查 `site:hkexnews.hk` 原文链接<!-- DALTON_CAP_ELSE -->港股与 A 股的一手公告与核心财务数字通过 `web_search` 查港交所披露易（`site:hkexnews.hk`）、巨潮资讯及交易所官网法定公告原文核实<!-- /DALTON_CAP -->；回报与估值核对复权、分红、拆股与币种）
 - `workspace_dir`：当前公司工作区路径
 - `as_of`：基准日期（`YYYY-MM-DD`；可不传或传 `"latest"`，`RunWorkflow` 会自动取最近一个美股交易日，`resume` 续跑时自动沿用上一 run 的值）
 - `profile`：`"tob"`（面向企业）或 `"toc"`（面向消费者），决定 D 支线做从业者信号表还是多平台产品体验表
@@ -68,7 +68,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - **阶段 0.8（问题清单 frame）**：按 `references/frame.md` 撰写 `research/<D>-fc/questions.md`（含每问 `A / B / C / D` 初始自评档位），并跑 `python .agents/skills/dalton-full-coverage/scripts/research_structure.py validate-agenda research/<D>-fc/questions.md` 直至通过。
    - **阶段 1（四条取证支线并行）**：
      - `ea.md`：按 `references/branch-a-industry.md`（行业定义与双法 TAM、5–8 家竞对现取财务与份额、周期高频指标、全球对标、政策、行业专用框架）；
-     - `eb.md`：按 `references/branch-b-sellside-expert.md`（AlphaEngine 分类检索与全文精读、卖方预期地图、内部库与 company-wiki、Guidepoint 英文专家纪要、卖方盲点）；
+     - `eb.md`：按 `references/branch-b-sellside-expert.md`（<!-- DALTON_CAP:alphaengine|researchdata_bridge|guidepoint -->AlphaEngine 分类检索与全文精读、卖方预期地图、内部库与 company-wiki、Guidepoint 英文专家纪要、卖方盲点<!-- DALTON_CAP_ELSE -->公开卖方研报摘要与预期地图、公开行业专家与访谈纪要、卖方盲点<!-- /DALTON_CAP -->）；
      - `ec.md`：按 `references/branch-c-primary.md`（4 期报告 MD&A/Risk Factors diff、4 期电话会措辞漂移、招股书承诺对照、**C4 过去 12 个季度指引 vs 实际可信度表**、8-K 与内部人交易）；
      - `ed.md`：按 `references/branch-d-offstreet.md`（X、雪球、员工评价、社区情绪、招聘信号、13F、ToC 产品体验表或 ToB 从业者信号表）。
    - **阶段 2（建模，串行在最前）**：按 `references/model-spec.md` 构建 `model/<TICKER>-model-v01.xlsx`（`recalc.py` 与 `audit.py --strict` 通过，Checks 全 OK）。建模失败立即中止，不进入写作——估值与三情景数字全部来自模型。
@@ -146,7 +146,7 @@ Workflow 返回后，主智能体按以下 6 步完成收尾（完成契约在�
 - `references/frame.md`：阶段 0.8 公司专属 12 问问题清单（`questions.md`，内部工作底稿）规则。
 - `references/branch-common.md`：A/B/C/D 四条取证支线通用规则。
 - `references/branch-a-industry.md`：支线 A（行业与竞争）取证规则。
-- `references/branch-b-sellside-expert.md`：支线 B（卖方、内部库与专家访谈）取证规则。
+- `references/branch-b-sellside-expert.md`：支线 B（卖方<!-- DALTON_CAP:researchdata_bridge -->、内部库<!-- /DALTON_CAP -->与专家访谈）取证规则。
 - `references/branch-c-primary.md`：支线 C（一手文件精读与 C4 12 季指引可信度表）取证规则。
 - `references/branch-d-offstreet.md`：支线 D（场外信号、产品体验与从业者反馈）取证规则。
 - `references/memo-writing.md`：备忘录写作目标、章节结构与各节要求、引用与数字纪律、写作与校验流程。

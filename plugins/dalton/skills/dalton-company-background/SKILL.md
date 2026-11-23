@@ -21,11 +21,13 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ## 2. 数据源优先级与核验纪律
 
 1. **上市公司（美股 / 港股 / A 股 / 日欧股）**：
-   - **美股**：优先调用 `dalton_sec`（`list_filings`、`get_company_facts`）与 `researchdata.finance(route="sec")` 读取最新 10-K / 20-F 与最近 4 个季度 10-Q / 6-K / 8-K。
-   - **港股与 A 股（`route="cn-hk"`）**：
+   - **美股**：优先调用 `dalton_sec`（`list_filings`、`get_company_facts`）<!-- DALTON_CAP:researchdata_bridge -->与 `researchdata.finance(route="sec")` <!-- DALTON_CAP_ELSE -->及 SEC EDGAR 原文<!-- /DALTON_CAP -->读取最新 10-K / 20-F 与最近 4 个季度 10-Q / 6-K / 8-K。
+<!-- DALTON_CAP:researchdata_bridge -->   - **港股与 A 股（`route="cn-hk"`）**：
      1. 先按单一意图分别调用 `researchdata.finance(route="cn-hk", operation="ask", query=..., limit=50)`（港股传 5 位零填充纯数字如 `"00700"` 或中文简称，A 股传 6 位纯数字如 `"600519"` 或中文简称）提取利润表（`query=f"{code_or_name} 港股利润表"` / `f"{code_or_name} 利润表"`）、资产负债表（`query=f"{code_or_name} 港股资产负债表"` / `f"{code_or_name} 资产负债表"`）、现金流量表（`query=f"{code_or_name} 港股现金流"` / `f"{code_or_name} 现金流"`）、主营业务构成（`query=f"{code_or_name} 主营构成"`）、十大股东（`query=f"{code_or_name} 十大股东"`）、分红（`query=f"{code_or_name} 分红"`）、回购（`query=f"{code_or_name} 回购"`）与 AH 溢价（`query="AH溢价"`）初值。
-     2. **平台财务表属二手数据、仅作初值线索**：第 2–5 节的核心财务数字必须调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=TODAY, limit=20)`（`end` 不得晚于当天 `TODAY`）查阅巨潮资讯（cninfo）近 3 年年报与近 4 期定期报告/业绩公告 PDF（`pdf_link`）原文核实；查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`。
-   - **行情、估值与复权/币种核对**：行情、市值、EV、估值倍数、一致预期优先调用 `researchdata`（`finance` 的 `route="estimates"` / `route="cn-hk"`）或 `market_data`；港股与 A 股必须核对前/后复权口径、分红派息、拆股合股以及交易币种（如 `HKD`）与报表币种（如 `CNY`）的汇率折算。
+     2. **平台财务表属二手数据、仅作初值线索**：第 2–5 节的核心财务数字必须调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=TODAY, limit=20)`（`end` 不得晚于当天 `TODAY`）查阅巨潮资讯（cninfo）近 3 年年报与近 4 期定期报告/业绩公告 PDF（`pdf_link`）原文核实；查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`。<!-- DALTON_CAP_ELSE -->   - **港股与 A 股**：
+     1. 通过 `web_search` 与公开披露平台（港交所披露易 `site:hkexnews.hk`、巨潮资讯 cninfo 及公司 IR 官网）查阅近 3 年年报与近 4 期定期报告/业绩公告原文，提取利润表、资产负债表、现金流量表、主营业务构成、主要股东及分红回购数据。
+     2. 公开行情与财务汇总表仅作初值参考，第 2–5 节的核心财务数字必须回法定定期报告与业绩公告原文核实。<!-- /DALTON_CAP -->
+   - **行情、估值与复权/币种核对**：行情、市值、EV、估值倍数、一致预期优先调用 <!-- DALTON_CAP:researchdata_bridge -->`researchdata`（`finance` 的 `route="estimates"` / `route="cn-hk"`）或 `market_data`<!-- DALTON_CAP_ELSE -->`market_data` 与公开行情/一致预期数据源<!-- /DALTON_CAP -->；港股与 A 股必须核对前/后复权口径、分红派息、拆股合股以及交易币种（如 `HKD`）与报表币种（如 `CNY`）的汇率折算。
 2. **未上市 / 拟上市公司**：
    - 优先读取招股书（S-1 / F-1 / 港交所聆讯后资料集）、官方新闻稿与权威第三方数据源。
 3. **单位与币种锁死**：

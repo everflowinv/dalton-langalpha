@@ -40,6 +40,8 @@ vi.mock('@/config/brand', () => ({
   get isDaltonBuild() {
     return h.isDaltonBuild;
   },
+  DALTON_PROFILE: 'everflow' as const,
+  isCoreProfileBuild: false,
   BRAND_NAME: 'Everflow',
   BRAND_MARK: 'everflow',
   APP_TAGLINE: '',

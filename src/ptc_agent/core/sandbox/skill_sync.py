@@ -651,26 +651,29 @@ def shared_tier(entry):
     return entry.get("owner") == "platform" or entry.get("sourceType") == MANAGED_SOURCE_TYPE
 
 
-def unpin_shared_copies(served, own):
-    """Drop this tier's copies of skills the shared tier serves, entries and
-    dirs alike.
+def unpin_shared_copies(served, own, disabled_managed=()):
+    """Drop this tier's copies of skills the shared tier serves (or that are
+    capability-disabled managed skills), entries and dirs alike.
 
     They arrive with a backup taken while the workspace lived at the computer
     root, where the shared tier was its own. Left as real dirs they would
     outrank the shared skill below and never update again. A name the shared
-    tier does not serve yet keeps its copy: a skill just promoted to the user
-    tier is ledgered as delivered before the asset sync delivers it. A name
-    in ``own`` is a workspace skill whatever its entry says, and the skill
-    sync, not this pass, decides its bytes.
+    tier does not serve yet keeps its copy unless it is in ``disabled_managed``:
+    a skill just promoted to the user tier is ledgered as delivered before the
+    asset sync delivers it. A name in ``own`` is a workspace skill whatever its
+    entry says, and the skill sync, not this pass, decides its bytes.
     """
     lock_data = read_lock()
     entries = lock_data["skills"]
     unpinned = []
     for name in sorted(entries):
         entry = entries[name]
-        # Served names are real directory names, so they are safe to join.
+        # Served/disabled_managed names are matched against lock entries;
+        # only platform/managed copies (shared_tier) are ever unpinned.
+        # DALTON-HOOK(standalone-core): drop capability-disabled managed copies
+        # restored into a workspace tier so they cannot shadow core filtering.
         if (
-            name not in served
+            (name not in served and name not in disabled_managed)
             or name in own
             or not isinstance(entry, dict)
             or not shared_tier(entry)
@@ -708,6 +711,7 @@ def run_link():
     user_base = ARGS["userBase"]
     prefix = ARGS["targetPrefix"]
     disabled = set(ARGS.get("disabled") or [])
+    disabled_managed = set(ARGS.get("disabledManaged") or [])  # DALTON-HOOK(standalone-core)
     own = set(ARGS.get("own") or [])
     fh = acquire_flock()
     # The shared tier's own copies are the ones being linked to.
@@ -721,7 +725,7 @@ def run_link():
         finally:
             fcntl.flock(shared_fh, fcntl.LOCK_UN)
             shared_fh.close()
-    unpinned = [] if same_tier else unpin_shared_copies(served, own)
+    unpinned = [] if same_tier else unpin_shared_copies(served, own, disabled_managed)
     # A real dir here is the workspace's own skill, which outranks anything
     # it shares a name with in the shared tier. So does a workspace row whose
     # dir is not here: a link would take the name its restore brings back.
@@ -1042,6 +1046,10 @@ async def link_shared_skills(
     }
     if base.rstrip("/") == user_base.rstrip("/"):
         return empty
+    from ptc_agent.agent.middleware.skills.dalton_registry import (  # DALTON-HOOK(standalone-core)
+        disabled_dalton_skills,
+    )
+
     payload = await _run(
         sandbox,
         {
@@ -1050,6 +1058,7 @@ async def link_shared_skills(
             "userBase": user_base,
             "targetPrefix": shared_link_target(base, user_base),
             "disabled": sorted(disabled),
+            "disabledManaged": sorted(disabled_dalton_skills()),
             "own": sorted(own),
         },
         retry_policy=RetryPolicy.SAFE,

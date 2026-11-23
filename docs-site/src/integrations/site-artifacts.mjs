@@ -1,6 +1,13 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  isDocIncluded,
+  isExcludedHelpUrl,
+  mapDocSlug,
+  resolveDocsProfile,
+  transformDocSource,
+} from './profile-filter.mjs';
 
 const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
 
@@ -12,8 +19,14 @@ function parseSimpleFrontmatter(raw) {
     const kv = line.match(/^([A-Za-z0-9_]+)\s*:\s*(.+)$/);
     if (!kv) continue;
     let val = kv[2].trim();
-    if ((val.startsWith("'") && val.endsWith("'")) || (val.startsWith('"') && val.endsWith('"'))) {
-      val = val.slice(1, -1);
+    if (val.startsWith('"') && val.endsWith('"')) {
+      try {
+        val = JSON.parse(val);
+      } catch {
+        val = val.slice(1, -1);
+      }
+    } else if (val.startsWith("'") && val.endsWith("'")) {
+      val = val.slice(1, -1).replace(/''/g, "'");
     }
     meta[kv[1]] = val;
   }
@@ -145,9 +158,10 @@ async function collectFrontendHelpLinks(repoRoot, basePath) {
   return [...targets].sort();
 }
 
-async function verifyFrontendHelpLinks(outDir, docsSiteRoot, basePath) {
+async function verifyFrontendHelpLinks(outDir, docsSiteRoot, basePath, { isCore = false } = {}) {
   const repoRoot = path.resolve(docsSiteRoot, '..');
-  const targets = await collectFrontendHelpLinks(repoRoot, basePath);
+  const allTargets = await collectFrontendHelpLinks(repoRoot, basePath);
+  const targets = allTargets.filter((url) => !isExcludedHelpUrl(url, { isCore }));
   const errors = [];
 
   for (const url of targets) {
@@ -196,7 +210,15 @@ async function verifyFrontendHelpLinks(outDir, docsSiteRoot, basePath) {
  * directly inside the Astro output directory using only Node built-ins,
  * and verifies that all `/help/...` URLs and anchors referenced by `web/` exist.
  */
-export function everflowSiteArtifacts({ basePath = '/help', siteOrigin: explicitOrigin = '' } = {}) {
+export function everflowSiteArtifacts({
+  basePath = '/help',
+  siteOrigin: explicitOrigin = '',
+  isCore: explicitIsCore,
+  brandName: explicitBrandName,
+} = {}) {
+  const resolved = resolveDocsProfile();
+  const isCore = explicitIsCore ?? resolved.isCore;
+  const brandName = explicitBrandName ?? resolved.brandName;
   return {
     name: 'everflow-site-artifacts',
     hooks: {
@@ -211,19 +233,22 @@ export function everflowSiteArtifacts({ basePath = '/help', siteOrigin: explicit
             'DOCS_SITE_ORIGIN / DALTON_FRONTEND_URL / PUBLIC_APP_URL is unset; whats-new/rss.xml links will be root-relative.',
           );
         }
-        const files = await walkDocs(docsDir);
+        const files = (await walkDocs(docsDir)).filter((filePath) =>
+          isDocIncluded(path.relative(docsDir, filePath), { isCore }),
+        );
         const llmsEntries = [];
         let rssXml = null;
 
         for (const filePath of files) {
           const rel = path.relative(docsDir, filePath).replace(/\\/g, '/');
-          const raw = await fs.readFile(filePath, 'utf-8');
+          const rawDisk = await fs.readFile(filePath, 'utf-8');
+          const raw = transformDocSource(rawDisk, { isCore, brandName, filePath: rel });
           const { meta, body } = parseSimpleFrontmatter(raw);
           const title = meta.title || rel;
           const description = meta.description || '';
           const mdText = mdxToPlainMarkdown(title, description, body);
 
-          const withoutExt = rel.replace(/\.(md|mdx)$/i, '');
+          const withoutExt = mapDocSlug(rel.replace(/\.(md|mdx)$/i, ''), { isCore });
           if (withoutExt === '404') continue;
           const isRootIndex = withoutExt === 'index';
           const routePath = isRootIndex
@@ -263,9 +288,13 @@ export function everflowSiteArtifacts({ basePath = '/help', siteOrigin: explicit
               '<?xml version="1.0" encoding="UTF-8"?>',
               '<rss version="2.0">',
               '  <channel>',
-              '    <title>Everflow 新功能</title>',
+              `    <title>${escapeXml(isCore ? `${brandName} 新功能` : 'Everflow 新功能')}</title>`,
               `    <link>${rssBase}/whats-new/</link>`,
-              '    <description>Everflow 投研平台与 Dalton 研究助手的用户可见更新说明。</description>',
+              `    <description>${escapeXml(
+                isCore
+                  ? `${brandName} 投研研究工作台的用户可见更新说明。`
+                  : 'Everflow 投研平台与 Dalton 研究助手的用户可见更新说明。',
+              )}</description>`,
               '    <language>zh-CN</language>',
               rssItems,
               '  </channel>',
@@ -276,9 +305,11 @@ export function everflowSiteArtifacts({ basePath = '/help', siteOrigin: explicit
         }
 
         const llmsLines = [
-          '# Everflow 文档',
+          isCore ? `# ${brandName} 文档` : '# Everflow 文档',
           '',
-          '> 面向投研分析师的 Everflow 平台与 Dalton 研究助手使用文档。以下页面均提供对应的纯 Markdown（`.md`）版本。',
+          isCore
+            ? `> 面向投研分析师的 ${brandName} 研究工作台使用文档。以下页面均提供对应的纯 Markdown（\`.md\`）版本。`
+            : '> 面向投研分析师的 Everflow 平台与 Dalton 研究助手使用文档。以下页面均提供对应的纯 Markdown（`.md`）版本。',
           '',
           ...llmsEntries.map((e) =>
             e.description
@@ -295,7 +326,7 @@ export function everflowSiteArtifacts({ basePath = '/help', siteOrigin: explicit
           await fs.writeFile(path.join(rssDir, 'rss.xml'), rssXml, 'utf-8');
         }
 
-        const verifiedCount = await verifyFrontendHelpLinks(outDir, docsSiteRoot, basePath);
+        const verifiedCount = await verifyFrontendHelpLinks(outDir, docsSiteRoot, basePath, { isCore });
 
         logger.info(
           `Generated ${llmsEntries.length} Markdown siblings, llms.txt${rssXml ? ', and whats-new/rss.xml' : ''}; verified ${verifiedCount} frontend /help links.`,
