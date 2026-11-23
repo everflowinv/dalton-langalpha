@@ -45,7 +45,8 @@ const EXPECTED = ['index', 'rolldown-runtime', 'vendor-react']
 // and 543 in sync11 S3 (#861/#862); Dalton keeps the larger ceiling (562) pending production build re-measurement.
 // #435 的团队模型判断已移出首屏，回落到 560
 // #457 在 zh-CN 文案目录（首屏必载）加了投递状态文案，生产构建实测 560.1 kB，上调到 562
-const MAX_EAGER_KB = 562
+// sync11 (#482) 合并上游后生产构建实测 574.4 kB（2026-11-23 部署时的检查结果），上调到 580
+const MAX_EAGER_KB = 580
 
 const outDir = process.argv[2] || 'dist'
 const indexPath = join(outDir, 'index.html')
