@@ -101,9 +101,15 @@ class FakeRolesAndCliDB:
                             }
                         ]
                         return cur
+                    if "SELECT base_url FROM user_api_keys" in sql:
+                        db.write_tx_depths.append(("api_key_base_url_lock", db.tx_depth))
+                        return cur
                     if "INSERT INTO user_api_keys" in sql:
                         db.write_tx_depths.append(("api_key_upsert", db.tx_depth))
                         db.api_keys_written.append((p[0], p[1]))
+                        return cur
+                    if "UPDATE user_api_keys SET base_url" in sql:
+                        db.write_tx_depths.append(("api_key_base_url_update", db.tx_depth))
                         return cur
                     if "DELETE FROM user_api_keys" in sql:
                         db.write_tx_depths.append(("api_key_delete", db.tx_depth))

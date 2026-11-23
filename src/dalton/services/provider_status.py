@@ -675,9 +675,17 @@ async def probe_provider(
         exc_error_kind = getattr(exc, "error_kind", None)
         msg = sanitize_error_text(f"{type(exc).__name__}: {exc}")
         msg_lower = msg.lower()
+        from src.dalton.credentials import is_base_url_blocked_exception
         from src.dalton.llm.providers.muse.client import is_muse_auth_expired_error
 
-        if provider == "muse-oauth" and is_muse_auth_expired_error(exc):
+        is_blocked = is_base_url_blocked_exception(exc)
+        if is_blocked:
+            detail_dict = exc.detail if isinstance(getattr(exc, "detail", None), dict) else {}
+            error_kind = "base_url_blocked"
+            status_code = 400
+            if detail_dict.get("message"):
+                msg = sanitize_error_text(str(detail_dict["message"]))
+        elif provider == "muse-oauth" and is_muse_auth_expired_error(exc):
             error_kind = "auth_expired"
             if "请重新连接 Muse" not in msg:
                 msg = f"{msg}（请重新连接 Muse）"
@@ -702,6 +710,8 @@ async def probe_provider(
                 "message": msg,
             },
         )
+        if is_blocked:
+            raise
         return {
             "ok": False,
             "provider": provider,

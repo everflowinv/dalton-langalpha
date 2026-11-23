@@ -569,8 +569,15 @@ async def test_egress_exemption_is_address_based_not_admin_identity(monkeypatch)
         create_autospec(egress_policy.get_saved_team_endpoints, return_value={}),
     )
 
+    from src.dalton import credentials as creds_mod
     from src.server.app import api_keys
     from src.server.services.llm import custom_catalog
+
+    holder_mock = create_autospec(
+        creds_mod._fetch_local_holder_id_sync,
+        return_value="admin-1",
+    )
+    monkeypatch.setattr(creds_mod, "_fetch_local_holder_id_sync", holder_mock)
 
     # Both member AND admin are refused on non-allowlisted, non-team private/metadata URLs
     for uid in ("member-1", "admin-1"):
@@ -589,10 +596,26 @@ async def test_egress_exemption_is_address_based_not_admin_identity(monkeypatch)
             await custom_catalog.refuse_custom_model_endpoints(custom_list, user_id=uid)
         assert exc_catalog.value.status_code == 400
 
-    # Operator-allowlisted URL passes AND still returns a DNS-pinning transport (never None)
+    # Operator-allowlisted URL passes AND still returns a DNS-pinning transport (never None).
+    # With team credential sharing active (#485), the holder can save an operator-allowlisted
+    # custom model base_url, while a non-holder member is still refused 400 (stricter policy wins).
     monkeypatch.setenv("DALTON_OPERATOR_LLM_ENDPOINTS", "http://127.0.0.1:8099/v1")
     transport = await api_keys._user_endpoint_transport("http://127.0.0.1:8099/v1", user_id="admin-1")
     assert transport is not None
+    await custom_catalog.refuse_custom_model_endpoints(
+        [{"name": "ok-model", "provider": "openai", "parameters": {"base_url": "http://127.0.0.1:8099/v1"}}],
+        user_id="admin-1",
+    )
+    with pytest.raises(HTTPException) as exc_member_shared:
+        await custom_catalog.refuse_custom_model_endpoints(
+            [{"name": "ok-model", "provider": "openai", "parameters": {"base_url": "http://127.0.0.1:8099/v1"}}],
+            user_id="member-1",
+        )
+    assert exc_member_shared.value.status_code == 400
+    assert "team credential sharing" in str(exc_member_shared.value.detail)
+
+    # Without a shared team holder, any user can save an operator-allowlisted endpoint.
+    holder_mock.return_value = None
     await custom_catalog.refuse_custom_model_endpoints(
         [{"name": "ok-model", "provider": "openai", "parameters": {"base_url": "http://127.0.0.1:8099/v1"}}],
         user_id="member-1",

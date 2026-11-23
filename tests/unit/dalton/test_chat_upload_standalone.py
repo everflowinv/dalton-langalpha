@@ -25,12 +25,15 @@ from ptc_agent.config.file_utils import load_yaml_config
 from ptc_agent.config.loaders import load_from_dict
 from ptc_agent.core.paths import WorkspaceLayout
 from ptc_agent.core.sandbox import wsfiles_transfer_runtime as transfer_rt
+from ptc_agent.core.sandbox.providers import docker as docker_provider_mod
 from ptc_agent.core.sandbox.providers.docker import DockerProvider
 from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 from src.dalton import chat_upload_storage as storage
 from src.dalton import transcription_storage as asr_storage
 from src.dalton.app.chat_uploads import (
     router as chat_uploads_router,
+)
+from src.dalton.app.chat_uploads import (
     sandbox_relay_router,
 )
 from src.dalton.database import chat_uploads as db_chat_uploads
