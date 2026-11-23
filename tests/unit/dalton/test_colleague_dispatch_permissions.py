@@ -97,7 +97,7 @@ def _setup_roles(
         "DALTON_COLLEAGUE_DISPATCH_ENABLED", "true" if dispatch_enabled else "false"
     )
 
-    async def _fake_get_user(uid: str) -> dict[str, Any] | None:
+    async def _fake_get_user(uid: str, *, conn: Any = None) -> dict[str, Any] | None:
         return USERS_BY_ID.get(uid)
 
     monkeypatch.setattr(
