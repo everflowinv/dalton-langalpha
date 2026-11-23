@@ -1,0 +1,106 @@
+name: Standalone Core E2E
+
+on:
+  pull_request:
+    paths:
+      - "docker-compose.yml"
+      - "docker-compose.core.yml"
+      - "docker-compose.ci.yml"
+      - "Dockerfile.sandbox"
+      - "agent_config*.yaml"
+      - "config*.yaml"
+      - "deploy/standalone/**"
+      - "scripts/standalone/**"
+      - "scripts/dalton/Dockerfile.dalton"
+      - "scripts/dalton/Dockerfile.postgres"
+      - "scripts/dalton/docker_entrypoint_dalton.sh"
+      - "migrations/**"
+      - "src/dalton/migrations/**"
+      - "src/dalton/profile.py"
+      - "src/dalton/settings.py"
+      - "src/dalton/dalton.core.yaml"
+      - "src/dalton/capabilities.py"
+      - "src/dalton/auth/**"
+      - "src/dalton/chat_upload_storage.py"
+      - "src/dalton/app/chat_uploads.py"
+      - "src/dalton/services/chat_uploads.py"
+      - "src/ptc_agent/config/**"
+      - "src/ptc_agent/agent/**"
+      - "src/server/**"
+      - "tests/fakes/**"
+      - "tests/standalone/**"
+      - ".github/workflows/standalone-core-e2e.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: standalone-core-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  standalone-core-e2e:
+    name: Clean Linux Standalone Core E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          df -h
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost
+          docker system prune -af --volumes || true
+          df -h
+
+      - name: Export clean standalone release directory
+        run: |
+          mkdir -p /tmp/standalone-artifacts
+          bash scripts/standalone/package_release.sh \
+            --ref HEAD \
+            --output /tmp/dalton-core-dist \
+            --report /tmp/standalone-artifacts/release-scan-report.txt
+
+      - name: Initialize standalone core environment
+        working-directory: /tmp/dalton-core-dist
+        run: |
+          bash scripts/standalone/init.sh --non-interactive --domain localhost
+
+      - name: Build standalone core images from clean export
+        working-directory: /tmp/dalton-core-dist
+        env:
+          INSTALL_BROWSER_CRAWLER: "false"
+        run: |
+          BUILD_GIT_SHA="$(cat .release_git_sha)"
+          export BUILD_GIT_SHA
+          export BUILD_GIT_DIRTY="false"
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.core.yml \
+            build --build-arg INSTALL_BROWSER_CRAWLER=false
+          df -h
+
+      - name: Run standalone acceptance checks (grouped by auth mode)
+        run: |
+          bash "${GITHUB_WORKSPACE}/tests/standalone/run_checks.sh" \
+            --work-dir /tmp/dalton-core-dist \
+            --checks-dir "${GITHUB_WORKSPACE}/tests/standalone/checks" \
+            --ci-compose "${GITHUB_WORKSPACE}/docker-compose.ci.yml" \
+            --artifacts-dir /tmp/standalone-artifacts
+
+      - name: Upload logs, scan report, and baseline DB snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-core-e2e-artifacts
+          path: /tmp/standalone-artifacts
+          if-no-files-found: warn
+          retention-days: 14

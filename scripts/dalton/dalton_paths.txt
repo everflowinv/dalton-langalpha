@@ -552,3 +552,9 @@ docker-compose.core.yml
 .env.core.example
 deploy/standalone/
 scripts/standalone/
+# Standalone Core Batch 1c: fake OpenAI Responses API server, header echo, CI compose,
+# standalone check framework, E2E workflow, and release packaging script.
+docker-compose.ci.yml
+.github/workflows/standalone-core-e2e.yml
+tests/fakes/
+tests/standalone/
