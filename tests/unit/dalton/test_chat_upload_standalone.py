@@ -2331,6 +2331,63 @@ class TestSandboxNetworkAndInitScript:
             (w / ".env").write_text(env_text, encoding="utf-8")
             return w
 
+        def _make_compose_config_docker_stub(
+            stub_dir: Path,
+            *,
+            extra_backend_env: dict[str, str] | None = None,
+            extra_bash: str = "",
+            log_file: Path | None = None,
+        ) -> Path:
+            """Create a fake `docker` binary that synthesizes `docker compose config --format json`
+            from `--env-file` (plus optional backend overrides) without requiring a real Docker daemon."""
+            stub_dir.mkdir(parents=True, exist_ok=True)
+            (stub_dir / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            (stub_dir / "flock").chmod(0o755)
+            overrides_json = json.dumps(extra_backend_env or {})
+            helper_py = stub_dir / "_render_compose_cfg.py"
+            helper_py.write_text(
+                "import json, re, sys\n"
+                "args = sys.argv[1:]\n"
+                "env_path = ''\n"
+                "for i, a in enumerate(args):\n"
+                "    if a == '--env-file' and i + 1 < len(args):\n"
+                "        env_path = args[i + 1]\n"
+                "env = {}\n"
+                "if env_path:\n"
+                "    for raw in open(env_path, encoding='utf-8'):\n"
+                "        s = raw.strip()\n"
+                "        if not s or s.startswith('#'): continue\n"
+                "        m = re.match(r'^\\s*(?:export\\s+)?([A-Za-z_][A-Za-z0-9_]*)\\s*[=:](.*)$', raw.rstrip('\\r\\n'))\n"
+                "        if m:\n"
+                "            v = m.group(2).strip()\n"
+                "            if len(v) >= 2 and v[0] == v[-1] and v[0] in (\"'\", '\"'): v = v[1:-1]\n"
+                "            env[m.group(1)] = v\n"
+                "if env.get('MINIO_ROOT_USER') or env.get('MINIO_ROOT_PASSWORD') or env.get('DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME') or env.get('DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL'):\n"
+                "    env.setdefault('DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL', 'http://minio:9000')\n"
+                "    env.setdefault('DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME', 'chat-uploads')\n"
+                "    env.setdefault('DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID', env.get('MINIO_ROOT_USER', ''))\n"
+                "    env.setdefault('DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY', env.get('MINIO_ROOT_PASSWORD', ''))\n"
+                f"env.update(json.loads({overrides_json!r}))\n"
+                "print(json.dumps({'services': {'backend': {'environment': env}}}))\n",
+                encoding="utf-8",
+            )
+            log_stmt = f'printf "%s\\n" "$*" >> "{log_file}"\n' if log_file is not None else ""
+            docker_bin = stub_dir / "docker"
+            docker_bin.write_text(
+                "#!/usr/bin/env bash\n"
+                + log_stmt
+                + f'if [[ "$*" == *" config --format json"* ]]; then {sys.executable} "{helper_py}" "$@"; exit $?; fi\n'
+                + extra_bash
+                + "\nexit 0\n",
+                encoding="utf-8",
+            )
+            docker_bin.chmod(0o755)
+            return stub_dir
+
+        base_stub_bin = _make_compose_config_docker_stub(tmp_path / "r6-base-stub-bin")
+        base_stub_env = os.environ.copy()
+        base_stub_env["PATH"] = f"{base_stub_bin}:{base_stub_env.get('PATH', '')}"
+
         # 1. Req 3: YAML default storage.provider="s3" when STORAGE_PROVIDER is unset:
         #    chat-uploads on MinIO + S3_BUCKET_NAME on default AWS S3 MUST be rejected
         #    by BOTH backup.sh and restore.sh.
@@ -2363,6 +2420,7 @@ class TestSandboxNetworkAndInitScript:
                     "--backup-dir",
                     str(bak_default),
                 ],
+                env=base_stub_env,
                 capture_output=True,
                 text=True,
                 timeout=15,
@@ -2395,6 +2453,7 @@ class TestSandboxNetworkAndInitScript:
                     str(bak_default),
                     "--skip-minio",
                 ],
+                env=base_stub_env,
                 capture_output=True,
                 text=True,
                 timeout=15,
@@ -2456,6 +2515,7 @@ class TestSandboxNetworkAndInitScript:
                         "--backup-dir",
                         str(bak_default),
                     ],
+                    env=base_stub_env,
                     capture_output=True,
                     text=True,
                     timeout=15,
@@ -2469,30 +2529,23 @@ class TestSandboxNetworkAndInitScript:
                 elif lock_m.exists():
                     lock_m.unlink()
 
-        # 4. Req 1 + Req 5: With `flock` on PATH, non-empty other DB in pg_database refuses restore
-        #    and stderr MUST preserve BOTH the refusal reason AND STANDALONE-DEPLOY.md (`down -v`).
-        fake_bin = tmp_path / "r6-fake-bin"
-        fake_bin.mkdir()
-        fake_flock = fake_bin / "flock"
-        fake_flock.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-        fake_flock.chmod(0o755)
-
+        # 4. Req 1 + Req 5 + B6R7 Req 1: With `flock` on PATH, non-empty other DB in pg_database
+        #    refuses restore, lists the other DB name and DB_NAME, does NOT suggest `down -v`,
+        #    while app-DB-only non-empty refusal STILL points to STANDALONE-DEPLOY.md (`down -v`).
         fake_docker_seen = tmp_path / "r6-docker-args.log"
-        fake_docker = fake_bin / "docker"
-        fake_docker.write_text(
-            "#!/usr/bin/env bash\n"
-            f'printf "%s\\n" "$*" >> "{fake_docker_seen}"\n'
-            'if [[ "$*" == *" ps --status running --services"* ]]; then echo "postgres"; exit 0; fi\n'
-            'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
-            'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
-            'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
-            'if [[ "$*" == *"FROM pg_database"* ]]; then printf "other_app_db\\npostgres\\n"; exit 0; fi\n'
-            'if [[ "$*" == *" -d other_app_db "* ]]; then printf "1\\t0\\t0\\n"; exit 0; fi\n'
-            'if [[ "$*" == *" -d postgres "* ]]; then printf "0\\t0\\t0\\n"; exit 0; fi\n'
-            "exit 0\n",
-            encoding="utf-8",
+        fake_bin = _make_compose_config_docker_stub(
+            tmp_path / "r6-fake-bin",
+            log_file=fake_docker_seen,
+            extra_bash=(
+                'if [[ "$*" == *" ps --status running --services"* ]]; then echo "postgres"; exit 0; fi\n'
+                'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
+                'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
+                'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
+                'if [[ "$*" == *"FROM pg_database"* ]]; then printf "other_app_db\\npostgres\\n"; exit 0; fi\n'
+                'if [[ "$*" == *" -d other_app_db "* ]]; then printf "1\\t0\\t0\\n"; exit 0; fi\n'
+                'if [[ "$*" == *" -d postgres "* ]]; then printf "0\\t0\\t0\\n"; exit 0; fi\n'
+            ),
         )
-        fake_docker.chmod(0o755)
 
         proj_flock = f"r6-flock-nonempty-{os.getpid()}"
         w_flock = _make_work(
@@ -2526,13 +2579,52 @@ class TestSandboxNetworkAndInitScript:
             )
             assert res_flock.returncode != 0
             assert "other_app_db" in res_flock.stderr, f"stderr swallowed or missing DB name: {res_flock.stderr!r}"
+            assert "backup.sh 只备份 postgres" in res_flock.stderr, f"missing other-DB backup scope warning: {res_flock.stderr!r}"
             assert "STANDALONE-DEPLOY.md" in res_flock.stderr, f"stderr missing manual path: {res_flock.stderr!r}"
-            assert "down -v" in res_flock.stderr, f"stderr missing down -v: {res_flock.stderr!r}"
-            assert f"label=com.docker.compose.project={proj_flock}" in res_flock.stderr
+            assert "down -v" not in res_flock.stderr, f"other-DB refusal MUST NOT suggest down -v: {res_flock.stderr!r}"
             docker_calls = fake_docker_seen.read_text(encoding="utf-8")
             assert f"compose -p {proj_flock} " in docker_calls
             assert "shell-poison-must-not-appear" not in docker_calls
             assert "pg_proc" in docker_calls and "pg_type" in docker_calls
+        finally:
+            if lock_flock.is_dir():
+                lock_flock.rmdir()
+            elif lock_flock.exists():
+                lock_flock.unlink()
+
+        # App-DB-only non-empty refusal STILL prints manual `down -v` hint with project volume filter
+        fake_bin_app_only = _make_compose_config_docker_stub(
+            tmp_path / "r6-fake-bin-app-only",
+            extra_bash=(
+                'if [[ "$*" == *" ps --status running --services"* ]]; then echo "postgres"; exit 0; fi\n'
+                'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
+                'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
+                'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
+                'if [[ "$*" == *"FROM pg_database"* ]]; then printf "postgres\\n"; exit 0; fi\n'
+                'if [[ "$*" == *" -d postgres "* ]]; then printf "3\\t0\\t0\\n"; exit 0; fi\n'
+            ),
+        )
+        app_only_env = os.environ.copy()
+        app_only_env["PATH"] = f"{fake_bin_app_only}:{app_only_env.get('PATH', '')}"
+        try:
+            res_app_only = subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir",
+                    str(w_flock),
+                    "--backup-dir",
+                    str(bak_default),
+                ],
+                env=app_only_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_app_only.returncode != 0
+            assert "STANDALONE-DEPLOY.md" in res_app_only.stderr
+            assert "down -v" in res_app_only.stderr
+            assert f"label=com.docker.compose.project={proj_flock}" in res_app_only.stderr
         finally:
             if lock_flock.is_dir():
                 lock_flock.rmdir()
@@ -2567,24 +2659,18 @@ class TestSandboxNetworkAndInitScript:
         stale_dec = w_mid / ".env.tmp-decrypt-stale1"
         stale_dec.write_text("STALE=1\n", encoding="utf-8")
 
-        fake_bin_mid = tmp_path / "r6-fake-bin-mid"
-        fake_bin_mid.mkdir()
-        (fake_bin_mid / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-        (fake_bin_mid / "flock").chmod(0o755)
-        fake_docker_mid = fake_bin_mid / "docker"
-        fake_docker_mid.write_text(
-            "#!/usr/bin/env bash\n"
-            'if [[ "$*" == *" ps --status running --services"* ]]; then echo "postgres"; exit 0; fi\n'
-            'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
-            'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
-            'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
-            'if [[ "$*" == *"FROM pg_database"* ]]; then echo "postgres"; exit 0; fi\n'
-            'if [[ "$*" == *" -d postgres "* && "$*" == *"pg_class"* ]]; then printf "0\\t0\\t0\\n"; exit 0; fi\n'
-            'if [[ "$*" == *" pg_restore "* ]]; then echo "simulated pg_restore failure" >&2; exit 1; fi\n'
-            "exit 0\n",
-            encoding="utf-8",
+        fake_bin_mid = _make_compose_config_docker_stub(
+            tmp_path / "r6-fake-bin-mid",
+            extra_bash=(
+                'if [[ "$*" == *" ps --status running --services"* ]]; then echo "postgres"; exit 0; fi\n'
+                'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
+                'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
+                'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
+                'if [[ "$*" == *"FROM pg_database"* ]]; then echo "postgres"; exit 0; fi\n'
+                'if [[ "$*" == *" -d postgres "* && "$*" == *"pg_class"* ]]; then printf "0\\t0\\t0\\n"; exit 0; fi\n'
+                'if [[ "$*" == *" pg_restore "* ]]; then echo "simulated pg_restore failure" >&2; exit 1; fi\n'
+            ),
         )
-        fake_docker_mid.chmod(0o755)
         mid_env = os.environ.copy()
         mid_env["PATH"] = f"{fake_bin_mid}:{mid_env.get('PATH', '')}"
         lock_mid = Path(f"/tmp/dalton-{proj_mid}.restore.lock")
@@ -2623,21 +2709,15 @@ class TestSandboxNetworkAndInitScript:
                 lock_mid.unlink()
 
         # 6. Req 1: PostgreSQL superuser credential connection failure refuses restore and explains why.
-        fake_bin_pgfail = tmp_path / "r6-fake-bin-pgfail"
-        fake_bin_pgfail.mkdir()
-        (fake_bin_pgfail / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-        (fake_bin_pgfail / "flock").chmod(0o755)
-        fake_docker_pgfail = fake_bin_pgfail / "docker"
-        fake_docker_pgfail.write_text(
-            "#!/usr/bin/env bash\n"
-            'if [[ "$*" == *" ps --status running --services"* ]]; then echo "postgres"; exit 0; fi\n'
-            'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
-            'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
-            'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "psql: error: FATAL: password authentication failed for user postgres" >&2; exit 2; fi\n'
-            "exit 0\n",
-            encoding="utf-8",
+        fake_bin_pgfail = _make_compose_config_docker_stub(
+            tmp_path / "r6-fake-bin-pgfail",
+            extra_bash=(
+                'if [[ "$*" == *" ps --status running --services"* ]]; then echo "postgres"; exit 0; fi\n'
+                'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
+                'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
+                'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "psql: error: FATAL: password authentication failed for user postgres" >&2; exit 2; fi\n'
+            ),
         )
-        fake_docker_pgfail.chmod(0o755)
         proj_pgfail = f"r6-pgfail-{os.getpid()}"
         w_pgfail = _make_work(
             "work-pgfail",
@@ -2677,11 +2757,149 @@ class TestSandboxNetworkAndInitScript:
             elif lock_pgfail.exists():
                 lock_pgfail.unlink()
 
-        # Verify restore.sh has zero `exec 9... 2>/dev/null` and MISSING_CHECK_PY exits 1 on missing objects
+        # 7. B6R7 Req 2: verify-backup-refs fails on missing completed (ready/completing) uploads
+        #    with cleanup-race hint, while skipping in-progress 'uploading' records and reporting count.
+        mm_refs = tmp_path / "r7-minio-manifest.json"
+        mm_refs.write_text(
+            json.dumps(
+                {
+                    "primary_bucket": "chat-uploads",
+                    "primary_key_prefix": "pfx",
+                    "targets": {
+                        "chat_upload": {
+                            "endpoint": "http://minio:9000",
+                            "bucket": "chat-uploads",
+                            "key_prefix": "pfx",
+                        }
+                    },
+                    "objects": [
+                        {"bucket": "chat-uploads", "key": "pfx/chat-uploads/ws1/u1/doc.txt", "size": 10},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        copy_ok_sql = tmp_path / "r7-copy-ok.sql"
+        copy_ok_sql.write_text(
+            "COPY public.dalton_chat_file_uploads (upload_id, object_key, state, cleaned_at) FROM stdin;\n"
+            "u1\tchat-uploads/ws1/u1/doc.txt\tready\t\\N\n"
+            "u2\tchat-uploads/ws1/u2/wip.txt\tuploading\t\\N\n"
+            "u3\tchat-uploads/ws1/u3/gone.txt\taborted\t\\N\n"
+            "u4\tchat-uploads/ws1/u4/cleaned.txt\tready\t2026-11-23 00:00:00+00\n"
+            "\\.\n",
+            encoding="utf-8",
+        )
+        res_ref_ok = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts/standalone/storage_config.py"),
+                "verify-backup-refs",
+                "--copy-sql",
+                str(copy_ok_sql),
+                "--minio-manifest",
+                str(mm_refs),
+                "--caller",
+                "backup",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_ref_ok.returncode == 0, f"Expected verify-backup-refs to pass: {res_ref_ok.stderr}"
+        assert "skipped 1" in res_ref_ok.stdout.lower()
+
+        copy_miss_sql = tmp_path / "r7-copy-miss.sql"
+        copy_miss_sql.write_text(
+            "COPY public.dalton_chat_file_uploads (upload_id, object_key, state, cleaned_at) FROM stdin;\n"
+            "u1\tchat-uploads/ws1/u1/doc.txt\tready\t\\N\n"
+            "u5\tchat-uploads/ws1/u5/missing.pdf\tready\t\\N\n"
+            "\\.\n",
+            encoding="utf-8",
+        )
+        res_ref_miss = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts/standalone/storage_config.py"),
+                "verify-backup-refs",
+                "--copy-sql",
+                str(copy_miss_sql),
+                "--minio-manifest",
+                str(mm_refs),
+                "--caller",
+                "backup",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_ref_miss.returncode != 0
+        assert "chat-uploads/ws1/u5/missing.pdf" in res_ref_miss.stderr
+        assert "可能是备份期间有清理任务运行，请重新备份" in res_ref_miss.stderr
+
+        # 8. B6R7 Req 3: Compose config override on `backend` bucket or endpoint is authoritative
+        #    and causes restore.sh to refuse even when `.env` still matches the backup.
+        bak_with_ep = _make_minio_backup(
+            "bak-with-ep",
+            primary_bucket="chat-uploads",
+            targets={
+                "chat_upload": {
+                    "endpoint": "http://minio:9000",
+                    "bucket": "chat-uploads",
+                    "key_prefix": "",
+                }
+            },
+        )
+        for ov_case, ov_env, expected_needle in (
+            ("bucket", {"DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME": "override-only-bucket"}, "override-only-bucket"),
+            ("endpoint", {"DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL": "http://other-minio:9000"}, "http://other-minio:9000"),
+        ):
+            proj_ov = f"r7-compose-ov-{ov_case}-{os.getpid()}"
+            w_ov = _make_work(
+                f"work-compose-ov-{ov_case}",
+                f"COMPOSE_PROJECT_NAME={proj_ov}\n"
+                "DB_HOST=postgres\n"
+                "MINIO_ROOT_USER=dalton\n"
+                "MINIO_ROOT_PASSWORD=secretpass\n"
+                "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME=chat-uploads\n",
+            )
+            ov_bin = _make_compose_config_docker_stub(
+                tmp_path / f"r7-ov-bin-{ov_case}",
+                extra_backend_env=ov_env,
+            )
+            ov_run_env = os.environ.copy()
+            ov_run_env["PATH"] = f"{ov_bin}:{ov_run_env.get('PATH', '')}"
+            lock_ov = Path(f"/tmp/dalton-{proj_ov}.restore.lock")
+            try:
+                res_ov = subprocess.run(
+                    [
+                        "bash",
+                        str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                        "--work-dir",
+                        str(w_ov),
+                        "--backup-dir",
+                        str(bak_with_ep),
+                    ],
+                    env=ov_run_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                assert res_ov.returncode != 0, f"Expected compose override ({ov_case}) to be refused"
+                assert expected_needle in res_ov.stderr, f"Missing {expected_needle!r} in stderr:\n{res_ov.stderr}"
+                assert "compose config" in res_ov.stderr.lower()
+            finally:
+                if lock_ov.is_dir():
+                    lock_ov.rmdir()
+                elif lock_ov.exists():
+                    lock_ov.unlink()
+
+        # Verify restore.sh has zero `exec 9... 2>/dev/null`, skips 'uploading' in SQL, and MISSING_CHECK_PY exits 1
         restore_src = (REPO_ROOT / "scripts/standalone/restore.sh").read_text(encoding="utf-8")
         assert not any(
             "2>/dev/null" in ln for ln in restore_src.splitlines() if "exec 9" in ln
         ), "restore.sh must never use `exec 9... 2>/dev/null`"
         assert "dalton-restore-env." not in restore_src
         assert ".env.tmp-decrypt-" in restore_src
+        assert "state IN ('ready', 'completing')" in restore_src
+        assert "state IN ('ready', 'completing', 'uploading')" not in restore_src
         assert "sys.exit(1)" in restore_src.split("MISSING_CHECK_PY='", 1)[1].split("'\n", 1)[0]

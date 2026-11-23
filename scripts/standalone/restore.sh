@@ -274,6 +274,7 @@ CANDIDATE_ENV=""
 ACTIVE_COMPOSE_ENV=""
 PREFLIGHT_COMPOSE_OVERRIDE=""
 MINIO_MANIFEST_TMP=""
+COMPOSE_CFG_TMP=""
 
 acquire_restore_lock() {
   if command -v flock >/dev/null 2>&1; then
@@ -346,6 +347,9 @@ cleanup() {
   fi
   if [[ -n "$MINIO_MANIFEST_TMP" && -f "$MINIO_MANIFEST_TMP" ]]; then
     rm -f "$MINIO_MANIFEST_TMP"
+  fi
+  if [[ -n "$COMPOSE_CFG_TMP" ]]; then
+    rm -f "$COMPOSE_CFG_TMP" "${COMPOSE_CFG_TMP}.err"
   fi
   release_restore_lock
   if [[ "$rc" -ne 0 && "$RESTORE_SUCCEEDED" -ne 1 && "$MUTATION_STARTED" -eq 1 ]]; then
@@ -531,53 +535,6 @@ CFG_EDGE_HTTPS_PORT="$(read_env_file_var "$CANDIDATE_ENV" "DALTON_EDGE_HTTPS_POR
 CFG_CHAT_BUCKET="$(read_env_file_var "$CANDIDATE_ENV" "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME" "chat-uploads")"
 validate_db_identifiers "$CFG_DB_USER" "$CFG_DB_NAME"
 
-# Validate effective object storage configuration using application rules (chat_upload,
-# ASR, general storage + agent_config.yaml), enforce single-service invariant, and
-# allow --skip-minio ONLY when no object storage is configured.
-STORAGE_CHECK_ARGS=(
-  python3 "${SCRIPT_DIR}/storage_config.py" check-env
-  --env-file "$CANDIDATE_ENV"
-  --work-dir "$WORK_DIR"
-  --caller restore
-  --json
-)
-if [[ "$SKIP_MINIO" -eq 1 ]]; then
-  STORAGE_CHECK_ARGS+=(--require-none-for-skip-minio)
-fi
-if ! STORAGE_CFG_JSON="$("${STORAGE_CHECK_ARGS[@]}")"; then
-  exit 1
-fi
-IFS=$'\t' read -r STORAGE_ANY_CONFIGURED RESOLVED_PRIMARY_BUCKET < <(
-  printf '%s' "$STORAGE_CFG_JSON" | python3 -c '
-import json, sys
-d = json.load(sys.stdin)
-print(("1" if d.get("any_configured") else "0") + "\t" + (d.get("primary_bucket") or ""))
-'
-)
-if [[ -n "$RESOLVED_PRIMARY_BUCKET" ]]; then
-  CFG_CHAT_BUCKET="$RESOLVED_PRIMARY_BUCKET"
-fi
-
-# Before touching Docker, .env, or any data, verify bucket name(s) and key prefix(es)
-# in the backup manifest match the candidate .env that will be used.
-if [[ "$STORAGE_ANY_CONFIGURED" -eq 1 && ( -n "$MINIO_MANIFEST_TMP" || -f "${BACKUP_DIR}/manifest.json" ) ]]; then
-  CMP_ARGS=(
-    python3 "${SCRIPT_DIR}/storage_config.py" compare-backup
-    --env-file "$CANDIDATE_ENV"
-    --work-dir "$WORK_DIR"
-    --caller restore
-  )
-  if [[ -n "$MINIO_MANIFEST_TMP" && -f "$MINIO_MANIFEST_TMP" ]]; then
-    CMP_ARGS+=(--minio-manifest "$MINIO_MANIFEST_TMP")
-  fi
-  if [[ -f "${BACKUP_DIR}/manifest.json" ]]; then
-    CMP_ARGS+=(--backup-manifest "${BACKUP_DIR}/manifest.json")
-  fi
-  if ! "${CMP_ARGS[@]}"; then
-    exit 1
-  fi
-fi
-
 # Build Compose file list from CANDIDATE_ENV
 if [[ -z "$COMPOSE_FILES_RAW" ]]; then
   env_compose_file="$(read_env_file_var "$CANDIDATE_ENV" "COMPOSE_FILE" "")"
@@ -740,6 +697,70 @@ service_is_running() {
   compose_cmd ps --status running --services 2>/dev/null | grep -qx "$svc"
 }
 
+# Before starting containers or writing .env/data, render the effective Compose
+# configuration (`docker compose -p ... -f ... --env-file ... config --format json`)
+# and validate the `backend` service's actual effective storage environment
+# (chat_upload, ASR, general: bucket, endpoint, key prefix) against the backup
+# manifest. `.env` is kept only as an auxiliary reference; `compose config` is
+# authoritative.
+COMPOSE_CFG_TMP="$(mktemp)"
+chmod 600 "$COMPOSE_CFG_TMP"
+set +e
+compose_cmd config --format json > "$COMPOSE_CFG_TMP" 2>"${COMPOSE_CFG_TMP}.err"
+COMPOSE_CFG_RC=$?
+set -e
+if [[ "$COMPOSE_CFG_RC" -ne 0 ]]; then
+  err "Failed to render effective Docker Compose configuration via 'docker compose config --format json':"
+  err "  $(cat "${COMPOSE_CFG_TMP}.err")"
+  exit 1
+fi
+
+STORAGE_CHECK_ARGS=(
+  python3 "${SCRIPT_DIR}/storage_config.py" check-env
+  --compose-config-json "$COMPOSE_CFG_TMP"
+  --service backend
+  --env-file "$CANDIDATE_ENV"
+  --work-dir "$WORK_DIR"
+  --caller restore
+  --json
+)
+if [[ "$SKIP_MINIO" -eq 1 ]]; then
+  STORAGE_CHECK_ARGS+=(--require-none-for-skip-minio)
+fi
+if ! STORAGE_CFG_JSON="$("${STORAGE_CHECK_ARGS[@]}")"; then
+  exit 1
+fi
+IFS=$'\t' read -r STORAGE_ANY_CONFIGURED RESOLVED_PRIMARY_BUCKET < <(
+  printf '%s' "$STORAGE_CFG_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print(("1" if d.get("any_configured") else "0") + "\t" + (d.get("primary_bucket") or ""))
+'
+)
+if [[ -n "$RESOLVED_PRIMARY_BUCKET" ]]; then
+  CFG_CHAT_BUCKET="$RESOLVED_PRIMARY_BUCKET"
+fi
+
+if [[ "$SKIP_MINIO" -eq 0 && ( -n "$MINIO_MANIFEST_TMP" || -f "${BACKUP_DIR}/manifest.json" ) ]]; then
+  CMP_ARGS=(
+    python3 "${SCRIPT_DIR}/storage_config.py" compare-backup
+    --compose-config-json "$COMPOSE_CFG_TMP"
+    --service backend
+    --env-file "$CANDIDATE_ENV"
+    --work-dir "$WORK_DIR"
+    --caller restore
+  )
+  if [[ -n "$MINIO_MANIFEST_TMP" && -f "$MINIO_MANIFEST_TMP" ]]; then
+    CMP_ARGS+=(--minio-manifest "$MINIO_MANIFEST_TMP")
+  fi
+  if [[ -f "${BACKUP_DIR}/manifest.json" ]]; then
+    CMP_ARGS+=(--backup-manifest "${BACKUP_DIR}/manifest.json")
+  fi
+  if ! "${CMP_ARGS[@]}"; then
+    exit 1
+  fi
+fi
+
 # Step 3: Verify entire target PostgreSQL instance and object storage are empty,
 # validate postgres.dump, then atomically write .env.
 info "3/7 Verifying target instance is empty and validating postgres.dump..."
@@ -800,6 +821,9 @@ fi
 
 DB_EXISTS=0
 CHECKED_DBS=()
+NON_EMPTY_APP_DESC=""
+NON_EMPTY_OTHER_DBS=()
+NON_EMPTY_OTHER_DESCS=()
 PG_EMPTY_SQL="SELECT \
   (SELECT COUNT(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
    WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
@@ -836,11 +860,33 @@ while IFS= read -r db_name; do
   fi
   total_cnt=$(( rel_cnt + proc_cnt + type_cnt ))
   if (( total_cnt > 0 )); then
-    err "Target PostgreSQL database '${db_name}' is NOT empty (${total_cnt} user object(s): relations=${rel_cnt}, functions=${proc_cnt}, types=${type_cnt})."
-    print_non_empty_manual_hint
-    exit 1
+    desc="Target PostgreSQL database '${db_name}' is NOT empty (${total_cnt} user object(s): relations=${rel_cnt}, functions=${proc_cnt}, types=${type_cnt})."
+    if [[ "$db_name" == "$CFG_DB_NAME" ]]; then
+      NON_EMPTY_APP_DESC="$desc"
+    else
+      NON_EMPTY_OTHER_DBS+=("$db_name")
+      NON_EMPTY_OTHER_DESCS+=("$desc")
+    fi
   fi
 done <<< "$PG_ALL_DBS_RAW"
+
+if (( ${#NON_EMPTY_OTHER_DBS[@]} > 0 )); then
+  for desc in "${NON_EMPTY_OTHER_DESCS[@]}"; do
+    err "$desc"
+  done
+  if [[ -n "$NON_EMPTY_APP_DESC" ]]; then
+    err "$NON_EMPTY_APP_DESC"
+  fi
+  OTHER_DB_LIST="$(IFS=', '; printf '%s' "${NON_EMPTY_OTHER_DBS[*]}")"
+  err "这个 PostgreSQL 实例里还有其他数据库（${OTHER_DB_LIST}），backup.sh 只备份 ${CFG_DB_NAME}。请先自行备份这些库，确认不再需要后再按手册清空实例（参见 ${MANUAL_OVERWRITE_REF}）。"
+  exit 1
+fi
+
+if [[ -n "$NON_EMPTY_APP_DESC" ]]; then
+  err "$NON_EMPTY_APP_DESC"
+  print_non_empty_manual_hint
+  exit 1
+fi
 
 if (( ${#CHECKED_DBS[@]} == 0 )); then
   err "pg_database returned zero non-template databases; refusing restore."
@@ -871,12 +917,12 @@ def _env(primary: str, *fallbacks: str, default: str = "") -> str:
             return val
     return default
 
-endpoint = _env("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL", "STORAGE_ENDPOINT_URL", default="http://minio:9000").rstrip("/")
-minio_init_bucket = _env("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME", "STORAGE_BUCKET_NAME", default="chat-uploads")
-access_key = _env("DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID", "MINIO_ROOT_USER", "STORAGE_ACCESS_KEY_ID")
-secret_key = _env("DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY", "MINIO_ROOT_PASSWORD", "STORAGE_SECRET_ACCESS_KEY")
-region = _env("DALTON_CHAT_UPLOAD_STORAGE_REGION", "STORAGE_REGION", default="us-east-1")
-addressing_style = _env("DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE", "STORAGE_ADDRESSING_STYLE", default="path").lower()
+endpoint = _env("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL", "DALTON_ASR_STORAGE_ENDPOINT_URL", "STORAGE_ENDPOINT_URL", "S3_ENDPOINT_URL", default="http://minio:9000").rstrip("/")
+minio_init_bucket = _env("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME", "DALTON_ASR_STORAGE_BUCKET_NAME", "STORAGE_BUCKET_NAME", "S3_BUCKET_NAME", default="chat-uploads")
+access_key = _env("DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID", "DALTON_ASR_STORAGE_ACCESS_KEY_ID", "MINIO_ROOT_USER", "STORAGE_ACCESS_KEY_ID", "S3_ACCESS_KEY_ID")
+secret_key = _env("DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY", "DALTON_ASR_STORAGE_SECRET_ACCESS_KEY", "MINIO_ROOT_PASSWORD", "STORAGE_SECRET_ACCESS_KEY", "S3_SECRET_ACCESS_KEY")
+region = _env("DALTON_CHAT_UPLOAD_STORAGE_REGION", "DALTON_ASR_STORAGE_REGION", "STORAGE_REGION", "S3_REGION", default="us-east-1")
+addressing_style = _env("DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE", "DALTON_ASR_STORAGE_ADDRESSING_STYLE", "STORAGE_ADDRESSING_STYLE", default="path").lower()
 
 if not access_key or not secret_key:
     print("ERROR: MinIO credentials missing in container environment.", file=sys.stderr)
@@ -933,7 +979,7 @@ print("EMPTY")
 '
   set +e
   MINIO_PREFLIGHT_OUT="$(compose_cmd run --rm -T --no-deps \
-    minio-init uv run --no-sync python -c "$MINIO_PREFLIGHT_PY" 2>&1)"
+    backend uv run --no-sync python -c "$MINIO_PREFLIGHT_PY" 2>&1)"
   MINIO_PREFLIGHT_RC=$?
   set -e
   if [[ "$MINIO_PREFLIGHT_RC" -eq 10 ]]; then
@@ -995,11 +1041,11 @@ def _env(primary: str, *fallbacks: str, default: str = "") -> str:
             return val
     return default
 
-endpoint = _env("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL", "STORAGE_ENDPOINT_URL", default="http://minio:9000").rstrip("/")
-access_key = _env("DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID", "MINIO_ROOT_USER", "STORAGE_ACCESS_KEY_ID")
-secret_key = _env("DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY", "MINIO_ROOT_PASSWORD", "STORAGE_SECRET_ACCESS_KEY")
-region = _env("DALTON_CHAT_UPLOAD_STORAGE_REGION", "STORAGE_REGION", default="us-east-1")
-addressing_style = _env("DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE", "STORAGE_ADDRESSING_STYLE", default="path").lower()
+endpoint = _env("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL", "DALTON_ASR_STORAGE_ENDPOINT_URL", "STORAGE_ENDPOINT_URL", "S3_ENDPOINT_URL", default="http://minio:9000").rstrip("/")
+access_key = _env("DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID", "DALTON_ASR_STORAGE_ACCESS_KEY_ID", "MINIO_ROOT_USER", "STORAGE_ACCESS_KEY_ID", "S3_ACCESS_KEY_ID")
+secret_key = _env("DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY", "DALTON_ASR_STORAGE_SECRET_ACCESS_KEY", "MINIO_ROOT_PASSWORD", "STORAGE_SECRET_ACCESS_KEY", "S3_SECRET_ACCESS_KEY")
+region = _env("DALTON_CHAT_UPLOAD_STORAGE_REGION", "DALTON_ASR_STORAGE_REGION", "STORAGE_REGION", "S3_REGION", default="us-east-1")
+addressing_style = _env("DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE", "DALTON_ASR_STORAGE_ADDRESSING_STYLE", "STORAGE_ADDRESSING_STYLE", default="path").lower()
 
 if not access_key or not secret_key:
     print("ERROR: MinIO credentials missing in container environment.", file=sys.stderr)
@@ -1210,7 +1256,7 @@ print(
     printf '%s\n' "$manifest_size"
     cat "$MINIO_MANIFEST_TMP"
     cat "${BACKUP_DIR}/minio-objects.tar.gz"
-  } | compose_cmd run --rm -T --no-deps minio-init uv run --no-sync python -c "$MINIO_RESTORE_PY"
+  } | compose_cmd run --rm -T --no-deps backend uv run --no-sync python -c "$MINIO_RESTORE_PY"
   ok "MinIO objects restored into original bucket(s) and verified."
 else
   info "4/7 Skipping MinIO restore."
@@ -1237,19 +1283,35 @@ info "Running migrations against '${CFG_DB_NAME}'..."
 compose_cmd run --rm migrate
 ok "Database '${CFG_DB_NAME}' migrated to current heads."
 
-# Verify every DB-referenced object exists in object storage; fail if any object is missing.
+# Verify every completed DB-referenced object exists in object storage; skip in-progress
+# 'uploading' records (incomplete at backup time) and report how many were skipped.
 if [[ "$SKIP_MINIO" -eq 0 && "$STORAGE_ANY_CONFIGURED" -eq 1 ]]; then
   DB_OBJ_REFS=""
+  SKIPPED_UPLOADING_COUNT=0
   has_chat_uploads="$(compose_cmd exec -T -e PGPASSWORD="$CFG_DB_PASSWORD" postgres \
     psql -h 127.0.0.1 -p 5432 -U "$CFG_DB_USER" -d "$CFG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc \
     "SELECT to_regclass('public.dalton_chat_file_uploads');" | tr -d '[:space:]')"
   if [[ -n "$has_chat_uploads" ]]; then
+    SKIPPED_UPLOADING_COUNT="$(compose_cmd exec -T -e PGPASSWORD="$CFG_DB_PASSWORD" postgres \
+      psql -h 127.0.0.1 -p 5432 -U "$CFG_DB_USER" -d "$CFG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "
+      SELECT COUNT(*)
+      FROM dalton_chat_file_uploads
+      WHERE cleaned_at IS NULL
+        AND state = 'uploading';
+    " | tr -d '[:space:]')"
+    if ! [[ "$SKIPPED_UPLOADING_COUNT" =~ ^[0-9]+$ ]]; then
+      err "Could not parse skipped 'uploading' record count (got '${SKIPPED_UPLOADING_COUNT}')."
+      exit 1
+    fi
+    if (( SKIPPED_UPLOADING_COUNT > 0 )); then
+      info "Skipping ${SKIPPED_UPLOADING_COUNT} in-progress 'uploading' chat upload record(s) during object reference verification (incomplete at backup time)."
+    fi
     DB_OBJ_REFS="$(compose_cmd exec -T -e PGPASSWORD="$CFG_DB_PASSWORD" postgres \
       psql -h 127.0.0.1 -p 5432 -U "$CFG_DB_USER" -d "$CFG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "
       SELECT 'chat_upload' || E'\t' || upload_id || E'\t' || object_key
       FROM dalton_chat_file_uploads
       WHERE cleaned_at IS NULL
-        AND state IN ('ready', 'completing', 'uploading')
+        AND state IN ('ready', 'completing')
         AND object_key IS NOT NULL AND object_key <> '';
     ")"
   fi
@@ -1267,6 +1329,8 @@ def _env(primary: str, *fallbacks: str, default: str = "") -> str:
         if val:
             return val
     return default
+
+skipped_uploading = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 0
 
 dedicated_ok = all(
     (os.getenv(k) or "").strip()
@@ -1337,12 +1401,15 @@ if missing:
     )
     sys.exit(1)
 else:
-    print(f"[restore] OK: All {checked} DB-referenced object(s) present in MinIO bucket {bucket!r}.")
+    print(
+        f"[restore] OK: All {checked} completed DB-referenced object(s) present in MinIO bucket {bucket!r} "
+        f"(skipped {skipped_uploading} in-progress \x27uploading\x27 record(s))."
+    )
 '
-    printf '%s\n' "$DB_OBJ_REFS" | compose_cmd run --rm -T --no-deps minio-init \
-      uv run --no-sync python -c "$MISSING_CHECK_PY"
+    printf '%s\n' "$DB_OBJ_REFS" | compose_cmd run --rm -T --no-deps backend \
+      uv run --no-sync python -c "$MISSING_CHECK_PY" "$SKIPPED_UPLOADING_COUNT"
   else
-    ok "No active DB object references to verify."
+    ok "No active completed DB object references to verify (skipped ${SKIPPED_UPLOADING_COUNT} in-progress 'uploading' record(s))."
   fi
 fi
 

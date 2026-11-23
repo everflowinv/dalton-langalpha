@@ -281,7 +281,7 @@ DALTON_OPERATOR_LLM_ENDPOINTS=https://llm-gateway.corp.internal/v1
 4. `.env` 密钥文件：传入 `--env-passphrase-file` 时使用 OpenSSL AES-256-CBC + PBKDF2（参数写入 `manifest.json`，整体完整性由 `SHA256SUMS` 校验）加密生成 `env.enc`。
 
 > **一致性与私钥保管边界**：
-> - **在线一致性窗口**：数据库 `postgres.dump` 是单一时刻的一致快照，MinIO 对象枚举紧随其后执行。在此窗口内被删除或写入尚未完成的对象可能缺失于对象归档中；恢复后若发现数据库引用了但对象存储中缺失的对象，`restore.sh` 会直接失败退出并提示在线备份的时间窗口。
+> - **在线一致性窗口与备份期对象核对**：数据库 `postgres.dump` 是单一时刻的一致快照，MinIO 对象枚举紧随其后执行。枚举完对象后，`backup.sh` 会立即核对数据库快照（`postgres.dump`）里所有**已完成**（非 `uploading`）的聊天上传记录，确认每一条的 `object_key` 都在本次对象归档里；只要有缺失，`backup.sh` 会直接失败、列出缺失的键并提示“可能是备份期间有清理任务运行，请重新备份”（不会发布不完整的备份目录）。对于备份时尚未完成的分片上传（状态为 `uploading` 的记录，本来就还没有最终对象），`backup.sh` 与 `restore.sh` 核对引用时都会跳过，`restore.sh` 会在输出中列出跳过了多少条；其他已完成记录在恢复后若仍有对象缺失，`restore.sh` 会直接失败退出并提示在线备份的时间窗口。
 > - **私钥保护**：`caddy-data.tar.gz` 包含 Caddy 的 TLS 私钥与内部 CA 私钥，同步至异地备份存储时请对整个备份目录采取加密与最小权限控制。使用 `custom` 模式时，请同时单独备份 `DALTON_TLS_CERT_DIR`。
 
 #### 准备执行账号、口令文件与备份目录（统一部署身份）
@@ -333,10 +333,10 @@ crontab -e
 
 v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不提供原地替换已有数据的路径）：
 1. 校验备份目录内的 `SHA256SUMS`、`manifest.json` 与对象归档清单；
-2. 准备目标 `.env`（**只读文件内容，不读 shell 环境变量**；解密 `env.enc` 产生的临时文件统一使用 `.env.tmp-*` 前缀，便于下次运行自动清理；传入 `--replace-env` 时对 `COMPOSE_PROJECT_NAME` 做**逐字比较**，不做规范化），在固定路径 `/tmp/dalton-<项目名>.restore.lock` 上加锁（优先使用 `flock`，无 `flock` 时退化为 `mkdir` 原子锁；不会按 PID 自动清理遗留锁，如遇残留锁需由管理员确认无并发恢复后手动删除），清理上次异常中断残留的 `.env.tmp-*`，并校验外部库拦截、数据库标识符、应用实际生效的单一对象存储约束（`--skip-minio` 仅在应用的确未配置任何对象存储时允许使用）、备份清单与目标 `.env` 的**桶名和键前缀一致性**（不一致即在写入任何数据前停止，提示先改 `.env` 让两者一致或使用 `--replace-env`）与 Compose 文件；
-3. 检查**整个目标 PostgreSQL 实例**与对象存储必须为空：使用目标/备份 `.env` 中的超级用户凭据经 TCP 连接 PostgreSQL（连不上或非超级用户直接拒绝并说明原因），通过 `pg_database` 列出全部非模板库（排除 `template0`、`template1`，包含 `postgres` 库在内），逐库检查非系统 schema 下 `pg_class` 全部关系及 `pg_proc` / `pg_type` 用户定义函数与类型，只要任意一个库不空即拒绝并指向下方"在已有实例上覆盖恢复"步骤；对象存储内不能有任何桶（或只能有 `minio_init` 刚创建、尚无任何对象的空桶）；同时用 `pg_restore --list` 校验备份文件。确认全部通过后，若配置来自 `env.enc`，再通过临时文件 `.env.tmp-*` + `chmod` + 原子 `mv` 写入正式 `.env`（即使在写入瞬间遭遇 `kill -9`，最多残留一个 `.env.tmp-*`，下次运行自动清理）；
+2. 准备目标 `.env`（**只读文件内容，不读 shell 环境变量**；解密 `env.enc` 产生的临时文件统一使用 `.env.tmp-*` 前缀，便于下次运行自动清理；传入 `--replace-env` 时对 `COMPOSE_PROJECT_NAME` 做**逐字比较**，不做规范化），在固定路径 `/tmp/dalton-<项目名>.restore.lock` 上加锁（优先使用 `flock`，无 `flock` 时退化为 `mkdir` 原子锁；不会按 PID 自动清理遗留锁，如遇残留锁需由管理员确认无并发恢复后手动删除），清理上次异常中断残留的 `.env.tmp-*`，校验外部库拦截、数据库标识符与 Compose 文件，并在写入任何数据之前通过 `docker compose -p <项目名> -f <文件>... --env-file <.env> config --format json` 取出 `backend` 服务**实际生效**的环境变量（`.env` 中的值只作为辅助参考，最终以 `compose config` 的结果为准），校验单一对象存储约束（`--skip-minio` 仅在 `backend` 实际未配置任何对象存储时允许使用）以及备份清单与 `backend` 实际配置在聊天上传、ASR、通用存储的**桶名、端点和键前缀一致性**（不一致即在写入任何数据前停止，提示修正 Compose 覆盖文件或先改 `.env` 让两者一致，或使用 `--replace-env`）；
+3. 检查**整个目标 PostgreSQL 实例**与对象存储必须为空：使用目标/备份 `.env` 中的超级用户凭据经 TCP 连接 PostgreSQL（连不上或非超级用户直接拒绝并说明原因），通过 `pg_database` 列出全部非模板库（排除 `template0`、`template1`，包含 `postgres` 库在内），逐库检查非系统 schema 下 `pg_class` 全部关系及 `pg_proc` / `pg_type` 用户定义函数与类型：如果只有应用库（`DB_NAME`）非空则拒绝并指向下方“在已有实例上覆盖恢复”步骤；如果应用库以外的数据库里有数据，由于 `backup.sh` 只备份 `DB_NAME`，脚本会列出这些库名并提示先自行备份、确认不再需要后再按手册清空实例（**不会**直接给出 `down -v` 命令）；对象存储内不能有任何桶（或只能有 `minio_init` 刚创建、尚无任何对象的空桶）；同时用 `pg_restore --list` 校验备份文件。确认全部通过后，若配置来自 `env.enc`，再通过临时文件 `.env.tmp-*` + `chmod` + 原子 `mv` 写入正式 `.env`（即使在写入瞬间遭遇 `kill -9`，最多残留一个 `.env.tmp-*`，下次运行自动清理）；
 4. 调用所有 `docker compose` 命令时均显式指定 `-p <项目名> -f <文件>... --env-file <.env>`，并提前通过 `env -u` 清除 `.env` 与编排文件中引用的键（及 `COMPOSE_PROJECT_NAME`、`COMPOSE_FILE`、`COMPOSE_PROFILES`），防止 shell 里导出的旧变量覆盖 `.env` 文件；
-5. 直接向正式对象存储的原桶名写入对象（流式上传并读回校验大小、SHA-256 与 `ContentType`），直接向正式数据库恢复 `postgres.dump` 并执行 `migrate`，再逐条核对数据库引用对象（若发现数据库引用了但对象存储缺失的对象，则直接失败退出并提示在线备份的时间窗口）；
+5. 通过 `backend` 服务实际生效的环境直接向正式对象存储的原桶名写入对象（流式上传并读回校验大小、SHA-256 与 `ContentType`），直接向正式数据库恢复 `postgres.dump` 并执行 `migrate`，再逐条核对数据库引用对象（跳过状态为 `uploading` 的未完成上传记录并在输出中列出跳过的条数；若已完成记录仍有对象缺失，则直接失败退出并提示在线备份的时间窗口）；
 6. 若 `.env` 来自备份则重建 `edge` 镜像（除非传入 `--skip-edge-build`），恢复 Caddy `/data`，最后启动全套服务并执行健康探测与双链版本核验。
 
 #### 空机恢复步骤
@@ -368,13 +368,20 @@ v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不�
 
 如果需要用备份覆盖已有数据的实例（包括升级执行数据库迁移后需要回滚到升级前状态），请按以下人工步骤依次操作（以下以部署目录 `/opt/dalton`、备份目录 `/var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3` 为例；启用 HTTPS 时在所有 `docker compose` 命令中一并加上 `-f deploy/standalone/docker-compose.tls.yml`，IPv6 回环加上 `-f deploy/standalone/docker-compose.tls.ipv6.yml`）：
 
-1. **确认有一份校验通过的备份**：检查 `backup.sh` 输出中是否包含 PostgreSQL、MinIO、Caddy 的 `OK: ... verified` 校验结果与 `== Backup Complete ==`，并在备份目录中重新核验 `SHA256SUMS`：
+1. **确认有一份校验通过的备份，并确认实例里只有应用库**：检查 `backup.sh` 输出中是否包含 PostgreSQL、MinIO、Caddy 的 `OK: ... verified` 校验结果与 `== Backup Complete ==`，并在备份目录中重新核验 `SHA256SUMS`：
    ```bash
    cd /var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3
    sha256sum -c SHA256SUMS
    cat manifest.json
    ```
-   确认全部文件返回 `OK`、`postgres.dump` 与 `minio-objects.tar.gz` 完整存在，且同期 `.env`（或 `env.enc` 与口令文件）可用；若打算保留当前 `.env`，请先核对 `manifest.json` 里的桶名与键前缀是否与 `.env` 一致。
+   确认全部文件返回 `OK`、`postgres.dump` 与 `minio-objects.tar.gz` 完整存在，且同期 `.env`（或 `env.enc` 与口令文件）可用；若打算保留当前 `.env`，请先核对 `manifest.json` 里的桶名、端点与键前缀是否与实际生效的 `backend` 配置一致。
+
+   **执行 `down -v` 之前，先确认 PostgreSQL 实例里只有应用库**（`backup.sh` 只备份 `.env` 里的 `DB_NAME`，而 `down -v` 会删除整个 PostgreSQL 数据卷；如果实例里还有其他业务数据库，请先自行备份并确认不再需要）：
+   ```bash
+   cd /opt/dalton
+   # <项目名> 从 .env 读取；若修改过 DB_USER，请将 postgres 替换为对应用户名
+   docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec -T postgres psql -U postgres -l
+   ```
 
 2. **从 `.env` 读取项目名，列出该项目下的完整卷清单并人工确认后，执行 `down -v` 删除本项目的卷**（仅删除当前项目的容器与数据卷，保留 `/opt/dalton/.env` 与发行文件）：
    ```bash

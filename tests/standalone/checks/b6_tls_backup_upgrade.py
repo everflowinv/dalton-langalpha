@@ -695,14 +695,39 @@ def seed_sentinel_data(ctx: _lib.ComposeContext) -> dict[str, str]:
     assert object_key, f"Could not resolve object_key for upload {upload_id}"
     bucket_name = ctx.env.get("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME") or "chat-uploads"
 
+    # Also initiate an in-progress multipart upload (state='uploading', no final MinIO object)
+    # to verify both backup.sh and restore.sh skip 'uploading' records and report the skipped count.
+    uploading_init = _lib.http_request(
+        "POST",
+        f"{ctx.edge_url}/api/v1/dalton/chat-uploads",
+        json_body={
+            "workspace_id": workspace_id,
+            "filename": "b6-in-progress-upload.txt",
+            "size_bytes": 64,
+            "mime_type": "text/plain",
+        },
+    )
+    assert uploading_init.status == 200, (
+        f"Initiate in-progress sentinel upload failed: {uploading_init.status} {uploading_init.text}"
+    )
+    uploading_id = uploading_init.json()["upload_id"]
+    uploading_state = ctx.psql_query(
+        f"SELECT state FROM dalton_chat_file_uploads WHERE upload_id = '{uploading_id}';"
+    )
+    assert uploading_state == "uploading", (
+        f"Expected in-progress upload {uploading_id} to have state='uploading', got {uploading_state!r}"
+    )
+
     log(
         f"Seeded sentinel workspace={workspace_id}, thread={thread_id} "
-        f"(replay_len={len(baseline_replay_text)}), upload={upload_id}, key={bucket_name}/{object_key}."
+        f"(replay_len={len(baseline_replay_text)}), upload={upload_id} (ready), "
+        f"uploading={uploading_id} (uploading), key={bucket_name}/{object_key}."
     )
     return {
         "workspace_id": workspace_id,
         "thread_id": thread_id,
         "upload_id": upload_id,
+        "uploading_id": uploading_id,
         "bucket": bucket_name,
         "object_key": object_key,
         "payload_sha": payload_sha,
@@ -1526,8 +1551,10 @@ def check_restore_on_clean_stack(
         ]
 
         try:
-            # 5a. Restore onto the brand-new empty stack (decrypting env.enc atomically)
-            _run_cmd(
+            # 5a. Restore onto the brand-new empty stack (decrypting env.enc atomically);
+            #     an in-progress 'uploading' record is present in the snapshot and MUST be
+            #     skipped with the skipped count reported while restore still succeeds.
+            restore_5a_proc = _run_cmd(
                 [
                     "bash",
                     str(restore_dir / "scripts" / "standalone" / "restore.sh"),
@@ -1545,6 +1572,10 @@ def check_restore_on_clean_stack(
                 env=restore_sh_env,
                 redact_env=ctx.env,
                 timeout=360,
+            )
+            restore_5a_stdout = restore_5a_proc.stdout or ""
+            assert "skipped 1" in restore_5a_stdout.lower() and "uploading" in restore_5a_stdout.lower(), (
+                f"Expected restore.sh to report skipping 1 'uploading' record, got stdout:\n{restore_5a_stdout[-1200:]}"
             )
             restored_env_file = restore_dir / ".env"
             assert restored_env_file.is_file(), "restore.sh did not write .env"
@@ -1747,6 +1778,45 @@ def check_restore_on_clean_stack(
                     os.chmod(restored_env_file, 0o600)
                 log("5d OK (bucket name mismatch in target .env refused before writing data).")
 
+                # 5d2. Effective backend Compose config guard: keeping .env bucket matching the backup
+                #      but adding an extra compose file that overrides `backend`'s bucket MUST be refused
+                #      before writing any data (compose config --format json is authoritative).
+                override_bucket = "overridden-backend-bucket-b6-ci"
+                override_compose = tmp_root / "docker-compose.override-backend-bucket.yml"
+                override_compose.write_text(
+                    "services:\n"
+                    "  backend:\n"
+                    "    environment:\n"
+                    f"      DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME: {override_bucket}\n",
+                    encoding="utf-8",
+                )
+                override_proc = _run_cmd(
+                    [
+                        "bash",
+                        str(restore_dir / "scripts" / "standalone" / "restore.sh"),
+                        "--backup-dir",
+                        str(restore_backup_dir),
+                        "--work-dir",
+                        str(restore_dir),
+                        "--compose-files",
+                        f"{restore_compose_files}:{override_compose}",
+                        "--skip-edge-build",
+                    ],
+                    cwd=restore_dir,
+                    env=restore_sh_env,
+                    check=False,
+                    redact_env=ctx.env,
+                    timeout=120,
+                )
+                assert override_proc.returncode != 0, (
+                    "restore.sh MUST refuse when an extra compose file overrides backend's bucket name!"
+                )
+                ov_stderr = override_proc.stderr or ""
+                assert override_bucket in ov_stderr and "bucket" in ov_stderr.lower(), (
+                    f"Compose-override bucket refusal should report {override_bucket!r}, got:\n{ov_stderr[-800:]}"
+                )
+                log("5d2 OK (extra compose file overriding backend bucket refused before writing data).")
+
                 # 5e. Whole-instance PostgreSQL empty guard: when target DB_NAME is empty,
                 #     another non-empty database in the same PostgreSQL instance MUST still
                 #     cause restore.sh to refuse and leave that database untouched.
@@ -1863,8 +1933,17 @@ def check_restore_on_clean_stack(
                     "restore.sh MUST refuse when another database in the same PostgreSQL instance has data!"
                 )
                 odb_stderr = other_db_proc.stderr or ""
-                assert other_db in odb_stderr and "STANDALONE-DEPLOY.md" in odb_stderr and "down -v" in odb_stderr, (
-                    f"Other-DB refusal stderr should name {other_db!r} and point to STANDALONE-DEPLOY.md (down -v), got:\n{odb_stderr[-800:]}"
+                assert other_db in odb_stderr, (
+                    f"Other-DB refusal stderr should name {other_db!r}, got:\n{odb_stderr[-800:]}"
+                )
+                assert ctx.db_name in odb_stderr and "backup.sh" in odb_stderr, (
+                    f"Other-DB refusal stderr should state backup.sh only backs up {ctx.db_name!r}, got:\n{odb_stderr[-800:]}"
+                )
+                assert "STANDALONE-DEPLOY.md" in odb_stderr, (
+                    f"Other-DB refusal stderr should reference STANDALONE-DEPLOY.md, got:\n{odb_stderr[-800:]}"
+                )
+                assert "down -v" not in odb_stderr, (
+                    f"Other-DB refusal stderr MUST NOT suggest 'down -v' when other databases contain data, got:\n{odb_stderr[-800:]}"
                 )
                 kept_val = subprocess.check_output(
                     [

@@ -441,6 +441,7 @@ PG_DUMP_BYTES="$(wc -c < "${STAGE_DIR}/postgres.dump" | tr -d ' ')"
 ALEMBIC_UPSTREAM="$(compose_cmd exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -Atqc "SELECT version_num FROM alembic_version;" 2>/dev/null | tr -d '\r\n' || true)"
 ALEMBIC_DALTON="$(compose_cmd exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -Atqc "SELECT version_num FROM alembic_version_dalton;" 2>/dev/null | tr -d '\r\n' || true)"
 
+PG_TOC=""
 PG_TOC_ENTRIES=0
 if [[ "$VERIFY" -eq 1 ]]; then
   PG_TOC="$(compose_cmd exec -T postgres pg_restore --list < "${STAGE_DIR}/postgres.dump")"
@@ -548,7 +549,22 @@ class _HashingStream:
 
 
 def _norm_ep(url: str) -> str:
-    return (url or "").strip().rstrip("/").lower()
+    raw = (url or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(raw)
+        if parts.username or parts.password:
+            host = parts.hostname or ""
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            netloc = f"{host}:{parts.port}" if parts.port else host
+            return urlunsplit((parts.scheme, netloc, parts.path, "", "")).rstrip("/").lower()
+    except Exception:
+        pass
+    return raw.lower()
 
 
 def _norm_prefix(raw: str) -> str:
@@ -839,7 +855,11 @@ with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz", format=tarfile.PAX_FOR
             "primary_bucket": default_bucket,
             "primary_key_prefix": default_key_prefix,
             "targets": {
-                name: {"bucket": t["bucket"], "key_prefix": t["key_prefix"]}
+                name: {
+                    "endpoint": t["endpoint"],
+                    "bucket": t["bucket"],
+                    "key_prefix": t["key_prefix"],
+                }
                 for name, t in runtime_targets.items()
             },
             "var_buckets": {k: v for k, v in configured_var_buckets.items() if v in buckets},
@@ -872,6 +892,28 @@ if [[ "$VERIFY" -eq 1 ]]; then
   ok "MinIO objects verified (${MINIO_BUCKET_COUNT} bucket(s), ${MINIO_OBJECT_COUNT} object(s), ${MINIO_TOTAL_BYTES} bytes)."
 else
   ok "MinIO objects archived (${MINIO_BUCKET_COUNT} bucket(s), ${MINIO_OBJECT_COUNT} object(s); verification skipped)."
+fi
+
+# Immediately verify every completed (non-'uploading') chat upload in the PostgreSQL snapshot
+# exists in the MinIO archive just enumerated; fail the backup if any object is missing.
+if [[ -z "$PG_TOC" ]]; then
+  PG_TOC="$(compose_cmd exec -T postgres pg_restore --list < "${STAGE_DIR}/postgres.dump")"
+fi
+if printf '%s\n' "$PG_TOC" | grep -Eq '^[[:space:]]*[0-9]+;[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+TABLE DATA[[:space:]]+public[[:space:]]+dalton_chat_file_uploads([[:space:]]|$)'; then
+  info "Verifying completed chat upload references in PostgreSQL snapshot against MinIO archive..."
+  CHAT_UPLOADS_COPY_TMP="${STAGE_DIR}/.chat-uploads-copy.sql"
+  if ! compose_cmd exec -T postgres pg_restore --data-only --schema=public --table=dalton_chat_file_uploads \
+      < "${STAGE_DIR}/postgres.dump" > "$CHAT_UPLOADS_COPY_TMP"; then
+    err "Failed to extract dalton_chat_file_uploads data from PostgreSQL snapshot for object verification."
+    exit 1
+  fi
+  if ! python3 "${SCRIPT_DIR}/storage_config.py" verify-backup-refs \
+      --copy-sql "$CHAT_UPLOADS_COPY_TMP" \
+      --minio-manifest "$MINIO_MANIFEST_FILE" \
+      --caller backup; then
+    exit 1
+  fi
+  rm -f "$CHAT_UPLOADS_COPY_TMP"
 fi
 
 # 3. Caddy certificate & PKI data backup (/data on edge)
