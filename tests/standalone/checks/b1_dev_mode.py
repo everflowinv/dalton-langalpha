@@ -347,8 +347,12 @@ def check_users_and_edge_header_stripping(ctx: _lib.ComposeContext) -> None:
     probe_ws_id = json.loads(ws_body)["workspace_id"]
     probe_tid = ctx.psql_query(
         f"""
-        INSERT INTO conversation_threads (workspace_id, user_id, title)
-        VALUES ('{probe_ws_id}', '{PROBE_EDGE_USER}', 'probe-replay-thread')
+        INSERT INTO conversation_threads
+            (workspace_id, user_id, title, current_status, thread_index)
+        SELECT '{probe_ws_id}', '{PROBE_EDGE_USER}', 'probe-replay-thread', 'completed',
+               COALESCE(MAX(thread_index), -1) + 1
+        FROM conversation_threads
+        WHERE workspace_id = '{probe_ws_id}'
         RETURNING conversation_thread_id;
         """
     )
