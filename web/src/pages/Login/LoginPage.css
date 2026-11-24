@@ -608,3 +608,15 @@
     padding: 2.5rem 1.5rem;
   }
 }
+
+/* DALTON-HOOK(mobile-web): let the split login page scroll cleanly within 100dvh / visual viewport on mobile */
+@media (max-width: 767px) {
+  .login-page--split {
+    padding-bottom: max(var(--login-frame-gap), env(safe-area-inset-bottom));
+  }
+
+  .login-page__frame {
+    min-height: 100%;
+    overflow: visible;
+  }
+}

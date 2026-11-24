@@ -226,6 +226,8 @@ function FilePanel({
 }: FilePanelProps): React.ReactElement {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
+  // DALTON-HOOK(mobile-web): only the currently visible mobile FilePanel elevates its own portaled overlays (hidden cached ChatViews stay at base z-index)
+  const mobileOverlayActive = isMobile && isActive !== false;
   const panelRef = useRef<HTMLDivElement>(null);
   // The tree waits for the measurement: rendered docked before it, a narrow
   // panel painted the column for a frame and then animated it shut.
@@ -277,6 +279,8 @@ function FilePanel({
   // A share has no workspace id of its own, so its bodies are scoped to this
   // mount: two shares open at once must not read each other's bytes.
   const mountId = useId();
+  // DALTON-HOOK(mobile-web): stable menu id linking per-row ⋯ buttons (aria-controls) to FileContextMenu
+  const contextMenuId = `${mountId}-file-menu`;
   const scope = workspaceId || `adapter:${mountId}`;
   const readers = useMemo(
     () => ({
@@ -356,6 +360,10 @@ function FilePanel({
 
   const { selectionTooltip, selectionComposing, beginReply, dismissSelection, contentWrapperRef, contextMenu, setContextMenu, handleEditorTextSelect, handleAddSelectionContext, askAboutWords } =
     useSelectionContext({ selectedFile, fileContent, onAddContext });
+  // DALTON-HOOK(mobile-web): switching chats hides this panel without a pointer press outside, so its open file menu closes here
+  useEffect(() => {
+    if (isActive === false) setContextMenu(null);
+  }, [isActive, setContextMenu]);
   const commentUi = useCommentUi(onAddContext ? askAboutWords : null);
   // DALTON-HOOK(team-sharing): no comment layer, docked comment box or publish
   // entry beside a read-only thread (teamReadOnly covers a colleague's
@@ -618,14 +626,25 @@ function FilePanel({
     selectedFile ? workspaceDownloadKey(workspaceId, selectedFile) : null,
   );
   const contextMenuDownloadState = useDownloadState(
-    contextMenu ? workspaceDownloadKey(workspaceId, contextMenu.filePath) : null,
+    contextMenu && contextMenu.kind !== 'dir' ? workspaceDownloadKey(workspaceId, contextMenu.filePath) : null,
   );
   const handleDownloadSelected = canDownload && selectedFile ? () => downloads.download(selectedFile) : undefined;
   const handleDownloadInFallback = canDownload && selectedFile ? () => downloads.downloadQuietly(selectedFile) : undefined;
 
   const handleContextMenuAction = useCallback((action: FileMenuAction, filePath: string) => {
+    const dirFiles = contextMenu?.dirFiles ?? [];
     setContextMenu(null);
-    if (action === 'add-context' && onAddContext) {
+    // DALTON-HOOK(mobile-web): handle directory-row menu actions (expand/collapse, select folder files, download folder files)
+    if (action === 'toggle-dir') {
+      filter.toggleDir(filePath);
+    } else if (action === 'select-dir') {
+      if (!readOnly && dirFiles.length > 0) {
+        selection.setSelectMode(true);
+        selection.toggleDirSelect(dirFiles);
+      }
+    } else if (action === 'download-dir') {
+      if (canDownload && dirFiles.length > 0) void downloads.downloadMany(dirFiles);
+    } else if (action === 'add-context' && onAddContext) {
       tabs.openFile(filePath, { pin: true });
       onAddContext({ kind: 'file', path: filePath });
     } else if (action === 'add-to-memo') {
@@ -640,7 +659,7 @@ function FilePanel({
     } else if (action === 'download-many') {
       void downloads.downloadMany([...selection.selectedPaths]);
     }
-  }, [onAddContext, teamReadOnly, handleAddToMemo, openFileAt, downloads, selection.selectedPaths, setContextMenu, tabs]);
+  }, [contextMenu, filter, readOnly, canDownload, onAddContext, teamReadOnly, handleAddToMemo, openFileAt, downloads, selection, setContextMenu, tabs]);
 
   /**
    * Coming back to a tab whose file the agent has rewritten re-reads it. The
@@ -1043,13 +1062,15 @@ function FilePanel({
           <div className="file-panel-viewer">
             {/* font-content only while reading a file: the tree stays on the UI font. */}
             <div className={`file-panel-content${selectedFile ? ' font-content' : ''}`} ref={contentWrapperRef}>
-              <ImageReply surfaceRef={contentWrapperRef} enabled={!!onAddContext && isActive !== false} paused={!!selectionTooltip || commentUi.modeTab === activeTab.id} agentName={agentName} onAddContext={onAddContext} />
+              {/* DALTON-HOOK(mobile-web): tag portaled ImageReply and SelectionQuote with mobileOverlayActive so only this active mobile FilePanel's overlays elevate */}
+              <ImageReply surfaceRef={contentWrapperRef} enabled={!!onAddContext && isActive !== false} paused={!!selectionTooltip || commentUi.modeTab === activeTab.id} mobileOverlay={mobileOverlayActive} agentName={agentName} onAddContext={onAddContext} />
               {selectionTooltip && selectedFile && (
                 <SelectionQuote
                   key={selectionTooltip.id}
                   anchor={selectionTooltip}
                   composing={selectionComposing}
                   hidden={!onAddContext || isActive === false}
+                  mobileOverlay={mobileOverlayActive}
                   boundsRef={contentWrapperRef}
                   label={t('context.quote.from', { name: selectionSourceName(selectionTooltip.path ?? selectedFile, selectionTooltip) })}
                   placeholder={agentName ? t('context.quote.reply', { name: agentName }) : t('context.quote.replyGeneric')}
@@ -1150,6 +1171,8 @@ function FilePanel({
               onAddContext={onAddContext}
               setContextMenu={setContextMenu}
               activeContextPath={contextMenu?.filePath ?? null}
+              // DALTON-HOOK(mobile-web): link per-row ⋯ buttons to FileContextMenu via aria-controls
+              contextMenuId={contextMenuId}
               readOnly={readOnly}
               uploadDisabled={uploadProgress !== null || uploadSaving}
               onUpload={() => fileInputRef.current?.click()}
@@ -1172,19 +1195,24 @@ function FilePanel({
       {/* DALTON-HOOK(multi-file-upload): multi-select picker */}
       <input ref={fileInputRef} type="file" multiple className="hidden" onChange={handleFileInputChange} />
 
-      {contextMenu && (
+      {/* DALTON-HOOK(mobile-web): a cached, hidden panel never shows its file menu over another chat */}
+      {contextMenu && isActive !== false && (
         <FileContextMenu
+          // DALTON-HOOK(mobile-web): stable menu id and directory select capability
+          id={contextMenuId}
           menu={contextMenu}
           onAction={handleContextMenuAction}
           onClose={() => setContextMenu(null)}
           canAddContext={!!onAddContext}
           // DALTON-HOOK(team-sharing): hide Add to Memo in colleague mirror mode
-          memoState={!teamReadOnly && memos && memoMimeForName(contextMenu.filePath)
+          memoState={contextMenu.kind !== 'dir' && !teamReadOnly && memos && memoMimeForName(contextMenu.filePath)
             ? (memoedMap.has(contextMenu.filePath) ? 'present' : 'absent')
             : null}
           canDownload={canDownload}
+          canSelectDir={!readOnly}
+          mobileOverlay={mobileOverlayActive}
           downloadState={contextMenuDownloadState}
-          selectedCount={selection.selectedPaths.has(contextMenu.filePath) ? selection.selectedPaths.size : 0}
+          selectedCount={contextMenu.kind !== 'dir' && selection.selectedPaths.has(contextMenu.filePath) ? selection.selectedPaths.size : 0}
         />
       )}
 

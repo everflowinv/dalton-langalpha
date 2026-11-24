@@ -95,6 +95,9 @@
     "copyAddress": "复制网址",
     "heldNote": "浏览器由你控制，交还后 Agent 才会继续。",
     "heldKeys": "按 Shift+Esc 交还控制",
+    "keyboard": "键盘",
+    "showKeyboard": "呼出键盘",
+    "hideKeyboard": "收起键盘",
     "agent": "Agent",
     "doing": {
       "opening": "正在打开 {{detail}}",
@@ -197,6 +200,8 @@
   "exitFullscreen": "退出全屏",
   "downloadAsHtml": "下载为 HTML",
   "moreActions": "更多操作",
+  "expandFolder": "展开",
+  "collapseFolder": "收起",
   "viewSource": "查看源代码",
   "viewPreview": "查看页面",
   "htmlPreviewFailed": "无法加载预览。",

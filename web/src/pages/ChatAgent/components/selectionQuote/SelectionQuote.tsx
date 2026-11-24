@@ -32,7 +32,7 @@ function useOutsidePress(onPress: () => void, enabled = true) {
 }
 
 export function SelectionToolbar<A extends TextAnchor>({
-  anchor, boundsRef, place, label, addLabel, asks = false, onReply, onAdd, onComment, onLost,
+  anchor, boundsRef, place, label, addLabel, asks = false, mobileOverlay = false, onReply, onAdd, onComment, onLost,
 }: {
   anchor: A;
   boundsRef: RefObject<HTMLElement | null>;
@@ -41,6 +41,8 @@ export function SelectionToolbar<A extends TextAnchor>({
   addLabel: string;
   /** The reply is a question in the chat about words outside it (a file's), named so beside Comment. */
   asks?: boolean;
+  // DALTON-HOOK(mobile-web): mark overlays belonging to the active mobile full-screen FilePanel for z-index scoping
+  mobileOverlay?: boolean;
   onReply: () => void;
   onAdd: () => void;
   /** Opens a comment box on the words, where the viewer takes comments. */
@@ -63,6 +65,8 @@ export function SelectionToolbar<A extends TextAnchor>({
     <div
       ref={ref}
       {...surfaceProps}
+      // DALTON-HOOK(mobile-web): scope z-index elevation strictly to the active mobile FilePanel instance
+      data-mobile-overlay-active={mobileOverlay ? '' : undefined}
       role="toolbar"
       aria-label={label}
       className="selection-quote-toolbar pop-in"
@@ -124,7 +128,7 @@ export function SelectionToolbar<A extends TextAnchor>({
  * than sending, so several quotes can go out together. Portaled because both
  * surfaces clip, and fixed so it can follow the selection across them.
  */
-export function QuoteComposer({ anchor, boundsRef, label, placeholder, hidden = false, onAdd, onDismiss }: {
+export function QuoteComposer({ anchor, boundsRef, label, placeholder, hidden = false, mobileOverlay = false, onAdd, onDismiss }: {
   anchor: QuoteAnchor;
   /** The surface the popover stays inside. */
   boundsRef: RefObject<HTMLElement | null>;
@@ -133,6 +137,8 @@ export function QuoteComposer({ anchor, boundsRef, label, placeholder, hidden = 
   placeholder: string;
   /** Out of sight for now, keeping what was written. */
   hidden?: boolean;
+  // DALTON-HOOK(mobile-web): mark overlays belonging to the active mobile full-screen FilePanel for z-index scoping
+  mobileOverlay?: boolean;
   onAdd: (reply?: string) => void;
   onDismiss: () => void;
 }) {
@@ -182,6 +188,8 @@ export function QuoteComposer({ anchor, boundsRef, label, placeholder, hidden = 
     <div
       ref={ref}
       {...surfaceProps}
+      // DALTON-HOOK(mobile-web): scope z-index elevation strictly to the active mobile FilePanel instance
+      data-mobile-overlay-active={mobileOverlay && !hidden ? '' : undefined}
       role="dialog"
       aria-label={label}
       className="selection-quote-popover owns-its-edge pop-in"
@@ -243,12 +251,14 @@ export function QuoteComposer({ anchor, boundsRef, label, placeholder, hidden = 
 
 /** The floating controls for a text selection: a small toolbar over the text, then the reply popover. */
 export function SelectionQuote({
-  anchor, composing, hidden = false, boundsRef, label, placeholder, addLabel, asks, onReply, onAdd, onComment, onDismiss,
+  anchor, composing, hidden = false, mobileOverlay = false, boundsRef, label, placeholder, addLabel, asks, onReply, onAdd, onComment, onDismiss,
 }: {
   anchor: TextAnchor;
   composing: boolean;
   /** The surface can't take a quote just now. A menu goes; a reply being written waits. */
   hidden?: boolean;
+  // DALTON-HOOK(mobile-web): mark overlays belonging to the active mobile full-screen FilePanel for z-index scoping
+  mobileOverlay?: boolean;
   /** The surface the controls stay inside. */
   boundsRef: RefObject<HTMLElement | null>;
   /** The popover's accessible name, saying where the quote is from. */
@@ -284,7 +294,8 @@ export function SelectionQuote({
   }, [followsSelection]);
 
   if (composing) {
-    return <QuoteComposer anchor={anchor} boundsRef={boundsRef} label={label} placeholder={placeholder} hidden={hidden} onAdd={onAdd} onDismiss={onDismiss} />;
+    // DALTON-HOOK(mobile-web): forward active mobile FilePanel marker to portaled composer/toolbar
+    return <QuoteComposer anchor={anchor} boundsRef={boundsRef} label={label} placeholder={placeholder} hidden={hidden} mobileOverlay={mobileOverlay} onAdd={onAdd} onDismiss={onDismiss} />;
   }
   if (hidden) return null;
   return (
@@ -295,6 +306,7 @@ export function SelectionQuote({
       label={t('context.quote.toolbar')}
       addLabel={addLabel}
       asks={asks}
+      mobileOverlay={mobileOverlay}
       onReply={onReply}
       onAdd={() => onAdd()}
       onComment={onComment}

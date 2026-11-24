@@ -5,6 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { BrandMark } from '@/components/brand/BrandMark';
 import { BRAND_NAME } from '@/config/brand';
 import { resolveDaltonLoginEmail } from '@/config/daltonAuth';
+import { APP_ENTRY_PATH } from '@/config/hostMode';
 import { Input } from '@/components/ui/input';
 import { useAuth } from '@/contexts/AuthContext';
 import { queryKeys } from '@/lib/queryKeys';
@@ -13,6 +14,7 @@ import {
   checkDaltonInviteToken,
   redeemDaltonInviteToken,
 } from '@/pages/Settings/utils/daltonApi';
+import '@/pages/Login/AuthPage.css';
 import '@/pages/Login/LoginPage.css';
 
 const USERNAME_RE = /^[a-z0-9._-]{3,32}$/;
@@ -118,7 +120,7 @@ export default function InviteRedeemPage() {
   };
 
   return (
-    <div className="login-page">
+    <div className="login-page owns-its-edge">
       <div className="login-page__card">
         <div className="login-page__card-header">
           <BrandMark className="login-page__logo-icon" />
@@ -137,7 +139,7 @@ export default function InviteRedeemPage() {
             <button
               type="button"
               className="login-page__back"
-              onClick={() => navigate('/login', { replace: true })}
+              onClick={() => navigate(APP_ENTRY_PATH, { replace: true })}
             >
               {t('auth.backToLogin')}
             </button>

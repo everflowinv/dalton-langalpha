@@ -48,6 +48,8 @@ export interface TreeColumnProps {
   onAddContext: ((ctx: ContextPayload) => void) | null;
   setContextMenu: (menu: ContextMenuData | null) => void;
   activeContextPath: string | null;
+  // DALTON-HOOK(mobile-web): menu element id for per-row aria-controls wiring
+  contextMenuId?: string;
 
   /** Dev servers the agent started in this workspace, in port order. */
   previews: PreviewEntry[];
@@ -450,6 +452,9 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
                 onAddContext={props.onAddContext}
                 setContextMenu={props.setContextMenu}
                 activeContextPath={props.activeContextPath}
+                // DALTON-HOOK(mobile-web): localized label and menu id for accessible per-row menu triggers
+                moreActionsLabel={t('filePanel:moreActions')}
+                contextMenuId={props.contextMenuId}
               />
             ))
           )}

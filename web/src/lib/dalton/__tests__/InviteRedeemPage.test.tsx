@@ -101,6 +101,25 @@ describe('InviteRedeemPage & LoginPage username completion', () => {
     replaceStateSpy.mockRestore();
   });
 
+  it('navigates to APP_ENTRY_PATH rather than /login when clicking back from an invalid invite', async () => {
+    h.checkDaltonInviteToken.mockResolvedValue({ valid: false, reason: 'expired' });
+
+    renderWithProviders(
+      <MemoryRouter initialEntries={['/invite#tok-bad']}>
+        <Routes>
+          <Route path="/invite" element={<InviteRedeemPage />} />
+          <Route path="/" element={<div data-testid="app-entry">Entry</div>} />
+          <Route path="/login" element={<div data-testid="legacy-login">Legacy</div>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    const backBtn = await screen.findByRole('button', { name: /返回登录|Back to sign in|Back to login/i });
+    fireEvent.click(backBtn);
+    expect(await screen.findByTestId('app-entry')).toBeInTheDocument();
+    expect(screen.queryByTestId('legacy-login')).not.toBeInTheDocument();
+  });
+
   it('renders registration form when invite is valid, validates inputs, redeems via POST body, and auto-logs in', async () => {
     h.checkDaltonInviteToken.mockResolvedValue({ valid: true, reason: null });
     h.redeemDaltonInviteToken.mockResolvedValue({

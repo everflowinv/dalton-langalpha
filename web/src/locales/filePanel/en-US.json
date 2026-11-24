@@ -99,6 +99,9 @@
     "copyAddress": "Copy address",
     "heldNote": "You have the browser. The agent waits until you hand it back.",
     "heldKeys": "Shift+Esc to hand back",
+    "keyboard": "Keyboard",
+    "showKeyboard": "Show keyboard",
+    "hideKeyboard": "Hide keyboard",
     "agent": "Agent",
     "doing": {
       "opening": "Opening {{detail}}",
@@ -204,6 +207,8 @@
   "exitFullscreen": "Exit fullscreen",
   "downloadAsHtml": "Download as HTML",
   "moreActions": "More actions",
+  "expandFolder": "Expand",
+  "collapseFolder": "Collapse",
   "viewSource": "View source",
   "viewPreview": "View page",
   "htmlPreviewFailed": "Couldn't load the preview.",

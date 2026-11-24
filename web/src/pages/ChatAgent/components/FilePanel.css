@@ -560,6 +560,11 @@
     .mobile-panel-overlay .file-panel-tree-list {
       padding-bottom: env(safe-area-inset-bottom, 0px);
     }
+
+    /* DALTON-HOOK(mobile-web): lift portaled file tree context menu only for an active mobile FilePanel instance */
+    .file-panel-context-menu[data-mobile-overlay-active] {
+      z-index: 1030;
+    }
   }
 /* A reference's target inside the open file. The tint is annotation, so it
    stays flat amber on the target; arrival fades it in once from a stronger mix. */

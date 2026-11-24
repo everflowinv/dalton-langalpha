@@ -235,3 +235,23 @@
   display: block;
   pointer-events: none;
 }
+
+/* DALTON-HOOK(mobile-web): allow standalone auth pages to scroll vertically on mobile and follow visualViewport height + offsetTop */
+@media (max-width: 767px) {
+  .login-page {
+    top: var(--visual-viewport-offset-top, 0px);
+    height: var(--visual-viewport-height, 100dvh);
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: contain;
+    align-items: flex-start;
+    padding-bottom: max(1.5rem, env(safe-area-inset-bottom));
+  }
+
+  .login-page__card {
+    margin-top: auto;
+    margin-bottom: auto;
+  }
+}
