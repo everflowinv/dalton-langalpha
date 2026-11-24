@@ -14,7 +14,7 @@ from typing import Any
 SKILL_DIR = Path(__file__).resolve().parents[1]
 SEED_ARCHIVE = SKILL_DIR / "data" / "seed.tar.gz"
 STATE_SUBDIR = Path("state") / "dalton-bdc-analyst"
-DEFAULT_EDGAR_IDENTITY = "DaltonResearch research@everflowinv.com"
+DEFAULT_EDGAR_IDENTITY = "DaltonResearch sec-contact@example.com"
 
 
 def resolve_sec_identity() -> tuple[str, str]:

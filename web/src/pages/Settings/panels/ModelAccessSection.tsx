@@ -8,6 +8,9 @@ import { SkeletonBar } from '@/components/ui/skeleton';
 import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(team-credentials): team-shared credentials hint & PM disconnect guard
 import { isDaltonAuth } from '@/config/daltonAuth';
+// DALTON-HOOK(standalone-core): gate subscription section & connect button on native_oauth_sync in Core builds only
+import { isCoreProfileBuild } from '@/config/brand';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { TEAM_SHARED_CREDENTIALS_HINT, useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { formatUnitList } from '@/lib/format';
 import { useConfiguredProviders, type ConfiguredProvider } from '@/hooks/useConfiguredProviders';
@@ -163,8 +166,11 @@ export function ModelAccessSection({
   // A rule may keep the user's own keys or sign-ins off: what they saved
   // stays listed, unused and removable, and nothing new can be added.
   const { policy } = useAccount();
+  // DALTON-HOOK(standalone-core): gate subscription group and connect-subscription button only in Core builds when native_oauth_sync is off
+  const { hasCapability } = useCapabilities();
+  const nativeOAuthEnabled = !(isCoreProfileBuild && !hasCapability('native_oauth_sync'));
   const ownKeys = allows(policy, RULE.ownApiKeys);
-  const ownSubscriptions = allows(policy, RULE.ownSubscriptions);
+  const ownSubscriptions = allows(policy, RULE.ownSubscriptions) && nativeOAuthEnabled;
   const [opened, setSheet] = useState<Sheet | null>(null);
   const [removing, setRemoving] = useState<ConfiguredProvider | null>(null);
   const [removingToken, setRemovingToken] = useState<TokenTarget | null>(null);
@@ -224,7 +230,10 @@ export function ModelAccessSection({
   const [keyFilter, setKeyFilter] = useState<KeyFilter>(NO_FILTER);
 
   const subscriptionRows = providers.filter((p) => p.access_type === 'oauth' || p.access_type === 'coding_plan');
-  const keyRows = providers.filter((p) => p.access_type === 'api_key');
+  // DALTON-HOOK(standalone-core): keep configured API-key coding plans visible in the API keys section when Core hides OAuth subscriptions
+  const keyRows = providers.filter(
+    (p) => p.access_type === 'api_key' || (!nativeOAuthEnabled && p.access_type === 'coding_plan'),
+  );
   const localRows = providers.filter((p) => p.access_type === 'local');
 
   // The key form opens on the region a key is saved for, and offers the rest.
@@ -372,6 +381,8 @@ export function ModelAccessSection({
         </p>
       )}
 
+      {/* DALTON-HOOK(standalone-core): hide Subscriptions group when native_oauth_sync is disabled */}
+      {nativeOAuthEnabled && (
       <SummaryTable on={!!summary && showPersonalClaudeCode}>
       <Group subgrid={!!summary && showPersonalClaudeCode} title={t('modelAccess.subscriptions')} empty={statusLoading ? '' : statusError ? t('modelAccess.status.unknownLong') : t('modelAccess.noneSubscriptions')}>
         {[
@@ -416,6 +427,7 @@ export function ModelAccessSection({
         ]}
       </Group>
       </SummaryTable>
+      )}
 
       {effectivePersonalOnly && claudeCodeOffered && !(setup?.on || tokenRows.length > 0) && (
         <div className="flex flex-wrap gap-2">
@@ -502,10 +514,12 @@ export function ModelAccessSection({
           {sheet.kind === 'pick-subscription' && (
             <SubscriptionChoices
               planGroups={planGroups}
+              signIns={nativeOAuthEnabled}
               configured={configuredSet}
               onPickSignIn={(p) => setSheet(configuredSet.has(p) ? { kind: 'manage', provider: p, from: 'list' } : { kind: 'connect-subscription', provider: p })}
               onPickPlan={pickKeyGroup('pick-subscription')}
-              claudeCode={claudeCodeChoice(setup, setupUnread, () => setSheet({ kind: 'claude-code' }))}
+              // DALTON-HOOK(standalone-core): omit OAuth sign-ins & Claude Code when Core hides native OAuth
+              claudeCode={nativeOAuthEnabled ? claudeCodeChoice(setup, setupUnread, () => setSheet({ kind: 'claude-code' })) : undefined}
             />
           )}
           {sheet.kind === 'connect-subscription' && (

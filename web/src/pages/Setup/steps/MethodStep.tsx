@@ -21,7 +21,9 @@ import type { AccessType } from '@/components/model/types';
 import type { AccountPolicy } from '@/types/api';
 import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(dalton-setup): omit Claude Code recommendation and gate skip on live Dalton team-model availability
-import { isDaltonBuild } from '@/config/brand';
+// DALTON-HOOK(standalone-core): hide OAuth subscription option & brand marks only in Core builds when native_oauth_sync is disabled
+import { isCoreProfileBuild, isDaltonBuild } from '@/config/brand';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { FlowFailure } from '@/components/modelAccess/parts';
 import { RowButton, StepLoadFailed } from '../answers/parts';
 import { useDaltonTeamModels } from '../answers/useTeamModels';
@@ -162,8 +164,9 @@ function ConnectedSummary({
 }
 
 /** The ways to connect no rule keeps off. */
-function allowedMethods(policy: AccountPolicy | null) {
-  return METHODS.filter((m) => methodAllowed(policy, m.id));
+// DALTON-HOOK(standalone-core): omit OAuth subscription login method when native_oauth_sync is disabled
+function allowedMethods(policy: AccountPolicy | null, nativeOAuthEnabled = true) {
+  return METHODS.filter((m) => (m.id !== 'oauth' || nativeOAuthEnabled) && methodAllowed(policy, m.id));
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +202,9 @@ export default function MethodStep() {
   // Ways a rule keeps off are not offered; `OwnAccessNote` says who keeps
   // them off.
   const { policy } = useAccount();
+  // DALTON-HOOK(standalone-core): gate OAuth subscription choice only in Core builds when native_oauth_sync is off
+  const { hasCapability } = useCapabilities();
+  const nativeOAuthEnabled = !(isCoreProfileBuild && !hasCapability('native_oauth_sync'));
 
   // Invitation code state
   const [showInvitation, setShowInvitation] = useState(false);
@@ -330,7 +336,8 @@ export default function MethodStep() {
       {!teamManagedByAdmin && (
         <ul aria-labelledby={headingId} className="flex flex-col gap-2">
           {/* DALTON-HOOK(team-credentials) */}
-          {allowedMethods(policy).map((method) => (
+          {/* DALTON-HOOK(standalone-core): hide OAuth subscription row when native_oauth_sync is off */}
+          {allowedMethods(policy, nativeOAuthEnabled).map((method) => (
             <li key={method.id}>
               {/* DALTON-HOOK(team-credentials) */}
               <button

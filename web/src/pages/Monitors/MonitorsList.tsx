@@ -5,6 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { AlertTriangle, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ListEmpty, ListError, ListSkeleton, MetaText, SectionHeader, TagBadge } from '@/components/mcp/McpPrimitives';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { useLocale } from '@/hooks/useLocale';
 import { formatTimestamp } from '@/lib/format';
 import { queryKeys } from '@/lib/queryKeys';
@@ -18,6 +19,8 @@ import {
 export function MonitorsList(): React.ReactElement {
   const { t } = useTranslation();
   const locale = useLocale();
+  const { hasCapability, isLoading: capsLoading } = useCapabilities();
+  const dataJobsEnabled = hasCapability('data_jobs');
   const { data, isLoading, isError, isFetching, refetch } = useQuery<MonitorSummary[]>({
     queryKey: queryKeys.daltonMonitors.list(),
     queryFn: listMonitors,
@@ -28,13 +31,14 @@ export function MonitorsList(): React.ReactElement {
     const map = new Map<MonitorCategory, MonitorSummary[]>();
     for (const cat of MONITOR_CATEGORIES) map.set(cat, []);
     for (const item of data ?? []) {
+      if (!dataJobsEnabled && item.source_kind === 'data_job') continue;
       const cat = MONITOR_CATEGORIES.includes(item.category) ? item.category : 'other';
       map.get(cat)!.push(item);
     }
     return MONITOR_CATEGORIES
       .map((cat) => ({ category: cat, items: map.get(cat) ?? [] }))
       .filter((group) => group.items.length > 0);
-  }, [data]);
+  }, [data, dataJobsEnabled]);
 
   return (
     <div className="monitors-page">
@@ -62,7 +66,7 @@ export function MonitorsList(): React.ReactElement {
             </Button>
           </div>
 
-          {isLoading ? (
+          {isLoading || capsLoading ? (
             <ListSkeleton rows={4} />
           ) : isError ? (
             <ListError onRetry={() => void refetch()}>

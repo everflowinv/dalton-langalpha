@@ -54,7 +54,8 @@ Colleague-shared workspaces (the `colleague_workspaces` list from `manage_worksp
 ## 自动化任务与设置指引
 
 {# DALTON-HOOK(prompt-audit-text): Home task entry routing and on-demand settings map pointer #}
-个人自动化任务通过 `.agents/user/automations/` 下的 JSON 文件管理；受覆盖单元管理的任务不直接改文件——财报排期用 `dalton_schedule_automation`，标准覆盖跟踪用 `dalton_coverage_tracking`，公司公共数据任务用 `dalton_system_jobs`，运维任务只读。用户询问某项设置在哪里修改，或需确认研究总监（Chief of Staff）能否代改及页面路径时，先读取 `.agents/skills/langalpha-doc/references/settings-map.md`。
+{# DALTON-HOOK(standalone-core): gate company data/ops job guidance on data_jobs and researchdata_bridge capabilities #}
+个人自动化任务通过 `.agents/user/automations/` 下的 JSON 文件管理；受覆盖单元管理的任务不直接改文件——财报排期用 `dalton_schedule_automation`，标准覆盖跟踪用 `dalton_coverage_tracking`{% if data_jobs_enabled | default(false) %}，公司公共数据任务用 `dalton_system_jobs`{% endif %}{% if researchdata_bridge_enabled | default(false) %}，运维任务只读{% endif %}。用户询问某项设置在哪里修改，或需确认研究总监（Chief of Staff）能否代改及页面路径时，先读取 `.agents/skills/langalpha-doc/references/settings-map.md`。
 
 ## Keeping the user up to date
 

@@ -2,6 +2,9 @@ import { useMemo } from 'react';
 import { useQueries, useQuery, type UseQueryResult } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import { useApiKeys } from './useApiKeys';
+// DALTON-HOOK(standalone-core): skip subscription OAuth status queries only in Core builds when native_oauth_sync is disabled
+import { isCoreProfileBuild } from '@/config/brand';
+import { useCapabilities } from './useCapabilities';
 import {
   getOAuthStatus,
   SUBSCRIPTIONS,
@@ -56,8 +59,12 @@ function statusQuery(provider: SubscriptionProvider) {
 }
 
 /** One subscription's status, from the cache every surface that shows it shares. */
-export function useOAuthStatus(provider: SubscriptionProvider) {
-  return useQuery(statusQuery(provider));
+export function useOAuthStatus(
+  provider: SubscriptionProvider,
+  // DALTON-HOOK(standalone-core): allow callers to skip OAuth status queries when native_oauth_sync is disabled.
+  options?: { enabled?: boolean },
+) {
+  return useQuery({ ...statusQuery(provider), enabled: options?.enabled ?? true });
 }
 
 // Module scope, so useQueries reruns it only when a status changes.
@@ -78,8 +85,11 @@ const combineStatuses = (results: UseQueryResult<OAuthStatus>[]) => ({
  */
 export function useConfiguredProviders({ enabled = true }: { enabled?: boolean } = {}) {
   const { apiKeys, isLoading: keysLoading, isError: keysError } = useApiKeys({ enabled });
+  // DALTON-HOOK(standalone-core): do not query subscription OAuth endpoints in Core builds when native_oauth_sync is off
+  const { hasCapability } = useCapabilities({ enabled });
+  const oauthEnabled = enabled && !(isCoreProfileBuild && !hasCapability('native_oauth_sync'));
   const oauth = useQueries({
-    queries: SUBSCRIPTIONS.map((s) => ({ ...statusQuery(s.provider), enabled })),
+    queries: SUBSCRIPTIONS.map((s) => ({ ...statusQuery(s.provider), enabled: oauthEnabled })),
     combine: combineStatuses,
   });
   const { statuses } = oauth;
@@ -101,21 +111,23 @@ export function useConfiguredProviders({ enabled = true }: { enabled?: boolean }
       ...(p.tool_calling_models ? { tool_calling_models: p.tool_calling_models } : {}),
     });
     const keys = rows.filter((p) => !p.withdrawn).map(asConnection);
-    const subscriptions = SUBSCRIPTIONS.flatMap((s, i): ConfiguredProvider[] => {
-      const status = statuses[i];
-      if (!status?.connected) return [];
-      return [{
-        provider: s.provider,
-        display_name: s.name,
-        access_type: 'oauth',
-        plan_type: status.plan_type ?? null,
-        state: status.state,
-        email: status.email,
-        account_id: status.account_id,
-      }];
-    });
+    const subscriptions = oauthEnabled
+      ? SUBSCRIPTIONS.flatMap((s, i): ConfiguredProvider[] => {
+          const status = statuses[i];
+          if (!status?.connected) return [];
+          return [{
+            provider: s.provider,
+            display_name: s.name,
+            access_type: 'oauth',
+            plan_type: status.plan_type ?? null,
+            state: status.state,
+            email: status.email,
+            account_id: status.account_id,
+          }];
+        })
+      : [];
     return { providers: [...keys, ...subscriptions], withdrawn: rows.filter((p) => p.withdrawn).map(asConnection) };
-  }, [apiKeys, statuses]);
+  }, [apiKeys, statuses, oauthEnabled]);
 
   /** Set of configured provider keys for fast lookup */
   const configuredSet = useMemo(
@@ -135,14 +147,16 @@ export function useConfiguredProviders({ enabled = true }: { enabled?: boolean }
     hasAny: providers.some((p) => p.state === 'connected'),
     /** The account's BYOK switch: off, the server runs no turn on a stored key. */
     byokEnabled: (apiKeys as Record<string, unknown> | null)?.byok_enabled === true,
-    isLoading: keysLoading || oauth.isLoading,
+    // DALTON-HOOK(standalone-core): never surface OAuth loading/error state when native_oauth_sync is off
+    isLoading: keysLoading || (oauthEnabled && oauth.isLoading),
     /** The subscriptions' statuses are still being read. */
-    statusLoading: oauth.isLoading,
+    statusLoading: oauthEnabled && oauth.isLoading,
     /** A status not read yet, fetching or paused offline: what it holds is unknown. */
-    statusPending: oauth.isPending,
+    // DALTON-HOOK(standalone-core): a disabled OAuth query stays pending forever, so it reads as settled
+    statusPending: oauthEnabled && oauth.isPending,
     /** A status that could not be read; its row shows unknown, not disconnected. */
-    statusError: oauth.isError,
+    statusError: oauthEnabled && oauth.isError,
     /** The keys, or a subscription's status, never read: what is connected is unknown. */
-    unread: (keysError && !apiKeys) || oauth.unread,
+    unread: (keysError && !apiKeys) || (oauthEnabled && oauth.unread),
   };
 }

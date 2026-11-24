@@ -8,7 +8,7 @@
 
 ### 1. 一手证据优先级阶梯（Evidence Ladder）
 报告中所有实际财务与经营数字必须按以下优先级从高到低采信，在句末或表格单元格内标注 `[引用N]`，并在文末 `## 引用` 给出可定位的出处（文件、页码/表名/章节或电话会说话人）：
-1. 已提交的当季 **`10-Q` / `10-K`**（外国私人发行人 **`6-K` / `20-F`**；港股与 A 股为通过 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 获取的 **HKEX 披露易业绩公告/中报/年报与巨潮资讯法定定期报告**，港股若 `cn-hk filings` 未覆盖则用 `web_search` 查 `site:hkexnews.hk` 原文链接；`researchdata.finance(route="cn-hk", operation="ask", ...)` 平台财务表仅作二手初值线索，核心财务数字必须回法定公告原文核实）；
+1. 已提交的当季 **`10-Q` / `10-K`**（外国私人发行人 **`6-K` / `20-F`**；港股与 A 股为<!-- DALTON_CAP:researchdata_bridge -->通过 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 获取的 **HKEX 披露易业绩公告/中报/年报与巨潮资讯法定定期报告**，港股若 `cn-hk filings` 未覆盖则用 `web_search` 查 `site:hkexnews.hk` 原文链接；`researchdata.finance(route="cn-hk", operation="ask", ...)` 平台财务表仅作二手初值线索，核心财务数字必须回法定公告原文核实<!-- DALTON_CAP_ELSE -->通过 `web_search` 查披露易（`site:hkexnews.hk`）与巨潮资讯获取的 **HKEX 披露易业绩公告/中报/年报与法定定期报告**原文<!-- /DALTON_CAP -->）；
 2. 披露当季业绩的 **`8-K EX-99.1`** 及其财务附表（Financial Supplement）；
 3. 公司官方 **财报新闻稿（Earnings Release）**；
 4. 公司官方 **业绩演示 PPT（Investor Presentation）与预备发言稿（Prepared Remarks）**；
@@ -90,7 +90,7 @@
 - **`### 股价反应与市场预期差`**：
   - 由 `scripts/price_reaction.py` 生成财报后股价表现：盘后/盘前、次日（T+1）、一周（5 个交易日）的绝对涨跌幅与相对基准（`QQQ` / `SPY` / 板块 ETF，硬件股加 `SOXX`/`SMH`）超额涨跌幅，以及最新收盘价在**真实 252 个交易日（52 周）高低区间**中的位置（引用指向 `price_reaction.py` 证据文件，不指向模型单元格）；
   - 股价反应归因：结合当季超预期成色、指引修正、买方隐含预期门槛与持仓拥挤度解释股价波动，严禁拿股价涨跌直接代替基本面验证信号；
-  - 列出本季财报强化的**多头核心逻辑（3–5 条）**、暴露或未消除的**空头/担忧逻辑（3–5 条）**，以及财报发布至发布后 3 个交易日（T0 至 T+3）内主流卖方与独立研究（AlphaEngine / FUNDA AI / TMTB / 销售交易台笔记〔Sales Notes〕）的盈利预测与目标价修正。
+  - 列出本季财报强化的**多头核心逻辑（3–5 条）**、暴露或未消除的**空头/担忧逻辑（3–5 条）**，以及财报发布至发布后 3 个交易日（T0 至 T+3）内主流卖方与独立研究<!-- DALTON_CAP:alphaengine|researchdata_bridge -->（AlphaEngine / FUNDA AI / TMTB / 销售交易台笔记〔Sales Notes〕）<!-- /DALTON_CAP -->的盈利预测与目标价修正。
 - **`### 核心支柱校准、前瞻对账与管理层兑现结论`**：
   - **逐条对账表、支柱逐条校准表、历史指引逐条兑现表一律留在工作区 `research/<D>-deep-<quarter>/` 下的 `reconcile.md`、`thesis-calibration.md`、`management-delta.md` 内部文件中**；
   - 报告正文在此处**对三项各用一两句话写出结论**（不写 `P1`、`V-001` 等内部编号、英文枚举或内部文件名）：
@@ -121,4 +121,4 @@
 
 ### 6. `## 附注`（按需）与 `## 引用`
 - **`## 附注`**：集中放置财年与报表币种说明、Non-GAAP 与 GAAP 完整调节明细、净现金双口径说明、资产负债表与现金流量表补充明细（商誉与无形资产、长期采购承诺、并购现金支出、融资与偿债净额）、不同来源之间的数字分歧及采信依据，以及正文没有说明过的其余缺口、检索范围和失败原因（指标缺失使用 `未指引 / 未披露 / 材料未含 / 来源未获` 四词规范，渠道取数失败用一句人话写明原因；影响判断的缺口写在相关判断首次出现处，不进附注）。
-- **`## 引用`**：将资料来源与核验映射合并为文末单一 `## 引用` 节（每行一条：`[引用N]: <evidence:|model:|prov:|f:> （来源类型｜机构/作者｜标题｜日期｜文档 id / accession / 链接）`），完整覆盖本报告采用的每一份法定财报、公司 IR 材料、电话会纪要、内部研究库（AlphaEngine / FUNDA AI / TMTB / Sales Notes）、一致预期与行情快照及本方模型各个单独单元格。
+- **`## 引用`**：将资料来源与核验映射合并为文末单一 `## 引用` 节（每行一条：`[引用N]: <evidence:|model:|prov:|f:> （来源类型｜机构/作者｜标题｜日期｜文档 id / accession / 链接）`），完整覆盖本报告采用的每一份法定财报、公司 IR 材料、电话会纪要、<!-- DALTON_CAP:alphaengine|researchdata_bridge -->内部研究库（AlphaEngine / FUNDA AI / TMTB / Sales Notes）<!-- DALTON_CAP_ELSE -->公开卖方点评与独立研究<!-- /DALTON_CAP -->、一致预期与行情快照及本方模型各个单独单元格。

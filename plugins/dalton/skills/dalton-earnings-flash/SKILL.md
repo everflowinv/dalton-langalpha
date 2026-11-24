@@ -17,7 +17,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - 对照前瞻预测文件 `predictions.json` 给出 3–5 条初步核对结论；
 - 给出事件五词结论**初判**（写入 `verdicts.md`），并确保次日 T+1 深度链自动任务（`tp1`）就绪。
 
-> **注意**：快讯写入 `research/<D>-flash-<季度>.md` 并在对话中直接输出（外部通知由 Dalton 通知模块按用户的飞书开关统一处理），**不进 `drafts/`**，也不调 `publish_report`。多公司同日发布时，每家公司独立输出完整一块。
+> **注意**：快讯写入 `research/<D>-flash-<季度>.md` 并在对话中直接输出（外部通知由 Dalton 通知模块按用户的<!-- DALTON_CAP:channel_feishu -->飞书<!-- DALTON_CAP_ELSE -->通知<!-- /DALTON_CAP -->开关统一处理），**不进 `drafts/`**，也不调 `publish_report`。多公司同日发布时，每家公司独立输出完整一块。
 
 ---
 
@@ -27,29 +27,32 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - 核实最新发布的财年与财季标签（沿用公司自身命名，如 `FY26Q3`，严格区分财季与自然季）。
 - **先读事前冻结条目（`frozen_pre_event=true`）**：读取工作区 `data/debate.json`（`debate.md`）各分歧 `debates[].expectations[]` 中本次财报事件（`event_id`）对应的 `frozen_pre_event == true` 冻结条目，以及 `research/` 下最新的 `preview-<季度>/predictions.json`，锁定财报前已冻结的买方 bogey / 我方预期门槛与卖方一致预期。**严禁拿财报发布后（`published_at >= t0` 或 `acquired_at >= t0`）的卖方点评或 sales 邮件去倒推或改写事前预期门槛**；若财报前未冻结某项买方 bogey，写明“无事前冻结买方门槛”，只比较实际 vs Street。
 - 准备三组对比期间：**当季（Current Quarter）、上一季（Prior Quarter）、去年同期（Year-Ago Quarter）**。
-- 若美股正式 `10-Q` / `10-K` 尚未提交，使用财报 `8-K EX-99.1`（外国私人发行人用 `6-K` 业绩附件）；港股与 A 股使用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 调取的巨潮资讯（cninfo）定期报告/业绩公告或港交所披露易（HKEXnews）官方业绩公告，并在 `## 来源` 中明确注明。
+- 若美股正式 `10-Q` / `10-K` 尚未提交，使用财报 `8-K EX-99.1`（外国私人发行人用 `6-K` 业绩附件）；港股与 A 股使用<!-- DALTON_CAP:researchdata_bridge --> `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 调取的巨潮资讯（cninfo）定期报告/业绩公告或港交所披露易（HKEXnews）官方业绩公告<!-- DALTON_CAP_ELSE -->通过 `web_search` 检索港交所披露易（`site:hkexnews.hk`）或巨潮资讯（cninfo）获取的法定定期报告与官方业绩公告<!-- /DALTON_CAP -->，并在 `## 来源` 中明确注明。
 
 ### Step 2：一手披露先行（含上一季同比与上次指引）
-- **美股（含 ADR）**：通过 `dalton_sec.list_filings` / `researchdata.finance(route="sec")` 及公司 IR 页面获取当季财报新闻稿（Earnings Release）、财务补充表（Financial Supplement）和演示稿（Investor Presentation）。
-- **港股与 A 股（`route="cn-hk"`）**：
+- **美股（含 ADR）**：通过 `dalton_sec.list_filings`<!-- DALTON_CAP:researchdata_bridge --> / `researchdata.finance(route="sec")`<!-- /DALTON_CAP --> 及公司 IR 页面获取当季财报新闻稿（Earnings Release）、财务补充表（Financial Supplement）和演示稿（Investor Presentation）。
+<!-- DALTON_CAP:researchdata_bridge -->- **港股与 A 股（`route="cn-hk"`）**：
   1. 在 PTC 中调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=SEARCH_START, end=min(SEARCH_END, TODAY), limit=20)`（`end` 不得晚于当天 `TODAY`；港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`，不带 `.HK`/`.SS`/`.SZ` 后缀），获取当季及上一季的定期报告、业绩公告、业绩快报/预告原文与 `pdf_link`；若港股披露易（HKEXnews）公告未被 `cn-hk` 的 `filings` 覆盖，必须使用 `web_search` 检索披露易（`site:hkexnews.hk`）及公司 IR 页面并核对公告原文链接。
-  2. 可按单一意图分别调用 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 利润表", limit=20)`（港股查 `f"{code_or_name} 港股利润表"`）或 `query=f"{code_or_name} 业绩快报"` 提取平台财务摘要作为初值线索，但**所有核心财务数字与分部/KPI 数据必须回法定公告原文核实**，并严格核对报表币种（`CNY`/`HKD`/`USD`）与会计准则口径（IFRS / CAS / Non-IFRS）。
+  2. 可按单一意图分别调用 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 利润表", limit=20)`（港股查 `f"{code_or_name} 港股利润表"`）或 `query=f"{code_or_name} 业绩快报"` 提取平台财务摘要作为初值线索，但**所有核心财务数字与分部/KPI 数据必须回法定公告原文核实**，并严格核对报表币种（`CNY`/`HKD`/`USD`）与会计准则口径（IFRS / CAS / Non-IFRS）。<!-- DALTON_CAP_ELSE -->- **港股与 A 股**：
+  1. 通过 `web_search` 检索港交所披露易（`site:hkexnews.hk`）、巨潮资讯（cninfo）及公司 IR 页面，获取当季及上一季的定期报告、业绩公告或业绩快报原文链接。
+  2. **所有核心财务数字与分部/KPI 数据必须回法定公告原文核实**，并严格核对报表币种（`CNY`/`HKD`/`USD`）与会计准则口径（IFRS / CAS / Non-IFRS）。<!-- /DALTON_CAP -->
 - **强制调取上一季财报新闻稿、公告或电话会**：提取**上一季报告的同比增速（prior-quarter YoY）**与**上一季发布的本季/全年官方指引**。**严禁拿本季环比（QoQ）冒充“上一季同比增速”**，也严禁凭卖方转述代替上次官方指引。
 
 ### Step 3：电话会全文与 Q&A 提炼
-- 调用 `researchdata.research(route="transcript", ticker=T, limit=2)` 定位本次财报电话会（定位时必须核对每条候选的日期 `date`/`publish_time`、`kind`（区分官方业绩电话会 `company_call` 与券商回访 `broker_callback`）以及返回的 `coverage`：单次最多扫 10 页×50 条；若 `coverage.complete=false`，表示有界扫描未穷尽——零命中只能视为“本次有界检索未命中”而非无匹配，即使有候选也不能保证已拿到期间最新一场，需把 `coverage.continuation_params` 交给 `researchdata.research(route="alphaengine", operation="search_library", ...)` 续查或缩小 `start`/`end` 窗口，切勿把 `continuation_params` 传回 `transcript`），确认目标 `doc_id` 后用 `researchdata.research(route="alphaengine", operation="get_document", params={"doc_id": ..., "content_field": "auto", "offset": 0, "max_chars": 30000})` 按 `offset` / `next_offset` 分页读完全文（`doc_id` 必须保留完整字符串含 `_inst_` 后缀；`content_field` 仅接受 `"auto"|"original_text"|"content"|"digest"|"digest_cn"|"main_point"|"question_answer"` 各字段独立分页——若所选字段为空且返回 `warning` 与 `available_content_fields`，按映射改读有字符数的合法字段如 `original_text`、`digest` 或 `question_answer`，同一分页序列必须固定同一 `content_field` 按 `next_offset` 续读直到 `complete=true` 或 `next_offset` 为空，并核对 `content_sha256`）。
+<!-- DALTON_CAP:alphaengine -->- 调用 `researchdata.research(route="transcript", ticker=T, limit=2)` 定位本次财报电话会（定位时必须核对每条候选的日期 `date`/`publish_time`、`kind`（区分官方业绩电话会 `company_call` 与券商回访 `broker_callback`）以及返回的 `coverage`：单次最多扫 10 页×50 条；若 `coverage.complete=false`，表示有界扫描未穷尽——零命中只能视为“本次有界检索未命中”而非无匹配，即使有候选也不能保证已拿到期间最新一场，需把 `coverage.continuation_params` 交给 `researchdata.research(route="alphaengine", operation="search_library", ...)` 续查或缩小 `start`/`end` 窗口，切勿把 `continuation_params` 传回 `transcript`），确认目标 `doc_id` 后用 `researchdata.research(route="alphaengine", operation="get_document", params={"doc_id": ..., "content_field": "auto", "offset": 0, "max_chars": 30000})` 按 `offset` / `next_offset` 分页读完全文（`doc_id` 必须保留完整字符串含 `_inst_` 后缀；`content_field` 仅接受 `"auto"|"original_text"|"content"|"digest"|"digest_cn"|"main_point"|"question_answer"` 各字段独立分页——若所选字段为空且返回 `warning` 与 `available_content_fields`，按映射改读有字符数的合法字段如 `original_text`、`digest` 或 `question_answer`，同一分页序列必须固定同一 `content_field` 按 `next_offset` 续读直到 `complete=true` 或 `next_offset` 为空，并核对 `content_sha256`）。<!-- DALTON_CAP_ELSE -->- 通过公司 IR 页面、SEC 归档或 `web_search` 获取本次财报电话会全文纪要（区分官方业绩电话会与第三方摘要），完整阅读管理层开场陈述与问答（Q&A）部分。<!-- /DALTON_CAP -->
 - **`Q&A takeaways` 只从电话会 Q&A 部分提取**（提炼 5–10 个最有决策价值的管理层回答，每个话题 1–2 句，不把开场白塞进 Q&A）。
 - **逐级降级规则**：若触发时刻电话会全文尚未入库，依次退到公司 IR（投资者关系）Webcast（网络直播）回放、8-K 预备发言稿（Prepared Remarks），并按影响只在一个位置说明一次——若缺电话会纪要改变当轮结论或确信度，在开头判断处用一句话写清影响；否则只在 `## 来源` 节写明“截至触发时刻电话会纪要尚未入库”，不在正文与 `## 来源` 重复写两遍。
 
 ### Step 4：卖方初评与独立研究点评（事后材料只进“反应分解”）
-- 调用 `researchdata.research(route="alphaengine", operation="search_library", ...)` 按公司名和 ticker 检索财报后报告（类别：`sell_side`、`sell_side_comment`、`sell_side_report`、`domestic_report`、`foreign_report`）。
+<!-- DALTON_CAP:alphaengine -->- 调用 `researchdata.research(route="alphaengine", operation="search_library", ...)` 按公司名和 ticker 检索财报后报告（类别：`sell_side`、`sell_side_comment`、`sell_side_report`、`domestic_report`、`foreign_report`）。<!-- DALTON_CAP_ELSE -->- 使用 `web_search` 按公司名和 ticker 检索财报后主流卖方初评、大行观点摘要与权威财经报道。<!-- /DALTON_CAP -->
 - **时间窗严格限定为 `[官方发布时刻 T0, 触发时刻]`**，**严格排除财报前瞻（preview）**；记录每份采用报告的机构名、标题、发布日期与 `doc_id`。
 - **事后材料隔离铁律**：所有 `published_at >= t0` 或 `acquired_at >= t0` 的事后材料（卖方初评、sales 盘后反馈、独立研究点评）**只能进入“反应分解”（卖方初评与市场反应分解），严禁用来重构或冒充财报前的买方 bogey / 事前预期门槛**。
-- 同时间窗检索 `FUNDA AI`（`route="funda-ai"`）与 `TMTB`（`route="tmtb"`）：若有信息增量，在**卖方初评（反应分解）**下单独列为“**独立研究点评（仅有增量时）**”，标明来源身份，**绝不计入卖方一致预期或券商预测修正区间/中位数**。
+<!-- DALTON_CAP:researchdata_bridge -->- 同时间窗检索 `FUNDA AI`（`route="funda-ai"`）与 `TMTB`（`route="tmtb"`）：若有信息增量，在**卖方初评（反应分解）**下单独列为“**独立研究点评（仅有增量时）**”，标明来源身份，**绝不计入卖方一致预期或券商预测修正区间/中位数**。<!-- DALTON_CAP_ELSE -->- 同时间窗通过 `web_search` 检索高质量公开独立研究点评：若有信息增量，在**卖方初评（反应分解）**下单独列为“**独立研究点评（仅有增量时）**”，标明来源身份，**绝不计入卖方一致预期或券商预测修正区间/中位数**。<!-- /DALTON_CAP -->
 
 ### Step 5：Sales 与投资者反馈（严格时间窗与匿名纪律）
-- 调用 `researchdata.research(route="sales-notes", params={"layer": "raw", "media": "all"})` 检索时间窗 **`[T0, 触发时刻)`**（或发布后 24 小时内，`T0` 为官方财报发布时间戳）。
-- **合格标准**：只采纳包含机构销售台或买方客户真实反应、反复追问的问题、持仓/资金流观察、多空交锋、盈利质量看法的原始邮件；排除已在 AlphaEngine 覆盖的正式研报、纯新闻摘抄与会议通知。
+<!-- DALTON_CAP:researchdata_bridge -->- 调用 `researchdata.research(route="sales-notes", params={"layer": "raw", "media": "all"})` 检索时间窗 **`[T0, 触发时刻)`**（或发布后 24 小时内，`T0` 为官方财报发布时间戳）。
+- **合格标准**：只采纳包含机构销售台或买方客户真实反应、反复追问的问题、持仓/资金流观察、多空交锋、盈利质量看法的原始邮件；排除已在 AlphaEngine 覆盖的正式研报、纯新闻摘抄与会议通知。<!-- DALTON_CAP_ELSE -->- 通过 `web_search` 检索时间窗 **`[T0, 触发时刻)`**（或发布后 24 小时内，`T0` 为官方财报发布时间戳）内公开可查的机构点评与投资者讨论反馈。
+- **合格标准**：只采纳包含机构或投资者真实反应、高频追问、持仓观察、多空交锋与盈利质量看法的可靠来源；排除纯新闻复读与会议通知。<!-- /DALTON_CAP -->
 - **去重与匿名**：按邮件线程去重，**严禁点名终端买方客户身份**，统一注明为“单方反馈（非市场共识）”，不得升级为卖方共识。
 - **空结果与失败区分**：
   - 若检索完成但无合格反馈：**直接省略 `Sales/Investor feedback` 整行（禁止写“未找到”或留空行）**；
@@ -103,13 +106,13 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 5. [ ] **指引对比基准真实**：指引修正对比的是上一季真实发布的官方指引，而非分析师事后记忆；
 6. [ ] **Q&A 纯净度**：`Q&A takeaways` 全部来自电话会 Q&A 部分，未混入管理层开场白；
 7. [ ] **排除事前前瞻**：未将财报前发布的 preview 误标为财报后卖方初评；
-8. [ ] **Sales 时间窗精确**：`sales-notes` 检索严格遵循 `[T0, 触发时刻)` 原始时间戳；
+8. [ ] <!-- DALTON_CAP:researchdata_bridge -->**Sales 时间窗精确**：`sales-notes` 检索严格遵循 `[T0, 触发时刻)` 原始时间戳<!-- DALTON_CAP_ELSE -->**事后反馈时间窗精确**：财报后市场与投资者反馈检索严格遵循 `[T0, 触发时刻)` 时间戳<!-- /DALTON_CAP -->；
 9. [ ] **Sales 反馈合规**：凡纳入的 sales/投资者反馈均可追溯至本轮读取的原邮件、注明为“单方反馈（非市场共识）”、隐去了终端客户身份、未升级为市场共识；
 10. [ ] **无空反馈占位**：当 sales 检索无合格内容时，已完整省略该 bullet，未出现空的反馈行或“未找到”字样；
 11. [ ] **预测修正不混口径**：卖方盈利预测修正未混杂不同财年、不同币种或 GAAP 与 Adjusted 口径；
 12. [ ] **估值与价格核验**：最新股价（未复权常规收盘价）与远期 P/E 通过币种、ADR 换算比与股本类别核验；
 13. [ ] **缺失数据显式标注**：未披露或尚未入库的数据均已显式注明（如“未提供”、“卖方修正未出，次日深度点评补”），零脑补推断；
-14. [ ] **来源可追溯**：`## 来源` 节每行先写可读来源说明（来源类型、机构、标题、日期），直接 URL、SEC accession 或内部库 `doc_id` / `mail:ID` / `funda:ID` 放在该行末尾，正文段落里不写文档编号。
+14. [ ] **来源可追溯**：`## 来源` 节每行先写可读来源说明（来源类型、机构、标题、日期），直接 URL、SEC accession <!-- DALTON_CAP:researchdata_bridge -->或内部库 `doc_id` / `mail:ID` / `funda:ID` <!-- /DALTON_CAP -->放在该行末尾，正文段落里不写文档编号。
 
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 
@@ -122,4 +125,4 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 输出模板
 
-按 [`templates/flash.md`](templates/flash.md) 写入 `research/<D>-flash-<季度>.md`，并在当前对话输出相同正文（外部通知由 Dalton 通知模块按用户的飞书开关统一处理）。
+按 [`templates/flash.md`](templates/flash.md) 写入 `research/<D>-flash-<季度>.md`，并在当前对话输出相同正文（外部通知由 Dalton 通知模块按用户的<!-- DALTON_CAP:channel_feishu -->飞书<!-- DALTON_CAP_ELSE -->通知<!-- /DALTON_CAP -->开关统一处理）。

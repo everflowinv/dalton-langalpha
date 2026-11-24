@@ -33,13 +33,13 @@
 | `space` | `UFO` |
 | `cn_mega` / `cn_ecom_vertical` / `cn_travel_local` / `cn_internet_small` / `cn_content` / `cn_games` / `cn_brokers_exch` / `cn_logistics` / `cn_health` / `cn_ai` / `cn_cloud_idc` / `cn_consumer_finance` | `KWEB` |
 
-## 3. 基金 Wiki 行业页（名单外公司第一回退）
+<!-- DALTON_CAP:researchdata_bridge -->## 3. 基金 Wiki 行业页（名单外公司第一回退）
 
 若目标公司不在 `coverage.yaml` 中：
 - 通过 `researchdata.research(route="company-wiki", operation="search", query=f"{ticker} peers 行业 可比公司")` 查询基金 wiki 是否已有该公司或所在细分行业的同组定义；
 - 若找到可比公司，通过 `--peers` 传给 `move_quant.py`。
 
-## 4. 脚本内置同组表与 yfinance 行业回退（兜底）
+## 4. <!-- DALTON_CAP_ELSE -->## 3. <!-- /DALTON_CAP -->脚本内置同组表与 yfinance 行业回退（兜底）
 
 若以上均未命中，`move_quant.py` 自动执行两层兜底：
 1. 查找脚本内置的 `DEFAULT_PEER_MAP`（涵盖 AI 算力/芯片、光通信/网络、半导体设备、大型科技、中概电商/科技、电动车等常见同组）；

@@ -1000,9 +1000,9 @@ def test_sec_user_agent_fallback_matches_settings(monkeypatch: pytest.MonkeyPatc
     net = _load("dalton_daily_filing_netio_fallback", SKILL_ROOT / "scripts" / "netio.py")
     for key in ("EDGAR_IDENTITY", "SEC_USER_AGENT", "DALTON_SEC_USER_AGENT"):
         monkeypatch.delenv(key, raising=False)
-    # Skill script netio.py keeps its Everflow fallback until Batch 3 skill cleanup,
-    # while src/dalton/settings.py uses a neutral placeholder without company email.
-    assert net.sec_user_agent() == "DaltonResearch research@everflowinv.com"
+    # Both skill script netio.py and src/dalton/settings.py use the same neutral placeholder without company email.
+    assert net.sec_user_agent() == get_sec_user_agent() == "DaltonResearch sec-contact@example.com"
+    assert "everflowinv" not in net.sec_user_agent().lower()
     assert "everflowinv" not in get_sec_user_agent().lower()
 
     monkeypatch.setenv("SEC_USER_AGENT", "AcmeResearch sec@acme.test")

@@ -14,7 +14,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 每周六 09:00（Asia/Shanghai，即美东周五收盘后）或按需对 `Home/dalton/coverage.yaml` 覆盖名单逐家核查下一次财报的**公司官方**披露日期，维护 `pending / confirmed / reported` 三态台账（`Home/dalton/earnings-calendar.json`）。
 
-- **只认公司官方来源**：仅公司 IR 新闻稿、IR Events 页面、美股 SEC 8-K/6-K 或港股/A 股交易所法定排期公告（通过 `researchdata.finance(route="cn-hk", operation="filings", ...)` 或披露易 HKEXnews 原文核实的董事会会议召期通告、定期报告预约披露时间表）明确披露未来发布日期时，才标为 `confirmed`（`date_status: confirmed`）并创建财报链自动任务。
+- **只认公司官方来源**：仅公司 IR 新闻稿、IR Events 页面、美股 SEC 8-K/6-K 或港股/A 股交易所法定排期公告（通过 <!-- DALTON_CAP:researchdata_bridge -->`researchdata.finance(route="cn-hk", operation="filings", ...)` 或披露易 HKEXnews <!-- DALTON_CAP_ELSE -->披露易 HKEXnews 或巨潮资讯 <!-- /DALTON_CAP -->原文核实的董事会会议召期通告、定期报告预约披露时间表）明确披露未来发布日期时，才标为 `confirmed`（`date_status: confirmed`）并创建财报链自动任务。
 - **聚合日历一律标“待确认”**：FMP、yfinance、Nasdaq、Zacks、Earnings Whispers、WSJ、MarketWatch、`get_earnings_calendar` 等给出的日期只记为 `pending`（附 `tentative_date`、`tentative_sources`），`date_status: estimated`，界面与总结显示“待确认”，**在官方公布前绝不建 `tm3/t0/tp1` 自动任务**（若 `tentative_date` 在 10 天内，只建一条 T-5 的 `once` 日期复查任务，仅复查日期不做研究）。详见 [`references/classification.md`](references/classification.md)。
 - **个人自动化任务与受覆盖单元管理的自动化任务分入口管理**：个人自动化任务通过 `.agents/user/automations/` 下的文件管理。受覆盖单元管理的自动化任务禁止直接通过文件新建、修改、删除或改名。财报任务的新建、改期和剩余窗口补建统一调用 `dalton_schedule_automation(action="upsert", name=..., trigger_type="once", next_run_at=..., instruction=..., description=..., timezone_name=..., workspace_id=..., ticker=...)`。标准四项自动跟踪（含 `move-up` / `move-down` 价格触发）在自动维护时统一调用 `dalton_coverage_tracking(action="enable", source="coverage_finish", ticker=..., workspace_id=...)` 开启与补建：自动维护时 `source` 必须传 `"coverage_finish"`，保留 `paused_by_user` 标记，不恢复用户主动暂停的跟踪和财报任务；仅当用户明确要求恢复跟踪时 `source` 才传 `"user"`。
 - **无工作区不建链**：只为 `workspace.status=active` 的公司创建自动任务链；没有工作区的 Core 公司列入总结“缺工作区”，严禁在 Home 工作区跑出无知识层支撑的前瞻。
@@ -103,7 +103,7 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
 1. **检索词与时间窗**：先算 `SEARCH_START_DATE = 今天 - 180 天`。每家公司执行两条检索：
    - `"{公司}" "to report" "{季度}" results`（限 180 天内）
    - `"{公司}" earnings date announcement`（限 180 天内）
-2. **官方源确认**：美股阅读公司 IR 页面（`coverage.yaml` 中的 `earnings.ir_url`）或 SEC 8-K/6-K 原文确认；港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=SEARCH_START_DATE, end=TODAY, limit=20)`（港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`）检索巨潮资讯披露的董事会会议召期通告（Date of Board Meeting）或定期报告预约披露公告原文（港股若 `cn-hk filings` 未覆盖则用 `WebSearch` 查披露易 `site:hkexnews.hk` 原文链接确认）。判定标准严格执行 [`references/classification.md`](references/classification.md)。
+2. **官方源确认**：美股阅读公司 IR 页面（`coverage.yaml` 中的 `earnings.ir_url`）或 SEC 8-K/6-K 原文确认；港股与 A 股<!-- DALTON_CAP:researchdata_bridge -->调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=SEARCH_START_DATE, end=TODAY, limit=20)`（港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`）检索巨潮资讯披露的董事会会议召期通告（Date of Board Meeting）或定期报告预约披露公告原文（港股若 `cn-hk filings` 未覆盖则用 `WebSearch` 查披露易 `site:hkexnews.hk` 原文链接确认）<!-- DALTON_CAP_ELSE -->通过 `web_search` 检索港交所披露易（`site:hkexnews.hk`）、巨潮资讯或交易所官网披露的董事会会议召期通告（Date of Board Meeting）与定期报告预约披露公告原文链接确认<!-- /DALTON_CAP -->。判定标准严格执行 [`references/classification.md`](references/classification.md)。
 3. **逐家追加 JSONL**：每查完一家，立即用 `json.dumps` 追加一行到 `dalton/research/earnings-scan-<YYYY-MM-DD>.jsonl`（本 skill 在 Home 工作区运行，路径相对 Home 根；禁止手写字符串拼接）。字段固定为：
    `ticker, name, status, earnings_date, timing, quarter_label, confidence, source_url, evidence, notes`
    - 工具报错或超时写 `"status": "scan_failed"`，**严禁写成 `"not_announced"`**。
@@ -218,7 +218,7 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
 
 ## 自动任务 JSON 模板
 
-> 推送由 Dalton 通知模块按用户的飞书开关统一处理，自动任务模板中不写 `"delivery"` 字段；公司价格触发任务在自动维护时统一由 `dalton_coverage_tracking(action="enable", source="coverage_finish", ticker=..., workspace_id=...)` 管理（仅在用户明确要求恢复跟踪时 `source` 传 `"user"`）。
+> 推送由 Dalton 通知模块按用户的<!-- DALTON_CAP:channel_feishu -->飞书<!-- DALTON_CAP_ELSE -->通知<!-- /DALTON_CAP -->开关统一处理，自动任务模板中不写 `"delivery"` 字段；公司价格触发任务在自动维护时统一由 `dalton_coverage_tracking(action="enable", source="coverage_finish", ticker=..., workspace_id=...)` 管理（仅在用户明确要求恢复跟踪时 `source` 传 `"user"`）。
 
 ### 1. 每周日历维护（`dalton-earnings-calendar.json`，Home 工作区）
 

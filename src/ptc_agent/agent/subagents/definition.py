@@ -114,3 +114,7 @@ class SubagentDefinition:
     source: str = "builtin"
     """``"builtin"``, ``"user"`` (deployment YAML), ``"plugin"`` (a plugin's
     ``agents/`` file) or ``"custom"`` (a user's own row)."""
+
+    # DALTON-HOOK(standalone-core): True only for deployment-bundled plugin subagents so
+    # capability content assembly never runs on user-installed plugins.
+    bundled_plugin: bool = False

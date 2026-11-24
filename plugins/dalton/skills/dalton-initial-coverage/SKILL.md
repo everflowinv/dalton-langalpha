@@ -18,7 +18,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 - `ticker`：规范股票代码（如 `META`、`APP`）
 - `company`：公司名称
-- `market`：市场（支持 `US`、`HK`、`CN`；港股与 A 股通过 `researchdata.finance(route="cn-hk", operation="filings"|"ask", ...)` 获取法定公告、财务表初值、行情、资金流、两融、股东与 AH 溢价——平台财务表仅作二手初值线索，核心财务数字必须回法定公告原文核实，港股披露易未覆盖时用 `web_search` 查 `site:hkexnews.hk` 原文链接，回报与估值核对复权、分红、拆股与交易/报表币种）
+- `market`：市场（支持 `US`、`HK`、`CN`；港股与 A 股<!-- DALTON_CAP:researchdata_bridge -->通过 `researchdata.finance(route="cn-hk", operation="filings"|"ask", ...)` 获取法定公告、财务表初值、行情、资金流、两融、股东与 AH 溢价——平台财务表仅作二手初值线索，核心财务数字必须回法定公告原文核实，港股披露易未覆盖时用 `web_search` 查 `site:hkexnews.hk` 原文链接<!-- DALTON_CAP_ELSE -->通过 `web_search` 与公开网页读取检索港交所披露易 `site:hkexnews.hk`、巨潮资讯网及公司 IR 官网的法定公告原文核实核心财务数字，行情与估值结合公开行情与财务接口获取<!-- /DALTON_CAP -->，回报与估值核对复权、分红、拆股与交易/报表币种）
 - `workspace_dir`：当前公司工作区根目录（如 `.` 或工作区路径）
 - `as_of`：基准日期（`YYYY-MM-DD`；可不传或传 `"latest"`，`RunWorkflow` 会自动取最近一个美股交易日，`resume` 续跑时自动沿用上一 run 的值）
 - `peers`（可选）：可比同业代码列表；不提供时由行业支线与估值支线自行选定 5–8 家竞争对手及 ≥3 家一档可比公司，并写明选取理由
@@ -63,7 +63,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      - **C 财务镜头**：按 `.agents/skills/dalton-financial-lenses/SKILL.md` 输出 `research/<D>-ic/lenses.json` 与 `drafts/<D>-lenses.md`；
      - **D 估值历史与可比（拆成取数 + 写稿两步派发）**：先按 `.agents/skills/comps-analysis/SKILL.md` 取数并生成可比表 `research/<D>-ic/comps.xlsx`，再按 `references/branch-valuation-history.md` 撰写估值历史与对数分解稿 `research/<D>-ic/valuation.md`；
      - **支线核验**：四条支线取证完成后，多一次支线核验派发，核对各支线产物是否存在并计算哈希。
-   - **阶段 2（bull/bear 快速版，含叙事收敛）**：综合 A–D 支线产物与内部库/AlphaEngine 检索，按 `.agents/skills/dalton-bullbear/SKILL.md` 快速版方法输出 `research/<D>-ic/bullbear-quick.md`；**首次覆盖时的叙事收敛按该 skill 快速版流程第 1 步执行**（先列全市场叙事、删减到 2–3 个决定价值的驱动变量〔driver〕、每个驱动变量再往下挖一层观察指标与数据来源），收敛结果写入主要分歧、第 3 阶段的知识层 `debate` / `drivers` 草案，以及第 4 阶段的内部 12 问底稿与初次覆盖报告。
+   - **阶段 2（bull/bear 快速版，含叙事收敛）**：综合 A–D 支线产物与<!-- DALTON_CAP:alphaengine|researchdata_bridge -->内部库/AlphaEngine <!-- DALTON_CAP_ELSE -->公开卖方点评与市场新闻<!-- /DALTON_CAP -->检索，按 `.agents/skills/dalton-bullbear/SKILL.md` 快速版方法输出 `research/<D>-ic/bullbear-quick.md`；**首次覆盖时的叙事收敛按该 skill 快速版流程第 1 步执行**（先列全市场叙事、删减到 2–3 个决定价值的驱动变量〔driver〕、每个驱动变量再往下挖一层观察指标与数据来源），收敛结果写入主要分歧、第 3 阶段的知识层 `debate` / `drivers` 草案，以及第 4 阶段的内部 12 问底稿与初次覆盖报告。
    - **阶段 3（知识层初始化草案 + 写手成稿前正式写入并锁定赔率卡版本）**：若本次运行开始时盘上已有在途旧结构草稿（由启动时的 `草稿探测` 最后一条已完成记录的原文匹配判定），则跳过成稿前的本阶段与暂停点（改在成稿后抽取草案）。否则，从阶段 1–2 的支线材料与 `bullbear-quick.md` 抽取结构化知识层操作草案 `research/<D>-ic/knowledge-proposal.json`（`thesis` 含 `underwriting` 三情景赔率卡，字段写法照 `src/dalton/knowledge/schemas/thesis.schema.json` 与 `plugins/dalton/skills/dalton-knowledge/references/structured-write-example.md`；每条 `thesis.evidence` 必填结构化 `figures` 数组，且 `source.ref` 指向一手文件或 `prov`）。因工作流子智能体无 `knowledge_update` 工具，若盘上尚无第一行写有固定格式 `已保存 thesis 版本 N` 的 `research/<D>-ic/underwriting-summary.md`，工作流在此暂停并返回 `resume_hint`，主智能体按以下顺序执行：
      1. **先正式写入依赖文档**：对 `knowledge-proposal.json` 中不依赖报告数字的 `agenda`、`debate`、`company`、`drivers`、`management` 先调用 `knowledge_update(..., dry_run=True)` 校验、通过后以 `dry_run=False` **正式写入**，确保 `thesis` 中 `trigger_refs`（如 `V-001`）与 `debate_ids` / `driver_ids` 等跨文档引用能通过数据库校验；
      2. **再对 `thesis` 先试写检查、通过后正式写入**：先调用 `knowledge_update(doc="thesis", ..., dry_run=True)` 校验（若第一行写着 `没有保存成功` 或 `不能写进正文`，必须先修正 `knowledge-proposal.json` 重试），通过后立即调用 `knowledge_update(doc="thesis", ..., dry_run=False)` **正式写入**数据库；

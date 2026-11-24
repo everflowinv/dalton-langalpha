@@ -752,7 +752,12 @@ async def _skill_folder(
         if skill is not None and not skill.hidden
         else None
     )
-    folder = await asyncio.to_thread(DiskFolder, root) if root is not None else None
+    # DALTON-HOOK(standalone-core): assemble conditional capability markers on shipped platform skill reads
+    folder = (
+        await asyncio.to_thread(DiskFolder, root, assemble=True)
+        if root is not None
+        else None
+    )
     if folder is None or "SKILL.md" not in folder.files:
         raise HTTPException(status_code=404, detail="Skill not found")
     return folder

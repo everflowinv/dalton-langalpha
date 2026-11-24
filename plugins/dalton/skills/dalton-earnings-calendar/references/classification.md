@@ -26,7 +26,7 @@
 2. **公司 IR Events 页（`source_type: "ir_events"`）**：公司官方 IR Calendar / Upcoming Events 页面明确列出的下一次季报/年报发布日及电话会时间。
 3. **监管机构与交易所公告（`source_type: "sec_filing"` / `"cnhk_filing"`）**：
    - **美股**：SEC EDGAR 上的 8-K 或 6-K 明确披露未来业绩发布日期。
-   - **港股与 A 股（`route="cn-hk"`）**：调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=SEARCH_START_DATE, end=TODAY, limit=20)`（港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`，不带 `.HK`/`.SS`/`.SZ` 后缀）检索巨潮资讯（cninfo）披露的**董事会会议召期通告（Date of Board Meeting）**、**定期报告预约披露时间表/变更公告**及 `pdf_link` 原文；若港交所披露易（HKEXnews）的董事会会议通告未被 `cn-hk` 的 `filings` 覆盖，必须使用 `web_search` 检索披露易（`site:hkexnews.hk`）并核对官方原文链接。也可辅以 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 公告", limit=20)` 定位线索，但必须核实官方公告原文后方可标为 `confirmed`。
+   - <!-- DALTON_CAP:researchdata_bridge -->**港股与 A 股（`route="cn-hk"`）**：调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=SEARCH_START_DATE, end=TODAY, limit=20)`（港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`，不带 `.HK`/`.SS`/`.SZ` 后缀）检索巨潮资讯（cninfo）披露的**董事会会议召期通告（Date of Board Meeting）**、**定期报告预约披露时间表/变更公告**及 `pdf_link` 原文；若港交所披露易（HKEXnews）的董事会会议通告未被 `cn-hk` 的 `filings` 覆盖，必须使用 `web_search` 检索披露易（`site:hkexnews.hk`）并核对官方原文链接。也可辅以 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 公告", limit=20)` 定位线索，但必须核实官方公告原文后方可标为 `confirmed`。<!-- DALTON_CAP_ELSE -->**港股与 A 股**：通过 `web_search` 检索港交所披露易（`site:hkexnews.hk`）、巨潮资讯（cninfo）及交易所官网披露的**董事会会议召期通告（Date of Board Meeting）**或**定期报告预约披露时间表/变更公告**原文链接，核实官方公告原文后方可标为 `confirmed`。<!-- /DALTON_CAP -->
 
 ### 2. 第三方聚合与估算来源（只能标 `pending` + `date_status: "estimated"`）
 

@@ -6,6 +6,8 @@ it without either importing the other.
 
 from __future__ import annotations
 
+import html  # DALTON-HOOK(standalone-core)
+
 from fastapi import Request
 from fastapi.responses import Response
 
@@ -41,9 +43,17 @@ def unavailable_response(request: Request, status_code: int) -> Response | None:
     )
 
 
+def _share_brand_name() -> str:
+    """Resolve public brand name for share pages (DALTON-HOOK(standalone-core))."""
+    from src.dalton.settings import get_brand_name
+
+    return html.escape(get_brand_name())
+
+
 def unavailable_page(status_code: int, *, chinese: bool) -> str:
     """Self-contained, theme-aware HTML page shown when a browser opens a shared
     report link that has been revoked (404) or lacks file access (403)."""
+    brand = _share_brand_name()  # DALTON-HOOK(standalone-core)
     if chinese:
         lang = "zh-CN"
         heading = "此分享报告不可用"
@@ -52,8 +62,8 @@ def unavailable_page(status_code: int, *, chinese: bool) -> str:
             if status_code == 403
             else "该链接可能已被创建者关闭，或报告已不存在。"
         )
-        # DALTON-HOOK(brand-name): Dalton serves these pages as Everflow.
-        link_text = "前往 Everflow"
+        # DALTON-HOOK(brand-name): Dalton serves these pages under the active brand.
+        link_text = f"前往 {brand}"
     else:
         lang = "en"
         heading = "This shared report isn’t available"
@@ -62,7 +72,7 @@ def unavailable_page(status_code: int, *, chinese: bool) -> str:
             if status_code == 403
             else "The link may have been turned off by its owner, or the report no longer exists."
         )
-        link_text = "Go to Everflow"
+        link_text = f"Go to {brand}"
     return f"""<!DOCTYPE html>
 <html lang="{lang}">
 <head>
@@ -111,7 +121,7 @@ def unavailable_page(status_code: int, *, chinese: bool) -> str:
 </head>
 <body>
   <div class="card">
-    <div class="badge">Everflow</div>  <!-- DALTON-HOOK(brand-name) -->
+    <div class="badge">{brand}</div>  <!-- DALTON-HOOK(brand-name) DALTON-HOOK(standalone-core) -->
     <h1>{heading}</h1>
     <p>{detail}</p>
     <a href="/">{link_text}</a>

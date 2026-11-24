@@ -50,7 +50,7 @@ pd.set_option("display.max_colwidth", None)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 STATE_SUBDIR = Path("state") / "dalton-13f-tracker"
-DEFAULT_EDGAR_IDENTITY = "DaltonResearch research@everflowinv.com"
+DEFAULT_EDGAR_IDENTITY = "DaltonResearch sec-contact@example.com"
 
 _CLASSIFICATION_BUCKETS = ("china_book", "ai_semi_saas", "other_us_book")
 _DICT_DATA_FILES = (

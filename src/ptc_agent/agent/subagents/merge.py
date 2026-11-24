@@ -234,15 +234,43 @@ def custom_definition(row: Mapping[str, Any]) -> SubagentDefinition:
     return replace(base, **changes) if changes else base
 
 
-def plugin_definition(row: Mapping[str, Any]) -> SubagentDefinition:
+def plugin_definition(
+    row: Mapping[str, Any],
+    *,
+    # DALTON-HOOK(standalone-core): distinguish shipped bundled plugins from user-installed plugins.
+    bundled: bool = False,
+) -> SubagentDefinition:
     """A plugin's subagent as a base, built the way a custom one is.
 
     ``row`` is shaped like a custom row (``name``, ``fields``, ``instructions``,
     ``roles``), so a package's instructions are passed as text under the
     frame too: nothing a package ships is rendered as a template.
     """
-    # A package's instructions are written for the tools its file names.
-    return replace(custom_definition(row), source="plugin", tools_narrowed=False)
+    defn = replace(custom_definition(row), source="plugin", tools_narrowed=False)
+    # DALTON-HOOK(standalone-core): assemble capability-conditional markers and strip disabled
+    # researchdata connector only on shipped bundled plugin subagents; user-installed plugins stay untouched.
+    if not bundled:
+        return defn
+    from src.dalton.capabilities import CapabilityId, has_capability
+    from src.dalton.content_assembly import assemble_markdown_text
+
+    agent_path = f"agents/{defn.name}.md"
+    assembled_desc = assemble_markdown_text(defn.description, path=agent_path)
+    assembled_role = (
+        assemble_markdown_text(defn.role_prompt, path=agent_path)
+        if defn.role_prompt
+        else defn.role_prompt
+    )
+    preferred = list(defn.preferred_connectors)
+    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
+        preferred = [c for c in preferred if c != "researchdata"]
+    return replace(
+        defn,
+        description=assembled_desc,
+        role_prompt=assembled_role,
+        preferred_connectors=preferred,
+        bundled_plugin=True,
+    )
 
 
 def add_plugin_bases(

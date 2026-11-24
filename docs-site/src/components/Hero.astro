@@ -3,8 +3,11 @@ import type { ImageMetadata } from 'astro';
 import { LinkButton } from '@astrojs/starlight/components';
 import DraftContentNotice from '@astrojs/starlight/components/DraftContentNotice.astro';
 import HeroImageSlot from './HeroImageSlot.astro';
+import { resolveDocsProfile } from '../integrations/profile-filter.mjs';
 
 const PAGE_TITLE_ID = '_top';
+const { isCore, brandName } = resolveDocsProfile();
+const eyebrowLabel = isCore ? `${brandName.toUpperCase()} 文档` : 'EVERFLOW 文档';
 
 const { entry } = Astro.locals.starlightRoute;
 const { data } = entry;
@@ -37,7 +40,7 @@ if (image) {
 		!isNotFound && (
 			<p class="ef-hero__eyebrow">
 				<span class="ef-eyebrow-dot" aria-hidden="true" />
-				<span>EVERFLOW 文档</span>
+				<span>{eyebrowLabel}</span>
 			</p>
 		)
 	}

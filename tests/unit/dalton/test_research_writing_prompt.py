@@ -43,7 +43,7 @@ def _dalton_subagent_definitions() -> dict[str, object]:
     )
     sub_cfg = SubagentsConfig(**(dalton_cfg.get("subagents") or {}))
     plugin_bases = [
-        (BaseSubagent(f"plugin:{bundle}/{plan.name}", plugin_definition(plan.row)), True)
+        (BaseSubagent(f"plugin:{bundle}/{plan.name}", plugin_definition(plan.row, bundled=True)), True)
         for bundle, plan in bundled_agent_plans()
     ]
     bases, offered = add_plugin_bases(

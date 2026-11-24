@@ -28,6 +28,8 @@ vi.mock('@/config/brand', () => ({
   get isDaltonBuild() {
     return h.isDaltonBuild;
   },
+  DALTON_PROFILE: 'everflow' as const,
+  isCoreProfileBuild: false,
 }));
 vi.mock('../useProviderModels', () => ({
   useMissingModels: () => ({ missingByProvider: new Map(), isLoading: false }),

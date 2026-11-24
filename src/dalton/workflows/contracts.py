@@ -115,7 +115,9 @@ def _load_contract_at(path: Path, *, expected_name: str) -> dict[str, Any]:
     if not path.is_file():
         raise ContractError(f"完成契约不存在：{path}")
     try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
+        from src.dalton.content_assembly import read_assembled_text
+
+        doc = json.loads(read_assembled_text(path))
     except (OSError, ValueError) as error:
         raise ContractError(f"完成契约不可读（{path}）：{error}") from error
     errors = validate_contract(doc)

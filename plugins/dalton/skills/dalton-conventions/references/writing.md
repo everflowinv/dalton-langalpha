@@ -10,7 +10,7 @@
 ## 2. 正文给人读
 
 1. **用户可见文字不出现机器内部标识与报错原文**（总规则见系统提示词「用户可见文字」，以下为 Dalton 报告与推送中的具体替换规范）：
-   - 进度消息、任务卡标题、最终回复、报告正文、推送正文（飞书 / Discord 推送）和外部渠道正文一律不写知识层编号（如论点支柱 `P1`、多空分歧 `D1`、触发器 `T25`、待验证项 `V-013`、证据 `E-20261023-01` 等）、枚举值（如 `NO_CHANGE`、`THESIS_STRENGTHENED`、`clearly_above`、`sector_beta`、`act_now`、`wait_evidence`、`frozen_pre_event=true` 等）、英文字段名（如 `stance`、`conviction`、`actionability`、`binding_constraint`、`breakeven_verdict`、`b_row`、`debate_ids`、`0y`、`+1y` 等）、函数名、脚本名（如 `price_reaction.py`、`implied_model.py`、`move_quant.py`）、工具名（如 `knowledge_update`、`researchdata`）、知识文件版本号和工具报错原文。工作区文件路径（如 `data/consensus/...`、`predictions.json`）正文不写；链接目标可以包含定位文件所需的真实路径。例外：报告内部给读者看的章节序号和短名（如多空讨论里的“Debate 1：云业务利润率能否守住”）可以保留，禁止的是知识层内部编号（`D1`、`P1`、`V-013` 这类）。
+   - 进度消息、任务卡标题、最终回复、报告正文、推送正文（<!-- DALTON_CAP:channel_feishu -->飞书 / Discord 推送<!-- DALTON_CAP_ELSE -->通知渠道推送<!-- /DALTON_CAP -->）和外部渠道正文一律不写知识层编号（如论点支柱 `P1`、多空分歧 `D1`、触发器 `T25`、待验证项 `V-013`、证据 `E-20261023-01` 等）、枚举值（如 `NO_CHANGE`、`THESIS_STRENGTHENED`、`clearly_above`、`sector_beta`、`act_now`、`wait_evidence`、`frozen_pre_event=true` 等）、英文字段名（如 `stance`、`conviction`、`actionability`、`binding_constraint`、`breakeven_verdict`、`b_row`、`debate_ids`、`0y`、`+1y` 等）、函数名、脚本名（如 `price_reaction.py`、`implied_model.py`、`move_quant.py`）、工具名（如 `knowledge_update`<!-- DALTON_CAP:researchdata_bridge -->、`researchdata`<!-- DALTON_CAP_ELSE -->、`dalton_sec`<!-- /DALTON_CAP -->）、知识文件版本号和工具报错原文。工作区文件路径（如 `data/consensus/...`、`predictions.json`）正文不写；链接目标可以包含定位文件所需的真实路径。例外：报告内部给读者看的章节序号和短名（如多空讨论里的“Debate 1：云业务利润率能否守住”）可以保留，禁止的是知识层内部编号（`D1`、`P1`、`V-013` 这类）。
    - **正面写法**：提到某条分歧或支柱时，用一句话直接写出它的具体内容；提到胜率裁决时写中文（“显著高于门槛”“在门槛附近”“低于门槛”“无法判断”；裁决所评的方向写“做多 / 做空”），提到事件五词结论时写中文（“无变化”“强化”“削弱”“证伪”“新论点”），提到方向、确信度、行动分类与限制变量时写中文（方向：“看多 / 看空 / 中性 / 暂不表态”；确信度：“高 / 中 / 低”，暂不表态时为“无”；行动分类：“立即行动 / 等待买点 / 等待证据 / 暂不参与”；限制变量：“无 / 价格 / 关键证据待验证 / 催化剂时点 / 下行路径风险 / 交易执行条件”）；数据缺口与取数失败的披露位置见本节第 5 条（不贴工具报错原文，渠道失败不得写成“没有新信息”）。
    - **示例 1**：
      - 改前：`结论：强化（THESIS_STRENGTHENED）——1Q26 实际业绩与 2Q26 指引同时验证 P1（美国餐饮主业现金牛稳固）、P2（新零售与杂货规模效应跨过盈亏平衡拐点）及 D1（2026 年投资周期属于可控的短期节奏错配）。`
@@ -80,6 +80,6 @@
 ## 引用
 [引用1]: evidence:E-20261023-01 （法定财报｜Meta Platforms｜FY2025 10-K 分部披露｜2026-02-01｜accession 0001326801-26-000012）
 [引用2]: model:model/META-model-v01.xlsx!DCF!C12 （本方模型｜DCF 估值页核心输出｜2026-10-23｜model/META-model-v01.xlsx）
-[引用3]: prov:3f6c9a12-0000-0000-0000-000000000001 （卖方研报｜Morgan Stanley｜META 3Q26 Preview｜2026-10-12｜alphaengine:doc_123）
+[引用3]: prov:3f6c9a12-0000-0000-0000-000000000001 （卖方研报｜Morgan Stanley｜META 3Q26 Preview｜2026-10-12｜<!-- DALTON_CAP:alphaengine -->alphaengine:doc_123<!-- DALTON_CAP_ELSE -->公开研报摘要 URL<!-- /DALTON_CAP -->）
 [引用4]: f:rev_q8 （数字底表｜最近一季营业收入｜2Q26｜research/2026-10-23-fc/facts.md）
 ```

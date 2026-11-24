@@ -197,11 +197,12 @@ def test_sec_identity_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
     set_id_stub = create_autospec(_identity_sig, spec_set=True)
     monkeypatch.setattr(mod, "set_identity", set_id_stub)
 
-    # 1. Default fallback matches src/dalton/settings.py
+    # 1. Default fallback matches src/dalton/sec_identity.py neutral placeholder (no internal email)
     ident, source = mod.configure_identity()
     assert source == "default"
-    assert ident == "DaltonResearch research@everflowinv.com"
+    assert ident == "DaltonResearch sec-contact@example.com"
     assert ident == mod.DEFAULT_EDGAR_IDENTITY
+    assert "everflowinv" not in ident.lower()
 
     # 2. EDGAR_IDENTITY overrides default
     monkeypatch.setenv("EDGAR_IDENTITY", "EdgarUser edgar@example.com")

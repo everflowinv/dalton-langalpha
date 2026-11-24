@@ -120,6 +120,13 @@ def resolve_skill_dir(
     return found
 
 
+def read_assembled_skill_file(path: Path) -> str:
+    """Read a skill markdown/text/JSON file with capability-aware assembly (DALTON-HOOK(standalone-core))."""
+    from src.dalton.content_assembly import read_assembled_text
+
+    return read_assembled_text(path)
+
+
 def load_skill_content(
     skill_name: str,
     skill_dirs: Optional[list[str]] = None,
@@ -143,7 +150,8 @@ def load_skill_content(
         return None
     skill_md_path = skill_dir / "SKILL.md"
     try:
-        content = skill_md_path.read_text(encoding="utf-8")
+        # DALTON-HOOK(standalone-core): assemble capability-gated fragments at read time.
+        content = read_assembled_skill_file(skill_md_path)
     except OSError as e:
         logger.warning(
             f"Failed to read SKILL.md for '{skill_name}' from {skill_md_path}: {e}"

@@ -8,12 +8,12 @@
 
 | 章节 | 规则摘要 | 上游真源路径 | JSON 路径 / 行号 |
 |---|---|---|---|
-| §1 角色与边界 | 基本面多头导向、不强迫看多、决策推导链与不参与的举证责任、PM 决定交易 | `/Users/everflow/Projects/dalton-research-agent-os/deploy/phase9/p9a-research-playbook-v1.json`<br>`docs/dalton/blueprint.md` | `$.investor_mandate` (L5–28)<br>§3.1 (L190–215) |
+| §1 角色与边界 | 基本面多头导向、不强迫看多、决策推导链与不参与的举证责任、PM 决定交易 | <!-- DALTON_CAP:researchdata_bridge -->`/Users/everflow/Projects/dalton-research-agent-os/deploy/phase9/p9a-research-playbook-v1.json`<!-- DALTON_CAP_ELSE -->`deploy/phase9/p9a-research-playbook-v1.json`<!-- /DALTON_CAP --><br>`docs/dalton/blueprint.md` | `$.investor_mandate` (L5–28)<br>§3.1 (L190–215) |
 | §2 与 `research-conventions` 的关系 | 6 项主题优先级对照表 | `docs/dalton/dev-guide/P0D-P1-data-and-onboarding.md` | §P1.1 (L911–921) |
 | §3 八条底线 | 数字带来源/期间/口径、模型只由证据改动、五词结论、完整空方、来源身份、先量化异动、只写重要变化、诚实边界 | `docs/dalton/blueprint.md`<br>`p9a-research-playbook-v1.json` | §3.1 (L190–215)<br>`$.non_negotiables` (L29–42) |
 | §4 按任务找参考 | 任务到 `references/*.md` 的路由表 | `docs/dalton/dev-guide/P0D-P1-data-and-onboarding.md` | §P1.1 (L899–905) |
-| §5 合规口径 | 专家访谈、管理层交流、Guidepoint 合规可用；标身份不写姓名；单源估计；Guidepoint ≤20 词 | `~/.openclaw/workspace/skills/bullbear-discussion/references/common_task.md`<br>`docs/dalton/dev-guide/P0D-P1-data-and-onboarding.md` | L136–154 (尤其 L139)<br>§P1.1 (L922–930) |
-| §6 数据入口速查 | `researchdata`、`dalton_sec`、`yfinance`、`estimates` 快照规则 | `docs/dalton/dev-guide/P0D-P1-data-and-onboarding.md` | §P0-D.2, §P0-D.5, §P0-D.6 (L804–811), 附录 A |
+| §5 合规口径 | 专家访谈、管理层交流<!-- DALTON_CAP:guidepoint -->、Guidepoint <!-- /DALTON_CAP -->合规可用；标身份不写姓名；单源估计<!-- DALTON_CAP:guidepoint -->；Guidepoint ≤20 词<!-- /DALTON_CAP --> | `~/.openclaw/workspace/skills/bullbear-discussion/references/common_task.md`<br>`docs/dalton/dev-guide/P0D-P1-data-and-onboarding.md` | L136–154 (尤其 L139)<br>§P1.1 (L922–930) |
+| §6 数据入口速查 | <!-- DALTON_CAP:researchdata_bridge -->`researchdata`、<!-- /DALTON_CAP -->`dalton_sec`、`yfinance`、`estimates` 快照规则 | `docs/dalton/dev-guide/P0D-P1-data-and-onboarding.md` | §P0-D.2, §P0-D.5, §P0-D.6 (L804–811), 附录 A |
 | §7 公司知识层读写约定 | PK.1 布局、PK.2 Schema、PK.4 工具、PK.6 托管块、wiki 只读 | `docs/dalton/dev-guide/PK-knowledge-governance-autonomy.md` | §PK.1, §PK.2, §PK.4, §PK.6 |
 
 ---
@@ -39,7 +39,7 @@
 | 章节 | 规则摘要 | 上游真源路径 | JSON 路径 / 行号 |
 |---|---|---|---|
 | §1 6 级来源层级与禁用来源 | Filing → 公司公告 → 署名研报/官方统计 → 独立产业数据 → 专家 → 新闻；禁用百度百科 | `p9a-research-playbook-v1.json`<br>`~/.openclaw/workspace/skills/company-preview/SKILL.md`<br>`company-deepdive-mx-0911/references/common_rules.md` | `$.evidence_discipline.source_hierarchy` (L275–298)<br>L33–57<br>L13–18 |
-| §2 `_sources.identity` 对照表 | `researchdata` 与 `dalton_sec` 14 类路由的身份映射 | `docs/dalton/dev-guide/P0D-P1-data-and-onboarding.md` | 附录 B (L1450–1468) |
+| §2 `_sources.identity` 对照表 | <!-- DALTON_CAP:researchdata_bridge -->`researchdata` 与 <!-- /DALTON_CAP -->`dalton_sec`<!-- DALTON_CAP:researchdata_bridge --> 14 类路由<!-- DALTON_CAP_ELSE --> 及公开数据源<!-- /DALTON_CAP -->的身份映射 | `docs/dalton/dev-guide/P0D-P1-data-and-onboarding.md` | 附录 B (L1450–1468) |
 | §3 来源链去重 | 同源转述只算一条；单一来源标"单源观点"；点赞转发不算共识 | `~/.openclaw/workspace/skills/bullbear-discussion/references/common_task.md`<br>`~/.openclaw/workspace/skills/company-preview/references/retrieval.md` | L33–47<br>L5, L50, L54 |
 | §4 关键数字双源验证 | 关键非财报数字至少两个独立来源 | `p9a-research-playbook-v1.json` | `$.evidence_discipline` (L285–305) |
 | §5 五类预期身份区分 | 指引、卖方一致预期、具体机构预测、买方门槛、作者判断；分歧不取平均 | `~/.openclaw/workspace/skills/bullbear-discussion/SKILL.md`<br>`bullbear-discussion/references/common_task.md` | L73, L76<br>L33–47 |
@@ -47,7 +47,7 @@
 | §7 "本轮未取得" vs "未披露" | 检索未命中写"本轮未取得"，限定在已覆盖范围 | `company-deepdive-mx-0911/references/common_rules.md` | L33 |
 | §8 推导与事实的边界 | 推算标"推算"+列假设、措辞降级；未披露≠不存在、组合均值不能识别单笔、有限检索不能推出"从不"（三条正反例） | 2026-10-30 生产复盘 R4（AMZN RPO 增量、MSFT RPO 期限、GOOGL 有限检索三案例），`REVIEW_24H_codex.md` §5 | thread 5b546b32 / 6a517794 / 2e02ccfb |
 | §9 数字底表原则 | 目标公司数字只取底表，不用相近数字顶替 | `company-deepdive-mx-0911/references/execution.md` | L66–68 |
-| §10–§11 合规口径与引用上限 | 专家合规全文；Guidepoint ≤20 词，其他 ≤3 句 | `bullbear-discussion/references/common_task.md`<br>`docs/dalton/dev-guide/P0D-P1-data-and-onboarding.md` | L136–154<br>§P0-D.2, §P1.1 (L922–930, L937) |
+| §10–§11 合规口径与引用上限 | 专家合规全文；<!-- DALTON_CAP:guidepoint -->Guidepoint ≤20 词，其他<!-- DALTON_CAP_ELSE -->原文引用<!-- /DALTON_CAP --> ≤3 句 | `bullbear-discussion/references/common_task.md`<br>`docs/dalton/dev-guide/P0D-P1-data-and-onboarding.md` | L136–154<br>§P0-D.2, §P1.1 (L922–930, L937) |
 
 ---
 

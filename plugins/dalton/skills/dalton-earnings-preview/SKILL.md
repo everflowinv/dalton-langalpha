@@ -35,11 +35,11 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 4. **基线快照**：
    - 读取工作区 `thesis.md`、`debate.md`、`drivers.md`、`management.md`；
    - 取公司上一季财报给出的最新官方指引作为比较基线；
-   - 调用 `researchdata.finance(route="estimates", ticker=T)` 获取一致预期快照，并按 P0-D.6 规范落盘到 `data/consensus/<YYYY-MM-DD_HHMM>.json`。
+   - <!-- DALTON_CAP:researchdata_bridge -->调用 `researchdata.finance(route="estimates", ticker=T)` 获取一致预期快照<!-- DALTON_CAP_ELSE -->通过公开市场数据与一致预期工具（如 Yahoo Finance 与公开行情接口）获取一致预期快照<!-- /DALTON_CAP -->，并按 P0-D.6 规范落盘到 `data/consensus/<YYYY-MM-DD_HHMM>.json`。
 
 ### Step 2：优先级 1 —— Buyside Bogey 与高频数字 Color（投入最大检索精力）
 
-按 [`references/retrieval.md`](references/retrieval.md) 必须分别检索内部研究库四个入口：**AlphaEngine、sales-notes、TMTB、FUNDA AI**（每个入口按公司名和 ticker 分别查）：
+按 [`references/retrieval.md`](references/retrieval.md) <!-- DALTON_CAP:alphaengine|researchdata_bridge -->必须分别检索内部研究库四个入口：**AlphaEngine、sales-notes、TMTB、FUNDA AI**（每个入口按公司名和 ticker 分别查）<!-- DALTON_CAP_ELSE -->通过 `web_search`、工作区历史笔记及公开市场/研究渠道，按公司名和 ticker 分别检索财报前瞻、一致预期修正与高频跟踪数据<!-- /DALTON_CAP -->：
 
 - **检索关键词**：`bogey`、`whisper`、`hurdle`、`investor expectations`、`into the print`、`买方预期`、`业绩门槛`、`渠道跟踪`，以及与该公司业务直接相关的高频指标（`sell-through`、`bookings`、`shipments`、`traffic`、`价格`、`排产`）。
 - **真实门槛五分（严禁混同）**：
@@ -55,7 +55,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ### Step 3：优先级 2 —— 业绩看法与关注点
 
-复用已读材料并补查**单公司前瞻、行业/板块前瞻（不要求标题含公司名，进正文/表格/附图查公司与别名）、sales 邮件、TMTB、FUNDA AI**：
+复用已读材料并补查**单公司前瞻、行业/板块前瞻（不要求标题含公司名，进正文/表格/附图查公司与别名）<!-- DALTON_CAP:researchdata_bridge -->、sales 邮件、TMTB、FUNDA AI<!-- DALTON_CAP_ELSE -->及公开机构评论<!-- /DALTON_CAP -->**：
 
 - **拆分短期与中期门槛**：严格区分“本季业绩 beat 不 beat”与“下季/全年指引及长期叙事的门槛”。
 - **区分市场焦点与本稿重点**：分别写清“市场最关注什么”和“本稿认为最决定预期差的变量是什么”，不把本稿判断伪装成市场共识。
@@ -79,7 +79,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 2. **按因果机制聚类（禁止按表面关键词合并）**：
    - 沿着“**共同前提 → 因果机制 → 关键变量 → 对盈利/估值的含义**”聚类。例如两位作者都谈订单，一个讲需求加速、一个讲供给受限，必须分成两条机制，不能因为都出现“订单”而合并。
 3. **独立性与来源链去重**：
-   - 称为“共享 narrative”至少需要 **≥2 个独立原始来源**支持；同一份卖方报告被邮件、TMTB、FUNDA AI、X 转述只算 **1 条来源链**；
+   - 称为“共享 narrative”至少需要 **≥2 个独立原始来源**支持；同一份卖方报告被<!-- DALTON_CAP:researchdata_bridge -->邮件、TMTB、FUNDA AI、X <!-- DALTON_CAP_ELSE -->多家媒体、资讯摘要或 X <!-- /DALTON_CAP -->转述只算 **1 条来源链**；
    - 仅单一来源支持的标“**单源观点**”；点赞量、转发量不证明机构共识。
 4. **可观察验证点、电话会必听问题与事前冻结（`frozen_pre_event=true`）**：
    - 每个核心 debate 必须绑定一个**本次财报可观察的验证点**（及管理层电话会最需关注的 3–4 个核心问题：为什么重要、什么回答证实、什么回答证伪、需要警惕的回避措辞）；
@@ -121,7 +121,7 @@ python3 .agents/skills/dalton-earnings-preview/scripts/predictions.py validate \
 1. **成稿落盘**：按 [`templates/preview.md`](templates/preview.md) 将中文前瞻写到 `drafts/<D>-preview-<季度>.md`。开头不超过 3 句话直接给核心判断（真实门槛、关键预期差、最需验证的判断）；每个数字首次出现带期间、单位/口径与来源身份（`（机构/身份 [引用N]）`）。
 2. **第 1 轮语言审查**：成稿后先调用 `check_language(draft_path="drafts/<D>-preview-<季度>.md", round=1)`（只标问题），读 `drafts/<D>-preview-<季度>.md.language.md` 清单并逐条修改草稿（只改语言表达，不动事实、数字、术语、引用编号与判断强度）。工具报错不算通过：重试或如实汇报未完成，不得跳过。
 3. **交付前自检清单**：
-   - [ ] AlphaEngine、sales-notes、TMTB、FUNDA AI 四个内部入口及行业前瞻均已按公司名和 ticker 检索；
+   - [ ] <!-- DALTON_CAP:alphaengine|researchdata_bridge -->AlphaEngine、sales-notes、TMTB、FUNDA AI 四个内部入口及行业前瞻<!-- DALTON_CAP_ELSE -->公开研究渠道、工作区笔记与行业前瞻<!-- /DALTON_CAP -->均已按公司名和 ticker 检索；
    - [ ] 关键引用均已读过正文全文（未仅凭搜索摘要引用）；
    - [ ] 图片表格中的数字已回原图核对正负号、小数点、单位和期间（`description_verified=false` 的自动识图描述未直接用作数字证据）；
    - [ ] 真实门槛五分清晰，buyside bogey 有明确来源或写明“本轮未找到有来源的买方数字门槛”；
@@ -136,7 +136,7 @@ python3 .agents/skills/dalton-earnings-preview/scripts/predictions.py validate \
    - **在 T−3 将预期门槛写入 `debate` 的事前冻结条目**：调用 `knowledge_update(doc="debate", ...)` 标注本次财报可检验的 debate，并在对应分歧的 `debates[].expectations[]` 中将财报前锁定的预期门槛写为 `frozen_pre_event: true` 条目——带齐 `metric`、`period`、`unit`、`street`/`buyside`/`house`（非空一侧必填 `value`、`basis`、`as_of`、`sources`）、`event_id`（如 `"META_FY26Q3_EARNINGS"`）、官方财报发布时刻 `t0`（ISO 8601 时间戳）、**三个均严格早于 `t0`（`< t0`）的时间戳** `published_at`（预期来源发布时间）、`acquired_at`（我方检索获取时间）、`frozen_at`（本次前瞻冻结时间，即 `as-of`）以及 `reconstructed: false`（样例见 `.agents/skills/dalton-knowledge/references/structured-write-example.md`）。若工作区的 `thesis` 已是 v2（含 `underwriting`），可同步更新 `thesis.market_view.observations`（每项含 `claim`、`who`、`as_of`、`sources`、`confidence`）；**若工作区的 `thesis` 还是 v1（没有 `underwriting`），收尾不要往 `thesis` 里单独加 `market_view.observations`**（一旦写入任何 v2 字段，整份 `thesis` 就会按 v2 校验并要求同时补齐 `underwriting` 与 `house_view` 的全部 v2 字段）；
    - 调用 `knowledge_append_verdict` 记录事件五词结论（`trigger.kind="earnings"`，`trigger.ref` 填 `<dalton_wake>` 的 `tm3` 信号 id 或 `"manual"`；通常为 `NO_CHANGE`，若前瞻研究已改变判断则如实填写），并在同次调用的 `agenda_ops` 中加入“财报发布当天对照 `debate` 中 `frozen_pre_event=true` 冻结门槛与 `research/<D>-preview-<季度>/predictions.json` 逐条核对”的验证项；
    - 调用 `check_draft(draft_path="drafts/<D>-preview-<季度>.md")` 生成数字核验反馈；PM 要求正式发布时调用 `publish_report(draft_path="drafts/<D>-preview-<季度>.md", title="<公司名>（<TICKER>）<季度> 财报前瞻", kind="earnings_preview", slug="<ticker-lower>-preview-<季度小写>-<D>")`；
-   - **推送稿两轮语言审查与原样回复**：按 `.agents/skills/dalton-conventions/SKILL.md` §8 将推送正文写入 `research/push/<D>-earnings-preview-<季度>.md`，完成两轮 `check_language` 后以该文件全文逐字作为最后回复（外部通知由 Dalton 通知模块按用户的飞书开关统一处理）。
+   - **推送稿两轮语言审查与原样回复**：按 `.agents/skills/dalton-conventions/SKILL.md` §8 将推送正文写入 `research/push/<D>-earnings-preview-<季度>.md`，完成两轮 `check_language` 后以该文件全文逐字作为最后回复（外部通知由 Dalton 通知模块按用户的<!-- DALTON_CAP:channel_feishu -->飞书<!-- DALTON_CAP_ELSE -->通知<!-- /DALTON_CAP -->开关统一处理）。
 
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 

@@ -1,8 +1,9 @@
-"""PostgreSQL persistence for Dalton data source health checks and daily data map cache (`d011`).
+"""PostgreSQL persistence for Dalton data source health checks and capability-scoped daily data map cache (`d011`, `d046`).
 
 Multi-worker invariant: all health status and daily rendered data map state live in PostgreSQL
-(`dalton_data_source_health` and `dalton_data_map_cache`). Never cache health or data map state
-in process-local module variables.
+(`dalton_data_source_health` and `dalton_data_map_scoped_cache`). The legacy `dalton_data_map_cache`
+table is left untouched for rolling-upgrade compatibility with previous backends. Never cache health
+or data map state in process-local module variables.
 """
 
 from __future__ import annotations
@@ -286,23 +287,37 @@ async def fetch_conversation_archive_stats(
     }
 
 
+def _resolve_cache_fingerprint(fingerprint: str | None) -> str:
+    if fingerprint is not None:
+        cleaned = str(fingerprint).strip()
+        if cleaned:
+            return cleaned
+    from src.dalton.capabilities import capabilities_fingerprint
+
+    return capabilities_fingerprint()
+
+
 async def get_cached_data_map(
     cache_date: date,
     *,
+    capabilities_fingerprint: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any] | None:
-    """Fetch the cached data map row for `cache_date` from `dalton_data_map_cache`, or None."""
+    """Fetch the capability-scoped cached data map row for ``(cache_date, capabilities_fingerprint)``."""
+    fp = _resolve_cache_fingerprint(capabilities_fingerprint)
     sql = """
         SELECT cache_date,
+               capabilities_fingerprint,
                rendered_markdown,
                payload,
                updated_at
-        FROM dalton_data_map_cache
+        FROM dalton_data_map_scoped_cache
         WHERE cache_date = %s
+          AND capabilities_fingerprint = %s
     """
     async with get_db_connection(conn) as db_conn:
         async with db_conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(sql, (cache_date,))
+            await cur.execute(sql, (cache_date, fp))
             row = await cur.fetchone()
             if not isinstance(row, Mapping):
                 return None
@@ -312,6 +327,7 @@ async def get_cached_data_map(
             updated_at = row.get("updated_at")
             return {
                 "cache_date": str(row.get("cache_date") or cache_date.isoformat()),
+                "capabilities_fingerprint": str(row.get("capabilities_fingerprint") or fp),
                 "rendered_markdown": md,
                 "payload": dict(row.get("payload") or {}) if isinstance(row.get("payload"), Mapping) else {},
                 "updated_at": (
@@ -322,23 +338,100 @@ async def get_cached_data_map(
             }
 
 
+async def get_latest_cached_route_metadata(
+    *,
+    capabilities_fingerprint: str | None = None,
+    conn: Any = None,
+) -> tuple[list[dict[str, Any]] | None, set[str] | None]:
+    """Read the most recent persisted ``catalog_routes`` and ``handoff_routes`` metadata.
+
+    Filters ``dalton_data_map_scoped_cache`` by the active capability fingerprint so
+    different profiles/capability sets sharing a database never cross-contaminate
+    each other's cached routes. Falls back (read-only) to the legacy
+    ``dalton_data_map_cache`` table only in non-Core profiles so a post-``d046``
+    Everflow startup backfill preserves dynamic routes without re-probing.
+    """
+    from src.dalton.profile import is_core_profile
+
+    fp = _resolve_cache_fingerprint(capabilities_fingerprint)
+    queries: list[tuple[str, tuple[Any, ...]]] = [
+        (
+            """
+            SELECT payload
+            FROM dalton_data_map_scoped_cache
+            WHERE capabilities_fingerprint = %s
+            ORDER BY cache_date DESC, updated_at DESC
+            LIMIT 1
+            """,
+            (fp,),
+        ),
+    ]
+    if not is_core_profile():
+        queries.append(
+            (
+                """
+                SELECT payload
+                FROM dalton_data_map_cache
+                WHERE (
+                    payload->>'capabilities_fingerprint' IS NULL
+                    OR payload->>'capabilities_fingerprint' = %s
+                )
+                ORDER BY cache_date DESC, updated_at DESC
+                LIMIT 1
+                """,
+                (fp,),
+            )
+        )
+    for sql, params in queries:
+        try:
+            async with get_db_connection(conn) as db_conn:
+                async with db_conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(sql, params)
+                    row = await cur.fetchone()
+        except Exception:
+            continue
+        if not isinstance(row, Mapping):
+            continue
+        payload = row.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        raw_catalog = payload.get("catalog_routes")
+        raw_handoff = payload.get("handoff_routes")
+        catalog_routes = (
+            [dict(r) for r in raw_catalog if isinstance(r, Mapping)]
+            if isinstance(raw_catalog, list)
+            else None
+        )
+        handoff_routes = (
+            {str(r).strip() for r in raw_handoff if str(r).strip()}
+            if isinstance(raw_handoff, list)
+            else None
+        )
+        if catalog_routes is not None or handoff_routes is not None:
+            return catalog_routes, handoff_routes
+    return None, None
+
+
 async def upsert_cached_data_map(
     cache_date: date,
     rendered_markdown: str,
     payload: Mapping[str, Any] | None = None,
     *,
+    capabilities_fingerprint: str | None = None,
     conn: Any = None,
 ) -> None:
-    """Write or overwrite the daily cached data map in `dalton_data_map_cache`."""
+    """Write or overwrite the capability-scoped daily cached data map in `dalton_data_map_scoped_cache`."""
+    fp = _resolve_cache_fingerprint(capabilities_fingerprint)
     sql = """
-        INSERT INTO dalton_data_map_cache (
+        INSERT INTO dalton_data_map_scoped_cache (
             cache_date,
+            capabilities_fingerprint,
             rendered_markdown,
             payload,
             updated_at
         )
-        VALUES (%s, %s, %s, NOW())
-        ON CONFLICT (cache_date) DO UPDATE SET
+        VALUES (%s, %s, %s, %s, NOW())
+        ON CONFLICT (cache_date, capabilities_fingerprint) DO UPDATE SET
             rendered_markdown = EXCLUDED.rendered_markdown,
             payload           = EXCLUDED.payload,
             updated_at        = NOW()
@@ -350,6 +443,7 @@ async def upsert_cached_data_map(
                     sql,
                     (
                         cache_date,
+                        fp,
                         str(rendered_markdown),
                         Jsonb(dict(payload or {})),
                     ),
