@@ -2258,7 +2258,7 @@ class TestSandboxNetworkAndInitScript:
             ),
             (
                 "fail-versions-unchanged-pure-dalton",
-                'echo "rev1"; exit 0',
+                'if [[ "$*" == *"alembic_version_dalton"* ]]; then echo "d046"; else echo "rev1"; fi; exit 0',
                 'echo "[migrate] transactional d049 rolled back" >&2; exit 1',
                 "exit 0",
                 ["--skip-build"],
@@ -2301,6 +2301,11 @@ class TestSandboxNetworkAndInitScript:
                     'revision = "rev1"\ndown_revision = None\n',
                     encoding="utf-8",
                 )
+                (urel / "src/dalton/migrations/versions").mkdir(parents=True, exist_ok=True)
+                (urel / "src/dalton/migrations/versions/d049_head.py").write_text(
+                    'revision = "d049"\ndown_revision = "d046"\n',
+                    encoding="utf-8",
+                )
                 (uwork / "release_marker.txt").write_text("before-v1\n", encoding="utf-8")
                 (urel / "release_marker.txt").write_text("after-v2\n", encoding="utf-8")
             for target_dir in (uwork, urel):
@@ -2333,6 +2338,7 @@ class TestSandboxNetworkAndInitScript:
                 'if [[ "$*" == *" images -q "* ]]; then echo "img123"; exit 0; fi\n'
                 'if [[ "$1" == "tag" ]]; then exit 0; fi\n'
                 f'if [[ "$*" == *" build "* ]]; then {build_body}; fi\n'
+                'if [[ "$*" == *"pg_stat_activity"* ]]; then echo "0"; exit 0; fi\n'
                 f'if [[ "$*" == *" psql "* ]]; then {psql_behavior}; fi\n'
                 f'if [[ "$*" == *" run --rm migrate"* ]]; then printf "DB_NAME=%s\\nARGS=%s\\n" "${{DB_NAME:-UNSET}}" "$*" > "{seen_migrate_env}"; {migrate_body}; fi\n'
                 "exit 0\n",
@@ -2384,7 +2390,8 @@ class TestSandboxNetworkAndInitScript:
                 assert "ALREADY restored the pre-upgrade release files" in res_sc.stderr, (
                     f"{scenario}: expected §6.3 auto-recovery rolled_back guide, got:\n{res_sc.stderr}"
                 )
-                assert "rolled back automatically" in res_sc.stderr
+                assert "d046 attempting only pure-transactional d049" in res_sc.stderr
+                assert "backend /health passed" in res_sc.stderr
                 assert "no data restore required" in res_sc.stderr
                 assert (uwork / "release_marker.txt").read_text(encoding="utf-8").strip() == "before-v1"
                 trace_text = docker_trace.read_text(encoding="utf-8")
@@ -5426,6 +5433,7 @@ class TestSandboxNetworkAndInitScript:
                 'if [[ "$*" == *"alembic_version"* ]]; then echo "up_head"; exit 0; fi\n'
                 'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
                 'if [[ "$*" == *"FROM pg_database"* ]]; then echo "postgres"; exit 0; fi\n'
+                'if [[ "$*" == *"pg_stat_activity"* ]]; then echo "0"; exit 0; fi\n'
                 'if [[ "$*" == *"pg_class"* ]]; then printf "0\\t0\\t0\\n"; exit 0; fi\n'
                 'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
                 'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
@@ -5862,6 +5870,7 @@ class TestSandboxNetworkAndInitScript:
                     'if [[ "$*" == *"alembic_version"* ]]; then echo "up_head"; exit 0; fi\n'
                     'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
                     'if [[ "$*" == *"FROM pg_database"* ]]; then echo "postgres"; exit 0; fi\n'
+                    'if [[ "$*" == *"pg_stat_activity"* ]]; then echo "0"; exit 0; fi\n'
                     'if [[ "$*" == *"pg_class"* ]]; then printf "0\\t0\\t0\\n"; exit 0; fi\n'
                     'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
                     'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'

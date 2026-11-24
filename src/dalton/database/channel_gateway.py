@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+import math
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -1641,6 +1642,7 @@ async def _register_and_resolve_weixin_inbound(
                                 generation=existing.get("session_generation"),
                             )
                             if cb_id:
+                                out_rep["collection_mode"] = "appended"
                                 out_rep["collect_buffer_id"] = cb_id
                                 out_rep["collect_buffer_status"] = cb_status
                             return out_rep
@@ -1656,6 +1658,7 @@ async def _register_and_resolve_weixin_inbound(
                             pending_interrupt=existing.get("pending_interrupt_snapshot"),
                         )
                         if cb_id:
+                            out_rep["collection_mode"] = "appended"
                             out_rep["collect_buffer_id"] = cb_id
                             out_rep["collect_buffer_status"] = cb_status
                         return out_rep
@@ -2286,6 +2289,13 @@ async def _register_and_resolve_weixin_inbound(
                 "deny_reason": "ilink_user_conflict_auto_unbound",
                 "one_time_weixin_reply": ver_res.get("one_time_weixin_reply"),
                 "accounts_revision": ver_res.get("accounts_revision"),
+            }
+        if ver_res["outcome"] == "denied":
+            return {
+                "existing_status": None,
+                "linked": True,
+                "allowed": False,
+                "deny_reason": ver_res.get("deny_reason") or "weixin_channel_disabled",
             }
         if ver_res["outcome"] == "stale_generation":
             return {
@@ -4844,6 +4854,20 @@ async def _execute_weixin_collect_or_help_command(
                     "deny_reason": "ilink_user_conflict_auto_unbound",
                     "one_time_weixin_reply": ver.get("one_time_weixin_reply"),
                 }
+            if ver["outcome"] == "denied":
+                return {
+                    "ok": False,
+                    "linked": True,
+                    "allowed": False,
+                    "deny_reason": ver.get("deny_reason") or "weixin_channel_disabled",
+                }
+            if ver["outcome"] == "stale_generation":
+                return {
+                    "ok": False,
+                    "linked": True,
+                    "allowed": False,
+                    "deny_reason": "weixin_bot_generation_superseded",
+                }
             continue
 
         if home_ensure_uid is not None:
@@ -5073,11 +5097,18 @@ async def _run_session_command_with_d11(
                     "ok": False,
                     "linked": False,
                     "allowed": False,
-                    "deny_reason": "conflict_auto_unbound",
+                    "deny_reason": "ilink_user_conflict_auto_unbound",
                 }
                 if verify_res.get("one_time_weixin_reply"):
                     out["one_time_weixin_reply"] = verify_res["one_time_weixin_reply"]
                 return out
+            if verify_res.get("outcome") == "denied":
+                return {
+                    "ok": False,
+                    "linked": True,
+                    "allowed": False,
+                    "deny_reason": verify_res.get("deny_reason") or "weixin_channel_disabled",
+                }
             if verify_res.get("outcome") == "stale_generation":
                 return {
                     "ok": False,
@@ -5522,16 +5553,15 @@ async def _execute_session_command_once(
                     )
 
                 # 1. Identity verification (including re-authorization on redelivery / startup recovery)
+                # R7 (Decision #3): On sender/account mismatch against an existing (platform, message_id)
+                # row, return denial WITHOUT mutating the stored status, command_result, or reply state!
                 if orig_puid and cleaned_puid and orig_puid != cleaned_puid:
-                    return await _deny_and_ignore_command(
-                        {
-                            "ok": False,
-                            "linked": False,
-                            "allowed": False,
-                            "deny_reason": "not_linked",
-                        },
-                        uid_val=None,
-                    )
+                    return {
+                        "ok": False,
+                        "linked": False,
+                        "allowed": False,
+                        "deny_reason": "not_linked",
+                    }
 
                 wx_acc_row: dict[str, Any] | None = None
                 pending_wx_account: dict[str, Any] | None = None
@@ -5549,6 +5579,13 @@ async def _execute_session_command_once(
                     or cleaned_address.startswith("weixin:group:")
                     or cleaned_scope.startswith("chat:")
                 ):
+                    if existing_inbound is not None:
+                        return {
+                            "ok": False,
+                            "linked": False,
+                            "allowed": False,
+                            "deny_reason": "weixin_group_unsupported",
+                        }
                     return await _deny_and_ignore_command(
                         {
                             "ok": False,
@@ -5589,17 +5626,20 @@ async def _execute_session_command_once(
                             if (eff_cmd_wx_bot and eff_cmd_wx_bot != wx_bot) or (
                                 eff_cmd_wx_gen is not None and eff_cmd_wx_gen != wx_gen
                             ):
+                                bot_deny = {
+                                    "ok": False,
+                                    "linked": True,
+                                    "allowed": False,
+                                    "deny_reason": (
+                                        "weixin_bot_generation_superseded"
+                                        if wx_st == "pending_verification"
+                                        else "weixin_bot_generation_mismatch"
+                                    ),
+                                }
+                                if existing_inbound is not None:
+                                    return bot_deny
                                 return await _deny_and_ignore_command(
-                                    {
-                                        "ok": False,
-                                        "linked": True,
-                                        "allowed": False,
-                                        "deny_reason": (
-                                            "weixin_bot_generation_superseded"
-                                            if wx_st == "pending_verification"
-                                            else "weixin_bot_generation_mismatch"
-                                        ),
-                                    },
+                                    bot_deny,
                                     uid_val=None,
                                 )
                             if wx_st == "pending_verification":
@@ -5613,24 +5653,30 @@ async def _execute_session_command_once(
                                     wx_acc_row.get("platform_user_id")
                                     and str(wx_acc_row["platform_user_id"]) != cleaned_puid
                                 ):
+                                    sender_deny = {
+                                        "ok": False,
+                                        "linked": False,
+                                        "allowed": False,
+                                        "deny_reason": "weixin_sender_mismatch",
+                                    }
+                                    if existing_inbound is not None:
+                                        return sender_deny
                                     return await _deny_and_ignore_command(
-                                        {
-                                            "ok": False,
-                                            "linked": False,
-                                            "allowed": False,
-                                            "deny_reason": "weixin_sender_mismatch",
-                                        },
+                                        sender_deny,
                                         uid_val=None,
                                     )
                                 identity = wx_acc_row
                             else:
+                                st_deny = {
+                                    "ok": False,
+                                    "linked": True,
+                                    "allowed": False,
+                                    "deny_reason": f"weixin_account_{wx_st}",
+                                }
+                                if existing_inbound is not None:
+                                    return st_deny
                                 return await _deny_and_ignore_command(
-                                    {
-                                        "ok": False,
-                                        "linked": True,
-                                        "allowed": False,
-                                        "deny_reason": f"weixin_account_{wx_st}",
-                                    },
+                                    st_deny,
                                     uid_val=None,
                                 )
                         else:
@@ -5713,6 +5759,10 @@ async def _execute_session_command_once(
                     if (orig_uid and orig_uid != resolved_identity_uid) or (
                         cleaned_uid and cleaned_uid != resolved_identity_uid
                     ):
+                        # Same platform_user_id rebound to a different Dalton user -> retire
+                        # pending reply row so redelivery never leaks old owner's workspaces.
+                        # (Different platform_user_id collision was already rejected at L5541
+                        # without modifying the original member's row.)
                         return await _deny_and_ignore_command(
                             {
                                 "ok": False,
@@ -5729,6 +5779,13 @@ async def _execute_session_command_once(
                     if not check_uid or (
                         orig_uid and cleaned_uid and orig_uid != cleaned_uid
                     ):
+                        if existing_inbound is not None:
+                            return {
+                                "ok": False,
+                                "linked": False,
+                                "allowed": False,
+                                "deny_reason": "not_linked",
+                            }
                         return await _deny_and_ignore_command(
                             {
                                 "ok": False,
@@ -6918,54 +6975,35 @@ async def _execute_session_command_once(
                     )
                     if context_stamp is not None:
                         (
-                            stamp_token,
-                            stamp_key,
+                            _stamp_token,
+                            _stamp_key,
                             stamp_aid,
                             stamp_bot,
                             stamp_gen,
                             stamp_seq,
                         ) = context_stamp
-                        if stamp_token is not None and stamp_key is not None:
-                            await cur.execute(
-                                """
-                                UPDATE dalton_channel_inbound_events
-                                SET encrypted_weixin_context_token = pgp_sym_encrypt(%s, %s),
-                                    weixin_account_id = %s::uuid,
-                                    weixin_context_bot_id = %s,
-                                    weixin_context_bot_generation = %s,
-                                    weixin_context_seq = %s,
-                                    updated_at = NOW()
-                                WHERE platform = %s AND message_id = %s
-                                """,
-                                (
-                                    stamp_token,
-                                    stamp_key,
-                                    stamp_aid,
-                                    stamp_bot,
-                                    stamp_gen,
-                                    stamp_seq,
-                                    cleaned_platform,
-                                    cleaned_msg_id,
-                                ),
-                            )
-                        else:
-                            await cur.execute(
-                                """
-                                UPDATE dalton_channel_inbound_events
-                                SET weixin_account_id = %s::uuid,
-                                    weixin_context_bot_id = %s,
-                                    weixin_context_bot_generation = %s,
-                                    updated_at = NOW()
-                                WHERE platform = %s AND message_id = %s
-                                """,
-                                (
-                                    stamp_aid,
-                                    stamp_bot,
-                                    stamp_gen,
-                                    cleaned_platform,
-                                    cleaned_msg_id,
-                                ),
-                            )
+                        # R7 (Decision #7): Never duplicate context_token into the legacy
+                        # dalton_channel_inbound_events.encrypted_weixin_context_token column;
+                        # token ciphertext lives exclusively in dalton_channel_weixin_account_tokens.
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_inbound_events
+                            SET weixin_account_id = %s::uuid,
+                                weixin_context_bot_id = %s,
+                                weixin_context_bot_generation = %s,
+                                weixin_context_seq = COALESCE(%s, weixin_context_seq),
+                                updated_at = NOW()
+                            WHERE platform = %s AND message_id = %s
+                            """,
+                            (
+                                stamp_aid,
+                                stamp_bot,
+                                stamp_gen,
+                                stamp_seq,
+                                cleaned_platform,
+                                cleaned_msg_id,
+                            ),
+                        )
 
                 return {
                     **cmd_result,
@@ -8811,6 +8849,124 @@ async def _store_discord_body_phase(
     return requested
 
 
+DELIVERY_DEFER_BASE_SECONDS = 30
+DELIVERY_DEFER_MAX_BACKOFF_SECONDS = 600
+DELIVERY_DEFER_MAX_WINDOW_SECONDS = 86400
+
+
+def _compute_defer_backoff_seconds(defer_count: int) -> int:
+    """Exponential backoff starting at 30s, capped at 600s (10 minutes)."""
+    exp = max(0, int(defer_count) - 1)
+    return min(
+        DELIVERY_DEFER_MAX_BACKOFF_SECONDS,
+        DELIVERY_DEFER_BASE_SECONDS * (2**exp),
+    )
+
+
+async def _check_deferred_delivery_in_tx(
+    cur: Any,
+    existing: dict[str, Any],
+    *,
+    is_current: bool = False,
+) -> dict[str, Any] | None:
+    """Evaluate a ``status == 'deferred'`` delivery row on I-6 claim.
+
+    Returns:
+    - ``None`` when ``next_retry_at <= db_now`` (due for re-claim);
+    - A ``claim_status == 'deferred'`` dict when not yet due;
+    - A ``claim_status == 'denied', status == 'failed', code == 'deferred_timeout'``
+      dict (transitioning the row to ``failed`` + writing Weixin audit log) once
+      ``db_now - first_deferred_at >= 24h``.
+    """
+    db_now = await _fetch_db_now(cur)
+    first_def_at = _coerce_utc_datetime(existing.get("first_deferred_at"))
+    next_retry_at = _coerce_utc_datetime(existing.get("next_retry_at"))
+    defer_count = int(existing.get("defer_count") or 0)
+    ex_key = str(existing["delivery_key"])
+    ex_plat = str(existing.get("platform") or "").strip().lower()
+    ex_uid = str(existing.get("user_id") or "").strip()
+
+    if (
+        first_def_at is not None
+        and (db_now - first_def_at).total_seconds() >= DELIVERY_DEFER_MAX_WINDOW_SECONDS
+    ):
+        err_code = str(existing.get("error_code") or "deferred_timeout")[:64]
+        err_msg = str(
+            existing.get("error_message")
+            or "Delivery defer window (24h) exceeded."
+        )
+        await cur.execute(
+            """
+            UPDATE dalton_channel_deliveries
+            SET status = 'failed',
+                next_retry_at = NULL,
+                error_code = COALESCE(error_code, %s::varchar),
+                error_message = COALESCE(error_message, %s::text),
+                updated_at = NOW()
+            WHERE delivery_key = %s
+            """,
+            (err_code, err_msg, ex_key),
+        )
+        if ex_plat == "weixin":
+            await wx_db.write_weixin_audit_log_in_tx(
+                cur,
+                action="delivery_deferred_timeout",
+                operator_user_id="system:delivery-defer",
+                target_user_id=(
+                    ex_uid
+                    if ex_uid and not ex_uid.startswith("unlinked:")
+                    else None
+                ),
+                weixin_account_id=(
+                    str(existing["weixin_account_id"])
+                    if existing.get("weixin_account_id")
+                    else None
+                ),
+                ilink_bot_id=existing.get("weixin_bot_id"),
+                ilink_user_id=existing.get("weixin_recipient_id"),
+                reason=err_msg,
+                metadata={
+                    "delivery_key": ex_key,
+                    "defer_count": defer_count,
+                    "first_deferred_at": first_def_at.isoformat(),
+                    "error_code": err_code,
+                    "expired_on": "authorize_and_claim",
+                },
+            )
+        return {
+            "claim_status": "denied",
+            "status": "failed",
+            "code": "deferred_timeout",
+            "message": "Delivery defer window (24h) exceeded.",
+            "platform": existing["platform"],
+            "target_address": existing["target_address"],
+            "delivery_attempt": _delivery_attempt(existing),
+            "defer_count": defer_count,
+            "first_deferred_at": first_def_at.isoformat(),
+            "is_current": is_current,
+        }
+
+    if next_retry_at is not None and next_retry_at > db_now:
+        remaining = (next_retry_at - db_now).total_seconds()
+        retry_after = max(1, int(math.ceil(remaining)))
+        return {
+            "claim_status": "deferred",
+            "status": "deferred",
+            "code": "delivery_deferred",
+            "message": "Delivery is deferred and not yet due for retry.",
+            "platform": existing["platform"],
+            "target_address": existing["target_address"],
+            "delivery_attempt": _delivery_attempt(existing),
+            "defer_count": defer_count,
+            "first_deferred_at": first_def_at.isoformat() if first_def_at else None,
+            "next_retry_at": next_retry_at.isoformat(),
+            "retry_after_seconds": retry_after,
+            "is_current": is_current,
+        }
+
+    return None
+
+
 async def authorize_and_claim_delivery(
     *,
     delivery_key: str,
@@ -8892,11 +9048,17 @@ async def authorize_and_claim_delivery(
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
+                plat_hint = cleaned_platform or (
+                    cleaned_target.split(":", 1)[0].strip().lower()
+                    if cleaned_target and ":" in cleaned_target
+                    else None
+                )
                 await wx_db.verify_gateway_epoch_in_tx(
                     cur,
                     gateway_epoch,
                     required=require_gateway_epoch,
-                    platform=platform,
+                    platform=plat_hint,
+                    enforce_post_lease_for_non_weixin=False,
                 )
                 # Serialize concurrent claims on the same delivery_key
                 await cur.execute(
@@ -8916,6 +9078,13 @@ async def authorize_and_claim_delivery(
                 # True only when this claim may persist activity_origin conversation -> replay.
                 replay_recovery = False
                 if existing:
+                    if str(existing.get("platform") or "").strip().lower() == "weixin":
+                        await wx_db.verify_gateway_epoch_in_tx(
+                            cur,
+                            gateway_epoch,
+                            required=require_gateway_epoch,
+                            platform="weixin",
+                        )
                     reject_company_system_auth(existing.get("user_id"))
                     ex_scope = (
                         str(existing.get("source_scope_key") or "").strip() or None
@@ -9077,6 +9246,12 @@ async def authorize_and_claim_delivery(
                             "thread_scope_key": ex_scope_key,
                             "is_current": ex_is_current,
                         }
+                    if ex_status == "deferred":
+                        deferred_res = await _check_deferred_delivery_in_tx(
+                            cur, existing, is_current=ex_is_current
+                        )
+                        if deferred_res is not None:
+                            return deferred_res
 
                 # Guard final text fallback (`fallback:<run_id>`) when an `unknown` current-turn text delivery exists (§1.3.3)
                 if cleaned_kind == "fallback" or cleaned_key.startswith("fallback:"):
@@ -9608,6 +9783,37 @@ async def authorize_and_claim_delivery(
                     eff_source_scope = persisted_scope
                     eff_source_gen = persisted_gen
 
+                    # R7 (Decision #4): Verify live DB current session_generation against the
+                    # source turn's persisted generation (not just caller-supplied values) so
+                    # delayed deliveries from pre-/new or pre-workspace-switch turns are rejected.
+                    if (
+                        resolved_platform == "weixin"
+                        and eff_source_scope
+                        and eff_source_gen is not None
+                    ):
+                        await cur.execute(
+                            """
+                            SELECT generation
+                            FROM dalton_channel_session_generations
+                            WHERE platform = 'weixin'
+                              AND scope_key = %s
+                              AND dalton_user_id = %s
+                            """,
+                            (eff_source_scope, resolved_user_id),
+                        )
+                        live_sg_row = await cur.fetchone()
+                        if (
+                            live_sg_row is not None
+                            and live_sg_row.get("generation") is not None
+                            and int(live_sg_row["generation"]) != int(eff_source_gen)
+                        ):
+                            return {
+                                "claim_status": "denied",
+                                "status": "failed",
+                                "code": "session_generation_superseded",
+                                "message": "Weixin session generation was advanced after the source turn.",
+                            }
+
                     if resolved_platform == "weixin":
                         weixin_source_row = dict(source_row)
                         src_tbl = str(source_row.get("_source_table") or "")
@@ -9847,6 +10053,7 @@ async def authorize_and_claim_delivery(
                         )
                         if (
                             cur_source
+                            and str(cur_source["platform"]).lower() == resolved_platform
                             and str(cur_source["target_address"])
                             == resolved_target_address
                         ):
@@ -9865,8 +10072,93 @@ async def authorize_and_claim_delivery(
                                 persisted_c_gen = int(cur_source["session_generation"])
                             elif cur_source.get("generation") is not None:
                                 persisted_c_gen = int(cur_source["generation"])
+                            elif (
+                                isinstance(cur_source.get("raw_payload"), dict)
+                                and cur_source["raw_payload"].get("generation") is not None
+                            ):
+                                persisted_c_gen = int(
+                                    cur_source["raw_payload"]["generation"]
+                                )
+                            # R7 (Decision #4): When kind=agent_send specifies target equal
+                            # to the current Weixin conversation address (e.g. `weixin:@me`),
+                            # enforce the EXACT same source run_id / bot_generation / account
+                            # verification as Scenario A2 (never bypass via "proactive")!
+                            if resolved_platform == "weixin":
+                                lookup_c_tid = (
+                                    normalize_uuid(cur_source.get("thread_id")) or norm_tid
+                                )
+                                if (
+                                    persisted_c_scope is None or persisted_c_gen is None
+                                ) and lookup_c_tid:
+                                    await cur.execute(
+                                        """
+                                        SELECT dalton_user_id, scope_key, generation
+                                        FROM dalton_channel_thread_watches
+                                        WHERE thread_id = %s
+                                        """,
+                                        (lookup_c_tid,),
+                                    )
+                                    wc_extra = await cur.fetchone()
+                                    if (
+                                        wc_extra
+                                        and str(wc_extra.get("dalton_user_id") or "")
+                                        == resolved_user_id
+                                    ):
+                                        if persisted_c_scope is None and wc_extra.get(
+                                            "scope_key"
+                                        ):
+                                            persisted_c_scope = (
+                                                str(wc_extra["scope_key"]).strip() or None
+                                            )
+                                        if (
+                                            persisted_c_gen is None
+                                            and wc_extra.get("generation") is not None
+                                        ):
+                                            persisted_c_gen = int(wc_extra["generation"])
+                                weixin_source_row = dict(cur_source)
+                                src_c_tbl = str(cur_source.get("_source_table") or "")
+                                matched_c_exact = bool(
+                                    cur_source.get("_matched_exact_run")
+                                )
+                                if (
+                                    not cleaned_rid
+                                    or not matched_c_exact
+                                    or src_c_tbl not in ("inbound_events", "background_runs")
+                                ):
+                                    weixin_source_kind = "unmatched_run"
+                                elif src_c_tbl == "background_runs":
+                                    weixin_source_kind = "background_run"
+                                else:
+                                    weixin_source_kind = "inbound"
 
                     if is_current:
+                        if (
+                            resolved_platform == "weixin"
+                            and persisted_c_scope
+                            and persisted_c_gen is not None
+                        ):
+                            await cur.execute(
+                                """
+                                SELECT generation
+                                FROM dalton_channel_session_generations
+                                WHERE platform = 'weixin'
+                                  AND scope_key = %s
+                                  AND dalton_user_id = %s
+                                """,
+                                (persisted_c_scope, resolved_user_id),
+                            )
+                            live_c_sg = await cur.fetchone()
+                            if (
+                                live_c_sg is not None
+                                and live_c_sg.get("generation") is not None
+                                and int(live_c_sg["generation"]) != int(persisted_c_gen)
+                            ):
+                                return {
+                                    "claim_status": "denied",
+                                    "status": "failed",
+                                    "code": "session_generation_superseded",
+                                    "message": "Weixin session generation was advanced after the source turn.",
+                                }
                         if eff_source_scope is not None and (
                             persisted_c_scope is None
                             or eff_source_scope != persisted_c_scope
@@ -10273,6 +10565,7 @@ async def authorize_and_claim_delivery(
                     )
                     ON CONFLICT (delivery_key) DO UPDATE SET
                         status = 'in_flight',
+                        next_retry_at = NULL,
                         is_current = EXCLUDED.is_current,
                         has_non_empty_text = EXCLUDED.has_non_empty_text,
                         platform = EXCLUDED.platform,
@@ -10369,6 +10662,7 @@ async def update_delivery_progress(
     files_status: list[Any] | None = None,
     first_response_json: dict[str, Any] | None = None,
     status: str | None = None,
+    outcome: str | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
     confirmed_thread_address: str | None = None,
@@ -10390,6 +10684,7 @@ async def update_delivery_progress(
             files_status=files_status,
             first_response_json=first_response_json,
             status=status,
+            outcome=outcome,
             error_code=error_code,
             error_message=error_message,
             confirmed_thread_address=confirmed_thread_address,
@@ -10411,6 +10706,7 @@ async def _update_delivery_progress_once(
     files_status: list[Any] | None = None,
     first_response_json: dict[str, Any] | None = None,
     status: str | None = None,
+    outcome: str | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
     confirmed_thread_address: str | None = None,
@@ -10428,7 +10724,10 @@ async def _update_delivery_progress_once(
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
                 await wx_db.verify_gateway_epoch_in_tx(
-                    cur, gateway_epoch, required=require_gateway_epoch
+                    cur,
+                    gateway_epoch,
+                    required=require_gateway_epoch,
+                    enforce_post_lease_for_non_weixin=False,
                 )
                 # 0. Serialize with authorize_and_claim_delivery on the same delivery_key
                 await cur.execute(
@@ -10514,7 +10813,13 @@ async def _update_delivery_progress_once(
                 )
 
                 prev_status = str(row["status"])
-                new_status = str(status or prev_status)
+                eff_outcome = str(outcome or "").strip().lower() or None
+                eff_req_status = str(status or "").strip().lower() or None
+                is_deferred_req = (
+                    eff_outcome == "deferred" or eff_req_status == "deferred"
+                )
+                effective_status_arg = status if status is not None else outcome
+                new_status = str(effective_status_arg or prev_status)
                 # A named generation must still be the current one before any
                 # column changes. Omitted generations keep the previous update
                 # rules for callers that have not adopted the token.
@@ -10527,6 +10832,124 @@ async def _update_delivery_progress_once(
                     _reject_delivery_update(
                         409, "delivery_attempt is no longer the current attempt"
                     )
+                if is_deferred_req:
+                    if prev_status in ("sent", "partial"):
+                        _reject_delivery_update(
+                            409, "Completed delivery cannot be deferred"
+                        )
+                    defer_now = db_now or await _fetch_db_now(cur)
+                    prev_defer_count = int(row.get("defer_count") or 0)
+                    new_defer_count = prev_defer_count + 1
+                    first_def_at = (
+                        _coerce_utc_datetime(row.get("first_deferred_at")) or defer_now
+                    )
+                    elapsed_seconds = max(
+                        0.0, (defer_now - first_def_at).total_seconds()
+                    )
+                    if elapsed_seconds >= DELIVERY_DEFER_MAX_WINDOW_SECONDS:
+                        deferred_status = "failed"
+                        expired_to_failed = True
+                        backoff_seconds: int | None = None
+                        next_retry_at: datetime | None = None
+                        eff_err_code = str(
+                            error_code or row.get("error_code") or "deferred_timeout"
+                        )[:64]
+                        eff_err_msg = (
+                            error_message
+                            or row.get("error_message")
+                            or "Delivery defer window (24h) exceeded."
+                        )
+                    else:
+                        deferred_status = "deferred"
+                        expired_to_failed = False
+                        backoff_seconds = _compute_defer_backoff_seconds(new_defer_count)
+                        next_retry_at = defer_now + timedelta(seconds=backoff_seconds)
+                        eff_err_code = (
+                            str(error_code)[:64] if error_code is not None else None
+                        )
+                        eff_err_msg = error_message
+
+                    await cur.execute(
+                        """
+                        UPDATE dalton_channel_deliveries
+                        SET status = %s,
+                            defer_count = %s,
+                            first_deferred_at = %s::timestamptz,
+                            next_retry_at = %s::timestamptz,
+                            error_code = COALESCE(%s::varchar, error_code),
+                            error_message = COALESCE(%s::text, error_message),
+                            updated_at = NOW()
+                        WHERE delivery_key = %s
+                        """,
+                        (
+                            deferred_status,
+                            new_defer_count,
+                            first_def_at,
+                            next_retry_at,
+                            eff_err_code,
+                            eff_err_msg,
+                            cleaned_key,
+                        ),
+                    )
+                    if locked_plat == "weixin":
+                        audit_action = (
+                            "delivery_deferred_timeout"
+                            if expired_to_failed
+                            else "delivery_deferred"
+                        )
+                        await wx_db.write_weixin_audit_log_in_tx(
+                            cur,
+                            action=audit_action,
+                            operator_user_id="system:delivery-defer",
+                            target_user_id=(
+                                locked_uid
+                                if locked_uid and not locked_uid.startswith("unlinked:")
+                                else None
+                            ),
+                            weixin_account_id=(
+                                str(row["weixin_account_id"])
+                                if row.get("weixin_account_id")
+                                else None
+                            ),
+                            ilink_bot_id=row.get("weixin_bot_id"),
+                            ilink_user_id=row.get("weixin_recipient_id"),
+                            reason=eff_err_msg
+                            or wx_db.AUDIT_DEFAULT_REASONS[audit_action],
+                            metadata={
+                                "delivery_key": cleaned_key,
+                                "defer_count": new_defer_count,
+                                "backoff_seconds": backoff_seconds,
+                                "first_deferred_at": first_def_at.isoformat(),
+                                "next_retry_at": (
+                                    next_retry_at.isoformat()
+                                    if next_retry_at is not None
+                                    else None
+                                ),
+                                "error_code": eff_err_code or row.get("error_code"),
+                                "expired_to_failed": expired_to_failed,
+                            },
+                        )
+                    return {
+                        "ok": True,
+                        "delivery_key": cleaned_key,
+                        "status": deferred_status,
+                        "outcome": deferred_status,
+                        "defer_count": new_defer_count,
+                        "first_deferred_at": first_def_at.isoformat(),
+                        "next_retry_at": (
+                            next_retry_at.isoformat()
+                            if next_retry_at is not None
+                            else None
+                        ),
+                        "retry_after_seconds": backoff_seconds,
+                        "expired_to_failed": expired_to_failed,
+                        "sent_to_current_count": 0,
+                        "confirmed_thread_address": _delivery_confirmed_thread_address(
+                            row
+                        ),
+                        "discord_body_phase": _delivery_discord_body_phase(row),
+                        "delivery_attempt": current_attempt,
+                    }
                 # Discord unknown stays unknown, except a stored data_task row
                 # and one case: startup recovery rewrote this same attempt from
                 # in_flight to unknown after the body phase was already
@@ -10625,8 +11048,9 @@ async def _update_delivery_progress_once(
                         files_status = %s,
                         first_response_json = %s,
                         status = %s,
-                        error_code = COALESCE(%s, error_code),
-                        error_message = COALESCE(%s, error_message),
+                        next_retry_at = NULL,
+                        error_code = COALESCE(%s::varchar, error_code),
+                        error_message = COALESCE(%s::text, error_message),
                         updated_at = NOW()
                     WHERE delivery_key = %s
                     """,
@@ -10858,6 +11282,7 @@ async def _update_inbound_progress_once(
                     gateway_epoch,
                     required=require_gateway_epoch,
                     platform=eff_plat_hint,
+                    enforce_post_lease_for_non_weixin=False,
                 )
                 # 0. Acquire per-inbound advisory lock first (matches I-1 and I-3 lock ordering)
                 if cleaned_p and cleaned_mid:
@@ -11741,6 +12166,7 @@ async def _reconcile_steer_once(
                     gateway_epoch,
                     required=require_gateway_epoch,
                     platform=cleaned_platform,
+                    enforce_post_lease_for_non_weixin=False,
                 )
                 await cur.execute(
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
@@ -12195,14 +12621,25 @@ async def recover_channel_state(
                     }
 
                 # mode == "startup"
-                # R5 (Decision #5): Lock active thread_watches in deterministic thread_id ASC
-                # order FIRST (matching unbind_weixin_account's watch -> account -> delivery FK
-                # lock order), THEN settle in_flight deliveries using FOR UPDATE SKIP LOCKED in
-                # delivery_key ASC order to eliminate AB-BA deadlocks (40P01) against concurrent
-                # unbind transactions.
+                # R7 (Decision #1): Align lock order strictly with unbind_weixin_account:
+                #   1) dalton_channel_weixin_accounts (ORDER BY account_id ASC FOR KEY SHARE)
+                #      BEFORE locking thread_watches — so backfill INSERT into
+                #      dalton_channel_background_runs (FK -> weixin_accounts KEY SHARE)
+                #      NEVER deadlocks against unbind's accounts FOR UPDATE -> watches FOR UPDATE!
+                #   2) dalton_channel_thread_watches (ORDER BY thread_id ASC FOR UPDATE)
+                #   3) dalton_channel_deliveries (ORDER BY delivery_key ASC FOR UPDATE SKIP LOCKED)
+                #   4) dalton_channel_inbound_events repairs (ORDER BY platform, message_id FOR UPDATE SKIP LOCKED)
                 # R5 (Decision #7): When channel_weixin is disabled, NEVER touch or mutate ANY
-                # Weixin watches, deliveries, collect buffers, or inbound events.
+                # Weixin accounts, watches, deliveries, collect buffers, or inbound events.
                 if weixin_on:
+                    await cur.execute(
+                        """
+                        SELECT account_id::text AS account_id
+                        FROM dalton_channel_weixin_accounts
+                        ORDER BY account_id ASC
+                        FOR KEY SHARE
+                        """
+                    )
                     await cur.execute(
                         """
                         SELECT * FROM dalton_channel_thread_watches
@@ -12303,91 +12740,137 @@ async def recover_channel_state(
                             )
 
                 # ①b Retire unfinished inbound events tied to cancelled/expired/done collect buffers (§3.4 #1)
+                # Use FOR UPDATE OF ie SKIP LOCKED so concurrent unbind cancelling collect buffers never blocks.
                 if weixin_on:
                     await cur.execute(
                         """
+                        WITH locked AS (
+                            SELECT ie.platform, ie.message_id
+                            FROM dalton_channel_inbound_events ie
+                            JOIN dalton_channel_weixin_collect_buffers cb
+                              ON ie.collect_buffer_id = cb.buffer_id
+                            WHERE cb.status IN ('cancelled', 'expired', 'done')
+                              AND (
+                                  ie.status IN ('pending', 'accepted', 'streaming', 'steered', 'pending_resubmit')
+                                  OR ie.fallback_pending = TRUE
+                                  OR ie.command_reply_pending = TRUE
+                                  OR ie.encrypted_weixin_media_meta IS NOT NULL
+                              )
+                            ORDER BY ie.platform ASC, ie.message_id ASC
+                            FOR UPDATE OF ie SKIP LOCKED
+                        )
                         UPDATE dalton_channel_inbound_events ie
                         SET status = 'ignored',
                             fallback_pending = FALSE,
                             command_reply_pending = FALSE,
                             encrypted_weixin_media_meta = NULL,
                             updated_at = NOW()
-                        FROM dalton_channel_weixin_collect_buffers cb
-                        WHERE ie.collect_buffer_id = cb.buffer_id
-                          AND cb.status IN ('cancelled', 'expired', 'done')
-                          AND (
-                              ie.status IN ('pending', 'accepted', 'streaming', 'steered', 'pending_resubmit')
-                              OR ie.fallback_pending = TRUE
-                              OR ie.command_reply_pending = TRUE
-                              OR ie.encrypted_weixin_media_meta IS NOT NULL
-                          )
+                        FROM locked l
+                        WHERE ie.platform = l.platform
+                          AND ie.message_id = l.message_id
                         """
                     )
 
-                # ② Heal invalid pending inbound events (skip platform='weixin' when capability disabled)
+                # ② Heal invalid pending inbound events (SKIP LOCKED; skip platform='weixin' when disabled)
                 if weixin_on:
                     await cur.execute(
                         """
-                        UPDATE dalton_channel_inbound_events
+                        WITH locked AS (
+                            SELECT platform, message_id
+                            FROM dalton_channel_inbound_events
+                            WHERE status = 'pending'
+                              AND (
+                                COALESCE(raw_payload->>'invalid_inbound_event', '') IN ('true', 'True')
+                                OR COALESCE(raw_payload->>'invalid_inbound', '') IN ('true', 'True')
+                                OR raw_payload->>'rejected_reason' = 'invalid_inbound_event'
+                                OR raw_payload->>'deny_reason' = 'invalid_inbound_event'
+                              )
+                            ORDER BY platform ASC, message_id ASC
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        UPDATE dalton_channel_inbound_events ie
                         SET status = 'ignored',
-                            raw_payload = COALESCE(raw_payload, '{}'::jsonb)
+                            raw_payload = COALESCE(ie.raw_payload, '{}'::jsonb)
                                 || jsonb_build_object(
                                     'invalid_inbound_event', TRUE,
                                     'deny_reason', 'invalid_inbound_event'
                                 ),
                             updated_at = NOW()
-                        WHERE status = 'pending'
-                          AND (
-                            COALESCE(raw_payload->>'invalid_inbound_event', '') IN ('true', 'True')
-                            OR COALESCE(raw_payload->>'invalid_inbound', '') IN ('true', 'True')
-                            OR raw_payload->>'rejected_reason' = 'invalid_inbound_event'
-                            OR raw_payload->>'deny_reason' = 'invalid_inbound_event'
-                          )
+                        FROM locked l
+                        WHERE ie.platform = l.platform
+                          AND ie.message_id = l.message_id
                         """
                     )
                 else:
                     await cur.execute(
                         """
-                        UPDATE dalton_channel_inbound_events
+                        WITH locked AS (
+                            SELECT platform, message_id
+                            FROM dalton_channel_inbound_events
+                            WHERE status = 'pending'
+                              AND platform <> 'weixin'
+                              AND (
+                                COALESCE(raw_payload->>'invalid_inbound_event', '') IN ('true', 'True')
+                                OR COALESCE(raw_payload->>'invalid_inbound', '') IN ('true', 'True')
+                                OR raw_payload->>'rejected_reason' = 'invalid_inbound_event'
+                                OR raw_payload->>'deny_reason' = 'invalid_inbound_event'
+                              )
+                            ORDER BY platform ASC, message_id ASC
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        UPDATE dalton_channel_inbound_events ie
                         SET status = 'ignored',
-                            raw_payload = COALESCE(raw_payload, '{}'::jsonb)
+                            raw_payload = COALESCE(ie.raw_payload, '{}'::jsonb)
                                 || jsonb_build_object(
                                     'invalid_inbound_event', TRUE,
                                     'deny_reason', 'invalid_inbound_event'
                                 ),
                             updated_at = NOW()
-                        WHERE status = 'pending'
-                          AND platform <> 'weixin'
-                          AND (
-                            COALESCE(raw_payload->>'invalid_inbound_event', '') IN ('true', 'True')
-                            OR COALESCE(raw_payload->>'invalid_inbound', '') IN ('true', 'True')
-                            OR raw_payload->>'rejected_reason' = 'invalid_inbound_event'
-                            OR raw_payload->>'deny_reason' = 'invalid_inbound_event'
-                          )
+                        FROM locked l
+                        WHERE ie.platform = l.platform
+                          AND ie.message_id = l.message_id
                         """
                     )
 
                 # Heal any historical pending_cancel command rows that lack a pinned target run_id
-                # (skip platform='weixin' when capability disabled)
+                # (SKIP LOCKED; skip platform='weixin' when capability disabled)
                 if weixin_on:
                     await cur.execute(
                         """
-                        UPDATE dalton_channel_inbound_events
+                        WITH locked AS (
+                            SELECT platform, message_id
+                            FROM dalton_channel_inbound_events
+                            WHERE command_effect_status = 'pending_cancel'
+                              AND (thread_id IS NULL OR run_id IS NULL OR btrim(run_id) = '')
+                            ORDER BY platform ASC, message_id ASC
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        UPDATE dalton_channel_inbound_events ie
                         SET command_effect_status = 'done',
                             updated_at = NOW()
-                        WHERE command_effect_status = 'pending_cancel'
-                          AND (thread_id IS NULL OR run_id IS NULL OR btrim(run_id) = '')
+                        FROM locked l
+                        WHERE ie.platform = l.platform
+                          AND ie.message_id = l.message_id
                         """
                     )
                 else:
                     await cur.execute(
                         """
-                        UPDATE dalton_channel_inbound_events
+                        WITH locked AS (
+                            SELECT platform, message_id
+                            FROM dalton_channel_inbound_events
+                            WHERE command_effect_status = 'pending_cancel'
+                              AND platform <> 'weixin'
+                              AND (thread_id IS NULL OR run_id IS NULL OR btrim(run_id) = '')
+                            ORDER BY platform ASC, message_id ASC
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        UPDATE dalton_channel_inbound_events ie
                         SET command_effect_status = 'done',
                             updated_at = NOW()
-                        WHERE command_effect_status = 'pending_cancel'
-                          AND platform <> 'weixin'
-                          AND (thread_id IS NULL OR run_id IS NULL OR btrim(run_id) = '')
+                        FROM locked l
+                        WHERE ie.platform = l.platform
+                          AND ie.message_id = l.message_id
                         """
                     )
 

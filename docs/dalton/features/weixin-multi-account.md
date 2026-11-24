@@ -629,6 +629,8 @@ ALTER TABLE dalton_channel_deliveries
 
 ## 6. 兼容与上线
 
+> **部署策略（批次 A 与批次 B 同时合并、同时部署）**：生产环境从未有过个人微信入站记录，旧单账号网关不跨越批次 A 的部署窗口。**后端（批次 A）与网关（批次 B）必须同时合并、同时部署上线**；旧单行内部接口 `I-9`（`/internal/weixin-state`）随本次发布直接下线，不为旧单账号网关保留兼容层。
+
 ### 6.1 旧「管理员扫码 + 成员绑定码」下线清单
 
 | 模块 | 旧实现位置 | 下线与替换处理方式 |
@@ -649,12 +651,12 @@ ALTER TABLE dalton_channel_deliveries
 
 ### 6.3 分形态部署、停机迁移、部署后外键校验与回退步骤（D2, D10, D18）
 
-#### （1）Everflow 生产部署（`launchd` + Docker Compose，脚本目录 `scripts/dalton/ops/prod/`）
+#### （1）Everflow 生产部署（`launchd` + Docker Compose，脚本目录 `scripts/dalton/ops/prod/`，**批次 A 与批次 B 同时部署**）
 
 1. **预演校验**：在集成测试环境用含活跃多线程会话（`generation > 1`、非 Home 工作区、`pending_interrupt`）、活跃监听、未完成附件入站、无 `scope_key` 后台运行与多代际投递的数据集跑通 `d046 -> d049 -> 部署后外键 VALIDATE -> 多人收发 -> downgrade d046`。
-2. **停止网关**：执行 `launchctl bootout gui/$(id -u)/com.dalton.channel-gateway`（对应 `scripts/dalton/launchd/com.dalton.channel-gateway.plist.template:18-25`）。
-3. **备份、重启后端并在停写态执行 `d049`**：执行 `bash scripts/dalton/ops/prod/deploy_main.sh --expect-migration d049`（`deploy_main.sh:824-943`：自动调 `wait_backend_idle.sh` 等待活跃回合结束 → 触发 `com.dalton.pg-backup` 运行 `scripts/dalton/ops/prod/backup.sh:13-16` 生成 `pg_dump -Fc` 全量备份 → 拉取代码构建前端 → 重启 `dalton-langalpha-backend-1`，在旧后端已退出、无进程写微信状态时由 `scripts/dalton/docker_entrypoint_dalton.sh:15-21` 执行 `d049` 迁移 → 校验 `/health` 与版本到达 `d049`）。
-4. **构建并启动唯一新网关实例**：执行 `(cd integrations/dalton-channel-gateway && pnpm install --frozen-lockfile && pnpm build)`，确认 plist 中 `DALTON_WEIXIN_ENABLED=true`，执行 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dalton.channel-gateway.plist`；验证网关获租后先完成 `mode=startup` 再开启轮询、原管理员原线程续聊、新成员扫码可用。
+2. **停止旧网关（停写）**：执行 `launchctl bootout gui/$(id -u)/com.dalton.channel-gateway`（对应 `scripts/dalton/launchd/com.dalton.channel-gateway.plist.template:18-25`）。批次 A 与批次 B 在同一维护窗口内一并上线，旧单账号网关不再恢复启动。
+3. **备份、部署批次 A 后端并在停写态执行 `d049`**：执行 `bash scripts/dalton/ops/prod/deploy_main.sh --expect-migration d049`（`deploy_main.sh:824-943`：自动调 `wait_backend_idle.sh` 等待活跃回合结束 → 触发 `com.dalton.pg-backup` 运行 `scripts/dalton/ops/prod/backup.sh:13-16` 生成 `pg_dump -Fc` 全量备份 → 拉取已合入批次 A + B 的代码并构建前端 → 重启 `dalton-langalpha-backend-1`，在旧后端已退出、无进程写微信状态时由 `scripts/dalton/docker_entrypoint_dalton.sh:15-21` 执行 `d049` 迁移 → 校验 `/health` 与版本到达 `d049`）。
+4. **同步构建并启动批次 B 唯一新网关实例**：紧接步骤 3 执行 `(cd integrations/dalton-channel-gateway && pnpm install --frozen-lockfile && pnpm build)`，确认 plist 中 `DALTON_WEIXIN_ENABLED=true`，执行 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dalton.channel-gateway.plist`；验证网关获租后先完成 `mode=startup` 再开启轮询、原管理员原线程续聊、新成员扫码可用。
 5. **部署后独立事务执行外键 `VALIDATE CONSTRAINT`（D18）**：在服务正常对外期间，分 5 条独立 SQL 事务（每条带 `SET lock_timeout = '5s';`）对 §2.1 (7) 的 5 条 `NOT VALID` 外键依次执行 `ALTER TABLE ... VALIDATE CONSTRAINT ...;`，并查询 `pg_constraint.convalidated = true` 确认全部通过。
 6. **回退步骤与适用边界（如需，对齐 §2.3）**：遵循 `scripts/dalton/ops/prod/deploy_main.sh:630-665` 规程——先 `launchctl bootout` 停 `backend-watchdog`、`channel-gateway` 等宿主服务并 `docker stop dalton-langalpha-edge-1 dalton-langalpha-crawler-1 dalton-langalpha-backend-1` 确认活跃连接归零 → 备份并按需导出 `dalton_channel_weixin_audit_logs`。**仅在新版尚未产生业务写入时**，用维护容器执行 `docker compose run --rm --no-deps --entrypoint "" backend sh -c "cd /app && uv run alembic -c src/dalton/alembic.ini downgrade d046"` 可使全库（含旧单行表全部字段与共享表）与升级前逐行一致；新版已产生业务写入时，按 §2.3 使用步骤 3 生成的升级前备份执行 `pg_restore` 恢复（若仅执行 `downgrade d046` 且原管理员在运行期重扫过码，则在旧管理页重新扫码一次恢复单机器人收发）。
 

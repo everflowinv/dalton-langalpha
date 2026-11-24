@@ -145,6 +145,7 @@ NO_USER_CREDENTIAL = {
     ("GET", "/api/v1/dalton/channels/internal/recover"),
     ("GET", "/api/v1/dalton/channels/internal/state"),
     ("GET", "/api/v1/dalton/channels/internal/weixin/accounts/{account_id}"),
+    ("GET", "/api/v1/dalton/channels/internal/weixin/collect-buffers/{buffer_id}"),
     ("GET", "/api/v1/dalton/channels/internal/weixin/login-sessions/{session_key}"),
     ("GET", "/api/v1/dalton/internal/usage/by-model"),
     ("PATCH", "/api/v1/dalton/channels/internal/weixin/login-sessions/{session_key}"),

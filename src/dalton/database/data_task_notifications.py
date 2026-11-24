@@ -1393,6 +1393,7 @@ async def authorize_and_claim_data_task_delivery(
                         gateway_epoch,
                         required=require_gateway_epoch,
                         platform=req_plat_hint,
+                        enforce_post_lease_for_non_weixin=False,
                     )
                 await _lock_saved_report_before_outer_identity(cur, cleaned_rid)
                 await _acquire_outer_identity_xact_lock(
@@ -1414,6 +1415,15 @@ async def authorize_and_claim_data_task_delivery(
                 )
                 existing = await cur.fetchone()
                 if existing:
+                    if str(existing.get("platform") or "").strip().lower() == "weixin" and (
+                        gateway_epoch is not None or require_gateway_epoch
+                    ):
+                        await wx_db.verify_gateway_epoch_in_tx(
+                            cur,
+                            gateway_epoch,
+                            required=require_gateway_epoch,
+                            platform="weixin",
+                        )
                     ex_status = str(existing["status"])
                     if ex_status in ("sent", "partial"):
                         return {
@@ -1434,6 +1444,16 @@ async def authorize_and_claim_data_task_delivery(
                             "target_address": existing["target_address"],
                             "is_current": False,
                         }
+                    if ex_status == "deferred":
+                        from src.dalton.database.channel_gateway import (
+                            _check_deferred_delivery_in_tx,
+                        )
+
+                        deferred_res = await _check_deferred_delivery_in_tx(
+                            cur, existing, is_current=False
+                        )
+                        if deferred_res is not None:
+                            return deferred_res
 
                 auth = await _authorize_run_and_target_in_tx(
                     cur,
@@ -1503,6 +1523,13 @@ async def authorize_and_claim_data_task_delivery(
                 wx_ctx_token: str | None = None
                 wx_ctx_version: int | None = None
                 if auth.platform == "weixin":
+                    if gateway_epoch is not None or require_gateway_epoch:
+                        await wx_db.verify_gateway_epoch_in_tx(
+                            cur,
+                            gateway_epoch,
+                            required=require_gateway_epoch,
+                            platform="weixin",
+                        )
                     from src.dalton.access_tiers import (
                         check_team_member_status_live,
                         evaluate_weixin_member_access,
@@ -1608,6 +1635,7 @@ async def authorize_and_claim_data_task_delivery(
                         VALUES (%s, 'data_task', %s, NULL, %s, %s::uuid, FALSE, %s, %s, %s, 'in_flight', %s, 0, '[]'::jsonb, '[]'::jsonb, %s::uuid, %s, %s, %s, NOW(), NOW())
                         ON CONFLICT (delivery_key) DO UPDATE SET
                             status = 'in_flight',
+                            next_retry_at = NULL,
                             total_chunks = EXCLUDED.total_chunks,
                             weixin_account_id = EXCLUDED.weixin_account_id,
                             weixin_bot_id = EXCLUDED.weixin_bot_id,
@@ -1644,6 +1672,7 @@ async def authorize_and_claim_data_task_delivery(
                         VALUES (%s, 'data_task', %s, NULL, %s, %s::uuid, FALSE, %s, %s, %s, 'in_flight', %s, 0, '[]'::jsonb, '[]'::jsonb, NOW(), NOW())
                         ON CONFLICT (delivery_key) DO UPDATE SET
                             status = 'in_flight',
+                            next_retry_at = NULL,
                             total_chunks = EXCLUDED.total_chunks,
                             error_code = NULL,
                             error_message = NULL,
