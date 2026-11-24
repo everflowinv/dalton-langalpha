@@ -1624,6 +1624,8 @@ def _is_ooxml_zip_bytes(buf: bytes) -> bool:
     member_count = _read_zip_eocd_member_count(buf)
     if member_count is None or member_count > _COS_ZIP_MAX_MEMBERS:
         return False
+    if buf.count(b"PK\x01\x02") > _COS_ZIP_MAX_MEMBERS:
+        return False
     try:
         with zipfile.ZipFile(io.BytesIO(buf)) as zf:
             return "[Content_Types].xml" in zf.namelist()
@@ -1664,7 +1666,7 @@ def _validate_copy_file_format(file_path: str, content: bytes) -> str | None:
         member_count = _read_zip_eocd_member_count(content)
         if member_count is None:
             return _COS_FORMAT_MISMATCH_ERROR
-        if member_count > _COS_ZIP_MAX_MEMBERS:
+        if member_count > _COS_ZIP_MAX_MEMBERS or content.count(b"PK\x01\x02") > _COS_ZIP_MAX_MEMBERS:
             return "压缩容器成员数量超出安全上限，不能拷贝"
         ok = _is_ooxml_zip_bytes(content)
     else:
@@ -1923,6 +1925,11 @@ def _scan_copy_bytes_for_secrets(
                 return "压缩容器无法解压核验，不能拷贝"
             if scan_state["members"] + eocd_members > _COS_ZIP_MAX_MEMBERS:
                 return "压缩容器成员数量超出安全上限，不能拷贝"
+            # The end record's count can understate the central directory, which
+            # ZipFile parses in full; every central entry starts with this
+            # signature, so its count bounds what ZipFile would build.
+            if scan_state["members"] + zip_bytes.count(b"PK\x01\x02") > _COS_ZIP_MAX_MEMBERS:
+                return "压缩容器成员数量超出安全上限，不能拷贝"
             try:
                 with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
                     infos = zf.infolist()
@@ -2142,6 +2149,22 @@ _COS_COPY_CLEANUP_TIMEOUT_S = 20.0
 def _consume_task_exception(task: asyncio.Task[Any]) -> None:
     if task.done() and not task.cancelled():
         task.exception()
+
+
+# Late cleanups scheduled from a done callback; held here so the loop keeps them alive.
+_LATE_COPY_CLEANUPS: set[asyncio.Task[Any]] = set()
+
+
+def _remove_after_upload(upload_task: asyncio.Task[Any], sandbox: Any, tmp_abs: str) -> None:
+    def _on_done(task: asyncio.Task[Any]) -> None:
+        _consume_task_exception(task)
+        cleanup = asyncio.get_running_loop().create_task(
+            _remove_temp_copy_file(sandbox, tmp_abs)
+        )
+        _LATE_COPY_CLEANUPS.add(cleanup)
+        cleanup.add_done_callback(_LATE_COPY_CLEANUPS.discard)
+
+    upload_task.add_done_callback(_on_done)
 
 
 async def _drain_cancelled_upload(
@@ -2569,6 +2592,11 @@ async def _workspace_file_copy_server(
                             tmp_abs,
                             timeout=_COS_COPY_UPLOAD_DRAIN_TIMEOUT_S,
                         )
+                    if upload_task is not None and not upload_task.done():
+                        # The upload outlived the drain, so it may still write the
+                        # staging file after the rm below: remove it again once
+                        # the upload really ends.
+                        _remove_after_upload(upload_task, dest_sandbox, tmp_abs)
                     try:
                         await _remove_temp_copy_file(dest_sandbox, tmp_abs)
                     finally:

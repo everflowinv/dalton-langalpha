@@ -2232,6 +2232,60 @@ class TestBinaryCopySecretChecks:
             == sec_tools_mod._COS_MACRO_OFFICE_REFUSED_ERROR
         )
 
+    def test_ooxml_understated_eocd_count_is_refused_before_zipfile(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An end record claiming few entries over a central directory holding
+        more than the limit is refused before ZipFile parses that directory."""
+        many_members = {f"xl/m{i}.xml": "<a/>" for i in range(2001)}
+        real = bytearray(_make_ooxml_zip(many_members))
+        eocd = real.rfind(b"PK\x05\x06")
+        struct.pack_into("<HH", real, eocd + 8, 5, 5)
+        understated = bytes(real)
+        assert sec_tools_mod._read_zip_eocd_member_count(understated) == 5
+
+        opened: list[object] = []
+        real_zipfile = zipfile.ZipFile
+
+        def _tracking_zipfile(*args: object, **kwargs: object) -> zipfile.ZipFile:
+            opened.append(args)
+            return real_zipfile(*args, **kwargs)
+
+        monkeypatch.setattr(zipfile, "ZipFile", _tracking_zipfile)
+        err = sec_tools_mod._scan_copy_bytes_for_secrets("many.xlsx", understated, {})
+        assert err == "压缩容器成员数量超出安全上限，不能拷贝"
+        assert opened == []
+
+    @pytest.mark.asyncio
+    async def test_upload_finishing_after_the_drain_still_has_its_staging_file_removed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        removed: list[str] = []
+
+        async def _fake_remove(sandbox: object, tmp_abs: str) -> None:
+            removed.append(tmp_abs)
+
+        monkeypatch.setattr(
+            sec_tools_mod,
+            "_remove_temp_copy_file",
+            create_autospec(sec_tools_mod._remove_temp_copy_file, side_effect=_fake_remove),
+        )
+        finish = asyncio.Event()
+
+        async def _slow_upload() -> None:
+            await finish.wait()
+
+        upload = asyncio.create_task(_slow_upload())
+        tmp = "/home/workspace/Home/.agents/tmp/colleague-copy-late"
+        sec_tools_mod._remove_after_upload(upload, object(), tmp)
+        await asyncio.sleep(0)
+        assert removed == []
+        finish.set()
+        await upload
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert removed == [tmp]
+
     def test_ooxml_eocd_precheck_standard_zip64_missing_and_nonempty_dir_entry(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
