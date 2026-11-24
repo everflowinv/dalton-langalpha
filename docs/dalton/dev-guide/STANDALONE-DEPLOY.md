@@ -334,8 +334,8 @@ crontab -e
 
 v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不提供原地替换已有数据的路径）：
 1. 校验备份目录内的 `SHA256SUMS`、`manifest.json` 与对象归档清单；
-2. 准备目标 `.env`（**只读文件内容，不读 shell 环境变量**；解密 `env.enc` 产生的临时文件统一使用 `.env.tmp-*` 前缀，便于下次运行自动清理；传入 `--replace-env` 时对 `COMPOSE_PROJECT_NAME` 做**逐字比较**，不做规范化），在固定路径 `/tmp/dalton-<项目名>.restore.lock` 上加锁（优先使用 `flock`，无 `flock` 时退化为 `mkdir` 原子锁；不会按 PID 自动清理遗留锁，如遇残留锁需由管理员确认无并发恢复后手动删除），清理上次异常中断残留的 `.env.tmp-*`，校验外部库拦截、数据库标识符与 Compose 文件，并在写入任何数据之前通过 `docker compose -p <项目名> -f <文件>... --env-file <.env> config --format json` 取出 `backend` 服务**实际生效**的环境变量（`.env` 中的值只作为辅助参考，最终以 `compose config` 的结果为准），校验单一对象存储约束（`--skip-minio` 仅在 `backend` 实际未配置任何对象存储时允许使用）以及备份清单与 `backend` 实际配置在聊天上传、ASR、通用存储的**桶名、端点和键前缀一致性**（不一致即在写入任何数据前停止，提示修正 Compose 覆盖文件或先改 `.env` 让两者一致，或使用 `--replace-env`）；
-3. 检查**整个目标 PostgreSQL 实例**与对象存储必须为空：使用目标/备份 `.env` 中的超级用户凭据经 TCP 连接 PostgreSQL（连不上或非超级用户直接拒绝并说明原因），通过 `pg_database` 列出全部非模板库（排除 `template0`、`template1`，包含 `postgres` 库在内），逐库检查非系统 schema 下 `pg_class` 全部关系及 `pg_proc` / `pg_type` 用户定义函数与类型：如果只有应用库（`DB_NAME`）非空则拒绝并指向下方“在已有实例上覆盖恢复”步骤；如果应用库以外的数据库里有数据，由于 `backup.sh` 只备份 `DB_NAME`，脚本会列出这些库名并提示先自行备份、确认不再需要后再按手册清空实例（**不会**直接给出 `down -v` 命令）；对象存储内不能有任何桶（或只能有 `minio_init` 刚创建、尚无任何对象的空桶）；同时用 `pg_restore --list` 校验备份文件。确认全部通过后，若配置来自 `env.enc`，再通过临时文件 `.env.tmp-*` + `chmod` + 原子 `mv` 写入正式 `.env`（即使在写入瞬间遭遇 `kill -9`，最多残留一个 `.env.tmp-*`，下次运行自动清理）；
+2. 准备目标 `.env`（**只读文件内容，不读 shell 环境变量**；解密 `env.enc` 产生的临时文件统一使用 `.env.tmp-*` 前缀，便于下次运行自动清理；传入 `--replace-env` 时对 `COMPOSE_PROJECT_NAME` 做**逐字比较**，不做规范化），在固定路径 `/tmp/dalton-<项目名>.restore.lock` 上加锁（优先使用 `flock`，无 `flock` 时退化为 `mkdir` 原子锁；不会按 PID 自动清理遗留锁，如遇残留锁需由管理员确认无并发恢复后手动删除），清理上次异常中断残留的 `.env.tmp-*`，校验外部库拦截、数据库标识符与 Compose 文件。从 `env.enc` 恢复时，在任何依赖 Compose 配置的预检开始之前，脚本会先将原 `.env`（若存在）备份成 `.env.pre-restore-<时间戳>`（权限 `600`），再用 `mv` 原子放入解密后的 `.env`（权限 `600`），后续所有预检、存储配置比对、写入与启动均使用与日常部署完全一致的 `docker compose` 参数（不生成临时 compose 覆盖文件）。随后在写入任何数据之前通过 `docker compose -p <项目名> -f <文件>... --env-file <.env> config --format json` 取出 `backend` 服务**实际生效**的环境变量（`.env` 中的值只作为辅助参考，最终以 `compose config` 的结果为准），校验单一对象存储约束（`--skip-minio` 仅在 `backend` 实际未配置任何对象存储时允许使用）以及备份清单与 `backend` 实际配置在聊天上传、ASR、通用存储的**桶名、端点和键前缀一致性**（不一致即在写入任何数据前停止，并由 `trap` 自动将 `.env` 恢复为恢复前的内容，提示修正 Compose 覆盖文件或先改 `.env` 让两者一致，或使用 `--replace-env`）；
+3. 检查**整个目标 PostgreSQL 实例**与对象存储必须为空：使用目标/备份 `.env` 中的超级用户凭据经 TCP 连接 PostgreSQL（连不上或非超级用户直接拒绝并说明原因），通过 `pg_database` 列出全部非模板库（排除 `template0`、`template1`，包含 `postgres` 库在内），逐库检查非系统 schema 下 `pg_class` 全部关系及 `pg_proc` / `pg_type` 用户定义函数与类型：如果只有应用库（`DB_NAME`）非空则拒绝并指向下方“在已有实例上覆盖恢复”步骤；如果应用库以外的数据库里有数据，由于 `backup.sh` 只备份 `DB_NAME`，脚本会列出这些库名并提示先自行备份、确认不再需要后再按手册清空实例（**不会**直接给出 `down -v` 命令）；对象存储内不能有任何桶（或只能有 `minio_init` 刚创建、尚无任何对象的空桶）；同时用 `pg_restore --list` 校验备份文件。在第一次向数据库或对象存储写入数据之前的任何一步失败，`trap` 都会自动把 `.env.pre-restore-<时间戳>` 换回 `.env`（原无 `.env` 则删除新写入的 `.env`）；开始写入数据后再失败则不再自动换回 `.env`，并输出原 `.env` 备份路径供人工按手册处理；恢复成功后会保留 `.env.pre-restore-<时间戳>` 并在结尾输出路径，提示确认无误后自行删除；
 4. 调用所有 `docker compose` 命令时均显式指定 `-p <项目名> -f <文件>... --env-file <.env>`，并提前通过 `env -u` 清除 `.env` 与编排文件中引用的键（及 `COMPOSE_PROJECT_NAME`、`COMPOSE_FILE`、`COMPOSE_PROFILES`），防止 shell 里导出的旧变量覆盖 `.env` 文件；
 5. 通过 `backend` 服务实际生效的环境直接向正式对象存储的原桶名写入对象（流式上传并读回校验大小、SHA-256 与 `ContentType`），直接向正式数据库恢复 `postgres.dump` 并执行 `migrate`，再逐条核对数据库引用对象（跳过状态为 `uploading` 的未完成上传记录并在输出中列出跳过的条数；若已完成记录仍有对象缺失，则直接失败退出并提示在线备份的时间窗口）；
 6. 若 `.env` 来自备份则重建 `edge` 镜像（除非传入 `--skip-edge-build`），恢复 Caddy `/data`，最后启动全套服务并执行健康探测与双链版本核验。
@@ -347,7 +347,7 @@ v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不�
    ```bash
    cd /opt/dalton
 
-   # 方式 A：备份目录含 env.enc，传入口令文件自动校验并原子写入 .env 后恢复全部数据
+   # 方式 A：备份目录含 env.enc，传入口令文件解密并原子放入 .env（写入数据前失败会自动回滚）后恢复全部数据
    bash scripts/standalone/restore.sh \
      --backup-dir /var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3 \
      --env-passphrase-file /etc/dalton/backup.pass
@@ -356,7 +356,7 @@ v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不�
    bash scripts/standalone/restore.sh \
      --backup-dir /var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3
    ```
-   > - 如果目标目录已有一份 `.env` 且目标实例为空，需要用备份内的 `env.enc` 替换该 `.env`，附加 `--replace-env`（要求新旧 `.env` 中的 `COMPOSE_PROJECT_NAME` 逐字一致，先校验目标为空后再原子写入）。
+   > - 如果目标目录已有一份 `.env` 且目标实例为空，需要用备份内的 `env.enc` 替换该 `.env`，附加 `--replace-env`（要求新旧 `.env` 中的 `COMPOSE_PROJECT_NAME` 逐字一致；从 `env.enc` 恢复时，脚本会先把原 `.env` 备份成 `.env.pre-restore-<时间戳>`（权限 `600`）再放入新 `.env`，写入数据前任何一步失败会自动换回原 `.env`，恢复成功后会保留该备份并输出路径，确认无误后自行删除）。
    > - 若使用已有 `.env` 而未用 `env.enc` 覆盖，请确认其中的对象存储桶名、键前缀与 `BYOK_ENCRYPTION_KEY` 均与备份同期原件一致（桶名或键前缀不一致会在写入前被直接拒绝，可先改 `.env` 让两者一致，或使用 `--replace-env`）。使用企业自有证书（`custom`）模式时，提前恢复 `DALTON_TLS_CERT_DIR` 并可附加 `--ca-file <企业CA.pem>`。
    > - 如需显式指定目标实例的 Docker Compose 项目名，可附加 `--project-name <项目名>`（优先级高于 `.env` 中的 `COMPOSE_PROJECT_NAME` 与部署目录名）。
 3. 恢复完成后，提前构建代码沙箱镜像以消除首次对话等待：
@@ -460,7 +460,7 @@ v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不�
 
 #### 恢复中途失败的处理
 
-如果 `restore.sh` 在**写入 `.env`（或开始写入对象/数据库）之后**的任何一步失败（例如对象上传中断、`pg_restore` / `migrate` 报错、DB 对象引用核对发现缺失、容器启动或健康探测失败），目标实例会处于**半成品**状态——此时直接重跑 `restore.sh` 会被空实例守卫拒绝。
+如果 `restore.sh` 在**开始写入对象存储或数据库之后**的任何一步失败（例如对象上传中断、`pg_restore` / `migrate` 报错、DB 对象引用核对发现缺失、容器启动或健康探测失败），目标实例会处于**半成品**状态——此时脚本**不会**自动换回 `.env`（避免配置与已写入数据不一致），会在错误输出中写明原 `.env` 备份路径 `.env.pre-restore-<时间戳>`（若是从 `env.enc` 替换已有 `.env`），且直接重跑 `restore.sh` 会被空实例守卫拒绝。
 
 **备份目录本身只读、完全不受影响。** 请直接按上方 §6.2「在已有实例上覆盖恢复」的第 1 步与第 3–4 步处理（沿用同一个 `PROJECT=<项目名>`）：
 1. 用 `docker volume ls --filter "label=com.docker.compose.project=${PROJECT}"` 确认本项目的完整卷清单；

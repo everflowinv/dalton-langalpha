@@ -9,14 +9,21 @@
 #      acquires `/tmp/dalton-<project>.restore.lock` (`flock`, or `mkdir` fallback
 #      without PID-based auto-cleanup), cleans leftover `.env.tmp-*` files, and
 #      runs static preflight checks (external DB guard, identifiers, Compose files).
-#   3. Verifies the entire PostgreSQL instance is empty (all non-template DBs
+#      When restoring from `env.enc`, backs up any existing `.env` via `cp -p` to
+#      `${ENV_FILE}.pre-restore-<timestamp>` (mode 600) and atomically moves the
+#      decrypted `.env` into `${ENV_FILE}` (mode 600) BEFORE any compose-dependent
+#      preflight so all preflight, comparison, write, and startup steps use the
+#      exact same regular `docker compose` arguments (no temporary compose override).
+#   3. Verifies effective `backend` storage config (`docker compose config --format json`),
+#      verifies the entire PostgreSQL instance is empty (all non-template DBs
 #      in `pg_database` including `postgres` checked over TCP with superuser
 #      credentials for non-system `pg_class`, `pg_proc`, and `pg_type` objects;
 #      object storage has 0 buckets or only the empty `minio_init` bucket),
-#      verifies backup bucket/key-prefix parity against `.env`, and validates
-#      `pg_restore --list`. Refuses non-empty targets and points to the manual
-#      reset-and-restore procedure in `docs/dalton/dev-guide/STANDALONE-DEPLOY.md` (§6.2).
-#      Only after validation succeeds, atomically writes `.env` via `.env.tmp-*` + `mv`.
+#      verifies backup bucket/key-prefix parity against effective backend config,
+#      and validates `pg_restore --list`. Any failure before data writes start
+#      automatically rolls `.env` back via `trap`. Refuses non-empty targets and
+#      points to the manual reset-and-restore procedure in
+#      `docs/dalton/dev-guide/STANDALONE-DEPLOY.md` (§6.2).
 #   4. Restores MinIO objects directly into their original bucket name(s) with
 #      read-back verification of size, SHA-256, and `ContentType`.
 #   5. Restores PostgreSQL directly into the official database, runs migrations,
@@ -71,7 +78,8 @@ Options:
                               COMPOSE_PROJECT_NAME and work-dir basename).
   --ca-file <path>            CA certificate PEM file used to verify HTTPS in custom/auto mode.
   --replace-env               Allow replacing an existing <work-dir>/.env from env.enc on an
-                              empty target instance (validated before atomic rename).
+                              empty target instance (backs up existing .env to
+                              .env.pre-restore-<ts> and rolls back on pre-write failure).
   --skip-edge-build           Skip rebuilding the edge image after restoring .env.
   --skip-minio                Skip restoring MinIO objects.
   --skip-caddy                Skip restoring Caddy certificate data.
@@ -316,11 +324,10 @@ if [[ -f "$ENV_FILE" ]]; then
   ORIG_ENV_MODE="$(get_file_mode "$ENV_FILE")"
 fi
 STAGED_ENV_TMP=""
-ENV_WRITE_TMP=""
 ENV_FROM_BACKUP=0
+ENV_BACKUP_PATH=""
+ENV_SWAPPED=0
 CANDIDATE_ENV=""
-ACTIVE_COMPOSE_ENV=""
-RESTORE_COMPOSE_OVERRIDE=""
 MINIO_MANIFEST_TMP=""
 COMPOSE_CFG_TMP=""
 
@@ -384,20 +391,34 @@ release_restore_lock() {
 
 cleanup() {
   local rc=$?
-  if [[ -n "$ENV_WRITE_TMP" && -f "$ENV_WRITE_TMP" ]]; then
-    rm -f "$ENV_WRITE_TMP"
-  fi
   if [[ -n "$STAGED_ENV_TMP" && -f "$STAGED_ENV_TMP" ]]; then
     rm -f "$STAGED_ENV_TMP"
-  fi
-  if [[ -n "$RESTORE_COMPOSE_OVERRIDE" && -f "$RESTORE_COMPOSE_OVERRIDE" ]]; then
-    rm -f "$RESTORE_COMPOSE_OVERRIDE"
   fi
   if [[ -n "$MINIO_MANIFEST_TMP" && -f "$MINIO_MANIFEST_TMP" ]]; then
     rm -f "$MINIO_MANIFEST_TMP"
   fi
   if [[ -n "$COMPOSE_CFG_TMP" ]]; then
     rm -f "$COMPOSE_CFG_TMP" "${COMPOSE_CFG_TMP}.err"
+  fi
+  if [[ "$rc" -ne 0 && "$RESTORE_SUCCEEDED" -ne 1 && "$MUTATION_STARTED" -eq 0 ]]; then
+    if [[ "$ENV_SWAPPED" -eq 1 ]]; then
+      if [[ "$ENV_EXISTED_BEFORE" -eq 1 && -n "$ENV_BACKUP_PATH" && -f "$ENV_BACKUP_PATH" ]]; then
+        if mv "$ENV_BACKUP_PATH" "$ENV_FILE"; then
+          chmod "$ORIG_ENV_MODE" "$ENV_FILE" 2>/dev/null || true
+          ENV_BACKUP_PATH=""
+          warn "已把 .env 恢复为恢复前的内容（${ENV_FILE}）。"
+        else
+          err "Failed to restore original ${ENV_FILE} from ${ENV_BACKUP_PATH}; restore it manually."
+        fi
+      elif [[ "$ENV_EXISTED_BEFORE" -eq 0 ]]; then
+        rm -f "$ENV_FILE"
+        warn "已把 .env 恢复为恢复前的内容（已删除本次新写入的 ${ENV_FILE}）。"
+      fi
+      ENV_SWAPPED=0
+    elif [[ -n "$ENV_BACKUP_PATH" && -f "$ENV_BACKUP_PATH" ]]; then
+      rm -f "$ENV_BACKUP_PATH"
+      ENV_BACKUP_PATH=""
+    fi
   fi
   release_restore_lock
   if [[ "$rc" -ne 0 && "$RESTORE_SUCCEEDED" -ne 1 && "$MUTATION_STARTED" -eq 1 ]]; then
@@ -406,7 +427,12 @@ cleanup() {
     if [[ -n "$COMPOSE_PROJECT" && "${#COMPOSE_FILE_ARGS[@]}" -gt 0 ]]; then
       down_cmd="$(fmt_cmd docker compose -p "$COMPOSE_PROJECT" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" down -v)"
     fi
-    err "Restore failed after writing .env or modifying target state; the instance is now in a partial/half-restored state (半成品)."
+    err "Restore failed after writing data to target database or object storage; the instance is now in a partial/half-restored state (半成品)."
+    if [[ "$ENV_SWAPPED" -eq 1 && -n "$ENV_BACKUP_PATH" && -f "$ENV_BACKUP_PATH" ]]; then
+      err "未自动换回 ${ENV_FILE}（写入开始后换回会导致配置与已写入数据不一致）；原 .env 备份路径：${ENV_BACKUP_PATH}，请按手册处理。"
+    elif [[ "$ENV_SWAPPED" -eq 1 ]]; then
+      err "未自动删除已写入的 ${ENV_FILE}（写入开始后删除会导致配置与已写入数据不一致），请按手册处理。"
+    fi
     err "Your backup directory (${BACKUP_DIR}) was NOT modified."
     err "Follow ${MANUAL_OVERWRITE_REF} to confirm volumes and reset before re-running restore.sh:"
     err "  $(fmt_cmd docker volume ls --filter "label=com.docker.compose.project=${proj}")"
@@ -495,7 +521,7 @@ if [[ -f "${BACKUP_DIR}/env.enc" && -n "$ENV_PASSPHRASE_FILE" ]]; then
     chmod 600 "$STAGED_ENV_TMP"
     ENV_FROM_BACKUP=1
     CANDIDATE_ENV="$STAGED_ENV_TMP"
-    ok "Decrypted env.enc into temporary file (will write ${ENV_FILE} atomically only after all preflight checks pass)."
+    ok "Decrypted env.enc into temporary staging file."
   else
     info "2/7 Using existing ${ENV_FILE} (pass --replace-env to replace it from env.enc on an empty target)."
     CANDIDATE_ENV="$ENV_FILE"
@@ -673,400 +699,37 @@ for cf in compose_files:
 PY
 )
 
-# Generate an env_file !override file that replaces ONLY entries pointing to
-# `${WORK_DIR}/.env` with the target env path, while preserving every other
-# `env_file` entry (e.g. `storage.env` from an additional compose file) in its
-# exact original order and form. During preflight the `.env` entry points to
-# $CANDIDATE_ENV so ${WORK_DIR}/.env stays untouched until all checks pass; after
-# writing ${ENV_FILE} atomically, the `.env` entry is updated in-place to
-# ${ENV_FILE}. Consequently preflight, formal writes, startup, and subsequent
-# regular `docker compose up` runs after cleanup removes the override file all
-# see the exact same effective `env_file` list.
-write_compose_env_override() {
-  local target_env_path="$1"
-  local out_path="$2"
-  python3 - "$target_env_path" "$WORK_DIR" "${RESOLVED_COMPOSE_FILES[@]}" > "$out_path" <<'PY'
-import json, os, re, sys
-
-env_path = sys.argv[1]
-work_dir = sys.argv[2]
-compose_files = sys.argv[3:]
-
-work_norm = os.path.normpath(os.path.abspath(work_dir))
-dotenv_norm = os.path.normpath(os.path.join(work_norm, ".env"))
-dotenv_real = os.path.realpath(dotenv_norm)
-
-
-def is_dotenv_path(raw_path: str) -> bool:
-    p = raw_path.strip()
-    if not p or "$" in p:
-        return False
-    if os.path.isabs(p):
-        cand_norm = os.path.normpath(p)
-        return cand_norm == dotenv_norm or os.path.realpath(cand_norm) == dotenv_real
-    cand_norm = os.path.normpath(os.path.join(work_norm, p))
-    return cand_norm == dotenv_norm or os.path.realpath(cand_norm) == dotenv_real
-
-
-def strip_comment(text: str) -> str:
-    in_quote: str | None = None
-    escaped = False
-    for idx, ch in enumerate(text):
-        if escaped:
-            escaped = False
-            continue
-        if in_quote == '"' and ch == "\\":
-            escaped = True
-            continue
-        if in_quote is not None:
-            if ch == in_quote:
-                in_quote = None
-            continue
-        if ch in ("'", '"'):
-            in_quote = ch
-        elif ch == "#" and (idx == 0 or text[idx - 1].isspace()):
-            return text[:idx].rstrip()
-    return text.rstrip()
-
-
-def parse_scalar(text: str):
-    val = strip_comment(text).strip()
-    if not val:
-        return ""
-    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
-        if val[0] == '"':
-            try:
-                return json.loads(val)
-            except Exception:
-                return val[1:-1]
-        return val[1:-1].replace("''", "'")
-    low = val.lower()
-    if low == "true":
-        return True
-    if low == "false":
-        return False
-    if low in ("null", "~"):
-        return None
-    return val
-
-
-def split_flow_items(inner: str) -> list[str]:
-    items: list[str] = []
-    buf: list[str] = []
-    in_quote: str | None = None
-    depth = 0
-    escaped = False
-    for ch in inner:
-        if escaped:
-            buf.append(ch)
-            escaped = False
-            continue
-        if in_quote == '"' and ch == "\\":
-            buf.append(ch)
-            escaped = True
-            continue
-        if in_quote is not None:
-            buf.append(ch)
-            if ch == in_quote:
-                in_quote = None
-            continue
-        if ch in ("'", '"'):
-            in_quote = ch
-            buf.append(ch)
-        elif ch in ("{", "["):
-            depth += 1
-            buf.append(ch)
-        elif ch in ("}", "]"):
-            depth = max(0, depth - 1)
-            buf.append(ch)
-        elif ch == "," and depth == 0:
-            part = "".join(buf).strip()
-            if part:
-                items.append(part)
-            buf = []
-        else:
-            buf.append(ch)
-    tail = "".join(buf).strip()
-    if tail:
-        items.append(tail)
-    return items
-
-
-def parse_flow_mapping(text: str) -> dict:
-    inner = text.strip()
-    if inner.startswith("{") and inner.endswith("}"):
-        inner = inner[1:-1]
-    out: dict = {}
-    for pair in split_flow_items(inner):
-        if ":" not in pair:
-            continue
-        k, v = pair.split(":", 1)
-        out[str(parse_scalar(k))] = parse_scalar(v)
-    return out
-
-
-def parse_env_file_fallback(cf: str) -> dict[str, tuple[str | None, list]]:
-    result: dict[str, tuple[str | None, list]] = {}
-    in_services = False
-    svc_indent: int | None = None
-    prop_indent: int | None = None
-    cur_svc: str | None = None
-    in_env_file = False
-    ef_indent = 0
-    ef_tag: str | None = None
-    ef_entries: list = []
-    cur_dict: dict | None = None
-    cur_item_indent: int | None = None
-
-    def flush_env_file() -> None:
-        nonlocal in_env_file, ef_tag, ef_entries, cur_dict, cur_item_indent
-        if in_env_file and cur_svc is not None:
-            result[cur_svc] = (ef_tag, ef_entries)
-        in_env_file = False
-        ef_tag = None
-        ef_entries = []
-        cur_dict = None
-        cur_item_indent = None
-
-    with open(cf, encoding="utf-8") as fh:
-        for raw in fh:
-            cleaned = strip_comment(raw.rstrip("\r\n"))
-            stripped = cleaned.strip()
-            if not stripped:
-                continue
-            indent = len(cleaned) - len(cleaned.lstrip(" "))
-            if indent == 0:
-                flush_env_file()
-                in_services = stripped == "services:" or stripped.startswith("services:")
-                svc_indent = None
-                prop_indent = None
-                cur_svc = None
-                continue
-            if not in_services:
-                continue
-            if svc_indent is None or indent <= svc_indent:
-                flush_env_file()
-                if stripped.endswith(":"):
-                    svc_indent = indent
-                    prop_indent = None
-                    cur_svc = str(parse_scalar(stripped[:-1]))
-                else:
-                    cur_svc = None
-                continue
-            if cur_svc is None:
-                continue
-            if in_env_file and (
-                indent < ef_indent
-                or (
-                    indent == ef_indent
-                    and not (stripped.startswith("-") and (len(stripped) == 1 or stripped[1].isspace()))
-                )
-            ):
-                flush_env_file()
-            if not in_env_file:
-                if prop_indent is None:
-                    prop_indent = indent
-                if indent != prop_indent:
-                    continue
-                if stripped.startswith("env_file:"):
-                    rest = stripped[len("env_file:"):].strip()
-                    tag: str | None = None
-                    for candidate_tag in ("!override", "!reset"):
-                        if rest == candidate_tag or rest.startswith(candidate_tag + " "):
-                            tag = candidate_tag
-                            rest = rest[len(candidate_tag):].strip()
-                            break
-                    if not rest:
-                        in_env_file = True
-                        ef_indent = indent
-                        ef_tag = tag
-                        ef_entries = []
-                        cur_dict = None
-                        cur_item_indent = None
-                    elif rest.startswith("[") and rest.endswith("]"):
-                        entries = []
-                        for tok in split_flow_items(rest[1:-1]):
-                            if tok.startswith("{") and tok.endswith("}"):
-                                entries.append(parse_flow_mapping(tok))
-                            else:
-                                entries.append(str(parse_scalar(tok)))
-                        result[cur_svc] = (tag, entries)
-                    elif rest.startswith("{") and rest.endswith("}"):
-                        result[cur_svc] = (tag, [parse_flow_mapping(rest)])
-                    else:
-                        val = parse_scalar(rest)
-                        result[cur_svc] = (tag, [] if val in (None, "") else [str(val)])
-                continue
-
-            if stripped.startswith("-") and (len(stripped) == 1 or stripped[1].isspace()):
-                item_text = stripped[1:].strip()
-                cur_dict = None
-                cur_item_indent = indent
-                if not item_text:
-                    cur_dict = {}
-                    ef_entries.append(cur_dict)
-                elif item_text.startswith("{") and item_text.endswith("}"):
-                    ef_entries.append(parse_flow_mapping(item_text))
-                elif re.match(r"^[A-Za-z_][A-Za-z0-9_-]*\s*:", item_text):
-                    k, v = item_text.split(":", 1)
-                    cur_dict = {k.strip(): parse_scalar(v)}
-                    ef_entries.append(cur_dict)
-                else:
-                    ef_entries.append(str(parse_scalar(item_text)))
-            elif cur_dict is not None and (cur_item_indent is None or indent > cur_item_indent):
-                if ":" in stripped:
-                    k, v = stripped.split(":", 1)
-                    cur_dict[k.strip()] = parse_scalar(v)
-
-    flush_env_file()
-    return result
-
-
-def parse_env_file_yaml(cf: str) -> dict[str, tuple[str | None, list]] | None:
-    try:
-        import yaml  # type: ignore[import-not-found]
-    except Exception:
-        return None
-
-    class _Tagged:
-        def __init__(self, tag: str, value):
-            self.tag = tag
-            self.value = value
-
-    class _Loader(yaml.SafeLoader):
-        pass
-
-    def _ctor(loader, node):
-        if isinstance(node, yaml.ScalarNode):
-            val = loader.construct_scalar(node)
-        elif isinstance(node, yaml.SequenceNode):
-            val = loader.construct_sequence(node, deep=True)
-        elif isinstance(node, yaml.MappingNode):
-            val = loader.construct_mapping(node, deep=True)
-        else:
-            val = None
-        return _Tagged(node.tag, val)
-
-    def _multi_ctor(loader, tag_suffix, node):
-        if isinstance(node, yaml.ScalarNode):
-            return loader.construct_scalar(node)
-        if isinstance(node, yaml.SequenceNode):
-            return loader.construct_sequence(node, deep=True)
-        if isinstance(node, yaml.MappingNode):
-            return loader.construct_mapping(node, deep=True)
-        return None
-
-    _Loader.add_constructor("!override", _ctor)
-    _Loader.add_constructor("!reset", _ctor)
-    _Loader.add_multi_constructor("!", _multi_ctor)
-
-    try:
-        with open(cf, encoding="utf-8") as fh:
-            data = yaml.load(fh, Loader=_Loader)
-    except Exception:
-        return None
-    if not isinstance(data, dict):
-        return {}
-    services = data.get("services")
-    if not isinstance(services, dict):
-        return {}
-    out: dict[str, tuple[str | None, list]] = {}
-    for svc_name, svc_cfg in services.items():
-        if not isinstance(svc_cfg, dict) or "env_file" not in svc_cfg:
-            continue
-        raw_ef = svc_cfg["env_file"]
-        tag = None
-        val = raw_ef
-        if isinstance(raw_ef, _Tagged):
-            tag = raw_ef.tag
-            val = raw_ef.value
-        if val is None:
-            entries = []
-        elif isinstance(val, str):
-            entries = [val]
-        elif isinstance(val, dict):
-            entries = [dict(val)]
-        elif isinstance(val, list):
-            entries = [
-                dict(x) if isinstance(x, dict) else str(x)
-                for x in val
-                if isinstance(x, (str, dict))
-            ]
-        else:
-            entries = []
-        out[str(svc_name)] = (tag, entries)
-    return out
-
-
-merged: dict[str, list] = {}
-for cf in compose_files:
-    parsed = parse_env_file_yaml(cf)
-    if parsed is None:
-        parsed = parse_env_file_fallback(cf)
-    for svc_name, (tag, entries) in parsed.items():
-        if tag == "!reset":
-            merged[svc_name] = []
-        elif tag == "!override":
-            merged[svc_name] = list(entries)
-        else:
-            merged.setdefault(svc_name, []).extend(entries)
-
-escaped_target = env_path.replace("$", "$$")
-rewritten_svcs: dict[str, list] = {}
-for svc, entries in merged.items():
-    replaced_any = False
-    new_entries: list = []
-    for entry in entries:
-        if isinstance(entry, str):
-            if is_dotenv_path(entry):
-                new_entries.append(escaped_target)
-                replaced_any = True
-            else:
-                new_entries.append(entry)
-        elif isinstance(entry, dict):
-            item = dict(entry)
-            p = item.get("path")
-            if isinstance(p, str) and is_dotenv_path(p):
-                item["path"] = escaped_target
-                replaced_any = True
-            new_entries.append(item)
-    if replaced_any:
-        rewritten_svcs[svc] = new_entries
-
-if rewritten_svcs:
-    print("services:")
-    for svc in sorted(rewritten_svcs):
-        print(f"  {svc}:")
-        print("    env_file: !override")
-        for item in rewritten_svcs[svc]:
-            if isinstance(item, str):
-                print(f"      - {json.dumps(item)}")
-            elif isinstance(item, dict) and item:
-                first = True
-                for k, v in item.items():
-                    prefix = "      - " if first else "        "
-                    first = False
-                    print(f"{prefix}{k}: {json.dumps(v)}")
-PY
-}
-
+# When restoring from env.enc, swap the decrypted file into place at $ENV_FILE
+# BEFORE any compose-dependent preflight so preflight, storage config comparison,
+# writes, and startup all use the exact same regular `docker compose` arguments
+# (no temporary compose override file). If any step fails before data writes
+# begin, cleanup() restores the original .env (or deletes the newly placed one).
 if [[ "$ENV_FROM_BACKUP" -eq 1 ]]; then
-  RESTORE_COMPOSE_OVERRIDE="$(mktemp "${TMPDIR:-/tmp}/dalton-restore-override.XXXXXX")"
-  chmod 600 "$RESTORE_COMPOSE_OVERRIDE"
-  write_compose_env_override "$CANDIDATE_ENV" "$RESTORE_COMPOSE_OVERRIDE"
-  if [[ ! -s "$RESTORE_COMPOSE_OVERRIDE" ]]; then
-    rm -f "$RESTORE_COMPOSE_OVERRIDE"
-    RESTORE_COMPOSE_OVERRIDE=""
+  if [[ "$ENV_EXISTED_BEFORE" -eq 1 ]]; then
+    env_bak_ts="$(date -u +%Y%m%d-%H%M%SZ)"
+    env_bak_candidate="${ENV_FILE}.pre-restore-${env_bak_ts}"
+    if [[ -e "$env_bak_candidate" ]]; then
+      env_bak_seq=1
+      while [[ -e "${env_bak_candidate}-${env_bak_seq}" ]]; do
+        env_bak_seq=$((env_bak_seq + 1))
+      done
+      env_bak_candidate="${env_bak_candidate}-${env_bak_seq}"
+    fi
+    ENV_BACKUP_PATH="$env_bak_candidate"
+    cp -p "$ENV_FILE" "$ENV_BACKUP_PATH"
+    chmod 600 "$ENV_BACKUP_PATH"
+    info "Backed up existing ${ENV_FILE} to ${ENV_BACKUP_PATH} (mode 600)."
   fi
+  chmod 600 "$STAGED_ENV_TMP"
+  mv "$STAGED_ENV_TMP" "$ENV_FILE"
+  STAGED_ENV_TMP=""
+  ENV_SWAPPED=1
+  CANDIDATE_ENV="$ENV_FILE"
+  ok "Atomically placed decrypted backup .env at ${ENV_FILE} (mode 600)."
 fi
 
-ACTIVE_COMPOSE_ENV="$CANDIDATE_ENV"
 compose_cmd() {
-  if [[ -n "$RESTORE_COMPOSE_OVERRIDE" && -f "$RESTORE_COMPOSE_OVERRIDE" ]]; then
-    env "${ENV_UNSET_ARGS[@]}" docker compose -p "$COMPOSE_PROJECT" "${COMPOSE_FILE_ARGS[@]}" -f "$RESTORE_COMPOSE_OVERRIDE" --env-file "$ACTIVE_COMPOSE_ENV" --project-directory "$WORK_DIR" "$@"
-  else
-    env "${ENV_UNSET_ARGS[@]}" docker compose -p "$COMPOSE_PROJECT" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ACTIVE_COMPOSE_ENV" --project-directory "$WORK_DIR" "$@"
-  fi
+  env "${ENV_UNSET_ARGS[@]}" docker compose -p "$COMPOSE_PROJECT" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" --project-directory "$WORK_DIR" "$@"
 }
 
 service_is_running() {
@@ -1096,7 +759,7 @@ STORAGE_CHECK_ARGS=(
   python3 "${SCRIPT_DIR}/storage_config.py" check-env
   --compose-config-json "$COMPOSE_CFG_TMP"
   --service backend
-  --env-file "$CANDIDATE_ENV"
+  --env-file "$ENV_FILE"
   --work-dir "$WORK_DIR"
   --caller restore
   --json
@@ -1123,7 +786,7 @@ if [[ "$SKIP_MINIO" -eq 0 && ( -n "$MINIO_MANIFEST_TMP" || -f "${BACKUP_DIR}/man
     python3 "${SCRIPT_DIR}/storage_config.py" compare-backup
     --compose-config-json "$COMPOSE_CFG_TMP"
     --service backend
-    --env-file "$CANDIDATE_ENV"
+    --env-file "$ENV_FILE"
     --work-dir "$WORK_DIR"
     --caller restore
   )
@@ -1138,8 +801,8 @@ if [[ "$SKIP_MINIO" -eq 0 && ( -n "$MINIO_MANIFEST_TMP" || -f "${BACKUP_DIR}/man
   fi
 fi
 
-# Step 3: Verify entire target PostgreSQL instance and object storage are empty,
-# validate postgres.dump, then atomically write .env.
+# Step 3: Verify entire target PostgreSQL instance and object storage are empty
+# and validate postgres.dump before writing any data.
 info "3/7 Verifying target instance is empty and validating postgres.dump..."
 if ! service_is_running postgres; then
   compose_cmd up -d postgres
@@ -1371,35 +1034,18 @@ print("EMPTY")
   ok "Confirmed target object storage is empty (no objects; only empty minio-init bucket allowed)."
 fi
 
-# Preflight passed: mark mutation boundary before atomically writing .env or data.
-MUTATION_STARTED=1
-if [[ "$ENV_FROM_BACKUP" -eq 1 ]]; then
-  ENV_WRITE_TMP="$(mktemp "${WORK_DIR}/.env.tmp-XXXXXX")"
-  cp "$CANDIDATE_ENV" "$ENV_WRITE_TMP"
-  chmod "$ORIG_ENV_MODE" "$ENV_WRITE_TMP"
-  mv "$ENV_WRITE_TMP" "$ENV_FILE"
-  ENV_WRITE_TMP=""
-  ACTIVE_COMPOSE_ENV="$ENV_FILE"
-  # Retarget the `.env` entry inside the override file in-place to the now-written
-  # ${ENV_FILE} (still preserving every other `env_file` entry in its exact original
-  # order) so $STAGED_ENV_TMP can be deleted immediately while preflight, formal
-  # writes, startup, and subsequent regular deployments all share the same env_file list.
-  if [[ -n "$RESTORE_COMPOSE_OVERRIDE" && -f "$RESTORE_COMPOSE_OVERRIDE" ]]; then
-    write_compose_env_override "$ENV_FILE" "$RESTORE_COMPOSE_OVERRIDE"
-    chmod 600 "$RESTORE_COMPOSE_OVERRIDE"
-  fi
-  if [[ -n "$STAGED_ENV_TMP" && -f "$STAGED_ENV_TMP" ]]; then
-    rm -f "$STAGED_ENV_TMP"
-    STAGED_ENV_TMP=""
-  fi
-  ok "Atomically wrote ${ENV_FILE} from backup env.enc."
-else
+if [[ "$ENV_FROM_BACKUP" -eq 0 ]]; then
   warn "Using existing ${ENV_FILE} (not overwritten from env.enc)."
   warn "If BYOK_ENCRYPTION_KEY in ${ENV_FILE} differs from the backup's original .env, saved LLM API keys will fail to decrypt."
 fi
 
-# Ensure infrastructure services match the final .env
+# Ensure infrastructure services are up before starting data writes
 compose_cmd up -d postgres redis minio
+
+# Preflight passed: mark mutation boundary immediately before the first write
+# to object storage (Step 4) or PostgreSQL (Step 5). Failures from here on do
+# not roll back .env so configuration remains consistent with any written data.
+MUTATION_STARTED=1
 
 # Step 4: Restore MinIO objects directly into original bucket name(s) with read-back verification
 if [[ "$SKIP_MINIO" -eq 0 && "$STORAGE_ANY_CONFIGURED" -eq 1 && -f "${BACKUP_DIR}/minio-objects.tar.gz" ]]; then
@@ -1926,6 +1572,12 @@ printf "  Restored from    : %s\n" "$BACKUP_DIR"
 printf "  Database         : %s (upstream=%s, dalton=%s)\n" "$CFG_DB_NAME" "$RESTORED_UP" "$RESTORED_DA"
 printf "  Active bucket    : %s\n" "$CFG_CHAT_BUCKET"
 printf "  Edge TLS mode    : %s\n" "$CFG_TLS_MODE"
+if [[ -n "$ENV_BACKUP_PATH" && -f "$ENV_BACKUP_PATH" ]]; then
+  printf "  Previous .env    : %s\n" "$ENV_BACKUP_PATH"
+fi
 printf "\n  Next steps:\n"
 printf "  - Verify service status: %s\n" "$(fmt_cmd docker compose -p "$COMPOSE_PROJECT" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" ps)"
 printf "  - Open the web UI and confirm your workspaces, threads, and uploaded files are visible.\n"
+if [[ -n "$ENV_BACKUP_PATH" && -f "$ENV_BACKUP_PATH" ]]; then
+  printf "  - 原 .env 已备份保留在 %s（权限 600），确认恢复无误后请自行删除。\n" "$ENV_BACKUP_PATH"
+fi

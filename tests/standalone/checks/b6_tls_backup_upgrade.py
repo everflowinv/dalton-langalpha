@@ -1945,7 +1945,9 @@ def check_restore_on_clean_stack(
 
                 # 5d3. Extra compose file adding `storage.env` to `backend`'s `env_file` with a
                 #      mismatched key prefix MUST remain in effect when restoring from `env.enc`
-                #      and cause restore.sh to refuse BEFORE writing `.env` or any data.
+                #      and cause restore.sh to refuse BEFORE writing any data, rolling `.env`
+                #      back to its exact pre-restore state (both when `.env` was absent and when
+                #      replacing an existing `.env` via `--replace-env`).
                 storage_override_prefix = "tenant-b-ci-storage-env"
                 storage_override_env = restore_dir / "storage.env"
                 storage_override_compose = tmp_root / "docker-compose.override-backend-storage-env.yml"
@@ -1991,14 +1993,63 @@ def check_restore_on_clean_stack(
                     assert storage_override_prefix in se_stderr and "key_prefix" in se_stderr.lower(), (
                         f"Extra storage.env key_prefix refusal should report {storage_override_prefix!r}, got:\n{se_stderr[-800:]}"
                     )
+                    assert "已把 .env 恢复为恢复前的内容" in se_stderr, (
+                        f"Refused restore from env.enc should report rolling back .env, got:\n{se_stderr[-800:]}"
+                    )
                     assert not restored_env_file.exists(), (
-                        "restore.sh must refuse mismatched storage.env BEFORE writing .env!"
+                        "restore.sh must roll back (remove) newly placed .env when storage.env mismatches backup!"
+                    )
+
+                    # Also verify existing .env + --replace-env is restored byte-for-byte on refusal
+                    pre_replace_env_text = saved_env_text.rstrip("\n") + "\n# b6-5d3-pre-restore-sentinel\n"
+                    restored_env_file.write_text(pre_replace_env_text, encoding="utf-8")
+                    os.chmod(restored_env_file, 0o600)
+                    storage_env_replace_proc = _run_cmd(
+                        [
+                            "bash",
+                            str(restore_dir / "scripts" / "standalone" / "restore.sh"),
+                            "--backup-dir",
+                            str(restore_backup_dir),
+                            "--work-dir",
+                            str(restore_dir),
+                            "--compose-files",
+                            f"{restore_compose_files}:{storage_override_compose}",
+                            "--env-passphrase-file",
+                            str(passphrase_file),
+                            "--replace-env",
+                            "--project-name",
+                            restore_project,
+                            "--skip-edge-build",
+                        ],
+                        cwd=restore_dir,
+                        env=restore_sh_env,
+                        check=False,
+                        redact_env=ctx.env,
+                        timeout=120,
+                    )
+                    assert storage_env_replace_proc.returncode != 0, (
+                        "restore.sh --replace-env MUST refuse when storage.env has mismatched key prefix!"
+                    )
+                    ser_stderr = storage_env_replace_proc.stderr or ""
+                    assert storage_override_prefix in ser_stderr and "key_prefix" in ser_stderr.lower(), (
+                        f"Extra storage.env --replace-env refusal should report {storage_override_prefix!r}, got:\n{ser_stderr[-800:]}"
+                    )
+                    assert "已把 .env 恢复为恢复前的内容" in ser_stderr, (
+                        f"Refused --replace-env should report restoring original .env, got:\n{ser_stderr[-800:]}"
+                    )
+                    assert restored_env_file.is_file() and restored_env_file.read_text(encoding="utf-8") == pre_replace_env_text, (
+                        "restore.sh must restore .env to its exact pre-restore content when refused before writing data!"
+                    )
+                    assert not list(restore_dir.glob(".env.pre-restore-*")), (
+                        "Rolled-back pre-restore backup file should have been moved back into .env!"
                     )
                 finally:
                     storage_override_env.unlink(missing_ok=True)
+                    for stale_pre in restore_dir.glob(".env.pre-restore-*"):
+                        stale_pre.unlink(missing_ok=True)
                     restored_env_file.write_text(saved_env_text, encoding="utf-8")
                     os.chmod(restored_env_file, 0o600)
-                log("5d3 OK (extra compose file storage.env key_prefix mismatch refused before writing .env/data).")
+                log("5d3 OK (extra compose file storage.env key_prefix mismatch refused before writing data and rolled .env back).")
 
                 # 5e. Whole-instance PostgreSQL empty guard: when target DB_NAME is empty,
                 #     another non-empty database in the same PostgreSQL instance MUST still

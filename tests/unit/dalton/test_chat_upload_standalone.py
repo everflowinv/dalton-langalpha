@@ -1947,7 +1947,10 @@ class TestSandboxNetworkAndInitScript:
         assert "--replace-data" not in restore_text, "restore.sh must remove --replace-data"
         assert "ALTER DATABASE" not in restore_text, "restore.sh must remove DB rename / swap logic"
         assert "_pre_restore_" not in restore_text, "restore.sh must remove preserved DB logic"
-        assert ".env.pre-restore-" not in restore_text, "restore.sh must remove pre-restore .env copy logic"
+        assert "${ENV_FILE}.pre-restore-" in restore_text, "restore.sh must back up existing .env before swapping from env.enc"
+        assert "write_compose_env_override" not in restore_text, "restore.sh must not generate temporary compose override files"
+        assert "RESTORE_COMPOSE_OVERRIDE" not in restore_text, "restore.sh must remove RESTORE_COMPOSE_OVERRIDE"
+        assert "ACTIVE_COMPOSE_ENV" not in restore_text, "restore.sh must remove ACTIVE_COMPOSE_ENV"
         assert "derive_restore_bucket_name" not in restore_text, "restore.sh must restore into original bucket names"
         assert "pid_is_alive" not in restore_text, "restore.sh must not auto-clean locks by PID"
         assert "/tmp/dalton-${LOCK_PROJECT}.restore.lock" in restore_text
@@ -3274,7 +3277,9 @@ class TestSandboxNetworkAndInitScript:
         assert verify_res["checked"] == 1
         assert verify_res["skipped_uploading"] == 1
 
-        # Item 3: restore.sh from env.enc keeps the exact same override compose file across preflight & formal write
+        # Item 3 (updated in r11): restore.sh from env.enc swaps .env in place before preflight
+        # and uses the exact same regular compose args (`-p`, `-f`, `--env-file "$ENV_FILE"`)
+        # across preflight & formal write with NO temporary compose override file.
         pass_f = tmp_path / "r9.pass"
         pass_f.write_text("r9-passphrase-123456\n", encoding="utf-8")
         pass_f.chmod(0o600)
@@ -3341,7 +3346,7 @@ class TestSandboxNetworkAndInitScript:
         ov_env["PATH"] = f"{ov_stub_dir}:{ov_env.get('PATH', '')}"
         lock_ov = Path(f"/tmp/dalton-{proj_ov}.restore.lock")
         try:
-            subprocess.run(
+            res_ov_parity = subprocess.run(
                 [
                     "bash",
                     str(REPO_ROOT / "scripts/standalone/restore.sh"),
@@ -3355,18 +3360,22 @@ class TestSandboxNetworkAndInitScript:
                 text=True,
                 timeout=15,
             )
+            assert res_ov_parity.returncode != 0
+            assert not (w_ov / ".env").exists(), "Pre-write failure must remove newly placed .env"
+            assert "已把 .env 恢复为恢复前的内容" in res_ov_parity.stderr
             calls = ov_calls_log.read_text(encoding="utf-8").splitlines()
             cfg_calls = [c for c in calls if " config --format json" in c]
             write_calls = [c for c in calls if " up -d postgres redis minio" in c]
             assert cfg_calls and write_calls, f"Missing expected compose calls: {calls}"
-            m_cfg = _re.search(r"-f (\S*dalton-restore-override\.\S+)", cfg_calls[0])
-            m_wrt = _re.search(r"-f (\S*dalton-restore-override\.\S+)", write_calls[0])
-            assert m_cfg is not None and m_wrt is not None, (
-                f"Both preflight and formal write must pass the override file: cfg={cfg_calls[0]!r}, write={write_calls[0]!r}"
+            assert all("dalton-restore-override" not in c for c in calls), (
+                f"restore.sh must NOT generate any temporary compose override file: {calls}"
             )
-            assert m_cfg.group(1) == m_wrt.group(1), (
-                f"Preflight and formal write used different override files: {m_cfg.group(1)!r} != {m_wrt.group(1)!r}"
+            cfg_prefix = cfg_calls[0].split(" config --format json", 1)[0]
+            write_prefix = write_calls[0].split(" up -d postgres redis minio", 1)[0]
+            assert cfg_prefix == write_prefix, (
+                f"Preflight and formal write used different compose args: {cfg_prefix!r} != {write_prefix!r}"
             )
+            assert f"--env-file {w_ov / '.env'}" in cfg_prefix
         finally:
             if lock_ov.is_dir():
                 lock_ov.rmdir()
@@ -3572,14 +3581,13 @@ class TestSandboxNetworkAndInitScript:
     def test_b6_r10_fixes_env_file_override_preservation_and_manual_db_check(
         self, tmp_path: Path
     ) -> None:
-        """Offline verification for Batch 6 R10 fixes:
-        1. restore.sh from env.enc replaces ONLY the `.env` entry in each service's
-           merged `env_file` list while preserving extra entries (e.g. `storage.env`)
-           in their exact original order; an extra compose file adding `storage.env`
-           with a mismatched key prefix is refused BEFORE writing `.env` or any data.
-        2. Both PyYAML and pure-stdlib fallback preserve ordering, object entries,
-           `!override`, and `!reset` semantics without touching non-`.env` paths.
-        3. The database check loop in `STANDALONE-DEPLOY.md` uses `set -eu` + explicit
+        """Offline verification for Batch 6 R10/R11 fixes:
+        1. When restoring from env.enc, an extra compose file adding `storage.env`
+           with a mismatched key prefix is refused BEFORE writing any data, using
+           regular compose args (no temporary compose override), and `.env` is rolled
+           back to its exact pre-restore state (removed if absent before, or restored
+           byte-for-byte if present before with `--replace-env`).
+        2. The database check loop in `STANDALONE-DEPLOY.md` uses `set -eu` + explicit
            status/digit checks (no pipeline exit-code masking), prints the DB name and
            `检查失败，先不要删除卷`, and exits non-zero when a query fails or returns
            empty/non-digit output.
@@ -3587,7 +3595,7 @@ class TestSandboxNetworkAndInitScript:
         import re as _re
         import tarfile
 
-        # --- Item 1a: Extra compose file adding `storage.env` with mismatched key prefix ---
+        # --- Item 1: Extra compose file adding `storage.env` with mismatched key prefix ---
         pass_f = tmp_path / "r10.pass"
         pass_f.write_text("r10-passphrase-987654\n", encoding="utf-8")
         pass_f.chmod(0o600)
@@ -3676,13 +3684,12 @@ class TestSandboxNetworkAndInitScript:
         )
         (work_r10 / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
 
-        # Stub `docker` that actually merges `-f` compose files (honoring `env_file: !override`)
-        # and loads every entry in `backend`'s `env_file` list in exact order relative to `--project-directory`.
+        # Stub `docker` that merges `-f` compose files and loads every entry in `backend`'s
+        # `env_file` list in exact order relative to `--project-directory`.
         stub_bin = tmp_path / "r10-bin"
         stub_bin.mkdir()
         (stub_bin / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
         (stub_bin / "flock").chmod(0o755)
-        captured_override = tmp_path / "r10-captured-override.yml"
         captured_calls = tmp_path / "r10-docker-calls.log"
         stub_compose_py = tmp_path / "r10_stub_compose.py"
         stub_compose_py.write_text(
@@ -3698,28 +3705,14 @@ class TestSandboxNetworkAndInitScript:
             "        proj_dir = args[i + 1]; i += 2\n"
             "    else:\n"
             "        i += 1\n"
-            "class _T:\n"
-            "    def __init__(self, tag, val): self.tag, self.val = tag, val\n"
-            "class _L(yaml.SafeLoader): pass\n"
-            "def _c(l, n):\n"
-            "    v = l.construct_sequence(n, deep=True) if isinstance(n, yaml.SequenceNode) else l.construct_scalar(n)\n"
-            "    return _T(n.tag, v)\n"
-            "_L.add_constructor('!override', _c)\n"
-            "_L.add_constructor('!reset', _c)\n"
             "env_files = []\n"
             "for f in files:\n"
-            "    if 'dalton-restore-override' in os.path.basename(f):\n"
-            f"        open({str(captured_override)!r}, 'w', encoding='utf-8').write(open(f, encoding='utf-8').read())\n"
-            "    doc = yaml.load(open(f, encoding='utf-8'), Loader=_L) or {}\n"
+            "    doc = yaml.safe_load(open(f, encoding='utf-8')) or {}\n"
             "    b = (doc.get('services') or {}).get('backend') or {}\n"
             "    if 'env_file' in b:\n"
             "        ef = b['env_file']\n"
-            "        tag = ef.tag if isinstance(ef, _T) else None\n"
-            "        val = ef.val if isinstance(ef, _T) else ef\n"
-            "        items = [val] if isinstance(val, str) else list(val or [])\n"
-            "        if tag == '!reset': env_files = []\n"
-            "        elif tag == '!override': env_files = items\n"
-            "        else: env_files.extend(items)\n"
+            "        items = [ef] if isinstance(ef, str) else list(ef or [])\n"
+            "        env_files.extend(items)\n"
             "merged_env = {}\n"
             "for entry in env_files:\n"
             "    p = entry['path'] if isinstance(entry, dict) else entry\n"
@@ -3749,6 +3742,7 @@ class TestSandboxNetworkAndInitScript:
         lock_r10 = Path(f"/tmp/dalton-{proj_r10}.restore.lock")
         lock_r10_existed = lock_r10.exists()
         try:
+            # 1a. Without pre-existing .env: refused before writing data and newly placed .env is deleted
             res_mismatch = subprocess.run(
                 [
                     "bash",
@@ -3770,105 +3764,62 @@ class TestSandboxNetworkAndInitScript:
             assert "tenant-b" in res_mismatch.stderr and "key_prefix" in res_mismatch.stderr.lower(), (
                 f"Expected key_prefix mismatch mentioning tenant-b in stderr, got:\n{res_mismatch.stderr}"
             )
+            assert "已把 .env 恢复为恢复前的内容" in res_mismatch.stderr
             assert not (work_r10 / ".env").exists(), (
-                "restore.sh must refuse BEFORE writing .env when storage.env mismatches backup!"
+                "restore.sh must remove newly placed .env when refused before writing data!"
             )
             calls_made = captured_calls.read_text(encoding="utf-8").splitlines()
             assert all(" up -d" not in c for c in calls_made), (
                 f"restore.sh must refuse BEFORE starting/mutating containers, calls={calls_made}"
             )
-            ov_text = captured_override.read_text(encoding="utf-8")
-            assert '"storage.env"' in ov_text, (
-                f"Override file must preserve storage.env entry in order, got:\n{ov_text}"
+            assert all("dalton-restore-override" not in c for c in calls_made), (
+                f"restore.sh must NOT pass any temporary compose override file, calls={calls_made}"
             )
-            assert ".env.tmp-decrypt-" in ov_text and ov_text.index(".env.tmp-decrypt-") < ov_text.index('"storage.env"'), (
-                f"Override file must replace only .env and keep storage.env after it, got:\n{ov_text}"
+
+            # 1b. With existing .env + --replace-env: refused before writing data and .env is restored byte-for-byte
+            orig_env_before = (
+                f"COMPOSE_PROJECT_NAME={proj_r10}\n"
+                "DB_HOST=postgres\n"
+                "SENTINEL=original-before-restore\n"
+                "DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX=tenant-orig\n"
             )
+            (work_r10 / ".env").write_text(orig_env_before, encoding="utf-8")
+            (work_r10 / ".env").chmod(0o600)
+            captured_calls.unlink(missing_ok=True)
+            res_mismatch_existing = subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir", str(work_r10),
+                    "--backup-dir", str(bak_r10),
+                    "--compose-files", "docker-compose.yml:docker-compose.core.yml:docker-compose.extra.yml",
+                    "--env-passphrase-file", str(pass_f),
+                    "--replace-env",
+                    "--skip-caddy", "--skip-edge-build",
+                ],
+                env=r10_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_mismatch_existing.returncode != 0
+            assert "tenant-b" in res_mismatch_existing.stderr and "key_prefix" in res_mismatch_existing.stderr.lower()
+            assert "已把 .env 恢复为恢复前的内容" in res_mismatch_existing.stderr
+            assert (work_r10 / ".env").read_text(encoding="utf-8") == orig_env_before, (
+                "restore.sh must restore .env byte-for-byte to pre-restore content on pre-write refusal!"
+            )
+            assert not list(work_r10.glob(".env.pre-restore-*")), (
+                "Pre-restore .env backup must be moved back into .env on pre-write failure"
+            )
+            calls_made_2 = captured_calls.read_text(encoding="utf-8").splitlines()
+            assert all(" up -d" not in c for c in calls_made_2)
+            assert all("dalton-restore-override" not in c for c in calls_made_2)
         finally:
             if not lock_r10_existed:
                 if lock_r10.is_dir():
                     lock_r10.rmdir()
                 elif lock_r10.exists():
                     lock_r10.unlink()
-
-        # --- Item 1b: Pure-stdlib fallback & PyYAML parity across complex env_file forms ---
-        restore_src = (REPO_ROOT / "scripts/standalone/restore.sh").read_text(encoding="utf-8")
-        m_ov_fn = _re.search(
-            r"write_compose_env_override\(\)\s*\{.*?<<'PY'\n(.*?)\nPY\n\}",
-            restore_src,
-            flags=_re.DOTALL,
-        )
-        assert m_ov_fn is not None, "Could not extract write_compose_env_override Python body"
-        ov_script = tmp_path / "run_ov.py"
-        ov_script.write_text(m_ov_fn.group(1), encoding="utf-8")
-
-        cmplx_work = tmp_path / "r10-cmplx"
-        cmplx_work.mkdir()
-        cf1 = cmplx_work / "base.yml"
-        cf2 = cmplx_work / "extra.yml"
-        cf1.write_text(
-            "services:\n"
-            "  backend:\n"
-            "    env_file:\n"
-            "      - pre.env\n"
-            "      - path: ./.env\n"
-            "        required: false\n"
-            "  worker:\n"
-            "    env_file: .env\n"
-            "  reset_svc:\n"
-            "    env_file: .env\n"
-            "  other_svc:\n"
-            "    env_file:\n"
-            "      - sub/.env\n"
-            "      - .env.local\n",
-            encoding="utf-8",
-        )
-        cf2.write_text(
-            "services:\n"
-            "  backend:\n"
-            "    env_file:\n"
-            "      - path: storage.env\n"
-            "        required: true\n"
-            "  worker:\n"
-            "    env_file: !override [only-storage.env]\n"
-            "  reset_svc:\n"
-            "    env_file: !reset []\n",
-            encoding="utf-8",
-        )
-
-        # Block PyYAML in a separate PYTHONPATH dir to test the pure-stdlib fallback too
-        no_yaml_dir = tmp_path / "no-yaml"
-        no_yaml_dir.mkdir()
-        (no_yaml_dir / "yaml.py").write_text('raise ImportError("blocked for fallback test")\n', encoding="utf-8")
-        target_decrypted = str(cmplx_work / ".env.tmp-decrypt-xyz")
-        outputs: list[str] = []
-        for mode_name, extra_pypath in (("yaml", ""), ("stdlib-fallback", str(no_yaml_dir))):
-            env_m = os.environ.copy()
-            if extra_pypath:
-                env_m["PYTHONPATH"] = f"{extra_pypath}:{env_m.get('PYTHONPATH', '')}"
-            run_ov = subprocess.run(
-                [sys.executable, str(ov_script), target_decrypted, str(cmplx_work), str(cf1), str(cf2)],
-                env=env_m,
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=15,
-            )
-            out_y = run_ov.stdout
-            outputs.append(out_y)
-            assert "  backend:\n" in out_y, f"{mode_name}: backend missing:\n{out_y}"
-            assert "  worker:\n" not in out_y, f"{mode_name}: overridden-away worker must not appear:\n{out_y}"
-            assert "  reset_svc:\n" not in out_y, f"{mode_name}: reset_svc must not appear:\n{out_y}"
-            assert "  other_svc:\n" not in out_y, f"{mode_name}: non-root .env other_svc must not appear:\n{out_y}"
-            assert (
-                out_y.index('"pre.env"')
-                < out_y.index(json.dumps(target_decrypted))
-                < out_y.index('"storage.env"')
-            ), f"{mode_name}: order not preserved:\n{out_y}"
-            assert "required: false" in out_y and "required: true" in out_y, (
-                f"{mode_name}: object attributes not preserved:\n{out_y}"
-            )
-        assert outputs[0] == outputs[1], f"PyYAML vs stdlib fallback diverged:\n{outputs[0]}\n---\n{outputs[1]}"
 
         # --- Item 3: Manual database check loop in STANDALONE-DEPLOY.md fails loudly on query error / non-digit ---
         doc_text = (REPO_ROOT / "docs/dalton/dev-guide/STANDALONE-DEPLOY.md").read_text(encoding="utf-8")
@@ -3942,3 +3893,255 @@ class TestSandboxNetworkAndInitScript:
         res_list_fail = _run_doc_snippet('echo "psql: cannot connect" >&2; exit 2\n')
         assert res_list_fail.returncode != 0
         assert "检查失败，先不要删除卷" in res_list_fail.stderr
+
+    def test_b6_r11_env_swap_rollback_and_pre_restore_backup(
+        self, tmp_path: Path
+    ) -> None:
+        """Offline verification for Batch 6 R11:
+        1. Post-write failure after MUTATION_STARTED=1 with existing .env + --replace-env
+           keeps the new .env (mode 0600), preserves .env.pre-restore-<ts> (mode 0600,
+           original content), and reports the backup path in stderr without rolling back.
+        2. Successful restore with existing .env + --replace-env keeps .env.pre-restore-<ts>
+           (mode 0600, original content), prints its path in stdout with a manual cleanup
+           hint, and runs every docker compose command with identical regular args.
+        3. Restoring with existing .env (without env.enc / --replace-env) creates no
+           .env.pre-restore-* backup and leaves .env untouched.
+        """
+        pass_f = tmp_path / "r11.pass"
+        pass_f.write_text("r11-passphrase-123456\n", encoding="utf-8")
+        pass_f.chmod(0o600)
+
+        def _make_r11_backup(name: str, proj: str, backup_env_text: str) -> Path:
+            bdir = tmp_path / name
+            bdir.mkdir()
+            (bdir / "postgres.dump").write_bytes(b"PGDMP")
+            plain = tmp_path / f"{name}.plain.env"
+            plain.write_text(backup_env_text, encoding="utf-8")
+            subprocess.run(
+                [
+                    "openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-md", "sha256", "-iter", "10000",
+                    "-salt", "-in", str(plain), "-out", str(bdir / "env.enc"), "-pass", f"file:{pass_f}",
+                ],
+                check=True,
+                capture_output=True,
+                timeout=15,
+            )
+            (bdir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "compose_project": proj,
+                        "env_backup": "encrypted",
+                        "env_encryption": {
+                            "cipher": "aes-256-cbc",
+                            "kdf": "pbkdf2",
+                            "digest": "sha256",
+                            "iterations": 10000,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return bdir
+
+        # --- Case 1: Post-write failure keeps new .env and reports .env.pre-restore-<ts> ---
+        proj_post = f"r11-post-fail-{uuid.uuid4().hex[:10]}"
+        orig_env_post = (
+            f"COMPOSE_PROJECT_NAME={proj_post}\n"
+            "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=oldpg\nDB_NAME=postgres\n"
+            "SENTINEL=original-before-post-fail\n"
+        )
+        new_env_post = (
+            f"COMPOSE_PROJECT_NAME={proj_post}\n"
+            "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=newpg\nDB_NAME=postgres\n"
+            "SENTINEL=restored-from-backup\n"
+        )
+        bak_post = _make_r11_backup("r11-bak-post", proj_post, new_env_post)
+        w_post = tmp_path / "r11-work-post"
+        w_post.mkdir()
+        (w_post / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
+        (w_post / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_post / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
+        (w_post / ".env").write_text(orig_env_post, encoding="utf-8")
+        (w_post / ".env").chmod(0o640)
+
+        bin_post = tmp_path / "r11-bin-post"
+        bin_post.mkdir()
+        (bin_post / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (bin_post / "flock").chmod(0o755)
+        (bin_post / "docker").write_text(
+            "#!/usr/bin/env bash\n"
+            'if [[ "$*" == *" config --format json"* ]]; then echo \'{"services":{"backend":{"environment":{}}}}\'; exit 0; fi\n'
+            'if [[ "$*" == *" ps --status running --services"* ]]; then echo "postgres"; exit 0; fi\n'
+            'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
+            'if [[ "$*" == *"FROM pg_database"* ]]; then echo "postgres"; exit 0; fi\n'
+            'if [[ "$*" == *" -d postgres "* && "$*" == *"pg_class"* ]]; then printf "0\\t0\\t0\\n"; exit 0; fi\n'
+            'if [[ "$*" == *" pg_restore "* ]]; then echo "simulated post-write pg_restore failure" >&2; exit 1; fi\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        (bin_post / "docker").chmod(0o755)
+        env_post = os.environ.copy()
+        env_post["PATH"] = f"{bin_post}:{env_post.get('PATH', '')}"
+        lock_post = Path(f"/tmp/dalton-{proj_post}.restore.lock")
+        try:
+            res_post = subprocess.run(
+                [
+                    "bash", str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir", str(w_post),
+                    "--backup-dir", str(bak_post),
+                    "--env-passphrase-file", str(pass_f),
+                    "--replace-env",
+                    "--skip-minio", "--skip-caddy", "--skip-edge-build",
+                ],
+                env=env_post,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_post.returncode != 0
+            assert "已把 .env 恢复为恢复前的内容" not in res_post.stderr
+            assert (w_post / ".env").read_text(encoding="utf-8") == new_env_post
+            assert stat.S_IMODE((w_post / ".env").stat().st_mode) == 0o600
+            pre_baks = list(w_post.glob(".env.pre-restore-*"))
+            assert len(pre_baks) == 1, f"Expected 1 .env.pre-restore-* backup, got {pre_baks}"
+            assert pre_baks[0].read_text(encoding="utf-8") == orig_env_post
+            assert stat.S_IMODE(pre_baks[0].stat().st_mode) == 0o600
+            assert str(pre_baks[0]) in res_post.stderr, (
+                f"Post-write failure must print pre-restore .env backup path in stderr:\n{res_post.stderr}"
+            )
+        finally:
+            if lock_post.is_dir():
+                lock_post.rmdir()
+            elif lock_post.exists():
+                lock_post.unlink()
+
+        # --- Case 2: Successful restore retains .env.pre-restore-<ts> and uses identical compose args ---
+        proj_ok = f"r11-ok-{uuid.uuid4().hex[:10]}"
+        orig_env_ok = (
+            f"COMPOSE_PROJECT_NAME={proj_ok}\n"
+            "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=oldpg\nDB_NAME=postgres\n"
+            "SENTINEL=original-before-ok\n"
+        )
+        new_env_ok = (
+            f"COMPOSE_PROJECT_NAME={proj_ok}\n"
+            "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=newpg\nDB_NAME=postgres\n"
+            "DALTON_TLS_MODE=loopback\nDALTON_EDGE_PORT=8088\n"
+            "SENTINEL=restored-ok\n"
+        )
+        bak_ok = _make_r11_backup("r11-bak-ok", proj_ok, new_env_ok)
+        w_ok = tmp_path / "r11-work-ok"
+        w_ok.mkdir()
+        (w_ok / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
+        (w_ok / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_ok / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
+        (w_ok / ".env").write_text(orig_env_ok, encoding="utf-8")
+        (w_ok / ".env").chmod(0o640)
+
+        bin_ok = tmp_path / "r11-bin-ok"
+        bin_ok.mkdir()
+        (bin_ok / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (bin_ok / "flock").chmod(0o755)
+        (bin_ok / "curl").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (bin_ok / "curl").chmod(0o755)
+        ok_calls_log = tmp_path / "r11-ok-calls.log"
+        (bin_ok / "docker").write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "%s\\n" "$*" >> "{ok_calls_log}"\n'
+            'if [[ "$*" == *" config --format json"* ]]; then echo \'{"services":{"backend":{"environment":{}}}}\'; exit 0; fi\n'
+            'if [[ "$*" == *" ps --status running --services"* ]]; then printf "postgres\\nedge\\n"; exit 0; fi\n'
+            'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
+            'if [[ "$*" == *"FROM pg_database"* ]]; then echo "postgres"; exit 0; fi\n'
+            'if [[ "$*" == *" -d postgres "* && "$*" == *"pg_class"* ]]; then printf "0\\t0\\t0\\n"; exit 0; fi\n'
+            'if [[ "$*" == *" port edge 8088"* ]]; then echo "127.0.0.1:8088"; exit 0; fi\n'
+            'if [[ "$*" == *"alembic_version_dalton"* ]]; then echo "dalton_head"; exit 0; fi\n'
+            'if [[ "$*" == *"alembic_version"* ]]; then echo "up_head"; exit 0; fi\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        (bin_ok / "docker").chmod(0o755)
+        env_ok = os.environ.copy()
+        env_ok["PATH"] = f"{bin_ok}:{env_ok.get('PATH', '')}"
+        lock_ok = Path(f"/tmp/dalton-{proj_ok}.restore.lock")
+        try:
+            res_ok = subprocess.run(
+                [
+                    "bash", str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir", str(w_ok),
+                    "--backup-dir", str(bak_ok),
+                    "--env-passphrase-file", str(pass_f),
+                    "--replace-env",
+                    "--skip-minio", "--skip-caddy", "--skip-edge-build",
+                ],
+                env=env_ok,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_ok.returncode == 0, f"Expected restore to succeed, stderr:\n{res_ok.stderr}"
+            assert (w_ok / ".env").read_text(encoding="utf-8") == new_env_ok
+            assert stat.S_IMODE((w_ok / ".env").stat().st_mode) == 0o600
+            pre_baks_ok = list(w_ok.glob(".env.pre-restore-*"))
+            assert len(pre_baks_ok) == 1, f"Expected retained .env.pre-restore-* backup, got {pre_baks_ok}"
+            assert pre_baks_ok[0].read_text(encoding="utf-8") == orig_env_ok
+            assert stat.S_IMODE(pre_baks_ok[0].stat().st_mode) == 0o600
+            assert str(pre_baks_ok[0]) in res_ok.stdout, (
+                f"Success output must print retained .env.pre-restore-* path:\n{res_ok.stdout}"
+            )
+            assert "自行删除" in res_ok.stdout
+            all_calls = ok_calls_log.read_text(encoding="utf-8").splitlines()
+            expected_prefix = (
+                f"compose -p {proj_ok} "
+                f"-f {w_ok / 'docker-compose.yml'} -f {w_ok / 'docker-compose.core.yml'} "
+                f"--env-file {w_ok / '.env'} --project-directory {w_ok} "
+            )
+            assert all_calls and all(c.startswith(expected_prefix) for c in all_calls), (
+                f"All docker compose calls must share exact regular prefix {expected_prefix!r}:\n{all_calls}"
+            )
+        finally:
+            if lock_ok.is_dir():
+                lock_ok.rmdir()
+            elif lock_ok.exists():
+                lock_ok.unlink()
+
+        # --- Case 3: Using existing .env (without env.enc) does not create .env.pre-restore-* ---
+        proj_keep = f"r11-keep-{uuid.uuid4().hex[:10]}"
+        orig_env_keep = (
+            f"COMPOSE_PROJECT_NAME={proj_keep}\n"
+            "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=keeppg\nDB_NAME=postgres\n"
+            "DALTON_TLS_MODE=loopback\nDALTON_EDGE_PORT=8088\n"
+        )
+        w_keep = tmp_path / "r11-work-keep"
+        w_keep.mkdir()
+        (w_keep / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
+        (w_keep / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_keep / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
+        (w_keep / ".env").write_text(orig_env_keep, encoding="utf-8")
+        (w_keep / ".env").chmod(0o600)
+        lock_keep = Path(f"/tmp/dalton-{proj_keep}.restore.lock")
+        try:
+            res_keep = subprocess.run(
+                [
+                    "bash", str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir", str(w_keep),
+                    "--backup-dir", str(bak_ok),
+                    "--skip-minio", "--skip-caddy", "--skip-edge-build",
+                ],
+                env=env_ok,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_keep.returncode == 0, f"Expected existing-.env restore to succeed, stderr:\n{res_keep.stderr}"
+            assert (w_keep / ".env").read_text(encoding="utf-8") == orig_env_keep
+            assert not list(w_keep.glob(".env.pre-restore-*"))
+            assert "Previous .env" not in res_keep.stdout
+        finally:
+            if lock_keep.is_dir():
+                lock_keep.rmdir()
+            elif lock_keep.exists():
+                lock_keep.unlink()
