@@ -39,6 +39,8 @@ const NOT_KEYS = [
   /`dashboard:\$\{[\w$]+\}\.rows`/g, // Dashboard/widgets/definitions/_holdingsPrimitives
   // DALTON-HOOK(composer-drafts): composer draftKey sentinel, not an i18n key
   /(["'`])dashboard:new\1/g, // Dashboard/components/ChatInputCard, ConversationWidget
+  // DALTON-HOOK(settings-section): Dalton notify override map key, not an i18n key
+  /`automation:\$\{[^}]+\}`/g, // lib/modelPreferences, Settings/panels/dalton/AutomationNotify*
 ];
 
 type AstNode = { type: string; [key: string]: unknown };

@@ -33,7 +33,8 @@ const ModelPickStep = React.lazy(() => import('./steps/ModelPickStep'));
 const DefaultsStep = React.lazy(withCopy(() => import('./steps/DefaultsStep'), ['settings']));
 const DoneStep = React.lazy(withCopy(() => import('./steps/DoneStep'), ['settings']));
 const UseStep = React.lazy(() => import('./steps/UseStep'));
-const ServerStep = React.lazy(withCopy(() => import('./steps/ServerStep'), ['settings']));
+// DALTON-HOOK(i18n): ServerStep reaches McpPrimitives ('mcp') in Dalton chunk graph
+const ServerStep = React.lazy(withCopy(() => import('./steps/ServerStep'), ['mcp', 'settings']));
 const ComputerStep = React.lazy(withCopy(() => import('./steps/ComputerStep'), ['filePanel']));
 const SshStep = React.lazy(() => import('./steps/SshStep'));
 const ModelStep = React.lazy(() => import('./steps/ModelStep'));

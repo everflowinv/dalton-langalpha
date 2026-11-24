@@ -333,8 +333,6 @@
     "resetModel": "移除覆盖设置",
     "effortDesc": "模型在回答前的思考强度，仅对提供该选项的模型生效。",
     "guidanceDesc": "代理在每轮对话中携带的指令量。精简会去掉指导性内容，只保留事实。",
-    "guidanceLean": "精简",
-    "guidanceDetailed": "完整",
     "coldCompaction": "长对话闲置后先总结",
     "coldCompactionDesc": "隔一段时间再回到较长的对话时，系统会在你发送下一条消息前先总结，比重新处理整段对话更省费用。",
     "fetchModel": "网页抓取模型",

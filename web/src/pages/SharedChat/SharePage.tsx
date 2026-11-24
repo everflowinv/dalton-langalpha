@@ -14,8 +14,9 @@ import { withCopy } from '@/i18n';
 
 // A file or app page never loads the chat replay, and an app page never loads
 // the file viewers.
+// DALTON-HOOK(monitors): SharedChatView and OwnerArtifactView reach PublishDialog ('monitors')
 const SharedChatView = React.lazy(withCopy(() => import('./SharedChatView'), [
-  'automation', 'customDashboard', 'dashboard', 'filePanel', 'mcp', 'orders', 'pageViewer', 'plugins', 'publish', 'toolArtifact', 'vault',
+  'automation', 'customDashboard', 'dashboard', 'filePanel', 'mcp', 'monitors', 'orders', 'pageViewer', 'plugins', 'publish', 'toolArtifact', 'vault',
 ]));
 const SharedFileView = React.lazy(withCopy(() => import('./SharedFileView'), [
   'filePanel', 'pageViewer', 'toolArtifact',
@@ -23,7 +24,7 @@ const SharedFileView = React.lazy(withCopy(() => import('./SharedFileView'), [
 const SharedPageView = React.lazy(withCopy(() => import('./SharedPageView'), ['filePanel']));
 // The owner's own HTML file, live with comments; their other files read as a visitor's do.
 const OwnerArtifactView = React.lazy(withCopy(() => import('./OwnerArtifactView'), [
-  'filePanel', 'pageViewer', 'publish',
+  'filePanel', 'monitors', 'pageViewer', 'publish',
 ]));
 
 /** An app's signed URL lasts an hour; swapping it reloads the running app, so only near the end. */

@@ -6,6 +6,7 @@ import { withCopy } from '@/i18n';
 // the entry, each lists every namespace it reads, though the chat page loads
 // most of them too.
 export const WorkspaceGallery = preloadableLazy(withCopy(() => import('./components/WorkspaceGallery'), ['filePanel']));
+// DALTON-HOOK(monitors): ThreadGallery reaches PublishDialog ('monitors')
 export const ThreadGallery = preloadableLazy(withCopy(() => import('./components/ThreadGallery'), [
-  'customDashboard', 'dashboard', 'filePanel', 'marketView', 'mcp', 'pageViewer', 'plugins', 'publish', 'settings', 'toolArtifact', 'vault',
+  'customDashboard', 'dashboard', 'filePanel', 'marketView', 'mcp', 'monitors', 'pageViewer', 'plugins', 'publish', 'settings', 'toolArtifact', 'vault',
 ]));

@@ -17,8 +17,9 @@ import { usePreferencesSync } from '@/lib/preferencesChannel';
 import { withCopy } from '@/i18n';
 import { preloadChatRoute } from '@/pages/ChatAgent/routePrefetch';
 
+// DALTON-HOOK(i18n): Dashboard reaches McpPrimitives ('mcp') in Dalton chunk graph
 const dashboardChunk = withCopy(() => import('../../pages/Dashboard/Dashboard'), [
-  'automation', 'customDashboard', 'dashboard', 'filePanel', 'marketView', 'settings',
+  'automation', 'customDashboard', 'dashboard', 'filePanel', 'marketView', 'mcp', 'settings',
 ]);
 const pluginsChunk = withCopy(() => import('../../pages/Plugins/Plugins'), ['mcp', 'plugins', 'settings', 'vault']);
 
@@ -38,15 +39,16 @@ const routeChunks = {
   automations: withCopy(() => import('../../pages/Automations/Automations'), [
     'automation', 'marketView', 'mcp', 'settings',
   ]),
-  // DALTON-HOOK(monitors): Monitors primary section chunk
-  monitors: withCopy(() => import('../../pages/Monitors/Monitors'), ['monitors']),
+  // DALTON-HOOK(monitors): Monitors primary section chunk (also reaches providerLabels/freshness & McpPrimitives)
+  monitors: withCopy(() => import('../../pages/Monitors/Monitors'), ['marketView', 'mcp', 'monitors']),
   // DALTON-HOOK(hide-trading): the Orders page is not built; an /orders warm
   // takes the dashboard chunk, the same one the catch-all redirect lands on.
   orders: dashboardChunk,
   library: withCopy(() => import('../../pages/Library/Library'), ['mcp']),
   plugins: pluginsChunk,
+  // DALTON-HOOK(i18n): Settings reaches McpPrimitives ('mcp') in Dalton chunk graph
   settings: withCopy(() => import('../../pages/Settings/Settings'), [
-    'filePanel', 'marketView', 'pageViewer', 'settings', 'setup',
+    'filePanel', 'marketView', 'mcp', 'pageViewer', 'settings', 'setup',
   ]),
   // Alias so preloading /connectors (the legacy path) warms the right chunk.
   connectors: pluginsChunk,

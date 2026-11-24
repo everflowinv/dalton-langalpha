@@ -77,9 +77,10 @@ export type GuidanceLevel = (typeof GUIDANCE_LEVELS)[number];
  * "detailed" on a control next to the composer reads as a promise about reply
  * length — which it is not.
  */
+// DALTON-HOOK(i18n): modelTuning is imported by the entry chunk in Dalton builds, so guidance labels stay in the main catalog beside SPEED_LABELS and EFFORT_LABELS
 export const GUIDANCE_LABELS: Record<GuidanceLevel, string> = {
-  lean: 'settings:modelTuning.guidanceLean',
-  detailed: 'settings:modelTuning.guidanceDetailed',
+  lean: 'chat.modelSelector.guidanceLean',
+  detailed: 'chat.modelSelector.guidanceDetailed',
 };
 
 export function isGuidanceLevel(value: unknown): value is GuidanceLevel {

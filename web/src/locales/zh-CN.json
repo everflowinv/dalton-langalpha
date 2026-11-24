@@ -1721,6 +1721,8 @@
       "speedStandard": "标准",
       "speedFast": "快速",
       "speedFastHint": "2 倍用量",
+      "guidanceLean": "精简",
+      "guidanceDetailed": "完整",
       "select": "选择模型",
       "fallbackName": "模型",
       "search": "搜索模型",

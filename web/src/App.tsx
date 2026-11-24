@@ -72,7 +72,7 @@ const ResetPassword = React.lazy(() => import('./pages/Login/ResetPassword'));
 // DALTON-HOOK(invite-signup): public invite redemption page (/invite#<token>)
 const InviteRedeemPage = React.lazy(() => import('./lib/dalton/InviteRedeemPage'));
 // DALTON-HOOK(monitors): anonymous read-only viewer route for public monitors (/m/:slug)
-const PublicMonitorPage = React.lazy(withCopy(() => import('./pages/Monitors/PublicMonitorPage'), ['monitors']));
+const PublicMonitorPage = React.lazy(withCopy(() => import('./pages/Monitors/PublicMonitorPage'), ['marketView', 'mcp', 'monitors']));
 // DALTON-HOOK(standalone-core): first-admin bootstrap route (/setup/admin) in local auth mode
 const AdminBootstrapStep = React.lazy(() => import('./pages/Setup/AdminBootstrapStep'));
 import { isDaltonLocalAuth } from './config/daltonAuth';

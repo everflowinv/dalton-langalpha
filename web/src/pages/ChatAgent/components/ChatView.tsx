@@ -121,7 +121,8 @@ import { preloadableLazy } from '@/lib/lazyWithMotion';
 
 // Preloadable: a lazy panel suspends on its first render even with its code
 // in, and its boundary's 300ms reveal throttle left a preloaded panel blank.
-const FilePanel = preloadableLazy(withCopy(() => import('./FilePanel'), ['publish', 'vault']));
+// DALTON-HOOK(monitors): FilePanel reaches PublishDialog ('monitors')
+const FilePanel = preloadableLazy(withCopy(() => import('./FilePanel'), ['monitors', 'publish', 'vault']));
 const loadFilePanel = FilePanel.preload;
 // The panel opens on the fold spring, which leaves the chat's edge almost
 // where it was for the first frames, and shuts on the collapse curve, as a

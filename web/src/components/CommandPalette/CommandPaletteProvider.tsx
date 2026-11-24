@@ -10,7 +10,8 @@ import { withCopy } from '@/i18n';
 // index.html's preload listener reports) closes again rather than taking the
 // app down with it, and the next open asks for the code afresh: a lazy
 // component keeps whatever its one load gave it, so a new one is made.
-const loadPalette = withCopy(() => import('./CommandPalette'), ['marketView', 'settings', 'setup']);
+// DALTON-HOOK(i18n): CommandPalette reaches McpPrimitives ('mcp') in Dalton chunk graph
+const loadPalette = withCopy(() => import('./CommandPalette'), ['marketView', 'mcp', 'settings', 'setup']);
 interface PaletteProps {
   open: boolean;
   onClose: () => void;

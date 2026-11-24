@@ -1738,6 +1738,8 @@
       "speedStandard": "Standard",
       "speedFast": "Fast",
       "speedFastHint": "2× usage",
+      "guidanceLean": "Concise",
+      "guidanceDetailed": "Thorough",
       "select": "Select model",
       "fallbackName": "Model",
       "search": "Search models",
