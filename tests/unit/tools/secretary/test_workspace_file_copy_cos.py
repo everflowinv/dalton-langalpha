@@ -144,6 +144,7 @@ def _install(
 
     sandbox = create_autospec(PTCSandbox, instance=True)
     sandbox.aupload_file_bytes.return_value = True
+    sandbox.execute_bash_command.return_value = {"success": True, "exit_code": 0}
     sandbox.als_directory.return_value = []
 
     import src.server.services.workspace_files as workspace_files_service
@@ -255,9 +256,12 @@ async def test_mirror_binary_copy_lands_in_home_shared(
         "workspace_id": "ws-anthropic",
         "path": "ant_sheet_update/Anthropic_sheet.xlsx",
     }
-    sandbox.aupload_file_bytes.assert_called_once_with(
-        "/root/Home/shared/Anthropic_sheet.xlsx", XLSX_BYTES
-    )
+    assert sandbox.aupload_file_bytes.call_count == 1
+    tmp_path, uploaded_bytes = sandbox.aupload_file_bytes.call_args.args
+    assert tmp_path.startswith("/root/Home/.agents/tmp/colleague-copy-")
+    assert uploaded_bytes == XLSX_BYTES
+    mv_cmd = sandbox.execute_bash_command.call_args.kwargs["command"]
+    assert tmp_path in mv_cmd and "/root/Home/shared/Anthropic_sheet.xlsx" in mv_cmd
 
 
 @pytest.mark.asyncio
@@ -279,9 +283,12 @@ async def test_live_sandbox_binary_copy_uses_read_contained_target(
     payload = _payload(command)
     assert payload["success"] is True, payload
     assert payload["path"] == "anthropic/ANT_cash_model.xlsx"
-    sandbox.aupload_file_bytes.assert_called_once_with(
-        "/root/Home/anthropic/ANT_cash_model.xlsx", XLSX_BYTES
-    )
+    assert sandbox.aupload_file_bytes.call_count == 1
+    tmp_path, uploaded_bytes = sandbox.aupload_file_bytes.call_args.args
+    assert tmp_path.startswith("/root/Home/.agents/tmp/colleague-copy-")
+    assert uploaded_bytes == XLSX_BYTES
+    mv_cmd = sandbox.execute_bash_command.call_args.kwargs["command"]
+    assert tmp_path in mv_cmd and "/root/Home/anthropic/ANT_cash_model.xlsx" in mv_cmd
 
 
 @pytest.mark.asyncio
@@ -991,9 +998,12 @@ async def test_flate_compressed_pdf_with_secret_is_refused_and_clean_pdf_copies(
     )
     payload_ok = _payload(cmd_ok)
     assert payload_ok.get("success") is True, payload_ok
-    sandbox.aupload_file_bytes.assert_called_once_with(
-        "/root/Home/shared/flate_clean.pdf", clean_pdf
-    )
+    assert sandbox.aupload_file_bytes.call_count == 1
+    tmp_path, uploaded_bytes = sandbox.aupload_file_bytes.call_args.args
+    assert tmp_path.startswith("/root/Home/.agents/tmp/colleague-copy-")
+    assert uploaded_bytes == clean_pdf
+    mv_cmd = sandbox.execute_bash_command.call_args.kwargs["command"]
+    assert tmp_path in mv_cmd and "/root/Home/shared/flate_clean.pdf" in mv_cmd
 
 
 @pytest.mark.asyncio
@@ -1634,16 +1644,25 @@ def _ooxml_with_member(member_name: str, member_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
-def test_macro_project_and_activex_parts_are_scanned_not_refused() -> None:
-    """A normal .xlsm carries xl/vbaProject.bin (an OLE file); it copies when it
-    holds no secret, and is refused when the raw bytes carry one."""
+def test_macro_project_refused_and_activex_parts_are_scanned() -> None:
+    """Macro-enabled .xlsm and vbaProject.bin are always refused; ActiveX parts in
+    macro-free .xlsx stay raw-scanned for secrets."""
     vault = {"k": OWNER_SECRET}
     clean = _ooxml_with_member("xl/vbaProject.bin", _OLE + b"\x00" * 512)
-    assert secretary_tools._scan_copy_bytes_for_secrets("book.xlsm", clean, vault) is None
+    assert secretary_tools._scan_copy_bytes_for_secrets("book.xlsm", clean, vault) == (
+        secretary_tools._COS_MACRO_OFFICE_REFUSED_ERROR
+    )
+    assert secretary_tools._scan_copy_bytes_for_secrets("book.xlsx", clean, vault) == (
+        secretary_tools._COS_MACRO_OFFICE_REFUSED_ERROR
+    )
     activex = _ooxml_with_member("xl/activeX/activeX1.bin", _OLE + b"\x00" * 64)
     assert secretary_tools._scan_copy_bytes_for_secrets("book.xlsx", activex, vault) is None
-    dirty = _ooxml_with_member("xl/vbaProject.bin", _OLE + OWNER_SECRET.encode())
-    assert "凭据" in (secretary_tools._scan_copy_bytes_for_secrets("book.xlsm", dirty, vault) or "")
+    dirty_activex = _ooxml_with_member(
+        "xl/activeX/activeX1.bin", _OLE + OWNER_SECRET.encode()
+    )
+    assert "凭据" in (
+        secretary_tools._scan_copy_bytes_for_secrets("book.xlsx", dirty_activex, vault) or ""
+    )
 
 
 def test_embedded_ole_object_is_still_refused() -> None:

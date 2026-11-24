@@ -250,6 +250,25 @@ async def has_active_manager(
     return False
 
 
+def _is_home_stand_in_workspace(workspace: dict[str, Any]) -> bool:
+    """DALTON-HOOK(colleague-access): decide from the row alone, with no lookup.
+
+    A stand-in's id is derived from its owner (``home_workspace.is_home_stand_in_id``)
+    and its ``config`` marker is only ever written on that id, so the id check
+    alone recognises every stand-in, even for a caller that passes only
+    ``workspace_id`` and ``user_id`` (``forks/service.py``); the other callers
+    pass full ``get_workspace`` rows. The colleague path in
+    ``src/dalton/sharing.py`` keeps its own lookup for dicts without ``config``."""
+    from src.server.database.home_workspace import (
+        is_home_stand_in_id,
+        is_home_stand_in_row,
+    )
+
+    return is_home_stand_in_row(workspace) or is_home_stand_in_id(
+        workspace.get("user_id"), workspace.get("workspace_id")
+    )
+
+
 async def workspace_access(
     workspace: Optional[dict[str, Any]], caller: str, *, manage: bool = False
 ) -> Access:
@@ -262,6 +281,9 @@ async def workspace_access(
     owner = workspace.get("user_id")
     if owner == caller:
         return Access(caller)
+    # DALTON-HOOK(colleague-access): Home stand-in rows never leak existence to non-owners (404, not 403)
+    if _is_home_stand_in_workspace(workspace):
+        raise _not_found("Workspace")
     if not is_holder(owner):
         raise _forbidden()
     return await shared_access(
@@ -326,6 +348,20 @@ async def thread_access(
     ):
         raise _not_found("Thread")
     if owner == caller:
+        # DALTON-HOOK(colleague-access): refuse thread-initiator shortcut when the thread lives in another user's Home stand-in
+        ws_owner = meta.get("workspace_owner_id")
+        if ws_owner and str(ws_owner) != str(caller):
+            from src.server.database.home_workspace import (
+                is_home_stand_in_id,
+                is_home_stand_in_row,
+            )
+
+            ws_id = meta.get("workspace_id")
+            if is_home_stand_in_id(ws_owner, ws_id) or (
+                "workspace_config" in meta
+                and is_home_stand_in_row({"config": meta.get("workspace_config")})
+            ):
+                raise _not_found("Thread")
         return Access(caller)
     if not is_holder(owner):
         raise _forbidden()
