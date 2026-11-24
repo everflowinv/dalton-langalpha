@@ -1544,25 +1544,38 @@ def _count_zip_central_entries(buf: bytes, limit: int) -> int | None:
         return None
     size_cd = endrec[zipfile._ECD_SIZE]
     offset_cd = endrec[zipfile._ECD_OFFSET]
-    # Same arithmetic as ZipFile._RealGetContents (3.13) / _handle_prepended_data
-    # (3.14): for ZIP64, _EndRecData already points _ECD_LOCATION at the ZIP64 record.
+    # ZipFile's own arithmetic. For ZIP64, _ECD_LOCATION points at the ZIP64 end
+    # record from 3.13.10 / 3.14.1 on and at the classic end record before, which
+    # puts the directory 76 bytes later; try that start too, so either runtime
+    # locates the same directory.
     concat = endrec[zipfile._ECD_LOCATION] - size_cd - offset_cd
-    pos = offset_cd + concat
-    end = pos + size_cd
-    if pos < 0 or end > len(buf):
-        return None
+    starts = [offset_cd + concat]
+    if endrec[zipfile._ECD_SIGNATURE] == zipfile.stringEndArchive64:
+        starts.append(starts[0] - zipfile.sizeEndCentDir64 - zipfile.sizeEndCentDir64Locator)
+    for start in starts:
+        end = start + size_cd
+        if start < 0 or end > len(buf) or buf[start : start + 4] != zipfile.stringCentralDir:
+            continue
+        return _walk_central_entries(buf, start, end, limit)
+    return None
+
+
+def _walk_central_entries(buf: bytes, pos: int, end: int, limit: int) -> int | None:
+    import struct
+    import zipfile
+
     count = 0
     while pos < end:
         if pos + zipfile.sizeCentralDir > end or buf[pos : pos + 4] != zipfile.stringCentralDir:
             return None
         name_len, extra_len, comment_len = struct.unpack_from("<HHH", buf, pos + 28)
         pos += zipfile.sizeCentralDir + name_len + extra_len + comment_len
+        if pos > end:
+            # This entry's name, extra or comment runs past the directory.
+            return None
         count += 1
         if count > limit:
             return count
-    if pos != end:
-        # The last entry's name, extra or comment runs past the directory.
-        return None
     return count
 
 

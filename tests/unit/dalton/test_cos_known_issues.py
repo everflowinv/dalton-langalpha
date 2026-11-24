@@ -2267,6 +2267,27 @@ class TestBinaryCopySecretChecks:
             )
         assert sec_tools_mod._scan_copy_bytes_for_secrets("memo.doc", mention, {}) is None
 
+    def test_zip64_directory_is_found_under_the_pre_3_13_10_end_record_location(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(zipfile, "ZIP_FILECOUNT_LIMIT", 1)
+        z64 = _make_ooxml_zip({"word/document.xml": "<w:document/>"})
+        monkeypatch.undo()
+        real_end_rec_data = zipfile._EndRecData
+
+        def _old_end_rec_data(fpin):  # noqa: ANN001 - mirrors zipfile's private signature
+            endrec = real_end_rec_data(fpin)
+            if endrec and endrec[zipfile._ECD_SIGNATURE] == zipfile.stringEndArchive64:
+                # Before 3.13.10 / 3.14.1 the location stayed at the classic end record.
+                endrec = list(endrec)
+                endrec[zipfile._ECD_LOCATION] += (
+                    zipfile.sizeEndCentDir64 + zipfile.sizeEndCentDir64Locator
+                )
+            return endrec
+
+        monkeypatch.setattr(zipfile, "_EndRecData", _old_end_rec_data)
+        assert sec_tools_mod._count_zip_central_entries(z64, 2000) == 2
+
     def test_central_entry_running_past_the_directory_is_malformed(self) -> None:
         good = bytearray(_make_ooxml_zip({"word/document.xml": "<w:document/>"}))
         last = good.rfind(b"PK\x01\x02")
