@@ -225,7 +225,19 @@ while IFS=$'\t' read -r auth_mode scripts_rest; do
   export DALTON_PROFILE="core"
   export DALTON_AUTH_MODE="$auth_mode"
   # The core profile accepts "oss" only with the explicit trial flag.
-  if [[ "$auth_mode" == "oss" ]]; then export DALTON_ALLOW_DEV_OSS_AUTH=1; else unset DALTON_ALLOW_DEV_OSS_AUTH; fi
+  # For "local", explicitly export empty DALTON_ALLOW_DEV_OSS_AUTH so it overrides .env,
+  # disable Secure cookie flag for loopback HTTP CI, expose the fake-llm operator allowlist
+  # to host-side check scripts, and enable the market-data WS route for WS ticket checks.
+  if [[ "$auth_mode" == "oss" ]]; then
+    export DALTON_ALLOW_DEV_OSS_AUTH=1
+    export DALTON_AUTH_COOKIE_SECURE=""
+    export CI_GINLIX_DATA_URL=""
+  else
+    export DALTON_ALLOW_DEV_OSS_AUTH=""
+    export DALTON_AUTH_COOKIE_SECURE="false"
+    export DALTON_OPERATOR_LLM_ENDPOINTS="${DALTON_OPERATOR_LLM_ENDPOINTS:-http://fake-llm:8099/v1}"
+    export CI_GINLIX_DATA_URL="${CI_GINLIX_DATA_URL:-http://header-echo:8098}"
+  fi
   export STANDALONE_AUTH_MODE="$auth_mode"
   export HOST_MODE="oss"
 

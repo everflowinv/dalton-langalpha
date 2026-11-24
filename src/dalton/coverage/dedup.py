@@ -525,11 +525,16 @@ async def _resolve_caller_tier(uid: str) -> str:
         return await get_user_tier(uid)
     from src.dalton.company_identity import is_company_system_user
     from src.dalton.invites import is_invite_pm
-    from src.dalton.settings import get_dalton_allowed_emails
+    from src.dalton.settings import get_dalton_allowed_emails, is_dalton_local_auth_enabled
     from src.server.database.user import get_user as get_user_row
 
     if is_company_system_user(uid):
         return "company"
+    if is_dalton_local_auth_enabled():
+        from src.dalton.auth.roles import get_user_role
+
+        role = await get_user_role(uid)
+        return role if role in ("admin", "internal", "external") else "external"
     if is_invite_pm(uid):
         return "admin"
     user = await get_user_row(uid)

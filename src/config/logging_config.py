@@ -21,6 +21,7 @@ from src.config.settings import (
     is_sse_event_log_enabled,
     get_sse_event_log_level,
 )
+from src.dalton.auth.dispatch import SensitiveQueryLogFilter  # DALTON-HOOK(standalone-core): redact WS ticket/token query strings in uvicorn handshake logs
 from src.observability.private_errors import DatabaseErrorLogFilter
 from src.observability.private_query import AccessLogQueryFilter
 
@@ -31,6 +32,7 @@ _logging_configured = False
 # One instance each, so a forced reconfigure does not add them twice.
 _ACCESS_LOG_QUERY_FILTER = AccessLogQueryFilter()
 _SERVER_ERROR_FILTER = DatabaseErrorLogFilter()
+_SENSITIVE_QUERY_LOG_FILTER = SensitiveQueryLogFilter()  # DALTON-HOOK(standalone-core)
 
 
 class _TraceContextFormatter(logging.Formatter):
@@ -224,7 +226,9 @@ def configure_logging(force: bool = False) -> None:
     # the query. This runs in each worker's lifespan, after uvicorn has
     # configured its loggers in that process.
     logging.getLogger("uvicorn.access").addFilter(_ACCESS_LOG_QUERY_FILTER)
+    logging.getLogger("uvicorn.access").addFilter(_SENSITIVE_QUERY_LOG_FILTER)  # DALTON-HOOK(standalone-core)
     logging.getLogger("uvicorn.error").addFilter(_SERVER_ERROR_FILTER)
+    logging.getLogger("uvicorn.error").addFilter(_SENSITIVE_QUERY_LOG_FILTER)  # DALTON-HOOK(standalone-core)
 
     _logging_configured = True
 

@@ -11,11 +11,12 @@ Routes (registered ONLY when ``DALTON_AUTH_MODE == "local"``):
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
 from src.dalton.auth.bootstrap import bootstrap_first_admin, get_bootstrap_status
+from src.dalton.auth.dispatch import _read_local_session_from_request
 from src.dalton.auth.sessions import (
     authenticate_local_login,
     change_local_password,
@@ -26,6 +27,7 @@ from src.dalton.auth.sessions import (
 from src.dalton.auth.tokens import (
     REFRESH_COOKIE_NAME,
     clear_refresh_cookie,
+    issue_local_ws_ticket,
     set_refresh_cookie,
     verify_cookie_csrf_origin,
 )
@@ -70,6 +72,13 @@ class LocalLoginRequest(BaseModel):
             raise ValueError("One of identifier, email, or username is required")
         self.identifier = chosen
         return self
+
+
+class LocalLogoutRequest(BaseModel):
+    """Optional caller identity binding so a stale tab cannot revoke another account's cookie."""
+
+    sub: str | None = Field(default=None, max_length=128)
+    session_id: str | None = Field(default=None, max_length=128)
 
 
 class ChangePasswordRequest(BaseModel):
@@ -150,16 +159,29 @@ async def local_refresh(
 async def local_logout(
     request: Request,
     response: Response,
+    body: LocalLogoutRequest | None = Body(default=None),
 ) -> Response | dict[str, str]:
     """Revoke the current refresh session by stable ``sid`` and clear the refresh cookie.
 
+    - Cookie session belongs to a different account/session than ``body.sub``/``body.session_id``:
+      revokes NO session, leaves the active cookie intact, and returns 409.
     - Active session revoked (current or unexpired rotated history): clears cookie & returns 200.
     - Expired rotated historical token: revokes NO session, clears cookie & returns 200.
     - Missing/unknown token or already-revoked session: clears cookie & returns 401.
     """
     verify_cookie_csrf_origin(request)
     raw_refresh = request.cookies.get(REFRESH_COOKIE_NAME)
-    outcome = await revoke_session_for_logout(raw_refresh, reason="logout")
+    outcome = await revoke_session_for_logout(
+        raw_refresh,
+        expected_user_id=(body.sub if body is not None else None),
+        expected_session_id=(body.session_id if body is not None else None),
+        reason="logout",
+    )
+    if outcome == "mismatch":
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "Active cookie session belongs to another account"},
+        )
     if outcome == "not_found":
         err_response = JSONResponse(
             status_code=401,
@@ -189,6 +211,28 @@ async def local_change_password(
     return {
         "status": "password_changed",
         "sessions_revoked": revoked_count,
+    }
+
+
+@local_auth_router.post("/ws-ticket")
+async def local_ws_ticket(
+    request: Request,
+    user_id: CurrentUserId,
+) -> dict[str, object]:
+    """Mint a 60-second HMAC-signed WebSocket handshake ticket bound to the caller's active session."""
+    session_id = _read_local_session_from_request(request)
+    if not session_id:
+        raise HTTPException(
+            status_code=401,
+            detail="Active local session is required to issue a WebSocket ticket",
+        )
+    ticket, expires_in = issue_local_ws_ticket(
+        user_id=user_id,
+        session_id=session_id,
+    )
+    return {
+        "ticket": ticket,
+        "expires_in": expires_in,
     }
 
 
@@ -242,6 +286,7 @@ __all__ = [
     "BootstrapAdminRequest",
     "ChangePasswordRequest",
     "LocalLoginRequest",
+    "LocalLogoutRequest",
     "bootstrap_router",
     "local_auth_router",
     "register_local_auth_routers",

@@ -116,7 +116,7 @@ async def pm_xai_access_token() -> str:
     ``None``, a refresh failure, or a plan with no API access is unavailable.
     The token value is never logged.
     """
-    from src.dalton.settings import get_configured_pm_user_ids
+    from src.dalton.access_tiers import get_primary_admin_user_id
     from src.server.services.oauth_health import (
         OAuthReauthRequired,
         OAuthRefreshUnavailable,
@@ -124,8 +124,7 @@ async def pm_xai_access_token() -> str:
     )
     from src.server.services.oauth_protocol import OAuthPlanNoApiAccess
 
-    pm_ids = get_configured_pm_user_ids()
-    pm_user_id = str(pm_ids[0]).strip() if pm_ids else ""
+    pm_user_id = str((await get_primary_admin_user_id()) or "").strip()
     if not pm_user_id:
         raise XSearchUnavailable(X_UNAVAILABLE_MESSAGE)
     try:

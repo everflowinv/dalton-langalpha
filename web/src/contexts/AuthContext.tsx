@@ -43,13 +43,25 @@ export interface AuthContextValue {
   verifyEmailOtp: (tokenHash: string, type: EmailOtpType) => Promise<AuthResponse | void>;
   /** Sets a new password on the current (e.g. recovery) session. */
   updatePassword: (password: string) => Promise<UserResponse | void>;
+  // DALTON-HOOK(standalone-core): local account bootstrap and password change
+  needsBootstrap?: boolean;
+  changePassword?: (currentPassword: string, newPassword: string) => Promise<void>;
+  bootstrapAdmin?: (payload: {
+    bootstrap_token: string;
+    email: string;
+    password: string;
+    username?: string;
+    name?: string;
+  }) => Promise<void>;
+  markBootstrapCompleted?: () => void;
 }
 
 // DALTON-HOOK(monitors): export AuthContext and default local value for test wrappers
 export const AuthContext = createContext<AuthContextValue | null>(null);
 
 import { isPlatformMode } from '@/config/hostMode';
-import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(dalton-auth): enable Supabase auth in OSS mode
+import { isDaltonAuth, isDaltonLocalAuth, isDaltonSupabaseAuth } from '@/config/daltonAuth'; // DALTON-HOOK(dalton-auth) DALTON-HOOK(standalone-core): enable Supabase or local auth in OSS mode
+import { LocalAuthProvider } from '@/lib/dalton/LocalAuthProvider';
 import { LOCAL_USER_ID } from '@/config/localUser';
 import { withShellReturn } from '../lib/desktopAuthHandoff';
 
@@ -86,16 +98,20 @@ const emailConfirmUrl = () => withShellReturn(window.location.origin + '/auth/co
 const passwordResetUrl = () => withShellReturn(window.location.origin + '/reset-password');
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
+  // DALTON-HOOK(standalone-core): standalone core local accounts use LocalAuthProvider
+  if (isDaltonLocalAuth) {
+    return <LocalAuthProvider>{children}</LocalAuthProvider>;
+  }
   // Skip all Supabase logic in OSS mode. `supabase` is checked separately
   // because it keys on the two Supabase env vars, not on the host mode: a
   // platform build with those unset still has no client to talk to.
-  // DALTON-HOOK(dalton-auth): use SupabaseAuthProvider when Dalton auth is enabled
-  if (!(isPlatformMode || isDaltonAuth) || !supabase) {
+  // DALTON-HOOK(dalton-auth): use SupabaseAuthProvider when Dalton Supabase auth is enabled
+  if (!(isPlatformMode || isDaltonSupabaseAuth) || !supabase) {
     // Say so loudly in that second case. The fallback renders a signed-in
     // local-dev UI, which for a platform build is a misconfiguration wearing a
     // working app's face: requests go out unauthenticated and the backend
     // rejects them, with nothing on screen to explain why.
-    if (isPlatformMode || isDaltonAuth) {
+    if (isPlatformMode || isDaltonSupabaseAuth) {
       console.error(
         '[auth] VITE_HOST_MODE=platform but VITE_SUPABASE_URL/_KEY are unset, '
         + 'so there is no auth client. Falling back to the local-dev context; '

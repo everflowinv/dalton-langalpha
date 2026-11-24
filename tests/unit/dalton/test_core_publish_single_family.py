@@ -961,6 +961,16 @@ class TestAuditTwoRoundLanguageAndBannerDisplay:
             "list_publications",
             create_autospec(db_publications.list_publications, return_value=[]),
         )
+        from src.dalton.auth import roles as local_roles
+
+        async def _fake_get_user_role(uid: str, *, conn: Any = None) -> str | None:
+            return "admin" if uid == "pm-user" else None
+
+        monkeypatch.setattr(
+            local_roles,
+            "get_user_role",
+            create_autospec(local_roles.get_user_role, side_effect=_fake_get_user_role),
+        )
         monkeypatch.setattr(
             publish_svc,
             "get_dalton_config",
@@ -1579,12 +1589,17 @@ class TestModelsEndpointToolCapabilityAndKeyProbe:
             ),
         )
         monkeypatch.setattr(api_keys_mod, "throttle", create_autospec(api_keys_mod.throttle, return_value=True))
+        async def _fake_user_endpoint_transport(
+            base_url: str | None, *, user_id: str | None = None
+        ):
+            return httpx.MockTransport(_handler_responses_only)
+
         monkeypatch.setattr(
             api_keys_mod,
             "_user_endpoint_transport",
             create_autospec(
                 api_keys_mod._user_endpoint_transport,
-                side_effect=lambda _url: httpx.MockTransport(_handler_responses_only),
+                side_effect=_fake_user_endpoint_transport,
             ),
         )
 

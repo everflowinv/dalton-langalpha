@@ -155,7 +155,31 @@
       "statusExpired": "Expired",
       "statusRevoked": "Revoked",
       "revokeTitle": "Revoke invite link?",
-      "revokeConfirm": "This link will immediately stop working for anyone who has not yet registered."
+      "revokeConfirm": "This link will immediately stop working for anyone who has not yet registered.",
+      "tierLabel": "Member tier",
+      "tierAdmin": "Admin",
+      "tierInternal": "Internal",
+      "tierExternal": "External"
+    },
+    "bootstrap": {
+      "title": "Create first administrator",
+      "subtitle": "Enter the setup token from your deployment environment to create the first local administrator account. This page closes automatically once setup completes.",
+      "tokenLabel": "Setup token",
+      "tokenPlaceholder": "Paste BOOTSTRAP_SETUP_TOKEN from your environment",
+      "tokenRequired": "Please enter the setup token.",
+      "emailRequired": "Please enter a valid email address.",
+      "usernameLabel": "Username (optional)",
+      "nameLabel": "Display name (optional)",
+      "submit": "Create administrator & sign in",
+      "submitting": "Creating administrator…",
+      "failed": "Setup failed. Please check the token and fields and try again."
+    },
+    "changePassword": {
+      "title": "Change password",
+      "subtitle": "Update the sign-in password for your local account. After saving, sign in again with your new password.",
+      "currentPassword": "Current password",
+      "saved": "Password updated.",
+      "failed": "Password update failed. Please check your current password and try again."
     },
     "feishuScopes": {
       "title": "Feishu doc access",

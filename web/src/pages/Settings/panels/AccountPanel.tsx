@@ -15,6 +15,8 @@ import { SettingRow, SettingsGroup } from '../components/SettingsLayout';
 import { useSettingCopy } from '../components/useSettingCopy';
 import { SETTINGS } from '../sections';
 import { SaveStatus } from '../components/SaveStatus';
+import { isDaltonLocalAuth } from '@/config/daltonAuth'; // DALTON-HOOK(standalone-core): local auth password change section
+import { LocalPasswordChangeSection } from './dalton/LocalPasswordChangeSection'; // DALTON-HOOK(standalone-core): local auth password change section
 
 /** Profile: photo, name and email, and signing out. */
 export function AccountPanel() {
@@ -147,6 +149,9 @@ export function AccountPanel() {
           </span>
         </SettingRow>
       </SettingsGroup>
+
+      {/* DALTON-HOOK(standalone-core): allow signed-in local-auth accounts to change password */}
+      {isDaltonLocalAuth && <LocalPasswordChangeSection />}
 
       <SettingsGroup>
         <SettingRow {...copy(SETTINGS.logout)}>

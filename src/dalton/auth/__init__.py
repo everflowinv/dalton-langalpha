@@ -501,7 +501,9 @@ async def verify_workspace_access(
             detail=f"Workspace '{workspace_id}' not found",
         )
 
-    if (need is not None or channel is not None) and is_dalton_supabase_auth_enabled():
+    if (need is not None or channel is not None) and (
+        is_dalton_supabase_auth_enabled() or is_dalton_local_auth_enabled()
+    ):
         from src.dalton.sharing import require_workspace_access
 
         return await require_workspace_access(

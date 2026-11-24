@@ -312,7 +312,13 @@ async function request<T>(method: string, url: string, data: unknown, config: Re
     } catch (e) {
       // iOS Safari returns from a frozen tab with a stale token before Supabase's
       // auto-refresh runs, so a refetch hits a 401. Force-refresh once and replay.
-      if (!(e instanceof ApiError) || e.status !== 401 || retried) throw e;
+      // DALTON-HOOK(standalone-core): never trigger a recursive 401 refresh for local auth endpoints
+      if (
+        !(e instanceof ApiError)
+        || e.status !== 401
+        || retried
+        || url.startsWith('/api/v1/dalton/auth/local/')
+      ) throw e;
       // A 401 can outlive the account it was issued for: the reply arrives
       // after a sign-out or an account switch, and by then the cache holds
       // somebody else's token. `refreshAccessToken` would hand that one over,

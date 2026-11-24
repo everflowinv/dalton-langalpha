@@ -20,17 +20,47 @@ from psycopg.rows import dict_row
 
 from src.dalton.coverage.identity import is_historical_duplicate_workspace
 from src.dalton.database.coverage_units import (
-    _require_ws_write,
+    can_write_bound_unit_workspace,
+    can_write_bound_unit_workspaces_batch,
     compute_unit_action_flags,
     get_coverage_unit,
+    is_coverage_multiuser_auth_enabled,
     load_active_units_by_workspace,
 )
 from src.dalton.invites import is_invite_pm
-from src.dalton.settings import is_dalton_supabase_auth_enabled
+from src.dalton.settings import (
+    is_dalton_local_auth_enabled,
+    is_dalton_supabase_auth_enabled as _default_is_dalton_supabase_auth_enabled,
+)
 from src.server.database.home_workspace import is_reserved_row
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
+# Preserved as a module attribute so Everflow unit tests that monkeypatch
+# `units_view.is_dalton_supabase_auth_enabled` continue to work unchanged.
+is_dalton_supabase_auth_enabled = _default_is_dalton_supabase_auth_enabled
+
+
+def _is_multiuser_auth_enabled() -> bool:
+    """Delegate to the single-source predicate shared with ``coverage_units._require_ws_write``."""
+    if is_dalton_supabase_auth_enabled is not _default_is_dalton_supabase_auth_enabled:
+        return bool(is_dalton_supabase_auth_enabled()) or is_dalton_local_auth_enabled()
+    return is_coverage_multiuser_auth_enabled()
+
+
+async def _is_coverage_pm(user_id: str | None, *, conn: Any = None) -> bool:
+    """Return True when ``user_id`` is a coverage admin for the active auth mode."""
+    if user_id is None:
+        return False
+    if is_dalton_local_auth_enabled():
+        from src.dalton.access_tiers import is_admin_user
+
+        return (
+            await is_admin_user(user_id, conn=conn)
+            if conn is not None
+            else await is_admin_user(user_id)
+        )
+    return is_invite_pm(user_id)
 
 
 @asynccontextmanager
@@ -265,20 +295,30 @@ def _compute_unit_action_flags(
     is_pm: bool,
     supabase_auth_enabled: bool | None = None,
     actor_has_ws_write: bool | None = None,
+    workspace_owner_tier: str | None = None,
 ) -> dict[str, bool]:
     supabase_auth = (
-        is_dalton_supabase_auth_enabled()
+        _is_multiuser_auth_enabled()
         if supabase_auth_enabled is None
         else bool(supabase_auth_enabled)
     )
     if actor_has_ws_write is None:
+        owner_allows_colleague_write = (
+            ws_owner == user_id
+            or str(workspace_owner_tier or "").strip().lower() in ("admin", "internal")
+        )
         has_ws_write = bool(
             ws_id
             and ws_active
             and user_id
             and (
                 ws_owner == user_id
-                or (supabase_auth and readable and web_level == "rw")
+                or (
+                    supabase_auth
+                    and readable
+                    and web_level == "rw"
+                    and owner_allows_colleague_write
+                )
             )
         )
     else:
@@ -293,6 +333,7 @@ def _compute_unit_action_flags(
         actor_has_ws_write=has_ws_write,
         is_pm=is_pm,
         supabase_auth_enabled=supabase_auth,
+        workspace_owner_tier=workspace_owner_tier,
     )
 
 
@@ -357,9 +398,7 @@ async def build_units_view(
     """
     from src.dalton.database.sector_members import fetch_members_for_sectors
 
-    supabase_auth = is_dalton_supabase_auth_enabled()
-    is_pm = is_invite_pm(user_id) if user_id is not None else False
-    eff_pm = is_pm and supabase_auth
+    supabase_auth = _is_multiuser_auth_enabled()
     own_auto_ws = {
         str(a.get("workspace_id") or "")
         for a in autos_by_user.get(str(user_id or ""), [])
@@ -367,6 +406,8 @@ async def build_units_view(
     }
     out: list[dict[str, Any]] = []
     async with _repeatable_read_conn(conn) as uconn:
+        is_pm = await _is_coverage_pm(user_id, conn=uconn)
+        eff_pm = is_pm and supabase_auth
         colleague_access, web_levels, _ = await _load_colleague_workspace_state(
             user_id, conn=uconn
         )
@@ -429,6 +470,48 @@ async def build_units_view(
                 ).append(dict(mr))
             company_ws_by_unit = await _load_company_bindings(ucur, member_rows)
 
+        ws_owner_tiers: dict[str, str] = {}
+        ws_write_map: dict[str, bool] | None = None
+        if user_id is not None and supabase_auth:
+            non_self_ws_owners = sorted(
+                {
+                    str(u.get("workspace_owner_id") or "").strip()
+                    for u in unit_rows
+                    if u.get("workspace_id")
+                    and str(u.get("workspace_status") or "") != "deleted"
+                    and str(u.get("workspace_owner_id") or "").strip()
+                    and str(u.get("workspace_owner_id") or "").strip() != str(user_id)
+                }
+            )
+            if non_self_ws_owners:
+                from src.dalton.access_tiers import classify_owner_tiers_batch
+
+                ws_owner_tiers = dict(
+                    await classify_owner_tiers_batch(non_self_ws_owners, conn=uconn)
+                )
+
+            if is_dalton_supabase_auth_enabled is _default_is_dalton_supabase_auth_enabled:
+                non_self_ws_rows = [
+                    {
+                        "workspace_id": str(u.get("workspace_id") or ""),
+                        "user_id": str(u.get("workspace_owner_id") or ""),
+                        "status": str(u.get("workspace_status") or ""),
+                        "config": u.get("workspace_config"),
+                    }
+                    for u in unit_rows
+                    if u.get("workspace_id")
+                    and str(u.get("workspace_status") or "") != "deleted"
+                    and str(u.get("workspace_owner_id") or "").strip()
+                    and str(u.get("workspace_owner_id") or "").strip() != str(user_id)
+                ]
+                ws_write_map = await can_write_bound_unit_workspaces_batch(
+                    non_self_ws_rows,
+                    str(user_id),
+                    is_pm=is_pm,
+                    conn=uconn,
+                    owner_tiers=ws_owner_tiers,
+                )
+
         for u in unit_rows:
             u_id = str(u.get("unit_id"))
             owner = str(u.get("owner_user_id") or "")
@@ -480,6 +563,14 @@ async def build_units_view(
                     readable and redacted_ws_id and redacted_ws_id in own_auto_ws
                 )
 
+            ws_owner_tier = ws_owner_tiers.get(ws_owner) if ws_owner else None
+            actor_has_ws_write: bool | None = None
+            if ws_id is not None and ws_active and user_id is not None:
+                if ws_owner == str(user_id):
+                    actor_has_ws_write = True
+                elif supabase_auth and ws_write_map is not None:
+                    actor_has_ws_write = ws_write_map.get(ws_id, False)
+
             flags = _compute_unit_action_flags(
                 user_id=user_id,
                 lead_uid=lead_uid,
@@ -491,6 +582,8 @@ async def build_units_view(
                 web_level=web_level,
                 is_pm=is_pm,
                 supabase_auth_enabled=supabase_auth,
+                actor_has_ws_write=actor_has_ws_write,
+                workspace_owner_tier=ws_owner_tier,
             )
 
             entry: dict[str, Any] = {
@@ -888,11 +981,11 @@ async def build_unit_detail(user_id: str, unit_id: str) -> dict[str, Any]:
     )
 
     uid = str(user_id or "").strip()
-    supabase_auth = is_dalton_supabase_auth_enabled()
-    is_pm = is_invite_pm(uid)
-    eff_pm = is_pm and supabase_auth
+    supabase_auth = _is_multiuser_auth_enabled()
 
     async with _repeatable_read_conn() as snap_conn:
+        is_pm = await _is_coverage_pm(uid, conn=snap_conn)
+        eff_pm = is_pm and supabase_auth
         unit = await get_coverage_unit(unit_id, conn=snap_conn)
         if unit is None or str(unit.get("status") or "") != "active":
             raise UnitNotFound(f"coverage unit {unit_id} not found")
@@ -907,6 +1000,7 @@ async def build_unit_detail(user_id: str, unit_id: str) -> dict[str, Any]:
         )
         ws_owner = ""
         ws_active = False
+        ws_owner_tier: str | None = None
         web_level = "hidden"
         actor_has_ws_write = False
         ws_row: dict[str, Any] | None = None
@@ -941,12 +1035,22 @@ async def build_unit_detail(user_id: str, unit_id: str) -> dict[str, Any]:
                     web_level = web_levels.get(ws_id, "ro")
                 else:
                     raise UnitNotFound(f"coverage unit {unit_id} not found")
+                if supabase_auth and ws_active and ws_owner and ws_owner != uid:
+                    from src.dalton.access_tiers import classify_owner_tier
+
+                    ws_owner_tier = await classify_owner_tier(ws_owner, conn=snap_conn)
                 if not actor_has_ws_write and ws_row is not None and ws_active:
-                    try:
-                        await _require_ws_write(ws_row, uid, is_pm=False, conn=snap_conn)
-                        actor_has_ws_write = True
-                    except ValueError:
-                        actor_has_ws_write = False
+                    actor_has_ws_write = await can_write_bound_unit_workspace(
+                        ws_row,
+                        uid,
+                        is_pm=is_pm,
+                        conn=snap_conn,
+                        owner_tiers=(
+                            {ws_owner: ws_owner_tier}
+                            if ws_owner_tier is not None
+                            else None
+                        ),
+                    )
 
             auto_tracked = False
             if ws_id and readable:
@@ -972,6 +1076,7 @@ async def build_unit_detail(user_id: str, unit_id: str) -> dict[str, Any]:
                 is_pm=is_pm,
                 supabase_auth_enabled=supabase_auth,
                 actor_has_ws_write=actor_has_ws_write,
+                workspace_owner_tier=ws_owner_tier,
             )
             entry: dict[str, Any] = {
                 "unit_id": str(unit.get("unit_id")),

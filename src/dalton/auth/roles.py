@@ -7,6 +7,7 @@ admin remains) under transactional row locks.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from typing import Any, Literal
 
 from fastapi import HTTPException
@@ -22,12 +23,22 @@ VALID_ROLE_TIERS: frozenset[str] = frozenset({"admin", "internal", "external"})
 LAST_ADMIN_PROTECTED_DETAIL = (
     "Cannot demote or remove the last remaining administrator"
 )
+CREDENTIAL_HOLDER_PROTECTED_DETAIL = (
+    "Cannot demote or remove the current team credential holder; transfer credential holder first"
+)
 
 
 class LastAdminProtectedError(HTTPException):
     """Raised (HTTP 409) when a write would leave zero active administrators."""
 
     def __init__(self, detail: str = LAST_ADMIN_PROTECTED_DETAIL) -> None:
+        super().__init__(status_code=409, detail=detail)
+
+
+class CredentialHolderProtectedError(HTTPException):
+    """Raised (HTTP 409) when attempting to demote or remove the active credential holder."""
+
+    def __init__(self, detail: str = CREDENTIAL_HOLDER_PROTECTED_DETAIL) -> None:
         super().__init__(status_code=409, detail=detail)
 
 
@@ -66,6 +77,36 @@ async def get_user_role(user_id: str, *, conn: Any = None) -> RoleTier | None:
     if tier in VALID_ROLE_TIERS:
         return tier  # type: ignore[return-value]
     return None
+
+
+async def get_user_roles_batch(
+    user_ids: Iterable[str],
+    *,
+    conn: Any = None,
+) -> dict[str, RoleTier]:
+    """Batch-read ``dalton_user_roles.tier`` for ``user_ids`` in a single async query."""
+    cleaned = sorted({str(u or "").strip() for u in user_ids if str(u or "").strip()})
+    if not cleaned:
+        return {}
+    sql = "SELECT user_id, tier FROM dalton_user_roles WHERE user_id = ANY(%s)"
+    if conn is not None:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(sql, (cleaned,))
+            rows = await cur.fetchall()
+    else:
+        async with get_db_connection() as db_conn:
+            async with db_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(sql, (cleaned,))
+                rows = await cur.fetchall()
+    out: dict[str, RoleTier] = {}
+    for row in rows or []:
+        if not row:
+            continue
+        uid = str(row.get("user_id") or "").strip()
+        tier = str(row.get("tier") or "").strip().lower()
+        if uid and tier in VALID_ROLE_TIERS:
+            out[uid] = tier  # type: ignore[assignment]
+    return out
 
 
 async def list_admin_user_ids(*, conn: Any = None) -> list[str]:
@@ -117,6 +158,13 @@ async def set_user_role(
                 admin_ids = {str(r["user_id"]).strip() for r in admin_rows}
                 if uid in admin_ids and len(admin_ids) <= 1:
                     raise LastAdminProtectedError()
+                await cur.execute(
+                    "SELECT holder_user_id FROM dalton_credential_holder "
+                    "WHERE singleton_id = 1 FOR SHARE"
+                )
+                holder_row = await cur.fetchone()
+                if holder_row and str(holder_row.get("holder_user_id") or "").strip() == uid:
+                    raise CredentialHolderProtectedError()
 
             await cur.execute(
                 """
@@ -163,6 +211,13 @@ async def delete_user_role(user_id: str, *, conn: Any = None) -> bool:
             admin_ids = {str(r["user_id"]).strip() for r in admin_rows}
             if uid in admin_ids and len(admin_ids) <= 1:
                 raise LastAdminProtectedError()
+            await cur.execute(
+                "SELECT holder_user_id FROM dalton_credential_holder "
+                "WHERE singleton_id = 1 FOR SHARE"
+            )
+            holder_row = await cur.fetchone()
+            if holder_row and str(holder_row.get("holder_user_id") or "").strip() == uid:
+                raise CredentialHolderProtectedError()
 
             await cur.execute(
                 "DELETE FROM dalton_user_roles WHERE user_id = %s RETURNING user_id",

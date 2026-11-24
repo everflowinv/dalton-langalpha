@@ -462,7 +462,7 @@ async def resolve_owner_tier_for_snapshot(
     """
     from src.dalton.company_identity import is_company_system_user
     from src.dalton.invites import is_invite_pm
-    from src.dalton.settings import get_dalton_allowed_emails
+    from src.dalton.settings import get_dalton_allowed_emails, is_dalton_local_auth_enabled
 
     uid = normalize_scope_text(user_id)
     if not uid:
@@ -477,6 +477,16 @@ async def resolve_owner_tier_for_snapshot(
         )
     if _access_tiers.get_user_tier is not _DEFAULT_GET_USER_TIER:
         return await _access_tiers.get_user_tier(uid)
+    if is_dalton_local_auth_enabled():
+        if isinstance(conn, NonCallableMock):
+            return "external"
+        async with get_db_connection(conn) as db_conn:
+            if isinstance(db_conn, NonCallableMock):
+                return "external"
+            from src.dalton.auth.roles import get_user_role
+
+            role = await get_user_role(uid, conn=db_conn)
+            return role if role in ("admin", "internal", "external") else "external"
     if is_invite_pm(uid):
         return "admin"
     if isinstance(conn, NonCallableMock):

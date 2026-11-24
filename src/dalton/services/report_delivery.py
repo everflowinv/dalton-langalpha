@@ -56,9 +56,6 @@ from src.dalton.services.company_automations import (
     AutomationVersionConflictError,
     automation_history_context,
 )
-from src.dalton.settings import (
-    get_configured_pm_user_ids,
-)
 from src.server.database import automation as auto_db
 from src.server.database.pool import get_db_connection
 from src.server.database.user import (
@@ -1112,7 +1109,12 @@ async def notify_admins_group_target_change(
                 "results": [],
             }
 
-    pm_ids = list((get_pm_ids_fn or get_configured_pm_user_ids)())
+    if get_pm_ids_fn is not None:
+        pm_ids = list(get_pm_ids_fn())
+    else:
+        from src.dalton.access_tiers import list_admin_user_ids
+
+        pm_ids = await list_admin_user_ids()
     if not pm_ids:
         return {"notified": False, "reason": "no_admins_configured", "targets": [], "results": []}
 

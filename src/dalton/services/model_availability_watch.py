@@ -77,11 +77,20 @@ def iter_subscription_providers() -> tuple[str, ...]:
 
 
 def resolve_credential_holder_user_id() -> str:
-    """Resolve the team credential holder user_id (``DALTON_PM_USER_IDS[0]``)."""
-    pm_ids = get_configured_pm_user_ids()
-    if not pm_ids:
-        raise RuntimeError("DALTON_PM_USER_IDS is not configured; cannot resolve team credential holder")
-    holder = credential_user_id(pm_ids[0])
+    """Resolve the team credential holder user_id (``dalton_credential_holder`` in ``local`` mode, ``DALTON_PM_USER_IDS[0]`` otherwise)."""
+    from src.dalton.access_tiers import get_primary_admin_user_id_sync
+    from src.dalton.settings import is_dalton_local_auth_enabled
+
+    if is_dalton_local_auth_enabled():
+        primary = get_primary_admin_user_id_sync()
+        if not primary:
+            raise RuntimeError("No local administrator or credential holder is configured; cannot resolve team credential holder")
+        holder = credential_user_id(primary)
+    else:
+        pm_ids = get_configured_pm_user_ids()
+        if not pm_ids:
+            raise RuntimeError("DALTON_PM_USER_IDS is not configured; cannot resolve team credential holder")
+        holder = credential_user_id(pm_ids[0])
     if not holder:
         raise RuntimeError("Failed to resolve team credential holder user_id")
     return holder
