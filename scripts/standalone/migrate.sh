@@ -30,10 +30,11 @@ LOCK_KEY = 724109845123456789
 
 conninfo = {
     "host": os.getenv("DB_HOST", "postgres"),
-    "port": int(os.getenv("DB_PORT", "5432")),
-    "user": os.getenv("DB_USER", "postgres"),
-    "password": os.getenv("DB_PASSWORD", "postgres"),
-    "dbname": os.getenv("DB_NAME", "postgres"),
+    # Empty values fall back like the PostgreSQL entrypoint's ${VAR:-default}.
+    "port": int(os.getenv("DB_PORT") or "5432"),
+    "user": os.getenv("DB_USER") or "postgres",
+    "password": os.getenv("DB_PASSWORD") or "postgres",
+    "dbname": os.getenv("DB_NAME") or "postgres",
     "sslmode": os.getenv("DB_SSLMODE", "prefer"),
 }
 

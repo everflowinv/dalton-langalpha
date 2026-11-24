@@ -147,16 +147,14 @@ services:
       postgres:
         condition: service_healthy
     env_file: .env
-    # DB_PASSWORD comes exclusively from `env_file: .env` (never shell-interpolated).
+    # DB_PORT / DB_USER / DB_PASSWORD / DB_NAME come exclusively from `env_file: .env`
+    # (never shell-interpolated), the same source PostgreSQL init and backend use.
     environment:
       # ptc_agent lives under src/; set it explicitly instead of relying on the venv .pth.
       PYTHONPATH: /app/src
       APP_ENV: core
       DALTON_PROFILE: core
       DB_HOST: ${DB_HOST:-postgres}
-      DB_PORT: ${DB_PORT:-5432}
-      DB_USER: ${DB_USER:-postgres}
-      DB_NAME: ${DB_NAME:-postgres}
     networks:
       - core_internal
 
