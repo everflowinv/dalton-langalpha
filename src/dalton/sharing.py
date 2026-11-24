@@ -54,7 +54,13 @@ def _sharing_auth_enabled() -> bool:
 from src.server.database import conversation as conv_db
 from src.server.database import user as user_db
 from src.server.database import workspace as ws_db
-from src.server.database.home_workspace import is_home_row, is_reserved_row
+from src.server.database.home_workspace import (
+    is_home_id,
+    is_home_row,
+    is_home_stand_in_id,
+    is_home_stand_in_row,
+    is_reserved_row,
+)
 from src.server.database.pool import get_db_connection
 from src.server.utils import api as auth_api
 
@@ -160,7 +166,7 @@ def can_edit_workspace_sharing(
     if not uid:
         return False
     if (
-        is_home_row(workspace)
+        is_reserved_row(workspace)
         or bool(workspace.get("is_home"))
         or workspace.get("status") in ("unbound", "deleted")
     ):
@@ -556,7 +562,7 @@ def can_edit_workspace_settings(
     if not uid:
         return False
     if (
-        is_home_row(workspace)
+        is_reserved_row(workspace)
         or bool(workspace.get("is_home"))
         or workspace.get("status") in ("unbound", "deleted")
     ):
@@ -924,6 +930,167 @@ async def require_team_reader(user_id: str | None, *, conn: Any = None) -> str:
     return uid
 
 
+async def _is_home_stand_in_workspace(
+    ws: dict[str, Any] | None,
+    *,
+    fetch_if_missing_config: bool,
+    conn: Any = None,
+) -> bool:
+    """Return True if ``ws`` is a Home stand-in workspace.
+
+    When a caller passes a partial workspace dict omitting ``config``, fetches
+    the full row from the database instead of assuming it is not a stand-in.
+    If the DB row no longer exists (``None``), raises HTTP 404 matching a
+    missing workspace rather than authorizing with the stale caller dict.
+    """
+    if not ws:
+        return False
+    if is_home_stand_in_row(ws):
+        return True
+    if is_home_stand_in_id(ws.get("user_id"), ws.get("workspace_id")):
+        return True
+    if fetch_if_missing_config and "config" not in ws:
+        ws_id_str = str(ws.get("workspace_id") or "").strip()
+        if ws_id_str:
+            try:
+                fetched = (
+                    await ws_db.get_workspace(ws_id_str, conn=conn)
+                    if conn is not None
+                    else await ws_db.get_workspace(ws_id_str)
+                )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "Failed to fetch workspace %s for stand-in check: %s",
+                    ws_id_str,
+                    exc,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace access verification unavailable",
+                ) from exc
+            if fetched is None:
+                raise HTTPException(status_code=404, detail="Workspace not found")
+            if is_home_stand_in_row(fetched) or is_home_stand_in_id(
+                fetched.get("user_id"), fetched.get("workspace_id")
+            ):
+                return True
+    return False
+
+
+async def _guard_thread_not_foreign_home_stand_in(
+    thread_id: str,
+    uid: str,
+    *,
+    workspace_id: str | dict[str, Any] | None = None,
+    workspace_owner_id: str | None = None,
+    meta: dict[str, Any] | None = None,
+    conn: Any = None,
+) -> None:
+    """Refuse (404 Thread not found) if ``thread_id`` lives in another user's Home or Home stand-in workspace.
+
+    Enforced before thread-initiator fast paths whether colleague sharing is
+    enabled or disabled.
+    """
+    ws_owner = str(
+        workspace_owner_id
+        or (meta or {}).get("workspace_owner_id")
+        or (
+            workspace_id.get("user_id")
+            if isinstance(workspace_id, dict)
+            else ""
+        )
+        or ""
+    ).strip()
+    ws_ref = (
+        workspace_id
+        if workspace_id is not None
+        else (meta or {}).get("workspace_id")
+    )
+    if ws_owner and ws_owner == uid:
+        return
+    if ws_ref is None or not ws_owner:
+        if meta is None:
+            meta = (
+                await conv_db.get_thread_auth_meta(thread_id, conn=conn)
+                if conn is not None
+                else await conv_db.get_thread_auth_meta(thread_id)
+            )
+        if meta is None:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        if ws_ref is None:
+            ws_ref = meta.get("workspace_id")
+        if not ws_owner:
+            ws_owner = str(meta.get("workspace_owner_id") or "").strip()
+    if ws_owner and ws_owner == uid:
+        return
+    ws_obj = await _resolve_thread_workspace_for_guard(
+        ws_ref, conn=conn, include_deleted=True
+    )
+    ws_id_for_check = (
+        str(ws_obj.get("workspace_id") or "")
+        if ws_obj
+        else (
+            str(ws_ref.get("workspace_id") or "")
+            if isinstance(ws_ref, dict)
+            else str(ws_ref or "")
+        )
+    )
+    ws_owner_for_check = str(
+        (ws_obj.get("user_id") if ws_obj else None) or ws_owner or ""
+    ).strip()
+    if ws_owner_for_check != uid:
+        if (ws_obj and is_home_stand_in_row(ws_obj)) or is_home_stand_in_id(
+            ws_owner_for_check, ws_id_for_check
+        ):
+            raise HTTPException(status_code=404, detail="Thread not found")
+        if (
+            ws_obj
+            and (is_home_row(ws_obj) or bool(ws_obj.get("is_home")))
+        ) or is_home_id(ws_owner_for_check, ws_id_for_check):
+            raise HTTPException(status_code=404, detail="Thread not found")
+
+
+async def _resolve_thread_workspace_for_guard(
+    resolved_workspace_id: str | dict[str, Any] | None,
+    *,
+    conn: Any = None,
+    include_deleted: bool = False,
+) -> dict[str, Any] | None:
+    """Load the full workspace row (with ``config``) for thread-access guards."""
+    if isinstance(resolved_workspace_id, dict):
+        if "config" in resolved_workspace_id:
+            return resolved_workspace_id
+        ws_id_str = str(resolved_workspace_id.get("workspace_id") or "").strip()
+        if not ws_id_str:
+            return resolved_workspace_id
+    else:
+        ws_id_str = str(resolved_workspace_id or "").strip()
+        if not ws_id_str:
+            return None
+    kwargs: dict[str, Any] = {}
+    if conn is not None:
+        kwargs["conn"] = conn
+    if include_deleted:
+        kwargs["include_deleted"] = True
+    try:
+        return await ws_db.get_workspace(ws_id_str, **kwargs)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Failed to fetch workspace %s for thread guard: %s",
+            ws_id_str,
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Workspace access verification unavailable",
+        ) from exc
+
+
+
 async def batch_check_team_readers(
     user_ids: Iterable[str],
     *,
@@ -1029,11 +1196,14 @@ async def require_workspace_access(
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
 
+    caller_passed_dict = False
     ws: dict[str, Any] | None
     if isinstance(workspace_id, dict):
         ws = workspace_id
+        caller_passed_dict = True
     elif workspace is not None:
         ws = workspace
+        caller_passed_dict = True
     elif workspace_id:
         ws_id_str = str(workspace_id).strip()
         if not ws_id_str or ws_id_str.lower() == "home":
@@ -1057,13 +1227,18 @@ async def require_workspace_access(
     if not ws:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
+    owner_id = str(ws.get("user_id") or "").strip()
+
     if not _sharing_auth_enabled():
+        if owner_id != uid and await _is_home_stand_in_workspace(
+            ws, fetch_if_missing_config=caller_passed_dict, conn=conn
+        ):
+            raise HTTPException(status_code=404, detail="Workspace not found")
         auth_api.require_workspace_owner(ws, user_id=uid)
         ws["_caller_web_access"] = "owner"
         ws["_caller_cos_access"] = "owner"
         return ws
 
-    owner_id = str(ws.get("user_id") or "").strip()
     if not owner_id:
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -1108,7 +1283,7 @@ async def require_workspace_access(
         raise HTTPException(status_code=403, detail="Forbidden")
     if owner_tier == "external":
         if (
-            is_home_row(ws)
+            is_reserved_row(ws)
             or bool(ws.get("is_home"))
             or ws.get("status") in ("unbound", "deleted")
         ):
@@ -1116,9 +1291,18 @@ async def require_workspace_access(
         if cleaned_channel == "cos":
             raise HTTPException(status_code=404, detail="Workspace not found")
 
+    # Home stand-ins never leak existence to non-owners (in-memory check first;
+    # any DB re-lookup for partial dicts missing ``config`` runs after the
+    # ``hidden`` / ``ro`` checks below so existing 404/403 refusals do not turn
+    # into 503 on lookup timeouts).
+    if await _is_home_stand_in_workspace(
+        ws, fetch_if_missing_config=False, conn=conn
+    ):
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
     # Personal Home workspaces and deleted/unbound workspaces are never shared with colleagues.
     if (
-        is_home_row(ws)
+        is_reserved_row(ws)
         or bool(ws.get("is_home"))
         or ws.get("status") in ("unbound", "deleted")
     ):
@@ -1159,6 +1343,12 @@ async def require_workspace_access(
         raise HTTPException(status_code=404, detail="Workspace not found")
     if level == "ro" and cleaned_need == "write":
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    if caller_passed_dict and "config" not in ws:
+        if await _is_home_stand_in_workspace(
+            ws, fetch_if_missing_config=True, conn=conn
+        ):
+            raise HTTPException(status_code=404, detail="Workspace not found")
 
     ws[f"_caller_{cleaned_channel}_access"] = level
     return ws
@@ -1203,8 +1393,22 @@ async def require_thread_access(
         if owner_id is not None:
             if owner_id != uid:
                 raise HTTPException(status_code=403, detail="Forbidden")
+            await _guard_thread_not_foreign_home_stand_in(
+                thread_id,
+                uid,
+                workspace_id=workspace_id,
+                workspace_owner_id=workspace_owner_id,
+                conn=conn,
+            )
             return owner_id
         await auth_api.require_thread_owner(thread_id, uid, conn=conn)
+        await _guard_thread_not_foreign_home_stand_in(
+            thread_id,
+            uid,
+            workspace_id=workspace_id,
+            workspace_owner_id=workspace_owner_id,
+            conn=conn,
+        )
         return uid
 
     if conn is not None:
@@ -1259,24 +1463,42 @@ async def require_thread_access(
         if caller_tier == "external":
             raise HTTPException(status_code=404, detail="Thread not found")
         if cleaned_need == "read" and cleaned_channel == "web":
+            # Check workspace ownership and Home / stand-in status before the web
+            # thread-initiator fast path, covering any pre-existing cross-user thread.
+            await _guard_thread_not_foreign_home_stand_in(
+                thread_id,
+                uid,
+                workspace_id=resolved_workspace_id,
+                workspace_owner_id=ws_owner,
+                meta=meta,
+                conn=conn,
+            )
             return thread_owner
         if is_tail_turn:
-            ws_obj = (
-                resolved_workspace_id
-                if isinstance(resolved_workspace_id, dict)
-                else await ws_db.get_workspace(str(resolved_workspace_id))
+            ws_obj = await _resolve_thread_workspace_for_guard(
+                resolved_workspace_id, conn=conn
             )
-            if not ws_obj or ws_obj.get("status") in ("unbound", "deleted"):
+            if ws_obj and (
+                is_home_stand_in_row(ws_obj)
+                or is_home_stand_in_id(ws_obj.get("user_id"), ws_obj.get("workspace_id"))
+            ):
+                raise HTTPException(status_code=404, detail="Thread not found")
+            if not ws_obj or is_reserved_row(ws_obj) or ws_obj.get("status") in ("unbound", "deleted"):
                 raise HTTPException(status_code=403, detail="Forbidden")
             return thread_owner
         if cleaned_need == "read":
-            await require_workspace_access(
-                resolved_workspace_id,
-                uid,
-                channel=channel,
-                need="read",
-                conn=conn,
-            )
+            try:
+                await require_workspace_access(
+                    resolved_workspace_id,
+                    uid,
+                    channel=channel,
+                    need="read",
+                    conn=conn,
+                )
+            except HTTPException as exc:
+                if exc.status_code == 404:
+                    raise HTTPException(status_code=404, detail="Thread not found") from exc
+                raise
             return thread_owner
         try:
             await require_workspace_access(
@@ -1289,12 +1511,15 @@ async def require_thread_access(
         except HTTPException as exc:
             if exc.status_code not in (403, 404):
                 raise
-            ws_obj = (
-                resolved_workspace_id
-                if isinstance(resolved_workspace_id, dict)
-                else await ws_db.get_workspace(str(resolved_workspace_id))
+            ws_obj = await _resolve_thread_workspace_for_guard(
+                resolved_workspace_id, conn=conn
             )
-            if not ws_obj or ws_obj.get("status") in ("unbound", "deleted"):
+            if ws_obj and (
+                is_home_stand_in_row(ws_obj)
+                or is_home_stand_in_id(ws_obj.get("user_id"), ws_obj.get("workspace_id"))
+            ):
+                raise HTTPException(status_code=404, detail="Thread not found") from exc
+            if not ws_obj or is_reserved_row(ws_obj) or ws_obj.get("status") in ("unbound", "deleted"):
                 raise HTTPException(status_code=403, detail="Forbidden") from exc
             raise HTTPException(
                 status_code=403,
@@ -1320,13 +1545,18 @@ async def require_thread_access(
         )
 
     # 3. Other colleague C (or when ws_owner was not yet resolved)
-    ws = await require_workspace_access(
-        resolved_workspace_id,
-        uid,
-        channel=channel,
-        need=cleaned_need,
-        conn=conn,
-    )
+    try:
+        ws = await require_workspace_access(
+            resolved_workspace_id,
+            uid,
+            channel=channel,
+            need=cleaned_need,
+            conn=conn,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            raise HTTPException(status_code=404, detail="Thread not found") from exc
+        raise
     resolved_ws_owner = str(ws.get("user_id") or ws_owner or "").strip()
     resolved_thread_owner = thread_owner or resolved_ws_owner
     if not resolved_thread_owner:

@@ -107,7 +107,7 @@ async def test_owned_workspace_on_computer_respects_dalton_sharing_need(monkeypa
 
     from src.server.database.workspace import get_workspace as db_get_workspace
 
-    row = _row(user_id="u-owner", is_home=False)
+    row = _row(user_id="u-owner", is_home=False, config={})  # get_workspace rows always carry config
     orig_get_sharing = dalton_sharing.get_workspace_sharing
     with patch(_READ, create_autospec(db_get_workspace, return_value=row)):
         # rw allows need="write"

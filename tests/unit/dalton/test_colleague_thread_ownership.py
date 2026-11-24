@@ -310,6 +310,7 @@ async def test_get_workspace_returns_thread_only_shell_when_reverted_to_hidden(
         "previous_root_dirs": ["/Users/bob/langalpha"],
         "status": "running",
         "is_home": False,
+        "config": {},
         "created_at": now,
         "updated_at": now,
     }
