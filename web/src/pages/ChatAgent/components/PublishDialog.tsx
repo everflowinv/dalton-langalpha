@@ -516,7 +516,13 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
     subscribePendingPauseTokens,
     () => (trackPublishResponsePause ? (pendingPauseTokens.get(workspaceId) ?? null) : null),
   );
-  const workspaceDetail = trackWorkspacePause ? workspaceQuery.data : cachedDetail;
+  // Placeholder data (useWorkspace seeds Home's detail from the Home query) is not
+  // the workspace's detail yet, so it neither supersedes nor clears a pending token.
+  const workspaceDetail = trackWorkspacePause
+    ? workspaceQuery.isPlaceholderData
+      ? undefined
+      : workspaceQuery.data
+    : cachedDetail;
   useEffect(() => {
     if (workspaceDetail !== undefined) {
       deletePendingPauseToken(workspaceId);
