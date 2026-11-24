@@ -53,8 +53,9 @@ IN_FLIGHT = "in_flight"
 UNKNOWN_SHOWN = "Whether the message went out is unknown."
 
 # A send fetches each file from the workspace and uploads it to the app
-# before answering, so it gets far longer than a listing does.
-_SEND_TIMEOUT = httpx.Timeout(90.0, connect=5.0)
+# before answering, and may wait on gateway preflight retries (<=180s budget),
+# so it gets far longer than a listing does.
+_SEND_TIMEOUT = httpx.Timeout(240.0, connect=5.0)  # DALTON-HOOK(dalton-notify)
 _TARGETS_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
 
 

@@ -27,6 +27,13 @@ logger = logging.getLogger(__name__)
 DATA_TASK_GATEWAY_PATH = "/internal/data-task-notifications"
 AUTOMATION_GATEWAY_PATH = "/internal/automation-notifications"
 
+# Shared preflight-retry budget contract (§3.1 / weixin-gateway-contract.md):
+# Gateway retries transient Weixin preflight `roster_lookup_error` (HTTP 503)
+# in-process within a 180s total deadline per delivery; backend callers wait
+# strictly longer (240s) so they do not time out prematurely into `unknown`.
+WEIXIN_PREFLIGHT_RETRY_BUDGET_SECONDS = 180
+GATEWAY_DELIVERY_READ_TIMEOUT_S = 240.0
+
 UNCERTAIN_NOTIFY_ERROR_CODES: frozenset[str] = frozenset(
     {
         "delivery_uncertain",
@@ -173,7 +180,7 @@ async def dispatch_data_task_target_via_gateway(
     eff_timeout_s = (
         max(1.0, float(timeout_s))
         if timeout_s is not None
-        else max(45.0, get_notify_http_timeout_s() * 2.5)
+        else max(GATEWAY_DELIVERY_READ_TIMEOUT_S, get_notify_http_timeout_s() * 2.5)
     )
     req_timeout = httpx.Timeout(eff_timeout_s, connect=min(5.0, eff_timeout_s))
     endpoint = f"{eff_base}{DATA_TASK_GATEWAY_PATH}"
@@ -524,7 +531,7 @@ async def post_automation_gateway_notify(
     eff_timeout_s = (
         max(1.0, float(timeout_s))
         if timeout_s is not None
-        else max(45.0, get_notify_http_timeout_s() * 2.5)
+        else max(GATEWAY_DELIVERY_READ_TIMEOUT_S, get_notify_http_timeout_s() * 2.5)
     )
     req_timeout = httpx.Timeout(eff_timeout_s, connect=min(5.0, eff_timeout_s))
     endpoint = f"{eff_base}{AUTOMATION_GATEWAY_PATH}"

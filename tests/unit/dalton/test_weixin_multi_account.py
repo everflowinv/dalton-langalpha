@@ -68,8 +68,6 @@ class InMemoryWeixinMultiAccountStore:
         self.account_tokens: dict[tuple[str, int, str], dict[str, Any]] = {}
         self.login_sessions: dict[str, dict[str, Any]] = {}
         self.audit_logs: list[dict[str, Any]] = []
-        self.collect_buffers: dict[str, dict[str, Any]] = {}
-        self.collect_items: dict[tuple[str, str], dict[str, Any]] = {}
         self.inbound_events: dict[tuple[str, str], dict[str, Any]] = {}
         self.thread_watches: dict[str, dict[str, Any]] = {}
         self.background_runs: dict[str, dict[str, Any]] = {}
@@ -444,10 +442,6 @@ class InMemoryWeixinMultiAccountStore:
             aid = str(params[0])
             removed = self.accounts.pop(aid, None)
             if removed:
-                # Simulate ON DELETE SET NULL on collect_buffers
-                for buf in self.collect_buffers.values():
-                    if buf.get("account_id") == aid:
-                        buf["account_id"] = None
                 # Simulate ON DELETE CASCADE on account_tokens
                 for k in list(self.account_tokens):
                     if k[0] == aid:
@@ -683,287 +677,6 @@ class InMemoryWeixinMultiAccountStore:
                 return []
             return []
 
-        # --- Collect buffers & items ---
-        if "UPDATE dalton_channel_weixin_collect_buffers SET status = 'expired'" in norm:
-            uid, skey = str(params[0]), str(params[1])
-            for b in self.collect_buffers.values():
-                if (
-                    b["dalton_user_id"] == uid
-                    and b["scope_key"] == skey
-                    and b["status"] == "collecting"
-                    and b["expires_at"] <= now
-                ):
-                    b["status"] = "expired"
-                    b["updated_at"] = now
-            return []
-
-        if "UPDATE dalton_channel_weixin_collect_buffers SET status = 'cancelled'" in norm:
-            cancelled_ids = []
-            if "WHERE buffer_id = ANY" in norm:
-                bids = {str(x) for x in (params[0] or [])}
-                unlink = "account_id = NULL" in norm
-                for bid in bids:
-                    b = self.collect_buffers.get(bid)
-                    if b:
-                        b["status"] = "cancelled"
-                        if unlink:
-                            b["account_id"] = None
-                        b["updated_at"] = now
-                        cancelled_ids.append(bid)
-            elif "WHERE dalton_user_id = %s AND scope_key = %s" in norm:
-                uid, skey = str(params[0]), str(params[1])
-                for b in self.collect_buffers.values():
-                    if b["dalton_user_id"] == uid and b["scope_key"] == skey and b["status"] in ("collecting", "flushing"):
-                        b["status"] = "cancelled"
-                        b["updated_at"] = now
-                        cancelled_ids.append(b["buffer_id"])
-            elif "WHERE buffer_id = %s" in norm:
-                bid = str(params[-1])
-                b = self.collect_buffers.get(bid)
-                if b and b["status"] in ("collecting", "flushing"):
-                    b["status"] = "cancelled"
-                    b["updated_at"] = now
-                    cancelled_ids.append(bid)
-            elif "WHERE account_id = %s" in norm:
-                aid = str(params[0])
-                for b in self.collect_buffers.values():
-                    if b.get("account_id") == aid and b["status"] in ("collecting", "flushing"):
-                        b["status"] = "cancelled"
-                        b["updated_at"] = now
-                        cancelled_ids.append(b["buffer_id"])
-            elif "WHERE dalton_user_id = %s" in norm:
-                uid = str(params[0])
-                for b in self.collect_buffers.values():
-                    if b["dalton_user_id"] == uid and b["status"] in ("collecting", "flushing"):
-                        b["status"] = "cancelled"
-                        b["updated_at"] = now
-                        cancelled_ids.append(b["buffer_id"])
-            return [{"buffer_id": bid} for bid in cancelled_ids]
-
-        if "UPDATE dalton_channel_weixin_collect_buffers SET account_id = NULL" in norm:
-            aid = str(params[0])
-            for b in self.collect_buffers.values():
-                if b.get("account_id") == aid:
-                    b["account_id"] = None
-                    b["updated_at"] = now
-            return []
-
-        if "UPDATE dalton_channel_weixin_collect_items SET upload_status = 'failed'" in norm:
-            if "WHERE buffer_id = ANY" in norm:
-                bids = {str(x) for x in (params[0] or [])}
-                for it in self.collect_items.values():
-                    if it["buffer_id"] in bids and it["upload_status"] == "pending_upload":
-                        it["upload_status"] = "failed"
-                        it["upload_error"] = "buffer_cancelled"
-            elif "WHERE buffer_id = %s" in norm:
-                bid = str(params[0])
-                for it in self.collect_items.values():
-                    if it["buffer_id"] == bid and it["upload_status"] == "pending_upload":
-                        it["upload_status"] = "failed"
-                        it["upload_error"] = "upload_timeout"
-            return []
-
-        if "INSERT INTO dalton_channel_weixin_collect_buffers" in norm:
-            aid, bot_gen, uid, skey, sess_gen, wid, init_prompt, exp, max_exp, c_at, u_at = params
-            bid = str(uuid4())
-            row = {
-                "buffer_id": bid,
-                "account_id": str(aid) if aid else None,
-                "bot_generation": int(bot_gen),
-                "dalton_user_id": str(uid),
-                "scope_key": str(skey),
-                "session_generation": int(sess_gen),
-                "workspace_id": str(wid),
-                "status": "collecting",
-                "initial_prompt": str(init_prompt or ""),
-                "flush_prompt": None,
-                "item_count": 0,
-                "total_text_chars": 0,
-                "attachment_count": 0,
-                "flushed_message_id": None,
-                "expires_at": exp,
-                "max_expires_at": max_exp,
-                "created_at": c_at,
-                "updated_at": u_at,
-            }
-            self.collect_buffers[bid] = row
-            return [dict(row)]
-
-        if "FROM dalton_channel_weixin_collect_buffers" in norm and "SELECT" in norm:
-            if "WHERE status IN ('collecting', 'flushing')" in norm:
-                rows_b = [b for b in self.collect_buffers.values() if b["status"] in ("collecting", "flushing")]
-                pidx = 0
-                if "AND account_id = %s::uuid" in norm:
-                    aid_f = str(params[pidx])
-                    pidx += 1
-                    rows_b = [b for b in rows_b if b.get("account_id") == aid_f]
-                if "AND dalton_user_id = %s" in norm:
-                    uid_f = str(params[pidx])
-                    pidx += 1
-                    rows_b = [b for b in rows_b if b.get("dalton_user_id") == uid_f]
-                if "AND scope_key = %s" in norm:
-                    skey_f = str(params[pidx])
-                    pidx += 1
-                    rows_b = [b for b in rows_b if b.get("scope_key") == skey_f]
-                if "AND session_generation = %s" in norm:
-                    sgen_f = int(params[pidx])
-                    pidx += 1
-                    rows_b = [b for b in rows_b if int(b.get("session_generation") or 0) == sgen_f]
-                rows_b.sort(key=lambda x: str(x["buffer_id"]))
-                return [dict(b) for b in rows_b]
-            if "WHERE buffer_id = %s" in norm:
-                b = self.collect_buffers.get(str(params[0]))
-                if not b:
-                    return []
-                d = dict(b)
-                d["db_now"] = now
-                return [d]
-            if "WHERE status = 'flushing'" in norm:
-                return [dict(b) for b in self.collect_buffers.values() if b["status"] == "flushing"]
-            if "WHERE account_id = %s::uuid AND bot_generation = %s AND scope_key = %s AND session_generation = %s" in norm:
-                aid, bgen, skey, sgen = str(params[0]), int(params[1]), str(params[2]), int(params[3])
-                allowed_st = ("collecting", "flushing") if "'flushing'" in norm else ("collecting",)
-                matches = [
-                    {**dict(b), "db_now": now}
-                    for b in self.collect_buffers.values()
-                    if b.get("account_id") == aid
-                    and int(b.get("bot_generation") or 0) == bgen
-                    and b.get("scope_key") == skey
-                    and int(b.get("session_generation") or 0) == sgen
-                    and b.get("status") in allowed_st
-                ]
-                return matches
-            if "WHERE dalton_user_id = %s AND scope_key = %s" in norm:
-                uid, skey = str(params[0]), str(params[1])
-                matches = [
-                    {**dict(b), "db_now": now}
-                    for b in self.collect_buffers.values()
-                    if b["dalton_user_id"] == uid and b["scope_key"] == skey and b["status"] == "collecting"
-                ]
-                return matches
-            return []
-
-        if "UPDATE dalton_channel_weixin_collect_buffers" in norm:
-            if "SET status = 'expired'" in norm and "AND expires_at <=" in norm:
-                db_n, aid, bgen, skey, sgen, exp_lim = params
-                for b in self.collect_buffers.values():
-                    if (
-                        b.get("account_id") == str(aid)
-                        and int(b.get("bot_generation") or 0) == int(bgen)
-                        and b.get("scope_key") == str(skey)
-                        and int(b.get("session_generation") or 0) == int(sgen)
-                        and b.get("status") == "collecting"
-                        and b.get("expires_at") is not None
-                        and b["expires_at"] <= exp_lim
-                    ):
-                        b["status"] = "expired"
-                        b["updated_at"] = db_n
-                return []
-            bid = str(params[-1])
-            b = self.collect_buffers.get(bid)
-            if not b:
-                return []
-            if "SET expires_at = %s, updated_at = %s" in norm:
-                b["expires_at"] = params[0]
-                b["updated_at"] = params[1]
-                return [dict(b)]
-            if "SET status = 'expired'" in norm:
-                b["status"] = "expired"
-                b["updated_at"] = params[0]
-                return [dict(b)]
-            if "SET status = 'cancelled'" in norm:
-                b["status"] = "cancelled"
-                b["updated_at"] = params[0]
-                return [dict(b)]
-            if "SET status = 'flushing'" in norm:
-                b["status"] = "flushing"
-                b["flush_prompt"] = params[0]
-                b["updated_at"] = params[1]
-                return [dict(b)]
-            if "SET status = 'done'" in norm:
-                b["status"] = "done"
-                b["flushed_message_id"] = str(params[0])
-                b["updated_at"] = now
-                return [dict(b)]
-            if "item_count = item_count + 1" in norm:
-                add_chars, add_atts, new_exp, u_at, _bid = params
-                b["item_count"] += 1
-                b["total_text_chars"] += int(add_chars)
-                b["attachment_count"] += int(add_atts)
-                b["expires_at"] = new_exp
-                b["updated_at"] = u_at
-                return [dict(b)]
-            return [dict(b)]
-
-        if "INSERT INTO dalton_channel_weixin_collect_items" in norm:
-            bid, mid, pseq, ptime, rorder, txt, exp_att_cnt, up_st, c_at, u_at = params
-            key = (str(bid), str(mid))
-            if key in self.collect_items:
-                return []
-            item = {
-                "buffer_id": str(bid),
-                "message_id": str(mid),
-                "protocol_seq": pseq,
-                "platform_time_ms": ptime,
-                "receive_order": int(rorder),
-                "text_content": str(txt or ""),
-                "expected_attachment_count": int(exp_att_cnt),
-                "upload_status": str(up_st),
-                "uploaded_attachments": [],
-                "upload_error": None,
-                "created_at": c_at,
-                "updated_at": u_at,
-            }
-            self.collect_items[key] = item
-            return [dict(item)]
-
-        if "FROM dalton_channel_weixin_collect_items" in norm and "SELECT" in norm:
-            bid = str(params[0])
-            if "WHERE buffer_id = %s::uuid AND message_id = %s" in norm:
-                mid = str(params[1])
-                it = self.collect_items.get((bid, mid))
-                return [dict(it)] if it else []
-            if "COUNT(*)" in norm and "pending_upload" in norm:
-                cnt = sum(
-                    1
-                    for it in self.collect_items.values()
-                    if it["buffer_id"] == bid and it["upload_status"] == "pending_upload"
-                )
-                return [{"cnt": cnt}]
-            if "MAX(receive_order)" in norm:
-                orders = [it["receive_order"] for it in self.collect_items.values() if it["buffer_id"] == bid]
-                return [{"max_ord": max(orders) if orders else 0}]
-            items = [dict(it) for it in self.collect_items.values() if it["buffer_id"] == bid]
-            items.sort(
-                key=lambda x: (
-                    x["protocol_seq"] is None,
-                    x["protocol_seq"] or 0,
-                    x["platform_time_ms"] or 0,
-                    x["receive_order"],
-                    x["message_id"],
-                )
-            )
-            return items
-
-        if "UPDATE dalton_channel_weixin_collect_items" in norm:
-            if "SET upload_status = 'failed', upload_error = COALESCE" in norm:
-                bid = str(params[0])
-                for it in self.collect_items.values():
-                    if it["buffer_id"] == bid and it["upload_status"] == "pending_upload":
-                        it["upload_status"] = "failed"
-                        it["upload_error"] = it.get("upload_error") or "upload_timeout"
-                return []
-            up_atts, up_st, up_err, bid, mid = params
-            it = self.collect_items.get((str(bid), str(mid)))
-            if it:
-                it["uploaded_attachments"] = self._unwrap(up_atts) or []
-                it["upload_status"] = str(up_st)
-                it["upload_error"] = up_err
-                self.last_rowcount = 1
-                return [dict(it)]
-            self.last_rowcount = 0
-            return []
-
         # --- Thread watches ---
         if "INSERT INTO dalton_channel_thread_watches" in norm:
             tid, uid, plat, addr, scope, gen, last_turn, active = (
@@ -1197,44 +910,6 @@ class InMemoryWeixinMultiAccountStore:
             if "WHERE delivery_key = %s" in norm:
                 d = self.deliveries.get(str(params[0]))
                 return [dict(d)] if d else []
-            if "MIN(next_retry_at) AS next_upcoming_retry_at" in norm:
-                skip_wx = "platform <> 'weixin'" in norm
-                plat_f = str(params[0]) if params and "platform = %s" in norm else None
-                cands = [
-                    d.get("next_retry_at")
-                    for d in self.deliveries.values()
-                    if d.get("status") in ("deferred", "partial_deferred")
-                    and d.get("next_retry_at") is not None
-                    and d["next_retry_at"] > now
-                    and (plat_f is None or str(d.get("platform") or "").lower() == plat_f)
-                    and (not skip_wx or str(d.get("platform") or "").lower() != "weixin")
-                ]
-                return [{"next_upcoming_retry_at": min(cands) if cands else None}]
-            if "status IN ('deferred', 'partial_deferred')" in norm:
-                skip_wx = "platform <> 'weixin'" in norm
-                plat_f = str(params[0]) if params and "platform = %s" in norm else None
-                only_expired = "first_deferred_at <= NOW() - INTERVAL '24 hours'" in norm
-                only_due = "next_retry_at <= NOW()" in norm
-                out_d = []
-                for d in sorted(
-                    self.deliveries.values(), key=lambda x: str(x.get("delivery_key") or "")
-                ):
-                    if d.get("status") not in ("deferred", "partial_deferred"):
-                        continue
-                    if plat_f is not None and str(d.get("platform") or "").lower() != plat_f:
-                        continue
-                    if skip_wx and str(d.get("platform") or "").lower() == "weixin":
-                        continue
-                    if only_expired:
-                        fdef = d.get("first_deferred_at")
-                        if fdef is None or (now - fdef).total_seconds() < 86400:
-                            continue
-                    if only_due:
-                        nret = d.get("next_retry_at")
-                        if nret is not None and nret > now:
-                            continue
-                    out_d.append(dict(d))
-                return out_d
             if "WHERE status = 'in_flight'" in norm:
                 skip_wx = "AND platform <> 'weixin'" in norm
                 return [
@@ -1263,83 +938,16 @@ class InMemoryWeixinMultiAccountStore:
                     settled.append(dict(d))
             return settled
 
-        if "UPDATE dalton_channel_deliveries SET status = %s, sent_chunks = %s" in norm and "defer_count = %s" in norm:
-            st, sc, tc, pmids, fstat, dsegs, dcnt, fdef, nret, ldef_att, ecode, emsg, dkey = params
-            d = self.deliveries.get(str(dkey))
-            if d is not None:
-                d["status"] = str(st)
-                d["sent_chunks"] = int(sc)
-                d["total_chunks"] = int(tc)
-                d["platform_message_ids"] = pmids.obj if hasattr(pmids, "obj") else pmids
-                d["files_status"] = fstat.obj if hasattr(fstat, "obj") else fstat
-                d["delivered_segments"] = dsegs.obj if hasattr(dsegs, "obj") else dsegs
-                d["defer_count"] = int(dcnt)
-                d["first_deferred_at"] = fdef
-                d["next_retry_at"] = nret
-                d["last_deferred_attempt"] = int(ldef_att)
-                if ecode is not None:
-                    d["error_code"] = ecode
-                if emsg is not None:
-                    d["error_message"] = emsg
-                d["updated_at"] = now
-            return []
-
-        if "UPDATE dalton_channel_deliveries SET status = %s, sent_chunks = %s" in norm and "delivered_segments = %s" in norm:
-            st, sc, tc, pmids, fstat, dsegs, dkey = params
-            d = self.deliveries.get(str(dkey))
-            if d is not None:
-                d["status"] = str(st)
-                d["sent_chunks"] = int(sc)
-                d["total_chunks"] = int(tc)
-                d["platform_message_ids"] = pmids.obj if hasattr(pmids, "obj") else pmids
-                d["files_status"] = fstat.obj if hasattr(fstat, "obj") else fstat
-                d["delivered_segments"] = dsegs.obj if hasattr(dsegs, "obj") else dsegs
-                d["updated_at"] = now
-            return []
-
-        if "UPDATE dalton_channel_deliveries SET status = 'failed', next_retry_at = NULL" in norm:
-            if "WHERE delivery_key = ANY" in norm:
-                ecode, emsg, keys = params
-                expired_out = []
-                for dk in keys:
-                    d = self.deliveries.get(str(dk))
-                    if d is not None and d.get("status") in ("deferred", "partial_deferred"):
-                        d["status"] = "failed"
-                        d["next_retry_at"] = None
-                        d["error_code"] = ecode
-                        if d.get("error_message") is None:
-                            d["error_message"] = emsg
-                        d["updated_at"] = now
-                        expired_out.append(dict(d))
-                return expired_out
-            ecode, emsg, dkey = params
-            d = self.deliveries.get(str(dkey))
-            if d is not None:
-                d["status"] = "failed"
-                d["next_retry_at"] = None
-                d["error_code"] = ecode
-                if d.get("error_message") is None:
-                    d["error_message"] = emsg
-                d["updated_at"] = now
-            return []
-
         if "UPDATE dalton_channel_deliveries SET sent_chunks = %s" in norm:
-            if "delivered_segments = %s" in norm:
-                sc, tc, pmids, fstat, dsegs, fresp, st, ecode, emsg, dkey = params
-            else:
-                sc, tc, pmids, fstat, fresp, st, ecode, emsg, dkey = params
-                dsegs = None
+            sc, tc, pmids, fstat, fresp, st, ecode, emsg, dkey = params
             d = self.deliveries.get(str(dkey))
             if d is not None:
                 d["sent_chunks"] = int(sc)
                 d["total_chunks"] = int(tc)
                 d["platform_message_ids"] = pmids.obj if hasattr(pmids, "obj") else pmids
                 d["files_status"] = fstat.obj if hasattr(fstat, "obj") else fstat
-                if dsegs is not None:
-                    d["delivered_segments"] = dsegs.obj if hasattr(dsegs, "obj") else dsegs
                 d["first_response_json"] = fresp.obj if hasattr(fresp, "obj") else fresp
                 d["status"] = str(st)
-                d["next_retry_at"] = None
                 if ecode is not None:
                     d["error_code"] = ecode
                 if emsg is not None:
@@ -1350,53 +958,6 @@ class InMemoryWeixinMultiAccountStore:
         if "INSERT INTO dalton_channel_deliveries" in norm:
             dkey = str(params[0])
             existing_d = self.deliveries.get(dkey)
-            if "last_deferred_attempt" in norm:
-                (
-                    _dk, kind_v, uid_v, tid_v, rid_v, eid_v, is_cur_v, has_txt_v,
-                    plat_v, tgt_v, st_v, tc_v, ec_v, em_v, sscope_v, sgen_v,
-                    aorig_v, dcnt_v, fdef_v, nret_v,
-                ) = params
-                if existing_d is not None:
-                    existing_d["status"] = str(st_v)
-                    existing_d["defer_count"] = int(dcnt_v)
-                    if existing_d.get("first_deferred_at") is None:
-                        existing_d["first_deferred_at"] = fdef_v
-                    existing_d["next_retry_at"] = nret_v
-                    existing_d["last_deferred_attempt"] = int(existing_d.get("delivery_attempt") or 1)
-                    existing_d["error_code"] = ec_v
-                    existing_d["error_message"] = em_v
-                    existing_d["updated_at"] = now
-                else:
-                    self.deliveries[dkey] = {
-                        "delivery_key": dkey,
-                        "kind": str(kind_v),
-                        "user_id": str(uid_v),
-                        "thread_id": tid_v,
-                        "run_id": rid_v,
-                        "execution_id": eid_v,
-                        "is_current": bool(is_cur_v),
-                        "has_non_empty_text": bool(has_txt_v),
-                        "platform": str(plat_v),
-                        "target_address": str(tgt_v),
-                        "status": str(st_v),
-                        "total_chunks": int(tc_v),
-                        "sent_chunks": 0,
-                        "platform_message_ids": [],
-                        "files_status": [],
-                        "delivered_segments": [],
-                        "delivery_attempt": 1,
-                        "defer_count": int(dcnt_v),
-                        "first_deferred_at": fdef_v,
-                        "next_retry_at": nret_v,
-                        "last_deferred_attempt": 1,
-                        "error_code": ec_v,
-                        "error_message": em_v,
-                        "source_scope_key": sscope_v,
-                        "source_generation": sgen_v,
-                        "activity_origin": aorig_v,
-                        "updated_at": now,
-                    }
-                return []
             if "'unknown'" in norm:
                 self.deliveries[dkey] = {
                     "delivery_key": dkey,
@@ -1411,7 +972,6 @@ class InMemoryWeixinMultiAccountStore:
                 uid_v = str(params[2]) if len(params) > 2 else ""
                 if existing_d is not None:
                     existing_d["status"] = "in_flight"
-                    existing_d["next_retry_at"] = None
                     existing_d["delivery_attempt"] = int(existing_d.get("delivery_attempt") or 1) + 1
                     existing_d["platform"] = plat_v
                     existing_d["target_address"] = tgt_v
@@ -1428,12 +988,7 @@ class InMemoryWeixinMultiAccountStore:
                         "sent_chunks": 0,
                         "platform_message_ids": [],
                         "files_status": [],
-                        "delivered_segments": [],
                         "delivery_attempt": 1,
-                        "defer_count": 0,
-                        "first_deferred_at": None,
-                        "next_retry_at": None,
-                        "last_deferred_attempt": None,
                         "error_code": None,
                         "error_message": None,
                         "source_scope_key": params[11] if len(params) > 11 else None,
@@ -1449,90 +1004,6 @@ class InMemoryWeixinMultiAccountStore:
 
         # --- Inbound events ---
         if "UPDATE dalton_channel_inbound_events" in norm:
-            if "WHERE collect_buffer_id = ANY" in norm:
-                bids = {str(x) for x in (params[0] or [])}
-                for r in self.inbound_events.values():
-                    if str(r.get("collect_buffer_id") or "") in bids:
-                        r["status"] = "ignored"
-                        r["fallback_pending"] = False
-                        r["command_reply_pending"] = False
-                        r["encrypted_weixin_media_meta"] = None
-                return []
-            if "WHERE collect_buffer_id = %s" in norm:
-                bid = str(params[0])
-                for r in self.inbound_events.values():
-                    if str(r.get("collect_buffer_id") or "") == bid:
-                        r["status"] = "ignored"
-                        r["fallback_pending"] = False
-                        r["command_reply_pending"] = False
-                        r["encrypted_weixin_media_meta"] = None
-                return []
-            if "SET status = 'ignored', fallback_pending = FALSE, command_reply_pending = FALSE, encrypted_weixin_media_meta = NULL" in norm:
-                if "dalton_channel_weixin_collect_buffers" in norm or not params:
-                    for r in self.inbound_events.values():
-                        bid = r.get("collect_buffer_id")
-                        if bid and bid in self.collect_buffers:
-                            if self.collect_buffers[bid]["status"] in ("cancelled", "expired", "done"):
-                                r["status"] = "ignored"
-                                r["fallback_pending"] = False
-                                r["command_reply_pending"] = False
-                                r["encrypted_weixin_media_meta"] = None
-                    return []
-                if "AND collect_buffer_id = %s::uuid AND weixin_account_id = %s::uuid" in norm:
-                    mid, bid, aid_f = str(params[0]), str(params[1]), str(params[2])
-                    r = self.inbound_events.get(("weixin", mid))
-                    if r and str(r.get("collect_buffer_id") or "") == bid and str(r.get("weixin_account_id") or "") == aid_f:
-                        r["status"] = "ignored"
-                        r["fallback_pending"] = False
-                        r["command_reply_pending"] = False
-                        r["encrypted_weixin_media_meta"] = None
-                    return []
-                if "AND collect_buffer_id = %s::uuid" in norm:
-                    mid, bid = str(params[0]), str(params[1])
-                    r = self.inbound_events.get(("weixin", mid))
-                    if r and str(r.get("collect_buffer_id") or "") == bid:
-                        r["status"] = "ignored"
-                        r["fallback_pending"] = False
-                        r["command_reply_pending"] = False
-                        r["encrypted_weixin_media_meta"] = None
-                    return []
-                mid = str(params[-1])
-                r = self.inbound_events.get(("weixin", mid))
-                if r:
-                    r["status"] = "ignored"
-                    r["fallback_pending"] = False
-                    r["command_reply_pending"] = False
-                    r["encrypted_weixin_media_meta"] = None
-                return []
-            if "SET collect_buffer_id = %s::uuid" in norm:
-                bid = str(params[0])
-                wid = str(params[1])
-                st = str(params[2])
-                mid = str(params[-1])
-                r = self.inbound_events.get(("weixin", mid))
-                if r:
-                    r["collect_buffer_id"] = bid
-                    r["workspace_id"] = wid
-                    r["status"] = st
-                    r["fallback_pending"] = False
-                    if "encrypted_weixin_media_meta = pgp_sym_encrypt" in norm:
-                        r["encrypted_weixin_media_meta"] = str(params[3])
-                return []
-            if "SET status = 'completed', fallback_pending = FALSE, uploaded_attachments = %s, encrypted_weixin_media_meta = NULL" in norm or "SET status = 'completed', uploaded_attachments = %s, encrypted_weixin_media_meta = NULL" in norm:
-                atts, mid = self._unwrap(params[0]), str(params[1])
-                r = self.inbound_events.get(("weixin", mid))
-                if r:
-                    if "AND collect_buffer_id = %s::uuid AND weixin_account_id = %s::uuid" in norm:
-                        if str(r.get("collect_buffer_id") or "") != str(params[2]) or str(r.get("weixin_account_id") or "") != str(params[3]):
-                            return []
-                    elif "AND collect_buffer_id = %s::uuid" in norm:
-                        if str(r.get("collect_buffer_id") or "") != str(params[2]):
-                            return []
-                    r["status"] = "completed"
-                    r["fallback_pending"] = False
-                    r["uploaded_attachments"] = atts
-                    r["encrypted_weixin_media_meta"] = None
-                return []
             if "SET status = 'ignored', raw_payload = %s, updated_at = NOW() WHERE platform = %s AND message_id = %s" in norm:
                 r_pay, plat, mid = params
                 r = self.inbound_events.get((str(plat), str(mid)))
@@ -1557,43 +1028,9 @@ class InMemoryWeixinMultiAccountStore:
             return []
 
         if "INSERT INTO dalton_channel_inbound_events" in norm:
-            # Handle synthetic collect inbound, collect/cancel command_result, or normal inbound (all platforms)
             if "VALUES ('weixin', %s" in norm or "VALUES ( 'weixin', %s" in norm:
                 mid = str(params[0])
                 key = ("weixin", mid)
-                if "command_result" in norm and "ON CONFLICT (platform, message_id) DO UPDATE" in norm:
-                    # _persist_weixin_collect_command_result (12 params)
-                    (
-                        _mid, req_k, uid_v, c_addr, s_key, ws_v, s_gen,
-                        cmd_res_p, cmd_pay_p, aid_v, bot_v, gen_v,
-                    ) = params
-                    row = {
-                        "platform": "weixin",
-                        "message_id": mid,
-                        "request_key": str(req_k),
-                        "dalton_user_id": str(uid_v),
-                        "chat_type": "dm",
-                        "chat_address": str(c_addr),
-                        "thread_scope_key": str(s_key),
-                        "workspace_id": ws_v,
-                        "session_generation": s_gen,
-                        "status": "completed",
-                        "fallback_pending": False,
-                        "command_effect_status": "done",
-                        "command_reply_pending": True,
-                        "command_result": self._unwrap(cmd_res_p),
-                        "raw_payload": self._unwrap(cmd_pay_p) or {},
-                        "event_kind": "command",
-                        "weixin_account_id": str(aid_v) if aid_v else None,
-                        "weixin_context_bot_id": str(bot_v) if bot_v else None,
-                        "weixin_context_bot_generation": int(gen_v) if gen_v is not None else None,
-                        "collect_buffer_id": None,
-                        "encrypted_weixin_media_meta": None,
-                        "created_at": now,
-                        "updated_at": now,
-                    }
-                    self.inbound_events[key] = row
-                    return [dict(row)]
                 if key in self.inbound_events and "ON CONFLICT" in norm:
                     return []
                 row = {
@@ -1606,7 +1043,6 @@ class InMemoryWeixinMultiAccountStore:
                     "command_reply_pending": False,
                     "raw_payload": {},
                     "uploaded_attachments": [],
-                    "collect_buffer_id": None,
                     "encrypted_weixin_media_meta": None,
                     "weixin_account_id": None,
                     "weixin_context_bot_id": None,
@@ -1619,9 +1055,7 @@ class InMemoryWeixinMultiAccountStore:
                     row["weixin_context_bot_id"] = str(params[8]) if params[8] else None
                     row["weixin_context_bot_generation"] = int(params[9]) if params[9] is not None else None
                 for p in params:
-                    if isinstance(p, str) and p in self.collect_buffers:
-                        row["collect_buffer_id"] = p
-                    elif hasattr(p, "obj") and isinstance(p.obj, dict):
+                    if hasattr(p, "obj") and isinstance(p.obj, dict):
                         row["raw_payload"] = dict(p.obj)
                     elif hasattr(p, "obj") and isinstance(p.obj, list):
                         row["uploaded_attachments"] = list(p.obj)
@@ -1686,18 +1120,12 @@ class InMemoryWeixinMultiAccountStore:
             return []
 
         if "FROM dalton_channel_inbound_events" in norm and "SELECT" in norm:
-            if "LEFT JOIN dalton_channel_weixin_collect_buffers cb" in norm:
+            if "FROM dalton_channel_inbound_events ie WHERE ie.status IN" in norm:
                 out = []
                 for r in self.inbound_events.values():
                     if r.get("status") in ("pending", "accepted", "streaming", "steered", "pending_resubmit") or r.get("fallback_pending") or r.get("command_reply_pending"):
                         d = dict(r)
-                        bid = r.get("collect_buffer_id")
-                        d["collect_buffer_status"] = (
-                            self.collect_buffers[bid]["status"]
-                            if bid and bid in self.collect_buffers
-                            else None
-                        )
-                        d["decrypted_weixin_media_meta_json"] = r.get("encrypted_weixin_media_meta")
+                        d["decrypted_weixin_media_json"] = r.get("encrypted_weixin_media_meta")
                         out.append(d)
                 return out
             if "WHERE platform = 'weixin' AND message_id = %s" in norm:
@@ -1939,7 +1367,7 @@ def test_d049_migration_schema_copy_only_not_valid_fks_and_fk_validator(
     assert 'revision: str = "d049"' in src
     assert 'down_revision: str | None = "d046"' in src
 
-    # All 8 new tables
+    # All 6 new tables (collect tables removed in R11)
     for tbl in (
         "dalton_channel_gateway_lease",
         "dalton_channel_weixin_config",
@@ -1947,16 +1375,21 @@ def test_d049_migration_schema_copy_only_not_valid_fks_and_fk_validator(
         "dalton_channel_weixin_account_tokens",
         "dalton_channel_weixin_login_sessions",
         "dalton_channel_weixin_audit_logs",
-        "dalton_channel_weixin_collect_buffers",
-        "dalton_channel_weixin_collect_items",
     ):
         assert f"CREATE TABLE IF NOT EXISTS {tbl}" in src
+    for removed_obj in (
+        "dalton_channel_weixin_collect_buffers",
+        "dalton_channel_weixin_collect_items",
+        "collect_buffer_id",
+        "fk_dalton_inbound_wx_collect_buf",
+    ):
+        assert removed_obj not in src
 
-    # All 5 NOT VALID foreign keys
-    assert len(fk_val.WEIXIN_D049_FK_CONSTRAINTS) == 5
+    # All 4 NOT VALID foreign keys
+    assert len(fk_val.WEIXIN_D049_FK_CONSTRAINTS) == 4
     for _table, cname in fk_val.WEIXIN_D049_FK_CONSTRAINTS:
         assert cname in src
-    assert src.count("NOT VALID") >= 5
+    assert src.count("NOT VALID") >= 4
 
     # Copy-only guarantee: legacy tables never mutated in upgrade()
     upgrade_body = src.split("def downgrade()")[0]
@@ -2036,9 +1469,9 @@ def test_d049_migration_schema_copy_only_not_valid_fks_and_fk_validator(
     )
     validated = fk_val.validate_d049_foreign_keys("postgresql://u:p@localhost/db_test")
     assert validated["ok"] is True
-    assert len(validated["validated"]) == 5
+    assert len(validated["validated"]) == 4
     assert all(item["convalidated"] is True for item in validated["validated"])
-    assert len(executed_txs) == 5
+    assert len(executed_txs) == 4
     for tx_sqls in executed_txs:
         assert any("SET LOCAL lock_timeout" in s for s in tx_sqls)
         assert any("VALIDATE CONSTRAINT" in s for s in tx_sqls)
@@ -2091,7 +1524,6 @@ async def test_gateway_lease_acquire_heartbeat_release_and_epoch_fencing_across_
     # Every write/recover internal route rejects old epoch=1 with HTTP 409 stale_gateway_epoch
     stale_hdr = {"X-Service-Token": SERVICE_TOKEN, "X-Gateway-Epoch": "1"}
     aid = str(uuid4())
-    bid = str(uuid4())
     for method, url, body in (
         ("GET", "/api/v1/dalton/channels/internal/recover?mode=startup", None),
         ("POST", "/api/v1/dalton/channels/internal/weixin/accounts/reconcile", {"since_revision": 0}),
@@ -2109,16 +1541,6 @@ async def test_gateway_lease_acquire_heartbeat_release_and_epoch_fencing_across_
             "PATCH",
             "/api/v1/dalton/channels/internal/weixin/login-sessions/sk-1",
             {"action": "update", "expected_login_version": 1, "status": "scaned"},
-        ),
-        (
-            "POST",
-            f"/api/v1/dalton/channels/internal/weixin/collect-buffers/{bid}/items/m1/attachments",
-            {"uploaded_attachments": []},
-        ),
-        (
-            "POST",
-            f"/api/v1/dalton/channels/internal/weixin/collect-buffers/{bid}/finalize",
-            None,
         ),
         (
             "POST",
@@ -2145,7 +1567,7 @@ async def test_gateway_lease_acquire_heartbeat_release_and_epoch_fencing_across_
             "POST",
             "/api/v1/dalton/channels/internal/session/command",
             {
-                "cmd": "help",
+                "cmd": "new",
                 "platform": "weixin",
                 "platform_user_id": "wx1",
                 "scope_key": "dm:wx1",
@@ -2986,191 +2408,6 @@ async def test_context_token_version_cas_stale_errcodes_and_secret_redaction(
 
 
 # ---------------------------------------------------------------------------
-# §7.1 #7 + Codex ④: Collect Mode (Home Auto-Create, Lock-Free /done,
-#                    Finalize, Cancel Stops Everything, collect_buffer_status)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_collect_mode_home_autocreate_lockfree_done_finalize_and_cancel_stops_everything(
-    wx_env: dict[str, Any],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Verify /collect Home auto-create, Codex ④ cancelled attachment rejection & status field, /done finalize, and cancel."""
-    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
-    aid = str(uuid4())
-    from src.server.database.home_workspace import get_home_workspace_id
-
-    home_ws_id = get_home_workspace_id("u-alice")
-    store.accounts[aid] = {
-        "account_id": aid,
-        "user_id": "u-alice",
-        "ilink_bot_id": "bot-a@im.wechat",
-        "encrypted_bot_token": "tok-a",
-        "bot_token": "tok-a",
-        "base_url": "https://ilinkai.weixin.qq.com",
-        "cdn_base_url": "https://novac2c.cdn.weixin.qq.com/c2c",
-        "get_updates_buf": "",
-        "status": "active",
-        "prev_status": None,
-        "disabled_reason": None,
-        "bot_generation": 1,
-        "prev_bot_generation": None,
-        "bot_generation_updated_at": None,
-        "ilink_user_id": "wx_alice@im.wechat",
-        "prev_ilink_user_id": None,
-        "ilink_username": "Alice",
-        "last_inbound_at": None,
-        "created_at": store.now,
-        "updated_at": store.now,
-    }
-
-    async def _create_home(uid: str, **kwargs: Any) -> dict[str, Any]:
-        wid = get_home_workspace_id(uid)
-        store.workspaces[wid] = {"workspace_id": wid, "user_id": uid, "name": "Home", "status": "running"}
-        return {"workspace_id": wid}
-
-    mock_home = create_autospec(
-        workspace_db.get_or_create_home_workspace,
-        side_effect=_create_home,
-    )
-    monkeypatch.setattr(workspace_db, "get_or_create_home_workspace", mock_home)
-    monkeypatch.setattr(
-        cg_db,
-        "_verify_workspace_write_permission",
-        create_autospec(cg_db._verify_workspace_write_permission, return_value=(True, None, {"workspace_id": home_ws_id})),
-    )
-
-    # 1. /collect auto-creates Home workspace and creates collecting buffer
-    r_collect = await cg_db.execute_session_command(
-        cmd="collect",
-        platform="weixin",
-        platform_user_id="wx_alice@im.wechat",
-        scope_key="dm:wx_alice@im.wechat",
-        message_id="wx_cmd_collect_1",
-        weixin_account_id=aid,
-        weixin_bot_id="bot-a@im.wechat",
-        weixin_bot_generation=1,
-        command_arg="帮我汇总",
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert r_collect["ok"] is True, r_collect
-    assert r_collect["collect_status"] == "started"
-    assert r_collect["workspace_id"] == home_ws_id
-    assert mock_home.call_count == 1
-    buf_id = r_collect["collect_buffer_id"]
-
-    # 2. Inbound message appends to collecting buffer and exposes collect_buffer_status (Codex ④)
-    r_in = await cg_db.register_and_resolve_inbound(
-        platform="weixin",
-        platform_user_id="wx_alice@im.wechat",
-        chat_type="dm",
-        chat_address="weixin:@me",
-        thread_scope_key="dm:wx_alice@im.wechat",
-        message_id="wx_item_1",
-        raw_payload={"text": "第一条转发", "seq": 10},
-        weixin_account_id=aid,
-        weixin_bot_id="bot-a@im.wechat",
-        weixin_bot_generation=1,
-        weixin_context_token="ctx-collect-1",
-        weixin_media_meta=[{"type": "image", "aes_key": "k1", "filename": "a.png"}],
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert r_in["collection_mode"] == "appended"
-    assert r_in["collect_buffer_id"] == buf_id
-    assert r_in["collect_buffer_status"] == "collecting"
-
-    # 3. Recovery also exposes collect_buffer_status + decrypted_weixin_attachments
-    rec = await cg_db.recover_channel_state(mode="startup", gateway_epoch=1, require_gateway_epoch=True)
-    rec_item = next(r for r in rec["inbound_events"] if r["message_id"] == "wx_item_1")
-    assert rec_item["collect_buffer_status"] == "collecting"
-
-    # 4. Attachment registration succeeds while collecting
-    r_att = await wx_db.register_collect_item_attachments(
-        buffer_id=buf_id,
-        message_id="wx_item_1",
-        gateway_epoch=1,
-        uploaded_attachments=[{"name": "a.png", "path": "/ws/a.png"}],
-    )
-    assert r_att["upload_status"] == "ready"
-    assert store.inbound_events[("weixin", "wx_item_1")]["encrypted_weixin_media_meta"] is None
-
-    # 5. /done transitions to flushing -> finalize registers synthetic collect:<buf_id> & marks done
-    r_done = await cg_db.execute_session_command(
-        cmd="done",
-        platform="weixin",
-        platform_user_id="wx_alice@im.wechat",
-        scope_key="dm:wx_alice@im.wechat",
-        message_id="wx_cmd_done_1",
-        weixin_account_id=aid,
-        weixin_bot_id="bot-a@im.wechat",
-        weixin_bot_generation=1,
-        command_arg="请总结要点",
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert r_done["ok"] is True
-    assert r_done["collect_status"] == "done"
-    assert store.collect_buffers[buf_id]["status"] == "done"
-    assert ("weixin", f"collect:{buf_id}") in store.inbound_events
-
-    # 6. Cancelled buffer stops attachment upload registration (Codex ④) AND finalize
-    r_c2 = await cg_db.execute_session_command(
-        cmd="collect",
-        platform="weixin",
-        platform_user_id="wx_alice@im.wechat",
-        scope_key="dm:wx_alice@im.wechat",
-        message_id="wx_cmd_collect_2",
-        weixin_account_id=aid,
-        weixin_bot_id="bot-a@im.wechat",
-        weixin_bot_generation=1,
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    buf2 = r_c2["collect_buffer_id"]
-    await cg_db.register_and_resolve_inbound(
-        platform="weixin",
-        platform_user_id="wx_alice@im.wechat",
-        chat_type="dm",
-        chat_address="weixin:@me",
-        thread_scope_key="dm:wx_alice@im.wechat",
-        message_id="wx_item_2",
-        raw_payload={"text": "第二条", "seq": 11},
-        weixin_account_id=aid,
-        weixin_bot_id="bot-a@im.wechat",
-        weixin_bot_generation=1,
-        weixin_media_meta=[{"type": "file", "aes_key": "k2", "filename": "b.pdf"}],
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    # Unbind cancels buffer, preserves buffer row with account_id=NULL, retires inbound
-    await wx_db.unbind_weixin_account(account_id=aid, operator_user_id="u-alice", action="member_unbind")
-    assert buf2 in store.collect_buffers
-    assert store.collect_buffers[buf2]["status"] == "cancelled"
-    assert store.collect_buffers[buf2]["account_id"] is None
-    assert store.inbound_events[("weixin", "wx_item_2")]["status"] == "ignored"
-    assert store.inbound_events[("weixin", "wx_item_2")]["collect_buffer_id"] == buf2
-
-    # Late attachment registration rejected with cancelled & "已取消" (Codex ④)
-    r_att_cancel = await wx_db.register_collect_item_attachments(
-        buffer_id=buf2,
-        message_id="wx_item_2",
-        gateway_epoch=1,
-        uploaded_attachments=[{"name": "b.pdf"}],
-    )
-    assert r_att_cancel["ok"] is True
-    assert r_att_cancel["upload_status"] == "cancelled"
-    assert "已取消" in str(r_att_cancel.get("message") or "")
-
-    # Finalize skips synthetic inbound creation
-    r_fin_cancel = await wx_db.finalize_collect_buffer(buffer_id=buf2, gateway_epoch=1)
-    assert r_fin_cancel["status"] == "cancelled"
-    assert ("weixin", f"collect:{buf2}") not in store.inbound_events
-
-
-# ---------------------------------------------------------------------------
 # §5.1: Report payload_json["text"], Notify Test Plan, Per-Target Transport
 # ---------------------------------------------------------------------------
 
@@ -3489,7 +2726,7 @@ async def test_r2_conditional_gateway_epoch_no_lease_allows_feishu_discord_rejec
     r_wx_i3 = client.post(
         "/api/v1/dalton/channels/internal/session/command",
         headers=no_epoch_hdrs,
-        json={"cmd": "help", "platform": "weixin", "platform_user_id": "wx_1@im.wechat", "scope_key": "dm:wx_1@im.wechat"},
+        json={"cmd": "new", "platform": "weixin", "platform_user_id": "wx_1@im.wechat", "scope_key": "dm:wx_1@im.wechat"},
     )
     assert r_wx_i3.status_code == 409
 
@@ -4052,149 +3289,6 @@ async def test_r2_i6_requires_exact_run_source_and_live_background_run_respects_
 
 
 @pytest.mark.asyncio
-async def test_r2_collect_attachment_buffer_account_scope_and_collect_cancel_replay_idempotency(
-    wx_env: dict[str, Any],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Decision #3e: Attachment registration never touches another buffer's inbound row; /collect & /cancel replay is idempotent."""
-    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
-    from src.server.database.home_workspace import get_home_workspace_id
-
-    aid_a = str(uuid4())
-    aid_b = str(uuid4())
-    home_ws = get_home_workspace_id("u-alice")
-    store.workspaces[home_ws] = {"workspace_id": home_ws, "user_id": "u-alice", "name": "Home", "status": "running"}
-    store.accounts[aid_a] = {
-        "account_id": aid_a,
-        "user_id": "u-alice",
-        "ilink_bot_id": "bot-a@im.wechat",
-        "encrypted_bot_token": "tok-a",
-        "bot_token": "tok-a",
-        "base_url": "https://ilinkai.weixin.qq.com",
-        "cdn_base_url": "https://novac2c.cdn.weixin.qq.com/c2c",
-        "get_updates_buf": "",
-        "status": "active",
-        "prev_status": None,
-        "disabled_reason": None,
-        "bot_generation": 1,
-        "prev_bot_generation": None,
-        "bot_generation_updated_at": None,
-        "ilink_user_id": "wx_alice@im.wechat",
-        "prev_ilink_user_id": None,
-        "ilink_username": "Alice",
-        "last_inbound_at": None,
-        "created_at": store.now,
-        "updated_at": store.now,
-    }
-    monkeypatch.setattr(
-        cg_db,
-        "_verify_workspace_write_permission",
-        create_autospec(cg_db._verify_workspace_write_permission, return_value=(True, None, {"workspace_id": home_ws})),
-    )
-
-    # 1. Start /collect (msg_1), then replay /collect (msg_1) -> duplicate=True without opening another buffer
-    r_c1 = await cg_db.execute_session_command(
-        cmd="collect",
-        platform="weixin",
-        platform_user_id="wx_alice@im.wechat",
-        scope_key="dm:wx_alice@im.wechat",
-        message_id="cmd_collect_idemp_1",
-        weixin_account_id=aid_a,
-        weixin_bot_id="bot-a@im.wechat",
-        weixin_bot_generation=1,
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert r_c1["collect_status"] == "started"
-    buf_1 = r_c1["collect_buffer_id"]
-
-    r_c1_dup = await cg_db.execute_session_command(
-        cmd="collect",
-        platform="weixin",
-        platform_user_id="wx_alice@im.wechat",
-        scope_key="dm:wx_alice@im.wechat",
-        message_id="cmd_collect_idemp_1",
-        weixin_account_id=aid_a,
-        weixin_bot_id="bot-a@im.wechat",
-        weixin_bot_generation=1,
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert r_c1_dup["duplicate"] is True
-    assert r_c1_dup["collect_buffer_id"] == buf_1
-
-    # 2. Cancel via /cancel (msg_2), then open a NEW buffer (buf_2), then REPLAY old /cancel (msg_2):
-    #    buf_2 MUST stay 'collecting'!
-    r_can1 = await cg_db.execute_session_command(
-        cmd="cancel",
-        platform="weixin",
-        platform_user_id="wx_alice@im.wechat",
-        scope_key="dm:wx_alice@im.wechat",
-        message_id="cmd_cancel_idemp_1",
-        weixin_account_id=aid_a,
-        weixin_bot_id="bot-a@im.wechat",
-        weixin_bot_generation=1,
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert r_can1["collect_status"] == "cancelled"
-    assert store.collect_buffers[buf_1]["status"] == "cancelled"
-
-    r_c2 = await cg_db.execute_session_command(
-        cmd="collect",
-        platform="weixin",
-        platform_user_id="wx_alice@im.wechat",
-        scope_key="dm:wx_alice@im.wechat",
-        message_id="cmd_collect_idemp_2",
-        weixin_account_id=aid_a,
-        weixin_bot_id="bot-a@im.wechat",
-        weixin_bot_generation=1,
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    buf_2 = r_c2["collect_buffer_id"]
-    assert store.collect_buffers[buf_2]["status"] == "collecting"
-
-    r_can1_replay = await cg_db.execute_session_command(
-        cmd="cancel",
-        platform="weixin",
-        platform_user_id="wx_alice@im.wechat",
-        scope_key="dm:wx_alice@im.wechat",
-        message_id="cmd_cancel_idemp_1",
-        weixin_account_id=aid_a,
-        weixin_bot_id="bot-a@im.wechat",
-        weixin_bot_generation=1,
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert r_can1_replay["duplicate"] is True
-    assert store.collect_buffers[buf_2]["status"] == "collecting"
-
-    # 3. Cross-buffer / cross-member attachment registration on cancelled buf_1 targeting another member's message_id ->
-    #    404 and ZERO modification to other member's inbound event & encrypted_weixin_media_meta!
-    store.inbound_events[("weixin", "other_member_mid")] = {
-        "platform": "weixin",
-        "message_id": "other_member_mid",
-        "dalton_user_id": "u-bob",
-        "weixin_account_id": aid_b,
-        "collect_buffer_id": buf_2,
-        "status": "pending",
-        "fallback_pending": True,
-        "encrypted_weixin_media_meta": "ENCRYPTED_BOB_MEDIA",
-    }
-    with pytest.raises(HTTPException) as exc_404:
-        await wx_db.register_collect_item_attachments(
-            buffer_id=buf_1,
-            message_id="other_member_mid",
-            gateway_epoch=1,
-            uploaded_attachments=[],
-        )
-    assert exc_404.value.status_code == 404
-    assert store.inbound_events[("weixin", "other_member_mid")]["status"] == "pending"
-    assert store.inbound_events[("weixin", "other_member_mid")]["encrypted_weixin_media_meta"] == "ENCRYPTED_BOB_MEDIA"
-
-
-@pytest.mark.asyncio
 async def test_r2_public_qr_errors_lock_order_reconcile_abort_preflight_retryable_and_cap_off(
     wx_env: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
@@ -4464,7 +3558,7 @@ async def test_r2_context_token_dual_watermarks_command_encrypt_and_group_reject
     # 4. I-3 session command encrypts token into dalton_channel_weixin_account_tokens via pgp_sym_encrypt & preserves higher seq on out-of-order cmd
     store.executed_sql.clear()
     await cg_db.execute_session_command(
-        cmd="help",
+        cmd="new",
         platform="weixin",
         platform_user_id="wx_alice@im.wechat",
         scope_key="dm:wx_alice@im.wechat",
@@ -4484,7 +3578,7 @@ async def test_r2_context_token_dual_watermarks_command_encrypt_and_group_reject
 
     # Lower protocol seq on next command preserves stored seq=20 and token!
     await cg_db.execute_session_command(
-        cmd="help",
+        cmd="new",
         platform="weixin",
         platform_user_id="wx_alice@im.wechat",
         scope_key="dm:wx_alice@im.wechat",
@@ -4787,7 +3881,7 @@ async def test_r5_i3_authorize_first_and_readonly_never_verifies(
     verify_spy.assert_not_called()
     roster["u-alice"] = "active"
 
-    # 4. Channel disabled rejected BEFORE verification (both ordinary & collect commands!)
+    # 4. Channel disabled rejected BEFORE verification
     store.config["enabled"] = False
     r_off = await cg_db.execute_session_command(
         cmd="new",
@@ -4804,22 +3898,6 @@ async def test_r5_i3_authorize_first_and_readonly_never_verifies(
         require_gateway_epoch=True,
     )
     assert r_off["deny_reason"] == "weixin_channel_disabled"
-    assert store.accounts[aid]["status"] == "pending_verification"
-    r_col_off = await cg_db.execute_session_command(
-        cmd="collect",
-        platform="weixin",
-        platform_user_id="wx_alice@im.wechat",
-        chat_type="dm",
-        chat_address="weixin:@me",
-        scope_key="dm:wx_alice@im.wechat",
-        message_id="r5_pv_col_off",
-        weixin_account_id=aid,
-        weixin_bot_id="bot-pv@im.wechat",
-        weixin_bot_generation=2,
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert r_col_off["deny_reason"] == "weixin_channel_disabled"
     assert store.accounts[aid]["status"] == "pending_verification"
     verify_spy.assert_not_called()
     store.config["enabled"] = True
@@ -5170,156 +4248,6 @@ async def test_r5_i6_thread_only_missing_source_and_authoritative_db_turn_time(
         require_gateway_epoch=True,
     )
     assert store.background_runs[r_no_ts]["weixin_bot_generation"] is None
-
-
-@pytest.mark.asyncio
-async def test_r5_collect_command_whitelisted_payload_and_replay_after_auth(
-    wx_env: dict[str, Any],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """R5 Decision #6: Collect command stores only safe whitelisted fields (never credentials/media),
-    and checks auth/switches/roster BEFORE returning cached replay.
-    """
-    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
-    roster: dict[str, str] = wx_env["roster"]
-    home_ws_id = cg_db.get_home_workspace_id("u-alice")
-    store.workspaces[home_ws_id] = {
-        "workspace_id": home_ws_id,
-        "user_id": "u-alice",
-        "name": "Home",
-        "status": "running",
-    }
-    monkeypatch.setattr(
-        cg_db,
-        "_verify_workspace_write_permission",
-        create_autospec(
-            cg_db._verify_workspace_write_permission,
-            return_value=(True, None, {"workspace_id": home_ws_id}),
-        ),
-    )
-    aid = str(uuid4())
-    store.accounts[aid] = {
-        "account_id": aid,
-        "user_id": "u-alice",
-        "ilink_bot_id": "bot-c@im.wechat",
-        "encrypted_bot_token": "tok-c",
-        "bot_token": "tok-c",
-        "base_url": "https://ilinkai.weixin.qq.com",
-        "cdn_base_url": "https://novac2c.cdn.weixin.qq.com/c2c",
-        "get_updates_buf": "",
-        "status": "active",
-        "prev_status": None,
-        "disabled_reason": None,
-        "bot_generation": 1,
-        "prev_bot_generation": None,
-        "bot_generation_updated_at": None,
-        "ilink_user_id": "wx_alice@im.wechat",
-        "prev_ilink_user_id": None,
-        "ilink_username": "Alice",
-        "last_inbound_at": None,
-        "created_at": store.now,
-        "updated_at": store.now,
-    }
-
-    r1 = await cg_db.execute_session_command(
-        cmd="collect",
-        platform="weixin",
-        platform_user_id="wx_alice@im.wechat",
-        chat_type="dm",
-        chat_address="weixin:@me",
-        scope_key="dm:wx_alice@im.wechat",
-        message_id="r5_collect_mid_1",
-        weixin_account_id=aid,
-        weixin_bot_id="bot-c@im.wechat",
-        weixin_bot_generation=1,
-        weixin_context_token="secret-ctx-token",
-        raw_payload={
-            "seq": 42,
-            "create_time_ms": 1700000000000,
-            "context_token": "secret-ctx-token",
-            "bot_token": "secret-bot-token",
-            "aes_key": "secret-aes-key",
-            "weixin_attachments": [{"url": "https://cdn.example/secret", "aes_key": "k"}],
-            "weixin_media_meta": [{"encrypt_query_param": "enc"}],
-        },
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert r1["ok"] is True
-    saved_row = store.inbound_events[("weixin", "r5_collect_mid_1")]
-    saved_raw = saved_row["raw_payload"]
-    assert saved_raw == {
-        "cmd": "collect",
-        "platform_user_id": "wx_alice@im.wechat",
-        "seq": 42,
-        "create_time_ms": 1700000000000,
-    }
-    for forbidden in (
-        "context_token",
-        "bot_token",
-        "aes_key",
-        "weixin_attachments",
-        "weixin_media_meta",
-    ):
-        assert forbidden not in saved_raw
-
-    # Replay when channel disabled -> denied (auth runs BEFORE replay!)
-    store.config["enabled"] = False
-    r_off = await cg_db.execute_session_command(
-        cmd="collect",
-        platform="weixin",
-        platform_user_id="wx_alice@im.wechat",
-        chat_type="dm",
-        chat_address="weixin:@me",
-        scope_key="dm:wx_alice@im.wechat",
-        message_id="r5_collect_mid_1",
-        weixin_account_id=aid,
-        weixin_bot_id="bot-c@im.wechat",
-        weixin_bot_generation=1,
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert r_off["ok"] is False
-    assert r_off["deny_reason"] == "weixin_channel_disabled"
-    store.config["enabled"] = True
-
-    # Replay when member removed -> denied BEFORE replay
-    roster["u-alice"] = "removed"
-    r_rem = await cg_db.execute_session_command(
-        cmd="collect",
-        platform="weixin",
-        platform_user_id="wx_alice@im.wechat",
-        chat_type="dm",
-        chat_address="weixin:@me",
-        scope_key="dm:wx_alice@im.wechat",
-        message_id="r5_collect_mid_1",
-        weixin_account_id=aid,
-        weixin_bot_id="bot-c@im.wechat",
-        weixin_bot_generation=1,
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert r_rem["ok"] is False
-    assert r_rem["deny_reason"] == "member_not_in_roster"
-    roster["u-alice"] = "active"
-
-    # Authorized owner replay returns duplicate=True
-    r_dup = await cg_db.execute_session_command(
-        cmd="collect",
-        platform="weixin",
-        platform_user_id="wx_alice@im.wechat",
-        chat_type="dm",
-        chat_address="weixin:@me",
-        scope_key="dm:wx_alice@im.wechat",
-        message_id="r5_collect_mid_1",
-        weixin_account_id=aid,
-        weixin_bot_id="bot-c@im.wechat",
-        weixin_bot_generation=1,
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert r_dup["ok"] is True
-    assert r_dup["duplicate"] is True
 
 
 @pytest.mark.asyncio
@@ -6245,295 +5173,6 @@ async def test_r8_batch_b_items_1_2_3_4_7_8_10_contracts(
     assert r_i3_conflict["deny_reason"] == "ilink_user_conflict_auto_unbound"
     assert aid_bob not in store.accounts
 
-    # --- Items 2, 7, 10: Collect buffer GET status, cancelled attachment ok=True, /done flushed_inbound ---
-    store.user_settings["u-alice"] = {
-        "user_id": "u-alice",
-        "version": 1,
-        "settings": {
-            "apps": {
-                "weixin": {
-                    "preferred": "weixin:@me",
-                    "chats": {"weixin:@me": {"workspace_id": ws_id}},
-                    "automation_output": {},
-                    "agent_messages": {"enabled": True, "allowed": ["weixin:@me"]},
-                }
-            }
-        },
-    }
-    r_col = await cg_db.execute_session_command(
-        cmd="collect",
-        platform="weixin",
-        platform_user_id="wx_alice_r8@im.wechat",
-        chat_type="dm",
-        chat_address="weixin:@me",
-        scope_key="dm:wx_alice_r8@im.wechat",
-        message_id="r8_col_start",
-        weixin_account_id=aid,
-        weixin_bot_id="bot-r8@im.wechat",
-        weixin_bot_generation=2,
-        weixin_context_token="ctx-col-1",
-        command_arg="整理要点",
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert r_col["ok"] is True
-    bid = r_col["collect_buffer_id"]
-
-    # Append 1 item with attachment
-    r_item = await cg_db.register_and_resolve_inbound(
-        platform="weixin",
-        platform_user_id="wx_alice_r8@im.wechat",
-        chat_type="dm",
-        chat_address="weixin:@me",
-        thread_scope_key="dm:wx_alice_r8@im.wechat",
-        message_id="r8_col_item_1",
-        raw_payload={"text": "财报摘录", "platform_user_id": "wx_alice_r8@im.wechat"},
-        weixin_account_id=aid,
-        weixin_bot_id="bot-r8@im.wechat",
-        weixin_bot_generation=2,
-        weixin_context_token="ctx-col-2",
-        weixin_media_meta=[{"type": "file", "filename": "q3.pdf"}],
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert r_item["collection_mode"] == "appended"
-    assert r_item["collect_buffer_id"] == bid
-
-    # Item 10: GET /internal/weixin/collect-buffers/{buffer_id} returns collecting & item_upload_status
-    r_buf_st = client.get(
-        f"/api/v1/dalton/channels/internal/weixin/collect-buffers/{bid}?message_id=r8_col_item_1",
-        headers=svc_read_hdrs,
-    )
-    assert r_buf_st.status_code == 200, r_buf_st.text
-    buf_json = r_buf_st.json()
-    assert buf_json["ok"] is True
-    assert buf_json["status"] == "collecting"
-    assert buf_json["item_upload_status"] == "pending_upload"
-
-    # Unknown buffer -> 404
-    r_buf_404 = client.get(
-        f"/api/v1/dalton/channels/internal/weixin/collect-buffers/{uuid4()}",
-        headers=svc_read_hdrs,
-    )
-    assert r_buf_404.status_code == 404
-
-    # Register attachment -> ready, then /done -> verify Item 7 flushed_inbound.raw_payload
-    r_att_ok = client.post(
-        f"/api/v1/dalton/channels/internal/weixin/collect-buffers/{bid}/items/r8_col_item_1/attachments",
-        headers=svc_hdrs,
-        json={"uploaded_attachments": [{"file_name": "q3.pdf", "workspace_path": "/workspace/q3.pdf"}]},
-    )
-    assert r_att_ok.status_code == 200
-    assert r_att_ok.json()["upload_status"] == "ready"
-
-    r_done = await cg_db.execute_session_command(
-        cmd="done",
-        platform="weixin",
-        platform_user_id="wx_alice_r8@im.wechat",
-        chat_type="dm",
-        chat_address="weixin:@me",
-        scope_key="dm:wx_alice_r8@im.wechat",
-        message_id="r8_col_done",
-        weixin_account_id=aid,
-        weixin_bot_id="bot-r8@im.wechat",
-        weixin_bot_generation=2,
-        weixin_context_token="ctx-col-3",
-        command_arg="总结三条结论",
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert r_done["ok"] is True
-    flushed = r_done["flushed_inbound"]
-    assert flushed is not None
-    assert flushed["raw_payload"]["platform_user_id"] == "wx_alice_r8@im.wechat"
-    assert "财报摘录" in flushed["raw_payload"]["text"]
-    assert "总结三条结论" in flushed["raw_payload"]["text"]
-    assert flushed["raw_payload"]["synthetic_collect"] is True
-
-    # Start second collect buffer, cancel it, verify GET status="cancelled" and attachment returns ok=True without writing collect_items
-    r_col2 = await cg_db.execute_session_command(
-        cmd="collect",
-        platform="weixin",
-        platform_user_id="wx_alice_r8@im.wechat",
-        chat_type="dm",
-        chat_address="weixin:@me",
-        scope_key="dm:wx_alice_r8@im.wechat",
-        message_id="r8_col2_start",
-        weixin_account_id=aid,
-        weixin_bot_id="bot-r8@im.wechat",
-        weixin_bot_generation=2,
-        weixin_context_token="ctx-col2-1",
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    bid2 = r_col2["collect_buffer_id"]
-    await cg_db.register_and_resolve_inbound(
-        platform="weixin",
-        platform_user_id="wx_alice_r8@im.wechat",
-        chat_type="dm",
-        chat_address="weixin:@me",
-        thread_scope_key="dm:wx_alice_r8@im.wechat",
-        message_id="r8_col2_item",
-        raw_payload={"text": "待取消附件", "platform_user_id": "wx_alice_r8@im.wechat"},
-        weixin_account_id=aid,
-        weixin_bot_id="bot-r8@im.wechat",
-        weixin_bot_generation=2,
-        weixin_context_token="ctx-col2-2",
-        weixin_media_meta=[{"type": "file", "filename": "cancel.pdf"}],
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    await cg_db.execute_session_command(
-        cmd="cancel",
-        platform="weixin",
-        platform_user_id="wx_alice_r8@im.wechat",
-        chat_type="dm",
-        chat_address="weixin:@me",
-        scope_key="dm:wx_alice_r8@im.wechat",
-        message_id="r8_col2_cancel",
-        weixin_account_id=aid,
-        weixin_bot_id="bot-r8@im.wechat",
-        weixin_bot_generation=2,
-        weixin_context_token="ctx-col2-3",
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    r_buf2 = client.get(
-        f"/api/v1/dalton/channels/internal/weixin/collect-buffers/{bid2}",
-        headers=svc_read_hdrs,
-    )
-    assert r_buf2.status_code == 200
-    assert r_buf2.json()["status"] == "cancelled"
-
-    r_att_c = client.post(
-        f"/api/v1/dalton/channels/internal/weixin/collect-buffers/{bid2}/items/r8_col2_item/attachments",
-        headers=svc_hdrs,
-        json={"uploaded_attachments": [{"file_name": "cancel.pdf"}]},
-    )
-    assert r_att_c.status_code == 200
-    assert r_att_c.json()["ok"] is True
-    assert r_att_c.json()["upload_status"] == "cancelled"
-    # collect_items must NOT have been mutated with uploaded_attachments
-    assert store.collect_items[(bid2, "r8_col2_item")]["uploaded_attachments"] == []
-
-
-@pytest.mark.asyncio
-async def test_r8_collect_buffer_duplicate_i1_returns_collection_mode_appended(
-    wx_env: dict[str, Any],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Batch B Item 6: Duplicate I-1 registration of a collected message returns collection_mode='appended'."""
-    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
-    aid = str(uuid4())
-    from src.server.database.home_workspace import get_home_workspace_id
-
-    ws_id = get_home_workspace_id("u-alice")
-    store.workspaces[ws_id] = {"workspace_id": ws_id, "user_id": "u-alice", "name": "Research", "status": "running"}
-    monkeypatch.setattr(
-        workspace_db,
-        "get_or_create_home_workspace",
-        create_autospec(
-            workspace_db.get_or_create_home_workspace,
-            return_value={"workspace_id": ws_id},
-        ),
-    )
-    monkeypatch.setattr(
-        cg_db,
-        "_verify_workspace_write_permission",
-        create_autospec(cg_db._verify_workspace_write_permission, return_value=(True, None, {"workspace_id": ws_id})),
-    )
-    store.accounts[aid] = {
-        "account_id": aid,
-        "user_id": "u-alice",
-        "ilink_bot_id": "bot-dup@im.wechat",
-        "encrypted_bot_token": "tok-dup",
-        "bot_token": "tok-dup",
-        "base_url": "https://ilinkai.weixin.qq.com",
-        "cdn_base_url": "https://novac2c.cdn.weixin.qq.com/c2c",
-        "get_updates_buf": "",
-        "status": "active",
-        "prev_status": None,
-        "disabled_reason": None,
-        "bot_generation": 1,
-        "prev_bot_generation": None,
-        "bot_generation_updated_at": None,
-        "ilink_user_id": "wx_dup@im.wechat",
-        "prev_ilink_user_id": None,
-        "ilink_username": "Alice",
-        "last_inbound_at": None,
-        "created_at": store.now,
-        "updated_at": store.now,
-    }
-    store.user_settings["u-alice"] = {
-        "user_id": "u-alice",
-        "version": 1,
-        "settings": {
-            "apps": {
-                "weixin": {
-                    "preferred": "weixin:@me",
-                    "chats": {"weixin:@me": {"workspace_id": ws_id}},
-                    "automation_output": {},
-                    "agent_messages": {"enabled": True, "allowed": ["weixin:@me"]},
-                }
-            }
-        },
-    }
-    r_col = await cg_db.execute_session_command(
-        cmd="collect",
-        platform="weixin",
-        platform_user_id="wx_dup@im.wechat",
-        chat_type="dm",
-        chat_address="weixin:@me",
-        scope_key="dm:wx_dup@im.wechat",
-        message_id="r8_dup_collect_cmd",
-        weixin_account_id=aid,
-        weixin_bot_id="bot-dup@im.wechat",
-        weixin_bot_generation=1,
-        weixin_context_token="ctx-dup-0",
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    bid = r_col["collect_buffer_id"]
-
-    # First I-1 append (text-only -> inbound status is 'ignored' + collect_buffer_id=bid)
-    first = await cg_db.register_and_resolve_inbound(
-        platform="weixin",
-        platform_user_id="wx_dup@im.wechat",
-        chat_type="dm",
-        chat_address="weixin:@me",
-        thread_scope_key="dm:wx_dup@im.wechat",
-        message_id="r8_dup_item_1",
-        raw_payload={"text": "重复投递的消息", "platform_user_id": "wx_dup@im.wechat"},
-        weixin_account_id=aid,
-        weixin_bot_id="bot-dup@im.wechat",
-        weixin_bot_generation=1,
-        weixin_context_token="ctx-dup-1",
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert first["collection_mode"] == "appended"
-    assert first["collect_buffer_id"] == bid
-
-    # Duplicate I-1 replay of the same message_id MUST ALSO include collection_mode="appended"
-    replay = await cg_db.register_and_resolve_inbound(
-        platform="weixin",
-        platform_user_id="wx_dup@im.wechat",
-        chat_type="dm",
-        chat_address="weixin:@me",
-        thread_scope_key="dm:wx_dup@im.wechat",
-        message_id="r8_dup_item_1",
-        raw_payload={"text": "重复投递的消息", "platform_user_id": "wx_dup@im.wechat"},
-        weixin_account_id=aid,
-        weixin_bot_id="bot-dup@im.wechat",
-        weixin_bot_generation=1,
-        weixin_context_token="ctx-dup-1",
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert replay["collection_mode"] == "appended"
-    assert replay["collect_buffer_id"] == bid
-    assert replay["collect_buffer_status"] == "collecting"
-
 
 @pytest.mark.asyncio
 async def test_r10_d049_migration_upgrade_downgrade_no_deferred_columns() -> None:
@@ -6998,85 +5637,6 @@ async def test_r10_i7_delivery_status_transition_table_and_discord_unknown_guard
 
 
 @pytest.mark.asyncio
-async def test_r10_collect_done_cancel_help_reject_other_sender_without_command_result(
-    wx_env: dict[str, Any],
-) -> None:
-    """R10 Codex #2: /collect, /done, /cancel, /help check account/user/sender on ANY existing
-    (platform='weixin', message_id) row even when command_result is None, never overwriting it."""
-    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
-    aid_a, aid_b = str(uuid4()), str(uuid4())
-    for aid, uid, bot, wxu in (
-        (aid_a, "u-alice", "bot-col-a@im.wechat", "wx_col_a@im.wechat"),
-        (aid_b, "u-bob", "bot-col-b@im.wechat", "wx_col_b@im.wechat"),
-    ):
-        store.accounts[aid] = {
-            "account_id": aid,
-            "user_id": uid,
-            "ilink_bot_id": bot,
-            "encrypted_bot_token": f"tok-{uid}",
-            "bot_token": f"tok-{uid}",
-            "base_url": "https://ilinkai.weixin.qq.com",
-            "cdn_base_url": "https://novac2c.cdn.weixin.qq.com/c2c",
-            "get_updates_buf": "",
-            "status": "active",
-            "prev_status": None,
-            "disabled_reason": None,
-            "bot_generation": 1,
-            "prev_bot_generation": None,
-            "bot_generation_updated_at": None,
-            "ilink_user_id": wxu,
-            "prev_ilink_user_id": None,
-            "ilink_username": uid,
-            "last_inbound_at": None,
-            "created_at": store.now,
-            "updated_at": store.now,
-        }
-
-    # Alice has a regular inbound message row (command_result is None!)
-    mid = "wx_alice_regular_msg_r10"
-    store.inbound_events[("weixin", mid)] = {
-        "platform": "weixin",
-        "message_id": mid,
-        "request_key": str(uuid4()),
-        "dalton_user_id": "u-alice",
-        "chat_type": "dm",
-        "chat_address": "weixin:@me",
-        "thread_scope_key": "dm:wx_col_a@im.wechat",
-        "status": "pending",
-        "command_reply_pending": False,
-        "command_effect_status": None,
-        "command_result": None,
-        "raw_payload": {"platform_user_id": "wx_col_a@im.wechat", "text": "alice msg"},
-        "weixin_account_id": aid_a,
-        "weixin_context_bot_id": "bot-col-a@im.wechat",
-        "weixin_context_bot_generation": 1,
-    }
-
-    for cmd in ("collect", "done", "cancel", "help"):
-        res = await cg_db.execute_session_command(
-            cmd=cmd,
-            platform="weixin",
-            platform_user_id="wx_col_b@im.wechat",
-            chat_type="dm",
-            chat_address="weixin:@me",
-            scope_key="dm:wx_col_b@im.wechat",
-            message_id=mid,
-            weixin_account_id=aid_b,
-            weixin_bot_id="bot-col-b@im.wechat",
-            weixin_bot_generation=1,
-            gateway_epoch=1,
-            require_gateway_epoch=True,
-        )
-        assert res["ok"] is False, f"/{cmd} must reject collision on Alice's inbound row"
-        assert res["deny_reason"] == "weixin_message_id_account_mismatch"
-        row = store.inbound_events[("weixin", mid)]
-        assert row["status"] == "pending"
-        assert row["command_result"] is None
-        assert row["command_reply_pending"] is False
-        assert row["dalton_user_id"] == "u-alice"
-
-
-@pytest.mark.asyncio
 async def test_r10_inbound_progress_derives_platform_from_conversation_threads(
     wx_env: dict[str, Any],
 ) -> None:
@@ -7232,144 +5792,6 @@ async def test_r9_i3_sender_check_before_invalid_inbound_and_missing_puid_no_ove
 
 
 @pytest.mark.asyncio
-async def test_r9_collect_too_late_unified_status_and_dup_media_meta_preserved(
-    wx_env: dict[str, Any],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """R9 Decisions #9 & #11:
-    - GET /internal/weixin/collect-buffers/{buffer_id} returns unified `upload_status` (and `item_upload_status`);
-    - POST attachments after buffer is `done` (or `flushing` on settled item) returns {ok: True, upload_status: "too_late"} without writing collect_items;
-    - Duplicate append_weixin_collect_item_in_tx does not overwrite encrypted_weixin_media_meta.
-    """
-    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
-    client: TestClient = wx_env["client"]
-    svc_hdrs = {"X-Service-Token": SERVICE_TOKEN, "X-Gateway-Epoch": "1"}
-    svc_read_hdrs = {"X-Service-Token": SERVICE_TOKEN}
-
-    aid = str(uuid4())
-    from src.server.database.home_workspace import get_home_workspace_id
-
-    ws_id = get_home_workspace_id("u-alice")
-    store.workspaces[ws_id] = {"workspace_id": ws_id, "user_id": "u-alice", "name": "Home", "status": "running"}
-    monkeypatch.setattr(
-        workspace_db,
-        "get_or_create_home_workspace",
-        create_autospec(workspace_db.get_or_create_home_workspace, return_value={"workspace_id": ws_id}),
-    )
-    monkeypatch.setattr(
-        cg_db,
-        "_verify_workspace_write_permission",
-        create_autospec(cg_db._verify_workspace_write_permission, return_value=(True, None, {"workspace_id": ws_id})),
-    )
-    store.accounts[aid] = {
-        "account_id": aid,
-        "user_id": "u-alice",
-        "ilink_bot_id": "bot-r9c@im.wechat",
-        "encrypted_bot_token": "tok-r9c",
-        "bot_token": "tok-r9c",
-        "base_url": "https://ilinkai.weixin.qq.com",
-        "cdn_base_url": "https://novac2c.cdn.weixin.qq.com/c2c",
-        "get_updates_buf": "",
-        "status": "active",
-        "prev_status": None,
-        "disabled_reason": None,
-        "bot_generation": 1,
-        "prev_bot_generation": None,
-        "bot_generation_updated_at": None,
-        "ilink_user_id": "wx_r9c@im.wechat",
-        "prev_ilink_user_id": None,
-        "ilink_username": "Alice",
-        "last_inbound_at": None,
-        "created_at": store.now,
-        "updated_at": store.now,
-    }
-    r_col = await cg_db.execute_session_command(
-        cmd="collect",
-        platform="weixin",
-        platform_user_id="wx_r9c@im.wechat",
-        chat_type="dm",
-        chat_address="weixin:@me",
-        scope_key="dm:wx_r9c@im.wechat",
-        message_id="r9c_start",
-        weixin_account_id=aid,
-        weixin_bot_id="bot-r9c@im.wechat",
-        weixin_bot_generation=1,
-        weixin_context_token="ctx-r9c-0",
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    bid = r_col["collect_buffer_id"]
-
-    await cg_db.register_and_resolve_inbound(
-        platform="weixin",
-        platform_user_id="wx_r9c@im.wechat",
-        chat_type="dm",
-        chat_address="weixin:@me",
-        thread_scope_key="dm:wx_r9c@im.wechat",
-        message_id="r9c_it1",
-        raw_payload={"text": "file1", "platform_user_id": "wx_r9c@im.wechat"},
-        weixin_account_id=aid,
-        weixin_bot_id="bot-r9c@im.wechat",
-        weixin_bot_generation=1,
-        weixin_context_token="ctx-r9c-1",
-        weixin_media_meta=[{"type": "file", "filename": "orig.pdf", "aes_key": "k-orig"}],
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    orig_meta = store.inbound_events[("weixin", "r9c_it1")]["encrypted_weixin_media_meta"]
-    assert "k-orig" in str(orig_meta)
-
-    # Direct duplicate append MUST NOT overwrite encrypted_weixin_media_meta
-    cur = create_autospec(psycopg.AsyncCursor, instance=True)
-
-    async def _exec(sql: str, params: Any = None) -> None:
-        cur._last = await store.handle_sql(sql, params)
-
-    async def _fetchone() -> Any:
-        rows = getattr(cur, "_last", [])
-        return rows[0] if rows else None
-
-    cur.execute.side_effect = _exec
-    cur.fetchone.side_effect = _fetchone
-    await wx_db.append_weixin_collect_item_in_tx(
-        cur,
-        account_id=aid,
-        bot_generation=1,
-        dalton_user_id="u-alice",
-        scope_key="dm:wx_r9c@im.wechat",
-        session_generation=1,
-        message_id="r9c_it1",
-        text_content="file1",
-        protocol_seq=None,
-        platform_time_ms=None,
-        weixin_media_meta=[{"type": "file", "filename": "spoof.pdf", "aes_key": "k-spoof"}],
-        verify_workspace_write_fn=cg_db._verify_workspace_write_permission,
-    )
-    assert store.inbound_events[("weixin", "r9c_it1")]["encrypted_weixin_media_meta"] == orig_meta
-
-    # Unified upload_status field on GET collect buffer status
-    r_st = client.get(
-        f"/api/v1/dalton/channels/internal/weixin/collect-buffers/{bid}?message_id=r9c_it1",
-        headers=svc_read_hdrs,
-    )
-    assert r_st.status_code == 200
-    assert r_st.json()["upload_status"] == "pending_upload"
-    assert r_st.json()["item_upload_status"] == "pending_upload"
-
-    # Mark buffer done -> late attachment registration returns too_late without mutating collect_items
-    store.collect_buffers[bid]["status"] = "done"
-    r_late = client.post(
-        f"/api/v1/dalton/channels/internal/weixin/collect-buffers/{bid}/items/r9c_it1/attachments",
-        headers=svc_hdrs,
-        json={"uploaded_attachments": [{"file_name": "orig.pdf"}]},
-    )
-    assert r_late.status_code == 200, r_late.text
-    assert r_late.json()["ok"] is True
-    assert r_late.json()["upload_status"] == "too_late"
-    assert store.collect_items[(bid, "r9c_it1")]["uploaded_attachments"] == []
-
-
-@pytest.mark.asyncio
 async def test_r9_pending_verification_admin_pause_rolls_back_and_legacy_dm_address_normalization(
     wx_env: dict[str, Any],
 ) -> None:
@@ -7424,6 +5846,262 @@ async def test_r9_pending_verification_admin_pause_rolls_back_and_legacy_dm_addr
     assert "one_time_weixin_reply" not in res_paused
     assert store.accounts[aid]["status"] == "pending_verification"
     assert store.accounts[aid]["ilink_user_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_r11_collect_mode_removed_routes_404_and_commands_rejected(
+    wx_env: dict[str, Any],
+) -> None:
+    """R11: Collect routes return 404, /collect|/done|/cancel|/help return 400, and startup recovery has no flushing_collect_buffers."""
+    client: TestClient = wx_env["client"]
+    hdrs = {"X-Service-Token": SERVICE_TOKEN, "X-Gateway-Epoch": "1"}
+    bid = str(uuid4())
+
+    assert (
+        client.get(
+            f"/api/v1/dalton/channels/internal/weixin/collect-buffers/{bid}",
+            headers={"X-Service-Token": SERVICE_TOKEN},
+        ).status_code
+        == 404
+    )
+    assert (
+        client.post(
+            f"/api/v1/dalton/channels/internal/weixin/collect-buffers/{bid}/items/m1/attachments",
+            headers=hdrs,
+            json={"uploaded_attachments": []},
+        ).status_code
+        == 404
+    )
+    assert (
+        client.post(
+            f"/api/v1/dalton/channels/internal/weixin/collect-buffers/{bid}/finalize",
+            headers=hdrs,
+        ).status_code
+        == 404
+    )
+    for removed_cmd in ("collect", "done", "cancel", "help", "收集", "完成", "取消"):
+        r_cmd = client.post(
+            "/api/v1/dalton/channels/internal/session/command",
+            headers=hdrs,
+            json={
+                "cmd": removed_cmd,
+                "platform": "weixin",
+                "platform_user_id": "wx_alice@im.wechat",
+                "scope_key": "dm:wx_alice@im.wechat",
+            },
+        )
+        assert r_cmd.status_code == 400, f"cmd={removed_cmd}: {r_cmd.status_code} {r_cmd.text}"
+
+    r_rec = client.get(
+        "/api/v1/dalton/channels/internal/recover?mode=startup",
+        headers=hdrs,
+    )
+    assert r_rec.status_code == 200
+    assert "flushing_collect_buffers" not in r_rec.json()
+
+
+@pytest.mark.asyncio
+async def test_r11_i7_unrelated_feishu_inbound_does_not_mask_weixin_thread_and_interrupt_locks_watch(
+    wx_env: dict[str, Any],
+) -> None:
+    """R11 (Codex #1 / Grok med):
+    - An unrelated Feishu (platform, message_id) passed alongside a Weixin conversation_threads
+      thread_watch MUST NOT mask the Weixin platform (still rejected 409);
+    - Interrupt-only session_interrupt_update omitting platform locks thread_watches FOR UPDATE
+      and enforces Weixin epoch (409 without epoch).
+    """
+    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
+    client: TestClient = wx_env["client"]
+    no_ep = {"X-Service-Token": SERVICE_TOKEN}
+    valid_ep = {"X-Service-Token": SERVICE_TOKEN, "X-Gateway-Epoch": "1"}
+
+    tid_wx = str(uuid4())
+    store.conversation_threads[tid_wx] = {
+        "conversation_thread_id": tid_wx,
+        "platform": "weixin",
+    }
+    store.inbound_events[("feishu", "om_unrelated_feishu")] = {
+        "platform": "feishu",
+        "message_id": "om_unrelated_feishu",
+        "dalton_user_id": "u-alice",
+        "thread_id": None,
+        "run_id": None,
+        "status": "completed",
+    }
+
+    # 1a. Without epoch + unrelated Feishu (platform, message_id) -> 409 stale_gateway_epoch
+    r_no_ep = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=no_ep,
+        json={
+            "platform": "feishu",
+            "message_id": "om_unrelated_feishu",
+            "thread_watch": {
+                "thread_id": tid_wx,
+                "dalton_user_id": "u-alice",
+                "platform": "feishu",
+                "target_address": "feishu:@me",
+                "scope_key": "dm:ou_spoof",
+                "generation": 1,
+                "watch_active": True,
+            },
+        },
+    )
+    assert r_no_ep.status_code == 409
+    assert r_no_ep.json()["code"] == "stale_gateway_epoch"
+    assert tid_wx not in store.thread_watches
+
+    # 1b. With valid epoch + unrelated Feishu (platform, message_id) -> 409 platform_mismatch
+    r_mm = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=valid_ep,
+        json={
+            "platform": "feishu",
+            "message_id": "om_unrelated_feishu",
+            "thread_watch": {
+                "thread_id": tid_wx,
+                "dalton_user_id": "u-alice",
+                "platform": "feishu",
+                "target_address": "feishu:@me",
+                "scope_key": "dm:ou_spoof",
+                "generation": 1,
+                "watch_active": True,
+            },
+        },
+    )
+    assert r_mm.status_code == 409
+    assert r_mm.json()["code"] == "platform_mismatch"
+    assert tid_wx not in store.thread_watches
+
+    # 2. Interrupt-only session_interrupt_update omitting platform on an existing Weixin watch -> 409 without epoch
+    tid_w_int = str(uuid4())
+    store.thread_watches[tid_w_int] = {
+        "thread_id": tid_w_int,
+        "dalton_user_id": "u-alice",
+        "platform": "weixin",
+        "target_address": "weixin:@me",
+        "scope_key": "dm:wx_alice",
+        "generation": 1,
+        "watch_active": True,
+        "pending_interrupt": None,
+    }
+    r_int = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=no_ep,
+        json={
+            "session_interrupt_update": {
+                "thread_id": tid_w_int,
+                "pending_interrupt": {"q": "spoofed"},
+            }
+        },
+    )
+    assert r_int.status_code == 409
+    assert r_int.json()["code"] == "stale_gateway_epoch"
+    assert store.thread_watches[tid_w_int]["pending_interrupt"] is None
+
+
+@pytest.mark.asyncio
+async def test_r11_discord_unknown_error_code_bypass_blocked(
+    wx_env: dict[str, Any],
+) -> None:
+    """R11 (Codex #3): Exact 3-request attack trying to overwrite error_code='gateway_restarted'
+    on a Discord unknown + dispatching + send_timeout row MUST fail with 409 at every step."""
+    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
+    client: TestClient = wx_env["client"]
+    no_ep = {"X-Service-Token": SERVICE_TOKEN}
+
+    dk = "dlv-dc-r11-attack"
+    store.deliveries[dk] = {
+        "delivery_key": dk,
+        "kind": "agent_send",
+        "user_id": "u-alice",
+        "platform": "discord",
+        "target_address": "discord:@me",
+        "status": "unknown",
+        "delivery_attempt": 1,
+        "error_code": "send_timeout",
+        "discord_body_phase": "dispatching",
+        "source_scope_key": None,
+        "source_generation": None,
+        "activity_origin": "none",
+    }
+
+    # Req 1: direct unknown -> failed rejected 409
+    r1 = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/progress",
+        headers=no_ep,
+        json={"delivery_key": dk, "status": "failed", "delivery_attempt": 1},
+    )
+    assert r1.status_code == 409
+
+    # Req 2: omitted status + error_code='gateway_restarted' MUST be rejected 409 without changing error_code
+    r2 = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/progress",
+        headers=no_ep,
+        json={"delivery_key": dk, "error_code": "gateway_restarted", "delivery_attempt": 1},
+    )
+    assert r2.status_code == 409
+    assert store.deliveries[dk]["error_code"] == "send_timeout"
+
+    # Req 2b: omitted status + any different error_code on unknown row also rejected 409
+    r2b = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/progress",
+        headers=no_ep,
+        json={"delivery_key": dk, "error_code": "other_error", "delivery_attempt": 1},
+    )
+    assert r2b.status_code == 409
+    assert store.deliveries[dk]["error_code"] == "send_timeout"
+
+    # Req 3: unknown -> failed STILL rejected 409
+    r3 = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/progress",
+        headers=no_ep,
+        json={"delivery_key": dk, "status": "failed", "delivery_attempt": 1},
+    )
+    assert r3.status_code == 409
+    assert store.deliveries[dk]["status"] == "unknown"
+    assert store.deliveries[dk]["error_code"] == "send_timeout"
+
+    # Req 4: in_flight Discord row also cannot forge error_code='gateway_restarted' via I-7
+    dk_inf = "dlv-dc-r11-in-flight"
+    store.deliveries[dk_inf] = {
+        "delivery_key": dk_inf,
+        "kind": "agent_send",
+        "user_id": "u-alice",
+        "platform": "discord",
+        "target_address": "discord:@me",
+        "status": "in_flight",
+        "delivery_attempt": 1,
+        "error_code": None,
+        "discord_body_phase": "dispatching",
+        "source_scope_key": None,
+        "source_generation": None,
+        "activity_origin": "none",
+    }
+    r4 = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/progress",
+        headers=no_ep,
+        json={
+            "delivery_key": dk_inf,
+            "status": "unknown",
+            "error_code": "gateway_restarted",
+            "delivery_attempt": 1,
+        },
+    )
+    assert r4.status_code == 409
+    assert store.deliveries[dk_inf]["status"] == "in_flight"
+    assert store.deliveries[dk_inf]["error_code"] is None
+
+
+def test_r11_backend_caller_timeouts_exceed_weixin_preflight_retry_budget() -> None:
+    """R11 (Codex #4): Backend gateway callers wait strictly longer than the 180s preflight retry cap."""
+    from src.dalton.notify import channel_transport as ct_mod
+    from src.tools.messaging import tools as msg_tools
+
+    assert ct_mod.WEIXIN_PREFLIGHT_RETRY_BUDGET_SECONDS == 180
+    assert ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S > ct_mod.WEIXIN_PREFLIGHT_RETRY_BUDGET_SECONDS
+    assert float(msg_tools._SEND_TIMEOUT.read or 0.0) > ct_mod.WEIXIN_PREFLIGHT_RETRY_BUDGET_SECONDS
+
 
 
 

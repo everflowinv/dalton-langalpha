@@ -150,8 +150,6 @@ class InMemoryChannelStore:
         self.weixin_account_tokens: dict[tuple[str, int, str], dict[str, Any]] = {}
         self.weixin_login_sessions: dict[str, dict[str, Any]] = {}
         self.weixin_audit_logs: list[dict[str, Any]] = []
-        self.weixin_collect_buffers: dict[str, dict[str, Any]] = {}
-        self.weixin_collect_items: dict[tuple[str, str], dict[str, Any]] = {}
 
     async def handle_sql(self, sql: str, params: Any) -> Any:
         norm = " ".join(sql.split())
@@ -260,10 +258,6 @@ class InMemoryChannelStore:
             self.weixin_login_sessions[str(skey)] = row
             return [dict(row)]
 
-        if "FROM dalton_channel_weixin_collect_buffers" in norm and "SELECT" in norm:
-            return []
-        if "UPDATE dalton_channel_weixin_collect_buffers" in norm:
-            return []
         if "INSERT INTO dalton_channel_weixin_audit_logs" in norm:
             self.weixin_audit_logs.append({"params": params})
             return []
@@ -1719,18 +1713,12 @@ class InMemoryChannelStore:
             return []
 
         if "UPDATE dalton_channel_deliveries SET sent_chunks = %s" in norm:
-            if len(params) == 10:
-                schunks, tchunks, pmids, fstat, dsegs, fresp, st, ecode, emsg, dkey = params
-            else:
-                schunks, tchunks, pmids, fstat, fresp, st, ecode, emsg, dkey = params
-                dsegs = None
+            schunks, tchunks, pmids, fstat, fresp, st, ecode, emsg, dkey = params
             r = self.deliveries[str(dkey)]
             r["sent_chunks"] = int(schunks)
             r["total_chunks"] = int(tchunks)
             r["platform_message_ids"] = pmids.obj if hasattr(pmids, "obj") else pmids
             r["files_status"] = fstat.obj if hasattr(fstat, "obj") else fstat
-            if dsegs is not None:
-                r["delivered_segments"] = dsegs.obj if hasattr(dsegs, "obj") else dsegs
             r["first_response_json"] = (
                 fresp.obj if hasattr(fresp, "obj") else fresp
             )
@@ -1902,8 +1890,7 @@ class InMemoryChannelStore:
 
         if (
             "SELECT * FROM dalton_channel_inbound_events WHERE status IN" in norm
-            or "FROM dalton_channel_inbound_events ie LEFT JOIN dalton_channel_weixin_collect_buffers cb"
-            in norm
+            or "FROM dalton_channel_inbound_events ie WHERE ie.status IN" in norm
         ):
             return [
                 dict(r)

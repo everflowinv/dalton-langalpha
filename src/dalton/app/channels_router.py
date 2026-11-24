@@ -223,12 +223,6 @@ class WeixinLoginSessionPatchRequest(BaseModel):
     ilink_username: str | None = None
 
 
-class WeixinCollectItemAttachmentsRequest(BaseModel):
-    uploaded_attachments: list[Any] = Field(default_factory=list)
-    upload_failed: bool = False
-    error_message: str | None = None
-
-
 class PreflightSendRequest(BaseModel):
     delivery_attempt: int | None = None
     chunk_index: int | None = None
@@ -749,77 +743,6 @@ async def internal_weixin_login_session_patch_endpoint(
         return _handle_structured_http_error(exc)
 
 
-@channels_router.get(
-    "/internal/weixin/collect-buffers/{buffer_id}",
-    dependencies=[
-        Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN)),
-        Depends(require_channel_service_token),
-    ],
-)
-async def internal_weixin_collect_buffer_status_endpoint(
-    buffer_id: str,
-    message_id: str | None = Query(default=None),
-) -> Any:
-    """Read-only collect buffer status check before uploading each attachment."""
-    try:
-        return await wx_db.get_weixin_collect_buffer_status(
-            buffer_id=buffer_id,
-            message_id=message_id,
-        )
-    except HTTPException as exc:
-        return _handle_structured_http_error(exc)
-
-
-@channels_router.post(
-    "/internal/weixin/collect-buffers/{buffer_id}/items/{message_id}/attachments",
-    dependencies=[
-        Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN)),
-        Depends(require_channel_service_token),
-    ],
-)
-async def internal_weixin_collect_item_attachments_endpoint(
-    buffer_id: str,
-    message_id: str,
-    body: WeixinCollectItemAttachmentsRequest,
-    request: Request,
-) -> Any:
-    """Idempotently register uploaded attachments for a collect item (rejects when buffer cancelled)."""
-    try:
-        epoch = _parse_gateway_epoch(request, required=True)
-        return await wx_db.register_collect_item_attachments(
-            buffer_id=buffer_id,
-            message_id=message_id,
-            gateway_epoch=int(epoch or 0),
-            uploaded_attachments=body.uploaded_attachments,
-            upload_failed=body.upload_failed,
-            error_message=body.error_message,
-        )
-    except HTTPException as exc:
-        return _handle_structured_http_error(exc)
-
-
-@channels_router.post(
-    "/internal/weixin/collect-buffers/{buffer_id}/finalize",
-    dependencies=[
-        Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN)),
-        Depends(require_channel_service_token),
-    ],
-)
-async def internal_weixin_collect_buffer_finalize_endpoint(
-    buffer_id: str,
-    request: Request,
-) -> Any:
-    """Finalize a `flushing` collect buffer (lock-free wait <=30s + atomic check & synthetic inbound)."""
-    try:
-        epoch = _parse_gateway_epoch(request, required=True)
-        return await wx_db.finalize_collect_buffer(
-            buffer_id=buffer_id,
-            gateway_epoch=int(epoch or 0),
-        )
-    except HTTPException as exc:
-        return _handle_structured_http_error(exc)
-
-
 @channels_router.post(
     "/internal/deliveries/{delivery_key}/preflight-send",
     dependencies=[Depends(require_channel_service_token)],
@@ -941,7 +864,7 @@ async def internal_session_command_endpoint(
     body: SessionCommandRequest,
     request: Request,
 ) -> Any:
-    """I-3: Execute session commands (`/workspace`, `/main`, `/new`, `/stop`, `/collect`, `/done`, `/cancel`, `/help`)."""
+    """I-3: Execute session commands (`/workspace`, `/main`, `/new`, `/stop`)."""
     require_channel_platform_capability(body.platform)
     eff_uid = _resolve_optional_internal_user_id(
         request,
