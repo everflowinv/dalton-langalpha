@@ -758,6 +758,7 @@ CFG_DOMAIN="$(read_env_file_var "$CANDIDATE_ENV" "DOMAIN" "localhost")"
 CFG_TLS_MODE="$(read_env_file_var "$CANDIDATE_ENV" "DALTON_TLS_MODE" "loopback")"
 CFG_EDGE_PORT="$(read_env_file_var "$CANDIDATE_ENV" "DALTON_EDGE_PORT" "8088")"
 CFG_EDGE_HTTPS_PORT="$(read_env_file_var "$CANDIDATE_ENV" "DALTON_EDGE_HTTPS_PORT" "18443")"
+CFG_EDGE_TLS_BIND="$(read_env_file_var "$CANDIDATE_ENV" "DALTON_EDGE_TLS_BIND" "")"
 CFG_CHAT_BUCKET="$(read_env_file_var "$CANDIDATE_ENV" "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME" "chat-uploads")"
 validate_db_identifiers "$CFG_DB_USER" "$CFG_DB_NAME"
 
@@ -1690,6 +1691,23 @@ resolve_edge_port() {
 PROBE_EDGE_PORT="$(resolve_edge_port 8088 "$CFG_EDGE_PORT")"
 PROBE_HTTPS_PORT="$(resolve_edge_port 443 "$CFG_EDGE_HTTPS_PORT")"
 
+resolve_probe_bind_addr() {
+  local raw="$1"
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+  local inner="${raw#[}"
+  inner="${inner%]}"
+  if [[ -z "$inner" || "$inner" == "0.0.0.0" ]]; then
+    printf '127.0.0.1'
+  elif [[ "$inner" == "::" ]]; then
+    printf '[::1]'
+  elif [[ "$inner" == *:* ]]; then
+    printf '[%s]' "$inner"
+  else
+    printf '%s' "$inner"
+  fi
+}
+
 probe_domain="${CFG_DOMAIN#[}"
 probe_domain="${probe_domain%]}"
 probe_url_host="$probe_domain"
@@ -1698,7 +1716,8 @@ if [[ "$probe_domain" == *:* ]]; then
   probe_url_host="[${probe_domain}]"
   probe_curl_extra=(-g)
 else
-  probe_curl_extra=(--resolve "${probe_url_host}:${PROBE_HTTPS_PORT}:127.0.0.1")
+  probe_resolve_addr="$(resolve_probe_bind_addr "$CFG_EDGE_TLS_BIND")"
+  probe_curl_extra=(--resolve "${probe_url_host}:${PROBE_HTTPS_PORT}:${probe_resolve_addr}")
 fi
 
 edge_ok=0

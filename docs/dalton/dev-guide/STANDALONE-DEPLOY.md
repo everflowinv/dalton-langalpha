@@ -146,12 +146,16 @@ docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -
 
 ### 3.2 内部 CA HTTPS 模式（`internal`）
 
-适用于企业内网域名、局域网 IP 与本机 HTTPS 验证。只在内网解析的域名（包括公网后缀下的内网子域名，如 `dalton.corp.example.com`）请在初始化时显式传入 `--tls-mode internal`。传入企业内网域名或局域网 IP 时，`init.sh` 自动启用本地登录（写入 `DALTON_AUTH_MODE=local`、`VITE_DALTON_AUTH=local`），将 `DALTON_EDGE_TLS_BIND` 设为 `0.0.0.0`（IPv6 设为 `[::]`），并监听 80/443 端口：
+适用于企业内网域名、局域网 IP 与本机 HTTPS 验证。只在内网解析的域名（包括公网后缀下的内网子域名，如 `dalton.corp.example.com`）请在初始化时显式传入 `--tls-mode internal`。传入企业内网域名或局域网 IP 时，`init.sh` 自动启用本地登录（写入 `DALTON_AUTH_MODE=local`、`VITE_DALTON_AUTH=local`），默认将 `DALTON_EDGE_TLS_BIND` 设为 `0.0.0.0`（IPv6 地址字面量设为 `[::]`）并监听 80/443 端口；纯 IPv6 内网使用主机名时，请同时传入 `--bind '[::]'` 并使用 IPv6 叠加文件（`deploy/standalone/docker-compose.tls.ipv6.yml`）：
 
 ```bash
-# 企业内网域名或局域网 IP（显式传入 --tls-mode internal，监听 0.0.0.0:80 与 0.0.0.0:443；IPv6 换用 docker-compose.tls.ipv6.yml）
+# 企业内网域名或 IPv4 局域网 IP（显式传入 --tls-mode internal，监听 0.0.0.0:80 与 0.0.0.0:443）
 bash scripts/standalone/init.sh --domain dalton.corp.example.com --tls-mode internal
 docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d --build
+
+# 纯 IPv6 内网主机名（传入 --bind '[::]'，监听 [::]:80 与 [::]:443，使用 IPv6 叠加文件）
+bash scripts/standalone/init.sh --domain dalton.corp.example.com --tls-mode internal --bind '[::]'
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.ipv6.yml --env-file .env up -d --build
 
 # 本机回环 HTTPS（绑定 127.0.0.1:18080 与 127.0.0.1:18443，HTTP 跳转自动携带 18443 端口并启用 HSTS）
 bash scripts/standalone/init.sh --domain localhost --tls-mode internal
@@ -183,15 +187,15 @@ docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -
 
 公网域名部署可直接启用自动 HTTPS：`init.sh` 自动写入 `DALTON_AUTH_MODE=local`、`VITE_DALTON_AUTH=local`、`DALTON_TLS_MODE=auto`，默认将 `DALTON_EDGE_TLS_BIND` 设为 `0.0.0.0`（监听 80 与 443）：
 
-1. 将目标域名（如 `dalton.example.com`）的 `A` 或 `AAAA` 记录指向服务器公网 IP。同时有 `A` 和 `AAAA` 记录时使用默认的 IPv4 叠加文件（`deploy/standalone/docker-compose.tls.yml`）即可；只有 `AAAA` 记录时，初始化传入 `--bind '[::]'` 并使用 IPv6 叠加文件（`deploy/standalone/docker-compose.tls.ipv6.yml`）。
+1. 为目标域名（如 `dalton.example.com`）配置指向服务器公网 IPv4 的 `A` 记录，并使用默认的 IPv4 叠加文件（`deploy/standalone/docker-compose.tls.yml`）。需要同时提供 IPv4 和 IPv6 访问的场景，在本版本统一按 IPv4 发布（仅配置 `A` 记录并绑定 `0.0.0.0`）。服务器只有 IPv6 地址且域名只有 `AAAA` 记录时，在初始化时传入 `--bind '[::]'` 并使用 IPv6 叠加文件（`deploy/standalone/docker-compose.tls.ipv6.yml`）。
 2. 在云安全组与系统防火墙放行入站 **TCP 80** 与 **TCP 443** 端口，并保持宿主机 80/443 端口空闲。
 3. 初始化并构建启动整套服务，Caddy 通过 ACME 自动签发并续期证书：
    ```bash
-   # 有 A 记录，或同时有 A 与 AAAA 记录（默认 IPv4 叠加文件）
+   # 标准公网部署（配置 A 记录，按 IPv4 绑定 0.0.0.0 并使用默认 IPv4 叠加文件）
    bash scripts/standalone/init.sh --domain dalton.example.com
    docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d --build
 
-   # 只有 AAAA 记录（纯 IPv6 主机：传 --bind '[::]' 并使用 IPv6 叠加文件）
+   # 纯 IPv6 主机（仅配置 AAAA 记录，传 --bind '[::]' 并使用 IPv6 叠加文件）
    bash scripts/standalone/init.sh --domain dalton.example.com --bind '[::]'
    docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.ipv6.yml --env-file .env up -d --build
    ```
@@ -204,18 +208,26 @@ docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -
 
 ### 4.1 启用本地多用户账号模式
 
-如需将已有的本机回环试用实例切换为本地多用户账号模式，在 `.env` 中配置以下参数：
+- **从本机回环试用切到域名 HTTPS 与本地登录（推荐）**：先执行 `init.sh --domain …` 更新域名、TLS 模式、监听地址与本地登录配置，再携带对应的 TLS 叠加文件整套重建并启动服务：
+  ```bash
+  # 示例：公网域名自动 HTTPS（内网域名加 --tls-mode internal；纯 IPv6 主机加 --bind '[::]'）
+  bash scripts/standalone/init.sh --domain dalton.example.com
 
-```dotenv
-DALTON_AUTH_MODE=local
-VITE_DALTON_AUTH=local
-```
+  # IPv4 HTTPS：附加 deploy/standalone/docker-compose.tls.yml
+  docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d --build
 
-修改后带上对应的 TLS 叠加文件构建并启动整套服务（IPv6 部署换用 `deploy/standalone/docker-compose.tls.ipv6.yml`；本机回环 HTTP 仅保留 `docker-compose.yml` 与 `docker-compose.core.yml`）：
-
-```bash
-docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d --build
-```
+  # IPv6 HTTPS：附加 deploy/standalone/docker-compose.tls.ipv6.yml
+  docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.ipv6.yml --env-file .env up -d --build
+  ```
+- **在本机回环 HTTP 模式下单独启用本地登录**：在 `.env` 中写入以下两项，然后使用两个基础编排文件整套重建并启动服务：
+  ```dotenv
+  DALTON_AUTH_MODE=local
+  VITE_DALTON_AUTH=local
+  ```
+  ```bash
+  # 本机回环 HTTP（仅使用 docker-compose.yml 与 docker-compose.core.yml）
+  docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d --build
+  ```
 
 ### 4.2 创建首位管理员
 

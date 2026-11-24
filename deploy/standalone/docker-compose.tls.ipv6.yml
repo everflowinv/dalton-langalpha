@@ -3,9 +3,15 @@
 # DALTON_EDGE_TLS_BIND is written to .env by scripts/standalone/init.sh based on
 # DOMAIN: loopback hosts stay bound to [::1], and non-loopback addresses (such as
 # [::]) are written only when local sign-in (DALTON_AUTH_MODE=local) is enabled.
-# Edge enforces this guard on startup using DALTON_AUTH_MODE and DALTON_PROFILE
-# from `env_file: .env` together with the interpolated bind address below;
-# backend startup repeats the check as a second line of defense.
+# Edge enforces this guard on startup using APP_ENV=core, DALTON_PROFILE=core,
+# and DALTON_AUTH_MODE=${DALTON_AUTH_MODE:-local} from docker-compose.core.yml
+# (edge intentionally omits `env_file: .env` so backend secrets never enter the
+# Caddy container) together with the interpolated bind address below; backend
+# startup repeats the check as a second line of defense.
+# The `!is_core` branch below is retained for parity with backend
+# `validate_dalton_auth_config()` (which scopes the bind guard to core); under
+# docker-compose.core.yml both APP_ENV and DALTON_PROFILE are fixed to `core`,
+# so `.env` cannot bypass the check.
 #
 # Convention: IPv6 addresses in .env use square brackets (e.g. [::1] or [::]) so
 # Docker Compose port strings interpolate directly without adding brackets here.

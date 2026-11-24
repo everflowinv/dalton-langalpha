@@ -275,8 +275,14 @@ services:
     depends_on:
       backend:
         condition: service_healthy
-    env_file: .env
+    # Keep edge free of `env_file: .env` so DB/JWT/bootstrap/BYOK secrets never
+    # enter the Caddy container; pass only the non-secret runtime and bind-guard
+    # values (`APP_ENV` / `DALTON_PROFILE` match backend; `DALTON_AUTH_MODE`
+    # defaults to `local`, matching src/dalton/settings.py:731-739 for core).
     environment:
+      APP_ENV: core
+      DALTON_PROFILE: core
+      DALTON_AUTH_MODE: ${DALTON_AUTH_MODE:-local}
       DOMAIN: ${DALTON_CADDY_HOST:-${DOMAIN:-localhost}}
       DALTON_TLS_MODE: ${DALTON_TLS_MODE:-loopback}
       DALTON_EDGE_HTTPS_PORT: ${DALTON_EDGE_HTTPS_PORT:-18443}

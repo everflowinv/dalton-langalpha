@@ -821,11 +821,29 @@ DOMAIN="$(read_env_file_var "$ENV_FILE" "DOMAIN" "localhost")"
 TLS_MODE="$(read_env_file_var "$ENV_FILE" "DALTON_TLS_MODE" "loopback")"
 EDGE_PORT="$(read_env_file_var "$ENV_FILE" "DALTON_EDGE_PORT" "8088")"
 EDGE_HTTPS_PORT="$(read_env_file_var "$ENV_FILE" "DALTON_EDGE_HTTPS_PORT" "18443")"
+EDGE_TLS_BIND="$(read_env_file_var "$ENV_FILE" "DALTON_EDGE_TLS_BIND" "")"
 
 if ! compose_cmd ps --status running --services | grep -qx "edge"; then
   err "Edge container is not running after upgrade."
   exit 1
 fi
+
+resolve_probe_bind_addr() {
+  local raw="$1"
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+  local inner="${raw#[}"
+  inner="${inner%]}"
+  if [[ -z "$inner" || "$inner" == "0.0.0.0" ]]; then
+    printf '127.0.0.1'
+  elif [[ "$inner" == "::" ]]; then
+    printf '[::1]'
+  elif [[ "$inner" == *:* ]]; then
+    printf '[%s]' "$inner"
+  else
+    printf '%s' "$inner"
+  fi
+}
 
 probe_domain="${DOMAIN#[}"
 probe_domain="${probe_domain%]}"
@@ -835,7 +853,8 @@ if [[ "$probe_domain" == *:* ]]; then
   probe_url_host="[${probe_domain}]"
   probe_curl_extra=(-g)
 else
-  probe_curl_extra=(--resolve "${probe_url_host}:${EDGE_HTTPS_PORT}:127.0.0.1")
+  probe_resolve_addr="$(resolve_probe_bind_addr "$EDGE_TLS_BIND")"
+  probe_curl_extra=(--resolve "${probe_url_host}:${EDGE_HTTPS_PORT}:${probe_resolve_addr}")
 fi
 
 edge_ok=0

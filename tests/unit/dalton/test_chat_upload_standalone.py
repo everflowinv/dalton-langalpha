@@ -5082,7 +5082,10 @@ class TestSandboxNetworkAndInitScript:
             Loader=_ComposeSafeLoader,
         )
         assert "DALTON_EDGE_TLS_BIND" not in core_cfg["services"]["backend"]["environment"]
-        assert core_cfg["services"]["edge"]["env_file"] == ".env"
+        assert "env_file" not in core_cfg["services"]["edge"]
+        assert core_cfg["services"]["edge"]["environment"]["APP_ENV"] == "core"
+        assert core_cfg["services"]["edge"]["environment"]["DALTON_PROFILE"] == "core"
+        assert core_cfg["services"]["edge"]["environment"]["DALTON_AUTH_MODE"] == "${DALTON_AUTH_MODE:-local}"
 
         fake_caddy_bin = tmp_path / "fake-caddy-bin"
         fake_caddy_bin.mkdir()
@@ -5548,3 +5551,432 @@ class TestSandboxNetworkAndInitScript:
         assert "--bind '[::]'" in doc_r16
         assert "--tls-mode internal" in doc_r16
         assert "up -d --build edge backend" not in doc_r16
+
+    def test_b6_r17_edge_env_isolation_and_bind_aware_health_probes(
+        self, tmp_path: Path
+    ) -> None:
+        """Offline checks for B6 r17:
+        1. Merged compose `edge` env never inherits DB/JWT/bootstrap/BYOK secrets, passes all Caddy `{$VAR}`
+           keys plus fixed core profile & core-default auth mode matching backend.
+        2. upgrade.sh and restore.sh derive `curl --resolve` target from `.env` DALTON_EDGE_TLS_BIND
+           (AAAA-only `--bind '[::]'`, specific IPv4/IPv6 bind, 0.0.0.0/empty -> 127.0.0.1, IPv6 literal preserved).
+        3. STANDALONE-DEPLOY.md sections 3.2, 3.4, 4.1 match the r17 guidance.
+        """
+        import json
+        import re
+        import shutil
+        import tarfile
+        import yaml
+
+        class _ComposeSafeLoader(yaml.SafeLoader):
+            pass
+
+        def _passthrough_tag(loader: yaml.SafeLoader, node: yaml.Node) -> Any:
+            if isinstance(node, yaml.MappingNode):
+                return loader.construct_mapping(node)
+            if isinstance(node, yaml.SequenceNode):
+                return loader.construct_sequence(node)
+            return loader.construct_scalar(node)
+
+        _ComposeSafeLoader.add_constructor("!reset", _passthrough_tag)
+        _ComposeSafeLoader.add_constructor("!override", _passthrough_tag)
+
+        def _merge_edge_service(compose_paths: tuple[str, ...]) -> dict[str, Any]:
+            merged_env: dict[str, str] = {}
+            merged_env_files: list[Any] = []
+            merged_cmd: Any = None
+            merged_build_args: dict[str, Any] = {}
+            for rel in compose_paths:
+                cfg = yaml.load(
+                    (REPO_ROOT / rel).read_text(encoding="utf-8"),
+                    Loader=_ComposeSafeLoader,
+                )
+                svc = (cfg.get("services") or {}).get("edge")
+                if not isinstance(svc, dict):
+                    continue
+                if "env_file" in svc and svc["env_file"]:
+                    ef = svc["env_file"]
+                    if isinstance(ef, list):
+                        merged_env_files.extend(ef)
+                    else:
+                        merged_env_files.append(ef)
+                env_block = svc.get("environment")
+                if isinstance(env_block, dict):
+                    for k, v in env_block.items():
+                        merged_env[str(k)] = "" if v is None else str(v)
+                elif isinstance(env_block, list):
+                    for item in env_block:
+                        if "=" in str(item):
+                            k, v = str(item).split("=", 1)
+                            merged_env[k] = v
+                        else:
+                            merged_env[str(item)] = ""
+                if "command" in svc:
+                    merged_cmd = svc["command"]
+                build_cfg = svc.get("build")
+                if isinstance(build_cfg, dict) and isinstance(build_cfg.get("args"), dict):
+                    merged_build_args.update(build_cfg["args"])
+            return {
+                "env_file": merged_env_files,
+                "environment": merged_env,
+                "command": merged_cmd,
+                "build_args": merged_build_args,
+            }
+
+        def _interpolate_compose_val(expr: str, vars_map: dict[str, str]) -> str:
+            # Resolve nested `${VAR:-default}` expressions right-to-left (innermost first)
+            pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-([^{}]*)\}")
+            cur = expr
+            for _ in range(5):
+                nxt = pattern.sub(
+                    lambda m: vars_map.get(m.group(1)) or m.group(2),
+                    cur,
+                )
+                if nxt == cur:
+                    break
+                cur = nxt
+            return cur
+
+        secret_keys = (
+            "DB_PASSWORD",
+            "JWT_SIGNING_SECRET",
+            "BOOTSTRAP_SETUP_TOKEN",
+            "BYOK_ENCRYPTION_KEY",
+        )
+        sample_dotenv = {
+            "DB_PASSWORD": "super-secret-db-password",
+            "JWT_SIGNING_SECRET": "super-secret-jwt-signing-key-at-least-32-bytes!",
+            "BOOTSTRAP_SETUP_TOKEN": "super-secret-bootstrap-token-value",
+            "BYOK_ENCRYPTION_KEY": "super-secret-byok-encryption-key",
+            "DALTON_PROFILE": "everflow",
+            "APP_ENV": "dalton",
+            "DOMAIN": "dalton.example.com",
+            "DALTON_TLS_MODE": "auto",
+            "DALTON_EDGE_HTTPS_PORT": "443",
+        }
+
+        # Collect every `{$VAR}` referenced by Caddyfile and modes/*.caddy
+        caddy_vars: set[str] = set()
+        for caddy_path in [
+            REPO_ROOT / "deploy/standalone/Caddyfile",
+            *(REPO_ROOT / "deploy/standalone/modes").glob("*.caddy"),
+        ]:
+            text = caddy_path.read_text(encoding="utf-8")
+            for m in re.finditer(r"\{\$([A-Za-z_][A-Za-z0-9_]*)(?::[^}]*)?\}", text):
+                caddy_vars.add(m.group(1))
+        assert caddy_vars == {"DOMAIN", "DALTON_TLS_MODE", "DALTON_EDGE_HTTPS_PORT"}
+
+        # --- Case 1: Merged compose edge env never contains backend secrets across all overlays ---
+        for combo in (
+            ("docker-compose.yml", "docker-compose.core.yml"),
+            ("docker-compose.yml", "docker-compose.core.yml", "deploy/standalone/docker-compose.tls.yml"),
+            ("docker-compose.yml", "docker-compose.core.yml", "deploy/standalone/docker-compose.tls.ipv6.yml"),
+            ("docker-compose.yml", "docker-compose.core.yml", "docker-compose.ci.yml"),
+            (
+                "docker-compose.yml",
+                "docker-compose.core.yml",
+                "deploy/standalone/docker-compose.tls.yml",
+                "docker-compose.ci.yml",
+            ),
+        ):
+            merged = _merge_edge_service(combo)
+            assert merged["env_file"] == [], f"{combo}: edge must not attach env_file: {merged['env_file']}"
+            raw_env = merged["environment"]
+            assert raw_env["APP_ENV"] == "core"
+            assert raw_env["DALTON_PROFILE"] == "core"
+            assert raw_env["DALTON_AUTH_MODE"] == "${DALTON_AUTH_MODE:-local}"
+            for cv in caddy_vars:
+                assert cv in raw_env, f"{combo}: edge missing Caddy env var {cv}"
+
+            # Simulate final container env (with no env_file, only merged environment keys enter container)
+            resolved_env = {
+                k: _interpolate_compose_val(v, sample_dotenv)
+                for k, v in raw_env.items()
+            }
+            for secret in secret_keys:
+                assert secret not in raw_env, f"{combo}: edge environment must not define {secret}"
+                assert secret not in resolved_env, f"{combo}: edge container env must not receive {secret}"
+                assert all(secret not in str(v) for v in raw_env.values()), (
+                    f"{combo}: edge environment must not interpolate {secret}"
+                )
+                assert all(secret not in str(v) for v in merged["build_args"].values()), (
+                    f"{combo}: edge build args must not interpolate {secret}"
+                )
+            # Even when .env has DALTON_PROFILE=everflow and omits DALTON_AUTH_MODE,
+            # edge matches core backend: APP_ENV=core, DALTON_PROFILE=core, DALTON_AUTH_MODE=local.
+            assert resolved_env["APP_ENV"] == "core"
+            assert resolved_env["DALTON_PROFILE"] == "core"
+            assert resolved_env["DALTON_AUTH_MODE"] == "local"
+
+        # Verify resolved TLS overlay env feeds edge startup guard identically to backend:
+        # (a) .env sets DALTON_PROFILE=everflow + DALTON_AUTH_MODE=oss, shell sets 0.0.0.0 -> REFUSED
+        # (b) .env omits DALTON_AUTH_MODE, shell sets 0.0.0.0 -> ALLOWED (defaults to local like backend)
+        fake_caddy_bin = tmp_path / "r17-fake-caddy"
+        fake_caddy_bin.mkdir()
+        (fake_caddy_bin / "caddy").write_text('#!/bin/sh\necho "CADDY_OK"\n', encoding="utf-8")
+        (fake_caddy_bin / "caddy").chmod(0o755)
+        caddy_sh_path = f"{fake_caddy_bin}:{os.environ.get('PATH', '')}"
+
+        for overlay_rel, non_lb_bind in (
+            ("deploy/standalone/docker-compose.tls.yml", "0.0.0.0"),
+            ("deploy/standalone/docker-compose.tls.ipv6.yml", "[::]"),
+        ):
+            merged_tls = _merge_edge_service(
+                ("docker-compose.yml", "docker-compose.core.yml", overlay_rel)
+            )
+            sh_script = merged_tls["command"][2].replace("$$", "$")
+
+            env_oss_spoof = {
+                **sample_dotenv,
+                "DALTON_AUTH_MODE": "oss",
+                "DALTON_EDGE_TLS_BIND": non_lb_bind,
+            }
+            resolved_oss = {
+                "PATH": caddy_sh_path,
+                **{k: _interpolate_compose_val(v, env_oss_spoof) for k, v in merged_tls["environment"].items()},
+            }
+            res_refuse = subprocess.run(
+                ["/bin/sh", "-c", sh_script],
+                env=resolved_oss,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_refuse.returncode != 0, (
+                f"[{overlay_rel}] Changing .env DALTON_PROFILE=everflow must not bypass core edge guard"
+            )
+            assert "CADDY_OK" not in res_refuse.stdout
+
+            env_default_auth = {
+                **sample_dotenv,
+                "DALTON_EDGE_TLS_BIND": non_lb_bind,
+            }
+            resolved_default = {
+                "PATH": caddy_sh_path,
+                **{k: _interpolate_compose_val(v, env_default_auth) for k, v in merged_tls["environment"].items()},
+            }
+            res_allow = subprocess.run(
+                ["/bin/sh", "-c", sh_script],
+                env=resolved_default,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_allow.returncode == 0, (
+                f"[{overlay_rel}] Omitting DALTON_AUTH_MODE should default to local like backend: {res_allow.stderr}"
+            )
+            assert "CADDY_OK" in res_allow.stdout
+
+        # --- Case 2: upgrade.sh & restore.sh derive curl --resolve target from DALTON_EDGE_TLS_BIND ---
+        # First verify init.sh --domain dalton.example.com --bind '[::]' produces the AAAA-only .env
+        fake_init_env = self._make_fake_docker_env(tmp_path, "28.0.1")
+        inst_aaaa_init, init_aaaa_sh = self._stage_init_install(tmp_path, "r17-init-aaaa")
+        res_init_aaaa = subprocess.run(
+            [
+                "bash",
+                str(init_aaaa_sh),
+                "--non-interactive",
+                "--skip-sandbox-build",
+                "--domain",
+                "dalton.example.com",
+                "--bind",
+                "[::]",
+            ],
+            env=fake_init_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert res_init_aaaa.returncode == 0, res_init_aaaa.stderr
+        aaaa_init_text = (inst_aaaa_init / ".env").read_text(encoding="utf-8")
+        assert "DALTON_EDGE_TLS_BIND=[::]\n" in aaaa_init_text
+
+        probe_matrix = (
+            # (case_tag, domain, tls_mode, bind_env_line, port_mapping, want_resolve_addr_or_none)
+            ("aaaa-auto", "dalton.example.com", "auto", "DALTON_EDGE_TLS_BIND=[::]\n", "[::]:443", "[::1]"),
+            ("aaaa-internal", "dalton.example.com", "internal", "DALTON_EDGE_TLS_BIND=[::]\n", "[::]:443", "[::1]"),
+            ("specific-ipv4-internal", "dalton.example.com", "internal", "DALTON_EDGE_TLS_BIND=10.20.30.40\n", "10.20.30.40:443", "10.20.30.40"),
+            ("specific-ipv4-auto", "dalton.example.com", "auto", "DALTON_EDGE_TLS_BIND=192.168.50.10\n", "192.168.50.10:443", "192.168.50.10"),
+            ("specific-ipv6", "dalton.example.com", "internal", "DALTON_EDGE_TLS_BIND=[2001:db8::10]\n", "[2001:db8::10]:443", "[2001:db8::10]"),
+            ("wildcard-ipv4", "dalton.example.com", "auto", "DALTON_EDGE_TLS_BIND=0.0.0.0\n", "0.0.0.0:443", "127.0.0.1"),
+            ("empty-bind", "dalton.example.com", "internal", "", "127.0.0.1:443", "127.0.0.1"),
+            ("ipv6-literal", "fd00::1", "internal", "DALTON_EDGE_TLS_BIND=[::]\n", "[::]:443", None),
+        )
+
+        for script_kind in ("upgrade", "restore"):
+            for case_tag, domain_val, tls_mode_val, bind_line, port_map, want_resolve in probe_matrix:
+                case_dir = tmp_path / f"r17-{script_kind}-{case_tag}"
+                case_dir.mkdir()
+                curl_log = case_dir / "curl.log"
+                bin_dir = case_dir / "bin"
+                bin_dir.mkdir()
+                (bin_dir / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+                (bin_dir / "flock").chmod(0o755)
+                (bin_dir / "curl").write_text(
+                    "#!/usr/bin/env bash\n"
+                    f'printf "%s\\n" "$*" >> "{curl_log}"\n'
+                    "exit 0\n",
+                    encoding="utf-8",
+                )
+                (bin_dir / "curl").chmod(0o755)
+                (bin_dir / "docker").write_text(
+                    "#!/usr/bin/env bash\n"
+                    'if [[ "$*" == *" config --format json"* ]]; then echo \'{"services":{"backend":{"environment":{}}}}\'; exit 0; fi\n'
+                    'if [[ "$*" == *" ps --status running --services"* ]]; then printf "postgres\\nbackend\\nedge\\n"; exit 0; fi\n'
+                    f'if [[ "$*" == *" port edge 443"* ]]; then echo "{port_map}"; exit 0; fi\n'
+                    'if [[ "$*" == *" port edge 8088"* ]]; then echo "127.0.0.1:8088"; exit 0; fi\n'
+                    'if [[ "$*" == *"/data/caddy/pki/authorities/local/root.crt"* ]]; then echo "FAKE_CA_CERT"; exit 0; fi\n'
+                    'if [[ "$*" == *"alembic_version_dalton"* ]]; then echo "dalton_head"; exit 0; fi\n'
+                    'if [[ "$*" == *"alembic_version"* ]]; then echo "up_head"; exit 0; fi\n'
+                    'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
+                    'if [[ "$*" == *"FROM pg_database"* ]]; then echo "postgres"; exit 0; fi\n'
+                    'if [[ "$*" == *"pg_class"* ]]; then printf "0\\t0\\t0\\n"; exit 0; fi\n'
+                    'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
+                    'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
+                    'if [[ "$*" == *"image inspect"* ]]; then exit 1; fi\n'
+                    'if [[ "$*" == *"ps -aq"* ]]; then exit 0; fi\n'
+                    "exit 0\n",
+                    encoding="utf-8",
+                )
+                (bin_dir / "docker").chmod(0o755)
+
+                probe_env = os.environ.copy()
+                probe_env["PATH"] = f"{bin_dir}:{probe_env.get('PATH', '')}"
+                proj_p = f"r17-probe-{uuid.uuid4().hex[:8]}"
+                env_body = (
+                    f"COMPOSE_PROJECT_NAME={proj_p}\n"
+                    "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=pg\nDB_NAME=postgres\n"
+                    f"DOMAIN={domain_val}\n"
+                    f"DALTON_TLS_MODE={tls_mode_val}\n"
+                    "DALTON_EDGE_HTTPS_PORT=443\n"
+                    f"{bind_line}"
+                )
+
+                if script_kind == "upgrade":
+                    work_u = case_dir / "work"
+                    rel_u = case_dir / "release"
+                    bak_u = case_dir / "backups"
+                    for d in (work_u / "scripts" / "standalone", rel_u / "scripts" / "standalone", bak_u):
+                        d.mkdir(parents=True, exist_ok=True)
+                    for root_d in (work_u, rel_u):
+                        (root_d / "deploy/standalone").mkdir(parents=True, exist_ok=True)
+                        (root_d / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+                        (root_d / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+                        (root_d / "deploy/standalone/docker-compose.tls.yml").write_text("services: {}\n", encoding="utf-8")
+                        (root_d / "deploy/standalone/docker-compose.tls.ipv6.yml").write_text("services: {}\n", encoding="utf-8")
+                        (root_d / "deploy/standalone/Caddyfile").write_text("# stub\n", encoding="utf-8")
+                        (root_d / "scripts/standalone/migrate.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+                        (root_d / "scripts/standalone/restore.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+                        (root_d / "scripts/standalone/backup.sh").write_text(
+                            "#!/usr/bin/env bash\n"
+                            f'mkdir -p "{bak_u}/dalton-backup-stub"\n'
+                            f'printf "  Backup directory : %s\\n" "{bak_u}/dalton-backup-stub"\n'
+                            "exit 0\n",
+                            encoding="utf-8",
+                        )
+                        (root_d / "scripts/standalone/backup.sh").chmod(0o755)
+                    (work_u / ".env").write_text(env_body, encoding="utf-8")
+                    res_u = subprocess.run(
+                        [
+                            "bash",
+                            str(REPO_ROOT / "scripts/standalone/upgrade.sh"),
+                            "--work-dir",
+                            str(work_u),
+                            "--release-dir",
+                            str(rel_u),
+                            "--backup-dir",
+                            str(bak_u),
+                            "--skip-build",
+                            "--project-name",
+                            proj_p,
+                        ],
+                        env=probe_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    assert res_u.returncode == 0, f"upgrade.sh ({case_tag}): {res_u.stderr}"
+                else:
+                    work_r = case_dir / "work"
+                    bak_r = case_dir / "backup"
+                    (work_r / "deploy/standalone").mkdir(parents=True, exist_ok=True)
+                    bak_r.mkdir()
+                    (work_r / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
+                    (work_r / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+                    (work_r / "deploy/standalone/docker-compose.tls.yml").write_text("services: {}\n", encoding="utf-8")
+                    (work_r / "deploy/standalone/docker-compose.tls.ipv6.yml").write_text("services: {}\n", encoding="utf-8")
+                    (work_r / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
+                    (work_r / ".env").write_text(env_body, encoding="utf-8")
+                    (bak_r / "postgres.dump").write_bytes(b"PGDMP-fake")
+                    with tarfile.open(bak_r / "caddy-data.tar.gz", "w:gz"):
+                        pass
+                    manifest = {
+                        "schema_version": 1,
+                        "compose_project": proj_p,
+                        "db_name": "postgres",
+                        "alembic_upstream": "up_head",
+                        "alembic_dalton": "dalton_head",
+                        "minio": {"included": False, "buckets": []},
+                        "caddy": {"included": False},
+                        "env": {"included": False},
+                    }
+                    (bak_r / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+                    sums_lines = []
+                    for fname in ("postgres.dump", "manifest.json"):
+                        digest = hashlib.sha256((bak_r / fname).read_bytes()).hexdigest()
+                        sums_lines.append(f"{digest}  {fname}")
+                    (bak_r / "SHA256SUMS").write_text("\n".join(sums_lines) + "\n", encoding="utf-8")
+
+                    dir_lock = Path(
+                        f"/tmp/dalton-restore-dir-{hashlib.sha256(str(work_r.resolve()).encode()).hexdigest()[:16]}.lock"
+                    )
+                    proj_lock = Path(f"/tmp/dalton-{proj_p}.restore.lock")
+                    try:
+                        res_r = subprocess.run(
+                            [
+                                "bash",
+                                str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                                "--work-dir",
+                                str(work_r),
+                                "--backup-dir",
+                                str(bak_r),
+                                "--skip-minio",
+                                "--skip-caddy",
+                                "--skip-edge-build",
+                                "--project-name",
+                                proj_p,
+                            ],
+                            env=probe_env,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                        assert res_r.returncode == 0, f"restore.sh ({case_tag}): {res_r.stderr}"
+                    finally:
+                        for lk in (proj_lock, dir_lock):
+                            if lk.is_dir():
+                                shutil.rmtree(lk, ignore_errors=True)
+                            elif lk.exists():
+                                lk.unlink(missing_ok=True)
+
+                curl_calls = curl_log.read_text(encoding="utf-8")
+                if want_resolve is not None:
+                    assert f"--resolve {domain_val}:443:{want_resolve}" in curl_calls, (
+                        f"[{script_kind}/{case_tag}] Expected --resolve {domain_val}:443:{want_resolve}, got: {curl_calls}"
+                    )
+                    assert f"https://{domain_val}:443/api/v1/auth/cli" in curl_calls
+                else:
+                    assert "--resolve" not in curl_calls, (
+                        f"[{script_kind}/{case_tag}] IPv6 literal must omit --resolve: {curl_calls}"
+                    )
+                    assert "-g" in curl_calls and f"https://[{domain_val}]:443/api/v1/auth/cli" in curl_calls
+
+        # --- Case 3: STANDALONE-DEPLOY.md sections 3.2, 3.4, 4.1 checks ---
+        doc_r17 = (REPO_ROOT / "docs/dalton/dev-guide/STANDALONE-DEPLOY.md").read_text(encoding="utf-8")
+        assert "--tls-mode internal --bind '[::]'" in doc_r17
+        assert "按 IPv4 发布" in doc_r17
+        sec_41 = doc_r17.split("### 4.1", 1)[1].split("### 4.2", 1)[0]
+        assert "init.sh --domain" in sec_41
+        assert "-f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d --build" in sec_41
+        assert "-f deploy/standalone/docker-compose.tls.yml --env-file .env up -d --build" in sec_41
+        assert "-f deploy/standalone/docker-compose.tls.ipv6.yml --env-file .env up -d --build" in sec_41
