@@ -34,6 +34,40 @@ export function isStaleGatewayEpochError(
   );
 }
 
+/**
+ * Raised when the local gateway lease is still unexpired (> 0ms remaining)
+ * but within the safety margin (<= 5s) or waiting for a heartbeat refresh.
+ * Callers MUST pause/defer new outbound/poll operations without treating
+ * this as fatal lease loss or exiting the process (Round 3 Decision #1).
+ */
+export class LeaseSafetyMarginPauseError extends Error {
+  readonly code = "gateway_lease_safety_margin";
+  readonly status = 503;
+  readonly retryable = true;
+  readonly remainingMs: number;
+
+  constructor(
+    message = "Gateway lease is within safety margin; pausing new requests until heartbeat refreshes",
+    options?: { remainingMs?: number },
+  ) {
+    super(message);
+    this.name = "LeaseSafetyMarginPauseError";
+    this.remainingMs = Math.max(0, options?.remainingMs ?? 0);
+  }
+}
+
+export function isLeaseSafetyMarginPauseError(
+  err: unknown,
+): err is LeaseSafetyMarginPauseError {
+  return (
+    err instanceof LeaseSafetyMarginPauseError ||
+    (typeof err === "object" &&
+      err !== null &&
+      "code" in err &&
+      (err as { code?: unknown }).code === "gateway_lease_safety_margin")
+  );
+}
+
 export interface GatewayLeaseBackend {
   acquireGatewayLease(req: {
     instance_id: string;
@@ -125,6 +159,7 @@ export class GatewayLeaseManager {
   private leaseLost = false;
   private stopped = false;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private expiryTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatInFlight = false;
 
   constructor(options: GatewayLeaseManagerOptions) {
@@ -163,17 +198,65 @@ export class GatewayLeaseManager {
   }
 
   /**
+   * True when the lease has definitively expired or been lost/stopped (fatal).
+   */
+  isLeaseExpired(nowMs: number = Date.now()): boolean {
+    return (
+      this.stopped ||
+      this.leaseLost ||
+      this.currentEpoch === null ||
+      this.expiresAtMs <= nowMs
+    );
+  }
+
+  /**
+   * True when the lease is NOT yet expired (`expires_at > now`) but remaining TTL is
+   * within the safety margin (`<= 5s`) or the last heartbeat failed transiently.
+   * New requests pause/defer without exiting the process (Round 3 Decision #1).
+   */
+  isInSafetyMargin(nowMs: number = Date.now()): boolean {
+    if (this.isLeaseExpired(nowMs)) {
+      return false;
+    }
+    return !this.lastHeartbeatOk || this.expiresAtMs - nowMs <= this.safetyMarginMs;
+  }
+
+  /**
    * Local double-check before processing a `getupdates` batch or committing side effects (D1 / §3.5):
    * requires an acquired epoch, healthy heartbeat state, and remaining TTL > safety margin (5s).
    */
   isLeaseLocallyValid(nowMs: number = Date.now()): boolean {
-    return (
-      !this.stopped &&
-      !this.leaseLost &&
-      this.currentEpoch !== null &&
-      this.lastHeartbeatOk &&
-      this.expiresAtMs - nowMs > this.safetyMarginMs
-    );
+    return !this.isLeaseExpired(nowMs) && !this.isInSafetyMargin(nowMs);
+  }
+
+  /**
+   * Synchronous gate for outbound / iLink operations (Round 3 Decision #1):
+   * - If the lease has expired (`expires_at <= now`) or been lost: triggers fatal lease loss
+   *   and throws `StaleGatewayEpochError`.
+   * - If remaining TTL is within the 5s safety margin (`0 < remaining <= safetyMarginMs`):
+   *   throws `LeaseSafetyMarginPauseError` to pause/defer new requests WITHOUT exiting.
+   */
+  assertLeaseForOutbound(operation: string, nowMs: number = Date.now()): void {
+    if (this.isLeaseExpired(nowMs)) {
+      if (
+        !this.stopped &&
+        !this.leaseLost &&
+        this.currentEpoch !== null &&
+        this.expiresAtMs <= nowMs
+      ) {
+        this.notifyLeaseLost("lease_expired_local_check");
+      }
+      throw new StaleGatewayEpochError(
+        `Gateway lease is expired or lost before ${operation}`,
+        { status: 409, epoch: this.currentEpoch },
+      );
+    }
+    if (this.isInSafetyMargin(nowMs)) {
+      throw new LeaseSafetyMarginPauseError(
+        `Gateway lease is within safety margin before ${operation}; pausing new request`,
+        { remainingMs: Math.max(0, this.expiresAtMs - nowMs) },
+      );
+    }
   }
 
   async acquireUntilGranted(signal?: AbortSignal): Promise<number> {
@@ -194,6 +277,7 @@ export class GatewayLeaseManager {
           this.lastHeartbeatOk = true;
           this.leaseLost = false;
           this.onEpochAcquired?.(res.epoch);
+          this.scheduleExpiryTimer();
           this.startHeartbeat();
           this.logger.info("Gateway deployment lease acquired", {
             instance_id: this.instanceId,
@@ -230,6 +314,34 @@ export class GatewayLeaseManager {
     }
 
     throw new Error("Gateway lease acquisition aborted");
+  }
+
+  private scheduleExpiryTimer(): void {
+    this.stopExpiryTimer();
+    if (this.stopped || this.leaseLost || this.currentEpoch === null) {
+      return;
+    }
+    const delayMs = Math.max(0, this.expiresAtMs - Date.now());
+    this.expiryTimer = setTimeout(() => {
+      this.expiryTimer = null;
+      if (this.stopped || this.leaseLost || this.currentEpoch === null) {
+        return;
+      }
+      const remainingMs = this.expiresAtMs - Date.now();
+      if (remainingMs <= 0) {
+        this.notifyLeaseLost("lease_expired_timer");
+      } else {
+        this.scheduleExpiryTimer();
+      }
+    }, delayMs);
+    this.expiryTimer.unref?.();
+  }
+
+  private stopExpiryTimer(): void {
+    if (this.expiryTimer) {
+      clearTimeout(this.expiryTimer);
+      this.expiryTimer = null;
+    }
   }
 
   private startHeartbeat(): void {
@@ -273,6 +385,7 @@ export class GatewayLeaseManager {
       const wasLocallyValid = this.isLeaseLocallyValid();
       this.expiresAtMs = parseExpiresAtMs(res.expires_at, this.ttlSeconds);
       this.lastHeartbeatOk = true;
+      this.scheduleExpiryTimer();
       if (!wasLocallyValid && this.isLeaseLocallyValid()) {
         this.onLeaseRecovered?.(epoch);
         for (const listener of this.leaseRecoveredListeners) {
@@ -321,6 +434,7 @@ export class GatewayLeaseManager {
     this.leaseLost = true;
     this.lastHeartbeatOk = false;
     this.stopHeartbeat();
+    this.stopExpiryTimer();
     this.logger.error("Gateway deployment lease lost; stopping instance", {
       instance_id: this.instanceId,
       epoch: this.currentEpoch,
@@ -332,6 +446,7 @@ export class GatewayLeaseManager {
   async stopAndRelease(): Promise<void> {
     this.stopped = true;
     this.stopHeartbeat();
+    this.stopExpiryTimer();
     const epoch = this.currentEpoch;
     this.currentEpoch = null;
     this.lastHeartbeatOk = false;

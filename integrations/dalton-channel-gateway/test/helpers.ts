@@ -179,7 +179,9 @@ export type MockBackend = BackendClient &
       BackendClient,
       | "setGatewayEpoch"
       | "setOnStaleGatewayEpoch"
+      | "getDueDeferredDeliveries"
       | "getWeixinCollectBufferStatus"
+      | "deleteWorkspaceFiles"
       | "authorizeDataTaskNotificationPlan"
       | "authorizeAutomationNotificationPlan"
       | "downloadDataTaskRunArtifact"
@@ -545,11 +547,18 @@ export function createMockBackend(): MockBackend {
   const updateDeliveryProgress = vi.fn(
     async (
       req: I7DeliveriesProgressRequest,
+      _options?: { platform?: string | null },
     ): Promise<I7DeliveriesProgressResponse> => ({
       ...structuredClone(defaultI7DeliverySent),
       ok: true,
       delivery_key: req.delivery_key,
       status: req.status ?? "in_flight",
+      outcome: req.outcome ?? req.status ?? null,
+      sent_chunks: req.sent_chunks ?? 0,
+      total_chunks: req.total_chunks ?? 0,
+      platform_message_ids: req.platform_message_ids ?? [],
+      files_status: req.files_status ?? [],
+      delivered_segments: req.delivered_segments ?? [],
       sent_to_current_count:
         req.status === "sent" || req.status === "partial" ? 1 : 0,
       ...(() => {
@@ -848,6 +857,16 @@ export function createMockBackend(): MockBackend {
         if (req.cmd === "new") {
           return structuredClone(defaultI3NewSession);
         }
+        if (req.cmd === "help") {
+          return {
+            ok: true,
+            linked: true,
+            allowed: true,
+            dalton_user_id: USER_ID,
+            command_effect_status: "done",
+            command_reply_pending: true,
+          };
+        }
         return {
           ...structuredClone(defaultI3WsList),
           ...structuredClone(defaultI3WsSwitch),
@@ -874,6 +893,12 @@ export function createMockBackend(): MockBackend {
     ),
 
     authorizeAndClaimDelivery,
+    getDueDeferredDeliveries: vi.fn(async () => ({
+      ok: true,
+      expired_count: 0,
+      next_upcoming_retry_at: null,
+      deliveries: [],
+    })),
     updateDeliveryProgress,
     updateInboundProgress,
 
@@ -1026,8 +1051,8 @@ export function createMockBackend(): MockBackend {
         ok: true,
         buffer_id: bufferId,
         status: "collecting",
-        upload_status: "pending",
-        cancelled: false,
+        upload_status: "pending_upload",
+        item_upload_status: "pending_upload",
       }),
     ),
 
@@ -1134,6 +1159,11 @@ export function createMockBackend(): MockBackend {
     startWorkspace: vi.fn(async () => ({ status: "running" })),
 
     uploadWorkspaceFile: vi.fn(async () => undefined),
+
+    deleteWorkspaceFiles: vi.fn(async (_userId: string, _workspaceId: string, paths: string[]) => ({
+      deleted: [...paths],
+      errors: [],
+    })),
 
     downloadWorkspaceFile: vi.fn(async () => ({
       content: Buffer.from("PDF_REPORT_CONTENT", "utf8"),

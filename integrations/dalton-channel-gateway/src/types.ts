@@ -374,7 +374,13 @@ export interface AgentSendFileOutcome {
 }
 
 export interface AgentSendResponse {
-  status: "sent" | "partial" | "failed" | "unknown" | "deferred";
+  status:
+    | "sent"
+    | "partial"
+    | "failed"
+    | "unknown"
+    | "deferred"
+    | "partial_deferred";
   code:
     | "not_linked"
     | "not_allowed"

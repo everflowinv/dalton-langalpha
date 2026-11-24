@@ -26,15 +26,23 @@ import {
   sendWeixinTextMessage,
   shapePublicQrWaitResponse,
   WEIXIN_MIXED_UNSUPPORTED_NOTE,
+  WEIXIN_POLL_POOL_TIMEOUT_MS,
   WeixinApiError,
   WeixinChannelAdapter,
   WeixinHttpPoolManager,
+  WeixinQrLoginError,
   WeixinQrLoginManager,
 } from "../src/channels/weixin/index.js";
 import { parseSlashCommand } from "../src/commands.js";
 import {
+  DEFAULT_DEFERRED_DELIVERY_POLL_INTERVAL_MS,
+  DeferredDeliveryPoller,
+} from "../src/deferred-delivery-poller.js";
+import { FakeChannelAdapter } from "../src/channels/fake-adapter.js";
+import {
   DEFAULT_GATEWAY_LEASE_ACQUIRE_RETRY_MS,
   GatewayLeaseManager,
+  LeaseSafetyMarginPauseError,
   StaleGatewayEpochError,
 } from "../src/gateway-lease.js";
 import {
@@ -1862,7 +1870,7 @@ describe("§7.2 #3 & Codex ④ — Startup Recovery & Collection Mode (/collect,
         }),
       );
 
-      // Skipped already-uploaded #1, uploaded ONLY #2, then started turn
+      // Skipped already-uploaded #1, uploaded ONLY #2 (with Weixin AbortSignal), then started turn
       expect(h.backend.uploadWorkspaceFile).toHaveBeenCalledTimes(1);
       expect(h.backend.uploadWorkspaceFile).toHaveBeenCalledWith(
         USER_ID,
@@ -1871,6 +1879,7 @@ describe("§7.2 #3 & Codex ④ — Startup Recovery & Collection Mode (/collect,
         "report_2.pdf",
         expect.any(Buffer),
         "application/pdf",
+        expect.any(AbortSignal),
       );
       expect(h.backend.createThreadMessages).toHaveBeenCalledTimes(1);
     } finally {
@@ -2064,7 +2073,7 @@ describe("§7.2 #3 & Codex ④ — Startup Recovery & Collection Mode (/collect,
         allowed: true,
         dalton_user_id: USER_ID,
         collect_buffer_id: "buf_mid_cancel",
-        cancelled_buffer_id: "buf_mid_cancel",
+        cancelled_buffer_ids: ["buf_mid_cancel"],
         collect_status: "cancelled",
         reply_text: "已取消材料收集窗口。",
         command_reply_pending: true,
@@ -3083,13 +3092,25 @@ describe("Batch B Round 2 — Lease Abort, Pre-Lease 503, Deferred/Unknown, Coll
       expect(h.backend.uploadWorkspaceFile).toHaveBeenCalledTimes(1);
       expect(h.backend.createThreadMessages).not.toHaveBeenCalled();
 
-      // 3) Decision #7 & #8: /done waits on Phase B; /cancel runs immediately without blocking behind /done,
+      // 3) Decision #7 & #8: /done transitions buffer to `flushing` (Phase A) then waits on Phase B;
+      //    once `flushing` is confirmed, /cancel runs immediately without blocking behind /done,
       //    aborts the in-flight uploadWorkspaceFile AbortSignal, and wakes /done as cancelled.
       const doneEntered = defer<void>();
       const releaseDoneAsCancelled = defer<void>();
       const doneCompleted = defer<void>();
+      let bufDupStatus: "collecting" | "flushing" | "cancelled" = "collecting";
+      vi.mocked(h.backend.getWeixinCollectBufferStatus).mockImplementation(
+        async (bufferId: string) => ({
+          ok: true,
+          buffer_id: bufferId,
+          status: bufferId === "buf_dup" ? bufDupStatus : "collecting",
+          upload_status: "pending_upload",
+          item_upload_status: "pending_upload",
+        }),
+      );
       vi.mocked(h.backend.sessionCommand).mockImplementation(async (req) => {
         if (req.cmd === "done") {
+          bufDupStatus = "flushing";
           doneEntered.resolve();
           await waitBounded(releaseDoneAsCancelled.promise, "done waiting on cancel");
           doneCompleted.resolve();
@@ -3104,6 +3125,7 @@ describe("Batch B Round 2 — Lease Abort, Pre-Lease 503, Deferred/Unknown, Coll
           };
         }
         if (req.cmd === "cancel") {
+          bufDupStatus = "cancelled";
           releaseDoneAsCancelled.resolve();
           return {
             ok: true,
@@ -3111,7 +3133,7 @@ describe("Batch B Round 2 — Lease Abort, Pre-Lease 503, Deferred/Unknown, Coll
             allowed: true,
             dalton_user_id: USER_ID,
             collect_buffer_id: "buf_dup",
-            cancelled_buffer_id: "buf_dup",
+            cancelled_buffer_ids: ["buf_dup"],
             collect_status: "cancelled",
             reply_text: "已取消",
             command_reply_pending: false,
@@ -3120,7 +3142,7 @@ describe("Batch B Round 2 — Lease Abort, Pre-Lease 503, Deferred/Unknown, Coll
         return { ok: true, linked: true, allowed: true, command_reply_pending: false };
       });
 
-      // emitInbound("/done") MUST return promptly without blocking the account's poll loop
+      // emitInbound("/done") confirms `flushing` acceptance and returns promptly without blocking /cancel
       await h.weixinAdapter.emitInbound(weixinDm("bot_1:cmd_done", "/done"));
       await waitBounded(doneEntered.promise, "/done I-3 entered");
 
@@ -3138,7 +3160,8 @@ describe("Batch B Round 2 — Lease Abort, Pre-Lease 503, Deferred/Unknown, Coll
         ok: true,
         buffer_id: "buf_admin_revoked",
         status: "cancelled",
-        cancelled: true,
+        upload_status: "pending_upload",
+        item_upload_status: "pending_upload",
       });
       h.weixinAdapter.setAttachment("bot_1:revoked_item:att:0", {
         content: Buffer.from("should not upload", "utf8"),
@@ -3178,7 +3201,8 @@ describe("Batch B Round 2 — Lease Abort, Pre-Lease 503, Deferred/Unknown, Coll
         ok: true,
         buffer_id: "buf_need_reg",
         status: "collecting",
-        upload_status: "pending",
+        upload_status: "pending_upload",
+        item_upload_status: "pending_upload",
       });
       vi.mocked(h.backend.registerWeixinCollectItemAttachments).mockClear();
       vi.mocked(h.backend.recoverState).mockResolvedValueOnce({
@@ -3250,36 +3274,30 @@ describe("Batch B Round 2 — Lease Abort, Pre-Lease 503, Deferred/Unknown, Coll
   });
 
   it("Decision #9, #10, #12, #13, #15, #16: preflighted command hints without stalling poll, account rotation aborts in-flight send, strict resolveAccountForEvent, monitor self-heal on changed=false & lease recovery, shared 429 cooldown + I-1 503 backoff, QR error redaction, and dual HTTP pools", async () => {
-    // 1) Decision #9: Weixin /bind & invalid command hints route via I-1 + preflight-send and swallow errors without stalling
+    // 1) Decision #9 / Round 3 Decision #12: Weixin `/bind` & invalid command hints route via I-3 (cmd=help) +
+    //    preflight-send (NEVER via I-1 so active collect buffers are not polluted) and swallow errors without stalling
     const h = createTestHarness();
     try {
-      vi.mocked(h.backend.registerAndResolveInbound).mockImplementationOnce(
-        async (req) => ({
-          ...emptyInbound(req),
-          linked: true,
-          allowed: true,
-          dalton_user_id: USER_ID,
+      await h.weixinAdapter.emitInbound(weixinDm("bot_1:bind_hint_1", "/bind"));
+      expect(h.backend.registerAndResolveInbound).not.toHaveBeenCalled();
+      expect(h.backend.sessionCommand).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cmd: "help",
+          platform: "weixin",
+          message_id: "bot_1:bind_hint_1",
         }),
       );
-      await h.weixinAdapter.emitInbound(weixinDm("bot_1:bind_hint_1", "/bind"));
       expect(h.backend.preflightWeixinSend).toHaveBeenCalled();
       expect(h.weixinAdapter.sentTexts.at(-1)?.text).toContain("扫码绑定");
 
       // If preflight fails on an invalid command hint, handleInboundEvent does NOT throw (cursor can advance)
-      vi.mocked(h.backend.registerAndResolveInbound).mockImplementationOnce(
-        async (req) => ({
-          ...emptyInbound(req),
-          linked: true,
-          allowed: true,
-          dalton_user_id: USER_ID,
-        }),
-      );
       vi.mocked(h.backend.preflightWeixinSend).mockRejectedValueOnce(
         new Error("simulated transient credential error"),
       );
       await expect(
         h.weixinAdapter.emitInbound(weixinDm("bot_1:bad_cmd_1", "/unbind extra")),
       ).resolves.toBeUndefined();
+      expect(h.backend.registerAndResolveInbound).not.toHaveBeenCalled();
     } finally {
       await h.cleanup();
     }
@@ -3643,5 +3661,1428 @@ describe("Batch B Round 2 — Lease Abort, Pre-Lease 503, Deferred/Unknown, Coll
     expect(poolMgr.getControlPoolConnections()).toBe(64);
     expect(poolMgr.getPollDispatcher()).not.toBe(poolMgr.getControlDispatcher());
     await poolMgr.close();
+  });
+});
+
+// ===========================================================================
+// Batch B Round 3 — Contract Alignment & Review Fixes (Decisions #1 ~ #13)
+// ===========================================================================
+
+describe("Batch B Round 3 — Lease Timer, Preflight Snapshot, Collect, /cancel, /done, Partial Deferred, Real Undici & Regressions", () => {
+  it("Decision #1: independent expires_at timer aborts hanging sendmessage even when heartbeat hangs; <5s safety margin pauses without exiting; DNS-phase expiry blocks HTTP dispatch", async () => {
+    const backend = createMockBackend();
+    const leaseLostReasons: string[] = [];
+    const sendStarted = defer<void>();
+    let sendSignalAborted = false;
+
+    // 1) Independent expiry timer fires at expires_at even while heartbeat hangs indefinitely
+    vi.mocked(backend.acquireGatewayLease).mockResolvedValueOnce({
+      granted: true,
+      epoch: 11,
+      expires_at: new Date(Date.now() + 90).toISOString(),
+    });
+    vi.mocked(backend.heartbeatGatewayLease).mockImplementation(
+      () => new Promise(() => undefined), // hangs forever
+    );
+
+    const adapter = new WeixinChannelAdapter({
+      backend,
+      accountId: "acc_exp",
+      ilinkBotId: "bot_exp",
+      botToken: "tok_exp",
+      botGeneration: 1,
+      checkResolvedIps: false,
+      fetchImpl: async (_url, init) => {
+        sendStarted.resolve();
+        await new Promise<void>((_res, rej) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => {
+              sendSignalAborted = true;
+              rej(new Error("aborted by expiry timer"));
+            },
+            { once: true },
+          );
+        });
+        return new Response("{}", { status: 200 });
+      },
+    });
+    const lease = new GatewayLeaseManager({
+      backend,
+      ttlSeconds: 1,
+      heartbeatIntervalMs: 30,
+      safetyMarginMs: 10,
+      onLeaseLost: (reason) => {
+        leaseLostReasons.push(reason);
+        adapter.abortAllInFlight();
+      },
+    });
+    adapter.setLeaseManager(lease);
+    await lease.acquireUntilGranted();
+
+    const sendPromise = adapter
+      .sendTextChunk({
+        targetAddress: "weixin:@me",
+        recipientPlatformUserId: "wx_alice",
+        text: "hello",
+        chunkIndex: 0,
+        totalChunks: 1,
+        weixinContextToken: "ctx_1",
+      })
+      .catch((e) => e);
+
+    await waitBounded(sendStarted.promise, "sendmessage started");
+    const sendErr = await waitBounded(sendPromise, "send aborted by expires_at timer");
+    expect(sendSignalAborted).toBe(true);
+    expect(leaseLostReasons).toContain("lease_expired_timer");
+    expect(sendErr).toBeInstanceOf(Error);
+    await adapter.stop();
+
+    // 2) <5s safety margin ONLY pauses new requests (deferred, NOT fatal StaleGatewayEpochError / exit)
+    const marginBackend = createMockBackend();
+    const marginLost: string[] = [];
+    vi.mocked(marginBackend.acquireGatewayLease).mockResolvedValueOnce({
+      granted: true,
+      epoch: 12,
+      // 2.5s remaining -> inside default 5s safety margin, but NOT expired
+      expires_at: new Date(Date.now() + 2_500).toISOString(),
+    });
+    const marginLease = new GatewayLeaseManager({
+      backend: marginBackend,
+      ttlSeconds: 45,
+      heartbeatIntervalMs: 60_000,
+      safetyMarginMs: 5_000,
+      onLeaseLost: (reason) => {
+        marginLost.push(reason);
+      },
+    });
+    await marginLease.acquireUntilGranted();
+    expect(marginLease.isLeaseExpired()).toBe(false);
+    expect(marginLease.isInSafetyMargin()).toBe(true);
+    expect(() => marginLease.assertLeaseForOutbound("sendTextChunk")).toThrow(
+      LeaseSafetyMarginPauseError,
+    );
+    expect(marginLost).toEqual([]);
+
+    const marginAdapter = new WeixinChannelAdapter({
+      backend: marginBackend,
+      leaseManager: marginLease,
+      accountId: "acc_m",
+      ilinkBotId: "bot_m",
+      botToken: "tok_m",
+      checkResolvedIps: false,
+    });
+    await expect(
+      marginAdapter.sendTextChunk({
+        targetAddress: "weixin:@me",
+        recipientPlatformUserId: "wx_alice",
+        text: "paused during margin",
+        chunkIndex: 0,
+        totalChunks: 1,
+        weixinContextToken: "ctx_m",
+      }),
+    ).rejects.toMatchObject({
+      outcome: "deferred",
+      retryable: true,
+      denyCode: "gateway_lease_safety_margin",
+    });
+    expect(marginLost).toEqual([]);
+    await marginLease.stopAndRelease();
+    await marginAdapter.stop();
+
+    // 3) Lease expiring DURING DNS resolution stops send BEFORE fetchImpl is ever invoked
+    let fetchCalledAfterDns = false;
+    let leaseValid = true;
+    await expect(
+      sendWeixinTextMessage(
+        {
+          baseUrl: "https://ilinkai.weixin.qq.com",
+          cdnBaseUrl: "https://novac2c.cdn.weixin.qq.com/c2c",
+          botToken: "tok_dns",
+          contextToken: "ctx_dns",
+          toUserId: "wx_alice",
+          checkResolvedIps: true,
+          resolveHostIps: async () => {
+            leaseValid = false; // simulate lease expiry while DNS resolves
+            return ["1.1.1.1"];
+          },
+          assertLeaseValid: () => {
+            if (!leaseValid) {
+              throw new StaleGatewayEpochError("Lease expired during DNS", {
+                status: 409,
+                epoch: 12,
+              });
+            }
+          },
+          fetchImpl: async () => {
+            fetchCalledAfterDns = true;
+            return new Response(JSON.stringify({ ret: 0 }), { status: 200 });
+          },
+        },
+        "must not dispatch",
+      ),
+    ).rejects.toBeInstanceOf(StaleGatewayEpochError);
+    expect(fetchCalledAfterDns).toBe(false);
+  });
+
+  it("Decision #2 & #13: creates abort signal BEFORE preflight-send & getWeixinAccountDetail, and rejects preflight bot_generation mismatch against managed snapshot", async () => {
+    const h = createTestHarness();
+    let ilinkCalled = 0;
+    vi.mocked(h.backend.reconcileWeixinAccounts).mockResolvedValue({
+      changed: true,
+      enabled: true,
+      max_concurrent_accounts: 50,
+      accounts_revision: 2,
+      accounts: [
+        makeAccountSnapshot({
+          account_id: "wx_acc_1",
+          ilink_bot_id: "bot_1",
+          bot_generation: 2,
+          bot_token: "tok_1",
+        }),
+      ],
+    });
+    const realAdapter = new WeixinChannelAdapter({
+      backend: h.backend,
+      accountId: "wx_acc_1",
+      ilinkBotId: "bot_1",
+      botToken: "tok_1",
+      botGeneration: 2,
+      checkResolvedIps: false,
+      fetchImpl: async (url, init) => {
+        const urlStr = String(url);
+        if (urlStr.includes("getupdates")) {
+          await new Promise<void>((_res, rej) => {
+            init?.signal?.addEventListener("abort", () => rej(new Error("aborted")), {
+              once: true,
+            });
+          });
+        }
+        ilinkCalled += 1;
+        return new Response(JSON.stringify({ ret: 0, message_id: "m_1" }), {
+          status: 200,
+        });
+      },
+    });
+    h.adapters.set("weixin", realAdapter as unknown as typeof h.weixinAdapter);
+
+    try {
+      // 1) Preflight returns stale bot_generation=1 while managed snapshot is bot_generation=2 -> refused before iLink
+      vi.mocked(h.backend.preflightWeixinSend).mockResolvedValueOnce({
+        authorized: true,
+        decision: "allow",
+        retryable: false,
+        chunk_index: 0,
+        account_id: "wx_acc_1",
+        ilink_bot_id: "bot_1",
+        bot_generation: 1,
+        bot_token: "tok_old",
+        base_url: "https://ilinkai.weixin.qq.com",
+        cdn_base_url: "https://novac2c.cdn.weixin.qq.com/c2c",
+        recipient_id: "wx_alice",
+        weixin_context_token: "ctx_old",
+        weixin_context_token_version: 1,
+      });
+
+      const ds = new (await import("../src/delivery-service.js")).DeliveryService({
+        backend: h.backend,
+        adapters: h.adapters,
+      });
+      // Mark realAdapter started/connected for DeliveryService check
+      await realAdapter.start();
+      const mismatchRes = await ds.executeDelivery({
+        deliveryKey: "del_snap_mismatch",
+        kind: "agent_send",
+        userId: USER_ID,
+        platform: "weixin",
+        target: "weixin:@me",
+        text: "stale gen must not send",
+      });
+      expect(mismatchRes.status).toBe("failed");
+      expect(ilinkCalled).toBe(0);
+      expect(h.backend.deliveryUpdates.at(-1)).toMatchObject({
+        delivery_key: "del_snap_mismatch",
+        status: "failed",
+        error_code: "weixin_bot_generation_mismatch",
+      });
+
+      // 2) Abort triggered WHILE preflightWeixinSend is in flight cancels before sendmessage
+      const preflightEntered = defer<void>();
+      const releasePreflight = defer<void>();
+      vi.mocked(h.backend.preflightWeixinSend).mockImplementationOnce(async () => {
+        preflightEntered.resolve();
+        await waitBounded(releasePreflight.promise, "release preflight");
+        return {
+          authorized: true,
+          decision: "allow",
+          retryable: false,
+          chunk_index: 0,
+          account_id: "wx_acc_1",
+          ilink_bot_id: "bot_1",
+          bot_generation: 2,
+          bot_token: "tok_1",
+          base_url: "https://ilinkai.weixin.qq.com",
+          cdn_base_url: "https://novac2c.cdn.weixin.qq.com/c2c",
+          recipient_id: "wx_alice",
+          weixin_context_token: "ctx_2",
+          weixin_context_token_version: 2,
+        };
+      });
+      const deliveryPromise = ds.executeDelivery({
+        deliveryKey: "del_abort_during_preflight",
+        kind: "agent_send",
+        userId: USER_ID,
+        platform: "weixin",
+        target: "weixin:@me",
+        text: "abort during preflight",
+      });
+      await waitBounded(preflightEntered.promise, "preflight entered");
+      realAdapter.abortAllInFlight();
+      releasePreflight.resolve();
+      const abortedRes = await deliveryPromise;
+      expect(abortedRes.status).toBe("failed");
+      expect(ilinkCalled).toBe(0);
+
+      // 3) Decision #13: beginProcessingFeedback creates abort signal BEFORE getWeixinAccountDetail,
+      //    so abortAllInFlight during getWeixinAccountDetail prevents getconfig from ever running.
+      const detailStarted = defer<void>();
+      const releaseDetail = defer<void>();
+      vi.mocked(h.backend.getWeixinAccountDetail).mockImplementationOnce(
+        async () => {
+          detailStarted.resolve();
+          await waitBounded(releaseDetail.promise, "release detail");
+          return {
+            account_id: "wx_acc_1",
+            user_id: USER_ID,
+            ilink_bot_id: "bot_1",
+            ilink_user_id: "wx_alice",
+            bot_token: "tok_1",
+            base_url: "https://ilinkai.weixin.qq.com",
+            cdn_base_url: "https://novac2c.cdn.weixin.qq.com/c2c",
+            bot_generation: 2,
+            status: "active",
+            get_updates_buf: "",
+            weixin_context_token: "ctx_typing",
+          };
+        },
+      );
+      const handle = realAdapter.beginProcessingFeedback({
+        event: weixinDm("bot_1:typing_abort_1", "hello", {
+          weixinAccountId: "wx_acc_1",
+          weixinBotId: "bot_1",
+          weixinBotGeneration: 2,
+          weixinContextToken: undefined,
+        }),
+      });
+      expect(handle).not.toBeNull();
+      await waitBounded(detailStarted.promise, "getWeixinAccountDetail entered");
+      realAdapter.abortAllInFlight();
+      releaseDetail.resolve();
+      await handle!.settle("done");
+      expect(ilinkCalled).toBe(0);
+    } finally {
+      await realAdapter.stop();
+      await h.cleanup();
+    }
+  });
+
+  it("Decision #3, #4, #5, #7: collect status 5xx blocks upload, too_late cleans up file, /cancel cancels only cancelled_buffer_ids, /done 503 retains cursor & notifies user, normal upload takes AbortSignal", async () => {
+    const h = createTestHarness();
+    try {
+      // 1) Decision #3: status query 500 blocks upload (never defaults to pending, never marks upload_failed)
+      vi.mocked(h.backend.getWeixinCollectBufferStatus).mockRejectedValueOnce(
+        new BackendHttpError("500 internal error", 500, {}),
+      );
+      h.weixinAdapter.setAttachment("att_500", {
+        content: Buffer.from("pdf", "utf8"),
+        filename: "doc500.pdf",
+        mimeType: "application/pdf",
+      });
+      vi.mocked(h.backend.registerAndResolveInbound).mockImplementationOnce(
+        async (req) => ({
+          ...emptyInbound(req),
+          linked: true,
+          allowed: true,
+          dalton_user_id: USER_ID,
+          workspace_id: HOME_WS_ID,
+          workspace_status: "running",
+          collection_mode: "appended",
+          collect_buffer_id: "buf_500",
+          collect_buffer_status: "collecting",
+        }),
+      );
+      await h.weixinAdapter.emitInbound(
+        weixinDm("bot_1:m_500", "doc", {
+          attachments: [
+            { id: "att_500", filename: "doc500.pdf", mimeType: "application/pdf" },
+          ],
+        }),
+      );
+      await new Promise((r) => setTimeout(r, 25));
+      expect(h.backend.uploadWorkspaceFile).not.toHaveBeenCalled();
+      expect(h.backend.registerWeixinCollectItemAttachments).not.toHaveBeenCalled();
+
+      // 2) Decision #3 & #7: registerWeixinCollectItemAttachments returning `too_late` deletes uploaded file cleanly
+      vi.mocked(h.backend.getWeixinCollectBufferStatus).mockResolvedValue({
+        ok: true,
+        buffer_id: "buf_late",
+        status: "flushing",
+        upload_status: "pending_upload",
+        item_upload_status: "pending_upload",
+      });
+      vi.mocked(h.backend.registerWeixinCollectItemAttachments).mockResolvedValueOnce({
+        ok: true,
+        upload_status: "too_late",
+        collect_buffer_status: "done",
+        code: "collect_buffer_too_late",
+      });
+      h.weixinAdapter.setAttachment("att_late", {
+        content: Buffer.from("late-pdf", "utf8"),
+        filename: "late.pdf",
+        mimeType: "application/pdf",
+      });
+      vi.mocked(h.backend.registerAndResolveInbound).mockImplementationOnce(
+        async (req) => ({
+          ...emptyInbound(req),
+          linked: true,
+          allowed: true,
+          dalton_user_id: USER_ID,
+          workspace_id: HOME_WS_ID,
+          workspace_status: "running",
+          collection_mode: "appended",
+          collect_buffer_id: "buf_late",
+          collect_buffer_status: "flushing",
+        }),
+      );
+      await h.weixinAdapter.emitInbound(
+        weixinDm("bot_1:m_late", "late", {
+          attachments: [
+            { id: "att_late", filename: "late.pdf", mimeType: "application/pdf" },
+          ],
+        }),
+      );
+      await new Promise((r) => setTimeout(r, 30));
+      expect(h.backend.deleteWorkspaceFiles).toHaveBeenCalledWith(
+        USER_ID,
+        HOME_WS_ID,
+        [expect.stringContaining("late.pdf")],
+      );
+
+      // 3) Decision #4 & #7: `/cancel` cancels ONLY `cancelled_buffer_ids` returned by I-3 (not newer buffer on same account),
+      //    and cleans up cancelled buffer's uploaded workspace file.
+      vi.mocked(h.backend.deleteWorkspaceFiles).mockClear();
+      vi.mocked(h.backend.getWeixinCollectBufferStatus).mockImplementation(
+        async (bufferId: string) => ({
+          ok: true,
+          buffer_id: bufferId,
+          status: "collecting",
+          upload_status: "pending_upload",
+          item_upload_status: "pending_upload",
+        }),
+      );
+      const oldUploadStarted = defer<void>();
+      const newUploadStarted = defer<void>();
+      const releaseUploads = defer<void>();
+      const signalsByFile = new Map<string, AbortSignal | undefined>();
+      vi.mocked(h.backend.uploadWorkspaceFile).mockImplementation(
+        async (_u, _ws, _path, filename, _c, _m, signal) => {
+          signalsByFile.set(filename, signal);
+          if (filename === "old.pdf") oldUploadStarted.resolve();
+          if (filename === "new.pdf") newUploadStarted.resolve();
+          await new Promise<void>((resolve, reject) => {
+            signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+              once: true,
+            });
+            void releaseUploads.promise.then(resolve);
+          });
+        },
+      );
+      h.weixinAdapter.setAttachment("att_old", {
+        content: Buffer.from("old", "utf8"),
+        filename: "old.pdf",
+        mimeType: "application/pdf",
+      });
+      h.weixinAdapter.setAttachment("att_new", {
+        content: Buffer.from("new", "utf8"),
+        filename: "new.pdf",
+        mimeType: "application/pdf",
+      });
+      vi.mocked(h.backend.registerAndResolveInbound)
+        .mockImplementationOnce(async (req) => ({
+          ...emptyInbound(req),
+          linked: true,
+          allowed: true,
+          dalton_user_id: USER_ID,
+          workspace_id: HOME_WS_ID,
+          workspace_status: "running",
+          collection_mode: "appended",
+          collect_buffer_id: "buf_old",
+          collect_buffer_status: "collecting",
+        }))
+        .mockImplementationOnce(async (req) => ({
+          ...emptyInbound(req),
+          linked: true,
+          allowed: true,
+          dalton_user_id: USER_ID,
+          workspace_id: HOME_WS_ID,
+          workspace_status: "running",
+          collection_mode: "appended",
+          collect_buffer_id: "buf_new",
+          collect_buffer_status: "collecting",
+        }));
+
+      await h.weixinAdapter.emitInbound(
+        weixinDm("bot_1:m_old", "old", {
+          attachments: [{ id: "att_old", filename: "old.pdf", mimeType: "application/pdf" }],
+        }),
+      );
+      await h.weixinAdapter.emitInbound(
+        weixinDm("bot_1:m_new", "new", {
+          attachments: [{ id: "att_new", filename: "new.pdf", mimeType: "application/pdf" }],
+        }),
+      );
+      await waitBounded(oldUploadStarted.promise, "old upload started");
+      await waitBounded(newUploadStarted.promise, "new upload started");
+
+      vi.mocked(h.backend.sessionCommand).mockResolvedValueOnce({
+        ok: true,
+        linked: true,
+        allowed: true,
+        dalton_user_id: USER_ID,
+        collect_status: "cancelled",
+        cancelled_buffer_ids: ["buf_old"],
+        command_reply_pending: false,
+      });
+      await h.weixinAdapter.emitInbound(weixinDm("bot_1:m_cancel_sel", "/cancel"));
+      await new Promise((r) => setTimeout(r, 25));
+
+      expect(signalsByFile.get("old.pdf")?.aborted).toBe(true);
+      expect(signalsByFile.get("new.pdf")?.aborted).toBe(false);
+      expect(h.backend.deleteWorkspaceFiles).toHaveBeenCalledWith(
+        USER_ID,
+        HOME_WS_ID,
+        [expect.stringContaining("old.pdf")],
+      );
+      releaseUploads.resolve();
+      await new Promise((r) => setTimeout(r, 25));
+
+      // 4) Decision #5: `/done` acceptance failure (503) rejects so monitor does NOT advance cursor,
+      //    and sends a preflighted failure notice to the user.
+      vi.mocked(h.backend.sessionCommand).mockRejectedValueOnce(
+        new BackendHttpError("503 roster lookup error", 503, {
+          code: "roster_lookup_error",
+        }),
+      );
+      vi.mocked(h.backend.preflightWeixinSend).mockClear();
+      await expect(
+        h.app.orchestrator.handleInboundEvent(
+          weixinDm("bot_1:m_done_503", "/done"),
+        ),
+      ).rejects.toBeInstanceOf(BackendHttpError);
+      expect(h.backend.preflightWeixinSend).toHaveBeenCalled();
+
+      // 5) Decision #7: normal inbound attachment upload receives an AbortSignal that aborts on lease loss
+      let normalUploadSignal: AbortSignal | undefined;
+      const normalUploadStarted = defer<void>();
+      vi.mocked(h.backend.uploadWorkspaceFile).mockImplementationOnce(
+        async (_u, _ws, _path, _fn, _c, _m, signal) => {
+          normalUploadSignal = signal;
+          normalUploadStarted.resolve();
+          await new Promise<void>((_res, rej) => {
+            signal?.addEventListener("abort", () => rej(new Error("aborted")), {
+              once: true,
+            });
+          });
+        },
+      );
+      h.weixinAdapter.setAttachment("att_norm", {
+        content: Buffer.from("normal", "utf8"),
+        filename: "norm.pdf",
+        mimeType: "application/pdf",
+      });
+      vi.mocked(h.backend.registerAndResolveInbound).mockImplementationOnce(
+        async (req) => ({
+          ...emptyInbound(req),
+          linked: true,
+          allowed: true,
+          dalton_user_id: USER_ID,
+          workspace_id: HOME_WS_ID,
+          workspace_status: "running",
+        }),
+      );
+      await h.weixinAdapter.emitInbound(
+        weixinDm("bot_1:m_norm_upload", "check file", {
+          attachments: [
+            { id: "att_norm", filename: "norm.pdf", mimeType: "application/pdf" },
+          ],
+        }),
+      );
+      await waitBounded(normalUploadStarted.promise, "normal upload started");
+      expect(normalUploadSignal).toBeDefined();
+      expect(normalUploadSignal?.aborted).toBe(false);
+      h.app.orchestrator.abortAllActiveCollectUploads();
+      expect(normalUploadSignal?.aborted).toBe(true);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("Decision #6: handles I-6 claim_status='deferred', settles chunk-2 / file defer as partial_deferred with breakpoints, and resumes remaining segments on retry (DeliveryService & DataTask)", async () => {
+    const h = createTestHarness();
+    try {
+      // 1) DeliveryService: I-6 claim_status="deferred" -> returns deferred without sending or calling I-7 failed
+      vi.mocked(h.backend.authorizeAndClaimDelivery).mockResolvedValueOnce({
+        claim_status: "deferred",
+        status: "partial_deferred",
+        code: "delivery_deferred",
+        retryable: true,
+        defer_count: 1,
+        retry_after_ms: 10_000,
+        platform: "weixin",
+        target_address: "weixin:@me",
+        sent_chunks: 1,
+        total_chunks: 2,
+        platform_message_ids: ["wx_c0"],
+        delivered_segments: [{ kind: "text", index: 0, message_id: "wx_c0" }],
+        is_current: true,
+      });
+      const deferredClaimRes = await h.app.deliveryService.executeDelivery({
+        deliveryKey: "del_not_due_yet",
+        kind: "agent_send",
+        userId: USER_ID,
+        platform: "weixin",
+        target: "weixin:@me",
+        text: "Chunk 1\nChunk 2",
+      });
+      expect(deferredClaimRes.status).toBe("partial_deferred");
+      expect(h.weixinAdapter.sentTexts).toHaveLength(0);
+      expect(h.backend.deliveryUpdates).toHaveLength(0);
+
+      // 2) DeliveryService: chunk 0 succeeds, chunk 1 hits preflight defer -> settles `partial_deferred` with breakpoints
+      vi.mocked(h.backend.preflightWeixinSend)
+        .mockResolvedValueOnce({
+          authorized: true,
+          decision: "allow",
+          retryable: false,
+          chunk_index: 0,
+          account_id: "wx_acc_1",
+          ilink_bot_id: "bot_1",
+          bot_generation: 1,
+          bot_token: "tok_1",
+          base_url: "https://ilinkai.weixin.qq.com",
+          cdn_base_url: "https://novac2c.cdn.weixin.qq.com/c2c",
+          recipient_id: "wx_alice",
+          weixin_context_token: "ctx_1",
+          weixin_context_token_version: 1,
+        })
+        .mockResolvedValueOnce({
+          authorized: false,
+          decision: "defer",
+          retryable: true,
+          deny_code: "roster_lookup_error",
+          message: "Roster temporarily unavailable",
+        });
+
+      const twoChunkText = `${"A".repeat(1900)}\n${"B".repeat(1900)}`;
+      const partialDefRes = await h.app.deliveryService.executeDelivery({
+        deliveryKey: "del_partial_defer_1",
+        kind: "agent_send",
+        userId: USER_ID,
+        platform: "weixin",
+        target: "weixin:@me",
+        text: twoChunkText,
+      });
+      expect(partialDefRes.status).toBe("partial_deferred");
+      expect(h.weixinAdapter.sentTexts).toHaveLength(1);
+      expect(h.backend.deliveryUpdates.at(-1)).toMatchObject({
+        delivery_key: "del_partial_defer_1",
+        status: "partial_deferred",
+        outcome: "partial_deferred",
+        sent_chunks: 1,
+        total_chunks: 2,
+        error_code: "roster_lookup_error",
+        delivered_segments: [expect.objectContaining({ kind: "text", index: 0 })],
+      });
+
+      // 3) Retry DeliveryService with breakpoint `sent_chunks: 1` -> skips chunk 0, sends ONLY chunk 1, settles `sent`
+      vi.mocked(h.backend.authorizeAndClaimDelivery).mockResolvedValueOnce({
+        claim_status: "claimed",
+        platform: "weixin",
+        target_address: "weixin:@me",
+        recipient_id: "wx_alice",
+        is_current: true,
+        delivery_attempt: 2,
+        sent_chunks: 1,
+        total_chunks: 2,
+        platform_message_ids: [h.weixinAdapter.sentTexts[0]!.messageId],
+        files_status: [],
+        delivered_segments: [
+          {
+            kind: "text",
+            index: 0,
+            message_id: h.weixinAdapter.sentTexts[0]!.messageId,
+          },
+        ],
+        weixin_account_id: "wx_acc_1",
+        weixin_bot_id: "bot_1",
+        weixin_bot_generation: 1,
+        weixin_context_token: "ctx_1",
+      });
+      const resumedRes = await h.app.deliveryService.executeDelivery({
+        deliveryKey: "del_partial_defer_1",
+        kind: "agent_send",
+        userId: USER_ID,
+        platform: "weixin",
+        target: "weixin:@me",
+        text: twoChunkText,
+      });
+      expect(resumedRes.status).toBe("sent");
+      expect(h.weixinAdapter.sentTexts).toHaveLength(2);
+      expect(h.weixinAdapter.sentTexts[1]!.text).toContain("B".repeat(100));
+
+      // 4) DataTaskNotificationService: text succeeds, file defers -> `partial_deferred`;
+      //    retry with `sent_chunks: 1` skips text and sends ONLY the file!
+      const pngBytes = Buffer.from("\x89PNG\r\n\x1a\npartial-defer-chart", "binary");
+      const pngSha = createHash("sha256").update(pngBytes).digest("hex");
+      const runUuid = "22222222-2222-4222-8222-222222222222";
+      const plan = {
+        authorized: true as const,
+        status: "authorized" as const,
+        run_id: runUuid,
+        owner_user_id: USER_ID,
+        owner_platform_user_id: "wx_alice",
+        platform: "weixin" as const,
+        target_kind: "dm" as const,
+        requested_target: "weixin:@me",
+        canonical_target_address: "weixin:@me",
+        recipient_id: "wx_alice",
+        items: [
+          {
+            item_index: 0,
+            delivery_key: "data_task:dt_partial_def",
+            kind: "text_and_file" as const,
+            text: "Caption text",
+            artifact: {
+              artifact_id: "art_pd",
+              filename: "chart.png",
+              mime_type: "image/png",
+              size_bytes: pngBytes.byteLength,
+              sha256: pngSha,
+            },
+          },
+        ],
+      };
+
+      // 4a) I-6 claim_status="deferred" in DataTask -> returns deferred cleanly without sending
+      vi.mocked(h.backend.authorizeDataTaskNotificationPlan).mockResolvedValueOnce(plan);
+      vi.mocked(h.backend.authorizeAndClaimDelivery).mockResolvedValueOnce({
+        claim_status: "deferred",
+        status: "deferred",
+        code: "delivery_deferred",
+        retryable: true,
+        platform: "weixin",
+        target_address: "weixin:@me",
+        is_current: false,
+      });
+      const dtNotDue = await h.app.dataTaskNotifications.handleDataTaskNotification({
+        run_id: runUuid,
+        target: "weixin:@me",
+      });
+      expect(dtNotDue.data.status).toBe("deferred");
+      expect(dtNotDue.data.code).toBe("delivery_deferred");
+
+      // 4b) Text sends, file preflight defers -> `partial_deferred`
+      const textCountBefore = h.weixinAdapter.sentTexts.length;
+      const fileCountBefore = h.weixinAdapter.sentFiles.length;
+      vi.mocked(h.backend.authorizeDataTaskNotificationPlan).mockResolvedValueOnce(plan);
+      vi.mocked(h.backend.authorizeAndClaimDelivery).mockResolvedValueOnce({
+        claim_status: "claimed",
+        platform: "weixin",
+        target_address: "weixin:@me",
+        recipient_id: "wx_alice",
+        is_current: false,
+        home_workspace_id: HOME_WS_ID,
+        weixin_context_token: "ctx_1",
+        delivery_attempt: 1,
+      });
+      vi.mocked(h.backend.downloadDataTaskRunArtifact).mockResolvedValueOnce({
+        content: pngBytes,
+        mimeType: "image/png",
+        filename: "chart.png",
+        sha256Header: pngSha,
+      });
+      vi.mocked(h.backend.preflightWeixinSend)
+        .mockResolvedValueOnce({
+          authorized: true,
+          decision: "allow",
+          retryable: false,
+          chunk_index: 0,
+          account_id: "wx_acc_1",
+          ilink_bot_id: "bot_1",
+          bot_generation: 1,
+          bot_token: "tok_1",
+          base_url: "https://ilinkai.weixin.qq.com",
+          cdn_base_url: "https://novac2c.cdn.weixin.qq.com/c2c",
+          recipient_id: "wx_alice",
+          weixin_context_token: "ctx_1",
+          weixin_context_token_version: 1,
+        })
+        .mockResolvedValueOnce({
+          authorized: false,
+          decision: "defer",
+          retryable: true,
+          deny_code: "roster_lookup_error",
+          message: "Roster down on file",
+        });
+
+      const dtPartDef = await h.app.dataTaskNotifications.handleDataTaskNotification({
+        run_id: runUuid,
+        target: "weixin:@me",
+      });
+      expect(dtPartDef.data.status).toBe("partial_deferred");
+      expect(dtPartDef.data.items[0]?.status).toBe("partial_deferred");
+      expect(h.weixinAdapter.sentTexts).toHaveLength(textCountBefore + 1);
+      expect(h.weixinAdapter.sentFiles).toHaveLength(fileCountBefore);
+      expect(h.backend.deliveryUpdates.at(-1)).toMatchObject({
+        delivery_key: "data_task:dt_partial_def",
+        status: "partial_deferred",
+        outcome: "partial_deferred",
+        sent_chunks: 1,
+      });
+
+      // 4c) Retry DataTask with `sent_chunks: 1` -> skips text and sends ONLY the chart file!
+      vi.mocked(h.backend.authorizeDataTaskNotificationPlan).mockResolvedValueOnce(plan);
+      vi.mocked(h.backend.authorizeAndClaimDelivery).mockResolvedValueOnce({
+        claim_status: "claimed",
+        platform: "weixin",
+        target_address: "weixin:@me",
+        recipient_id: "wx_alice",
+        is_current: false,
+        home_workspace_id: HOME_WS_ID,
+        weixin_context_token: "ctx_1",
+        delivery_attempt: 2,
+        sent_chunks: 1,
+        platform_message_ids: ["wx_caption_0"],
+        files_status: [],
+        delivered_segments: [
+          { kind: "text", index: 0, message_id: "wx_caption_0" },
+        ],
+      });
+      vi.mocked(h.backend.downloadDataTaskRunArtifact).mockResolvedValueOnce({
+        content: pngBytes,
+        mimeType: "image/png",
+        filename: "chart.png",
+        sha256Header: pngSha,
+      });
+      const dtResumed = await h.app.dataTaskNotifications.handleDataTaskNotification({
+        run_id: runUuid,
+        target: "weixin:@me",
+      });
+      expect(dtResumed.data.status).toBe("sent");
+      expect(h.weixinAdapter.sentTexts).toHaveLength(textCountBefore + 1); // text NOT re-sent
+      expect(h.weixinAdapter.sentFiles).toHaveLength(fileCountBefore + 1); // file sent
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("Decision #8: real undici connection pools load without injected factory and poll pool timeout exceeds 60s max long-poll", async () => {
+    expect(WEIXIN_POLL_POOL_TIMEOUT_MS).toBeGreaterThan(60_000);
+    const poolMgr = new WeixinHttpPoolManager({ maxConcurrentAccounts: 64 });
+    try {
+      await poolMgr.initAsync();
+      const pollDispatcher = poolMgr.getPollDispatcher();
+      const controlDispatcher = poolMgr.getControlDispatcher();
+      expect(pollDispatcher).toBeDefined();
+      expect(controlDispatcher).toBeDefined();
+      expect(pollDispatcher).not.toBe(controlDispatcher);
+      expect(typeof pollDispatcher?.close).toBe("function");
+      expect(typeof controlDispatcher?.close).toBe("function");
+      expect(poolMgr.getPollPoolConnections()).toBe(80);
+      expect(poolMgr.getControlPoolConnections()).toBe(64);
+    } finally {
+      await poolMgr.close();
+    }
+  });
+
+  it("Decision #9: Feishu & Discord omit X-Gateway-Epoch on I-6/I-7 while Weixin sends it, and Feishu & Discord retain 'partial' on chunk-2 unknown", async () => {
+    // 1) HttpBackendClient header checks for I-6 / I-7 across weixin vs feishu/discord
+    const seenHeaders: Array<{ url: string; epoch: string | null }> = [];
+    const client = new HttpBackendClient({
+      baseUrl: "http://127.0.0.1:8000",
+      serviceToken: TEST_SERVICE_TOKEN,
+      fetchImpl: async (input, init) => {
+        const hdrs = new Headers(init?.headers);
+        seenHeaders.push({
+          url: String(input),
+          epoch: hdrs.get("x-gateway-epoch"),
+        });
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            claim_status: "claimed",
+            delivery_key: "k",
+            status: "sent",
+            sent_to_current_count: 1,
+            reconcile_status: "consumed",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    });
+    client.setGatewayEpoch(7);
+
+    // Feishu & Discord -> NO X-Gateway-Epoch on I-6 / I-7
+    await client.authorizeAndClaimDelivery({
+      delivery_key: "k_feishu",
+      kind: "agent_send",
+      platform: "feishu",
+      target: "feishu:@me",
+      has_non_empty_text: true,
+      total_chunks: 1,
+    });
+    await client.authorizeAndClaimDelivery({
+      delivery_key: "k_discord",
+      kind: "agent_send",
+      platform: "discord",
+      target: "discord:@me",
+      has_non_empty_text: true,
+      total_chunks: 1,
+    });
+    await client.updateDeliveryProgress(
+      { delivery_key: "k_feishu", status: "sent" },
+      { platform: "feishu" },
+    );
+    await client.updateDeliveryProgress(
+      { delivery_key: "k_discord", status: "sent" },
+      { platform: "discord" },
+    );
+    await client.updateInboundProgress({
+      platform: "feishu",
+      message_id: "m_f",
+      status: "completed",
+    });
+    await client.reconcileSteer({ platform: "discord", message_id: "m_d" });
+
+    for (const entry of seenHeaders) {
+      expect(entry.epoch).toBeNull();
+    }
+
+    // Weixin -> MUST include X-Gateway-Epoch: 7 on I-6 / I-7
+    seenHeaders.length = 0;
+    await client.authorizeAndClaimDelivery({
+      delivery_key: "k_wx",
+      kind: "agent_send",
+      platform: "weixin",
+      target: "weixin:@me",
+      has_non_empty_text: true,
+      total_chunks: 1,
+    });
+    await client.updateDeliveryProgress(
+      { delivery_key: "k_wx", status: "sent" },
+      { platform: "weixin" },
+    );
+    await client.updateInboundProgress({
+      platform: "weixin",
+      message_id: "m_w",
+      status: "completed",
+    });
+    await client.reconcileSteer({ platform: "weixin", message_id: "m_w" });
+    expect(seenHeaders.every((e) => e.epoch === "7")).toBe(true);
+
+    // 2) Feishu & Discord chunk-2 `unknown` after chunk-1 success retains original `partial` settlement
+    const h = createTestHarness();
+    try {
+      for (const adapter of [h.feishuAdapter, h.discordAdapter] as const) {
+        let sendCalls = 0;
+        adapter.setSendTextBehavior(async () => {
+          sendCalls += 1;
+          if (sendCalls === 1) return { messageId: `${adapter.platform}_chunk0` };
+          throw new ChannelDeliveryError("Transient network drop", {
+            outcome: "unknown",
+            code: "unavailable",
+          });
+        });
+        const res = await h.app.deliveryService.executeDelivery({
+          deliveryKey: `del_${adapter.platform}_chunk2_unknown`,
+          kind: "agent_send",
+          userId: USER_ID,
+          platform: adapter.platform,
+          target: `${adapter.platform}:@me`,
+          text: `${"F".repeat(1900)}\n${"G".repeat(1900)}`,
+        });
+        expect(res.status).toBe("partial");
+        expect(h.backend.deliveryUpdates.at(-1)).toMatchObject({
+          delivery_key: `del_${adapter.platform}_chunk2_unknown`,
+          status: "partial",
+        });
+      }
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("Decision #10 & #11: QR errors use fixed safe messages (never backend free text), and startup 503 allows read-only GET /agent/* while blocking writes & QR", async () => {
+    // 1) Decision #10: backend free-text message is NEVER forwarded on QR error
+    const qrBackend = createMockBackend();
+    vi.mocked(qrBackend.patchWeixinLoginSession).mockRejectedValueOnce(
+      new BackendHttpError("conflict", 409, {
+        code: "ilink_user_already_bound",
+        message: "LEAKED_INTERNAL_DB_ROW_SECRET_XYZ",
+      }),
+    );
+    const qrMgr = new WeixinQrLoginManager({
+      backend: qrBackend,
+      checkResolvedIps: false,
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            ret: 0,
+            qrcode: "qr_tok_safe",
+            qrcode_img_content: "https://ilinkai.weixin.qq.com/qr/safe",
+          }),
+          { status: 200 },
+        ),
+    });
+    try {
+      await qrMgr.startQrLogin(USER_ID, { sessionKey: "sess_err_1", loginVersion: 1 });
+      expect.unreachable("Expected WeixinQrLoginError");
+    } catch (err) {
+      expect(err).toBeInstanceOf(WeixinQrLoginError);
+      const qrErr = err as WeixinQrLoginError;
+      expect(qrErr.code).toBe("ilink_user_already_bound");
+      expect(qrErr.message).not.toContain("LEAKED_INTERNAL_DB_ROW_SECRET_XYZ");
+      expect(qrErr.message).toContain("already bound");
+    }
+
+    // 2) Decision #11: While waiting for lease, read-only GET /agent/* returns 200 while write/QR returns 503
+    const backend = createMockBackend();
+    const leaseEntered = defer<void>();
+    const releaseLease = defer<void>();
+    vi.mocked(backend.acquireGatewayLease).mockImplementation(async (req) => {
+      leaseEntered.resolve();
+      await releaseLease.promise;
+      return {
+        granted: true,
+        epoch: 1,
+        expires_at: new Date(Date.now() + req.ttl_seconds * 1000).toISOString(),
+      };
+    });
+    const config = loadConfig({
+      GATEWAY_HOST: "127.0.0.1",
+      GATEWAY_PORT: "0",
+      INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
+      DALTON_BACKEND_URL: "http://127.0.0.1:8000",
+      WEB_BASE_URL: "https://app.ginlix.ai",
+    });
+    const feishu = new (await import("../src/channels/fake-adapter.js")).FakeChannelAdapter("feishu", 2000);
+    const app = createGatewayApp({
+      config,
+      backend,
+      adapters: new Map([["feishu", feishu]]),
+      enableLease: true,
+    });
+    const startPromise = app.start();
+
+    try {
+      await waitBounded(leaseEntered.promise, "lease acquire entered");
+      const addr = app.server.address();
+      if (!addr || typeof addr === "string") {
+        throw new Error("Expected gateway server to be listening on TCP port");
+      }
+      const authHeaders = {
+        "X-Service-Token": TEST_SERVICE_TOKEN,
+        "X-User-Id": USER_ID,
+      };
+      const base = `http://${addr.address}:${addr.port}`;
+
+      // Read-only routes return 200 while acquiring lease
+      const healthRes = await fetchGatewayServer(app, `${base}/health`, {
+        method: "GET",
+        headers: authHeaders,
+      });
+      expect(healthRes.status).toBe(200);
+
+      const settingsRes = await fetchGatewayServer(app, `${base}/agent/settings`, {
+        method: "GET",
+        headers: authHeaders,
+      });
+      expect(settingsRes.status).toBe(200);
+
+      const targetsRes = await fetchGatewayServer(app, `${base}/agent/targets`, {
+        method: "GET",
+        headers: authHeaders,
+      });
+      expect(targetsRes.status).toBe(200);
+
+      const availRes = await fetchGatewayServer(
+        app,
+        `${base}/agent/settings/available`,
+        { method: "GET", headers: authHeaders },
+      );
+      expect(availRes.status).toBe(200);
+
+      const autoTargetsRes = await fetchGatewayServer(
+        app,
+        `${base}/agent/automation-targets`,
+        { method: "GET", headers: authHeaders },
+      );
+      expect(autoTargetsRes.status).toBe(200);
+
+      // Write & iLink routes return 503 gateway_starting
+      const putSettingsRes = await fetchGatewayServer(
+        app,
+        `${base}/agent/settings`,
+        {
+          method: "PUT",
+          headers: { ...authHeaders, "Content-Type": "application/json" },
+          body: JSON.stringify({ version: "1", settings: {} }),
+        },
+      );
+      expect(putSettingsRes.status).toBe(503);
+      expect(await putSettingsRes.json()).toMatchObject({
+        code: "gateway_starting",
+      });
+
+      const qrRes = await fetchGatewayServer(
+        app,
+        `${base}/internal/weixin/qrcode/start`,
+        {
+          method: "POST",
+          headers: { ...authHeaders, "Content-Type": "application/json" },
+          body: JSON.stringify({ user_id: USER_ID }),
+        },
+      );
+      expect(qrRes.status).toBe(503);
+    } finally {
+      releaseLease.resolve();
+      await startPromise;
+      await app.stop();
+    }
+  });
+
+  it("Round 3 Supplement #4: polls GET /internal/deliveries/deferred-due (30s default), re-claims partial_deferred under original delivery_key sending only remaining chunks, and stops immediately on lease loss", async () => {
+    expect(DEFAULT_DEFERRED_DELIVERY_POLL_INTERVAL_MS).toBe(30_000);
+
+    const backend = createMockBackend();
+    const weixin = new FakeChannelAdapter("weixin", 100);
+    const deliveryKey = "run_deferred_replay_1:tc_1";
+    const twoChunkText = `${"A".repeat(100)}${"B".repeat(40)}`;
+
+    // Track simulated backend I-6/I-7 ledger for `deliveryKey`
+    let claimCount = 0;
+    let storedSentChunks = 0;
+    let storedMsgIds: string[] = [];
+    let storedSegments: unknown[] = [];
+    let storedStatus: "in_flight" | "partial_deferred" | "sent" = "in_flight";
+    let dueReady = false;
+    const replayFinished = defer<void>();
+
+    vi.mocked(backend.authorizeAndClaimDelivery).mockImplementation(async (req) => {
+      claimCount += 1;
+      if (req.delivery_key === deliveryKey) {
+        return {
+          claim_status: "claimed",
+          platform: "weixin",
+          target_address: "weixin:wx_u1@im.wechat",
+          recipient_id: "wx_u1@im.wechat",
+          is_current: true,
+          delivery_attempt: claimCount,
+          sent_chunks: storedSentChunks,
+          total_chunks: 2,
+          platform_message_ids: [...storedMsgIds],
+          files_status: [],
+          delivered_segments: [...storedSegments],
+          weixin_account_id: "wx_acc_1",
+          weixin_bot_id: "bot_1",
+          weixin_bot_generation: 1,
+          weixin_context_token: "ctx_tok_1",
+        };
+      }
+      return {
+        claim_status: "claimed",
+        platform: "weixin",
+        target_address: req.target ?? "weixin:@me",
+        recipient_id: "wx_u1@im.wechat",
+        is_current: true,
+        delivery_attempt: claimCount,
+      };
+    });
+
+    vi.mocked(backend.updateDeliveryProgress).mockImplementation(async (req) => {
+      if (req.delivery_key === deliveryKey) {
+        if (typeof req.sent_chunks === "number") {
+          storedSentChunks = req.sent_chunks;
+        }
+        if (Array.isArray(req.platform_message_ids)) {
+          storedMsgIds = [...req.platform_message_ids];
+        }
+        if (Array.isArray(req.delivered_segments)) {
+          storedSegments = [...req.delivered_segments];
+        }
+        if (req.status === "partial_deferred") {
+          storedStatus = "partial_deferred";
+        } else if (req.status === "sent") {
+          storedStatus = "sent";
+          dueReady = false;
+          replayFinished.resolve();
+        }
+      }
+      return {
+        ok: true,
+        delivery_key: req.delivery_key,
+        status: req.status ?? storedStatus,
+        sent_to_current_count: req.status === "sent" ? 1 : 0,
+      };
+    });
+
+    // Chunk 0 succeeds; chunk 1 initially defers, then succeeds when replayed
+    let chunk1DeferredOnce = false;
+    vi.mocked(backend.preflightWeixinSend).mockImplementation(async (_key, req) => {
+      if (req.chunk_index === 1 && !chunk1DeferredOnce) {
+        chunk1DeferredOnce = true;
+        return {
+          authorized: false,
+          decision: "defer",
+          retryable: true,
+          deny_code: "roster_lookup_error",
+          message: "Roster lookup transient failure",
+        };
+      }
+      return {
+        authorized: true,
+        decision: "allow",
+        retryable: false,
+        chunk_index: req.chunk_index ?? 0,
+        account_id: "wx_acc_1",
+        ilink_bot_id: "bot_1",
+        bot_generation: 1,
+        bot_token: "bot_tok_1",
+        base_url: "https://ilinkai.weixin.qq.com",
+        cdn_base_url: "https://novac2c.cdn.weixin.qq.com/c2c",
+        recipient_id: "wx_u1@im.wechat",
+        weixin_context_token: "ctx_tok_1",
+        weixin_context_token_version: 1,
+      };
+    });
+
+    vi.mocked(backend.getDueDeferredDeliveries!).mockImplementation(async () => {
+      if (!dueReady) {
+        return {
+          ok: true,
+          expired_count: 0,
+          next_upcoming_retry_at: null,
+          deliveries: [],
+        };
+      }
+      return {
+        ok: true,
+        expired_count: 0,
+        next_upcoming_retry_at: null,
+        deliveries: [
+          {
+            delivery_key: deliveryKey,
+            kind: "agent_send",
+            user_id: USER_ID,
+            platform: "weixin",
+            target_address: "weixin:wx_u1@im.wechat",
+            status: "partial_deferred",
+            defer_count: 1,
+            sent_chunks: storedSentChunks,
+            total_chunks: 2,
+            platform_message_ids: [...storedMsgIds],
+            files_status: [],
+            delivered_segments: [...storedSegments],
+            delivery_attempt: 1,
+            weixin_account_id: "wx_acc_1",
+            weixin_bot_id: "bot_1",
+            weixin_bot_generation: 1,
+            weixin_recipient_id: "wx_u1@im.wechat",
+          },
+        ],
+      };
+    });
+
+    let leaseLostReason: string | null = null;
+    const leaseLostDeferred = defer<string>();
+    const config = loadConfig({
+      GATEWAY_HOST: "127.0.0.1",
+      GATEWAY_PORT: "0",
+      INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
+      DALTON_WEIXIN_ENABLED: "true",
+    });
+    const app = createGatewayApp({
+      config,
+      backend,
+      adapters: new Map([["weixin", weixin]]),
+      enableLease: true,
+      deferredDeliveryPollIntervalMs: 30,
+      onLeaseLost: (reason) => {
+        leaseLostReason = reason;
+        leaseLostDeferred.resolve(reason);
+      },
+    });
+
+    try {
+      await app.start();
+      expect(app.deferredDeliveryPoller?.isRunning).toBe(true);
+
+      // Initial delivery: chunk 0 delivers, chunk 1 defers -> partial_deferred
+      const initialRes = await app.deliveryService.executeDelivery({
+        deliveryKey,
+        kind: "agent_send",
+        userId: USER_ID,
+        platform: "weixin",
+        target: "weixin:wx_u1@im.wechat",
+        text: twoChunkText,
+      });
+      expect(initialRes.status).toBe("partial_deferred");
+      expect(weixin.sentTexts).toHaveLength(1);
+      expect(weixin.sentTexts[0]?.chunkIndex).toBe(0);
+      expect(app.deliveryService.hasDeferredPayload(deliveryKey)).toBe(true);
+
+      // Make the deferred delivery due on the backend; poller should re-claim and send ONLY chunk 1
+      dueReady = true;
+      await waitBounded(replayFinished.promise, "deferred delivery replay finished");
+
+      expect(backend.getDueDeferredDeliveries).toHaveBeenCalledWith({ limit: 50 });
+      expect(claimCount).toBe(2);
+      expect(weixin.sentTexts).toHaveLength(2);
+      expect(weixin.sentTexts[0]?.chunkIndex).toBe(0);
+      expect(weixin.sentTexts[0]?.text).toBe("A".repeat(100));
+      expect(weixin.sentTexts[1]?.chunkIndex).toBe(1);
+      expect(weixin.sentTexts[1]?.text).toBe("B".repeat(40));
+      expect(storedStatus).toBe("sent");
+      expect(app.deliveryService.hasDeferredPayload(deliveryKey)).toBe(false);
+
+      // Trigger lease loss via 409 stale_gateway_epoch on next poll -> poller stops immediately
+      vi.mocked(backend.getDueDeferredDeliveries!).mockRejectedValueOnce(
+        new StaleGatewayEpochError("Gateway lease epoch is stale", {
+          status: 409,
+          epoch: 1,
+        }),
+      );
+      await waitBounded(
+        leaseLostDeferred.promise,
+        "deferred poller stopped on 409 stale epoch",
+      );
+      expect(leaseLostReason).toBe("deferred_poll_stale_epoch");
+      expect(app.deferredDeliveryPoller?.isRunning).toBe(false);
+      const callsAtStop = vi.mocked(backend.getDueDeferredDeliveries!).mock.calls.length;
+      await new Promise((r) => setTimeout(r, 110));
+      expect(vi.mocked(backend.getDueDeferredDeliveries!).mock.calls.length).toBe(
+        callsAtStop,
+      );
+    } finally {
+      await app.stop();
+    }
+  });
+
+  it("Round 3 Supplement #4: DeferredDeliveryPoller skips ticks during safety margin without stopping, and routes due data_task rows to DataTaskNotificationService", async () => {
+    const backend = createMockBackend();
+    const handleDataTaskNotification = vi.fn(async () => ({
+      status: 200,
+      data: {
+        ok: true,
+        status: "sent" as const,
+        code: null,
+        message: "ok",
+        run_id: "11111111-1111-4111-8111-111111111111",
+        target: "weixin:wx_u1@im.wechat",
+        platform: "weixin" as const,
+        items_total: 1,
+        items_sent: 1,
+        items: [],
+      },
+    }));
+    const leaseManager = new GatewayLeaseManager({
+      backend,
+      ttlSeconds: 30,
+      heartbeatIntervalMs: 60_000,
+      safetyMarginMs: 5_000,
+    });
+    // Acquire with only 2s remaining (inside 5s safety margin, not expired)
+    vi.mocked(backend.acquireGatewayLease).mockResolvedValueOnce({
+      granted: true,
+      epoch: 7,
+      expires_at: new Date(Date.now() + 2_000).toISOString(),
+    });
+    await leaseManager.acquireUntilGranted();
+
+    const poller = new DeferredDeliveryPoller({
+      backend,
+      deliveryService: {
+        hasDeferredPayload: () => false,
+        replayDeferredDelivery: async () => null,
+      },
+      dataTaskNotifications: {
+        handleDataTaskNotification,
+      },
+      automationNotifications: {
+        handle: vi.fn(async () => ({
+          status: 200,
+          data: {
+            ok: true,
+            status: "sent" as const,
+            code: null,
+            message: "ok",
+            run_id: "11111111-1111-4111-8111-111111111111",
+            target: "weixin:wx_u1@im.wechat",
+            platform: "weixin" as const,
+            items_total: 0,
+            items_sent: 0,
+            items: [],
+          },
+        })),
+      },
+      leaseManager,
+      intervalMs: 60_000,
+    });
+
+    try {
+      poller.start();
+      // In safety margin: pollOnce skips without calling backend and keeps poller running
+      const skipped = await poller.pollOnce();
+      expect(skipped).toBe(0);
+      expect(backend.getDueDeferredDeliveries).not.toHaveBeenCalled();
+      expect(poller.isRunning).toBe(true);
+
+      // Refresh lease beyond safety margin -> pollOnce now calls backend and routes data_task
+      vi.mocked(backend.heartbeatGatewayLease).mockResolvedValueOnce({
+        ok: true,
+        epoch: 7,
+        expires_at: new Date(Date.now() + 30_000).toISOString(),
+      });
+      await leaseManager.runHeartbeatOnce();
+      vi.mocked(backend.getDueDeferredDeliveries!).mockResolvedValueOnce({
+        ok: true,
+        expired_count: 0,
+        next_upcoming_retry_at: null,
+        deliveries: [
+          {
+            delivery_key: "data_task:11111111-1111-4111-8111-111111111111:item_0",
+            kind: "data_task",
+            run_id: "11111111-1111-4111-8111-111111111111",
+            platform: "weixin",
+            target_address: "weixin:wx_u1@im.wechat",
+            status: "partial_deferred",
+            defer_count: 1,
+            sent_chunks: 1,
+            total_chunks: 2,
+          },
+        ],
+      });
+
+      const replayed = await poller.pollOnce();
+      expect(replayed).toBe(1);
+      expect(handleDataTaskNotification).toHaveBeenCalledTimes(1);
+      expect(handleDataTaskNotification).toHaveBeenCalledWith({
+        run_id: "11111111-1111-4111-8111-111111111111",
+        target: "weixin:wx_u1@im.wechat",
+      });
+    } finally {
+      poller.stop();
+      await leaseManager.stopAndRelease();
+    }
   });
 });

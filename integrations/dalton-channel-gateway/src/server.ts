@@ -9,18 +9,22 @@ import { AgentRoutesHandler } from "./agent-routes.js";
 import { extractUserIdHeader, verifyServiceToken } from "./auth.js";
 import type { BackendClient } from "./backend-client.js";
 import type { ChannelAdapter } from "./channels/adapter.js";
-import { WeixinQrLoginError } from "./channels/weixin/index.js";
+import {
+  resolveSafeQrError,
+  WeixinQrLoginError,
+} from "./channels/weixin/index.js";
 import type { GatewayConfig } from "./config.js";
 import { AutomationNotificationService } from "./automation-notifications.js";
 import { DataTaskNotificationService } from "./data-task-notifications.js";
+import { DeferredDeliveryPoller } from "./deferred-delivery-poller.js";
 import { handleOpsAlert } from "./ops-alerts.js";
 import { DeliveryService } from "./delivery-service.js";
 import {
   GatewayLeaseManager,
+  isLeaseSafetyMarginPauseError,
   isStaleGatewayEpochError,
 } from "./gateway-lease.js";
 import { ChannelGatewayOrchestrator } from "./orchestrator.js";
-import { redactCredentialString } from "./shared/logger.js";
 import type {
   AgentAutomationOutputPutRequest,
   AgentAutomationRunFinishRequest,
@@ -37,6 +41,7 @@ export interface GatewayApp {
   readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
   readonly deliveryService: DeliveryService;
   readonly dataTaskNotifications: DataTaskNotificationService;
+  readonly deferredDeliveryPoller?: DeferredDeliveryPoller;
   readonly agentRoutes: AgentRoutesHandler;
   readonly orchestrator: ChannelGatewayOrchestrator;
   readonly leaseManager?: GatewayLeaseManager;
@@ -200,6 +205,7 @@ export function createGatewayApp(options: {
   leaseTtlSeconds?: number;
   leaseHeartbeatIntervalMs?: number;
   leaseAcquireRetryMs?: number;
+  deferredDeliveryPollIntervalMs?: number;
   onLeaseLost?: (reason: string, error?: unknown) => void;
 }): GatewayApp {
   const { config, backend, adapters } = options;
@@ -252,11 +258,15 @@ export function createGatewayApp(options: {
     config.mode !== "outgoing" && options.enableLease !== false;
   let leaseReady = !shouldUseLease;
   let stopInProgress = false;
+  let deferredDeliveryPoller: DeferredDeliveryPoller | undefined;
   const handleFatalLeaseLost = (reason: string, error?: unknown): void => {
     // Decision #1: synchronously abort ALL in-flight sends, uploads, QR, collect uploads,
-    // and polling loops BEFORE waiting on any async teardown, so nothing can still hit iLink.
+    // deferred replay polling, and long-polling loops BEFORE waiting on any async teardown,
+    // so nothing can still hit iLink.
     leaseReady = false;
+    deferredDeliveryPoller?.stop();
     deliveryService.setStartupBlocked(true);
+    deliveryService.clearDeferredPayloads();
     dataTaskNotifications.setStartupBlocked(true);
     backend.setGatewayEpoch?.(null);
     orchestrator.abortAllActiveCollectUploads();
@@ -318,6 +328,21 @@ export function createGatewayApp(options: {
     wxInitial?.setLeaseManager?.(leaseManager);
   }
 
+  deferredDeliveryPoller =
+    config.mode !== "outgoing"
+      ? new DeferredDeliveryPoller({
+          backend,
+          deliveryService,
+          dataTaskNotifications,
+          automationNotifications,
+          leaseManager,
+          intervalMs: options.deferredDeliveryPollIntervalMs,
+          onFallbackReplay: async (row) => {
+            await orchestrator.replayDeferredFallbackRow(row);
+          },
+        })
+      : undefined;
+
   const server = createServer(async (req, res) => {
     try {
       const method = (req.method ?? "GET").toUpperCase();
@@ -357,10 +382,16 @@ export function createGatewayApp(options: {
         return;
       }
 
-      // Decision #2: While acquiring deployment lease / completing startup recovery,
-      // reject ALL iLink & backend-writing routes with 503 `gateway_starting` so they
-      // never contact iLink or trigger false stale-epoch lease loss before epoch is held.
-      if (shouldUseLease && !leaseReady) {
+      // Round 3 Decision #11: While acquiring deployment lease / completing startup recovery,
+      // allow read-only `GET /agent/*` inspection routes (plus `/health` & `/internal/ops-alerts`)
+      // to respond normally; only block write & iLink routes with 503 `gateway_starting`.
+      const isReadOnlyStartupRoute =
+        method === "GET" &&
+        (pathname === "/agent/targets" ||
+          pathname === "/agent/settings" ||
+          pathname === "/agent/settings/available" ||
+          pathname === "/agent/automation-targets");
+      if (shouldUseLease && !leaseReady && !isReadOnlyStartupRoute) {
         sendJson(res, 503, {
           ok: false,
           code: "gateway_starting",
@@ -637,6 +668,13 @@ export function createGatewayApp(options: {
 
       sendJson(res, 404, { detail: "Not found" });
     } catch (err) {
+      if (isLeaseSafetyMarginPauseError(err)) {
+        sendJson(res, 503, {
+          code: "gateway_lease_paused",
+          detail: "Gateway lease is renewing; please retry shortly.",
+        });
+        return;
+      }
       if (isStaleGatewayEpochError(err)) {
         sendJson(res, 409, {
           code: "stale_gateway_epoch",
@@ -645,10 +683,12 @@ export function createGatewayApp(options: {
         return;
       }
       if (err instanceof WeixinQrLoginError) {
-        // Decision #15 (§4.3): whitelist code and redact any credential substrings.
+        // Round 3 Decision #10 (§4.3): whitelist error code and return fixed safe message;
+        // never forward arbitrary backend or iLink free-text `message`.
+        const safe = resolveSafeQrError(err.code, "qr_login_error");
         sendJson(res, err.statusCode, {
-          code: err.code ?? "qr_login_error",
-          detail: redactCredentialString(err.message),
+          code: safe.code,
+          detail: safe.message,
         });
         return;
       }
@@ -667,6 +707,7 @@ export function createGatewayApp(options: {
     adapters,
     deliveryService,
     dataTaskNotifications,
+    deferredDeliveryPoller,
     agentRoutes,
     orchestrator,
     leaseManager,
@@ -702,7 +743,9 @@ export function createGatewayApp(options: {
               await adapter.start();
             }
           }
+          deferredDeliveryPoller?.start();
         } catch (err) {
+          deferredDeliveryPoller?.stop();
           if (server.listening) {
             await new Promise<void>((resolveClose) => {
               server.close(() => resolveClose());
@@ -713,6 +756,15 @@ export function createGatewayApp(options: {
         if (startupRecoverySnapshot) {
           // Dispatch long-running recovery streams/tasks in background after HTTP listen & adapters are ready.
           orchestrator.dispatchStartupRecoverySnapshot(startupRecoverySnapshot);
+          if (
+            deferredDeliveryPoller &&
+            Array.isArray(startupRecoverySnapshot.deferred_deliveries) &&
+            startupRecoverySnapshot.deferred_deliveries.length > 0
+          ) {
+            void deferredDeliveryPoller.replayRows(
+              startupRecoverySnapshot.deferred_deliveries,
+            );
+          }
         }
       }
       const addr = server.address() as AddressInfo;
@@ -721,6 +773,8 @@ export function createGatewayApp(options: {
     async stop(): Promise<void> {
       stopInProgress = true;
       leaseReady = false;
+      deferredDeliveryPoller?.stop();
+      deliveryService.clearDeferredPayloads();
       if (config.mode !== "outgoing") {
         orchestrator.abortAllActiveCollectUploads();
         await orchestrator.stopAllWatches();

@@ -1,7 +1,10 @@
 // Portions adapted from @tencent-weixin/openclaw-weixin (MIT License, Copyright (c) 2026 Tencent).
 
 import { randomBytes } from "node:crypto";
-import { isStaleGatewayEpochError } from "../../gateway-lease.js";
+import {
+  isLeaseSafetyMarginPauseError,
+  isStaleGatewayEpochError,
+} from "../../gateway-lease.js";
 import type { HostIpResolver } from "../../shared/safe-fetch.js";
 import {
   ChannelDeliveryError,
@@ -84,6 +87,8 @@ export interface WeixinSendContext {
   allowedCdnDomains?: readonly string[];
   resolveHostIps?: HostIpResolver;
   checkResolvedIps?: boolean;
+  /** Synchronous lease check invoked after DNS resolution and immediately before HTTP dispatch (Round 3 Decision #1). */
+  assertLeaseValid?: () => void;
   onSessionExpired?: (err: WeixinApiError) => Promise<void> | void;
   onBusinessError?: (err: WeixinApiError) => Promise<void> | void;
   /** Account that owned the CDN upload. Checked again before sendmessage. */
@@ -120,6 +125,14 @@ async function classifyAndThrowSendMessageError(
 ): Promise<never> {
   if (isStaleGatewayEpochError(err)) {
     throw err;
+  }
+  if (isLeaseSafetyMarginPauseError(err)) {
+    throw new ChannelDeliveryError(err.message, {
+      outcome: "deferred",
+      code: "unavailable",
+      retryable: true,
+      denyCode: err.code,
+    });
   }
   if (err instanceof ChannelDeliveryError) {
     throw err;
@@ -178,6 +191,14 @@ async function classifyAndThrowUploadStageError(
 ): Promise<never> {
   if (isStaleGatewayEpochError(err)) {
     throw err;
+  }
+  if (isLeaseSafetyMarginPauseError(err)) {
+    throw new ChannelDeliveryError(err.message, {
+      outcome: "deferred",
+      code: "unavailable",
+      retryable: true,
+      denyCode: err.code,
+    });
   }
   if (err instanceof ChannelDeliveryError) {
     throw err;
@@ -270,6 +291,7 @@ export async function sendWeixinTextMessage(
       allowedDomains: ctx.allowedApiDomains,
       resolveHostIps: ctx.resolveHostIps,
       checkResolvedIps: ctx.checkResolvedIps,
+      assertLeaseValid: ctx.assertLeaseValid,
     });
     const rawMsgId = resp.message_id ?? resp.msg_id;
     return {
@@ -347,6 +369,7 @@ export async function sendWeixinMediaAttachment(
       allowedCdnDomains: ctx.allowedCdnDomains,
       resolveHostIps: ctx.resolveHostIps,
       checkResolvedIps: ctx.checkResolvedIps,
+      assertLeaseValid: ctx.assertLeaseValid,
     });
   } catch (err) {
     return classifyAndThrowUploadStageError(err, ctx.onSessionExpired);
@@ -450,6 +473,7 @@ export async function sendWeixinMediaAttachment(
       allowedDomains: ctx.allowedApiDomains,
       resolveHostIps: ctx.resolveHostIps,
       checkResolvedIps: ctx.checkResolvedIps,
+      assertLeaseValid: ctx.assertLeaseValid,
     });
     const rawMsgId = resp.message_id ?? resp.msg_id;
     return {

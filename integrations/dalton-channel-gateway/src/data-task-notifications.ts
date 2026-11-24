@@ -37,6 +37,7 @@ const RECOGNIZED_DELIVERY_STATUSES = new Set<string>([
   "failed",
   "unknown",
   "deferred",
+  "partial_deferred",
 ]);
 const SKIP_CODES = new Set([
   "dalton_disabled",
@@ -124,8 +125,24 @@ type ValidatedDataTaskClaim =
       recipientId: string;
       isCurrent: false;
       homeWorkspaceId: string | null;
+      weixinAccountId: string | null;
       weixinContextToken: string | null;
       deliveryAttempt?: number;
+      sentChunks: number;
+      platformMessageIds: string[];
+      filesStatus: Array<{
+        path: string;
+        status: "sent" | "linked" | "failed" | "unknown";
+        reason: string | null;
+      }>;
+      deliveredSegments: unknown[];
+    }
+  | {
+      kind: "deferred";
+      status: "deferred" | "partial_deferred";
+      code: string;
+      message: string;
+      platformMessageIds: string[];
     }
   | {
       kind: "already_completed";
@@ -230,6 +247,46 @@ function validateDataTaskClaimResponse(
       rawClaim.delivery_attempt > 0
         ? rawClaim.delivery_attempt
         : undefined;
+    const sentChunks =
+      typeof rawClaim.sent_chunks === "number" &&
+      Number.isInteger(rawClaim.sent_chunks) &&
+      rawClaim.sent_chunks >= 0
+        ? rawClaim.sent_chunks
+        : 0;
+    const platformMessageIds = Array.isArray(rawClaim.platform_message_ids)
+      ? rawClaim.platform_message_ids.filter(
+          (id): id is string => typeof id === "string" && id.length > 0,
+        )
+      : [];
+    const filesStatus: Array<{
+      path: string;
+      status: "sent" | "linked" | "failed" | "unknown";
+      reason: string | null;
+    }> = Array.isArray(rawClaim.files_status)
+      ? rawClaim.files_status
+          .filter((entry): entry is Record<string, unknown> => isPlainRecord(entry))
+          .filter(
+            (entry) =>
+              typeof entry.path === "string" &&
+              (entry.status === "sent" ||
+                entry.status === "linked" ||
+                entry.status === "failed" ||
+                entry.status === "unknown"),
+          )
+          .map((entry) => ({
+            path: entry.path as string,
+            status: entry.status as "sent" | "linked" | "failed" | "unknown",
+            reason: typeof entry.reason === "string" ? entry.reason : null,
+          }))
+      : [];
+    const deliveredSegments = Array.isArray(rawClaim.delivered_segments)
+      ? [...rawClaim.delivered_segments]
+      : [];
+    const weixinAccountId =
+      typeof rawClaim.weixin_account_id === "string" &&
+      rawClaim.weixin_account_id.trim().length > 0
+        ? rawClaim.weixin_account_id.trim()
+        : null;
     return {
       kind: "claimed",
       platform: expected.platform,
@@ -237,8 +294,58 @@ function validateDataTaskClaimResponse(
       recipientId: rawClaim.recipient_id,
       isCurrent: false,
       homeWorkspaceId: rawClaim.home_workspace_id,
+      weixinAccountId,
       weixinContextToken: rawClaim.weixin_context_token,
       ...(deliveryAttempt !== undefined ? { deliveryAttempt } : {}),
+      sentChunks,
+      platformMessageIds,
+      filesStatus,
+      deliveredSegments,
+    };
+  }
+
+  if (claimStatus === "deferred") {
+    if (rawClaim.status !== "deferred" && rawClaim.status !== "partial_deferred") {
+      return {
+        kind: "invalid",
+        reason: "I-6 deferred response has missing or unrecognized status.",
+      };
+    }
+    if (
+      rawClaim.platform !== undefined &&
+      rawClaim.platform !== expected.platform
+    ) {
+      return {
+        kind: "invalid",
+        reason: "I-6 deferred platform does not match the authorized plan.",
+      };
+    }
+    if (
+      rawClaim.target_address !== undefined &&
+      rawClaim.target_address !== expected.canonicalTargetAddress
+    ) {
+      return {
+        kind: "invalid",
+        reason: "I-6 deferred target_address does not match the authorized plan.",
+      };
+    }
+    const platformMessageIds = Array.isArray(rawClaim.platform_message_ids)
+      ? rawClaim.platform_message_ids.filter(
+          (id): id is string => typeof id === "string" && id.length > 0,
+        )
+      : [];
+    return {
+      kind: "deferred",
+      status: rawClaim.status,
+      code:
+        typeof rawClaim.code === "string" && rawClaim.code.trim().length > 0
+          ? rawClaim.code
+          : "delivery_deferred",
+      message:
+        typeof rawClaim.message === "string"
+          ? rawClaim.message
+          : "Delivery is deferred and not yet due for retry.",
+      platformMessageIds,
     };
   }
 
@@ -474,6 +581,7 @@ export class DataTaskNotificationService {
 
   private async recordValidatedDeliveryProgress(
     req: I7DeliveriesProgressRequest,
+    platform?: ChannelPlatform,
   ): Promise<I7DeliveriesProgressResponse> {
     const expectedStatus = req.status ?? "in_flight";
     if (!RECOGNIZED_DELIVERY_STATUSES.has(expectedStatus)) {
@@ -483,7 +591,9 @@ export class DataTaskNotificationService {
     }
     let rawAck: unknown;
     try {
-      rawAck = await this.backend.updateDeliveryProgress(req);
+      rawAck = await this.backend.updateDeliveryProgress(req, {
+        platform: platform ?? null,
+      });
     } catch (err) {
       if (isStaleGatewayEpochError(err)) {
         throw err;
@@ -513,10 +623,14 @@ export class DataTaskNotificationService {
         "I-7 deliveries/progress acknowledgement delivery_key mismatch.",
       );
     }
+    const expiredDeferredAck =
+      (expectedStatus === "deferred" || expectedStatus === "partial_deferred") &&
+      rawAck.status === "failed" &&
+      rawAck.expired_to_failed === true;
     if (
       typeof rawAck.status !== "string" ||
       !RECOGNIZED_DELIVERY_STATUSES.has(rawAck.status) ||
-      rawAck.status !== expectedStatus
+      (rawAck.status !== expectedStatus && !expiredDeferredAck)
     ) {
       throw new DataTaskBackendAckError(
         "I-7 deliveries/progress acknowledgement status is unrecognized or inconsistent with submitted transition.",
@@ -536,6 +650,7 @@ export class DataTaskNotificationService {
       delivery_key: rawAck.delivery_key,
       status: rawAck.status,
       sent_to_current_count: rawAck.sent_to_current_count,
+      ...(rawAck.expired_to_failed === true ? { expired_to_failed: true } : {}),
     };
   }
 
@@ -1190,6 +1305,34 @@ export class DataTaskNotificationService {
         };
       }
 
+      if (validatedClaim.kind === "deferred") {
+        tracker.claimedAnyItem = hadPriorClaim;
+        itemOutcomes.push({
+          item_index: item.item_index,
+          delivery_key: item.delivery_key,
+          status: validatedClaim.status,
+          duplicate: false,
+          platform_message_ids: validatedClaim.platformMessageIds,
+          code: validatedClaim.code,
+          message: validatedClaim.message,
+        });
+        return {
+          status: 200,
+          data: {
+            ok: false,
+            status: validatedClaim.status,
+            code: validatedClaim.code,
+            message: validatedClaim.message,
+            run_id: runId,
+            target,
+            platform,
+            items_total: planItems.length,
+            items_sent: itemsSent,
+            items: itemOutcomes,
+          },
+        };
+      }
+
       if (validatedClaim.kind === "denied") {
         tracker.claimedAnyItem = hadPriorClaim;
         const denyCode = validatedClaim.code;
@@ -1243,14 +1386,17 @@ export class DataTaskNotificationService {
           const denyMsg =
             liveCheck.message ?? `Group target ${targetAddress} is no longer accessible.`;
           try {
-            await this.recordValidatedDeliveryProgress({
-              delivery_key: item.delivery_key,
-              sent_chunks: 0,
-              total_chunks: totalChunks,
-              status: "failed",
-              error_code: failCode,
-              error_message: denyMsg,
-            });
+            await this.recordValidatedDeliveryProgress(
+              {
+                delivery_key: item.delivery_key,
+                sent_chunks: 0,
+                total_chunks: totalChunks,
+                status: "failed",
+                error_code: failCode,
+                error_message: denyMsg,
+              },
+              platform,
+            );
           } catch (progressErr) {
             const pMsg = safeBackendErrorMessage(
               progressErr,
@@ -1332,14 +1478,17 @@ export class DataTaskNotificationService {
             "Card image artifact validation failed.",
           );
           try {
-            await this.recordValidatedDeliveryProgress({
-              delivery_key: item.delivery_key,
-              sent_chunks: 0,
-              total_chunks: 1,
-              status: "failed",
-              error_code: "artifact_invalid",
-              error_message: artMsg,
-            });
+            await this.recordValidatedDeliveryProgress(
+              {
+                delivery_key: item.delivery_key,
+                sent_chunks: 0,
+                total_chunks: 1,
+                status: "failed",
+                error_code: "artifact_invalid",
+                error_message: artMsg,
+              },
+              platform,
+            );
           } catch (progressErr) {
             const pMsg = safeBackendErrorMessage(
               progressErr,
@@ -1409,18 +1558,21 @@ export class DataTaskNotificationService {
             reason: null,
           }));
           try {
-            await this.recordValidatedDeliveryProgress({
-              delivery_key: item.delivery_key,
-              sent_chunks: 1,
-              total_chunks: 1,
-              platform_message_ids: [sendRes.messageId],
-              files_status: filesStatus,
-              status: "sent",
-              first_response_json: {
-                status: "sent",
+            await this.recordValidatedDeliveryProgress(
+              {
+                delivery_key: item.delivery_key,
+                sent_chunks: 1,
+                total_chunks: 1,
                 platform_message_ids: [sendRes.messageId],
+                files_status: filesStatus,
+                status: "sent",
+                first_response_json: {
+                  status: "sent",
+                  platform_message_ids: [sendRes.messageId],
+                },
               },
-            });
+              platform,
+            );
           } catch (progressErr) {
             const pMsg = safeBackendErrorMessage(
               progressErr,
@@ -1468,14 +1620,17 @@ export class DataTaskNotificationService {
           const itemStatus =
             classified.outcome === "unknown" ? "unknown" : "failed";
           try {
-            await this.recordValidatedDeliveryProgress({
-              delivery_key: item.delivery_key,
-              sent_chunks: 0,
-              total_chunks: 1,
-              status: itemStatus,
-              error_code: classified.code,
-              error_message: classified.message,
-            });
+            await this.recordValidatedDeliveryProgress(
+              {
+                delivery_key: item.delivery_key,
+                sent_chunks: 0,
+                total_chunks: 1,
+                status: itemStatus,
+                error_code: classified.code,
+                error_message: classified.message,
+              },
+              platform,
+            );
           } catch {
             // Row remains 'in_flight' in dalton_channel_deliveries (safe uncertain state)
             itemOutcomes.push({
@@ -1548,14 +1703,17 @@ export class DataTaskNotificationService {
             "Attachment artifact validation failed.",
           );
           try {
-            await this.recordValidatedDeliveryProgress({
-              delivery_key: item.delivery_key,
-              sent_chunks: 0,
-              total_chunks: totalChunks,
-              status: "failed",
-              error_code: "artifact_invalid",
-              error_message: artMsg,
-            });
+            await this.recordValidatedDeliveryProgress(
+              {
+                delivery_key: item.delivery_key,
+                sent_chunks: 0,
+                total_chunks: totalChunks,
+                status: "failed",
+                error_code: "artifact_invalid",
+                error_message: artMsg,
+              },
+              platform,
+            );
           } catch (progressErr) {
             if (isStaleGatewayEpochError(progressErr)) {
               throw progressErr;
@@ -1616,13 +1774,28 @@ export class DataTaskNotificationService {
         }
       }
 
-      const messageIds: string[] = [];
-      let sentChunks = 0;
+      // Round 3 Decision #6: resume from persisted breakpoint fields when retrying a `partial_deferred` item.
+      const resumeSentChunks = Math.max(
+        0,
+        Math.min(textChunks.length, validatedClaim.sentChunks),
+      );
+      const messageIds: string[] = [...validatedClaim.platformMessageIds];
+      let sentChunks = resumeSentChunks;
       const filesStatus: Array<{
         path: string;
         status: "sent" | "linked" | "failed" | "unknown";
         reason: string | null;
-      }> = [];
+      }> = validatedClaim.filesStatus.filter(
+        (entry) => entry.status === "sent" || entry.status === "linked",
+      );
+      const deliveredSegments: unknown[] = [...validatedClaim.deliveredSegments];
+      const attachmentAlreadySent =
+        verifiedAttachment !== null &&
+        filesStatus.some(
+          (entry) =>
+            entry.path === verifiedAttachment!.filename &&
+            entry.status === "sent",
+        );
       const sendTextWithFile = readyAdapter.sendTextWithFile?.bind(readyAdapter);
       // One platform message for a caption plus its file. Longer text still
       // chunks, and the file rides on the last chunk instead of a second post.
@@ -1630,11 +1803,30 @@ export class DataTaskNotificationService {
       const attachFileToLastTextChunk =
         item.kind === "text_and_file" &&
         verifiedAttachment !== null &&
+        !attachmentAlreadySent &&
         typeof sendTextWithFile === "function" &&
         textChunks.length > 0;
-      let fileAttachedToText = false;
+      let fileAttachedToText = attachmentAlreadySent;
 
-      for (let i = 0; i < textChunks.length; i += 1) {
+      const runWithWeixinSignal = async <T>(
+        fn: (ctx: {
+          signal?: AbortSignal;
+          attachAccount: (id: string | null | undefined) => void;
+        }) => Promise<T>,
+      ): Promise<T> => {
+        if (
+          platform === "weixin" &&
+          typeof readyAdapter.runWithAccountOperationSignal === "function"
+        ) {
+          return readyAdapter.runWithAccountOperationSignal(
+            validatedClaim.weixinAccountId,
+            fn,
+          );
+        }
+        return fn({ signal: undefined, attachAccount: () => undefined });
+      };
+
+      for (let i = resumeSentChunks; i < textChunks.length; i += 1) {
         let chunkRes: { messageId: string };
         const attachFile =
           attachFileToLastTextChunk && i === textChunks.length - 1;
@@ -1673,62 +1865,102 @@ export class DataTaskNotificationService {
             });
           } else {
             const effectiveWeixinAttempt = validatedClaim.deliveryAttempt ?? 1;
-            let weixinPreflight: WeixinPreflightAuthorizedData | null = null;
-            if (platform === "weixin") {
-              weixinPreflight = await this.runWeixinPreflight(
-                item.delivery_key,
-                effectiveWeixinAttempt,
-                i,
-              );
-            }
-            chunkRes = await readyAdapter.sendTextChunk({
-              targetAddress,
-              recipientPlatformUserId:
-                weixinPreflight?.recipient_id ?? recipientPlatformUserId,
-              text: textChunks[i]!,
-              chunkIndex: i,
-              totalChunks: textChunks.length,
-              deliveryKey: item.delivery_key,
-              deliveryAttempt: effectiveWeixinAttempt,
-              weixinPreflight,
-              weixinAccountId: weixinPreflight?.account_id ?? null,
-              weixinContextToken:
-                weixinPreflight?.weixin_context_token ??
-                validatedClaim.weixinContextToken,
-            });
+            chunkRes = await runWithWeixinSignal(
+              async ({ signal, attachAccount }) => {
+                let weixinPreflight: WeixinPreflightAuthorizedData | null = null;
+                if (platform === "weixin") {
+                  weixinPreflight = await this.runWeixinPreflight(
+                    item.delivery_key,
+                    effectiveWeixinAttempt,
+                    i,
+                  );
+                  attachAccount(weixinPreflight.account_id);
+                  if (signal?.aborted) {
+                    throw new ChannelDeliveryError("Weixin text send aborted", {
+                      outcome: "failed",
+                      code: "unavailable",
+                    });
+                  }
+                }
+                return readyAdapter.sendTextChunk({
+                  targetAddress,
+                  recipientPlatformUserId:
+                    weixinPreflight?.recipient_id ?? recipientPlatformUserId,
+                  text: textChunks[i]!,
+                  chunkIndex: i,
+                  totalChunks: textChunks.length,
+                  deliveryKey: item.delivery_key,
+                  deliveryAttempt: effectiveWeixinAttempt,
+                  weixinPreflight,
+                  weixinAccountId:
+                    weixinPreflight?.account_id ??
+                    validatedClaim.weixinAccountId,
+                  weixinContextToken:
+                    weixinPreflight?.weixin_context_token ??
+                    validatedClaim.weixinContextToken,
+                  signal,
+                });
+              },
+            );
           }
         } catch (chunkErr) {
           if (isStaleGatewayEpochError(chunkErr)) {
             throw chunkErr;
           }
           const classified = classifyAdapterError(chunkErr);
-          const anySent = sentChunks > 0;
-          // Decision #14: unknown beats partial; Decision #4: retryable defer records non-terminal deferred + denyCode.
-          const itemStatus: "partial" | "unknown" | "failed" | "deferred" =
-            classified.outcome === "unknown"
-              ? "unknown"
-              : anySent
-                ? "partial"
-                : classified.outcome === "deferred"
-                  ? "deferred"
+          const anySent = sentChunks > 0 || filesStatus.length > 0;
+          // Round 3 Decision #6 & #9:
+          // - Retryable defer after partial progress settles as `partial_deferred` (non-terminal).
+          // - `unknown` overrides `partial` ONLY on Weixin; Feishu & Discord keep original `partial`.
+          const itemStatus:
+            | "partial"
+            | "unknown"
+            | "failed"
+            | "deferred"
+            | "partial_deferred" =
+            classified.outcome === "deferred"
+              ? anySent
+                ? "partial_deferred"
+                : "deferred"
+              : classified.outcome === "unknown"
+                ? platform === "weixin" || !anySent
+                  ? "unknown"
+                  : "partial"
+                : anySent
+                  ? "partial"
                   : "failed";
           const recordedErrorCode = classified.denyCode ?? classified.code;
-          const overallStatus: "failed" | "unknown" | "deferred" =
-            itemStatus === "deferred"
-              ? "deferred"
+          const isDeferredStatus =
+            itemStatus === "deferred" || itemStatus === "partial_deferred";
+          let settledItemStatus: DataTaskItemDeliveryOutcome["status"] = itemStatus;
+          let overallStatus: DataTaskNotificationResponse["status"] =
+            isDeferredStatus
+              ? itemStatus
               : itemStatus === "failed"
                 ? "failed"
                 : "unknown";
           try {
-            await this.recordValidatedDeliveryProgress({
-              delivery_key: item.delivery_key,
-              sent_chunks: sentChunks,
-              total_chunks: totalChunks,
-              platform_message_ids: [...messageIds],
-              status: itemStatus,
-              error_code: recordedErrorCode,
-              error_message: classified.message,
-            });
+            const ack = await this.recordValidatedDeliveryProgress(
+              {
+                delivery_key: item.delivery_key,
+                sent_chunks: sentChunks,
+                total_chunks: totalChunks,
+                platform_message_ids: [...messageIds],
+                ...(filesStatus.length > 0 ? { files_status: [...filesStatus] } : {}),
+                ...(platform === "weixin" && deliveredSegments.length > 0
+                  ? { delivered_segments: [...deliveredSegments] }
+                  : {}),
+                status: itemStatus,
+                ...(isDeferredStatus ? { outcome: itemStatus } : {}),
+                error_code: recordedErrorCode,
+                error_message: classified.message,
+              },
+              platform,
+            );
+            if (isDeferredStatus && ack.expired_to_failed === true) {
+              settledItemStatus = "failed";
+              overallStatus = "failed";
+            }
           } catch (progressErr) {
             if (isStaleGatewayEpochError(progressErr)) {
               throw progressErr;
@@ -1761,10 +1993,10 @@ export class DataTaskNotificationService {
           itemOutcomes.push({
             item_index: item.item_index,
             delivery_key: item.delivery_key,
-            status: itemStatus,
+            status: settledItemStatus,
             duplicate: false,
             platform_message_ids: [...messageIds],
-            code: itemStatus === "partial" ? "partial" : recordedErrorCode,
+            code: settledItemStatus === "partial" ? "partial" : recordedErrorCode,
             message: classified.message,
           });
           return {
@@ -1772,7 +2004,7 @@ export class DataTaskNotificationService {
             data: {
               ok: false,
               status: overallStatus,
-              code: itemStatus === "partial" ? "partial" : recordedErrorCode,
+              code: settledItemStatus === "partial" ? "partial" : recordedErrorCode,
               message: classified.message,
               run_id: runId,
               target,
@@ -1786,13 +2018,24 @@ export class DataTaskNotificationService {
 
         sentChunks += 1;
         messageIds.push(chunkRes.messageId);
+        deliveredSegments.push({
+          kind: "text",
+          index: i,
+          message_id: chunkRes.messageId,
+        });
         try {
-          await this.recordValidatedDeliveryProgress({
-            delivery_key: item.delivery_key,
-            sent_chunks: sentChunks,
-            total_chunks: totalChunks,
-            platform_message_ids: [...messageIds],
-          });
+          await this.recordValidatedDeliveryProgress(
+            {
+              delivery_key: item.delivery_key,
+              sent_chunks: sentChunks,
+              total_chunks: totalChunks,
+              platform_message_ids: [...messageIds],
+              ...(platform === "weixin"
+                ? { delivered_segments: [...deliveredSegments] }
+                : {}),
+            },
+            platform,
+          );
         } catch (progressErr) {
           if (isStaleGatewayEpochError(progressErr)) {
             throw progressErr;
@@ -1832,38 +2075,52 @@ export class DataTaskNotificationService {
         try {
           const effectiveWeixinAttempt = validatedClaim.deliveryAttempt ?? 1;
           const fileChunkIndex = textChunks.length;
-          let weixinPreflight: WeixinPreflightAuthorizedData | null = null;
-          if (platform === "weixin") {
-            weixinPreflight = await this.runWeixinPreflight(
-              item.delivery_key,
-              effectiveWeixinAttempt,
-              fileChunkIndex,
-            );
-          }
-          const fileRes = await readyAdapter.sendFile({
-            targetAddress,
-            recipientPlatformUserId:
-              weixinPreflight?.recipient_id ?? recipientPlatformUserId,
-            path: verifiedAttachment.filename,
-            filename: verifiedAttachment.filename,
-            content: verifiedAttachment.content,
-            mimeType: verifiedAttachment.mimeType,
-            deliveryKey: item.delivery_key,
-            deliveryAttempt: effectiveWeixinAttempt,
-            weixinPreflight,
-            weixinAccountId: weixinPreflight?.account_id ?? null,
-            weixinContextToken:
-              weixinPreflight?.weixin_context_token ??
-              validatedClaim.weixinContextToken,
-            refreshWeixinPreflight:
-              platform === "weixin"
-                ? () =>
-                    this.backend.preflightWeixinSend(item.delivery_key, {
-                      delivery_attempt: effectiveWeixinAttempt,
-                      chunk_index: fileChunkIndex,
-                    })
-                : undefined,
-          });
+          const fileRes = await runWithWeixinSignal(
+            async ({ signal, attachAccount }) => {
+              let weixinPreflight: WeixinPreflightAuthorizedData | null = null;
+              if (platform === "weixin") {
+                weixinPreflight = await this.runWeixinPreflight(
+                  item.delivery_key,
+                  effectiveWeixinAttempt,
+                  fileChunkIndex,
+                );
+                attachAccount(weixinPreflight.account_id);
+                if (signal?.aborted) {
+                  throw new ChannelDeliveryError("Weixin file send aborted", {
+                    outcome: "failed",
+                    code: "unavailable",
+                  });
+                }
+              }
+              return readyAdapter.sendFile({
+                targetAddress,
+                recipientPlatformUserId:
+                  weixinPreflight?.recipient_id ?? recipientPlatformUserId,
+                path: verifiedAttachment.filename,
+                filename: verifiedAttachment.filename,
+                content: verifiedAttachment.content,
+                mimeType: verifiedAttachment.mimeType,
+                deliveryKey: item.delivery_key,
+                deliveryAttempt: effectiveWeixinAttempt,
+                weixinPreflight,
+                weixinAccountId:
+                  weixinPreflight?.account_id ??
+                  validatedClaim.weixinAccountId,
+                weixinContextToken:
+                  weixinPreflight?.weixin_context_token ??
+                  validatedClaim.weixinContextToken,
+                signal,
+                refreshWeixinPreflight:
+                  platform === "weixin"
+                    ? () =>
+                        this.backend.preflightWeixinSend(item.delivery_key, {
+                          delivery_attempt: effectiveWeixinAttempt,
+                          chunk_index: fileChunkIndex,
+                        })
+                    : undefined,
+              });
+            },
+          );
           if (fileRes.status !== "sent") {
             const substMsg =
               fileRes.reason ??
@@ -1876,16 +2133,19 @@ export class DataTaskNotificationService {
               reason: substMsg,
             });
             try {
-              await this.recordValidatedDeliveryProgress({
-                delivery_key: item.delivery_key,
-                sent_chunks: sentChunks,
-                total_chunks: totalChunks,
-                platform_message_ids: [...messageIds],
-                files_status: filesStatus,
-                status: itemStatus,
-                error_code: "file_not_sent",
-                error_message: substMsg,
-              });
+              await this.recordValidatedDeliveryProgress(
+                {
+                  delivery_key: item.delivery_key,
+                  sent_chunks: sentChunks,
+                  total_chunks: totalChunks,
+                  platform_message_ids: [...messageIds],
+                  files_status: filesStatus,
+                  status: itemStatus,
+                  error_code: "file_not_sent",
+                  error_message: substMsg,
+                },
+                platform,
+              );
             } catch (progressErr) {
               if (isStaleGatewayEpochError(progressErr)) {
                 throw progressErr;
@@ -1950,38 +2210,77 @@ export class DataTaskNotificationService {
             status: "sent",
             reason: null,
           });
+          deliveredSegments.push({
+            kind: "file",
+            index: 0,
+            path: verifiedAttachment.filename,
+            message_id: fileRes.messageId,
+          });
         } catch (fileErr) {
           if (isStaleGatewayEpochError(fileErr)) {
             throw fileErr;
           }
           const classified = classifyAdapterError(fileErr);
-          const anySent = sentChunks > 0;
-          // Decision #14: unknown beats partial, and file entry status records "unknown" instead of "failed".
-          const itemStatus: "partial" | "unknown" | "failed" | "deferred" =
-            classified.outcome === "unknown"
-              ? "unknown"
-              : anySent
-                ? "partial"
-                : classified.outcome === "deferred"
-                  ? "deferred"
+          const anySent = sentChunks > 0 || filesStatus.length > 0;
+          // Round 3 Decision #6 & #9:
+          // - Retryable defer after text chunks settles as `partial_deferred` (non-terminal).
+          // - `unknown` overrides `partial` ONLY on Weixin; Feishu & Discord keep original `partial`.
+          const itemStatus:
+            | "partial"
+            | "unknown"
+            | "failed"
+            | "deferred"
+            | "partial_deferred" =
+            classified.outcome === "deferred"
+              ? anySent
+                ? "partial_deferred"
+                : "deferred"
+              : classified.outcome === "unknown"
+                ? platform === "weixin" || !anySent
+                  ? "unknown"
+                  : "partial"
+                : anySent
+                  ? "partial"
                   : "failed";
           const recordedErrorCode = classified.denyCode ?? classified.code;
-          filesStatus.push({
-            path: verifiedAttachment.filename,
-            status: classified.outcome === "unknown" ? "unknown" : "failed",
-            reason: classified.message,
-          });
-          try {
-            await this.recordValidatedDeliveryProgress({
-              delivery_key: item.delivery_key,
-              sent_chunks: sentChunks,
-              total_chunks: totalChunks,
-              platform_message_ids: [...messageIds],
-              files_status: filesStatus,
-              status: itemStatus,
-              error_code: recordedErrorCode,
-              error_message: classified.message,
+          const isDeferredStatus =
+            itemStatus === "deferred" || itemStatus === "partial_deferred";
+          if (!isDeferredStatus) {
+            filesStatus.push({
+              path: verifiedAttachment.filename,
+              status: classified.outcome === "unknown" ? "unknown" : "failed",
+              reason: classified.message,
             });
+          }
+          let settledItemStatus: DataTaskItemDeliveryOutcome["status"] = itemStatus;
+          let overallStatus: DataTaskNotificationResponse["status"] =
+            isDeferredStatus
+              ? itemStatus
+              : itemStatus === "failed"
+                ? "failed"
+                : "unknown";
+          try {
+            const ack = await this.recordValidatedDeliveryProgress(
+              {
+                delivery_key: item.delivery_key,
+                sent_chunks: sentChunks,
+                total_chunks: totalChunks,
+                platform_message_ids: [...messageIds],
+                files_status: filesStatus,
+                ...(platform === "weixin" && deliveredSegments.length > 0
+                  ? { delivered_segments: [...deliveredSegments] }
+                  : {}),
+                status: itemStatus,
+                ...(isDeferredStatus ? { outcome: itemStatus } : {}),
+                error_code: recordedErrorCode,
+                error_message: classified.message,
+              },
+              platform,
+            );
+            if (isDeferredStatus && ack.expired_to_failed === true) {
+              settledItemStatus = "failed";
+              overallStatus = "failed";
+            }
           } catch (progressErr) {
             if (isStaleGatewayEpochError(progressErr)) {
               throw progressErr;
@@ -2014,23 +2313,18 @@ export class DataTaskNotificationService {
           itemOutcomes.push({
             item_index: item.item_index,
             delivery_key: item.delivery_key,
-            status: itemStatus,
+            status: settledItemStatus,
             duplicate: false,
             platform_message_ids: [...messageIds],
-            code: itemStatus === "partial" ? "partial" : recordedErrorCode,
+            code: settledItemStatus === "partial" ? "partial" : recordedErrorCode,
             message: classified.message,
           });
           return {
             status: 200,
             data: {
               ok: false,
-              status:
-                itemStatus === "deferred"
-                  ? "deferred"
-                  : itemStatus === "failed"
-                    ? "failed"
-                    : "unknown",
-              code: itemStatus === "partial" ? "partial" : recordedErrorCode,
+              status: overallStatus,
+              code: settledItemStatus === "partial" ? "partial" : recordedErrorCode,
               message: classified.message,
               run_id: runId,
               target,
@@ -2044,18 +2338,24 @@ export class DataTaskNotificationService {
       }
 
       try {
-        await this.recordValidatedDeliveryProgress({
-          delivery_key: item.delivery_key,
-          sent_chunks: sentChunks,
-          total_chunks: totalChunks,
-          platform_message_ids: [...messageIds],
-          files_status: filesStatus,
-          status: "sent",
-          first_response_json: {
-            status: "sent",
+        await this.recordValidatedDeliveryProgress(
+          {
+            delivery_key: item.delivery_key,
+            sent_chunks: sentChunks,
+            total_chunks: totalChunks,
             platform_message_ids: [...messageIds],
+            files_status: filesStatus,
+            ...(platform === "weixin" && deliveredSegments.length > 0
+              ? { delivered_segments: [...deliveredSegments] }
+              : {}),
+            status: "sent",
+            first_response_json: {
+              status: "sent",
+              platform_message_ids: [...messageIds],
+            },
           },
-        });
+          platform,
+        );
       } catch (progressErr) {
         if (isStaleGatewayEpochError(progressErr)) {
           throw progressErr;

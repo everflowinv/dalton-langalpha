@@ -82,6 +82,8 @@ export interface SendTextChunkOptions {
   /** Authoritative Weixin preflight credentials for this exact chunk send. */
   weixinPreflight?: WeixinPreflightAuthorizedData | null;
   weixinAccountId?: string | null;
+  /** Optional abort signal created before preflight to cancel on lease loss or account change. */
+  signal?: AbortSignal;
 }
 
 export interface SendTextChunkResult {
@@ -106,6 +108,8 @@ export interface SendFileOptions {
   /** Called right after CDN upload and immediately before `sendmessage` to re-verify account authorization. */
   refreshWeixinPreflight?: () => Promise<WeixinPreflightSendResponse>;
   weixinAccountId?: string | null;
+  /** Optional abort signal created before preflight to cancel on lease loss or account change. */
+  signal?: AbortSignal;
 }
 
 export interface SendFileResult {
@@ -386,6 +390,18 @@ export interface ChannelAdapter {
    * QR login, long-poll loops) without waiting for handlers to settle (D1 / §3.2).
    */
   abortAllInFlight?(): void;
+  /**
+   * Runs a Weixin preflight + send operation under a tracked AbortSignal registered BEFORE
+   * `preflight-send` is called (Round 3 Decision #2), so lease loss or account invalidation
+   * during preflight immediately aborts before `sendmessage` / CDN upload.
+   */
+  runWithAccountOperationSignal?<T>(
+    accountId: string | null | undefined,
+    fn: (ctx: {
+      signal: AbortSignal;
+      attachAccount: (id: string | null | undefined) => void;
+    }) => Promise<T>,
+  ): Promise<T>;
   /** Restart any pollable Weixin account monitors that exited transiently (e.g. brief lease dip). */
   ensurePollableMonitorsRunning?(): void;
   onWeixinAccountInvalidated?(

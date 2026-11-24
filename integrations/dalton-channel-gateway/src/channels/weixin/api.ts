@@ -7,6 +7,10 @@
 
 import crypto from "node:crypto";
 import {
+  isLeaseSafetyMarginPauseError,
+  isStaleGatewayEpochError,
+} from "../../gateway-lease.js";
+import {
   type HostIpResolver,
   SafeFetchError,
   safeFetchResponse,
@@ -278,6 +282,8 @@ export interface WeixinHttpCommonOptions {
   allowedDomains?: readonly string[];
   resolveHostIps?: HostIpResolver;
   checkResolvedIps?: boolean;
+  /** Synchronous lease check invoked after DNS resolution and immediately before HTTP dispatch (Round 3 Decision #1). */
+  assertLeaseValid?: () => void;
 }
 
 async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: number; errmsg?: string }>(params: {
@@ -294,6 +300,7 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
   allowedDomains?: readonly string[];
   resolveHostIps?: HostIpResolver;
   checkResolvedIps?: boolean;
+  assertLeaseValid?: () => void;
 }): Promise<T> {
   const safeEndpoint = sanitizeIlinkEndpointForLog(params.endpoint);
   const allowedDomains = params.allowedDomains ?? OFFICIAL_ILINK_API_DOMAINS;
@@ -309,6 +316,8 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
     resolveHostIps: params.resolveHostIps,
     checkResolvedIps: params.checkResolvedIps,
   });
+  // Round 3 Decision #1: re-verify local lease after DNS resolution and before building/dispatching HTTP request.
+  params.assertLeaseValid?.();
 
   const bodyStr =
     params.bodyObj !== undefined ? JSON.stringify(params.bodyObj) : undefined;
@@ -320,6 +329,7 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
 
   let requestDispatched = false;
   const wrappedFetch: typeof fetch = async (input, init) => {
+    params.assertLeaseValid?.();
     requestDispatched = true;
     const fn = params.fetchImpl ?? globalThis.fetch;
     return fn(input, init);
@@ -341,7 +351,11 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
       dispatcher: params.dispatcher,
     });
   } catch (err) {
-    if (err instanceof WeixinApiError) {
+    if (
+      err instanceof WeixinApiError ||
+      isStaleGatewayEpochError(err) ||
+      isLeaseSafetyMarginPauseError(err)
+    ) {
       throw err;
     }
     throw new WeixinApiError({
@@ -437,6 +451,7 @@ export async function fetchWeixinQrCode(
     allowedDomains: options.allowedDomains,
     resolveHostIps: options.resolveHostIps,
     checkResolvedIps: options.checkResolvedIps,
+    assertLeaseValid: options.assertLeaseValid,
   });
 }
 
@@ -460,6 +475,7 @@ export async function pollWeixinQrStatus(
       allowedDomains: options.allowedDomains,
       resolveHostIps: options.resolveHostIps,
       checkResolvedIps: options.checkResolvedIps,
+      assertLeaseValid: options.assertLeaseValid,
     });
   } catch (err) {
     if (
@@ -500,6 +516,7 @@ export async function submitWeixinQrVerifyCode(
     allowedDomains: options.allowedDomains,
     resolveHostIps: options.resolveHostIps,
     checkResolvedIps: options.checkResolvedIps,
+    assertLeaseValid: options.assertLeaseValid,
   });
 }
 
@@ -524,6 +541,7 @@ export async function getWeixinUpdates(
       allowedDomains: options.allowedDomains,
       resolveHostIps: options.resolveHostIps,
       checkResolvedIps: options.checkResolvedIps,
+      assertLeaseValid: options.assertLeaseValid,
     });
   } catch (err) {
     if (
@@ -556,6 +574,7 @@ export async function getWeixinUploadUrl(
     allowedDomains,
     resolveHostIps,
     checkResolvedIps,
+    assertLeaseValid,
     ...uploadFields
   } = options;
   return executeIlinkJsonRequest<GetUploadUrlResp>({
@@ -574,6 +593,7 @@ export async function getWeixinUploadUrl(
     allowedDomains,
     resolveHostIps,
     checkResolvedIps,
+    assertLeaseValid,
   });
 }
 
@@ -596,6 +616,7 @@ export async function sendWeixinMessage(
     allowedDomains: options.allowedDomains,
     resolveHostIps: options.resolveHostIps,
     checkResolvedIps: options.checkResolvedIps,
+    assertLeaseValid: options.assertLeaseValid,
   });
 }
 
@@ -625,6 +646,7 @@ export async function getWeixinConfig(
     allowedDomains: options.allowedDomains,
     resolveHostIps: options.resolveHostIps,
     checkResolvedIps: options.checkResolvedIps,
+    assertLeaseValid: options.assertLeaseValid,
   });
 }
 
@@ -654,5 +676,6 @@ export async function sendWeixinTyping(
     allowedDomains: options.allowedDomains,
     resolveHostIps: options.resolveHostIps,
     checkResolvedIps: options.checkResolvedIps,
+    assertLeaseValid: options.assertLeaseValid,
   });
 }

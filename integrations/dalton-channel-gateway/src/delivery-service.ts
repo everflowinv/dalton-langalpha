@@ -49,6 +49,7 @@ export interface FirstCurrentDeliveryInfo {
 }
 
 export class DeliveryService {
+  private static readonly MAX_CACHED_DEFERRED_PAYLOADS = 2_000;
   private readonly backend: BackendClient;
   private readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
   private readonly firstCurrentDeliveryListeners = new Set<
@@ -57,6 +58,10 @@ export class DeliveryService {
   private readonly inFlightCurrentDeliveriesByRun = new Map<
     string,
     Set<Promise<AgentSendResponse>>
+  >();
+  private readonly deferredPayloadsByKey = new Map<
+    string,
+    ExecuteDeliveryOptions
   >();
   private startupBlocked = false;
 
@@ -77,6 +82,53 @@ export class DeliveryService {
    */
   setStartupBlocked(blocked: boolean): void {
     this.startupBlocked = blocked;
+  }
+
+  hasDeferredPayload(deliveryKey: string): boolean {
+    return this.deferredPayloadsByKey.has(deliveryKey);
+  }
+
+  clearDeferredPayloads(): void {
+    this.deferredPayloadsByKey.clear();
+  }
+
+  /**
+   * Replays a previously deferred (`deferred` / `partial_deferred`) delivery under its
+   * original `deliveryKey`, re-claiming via I-6 and sending only remaining unsent chunks/files.
+   */
+  async replayDeferredDelivery(
+    deliveryKey: string,
+  ): Promise<AgentSendResponse | null> {
+    const saved = this.deferredPayloadsByKey.get(deliveryKey);
+    if (!saved) {
+      return null;
+    }
+    return await this.executeDelivery(saved);
+  }
+
+  private rememberDeferredPayload(options: ExecuteDeliveryOptions): void {
+    const key = options.deliveryKey;
+    if (this.deferredPayloadsByKey.has(key)) {
+      this.deferredPayloadsByKey.delete(key);
+    } else if (
+      this.deferredPayloadsByKey.size >=
+      DeliveryService.MAX_CACHED_DEFERRED_PAYLOADS
+    ) {
+      const oldest = this.deferredPayloadsByKey.values().next().value;
+      if (oldest) {
+        this.deferredPayloadsByKey.delete(oldest.deliveryKey);
+      }
+    }
+    this.deferredPayloadsByKey.set(key, {
+      ...options,
+      ...(options.files
+        ? { files: options.files.map((file) => ({ ...file })) }
+        : {}),
+    });
+  }
+
+  private forgetDeferredPayload(deliveryKey: string): void {
+    this.deferredPayloadsByKey.delete(deliveryKey);
   }
 
   addFirstCurrentDeliveryListener(
@@ -302,6 +354,7 @@ export class DeliveryService {
     });
 
     if (claim.claim_status === "already_completed") {
+      this.forgetDeferredPayload(options.deliveryKey);
       if (!claim.is_current) {
         untrackIfNotCurrent?.();
       }
@@ -337,6 +390,7 @@ export class DeliveryService {
     }
 
     if (claim.claim_status === "denied") {
+      this.forgetDeferredPayload(options.deliveryKey);
       if (!claim.is_current) {
         untrackIfNotCurrent?.();
       }
@@ -355,12 +409,35 @@ export class DeliveryService {
       };
     }
 
+    if (claim.claim_status === "deferred") {
+      this.rememberDeferredPayload(options);
+      if (!claim.is_current) {
+        untrackIfNotCurrent?.();
+      }
+      const deferredStatus: AgentSendResponse["status"] =
+        claim.status === "partial_deferred" ? "partial_deferred" : "deferred";
+      return {
+        status: deferredStatus,
+        code: "unavailable",
+        address: claim.target_address ?? options.target ?? null,
+        current: Boolean(claim.is_current),
+        duplicate: false,
+        message:
+          claim.message ??
+          "Delivery is deferred and waiting for its next retry window.",
+        files: Array.isArray(claim.files_status) ? claim.files_status : [],
+      };
+    }
+
     // `claim_status === "claimed"`
     if (!claim.is_current) {
       untrackIfNotCurrent?.();
     }
     const deliveryAttempt =
       typeof claim.delivery_attempt === "number" ? claim.delivery_attempt : undefined;
+    // Note (`PROTOCOL.md` §9 I-6): `claim.recipient_id` is the platform recipient ID
+    // (`platform_user_id` for DM or `chat_id` for group), whereas `options.userId` is the Dalton user UUID!
+    const platformStr = (claim.platform ?? preliminaryPlat ?? "").toLowerCase();
     const recordProgress = (
       body: Parameters<BackendClient["updateDeliveryProgress"]>[0],
     ) =>
@@ -368,10 +445,8 @@ export class DeliveryService {
         deliveryAttempt === undefined
           ? body
           : { ...body, delivery_attempt: deliveryAttempt },
+        { platform: platformStr || null },
       );
-    // Note (`PROTOCOL.md` §9 I-6): `claim.recipient_id` is the platform recipient ID
-    // (`platform_user_id` for DM or `chat_id` for group), whereas `options.userId` is the Dalton user UUID!
-    const platformStr = (claim.platform ?? preliminaryPlat ?? "").toLowerCase();
     const targetAddress = claim.target_address ?? options.target ?? null;
     const isCurrent = Boolean(claim.is_current);
     const effectiveThreadScopeKey =
@@ -383,6 +458,7 @@ export class DeliveryService {
     const daltonUserId = (options.userId ?? "").trim();
 
     if (!isSupportedPlatform(platformStr) || !targetAddress) {
+      this.forgetDeferredPayload(options.deliveryKey);
       const failResp: AgentSendResponse = {
         status: "failed",
         code: "unavailable",
@@ -404,6 +480,7 @@ export class DeliveryService {
 
     const adapter = this.adapters.get(platformStr);
     if (!adapter || !adapter.isConfigured() || !adapter.isConnected()) {
+      this.forgetDeferredPayload(options.deliveryKey);
       const failResp: AgentSendResponse = {
         status: "failed",
         code: "unavailable",
@@ -451,8 +528,39 @@ export class DeliveryService {
       }
     }
 
-    const platformMessageIds: string[] = [];
-    let sentChunks = 0;
+    // Round 3 Decision #6: resume from persisted breakpoint fields when retrying a `partial_deferred` delivery.
+    const resumeSentChunks = Math.max(
+      0,
+      Math.min(
+        chunks.length,
+        typeof claim.sent_chunks === "number" && Number.isFinite(claim.sent_chunks)
+          ? Math.trunc(claim.sent_chunks)
+          : 0,
+      ),
+    );
+    const platformMessageIds: string[] = Array.isArray(claim.platform_message_ids)
+      ? [...claim.platform_message_ids]
+      : [];
+    const deliveredSegments: unknown[] = Array.isArray(claim.delivered_segments)
+      ? [...claim.delivered_segments]
+      : [];
+    const priorDeliveredFilesByPath = new Map<string, AgentSendFileOutcome>();
+    if (Array.isArray(claim.files_status)) {
+      for (const entry of claim.files_status) {
+        if (
+          entry &&
+          typeof entry.path === "string" &&
+          (entry.status === "sent" || entry.status === "linked")
+        ) {
+          priorDeliveredFilesByPath.set(entry.path, {
+            path: entry.path,
+            status: entry.status,
+            reason: entry.reason ?? null,
+          });
+        }
+      }
+    }
+    let sentChunks = resumeSentChunks;
     let firstCurrentDeliveryNotified = false;
     const isFeedbackTrackedKind =
       options.kind === "agent_send" ||
@@ -486,64 +594,104 @@ export class DeliveryService {
         ? deliveryAttempt
         : 1;
 
-    for (let i = 0; i < chunks.length; i++) {
+    const runWithWeixinSignal = async <T>(
+      initialAccountId: string | null | undefined,
+      fn: (ctx: {
+        signal?: AbortSignal;
+        attachAccount: (id: string | null | undefined) => void;
+      }) => Promise<T>,
+    ): Promise<T> => {
+      if (
+        platformStr === "weixin" &&
+        typeof adapter.runWithAccountOperationSignal === "function"
+      ) {
+        return adapter.runWithAccountOperationSignal(initialAccountId, fn);
+      }
+      return fn({ signal: undefined, attachAccount: () => undefined });
+    };
+
+    for (let i = resumeSentChunks; i < chunks.length; i++) {
       const chunkText = chunks[i]!;
       try {
-        let weixinPreflight: WeixinPreflightAuthorizedData | null = null;
-        let weixinContextToken: string | null = claim.weixin_context_token ?? null;
-        let effectiveRecipientId = recipientPlatformUserId;
-        if (platformStr === "weixin") {
-          weixinPreflight = await this.runWeixinPreflight(
-            options.deliveryKey,
-            effectiveWeixinAttempt,
-            i,
-          );
-          weixinContextToken = weixinPreflight.weixin_context_token;
-          effectiveRecipientId = weixinPreflight.recipient_id;
-        }
-
-        const creatingDiscordThread =
-          i === 0 &&
-          platformStr === "discord" &&
-          options.newThread === true &&
-          !reuseConfirmedThread;
-        if (i === 0 && reuseConfirmedThread) {
-          await this.authorizeDiscordBodyDispatch(options.deliveryKey, deliveryAttempt);
-        }
-        const res = await adapter.sendTextChunk({
-          targetAddress: finalAddress,
-          recipientPlatformUserId: effectiveRecipientId,
-          text: chunkText,
-          chunkIndex: i,
-          totalChunks,
-          replyToMessageId: i === 0 ? options.replyToMessageId : null,
-          newThread: i === 0 ? Boolean(options.newThread) && !reuseConfirmedThread : false,
-          threadScopeKey: effectiveThreadScopeKey,
-          deliveryKey: options.deliveryKey,
-          deliveryAttempt: effectiveWeixinAttempt,
-          weixinPreflight,
-          weixinAccountId: weixinPreflight?.account_id ?? claim.weixin_account_id ?? null,
-          weixinContextToken,
-          inboundMessageId: options.inboundMessageId ?? null,
-          confirmedThreadAddress:
-            i === 0 && reuseConfirmedThread ? confirmedThreadAddress : null,
-          onConfirmedThread: creatingDiscordThread
-            ? async (confirmed) => {
-                await this.storeConfirmedDiscordThread(
-                  options.deliveryKey,
-                  confirmed.address,
-                  deliveryAttempt,
-                );
-                finalAddress = confirmed.address;
-                await this.authorizeDiscordBodyDispatch(
-                  options.deliveryKey,
-                  deliveryAttempt,
-                );
+        const res = await runWithWeixinSignal(
+          claim.weixin_account_id ?? null,
+          async ({ signal, attachAccount }) => {
+            let weixinPreflight: WeixinPreflightAuthorizedData | null = null;
+            let weixinContextToken: string | null =
+              claim.weixin_context_token ?? null;
+            let effectiveRecipientId = recipientPlatformUserId;
+            if (platformStr === "weixin") {
+              weixinPreflight = await this.runWeixinPreflight(
+                options.deliveryKey,
+                effectiveWeixinAttempt,
+                i,
+              );
+              attachAccount(weixinPreflight.account_id);
+              if (signal?.aborted) {
+                throw new ChannelDeliveryError("Weixin text send aborted", {
+                  outcome: "failed",
+                  code: "unavailable",
+                });
               }
-            : undefined,
-        });
+              weixinContextToken = weixinPreflight.weixin_context_token;
+              effectiveRecipientId = weixinPreflight.recipient_id;
+            }
+
+            const creatingDiscordThread =
+              i === 0 &&
+              platformStr === "discord" &&
+              options.newThread === true &&
+              !reuseConfirmedThread;
+            if (i === 0 && reuseConfirmedThread) {
+              await this.authorizeDiscordBodyDispatch(
+                options.deliveryKey,
+                deliveryAttempt,
+              );
+            }
+            return adapter.sendTextChunk({
+              targetAddress: finalAddress,
+              recipientPlatformUserId: effectiveRecipientId,
+              text: chunkText,
+              chunkIndex: i,
+              totalChunks,
+              replyToMessageId: i === 0 ? options.replyToMessageId : null,
+              newThread:
+                i === 0 ? Boolean(options.newThread) && !reuseConfirmedThread : false,
+              threadScopeKey: effectiveThreadScopeKey,
+              deliveryKey: options.deliveryKey,
+              deliveryAttempt: effectiveWeixinAttempt,
+              weixinPreflight,
+              weixinAccountId:
+                weixinPreflight?.account_id ?? claim.weixin_account_id ?? null,
+              weixinContextToken,
+              inboundMessageId: options.inboundMessageId ?? null,
+              signal,
+              confirmedThreadAddress:
+                i === 0 && reuseConfirmedThread ? confirmedThreadAddress : null,
+              onConfirmedThread: creatingDiscordThread
+                ? async (confirmed) => {
+                    await this.storeConfirmedDiscordThread(
+                      options.deliveryKey,
+                      confirmed.address,
+                      deliveryAttempt,
+                    );
+                    finalAddress = confirmed.address;
+                    await this.authorizeDiscordBodyDispatch(
+                      options.deliveryKey,
+                      deliveryAttempt,
+                    );
+                  }
+                : undefined,
+            });
+          },
+        );
         sentChunks += 1;
         platformMessageIds.push(res.messageId);
+        deliveredSegments.push({
+          kind: "text",
+          index: i,
+          message_id: res.messageId,
+        });
         if (res.resolvedAddress) {
           finalAddress = res.resolvedAddress;
         }
@@ -552,7 +700,10 @@ export class DeliveryService {
           delivery_key: options.deliveryKey,
           sent_chunks: sentChunks,
           total_chunks: totalChunks,
-          platform_message_ids: platformMessageIds,
+          platform_message_ids: [...platformMessageIds],
+          ...(platformStr === "weixin"
+            ? { delivered_segments: [...deliveredSegments] }
+            : {}),
         });
       } catch (err) {
         if (isStaleGatewayEpochError(err)) {
@@ -596,6 +747,12 @@ export class DeliveryService {
     if (!chunkFailure) {
       for (let fileIdx = 0; fileIdx < files.length; fileIdx += 1) {
         const fileRef = files[fileIdx]!;
+        const alreadySentFile = priorDeliveredFilesByPath.get(fileRef.path);
+        if (alreadySentFile) {
+          anyFileSucceeded = true;
+          fileOutcomes.push(alreadySentFile);
+          continue;
+        }
         const wsId = fileRef.workspace_id || claim.home_workspace_id || "";
         if (!wsId) {
           anyFileFailed = true;
@@ -647,46 +804,67 @@ export class DeliveryService {
 
         try {
           const fileChunkIndex = chunks.length + fileIdx;
-          let weixinPreflight: WeixinPreflightAuthorizedData | null = null;
-          let weixinContextToken: string | null = claim.weixin_context_token ?? null;
-          let effectiveRecipientId = recipientPlatformUserId;
-          if (platformStr === "weixin") {
-            weixinPreflight = await this.runWeixinPreflight(
-              options.deliveryKey,
-              effectiveWeixinAttempt,
-              fileChunkIndex,
-            );
-            weixinContextToken = weixinPreflight.weixin_context_token;
-            effectiveRecipientId = weixinPreflight.recipient_id;
-          }
+          const sendRes = await runWithWeixinSignal(
+            claim.weixin_account_id ?? null,
+            async ({ signal, attachAccount }) => {
+              let weixinPreflight: WeixinPreflightAuthorizedData | null = null;
+              let weixinContextToken: string | null =
+                claim.weixin_context_token ?? null;
+              let effectiveRecipientId = recipientPlatformUserId;
+              if (platformStr === "weixin") {
+                weixinPreflight = await this.runWeixinPreflight(
+                  options.deliveryKey,
+                  effectiveWeixinAttempt,
+                  fileChunkIndex,
+                );
+                attachAccount(weixinPreflight.account_id);
+                if (signal?.aborted) {
+                  throw new ChannelDeliveryError("Weixin file send aborted", {
+                    outcome: "failed",
+                    code: "unavailable",
+                  });
+                }
+                weixinContextToken = weixinPreflight.weixin_context_token;
+                effectiveRecipientId = weixinPreflight.recipient_id;
+              }
 
-          const sendRes = await adapter.sendFile({
-            targetAddress: finalAddress,
-            recipientPlatformUserId: effectiveRecipientId,
-            path: fileRef.path,
-            filename: basename(fileRef.path) || "attachment",
-            content: downloaded.content,
-            mimeType: downloaded.mimeType,
-            threadScopeKey: effectiveThreadScopeKey,
-            deliveryKey: options.deliveryKey,
-            deliveryAttempt: effectiveWeixinAttempt,
-            weixinPreflight,
-            weixinAccountId: weixinPreflight?.account_id ?? claim.weixin_account_id ?? null,
-            weixinContextToken,
-            inboundMessageId: options.inboundMessageId ?? null,
-            refreshWeixinPreflight:
-              platformStr === "weixin"
-                ? () =>
-                    this.backend.preflightWeixinSend(options.deliveryKey, {
-                      delivery_attempt: effectiveWeixinAttempt,
-                      chunk_index: fileChunkIndex,
-                    })
-                : undefined,
-          });
+              return adapter.sendFile({
+                targetAddress: finalAddress,
+                recipientPlatformUserId: effectiveRecipientId,
+                path: fileRef.path,
+                filename: basename(fileRef.path) || "attachment",
+                content: downloaded.content,
+                mimeType: downloaded.mimeType,
+                threadScopeKey: effectiveThreadScopeKey,
+                deliveryKey: options.deliveryKey,
+                deliveryAttempt: effectiveWeixinAttempt,
+                weixinPreflight,
+                weixinAccountId:
+                  weixinPreflight?.account_id ?? claim.weixin_account_id ?? null,
+                weixinContextToken,
+                inboundMessageId: options.inboundMessageId ?? null,
+                signal,
+                refreshWeixinPreflight:
+                  platformStr === "weixin"
+                    ? () =>
+                        this.backend.preflightWeixinSend(options.deliveryKey, {
+                          delivery_attempt: effectiveWeixinAttempt,
+                          chunk_index: fileChunkIndex,
+                        })
+                    : undefined,
+              });
+            },
+          );
           const fileSucceeded =
             sendRes.status === "sent" || sendRes.status === "linked";
           if (fileSucceeded) {
             platformMessageIds.push(sendRes.messageId);
+            deliveredSegments.push({
+              kind: "file",
+              index: fileIdx,
+              path: fileRef.path,
+              message_id: sendRes.messageId,
+            });
             anyFileSucceeded = true;
             maybeNotifyFirstCurrentDelivery();
           } else {
@@ -704,6 +882,9 @@ export class DeliveryService {
               total_chunks: totalChunks,
               platform_message_ids: [...platformMessageIds],
               files_status: [...fileOutcomes],
+              ...(platformStr === "weixin"
+                ? { delivered_segments: [...deliveredSegments] }
+                : {}),
             });
           }
         } catch (err) {
@@ -712,12 +893,14 @@ export class DeliveryService {
           }
           anyFileFailed = true;
           let fileEntryStatus: AgentSendFileOutcome["status"] = "failed";
+          let isFileDeferred = false;
           if (err instanceof ChannelDeliveryError) {
             if (err.outcome === "unknown") {
               fileUnknownError = err.message;
               fileEntryStatus = "unknown";
             } else if (err.outcome === "deferred") {
               fileDeferredError = err.message;
+              isFileDeferred = true;
             }
             if (!fileFailureCode) {
               fileFailureCode = err.code;
@@ -730,6 +913,10 @@ export class DeliveryService {
               err instanceof Error ? err.message : String(err);
             fileEntryStatus = "unknown";
           }
+          if (isFileDeferred) {
+            // Leave the deferred file out of `fileOutcomes` so the next retry resumes cleanly.
+            break;
+          }
           fileOutcomes.push({
             path: fileRef.path,
             status: fileEntryStatus,
@@ -738,38 +925,65 @@ export class DeliveryService {
         }
       }
     } else if (files.length > 0) {
-      for (const fileRef of files) {
-        anyFileFailed = true;
-        fileOutcomes.push({
-          path: fileRef.path,
-          status: "failed",
-          reason: "Skipped because earlier message chunk failed",
-        });
+      if (chunkFailure.outcome === "deferred") {
+        for (const fileRef of files) {
+          const alreadySentFile = priorDeliveredFilesByPath.get(fileRef.path);
+          if (alreadySentFile) {
+            anyFileSucceeded = true;
+            fileOutcomes.push(alreadySentFile);
+          }
+        }
+      } else {
+        for (const fileRef of files) {
+          const alreadySentFile = priorDeliveredFilesByPath.get(fileRef.path);
+          if (alreadySentFile) {
+            anyFileSucceeded = true;
+            fileOutcomes.push(alreadySentFile);
+            continue;
+          }
+          anyFileFailed = true;
+          fileOutcomes.push({
+            path: fileRef.path,
+            status: "failed",
+            reason: "Skipped because earlier message chunk failed",
+          });
+        }
       }
     }
 
-    const somethingSucceeded = sentChunks > 0 || anyFileSucceeded;
+    const somethingSucceeded =
+      sentChunks > 0 || anyFileSucceeded || priorDeliveredFilesByPath.size > 0;
     let finalStatus: AgentSendResponse["status"];
     let finalCode: AgentSendResponse["code"] = null;
     let finalMessage: string;
 
     if (chunkFailure) {
-      if (chunkFailure.outcome === "unknown") {
-        // Decision #14: unknown MUST NEVER be masked by partial, even when earlier chunks succeeded.
-        finalStatus = "unknown";
+      if (chunkFailure.outcome === "deferred") {
+        // Round 3 Decision #6: when earlier chunks/files already delivered and a later chunk hits
+        // retryable defer, settle as `partial_deferred` so retry resumes remaining segments.
+        finalStatus = somethingSucceeded ? "partial_deferred" : "deferred";
         finalCode = chunkFailure.code;
         finalMessage = somethingSucceeded
-          ? `Delivered ${sentChunks}/${totalChunks} text chunks before uncertain outcome: ${chunkFailure.message}`
-          : `Delivery outcome could not be confirmed: ${chunkFailure.message}`;
+          ? `Delivered ${sentChunks}/${totalChunks} text chunks before defer: ${chunkFailure.message}`
+          : chunkFailure.message;
+      } else if (chunkFailure.outcome === "unknown") {
+        // Round 3 Decision #9: `unknown` overrides `partial` ONLY on Weixin;
+        // Feishu & Discord preserve original `partial` settlement when earlier chunks succeeded.
+        if (platformStr === "weixin" || !somethingSucceeded) {
+          finalStatus = "unknown";
+          finalCode = chunkFailure.code;
+          finalMessage = somethingSucceeded
+            ? `Delivered ${sentChunks}/${totalChunks} text chunks before uncertain outcome: ${chunkFailure.message}`
+            : `Delivery outcome could not be confirmed: ${chunkFailure.message}`;
+        } else {
+          finalStatus = "partial";
+          finalCode = chunkFailure.code;
+          finalMessage = `Delivered ${sentChunks}/${totalChunks} text chunks before error: ${chunkFailure.message}`;
+        }
       } else if (somethingSucceeded) {
         finalStatus = "partial";
         finalCode = chunkFailure.code;
         finalMessage = `Delivered ${sentChunks}/${totalChunks} text chunks before error: ${chunkFailure.message}`;
-      } else if (chunkFailure.outcome === "deferred") {
-        // Decision #4: retryable preflight defer settles I-7 as non-terminal `deferred`.
-        finalStatus = "deferred";
-        finalCode = chunkFailure.code;
-        finalMessage = chunkFailure.message;
       } else {
         finalStatus = "failed";
         finalCode = chunkFailure.code;
@@ -777,18 +991,25 @@ export class DeliveryService {
       }
     } else if (anyFileFailed) {
       if (fileUnknownError) {
-        // Decision #14: uncertain file dispatch MUST settle as unknown, not partial.
-        finalStatus = "unknown";
-        finalCode = "unavailable";
-        finalMessage = `File delivery outcome could not be confirmed: ${fileUnknownError}`;
+        if (platformStr === "weixin" || !somethingSucceeded) {
+          finalStatus = "unknown";
+          finalCode = "unavailable";
+          finalMessage = `File delivery outcome could not be confirmed: ${fileUnknownError}`;
+        } else {
+          finalStatus = "partial";
+          finalCode = fileFailureCode ?? "unavailable";
+          finalMessage = "Message delivered, but one or more attached files failed.";
+        }
+      } else if (fileDeferredError) {
+        finalStatus = somethingSucceeded ? "partial_deferred" : "deferred";
+        finalCode = fileFailureCode ?? "unavailable";
+        finalMessage = somethingSucceeded
+          ? `Delivered partial content before file defer: ${fileDeferredError}`
+          : fileDeferredError;
       } else if (somethingSucceeded) {
         finalStatus = "partial";
         finalCode = fileFailureCode;
         finalMessage = "Message delivered, but one or more attached files failed.";
-      } else if (fileDeferredError) {
-        finalStatus = "deferred";
-        finalCode = fileFailureCode ?? "unavailable";
-        finalMessage = fileDeferredError;
       } else {
         finalStatus = "failed";
         finalCode = fileFailureCode;
@@ -814,18 +1035,40 @@ export class DeliveryService {
       platformStr === "weixin"
         ? (chunkFailure?.denyCode ?? fileFailureDenyCode ?? finalCode)
         : finalCode;
+    const isDeferredSettlement =
+      finalStatus === "deferred" || finalStatus === "partial_deferred";
 
-    await recordProgress({
+    const progressAck = await recordProgress({
       delivery_key: options.deliveryKey,
       sent_chunks: sentChunks,
       total_chunks: totalChunks,
       platform_message_ids: platformMessageIds,
       files_status: fileOutcomes,
+      ...(platformStr === "weixin" && deliveredSegments.length > 0
+        ? { delivered_segments: deliveredSegments }
+        : {}),
       first_response_json: responseObj as unknown as Record<string, unknown>,
       status: finalStatus,
+      ...(isDeferredSettlement ? { outcome: finalStatus } : {}),
       error_code: recordedErrorCode,
       error_message: finalStatus === "sent" ? null : finalMessage,
     });
+
+    if (isDeferredSettlement && progressAck?.expired_to_failed === true) {
+      this.forgetDeferredPayload(options.deliveryKey);
+      return {
+        ...responseObj,
+        status: "failed",
+        code: "unavailable",
+        message: "Delivery defer window (24h) exceeded.",
+      };
+    }
+
+    if (isDeferredSettlement) {
+      this.rememberDeferredPayload(options);
+    } else {
+      this.forgetDeferredPayload(options.deliveryKey);
+    }
 
     return responseObj;
   }
@@ -889,13 +1132,16 @@ export class DeliveryService {
   ): Promise<void> {
     let stored = false;
     try {
-      const ack = await this.backend.updateDeliveryProgress({
-        delivery_key: deliveryKey,
-        confirmed_thread_address: address,
-        ...(typeof deliveryAttempt === "number"
-          ? { delivery_attempt: deliveryAttempt }
-          : {}),
-      });
+      const ack = await this.backend.updateDeliveryProgress(
+        {
+          delivery_key: deliveryKey,
+          confirmed_thread_address: address,
+          ...(typeof deliveryAttempt === "number"
+            ? { delivery_attempt: deliveryAttempt }
+            : {}),
+        },
+        { platform: "discord" },
+      );
       const phase = ack.discord_body_phase;
       stored =
         ack.ok === true &&
@@ -924,13 +1170,16 @@ export class DeliveryService {
   ): Promise<void> {
     let authorized = false;
     try {
-      const ack = await this.backend.updateDeliveryProgress({
-        delivery_key: deliveryKey,
-        discord_body_phase: "dispatching",
-        ...(typeof deliveryAttempt === "number"
-          ? { delivery_attempt: deliveryAttempt }
-          : {}),
-      });
+      const ack = await this.backend.updateDeliveryProgress(
+        {
+          delivery_key: deliveryKey,
+          discord_body_phase: "dispatching",
+          ...(typeof deliveryAttempt === "number"
+            ? { delivery_attempt: deliveryAttempt }
+            : {}),
+        },
+        { platform: "discord" },
+      );
       authorized = ack.ok === true && ack.discord_body_phase === "dispatching";
     } catch {
       authorized = false;

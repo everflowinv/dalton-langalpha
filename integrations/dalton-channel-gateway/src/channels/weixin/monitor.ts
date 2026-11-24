@@ -2,6 +2,7 @@
 
 import type { BackendClient } from "../../backend-client.js";
 import {
+  isLeaseSafetyMarginPauseError,
   isStaleGatewayEpochError,
   type StaleGatewayEpochError,
 } from "../../gateway-lease.js";
@@ -65,6 +66,8 @@ export interface WeixinMonitorOptions {
    * inbound messages or committing the cursor (D1 / §3.5).
    */
   isLeaseValid?: () => boolean;
+  /** Synchronous lease check invoked after DNS resolution and before iLink HTTP dispatch. */
+  assertLeaseValid?: () => void;
   /** Shared instance-wide 429 cooldown remaining time in ms (gates ALL accounts before `getupdates`). */
   getSharedCooldownRemainingMs?: () => number;
   onInboundEvent: (event: InboundChannelEvent) => Promise<void>;
@@ -257,6 +260,7 @@ export class WeixinMonitor {
           allowedDomains: allowedApiDomains,
           resolveHostIps,
           checkResolvedIps,
+          assertLeaseValid: this.opts.assertLeaseValid,
         });
 
         if (signal.aborted) break;
@@ -347,6 +351,10 @@ export class WeixinMonitor {
         consecutiveFailures = 0;
       } catch (err) {
         if (signal.aborted) break;
+        if (isLeaseSafetyMarginPauseError(err)) {
+          // Round 3 Decision #1: <5s safety margin only pauses polling; do NOT treat as fatal lease loss.
+          break;
+        }
         if (isStaleGatewayEpochError(err)) {
           this.opts.onStaleEpoch?.(err);
           break;

@@ -8,8 +8,8 @@ import {
 } from "../../backend-client.js";
 import {
   type GatewayLeaseManager,
+  isLeaseSafetyMarginPauseError,
   isStaleGatewayEpochError,
-  StaleGatewayEpochError,
 } from "../../gateway-lease.js";
 import {
   createSubsystemLogger,
@@ -202,6 +202,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     | null = null;
 
   private started = false;
+  private hasAppliedSnapshot = false;
   private backendEnabled = true;
   private backendNotFound404 = false;
   private lastRevision: number | null = null;
@@ -253,6 +254,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     ).trim();
     if (initialToken && initialBotId) {
       const accountId = opts.accountId?.trim() || "standalone";
+      this.hasAppliedSnapshot = true;
       this.accounts.set(accountId, {
         accountId,
         userId: "",
@@ -302,11 +304,52 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     this.accountInvalidatedHandler = handler;
   }
 
-  private assertLeaseLocallyValid(operation: string): void {
-    if (this.leaseManager && !this.leaseManager.isLeaseLocallyValid()) {
-      throw new StaleGatewayEpochError(
-        `Gateway lease is not locally valid before ${operation}`,
-        { status: 409, epoch: this.leaseManager.epoch },
+  private assertLeaseForOutbound(operation: string): void {
+    this.leaseManager?.assertLeaseForOutbound(operation);
+  }
+
+  private assertLeaseForDelivery(operation: string): void {
+    try {
+      this.leaseManager?.assertLeaseForOutbound(operation);
+    } catch (err) {
+      if (isLeaseSafetyMarginPauseError(err)) {
+        throw new ChannelDeliveryError(err.message, {
+          outcome: "deferred",
+          code: "unavailable",
+          retryable: true,
+          denyCode: err.code,
+        });
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Round 3 Decision #2: After `preflight-send` returns and before `sendmessage` / CDN upload,
+   * verify that the preflight's `account_id`, `ilink_bot_id`, and `bot_generation` match the
+   * current managed snapshot (when snapshots have been loaded).
+   */
+  private assertPreflightMatchesSnapshot(
+    preflight: WeixinPreflightAuthorizedData,
+  ): void {
+    const snap = this.accounts.get(preflight.account_id);
+    if (!this.hasAppliedSnapshot && !snap) {
+      return;
+    }
+    if (
+      !snap ||
+      !isPollableAccountStatus(snap.status) ||
+      snap.ilinkBotId !== preflight.ilink_bot_id ||
+      snap.botGeneration !== preflight.bot_generation
+    ) {
+      throw new ChannelDeliveryError(
+        "Weixin preflight account or bot generation does not match current managed snapshot.",
+        {
+          outcome: "failed",
+          code: "not_allowed",
+          retryable: false,
+          denyCode: "weixin_bot_generation_mismatch",
+        },
       );
     }
   }
@@ -324,6 +367,9 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       getDispatcher: () => this.httpPools.getControlDispatcher(),
       isLeaseValid: this.leaseManager
         ? () => this.leaseManager!.isLeaseLocallyValid()
+        : undefined,
+      assertLeaseValid: this.leaseManager
+        ? (operation) => this.leaseManager!.assertLeaseForOutbound(operation)
         : undefined,
       onAccountConfirmed: async (confirmed) => {
         await this.handleConfirmedAccount(confirmed);
@@ -390,7 +436,10 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     return splitTextByLimit(text, this.maxChunkChars);
   }
 
-  private createOperationSignal(initialAccountId?: string | null): {
+  private createOperationSignal(
+    initialAccountId?: string | null,
+    externalSignal?: AbortSignal,
+  ): {
     signal: AbortSignal;
     attachAccount: (accountId: string | null | undefined) => void;
     release: () => void;
@@ -398,6 +447,16 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     const controller = new AbortController();
     this.inFlightControllers.add(controller);
     let attachedAccountId: string | null = null;
+    const onExternalAbort = (): void => {
+      controller.abort();
+    };
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        controller.abort();
+      } else {
+        externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+      }
+    }
 
     const attachAccount = (accountId: string | null | undefined): void => {
       const clean = accountId?.trim() || null;
@@ -426,6 +485,9 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       signal: controller.signal,
       attachAccount,
       release: () => {
+        if (externalSignal) {
+          externalSignal.removeEventListener("abort", onExternalAbort);
+        }
         this.inFlightControllers.delete(controller);
         if (attachedAccountId) {
           const set = this.accountInFlightControllers.get(attachedAccountId);
@@ -436,6 +498,24 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         }
       },
     };
+  }
+
+  async runWithAccountOperationSignal<T>(
+    accountId: string | null | undefined,
+    fn: (ctx: {
+      signal: AbortSignal;
+      attachAccount: (id: string | null | undefined) => void;
+    }) => Promise<T>,
+  ): Promise<T> {
+    const op = this.createOperationSignal(accountId);
+    try {
+      return await fn({
+        signal: op.signal,
+        attachAccount: op.attachAccount,
+      });
+    } finally {
+      op.release();
+    }
   }
 
   private abortAccountInFlight(accountId: string): void {
@@ -667,6 +747,9 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       isLeaseValid: this.leaseManager
         ? () => this.leaseManager!.isLeaseLocallyValid()
         : undefined,
+      assertLeaseValid: this.leaseManager
+        ? () => this.leaseManager!.assertLeaseForOutbound("getupdates")
+        : undefined,
       getSharedCooldownRemainingMs: () => this.getSharedCooldownRemainingMs(),
       onInboundEvent: async (ev) => {
         if (!this.inboundHandler) return;
@@ -824,9 +907,15 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       }
 
       this.backendEnabled = true;
-      if (!resp.changed && this.lastRevision !== null) {
+      if (!resp.changed) {
+        if (this.lastRevision === null) {
+          this.lastRevision = resp.accounts_revision;
+        }
         // Decision #12: self-heal any pollable monitor whose coroutine exited
         // (e.g. after a transient lease dip) even when accounts_revision did not change.
+        // Note (Contract §2.1): real backend always returns `changed: true` on initial
+        // `since_revision: null` reconcile, so skipping `applyAccountSnapshots` when
+        // `changed === false` avoids falsely marking an empty snapshot as authoritative.
         this.ensurePollableMonitorsRunning();
         return;
       }
@@ -902,6 +991,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   private async applyAccountSnapshots(
     snapshots: readonly WeixinAccountSnapshot[],
   ): Promise<void> {
+    this.hasAppliedSnapshot = true;
     const pollableRaw = snapshots.filter(
       (s) =>
         isPollableAccountStatus(s.status) &&
@@ -1062,6 +1152,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       monitorController: null,
       monitorTask: null,
     };
+    this.hasAppliedSnapshot = true;
     this.accounts.set(confirmed.accountId, next);
     if (this.started) {
       this.startAccountMonitor(next);
@@ -1322,6 +1413,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           allowedDomains: this.opts.allowedApiDomains,
           resolveHostIps: this.opts.resolveHostIps,
           checkResolvedIps: this.opts.checkResolvedIps,
+          assertLeaseValid: () => this.assertLeaseForOutbound("sendtyping.renew"),
         })
           .then(() => {
             if (!settled && isCurrentTypingOwner()) {
@@ -1360,27 +1452,42 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       ) {
         ticket = cached.ticket;
       } else {
-        let contextToken = event.weixinContextToken?.trim() || undefined;
-        if (!contextToken && this.backend && capturedAccountId !== "standalone") {
-          try {
-            const detail = await this.backend.getWeixinAccountDetail(
-              capturedAccountId,
-              {
-                recipient_platform_user_id: ilinkUserId,
-                inbound_message_id: event.messageId,
-              },
-            );
-            contextToken = detail.weixin_context_token?.trim() || undefined;
-          } catch {
-            // Proceed best-effort without context_token if unavailable.
-          }
-        }
-        if (settled || !isSameActiveAccount() || !isCurrentTypingOwner()) {
-          stopTimer();
-          return;
-        }
+        // Round 3 Decision #13: create & register abort signal BEFORE `getWeixinAccountDetail`
+        // so lease loss or account invalidation during the lookup immediately cancels `getconfig`.
         const { signal, release } = this.createOperationSignal(capturedAccountId);
         try {
+          let contextToken = event.weixinContextToken?.trim() || undefined;
+          if (!contextToken && this.backend && capturedAccountId !== "standalone") {
+            try {
+              const detail = await this.backend.getWeixinAccountDetail(
+                capturedAccountId,
+                {
+                  recipient_platform_user_id: ilinkUserId,
+                  inbound_message_id: event.messageId,
+                },
+              );
+              if (
+                detail.ilink_bot_id !== capturedBotId ||
+                detail.bot_generation !== capturedGen ||
+                !isPollableAccountStatus(detail.status)
+              ) {
+                stopTimer();
+                return;
+              }
+              contextToken = detail.weixin_context_token?.trim() || undefined;
+            } catch {
+              // Proceed best-effort without context_token if unavailable.
+            }
+          }
+          if (
+            settled ||
+            signal.aborted ||
+            !isSameActiveAccount() ||
+            !isCurrentTypingOwner()
+          ) {
+            stopTimer();
+            return;
+          }
           const cfg = await getWeixinConfig({
             baseUrl: capturedBaseUrl,
             botToken: capturedBotToken,
@@ -1392,6 +1499,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
             allowedDomains: this.opts.allowedApiDomains,
             resolveHostIps: this.opts.resolveHostIps,
             checkResolvedIps: this.opts.checkResolvedIps,
+            assertLeaseValid: () => this.assertLeaseForOutbound("getconfig"),
           });
           ticket = cfg.typing_ticket?.trim() || undefined;
           if (ticket) {
@@ -1437,6 +1545,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           allowedDomains: this.opts.allowedApiDomains,
           resolveHostIps: this.opts.resolveHostIps,
           checkResolvedIps: this.opts.checkResolvedIps,
+          assertLeaseValid: () => this.assertLeaseForOutbound("sendtyping.start"),
         });
         typingStarted = true;
         activeTicket = ticket;
@@ -1499,6 +1608,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
               allowedDomains: this.opts.allowedApiDomains,
               resolveHostIps: this.opts.resolveHostIps,
               checkResolvedIps: this.opts.checkResolvedIps,
+              assertLeaseValid: () => this.assertLeaseForOutbound("sendtyping.cancel"),
             });
           } catch (err) {
             // Decision #15 (§4.3): log only whitelisted fields, never raw error/message text.
@@ -1532,14 +1642,14 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     envelope: OneTimeWeixinReplyEnvelope,
     dedupeKey?: string,
   ): Promise<{ sent: boolean; duplicate?: boolean; messageId?: string }> {
-    this.assertLeaseLocallyValid("sendOneTimeReply");
+    this.assertLeaseForOutbound("sendOneTimeReply");
     if (dedupeKey && this.sentOneTimeReplyKeys.has(dedupeKey)) {
       return { sent: false, duplicate: true };
     }
     const { signal, release } = this.createOperationSignal(envelope.account_id);
     try {
       const safeBaseUrl = await this.resolveSafeBaseUrl(envelope.base_url);
-      this.assertLeaseLocallyValid("sendOneTimeReply.dispatch");
+      this.assertLeaseForOutbound("sendOneTimeReply.dispatch");
       if (signal.aborted) {
         throw new ChannelDeliveryError("Weixin one-time reply aborted", {
           outcome: "failed",
@@ -1565,6 +1675,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           allowedCdnDomains: this.opts.allowedCdnDomains,
           resolveHostIps: this.opts.resolveHostIps,
           checkResolvedIps: this.opts.checkResolvedIps,
+          assertLeaseValid: () => this.assertLeaseForOutbound("sendOneTimeReply.http"),
         },
         envelope.text,
       );
@@ -1713,11 +1824,13 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   async sendTextChunk(
     options: SendTextChunkOptions,
   ): Promise<SendTextChunkResult> {
-    this.assertLeaseLocallyValid("sendTextChunk");
+    this.assertLeaseForDelivery("sendTextChunk");
     const initialAccountId =
       options.weixinPreflight?.account_id ?? options.weixinAccountId ?? null;
-    const { signal, attachAccount, release } =
-      this.createOperationSignal(initialAccountId);
+    const { signal, attachAccount, release } = this.createOperationSignal(
+      initialAccountId,
+      options.signal,
+    );
     try {
       const creds = await this.resolvePreflightOrStandaloneCredentials({
         targetAddress: options.targetAddress,
@@ -1730,7 +1843,10 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         chunkIndex: options.chunkIndex,
       });
       attachAccount(creds.accountId);
-      this.assertLeaseLocallyValid("sendTextChunk.dispatch");
+      if (creds.preflight) {
+        this.assertPreflightMatchesSnapshot(creds.preflight);
+      }
+      this.assertLeaseForDelivery("sendTextChunk.dispatch");
       if (signal.aborted) {
         throw new ChannelDeliveryError("Weixin text send aborted", {
           outcome: "failed",
@@ -1751,6 +1867,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           allowedCdnDomains: this.opts.allowedCdnDomains,
           resolveHostIps: this.opts.resolveHostIps,
           checkResolvedIps: this.opts.checkResolvedIps,
+          assertLeaseValid: () => this.assertLeaseForOutbound("sendTextChunk.http"),
           onSessionExpired: async (err) => {
             await this.markAccountSessionExpired(
               creds.accountId,
@@ -1773,11 +1890,13 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   }
 
   async sendFile(options: SendFileOptions): Promise<SendFileResult> {
-    this.assertLeaseLocallyValid("sendFile");
+    this.assertLeaseForDelivery("sendFile");
     const initialAccountId =
       options.weixinPreflight?.account_id ?? options.weixinAccountId ?? null;
-    const { signal, attachAccount, release } =
-      this.createOperationSignal(initialAccountId);
+    const { signal, attachAccount, release } = this.createOperationSignal(
+      initialAccountId,
+      options.signal,
+    );
     try {
       const creds = await this.resolvePreflightOrStandaloneCredentials({
         targetAddress: options.targetAddress,
@@ -1790,7 +1909,10 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         chunkIndex: 0,
       });
       attachAccount(creds.accountId);
-      this.assertLeaseLocallyValid("sendFile.dispatch");
+      if (creds.preflight) {
+        this.assertPreflightMatchesSnapshot(creds.preflight);
+      }
+      this.assertLeaseForDelivery("sendFile.dispatch");
       if (signal.aborted) {
         throw new ChannelDeliveryError("Weixin file send aborted", {
           outcome: "failed",
@@ -1811,6 +1933,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           allowedCdnDomains: this.opts.allowedCdnDomains,
           resolveHostIps: this.opts.resolveHostIps,
           checkResolvedIps: this.opts.checkResolvedIps,
+          assertLeaseValid: () => this.assertLeaseForOutbound("sendFile.http"),
           onSessionExpired: async (err) => {
             await this.markAccountSessionExpired(
               creds.accountId,
@@ -1831,7 +1954,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           },
           refreshAfterUpload: options.refreshWeixinPreflight
             ? async () => {
-                this.assertLeaseLocallyValid("sendFile.refreshAfterUpload");
+                this.assertLeaseForDelivery("sendFile.refreshAfterUpload");
                 if (signal.aborted) {
                   throw new ChannelDeliveryError(
                     "Weixin file send aborted before sendmessage",
@@ -1861,10 +1984,11 @@ export class WeixinChannelAdapter implements ChannelAdapter {
                     },
                   );
                 }
+                this.assertPreflightMatchesSnapshot(refreshed);
                 const safeRefreshedBase = await this.resolveSafeBaseUrl(
                   refreshed.base_url,
                 );
-                this.assertLeaseLocallyValid("sendFile.sendmessage");
+                this.assertLeaseForDelivery("sendFile.sendmessage");
                 if (signal.aborted) {
                   throw new ChannelDeliveryError(
                     "Weixin file send aborted before sendmessage",
@@ -1900,7 +2024,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     descriptor: InboundAttachmentDescriptor,
     event: InboundChannelEvent,
   ): Promise<DownloadedAttachment> {
-    this.assertLeaseLocallyValid("downloadAttachment");
+    this.assertLeaseForOutbound("downloadAttachment");
     const account = this.resolveAccountForEvent(event);
     if (account && account.status === "expired") {
       throw new Error("Weixin bot session has expired (-14)");
@@ -1928,6 +2052,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         signal,
         fetchImpl: this.opts.fetchImpl,
         dispatcher: this.httpPools.getControlDispatcher(),
+        assertLeaseValid: () => this.assertLeaseForOutbound("downloadAttachment.http"),
       });
       return {
         content: downloaded.buffer,
@@ -1997,7 +2122,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     loginVersion?: number;
     expectedBotGeneration?: number;
   }): Promise<WeixinQrStartResult> {
-    this.assertLeaseLocallyValid("startQrLogin");
+    this.assertLeaseForOutbound("startQrLogin");
     if (!this.qrManager) {
       throw new Error(
         "Weixin QR login manager is not initialized with a BackendClient",
@@ -2020,7 +2145,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     userId: string;
     sessionKey: string;
   }): Promise<WeixinQrWaitResult> {
-    this.assertLeaseLocallyValid("waitQrLogin");
+    this.assertLeaseForOutbound("waitQrLogin");
     if (!this.qrManager) {
       throw new Error(
         "Weixin QR login manager is not initialized with a BackendClient",
@@ -2043,7 +2168,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     sessionKey: string;
     code: string;
   }): Promise<WeixinQrWaitResult> {
-    this.assertLeaseLocallyValid("submitVerifyCode");
+    this.assertLeaseForOutbound("submitVerifyCode");
     if (!this.qrManager) {
       throw new Error(
         "Weixin QR login manager is not initialized with a BackendClient",

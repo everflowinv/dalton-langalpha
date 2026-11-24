@@ -7,6 +7,7 @@ import {
   type WeixinLoginSessionGetResponse,
 } from "../../backend-client.js";
 import {
+  isLeaseSafetyMarginPauseError,
   isStaleGatewayEpochError,
   StaleGatewayEpochError,
 } from "../../gateway-lease.js";
@@ -71,6 +72,11 @@ export interface WeixinQrLoginManagerOptions {
   getDispatcher?: () => unknown;
   /** Synchronous local lease check before contacting iLink (Decision #1). */
   isLeaseValid?: () => boolean;
+  /**
+   * Synchronous lease gate differentiating expired lease (`StaleGatewayEpochError`)
+   * from `<5s` safety margin pause (`LeaseSafetyMarginPauseError`, Round 3 Decision #1).
+   */
+  assertLeaseValid?: (operation: string) => void;
   onAccountConfirmed?: (account: ConfirmedWeixinAccount) => Promise<void> | void;
 }
 
@@ -85,33 +91,66 @@ function isDomainAllowed(
   });
 }
 
-function extractBackendErrorMeta(body: unknown): {
-  code?: string;
-  message?: string;
-} {
+/**
+ * Allowlist of Weixin QR login error codes mapped to fixed, safe public messages
+ * (Round 3 Decision #10 / §4.3). Arbitrary backend or iLink free-text `message`
+ * values are NEVER forwarded to HTTP responses.
+ */
+export const SAFE_WEIXIN_QR_ERROR_MESSAGES: Readonly<Record<string, string>> = {
+  unauthorized: "Missing or invalid authenticated user.",
+  invalid_request: "Invalid Weixin QR login request.",
+  forbidden: "Weixin QR login session belongs to a different user.",
+  channel_disabled: "Weixin channel is currently disabled.",
+  weixin_channel_disabled: "Weixin channel is currently disabled.",
+  login_session_revoked: "Weixin QR login session was superseded or expired.",
+  ilink_user_already_bound: "This WeChat account is already bound to another user.",
+  weixin_capacity_reached: "Weixin active account capacity limit has been reached.",
+  roster_lookup_error: "Unable to verify team roster right now; please retry shortly.",
+  member_not_in_roster: "Your account is not eligible for Weixin channel access.",
+  external_member_forbidden: "External members are not permitted to bind Weixin.",
+  ilink_invalid_qrcode: "Weixin iLink did not return a valid QR code.",
+  ilink_invalid_confirm: "Weixin login confirmation response was incomplete.",
+  gateway_lease_paused: "Gateway lease is renewing; please retry shortly.",
+  qr_login_error: "Weixin QR login request failed.",
+};
+
+export function resolveSafeQrError(
+  rawCode: string | undefined | null,
+  fallbackCode = "qr_login_error",
+): { code: string; message: string } {
+  const cleanCode = rawCode?.trim();
+  if (cleanCode && cleanCode in SAFE_WEIXIN_QR_ERROR_MESSAGES) {
+    return {
+      code: cleanCode,
+      message: SAFE_WEIXIN_QR_ERROR_MESSAGES[cleanCode]!,
+    };
+  }
+  const safeFallback =
+    fallbackCode in SAFE_WEIXIN_QR_ERROR_MESSAGES
+      ? fallbackCode
+      : "qr_login_error";
+  return {
+    code: safeFallback,
+    message: SAFE_WEIXIN_QR_ERROR_MESSAGES[safeFallback]!,
+  };
+}
+
+function extractBackendErrorCode(body: unknown): string | undefined {
   if (!body || typeof body !== "object") {
-    return {};
+    return undefined;
   }
   const obj = body as Record<string, unknown>;
   const detail =
     obj.detail && typeof obj.detail === "object"
       ? (obj.detail as Record<string, unknown>)
       : null;
-  const code =
-    typeof obj.code === "string"
-      ? obj.code
-      : typeof detail?.code === "string"
-        ? detail.code
-        : undefined;
-  const message =
-    typeof obj.message === "string"
-      ? obj.message
-      : typeof detail?.message === "string"
-        ? detail.message
-        : typeof obj.detail === "string"
-          ? obj.detail
-          : undefined;
-  return { code, message };
+  if (typeof obj.code === "string" && obj.code.trim()) {
+    return obj.code.trim();
+  }
+  if (typeof detail?.code === "string" && detail.code.trim()) {
+    return detail.code.trim();
+  }
+  return undefined;
 }
 
 export function sanitizeQrCodeImageContent(
@@ -264,6 +303,7 @@ export class WeixinQrLoginManager {
   private readonly fetchImpl?: typeof fetch;
   private readonly getDispatcher?: () => unknown;
   private readonly isLeaseValid?: () => boolean;
+  private readonly assertLeaseValidFn?: (operation: string) => void;
   private readonly onAccountConfirmed?: (
     account: ConfirmedWeixinAccount,
   ) => Promise<void> | void;
@@ -283,10 +323,15 @@ export class WeixinQrLoginManager {
     this.fetchImpl = opts.fetchImpl;
     this.getDispatcher = opts.getDispatcher;
     this.isLeaseValid = opts.isLeaseValid;
+    this.assertLeaseValidFn = opts.assertLeaseValid;
     this.onAccountConfirmed = opts.onAccountConfirmed;
   }
 
   private assertLeaseValid(operation: string): void {
+    if (this.assertLeaseValidFn) {
+      this.assertLeaseValidFn(operation);
+      return;
+    }
     if (this.isLeaseValid && !this.isLeaseValid()) {
       throw new StaleGatewayEpochError(
         `Gateway lease is not locally valid before ${operation}`,
@@ -353,16 +398,14 @@ export class WeixinQrLoginManager {
       allowedDomains: this.allowedApiDomains,
       resolveHostIps: this.resolveHostIps,
       checkResolvedIps: this.checkResolvedIps,
+      assertLeaseValid: () => this.assertLeaseValid("fetchWeixinQrCode"),
     });
 
     const qrcode = qrResp.qrcode?.trim();
     const qrcodeImgContent = qrResp.qrcode_img_content?.trim();
     if (!qrcode || !qrcodeImgContent) {
-      throw new WeixinQrLoginError(
-        "Weixin iLink did not return a valid QR code",
-        502,
-        "ilink_invalid_qrcode",
-      );
+      const safe = resolveSafeQrError("ilink_invalid_qrcode");
+      throw new WeixinQrLoginError(safe.message, 502, safe.code);
     }
 
     const fallbackExpiresAt = new Date(
@@ -381,26 +424,23 @@ export class WeixinQrLoginManager {
         redirect_base_url: this.baseUrl,
       });
     } catch (err) {
-      if (isStaleGatewayEpochError(err)) {
+      if (isStaleGatewayEpochError(err) || isLeaseSafetyMarginPauseError(err)) {
         throw err;
       }
       if (err instanceof BackendHttpError) {
-        const meta = extractBackendErrorMeta(err.body);
-        throw new WeixinQrLoginError(
-          meta.message ?? "Failed to save Weixin QR login session.",
-          err.status,
-          meta.code,
+        const rawCode = extractBackendErrorCode(err.body);
+        const safe = resolveSafeQrError(
+          rawCode,
+          err.status === 409 ? "login_session_revoked" : "qr_login_error",
         );
+        throw new WeixinQrLoginError(safe.message, err.status, safe.code);
       }
       throw err;
     }
 
     if (saved.revoked || !saved.ok) {
-      throw new WeixinQrLoginError(
-        saved.message ?? "Weixin QR login session was superseded or revoked.",
-        409,
-        saved.code ?? "login_session_revoked",
-      );
+      const safe = resolveSafeQrError(saved.code, "login_session_revoked");
+      throw new WeixinQrLoginError(safe.message, 409, safe.code);
     }
 
     return shapePublicQrStartResponse({
@@ -602,12 +642,9 @@ export class WeixinQrLoginManager {
             }),
           };
         }
-        const meta = extractBackendErrorMeta(err.body);
-        throw new WeixinQrLoginError(
-          meta.message ?? `Failed to read QR login session (${err.status})`,
-          err.status,
-          meta.code,
-        );
+        const rawCode = extractBackendErrorCode(err.body);
+        const safe = resolveSafeQrError(rawCode, "qr_login_error");
+        throw new WeixinQrLoginError(safe.message, err.status, safe.code);
       }
       throw err;
     }
@@ -647,6 +684,7 @@ export class WeixinQrLoginManager {
       allowedDomains: this.allowedApiDomains,
       resolveHostIps: this.resolveHostIps,
       checkResolvedIps: this.checkResolvedIps,
+      assertLeaseValid: () => this.assertLeaseValid("pollWeixinQrStatus"),
     });
 
     return this.handleStatusPollResult(
@@ -707,6 +745,7 @@ export class WeixinQrLoginManager {
       allowedDomains: this.allowedApiDomains,
       resolveHostIps: this.resolveHostIps,
       checkResolvedIps: this.checkResolvedIps,
+      assertLeaseValid: () => this.assertLeaseValid("submitWeixinQrVerifyCode"),
     });
 
     return this.handleStatusPollResult(
@@ -732,23 +771,25 @@ export class WeixinQrLoginManager {
         redirect_base_url: redirectBaseUrl,
       });
       if (upd.revoked || !upd.ok) {
+        const safe = resolveSafeQrError(upd.code, "login_session_revoked");
         return {
           revoked: true,
-          code: upd.code ?? "login_session_revoked",
-          message: upd.message ?? "QR login session was superseded.",
+          code: safe.code,
+          message: safe.message,
         };
       }
       return { revoked: false };
     } catch (err) {
-      if (isStaleGatewayEpochError(err)) {
+      if (isStaleGatewayEpochError(err) || isLeaseSafetyMarginPauseError(err)) {
         throw err;
       }
       if (err instanceof BackendHttpError && err.status === 409) {
-        const meta = extractBackendErrorMeta(err.body);
+        const rawCode = extractBackendErrorCode(err.body);
+        const safe = resolveSafeQrError(rawCode, "login_session_revoked");
         return {
           revoked: true,
-          code: meta.code ?? "login_session_revoked",
-          message: meta.message ?? "QR login session was superseded.",
+          code: safe.code,
+          message: safe.message,
         };
       }
       throw err;
@@ -894,30 +935,29 @@ export class WeixinQrLoginManager {
         ilink_username: statusResp.ilink_username?.trim() || undefined,
       });
     } catch (err) {
-      if (isStaleGatewayEpochError(err)) {
+      if (isStaleGatewayEpochError(err) || isLeaseSafetyMarginPauseError(err)) {
         throw err;
       }
       if (err instanceof BackendHttpError) {
-        const meta = extractBackendErrorMeta(err.body);
-        throw new WeixinQrLoginError(
-          meta.message ?? `Failed to confirm Weixin QR login (${err.status})`,
-          err.status,
-          meta.code,
+        const rawCode = extractBackendErrorCode(err.body);
+        const safe = resolveSafeQrError(
+          rawCode,
+          err.status === 409 ? "login_session_revoked" : "qr_login_error",
         );
+        throw new WeixinQrLoginError(safe.message, err.status, safe.code);
       }
       throw err;
     }
 
     if (confirmRes.revoked || !confirmRes.ok) {
+      const safe = resolveSafeQrError(confirmRes.code, "login_session_revoked");
       return shapePublicQrWaitResponse({
         sessionKey,
         status: "superseded",
         connected: false,
         revoked: true,
-        code: confirmRes.code ?? "login_session_revoked",
-        message:
-          confirmRes.message ??
-          "QR login session was superseded or expired before confirmation.",
+        code: safe.code,
+        message: safe.message,
       });
     }
 

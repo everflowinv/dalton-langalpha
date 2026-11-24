@@ -81,7 +81,13 @@ export interface DataTaskDownloadedArtifact {
 export interface DataTaskItemDeliveryOutcome {
   item_index: number;
   delivery_key: string;
-  status: "sent" | "partial" | "failed" | "unknown" | "deferred";
+  status:
+    | "sent"
+    | "partial"
+    | "failed"
+    | "unknown"
+    | "deferred"
+    | "partial_deferred";
   duplicate: boolean;
   platform_message_ids: string[];
   code?: string | null;
@@ -90,7 +96,13 @@ export interface DataTaskItemDeliveryOutcome {
 
 export interface DataTaskNotificationResponse {
   ok: boolean;
-  status: "sent" | "skipped" | "failed" | "unknown" | "deferred";
+  status:
+    | "sent"
+    | "skipped"
+    | "failed"
+    | "unknown"
+    | "deferred"
+    | "partial_deferred";
   code: string | null;
   message: string;
   run_id: string;

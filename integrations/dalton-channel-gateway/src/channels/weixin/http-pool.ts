@@ -11,9 +11,12 @@
  * that rely on Node's built-in fetch without an explicit `undici` dependency.
  */
 
+import { createSubsystemLogger, type SubsystemLogger } from "../../shared/logger.js";
+
 export const WEIXIN_POLL_POOL_HEADROOM = 16;
 export const WEIXIN_CONTROL_POOL_CONNECTIONS = 64;
-export const WEIXIN_POLL_POOL_TIMEOUT_MS = 45_000;
+/** Must exceed max `longpolling_timeout_ms` (60s) with headroom so undici never aborts valid long polls (Round 3 Decision #8). */
+export const WEIXIN_POLL_POOL_TIMEOUT_MS = 75_000;
 export const WEIXIN_CONTROL_POOL_TIMEOUT_MS = 30_000;
 
 export interface WeixinHttpAgentOptions {
@@ -37,10 +40,15 @@ type UndiciAgentCtor = new (
   options: WeixinHttpAgentOptions,
 ) => ClosableHttpDispatcher;
 
+const poolLogger: SubsystemLogger = createSubsystemLogger("weixin/http-pool");
+
 let cachedUndiciAgentCtor: UndiciAgentCtor | null | undefined;
 let undiciLoadPromise: Promise<UndiciAgentCtor | null> | null = null;
+let undiciImportWarned = false;
 
-async function loadUndiciAgentCtor(): Promise<UndiciAgentCtor | null> {
+async function loadUndiciAgentCtor(
+  logger: SubsystemLogger = poolLogger,
+): Promise<UndiciAgentCtor | null> {
   if (cachedUndiciAgentCtor !== undefined) {
     return cachedUndiciAgentCtor;
   }
@@ -49,10 +57,32 @@ async function loadUndiciAgentCtor(): Promise<UndiciAgentCtor | null> {
       try {
         const modName = "undici";
         const mod = (await import(modName)) as { Agent?: UndiciAgentCtor };
-        cachedUndiciAgentCtor =
-          typeof mod?.Agent === "function" ? mod.Agent : null;
-      } catch {
+        if (typeof mod?.Agent === "function") {
+          cachedUndiciAgentCtor = mod.Agent;
+        } else {
+          cachedUndiciAgentCtor = null;
+          if (!undiciImportWarned) {
+            undiciImportWarned = true;
+            logger.warn(
+              "Loaded undici module without Agent export; Weixin HTTP pools falling back to default fetch dispatcher",
+            );
+          }
+        }
+      } catch (err) {
         cachedUndiciAgentCtor = null;
+        if (!undiciImportWarned) {
+          undiciImportWarned = true;
+          logger.warn(
+            "Failed to load undici Agent; Weixin HTTP pools falling back to default fetch dispatcher",
+            {
+              error_name: err instanceof Error ? err.name : "Error",
+              error_code:
+                typeof (err as { code?: unknown })?.code === "string"
+                  ? (err as { code: string }).code
+                  : undefined,
+            },
+          );
+        }
       }
       return cachedUndiciAgentCtor;
     })();

@@ -368,9 +368,14 @@ export interface I3SessionCommandResponse {
   switched?: boolean;
   /** Weixin collection mode / help fields. */
   collect_buffer_id?: string | null;
-  collect_status?: "collecting" | "done" | "cancelled" | "empty" | "not_collecting" | string | null;
+  collect_status?: "collecting" | "flushing" | "done" | "cancelled" | "empty" | "not_collecting" | string | null;
+  /** Plural array of cancelled collect buffer IDs per contract §5.3 (`I-3 /cancel`). */
+  cancelled_buffer_ids?: string[];
+  /** Legacy singular field retained for backward compatibility. */
   cancelled_buffer_id?: string | null;
   reply_text?: string | null;
+  message?: string | null;
+  help_text?: string | null;
   flushed_inbound?: WeixinFlushedInbound | null;
   one_time_weixin_reply?: OneTimeWeixinReplyEnvelope | null;
 }
@@ -485,17 +490,43 @@ export interface I6AuthorizeAndClaimResponse {
     | "already_completed"
     | "in_flight_or_unknown"
     | "denied"
+    | "deferred"
     | "claimed";
-  status?: "sent" | "partial" | "failed" | "unknown";
+  status?:
+    | "sent"
+    | "partial"
+    | "failed"
+    | "unknown"
+    | "deferred"
+    | "partial_deferred";
   code?:
     | "not_linked"
     | "not_allowed"
     | "no_current_conversation"
     | "unknown_delivery_blocks_fallback"
     | "in_flight"
+    | "delivery_deferred"
+    | "roster_lookup_error"
+    | "deferred_timeout"
     | string
     | null;
   message?: string;
+  retryable?: boolean;
+  defer_count?: number;
+  first_deferred_at?: string | null;
+  next_retry_at?: string | null;
+  retry_after_seconds?: number | null;
+  retry_after_ms?: number | null;
+  /** Resume breakpoints persisted on deferred / partial_deferred deliveries (contract §7.1). */
+  sent_chunks?: number;
+  total_chunks?: number;
+  platform_message_ids?: string[];
+  files_status?: Array<{
+    path: string;
+    status: "sent" | "linked" | "failed" | "unknown";
+    reason: string | null;
+  }>;
+  delivered_segments?: unknown[];
   first_response_json?: Record<string, unknown> | null;
   /** Platform recipient identifier (`platform_user_id` for DM, `chat_id` for group). */
   recipient_id?: string;
@@ -542,8 +573,24 @@ export interface I7DeliveriesProgressRequest {
     status: "sent" | "linked" | "failed" | "unknown";
     reason: string | null;
   }>;
+  delivered_segments?: unknown[];
   first_response_json?: Record<string, unknown>;
-  status?: "in_flight" | "sent" | "partial" | "failed" | "unknown" | "deferred";
+  status?:
+    | "in_flight"
+    | "sent"
+    | "partial"
+    | "failed"
+    | "unknown"
+    | "deferred"
+    | "partial_deferred";
+  outcome?:
+    | "sent"
+    | "partial"
+    | "failed"
+    | "unknown"
+    | "deferred"
+    | "partial_deferred"
+    | null;
   error_code?: string | null;
   error_message?: string | null;
   /** Full Discord thread address. Omitted unless this call confirms a thread. */
@@ -564,6 +611,23 @@ export interface I7DeliveriesProgressResponse {
   ok: boolean;
   delivery_key: string;
   status: string;
+  outcome?: string | null;
+  defer_count?: number;
+  first_deferred_at?: string | null;
+  next_retry_at?: string | null;
+  retry_after_seconds?: number | null;
+  retry_after_ms?: number | null;
+  expired_to_failed?: boolean;
+  idempotent_replay?: boolean;
+  sent_chunks?: number;
+  total_chunks?: number;
+  platform_message_ids?: string[];
+  files_status?: Array<{
+    path: string;
+    status: "sent" | "linked" | "failed" | "unknown";
+    reason: string | null;
+  }>;
+  delivered_segments?: unknown[];
   sent_to_current_count: number;
   /** Echo of the stored Discord thread address, or null when none is stored. */
   confirmed_thread_address?: string | null;
@@ -571,6 +635,51 @@ export interface I7DeliveriesProgressResponse {
   discord_body_phase?: "before_body" | "dispatching" | null;
   /** Echo of the stored claim generation. Progress does not increment it. */
   delivery_attempt?: number;
+}
+
+export interface DeferredDeliveryDueRow {
+  delivery_key: string;
+  kind: string;
+  user_id?: string | null;
+  thread_id?: string | null;
+  run_id?: string | null;
+  execution_id?: string | null;
+  is_current?: boolean;
+  has_non_empty_text?: boolean;
+  platform: string;
+  target_address: string;
+  status: "deferred" | "partial_deferred" | string;
+  error_code?: string | null;
+  error_message?: string | null;
+  defer_count: number;
+  first_deferred_at?: string | null;
+  next_retry_at?: string | null;
+  sent_chunks: number;
+  total_chunks: number;
+  platform_message_ids?: string[];
+  files_status?: Array<{
+    path: string;
+    status: "sent" | "linked" | "failed" | "unknown";
+    reason: string | null;
+  }>;
+  delivered_segments?: unknown[];
+  source_scope_key?: string | null;
+  source_generation?: number | null;
+  activity_origin?: DeliveryActivityOrigin | null;
+  delivery_attempt?: number;
+  weixin_account_id?: string | null;
+  weixin_bot_id?: string | null;
+  weixin_bot_generation?: number | null;
+  weixin_recipient_id?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface DeferredDeliveriesDueResponse {
+  ok: boolean;
+  expired_count: number;
+  next_upcoming_retry_at?: string | null;
+  deliveries: DeferredDeliveryDueRow[];
 }
 
 export type InboundEventStatus =
@@ -780,6 +889,7 @@ export interface I7RecoverResponse {
   thread_watches: RecoverThreadWatchRow[];
   automation_runs?: RecoverAutomationRunRow[];
   flushing_collect_buffers?: RecoverFlushingCollectBufferRow[];
+  deferred_deliveries?: DeferredDeliveryDueRow[];
 }
 
 export interface I8AutomationRunStartRequest {
@@ -988,7 +1098,19 @@ export interface WeixinCollectBufferStatusResponse {
   ok?: boolean;
   buffer_id?: string;
   status: "collecting" | "flushing" | "done" | "cancelled" | "expired" | string;
-  upload_status?: "pending" | "ready" | "failed" | "cancelled" | string | null;
+  /** Contract §4.1: `"pending_upload" | "ready" | "failed" | null`. */
+  upload_status?: "pending_upload" | "ready" | "failed" | string | null;
+  /** Contract §4.1 alias of `upload_status`. */
+  item_upload_status?: "pending_upload" | "ready" | "failed" | string | null;
+  account_id?: string | null;
+  dalton_user_id?: string | null;
+  workspace_id?: string | null;
+  scope_key?: string | null;
+  session_generation?: number;
+  bot_generation?: number;
+  item_count?: number;
+  expires_at?: string | null;
+  max_expires_at?: string | null;
   cancelled?: boolean;
 }
 
@@ -1000,9 +1122,9 @@ export interface WeixinCollectAttachmentsRegisterRequest {
 
 export interface WeixinCollectAttachmentsRegisterResponse {
   ok: boolean;
-  upload_status: "ready" | "failed" | "cancelled" | string;
+  upload_status: "ready" | "failed" | "cancelled" | "too_late" | string;
   collect_buffer_status: string;
-  code?: string | null;
+  code?: "collect_buffer_cancelled" | "collect_buffer_too_late" | string | null;
   message?: string | null;
 }
 
@@ -1217,8 +1339,14 @@ export interface BackendClient {
     req: I6AuthorizeAndClaimRequest,
   ): Promise<I6AuthorizeAndClaimResponse>;
 
+  getDueDeferredDeliveries?(params?: {
+    platform?: string | null;
+    limit?: number;
+  }): Promise<DeferredDeliveriesDueResponse>;
+
   updateDeliveryProgress(
     req: I7DeliveriesProgressRequest,
+    options?: { platform?: string | null },
   ): Promise<I7DeliveriesProgressResponse>;
 
   updateInboundProgress(
@@ -1370,6 +1498,12 @@ export interface BackendClient {
     mimeType: string,
     signal?: AbortSignal,
   ): Promise<void>;
+
+  deleteWorkspaceFiles?(
+    userId: string,
+    workspaceId: string,
+    paths: string[],
+  ): Promise<{ deleted: string[]; errors: Array<{ path: string; detail: string }> }>;
 
   downloadWorkspaceFile(
     userId: string,
@@ -1831,9 +1965,33 @@ export class HttpBackendClient implements BackendClient {
   }
 
   // --- I-6 ---
+  private inferPlatformForEpoch(
+    explicitPlatform?: string | null,
+    targetAddress?: string | null,
+  ): string | null {
+    const cleanExplicit = explicitPlatform?.trim().toLowerCase();
+    if (cleanExplicit) return cleanExplicit;
+    const cleanTarget = targetAddress?.trim().toLowerCase();
+    if (cleanTarget && cleanTarget.includes(":")) {
+      const prefix = cleanTarget.split(":", 1)[0]?.trim();
+      if (prefix === "feishu" || prefix === "discord" || prefix === "weixin") {
+        return prefix;
+      }
+    }
+    return null;
+  }
+
   async authorizeAndClaimDelivery(
     req: I6AuthorizeAndClaimRequest,
   ): Promise<I6AuthorizeAndClaimResponse> {
+    // Contract §0 & §7 (Round 3 Decision #9): attach X-Gateway-Epoch on I-6 ONLY for Weixin
+    // (or ambiguous current-conversation target when platform is omitted); omit for Feishu / Discord.
+    const inferredPlatform = this.inferPlatformForEpoch(
+      req.platform,
+      req.target,
+    );
+    const includeGatewayEpoch =
+      inferredPlatform === "weixin" || inferredPlatform === null;
     if (req.kind === "data_task" || req.kind === "automation_notify") {
       const { data } = await this.jsonRequest<I6AuthorizeAndClaimResponse>(
         "POST",
@@ -1846,7 +2004,7 @@ export class HttpBackendClient implements BackendClient {
           cache: "no-store",
           strictJson: true,
           operationLabel: "I-6 authorize-and-claim",
-          includeGatewayEpoch: true,
+          includeGatewayEpoch,
         },
       );
       return data;
@@ -1854,7 +2012,7 @@ export class HttpBackendClient implements BackendClient {
     const { status, data } = await this.jsonRequest<I6AuthorizeAndClaimResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
-      { userId: req.user_id, body: req, includeGatewayEpoch: true },
+      { userId: req.user_id, body: req, includeGatewayEpoch },
     );
     if (status >= 400) {
       throw new BackendHttpError(
@@ -1866,10 +2024,63 @@ export class HttpBackendClient implements BackendClient {
     return data;
   }
 
+  async getDueDeferredDeliveries(params?: {
+    platform?: string | null;
+    limit?: number;
+  }): Promise<DeferredDeliveriesDueResponse> {
+    const plat = params?.platform?.trim().toLowerCase() || null;
+    const includeGatewayEpoch = plat === "weixin" || plat === null;
+    const { status, data } =
+      await this.jsonRequest<DeferredDeliveriesDueResponse>(
+        "GET",
+        "/api/v1/dalton/channels/internal/deliveries/deferred-due",
+        {
+          query: {
+            platform: plat ?? undefined,
+            limit:
+              typeof params?.limit === "number" && params.limit > 0
+                ? String(Math.trunc(params.limit))
+                : undefined,
+          },
+          timeoutMs: 15_000,
+          includeGatewayEpoch,
+        },
+      );
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `deliveries/deferred-due failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return data;
+  }
+
   // --- I-7 (1) ---
   async updateDeliveryProgress(
     req: I7DeliveriesProgressRequest,
+    options?: { platform?: string | null },
   ): Promise<I7DeliveriesProgressResponse> {
+    // Contract §0 & §7 (Round 3 Decision #9): attach X-Gateway-Epoch on I-7 deliveries/progress
+    // ONLY when target platform is Weixin; omit for Feishu / Discord.
+    const rawAddr =
+      typeof req.first_response_json?.address === "string"
+        ? req.first_response_json.address
+        : null;
+    const inferredFromKey =
+      typeof req.delivery_key === "string" &&
+      req.delivery_key.startsWith("notice:weixin:")
+        ? "weixin"
+        : typeof req.delivery_key === "string" &&
+            (req.delivery_key.startsWith("notice:feishu:") ||
+              req.delivery_key.startsWith("notice:discord:"))
+          ? req.delivery_key.split(":")[1]
+          : null;
+    const resolvedPlatform = this.inferPlatformForEpoch(
+      options?.platform ?? inferredFromKey,
+      rawAddr,
+    );
+    const includeGatewayEpoch = resolvedPlatform === "weixin";
     if (
       typeof req.delivery_key === "string" &&
       (req.delivery_key.startsWith("data_task:") ||
@@ -1885,7 +2096,7 @@ export class HttpBackendClient implements BackendClient {
           cache: "no-store",
           strictJson: true,
           operationLabel: "I-7 deliveries/progress",
-          includeGatewayEpoch: true,
+          includeGatewayEpoch,
         },
       );
       return data;
@@ -1893,7 +2104,7 @@ export class HttpBackendClient implements BackendClient {
     const { status, data } = await this.jsonRequest<I7DeliveriesProgressResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/deliveries/progress",
-      { body: req, includeGatewayEpoch: true },
+      { body: req, includeGatewayEpoch },
     );
     if (status >= 400) {
       throw new BackendHttpError(
@@ -1909,10 +2120,20 @@ export class HttpBackendClient implements BackendClient {
   async updateInboundProgress(
     req: I7InboundProgressRequest,
   ): Promise<I7InboundProgressResponse> {
+    const inferredPlatform = (
+      req.platform ??
+      req.thread_watch?.platform ??
+      req.background_run?.platform ??
+      req.session_interrupt_update?.platform ??
+      ""
+    )
+      .trim()
+      .toLowerCase();
+    const includeGatewayEpoch = inferredPlatform === "weixin";
     const { status, data } = await this.jsonRequest<I7InboundProgressResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/inbound/progress",
-      { body: req, includeGatewayEpoch: true },
+      { body: req, includeGatewayEpoch },
     );
     if (status >= 400) {
       throw new BackendHttpError(
@@ -1928,10 +2149,12 @@ export class HttpBackendClient implements BackendClient {
   async reconcileSteer(
     req: I7SteersReconcileRequest,
   ): Promise<I7SteersReconcileResponse> {
+    const includeGatewayEpoch =
+      (req.platform ?? "").trim().toLowerCase() === "weixin";
     const { status, data } = await this.jsonRequest<I7SteersReconcileResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/steers/reconcile",
-      { body: req, includeGatewayEpoch: true },
+      { body: req, includeGatewayEpoch },
     );
     if (status >= 400) {
       throw new BackendHttpError(
@@ -2526,6 +2749,40 @@ export class HttpBackendClient implements BackendClient {
       const errText = await resp.text();
       throw new Error(`uploadWorkspaceFile failed (${resp.status}): ${errText}`);
     }
+  }
+
+  /**
+   * Best-effort cleanup of workspace files uploaded by a cancelled collect-buffer item
+   * (`DELETE /api/v1/workspaces/{workspace_id}/files`, Round 3 Decision #7).
+   */
+  async deleteWorkspaceFiles(
+    userId: string,
+    workspaceId: string,
+    paths: string[],
+  ): Promise<{ deleted: string[]; errors: Array<{ path: string; detail: string }> }> {
+    const cleanPaths = paths.map((p) => p.trim()).filter(Boolean);
+    if (cleanPaths.length === 0) {
+      return { deleted: [], errors: [] };
+    }
+    const { status, data } = await this.jsonRequest<{
+      deleted?: string[];
+      errors?: Array<{ path: string; detail: string }>;
+    }>("DELETE", `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/files`, {
+      userId,
+      body: { paths: cleanPaths },
+      timeoutMs: 15_000,
+    });
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `deleteWorkspaceFiles failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return {
+      deleted: Array.isArray(data?.deleted) ? data.deleted : [],
+      errors: Array.isArray(data?.errors) ? data.errors : [],
+    };
   }
 
   async downloadWorkspaceFile(
