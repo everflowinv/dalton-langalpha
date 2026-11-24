@@ -996,12 +996,12 @@ async def require_workspace_access(
         raise HTTPException(status_code=404, detail="Workspace not found")
 
     owner_id = str(ws.get("user_id") or "").strip()
-    if owner_id != uid and await _is_home_stand_in_workspace(
-        ws, fetch_if_missing_config=caller_passed_dict, conn=conn
-    ):
-        raise HTTPException(status_code=404, detail="Workspace not found")
 
     if not _sharing_auth_enabled():
+        if owner_id != uid and await _is_home_stand_in_workspace(
+            ws, fetch_if_missing_config=caller_passed_dict, conn=conn
+        ):
+            raise HTTPException(status_code=404, detail="Workspace not found")
         auth_api.require_workspace_owner(ws, user_id=uid)
         ws["_caller_web_access"] = "owner"
         ws["_caller_cos_access"] = "owner"
@@ -1059,7 +1059,13 @@ async def require_workspace_access(
         if cleaned_channel == "cos":
             raise HTTPException(status_code=404, detail="Workspace not found")
 
-    # Personal Home workspaces (and Home stand-ins) and deleted/unbound workspaces are never shared with colleagues.
+    # Home stand-ins never leak existence to non-owners (uniform 404 before Home/status 403 and sharing checks).
+    if await _is_home_stand_in_workspace(
+        ws, fetch_if_missing_config=caller_passed_dict, conn=conn
+    ):
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    # Personal Home workspaces and deleted/unbound workspaces are never shared with colleagues.
     if (
         is_reserved_row(ws)
         or bool(ws.get("is_home"))
