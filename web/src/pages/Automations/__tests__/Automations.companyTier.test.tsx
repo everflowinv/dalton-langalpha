@@ -213,8 +213,8 @@ describe('company group when Dalton credentials/status fails', () => {
     expect(await screen.findByRole('button', { name: /Morning note/ }, { timeout: TIER_WAIT_MS })).toBeInTheDocument();
     await settledTier(queryClient, 'error');
 
-    expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument();
-    expect(screen.getByRole('region', { name: label('automation.groupMine') })).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: label('automation:groupCompany') })).not.toBeInTheDocument();
+    expect(screen.getByRole('region', { name: label('automation:groupMine') })).toBeInTheDocument();
     expectNoCompanyReads();
     expect(api.listAutomationReads).toHaveBeenCalledWith(
       expect.objectContaining({ scope: 'personal', includeDeleted: true, limit: 50, offset: 0 }),
@@ -231,14 +231,14 @@ describe('company group when Dalton credentials/status fails', () => {
     expect(await screen.findByRole('button', { name: /Morning note/ })).toBeInTheDocument();
     await settledTier(queryClient, 'success');
     expect(queryClient.getQueryData(tierKey())).toMatchObject({ caller_tier: 'external' });
-    expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: label('automation:groupCompany') })).not.toBeInTheDocument();
     expectNoCompanyReads();
 
     statusApi.get.mockImplementation(rejectStatus);
     await queryClient.invalidateQueries({ queryKey: tierKey() });
     await settledTier(queryClient, 'error');
 
-    expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: label('automation:groupCompany') })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Morning note/ })).toBeInTheDocument();
     expectNoCompanyReads();
   }, 15_000);
@@ -250,7 +250,7 @@ describe('company group when Dalton credentials/status fails', () => {
     });
     const { queryClient } = renderWithProviders(<Automations />, { route: '/automations?view=manage' });
 
-    expect(await screen.findByRole('region', { name: label('automation.groupCompany') }, { timeout: TIER_WAIT_MS })).toBeInTheDocument();
+    expect(await screen.findByRole('region', { name: label('automation:groupCompany') }, { timeout: TIER_WAIT_MS })).toBeInTheDocument();
     await settledTier(queryClient, 'success');
     expect(screen.getByRole('button', { name: /Desk brief/ })).toBeInTheDocument();
     expect(api.listAutomationReads).toHaveBeenCalledWith({ scope: 'company', limit: 50, offset: 0 });

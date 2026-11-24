@@ -1,7 +1,8 @@
 import React, { Suspense, useCallback, useRef, useState } from 'react';
 import { preloadableLazy } from '@/lib/lazyWithMotion';
+import { withCopy } from '@/i18n';
 
-const PublishDialog = preloadableLazy(() => import('../PublishDialog'));
+const PublishDialog = preloadableLazy(withCopy(() => import('../PublishDialog'), ['monitors', 'publish'])); // DALTON-HOOK(monitors)
 
 interface Publishing {
   workspaceId: string;

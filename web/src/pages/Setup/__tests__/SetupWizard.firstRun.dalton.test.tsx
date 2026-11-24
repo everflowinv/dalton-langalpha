@@ -491,12 +491,7 @@ beforeAll(async () => {
     { shellTarget },
     { default: SetupWizard },
     { initI18n, default: i18n },
-    { default: enUS },
-    { default: zhCN },
-    { default: enUSIntros },
-    { default: zhCNIntros },
-    { default: enUSFirstRun },
-    { default: zhCNFirstRun },
+    { resources },
   ] = await Promise.all([
     import('@tanstack/react-query'),
     import('react-router'),
@@ -508,12 +503,7 @@ beforeAll(async () => {
     import('../answers/gate'),
     import('../SetupWizard'),
     import('@/i18n'),
-    import('@/locales/en-US.json'),
-    import('@/locales/zh-CN.json'),
-    import('@/locales/intros/en-US.json'),
-    import('@/locales/intros/zh-CN.json'),
-    import('@/locales/thisMacFirstRun/en-US.json'),
-    import('@/locales/thisMacFirstRun/zh-CN.json'),
+    import('@/test/catalogs'),
     import('../steps/UseStep'),
     import('../steps/ComputerStep'),
     import('../steps/ModelStep'),
@@ -525,10 +515,7 @@ beforeAll(async () => {
     import('@/pages/Onboarding/welcome/Welcome'),
   ]);
 
-  await initI18n({
-    'en-US': { translation: enUS, intros: enUSIntros, thisMacFirstRun: enUSFirstRun },
-    'zh-CN': { translation: zhCN, intros: zhCNIntros, thisMacFirstRun: zhCNFirstRun },
-  });
+  await initI18n(resources);
   await i18n.changeLanguage('en-US');
 
   Loaded = {
@@ -553,27 +540,11 @@ beforeAll(async () => {
 afterAll(async () => {
   vi.unstubAllEnvs();
   vi.resetModules();
-  const [
-    { initI18n },
-    { default: enUS },
-    { default: zhCN },
-    { default: enUSIntros },
-    { default: zhCNIntros },
-    { default: enUSFirstRun },
-    { default: zhCNFirstRun },
-  ] = await Promise.all([
+  const [{ initI18n }, { resources }] = await Promise.all([
     import('@/i18n'),
-    import('@/locales/en-US.json'),
-    import('@/locales/zh-CN.json'),
-    import('@/locales/intros/en-US.json'),
-    import('@/locales/intros/zh-CN.json'),
-    import('@/locales/thisMacFirstRun/en-US.json'),
-    import('@/locales/thisMacFirstRun/zh-CN.json'),
+    import('@/test/catalogs'),
   ]);
-  await initI18n({
-    'en-US': { translation: enUS, intros: enUSIntros, thisMacFirstRun: enUSFirstRun },
-    'zh-CN': { translation: zhCN, intros: zhCNIntros, thisMacFirstRun: zhCNFirstRun },
-  });
+  await initI18n(resources);
 });
 
 const activeClients: Array<{ clear: () => void; cancelQueries: () => Promise<void> }> = [];

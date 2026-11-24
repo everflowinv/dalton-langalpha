@@ -46,7 +46,8 @@ const EXPECTED = ['index', 'rolldown-runtime', 'vendor-react']
 // #435 的团队模型判断已移出首屏，回落到 560
 // #457 在 zh-CN 文案目录（首屏必载）加了投递状态文案，生产构建实测 560.1 kB，上调到 562
 // sync11 (#482) 合并上游后生产构建实测 574.4 kB（2026-11-23 部署时的检查结果），上调到 580
-const MAX_EAGER_KB = 580
+// sync12: upstream dropped to 444 after #863/#865 (lazy copy namespaces + logo split); Dalton measured 475.0 kB, lowered ceiling to 490 (~15 kB headroom).
+const MAX_EAGER_KB = 490
 
 const outDir = process.argv[2] || 'dist'
 const indexPath = join(outDir, 'index.html')
@@ -90,18 +91,18 @@ if (!assets.length) {
 // Attribute order carries no meaning in HTML, and requiring type before src is
 // not merely brittle here — it fails silently in the direction that matters. A
 // second entry written `<script src="…" type="module">` would go uncounted, so
-// this gate would still see exactly one and pass, while currentBuild()'s
-// `script[type="module"][src]` selector takes it as the first match and
-// compares the wrong filename for every visitor.
+// this gate would still see exactly one and pass, while currentBuild(), which
+// takes the first module script under the build's asset folder, could read it
+// and compare the wrong filename for every visitor.
 const moduleScripts = [...html.matchAll(/<script\b([^>]*)>/g)]
   .map(([, attrs]) => attrs)
   .filter((attrs) => /\btype\s*=\s*"module"/.test(attrs))
   .map((attrs) => /\bsrc\s*=\s*"([^"]+)"/.exec(attrs))
   .filter((m) => m !== null)
 
-// currentBuild() takes querySelector's first match. More than one module script
-// and it may read something that is not the entry, and then `build !== mine` is
-// true for every visitor — a permanent, undismissable "new version" toast.
+// currentBuild() takes the first module script among the build's own assets.
+// With more than one it may read something that is not the entry, and then
+// `build !== mine` is true for every visitor: a permanent "new version" toast.
 if (moduleScripts.length !== 1) {
   console.error(`\n✗ expected exactly 1 module <script> in ${indexPath}, found ${moduleScripts.length}`)
   console.error('  staleBuild.tsx currentBuild() reads the first one and assumes it is')
@@ -179,6 +180,9 @@ const zlib = `zlib ${process.versions.zlib}`
 // alongside the entry. The largest counts, since that is what some visitor
 // pays. A build without the preload fails here rather than reading light while
 // every visitor waits on a request that only starts once the entry has run.
+// The namespace folders (locales/<ns>/) are not counted: they load with the
+// lazy chunks that read them, after first paint, and the copyNamespaces build
+// plugin fails a bundle whose entry reads one.
 const catalogs = [...html.matchAll(CATALOG_URL)]
   .map(([, locale, file]) => ({ locale, bytes: gz(file) }))
 

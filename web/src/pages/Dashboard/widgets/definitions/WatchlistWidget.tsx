@@ -42,7 +42,7 @@ function WatchlistWidget({ instance }: WidgetRenderProps<WatchlistConfig>) {
       return {
         widget_type: 'watchlist.list',
         widget_id: instance.id,
-        label: t('dashboard.widgets.watchlist.title') + ' · ' + rows.length,
+        label: t('dashboard:widgets.watchlist.title') + ' · ' + rows.length,
         description: rows.length ? `${rows.length} symbol${rows.length === 1 ? '' : 's'}` : 'empty',
         captured_at: new Date().toISOString(),
         text,
@@ -66,7 +66,7 @@ function WatchlistWidget({ instance }: WidgetRenderProps<WatchlistConfig>) {
           (row.quoteAvailable !== false && labelPct !== undefined
             ? ` · ${formatSignedPct2(labelPct)}`
             : ''),
-        description: t('dashboard.widgets.watchlist.title'),
+        description: t('dashboard:widgets.watchlist.title'),
         captured_at: new Date().toISOString(),
         text,
         data: { row: cleaned },
@@ -106,7 +106,7 @@ function WatchlistWidget({ instance }: WidgetRenderProps<WatchlistConfig>) {
                 </AnimatePresence>
               )}
             </WatchlistTable>
-            <HoldingsAddButton label={t('dashboard.widgets.watchlist.addSymbol')} onClick={watchlistHandlers.onAdd} />
+            <HoldingsAddButton label={t('dashboard:widgets.watchlist.addSymbol')} onClick={watchlistHandlers.onAdd} />
           </div>
         </SwapCell>
       </div>
@@ -116,9 +116,9 @@ function WatchlistWidget({ instance }: WidgetRenderProps<WatchlistConfig>) {
 
 registerWidget<WatchlistConfig>({
   type: 'watchlist.list',
-  titleKey: 'dashboard.widgets.watchlist.title',
-  cardTitleKey: 'dashboard.widgets.watchlist.header',
-  descriptionKey: 'dashboard.widgets.watchlist.description',
+  titleKey: 'dashboard:widgets.watchlist.title',
+  cardTitleKey: 'dashboard:widgets.watchlist.header',
+  descriptionKey: 'dashboard:widgets.watchlist.description',
   category: 'personal',
   icon: Eye,
   component: WatchlistWidget,

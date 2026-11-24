@@ -12,7 +12,7 @@ function uploadErrorMessage(err: unknown, file: globalThis.File, t: TFunction): 
   const failure = classifyUploadError(err);
   switch (failure.kind) {
     case 'send':
-      return t('filePanel.uploadSendFailed');
+      return t('filePanel:uploadSendFailed');
     // The server's 413 names its own limit; one without a detail came from
     // something in front of it, whose limit this page cannot know.
     case 'tooLarge':
@@ -209,7 +209,7 @@ export function useFileUpload({ workspaceId, onRefreshFiles, away }: {
           if (!isBatch) {
             setUploadError(failures[0].reason);
           } else {
-            setUploadError(t('filePanel.uploadFailedSummary', {
+            setUploadError(t('filePanel:uploadFailedSummary', {
               count: failures.length,
               details: failures.map((f) => `${f.name} (${f.reason})`).join('; '),
             }));

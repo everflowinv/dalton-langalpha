@@ -102,16 +102,16 @@ function KeyStep({ state, form, fields, option, place }: {
           <ProviderTitle
             name={displayName}
             markProvider={place?.group.markProvider ?? entry.provider}
-            title={t('setup.connectTitle', { provider: displayName })}
+            title={t('setup:connectTitle', { provider: displayName })}
             size="md"
           />
         }
         helper={
           form.local
-            ? t('setup.localServerDesc')
+            ? t('setup:localServerDesc')
             : entry.access_type === 'coding_plan'
-              ? t('setup.codingPlanDesc')
-              : t('setup.apiKeyInputDesc')
+              ? t('setup:codingPlanDesc')
+              : t('setup:apiKeyInputDesc')
         }
       />
       {/* DALTON-HOOK(team-credentials): team-shared credentials hint */}
@@ -128,12 +128,12 @@ function KeyStep({ state, form, fields, option, place }: {
       {/* DALTON-HOOK(team-credentials): hide API key inputs and save action for non-PM members under team sharing */}
       {!teamManagedByAdmin && <div className="flex flex-col gap-4">{fields}</div>}
       <SetupFooter
-        back={{ label: t('setup.back'), onClick: handleBack }}
+        back={{ label: t('setup:back'), onClick: handleBack }}
         primary={
           teamManagedByAdmin
             ? null
             : {
-                label: form.saving ? t('setup.saving') : t('setup.continue'),
+                label: form.saving ? t('setup:saving') : t('setup:continue'),
                 onClick: handleSave,
                 disabled: !form.canSave,
                 busy: form.saving,

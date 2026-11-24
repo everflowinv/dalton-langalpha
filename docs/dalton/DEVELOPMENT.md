@@ -55,7 +55,7 @@ uv run python scripts/dalton/check_report_claims.py --strict <path/to/report.md>
 
 ## 4. 前端首屏体积预算与按需导入规则
 
-生产前端包会用 `web/scripts/check-critical-path.mjs` 强制卡住两项指标：首屏 JS 块集合必须等于 `EXPECTED = ['index', 'rolldown-runtime', 'vendor-react']`，首屏总负载上限是 **`MAX_EAGER_KB = 562`**（单位为 **KiB**，即 `bytes / 1024`）。统计范围包括 **gzip** 压缩后的入口 `index.html`、所有被引用的首屏 JS/CSS 资源，以及体积最大的语言包（当前为默认中文包 `zh-CN`）字节总和。
+生产前端包会用 `web/scripts/check-critical-path.mjs` 强制卡住两项指标：首屏 JS 块集合必须等于 `EXPECTED = ['index', 'rolldown-runtime', 'vendor-react']`，首屏总负载上限是 **`MAX_EAGER_KB = 490`**（单位为 **KiB**，即 `bytes / 1024`）。统计范围包括 **gzip** 压缩后的入口 `index.html`、所有被引用的首屏 JS/CSS 资源，以及体积最大的语言包（当前为默认中文包 `zh-CN`）字节总和。
 
 - **严禁在 Settings 以外的页面从 `@/components/dalton/primitives`（即 `web/src/components/dalton/primitives/index.ts` 汇总导出入口）导入组件**。
 - **原因**：`primitives/index.ts` 汇总导出了 `DaltonActionConfirmButton`，它里面引了 `ConfirmDialog` 和 `framer-motion`。只要首屏同步路由误引这个入口，整套 `framer-motion` 就会被拖进首屏同步块，直接爆预算。

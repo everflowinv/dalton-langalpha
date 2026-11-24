@@ -6,7 +6,7 @@ import { useTranslation } from 'react-i18next';
 import { TextShimmer } from '@/components/ui/text-shimmer';
 import { DotLoader } from '@/components/ui/dot-loader';
 import { ToolIcon } from '../ToolIcon';
-import { getDiscardedToolCallReason, getDisplayName, getFailedToolCallLabel, getToolIcon, getPreparingText } from '../toolDisplayConfig';
+import { getDiscardedToolCallReason, getDisplayName, getFailedToolCallLabel, getToolIcon, getPreparingText } from '../toolDisplayConfig'; // DALTON-HOOK(empty-turn-guard)
 import { liveToolLabel, completedToolTitle, completedToolSummary } from './activitySummary';
 import { TWEEN } from '@/lib/motion';
 import { useLaNames } from '../../hooks/useLaNames';
@@ -62,6 +62,7 @@ export const ToolCallLiveRow = memo(function ToolCallLiveRow({ tc, liveState }: 
         <RunningIcon running={isInProgress}>
           <ToolIcon toolName={toolName} args={args} artifact={artifact} className="h-4 w-4" />
         </RunningIcon>
+        {/* DALTON-HOOK(empty-turn-guard): use discarded-aware failedLabel */}
         <FailedIconBadge failed={liveState === 'failed'} label={failedLabel} />
       </div>
       <SwapCell swapKey={isInProgress ? 'running' : 'settled'} className="flex-1" layerClassName="flex items-center gap-2">
@@ -76,11 +77,12 @@ export const ToolCallLiveRow = memo(function ToolCallLiveRow({ tc, liveState }: 
         ) : (
           <>
             <span className="font-medium shrink-0 whitespace-nowrap">{completedTitle}</span>
+            {/* DALTON-HOOK(empty-turn-guard): show discarded reason before summary/done */}
             {discardedReason
               ? <span className="truncate min-w-0" style={{ opacity: 0.65 }}>&mdash; {discardedReason}</span>
               : summary
                 ? <span className="truncate min-w-0" style={{ opacity: 0.55 }}>&mdash; {summary}</span>
-                : <span style={{ opacity: 0.55 }}>{t('toolArtifact.done')}</span>}
+                : <span style={{ opacity: 0.55 }}>{t('toolArtifact:done')}</span>}
           </>
         )}
       </SwapCell>
@@ -98,7 +100,7 @@ interface PreparingToolCallRowProps {
 export function PreparingToolCallRow({ tc }: PreparingToolCallRowProps): React.ReactElement {
   const { t } = useTranslation();
   const toolName = tc.toolName || '';
-  const displayName = toolName ? getDisplayName(toolName, t) : t('toolArtifact.toolCall');
+  const displayName = toolName ? getDisplayName(toolName, t) : t('toolArtifact:toolCall');
   const IconComponent: LucideIcon = toolName ? getToolIcon(toolName) : Wrench;
   const prepText = getPreparingText(toolName, tc.argsLength, t);
 

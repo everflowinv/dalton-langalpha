@@ -19,12 +19,12 @@ export function RecordTabs({
 }) {
   const { t } = useTranslation();
   return (
-    <div className="automation-record-tabs" role="tablist" aria-label={t('automation.records')}>
+    <div className="automation-record-tabs" role="tablist" aria-label={t('automation:records')}>
       <button type="button" role="tab" aria-selected={value === 'runs'} onClick={() => onChange('runs')}>
-        {t('automation.runHistory')}
+        {t('automation:runHistory')}
       </button>
       <button type="button" role="tab" aria-selected={value === 'history'} onClick={() => onChange('history')}>
-        {t('automation.modificationHistory')}
+        {t('automation:modificationHistory')}
       </button>
     </div>
   );
@@ -53,44 +53,44 @@ export function ModificationHistory({
   const activeVersion = history?.active_version;
 
   return (
-    <div role="tabpanel" aria-label={t('automation.modificationHistory')}>
+    <div role="tabpanel" aria-label={t('automation:modificationHistory')}>
       {prevVersion != null && onRollback && (
         <div className="automation-inspector-actions">
           <HeaderButton variant="secondary" icon={Undo2} onClick={onRollback}>
-            {t('automation.rollbackButton', { version: prevVersion })}
+            {t('automation:rollbackButton', { version: prevVersion })}
           </HeaderButton>
         </div>
       )}
       {loading ? (
         <ListSkeleton rows={3} />
       ) : failed ? (
-        <p className="automations-quiet-note">{t('automation.historyLoadFailed')}</p>
+        <p className="automations-quiet-note">{t('automation:historyLoadFailed')}</p>
       ) : entries.length === 0 ? (
-        <p className="automations-quiet-note">{t('automation.historyEmpty')}</p>
+        <p className="automations-quiet-note">{t('automation:historyEmpty')}</p>
       ) : (
-        <ul className="automation-mod-list" aria-label={t('automation.modificationHistory')}>
+        <ul className="automation-mod-list" aria-label={t('automation:modificationHistory')}>
           {entries.map((entry) => {
             const actionKey = historyActionKey(entry.action);
             const lines = changeLines(entry.changes);
             return (
               <li key={entry.version} className="automation-mod-row">
                 <div>
-                  <span className="automation-mono">{t('automation.historyVersion', { version: entry.version })}</span>
+                  <span className="automation-mono">{t('automation:historyVersion', { version: entry.version })}</span>
                   {entry.version === activeVersion && (
-                    <span className="automation-mod-badge">{t('automation.historyCurrent')}</span>
+                    <span className="automation-mod-badge">{t('automation:historyCurrent')}</span>
                   )}
                 </div>
                 <div className="automation-mod-meta">
                   {actionKey ? t(actionKey) : entry.action}
                   {' · '}
-                  {t('automation.historyActor', { actor: entry.actor_user_id || t('automation.unknownActor') })}
+                  {t('automation:historyActor', { actor: entry.actor_user_id || t('automation:unknownActor') })}
                   {entry.changed_at ? ` · ${formatDateTimeShort(entry.changed_at, locale)}` : ''}
                 </div>
                 {lines.length > 0 && (
                   <ul className="automation-mod-changes">
                     {lines.map((line) => (
                       <li key={line.field}>
-                        {t('automation.historyChange', {
+                        {t('automation:historyChange', {
                           field: labeledField((key) => t(key), line.fieldKey, line.field),
                           old: line.oldValue,
                           next: line.newValue,
@@ -114,8 +114,8 @@ export function DeletedMeta({ deletedAt, deletedBy }: { deletedAt?: string | nul
   if (!deletedAt && !deletedBy) return null;
   return (
     <p className="automation-inspector-desc">
-      {t('automation.deletedMeta', {
-        actor: deletedBy || t('automation.unknownActor'),
+      {t('automation:deletedMeta', {
+        actor: deletedBy || t('automation:unknownActor'),
         time: deletedAt ? formatDateTimeShort(deletedAt, locale) : '—',
       })}
     </p>
@@ -147,12 +147,12 @@ export function RollbackDialog({
   const lines = snapshotLines(snapshot);
   const summary = !ready ? (
     pending ? (
-      <p>{t('automation.rollbackSnapshotLoading')}</p>
+      <p>{t('automation:rollbackSnapshotLoading')}</p>
     ) : (
-      <p>{t('automation.rollbackSnapshotMissing', { version: version ?? '—' })}</p>
+      <p>{t('automation:rollbackSnapshotMissing', { version: version ?? '—' })}</p>
     )
   ) : lines.length === 0 ? (
-    <p>{t('automation.rollbackVersionOnly', { version: version ?? '—' })}</p>
+    <p>{t('automation:rollbackVersionOnly', { version: version ?? '—' })}</p>
   ) : (
     <ul className="automation-mod-changes">
       {lines.map((line) => (
@@ -171,15 +171,15 @@ export function RollbackDialog({
         style={{ backgroundColor: 'var(--color-bg-elevated)', borderColor: 'var(--color-border-elevated)' }}
       >
         <DialogHeader>
-          <DialogTitle style={{ color: 'var(--color-text-primary)' }}>{t('automation.rollbackTitle')}</DialogTitle>
+          <DialogTitle style={{ color: 'var(--color-text-primary)' }}>{t('automation:rollbackTitle')}</DialogTitle>
           <DialogDescription style={{ color: 'var(--color-text-secondary)' }}>
             {version == null
-              ? t('automation.rollbackTitle')
-              : t('automation.rollbackConfirm', { version })}
+              ? t('automation:rollbackTitle')
+              : t('automation:rollbackConfirm', { version })}
           </DialogDescription>
         </DialogHeader>
         <div className="automations-quiet-note">
-          <p>{t('automation.rollbackSummary')}</p>
+          <p>{t('automation:rollbackSummary')}</p>
           {summary}
         </div>
         <DialogFooter className="gap-2 sm:gap-0">
@@ -187,7 +187,7 @@ export function RollbackDialog({
             {t('common.cancel')}
           </Button>
           <Button variant="default" onClick={onConfirm} disabled={loading || version == null || !ready}>
-            {loading ? t('automation.rollbackWorking') : t('automation.rollbackSubmit')}
+            {loading ? t('automation:rollbackWorking') : t('automation:rollbackSubmit')}
           </Button>
         </DialogFooter>
       </DialogContent>

@@ -254,11 +254,11 @@ export function ModelAccessSection({
   const sheetTitle = (() => {
     if (!sheet) return null;
     const providerTitle = (name: string, markProvider: string) => (
-      <ProviderTitle name={name} markProvider={markProvider} title={t('setup.connectTitle', { provider: name })} />
+      <ProviderTitle name={name} markProvider={markProvider} title={t('setup:connectTitle', { provider: name })} />
     );
     switch (sheet.kind) {
       case 'pick-subscription': return t('modelAccess.connectSubscription');
-      case 'connect-subscription': return t('setup.connectTitle', { provider: subscriptionName(t, sheet.provider) });
+      case 'connect-subscription': return t('setup:connectTitle', { provider: subscriptionName(t, sheet.provider) });
       case 'pick-key': return t('modelAccess.addKey');
       case 'pick-local': return t('modelAccess.addLocal');
       case 'key': return providerTitle(sheet.group.name, sheet.group.markProvider);
@@ -359,20 +359,20 @@ export function ModelAccessSection({
       )}
       {scope === 'personal' && showTeamHint && canManage && !teamCredsError && (
         <div className="flex items-center justify-between gap-2 text-xs" style={{ color: 'var(--color-text-secondary)' }}>
-          <span>{t('settings.modelAccess.personalDesc')}</span>
+          <span>{t('settings:modelAccess.personalDesc')}</span>
           <button
             type="button"
             onClick={() => navigate('/settings?tab=teamModels#team-model-access')}
             className="underline underline-offset-2 shrink-0 hover:opacity-80"
             style={{ color: 'var(--color-accent-primary)' }}
           >
-            {t('settings.modelAccess.goToTeamModels')}
+            {t('settings:modelAccess.goToTeamModels')}
           </button>
         </div>
       )}
       {teamCredsError && (
         <p className="text-xs" role="status" style={{ color: 'var(--color-text-tertiary)' }} data-testid="model-access-creds-error">
-          {t('settings.modelAccess.statusUnavailable')}
+          {t('settings:modelAccess.statusUnavailable')}
         </p>
       )}
       {teamManagedByAdmin && (

@@ -922,6 +922,9 @@ class LLMRole:
     service_tier: str | None = None
     reasoning_effort: str | None = None
     effort_follows: bool = False
+    # DALTON-HOOK(antigravity-series): subagent's original requested effort so
+    # main-model fallback re-resolves it against main_model in either direction.
+    follow_effort: str | None = None
     own_client: bool = False
 
 
@@ -1186,29 +1189,76 @@ async def _resolve_role_clients(
     # moves this way: it is a fact about that model. One client per level
     # serves every role at it; ``client_for_role`` hands each a copy.
     if main_model:
+        # DALTON-HOOK(antigravity-series): when a pinned subagent model gets no
+        # client and falls back to main_model, re-resolve its set effort against
+        # main_model (map to closest allowed Antigravity variant with
+        # reasoning_effort=None, or pass raw effort for non-Antigravity models).
+        from src.dalton.llm.antigravity_series import (
+            ANTIGRAVITY_PROVIDER,
+            resolve_antigravity_effort_model,
+        )
+        from src.llms.llm import LLM as LLMFactory
+        from .availability import policy_refuses
+
+        def _fallback_target(base_model: str, desired_effort: str | None) -> tuple[str, str | None]:
+            mc = LLMFactory.get_model_config()
+            is_custom = not ignore_custom_models and user_models.custom_model(model_pref, base_model) is not None
+            entry = None if is_custom else mc.get_model_config(base_model)
+            if isinstance(entry, dict) and entry.get("provider") == ANTIGRAVITY_PROVIDER:
+                if desired_effort:
+                    allowed_fn = (
+                        (lambda m: policy_refuses(policy, model_pref, m) is None)
+                        if policy is not None
+                        else None
+                    )
+                    mapped = resolve_antigravity_effort_model(
+                        base_model, desired_effort, model_config=mc, allowed_filter=allowed_fn
+                    )
+                    if mapped is not None:
+                        return mapped[0], None
+                return base_model, None
+            return base_model, desired_effort
+
         pending = [
             role for role in roles
             if role.effort_follows
             and role.model != main_model
             and role.key not in config.subsidiary_llm_clients
         ]
-        efforts = list(dict.fromkeys(role.reasoning_effort for role in pending))
-        at_effort = dict(zip(efforts, await asyncio.gather(
-            *(_main_client_at(main_model, effort) for effort in efforts)
+        targets = {}
+        for role in pending:
+            target = _fallback_target(
+                main_model,
+                role.follow_effort if role.follow_effort is not None else role.reasoning_effort,
+            )
+            if target != (role.model, role.reasoning_effort):
+                targets[role.key] = target
+        pending = [role for role in pending if role.key in targets]
+        unique_targets = list(dict.fromkeys(targets.values()))
+        at_target = dict(zip(unique_targets, await asyncio.gather(
+            *(_main_client_at(target_model, target_effort) for target_model, target_effort in unique_targets)
         )))
         for role in pending:
-            client = at_effort[role.reasoning_effort]
+            target = targets[role.key]
+            client = at_target[target]
             if client is not None:
+                target_model, target_effort = target
+                desired_effort = (
+                    role.follow_effort if role.follow_effort is not None else role.reasoning_effort
+                )
                 # DALTON-HOOK(subagent-model-pin): log when a pinned model with a set effort falls back to main_model.
                 logger.warning(
-                    "[CHAT] Subagent %r pins %r, which got no client; running main model %r at effort=%r instead",
+                    "[CHAT] Subagent %r pins %r, which got no client; running main model %r (target=%r, effort=%r) instead",
                     role.key.removeprefix("subagent:"),
                     role.model,
                     main_model,
-                    role.reasoning_effort,
+                    target_model,
+                    target_effort if target_effort is not None else desired_effort,
                 )
                 config.subsidiary_llm_clients[role.key] = client
-                if config.prompt_guidance:
+                if target_model != main_model:
+                    config.role_prompt_guidance[role.key] = user_models.guidance_for(model_pref, target_model)
+                elif config.prompt_guidance:
                     config.role_prompt_guidance[role.key] = config.prompt_guidance
 
     # BYOK-pure write-time materialization. Gate purely on the credential

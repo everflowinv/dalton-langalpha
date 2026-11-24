@@ -163,7 +163,7 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     try {
       await navigator.clipboard.writeText(permalink);
       setCopied(true);
-      toast({ description: t('monitors.linkCopied') });
+      toast({ description: t('monitors:linkCopied') });
       window.setTimeout(() => setCopied(false), 2000);
     } catch {
       toast({ description: permalink });
@@ -181,8 +181,8 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
   const hiddenDataJob = !publicMode && monitor?.source_kind === 'data_job' && !dataJobsEnabled;
   if (detailQuery.isError || !monitor || !detail || hiddenDataJob) {
     const status = apiErrorStatus(detailQuery.error);
-    const title = status === 403 ? t('monitors.forbiddenTitle') : t('monitors.notFoundTitle');
-    const desc = status === 403 ? t('monitors.forbiddenDesc') : t('monitors.notFoundDesc');
+    const title = status === 403 ? t('monitors:forbiddenTitle') : t('monitors:notFoundTitle');
+    const desc = status === 403 ? t('monitors:forbiddenDesc') : t('monitors:notFoundDesc');
     return (
       <div className="monitors-page">
         <div className="monitors-scroll">
@@ -190,7 +190,7 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
             {!publicMode && (
               <Link to="/monitors" className="inline-flex items-center gap-1.5 text-xs hover:underline" style={{ color: 'var(--color-text-secondary)' }}>
                 <ArrowLeft className="h-3.5 w-3.5" />
-                {t('monitors.backToList')}
+                {t('monitors:backToList')}
               </Link>
             )}
             <ListError>{title} — {desc}</ListError>
@@ -213,7 +213,7 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
               style={{ color: 'var(--color-text-secondary)' }}
             >
               <ArrowLeft className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">{t('monitors.backToList')}</span>
+              <span className="hidden sm:inline">{t('monitors:backToList')}</span>
             </Link>
             <span className="text-xs" style={{ color: 'var(--color-text-quaternary)' }} aria-hidden="true">/</span>
           </>
@@ -221,7 +221,7 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
         <h1 className="monitors-topbar-title" title={monitor.title}>
           {monitor.title}
         </h1>
-        <TagBadge soft>{t(`monitors.visibility.${monitor.visibility}`)}</TagBadge>
+        <TagBadge soft>{t(`monitors:visibility.${monitor.visibility}`)}</TagBadge>
 
         {monitor.last_publish_error && monitor.last_publish_failed_at && (
           <span
@@ -230,7 +230,7 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
             title={monitor.last_publish_error}
           >
             <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-            {t('monitors.lastPublishFailed', {
+            {t('monitors:lastPublishFailed', {
               time: formatTimestamp(monitor.last_publish_failed_at, locale),
             })}
           </span>
@@ -239,7 +239,7 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
         <div className="monitors-topbar-actions">
           {!publicMode && detail.versions.length > 0 && (
             <Select
-              aria-label={t('monitors.versionSelect')}
+              aria-label={t('monitors:versionSelect')}
               value={String(effectiveSeq)}
               onChange={(e) => setSelectedSeq(Number(e.target.value))}
               className="w-28"
@@ -247,7 +247,7 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
             >
               {detail.versions.map((v) => (
                 <option key={v.seq} value={String(v.seq)}>
-                  {t('monitors.versionOption', { seq: v.seq })}
+                  {t('monitors:versionOption', { seq: v.seq })}
                 </option>
               ))}
             </Select>
@@ -261,7 +261,7 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
             onClick={() => void copyLink()}
           >
             {copied ? <Check className="h-3.5 w-3.5" style={{ color: 'var(--color-success)' }} /> : <Copy className="h-3.5 w-3.5" />}
-            <span className="hidden sm:inline">{t('monitors.copyLink')}</span>
+            <span className="hidden sm:inline">{t('monitors:copyLink')}</span>
           </Button>
 
           <a
@@ -275,7 +275,7 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
             }}
           >
             <ExternalLink className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">{t('monitors.openInNewWindow')}</span>
+            <span className="hidden sm:inline">{t('monitors:openInNewWindow')}</span>
           </a>
 
           {canOpenSource && (
@@ -292,7 +292,7 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
               }}
             >
               <FileCode2 className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">{t('monitors.goToSource')}</span>
+              <span className="hidden sm:inline">{t('monitors:goToSource')}</span>
             </Button>
           )}
         </div>

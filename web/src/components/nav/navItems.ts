@@ -25,7 +25,7 @@ export const NAV_ITEMS: NavItem[] = [
   { key: '/chat', icon: MessagesSquare, labelKey: 'sidebar.chatAgent', match: 'prefix' },
   { key: '/market', icon: ChartCandlestick, labelKey: 'sidebar.marketView', match: 'exact-or-sub', requires: 'market' }, // DALTON-HOOK(dalton-nav)
   { key: '/automations', icon: Timer, labelKey: 'sidebar.automations', match: 'exact-or-sub' },
-  { key: '/monitors', icon: Monitor, labelKey: 'monitors.navLabel', match: 'exact-or-sub' }, // DALTON-HOOK(monitors)
+  { key: '/monitors', icon: Monitor, labelKey: 'sidebar.monitors', match: 'exact-or-sub' }, // DALTON-HOOK(monitors)
   { key: '/library', icon: LibraryBig, labelKey: 'sidebar.library', match: 'exact-or-sub', requires: 'org_library' },
   // DALTON-HOOK(hide-trading): remove '/orders' from primary navigation
   { key: '/plugins', icon: Blocks, labelKey: 'sidebar.plugins', match: 'exact-or-sub' },

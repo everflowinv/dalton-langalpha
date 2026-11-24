@@ -44,7 +44,7 @@ function ClaudeCodeStepInner() {
 
   return (
     <div>
-      <WizardStepHeader titleId={headingId} title={t('setup.connectTitle', { provider: name })} />
+      <WizardStepHeader titleId={headingId} title={t('setup:connectTitle', { provider: name })} />
       {isLoading && !setup ? (
         <div className="flex items-center justify-center py-12">
           <Loader size={20} className="text-(--color-text-tertiary)" label={t('common.loading')} />
@@ -55,9 +55,9 @@ function ClaudeCodeStepInner() {
       {removing && <RemoveClaudeCodeTokenDialog target={removing} onClose={() => setRemoving(null)} />}
       <ComputersDialogHost planInPlace />
       <SetupFooter
-        back={{ label: t('setup.back'), onClick: () => navigate('/setup/provider', { state: { list: 'oauth' } }) }}
+        back={{ label: t('setup:back'), onClick: () => navigate('/setup/provider', { state: { list: 'oauth' } }) }}
         primary={{
-          label: t('setup.continue'),
+          label: t('setup:continue'),
           disabled: !claudeCodeConnected(setup),
           onClick: () => connected({
             method: 'oauth', list: 'oauth', provider: CLAUDE_CODE, displayName: name, modelsFrom: CLAUDE_CODE, justConnected: true,

@@ -143,9 +143,9 @@ function ConfigConflictNotice({
   const { t } = useTranslation();
   return (
     <div className="automations-quiet-note" role="status">
-      <p>{message ? t('automation.configUpdatedDetail', { detail: message }) : t('automation.configUpdated')}</p>
-      {version != null && <p>{t('automation.currentVersion', { version })}</p>}
-      {schedule && <p>{t('automation.serverSchedule', { cron: schedule.cron, zone: schedule.timezone })}</p>}
+      <p>{message ? t('automation:configUpdatedDetail', { detail: message }) : t('automation:configUpdated')}</p>
+      {version != null && <p>{t('automation:currentVersion', { version })}</p>}
+      {schedule && <p>{t('automation:serverSchedule', { cron: schedule.cron, zone: schedule.timezone })}</p>}
     </div>
   );
 }
@@ -714,7 +714,7 @@ export default function Automations() {
             timezone: editing.timezone,
             loading: busy,
             submitDisabled: !!held && held.current == null,
-            submitLabel: held ? t('automation.retryWithCurrent') : undefined,
+            submitLabel: held ? t('automation:retryWithCurrent') : undefined,
             notice: held ? (
               <ConfigConflictNotice
                 message={held.message}
@@ -744,7 +744,7 @@ export default function Automations() {
           onDirtyChange: setDraftDirty,
           loading: busy,
           submitDisabled: !!held && held.current == null,
-          submitLabel: held ? t('automation.retryWithCurrent') : undefined,
+          submitLabel: held ? t('automation:retryWithCurrent') : undefined,
           // DALTON-HOOK(company-automations): a company agent edit does not offer personal delivery.
           omitDelivery: isCompanyTask(editing),
           notice: held ? <ConfigConflictNotice message={held.message} version={held.current} /> : undefined,
@@ -865,9 +865,9 @@ export default function Automations() {
   };
 
   const pages: ScopePage[] = [
-    scopePage('company', 'automation.groupCompany', companyTasks, companyQuery, companyForbidden, companyDeleted),
-    scopePage('personal', 'automation.groupMine', personalTasks, personalQuery, personalForbidden, personalDeleted),
-    scopePage('research_tracking', 'automation.groupResearch', researchTasks, researchQuery, researchForbidden, researchDeleted),
+    scopePage('company', 'automation:groupCompany', companyTasks, companyQuery, companyForbidden, companyDeleted),
+    scopePage('personal', 'automation:groupMine', personalTasks, personalQuery, personalForbidden, personalDeleted),
+    scopePage('research_tracking', 'automation:groupResearch', researchTasks, researchQuery, researchForbidden, researchDeleted),
   ].filter((page) => page.scope !== 'company' || !hideCompany);
 
   const visibleCount = companyTasks.length + personalTasks.length + researchTasks.length;
@@ -897,7 +897,7 @@ export default function Automations() {
       body = (
         <div className="automations-scroll">
           <div className="automations-frame">
-            <ListError>{t('automation.loadFailed')}</ListError>
+            <ListError>{t('automation:loadFailed')}</ListError>
           </div>
         </div>
       );
@@ -941,7 +941,7 @@ export default function Automations() {
         <div className="automations-frame">
           {formHost?.kind === 'agent' ? (
             <div className="automation-form-pane automations-zero-form">
-              <h2 className="title-font automation-form-title">{t('automation.newAutomation')}</h2>
+              <h2 className="title-font automation-form-title">{t('automation:newAutomation')}</h2>
               <AutomationInlineForm key={formHost.key} {...formHost.props} />
             </div>
           ) : (
@@ -990,9 +990,9 @@ export default function Automations() {
 
       <ConfirmDialog
         open={!!pendingLeave}
-        title={t('automation.discardDraftTitle')}
-        message={t('automation.discardDraftMessage')}
-        confirmLabel={t('automation.discardDraft')}
+        title={t('automation:discardDraftTitle')}
+        message={t('automation:discardDraftMessage')}
+        confirmLabel={t('automation:discardDraft')}
         onConfirm={() => {
           const proceed = pendingLeave;
           setPendingLeave(null);

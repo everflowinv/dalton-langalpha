@@ -7,7 +7,7 @@ without backend or third-party dependencies.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -247,6 +247,79 @@ def build_antigravity_series_catalog(
         )
         result.append(entry.to_dict())
     return result
+
+
+def resolve_antigravity_effort_model(
+    model_name: str,
+    effort: str,
+    *,
+    model_config: Any = None,
+    allowed_filter: Callable[[str], bool] | None = None,
+) -> tuple[str, str] | None:
+    """Map a built-in Antigravity suffixed model + requested ``effort`` to the matching variant.
+
+    Antigravity encodes reasoning effort in the model key (e.g.
+    ``gemini-4-neon-high-oauth`` -> ``gemini-4-neon-low-oauth``). When
+    ``allowed_filter`` is provided, only variants satisfying it are eligible;
+    unavailable or disallowed levels fall back to the closest allowed level in
+    the same series (stepping down first, then up). Returns
+    ``(target_model_name, chosen_effort)`` or ``None`` if ``model_name`` is not
+    a built-in suffixed Antigravity series model, ``effort`` is not a known
+    reasoning level, or no variant in the series is allowed.
+    """
+    if not isinstance(model_name, str) or not isinstance(effort, str):
+        return None
+    if effort not in REASONING_LEVELS:
+        return None
+    parsed = parse_antigravity_series(model_name)
+    if parsed is None:
+        return None
+    series_prefix, current_effort = parsed
+    if current_effort is None:
+        return None
+
+    llm_cfg = _extract_llm_config(model_config)
+    if llm_cfg is None:
+        try:
+            from src.llms.llm import LLM
+
+            llm_cfg = _extract_llm_config(LLM.get_model_config())
+        except Exception:
+            llm_cfg = None
+    if llm_cfg is None:
+        return None
+
+    source_entry = llm_cfg.get(model_name)
+    if not isinstance(source_entry, Mapping) or source_entry.get("provider") != ANTIGRAVITY_PROVIDER:
+        return None
+
+    raw_variants: dict[str, str] = {}
+    for key, entry in llm_cfg.items():
+        if not isinstance(key, str) or not isinstance(entry, Mapping):
+            continue
+        if entry.get("provider") != ANTIGRAVITY_PROVIDER:
+            continue
+        if entry.get("visible") is False or entry.get("retired"):
+            continue
+        key_parsed = parse_antigravity_series(key)
+        if key_parsed is None:
+            continue
+        key_prefix, key_effort = key_parsed
+        if key_prefix == series_prefix and key_effort is not None:
+            if allowed_filter is not None and not allowed_filter(key):
+                continue
+            raw_variants[key_effort] = key
+
+    ordered = [lv for lv in REASONING_LEVELS if lv in raw_variants]
+    if not ordered:
+        return None
+    if effort in raw_variants:
+        chosen = effort
+    else:
+        ceiling = REASONING_LEVELS.index(effort)
+        at_or_below = [lv for lv in ordered if REASONING_LEVELS.index(lv) <= ceiling]
+        chosen = at_or_below[-1] if at_or_below else ordered[0]
+    return raw_variants[chosen], chosen
 
 
 def quota_cooldown_target(
