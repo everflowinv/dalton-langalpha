@@ -165,13 +165,97 @@ function resolvePendingHistoryInterrupt(
   return true;
 }
 
+// --- DALTON-HOOK(cos-settings-tools): begin ---
+/** Derive settled card fields (approved / rejected / failed) from a tool result.
+ *  Shared by both live stream settlement and history replay so both views agree. */
+function proposalResultFields(type: string, result: ToolResultLike): Record<string, unknown> {
+  const { content } = result;
+  if (typeof content !== 'string') return { status: 'approved' };
+  if (content.startsWith('User declined')) {
+    return { status: 'rejected', failure_code: undefined, failure_error: undefined };
+  }
+  if (type === 'ptc_agent') {
+    return { status: 'approved', ...dispatchResultFields(result) };
+  }
+  try {
+    const parsed = JSON.parse(content) as Record<string, unknown> | null;
+    if (parsed && typeof parsed === 'object') {
+      if (parsed.success === false) {
+        return {
+          status: 'failed',
+          ...(typeof parsed.code === 'string' && parsed.code ? { failure_code: parsed.code } : {}),
+          ...(typeof parsed.error === 'string' && parsed.error ? { failure_error: parsed.error } : {}),
+        };
+      }
+      if (type === 'create_workspace') {
+        return {
+          status: 'approved',
+          failure_code: undefined,
+          failure_error: undefined,
+          ...(typeof parsed.computer_name === 'string' && parsed.computer_name ? { computer_name: parsed.computer_name } : {}),
+          ...(parsed.bootstrap_cloud_primary === true ? { bootstrap_cloud_primary: true } : {}),
+        };
+      }
+    }
+  } catch { /* non-JSON → treat as approved */ }
+  return { status: 'approved', failure_code: undefined, failure_error: undefined };
+}
+
+/** Settle a live submitting/pending proposal card by exact ``tool_call_id``.
+ *  Returns ``messages`` unchanged (same reference) when no card matches. */
+function settleLiveProposalFromResult(
+  messages: ChatMessage[],
+  toolCallId: string | undefined,
+  result: ToolResultLike,
+): ChatMessage[] {
+  if (!toolCallId || typeof result.content !== 'string') return messages;
+  const buckets: Array<keyof AssistantMessage & ('workspaceProposals' | 'secretaryActionProposals')> = [
+    'workspaceProposals',
+    'secretaryActionProposals',
+  ];
+  let changed = false;
+  const next = messages.map((m) => {
+    if (m.role !== 'assistant') return m;
+    const msg = m as AssistantMessage;
+    let msgChanged = false;
+    let updatedMsg: AssistantMessage = msg;
+    for (const bucket of buckets) {
+      const cards = msg[bucket] as Record<string, Record<string, unknown>> | undefined;
+      if (!cards) continue;
+      let bucketChanged = false;
+      const nextCards: Record<string, Record<string, unknown>> = { ...cards };
+      for (const [cardId, card] of Object.entries(cards)) {
+        if (
+          card?.tool_call_id === toolCallId
+          && (card.status === 'submitting' || card.status === 'pending')
+        ) {
+          const cardType = bucket === 'workspaceProposals'
+            ? 'create_workspace'
+            : String(card.actionType || 'delete_workspace');
+          nextCards[cardId] = { ...card, ...proposalResultFields(cardType, result) };
+          bucketChanged = true;
+        }
+      }
+      if (bucketChanged) {
+        updatedMsg = { ...updatedMsg, [bucket]: nextCards };
+        msgChanged = true;
+      }
+    }
+    if (msgChanged) changed = true;
+    return msgChanged ? updatedMsg : m;
+  });
+  return changed ? next : messages;
+}
+// --- DALTON-HOOK(cos-settings-tools): end ---
+
 /**
- * Settle the pending proposal a tool result answers. A decline rejects it, and
- * so does a result with `success: false` on any card but a hand-off's (see
- * `dispatchResultFields`); anything else approves it. One resume can answer
- * several interrupts, and their results need not arrive in the order the cards
- * did, so an interrupt that named its tool call (a dispatch does) is settled
- * only by that call's result; the rest take the next result in order.
+ * Settle the pending proposal a tool result answers. A decline rejects it, a
+ * result with `success: false` on any card but a hand-off's marks it failed
+ * (preserving `failure_code` / `failure_error` such as `scope_changed`);
+ * anything else approves it. One resume can answer several interrupts, and
+ * their results need not arrive in the order the cards did, so an interrupt
+ * that named its tool call is settled only by that call's result; the rest
+ * take the next result in order.
  */
 function settleProposalFromResult(
   pending: HistoryInterruptInfo[],
@@ -187,24 +271,12 @@ function settleProposalFromResult(
     (p) => PROPOSAL_INTERRUPT_TYPES.has(p.type) &&
       (named ? p.toolCallId === toolCallId : !toolCallId || !p.toolCallId),
     // Parsed here so a result pays for it only when it settles a proposal.
-    (m) => {
-      let status = 'approved';
-      if (content.startsWith('User declined')) {
-        status = 'rejected';
-      } else if (m.type !== 'ptc_agent') {
-        try {
-          if (JSON.parse(content)?.success === false) status = 'rejected';
-        } catch { /* non-JSON → treat as approved */ }
-      }
-      const extraFields = m.type === 'ptc_agent' && status === 'approved'
-        ? dispatchResultFields(result)
-        : {};
-      return {
-        bucket: PROPOSAL_DATA_KEY_MAP[m.type] || 'questionProposals',
-        key: m.proposalId!,
-        fields: { status, ...extraFields },
-      };
-    },
+    (m) => ({
+      bucket: PROPOSAL_DATA_KEY_MAP[m.type] || 'questionProposals',
+      key: m.proposalId!,
+      // DALTON-HOOK(cos-settings-tools): share 4-state settlement (approved / rejected / failed)
+      fields: proposalResultFields(m.type, result),
+    }),
     setMessages,
   );
 }
@@ -213,6 +285,6 @@ export {
   PROPOSAL_INTERRUPT_TYPES, PROPOSAL_DATA_KEY_MAP,
   INTERRUPT_CARD_BUCKETS, CARD_BUCKET_FOR_TYPE,
   setCardStatus, setCardFields, resolvePendingHistoryInterrupt, historyCardKey,
-  settleProposalFromResult,
+  proposalResultFields, settleProposalFromResult, settleLiveProposalFromResult,
   stripHistoryInterruptCards,
 };

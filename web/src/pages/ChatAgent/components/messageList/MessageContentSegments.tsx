@@ -498,6 +498,9 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
                 name={String(made.workspace_name ?? '')}
                 workspaceId={typeof made.workspace_id === 'string' ? made.workspace_id : undefined}
                 description={typeof made.workspace_description === 'string' ? made.workspace_description : undefined}
+                // DALTON-HOOK(cos-settings-tools): pass target computer snapshot info to WorkspaceCreatedSlip
+                computerName={typeof made.computer_name === 'string' ? made.computer_name : undefined}
+                bootstrapCloudPrimary={made.bootstrap_cloud_primary === true}
               />
             );
           }

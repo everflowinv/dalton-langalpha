@@ -7,7 +7,8 @@ import { SettledStep } from './SettledStep';
 interface ProposalCardProps {
   icon: LucideIcon;
   title: string;
-  status: 'pending' | 'approved' | 'rejected';
+  // DALTON-HOOK(cos-settings-tools): support 4-state lifecycle (pending/submitting, approved, rejected, failed)
+  status: 'pending' | 'submitting' | 'approved' | 'rejected' | 'failed';
   /** The settled row's words, for whichever answer it was given. */
   settledLabel: string;
   approveLabel: string;
@@ -55,12 +56,15 @@ export function ProposalCard({
   children,
   settledDetail,
 }: ProposalCardProps): React.ReactElement {
+  // DALTON-HOOK(cos-settings-tools): submitting stays unresolved & disables buttons until tool_call_result arrives
+  const effectiveBusy = busy || status === 'submitting';
+  const settledVerdict = status === 'approved' ? 'approved' : status === 'failed' ? 'failed' : 'rejected';
   return (
     <ResolveSwap
-      resolved={status !== 'pending'}
+      resolved={status !== 'pending' && status !== 'submitting'}
       settled={
         <SettledStep
-          verdict={status === 'approved' ? 'approved' : 'rejected'}
+          verdict={settledVerdict}
           label={settledLabel}
           testId="proposal-settled"
         >
@@ -81,12 +85,13 @@ export function ProposalCard({
       {/* DALTON-HOOK(team-sharing): a colleague's read-only thread passes no
           action handlers; the card shows the proposal without action buttons */}
       {(onApprove || onReject || approveAlways) && (
-        <div className="pt-3 flex items-center gap-2">
+        // DALTON-HOOK(cos-settings-tools): wrap buttons cleanly with >=36px touch height on narrow viewports
+        <div className="pt-3 flex flex-wrap items-center gap-2">
           <button
             type="button"
-            disabled={busy}
+            disabled={effectiveBusy}
             onClick={(e) => { e.stopPropagation(); onApprove?.(); }}
-            className="press flex items-center gap-1.5 text-sm px-4 py-2 rounded-md font-medium hover:brightness-110"
+            className="press flex items-center gap-1.5 text-sm px-4 py-2 min-h-9 rounded-md font-medium hover:brightness-110"
             style={{ backgroundColor: 'var(--color-btn-primary-bg)', color: 'var(--color-btn-primary-text)' }}
           >
             <Check className="h-3.5 w-3.5 stroke-[2.5]" />
@@ -95,10 +100,10 @@ export function ProposalCard({
           {approveAlways && (
             <button
               type="button"
-              disabled={busy}
+              disabled={effectiveBusy}
               title={approveAlways.hint}
               onClick={(e) => { e.stopPropagation(); approveAlways.onClick(); }}
-              className="press text-sm px-4 py-2 rounded-md font-medium hover:bg-(--color-bg-hover)"
+              className="press text-sm px-4 py-2 min-h-9 rounded-md font-medium hover:bg-(--color-bg-hover)"
               style={{ border: '1px solid var(--color-border-default)', color: 'var(--color-text-secondary)' }}
             >
               {approveAlways.label}
@@ -106,9 +111,9 @@ export function ProposalCard({
           )}
           <button
             type="button"
-            disabled={busy}
+            disabled={effectiveBusy}
             onClick={(e) => { e.stopPropagation(); onReject?.(); }}
-            className="press flex items-center gap-1.5 text-sm px-4 py-2 rounded-md font-medium"
+            className="press flex items-center gap-1.5 text-sm px-4 py-2 min-h-9 rounded-md font-medium"
             style={{ backgroundColor: 'var(--color-border-muted)', color: 'var(--color-text-tertiary)' }}
           >
             <X className="h-3.5 w-3.5" />

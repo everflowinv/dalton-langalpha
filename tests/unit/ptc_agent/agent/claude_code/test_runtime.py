@@ -89,7 +89,10 @@ def test_a_rejected_rate_limit_is_a_spent_plan_only_when_the_query_failed():
 
 def test_a_claude_code_thread_keeps_every_main_agent_channel():
     assert set(MainAgentState.__annotations__) < set(ClaudeCodeState.__annotations__)
-    assert set(ClaudeCodeState.__annotations__) - set(MainAgentState.__annotations__) == {"claude_session", "_claude_code_rules", "preapproved_calls"}
+    # DALTON-HOOK(cos-settings-tools): StandingApprovalState also carries approval_snapshots
+    assert set(ClaudeCodeState.__annotations__) - set(MainAgentState.__annotations__) == {
+        "claude_session", "_claude_code_rules", "preapproved_calls", "approval_snapshots"
+    }
     ours, main = StateGraph(ClaudeCodeState).channels, StateGraph(MainAgentState).channels
     assert {k: type(main[k]) for k in main} == {k: type(ours[k]) for k in main}
 

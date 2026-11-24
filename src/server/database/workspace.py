@@ -860,6 +860,8 @@ async def create_workspace_on_computer(
     config: Optional[Dict[str, Any]] = None,
     workspace_id: Optional[str] = None,
     selection_from: Optional[str] = None,
+    # DALTON-HOOK(cos-settings-tools): transactional readiness check for snapshot-verified creates
+    reject_unavailable: bool = False,
     conn=None,
 ) -> Optional[Dict[str, Any]]:
     """Create a complete shadow atomically so failed binding cannot leave an unbound project.
@@ -900,6 +902,14 @@ async def create_workspace_on_computer(
                 try:
                     # A savepoint, which a failed insert rolls back so the next
                     # attempt can run.
+                    # DALTON-HOOK(cos-settings-tools): enforce error/archiving/preparing guard under FOR SHARE
+                    extra_fence = (
+                        "\n                                  AND status <> 'error'"
+                        "\n                                  AND NOT COALESCE(config, '{}'::jsonb) @> '{\"archiving\": true}'::jsonb"
+                        "\n                                  AND (provider_ref IS NOT NULL OR status NOT IN ('creating', 'starting'))"
+                        if reject_unavailable
+                        else ""
+                    )
                     async with owned.transaction():
                         await cur.execute(
                             f"""
@@ -909,7 +919,7 @@ async def create_workspace_on_computer(
                                 FROM computers
                                 WHERE computer_id = %(computer_id)s AND {FENCE_NOT_DELETED}
                                   AND {FENCE_TAKES_WORKSPACES}
-                                  AND user_id = %(user_id)s
+                                  AND user_id = %(user_id)s{extra_fence}
                                 FOR SHARE
                             )
                             INSERT INTO workspaces (

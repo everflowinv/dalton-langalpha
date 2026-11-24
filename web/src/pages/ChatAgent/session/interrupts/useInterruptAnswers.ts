@@ -66,20 +66,52 @@ export function useInterruptAnswers({
   // The card names its own bucket because the slot may hold another family's
   // interrupt when several are pending, and a click on one card must never
   // settle a different one (a delete_thread, say).
-  const decidePendingProposal = useCallback((bucket: ProposalBucket, verdict: 'approve' | 'reject') => {
+  // DALTON-HOOK(cos-settings-tools): wait for tool_call_result on approve when correlated by tool_call_id, and echo confirm_token
+  const decidePendingProposal = useCallback((
+    bucket: ProposalBucket,
+    verdict: 'approve' | 'reject',
+    proposal?: Record<string, unknown>,
+  ) => {
     if (!pendingInterrupt || PROPOSAL_DATA_KEY_MAP[pendingInterrupt.type] !== bucket) return;
-    const { proposalId, interruptId } = pendingInterrupt;
-    setMessages((prev) => setCardStatus(prev, bucket, proposalId!, verdict === 'approve' ? 'approved' : 'rejected'));
-    resumeWithHitlResponse({ [interruptId!]: { decisions: [{ type: verdict }] } });
+    const proposalId = (typeof proposal?.proposalId === 'string' && proposal.proposalId)
+      ? proposal.proposalId
+      : pendingInterrupt.proposalId;
+    const interruptId = (typeof proposal?.interruptId === 'string' && proposal.interruptId)
+      ? proposal.interruptId
+      : pendingInterrupt.interruptId;
+    const toolCallId = (typeof proposal?.tool_call_id === 'string' && proposal.tool_call_id)
+      ? proposal.tool_call_id
+      : pendingInterrupt.toolCallId;
+    const confirmToken = typeof proposal?.confirm_token === 'string' && proposal.confirm_token
+      ? proposal.confirm_token
+      : undefined;
+    const nextStatus = verdict === 'approve'
+      ? (bucket === 'workspaceProposals' && toolCallId ? 'submitting' : 'approved')
+      : 'rejected';
+    setMessages((prev) => setCardFields(prev, bucket, proposalId!, {
+      status: nextStatus,
+      failure_code: undefined,
+      failure_error: undefined,
+    }));
+    const decision: HitlDecisionBody = confirmToken
+      ? { type: verdict, confirm_token: confirmToken }
+      : { type: verdict };
+    resumeWithHitlResponse({ [interruptId!]: { decisions: [decision] } });
   }, [pendingInterrupt, setMessages, resumeWithHitlResponse]);
 
   const proposalHandlers = useMemo(() => ({
-    handleApproveCreateWorkspace: () => decidePendingProposal('workspaceProposals', 'approve'),
-    handleRejectCreateWorkspace: () => decidePendingProposal('workspaceProposals', 'reject'),
-    handleApproveStartQuestion: () => decidePendingProposal('questionProposals', 'approve'),
-    handleRejectStartQuestion: () => decidePendingProposal('questionProposals', 'reject'),
-    handleApproveSecretaryAction: () => decidePendingProposal('secretaryActionProposals', 'approve'),
-    handleRejectSecretaryAction: () => decidePendingProposal('secretaryActionProposals', 'reject'),
+    handleApproveCreateWorkspace: (proposal?: Record<string, unknown>) =>
+      decidePendingProposal('workspaceProposals', 'approve', proposal),
+    handleRejectCreateWorkspace: (proposal?: Record<string, unknown>) =>
+      decidePendingProposal('workspaceProposals', 'reject', proposal),
+    handleApproveStartQuestion: (proposal?: Record<string, unknown>) =>
+      decidePendingProposal('questionProposals', 'approve', proposal),
+    handleRejectStartQuestion: (proposal?: Record<string, unknown>) =>
+      decidePendingProposal('questionProposals', 'reject', proposal),
+    handleApproveSecretaryAction: (proposal?: Record<string, unknown>) =>
+      decidePendingProposal('secretaryActionProposals', 'approve', proposal),
+    handleRejectSecretaryAction: (proposal?: Record<string, unknown>) =>
+      decidePendingProposal('secretaryActionProposals', 'reject', proposal),
   }), [decidePendingProposal]);
 
   // The clicked PTC card supplies its own proposal and interrupt ids, for the

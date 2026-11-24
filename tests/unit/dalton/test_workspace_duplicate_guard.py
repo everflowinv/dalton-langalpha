@@ -119,11 +119,29 @@ def _create_call(call_id: str, name: str) -> dict:
 
 @pytest.fixture
 def workspace_creation_granted(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.server.database.computer import get_primary_computer as _REAL_PRIMARY
+
     monkeypatch.setattr(
         "src.server.database.user.get_user_preferences",
         create_autospec(
             _REAL_PREFS,
             return_value={"other_preference": {AUTO_APPROVE_WORKSPACE_CREATION: True}},
+        ),
+    )
+    monkeypatch.setattr(
+        "src.server.database.computer.get_primary_computer",
+        create_autospec(
+            _REAL_PRIMARY,
+            return_value={
+                "computer_id": "c-cloud-1",
+                "user_id": USER,
+                "name": "Cloud",
+                "kind": "docker",
+                "status": "stopped",
+                "provider_ref": "sbx-1",
+                "is_primary": True,
+                "config": {},
+            },
         ),
     )
 
@@ -137,7 +155,8 @@ async def test_a_duplicate_withholds_the_standing_approval(
         _names_double({"workspace_id": EXISTING_ID, "name": "0700.HK"}),
     )
     update = await _recorded([_create_call("c1", "700.HK")])
-    assert update == {"preapproved_calls": []}
+    assert update["preapproved_calls"] == []
+    assert update["approval_snapshots"]["c1"]["duplicate_workspace_id"] == EXISTING_ID
 
 
 @pytest.mark.asyncio
@@ -149,7 +168,8 @@ async def test_a_read_that_cannot_run_withholds_it_too(
         "src.server.database.workspace.get_live_workspace_names", _names_failing()
     )
     update = await _recorded([_create_call("c1", "Research")])
-    assert update == {"preapproved_calls": []}
+    assert update["preapproved_calls"] == []
+    assert update["approval_snapshots"]["c1"]["duplicate_check_unavailable"] is True
 
 
 @pytest.mark.asyncio
@@ -161,7 +181,8 @@ async def test_a_clean_create_keeps_its_standing_approval(
         _names_double({"workspace_id": EXISTING_ID, "name": "0700.HK"}),
     )
     update = await _recorded([_create_call("c1", "META")])
-    assert update == {"preapproved_calls": ["c1"]}
+    assert update["preapproved_calls"] == ["c1"]
+    assert update["approval_snapshots"]["c1"]["computer_id"] == "c-cloud-1"
 
 
 @pytest.mark.asyncio
@@ -175,7 +196,8 @@ async def test_a_plain_name_folding_is_not_a_duplicate(
         _names_double({"workspace_id": EXISTING_ID, "name": "计划1"}),
     )
     update = await _recorded([_create_call("c1", "计划①")])
-    assert update == {"preapproved_calls": ["c1"]}
+    assert update["preapproved_calls"] == ["c1"]
+    assert update["approval_snapshots"]["c1"]["computer_id"] == "c-cloud-1"
 
 
 # --- The tool asks on the frozen record, and the card says why ----------------

@@ -262,6 +262,8 @@ class AdmittedTurn:
     thread_id: str
     body: ChatRequest
     auth: ChatAuthResult
+    # DALTON-HOOK(cos-settings-tools): preserve caller Principal for web-only HITL confirmation verification
+    principal: Principal | None = None
 
 
 async def _admit(
@@ -284,6 +286,7 @@ async def _admit(
         thread_id=thread_id or str(uuid4()),
         body=body,
         auth=await limit(principal.user_id),
+        principal=principal,  # DALTON-HOOK(cos-settings-tools)
     )
 
 
@@ -325,7 +328,10 @@ async def send_new_thread_message(
     The server creates a new thread_id and returns it in SSE events.
     If external_thread_id + platform are provided, resolves to an existing thread first.
     """
-    return await _handle_send_message(turn.body, turn.auth, turn.thread_id, raw_request)
+    # DALTON-HOOK(cos-settings-tools): pass Principal for web-only HITL confirmation verification
+    return await _handle_send_message(
+        turn.body, turn.auth, turn.thread_id, raw_request, principal=turn.principal
+    )
 
 
 @router.post("/{thread_id}/messages")
@@ -335,7 +341,10 @@ async def send_thread_message(
     """
     Send a message to an existing thread. Returns an SSE stream.
     """
-    return await _handle_send_message(turn.body, turn.auth, turn.thread_id, raw_request)
+    # DALTON-HOOK(cos-settings-tools): pass Principal for web-only HITL confirmation verification
+    return await _handle_send_message(
+        turn.body, turn.auth, turn.thread_id, raw_request, principal=turn.principal
+    )
 
 
 def _is_service_request(raw_request: Request | None) -> bool:
@@ -458,7 +467,14 @@ async def _reject_duplicate_request(
 
 
 async def _settle_against_branch(
-    thread_id: str, request: ChatRequest, user_id: str
+    thread_id: str,
+    request: ChatRequest,
+    user_id: str,
+    *,
+    # DALTON-HOOK(cos-settings-tools): caller context for web-only HITL confirmation verification
+    principal: Principal | None = None,
+    raw_request: Request | None = None,
+    thread_meta: dict | None = None,
 ) -> ChatRequest:
     """A fork or HITL answer checked against the thread's branch.
 
@@ -475,7 +491,14 @@ async def _settle_against_branch(
         if request.fork_from_turn is not None and request.checkpoint_id:
             return await settle_fork_request(thread_id, request)
         if request.hitl_response:
-            return await settle_resume_request(thread_id, request)
+            # DALTON-HOOK(cos-settings-tools): pass principal, raw_request, thread_meta for authenticity verification
+            return await settle_resume_request(
+                thread_id,
+                request,
+                principal=principal,
+                raw_request=raw_request,
+                thread_meta=thread_meta,
+            )
         return request
     except HTTPException as refused:
         if refused.status_code == 409 and request.request_key:
@@ -493,6 +516,7 @@ async def _handle_send_message(
     raw_request: Request | None = None,
     *,
     retry_of_run_id: str | None = None,
+    principal: Principal | None = None,  # DALTON-HOOK(cos-settings-tools)
 ):
     """Shared logic for both POST /threads/messages and POST /threads/{id}/messages.
 
@@ -650,7 +674,15 @@ async def _handle_send_message(
         # later reader (the truncation, the regenerate's turn, the prior-turn
         # read) takes it from the request, so it is settled here, once, with
         # the branch tip it was read off for START to hold it to.
-        request = await _settle_against_branch(thread_id, request, user_id)
+        # DALTON-HOOK(cos-settings-tools): pass principal, raw_request, thread_meta for confirmation authenticity
+        request = await _settle_against_branch(
+            thread_id,
+            request,
+            user_id,
+            principal=principal,
+            raw_request=raw_request,
+            thread_meta=thread_meta,
+        )
         if is_holder(owner_id):
             from src.server.handlers.checkpoint_handler import first_turn_replaced
 

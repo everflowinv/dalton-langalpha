@@ -76,16 +76,41 @@ export function restoreToolApprovalsPending(
   return messages.map((m) => {
     if (m.role !== 'assistant') return m;
     const msg = m as AssistantMessage;
-    const cards = msg.toolApprovals;
-    if (!cards) return m;
+    let nextMsg = msg;
     let changed = false;
-    const next: Record<string, ToolApprovalState> = {};
-    for (const [id, card] of Object.entries(cards)) {
-      const stranded = card.status !== 'pending' && !!card.interruptId && interruptIds.has(card.interruptId);
-      if (stranded) changed = true;
-      next[id] = stranded ? { ...card, status: 'pending' } : card;
+    const cards = msg.toolApprovals;
+    if (cards) {
+      let taChanged = false;
+      const next: Record<string, ToolApprovalState> = {};
+      for (const [id, card] of Object.entries(cards)) {
+        const stranded = card.status !== 'pending' && !!card.interruptId && interruptIds.has(card.interruptId);
+        if (stranded) taChanged = true;
+        next[id] = stranded ? { ...card, status: 'pending' } : card;
+      }
+      if (taChanged) {
+        nextMsg = { ...nextMsg, toolApprovals: next };
+        changed = true;
+      }
     }
-    return changed ? { ...msg, toolApprovals: next } : m;
+    // DALTON-HOOK(cos-settings-tools): restore submitting/rejected workspace & secretary cards when resume POST is refused
+    for (const bucket of ['workspaceProposals', 'secretaryActionProposals'] as const) {
+      const proposals = msg[bucket] as Record<string, Record<string, unknown>> | undefined;
+      if (!proposals) continue;
+      let pChanged = false;
+      const nextProposals: Record<string, Record<string, unknown>> = {};
+      for (const [id, card] of Object.entries(proposals)) {
+        const stranded = (card.status === 'submitting' || card.status === 'rejected')
+          && typeof card.interruptId === 'string'
+          && interruptIds.has(card.interruptId);
+        if (stranded) pChanged = true;
+        nextProposals[id] = stranded ? { ...card, status: 'pending' } : card;
+      }
+      if (pChanged) {
+        nextMsg = { ...nextMsg, [bucket]: nextProposals };
+        changed = true;
+      }
+    }
+    return changed ? nextMsg : m;
   });
 }
 

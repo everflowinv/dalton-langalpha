@@ -185,6 +185,13 @@ export function projectHistoryInterrupt(
                 duplicate_workspace_id: proposalData.duplicate_workspace_id,
                 duplicate_workspace_name: proposalData.duplicate_workspace_name,
                 duplicate_check_unavailable: proposalData.duplicate_check_unavailable,
+                // DALTON-HOOK(cos-settings-tools): confirmation snapshot fields, tool_call_id, and confirm_token
+                computer_id: proposalData.computer_id,
+                computer_name: proposalData.computer_name,
+                computer_is_own_machine: proposalData.computer_is_own_machine,
+                bootstrap_cloud_primary: proposalData.bootstrap_cloud_primary,
+                tool_call_id: proposalData.tool_call_id,
+                confirm_token: proposalData.confirm_token,
                 interruptId: event.interrupt_id,
                 status: 'pending',
               },
@@ -198,6 +205,8 @@ export function projectHistoryInterrupt(
         assistantMessageId: interruptAssistantId,
         proposalId,
         interruptId: event.interrupt_id,
+        // DALTON-HOOK(cos-settings-tools): correlate history replay settlement by tool_call_id
+        toolCallId: proposalData.tool_call_id,
       });
     } else if (actionType === 'start_question') {
       // --- Start question interrupt (history) ---
@@ -289,6 +298,9 @@ export function projectHistoryInterrupt(
                 workspace_id: proposalData.workspace_id,
                 workspace_name: proposalData.workspace_name,
                 thread_id: proposalData.thread_id,
+                // DALTON-HOOK(cos-settings-tools): carry tool_call_id and confirm_token for secretary cards
+                tool_call_id: proposalData.tool_call_id,
+                confirm_token: proposalData.confirm_token,
                 interruptId: event.interrupt_id,
                 status: 'pending',
               },
@@ -302,6 +314,7 @@ export function projectHistoryInterrupt(
         assistantMessageId: interruptAssistantId,
         proposalId,
         interruptId: event.interrupt_id,
+        toolCallId: proposalData.tool_call_id,
       });
     } else if (actionType === 'credit_pause') {
       // --- Credit pause interrupt (history) ---

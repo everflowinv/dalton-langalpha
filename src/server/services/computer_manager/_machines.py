@@ -14,6 +14,7 @@ from uuid import uuid4
 from ptc_agent.core.sandbox.providers import (
     MACHINE_KINDS,
     PROVIDER_KINDS,
+    RECREATABLE_KINDS,  # DALTON-HOOK(cos-settings-tools)
     builds_computers,
     provider_class,
 )
@@ -66,6 +67,7 @@ from src.server.services.activity import Action
 from src.server.services.account import refuse_machine_use
 from src.server.services.computer_usage.events import note_start_path
 from src.server.services.computer_errors import (
+    ApprovalScopeChangedError,  # DALTON-HOOK(cos-settings-tools)
     NeedsComputer,
     ProviderNotOffered,
     UnknownResourceTier,
@@ -268,6 +270,59 @@ class MachineLifecycleMixin:
             # A racing delete can remove the winner; never return the tombstoned loser.
             raise RuntimeError(f"User {user_id} has no primary computer")
         return winner
+
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    async def bootstrap_cloud_primary_computer(
+        self,
+        user_id: str,
+        *,
+        default_name: Optional[str] = None,
+        resource_tier: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create a hosted cloud primary computer for a confirmed snapshot that
+        observed no primary computer.
+
+        Strictly restricts the provider to ``RECREATABLE_KINDS`` (never ``local``
+        or ``ssh``), never promotes an existing own machine, and aborts with
+        ``ApprovalScopeChangedError`` if any primary computer appeared before
+        this execution ran.
+        """
+        kind = self.config.sandbox.provider
+        if (
+            kind not in RECREATABLE_KINDS
+            or kind not in self.config.sandbox.creatable_providers()
+        ):
+            raise ProviderNotOffered(
+                f"Default sandbox provider {kind!r} cannot create a hosted cloud primary computer"
+            )
+        async with computer_capacity_lock(user_id) as conn:
+            existing_primary = await get_primary_computer(user_id, conn=conn)
+            if existing_primary is not None:
+                raise ApprovalScopeChangedError("情况已变化，请重新发起")
+            user_row = await get_user(user_id, conn=conn)
+            if (user_row or {}).get("computer_choice") == "own_machine":
+                raise ApprovalScopeChangedError("情况已变化，请重新发起")
+            computer = await self.create_computer_for_user(
+                user_id,
+                kind=kind,
+                default_name=default_name,
+                resource_tier=resource_tier,
+                is_primary=True,
+                record=False,
+            )
+        if computer.get("is_primary"):
+            _record_added(user_id, computer, automatic=True)
+            return computer
+
+        computer_id = str(computer["computer_id"])
+        logger.info(
+            "bootstrap_cloud_primary_lost_race user_id=%s computer_id=%s",
+            user_id,
+            computer_id,
+        )
+        await update_computer_status(computer_id, "deleted")
+        raise ApprovalScopeChangedError("情况已变化，请重新发起")
+    # --- DALTON-HOOK(cos-settings-tools): end ---
 
     async def ensure_stand_in_host(self, user_id: str) -> Optional[Dict[str, Any]]:
         """Give Home's stand-in a cloud computer to stand on where the plan

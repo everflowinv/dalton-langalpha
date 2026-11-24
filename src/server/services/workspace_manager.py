@@ -63,6 +63,8 @@ from src.server.models.computer import ComputerRemoveResponse, ComputerStatus
 from src.server.services.computer_usage.events import note_start_failure
 from src.server.services.path_lock_coordination import STOP_HEARTBEAT_UNAVAILABLE_RECOVERY_S
 from src.server.services.computer_errors import (
+    ApprovalScopeChangedError,  # DALTON-HOOK(cos-settings-tools)
+    ComputerArchivingError,  # DALTON-HOOK(cos-settings-tools)
     ComputerNotFoundError,
     ComputerPreparingError,
     ComputerRemovalRefused,
@@ -145,6 +147,9 @@ class WorkspaceManager(ComputerManager):
         config: Optional[Dict[str, Any]] = None,
         resource_tier: Optional[str] = None,
         computer_id: Optional[str] = None,
+        # DALTON-HOOK(cos-settings-tools): snapshot-verified create & cloud-only bootstrap
+        bootstrap_cloud_primary: bool = False,
+        verify_snapshot: bool = False,
     ) -> Dict[str, Any]:
         """Create a project on the user's computer and return it straight away.
 
@@ -175,8 +180,22 @@ class WorkspaceManager(ComputerManager):
         # Before a first computer is minted for a name that cannot be stored.
         name = checked_workspace_name(name)
         chosen = computer_id is not None
-        if chosen:
-            computer = await self._chosen_computer(user_id, computer_id)
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        if bootstrap_cloud_primary:
+            if chosen:
+                raise ApprovalScopeChangedError("情况已变化，请重新发起")
+            computer = await self.bootstrap_cloud_primary_computer(
+                user_id, default_name=name, resource_tier=resource_tier
+            )
+        elif chosen:
+            try:
+                computer = await self._chosen_computer(user_id, computer_id)
+            except (ComputerNotFoundError, ComputerArchivingError):
+                if verify_snapshot:
+                    raise ApprovalScopeChangedError("情况已变化，请重新发起") from None
+                raise
+            if verify_snapshot and computer.get("status") == ComputerStatus.ERROR:
+                raise ApprovalScopeChangedError("情况已变化，请重新发起")
         else:
             computer = await self.ensure_primary_computer(
                 user_id, default_name=name, resource_tier=resource_tier
@@ -187,29 +206,39 @@ class WorkspaceManager(ComputerManager):
             ComputerStatus.CREATING,
             ComputerStatus.STARTING,
         ) and not computer.get("provider_ref"):
+            if verify_snapshot:
+                raise ApprovalScopeChangedError("情况已变化，请重新发起")
             raise ComputerPreparingError("Computer is still being prepared")
         computer_id = str(computer["computer_id"])
 
         # DALTON-HOOK(colleague-access): strip pending_outbound_confirm on create when colleague sharing auth is enabled
         _owned_config_keys = server_owned_config_keys()
-        workspace = await create_workspace_on_computer(
-            user_id,
-            name,
-            computer_id,
-            description=description,
-            config={
+        create_kwargs: Dict[str, Any] = {
+            "description": description,
+            "config": {
                 key: value
                 for key, value in (config or {}).items()
                 if key not in _owned_config_keys
             },
+        }
+        if verify_snapshot or bootstrap_cloud_primary:
+            create_kwargs["reject_unavailable"] = True
+        workspace = await create_workspace_on_computer(
+            user_id,
+            name,
+            computer_id,
+            **create_kwargs,
         )
         if workspace is None:
+            if verify_snapshot or bootstrap_cloud_primary:
+                raise ApprovalScopeChangedError("情况已变化，请重新发起")
             if chosen:
                 raise ComputerNotFoundError("Computer not found")
             raise RuntimeError(
                 f"Computer {computer_id} was gone before workspace {name!r} "
                 "could be created on it"
             )
+        # --- DALTON-HOOK(cos-settings-tools): end ---
 
         workspace_id = str(workspace["workspace_id"])
         await self.resolve_binding(workspace_id, workspace=workspace)
@@ -234,6 +263,11 @@ class WorkspaceManager(ComputerManager):
             or (computer.get("config") or {}).get("retire_when_empty")
         ):
             raise ComputerNotFoundError("Computer not found")
+        # DALTON-HOOK(cos-settings-tools): refuse creating a workspace on an archiving computer
+        if (computer.get("config") or {}).get("archiving"):
+            raise ComputerArchivingError(
+                "This computer is currently being archived and cannot accept new workspaces."
+            )
         return computer
 
     async def get_session_for_workspace(

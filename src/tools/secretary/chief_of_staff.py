@@ -27,7 +27,8 @@ from src.tools.secretary._commands import (
     success_command,
     verify_thread_owner,
 )
-from src.tools.secretary.approvals import preapproved
+# DALTON-HOOK(cos-settings-tools): import approval_snapshot for frozen create snapshots
+from src.tools.secretary.approvals import approval_snapshot, preapproved
 from src.tools.secretary.dispatch import dispatch
 # DALTON-HOOK(computer-cli-tokens-off): retain server-side CoS tools when la CLI is off.
 # DALTON-HOOK(cos-settings-tools): wire update action into manage_workspaces.
@@ -62,6 +63,8 @@ async def chief_of_staff_workspaces(
     name: str | None = None,
     description: str | None = None,
     workspace_id: str | None = None,
+    # DALTON-HOOK(cos-settings-tools): optional target computer name/id for "create"
+    computer: str | None = None,
     # DALTON-HOOK(workspace-sharing-settings): optional path/content for CoS file read/write
     path: str | None = None,
     content: str | None = None,
@@ -101,6 +104,7 @@ async def chief_of_staff_workspaces(
         name: Workspace name; required for "create", optional for "update" (omit on "update" to keep the current name; at least one of name or description is required). Renaming a workspace also changes its folder name on its computer; Home cannot be renamed.
         description: Workspace description (up to 1,000 characters); optional for "create" and "update" (omit on "update" to keep the current description).
         workspace_id: Target workspace ID; required for "update", "delete", "list_files", "read_file", "copy_file", and "write_file". Home cannot be deleted.
+        computer: Optional target computer for "create": pass a computer display name from `<activity>` or `manage_workspaces(action="list")`, its full UUID, or an 8+ character unique prefix. Omit to use the primary computer (or create a new hosted cloud primary computer on first setup when supported). Own machines always show a confirmation card.
         path: Relative directory or file path INSIDE workspace_id's own folder (sources/x.md, not DASH/sources/x.md); optional prefix for "list_files", required for "read_file", "copy_file" and "write_file". Workspace folders sit beside Home (../<folder>), never inside it — a path starting with a workspace folder name is refused, because it would silently land in the wrong workspace.
         content: Full UTF-8 text to write; required for "write_file" (requires "rw" access).
         dest_path: Where "copy_file" lands the file, relative to the destination's folder; default shared/<filename>.
@@ -126,6 +130,9 @@ async def chief_of_staff_workspaces(
         return await workspaces_create(
             user_id, name, description, tool_call_id,
             preapproved=preapproved(state, tool_call_id),
+            # DALTON-HOOK(cos-settings-tools): pass target computer and frozen confirmation snapshot
+            computer=computer,
+            snapshot=approval_snapshot(state, tool_call_id),
             # DALTON-HOOK(workspace-dedup): pass explicit duplicate override and coverage registration fields
             allow_duplicate_company=allow_duplicate_company,
             coverage_kind=coverage_kind,

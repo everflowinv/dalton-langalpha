@@ -7,8 +7,11 @@ Provides endpoints for:
 - Retrying failed/interrupted threads from the appropriate checkpoint
 """
 
+import hmac  # DALTON-HOOK(cos-settings-tools)
 import logging
-from typing import NamedTuple
+import os  # DALTON-HOOK(cos-settings-tools)
+from typing import Any, NamedTuple  # DALTON-HOOK(cos-settings-tools)
+from urllib.parse import urlparse  # DALTON-HOOK(cos-settings-tools)
 
 from fastapi import HTTPException
 
@@ -18,6 +21,7 @@ from src.server.utils.checkpoint_helpers import (
     FORK_ROOT_CHECKPOINT_ID,
     build_checkpoint_config,
     get_checkpointer,
+    interrupt_records,  # DALTON-HOOK(cos-settings-tools)
     turn_base_checkpoint_id,
 )
 from src.server.utils.pg_sanitize import normalize_uuid
@@ -272,7 +276,256 @@ async def get_retry_checkpoint(thread_id: str, checkpoint_id: str | None = None)
     return replay
 
 
-async def settle_resume_request(thread_id: str, request: ChatRequest) -> ChatRequest:
+# --- DALTON-HOOK(cos-settings-tools): begin ---
+WEB_CONFIRM_ACTION_TYPES: frozenset[str] = frozenset(
+    {"create_workspace", "archive_workspace"}
+)
+
+
+def _interrupt_action_request(record: dict[str, Any]) -> dict[str, Any] | None:
+    value = record.get("value")
+    if not isinstance(value, dict):
+        return None
+    action_requests = value.get("action_requests")
+    if not isinstance(action_requests, list) or not action_requests:
+        return None
+    first = action_requests[0]
+    return first if isinstance(first, dict) else None
+
+
+def _is_web_confirm_interrupt(record: dict[str, Any]) -> bool:
+    action_req = _interrupt_action_request(record)
+    return bool(action_req and action_req.get("type") in WEB_CONFIRM_ACTION_TYPES)
+
+
+def _is_loopback_origin(raw_origin: str) -> bool:
+    parsed = urlparse(raw_origin.strip())
+    if (parsed.scheme or "").lower() not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
+def _verify_oss_loopback_web_caller(raw_request: Any) -> bool:
+    """Verify that a confirmation in ``DALTON_AUTH_MODE == 'oss'`` came from a
+    first-party loopback web browser or desktop app rather than an unauthenticated
+    API client.
+
+    - When ``LANGALPHA_OWNER_SECRET`` is configured (desktop app), requires a
+      valid ``x-langalpha-owner`` header verified via ``hmac.compare_digest``.
+    - When ``LANGALPHA_OWNER_SECRET`` is not configured (loopback browser trial),
+      requires browser same-origin Fetch Metadata / loopback ``Origin`` headers
+      (paired with the per-approval ``confirm_token`` checked against the
+      checkpoint snapshot below), rejecting unauthenticated API clients that
+      present neither.
+    """
+    from src.dalton.auth.tokens import _allowed_cookie_origins, _normalize_origin
+    from src.server.auth import owner_requests
+
+    if os.environ.get(owner_requests.OWNER_SECRET_ENV, ""):
+        return owner_requests.is_owner(raw_request.scope)
+
+    headers = getattr(raw_request, "headers", None)
+    if headers is None:
+        return False
+    sec_fetch_site = (headers.get("sec-fetch-site") or "").strip().lower()
+    if sec_fetch_site and sec_fetch_site not in ("same-origin", "same-site"):
+        return False
+
+    allowed_origins = _allowed_cookie_origins(raw_request)
+    origin_hdr = (headers.get("origin") or "").strip()
+    if origin_hdr:
+        norm = _normalize_origin(origin_hdr)
+        if not norm:
+            return False
+        is_loopback = _is_loopback_origin(origin_hdr)
+        if sec_fetch_site == "same-site" and not is_loopback:
+            return False
+        return is_loopback or norm in allowed_origins
+
+    if sec_fetch_site != "same-origin":
+        return False
+    referer_hdr = (headers.get("referer") or "").strip()
+    if referer_hdr:
+        norm_ref = _normalize_origin(referer_hdr)
+        if not norm_ref:
+            return False
+        return _is_loopback_origin(referer_hdr) or norm_ref in allowed_origins
+    return True
+
+
+def _snapshot_matches_action(
+    snapshot: dict[str, Any], action_req: dict[str, Any]
+) -> bool:
+    action_type = action_req.get("type")
+    if snapshot.get("action") != action_type:
+        return False
+    if action_type == "create_workspace":
+        return (
+            snapshot.get("workspace_name") == action_req.get("workspace_name")
+            and snapshot.get("computer_id") == action_req.get("computer_id")
+            and bool(snapshot.get("bootstrap_cloud_primary"))
+            == bool(action_req.get("bootstrap_cloud_primary"))
+            and bool(snapshot.get("computer_is_own_machine"))
+            == bool(action_req.get("computer_is_own_machine"))
+        )
+    if action_type == "archive_workspace":
+        return (
+            snapshot.get("workspace_id") == action_req.get("workspace_id")
+            and snapshot.get("computer_id") == action_req.get("computer_id")
+        )
+    return False
+
+
+def _extract_first_confirm_token(entry: Any) -> str | None:
+    decisions = (
+        entry.get("decisions")
+        if isinstance(entry, dict)
+        else getattr(entry, "decisions", None)
+    )
+    if not isinstance(decisions, list) or not decisions:
+        return None
+    first = decisions[0]
+    token = (
+        first.get("confirm_token")
+        if isinstance(first, dict)
+        else getattr(first, "confirm_token", None)
+    )
+    return token if isinstance(token, str) and token else None
+
+
+async def _verify_web_confirm_resume(
+    *,
+    thread_id: str,
+    request: ChatRequest,
+    newest: Any,
+    pending_by_id: dict[str, dict[str, Any]],
+    guarded_by_id: dict[str, dict[str, Any]],
+    principal: Any,
+    raw_request: Any,
+    thread_meta: dict[str, Any] | None,
+) -> None:
+    """Enforce first-party web confirmation authenticity for ``create_workspace``
+    and ``archive_workspace`` HITL resumes."""
+    from src.config import settings as app_settings
+    from src.dalton.auth import is_dalton_supabase_auth_enabled
+    from src.dalton.settings import get_dalton_auth_mode
+    from src.server.database.conversation import senders
+    from src.server.database.shared_workspaces import is_holder
+
+    def _forbid(code: str, message: str) -> HTTPException:
+        return HTTPException(status_code=403, detail={"code": code, "message": message})
+
+    # 1. First-party web session check (rejects service, oauth, pat, computer, channel).
+    if principal is None or raw_request is None:
+        raise _forbid(
+            "web_session_required",
+            "This confirmation requires an active first-party web session.",
+        )
+    if getattr(principal, "auth", None) != "session":
+        raise _forbid(
+            "web_session_required",
+            "This confirmation requires an active first-party web session.",
+        )
+    headers = getattr(raw_request, "headers", None)
+    if headers is None or (headers.get("X-Service-Token") or "").strip():
+        raise _forbid(
+            "web_session_required",
+            "This confirmation requires an active first-party web session.",
+        )
+    if request.platform or request.external_thread_id:
+        raise _forbid(
+            "web_session_required",
+            "This confirmation must be completed in the web app.",
+        )
+
+    is_oss_mode = (
+        app_settings.HOST_MODE == "oss"
+        and not is_dalton_supabase_auth_enabled()
+        and get_dalton_auth_mode() == "oss"
+    )
+    if is_oss_mode:
+        if (headers.get("Authorization") or "").strip():
+            raise _forbid(
+                "web_session_required",
+                "Token-authenticated API clients cannot confirm this action in OSS mode.",
+            )
+        if not _verify_oss_loopback_web_caller(raw_request):
+            raise _forbid(
+                "web_session_required",
+                "Loopback web confirmation requires a first-party browser or desktop app session.",
+            )
+
+    # 2. Initiator identity check.
+    if not thread_meta:
+        raise _forbid(
+            "confirm_initiator_mismatch",
+            "Only the initiator of this confirmation can answer it.",
+        )
+    owner_id = thread_meta.get("user_id")
+    ws_owner_id = thread_meta.get("workspace_owner_id")
+    is_multi_actor_thread = is_holder(owner_id) or (
+        ws_owner_id is not None and str(ws_owner_id) != str(owner_id)
+    )
+    if is_multi_actor_thread:
+        initiator = await senders.latest_turn_sender(thread_id)
+    else:
+        initiator = owner_id
+    if not initiator or str(initiator) != str(principal.user_id):
+        raise _forbid(
+            "confirm_initiator_mismatch",
+            "Only the initiator of this confirmation can answer it.",
+        )
+
+    # 3. Current pending interrupt_id check.
+    answers = request.hitl_response or {}
+    if not answers or any(iid not in pending_by_id for iid in answers):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "scope_changed", "message": "情况已变化，请重新发起"},
+        )
+
+    # 4. Persisted approval_snapshots & confirm_token check.
+    checkpoint_data = (newest.checkpoint or {}) if newest is not None else {}
+    channel_values = checkpoint_data.get("channel_values") or {}
+    snapshots = channel_values.get("approval_snapshots")
+    for iid, entry in answers.items():
+        if iid not in guarded_by_id:
+            continue
+        action_req = _interrupt_action_request(guarded_by_id[iid]) or {}
+        tool_call_id = action_req.get("tool_call_id")
+        snap = (
+            snapshots.get(tool_call_id)
+            if isinstance(snapshots, dict) and isinstance(tool_call_id, str)
+            else None
+        )
+        if not isinstance(snap, dict) or not _snapshot_matches_action(snap, action_req):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "scope_changed", "message": "情况已变化，请重新发起"},
+            )
+        expected_token = snap.get("confirm_token")
+        if expected_token:
+            sent_token = _extract_first_confirm_token(entry)
+            if not sent_token or not hmac.compare_digest(
+                sent_token, str(expected_token)
+            ):
+                raise _forbid(
+                    "web_session_required",
+                    "Confirmation token is missing or invalid.",
+                )
+# --- DALTON-HOOK(cos-settings-tools): end ---
+
+
+async def settle_resume_request(
+    thread_id: str,
+    request: ChatRequest,
+    *,
+    # DALTON-HOOK(cos-settings-tools): optional caller context for web-only HITL confirmation checks
+    principal: Any = None,
+    raw_request: Any = None,
+    thread_meta: dict[str, Any] | None = None,
+) -> ChatRequest:
     """The HITL answer ``request``, refused unless it resumes the pause the
     thread would resume next, else stamped with the run horizon START holds it
     to.
@@ -292,12 +545,43 @@ async def settle_resume_request(thread_id: str, request: ChatRequest) -> ChatReq
     branch = await threads_read.get_thread_branch_read(thread_id)
     checkpointer = get_checkpointer()
     stale = await turn_base_checkpoint_id(checkpointer, thread_id) is not None
-    if not stale and request.checkpoint_id:
+    newest = None
+    if not stale:
+        # DALTON-HOOK(cos-settings-tools): load newest checkpoint once for both staleness & interrupt verification
         newest = await checkpointer.aget_tuple(build_checkpoint_config(thread_id))
-        stale = (
-            newest is None
-            or newest.config["configurable"]["checkpoint_id"] != request.checkpoint_id
-        )
+        if request.checkpoint_id:
+            stale = (
+                newest is None
+                or newest.config["configurable"]["checkpoint_id"] != request.checkpoint_id
+            )
     if stale:
         raise HTTPException(status_code=409, detail=stale_fork_detail())
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    if request.hitl_response and newest is not None:
+        pending_records = interrupt_records(getattr(newest, "pending_writes", None))
+        pending_by_id = {
+            str(rec["id"]): rec
+            for rec in pending_records
+            if rec.get("id") is not None
+        }
+        guarded_by_id = {
+            iid: rec
+            for iid, rec in pending_by_id.items()
+            if _is_web_confirm_interrupt(rec)
+        }
+        if guarded_by_id and (
+            any(iid in guarded_by_id for iid in request.hitl_response)
+            or not set(request.hitl_response).issubset(set(pending_by_id))
+        ):
+            await _verify_web_confirm_resume(
+                thread_id=thread_id,
+                request=request,
+                newest=newest,
+                pending_by_id=pending_by_id,
+                guarded_by_id=guarded_by_id,
+                principal=principal,
+                raw_request=raw_request,
+                thread_meta=thread_meta,
+            )
+    # --- DALTON-HOOK(cos-settings-tools): end ---
     return request.model_copy(update={"resume_run_horizon": branch.run_horizon})

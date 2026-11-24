@@ -180,8 +180,29 @@ def _call(tool_name: str, call_id: str, **args) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_each_setting_covers_only_its_own_action(other_preference):
+async def test_each_setting_covers_only_its_own_action(other_preference, monkeypatch):
     # DALTON-HOOK(computer-cli-tokens-off): manage_workspaces(create) keeps standing approval.
+    # DALTON-HOOK(cos-settings-tools): create snapshot resolves the primary cloud computer once.
+    from unittest.mock import create_autospec
+
+    from src.server.database.computer import get_primary_computer
+
+    monkeypatch.setattr(
+        "src.server.database.computer.get_primary_computer",
+        create_autospec(
+            get_primary_computer,
+            return_value={
+                "computer_id": "c-cloud-1",
+                "user_id": USER_ID,
+                "name": "Cloud",
+                "kind": "docker",
+                "status": "stopped",
+                "provider_ref": "sbx-1",
+                "is_primary": True,
+                "config": {},
+            },
+        ),
+    )
     other_preference[AUTO_APPROVE_WORKSPACE_CREATION] = True
     update = await _recorded([
         _call("manage_workspaces", "create", action="create", name="Research"),
@@ -189,7 +210,8 @@ async def test_each_setting_covers_only_its_own_action(other_preference):
         _call("delegate_to_analyst", "handoff", question="q", workspace_id="ws-1"),
     ])
 
-    assert update == {"preapproved_calls": ["create"]}
+    assert update["preapproved_calls"] == ["create"]
+    assert update["approval_snapshots"]["create"]["computer_id"] == "c-cloud-1"
 
 
 @pytest.mark.asyncio

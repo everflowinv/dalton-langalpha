@@ -79,9 +79,17 @@ export function preapprovedCard(
   if (result?.preapproved !== true) return null;
   if (!isHandoff) {
     if (result.success !== true) return null;
+    // DALTON-HOOK(cos-settings-tools): carry target computer & workspace id onto preapproved create slip when present
     return {
       type: 'create_workspace',
-      proposal: { status: 'approved', workspace_name: result.workspace_name, workspace_description: result.workspace_description },
+      proposal: {
+        status: 'approved',
+        workspace_name: result.workspace_name,
+        workspace_description: result.workspace_description,
+        ...(typeof result.workspace_id === 'string' && result.workspace_id ? { workspace_id: result.workspace_id } : {}),
+        ...(typeof result.computer_name === 'string' && result.computer_name ? { computer_name: result.computer_name } : {}),
+        ...(result.bootstrap_cloud_primary === true ? { bootstrap_cloud_primary: true } : {}),
+      },
     };
   }
   // A hand-off that failed after it was approved still draws its card, as
