@@ -5308,9 +5308,11 @@ describe("Batch B Round 3 — Lease Timer, Preflight Snapshot, Collect, /cancel,
 
     const logLines: string[] = [];
     const safeLogger = createSubsystemLogger("lease-test", {
-      info: (l) => logLines.push(l),
-      warn: (l) => logLines.push(l),
-      error: (l) => logLines.push(l),
+      sink: {
+        info: (l: string) => logLines.push(l),
+        warn: (l: string) => logLines.push(l),
+        error: (l: string) => logLines.push(l),
+      },
     });
     const logBackend = createMockBackend();
     vi.mocked(logBackend.heartbeatGatewayLease).mockRejectedValueOnce(
