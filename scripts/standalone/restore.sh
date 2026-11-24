@@ -342,6 +342,9 @@ ENV_FROM_BACKUP=0
 ENV_BACKUP_PATH=""
 CANDIDATE_ENV=""
 MINIO_MANIFEST_TMP=""
+# Set at preflight when the backup carries an object archive; the write step trusts this,
+# not a second look at the directory, so an archive that vanishes later stops the restore.
+MINIO_ARCHIVE_SEEN=0
 COMPOSE_CFG_TMP=""
 
 compute_dir_lock_hash() {
@@ -581,6 +584,7 @@ PY
 fi
 
 if [[ -f "${BACKUP_DIR}/minio-objects.tar.gz" ]]; then
+  MINIO_ARCHIVE_SEEN=1
   MINIO_MANIFEST_TMP="$(mktemp)"
   chmod 600 "$MINIO_MANIFEST_TMP"
   if ! tar -xOzf "${BACKUP_DIR}/minio-objects.tar.gz" _minio_manifest.json > "$MINIO_MANIFEST_TMP"; then
@@ -854,13 +858,23 @@ if [[ "$ENV_FROM_BACKUP" -eq 1 ]]; then
       done
       env_bak_candidate="${env_bak_candidate}-${env_bak_seq}"
     fi
-    ENV_BACKUP_PATH="$env_bak_candidate"
     if [[ "$ENV_WAS_SYMLINK" -eq 1 ]]; then
+      # A rename is atomic: either the link moved and the backup exists, or nothing
+      # changed and cleanup finds no backup to put back.
+      ENV_BACKUP_PATH="$env_bak_candidate"
       mv "$ENV_FILE" "$ENV_BACKUP_PATH"
       info "Backed up existing symlink ${ENV_FILE} to ${ENV_BACKUP_PATH} (symlink preserved; target untouched)."
     else
-      cp -P -p "$ENV_FILE" "$ENV_BACKUP_PATH"
-      chmod 600 "$ENV_BACKUP_PATH"
+      # Copy to a side name and compare before naming it the backup, so a copy cut
+      # short (a full disk) is never what cleanup puts back over the intact .env.
+      env_bak_tmp="${env_bak_candidate}.partial"
+      if ! { cp -P -p "$ENV_FILE" "$env_bak_tmp" && chmod 600 "$env_bak_tmp" && cmp -s "$ENV_FILE" "$env_bak_tmp"; }; then
+        rm -f "$env_bak_tmp"
+        err "Could not back up ${ENV_FILE} (disk full?). Nothing was changed."
+        exit 1
+      fi
+      mv "$env_bak_tmp" "$env_bak_candidate"
+      ENV_BACKUP_PATH="$env_bak_candidate"
       info "Backed up existing ${ENV_FILE} to ${ENV_BACKUP_PATH} (mode 600)."
     fi
   fi
@@ -1186,7 +1200,7 @@ fi
 compose_cmd up -d postgres redis minio
 
 # Step 4: Restore MinIO objects directly into original bucket name(s) with read-back verification
-if [[ "$SKIP_MINIO" -eq 0 && "$STORAGE_ANY_CONFIGURED" -eq 1 && -f "${BACKUP_DIR}/minio-objects.tar.gz" ]]; then
+if [[ "$SKIP_MINIO" -eq 0 && "$STORAGE_ANY_CONFIGURED" -eq 1 && "$MINIO_ARCHIVE_SEEN" -eq 1 ]]; then
   info "4/7 Restoring MinIO objects into original bucket(s) with read-back verification..."
 
   MINIO_RESTORE_PY='
