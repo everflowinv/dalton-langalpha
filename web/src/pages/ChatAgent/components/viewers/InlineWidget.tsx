@@ -6,6 +6,7 @@ import { useHtmlSandbox } from './html/useHtmlSandbox';
 import { useHtmlActions } from './html/useHtmlActions';
 import HtmlActionBar from './html/HtmlActionBar';
 import HtmlFullscreenModal from './html/HtmlFullscreenModal';
+import type { WidgetExports } from '../messageList/MessageActionsContext'; // DALTON-HOOK(shared-widgets)
 import './InlineWidget.css';
 
 interface InlineWidgetProps {
@@ -14,6 +15,8 @@ interface InlineWidgetProps {
   onSendPrompt?: (text: string) => void;
   /** Inline data file contents — injected directly as __WIDGET_DATA__. */
   data?: Record<string, string>;
+  /** DALTON-HOOK(shared-widgets): export actions offered; all by default. */
+  exports?: WidgetExports;
 }
 
 /**
@@ -40,7 +43,8 @@ function widgetHeightKey(html: string, data?: Record<string, string>): string {
   return `${h}|${html.length}|${dataSig}`;
 }
 
-export default function InlineWidget({ html, title, onSendPrompt, data }: InlineWidgetProps) {
+// DALTON-HOOK(shared-widgets): `exports` narrows the export actions on a shared view.
+export default function InlineWidget({ html, title, onSendPrompt, data, exports = 'all' }: InlineWidgetProps) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [fullscreen, setFullscreen] = useState(false);
 
@@ -71,7 +75,16 @@ export default function InlineWidget({ html, title, onSendPrompt, data }: Inline
   // opening, downloading or printing it would hand the user a document carrying
   // the dialog's own layout, and on paper the box is 680px wide and neither the
   // column cap nor the magnification means anything.
-  const actions = useHtmlActions({ mode: 'widget', srcDoc, fileName: title });
+  const allActions = useHtmlActions({ mode: 'widget', srcDoc, fileName: title });
+  // DALTON-HOOK(shared-widgets): a surface may offer fewer exports (a shared view).
+  const actions = useMemo(
+    () => ({
+      openInNewTab: exports === 'all' ? allActions.openInNewTab : undefined,
+      downloadHtml: exports === 'none' ? undefined : allActions.downloadHtml,
+      exportPdf: exports === 'all' ? allActions.exportPdf : undefined,
+    }),
+    [exports, allActions.openInNewTab, allActions.downloadHtml, allActions.exportPdf],
+  );
 
   // No max-height cap — widgets span naturally to fit content (charts, tables,
   // dashboards). The agent controls HTML output and the skill doc guides it to
