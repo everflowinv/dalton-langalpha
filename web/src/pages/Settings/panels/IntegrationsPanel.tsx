@@ -2,7 +2,9 @@ import { useTranslation } from 'react-i18next';
 import { Favicon } from '@/pages/ChatAgent/components/Favicon';
 import { MESSAGING_APPS, messagingAppDomain, messagingAppName } from '@/pages/ChatAgent/components/messaging/messageDelivery';
 import { isPlatformMode } from '@/config/hostMode';
+import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(standalone-core)
 import { useLinkedChatApps } from '@/hooks/useLinkedChatApps';
+import { DaltonLoadingRow } from '@/components/dalton/primitives'; // DALTON-HOOK(standalone-core)
 import { ConsoleLink } from '../components/ConsoleLink';
 import { SettingRow, SettingsGroup } from '../components/SettingsLayout';
 import { useSettingCopy } from '../components/useSettingCopy';
@@ -21,16 +23,24 @@ export function IntegrationsPanel() {
   const { t } = useTranslation();
   const copy = useSettingCopy();
   const linked = useLinkedChatApps();
+  // DALTON-HOOK(standalone-core): gate personal channel cards on enabled channel capabilities
+  const { hasCapability, isLoading: capsLoading } = useCapabilities();
+  const showNotifyAndBindings = hasCapability(['channel_feishu', 'channel_discord']);
+  const showWeixinBind = hasCapability('channel_weixin');
   // iMessage depends on the deployment, so it shows once it is linked.
   const apps = MESSAGING_APPS.filter((app) => app !== 'imessage' || linked?.has(app));
   const chatApps = copy(SETTINGS.chatApps);
 
+  if (capsLoading) {
+    return <DaltonLoadingRow label={t('dalton.common.loading')} />;
+  }
+
   return (
     <>
       {/* DALTON-HOOK(settings-reorg): personal notify switches, channel bindings, and WeChat link */}
-      <DaltonNotifyTargetsCard />
-      <DaltonChannelBindingsCard />
-      <DaltonWeixinBindCard />
+      {showNotifyAndBindings && <DaltonNotifyTargetsCard />}
+      {showNotifyAndBindings && <DaltonChannelBindingsCard />}
+      {showWeixinBind && <DaltonWeixinBindCard />}
 
       {isPlatformMode && (
         <SettingsGroup title={chatApps.label} description={chatApps.description}>

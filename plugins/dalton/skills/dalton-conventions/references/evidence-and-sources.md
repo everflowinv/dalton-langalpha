@@ -5,45 +5,46 @@
 当不同来源对同一事实或数字存在冲突时，严格按以下 6 级权威度从高到低采信（高于 `research-conventions` 的默认排序）：
 
 1. **Level 1 — 监管法定披露（`filing`，默认 tier 1）**：SEC 10-K/10-Q/8-K/20-F、港交所披露易公告、巨潮资讯法定财报。
-2. **Level 2 — 公司官方材料与电话会转写（`company` / 知识层 `company_release`、`transcript`，默认 tier 2）**：业绩新闻稿（Earnings Release）、投资者演示文稿（IR Deck）、业绩电话会/发布会转写（Prepared Remarks & Confirmed Q&A，包括 AlphaEngine ASR 稿；卖方回访转写记 tier 3）。
-3. **Level 3 — 具名机构研报与一致预期（`broker_report` / `consensus`，默认 tier 3）**：具名卖方深度/点评研报（AlphaEngine、Sales Notes 原件）、卖方一致预期（`consensus`，直接记 `consensus` 而不必硬塞进 `broker_report`）。
+2. **Level 2 — 公司官方材料与电话会转写（`company` / 知识层 `company_release`、`transcript`，默认 tier 2）**：业绩新闻稿（Earnings Release）、投资者演示文稿（IR Deck）、业绩电话会/发布会转写（Prepared Remarks & Confirmed Q&A<!-- DALTON_CAP:alphaengine -->，包括 AlphaEngine ASR 稿<!-- /DALTON_CAP -->；卖方回访转写记 tier 3）。
+3. **Level 3 — 具名机构研报与一致预期（`broker_report` / `consensus`，默认 tier 3）**：具名卖方深度/点评研报<!-- DALTON_CAP:alphaengine|researchdata_bridge -->（AlphaEngine、Sales Notes 原件）<!-- /DALTON_CAP -->、卖方一致预期（`consensus`，直接记 `consensus` 而不必硬塞进 `broker_report`）。
 4. **Level 4 — 官方/协会统计与第三方独立产业数据（`official_data`，默认 tier 4）**：央行/FRED/财政部/行业协会官方统计、上下游上市公司披露、供应链独立调研、行业监测数据库。
-5. **Level 5 — 专家访谈与团队内部纪要（`expert` / `internal_note`，默认 tier 5）**：Guidepoint 专家纪要、基金 Wiki 与 AlphaEngine 中的专家访谈（必须标明专家身份、日期与验证状态，经营数字标"单一来源估计"），以及团队内部对话或纪要（`internal_note`，默认 tier 5，视引述内容可标 3–5）。
-6. **Level 6 — 财经新闻与社媒讨论（`news` / `derived`，默认 tier 6）**：新闻报道、TMTB、FUNDA AI 摘要等**仅作研究线索**，涉及财务或经营数字时必须回溯到 Level 1–5 原始出处。
+5. **Level 5 — 专家访谈与团队内部纪要（`expert` / `internal_note`，默认 tier 5）**：<!-- DALTON_CAP:guidepoint|alphaengine|researchdata_bridge -->Guidepoint 专家纪要、基金 Wiki 与 AlphaEngine 中的专家访谈<!-- DALTON_CAP_ELSE -->公开或用户提供的专家访谈与调研纪要<!-- /DALTON_CAP -->（必须标明专家身份、日期与验证状态，经营数字标"单一来源估计"），以及团队内部对话或纪要（`internal_note`，默认 tier 5，视引述内容可标 3–5）。
+6. **Level 6 — 财经新闻与社媒讨论（`news` / `derived`，默认 tier 6）**：新闻报道<!-- DALTON_CAP:researchdata_bridge -->、TMTB、FUNDA AI 摘要<!-- DALTON_CAP_ELSE -->与第三方资讯摘要<!-- /DALTON_CAP -->等**仅作研究线索**，涉及财务或经营数字时必须回溯到 Level 1–5 原始出处。
 7. **本方模型推导（知识层 `model`，默认 tier 2–3）**：引用工作区财务模型（必须指向 `source.ref.kind="model_cell"` 的具体 `Sheet!Cell`，且**不能标 tier 1**）。
 
 **绝对禁用来源**：**百度百科**（任何情况下不得作为事实、历史沿革或行业数据的来源）。
 
 ---
 
-## 2. 来源身份与 `researchdata` 的 `_sources.identity` 对照表
+## 2. 来源身份与 <!-- DALTON_CAP:researchdata_bridge -->`researchdata` 的 <!-- /DALTON_CAP -->`_sources.identity` 对照表<!-- DALTON_CAP:researchdata_bridge -->
 
-各来源提供的证据与 `research` 路由选用规则，统一以 `<mcp-servers>` 中 `researchdata` 的说明与 `.agents/tools/docs/researchdata/research.md`（由 `scripts/dalton/researchdata_bridge.py` 的 `RESEARCH_EVIDENCE_AND_ROUTE_GUIDE` 单一来源生成）为准，此处不再重复抄录。
+各来源提供的证据与 `research` 路由选用规则，统一以 `<mcp-servers>` 中 `researchdata` 的说明与 `.agents/tools/docs/researchdata/research.md`（由 `scripts/dalton/researchdata_bridge.py` 的 `RESEARCH_EVIDENCE_AND_ROUTE_GUIDE` 单一来源生成）为准，此处不再重复抄录。<!-- /DALTON_CAP -->
 
 所有工具返回的 `_sources` 条目按以下规则映射来源身份（`identity`）：
 
 | 路由与操作（route / operation） | `document_id` 格式 | `identity`（来源身份） | `publisher`（发布方） | `as_of` 口径 |
-|---|---|---|---|---|
-| `alphaengine` (`search_library` / `get_document`；仅此两操作生成研究文档 `_sources`，`list_recording_tasks` / `get_recording_status` / `get_recording_task` / `get_document_info` / `list_attachments` / `list_filters` / `auth_status` 不生成研究文档来源) | `alphaengine:{doc_id}`（完整不透明字符串 ID，保留 `_inst_` 后缀） | 结合 `document_code` / `type_id` / `type_name` / `type_show_name` 映射：业绩说明会（`IND_SECOND_5FA442AE` / `SimultaneousInterpretation` / 业绩会）与公司公告（`companyAllAnnouncement`）→ `company`；专家库（`expert_summary` / 专家）→ `expert`；资讯（`news`）→ `news`；卖方研报与点评（`comment` / `chinaReport` / `foreignReport`，或细分类型明确为券商/卖方研报）→ `broker_report`；**`document_code="summary"` 且细分类型未确认为卖方的个人/机构会议、三方报告（`thirdReport`）、全球智库（`globalThinkTank`）及未知类型均保持 `unknown`（录制范围或资料大类本身不足以证明卖方身份，不默认判卖方）** | `sources[0]` 机构名 | `publish_time`（缺发布时间时留空、`as_of_basis="unknown"`，不用调用日期冒充；`rank_date` 是入库排序时间，非会议开始时间） |
-| `guidepoint` (`search_library`) | `guidepoint:{sha1}` | `expert` | `"Guidepoint · {title}, {company}"`（**不写姓名**） | `date` (`call_date`) |
-| `transcript` (`transcript`) | `alphaengine:{doc_id}` | 公司电话会 → `_sources` 标 `company`，知识层 `source.type` 记 `transcript`（tier 2，含 AlphaEngine ASR 稿）；卖方回访 → `broker_report` / `transcript`（tier 3） | `sources` | `publish_time` |
+|---|---|---|---|---|<!-- DALTON_CAP:alphaengine -->
+| `alphaengine` (`search_library` / `get_document`；仅此两操作生成研究文档 `_sources`，`list_recording_tasks` / `get_recording_status` / `get_recording_task` / `get_document_info` / `list_attachments` / `list_filters` / `auth_status` 不生成研究文档来源) | `alphaengine:{doc_id}`（完整不透明字符串 ID，保留 `_inst_` 后缀） | 结合 `document_code` / `type_id` / `type_name` / `type_show_name` 映射：业绩说明会（`IND_SECOND_5FA442AE` / `SimultaneousInterpretation` / 业绩会）与公司公告（`companyAllAnnouncement`）→ `company`；专家库（`expert_summary` / 专家）→ `expert`；资讯（`news`）→ `news`；卖方研报与点评（`comment` / `chinaReport` / `foreignReport`，或细分类型明确为券商/卖方研报）→ `broker_report`；**`document_code="summary"` 且细分类型未确认为卖方的个人/机构会议、三方报告（`thirdReport`）、全球智库（`globalThinkTank`）及未知类型均保持 `unknown`（录制范围或资料大类本身不足以证明卖方身份，不默认判卖方）** | `sources[0]` 机构名 | `publish_time`（缺发布时间时留空、`as_of_basis="unknown"`，不用调用日期冒充；`rank_date` 是入库排序时间，非会议开始时间） |<!-- /DALTON_CAP --><!-- DALTON_CAP:guidepoint -->
+| `guidepoint` (`search_library`) | `guidepoint:{sha1}` | `expert` | `"Guidepoint · {title}, {company}"`（**不写姓名**） | `date` (`call_date`) |<!-- /DALTON_CAP --><!-- DALTON_CAP:alphaengine -->
+| `transcript` (`transcript`) | `alphaengine:{doc_id}` | 公司电话会 → `_sources` 标 `company`，知识层 `source.type` 记 `transcript`（tier 2，含 AlphaEngine ASR 稿）；卖方回访 → `broker_report` / `transcript`（tier 3） | `sources` | `publish_time` |<!-- DALTON_CAP_ELSE -->
+| 财报电话会纪要（`transcript`） | 公开纪要 URL 或归档 ID | 公司电话会 → `_sources` 标 `company`，知识层 `source.type` 记 `transcript`（tier 2）；卖方回访 → `broker_report` / `transcript`（tier 3） | 纪要发布方或公司 IR | 发布日期 |<!-- /DALTON_CAP --><!-- DALTON_CAP:researchdata_bridge -->
 | `company-wiki` (`search` / `read` / `list`) | `wiki:<id>` | 专家访谈 → `expert`；管理层纪要 → `company`（或知识层 `transcript`）；券商研报/卖方交流/Earnings Update → `broker_report`；微信文章 → `news`；内部笔记 → `internal_note`（默认 tier 5） | frontmatter `source`（无则写`"基金 wiki"`） | `date` (`document_date`) |
 | `sales-notes` (`search` / `read`) | `mail:<id>` / `digest:<id>` | 单封邮件 → `broker_report`；汇总层 `layer=digest` → `derived` (`independent=false`) | 发件人 `original_source` | `date` (`document_date`) |
 | `tmtb` (`search` / `read`) | `tmtb:<id>` | `news`（第三方通讯） | `"TMTB"` | `date` |
 | `funda-ai` (`search` / `read`) | `funda:<id>` | `derived` (`independent=false`) | `"FUNDA AI"` | `published_at` |
-| `all` (`search` 联搜：本地 4 库 + AlphaEngine + Guidepoint) | 保留各源 `document_id`，合并 `alternate_document_ids` | 按所属原始源规则映射 | 各源发布方 | 各源日期 |
-| `sec` (`researchdata` 或 `dalton_sec`) | `sec:{accession}` | `filing` | `"SEC EDGAR"` | `filing_date` (`filed`) |
+| `all` (`search` 联搜：本地 4 库 + AlphaEngine + Guidepoint) | 保留各源 `document_id`，合并 `alternate_document_ids` | 按所属原始源规则映射 | 各源发布方 | 各源日期 |<!-- /DALTON_CAP -->
+| `sec` (<!-- DALTON_CAP:researchdata_bridge -->`researchdata` 或 <!-- /DALTON_CAP -->`dalton_sec`) | `sec:{accession}` | `filing` | `"SEC EDGAR"` | `filing_date` (`filed`) |
 | `estimates` (`consensus`) | `estimates:yahoo:{ticker}:{fetched_at}` | `_sources` 标 `street_estimate`；知识层 `source.type` 记 `consensus`（tier 3） | `"Yahoo Finance via yfinance"` | `fetched_at` |
-| `fred` / `treasury` | `fred:{series}` / `treasury:{dataset}` | `official_data` | `"FRED"` / `"US Treasury"` | `observation_date` |
+| `fred` / `treasury` | `fred:{series}` / `treasury:{dataset}` | `official_data` | `"FRED"` / `"US Treasury"` | `observation_date` |<!-- DALTON_CAP:researchdata_bridge -->
 | `market-regime` (`snapshot` / `us_topbottom` / `crowding` / `cn_leverage`) | `regime:<op>:<date>` | `derived`（Dalton 市场监控数据任务产物） | `"OpenClaw"`（兼容保留的来源字段值） | 数据日期（`date` / `trade_date` / `as_of`） |
 | `cn-hk` (`filings`) | `cn-hk:{ticker}:{date}:{index}` | `filing` | `"cninfo"`（巨潮资讯；港股未覆盖时补 HKEXnews 原文链接） | 公告日期 (`date`) |
-| `cn-hk` (`ask`) | 无独立归档 ID（平台聚合表） | 二手初值线索（非 `filing`，核心财务数须回公告核实） | 底层平台（AkShare / 东财 / 同花顺 / 新浪等，见 `plan.source`） | 报告期 / 查询日（无历史 as-of 保证） |
+| `cn-hk` (`ask`) | 无独立归档 ID（平台聚合表） | 二手初值线索（非 `filing`，核心财务数须回公告核实） | 底层平台（AkShare / 东财 / 同花顺 / 新浪等，见 `plan.source`） | 报告期 / 查询日（无历史 as-of 保证） |<!-- /DALTON_CAP -->
 
 ---
 
 ## 3. 来源链去重（Source Chain Deduplication）
 
-- **同源转述只算一条**：同一份大行研报或管理层表态被邮件（`sales-notes`）、汇总（`digest`）、`TMTB`、`FUNDA AI` 或社媒多次转述时，在证据计数与支撑力度上**只算 1 条来源**，并优先引用最早或最完整的原始报告。
+- **同源转述只算一条**：同一份大行研报或管理层表态被<!-- DALTON_CAP:researchdata_bridge -->邮件（`sales-notes`）、汇总（`digest`）、`TMTB`、`FUNDA AI` 或<!-- DALTON_CAP_ELSE -->多家媒体、资讯摘要或<!-- /DALTON_CAP -->社媒多次转述时，在证据计数与支撑力度上**只算 1 条来源**，并优先引用最早或最完整的原始报告。
 - **来源身份正面写，不追加否定**：来源用“机构 + 转述 / 估计”正面标明（如“据高盛路演转述”“某卖方估计”“某客户专家称”）；已经标明来源身份后，不再追加“这不是公司一手表态 / 不是管理层原话 / 不是公司披露”。
 - **单源标注**：当某个行业数字、供应链传闻或竞争判断只有 1 家独立来源（尤其是单一券商或单一专家）时，正文必须显式标注**"单源观点"**或**"单一来源估计"**。
 - **热度不等于共识**：转发量、点赞数或多封汇总邮件重复提及同一传闻，绝不构成"市场共识"或"多源交叉验证"。
@@ -60,7 +61,7 @@
 证据分两条轨道，各自适用不同规则：
 
 - **Track A（经营事实）**：支撑 Thesis 支柱、驱动树假设与估值结论的公司经营事实与数字，适用 §1 的 6 级层级与上面的双源规则。
-- **Track B（市场预期观察）**：TMTB（科技媒体通信行业简报）、sales color（卖方销售台的盘面点评）、买方 bogey（买方预期门槛）、买方持仓描述等材料，在用来说明**"市场在想什么、在交易什么"**时，只需标注**是谁的观点（身份 / 机构）、什么时点、来源链与置信度（高 / 中 / 低）**即可使用，**不适用双源规则**；同一来源链去重后，多次转述只算一条。
+- **Track B（市场预期观察）**：<!-- DALTON_CAP:researchdata_bridge -->TMTB（科技媒体通信行业简报）、<!-- /DALTON_CAP -->sales color（卖方销售台的盘面点评）、买方 bogey（买方预期门槛）、买方持仓描述等材料，在用来说明**"市场在想什么、在交易什么"**时，只需标注**是谁的观点（身份 / 机构）、什么时点、来源链与置信度（高 / 中 / 低）**即可使用，**不适用双源规则**；同一来源链去重后，多次转述只算一条。
 - **不得跨轨**：同一条市场观察**不得**用来支撑公司的经营事实或支柱数字（份额、增速、利润率等）；经营事实回到 Track A 的层级与双源规则。
 - **买方 bogey 拿不到时**：写明原因即可（未检索到 / 渠道未覆盖），**不得因此压低 `conviction`（确信度）**；买方预期为空是合法状态（见 §5 第 4 类身份的定义）。
 - **结构化标注方式**：在 `thesis.evidence` 中可将市场预期观察标为 `source.type="market_color"`（默认 tier 5，不可单独支撑核心支柱的经营事实），同时在 `thesis.market_view`（`summary`、`observations`、`positioning`、`figures`）中按结构化字段记录市场观点、预期观察（每条 `observations` 含主张 `claim`、来源身份 `who`、日期 `as_of`、来源引用 `sources` 与置信度 `confidence`；数字指标写入 `market_view.figures`，含 `metric`、`period`、`value`、`unit`、`label`）与持仓拥挤度判断（完整字段路径与样例见 `.agents/skills/dalton-knowledge/references/structured-write-example.md`）。
@@ -88,10 +89,12 @@
 ## 7. "本轮未取得" vs "公司未披露" vs "`ok: false` 取数失败"
 
 - **严禁把检索未命中直接写成"公司未披露"**：当工具未搜到某项数据时，只能表述为**"本轮未取得"**。
-- **`ok: false` 不等于"没有数据"**：
+<!-- DALTON_CAP:researchdata_bridge -->- **`ok: false` 不等于"没有数据"**：
   - `researchdata` 返回 `ok: false` 时，`error` 会写明具体错误类别（`参数错误`、`上游不可用`、`权限或额度`、`没有匹配`），并附带 `hint` 指明下一步操作（换参数、换 `operation`、换数据源，或如实报告失败）。
   - 智能体必须先按 `hint` 处理（例如不确定参数时查 `catalog(route=...)`，或根据 `normalized_params` 核对参数后重试，或切换备用数据源）；如果按 `hint` 处理后仍无法取数，**按 `writing.md` §2 第 5 条如实披露取数失败及原因（均不贴工具报错原文）**，**严禁把 `ok: false` 当成"没有数据"继续往下写，也严禁写成"没有新信息 / 没有相关信息 / 无新增"**。
-  - **真正的"没有匹配"与出错分开**：查询执行成功但没有命中记录时，接口返回 `ok: true` 加空结果，并带上 `empty_reason`（如 `no_matching_records`、`no_matching_transcripts`）；此时可根据 `hint` 换公司名（`transcript` 仅来自 AlphaEngine，中英文公司名用 `|` 分隔）或扩大时间范围 `start`/`end` 重试。
+  - **真正的"没有匹配"与出错分开**：查询执行成功但没有命中记录时，接口返回 `ok: true` 加空结果，并带上 `empty_reason`（如 `no_matching_records`、`no_matching_transcripts`）；此时可根据 `hint` 换公司名（`transcript` 仅来自 AlphaEngine，中英文公司名用 `|` 分隔）或扩大时间范围 `start`/`end` 重试。<!-- DALTON_CAP_ELSE -->- **工具取数失败不等于"没有数据"**：
+  - 数据工具返回错误或超时时，先核对参数或改用备用公开数据源重试；如果仍无法取数，**按 `writing.md` §2 第 5 条如实披露取数失败及原因（均不贴工具报错原文）**，**严禁把调用失败当成"没有数据"继续往下写，也严禁写成"没有新信息 / 没有相关信息 / 无新增"**。
+  - **真正的"没有匹配"与出错分开**：查询执行成功但没有命中记录时，可尝试更换公司中英文名称或扩大时间范围重试。<!-- /DALTON_CAP -->
 - **三种状态不得互相改写**：检索未命中是“本轮未取得”，公司文件里没有该项是“未披露”，`ok: false` 是调用失败。缺口放在哪里、同一缺口全文只说明一次，见 `writing.md` §2 第 5 条。
 
 ---
@@ -108,31 +111,31 @@
 
 ## 9. 数字底表原则（Primary Table Rule）
 
-- **目标公司的历史财务数字只取一手法定底表**（美股 SEC 10-K/10-Q/20-F、港股 HKEX 披露易业绩公告与年报/中报、A 股巨潮资讯法定定期报告与公告附注）：研报、新闻、摘要或 `researchdata.finance(route="cn-hk", operation="ask")` 平台财务表里引用的目标公司历史财务数据只能作初筛线索与初值，入表与成稿前美股必须用 `dalton_sec` 或 `researchdata.finance(route="sec")` 核对底表，港股与 A 股必须用 `researchdata.finance(route="cn-hk", operation="filings", ticker=..., start=..., end=..., limit=...)` 调取官方公告原文/PDF（查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`）核实。
+- **目标公司的历史财务数字只取一手法定底表**（美股 SEC 10-K/10-Q/20-F、港股 HKEX 披露易业绩公告与年报/中报、A 股巨潮资讯法定定期报告与公告附注）：研报、新闻、摘要<!-- DALTON_CAP:researchdata_bridge -->或 `researchdata.finance(route="cn-hk", operation="ask")` 平台财务表<!-- /DALTON_CAP -->里引用的目标公司历史财务数据只能作初筛线索与初值，入表与成稿前美股必须用 `dalton_sec`<!-- DALTON_CAP:researchdata_bridge --> 或 `researchdata.finance(route="sec")`<!-- /DALTON_CAP --> 核对底表，港股与 A 股必须<!-- DALTON_CAP:researchdata_bridge -->用 `researchdata.finance(route="cn-hk", operation="filings", ticker=..., start=..., end=..., limit=...)` 调取官方公告原文/PDF（查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`）<!-- DALTON_CAP_ELSE -->通过 `web_search` 查披露易（`site:hkexnews.hk`）、巨潮资讯或交易所官网调取官方公告原文/PDF <!-- /DALTON_CAP -->核实。
 - **拿不到就写"本轮未取得"**：如果某个细分指标底表未披露，直接写"未披露 / 本轮未取得"，**严禁用口径相近但不同的数字顶替**（例如不得用总 GMV 顶替自营 GMV，不得用含税收入顶替不含税收入）。
 
 ---
 
 ## 10. 合规口径（全文照录）
 
-> 专家访谈、管理层交流（包括转入基金 wiki 的材料）以及 Guidepoint 的检索结果，都已经过用户的合规流程，可以使用（2026-10-15 确认，2026-10-18 owner 再次确认范围包括 Guidepoint）。这包括以公司在职员工口吻发言的专家，以及高管小范围交流。照常使用，不要自行以"重大非公开信息"为由排除。
+<!-- DALTON_CAP:guidepoint|alphaengine|researchdata_bridge -->> 专家访谈、管理层交流（包括转入基金 wiki 的材料）以及 Guidepoint 的检索结果，都已经过用户的合规流程，可以使用（2026-10-15 确认，2026-10-18 owner 再次确认范围包括 Guidepoint）。这包括以公司在职员工口吻发言的专家，以及高管小范围交流。照常使用，不要自行以"重大非公开信息"为由排除。
 >
 > 引用时写日期和专家身份（写身份，不写姓名），并注明可靠性（已证实、被反驳、互相矛盾）。专家给出的经营数字，标为"单一来源估计"，与公司披露和卖方数据分开写。
 >
 > Guidepoint 原文引用不超过 20 个词，并附 `source_attribution`；不得用于 KYC 或合规筛查。
 
-适用范围已定：wiki 里的专家访谈和管理层交流、AlphaEngine 里的专家和调研纪要、Guidepoint 检索结果，一律可用并标专家身份。
+适用范围已定：wiki 里的专家访谈和管理层交流、AlphaEngine 里的专家和调研纪要、Guidepoint 检索结果，一律可用并标专家身份。<!-- DALTON_CAP_ELSE -->> 公开渠道或用户提供的专家访谈、行业会议纪要与管理层交流材料，引用时须写明日期和受访者身份（写身份，不写姓名），并注明可靠性（已证实、被反驳、互相矛盾）。专家给出的经营数字，标为"单一来源估计"，与公司披露和卖方数据分开写。<!-- /DALTON_CAP -->
 
 ---
 
 ## 11. 原文引用上限（Verbatim Quote Limits）
 
-- **Guidepoint 专家材料**：单次直接原文引用**不超过 20 个英文词**（或等长中文），且必须附带 `source_attribution`（专家职位/公司身份 + 访谈日期，不写姓名）。
-- **其他受版权保护的研报与纪要**：直接原文引用**不超过连续 3 句话**；超出部分必须使用分析性转述并标注来源身份与日期。
+<!-- DALTON_CAP:guidepoint -->- **Guidepoint 专家材料**：单次直接原文引用**不超过 20 个英文词**（或等长中文），且必须附带 `source_attribution`（专家职位/公司身份 + 访谈日期，不写姓名）。
+<!-- /DALTON_CAP -->- **<!-- DALTON_CAP:guidepoint -->其他<!-- /DALTON_CAP -->受版权保护的研报与纪要**：直接原文引用**不超过连续 3 句话**；超出部分必须使用分析性转述并标注来源身份与日期。
 
 ---
 
-## 12. 港股与 A 股（`cn-hk`）数据口径与核验纪律
+<!-- DALTON_CAP:researchdata_bridge -->## 12. 港股与 A 股（`cn-hk`）数据口径与核验纪律
 
 针对港股（HKEX）与 A 股（上交所/深交所/北交所）标的，调用 `researchdata.finance(route="cn-hk", ...)` 时必须严格执行以下四条口径规则：
 
@@ -175,7 +178,17 @@
 2. **引用必须写平台、日期和原帖 URL**：每次引用社区帖子或员工评论，必须同时注明来源平台（`platform`）、发帖日期（`date`）与原帖链接（`url`）。
 3. **Blind 第 31 条以后的正文不能当证据**：Blind 免费接口从第 31 条评论起正文为锁死占位文本（lorem ipsum / `body_locked: true`），严禁将第 31 条以后的正文当作员工观点或证据引用；被锁定的记录（第 31 条以后）仅可用于统计评分等元数据，**不能**用于做正文词频统计（正文词频只能来自未锁定的前 30 条真实正文）。
 4. **Polymarket 只算市场定价信号**：`last30days` 返回的 Polymarket 赔率与成交量仅代表预测市场当前的概率定价信号，不算事实证据或基本面定论。
-5. **财务数字要回到公告核对**：社区帖子或评论中提及的任何营收、利润、订单、指引或估值数字，必须回到公司法定公告（SEC / 巨潮 `cn-hk` / 港交所披露易）原文核对，禁止直接引用社区帖子的财务数字。
+5. **财务数字要回到公告核对**：社区帖子或评论中提及的任何营收、利润、订单、指引或估值数字，必须回到公司法定公告（SEC / 巨潮 `cn-hk` / 港交所披露易）原文核对，禁止直接引用社区帖子的财务数字。<!-- DALTON_CAP_ELSE -->## 12. 港股与 A 股数据口径与核验纪律
+
+针对港股（HKEX）与 A 股（上交所/深交所/北交所）标的，采集公开数据与公告时必须严格执行以下三条口径规则：
+
+1. **第三方财务汇总表属二手初值，核心数字必须回法定公告核实**：
+   - 凡进入数字底表（`facts.md`）、财务镜头、财报点评或正式报告的核心财务数字（营业收入、毛利、营业利润、归母净利润、Non-IFRS/经调整利润、现金及定期存款、受限资金、理财/FVPL、有息负债、总股本、分红与实际回购金额），必须通过 `web_search` 与港交所披露易（`site:hkexnews.hk`）、巨潮资讯（cninfo）或交易所官网获取法定定期报告与业绩公告原文核实。
+2. **复权、分红、拆股与币种核对**：
+   - 核对区间涨跌幅与历史股东回报时，必须核实前/后复权状态及区间内的现金分红、送转股、拆股/合股除权。
+   - **交易币种与报表币种严格分离**：港股大量公司以港币交易（`listing_currency="HKD"`）、以人民币或美元编制财报（`financial_currency="CNY"` 或 `"USD"`）；A 股以人民币交易并编制财报（`CNY`）。计算市值、EV、每股指标与财务镜头时，必须显式传入 `--listing-currency`、`--financial-currency` 及对应汇率，**严禁把港币市值/股价与人民币报表金额按 1:1 混算或套错汇率**。
+   - **A+H 双重上市股本对齐**：对 A+H 两地上市公司，总市值与稀释总股本必须覆盖全部已发行股份（A 股 + H 股总和），与合并财务报表口径保持一致。
+3. **以法定公告发布日做历史对照**：涉及历史回测或跨期对比时需结合法定公告发布日期核实，避免引入事后重述口径。<!-- /DALTON_CAP --><!-- DALTON_CAP:alphaengine -->
 
 ---
 
@@ -199,4 +212,4 @@
    - `get_document` 实际返回 `metadata.doc_id`、`content_field`、`available_content_fields`（字段名→字符长度映射）、`warning`、`next_offset`、`complete`、`content_sha256`（**无顶层 `doc_id`，也无 `has_more`**）：当所选字段为空时返回 `warning` 与 `available_content_fields`，不得推断整篇文档为空，应改传有字符数的合法 `content_field`（如 `original_text`、`digest`、`main_point` 或 `question_answer`）；同一分页序列必须固定同一个 `content_field` 按 `next_offset` 续读，直到 `complete=true` 或 `next_offset` 为空，并核对 `content_sha256`。
 5. **发布日期、入库排序时间、资料发布方与录制归属的严格区分**：
    - `start`/`end`（`date_from`/`date_to`）按文档发布时间 **`publish_time`** 筛选；**`rank_date`** 是上游入库排序时间（仅精确到秒，**不是会议开始时间**），`sort="newest"` 必须保留上游返回顺序，严禁在本地按 `publish_time` 二次重排。
-   - **`source_names` / `sources`** 表示资料发布方（如券商或第三方研究机构名称），而 **`meeting_scope`** 与返回条目中的 **`institution_meeting_flag` / `personal_meeting_flag`** 才表示本机构或个人录制归属，严禁将资料发布方与本机构录制归属混为一谈。
+   - **`source_names` / `sources`** 表示资料发布方（如券商或第三方研究机构名称），而 **`meeting_scope`** 与返回条目中的 **`institution_meeting_flag` / `personal_meeting_flag`** 才表示本机构或个人录制归属，严禁将资料发布方与本机构录制归属混为一谈。<!-- /DALTON_CAP -->

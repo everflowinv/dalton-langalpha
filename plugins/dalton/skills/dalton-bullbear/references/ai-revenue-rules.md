@@ -14,7 +14,7 @@
    - **核对合同用途范围**：若大额合同同时涵盖传统云/软件/硬件与 AI 服务，而公司未披露合同内的 AI / 非 AI 金额拆分，必须在摘要与正文的**同一句写明“合同未拆分 AI 与非 AI 金额”**，不得将整个 TCV 暗示为纯 AI 收入贡献。
 
 2. **Filing 全文穿透核查（产品名与合作方名）**
-   - 使用 `researchdata.finance(route="sec", operation="search-text", ...)` 及 `read-item` 在最新 10-K / 10-Q / 20-F 全文中分别检索**具体 AI 产品名称**与**披露的合作方名称**，回读收入确认（Revenue Recognition）、关联交易（Related Party Transactions）、分部报告（Segment Reporting）及承诺与或有事项（Commitments and Contingencies）附注。
+   - 使用<!-- DALTON_CAP:researchdata_bridge --> `researchdata.finance(route="sec", operation="search-text", ...)` 及 `read-item`<!-- DALTON_CAP_ELSE --> `dalton_sec`（`list_filings`、`get_company_facts`）与 SEC EDGAR 公告原文检索<!-- /DALTON_CAP --> 在最新 10-K / 10-Q / 20-F 全文中分别检索**具体 AI 产品名称**与**披露的合作方名称**，回读收入确认（Revenue Recognition）、关联交易（Related Party Transactions）、分部报告（Segment Reporting）及承诺与或有事项（Commitments and Contingencies）附注。
    - 逐项核实并记录进证据底稿，再与管理层在电话会上的“多年锁定 / 强劲需求”说法对照：
      1. **不可撤销 RPO（Non-cancellable RPO）** vs 可随时缩减的意向性额度；
      2. **退出 / 终止 / 续选条款（Termination / Opt-out / Renewal Clauses）**：客户是否有权无罚金提前终止或将额度转作他用；

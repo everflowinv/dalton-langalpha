@@ -74,8 +74,40 @@ vi.mock('../api', async (importOriginal) => {
 });
 
 import { getMonitorDetail, getPublicMonitorDetail, listMonitors, mintMonitorGrant } from '../api';
+import {
+  CORE_DEFAULT_CAPABILITY_SET,
+  EVERFLOW_DEFAULT_CAPABILITY_SET,
+  type UseCapabilitiesResult,
+} from '@/hooks/useCapabilities';
 import Monitors from '../Monitors';
 import PublicMonitorPage from '../PublicMonitorPage';
+
+const capabilitiesMock = vi.hoisted(() => ({
+  enabled: true,
+}));
+
+vi.mock('@/hooks/useCapabilities', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/hooks/useCapabilities')>();
+  return {
+    ...actual,
+    useCapabilities: (): UseCapabilitiesResult => {
+      const caps = capabilitiesMock.enabled
+        ? actual.EVERFLOW_DEFAULT_CAPABILITY_SET
+        : actual.CORE_DEFAULT_CAPABILITY_SET;
+      return {
+        profile: capabilitiesMock.enabled ? 'everflow' : 'core',
+        capabilities: caps,
+        hasCapability: (req) => actual.hasRequiredCapability(caps, req),
+        brandName: capabilitiesMock.enabled ? 'Everflow' : 'Dalton',
+        fingerprint: null,
+        isLoading: false,
+        isLoaded: true,
+        isCoreBuild: !capabilitiesMock.enabled,
+        isEverflowBuild: capabilitiesMock.enabled,
+      };
+    },
+  };
+});
 
 const mockListMonitors = vi.mocked(listMonitors);
 const mockGetMonitorDetail = vi.mocked(getMonitorDetail);
@@ -154,6 +186,7 @@ function LocationProbe() {
 describe('Monitors page (Checklist 8)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    capabilitiesMock.enabled = true;
     bridgeCallbacks.onNavigate = null;
     bridgeCallbacks.lastPosted = [];
     mockClipboardWriteText = vi.fn<typeof navigator.clipboard.writeText>(async () => {});
@@ -367,5 +400,37 @@ describe('Monitors page (Checklist 8)', () => {
     expect(screen.getByTestId('bridged-frame').getAttribute('data-src')).toBe(
       '/api/v1/dalton/monitors/g/m1.secret-grant-token/v/5/hk-momentum/index.html',
     );
+  });
+
+  it('hides data_job monitors when data_jobs capability is off while keeping workspace monitors visible', async () => {
+    capabilitiesMock.enabled = false;
+    mockListMonitors.mockResolvedValue([
+      makeSummary({
+        monitor_id: 'm-ws',
+        slug: 'workspace-dashboard',
+        title: 'Workspace Coverage Dashboard',
+        category: 'portfolio',
+        source_kind: 'workspace',
+      }),
+      makeSummary({
+        monitor_id: 'm-dj',
+        slug: 'internal-data-job',
+        title: 'Internal Data Job Monitor',
+        category: 'us',
+        source_kind: 'data_job',
+      }),
+    ]);
+
+    renderWithProviders(
+      <Routes>
+        <Route path="/monitors" element={<Monitors />} />
+      </Routes>,
+      { route: '/monitors' },
+    );
+
+    expect(await screen.findByText('Workspace Coverage Dashboard')).toBeInTheDocument();
+    expect(screen.queryByText('Internal Data Job Monitor')).not.toBeInTheDocument();
+    expect(CORE_DEFAULT_CAPABILITY_SET.has('data_jobs')).toBe(false);
+    expect(EVERFLOW_DEFAULT_CAPABILITY_SET.has('data_jobs')).toBe(true);
   });
 });

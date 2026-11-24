@@ -1,4 +1,7 @@
 import { useTranslation } from 'react-i18next';
+// DALTON-HOOK(standalone-core): skip OAuth status queries in Core builds when native_oauth_sync is disabled
+import { isCoreProfileBuild } from '@/config/brand';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { useOAuthStatus } from '@/hooks/useConfiguredProviders';
 import { useAvailableModels } from '@/hooks/useProviderModels';
 import { useAllModels } from '@/hooks/useAllModels';
@@ -12,7 +15,10 @@ import { FactRow, ModelChips, StatusLabel } from './parts';
 export function SubscriptionSummary({ provider }: { provider: SubscriptionProvider }) {
   const { t } = useTranslation();
   const key = subscriptionKey(provider);
-  const status = useOAuthStatus(provider).data;
+  // DALTON-HOOK(standalone-core): do not query OAuth status in Core builds when native_oauth_sync is disabled
+  const { hasCapability } = useCapabilities();
+  const oauthEnabled = !(isCoreProfileBuild && !hasCapability('native_oauth_sync'));
+  const status = useOAuthStatus(provider, { enabled: oauthEnabled }).data;
   const connected = status?.state === 'connected';
   const list = useAvailableModels(provider, { enabled: connected });
   const { metadata } = useAllModels();

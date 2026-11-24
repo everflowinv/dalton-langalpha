@@ -11,5 +11,5 @@
 
 - `sources/legacy/openclaw/`：OpenClaw `stock-tracker` 迁入时的 `thesis.md`、跟踪配置、提示词与去重日志原样副本。
 - `sources/legacy/dalton-core/`：旧 Dalton 数据库迁入时的最新 `debate_map`、`company_dossier` 原始 JSON 记录。
-- `sources/legacy/provenance.json`：知识层各条目（如 `P1`、`D1`、`K1`）回指旧系统版本与文件哈希的机器可读出处总表。
-- `sources/wiki-index.md`：基金只读 Wiki（`vectors.db`）中与本公司直接关联及交叉提及的文档索引（正文不复制，按需经 `researchdata` 读取）。
+- `sources/legacy/provenance.json`：知识层各条目（如 `P1`、`D1`、`K1`）回指旧系统版本与文件哈希的机器可读出处总表。<!-- DALTON_CAP:researchdata_bridge -->
+- `sources/wiki-index.md`：基金只读 Wiki（`vectors.db`）中与本公司直接关联及交叉提及的文档索引（正文不复制，按需经 `researchdata` 读取）。<!-- /DALTON_CAP -->

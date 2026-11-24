@@ -81,6 +81,15 @@ load_vite_vars_from_file() {
         DALTON_AUTH_MODE)
           _ENV_DALTON_AUTH_MODE="$(strip_env_value "$raw_val")" || exit 1
           ;;
+        APP_ENV)
+          _ENV_APP_ENV="$(strip_env_value "$raw_val")" || exit 1
+          ;;
+        DALTON_PROFILE)
+          _ENV_DALTON_PROFILE="$(strip_env_value "$raw_val")" || exit 1
+          ;;
+        BRAND_NAME)
+          _ENV_BRAND_NAME="$(strip_env_value "$raw_val")" || exit 1
+          ;;
         SUPABASE_URL)
           _ENV_SUPABASE_URL="$(strip_env_value "$raw_val")" || exit 1
           ;;
@@ -100,13 +109,16 @@ load_vite_vars_from_file() {
 }
 
 _ENV_DALTON_AUTH_MODE=""
+_ENV_APP_ENV=""
+_ENV_DALTON_PROFILE=""
+_ENV_BRAND_NAME=""
 _ENV_SUPABASE_URL=""
 _ENV_SUPABASE_PUBLISHABLE_KEY=""
 
 # 1. Seed brand defaults from web/.env.dalton (if not already set in caller environment)
 load_vite_vars_from_file "$DALTON_WEB_ENV" 0
 
-# 2. Load VITE_* (and backend auth fallbacks) from repo .env; VITE_* in .env
+# 2. Load VITE_* (and backend auth/profile fallbacks) from repo .env; VITE_* in .env
 #    unconditionally overrides both web/.env.dalton and caller environment variables.
 if [[ -f "$ENV_FILE" ]]; then
   echo "[build_frontend_prod] Loading VITE_* configuration from ${ENV_FILE}"
@@ -115,8 +127,75 @@ else
   echo "[build_frontend_prod] WARN: ${ENV_FILE} not found; using current environment and web/.env.dalton defaults." >&2
 fi
 
-export VITE_BRAND_NAME="${VITE_BRAND_NAME:-Everflow}"
-export VITE_BRAND_MARK="${VITE_BRAND_MARK:-everflow}"
+trim_whitespace() {
+  local val="$1"
+  val="${val#"${val%%[![:space:]]*}"}"
+  val="${val%"${val##*[![:space:]]}"}"
+  printf '%s' "$val"
+}
+
+# Resolve ONE authoritative profile strictly from backend APP_ENV / DALTON_PROFILE.
+# Legacy VITE_DALTON_PROFILE is ignored as a source and rejected when it conflicts.
+_EFFECTIVE_DALTON_PROFILE="$(trim_whitespace "${DALTON_PROFILE:-${_ENV_DALTON_PROFILE:-}}")"
+_EFFECTIVE_APP_ENV="$(trim_whitespace "${APP_ENV:-${_ENV_APP_ENV:-}}")"
+_LOWER_DALTON_PROFILE="$(printf '%s' "$_EFFECTIVE_DALTON_PROFILE" | tr '[:upper:]' '[:lower:]')"
+_LOWER_APP_ENV="$(printf '%s' "$_EFFECTIVE_APP_ENV" | tr '[:upper:]' '[:lower:]')"
+
+if [[ -n "$_LOWER_DALTON_PROFILE" && "$_LOWER_DALTON_PROFILE" != "core" && "$_LOWER_DALTON_PROFILE" != "everflow" ]]; then
+  echo "ERROR: Invalid DALTON_PROFILE='${_EFFECTIVE_DALTON_PROFILE}' (expected 'core' or 'everflow')." >&2
+  exit 1
+fi
+
+_APP_ENV_PROFILE=""
+if [[ -n "$_LOWER_APP_ENV" ]]; then
+  if [[ "$_LOWER_APP_ENV" == "core" ]]; then
+    _APP_ENV_PROFILE="core"
+  else
+    _APP_ENV_PROFILE="everflow"
+  fi
+fi
+
+if [[ -n "$_LOWER_DALTON_PROFILE" && -n "$_APP_ENV_PROFILE" && "$_LOWER_DALTON_PROFILE" != "$_APP_ENV_PROFILE" ]]; then
+  echo "ERROR: Conflicting backend profile settings: DALTON_PROFILE='${_EFFECTIVE_DALTON_PROFILE}' vs APP_ENV='${_EFFECTIVE_APP_ENV}'." >&2
+  exit 1
+fi
+
+if [[ -n "$_LOWER_DALTON_PROFILE" ]]; then
+  _RESOLVED_PROFILE="$_LOWER_DALTON_PROFILE"
+elif [[ -n "$_APP_ENV_PROFILE" ]]; then
+  _RESOLVED_PROFILE="$_APP_ENV_PROFILE"
+else
+  _RESOLVED_PROFILE="everflow"
+fi
+
+_LEGACY_VITE_PROFILE="$(trim_whitespace "${VITE_DALTON_PROFILE:-}" | tr '[:upper:]' '[:lower:]')"
+if [[ -n "$_LEGACY_VITE_PROFILE" && "$_LEGACY_VITE_PROFILE" != "$_RESOLVED_PROFILE" ]]; then
+  echo "ERROR: Legacy VITE_DALTON_PROFILE='${VITE_DALTON_PROFILE}' conflicts with backend profile '${_RESOLVED_PROFILE}' (from APP_ENV/DALTON_PROFILE). Remove VITE_DALTON_PROFILE or align APP_ENV/DALTON_PROFILE." >&2
+  exit 1
+fi
+
+export DALTON_PROFILE="${_RESOLVED_PROFILE}"
+export VITE_DALTON_PROFILE="${_RESOLVED_PROFILE}"
+
+if [[ "$_RESOLVED_PROFILE" == "core" ]]; then
+  _RESOLVED_BRAND="${BRAND_NAME:-${_ENV_BRAND_NAME:-}}"
+  if [[ -z "$_RESOLVED_BRAND" ]]; then
+    if [[ -n "${VITE_BRAND_NAME:-}" && "${VITE_BRAND_NAME}" != "Everflow" ]]; then
+      _RESOLVED_BRAND="${VITE_BRAND_NAME}"
+    else
+      _RESOLVED_BRAND="Dalton"
+    fi
+  fi
+  export BRAND_NAME="${_RESOLVED_BRAND}"
+  export VITE_BRAND_NAME="${_RESOLVED_BRAND}"
+  if [[ -z "${VITE_BRAND_MARK:-}" || "${VITE_BRAND_MARK}" == "everflow" ]]; then
+    export VITE_BRAND_MARK="dalton"
+  fi
+else
+  export VITE_BRAND_NAME="${VITE_BRAND_NAME:-${BRAND_NAME:-${_ENV_BRAND_NAME:-Everflow}}}"
+  export BRAND_NAME="${BRAND_NAME:-${_ENV_BRAND_NAME:-${VITE_BRAND_NAME}}}"
+  export VITE_BRAND_MARK="${VITE_BRAND_MARK:-everflow}"
+fi
 export VITE_DALTON_AUTH="${VITE_DALTON_AUTH:-${_ENV_DALTON_AUTH_MODE}}"
 export VITE_SUPABASE_URL="${VITE_SUPABASE_URL:-${_ENV_SUPABASE_URL}}"
 export VITE_SUPABASE_PUBLISHABLE_KEY="${VITE_SUPABASE_PUBLISHABLE_KEY:-${_ENV_SUPABASE_PUBLISHABLE_KEY}}"
@@ -144,6 +223,8 @@ if [[ -n "$VITE_SUPABASE_PUBLISHABLE_KEY" ]]; then
 fi
 
 echo "[build_frontend_prod] Build settings:"
+echo "  DALTON_PROFILE=${DALTON_PROFILE}"
+echo "  VITE_DALTON_PROFILE=${VITE_DALTON_PROFILE}"
 echo "  VITE_BRAND_NAME=${VITE_BRAND_NAME}"
 echo "  VITE_BRAND_MARK=${VITE_BRAND_MARK}"
 echo "  VITE_DALTON_AUTH=${VITE_DALTON_AUTH:-<empty>}"
@@ -171,11 +252,12 @@ fi
 echo "[build_frontend_prod] OK: Production bundle written to ${DIST_DIR}"
 echo "[build_frontend_prod] version.json: $(tr -d '\n' < "${DIST_DIR}/version.json")"
 
-# 6. Build Everflow static docs site (docs-site/) and copy output to web/dist/help/
+# 6. Build static docs site (docs-site/) with matching profile and copy output to web/dist/help/
 DOCS_DIR="${REPO_ROOT}/docs-site"
 HELP_DIST_DIR="${DIST_DIR}/help"
-echo "[build_frontend_prod] Building documentation site in ${DOCS_DIR}"
+echo "[build_frontend_prod] Building documentation site in ${DOCS_DIR} (DALTON_PROFILE=${DALTON_PROFILE})"
 cd "$DOCS_DIR"
+rm -rf "${DOCS_DIR}/.astro" "${DOCS_DIR}/dist"
 pnpm install --frozen-lockfile
 pnpm build
 if [[ ! -s "${DOCS_DIR}/dist/index.html" ]]; then

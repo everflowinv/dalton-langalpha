@@ -14,10 +14,11 @@ from typing import Any
 from ptc_agent.agent.subagents.merge import BaseSubagent, plugin_definition
 
 
-def _base(plugin: str, row: Mapping[str, Any]) -> BaseSubagent:
+# DALTON-HOOK(standalone-core): mark bundled plugin subagents explicitly so user-installed plugins bypass Dalton content assembly.
+def _base(plugin: str, row: Mapping[str, Any], *, bundled: bool = False) -> BaseSubagent:
     from src.server.database.plugin_subagents import plugin_key
 
-    return BaseSubagent(plugin_key(plugin, row["name"]), plugin_definition(row))
+    return BaseSubagent(plugin_key(plugin, row["name"]), plugin_definition(row, bundled=bundled))
 
 
 async def plugin_bases(user_id: str, *, conn=None) -> list[tuple[BaseSubagent, bool]]:
@@ -36,6 +37,6 @@ async def plugin_bases(user_id: str, *, conn=None) -> list[tuple[BaseSubagent, b
         off = (await list_account_disables(user_id, conn=conn)).bundles
     rows = await list_user_plugin_subagents(user_id, conn=conn)
     return [
-        *((_base(bundle, plan.row), bundle not in off) for bundle, plan in bundled),
-        *((_base(row["plugin_name"], row), bool(row["plugin_enabled"])) for row in rows),
+        *((_base(bundle, plan.row, bundled=True), bundle not in off) for bundle, plan in bundled),
+        *((_base(row["plugin_name"], row, bundled=False), bool(row["plugin_enabled"])) for row in rows),
     ]

@@ -26,7 +26,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - **首次覆盖时执行叙事收敛（全列 → 删减 → 下挖底层驱动）**：初次覆盖一家公司、知识层尚无 `debate`（分歧档案）时，先把市场上流传的叙事**全部列出**（不加筛选，含互相矛盾的说法）；再**删减到 2–3 个可研究、真正决定价值的驱动变量（driver）**，逐条写明删除理由；每个驱动变量再**往下挖一层底层驱动**，写明观察指标与数据来源。收敛结果作为本轮"主要分歧"段的输入，并写入知识层 `debate` 与 `drivers`（驱动变量档案）初稿；后续季度重估只做增量更新，不再重跑全量收敛。
 
 2. **一致预期与隐含费用空间**
-   - 在 PTC（`execute_code`）中先调一次 `researchdata.catalog()`，再调 `researchdata.finance(route="estimates", ticker=T)`，获取本财年（`0y`）与下一财年（`+1y`）EPS、收入一致预期、7/30/90 天 EPS 修正轨迹、近 30 天上调/下调次数，以及近 4 次财报次日涨跌。
+   - <!-- DALTON_CAP:researchdata_bridge -->在 PTC（`execute_code`）中先调一次 `researchdata.catalog()`，再调 `researchdata.finance(route="estimates", ticker=T)`<!-- DALTON_CAP_ELSE -->通过公开市场数据工具（行情与一致预期接口或 `web_search`）<!-- /DALTON_CAP -->，获取本财年（`0y`）与下一财年（`+1y`）EPS、收入一致预期、7/30/90 天 EPS 修正轨迹、近 30 天上调/下调次数，以及近 4 次财报次日涨跌。
    - 每次取数将原始 JSON（附 `_meta{route, fetched_at, source}`）存盘到 `data/consensus/<YYYY-MM-DD_HHMM>.json`。
    - 运行隐含费用测算脚本（或调用同名函数）：
      ```bash
@@ -34,20 +34,25 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      ```
      若最近财年存在一次性税项，传入 `--tax <公司指引有效税率>`，得出一致预期隐含税前利润、隐含总费用空间（`implied_total_expenses_bn`）、每 100 亿美元费用的 EPS 敏感度（`eps_per_10bn_expense`）及每 1% 收入的 EPS 敏感度（`eps_per_1pct_revenue`）。
 
-3. **内部研究库四路由检索**
+<!-- DALTON_CAP:researchdata_bridge -->3. **内部研究库四路由检索**
    - 对 `sales-notes`、`tmtb`、`funda-ai`、`company-wiki` 四个路由，分别用以下三组关键词各查一次（时间窗默认最近 92 天）：
      1. 公司名 / 股票代码
      2. 核心产品或核心业务名
      3. `"capex"` / `"费用"` / `"指引"` / `"预测"`
-   - **Sales color 专项规则**：按公司名和代码分别搜，邮件按 `message_id`、研报按 `doc_id` 去重后用 `read` 读正文（多票日报按 `next_offset` 翻页摘出本公司段落）。按正文里的 sales/trading 身份声明归类，不按数据库分类（如 `Sector Specialist Commentary`、`TECH SKETCH` 可能归在 `foreign_report` 下）。
+   - **Sales color 专项规则**：按公司名和代码分别搜，邮件按 `message_id`、研报按 `doc_id` 去重后用 `read` 读正文（多票日报按 `next_offset` 翻页摘出本公司段落）。按正文里的 sales/trading 身份声明归类，不按数据库分类（如 `Sector Specialist Commentary`、`TECH SKETCH` 可能归在 `foreign_report` 下）。<!-- DALTON_CAP_ELSE -->3. **工作区资料与公开研究检索**
+   - 检索工作区既有研究文档，并用 `web_search` 按以下三组关键词分别检索公开研究、行业评论与市场报道（时间窗默认最近 92 天）：
+     1. 公司名 / 股票代码
+     2. 核心产品或核心业务名
+     3. `"capex"` / `"费用"` / `"指引"` / `"预测"`<!-- /DALTON_CAP -->
 
-4. **AlphaEngine 卖方研报与机构会议检索**
+<!-- DALTON_CAP:alphaengine -->4. **AlphaEngine 卖方研报与机构会议检索**
    - 中英文 query 各搜一次（`researchdata.research(route="alphaengine", operation="search_library", query=..., start=..., end=..., params={"sort": "relevance"})`；若按文档类别过滤，可直接传 `params={"document_categories": [...], "sort": "relevance"}`，或显式调 `researchdata.research(route="alphaengine", operation="list_filters", params={"filter_type": "document_types", "document_code": "summary"})` 获取细粒度 `type_ids`——注意无参 `list_filters()` 只返回友好 `categories`，不会返回 `type_ids`；时间窗默认近 92 天）。
-   - 挑 3–6 篇高相关报告调 `operation="get_document"` 读正文，优先外资行（MS、GS、UBS、JPM、Citi、BofA、Jefferies、Bernstein 等）的财报前瞻与预测调整报告。
+   - 挑 3–6 篇高相关报告调 `operation="get_document"` 读正文，优先外资行（MS、GS、UBS、JPM、Citi、BofA、Jefferies、Bernstein 等）的财报前瞻与预测调整报告。<!-- DALTON_CAP_ELSE -->4. **公开卖方观点与机构会议检索**
+   - 使用 `web_search` 与公开财报电话会纪要、投资者日材料及行业评论，中英文 query 各搜一次（时间窗默认近 92 天），重点整理主流机构对财报前瞻与盈利预测调整的核心观点。<!-- /DALTON_CAP -->
    - 若涉及 AI 收入占比、大单 TCV/RPO 或 AI 降本提效，遵循 `references/ai-revenue-rules.md` 核对口径。
 
 5. **一手指引与公告核对**
-   - 美股用 `dalton_sec.list_filings` 与 `researchdata.finance(route="sec")` 核对最新 8-K / 10-Q / 10-K 的业绩指引原文与电话会纪要，记录 accession 与期间；港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)`（查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`）核对最新定期报告与业绩公告原文（`operation="ask"` 平台财务表仅作二手初值，核心财务数字回公告核实，回报核对复权、分红、拆股与币种）。分析师提问中提及但管理层未确认的数字，标为“分析师提问口径，管理层未确认”。
+   - <!-- DALTON_CAP:researchdata_bridge -->美股用 `dalton_sec.list_filings` 与 `researchdata.finance(route="sec")` 核对最新 8-K / 10-Q / 10-K 的业绩指引原文与电话会纪要，记录 accession 与期间；港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)`（查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`）核对最新定期报告与业绩公告原文（`operation="ask"` 平台财务表仅作二手初值，核心财务数字回公告核实，回报核对复权、分红、拆股与币种）<!-- DALTON_CAP_ELSE -->美股用 `dalton_sec.list_filings` 与 SEC EDGAR 原文核对最新 8-K / 10-Q / 10-K 的业绩指引原文与电话会纪要，记录 accession 与期间；港股与 A 股通过 `web_search` 查披露易（`site:hkexnews.hk`）、巨潮资讯或交易所官网核对最新定期报告与业绩公告原文（核心财务数字回公告核实，回报核对复权、分红、拆股与币种）<!-- /DALTON_CAP -->。分析师提问中提及但管理层未确认的数字，标为“分析师提问口径，管理层未确认”。
 
 6. **按固定七段结构在对话中回复**（除非 PM 要求写文件，否则直接在对话中输出；收尾同步将赔率卡写入 `thesis.underwriting`、方向与行动分类写入 `thesis.house_view`、市场观点写入 `thesis.market_view`——先 `knowledge_update(doc="thesis", dry_run=True)` 看赔率计算摘要，再正式写入，正文赔率卡数字与 `thesis` 保持一致，不另算一套，见 `dalton-conventions/SKILL.md` §1）：
 
@@ -58,7 +63,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 **赔率卡**：三情景（bear 悲观 / base 基准 / bull 乐观）EPS × 倍数 = 价格带（单个价带宽度 `(hi−lo)/mid`〔（上沿−下沿）÷中点〕≤ 25%，三档中点严格递增，主判定取价带中点）＋ 所需胜率与裁决——按 `.agents/skills/dalton-conventions/references/risk-reward.md` §2 第 4 条计算（base 测试权重固定 25% / 50% 两行，注明"测试权重，不是预测"；多头算所需 bull 概率、空头算所需 bear 概率），裁决用中文四选一（显著高于门槛 / 在门槛附近 / 低于门槛 / 无法判断；英文枚举只写进 `thesis.underwriting.breakeven_verdict`），并写明方向、所用权重行与所依据分歧的具体内容（不写 `D1` 等编号或 `u_req(b)`/`d_req(b)` 符号）；不编造概率点值
 **三层保护与失效条件**：生存（资金链 / 融资需求）｜价值（机制与区间）｜路径（跌到价值区之间会发生什么），各一句，并写明保护在什么条件下失效；遵守 `risk-reward.md` §6 的硬规则——不输出单一"底价"、回购授权不算托底（只认实际股本缩减）、EPS × 倍数后不得再加全部净现金、SBC（股票期权报酬）只算一次、历史低谷倍数只作价值层输入并写明为何仍适用、融资需求可写"未知"但写未知不得宣称生存保护充分
 **非线性四问**（检查表见 `.agents/skills/dalton-conventions/references/nonlinear.md`）：倍数 regime（市场给这类资产的定价规则）变了吗｜driver（驱动变量）有没有非线性或凸性（斜率随变量增大而加大，或阈值 / 期权性质）机会｜拥挤持仓 + 催化剂怎么组合｜有没有反身性（股价反过来改变公司行为）——无信号时一行写明"本轮没有可承保的非线性机会"
-**投委会四问（含改判条件）、默认前提自检与来源**：投委会四问（每问 1–2 句）——① 什么在改变客户行为和公司的经济性？② 为什么这个解释比竞争解释更可信？③ 市场在哪个环节判断错了？④ 看到什么我会认错（改判条件：看到什么可观测证据或数字会升级 / 加仓或回补，看到什么会降级 / 减仓或加空，各至少一条）；默认前提自检——结论是否仅靠"默认会复苏 / 默认管理层会兑现 / 默认政策会好转 / 默认利润率会回到历史水平 / 默认新业务会成功"支撑，若是则降为低确信或补齐证据；来源——按信源类别（内部研究库 / 卖方研报与点评 / 专家访谈纪要 / 一手披露与一致预期）交代实际用了哪些材料（不写命中数或内部路由名）；未取得的数据按共用规则全文只说一次（会改变结论、确信度或行动的缺口在相关判断首次出现处用一句话写清影响，本节末尾不再重复；其余未取得的数据及原因只在本节末尾写一次，不贴工具报错原文）
+**投委会四问（含改判条件）、默认前提自检与来源**：投委会四问（每问 1–2 句）——① 什么在改变客户行为和公司的经济性？② 为什么这个解释比竞争解释更可信？③ 市场在哪个环节判断错了？④ 看到什么我会认错（改判条件：看到什么可观测证据或数字会升级 / 加仓或回补，看到什么会降级 / 减仓或加空，各至少一条）；默认前提自检——结论是否仅靠"默认会复苏 / 默认管理层会兑现 / 默认政策会好转 / 默认利润率会回到历史水平 / 默认新业务会成功"支撑，若是则降为低确信或补齐证据；来源——按信源类别（<!-- DALTON_CAP:researchdata_bridge -->内部研究库 / <!-- /DALTON_CAP -->卖方研报与点评 / <!-- DALTON_CAP:guidepoint -->专家访谈纪要 / <!-- /DALTON_CAP -->一手披露与一致预期）交代实际用了哪些材料（不写命中数或内部路由名）；未取得的数据按共用规则全文只说一次（会改变结论、确信度或行动的缺口在相关判断首次出现处用一句话写清影响，本节末尾不再重复；其余未取得的数据及原因只在本节末尾写一次，不贴工具报错原文）
 ```
 
 7. **收尾：写知识层并询问是否转成稿**

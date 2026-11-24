@@ -14,7 +14,7 @@ lastUpdated: 2026-11-22
    - 提前在工作区跑 `/dalton-earnings-calendar`，看清近期的财报窗口。
    - 如果工作区里记了财报期待验证事项，到期时间要写成标准日期（`YYYY-MM-DD`）。系统会按**这只股票所属交易所当地时间 18:00** 判到期，并在巡检时汇总。
 2. **生成财报前瞻**：
-   - 运行 `/dalton-earnings-preview`，或者直接跟分析师说：*“帮我做一份本季度财报前瞻，重点对比市场一致预期和最近两周销售纪要里的市场预期差（whisper）。”*
+   - 运行 `/dalton-earnings-preview`，或者直接跟分析师说：*“帮我做一份本季度财报前瞻，重点对比市场一致预期{/* DALTON_DOC:everflow */}和最近两周销售纪要里的市场预期差（whisper）{/* DALTON_DOC_ELSE */}以及近期业绩指引与市场预期差（whisper）{/* /DALTON_DOC */}。”*
    - 分析师会列出核心财务指标一致预期表、本季要盯的 3–5 个关键业务指标、指引敏感性，以及不同业绩落点下的情景推演。
 
 ## 财报发布后：速评与深度复盘
@@ -41,5 +41,5 @@ lastUpdated: 2026-11-22
 
 ## 相关页面
 
-- 看业绩会转写和跳过缓存的详细说明：[研究数据源](/help/everflow/research-data-sources/)
+- {/* DALTON_DOC:everflow */}看业绩会转写和跳过缓存的详细说明：[研究数据源](/help/everflow/research-data-sources/){/* DALTON_DOC_ELSE */}看财报技能与内置插件如何配合：[技能与插件](/help/concepts/skills-and-plugins/){/* /DALTON_DOC */}
 - 看议程到期时间怎么算：[定时任务、唤醒与后台命令](/help/concepts/automations-wakeups-commands/)

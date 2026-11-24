@@ -20,8 +20,11 @@ Routing:
 {# DALTON-HOOK(data-map) #}
 {# DALTON-HOOK(market-regime) #}
 {# DALTON-HOOK(team-memory-toggle) #}
+{# DALTON-HOOK(standalone-core): gate researchdata service and market-regime guidance on researchdata_bridge capability #}
+{% if researchdata_bridge_enabled | default(false) %}
 - 研究服务（{% if tool_summary and not thread_id %}`MCP Tools (via Python)`{% else %}`<mcp-servers>`{% endif %}，经一次简短 `ExecuteCode`）提供卖方、专家、管理层原话和内部笔记，是解释“发生了什么、为什么”时的主要证据，与网页搜索互补。
-- {# DALTON-HOOK(prompt-compaction) #}下结论前核查会改变结论的直接相关来源；若本轮有 `<data_map>`，说“证据不足/无法确定”前先用它查找可能改变结论的遗漏来源。{% if conversation_search_enabled %}团队记忆可用时（以本轮运行时说明为准），回答公司或主题问题前先用 `conversation_search` 核查团队既有观点、假设和决定，并说明观点变化。{% endif %}若可用服务包含 `researchdata`，大盘、仓位和超买超卖问题先查 `macro(route="market-regime", operation="snapshot")`。篇幅简短只限制回复长度，不减少应查的来源。
+{% endif %}
+- {# DALTON-HOOK(prompt-compaction) #}下结论前核查会改变结论的直接相关来源；若本轮有 `<data_map>`，说“证据不足/无法确定”前先用它查找可能改变结论的遗漏来源。{% if conversation_search_enabled %}团队记忆可用时（以本轮运行时说明为准），回答公司或主题问题前先用 `conversation_search` 核查团队既有观点、假设和决定，并说明观点变化。{% endif %}{% if researchdata_bridge_enabled | default(false) %}若可用服务包含 `researchdata`，大盘、仓位和超买超卖问题先查 `macro(route="market-regime", operation="snapshot")`。{% endif %}篇幅简短只限制回复长度，不减少应查的来源。
 - Need to compute, compare, model, or chart → MCP (via Python)
 - File, search, shell{% if web_enabled %}, or web{% endif %} operations → Core
 {% if crawl_enabled %}

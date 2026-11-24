@@ -1,4 +1,4 @@
-# Company Wiki 入库流程（`ingest_company_wiki`）
+<!-- DALTON_CAP:researchdata_bridge --># Company Wiki 入库流程（`ingest_company_wiki`）
 
 `company-wiki` 默认只读。只有当用户明确要求入库（如“入库”、“存一下”、“加到 wiki”）时，才在 Chief of Staff（Home）或公司工作区（Analyst）中按本规范调用 `ingest_company_wiki`。
 
@@ -111,4 +111,6 @@
 `confirm=True` 返回 `doc_id`（即 `wiki:<doc_id>`）与 `filepath` 后，必须执行入库后核验：
 
 1. **回读核对**：在 `execute_code` 中调用 `researchdata.research(route="company-wiki", operation="read", document="wiki:<doc_id>")`，核对入库文档标题、日期、来源及正文内容完整无误。
-2. **检查自动标签**：检查入库返回及回读结果中的自动标签（`tags`、`related_companies`、`related_sectors`），并向用户汇报入库路径、`wiki:<doc_id>` 与自动生成的标签。
+2. **检查自动标签**：检查入库返回及回读结果中的自动标签（`tags`、`related_companies`、`related_sectors`），并向用户汇报入库路径、`wiki:<doc_id>` 与自动生成的标签。<!-- DALTON_CAP_ELSE --># 研究笔记与知识归档流程
+
+日常研究发现、访谈纪要、论点演进与正式报告统一通过公司工作区知识层（`knowledge_update`、`knowledge_append_verdict`）与工作区 `published/` 目录归档管理。<!-- /DALTON_CAP -->

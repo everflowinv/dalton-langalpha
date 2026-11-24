@@ -6,12 +6,14 @@ and turns a save of its file into a create, update or delete.
 
 from __future__ import annotations
 
+from typing import Any  # DALTON-HOOK(standalone-core)
+
 from ptc_agent.agent.backends.db_json_folder import DbJsonFolderRoute
 from ptc_agent.agent.backends.db_json_route import README_FILE
 from ptc_agent.core.paths import SandboxLayout
 from src.server.services.automations import file
 
-__all__ = ["README_FILE", "AutomationsBackend"]
+__all__ = ["README_FILE", "AutomationsBackend", "render_automations_readme"]  # DALTON-HOOK(standalone-core)
 
 # DALTON-HOOK(automation-effort): parenthesize README fragments so hook comments never truncate _README_CONTENT
 _README_CONTENT = (
@@ -203,6 +205,149 @@ you save a price alert.
 )  # DALTON-HOOK(automation-effort): end of parenthesized _README_CONTENT
 
 
+# DALTON-HOOK(standalone-core): render automation README sections conditionally by capabilities
+def _format_channel_list(labels: list[str]) -> str:
+    if len(labels) >= 3:
+        return ", ".join(labels[:-1]) + f", or {labels[-1]}"
+    if len(labels) == 2:
+        return f"{labels[0]} or {labels[1]}"
+    return labels[0] if labels else ""
+
+
+def render_automations_readme(*, capabilities: frozenset[Any] | None = None) -> str:
+    """Render `.agents/user/automations/README.md` according to active capabilities."""
+    from src.dalton.capabilities import CapabilityId, effective_capabilities
+
+    active = effective_capabilities() if capabilities is None else capabilities
+    data_jobs_on = CapabilityId.DATA_JOBS in active
+    bridge_on = CapabilityId.RESEARCHDATA_BRIDGE in active
+    native_oauth_on = CapabilityId.NATIVE_OAUTH_SYNC in active
+    gateway_on = CapabilityId.CHANNEL_GATEWAY in active
+    feishu_on = gateway_on and (CapabilityId.CHANNEL_FEISHU in active)
+    discord_on = gateway_on and (CapabilityId.CHANNEL_DISCORD in active)
+    weixin_on = gateway_on and (CapabilityId.CHANNEL_WEIXIN in active)
+
+    if (
+        data_jobs_on
+        and bridge_on
+        and native_oauth_on
+        and feishu_on
+        and discord_on
+        and weixin_on
+    ):
+        return _README_CONTENT
+
+    text = _README_CONTENT
+
+    channel_entries = [
+        (feishu_on, "Feishu", "feishu"),
+        (discord_on, "Discord", "discord"),
+        (weixin_on, "personal WeChat", "weixin"),
+    ]
+    enabled_labels = [label for on, label, _ in channel_entries if on]
+    enabled_ids = [cid for on, _, cid in channel_entries if on]
+
+    # 1. Confirm-first delivery bullet
+    orig_delivery_bullet = (
+        "- delivery: in-app only, or also a connected chat app (Feishu, Discord, or\n"
+        "  personal WeChat), or one chat there.\n"
+    )
+    if enabled_labels:
+        new_delivery_bullet = (
+            f"- delivery: in-app only, or also a connected chat app "
+            f"({_format_channel_list(enabled_labels)}), or one chat there.\n"
+        )
+    else:
+        new_delivery_bullet = ""
+    text = text.replace(orig_delivery_bullet, new_delivery_bullet, 1)
+
+    # 2. Managed-task split paragraph
+    orig_managed_para = (
+        "Personal automations are managed through these files. Automations managed by a\n"
+        "coverage unit refuse direct file create, update, delete, or rename: use\n"
+        "`dalton_schedule_automation` for earnings schedules, `dalton_coverage_tracking`\n"
+        "for standard coverage tracking, and `dalton_system_jobs` for company public data\n"
+        "jobs (ops jobs are read-only)."
+    )
+    if data_jobs_on and bridge_on:
+        new_managed_para = orig_managed_para
+    elif data_jobs_on:
+        new_managed_para = (
+            "Personal automations are managed through these files. Automations managed by a\n"
+            "coverage unit refuse direct file create, update, delete, or rename: use\n"
+            "`dalton_schedule_automation` for earnings schedules, `dalton_coverage_tracking`\n"
+            "for standard coverage tracking, and `dalton_system_jobs` for company public data\n"
+            "jobs."
+        )
+    elif bridge_on:
+        new_managed_para = (
+            "Personal automations are managed through these files. Automations managed by a\n"
+            "coverage unit refuse direct file create, update, delete, or rename: use\n"
+            "`dalton_schedule_automation` for earnings schedules and `dalton_coverage_tracking`\n"
+            "for standard coverage tracking (ops jobs are read-only)."
+        )
+    else:
+        new_managed_para = (
+            "Personal automations are managed through these files. Automations managed by a\n"
+            "coverage unit refuse direct file create, update, delete, or rename: use\n"
+            "`dalton_schedule_automation` for earnings schedules and `dalton_coverage_tracking`\n"
+            "for standard coverage tracking."
+        )
+    text = text.replace(orig_managed_para, new_managed_para, 1)
+
+    # 3. Example JSON delivery line
+    orig_example_delivery = '  "delivery": ["discord:@me"],\n'
+    if discord_on:
+        new_example_delivery = orig_example_delivery
+    elif enabled_ids:
+        new_example_delivery = f'  "delivery": ["{enabled_ids[0]}:@me"],\n'
+    else:
+        new_example_delivery = '  "delivery": [],\n'
+    text = text.replace(orig_example_delivery, new_example_delivery, 1)
+
+    # 4. reasoning_effort Antigravity note
+    if not native_oauth_on:
+        text = text.replace(
+            " Built-in Antigravity models encode effort in the suffixed `llm_model` ID and keep `reasoning_effort` as `null`.",
+            "",
+            1,
+        )
+
+    # 5. delivery table row
+    orig_delivery_row = (
+        "| delivery       | no  | Where results also go besides the app: a connected chat app in Dalton (Feishu, Discord, or personal WeChat), "
+        'e.g. `["discord:@me"]` or `["feishu"]`, or a group address from `.agents/user/channels/available.json`, which lists every chat on each connected app; `[]` for none. '
+        "Personal WeChat supports direct messages only (`weixin:@me`). "
+        "A chat is checked when you save, and so is an app, which is refused while the user hasn't linked it. "
+        "An app alone posts to the chat set for the automations of the workspace it runs in (Home has none), else the app's preferred chat, else the user's direct messages; "
+        'to always post to direct messages, name them, e.g. `["discord:@me"]`, `["feishu:@me"]`, or `["weixin:@me"]`. '
+        "Leave sending out of `instruction`: each run sends its result there itself, a chat it missed gets the final answer, and a failed or stopped run posts a short notice. |\n"
+    )
+    if enabled_ids:
+        dm_examples = _format_channel_list([f'`["{cid}:@me"]`' for cid in enabled_ids])
+        first_example = f'`["{enabled_ids[0]}:@me"]`'
+        weixin_clause = (
+            " Personal WeChat supports direct messages only (`weixin:@me`)."
+            if weixin_on
+            else ""
+        )
+        new_delivery_row = (
+            f"| delivery       | no  | Where results also go besides the app: a connected chat app "
+            f"({_format_channel_list(enabled_labels)}), e.g. {first_example}, or a group address from "
+            f"`.agents/user/channels/available.json`, which lists every chat on each connected app; `[]` for none."
+            f"{weixin_clause} "
+            "A chat is checked when you save, and so is an app, which is refused while the user hasn't linked it. "
+            "An app alone posts to the chat set for the automations of the workspace it runs in (Home has none), else the app's preferred chat, else the user's direct messages; "
+            f"to always post to direct messages, name them, e.g. {dm_examples}. "
+            "Leave sending out of `instruction`: each run sends its result there itself, a chat it missed gets the final answer, and a failed or stopped run posts a short notice. |\n"
+        )
+    else:
+        new_delivery_row = ""
+    text = text.replace(orig_delivery_row, new_delivery_row, 1)
+
+    return text
+
+
 class AutomationsBackend(DbJsonFolderRoute):
     """Filesystem surface backed by the `automations` table."""
 
@@ -210,6 +355,10 @@ class AutomationsBackend(DbJsonFolderRoute):
     readme_content = _README_CONTENT
     name_rule = file.NAME_RULE
     entry = "an automation"
+
+    # DALTON-HOOK(standalone-core): dynamically render README per active capabilities
+    async def _readme(self) -> str:
+        return render_automations_readme()
 
     source = "automations_backend"
     read_failure = "Failed to read automations data"

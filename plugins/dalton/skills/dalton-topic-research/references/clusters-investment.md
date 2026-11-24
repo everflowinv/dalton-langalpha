@@ -8,12 +8,12 @@
 
 ### C1：财务数据 + 估值（Financials & Valuation）
 - **核心问题**：行业/赛道规模（TAM/SAM）的实际增速、毛利率与营业利润率结构、单位经济模型（Unit Economics）、ROIC 与资本开支强度、可比公司估值倍数（P/E、EV/EBITDA、EV/Sales）与历史分位。
-- **优先信源**：SEC 10-K/10-Q/20-F 分部披露、`researchdata` `finance`（财务比率与可比公司表）、一致预期修正历史。
+- **优先信源**：SEC 10-K/10-Q/20-F 分部披露、<!-- DALTON_CAP:researchdata_bridge -->`researchdata` `finance`（财务比率与可比公司表）<!-- DALTON_CAP_ELSE -->`dalton_sec` / `fundamentals` / `yf_fundamentals`（财务比率与可比公司表）<!-- /DALTON_CAP -->、一致预期修正历史。
 - **必核指标**：收入口径差异（总额法 vs 净额法、GAAP vs Non-GAAP）、CapEx / Revenue、FCF 转化率、可比公司 2 年远期估值溢价/折价原因。
 
 ### C2：竞争格局 + 行业趋势（Competitive Landscape & Industry Trends）
 - **核心问题**：存量份额与增量份额（Incremental Share）归属、技术路线演进、客户切换成本、上下游议价权（供应商集中度与客户集中度）、新进入者壁垒与价格战风险。
-- **优先信源**：竞争对手 10-K/法说会纪要、第三方行业统计（IDC/Gartner/Mercury/SemiAnalysis 等）、`researchdata.research(route="tmtb")`、`researchdata.research(route="funda-ai")`、`researchdata.research(route="guidepoint")` 产业链上下游访谈。
+- **优先信源**：竞争对手 10-K/法说会纪要、第三方行业统计（IDC/Gartner/Mercury/SemiAnalysis 等）<!-- DALTON_CAP:researchdata_bridge -->、`researchdata.research(route="tmtb")`、`researchdata.research(route="funda-ai")`、`researchdata.research(route="guidepoint")` 产业链上下游访谈<!-- DALTON_CAP_ELSE -->、公开产业链深度报道与上下游公开访谈（`web_search` / `web_fetch`）<!-- /DALTON_CAP -->。
 - **必核指标**：CR3/CR5 市场份额变化（带具体季度）、ASP 趋势、大客户二供/自研进展、交期（Lead Time）与库存水位。
 
 ### C3：催化剂 + 风险（Catalysts & Risks）
@@ -28,7 +28,7 @@
 
 ### C5：牛熊观点 + 卖方研究（Bull/Bear Views & Sell-Side Research）
 - **核心问题**：当前买方与卖方的主流叙事是什么？多头最依赖的 2–3 个核心假设是什么？空头最犀利的证伪点是什么？市场分歧集中在哪个具体的经营驱动变量（Driver）上？
-- **优先信源**：`researchdata.research(route="alphaengine")`（近 6 个月大行深度报告与评级变更）、`researchdata.research(route="sales-notes")`（买方路演反馈）、`researchdata.community` 专业投资者深度讨论。
+- **优先信源**：<!-- DALTON_CAP:researchdata_bridge -->`researchdata.research(route="alphaengine")`（近 6 个月大行深度报告与评级变更）、`researchdata.research(route="sales-notes")`（买方路演反馈）、`researchdata.community` 专业投资者深度讨论<!-- DALTON_CAP_ELSE -->近 6 个月公开卖方评级与目标价报道（`web_search` / `web_fetch`）、一致预期修正数据（`yf_analysis`）及专业投资者公开讨论（`x_search`）<!-- /DALTON_CAP -->。
 - **必核指标**：卖方目标价区间与隐含倍数、多空双方对核心 Driver（如次年出货量/毛利率）的具体数字分歧。
 
 ---

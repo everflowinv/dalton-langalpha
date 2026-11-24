@@ -4,6 +4,7 @@ import { Inbox } from 'lucide-react';
 // Direct module imports: the primitives barrel also re-exports the
 // confirm dialog, which would pull its animation library onto first load.
 import { TOOLBAR_CHIP_CLASS, toolbarChipStyle } from '@/components/dalton/primitives/DaltonToolbarPill';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { cn } from '@/lib/utils';
 import { fetchAutoIngest, updateAutoIngest } from '../../utils/api/workspaces';
 
@@ -21,6 +22,8 @@ export function AutoIngestToggle({
   readOnly?: boolean;
 }): React.ReactElement | null {
   const { t } = useTranslation();
+  const { hasCapability } = useCapabilities();
+  const canAutoIngest = hasCapability('researchdata_bridge');
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
@@ -28,7 +31,7 @@ export function AutoIngestToggle({
 
   React.useEffect(() => {
     let cancelled = false;
-    if (!workspaceId) return;
+    if (!workspaceId || !canAutoIngest) return;
     fetchAutoIngest(workspaceId)
       .then((value) => {
         if (!cancelled) {
@@ -42,9 +45,9 @@ export function AutoIngestToggle({
     return () => {
       cancelled = true;
     };
-  }, [workspaceId]);
+  }, [workspaceId, canAutoIngest]);
 
-  if (!workspaceId || !loaded || enabled === null) {
+  if (!canAutoIngest || !workspaceId || !loaded || enabled === null) {
     return null;
   }
 

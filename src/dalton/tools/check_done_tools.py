@@ -2084,6 +2084,70 @@ async def _check_closing(
             )
         )
 
+    material_req = closing.get("material_verdict_requires")
+    if isinstance(material_req, dict) and verdict_rows:
+        candidates = verdict_rows
+        if conversation_run_id:
+            candidates = [
+                row
+                for row in verdict_rows
+                if str(row.get("run_id") or "") == str(conversation_run_id)
+            ]
+        latest = candidates[0] if candidates else None
+        if latest is not None:
+            latest_word = (
+                str(latest.get("word") or "").strip()
+                or str(latest.get("verdict") or "").strip()
+            ).upper()
+            latest_progress = str(latest.get("progress") or "none").strip().lower()
+            latest_payoff = _row_payoff_assessment(latest)
+            is_material = (
+                (bool(latest_word) and latest_word != "NO_CHANGE")
+                or (latest_progress not in ("", "none"))
+                or (
+                    isinstance(latest_payoff, dict)
+                    and latest_payoff.get("changed") is True
+                    and latest_payoff.get("reason") == "price_crossed_band"
+                )
+            )
+            if is_material:
+                for art in material_req.get("artifacts") or []:
+                    if not isinstance(art, dict):
+                        continue
+                    art_missing, art_warnings, art_resolved = await _check_artifact(
+                        backend, art, params, since_epoch=int(since.timestamp())
+                    )
+                    missing.extend(art_missing)
+                    warnings.extend(art_warnings)
+                    resolved_map.update(art_resolved)
+                req_docs_any = list(material_req.get("docs_any") or [])
+                if req_docs_any:
+                    if not workspace_id:
+                        missing.append(
+                            "无 workspace_id，知识层版本无法核对（需在工作区线程调用），请重试。"
+                        )
+                    else:
+                        try:
+                            mat_found = await _check_knowledge_versions(
+                                workspace_id, req_docs_any, since
+                            )
+                        except Exception as error:
+                            logger.warning(
+                                "dalton_check_done material knowledge version query failed",
+                                error=str(error),
+                            )
+                            missing.append(
+                                "知识层版本无法核对（数据库查询失败），请重试；"
+                                f"待核对：{'、'.join(req_docs_any)}。"
+                            )
+                        else:
+                            if not any(mat_found[doc] for doc in req_docs_any):
+                                missing.append(
+                                    f"本轮 verdict 显示存在实质变化，但知识层 {'、'.join(req_docs_any)} "
+                                    f"自 {since_label} 起均无 `source=tool` 新版本（至少需要其一）；"
+                                    "下一步：用 `knowledge_update` 写入受影响文档。"
+                                )
+
     # DALTON-HOOK(payoff-assessment): stock-move / thesis-delta declare this
     # key. The verdict table is append-only, so the check reads only the
     # LATEST verdict this run wrote into this workspace through this skill's

@@ -16,6 +16,13 @@ from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
 logger = structlog.get_logger(__name__)
 
 
+def read_assembled_workflow_file(path: Path) -> str:
+    """Read a workflow script/contract file with capability-aware assembly (DALTON-HOOK(standalone-core))."""
+    from src.dalton.content_assembly import read_assembled_text
+
+    return read_assembled_text(path)
+
+
 class PrebuiltWorkflowRegistry:
     """Load validated prebuilt workflows from a repository root."""
 
@@ -34,7 +41,8 @@ class PrebuiltWorkflowRegistry:
         for script_path in sorted(workflows_dir.glob("*/workflow.js")):
             directory_name = script_path.parent.name
             try:
-                source = script_path.read_text(encoding="utf-8")
+                # DALTON-HOOK(standalone-core): assemble capability-gated workflow fragments
+                source = read_assembled_workflow_file(script_path)
                 meta = compile_check(source)
                 if meta.name != directory_name:
                     raise WorkflowScriptError(
@@ -67,5 +75,12 @@ class PrebuiltWorkflowRegistry:
 
 
 @cache
-def get_prebuilt_workflows() -> PrebuiltWorkflowRegistry:
+def _cached_prebuilt_workflows(_fingerprint: str) -> PrebuiltWorkflowRegistry:
     return PrebuiltWorkflowRegistry()
+
+
+def get_prebuilt_workflows() -> PrebuiltWorkflowRegistry:
+    # DALTON-HOOK(standalone-core): key cached prebuilt workflows by capabilities fingerprint
+    from src.dalton.capabilities import capabilities_fingerprint
+
+    return _cached_prebuilt_workflows(capabilities_fingerprint())

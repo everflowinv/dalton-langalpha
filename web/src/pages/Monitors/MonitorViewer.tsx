@@ -9,6 +9,7 @@ import { Select } from '@/components/ui/select';
 import { toast } from '@/components/ui/use-toast';
 import { ListError, TagBadge } from '@/components/mcp/McpPrimitives';
 import { apiErrorStatus } from '@/api/errors';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { useLocale } from '@/hooks/useLocale';
 import { GRANT_RENEW_MARGIN_MS, MIN_RENEW_INTERVAL_MS, msUntilRenewal } from '@/lib/expiry';
 import { formatTimestamp } from '@/lib/format';
@@ -36,6 +37,11 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
   const { t } = useTranslation();
   const locale = useLocale();
   const navigate = useNavigate();
+  // Anonymous public viewers must not hit authenticated /api/v1/dalton/capabilities
+  // (which 401s under Supabase auth); GET /api/v1/dalton/monitors/public/{slug} already
+  // enforces data_jobs server-side and returns 404 when disabled.
+  const { hasCapability, isLoading: capsLoading } = useCapabilities({ enabled: !publicMode });
+  const dataJobsEnabled = hasCapability('data_jobs');
 
   const detailQuery = useQuery<MonitorDetail>({
     queryKey: publicMode ? ['dalton', 'monitors', 'public', slug] : queryKeys.daltonMonitors.detail(slug),
@@ -161,7 +167,7 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     }
   };
 
-  if (detailQuery.isLoading) {
+  if (detailQuery.isLoading || (!publicMode && capsLoading)) {
     return (
       <div className="monitors-viewer items-center justify-center">
         <Loader size={20} label={t('common.loading')} className="text-(--color-text-tertiary)" />
@@ -169,7 +175,8 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     );
   }
 
-  if (detailQuery.isError || !monitor || !detail) {
+  const hiddenDataJob = !publicMode && monitor?.source_kind === 'data_job' && !dataJobsEnabled;
+  if (detailQuery.isError || !monitor || !detail || hiddenDataJob) {
     const status = apiErrorStatus(detailQuery.error);
     const title = status === 403 ? t('monitors.forbiddenTitle') : t('monitors.notFoundTitle');
     const desc = status === 403 ? t('monitors.forbiddenDesc') : t('monitors.notFoundDesc');

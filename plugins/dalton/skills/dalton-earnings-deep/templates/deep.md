@@ -91,7 +91,7 @@
 | **次日（`T+1`）[引用5]** | {日期与价格 [引用5]} | {日期与价格 [引用5]} | {涨跌 [引用5]} | {超额 [引用5]} | {超额 [引用5]} | {超额 [引用5]} |
 | **一周（5 交易日）[引用5]** | {日期与价格 [引用5]} | {日期与价格 [引用5]} | {涨跌 [引用5]} | {超额 [引用5]} | {超额 [引用5]} | {超额 [引用5]} |
 
-{先用一段分析“为什么动（股价反应归因）”：结合当季超预期成色、指引修正幅度、财报前买方隐含预期门槛（bogey）、估值位置与持仓拥挤度拆解股价驱动，严禁拿股价涨跌直接代替基本面验证信号 [引用4][引用5]。随后用简明条目对比财报后强化的**多头核心逻辑（3–5 条）**与暴露或未解除的**空头/担忧逻辑（3–5 条）**，并汇总财报发布至发布后 3 个交易日（T0 至 T+3）主流卖方与独立研究（FUNDA AI / TMTB / 交易台笔记）的盈利预测修正、目标价调整与核心分歧 [引用4]：}
+{先用一段分析“为什么动（股价反应归因）”：结合当季超预期成色、指引修正幅度、财报前买方隐含预期门槛（bogey）、估值位置与持仓拥挤度拆解股价驱动，严禁拿股价涨跌直接代替基本面验证信号 [引用4][引用5]。随后用简明条目对比财报后强化的**多头核心逻辑（3–5 条）**与暴露或未解除的**空头/担忧逻辑（3–5 条）**，并汇总财报发布至发布后 3 个交易日（T0 至 T+3）主流卖方与独立研究<!-- DALTON_CAP:researchdata_bridge -->（FUNDA AI / TMTB / 交易台笔记）<!-- /DALTON_CAP -->的盈利预测修正、目标价调整与核心分歧 [引用4]：}
 
 - **多头核心逻辑（3–5 条）**：{本季财报强化的核心证据 [引用1][引用2]}
 - **空头 / 担忧逻辑（3–5 条）**：{本季财报暴露或尚未解除的隐患 [引用1][引用2]}
@@ -195,8 +195,8 @@
 
 [引用1]: evidence:E-20261023-01 （法定财报｜SEC 10-Q / 8-K EX-99.1 / 6-K｜{标题与期次}｜{日期}｜{accession 或公告链接}）
 [引用2]: evidence:E-20261023-02 （公司 IR｜财报新闻稿、业绩演示 PPT、Financial Supplement｜{标题}｜{日期}｜{URL}）
-[引用3]: evidence:E-20261023-03 （电话会纪要｜AlphaEngine / 法定归档｜{标题}｜{日期}｜{doc_id 或链接}）
-[引用4]: prov:3f6c9a12-0000-0000-0000-000000000001 （卖方与独立研究｜AlphaEngine / FUNDA AI / TMTB / Sales Notes｜{机构与标题}｜{日期}｜{doc_id / mail:ID}）
+[引用3]: evidence:E-20261023-03 （电话会纪要｜<!-- DALTON_CAP:alphaengine -->AlphaEngine / 法定归档<!-- DALTON_CAP_ELSE -->公司 IR / 公开电话会纪要<!-- /DALTON_CAP -->｜{标题}｜{日期}｜{doc_id 或链接}）
+[引用4]: prov:3f6c9a12-0000-0000-0000-000000000001 （卖方与独立研究｜<!-- DALTON_CAP:alphaengine|researchdata_bridge -->AlphaEngine / FUNDA AI / TMTB / Sales Notes<!-- DALTON_CAP_ELSE -->公开卖方点评与独立研究<!-- /DALTON_CAP -->｜{机构与标题}｜{日期}｜{<!-- DALTON_CAP:alphaengine|researchdata_bridge -->doc_id / mail:ID<!-- DALTON_CAP_ELSE -->来源链接<!-- /DALTON_CAP -->}）
 [引用5]: evidence:E-20261023-05 （行情与一致预期快照｜price_reaction.py 输出与一致预期快照｜{日期}｜research/.../price_reaction.json 及 data/consensus/...）
 [引用6]: model:model/META-model-v01.xlsx!Scenarios!C12 （本方模型｜Bull 情景远期 EPS｜{日期}）
 [引用7]: model:model/META-model-v01.xlsx!Scenarios!D12 （本方模型｜Bull 情景目标价中点｜{日期}）

@@ -34,7 +34,12 @@ from src.dalton.coverage.models import (
     validate_earnings_calendar_ledger,
 )
 from src.dalton.database import coverage as coverage_db
+from src.dalton.profile import is_core_profile
 from src.server.database import pool as _db_pool_mod
+
+DEFAULT_COVERAGE_YAML: Path = (
+    Path(__file__).resolve().parents[3] / "config" / "dalton" / "coverage.yaml"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2825,19 +2830,53 @@ async def query_user_earnings_calendar(
 
 
 # ---------------------------------------------------------------------------
-# Item 1: Seed user coverage from coverage.yaml
+# Item 1: Seed user coverage from coverage.yaml (profile-aware default roster)
 # ---------------------------------------------------------------------------
+
+
+def _is_default_coverage_yaml(path: Path) -> bool:
+    try:
+        return path.resolve() == DEFAULT_COVERAGE_YAML.resolve()
+    except OSError:
+        return False
+
+
+def load_default_coverage_companies(yaml_path: Path | None = None) -> list[dict[str, Any]]:
+    """Return the built-in default coverage company list for the active profile.
+
+    - In Standalone Core profile (``is_core_profile()``), returns an empty list
+      without reading ``config/dalton/coverage.yaml`` so customers start with a
+      clean coverage roster.
+    - In Everflow profile, parses ``yaml_path`` (defaulting to
+      ``config/dalton/coverage.yaml``).
+    """
+    if is_core_profile():
+        return []
+    target = yaml_path or DEFAULT_COVERAGE_YAML
+    if not target.is_file():
+        return []
+    doc = yaml.safe_load(target.read_text(encoding="utf-8")) or {}
+    companies = doc.get("companies") or []
+    return [dict(c) for c in companies if isinstance(c, Mapping)]
+
+
+def get_default_coverage_doc(yaml_path: Path | None = None) -> dict[str, Any]:
+    """Return the built-in default coverage document (empty in Core profile)."""
+    return build_coverage_doc(load_default_coverage_companies(yaml_path))
 
 
 async def seed_user_coverage_from_yaml(
     user_id: str,
-    yaml_path: Path,
+    yaml_path: Path | None = None,
     *,
     apply: bool = False,
     conn: Any = None,
 ) -> dict[str, Any]:
     """Seed `dalton_coverage` for `user_id` from a `coverage.yaml` file.
 
+    - In Standalone Core profile, omitting ``yaml_path`` or pointing at the
+      built-in Everflow ``config/dalton/coverage.yaml`` returns an empty roster
+      without reading or seeding Everflow's 105-company list.
     - When `apply=False` (default dry-run), only parses and validates rows and returns counts.
     - When `apply=True`, upserts all rows in a single transaction under per-user advisory lock
       and asserts that the written row count matches the YAML company count.
@@ -2845,13 +2884,27 @@ async def seed_user_coverage_from_yaml(
     uid = str(user_id or "").strip()
     if not uid:
         raise ValueError("user_id is required")
-    if not yaml_path.is_file():
-        raise FileNotFoundError(f"Coverage YAML file not found: {yaml_path}")
+    target_path = yaml_path or DEFAULT_COVERAGE_YAML
+    if is_core_profile() and (yaml_path is None or _is_default_coverage_yaml(target_path)):
+        return {
+            "ok": True,
+            "mode": "applied" if apply else "dry_run",
+            "user_id": uid,
+            "source_file": "",
+            "planned_count": 0,
+            "core_count": 0,
+            "watch_count": 0,
+            "written_count": 0,
+            "skipped_reason": "core_profile_empty_default_coverage",
+        }
+    if not target_path.is_file():
+        raise FileNotFoundError(f"Coverage YAML file not found: {target_path}")
 
-    doc = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+    doc = yaml.safe_load(target_path.read_text(encoding="utf-8")) or {}
     companies = doc.get("companies") or []
     if not isinstance(companies, list):
-        raise ValueError(f"Invalid 'companies' list in {yaml_path}")
+        raise ValueError(f"Invalid 'companies' list in {target_path}")
+    yaml_path = target_path
 
     rows: list[dict[str, Any]] = []
     seen_tickers: set[str] = set()

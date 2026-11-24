@@ -23,7 +23,7 @@ description: "解析 BDC 10-K/10-Q 投资明细表（Schedule of Investments）�
 - **`--workspace-dir` 规则**：
   - `harvest.py` **必须传入 `--workspace-dir <workspace>`**；未传时直接报错退出，不写入任何文件。
   - `compare.py` 对比分析：传入 `--workspace-dir <workspace>` 时会先将缺失的种子文件初始化到工作区状态目录 `<workspace>/state/dalton-bdc-analyst/`，再从工作区状态读取；未传 `--workspace-dir` 时仅在内存中只读读取内置种子 `data/seed.tar.gz`，不写磁盘。
-- **SEC 请求身份**：按 `SEC_USER_AGENT` → `EDGAR_IDENTITY` → `DaltonResearch research@everflowinv.com` 的顺序解析，并保持 SEC EDGAR 限速与指数退避重试。
+- **SEC 请求身份**：按 `SEC_USER_AGENT` → `EDGAR_IDENTITY`<!-- DALTON_CAP:researchdata_bridge --> → `DaltonResearch research@everflowinv.com`<!-- DALTON_CAP_ELSE --> → `DaltonResearch sec-contact@example.com`<!-- /DALTON_CAP --> 的顺序解析，并保持 SEC EDGAR 限速与指数退避重试。
 - **依赖**：依赖沙箱预装的 `requests`、`pandas`、`numpy`、`beautifulsoup4`、`lxml`、`tabulate`（如缺包，直接告知管理员，不要擅自修改系统环境）。
 
 ---
@@ -94,8 +94,8 @@ SEC 代码表已查不到：`MRCC`、`SSSS`（`harvest.py --ticker all` 默认�
 
 ### 交付格式（Dalton 惯例）
 - 回复中直接使用 Markdown 表格呈现对比结果（列顺序：`公司名`、`periodA face value`、`periodA fair value`、`periodA face/fair`、`periodB face`、`periodB fair`、`periodB face/fair`、`期间face/fair变化`、`行业`、`细分行业`、`公司主要业务简介`）。
-- 如用户需要导出文件，可用 `--csv` 保存至工作区。
-- **仅当用户在本次对话明确要求写入飞书文档时**，调用 `feishu_create_doc(title="BDC 持仓信用恶化对比（{periodA} vs {periodB}）", markdown=...)` 生成文档并返回链接。
+- 如用户需要导出文件，可用 `--csv` 保存至工作区。<!-- DALTON_CAP:feishu_docs -->
+- **仅当用户在本次对话明确要求写入飞书文档时**，调用 `feishu_create_doc(title="BDC 持仓信用恶化对比（{periodA} vs {periodB}）", markdown=...)` 生成文档并返回链接。<!-- /DALTON_CAP -->
 
 ---
 

@@ -85,5 +85,5 @@ verdict（上文五词结论）描述的是论点本身的变化，动作要看 
 ### 第二步：按四级顺序排查原因（严禁倒序把股吧传闻当主因）
 1. **监管 Filing 与公司官方公告**：先查 `sec`（8-K、Form 4 内部人减持、13D/G）或交易所公告、公司 IR 新闻稿、高管公开出席行业会议表态。
 2. **权威财经新闻与同业/上下游联动**：查主流财经通讯社、上下游大客户/供应商最新财报或指引、监管/关税/反垄断动态。
-3. **卖方研报与买方销售笔记**：查 `alphaengine`、`sales-notes`、`tmtb` 是否有大行升降级（Upgrade/Downgrade）、目标价调整、渠道调研（Channel Check）或专家会纪要流出。
+3. **卖方研报与<!-- DALTON_CAP:researchdata_bridge -->买方销售笔记<!-- DALTON_CAP_ELSE -->机构评论<!-- /DALTON_CAP -->**：<!-- DALTON_CAP:alphaengine|researchdata_bridge -->查 `alphaengine`、`sales-notes`、`tmtb` <!-- DALTON_CAP_ELSE -->通过 `web_search` 查主流券商研报摘要与公开机构评论，核实<!-- /DALTON_CAP -->是否有大行升降级（Upgrade/Downgrade）、目标价调整、渠道调研（Channel Check）或专家会纪要流出。
 4. **社媒与社区讨论（最后辅助）**：最后才查看市场传闻，且必须在报告中明确标为"市场传闻 / 未经证实"，不得与前三级硬证据混为一谈。

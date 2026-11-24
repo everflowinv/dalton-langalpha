@@ -318,7 +318,7 @@ if (missing.length) {
 
 phase('bull/bear 快速版')
 const bb = await agent(
-  `${base} 读 ${R}/ 下全部支线文件与 ${W}/drafts/${D}-background.md，按 .agents/skills/dalton-bullbear/SKILL.md 的快速版方法写成文字版到 ${R}/bullbear-quick.md（可补充检索内部库与 AlphaEngine）。缺失支线：${
+  `${base} 读 ${R}/ 下全部支线文件与 ${W}/drafts/${D}-background.md，按 .agents/skills/dalton-bullbear/SKILL.md 的快速版方法写成文字版到 ${R}/bullbear-quick.md/* DALTON_CAP:alphaengine|researchdata_bridge */（可补充检索内部库与 AlphaEngine）/* /DALTON_CAP */。缺失支线：${
     missing.join(',') || '无'
   }。`,
   { agentType: 'general-purpose', label: 'bull/bear 快速版', phase: 'bull/bear 快速版', schema: OUT }

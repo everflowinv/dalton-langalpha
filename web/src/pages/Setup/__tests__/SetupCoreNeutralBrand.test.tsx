@@ -30,10 +30,13 @@ const h = vi.hoisted(() => ({
 // DefaultStep prefetches the welcome page; a stub keeps that import from
 // finishing after the test environment has closed.
 vi.mock('@/pages/Onboarding/welcome/Welcome', () => ({ default: () => null }));
-vi.mock('@/config/brand', () => ({
+vi.mock('@/config/brand', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/config/brand')>()),
   BRAND_NAME: 'LangAlpha',
   BRAND_MARK: 'langalpha',
   isDaltonBuild: true,
+  isCoreProfileBuild: true,
+  DALTON_PROFILE: 'core',
   faviconHref: () => '/logo-favicon.svg',
 }));
 

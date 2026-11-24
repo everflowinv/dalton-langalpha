@@ -60,15 +60,26 @@ def render_base_body(defn: SubagentDefinition) -> str:
     """
     from ptc_agent.agent.prompts import get_loader
     from ptc_agent.agent.subagents.compiler import subagent_template_vars
+    from src.dalton.content_assembly import assemble_markdown_text  # DALTON-HOOK(standalone-core)
 
+    agent_path = f"agents/{defn.name}.md"
+    should_assemble = defn.source in ("builtin", "user") or (
+        defn.source == "plugin" and defn.bundled_plugin
+    )
     if defn.custom_prompt is not None:
-        return defn.custom_prompt.strip()
+        raw = defn.custom_prompt
+        if should_assemble:
+            raw = assemble_markdown_text(raw, path=agent_path)
+        return raw.strip()
     variables = subagent_template_vars(defn, guidance=BODY_GUIDANCE)
     # In the compiler's order, so a definition setting several shows the one a turn runs.
     if defn.custom_prompt_template:
         template = defn.custom_prompt_template
     elif defn.role_prompt:
-        return defn.role_prompt.strip()
+        raw = defn.role_prompt
+        if should_assemble:
+            raw = assemble_markdown_text(raw, path=agent_path)
+        return raw.strip()
     elif defn.role_prompt_template:
         template = f"subagents/{defn.role_prompt_template}"
         # The base prompt hands its role template this one as well.
@@ -188,10 +199,20 @@ def _base_view(
     deployment definition now takes a plugin subagent's name); it is shown as base
     removed on this view, and a save starts over from the current base.
     """
+    from src.dalton.content_assembly import assemble_markdown_text  # DALTON-HOOK(standalone-core)
+
     body = render_base_body(base.definition)
     base_values = definition_values(base.definition, enabled=True)
     edited = row is not None and bool(row.get("fields"))
     problems = [{"code": "base_removed", "detail": stale.get("base_key")}] if stale else []
+    should_assemble = defn.source in ("builtin", "user") or (
+        defn.source == "plugin" and defn.bundled_plugin
+    )
+    desc = (
+        assemble_markdown_text(defn.description, path=f"agents/{defn.name}.md")
+        if should_assemble
+        else defn.description
+    )
     return _finish(
         {
             "name": defn.name,
@@ -200,7 +221,7 @@ def _base_view(
             "plugin": _plugin_of_key(base.key),
             "edited": edited,
             "user_fields": _user_fields(row),
-            "description": defn.description,
+            "description": desc,
             "instructions": body,
             **definition_values(defn, enabled=enabled),
             "available_to": _roles(defn.roles),

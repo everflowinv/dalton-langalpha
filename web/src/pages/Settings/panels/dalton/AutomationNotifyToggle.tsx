@@ -1,6 +1,7 @@
 import React from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { ToggleSwitch } from '@/components/ui/switch';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { queryKeys } from '@/lib/queryKeys';
@@ -23,11 +24,15 @@ interface AutomationNotifyToggleProps {
 export function AutomationNotifyToggle({
   automation,
 }: AutomationNotifyToggleProps): React.ReactElement | null {
+  const { hasCapability } = useCapabilities();
   const { preferences, isLoading, isLoaded } = usePreferences();
   const updatePreferences = useUpdatePreferences();
   const queryClient = useQueryClient();
 
-  if (!automation.dalton_notify_category) {
+  if (
+    !automation.dalton_notify_category ||
+    !hasCapability(['channel_gateway', 'channel_feishu', 'channel_discord'])
+  ) {
     return null;
   }
 

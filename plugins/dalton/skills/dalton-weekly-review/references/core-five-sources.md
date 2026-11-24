@@ -13,7 +13,7 @@
 
 ## 二、五类必查来源（Core Five Sources）
 
-### 1. AlphaEngine（卖方研报、卖方点评、会议纪要、本机构会议、新闻公告）
+<!-- DALTON_CAP:alphaengine -->### 1. AlphaEngine（卖方研报、卖方点评、会议纪要、本机构会议、新闻公告）
 通过 PTC 直接使用友好分类 `params.document_categories`（或显式调用 `researchdata.research(route="alphaengine", operation="list_filters", params={"filter_type": "document_types", "document_code": "summary"})` 查询细粒度 `type_ids`——注意无参 `list_filters()` 只返回友好 `categories`，不返回 `type_ids`），再调用 `researchdata.research(route="alphaengine", operation="search_library", ...)`，每家公司执行以下独立检索（输出中须明确注明**“首屏 / 限定检索”**，不得声称全量穷尽）：
 1. **研报与纪要类**：
    - `params={"document_categories": ["sell_side_report", "sell_side_comment", "foreign_report", "meeting_minutes"], "sort": "relevance"}`（或对应 `type_ids`）
@@ -27,29 +27,33 @@
 4. **跨语言补查与配额纪律**：
    - 当某类相关结果少于 3 条时，换用另一种语言的公司名补查 1 次；
    - 挑出解释本周股价或基本面变化最关键的文档调 `get_document` 读取正文；
-   - **配额保护**：若接口返回“无查看权限或额度已达上限”或 `E_DESKTOP_NOT_RUNNING`，**立即停止重试**，在输出文件及“口径与缺口”中如实写明**“AlphaEngine 额度用尽 / 未登录，未覆盖”**，**严禁写成“本周无更新”**。
+   - **配额保护**：若接口返回“无查看权限或额度已达上限”或 `E_DESKTOP_NOT_RUNNING`，**立即停止重试**，在输出文件及“口径与缺口”中如实写明**“AlphaEngine 额度用尽 / 未登录，未覆盖”**，**严禁写成“本周无更新”**。<!-- DALTON_CAP_ELSE -->### 1. 公开卖方观点、评级变动与会议纪要
+- 使用 `web_search`（带窗口 `start_date = base - 1d`、`end_date = end + 1d`）与 `web_fetch` 检索主流券商与外资行本周发布的评级调整、目标价变动、盈利预测修正及公开业绩会/行业会议纪要。
+- 挑出解释本周股价或基本面变化最关键的 2–3 篇报道或公告原文精读正文，不凭标题或简短摘要下结论。<!-- /DALTON_CAP -->
 
-### 2. 内部研究库（`sales-notes`、`tmtb`、`funda-ai`、`company-wiki`）
+<!-- DALTON_CAP:researchdata_bridge -->### 2. 内部研究库（`sales-notes`、`tmtb`、`funda-ai`、`company-wiki`）
 通过 PTC 分别或融合检索内部四库：
 1. **`sales-notes`（GS、Jefferies、BofA 等销售邮件）、`tmtb`、`funda-ai`**：
    - 使用公司别名（`aliases`）在窗口内按关键词/语义检索，读取命中文档并按大小写精确复核提及本公司的段落；
    - **别名过宽拆分规则**：若某家公司别名较泛导致单次检索触及返回上限（`limit_hit`），按各个别名分开检索。
 2. **`company-wiki`（基金 Wiki，只读）**：
-   - 列出窗口内新入库（`indexed_since = base`）的文档：归在本公司目录（`params.company=TICKER`）下的全部读取；行业级文档中命中本公司别名 ≥ 2 次的读取。
+   - 列出窗口内新入库（`indexed_since = base`）的文档：归在本公司目录（`params.company=TICKER`）下的全部读取；行业级文档中命中本公司别名 ≥ 2 次的读取。<!-- DALTON_CAP_ELSE -->### 2. 工作区知识层与历史观点对照
+- 查阅当前公司工作区知识层（`../<TICKER>/thesis.md`、`debate.md`、`verdicts.md`、`data/consensus/`）与近期研究底稿，核对本周新信号相对既有论点与一致预期快照的边际变化。<!-- /DALTON_CAP -->
 
-### 3. 公开新闻与法定公告（`web_search` / `sec` / `cn-hk`）
+### 3. 公开新闻与法定公告（`web_search` / `sec`<!-- DALTON_CAP:researchdata_bridge --> / `cn-hk`<!-- /DALTON_CAP -->）
 1. 执行 1 次带显式日期范围（`start_date = base - 1d`、`end_date = end + 1d`）的常规新闻检索；
 2. 对 `screen.json` 中该公司出现**放量（量比 ≥ 2.0x）或单日明显偏离同组（|日超额| ≥ 3pp 或 |z| ≥ 2）**的每个异常交易日，额外执行 1 次定向检索：`"{公司名/TICKER} stock {YYYY-MM-DD} why"`。
-3. **港股与 A 股必加 `cn-hk` 深度检索（公告 + 资金面/交易结构）**：
+<!-- DALTON_CAP:researchdata_bridge -->3. **港股与 A 股必加 `cn-hk` 深度检索（公告 + 资金面/交易结构）**：
    - **一手公告核查（`operation="filings"`）**：调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=code_5_or_6, start=base_minus_1d, end=min(end_plus_1d, TODAY), limit=20)`（`filings` 的 `end` 不得晚于当天 `TODAY`，否则整次调用失败；港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`，不带 `.HK`/`.SS`/`.SZ` 后缀），检索窗口内巨潮资讯（cninfo）发布的业绩、回购、股东增减持、重大合同或监管公告及 `pdf_link`；查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`。
-   - **资金流、两融、龙虎榜、股东/回购与 AH 溢价（`operation="ask"`）**：每次调用只查**单一意图**（不要把多个意图拼成一条 query）：资金流类查询必须带具体异动日或窗口日期（如 `query="宁德时代 300750 2026-10-21 主力资金净流入和成交额"`）；两融（`query=f"{code_or_name} {event_date} 两融"`）、龙虎榜（`query=f"{code_or_name} {event_date} 龙虎榜"`）、大宗交易（`query=f"{code_or_name} {event_date} 大宗交易"`）、回购（`query=f"{code_or_name} 回购"`）、分红（`query=f"{code_or_name} 分红"`）、AH 溢价（`query="AH溢价"`）各自单独调用一条 `ask`。必须检查返回的 `summary` 与实际来源：若东财接口失败回退到同花顺当日即时口径，成稿必须标明口径；拿不到指定历史日的数据就写明缺口，不得把即时/最新值当作窗口内日终数。若涉及财务报表数字，平台数据仅作二手初值线索，核心数字必须回法定公告原文核实；核对周度与区间回报时须核实复权口径（A 股默认前复权 `qfq`、港股默认不复权，跨源回退核查 `plan.source`）、分红、拆股与币种。
+   - **资金流、两融、龙虎榜、股东/回购与 AH 溢价（`operation="ask"`）**：每次调用只查**单一意图**（不要把多个意图拼成一条 query）：资金流类查询必须带具体异动日或窗口日期（如 `query="宁德时代 300750 2026-10-21 主力资金净流入和成交额"`）；两融（`query=f"{code_or_name} {event_date} 两融"`）、龙虎榜（`query=f"{code_or_name} {event_date} 龙虎榜"`）、大宗交易（`query=f"{code_or_name} {event_date} 大宗交易"`）、回购（`query=f"{code_or_name} 回购"`）、分红（`query=f"{code_or_name} 分红"`）、AH 溢价（`query="AH溢价"`）各自单独调用一条 `ask`。必须检查返回的 `summary` 与实际来源：若东财接口失败回退到同花顺当日即时口径，成稿必须标明口径；拿不到指定历史日的数据就写明缺口，不得把即时/最新值当作窗口内日终数。若涉及财务报表数字，平台数据仅作二手初值线索，核心数字必须回法定公告原文核实；核对周度与区间回报时须核实复权口径（A 股默认前复权 `qfq`、港股默认不复权，跨源回退核查 `plan.source`）、分红、拆股与币种。<!-- DALTON_CAP_ELSE -->3. **港股与 A 股法定公告与交易面检索**：
+   - 使用 `web_search` 与 `web_fetch` 检索港交所披露易（`site:hkexnews.hk`）、巨潮资讯网及公司 IR 官网在 `[base - 1d, end + 1d]` 窗口内的业绩、回购、股东增减持、重大合同与监管公告原文；核心财务数字必须回法定公告原文核实，核对周度与区间回报时须核实复权口径、分红、拆股与币种。<!-- /DALTON_CAP -->
 
 ### 4. 社交媒体 X
 - 检索带 `since:{base}` 的帖子，优先按浏览量与点赞数排序阅读；
 - 只采纳有实质数据或基本面拆解的观点，且**必须能与行情走势或其他独立来源相互印证；对不上的内容直接弃用并在文末说明**。
 
-### 5. 雪球讨论（`community(route="xueqiu")`）
-- 对港股、A 股、中概股及中文社区关注度高的核心标的，调用 `researchdata.community(route="xueqiu", operation="posts", ticker=..., pages=2)`（港股传 5 位代码如 `"00700"`、`"06181"`，A 股传 `"SH600519"` / `"SZ300750"`）或 `researchdata.community(route="xueqiu", operation="search", query=f"{公司名/TICKER}", pages=1)` 获取窗口内讨论；对高价值长帖调用 `operation="post"` 读取全文；
+### 5. 雪球讨论<!-- DALTON_CAP:researchdata_bridge -->（`community(route="xueqiu")`）<!-- /DALTON_CAP -->
+- 对港股、A 股、中概股及中文社区关注度高的核心标的，<!-- DALTON_CAP:researchdata_bridge -->调用 `researchdata.community(route="xueqiu", operation="posts", ticker=..., pages=2)`（港股传 5 位代码如 `"00700"`、`"06181"`，A 股传 `"SH600519"` / `"SZ300750"`）或 `researchdata.community(route="xueqiu", operation="search", query=f"{公司名/TICKER}", pages=1)` 获取窗口内讨论；对高价值长帖调用 `operation="post"` 读取全文；<!-- DALTON_CAP_ELSE -->使用 `web_search` 与 `web_fetch` 检索雪球及中文投资社区在窗口内的深度分析帖与财报拆解，并读取高价值长帖正文；<!-- /DALTON_CAP -->
 - 区分中文 KOL 基本面分析与散户情绪，只引用带发帖日期（`created_at`）和原帖链接（`url`）的帖子，且必须能与公告、行情或其他独立来源相互印证。
 
 ---
@@ -60,7 +64,7 @@
 
 1. **窗口涨跌与同组对比**：本周复权涨跌幅、同组中位数、超额收益（pp）与窗口 z 值（来自 `screen.json`）；
 2. **异常交易日定位**：哪一天出现了放量或相对同组明显背离；
-3. **事件还原**：异常日当天及本周发生了什么具体事件（附一手公告、新闻或内部库来源）；
+3. **事件还原**：异常日当天及本周发生了什么具体事件（附一手公告、新闻<!-- DALTON_CAP:researchdata_bridge -->或内部库<!-- DALTON_CAP_ELSE -->或公开机构点评<!-- /DALTON_CAP -->来源）；
 4. **卖方观点汇总**：本周发布研报/点评的机构、日期、评级、目标价变动与核心论点；
 5. **归因判断（含 EPS vs 倍数分解）**：结合 `attribution.json` 中的 EPS 预期贡献（pp）与估值倍数贡献（pp），说明本周是盈利驱动、估值驱动、两者兼有还是相抵，以及背后的业务逻辑；
 6. **对 Thesis 与 Debate 的影响**：结合该公司本周 `verdicts.md` 已记录的结论与本次新发现，评估对哪个支柱或 debate 有什么影响，给出本周综合事件五词，并判断是否具备升级为本周 `call_candidate` 的潜力；

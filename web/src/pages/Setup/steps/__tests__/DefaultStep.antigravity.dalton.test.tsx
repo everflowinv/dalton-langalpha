@@ -111,6 +111,8 @@ const h = vi.hoisted(() => {
 
 vi.mock('@/config/brand', () => ({
   isDaltonBuild: true,
+  DALTON_PROFILE: 'everflow' as const,
+  isCoreProfileBuild: false,
   BRAND_NAME: 'Everflow',
   BRAND_MARK: 'everflow',
   APP_TAGLINE: '',

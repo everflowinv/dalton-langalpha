@@ -12,10 +12,28 @@ from collections.abc import Collection, Sequence
 from fastapi import HTTPException
 
 from src.dalton.access_tiers import get_user_tier
+from src.dalton.capabilities import CapabilityId, has_capability
 from src.dalton.company_identity import is_company_system_user
 from src.dalton.monitors.models import MonitorRecord, MonitorVisibility
 
 COMPANY_TIERS = frozenset({"admin", "internal"})
+
+
+def is_monitor_capability_enabled(monitor: MonitorRecord) -> bool:
+    """Return False when *monitor* belongs to a capability disabled in the current profile."""
+    if monitor.source_kind == "data_job":
+        return has_capability(CapabilityId.DATA_JOBS)
+    return True
+
+
+def require_monitor_capability(
+    monitor: MonitorRecord,
+    *,
+    detail: str = "监控面板不存在",
+) -> None:
+    """Raise 404 when *monitor* belongs to a disabled capability."""
+    if not is_monitor_capability_enabled(monitor):
+        raise HTTPException(status_code=404, detail=detail)
 
 
 def is_company_tier(tier: str | None) -> bool:
@@ -48,6 +66,8 @@ async def can_view_monitor(
     member_user_ids: Collection[str] | None = None,
 ) -> bool:
     """Single source of truth for viewing monitor metadata, files, versions, and realtime data."""
+    if not is_monitor_capability_enabled(monitor):
+        return False
     uid = str(user_id or "").strip()
     if not uid:
         return False

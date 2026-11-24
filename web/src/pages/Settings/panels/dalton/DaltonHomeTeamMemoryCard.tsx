@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { api } from '@/api/client';
 import { isDaltonAuth } from '@/config/daltonAuth';
+import { hasRequiredCapability } from '@/hooks/useCapabilities';
 import { queryKeys } from '@/lib/queryKeys';
 import { SettingRow } from '@/pages/Settings/components/SettingsLayout';
 import { ToggleSwitch } from '@/components/ui/switch';
@@ -20,6 +21,7 @@ export function canShowDaltonHomeTeamMemoryCard(
   return (
     isDaltonAuth &&
     Boolean(ctx) &&
+    hasRequiredCapability(ctx?.capabilities, 'conversation_archive') &&
     (ctx?.callerTier === 'admin' || ctx?.callerTier === 'internal')
   );
 }

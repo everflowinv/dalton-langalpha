@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ToggleSwitch } from '@/components/ui/switch';
 import ConfirmDialog from '@/pages/Dashboard/components/ConfirmDialog';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { modelPrefs, splitPreferenceWrite } from '@/lib/modelPreferences';
@@ -60,12 +61,16 @@ export function DaltonNotifyTargetsCard({
 }: DaltonNotifyTargetsCardProps) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const { hasCapability } = useCapabilities();
+  const canFeishu = hasCapability('channel_feishu');
+  const canDiscord = hasCapability('channel_discord');
   const { preferences, isLoading: prefsLoading, isLoaded } = usePreferences();
   const updatePrefs = useUpdatePreferences();
 
   const bindingsQuery = useQuery({
     queryKey: queryKeys.dalton.channelBindings(),
     queryFn: fetchDaltonChannelBindings,
+    enabled: canFeishu || canDiscord,
     retry: false,
   });
 
@@ -95,7 +100,7 @@ export function DaltonNotifyTargetsCard({
     const bindings = bindingsQuery.data?.bindings;
     if (!bindings) return [];
     const list: BoundCandidate[] = [];
-    if (bindings.feishu?.linked && bindings.feishu.platform_user_id) {
+    if (canFeishu && bindings.feishu?.linked && bindings.feishu.platform_user_id) {
       list.push({
         platform: 'feishu',
         target: `feishu:user:${bindings.feishu.platform_user_id}`,
@@ -103,7 +108,7 @@ export function DaltonNotifyTargetsCard({
         accountId: bindings.feishu.platform_user_id,
       });
     }
-    if (bindings.discord?.linked && bindings.discord.platform_user_id) {
+    if (canDiscord && bindings.discord?.linked && bindings.discord.platform_user_id) {
       list.push({
         platform: 'discord',
         target: `discord:user:${bindings.discord.platform_user_id}`,
@@ -112,7 +117,7 @@ export function DaltonNotifyTargetsCard({
       });
     }
     return list;
-  }, [bindingsQuery.data?.bindings]);
+  }, [bindingsQuery.data?.bindings, canFeishu, canDiscord]);
 
   const boundTargetSet = useMemo(
     () => new Set(boundCandidates.map((c) => c.target)),
@@ -250,6 +255,10 @@ export function DaltonNotifyTargetsCard({
       setTestNotice({ tone: 'error', message: t('dalton.notifyTargets.testFailed') });
     },
   });
+
+  if (!canFeishu && !canDiscord) {
+    return null;
+  }
 
   return (
     <DaltonSettingsCard

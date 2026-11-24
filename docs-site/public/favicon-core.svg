@@ -1,0 +1,20 @@
+<svg width="56" height="56" viewBox="0 0 56 56" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="dalton-favicon-bg" x1="0" y1="0" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0f766e"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+  <rect width="56" height="56" rx="12" fill="url(#dalton-favicon-bg)"/>
+  <path
+    d="M17 13h11.5c8.6 0 14.5 6.1 14.5 15s-5.9 15-14.5 15H17V13Z"
+    stroke="white"
+    stroke-width="4"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M24 21h4.5c4.3 0 7.5 2.9 7.5 7s-3.2 7-7.5 7H24V21Z"
+    fill="white"
+    fill-opacity="0.22"
+  />
+</svg>
