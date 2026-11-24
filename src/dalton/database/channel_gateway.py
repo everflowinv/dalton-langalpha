@@ -5173,7 +5173,7 @@ async def _execute_session_command_once(
     )
     if cleaned_puid:
         payload_dict["platform_user_id"] = cleaned_puid
-    context_stamp: tuple[str, str, str, int, int] | None = None
+    context_stamp: tuple[str | None, str | None, str, str, int, int | None] | None = None
 
     cmd_req_dict: dict[str, Any] = {
         "cmd": cleaned_cmd,
@@ -6103,6 +6103,14 @@ async def _execute_session_command_once(
                             uid_val=cleaned_uid,
                         )
                     if not plain_token:
+                        context_stamp = (
+                            None,
+                            None,
+                            str(acc_row["account_id"]),
+                            str(active_bot_id),
+                            int(active_bot_gen),
+                            None,
+                        )
                         return None
                     sender = cleaned_puid or str(acc_row.get("ilink_user_id") or "").strip()
                     if not sender:
@@ -6144,6 +6152,7 @@ async def _execute_session_command_once(
                     context_stamp = (
                         plain_token,
                         enc_key,
+                        str(acc_row["account_id"]),
                         str(active_bot_id),
                         int(active_bot_gen),
                         int(stored_seq),
@@ -6762,29 +6771,55 @@ async def _execute_session_command_once(
                         ),
                     )
                     if context_stamp is not None:
-                        stamp_token, stamp_key, stamp_bot, stamp_gen, stamp_seq = (
-                            context_stamp
-                        )
-                        await cur.execute(
-                            """
-                            UPDATE dalton_channel_inbound_events
-                            SET encrypted_weixin_context_token = pgp_sym_encrypt(%s, %s),
-                                weixin_context_bot_id = %s,
-                                weixin_context_bot_generation = %s,
-                                weixin_context_seq = %s,
-                                updated_at = NOW()
-                            WHERE platform = %s AND message_id = %s
-                            """,
-                            (
-                                stamp_token,
-                                stamp_key,
-                                stamp_bot,
-                                stamp_gen,
-                                stamp_seq,
-                                cleaned_platform,
-                                cleaned_msg_id,
-                            ),
-                        )
+                        (
+                            stamp_token,
+                            stamp_key,
+                            stamp_aid,
+                            stamp_bot,
+                            stamp_gen,
+                            stamp_seq,
+                        ) = context_stamp
+                        if stamp_token is not None and stamp_key is not None:
+                            await cur.execute(
+                                """
+                                UPDATE dalton_channel_inbound_events
+                                SET encrypted_weixin_context_token = pgp_sym_encrypt(%s, %s),
+                                    weixin_account_id = %s::uuid,
+                                    weixin_context_bot_id = %s,
+                                    weixin_context_bot_generation = %s,
+                                    weixin_context_seq = %s,
+                                    updated_at = NOW()
+                                WHERE platform = %s AND message_id = %s
+                                """,
+                                (
+                                    stamp_token,
+                                    stamp_key,
+                                    stamp_aid,
+                                    stamp_bot,
+                                    stamp_gen,
+                                    stamp_seq,
+                                    cleaned_platform,
+                                    cleaned_msg_id,
+                                ),
+                            )
+                        else:
+                            await cur.execute(
+                                """
+                                UPDATE dalton_channel_inbound_events
+                                SET weixin_account_id = %s::uuid,
+                                    weixin_context_bot_id = %s,
+                                    weixin_context_bot_generation = %s,
+                                    updated_at = NOW()
+                                WHERE platform = %s AND message_id = %s
+                                """,
+                                (
+                                    stamp_aid,
+                                    stamp_bot,
+                                    stamp_gen,
+                                    cleaned_platform,
+                                    cleaned_msg_id,
+                                ),
+                            )
 
                 return {
                     **cmd_result,

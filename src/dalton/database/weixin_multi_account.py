@@ -1392,7 +1392,7 @@ async def reevaluate_weixin_accounts(
                             SELECT account_id::text AS account_id, user_id, ilink_bot_id,
                                    ilink_user_id, prev_ilink_user_id, status, prev_status, disabled_reason
                             FROM dalton_channel_weixin_accounts
-                            WHERE user_id = ANY(%s)
+                            WHERE user_id = ANY(%s::text[])
                             ORDER BY account_id ASC
                             """,
                             (list(target_user_ids),),
@@ -1494,7 +1494,10 @@ async def reevaluate_weixin_accounts(
             async with owned_conn.transaction():
                 async with owned_conn.cursor(row_factory=dict_row) as cur:
                     await verify_gateway_epoch_in_tx(
-                        cur, gateway_epoch, required=require_gateway_epoch
+                        cur,
+                        gateway_epoch,
+                        required=require_gateway_epoch,
+                        platform="weixin",
                     )
                     if not mutations:
                         cfg_now = await ensure_and_lock_weixin_config_in_tx(
@@ -2702,7 +2705,7 @@ async def _patch_login_session_save_qr(
                         SET status = 'wait',
                             encrypted_qrcode = pgp_sym_encrypt(%s, %s),
                             qrcode_img_content = %s,
-                            redirect_base_url = COALESCE(NULLIF(%s, ''), redirect_base_url),
+                            redirect_base_url = COALESCE(NULLIF(%s::text, ''), redirect_base_url),
                             expires_at = NOW() + INTERVAL '5 minutes',
                             login_version = 2,
                             updated_at = NOW()
@@ -2788,9 +2791,9 @@ async def _patch_login_session_update(
                 await cur.execute(
                     f"""
                     UPDATE dalton_channel_weixin_login_sessions
-                    SET status = COALESCE(%s, status),
-                        redirect_base_url = COALESCE(NULLIF(%s, ''), redirect_base_url),
-                        qrcode_img_content = CASE WHEN %s THEN NULL ELSE qrcode_img_content END,
+                    SET status = COALESCE(%s::text, status),
+                        redirect_base_url = COALESCE(NULLIF(%s::text, ''), redirect_base_url),
+                        qrcode_img_content = CASE WHEN %s::boolean THEN NULL ELSE qrcode_img_content END,
                         login_version = login_version + 1,
                         updated_at = NOW()
                     WHERE session_key = %s
@@ -3151,7 +3154,7 @@ async def _patch_login_session_confirm(
                             SET ilink_bot_id = %s,
                                 ilink_user_id = %s,
                                 prev_ilink_user_id = %s,
-                                ilink_username = COALESCE(%s, ilink_username),
+                                ilink_username = COALESCE(%s::text, ilink_username),
                                 encrypted_bot_token = pgp_sym_encrypt(%s, %s),
                                 base_url = %s,
                                 cdn_base_url = %s,
@@ -3213,7 +3216,7 @@ async def _patch_login_session_confirm(
                                 """
                                 UPDATE dalton_channel_thread_watches
                                 SET weixin_bot_generation = %s,
-                                    weixin_recipient_id = COALESCE(%s, weixin_recipient_id),
+                                    weixin_recipient_id = COALESCE(%s::text, weixin_recipient_id),
                                     updated_at = %s
                                 WHERE platform = 'weixin'
                                   AND weixin_account_id = %s::uuid
@@ -4604,7 +4607,10 @@ async def finalize_collect_buffer(
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
                 await verify_gateway_epoch_in_tx(
-                    cur, gateway_epoch, required=require_gateway_epoch
+                    cur,
+                    gateway_epoch,
+                    required=require_gateway_epoch,
+                    platform="weixin",
                 )
                 await cur.execute(
                     """
@@ -4914,7 +4920,10 @@ async def verify_pending_weixin_account_first_message(
             async with owned_conn.transaction():
                 async with owned_conn.cursor(row_factory=dict_row) as cur:
                     await verify_gateway_epoch_in_tx(
-                        cur, gateway_epoch, required=require_gateway_epoch
+                        cur,
+                        gateway_epoch,
+                        required=require_gateway_epoch,
+                        platform="weixin",
                     )
                     locked_uids = await lock_user_settings_in_tx(cur, disc_uids)
                     if _after_user_locks_hook is not None:

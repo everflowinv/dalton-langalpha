@@ -4243,3 +4243,64 @@ async def test_r3_no_bare_cursor_outside_transaction_and_lease_hook_before_for_u
     assert bare_cursor_violations == []
     assert tx_depth == 0
 
+
+@pytest.mark.asyncio
+async def test_r4_weixin_command_stamps_account_id_for_i6_notice_claim(
+    wx_env: dict[str, Any],
+) -> None:
+    """Round 4 regression: Weixin slash command (`new`/`stop`/etc.) stamps `weixin_account_id`
+    onto `dalton_channel_inbound_events`, so subsequent I-6 `notice` delivery claim succeeds
+    instead of being denied as `source_generation_unknown`.
+    """
+    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
+    aid = str(uuid4())
+    store.accounts[aid] = {
+        "account_id": aid,
+        "user_id": "u-alice",
+        "ilink_bot_id": "bot-cmd@im.wechat",
+        "ilink_user_id": "wx_cmd_alice@im.wechat",
+        "prev_ilink_user_id": None,
+        "ilink_username": "Alice",
+        "encrypted_bot_token": "tok-cmd",
+        "base_url": "https://ilinkai.weixin.qq.com",
+        "cdn_base_url": "https://novac2c.cdn.weixin.qq.com/c2c",
+        "get_updates_buf": "",
+        "status": "active",
+        "prev_status": None,
+        "disabled_reason": None,
+        "bot_generation": 1,
+        "prev_bot_generation": None,
+        "bot_generation_updated_at": None,
+        "last_inbound_at": None,
+        "last_error_code": None,
+        "last_error_at": None,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+    store.executed_sql.clear()
+    cmd_res = await cg_db.execute_session_command(
+        cmd="new",
+        platform="weixin",
+        platform_user_id="wx_cmd_alice@im.wechat",
+        chat_type="dm",
+        chat_address="weixin:@me",
+        scope_key="dm:wx_cmd_alice@im.wechat",
+        message_id="wx_r4_cmd_new_1",
+        weixin_account_id=aid,
+        weixin_context_token="ctx-r4-cmd-new",
+        weixin_bot_id="bot-cmd@im.wechat",
+        weixin_bot_generation=1,
+        weixin_context_source="protocol",
+        weixin_context_seq=10,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+        raw_payload={"seq": 10},
+    )
+    assert cmd_res["ok"] is True
+    assert any(
+        "UPDATE dalton_channel_inbound_events" in s and "weixin_account_id = %s::uuid" in s
+        for s, _ in store.executed_sql
+    )
+
+

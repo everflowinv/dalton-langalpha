@@ -233,7 +233,7 @@ async def _cleanup_test_rows(
             await cur.execute(
                 """
                 DELETE FROM dalton_channel_weixin_collect_buffers
-                WHERE user_id = ANY(%s)
+                WHERE dalton_user_id = ANY(%s)
                    OR account_id IN (
                        SELECT account_id FROM dalton_channel_weixin_accounts
                        WHERE user_id = ANY(%s) OR ilink_bot_id LIKE %s OR ilink_user_id LIKE %s
@@ -4852,7 +4852,17 @@ async def _serve_cli_harness_main() -> None:
         async with pool.connection() as conn:
             yield conn
 
-    for mod in (db_pool, cg_db, dalton_sharing, dalton_invites, user_db, workspace_db):
+    for mod in (
+        db_pool,
+        cg_db,
+        wx_db,
+        dalton_sharing,
+        dalton_invites,
+        dalton_members,
+        dalton_roles,
+        user_db,
+        workspace_db,
+    ):
         setattr(mod, "get_db_connection", _pooled_get_db_connection)
 
     prefix = f"ch1_http_{uuid4().hex[:8]}"
@@ -5371,7 +5381,8 @@ async def test_weixin_context_order_source_and_invalid_inbound_real_pg(
 
         # Replaying older message_id (mid_p10) must NOT overwrite T-P25
         replay_old = await reg(mid_p10, "T-P10", {"seq": 10})
-        assert replay_old["duplicate"] is True
+        assert replay_old["existing_status"] == "pending"
+        assert replay_old["allowed"] is True
         assert (await token_row())["context_token"] == "T-P25"
 
         # I-6 and account detail both resolve newest token T-P25 even when naming older mid_p10
@@ -5620,6 +5631,7 @@ async def test_weixin_completed_command_replay_keeps_newer_context_real_pg(
         await cg_db.update_inbound_progress(
             platform="weixin",
             message_id=mid_a,
+            status="completed",
             command_reply_pending=False,
             gateway_epoch=epoch,
             require_gateway_epoch=True,
@@ -6488,8 +6500,8 @@ async def test_d049_copy_only_migration_fk_validate_and_lossless_downgrade_real_
                         'dm', 'weixin:@me', %s, %s::uuid, %s,
                         'pending', TRUE, %s, 3,
                         jsonb_build_object(
-                            'platform_user_id', %s,
-                            'ilink_bot_id', %s,
+                            'platform_user_id', %s::text,
+                            'ilink_bot_id', %s::text,
                             'weixin_attachments', jsonb_build_array(jsonb_build_object('aes_key', 'k46', 'filename', 'doc.pdf'))
                         )
                     )
