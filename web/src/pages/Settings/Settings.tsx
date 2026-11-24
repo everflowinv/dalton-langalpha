@@ -135,12 +135,12 @@ function Settings() {
   useEffect(() => {
     if (!accessDenied && !disabledCoverage) return;
     const message = unauthorizedDaltonAuth
-      ? t('settings.daltonAuthOnly')
+      ? t('settings:daltonAuthOnly')
       : unauthorizedTier
         ? t(
             requestedMeta?.minTier === 'admin'
-              ? 'settings.adminRequired'
-              : 'settings.internalRequired',
+              ? 'settings:adminRequired'
+              : 'settings:internalRequired',
           )
         : undefined;
     navigate('?tab=account', {

@@ -14,7 +14,7 @@ import { useProviderGate } from '@/pages/ChatAgent/hooks/useProviderGate';
 import { isProviderLocked } from '@/pages/ChatAgent/components/providerUi';
 import { useUser } from '@/hooks/useUser';
 import { CLAUDE_CODE } from '@/lib/claudeCode';
-import { llmProviderArt } from '@/lib/brandArt';
+import { llmProviderArt } from '@/lib/providerArt';
 import { BrandMark } from '@/pages/ChatAgent/components/mcp/BrandMark';
 import { cn } from '@/lib/utils';
 import { SetupFooter } from '../SetupFooter';
@@ -191,11 +191,11 @@ function UseForm() {
       {/* DALTON-HOOK(dalton-setup): use declarative header & section copy when team models skip selection */}
       <WizardStepHeader
         titleId={headingId}
-        title={t(teamModelsOnly ? 'setup.answers.use.teamTitle' : 'setup.answers.use.title')}
-        helper={t(teamModelsOnly ? 'setup.answers.use.teamLead' : 'setup.answers.use.lead')}
+        title={t(teamModelsOnly ? 'setup:answers.use.teamTitle' : 'setup:answers.use.title')}
+        helper={t(teamModelsOnly ? 'setup:answers.use.teamLead' : 'setup:answers.use.lead')}
       />
       <WizardSection
-        title={t(teamModelsOnly ? 'setup.answers.use.teamModelsLabel' : 'setup.answers.use.modelsLabel')}
+        title={t(teamModelsOnly ? 'setup:answers.use.teamModelsLabel' : 'setup:answers.use.modelsLabel')}
         titleId={modelsId}
         className="mt-0"
       >
@@ -208,10 +208,10 @@ function UseForm() {
             <Server aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" style={{ color: 'var(--color-accent-primary)' }} />
             <div className="flex flex-col gap-0.5">
               <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                {t('setup.answers.use.teamSharedTitle')}
+                {t('setup:answers.use.teamSharedTitle')}
               </span>
               <span className="text-xs leading-relaxed" style={{ color: 'var(--color-text-secondary)' }}>
-                {t('setup.answers.use.teamSharedDesc')}
+                {t('setup:answers.use.teamSharedDesc')}
               </span>
             </div>
           </div>
@@ -225,11 +225,11 @@ function UseForm() {
               <Server aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
               <div className="flex flex-col gap-0.5">
                 <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                  {t('setup.answers.use.teamModelsEmptyTitle')}
+                  {t('setup:answers.use.teamModelsEmptyTitle')}
                 </span>
               </div>
             </div>
-            <RowButton onClick={team.retry}>{t('setup.answers.tryAgain')}</RowButton>
+            <RowButton onClick={team.retry}>{t('setup:answers.tryAgain')}</RowButton>
           </div>
         ) : (
           /* DALTON-HOOK(dalton-setup): personal model choices when team sharing has no models */
@@ -240,9 +240,9 @@ function UseForm() {
                 value="claude_code"
                 checked={pickedModels === 'claude_code'}
                 onSelect={setModels}
-                mark={<BrandMark name="Claude Code" art={llmProviderArt(CLAUDE_CODE)} size="xs" />}
-                title={t('setup.answers.use.claudeCode')}
-                detail={t('setup.answers.use.claudeCodeDesc')}
+                mark={<AnswerTile><BrandMark name="Claude Code" art={llmProviderArt(CLAUDE_CODE)} className="h-5 w-5" /></AnswerTile>}
+                title={t('setup:answers.use.claudeCode')}
+                detail={t('setup:answers.use.claudeCodeDesc')}
               />
             )}
             <AnswerOption
@@ -251,8 +251,8 @@ function UseForm() {
               checked={pickedModels === 'subscription_or_key'}
               onSelect={setModels}
               mark={<MarkStack />}
-              title={t('setup.answers.use.subscription')}
-              detail={<MarkRow label={t('setup.answers.use.subscriptionDesc')} more={t('setup.answers.use.anyKey')} />}
+              title={t('setup:answers.use.subscription')}
+              detail={<MarkRow label={t('setup:answers.use.subscriptionDesc')} more={t('setup:answers.use.anyKey')} />}
             />
             {/* DALTON-HOOK(dalton-setup): personal choices wrapper ends here */}
             {serverModels && (
@@ -262,14 +262,14 @@ function UseForm() {
                 checked={pickedModels === 'langalpha_models'}
                 onSelect={setModels}
                 mark={<AnswerTile><Server aria-hidden="true" strokeWidth={1.5} /></AnswerTile>}
-                title={t('setup.answers.use.serverModels')}
-                detail={t('setup.answers.use.serverModelsDesc')}
+                title={t('setup:answers.use.serverModels')}
+                detail={t('setup:answers.use.serverModelsDesc')}
               />
             )}
           </div>
         )}
       </WizardSection>
-      <WizardSection title={t('setup.answers.use.whereLabel')} titleId={whereId}>
+      <WizardSection title={t('setup:answers.use.whereLabel')} titleId={whereId}>
         <div role="radiogroup" aria-labelledby={whereId} className="flex flex-col gap-2">
           <AnswerOption
             name={whereId}
@@ -277,24 +277,24 @@ function UseForm() {
             checked={pickedRunsOn === 'cloud'}
             onSelect={setRunsOn}
             mark={<AnswerTile>{inDesktopApp ? <Laptop aria-hidden="true" strokeWidth={1.5} /> : <Cloud aria-hidden="true" strokeWidth={1.5} />}</AnswerTile>}
-            title={t(inDesktopApp ? 'setup.answers.use.thisComputer' : 'setup.answers.use.serverComputer')}
+            title={t(inDesktopApp ? 'setup:answers.use.thisComputer' : 'setup:answers.use.serverComputer')}
             // DALTON-HOOK(brand-name): the desktop line names the product through the brand
-            detail={t(inDesktopApp ? 'setup.answers.use.thisComputerDesc' : 'setup.answers.use.serverComputerDesc', { brand: BRAND_NAME })}
+            detail={t(inDesktopApp ? 'setup:answers.use.thisComputerDesc' : 'setup:answers.use.serverComputerDesc', { brand: BRAND_NAME })}
           />
           {/* DALTON-HOOK(brand-name): the upstream hosted-service pitch stays out of Dalton builds */}
           {inDesktopApp && !isDaltonBuild && (
             <SetupNote icon={<Cloud />}>
-              {t('setup.answers.use.hostedPitch')}
+              {t('setup:answers.use.hostedPitch')}
               <span className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1">
                 {/* DALTON-HOOK(help): DESKTOP_DOWNLOAD_URL is null in Dalton builds */}
                 {DESKTOP_DOWNLOAD_URL && (
-                  <PitchLink href={DESKTOP_DOWNLOAD_URL}>{t('setup.answers.use.hostedApp')}</PitchLink>
+                  <PitchLink href={DESKTOP_DOWNLOAD_URL}>{t('setup:answers.use.hostedApp')}</PitchLink>
                 )}
-                <PitchLink href={HOSTED_OR_SELF_HOSTED_URL}>{t('setup.answers.use.hostedCompare')}</PitchLink>
+                <PitchLink href={HOSTED_OR_SELF_HOSTED_URL}>{t('setup:answers.use.hostedCompare')}</PitchLink>
               </span>
             </SetupNote>
           )}
-          {pickedRunsOn === 'cloud' && homeOnMac && <SetupNote>{t('setup.answers.use.homeStays')}</SetupNote>}
+          {pickedRunsOn === 'cloud' && homeOnMac && <SetupNote>{t('setup:answers.use.homeStays')}</SetupNote>}
           {showOwnComputerOption && !isDaltonBuild && (
             <AnswerOption
               name={whereId}
@@ -302,8 +302,8 @@ function UseForm() {
               checked={pickedRunsOn === 'own_computer'}
               onSelect={setRunsOn}
               mark={<AnswerTile><Laptop aria-hidden="true" strokeWidth={1.5} /></AnswerTile>}
-              title={t('setup.answers.use.own')}
-              detail={t('setup.answers.use.ownDesc')}
+              title={t('setup:answers.use.own')}
+              detail={t('setup:answers.use.ownDesc')}
             />
           )}
           {showOwnComputerOption && isDaltonBuild && (
@@ -317,7 +317,7 @@ function UseForm() {
                 aria-expanded={advancedOpen || pickedRunsOn === 'own_computer'}
               >
                 <ChevronRight className={`h-3 w-3 transition-transform ${(advancedOpen || pickedRunsOn === 'own_computer') ? 'rotate-90' : ''}`} />
-                {t('setup.answers.use.advancedComputer')}
+                {t('setup:answers.use.advancedComputer')}
               </button>
               {(advancedOpen || pickedRunsOn === 'own_computer') && (
                 <div className="mt-2">
@@ -327,8 +327,8 @@ function UseForm() {
                     checked={pickedRunsOn === 'own_computer'}
                     onSelect={setRunsOn}
                     mark={<Laptop aria-hidden="true" className="h-4 w-4" />}
-                    title={t('setup.answers.use.own')}
-                    detail={t('setup.answers.use.ownDesc')}
+                    title={t('setup:answers.use.own')}
+                    detail={t('setup:answers.use.ownDesc')}
                   />
                 </div>
               )}
@@ -337,10 +337,10 @@ function UseForm() {
           )}
         </div>
       </WizardSection>
-      {failed && <StepError>{t('setup.answers.use.saveFailed')}</StepError>}
+      {failed && <StepError>{t('setup:answers.use.saveFailed')}</StepError>}
       <SetupFooter
         primary={{
-          label: t('setup.continue'),
+          label: t('setup:continue'),
           onClick: submit,
           disabled: isLoading || !pickedModels || !pickedRunsOn || isUpdating,
           busy: isUpdating,

@@ -2,7 +2,7 @@ import React from 'react';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { cn } from '@/lib/utils';
 import { XCircle } from 'lucide-react';
-import { getDisplayName, getFailedToolCallLabel, isTaskTool } from './toolDisplayConfig';
+import { getDisplayName, getFailedToolCallLabel, isTaskTool } from './toolDisplayConfig'; // DALTON-HOOK(empty-turn-guard)
 import { ToolIcon } from './ToolIcon';
 import iconRobo from '../../../assets/img/icon-robo.png';
 import iconRoboSing from '../../../assets/img/icon-robo-sing.png';
@@ -34,7 +34,7 @@ function DetailPanel({ toolCallProcess, onOpenFile, onOpenSubagentTask }: Detail
   const toolArgs = toolCallProcess.toolCall?.args;
   const isTask = isTaskTool(toolName);
   const displayName = isTask
-    ? t('toolArtifact.subagentTask')
+    ? t('toolArtifact:subagentTask')
     : getDisplayName(toolName, t, toolArgs, { record: toolCallProcess, root });
   const subagentType = isTask ? ((toolCallProcess.toolCall?.args?.subagent_type as string) || 'general-purpose') : '';
   // Status only — a Task's reply exists from the moment it is dispatched, so

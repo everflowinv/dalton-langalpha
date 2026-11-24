@@ -161,7 +161,7 @@ export function FallbackModelsPicker({
         className="text-sm font-medium"
         style={{ color: "var(--color-text-primary)" }}
       >
-        {label ?? t("settings.fallbackModels")}
+        {label ?? t("settings:fallbackModels")}
       </label>
       <p
         className="text-xs leading-relaxed"
@@ -192,7 +192,7 @@ export function FallbackModelsPicker({
               onClick={() => handleRemove(m)}
               className="ml-0.5 hover:opacity-70"
               style={{ color: "var(--color-text-tertiary)" }}
-              aria-label={t("settings.removeModel", { model: chipLabel(m) })}
+              aria-label={t("settings:removeModel", { model: chipLabel(m) })}
             >
               &times;
             </button>
@@ -209,7 +209,7 @@ export function FallbackModelsPicker({
             color: "var(--color-accent-primary)",
           }}
         >
-          + {t("settings.addModels")}
+          + {t("settings:addModels")}
         </button>
       </div>
 
@@ -381,7 +381,7 @@ export function FallbackModelsPicker({
             ))}
             {filteredGroups.length === 0 && (
               <p className="px-3 py-2 text-xs" style={{ color: "var(--color-text-tertiary)" }}>
-                {t("settings.fallbackModelsEmpty")}
+                {t("settings:fallbackModelsEmpty")}
               </p>
             )}
           </div>

@@ -48,6 +48,7 @@ import { AnswersStrip, PickCard, RowButton, StepError, StepLoadFailed, StepLoadi
 import { effectiveModelsAnswer, SETUP_STEP_PATHS, type ModelsAnswer } from '../answers/setupSteps';
 import { useDaltonTeamModels, type DaltonTeamModelsState } from '../answers/useTeamModels';
 import { ProgressList, ProgressStep } from '../answers/ProgressSteps';
+import { withCopy } from '@/i18n';
 
 /**
  * The models every conversation and its Background work run on, from what the
@@ -305,10 +306,10 @@ function DefaultForm({
     profile: rawApiResponse?.dalton_profile,
     metadata: effectiveMetadata,
   });
-  const deploymentBackground = systemBackground ? t('settings.autoModel', { model: name(systemBackground) }) : undefined;
+  const deploymentBackground = systemBackground ? t('settings:autoModel', { model: name(systemBackground) }) : undefined;
   // DALTON-HOOK(standalone-core): Core Recommended card & Customize placeholder show "Follows primary model" when recommended.background is null
   const isCoreProfile = isDaltonBuild && isCoreDaltonProfile(rawApiResponse?.dalton_profile);
-  const backgroundFollowsPrimaryLabel = t('setup.answers.default.backgroundFollowsPrimary');
+  const backgroundFollowsPrimaryLabel = t('setup:answers.default.backgroundFollowsPrimary');
   const recommendedBackgroundLabel = resolveDaltonRecommendedBackgroundLabel(
     recommended.background,
     name,
@@ -332,14 +333,14 @@ function DefaultForm({
     || (!primary && (isDaltonBuild || effectiveModels === 'subscription_or_key'));
   const where = effectiveModels !== 'claude_code' || !isPlatformMode ? null
     : target?.kind === 'computer'
-      ? t('setup.answers.default.claudeCodeOn', { name: target.name })
-      : t('setup.answers.default.claudeCodeOnCloud');
+      ? t('setup:answers.default.claudeCodeOn', { name: target.name })
+      : t('setup:answers.default.claudeCodeOnCloud');
 
   // Every step checks the form is still up: leaving setup mid-way (Back,
   // Exit) ends the run, and no later write or navigation lands for it.
   const setUp = async () => {
     if (!primary && isDaltonBuild) return;
-    void import('@/pages/Onboarding/welcome/Welcome');
+    void withCopy(() => import('@/pages/Onboarding/welcome/Welcome'), ['dashboard', 'filePanel', 'mcp', 'plugins'])();
     setPhase('models');
     if (primary) {
       const auto = background === BACKGROUND_AUTO;
@@ -396,10 +397,10 @@ function DefaultForm({
     return (
       <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={TWEEN.enter} data-testid="setup-setting-up">
         <div ref={settingUpRef} tabIndex={-1} className="outline-none">
-          <WizardStepHeader titleId={headingId} title={t('setup.answers.default.settingUp.title')} />
+          <WizardStepHeader titleId={headingId} title={t('setup:answers.default.settingUp.title')} />
         </div>
         <p role="status" className="sr-only">
-          {phase === 'done' ? t('setup.answers.default.settingUp.done') : t(`setup.answers.default.settingUp.${phase}`)}
+          {phase === 'done' ? t('setup:answers.default.settingUp.done') : t(`setup:answers.default.settingUp.${phase}`)}
         </p>
         <div>
           <ProgressList>
@@ -410,7 +411,7 @@ function DefaultForm({
                   key={step}
                   n={i + 1}
                   state={index < at ? 'done' : index === at ? 'active' : 'todo'}
-                  title={t(`setup.answers.default.settingUp.${step}`)}
+                  title={t(`setup:answers.default.settingUp.${step}`)}
                 />
               );
             })}
@@ -424,7 +425,7 @@ function DefaultForm({
     <div ref={formRef} tabIndex={-1} className="outline-none">
       {/* DALTON-HOOK(dalton-setup): pass teamModelsAvailable so legacy answers normalize in AnswersStrip */}
       {flow.first && flow.answers && <AnswersStrip answers={flow.answers} teamModelsAvailable={team.available} />}
-      <WizardStepHeader titleId={headingId} title={t('setup.answers.default.title')} helper={t('setup.answers.default.lead')} />
+      <WizardStepHeader titleId={headingId} title={t('setup:answers.default.title')} helper={t('setup:answers.default.lead')} />
       {choices.list.length === 0 ? (
         /* DALTON-HOOK(dalton-setup): always prompt to contact admin & retry in Dalton when none of the 5 curated candidates is available */
         isDaltonBuild ? (
@@ -433,12 +434,12 @@ function DefaultForm({
             className="shell-box flex items-center justify-between gap-3 px-4 py-3"
           >
             <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
-              {t('setup.answers.default.teamModelsEmpty')}
+              {t('setup:answers.default.teamModelsEmpty')}
             </p>
-            <RowButton onClick={team.retry}>{t('setup.answers.tryAgain')}</RowButton>
+            <RowButton onClick={team.retry}>{t('setup:answers.tryAgain')}</RowButton>
           </div>
         ) : (
-          <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>{t('setup.answers.default.none')}</p>
+          <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>{t('setup:answers.default.none')}</p>
         )
       ) : (
         <div className="flex flex-col gap-6">
@@ -446,7 +447,7 @@ function DefaultForm({
             <section aria-labelledby={headingId + '-rec'} className="shell-box flex flex-col gap-3 px-4 py-3.5">
               <div className="flex items-center justify-between gap-3">
                 <h3 id={headingId + '-rec'} className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                  {t('setup.answers.default.recommendedSetup')}
+                  {t('setup:answers.default.recommendedSetup')}
                 </h3>
                 {!onRecommended && (
                   <Button
@@ -459,7 +460,7 @@ function DefaultForm({
                       setBackground(null);
                     }}
                   >
-                    {t('setup.answers.default.useRecommended')}
+                    {t('setup:answers.default.useRecommended')}
                   </Button>
                 )}
               </div>
@@ -468,7 +469,7 @@ function DefaultForm({
                 <dd className="flex flex-col gap-0.5">
                   <span className="font-medium" style={{ color: 'var(--color-text-primary)' }}>{name(recommended.primary)}</span>
                   {recommended.primaryWhy && (
-                    <span style={{ color: 'var(--color-text-secondary)' }}>{t(`setup.answers.default.why.${recommended.primaryWhy}`)}</span>
+                    <span style={{ color: 'var(--color-text-secondary)' }}>{t(`setup:answers.default.why.${recommended.primaryWhy}`)}</span>
                   )}
                 </dd>
                 {recommendedBackgroundLabel && (
@@ -485,7 +486,7 @@ function DefaultForm({
                       </span>
                       {recommended.backgroundWhy && (recommended.background || !isCoreProfile) && (
                         <span style={{ color: 'var(--color-text-secondary)' }}>
-                          {t(`setup.answers.default.why.${recommended.backgroundWhy}Background`, {
+                          {t(`setup:answers.default.why.${recommended.backgroundWhy}Background`, {
                             model: systemBackground ? name(systemBackground) : '',
                           })}
                         </span>
@@ -510,10 +511,10 @@ function DefaultForm({
                   <span className="flex min-w-0 flex-1 flex-col gap-1">
                     <span className="flex flex-wrap items-center gap-2 text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
                       {name(m)}
-                      {isRecommendedCard && <NameTag>{t('setup.answers.default.recommended')}</NameTag>}
+                      {isRecommendedCard && <NameTag>{t('setup:answers.default.recommended')}</NameTag>}
                       {isUnverifiedToolCalling && (
                         <span data-testid="setup-model-unverified-tool-calling">
-                          <NameTag>{t('setup.answers.default.toolCallingUnverified')}</NameTag>
+                          <NameTag>{t('setup:answers.default.toolCallingUnverified')}</NameTag>
                         </span>
                       )}
                     </span>
@@ -536,7 +537,7 @@ function DefaultForm({
               aria-expanded={customizing}
             >
               <ChevronRight className={cn('h-3 w-3 transition-transform', customizing && 'rotate-90')} />
-              {t('setup.answers.default.customize')}
+              {t('setup:answers.default.customize')}
             </button>
             <AnimatePresence initial={false}>
               {customizing && (
@@ -568,8 +569,8 @@ function DefaultForm({
                       preferLowEffort
                     />
                     <ModelSelector
-                      label={t('settings.modelTuning.fetchModel')}
-                      description={t('settings.modelTuning.fetchModelDesc')}
+                      label={t('settings:modelTuning.fetchModel')}
+                      description={t('settings:modelTuning.fetchModelDesc')}
                       value={fetchModel}
                       onChange={setFetchModel}
                       models={curatedCustomizeModels}
@@ -583,8 +584,8 @@ function DefaultForm({
                       hideEffortPicker
                     />
                     <ModelSelector
-                      label={t('settings.modelTuning.compactionModel')}
-                      description={t('settings.modelTuning.compactionModelDesc')}
+                      label={t('settings:modelTuning.compactionModel')}
+                      description={t('settings:modelTuning.compactionModelDesc')}
                       value={compactionModel}
                       onChange={setCompactionModel}
                       models={curatedCustomizeModels}
@@ -616,11 +617,11 @@ function DefaultForm({
           </div>
         </div>
       )}
-      {(update.isError || flow.finishFailed) && <StepError>{t('setup.answers.default.saveFailed')}</StepError>}
+      {(update.isError || flow.finishFailed) && <StepError>{t('setup:answers.default.saveFailed')}</StepError>}
       <SetupFooter
-        back={flow.back ? { label: t('setup.back'), onClick: flow.back } : null}
+        back={flow.back ? { label: t('setup:back'), onClick: flow.back } : null}
         primary={{
-          label: t('setup.continue'),
+          label: t('setup:continue'),
           onClick: () => void setUp(),
           disabled: update.isPending || flow.finishing || held,
           busy: update.isPending || flow.finishing,
@@ -642,9 +643,9 @@ function Ratings({ meta }: { meta: ModelMetadataEntry | undefined }) {
     <span className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
       {rated.map((key) => {
         const value = meta?.[key] ?? 0;
-        const label = t(`setup.answers.default.${key}`);
+        const label = t(`setup:answers.default.${key}`);
         return (
-          <span key={key} role="img" aria-label={t('setup.answers.default.rating', { label, value })} className="inline-flex items-center gap-1.5">
+          <span key={key} role="img" aria-label={t('setup:answers.default.rating', { label, value })} className="inline-flex items-center gap-1.5">
             <span aria-hidden>{label}</span>
             <span aria-hidden className="inline-flex gap-0.5">
               {[1, 2, 3, 4, 5].map((i) => (

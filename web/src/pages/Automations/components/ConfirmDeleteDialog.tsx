@@ -28,9 +28,9 @@ export default function ConfirmDeleteDialog({ open, onOpenChange, onConfirm, aut
       >
         <DialogHeader>
           {/* DALTON-HOOK(company-automations): delete confirms a move into the recycle bin. */}
-          <DialogTitle style={{ color: 'var(--color-text-primary)' }}>{t('automation.recycleTitle')}</DialogTitle>
+          <DialogTitle style={{ color: 'var(--color-text-primary)' }}>{t('automation:recycleTitle')}</DialogTitle>
           <DialogDescription style={{ color: 'var(--color-text-secondary)' }}>
-            {t('automation.recycleConfirm', { name: automationName })}
+            {t('automation:recycleConfirm', { name: automationName })}
           </DialogDescription>
         </DialogHeader>
         <DialogFooter className="gap-2 sm:gap-0">
@@ -46,7 +46,7 @@ export default function ConfirmDeleteDialog({ open, onOpenChange, onConfirm, aut
             onClick={onConfirm}
             disabled={loading}
           >
-            {loading ? t('automation.recycling') : t('automation.moveToRecycle')}
+            {loading ? t('automation:recycling') : t('automation:moveToRecycle')}
           </Button>
         </DialogFooter>
       </DialogContent>

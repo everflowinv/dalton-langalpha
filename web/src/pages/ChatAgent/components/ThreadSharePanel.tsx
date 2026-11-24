@@ -179,7 +179,7 @@ export function ThreadSharePanel({
       setTimeout(() => setCopied(false), 2000);
     }, (e) => {
       console.error('Failed to copy share link:', e);
-      toast({ description: t('filePanel.shareLinkFailed'), variant: 'destructive' });
+      toast({ description: t('filePanel:shareLinkFailed'), variant: 'destructive' });
     });
   }, [shareState, t]);
 

@@ -14,8 +14,8 @@ import type {
 import { mutationErrorMessage } from './errors';
 
 const METHOD_KEY: Record<string, string> = {
-  slack: 'automation.deliverToSlack',
-  discord: 'automation.deliverToDiscord',
+  slack: 'automation:deliverToSlack',
+  discord: 'automation:deliverToDiscord',
 };
 
 /** A delivery channel's name as the reader sees it. A DM address reads
@@ -27,7 +27,7 @@ export function deliveryMethodName(method: string, t: TFunction): string {
   if (method.includes(':') && isDmAddress(method)) {
     const app = platformOf(method) as string;
     const appKey = METHOD_KEY[app];
-    return t('automation.deliverToDm', { app: appKey ? t(appKey) : messagingAppName(app) });
+    return t('automation:deliverToDm', { app: appKey ? t(appKey) : messagingAppName(app) });
   }
   if (!method.includes(':')) return messagingAppName(method) ?? method;
   return method.charAt(0).toUpperCase() + method.slice(1);
@@ -89,7 +89,7 @@ export function deliveryEntryName(
   if (!namesChat(entry)) {
     const app = deliveryMethodName(entry, t);
     const lands = deliveryDefaultOf(options, entry)?.name;
-    return lands ? t('automation.deliverAppLandsIn', { app, name: lands }) : app;
+    return lands ? t('automation:deliverAppLandsIn', { app, name: lands }) : app;
   }
   return names?.get(entry) ?? deliveryMethodName(entry, t);
 }
@@ -131,12 +131,12 @@ export function deliveryOutcome(
 }
 
 const OUTCOME_KEY: Record<DeliveryOutcome, string> = {
-  sent: 'automation.deliveredVia',
-  fallback: 'automation.deliveredFallbackVia',
-  notice: 'automation.deliveredNoticeVia',
-  failed: 'automation.deliveryFailedVia',
+  sent: 'automation:deliveredVia',
+  fallback: 'automation:deliveredFallbackVia',
+  notice: 'automation:deliveredNoticeVia',
+  failed: 'automation:deliveryFailedVia',
   // DALTON-HOOK(execution-delivery-status): retrying label key & settle-window forwarding
-  retrying: 'automation.deliveryRetryingVia',
+  retrying: 'automation:deliveryRetryingVia',
 };
 
 /** One delivery as a phrase: "sent to #demo", "#demo delivery failed". */
@@ -182,8 +182,8 @@ export function deliveryProblems(err: unknown): DeliveryProblem[] {
 /** Why a workspace default wasn't set, in a line. */
 export function deliveryDefaultError(err: unknown, t: TFunction): string {
   const status = apiErrorStatus(err);
-  if (status === 409) return t('automation.deliveryDefaultBusy');
-  if (status === 503) return t('automation.deliveryDefaultUnavailable');
+  if (status === 409) return t('automation:deliveryDefaultBusy');
+  if (status === 503) return t('automation:deliveryDefaultUnavailable');
   const raw = problemList(err);
   const messages = Array.isArray(raw)
     ? raw.flatMap((p) => {
@@ -192,7 +192,7 @@ export function deliveryDefaultError(err: unknown, t: TFunction): string {
       })
     : [];
   if (messages.length) return messages.join(' ');
-  return mutationErrorMessage(err, t('automation.deliveryDefaultFailed'));
+  return mutationErrorMessage(err, t('automation:deliveryDefaultFailed'));
 }
 
 // DALTON-HOOK(execution-delivery-status): normalize and localize execution delivery outcomes & failure reasons
@@ -211,32 +211,32 @@ const CARD_LIMIT_UPGRADEABLE_CODES = new Set([
 ]);
 
 const DELIVERY_REASON_KEY: Record<string, string> = {
-  card_limit_exceeded: 'automation.deliveryReasonCardLimit',
-  card_element_limit_exceeded: 'automation.deliveryReasonCardElementLimit',
-  attempts_exhausted: 'automation.deliveryReasonAttemptsExhausted',
-  target_failed: 'automation.deliveryReasonTargetFailed',
-  delivery_failed: 'automation.deliveryReasonTargetFailed',
-  delivery_uncertain: 'automation.deliveryReasonUnconfirmed',
-  delivery_unconfirmed: 'automation.deliveryReasonUnconfirmed',
-  unknown: 'automation.deliveryReasonUnconfirmed',
-  in_flight: 'automation.deliveryReasonUnconfirmed',
-  partial: 'automation.deliveryReasonUnconfirmed',
-  gateway_restarted: 'automation.deliveryReasonUnconfirmed',
-  feishu_cards_not_supported: 'automation.deliveryReasonUnsupportedMedia',
-  images_not_supported: 'automation.deliveryReasonUnsupportedMedia',
-  image_placeholder_not_supported: 'automation.deliveryReasonUnsupportedMedia',
-  missing_card: 'automation.deliveryReasonEmptyContent',
-  missing_text: 'automation.deliveryReasonEmptyContent',
-  unsupported_platform: 'automation.deliveryReasonUnsupportedPlatform',
-  service_token_unconfigured: 'automation.deliveryReasonGatewayUnconfigured',
-  gateway_url_unconfigured: 'automation.deliveryReasonGatewayUnconfigured',
-  connecterror: 'automation.deliveryReasonGatewayUnavailable',
-  connecttimeout: 'automation.deliveryReasonGatewayUnavailable',
-  http_500: 'automation.deliveryReasonGatewayUnavailable',
-  http_502: 'automation.deliveryReasonGatewayUnavailable',
-  http_503: 'automation.deliveryReasonGatewayUnavailable',
-  http_504: 'automation.deliveryReasonGatewayUnavailable',
-  not_allowed: 'automation.deliveryReasonNotAllowed',
+  card_limit_exceeded: 'automation:deliveryReasonCardLimit',
+  card_element_limit_exceeded: 'automation:deliveryReasonCardElementLimit',
+  attempts_exhausted: 'automation:deliveryReasonAttemptsExhausted',
+  target_failed: 'automation:deliveryReasonTargetFailed',
+  delivery_failed: 'automation:deliveryReasonTargetFailed',
+  delivery_uncertain: 'automation:deliveryReasonUnconfirmed',
+  delivery_unconfirmed: 'automation:deliveryReasonUnconfirmed',
+  unknown: 'automation:deliveryReasonUnconfirmed',
+  in_flight: 'automation:deliveryReasonUnconfirmed',
+  partial: 'automation:deliveryReasonUnconfirmed',
+  gateway_restarted: 'automation:deliveryReasonUnconfirmed',
+  feishu_cards_not_supported: 'automation:deliveryReasonUnsupportedMedia',
+  images_not_supported: 'automation:deliveryReasonUnsupportedMedia',
+  image_placeholder_not_supported: 'automation:deliveryReasonUnsupportedMedia',
+  missing_card: 'automation:deliveryReasonEmptyContent',
+  missing_text: 'automation:deliveryReasonEmptyContent',
+  unsupported_platform: 'automation:deliveryReasonUnsupportedPlatform',
+  service_token_unconfigured: 'automation:deliveryReasonGatewayUnconfigured',
+  gateway_url_unconfigured: 'automation:deliveryReasonGatewayUnconfigured',
+  connecterror: 'automation:deliveryReasonGatewayUnavailable',
+  connecttimeout: 'automation:deliveryReasonGatewayUnavailable',
+  http_500: 'automation:deliveryReasonGatewayUnavailable',
+  http_502: 'automation:deliveryReasonGatewayUnavailable',
+  http_503: 'automation:deliveryReasonGatewayUnavailable',
+  http_504: 'automation:deliveryReasonGatewayUnavailable',
+  not_allowed: 'automation:deliveryReasonNotAllowed',
 };
 
 export function stripSyncedDeliveryExcerptSuffix(excerpt: string | null | undefined): string | null {
@@ -388,7 +388,7 @@ export function deliveryTargetName(
   }
   if (matchedAttempt) return deliveryAttemptName(matchedAttempt, t, names);
   const fallbackKey = addr || chan;
-  return fallbackKey ? deliveryMethodName(fallbackKey, t) : t('automation.delivery');
+  return fallbackKey ? deliveryMethodName(fallbackKey, t) : t('automation:delivery');
 }
 
 export function resolveExecutionDelivery(

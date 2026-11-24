@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import zhCN from '@/locales/zh-CN.json';
+import { zhCN, lookup } from '@/test/catalogs';
 import {
   EVERFLOW_DEFAULT_CAPABILITY_SET,
   CORE_DEFAULT_CAPABILITY_SET,
@@ -12,20 +12,10 @@ import {
   type DaltonSettingVisibilityContext,
 } from '../sections';
 
-function lookupKey(obj: Record<string, unknown>, key: string): string {
-  const parts = key.split('.');
-  let cur: unknown = obj;
-  for (const p of parts) {
-    if (cur && typeof cur === 'object' && p in (cur as Record<string, unknown>)) {
-      cur = (cur as Record<string, unknown>)[p];
-    } else {
-      return key;
-    }
-  }
-  return typeof cur === 'string' ? cur : key;
-}
-
-const tZh = (key: string) => lookupKey(zhCN as unknown as Record<string, unknown>, key);
+const tZh = (key: string) => {
+  const val = lookup(zhCN, key);
+  return typeof val === 'string' ? val : key;
+};
 
 afterEach(() => {
   vi.unstubAllEnvs();

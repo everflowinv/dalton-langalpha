@@ -72,11 +72,11 @@ export function useAutomationMutations() {
       if (apiErrorStatus(err) === 409) {
         const detail = mutationErrorMessage(err, '');
         toast({
-          description: detail ? t('automation.configUpdatedDetail', { detail }) : t('automation.configUpdated'),
+          description: detail ? t('automation:configUpdatedDetail', { detail }) : t('automation:configUpdated'),
         });
         return queryClient.invalidateQueries({ queryKey: queryKeys.automations.all });
       }
-      toast({ variant: 'destructive', description: mutationErrorMessage(err, t('automation.actionFailed')) });
+      toast({ variant: 'destructive', description: mutationErrorMessage(err, t('automation:actionFailed')) });
       // DALTON-HOOK(company-automations): a company 403 re-reads that company list and that task. A 409 re-reads the family.
       const companyId = apiErrorStatus(err) === 403 ? companyWriteId(variables) : null;
       if (companyId) return refreshCompanyAccess(queryClient, companyId);
@@ -105,7 +105,7 @@ export function useAutomationMutations() {
   // Delete, restore, and rollback say the row changed under the reader. Other writes keep the shared 409 copy.
   const versionConflict = (err: unknown, variables: unknown) => {
     if (apiErrorStatus(err) === 409) {
-      toast({ description: t('automation.versionConflict') });
+      toast({ description: t('automation:versionConflict') });
       return queryClient.invalidateQueries({ queryKey: queryKeys.automations.all });
     }
     return shared.onError(err, variables);
@@ -158,7 +158,7 @@ export function useAutomationMutations() {
     ...shared,
     mutationFn: (id: string) => automationApi.triggerAutomation(id),
     onSuccess: () => {
-      toast({ description: t('automation.runStarted') });
+      toast({ description: t('automation:runStarted') });
       return shared.onSuccess();
     },
   });

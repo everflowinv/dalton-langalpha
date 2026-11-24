@@ -40,9 +40,9 @@ export function asAutomations(tasks: readonly ManageTask[]): Automation[] {
 
 /** Script configuration status. The latest run's status is not a substitute. */
 export function scriptStatusLabelKey(task: ScriptAutomationRead): string | null {
-  if (task.paused_by_user || task.status === 'paused') return 'automation.statePaused';
-  if (task.status === 'disabled' || task.enabled === false) return 'automation.stateDisabled';
-  if (task.status === 'active' || task.enabled) return 'automation.statusActive';
+  if (task.paused_by_user || task.status === 'paused') return 'automation:statePaused';
+  if (task.status === 'disabled' || task.enabled === false) return 'automation:stateDisabled';
+  if (task.status === 'active' || task.enabled) return 'automation:statusActive';
   return null;
 }
 
@@ -50,22 +50,22 @@ export function scriptStatusLabelKey(task: ScriptAutomationRead): string | null 
 export function runStatusKey(status: string): string | null {
   switch (status) {
     case 'succeeded':
-      return 'automation.runSucceeded';
+      return 'automation:runSucceeded';
     case 'timed_out':
     case 'timeout':
-      return 'automation.runTimedOut';
+      return 'automation:runTimedOut';
     case 'failed':
-      return 'automation.runFailed';
+      return 'automation:runFailed';
     case 'running':
-      return 'automation.runRunning';
+      return 'automation:runRunning';
     case 'pending':
-      return 'automation.runQueued';
+      return 'automation:runQueued';
     case 'completed':
-      return 'automation.runCompleted';
+      return 'automation:runCompleted';
     case 'skipped':
-      return 'automation.runSkipped';
+      return 'automation:runSkipped';
     case 'waiting':
-      return 'automation.runWaiting';
+      return 'automation:runWaiting';
     default:
       return null;
   }

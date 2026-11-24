@@ -211,17 +211,17 @@ export default function MoreOptions({
     ...(form.llm_model
       ? [effortSummaryLabel ? `${formatModel(form.llm_model)} · ${effortSummaryLabel}` : formatModel(form.llm_model)]
       : effortSummaryLabel
-        ? [`${t('automation.defaultModel')} · ${effortSummaryLabel}`]
+        ? [`${t('automation:defaultModel')} · ${effortSummaryLabel}`]
         : []),
-    t(form.thread_strategy === 'continue' ? 'automation.continueExisting' : 'automation.newThreadEachRun'),
+    t(form.thread_strategy === 'continue' ? 'automation:continueExisting' : 'automation:newThreadEachRun'),
     ...(omitDelivery
       ? []
       : [
           form.delivery_methods.length
-            ? t('automation.deliversTo', { method: form.delivery_methods.map(entryName).join(', ') })
-            : t('automation.noDelivery'),
+            ? t('automation:deliversTo', { method: form.delivery_methods.map(entryName).join(', ') })
+            : t('automation:noDelivery'),
         ]),
-    t('automation.stopsAfter', { count: form.max_failures }),
+    t('automation:stopsAfter', { count: form.max_failures }),
   ].join(' · ');
 
   return (
@@ -234,7 +234,7 @@ export default function MoreOptions({
         onClick={() => onOpenChange(!open)}
       >
         <span className="automation-form-label inline-flex items-center gap-1">
-          {t('automation.moreOptions')}
+          {t('automation:moreOptions')}
           <ChevronRight className={cn('h-3.5 w-3.5 transition-transform', open && 'rotate-90')} />
         </span>
         {!open && <span className="automation-form-summary">{summary}</span>}
@@ -246,7 +246,7 @@ export default function MoreOptions({
             aria-label={t('thread.workspace')}
             selectedKey={form.place || null}
             onSelectionChange={(key) => patch('place', key == null ? '' : String(key))}
-            placeholder={t('automation.selectWorkspace')}
+            placeholder={t('automation:selectWorkspace')}
             className="max-w-sm"
           >
             <SelectTrigger>
@@ -266,29 +266,29 @@ export default function MoreOptions({
         </FormRow>
 
         {/* DALTON-HOOK(automation-model): per-automation model selector in MoreOptions */}
-        <FormRow label={t('automation.detailModel')}>
+        <FormRow label={t('automation:detailModel')}>
           <div className="max-w-sm">
             {!catalogReady ? (
               <p className="text-sm" style={{ color: 'var(--color-text-tertiary)' }} role="status">
-                {modelsLoading ? t('automation.modelCatalogLoading') : t('automation.modelCatalogUnavailable')}
+                {modelsLoading ? t('automation:modelCatalogLoading') : t('automation:modelCatalogUnavailable')}
               </p>
             ) : (
             // DALTON-HOOK(antigravity-series): pass seriesCatalog, rawMetadata & customModels into automation ModelSelector
             <ModelSelector
-              ariaLabel={t('automation.detailModel')}
+              ariaLabel={t('automation:detailModel')}
               nameOf={formatModel}
               // A saved model missing from the list is called unavailable only when the
               // keys say so; any other absence may be a request that failed, so it is
               // shown as the current setting rather than inviting a reset.
               missingLabel={(m) =>
                 keylessModels?.has(m)
-                  ? t('automation.modelUnavailableOption', { model: formatModel(m) })
-                  : t('automation.modelCurrentOption', { model: formatModel(m) })
+                  ? t('automation:modelUnavailableOption', { model: formatModel(m) })
+                  : t('automation:modelCurrentOption', { model: formatModel(m) })
               }
               value={form.llm_model ?? ''}
               onChange={handleModelChange}
               models={availableModels}
-              placeholder={t('automation.defaultModelOption')}
+              placeholder={t('automation:defaultModelOption')}
               payers={payers}
               metadata={metadata}
               seriesCatalog={seriesCatalog}
@@ -318,7 +318,7 @@ export default function MoreOptions({
                   patch('reasoning_effort', next);
                 }}
               >
-                <option value="">{t('automation.reasoningEffortDefault')}</option>
+                <option value="">{t('automation:reasoningEffortDefault')}</option>
                 {nonAntigravityEfforts.map((lv) => (
                   <option key={lv} value={lv}>
                     {effortLabelFor(t, lv) ?? lv}
@@ -329,20 +329,20 @@ export default function MoreOptions({
           </FormRow>
         )}
 
-        <FormRow label={t('automation.threadStrategy')} labelId={ids.thread}>
+        <FormRow label={t('automation:threadStrategy')} labelId={ids.thread}>
           <SegmentedControl
             labelledBy={ids.thread}
             value={form.thread_strategy}
             onChange={(strategy) => patch('thread_strategy', strategy)}
             options={[
-              { value: 'new', label: t('automation.newThreadEachRun') },
-              { value: 'continue', label: t('automation.continueExisting') },
+              { value: 'new', label: t('automation:newThreadEachRun') },
+              { value: 'continue', label: t('automation:continueExisting') },
             ]}
           />
         </FormRow>
 
         {/* DALTON-HOOK(company-automations): company edits do not offer personal delivery. */}
-        {!omitDelivery && <FormRow label={t('automation.delivery')} labelId={ids.delivery}>
+        {!omitDelivery && <FormRow label={t('automation:delivery')} labelId={ids.delivery}>
           {picker ? (
             <DeliveryPicker
               methods={form.delivery_methods}
@@ -365,7 +365,7 @@ export default function MoreOptions({
                   </li>
                 ))}
               </ul>
-              {!!delivery.error && <p className="automation-form-readout">{t('automation.deliveryOptionsUnavailable')}</p>}
+              {!!delivery.error && <p className="automation-form-readout">{t('automation:deliveryOptionsUnavailable')}</p>}
               <DeliveryProblems problems={deliveryProblems} nameOf={entryName} />
             </>
           ) : (
@@ -375,12 +375,12 @@ export default function MoreOptions({
                 value={deliveryChoice(form.delivery_methods)}
                 onChange={(choice) => patch('delivery_methods', choice === 'none' ? [] : [choice])}
                 options={[
-                  { value: 'none', label: t('automation.deliverNone') },
+                  { value: 'none', label: t('automation:deliverNone') },
                   { value: 'slack', label: deliveryMethodName('slack', t) },
                   { value: 'discord', label: deliveryMethodName('discord', t) },
                 ]}
               />
-              {!!delivery.error && <p className="automation-form-readout">{t('automation.deliveryOptionsUnavailable')}</p>}
+              {!!delivery.error && <p className="automation-form-readout">{t('automation:deliveryOptionsUnavailable')}</p>}
               <DeliveryProblems problems={deliveryProblems} nameOf={entryName} />
             </>
           )}
@@ -388,7 +388,7 @@ export default function MoreOptions({
         </FormRow>}
 
         {form.trigger_type === 'price' && (
-          <FormRow label={t('automation.priceRetrigger')} labelId={ids.retrigger}>
+          <FormRow label={t('automation:priceRetrigger')} labelId={ids.retrigger}>
             <SegmentedControl
               labelledBy={ids.retrigger}
               value={form.price_retrigger_mode}
@@ -399,7 +399,7 @@ export default function MoreOptions({
         )}
 
         {form.trigger_type === 'price' && form.price_retrigger_mode === 'recurring' && (
-          <FormRow label={t('automation.priceCooldown')} htmlFor={ids.cooldown}>
+          <FormRow label={t('automation:priceCooldown')} htmlFor={ids.cooldown}>
             <div className="flex items-center gap-2">
               <Input
                 id={ids.cooldown}
@@ -409,13 +409,13 @@ export default function MoreOptions({
                 onChange={(e) => patch('price_cooldown_minutes', e.target.value)}
                 className="w-28 font-mono tabular-nums"
               />
-              <span className="automation-form-joiner">{t('automation.minutes')}</span>
+              <span className="automation-form-joiner">{t('automation:minutes')}</span>
             </div>
-            <p className="automation-form-readout">{t('automation.cooldownHint')}</p>
+            <p className="automation-form-readout">{t('automation:cooldownHint')}</p>
           </FormRow>
         )}
 
-        <FormRow label={t('automation.maxFailures')} htmlFor={ids.failures}>
+        <FormRow label={t('automation:maxFailures')} htmlFor={ids.failures}>
           <CountInput
             id={ids.failures}
             value={form.max_failures}
@@ -431,7 +431,7 @@ export default function MoreOptions({
             id={ids.description}
             value={form.description}
             onChange={(e) => patch('description', e.target.value)}
-            placeholder={t('automation.descPlaceholder')}
+            placeholder={t('automation:descPlaceholder')}
           />
         </FormRow>
       </Disclosure>

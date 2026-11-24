@@ -165,8 +165,8 @@ export function DaltonChannelBindingsCard() {
 
     const label =
       platform === 'feishu'
-        ? t('settings.dalton.channelPlatformFeishu')
-        : t('settings.dalton.channelPlatformDiscord');
+        ? t('settings:dalton.channelPlatformFeishu')
+        : t('settings:dalton.channelPlatformDiscord');
 
     try {
       const created = await createDaltonChannelBindCode(platform);
@@ -174,7 +174,7 @@ export function DaltonChannelBindingsCard() {
       if (created.platform && created.platform !== platform) {
         setGenerateError((prev) => ({
           ...prev,
-          [platform]: t('settings.dalton.channelBindingsGenerateError', { platform: label }),
+          [platform]: t('settings:dalton.channelBindingsGenerateError', { platform: label }),
         }));
         return;
       }
@@ -186,7 +186,7 @@ export function DaltonChannelBindingsCard() {
       setGenerateError((prev) => ({
         ...prev,
         [platform]:
-          detail || t('settings.dalton.channelBindingsGenerateError', { platform: label }),
+          detail || t('settings:dalton.channelBindingsGenerateError', { platform: label }),
       }));
     } finally {
       inFlightRef.current[platform] = false;
@@ -199,8 +199,8 @@ export function DaltonChannelBindingsCard() {
   const handleCopy = async (platform: BindPlatform, command: string) => {
     const label =
       platform === 'feishu'
-        ? t('settings.dalton.channelPlatformFeishu')
-        : t('settings.dalton.channelPlatformDiscord');
+        ? t('settings:dalton.channelPlatformFeishu')
+        : t('settings:dalton.channelPlatformDiscord');
     try {
       await copyText(command);
       setCopiedPlatform(platform);
@@ -212,7 +212,7 @@ export function DaltonChannelBindingsCard() {
     } catch {
       setCopyError((prev) => ({
         ...prev,
-        [platform]: t('settings.dalton.channelBindingsCopyFailed', { platform: label }),
+        [platform]: t('settings:dalton.channelBindingsCopyFailed', { platform: label }),
       }));
     }
   };
@@ -227,37 +227,37 @@ export function DaltonChannelBindingsCard() {
 
   const singleChannelLabel =
     canFeishu && !canDiscord
-      ? t('settings.dalton.channelPlatformFeishu')
+      ? t('settings:dalton.channelPlatformFeishu')
       : !canFeishu && canDiscord
-        ? t('settings.dalton.channelPlatformDiscord')
+        ? t('settings:dalton.channelPlatformDiscord')
         : null;
   const cardTitle =
     canFeishu && !canDiscord
-      ? t('settings.dalton.channelBindingsLabelFeishu')
+      ? t('settings:dalton.channelBindingsLabelFeishu')
       : !canFeishu && canDiscord
-        ? t('settings.dalton.channelBindingsLabelDiscord')
-        : t('settings.dalton.channelBindingsLabel');
+        ? t('settings:dalton.channelBindingsLabelDiscord')
+        : t('settings:dalton.channelBindingsLabel');
   const cardDesc =
     canFeishu && !canDiscord
-      ? t('settings.dalton.channelBindingsDescFeishu')
+      ? t('settings:dalton.channelBindingsDescFeishu')
       : !canFeishu && canDiscord
-        ? t('settings.dalton.channelBindingsDescDiscord')
-        : t('settings.dalton.channelBindingsDesc');
+        ? t('settings:dalton.channelBindingsDescDiscord')
+        : t('settings:dalton.channelBindingsDesc');
   const refreshLabel = singleChannelLabel
-    ? t('settings.dalton.channelBindingsRefreshGeneric', { channel: singleChannelLabel })
-    : t('settings.dalton.channelBindingsRefresh');
+    ? t('settings:dalton.channelBindingsRefreshGeneric', { channel: singleChannelLabel })
+    : t('settings:dalton.channelBindingsRefresh');
   const loadingLabel = singleChannelLabel
-    ? t('settings.dalton.channelBindingsLoadingGeneric', { channel: singleChannelLabel })
-    : t('settings.dalton.channelBindingsLoading');
+    ? t('settings:dalton.channelBindingsLoadingGeneric', { channel: singleChannelLabel })
+    : t('settings:dalton.channelBindingsLoading');
   const retryLabel = singleChannelLabel
-    ? t('settings.dalton.channelBindingsRetryGeneric', { channel: singleChannelLabel })
-    : t('settings.dalton.channelBindingsRetry');
+    ? t('settings:dalton.channelBindingsRetryGeneric', { channel: singleChannelLabel })
+    : t('settings:dalton.channelBindingsRetry');
   const forbiddenLabel = singleChannelLabel
-    ? t('settings.dalton.channelBindingsForbiddenGeneric', { channel: singleChannelLabel })
-    : t('settings.dalton.channelBindingsForbidden');
+    ? t('settings:dalton.channelBindingsForbiddenGeneric', { channel: singleChannelLabel })
+    : t('settings:dalton.channelBindingsForbidden');
   const loadErrorLabel = singleChannelLabel
-    ? t('settings.dalton.channelBindingsLoadErrorGeneric', { channel: singleChannelLabel })
-    : t('settings.dalton.channelBindingsLoadError');
+    ? t('settings:dalton.channelBindingsLoadErrorGeneric', { channel: singleChannelLabel })
+    : t('settings:dalton.channelBindingsLoadError');
 
   return (
     <DaltonSettingsCard
@@ -277,7 +277,7 @@ export function DaltonChannelBindingsCard() {
       below={
         bindingsQuery.isError && bindings ? (
           <DaltonInlineNotice tone="warning" className="mt-2">
-            {t('settings.dalton.channelBindingsRefreshError')}
+            {t('settings:dalton.channelBindingsRefreshError')}
           </DaltonInlineNotice>
         ) : undefined
       }
@@ -312,8 +312,8 @@ export function DaltonChannelBindingsCard() {
         visiblePlatforms.map((platform) => {
           const label =
             platform === 'feishu'
-              ? t('settings.dalton.channelPlatformFeishu')
-              : t('settings.dalton.channelPlatformDiscord');
+              ? t('settings:dalton.channelPlatformFeishu')
+              : t('settings:dalton.channelPlatformDiscord');
           const state: DaltonChannelBindingState | undefined = bindings?.[platform];
           const knownLinked = typeof state?.linked === 'boolean' ? state.linked : null;
           const unavailable = knownLinked === null;
@@ -341,10 +341,10 @@ export function DaltonChannelBindingsCard() {
                       tone={unavailable ? 'neutral' : linked ? 'success' : 'neutral'}
                       label={
                         unavailable
-                          ? t('settings.dalton.channelBindingsUnavailable')
+                          ? t('settings:dalton.channelBindingsUnavailable')
                           : linked
-                            ? t('settings.dalton.channelBindingsLinked')
-                            : t('settings.dalton.channelBindingsNotLinked')
+                            ? t('settings:dalton.channelBindingsLinked')
+                            : t('settings:dalton.channelBindingsNotLinked')
                       }
                     />
                   </div>
@@ -355,14 +355,14 @@ export function DaltonChannelBindingsCard() {
                     >
                       {accountName && (
                         <span>
-                          {t('settings.dalton.channelBindingsAccountName', {
+                          {t('settings:dalton.channelBindingsAccountName', {
                             name: accountName,
                           })}
                         </span>
                       )}
                       {accountId && (
                         <span className="font-mono text-[11px]">
-                          {t('settings.dalton.channelBindingsAccountId', {
+                          {t('settings:dalton.channelBindingsAccountId', {
                             id: accountId,
                           })}
                         </span>
@@ -382,8 +382,8 @@ export function DaltonChannelBindingsCard() {
                     data-testid={`dalton-channel-generate-${platform}`}
                   >
                     {isGenerating
-                      ? t('settings.dalton.channelBindingsGenerating', { platform: label })
-                      : t('settings.dalton.channelBindingsGenerate', { platform: label })}
+                      ? t('settings:dalton.channelBindingsGenerating', { platform: label })
+                      : t('settings:dalton.channelBindingsGenerate', { platform: label })}
                   </Button>
                 )}
               </div>
@@ -402,7 +402,7 @@ export function DaltonChannelBindingsCard() {
                 >
                   {isExpired ? (
                     <div className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
-                      {t('settings.dalton.channelBindingsExpired', { platform: label })}
+                      {t('settings:dalton.channelBindingsExpired', { platform: label })}
                     </div>
                   ) : (
                     <>
@@ -428,8 +428,8 @@ export function DaltonChannelBindingsCard() {
                           )}
                           <span>
                             {isCopied
-                              ? t('settings.dalton.channelBindingsCopied', { platform: label })
-                              : t('settings.dalton.channelBindingsCopy', { platform: label })}
+                              ? t('settings:dalton.channelBindingsCopied', { platform: label })
+                              : t('settings:dalton.channelBindingsCopy', { platform: label })}
                           </span>
                         </Button>
                       </div>
@@ -437,12 +437,12 @@ export function DaltonChannelBindingsCard() {
                         <DaltonInlineNotice tone="warning">{copyError[platform]}</DaltonInlineNotice>
                       )}
                       <div className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
-                        {t('settings.dalton.channelBindingsExpires', {
+                        {t('settings:dalton.channelBindingsExpires', {
                           time: formatTimestamp(generated.expiresAt, locale),
                         })}
                       </div>
                       <div className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
-                        {t('settings.dalton.channelBindingsDmHint')}
+                        {t('settings:dalton.channelBindingsDmHint')}
                       </div>
                     </>
                   )}

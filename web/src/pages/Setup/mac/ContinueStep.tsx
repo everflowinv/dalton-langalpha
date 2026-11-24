@@ -13,7 +13,7 @@ import { useSetupFacts } from '../answers/useSetupFacts';
 import { leftItems } from './macRoute';
 import { ProgressList } from '../answers/ProgressSteps';
 
-const T = 'setup.continueMac';
+const T = 'setup:continueMac';
 
 /**
  * /setup/continue, in the Mac app, for setup a browser started: "Continue
@@ -70,7 +70,7 @@ function ContinueStepInner() {
 
   return (
     <div>
-      <StepKicker>{t(paired ? 'setup.thisMac.paired.title' : `${T}.kickerNotPaired`)}</StepKicker>
+      <StepKicker>{t(paired ? 'setup:thisMac.paired.title' : `${T}.kickerNotPaired`)}</StepKicker>
       <WizardStepHeader titleId={headingId} title={t(`${T}.title`)} helper={t(paired ? `${T}.leadPaired` : `${T}.leadNotPaired`)} />
       <ProgressList testId="continue-left">
         {items.map((item, i) => (
@@ -87,7 +87,7 @@ function ContinueStepInner() {
         ))}
       </ProgressList>
       <SetupNote>{t(`${T}.note`)}</SetupNote>
-      {saveFailed && <StepError>{t('setup.answers.saveFailed')}</StepError>}
+      {saveFailed && <StepError>{t('setup:answers.saveFailed')}</StepError>}
       <SetupFooter
         back={{ label: t(`${T}.inBrowser`), onClick: () => void choose('browser'), disabled: isUpdating }}
         primary={{ label: t(`${T}.here`), onClick: () => void choose('app'), disabled: isUpdating, busy: isUpdating }}

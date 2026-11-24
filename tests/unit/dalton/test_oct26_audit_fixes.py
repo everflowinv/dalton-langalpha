@@ -218,6 +218,8 @@ async def test_task_resume_on_workflow_redirects_to_run_workflow_resume() -> Non
 
     handler = create_autospec(_noop_handler)
 
+    from ptc_agent.config.agent import TaskAsk
+
     msg = await _handle_resume(
         mw,
         req,
@@ -227,6 +229,7 @@ async def test_task_resume_on_workflow_redirects_to_run_workflow_resume() -> Non
         description="resume workflow",
         prompt="continue",
         args={},
+        ask=TaskAsk(),
         parent_thread_id="64f22fbb",
         tool_call_id="tc-2",
         current_run_id="run-2",

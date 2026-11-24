@@ -44,8 +44,8 @@ def test_native_overlay_does_not_collide_with_upstream():
     native_models = native.get("models") or {}
     # DALTON-HOOK(llm-overlay): claude-fable-5-2{,-oauth} and gpt-6.2-{astra,sol}{,-oauth} graduated into
     # upstream; gemini-4-neon-{low,medium,high,xhigh}-oauth added; gemini-3.8-flash-{low,medium,high}-oauth,
-    # gemini-3-flash-oauth and grok-4.3-oauth removed (33).
-    assert len(native_models) == 33
+    # gemini-3-flash-oauth and grok-4.3-oauth removed; glm-5.4-plan and glm-5.4 added (35).
+    assert len(native_models) == 35
     overlap = set(native_models) & set(upstream_models)
     # The Grok subscription keys are Dalton's pinned routes: upstream grew
     # same-named entries on its own grok-oauth (api.x.ai) line, and the
@@ -2330,5 +2330,134 @@ def test_agent_config_dalton_merged_fallback_order(monkeypatch):
     ]
 
 
+def test_glm_5_4_plan_and_payg_overlay_resolution_pricing_and_clients(monkeypatch):
+    """Verify glm-5.4-plan (Coding Plan via z-ai-cn-coding) and glm-5.4 (pay-as-you-go via z-ai)
+    both resolve from native_overlay.json with expected modalities, pricing, notional rates,
+    clients, and availability in Standalone Core without changing 5.3 defaults."""
+    from langchain_anthropic import ChatAnthropic
+    from src.dalton.llm.notional_pricing import (
+        build_notional_price_index,
+        is_subscription_model,
+    )
+    from src.dalton.llm.overlay import _filter_generic_overlay
+    from src.llms.llm import create_llm
+    from src.llms.pricing_utils import resolve_pricing_identity
+    from src.llms.vendor.langchain_zai import ChatZai
 
+    monkeypatch.setattr(LLM, "_model_config", None)
+    mc = LLM.get_model_config()
+    dalton_meta = load_dalton_meta()
 
+    # 1) Coding Plan subscription entry: glm-5.4-plan -> z-ai-cn-coding
+    plan_cfg = mc.get_model_config("glm-5.4-plan")
+    assert plan_cfg is not None
+    assert plan_cfg["provider"] == "z-ai-cn-coding"
+    assert plan_cfg["model_id"] == "glm-5.4"
+    assert plan_cfg["visible"] is True
+    assert plan_cfg["context"] == 1000000
+    assert plan_cfg["parameters"]["max_tokens"] == 128000
+    assert plan_cfg["parameters"]["thinking"] == {"type": "enabled"}
+    # PDF is left out until the Coding Plan endpoint is verified to accept document blocks.
+    assert plan_cfg["input_modalities"] == ["text", "image"]
+    assert plan_cfg["intelligence"] >= mc.get_model_config("glm-5.3-plan")["intelligence"]
+    assert plan_cfg["reasoning"] == {
+        "efforts": ["low", "high", "max"],
+        "default": "low",
+        "write": "parameters.output_config.effort",
+        "on": {"parameters.thinking.type": "enabled"},
+    }
+
+    assert resolve_pricing_identity("glm-5.4-plan", billing_type="platform") == (
+        "z-ai-cn-coding",
+        "glm-5.4",
+    )
+    plan_card_direct = find_model_pricing("glm-5.4-plan")
+    plan_card_prov = find_model_pricing("glm-5.4", provider="z-ai-cn-coding")
+    for card in (plan_card_direct, plan_card_prov):
+        assert card is not None
+        assert card["input"] == 0.0
+        assert card["cached_input"] == 0.0
+        assert card["output"] == 0.0
+
+    assert dalton_meta["glm-5.4-plan"]["family"] == "zai-glm"
+    assert dalton_meta["glm-5.4-plan"]["billing"] == "subscription"
+    assert dalton_meta["glm-5.4-plan"]["notional_ref"] == "glm-5.4"
+    assert dalton_meta["glm-5.4-plan"]["tool_calling"] is True
+    assert is_subscription_model("glm-5.4-plan") is True
+
+    # 2) Pay-as-you-go entry: glm-5.4 -> z-ai (estimated at 2/3 of glm-5.3)
+    payg_cfg = mc.get_model_config("glm-5.4")
+    assert payg_cfg is not None
+    assert payg_cfg["provider"] == "z-ai"
+    assert payg_cfg["model_id"] == "glm-5.4"
+    assert payg_cfg["display_name"] == "GLM-5.4"
+    # Hidden until Z.AI opens the pay-as-you-go API; the catalog entry and estimate stay.
+    assert payg_cfg["visible"] is False
+    assert payg_cfg["context"] == 1000000
+    assert payg_cfg["parameters"]["max_tokens"] == 128000
+    assert payg_cfg["extra_body"] == {
+        "thinking": {"type": "enabled", "clear_thinking": False}
+    }
+    assert payg_cfg["input_modalities"] == ["text", "image"]
+    assert payg_cfg["intelligence"] >= mc.get_model_config("glm-5.3")["intelligence"]
+    assert payg_cfg["reasoning"] == {
+        "efforts": ["low", "high", "max"],
+        "default": "high",
+        "write": "extra_body.reasoning_effort",
+    }
+
+    assert resolve_pricing_identity("glm-5.4", billing_type="platform") == ("z-ai", "glm-5.4")
+    assert resolve_pricing_identity("glm-5.4", billing_type="byok") == ("z-ai", "glm-5.4")
+    payg_card_direct = find_model_pricing("glm-5.4")
+    payg_card_prov = find_model_pricing("glm-5.4", provider="z-ai")
+    for card in (payg_card_direct, payg_card_prov):
+        assert card is not None
+        assert card["input"] == pytest.approx(0.9333)
+        assert card["cached_input"] == pytest.approx(0.1733)
+        assert card["output"] == pytest.approx(2.9333)
+
+    zai_entries = [e for e in mc.manifest["models"]["z-ai"] if e.get("id") == "glm-5.4"]
+    assert len(zai_entries) == 1
+    assert "官方价格未公布，按 GLM-5.3 的 2/3 估算" in zai_entries[0]["description"]
+
+    assert dalton_meta["glm-5.4"]["family"] == "zai-glm"
+    assert dalton_meta["glm-5.4"]["billing"] == "cash"
+    assert dalton_meta["glm-5.4"]["tool_calling"] is True
+    assert is_subscription_model("glm-5.4") is False
+
+    # Notional price index resolves glm-5.4-plan -> glm-5.4 estimated rates without marking glm-5.4 as subscription
+    notional_idx = build_notional_price_index()
+    assert notional_idx["glm-5.4-plan"] == {
+        "input": 0.9333,
+        "output": 2.9333,
+        "cached_input": 0.1733,
+    }
+    assert "glm-5.4" not in notional_idx
+
+    # 3) Model metadata and client instantiation
+    metadata = mc.get_model_metadata()
+    assert metadata["glm-5.4-plan"]["provider"] == "z-ai-cn-coding"
+    assert metadata["glm-5.4-plan"]["access_type"] == "coding_plan"
+    assert metadata["glm-5.4-plan"]["pricing"] == {"input": 0.0, "output": 0.0}
+    # The pay-as-you-go entry is hidden until Z.AI opens its API, so it is not listed.
+    assert "glm-5.4" not in metadata
+
+    monkeypatch.setenv("ZAI_CN_CODING_API_KEY", "test-zai-coding-key")
+    monkeypatch.setenv("ZAI_API_KEY", "test-zai-api-key")
+    plan_client = create_llm("glm-5.4-plan")
+    assert isinstance(plan_client, ChatAnthropic)
+    assert plan_client.model == "glm-5.4"
+    assert plan_client.anthropic_api_url == "https://open.bigmodel.cn/api/anthropic"
+
+    payg_client = create_llm("glm-5.4")
+    assert isinstance(payg_client, ChatZai)
+    assert payg_client.model_name == "glm-5.4"
+    assert payg_client.profile["max_input_tokens"] == 1000000
+    assert payg_client.profile["max_output_tokens"] == 128000
+
+    # 4) Both entries survive Core generic overlay filtering (shared Everflow/Core architecture)
+    generic = _filter_generic_overlay(load_overlay_data(NATIVE_OVERLAY_PATH) or {})
+    assert "glm-5.4-plan" in generic["models"]
+    assert "glm-5.4" in generic["models"]
+    assert any(e["id"] == "glm-5.4" for e in generic["providers"]["models"]["z-ai-cn-coding"])
+    assert any(e["id"] == "glm-5.4" for e in generic["providers"]["models"]["z-ai"])
