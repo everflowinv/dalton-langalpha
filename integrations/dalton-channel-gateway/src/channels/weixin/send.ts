@@ -128,7 +128,7 @@ async function classifyAndThrowSendMessageError(
   }
   if (isLeaseSafetyMarginPauseError(err)) {
     throw new ChannelDeliveryError(err.message, {
-      outcome: "deferred",
+      outcome: "failed",
       code: "unavailable",
       retryable: true,
       denyCode: err.code,
@@ -194,7 +194,7 @@ async function classifyAndThrowUploadStageError(
   }
   if (isLeaseSafetyMarginPauseError(err)) {
     throw new ChannelDeliveryError(err.message, {
-      outcome: "deferred",
+      outcome: "failed",
       code: "unavailable",
       retryable: true,
       denyCode: err.code,

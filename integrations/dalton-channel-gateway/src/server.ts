@@ -16,7 +16,6 @@ import {
 import type { GatewayConfig } from "./config.js";
 import { AutomationNotificationService } from "./automation-notifications.js";
 import { DataTaskNotificationService } from "./data-task-notifications.js";
-import { DeferredDeliveryPoller } from "./deferred-delivery-poller.js";
 import { handleOpsAlert } from "./ops-alerts.js";
 import { DeliveryService } from "./delivery-service.js";
 import {
@@ -41,7 +40,6 @@ export interface GatewayApp {
   readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
   readonly deliveryService: DeliveryService;
   readonly dataTaskNotifications: DataTaskNotificationService;
-  readonly deferredDeliveryPoller?: DeferredDeliveryPoller;
   readonly agentRoutes: AgentRoutesHandler;
   readonly orchestrator: ChannelGatewayOrchestrator;
   readonly leaseManager?: GatewayLeaseManager;
@@ -199,13 +197,16 @@ export function createGatewayApp(options: {
   adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
   backoffDelayFn?: (ms: number) => Promise<void>;
   busyThreadMaxWaitMs?: number;
+  collectCleanupLateRecheckMs?: number;
   nowFn?: () => number;
   leaseManager?: GatewayLeaseManager;
   enableLease?: boolean;
   leaseTtlSeconds?: number;
   leaseHeartbeatIntervalMs?: number;
   leaseAcquireRetryMs?: number;
-  deferredDeliveryPollIntervalMs?: number;
+  retryDelayFn?: (ms: number, signal?: AbortSignal) => Promise<boolean>;
+  preflightRetryMaxElapsedMs?: number;
+  claim503MaxAttempts?: number;
   onLeaseLost?: (reason: string, error?: unknown) => void;
 }): GatewayApp {
   const { config, backend, adapters } = options;
@@ -220,11 +221,22 @@ export function createGatewayApp(options: {
     wxInitial.setBackendClient(backend);
   }
 
-  const deliveryService = new DeliveryService({ backend, adapters });
+  const deliveryService = new DeliveryService({
+    backend,
+    adapters,
+    retryDelayFn: options.retryDelayFn,
+    preflightRetryMaxElapsedMs: options.preflightRetryMaxElapsedMs,
+    claim503MaxAttempts: options.claim503MaxAttempts,
+    nowFn: options.nowFn,
+  });
   const dataTaskNotifications = new DataTaskNotificationService({
     backend,
     adapters,
     mode: config.mode,
+    retryDelayFn: options.retryDelayFn,
+    preflightRetryMaxElapsedMs: options.preflightRetryMaxElapsedMs,
+    claim503MaxAttempts: options.claim503MaxAttempts,
+    nowFn: options.nowFn,
   });
   const automationNotifications = new AutomationNotificationService(
     backend,
@@ -251,6 +263,7 @@ export function createGatewayApp(options: {
     statusFeedback: config.statusFeedback,
     backoffDelayFn: options.backoffDelayFn,
     busyThreadMaxWaitMs: options.busyThreadMaxWaitMs,
+    collectCleanupLateRecheckMs: options.collectCleanupLateRecheckMs,
     nowFn: options.nowFn,
   });
 
@@ -258,15 +271,12 @@ export function createGatewayApp(options: {
     config.mode !== "outgoing" && options.enableLease !== false;
   let leaseReady = !shouldUseLease;
   let stopInProgress = false;
-  let deferredDeliveryPoller: DeferredDeliveryPoller | undefined;
   const handleFatalLeaseLost = (reason: string, error?: unknown): void => {
     // Decision #1: synchronously abort ALL in-flight sends, uploads, QR, collect uploads,
-    // deferred replay polling, and long-polling loops BEFORE waiting on any async teardown,
+    // in-delivery retry waits, and long-polling loops BEFORE waiting on any async teardown,
     // so nothing can still hit iLink.
     leaseReady = false;
-    deferredDeliveryPoller?.stop();
     deliveryService.setStartupBlocked(true);
-    deliveryService.clearDeferredPayloads();
     dataTaskNotifications.setStartupBlocked(true);
     backend.setGatewayEpoch?.(null);
     orchestrator.abortAllActiveCollectUploads();
@@ -327,21 +337,6 @@ export function createGatewayApp(options: {
     });
     wxInitial?.setLeaseManager?.(leaseManager);
   }
-
-  deferredDeliveryPoller =
-    config.mode !== "outgoing"
-      ? new DeferredDeliveryPoller({
-          backend,
-          deliveryService,
-          dataTaskNotifications,
-          automationNotifications,
-          leaseManager,
-          intervalMs: options.deferredDeliveryPollIntervalMs,
-          onFallbackReplay: async (row) => {
-            await orchestrator.replayDeferredFallbackRow(row);
-          },
-        })
-      : undefined;
 
   const server = createServer(async (req, res) => {
     try {
@@ -707,7 +702,6 @@ export function createGatewayApp(options: {
     adapters,
     deliveryService,
     dataTaskNotifications,
-    deferredDeliveryPoller,
     agentRoutes,
     orchestrator,
     leaseManager,
@@ -715,7 +709,8 @@ export function createGatewayApp(options: {
       let startupRecoverySnapshot = null;
       if (config.mode !== "outgoing") {
         // D1 / §3.5 strict startup ordering:
-        // Block I-6 claims while HTTP /health binds, lease is acquired, and mode=startup recovery snapshot completes.
+        // Block I-6 claims while HTTP /health binds, lease is acquired, mode=startup recovery
+        // snapshot completes, and initial managed account snapshots are applied (R4 #5).
         deliveryService.setStartupBlocked(true);
         dataTaskNotifications.setStartupBlocked(true);
       }
@@ -735,6 +730,13 @@ export function createGatewayApp(options: {
           // Complete mode=startup recovery snapshot BEFORE starting any long-polling or I-6 claims.
           startupRecoverySnapshot =
             await orchestrator.fetchStartupRecoverySnapshot();
+          // R4 #5 (Codex #9): Apply initial managed account snapshots BEFORE lifting write
+          // restrictions so no outbound request can run before the first snapshot is applied.
+          for (const adapter of adapters.values()) {
+            if (adapter.isConfigured() || adapter.platform === "weixin") {
+              await adapter.prepareStartupSnapshot?.();
+            }
+          }
           leaseReady = true;
           deliveryService.setStartupBlocked(false);
           dataTaskNotifications.setStartupBlocked(false);
@@ -743,9 +745,7 @@ export function createGatewayApp(options: {
               await adapter.start();
             }
           }
-          deferredDeliveryPoller?.start();
         } catch (err) {
-          deferredDeliveryPoller?.stop();
           if (server.listening) {
             await new Promise<void>((resolveClose) => {
               server.close(() => resolveClose());
@@ -756,15 +756,6 @@ export function createGatewayApp(options: {
         if (startupRecoverySnapshot) {
           // Dispatch long-running recovery streams/tasks in background after HTTP listen & adapters are ready.
           orchestrator.dispatchStartupRecoverySnapshot(startupRecoverySnapshot);
-          if (
-            deferredDeliveryPoller &&
-            Array.isArray(startupRecoverySnapshot.deferred_deliveries) &&
-            startupRecoverySnapshot.deferred_deliveries.length > 0
-          ) {
-            void deferredDeliveryPoller.replayRows(
-              startupRecoverySnapshot.deferred_deliveries,
-            );
-          }
         }
       }
       const addr = server.address() as AddressInfo;
@@ -773,8 +764,8 @@ export function createGatewayApp(options: {
     async stop(): Promise<void> {
       stopInProgress = true;
       leaseReady = false;
-      deferredDeliveryPoller?.stop();
-      deliveryService.clearDeferredPayloads();
+      deliveryService.abortAllRetries();
+      dataTaskNotifications.abortAllRetries();
       if (config.mode !== "outgoing") {
         orchestrator.abortAllActiveCollectUploads();
         await orchestrator.stopAllWatches();

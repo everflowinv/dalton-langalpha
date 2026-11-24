@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
   type BackendClient,
   BackendHttpError,
+  type I6AuthorizeAndClaimRequest,
   type I7DeliveriesProgressRequest,
   type I7DeliveriesProgressResponse,
   type WeixinPreflightAuthorizedData,
@@ -11,6 +12,15 @@ import {
   ChannelDeliveryError,
   type SendCardImageInput,
 } from "./channels/adapter.js";
+import {
+  abortableRetrySleep,
+  DELIVERY_CLAIM_503_INITIAL_DELAY_MS,
+  DELIVERY_CLAIM_503_MAX_ATTEMPTS,
+  DELIVERY_CLAIM_503_MAX_DELAY_MS,
+  WEIXIN_PREFLIGHT_RETRY_INITIAL_DELAY_MS,
+  WEIXIN_PREFLIGHT_RETRY_MAX_DELAY_MS,
+  WEIXIN_PREFLIGHT_RETRY_MAX_ELAPSED_MS,
+} from "./delivery-service.js";
 import { isStaleGatewayEpochError } from "./gateway-lease.js";
 import type {
   DataTaskAuthorizePlanResponse,
@@ -23,6 +33,10 @@ import {
   createSequentialQueue,
   type SequentialQueue,
 } from "./shared/keyed-queue.js";
+import {
+  createSubsystemLogger,
+  extractSafeLogErrorFields,
+} from "./shared/logger.js";
 import type { ChannelPlatform } from "./types.js";
 
 const MAX_ARTIFACT_BYTES = 20 * 1024 * 1024;
@@ -36,8 +50,6 @@ const RECOGNIZED_DELIVERY_STATUSES = new Set<string>([
   "partial",
   "failed",
   "unknown",
-  "deferred",
-  "partial_deferred",
 ]);
 const SKIP_CODES = new Set([
   "dalton_disabled",
@@ -92,19 +104,14 @@ function safeBackendErrorMessage(err: unknown, fallback: string): string {
 }
 
 function classifyAdapterError(err: unknown): {
-  outcome: "failed" | "unknown" | "deferred";
+  outcome: "failed" | "unknown";
   code: string;
   denyCode?: string;
   message: string;
 } {
   if (err instanceof ChannelDeliveryError) {
     return {
-      outcome:
-        err.outcome === "unknown"
-          ? "unknown"
-          : err.outcome === "deferred"
-            ? "deferred"
-            : "failed",
+      outcome: err.outcome === "unknown" ? "unknown" : "failed",
       code: err.code,
       denyCode: err.denyCode,
       message: err.message,
@@ -128,21 +135,6 @@ type ValidatedDataTaskClaim =
       weixinAccountId: string | null;
       weixinContextToken: string | null;
       deliveryAttempt?: number;
-      sentChunks: number;
-      platformMessageIds: string[];
-      filesStatus: Array<{
-        path: string;
-        status: "sent" | "linked" | "failed" | "unknown";
-        reason: string | null;
-      }>;
-      deliveredSegments: unknown[];
-    }
-  | {
-      kind: "deferred";
-      status: "deferred" | "partial_deferred";
-      code: string;
-      message: string;
-      platformMessageIds: string[];
     }
   | {
       kind: "already_completed";
@@ -247,41 +239,6 @@ function validateDataTaskClaimResponse(
       rawClaim.delivery_attempt > 0
         ? rawClaim.delivery_attempt
         : undefined;
-    const sentChunks =
-      typeof rawClaim.sent_chunks === "number" &&
-      Number.isInteger(rawClaim.sent_chunks) &&
-      rawClaim.sent_chunks >= 0
-        ? rawClaim.sent_chunks
-        : 0;
-    const platformMessageIds = Array.isArray(rawClaim.platform_message_ids)
-      ? rawClaim.platform_message_ids.filter(
-          (id): id is string => typeof id === "string" && id.length > 0,
-        )
-      : [];
-    const filesStatus: Array<{
-      path: string;
-      status: "sent" | "linked" | "failed" | "unknown";
-      reason: string | null;
-    }> = Array.isArray(rawClaim.files_status)
-      ? rawClaim.files_status
-          .filter((entry): entry is Record<string, unknown> => isPlainRecord(entry))
-          .filter(
-            (entry) =>
-              typeof entry.path === "string" &&
-              (entry.status === "sent" ||
-                entry.status === "linked" ||
-                entry.status === "failed" ||
-                entry.status === "unknown"),
-          )
-          .map((entry) => ({
-            path: entry.path as string,
-            status: entry.status as "sent" | "linked" | "failed" | "unknown",
-            reason: typeof entry.reason === "string" ? entry.reason : null,
-          }))
-      : [];
-    const deliveredSegments = Array.isArray(rawClaim.delivered_segments)
-      ? [...rawClaim.delivered_segments]
-      : [];
     const weixinAccountId =
       typeof rawClaim.weixin_account_id === "string" &&
       rawClaim.weixin_account_id.trim().length > 0
@@ -297,55 +254,6 @@ function validateDataTaskClaimResponse(
       weixinAccountId,
       weixinContextToken: rawClaim.weixin_context_token,
       ...(deliveryAttempt !== undefined ? { deliveryAttempt } : {}),
-      sentChunks,
-      platformMessageIds,
-      filesStatus,
-      deliveredSegments,
-    };
-  }
-
-  if (claimStatus === "deferred") {
-    if (rawClaim.status !== "deferred" && rawClaim.status !== "partial_deferred") {
-      return {
-        kind: "invalid",
-        reason: "I-6 deferred response has missing or unrecognized status.",
-      };
-    }
-    if (
-      rawClaim.platform !== undefined &&
-      rawClaim.platform !== expected.platform
-    ) {
-      return {
-        kind: "invalid",
-        reason: "I-6 deferred platform does not match the authorized plan.",
-      };
-    }
-    if (
-      rawClaim.target_address !== undefined &&
-      rawClaim.target_address !== expected.canonicalTargetAddress
-    ) {
-      return {
-        kind: "invalid",
-        reason: "I-6 deferred target_address does not match the authorized plan.",
-      };
-    }
-    const platformMessageIds = Array.isArray(rawClaim.platform_message_ids)
-      ? rawClaim.platform_message_ids.filter(
-          (id): id is string => typeof id === "string" && id.length > 0,
-        )
-      : [];
-    return {
-      kind: "deferred",
-      status: rawClaim.status,
-      code:
-        typeof rawClaim.code === "string" && rawClaim.code.trim().length > 0
-          ? rawClaim.code
-          : "delivery_deferred",
-      message:
-        typeof rawClaim.message === "string"
-          ? rawClaim.message
-          : "Delivery is deferred and not yet due for retry.",
-      platformMessageIds,
     };
   }
 
@@ -487,6 +395,10 @@ export interface DataTaskNotificationServiceOptions {
   adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
   mode?: "incoming" | "outgoing";
   queueTaskTimeoutMs?: number;
+  retryDelayFn?: (ms: number, signal?: AbortSignal) => Promise<boolean>;
+  preflightRetryMaxElapsedMs?: number;
+  claim503MaxAttempts?: number;
+  nowFn?: () => number;
 }
 
 export interface ExecutionStateTracker {
@@ -509,64 +421,241 @@ export class DataTaskNotificationService {
   private readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
   private readonly mode: "incoming" | "outgoing";
   private readonly queue: SequentialQueue;
+  private readonly logger = createSubsystemLogger("data-task-notifications");
+  private readonly retryDelayFn: (
+    ms: number,
+    signal?: AbortSignal,
+  ) => Promise<boolean>;
+  private readonly preflightRetryMaxElapsedMs: number;
+  private readonly claim503MaxAttempts: number;
+  private readonly nowFn: () => number;
+  private retryAbortController = new AbortController();
   private startupBlocked = false;
 
   constructor(options: DataTaskNotificationServiceOptions) {
     this.backend = options.backend;
     this.adapters = options.adapters;
     this.mode = options.mode ?? "incoming";
+    this.retryDelayFn = options.retryDelayFn ?? abortableRetrySleep;
+    this.preflightRetryMaxElapsedMs =
+      options.preflightRetryMaxElapsedMs ??
+      WEIXIN_PREFLIGHT_RETRY_MAX_ELAPSED_MS;
+    this.claim503MaxAttempts =
+      options.claim503MaxAttempts ?? DELIVERY_CLAIM_503_MAX_ATTEMPTS;
+    this.nowFn = options.nowFn ?? (() => Date.now());
     this.queue = createSequentialQueue({
-      taskTimeoutMs: options.queueTaskTimeoutMs ?? 180_000,
+      taskTimeoutMs:
+        options.queueTaskTimeoutMs ??
+        Math.max(180_000, this.preflightRetryMaxElapsedMs + 30_000),
     });
   }
 
   setStartupBlocked(blocked: boolean): void {
     this.startupBlocked = blocked;
+    if (blocked) {
+      this.abortAllRetries();
+    }
+  }
+
+  abortAllRetries(): void {
+    this.retryAbortController.abort();
+    this.retryAbortController = new AbortController();
+  }
+
+  private async claimDeliveryWith503Retry(
+    req: I6AuthorizeAndClaimRequest,
+  ): Promise<unknown> {
+    const signal = this.retryAbortController.signal;
+    let delayMs = DELIVERY_CLAIM_503_INITIAL_DELAY_MS;
+    for (let attempt = 1; attempt <= this.claim503MaxAttempts; attempt += 1) {
+      if (this.startupBlocked || signal.aborted) {
+        throw new BackendHttpError(
+          "I-6 authorize-and-claim aborted due to lease loss or shutdown",
+          503,
+          null,
+        );
+      }
+      try {
+        return await this.backend.authorizeAndClaimDelivery(req, { signal });
+      } catch (err) {
+        if (isStaleGatewayEpochError(err)) {
+          throw err;
+        }
+        const isRetryable503 =
+          err instanceof BackendHttpError && err.status === 503;
+        if (!isRetryable503 || attempt >= this.claim503MaxAttempts) {
+          throw err;
+        }
+        this.logger.warn(
+          "Data-task I-6 authorize-and-claim returned 503; retrying in delivery",
+          {
+            delivery_key: req.delivery_key,
+            platform: req.platform ?? null,
+            attempt,
+            delay_ms: delayMs,
+            ...extractSafeLogErrorFields(err),
+          },
+        );
+        const slept = await this.retryDelayFn(delayMs, signal);
+        if (!slept || this.startupBlocked || signal.aborted) {
+          throw err;
+        }
+        delayMs = Math.min(delayMs * 2, DELIVERY_CLAIM_503_MAX_DELAY_MS);
+      }
+    }
+    throw new BackendHttpError("I-6 authorize-and-claim failed (503)", 503, null);
   }
 
   private async runWeixinPreflight(
     deliveryKey: string,
     deliveryAttempt: number,
     chunkIndex: number,
+    signal?: AbortSignal,
   ): Promise<WeixinPreflightAuthorizedData> {
-    const pf = await this.backend.preflightWeixinSend(deliveryKey, {
-      delivery_attempt: deliveryAttempt,
-      chunk_index: chunkIndex,
-    });
-    if (pf.authorized) {
-      return pf;
-    }
-    if (pf.deny_code === "source_generation_unknown") {
-      throw new ChannelDeliveryError(
-        pf.message ?? "Weixin delivery source generation is unknown.",
-        {
-          outcome: "unknown",
+    const combinedSignal = signal
+      ? AbortSignal.any([signal, this.retryAbortController.signal])
+      : this.retryAbortController.signal;
+    const startedAt = this.nowFn();
+    let accumulatedDelayMs = 0;
+    let delayMs = WEIXIN_PREFLIGHT_RETRY_INITIAL_DELAY_MS;
+    let attempt = 0;
+    const getRemainingBudgetMs = (): number =>
+      this.preflightRetryMaxElapsedMs -
+      Math.max(this.nowFn() - startedAt, accumulatedDelayMs);
+
+    for (;;) {
+      attempt += 1;
+      if (this.startupBlocked || combinedSignal.aborted) {
+        throw new ChannelDeliveryError("Weixin preflight aborted", {
+          outcome: "failed",
           code: "unavailable",
+          retryable: false,
+        });
+      }
+
+      let pf: Awaited<ReturnType<BackendClient["preflightWeixinSend"]>>;
+      try {
+        pf = await this.backend.preflightWeixinSend(
+          deliveryKey,
+          {
+            delivery_attempt: deliveryAttempt,
+            chunk_index: chunkIndex,
+          },
+          { signal: combinedSignal },
+        );
+      } catch (err) {
+        if (isStaleGatewayEpochError(err)) {
+          throw err;
+        }
+        if (this.startupBlocked || combinedSignal.aborted) {
+          throw new ChannelDeliveryError("Weixin preflight aborted", {
+            outcome: "failed",
+            code: "unavailable",
+            retryable: false,
+          });
+        }
+        const isRetryable503 =
+          err instanceof BackendHttpError && err.status === 503;
+        if (!isRetryable503) {
+          throw err;
+        }
+        const remainingMs = getRemainingBudgetMs();
+        if (remainingMs <= 0) {
+          throw new ChannelDeliveryError(
+            "Weixin preflight remained temporarily unavailable (503).",
+            {
+              outcome: "failed",
+              code: "unavailable",
+              retryable: false,
+              denyCode: "roster_lookup_error",
+            },
+          );
+        }
+        const waitMs = Math.min(delayMs, remainingMs);
+        this.logger.warn(
+          "Data-task Weixin preflight returned 503; retrying in delivery",
+          {
+            delivery_key: deliveryKey,
+            chunk_index: chunkIndex,
+            attempt,
+            delay_ms: waitMs,
+            ...extractSafeLogErrorFields(err),
+          },
+        );
+        const slept = await this.retryDelayFn(waitMs, combinedSignal);
+        accumulatedDelayMs += waitMs;
+        if (!slept || this.startupBlocked || combinedSignal.aborted) {
+          throw new ChannelDeliveryError("Weixin preflight aborted", {
+            outcome: "failed",
+            code: "unavailable",
+            retryable: false,
+          });
+        }
+        delayMs = Math.min(delayMs * 2, WEIXIN_PREFLIGHT_RETRY_MAX_DELAY_MS);
+        continue;
+      }
+
+      if (pf.authorized) {
+        return pf;
+      }
+      if (pf.deny_code === "source_generation_unknown") {
+        throw new ChannelDeliveryError(
+          pf.message ?? "Weixin delivery source generation is unknown.",
+          {
+            outcome: "unknown",
+            code: "unavailable",
+            retryable: false,
+            denyCode: pf.deny_code,
+          },
+        );
+      }
+      if (pf.retryable === true || pf.decision === "defer") {
+        const remainingMs = getRemainingBudgetMs();
+        if (remainingMs <= 0) {
+          throw new ChannelDeliveryError(
+            pf.message ??
+              `Weixin send preflight remained unavailable (${pf.deny_code}).`,
+            {
+              outcome: "failed",
+              code: "unavailable",
+              retryable: false,
+              denyCode: pf.deny_code,
+            },
+          );
+        }
+        const waitMs = Math.min(delayMs, remainingMs);
+        this.logger.warn(
+          "Data-task Weixin preflight returned retryable denial; retrying in delivery",
+          {
+            delivery_key: deliveryKey,
+            chunk_index: chunkIndex,
+            attempt,
+            delay_ms: waitMs,
+            error_code: pf.deny_code,
+          },
+        );
+        const slept = await this.retryDelayFn(waitMs, combinedSignal);
+        accumulatedDelayMs += waitMs;
+        if (!slept || this.startupBlocked || combinedSignal.aborted) {
+          throw new ChannelDeliveryError("Weixin preflight aborted", {
+            outcome: "failed",
+            code: "unavailable",
+            retryable: false,
+          });
+        }
+        delayMs = Math.min(delayMs * 2, WEIXIN_PREFLIGHT_RETRY_MAX_DELAY_MS);
+        continue;
+      }
+      throw new ChannelDeliveryError(
+        pf.message ?? `Weixin send denied (${pf.deny_code}).`,
+        {
+          outcome: "failed",
+          code: "not_allowed",
           retryable: false,
           denyCode: pf.deny_code,
         },
       );
     }
-    if (pf.decision === "defer" || pf.retryable) {
-      throw new ChannelDeliveryError(
-        pf.message ?? `Weixin send deferred (${pf.deny_code}); please retry.`,
-        {
-          outcome: "deferred",
-          code: "unavailable",
-          retryable: true,
-          denyCode: pf.deny_code,
-        },
-      );
-    }
-    throw new ChannelDeliveryError(
-      pf.message ?? `Weixin send denied (${pf.deny_code}).`,
-      {
-        outcome: "failed",
-        code: "not_allowed",
-        retryable: false,
-        denyCode: pf.deny_code,
-      },
-    );
   }
 
   private isAdapterOutboundReady(adapter: ChannelAdapter | undefined): boolean {
@@ -623,14 +712,10 @@ export class DataTaskNotificationService {
         "I-7 deliveries/progress acknowledgement delivery_key mismatch.",
       );
     }
-    const expiredDeferredAck =
-      (expectedStatus === "deferred" || expectedStatus === "partial_deferred") &&
-      rawAck.status === "failed" &&
-      rawAck.expired_to_failed === true;
     if (
       typeof rawAck.status !== "string" ||
       !RECOGNIZED_DELIVERY_STATUSES.has(rawAck.status) ||
-      (rawAck.status !== expectedStatus && !expiredDeferredAck)
+      rawAck.status !== expectedStatus
     ) {
       throw new DataTaskBackendAckError(
         "I-7 deliveries/progress acknowledgement status is unrecognized or inconsistent with submitted transition.",
@@ -650,7 +735,6 @@ export class DataTaskNotificationService {
       delivery_key: rawAck.delivery_key,
       status: rawAck.status,
       sent_to_current_count: rawAck.sent_to_current_count,
-      ...(rawAck.expired_to_failed === true ? { expired_to_failed: true } : {}),
     };
   }
 
@@ -1161,7 +1245,7 @@ export class DataTaskNotificationService {
       tracker.claimedAnyItem = true;
       let rawClaim: unknown;
       try {
-        rawClaim = await this.backend.authorizeAndClaimDelivery({
+        rawClaim = await this.claimDeliveryWith503Retry({
           delivery_key: item.delivery_key,
           kind: claimKind,
           run_id: plan.run_id ?? runId,
@@ -1293,34 +1377,6 @@ export class DataTaskNotificationService {
           data: {
             ok: false,
             status: "unknown",
-            code: validatedClaim.code,
-            message: validatedClaim.message,
-            run_id: runId,
-            target,
-            platform,
-            items_total: planItems.length,
-            items_sent: itemsSent,
-            items: itemOutcomes,
-          },
-        };
-      }
-
-      if (validatedClaim.kind === "deferred") {
-        tracker.claimedAnyItem = hadPriorClaim;
-        itemOutcomes.push({
-          item_index: item.item_index,
-          delivery_key: item.delivery_key,
-          status: validatedClaim.status,
-          duplicate: false,
-          platform_message_ids: validatedClaim.platformMessageIds,
-          code: validatedClaim.code,
-          message: validatedClaim.message,
-        });
-        return {
-          status: 200,
-          data: {
-            ok: false,
-            status: validatedClaim.status,
             code: validatedClaim.code,
             message: validatedClaim.message,
             run_id: runId,
@@ -1774,28 +1830,13 @@ export class DataTaskNotificationService {
         }
       }
 
-      // Round 3 Decision #6: resume from persisted breakpoint fields when retrying a `partial_deferred` item.
-      const resumeSentChunks = Math.max(
-        0,
-        Math.min(textChunks.length, validatedClaim.sentChunks),
-      );
-      const messageIds: string[] = [...validatedClaim.platformMessageIds];
-      let sentChunks = resumeSentChunks;
+      const messageIds: string[] = [];
+      let sentChunks = 0;
       const filesStatus: Array<{
         path: string;
         status: "sent" | "linked" | "failed" | "unknown";
         reason: string | null;
-      }> = validatedClaim.filesStatus.filter(
-        (entry) => entry.status === "sent" || entry.status === "linked",
-      );
-      const deliveredSegments: unknown[] = [...validatedClaim.deliveredSegments];
-      const attachmentAlreadySent =
-        verifiedAttachment !== null &&
-        filesStatus.some(
-          (entry) =>
-            entry.path === verifiedAttachment!.filename &&
-            entry.status === "sent",
-        );
+      }> = [];
       const sendTextWithFile = readyAdapter.sendTextWithFile?.bind(readyAdapter);
       // One platform message for a caption plus its file. Longer text still
       // chunks, and the file rides on the last chunk instead of a second post.
@@ -1803,10 +1844,9 @@ export class DataTaskNotificationService {
       const attachFileToLastTextChunk =
         item.kind === "text_and_file" &&
         verifiedAttachment !== null &&
-        !attachmentAlreadySent &&
         typeof sendTextWithFile === "function" &&
         textChunks.length > 0;
-      let fileAttachedToText = attachmentAlreadySent;
+      let fileAttachedToText = false;
 
       const runWithWeixinSignal = async <T>(
         fn: (ctx: {
@@ -1826,7 +1866,7 @@ export class DataTaskNotificationService {
         return fn({ signal: undefined, attachAccount: () => undefined });
       };
 
-      for (let i = resumeSentChunks; i < textChunks.length; i += 1) {
+      for (let i = 0; i < textChunks.length; i += 1) {
         let chunkRes: { messageId: string };
         const attachFile =
           attachFileToLastTextChunk && i === textChunks.length - 1;
@@ -1873,6 +1913,7 @@ export class DataTaskNotificationService {
                     item.delivery_key,
                     effectiveWeixinAttempt,
                     i,
+                    signal,
                   );
                   attachAccount(weixinPreflight.account_id);
                   if (signal?.aborted) {
@@ -1909,58 +1950,32 @@ export class DataTaskNotificationService {
           }
           const classified = classifyAdapterError(chunkErr);
           const anySent = sentChunks > 0 || filesStatus.length > 0;
-          // Round 3 Decision #6 & #9:
-          // - Retryable defer after partial progress settles as `partial_deferred` (non-terminal).
-          // - `unknown` overrides `partial` ONLY on Weixin; Feishu & Discord keep original `partial`.
-          const itemStatus:
-            | "partial"
-            | "unknown"
-            | "failed"
-            | "deferred"
-            | "partial_deferred" =
-            classified.outcome === "deferred"
-              ? anySent
-                ? "partial_deferred"
-                : "deferred"
-              : classified.outcome === "unknown"
-                ? platform === "weixin" || !anySent
-                  ? "unknown"
-                  : "partial"
-                : anySent
-                  ? "partial"
-                  : "failed";
+          // `unknown` overrides `partial` ONLY on Weixin; Feishu & Discord keep original `partial`.
+          const itemStatus: "partial" | "unknown" | "failed" =
+            classified.outcome === "unknown"
+              ? platform === "weixin" || !anySent
+                ? "unknown"
+                : "partial"
+              : anySent
+                ? "partial"
+                : "failed";
           const recordedErrorCode = classified.denyCode ?? classified.code;
-          const isDeferredStatus =
-            itemStatus === "deferred" || itemStatus === "partial_deferred";
-          let settledItemStatus: DataTaskItemDeliveryOutcome["status"] = itemStatus;
-          let overallStatus: DataTaskNotificationResponse["status"] =
-            isDeferredStatus
-              ? itemStatus
-              : itemStatus === "failed"
-                ? "failed"
-                : "unknown";
+          const overallStatus: DataTaskNotificationResponse["status"] =
+            itemStatus === "failed" ? "failed" : "unknown";
           try {
-            const ack = await this.recordValidatedDeliveryProgress(
+            await this.recordValidatedDeliveryProgress(
               {
                 delivery_key: item.delivery_key,
                 sent_chunks: sentChunks,
                 total_chunks: totalChunks,
                 platform_message_ids: [...messageIds],
                 ...(filesStatus.length > 0 ? { files_status: [...filesStatus] } : {}),
-                ...(platform === "weixin" && deliveredSegments.length > 0
-                  ? { delivered_segments: [...deliveredSegments] }
-                  : {}),
                 status: itemStatus,
-                ...(isDeferredStatus ? { outcome: itemStatus } : {}),
                 error_code: recordedErrorCode,
                 error_message: classified.message,
               },
               platform,
             );
-            if (isDeferredStatus && ack.expired_to_failed === true) {
-              settledItemStatus = "failed";
-              overallStatus = "failed";
-            }
           } catch (progressErr) {
             if (isStaleGatewayEpochError(progressErr)) {
               throw progressErr;
@@ -1993,10 +2008,10 @@ export class DataTaskNotificationService {
           itemOutcomes.push({
             item_index: item.item_index,
             delivery_key: item.delivery_key,
-            status: settledItemStatus,
+            status: itemStatus,
             duplicate: false,
             platform_message_ids: [...messageIds],
-            code: settledItemStatus === "partial" ? "partial" : recordedErrorCode,
+            code: itemStatus === "partial" ? "partial" : recordedErrorCode,
             message: classified.message,
           });
           return {
@@ -2004,7 +2019,7 @@ export class DataTaskNotificationService {
             data: {
               ok: false,
               status: overallStatus,
-              code: settledItemStatus === "partial" ? "partial" : recordedErrorCode,
+              code: itemStatus === "partial" ? "partial" : recordedErrorCode,
               message: classified.message,
               run_id: runId,
               target,
@@ -2018,11 +2033,6 @@ export class DataTaskNotificationService {
 
         sentChunks += 1;
         messageIds.push(chunkRes.messageId);
-        deliveredSegments.push({
-          kind: "text",
-          index: i,
-          message_id: chunkRes.messageId,
-        });
         try {
           await this.recordValidatedDeliveryProgress(
             {
@@ -2030,9 +2040,6 @@ export class DataTaskNotificationService {
               sent_chunks: sentChunks,
               total_chunks: totalChunks,
               platform_message_ids: [...messageIds],
-              ...(platform === "weixin"
-                ? { delivered_segments: [...deliveredSegments] }
-                : {}),
             },
             platform,
           );
@@ -2083,6 +2090,7 @@ export class DataTaskNotificationService {
                   item.delivery_key,
                   effectiveWeixinAttempt,
                   fileChunkIndex,
+                  signal,
                 );
                 attachAccount(weixinPreflight.account_id);
                 if (signal?.aborted) {
@@ -2113,10 +2121,12 @@ export class DataTaskNotificationService {
                 refreshWeixinPreflight:
                   platform === "weixin"
                     ? () =>
-                        this.backend.preflightWeixinSend(item.delivery_key, {
-                          delivery_attempt: effectiveWeixinAttempt,
-                          chunk_index: fileChunkIndex,
-                        })
+                        this.runWeixinPreflight(
+                          item.delivery_key,
+                          effectiveWeixinAttempt,
+                          fileChunkIndex,
+                          signal,
+                        )
                     : undefined,
               });
             },
@@ -2210,77 +2220,43 @@ export class DataTaskNotificationService {
             status: "sent",
             reason: null,
           });
-          deliveredSegments.push({
-            kind: "file",
-            index: 0,
-            path: verifiedAttachment.filename,
-            message_id: fileRes.messageId,
-          });
         } catch (fileErr) {
           if (isStaleGatewayEpochError(fileErr)) {
             throw fileErr;
           }
           const classified = classifyAdapterError(fileErr);
           const anySent = sentChunks > 0 || filesStatus.length > 0;
-          // Round 3 Decision #6 & #9:
-          // - Retryable defer after text chunks settles as `partial_deferred` (non-terminal).
-          // - `unknown` overrides `partial` ONLY on Weixin; Feishu & Discord keep original `partial`.
-          const itemStatus:
-            | "partial"
-            | "unknown"
-            | "failed"
-            | "deferred"
-            | "partial_deferred" =
-            classified.outcome === "deferred"
-              ? anySent
-                ? "partial_deferred"
-                : "deferred"
-              : classified.outcome === "unknown"
-                ? platform === "weixin" || !anySent
-                  ? "unknown"
-                  : "partial"
-                : anySent
-                  ? "partial"
-                  : "failed";
+          // `unknown` overrides `partial` ONLY on Weixin; Feishu & Discord keep original `partial`.
+          const itemStatus: "partial" | "unknown" | "failed" =
+            classified.outcome === "unknown"
+              ? platform === "weixin" || !anySent
+                ? "unknown"
+                : "partial"
+              : anySent
+                ? "partial"
+                : "failed";
           const recordedErrorCode = classified.denyCode ?? classified.code;
-          const isDeferredStatus =
-            itemStatus === "deferred" || itemStatus === "partial_deferred";
-          if (!isDeferredStatus) {
-            filesStatus.push({
-              path: verifiedAttachment.filename,
-              status: classified.outcome === "unknown" ? "unknown" : "failed",
-              reason: classified.message,
-            });
-          }
-          let settledItemStatus: DataTaskItemDeliveryOutcome["status"] = itemStatus;
-          let overallStatus: DataTaskNotificationResponse["status"] =
-            isDeferredStatus
-              ? itemStatus
-              : itemStatus === "failed"
-                ? "failed"
-                : "unknown";
+          filesStatus.push({
+            path: verifiedAttachment.filename,
+            status: classified.outcome === "unknown" ? "unknown" : "failed",
+            reason: classified.message,
+          });
+          const overallStatus: DataTaskNotificationResponse["status"] =
+            itemStatus === "failed" ? "failed" : "unknown";
           try {
-            const ack = await this.recordValidatedDeliveryProgress(
+            await this.recordValidatedDeliveryProgress(
               {
                 delivery_key: item.delivery_key,
                 sent_chunks: sentChunks,
                 total_chunks: totalChunks,
                 platform_message_ids: [...messageIds],
                 files_status: filesStatus,
-                ...(platform === "weixin" && deliveredSegments.length > 0
-                  ? { delivered_segments: [...deliveredSegments] }
-                  : {}),
                 status: itemStatus,
-                ...(isDeferredStatus ? { outcome: itemStatus } : {}),
                 error_code: recordedErrorCode,
                 error_message: classified.message,
               },
               platform,
             );
-            if (isDeferredStatus && ack.expired_to_failed === true) {
-              settledItemStatus = "failed";
-              overallStatus = "failed";
-            }
           } catch (progressErr) {
             if (isStaleGatewayEpochError(progressErr)) {
               throw progressErr;
@@ -2313,10 +2289,10 @@ export class DataTaskNotificationService {
           itemOutcomes.push({
             item_index: item.item_index,
             delivery_key: item.delivery_key,
-            status: settledItemStatus,
+            status: itemStatus,
             duplicate: false,
             platform_message_ids: [...messageIds],
-            code: settledItemStatus === "partial" ? "partial" : recordedErrorCode,
+            code: itemStatus === "partial" ? "partial" : recordedErrorCode,
             message: classified.message,
           });
           return {
@@ -2324,7 +2300,7 @@ export class DataTaskNotificationService {
             data: {
               ok: false,
               status: overallStatus,
-              code: settledItemStatus === "partial" ? "partial" : recordedErrorCode,
+              code: itemStatus === "partial" ? "partial" : recordedErrorCode,
               message: classified.message,
               run_id: runId,
               target,
@@ -2345,9 +2321,6 @@ export class DataTaskNotificationService {
             total_chunks: totalChunks,
             platform_message_ids: [...messageIds],
             files_status: filesStatus,
-            ...(platform === "weixin" && deliveredSegments.length > 0
-              ? { delivered_segments: [...deliveredSegments] }
-              : {}),
             status: "sent",
             first_response_json: {
               status: "sent",

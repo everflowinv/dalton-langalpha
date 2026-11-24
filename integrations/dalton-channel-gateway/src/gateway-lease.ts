@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { createSubsystemLogger, type SubsystemLogger } from "./shared/logger.js";
+import {
+  createSubsystemLogger,
+  extractSafeLogErrorFields,
+  type SubsystemLogger,
+} from "./shared/logger.js";
 
 export const DEFAULT_GATEWAY_LEASE_TTL_SECONDS = 45;
 export const DEFAULT_GATEWAY_LEASE_HEARTBEAT_MS = 15_000;
@@ -307,7 +311,7 @@ export class GatewayLeaseManager {
         this.logger.warn("Gateway lease acquire attempt failed; retrying", {
           instance_id: this.instanceId,
           attempt,
-          error: err instanceof Error ? err.message : String(err),
+          ...extractSafeLogErrorFields(err),
         });
         await sleepAbortable(this.acquireRetryMs, signal);
       }
@@ -412,7 +416,7 @@ export class GatewayLeaseManager {
         instance_id: this.instanceId,
         epoch,
         remaining_ms: Math.max(0, remainingMs),
-        error: err instanceof Error ? err.message : String(err),
+        ...extractSafeLogErrorFields(err),
       });
       if (remainingMs <= 0) {
         this.notifyLeaseLost("heartbeat_expired", err);
@@ -460,7 +464,7 @@ export class GatewayLeaseManager {
         this.logger.warn("Best-effort gateway lease release failed", {
           instance_id: this.instanceId,
           epoch,
-          error: err instanceof Error ? err.message : String(err),
+          ...extractSafeLogErrorFields(err),
         });
       }
     }

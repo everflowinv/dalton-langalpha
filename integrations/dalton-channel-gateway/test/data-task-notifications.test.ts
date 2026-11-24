@@ -895,14 +895,7 @@ describe("Dalton data-task report delivery via channel gateway", () => {
     const ledger = new Map<
       string,
       {
-        status:
-          | "in_flight"
-          | "sent"
-          | "partial"
-          | "failed"
-          | "unknown"
-          | "deferred"
-          | "partial_deferred";
+        status: "in_flight" | "sent" | "partial" | "failed" | "unknown";
       }
     >();
 

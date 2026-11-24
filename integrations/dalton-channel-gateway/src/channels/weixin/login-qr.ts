@@ -967,6 +967,14 @@ export class WeixinQrLoginManager {
       typeof confirmRes.bot_generation === "number"
         ? confirmRes.bot_generation
         : session.expected_bot_generation + 1;
+    // Contract §3.2 places account status in `status` ("active" | "pending_verification"),
+    // while backend `confirm_weixin_login_session` returns `status: "confirmed"` + `account_status`.
+    // Support both so contract-only mocks and live backend behave identically.
+    const resolvedAccountStatus: "active" | "pending_verification" =
+      confirmRes.account_status === "pending_verification" ||
+      confirmRes.status === "pending_verification"
+        ? "pending_verification"
+        : "active";
 
     if (this.onAccountConfirmed && confirmedAccountId) {
       await this.onAccountConfirmed({
@@ -978,7 +986,7 @@ export class WeixinQrLoginManager {
         botGeneration: confirmedGeneration,
         getUpdatesBuf: "",
         ownerUserId: userId,
-        accountStatus: confirmRes.account_status ?? "active",
+        accountStatus: resolvedAccountStatus,
         accountsRevision: confirmRes.accounts_revision ?? null,
         ilinkUserId:
           confirmRes.ilink_user_id ?? statusResp.ilink_user_id?.trim() ?? null,
@@ -993,10 +1001,9 @@ export class WeixinQrLoginManager {
       connected: confirmRes.connected ?? true,
       alreadyConnected: confirmRes.already_connected ?? false,
       accountId: confirmedAccountId || null,
-      accountStatus: confirmRes.account_status ?? "active",
+      accountStatus: resolvedAccountStatus,
       accountsRevision: confirmRes.accounts_revision ?? null,
-      pendingVerification:
-        confirmRes.account_status === "pending_verification",
+      pendingVerification: resolvedAccountStatus === "pending_verification",
       ilinkBotId: confirmRes.ilink_bot_id ?? ilinkBotId,
       ilinkUserId:
         confirmRes.ilink_user_id ?? statusResp.ilink_user_id?.trim() ?? null,

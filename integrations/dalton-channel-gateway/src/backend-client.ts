@@ -134,7 +134,7 @@ export interface I1RegisterAndResolveRequest {
   weixin_bot_generation?: number | null;
   weixin_context_seq?: number | null;
   weixin_media_meta?: WeixinPersistedAttachmentMeta[] | null;
-  unsupported_item_types?: number[] | null;
+  unsupported_item_types?: string[] | null;
 }
 
 export interface I1RegisterAndResolveResponse {
@@ -371,8 +371,6 @@ export interface I3SessionCommandResponse {
   collect_status?: "collecting" | "flushing" | "done" | "cancelled" | "empty" | "not_collecting" | string | null;
   /** Plural array of cancelled collect buffer IDs per contract §5.3 (`I-3 /cancel`). */
   cancelled_buffer_ids?: string[];
-  /** Legacy singular field retained for backward compatibility. */
-  cancelled_buffer_id?: string | null;
   reply_text?: string | null;
   message?: string | null;
   help_text?: string | null;
@@ -490,43 +488,19 @@ export interface I6AuthorizeAndClaimResponse {
     | "already_completed"
     | "in_flight_or_unknown"
     | "denied"
-    | "deferred"
     | "claimed";
-  status?:
-    | "sent"
-    | "partial"
-    | "failed"
-    | "unknown"
-    | "deferred"
-    | "partial_deferred";
+  status?: "sent" | "partial" | "failed" | "unknown";
   code?:
     | "not_linked"
     | "not_allowed"
     | "no_current_conversation"
     | "unknown_delivery_blocks_fallback"
     | "in_flight"
-    | "delivery_deferred"
     | "roster_lookup_error"
-    | "deferred_timeout"
     | string
     | null;
   message?: string;
   retryable?: boolean;
-  defer_count?: number;
-  first_deferred_at?: string | null;
-  next_retry_at?: string | null;
-  retry_after_seconds?: number | null;
-  retry_after_ms?: number | null;
-  /** Resume breakpoints persisted on deferred / partial_deferred deliveries (contract §7.1). */
-  sent_chunks?: number;
-  total_chunks?: number;
-  platform_message_ids?: string[];
-  files_status?: Array<{
-    path: string;
-    status: "sent" | "linked" | "failed" | "unknown";
-    reason: string | null;
-  }>;
-  delivered_segments?: unknown[];
   first_response_json?: Record<string, unknown> | null;
   /** Platform recipient identifier (`platform_user_id` for DM, `chat_id` for group). */
   recipient_id?: string;
@@ -573,24 +547,9 @@ export interface I7DeliveriesProgressRequest {
     status: "sent" | "linked" | "failed" | "unknown";
     reason: string | null;
   }>;
-  delivered_segments?: unknown[];
   first_response_json?: Record<string, unknown>;
-  status?:
-    | "in_flight"
-    | "sent"
-    | "partial"
-    | "failed"
-    | "unknown"
-    | "deferred"
-    | "partial_deferred";
-  outcome?:
-    | "sent"
-    | "partial"
-    | "failed"
-    | "unknown"
-    | "deferred"
-    | "partial_deferred"
-    | null;
+  status?: "in_flight" | "sent" | "partial" | "failed" | "unknown";
+  outcome?: "sent" | "partial" | "failed" | "unknown" | null;
   error_code?: string | null;
   error_message?: string | null;
   /** Full Discord thread address. Omitted unless this call confirms a thread. */
@@ -612,13 +571,6 @@ export interface I7DeliveriesProgressResponse {
   delivery_key: string;
   status: string;
   outcome?: string | null;
-  defer_count?: number;
-  first_deferred_at?: string | null;
-  next_retry_at?: string | null;
-  retry_after_seconds?: number | null;
-  retry_after_ms?: number | null;
-  expired_to_failed?: boolean;
-  idempotent_replay?: boolean;
   sent_chunks?: number;
   total_chunks?: number;
   platform_message_ids?: string[];
@@ -627,7 +579,6 @@ export interface I7DeliveriesProgressResponse {
     status: "sent" | "linked" | "failed" | "unknown";
     reason: string | null;
   }>;
-  delivered_segments?: unknown[];
   sent_to_current_count: number;
   /** Echo of the stored Discord thread address, or null when none is stored. */
   confirmed_thread_address?: string | null;
@@ -635,51 +586,6 @@ export interface I7DeliveriesProgressResponse {
   discord_body_phase?: "before_body" | "dispatching" | null;
   /** Echo of the stored claim generation. Progress does not increment it. */
   delivery_attempt?: number;
-}
-
-export interface DeferredDeliveryDueRow {
-  delivery_key: string;
-  kind: string;
-  user_id?: string | null;
-  thread_id?: string | null;
-  run_id?: string | null;
-  execution_id?: string | null;
-  is_current?: boolean;
-  has_non_empty_text?: boolean;
-  platform: string;
-  target_address: string;
-  status: "deferred" | "partial_deferred" | string;
-  error_code?: string | null;
-  error_message?: string | null;
-  defer_count: number;
-  first_deferred_at?: string | null;
-  next_retry_at?: string | null;
-  sent_chunks: number;
-  total_chunks: number;
-  platform_message_ids?: string[];
-  files_status?: Array<{
-    path: string;
-    status: "sent" | "linked" | "failed" | "unknown";
-    reason: string | null;
-  }>;
-  delivered_segments?: unknown[];
-  source_scope_key?: string | null;
-  source_generation?: number | null;
-  activity_origin?: DeliveryActivityOrigin | null;
-  delivery_attempt?: number;
-  weixin_account_id?: string | null;
-  weixin_bot_id?: string | null;
-  weixin_bot_generation?: number | null;
-  weixin_recipient_id?: string | null;
-  created_at?: string | null;
-  updated_at?: string | null;
-}
-
-export interface DeferredDeliveriesDueResponse {
-  ok: boolean;
-  expired_count: number;
-  next_upcoming_retry_at?: string | null;
-  deliveries: DeferredDeliveryDueRow[];
 }
 
 export type InboundEventStatus =
@@ -889,7 +795,6 @@ export interface I7RecoverResponse {
   thread_watches: RecoverThreadWatchRow[];
   automation_runs?: RecoverAutomationRunRow[];
   flushing_collect_buffers?: RecoverFlushingCollectBufferRow[];
-  deferred_deliveries?: DeferredDeliveryDueRow[];
 }
 
 export interface I8AutomationRunStartRequest {
@@ -1152,7 +1057,7 @@ export interface WeixinPreflightAuthorizedData {
   cdn_base_url?: string | null;
   recipient_id: string;
   weixin_context_token: string;
-  weixin_context_token_version: number;
+  weixin_context_token_version?: number | null;
 }
 
 export interface WeixinPreflightDeniedData {
@@ -1337,12 +1242,8 @@ export interface BackendClient {
 
   authorizeAndClaimDelivery(
     req: I6AuthorizeAndClaimRequest,
+    options?: { signal?: AbortSignal },
   ): Promise<I6AuthorizeAndClaimResponse>;
-
-  getDueDeferredDeliveries?(params?: {
-    platform?: string | null;
-    limit?: number;
-  }): Promise<DeferredDeliveriesDueResponse>;
 
   updateDeliveryProgress(
     req: I7DeliveriesProgressRequest,
@@ -1373,6 +1274,7 @@ export interface BackendClient {
   // Weixin Multi-Account, QR Login, Collection & Preflight Internal Endpoints
   reconcileWeixinAccounts(
     sinceRevision?: number | null,
+    options?: { signal?: AbortSignal },
   ): Promise<WeixinAccountsReconcileResponse>;
 
   getWeixinAccountDetail(
@@ -1380,6 +1282,7 @@ export interface BackendClient {
     options?: {
       recipient_platform_user_id?: string | null;
       inbound_message_id?: string | null;
+      signal?: AbortSignal;
     },
   ): Promise<WeixinAccountDetailResponse>;
 
@@ -1420,6 +1323,7 @@ export interface BackendClient {
   preflightWeixinSend(
     deliveryKey: string,
     req: WeixinPreflightSendRequest,
+    options?: { signal?: AbortSignal },
   ): Promise<WeixinPreflightSendResponse>;
 
   // Upstream Conversation, Replay, Watch & Workspace Endpoints
@@ -1636,6 +1540,7 @@ export class HttpBackendClient implements BackendClient {
       query?: Record<string, string | undefined | null>;
       body?: unknown;
       timeoutMs?: number;
+      signal?: AbortSignal;
       redirect?: RequestRedirect;
       cache?: RequestCache;
       strictJson?: boolean;
@@ -1651,6 +1556,14 @@ export class HttpBackendClient implements BackendClient {
         }
       }
     }
+    const timeoutSignal =
+      typeof options?.timeoutMs === "number" && options.timeoutMs > 0
+        ? AbortSignal.timeout(options.timeoutMs)
+        : undefined;
+    const effectiveSignal =
+      options?.signal && timeoutSignal
+        ? AbortSignal.any([options.signal, timeoutSignal])
+        : (options?.signal ?? timeoutSignal);
     const init: RequestInit = {
       method,
       headers: this.headers(
@@ -1661,9 +1574,7 @@ export class HttpBackendClient implements BackendClient {
       ...(options?.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
       ...(options?.redirect ? { redirect: options.redirect } : {}),
       ...(options?.cache ? { cache: options.cache } : {}),
-      ...(typeof options?.timeoutMs === "number" && options.timeoutMs > 0
-        ? { signal: AbortSignal.timeout(options.timeoutMs) }
-        : {}),
+      ...(effectiveSignal ? { signal: effectiveSignal } : {}),
     };
     const resp = await this.fetchImpl(url, init);
     const text = await resp.text();
@@ -1969,8 +1880,9 @@ export class HttpBackendClient implements BackendClient {
     explicitPlatform?: string | null,
     targetAddress?: string | null,
   ): string | null {
-    const cleanExplicit = explicitPlatform?.trim().toLowerCase();
-    if (cleanExplicit) return cleanExplicit;
+    // R4 #1: Target address platform ALWAYS takes precedence over turn/origin platform
+    // so cross-channel sends (e.g. Discord turn -> `weixin:@me` or Weixin turn -> `feishu:...`)
+    // attach/omit `X-Gateway-Epoch` strictly according to the actual target platform.
     const cleanTarget = targetAddress?.trim().toLowerCase();
     if (cleanTarget && cleanTarget.includes(":")) {
       const prefix = cleanTarget.split(":", 1)[0]?.trim();
@@ -1978,14 +1890,18 @@ export class HttpBackendClient implements BackendClient {
         return prefix;
       }
     }
+    const cleanExplicit = explicitPlatform?.trim().toLowerCase();
+    if (cleanExplicit) return cleanExplicit;
     return null;
   }
 
   async authorizeAndClaimDelivery(
     req: I6AuthorizeAndClaimRequest,
+    options?: { signal?: AbortSignal },
   ): Promise<I6AuthorizeAndClaimResponse> {
-    // Contract §0 & §7 (Round 3 Decision #9): attach X-Gateway-Epoch on I-6 ONLY for Weixin
-    // (or ambiguous current-conversation target when platform is omitted); omit for Feishu / Discord.
+    // Contract §0 & §7 (R4 #1): attach X-Gateway-Epoch on I-6 ONLY when the resolved TARGET
+    // platform is Weixin (or ambiguous current-conversation target with no platform/target);
+    // omit for Feishu / Discord targets even when sent from a Weixin turn.
     const inferredPlatform = this.inferPlatformForEpoch(
       req.platform,
       req.target,
@@ -2000,6 +1916,7 @@ export class HttpBackendClient implements BackendClient {
           userId: req.user_id,
           body: req,
           timeoutMs: 15_000,
+          signal: options?.signal,
           redirect: "error",
           cache: "no-store",
           strictJson: true,
@@ -2012,43 +1929,16 @@ export class HttpBackendClient implements BackendClient {
     const { status, data } = await this.jsonRequest<I6AuthorizeAndClaimResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
-      { userId: req.user_id, body: req, includeGatewayEpoch },
+      {
+        userId: req.user_id,
+        body: req,
+        signal: options?.signal,
+        includeGatewayEpoch,
+      },
     );
     if (status >= 400) {
       throw new BackendHttpError(
         `I-6 authorize-and-claim failed (${status})`,
-        status,
-        data,
-      );
-    }
-    return data;
-  }
-
-  async getDueDeferredDeliveries(params?: {
-    platform?: string | null;
-    limit?: number;
-  }): Promise<DeferredDeliveriesDueResponse> {
-    const plat = params?.platform?.trim().toLowerCase() || null;
-    const includeGatewayEpoch = plat === "weixin" || plat === null;
-    const { status, data } =
-      await this.jsonRequest<DeferredDeliveriesDueResponse>(
-        "GET",
-        "/api/v1/dalton/channels/internal/deliveries/deferred-due",
-        {
-          query: {
-            platform: plat ?? undefined,
-            limit:
-              typeof params?.limit === "number" && params.limit > 0
-                ? String(Math.trunc(params.limit))
-                : undefined,
-          },
-          timeoutMs: 15_000,
-          includeGatewayEpoch,
-        },
-      );
-    if (status >= 400) {
-      throw new BackendHttpError(
-        `deliveries/deferred-due failed (${status})`,
         status,
         data,
       );
@@ -2239,6 +2129,7 @@ export class HttpBackendClient implements BackendClient {
 
   async reconcileWeixinAccounts(
     sinceRevision?: number | null,
+    options?: { signal?: AbortSignal },
   ): Promise<WeixinAccountsReconcileResponse> {
     const { status, data } = await this.jsonRequest<WeixinAccountsReconcileResponse>(
       "POST",
@@ -2249,6 +2140,7 @@ export class HttpBackendClient implements BackendClient {
             ? { since_revision: sinceRevision }
             : {},
         timeoutMs: 15_000,
+        signal: options?.signal,
         includeGatewayEpoch: true,
       },
     );
@@ -2267,6 +2159,7 @@ export class HttpBackendClient implements BackendClient {
     options?: {
       recipient_platform_user_id?: string | null;
       inbound_message_id?: string | null;
+      signal?: AbortSignal;
     },
   ): Promise<WeixinAccountDetailResponse> {
     const { status, data } = await this.jsonRequest<WeixinAccountDetailResponse>(
@@ -2278,6 +2171,7 @@ export class HttpBackendClient implements BackendClient {
           inbound_message_id: options?.inbound_message_id ?? undefined,
         },
         timeoutMs: 15_000,
+        signal: options?.signal,
       },
     );
     if (status >= 400) {
@@ -2451,6 +2345,7 @@ export class HttpBackendClient implements BackendClient {
   async preflightWeixinSend(
     deliveryKey: string,
     req: WeixinPreflightSendRequest,
+    options?: { signal?: AbortSignal },
   ): Promise<WeixinPreflightSendResponse> {
     const { status, data } = await this.jsonRequest<WeixinPreflightSendResponse>(
       "POST",
@@ -2458,6 +2353,7 @@ export class HttpBackendClient implements BackendClient {
       {
         body: req,
         timeoutMs: 15_000,
+        signal: options?.signal,
         includeGatewayEpoch: true,
       },
     );

@@ -524,6 +524,24 @@ export class FakeChannelAdapter implements ChannelAdapter {
     return { status: "confirmed" };
   }
 
+  private weixinAccountInvalidatedHandler?: (info: {
+    accountId: string;
+    reason: string;
+  }) => void;
+
+  onWeixinAccountInvalidated(
+    handler: (info: { accountId: string; reason: string }) => void,
+  ): void {
+    this.weixinAccountInvalidatedHandler = handler;
+  }
+
+  emitWeixinAccountInvalidated(info: {
+    accountId: string;
+    reason: string;
+  }): void {
+    this.weixinAccountInvalidatedHandler?.(info);
+  }
+
   applyPersistedState(state: {
     configured: boolean;
     status: string;

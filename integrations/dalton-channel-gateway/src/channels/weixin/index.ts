@@ -13,6 +13,7 @@ import {
 } from "../../gateway-lease.js";
 import {
   createSubsystemLogger,
+  extractSafeLogErrorFields,
   type SubsystemLogger,
 } from "../../shared/logger.js";
 import type { HostIpResolver } from "../../shared/safe-fetch.js";
@@ -314,7 +315,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     } catch (err) {
       if (isLeaseSafetyMarginPauseError(err)) {
         throw new ChannelDeliveryError(err.message, {
-          outcome: "deferred",
+          outcome: "failed",
           code: "unavailable",
           retryable: true,
           denyCode: err.code,
@@ -325,17 +326,26 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   }
 
   /**
-   * Round 3 Decision #2: After `preflight-send` returns and before `sendmessage` / CDN upload,
-   * verify that the preflight's `account_id`, `ilink_bot_id`, and `bot_generation` match the
-   * current managed snapshot (when snapshots have been loaded).
+   * Round 3 Decision #2 & R4 #5 (Codex #9): After `preflight-send` returns and before
+   * `sendmessage` / CDN upload, verify that the initial managed snapshot has been applied
+   * and that the preflight's `account_id`, `ilink_bot_id`, and `bot_generation` match the
+   * current managed snapshot. Without an applied snapshot, never send outbound.
    */
   private assertPreflightMatchesSnapshot(
     preflight: WeixinPreflightAuthorizedData,
   ): void {
-    const snap = this.accounts.get(preflight.account_id);
-    if (!this.hasAppliedSnapshot && !snap) {
-      return;
+    if (this.backend && !this.hasAppliedSnapshot) {
+      throw new ChannelDeliveryError(
+        "Weixin managed account snapshot has not been applied yet.",
+        {
+          outcome: "failed",
+          code: "unavailable",
+          retryable: false,
+          denyCode: "weixin_snapshot_not_ready",
+        },
+      );
     }
+    const snap = this.accounts.get(preflight.account_id);
     if (
       !snap ||
       !isPollableAccountStatus(snap.status) ||
@@ -580,14 +590,43 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     (this.reconcileTimer as { unref?: () => void }).unref?.();
   }
 
+  /**
+   * R4 #5 (Codex #9): Loads and applies the initial account snapshot BEFORE the gateway
+   * lifts startup write restrictions and before long-polling begins.
+   */
+  async prepareStartupSnapshot(): Promise<void> {
+    if (!this.backend || this.hasAppliedSnapshot) {
+      return;
+    }
+    if (!this.reconcileAbortController) {
+      this.reconcileAbortController = new AbortController();
+    }
+    if (this.leaseManager && !this.leaseManager.isLeaseLocallyValid()) {
+      return;
+    }
+    await this.executeSingleReconcilePass("startup_snapshot", {
+      startMonitors: false,
+    });
+  }
+
   async start(): Promise<void> {
     if (this.started) {
       return;
     }
     this.started = true;
-    this.reconcileAbortController = new AbortController();
+    if (!this.reconcileAbortController || this.reconcileAbortController.signal.aborted) {
+      this.reconcileAbortController = new AbortController();
+    }
 
     if (this.backend) {
+      if (this.hasAppliedSnapshot) {
+        this.ensurePollableMonitorsRunning();
+        const nextDelay = this.backendNotFound404
+          ? this.probeInterval404Ms
+          : this.reconcileIntervalMs;
+        this.scheduleNextReconcile(nextDelay);
+        return;
+      }
       await this.runSingleFlightReconcile("startup");
       return;
     }
@@ -862,10 +901,16 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     await task;
   }
 
-  private async executeSingleReconcilePass(reason: string): Promise<void> {
+  private async executeSingleReconcilePass(
+    reason: string,
+    options?: { startMonitors?: boolean },
+  ): Promise<void> {
     if (!this.backend) return;
     try {
-      const resp = await this.backend.reconcileWeixinAccounts(this.lastRevision);
+      const resp = await this.backend.reconcileWeixinAccounts(
+        this.lastRevision,
+        { signal: this.reconcileAbortController?.signal },
+      );
       this.backendNotFound404 = false;
       this.maxConcurrentAccounts = Math.max(
         1,
@@ -913,15 +958,16 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         }
         // Decision #12: self-heal any pollable monitor whose coroutine exited
         // (e.g. after a transient lease dip) even when accounts_revision did not change.
-        // Note (Contract §2.1): real backend always returns `changed: true` on initial
-        // `since_revision: null` reconcile, so skipping `applyAccountSnapshots` when
-        // `changed === false` avoids falsely marking an empty snapshot as authoritative.
-        this.ensurePollableMonitorsRunning();
+        if (options?.startMonitors !== false) {
+          this.ensurePollableMonitorsRunning();
+        }
         return;
       }
 
       this.lastRevision = resp.accounts_revision;
-      await this.applyAccountSnapshots(resp.accounts ?? []);
+      await this.applyAccountSnapshots(resp.accounts ?? [], {
+        startMonitors: options?.startMonitors,
+      });
     } catch (err) {
       if (isStaleGatewayEpochError(err)) {
         this.abortAllInFlight();
@@ -958,7 +1004,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       }
       this.logger.warn("Weixin accounts reconcile failed; retaining current pollers", {
         reason,
-        error: err instanceof Error ? err.message : String(err),
+        ...extractSafeLogErrorFields(err),
       });
     }
   }
@@ -990,7 +1036,9 @@ export class WeixinChannelAdapter implements ChannelAdapter {
 
   private async applyAccountSnapshots(
     snapshots: readonly WeixinAccountSnapshot[],
+    options?: { startMonitors?: boolean },
   ): Promise<void> {
+    const startMonitors = options?.startMonitors !== false && this.started;
     this.hasAppliedSnapshot = true;
     const pollableRaw = snapshots.filter(
       (s) =>
@@ -1030,7 +1078,8 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     // 2. Diff remaining / new accounts and collect those needing monitor start.
     const toStart: ManagedWeixinAccount[] = [];
     for (const snap of pollable) {
-      if (!this.started) return;
+      if (startMonitors && !this.started) return;
+      if (this.reconcileAbortController?.signal.aborted) return;
       const safeBaseUrl = await this.resolveSafeBaseUrl(snap.base_url);
       const cdnBaseUrl = (
         snap.cdn_base_url ||
@@ -1098,6 +1147,9 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     }
 
     // 3. Staggered startup (<= 10 accounts/sec + 0..500ms jitter) when starting multiple pollers (§3.4).
+    if (!startMonitors) {
+      return;
+    }
     const signal = this.reconcileAbortController?.signal;
     for (let idx = 0; idx < toStart.length; idx += 1) {
       if (!this.started || signal?.aborted) {
@@ -1464,6 +1516,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
                 {
                   recipient_platform_user_id: ilinkUserId,
                   inbound_message_id: event.messageId,
+                  signal,
                 },
               );
               if (
@@ -1703,6 +1756,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     deliveryKey?: string | null;
     deliveryAttempt?: number;
     chunkIndex?: number;
+    signal?: AbortSignal;
   }): Promise<{
     preflight: WeixinPreflightAuthorizedData | null;
     accountId: string;
@@ -1722,22 +1776,24 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       typeof options.deliveryAttempt === "number" &&
       options.deliveryAttempt > 0
     ) {
-      const pf = await this.backend.preflightWeixinSend(options.deliveryKey, {
-        delivery_attempt: options.deliveryAttempt,
-        chunk_index: options.chunkIndex ?? 0,
-      });
+      const pf = await this.backend.preflightWeixinSend(
+        options.deliveryKey,
+        {
+          delivery_attempt: options.deliveryAttempt,
+          chunk_index: options.chunkIndex ?? 0,
+        },
+        { signal: options.signal },
+      );
       if (!pf.authorized) {
-        const isDeferred = pf.decision === "defer" || pf.retryable;
+        const isTransient = pf.decision === "defer" || pf.retryable;
         throw new ChannelDeliveryError(
           pf.message ?? `Weixin preflight ${pf.decision}: ${pf.deny_code}`,
           {
             outcome:
               pf.deny_code === "source_generation_unknown"
                 ? "unknown"
-                : isDeferred
-                  ? "deferred"
-                  : "failed",
-            code: isDeferred ? "unavailable" : "not_allowed",
+                : "failed",
+            code: isTransient ? "unavailable" : "not_allowed",
             retryable: pf.retryable,
             denyCode: pf.deny_code,
           },
@@ -1841,6 +1897,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         deliveryKey: options.deliveryKey,
         deliveryAttempt: options.deliveryAttempt,
         chunkIndex: options.chunkIndex,
+        signal,
       });
       attachAccount(creds.accountId);
       if (creds.preflight) {
@@ -1907,6 +1964,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         deliveryKey: options.deliveryKey,
         deliveryAttempt: options.deliveryAttempt,
         chunkIndex: 0,
+        signal,
       });
       attachAccount(creds.accountId);
       if (creds.preflight) {
@@ -1966,7 +2024,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
                 }
                 const refreshed = await options.refreshWeixinPreflight!();
                 if (!refreshed.authorized) {
-                  const isDeferred =
+                  const isTransient =
                     refreshed.decision === "defer" || refreshed.retryable;
                   throw new ChannelDeliveryError(
                     refreshed.message ??
@@ -1975,10 +2033,8 @@ export class WeixinChannelAdapter implements ChannelAdapter {
                       outcome:
                         refreshed.deny_code === "source_generation_unknown"
                           ? "unknown"
-                          : isDeferred
-                            ? "deferred"
-                            : "failed",
-                      code: isDeferred ? "unavailable" : "not_allowed",
+                          : "failed",
+                      code: isTransient ? "unavailable" : "not_allowed",
                       retryable: refreshed.retryable,
                       denyCode: refreshed.deny_code,
                     },

@@ -179,7 +179,6 @@ export type MockBackend = BackendClient &
       BackendClient,
       | "setGatewayEpoch"
       | "setOnStaleGatewayEpoch"
-      | "getDueDeferredDeliveries"
       | "getWeixinCollectBufferStatus"
       | "deleteWorkspaceFiles"
       | "authorizeDataTaskNotificationPlan"
@@ -558,7 +557,6 @@ export function createMockBackend(): MockBackend {
       total_chunks: req.total_chunks ?? 0,
       platform_message_ids: req.platform_message_ids ?? [],
       files_status: req.files_status ?? [],
-      delivered_segments: req.delivered_segments ?? [],
       sent_to_current_count:
         req.status === "sent" || req.status === "partial" ? 1 : 0,
       ...(() => {
@@ -893,12 +891,6 @@ export function createMockBackend(): MockBackend {
     ),
 
     authorizeAndClaimDelivery,
-    getDueDeferredDeliveries: vi.fn(async () => ({
-      ok: true,
-      expired_count: 0,
-      next_upcoming_retry_at: null,
-      deliveries: [],
-    })),
     updateDeliveryProgress,
     updateInboundProgress,
 
@@ -1210,6 +1202,10 @@ export interface TestHarness {
 export function createTestHarness(options?: {
   nowFn?: () => number;
   backoffDelayFn?: (ms: number) => Promise<void>;
+  retryDelayFn?: (ms: number, signal?: AbortSignal) => Promise<boolean>;
+  preflightRetryMaxElapsedMs?: number;
+  claim503MaxAttempts?: number;
+  collectCleanupLateRecheckMs?: number;
   busyThreadMaxWaitMs?: number;
   statusFeedback?: StatusFeedbackConfig;
   env?: NodeJS.ProcessEnv;
@@ -1240,6 +1236,11 @@ export function createTestHarness(options?: {
     backend,
     adapters,
     backoffDelayFn: options?.backoffDelayFn ?? (async () => undefined),
+    retryDelayFn:
+      options?.retryDelayFn ?? (async (_ms, signal) => !signal?.aborted),
+    preflightRetryMaxElapsedMs: options?.preflightRetryMaxElapsedMs,
+    claim503MaxAttempts: options?.claim503MaxAttempts,
+    collectCleanupLateRecheckMs: options?.collectCleanupLateRecheckMs ?? 25,
     busyThreadMaxWaitMs: options?.busyThreadMaxWaitMs,
     nowFn: options?.nowFn,
   });

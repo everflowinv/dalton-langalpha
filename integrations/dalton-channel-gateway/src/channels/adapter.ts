@@ -16,8 +16,7 @@ import type {
 export type ChannelErrorOutcome =
   | "failed"
   | "unknown"
-  | "rate_limited"
-  | "deferred";
+  | "rate_limited";
 export type ChannelErrorCode =
   | "target_not_found"
   | "rate_limited"
@@ -385,6 +384,11 @@ export interface ChannelAdapter {
   /** Optional Weixin iLink multi-account & QR login methods (§3.1 ~ §3.5). */
   setBackendClient?(client: BackendClient): void;
   setLeaseManager?(lease: GatewayLeaseManager): void;
+  /**
+   * Loads and applies the initial managed account snapshot BEFORE the gateway lifts
+   * startup write gating and before long-polling starts (R4 #5).
+   */
+  prepareStartupSnapshot?(): Promise<void>;
   /**
    * Synchronously abort every in-flight network request (sendmessage, CDN upload,
    * QR login, long-poll loops) without waiting for handlers to settle (D1 / §3.2).

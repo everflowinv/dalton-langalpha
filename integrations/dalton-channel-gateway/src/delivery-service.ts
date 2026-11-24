@@ -1,12 +1,19 @@
 import { createHash } from "node:crypto";
 import { basename } from "node:path";
-import type {
-  BackendClient,
-  DeliveryActivityOrigin,
-  WeixinPreflightAuthorizedData,
+import {
+  type BackendClient,
+  BackendHttpError,
+  type DeliveryActivityOrigin,
+  type I6AuthorizeAndClaimRequest,
+  type I6AuthorizeAndClaimResponse,
+  type WeixinPreflightAuthorizedData,
 } from "./backend-client.js";
 import { ChannelDeliveryError, type ChannelAdapter } from "./channels/adapter.js";
 import { isStaleGatewayEpochError } from "./gateway-lease.js";
+import {
+  createSubsystemLogger,
+  extractSafeLogErrorFields,
+} from "./shared/logger.js";
 import {
   type AgentSendFileOutcome,
   type AgentSendFileRef,
@@ -19,6 +26,38 @@ import {
   MAX_SEND_TEXT_CHARS,
   MAX_TOTAL_ATTACHMENT_BYTES,
 } from "./types.js";
+
+/** R4 Design: in-delivery bounded backoff retry for retryable preflight (`roster_lookup_error`) and I-6 503. */
+export const WEIXIN_PREFLIGHT_RETRY_INITIAL_DELAY_MS = 1_000;
+export const WEIXIN_PREFLIGHT_RETRY_MAX_DELAY_MS = 16_000;
+export const WEIXIN_PREFLIGHT_RETRY_MAX_ELAPSED_MS = 3 * 60 * 1000;
+export const DELIVERY_CLAIM_503_INITIAL_DELAY_MS = 1_000;
+export const DELIVERY_CLAIM_503_MAX_DELAY_MS = 8_000;
+export const DELIVERY_CLAIM_503_MAX_ATTEMPTS = 5;
+
+export async function abortableRetrySleep(
+  ms: number,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (signal?.aborted) {
+    return false;
+  }
+  if (ms <= 0) {
+    return true;
+  }
+  return await new Promise<boolean>((resolve) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, ms);
+    (timer as { unref?: () => void }).unref?.();
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 export interface ExecuteDeliveryOptions {
   deliveryKey: string;
@@ -49,9 +88,16 @@ export interface FirstCurrentDeliveryInfo {
 }
 
 export class DeliveryService {
-  private static readonly MAX_CACHED_DEFERRED_PAYLOADS = 2_000;
   private readonly backend: BackendClient;
   private readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
+  private readonly logger = createSubsystemLogger("delivery-service");
+  private readonly retryDelayFn: (
+    ms: number,
+    signal?: AbortSignal,
+  ) => Promise<boolean>;
+  private readonly preflightRetryMaxElapsedMs: number;
+  private readonly claim503MaxAttempts: number;
+  private readonly nowFn: () => number;
   private readonly firstCurrentDeliveryListeners = new Set<
     (info: FirstCurrentDeliveryInfo) => void
   >();
@@ -59,19 +105,27 @@ export class DeliveryService {
     string,
     Set<Promise<AgentSendResponse>>
   >();
-  private readonly deferredPayloadsByKey = new Map<
-    string,
-    ExecuteDeliveryOptions
-  >();
+  private retryAbortController = new AbortController();
   private startupBlocked = false;
 
   constructor(options: {
     backend: BackendClient;
     adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
     onFirstCurrentDelivery?: (info: FirstCurrentDeliveryInfo) => void;
+    retryDelayFn?: (ms: number, signal?: AbortSignal) => Promise<boolean>;
+    preflightRetryMaxElapsedMs?: number;
+    claim503MaxAttempts?: number;
+    nowFn?: () => number;
   }) {
     this.backend = options.backend;
     this.adapters = options.adapters;
+    this.retryDelayFn = options.retryDelayFn ?? abortableRetrySleep;
+    this.preflightRetryMaxElapsedMs =
+      options.preflightRetryMaxElapsedMs ??
+      WEIXIN_PREFLIGHT_RETRY_MAX_ELAPSED_MS;
+    this.claim503MaxAttempts =
+      options.claim503MaxAttempts ?? DELIVERY_CLAIM_503_MAX_ATTEMPTS;
+    this.nowFn = options.nowFn ?? (() => Date.now());
     if (options.onFirstCurrentDelivery) {
       this.firstCurrentDeliveryListeners.add(options.onFirstCurrentDelivery);
     }
@@ -79,56 +133,18 @@ export class DeliveryService {
 
   /**
    * Blocks new I-6 delivery claims while startup `mode=startup` recovery is still running (D1 / §3.5).
+   * When blocking (e.g. on lease loss), also aborts any in-delivery retry waits immediately.
    */
   setStartupBlocked(blocked: boolean): void {
     this.startupBlocked = blocked;
-  }
-
-  hasDeferredPayload(deliveryKey: string): boolean {
-    return this.deferredPayloadsByKey.has(deliveryKey);
-  }
-
-  clearDeferredPayloads(): void {
-    this.deferredPayloadsByKey.clear();
-  }
-
-  /**
-   * Replays a previously deferred (`deferred` / `partial_deferred`) delivery under its
-   * original `deliveryKey`, re-claiming via I-6 and sending only remaining unsent chunks/files.
-   */
-  async replayDeferredDelivery(
-    deliveryKey: string,
-  ): Promise<AgentSendResponse | null> {
-    const saved = this.deferredPayloadsByKey.get(deliveryKey);
-    if (!saved) {
-      return null;
+    if (blocked) {
+      this.abortAllRetries();
     }
-    return await this.executeDelivery(saved);
   }
 
-  private rememberDeferredPayload(options: ExecuteDeliveryOptions): void {
-    const key = options.deliveryKey;
-    if (this.deferredPayloadsByKey.has(key)) {
-      this.deferredPayloadsByKey.delete(key);
-    } else if (
-      this.deferredPayloadsByKey.size >=
-      DeliveryService.MAX_CACHED_DEFERRED_PAYLOADS
-    ) {
-      const oldest = this.deferredPayloadsByKey.values().next().value;
-      if (oldest) {
-        this.deferredPayloadsByKey.delete(oldest.deliveryKey);
-      }
-    }
-    this.deferredPayloadsByKey.set(key, {
-      ...options,
-      ...(options.files
-        ? { files: options.files.map((file) => ({ ...file })) }
-        : {}),
-    });
-  }
-
-  private forgetDeferredPayload(deliveryKey: string): void {
-    this.deferredPayloadsByKey.delete(deliveryKey);
+  abortAllRetries(): void {
+    this.retryAbortController.abort();
+    this.retryAbortController = new AbortController();
   }
 
   addFirstCurrentDeliveryListener(
@@ -335,26 +351,45 @@ export class DeliveryService {
         : [rawText]
       : [];
 
-    const claim = await this.backend.authorizeAndClaimDelivery({
-      delivery_key: options.deliveryKey,
-      kind: options.kind,
-      user_id: options.userId ?? null,
-      thread_id: options.threadId ?? null,
-      run_id: options.runId ?? null,
-      execution_id: options.executionId ?? null,
-      automation_execution_id: options.automationExecutionId ?? null,
-      platform: options.platform ?? preliminaryPlat ?? null,
-      target: options.target ?? null,
-      inbound_message_id: options.inboundMessageId ?? null,
-      has_non_empty_text: hasNonEmptyText,
-      total_chunks: Math.max(preliminaryChunks.length, hasNonEmptyText ? 1 : 0),
-      source_scope_key: options.sourceScopeKey ?? options.threadScopeKey ?? null,
-      source_generation: options.sourceGeneration ?? null,
-      activity_origin: options.activityOrigin ?? null,
-    });
+    let claim: I6AuthorizeAndClaimResponse;
+    try {
+      claim = await this.claimDeliveryWith503Retry({
+        delivery_key: options.deliveryKey,
+        kind: options.kind,
+        user_id: options.userId ?? null,
+        thread_id: options.threadId ?? null,
+        run_id: options.runId ?? null,
+        execution_id: options.executionId ?? null,
+        automation_execution_id: options.automationExecutionId ?? null,
+        platform: preliminaryPlat ?? options.platform ?? null,
+        target: options.target ?? null,
+        inbound_message_id: options.inboundMessageId ?? null,
+        has_non_empty_text: hasNonEmptyText,
+        total_chunks: Math.max(preliminaryChunks.length, hasNonEmptyText ? 1 : 0),
+        source_scope_key: options.sourceScopeKey ?? options.threadScopeKey ?? null,
+        source_generation: options.sourceGeneration ?? null,
+        activity_origin: options.activityOrigin ?? null,
+      });
+    } catch (err) {
+      if (isStaleGatewayEpochError(err)) {
+        throw err;
+      }
+      if (err instanceof BackendHttpError && err.status === 503) {
+        untrackIfNotCurrent?.();
+        return {
+          status: "failed",
+          code: "unavailable",
+          address: options.target ?? null,
+          current: options.target === undefined || options.target === null,
+          duplicate: false,
+          message: "Delivery authorization is temporarily unavailable (503).",
+          files: [],
+        };
+      }
+      throw err;
+    }
 
     if (claim.claim_status === "already_completed") {
-      this.forgetDeferredPayload(options.deliveryKey);
       if (!claim.is_current) {
         untrackIfNotCurrent?.();
       }
@@ -390,7 +425,6 @@ export class DeliveryService {
     }
 
     if (claim.claim_status === "denied") {
-      this.forgetDeferredPayload(options.deliveryKey);
       if (!claim.is_current) {
         untrackIfNotCurrent?.();
       }
@@ -398,34 +432,17 @@ export class DeliveryService {
         claim.code === "unknown_delivery_blocks_fallback"
           ? null
           : ((claim.code ?? "not_allowed") as AgentSendResponse["code"]);
+      // R4 #7 (Codex #12): preserve `status: "unknown"` when backend denies with unknown state (e.g. `source_generation_unknown`).
+      const deniedStatus: AgentSendResponse["status"] =
+        claim.status === "unknown" ? "unknown" : "failed";
       return {
-        status: "failed",
+        status: deniedStatus,
         code: mappedCode,
         address: claim.target_address ?? options.target ?? null,
         current: Boolean(claim.is_current),
         duplicate: false,
         message: claim.message ?? "Delivery was refused.",
         files: [],
-      };
-    }
-
-    if (claim.claim_status === "deferred") {
-      this.rememberDeferredPayload(options);
-      if (!claim.is_current) {
-        untrackIfNotCurrent?.();
-      }
-      const deferredStatus: AgentSendResponse["status"] =
-        claim.status === "partial_deferred" ? "partial_deferred" : "deferred";
-      return {
-        status: deferredStatus,
-        code: "unavailable",
-        address: claim.target_address ?? options.target ?? null,
-        current: Boolean(claim.is_current),
-        duplicate: false,
-        message:
-          claim.message ??
-          "Delivery is deferred and waiting for its next retry window.",
-        files: Array.isArray(claim.files_status) ? claim.files_status : [],
       };
     }
 
@@ -458,7 +475,6 @@ export class DeliveryService {
     const daltonUserId = (options.userId ?? "").trim();
 
     if (!isSupportedPlatform(platformStr) || !targetAddress) {
-      this.forgetDeferredPayload(options.deliveryKey);
       const failResp: AgentSendResponse = {
         status: "failed",
         code: "unavailable",
@@ -480,7 +496,6 @@ export class DeliveryService {
 
     const adapter = this.adapters.get(platformStr);
     if (!adapter || !adapter.isConfigured() || !adapter.isConnected()) {
-      this.forgetDeferredPayload(options.deliveryKey);
       const failResp: AgentSendResponse = {
         status: "failed",
         code: "unavailable",
@@ -528,39 +543,8 @@ export class DeliveryService {
       }
     }
 
-    // Round 3 Decision #6: resume from persisted breakpoint fields when retrying a `partial_deferred` delivery.
-    const resumeSentChunks = Math.max(
-      0,
-      Math.min(
-        chunks.length,
-        typeof claim.sent_chunks === "number" && Number.isFinite(claim.sent_chunks)
-          ? Math.trunc(claim.sent_chunks)
-          : 0,
-      ),
-    );
-    const platformMessageIds: string[] = Array.isArray(claim.platform_message_ids)
-      ? [...claim.platform_message_ids]
-      : [];
-    const deliveredSegments: unknown[] = Array.isArray(claim.delivered_segments)
-      ? [...claim.delivered_segments]
-      : [];
-    const priorDeliveredFilesByPath = new Map<string, AgentSendFileOutcome>();
-    if (Array.isArray(claim.files_status)) {
-      for (const entry of claim.files_status) {
-        if (
-          entry &&
-          typeof entry.path === "string" &&
-          (entry.status === "sent" || entry.status === "linked")
-        ) {
-          priorDeliveredFilesByPath.set(entry.path, {
-            path: entry.path,
-            status: entry.status,
-            reason: entry.reason ?? null,
-          });
-        }
-      }
-    }
-    let sentChunks = resumeSentChunks;
+    const platformMessageIds: string[] = [];
+    let sentChunks = 0;
     let firstCurrentDeliveryNotified = false;
     const isFeedbackTrackedKind =
       options.kind === "agent_send" ||
@@ -583,7 +567,7 @@ export class DeliveryService {
     const reuseConfirmedThread =
       platformStr === "discord" && confirmedThreadAddress.length > 0;
     let chunkFailure: {
-      outcome: "failed" | "unknown" | "deferred";
+      outcome: "failed" | "unknown";
       code: AgentSendResponse["code"];
       denyCode?: string;
       retryable?: boolean;
@@ -610,7 +594,7 @@ export class DeliveryService {
       return fn({ signal: undefined, attachAccount: () => undefined });
     };
 
-    for (let i = resumeSentChunks; i < chunks.length; i++) {
+    for (let i = 0; i < chunks.length; i++) {
       const chunkText = chunks[i]!;
       try {
         const res = await runWithWeixinSignal(
@@ -625,6 +609,7 @@ export class DeliveryService {
                 options.deliveryKey,
                 effectiveWeixinAttempt,
                 i,
+                signal,
               );
               attachAccount(weixinPreflight.account_id);
               if (signal?.aborted) {
@@ -687,11 +672,6 @@ export class DeliveryService {
         );
         sentChunks += 1;
         platformMessageIds.push(res.messageId);
-        deliveredSegments.push({
-          kind: "text",
-          index: i,
-          message_id: res.messageId,
-        });
         if (res.resolvedAddress) {
           finalAddress = res.resolvedAddress;
         }
@@ -701,9 +681,6 @@ export class DeliveryService {
           sent_chunks: sentChunks,
           total_chunks: totalChunks,
           platform_message_ids: [...platformMessageIds],
-          ...(platformStr === "weixin"
-            ? { delivered_segments: [...deliveredSegments] }
-            : {}),
         });
       } catch (err) {
         if (isStaleGatewayEpochError(err)) {
@@ -712,12 +689,7 @@ export class DeliveryService {
         }
         if (err instanceof ChannelDeliveryError) {
           chunkFailure = {
-            outcome:
-              err.outcome === "unknown"
-                ? "unknown"
-                : err.outcome === "deferred"
-                  ? "deferred"
-                  : "failed",
+            outcome: err.outcome === "unknown" ? "unknown" : "failed",
             code: err.code,
             denyCode: err.denyCode,
             retryable: err.retryable,
@@ -740,19 +712,12 @@ export class DeliveryService {
     let anyFileSucceeded = false;
     let anyFileFailed = false;
     let fileUnknownError: string | null = null;
-    let fileDeferredError: string | null = null;
     let fileFailureCode: AgentSendResponse["code"] = null;
     let fileFailureDenyCode: string | undefined;
 
     if (!chunkFailure) {
       for (let fileIdx = 0; fileIdx < files.length; fileIdx += 1) {
         const fileRef = files[fileIdx]!;
-        const alreadySentFile = priorDeliveredFilesByPath.get(fileRef.path);
-        if (alreadySentFile) {
-          anyFileSucceeded = true;
-          fileOutcomes.push(alreadySentFile);
-          continue;
-        }
         const wsId = fileRef.workspace_id || claim.home_workspace_id || "";
         if (!wsId) {
           anyFileFailed = true;
@@ -816,6 +781,7 @@ export class DeliveryService {
                   options.deliveryKey,
                   effectiveWeixinAttempt,
                   fileChunkIndex,
+                  signal,
                 );
                 attachAccount(weixinPreflight.account_id);
                 if (signal?.aborted) {
@@ -847,10 +813,12 @@ export class DeliveryService {
                 refreshWeixinPreflight:
                   platformStr === "weixin"
                     ? () =>
-                        this.backend.preflightWeixinSend(options.deliveryKey, {
-                          delivery_attempt: effectiveWeixinAttempt,
-                          chunk_index: fileChunkIndex,
-                        })
+                        this.runWeixinPreflight(
+                          options.deliveryKey,
+                          effectiveWeixinAttempt,
+                          fileChunkIndex,
+                          signal,
+                        )
                     : undefined,
               });
             },
@@ -859,12 +827,6 @@ export class DeliveryService {
             sendRes.status === "sent" || sendRes.status === "linked";
           if (fileSucceeded) {
             platformMessageIds.push(sendRes.messageId);
-            deliveredSegments.push({
-              kind: "file",
-              index: fileIdx,
-              path: fileRef.path,
-              message_id: sendRes.messageId,
-            });
             anyFileSucceeded = true;
             maybeNotifyFirstCurrentDelivery();
           } else {
@@ -882,9 +844,6 @@ export class DeliveryService {
               total_chunks: totalChunks,
               platform_message_ids: [...platformMessageIds],
               files_status: [...fileOutcomes],
-              ...(platformStr === "weixin"
-                ? { delivered_segments: [...deliveredSegments] }
-                : {}),
             });
           }
         } catch (err) {
@@ -893,14 +852,10 @@ export class DeliveryService {
           }
           anyFileFailed = true;
           let fileEntryStatus: AgentSendFileOutcome["status"] = "failed";
-          let isFileDeferred = false;
           if (err instanceof ChannelDeliveryError) {
             if (err.outcome === "unknown") {
               fileUnknownError = err.message;
               fileEntryStatus = "unknown";
-            } else if (err.outcome === "deferred") {
-              fileDeferredError = err.message;
-              isFileDeferred = true;
             }
             if (!fileFailureCode) {
               fileFailureCode = err.code;
@@ -913,10 +868,6 @@ export class DeliveryService {
               err instanceof Error ? err.message : String(err);
             fileEntryStatus = "unknown";
           }
-          if (isFileDeferred) {
-            // Leave the deferred file out of `fileOutcomes` so the next retry resumes cleanly.
-            break;
-          }
           fileOutcomes.push({
             path: fileRef.path,
             status: fileEntryStatus,
@@ -925,48 +876,23 @@ export class DeliveryService {
         }
       }
     } else if (files.length > 0) {
-      if (chunkFailure.outcome === "deferred") {
-        for (const fileRef of files) {
-          const alreadySentFile = priorDeliveredFilesByPath.get(fileRef.path);
-          if (alreadySentFile) {
-            anyFileSucceeded = true;
-            fileOutcomes.push(alreadySentFile);
-          }
-        }
-      } else {
-        for (const fileRef of files) {
-          const alreadySentFile = priorDeliveredFilesByPath.get(fileRef.path);
-          if (alreadySentFile) {
-            anyFileSucceeded = true;
-            fileOutcomes.push(alreadySentFile);
-            continue;
-          }
-          anyFileFailed = true;
-          fileOutcomes.push({
-            path: fileRef.path,
-            status: "failed",
-            reason: "Skipped because earlier message chunk failed",
-          });
-        }
+      for (const fileRef of files) {
+        anyFileFailed = true;
+        fileOutcomes.push({
+          path: fileRef.path,
+          status: "failed",
+          reason: "Skipped because earlier message chunk failed",
+        });
       }
     }
 
-    const somethingSucceeded =
-      sentChunks > 0 || anyFileSucceeded || priorDeliveredFilesByPath.size > 0;
+    const somethingSucceeded = sentChunks > 0 || anyFileSucceeded;
     let finalStatus: AgentSendResponse["status"];
     let finalCode: AgentSendResponse["code"] = null;
     let finalMessage: string;
 
     if (chunkFailure) {
-      if (chunkFailure.outcome === "deferred") {
-        // Round 3 Decision #6: when earlier chunks/files already delivered and a later chunk hits
-        // retryable defer, settle as `partial_deferred` so retry resumes remaining segments.
-        finalStatus = somethingSucceeded ? "partial_deferred" : "deferred";
-        finalCode = chunkFailure.code;
-        finalMessage = somethingSucceeded
-          ? `Delivered ${sentChunks}/${totalChunks} text chunks before defer: ${chunkFailure.message}`
-          : chunkFailure.message;
-      } else if (chunkFailure.outcome === "unknown") {
+      if (chunkFailure.outcome === "unknown") {
         // Round 3 Decision #9: `unknown` overrides `partial` ONLY on Weixin;
         // Feishu & Discord preserve original `partial` settlement when earlier chunks succeeded.
         if (platformStr === "weixin" || !somethingSucceeded) {
@@ -1000,12 +926,6 @@ export class DeliveryService {
           finalCode = fileFailureCode ?? "unavailable";
           finalMessage = "Message delivered, but one or more attached files failed.";
         }
-      } else if (fileDeferredError) {
-        finalStatus = somethingSucceeded ? "partial_deferred" : "deferred";
-        finalCode = fileFailureCode ?? "unavailable";
-        finalMessage = somethingSucceeded
-          ? `Delivered partial content before file defer: ${fileDeferredError}`
-          : fileDeferredError;
       } else if (somethingSucceeded) {
         finalStatus = "partial";
         finalCode = fileFailureCode;
@@ -1035,87 +955,210 @@ export class DeliveryService {
       platformStr === "weixin"
         ? (chunkFailure?.denyCode ?? fileFailureDenyCode ?? finalCode)
         : finalCode;
-    const isDeferredSettlement =
-      finalStatus === "deferred" || finalStatus === "partial_deferred";
 
-    const progressAck = await recordProgress({
+    await recordProgress({
       delivery_key: options.deliveryKey,
       sent_chunks: sentChunks,
       total_chunks: totalChunks,
       platform_message_ids: platformMessageIds,
       files_status: fileOutcomes,
-      ...(platformStr === "weixin" && deliveredSegments.length > 0
-        ? { delivered_segments: deliveredSegments }
-        : {}),
       first_response_json: responseObj as unknown as Record<string, unknown>,
       status: finalStatus,
-      ...(isDeferredSettlement ? { outcome: finalStatus } : {}),
       error_code: recordedErrorCode,
       error_message: finalStatus === "sent" ? null : finalMessage,
     });
 
-    if (isDeferredSettlement && progressAck?.expired_to_failed === true) {
-      this.forgetDeferredPayload(options.deliveryKey);
-      return {
-        ...responseObj,
-        status: "failed",
-        code: "unavailable",
-        message: "Delivery defer window (24h) exceeded.",
-      };
-    }
-
-    if (isDeferredSettlement) {
-      this.rememberDeferredPayload(options);
-    } else {
-      this.forgetDeferredPayload(options.deliveryKey);
-    }
-
     return responseObj;
+  }
+
+  private async claimDeliveryWith503Retry(
+    req: I6AuthorizeAndClaimRequest,
+  ): Promise<I6AuthorizeAndClaimResponse> {
+    const signal = this.retryAbortController.signal;
+    let delayMs = DELIVERY_CLAIM_503_INITIAL_DELAY_MS;
+    for (let attempt = 1; attempt <= this.claim503MaxAttempts; attempt += 1) {
+      if (this.startupBlocked || signal.aborted) {
+        throw new BackendHttpError(
+          "Delivery claim aborted due to lease loss or shutdown",
+          503,
+          { code: "gateway_stopping" },
+        );
+      }
+      try {
+        return await this.backend.authorizeAndClaimDelivery(req, { signal });
+      } catch (err) {
+        if (isStaleGatewayEpochError(err)) {
+          throw err;
+        }
+        const isRetryable503 =
+          err instanceof BackendHttpError && err.status === 503;
+        if (!isRetryable503 || attempt >= this.claim503MaxAttempts) {
+          throw err;
+        }
+        this.logger.warn("I-6 authorize-and-claim returned 503; retrying in delivery", {
+          delivery_key: req.delivery_key,
+          platform: req.platform ?? null,
+          attempt,
+          delay_ms: delayMs,
+          ...extractSafeLogErrorFields(err),
+        });
+        const slept = await this.retryDelayFn(delayMs, signal);
+        if (!slept || this.startupBlocked || signal.aborted) {
+          throw err;
+        }
+        delayMs = Math.min(delayMs * 2, DELIVERY_CLAIM_503_MAX_DELAY_MS);
+      }
+    }
+    throw new BackendHttpError("I-6 authorize-and-claim failed (503)", 503, null);
   }
 
   private async runWeixinPreflight(
     deliveryKey: string,
     deliveryAttempt: number,
     chunkIndex: number,
+    signal?: AbortSignal,
   ): Promise<WeixinPreflightAuthorizedData> {
-    const pf = await this.backend.preflightWeixinSend(deliveryKey, {
-      delivery_attempt: deliveryAttempt,
-      chunk_index: chunkIndex,
-    });
-    if (pf.authorized) {
-      return pf;
-    }
-    if (pf.deny_code === "source_generation_unknown") {
-      throw new ChannelDeliveryError(
-        pf.message ?? "Weixin delivery source generation is unknown.",
-        {
-          outcome: "unknown",
+    const combinedSignal = signal
+      ? AbortSignal.any([signal, this.retryAbortController.signal])
+      : this.retryAbortController.signal;
+    const startedAt = this.nowFn();
+    let accumulatedDelayMs = 0;
+    let delayMs = WEIXIN_PREFLIGHT_RETRY_INITIAL_DELAY_MS;
+    let attempt = 0;
+    const getRemainingBudgetMs = (): number =>
+      this.preflightRetryMaxElapsedMs -
+      Math.max(this.nowFn() - startedAt, accumulatedDelayMs);
+
+    for (;;) {
+      attempt += 1;
+      if (this.startupBlocked || combinedSignal.aborted) {
+        throw new ChannelDeliveryError("Weixin preflight aborted", {
+          outcome: "failed",
           code: "unavailable",
+          retryable: false,
+        });
+      }
+
+      let pf: Awaited<ReturnType<BackendClient["preflightWeixinSend"]>>;
+      try {
+        pf = await this.backend.preflightWeixinSend(
+          deliveryKey,
+          {
+            delivery_attempt: deliveryAttempt,
+            chunk_index: chunkIndex,
+          },
+          { signal: combinedSignal },
+        );
+      } catch (err) {
+        if (isStaleGatewayEpochError(err)) {
+          throw err;
+        }
+        if (this.startupBlocked || combinedSignal.aborted) {
+          throw new ChannelDeliveryError("Weixin preflight aborted", {
+            outcome: "failed",
+            code: "unavailable",
+            retryable: false,
+          });
+        }
+        const isRetryable503 =
+          err instanceof BackendHttpError && err.status === 503;
+        if (!isRetryable503) {
+          throw err;
+        }
+        const remainingMs = getRemainingBudgetMs();
+        if (remainingMs <= 0) {
+          throw new ChannelDeliveryError(
+            "Weixin preflight remained temporarily unavailable (503).",
+            {
+              outcome: "failed",
+              code: "unavailable",
+              retryable: false,
+              denyCode: "roster_lookup_error",
+            },
+          );
+        }
+        const waitMs = Math.min(delayMs, remainingMs);
+        this.logger.warn("Weixin preflight returned 503; retrying in delivery", {
+          delivery_key: deliveryKey,
+          chunk_index: chunkIndex,
+          attempt,
+          delay_ms: waitMs,
+          ...extractSafeLogErrorFields(err),
+        });
+        const slept = await this.retryDelayFn(waitMs, combinedSignal);
+        accumulatedDelayMs += waitMs;
+        if (!slept || this.startupBlocked || combinedSignal.aborted) {
+          throw new ChannelDeliveryError("Weixin preflight aborted", {
+            outcome: "failed",
+            code: "unavailable",
+            retryable: false,
+          });
+        }
+        delayMs = Math.min(delayMs * 2, WEIXIN_PREFLIGHT_RETRY_MAX_DELAY_MS);
+        continue;
+      }
+
+      if (pf.authorized) {
+        return pf;
+      }
+      if (pf.deny_code === "source_generation_unknown") {
+        throw new ChannelDeliveryError(
+          pf.message ?? "Weixin delivery source generation is unknown.",
+          {
+            outcome: "unknown",
+            code: "unavailable",
+            retryable: false,
+            denyCode: pf.deny_code,
+          },
+        );
+      }
+      if (pf.retryable === true || pf.decision === "defer") {
+        const remainingMs = getRemainingBudgetMs();
+        if (remainingMs <= 0) {
+          throw new ChannelDeliveryError(
+            pf.message ??
+              `Weixin send preflight remained unavailable (${pf.deny_code}).`,
+            {
+              outcome: "failed",
+              code: "unavailable",
+              retryable: false,
+              denyCode: pf.deny_code,
+            },
+          );
+        }
+        const waitMs = Math.min(delayMs, remainingMs);
+        this.logger.warn(
+          "Weixin preflight returned retryable denial; retrying in delivery",
+          {
+            delivery_key: deliveryKey,
+            chunk_index: chunkIndex,
+            attempt,
+            delay_ms: waitMs,
+            error_code: pf.deny_code,
+          },
+        );
+        const slept = await this.retryDelayFn(waitMs, combinedSignal);
+        accumulatedDelayMs += waitMs;
+        if (!slept || this.startupBlocked || combinedSignal.aborted) {
+          throw new ChannelDeliveryError("Weixin preflight aborted", {
+            outcome: "failed",
+            code: "unavailable",
+            retryable: false,
+          });
+        }
+        delayMs = Math.min(delayMs * 2, WEIXIN_PREFLIGHT_RETRY_MAX_DELAY_MS);
+        continue;
+      }
+      throw new ChannelDeliveryError(
+        pf.message ?? `Weixin send denied (${pf.deny_code}).`,
+        {
+          outcome: "failed",
+          code: "not_allowed",
           retryable: false,
           denyCode: pf.deny_code,
         },
       );
     }
-    if (pf.decision === "defer" || pf.retryable) {
-      throw new ChannelDeliveryError(
-        pf.message ?? `Weixin send deferred (${pf.deny_code}); please retry.`,
-        {
-          outcome: "deferred",
-          code: "unavailable",
-          retryable: true,
-          denyCode: pf.deny_code,
-        },
-      );
-    }
-    throw new ChannelDeliveryError(
-      pf.message ?? `Weixin send denied (${pf.deny_code}).`,
-      {
-        outcome: "failed",
-        code: "not_allowed",
-        retryable: false,
-        denyCode: pf.deny_code,
-      },
-    );
   }
 
   /**
@@ -1195,14 +1238,15 @@ export class DeliveryService {
     explicitPlatform?: string | null,
     target?: string | null,
   ): ChannelPlatform | null {
-    if (explicitPlatform && isSupportedPlatform(explicitPlatform.toLowerCase())) {
-      return explicitPlatform.toLowerCase() as ChannelPlatform;
-    }
+    // R4 #1: Target address platform ALWAYS takes precedence over turn/origin platform.
     if (target) {
-      const [prefix] = target.split(":", 1);
+      const [prefix] = target.trim().split(":", 1);
       if (prefix && isSupportedPlatform(prefix.toLowerCase())) {
         return prefix.toLowerCase() as ChannelPlatform;
       }
+    }
+    if (explicitPlatform && isSupportedPlatform(explicitPlatform.toLowerCase())) {
+      return explicitPlatform.toLowerCase() as ChannelPlatform;
     }
     return null;
   }

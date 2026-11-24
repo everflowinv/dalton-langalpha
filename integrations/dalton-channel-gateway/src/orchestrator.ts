@@ -3,7 +3,6 @@ import type { AgentRoutesHandler } from "./agent-routes.js";
 import {
   type BackendClient,
   BackendHttpError,
-  type DeferredDeliveryDueRow,
   type DeliveryActivityOrigin,
   type I1RegisterAndResolveResponse,
   type I3SessionCommandRequest,
@@ -36,7 +35,10 @@ import {
 import type { DeliveryService } from "./delivery-service.js";
 import { isStaleGatewayEpochError } from "./gateway-lease.js";
 import { ProcessingFeedbackCoordinator } from "./processing-feedback.js";
-import { createSubsystemLogger } from "./shared/logger.js";
+import {
+  createSubsystemLogger,
+  extractSafeLogErrorFields,
+} from "./shared/logger.js";
 import {
   ACTIVE_WAKEUP_STATES,
   type AgentSendResponse,
@@ -77,6 +79,14 @@ import {
 const BACKOFF_DELAYS_MS = [1000, 2000, 4000];
 const CAPACITY_BACKOFF_DELAYS_MS = [2000, 4000, 8000];
 export const DEFAULT_BUSY_THREAD_MAX_WAIT_MS = 30 * 60 * 1000;
+/** R4 #3 (Codex #7): bounded in-process backoff retry when collect buffer status query fails (timeout / 5xx). */
+export const COLLECT_STATUS_RETRY_MAX_ATTEMPTS = 5;
+export const COLLECT_STATUS_RETRY_INITIAL_DELAY_MS = 1_000;
+export const COLLECT_STATUS_RETRY_MAX_DELAY_MS = 16_000;
+/** R4 #4 (Codex #8): bounded retry & delayed recheck for cancelled/aborted workspace upload cleanup. */
+export const WORKSPACE_CLEANUP_MAX_ATTEMPTS = 3;
+export const WORKSPACE_CLEANUP_RETRY_DELAY_MS = 500;
+export const WORKSPACE_CLEANUP_LATE_RECHECK_DELAY_MS = 1_500;
 
 export interface PendingNeedsInputNotice {
   wsName: string;
@@ -352,7 +362,14 @@ export class ChannelGatewayOrchestrator {
     { accountId?: string; controllers: Set<AbortController> }
   >();
   private readonly activeCollectItemKeys = new Set<string>();
-  private readonly activeInboundUploadControllers = new Set<AbortController>();
+  private readonly activeInboundUploadControllers = new Map<
+    AbortController,
+    { accountId?: string }
+  >();
+  private readonly pendingCleanupTimers = new Set<
+    ReturnType<typeof setTimeout>
+  >();
+  private readonly collectCleanupLateRecheckMs: number;
   private readonly lastActiveCollectBufferByScope = new Map<
     string,
     { bufferId: string; userId?: string | null }
@@ -368,6 +385,7 @@ export class ChannelGatewayOrchestrator {
     statusFeedback?: StatusFeedbackConfig;
     backoffDelayFn?: (ms: number) => Promise<void>;
     busyThreadMaxWaitMs?: number;
+    collectCleanupLateRecheckMs?: number;
     nowFn?: () => number;
   }) {
     this.backend = options.backend;
@@ -380,6 +398,9 @@ export class ChannelGatewayOrchestrator {
       ((ms: number) => new Promise((r) => setTimeout(r, ms)));
     this.busyThreadMaxWaitMs =
       options.busyThreadMaxWaitMs ?? DEFAULT_BUSY_THREAD_MAX_WAIT_MS;
+    this.collectCleanupLateRecheckMs =
+      options.collectCleanupLateRecheckMs ??
+      WORKSPACE_CLEANUP_LATE_RECHECK_DELAY_MS;
     this.nowFn = options.nowFn ?? (() => Date.now());
     this.processingFeedback = new ProcessingFeedbackCoordinator({
       adapters: options.adapters,
@@ -429,18 +450,33 @@ export class ChannelGatewayOrchestrator {
         this.cancelCollectBufferUploads(bufferId);
       }
     }
+    // R4 #4 (Codex #8): also abort normal Weixin inbound attachment uploads when the account rotates/invalidates.
+    for (const [ctrl, meta] of [...this.activeInboundUploadControllers.entries()]) {
+      if (meta.accountId === cleanAccountId) {
+        ctrl.abort();
+        this.activeInboundUploadControllers.delete(ctrl);
+      }
+    }
   }
 
   private isCollectBufferCancelled(bufferId: string): boolean {
     return this.shuttingDown || this.cancelledCollectBuffers.has(bufferId);
   }
 
+  private clearPendingCleanupTimers(): void {
+    for (const timer of [...this.pendingCleanupTimers]) {
+      clearTimeout(timer);
+    }
+    this.pendingCleanupTimers.clear();
+  }
+
   /**
    * Synchronously aborts all in-flight Weixin collect-buffer AND normal inbound
-   * workspace uploads (Round 3 Decision #1 & #7).
+   * workspace uploads (Round 3 Decision #1 & #7, R4 #4).
    */
   abortAllActiveCollectUploads(): void {
     this.shuttingDown = true;
+    this.clearPendingCleanupTimers();
     for (const [bufferId, entry] of [...this.activeCollectUploads.entries()]) {
       this.cancelledCollectBuffers.add(bufferId);
       for (const ctrl of entry.controllers) {
@@ -448,7 +484,7 @@ export class ChannelGatewayOrchestrator {
       }
       this.activeCollectUploads.delete(bufferId);
     }
-    for (const ctrl of [...this.activeInboundUploadControllers]) {
+    for (const ctrl of [...this.activeInboundUploadControllers.keys()]) {
       ctrl.abort();
     }
     this.activeInboundUploadControllers.clear();
@@ -1590,20 +1626,11 @@ export class ChannelGatewayOrchestrator {
         : {}),
     };
 
-    // Round 3 Decision #5: Weixin `/done` MUST NOT return success to the poll loop (which
-    // advances `get_updates_buf`) until backend confirms acceptance (either the I-3 call itself
-    // settles, or the known active collect buffer transitions to `flushing` while Phase B waits
-    // on in-flight uploads). If acceptance fails (e.g. 503 roster_lookup_error), throw so the
-    // cursor is retained & retried, and send a best-effort failure notice via preflight.
-    if (event.platform === "weixin" && parsedCmd.cmd === "done") {
-      await this.executeWeixinDoneWithAcceptanceConfirmation(
-        event,
-        parsedCmd,
-        sessionCommandPayload,
-      );
-      return true;
-    }
-
+    // R4 #2 (Codex #6): Weixin `/done` advances the cursor ONLY after THIS `/done`'s own I-3
+    // request is accepted (200) — never by observing an earlier `/done`'s `flushing` state.
+    // On `503` (e.g. `roster_lookup_error`), throwing retains the cursor for automatic retry
+    // without attempting an unclaimable pre-acceptance notice; the user gets the reply once
+    // the retried I-3 succeeds.
     // Round 3 Decision #4: `/cancel` calls I-3 FIRST and cancels ONLY the `cancelled_buffer_ids`
     // returned by backend (handled inside `completeSessionCommandExecution`), never blanket by account.
     const cmdRes = await this.backend.sessionCommand(sessionCommandPayload);
@@ -1616,196 +1643,6 @@ export class ChannelGatewayOrchestrator {
       cmdRes,
     });
     return true;
-  }
-
-  private async waitForCollectBufferFlushing(
-    bufferId: string,
-    stopSignal: AbortSignal,
-    maxWaitMs = 5_000,
-  ): Promise<boolean> {
-    if (typeof this.backend.getWeixinCollectBufferStatus !== "function") {
-      return false;
-    }
-    const deadline = this.nowFn() + maxWaitMs;
-    while (!stopSignal.aborted && this.nowFn() < deadline) {
-      try {
-        const st = await this.backend.getWeixinCollectBufferStatus(bufferId);
-        const status = (st.status ?? "").toLowerCase();
-        if (
-          status === "flushing" ||
-          status === "done" ||
-          status === "cancelled" ||
-          status === "expired"
-        ) {
-          return true;
-        }
-      } catch (err) {
-        if (isStaleGatewayEpochError(err)) {
-          throw err;
-        }
-        // Transient probe failure does not confirm acceptance; keep waiting for I-3 or next probe.
-      }
-      if (stopSignal.aborted) {
-        return false;
-      }
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, 50);
-        const onAbort = () => {
-          clearTimeout(timer);
-          resolve();
-        };
-        stopSignal.addEventListener("abort", onAbort, { once: true });
-      });
-    }
-    return false;
-  }
-
-  private async notifyWeixinDoneFailureBestEffort(
-    event: InboundChannelEvent,
-    knownUserId: string | null | undefined,
-  ): Promise<void> {
-    const uid = knownUserId?.trim();
-    if (!uid) return;
-    try {
-      await this.sendInboundNotice(
-        event,
-        uid,
-        `notice:weixin:${event.messageId}:done_failed`,
-        "提交材料收集时遇到临时服务异常，稍后会自动重试或请重新发送 `/done`。",
-      );
-    } catch (noticeErr) {
-      if (isStaleGatewayEpochError(noticeErr)) {
-        throw noticeErr;
-      }
-    }
-  }
-
-  private async executeWeixinDoneWithAcceptanceConfirmation(
-    event: InboundChannelEvent,
-    parsedCmd: Extract<ParsedSlashCommand, { kind: "session" }>,
-    sessionCommandPayload: I3SessionCommandRequest,
-  ): Promise<void> {
-    const scopeKey = this.collectScopeKey(
-      event.weixinAccountId,
-      event.threadScopeKey,
-    );
-    const knownBuffer = this.lastActiveCollectBufferByScope.get(scopeKey);
-    const hasPendingLocalUploads = Boolean(
-      knownBuffer?.bufferId &&
-        this.activeCollectUploads.has(knownBuffer.bufferId),
-    );
-
-    const doneRequestPromise = this.backend.sessionCommand(sessionCommandPayload);
-
-    // If there are no active local uploads for a known buffer, await I-3 directly so
-    // acceptance and any 503 error are observed before returning to the poll loop.
-    if (!knownBuffer?.bufferId || !hasPendingLocalUploads) {
-      try {
-        const cmdRes = await doneRequestPromise;
-        await this.completeSessionCommandExecution({
-          event,
-          cmd: parsedCmd.cmd,
-          targetKind: parsedCmd.targetKind ?? null,
-          workspaceQuery: parsedCmd.workspaceQuery ?? null,
-          cmdRes,
-        });
-        return;
-      } catch (err) {
-        if (isStaleGatewayEpochError(err)) {
-          throw err;
-        }
-        await this.notifyWeixinDoneFailureBestEffort(event, knownBuffer?.userId);
-        throw err;
-      }
-    }
-
-    // Active local uploads exist -> I-3 /done may block in Phase B waiting for uploads.
-    // Race I-3 against polling GET /collect-buffers/{id} until Phase A marks it `flushing`.
-    // Only return to the poll loop AFTER `flushing` is confirmed (so /cancel isn't blocked)
-    // OR after I-3 resolves; if I-3 rejects before acceptance, throw to retain the cursor!
-    const probeStop = new AbortController();
-    type RaceOutcome =
-      | { kind: "resolved"; cmdRes: I3SessionCommandResponse }
-      | { kind: "rejected"; error: unknown }
-      | { kind: "accepted_flushing" };
-
-    const raceOutcome = await new Promise<RaceOutcome>((resolve) => {
-      let settled = false;
-      const finish = (outcome: RaceOutcome): void => {
-        if (settled) return;
-        settled = true;
-        probeStop.abort();
-        resolve(outcome);
-      };
-
-      doneRequestPromise.then(
-        (cmdRes) => finish({ kind: "resolved", cmdRes }),
-        (error) => finish({ kind: "rejected", error }),
-      );
-
-      void this.waitForCollectBufferFlushing(
-        knownBuffer.bufferId,
-        probeStop.signal,
-      )
-        .then((confirmed) => {
-          if (confirmed) {
-            finish({ kind: "accepted_flushing" });
-          }
-        })
-        .catch((probeErr) => {
-          if (isStaleGatewayEpochError(probeErr)) {
-            finish({ kind: "rejected", error: probeErr });
-          }
-        });
-    });
-
-    if (raceOutcome.kind === "rejected") {
-      if (isStaleGatewayEpochError(raceOutcome.error)) {
-        throw raceOutcome.error;
-      }
-      await this.notifyWeixinDoneFailureBestEffort(event, knownBuffer.userId);
-      throw raceOutcome.error;
-    }
-
-    if (raceOutcome.kind === "resolved") {
-      await this.completeSessionCommandExecution({
-        event,
-        cmd: parsedCmd.cmd,
-        targetKind: parsedCmd.targetKind ?? null,
-        workspaceQuery: parsedCmd.workspaceQuery ?? null,
-        cmdRes: raceOutcome.cmdRes,
-      });
-      return;
-    }
-
-    // Accepted (`flushing` confirmed): finish Phase B/C in a tracked background task
-    // so same-account `/cancel` or `/help` can run immediately.
-    const bgDoneTask = (async () => {
-      const cmdRes = await doneRequestPromise;
-      await this.completeSessionCommandExecution({
-        event,
-        cmd: parsedCmd.cmd,
-        targetKind: parsedCmd.targetKind ?? null,
-        workspaceQuery: parsedCmd.workspaceQuery ?? null,
-        cmdRes,
-      });
-    })().catch(async (err) => {
-      if (isStaleGatewayEpochError(err)) {
-        return;
-      }
-      this.logger.warn("Background Weixin /done completion failed after acceptance", {
-        account_id: event.weixinAccountId ?? null,
-        message_id: event.messageId,
-        error_name: err instanceof Error ? err.name : "Error",
-      });
-      await this.notifyWeixinDoneFailureBestEffort(event, knownBuffer.userId).catch(
-        () => undefined,
-      );
-    });
-    this.activeInboundTurns.add(bgDoneTask);
-    void bgDoneTask.finally(() => {
-      this.activeInboundTurns.delete(bgDoneTask);
-    });
   }
 
   // =========================================================================
@@ -2147,9 +1984,6 @@ export class ChannelGatewayOrchestrator {
         this.cancelCollectBufferUploads(bid);
         this.forgetCollectBufferId(bid);
       }
-    } else if (cmdRes.cancelled_buffer_id) {
-      this.cancelCollectBufferUploads(cmdRes.cancelled_buffer_id);
-      this.forgetCollectBufferId(cmdRes.cancelled_buffer_id);
     } else if (
       (cmd === "new" ||
         (cmd === "workspace_switch" && cmdRes.ok && cmdRes.switched !== false)) &&
@@ -2814,7 +2648,9 @@ export class ChannelGatewayOrchestrator {
         if (this.shuttingDown) {
           uploadController.abort();
         }
-        this.activeInboundUploadControllers.add(uploadController);
+        this.activeInboundUploadControllers.set(uploadController, {
+          accountId: event.weixinAccountId,
+        });
         try {
           await this.backend.uploadWorkspaceFile(
             userId,
@@ -2825,6 +2661,31 @@ export class ChannelGatewayOrchestrator {
             downloaded.mimeType || desc.mimeType || "application/octet-stream",
             uploadController.signal,
           );
+          if (uploadController.signal.aborted) {
+            await this.cleanupAbortedWorkspacePaths({
+              userId,
+              workspaceId: targetWorkspaceId,
+              paths: [workspacePath],
+              context: {
+                message_id: event.messageId,
+                account_id: event.weixinAccountId ?? null,
+              },
+            });
+            throw new Error("Weixin attachment upload aborted");
+          }
+        } catch (uploadErr) {
+          if (uploadController.signal.aborted) {
+            await this.cleanupAbortedWorkspacePaths({
+              userId,
+              workspaceId: targetWorkspaceId,
+              paths: [workspacePath],
+              context: {
+                message_id: event.messageId,
+                account_id: event.weixinAccountId ?? null,
+              },
+            });
+          }
+          throw uploadErr;
         } finally {
           this.activeInboundUploadControllers.delete(uploadController);
         }
@@ -9006,7 +8867,9 @@ export class ChannelGatewayOrchestrator {
         return "already_ready";
       }
       if (bufStatus === "collecting") {
-        if (itemStatus === "" || itemStatus === "pending_upload") {
+        // R4 #3 (Codex #7): require explicit `pending_upload`; when both `upload_status` and
+        // `item_upload_status` are null (missing item), do NOT treat as pending upload.
+        if (itemStatus === "pending_upload") {
           return this.isCollectBufferCancelled(bufferId) ? "cancelled" : "pending";
         }
         return "already_ready";
@@ -9030,6 +8893,223 @@ export class ChannelGatewayOrchestrator {
       // Round 3 Decision #3: status query failure (timeout / 5xx / network error) MUST NOT upload.
       return "retry_later";
     }
+  }
+
+  /**
+   * R4 #3 (Codex #7): When collect-buffer status query transiently fails (`retry_later` due to
+   * timeout / 5xx), retry in-process with bounded exponential backoff instead of abandoning the
+   * item immediately. Stops immediately if the buffer is cancelled or aborted.
+   */
+  private async confirmCollectBufferPendingWithRetry(
+    params: {
+      bufferId: string;
+      messageId: string;
+      accountId?: string | null;
+      botGeneration?: number | null;
+    },
+    signal: AbortSignal,
+  ): Promise<"pending" | "cancelled" | "already_ready" | "retry_later"> {
+    let delayMs = COLLECT_STATUS_RETRY_INITIAL_DELAY_MS;
+    for (let attempt = 1; attempt <= COLLECT_STATUS_RETRY_MAX_ATTEMPTS; attempt += 1) {
+      if (this.isCollectBufferCancelled(params.bufferId) || signal.aborted) {
+        return "cancelled";
+      }
+      const state = await this.confirmCollectBufferStillPending(params);
+      if (state !== "retry_later") {
+        return state;
+      }
+      if (attempt >= COLLECT_STATUS_RETRY_MAX_ATTEMPTS) {
+        this.logger.warn(
+          "Collect buffer status query exhausted in-process retries; deferring to recovery",
+          {
+            buffer_id: params.bufferId,
+            message_id: params.messageId,
+            attempts: attempt,
+            error_code: "collect_status_query_unavailable",
+          },
+        );
+        return "retry_later";
+      }
+      this.logger.warn(
+        "Collect buffer status query temporarily unavailable; retrying with backoff",
+        {
+          buffer_id: params.bufferId,
+          message_id: params.messageId,
+          attempt,
+          delay_ms: delayMs,
+          error_code: "collect_status_query_retry",
+        },
+      );
+      const slept = await this.waitAbortableBackoff(delayMs, signal);
+      if (!slept || this.isCollectBufferCancelled(params.bufferId) || signal.aborted) {
+        return "cancelled";
+      }
+      delayMs = Math.min(delayMs * 2, COLLECT_STATUS_RETRY_MAX_DELAY_MS);
+    }
+    return "retry_later";
+  }
+
+  private async waitAbortableBackoff(
+    ms: number,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (signal.aborted || this.shuttingDown) {
+      return false;
+    }
+    let aborted = false;
+    await new Promise<void>((resolve) => {
+      const onAbort = () => {
+        aborted = true;
+        resolve();
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      void this.backoffDelayFn(ms)
+        .catch(() => undefined)
+        .finally(() => {
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        });
+    });
+    return !aborted && !signal.aborted && !this.shuttingDown;
+  }
+
+  /**
+   * R4 #4 (Codex #8): Deletes workspace files while inspecting HTTP 200 per-path `errors`,
+   * retrying failed paths up to `WORKSPACE_CLEANUP_MAX_ATTEMPTS` with backoff.
+   */
+  private async deleteWorkspacePathsWithRetry(params: {
+    userId: string;
+    workspaceId: string;
+    paths: readonly string[];
+    context: Record<string, unknown>;
+  }): Promise<void> {
+    const { userId, workspaceId, context } = params;
+    if (typeof this.backend.deleteWorkspaceFiles !== "function") {
+      return;
+    }
+    let remainingPaths = [...new Set(params.paths.filter((p) => p.trim().length > 0))];
+    if (remainingPaths.length === 0) {
+      return;
+    }
+
+    for (let attempt = 1; attempt <= WORKSPACE_CLEANUP_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        const res = await this.backend.deleteWorkspaceFiles(
+          userId,
+          workspaceId,
+          remainingPaths,
+        );
+        const retryableErrorPaths = (Array.isArray(res?.errors) ? res.errors : [])
+          .filter(
+            (entry) =>
+              entry &&
+              typeof entry.path === "string" &&
+              entry.path.trim().length > 0 &&
+              !(
+                typeof entry.detail === "string" &&
+                /not\s+found/i.test(entry.detail)
+              ),
+          )
+          .map((entry) => entry.path.trim());
+
+        if (retryableErrorPaths.length === 0) {
+          return;
+        }
+        remainingPaths = [...new Set(retryableErrorPaths)];
+        if (attempt >= WORKSPACE_CLEANUP_MAX_ATTEMPTS) {
+          this.logger.warn(
+            "Workspace file cleanup still reported per-path errors after retries",
+            {
+              ...context,
+              attempt,
+              failed_count: remainingPaths.length,
+              error_code: "workspace_delete_partial_error",
+            },
+          );
+          return;
+        }
+        this.logger.warn(
+          "Workspace file cleanup returned per-path errors; retrying failed paths",
+          {
+            ...context,
+            attempt,
+            failed_count: remainingPaths.length,
+            error_code: "workspace_delete_retry",
+          },
+        );
+      } catch (cleanupErr) {
+        if (isStaleGatewayEpochError(cleanupErr)) {
+          throw cleanupErr;
+        }
+        if (attempt >= WORKSPACE_CLEANUP_MAX_ATTEMPTS) {
+          this.logger.warn(
+            "Workspace file cleanup failed after retries",
+            {
+              ...context,
+              attempt,
+              file_count: remainingPaths.length,
+              ...extractSafeLogErrorFields(cleanupErr),
+            },
+          );
+          return;
+        }
+        this.logger.warn(
+          "Workspace file cleanup request failed; retrying",
+          {
+            ...context,
+            attempt,
+            file_count: remainingPaths.length,
+            ...extractSafeLogErrorFields(cleanupErr),
+          },
+        );
+      }
+      await this.backoffDelayFn(WORKSPACE_CLEANUP_RETRY_DELAY_MS * attempt).catch(
+        () => undefined,
+      );
+    }
+  }
+
+  /**
+   * R4 #4 (Codex #8): Runs immediate retryable delete AND schedules one bounded delayed
+   * recheck to remove any file written server-side after client HTTP abort.
+   */
+  private async cleanupAbortedWorkspacePaths(params: {
+    userId: string;
+    workspaceId: string;
+    paths: readonly string[];
+    context: Record<string, unknown>;
+  }): Promise<void> {
+    const uniquePaths = [...new Set(params.paths.filter((p) => p.trim().length > 0))];
+    if (
+      !params.workspaceId ||
+      uniquePaths.length === 0 ||
+      typeof this.backend.deleteWorkspaceFiles !== "function"
+    ) {
+      return;
+    }
+    await this.deleteWorkspacePathsWithRetry({
+      userId: params.userId,
+      workspaceId: params.workspaceId,
+      paths: uniquePaths,
+      context: params.context,
+    });
+    if (this.shuttingDown || this.collectCleanupLateRecheckMs < 0) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.pendingCleanupTimers.delete(timer);
+      if (this.shuttingDown) {
+        return;
+      }
+      void this.deleteWorkspacePathsWithRetry({
+        userId: params.userId,
+        workspaceId: params.workspaceId,
+        paths: uniquePaths,
+        context: { ...params.context, late_recheck: true },
+      }).catch(() => undefined);
+    }, this.collectCleanupLateRecheckMs);
+    (timer as { unref?: () => void }).unref?.();
+    this.pendingCleanupTimers.add(timer);
   }
 
   private async uploadAndRegisterCollectItemAttachments(params: {
@@ -9067,33 +9147,18 @@ export class ChannelGatewayOrchestrator {
       .filter((p): p is string => typeof p === "string" && p.length > 0);
 
     const cleanupCancelledWorkspaceFiles = async (): Promise<void> => {
-      if (
-        !targetWorkspaceId ||
-        dispatchedWorkspacePaths.length === 0 ||
-        typeof this.backend.deleteWorkspaceFiles !== "function"
-      ) {
+      if (!targetWorkspaceId || dispatchedWorkspacePaths.length === 0) {
         return;
       }
-      const uniquePaths = [...new Set(dispatchedWorkspacePaths)];
-      try {
-        await this.backend.deleteWorkspaceFiles(
-          userId,
-          targetWorkspaceId,
-          uniquePaths,
-        );
-      } catch (cleanupErr) {
-        if (isStaleGatewayEpochError(cleanupErr)) {
-          throw cleanupErr;
-        }
-        this.logger.warn(
-          "Best-effort cleanup of cancelled collect workspace files failed",
-          {
-            buffer_id: bufferId,
-            message_id: event.messageId,
-            file_count: uniquePaths.length,
-          },
-        );
-      }
+      await this.cleanupAbortedWorkspacePaths({
+        userId,
+        workspaceId: targetWorkspaceId,
+        paths: dispatchedWorkspacePaths,
+        context: {
+          buffer_id: bufferId,
+          message_id: event.messageId,
+        },
+      });
     };
 
     try {
@@ -9172,12 +9237,15 @@ export class ChannelGatewayOrchestrator {
             await cleanupCancelledWorkspaceFiles();
             return;
           }
-          const preDownloadState = await this.confirmCollectBufferStillPending({
-            bufferId,
-            messageId: event.messageId,
-            accountId: event.weixinAccountId,
-            botGeneration: event.weixinBotGeneration,
-          });
+          const preDownloadState = await this.confirmCollectBufferPendingWithRetry(
+            {
+              bufferId,
+              messageId: event.messageId,
+              accountId: event.weixinAccountId,
+              botGeneration: event.weixinBotGeneration,
+            },
+            controller.signal,
+          );
           if (preDownloadState !== "pending") {
             if (preDownloadState === "cancelled") {
               await cleanupCancelledWorkspaceFiles();
@@ -9212,12 +9280,15 @@ export class ChannelGatewayOrchestrator {
             await cleanupCancelledWorkspaceFiles();
             return;
           }
-          const preUploadState = await this.confirmCollectBufferStillPending({
-            bufferId,
-            messageId: event.messageId,
-            accountId: event.weixinAccountId,
-            botGeneration: event.weixinBotGeneration,
-          });
+          const preUploadState = await this.confirmCollectBufferPendingWithRetry(
+            {
+              bufferId,
+              messageId: event.messageId,
+              accountId: event.weixinAccountId,
+              botGeneration: event.weixinBotGeneration,
+            },
+            controller.signal,
+          );
           if (preUploadState !== "pending") {
             if (preUploadState === "cancelled") {
               await cleanupCancelledWorkspaceFiles();
@@ -9519,52 +9590,6 @@ export class ChannelGatewayOrchestrator {
   // =========================================================================
   // §5.2 Full Startup Recovery
   // =========================================================================
-
-  async replayDeferredFallbackRow(row: DeferredDeliveryDueRow): Promise<boolean> {
-    if (row.kind !== "fallback") {
-      return false;
-    }
-    const userId = typeof row.user_id === "string" ? row.user_id.trim() : "";
-    const threadId = typeof row.thread_id === "string" ? row.thread_id.trim() : "";
-    const targetAddress =
-      typeof row.target_address === "string" ? row.target_address.trim() : "";
-    const platformStr =
-      typeof row.platform === "string" ? row.platform.trim().toLowerCase() : "";
-    if (
-      !userId ||
-      !threadId ||
-      !targetAddress ||
-      !isSupportedPlatform(platformStr)
-    ) {
-      return false;
-    }
-    const runId =
-      typeof row.run_id === "string" && row.run_id.trim().length > 0
-        ? row.run_id.trim()
-        : null;
-    let turnIndex: number | null = null;
-    if (!runId && typeof row.delivery_key === "string") {
-      const match = /^fallback:[^:]+:turn:(\d+)$/.exec(row.delivery_key.trim());
-      if (match?.[1]) {
-        const parsed = Number.parseInt(match[1], 10);
-        if (Number.isInteger(parsed) && parsed >= 0) {
-          turnIndex = parsed;
-        }
-      }
-    }
-    return await this.deliverReplayFallback({
-      userId,
-      threadId,
-      runId,
-      turnIndex,
-      platform: platformStr,
-      targetAddress,
-      scopeKey: row.source_scope_key ?? null,
-      generation:
-        typeof row.source_generation === "number" ? row.source_generation : null,
-      activityOrigin: row.activity_origin ?? "replay",
-    });
-  }
 
   async fetchStartupRecoverySnapshot(): Promise<I7RecoverResponse> {
     return await this.backend.recoverState({ mode: "startup" });
@@ -10797,9 +10822,14 @@ export class ChannelGatewayOrchestrator {
 
   async stopAllWatches(): Promise<void> {
     this.shuttingDown = true;
+    this.clearPendingCleanupTimers();
     for (const bufferId of [...this.activeCollectUploads.keys()]) {
       this.cancelCollectBufferUploads(bufferId);
     }
+    for (const ctrl of [...this.activeInboundUploadControllers.keys()]) {
+      ctrl.abort();
+    }
+    this.activeInboundUploadControllers.clear();
     this.processingFeedback.settleAll("failed");
     for (const handle of this.activeWatches.values()) {
       handle.abortController.abort();
@@ -10886,15 +10916,18 @@ export class ChannelGatewayOrchestrator {
       ) {
         return false;
       } else if (claim.claim_status === "claimed") {
-        await this.backend.updateDeliveryProgress({
-          delivery_key: params.fallbackDeliveryKey,
-          status: "failed",
-          sent_chunks: 0,
-          total_chunks: 1,
-          error_code: "already_sent_to_current",
-          error_message:
-            "Text already sent to current conversation via /agent/send.",
-        });
+        await this.backend.updateDeliveryProgress(
+          {
+            delivery_key: params.fallbackDeliveryKey,
+            status: "failed",
+            sent_chunks: 0,
+            total_chunks: 1,
+            error_code: "already_sent_to_current",
+            error_message:
+              "Text already sent to current conversation via /agent/send.",
+          },
+          { platform: claim.platform ?? params.platform },
+        );
       }
     }
 

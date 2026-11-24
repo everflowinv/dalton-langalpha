@@ -39,6 +39,74 @@ export function formatSafeSessionKeyPrefix(sessionKey: string | undefined | null
   return trimmed.slice(0, 8);
 }
 
+const SAFE_LOG_ERROR_CODE_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+/**
+ * Extracts strictly whitelisted error code / HTTP status metadata from an arbitrary error,
+ * never emitting free-text `err.message` or `String(err)` into logs (§4.3 / R4 #8).
+ */
+export function extractSafeLogErrorFields(
+  err: unknown,
+): { error_code: string; http_status?: number } {
+  const out: { error_code: string; http_status?: number } = {
+    error_code: "unknown_error",
+  };
+  if (typeof err === "object" && err !== null) {
+    const rec = err as {
+      code?: unknown;
+      denyCode?: unknown;
+      kind?: unknown;
+      status?: unknown;
+      statusCode?: unknown;
+      name?: unknown;
+      body?: unknown;
+      cause?: unknown;
+    };
+    const rawStatus =
+      typeof rec.status === "number"
+        ? rec.status
+        : typeof rec.statusCode === "number"
+          ? rec.statusCode
+          : undefined;
+    if (
+      rawStatus !== undefined &&
+      Number.isInteger(rawStatus) &&
+      rawStatus >= 100 &&
+      rawStatus <= 599
+    ) {
+      out.http_status = rawStatus;
+    }
+    const bodyCode =
+      typeof rec.body === "object" && rec.body !== null && "code" in rec.body
+        ? (rec.body as { code?: unknown }).code
+        : undefined;
+    const causeCode =
+      typeof rec.cause === "object" && rec.cause !== null && "code" in rec.cause
+        ? (rec.cause as { code?: unknown }).code
+        : undefined;
+    for (const candidate of [
+      rec.denyCode,
+      bodyCode,
+      rec.code,
+      causeCode,
+      rec.kind,
+      rec.name,
+    ]) {
+      if (
+        typeof candidate === "string" &&
+        SAFE_LOG_ERROR_CODE_RE.test(candidate.trim())
+      ) {
+        out.error_code = candidate.trim();
+        return out;
+      }
+    }
+    if (out.http_status !== undefined) {
+      out.error_code = `http_${out.http_status}`;
+    }
+  }
+  return out;
+}
+
 /**
  * Scrubs credential-like substrings (Bearer tokens, JSON/query secret fields,
  * URL userinfo, Feishu tenant/app tokens) and truncates long strings so raw
