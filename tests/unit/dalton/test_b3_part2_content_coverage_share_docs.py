@@ -906,3 +906,93 @@ console.log(JSON.stringify(actual));
         assert res["ok"] is True
         assert res["planned_count"] == 0
         assert load_spy.call_count == 0
+
+
+class TestB3StandaloneCheckScript:
+    def test_b3_check_script_uses_stdlib_only_and_container_program_executes_cleanly(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import ast
+        import importlib.util
+        import shutil
+        import sys
+
+        check_path = REPO_ROOT / "tests" / "standalone" / "checks" / "b3_skills_prompts_ui.py"
+        src_text = check_path.read_text(encoding="utf-8")
+        tree = ast.parse(src_text)
+        forbidden_roots = {"src", "ptc_agent", "unittest", "httpx", "psycopg"}
+        bad_imports = [
+            node.names[0].name if isinstance(node, ast.Import) else node.module
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            and (
+                (node.module if isinstance(node, ast.ImportFrom) else node.names[0].name) or ""
+            ).split(".")[0]
+            in forbidden_roots
+        ]
+        assert bad_imports == [], f"Host check script imported forbidden modules: {bad_imports}"
+
+        spec = importlib.util.spec_from_file_location("b3_skills_prompts_ui_under_test", check_path)
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        # Container program compiles cleanly, uses no unittest, and includes all required checks
+        container_src: str = mod.BACKEND_CONTAINER_CHECK_SCRIPT
+        compile(container_src, "<b3-backend-container-check>", "exec")
+        container_tree = ast.parse(container_src)
+        container_bad = [
+            node.names[0].name if isinstance(node, ast.Import) else node.module
+            for node in ast.walk(container_tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            and (
+                (node.module if isinstance(node, ast.ImportFrom) else node.names[0].name) or ""
+            ).split(".")[0]
+            == "unittest"
+        ]
+        assert container_bad == [], f"Container script must not import unittest: {container_bad}"
+        for expected_check in mod.EXPECTED_CONTAINER_CHECKS:
+            assert expected_check in container_src
+
+        # Execute the exact container program via stdin under APP_ENV=core / DALTON_PROFILE=core
+        env = {
+            k: v
+            for k, v in __import__("os").environ.items()
+            if not k.startswith("DALTON_CAP_")
+            and k not in ("DALTON_RESEARCHDATA_URL", "DALTON_BRIDGE_URL", "CHANNEL_GATEWAY_URL", "BRAND_NAME")
+        }
+        env["APP_ENV"] = "core"
+        env["DALTON_PROFILE"] = "core"
+        proc = subprocess.run(
+            [sys.executable, "-"],
+            input=container_src,
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert proc.returncode == 0, (
+            f"Container check script failed (rc={proc.returncode}):\n"
+            f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        )
+        stdout_lines = [line for line in proc.stdout.splitlines() if line.strip()]
+        assert len(stdout_lines) == 1, f"Expected single JSON line on stdout, got: {stdout_lines!r}"
+        parsed = mod._parse_container_result(proc.stdout, proc.stderr, proc.returncode)
+        assert parsed["ok"] is True
+        for expected_check in mod.EXPECTED_CONTAINER_CHECKS:
+            assert parsed["checks"][expected_check]["ok"] is True
+
+        # Host-side source & docs checks run offline against REPO_ROOT
+        assert mod._check_no_everflowinv_in_dist(REPO_ROOT) > 0
+        mod._check_frontend_capability_gating(REPO_ROOT)
+        monkeypatch.delenv("STANDALONE_BASE_URL", raising=False)
+        docs_summary = mod._check_docs_site_core_surface(REPO_ROOT)
+        assert docs_summary["included"] > 15 and docs_summary["excluded"] >= 5
+
+        # Missing node executable raises RuntimeError explicitly instead of silently skipping
+        monkeypatch.setattr(shutil, "which", lambda _name: None)
+        with pytest.raises(RuntimeError, match="node executable not found"):
+            mod._check_docs_site_core_surface(REPO_ROOT)
