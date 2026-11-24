@@ -1,8 +1,8 @@
 // DALTON-HOOK(monitors): integrate 4-tier monitor publishing, ACLs, and admin public confirmation
-import { useEffect, useId, useMemo, useRef, useState, type RefObject } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from 'react';
 import { Check, Copy, ExternalLink, Link2, Lock } from 'lucide-react';
 import { Trans, useTranslation } from 'react-i18next';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -21,8 +21,10 @@ import { cn } from '@/lib/utils';
 import { formatBytes, shortMonthDay } from '@/lib/format';
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { queryKeys } from '@/lib/queryKeys';
+import { registerAuthReset } from '@/lib/authResets';
 import { useCopyShareLink } from '@/hooks/useCopyShareLink';
 import { useLocale } from '@/hooks/useLocale';
+import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(colleague-access): gate auto-publish pause tracking on colleague_sharing capability
 import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { useWorkspace } from '@/hooks/useWorkspace'; // DALTON-HOOK(colleague-access): read workspace auto-publish pause state & token
 import {
@@ -50,7 +52,13 @@ import {
 } from '@/pages/Monitors/api';
 import { pageLoadsOf } from '@/lib/pageLoads';
 import { usePageScout } from './viewers/html/usePageScout';
-import type { ArtifactStatus, ArtifactVersion, ShareFileEntry } from '@/types/api';
+import type {
+  ArtifactStatus,
+  ArtifactVersion,
+  ShareFileEntry,
+  Workspace,
+  WorkspacesResponse,
+} from '@/types/api';
 import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
 import { basename, dirname } from '../utils/fileRefResolver';
 import { shareLinkHref } from '../utils/api/shareLinks';
@@ -65,6 +73,68 @@ import type { ShareAudience } from '@/types/api';
 
 /** The server takes a label of 1 to 200 characters. */
 const LABEL_MAX = 200;
+
+/**
+ * DALTON-HOOK(colleague-access): browser-session execution context (not server
+ * state). Holds a publish response's CAS pause token only while the workspace
+ * detail cache is empty (for example, while the first detail GET is in flight
+ * or when `/credentials/status` fails), so closing and reopening the dialog
+ * within this tab still sends the token on the next submit. Removed as soon as
+ * workspace detail data is written to the cache, and cleared on sign-out.
+ */
+const pendingPauseTokens = new Map<string, string>();
+const pendingPauseTokenListeners = new Set<() => void>();
+const watchedPauseQueryClients = new WeakSet<QueryClient>();
+
+function detailWorkspaceIdFromKey(key: readonly unknown[]): string | null {
+  const prefix = queryKeys.workspaces.details();
+  if (key.length !== prefix.length + 1) return null;
+  for (let i = 0; i < prefix.length; i += 1) {
+    if (key[i] !== prefix[i]) return null;
+  }
+  const id = key[prefix.length];
+  return typeof id === 'string' ? id : null;
+}
+
+function notifyPendingPauseTokens(): void {
+  pendingPauseTokenListeners.forEach((listener) => listener());
+}
+
+function subscribePendingPauseTokens(listener: () => void): () => void {
+  pendingPauseTokenListeners.add(listener);
+  return () => pendingPauseTokenListeners.delete(listener);
+}
+
+function deletePendingPauseToken(workspaceId: string): void {
+  if (pendingPauseTokens.delete(workspaceId)) {
+    notifyPendingPauseTokens();
+  }
+}
+
+function ensureDetailCacheWatcher(qc: QueryClient): void {
+  if (watchedPauseQueryClients.has(qc)) return;
+  watchedPauseQueryClients.add(qc);
+  qc.getQueryCache().subscribe((event) => {
+    if (pendingPauseTokens.size === 0) return;
+    if (event.type !== 'updated' && event.type !== 'added') return;
+    if (event.query.state.data === undefined) return;
+    const wsId = detailWorkspaceIdFromKey(event.query.queryKey);
+    if (wsId) deletePendingPauseToken(wsId);
+  });
+}
+
+function setPendingPauseToken(qc: QueryClient, workspaceId: string, token: string): void {
+  ensureDetailCacheWatcher(qc);
+  if (pendingPauseTokens.get(workspaceId) === token) return;
+  pendingPauseTokens.set(workspaceId, token);
+  notifyPendingPauseTokens();
+}
+
+registerAuthReset(() => {
+  if (pendingPauseTokens.size === 0) return;
+  pendingPauseTokens.clear();
+  notifyPendingPauseTokens();
+});
 
 interface PublishDialogProps {
   open: boolean;
@@ -358,7 +428,14 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   const qc = useQueryClient();
   const root = useWorkspaceFolders()?.rootDir;
   // DALTON-HOOK(monitors): caller tier gates 4-tier visibility (external=own only, admin=public allowed)
-  const { callerTier, colleagueSharingEnabled = false } = useTeamCredentials();
+  const {
+    callerTier,
+    colleagueSharingEnabled = false,
+    colleagueSharingKnown = true,
+  } = useTeamCredentials();
+  // DALTON-HOOK(colleague-access): gate auto-publish pause tracking on colleague_sharing capability
+  const { hasCapability } = useCapabilities();
+  const colleagueSharingCapable = hasCapability('colleague_sharing');
   const isExternal = callerTier === 'external';
   const isAdmin = callerTier === 'admin' || !isDaltonAuth;
 
@@ -399,52 +476,70 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   const [copiedPermalink, setCopiedPermalink] = useState(false);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   // DALTON-HOOK(colleague-access): read workspace auto-publish pause state & CAS token only when colleague sharing is enabled
-  const trackAutoPublishPause = !unshareOnly && colleagueSharingEnabled;
-  const workspaceQuery = useWorkspace(trackAutoPublishPause ? workspaceId : null);
+  const trackWorkspacePause =
+    !unshareOnly && colleagueSharingCapable && colleagueSharingKnown && colleagueSharingEnabled;
+  const trackPublishResponsePause =
+    !unshareOnly && colleagueSharingCapable && (!colleagueSharingKnown || colleagueSharingEnabled);
+  const workspaceQuery = useWorkspace(trackWorkspacePause ? workspaceId : null);
   const refetchWorkspace = workspaceQuery.refetch;
   useEffect(() => {
-    if (trackAutoPublishPause && workspaceId && refetchWorkspace) {
+    if (trackWorkspacePause && workspaceId && refetchWorkspace) {
       void refetchWorkspace();
     }
-  }, [trackAutoPublishPause, workspaceId, refetchWorkspace]);
-  const workspaceSnapshotRef = useRef<{
-    data: typeof workspaceQuery.data;
-    updatedAt: number;
-  }>({ data: workspaceQuery.data, updatedAt: workspaceQuery.dataUpdatedAt ?? 0 });
-  workspaceSnapshotRef.current = {
-    data: workspaceQuery.data,
-    updatedAt: workspaceQuery.dataUpdatedAt ?? 0,
-  };
-  const [pauseOverride, setPauseOverride] = useState<{
-    paused: boolean;
-    token: string | null;
-    notice: string | null;
-    baseData: typeof workspaceQuery.data;
-    baseUpdatedAt: number;
-  } | null>(null);
-  const workspaceRefreshedAfterOverride =
-    pauseOverride !== null &&
-    ((workspaceQuery.dataUpdatedAt ?? 0) > pauseOverride.baseUpdatedAt ||
-      workspaceQuery.data !== pauseOverride.baseData);
-  const pauseOverrideActive = pauseOverride !== null && !workspaceRefreshedAfterOverride;
-  const autoPublishPaused = trackAutoPublishPause
-    ? (pauseOverrideActive
-        ? pauseOverride.paused
-        : Boolean(workspaceQuery.data?.auto_publish_paused))
+  }, [trackWorkspacePause, workspaceId, refetchWorkspace]);
+  const trackPublishResponsePauseRef = useRef(trackPublishResponsePause);
+  useEffect(() => {
+    trackPublishResponsePauseRef.current = trackPublishResponsePause;
+  }, [trackPublishResponsePause]);
+  // Publish response notice stays in component state until dialog close or the next submit.
+  const [pauseNotice, setPauseNotice] = useState<string | null>(null);
+  // Read cached workspace detail reactively without triggering a fetch when sharing status is unknown.
+  const subscribeCachedDetail = useCallback(
+    (onStoreChange: () => void) => {
+      if (!trackPublishResponsePause || trackWorkspacePause) return () => {};
+      return qc.getQueryCache().subscribe((event) => {
+        if (detailWorkspaceIdFromKey(event.query.queryKey) === workspaceId) {
+          onStoreChange();
+        }
+      });
+    },
+    [qc, workspaceId, trackPublishResponsePause, trackWorkspacePause],
+  );
+  const cachedDetail = useSyncExternalStore(
+    subscribeCachedDetail,
+    () =>
+      trackPublishResponsePause && !trackWorkspacePause
+        ? qc.getQueryData<Workspace>(queryKeys.workspaces.detail(workspaceId))
+        : undefined,
+  );
+  const pendingPauseToken = useSyncExternalStore(
+    subscribePendingPauseTokens,
+    () => (trackPublishResponsePause ? (pendingPauseTokens.get(workspaceId) ?? null) : null),
+  );
+  // Placeholder data (useWorkspace seeds Home's detail from the Home query) is not
+  // the workspace's detail yet, so it neither supersedes nor clears a pending token.
+  const workspaceDetail = trackWorkspacePause
+    ? workspaceQuery.isPlaceholderData
+      ? undefined
+      : workspaceQuery.data
+    : cachedDetail;
+  useEffect(() => {
+    if (workspaceDetail !== undefined) {
+      deletePendingPauseToken(workspaceId);
+    }
+  }, [workspaceDetail, workspaceId]);
+  const autoPublishPaused = trackWorkspacePause
+    ? workspaceDetail !== undefined
+      ? Boolean(workspaceDetail.auto_publish_paused)
+      : pendingPauseToken !== null
     : false;
-  const autoPublishPauseToken = trackAutoPublishPause
-    ? (pauseOverrideActive
-        ? pauseOverride.token
-        : (workspaceQuery.data?.auto_publish_pause_token ?? null))
+  const showAutoPublishPausedHint = autoPublishPaused;
+  const autoPublishPauseToken = trackPublishResponsePause
+    ? workspaceDetail !== undefined
+      ? (workspaceDetail.auto_publish_pause_token ?? null)
+      : pendingPauseToken
     : null;
-  const autoPublishPauseNotice =
-    trackAutoPublishPause &&
-    autoPublishPaused &&
-    pauseOverride?.notice &&
-    (pauseOverrideActive ||
-      workspaceQuery.data?.auto_publish_pause_token === pauseOverride.token)
-      ? pauseOverride.notice
-      : null;
+  const autoPublishPauseNotice = trackPublishResponsePause ? pauseNotice : null;
 
   const busy = publishingMonitor || unshare.isPending || keepUpdated.isPending || audienceChange.isPending;
   useEffect(() => {
@@ -539,6 +634,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
     const loads = pageLoadsOf(artifact.workspace_id, artifact.path);
     const statusAt = statusQuery.dataUpdatedAt;
     setOutcome(null);
+    setPauseNotice(null);
     setPublishingMonitor(true);
     try {
       // DALTON-HOOK(colleague-access): include CAS confirm_pause_token and surface server pause notice
@@ -555,34 +651,60 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
         loaded: loads.now,
         earlier: loads.earlier,
         page_sha256: status?.page_sha256 ?? undefined,
-        ...(trackAutoPublishPause && autoPublishPauseToken
+        ...(trackPublishResponsePause && autoPublishPauseToken
           ? { confirm_pause_token: autoPublishPauseToken }
           : {}),
       });
-      const snapshotAtResponse = workspaceSnapshotRef.current;
       setLabel('');
       qc.setQueryData(queryKeys.daltonMonitors.byArtifact(artifact.artifact_id), result.monitor);
       void qc.invalidateQueries({ queryKey: queryKeys.daltonMonitors.all });
       void qc.invalidateQueries({ queryKey: queryKeys.artifacts.pathsIn(workspaceId) });
-      if (trackAutoPublishPause) {
-        void qc.invalidateQueries({ queryKey: queryKeys.workspaces.detail(workspaceId) });
-        void qc.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
-        if (result.auto_publish_paused) {
-          setPauseOverride({
-            paused: true,
-            token: result.auto_publish_pause_token ?? null,
-            notice: result.auto_publish_pause_notice ?? null,
-            baseData: snapshotAtResponse.data,
-            baseUpdatedAt: snapshotAtResponse.updatedAt,
+      if (trackPublishResponsePauseRef.current) {
+        const detailKey = queryKeys.workspaces.detail(workspaceId);
+        const paused = Boolean(result.auto_publish_paused);
+        const token = paused ? (result.auto_publish_pause_token ?? null) : null;
+        const notice = paused ? (result.auto_publish_pause_notice ?? null) : null;
+        // Cancel any pre-publish detail GET (including a first cold fetch whose data is still undefined)
+        // so its older payload never overwrites this response and invalidateQueries starts a fresh GET.
+        await qc.cancelQueries({ queryKey: detailKey, exact: true });
+        if (trackPublishResponsePauseRef.current) {
+          setPauseNotice(notice);
+          let mergedDetail = false;
+          qc.setQueryData<Workspace>(detailKey, (old) => {
+            if (!old) return old;
+            mergedDetail = true;
+            return {
+              ...old,
+              auto_publish_paused: paused,
+              auto_publish_pause_token: token,
+            };
           });
-        } else {
-          setPauseOverride({
-            paused: false,
-            token: null,
-            notice: null,
-            baseData: snapshotAtResponse.data,
-            baseUpdatedAt: snapshotAtResponse.updatedAt,
-          });
+          qc.setQueriesData<WorkspacesResponse | undefined>(
+            { queryKey: queryKeys.workspaces.lists() },
+            (old) => {
+              if (!old?.workspaces) return old;
+              let matched = false;
+              const workspaces = old.workspaces.map((row) => {
+                if (row.workspace_id !== workspaceId) return row;
+                matched = true;
+                return {
+                  ...row,
+                  auto_publish_paused: paused,
+                  auto_publish_pause_token: token,
+                };
+              });
+              return matched ? { ...old, workspaces } : old;
+            },
+          );
+          if (mergedDetail) {
+            deletePendingPauseToken(workspaceId);
+          } else if (token) {
+            setPendingPauseToken(qc, workspaceId, token);
+          } else {
+            deletePendingPauseToken(workspaceId);
+          }
+          void qc.invalidateQueries({ queryKey: detailKey, exact: true });
+          void qc.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
         }
       }
       if (result.cut === false) {
@@ -926,7 +1048,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
                 )}
             </div>
             {/* DALTON-HOOK(colleague-access): show auto-publish pause guidance under keep-updated toggle */}
-            {autoPublishPaused && (
+            {showAutoPublishPausedHint && (
               <p className="text-xs" role="status" style={{ color: 'var(--color-warning)' }}>
                 {t('monitors.dialog.autoPublishPausedHint', {
                   action: monitorPublished ? t('publish.update') : t('publish.publish'),
