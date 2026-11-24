@@ -4538,3 +4538,457 @@ class TestSandboxNetworkAndInitScript:
         assert restore_src.count("MUTATION_STARTED=1") == 2, (
             "MUTATION_STARTED=1 should be set immediately before MinIO upload write and before PG write"
         )
+
+    def test_b6_r13_dir_lock_lazy_decrypt_term_before_swap_and_readable_guard(
+        self, tmp_path: Path
+    ) -> None:
+        """Offline verification for Batch 6 R13 fixes:
+        1. Deployment-directory lock `/tmp/dalton-restore-dir-<sha256(pwd -P)[:16]>.lock`
+           is acquired FIRST (before reading/checking `.env`), followed by the project
+           lock; contention fails with "这个目录里已有另一个恢复在进行".
+        2. When keeping an existing `.env` (no `--replace-env`), `restore.sh` neither
+           reads the passphrase file nor decrypts `env.enc`, even if a wrong passphrase
+           file is configured in `DALTON_BACKUP_PASSPHRASE_FILE`.
+        3. Cleanup inspects actual file state without `ENV_SWAPPED` and never deletes
+           `.env.pre-restore-*`: sending SIGTERM after backup completes and BEFORE
+           swapping in decrypted `.env` exits 143 and restores `.env` (both regular
+           file and symlink) intact without `rm`ing the backup.
+        4. Before setting `MUTATION_STARTED=1`, `restore.sh` checks that backup files
+           (`postgres.dump`, object archive) exist and are readable; if unreadable
+           after preflight, it treats the error as a pre-write failure and rolls `.env` back.
+        5. `STANDALONE-DEPLOY.md` documents regular-file (600) vs symlink backup permissions.
+        """
+        import hashlib
+        import shutil
+
+        pass_f = tmp_path / "r13-good.pass"
+        pass_f.write_text("r13-good-passphrase-999\n", encoding="utf-8")
+        pass_f.chmod(0o600)
+
+        wrong_pass_f = tmp_path / "r13-wrong.pass"
+        wrong_pass_f.write_text("totally-wrong-passphrase\n", encoding="utf-8")
+        wrong_pass_f.chmod(0o600)
+
+        def _make_r13_backup(name: str, proj: str, backup_env_text: str) -> Path:
+            bdir = tmp_path / name
+            bdir.mkdir()
+            (bdir / "postgres.dump").write_bytes(b"PGDMP")
+            plain = tmp_path / f"{name}.plain.env"
+            plain.write_text(backup_env_text, encoding="utf-8")
+            subprocess.run(
+                [
+                    "openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-md", "sha256", "-iter", "10000",
+                    "-salt", "-in", str(plain), "-out", str(bdir / "env.enc"), "-pass", f"file:{pass_f}",
+                ],
+                check=True,
+                capture_output=True,
+                timeout=15,
+            )
+            (bdir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "compose_project": proj,
+                        "env_backup": "encrypted",
+                        "env_encryption": {
+                            "cipher": "aes-256-cbc",
+                            "kdf": "pbkdf2",
+                            "digest": "sha256",
+                            "iterations": 10000,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return bdir
+
+        def _cleanup_lock(p: Path, existed_before: bool) -> None:
+            if existed_before:
+                return
+            if p.is_dir():
+                p.rmdir()
+            elif p.exists():
+                p.unlink()
+
+        def _dir_lock_for(work_dir: Path) -> Path:
+            real_path = os.path.realpath(str(work_dir))
+            digest = hashlib.sha256(real_path.encode("utf-8")).hexdigest()[:16]
+            return Path(f"/tmp/dalton-restore-dir-{digest}.lock")
+
+        # --- Case 1: Directory lock via `pwd -P` sha256[:16] acquired BEFORE project lock ---
+        proj_lock_a = f"r13-dirlock-a-{uuid.uuid4().hex[:10]}"
+        proj_lock_b = f"r13-dirlock-b-{uuid.uuid4().hex[:10]}"
+        w_dir_real = tmp_path / "r13-dir-real"
+        w_dir_real.mkdir()
+        (w_dir_real / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
+        (w_dir_real / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_dir_real / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
+        orig_dir_env = (
+            f"COMPOSE_PROJECT_NAME={proj_lock_a}\n"
+            "DB_HOST=external-pg.corp.internal\nDB_USER=postgres\nDB_PASSWORD=pg\nDB_NAME=postgres\n"
+        )
+        (w_dir_real / ".env").write_text(orig_dir_env, encoding="utf-8")
+        w_dir_link = tmp_path / "r13-dir-symlink"
+        w_dir_link.symlink_to(w_dir_real)
+        bak_dir_lock = _make_r13_backup("r13-bak-dirlock", proj_lock_a, orig_dir_env)
+
+        expected_dir_lock = _dir_lock_for(w_dir_real)
+        expected_proj_lock_a = Path(f"/tmp/dalton-{proj_lock_a}.restore.lock")
+        expected_proj_lock_b = Path(f"/tmp/dalton-{proj_lock_b}.restore.lock")
+        dir_lock_existed = expected_dir_lock.exists()
+        proj_a_existed = expected_proj_lock_a.exists()
+        proj_b_existed = expected_proj_lock_b.exists()
+
+        # 1a: Directory lock contention (even with a different --project-name via symlink path)
+        bin_dir_busy = tmp_path / "r13-bin-dir-busy"
+        bin_dir_busy.mkdir()
+        busy_log = tmp_path / "r13-dir-busy.log"
+        (bin_dir_busy / "flock").write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "%s\\n" "$*" >> "{busy_log}"\n'
+            'if [[ "$1" == "-n" && "$2" == "7" ]]; then exit 1; fi\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        (bin_dir_busy / "flock").chmod(0o755)
+        env_dir_busy = os.environ.copy()
+        env_dir_busy["PATH"] = f"{bin_dir_busy}:{env_dir_busy.get('PATH', '')}"
+        try:
+            res_busy = subprocess.run(
+                [
+                    "bash", str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir", str(w_dir_link),
+                    "--backup-dir", str(bak_dir_lock),
+                    "--project-name", proj_lock_b,
+                ],
+                env=env_dir_busy,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_busy.returncode != 0
+            assert "这个目录里已有另一个恢复在进行" in res_busy.stderr, (
+                f"Expected directory-lock contention message, got:\n{res_busy.stderr}"
+            )
+            assert str(expected_dir_lock) in res_busy.stderr
+            assert (w_dir_real / ".env").read_text(encoding="utf-8") == orig_dir_env
+            flock_calls = busy_log.read_text(encoding="utf-8").splitlines()
+            assert flock_calls == ["-n 7"], f"Must fail on dir lock (fd 7) before touching project lock, got {flock_calls}"
+
+            # 1b: Lock acquisition order is strictly dir lock (fd 7) THEN project lock (fd 9)
+            bin_order = tmp_path / "r13-bin-order"
+            bin_order.mkdir()
+            order_log = tmp_path / "r13-lock-order.log"
+            (bin_order / "flock").write_text(
+                "#!/usr/bin/env bash\n"
+                f'printf "%s\\n" "$*" >> "{order_log}"\n'
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            (bin_order / "flock").chmod(0o755)
+            env_order = os.environ.copy()
+            env_order["PATH"] = f"{bin_order}:{env_order.get('PATH', '')}"
+            res_order = subprocess.run(
+                [
+                    "bash", str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir", str(w_dir_link),
+                    "--backup-dir", str(bak_dir_lock),
+                ],
+                env=env_order,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_order.returncode != 0  # fails on external DB_HOST guard after both locks acquired
+            order_lines = order_log.read_text(encoding="utf-8").splitlines()
+            assert order_lines[:2] == ["-n 7", "-n 9"], (
+                f"Expected fixed acquisition order [dir lock fd 7, project lock fd 9], got {order_lines}"
+            )
+            assert expected_dir_lock.exists(), f"Expected dir lock file at {expected_dir_lock}"
+            assert expected_proj_lock_a.exists(), f"Expected project lock file at {expected_proj_lock_a}"
+        finally:
+            _cleanup_lock(expected_proj_lock_a, proj_a_existed)
+            _cleanup_lock(expected_proj_lock_b, proj_b_existed)
+            _cleanup_lock(expected_dir_lock, dir_lock_existed)
+
+        # --- Case 2: Existing `.env` + no `--replace-env` + wrong passphrase file in env ---
+        proj_keep = f"r13-keep-badpass-{uuid.uuid4().hex[:10]}"
+        orig_keep_env = (
+            f"COMPOSE_PROJECT_NAME={proj_keep}\n"
+            "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=keeppg\nDB_NAME=postgres\n"
+            "DALTON_TLS_MODE=loopback\nDALTON_EDGE_PORT=8088\n"
+            "SENTINEL=keep-existing-env\n"
+        )
+        bak_keep = _make_r13_backup("r13-bak-keep", proj_keep, orig_keep_env + "EXTRA=from-backup\n")
+        w_keep = tmp_path / "r13-work-keep"
+        w_keep.mkdir()
+        (w_keep / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
+        (w_keep / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_keep / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
+        (w_keep / ".env").write_text(orig_keep_env, encoding="utf-8")
+        (w_keep / ".env").chmod(0o600)
+
+        bin_keep = tmp_path / "r13-bin-keep"
+        bin_keep.mkdir()
+        (bin_keep / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (bin_keep / "flock").chmod(0o755)
+        (bin_keep / "curl").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (bin_keep / "curl").chmod(0o755)
+        (bin_keep / "docker").write_text(
+            "#!/usr/bin/env bash\n"
+            'if [[ "$*" == *" config --format json"* ]]; then echo \'{"services":{"backend":{"environment":{}}}}\'; exit 0; fi\n'
+            'if [[ "$*" == *" ps --status running --services"* ]]; then printf "postgres\\nedge\\n"; exit 0; fi\n'
+            'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
+            'if [[ "$*" == *"FROM pg_database"* ]]; then echo "postgres"; exit 0; fi\n'
+            'if [[ "$*" == *" -d postgres "* && "$*" == *"pg_class"* ]]; then printf "0\\t0\\t0\\n"; exit 0; fi\n'
+            'if [[ "$*" == *" port edge 8088"* ]]; then echo "127.0.0.1:8088"; exit 0; fi\n'
+            'if [[ "$*" == *"alembic_version_dalton"* ]]; then echo "dalton_head"; exit 0; fi\n'
+            'if [[ "$*" == *"alembic_version"* ]]; then echo "up_head"; exit 0; fi\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        (bin_keep / "docker").chmod(0o755)
+        env_keep = os.environ.copy()
+        env_keep["PATH"] = f"{bin_keep}:{env_keep.get('PATH', '')}"
+        env_keep["DALTON_BACKUP_PASSPHRASE_FILE"] = str(wrong_pass_f)
+        dir_lock_keep = _dir_lock_for(w_keep)
+        proj_lock_keep = Path(f"/tmp/dalton-{proj_keep}.restore.lock")
+        dlk_ex = dir_lock_keep.exists()
+        plk_ex = proj_lock_keep.exists()
+        try:
+            res_keep = subprocess.run(
+                [
+                    "bash", str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir", str(w_keep),
+                    "--backup-dir", str(bak_keep),
+                    "--skip-minio", "--skip-caddy", "--skip-edge-build",
+                ],
+                env=env_keep,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_keep.returncode == 0, (
+                f"Keeping existing .env must NOT read wrong passphrase file or decrypt env.enc:\n"
+                f"stdout:\n{res_keep.stdout}\nstderr:\n{res_keep.stderr}"
+            )
+            assert (w_keep / ".env").read_text(encoding="utf-8") == orig_keep_env
+            assert not list(w_keep.glob(".env.pre-restore-*"))
+            assert "Using existing" in res_keep.stdout
+            assert "Decrypting env.enc" not in res_keep.stdout
+        finally:
+            _cleanup_lock(proj_lock_keep, plk_ex)
+            _cleanup_lock(dir_lock_keep, dlk_ex)
+
+        # --- Case 3: SIGTERM after backup completes and BEFORE swapping in new `.env` ---
+        # Tests BOTH symlink `.env` (pointing to 0640 target) and regular file `.env` (0640).
+        real_chmod = shutil.which("chmod") or "/bin/chmod"
+        real_rm = shutil.which("rm") or "/bin/rm"
+
+        for kind in ("symlink", "regular"):
+            proj_t = f"r13-term-{kind}-{uuid.uuid4().hex[:10]}"
+            orig_t_env = (
+                f"COMPOSE_PROJECT_NAME={proj_t}\n"
+                "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=oldpg\nDB_NAME=postgres\n"
+                f"SENTINEL=original-{kind}\n"
+            )
+            new_t_env = (
+                f"COMPOSE_PROJECT_NAME={proj_t}\n"
+                "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=newpg\nDB_NAME=postgres\n"
+                f"SENTINEL=backup-{kind}\n"
+            )
+            bak_t = _make_r13_backup(f"r13-bak-term-{kind}", proj_t, new_t_env)
+            w_t = tmp_path / f"r13-work-term-{kind}"
+            w_t.mkdir()
+            (w_t / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
+            (w_t / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+            (w_t / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
+
+            sym_target_t: Path | None = None
+            if kind == "symlink":
+                sym_target_t = tmp_path / f"r13-sym-target-{kind}.env"
+                sym_target_t.write_text(orig_t_env, encoding="utf-8")
+                sym_target_t.chmod(0o640)
+                (w_t / ".env").symlink_to(sym_target_t)
+            else:
+                (w_t / ".env").write_text(orig_t_env, encoding="utf-8")
+                (w_t / ".env").chmod(0o640)
+
+            bin_t = tmp_path / f"r13-bin-term-{kind}"
+            bin_t.mkdir()
+            rm_log_t = tmp_path / f"r13-rm-{kind}.log"
+            window_log_t = tmp_path / f"r13-window-{kind}.log"
+            (bin_t / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            (bin_t / "flock").chmod(0o755)
+            (bin_t / "rm").write_text(
+                "#!/usr/bin/env bash\n"
+                f'printf "%s\\n" "$*" >> "{rm_log_t}"\n'
+                f'exec "{real_rm}" "$@"\n',
+                encoding="utf-8",
+            )
+            (bin_t / "rm").chmod(0o755)
+            # Trigger SIGTERM right at `chmod 600 "$STAGED_ENV_TMP"` AFTER backup exists
+            # and BEFORE `mv "$STAGED_ENV_TMP" "$ENV_FILE"` executes.
+            (bin_t / "chmod").write_text(
+                "#!/usr/bin/env bash\n"
+                f'"{real_chmod}" "$@"\n'
+                'rc=$?\n'
+                f'if [[ "$1" == "600" && "$2" == "{w_t}/.env.tmp-decrypt-"* ]]; then\n'
+                f'  shopt -s nullglob\n'
+                f'  baks=("{w_t}"/.env.pre-restore-*)\n'
+                f'  shopt -u nullglob\n'
+                f'  if (( ${{#baks[@]}} > 0 )); then\n'
+                f'    if [[ -L "{w_t}/.env" || -e "{w_t}/.env" ]]; then echo "ENV_PRESENT" >> "{window_log_t}"; else echo "ENV_ABSENT" >> "{window_log_t}"; fi\n'
+                f'    if [[ -L "${{baks[0]}}" ]]; then echo "BAK_SYMLINK:$(readlink "${{baks[0]}}")" >> "{window_log_t}"; else echo "BAK_REGULAR" >> "{window_log_t}"; fi\n'
+                f'    kill -TERM "$PPID"\n'
+                f'  fi\n'
+                f'fi\n'
+                'exit "$rc"\n',
+                encoding="utf-8",
+            )
+            (bin_t / "chmod").chmod(0o755)
+            env_t = os.environ.copy()
+            env_t["PATH"] = f"{bin_t}:{env_t.get('PATH', '')}"
+            dl_t = _dir_lock_for(w_t)
+            pl_t = Path(f"/tmp/dalton-{proj_t}.restore.lock")
+            dl_t_ex = dl_t.exists()
+            pl_t_ex = pl_t.exists()
+            try:
+                res_t = subprocess.run(
+                    [
+                        "bash", str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                        "--work-dir", str(w_t),
+                        "--backup-dir", str(bak_t),
+                        "--env-passphrase-file", str(pass_f),
+                        "--replace-env",
+                        "--skip-minio", "--skip-caddy", "--skip-edge-build",
+                    ],
+                    env=env_t,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                assert res_t.returncode == 143, (
+                    f"[{kind}] Expected exit 143 on SIGTERM between backup and swap, got {res_t.returncode}:\n{res_t.stderr}"
+                )
+                assert window_log_t.exists(), f"[{kind}] Expected SIGTERM to fire in backup-done / pre-swap window"
+                win_lines = window_log_t.read_text(encoding="utf-8").splitlines()
+                if kind == "symlink":
+                    assert sym_target_t is not None
+                    assert "ENV_ABSENT" in win_lines and f"BAK_SYMLINK:{sym_target_t}" in win_lines, (
+                        f"Expected symlink moved to backup before swap, got {win_lines}"
+                    )
+                    assert (w_t / ".env").is_symlink(), "Symlink .env must be restored intact on pre-swap SIGTERM!"
+                    assert os.readlink(w_t / ".env") == str(sym_target_t)
+                    assert sym_target_t.read_text(encoding="utf-8") == orig_t_env
+                    assert stat.S_IMODE(sym_target_t.stat().st_mode) == 0o640
+                else:
+                    assert "ENV_PRESENT" in win_lines and "BAK_REGULAR" in win_lines, (
+                        f"Expected regular backup present before swap, got {win_lines}"
+                    )
+                    assert (w_t / ".env").is_file() and not (w_t / ".env").is_symlink()
+                    assert (w_t / ".env").read_text(encoding="utf-8") == orig_t_env
+                    assert stat.S_IMODE((w_t / ".env").stat().st_mode) == 0o640
+                assert not list(w_t.glob(".env.pre-restore-*")), (
+                    f"[{kind}] Backup should be moved back to .env (no stray backup left)"
+                )
+                rm_entries = rm_log_t.read_text(encoding="utf-8") if rm_log_t.exists() else ""
+                assert ".env.pre-restore-" not in rm_entries, (
+                    f"[{kind}] cleanup must NEVER rm any .env.pre-restore-* backup file; rm calls:\n{rm_entries}"
+                )
+            finally:
+                _cleanup_lock(pl_t, pl_t_ex)
+                _cleanup_lock(dl_t, dl_t_ex)
+
+        # --- Case 4: Unreadable/missing postgres.dump before MUTATION_STARTED=1 -> pre-write rollback ---
+        proj_unr = f"r13-unreadable-{uuid.uuid4().hex[:10]}"
+        orig_unr_env = (
+            f"COMPOSE_PROJECT_NAME={proj_unr}\n"
+            "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=oldpg\nDB_NAME=postgres\n"
+            "SENTINEL=orig-before-unreadable-dump\n"
+        )
+        new_unr_env = (
+            f"COMPOSE_PROJECT_NAME={proj_unr}\n"
+            "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=newpg\nDB_NAME=postgres\n"
+            "SENTINEL=new-from-backup\n"
+        )
+        bak_unr = _make_r13_backup("r13-bak-unreadable", proj_unr, new_unr_env)
+        w_unr = tmp_path / "r13-work-unreadable"
+        w_unr.mkdir()
+        (w_unr / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
+        (w_unr / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_unr / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
+        (w_unr / ".env").write_text(orig_unr_env, encoding="utf-8")
+        (w_unr / ".env").chmod(0o640)
+
+        bin_unr = tmp_path / "r13-bin-unreadable"
+        bin_unr.mkdir()
+        unr_calls = tmp_path / "r13-unr-docker.log"
+        (bin_unr / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (bin_unr / "flock").chmod(0o755)
+        # Remove postgres.dump right after preflight finishes (simulating backup disk unmount before Step 5)
+        (bin_unr / "docker").write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "%s\\n" "$*" >> "{unr_calls}"\n'
+            'if [[ "$*" == *" config --format json"* ]]; then echo \'{"services":{"backend":{"environment":{}}}}\'; exit 0; fi\n'
+            'if [[ "$*" == *" ps --status running --services"* ]]; then echo "postgres"; exit 0; fi\n'
+            'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
+            'if [[ "$*" == *"FROM pg_database"* ]]; then echo "postgres"; exit 0; fi\n'
+            'if [[ "$*" == *" -d postgres "* && "$*" == *"pg_class"* ]]; then\n'
+            f'  rm -f "{bak_unr}/postgres.dump"\n'
+            '  printf "0\\t0\\t0\\n"\n'
+            '  exit 0\n'
+            'fi\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        (bin_unr / "docker").chmod(0o755)
+        env_unr = os.environ.copy()
+        env_unr["PATH"] = f"{bin_unr}:{env_unr.get('PATH', '')}"
+        dl_unr = _dir_lock_for(w_unr)
+        pl_unr = Path(f"/tmp/dalton-{proj_unr}.restore.lock")
+        dl_unr_ex = dl_unr.exists()
+        pl_unr_ex = pl_unr.exists()
+        try:
+            res_unr = subprocess.run(
+                [
+                    "bash", str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir", str(w_unr),
+                    "--backup-dir", str(bak_unr),
+                    "--env-passphrase-file", str(pass_f),
+                    "--replace-env",
+                    "--skip-minio", "--skip-caddy", "--skip-edge-build",
+                ],
+                env=env_unr,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_unr.returncode != 0
+            assert "半成品" not in res_unr.stderr, (
+                f"Unreadable postgres.dump before MUTATION_STARTED must NOT report partial restore:\n{res_unr.stderr}"
+            )
+            assert "已把 .env 恢复为恢复前的内容" in res_unr.stderr, (
+                f"Unreadable postgres.dump must roll .env back as pre-write failure:\n{res_unr.stderr}"
+            )
+            assert (w_unr / ".env").read_text(encoding="utf-8") == orig_unr_env
+            assert stat.S_IMODE((w_unr / ".env").stat().st_mode) == 0o640
+            assert not list(w_unr.glob(".env.pre-restore-*"))
+            docker_log_text = unr_calls.read_text(encoding="utf-8")
+            assert "--exit-on-error" not in docker_log_text, (
+                f"pg_restore must NOT have been invoked when postgres.dump is unreadable:\n{docker_log_text}"
+            )
+        finally:
+            _cleanup_lock(pl_unr, pl_unr_ex)
+            _cleanup_lock(dl_unr, dl_unr_ex)
+
+        # --- Case 5: Static invariants on restore.sh and STANDALONE-DEPLOY.md ---
+        restore_src = (REPO_ROOT / "scripts/standalone/restore.sh").read_text(encoding="utf-8")
+        assert "ENV_SWAPPED" not in restore_src, "restore.sh must not rely on ENV_SWAPPED flag"
+        assert 'rm -f "$ENV_BACKUP_PATH"' not in restore_src, "restore.sh must never delete ENV_BACKUP_PATH"
+        doc_src = (REPO_ROOT / "docs/dalton/dev-guide/STANDALONE-DEPLOY.md").read_text(encoding="utf-8")
+        assert "符号链接" in doc_src and "权限由链接指向的文件决定" in doc_src
