@@ -307,6 +307,7 @@
   - 拒绝：`{"authorized": false, "decision": "deny", "retryable": false, "deny_code": string}`
 - **网关进程内退避重试上限与后端调用超时协同常量**：
   - **单次投递预检重试总时长上限**：固定为 **`180s`（3 分钟，后端常量 `WEIXIN_PREFLIGHT_RETRY_BUDGET_SECONDS = 180`）**，整笔投递（跨全部分片与附件）共享该总预算（指数退避如 2s → 4s → 8s → 16s → 30s 封顶），后端不落库暂缓状态、投递行保持 `in_flight`；超预算仍未恢复时，网关通过 I-7 上报终态 `status: "failed"`（若已有部分分段送出则按既有分段语义上报 `partial` 或 `unknown`）。
+  - **网关实际取值**：网关常量 `WEIXIN_PREFLIGHT_RETRY_MAX_ELAPSED_MS = 35000`（35s），在上述 180s 上限之内；重试用尽时 I-7 的 `error_code` 填最后一次可重试的根因（如 `roster_lookup_error`），并附可选字段 `error_detail: "preflight_deadline_exceeded"`。后端 I-7 请求模型允许额外字段，当前只记录 `error_code`。
   - **后端调用网关读超时（严格大于 `180s` 并留 60s 余量）**：
     - `src/dalton/notify/channel_transport.py`：`GATEWAY_DELIVERY_READ_TIMEOUT_S = 240.0`（`post_data_task_gateway_notify`、`post_automation_gateway_notify` 默认读超时 `max(240.0, get_notify_http_timeout_s() * 2.5)`）
     - `src/tools/messaging/tools.py`：`_SEND_TIMEOUT = httpx.Timeout(240.0, connect=5.0)`
