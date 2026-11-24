@@ -345,6 +345,8 @@ MINIO_MANIFEST_TMP=""
 # Set at preflight when the backup carries an object archive; the write step trusts this,
 # not a second look at the directory, so an archive that vanishes later stops the restore.
 MINIO_ARCHIVE_SEEN=0
+# A side copy of .env still being written; cleanup removes it (it holds credentials).
+ENV_BACKUP_PARTIAL=""
 COMPOSE_CFG_TMP=""
 
 compute_dir_lock_hash() {
@@ -475,6 +477,9 @@ release_restore_lock() {
 
 cleanup() {
   local rc=$?
+  if [[ -n "$ENV_BACKUP_PARTIAL" ]]; then
+    rm -f "$ENV_BACKUP_PARTIAL"
+  fi
   if [[ -n "$STAGED_ENV_TMP" && -f "$STAGED_ENV_TMP" ]]; then
     rm -f "$STAGED_ENV_TMP"
   fi
@@ -868,12 +873,14 @@ if [[ "$ENV_FROM_BACKUP" -eq 1 ]]; then
       # Copy to a side name and compare before naming it the backup, so a copy cut
       # short (a full disk) is never what cleanup puts back over the intact .env.
       env_bak_tmp="${env_bak_candidate}.partial"
+      ENV_BACKUP_PARTIAL="$env_bak_tmp"
       if ! { cp -P -p "$ENV_FILE" "$env_bak_tmp" && chmod 600 "$env_bak_tmp" && cmp -s "$ENV_FILE" "$env_bak_tmp"; }; then
         rm -f "$env_bak_tmp"
         err "Could not back up ${ENV_FILE} (disk full?). Nothing was changed."
         exit 1
       fi
       mv "$env_bak_tmp" "$env_bak_candidate"
+      ENV_BACKUP_PARTIAL=""
       ENV_BACKUP_PATH="$env_bak_candidate"
       info "Backed up existing ${ENV_FILE} to ${ENV_BACKUP_PATH} (mode 600)."
     fi
@@ -1200,6 +1207,10 @@ fi
 compose_cmd up -d postgres redis minio
 
 # Step 4: Restore MinIO objects directly into original bucket name(s) with read-back verification
+if [[ "$MINIO_ARCHIVE_SEEN" -eq 0 && -e "${BACKUP_DIR}/minio-objects.tar.gz" ]]; then
+  err "${BACKUP_DIR}/minio-objects.tar.gz appeared after the preflight checks; the backup directory is still changing. Wait until it is complete and run restore again."
+  exit 1
+fi
 if [[ "$SKIP_MINIO" -eq 0 && "$STORAGE_ANY_CONFIGURED" -eq 1 && "$MINIO_ARCHIVE_SEEN" -eq 1 ]]; then
   info "4/7 Restoring MinIO objects into original bucket(s) with read-back verification..."
 
