@@ -184,6 +184,59 @@ async def _get_execution_for_run_id(run_id: str) -> dict[str, Any] | None:
             return dict(row) if row else None
 
 
+async def _get_run_system_only(run_id: str) -> bool | None:
+    """Read ``llm_model_system_only`` directly from a source run's ``conversation_responses.metadata``."""
+    if normalize_uuid(run_id) is None:
+        return None
+    try:
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT COALESCE((metadata->>'llm_model_system_only')::boolean, FALSE) AS llm_model_system_only
+                    FROM conversation_responses
+                    WHERE conversation_response_id = %s::uuid
+                    LIMIT 1
+                    """,
+                    (run_id,),
+                )
+                row = await cur.fetchone()
+                return bool(row["llm_model_system_only"]) if row else None
+    except RuntimeError as exc:
+        if "pool" in str(exc).lower():
+            return None
+        raise
+    except Exception:
+        logger.debug(
+            "[AUTOMATION_THREAD_MODEL] Failed reading source run system-only marker for run_id=%s",
+            run_id,
+            exc_info=True,
+        )
+        return None
+
+
+async def _get_latest_run_for_thread(thread_id: str) -> dict[str, Any] | None:
+    """Read the thread's latest attempt row for HITL resume provenance."""
+    if normalize_uuid(thread_id) is None:
+        return None
+    from src.server.database.runs import lifecycle as runs_lifecycle_db
+
+    try:
+        latest = await runs_lifecycle_db.get_latest_attempt(thread_id)
+        return dict(latest) if isinstance(latest, Mapping) else None
+    except RuntimeError as exc:
+        if "pool" in str(exc).lower():
+            return None
+        raise
+    except Exception:
+        logger.debug(
+            "[AUTOMATION_THREAD_MODEL] Failed reading latest attempt for thread=%s",
+            thread_id,
+            exc_info=True,
+        )
+        return None
+
+
 async def _get_execution_for_command(
     thread_id: str, command_id: str
 ) -> dict[str, Any] | None:
@@ -575,16 +628,36 @@ async def _resolve_automation_notification_context(
         is_server_retry=is_server_retry,
     )
     is_user_retry = bool(retry_of_run_id) and not is_server_turn
-    if not is_server_turn and not is_user_retry:
+    is_hitl_resume = bool(getattr(request, "hitl_response", None))
+    if not is_server_turn and not is_user_retry and not is_hitl_resume:
         return None, None, None, False, False, None
     if normalize_uuid(thread_id) is None:
         return None, None, None, False, False, None
 
+    source_run_system_only = False
+    target_exec: dict[str, Any] | None = None
+    match_kind = "none"
     try:
+        if retry_of_run_id:
+            if await _get_run_system_only(str(retry_of_run_id)):
+                source_run_system_only = True
         if is_user_retry:
             exec_row = await _get_execution_for_run_id(str(retry_of_run_id))
             target_exec = exec_row
             match_kind = "user_retry_run" if exec_row is not None else "none"
+        elif is_hitl_resume and not is_server_turn:
+            latest_run = await _get_latest_run_for_thread(thread_id)
+            latest_meta = (latest_run or {}).get("metadata") if isinstance(latest_run, Mapping) else None
+            if isinstance(latest_meta, Mapping) and bool(latest_meta.get("llm_model_system_only")):
+                source_run_system_only = True
+            latest_run_id = (
+                str(latest_run.get("conversation_response_id") or "")
+                if isinstance(latest_run, Mapping)
+                else ""
+            )
+            exec_row = await _get_execution_for_run_id(latest_run_id) if latest_run_id else None
+            target_exec = exec_row
+            match_kind = "hitl_resume_run" if exec_row is not None else "none"
         else:
             target_exec, match_kind = await _resolve_source_execution(
                 request,
@@ -592,25 +665,46 @@ async def _resolve_automation_notification_context(
                 retry_of_run_id=retry_of_run_id,
                 allow_running_fallback=allow_running_fallback,
             )
+            if is_hitl_resume and not source_run_system_only:
+                latest_run = await _get_latest_run_for_thread(thread_id)
+                latest_meta = (latest_run or {}).get("metadata") if isinstance(latest_run, Mapping) else None
+                if isinstance(latest_meta, Mapping) and bool(latest_meta.get("llm_model_system_only")):
+                    source_run_system_only = True
+                if target_exec is None and isinstance(latest_run, Mapping):
+                    latest_run_id = str(latest_run.get("conversation_response_id") or "")
+                    if latest_run_id:
+                        exec_row = await _get_execution_for_run_id(latest_run_id)
+                        if exec_row is not None:
+                            target_exec = exec_row
+                            match_kind = "hitl_resume_run"
     except Exception:
         logger.warning(
             f"[AUTOMATION_THREAD_MODEL] Failed resolving source execution "
             f"for thread={thread_id}; falling back to default resolution",
             exc_info=True,
         )
+        if source_run_system_only:
+            return {"_llm_model_system_only": True}, None, None, False, False, None
         return None, None, None, False, False, None
     if target_exec is None:
+        if source_run_system_only:
+            return {"_llm_model_system_only": True}, None, None, False, False, None
         return None, None, None, False, False, None
 
     fallback_eligible = is_server_turn and match_kind in _EXPLICIT_EXECUTION_MATCH_KINDS
     confirmed_source = fallback_eligible or match_kind == "user_retry_run"
     if confirmed_source and not fallback_eligible:
         target_exec = {**target_exec, "_effort_source_confirmed": True}
+    if match_kind == "hitl_resume_run":
+        target_exec = {**target_exec, "_provenance_source_confirmed": True}
     explicit_request_model = getattr(request, "llm_model", None)
     explicit_request_effort = getattr(request, "reasoning_effort", None)
     need_model = bool(is_server_turn and resolve_model and not explicit_request_model)
     need_effort = bool(confirmed_source and explicit_request_effort is None)
-    if not need_model and not need_effort:
+    need_system_only = not source_run_system_only
+    if not need_model and not need_effort and not need_system_only:
+        if source_run_system_only:
+            target_exec = {**target_exec, "_llm_model_system_only": True}
         return target_exec, None, None, fallback_eligible, False, None
 
     exec_id = str(target_exec["automation_execution_id"])
@@ -618,7 +712,7 @@ async def _resolve_automation_notification_context(
     source: str | None = None
     effort_configured = False
     inherited_effort: str | None = None
-    inherited_system_only = False
+    inherited_system_only = source_run_system_only
     first_system_only: bool | None = None
     try:
         if _get_execution_first_turn_llm_model is not _DEFAULT_GET_FIRST_TURN_LLM_MODEL:
@@ -649,15 +743,15 @@ async def _resolve_automation_notification_context(
         if need_model and first_model:
             chosen_model = first_model
             source = "first_turn"
-        if confirmed_source and first_effort_configured:
+        if need_effort and confirmed_source and first_effort_configured:
             effort_configured = True
             inherited_effort = first_effort
         if first_system_only is not None:
-            inherited_system_only = bool(first_system_only)
+            inherited_system_only = inherited_system_only or bool(first_system_only)
 
         need_db_model = need_model and not chosen_model
         need_db_effort = need_effort and not effort_configured
-        need_db_system_only = first_system_only is None
+        need_db_system_only = (not inherited_system_only) and (first_system_only is None)
         if need_db_model or need_db_effort or need_db_system_only:
             try:
                 automation = await auto_db.get_automation_including_deleted(
@@ -695,6 +789,8 @@ async def _resolve_automation_notification_context(
             f"execution_id={exec_id} via={match_kind}",
             exc_info=True,
         )
+        if source_run_system_only:
+            target_exec = {**target_exec, "_llm_model_system_only": True}
         if not need_model:
             return target_exec, None, None, fallback_eligible, False, None
         if fallback_eligible:
@@ -708,6 +804,8 @@ async def _resolve_automation_notification_context(
                 False,
                 None,
             )
+        if source_run_system_only:
+            return target_exec, None, None, False, False, None
         return None, None, None, False, False, None
 
     if inherited_system_only:
@@ -741,7 +839,9 @@ async def _resolve_automation_notification_context(
                 effort_configured,
                 inherited_effort,
             )
-        # Inferred link only: the previous behavior, default resolution.
+        # Inferred link only: the previous behavior, default resolution, while preserving system_only.
+        if inherited_system_only:
+            return target_exec, None, None, False, False, None
         return None, None, None, False, False, None
 
     prefs_for_resolve = (
@@ -881,16 +981,18 @@ async def resolve_turn_config_with_automation_inheritance(
     fallback_eligible = False
     effort_configured = False
     inherited_effort: str | None = None
+    is_server_turn = _is_server_notification_turn(
+        request,
+        from_service=from_service,
+        retry_of_run_id=retry_of_run_id,
+        is_server_retry=is_server_retry,
+    )
     if (
         requested_model is None
         or flagged_subscription is not None
         or bool(retry_of_run_id)
-        or _is_server_notification_turn(
-            request,
-            from_service=from_service,
-            retry_of_run_id=retry_of_run_id,
-            is_server_retry=is_server_retry,
-        )
+        or bool(getattr(request, "hitl_response", None))
+        or is_server_turn
     ):
         (
             target_exec,
@@ -906,7 +1008,9 @@ async def resolve_turn_config_with_automation_inheritance(
             from_service=from_service,
             is_server_retry=is_server_retry,
             retry_of_run_id=retry_of_run_id,
-            allow_running_fallback=(requested_model is None and flagged_subscription is None),
+            allow_running_fallback=(
+                requested_model is None and flagged_subscription is None
+            ),
             resolve_model=(requested_model is None),
         )
 
@@ -917,20 +1021,24 @@ async def resolve_turn_config_with_automation_inheritance(
     confirmed_for_context = target_exec is not None and (
         fallback_eligible or bool(target_exec.get("_effort_source_confirmed"))
     )
-    if confirmed_for_context and on_automation_context is not None:
-        exec_id = target_exec.get("automation_execution_id")
-        if exec_id:
-            # Stamp automation_source_execution_id (NOT automation_execution_id) so
-            # restart recovery never mistakes a wakeup/continuation/retry run for a
-            # scheduler-refirable firing turn while still preserving provenance.
-            ctx_meta: dict[str, Any] = {
-                "automation_source_execution_id": str(exec_id),
-            }
-            if effort_configured:
-                ctx_meta["automation_reasoning_effort_configured"] = True
-                ctx_meta["automation_reasoning_effort"] = inherited_effort
-            if inherited_system_only:
-                ctx_meta["llm_model_system_only"] = True
+    provenance_for_context = confirmed_for_context or bool(
+        (target_exec or {}).get("_provenance_source_confirmed")
+    )
+    if on_automation_context is not None:
+        ctx_meta: dict[str, Any] = {}
+        if provenance_for_context and target_exec is not None:
+            exec_id = target_exec.get("automation_execution_id")
+            if exec_id:
+                # Stamp automation_source_execution_id (NOT automation_execution_id) so
+                # restart recovery never mistakes a wakeup/continuation/retry run for a
+                # scheduler-refirable firing turn while still preserving provenance.
+                ctx_meta["automation_source_execution_id"] = str(exec_id)
+                if confirmed_for_context and effort_configured:
+                    ctx_meta["automation_reasoning_effort_configured"] = True
+                    ctx_meta["automation_reasoning_effort"] = inherited_effort
+        if inherited_system_only:
+            ctx_meta["llm_model_system_only"] = True
+        if ctx_meta:
             on_automation_context(ctx_meta)
 
     explicit_request_effort = getattr(request, "reasoning_effort", None)

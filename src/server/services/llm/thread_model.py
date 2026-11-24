@@ -591,9 +591,37 @@ async def switch_thread_model(
             changed=True,
         )
 
-    updated_thread = await threads_write.update_thread_fields(
-        thread_id, llm_model=model
-    )
+    # DALTON-HOOK(cos-settings-tools): stamp owner model switch after a system-only run so immediate manual compaction uses the owner's selection
+    switch_meta_merge: dict[str, Any] | None = None
+    try:
+        from src.server.database.runs import lifecycle as _runs_lifecycle
+
+        _latest_attempt = await _runs_lifecycle.get_latest_attempt(thread_id)
+        if (
+            isinstance(_latest_attempt, dict)
+            and (_latest_attempt.get("metadata") or {}).get("llm_model_system_only")
+            and _latest_attempt.get("conversation_response_id")
+        ):
+            switch_meta_merge = {
+                "owner_model_switch_run_id": str(
+                    _latest_attempt["conversation_response_id"]
+                )
+            }
+    except Exception:
+        logger.debug(
+            "latest run read for system-only switch stamp failed on thread %s",
+            thread_id,
+            exc_info=True,
+        )
+
+    if switch_meta_merge is not None:
+        updated_thread = await threads_write.update_thread_fields(
+            thread_id, llm_model=model, metadata_merge=switch_meta_merge
+        )
+    else:
+        updated_thread = await threads_write.update_thread_fields(
+            thread_id, llm_model=model
+        )
     if not updated_thread:
         raise HTTPException(
             status_code=404, detail=f"Thread not found: {thread_id}"

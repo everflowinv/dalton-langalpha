@@ -344,6 +344,8 @@ async def input_rerun_request(
         subagents_enabled=run_meta.get("subagents_enabled"),
         request_key=body.request_key if body else None,
         llm_model=body.llm_model if body else None,
+        # DALTON-HOOK(cos-settings-tools): preserve system-only marker from failed run metadata on pending-input retry
+        llm_model_system_only=bool(run_meta.get("llm_model_system_only")),
         reasoning_effort=body.reasoning_effort if body else None,
         fast_mode=body.fast_mode if body else None,
         keep_full_context=bool(body and body.keep_full_context),

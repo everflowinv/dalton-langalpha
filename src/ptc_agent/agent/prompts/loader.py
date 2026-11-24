@@ -97,10 +97,15 @@ class PromptLoader:
         # DALTON-HOOK(standalone-core): inject deployment capabilities & brand name for conditional prompt rendering
         from src.dalton.access_tiers import is_internal_tier
         from src.dalton.capabilities import CapabilityId, effective_capabilities
-        from src.dalton.settings import get_brand_name
+        from src.dalton.settings import get_brand_name, get_dalton_settings
 
         active_caps = effective_capabilities()
         context.setdefault("brand_name", get_brand_name())
+        # DALTON-HOOK(cos-settings-tools): gate managed automation tool guidance on autonomy.enabled
+        context.setdefault(
+            "autonomy_enabled",
+            bool(get_dalton_settings().autonomy.enabled),
+        )
         context.setdefault(
             "researchdata_bridge_enabled",
             CapabilityId.RESEARCHDATA_BRIDGE in active_caps,

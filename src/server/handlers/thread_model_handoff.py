@@ -51,6 +51,7 @@ async def inspect_hand_off(thread_id: str, user_id: str, model: str | None):
     or when the checkpoint is paused on an unresolved user interrupt."""
     from src.llms.provider_compaction import replays
     from src.server.handlers.thread_maintenance import (
+        _resolve_accepts_ignore_custom_override,  # DALTON-HOOK(cos-settings-tools)
         _resolver,
         _summary_to_hand_off,
         thread_route,
@@ -72,7 +73,13 @@ async def inspect_hand_off(thread_id: str, user_id: str, model: str | None):
         logger.warning(f"[handoff] thread {thread_id}: switch not read", exc_info=True)
         return "retryable_failure", None
     try:
-        switched_to = (await resolve(meta.get("llm_model"))).get_llm_client()
+        # DALTON-HOOK(cos-settings-tools): resolve the newly switched-to model under the owner's own selection
+        if _resolve_accepts_ignore_custom_override(resolve):
+            switched_to = (
+                await resolve(meta.get("llm_model"), ignore_custom_models_override=False)
+            ).get_llm_client()
+        else:
+            switched_to = (await resolve(meta.get("llm_model"))).get_llm_client()
     except Exception:
         # A model that cannot run now reads the text when it can.
         switched_to = None

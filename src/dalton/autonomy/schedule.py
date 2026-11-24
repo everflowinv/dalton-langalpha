@@ -653,6 +653,7 @@ async def _check_managed_automation_model(
     pref: dict[str, Any] | None,
     *,
     cross_user: bool,
+    via_rest: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Validate *model_name* for a managed automation write.
 
@@ -673,11 +674,22 @@ async def _check_managed_automation_model(
         if model_name in configured and source == user_models.ModelSource.SYSTEM:
             return source, entry if isinstance(entry, dict) else {}
         raise lifecycle.AutomationRefusal(
-            f"unknown model {model_name!r}; use null for the user's default, "
+            f'unknown model {model_name!r}; pass "" to clear and use the user\'s default, '
             f"or one of: {', '.join(configured)}",
             field="llm_model",
         )
-    return await lifecycle.check_model(task_owner, model_name, pref)
+    try:
+        return await lifecycle.check_model(task_owner, model_name, pref)
+    except lifecycle.AutomationRefusal as exc:
+        if not via_rest and "use null for the user's default" in str(exc):
+            raise lifecycle.AutomationRefusal(
+                str(exc).replace(
+                    "use null for the user's default",
+                    'pass "" to clear and use the user\'s default',
+                ),
+                field=exc.field,
+            ) from None
+        raise
 
 
 async def _check_active_admin_in_tx(actor_id: str, *, conn: Any = None) -> bool:
@@ -886,9 +898,8 @@ async def _lock_and_verify_workspace_placement(
             comp_raw = await cur.fetchone()
             locked_comp_row = dict(comp_raw) if comp_raw else None
         await cur.execute(
-            f"""
-            SELECT w.workspace_id, w.user_id, w.computer_id, w.status, w.config,
-                   {workspace_move_fences("w.workspace_id")} AS move_fenced
+            """
+            SELECT w.workspace_id, w.user_id, w.computer_id, w.status, w.config
             FROM workspaces w
             WHERE w.workspace_id = %(workspace_id)s AND w.status <> 'deleted'
             ORDER BY w.workspace_id
@@ -897,10 +908,20 @@ async def _lock_and_verify_workspace_placement(
             {"workspace_id": norm_ws},
         )
         ws_raw = await cur.fetchone()
-    if ws_raw is None:
-        raise _make_schedule_refusal("情况已变化，请重新发起", field="workspace_id")
+        if ws_raw is None:
+            raise _make_schedule_refusal("情况已变化，请重新发起", field="workspace_id")
+        # Recheck active workspace moves in a separate statement AFTER acquiring
+        # FOR SHARE on workspaces so READ COMMITTED takes a fresh snapshot that
+        # observes any workspace_moves row committed while waiting on the lock.
+        await cur.execute(
+            f"""
+            SELECT {workspace_move_fences("%(workspace_id)s::uuid")} AS move_fenced
+            """,
+            {"workspace_id": norm_ws},
+        )
+        fence_raw = await cur.fetchone()
     locked_ws_row = dict(ws_raw)
-    if locked_ws_row.get("move_fenced"):
+    if fence_raw and fence_raw.get("move_fenced"):
         raise _make_schedule_refusal("情况已变化，请重新发起", field="workspace_id")
     actual_comp_id = (
         str(locked_ws_row["computer_id"]) if locked_ws_row.get("computer_id") else None
@@ -933,7 +954,8 @@ async def _recheck_operator_authorization_in_tx(
     """Re-verify operator authorization inside the locked transaction."""
     sql_conn = locked_conn if _conn_supports_sql_locks(locked_conn) else None
 
-    if is_home:
+    home_job_names = {str(s["name"]) for s in build_global_director_specs()}
+    if is_home or saved_name in home_job_names:
         if role != "chief_of_staff":
             raise _make_schedule_refusal(
                 "公司分析师只能操作当前工作区的任务，禁止操作 Home 全局任务。",
@@ -947,14 +969,14 @@ async def _recheck_operator_authorization_in_tx(
                     field="workspace_id",
                     code="forbidden_pm",
                 )
-            return
-        if not await _check_active_admin_in_tx(effective_actor_id, conn=sql_conn):
+        elif not await _check_active_admin_in_tx(effective_actor_id, conn=sql_conn):
             raise _make_schedule_refusal(
                 "只有 PM 用户可以修改或启停 Home 全局任务。",
                 field="workspace_id",
                 code="forbidden_pm",
             )
-        return
+        if is_home:
+            return
 
     if sql_conn is None:
         return
@@ -991,26 +1013,48 @@ async def _recheck_operator_authorization_in_tx(
                     field="workspace_id",
                     code="not_unit_lead_analyst",
                 )
+            ws_owner = str((locked_ws_row or {}).get("user_id") or "").strip()
+            actor_is_pm = False
             if effective_actor_id != locked_lead:
-                if not (
+                actor_is_pm = bool(
                     auth_on
                     and await _check_active_admin_in_tx(
                         effective_actor_id, conn=sql_conn
                     )
-                ):
+                )
+                if not actor_is_pm:
                     raise _make_schedule_refusal(
                         f"工作区 {locked_ws_id} 已绑定覆盖单元，受管自动任务 {saved_name} "
                         f"仅可由当前主分析师或 PM 修改。",
                         field="workspace_id",
                         code="not_unit_lead_analyst",
                     )
-                ws_owner = str((locked_ws_row or {}).get("user_id") or "").strip()
-                if ws_owner and ws_owner != effective_actor_id:
+            elif ws_owner and ws_owner != effective_actor_id:
+                actor_is_pm = bool(
+                    auth_on
+                    and await _check_active_admin_in_tx(
+                        effective_actor_id, conn=sql_conn
+                    )
+                )
+            if locked_ws_row is not None and ws_owner and ws_owner != effective_actor_id:
+                if actor_is_pm:
                     owner_tier = await classify_owner_tier(ws_owner, conn=sql_conn)
                     if owner_tier in ("unknown", "external"):
                         raise _make_schedule_refusal(
                             "情况已变化，请重新发起", field="workspace_id"
                         )
+                try:
+                    await require_workspace_access(
+                        dict(locked_ws_row),
+                        effective_actor_id,
+                        channel="web",
+                        need="read" if actor_is_pm else "write",
+                        conn=sql_conn,
+                    )
+                except (HTTPException, ColleagueAccessRevokedError):
+                    raise _make_schedule_refusal(
+                        "情况已变化，请重新发起", field="workspace_id"
+                    ) from None
             return
         if effective_actor_id != task_owner:
             raise _make_schedule_refusal(
@@ -1305,10 +1349,7 @@ async def schedule_dalton_automation_helper(
     if not resolved_name:
         return {"ok": False, "error": "缺少自动任务名称 `name`。"}
 
-    if resolved_name in home_job_names:
-        is_home_target = True
-
-    if is_home_target:
+    if is_home_target or resolved_name in home_job_names:
         if role != "chief_of_staff":
             return {
                 "ok": False,
@@ -1939,6 +1980,7 @@ async def schedule_dalton_automation_helper(
                         target_model_for_effort,
                         pref_for_effort,
                         cross_user=cross_user,
+                        via_rest=via_rest,
                     )
                 elif target_model_for_effort and target_system_only:
                     sys_src, sys_entry = await user_models.classify_model(
@@ -2026,10 +2068,9 @@ async def schedule_dalton_automation_helper(
                     or saved_name
                 )
                 locked_is_home = bool(
-                    is_home_target
-                    or not locked_ws_id
-                    or locked_name in home_job_names
+                    not locked_ws_id
                     or is_home_id(task_owner, locked_ws_id)
+                    or (is_home_target and _ws_key(locked_ws_id) == _ws_key(ws_id))
                 )
                 locked_ws_row, resolved_computer = (
                     await _lock_and_verify_workspace_placement(
@@ -2093,6 +2134,7 @@ async def schedule_dalton_automation_helper(
                         final_model,
                         pref_for_effort,
                         cross_user=cross_user,
+                        via_rest=via_rest,
                     )
                 elif final_model and final_system_only:
                     sys_src, sys_entry = await user_models.classify_model(
@@ -2302,6 +2344,7 @@ async def schedule_dalton_automation_helper(
                         create_llm_model,
                         pref_for_effort,
                         cross_user=cross_user,
+                        via_rest=via_rest,
                     )
                 if create_resolved_computer is not _UNSET_RESOLVED_COMPUTER:
                     await check_claude_code_hosted(

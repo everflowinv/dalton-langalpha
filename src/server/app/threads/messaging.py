@@ -775,6 +775,11 @@ async def _handle_send_message(
             else None
         )
 
+        # DALTON-HOOK(cos-settings-tools): build run_meta ahead of thread_resolver so system-only follows the run's metadata
+        run_meta: dict[str, object] = {}
+        if getattr(request, "llm_model_system_only", False):
+            run_meta["llm_model_system_only"] = True
+
         # Likewise a turn naming no effort or fast mode runs the thread's own
         # (``thread_resolver`` says when the row decides).
         resolve = thread_resolver(
@@ -787,8 +792,8 @@ async def _handle_send_message(
             reasoning_effort=getattr(request, "reasoning_effort", None),
             fast_mode=getattr(request, "fast_mode", None),
             enabled_subagents=request.subagents_enabled,
-            # DALTON-HOOK(cos-settings-tools): enforce system-catalog model resolution when server-stamped
-            ignore_custom_models=bool(getattr(request, "llm_model_system_only", False)),
+            # DALTON-HOOK(cos-settings-tools): enforce system-catalog model resolution from this run's metadata
+            run_metadata=run_meta,
         )
 
         # A report-back or a channel message has nobody at a client to
@@ -805,6 +810,11 @@ async def _handle_send_message(
 
         fallback_records: list[dict[str, object]] = []
         automation_run_ctx: dict[str, object] = {}
+
+        def _record_automation_context(ctx: dict[str, object]) -> None:
+            automation_run_ctx.update(ctx)
+            run_meta.update(ctx)
+
         config = await resolve_turn_config_with_automation_inheritance(
             user_id=user_id,
             thread_id=thread_id,
@@ -817,7 +827,7 @@ async def _handle_send_message(
             resolve=resolve,
             flagged_subscription=flagged_subscription,
             on_fallback=fallback_records.append,
-            on_automation_context=automation_run_ctx.update,
+            on_automation_context=_record_automation_context,
         )
 
         # is_byok is True only when the stamped credential_source confirms the user
@@ -923,8 +933,7 @@ async def _handle_send_message(
 
     # DALTON-HOOK(colleague-dispatch): pass origin_channel, tail_turn_no_new_work, and workspace_owner_id into run metadata & configurable.
     # DALTON-HOOK(automation-effort): propagate automation_source_execution_id (not scheduler firing automation_execution_id) and two-state effort to continuation/retry run_meta
-    # DALTON-HOOK(cos-settings-tools): persist llm_model_system_only onto continuation/retry run_meta
-    run_meta: dict[str, object] = {}
+    # DALTON-HOOK(cos-settings-tools): run_meta was initialized before thread_resolver and populated by automation inheritance
     if automation_run_ctx:
         run_meta.update(automation_run_ctx)
     if getattr(request, "llm_model_system_only", False):
@@ -2082,6 +2091,10 @@ async def retry_thread(
                 ),
                 request_key=(body.request_key if body else None),
                 llm_model=(body.llm_model if body else None),
+                # DALTON-HOOK(cos-settings-tools): preserve system-only marker from failed run metadata on checkpoint retry
+                llm_model_system_only=bool(
+                    (latest.get("metadata") or {}).get("llm_model_system_only")
+                ),
                 reasoning_effort=(body.reasoning_effort if body else None),
                 fast_mode=(body.fast_mode if body else None),
                 keep_full_context=bool(body and body.keep_full_context),

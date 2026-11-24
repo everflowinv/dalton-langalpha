@@ -10,6 +10,7 @@ services/thread_status.py.
 
 import asyncio
 import logging
+from collections.abc import Mapping  # DALTON-HOOK(cos-settings-tools)
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -468,7 +469,50 @@ async def _previous_run(thread_id: str) -> TurnContext:
     return TurnContext(previous_run_settled_at=run_settled_at(attempt))
 
 
-async def _resolver(user_id: str, thread_id: str, meta: dict, route):
+# DALTON-HOOK(cos-settings-tools): keep previous run's system-only flag for compaction only while thread still runs that model
+def _should_keep_system_only_for_thread_selection(
+    meta: Mapping[str, Any],
+    latest: Mapping[str, Any] | None,
+    latest_meta: Mapping[str, Any],
+) -> bool:
+    if not latest_meta.get("llm_model_system_only"):
+        return False
+    thread_meta = meta.get("metadata") if isinstance(meta.get("metadata"), Mapping) else {}
+    if thread_meta.get("dalton_pending_model_handoff"):
+        return False
+    latest_run_id = str((latest or {}).get("conversation_response_id") or "").strip()
+    switched_after = str(thread_meta.get("owner_model_switch_run_id") or "").strip()
+    if latest_run_id and switched_after == latest_run_id:
+        return False
+    latest_model = latest_meta.get("llm_model")
+    if latest_model and meta.get("llm_model") != latest_model:
+        return False
+    return True
+
+
+def _resolve_accepts_ignore_custom_override(resolve: Any) -> bool:
+    import inspect
+
+    try:
+        sig = inspect.signature(resolve)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        name == "ignore_custom_models_override"
+        or param.kind == inspect.Parameter.VAR_KEYWORD
+        for name, param in sig.parameters.items()
+    )
+
+
+async def _resolver(
+    user_id: str,
+    thread_id: str,
+    meta: dict,
+    route,
+    *,
+    ignore_custom_models: bool | None = None,  # DALTON-HOOK(cos-settings-tools)
+    for_current_selection: bool = False,  # DALTON-HOOK(cos-settings-tools)
+):
     """``thread_resolver`` for a call between turns, which no composer
     started, so the thread's row sets its effort and fast mode, and its
     latest run the subagents its tools name, as that run's build was given
@@ -484,6 +528,15 @@ async def _resolver(user_id: str, thread_id: str, meta: dict, route):
         logger.debug("latest run read failed for thread %s", thread_id, exc_info=True)
         latest = None
     latest_meta = (latest or {}).get("metadata") or {}
+    # DALTON-HOOK(cos-settings-tools): preserve system-only catalog resolution for the previous run's model only
+    if ignore_custom_models is not None:
+        effective_ignore_custom = bool(ignore_custom_models)
+    elif for_current_selection:
+        effective_ignore_custom = _should_keep_system_only_for_thread_selection(
+            meta, latest, latest_meta
+        )
+    else:
+        effective_ignore_custom = bool(latest_meta.get("llm_model_system_only"))
     return thread_resolver(
         user_id,
         thread_id,
@@ -493,7 +546,7 @@ async def _resolver(user_id: str, thread_id: str, meta: dict, route):
         is_byok=(await own_access(user_id, sign_ins=False)).api_keys,
         enabled_subagents=latest_meta.get("subagents_enabled"),
         # DALTON-HOOK(cos-settings-tools): preserve system-only catalog resolution for compaction and model-switch handoff
-        ignore_custom_models=bool(latest_meta.get("llm_model_system_only")),
+        ignore_custom_models=effective_ignore_custom,
     )
 
 
@@ -609,7 +662,10 @@ async def _compaction_config(
             named=None,
             held=meta.get("llm_model"),
             fall_back=not on_claude_code,
-            resolve=await _resolver(user_id, thread_id, meta, route),
+            # DALTON-HOOK(cos-settings-tools): do not carry previous run's system-only flag onto a newly switched thread model
+            resolve=await _resolver(
+                user_id, thread_id, meta, route, for_current_selection=True
+            ),
             clear_dead=clear_dead,
         )
     except HTTPException:
@@ -910,7 +966,13 @@ async def _hand_off_config(thread_id: str, user_id: str, model: str | None):
     meta, route = await thread_route(thread_id, user_id)
     resolve = await _resolver(user_id, thread_id, meta, route)
     try:
-        switched_to = (await resolve(meta.get("llm_model"))).get_llm_client()
+        # DALTON-HOOK(cos-settings-tools): resolve the newly switched-to model under the owner's own selection (not previous run's system-only flag)
+        if _resolve_accepts_ignore_custom_override(resolve):
+            switched_to = (
+                await resolve(meta.get("llm_model"), ignore_custom_models_override=False)
+            ).get_llm_client()
+        else:
+            switched_to = (await resolve(meta.get("llm_model"))).get_llm_client()
     except Exception:
         # A model that cannot run now reads the text when it can.
         switched_to = None

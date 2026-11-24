@@ -736,6 +736,27 @@ async def update_thread_endpoint(
                 await require_selectable_model(x_user_id, request.llm_model)
             updates["llm_model"] = request.llm_model
             switched_from = (await get_thread_auth_meta(thread_id) or {}).get("llm_model")
+            # DALTON-HOOK(cos-settings-tools): record owner model switch after a system-only run so immediate manual compaction uses the owner's selection
+            try:
+                from src.server.database.runs import lifecycle as _runs_lifecycle
+
+                _latest_attempt = await _runs_lifecycle.get_latest_attempt(thread_id)
+                if (
+                    isinstance(_latest_attempt, dict)
+                    and (_latest_attempt.get("metadata") or {}).get("llm_model_system_only")
+                    and _latest_attempt.get("conversation_response_id")
+                ):
+                    updates["metadata_merge"] = {
+                        "owner_model_switch_run_id": str(
+                            _latest_attempt["conversation_response_id"]
+                        )
+                    }
+            except Exception:
+                logger.debug(
+                    "latest run read for system-only switch stamp failed on thread %s",
+                    thread_id,
+                    exc_info=True,
+                )
         if "subagents_allowed" in provided:
             # null, or the side the owner's default is on, returns the thread
             # to following the default (decided in the UPDATE). Read by the

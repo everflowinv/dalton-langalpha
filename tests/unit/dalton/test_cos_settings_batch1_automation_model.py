@@ -496,6 +496,8 @@ async def test_cross_user_model_validation_system_only_flag_list_and_effort_hidi
         )
         assert refused["ok"] is False
         assert refused["error"] == "invalid_llm_model"
+        assert 'pass "" to clear' in refused["message"]
+        assert "null" not in refused["message"].lower()
         allowed_part = refused["message"].split("one of:", 1)[-1]
         assert "my-secret-private-model" not in allowed_part
         assert "my-secret-gw" not in allowed_part
@@ -1223,8 +1225,9 @@ async def test_regular_workspace_locks_in_order_rechecks_same_model_claude_code_
                     "computer_id": db_state["computer_id"],
                     "status": "running",
                     "config": {},
-                    "move_fenced": db_state["move_fenced"],
                 }
+            elif "FROM workspace_moves" in norm:
+                last["row"] = {"move_fenced": db_state["move_fenced"]}
             else:
                 last["row"] = None
 
@@ -1282,7 +1285,9 @@ async def test_regular_workspace_locks_in_order_rechecks_same_model_claude_code_
     assert res_same["ok"] is True
     comp_idx = next(i for i, s in enumerate(executed_sql) if "FROM computers" in s and "ORDER BY computer_id FOR SHARE" in s)
     ws_idx = next(i for i, s in enumerate(executed_sql) if "FROM workspaces" in s and "ORDER BY w.workspace_id FOR SHARE" in s)
-    assert comp_idx < ws_idx
+    fence_idx = next(i for i, s in enumerate(executed_sql) if "FROM workspace_moves" in s and "AS move_fenced" in s)
+    assert comp_idx < ws_idx < fence_idx
+    assert "workspace_moves" not in executed_sql[ws_idx]
     assert len(cc_calls) == 1
     assert cc_calls[0]["model"] == "claude-sonnet-4-6"
     assert cc_calls[0]["resolved_computer"]["computer_id"] == COMP_1
@@ -1411,3 +1416,810 @@ async def test_continuation_turn_subscription_fallback_forwards_ignore_custom_mo
         ("gpt-6.2-sol", True),
     ]
 
+
+
+# ---------------------------------------------------------------------------
+# Round 2 tests: Decisions 1, 2, 3, 5, 6, 7
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_system_only_preserved_on_web_retry_hitl_resume_and_running_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Decision 1: llm_model_system_only follows the run across web retry (including with both
+    llm_model and reasoning_effort), /retry pending-input rerun, HITL resume, and running_thread
+    server continuations, and writes llm_model_system_only into run_meta for thread_resolver."""
+    from src.server.models.workflow import RetryRequest
+    from src.server.services.llm import thread_model as thread_model_mod
+    from src.server.services.runs import pending_input as pending_input_mod
+
+    exec_row = {
+        "automation_execution_id": EXEC_ID,
+        "automation_id": AUTO_ID,
+        "status": "running",
+        "conversation_thread_id": THREAD_ID,
+        "user_id": OWNER,
+    }
+    _install_catalog_and_prefs(monkeypatch, owner_pref={})
+    monkeypatch.setattr("src.server.app.setup.agent_config", SimpleNamespace())
+    monkeypatch.setattr(
+        thread_model_mod,
+        "model_resolves",
+        create_autospec(thread_model_mod.model_resolves, return_value=True),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "model_resolves",
+        create_autospec(atm_mod.model_resolves, return_value=True),
+    )
+
+    resolve_calls: list[tuple[str | None, bool, str | None]] = []
+
+    async def _fake_resolve_llm(_base, _uid, model_name, _byok, **kw):
+        resolve_calls.append(
+            (model_name, bool(kw.get("ignore_custom_models", False)), kw.get("reasoning_effort"))
+        )
+        return SimpleNamespace(llm=SimpleNamespace(name=model_name), llm_client=object())
+
+    monkeypatch.setattr(
+        llm_config_mod,
+        "resolve_llm_config",
+        create_autospec(llm_config_mod.resolve_llm_config, side_effect=_fake_resolve_llm),
+    )
+
+    def _make_resolver(run_meta: dict[str, Any], effort: str | None = None):
+        return thread_agent.thread_resolver(
+            OWNER,
+            THREAD_ID,
+            TurnRoute(workspace_id=WS, owner_id=OWNER, role="analyst"),
+            identity=TurnIdentity(sender=OWNER, owner=OWNER, recorded_as=OWNER),
+            thread={"llm_model": "claude-sonnet-4-6"},
+            is_byok=False,
+            reasoning_effort=effort,
+            run_metadata=run_meta,
+        )
+
+    # (a) User web retry sending BOTH llm_model and reasoning_effort (previously hit early return!)
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_run_system_only",
+        create_autospec(atm_mod._get_run_system_only, return_value=False),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_for_run_id",
+        create_autospec(atm_mod._get_execution_for_run_id, return_value=exec_row),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_first_turn_run_settings",
+        create_autospec(
+            atm_mod._get_execution_first_turn_run_settings,
+            return_value=("claude-sonnet-4-6", True, "medium", True),
+        ),
+    )
+    run_meta_retry: dict[str, Any] = {}
+    req_web_retry = ChatRequest(
+        workspace_id=WS,
+        messages=[],
+        llm_model="claude-sonnet-4-6",
+        reasoning_effort="high",
+    )
+    await atm_mod.resolve_turn_config_with_automation_inheritance(
+        user_id=OWNER,
+        thread_id=THREAD_ID,
+        request=req_web_retry,
+        requested_model="claude-sonnet-4-6",
+        held_model="claude-sonnet-4-6",
+        from_service=False,
+        is_server_retry=False,
+        retry_of_run_id="99999999-9999-4999-8999-999999999999",
+        resolve=_make_resolver(run_meta_retry, effort="high"),
+        on_automation_context=run_meta_retry.update,
+    )
+    assert run_meta_retry.get("llm_model_system_only") is True
+    assert run_meta_retry.get("automation_source_execution_id") == EXEC_ID
+    assert resolve_calls[-1] == ("claude-sonnet-4-6", True, "high")
+
+    # (b) User /retry with only reasoning_effort (no llm_model)
+    run_meta_effort_retry: dict[str, Any] = {}
+    req_effort_retry = ChatRequest(
+        workspace_id=WS,
+        messages=[],
+        reasoning_effort="low",
+    )
+    await atm_mod.resolve_turn_config_with_automation_inheritance(
+        user_id=OWNER,
+        thread_id=THREAD_ID,
+        request=req_effort_retry,
+        requested_model=None,
+        held_model="claude-sonnet-4-6",
+        from_service=False,
+        is_server_retry=False,
+        retry_of_run_id="99999999-9999-4999-8999-999999999999",
+        resolve=_make_resolver(run_meta_effort_retry, effort="low"),
+        on_automation_context=run_meta_effort_retry.update,
+    )
+    assert run_meta_effort_retry.get("llm_model_system_only") is True
+    assert resolve_calls[-1] == ("claude-sonnet-4-6", True, "low")
+
+    # (c) HITL resume submitted from web (user request with hitl_response + llm_model + reasoning_effort)
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_latest_run_for_thread",
+        create_autospec(
+            atm_mod._get_latest_run_for_thread,
+            return_value={
+                "conversation_response_id": "88888888-8888-4888-8888-888888888888",
+                "metadata": {"llm_model_system_only": True, "automation_execution_id": EXEC_ID},
+            },
+        ),
+    )
+    run_meta_hitl: dict[str, Any] = {}
+    req_hitl = ChatRequest(
+        workspace_id=WS,
+        messages=[],
+        hitl_response={"interrupt-1": {"decisions": [{"type": "approve"}]}},
+        llm_model="claude-sonnet-4-6",
+        reasoning_effort="medium",
+    )
+    await atm_mod.resolve_turn_config_with_automation_inheritance(
+        user_id=OWNER,
+        thread_id=THREAD_ID,
+        request=req_hitl,
+        requested_model="claude-sonnet-4-6",
+        held_model="claude-sonnet-4-6",
+        from_service=False,
+        resolve=_make_resolver(run_meta_hitl, effort="medium"),
+        on_automation_context=run_meta_hitl.update,
+    )
+    assert run_meta_hitl.get("llm_model_system_only") is True
+    assert run_meta_hitl.get("automation_source_execution_id") == EXEC_ID
+    assert resolve_calls[-1] == ("claude-sonnet-4-6", True, "medium")
+
+    # (d) Server continuation matching ONLY running_thread fallback writes llm_model_system_only to run_meta
+    monkeypatch.setattr(
+        atm_mod.exec_db,
+        "get_running_executions_for_thread",
+        create_autospec(atm_mod.exec_db.get_running_executions_for_thread, return_value=[exec_row]),
+    )
+    run_meta_running: dict[str, Any] = {}
+    req_running = ChatRequest(
+        workspace_id=WS,
+        messages=[ChatMessage(role="user", content="resume")],
+        query_type="system",
+    )
+    await atm_mod.resolve_turn_config_with_automation_inheritance(
+        user_id=OWNER,
+        thread_id=THREAD_ID,
+        request=req_running,
+        requested_model=None,
+        held_model=None,
+        from_service=True,
+        resolve=_make_resolver(run_meta_running),
+        on_automation_context=run_meta_running.update,
+    )
+    assert run_meta_running.get("llm_model_system_only") is True
+    assert "automation_source_execution_id" not in run_meta_running
+    assert resolve_calls[-1][0] == "claude-sonnet-4-6"
+    assert resolve_calls[-1][1] is True
+
+    # (e) input_rerun_request copies llm_model_system_only from failed run metadata
+    monkeypatch.setattr(
+        "src.server.database.conversation.queries.get_query_at_turn",
+        create_autospec(
+            __import__(
+                "src.server.database.conversation.queries", fromlist=["get_query_at_turn"]
+            ).get_query_at_turn,
+            return_value={"content": "retry me", "type": "initial", "metadata": {}},
+        ),
+    )
+    rerun_req = await pending_input_mod.input_rerun_request(
+        THREAD_ID,
+        {"turn_index": 1, "metadata": {"llm_model_system_only": True}},
+        pending_input_mod.PendingInput(replay=False, checkpoint_id=None, resend=False, context=False),
+        workspace_id=WS,
+        body=RetryRequest(
+            workspace_id=WS, llm_model="claude-sonnet-4-6", reasoning_effort="high"
+        ),
+    )
+    assert rerun_req.llm_model_system_only is True
+
+
+@pytest.mark.asyncio
+async def test_generic_patch_maintains_system_only_marker_and_effort_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Decision 2: generic PATCH clears llm_model_system_only on llm_model=None or custom model,
+    rejects client metadata writes to llm_model_system_only, and validates effort-only edits
+    against the system catalog when llm_model_system_only is True."""
+    from src.server.models.automation import AutomationCreate
+
+    owner_pref = {
+        "custom_models": [
+            {
+                "name": "claude-sonnet-4-6",
+                "provider": "openai",
+                "model_id": "owner-shadow-no-reasoning",
+            },
+            {
+                "name": "owner-custom-only",
+                "provider": "openai",
+                "model_id": "owner-custom-id",
+                "reasoning": {"efforts": ["low"], "default": "low"},
+            },
+        ],
+    }
+    _install_catalog_and_prefs(monkeypatch, owner_pref=owner_pref)
+    monkeypatch.setattr(
+        lifecycle_mod,
+        "check_claude_code_hosted",
+        create_autospec(lifecycle_mod.check_claude_code_hosted, return_value=None),
+    )
+
+    stored_sys_row = {
+        "automation_id": AUTO_ID,
+        "user_id": OWNER,
+        "name": "dalton-nvda-watch",
+        "trigger_type": "cron",
+        "cron_expression": "0 9 * * 1-5",
+        "timezone": "Asia/Shanghai",
+        "status": "active",
+        "workspace_id": WS,
+        "llm_model": "claude-sonnet-4-6",
+        "reasoning_effort": "medium",
+        "metadata": {"dalton_managed": True, "llm_model_system_only": True},
+    }
+
+    # (a) Clearing llm_model=None removes llm_model_system_only in both prepare & locked recheck
+    prep_clear = await lifecycle_mod.prepare_owned_automation_update(
+        AUTO_ID, OWNER, {"llm_model": None}, current=dict(stored_sys_row), model_pref=owner_pref
+    )
+    assert prep_clear is not None
+    assert prep_clear.update_kwargs["llm_model"] is None
+    assert "llm_model_system_only" not in prep_clear.update_kwargs["metadata"]
+    assert prep_clear.update_kwargs["metadata"]["dalton_managed"] is True
+
+    eff_clear = dict(prep_clear.update_kwargs)
+    await lifecycle_mod.recheck_locked_automation_update(
+        user_id=OWNER,
+        update=prep_clear.update,
+        current=stored_sys_row,
+        stored_in=WS,
+        stored_pin=None,
+        new_cron=None,
+        new_tz=None,
+        pref_for_lock=owner_pref,
+        locked_row=dict(stored_sys_row),
+        effective_kwargs=eff_clear,
+        locked_conn=None,
+    )
+    assert "llm_model_system_only" not in eff_clear["metadata"]
+
+    # (b) Switching explicitly to a custom model removes llm_model_system_only
+    prep_custom = await lifecycle_mod.prepare_owned_automation_update(
+        AUTO_ID,
+        OWNER,
+        {"llm_model": "owner-custom-only"},
+        current=dict(stored_sys_row),
+        model_pref=owner_pref,
+    )
+    assert prep_custom is not None
+    assert prep_custom.update_kwargs["llm_model"] == "owner-custom-only"
+    assert "llm_model_system_only" not in prep_custom.update_kwargs["metadata"]
+
+    # (c) Client metadata cannot write llm_model_system_only on PATCH or create
+    normal_row = {**stored_sys_row, "metadata": {"dalton_managed": True}}
+    prep_forge = await lifecycle_mod.prepare_owned_automation_update(
+        AUTO_ID,
+        OWNER,
+        {"metadata": {"dalton_managed": True, "llm_model_system_only": True}},
+        current=normal_row,
+        model_pref=owner_pref,
+    )
+    assert prep_forge is not None
+    assert "llm_model_system_only" not in prep_forge.update_kwargs["metadata"]
+
+    # Client metadata on a system-only row without changing llm_model preserves the server flag
+    prep_keep = await lifecycle_mod.prepare_owned_automation_update(
+        AUTO_ID,
+        OWNER,
+        {"metadata": {"dalton_managed": True, "note": "keep", "llm_model_system_only": False}},
+        current=dict(stored_sys_row),
+        model_pref=owner_pref,
+    )
+    assert prep_keep is not None
+    assert prep_keep.update_kwargs["metadata"]["llm_model_system_only"] is True
+    assert prep_keep.update_kwargs["metadata"]["note"] == "keep"
+
+    # Generic create_automation also strips client-forged llm_model_system_only
+    created_meta_capture: list[Any] = []
+    monkeypatch.setattr(
+        lifecycle_mod,
+        "_placement",
+        create_autospec(lifecycle_mod._placement, return_value=WS),
+    )
+    monkeypatch.setattr(
+        lifecycle_mod,
+        "require_target_ownership",
+        create_autospec(lifecycle_mod.require_target_ownership, return_value=None),
+    )
+    monkeypatch.setattr("src.dalton.settings.is_coverage_units_enabled", lambda: False)
+    monkeypatch.setattr(
+        "src.dalton.database.company_automations.resolve_automation_scope_for_write",
+        create_autospec(
+            __import__(
+                "src.dalton.database.company_automations",
+                fromlist=["resolve_automation_scope_for_write"],
+            ).resolve_automation_scope_for_write,
+            return_value="personal",
+        ),
+    )
+
+    async def _fake_create_auto(**kw):
+        created_meta_capture.append(kw.get("metadata"))
+        return {"automation_id": AUTO_ID, **kw}
+
+    monkeypatch.setattr(
+        auto_db,
+        "create_automation",
+        create_autospec(auto_db.create_automation, side_effect=_fake_create_auto),
+    )
+    await lifecycle_mod.create_automation(
+        OWNER,
+        AutomationCreate(
+            name="Personal job",
+            trigger_type="cron",
+            cron_expression="0 9 * * 1-5",
+            instruction="Run",
+            workspace_id=WS,
+            metadata={"llm_model_system_only": True, "tag": "x"},
+        ),
+        model_pref=owner_pref,
+    )
+    assert created_meta_capture == [{"tag": "x"}]
+
+    # (d) Updating ONLY reasoning_effort="high" on a system-only row whose owner shadow has NO efforts
+    #     succeeds because classification uses system catalog (ignore_custom_models=True)
+    prep_effort = await lifecycle_mod.prepare_owned_automation_update(
+        AUTO_ID,
+        OWNER,
+        {"reasoning_effort": "high"},
+        current=dict(stored_sys_row),
+        model_pref=owner_pref,
+    )
+    assert prep_effort is not None
+    assert prep_effort.update_kwargs["reasoning_effort"] == "high"
+    eff_effort = dict(prep_effort.update_kwargs)
+    await lifecycle_mod.recheck_locked_automation_update(
+        user_id=OWNER,
+        update=prep_effort.update,
+        current=stored_sys_row,
+        stored_in=WS,
+        stored_pin=None,
+        new_cron=None,
+        new_tz=None,
+        pref_for_lock=owner_pref,
+        locked_row=dict(stored_sys_row),
+        effective_kwargs=eff_effort,
+        locked_conn=None,
+    )
+    assert eff_effort["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_in_tx_coverage_unit_rechecks_web_access_for_pm_and_non_owner_lead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Decision 3: coverage-unit in-tx auth rechecks web read for PM and web write for non-owner
+    lead analyst, refusing if workspace owner flipped web_access to hidden before the lock."""
+    from src.dalton import access_tiers, sharing as sharing_mod
+    from src.dalton.database import coverage_units as units_db
+
+    ws_owner = "ws-owner-user"
+    lead_analyst = "lead-analyst-user"
+    conn = create_autospec(AsyncConnection, instance=True)
+
+    @asynccontextmanager
+    async def _dummy_cursor(*_a, **_kw):
+        yield create_autospec(AsyncCursor, instance=True)
+
+    conn.cursor.side_effect = _dummy_cursor
+
+    unit_row = {
+        "unit_id": "unit-1",
+        "kind": "company",
+        "ticker": "NVDA",
+        "workspace_id": WS,
+        "owner_user_id": ws_owner,
+        "lead_analyst_user_id": lead_analyst,
+    }
+    monkeypatch.setattr(
+        units_db,
+        "get_active_unit_by_workspace",
+        create_autospec(units_db.get_active_unit_by_workspace, return_value=unit_row),
+    )
+    monkeypatch.setattr(
+        access_tiers,
+        "classify_owner_tier",
+        create_autospec(access_tiers.classify_owner_tier, return_value="internal"),
+    )
+
+    access_calls: list[tuple[str, str, str]] = []
+
+    async def _deny_hidden(ws_arg, actor_id, channel="web", need="read", *, workspace=None, conn=None):
+        access_calls.append((actor_id, channel, need))
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    monkeypatch.setattr(
+        sharing_mod,
+        "require_workspace_access",
+        create_autospec(sharing_mod.require_workspace_access, side_effect=_deny_hidden),
+    )
+
+    orig_check_admin = schedule_mod._check_active_admin_in_tx
+    # (a) PM editing unit automation when owner switched web_access to hidden -> refused with web/read check
+    monkeypatch.setattr(
+        schedule_mod,
+        "_check_active_admin_in_tx",
+        create_autospec(orig_check_admin, return_value=True),
+    )
+    with pytest.raises(lifecycle_mod.AutomationRefusal) as exc_pm:
+        await schedule_mod._recheck_operator_authorization_in_tx(
+            conn,
+            effective_actor_id=PM,
+            task_owner=lead_analyst,
+            role="chief_of_staff",
+            saved_name="dalton-nvda-watch",
+            saved_metadata={"dalton_managed": True, "ticker": "NVDA"},
+            locked_ws_id=WS,
+            locked_ws_row={"workspace_id": WS, "user_id": ws_owner, "status": "running", "config": {}},
+            locked_row=None,
+            is_home=False,
+            units_on=True,
+            auth_on=True,
+        )
+    assert str(exc_pm.value) == "情况已变化，请重新发起"
+    assert access_calls[-1] == (PM, "web", "read")
+
+    # (b) Non-owner lead analyst (non-PM) -> rechecks web/write and refuses when revoked/hidden
+    monkeypatch.setattr(
+        schedule_mod,
+        "_check_active_admin_in_tx",
+        create_autospec(orig_check_admin, return_value=False),
+    )
+    with pytest.raises(lifecycle_mod.AutomationRefusal) as exc_lead:
+        await schedule_mod._recheck_operator_authorization_in_tx(
+            conn,
+            effective_actor_id=lead_analyst,
+            task_owner=lead_analyst,
+            role="analyst",
+            saved_name="dalton-nvda-watch",
+            saved_metadata={"dalton_managed": True, "ticker": "NVDA"},
+            locked_ws_id=WS,
+            locked_ws_row={"workspace_id": WS, "user_id": ws_owner, "status": "running", "config": {}},
+            locked_row=None,
+            is_home=False,
+            units_on=True,
+            auth_on=True,
+        )
+    assert str(exc_lead.value) == "情况已变化，请重新发起"
+    assert access_calls[-1] == (lead_analyst, "web", "write")
+
+
+@pytest.mark.asyncio
+async def test_global_job_name_on_regular_workspace_validates_against_regular_workspace_computer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Decision 5: naming a task dalton-earnings-calendar on a regular workspace UUID validates
+    against that workspace's computer, NOT Home's computer."""
+    from src.server.services import home_placement
+
+    _install_catalog_and_prefs(monkeypatch, owner_pref={})
+    monkeypatch.setattr("src.dalton.settings.is_coverage_units_enabled", lambda: False)
+    monkeypatch.setattr("src.dalton.settings.is_dalton_auth_enabled", lambda: False)
+    monkeypatch.setattr("src.dalton.settings.is_dalton_local_auth_enabled", lambda: False)
+    monkeypatch.setattr(
+        schedule_mod,
+        "verify_workspace_access",
+        create_autospec(
+            schedule_mod.verify_workspace_access,
+            return_value={"workspace_id": WS, "user_id": OWNER, "computer_id": COMP_2},
+        ),
+    )
+    monkeypatch.setattr(
+        computer_db,
+        "get_computer_for_workspace",
+        create_autospec(computer_db.get_computer_for_workspace, return_value={"computer_id": COMP_2}),
+    )
+    home_turn_spy = create_autospec(
+        home_placement.home_turn_computer,
+        return_value=({"computer_id": COMP_1, "kind": "ssh"}, False),
+    )
+    monkeypatch.setattr(home_placement, "home_turn_computer", home_turn_spy)
+
+    conn = create_autospec(AsyncConnection, instance=True)
+
+    @asynccontextmanager
+    async def _cursor(*_a: Any, **_kw: Any):
+        cur = create_autospec(AsyncCursor, instance=True)
+        last: dict[str, Any] = {"row": None}
+
+        async def _exec(sql: str, params: Any = None) -> None:
+            norm = " ".join(sql.split())
+            if "FROM computers" in norm:
+                last["row"] = {
+                    "computer_id": COMP_2,
+                    "user_id": OWNER,
+                    "kind": "docker",
+                    "status": "running",
+                    "name": "Cloud",
+                }
+            elif "FROM workspaces" in norm:
+                last["row"] = {
+                    "workspace_id": WS,
+                    "user_id": OWNER,
+                    "computer_id": COMP_2,
+                    "status": "running",
+                    "config": {},
+                }
+            elif "FROM workspace_moves" in norm:
+                last["row"] = {"move_fenced": False}
+            else:
+                last["row"] = None
+
+        cur.execute.side_effect = _exec
+        cur.fetchone.side_effect = lambda: last["row"]
+        yield cur
+
+    conn.cursor.side_effect = _cursor
+
+    @asynccontextmanager
+    async def _lock(uid: str, *, conn: Any = None, prelock_ws=None):
+        yield conn_ref
+
+    conn_ref = conn
+    monkeypatch.setattr(schedule_mod, "_user_automations_lock_for_write", _lock)
+    monkeypatch.setattr(
+        auto_db,
+        "list_all_automations",
+        create_autospec(auto_db.list_all_automations, return_value=[]),
+    )
+    monkeypatch.setattr(
+        auto_db,
+        "create_automation",
+        create_autospec(
+            auto_db.create_automation,
+            return_value={"automation_id": AUTO_ID, "workspace_id": WS, "name": "dalton-earnings-calendar"},
+        ),
+    )
+    monkeypatch.setattr(
+        "src.dalton.database.company_automations.resolve_automation_scope_for_write",
+        create_autospec(
+            __import__(
+                "src.dalton.database.company_automations",
+                fromlist=["resolve_automation_scope_for_write"],
+            ).resolve_automation_scope_for_write,
+            return_value="personal",
+        ),
+    )
+
+    seen_computers: list[Any] = []
+
+    async def _spy_cc(uid, model, ws, c=None, pref=None, *, resolved_computer=lifecycle_mod._UNSET_COMPUTER):
+        seen_computers.append((ws, resolved_computer))
+
+    monkeypatch.setattr(
+        lifecycle_mod,
+        "check_claude_code_hosted",
+        create_autospec(lifecycle_mod.check_claude_code_hosted, side_effect=_spy_cc),
+    )
+
+    res = await schedule_mod.schedule_dalton_automation_helper(
+        "dalton-earnings-calendar",
+        {
+            "trigger_type": "cron",
+            "cron_expression": "0 9 * * 6",
+            "instruction": "Calendar on regular workspace.",
+            "llm_model": "claude-sonnet-4-6",
+        },
+        user_id=OWNER,
+        workspace_id=WS,
+        role="chief_of_staff",
+    )
+    assert res["ok"] is True
+    home_turn_spy.assert_not_awaited()
+    assert len(seen_computers) == 1
+    assert seen_computers[0][0] == WS
+    assert seen_computers[0][1]["computer_id"] == COMP_2
+
+
+@pytest.mark.asyncio
+async def test_handoff_and_manual_compaction_only_apply_system_only_to_old_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Decision 6: model-switch handoff and manual compaction apply the previous run's
+    llm_model_system_only flag ONLY to the old model, never to the newly switched model."""
+    from src.llms import provider_compaction as pc_mod
+    from src.server.handlers import thread_model_handoff as handoff_mod
+    from src.server.services.llm import thread_model as thread_model_mod
+
+    monkeypatch.setattr(
+        "src.server.services.account.own_access",
+        create_autospec(
+            __import__("src.server.services.account", fromlist=["own_access"]).own_access,
+            return_value=SimpleNamespace(api_keys=False),
+        ),
+    )
+    monkeypatch.setattr(
+        maint_mod.TurnIdentity,
+        "of",
+        create_autospec(
+            TurnIdentity.of,
+            return_value=TurnIdentity(sender=OWNER, owner=OWNER, recorded_as=OWNER),
+        ),
+    )
+    monkeypatch.setattr("src.server.app.setup.agent_config", SimpleNamespace())
+
+    route = TurnRoute(workspace_id=WS, owner_id=OWNER, role="analyst")
+    latest_run_id = "77777777-7777-4777-8777-777777777777"
+    monkeypatch.setattr(
+        runs_lifecycle_db,
+        "get_latest_attempt",
+        create_autospec(
+            runs_lifecycle_db.get_latest_attempt,
+            return_value={
+                "conversation_response_id": latest_run_id,
+                "metadata": {
+                    "llm_model": "claude-sonnet-4-6",
+                    "llm_model_system_only": True,
+                },
+            },
+        ),
+    )
+
+    resolve_log: list[tuple[str | None, bool]] = []
+
+    async def _fake_resolve_llm(_base, _uid, model_name, _byok, **kw):
+        ign = bool(kw.get("ignore_custom_models", False))
+        resolve_log.append((model_name, ign))
+        # Distinguish system client vs custom client
+        client = SimpleNamespace(model=model_name, system_only=ign)
+        return SimpleNamespace(
+            llm=SimpleNamespace(name=model_name),
+            llm_client=client,
+            get_llm_client=lambda c=client: c,
+        )
+
+    monkeypatch.setattr(
+        llm_config_mod,
+        "resolve_llm_config",
+        create_autospec(llm_config_mod.resolve_llm_config, side_effect=_fake_resolve_llm),
+    )
+
+    orig_thread_route = maint_mod.thread_route
+    # (a) _hand_off_config: new model (owner's custom) uses ignore_custom_models=False, old uses True
+    monkeypatch.setattr(
+        maint_mod,
+        "_summary_to_hand_off",
+        create_autospec(maint_mod._summary_to_hand_off, return_value=SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        maint_mod,
+        "thread_route",
+        create_autospec(
+            orig_thread_route,
+            return_value=({"llm_model": "owner-custom-only"}, route),
+        ),
+    )
+    monkeypatch.setattr(
+        pc_mod,
+        "replays",
+        create_autospec(
+            pc_mod.replays,
+            side_effect=lambda _summary, client: client.model == "claude-sonnet-4-6" and client.system_only,
+        ),
+    )
+
+    res_ho = await maint_mod._hand_off_config(THREAD_ID, OWNER, "claude-sonnet-4-6")
+    assert res_ho is not None
+    assert resolve_log[-2:] == [
+        ("owner-custom-only", False),  # new model -> owner's own choice
+        ("claude-sonnet-4-6", True),  # old model -> previous run's system-only flag
+    ]
+
+    # (b) inspect_hand_off: same split between new model and old model
+    resolve_log.clear()
+    status, payload = await handoff_mod.inspect_hand_off(THREAD_ID, OWNER, "claude-sonnet-4-6")
+    assert status == "ready" and payload is not None
+    assert resolve_log == [
+        ("owner-custom-only", False),
+        ("claude-sonnet-4-6", True),
+    ]
+
+    # (c) Manual compaction after owner switched to custom model -> ignore_custom_models=False
+    resolve_log.clear()
+    monkeypatch.setattr(
+        thread_model_mod,
+        "turn_model",
+        create_autospec(
+            thread_model_mod.turn_model,
+            side_effect=lambda _u, _t, *, named, held, clear_dead=True: named or held,
+        ),
+    )
+    await maint_mod._compaction_config(THREAD_ID, OWNER)
+    assert resolve_log == [("owner-custom-only", False)]
+
+    # (d) Manual compaction after owner switched to SAME name (shadowed custom) with switch stamp -> False
+    resolve_log.clear()
+    monkeypatch.setattr(
+        maint_mod,
+        "thread_route",
+        create_autospec(
+            orig_thread_route,
+            return_value=(
+                {
+                    "llm_model": "claude-sonnet-4-6",
+                    "metadata": {"owner_model_switch_run_id": latest_run_id},
+                },
+                route,
+            ),
+        ),
+    )
+    await maint_mod._compaction_config(THREAD_ID, OWNER)
+    assert resolve_log == [("claude-sonnet-4-6", False)]
+
+    # (e) Manual compaction WITHOUT switch (still on previous run's model) -> True
+    resolve_log.clear()
+    monkeypatch.setattr(
+        maint_mod,
+        "thread_route",
+        create_autospec(
+            orig_thread_route,
+            return_value=({"llm_model": "claude-sonnet-4-6", "metadata": {}}, route),
+        ),
+    )
+    await maint_mod._compaction_config(THREAD_ID, OWNER)
+    assert resolve_log == [("claude-sonnet-4-6", True)]
+
+
+def test_user_profile_prompt_llm_model_guidance_and_autonomy_gate() -> None:
+    """Decision 7: user_profile.md.j2 documents llm_model for all managed automations (omit=keep,
+    empty/default/clear=clear & inherit owner default, cross-user=system catalog only) and hides
+    dalton_schedule_automation when autonomy_enabled=False."""
+    from ptc_agent.agent.prompts.loader import PromptLoader
+
+    loader = PromptLoader()
+    rendered_on = loader.render(
+        "components/user_profile.md.j2",
+        user_profile={"name": "Analyst", "timezone": "Asia/Shanghai", "locale": "zh-CN"},
+        preferences=SimpleNamespace(empty=True),
+        investment_lines=[],
+        user_data_counts=None,
+        main_agent_steering=True,
+        channels_enabled=False,
+        wakeups_enabled=False,
+        role="chief_of_staff",
+        autonomy_enabled=True,
+    )
+    assert "财报任务的新建、改期和剩余窗口补建用 `dalton_schedule_automation`" in rendered_on
+    assert "管理受管自动化任务时，可用 `llm_model`" in rendered_on
+    assert "省略会保留当前设置" in rendered_on
+    assert '传入 `""`、`"default"` 或 `"clear"` 会清除覆盖并继承任务所有者的默认模型' in rendered_on
+    assert "跨人修改时，仅填写系统目录模型" in rendered_on
+
+    rendered_off = loader.render(
+        "components/user_profile.md.j2",
+        user_profile={"name": "Analyst", "timezone": "Asia/Shanghai", "locale": "zh-CN"},
+        preferences=SimpleNamespace(empty=True),
+        investment_lines=[],
+        user_data_counts=None,
+        main_agent_steering=True,
+        channels_enabled=False,
+        wakeups_enabled=False,
+        role="chief_of_staff",
+        autonomy_enabled=False,
+    )
+    assert "dalton_schedule_automation" not in rendered_off
+    assert "llm_model" not in rendered_off
