@@ -10,8 +10,8 @@ export function DaltonTeamModelsPanel() {
     <div className="space-y-8">
       <SettingsGroup
         id="team-model-access"
-        title={t('settings.modelAccess.teamTitle')}
-        description={t('settings.modelAccess.teamDesc')}
+        title={t('settings:modelAccess.teamTitle')}
+        description={t('settings:modelAccess.teamDesc')}
       >
         <SettingsCardBody>
           <ModelAccessSection scope="team" />

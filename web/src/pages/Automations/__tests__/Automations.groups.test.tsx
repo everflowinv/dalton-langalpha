@@ -205,7 +205,7 @@ describe('three manage groups', () => {
     expect(screen.getAllByText('personal 0').length).toBeGreaterThan(0);
 
     const companyNext = () =>
-      screen.getByRole('button', { name: `${label('automation.nextPage')} ${label('automation.groupCompany')}` });
+      screen.getByRole('button', { name: `${label('automation:nextPage')} ${label('automation:groupCompany')}` });
     fireEvent.click(companyNext());
     expect((await screen.findAllByText('company 50')).length).toBeGreaterThan(0);
     fireEvent.click(companyNext());
@@ -217,7 +217,7 @@ describe('three manage groups', () => {
     expect(api.listAutomationReads).toHaveBeenCalledWith({ scope: 'personal', limit: 50, offset: 0 });
 
     const personalNext = () =>
-      screen.getByRole('button', { name: `${label('automation.nextPage')} ${label('automation.groupMine')}` });
+      screen.getByRole('button', { name: `${label('automation:nextPage')} ${label('automation:groupMine')}` });
     fireEvent.click(personalNext());
     expect((await screen.findAllByText('personal 50')).length).toBeGreaterThan(0);
     fireEvent.click(personalNext());
@@ -242,10 +242,10 @@ describe('three manage groups', () => {
     });
     renderAt('/automations?view=manage');
 
-    const personal = await screen.findByRole('region', { name: label('automation.groupMine') });
-    const research = screen.getByRole('region', { name: label('automation.groupResearch') });
-    await waitFor(() => expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument());
-    expect(screen.queryByText(label('automation.companyUnavailable'))).not.toBeInTheDocument();
+    const personal = await screen.findByRole('region', { name: label('automation:groupMine') });
+    const research = screen.getByRole('region', { name: label('automation:groupResearch') });
+    await waitFor(() => expect(screen.queryByRole('region', { name: label('automation:groupCompany') })).not.toBeInTheDocument());
+    expect(screen.queryByText(label('automation:companyUnavailable'))).not.toBeInTheDocument();
     expect(within(personal).getByRole('button', { name: /My morning note/ })).toBeInTheDocument();
     expect(within(research).getByRole('button', { name: /Filing watch/ })).toBeInTheDocument();
     expect(screen.queryByText(secret)).not.toBeInTheDocument();
@@ -259,13 +259,13 @@ describe('three manage groups', () => {
     });
     renderAt('/automations?view=manage');
 
-    const company = await screen.findByRole('region', { name: label('automation.groupCompany') });
-    expect(within(company).getByText(label('automation.scopeLoadFailed'))).toBeInTheDocument();
+    const company = await screen.findByRole('region', { name: label('automation:groupCompany') });
+    expect(within(company).getByText(label('automation:scopeLoadFailed'))).toBeInTheDocument();
     expect(
-      within(screen.getByRole('region', { name: label('automation.groupMine') })).getByText(label('automation.scopeEmpty')),
+      within(screen.getByRole('region', { name: label('automation:groupMine') })).getByText(label('automation:scopeEmpty')),
     ).toBeInTheDocument();
     expect(
-      within(screen.getByRole('region', { name: label('automation.groupResearch') })).getByText(label('automation.scopeEmpty')),
+      within(screen.getByRole('region', { name: label('automation:groupResearch') })).getByText(label('automation:scopeEmpty')),
     ).toBeInTheDocument();
   });
 
@@ -319,14 +319,14 @@ describe('company script and agent details', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: /Close prices/ }));
     const scriptPane = inspector('Close prices');
-    await waitFor(() => expect(scriptPane.getByRole('button', { name: label('automation.pause') })).toBeEnabled());
-    expect(scriptPane.getByRole('button', { name: label('automation.edit') })).toBeEnabled();
-    expect(scriptPane.queryByRole('button', { name: label('automation.runNow') })).not.toBeInTheDocument();
-    expect(scriptPane.getByRole('button', { name: label('automation.moveToRecycle') })).toBeInTheDocument();
+    await waitFor(() => expect(scriptPane.getByRole('button', { name: label('automation:pause') })).toBeEnabled());
+    expect(scriptPane.getByRole('button', { name: label('automation:edit') })).toBeEnabled();
+    expect(scriptPane.queryByRole('button', { name: label('automation:runNow') })).not.toBeInTheDocument();
+    expect(scriptPane.getByRole('button', { name: label('automation:moveToRecycle') })).toBeInTheDocument();
     expect(scriptPane.queryByRole('button', { name: label('common.delete') })).not.toBeInTheDocument();
-    expect(scriptPane.queryByRole('button', { name: label('automation.openThread') })).not.toBeInTheDocument();
+    expect(scriptPane.queryByRole('button', { name: label('automation:openThread') })).not.toBeInTheDocument();
     const scriptRun = await scriptPane.findByRole('listitem');
-    expect(scriptRun.textContent).toContain(label('automation.runSucceeded'));
+    expect(scriptRun.textContent).toContain(label('automation:runSucceeded'));
     expect(scriptRun.textContent).toContain('·');
 
     fireEvent.click(screen.getByRole('button', { name: /Desk brief/ }));
@@ -335,10 +335,10 @@ describe('company script and agent details', () => {
     await waitFor(() => {
       expect(screen.queryByRole('heading', { level: 2, name: 'Close prices' })).not.toBeInTheDocument();
     });
-    await waitFor(() => expect(agentPane.getByRole('button', { name: label('automation.pause') })).toBeEnabled());
-    expect(agentPane.getByRole('button', { name: label('automation.edit') })).toBeEnabled();
-    expect(agentPane.queryByRole('button', { name: label('automation.runNow') })).not.toBeInTheDocument();
-    expect(agentPane.getByRole('button', { name: label('automation.moveToRecycle') })).toBeInTheDocument();
+    await waitFor(() => expect(agentPane.getByRole('button', { name: label('automation:pause') })).toBeEnabled());
+    expect(agentPane.getByRole('button', { name: label('automation:edit') })).toBeEnabled();
+    expect(agentPane.queryByRole('button', { name: label('automation:runNow') })).not.toBeInTheDocument();
+    expect(agentPane.getByRole('button', { name: label('automation:moveToRecycle') })).toBeInTheDocument();
     expect(agentPane.queryByRole('button', { name: label('common.delete') })).not.toBeInTheDocument();
   });
 
@@ -353,9 +353,9 @@ describe('company script and agent details', () => {
     const heading = await screen.findByRole('heading', { level: 2, name: 'Close prices' });
     expect(api.getAutomationRead).toHaveBeenCalledWith('data:prices');
     const linkedRun = await within(heading.closest('article')!).findByRole('listitem');
-    expect(linkedRun.textContent).toContain(label('automation.runSucceeded'));
+    expect(linkedRun.textContent).toContain(label('automation:runSucceeded'));
     expect(linkedRun.textContent).toContain('·');
-    expect(screen.queryByText(label('automation.notFound'))).not.toBeInTheDocument();
+    expect(screen.queryByText(label('automation:notFound'))).not.toBeInTheDocument();
   });
 
   it('sends the detail version for a company agent and leaves delivery off the request', async () => {
@@ -371,11 +371,11 @@ describe('company script and agent details', () => {
     });
     renderAt('/automations?view=manage');
 
-    const edit = () => inspector('Desk').getByRole('button', { name: label('automation.edit') });
+    const edit = () => inspector('Desk').getByRole('button', { name: label('automation:edit') });
     await waitFor(() => expect(edit()).toBeEnabled());
     fireEvent.click(edit());
     fireEvent.change(await screen.findByLabelText(label('common.name')), { target: { value: 'Desk hours' } });
-    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+    fireEvent.click(screen.getByRole('button', { name: label('automation:saveChanges') }));
 
     await waitFor(() => expect(api.updateAutomation).toHaveBeenCalled());
     const [id, payload] = vi.mocked(api.updateAutomation).mock.calls[0];
@@ -405,7 +405,7 @@ describe('company script and agent details', () => {
     });
     renderAt('/automations?view=manage');
 
-    const pause = () => inspector('Desk').getByRole('button', { name: label('automation.pause') });
+    const pause = () => inspector('Desk').getByRole('button', { name: label('automation:pause') });
     await waitFor(() => expect(pause()).toBeEnabled());
     fireEvent.click(pause());
     await waitFor(() => expect(api.pauseAutomation).toHaveBeenCalledWith('co-1', 7));
@@ -431,22 +431,22 @@ describe('a company script save', () => {
     });
     renderAt('/automations?view=manage');
 
-    const edit = () => inspector('Close prices').getByRole('button', { name: label('automation.edit') });
+    const edit = () => inspector('Close prices').getByRole('button', { name: label('automation:edit') });
     await waitFor(() => expect(edit()).toBeEnabled());
     fireEvent.click(edit());
-    fireEvent.click(await screen.findByRole('button', { name: label('automation.daySat') }));
-    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+    fireEvent.click(await screen.findByRole('button', { name: label('automation:daySat') }));
+    fireEvent.click(screen.getByRole('button', { name: label('automation:saveChanges') }));
 
-    expect(await screen.findByText(label('automation.currentVersion', { version: 4 }))).toBeInTheDocument();
-    expect(screen.getByText(label('automation.serverSchedule', { cron: '15 8 * * 1-5', zone: 'UTC' }))).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: label('automation.daySat') })).toHaveAttribute('aria-pressed', 'true');
+    expect(await screen.findByText(label('automation:currentVersion', { version: 4 }))).toBeInTheDocument();
+    expect(screen.getByText(label('automation:serverSchedule', { cron: '15 8 * * 1-5', zone: 'UTC' }))).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: label('automation:daySat') })).toHaveAttribute('aria-pressed', 'true');
     expect(api.updateCompanyScript).toHaveBeenCalledTimes(1);
     expect(vi.mocked(api.updateCompanyScript).mock.calls[0]).toEqual([
       id,
       { expected_config_version: 3, cron_expression: '0 9 * * 1,2,3,4,5,6' },
     ]);
 
-    const retry = await screen.findByRole('button', { name: label('automation.retryWithCurrent') });
+    const retry = await screen.findByRole('button', { name: label('automation:retryWithCurrent') });
     await waitFor(() => expect(retry).toBeEnabled());
     fireEvent.click(retry);
     await waitFor(() => expect(api.updateCompanyScript).toHaveBeenCalledTimes(2));
@@ -473,16 +473,16 @@ describe('a company script save', () => {
     });
     renderAt('/automations?view=manage');
 
-    const edit = () => inspector('Close prices').getByRole('button', { name: label('automation.edit') });
+    const edit = () => inspector('Close prices').getByRole('button', { name: label('automation:edit') });
     await waitFor(() => expect(edit()).toBeEnabled());
     fireEvent.click(edit());
-    fireEvent.click(await screen.findByRole('button', { name: label('automation.daySat') }));
-    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+    fireEvent.click(await screen.findByRole('button', { name: label('automation:daySat') }));
+    fireEvent.click(screen.getByRole('button', { name: label('automation:saveChanges') }));
 
-    expect(await screen.findByText(label('automation.detailForbidden'))).toBeInTheDocument();
-    await waitFor(() => expect(screen.queryByRole('button', { name: label('automation.daySat') })).not.toBeInTheDocument());
-    expect(screen.queryByRole('button', { name: label('automation.pause') })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: label('automation.edit') })).not.toBeInTheDocument();
+    expect(await screen.findByText(label('automation:detailForbidden'))).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('button', { name: label('automation:daySat') })).not.toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: label('automation:pause') })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: label('automation:edit') })).not.toBeInTheDocument();
     expect(screen.getByText('Close prices')).toBeInTheDocument();
   });
 
@@ -508,24 +508,24 @@ describe('a company script save', () => {
     });
     renderAt(`/automations?view=manage&id=${encodeURIComponent(id)}`);
 
-    const edit = () => inspector('Close prices').getByRole('button', { name: label('automation.edit') });
+    const edit = () => inspector('Close prices').getByRole('button', { name: label('automation:edit') });
     await waitFor(() => expect(edit()).toBeEnabled());
     fireEvent.click(edit());
-    const sat = await screen.findByRole('button', { name: label('automation.daySat') });
+    const sat = await screen.findByRole('button', { name: label('automation:daySat') });
     fireEvent.click(sat);
     expect(sat).toHaveAttribute('aria-pressed', 'true');
 
     companyRefused = true;
-    fireEvent.click(screen.getByRole('button', { name: `${label('automation.nextPage')} ${label('automation.groupCompany')}` }));
+    fireEvent.click(screen.getByRole('button', { name: `${label('automation:nextPage')} ${label('automation:groupCompany')}` }));
 
-    expect(await screen.findByText(label('automation.detailForbidden'))).toBeInTheDocument();
-    await waitFor(() => expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument());
-    expect(screen.queryByText(label('automation.companyUnavailable'))).not.toBeInTheDocument();
-    await waitFor(() => expect(screen.queryByRole('button', { name: label('automation.daySat') })).not.toBeInTheDocument());
+    expect(await screen.findByText(label('automation:detailForbidden'))).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('region', { name: label('automation:groupCompany') })).not.toBeInTheDocument());
+    expect(screen.queryByText(label('automation:companyUnavailable'))).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('button', { name: label('automation:daySat') })).not.toBeInTheDocument());
     expect(screen.queryByText('Close prices')).not.toBeInTheDocument();
     expect(screen.queryByText('Quarterly ledger alpha')).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: label('automation.pause') })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: label('automation.edit') })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: label('automation:pause') })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: label('automation:edit') })).not.toBeInTheDocument();
     expect(screen.getByText('My morning note')).toBeInTheDocument();
     expect(screen.getByText('Filing watch')).toBeInTheDocument();
     expect(api.getAutomationRead).toHaveBeenCalledWith(id);
@@ -550,18 +550,18 @@ describe('a company script save', () => {
     });
     renderAt('/automations?view=manage');
 
-    const edit = () => inspector('Close prices').getByRole('button', { name: label('automation.edit') });
+    const edit = () => inspector('Close prices').getByRole('button', { name: label('automation:edit') });
     await waitFor(() => expect(edit()).toBeEnabled());
     fireEvent.click(edit());
-    fireEvent.click(await screen.findByRole('button', { name: label('automation.daySat') }));
-    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+    fireEvent.click(await screen.findByRole('button', { name: label('automation:daySat') }));
+    fireEvent.click(screen.getByRole('button', { name: label('automation:saveChanges') }));
 
     await waitFor(() => expect(api.updateCompanyScript).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(screen.queryByRole('button', { name: label('automation.daySat') })).not.toBeInTheDocument());
-    await waitFor(() => expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument());
-    expect(screen.queryByText(label('automation.companyUnavailable'))).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('button', { name: label('automation:daySat') })).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByRole('region', { name: label('automation:groupCompany') })).not.toBeInTheDocument());
+    expect(screen.queryByText(label('automation:companyUnavailable'))).not.toBeInTheDocument();
     expect(screen.queryByText('Close prices')).not.toBeInTheDocument();
-    expect(within(screen.getByRole('region', { name: label('automation.groupMine') })).getByText(label('automation.scopeEmpty'))).toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: label('automation:groupMine') })).getByText(label('automation:scopeEmpty'))).toBeInTheDocument();
   });
 
   it('clears a company script after a forbidden pause', async () => {
@@ -583,16 +583,16 @@ describe('a company script save', () => {
     });
     renderAt('/automations?view=manage');
 
-    const pause = () => inspector('Close prices').getByRole('button', { name: label('automation.pause') });
+    const pause = () => inspector('Close prices').getByRole('button', { name: label('automation:pause') });
     await waitFor(() => expect(pause()).toBeEnabled());
     fireEvent.click(pause());
 
     await waitFor(() => expect(api.pauseAutomation).toHaveBeenCalledWith(taskId, 3));
     await waitFor(() => expect(screen.queryByRole('heading', { level: 2, name: 'Close prices' })).not.toBeInTheDocument());
-    await waitFor(() => expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument());
-    expect(screen.queryByText(label('automation.companyUnavailable'))).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: label('automation.pause') })).not.toBeInTheDocument();
-    expect(within(screen.getByRole('region', { name: label('automation.groupMine') })).getByText(label('automation.scopeEmpty'))).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('region', { name: label('automation:groupCompany') })).not.toBeInTheDocument());
+    expect(screen.queryByText(label('automation:companyUnavailable'))).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: label('automation:pause') })).not.toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: label('automation:groupMine') })).getByText(label('automation:scopeEmpty'))).toBeInTheDocument();
   });
 });
 
@@ -617,7 +617,7 @@ describe('cached reads and independent pages', () => {
       }),
     );
     renderAt('/automations?view=manage&id=data%3Aprices');
-    await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
+    await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation:edit') })).toBeEnabled());
     await act(async () => {
       rejectRuns(httpError(403, 'restricted'));
     });
@@ -625,11 +625,11 @@ describe('cached reads and independent pages', () => {
       expect(screen.queryByRole('heading', { level: 2, name: 'Close prices' })).not.toBeInTheDocument();
       expect(screen.queryByRole('button', { name: /Close prices/ })).not.toBeInTheDocument();
     });
-    expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument();
-    expect(screen.queryByText(label('automation.companyUnavailable'))).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: label('automation:groupCompany') })).not.toBeInTheDocument();
+    expect(screen.queryByText(label('automation:companyUnavailable'))).not.toBeInTheDocument();
     expect(screen.queryByText('restricted')).not.toBeInTheDocument();
-    expect(within(screen.getByRole('region', { name: label('automation.groupMine') })).getByText(label('automation.scopeEmpty'))).toBeInTheDocument();
-    expect(within(screen.getByRole('region', { name: label('automation.groupResearch') })).getByText(label('automation.scopeEmpty'))).toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: label('automation:groupMine') })).getByText(label('automation:scopeEmpty'))).toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: label('automation:groupResearch') })).getByText(label('automation:scopeEmpty'))).toBeInTheDocument();
   });
 
   it('keeps a company script when its run list fails', async () => {
@@ -641,7 +641,7 @@ describe('cached reads and independent pages', () => {
     vi.mocked(api.getAutomationRead).mockResolvedValue({ data: task } as never);
     vi.mocked(api.listAutomationExecutionReads).mockRejectedValue(httpError(503, 'unavailable'));
     renderAt('/automations?view=manage&id=data%3Aprices');
-    await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
+    await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation:edit') })).toBeEnabled());
     expect(screen.getByRole('heading', { level: 2, name: 'Close prices' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Close prices/ })).toBeInTheDocument();
   });
@@ -659,7 +659,7 @@ describe('cached reads and independent pages', () => {
       return { data: { executions: [], has_more: false } } as never;
     });
     const { queryClient } = renderAt('/automations?view=manage&id=co-agent');
-    await waitFor(() => expect(inspector('Desk brief').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
+    await waitFor(() => expect(inspector('Desk brief').getByRole('button', { name: label('automation:edit') })).toBeEnabled());
     await act(async () => {
       revoked = true;
       await queryClient.invalidateQueries({ queryKey: queryKeys.automations.executions(task.automation_id) });
@@ -668,9 +668,9 @@ describe('cached reads and independent pages', () => {
       expect(screen.queryByRole('heading', { level: 2, name: 'Desk brief' })).not.toBeInTheDocument();
       expect(screen.queryByRole('button', { name: /Desk brief/ })).not.toBeInTheDocument();
     });
-    expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument();
-    expect(screen.queryByText(label('automation.companyUnavailable'))).not.toBeInTheDocument();
-    expect(within(screen.getByRole('region', { name: label('automation.groupMine') })).getByText(label('automation.scopeEmpty'))).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: label('automation:groupCompany') })).not.toBeInTheDocument();
+    expect(screen.queryByText(label('automation:companyUnavailable'))).not.toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: label('automation:groupMine') })).getByText(label('automation:scopeEmpty'))).toBeInTheDocument();
   });
 
   it('keeps a company draft while a different group changes pages', async () => {
@@ -688,16 +688,16 @@ describe('cached reads and independent pages', () => {
     });
     vi.mocked(api.getAutomationRead).mockResolvedValue({ data: task } as never);
     renderAt('/automations?view=manage');
-    await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
-    fireEvent.click(inspector('Close prices').getByRole('button', { name: label('automation.edit') }));
-    fireEvent.click(await screen.findByRole('button', { name: label('automation.daySat') }));
-    fireEvent.click(screen.getByRole('button', { name: `${label('automation.nextPage')} ${label('automation.groupResearch')}` }));
+    await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation:edit') })).toBeEnabled());
+    fireEvent.click(inspector('Close prices').getByRole('button', { name: label('automation:edit') }));
+    fireEvent.click(await screen.findByRole('button', { name: label('automation:daySat') }));
+    fireEvent.click(screen.getByRole('button', { name: `${label('automation:nextPage')} ${label('automation:groupResearch')}` }));
     await waitFor(() => expect(finishPage).toBeDefined());
-    expect(screen.getByRole('button', { name: label('automation.daySat') })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: label('automation:daySat') })).toHaveAttribute('aria-pressed', 'true');
     await act(async () => {
       finishPage({ data: { automations: [agent({ automation_id: 'research-50', name: 'Research second', scope: 'research_tracking' })], total: 51 } } as never);
     });
-    expect(await screen.findByRole('button', { name: label('automation.daySat') })).toHaveAttribute('aria-pressed', 'true');
+    expect(await screen.findByRole('button', { name: label('automation:daySat') })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByRole('button', { name: /Research second/ })).toBeInTheDocument();
   });
 
@@ -715,22 +715,22 @@ describe('cached reads and independent pages', () => {
     });
     vi.mocked(api.getAutomationRead).mockImplementation(async (id) => ({ data: id === second.automation_id ? second : task }) as never);
     renderAt('/automations?view=manage');
-    const nextName = `${label('automation.nextPage')} ${label('automation.groupCompany')}`;
-    await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
-    fireEvent.click(inspector('Close prices').getByRole('button', { name: label('automation.edit') }));
-    fireEvent.click(await screen.findByRole('button', { name: label('automation.daySat') }));
+    const nextName = `${label('automation:nextPage')} ${label('automation:groupCompany')}`;
+    await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation:edit') })).toBeEnabled());
+    fireEvent.click(inspector('Close prices').getByRole('button', { name: label('automation:edit') }));
+    fireEvent.click(await screen.findByRole('button', { name: label('automation:daySat') }));
     fireEvent.click(screen.getByRole('button', { name: nextName }));
     const dialog = await screen.findByRole('dialog');
-    expect(screen.getByRole('button', { name: label('automation.daySat'), hidden: true })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: label('automation:daySat'), hidden: true })).toHaveAttribute('aria-pressed', 'true');
     expect(pageTwo).toBe(false);
     fireEvent.click(within(dialog).getByRole('button', { name: label('common.cancel') }));
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
-    expect(screen.getByRole('button', { name: label('automation.daySat') })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: label('automation:daySat') })).toHaveAttribute('aria-pressed', 'true');
     expect(pageTwo).toBe(false);
     fireEvent.click(screen.getByRole('button', { name: nextName }));
-    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: label('automation.discardDraft') }));
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: label('automation:discardDraft') }));
     expect(await screen.findByRole('button', { name: /Second company/ })).toBeInTheDocument();
-    await waitFor(() => expect(screen.queryByRole('button', { name: label('automation.daySat') })).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByRole('button', { name: label('automation:daySat') })).not.toBeInTheDocument());
   });
 
   it('returns to an existing page when the final page becomes empty', async () => {
@@ -743,14 +743,14 @@ describe('cached reads and independent pages', () => {
     });
     vi.mocked(api.getAutomationRead).mockImplementation(async (id) => ({ data: id === last.automation_id ? last : remaining }) as never);
     const { queryClient } = renderAt('/automations?view=manage');
-    fireEvent.click(await screen.findByRole('button', { name: `${label('automation.nextPage')} ${label('automation.groupMine')}` }));
+    fireEvent.click(await screen.findByRole('button', { name: `${label('automation:nextPage')} ${label('automation:groupMine')}` }));
     await screen.findByRole('button', { name: /Last personal/ });
     await act(async () => {
       reduced = true;
       await queryClient.invalidateQueries();
     });
     expect(await screen.findByRole('button', { name: /Remaining personal/ })).toBeInTheDocument();
-    expect(screen.queryByText(label('automation.startFrom'))).not.toBeInTheDocument();
+    expect(screen.queryByText(label('automation:startFrom'))).not.toBeInTheDocument();
   });
 
   it('keeps an off-page draft when a detail refetch fails', async () => {
@@ -761,16 +761,16 @@ describe('cached reads and independent pages', () => {
       return { data: task } as never;
     });
     const { queryClient } = renderAt('/automations?view=manage&id=data%3Aoffpage');
-    await waitFor(() => expect(inspector('Off page script').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
-    fireEvent.click(inspector('Off page script').getByRole('button', { name: label('automation.edit') }));
-    fireEvent.click(await screen.findByRole('button', { name: label('automation.daySat') }));
+    await waitFor(() => expect(inspector('Off page script').getByRole('button', { name: label('automation:edit') })).toBeEnabled());
+    fireEvent.click(inspector('Off page script').getByRole('button', { name: label('automation:edit') }));
+    fireEvent.click(await screen.findByRole('button', { name: label('automation:daySat') }));
     await act(async () => {
       failed = true;
       await queryClient.invalidateQueries();
     });
     await pastPaneExit();
-    expect(screen.getByRole('button', { name: label('automation.daySat') })).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.queryByText(label('automation.notFound'))).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: label('automation:daySat') })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.queryByText(label('automation:notFound'))).not.toBeInTheDocument();
   });
 
   it('keeps the draft when a conflict refetch fails and leaves retry off', async () => {
@@ -789,22 +789,22 @@ describe('cached reads and independent pages', () => {
       throw httpError(409, 'Someone else saved this task.');
     });
     renderAt('/automations?view=manage');
-    await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
-    fireEvent.click(inspector('Close prices').getByRole('button', { name: label('automation.edit') }));
-    fireEvent.click(await screen.findByRole('button', { name: label('automation.daySat') }));
-    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+    await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation:edit') })).toBeEnabled());
+    fireEvent.click(inspector('Close prices').getByRole('button', { name: label('automation:edit') }));
+    fireEvent.click(await screen.findByRole('button', { name: label('automation:daySat') }));
+    fireEvent.click(screen.getByRole('button', { name: label('automation:saveChanges') }));
     await waitFor(() => expect(vi.mocked(api.getAutomationRead).mock.calls.length).toBeGreaterThan(1));
     await pastPaneExit();
-    expect(screen.getByRole('button', { name: label('automation.daySat') })).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByRole('button', { name: label('automation.retryWithCurrent') })).toBeDisabled();
+    expect(screen.getByRole('button', { name: label('automation:daySat') })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: label('automation:retryWithCurrent') })).toBeDisabled();
     expect(api.updateCompanyScript).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText(label('automation.notFound'))).not.toBeInTheDocument();
+    expect(screen.queryByText(label('automation:notFound'))).not.toBeInTheDocument();
   });
 
   it('retries a script with the later detail version and the same draft', async () => {
     const taskId = 'data:prices';
     const nextCron = '0 9 * * 1,2,3,4,5,6';
-    const retryName = label('automation.retryWithCurrent');
+    const retryName = label('automation:retryWithCurrent');
     const listed = script({ automation_id: taskId, name: 'Close prices', config_version: 3, cron_expression: '0 9 * * 1-5' });
     const other = script({ automation_id: 'data:other', name: 'Other book', config_version: 11 });
     let detailMode: 'open' | 'fail' | 'other' | 'fresh' = 'open';
@@ -824,13 +824,13 @@ describe('cached reads and independent pages', () => {
       throw httpError(409, 'Someone else saved this task.');
     });
     const { queryClient } = renderAt('/automations?view=manage');
-    const sat = () => screen.getByRole('button', { name: label('automation.daySat') });
+    const sat = () => screen.getByRole('button', { name: label('automation:daySat') });
     const retry = () => screen.getByRole('button', { name: retryName });
 
-    await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
-    fireEvent.click(inspector('Close prices').getByRole('button', { name: label('automation.edit') }));
-    fireEvent.click(await screen.findByRole('button', { name: label('automation.daySat') }));
-    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+    await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation:edit') })).toBeEnabled());
+    fireEvent.click(inspector('Close prices').getByRole('button', { name: label('automation:edit') }));
+    fireEvent.click(await screen.findByRole('button', { name: label('automation:daySat') }));
+    fireEvent.click(screen.getByRole('button', { name: label('automation:saveChanges') }));
 
     await waitFor(() => {
       expect(retry()).toBeDisabled();
@@ -851,8 +851,8 @@ describe('cached reads and independent pages', () => {
     expect(retry()).toBeDisabled();
     expect(sat()).toHaveAttribute('aria-pressed', 'true');
     expect(api.updateCompanyScript).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText(label('automation.currentVersion', { version: 11 }))).not.toBeInTheDocument();
-    expect(screen.queryByText(label('automation.notFound'))).not.toBeInTheDocument();
+    expect(screen.queryByText(label('automation:currentVersion', { version: 11 }))).not.toBeInTheDocument();
+    expect(screen.queryByText(label('automation:notFound'))).not.toBeInTheDocument();
 
     await act(async () => {
       detailMode = 'fresh';
@@ -861,7 +861,7 @@ describe('cached reads and independent pages', () => {
     await waitFor(() => expect(retry()).toBeEnabled());
     expect(api.updateCompanyScript).toHaveBeenCalledTimes(1);
     expect(sat()).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByText(label('automation.currentVersion', { version: 8 }))).toBeInTheDocument();
+    expect(screen.getByText(label('automation:currentVersion', { version: 8 }))).toBeInTheDocument();
 
     fireEvent.click(retry());
     await waitFor(() => expect(api.updateCompanyScript).toHaveBeenCalledTimes(2));
@@ -874,7 +874,7 @@ describe('cached reads and independent pages', () => {
   it('retries a company agent with the later detail version and the same draft', async () => {
     const taskId = 'co-1';
     const draft = 'Desk hours';
-    const retryName = label('automation.retryWithCurrent');
+    const retryName = label('automation:retryWithCurrent');
     const listed = agent({ automation_id: taskId, name: 'Desk', scope: 'company', config_version: 2 });
     const other = agent({ automation_id: 'co-2', name: 'Other desk', scope: 'company', config_version: 11 });
     let detailMode: 'open' | 'fail' | 'other' | 'fresh' = 'open';
@@ -897,10 +897,10 @@ describe('cached reads and independent pages', () => {
     const name = () => screen.getByLabelText(label('common.name'));
     const retry = () => screen.getByRole('button', { name: retryName });
 
-    await waitFor(() => expect(inspector('Desk').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
-    fireEvent.click(inspector('Desk').getByRole('button', { name: label('automation.edit') }));
+    await waitFor(() => expect(inspector('Desk').getByRole('button', { name: label('automation:edit') })).toBeEnabled());
+    fireEvent.click(inspector('Desk').getByRole('button', { name: label('automation:edit') }));
     fireEvent.change(await screen.findByLabelText(label('common.name')), { target: { value: draft } });
-    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+    fireEvent.click(screen.getByRole('button', { name: label('automation:saveChanges') }));
 
     await waitFor(() => {
       expect(retry()).toBeDisabled();
@@ -923,8 +923,8 @@ describe('cached reads and independent pages', () => {
     expect(retry()).toBeDisabled();
     expect(name()).toHaveValue(draft);
     expect(api.updateAutomation).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText(label('automation.currentVersion', { version: 11 }))).not.toBeInTheDocument();
-    expect(screen.queryByText(label('automation.notFound'))).not.toBeInTheDocument();
+    expect(screen.queryByText(label('automation:currentVersion', { version: 11 }))).not.toBeInTheDocument();
+    expect(screen.queryByText(label('automation:notFound'))).not.toBeInTheDocument();
 
     await act(async () => {
       detailMode = 'fresh';
@@ -933,7 +933,7 @@ describe('cached reads and independent pages', () => {
     await waitFor(() => expect(retry()).toBeEnabled());
     expect(api.updateAutomation).toHaveBeenCalledTimes(1);
     expect(name()).toHaveValue(draft);
-    expect(screen.getByText(label('automation.currentVersion', { version: 9 }))).toBeInTheDocument();
+    expect(screen.getByText(label('automation:currentVersion', { version: 9 }))).toBeInTheDocument();
 
     fireEvent.click(retry());
     await waitFor(() => expect(api.updateAutomation).toHaveBeenCalledTimes(2));
@@ -953,13 +953,13 @@ describe('cached reads and independent pages', () => {
       return { data: { automations: [agent({ automation_id: 'research-first', name: 'Research first', scope: 'research_tracking' })], total: 76 } } as never;
     });
     renderAt('/automations?view=manage');
-    const research = () => screen.getByRole('region', { name: label('automation.groupResearch') });
-    fireEvent.click(await screen.findByRole('button', { name: `${label('automation.nextPage')} ${label('automation.groupResearch')}` }));
-    await waitFor(() => expect(within(research()).getByText(label('automation.scopeLoadFailed'))).toBeInTheDocument());
-    expect(within(research()).getByRole('button', { name: `${label('automation.prevPage')} ${label('automation.groupResearch')}` })).toBeEnabled();
-    expect(within(research()).getByRole('button', { name: `${label('automation.nextPage')} ${label('automation.groupResearch')}` })).toBeDisabled();
+    const research = () => screen.getByRole('region', { name: label('automation:groupResearch') });
+    fireEvent.click(await screen.findByRole('button', { name: `${label('automation:nextPage')} ${label('automation:groupResearch')}` }));
+    await waitFor(() => expect(within(research()).getByText(label('automation:scopeLoadFailed'))).toBeInTheDocument());
+    expect(within(research()).getByRole('button', { name: `${label('automation:prevPage')} ${label('automation:groupResearch')}` })).toBeEnabled();
+    expect(within(research()).getByRole('button', { name: `${label('automation:nextPage')} ${label('automation:groupResearch')}` })).toBeDisabled();
     expect(within(research()).queryByText(/Page /)).not.toBeInTheDocument();
-    fireEvent.click(within(research()).getByRole('button', { name: `${label('automation.prevPage')} ${label('automation.groupResearch')}` }));
+    fireEvent.click(within(research()).getByRole('button', { name: `${label('automation:prevPage')} ${label('automation:groupResearch')}` }));
     expect(await within(research()).findByRole('button', { name: /Research first/ })).toBeInTheDocument();
   });
 });
@@ -1004,11 +1004,11 @@ describe('the feed and a personal task', () => {
 
   it('still starts a personal automation from a blank template', async () => {
     renderAt('/automations');
-    fireEvent.click(await screen.findByText(label('automation.blankAutomation')));
+    fireEvent.click(await screen.findByText(label('automation:blankAutomation')));
 
     expect(await screen.findByLabelText(label('common.name'))).toBeInTheDocument();
-    expect(screen.getByLabelText(label('automation.instruction'))).toBeInTheDocument();
-    expect(screen.queryByLabelText(label('automation.scriptCron'))).not.toBeInTheDocument();
+    expect(screen.getByLabelText(label('automation:instruction'))).toBeInTheDocument();
+    expect(screen.queryByLabelText(label('automation:scriptCron'))).not.toBeInTheDocument();
   });
 
   it('opens the selected task in the phone sheet', async () => {

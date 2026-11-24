@@ -9,7 +9,7 @@ is ``user_models``.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace  # DALTON-HOOK(antigravity-series)
 from typing import TYPE_CHECKING, Any
 
 from ptc_agent.agent.roles import AgentRole
@@ -791,6 +791,35 @@ async def resolve_llm_config(
         )
         selection = select_model(config, model_pref, slot, request_model)
         apply_policy_to_roles(config, model_pref, selection, slot, policy=policy)
+        # DALTON-HOOK(antigravity-series): map an explicit turn reasoning_effort
+        # (e.g. from delegate_to_analyst) on a built-in Antigravity model to the
+        # matching series variant and drop the raw effort parameter.
+        if slot == "primary" and reasoning_effort is not None:
+            from src.dalton.llm.antigravity_series import (
+                ANTIGRAVITY_PROVIDER,
+                resolve_antigravity_effort_model,
+            )
+            from src.llms.llm import LLM as LLMFactory
+
+            _ag_mc = LLMFactory.get_model_config()
+            _ag_entry = (
+                _ag_mc.get_model_config(selection.effective_model)
+                if custom_model(model_pref, selection.effective_model) is None
+                else None
+            )
+            if isinstance(_ag_entry, dict) and _ag_entry.get("provider") == ANTIGRAVITY_PROVIDER:
+                _ag_mapped = resolve_antigravity_effort_model(
+                    selection.effective_model, reasoning_effort, model_config=_ag_mc
+                )
+                if (
+                    _ag_mapped is not None
+                    and policy_refuses(policy, model_pref, _ag_mapped[0]) is None
+                ):
+                    selection = replace(selection, effective_model=_ag_mapped[0])
+                    if config.llm is not None:
+                        config.llm.name = _ag_mapped[0]
+                        config.llm_client = None
+                reasoning_effort = None
         if shared and is_claude_code_model(selection.effective_model):
             # Its session files would be laid out on a member's own computer.
             raise HTTPException(

@@ -221,7 +221,7 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
       navigate('/setup/ready');
     } catch (e: unknown) {
       const detail = apiErrorDetail(e);
-      setError(typeof detail === 'string' ? detail : (e instanceof Error && e.message) || t('setup.errorSavePrefs'));
+      setError(typeof detail === 'string' ? detail : (e instanceof Error && e.message) || t('setup:errorSavePrefs'));
     } finally {
       setSaving(false);
     }
@@ -253,7 +253,7 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
 
   return (
     <div>
-      <WizardStepHeader titleId={headingId} title={t('setup.chooseYourModels')} helper={copy.chooseDesc} />
+      <WizardStepHeader titleId={headingId} title={t('setup:chooseYourModels')} helper={copy.chooseDesc} />
       <div className="flex flex-col gap-4 sm:gap-6">
       {teamEmpty ? (
         /* DALTON-HOOK(dalton-setup): reuse DefaultStep's contact-admin & retry notice when team models are empty */
@@ -262,9 +262,9 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
           className="shell-box flex items-center justify-between gap-3 px-4 py-3"
         >
           <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
-            {t('setup.answers.default.teamModelsEmpty')}
+            {t('setup:answers.default.teamModelsEmpty')}
           </p>
-          <RowButton onClick={team.retry}>{t('setup.answers.tryAgain')}</RowButton>
+          <RowButton onClick={team.retry}>{t('setup:answers.tryAgain')}</RowButton>
         </div>
       ) : (
         <>
@@ -281,7 +281,7 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
           style={{ color: 'var(--color-text-secondary)' }}
         >
           {/* DALTON-HOOK(dalton-setup): show team-configured note only when Dalton team models are actually available */}
-          {isDaltonBuild && team.available ? t('setup.daltonModelAccessNote') : t('setup.modelAccessReminder')}
+          {isDaltonBuild && team.available ? t('setup:daltonModelAccessNote') : t('setup:modelAccessReminder')}
         </p>
       </div>
 
@@ -317,7 +317,7 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
           <ChevronRight
             className={cn('h-3 w-3 transition-transform', advancedOpen && 'rotate-90')}
           />
-          {t('settings.modelTuning.advanced')}
+          {t('settings:modelTuning.advanced')}
         </button>
 
         <AnimatePresence initial={false}>
@@ -334,8 +334,8 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
                 {/* DALTON-HOOK(dalton-setup): pass Dalton curated slot models and payers */}
                 {/* DALTON-HOOK(antigravity-series): hide effort pickers & format series names in Advanced routing dropdowns */}
                 <ModelSelector
-                  label={t('settings.modelTuning.fetchModel')}
-                  description={t('settings.modelTuning.fetchModelDesc')}
+                  label={t('settings:modelTuning.fetchModel')}
+                  description={t('settings:modelTuning.fetchModelDesc')}
                   value={advancedModels.fetchModel}
                   onChange={(v) => handleAdvancedChange({ fetchModel: v })}
                   models={curatedSlotModels}
@@ -350,8 +350,8 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
                   hideEffortPicker
                 />
                 <ModelSelector
-                  label={t('settings.modelTuning.compactionModel')}
-                  description={t('settings.modelTuning.compactionModelDesc')}
+                  label={t('settings:modelTuning.compactionModel')}
+                  description={t('settings:modelTuning.compactionModelDesc')}
                   value={advancedModels.compactionModel}
                   onChange={(v) => handleAdvancedChange({ compactionModel: v })}
                   models={curatedSlotModels}
@@ -389,7 +389,7 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
       {/* A read that failed: nothing is filled, and nothing can be saved over it. */}
       {prefsFailed && (
         <p role="alert" className="text-sm" style={{ color: 'var(--color-loss)' }}>
-          {t('settings.failedToLoadModels')}
+          {t('settings:failedToLoadModels')}
         </p>
       )}
 
@@ -402,9 +402,9 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
       </div>
 
       <SetupFooter
-        back={{ label: t('setup.back'), onClick: handleBack }}
+        back={{ label: t('setup:back'), onClick: handleBack }}
         primary={{
-          label: saving ? t('setup.saving') : t('setup.continue'),
+          label: saving ? t('setup:saving') : t('setup:continue'),
           onClick: handleNext,
           disabled: !canContinue,
           busy: saving,

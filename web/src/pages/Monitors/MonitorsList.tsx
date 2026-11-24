@@ -47,10 +47,10 @@ export function MonitorsList(): React.ReactElement {
           <div className="monitors-header">
             <div className="min-w-0">
               <h1 className="title-font text-lg font-semibold" style={{ color: 'var(--color-text-primary)' }}>
-                {t('monitors.title')}
+                {t('monitors:title')}
               </h1>
               <p className="mt-1 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-                {t('monitors.subtitle')}
+                {t('monitors:subtitle')}
               </p>
             </div>
             <Button
@@ -70,21 +70,21 @@ export function MonitorsList(): React.ReactElement {
             <ListSkeleton rows={4} />
           ) : isError ? (
             <ListError onRetry={() => void refetch()}>
-              {t('monitors.loadFailed')}
+              {t('monitors:loadFailed')}
             </ListError>
           ) : grouped.length === 0 ? (
             <ListEmpty>
               <p className="font-medium" style={{ color: 'var(--color-text-secondary)' }}>
-                {t('monitors.emptyTitle')}
+                {t('monitors:emptyTitle')}
               </p>
-              <p className="mt-1 text-xs">{t('monitors.emptyDesc')}</p>
+              <p className="mt-1 text-xs">{t('monitors:emptyDesc')}</p>
             </ListEmpty>
           ) : (
             <div className="flex flex-col gap-7">
               {grouped.map((group) => (
-                <section key={group.category} aria-label={t(`monitors.categories.${group.category}`)}>
+                <section key={group.category} aria-label={t(`monitors:categories.${group.category}`)}>
                   <SectionHeader>
-                    {t(`monitors.categories.${group.category}`)} ({group.items.length})
+                    {t(`monitors:categories.${group.category}`)} ({group.items.length})
                   </SectionHeader>
                   <div className="mt-2.5 grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3">
                     {group.items.map((item) => {
@@ -109,15 +109,15 @@ export function MonitorsList(): React.ReactElement {
                               {item.title}
                             </span>
                             <TagBadge soft>
-                              {t(`monitors.visibility.${item.visibility}`)}
+                              {t(`monitors:visibility.${item.visibility}`)}
                             </TagBadge>
                           </div>
 
                           <div className="flex flex-col gap-1">
-                            <MetaText>{t('monitors.ownerLabel', { owner: ownerLabel })}</MetaText>
-                            <MetaText>{t('monitors.pageUpdatedAt', { time: pageTime })}</MetaText>
+                            <MetaText>{t('monitors:ownerLabel', { owner: ownerLabel })}</MetaText>
+                            <MetaText>{t('monitors:pageUpdatedAt', { time: pageTime })}</MetaText>
                             {dataTime && (
-                              <MetaText>{t('monitors.dataUpdatedAt', { time: dataTime })}</MetaText>
+                              <MetaText>{t('monitors:dataUpdatedAt', { time: dataTime })}</MetaText>
                             )}
                             {item.last_publish_error && item.last_publish_failed_at && (
                               <span
@@ -125,7 +125,7 @@ export function MonitorsList(): React.ReactElement {
                                 style={{ color: 'var(--color-warning)' }}
                               >
                                 <AlertTriangle className="h-3 w-3 shrink-0" />
-                                {t('monitors.lastPublishFailed', {
+                                {t('monitors:lastPublishFailed', {
                                   time: formatTimestamp(item.last_publish_failed_at, locale),
                                 })}
                               </span>

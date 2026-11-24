@@ -249,6 +249,74 @@ def build_antigravity_series_catalog(
     return result
 
 
+def resolve_antigravity_effort_model(
+    model_name: str,
+    effort: str,
+    *,
+    model_config: Any = None,
+) -> tuple[str, str] | None:
+    """Map a built-in Antigravity suffixed model + requested ``effort`` to the matching variant.
+
+    Antigravity encodes reasoning effort in the model key (e.g.
+    ``gemini-4-neon-high-oauth`` -> ``gemini-4-neon-low-oauth``). Returns
+    ``(target_model_name, chosen_effort)`` using the same step-down clamping
+    rule as ``clamp_reasoning_effort``, or ``None`` if ``model_name`` is not a
+    built-in suffixed Antigravity series model or ``effort`` is not a known
+    reasoning level.
+    """
+    if not isinstance(model_name, str) or not isinstance(effort, str):
+        return None
+    if effort not in REASONING_LEVELS:
+        return None
+    parsed = parse_antigravity_series(model_name)
+    if parsed is None:
+        return None
+    series_prefix, current_effort = parsed
+    if current_effort is None:
+        return None
+
+    llm_cfg = _extract_llm_config(model_config)
+    if llm_cfg is None:
+        try:
+            from src.llms.llm import LLM
+
+            llm_cfg = _extract_llm_config(LLM.get_model_config())
+        except Exception:
+            llm_cfg = None
+    if llm_cfg is None:
+        return None
+
+    source_entry = llm_cfg.get(model_name)
+    if not isinstance(source_entry, Mapping) or source_entry.get("provider") != ANTIGRAVITY_PROVIDER:
+        return None
+
+    raw_variants: dict[str, str] = {}
+    for key, entry in llm_cfg.items():
+        if not isinstance(key, str) or not isinstance(entry, Mapping):
+            continue
+        if entry.get("provider") != ANTIGRAVITY_PROVIDER:
+            continue
+        if entry.get("visible") is False or entry.get("retired"):
+            continue
+        key_parsed = parse_antigravity_series(key)
+        if key_parsed is None:
+            continue
+        key_prefix, key_effort = key_parsed
+        if key_prefix == series_prefix and key_effort is not None:
+            raw_variants[key_effort] = key
+
+    ordered = [lv for lv in REASONING_LEVELS if lv in raw_variants]
+    if not ordered:
+        return None
+    if effort in raw_variants:
+        chosen = effort
+    else:
+        ceiling = REASONING_LEVELS.index(effort)
+        at_or_below = [lv for lv in ordered if REASONING_LEVELS.index(lv) <= ceiling]
+        chosen = at_or_below[-1] if at_or_below else ordered[0]
+    return raw_variants[chosen], chosen
+
+
 def quota_cooldown_target(
     provider: str,
     model_name: str,

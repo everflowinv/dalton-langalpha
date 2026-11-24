@@ -247,15 +247,38 @@ def subagent_roles(
     effort: a copy of the main client cannot carry it, because a level is
     turned into request parameters when a client is built.
     """
+    # DALTON-HOOK(antigravity-series): map subagent definition reasoning_effort on
+    # built-in Antigravity models to the matching series variant instead of
+    # forwarding raw reasoning_effort.
+    from src.dalton.llm.antigravity_series import (
+        ANTIGRAVITY_PROVIDER,
+        resolve_antigravity_effort_model,
+    )
+    from src.llms.llm import LLM as LLMFactory
+
+    mc = LLMFactory.get_model_config()
     roles: list[LLMRole] = []
     for defn in roster.for_role(role):
         effort = defn.reasoning_effort
         runs = defn.model or (turn_model if effort else None)
         if runs:
+            entry = mc.get_model_config(runs) if not user_models.custom_model(model_pref, runs) else None
+            is_builtin_antigravity = (
+                isinstance(entry, dict) and entry.get("provider") == ANTIGRAVITY_PROVIDER
+            )
+            if is_builtin_antigravity and effort:
+                mapped = resolve_antigravity_effort_model(runs, effort, model_config=mc)
+                if mapped is not None:
+                    runs = mapped[0]
+            role_effort = (
+                None
+                if is_builtin_antigravity
+                else (effort or resolve_tuning(model_pref, runs).reasoning_effort)
+            )
             roles.append(LLMRole(
                 f"subagent:{defn.name}", runs,
-                reasoning_effort=effort or resolve_tuning(model_pref, runs).reasoning_effort,
-                effort_follows=bool(effort), own_client=True,
+                reasoning_effort=role_effort,
+                effort_follows=bool(effort) and not is_builtin_antigravity, own_client=True,
                 # DALTON-HOOK(subagent-model-pin): a pinned model with no client
                 # must not run on a silent copy of the main client;
                 # demote_clientless turns it into Inherit and says so.

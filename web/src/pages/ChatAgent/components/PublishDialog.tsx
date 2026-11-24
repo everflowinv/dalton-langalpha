@@ -119,12 +119,12 @@ function FileRow({ artifactId, entry, added, leftOut, gutter, locked }: {
             <input
               type="checkbox"
               className="h-3.5 w-3.5 shrink-0 cursor-pointer accent-(--color-accent-primary)"
-              aria-label={t('publish.includeFile', { file: name })}
+              aria-label={t('publish:includeFile', { file: name })}
               checked={!out}
               disabled={locked || toggle.isPending}
               onChange={(e) => toggle.mutate(
                 { path: entry.path, leftOut: !e.target.checked },
-                { onError: () => toast({ description: t('publish.leftOutFailed'), variant: 'destructive' }) },
+                { onError: () => toast({ description: t('publish:leftOutFailed'), variant: 'destructive' }) },
               )}
             />
           ) : gutter && <span aria-hidden className="w-3.5 shrink-0" />}
@@ -150,7 +150,7 @@ function FileRow({ artifactId, entry, added, leftOut, gutter, locked }: {
             className="shrink-0 w-24 text-right"
             style={{ color: added && !out ? 'var(--color-warning)' : 'var(--color-text-quaternary)' }}
           >
-            {out ? t('publish.leftOut') : added ? t('publish.notShared') : t(`shareLink.reason.${entry.reason}`)}
+            {out ? t('publish:leftOut') : added ? t('publish:notShared') : t(`shareLink.reason.${entry.reason}`)}
           </span>
         </li>
       </TooltipTrigger>
@@ -158,10 +158,10 @@ function FileRow({ artifactId, entry, added, leftOut, gutter, locked }: {
         <p className="wrap-anywhere">{entry.path}</p>
         <p className="mt-1" style={{ color: 'var(--color-text-tertiary)' }}>
           {out
-            ? t('publish.leftOutDetail')
+            ? t('publish:leftOutDetail')
             : t(`shareLink.reasonDetail.${entry.reason === 'loaded' && entry.optional ? 'loadedBefore' : entry.reason}`)}
         </p>
-        {added && !out && <p className="mt-1" style={{ color: 'var(--color-warning)' }}>{t('publish.notSharedDetail')}</p>}
+        {added && !out && <p className="mt-1" style={{ color: 'var(--color-warning)' }}>{t('publish:notSharedDetail')}</p>}
       </TooltipContent>
     </Tooltip>
   );
@@ -173,7 +173,7 @@ function VersionRow({ version }: { version: ArtifactVersion }) {
   return (
     <li className="flex items-center gap-3 px-3 py-1.5 text-xs">
       <span className="shrink-0 tabular-nums font-medium" style={{ color: 'var(--color-text-primary)' }}>
-        {t('publish.version', { seq: version.seq })}
+        {t('publish:version', { seq: version.seq })}
       </span>
       <span className="shrink-0 tabular-nums" style={{ color: 'var(--color-text-tertiary)' }}>
         {shortMonthDay(new Date(version.published_at), locale)}
@@ -188,7 +188,7 @@ function VersionRow({ version }: { version: ArtifactVersion }) {
       </span>
       {version.origin === 'keep_updated' && (
         <span className="shrink-0" style={{ color: 'var(--color-text-quaternary)' }}>
-          {t('publish.keptUpdated')}
+          {t('publish:keptUpdated')}
         </span>
       )}
     </li>
@@ -203,7 +203,7 @@ function VersionList({ artifactId }: { artifactId: string | undefined }) {
   return (
     <div className="flex flex-col gap-1.5">
       <span id={headingId} className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
-        {t('publish.versions')}
+        {t('publish:versions')}
       </span>
       <div
         className={cn('rounded-lg border overflow-hidden', versionsQuery.isLoading && 'py-3')}
@@ -215,7 +215,7 @@ function VersionList({ artifactId }: { artifactId: string | undefined }) {
           </div>
         ) : versionsQuery.isError ? (
           <p className="px-3 py-2 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-            {t('publish.versionsFailed')}
+            {t('publish:versionsFailed')}
           </p>
         ) : (
           <ul
@@ -259,7 +259,7 @@ function ReviewList({ artifactId, heading, status, files, added, failure, failed
   return (
     <div className="flex flex-col gap-1.5">
       <span id={headingId} className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
-        {heading ?? t('publish.listing')}
+        {heading ?? t('publish:listing')}
       </span>
       <div
         className={cn('rounded-lg border overflow-hidden', !status && !failed && 'py-4')}
@@ -268,7 +268,7 @@ function ReviewList({ artifactId, heading, status, files, added, failure, failed
         {failed ? (
           <div className="flex items-center justify-between gap-3 px-3 py-2 text-xs">
             <span style={{ color: 'var(--color-text-tertiary)' }}>
-              {failure ?? t('publish.listFailed')}
+              {failure ?? t('publish:listFailed')}
             </span>
             <button
               type="button"
@@ -457,10 +457,16 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   const status = statusQuery.data;
   scout.follow(status?.page_sha256);
   const statusRefusal = refusalIn(statusQuery.error);
-  const statusFailure = statusRefusal?.kind === 'unavailable' ? t('publish.unavailable')
-    : statusRefusal?.kind === 'needsComputer' ? t('publish.needsComputer') : null;
+  // A cap or a missing file ends the review; a file unreadable for now is
+  // retried from the list.
+  // Said where the list would be, so not again below it.
+  const statusFailure = statusRefusal?.kind === 'unavailable' ? t('publish:unavailable')
+    : statusRefusal?.kind === 'needsComputer' ? t('publish:needsComputer') : null;
   const blocking = statusFailure ? null : statusRefusal;
-  const listFailure = statusFailure ?? (scout.failed ? t('publish.unavailable') : null);
+  // The page could not run to say what it loads: said and retried as a list
+  // unreadable for now is.
+  const listFailure = statusFailure ?? (scout.failed ? t('publish:unavailable') : null);
+  // Past a cap the list still comes, for the owner to leave out what puts it over.
   const overCap = status?.over_cap ?? null;
   const refusal = blocking
     ?? (overCap ? { kind: 'cap' as const, cap: overCap } : null)
@@ -504,15 +510,15 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
 
   const visibilityOptions = useMemo<SegmentedOption<MonitorVisibility>[]>(() => {
     if (isExternal) {
-      return [{ value: 'own', label: t('monitors.visibility.own') }];
+      return [{ value: 'own', label: t('monitors:visibility.own') }];
     }
     const base: SegmentedOption<MonitorVisibility>[] = [
-      { value: 'own', label: t('monitors.visibility.own') },
-      { value: 'members', label: t('monitors.visibility.members') },
-      { value: 'company', label: t('monitors.visibility.company') },
+      { value: 'own', label: t('monitors:visibility.own') },
+      { value: 'members', label: t('monitors:visibility.members') },
+      { value: 'company', label: t('monitors:visibility.company') },
     ];
     if (isAdmin) {
-      base.push({ value: 'public', label: t('monitors.visibility.public') });
+      base.push({ value: 'public', label: t('monitors:visibility.public') });
     }
     return base;
   }, [isExternal, isAdmin, t]);
@@ -588,7 +594,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
       if (result.cut === false) {
         setOutcome({ kind: 'unchanged', seq: result.monitor.published_seq });
       } else {
-        toast({ description: t('monitors.dialog.publishedToast') });
+        toast({ description: t('monitors:dialog.publishedToast') });
       }
     } catch (err) {
       const changed = filesChangedIn(err);
@@ -601,7 +607,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
         setOutcome({ kind: 'refused', refusal: ref });
         return;
       }
-      failed(err, t('publish.failed'));
+      failed(err, t('publish:failed'));
     } finally {
       setPublishingMonitor(false);
     }
@@ -621,7 +627,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   const stop = () => {
     if (!artifact || busy) return;
     setOutcome((prev) => (prev?.kind === 'unchanged' ? null : prev));
-    unshare.mutate(artifact.artifact_id, { onError: (err) => failed(err, t('publish.changeFailed')) });
+    unshare.mutate(artifact.artifact_id, { onError: (err) => failed(err, t('publish:changeFailed')) });
   };
 
   const toggleKeep = () => {
@@ -634,7 +640,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
           qc.setQueryData(queryKeys.daltonMonitors.byArtifact(artifact.artifact_id), res.monitor);
           void qc.invalidateQueries({ queryKey: queryKeys.daltonMonitors.all });
         })
-        .catch((err) => failed(err, t('publish.changeFailed')));
+        .catch((err) => failed(err, t('publish:changeFailed')));
     }
   };
 
@@ -665,7 +671,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
     if (!artifact || busy) return;
     audienceChange.mutate(
       { artifactId: artifact.artifact_id, audience: to },
-      { onError: (err) => failed(err, t('publish.changeFailed')) },
+      { onError: (err) => failed(err, t('publish:changeFailed')) },
     );
   };
 
@@ -675,43 +681,44 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   if (standing.state === 'paused') {
     stateHint = t('organization.share.pausedShort', { whoMid: setterName(RULE.publicLinks).mid });
   } else if (existingMonitor) {
-    stateHint = t('publish.publishedAt', { seq: existingMonitor.published_seq || latestSeq });
+    stateHint = t('publish:publishedAt', { seq: existingMonitor.published_seq || latestSeq });
   } else if (!shared) {
-    stateHint = latestSeq > 0 ? t('publish.privateWithVersions') : t('publish.privateHint');
+    stateHint = latestSeq > 0 ? t('publish:privateWithVersions') : t('publish:privateHint');
   } else if (legacyRefused) {
-    stateHint = t('publish.legacyRefused');
+    stateHint = t('publish:legacyRefused');
   } else if (visitorsAt === 0 || status?.changed == null) {
-    stateHint = membersOnly ? orgT('organization.share.fileMembersHint') : t('publish.sharedHint');
+    stateHint = membersOnly ? orgT('organization.share.fileMembersHint') : t('publish:sharedHint');
   } else {
-    stateHint = t('publish.changedSince', { seq: visitorsAt });
+    stateHint = t('publish:changedSince', { seq: visitorsAt });
   }
 
   const listHeading = !monitorPublished && !shared
-    ? t('publish.filesPublish', { count: files.length })
-    : t('publish.filesUpdate', { count: files.length });
+    ? t('publish:filesPublish', { count: files.length })
+    : t('publish:filesUpdate', { count: files.length });
 
   let refusalText: string | null = null;
   if (refusal?.kind === 'cap') {
     refusalText = refusal.cap.code === 'too_many_bytes'
-      ? t('publish.tooManyBytes', { size: formatBytes(refusal.cap.limit, locale) })
-      : t('publish.tooManyFiles', { limit: refusal.cap.limit });
-    if (overCap && files.some((f) => f.optional)) refusalText += ` ${t('publish.overCapLeaveOut')}`;
+      ? t('publish:tooManyBytes', { size: formatBytes(refusal.cap.limit, locale) })
+      : t('publish:tooManyFiles', { limit: refusal.cap.limit });
+    // Said only where a box can bring it back under.
+    if (overCap && files.some((f) => f.optional)) refusalText += ` ${t('publish:overCapLeaveOut')}`;
   } else if (refusal?.kind === 'missing') {
-    refusalText = t('publish.missing');
+    refusalText = t('publish:missing');
   } else if (refusal?.kind === 'unavailable') {
-    refusalText = t('publish.unavailable');
+    refusalText = t('publish:unavailable');
   } else if (refusal?.kind === 'needsComputer') {
-    refusalText = t('publish.needsComputer');
+    refusalText = t('publish:needsComputer');
   }
 
   return (
     <>
       {scout.element}
       <DialogTitle className="flex min-w-0 text-base font-semibold pr-6" style={{ color: 'var(--color-text-primary)' }} title={name}>
-        <span className="truncate">{t('publish.title', { file: name })}</span>
+        <span className="truncate">{t('publish:title', { file: name })}</span>
       </DialogTitle>
       <DialogDescription className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
-        {t('publish.description')}
+        {t('publish:description')}
       </DialogDescription>
 
       <div className="flex flex-col gap-4 pt-1">
@@ -722,7 +729,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
             style={{ backgroundColor: 'var(--color-bg-input)', color: 'var(--color-text-secondary)' }}
           >
             <span className="truncate font-mono" data-selectable>
-              {href || (recordFailed ? t('publish.linkFailed') : '…')}
+              {href || (recordFailed ? t('publish:linkFailed') : '…')}
             </span>
           </div>
           {recordFailed ? (
@@ -740,7 +747,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
               {copied
                 ? <Check className="h-3.5 w-3.5" style={{ color: 'var(--color-success)' }} />
                 : <Copy className="h-3.5 w-3.5" />}
-              {copied ? t('publish.copied') : t('publish.copy')}
+              {copied ? t('publish:copied') : t('publish:copy')}
             </Button>
           )}
         </div>
@@ -751,12 +758,12 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <label className="flex flex-col gap-1">
                 <span className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
-                  {t('monitors.dialog.titleField')}
+                  {t('monitors:dialog.titleField')}
                 </span>
                 <Input
                   value={effectiveTitle}
                   onChange={(e) => setTitleDraft(e.target.value)}
-                  placeholder={t('monitors.dialog.titlePlaceholder')}
+                  placeholder={t('monitors:dialog.titlePlaceholder')}
                   maxLength={300}
                   disabled={busy}
                   className="h-8 sm:text-xs bg-(--color-bg-input) border-(--color-border-muted) text-(--color-text-primary)"
@@ -764,7 +771,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
               </label>
               <label className="flex flex-col gap-1">
                 <span className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
-                  {t('monitors.dialog.categoryField')}
+                  {t('monitors:dialog.categoryField')}
                 </span>
                 <Select
                   value={effectiveCategory}
@@ -774,7 +781,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
                 >
                   {MONITOR_CATEGORIES.map((cat) => (
                     <option key={cat} value={cat}>
-                      {t(`monitors.categories.${cat}`)}
+                      {t(`monitors:categories.${cat}`)}
                     </option>
                   ))}
                 </Select>
@@ -783,24 +790,24 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
 
             <div className="flex flex-col gap-1.5">
               <span className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
-                {t('monitors.dialog.visibilityField')}
+                {t('monitors:dialog.visibilityField')}
               </span>
               <SegmentedControl
                 value={effectiveVisibility}
                 onChange={(val) => setVisibilityDraft(val)}
                 options={visibilityOptions}
-                label={t('monitors.dialog.visibilityField')}
+                label={t('monitors:dialog.visibilityField')}
                 disabled={busy}
                 size="compact"
               />
               {isExternal && (
                 <p className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>
-                  {t('monitors.dialog.externalOwnOnlyHint')}
+                  {t('monitors:dialog.externalOwnOnlyHint')}
                 </p>
               )}
               {!isExternal && !isAdmin && existingMonitor?.visibility === 'public' && (
                 <p className="text-[0.6875rem]" role="note" style={{ color: 'var(--color-warning)' }}>
-                  {t('monitors.dialog.nonAdminPublicDowngradeHint')}
+                  {t('monitors:dialog.nonAdminPublicDowngradeHint')}
                 </p>
               )}
             </div>
@@ -808,16 +815,16 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
             {!isExternal && effectiveVisibility === 'members' && (
               <div className="flex flex-col gap-1.5">
                 <span className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
-                  {t('monitors.dialog.membersField')}
+                  {t('monitors:dialog.membersField')}
                 </span>
                 {companyMembersQuery.isLoading ? (
                   <div className="flex items-center gap-2 py-2 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
                     <Loader size={14} />
-                    {t('monitors.dialog.membersLoading')}
+                    {t('monitors:dialog.membersLoading')}
                   </div>
                 ) : (companyMembersQuery.data ?? []).length === 0 ? (
                   <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-                    {t('monitors.dialog.membersEmpty')}
+                    {t('monitors:dialog.membersEmpty')}
                   </p>
                 ) : (
                   <div
@@ -847,7 +854,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
                 )}
                 {membersInvalid && (
                   <p className="text-[0.6875rem]" style={{ color: 'var(--color-warning)' }}>
-                    {t('monitors.dialog.membersRequired')}
+                    {t('monitors:dialog.membersRequired')}
                   </p>
                 )}
               </div>
@@ -869,10 +876,10 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
               <div className="flex flex-col min-w-0">
                 <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
                   {monitorPublished
-                    ? t(`monitors.visibility.${existingMonitor.visibility}`)
+                    ? t(`monitors:visibility.${existingMonitor.visibility}`)
                     : !shared
-                      ? t('publish.private')
-                      : visitorsAt > 0 ? t('publish.publishedAt', { seq: visitorsAt }) : t('publish.published')}
+                      ? t('publish:private')
+                      : visitorsAt > 0 ? t('publish:publishedAt', { seq: visitorsAt }) : t('publish:published')}
                 </span>
                 <span className="text-xs" style={{ color: legacyRefused ? 'var(--color-warning)' : 'var(--color-text-tertiary)' }}>{stateHint}</span>
               </div>
@@ -886,7 +893,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
                 disabled={busy || lockedOut}
               >
                 {unshare.isPending && <Loader size={12} style={{ color: 'inherit' }} />}
-                {t('publish.unshare')}
+                {t('publish:unshare')}
               </Button>
             )}
           </div>
@@ -908,10 +915,10 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
             <div className="flex items-center justify-between gap-3">
               <div className="flex flex-col min-w-0">
                 <span className="text-sm" style={{ color: 'var(--color-text-primary)' }}>
-                  {t('monitors.dialog.keepUpdated')}
+                  {t('monitors:dialog.keepUpdated')}
                 </span>
                 <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-                  {t('monitors.dialog.keepUpdatedHint')}
+                  {t('monitors:dialog.keepUpdatedHint')}
                 </span>
               </div>
               {keepUpdated.isPending
@@ -921,15 +928,15 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
                     checked={keepOn}
                     onChange={toggleKeep}
                     disabled={!artifact || busy || (shared && lockedOut)}
-                    ariaLabel={t('monitors.dialog.keepUpdated')}
+                    ariaLabel={t('monitors:dialog.keepUpdated')}
                   />
                 )}
             </div>
             {/* DALTON-HOOK(colleague-access): show auto-publish pause guidance under keep-updated toggle */}
             {autoPublishPaused && (
               <p className="text-xs" role="status" style={{ color: 'var(--color-warning)' }}>
-                {t('monitors.dialog.autoPublishPausedHint', {
-                  action: monitorPublished ? t('publish.update') : t('publish.publish'),
+                {t('monitors:dialog.autoPublishPausedHint', {
+                  action: monitorPublished ? t('publish:update') : t('publish:publish'),
                 })}
               </p>
             )}
@@ -951,7 +958,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
         )}
         {outcome?.kind === 'conflict' && (
           <p className="text-xs" role="status" style={{ color: 'var(--color-warning)' }}>
-            {t('publish.filesChanged')}
+            {t('publish:filesChanged')}
           </p>
         )}
         {refusalText && (
@@ -961,7 +968,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
         )}
         {outcome?.kind === 'unchanged' && (
           <p className="text-xs" role="status" style={{ color: 'var(--color-text-tertiary)' }}>
-            {t('publish.unchanged', { seq: outcome.seq })}
+            {t('publish:unchanged', { seq: outcome.seq })}
           </p>
         )}
         {added.size > 0 && (
@@ -969,13 +976,13 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
             className="rounded-lg border px-3 py-2.5 text-xs"
             style={{ borderColor: 'var(--color-border-muted)', backgroundColor: 'var(--color-warning-soft)', color: 'var(--color-text-primary)' }}
           >
-            {t('publish.driftAdded', { count: added.size })}
+            {t('publish:driftAdded', { count: added.size })}
           </p>
         )}
         {rootRefs.length > 0 && (
           <p className="text-xs" role="status" style={{ color: 'var(--color-warning)' }}>
             <Trans
-              i18nKey="publish.rootRefs"
+              i18nKey="publish:rootRefs"
               values={{ example: rootRefs[0] }}
               components={{ path: <code className="break-all" />, cmd: <code className="whitespace-nowrap" /> }}
             />
@@ -1002,7 +1009,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
         {!unshareOnly && !blocked && (
         <label className="flex flex-col gap-1.5">
           <span className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
-            {t('publish.label')}
+            {t('publish:label')}
           </span>
           <Input
             value={label}
@@ -1014,7 +1021,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
               }
             }}
             maxLength={LABEL_MAX}
-            placeholder={t('publish.labelPlaceholder')}
+            placeholder={t('publish:labelPlaceholder')}
             disabled={busy || !artifact}
             className="h-8 sm:text-xs bg-(--color-bg-input) border-(--color-border-muted) text-(--color-text-primary)"
           />
@@ -1039,7 +1046,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
               style={{ color: 'var(--color-text-secondary)' }}
             >
               <ExternalLink className="h-3.5 w-3.5" />
-              {t('monitors.openInNewWindow')}
+              {t('monitors:openInNewWindow')}
             </a>
           ) : <span />}
           <div className="flex items-center gap-2">
@@ -1050,7 +1057,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
             {!unshareOnly && !blocked && (
             <Button size="sm" className="gap-1.5" onClick={send} disabled={!canPublish}>
               {publishingMonitor && <Loader size={14} style={{ color: 'inherit' }} />}
-              {monitorPublished ? t('publish.update') : t('publish.publish')}
+              {monitorPublished ? t('publish:update') : t('publish:publish')}
             </Button>
             )}
           </div>
@@ -1061,9 +1068,9 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
       <ConfirmDialog
         open={publicConfirmOpen}
         onOpenChange={setPublicConfirmOpen}
-        title={t('monitors.dialog.publicConfirmTitle')}
-        message={t('monitors.dialog.publicConfirmMessage')}
-        confirmLabel={t('monitors.dialog.publicConfirmButton')}
+        title={t('monitors:dialog.publicConfirmTitle')}
+        message={t('monitors:dialog.publicConfirmMessage')}
+        confirmLabel={t('monitors:dialog.publicConfirmButton')}
         onConfirm={executeMonitorPublish}
       />
     </>

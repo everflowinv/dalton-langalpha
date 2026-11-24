@@ -588,6 +588,28 @@ AUDIT_EXEMPT_FILES = {
     # unexplained diffs), and the UUID placeholders come from the
     # DALTON-HOOK(xai-oauth) normalization in the test module.
     "tests/unit/llms/request_lock.json",
+    # sync12 (#863): upstream split deferred copy into locales/<ns>/{en-US,zh-CN}.json.
+    # JSON carries no inline markers; Dalton keys and copy overrides live in these 10 namespaces.
+    "web/src/locales/automation/en-US.json",
+    "web/src/locales/automation/zh-CN.json",
+    "web/src/locales/customDashboard/en-US.json",
+    "web/src/locales/customDashboard/zh-CN.json",
+    "web/src/locales/dashboard/en-US.json",
+    "web/src/locales/dashboard/zh-CN.json",
+    "web/src/locales/filePanel/en-US.json",
+    "web/src/locales/filePanel/zh-CN.json",
+    "web/src/locales/marketView/en-US.json",
+    "web/src/locales/marketView/zh-CN.json",
+    "web/src/locales/memoPanel/en-US.json",
+    "web/src/locales/memoPanel/zh-CN.json",
+    "web/src/locales/plugins/en-US.json",
+    "web/src/locales/plugins/zh-CN.json",
+    "web/src/locales/settings/en-US.json",
+    "web/src/locales/settings/zh-CN.json",
+    "web/src/locales/setup/en-US.json",
+    "web/src/locales/setup/zh-CN.json",
+    "web/src/locales/toolArtifact/en-US.json",
+    "web/src/locales/toolArtifact/zh-CN.json",
 }
 
 def is_dalton_owned(rel: str) -> bool:

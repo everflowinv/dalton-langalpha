@@ -586,3 +586,5 @@ tests/fakes/
 tests/standalone/
 # Standalone Core Batch 6: third-party open-source attribution notice.
 NOTICE
+# sync12 (#863): Dalton-only deferred copy namespace for lazy Monitors routes (/monitors, /m/:slug).
+web/src/locales/monitors/

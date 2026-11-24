@@ -26,6 +26,7 @@ from src.dalton.llm.antigravity_series import (
     format_series_display_name,
     parse_antigravity_series,
     quota_cooldown_target,
+    resolve_antigravity_effort_model,
     resolve_series_default_effort,
 )
 from src.llms.llm import LLM
@@ -303,3 +304,102 @@ class TestQuotaCooldownTarget:
         assert quota_cooldown_target(
             "gemini", "gemini-4-neon", model_config=mc
         ) == ("model", "gemini-4-neon")
+
+
+class TestResolveAntigravityEffortModel:
+    def test_maps_suffixed_series_model_to_requested_or_clamped_variant(self):
+        mc = LLM.get_model_config()
+        assert resolve_antigravity_effort_model(
+            "gemini-4-neon-high-oauth", "low", model_config=mc
+        ) == ("gemini-4-neon-low-oauth", "low")
+        assert resolve_antigravity_effort_model(
+            "gemini-4-neon-low-oauth", "xhigh", model_config=mc
+        ) == ("gemini-4-neon-xhigh-oauth", "xhigh")
+        # max steps down to xhigh on gemini-4-neon
+        assert resolve_antigravity_effort_model(
+            "gemini-4-neon-high-oauth", "max", model_config=mc
+        ) == ("gemini-4-neon-xhigh-oauth", "xhigh")
+        # xhigh steps down to high on gemini-4-carbon (only low/medium/high)
+        assert resolve_antigravity_effort_model(
+            "gemini-4-carbon-medium-oauth", "xhigh", model_config=mc
+        ) == ("gemini-4-carbon-high-oauth", "high")
+        # low steps up to lowest available (medium) on gpt-oss-120b
+        assert resolve_antigravity_effort_model(
+            "gpt-oss-120b-medium-oauth", "low", model_config=mc
+        ) == ("gpt-oss-120b-medium-oauth", "medium")
+
+    def test_returns_none_for_unsuffixed_or_non_antigravity_models(self):
+        mc = LLM.get_model_config()
+        assert resolve_antigravity_effort_model("gemini-2.5-pro-oauth", "high", model_config=mc) is None
+        assert resolve_antigravity_effort_model("claude-opus-5-5-oauth", "low", model_config=mc) is None
+        assert resolve_antigravity_effort_model("gpt-6.2-sol", "high", model_config=mc) is None
+        assert resolve_antigravity_effort_model("gemini-4-neon-high-oauth", "bogus", model_config=mc) is None
+
+
+@pytest.mark.asyncio
+async def test_task_model_gate_maps_antigravity_effort_to_variant_and_omits_raw_effort(monkeypatch):
+    from types import SimpleNamespace
+    from ptc_agent.config.agent import CredentialSource, TaskAsk, TaskModel
+    from src.server.services.llm import task_model as tm
+    from src.server.services.llm import user_models
+    from src.server.services.llm.clients import ResolvedClient
+
+    real_mc = LLM.get_model_config()
+    captured: list[tuple[str, str | None]] = []
+
+    async def fake_classify(_user, name, _pref_cache=None):
+        entry = real_mc.get_model_config(name)
+        return (user_models.ModelSource.SYSTEM, entry) if entry else (user_models.ModelSource.UNKNOWN, {})
+
+    async def fake_resolve_client(user_id, name, **kwargs):
+        captured.append((name, kwargs.get("reasoning_effort")))
+        entry = real_mc.get_model_config(name) or {}
+        eff = (entry.get("reasoning") or {}).get("default")
+        client = SimpleNamespace(metadata={"manifest_model": name, "reasoning_effort": eff}, model=name)
+        return ResolvedClient(client, user_models.ModelSource.SYSTEM, CredentialSource.OAUTH)
+
+    monkeypatch.setattr(user_models, "classify_model", fake_classify)
+    monkeypatch.setattr(user_models, "model_entry", lambda _pref, name: real_mc.get_model_config(name))
+    monkeypatch.setattr(user_models, "guidance_for", lambda _pref, name: "")
+    monkeypatch.setattr(tm, "model_resolves", lambda _pref, name: real_mc.get_model_config(name) is not None)
+    monkeypatch.setattr(tm, "resolve_model_client", fake_resolve_client)
+    monkeypatch.setattr(
+        tm, "turn_roster",
+        lambda _s: SimpleNamespace(definitions={"research": SimpleNamespace(model=None, reasoning_effort=None)}),
+    )
+
+    cfg = SimpleNamespace(
+        credential_source=CredentialSource.OAUTH,
+        compaction=SimpleNamespace(profile="expansive"),
+        claude_code=False,
+        claude_code_admitted=None,
+        claude_code_pins=None,
+        subsidiary_llm_clients={},
+        subagents=None,
+    )
+    gate = tm.TaskModelGate(
+        cfg,
+        user_id="u-1",
+        workspace_id="w-1",
+        thread_id="t-1",
+        model_pref={},
+        permits=SimpleNamespace(),
+        is_byok=False,
+        turn_model="gemini-4-neon-high-oauth",
+        plan_exempt=frozenset(),
+    )
+
+    # Own model is gemini-4-neon-high-oauth; asking effort="low" maps to gemini-4-neon-low-oauth
+    # and passes reasoning_effort=None (never raw effort) to resolve_model_client.
+    resolved = await gate.resolve(TaskAsk(effort="low"), "research")
+    assert isinstance(resolved, TaskModel)
+    assert resolved.name == "gemini-4-neon-low-oauth"
+    assert resolved.effort == "low"
+    assert captured[-1] == ("gemini-4-neon-low-oauth", None)
+
+    # Asking effort="max" clamps down to gemini-4-neon-xhigh-oauth.
+    clamped = await gate.resolve(TaskAsk(effort="max"), "research")
+    assert isinstance(clamped, TaskModel)
+    assert clamped.name == "gemini-4-neon-xhigh-oauth"
+    assert clamped.effort == "max"
+    assert captured[-1] == ("gemini-4-neon-xhigh-oauth", None)

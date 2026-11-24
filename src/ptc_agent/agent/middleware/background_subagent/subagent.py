@@ -53,6 +53,7 @@ from ptc_agent.config.agent import Admitted, RunOn, SubagentModel, TaskModel
 from src.llms.claude_code import ClaudeCodeTarget
 from src.llms.content_utils import extract_text_blocks  # DALTON-HOOK(subagent-spill-recovery)
 from src.llms.llm import narrow_prompt_cache_key
+from src.llms.reasoning import DelegatedEffort
 from src.observability.langsmith_tracer import with_run_tracer
 from src.tools.turn_tool import input_schema
 from src.utils.concurrency import iterate_until
@@ -191,6 +192,7 @@ _EXCLUDED_STATE_KEYS = {"messages", "todos", "structured_response"}
 # items under 派发任务 live in <subagent_coordination>.
 # DALTON-HOOK(subagent-cancel): update appends instructions to a running task
 # and does not stop it; stopping uses ThreadStatus's stop.
+# DALTON-HOOK(computer-cli-tokens-off): omit `la models list` when CLI tokens are off.
 TASK_TOOL_DESCRIPTION = """Launch a subagent for complex, multi-step tasks.
 
 Use for: Complex tasks, isolated research, context-heavy operations.
@@ -202,8 +204,8 @@ Args:
     subagent_type: Which subagent to use (e.g. "general-purpose"). Required for "init".
     action: "init" (new task, default), "update" (append instructions to a running task; to stop it, use ThreadStatus's stop), or "resume". 更新用于正在运行的任务；恢复仅用于工具明确标为可恢复的任务。用户取消的任务不自动恢复或重新派发。因超时、额度或执行中断而停止的任务，按返回的原因和恢复说明处理。
     task_id: The target task's short alphanumeric ID. Required for "update" and "resume".
-# DALTON-HOOK(computer-cli-tokens-off): omit `la models list` when CLI tokens are off.
     model: Run this task on another model instead of the subagent's own. Pass it only when the user asks for a model or a skill's procedure names one. On resume, omitted keeps the model the task last ran on.
+    effort: How much work the subagent puts in: low, medium, high, xhigh or max. More than thinking: lower levels make fewer tool calls, keep to what was asked and may skip a search or a check; higher ones explore further, verify their work and persist longer, at more time and cost. Omitted, it runs at its own. Low to high covers most work, and medium is a good default where the model offers it; xhigh only when a task needs more than high gives. Frontier models offer every level; some open models, DeepSeek among them, have no medium. A level the model lacks runs at the next one below, and the reply says which. On resume, omitted keeps the effort the task last ran at.
 
 Returns:
     A task ID immediately, not the subagent's work. The subagent runs
@@ -833,6 +835,10 @@ def _create_task_tool(
             # DALTON-HOOK(computer-cli-tokens-off): omit `la models list` when CLI tokens are off.
             "Model key to run on; only when the user asks for one or a skill's procedure names one.",
         ] = None,
+        effort: Annotated[
+            DelegatedEffort | None,
+            "How much work the subagent puts in; omitted, its own effort on init and the last run's on resume.",
+        ] = None,
         runtime: ToolRuntime = None,  # type: ignore[assignment]
     ) -> str | ToolMessage | Command:
         # Resolve subagent_type based on action
@@ -934,6 +940,10 @@ def _create_task_tool(
             str | None,
             # DALTON-HOOK(computer-cli-tokens-off): omit `la models list` when CLI tokens are off.
             "Model key to run on; only when the user asks for one or a skill's procedure names one.",
+        ] = None,
+        effort: Annotated[
+            DelegatedEffort | None,
+            "How much work the subagent puts in; omitted, its own effort on init and the last run's on resume.",
         ] = None,
         runtime: ToolRuntime = None,  # type: ignore[assignment]
     ) -> str | ToolMessage | Command:
@@ -1177,12 +1187,13 @@ class SubAgentMiddleware(AgentMiddleware):
             build=partial(self._build_graph, claude_code=claude_code),
             checkpointer=checkpointer,
         )
-        # A task's graph on a model its call names, built once per type and
-        # model. This middleware is built per turn, on the turn's worker, so
-        # these are that turn's execution context and nothing else reads them.
+        # A task's graph on a model or effort its call names, built once per
+        # type, model and effort. This middleware is built per turn, on the
+        # turn's worker, so these are that turn's execution context and
+        # nothing else reads them.
         self._compile_on = compile_on
         self._claude_code_on = claude_code_on
-        self._model_graphs: dict[tuple[str, str, Admitted | None], Runnable] = {}
+        self._model_graphs: dict[tuple[str, str, str | None, Admitted | None], Runnable] = {}
         task_tool = _create_task_tool(
             subagent_graphs=self.subagent_graphs,
             task_description=task_description,
@@ -1195,7 +1206,7 @@ class SubAgentMiddleware(AgentMiddleware):
     def _graph_on(self, subagent_type: str, on: TaskModel) -> Runnable:
         # Where Claude Code was placed too: two Tasks resolving at once can be
         # placed apart, and the graph keeps the computer it was built for.
-        key = (subagent_type, on.name, on.claude_code)
+        key = (subagent_type, on.name, on.effort, on.claude_code)
         if key not in self._model_graphs:
             claude_code = (
                 self._claude_code_on(on.claude_code)

@@ -121,7 +121,7 @@ import { preloadableLazy } from '@/lib/lazyWithMotion';
 
 // Preloadable: a lazy panel suspends on its first render even with its code
 // in, and its boundary's 300ms reveal throttle left a preloaded panel blank.
-const FilePanel = preloadableLazy(() => import('./FilePanel'));
+const FilePanel = preloadableLazy(withCopy(() => import('./FilePanel'), ['publish', 'vault']));
 const loadFilePanel = FilePanel.preload;
 // The panel opens on the fold spring, which leaves the chat's edge almost
 // where it was for the first frames, and shuts on the collapse curve, as a
@@ -174,6 +174,7 @@ import { useForkThread } from './chatView/useForkThread';
 import { ForkedFromLink } from './chatView/ForkedFromLink';
 import { ThreadPrivacyRow } from './chatView/threadPrivacy';
 import { useThreadPrivacy } from './chatView/useThreadPrivacy';
+import { withCopy } from '@/i18n';
 
 
 // Clears the composer floating over the transcript's bottom edge (its height
@@ -1365,7 +1366,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         // A card's Download is the whole interaction: nothing opens, nothing
         // navigates, and the browser shows no save. Without this the click is
         // indistinguishable from a dead button.
-        toast({ description: t('filePanel.downloadFailed'), variant: 'destructive' });
+        toast({ description: t('filePanel:downloadFailed'), variant: 'destructive' });
         return false;
       }
     });

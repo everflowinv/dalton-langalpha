@@ -1,5 +1,6 @@
 import { Suspense, useEffect } from 'react';
 import { Routes, Route, Navigate, useLocation } from 'react-router';
+import type { QueryClient } from '@tanstack/react-query';
 import PageLoading from '@/components/PageLoading/PageLoading';
 import { isFeatureEnabled, useFeatures } from '@/hooks/useFeatures';
 import { useIsMobile } from '@/hooks/useIsMobile';
@@ -13,27 +14,42 @@ import { lazyWithMotion, preloadableLazy } from '@/lib/lazyWithMotion';
 import type { AppSection } from '@/lib/appRoutes';
 import { whenIdle } from '@/lib/whenIdle';
 import { usePreferencesSync } from '@/lib/preferencesChannel';
+import { withCopy } from '@/i18n';
+import { preloadChatRoute } from '@/pages/ChatAgent/routePrefetch';
+
+const dashboardChunk = withCopy(() => import('../../pages/Dashboard/Dashboard'), [
+  'automation', 'customDashboard', 'dashboard', 'filePanel', 'marketView', 'settings',
+]);
+const pluginsChunk = withCopy(() => import('../../pages/Plugins/Plugins'), ['mcp', 'plugins', 'settings', 'vault']);
 
 // Chunk thunks shared by the lazy components and preloadRouteChunk — import()
 // is deduped by the module system, so a preload and the lazy mount share one
 // network fetch. Keyed by every section `APP_SECTIONS` names, so a link the
 // chat routes in place always has a page here.
 const routeChunks = {
-  dashboard: () => import('../../pages/Dashboard/Dashboard'),
-  chat: () => import('../../pages/ChatAgent/ChatAgent'),
-  market: () => import('../../pages/MarketView/MarketView'),
+  dashboard: dashboardChunk,
+  chat: withCopy(() => import('../../pages/ChatAgent/ChatAgent'), [
+    'automation', 'customDashboard', 'dashboard', 'filePanel', 'marketView', 'mcp', 'orders', 'pageViewer', 'plugins', 'settings', 'setup', 'toolArtifact',
+  ]),
+  market: withCopy(() => import('../../pages/MarketView/MarketView'), [
+    'automation', 'customDashboard', 'dashboard', 'filePanel', 'marketView', 'mcp', 'orders', 'pageViewer', 'plugins', 'settings', 'toolArtifact',
+  ]),
   news: () => import('../../pages/Detail/NewsDetailPage'),
-  automations: () => import('../../pages/Automations/Automations'),
+  automations: withCopy(() => import('../../pages/Automations/Automations'), [
+    'automation', 'marketView', 'mcp', 'settings',
+  ]),
   // DALTON-HOOK(monitors): Monitors primary section chunk
-  monitors: () => import('../../pages/Monitors/Monitors'),
+  monitors: withCopy(() => import('../../pages/Monitors/Monitors'), ['monitors']),
   // DALTON-HOOK(hide-trading): the Orders page is not built; an /orders warm
   // takes the dashboard chunk, the same one the catch-all redirect lands on.
-  orders: () => import('../../pages/Dashboard/Dashboard'),
-  library: () => import('../../pages/Library/Library'),
-  plugins: () => import('../../pages/Plugins/Plugins'),
-  settings: () => import('../../pages/Settings/Settings'),
+  orders: dashboardChunk,
+  library: withCopy(() => import('../../pages/Library/Library'), ['mcp']),
+  plugins: pluginsChunk,
+  settings: withCopy(() => import('../../pages/Settings/Settings'), [
+    'filePanel', 'marketView', 'pageViewer', 'settings', 'setup',
+  ]),
   // Alias so preloading /connectors (the legacy path) warms the right chunk.
-  connectors: () => import('../../pages/Plugins/Plugins'),
+  connectors: pluginsChunk,
 } satisfies Record<AppSection, () => Promise<unknown>>;
 
 const Dashboard = lazyWithMotion(routeChunks.dashboard);
@@ -81,10 +97,11 @@ const routePreloads = {
  * shell can warm the target route while the /users/me gate is still
  * resolving instead of serializing the two network legs. Unknown segments
  * warm the dashboard chunk (the catch-all redirect's target). */
-export function preloadRouteChunk(pathname: string): void {
+export function preloadRouteChunk(pathname: string, queryClient: QueryClient): void {
   const chunkFor: Record<string, () => Promise<unknown>> = routePreloads;
   const segment = pathname.split('/')[1] || 'dashboard';
   void (chunkFor[segment] ?? routePreloads.dashboard)();
+  if (segment === 'chat') preloadChatRoute(pathname, queryClient);
 }
 
 // Warmed in the order the rail lists them, the likeliest next stops first.

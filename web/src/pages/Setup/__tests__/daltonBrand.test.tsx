@@ -384,20 +384,11 @@ describe('Dalton brand rendering across Setup and Onboarding', () => {
     cleanup();
     vi.unstubAllEnvs();
     vi.resetModules();
-    const [{ initI18n }, { default: enUS }, { default: zhCN }, { default: introsEn }, { default: introsZh }, { default: thisMacEn }, { default: thisMacZh }] =
-      await Promise.all([
-        import('@/i18n'),
-        import('@/locales/en-US.json'),
-        import('@/locales/zh-CN.json'),
-        import('@/locales/intros/en-US.json'),
-        import('@/locales/intros/zh-CN.json'),
-        import('@/locales/thisMacFirstRun/en-US.json'),
-        import('@/locales/thisMacFirstRun/zh-CN.json'),
-      ]);
-    await initI18n({
-      'en-US': { translation: enUS, intros: introsEn, thisMacFirstRun: thisMacEn },
-      'zh-CN': { translation: zhCN, intros: introsZh, thisMacFirstRun: thisMacZh },
-    });
+    const [{ initI18n }, { resources }] = await Promise.all([
+      import('@/i18n'),
+      import('@/test/catalogs'),
+    ]);
+    await initI18n(resources);
   });
 
   it.each(['en-US', 'zh-CN'] as const)(
@@ -405,12 +396,7 @@ describe('Dalton brand rendering across Setup and Onboarding', () => {
     async (locale) => {
       const [
         { initI18n, default: i18n },
-        { default: enUS },
-        { default: zhCN },
-        { default: introsEn },
-        { default: introsZh },
-        { default: thisMacEn },
-        { default: thisMacZh },
+        { resources },
         { renderWithProviders, createTestQueryClient },
         { render },
         { MemoryRouter, Route: DynamicRoute, Routes: DynamicRoutes },
@@ -442,12 +428,7 @@ describe('Dalton brand rendering across Setup and Onboarding', () => {
         { ThisMacPairingBody },
       ] = await Promise.all([
         import('@/i18n'),
-        import('@/locales/en-US.json'),
-        import('@/locales/zh-CN.json'),
-        import('@/locales/intros/en-US.json'),
-        import('@/locales/intros/zh-CN.json'),
-        import('@/locales/thisMacFirstRun/en-US.json'),
-        import('@/locales/thisMacFirstRun/zh-CN.json'),
+        import('@/test/catalogs'),
         import('@/test/utils'),
         import('@testing-library/react'),
         import('react-router'),
@@ -479,10 +460,7 @@ describe('Dalton brand rendering across Setup and Onboarding', () => {
         import('../mac/ThisMacPairing'),
       ]);
 
-      await initI18n({
-        'en-US': { translation: enUS, intros: introsEn, thisMacFirstRun: thisMacEn },
-        'zh-CN': { translation: zhCN, intros: introsZh, thisMacFirstRun: thisMacZh },
-      });
+      await initI18n(resources);
       await i18n.changeLanguage(locale);
 
       expect(BRAND_NAME).toBe('Everflow');
