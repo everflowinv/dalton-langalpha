@@ -306,29 +306,6 @@ async def dispatch_data_task_target_via_gateway(
             ],
         }
 
-    if gw_status in ("deferred", "partial_deferred") or safe_code == "delivery_deferred":
-        defer_code = safe_code or "delivery_deferred"
-        return {
-            "ok": False,
-            "status": gw_status if gw_status in ("deferred", "partial_deferred") else "deferred",
-            "retryable": True,
-            "uncertain": False,
-            "status_code": resp.status_code,
-            "error_code": defer_code,
-            "retry_after_ms": parsed.get("retry_after_ms"),
-            "results": [
-                {
-                    "target": cleaned_target,
-                    "ok": False,
-                    "status": gw_status if gw_status in ("deferred", "partial_deferred") else "deferred",
-                    "retryable": True,
-                    "error": defer_code,
-                    "error_code": defer_code,
-                    "retry_after_ms": parsed.get("retry_after_ms"),
-                }
-            ],
-        }
-
     if gw_status in ("unknown", "partial", "in_flight") or is_uncertain_notify_error_code(safe_code):
         uncertain_code = safe_code if is_uncertain_notify_error_code(safe_code) else "delivery_uncertain"
         return {
@@ -650,29 +627,6 @@ async def post_automation_gateway_notify(
                     "status": "skipped",
                     "reason": skip_code,
                     "error_code": skip_code,
-                }
-            ],
-        }
-
-    if gw_status in ("deferred", "partial_deferred") or safe_code == "delivery_deferred":
-        defer_code = safe_code or "delivery_deferred"
-        return {
-            "ok": False,
-            "status": gw_status if gw_status in ("deferred", "partial_deferred") else "deferred",
-            "retryable": True,
-            "uncertain": False,
-            "status_code": resp.status_code,
-            "error_code": defer_code,
-            "retry_after_ms": parsed.get("retry_after_ms"),
-            "results": [
-                {
-                    "target": cleaned_target,
-                    "ok": False,
-                    "status": gw_status if gw_status in ("deferred", "partial_deferred") else "deferred",
-                    "retryable": True,
-                    "error": defer_code,
-                    "error_code": defer_code,
-                    "retry_after_ms": parsed.get("retry_after_ms"),
                 }
             ],
         }

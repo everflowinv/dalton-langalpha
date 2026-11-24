@@ -336,12 +336,7 @@ def upgrade() -> None:
             ADD COLUMN IF NOT EXISTS weixin_account_id UUID,
             ADD COLUMN IF NOT EXISTS weixin_bot_id VARCHAR(255),
             ADD COLUMN IF NOT EXISTS weixin_bot_generation BIGINT,
-            ADD COLUMN IF NOT EXISTS weixin_recipient_id VARCHAR(255),
-            ADD COLUMN IF NOT EXISTS defer_count INTEGER NOT NULL DEFAULT 0,
-            ADD COLUMN IF NOT EXISTS first_deferred_at TIMESTAMPTZ,
-            ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ,
-            ADD COLUMN IF NOT EXISTS last_deferred_attempt INTEGER,
-            ADD COLUMN IF NOT EXISTS delivered_segments JSONB NOT NULL DEFAULT '[]'::jsonb;
+            ADD COLUMN IF NOT EXISTS weixin_recipient_id VARCHAR(255);
         """
     )
     op.execute(
@@ -917,15 +912,10 @@ def downgrade() -> None:
         "ALTER TABLE dalton_channel_inbound_events DROP CONSTRAINT IF EXISTS fk_dalton_inbound_wx_account;"
     )
 
-    # Drop 13 new columns from 4 hot tables
+    # Drop new columns from 4 hot tables
     op.execute(
         """
         ALTER TABLE dalton_channel_deliveries
-            DROP COLUMN IF EXISTS delivered_segments,
-            DROP COLUMN IF EXISTS last_deferred_attempt,
-            DROP COLUMN IF EXISTS next_retry_at,
-            DROP COLUMN IF EXISTS first_deferred_at,
-            DROP COLUMN IF EXISTS defer_count,
             DROP COLUMN IF EXISTS weixin_recipient_id,
             DROP COLUMN IF EXISTS weixin_bot_generation,
             DROP COLUMN IF EXISTS weixin_bot_id,

@@ -107,8 +107,6 @@ AUDIT_DEFAULT_REASONS: dict[str, str] = {
     "disabled_account_reclaimed": "在职成员扫码接管已离职成员释放的微信号",
     "conflict_auto_unbound": "首条消息核验发现微信号已被团队内其他成员关联，自动解除待验证连接",
     "ambiguous_legacy_delivery_blocked": "历史后台运行或投递缺少唯一来源账号与机器人代际，置为 unknown 并阻断外发",
-    "delivery_deferred": "投递因临时错误延迟重试",
-    "delivery_deferred_timeout": "投递延迟重试超过 24 小时上限，自动标记为失败",
 }
 
 COLLECT_MAX_ITEMS = 50

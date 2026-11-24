@@ -1362,6 +1362,12 @@ class InMemoryChannelStore:
                 bool(params[7]),
             )
             prev = self.thread_watches.get(tid)
+            if (
+                prev is not None
+                and "WHERE dalton_channel_thread_watches.platform = EXCLUDED.platform" in norm
+                and str(prev.get("platform") or "").strip().lower() != plat.lower()
+            ):
+                return []
             if len(params) >= 9:
                 p_int_arg = params[8]
                 p_int = p_int_arg.obj if hasattr(p_int_arg, "obj") else p_int_arg
@@ -1398,7 +1404,7 @@ class InMemoryChannelStore:
                 "created_at": (prev or {}).get("created_at") or now,
                 "updated_at": now,
             }
-            return []
+            return [{"platform": plat}] if "RETURNING platform" in norm else []
 
         if "UPDATE dalton_channel_thread_watches SET pending_interrupt = %s" in norm:
             p_int = params[0].obj if hasattr(params[0], "obj") else params[0]
@@ -1482,6 +1488,12 @@ class InMemoryChannelStore:
                 bool(params[7]),
             )
             prev = self.background_runs.get(rid)
+            if (
+                prev is not None
+                and "WHERE dalton_channel_background_runs.platform = EXCLUDED.platform" in norm
+                and str(prev.get("platform") or "").strip().lower() != plat.lower()
+            ):
+                return []
             self.background_runs[rid] = {
                 "run_id": rid,
                 "thread_id": UUID(tid),
@@ -1495,7 +1507,7 @@ class InMemoryChannelStore:
                 "created_at": (prev or {}).get("created_at") or now,
                 "updated_at": now,
             }
-            return []
+            return [{"platform": plat}] if "RETURNING platform" in norm else []
 
         if (
             "FROM dalton_channel_background_runs" in norm
