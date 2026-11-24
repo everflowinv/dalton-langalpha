@@ -15,6 +15,8 @@ import {
 } from "../../shared/safe-fetch.js";
 import {
   type BaseInfo,
+  type GetConfigReq,
+  type GetConfigResp,
   type GetUpdatesReq,
   type GetUpdatesResp,
   type GetUploadUrlReq,
@@ -27,6 +29,8 @@ import {
   type QrCodeStatusResp,
   type SendMessageReq,
   type SendMessageResp,
+  type SendTypingReq,
+  type SendTypingResp,
   SESSION_EXPIRED_ERRCODE,
 } from "./types.js";
 
@@ -557,6 +561,62 @@ export async function sendWeixinMessage(
       ...options.body,
       base_info: options.body.base_info ?? buildBaseInfo(),
     },
+    timeoutMs: options.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
+    signal: options.signal,
+    fetchImpl: options.fetchImpl,
+    allowedDomains: options.allowedDomains,
+    resolveHostIps: options.resolveHostIps,
+    checkResolvedIps: options.checkResolvedIps,
+  });
+}
+
+export async function getWeixinConfig(
+  options: WeixinHttpCommonOptions & {
+    ilinkUserId: string;
+    contextToken?: string;
+  },
+): Promise<GetConfigResp> {
+  const reqBody: GetConfigReq = {
+    ilink_user_id: options.ilinkUserId.trim(),
+    ...(options.contextToken?.trim()
+      ? { context_token: options.contextToken.trim() }
+      : {}),
+    base_info: buildBaseInfo(),
+  };
+  return executeIlinkJsonRequest<GetConfigResp>({
+    method: "POST",
+    endpoint: "ilink/bot/getconfig",
+    baseUrl: options.baseUrl,
+    botToken: options.botToken,
+    bodyObj: reqBody,
+    timeoutMs: options.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
+    signal: options.signal,
+    fetchImpl: options.fetchImpl,
+    allowedDomains: options.allowedDomains,
+    resolveHostIps: options.resolveHostIps,
+    checkResolvedIps: options.checkResolvedIps,
+  });
+}
+
+export async function sendWeixinTyping(
+  options: WeixinHttpCommonOptions & {
+    ilinkUserId: string;
+    typingTicket: string;
+    status: number;
+  },
+): Promise<SendTypingResp> {
+  const reqBody: SendTypingReq = {
+    ilink_user_id: options.ilinkUserId.trim(),
+    typing_ticket: options.typingTicket.trim(),
+    status: options.status,
+    base_info: buildBaseInfo(),
+  };
+  return executeIlinkJsonRequest<SendTypingResp>({
+    method: "POST",
+    endpoint: "ilink/bot/sendtyping",
+    baseUrl: options.baseUrl,
+    botToken: options.botToken,
+    bodyObj: reqBody,
     timeoutMs: options.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
     signal: options.signal,
     fetchImpl: options.fetchImpl,

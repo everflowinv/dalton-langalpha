@@ -4,6 +4,10 @@ import type {
   BackendClient,
   I9WeixinStateGetResponse,
 } from "../../backend-client.js";
+import {
+  createSubsystemLogger,
+  type SubsystemLogger,
+} from "../../shared/logger.js";
 import type { HostIpResolver } from "../../shared/safe-fetch.js";
 import type {
   InboundAttachmentDescriptor,
@@ -15,6 +19,9 @@ import {
   ChannelDeliveryError,
   type CheckTargetLiveResult,
   type DownloadedAttachment,
+  type ProcessingFeedbackContext,
+  type ProcessingFeedbackHandle,
+  type ProcessingFeedbackOutcome,
   type SendFileOptions,
   type SendFileResult,
   type SendTextChunkOptions,
@@ -24,8 +31,11 @@ import {
   type WeixinQrWaitResult,
 } from "../adapter.js";
 import {
+  getWeixinConfig,
   normalizeAndValidateIlinkBaseUrl,
   resolveValidatedRedirectBaseUrl,
+  sendWeixinTyping,
+  WeixinApiError,
 } from "./api.js";
 import { downloadWeixinCdnAttachment } from "./cdn.js";
 import { resolvePersistedAttachmentMeta } from "./inbound.js";
@@ -43,6 +53,7 @@ import {
   ILINK_DEFAULT_BASE_URL,
   ILINK_DEFAULT_BOT_TYPE,
   ILINK_DEFAULT_CDN_BASE_URL,
+  TypingStatus,
 } from "./types.js";
 
 export * from "./types.js";
@@ -55,6 +66,10 @@ export * from "./login-qr.js";
 export * from "./monitor.js";
 
 export const WEIXIN_MAX_CHUNK_CHARS = 2_000;
+export const WEIXIN_TYPING_INTERVAL_MS = 10_000;
+export const WEIXIN_TYPING_MAX_DURATION_MS = 120_000;
+export const WEIXIN_TYPING_TICKET_TTL_MS = 24 * 60 * 60 * 1_000;
+const MAX_CACHED_TYPING_TICKETS = 2_000;
 
 export interface WeixinChannelAdapterOptions {
   backend?: BackendClient;
@@ -71,6 +86,11 @@ export interface WeixinChannelAdapterOptions {
   resolveHostIps?: HostIpResolver;
   checkResolvedIps?: boolean;
   fetchImpl?: typeof fetch;
+  logger?: SubsystemLogger;
+  typingIntervalMs?: number;
+  typingMaxDurationMs?: number;
+  typingTicketTtlMs?: number;
+  nowFn?: () => number;
 }
 
 interface ActiveWeixinAccountState {
@@ -88,6 +108,17 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   readonly maxChunkChars = WEIXIN_MAX_CHUNK_CHARS;
 
   private readonly opts: WeixinChannelAdapterOptions;
+  private readonly logger: SubsystemLogger;
+  private readonly typingIntervalMs: number;
+  private readonly typingMaxDurationMs: number;
+  private readonly typingTicketTtlMs: number;
+  private readonly nowFn: () => number;
+  private readonly typingTicketCache = new Map<
+    string,
+    { ticket: string; cachedAtMs: number }
+  >();
+  private readonly typingSeqByUser = new Map<string, number>();
+  private readonly activeFeedbackCleanups = new Set<() => void>();
   private backend?: BackendClient;
   private account: ActiveWeixinAccountState;
   private started = false;
@@ -107,6 +138,13 @@ export class WeixinChannelAdapter implements ChannelAdapter {
 
   constructor(opts: WeixinChannelAdapterOptions = {}) {
     this.opts = opts;
+    this.logger = opts.logger ?? createSubsystemLogger("weixin");
+    this.typingIntervalMs = opts.typingIntervalMs ?? WEIXIN_TYPING_INTERVAL_MS;
+    this.typingMaxDurationMs =
+      opts.typingMaxDurationMs ?? WEIXIN_TYPING_MAX_DURATION_MS;
+    this.typingTicketTtlMs =
+      opts.typingTicketTtlMs ?? WEIXIN_TYPING_TICKET_TTL_MS;
+    this.nowFn = opts.nowFn ?? (() => Date.now());
     this.backend = opts.backend;
 
     const initialBaseUrl = (opts.baseUrl || ILINK_DEFAULT_BASE_URL).trim();
@@ -231,6 +269,12 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     this.started = false;
     this.monitorRestartPending = false;
     this.pendingRestartEpoch = null;
+    for (const cleanup of [...this.activeFeedbackCleanups]) {
+      cleanup();
+    }
+    this.activeFeedbackCleanups.clear();
+    this.typingTicketCache.clear();
+    this.typingSeqByUser.clear();
     await this.stopMonitorLoop();
     for (const ctrl of [...this.inFlightControllers]) {
       ctrl.abort();
@@ -469,6 +513,10 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       getUpdatesBuf: this.cursorAfterAccountSwitch(sameAccount, incomingCursor),
       status: "active",
     };
+    if (!sameAccount) {
+      this.typingTicketCache.clear();
+      this.typingSeqByUser.clear();
+    }
     await this.ensureSingleMonitorLoop();
   }
 
@@ -568,6 +616,10 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       getUpdatesBuf: nextCursor,
       status: "active",
     };
+    if (!sameAccount) {
+      this.typingTicketCache.clear();
+      this.typingSeqByUser.clear();
+    }
 
     if (needsMonitorRestart && this.started) {
       await this.ensureSingleMonitorLoop();
@@ -685,6 +737,306 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       return currentToken;
     }
     throw missingToken("Missing active Weixin context_token for recipient");
+  }
+
+  private rememberTypingTicket(cacheKey: string, ticket: string): void {
+    if (
+      this.typingTicketCache.size >= MAX_CACHED_TYPING_TICKETS &&
+      !this.typingTicketCache.has(cacheKey)
+    ) {
+      const oldestKey = this.typingTicketCache.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.typingTicketCache.delete(oldestKey);
+      }
+    }
+    this.typingTicketCache.set(cacheKey, {
+      ticket,
+      cachedAtMs: this.nowFn(),
+    });
+  }
+
+  /**
+   * Starts best-effort Weixin iLink typing status (`sendtyping` status=1 start,
+   * renewed every 10s up to 120s, and status=2 on settle). Fetches and caches
+   * `typing_ticket` in memory via `ilink/bot/getconfig` when missing; failures
+   * are logged and skipped without blocking reply delivery.
+   */
+  beginProcessingFeedback(
+    context: ProcessingFeedbackContext,
+  ): ProcessingFeedbackHandle | null {
+    const { event } = context;
+    if (event.chatType === "group") {
+      return null;
+    }
+    if (
+      this.account.status !== "active" ||
+      !this.account.botToken ||
+      !this.account.ilinkBotId
+    ) {
+      return null;
+    }
+    const ilinkUserId = event.platformUserId.trim();
+    if (!ilinkUserId) {
+      return null;
+    }
+
+    const capturedBotId = this.account.ilinkBotId;
+    const capturedGen = this.account.botGeneration;
+    const capturedBaseUrl = this.account.baseUrl;
+    const capturedBotToken = this.account.botToken;
+    const cacheKey = `${capturedBotId}:${capturedGen}:${ilinkUserId}`;
+    const startedAtMs = this.nowFn();
+    const mySeq = (this.typingSeqByUser.get(cacheKey) ?? 0) + 1;
+    this.typingSeqByUser.set(cacheKey, mySeq);
+
+    let settled = false;
+    let typingStarted = false;
+    let activeTicket: string | null = null;
+    let settlePromise: Promise<void> | null = null;
+    let renewTimer: ReturnType<typeof setTimeout> | null = null;
+    let activeRenewalTask: Promise<void> = Promise.resolve();
+
+    const isSameActiveAccount = (): boolean =>
+      this.account.status === "active" &&
+      this.account.ilinkBotId === capturedBotId &&
+      this.account.botGeneration === capturedGen;
+
+    const isCurrentTypingOwner = (): boolean =>
+      this.typingSeqByUser.get(cacheKey) === mySeq;
+
+    const stopTimer = (): void => {
+      if (renewTimer !== null) {
+        clearTimeout(renewTimer);
+        renewTimer = null;
+      }
+      this.activeFeedbackCleanups.delete(stopTimer);
+    };
+
+    const scheduleRenewal = (): void => {
+      if (
+        settled ||
+        !activeTicket ||
+        !isSameActiveAccount() ||
+        !isCurrentTypingOwner()
+      ) {
+        stopTimer();
+        return;
+      }
+      const elapsedMs = this.nowFn() - startedAtMs;
+      if (elapsedMs + this.typingIntervalMs >= this.typingMaxDurationMs) {
+        stopTimer();
+        return;
+      }
+      renewTimer = setTimeout(() => {
+        renewTimer = null;
+        if (
+          settled ||
+          !activeTicket ||
+          !isSameActiveAccount() ||
+          !isCurrentTypingOwner()
+        ) {
+          stopTimer();
+          return;
+        }
+        if (this.nowFn() - startedAtMs >= this.typingMaxDurationMs) {
+          stopTimer();
+          return;
+        }
+        const ticket = activeTicket;
+        const { signal, release } = this.createOperationSignal();
+        const renewalPromise = sendWeixinTyping({
+          baseUrl: capturedBaseUrl,
+          botToken: capturedBotToken,
+          ilinkUserId,
+          typingTicket: ticket,
+          status: TypingStatus.TYPING,
+          signal,
+          fetchImpl: this.opts.fetchImpl,
+          allowedDomains: this.opts.allowedApiDomains,
+          resolveHostIps: this.opts.resolveHostIps,
+          checkResolvedIps: this.opts.checkResolvedIps,
+        })
+          .then(() => {
+            if (!settled && isCurrentTypingOwner()) {
+              scheduleRenewal();
+            }
+          })
+          .catch((err) => {
+            if (err instanceof WeixinApiError && err.kind === "business_error") {
+              this.typingTicketCache.delete(cacheKey);
+            }
+            stopTimer();
+            this.logger.debug("Weixin typing renewal skipped", {
+              ilinkUserId,
+              error: err,
+            });
+          })
+          .finally(() => {
+            release();
+          });
+        activeRenewalTask = renewalPromise;
+        void renewalPromise;
+      }, this.typingIntervalMs);
+      (renewTimer as { unref?: () => void }).unref?.();
+    };
+
+    this.activeFeedbackCleanups.add(stopTimer);
+
+    const startTask = (async () => {
+      const cached = this.typingTicketCache.get(cacheKey);
+      let ticket: string | undefined;
+      if (
+        cached &&
+        this.nowFn() - cached.cachedAtMs < this.typingTicketTtlMs
+      ) {
+        ticket = cached.ticket;
+      } else {
+        let contextToken = event.weixinContextToken?.trim() || undefined;
+        if (!contextToken && this.backend) {
+          try {
+            contextToken = await this.resolveFreshContextToken(
+              ilinkUserId,
+              null,
+              event.messageId,
+            );
+          } catch {
+            // Proceed best-effort without context_token if unavailable.
+          }
+        }
+        if (settled || !isSameActiveAccount() || !isCurrentTypingOwner()) {
+          stopTimer();
+          return;
+        }
+        const { signal, release } = this.createOperationSignal();
+        try {
+          const cfg = await getWeixinConfig({
+            baseUrl: capturedBaseUrl,
+            botToken: capturedBotToken,
+            ilinkUserId,
+            contextToken,
+            signal,
+            fetchImpl: this.opts.fetchImpl,
+            allowedDomains: this.opts.allowedApiDomains,
+            resolveHostIps: this.opts.resolveHostIps,
+            checkResolvedIps: this.opts.checkResolvedIps,
+          });
+          ticket = cfg.typing_ticket?.trim() || undefined;
+          if (ticket) {
+            this.rememberTypingTicket(cacheKey, ticket);
+          } else {
+            stopTimer();
+            this.logger.debug("Weixin getconfig returned no typing_ticket", {
+              ilinkUserId,
+            });
+            return;
+          }
+        } catch (err) {
+          stopTimer();
+          this.logger.debug("Weixin getconfig for typing_ticket failed; skipping", {
+            ilinkUserId,
+            error: err,
+          });
+          return;
+        } finally {
+          release();
+        }
+      }
+
+      if (!ticket || settled || !isSameActiveAccount() || !isCurrentTypingOwner()) {
+        stopTimer();
+        return;
+      }
+
+      const { signal, release } = this.createOperationSignal();
+      try {
+        await sendWeixinTyping({
+          baseUrl: capturedBaseUrl,
+          botToken: capturedBotToken,
+          ilinkUserId,
+          typingTicket: ticket,
+          status: TypingStatus.TYPING,
+          signal,
+          fetchImpl: this.opts.fetchImpl,
+          allowedDomains: this.opts.allowedApiDomains,
+          resolveHostIps: this.opts.resolveHostIps,
+          checkResolvedIps: this.opts.checkResolvedIps,
+        });
+        typingStarted = true;
+        activeTicket = ticket;
+        if (!settled && isCurrentTypingOwner()) {
+          scheduleRenewal();
+        } else {
+          stopTimer();
+        }
+      } catch (err) {
+        stopTimer();
+        if (err instanceof WeixinApiError && err.kind === "business_error") {
+          this.typingTicketCache.delete(cacheKey);
+        }
+        this.logger.debug("Weixin sendtyping(start) skipped", {
+          ilinkUserId,
+          error: err,
+        });
+      } finally {
+        release();
+      }
+    })().catch((err) => {
+      stopTimer();
+      this.logger.warn("Weixin processing feedback start unexpected error", {
+        ilinkUserId,
+        error: err,
+      });
+    });
+
+    return {
+      settle: (_outcome: ProcessingFeedbackOutcome): Promise<void> => {
+        if (settled) {
+          return settlePromise ?? Promise.resolve();
+        }
+        settled = true;
+        stopTimer();
+        settlePromise = (async () => {
+          await startTask;
+          await activeRenewalTask;
+          if (
+            !typingStarted ||
+            !activeTicket ||
+            !isSameActiveAccount() ||
+            !isCurrentTypingOwner()
+          ) {
+            return;
+          }
+          const { signal, release } = this.createOperationSignal();
+          try {
+            await sendWeixinTyping({
+              baseUrl: capturedBaseUrl,
+              botToken: capturedBotToken,
+              ilinkUserId,
+              typingTicket: activeTicket,
+              status: TypingStatus.CANCEL,
+              signal,
+              fetchImpl: this.opts.fetchImpl,
+              allowedDomains: this.opts.allowedApiDomains,
+              resolveHostIps: this.opts.resolveHostIps,
+              checkResolvedIps: this.opts.checkResolvedIps,
+            });
+          } catch (err) {
+            this.logger.warn("Weixin sendtyping(cancel) failed", {
+              ilinkUserId,
+              error: err,
+            });
+          } finally {
+            release();
+          }
+        })().catch((err) => {
+          this.logger.warn("Weixin processing feedback settle error", {
+            ilinkUserId,
+            error: err,
+          });
+        });
+        return settlePromise;
+      },
+    };
   }
 
   async sendTextChunk(

@@ -41,6 +41,8 @@ export interface DiscordRequestOptions {
   priority?: DiscordRequestPriority;
   /** Safe to retry after an ambiguous (timeout/5xx) failure. */
   idempotent?: boolean;
+  /** Optional abort signal to cancel a queued (or in-flight) request early. */
+  signal?: AbortSignal;
 }
 
 interface QueuedRequest {
@@ -50,6 +52,8 @@ interface QueuedRequest {
   data?: unknown;
   query?: DiscordRequestOptions["query"];
   idempotent: boolean;
+  signal?: AbortSignal;
+  cleanupAbort?: () => void;
   routeKey: string;
   enqueuedAt: number;
   generation: number;
@@ -141,6 +145,20 @@ export function createRouteKey(method: string, path: string): string {
   if ((segments[0] === "webhooks" || segments[0] === "interactions") && segments[2]) {
     segments[2] = "[redacted]";
   }
+  // Discord rate-limit buckets are keyed by channel major parameter, not message_id or emoji.
+  // Normalize reaction endpoints so per-message reactions do not accumulate unbounded route mappings.
+  if (
+    segments[0] === "channels" &&
+    segments[1] &&
+    segments[2] === "messages" &&
+    segments[3] &&
+    segments[4] === "reactions"
+  ) {
+    segments[3] = ":message_id";
+    if (segments[5]) {
+      segments[5] = ":emoji";
+    }
+  }
   return `${method.toUpperCase()} /${segments.join("/")}`;
 }
 
@@ -204,6 +222,8 @@ const LANE_SCHEDULE: DiscordRequestPriority[] = [
 ];
 const MAX_QUEUE_SIZE = 1000;
 const MAX_CONCURRENT_WORKERS = 4;
+/** Cap background (reaction/typing status feedback) concurrency so standard/critical requests (including channel/user GETs, replies, and error notices) always have slots. */
+const MAX_BACKGROUND_CONCURRENT_WORKERS = 1;
 const BACKGROUND_STALE_MS = 20_000;
 
 export interface RestSchedulerOptions {
@@ -218,6 +238,7 @@ export class RestScheduler {
   private readonly routeBuckets = new Map<string, string>();
   private globalRateLimitUntil = 0;
   private activeWorkers = 0;
+  private activeBackgroundWorkers = 0;
   private queuedRequests = 0;
   private readonly queuedByLane: Record<DiscordRequestPriority, number> = {
     critical: 0, standard: 0, background: 0,
@@ -225,6 +246,7 @@ export class RestScheduler {
   private laneCursor = 0;
   private queueGeneration = 0;
   private drainTimer: ReturnType<typeof setTimeout> | undefined;
+  private drainTimerAt: number | undefined;
   private readonly maxQueueSize: number;
   private readonly now: () => number;
   private readonly setTimeoutFn: NonNullable<RestSchedulerOptions["setTimeoutFn"]>;
@@ -241,33 +263,69 @@ export class RestScheduler {
   }
 
   get queueSize(): number { return this.queuedRequests; }
+  get routeBucketCount(): number { return this.routeBuckets.size; }
+  get bucketCount(): number { return this.buckets.size; }
 
   enqueue(params: {
     method: string; path: string; priority?: DiscordRequestPriority;
     data?: unknown; query?: DiscordRequestOptions["query"]; idempotent?: boolean;
+    signal?: AbortSignal;
   }): Promise<unknown> {
+    if (params.signal?.aborted) {
+      return Promise.reject(new DiscordQueueError("queue_aborted", "Discord request aborted before dispatch"));
+    }
     if (this.queuedRequests >= this.maxQueueSize) {
       return Promise.reject(new DiscordQueueError("queue_full", "Discord request queue is full"));
     }
     const routeKey = createRouteKey(params.method, params.path);
     const bucket = this.getBucket(this.routeBuckets.get(routeKey) ?? routeKey);
-    const priority = params.priority ?? (params.method.toUpperCase() === "GET" ? "background" : "standard");
+    // Only explicit `"background"` status feedback requests (reactions/typing) share the
+    // single-concurrency background lane; all other requests (including GET /channels/{id}
+    // and GET /users/@me) default to `"standard"` so status requests never block replies or inbound.
+    const priority = params.priority ?? "standard";
     return new Promise<unknown>((resolve, reject) => {
       this.queuedRequests += 1;
       this.queuedByLane[priority] += 1;
-      bucket.pending[priority].push({
+      const queued: QueuedRequest = {
         method: params.method, path: params.path, priority, data: params.data,
         query: params.query, idempotent: params.idempotent ?? params.method.toUpperCase() === "GET",
+        signal: params.signal,
         routeKey, enqueuedAt: this.now(), generation: this.queueGeneration,
         retryCount: 0, resolve, reject,
-      });
+      };
+      if (params.signal) {
+        const onAbort = (): void => {
+          this.cancelQueuedRequest(queued);
+        };
+        params.signal.addEventListener("abort", onAbort, { once: true });
+        queued.cleanupAbort = () => {
+          params.signal?.removeEventListener("abort", onAbort);
+        };
+      }
+      bucket.pending[priority].push(queued);
       this.drainQueues();
     });
   }
 
+  private cancelQueuedRequest(target: QueuedRequest): void {
+    for (const bucket of this.buckets.values()) {
+      const queue = bucket.pending[target.priority];
+      const idx = queue.indexOf(target);
+      if (idx !== -1) {
+        queue.splice(idx, 1);
+        target.cleanupAbort?.();
+        target.cleanupAbort = undefined;
+        this.queuedRequests = Math.max(0, this.queuedRequests - 1);
+        this.queuedByLane[target.priority] = Math.max(0, this.queuedByLane[target.priority] - 1);
+        target.reject(new DiscordQueueError("queue_aborted", "Discord request aborted before dispatch"));
+        return;
+      }
+    }
+  }
+
   clearQueue(): void {
     this.queueGeneration += 1;
-    if (this.drainTimer) { this.clearTimeoutFn(this.drainTimer); this.drainTimer = undefined; }
+    if (this.drainTimer) { this.clearTimeoutFn(this.drainTimer); this.drainTimer = undefined; this.drainTimerAt = undefined; }
     this.rejectPending(new DiscordQueueError("queue_cleared", "Discord request queue cleared"));
   }
 
@@ -280,6 +338,8 @@ export class RestScheduler {
     for (const bucket of this.buckets.values()) {
       for (const lane of PRIORITIES) {
         for (const queued of bucket.pending[lane].splice(0)) {
+          queued.cleanupAbort?.();
+          queued.cleanupAbort = undefined;
           queued.reject(error);
           this.queuedRequests = Math.max(0, this.queuedRequests - 1);
           this.queuedByLane[lane] = Math.max(0, this.queuedByLane[lane] - 1);
@@ -338,13 +398,27 @@ export class RestScheduler {
   }
 
   private scheduleDrain(delayMs: number): void {
-    if (this.drainTimer) return;
-    this.drainTimer = this.setTimeoutFn(() => { this.drainTimer = undefined; this.drainQueues(); }, Math.max(0, delayMs));
+    // Keep the earliest wake-up: a later one set for the status lane must not hold
+    // back a standard request that can go sooner.
+    const at = this.now() + Math.max(0, delayMs);
+    if (this.drainTimer && this.drainTimerAt !== undefined && this.drainTimerAt <= at) return;
+    if (this.drainTimer) this.clearTimeoutFn(this.drainTimer);
+    this.drainTimerAt = at;
+    this.drainTimer = this.setTimeoutFn(() => {
+      this.drainTimer = undefined;
+      this.drainTimerAt = undefined;
+      this.drainQueues();
+    }, Math.max(0, delayMs));
     (this.drainTimer as { unref?: () => void }).unref?.();
   }
 
   private drainQueues(): void {
-    while (this.activeWorkers < MAX_CONCURRENT_WORKERS) {
+    // Status requests (background lane) have a slot of their own and never take one of
+    // the standard slots that replies, notices and lookups use.
+    while (
+      this.activeWorkers < MAX_CONCURRENT_WORKERS ||
+      this.activeBackgroundWorkers < MAX_BACKGROUND_CONCURRENT_WORKERS
+    ) {
       const next = this.takeNext();
       if (!next.queued) {
         if (next.waitMs !== undefined && Number.isFinite(next.waitMs)) this.scheduleDrain(next.waitMs);
@@ -353,7 +427,11 @@ export class RestScheduler {
       const { bucket, queued } = next;
       if (bucket.remaining !== undefined && bucket.remaining > 0) bucket.remaining -= 1;
       bucket.active += 1;
-      this.activeWorkers += 1;
+      if (queued.priority === "background") {
+        this.activeBackgroundWorkers += 1;
+      } else {
+        this.activeWorkers += 1;
+      }
       void this.runQueued(queued, bucket);
     }
   }
@@ -371,11 +449,29 @@ export class RestScheduler {
     for (let offset = 0; offset < LANE_SCHEDULE.length; offset += 1) {
       const lane = LANE_SCHEDULE[(this.laneCursor + offset) % LANE_SCHEDULE.length]!;
       if (this.queuedByLane[lane] <= 0) continue;
+      if (lane === "background" && this.activeBackgroundWorkers >= MAX_BACKGROUND_CONCURRENT_WORKERS) {
+        continue;
+      }
+      if (lane !== "background" && this.activeWorkers >= MAX_CONCURRENT_WORKERS) {
+        continue;
+      }
       for (const bucket of buckets) {
         const queue = bucket.pending[lane];
+        while (queue.length > 0 && queue[0]!.signal?.aborted) {
+          const aborted = queue.shift()!;
+          aborted.cleanupAbort?.();
+          aborted.cleanupAbort = undefined;
+          this.queuedRequests = Math.max(0, this.queuedRequests - 1);
+          this.queuedByLane[lane] = Math.max(0, this.queuedByLane[lane] - 1);
+          aborted.reject(
+            new DiscordQueueError("queue_aborted", "Discord request aborted before dispatch"),
+          );
+        }
         if (lane === "background") {
           while (queue.length > 0 && now - queue[0]!.enqueuedAt > BACKGROUND_STALE_MS) {
             const stale = queue.shift()!;
+            stale.cleanupAbort?.();
+            stale.cleanupAbort = undefined;
             this.queuedRequests = Math.max(0, this.queuedRequests - 1);
             this.queuedByLane[lane] = Math.max(0, this.queuedByLane[lane] - 1);
             stale.reject(
@@ -391,6 +487,8 @@ export class RestScheduler {
         if (waitMs > 0) { nextDelay = Math.min(nextDelay ?? waitMs, waitMs); continue; }
         if (bucket.remaining === 0 && bucket.resetAt <= now) bucket.remaining = bucket.limit;
         const queued = queue.shift()!;
+        queued.cleanupAbort?.();
+        queued.cleanupAbort = undefined;
         this.queuedByLane[lane] = Math.max(0, this.queuedByLane[lane] - 1);
         this.laneCursor = (this.laneCursor + offset + 1) % LANE_SCHEDULE.length;
         return { bucket, queued };
@@ -401,26 +499,61 @@ export class RestScheduler {
 
   private async runQueued(queued: QueuedRequest, bucket: Bucket): Promise<void> {
     let requeued = false;
+    let failed = false;
     try {
+      if (queued.signal?.aborted) {
+        queued.reject(new DiscordQueueError("queue_aborted", "Discord request aborted before dispatch"));
+        return;
+      }
       queued.resolve(await this.executor(queued));
     } catch (error) {
       // A 429 means Discord rejected the request before executing it, so
       // requeueing is safe for any method and reuses the original body/nonce.
-      if (error instanceof RateLimitError && queued.generation === this.queueGeneration && queued.retryCount < MAX_RATE_LIMIT_RETRIES) {
+      if (
+        error instanceof RateLimitError &&
+        !queued.signal?.aborted &&
+        queued.generation === this.queueGeneration &&
+        queued.retryCount < MAX_RATE_LIMIT_RETRIES
+      ) {
         requeued = true;
         const bucketKey = this.routeBuckets.get(queued.routeKey) ?? queued.routeKey;
-        this.getBucket(bucketKey).pending[queued.priority].push({ ...queued, enqueuedAt: this.now(), retryCount: queued.retryCount + 1 });
+        const retried: QueuedRequest = {
+          ...queued,
+          enqueuedAt: this.now(),
+          retryCount: queued.retryCount + 1,
+        };
+        if (retried.signal) {
+          const onAbort = (): void => {
+            this.cancelQueuedRequest(retried);
+          };
+          retried.signal.addEventListener("abort", onAbort, { once: true });
+          retried.cleanupAbort = () => {
+            retried.signal?.removeEventListener("abort", onAbort);
+          };
+        }
+        this.getBucket(bucketKey).pending[queued.priority].push(retried);
         this.queuedByLane[queued.priority] += 1;
         const waitMs = Math.max(0, (error.global ? this.globalRateLimitUntil : bucket.resetAt) - this.now(), error.retryAfter * 1000);
         this.scheduleDrain(waitMs);
         return;
       }
+      failed = true;
       queued.reject(error);
     } finally {
       bucket.active = Math.max(0, bucket.active - 1);
-      this.activeWorkers = Math.max(0, this.activeWorkers - 1);
+      if (queued.priority === "background") {
+        this.activeBackgroundWorkers = Math.max(0, this.activeBackgroundWorkers - 1);
+      } else {
+        this.activeWorkers = Math.max(0, this.activeWorkers - 1);
+      }
       if (!requeued) this.queuedRequests = Math.max(0, this.queuedRequests - 1);
-      this.drainQueues();
+      if (failed && queued.priority === "background") {
+        // Yield one microtask so the caller's `.catch()` (e.g. Discord 404 withdrawal)
+        // can abort queued follow-up background requests before the next one dispatches.
+        queueMicrotask(() => this.drainQueues());
+      } else {
+        this.drainQueues();
+      }
     }
   }
 }
@@ -475,7 +608,7 @@ export class RequestClient {
     this.queueRequests = options.queueRequests ?? true;
     this.fetchImpl = options.fetchImpl;
     this.scheduler = new RestScheduler(
-      async (req) => this.executeRequest(req.method, req.path, { data: req.data, query: req.query }, req.routeKey),
+      async (req) => this.executeRequest(req.method, req.path, { data: req.data, query: req.query, signal: req.signal }, req.routeKey),
       options.schedulerOptions,
     );
   }
@@ -488,20 +621,23 @@ export class RequestClient {
     this.controllers.clear();
   }
 
-  async get(path: string, query?: DiscordRequestOptions["query"]): Promise<unknown> {
+  get(path: string, query?: DiscordRequestOptions["query"]): Promise<unknown> {
     return this.request("GET", path, { query, idempotent: true });
   }
-  async post(path: string, data?: unknown, opts: Omit<DiscordRequestOptions, "data"> = {}): Promise<unknown> {
+  post(path: string, data?: unknown, opts: Omit<DiscordRequestOptions, "data"> = {}): Promise<unknown> {
     return this.request("POST", path, { ...opts, data });
   }
-  async patch(path: string, data?: unknown, opts: Omit<DiscordRequestOptions, "data"> = {}): Promise<unknown> {
+  put(path: string, data?: unknown, opts: Omit<DiscordRequestOptions, "data"> = {}): Promise<unknown> {
+    return this.request("PUT", path, { ...opts, data });
+  }
+  patch(path: string, data?: unknown, opts: Omit<DiscordRequestOptions, "data"> = {}): Promise<unknown> {
     return this.request("PATCH", path, { ...opts, data });
   }
-  async delete(path: string, opts: DiscordRequestOptions = {}): Promise<unknown> {
+  delete(path: string, opts: DiscordRequestOptions = {}): Promise<unknown> {
     return this.request("DELETE", path, opts);
   }
 
-  async request(method: string, path: string, params: DiscordRequestOptions = {}): Promise<unknown> {
+  request(method: string, path: string, params: DiscordRequestOptions = {}): Promise<unknown> {
     const upper = method.toUpperCase();
     if (!this.queueRequests) {
       return this.executeRequest(upper, path, params, createRouteKey(upper, path));
@@ -509,6 +645,7 @@ export class RequestClient {
     return this.scheduler.enqueue({
       method: upper, path, priority: params.priority, data: params.data,
       query: params.query, idempotent: params.idempotent ?? upper === "GET",
+      signal: params.signal,
     });
   }
 
@@ -516,11 +653,16 @@ export class RequestClient {
     method: string, path: string, params: DiscordRequestOptions = {},
     routeKey: string = createRouteKey(method, path),
   ): Promise<unknown> {
+    if (params.signal?.aborted) {
+      throw new DiscordQueueError("queue_aborted", "Discord request aborted before dispatch");
+    }
     const url = `${this.apiBaseUrl}${appendQuery(path, params.query)}`;
     const headers = new Headers({ "User-Agent": "DaltonChannelGateway (discord)" });
     if (this.token && this.token !== "webhook") headers.set("Authorization", `Bot ${this.token}`);
     const body = serializeRequestBody(params.data, headers);
     const controller = new AbortController();
+    const onExternalAbort = (): void => controller.abort();
+    params.signal?.addEventListener("abort", onExternalAbort, { once: true });
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     (timer as { unref?: () => void }).unref?.();
     this.controllers.add(controller);
@@ -553,6 +695,7 @@ export class RequestClient {
       return parsed;
     } finally {
       clearTimeout(timer);
+      params.signal?.removeEventListener("abort", onExternalAbort);
       this.controllers.delete(controller);
     }
   }
