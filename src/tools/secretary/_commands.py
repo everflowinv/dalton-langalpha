@@ -184,11 +184,12 @@ async def verify_workspace_owner(
     if str(ws.get("user_id")) == user_id:
         return None
     # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+    # DALTON-HOOK(colleague-access): gate colleague workspace access on is_dalton_sharing_auth_enabled().
     if not owner_only:
         from fastapi import HTTPException
-        from src.dalton.settings import is_dalton_supabase_auth_enabled
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
 
-        if is_dalton_supabase_auth_enabled():
+        if is_dalton_sharing_auth_enabled():
             from src.dalton.sharing import require_workspace_access
 
             try:
@@ -236,9 +237,10 @@ async def verify_thread_owner(
         owner_id = await get_thread_owner_id(thread_id)
         if owner_id == user_id:
             # --- DALTON-HOOK(colleague-dispatch): begin ---
-            from src.dalton.settings import is_dalton_supabase_auth_enabled
+            # DALTON-HOOK(colleague-access): gate colleague workspace access on is_dalton_sharing_auth_enabled().
+            from src.dalton.settings import is_dalton_sharing_auth_enabled
 
-            if is_dalton_supabase_auth_enabled():
+            if is_dalton_sharing_auth_enabled():
                 from fastapi import HTTPException
                 from src.dalton.sharing import require_workspace_access
 
@@ -281,9 +283,10 @@ async def verify_thread_owner(
         # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id and workspace_id for non-owner thread access checks.
         if not owner_only and owner_id is not None:
             from fastapi import HTTPException
-            from src.dalton.settings import is_dalton_supabase_auth_enabled
+            # DALTON-HOOK(colleague-access): gate colleague thread access on is_dalton_sharing_auth_enabled().
+            from src.dalton.settings import is_dalton_sharing_auth_enabled
 
-            if is_dalton_supabase_auth_enabled():
+            if is_dalton_sharing_auth_enabled():
                 from src.dalton.sharing import require_thread_access
 
                 meta = await get_thread_auth_meta(thread_id)

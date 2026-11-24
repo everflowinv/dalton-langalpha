@@ -92,6 +92,7 @@ from src.dalton.notify.dispatch import (
 from src.dalton.settings import (
     get_configured_pm_user_ids,
     get_data_task_min_free_mem_mb,
+    is_dalton_local_auth_enabled,
     is_data_jobs_enabled,
 )
 from src.server.database.pool import (
@@ -234,16 +235,19 @@ async def check_scheduler_lock(lock_conn: Any) -> None:
 
 
 async def resolve_task_vault_secrets(secret_names: Sequence[str]) -> dict[str, str]:
-    """Fetch decrypted Vault secrets for ``secret_names`` from the primary PM admin (`DALTON_PM_USER_IDS[0]`, §4.4.1)."""
+    """Fetch decrypted Vault secrets for ``secret_names`` from the primary PM admin."""
     names = [str(s).strip() for s in secret_names if str(s).strip()]
     if not names:
         return {}
-    pm_ids = get_configured_pm_user_ids()
-    if not pm_ids:
-        logger.warning("No DALTON_PM_USER_IDS configured; skipping Vault secret fetch for %s", names)
-        return {}
-    pm_user_id = str(pm_ids[0]).strip()
+    if is_dalton_local_auth_enabled():
+        from src.dalton.access_tiers import get_primary_admin_user_id
+
+        pm_user_id = str((await get_primary_admin_user_id()) or "").strip()
+    else:
+        pm_ids = get_configured_pm_user_ids()
+        pm_user_id = str(pm_ids[0]).strip() if pm_ids else ""
     if not pm_user_id:
+        logger.warning("No primary administrator configured; skipping Vault secret fetch for %s", names)
         return {}
     return await get_user_secrets_decrypted(pm_user_id, names=names)
 
@@ -3284,8 +3288,13 @@ async def dispatch_data_task_run_notification(
     automation = build_data_task_notify_automation(job_key)
     data_key = str(automation["automation_id"])
 
-    pm_ids = get_configured_pm_user_ids()
-    pm_user_id = str(pm_ids[0]).strip() if pm_ids else ""
+    if is_dalton_local_auth_enabled():
+        from src.dalton.access_tiers import get_primary_admin_user_id
+
+        pm_user_id = str((await get_primary_admin_user_id()) or "").strip()
+    else:
+        pm_ids = get_configured_pm_user_ids()
+        pm_user_id = str(pm_ids[0]).strip() if pm_ids else ""
 
     await check_scheduler_lock(lock_conn)
     allowed, skip_reason, targets = await evaluate_eligibility_fn(

@@ -614,6 +614,19 @@ def build_dalton_monitor_tool(*, allow_home_workspace: bool = False) -> BaseTool
         if not user_id:
             return _err("缺少当前用户信息（user_id），无法操作监控面板。")
 
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        sharing_auth_enabled = is_dalton_sharing_auth_enabled()
+        if act in ("publish", "update", "republish") and sharing_auth_enabled:
+            from src.dalton.colleague_outbound_guard import (
+                OUTBOUND_GUARD_REFUSAL_MESSAGE,
+                is_run_outbound_blocked,
+            )
+
+            tool_role = "chief_of_staff" if allow_home_workspace else "analyst"
+            if await is_run_outbound_blocked(config, role=tool_role):
+                return _err(OUTBOUND_GUARD_REFUSAL_MESSAGE, code="colleague_outbound_blocked")
+
         clean_path_ctx: str | None = None
         clean_slug_ctx: str | None = None
         try:
@@ -656,6 +669,24 @@ def build_dalton_monitor_tool(*, allow_home_workspace: bool = False) -> BaseTool
                 if not is_company_tier(caller_tier) and current_visibility != "own":
                     return _err(EXTERNAL_SCOPE_FORBIDDEN_MESSAGE)
 
+                # Require explicit owner confirmation if workspace has pending_outbound_confirm
+                mon_ws_id = str(current_mon.get("workspace_id") or "")
+                if sharing_auth_enabled and mon_ws_id:
+                    from src.dalton.colleague_outbound_guard import (
+                        PENDING_CONFIRM_REQUIRED_MESSAGE,
+                        is_workspace_pending_outbound_confirm,
+                    )
+
+                    mon_ws = await db_get_workspace(mon_ws_id)
+                    if (
+                        is_workspace_pending_outbound_confirm(mon_ws)
+                        and user_confirmed_scope is not True
+                    ):
+                        return _err(
+                            PENDING_CONFIRM_REQUIRED_MESSAGE,
+                            code="pending_outbound_confirm",
+                        )
+
                 files_list, page_sha256, snap_err = await _prepare_republish_snapshot(
                     current_mon, user_id, clean_slug
                 )
@@ -666,6 +697,9 @@ def build_dalton_monitor_tool(*, allow_home_workspace: bool = False) -> BaseTool
                     clean_slug,
                     RepublishMonitorRequest(files=files_list, page_sha256=page_sha256),
                     caller_id=user_id,
+                    reject_if_pending_outbound_confirm=(
+                        sharing_auth_enabled and user_confirmed_scope is not True
+                    ),
                 )
                 return _format_monitor_result("republish", detail)
 
@@ -730,6 +764,21 @@ def build_dalton_monitor_tool(*, allow_home_workspace: bool = False) -> BaseTool
                     if not is_company_tier(caller_tier) and existing_visibility != "own":
                         return _err(EXTERNAL_SCOPE_FORBIDDEN_MESSAGE)
 
+                if sharing_auth_enabled:
+                    from src.dalton.colleague_outbound_guard import (
+                        PENDING_CONFIRM_REQUIRED_MESSAGE,
+                        is_workspace_pending_outbound_confirm,
+                    )
+
+                    if (
+                        is_workspace_pending_outbound_confirm(workspace)
+                        and user_confirmed_scope is not True
+                    ):
+                        return _err(
+                            PENDING_CONFIRM_REQUIRED_MESSAGE,
+                            code="pending_outbound_confirm",
+                        )
+
                 if effective_visibility in ("members", "company") and user_confirmed_scope is not True:
                     return _err(SCOPE_CONFIRMATION_REQUIRED_MESSAGE)
 
@@ -781,7 +830,13 @@ def build_dalton_monitor_tool(*, allow_home_workspace: bool = False) -> BaseTool
                 except ValidationError as exc:
                     return _err(f"参数格式有误（{exc.errors()[0].get('msg', 'invalid input')}）。")
 
-                detail = await monitor_service.publish_workspace_monitor(req, caller_id=user_id)
+                detail = await monitor_service.publish_workspace_monitor(
+                    req,
+                    caller_id=user_id,
+                    reject_if_pending_outbound_confirm=(
+                        sharing_auth_enabled and user_confirmed_scope is not True
+                    ),
+                )
                 return _format_monitor_result(
                     "publish",
                     detail,
@@ -874,6 +929,13 @@ def build_dalton_monitor_tool(*, allow_home_workspace: bool = False) -> BaseTool
             )
             return _format_monitor_result("update", detail, note=preserved_members_note)
         except HTTPException as exc:
+            if isinstance(exc.detail, dict) and exc.detail.get("code") == "pending_outbound_confirm":
+                from src.dalton.colleague_outbound_guard import PENDING_CONFIRM_REQUIRED_MESSAGE
+
+                return _err(
+                    str(exc.detail.get("message") or PENDING_CONFIRM_REQUIRED_MESSAGE),
+                    code="pending_outbound_confirm",
+                )
             return _err(_translate_http_error(exc, path=clean_path_ctx, slug=clean_slug_ctx))
         except Exception as exc:
             logger.exception("dalton_monitor action=%s failed with unexpected error", act)

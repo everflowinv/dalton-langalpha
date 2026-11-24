@@ -511,4 +511,8 @@ def build_grok_client(llm: Any, cache_key: str | None = None) -> ChatGrokOpenAI:
     existing_mk["prompt_cache_key"] = session_id
     params["model_kwargs"] = existing_mk
 
+    hold_egress = getattr(llm, "_hold_params_to_egress", None)
+    if callable(hold_egress):
+        hold_egress(params, "openai")
+
     return ChatGrokOpenAI(**params)

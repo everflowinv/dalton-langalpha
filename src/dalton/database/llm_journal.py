@@ -96,6 +96,18 @@ def is_unknown_usage_journal_row(row: Mapping[str, Any]) -> bool:
     return count_unknown_usage_in_row(row) > 0
 
 
+def is_pricing_failed_journal_row(row: Mapping[str, Any]) -> bool:
+    """Return True when a journal or journal-attempt row is marked `pricing_failed=True`."""
+    if not isinstance(row, Mapping):
+        return False
+    if row.get("pricing_failed") is True:
+        return True
+    usage = row.get("usage")
+    if isinstance(usage, Mapping) and usage.get("pricing_failed") is True:
+        return True
+    return False
+
+
 def _is_stale(claimed_at: Any, stale_after_s: int, now_utc: datetime | None = None) -> bool:
     if not isinstance(claimed_at, datetime):
         return False
@@ -740,9 +752,13 @@ def _normalize_attempt_call_records(
             rec_cash = Decimal(str(rec.get("cash_usd") or "0"))
             rec_notional = Decimal(str(rec.get("notional_usd") or "0"))
             raw_u = rec.get("usage")
+            rec_prov = rec.get("provider")
+            rec_btype = rec.get("billing_type")
             normalized.append(
                 {
                     "call_seq": max(1, int(rec.get("call_seq") or idx)),
+                    "provider": str(rec_prov) if isinstance(rec_prov, str) and rec_prov else None,
+                    "billing_type": str(rec_btype) if isinstance(rec_btype, str) and rec_btype else None,
                     "outcome": outcome,
                     "error_kind": rec.get("error_kind"),
                     "usage": dict(raw_u) if isinstance(raw_u, Mapping) else raw_u,
@@ -758,6 +774,8 @@ def _normalize_attempt_call_records(
     return [
         {
             "call_seq": 1,
+            "provider": None,
+            "billing_type": None,
             "outcome": default_outcome,
             "error_kind": default_error_kind,
             "usage": dict(default_usage) if isinstance(default_usage, Mapping) else default_usage,
@@ -898,8 +916,8 @@ async def complete_journal_done(
                         j.scope_ref,
                         j.purpose,
                         j.model_key,
-                        COALESCE(%s::text, j.provider),
-                        COALESCE(%s::text, j.billing_type),
+                        COALESCE(r.provider, %s::text, j.provider),
+                        COALESCE(r.billing_type, %s::text, j.billing_type),
                         r.outcome,
                         r.error_kind,
                         r.usage,
@@ -911,6 +929,8 @@ async def complete_journal_done(
                     FROM dalton_llm_journal j
                     CROSS JOIN jsonb_to_recordset(%s::jsonb) AS r(
                         call_seq INT,
+                        provider TEXT,
+                        billing_type TEXT,
                         outcome TEXT,
                         error_kind TEXT,
                         usage JSONB,
@@ -924,7 +944,9 @@ async def complete_journal_done(
                       ON j.invocation_id = v.inv_id
                     WHERE NOT EXISTS (SELECT 1 FROM already_settled)
                     ON CONFLICT (invocation_id, attempt, call_seq) DO UPDATE
-                    SET outcome = EXCLUDED.outcome,
+                    SET provider = EXCLUDED.provider,
+                        billing_type = EXCLUDED.billing_type,
+                        outcome = EXCLUDED.outcome,
                         error_kind = EXCLUDED.error_kind,
                         usage = EXCLUDED.usage,
                         cash_usd = EXCLUDED.cash_usd,
@@ -1013,6 +1035,8 @@ async def complete_journal_failed(
     usage: dict[str, Any] | None = None,
     cash_usd: Decimal | None = None,
     notional_usd: Decimal | None = None,
+    provider: str | None = None,
+    billing_type: str | None = None,
     stamp_credential_holder: bool = True,
     attempt_usage: dict[str, Any] | None = None,
     usage_known: bool | None = None,
@@ -1098,6 +1122,21 @@ async def complete_journal_failed(
     )
     records_json = json.dumps(records_payload, ensure_ascii=False, default=str)
 
+    provider_update_sql = ""
+    provider_update_params: tuple[Any, ...] = ()
+    attempt_provider_sql = "COALESCE(r.provider, j.provider)"
+    attempt_billing_sql = "COALESCE(r.billing_type, j.billing_type)"
+    attempt_identity_params: tuple[Any, ...] = ()
+    if provider is not None or billing_type is not None:
+        provider_update_sql = (
+            ",\n                        provider = COALESCE(%s, provider)"
+            ",\n                        billing_type = COALESCE(%s, billing_type)"
+        )
+        provider_update_params = (provider, billing_type)
+        attempt_provider_sql = "COALESCE(r.provider, %s::text, j.provider)"
+        attempt_billing_sql = "COALESCE(r.billing_type, %s::text, j.billing_type)"
+        attempt_identity_params = (provider, billing_type)
+
     async def _do_update(c: Any) -> dict[str, Any] | None:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -1109,7 +1148,7 @@ async def complete_journal_failed(
                         error_kind = %s,
                         error_text = %s,
                         cash_usd = COALESCE(cash_usd, 0) + COALESCE(%s, 0),
-                        notional_usd = COALESCE(notional_usd, 0) + COALESCE(%s, 0){usage_sql}
+                        notional_usd = COALESCE(notional_usd, 0) + COALESCE(%s, 0){usage_sql}{provider_update_sql}
                     -- Only the attempt that claimed the row writes it back. A stale
                     -- mark (pending -> indeterminate) keeps the attempt number, so
                     -- that attempt may still settle it; a takeover bumps the attempt
@@ -1147,8 +1186,8 @@ async def complete_journal_failed(
                         j.scope_ref,
                         j.purpose,
                         j.model_key,
-                        j.provider,
-                        j.billing_type,
+                        {attempt_provider_sql},
+                        {attempt_billing_sql},
                         r.outcome,
                         r.error_kind,
                         r.usage,
@@ -1160,6 +1199,8 @@ async def complete_journal_failed(
                     FROM dalton_llm_journal j
                     CROSS JOIN jsonb_to_recordset(%s::jsonb) AS r(
                         call_seq INT,
+                        provider TEXT,
+                        billing_type TEXT,
                         outcome TEXT,
                         error_kind TEXT,
                         usage JSONB,
@@ -1173,7 +1214,9 @@ async def complete_journal_failed(
                       ON j.invocation_id = v.inv_id
                     WHERE NOT EXISTS (SELECT 1 FROM already_settled)
                     ON CONFLICT (invocation_id, attempt, call_seq) DO UPDATE
-                    SET outcome = EXCLUDED.outcome,
+                    SET provider = EXCLUDED.provider,
+                        billing_type = EXCLUDED.billing_type,
+                        outcome = EXCLUDED.outcome,
                         error_kind = EXCLUDED.error_kind,
                         usage = EXCLUDED.usage,
                         cash_usd = EXCLUDED.cash_usd,
@@ -1197,10 +1240,12 @@ async def complete_journal_failed(
                     cash_usd,
                     notional_usd,
                     *usage_params,
+                    *provider_update_params,
                     invocation_id,
                     int(attempt),
                     invocation_id,
                     int(attempt),
+                    *attempt_identity_params,
                     records_json,
                     invocation_id,
                     int(attempt),

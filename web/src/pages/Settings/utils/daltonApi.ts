@@ -475,11 +475,13 @@ export async function runDaltonSystemJobNow(
 }
 
 export type DaltonInviteStatus = 'pending' | 'used' | 'expired' | 'revoked';
+export type DaltonInviteTier = 'admin' | 'internal' | 'external';
 
 export interface DaltonInviteItem {
   invite_id: string;
   status: DaltonInviteStatus;
   status_label?: string;
+  tier?: DaltonInviteTier;
   created_at: string | null;
   expires_at: string | null;
   used_at?: string | null;
@@ -509,6 +511,7 @@ export interface DaltonInviteRedeemResponse {
   ok: boolean;
   username: string;
   email: string;
+  tier?: DaltonInviteTier;
 }
 
 export async function fetchDaltonInvites(): Promise<DaltonInviteListResponse> {
@@ -516,8 +519,11 @@ export async function fetchDaltonInvites(): Promise<DaltonInviteListResponse> {
   return data;
 }
 
-export async function createDaltonInvite(): Promise<DaltonInviteCreateResponse> {
-  const { data } = await api.post<DaltonInviteCreateResponse>('/api/v1/dalton/invites', {});
+export async function createDaltonInvite(
+  tier?: DaltonInviteTier,
+): Promise<DaltonInviteCreateResponse> {
+  const payload = tier ? { tier } : {};
+  const { data } = await api.post<DaltonInviteCreateResponse>('/api/v1/dalton/invites', payload);
   return data;
 }
 

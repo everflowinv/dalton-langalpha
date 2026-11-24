@@ -11,7 +11,9 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { getMarketDataWSUrl } from '../utils/api';
+import { isDaltonLocalAuth } from '@/config/daltonAuth'; // DALTON-HOOK(standalone-core): use short-lived WS tickets in local auth mode
 import { getAccessToken } from '@/lib/authToken';
+import { fetchLocalWsTicket } from '@/lib/dalton/localAuth'; // DALTON-HOOK(standalone-core): mint 60s WS ticket for local auth
 import { writeQuoteFromWs } from '@/lib/quotes';
 import { stockKey, type QuoteRow } from '@/lib/quotes/quoteBatcher';
 import { queryKeys } from '@/lib/queryKeys';
@@ -292,7 +294,24 @@ export default function useMarketDataWS(): UseMarketDataWSReturn {
     if (!mountedRef.current) return;
     const base = getMarketDataWSUrl('stock');
     const sep = base.includes('?') ? '&' : '?';
-    const url = token ? `${base}${sep}token=${token}` : base;
+    // DALTON-HOOK(standalone-core): use short-lived HMAC ticket instead of access JWT in WS query string
+    let url = base;
+    if (isDaltonLocalAuth) {
+      if (!token) {
+        scheduleReconnect();
+        return;
+      }
+      try {
+        const { ticket } = await fetchLocalWsTicket(token);
+        if (!mountedRef.current) return;
+        url = `${base}${sep}ticket=${encodeURIComponent(ticket)}`;
+      } catch {
+        scheduleReconnect();
+        return;
+      }
+    } else if (token) {
+      url = `${base}${sep}token=${token}`;
+    }
 
     let ws;
     try {
@@ -305,7 +324,7 @@ export default function useMarketDataWS(): UseMarketDataWSReturn {
 
     ws.onopen = () => {
       if (!mountedRef.current) { ws.close(); return; }
-      console.info('[WS] connected to', url.replace(/token=[^&]+/, 'token=***'));
+      console.info('[WS] connected to', url.replace(/(token|ticket)=[^&]+/, '$1=***'));
       setConnectionStatus('connected');
       // Derive data level from the WS URL interval param
       const wsInterval = new URL(base, location.origin).searchParams.get('interval') || 'second';

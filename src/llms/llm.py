@@ -651,6 +651,8 @@ class LLM:
     # No hold unless a caller asks for one, including on an instance that was
     # put together without ``__init__``.
     egress_transport: Callable[[str], Any] | None = None
+    # DALTON-HOOK(team-credentials): shared-key clients disable HTTP redirects across all SDKs.
+    follow_redirects: bool = True
 
     @classmethod
     def get_model_config(cls) -> ModelConfig:
@@ -669,6 +671,8 @@ class LLM:
         reasoning_effort: str | None = None,
         *,
         egress_transport: Callable[[str], Any] | None = None,
+        # DALTON-HOOK(team-credentials): disable HTTP redirects on shared-key clients when False.
+        follow_redirects: bool = True,
         **override_params,
     ):
         """
@@ -685,9 +689,12 @@ class LLM:
                 is sent through, given its SDK family ("openai", "anthropic",
                 "gemini" or "openrouter"). None leaves each SDK its own; whether an endpoint
                 needs one is the caller's call, not the factory's.
+            follow_redirects: Whether the client's HTTP transport follows redirects.
+                Defaults to True; set to False for team-shared credentials.
             **override_params: Additional parameters to override defaults.
         """
         self.egress_transport = egress_transport
+        self.follow_redirects = follow_redirects
         self.model_config = self.get_model_config()
         spec = (
             model
@@ -811,6 +818,8 @@ class LLM:
         reasoning_effort: str | None = None,
         *,
         egress_transport: Callable[[str], Any] | None = None,
+        # DALTON-HOOK(team-credentials): disable HTTP redirects on shared-key clients when False.
+        follow_redirects: bool = True,
         **override_params,
     ):
         """
@@ -830,6 +839,7 @@ class LLM:
                 the ladder the config declares, or the one it inherits from the
                 built-in whose name it took.
             egress_transport: See :class:`LLM`.
+            follow_redirects: See :class:`LLM`.
             **override_params: Additional parameters to override defaults.
 
         Returns:
@@ -841,6 +851,7 @@ class LLM:
             base_url_override=base_url_override,
             reasoning_effort=reasoning_effort,
             egress_transport=egress_transport,
+            follow_redirects=follow_redirects,  # DALTON-HOOK(team-credentials)
             **override_params,
         )
         return instance.get_llm(cache_key=cache_key)
@@ -1009,13 +1020,77 @@ class LLM:
                 raise MissingProviderKeyError(f"{self.env_key} environment variable is not set")
         return "EMPTY"
 
+    # DALTON-HOOK(team-credentials): shared dual transport for Gemini no-redirect clients
+    # so google-genai disables aiohttp and enforces follow_redirects=False on both sync & async,
+    # while preserving environment proxy settings (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY).
+    @staticmethod
+    @functools.lru_cache(maxsize=32)
+    def _gemini_no_redirect_transport(client_line: str, proxy_url: str | None = None):
+        import httpx
+        import httpx2
+
+        hx = httpx if client_line == "httpx" else httpx2
+
+        class _SharedDualTransport:
+            def __init__(self) -> None:
+                ssl_context = hx.create_ssl_context(trust_env=True)
+                transport_kwargs: dict[str, Any] = {
+                    "verify": ssl_context,
+                    "trust_env": True,
+                }
+                if proxy_url is not None:
+                    transport_kwargs["proxy"] = proxy_url
+                self._sync = hx.HTTPTransport(**transport_kwargs)
+                self._async = hx.AsyncHTTPTransport(**transport_kwargs)
+
+            def handle_request(self, request):
+                return self._sync.handle_request(request)
+
+            async def handle_async_request(self, request):
+                return await self._async.handle_async_request(request)
+
+            def close(self) -> None:
+                return None
+
+            async def aclose(self) -> None:
+                return None
+
+        return _SharedDualTransport()
+
+    @classmethod
+    def _gemini_no_redirect_client_args(cls, client_line: str) -> dict[str, Any]:
+        """Build Gemini client_args that disable redirects/aiohttp while keeping env proxies."""
+        import httpx
+        import httpx2
+
+        hx = httpx if client_line == "httpx" else httpx2
+        client_args: dict[str, Any] = {
+            "transport": cls._gemini_no_redirect_transport(client_line),
+            "follow_redirects": False,
+            "trust_env": True,
+        }
+        env_proxies = hx._utils.get_environment_proxies()
+        if env_proxies:
+            client_args["mounts"] = {
+                pattern: (
+                    None
+                    if proxy_url is None
+                    else cls._gemini_no_redirect_transport(client_line, proxy_url)
+                )
+                for pattern, proxy_url in env_proxies.items()
+            }
+        return client_args
+
     def _hold_params_to_egress(self, params: dict, family: str) -> None:
         """Send every request of the client ``params`` builds through the egress
         transport. Applied last, so nothing in ``parameters`` can swap it out."""
-        if self.egress_transport is None:
+        # DALTON-HOOK(team-credentials): also disable HTTP redirects across all SDKs
+        # when follow_redirects is False (team-shared BYOK credentials), even outside
+        # platform egress mode.
+        if self.egress_transport is None and self.follow_redirects:
             return
         _drop_connection_params(params, self.model)
-        transport = self.egress_transport(family)
+        transport = self.egress_transport(family) if self.egress_transport is not None else None
         # Redirects are not followed: no model API needs one, and a hop is one
         # more connection for an endpoint to choose.
         if family == "openai":
@@ -1024,19 +1099,27 @@ class LLM:
             # Explicitly, or the field falls back to OPENAI_PROXY, which
             # ChatOpenAI refuses beside a client of its own.
             params["openai_proxy"] = None
-            params["http_client"] = openai.DefaultHttpxClient(
-                transport=transport, follow_redirects=False
-            )
-            params["http_async_client"] = openai.DefaultAsyncHttpxClient(
-                transport=transport, follow_redirects=False
-            )
+            http_kwargs: dict[str, Any] = {"follow_redirects": False}
+            if transport is not None:
+                http_kwargs["transport"] = transport
+            params["http_client"] = openai.DefaultHttpxClient(**http_kwargs)
+            params["http_async_client"] = openai.DefaultAsyncHttpxClient(**http_kwargs)
         elif family == "gemini":
             # One mapping serves both of google-genai's clients, and a transport
             # in it is also what turns off its aiohttp path, which no httpx
             # transport would see.
-            params["client_args"] = {"transport": transport, "follow_redirects": False}
+            if transport is None:
+                line = (
+                    "httpx"
+                    if os.environ.get("GOOGLE_GENAI_HTTP_CLIENT", "").strip().lower() == "httpx"
+                    else "httpx2"
+                )
+                params["client_args"] = self._gemini_no_redirect_client_args(line)
+            else:
+                params["client_args"] = {"transport": transport, "follow_redirects": False}
         elif family == "openrouter":
-            params["http_transports"] = (transport, transport)
+            if transport is not None:
+                params["http_transports"] = (transport, transport)
             params["follow_redirects"] = False
         else:
             raise ValueError(f"No egress hold for SDK family {family!r}")
@@ -1049,7 +1132,9 @@ class LLM:
         so a release that stops caching under these names is refused here rather
         than left to dial on its own.
         """
-        if self.egress_transport is None:
+        # DALTON-HOOK(team-credentials): pre-seed no-redirect httpx clients for
+        # ChatAnthropic when follow_redirects is False even without egress_transport.
+        if self.egress_transport is None and self.follow_redirects:
             return
         import anthropic
 
@@ -1059,18 +1144,22 @@ class LLM:
                     f"{type(llm).__name__}.{name} is not a cached property; "
                     "the egress transport cannot be attached"
                 )
-        transport = self.egress_transport("anthropic")
+        transport = self.egress_transport("anthropic") if self.egress_transport is not None else None
         client_params = llm._client_params
-        http_kwargs = {"timeout": client_params["timeout"]} if "timeout" in client_params else {}
+        http_kwargs: dict[str, Any] = (
+            {"timeout": client_params["timeout"]} if "timeout" in client_params else {}
+        )
         # Not followed, as in ``_hold_params_to_egress``.
         http_kwargs["follow_redirects"] = False
+        if transport is not None:
+            http_kwargs["transport"] = transport
         sync_client = anthropic.Client(
             **client_params,
-            http_client=anthropic.DefaultHttpxClient(transport=transport, **http_kwargs),
+            http_client=anthropic.DefaultHttpxClient(**http_kwargs),
         )
         async_client = anthropic.AsyncClient(
             **client_params,
-            http_client=anthropic.DefaultAsyncHttpxClient(transport=transport, **http_kwargs),
+            http_client=anthropic.DefaultAsyncHttpxClient(**http_kwargs),  # DALTON-HOOK(team-credentials)
         )
         if client_params.get("auth_token"):
             # As ChatAnthropicOAuth does for its own clients: the SDK fills a
@@ -1348,7 +1437,8 @@ class LLM:
         if self.extra_body:
             params.setdefault("model_kwargs", {})["extra_body"] = self.extra_body
 
-        if self.egress_transport is not None:
+        # DALTON-HOOK(team-credentials): drop connection params when redirects are disabled too
+        if self.egress_transport is not None or not self.follow_redirects:
             _drop_connection_params(params, self.model)
 
         # OAuth tokens (sk-ant-oat*) need Authorization: Bearer, not X-Api-Key.

@@ -36,6 +36,9 @@ ENV VITE_DALTON_INVITE_EMAIL_DOMAIN=${VITE_DALTON_INVITE_EMAIL_DOMAIN}
 ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
 ENV DOCS_SITE_ORIGIN=${DOCS_SITE_ORIGIN}
 
+# VITE_DALTON_AUTH is passed as a regular (non-secret) build ARG / ENV above so
+# switching authentication modes invalidates the frontend build cache automatically
+# whenever edge is rebuilt.
 RUN pnpm run build \
     && test -s dist/index.html \
     && test -s dist/version.json \

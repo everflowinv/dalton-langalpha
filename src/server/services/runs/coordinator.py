@@ -505,6 +505,7 @@ class RunCoordinator:
         *,
         status: str = "error",
         metadata: Optional[Dict[str, Any]] = None,
+        no_model_calls: bool = False,  # DALTON-HOOK(budget)
     ) -> Optional[FinalizeResult]:
         """Guarantee-finalize for paths that die between START and execution.
 
@@ -522,6 +523,8 @@ class RunCoordinator:
             metadata=metadata or {},
             errors=[error_message],
             execution_time=(datetime.now(timezone.utc) - handle.started_at).total_seconds(),
+            # DALTON-HOOK(budget): caller explicitly passes no_model_calls (True only before executor handoff; conservative False otherwise).
+            no_model_calls=no_model_calls,
         )
 
         async def _finalize() -> Optional[FinalizeResult]:
@@ -896,6 +899,16 @@ class RunCoordinator:
         workspace_id, user_id = meta.get("workspace_id"), meta.get("user_id")
         if not workspace_id or not user_id:
             return
+        # DALTON-HOOK(colleague-access): skip auto keep_updated for outbound-blocked analyst turns (workspace pending_outbound_confirm was already stamped when the turn entered blocked state)
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        if is_dalton_sharing_auth_enabled():
+            from src.dalton.colleague_outbound_guard import (
+                is_run_row_outbound_blocked,
+            )
+
+            if is_run_row_outbound_blocked(run):
+                return
         try:
             from src.server.services.artifacts.snapshot import keep_updated_after_turn
 

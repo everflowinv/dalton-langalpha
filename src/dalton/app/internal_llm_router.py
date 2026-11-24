@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field, create_model
 from src.dalton.app.channels_router import require_channel_service_token
 from src.dalton.capabilities import CapabilityId, require_capability_dep
 from src.dalton.llm.complete import dalton_complete
-from src.dalton.settings import get_configured_pm_user_ids, get_dalton_config
+from src.dalton.settings import get_dalton_config
 
 logger = logging.getLogger(__name__)
 
@@ -161,15 +161,17 @@ async def internal_llm_complete(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    pm_user_ids = get_configured_pm_user_ids()
-    if not pm_user_ids:
+    from src.dalton.access_tiers import get_primary_admin_user_id
+
+    primary_admin_id = await get_primary_admin_user_id()
+    if not primary_admin_id:
         raise HTTPException(
             status_code=503,
             detail="DALTON_PM_USER_IDS is not configured for internal LLM calls.",
         )
 
     result = await dalton_complete(
-        user_id=pm_user_ids[0],
+        user_id=primary_admin_id,
         system_prompt=payload.system_prompt,
         user_prompt=payload.user_prompt,
         model=requested_model,

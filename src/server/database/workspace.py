@@ -650,6 +650,16 @@ SERVER_OWNED_CONFIG_KEYS = (
 )
 
 
+# DALTON-HOOK(colleague-access): preserve pending_outbound_confirm only when colleague sharing auth is enabled
+def server_owned_config_keys() -> tuple[str, ...]:
+    """Return server-owned config keys for the current deployment."""
+    from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+    if is_dalton_sharing_auth_enabled():
+        return (*SERVER_OWNED_CONFIG_KEYS, "pending_outbound_confirm")
+    return SERVER_OWNED_CONFIG_KEYS
+
+
 async def stamp_computer_sandbox_config(computer_id: str, stamp: Dict[str, Any]) -> None:
     """Record the settings the computer's sandbox was verified under on every live folder.
 
@@ -1238,12 +1248,13 @@ async def update_workspace(
             # A replaced config keeps the row's server-owned keys and never
             # takes the caller's.
             # DALTON-HOOK(historical-duplicate-marker): SERVER_OWNED_CONFIG_KEYS includes dalton_historical_duplicate_of
+            # DALTON-HOOK(colleague-access): include pending_outbound_confirm only when colleague sharing auth is enabled
             config_sql = (
                 "(%s::jsonb - %s::text[]) || COALESCE("
                 "(SELECT jsonb_object_agg(key, value) FROM jsonb_each(config)"
                 " WHERE key = ANY(%s::text[])), '{}'::jsonb)"
             )
-            owned = list(SERVER_OWNED_CONFIG_KEYS)
+            owned = list(server_owned_config_keys())
             config_params = [Json(config), owned, owned]
         if name is not None:
             # A new name ends a backoff a settle left for want of room, as the
@@ -1727,16 +1738,27 @@ async def lock_run_workspace(
     run_metadata: Optional[dict] = None,
 ) -> bool:
     """Serialize admission with deletion and moves across workers until START commits."""
+    # DALTON-HOOK(colleague-access): cross-user analyst START updates workspaces.config in _on_start;
+    # acquire FOR NO KEY UPDATE directly instead of FOR SHARE to avoid FOR SHARE -> FOR NO KEY UPDATE upgrade deadlocks.
+    from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+    _lock_clause = (
+        "FOR NO KEY UPDATE OF w"
+        if is_dalton_sharing_auth_enabled()
+        and isinstance(run_metadata, dict)
+        and bool(run_metadata.get("colleague_outbound_blocked"))
+        else "FOR SHARE OF w"
+    )
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
-            """
+            f"""
             SELECT w.workspace_id, w.user_id, w.status, w.name,
                    COALESCE(t.user_id, w.user_id) AS thread_user_id,
                    t.metadata AS thread_metadata
             FROM workspaces w
             JOIN conversation_threads t ON t.workspace_id = w.workspace_id
             WHERE t.conversation_thread_id = %s
-            FOR SHARE OF w
+            {_lock_clause}
             """,
             (thread_id,),
         )

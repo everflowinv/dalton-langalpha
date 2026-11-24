@@ -26,6 +26,8 @@ from src.utils.cache.throttle import throttle
 from src.server.database.api_keys import (
     get_user_api_keys,
     get_base_url_for_provider,
+    # DALTON-HOOK(team-credentials): read base_url and api_key together in one query for model discovery
+    get_key_and_base_url_for_provider,
     set_byok_enabled,
     upsert_api_key,
     delete_api_key,
@@ -263,12 +265,39 @@ class UpdateApiKeysRequest(BaseModel):
         return v
 
 
-async def _refuse_base_urls(base_urls: Dict[str, Optional[str]]) -> None:
+async def _refuse_base_urls(
+    base_urls: Dict[str, Optional[str]], *, user_id: str | None = None
+) -> dict[str, str]:
     """Refuse, in platform mode, a base URL the server must not dial."""
+    del user_id
     from src.server.services.llm import egress
 
     if not egress.enforced():
-        return
+        return {}
+    # DALTON-HOOK(standalone-core): enforce address-based egress rules (saved team base_url or operator allowlist only; never exempt by identity)
+    from src.dalton.llm.egress_policy import (
+        check_core_endpoint_refusal,
+        get_saved_team_endpoints,
+        is_core_llm_egress_enforced,
+    )
+
+    if is_core_llm_egress_enforced():
+        saved_team = await get_saved_team_endpoints()
+        resolved_classes: dict[str, str] = {}
+        for provider, url in base_urls.items():
+            if not url:
+                continue
+            reason, addr_class = await check_core_endpoint_refusal(
+                url, require_resolution=True, saved_team_endpoints=saved_team
+            )
+            if reason:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Base URL for {provider} cannot be used: {reason}",
+                )
+            if addr_class in ("public", "private"):
+                resolved_classes[url] = addr_class
+        return resolved_classes
     reasons = await egress.save_refusals(base_urls.values())
     for provider, url in base_urls.items():
         if url and reasons[url]:
@@ -276,6 +305,7 @@ async def _refuse_base_urls(base_urls: Dict[str, Optional[str]]) -> None:
                 status_code=400,
                 detail=f"Base URL for {provider} cannot be used: {reasons[url]}",
             )
+    return {}
 
 
 def _get_allowed_providers(custom_providers: list) -> set[str]:
@@ -306,18 +336,22 @@ async def update_api_keys(body: UpdateApiKeysRequest, user_id: CurrentUserId):
     - api_keys: { "openai": "sk-..." } to set, { "openai": null } to delete
     """
     # DALTON-HOOK(team-credentials): validate all credential-admin permissions before any DB or cache writes
+    _base_url_without_key = any(  # DALTON-HOOK(team-credentials)
+        not (body.api_keys and (body.api_keys.get(p) or "").strip())  # DALTON-HOOK(team-credentials)
+        for p in (body.base_urls or {})  # DALTON-HOOK(team-credentials)
+    )  # DALTON-HOOK(team-credentials)
     if (  # DALTON-HOOK(team-credentials)
         body.byok_enabled is False  # DALTON-HOOK(team-credentials)
         or any(not (v or "").strip() for v in (body.api_keys or {}).values())  # DALTON-HOOK(team-credentials)
-        or any(  # DALTON-HOOK(team-credentials)
-            not (body.api_keys and (body.api_keys.get(p) or "").strip())  # DALTON-HOOK(team-credentials)
-            for p in (body.base_urls or {})  # DALTON-HOOK(team-credentials)
-        )  # DALTON-HOOK(team-credentials)
+        or _base_url_without_key  # DALTON-HOOK(team-credentials)
     ):  # DALTON-HOOK(team-credentials)
         from src.dalton.credentials import require_credential_admin  # DALTON-HOOK(team-credentials)
         require_credential_admin(user_id)  # DALTON-HOOK(team-credentials)
     from src.dalton.credentials import require_credential_write_admin  # DALTON-HOOK(team-credentials)
     require_credential_write_admin(user_id)  # DALTON-HOOK(team-credentials)
+    if _base_url_without_key:  # DALTON-HOOK(team-credentials): only the credential holder may modify an existing shared key's base_url
+        from src.dalton.credentials import require_credential_holder  # DALTON-HOOK(team-credentials)
+        require_credential_holder(user_id)  # DALTON-HOOK(team-credentials)
     # Turning keys on, or saving one, is a new connection; removing one is not.
     if body.byok_enabled or any(
         value is not None
@@ -336,8 +370,10 @@ async def update_api_keys(body: UpdateApiKeysRequest, user_id: CurrentUserId):
                 status_code=400,
                 detail=f"Unsupported provider: {provider}.",
             )
+    resolved_url_classes: dict[str, str] = {}
     if body.base_urls:
-        await _refuse_base_urls(body.base_urls)
+        # DALTON-HOOK(standalone-core): check base URLs by address rules and capture resolved address class for team URL pinning
+        resolved_url_classes = await _refuse_base_urls(body.base_urls, user_id=user_id) or {}
 
     # All or nothing, so a failed write leaves the keys as they were.
     redirected: list[str] = []
@@ -372,6 +408,12 @@ async def update_api_keys(body: UpdateApiKeysRequest, user_id: CurrentUserId):
                 # Update base_url on existing key row
                 if await update_base_url(user_id, provider, url, conn=conn):
                     redirected.append(provider)
+
+        # DALTON-HOOK(standalone-core): persist resolved address class (public/private) for saved team base_urls
+        if resolved_url_classes:
+            from src.dalton.llm.egress_policy import record_saved_team_base_url_classes
+
+            await record_saved_team_base_url_classes(resolved_url_classes, conn=conn)
 
     # Invalidate cached BYOK status so the next chat picks up key changes
     await invalidate_byok_cache(user_id)
@@ -451,11 +493,15 @@ class TestApiKeyRequest(BaseModel):
         return key_probe.probe_url(v)
 
 
-async def _user_endpoint_transport(base_url: str | None):
+async def _user_endpoint_transport(
+    base_url: str | None, *, user_id: str | None = None
+):
     """The transport a request to a user's endpoint goes out on; a URL the
     egress policy refuses is a 400."""
+    del user_id
     from src.server.services.llm import egress
 
+    # DALTON-HOOK(standalone-core): address-based egress transport (never exempt by admin identity)
     try:
         return await egress.user_endpoint_transport(base_url)
     except EndpointRefused as e:
@@ -497,7 +543,10 @@ async def test_api_key(body: TestApiKeyRequest, user_id: CurrentUserId):
     if not provider_info:
         provider_info = mc.get_provider_info(custom["parent_provider"])
 
-    transport = await _user_endpoint_transport(body.base_url or provider_info.get("base_url"))
+    # DALTON-HOOK(standalone-core): pass caller user_id for admin team-model egress exemption
+    transport = await _user_endpoint_transport(
+        body.base_url or provider_info.get("base_url"), user_id=user_id
+    )
     try:
         # DALTON-HOOK(standalone-core): keep HeldTransport open across /models, key check, and Core tool probe, closing once at end
         _tp = __import__("src.dalton.llm.tool_probe", fromlist=["core_key_test_transport_scope", "core_key_probe_options", "probe_tool_calling_for_key_test"])
@@ -542,31 +591,52 @@ async def list_provider_models(provider: str, user_id: CurrentUserId):
     if not provider_info.get("dynamic_models"):
         raise HTTPException(status_code=400, detail="Provider does not support dynamic model discovery")
 
-    # Resolve base URL (provider default → user override)
+    # Resolve base URL (provider default → user override) and optional API key in one query
     base_url = (provider_info.get("base_url") or "").replace(
         "{HOST_IP}", HOST_IP,
     )
 
-    # Try to read user's stored base_url override — narrow query, no PGP decrypt
+    # DALTON-HOOK(team-credentials): read base_url and api_key together from the same
+    # row; fail closed on DB/decrypt errors only when reading a team-shared credential
+    # (caller is not the holder), preserving the original fallback for the holder and
+    # deployments without team sharing.
+    from src.dalton.credentials import uses_shared_team_credential
+
+    is_shared = uses_shared_team_credential(user_id)
+    stored = None
     try:
-        override = await get_base_url_for_provider(user_id, provider)
-        if override:
-            base_url = override.replace("{HOST_IP}", HOST_IP)
-    except Exception:
-        pass  # DB not available — use provider defaults
+        stored = await get_key_and_base_url_for_provider(user_id, provider)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if is_shared:
+            logger.error(
+                "list_provider_models failed to read stored credentials for %s: %s",
+                provider,
+                exc,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Failed to read provider credentials from database",
+            ) from exc
+        try:
+            override_only = await get_base_url_for_provider(user_id, provider)
+            if override_only:
+                stored = {"base_url": override_only, "api_key": None}
+        except Exception:
+            pass
+
+    override = (stored or {}).get("base_url")
+    if override:
+        base_url = override.replace("{HOST_IP}", HOST_IP)
+    api_key = (stored or {}).get("api_key") or None
 
     if not base_url:
         raise HTTPException(status_code=400, detail="No base URL configured for provider")
 
-    transport = await _user_endpoint_transport(base_url)
-
-    # Minimal auth — local providers generally don't require it
-    api_key = None
-    try:
-        from src.server.database.api_keys import get_key_for_provider
-        api_key = await get_key_for_provider(user_id, provider)
-    except Exception:
-        pass  # No key available — proceed without auth
+    # DALTON-HOOK(standalone-core): pass caller user_id for admin team-model egress exemption
+    transport = await _user_endpoint_transport(base_url, user_id=user_id)
 
     try:
         return {"models": await pm.local_server_models(base_url, api_key, transport=transport)}
@@ -671,7 +741,8 @@ async def list_endpoint_models(body: EndpointModelsRequest, user_id: CurrentUser
             headers={"Retry-After": "60"},
         )
 
-    transport = await _user_endpoint_transport(body.base_url)
+    # DALTON-HOOK(standalone-core): pass caller user_id for admin team-model egress exemption
+    transport = await _user_endpoint_transport(body.base_url, user_id=user_id)
     return await pm.endpoint_models(body.api_format, body.base_url, body.api_key, transport=transport)
 
 

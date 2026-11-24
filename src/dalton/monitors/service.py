@@ -171,6 +171,8 @@ async def cut_monitor_version(
     artifact: Any | None = None,
     new_owner_user_id: str | None = None,
     verify_public_authority: Any = None,
+    check_pending_outbound_confirm: bool = False,
+    reject_if_pending_outbound_confirm: bool = False,
 ) -> tuple[MonitorRecord, PublishResult | None, bool]:
     """Cut a monitor version atomically with visibility lock re-read, unshare, and run_id dedup."""
     _ = artifact
@@ -188,10 +190,25 @@ async def cut_monitor_version(
         run_id=run_id,
         new_owner_user_id=new_owner_user_id,
         verify_public_authority=verify_public_authority,
+        check_pending_outbound_confirm=check_pending_outbound_confirm,
+        reject_if_pending_outbound_confirm=reject_if_pending_outbound_confirm,
     )
 
 
 def _translate_snapshot_error(exc: Exception) -> HTTPException:
+    from src.dalton.colleague_outbound_guard import (
+        PENDING_CONFIRM_REQUIRED_MESSAGE,
+        WorkspaceAutoPublishPaused,
+    )
+
+    if isinstance(exc, WorkspaceAutoPublishPaused):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "pending_outbound_confirm",
+                "message": PENDING_CONFIRM_REQUIRED_MESSAGE,
+            },
+        )
     if isinstance(exc, artifact_snapshot.SnapshotRefused):
         if exc.code == "file_missing":
             return HTTPException(status_code=404, detail={"code": "file_missing"})
@@ -387,7 +404,11 @@ async def mint_grant_for_monitor(slug: str, *, viewer_id: str) -> dict[str, Any]
 
 
 async def publish_workspace_monitor(
-    payload: PublishMonitorRequest, *, caller_id: str
+    payload: PublishMonitorRequest,
+    *,
+    caller_id: str,
+    allow_clear_pause: bool = False,
+    reject_if_pending_outbound_confirm: bool = False,
 ) -> dict[str, Any]:
     members = await validate_publish_permissions(
         caller_id=caller_id,
@@ -500,9 +521,12 @@ async def publish_workspace_monitor(
             loaded_files=[e.path for e in snap.entries if e.reason == REASON_LOADED],
             left_out_files=[e.path for e in snap.left_out],
             verify_public_authority=_verify_user_is_admin,
+            reject_if_pending_outbound_confirm=reject_if_pending_outbound_confirm,
         )
     except Exception as exc:
-        if existing is not None:
+        from src.dalton.colleague_outbound_guard import WorkspaceAutoPublishPaused
+
+        if existing is not None and not isinstance(exc, WorkspaceAutoPublishPaused):
             await monitor_db.record_monitor_publish_failure(
                 existing.monitor_id, error_message=str(exc)
             )
@@ -510,6 +534,21 @@ async def publish_workspace_monitor(
 
     detail = await _build_monitor_detail_payload(updated_monitor, viewer_id=caller_id)
     detail["cut"] = result.cut
+    # Only explicit web manual publish by the workspace owner may CAS-clear pending_outbound_confirm
+    if allow_clear_pause and str(caller_id) == str(workspace.get("user_id") or ""):
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        if is_dalton_sharing_auth_enabled():
+            from src.dalton.colleague_outbound_guard import clear_pending_outbound_confirm
+
+            clear_res = await clear_pending_outbound_confirm(
+                str(workspace["workspace_id"]),
+                expected_pause_token=payload.confirm_pause_token,
+            )
+            if not clear_res.cleared and clear_res.status != "not_paused":
+                detail["auto_publish_paused"] = True
+                detail["auto_publish_pause_token"] = clear_res.current_pause_token
+                detail["auto_publish_pause_notice"] = clear_res.notice
     return detail
 
 
@@ -588,6 +627,8 @@ async def republish_workspace_monitor(
     payload: RepublishMonitorRequest,
     *,
     caller_id: str,
+    allow_clear_pause: bool = False,
+    reject_if_pending_outbound_confirm: bool = False,
 ) -> dict[str, Any]:
     _require_publishing_enabled()
     monitor = await monitor_db.get_monitor_by_slug(slug)
@@ -639,15 +680,34 @@ async def republish_workspace_monitor(
             left_out_files=[e.path for e in snap.left_out],
             new_owner_user_id=takeover_owner,
             verify_public_authority=_verify_user_is_admin,
+            reject_if_pending_outbound_confirm=reject_if_pending_outbound_confirm,
         )
     except Exception as exc:
-        await monitor_db.record_monitor_publish_failure(
-            monitor.monitor_id, error_message=str(exc)
-        )
+        from src.dalton.colleague_outbound_guard import WorkspaceAutoPublishPaused
+
+        if not isinstance(exc, WorkspaceAutoPublishPaused):
+            await monitor_db.record_monitor_publish_failure(
+                monitor.monitor_id, error_message=str(exc)
+            )
         raise _translate_snapshot_error(exc) from None
 
     detail = await _build_monitor_detail_payload(updated, viewer_id=caller_id)
     detail["cut"] = bool(result.cut) if result is not None else False
+    # Only explicit web manual republish by the workspace owner may CAS-clear pending_outbound_confirm
+    if allow_clear_pause and artifact.workspace_id and str(caller_id) == str(workspace_owner_id):
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        if is_dalton_sharing_auth_enabled():
+            from src.dalton.colleague_outbound_guard import clear_pending_outbound_confirm
+
+            clear_res = await clear_pending_outbound_confirm(
+                str(artifact.workspace_id),
+                expected_pause_token=payload.confirm_pause_token,
+            )
+            if not clear_res.cleared and clear_res.status != "not_paused":
+                detail["auto_publish_paused"] = True
+                detail["auto_publish_pause_token"] = clear_res.current_pause_token
+                detail["auto_publish_pause_notice"] = clear_res.notice
     return detail
 
 
@@ -685,8 +745,45 @@ async def republish_workspace_monitors_after_turn(*, workspace_id: str) -> None:
     if not workspace or workspace.get("status") != "running":
         return
     workspace_owner_id = str(workspace["user_id"])
+    from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+    sharing_auth_enabled = is_dalton_sharing_auth_enabled()
+    if sharing_auth_enabled:
+        from src.dalton.colleague_outbound_guard import (
+            is_workspace_pending_outbound_confirm,
+        )
+
+        if is_workspace_pending_outbound_confirm(workspace):
+            logger.info(
+                "Skipping auto-update for workspace %s monitors: pending_outbound_confirm",
+                workspace_id,
+            )
+            return
 
     for monitor in monitors:
+        if sharing_auth_enabled:
+            from src.dalton.colleague_outbound_guard import (
+                is_workspace_pending_outbound_confirm,
+            )
+
+            try:
+                fresh_ws = await db_get_workspace(workspace_id)
+            except Exception:
+                logger.warning(
+                    "Skipping auto-update for workspace monitor %s (%s): failed to re-read workspace %s",
+                    monitor.slug,
+                    monitor.monitor_id,
+                    workspace_id,
+                    exc_info=True,
+                )
+                continue
+            if not fresh_ws or is_workspace_pending_outbound_confirm(fresh_ws):
+                logger.info(
+                    "Skipping auto-update for workspace monitor %s (%s): pending_outbound_confirm",
+                    monitor.slug,
+                    monitor.monitor_id,
+                )
+                continue
         try:
             if monitor.visibility == "public":
                 if await get_user_tier(monitor.owner_user_id) != "admin":
@@ -718,6 +815,7 @@ async def republish_workspace_monitors_after_turn(*, workspace_id: str) -> None:
                 ],
                 artifact=artifact,
                 verify_public_authority=_verify_user_is_admin,
+                check_pending_outbound_confirm=sharing_auth_enabled,
             )
         except Exception as exc:
             logger.warning(

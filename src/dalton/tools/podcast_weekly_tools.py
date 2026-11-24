@@ -1357,6 +1357,23 @@ def create_podcast_weekly_tools(filesystem_backend: Any = None) -> list[BaseTool
                 out = await _handle_collect(root, backend, video_id, artifacts)
                 return json.dumps(out, ensure_ascii=False)
             if act == "publish_doc":
+                from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+                if is_dalton_sharing_auth_enabled():
+                    from src.dalton.colleague_outbound_guard import (
+                        OUTBOUND_GUARD_REFUSAL_MESSAGE,
+                        is_run_outbound_blocked,
+                    )
+
+                    if await is_run_outbound_blocked(config):
+                        return json.dumps(
+                            {
+                                "ok": False,
+                                "error": "colleague_outbound_blocked",
+                                "message": OUTBOUND_GUARD_REFUSAL_MESSAGE,
+                            },
+                            ensure_ascii=False,
+                        )
                 out = await _handle_publish_doc(root, backend, user_id, video_id, date)
                 return json.dumps(out, ensure_ascii=False)
             if act == "write_artifact":

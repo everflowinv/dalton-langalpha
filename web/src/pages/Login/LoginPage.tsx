@@ -6,7 +6,7 @@ import { useTranslation, Trans } from 'react-i18next';
 import { BrandMark } from '@/components/brand/BrandMark'; // DALTON-HOOK(brand-name)
 import { BRAND_MARK, BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { useAuth } from '../../contexts/AuthContext';
-import { isDaltonAuth, resolveDaltonLoginEmail } from '../../config/daltonAuth'; // DALTON-HOOK(dalton-auth) DALTON-HOOK(invite-signup): restrict login page and resolve username login
+import { isDaltonAuth, isDaltonLocalAuth, resolveDaltonLoginEmail } from '../../config/daltonAuth'; // DALTON-HOOK(dalton-auth) DALTON-HOOK(invite-signup) DALTON-HOOK(standalone-core): restrict login page, resolve username login, support local auth
 import { authErrorMessage, type AuthErrorInfo } from '../../lib/authErrors';
 import { PRIVACY_URL } from '../../config/supportLinks';
 import PasswordInput from './PasswordInput';
@@ -167,8 +167,12 @@ function LoginPage() {
 
   const handleLogin = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    // DALTON-HOOK(invite-signup): append invite email domain when input has no @ in Dalton mode
-    const emailToSubmit = isDaltonAuth ? resolveDaltonLoginEmail(loginEmail) : loginEmail;
+    // DALTON-HOOK(invite-signup) DALTON-HOOK(standalone-core): pass identifier directly in local auth; append invite email domain in Supabase mode
+    const emailToSubmit = isDaltonLocalAuth
+      ? loginEmail.trim()
+      : isDaltonAuth
+        ? resolveDaltonLoginEmail(loginEmail)
+        : loginEmail;
     await runSubmit(() => loginWithEmail(emailToSubmit, loginPassword), 'Login failed');
   };
 
@@ -338,16 +342,19 @@ function LoginPage() {
             <div className="login-page__field">
               <div className="login-page__label-row">
                 <label className="login-page__label">{t('common.password')}</label>
-                <button
-                  type="button"
-                  className="login-page__forgot"
-                  onClick={() => {
-                    setForgotEmail((cur) => cur || loginEmail);
-                    goToView('forgot-password');
-                  }}
-                >
-                  {t('auth.forgotPassword')}
-                </button>
+                {/* DALTON-HOOK(standalone-core): local auth resets passwords via signed-in settings or server CLI */}
+                {!isDaltonLocalAuth && (
+                  <button
+                    type="button"
+                    className="login-page__forgot"
+                    onClick={() => {
+                      setForgotEmail((cur) => cur || loginEmail);
+                      goToView('forgot-password');
+                    }}
+                  >
+                    {t('auth.forgotPassword')}
+                  </button>
+                )}
               </div>
               <PasswordInput
                 value={loginPassword}

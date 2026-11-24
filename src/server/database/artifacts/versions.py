@@ -269,6 +269,18 @@ async def turn_version(
     async with _locked(user_id, artifact_id) as (cur, locked):
         if not locked.follows_turns:
             return PublishResult(locked, locked.latest_seq, False, False)
+        # DALTON-HOOK(colleague-access): skip auto turn_version inside the same transaction if workspace has pending_outbound_confirm
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        if is_dalton_sharing_auth_enabled():
+            from src.dalton.colleague_outbound_guard import (
+                is_workspace_pending_outbound_confirm_in_cur,
+            )
+
+            if await is_workspace_pending_outbound_confirm_in_cur(
+                cur, locked.workspace_id
+            ):
+                return PublishResult(locked, locked.latest_seq, False, False)
         read.check(locked)
         return await _cut(
             cur,
@@ -300,6 +312,19 @@ async def legacy_version(
     async with _locked(user_id, artifact_id) as (cur, locked):
         if not (locked.shared and locked.shared_seq == 0):
             return PublishResult(locked, locked.latest_seq, False, False)
+        # DALTON-HOOK(colleague-access): check pending_outbound_confirm under FOR SHARE in the same commit txn
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        if is_dalton_sharing_auth_enabled():
+            from src.dalton.colleague_outbound_guard import (
+                WorkspaceAutoPublishPaused,
+                is_workspace_pending_outbound_confirm_in_cur,
+            )
+
+            if await is_workspace_pending_outbound_confirm_in_cur(
+                cur, locked.workspace_id
+            ):
+                raise WorkspaceAutoPublishPaused(locked.workspace_id)
         read.check(locked)
         # DALTON-HOOK(legacy-keeps-owner-setting): migration 101 already
         # backfilled the pre-versions links to keep_updated=TRUE, so a

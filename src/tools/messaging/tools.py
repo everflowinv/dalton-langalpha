@@ -505,6 +505,7 @@ async def _send(
     config: RunnableConfig | None,
     tool_call_id: str,
     computers: ComputerReach | None = None,
+    role: AgentRole | None = None,
 ) -> tuple[str, dict[str, Any]]:
     turn = _turn(config)
     if not turn["user_id"]:
@@ -513,6 +514,17 @@ async def _send(
             "unavailable",
             "This turn has no user attached, so there is no one to message.",
         )
+    # DALTON-HOOK(colleague-access): block outbound send_message on restricted analyst turns only
+    from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+    if is_dalton_sharing_auth_enabled():
+        from src.dalton.colleague_outbound_guard import (
+            OUTBOUND_GUARD_REFUSAL_MESSAGE,
+            is_run_outbound_blocked,
+        )
+
+        if await is_run_outbound_blocked(config, role=role):
+            return _refusal("failed", "colleague_outbound_blocked", OUTBOUND_GUARD_REFUSAL_MESSAGE)
     if await _in_shared_workspace(turn):
         return _refusal("failed", "unavailable", f"{_SHARED_REFUSAL} Nothing was sent.")
     text = text or ""
@@ -646,6 +658,7 @@ async def _send_from_workspace(
     new_thread: _NEW_THREAD_ARG = False,
     tool_call_id: Annotated[str, InjectedToolCallId] = "",
 ) -> tuple[str, dict[str, Any]]:
+    # DALTON-HOOK(colleague-access): mark analyst send_message calls for outbound guard
     return await _send(
         text=text,
         files=files,
@@ -655,6 +668,7 @@ async def _send_from_workspace(
         files_workspace_id=None,
         config=config,
         tool_call_id=tool_call_id,
+        role="analyst",
     )
 
 
@@ -705,6 +719,7 @@ def _send_from_home(computers: ComputerReach | None) -> BaseTool:
         new_thread: _NEW_THREAD_ARG = False,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
     ) -> tuple[str, dict[str, Any]]:
+        # DALTON-HOOK(colleague-access): Chief of Staff send_message is unaffected by analyst outbound guard
         return await _send(
             text=text,
             files=files,
@@ -715,6 +730,7 @@ def _send_from_home(computers: ComputerReach | None) -> BaseTool:
             config=config,
             tool_call_id=tool_call_id,
             computers=computers,
+            role="chief_of_staff",
         )
 
     return StructuredTool.from_function(

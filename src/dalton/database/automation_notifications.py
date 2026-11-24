@@ -302,15 +302,11 @@ async def _eligibility(
     if source == "report_delivery_admin_notice":
         if not user_id:
             return False, "missing_user_id"
-        from src.dalton.access_tiers import get_user_tier
-        from src.dalton.settings import get_configured_pm_user_ids
+        from src.dalton.access_tiers import is_admin_user
 
-        pm_ids = set(get_configured_pm_user_ids())
-        is_admin = user_id in pm_ids
+        is_admin = await is_admin_user(user_id)
         if not is_admin and is_admin_fn is not None:
             is_admin = bool(await is_admin_fn(user_id))
-        if not is_admin:
-            is_admin = (await get_user_tier(user_id)) == "admin"
         if not is_admin:
             return False, "not_admin"
         configured = [

@@ -33,6 +33,8 @@ from src.dalton import chat_upload_storage as storage
 from src.dalton import transcription_storage as asr_storage
 from src.dalton.app.chat_uploads import (
     router as chat_uploads_router,
+)
+from src.dalton.app.chat_uploads import (
     sandbox_relay_router,
 )
 from src.dalton.auth import sessions as local_auth_sessions
@@ -723,6 +725,8 @@ class TestSandboxNetworkAndInitScript:
             captured_cfg.update(container_config)
             raise RuntimeError("stop-after-capture")
 
+        from ptc_agent.core.sandbox.providers import docker as docker_provider_mod
+
         mock_get_client = create_autospec(provider._get_client, return_value=object())
         mock_ensure_image = create_autospec(docker_provider_mod.ensure_image, return_value=None)
         mock_start_new = create_autospec(provider._start_new, side_effect=_fake_start_new)
@@ -740,6 +744,8 @@ class TestSandboxNetworkAndInitScript:
     async def test_docker_provider_omits_host_gateway_only_when_core_and_sandbox_network_set(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        from ptc_agent.core.sandbox.providers import docker as docker_provider_mod
+
         async def _capture_host_config() -> dict[str, Any]:
             provider = DockerProvider(DockerConfig(network_mode="sandbox-net"))
             captured: dict[str, Any] = {}
@@ -778,6 +784,8 @@ class TestSandboxNetworkAndInitScript:
     async def test_docker_provider_keeps_host_gateway_in_everflow_profile(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        from ptc_agent.core.sandbox.providers import docker as docker_provider_mod
+
         async def _capture_host_config() -> dict[str, Any]:
             provider = DockerProvider(DockerConfig(network_mode="bridge"))
             captured: dict[str, Any] = {}
@@ -950,6 +958,16 @@ class TestSandboxNetworkAndInitScript:
     def test_init_script_docker_server_version_domain_guard_and_removed_env_file_flag(
         self, tmp_path: Path
     ) -> None:
+        def _parse_env(path: Path) -> dict[str, str]:
+            out: dict[str, str] = {}
+            for raw in path.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip()
+            return out
+
         # 1. --env-file flag is removed
         _, init_removed = self._stage_init_install(tmp_path, "inst-removed-flag")
         res_flag = subprocess.run(
@@ -962,8 +980,20 @@ class TestSandboxNetworkAndInitScript:
         assert res_flag.returncode == 2
         assert "Unknown argument" in res_flag.stderr
 
-        # 2. Public domain with oss auth is rejected with exact message
+        # 2. Public domain automatically configures local auth, strips all assignment variants,
+        #    sets VITE_DALTON_AUTH=local, and leaves no DALTON_ALLOW_DEV_OSS_AUTH line.
         inst_domain, init_domain = self._stage_init_install(tmp_path, "inst-domain")
+        (inst_domain / ".env").write_text(
+            "  export DALTON_AUTH_MODE = oss\n"
+            "DALTON_AUTH_MODE: oss\n"
+            "DALTON_ALLOW_DEV_OSS_AUTH=1\n"
+            "  export   DALTON_ALLOW_DEV_OSS_AUTH : 1\n"
+            "  DOMAIN = old.example.com\n"
+            "export DOMAIN: localhost\n"
+            "  VITE_DALTON_AUTH = oss\n"
+            "# Keep this comment DALTON_AUTH_MODE=oss\n",
+            encoding="utf-8",
+        )
         res_domain = subprocess.run(
             [
                 "bash",
@@ -976,16 +1006,40 @@ class TestSandboxNetworkAndInitScript:
             env=self._make_fake_docker_env(tmp_path, "28.0.1"),
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=30,
         )
-        assert res_domain.returncode != 0
-        assert (
-            "当前核心版是免密单机试用，请先用 localhost 安装；正式对外部署等本地登录（Batch 4b）上线后再配置域名。"
-            in res_domain.stderr
-        )
-        assert not (inst_domain / ".env").exists()
+        assert res_domain.returncode == 0, res_domain.stderr
+        domain_env_text = (inst_domain / ".env").read_text(encoding="utf-8")
+        lines = domain_env_text.splitlines()
+        auth_lines = [
+            ln for ln in lines
+            if not ln.lstrip().startswith("#") and "DALTON_AUTH_MODE" in ln
+        ]
+        dev_oss_lines = [
+            ln for ln in lines
+            if not ln.lstrip().startswith("#") and "DALTON_ALLOW_DEV_OSS_AUTH" in ln
+        ]
+        domain_lines = [
+            ln for ln in lines
+            if not ln.lstrip().startswith("#")
+            and ln.lstrip().removeprefix("export").lstrip().startswith("DOMAIN")
+            and ln.lstrip().removeprefix("export").lstrip()[6:7] in ("=", ":", " ", "\t")
+        ]
+        vite_auth_lines = [
+            ln for ln in lines
+            if not ln.lstrip().startswith("#") and "VITE_DALTON_AUTH" in ln
+        ]
+        assert auth_lines == ["DALTON_AUTH_MODE=local"]
+        assert dev_oss_lines == []
+        assert domain_lines == ["DOMAIN=dalton.example.com"]
+        assert vite_auth_lines == ["VITE_DALTON_AUTH=local"]
+        assert "# Keep this comment DALTON_AUTH_MODE=oss" in lines
+        parsed_pub = _parse_env(inst_domain / ".env")
+        assert parsed_pub["PUBLIC_APP_URL"] == "https://dalton.example.com"
+        assert parsed_pub["SERVER_BASE_URL"] == "https://dalton.example.com"
+        assert parsed_pub["DALTON_INVITE_EMAIL_DOMAIN"] == "team.dalton.example.com"
 
-        # 3. ::1 is allowed as loopback under oss auth
+        # 3. ::1 and localhost keep loopback passwordless trial (DALTON_AUTH_MODE=oss, DALTON_ALLOW_DEV_OSS_AUTH=1)
         inst_v6, init_v6 = self._stage_init_install(tmp_path, "inst-v6")
         res_v6 = subprocess.run(
             [
@@ -1003,41 +1057,58 @@ class TestSandboxNetworkAndInitScript:
         )
         assert res_v6.returncode == 0
         assert (inst_v6 / ".env").is_file()
+        parsed_v6 = _parse_env(inst_v6 / ".env")
+        assert parsed_v6["DALTON_AUTH_MODE"] == "oss"
+        assert parsed_v6["DALTON_ALLOW_DEV_OSS_AUTH"] == "1"
 
-        # 3b. Any non-loopback domain is refused, whatever .env or the shell say,
-        # until Batch 4b writes the local auth mode itself.
-        for name, env_text, shell_mode in (
-            ("inst-shell-supabase", None, "supabase"),
-            ("inst-env-local", "DALTON_AUTH_MODE=local\n", None),
-            ("inst-env-quoted-oss", "DALTON_AUTH_MODE='oss'\n", None),
-            ("inst-env-expansion", "DALTON_AUTH_MODE=${LOCAL}\n", None),
-        ):
-            inst_case, init_case = self._stage_init_install(tmp_path, name)
-            if env_text is not None:
-                (inst_case / ".env").write_text(env_text)
-            case_env = self._make_fake_docker_env(tmp_path, "28.0.1")
-            case_env.pop("DALTON_AUTH_MODE", None)
-            if shell_mode is not None:
-                case_env["DALTON_AUTH_MODE"] = shell_mode
-            res_case = subprocess.run(
-                ["bash", str(init_case), "--non-interactive", "--domain",
-                 "dalton.example.com", "--skip-sandbox-build"],
-                env=case_env, capture_output=True, text=True, timeout=15,
-            )
-            assert res_case.returncode != 0, name
-            assert "免密单机试用" in res_case.stderr, name
+        # 3b. validate_domain_for_auth refuses a public domain when SCRIPT_WROTE_LOCAL_AUTH != 1,
+        #     even if .env already contains DALTON_AUTH_MODE=local.
+        inst_guard, init_guard = self._stage_init_install(tmp_path, "inst-guard")
+        guard_env_file = inst_guard / ".env"
+        guard_env_file.write_text("DALTON_AUTH_MODE=local\nDOMAIN=dalton.example.com\n", encoding="utf-8")
+        guard_script = (
+            "set -euo pipefail\n"
+            f'ENV_FILE="{guard_env_file}"\n'
+            "SCRIPT_WROTE_LOCAL_AUTH=0\n"
+            'err() { printf "ERR: %s\\n" "$1" >&2; }\n'
+            f'eval "$(awk \'/^(get_env_value|count_env_key_assignments|is_loopback_domain|validate_domain_for_auth)\\(\\) \\{{/ {{p=1}} p {{print}} p && /^\\}}/ {{p=0}}\' "{init_guard}")"\n'
+            'validate_domain_for_auth "dalton.example.com"\n'
+        )
+        res_guard_refused = subprocess.run(
+            ["bash", "-c", guard_script],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_guard_refused.returncode != 0
+        assert "DALTON_AUTH_MODE=local" in res_guard_refused.stderr
 
-        # 3c. A public DOMAIN already in .env, with no --domain, is refused too.
+        # And passes ONLY when SCRIPT_WROTE_LOCAL_AUTH=1 and .env has unique local + no dev oss flag
+        res_guard_ok = subprocess.run(
+            ["bash", "-c", guard_script.replace("SCRIPT_WROTE_LOCAL_AUTH=0", "SCRIPT_WROTE_LOCAL_AUTH=1")],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res_guard_ok.returncode == 0, res_guard_ok.stderr
+
+        # 3c. Existing public DOMAIN in .env with no --domain is also normalized cleanly to local auth.
         inst_prev, init_prev = self._stage_init_install(tmp_path, "inst-env-domain")
-        (inst_prev / ".env").write_text("DOMAIN=dalton.example.com\n")
+        (inst_prev / ".env").write_text(
+            "export DOMAIN = dalton.example.com\nDALTON_AUTH_MODE=oss\nDALTON_ALLOW_DEV_OSS_AUTH=1\n",
+            encoding="utf-8",
+        )
         res_prev = subprocess.run(
             ["bash", str(init_prev), "--non-interactive", "--skip-sandbox-build"],
             env=self._make_fake_docker_env(tmp_path, "28.0.1"),
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=30,
         )
-        assert res_prev.returncode != 0
-        assert "免密单机试用" in res_prev.stderr
-        assert "dalton.example.com" in res_prev.stderr
+        assert res_prev.returncode == 0, res_prev.stderr
+        parsed_prev = _parse_env(inst_prev / ".env")
+        assert parsed_prev["DOMAIN"] == "dalton.example.com"
+        assert parsed_prev["DALTON_AUTH_MODE"] == "local"
+        assert parsed_prev["VITE_DALTON_AUTH"] == "local"
+        assert "DALTON_ALLOW_DEV_OSS_AUTH" not in parsed_prev
 
         # 4. Docker server < 28.0 or unreachable fails in --non-interactive
         for ver in ("27.5.1", None):

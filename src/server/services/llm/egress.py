@@ -107,7 +107,12 @@ _SETTINGS_LINK = {"url": "/settings?tab=model", "label": "Open Settings"}
 def enforced() -> bool:
     from src.config import settings
 
-    return settings.HOST_MODE == "platform"
+    if settings.HOST_MODE == "platform":
+        return True
+    # DALTON-HOOK(standalone-core): enforce LLM egress checks in standalone core multi-user mode
+    from src.dalton.llm.egress_policy import is_core_llm_egress_enforced
+
+    return is_core_llm_egress_enforced()
 
 
 def is_operator_endpoint(url: str) -> bool:
@@ -118,6 +123,11 @@ def is_operator_endpoint(url: str) -> bool:
     host, and platform routes because no user key is ever meant for them, so a
     user naming either gets the same check as any other URL.
     """
+    # DALTON-HOOK(standalone-core): allowlist deployer-configured LLM endpoints via DALTON_OPERATOR_LLM_ENDPOINTS
+    from src.dalton.llm.egress_policy import is_operator_allowlisted_endpoint
+
+    if is_operator_allowlisted_endpoint(url):
+        return True
     from src.llms.llm import LLM
 
     return any(
@@ -472,8 +482,9 @@ def _held_transport_class(hx: Any, hc: Any) -> type:
         that does not resolve is a connection error, as it is without this.
         """
 
-        def __init__(self, refused: type[EndpointRefused]) -> None:
+        def __init__(self, refused: type[EndpointRefused], *, ip_policy: str = "public") -> None:  # DALTON-HOOK(standalone-core): support pinned private/allowlist address-class locks
             self._refused = refused
+            self._ip_policy = ip_policy
             self._inner = hc.AnyIOBackend()
 
         async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
@@ -487,7 +498,18 @@ def _held_transport_class(hx: Any, hc: Any) -> type:
                 # gives anyio's connect_tcp.
                 with anyio.fail_after(timeout):
                     try:
-                        ips = await resolve_public_ips(host, port=port, executor=_CONNECT_RESOLVER)
+                        # DALTON-HOOK(standalone-core): pin resolved IPs for team/allowlisted endpoints according to their address-class policy
+                        if self._ip_policy == "public":
+                            ips = await resolve_public_ips(host, port=port, executor=_CONNECT_RESOLVER)
+                        else:
+                            from src.dalton.llm.egress_policy import classify_ips
+
+                            ips = await resolve_public_ips(
+                                host, port=port, allow_non_global=True, executor=_CONNECT_RESOLVER
+                            )
+                            cls = classify_ips(ips)
+                            if cls is None or (self._ip_policy == "private" and cls != "private"):
+                                raise EgressBlockedError(f"egress to {host!r} violates pinned {self._ip_policy} class")
                     except EgressBlockedError as exc:
                         raise refusal(self._refused, host, exc) from exc
                     return await _race(hc, host, _interleaved(ips), connect)
@@ -500,15 +522,25 @@ def _held_transport_class(hx: Any, hc: Any) -> type:
     class SyncBackend(hc.NetworkBackend):
         """:class:`AsyncBackend` for a blocking client."""
 
-        def __init__(self, refused: type[EndpointRefused]) -> None:
+        def __init__(self, refused: type[EndpointRefused], *, ip_policy: str = "public") -> None:  # DALTON-HOOK(standalone-core): support pinned private/allowlist address-class locks
             self._refused = refused
+            self._ip_policy = ip_policy
 
         def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
             # One deadline for the lookup and the race, as on the async side,
             # though a blocking lookup runs to its end, as in httpcore's own.
             started = time.monotonic()
             try:
-                ips = resolve_public_ips_sync(host, port=port)
+                # DALTON-HOOK(standalone-core): pin resolved IPs for team/allowlisted endpoints according to their address-class policy
+                if self._ip_policy == "public":
+                    ips = resolve_public_ips_sync(host, port=port)
+                else:
+                    from src.dalton.llm.egress_policy import classify_ips
+
+                    ips = resolve_public_ips_sync(host, port=port, allow_non_global=True)
+                    cls = classify_ips(ips)
+                    if cls is None or (self._ip_policy == "private" and cls != "private"):
+                        raise EgressBlockedError(f"egress to {host!r} violates pinned {self._ip_policy} class")
             except EgressBlockedError as exc:
                 raise refusal(self._refused, host, exc) from exc
             if timeout is not None:
@@ -548,16 +580,17 @@ def _held_transport_class(hx: Any, hc: Any) -> type:
         can leave open.
         """
 
-        def __init__(self, refused: type[EndpointRefused], *, shared: bool = False) -> None:
+        def __init__(self, refused: type[EndpointRefused], *, shared: bool = False, ip_policy: str = "public") -> None:  # DALTON-HOOK(standalone-core): accept pinned ip_policy
             self._shared = shared
+            self._ip_policy = ip_policy
             ssl_context = hx.create_ssl_context()
             self._sync = attached(
-                hx.HTTPTransport(verify=ssl_context), hc.ConnectionPool, SyncBackend(refused), ssl_context
+                hx.HTTPTransport(verify=ssl_context), hc.ConnectionPool, SyncBackend(refused, ip_policy=ip_policy), ssl_context
             )
             self._async = attached(
                 hx.AsyncHTTPTransport(verify=ssl_context),
                 hc.AsyncConnectionPool,
-                AsyncBackend(refused),
+                AsyncBackend(refused, ip_policy=ip_policy),
                 ssl_context,
             )
 
@@ -582,6 +615,135 @@ def _held_transport_class(hx: Any, hc: Any) -> type:
 
 _HeldHttpx = _held_transport_class(httpx, httpcore)
 _HeldHttpx2 = _held_transport_class(httpx2, httpcore2)
+
+
+# DALTON-HOOK(standalone-core): policy-routing pinned transport that inspects the actual wire request URL and reuses cached pools per (family, IP policy)
+@functools.cache
+def _core_sdk_policy_transport(family: str, ip_policy: str):
+    """Cached shared held transport for one ``(SDK family, ip_policy)`` pair.
+
+    Avoids allocating 3 transports (6 httpcore pools) on every client build in local
+    mode while strictly isolating pools across ``public``, ``private``, and ``any``.
+    """
+    if ip_policy not in ("public", "private", "any"):
+        raise ValueError(f"Unsupported IP policy {ip_policy!r}")
+    if family == "openai":
+        return _HeldHttpx2(_OpenAIEndpointRefused, shared=True, ip_policy=ip_policy)
+    if family == "anthropic":
+        return _HeldHttpx(_AnthropicEndpointRefused, shared=True, ip_policy=ip_policy)
+    if family == "gemini":
+        if os.environ.get("GOOGLE_GENAI_HTTP_CLIENT", "").strip().lower() == "httpx":
+            return _HeldHttpx(EndpointRefused, shared=True, ip_policy=ip_policy)
+        return _HeldHttpx2(EndpointRefused, shared=True, ip_policy=ip_policy)
+    if family == "openrouter":
+        return _HeldHttpx(EndpointRefused, shared=True, ip_policy=ip_policy)
+    raise ValueError(f"No held transport for SDK family {family!r}")
+
+
+# DALTON-HOOK(standalone-core): per-request policy wrapper routing to cached per-policy held transports
+def _policy_transport_class(hx: Any, held_cls: type) -> type:
+    class PolicyHeldTransport(hx.BaseTransport, hx.AsyncBaseTransport):
+        def __init__(
+            self,
+            refused: type[EndpointRefused],
+            *,
+            saved_team_endpoints: Mapping[str, str] | None = None,
+            shared: bool = False,
+            transport_for_policy: Any = None,
+        ) -> None:
+            self._refused = refused
+            self._shared = shared
+            self._saved_team_endpoints = dict(saved_team_endpoints or {})
+            self._transport_for_policy = transport_for_policy
+            self._transports: dict[str, Any] = {}
+
+        def _select(self, request: Any):
+            from src.dalton.llm.egress_policy import ip_policy_for_request_url
+
+            policy = ip_policy_for_request_url(
+                str(request.url),
+                saved_team_endpoints=self._saved_team_endpoints,
+            )
+            if self._transport_for_policy is not None:
+                return self._transport_for_policy(policy)
+            transport = self._transports.get(policy)
+            if transport is None:
+                transport = held_cls(self._refused, shared=self._shared, ip_policy=policy)
+                self._transports[policy] = transport
+            return transport
+
+        def handle_request(self, request):
+            return self._select(request).handle_request(request)
+
+        async def handle_async_request(self, request):
+            return await self._select(request).handle_async_request(request)
+
+        def close(self) -> None:
+            if not self._shared:
+                for t in self._transports.values():
+                    t.close()
+
+        async def aclose(self) -> None:
+            if not self._shared:
+                for t in self._transports.values():
+                    await t.aclose()
+
+    return PolicyHeldTransport
+
+
+_PolicyHeldHttpx = _policy_transport_class(httpx, _HeldHttpx)
+_PolicyHeldHttpx2 = _policy_transport_class(httpx2, _HeldHttpx2)
+
+
+def core_http_transport(saved_team_endpoints: Mapping[str, str] | None = None):
+    """DALTON-HOOK(standalone-core): per-request pinned httpx transport enforcing wire URL & address-class rules."""
+    return _PolicyHeldHttpx(EndpointRefused, saved_team_endpoints=saved_team_endpoints)
+
+
+def core_sdk_transport_factory(saved_team_endpoints: Mapping[str, str] | None = None):
+    """DALTON-HOOK(standalone-core): SDK transport factory pinning all core local-auth model traffic using cached policy transports."""
+    saved_map = dict(saved_team_endpoints or {})
+
+    def _build(family: str):
+        provider_for_policy = functools.partial(_core_sdk_policy_transport, family)
+        if family == "openai":
+            return _PolicyHeldHttpx2(
+                _OpenAIEndpointRefused,
+                saved_team_endpoints=saved_map,
+                shared=True,
+                transport_for_policy=provider_for_policy,
+            )
+        if family == "anthropic":
+            return _PolicyHeldHttpx(
+                _AnthropicEndpointRefused,
+                saved_team_endpoints=saved_map,
+                shared=True,
+                transport_for_policy=provider_for_policy,
+            )
+        if family == "gemini":
+            if os.environ.get("GOOGLE_GENAI_HTTP_CLIENT", "").strip().lower() == "httpx":
+                return _PolicyHeldHttpx(
+                    EndpointRefused,
+                    saved_team_endpoints=saved_map,
+                    shared=True,
+                    transport_for_policy=provider_for_policy,
+                )
+            return _PolicyHeldHttpx2(
+                EndpointRefused,
+                saved_team_endpoints=saved_map,
+                shared=True,
+                transport_for_policy=provider_for_policy,
+            )
+        if family == "openrouter":
+            return _PolicyHeldHttpx(
+                EndpointRefused,
+                saved_team_endpoints=saved_map,
+                shared=True,
+                transport_for_policy=provider_for_policy,
+            )
+        raise ValueError(f"No held transport for SDK family {family!r}")
+
+    return _build
 
 
 @functools.cache
@@ -623,7 +785,26 @@ async def user_endpoint_transport(base_url: str | None):
     ``EndpointRefused`` now, and the rest go out pinned, so a name that
     resolves elsewhere by the time it is dialed cannot carry the request inside.
     """
-    if not enforced() or not base_url or is_operator_endpoint(base_url):
+    if not enforced() or not base_url:
+        return None
+    # DALTON-HOOK(standalone-core): in core local auth, pin ALL endpoints (including team & operator allowlist) to their address class and normalized URL
+    from src.dalton.llm.egress_policy import (
+        check_core_endpoint_refusal,
+        get_saved_team_endpoints,
+        is_core_llm_egress_enforced,
+    )
+
+    if is_core_llm_egress_enforced():
+        saved_team = await get_saved_team_endpoints()
+        reason, _ = await check_core_endpoint_refusal(
+            base_url,
+            require_resolution=True,
+            saved_team_endpoints=saved_team,
+        )
+        if reason:
+            raise EndpointRefused(f"Base URL cannot be used: {reason}")
+        return core_http_transport(saved_team_endpoints=saved_team)
+    if is_operator_endpoint(base_url):
         return None
     reason = await endpoint_refusal(base_url)
     if reason:

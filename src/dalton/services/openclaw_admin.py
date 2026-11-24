@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from src.config.env import _IN_DOCKER
-from src.dalton.settings import get_dalton_settings, get_pm_user_ids_source
+from src.dalton.settings import get_pm_user_ids_source
 
 logger = logging.getLogger(__name__)
 
@@ -258,16 +258,25 @@ async def probe_health(user_id: str | None = None) -> dict[str, Any]:
     was removed with the ``ocb-*`` catalog (OC-5); this no longer calls the
     broker.
     """
+    from src.dalton.access_tiers import is_admin_user
+    from src.dalton.settings import is_dalton_local_auth_enabled
+
     git_sha, git_dirty = get_startup_git_info()
-    pm_ids = get_dalton_settings().pm_user_ids
+    caller_is_pm = bool(
+        user_id and await is_admin_user(user_id, include_config_defaults=True)
+    )
     return {
         "status": "ok",
         "git_sha": git_sha,
         "git_dirty": git_dirty,
         "user_id": user_id,
-        "is_pm": bool(user_id and user_id in pm_ids),
+        "is_pm": caller_is_pm,
         "deployment": _DEPLOYMENT_MODE,
-        "pm_user_ids_source": get_pm_user_ids_source(),
+        "pm_user_ids_source": (
+            "dalton_user_roles"
+            if is_dalton_local_auth_enabled()
+            else get_pm_user_ids_source()
+        ),
     }
 
 

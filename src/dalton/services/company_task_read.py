@@ -761,9 +761,9 @@ def _notify_view(
 
 
 async def _legacy_routes_by_job(def_rows: Sequence[Mapping[str, Any]]) -> dict[str, list[str]]:
-    from src.dalton.settings import get_configured_pm_user_ids
+    from src.dalton.access_tiers import list_admin_user_ids
 
-    pm_ids = get_configured_pm_user_ids()
+    pm_ids = await list_admin_user_ids()
     owners: dict[str, str] = {}
     for row in def_rows:
         if str(row.get("notify_storage_mode") or "") == "task_row":

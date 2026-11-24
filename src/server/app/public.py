@@ -63,6 +63,7 @@ from src.server.services.artifacts import grants as artifact_grants
 from src.server.services.file_grants import grant_prefix, mint_file_grant, seconds_left
 from src.server.services.artifacts.snapshot import (
     LegacyRefused,
+    SnapshotAutoPublishPaused,  # DALTON-HOOK(colleague-access)
     SnapshotUnavailable,
     legacy_snapshot,
 )
@@ -100,6 +101,15 @@ async def _latest_shared_version(artifact: Artifact | None) -> tuple[Artifact, V
             artifact = await legacy_snapshot(artifact)
         except LegacyRefused:
             raise HTTPException(status_code=404, detail=LINK_NOT_FOUND) from None
+        # DALTON-HOOK(colleague-access): return stable 503 error code for paused legacy shared links
+        except SnapshotAutoPublishPaused:
+            logger.warning(
+                f"First version of shared link {artifact.code} paused pending owner confirmation"
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "auto_publish_paused"},
+            ) from None
         except SnapshotUnavailable as e:
             logger.warning(
                 f"First version of shared link {artifact.code} unavailable: "

@@ -431,6 +431,15 @@ async def test_db_pool(test_db_uri):
     yields the pool, then tears down by truncating all tables.
     """
     import psycopg
+    from psycopg.conninfo import conninfo_to_dict
+
+    # DALTON-HOOK(budget): parse effective libpq dbname via psycopg and verify it ends with `_test` before connecting.
+    conn_params = conninfo_to_dict(test_db_uri)
+    db_name = str(conn_params.get("dbname") or "")
+    if not db_name.endswith("_test"):
+        raise RuntimeError(
+            f"Refusing to run integration DB setup against non-test database: {db_name!r} (must end with '_test')"
+        )
 
     # Nuke the whole schema for a clean slate before migrations. A named
     # drop-list goes stale every time a migration adds a table (it silently
@@ -442,6 +451,20 @@ async def test_db_pool(test_db_uri):
         test_db_uri, autocommit=False
     ) as conn:
         async with conn.cursor() as cur:
+            # DALTON-HOOK(budget): verify actual connected database via current_database() before dropping public schema.
+            await cur.execute("SELECT current_database()")
+            row = await cur.fetchone()
+            actual_db = (
+                row["current_database"]
+                if isinstance(row, dict)
+                else (row[0] if row else None)
+            )
+            if isinstance(actual_db, (bytes, bytearray)):
+                actual_db = actual_db.decode("utf-8", "replace")
+            if not isinstance(actual_db, str) or not actual_db.endswith("_test"):
+                raise RuntimeError(
+                    f"Refusing to DROP SCHEMA public against non-test database: {actual_db!r} (must end with '_test')"
+                )
             await cur.execute("DROP SCHEMA public CASCADE")
             await cur.execute("CREATE SCHEMA public")
         await conn.commit()

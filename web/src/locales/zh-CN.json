@@ -155,7 +155,31 @@
       "statusExpired": "已过期",
       "statusRevoked": "已撤销",
       "revokeTitle": "撤销邀请链接？",
-      "revokeConfirm": "撤销后该邀请链接将立即失效，未注册的受邀人将无法再使用它加入团队。"
+      "revokeConfirm": "撤销后该邀请链接将立即失效，未注册的受邀人将无法再使用它加入团队。",
+      "tierLabel": "邀请等级",
+      "tierAdmin": "管理员",
+      "tierInternal": "内部成员",
+      "tierExternal": "外部成员"
+    },
+    "bootstrap": {
+      "title": "创建首位管理员",
+      "subtitle": "填写部署配置中的自举口令，创建首位本地管理员账号；完成后该页面自动关闭。",
+      "tokenLabel": "自举口令",
+      "tokenPlaceholder": "粘贴部署环境变量中的 BOOTSTRAP_SETUP_TOKEN",
+      "tokenRequired": "请填写自举口令。",
+      "emailRequired": "请填写有效的邮箱地址。",
+      "usernameLabel": "用户名（可选）",
+      "nameLabel": "显示名称（可选）",
+      "submit": "创建管理员并登录",
+      "submitting": "正在创建管理员…",
+      "failed": "创建管理员失败，请检查口令与输入信息后重试。"
+    },
+    "changePassword": {
+      "title": "修改密码",
+      "subtitle": "更新本地账号的登录密码，保存后请使用新密码重新登录。",
+      "currentPassword": "当前密码",
+      "saved": "密码已更新。",
+      "failed": "密码更新失败，请检查当前密码后重试。"
     },
     "feishuScopes": {
       "title": "飞书文档访问范围",
@@ -2559,6 +2583,8 @@
     "unavailableSignInBody": "如果这是你的链接，请登录后打开。",
     "loadFailedTitle": "无法加载此链接",
     "loadFailedBody": "加载过程中出了点问题，请稍后重试。",
+    "pausedTitle": "暂不可用，请稍后再试",
+    "pausedBody": "页面正在等待所有者确认最新内容后更新，请稍后再试。",
     "retry": "重试",
     "signIn": "登录",
     "goToLangAlpha": "前往 {{brand}}",
@@ -9845,6 +9871,7 @@
       "membersRequired": "请至少选择一位公司成员",
       "keepUpdated": "文件更新后自动更新",
       "keepUpdatedHint": "研究助手每轮对话结束发现文件变化时自动发布新版本",
+      "autoPublishPausedHint": "自动发布已暂停：本工作区读过同事的内容。请核对文件与可见范围，点「{{action}}」后恢复自动发布。",
       "externalOwnOnlyHint": "外部成员仅支持发布为“仅自己”可见",
       "nonAdminPublicDowngradeHint": "你没有公开权限，发布后可见范围会改为全公司",
       "publicConfirmTitle": "确认公开发布？",

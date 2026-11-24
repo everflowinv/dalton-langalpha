@@ -721,6 +721,16 @@ async def astream_ptc_workflow(
                         or run_metadata["subscription_fallback"].get("execution_id")
                     )
 
+                # DALTON-HOOK(colleague-access): cross-user analyst turns immediately pause workspace auto-publish inside the START transaction
+                from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+                _is_cross_user_analyst = bool(
+                    is_dalton_sharing_auth_enabled()
+                    and route.role == "analyst"
+                    and workspace_owner_id
+                    and str(workspace_owner_id) != str(user_id)
+                )
+
                 # DALTON-HOOK(automation-continuation-identity): take over firing inside START txn after FOR UPDATE lock on execution
                 async def _on_start(conn) -> None:
                     if turn_attachments:
@@ -742,6 +752,19 @@ async def astream_ptc_workflow(
                         await mark_execution_subscription_fallback(
                             str(_fb_exec_id), conn=conn
                         )
+                    # DALTON-HOOK(colleague-access): atomically stamp pending_outbound_confirm on workspace before START commits
+                    if _is_cross_user_analyst and workspace_id:
+                        from src.dalton.colleague_outbound_guard import (
+                            mark_workspace_pending_outbound_confirm,
+                        )
+
+                        marked = await mark_workspace_pending_outbound_confirm(
+                            workspace_id, run_id=run_id, conn=conn
+                        )
+                        if not marked:
+                            raise RuntimeError(
+                                f"Failed to persist pending_outbound_confirm for workspace {workspace_id}"
+                            )
 
                 # Before START, which writes an edited or regenerated turn's query
                 # row anew, without the origin that tells whether a person typed it.
@@ -787,11 +810,25 @@ async def astream_ptc_workflow(
                         **identity.stamp(run_metadata),
                         # DALTON-HOOK(agent-switch-model): persist retried_origin on retry run row so retry-of-retry preserves it
                         **({"retried_origin": retried_origin} if retried_origin else {}),
+                        # DALTON-HOOK(colleague-access): persist agent_role and initial cross-user analyst outbound guard flag
+                        "agent_role": route.role,
+                        **(
+                            {"colleague_outbound_blocked": True}
+                            if _is_cross_user_analyst
+                            else {}
+                        ),
                     },
                     in_start=home.in_start(
                         user_id,
                         run_id,
-                        _on_start if (turn_attachments or firing or _fb_exec_id) else None,
+                        _on_start
+                        if (
+                            turn_attachments
+                            or firing
+                            or _fb_exec_id
+                            or _is_cross_user_analyst
+                        )
+                        else None,
                     ),
                     runs_in=home.moved_off,
                 )
@@ -1229,6 +1266,11 @@ async def astream_ptc_workflow(
         # LangSmith Tracing Configuration
         # =====================================================================
 
+        # DALTON-HOOK(colleague-access): only engage cross-user analyst outbound guard when colleague sharing auth is enabled
+        from src.dalton.settings import (
+            is_dalton_sharing_auth_enabled as _is_colleague_sharing_auth_enabled,
+        )
+
         # DALTON-HOOK(colleague-dispatch): stamp turn_admitted_workspace_id and workspace_owner_id in configurable
         extra_configurable = {
             **(extra_configurable or {}),
@@ -1238,6 +1280,16 @@ async def astream_ptc_workflow(
             **({"tail_turn_no_new_work": True} if tail_turn_no_new_work else {}),
             # DALTON-HOOK(agent-switch-model): forward retried_origin into configurable for switch_thread_model
             **({"retried_origin": retried_origin} if retried_origin else {}),
+            # DALTON-HOOK(colleague-access): forward agent_role and initial cross-user analyst outbound guard flag
+            "agent_role": route.role,
+            **(
+                {"colleague_outbound_blocked": True}
+                if _is_colleague_sharing_auth_enabled()
+                and route.role == "analyst"
+                and workspace_owner_id
+                and str(workspace_owner_id) != str(user_id)
+                else {}
+            ),
         }
         graph_config = build_graph_config(
             thread_id=thread_id,

@@ -14,7 +14,8 @@
  */
 import type { Session } from '@supabase/supabase-js';
 import { isPlatformMode } from '../config/hostMode';
-import { isDaltonAuth } from '../config/daltonAuth'; // DALTON-HOOK(dalton-auth): attach Supabase token when Dalton auth is enabled
+import { isDaltonLocalAuth, isDaltonSupabaseAuth } from '../config/daltonAuth'; // DALTON-HOOK(standalone-core): route local auth to in-memory token + cookie refresh
+import { localRefresh, parseJwtSubject } from './dalton/localAuth';
 import { tokenEndpointCooldownRemainingMs } from './authCooldown';
 import { supabase } from './supabase';
 import { setStorageUser } from './userStorage';
@@ -92,6 +93,40 @@ let lastForceAt = 0;
  * renewal paths' own result coming back, and fencing that would discard it.
  */
 let generation = 0;
+// DALTON-HOOK(standalone-core): callback invoked when local cookie refresh returns 401
+let localAuthExpiredHandler: (() => void) | null = null;
+
+export function setLocalAuthExpiredHandler(handler: (() => void) | null): void {
+  localAuthExpiredHandler = handler;
+}
+
+/**
+ * Store a standalone local-auth access token strictly in memory (never in Web Storage).
+ */
+// DALTON-HOOK(standalone-core): allow clearing local token with optional userId
+export function publishLocalToken(
+  token: string | null,
+  userId: string | null = null,
+  expiresInSeconds?: number,
+): void {
+  if ((userId ?? null) !== currentUserId()) generation += 1;
+  if (!token) {
+    cache = { status: 'signed-out' };
+    setStorageUser(null);
+    return;
+  }
+  const ttlMs = typeof expiresInSeconds === 'number' && expiresInSeconds > 0
+    ? expiresInSeconds * 1000
+    : 15 * 60 * 1000;
+  cache = {
+    status: 'token',
+    token,
+    userId,
+    expiresAtMs: Date.now() + ttlMs,
+    stampedAt: Date.now(),
+  };
+  setStorageUser(userId);
+}
 
 /**
  * The auth client, but only in the mode that has one.
@@ -104,8 +139,9 @@ let generation = 0;
  * (web/AGENTS.md).
  */
 function authClient() {
-  // DALTON-HOOK(dalton-auth): read session from Supabase client when Dalton auth is enabled
-  return isPlatformMode || isDaltonAuth ? supabase : null;
+  // DALTON-HOOK(dalton-auth): read session from Supabase client when Dalton Supabase auth is enabled
+  // DALTON-HOOK(standalone-core): local auth mode never reads the Supabase client
+  return isPlatformMode || isDaltonSupabaseAuth ? supabase : null;
 }
 
 function currentUserId(): string | null {
@@ -264,7 +300,43 @@ function publishIfCurrent(session: Session | null, startedAt: number): void {
  * ours, so a token this module calls stale is one auth-js has already renewed
  * by the time it answers.
  */
+async function renewLocalFromCookie(
+  startedAt: number,
+  startedFor: string | null,
+): Promise<string | null> {
+  try {
+    const refreshed = await localRefresh();
+    if (generation !== startedAt) return null;
+    if (!refreshed?.access_token) {
+      clearAuthToken();
+      localAuthExpiredHandler?.();
+      return null;
+    }
+    const parsedSub = parseJwtSubject(refreshed.access_token);
+    if (!parsedSub || (startedFor !== null && parsedSub !== startedFor)) {
+      clearAuthToken();
+      localAuthExpiredHandler?.();
+      return null;
+    }
+    publishLocalToken(refreshed.access_token, parsedSub, refreshed.expires_in);
+    lastRenewAt = Date.now();
+    return tokenIfStill(startedFor);
+  } catch {
+    lastRenewAt = Date.now();
+    return null;
+  }
+}
+
 async function renewFromStorage(): Promise<string | null> {
+  // DALTON-HOOK(standalone-core): refresh local access token from HttpOnly cookie
+  if (isDaltonLocalAuth) {
+    if (cache.status === 'signed-out') return null;
+    if (withinFloor(lastRenewAt, MIN_RENEW_INTERVAL_MS)) return heldToken();
+    const startedAt = generation;
+    const startedFor = currentUserId();
+    const renewed = await renewLocalFromCookie(startedAt, startedFor);
+    return renewed ?? heldToken();
+  }
   const sb = authClient();
   if (!sb) return null;
   // Nobody is signed in. Reading storage would confirm that at the cost of a
@@ -297,6 +369,16 @@ async function renewFromStorage(): Promise<string | null> {
  * dead token is deliberate: the caller is a 401 retry.
  */
 async function forceRefresh(refused: string | null): Promise<string | null> {
+  // DALTON-HOOK(standalone-core): single-flight cookie refresh on 401 in local auth mode
+  if (isDaltonLocalAuth) {
+    if (cache.status === 'signed-out') return null;
+    if (withinFloor(lastForceAt, MIN_FORCE_INTERVAL_MS)) return null;
+    lastForceAt = Date.now();
+    const startedAt = generation;
+    const startedFor = currentUserId();
+    const token = await renewLocalFromCookie(startedAt, startedFor);
+    return token && token !== refused ? token : null;
+  }
   const sb = authClient();
   if (!sb || tokenEndpointCooldownRemainingMs() > 0) return null;
   // Nobody is signed in, so there is nothing to rotate. The read path already
@@ -451,6 +533,12 @@ export function refreshAccessToken(refused: string | null): Promise<string | nul
  * Empty when there is no token, so an unauthenticated call sends no header
  * rather than an empty one.
  */
+// DALTON-HOOK(standalone-core): local sign-in calls that already hold their token build the header here too
+/** The Bearer header for a token a caller already holds, kept beside the cache's own. */
+export function bearerHeaderFor(token: string): Record<string, string> {
+  return { Authorization: `Bearer ${token}` };
+}
+
 export async function getAuthHeaders(): Promise<Record<string, string>> {
   const token = await getAccessToken();
   return token ? { Authorization: `Bearer ${token}` } : {};

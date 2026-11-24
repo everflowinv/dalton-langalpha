@@ -157,6 +157,7 @@ class PublishMonitorRequest(BaseModel):
     loaded: list[str] = Field(default_factory=list)
     earlier: list[str] = Field(default_factory=list)
     page_sha256: str | None = None
+    confirm_pause_token: str | None = Field(default=None, max_length=128)
 
 
 class UpdateMonitorRequest(BaseModel):
@@ -182,6 +183,7 @@ class RepublishMonitorRequest(BaseModel):
     loaded: list[str] = Field(default_factory=list)
     earlier: list[str] = Field(default_factory=list)
     page_sha256: str | None = None
+    confirm_pause_token: str | None = Field(default=None, max_length=128)
 
 
 class MonitorDataPutRequest(BaseModel):

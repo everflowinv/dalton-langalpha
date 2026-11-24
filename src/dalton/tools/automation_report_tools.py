@@ -112,6 +112,16 @@ def create_automation_report_tools() -> list[BaseTool]:
                 "invalid_action",
                 "action must be submit or status.",
             )
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        if is_dalton_sharing_auth_enabled():
+            from src.dalton.colleague_outbound_guard import (
+                OUTBOUND_GUARD_REFUSAL_MESSAGE,
+                is_run_outbound_blocked,
+            )
+
+            if await is_run_outbound_blocked(config):
+                return _refuse("submit", "colleague_outbound_blocked", OUTBOUND_GUARD_REFUSAL_MESSAGE)
         if not isinstance(material, str):
             return _refuse(
                 "submit",

@@ -120,10 +120,12 @@ async def call_context(computer_id: str, call_id: str | None) -> CallContext | N
         return None
     if not isinstance(filed, dict):
         return None
+    # DALTON-HOOK(colleague-access): restore caller_user_id for cross-user LiveFS read-only check
     return CallContext(
         workspace_id=filed.get("workspace_id"),
         thread_id=filed.get("thread_id"),
         timezone=filed.get("timezone"),
+        caller_user_id=filed.get("caller_user_id"),
     )
 
 

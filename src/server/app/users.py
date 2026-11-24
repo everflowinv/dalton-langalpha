@@ -732,7 +732,10 @@ async def update_preferences(
 
         # Providers before models: a model names the provider it runs on.
         if model_pref.get("custom_providers") is not None:
-            validate_custom_providers(model_pref["custom_providers"], stored_model_pref)
+            # DALTON-HOOK(team-credentials): pass user_id so non-holder members cannot save endpoint/connection params
+            validate_custom_providers(
+                model_pref["custom_providers"], stored_model_pref, user_id=user_id
+            )
 
         # Checked against the merged catalog rather than the request, because a
         # patch that only drops a provider names no model and would otherwise
@@ -748,8 +751,11 @@ async def update_preferences(
         await _refuse_new_own_models(user_id, model_pref, stored_model_pref)
 
         if model_pref.get("custom_models"):
+            # DALTON-HOOK(team-credentials): pass user_id so non-holder members cannot save endpoint/connection params
             await refuse_custom_model_endpoints(
-                model_pref["custom_models"], stored_model_pref.get("custom_models")
+                model_pref["custom_models"],
+                stored_model_pref.get("custom_models"),
+                user_id=user_id,
             )
 
         _validate_model_tuning(model_pref, effective)
@@ -1034,12 +1040,13 @@ async def delete_preferences(user_id: CurrentUserId):
     # preferences, preserve all `dalton_notify*` keys in place (without
     # writing an audit entry or bumping `config_version`) and perform the
     # check + write/delete in a single transaction and profile lock.
-    from src.dalton.settings import get_configured_pm_user_ids
+    # DALTON-HOOK(standalone-core): resolve primary admin through access_tiers (reads dalton_credential_holder / dalton_user_roles in local mode)
+    from src.dalton.access_tiers import get_primary_admin_user_id
 
-    pm_ids = get_configured_pm_user_ids()
+    primary_admin = await get_primary_admin_user_id()
     uid_clean = str(user_id or "").strip()
     keep_overrides = granted_override_keys()
-    if pm_ids and uid_clean == pm_ids[0]:
+    if primary_admin and uid_clean == primary_admin:
         async with get_db_connection() as conn, conn.transaction():
             locked = await db_lock_user_preferences(user_id, conn=conn)
             locked_model_pref = (locked or {}).get("model_preference") or {}

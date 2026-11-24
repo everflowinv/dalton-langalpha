@@ -189,20 +189,20 @@ TRACKING_OWNER_ONLY_DETAIL = (
 
 async def _verify_tracking_workspace_owner(workspace_id: str, user_id: str) -> str:
     """Verify caller may mutate tracking/system jobs on ``workspace_id`` and return effective task owner."""
+    from src.dalton.access_tiers import is_admin_user
     from src.dalton.autonomy.tracking import resolve_workspace_tracking_owner
     from src.dalton.database.coverage_units import get_active_unit_by_workspace
     from src.dalton.settings import (
-        get_dalton_settings,
         is_coverage_units_enabled,
-        is_dalton_supabase_auth_enabled,
+        is_dalton_auth_enabled,
     )
     from src.dalton.sharing import ColleagueAccessRevokedError, require_workspace_access
 
     uid = str(user_id or "").strip()
-    is_pm = bool(uid and uid in get_dalton_settings().pm_user_ids)
+    is_pm = await is_admin_user(uid, include_config_defaults=True)
     units_on = is_coverage_units_enabled()
 
-    if units_on and is_dalton_supabase_auth_enabled():
+    if units_on and is_dalton_auth_enabled():
         ws_row: dict[str, Any] | None = None
         if units_on:
             try:
@@ -269,7 +269,7 @@ async def _verify_tracking_workspace_owner(workspace_id: str, user_id: str) -> s
         raise
     task_owner = await resolve_workspace_tracking_owner(workspace_id, ws_row)
     ws_owner = str((ws_row or {}).get("user_id") or uid).strip()
-    if units_on and is_dalton_supabase_auth_enabled() and task_owner and uid != task_owner and not is_pm:
+    if units_on and is_dalton_auth_enabled() and task_owner and uid != task_owner and not is_pm:
         raise HTTPException(status_code=403, detail=TRACKING_OWNER_ONLY_DETAIL)
     return task_owner or ws_owner
 
@@ -1089,14 +1089,14 @@ def build_director_tools(
         user_id = str(configurable.get("user_id") or "").strip()
         if not user_id:
             raise ValueError("user_id is required")
-        from src.dalton.settings import is_dalton_supabase_auth_enabled
+        from src.dalton.settings import is_dalton_auth_enabled
         from src.dalton.sharing import ColleagueAccessRevokedError
 
         access_channel = "cos"
         try:
             await verify_workspace_access(workspace_id, user_id, need="write", channel="cos")
         except HTTPException as exc:
-            if exc.status_code not in (403, 404) or not is_dalton_supabase_auth_enabled():
+            if exc.status_code not in (403, 404) or not is_dalton_auth_enabled():
                 raise
             try:
                 await verify_workspace_access(workspace_id, user_id, need="write", channel="web")

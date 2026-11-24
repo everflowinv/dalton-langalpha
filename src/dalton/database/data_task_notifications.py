@@ -47,7 +47,7 @@ from src.dalton.database.channel_gateway import _verify_group_target_deliverable
 from src.dalton.llm.model_prefs import resolve_dalton_notify_targets
 from src.dalton.notify.channel_transport import UNCERTAIN_NOTIFY_ERROR_CODES
 from src.dalton.notify.dispatch import evaluate_user_notify_eligibility
-from src.dalton.settings import get_configured_pm_user_ids, get_dalton_settings
+from src.dalton.settings import get_dalton_settings
 from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.pool import get_db_connection
 
@@ -609,8 +609,9 @@ async def _authorize_run_and_target_in_tx(
             deny_message="Notifications are disabled for this data task.",
         )
 
-    pm_ids = get_configured_pm_user_ids()
-    owner_user_id = str(pm_ids[0]).strip() if pm_ids else ""
+    from src.dalton.access_tiers import get_primary_admin_user_id
+
+    owner_user_id = str((await get_primary_admin_user_id()) or "").strip()
     if not owner_user_id:
         return AuthorizedDataTaskTarget(
             allowed=False,
@@ -1073,8 +1074,9 @@ async def _persist_reconcile_identity_on_outer_delivery(
         eff_job_key = str(job_key or "").strip()
         eff_owner_uid = str(owner_user_id or "").strip()
         if not eff_owner_uid:
-            pm_ids = get_configured_pm_user_ids()
-            eff_owner_uid = str(pm_ids[0]).strip() if pm_ids else ""
+            from src.dalton.access_tiers import get_primary_admin_user_id
+
+            eff_owner_uid = str((await get_primary_admin_user_id()) or "").strip()
         route_key = f"data:{eff_job_key}" if eff_job_key else "data:unknown"
         initial_payload: dict[str, Any] = {
             "route_key": route_key,

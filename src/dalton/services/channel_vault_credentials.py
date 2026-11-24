@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Collection
 import logging
 
-from src.dalton.settings import get_configured_pm_user_ids, get_dalton_settings
+from src.dalton.settings import get_dalton_settings
 from src.server.database.user_vault_secrets import get_user_secrets_decrypted
 
 logger = logging.getLogger(__name__)
@@ -52,8 +52,9 @@ async def load_dedicated_feishu_vault_credentials(
             status_code=503,
         )
 
-    pm_ids = get_configured_pm_user_ids()
-    owner_user_id = str(pm_ids[0]).strip() if pm_ids else ""
+    from src.dalton.access_tiers import get_primary_admin_user_id
+
+    owner_user_id = str((await get_primary_admin_user_id()) or "").strip()
     if not owner_user_id or any(ch.isspace() or ch == "\x00" for ch in owner_user_id):
         raise ChannelVaultCredentialError(
             "Primary Dalton administrator is not configured.",

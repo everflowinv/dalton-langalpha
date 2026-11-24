@@ -82,7 +82,10 @@ def test_the_workspace_is_read_for_its_owner_and_the_turn_for_its_sender():
     spies = _build(user_id=SENDER, owner_id=OWNER)
 
     assert spies["gates"].call_args.kwargs["user_id"] == OWNER
-    assert spies["filesystem"].call_args.kwargs["user_id"] == OWNER
+    # DALTON-HOOK(colleague-access): the backend learns the sender too, so a
+    # colleague's turn reads the owner's data and writes none of it.
+    assert spies["filesystem"].call_args.kwargs["user_id"] == SENDER
+    assert spies["filesystem"].call_args.kwargs["workspace_owner_id"] == OWNER
     assert spies["hand_off"].call_args.kwargs["user_id"] == SENDER
     assert spies["thread_status"].call_args.kwargs["user_id"] == SENDER
 

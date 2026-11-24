@@ -7,13 +7,13 @@
 #      (>= 30 GiB recommended).
 #   2. Print the /var/run/docker.sock security & permissions notice.
 #   3. Create/update .env (strictly mode 0600) from .env.core.example, configuring
-#      DOMAIN, edge TLS mode, trusted proxy settings, and COMPOSE_FILE:
-#        - Until local sign-in ships (Batch 4b), only loopback addresses
-#          (localhost, 127.0.0.1, ::1) are accepted.
-#        - Loopback HTTP (default)  -> DALTON_TLS_MODE=loopback (127.0.0.1:8088 only)
-#        - Loopback internal CA     -> DALTON_TLS_MODE=internal (127.0.0.1:18080/18443)
-#        - Loopback custom cert     -> DALTON_TLS_MODE=custom   (127.0.0.1:18080/18443)
-#        - Public / LAN (Batch 4b+) -> auto / internal / custom on TCP 80 & 443
+#      DOMAIN, authentication mode, edge TLS mode, trusted proxy settings, and
+#      COMPOSE_FILE:
+#        - Loopback HTTP (default)  -> DALTON_AUTH_MODE=oss, DALTON_TLS_MODE=loopback (127.0.0.1:8088 only)
+#        - Loopback internal CA     -> DALTON_AUTH_MODE=oss, DALTON_TLS_MODE=internal (127.0.0.1:18080/18443)
+#        - Loopback custom cert     -> DALTON_AUTH_MODE=oss, DALTON_TLS_MODE=custom   (127.0.0.1:18080/18443)
+#        - Public / LAN domain      -> DALTON_AUTH_MODE=local & VITE_DALTON_AUTH=local,
+#                                      auto / internal / custom TLS on TCP 80 & 443
 #   4. Generate all required secrets with `openssl rand -hex 32` without overwriting
 #      existing non-empty values and without printing any secret values to stdout/logs.
 #   5. Optionally build the code sandbox image (langalpha-sandbox:latest).
@@ -36,6 +36,7 @@ DOMAIN_ARG=""
 TLS_MODE_ARG=""
 TLS_CERT_DIR_ARG=""
 BUILD_SANDBOX=1
+SCRIPT_WROTE_LOCAL_AUTH=0
 
 usage() {
   cat <<'EOF'
@@ -43,10 +44,12 @@ Usage: bash scripts/standalone/init.sh [OPTIONS]
 
 Options:
   --non-interactive          Do not prompt; use defaults / flags / existing .env values.
-  --domain <host>            localhost, 127.0.0.1 or ::1 (the default). Public and LAN
-                             domains are accepted once local sign-in ships (Batch 4b).
+  --domain <host>            localhost, 127.0.0.1 or ::1 (loopback passwordless trial, default),
+                             or a public/LAN domain (automatically enables DALTON_AUTH_MODE=local
+                             and VITE_DALTON_AUTH=local).
   --tls-mode <mode>          Override edge TLS mode: loopback | internal | auto | custom.
-                             Default for loopback addresses is loopback (HTTP 127.0.0.1:8088);
+                             Default is loopback (HTTP 127.0.0.1:8088) for loopback hosts,
+                             auto (ACME HTTPS) for public domains, internal for private/LAN hosts;
                              use --tls-mode internal for loopback HTTPS (127.0.0.1:18443).
   --tls-cert-dir <path>      Directory containing cert.pem and key.pem (used with --tls-mode custom).
   --skip-sandbox-build       Leave the code sandbox image unbuilt (build it later with
@@ -169,8 +172,8 @@ validate_domain_syntax() {
     exit 2
   fi
 
-  # Reject userinfo (user@host) or whitespace/quotes/control characters immediately.
-  if [[ "$raw" == *"@"* || "$raw" =~ [[:space:]\'\"\\] ]]; then
+  # Reject userinfo (user@host) or whitespace/quotes/shell metacharacters immediately.
+  if [[ "$raw" == *"@"* || "$raw" =~ [[:space:]\'\"\$\\] ]]; then
     err "Invalid DOMAIN '${raw}': must be a bare hostname or IP without spaces, quotes, or credentials."
     exit 2
   fi
@@ -317,17 +320,6 @@ is_loopback_domain() {
   [[ "$d" == "localhost" || "$d" == "127.0.0.1" || "$d" == "::1" ]]
 }
 
-validate_domain_for_auth() {
-  local domain_val="$1"
-  # Until local sign-in ships (Batch 4b), a core install has no login screen,
-  # so it installs on a loopback address only. Batch 4b's init writes the
-  # local auth mode itself before it accepts a public domain.
-  if ! is_loopback_domain "$domain_val"; then
-    err "当前核心版是免密单机试用，请先用 localhost 安装；正式对外部署等本地登录（Batch 4b）上线后再配置域名。（读到的域名：'${domain_val}'；.env 里请写成单独一行 DOMAIN=localhost，不加引号。）"
-    exit 1
-  fi
-}
-
 check_environment() {
   printf "\n== Environment Checks ==\n"
 
@@ -447,10 +439,47 @@ print_docker_sock_notice() {
 EOF
 }
 
-get_env_value() {
+get_env_value_any() {
   local key="$1"
   [[ -f "$ENV_FILE" ]] || return 0
+  # Parse `.env` following Docker Compose env-file syntax:
+  # - ignores blank lines and `#` comments, strips CR (`\r`), supports `export`
+  # - accepts both `KEY=value` and `KEY: value` assignments
+  # - preserves `#` inside single/double quotes and strips unquoted inline `#` comments
   awk -v k="$key" '
+    function parse_val(s,    q, out, i, n, ch, nxt) {
+      sub(/^[[:space:]]+/, "", s)
+      if (s == "") return ""
+      q = substr(s, 1, 1)
+      if (q == "\"") {
+        out = ""
+        n = length(s)
+        for (i = 2; i <= n; i++) {
+          ch = substr(s, i, 1)
+          if (ch == "\\" && i < n) {
+            nxt = substr(s, i + 1, 1)
+            out = out nxt
+            i++
+          } else if (ch == "\"") {
+            return out
+          } else {
+            out = out ch
+          }
+        }
+        return out
+      }
+      if (q == "\047") {
+        n = index(substr(s, 2), "\047")
+        if (n > 0) {
+          return substr(s, 2, n - 1)
+        }
+        return substr(s, 2)
+      }
+      if (substr(s, 1, 1) == "#") return ""
+      sub(/[[:space:]]+#.*$/, "", s)
+      sub(/[[:space:]]+$/, "", s)
+      return s
+    }
     {
       line = $0
       sub(/\r$/, "", line)
@@ -459,25 +488,30 @@ get_env_value() {
       if (line ~ /^export[[:space:]]+/) {
         sub(/^export[[:space:]]+/, "", line)
       }
-      if (substr(line, 1, length(k)) != k) next
-      rest = substr(line, length(k) + 1)
-      if (rest !~ /^[[:space:]]*[=:]/) next
-      sub(/^[[:space:]]*[=:][[:space:]]*/, "", rest)
-      first = substr(rest, 1, 1)
-      last = substr(rest, length(rest), 1)
-      if (length(rest) >= 2 && first == last && (first == "\"" || first == "\047")) {
-        rest = substr(rest, 2, length(rest) - 2)
-      } else {
-        sub(/[[:space:]]+#.*$/, "", rest)
-        sub(/[[:space:]]+$/, "", rest)
+      if (substr(line, 1, length(k)) == k) {
+        rest = substr(line, length(k) + 1)
+        if (rest ~ /^[[:space:]]*[=:]/) {
+          sub(/^[[:space:]]*[=:]/, "", rest)
+          val = parse_val(rest)
+        }
       }
-      val = rest
-      found = 1
     }
     END {
-      if (found) printf "%s", val
+      if (val != "") print val
     }
-  ' "$ENV_FILE"
+  ' "$ENV_FILE" 2>/dev/null || true
+}
+
+get_env_value() {
+  if declare -F get_env_value_any >/dev/null 2>&1; then
+    get_env_value_any "$1"
+    return $?
+  fi
+  local key="$1"
+  [[ -f "$ENV_FILE" ]] || return 0
+  local line
+  line="$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -n 1 || true)"
+  printf '%s' "${line#*=}"
 }
 
 get_file_mode() {
@@ -489,6 +523,85 @@ get_file_mode() {
   else
     printf '600'
   fi
+}
+
+count_env_key_assignments() {
+  local key="$1"
+  if [[ ! -f "$ENV_FILE" ]]; then
+    printf '0'
+    return 0
+  fi
+  awk -v k="$key" '
+    BEGIN { count = 0 }
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (line ~ /^export[[:space:]]+/) {
+        sub(/^export[[:space:]]+/, "", line)
+      }
+      if (substr(line, 1, length(k)) == k) {
+        rest = substr(line, length(k) + 1)
+        if (rest ~ /^[[:space:]]*[=:]/) {
+          count++
+        }
+      }
+    }
+    END { print count }
+  ' "$ENV_FILE"
+}
+
+remove_env_key_all() {
+  local key="$1"
+  [[ -f "$ENV_FILE" ]] || return 0
+  local env_dir tmp
+  env_dir="$(dirname "$ENV_FILE")"
+  tmp="$(mktemp "${env_dir}/.env.tmp.XXXXXX")"
+  chmod 600 "$tmp"
+  awk -v k="$key" '
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (line ~ /^export[[:space:]]+/) {
+        sub(/^export[[:space:]]+/, "", line)
+      }
+      if (substr(line, 1, length(k)) == k) {
+        rest = substr(line, length(k) + 1)
+        if (rest ~ /^[[:space:]]*[=:]/) {
+          next
+        }
+      }
+      print $0
+    }
+  ' "$ENV_FILE" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$ENV_FILE"
+}
+
+append_env_key_unique() {
+  local key="$1" val="$2"
+  remove_env_key_all "$key"
+  local env_dir tmp
+  env_dir="$(dirname "$ENV_FILE")"
+  tmp="$(mktemp "${env_dir}/.env.tmp.XXXXXX")"
+  chmod 600 "$tmp"
+  if [[ -f "$ENV_FILE" ]]; then
+    cat "$ENV_FILE" > "$tmp"
+  fi
+  printf '%s=%s\n' "$key" "$val" >> "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$ENV_FILE"
+}
+
+configure_public_domain_local_auth() {
+  local domain_val="$1"
+  remove_env_key_all "DALTON_AUTH_MODE"
+  remove_env_key_all "DALTON_ALLOW_DEV_OSS_AUTH"
+  remove_env_key_all "DOMAIN"
+  remove_env_key_all "VITE_DALTON_AUTH"
+  append_env_key_unique "DALTON_AUTH_MODE" "local"
+  append_env_key_unique "DOMAIN" "$domain_val"
+  append_env_key_unique "VITE_DALTON_AUTH" "local"
+  SCRIPT_WROTE_LOCAL_AUTH=1
 }
 
 write_env_key() {
@@ -612,8 +725,8 @@ print_tls_notice() {
 
   Notes:
   - For loopback addresses, ports remain strictly bound to 127.0.0.1.
-  - Public ACME requires a publicly resolvable DNS domain (available once local
-    sign-in ships in Batch 4b) with inbound TCP ports 80 and 443 open.
+  - Public ACME requires a publicly resolvable DNS domain with inbound TCP
+    ports 80 and 443 open.
   - Certificates are persisted in the Compose volume \`dalton-caddy-data\`
     (locate on host with \`docker volume ls --filter name=dalton-caddy-data\`).
 EOF
@@ -659,6 +772,25 @@ EOF
   esac
 }
 
+validate_domain_for_auth() {
+  local domain_val="$1"
+  if is_loopback_domain "$domain_val"; then
+    return 0
+  fi
+  if [[ "$SCRIPT_WROTE_LOCAL_AUTH" -ne 1 ]]; then
+    err "公网域名 '${domain_val}' 仅在脚本本次写入 DALTON_AUTH_MODE=local 后才放行，拒绝在免密模式或未规范化的 .env 下继续。"
+    exit 1
+  fi
+  local auth_count allow_dev_count auth_val
+  auth_count="$(count_env_key_assignments "DALTON_AUTH_MODE")"
+  allow_dev_count="$(count_env_key_assignments "DALTON_ALLOW_DEV_OSS_AUTH")"
+  auth_val="$(get_env_value "DALTON_AUTH_MODE")"
+  if [[ "$auth_count" -ne 1 || "$auth_val" != "local" || "$allow_dev_count" -ne 0 ]]; then
+    err "公网域名 '${domain_val}' 校验失败：.env 必须仅包含唯一的 DALTON_AUTH_MODE=local 且不得包含 DALTON_ALLOW_DEV_OSS_AUTH。"
+    exit 1
+  fi
+}
+
 main() {
   if [[ -n "$TLS_MODE_ARG" ]]; then
     validate_tls_mode "$TLS_MODE_ARG" "--tls-mode"
@@ -669,7 +801,6 @@ main() {
     local pre_domain
     pre_domain="$(normalize_domain "$DOMAIN_ARG")"
     pre_domain="$(validate_domain_syntax "$pre_domain")"
-    validate_domain_for_auth "$pre_domain"
     DOMAIN_ARG="$pre_domain"
   fi
   check_environment
@@ -697,30 +828,31 @@ main() {
 
   # Resolve target domain
   local existing_domain domain domain_changed=0
-  existing_domain="$(get_env_value "DOMAIN")"
+  existing_domain="$(get_env_value_any "DOMAIN")"
   if [[ -n "$DOMAIN_ARG" ]]; then
     domain="$DOMAIN_ARG"
-    write_env_key "DOMAIN" "$domain"
     domain_changed=1
   elif [[ -n "$existing_domain" ]]; then
     domain="$(normalize_domain "$existing_domain")"
     domain="$(validate_domain_syntax "$domain")"
-    validate_domain_for_auth "$domain"
-    if [[ "$domain" != "$existing_domain" ]]; then
-      write_env_key "DOMAIN" "$domain"
-    fi
   elif [[ "$NON_INTERACTIVE" -eq 1 ]]; then
     domain="localhost"
-    validate_domain_for_auth "$domain"
-    write_env_key "DOMAIN" "$domain"
     domain_changed=1
   else
-    read -r -p "  Target domain (use 'localhost' for loopback trial) [localhost]: " domain
+    read -r -p "  Target domain (use 'localhost' for loopback trial, or a public domain for local auth) [localhost]: " domain
     domain="$(normalize_domain "${domain:-localhost}")"
     domain="$(validate_domain_syntax "$domain")"
-    validate_domain_for_auth "$domain"
-    write_env_key "DOMAIN" "$domain"
     domain_changed=1
+  fi
+
+  if is_loopback_domain "$domain"; then
+    write_env_key "DOMAIN" "$domain"
+    set_env_if_empty "DALTON_AUTH_MODE" "oss" || true
+    set_env_if_empty "DALTON_ALLOW_DEV_OSS_AUTH" "1" || true
+    validate_domain_for_auth "$domain"
+  else
+    configure_public_domain_local_auth "$domain"
+    validate_domain_for_auth "$domain"
   fi
   ok "DOMAIN=${domain}"
 
@@ -735,7 +867,7 @@ main() {
   if [[ -n "$TLS_MODE_ARG" ]]; then
     tls_mode="$TLS_MODE_ARG"
     tls_changed=1
-  elif [[ "$domain_changed" -eq 1 || -z "$existing_tls_mode" ]]; then
+  elif [[ "$domain_changed" -eq 1 || -z "$existing_tls_mode" || ( "$domain_class" != "loopback" && "$existing_tls_mode" == "loopback" ) ]]; then
     case "$domain_class" in
       public)   tls_mode="auto" ;;
       private)  tls_mode="internal" ;;
@@ -812,12 +944,21 @@ main() {
       compose_file="docker-compose.yml:docker-compose.core.yml"
       ;;
     internal|auto|custom)
-      # Before Batch 4b ships local sign-in, all published addresses stay hardcoded
-      # to 127.0.0.1 (or [::1] via docker-compose.tls.ipv6.yml) in the Compose files.
-      tls_bind="$loopback_bind"
-      http_port="18080"
-      https_port="18443"
-      public_url="https://${url_host}:${https_port}"
+      if [[ "$domain_class" == "loopback" ]]; then
+        tls_bind="$loopback_bind"
+        http_port="18080"
+        https_port="18443"
+        public_url="https://${url_host}:${https_port}"
+      else
+        if [[ "$domain" == *:* ]]; then
+          tls_bind="[::]"
+        else
+          tls_bind="0.0.0.0"
+        fi
+        http_port="80"
+        https_port="443"
+        public_url="https://${url_host}"
+      fi
       compose_file="docker-compose.yml:docker-compose.core.yml:${tls_overlay_file}"
       ;;
   esac
@@ -829,16 +970,20 @@ main() {
   fi
 
   set_env_maybe_override "$force_network_update" "DALTON_TLS_MODE" "$tls_mode"
-  # Before Batch 4b ships local sign-in, always rewrite the listen/bind address in .env
-  # to the loopback address (127.0.0.1 or [::1]) on every init.sh run regardless of any
-  # pre-existing value (e.g. 0.0.0.0) so no passwordless stack can publish externally.
-  local existing_tls_bind
-  existing_tls_bind="$(get_env_value "DALTON_EDGE_TLS_BIND")"
-  write_env_key "DALTON_EDGE_TLS_BIND" "$tls_bind"
-  if [[ -n "$existing_tls_bind" && "$existing_tls_bind" != "$tls_bind" ]]; then
-    warn "Rewrote DALTON_EDGE_TLS_BIND from '${existing_tls_bind}' to '${tls_bind}' (before Batch 4b, only loopback listening addresses are permitted)."
+  if [[ "$domain_class" == "loopback" || "$tls_mode" == "loopback" ]]; then
+    # For loopback deployments, always rewrite the listen/bind address in .env
+    # to the loopback address (127.0.0.1 or [::1]) on every init.sh run regardless
+    # of any pre-existing value (e.g. 0.0.0.0) so a passwordless stack never publishes externally.
+    local existing_tls_bind
+    existing_tls_bind="$(get_env_value "DALTON_EDGE_TLS_BIND")"
+    write_env_key "DALTON_EDGE_TLS_BIND" "$tls_bind"
+    if [[ -n "$existing_tls_bind" && "$existing_tls_bind" != "$tls_bind" ]]; then
+      warn "Rewrote DALTON_EDGE_TLS_BIND from '${existing_tls_bind}' to '${tls_bind}' (loopback host requires a loopback listening address)."
+    else
+      info "Enforced loopback listen address DALTON_EDGE_TLS_BIND=${tls_bind}."
+    fi
   else
-    info "Enforced loopback listen address DALTON_EDGE_TLS_BIND=${tls_bind} (before Batch 4b, only loopback addresses are published)."
+    set_env_maybe_override "$force_network_update" "DALTON_EDGE_TLS_BIND" "$tls_bind"
   fi
   if [[ "$domain" == *:* ]]; then
     write_env_key "DALTON_CADDY_HOST" "$url_host"
@@ -848,9 +993,29 @@ main() {
   set_env_maybe_override "$force_network_update" "DALTON_EDGE_HTTP_PORT" "$http_port"
   set_env_maybe_override "$force_network_update" "DALTON_EDGE_HTTPS_PORT" "$https_port"
   set_env_maybe_override "$force_network_update" "COMPOSE_FILE" "$compose_file"
-  set_env_maybe_override "$force_network_update" "PUBLIC_APP_URL" "$public_url"
-  set_env_maybe_override "$force_network_update" "SERVER_BASE_URL" "$public_url"
-  set_env_maybe_override "$force_network_update" "DALTON_INVITE_EMAIL_DOMAIN" "$invite_domain"
+  if [[ "$force_network_update" -eq 1 ]]; then
+    write_env_key "PUBLIC_APP_URL" "$public_url"
+    write_env_key "SERVER_BASE_URL" "$public_url"
+    write_env_key "DALTON_INVITE_EMAIL_DOMAIN" "$invite_domain"
+  elif ! is_loopback_domain "$domain"; then
+    local cur_pub cur_srv cur_inv
+    cur_pub="$(get_env_value "PUBLIC_APP_URL")"
+    cur_srv="$(get_env_value "SERVER_BASE_URL")"
+    cur_inv="$(get_env_value "DALTON_INVITE_EMAIL_DOMAIN")"
+    if [[ -z "$cur_pub" || "$cur_pub" == "http://127.0.0.1:8088" || "$cur_pub" == "http://127.0.0.1:${edge_port}" ]]; then
+      write_env_key "PUBLIC_APP_URL" "$public_url"
+    fi
+    if [[ -z "$cur_srv" || "$cur_srv" == "http://127.0.0.1:8088" || "$cur_srv" == "http://127.0.0.1:${edge_port}" ]]; then
+      write_env_key "SERVER_BASE_URL" "$public_url"
+    fi
+    if [[ -z "$cur_inv" || "$cur_inv" == "team.dalton.local" ]]; then
+      write_env_key "DALTON_INVITE_EMAIL_DOMAIN" "$invite_domain"
+    fi
+  else
+    set_env_if_empty "PUBLIC_APP_URL" "$public_url" || true
+    set_env_if_empty "SERVER_BASE_URL" "$public_url" || true
+    set_env_if_empty "DALTON_INVITE_EMAIL_DOMAIN" "$invite_domain" || true
+  fi
 
   if [[ -n "$TLS_CERT_DIR_ARG" ]]; then
     write_env_key "DALTON_TLS_CERT_DIR" "$TLS_CERT_DIR_ARG"
@@ -929,10 +1094,13 @@ main() {
     fi
   fi
 
-  local compose_start_cmd="docker compose -f docker-compose.yml -f docker-compose.core.yml up -d"
+  local compose_base_cmd="docker compose -f docker-compose.yml -f docker-compose.core.yml"
   if [[ "$tls_mode" != "loopback" ]]; then
-    compose_start_cmd="docker compose -f docker-compose.yml -f docker-compose.core.yml -f ${tls_overlay_file} up -d"
+    compose_base_cmd="docker compose -f docker-compose.yml -f docker-compose.core.yml -f ${tls_overlay_file}"
   fi
+  local compose_start_cmd="${compose_base_cmd} up -d"
+  local vite_auth
+  vite_auth="$(get_env_value_any "VITE_DALTON_AUTH")"
 
   printf "\n== Next Steps ==\n"
   if [[ "$NON_INTERACTIVE" -eq 0 ]]; then
@@ -944,13 +1112,17 @@ main() {
   2. Optional: set SEC_USER_AGENT="Dalton <your-email@example.com>" in .env
      for SEC EDGAR compliance identification.
 
-  3. Start the Standalone Core stack:
+  3. Build edge with VITE_DALTON_AUTH from .env and start the Standalone Core stack:
+       ${compose_base_cmd} build --build-arg VITE_DALTON_AUTH="${vite_auth}" edge
        ${compose_start_cmd}
+     (Whenever you switch DALTON_AUTH_MODE / VITE_DALTON_AUTH in .env, rebuild edge
+      so the frontend bundle picks up the new authentication mode.)
 
   4. Open the web UI at ${public_url}
 EOF
   else
-    info "Non-interactive initialization complete (APP_ENV=core, DOMAIN=${domain}, DALTON_TLS_MODE=${tls_mode})."
+    info "Non-interactive initialization complete (APP_ENV=core, DOMAIN=${domain}, DALTON_TLS_MODE=${tls_mode}, VITE_DALTON_AUTH=${vite_auth:-<empty>})."
+    info "Build edge with: ${compose_base_cmd} build --build-arg VITE_DALTON_AUTH=${vite_auth} edge"
     info "Start the stack with: ${compose_start_cmd}"
   fi
 }

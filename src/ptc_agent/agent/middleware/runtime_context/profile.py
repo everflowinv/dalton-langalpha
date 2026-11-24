@@ -145,6 +145,8 @@ def render_user_profile(
     main_agent_steering: bool,
     switches: ProfileSwitches = ProfileSwitches(),
     role: str = "analyst",
+    # DALTON-HOOK(colleague-access): flag cross-user turns so requester profile is distinct from workspace owner's user-data
+    is_cross_user: bool = False,
 ) -> str:
     """The ``components/user_profile.md.j2`` block for one profile.
 
@@ -169,6 +171,7 @@ def render_user_profile(
         channels_enabled=bool(switches.channels),
         wakeups_enabled=switches.wakeups,
         role=role,
+        is_cross_user=is_cross_user,
     )
 
 
