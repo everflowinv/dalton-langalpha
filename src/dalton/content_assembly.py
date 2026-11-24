@@ -30,7 +30,11 @@ from pathlib import Path
 import re
 from typing import Any
 
-from src.dalton.capabilities import CapabilityId, effective_capabilities
+from src.dalton.capabilities import (
+    CapabilityId,
+    effective_capabilities,
+    is_bridge_route_enabled,
+)
 
 
 class ContentAssemblyError(ValueError):
@@ -360,6 +364,72 @@ def assemble_json_text(
         # Validate JSON stays well-formed after string cleanup.
         json.loads(updated)
         return updated
+
+    if path_str.endswith(".json") and (
+        "/dalton-bullbear-tracker/config/" in path_str
+        or path_str.startswith("dalton-bullbear-tracker/config/")
+    ):
+        bridge_on = CapabilityId.RESEARCHDATA_BRIDGE in active_caps
+        ae_on = CapabilityId.ALPHAENGINE in active_caps
+        doc = json.loads(text)
+        if isinstance(doc, dict):
+            sources = doc.get("sources")
+            sources_copy = dict(sources) if isinstance(sources, dict) else {}
+            changed = False
+            if not bridge_on:
+                sources_copy["internal"] = False
+                sources_copy["alphaengine"] = False
+                sources_copy["sec"] = False
+                sources_copy["x"] = False
+                doc["_dalton_cap_researchdata_bridge"] = False
+                doc["_dalton_cap_alphaengine"] = False
+                changed = True
+            else:
+                if not ae_on:
+                    sources_copy["alphaengine"] = False
+                    doc["_dalton_cap_alphaengine"] = False
+                    changed = True
+                disabled_internal_routes: list[str] = []
+                raw_routes = sources_copy.get("internal_routes")
+                if isinstance(raw_routes, list):
+                    filtered_routes = [
+                        r
+                        for r in raw_routes
+                        if is_bridge_route_enabled(str(r), capabilities=active_caps)
+                    ]
+                    if len(filtered_routes) != len(raw_routes):
+                        for r in raw_routes:
+                            rs = str(r)
+                            if (
+                                not is_bridge_route_enabled(rs, capabilities=active_caps)
+                                and rs not in disabled_internal_routes
+                            ):
+                                disabled_internal_routes.append(rs)
+                        sources_copy["internal_routes"] = filtered_routes
+                        changed = True
+                top_routes = doc.get("internal_routes")
+                if isinstance(top_routes, list):
+                    filtered_top = [
+                        r
+                        for r in top_routes
+                        if is_bridge_route_enabled(str(r), capabilities=active_caps)
+                    ]
+                    if len(filtered_top) != len(top_routes):
+                        for r in top_routes:
+                            rs = str(r)
+                            if (
+                                not is_bridge_route_enabled(rs, capabilities=active_caps)
+                                and rs not in disabled_internal_routes
+                            ):
+                                disabled_internal_routes.append(rs)
+                        doc["internal_routes"] = filtered_top
+                        changed = True
+                if disabled_internal_routes:
+                    doc["_dalton_cap_disabled_internal_routes"] = disabled_internal_routes
+            if not changed:
+                return text
+            doc["sources"] = sources_copy
+            return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
 
     return text
 

@@ -116,6 +116,16 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _expected_origin_packet_with_ae_fresh(expected_json: str) -> str:
+    """原 origin/dalton/main 基准未带 AE 首页 params.fresh=True；补入该键后应逐字节一致。"""
+    obj = json.loads(expected_json)
+    for row in (obj.get("alphaengine") or {}).get("status") or []:
+        req = row.get("request")
+        if isinstance(req, dict) and isinstance(req.get("params"), dict):
+            req["params"]["fresh"] = True
+    return json.dumps(obj, ensure_ascii=False, indent=2) + "\n"
+
+
 def _ae_state(until: str, marker: str) -> dict[str, Any]:
     return {
         "queries": [{
@@ -392,14 +402,14 @@ def test_read_cap_pending_commit_and_internal_retry(
     tmtb_starts = [args["start"] for args in calls if args.get("route") == "tmtb"]
     ae_starts = [args["start"] for args in calls if args.get("route") == "alphaengine"]
     assert tmtb_starts == ["2026-11-08"]
-    assert ae_starts and set(ae_starts) == {"2026-11-06"}
+    assert ae_starts and set(ae_starts) == {"2026-11-08"}
 
     calls.clear()
     clock["now"] = datetime(2026, 11, 11, 15, 0, tzinfo=ET)
     code, _payload = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261111-1500", "--since", "2026-11-01"])
     assert code == 0
     assert [args["start"] for args in calls if args.get("route") == "tmtb"] == ["2026-11-01"]
-    assert {args["start"] for args in calls if args.get("route") == "alphaengine"} == {"2026-10-29"}
+    assert {args["start"] for args in calls if args.get("route") == "alphaengine"} == {"2026-11-08"}
 
 
 def test_wiki_alias_threshold_and_truncated_read(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -472,7 +482,7 @@ def test_ae_two_query_window_resume_and_completed_gap(monkeypatch: pytest.Monkey
             }
         if arguments["query"] == first:
             return {"ok": True, "data": {"results": [
-                {"doc_id": "alphaengine:_inst_99", "title": "Kept", "companies": ["Microsoft"]},
+                {"doc_id": "alphaengine:_inst_99", "title": "Kept", "companies": ["Microsoft"], "publish_time": arguments["end"]},
             ], "has_more": True, "cursor": "c-new"}}
         return {"ok": True, "data": {"results": [], "has_more": False}}
 
@@ -483,29 +493,41 @@ def test_ae_two_query_window_resume_and_completed_gap(monkeypatch: pytest.Monkey
     ]}}
     _ae, state = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", {"alphaengine:seen-me"}, last_run)
     by_query = {row["query"]: row for row in state["queries"]}
-    q1 = next(args for args in calls if args["query"] == first)
-    q2 = next(args for args in calls if args["query"] == second)
-    assert q1["start"] == "2026-10-25" and q1["start"] <= "2026-10-28" and q1["end"] == "2026-11-10"
-    assert "cursor" not in q1["params"]
-    assert q2["start"] == "2026-10-17" and q2["end"] == "2026-10-28" and q2["params"]["cursor"] == "cur-2"
-    assert [args["query"] for args in calls].count(first) == 1
+    q1_calls = [args for args in calls if args["query"] == first]
+    q2_calls = [args for args in calls if args["query"] == second]
+    assert q1_calls[0]["start"] == "2026-10-25" and q1_calls[0]["end"] == "2026-11-10"
+    assert q1_calls[0]["params"] == {"sort": "relevance", "fresh": True}
+    assert len(q1_calls) == (collect_mod.MAX_AE_PAGES - 1) + collect_mod.MAX_AE_PAGES
+    assert q1_calls[collect_mod.MAX_AE_PAGES - 1]["start"] == "2026-10-26"
+    assert q1_calls[collect_mod.MAX_AE_PAGES - 1]["end"] == "2026-10-29"
+    assert q2_calls[0]["start"] == "2026-10-17" and q2_calls[0]["end"] == "2026-11-10"
+    assert q2_calls[0]["params"] == {"sort": "relevance", "fresh": True}
+    assert all("cur-2" not in json.dumps(args) for args in calls)
     assert by_query[first]["complete"] is False
-    assert by_query[first]["covered_until"] == "2026-10-28"
-    assert by_query[first]["cursor"] == "c-new"
+    assert by_query[first]["covered_until"] == "2026-10-29"
+    assert by_query[first]["cursor"] is None
+    assert "2026-10-29 超过翻页上限，只取了前 1 条" in by_query[first]["error"]
+    assert "2026-10-30 至 2026-11-10" in by_query[first]["error"]
     assert by_query[second]["complete"] is True
-    assert by_query[second]["covered_until"] == "2026-10-28"
+    assert by_query[second]["covered_until"] == "2026-11-10"
+    assert by_query[second]["cursor"] is None
     assert "alphaengine:_inst_99" in _ae["new"]
 
     calls.clear()
-    collect_mod.collect_alphaengine(
+    _ae2, state2 = collect_mod.collect_alphaengine(
         cfg, "2026-11-09", "2026-11-12", set(), {"msft_ae_state": state}
     )
-    replay = next(args for args in calls if args["query"] == first)
-    opened = next(args for args in calls if args["query"] == second)
-    assert replay["start"] == "2026-10-25" and replay["end"] == "2026-11-10" and replay["params"]["cursor"] == "c-new"
-    assert opened["end"] == "2026-11-12" and opened["start"] <= "2026-10-28"
-    assert [args["query"] for args in calls].count(first) == 1
-    assert [args["query"] for args in calls].count(second) == 1
+    by_query2 = {row["query"]: row for row in state2["queries"]}
+    replay = [args for args in calls if args["query"] == first]
+    opened = [args for args in calls if args["query"] == second]
+    assert replay[0]["start"] == "2026-10-26" and replay[0]["end"] == "2026-11-12"
+    assert replay[0]["params"] == {"sort": "relevance", "fresh": True}
+    assert replay[collect_mod.MAX_AE_PAGES - 1]["start"] == "2026-10-27"
+    assert replay[collect_mod.MAX_AE_PAGES - 1]["end"] == "2026-10-30"
+    assert by_query2[first]["covered_until"] == "2026-10-30"
+    assert opened[0]["end"] == "2026-11-12" and opened[0]["start"] <= "2026-11-10"
+    assert opened[0]["params"] == {"sort": "relevance", "fresh": True}
+    assert len(opened) == 1
 
     calls.clear()
     mode["kind"] = "partial"
@@ -737,11 +759,11 @@ def test_legacy_ae_resume_then_new_state(
     _ae, state = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), imported)
     assert [args["query"] for args in calls] == [first, second]
     assert {args["start"] for args in calls} == {"2026-10-25"}
-    assert {args["end"] for args in calls} == {"2026-10-28"}
-    assert all("cursor" not in args["params"] for args in calls)
+    assert {args["end"] for args in calls} == {"2026-11-10"}
+    assert all(args["params"] == {"sort": "relevance", "fresh": True} for args in calls)
     assert all("legacy-cursor-token" not in json.dumps(args) for args in calls)
     assert {row["complete"] for row in state["queries"]} == {True}
-    assert {row["covered_until"] for row in state["queries"]} == {"2026-10-28"}
+    assert {row["covered_until"] for row in state["queries"]} == {"2026-11-10"}
 
     ws = _workspace(tmp_path)
     (ws / "data" / "consensus" / "snap.json").write_text("{}", encoding="utf-8")
@@ -755,14 +777,15 @@ def test_legacy_ae_resume_then_new_state(
     assert last["run_id"] == "20261110-1000"
     assert "ae_resume" not in last and "ae_covered_until" not in last
     assert "legacy-cursor-token" not in json.dumps(last)
-    assert {row["window"]["end"] for row in last["msft_ae_state"]["queries"]} == {"2026-10-28"}
+    assert all("cursor" not in row and "resumed_cursor" not in row for row in last["msft_ae_state"]["queries"])
+    assert {row["window"]["end"] for row in last["msft_ae_state"]["queries"]} == {"2026-11-10"}
 
     calls.clear()
     collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), last)
     assert [args["query"] for args in calls] == [first, second]
-    assert {args["start"] for args in calls} == {"2026-10-25"}
+    assert {args["start"] for args in calls} == {"2026-11-06"}
     assert {args["end"] for args in calls} == {"2026-11-10"}
-    assert all("cursor" not in args["params"] for args in calls)
+    assert all(args["params"] == {"sort": "relevance", "fresh": True} for args in calls)
     assert _ae["status"]
 
 
@@ -822,11 +845,15 @@ def test_retained_ae_coverage_commits_and_resumes(
         assert [row["query"] for row in rows] == [first, second]
         assert all(row["complete"] is False and row["covered_until"] == "2026-11-10" for row in rows)
         assert all(row["window"] == {"start": "2026-11-06", "end": "2026-11-10"} for row in rows)
-        assert all("cursor" not in args.get("params", {}) for args in calls)
+        first_calls = [
+            next(args for args in calls if args["query"] == q)
+            for q in (first, second)
+        ]
+        assert all(args["params"] == {"sort": "relevance", "fresh": True} for args in first_calls)
         assert _ae["status"]
         states[kind] = state
-    assert [row["cursor"] for row in states["has_more"]["queries"]] == ["cursor-kept", "cursor-kept-2"]
-    assert all(row["ok"] is True for row in states["has_more"]["queries"])
+    assert [row["cursor"] for row in states["has_more"]["queries"]] == [None, None]
+    assert all(row["ok"] is True and "翻页上限" in row["error"] for row in states["has_more"]["queries"])
     assert all(
         row["ok"] is False and row["cursor"] is None and row["error"] == "upstream down"
         for row in states["error"]["queries"]
@@ -855,7 +882,7 @@ def test_retained_ae_coverage_commits_and_resumes(
             kept = saved[row["query"]]
             assert kept["complete"] is False
             assert kept["covered_until"] == "2026-11-10"
-            assert kept["cursor"] == row["cursor"]
+            assert "cursor" not in kept and "resumed_cursor" not in kept
             assert kept["ok"] is row["ok"]
             assert kept["window"] == {"start": "2026-11-06", "end": "2026-11-10"}
         return ws, last
@@ -869,10 +896,10 @@ def test_retained_ae_coverage_commits_and_resumes(
     collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-12", set(), kept_last)
     replayed = {args["query"]: args for args in calls}
     assert set(replayed) == {first, second}
-    assert replayed[first]["start"] == "2026-11-06" and replayed[first]["end"] == "2026-11-10"
-    assert replayed[first]["params"]["cursor"] == "cursor-kept"
-    assert replayed[second]["start"] == "2026-11-06" and replayed[second]["end"] == "2026-11-10"
-    assert replayed[second]["params"]["cursor"] == "cursor-kept-2"
+    assert replayed[first]["start"] == "2026-11-06" and replayed[first]["end"] == "2026-11-12"
+    assert replayed[first]["params"] == {"sort": "relevance", "fresh": True}
+    assert replayed[second]["start"] == "2026-11-06" and replayed[second]["end"] == "2026-11-12"
+    assert replayed[second]["params"] == {"sort": "relevance", "fresh": True}
 
     blocked = _workspace(tmp_path / "earlier")
     (blocked / "data" / "consensus" / "snap.json").write_text("{}", encoding="utf-8")
@@ -926,7 +953,7 @@ def test_retained_ae_coverage_commits_and_resumes(
     )
     assert code == 2 and payload["status"] == "ae_incomplete_advanced"
     assert kept_path.read_bytes() == before
-    assert _read_json(kept_path)["msft_ae_state"]["queries"][0]["cursor"] == "cursor-kept"
+    assert "cursor" not in _read_json(kept_path)["msft_ae_state"]["queries"][0]
 
 
 def test_offline_collect_leaves_seen_and_recovers_packet(
@@ -1186,7 +1213,9 @@ def test_commit_older_first_logs_once_and_keeps_newer_cursors(
     last = _read_json(last_path)
     assert last["run_id"] == "20261110-2200"
     assert last["internal_retry_since"] == "2026-11-08"
-    assert last["msft_ae_state"]["queries"][0]["cursor"] == "cursor-2200"
+    assert last["msft_ae_state"]["queries"][0]["covered_until"] == "2026-10-28"
+    assert "cursor" not in last["msft_ae_state"]["queries"][0]
+    assert "cursor-2200" not in saved
 
     code, payload = commit("20261110-1000")
     assert code == 0 and payload["stale"] is True and payload["last_run_unchanged"] is True
@@ -1205,7 +1234,8 @@ def test_commit_older_first_logs_once_and_keeps_newer_cursors(
     assert _log_count(log, "20261110-1000") == 1
     assert _log_count(log, "20261110-2200") == 1
     assert sum(1 for line in log.splitlines() if "| material=" in line) == 2
-    assert _read_json(last_path)["msft_ae_state"]["queries"][0]["cursor"] == "cursor-2200"
+    assert _read_json(last_path)["msft_ae_state"]["queries"][0]["covered_until"] == "2026-10-28"
+    assert "cursor" not in _read_json(last_path)["msft_ae_state"]["queries"][0]
     assert "cursor-1000" not in saved
     assert (ws / "research" / "tracker" / "20261110-1000" / "packet.json").read_bytes() == older_bytes
 
@@ -1496,18 +1526,21 @@ def test_incomplete_ae_page_keeps_packet_ok_and_recovers(
     assert payload["short_circuit_eligible"] is False
     assert payload["counts"]["alphaengine"] == 40
     errors = [item["error"] for item in payload["failed_sources"] if item["source"] == "alphaengine"]
-    assert errors == [f"{query}: 未完成，覆盖日期不推进" for query in (first, second)]
+    assert len(errors) == 2
+    for query, err in zip((first, second), errors, strict=True):
+        assert err.startswith(f"{query}: ")
+        assert "2026-11-10 超过翻页上限，只取了前 20 条" in err
     packet_path = tracker / "ae-page" / "packet.json"
     packet_bytes = packet_path.read_bytes()
     packet = json.loads(packet_bytes)
     assert packet["collection_complete"] is True
     assert packet["failed_sources"] == payload["failed_sources"]
     by_query = {row["query"]: row for row in packet["msft_ae_state"]["queries"]}
-    for query, token in ((first, "a"), (second, "b")):
+    for query in (first, second):
         row = by_query[query]
         assert row["ok"] is True and row["returned"] == 20 and row["has_more"] is True
-        assert row["complete"] is False and row["cursor"] == f"cursor-{token}"
-        assert row["covered_until"] == "2026-11-09"
+        assert row["complete"] is False and row["cursor"] is None
+        assert row["covered_until"] == "2026-11-10"
         assert row["window"]["end"] == "2026-11-10"
     assert last_path.read_bytes() == before_last
     taken = calls["n"]
@@ -1553,23 +1586,45 @@ def test_legacy_incomplete_window_can_commit_and_resume(monkeypatch, tmp_path, c
             return {"ok": False, "error": "unavailable", "data": {}}
         if mode == "partial":
             return {"ok": True, "status": "partial", "data": {"results": [], "status": "partial", "warnings": [WIKI_WARNING]}}
-        return {"ok": True, "data": {"results": [], "has_more": True, "cursor": "new-query-cursor"}}
+        return {
+            "ok": True,
+            "data": {
+                "results": [
+                    {
+                        "doc_id": f"alphaengine:legacy-{arguments['end']}",
+                        "title": "Microsoft",
+                        "companies": ["Microsoft"],
+                        "publish_time": arguments["end"],
+                    }
+                ],
+                "has_more": True,
+                "cursor": "new-query-cursor",
+            },
+        }
     _patch_bridge(monkeypatch, bridge)
     _patch_clock(monkeypatch, {"now": FROZEN})
     imported = {"ae_covered_until": "2026-10-28", "ae_resume": {"window": {"since": "2026-10-25", "until": "2026-10-28"}, "cursor": "legacy-cursor"}}
     _, state = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), imported)
-    assert all(not row["complete"] and row["covered_until"] is None for row in state["queries"])
+    if mode == "has_more":
+        assert all(not row["complete"] and row["covered_until"] == "2026-10-28" for row in state["queries"])
+    else:
+        assert all(not row["complete"] and row["covered_until"] is None for row in state["queries"])
     ws = _workspace(tmp_path)
     (ws / "data/consensus/snap.json").write_text("{}", encoding="utf-8")
     _write_packet(ws, "20261110-1000", "2026-11-10", since="2026-11-09", ae=state)
     code, _ = _run(capsys, ["commit", "--workspace-dir", str(ws), "--run-id", "20261110-1000", "--material", "no", "--summary", "resume legacy window"])
     assert code == 0
     last = _read_json(ws / "research/tracker/last_run.json")
+    assert all("cursor" not in row for row in last["msft_ae_state"]["queries"])
     calls.clear()
     collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-11", set(), last)
-    assert len(calls) == 2
-    assert all(row["start"] == "2026-10-25" and row["end"] == "2026-10-28" for row in calls)
-    assert all(row["params"].get("cursor") == ("new-query-cursor" if mode == "has_more" else None) for row in calls)
+    first_per_query = [
+        next(row for row in calls if row["query"] == q)
+        for q in cfg["ae_queries"]
+    ]
+    assert all(row["start"] == "2026-10-25" and row["end"] == "2026-11-11" for row in first_per_query)
+    assert all(row["params"] == {"sort": "relevance", "fresh": True} for row in first_per_query)
+    assert all("new-query-cursor" not in json.dumps(row) for row in first_per_query)
 
 
 def test_old_incomplete_packet_commits_after_newer_coverage(monkeypatch, tmp_path, capsys):
@@ -1965,7 +2020,7 @@ def test_legacy_four_tickers_packet_matches_origin_fixtures(
     assert code == 0
     actual_json = (ws / "research" / "tracker" / "20261110-2250" / "packet.json").read_text(encoding="utf-8")
     actual_md = (ws / "research" / "tracker" / "20261110-2250" / "packet.md").read_text(encoding="utf-8")
-    assert actual_json == expected_json
+    assert actual_json == _expected_origin_packet_with_ae_fresh(expected_json)
     assert actual_md == expected_md
     assert "data_status" not in json.loads(actual_json)
     assert "财报日历" not in actual_md
@@ -2607,7 +2662,7 @@ def test_legacy_four_tickers_at_pool_matches_origin_fixtures(
     assert code == 0
     actual_json = (ws / "research" / "tracker" / "20261110-2250" / "packet.json").read_text(encoding="utf-8")
     actual_md = (ws / "research" / "tracker" / "20261110-2250" / "packet.md").read_text(encoding="utf-8")
-    assert actual_json == expected_json
+    assert actual_json == _expected_origin_packet_with_ae_fresh(expected_json)
     assert actual_md == expected_md
 
 
@@ -3022,7 +3077,7 @@ def test_legacy_four_tickers_degraded_and_price_fail_match_origin_fixtures(
     assert code == 0
     actual_json = (ws / "research" / "tracker" / "20261110-2250" / "packet.json").read_text(encoding="utf-8")
     actual_md = (ws / "research" / "tracker" / "20261110-2250" / "packet.md").read_text(encoding="utf-8")
-    assert actual_json == expected_json
+    assert actual_json == _expected_origin_packet_with_ae_fresh(expected_json)
     assert actual_md == expected_md
 
 
@@ -3931,7 +3986,7 @@ def test_legacy_four_tickers_ignore_explicit_sources_price_switch(
     assert forbid_configured.call_count == 0
     actual_json = (ws / "research" / "tracker" / "20261110-2250" / "packet.json").read_text(encoding="utf-8")
     actual_md = (ws / "research" / "tracker" / "20261110-2250" / "packet.md").read_text(encoding="utf-8")
-    assert actual_json == expected_json
+    assert actual_json == _expected_origin_packet_with_ae_fresh(expected_json)
     assert actual_md == expected_md
 
     # Verify request sequence with real _g.fetch_consensus_snapshot: Ticker consensus runs BEFORE download()
@@ -4065,3 +4120,2693 @@ def test_aliases_that_differ_only_in_case_from_each_other_are_both_kept():
     assert pattern.search("Watching BF today")
     assert pattern.search("$bf.b ramp")
     assert not pattern.search("bf.b lowercase without dollar")
+
+
+def test_ae_same_run_multipage_and_no_cursor_in_last_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """一轮内翻多页直到 has_more=false，首页带 fresh=True，last_run.json 里没有 cursor。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    ae_calls: list[dict[str, Any]] = []
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        route = arguments.get("route")
+        if route == "alphaengine":
+            ae_calls.append(arguments)
+            cur = (arguments.get("params") or {}).get("cursor")
+            if arguments["query"] == first:
+                if cur is None:
+                    return {
+                        "ok": True,
+                        "data": {
+                            "results": [{"doc_id": "alphaengine:q1-p1", "title": "Azure p1", "companies": ["Microsoft"], "publish_time": "2026-11-09"}],
+                            "has_more": True,
+                            "cursor": "ae1:q1-c1",
+                        },
+                    }
+                if cur == "ae1:q1-c1":
+                    return {
+                        "ok": True,
+                        "data": {
+                            "results": [{"doc_id": "alphaengine:q1-p2", "title": "Azure p2", "companies": ["Microsoft"], "publish_time": "2026-11-10"}],
+                            "has_more": True,
+                            "cursor": "ae1:q1-c2",
+                        },
+                    }
+                if cur == "ae1:q1-c2":
+                    return {
+                        "ok": True,
+                        "data": {
+                            "results": [{"doc_id": "alphaengine:q1-p3", "title": "Azure p3", "companies": ["Microsoft"], "publish_time": "2026-11-10"}],
+                            "has_more": False,
+                        },
+                    }
+                raise AssertionError(cur)
+            if cur is None:
+                return {
+                    "ok": True,
+                    "data": {
+                        "results": [{"doc_id": "alphaengine:q2-p1", "title": "Copilot p1", "companies": ["Microsoft"], "publish_time": "2026-11-10"}],
+                        "has_more": True,
+                        "cursor": "ae1:q2-c1",
+                    },
+                }
+            return {
+                "ok": True,
+                "data": {
+                    "results": [{"doc_id": "alphaengine:q2-p2", "title": "Copilot p2", "companies": ["Microsoft"], "publish_time": "2026-11-10"}],
+                    "has_more": False,
+                },
+            }
+        if route == "sec":
+            return {"ok": True, "data": {"rows": []}}
+        if route == "x-timeline":
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        return {"ok": True, "data": {"results": [], "has_more": False}}
+
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    _patch_consensus(monkeypatch, _consensus_ok)
+    ws = _workspace(tmp_path)
+
+    code, payload = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"])
+    assert code == 0 and payload["ok"] is True
+    assert payload["failed_sources"] == []
+    assert payload["counts"]["alphaengine"] == 5
+
+    q1_calls = [c for c in ae_calls if c["query"] == first]
+    q2_calls = [c for c in ae_calls if c["query"] == second]
+    assert len(q1_calls) == 3 and len(q2_calls) == 2
+    assert q1_calls[0]["params"] == {"sort": "relevance", "fresh": True}
+    assert q1_calls[1]["params"] == {"sort": "relevance", "cursor": "ae1:q1-c1"}
+    assert q1_calls[2]["params"] == {"sort": "relevance", "cursor": "ae1:q1-c2"}
+    assert q2_calls[0]["params"] == {"sort": "relevance", "fresh": True}
+    assert q2_calls[1]["params"] == {"sort": "relevance", "cursor": "ae1:q2-c1"}
+
+    packet = _read_json(ws / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert set(packet["alphaengine"]["new"]) == {
+        "alphaengine:q1-p1", "alphaengine:q1-p2", "alphaengine:q1-p3",
+        "alphaengine:q2-p1", "alphaengine:q2-p2",
+    }
+    assert all(row["complete"] is True and row["covered_until"] == "2026-11-10" for row in packet["msft_ae_state"]["queries"])
+
+    code, _ = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(ws), "--run-id", "20261110-2250", "--material", "no", "--summary", "multipage"],
+    )
+    assert code == 0
+    last_text = (ws / "research" / "tracker" / "last_run.json").read_text(encoding="utf-8")
+    last = json.loads(last_text)
+    for row in last["msft_ae_state"]["queries"]:
+        assert "cursor" not in row
+        assert "resumed_cursor" not in row
+        assert row["covered_until"] == "2026-11-10"
+    assert "ae1:" not in last_text
+
+
+def test_ae_ignores_saved_cursor_in_old_state_and_starts_page_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """旧状态文件里带 cursor 与锁死的旧 window.end 时，本轮忽略 cursor、从第一页带 fresh=True 开始并推进至 until。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    calls: list[dict[str, Any]] = []
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        calls.append(arguments)
+        return {"ok": True, "data": {"results": [], "has_more": False}}
+
+    _patch_bridge(monkeypatch, bridge)
+    old_last_run = {
+        "msft_ae_state": {
+            "queries": [
+                {
+                    "query": first,
+                    "window": {"start": "2026-11-01", "end": "2026-11-05"},
+                    "cursor": "ae1:expired-from-yesterday-1",
+                    "has_more": True,
+                    "complete": False,
+                    "covered_until": "2026-11-04",
+                    "ok": True,
+                },
+                {
+                    "query": second,
+                    "window": {"start": "2026-11-01", "end": "2026-11-05"},
+                    "cursor": "ae1:expired-from-yesterday-2",
+                    "has_more": True,
+                    "complete": False,
+                    "covered_until": "2026-11-04",
+                    "ok": True,
+                },
+            ]
+        }
+    }
+
+    ae, state = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), old_last_run)
+    assert len(calls) == 2
+    for req in calls:
+        assert req["start"] == "2026-11-01"
+        assert req["end"] == "2026-11-10"
+        assert req["params"] == {"sort": "relevance", "fresh": True}
+        assert "cursor" not in req["params"]
+    assert "expired-from-yesterday" not in json.dumps(calls)
+    assert all(row["complete"] is True and row["covered_until"] == "2026-11-10" for row in state["queries"])
+    assert collect_mod.failed_sources({}, ae, {}, {}, {"ok": True, "status": "ok"}) == []
+
+
+def test_ae_same_run_cursor_expired_restarts_once_and_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """同轮第 2 页遇到 E_CURSOR_EXPIRED / E_CURSOR_FILTER_MISMATCH → 带 fresh=True 从首页重扫一次 → 成功且无脚注。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    calls: list[dict[str, Any]] = []
+    counts = {first: 0, second: 0}
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        calls.append(arguments)
+        q = arguments["query"]
+        counts[q] += 1
+        step = counts[q]
+        if q == first:
+            if step == 1:
+                assert arguments["params"] == {"sort": "relevance", "fresh": True}
+                return {
+                    "ok": True,
+                    "data": {
+                        "results": [{"doc_id": "alphaengine:d1", "title": "Microsoft d1", "companies": ["Microsoft"]}],
+                        "has_more": True,
+                        "cursor": "ae1:old-c1",
+                    },
+                }
+            if step == 2:
+                assert arguments["params"] == {"sort": "relevance", "cursor": "ae1:old-c1"}
+                return {
+                    "ok": False,
+                    "error": "E_CURSOR_EXPIRED: 搜索游标不存在或已超过 15 分钟，请重新检索",
+                    "data": {"error_code": "E_CURSOR_EXPIRED"},
+                }
+            if step == 3:
+                assert arguments["params"] == {"sort": "relevance", "fresh": True}
+                return {
+                    "ok": True,
+                    "data": {
+                        "results": [
+                            {"doc_id": "alphaengine:d1", "title": "Microsoft d1", "companies": ["Microsoft"]},
+                            {"doc_id": "alphaengine:d2", "title": "Microsoft d2", "companies": ["Microsoft"]},
+                        ],
+                        "has_more": True,
+                        "cursor": "ae1:new-c2",
+                    },
+                }
+            if step == 4:
+                assert arguments["params"] == {"sort": "relevance", "cursor": "ae1:new-c2"}
+                return {
+                    "ok": True,
+                    "data": {
+                        "results": [{"doc_id": "alphaengine:d3", "title": "Microsoft d3", "companies": ["Microsoft"]}],
+                        "has_more": False,
+                    },
+                }
+            raise AssertionError(step)
+
+        if step == 1:
+            assert arguments["params"] == {"sort": "relevance", "fresh": True}
+            return {
+                "ok": True,
+                "data": {
+                    "results": [{"doc_id": "alphaengine:d4", "title": "Azure d4", "companies": ["Microsoft"]}],
+                    "has_more": True,
+                    "cursor": "ae1:mismatch-c1",
+                },
+            }
+        if step == 2:
+            assert arguments["params"] == {"sort": "relevance", "cursor": "ae1:mismatch-c1"}
+            return {
+                "ok": False,
+                "error": "E_CURSOR_FILTER_MISMATCH: 翻页时 query 与筛选条件必须保持不变",
+                "data": {"error_code": "E_CURSOR_FILTER_MISMATCH"},
+            }
+        if step == 3:
+            assert arguments["params"] == {"sort": "relevance", "fresh": True}
+            return {
+                "ok": True,
+                "data": {
+                    "results": [
+                        {"doc_id": "alphaengine:d4", "title": "Azure d4", "companies": ["Microsoft"]},
+                        {"doc_id": "alphaengine:d5", "title": "Azure d5", "companies": ["Microsoft"]},
+                    ],
+                    "has_more": False,
+                },
+            }
+        raise AssertionError(step)
+
+    _patch_bridge(monkeypatch, bridge)
+    last_run = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-09", "ok": True, "window": {"start": "2026-11-06", "end": "2026-11-09"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    ae, state = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), last_run)
+    assert counts == {first: 4, second: 3}
+    assert set(ae["new"]) == {
+        "alphaengine:d1", "alphaengine:d2", "alphaengine:d3", "alphaengine:d4", "alphaengine:d5"
+    }
+    assert all(row["ok"] is True and row["complete"] is True and row["covered_until"] == "2026-11-10" for row in state["queries"])
+    assert collect_mod.failed_sources({}, ae, {}, {}, {"ok": True, "status": "ok"}) == []
+
+
+def test_ae_same_run_cursor_expired_twice_keeps_items_without_marking_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同轮重扫后再次游标失效：保留已取条目，ok=True（不记整段失败），记录未扫完原因与未覆盖日期范围。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    counts = {first: 0, second: 0}
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        q = arguments["query"]
+        counts[q] += 1
+        if q == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        step = counts[q]
+        if step == 1:
+            return {
+                "ok": True,
+                "data": {
+                    "results": [{"doc_id": "alphaengine:keep-1", "title": "Microsoft keep 1", "companies": ["Microsoft"]}],
+                    "has_more": True,
+                    "cursor": "ae1:c1",
+                },
+            }
+        if step == 2:
+            return {"ok": False, "error": "E_CURSOR_EXPIRED: expired 1", "data": {"error_code": "E_CURSOR_EXPIRED"}}
+        if step == 3:
+            return {
+                "ok": True,
+                "data": {
+                    "results": [
+                        {"doc_id": "alphaengine:keep-1", "title": "Microsoft keep 1", "companies": ["Microsoft"]},
+                        {"doc_id": "alphaengine:keep-2", "title": "Microsoft keep 2", "companies": ["Microsoft"]},
+                    ],
+                    "has_more": True,
+                    "cursor": "ae1:c2",
+                },
+            }
+        if step == 4:
+            return {"ok": False, "error": "E_CURSOR_EXPIRED: expired 2", "data": {"error_code": "E_CURSOR_EXPIRED"}}
+        raise AssertionError(step)
+
+    _patch_bridge(monkeypatch, bridge)
+    last_run = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-09", "ok": True, "window": {"start": "2026-11-06", "end": "2026-11-09"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    ae, state = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), last_run)
+    assert counts[first] == 4
+    assert {"alphaengine:keep-1", "alphaengine:keep-2"} == set(ae["new"])
+    by_q = {row["query"]: row for row in state["queries"]}
+    row1 = by_q[first]
+    assert row1["ok"] is True
+    assert row1["complete"] is False
+    assert row1["covered_until"] == "2026-11-09"
+    assert row1["cursor"] is None
+    assert "游标失效重扫后仍未扫完" in row1["error"]
+    assert "未覆盖日期：2026-11-10 至 2026-11-10" in row1["error"]
+    failures = collect_mod.failed_sources({}, ae, {}, {}, {"ok": True, "status": "ok"})
+    assert len(failures) == 1
+    assert failures[0]["source"] == "alphaengine"
+    assert "游标失效重扫后仍未扫完" in failures[0]["error"]
+    assert "2026-11-10 至 2026-11-10" in failures[0]["error"]
+
+
+def test_ae_page_cap_advances_only_completed_days_and_next_run_resumes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """达到翻页上限：covered_until 只推进到已扫完的日期，脚注写明未覆盖范围，下一轮从那里继续。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    phase = {"round": 1}
+    ae_calls: list[dict[str, Any]] = []
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        route = arguments.get("route")
+        if route == "alphaengine":
+            ae_calls.append(arguments)
+            q = arguments["query"]
+            if q == second:
+                return {"ok": True, "data": {"results": [], "has_more": False}}
+            if phase["round"] == 1:
+                # 整段 2026-11-03..2026-11-10 返回 total_upstream=200，立即转按日切分（消耗 1 页，剩余 4 页）
+                if arguments["start"] == "2026-11-03" and arguments["end"] == "2026-11-10":
+                    return {
+                        "ok": True,
+                        "data": {
+                            "results": [{"doc_id": "alphaengine:whole-1", "title": "Azure whole", "companies": ["Microsoft"]}],
+                            "has_more": True,
+                            "cursor": "ae1:whole",
+                            "total_upstream": 200,
+                        },
+                    }
+                # 2026-11-07 子窗口（含回看 11-03..11-07）：1 页扫完 -> covered_until 推进至 2026-11-07
+                if arguments["end"] == "2026-11-07":
+                    return {
+                        "ok": True,
+                        "data": {
+                            "results": [{"doc_id": "alphaengine:d07", "title": "Azure 07", "companies": ["Microsoft"], "publish_time": "2026-11-07"}],
+                            "has_more": False,
+                        },
+                    }
+                # 2026-11-08 单日：1 页扫完 -> covered_until 推进至 2026-11-08
+                if arguments["end"] == "2026-11-08":
+                    return {
+                        "ok": True,
+                        "data": {
+                            "results": [{"doc_id": "alphaengine:d08", "title": "Azure 08", "companies": ["Microsoft"], "publish_time": "2026-11-08"}],
+                            "has_more": False,
+                        },
+                    }
+                # 2026-11-09 单日：连续返回 has_more=True，用完剩余 2 页（总计 5 页上限），未扫完
+                if arguments["end"] == "2026-11-09":
+                    cur = (arguments.get("params") or {}).get("cursor")
+                    return {
+                        "ok": True,
+                        "data": {
+                            "results": [{"doc_id": f"alphaengine:d09-{cur or 'p1'}", "title": "Azure 09", "companies": ["Microsoft"], "publish_time": "2026-11-09"}],
+                            "has_more": True,
+                            "cursor": "ae1:d09-next",
+                        },
+                    }
+                raise AssertionError(arguments)
+            # 第 2 轮：从 covered_until(2026-11-08) - 3 = 2026-11-05 开始到 2026-11-11，全部扫完
+            return {
+                "ok": True,
+                "data": {
+                    "results": [{"doc_id": "alphaengine:r2-done", "title": "Azure round 2", "companies": ["Microsoft"]}],
+                    "has_more": False,
+                },
+            }
+        if route == "sec":
+            return {"ok": True, "data": {"rows": []}}
+        if route == "x-timeline":
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        return {"ok": True, "data": {"results": [], "has_more": False}}
+
+    clock = {"now": FROZEN}
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, clock)
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    _patch_consensus(monkeypatch, _consensus_ok)
+    ws = _workspace(tmp_path)
+    tracker = ws / "research" / "tracker"
+    (tracker / "last_run.json").write_text(
+        json.dumps({
+            "ticker": "MSFT",
+            "run_id": "20261106-2200",
+            "until": "2026-11-06",
+            "msft_ae_state": {
+                "queries": [
+                    {"query": q, "complete": True, "covered_until": "2026-11-06", "ok": True, "window": {"start": "2026-11-03", "end": "2026-11-06"}}
+                    for q in (first, second)
+                ]
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    code, payload = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250", "--since", "2026-11-09"])
+    assert code == 0 and payload["ok"] is True
+    q1_calls = [c for c in ae_calls if c["query"] == first]
+    assert len(q1_calls) == 1 + 1 + 1 + collect_mod.MAX_AE_PAGES
+
+    packet = _read_json(tracker / "20261110-2250" / "packet.json")
+    packet_md = (tracker / "20261110-2250" / "packet.md").read_text(encoding="utf-8")
+    by_q = {row["query"]: row for row in packet["msft_ae_state"]["queries"]}
+    assert by_q[first]["complete"] is False
+    assert by_q[first]["ok"] is True
+    assert by_q[first]["covered_until"] == "2026-11-08"
+    assert by_q[first]["cursor"] is None
+    assert by_q[second]["complete"] is True
+    assert by_q[second]["covered_until"] == "2026-11-10"
+    assert {"alphaengine:whole-1", "alphaengine:d07", "alphaengine:d08", "alphaengine:d09-p1", "alphaengine:d09-ae1:d09-next"} <= set(packet["alphaengine"]["new"])
+    assert len(payload["failed_sources"]) == 1
+    err = payload["failed_sources"][0]["error"]
+    assert "达到翻页上限" in err
+    assert "覆盖边界已推进至 2026-11-08" in err
+    assert "未覆盖日期：2026-11-09 至 2026-11-10" in err
+    assert "达到翻页上限" in packet_md and "未覆盖日期：2026-11-09 至 2026-11-10" in packet_md
+
+    code, _ = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(ws), "--run-id", "20261110-2250", "--material", "no", "--summary", "cap-partial"],
+    )
+    assert code == 0
+    last = _read_json(tracker / "last_run.json")
+    saved_by_q = {row["query"]: row for row in last["msft_ae_state"]["queries"]}
+    assert saved_by_q[first]["covered_until"] == "2026-11-08"
+    assert "cursor" not in saved_by_q[first]
+
+    # 下一轮从 covered_until(2026-11-08) - AE_LOOKBACK_DAYS(3) = 2026-11-05 继续到新 until(2026-11-11)
+    ae_calls.clear()
+    phase["round"] = 2
+    clock["now"] = datetime(2026, 11, 11, 22, 50, tzinfo=ET)
+    code, payload2 = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261111-2250"])
+    assert code == 0 and payload2["failed_sources"] == []
+    q1_r2 = [c for c in ae_calls if c["query"] == first]
+    assert len(q1_r2) == 1
+    assert q1_r2[0]["start"] == "2026-11-05"
+    assert q1_r2[0]["end"] == "2026-11-11"
+    assert q1_r2[0]["params"] == {"sort": "relevance", "fresh": True}
+    packet2 = _read_json(tracker / "20261111-2250" / "packet.json")
+    assert all(row["complete"] is True and row["covered_until"] == "2026-11-11" for row in packet2["msft_ae_state"]["queries"])
+
+
+def test_ae_window_advances_to_until_after_normal_completion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """正常完成后窗口 covered_until 推进到本轮 until，下一轮基于新 covered_until - AE_LOOKBACK_DAYS 推进到新 until。"""
+    ae_calls: list[dict[str, Any]] = []
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        route = arguments.get("route")
+        if route == "alphaengine":
+            ae_calls.append(arguments)
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        if route == "sec":
+            return {"ok": True, "data": {"rows": []}}
+        if route == "x-timeline":
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        return {"ok": True, "data": {"results": [], "has_more": False}}
+
+    clock = {"now": FROZEN}
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, clock)
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    _patch_consensus(monkeypatch, _consensus_ok)
+    ws = _workspace(tmp_path)
+    tracker = ws / "research" / "tracker"
+
+    code, payload1 = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"])
+    assert code == 0 and payload1["failed_sources"] == []
+    code, _ = _run(capsys, ["commit", "--workspace-dir", str(ws), "--run-id", "20261110-2250", "--material", "no", "--summary", "r1"])
+    assert code == 0
+    last1 = _read_json(tracker / "last_run.json")
+    assert all(row["covered_until"] == "2026-11-10" and "cursor" not in row for row in last1["msft_ae_state"]["queries"])
+
+    ae_calls.clear()
+    clock["now"] = datetime(2026, 11, 13, 22, 50, tzinfo=ET)
+    code, payload2 = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261113-2250", "--since", "2026-11-11"])
+    assert code == 0 and payload2["failed_sources"] == []
+    assert len(ae_calls) == 2
+    assert {c["start"] for c in ae_calls} == {"2026-11-07"}
+    assert {c["end"] for c in ae_calls} == {"2026-11-13"}
+    assert all(c["params"] == {"sort": "relevance", "fresh": True} for c in ae_calls)
+    code, _ = _run(capsys, ["commit", "--workspace-dir", str(ws), "--run-id", "20261113-2250", "--material", "no", "--summary", "r2"])
+    assert code == 0
+    last2 = _read_json(tracker / "last_run.json")
+    assert all(row["covered_until"] == "2026-11-13" and "cursor" not in row for row in last2["msft_ae_state"]["queries"])
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    ["hit_page_cap", "early_exit", "partial_status", "truncation_warning", "has_more_no_cursor"],
+)
+def test_ae_all_incomplete_full_scans_enter_day_split(
+    monkeypatch: pytest.MonkeyPatch,
+    trigger: str,
+) -> None:
+    """整段扫不完的所有情况（页上限、early_exit、status=partial、截断警告、has_more 无 cursor）都进入按日续采。
+
+    复现 codex 高 1：11-05 已覆盖，11-06 有 21 条（2 页）、11-07 有 69 条（4 页）、11-08 有 5 条（1 页），
+    每未覆盖日有自己的页预算，首个子窗口只含 11-06（加 3 天回看），一轮即可全部扫完并推进到 11-08。
+    """
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    ae_calls: list[dict[str, Any]] = []
+    full_pages = {"n": 0}
+    day_pages: dict[str, int] = {"2026-11-06": 0, "2026-11-07": 0, "2026-11-08": 0}
+
+    def _make_docs(prefix: str, count: int, day: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "doc_id": f"alphaengine:{prefix}-{i}",
+                "title": f"Microsoft {prefix} {i}",
+                "companies": ["Microsoft"],
+                "publish_time": day,
+            }
+            for i in range(count)
+        ]
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        ae_calls.append(arguments)
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        if arguments["start"] == "2026-11-02" and arguments["end"] == "2026-11-08":
+            full_pages["n"] += 1
+            if trigger == "hit_page_cap":
+                return {
+                    "ok": True,
+                    "data": {
+                        "results": _make_docs(f"full-p{full_pages['n']}", 20, "2026-11-07"),
+                        "has_more": True,
+                        "cursor": f"ae1:full-c{full_pages['n']}",
+                    },
+                }
+            if trigger == "early_exit":
+                return {
+                    "ok": True,
+                    "data": {
+                        "results": _make_docs("full-early", 20, "2026-11-07"),
+                        "has_more": True,
+                        "cursor": "ae1:full-early",
+                        "total_upstream": 150,
+                    },
+                }
+            if trigger == "partial_status":
+                return {
+                    "ok": True,
+                    "status": "partial",
+                    "data": {
+                        "ok": True,
+                        "status": "partial",
+                        "results": _make_docs("full-partial", 5, "2026-11-07"),
+                        "has_more": False,
+                    },
+                }
+            if trigger == "truncation_warning":
+                return {
+                    "ok": True,
+                    "data": {
+                        "results": _make_docs("full-warn", 5, "2026-11-07"),
+                        "warnings": [WIKI_WARNING],
+                        "has_more": False,
+                    },
+                }
+            return {
+                "ok": True,
+                "data": {
+                    "results": _make_docs("full-nocursor", 20, "2026-11-07"),
+                    "has_more": True,
+                    "cursor": None,
+                },
+            }
+
+        sub_end = arguments["end"]
+        day_pages[sub_end] += 1
+        p = day_pages[sub_end]
+        if sub_end == "2026-11-06":
+            assert arguments["start"] == "2026-11-03"
+            if p == 1:
+                return {"ok": True, "data": {"results": _make_docs("d06-p1", 20, "2026-11-06"), "has_more": True, "cursor": "ae1:d06-c1"}}
+            return {"ok": True, "data": {"results": _make_docs("d06-p2", 1, "2026-11-06"), "has_more": False}}
+        if sub_end == "2026-11-07":
+            assert arguments["start"] == "2026-11-07"
+            if p < 4:
+                return {"ok": True, "data": {"results": _make_docs(f"d07-p{p}", 20, "2026-11-07"), "has_more": True, "cursor": f"ae1:d07-c{p}"}}
+            return {"ok": True, "data": {"results": _make_docs("d07-p4", 9, "2026-11-07"), "has_more": False}}
+        if sub_end == "2026-11-08":
+            assert arguments["start"] == "2026-11-08"
+            return {"ok": True, "data": {"results": _make_docs("d08-p1", 5, "2026-11-08"), "has_more": False}}
+        raise AssertionError(arguments)
+
+    _patch_bridge(monkeypatch, bridge)
+    last_run = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-05", "ok": True, "window": {"start": "2026-11-02", "end": "2026-11-05"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    ae, state = collect_mod.collect_alphaengine(cfg, "2026-11-07", "2026-11-08", set(), last_run)
+    by_q = {row["query"]: row for row in state["queries"]}
+    assert by_q[first]["ok"] is True
+    assert by_q[first]["complete"] is True
+    assert by_q[first]["covered_until"] == "2026-11-08"
+    assert by_q[first]["error"] is None
+    assert day_pages == {"2026-11-06": 2, "2026-11-07": 4, "2026-11-08": 1}
+    assert "alphaengine:d06-p2-0" in ae["new"]
+    assert "alphaengine:d07-p4-8" in ae["new"]
+    assert "alphaengine:d08-p1-4" in ae["new"]
+    assert collect_mod.failed_sources({}, ae, {}, {}, {"ok": True, "status": "ok"}) == []
+
+
+def test_ae_day_split_respects_per_query_round_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """按日续采受每条查询每轮最多 20 次请求上限约束，已完成日期照常推进并写出未覆盖范围。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    q1_calls: list[dict[str, Any]] = []
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        q1_calls.append(arguments)
+        if arguments["start"] == "2026-10-12" and arguments["end"] == "2026-11-10":
+            return {
+                "ok": True,
+                "data": {"results": [], "has_more": True, "cursor": "ae1:big", "total_upstream": 500},
+            }
+        return {
+            "ok": True,
+            "data": {
+                "results": [{"doc_id": f"alphaengine:day-{arguments['end']}", "title": "Microsoft day", "companies": ["Microsoft"]}],
+                "has_more": False,
+            },
+        }
+
+    _patch_bridge(monkeypatch, bridge)
+    last_run = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-10-15", "ok": True, "window": {"start": "2026-10-12", "end": "2026-10-15"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    _ae, state = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), last_run)
+    by_q = {row["query"]: row for row in state["queries"]}
+    assert len(q1_calls) == collect_mod.MAX_AE_REQUESTS_PER_QUERY == 20
+    # 1 次整段早退 + 19 个单日（2026-10-16 .. 2026-11-03）
+    assert by_q[first]["complete"] is False
+    assert by_q[first]["ok"] is True
+    assert by_q[first]["covered_until"] == "2026-11-03"
+    assert "本轮请求次数已用完，2026-11-04 起留待下一轮" in by_q[first]["error"]
+    assert "翻页上限" not in by_q[first]["error"]
+    assert "未覆盖日期：2026-11-04 至 2026-11-10" in by_q[first]["error"]
+
+
+def test_ae_single_day_over_page_cap_advances_boundary_with_footnote_and_commits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """单日正常用完翻页预算且本轮尚未推进任何一天时，边界越过该日、写「<日期> 超过翻页上限，只取了前 N 条」并可正常 commit。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    page_counters: dict[str, int] = {}
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        key = f"{arguments['start']}..{arguments['end']}"
+        page_counters[key] = page_counters.get(key, 0) + 1
+        p = page_counters[key]
+        if arguments["start"] == "2026-11-02" and arguments["end"] == "2026-11-09":
+            return {
+                "ok": True,
+                "data": {
+                    "results": [{"doc_id": f"alphaengine:full-{p}", "title": "Microsoft full", "companies": ["Microsoft"]}],
+                    "has_more": True,
+                    "cursor": f"ae1:full-{p}",
+                    "total_upstream": 300,
+                },
+            }
+        return {
+            "ok": True,
+            "data": {
+                "results": [
+                    {
+                        "doc_id": f"alphaengine:d-{arguments['end']}-p{p}-{i}",
+                        "title": "Microsoft note",
+                        "companies": ["Microsoft"],
+                        "publish_time": arguments["end"],
+                    }
+                    for i in range(20)
+                ],
+                "has_more": True,
+                "cursor": f"ae1:d-{p}",
+            },
+        }
+
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+
+    # 场景 1：多日积压，首个未覆盖日 2026-11-06 用满 5 页仍 has_more=true -> 越过 2026-11-06
+    last_multi = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-05", "ok": True, "window": {"start": "2026-11-02", "end": "2026-11-05"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    ae1, state1 = collect_mod.collect_alphaengine(cfg, "2026-11-08", "2026-11-09", set(), last_multi)
+    row1 = {row["query"]: row for row in state1["queries"]}[first]
+    assert row1["ok"] is True and row1["complete"] is False
+    assert row1["covered_until"] == "2026-11-06"
+    assert "2026-11-06 超过翻页上限，只取了前 100 条" in row1["error"]
+    assert "未覆盖日期：2026-11-07 至 2026-11-09" in row1["error"]
+    assert len([k for k in ae1["new"] if k.startswith("alphaengine:d-2026-11-06-")]) == 100
+
+    # 场景 2：仅 1 个待扫日 2026-11-10 用满 5 页仍 has_more=true -> 越过 2026-11-10 且 commit 放行
+    page_counters.clear()
+    last_single = {
+        "ticker": "MSFT",
+        "run_id": "20261109-2200",
+        "until": "2026-11-09",
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-09", "ok": True, "window": {"start": "2026-11-06", "end": "2026-11-09"}}
+                for q in (first, second)
+            ]
+        },
+    }
+    _ae2, state2 = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), last_single)
+    row2 = {row["query"]: row for row in state2["queries"]}[first]
+    assert row2["ok"] is True and row2["complete"] is False
+    assert row2["covered_until"] == "2026-11-10"
+    assert "2026-11-10 超过翻页上限，只取了前 100 条" in row2["error"]
+
+    ws = _workspace(tmp_path)
+    (ws / "data" / "consensus" / "snap.json").write_text("{}", encoding="utf-8")
+    (ws / "research" / "tracker" / "last_run.json").write_text(json.dumps(last_single), encoding="utf-8")
+    _write_packet(ws, "20261110-2250", "2026-11-10", ae=state2, collected_at="2026-11-10T22:50:00-05:00")
+    code, payload = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(ws), "--run-id", "20261110-2250", "--material", "no", "--summary", "single-day-cap"],
+    )
+    assert code == 0 and payload["ok"] is True
+    saved = {row["query"]: row for row in _read_json(ws / "research" / "tracker" / "last_run.json")["msft_ae_state"]["queries"]}
+    assert saved[first]["covered_until"] == "2026-11-10"
+
+
+@pytest.mark.parametrize("stale_kind", ["stale_flag", "cursor_unavailable", "day2_bridge_cache_stale"])
+def test_ae_stale_and_cursor_unavailable_keep_items_without_advancing_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    stale_kind: str,
+) -> None:
+    """响应带 stale=true 或 cursor_unavailable 时，已取条目照常入包，该窗口不推进 covered_until，脚注写缓存提示。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        if stale_kind == "stale_flag":
+            # 复现 codex 高 2：仅 1 页、has_more=False 但 stale=True
+            return {
+                "ok": True,
+                "data": {
+                    "stale": True,
+                    "results": [{"doc_id": "alphaengine:stale-1", "title": "Microsoft cached", "companies": ["Microsoft"]}],
+                    "has_more": False,
+                },
+            }
+        if stale_kind == "cursor_unavailable":
+            return {
+                "ok": True,
+                "data": {
+                    "cursor_unavailable": "upstream_down",
+                    "results": [{"doc_id": "alphaengine:cu-1", "title": "Microsoft cu", "companies": ["Microsoft"]}],
+                    "has_more": False,
+                },
+            }
+        # day2_bridge_cache_stale：整段早退 -> 11-06 正常完成 -> 11-07 返回 _bridge_cache.stale=True
+        if arguments["start"] == "2026-11-02" and arguments["end"] == "2026-11-08":
+            return {
+                "ok": True,
+                "data": {
+                    "results": [{"doc_id": "alphaengine:shared", "title": "Microsoft fresh", "companies": ["Microsoft"], "snippet": "fresh snippet"}],
+                    "has_more": True,
+                    "cursor": "ae1:w",
+                    "total_upstream": 200,
+                },
+            }
+        if arguments["end"] == "2026-11-06":
+            return {
+                "ok": True,
+                "data": {
+                    "results": [{"doc_id": "alphaengine:d06", "title": "Microsoft 06", "companies": ["Microsoft"]}],
+                    "has_more": False,
+                },
+            }
+        if arguments["end"] == "2026-11-07":
+            return {
+                "ok": True,
+                "data": {
+                    "_bridge_cache": {"stale": True, "status": "stale"},
+                    "results": [
+                        {"doc_id": "alphaengine:shared", "title": "Microsoft stale dup", "companies": ["Microsoft"], "snippet": "stale snippet"},
+                        {"doc_id": "alphaengine:d07-stale", "title": "Microsoft 07 stale", "companies": ["Microsoft"]},
+                    ],
+                    "has_more": False,
+                },
+            }
+        raise AssertionError(arguments)
+
+    _patch_bridge(monkeypatch, bridge)
+    last_run = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-05", "ok": True, "window": {"start": "2026-11-02", "end": "2026-11-05"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    end_day = "2026-11-08" if stale_kind == "day2_bridge_cache_stale" else "2026-11-10"
+    ae, state = collect_mod.collect_alphaengine(cfg, "2026-11-07", end_day, set(), last_run)
+    row1 = {row["query"]: row for row in state["queries"]}[first]
+    assert row1["complete"] is False
+    assert "AlphaEngine 暂时不可用，返回的是缓存结果" in row1["error"]
+
+    if stale_kind == "stale_flag":
+        assert "alphaengine:stale-1" in ae["new"]
+        assert row1["covered_until"] == "2026-11-05"
+        assert "未覆盖日期：2026-11-06 至 2026-11-10" in row1["error"]
+    elif stale_kind == "cursor_unavailable":
+        assert "alphaengine:cu-1" in ae["new"]
+        assert row1["covered_until"] == "2026-11-05"
+        assert "未覆盖日期：2026-11-06 至 2026-11-10" in row1["error"]
+    else:
+        assert {"alphaengine:shared", "alphaengine:d06", "alphaengine:d07-stale"} <= set(ae["new"])
+        # 正常取得的版本优先于过期缓存版本
+        assert ae["new"]["alphaengine:shared"]["snippet"] == "fresh snippet"
+        assert row1["covered_until"] == "2026-11-06"
+        assert "覆盖边界已推进至 2026-11-06" in row1["error"]
+        assert "未覆盖日期：2026-11-07 至 2026-11-08" in row1["error"]
+
+    failures = collect_mod.failed_sources({}, ae, {}, {}, {"ok": True, "status": "ok"})
+    assert len(failures) == 1
+    assert "AlphaEngine 暂时不可用，返回的是缓存结果" in failures[0]["error"]
+
+
+def test_ae_cursor_expired_restarts_within_query_budget_and_never_blames_page_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """只要本条查询本轮还有剩余请求次数，第一次游标失效就重扫；游标失效导致停止时脚注绝不写「已达翻页上限」。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+
+    # 场景 1（复现 codex 中 3）：多日整段第 4 次请求首次 E_CURSOR_EXPIRED -> 整段 4 页已满但本查询还有剩余请求 -> 第 5 次带 fresh=True 重扫并成功
+    calls_1: list[dict[str, Any]] = []
+
+    def bridge_restart_on_4th(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        calls_1.append(arguments)
+        step = len(calls_1)
+        if step in (1, 2, 3):
+            return {
+                "ok": True,
+                "data": {
+                    "results": [{"doc_id": f"alphaengine:p{step}", "title": "Microsoft", "companies": ["Microsoft"]}],
+                    "has_more": True,
+                    "cursor": f"ae1:c{step}",
+                },
+            }
+        if step == 4:
+            assert arguments["params"] == {"sort": "relevance", "cursor": "ae1:c3"}
+            return {
+                "ok": False,
+                "error": "E_CURSOR_EXPIRED: expired on 4th request",
+                "data": {"error_code": "E_CURSOR_EXPIRED"},
+            }
+        if step == 5:
+            assert arguments["params"] == {"sort": "relevance", "fresh": True}
+            return {
+                "ok": True,
+                "data": {
+                    "results": [{"doc_id": "alphaengine:p5-fresh", "title": "Microsoft fresh", "companies": ["Microsoft"]}],
+                    "has_more": False,
+                },
+            }
+        raise AssertionError(step)
+
+    _patch_bridge(monkeypatch, bridge_restart_on_4th)
+    last_multi = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-05", "ok": True, "window": {"start": "2026-11-02", "end": "2026-11-05"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    ae1, state1 = collect_mod.collect_alphaengine(cfg, "2026-11-07", "2026-11-10", set(), last_multi)
+    row1 = {row["query"]: row for row in state1["queries"]}[first]
+    assert len(calls_1) == 5
+    assert row1["ok"] is True and row1["complete"] is True and row1["covered_until"] == "2026-11-10"
+    assert "alphaengine:p5-fresh" in ae1["new"]
+    assert collect_mod.failed_sources({}, ae1, {}, {}, {"ok": True, "status": "ok"}) == []
+
+    # 场景 2：在查询本轮最后一次请求（第 5/5 次）才首次游标失效 -> 无剩余预算可重扫，脚注不得写「已达翻页上限」
+    monkeypatch.setattr(collect_mod, "MAX_AE_REQUESTS_PER_QUERY", 5)
+    calls_2: list[dict[str, Any]] = []
+
+    def bridge_expire_on_last_request(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        calls_2.append(arguments)
+        step = len(calls_2)
+        if step < 5:
+            return {
+                "ok": True,
+                "data": {
+                    "results": [{"doc_id": f"alphaengine:last-{step}", "title": "Microsoft", "companies": ["Microsoft"]}],
+                    "has_more": True,
+                    "cursor": f"ae1:last-{step}",
+                },
+            }
+        return {
+            "ok": False,
+            "error": "E_CURSOR_EXPIRED: expired on last request",
+            "data": {"error_code": "E_CURSOR_EXPIRED"},
+        }
+
+    _patch_bridge(monkeypatch, bridge_expire_on_last_request)
+    last_single = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-09", "ok": True, "window": {"start": "2026-11-06", "end": "2026-11-09"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    _ae2, state2 = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), last_single)
+    row2 = {row["query"]: row for row in state2["queries"]}[first]
+    assert len(calls_2) == 5
+    assert row2["ok"] is True and row2["complete"] is False and row2["covered_until"] == "2026-11-09"
+    assert "游标失效" in row2["error"]
+    assert "已达翻页上限" not in row2["error"]
+    assert "达到翻页上限" not in row2["error"]
+
+
+def test_ae_capability_disabled_skips_alphaengine_cleanly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """alphaengine 能力关闭时，采集直接跳过 AlphaEngine，不发请求、不写失败、不写脚注，其他来源照常。"""
+    from src.dalton.capabilities import CapabilityId
+    from src.dalton.content_assembly import assemble_json_text
+
+    # The sandbox learns the capability only from the config the backend assembles,
+    # so the test drives the real path: assemble with alphaengine off, then collect.
+    called_routes: list[str] = []
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        route = str(arguments.get("route") or "")
+        called_routes.append(route)
+        assert route != "alphaengine", "alphaengine capability is disabled; must not call alphaengine"
+        if route == "sec":
+            return {"ok": True, "data": {"rows": []}}
+        if route == "x-timeline":
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        return {"ok": True, "data": {"results": [], "has_more": False}}
+
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    _patch_consensus(monkeypatch, _consensus_ok)
+
+    # 3) 沙箱上传装配路径：assemble_json_text 在 Everflow 全开时原样返回，在 alphaengine 关闭时注入 sources.alphaengine=false
+    skill_dir = REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-bullbear-tracker"
+    everflow_caps = frozenset(CapabilityId) - {CapabilityId.TRANSCRIPTION}
+    no_ae_caps = everflow_caps - {CapabilityId.ALPHAENGINE}
+
+    fake_skill = tmp_path / "assembled-skill"
+    (fake_skill / "config").mkdir(parents=True)
+    (fake_skill / "references").mkdir(parents=True)
+    (fake_skill / "references" / "common-rules.md").write_text("# Common\n", encoding="utf-8")
+
+    for ticker_name in ("MSFT", "ANT"):
+        src_cfg = skill_dir / "config" / f"{ticker_name}.json"
+        raw = src_cfg.read_text(encoding="utf-8")
+        assert assemble_json_text(raw, path=src_cfg, capabilities=everflow_caps) == raw
+        assembled = assemble_json_text(raw, path=src_cfg, capabilities=no_ae_caps)
+        parsed_assembled = json.loads(assembled)
+        assert parsed_assembled["sources"]["alphaengine"] is False
+        assert parsed_assembled["_dalton_cap_alphaengine"] is False
+        (fake_skill / "config" / f"{ticker_name}.json").write_text(assembled, encoding="utf-8")
+        (fake_skill / "references" / f"{ticker_name.lower()}-rules.md").write_text(f"# {ticker_name}\n", encoding="utf-8")
+
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+    called_routes.clear()
+    ws_msft = _workspace(tmp_path / "assembled-msft", ticker="MSFT")
+    code_m, payload_m = _run(capsys, ["collect", "--workspace-dir", str(ws_msft), "--run-id", "20261110-asm"])
+    assert code_m == 0 and payload_m["failed_sources"] == []
+    assert "alphaengine" not in called_routes
+    assert "tmtb" in called_routes
+
+    called_routes.clear()
+    ws_ant = _workspace(tmp_path / "assembled-ant", ticker="ANT")
+    _patch_consensus(monkeypatch, lambda ticker, benchmark="QQQ": {**_consensus_ok("MSFT", benchmark), "ticker": ticker})
+    code_a, payload_a = _run(capsys, ["collect", "--workspace-dir", str(ws_ant), "--run-id", "20261110-asm-ant"], ticker="ANT")
+    assert code_a == 0 and payload_a["failed_sources"] == []
+    assert "alphaengine" not in called_routes
+    assert "tmtb" in called_routes
+
+
+@pytest.mark.parametrize("partial_page", [1, 2])
+def test_ae_partial_status_with_cursor_enters_day_split(
+    monkeypatch: pytest.MonkeyPatch,
+    partial_page: int,
+) -> None:
+    """首页或中间页返回 status=partial 且带有效 cursor 时，进入按日续采，不能把覆盖推进到整段末尾。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    full_pages = {"n": 0}
+    day_pages: dict[str, int] = {"2026-11-06": 0, "2026-11-07": 0, "2026-11-08": 0}
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        if arguments["start"] == "2026-11-02" and arguments["end"] == "2026-11-08":
+            full_pages["n"] += 1
+            p = full_pages["n"]
+            if p == partial_page:
+                return {
+                    "ok": True,
+                    "status": "partial",
+                    "data": {
+                        "ok": True,
+                        "status": "partial",
+                        "results": [
+                            {
+                                "doc_id": f"alphaengine:full-p{p}",
+                                "title": "Microsoft partial",
+                                "companies": ["Microsoft"],
+                                "publish_time": "2026-11-07",
+                            }
+                        ],
+                        "has_more": True,
+                        "cursor": f"ae1:full-partial-{p}",
+                    },
+                }
+            if p < partial_page:
+                return {
+                    "ok": True,
+                    "data": {
+                        "results": [
+                            {
+                                "doc_id": f"alphaengine:full-ok-{p}",
+                                "title": "Microsoft ok",
+                                "companies": ["Microsoft"],
+                                "publish_time": "2026-11-07",
+                            }
+                        ],
+                        "has_more": True,
+                        "cursor": f"ae1:full-ok-{p}",
+                    },
+                }
+            # 若误继续翻页就会在末页正常结束并把覆盖推进到 11-08
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        sub_end = arguments["end"]
+        day_pages[sub_end] += 1
+        return {
+            "ok": True,
+            "data": {
+                "results": [
+                    {
+                        "doc_id": f"alphaengine:day-{sub_end}",
+                        "title": f"Microsoft {sub_end}",
+                        "companies": ["Microsoft"],
+                        "publish_time": sub_end,
+                    }
+                ],
+                "has_more": False,
+            },
+        }
+
+    _patch_bridge(monkeypatch, bridge)
+    last_run = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-05", "ok": True, "window": {"start": "2026-11-02", "end": "2026-11-05"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    ae, state = collect_mod.collect_alphaengine(cfg, "2026-11-07", "2026-11-08", set(), last_run)
+    by_q = {row["query"]: row for row in state["queries"]}
+    assert full_pages["n"] == partial_page
+    assert day_pages == {"2026-11-06": 1, "2026-11-07": 1, "2026-11-08": 1}
+    assert by_q[first]["ok"] is True and by_q[first]["complete"] is True
+    assert by_q[first]["covered_until"] == "2026-11-08"
+    assert {"alphaengine:day-2026-11-06", "alphaengine:day-2026-11-07", "alphaengine:day-2026-11-08"} <= set(ae["new"])
+
+    # 单日窗口整段首页返回 status=partial 且带 cursor 时，先用剩余预算按日单独查 [待采日, 待采日]；
+    # 若子窗口也返回 status=partial 且带 cursor，则不再继续翻页且不推进覆盖
+    single_windows: list[tuple[str, str]] = []
+
+    def single_bridge_both_partial(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        single_windows.append((arguments["start"], arguments["end"]))
+        return {
+            "ok": True,
+            "status": "partial",
+            "data": {
+                "ok": True,
+                "status": "partial",
+                "results": [{"doc_id": f"alphaengine:single-p{len(single_windows)}", "title": "Microsoft", "companies": ["Microsoft"], "publish_time": "2026-11-10"}],
+                "has_more": True,
+                "cursor": f"ae1:single-c{len(single_windows)}",
+            },
+        }
+
+    _patch_bridge(monkeypatch, single_bridge_both_partial)
+    last_single = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-09", "ok": True, "window": {"start": "2026-11-06", "end": "2026-11-09"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    _ae_s, state_s = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), last_single)
+    row_s = {row["query"]: row for row in state_s["queries"]}[first]
+    assert single_windows == [("2026-11-07", "2026-11-10"), ("2026-11-10", "2026-11-10")]
+    assert row_s["ok"] is True and row_s["complete"] is False
+    assert row_s["covered_until"] == "2026-11-09"
+    assert "未覆盖日期：2026-11-10 至 2026-11-10" in row_s["error"]
+
+
+@pytest.mark.parametrize("fail_page", [1, 2])
+def test_ae_upstream_cursor_error_enters_day_split(
+    monkeypatch: pytest.MonkeyPatch,
+    fail_page: int,
+) -> None:
+    """MCP 返回 E_UPSTREAM_CURSOR 时，只要还有请求预算，按整段扫不完进入按日续采，不当成普通失败直接结束。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    full_pages = {"n": 0}
+    day_pages: dict[str, int] = {"2026-11-06": 0, "2026-11-07": 0, "2026-11-08": 0}
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        if arguments["start"] == "2026-11-02" and arguments["end"] == "2026-11-08":
+            full_pages["n"] += 1
+            p = full_pages["n"]
+            if p == fail_page:
+                return {
+                    "ok": False,
+                    "error": "E_UPSTREAM_CURSOR: 上游声明还有数据但未推进游标；不能把部分结果当作全量",
+                    "data": {"error": "E_UPSTREAM_CURSOR: 上游声明还有数据但未推进游标；不能把部分结果当作全量"},
+                }
+            return {
+                "ok": True,
+                "data": {
+                    "results": [{"doc_id": f"alphaengine:u-p{p}", "title": "Microsoft", "companies": ["Microsoft"], "publish_time": "2026-11-07"}],
+                    "has_more": True,
+                    "cursor": f"ae1:u-{p}",
+                },
+            }
+        sub_end = arguments["end"]
+        day_pages[sub_end] += 1
+        return {
+            "ok": True,
+            "data": {
+                "results": [{"doc_id": f"alphaengine:u-day-{sub_end}", "title": "Microsoft", "companies": ["Microsoft"], "publish_time": sub_end}],
+                "has_more": False,
+            },
+        }
+
+    _patch_bridge(monkeypatch, bridge)
+    last_run = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-05", "ok": True, "window": {"start": "2026-11-02", "end": "2026-11-05"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    ae, state = collect_mod.collect_alphaengine(cfg, "2026-11-07", "2026-11-08", set(), last_run)
+    by_q = {row["query"]: row for row in state["queries"]}
+    assert full_pages["n"] == fail_page
+    assert day_pages == {"2026-11-06": 1, "2026-11-07": 1, "2026-11-08": 1}
+    assert by_q[first]["ok"] is True and by_q[first]["complete"] is True
+    assert by_q[first]["covered_until"] == "2026-11-08"
+    assert collect_mod.failed_sources({}, ae, {}, {}, {"ok": True, "status": "ok"}) == []
+
+    # 单日子窗口也遇到 E_UPSTREAM_CURSOR 时，该日不推进覆盖，前面已完成的日期保留
+    def bridge_day2_fail(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        if arguments["start"] == "2026-11-02" and arguments["end"] == "2026-11-08":
+            return {"ok": False, "error": "E_UPSTREAM_CURSOR: 上游声明还有数据但未推进游标", "data": {}}
+        if arguments["end"] == "2026-11-06":
+            return {"ok": True, "data": {"results": [{"doc_id": "alphaengine:d06", "title": "Microsoft", "companies": ["Microsoft"], "publish_time": "2026-11-06"}], "has_more": False}}
+        if arguments["end"] == "2026-11-07":
+            return {"ok": False, "error": "E_UPSTREAM_CURSOR: 上游声明还有数据但未推进游标", "data": {}}
+        raise AssertionError(arguments)
+
+    _patch_bridge(monkeypatch, bridge_day2_fail)
+    ae2, state2 = collect_mod.collect_alphaengine(cfg, "2026-11-07", "2026-11-08", set(), last_run)
+    row2 = {row["query"]: row for row in state2["queries"]}[first]
+    assert row2["complete"] is False and row2["covered_until"] == "2026-11-06"
+    assert "E_UPSTREAM_CURSOR" in row2["error"]
+    assert "未覆盖日期：2026-11-07 至 2026-11-08" in row2["error"]
+    assert collect_mod.failed_sources({}, ae2, {}, {}, {"ok": True, "status": "ok"})
+
+
+def test_ae_single_pending_day_start_and_lookback_crowded_handling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单个待采日窗口从 [待采日 - AE_LOOKBACK_DAYS, until] 开始；回看日占满页数时不越过该日。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+
+    # 1) 已覆盖到 11-09、until 11-10 时，请求从 11-07 开始（不论 since 是 11-09 还是 11-08）
+    seen_windows: list[tuple[str, str]] = []
+
+    def bridge_capture(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == first:
+            seen_windows.append((arguments["start"], arguments["end"]))
+        return {"ok": True, "data": {"results": [], "has_more": False}}
+
+    _patch_bridge(monkeypatch, bridge_capture)
+    last_1109 = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-09", "ok": True, "window": {"start": "2026-11-06", "end": "2026-11-09"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    for since_day in ("2026-11-09", "2026-11-08", "2026-11-01"):
+        seen_windows.clear()
+        _ae, state = collect_mod.collect_alphaengine(cfg, since_day, "2026-11-10", set(), last_1109)
+        assert seen_windows == [("2026-11-07", "2026-11-10")]
+        row = {r["query"]: r for r in state["queries"]}[first]
+        assert row["window"] == {"start": "2026-11-07", "end": "2026-11-10"}
+        assert row["complete"] is True and row["covered_until"] == "2026-11-10"
+
+    # 2) 单日超上限但 5 页全部是回看日文档（2026-11-03）：覆盖不越过 2026-11-06，脚注写「回看日文档较多，2026-11-06 留待下一轮」
+    page_no = {"n": 0}
+
+    def bridge_all_lookback(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        page_no["n"] += 1
+        p = page_no["n"]
+        assert arguments["start"] == "2026-11-03" and arguments["end"] == "2026-11-06"
+        return {
+            "ok": True,
+            "data": {
+                "results": [
+                    {
+                        "doc_id": f"alphaengine:old-p{p}-{i}",
+                        "title": "Microsoft old",
+                        "companies": ["Microsoft"],
+                        "publish_time": "2026-11-03 10:00:00",
+                    }
+                    for i in range(20)
+                ],
+                "has_more": True,
+                "cursor": f"ae1:old-{p}",
+            },
+        }
+
+    _patch_bridge(monkeypatch, bridge_all_lookback)
+    last_1105 = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-05", "ok": True, "window": {"start": "2026-11-02", "end": "2026-11-05"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    _ae_lb, state_lb = collect_mod.collect_alphaengine(cfg, "2026-11-05", "2026-11-06", set(), last_1105)
+    row_lb = {r["query"]: r for r in state_lb["queries"]}[first]
+    assert page_no["n"] == collect_mod.MAX_AE_PAGES
+    assert row_lb["ok"] is True and row_lb["complete"] is False
+    assert row_lb["covered_until"] == "2026-11-05"
+    assert "回看日文档较多，2026-11-06 留待下一轮" in row_lb["error"]
+    assert "超过翻页上限" not in row_lb["error"]
+
+    # 3) 同一窗口确实取到了待采日（2026-11-06）文档时，覆盖越过 2026-11-06 并写「2026-11-06 超过翻页上限」
+    page_no["n"] = 0
+
+    def bridge_with_target_day(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        page_no["n"] += 1
+        p = page_no["n"]
+        return {
+            "ok": True,
+            "data": {
+                "results": [
+                    {
+                        "doc_id": f"alphaengine:mix-p{p}-{i}",
+                        "title": "Microsoft mix",
+                        "companies": ["Microsoft"],
+                        "publish_time": "2026-11-06" if (p == 5 and i == 0) else "2026-11-03",
+                    }
+                    for i in range(20)
+                ],
+                "has_more": True,
+                "cursor": f"ae1:mix-{p}",
+            },
+        }
+
+    _patch_bridge(monkeypatch, bridge_with_target_day)
+    _ae_mix, state_mix = collect_mod.collect_alphaengine(cfg, "2026-11-05", "2026-11-06", set(), last_1105)
+    row_mix = {r["query"]: r for r in state_mix["queries"]}[first]
+    assert row_mix["ok"] is True and row_mix["complete"] is False
+    assert row_mix["covered_until"] == "2026-11-06"
+    assert "2026-11-06 超过翻页上限，只取了前 100 条" in row_mix["error"]
+
+    # 4) 多日按日切分的首子窗口（11-03..11-06）同样遵循：全是回看日文档时不越过 11-06
+    sub_pages = {"n": 0}
+
+    def bridge_multi_all_lookback(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        if arguments["start"] == "2026-11-02" and arguments["end"] == "2026-11-08":
+            return {"ok": True, "data": {"results": [], "has_more": True, "cursor": "ae1:m", "total_upstream": 300}}
+        sub_pages["n"] += 1
+        p = sub_pages["n"]
+        assert arguments["start"] == "2026-11-03" and arguments["end"] == "2026-11-06"
+        return {
+            "ok": True,
+            "data": {
+                "results": [
+                    {
+                        "doc_id": f"alphaengine:mlb-p{p}-{i}",
+                        "title": "Microsoft old",
+                        "companies": ["Microsoft"],
+                        "publish_time": "2026-11-04",
+                    }
+                    for i in range(20)
+                ],
+                "has_more": True,
+                "cursor": f"ae1:mlb-{p}",
+            },
+        }
+
+    _patch_bridge(monkeypatch, bridge_multi_all_lookback)
+    _ae_mlb, state_mlb = collect_mod.collect_alphaengine(cfg, "2026-11-07", "2026-11-08", set(), last_1105)
+    row_mlb = {r["query"]: r for r in state_mlb["queries"]}[first]
+    assert row_mlb["ok"] is True and row_mlb["complete"] is False
+    assert row_mlb["covered_until"] == "2026-11-05"
+    assert "回看日文档较多，2026-11-06 留待下一轮" in row_mlb["error"]
+    assert "未覆盖日期：2026-11-06 至 2026-11-08" in row_mlb["error"]
+
+
+def test_researchdata_bridge_disabled_skips_bridge_sources_and_keeps_market_and_news(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """researchdata_bridge 能力关闭时，跳过依赖桥的来源，行情和网页新闻照常进入数据包且不写失败。"""
+    from src.dalton.capabilities import CapabilityId
+    from src.dalton.content_assembly import assemble_json_text
+
+    def _forbid_bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        raise AssertionError(f"bridge should not be called when researchdata_bridge is disabled: {arguments}")
+
+    _patch_bridge(monkeypatch, _forbid_bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": None, "error": "researchdata_transport_unconfigured"})
+    _patch_consensus(monkeypatch, _consensus_ok)
+
+    skill_dir = REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-bullbear-tracker"
+    everflow_caps = frozenset(CapabilityId) - {CapabilityId.TRANSCRIPTION}
+    no_bridge_caps = frozenset({CapabilityId.FUND_AUTOMATIONS})
+
+    fake_skill = tmp_path / "no-bridge-skill"
+    (fake_skill / "config").mkdir(parents=True)
+    (fake_skill / "references").mkdir(parents=True)
+    (fake_skill / "references" / "common-rules.md").write_text("# Common\n", encoding="utf-8")
+
+    for ticker_name in ("MSFT", "ANT"):
+        src_cfg = skill_dir / "config" / f"{ticker_name}.json"
+        raw = src_cfg.read_text(encoding="utf-8")
+        assert assemble_json_text(raw, path=src_cfg, capabilities=everflow_caps) == raw
+        assembled = assemble_json_text(raw, path=src_cfg, capabilities=no_bridge_caps)
+        parsed = json.loads(assembled)
+        assert parsed["_dalton_cap_researchdata_bridge"] is False
+        assert parsed["_dalton_cap_alphaengine"] is False
+        assert parsed["sources"]["internal"] is False
+        assert parsed["sources"]["alphaengine"] is False
+        assert parsed["sources"]["sec"] is False
+        assert parsed["sources"]["x"] is False
+        (fake_skill / "config" / f"{ticker_name}.json").write_text(assembled, encoding="utf-8")
+        (fake_skill / "references" / f"{ticker_name.lower()}-rules.md").write_text(f"# {ticker_name}\n", encoding="utf-8")
+
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+
+    ws_msft = _workspace(tmp_path / "ws-msft", ticker="MSFT")
+    code_m, payload_m = _run(capsys, ["collect", "--workspace-dir", str(ws_msft), "--run-id", "20261110-nobridge"])
+    assert code_m == 0 and payload_m["ok"] is True and payload_m["failed_sources"] == []
+    packet_m = _read_json(ws_msft / "research" / "tracker" / "20261110-nobridge" / "packet.json")
+    assert packet_m["consensus"]["price"]["close"] == 400
+    assert packet_m["news"]["status"] == "pending_agent_search"
+    assert packet_m["news"]["queries"]
+    assert packet_m["internal"]["status"] == {}
+    assert packet_m["alphaengine"] == {"status": [], "new": {}}
+    assert packet_m["sec"] == {"status": [], "new": {}}
+    assert packet_m["x"]["status"] == []
+
+    ws_ant = _workspace(tmp_path / "ws-ant", ticker="ANT")
+    _patch_consensus(monkeypatch, lambda ticker, benchmark="QQQ": {**_consensus_ok("MSFT", benchmark), "ticker": ticker})
+    code_a, payload_a = _run(capsys, ["collect", "--workspace-dir", str(ws_ant), "--run-id", "20261110-nobridge-ant"], ticker="ANT")
+    assert code_a == 0 and payload_a["ok"] is True and payload_a["failed_sources"] == []
+    packet_a = _read_json(ws_ant / "research" / "tracker" / "20261110-nobridge-ant" / "packet.json")
+    assert packet_a["consensus"]["price"]["close"] == 400
+    assert packet_a["news"]["status"] == "pending_agent_search"
+    assert packet_a["news"]["queries"]
+
+
+@pytest.mark.parametrize("disabled_mode", ["alphaengine_off", "bridge_off"])
+def test_ae_disabled_commit_preserves_covered_until_and_resumes_when_reenabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    disabled_mode: str,
+) -> None:
+    """AlphaEngine 被跳过的轮次提交时保留 last_run.json 原有的 AE 查询状态；重新开启后从原 covered_until 继续。"""
+    from src.dalton.capabilities import CapabilityId
+    from src.dalton.content_assembly import assemble_json_text
+
+    skill_dir = REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-bullbear-tracker"
+    src_cfg = skill_dir / "config" / "MSFT.json"
+    raw_cfg = src_cfg.read_text(encoding="utf-8")
+    parsed_raw = json.loads(raw_cfg)
+    first, second = parsed_raw["ae_queries"]
+
+    caps_off = (
+        frozenset(CapabilityId) - {CapabilityId.TRANSCRIPTION, CapabilityId.ALPHAENGINE}
+        if disabled_mode == "alphaengine_off"
+        else frozenset({CapabilityId.FUND_AUTOMATIONS})
+    )
+    assembled_off = assemble_json_text(raw_cfg, path=src_cfg, capabilities=caps_off)
+
+    fake_skill = tmp_path / "skill-toggle"
+    (fake_skill / "config").mkdir(parents=True)
+    (fake_skill / "references").mkdir(parents=True)
+    (fake_skill / "references" / "common-rules.md").write_text("# Common\n", encoding="utf-8")
+    (fake_skill / "references" / "msft-rules.md").write_text("# MSFT\n", encoding="utf-8")
+    (fake_skill / "config" / "MSFT.json").write_text(assembled_off, encoding="utf-8")
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+
+    ws = _workspace(tmp_path / "ws-toggle")
+    tracker = ws / "research" / "tracker"
+    initial_queries = [
+        {
+            "query": q,
+            "window": {"start": "2026-11-02", "end": "2026-11-05"},
+            "has_more": False,
+            "complete": True,
+            "covered_until": "2026-11-05",
+            "ok": True,
+            "returned": 3,
+            "error": None,
+        }
+        for q in (first, second)
+    ]
+    seed_last = {
+        "ticker": "MSFT",
+        "run_id": "20261105-2200",
+        "committed_at": "2026-11-05T22:00:00-05:00",
+        "collected_at": "2026-11-05T22:00:00-05:00",
+        "since": "2026-11-04",
+        "until": "2026-11-05",
+        "snapshot_file": "data/consensus/2026-11-05_2200.json",
+        "material": "no",
+        "summary": "seed",
+        "msft_ae_state": {"queries": initial_queries},
+    }
+    (tracker / "last_run.json").write_text(json.dumps(seed_last), encoding="utf-8")
+
+    ae_calls: list[dict[str, Any]] = []
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments.get("route") == "alphaengine":
+            ae_calls.append(arguments)
+        if arguments.get("route") == "sec":
+            return {"ok": True, "data": {"rows": []}}
+        if arguments.get("route") == "x-timeline":
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        return {"ok": True, "data": {"results": [], "has_more": False}}
+
+    clock = {"now": datetime(2026, 11, 24, 22, 50, tzinfo=ET)}
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, clock)
+    _patch_transport(
+        monkeypatch,
+        {"mode": None, "error": "researchdata_transport_unconfigured"} if disabled_mode == "bridge_off" else {"mode": "bridge"},
+    )
+    _patch_consensus(monkeypatch, _consensus_ok)
+
+    code_c, payload_c = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261124-2250"])
+    assert code_c == 0 and payload_c["failed_sources"] == []
+    assert ae_calls == []
+    code_m, payload_m = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(ws), "--run-id", "20261124-2250", "--material", "no", "--summary", "ae-off"],
+    )
+    assert code_m == 0 and payload_m["ok"] is True
+
+    last_after_off = _read_json(tracker / "last_run.json")
+    assert last_after_off["until"] == "2026-11-24"
+    assert last_after_off["msft_ae_state"]["queries"] == initial_queries
+
+    # 25 日重新开启能力后，从原 covered_until（11-05）继续，首个请求起点为 11-02，而非 11-21
+    (fake_skill / "config" / "MSFT.json").write_text(raw_cfg, encoding="utf-8")
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    clock["now"] = datetime(2026, 11, 25, 22, 50, tzinfo=ET)
+    code_on, payload_on = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261125-2250"])
+    assert code_on == 0 and payload_on["failed_sources"] == []
+    assert len(ae_calls) == 2
+    assert {c["start"] for c in ae_calls} == {"2026-11-02"}
+    assert {c["end"] for c in ae_calls} == {"2026-11-25"}
+
+
+def test_ae_round_cap_footnote_distinguished_from_single_day_page_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """复现 codex 低 6：整段 4 次 + 前三天各 5 次 + 第 4 天仅剩 1 次仍 has_more，脚注写本轮请求次数已用完而非翻页上限。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    day_pages: dict[str, int] = {}
+    q1_total = {"n": 0}
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        q1_total["n"] += 1
+        key = f"{arguments['start']}..{arguments['end']}"
+        day_pages[key] = day_pages.get(key, 0) + 1
+        p = day_pages[key]
+        if arguments["start"] == "2026-11-02" and arguments["end"] == "2026-11-10":
+            return {
+                "ok": True,
+                "data": {
+                    "results": [{"doc_id": f"alphaengine:f-{p}", "title": "Microsoft", "companies": ["Microsoft"], "publish_time": "2026-11-06"}],
+                    "has_more": True,
+                    "cursor": f"ae1:f-{p}",
+                },
+            }
+        sub_end = arguments["end"]
+        if sub_end in ("2026-11-06", "2026-11-07", "2026-11-08"):
+            # 前三天各恰好在第 5 页扫完
+            return {
+                "ok": True,
+                "data": {
+                    "results": [{"doc_id": f"alphaengine:{sub_end}-p{p}", "title": "Microsoft", "companies": ["Microsoft"], "publish_time": sub_end}],
+                    "has_more": p < 5,
+                    "cursor": f"ae1:{sub_end}-c{p}" if p < 5 else None,
+                },
+            }
+        if sub_end == "2026-11-09":
+            # 第 4 天只剩 1 次请求，且仍有下一页
+            return {
+                "ok": True,
+                "data": {
+                    "results": [{"doc_id": "alphaengine:2026-11-09-p1", "title": "Microsoft", "companies": ["Microsoft"], "publish_time": "2026-11-09"}],
+                    "has_more": True,
+                    "cursor": "ae1:2026-11-09-c1",
+                },
+            }
+        raise AssertionError(arguments)
+
+    _patch_bridge(monkeypatch, bridge)
+    last_run = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-05", "ok": True, "window": {"start": "2026-11-02", "end": "2026-11-05"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    _ae, state = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), last_run)
+    row = {r["query"]: r for r in state["queries"]}[first]
+    assert q1_total["n"] == collect_mod.MAX_AE_REQUESTS_PER_QUERY == 20
+    assert row["ok"] is True and row["complete"] is False
+    assert row["covered_until"] == "2026-11-08"
+    assert "本轮请求次数已用完，2026-11-09 起留待下一轮" in row["error"]
+    assert "翻页上限" not in row["error"]
+    assert "未覆盖日期：2026-11-09 至 2026-11-10" in row["error"]
+
+
+def test_ae_page_cap_without_target_day_docs_never_advances_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """翻页用尽时若没有日期可解析且等于待采日的文档（全部无日期或混合回看日），一律不推进覆盖。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    last_1109 = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-09", "ok": True, "window": {"start": "2026-11-06", "end": "2026-11-09"}}
+                for q in (first, second)
+            ]
+        }
+    }
+
+    # 1) 前 5 页全部缺少可解析日期 -> 不推进覆盖，脚注写「返回的文档缺少日期，2026-11-10 留待下一轮」
+    page_no = {"n": 0}
+
+    def bridge_all_undated(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        page_no["n"] += 1
+        p = page_no["n"]
+        return {
+            "ok": True,
+            "data": {
+                "results": [
+                    {
+                        "doc_id": f"alphaengine:nodate-p{p}-{i}",
+                        "title": "Microsoft undated",
+                        "companies": ["Microsoft"],
+                        "publish_time": "" if i % 2 == 0 else "not-a-date",
+                    }
+                    for i in range(20)
+                ],
+                "has_more": True,
+                "cursor": f"ae1:nodate-{p}",
+            },
+        }
+
+    _patch_bridge(monkeypatch, bridge_all_undated)
+    _ae_nd, state_nd = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), last_1109)
+    row_nd = {r["query"]: r for r in state_nd["queries"]}[first]
+    assert page_no["n"] == collect_mod.MAX_AE_PAGES
+    assert row_nd["ok"] is True and row_nd["complete"] is False
+    assert row_nd["covered_until"] == "2026-11-09"
+    assert "返回的文档缺少日期，2026-11-10 留待下一轮" in row_nd["error"]
+    assert "超过翻页上限" not in row_nd["error"]
+    assert "未覆盖日期：2026-11-10 至 2026-11-10" in row_nd["error"]
+
+    # 2) 回看日 + 无日期混合（无待采日文档）-> 不推进覆盖，脚注写「回看日文档较多，2026-11-10 留待下一轮」
+    page_no["n"] = 0
+
+    def bridge_mixed_no_target(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        page_no["n"] += 1
+        p = page_no["n"]
+        return {
+            "ok": True,
+            "data": {
+                "results": [
+                    {
+                        "doc_id": f"alphaengine:mixnd-p{p}-{i}",
+                        "title": "Microsoft old or undated",
+                        "companies": ["Microsoft"],
+                        **({"publish_time": "2026-11-07"} if i % 2 == 0 else {}),
+                    }
+                    for i in range(20)
+                ],
+                "has_more": True,
+                "cursor": f"ae1:mixnd-{p}",
+            },
+        }
+
+    _patch_bridge(monkeypatch, bridge_mixed_no_target)
+    _ae_mx, state_mx = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), last_1109)
+    row_mx = {r["query"]: r for r in state_mx["queries"]}[first]
+    assert row_mx["ok"] is True and row_mx["complete"] is False
+    assert row_mx["covered_until"] == "2026-11-09"
+    assert "回看日文档较多，2026-11-10 留待下一轮" in row_mx["error"]
+    assert "超过翻页上限" not in row_mx["error"]
+
+    # 3) 多日按日子窗口前 5 页都无日期 -> 同样不推进覆盖
+    last_1105 = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-05", "ok": True, "window": {"start": "2026-11-02", "end": "2026-11-05"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    sub_pages = {"n": 0}
+
+    def bridge_multi_undated(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        if arguments["start"] == "2026-11-02" and arguments["end"] == "2026-11-08":
+            return {"ok": True, "data": {"results": [], "has_more": True, "cursor": "ae1:m", "total_upstream": 300}}
+        sub_pages["n"] += 1
+        p = sub_pages["n"]
+        return {
+            "ok": True,
+            "data": {
+                "results": [
+                    {"doc_id": f"alphaengine:mnd-p{p}-{i}", "title": "Microsoft undated", "companies": ["Microsoft"]}
+                    for i in range(20)
+                ],
+                "has_more": True,
+                "cursor": f"ae1:mnd-{p}",
+            },
+        }
+
+    _patch_bridge(monkeypatch, bridge_multi_undated)
+    _ae_mnd, state_mnd = collect_mod.collect_alphaengine(cfg, "2026-11-07", "2026-11-08", set(), last_1105)
+    row_mnd = {r["query"]: r for r in state_mnd["queries"]}[first]
+    assert sub_pages["n"] == collect_mod.MAX_AE_PAGES
+    assert row_mnd["ok"] is True and row_mnd["complete"] is False
+    assert row_mnd["covered_until"] == "2026-11-05"
+    assert "返回的文档缺少日期，2026-11-06 留待下一轮" in row_mnd["error"]
+    assert "超过翻页上限" not in row_mnd["error"]
+
+
+@pytest.mark.parametrize(
+    ("fault_kind", "fault_page"),
+    [
+        ("partial", 1),
+        ("partial", 2),
+        ("upstream_cursor", 1),
+        ("upstream_cursor", 2),
+    ],
+)
+def test_ae_single_pending_day_partial_and_upstream_cursor_retry_target_day(
+    monkeypatch: pytest.MonkeyPatch,
+    fault_kind: str,
+    fault_page: int,
+) -> None:
+    """单待采日窗口 [待采日-3, until] 返回 partial 或 E_UPSTREAM_CURSOR 时，用剩余预算单独查 [待采日, 待采日]。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    last_1109 = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-09", "ok": True, "window": {"start": "2026-11-06", "end": "2026-11-09"}}
+                for q in (first, second)
+            ]
+        }
+    }
+
+    calls_seen: list[tuple[str, str]] = []
+    full_pages = {"n": 0}
+
+    def bridge_recover(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        calls_seen.append((arguments["start"], arguments["end"]))
+        if arguments["start"] == "2026-11-07" and arguments["end"] == "2026-11-10":
+            full_pages["n"] += 1
+            p = full_pages["n"]
+            if p == fault_page:
+                if fault_kind == "partial":
+                    return {
+                        "ok": True,
+                        "status": "partial",
+                        "data": {
+                            "ok": True,
+                            "status": "partial",
+                            "results": [
+                                {"doc_id": "alphaengine:full-partial-item", "title": "Microsoft partial", "companies": ["Microsoft"], "publish_time": "2026-11-08"}
+                            ],
+                            "has_more": True,
+                            "cursor": "ae1:full-partial",
+                        },
+                    }
+                return {
+                    "ok": False,
+                    "error": "E_UPSTREAM_CURSOR: 上游未推进游标",
+                    "data": {"error": "E_UPSTREAM_CURSOR: 上游未推进游标"},
+                }
+            return {
+                "ok": True,
+                "data": {
+                    "results": [
+                        {"doc_id": f"alphaengine:full-ok-{p}", "title": "Microsoft ok", "companies": ["Microsoft"], "publish_time": "2026-11-08"}
+                    ],
+                    "has_more": True,
+                    "cursor": f"ae1:full-ok-{p}",
+                },
+            }
+        assert arguments["start"] == "2026-11-10" and arguments["end"] == "2026-11-10"
+        return {
+            "ok": True,
+            "data": {
+                "results": [
+                    {"doc_id": "alphaengine:day-1110", "title": "Microsoft day", "companies": ["Microsoft"], "publish_time": "2026-11-10"}
+                ],
+                "has_more": False,
+            },
+        }
+
+    _patch_bridge(monkeypatch, bridge_recover)
+    ae, state = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), last_1109)
+    row = {r["query"]: r for r in state["queries"]}[first]
+    assert full_pages["n"] == fault_page
+    assert calls_seen[-1] == ("2026-11-10", "2026-11-10")
+    assert row["ok"] is True and row["complete"] is True and row["covered_until"] == "2026-11-10"
+    assert "alphaengine:day-1110" in ae["new"]
+    if fault_kind == "partial":
+        assert "alphaengine:full-partial-item" in ae["new"]
+    assert collect_mod.failed_sources({}, ae, {}, {}, {"ok": True, "status": "ok"}) == []
+
+
+def test_ae_partial_status_with_non_empty_error_keeps_items_and_enters_day_split(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """一页同时带 status=partial 和非空 error 时，按部分响应保留该页条目并进入按日续采，不走普通失败分支。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+
+    # 用真实的 _normalize_dict_result 构造响应（与 HTTP/wrapper 桥接层输出完全同构，此时 ok=False）
+    normalized_partial_err = collect_mod._g._normalize_dict_result(
+        {
+            "status": "partial",
+            "error": "upstream partial timeout",
+            "results": [
+                {
+                    "doc_id": "alphaengine:partial-with-err",
+                    "title": "Microsoft partial with error",
+                    "companies": ["Microsoft"],
+                    "publish_time": "2026-11-07",
+                }
+            ],
+            "has_more": True,
+            "cursor": "ae1:pe-1",
+        }
+    )
+    assert normalized_partial_err["ok"] is False
+    assert normalized_partial_err["status"] == "partial"
+    assert normalized_partial_err["error"] == "upstream partial timeout"
+
+    # 1) 多日窗口首页返回 partial + non-empty error -> 保留该页条目，进入按日续采并扫完
+    day_calls: list[tuple[str, str]] = []
+
+    def bridge_multi(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        if arguments["start"] == "2026-11-02" and arguments["end"] == "2026-11-08":
+            return normalized_partial_err
+        day_calls.append((arguments["start"], arguments["end"]))
+        return {
+            "ok": True,
+            "data": {
+                "results": [
+                    {
+                        "doc_id": f"alphaengine:pe-day-{arguments['end']}",
+                        "title": f"Microsoft {arguments['end']}",
+                        "companies": ["Microsoft"],
+                        "publish_time": arguments["end"],
+                    }
+                ],
+                "has_more": False,
+            },
+        }
+
+    _patch_bridge(monkeypatch, bridge_multi)
+    last_1105 = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-05", "ok": True, "window": {"start": "2026-11-02", "end": "2026-11-05"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    ae_m, state_m = collect_mod.collect_alphaengine(cfg, "2026-11-07", "2026-11-08", set(), last_1105)
+    row_m = {r["query"]: r for r in state_m["queries"]}[first]
+    assert day_calls == [
+        ("2026-11-03", "2026-11-06"),
+        ("2026-11-07", "2026-11-07"),
+        ("2026-11-08", "2026-11-08"),
+    ]
+    assert row_m["ok"] is True and row_m["complete"] is True and row_m["covered_until"] == "2026-11-08"
+    assert "alphaengine:partial-with-err" in ae_m["new"]
+    assert {"alphaengine:pe-day-2026-11-06", "alphaengine:pe-day-2026-11-07", "alphaengine:pe-day-2026-11-08"} <= set(ae_m["new"])
+    assert collect_mod.failed_sources({}, ae_m, {}, {}, {"ok": True, "status": "ok"}) == []
+
+    # 2) 单日窗口首页返回 partial + non-empty error -> 保留该页条目，单独查 [待采日, 待采日]
+    single_calls: list[tuple[str, str]] = []
+
+    def bridge_single(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        single_calls.append((arguments["start"], arguments["end"]))
+        if arguments["start"] == "2026-11-07" and arguments["end"] == "2026-11-10":
+            return normalized_partial_err
+        return {
+            "ok": True,
+            "data": {
+                "results": [
+                    {
+                        "doc_id": "alphaengine:pe-single-1110",
+                        "title": "Microsoft 11-10",
+                        "companies": ["Microsoft"],
+                        "publish_time": "2026-11-10",
+                    }
+                ],
+                "has_more": False,
+            },
+        }
+
+    _patch_bridge(monkeypatch, bridge_single)
+    last_1109 = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-09", "ok": True, "window": {"start": "2026-11-06", "end": "2026-11-09"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    ae_s, state_s = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), last_1109)
+    row_s = {r["query"]: r for r in state_s["queries"]}[first]
+    assert single_calls == [("2026-11-07", "2026-11-10"), ("2026-11-10", "2026-11-10")]
+    assert row_s["ok"] is True and row_s["complete"] is True and row_s["covered_until"] == "2026-11-10"
+    assert {"alphaengine:partial-with-err", "alphaengine:pe-single-1110"} <= set(ae_s["new"])
+
+
+def test_content_assembly_filters_disabled_bridge_routes_preserving_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """研究桥和 AlphaEngine 开启、tmtb 关闭时，装配过滤掉 tmtb 且其余路线保持顺序；采集不请求 tmtb。"""
+    from src.dalton.capabilities import CapabilityId
+    from src.dalton.content_assembly import assemble_json_text
+
+    skill_dir = REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-bullbear-tracker"
+    all_on_caps = frozenset(CapabilityId) - {CapabilityId.TRANSCRIPTION}
+    no_tmtb_caps = all_on_caps - {CapabilityId.TMTB}
+
+    msft_path = skill_dir / "config" / "MSFT.json"
+    msft_raw = msft_path.read_text(encoding="utf-8")
+    assert assemble_json_text(msft_raw, path=msft_path, capabilities=all_on_caps) == msft_raw
+    msft_assembled = assemble_json_text(msft_raw, path=msft_path, capabilities=no_tmtb_caps)
+    msft_doc = json.loads(msft_assembled)
+    assert msft_doc["sources"]["internal_routes"] == ["sales-notes", "funda-ai", "company-wiki"]
+    assert "_dalton_cap_researchdata_bridge" not in msft_doc
+    assert "_dalton_cap_alphaengine" not in msft_doc
+
+    ant_path = skill_dir / "config" / "ANT.json"
+    ant_raw = ant_path.read_text(encoding="utf-8")
+    assert assemble_json_text(ant_raw, path=ant_path, capabilities=all_on_caps) == ant_raw
+    ant_assembled = assemble_json_text(ant_raw, path=ant_path, capabilities=no_tmtb_caps)
+    ant_doc = json.loads(ant_assembled)
+    assert ant_doc["sources"]["internal_routes"] == ["sales-notes", "funda-ai"]
+
+    # 采集脚本直接读装配后的配置，不再请求 tmtb，其余内部路线保持顺序
+    fake_skill = tmp_path / "no-tmtb-skill"
+    (fake_skill / "config").mkdir(parents=True)
+    (fake_skill / "references").mkdir(parents=True)
+    (fake_skill / "references" / "common-rules.md").write_text("# Common\n", encoding="utf-8")
+    (fake_skill / "references" / "msft-rules.md").write_text("# MSFT\n", encoding="utf-8")
+    (fake_skill / "config" / "MSFT.json").write_text(msft_assembled, encoding="utf-8")
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+
+    internal_routes_called: list[str] = []
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        route = str(arguments.get("route") or "")
+        assert route != "tmtb", "tmtb capability is disabled; collector must not request tmtb"
+        if route in {"sales-notes", "funda-ai", "company-wiki"}:
+            internal_routes_called.append(route)
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        if route == "sec":
+            return {"ok": True, "data": {"rows": []}}
+        if route == "x-timeline":
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        return {"ok": True, "data": {"results": [], "has_more": False}}
+
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    _patch_consensus(monkeypatch, _consensus_ok)
+
+    ws = _workspace(tmp_path / "ws-no-tmtb")
+    code, payload = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-notmtb"])
+    assert code == 0 and payload["failed_sources"] == []
+    assert internal_routes_called == ["sales-notes", "funda-ai", "company-wiki"]
+
+
+def test_bridge_disabled_two_days_preserves_internal_sec_x_and_ae_resume_positions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """研究桥关闭两天再打开：until 照常前进，内部库从原重试日起查，SEC 和 X 从关闭前的位置起查。"""
+    from src.dalton.capabilities import CapabilityId
+    from src.dalton.content_assembly import assemble_json_text
+
+    skill_dir = REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-bullbear-tracker"
+    src_cfg = skill_dir / "config" / "MSFT.json"
+    raw_cfg = src_cfg.read_text(encoding="utf-8")
+    parsed_raw = json.loads(raw_cfg)
+    first, second = parsed_raw["ae_queries"]
+
+    assembled_off = assemble_json_text(
+        raw_cfg,
+        path=src_cfg,
+        capabilities=frozenset({CapabilityId.FUND_AUTOMATIONS}),
+    )
+
+    fake_skill = tmp_path / "skill-bridge-gap"
+    (fake_skill / "config").mkdir(parents=True)
+    (fake_skill / "references").mkdir(parents=True)
+    (fake_skill / "references" / "common-rules.md").write_text("# Common\n", encoding="utf-8")
+    (fake_skill / "references" / "msft-rules.md").write_text("# MSFT\n", encoding="utf-8")
+    (fake_skill / "config" / "MSFT.json").write_text(assembled_off, encoding="utf-8")
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+
+    ws = _workspace(tmp_path / "ws-bridge-gap")
+    tracker = ws / "research" / "tracker"
+    (tracker / "x_pool.json").write_text(
+        json.dumps({"keeper": {"active": True, "tickers": ["MSFT"]}}),
+        encoding="utf-8",
+    )
+    seed_queries = [
+        {
+            "query": q,
+            "window": {"start": "2026-11-07", "end": "2026-11-10"},
+            "has_more": False,
+            "complete": True,
+            "covered_until": "2026-11-10",
+            "ok": True,
+            "returned": 2,
+            "error": None,
+        }
+        for q in (first, second)
+    ]
+    seed_last = {
+        "ticker": "MSFT",
+        "run_id": "20261110-2200",
+        "committed_at": "2026-11-10T22:00:00-05:00",
+        "collected_at": "2026-11-10T22:00:00-05:00",
+        "since": "2026-11-09",
+        "until": "2026-11-10",
+        "snapshot_file": "data/consensus/2026-11-10_2200.json",
+        "material": "no",
+        "summary": "seed",
+        "internal_retry_since": "2026-11-08",
+        "msft_ae_state": {"queries": seed_queries},
+    }
+    (tracker / "last_run.json").write_text(json.dumps(seed_last), encoding="utf-8")
+
+    def _forbid_bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        raise AssertionError(f"bridge must not be called while disabled: {arguments}")
+
+    clock = {"now": datetime(2026, 11, 11, 22, 50, tzinfo=ET)}
+    _patch_bridge(monkeypatch, _forbid_bridge)
+    _patch_clock(monkeypatch, clock)
+    _patch_transport(monkeypatch, {"mode": None, "error": "researchdata_transport_unconfigured"})
+    _patch_consensus(monkeypatch, _consensus_ok)
+
+    # 第 1 天关桥（11-11）和第 2 天关桥（11-12）均正常采集并提交
+    for day_num in (11, 12):
+        clock["now"] = datetime(2026, 11, day_num, 22, 50, tzinfo=ET)
+        run_id = f"202611{day_num:02d}-2250"
+        code_c, payload_c = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", run_id])
+        assert code_c == 0 and payload_c["failed_sources"] == []
+        code_m, payload_m = _run(
+            capsys,
+            ["commit", "--workspace-dir", str(ws), "--run-id", run_id, "--material", "no", "--summary", f"off-{day_num}"],
+        )
+        assert code_m == 0 and payload_m["ok"] is True
+        saved = _read_json(tracker / "last_run.json")
+        assert saved["until"] == f"2026-11-{day_num:02d}"
+        assert saved["internal_retry_since"] == "2026-11-08"
+        assert saved["sec_last_collected_until"] == "2026-11-10"
+        assert saved["x_last_collected_until"] == "2026-11-10"
+        assert saved["msft_ae_state"]["queries"] == seed_queries
+
+    # 第 3 天重新打开（11-13）：内部库从 11-08 起查，SEC 从 11-10 起查（floor=11-08），X 从 11-10 起查
+    (fake_skill / "config" / "MSFT.json").write_text(raw_cfg, encoding="utf-8")
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    clock["now"] = datetime(2026, 11, 13, 22, 50, tzinfo=ET)
+    reopen_calls: list[dict[str, Any]] = []
+
+    def bridge_reopen(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        reopen_calls.append(arguments)
+        route = arguments.get("route")
+        if route == "sec":
+            if arguments.get("form") == "8-K":
+                return {
+                    "ok": True,
+                    "data": {
+                        "rows": [
+                            {"accession_no": "0001193125-26-999001", "form": "8-K", "filing_date": "2026-11-08"},
+                        ]
+                    },
+                }
+            return {"ok": True, "data": {"rows": []}}
+        if route == "x-timeline":
+            if arguments.get("operation") == "tweets":
+                return {
+                    "ok": True,
+                    "data": {
+                        "data": {
+                            "items": [
+                                {
+                                    "id": "gap-post-1",
+                                    "text": "MSFT Azure capex update",
+                                    "created_at": "2026-11-10T23:30:00-05:00",
+                                    "author_handle": "keeper",
+                                    "metrics": {"likes": 5, "reposts": 1, "replies": 0, "views": 10},
+                                }
+                            ],
+                            "has_more": False,
+                        }
+                    },
+                }
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        return {"ok": True, "data": {"results": [], "has_more": False}}
+
+    _patch_bridge(monkeypatch, bridge_reopen)
+    code_on, payload_on = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261113-2250"])
+    assert code_on == 0 and payload_on["failed_sources"] == []
+
+    packet_on = _read_json(tracker / "20261113-2250" / "packet.json")
+    assert packet_on["since"] == "2026-11-11"
+    assert packet_on["internal_since"] == "2026-11-08"
+
+    keyword_starts = {c["start"] for c in reopen_calls if c.get("route") in {"tmtb", "sales-notes", "funda-ai"}}
+    wiki_starts = {c["params"]["indexed_since"] for c in reopen_calls if c.get("route") == "company-wiki"}
+    assert keyword_starts == {"2026-11-08"}
+    assert wiki_starts == {"2026-11-08"}
+
+    sec_floors = {row["floor"] for row in packet_on["sec"]["status"]}
+    assert sec_floors == {"2026-11-08"}
+    assert "sec:0001193125-26-999001" in packet_on["sec"]["new"]
+
+    x_sinces = {c["since"] for c in reopen_calls if c.get("route") == "x-timeline"}
+    assert x_sinces == {"2026-11-10"}
+    assert "x:gap-post-1" in packet_on["x"]["new"]
+
+    ae_starts = {c["start"] for c in reopen_calls if c.get("route") == "alphaengine"}
+    assert ae_starts == {"2026-11-07"}
+
+    # 重新开启后提交成功：仅跳过轮次才写的上次实际采集日字段不再保留
+    code_cm, payload_cm = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(ws), "--run-id", "20261113-2250", "--material", "no", "--summary", "reopen"],
+    )
+    assert code_cm == 0 and payload_cm["ok"] is True
+    last_final = _read_json(tracker / "last_run.json")
+    assert last_final["until"] == "2026-11-13"
+    assert last_final["internal_retry_since"] is None
+    assert "sec_last_collected_until" not in last_final
+    assert "x_last_collected_until" not in last_final
+    assert "internal_last_collected_until" not in last_final
+
+
+def test_ae_target_day_ignores_rank_date_and_generic_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """codex 高 1：判断待采日文档只读 publish_date/publish_time；前 5 页无发布日期、有 rank_date=待采日时不推进覆盖。"""
+    assert collect_mod._ae_item_day({"rank_date": "2026-11-10", "date": "2026-11-10"}) is None
+    assert collect_mod._ae_item_day({"publish_date": "2026-11-10"}) == "2026-11-10"
+    assert collect_mod._ae_item_day({"publish_time": "2026-11-10T09:30:00Z"}) == "2026-11-10"
+
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    last_1109 = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-09", "ok": True, "window": {"start": "2026-11-06", "end": "2026-11-09"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    page_no = {"n": 0}
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        page_no["n"] += 1
+        p = page_no["n"]
+        rows = [
+            {
+                "doc_id": f"alphaengine:rankonly-p{p}-{i}",
+                "title": "Microsoft rank date only",
+                "companies": ["Microsoft"],
+                **({"rank_date": "2026-11-10"} if p == 1 and i == 0 else {}),
+                **({"date": "2026-11-10"} if p == 1 and i == 1 else {}),
+            }
+            for i in range(20)
+        ]
+        return {
+            "ok": True,
+            "data": {"results": rows, "has_more": True, "cursor": f"ae1:rankonly-{p}"},
+        }
+
+    _patch_bridge(monkeypatch, bridge)
+    _ae, state = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), last_1109)
+    row = {r["query"]: r for r in state["queries"]}[first]
+    assert page_no["n"] == collect_mod.MAX_AE_PAGES
+    assert row["ok"] is True and row["complete"] is False
+    assert row["covered_until"] == "2026-11-09"
+    assert "返回的文档缺少日期，2026-11-10 留待下一轮" in row["error"]
+    assert "超过翻页上限" not in row["error"]
+
+
+def test_ae_outer_partial_not_overridden_by_inner_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """codex 中 2a：外层 status=partial 带 error、内层 structuredContent 为 status=error 且有条目时，按部分响应处理。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    outer_partial_inner_error = {
+        "ok": False,
+        "status": "partial",
+        "error": "outer partial timeout",
+        "data": {
+            "structuredContent": {
+                "status": "error",
+                "error": "inner timeout",
+                "results": [
+                    {
+                        "doc_id": "alphaengine:outer-partial-item",
+                        "title": "Microsoft outer partial",
+                        "companies": ["Microsoft"],
+                        "publish_time": "2026-11-08",
+                    }
+                ],
+                "has_more": True,
+                "cursor": "ae1:opie-1",
+            }
+        },
+    }
+    assert collect_mod._is_partial_status(outer_partial_inner_error, outer_partial_inner_error["data"]) is True
+    assert collect_mod._known_truncation(outer_partial_inner_error, outer_partial_inner_error["data"]) is not None
+
+    # 单待采日整段查询：保留条目并单查 [2026-11-10, 2026-11-10]
+    single_calls: list[tuple[str, str]] = []
+
+    def bridge_single(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        single_calls.append((arguments["start"], arguments["end"]))
+        if arguments["start"] == "2026-11-07" and arguments["end"] == "2026-11-10":
+            return outer_partial_inner_error
+        return {
+            "ok": True,
+            "data": {
+                "results": [
+                    {
+                        "doc_id": "alphaengine:opie-day-1110",
+                        "title": "Microsoft 11-10",
+                        "companies": ["Microsoft"],
+                        "publish_time": "2026-11-10",
+                    }
+                ],
+                "has_more": False,
+            },
+        }
+
+    _patch_bridge(monkeypatch, bridge_single)
+    last_1109 = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-09", "ok": True, "window": {"start": "2026-11-06", "end": "2026-11-09"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    ae_s, state_s = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), last_1109)
+    row_s = {r["query"]: r for r in state_s["queries"]}[first]
+    assert single_calls == [("2026-11-07", "2026-11-10"), ("2026-11-10", "2026-11-10")]
+    assert row_s["ok"] is True and row_s["complete"] is True and row_s["covered_until"] == "2026-11-10"
+    assert {"alphaengine:outer-partial-item", "alphaengine:opie-day-1110"} <= set(ae_s["new"])
+
+
+@pytest.mark.parametrize("with_partial_status", [True, False])
+def test_ae_no_match_with_items_keeps_items_and_enters_day_split(
+    monkeypatch: pytest.MonkeyPatch,
+    with_partial_status: bool,
+) -> None:
+    """codex 中 2b：带「没有匹配」标记但已返回条目的响应，不清空条目，保留条目再进入按日续采。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    resp: dict[str, Any] = {
+        "ok": False,
+        "error": "[没有匹配] 上游部分分段返回空",
+        "data": {
+            "error_category": "没有匹配",
+            "results": [
+                {
+                    "doc_id": "alphaengine:nomatch-kept-item",
+                    "title": "Microsoft kept despite no_match",
+                    "companies": ["Microsoft"],
+                    "publish_time": "2026-11-06",
+                }
+            ],
+            "has_more": False,
+        },
+    }
+    if with_partial_status:
+        resp["status"] = "partial"
+
+    day_calls: list[tuple[str, str]] = []
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        if arguments["start"] == "2026-11-02" and arguments["end"] == "2026-11-07":
+            return resp
+        day_calls.append((arguments["start"], arguments["end"]))
+        return {
+            "ok": True,
+            "data": {
+                "results": [
+                    {
+                        "doc_id": f"alphaengine:nm-day-{arguments['end']}",
+                        "title": f"Microsoft {arguments['end']}",
+                        "companies": ["Microsoft"],
+                        "publish_time": arguments["end"],
+                    }
+                ],
+                "has_more": False,
+            },
+        }
+
+    _patch_bridge(monkeypatch, bridge)
+    last_1105 = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-05", "ok": True, "window": {"start": "2026-11-02", "end": "2026-11-05"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    ae, state = collect_mod.collect_alphaengine(cfg, "2026-11-06", "2026-11-07", set(), last_1105)
+    row = {r["query"]: r for r in state["queries"]}[first]
+    assert day_calls == [("2026-11-03", "2026-11-06"), ("2026-11-07", "2026-11-07")]
+    assert row["ok"] is True and row["complete"] is True and row["covered_until"] == "2026-11-07"
+    assert {"alphaengine:nomatch-kept-item", "alphaengine:nm-day-2026-11-06", "alphaengine:nm-day-2026-11-07"} <= set(ae["new"])
+
+
+def test_bridge_reopen_sec_x_timeout_preserves_resume_and_fresh_bridge_off_no_fake_until(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """codex 中 3：桥恢复首轮 SEC/X 超时不清除续采日期，下一轮仍从原日期起采；新工作区首轮关桥不伪造实际采集日。"""
+    from src.dalton.capabilities import CapabilityId
+    from src.dalton.content_assembly import assemble_json_text
+
+    skill_dir = REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-bullbear-tracker"
+    src_cfg = skill_dir / "config" / "MSFT.json"
+    raw_cfg = src_cfg.read_text(encoding="utf-8")
+    assembled_off = assemble_json_text(
+        raw_cfg,
+        path=src_cfg,
+        capabilities=frozenset({CapabilityId.FUND_AUTOMATIONS}),
+    )
+
+    fake_skill = tmp_path / "skill-r5-resume"
+    (fake_skill / "config").mkdir(parents=True)
+    (fake_skill / "references").mkdir(parents=True)
+    (fake_skill / "references" / "common-rules.md").write_text("# Common\n", encoding="utf-8")
+    (fake_skill / "references" / "msft-rules.md").write_text("# MSFT\n", encoding="utf-8")
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+
+    # 1) 已有采集记录 -> 11-11..11-16 关桥 -> 11-17 恢复但 SEC 与 X 超时 -> 11-18 仍从 11-10 起采
+    (fake_skill / "config" / "MSFT.json").write_text(assembled_off, encoding="utf-8")
+    ws = _workspace(tmp_path / "ws-reopen-timeout")
+    tracker = ws / "research" / "tracker"
+    (tracker / "x_pool.json").write_text(
+        json.dumps({"keeper": {"active": True, "tickers": ["MSFT"]}}),
+        encoding="utf-8",
+    )
+    seed_last = {
+        "ticker": "MSFT",
+        "run_id": "20261110-2200",
+        "committed_at": "2026-11-10T22:00:00-05:00",
+        "collected_at": "2026-11-10T22:00:00-05:00",
+        "since": "2026-11-09",
+        "until": "2026-11-10",
+        "snapshot_file": "data/consensus/2026-11-10_2200.json",
+        "material": "no",
+        "summary": "seed",
+        "msft_ae_state": {"queries": []},
+    }
+    (tracker / "last_run.json").write_text(json.dumps(seed_last), encoding="utf-8")
+
+    clock = {"now": datetime(2026, 11, 16, 22, 50, tzinfo=ET)}
+    _patch_clock(monkeypatch, clock)
+    _patch_consensus(monkeypatch, _consensus_ok)
+    _patch_transport(monkeypatch, {"mode": None, "error": "researchdata_transport_unconfigured"})
+    _patch_bridge(monkeypatch, lambda *a, **kw: (_ for _ in ()).throw(AssertionError("bridge off")))
+
+    code_c, _ = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261116-2250"])
+    assert code_c == 0
+    code_m, _ = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(ws), "--run-id", "20261116-2250", "--material", "no", "--summary", "off"],
+    )
+    assert code_m == 0
+    saved_16 = _read_json(tracker / "last_run.json")
+    assert saved_16["sec_last_collected_until"] == "2026-11-10"
+    assert saved_16["x_last_collected_until"] == "2026-11-10"
+    assert saved_16["internal_last_collected_until"] == "2026-11-10"
+
+    # 11-17 恢复桥接，但 SEC 与 X 均超时
+    (fake_skill / "config" / "MSFT.json").write_text(raw_cfg, encoding="utf-8")
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    clock["now"] = datetime(2026, 11, 17, 22, 50, tzinfo=ET)
+
+    def bridge_timeout(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        route = arguments.get("route")
+        if route in ("sec", "x-timeline"):
+            return {"ok": False, "error": "upstream timeout", "data": {"error": "upstream timeout"}}
+        return {"ok": True, "data": {"results": [], "has_more": False}}
+
+    _patch_bridge(monkeypatch, bridge_timeout)
+    code_c17, payload_17 = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261117-2250"])
+    assert code_c17 == 0
+    assert {f["source"] for f in payload_17["failed_sources"]} >= {"sec", "x-timeline"}
+    code_m17, _ = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(ws), "--run-id", "20261117-2250", "--material", "no", "--summary", "timeout"],
+    )
+    assert code_m17 == 0
+    saved_17 = _read_json(tracker / "last_run.json")
+    assert saved_17["until"] == "2026-11-17"
+    assert saved_17["sec_last_collected_until"] == "2026-11-10"
+    assert saved_17["x_last_collected_until"] == "2026-11-10"
+    assert "internal_last_collected_until" not in saved_17
+
+    # 11-18 重跑恢复成功：SEC 与 X 仍从 11-10 起采，提交后清除续采日期
+    clock["now"] = datetime(2026, 11, 18, 22, 50, tzinfo=ET)
+    calls_18: list[dict[str, Any]] = []
+
+    def bridge_ok_18(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        calls_18.append(arguments)
+        route = arguments.get("route")
+        if route == "sec":
+            return {
+                "ok": True,
+                "data": {
+                    "rows": [
+                        {"accession_no": "0001193125-26-888012", "form": "8-K", "filing_date": "2026-11-12"},
+                    ]
+                    if arguments.get("form") == "8-K"
+                    else []
+                },
+            }
+        if route == "x-timeline":
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        return {"ok": True, "data": {"results": [], "has_more": False}}
+
+    _patch_bridge(monkeypatch, bridge_ok_18)
+    code_c18, payload_18 = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261118-2250"])
+    assert code_c18 == 0 and payload_18["failed_sources"] == []
+    packet_18 = _read_json(tracker / "20261118-2250" / "packet.json")
+    assert {row["floor"] for row in packet_18["sec"]["status"]} == {"2026-11-08"}
+    assert "sec:0001193125-26-888012" in packet_18["sec"]["new"]
+    assert {c["since"] for c in calls_18 if c.get("route") == "x-timeline"} == {"2026-11-10"}
+
+    code_m18, _ = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(ws), "--run-id", "20261118-2250", "--material", "no", "--summary", "recovered"],
+    )
+    assert code_m18 == 0
+    saved_18 = _read_json(tracker / "last_run.json")
+    assert "sec_last_collected_until" not in saved_18
+    assert "x_last_collected_until" not in saved_18
+
+    # 2) 新工作区首轮即桥关闭，连续两轮关桥提交：不把未采集的 until 写成实际采集日，
+    #    而是记下首轮的起点，重新开启后从那一天补采（codex r5 中 2 / grok r5 高）
+    (fake_skill / "config" / "MSFT.json").write_text(assembled_off, encoding="utf-8")
+    _patch_transport(monkeypatch, {"mode": None, "error": "researchdata_transport_unconfigured"})
+    _patch_bridge(monkeypatch, lambda *a, **kw: (_ for _ in ()).throw(AssertionError("bridge off")))
+    fresh_ws = _workspace(tmp_path / "ws-fresh-bridge-off")
+    fresh_tracker = fresh_ws / "research" / "tracker"
+    first_since: str | None = None
+    for day_num in (10, 11):
+        clock["now"] = datetime(2026, 11, day_num, 22, 50, tzinfo=ET)
+        run_id = f"202611{day_num:02d}-2250"
+        c_code, c_payload = _run(capsys, ["collect", "--workspace-dir", str(fresh_ws), "--run-id", run_id])
+        if first_since is None:
+            first_since = _read_json(fresh_tracker / run_id / "packet.json")["since"]
+        assert c_code == 0 and c_payload["failed_sources"] == []
+        m_code, _ = _run(
+            capsys,
+            ["commit", "--workspace-dir", str(fresh_ws), "--run-id", run_id, "--material", "no", "--summary", f"fresh-{day_num}"],
+        )
+        assert m_code == 0
+        saved_fresh = _read_json(fresh_tracker / "last_run.json")
+        assert saved_fresh["until"] == f"2026-11-{day_num:02d}"
+        assert first_since is not None and first_since < "2026-11-10"
+        assert saved_fresh["internal_last_collected_until"] == first_since
+        assert saved_fresh["sec_last_collected_until"] == first_since
+        assert saved_fresh["x_last_collected_until"] == first_since
+
+
+def test_single_disabled_internal_route_preserves_retry_since_until_reopened(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """codex 中 4：只关 tmtb 一轮后重新打开，保留原 internal_retry_since 并从原重试日起查。"""
+    from src.dalton.capabilities import CapabilityId
+    from src.dalton.content_assembly import assemble_json_text
+
+    skill_dir = REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-bullbear-tracker"
+    src_cfg = skill_dir / "config" / "MSFT.json"
+    raw_cfg = src_cfg.read_text(encoding="utf-8")
+    all_on_caps = frozenset(CapabilityId) - {CapabilityId.TRANSCRIPTION}
+    no_tmtb_caps = all_on_caps - {CapabilityId.TMTB}
+    assembled_no_tmtb = assemble_json_text(raw_cfg, path=src_cfg, capabilities=no_tmtb_caps)
+    parsed_no_tmtb = json.loads(assembled_no_tmtb)
+    assert parsed_no_tmtb["sources"]["internal_routes"] == ["sales-notes", "funda-ai", "company-wiki"]
+    assert parsed_no_tmtb["_dalton_cap_disabled_internal_routes"] == ["tmtb"]
+
+    fake_skill = tmp_path / "skill-tmtb-toggle"
+    (fake_skill / "config").mkdir(parents=True)
+    (fake_skill / "references").mkdir(parents=True)
+    (fake_skill / "references" / "common-rules.md").write_text("# Common\n", encoding="utf-8")
+    (fake_skill / "references" / "msft-rules.md").write_text("# MSFT\n", encoding="utf-8")
+    (fake_skill / "config" / "MSFT.json").write_text(assembled_no_tmtb, encoding="utf-8")
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+
+    ws = _workspace(tmp_path / "ws-tmtb-toggle")
+    tracker = ws / "research" / "tracker"
+    seed_last = {
+        "ticker": "MSFT",
+        "run_id": "20261110-2200",
+        "committed_at": "2026-11-10T22:00:00-05:00",
+        "collected_at": "2026-11-10T22:00:00-05:00",
+        "since": "2026-11-09",
+        "until": "2026-11-10",
+        "snapshot_file": "data/consensus/2026-11-10_2200.json",
+        "material": "no",
+        "summary": "seed",
+        "internal_retry_since": "2026-11-08",
+        "msft_ae_state": {"queries": []},
+    }
+    (tracker / "last_run.json").write_text(json.dumps(seed_last), encoding="utf-8")
+
+    def bridge_no_tmtb(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        route = arguments.get("route")
+        assert route != "tmtb"
+        if route == "sec":
+            return {"ok": True, "data": {"rows": []}}
+        if route == "x-timeline":
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        return {"ok": True, "data": {"results": [], "has_more": False}}
+
+    clock = {"now": datetime(2026, 11, 12, 22, 50, tzinfo=ET)}
+    _patch_bridge(monkeypatch, bridge_no_tmtb)
+    _patch_clock(monkeypatch, clock)
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    _patch_consensus(monkeypatch, _consensus_ok)
+
+    code_c1, payload_c1 = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261112-2250"])
+    assert code_c1 == 0 and payload_c1["failed_sources"] == []
+    packet_12 = _read_json(tracker / "20261112-2250" / "packet.json")
+    assert packet_12["internal_retry_since"] == "2026-11-08"
+
+    code_m1, _ = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(ws), "--run-id", "20261112-2250", "--material", "no", "--summary", "tmtb-off"],
+    )
+    assert code_m1 == 0
+    saved_12 = _read_json(tracker / "last_run.json")
+    assert saved_12["until"] == "2026-11-12"
+    assert saved_12["internal_retry_since"] == "2026-11-08"
+
+    # 重新打开 tmtb：从原重试日 2026-11-08 起查，全部成功后清除 internal_retry_since
+    (fake_skill / "config" / "MSFT.json").write_text(raw_cfg, encoding="utf-8")
+    clock["now"] = datetime(2026, 11, 13, 22, 50, tzinfo=ET)
+    tmtb_starts: list[str] = []
+
+    def bridge_all_on(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        route = arguments.get("route")
+        if route == "tmtb":
+            tmtb_starts.append(str(arguments.get("start")))
+        if route == "sec":
+            return {"ok": True, "data": {"rows": []}}
+        if route == "x-timeline":
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        return {"ok": True, "data": {"results": [], "has_more": False}}
+
+    _patch_bridge(monkeypatch, bridge_all_on)
+    code_c2, payload_c2 = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261113-2250"])
+    assert code_c2 == 0 and payload_c2["failed_sources"] == []
+    assert tmtb_starts == ["2026-11-08"]
+
+    code_m2, _ = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(ws), "--run-id", "20261113-2250", "--material", "no", "--summary", "tmtb-on"],
+    )
+    assert code_m2 == 0
+    saved_13 = _read_json(tracker / "last_run.json")
+    assert saved_13["internal_retry_since"] is None
+
+
+@pytest.mark.parametrize(
+    ("later_mode", "expected_prefix"),
+    [
+        ("missing_dates", "返回的文档缺少日期，2026-11-07 留待下一轮"),
+        ("lookback_crowded", "回看日文档较多，2026-11-07 留待下一轮"),
+    ],
+)
+def test_ae_later_subwindow_missing_dates_and_lookback_crowded_footnotes(
+    monkeypatch: pytest.MonkeyPatch,
+    later_mode: str,
+    expected_prefix: str,
+) -> None:
+    """codex 低 6：按日续采先完成 11-06，随后 11-07 因缺少日期或全为回看日未推进时，用专门措辞而非通用翻页上限。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    last_1105 = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-05", "ok": True, "window": {"start": "2026-11-02", "end": "2026-11-05"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    sub_1107_pages = {"n": 0}
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        if arguments["start"] == "2026-11-02" and arguments["end"] == "2026-11-08":
+            return {"ok": True, "data": {"results": [], "has_more": True, "cursor": "ae1:early", "total_upstream": 300}}
+        if arguments["end"] == "2026-11-06":
+            return {
+                "ok": True,
+                "data": {
+                    "results": [
+                        {"doc_id": "alphaengine:d1106", "title": "Microsoft 1106", "companies": ["Microsoft"], "publish_time": "2026-11-06"}
+                    ],
+                    "has_more": False,
+                },
+            }
+        assert arguments["start"] == "2026-11-07" and arguments["end"] == "2026-11-07"
+        sub_1107_pages["n"] += 1
+        p = sub_1107_pages["n"]
+        return {
+            "ok": True,
+            "data": {
+                "results": [
+                    {
+                        "doc_id": f"alphaengine:d1107-{later_mode}-p{p}-{i}",
+                        "title": "Microsoft later subwindow",
+                        "companies": ["Microsoft"],
+                        **({"publish_time": "2026-11-05"} if later_mode == "lookback_crowded" else {}),
+                    }
+                    for i in range(20)
+                ],
+                "has_more": True,
+                "cursor": f"ae1:d1107-{p}",
+            },
+        }
+
+    _patch_bridge(monkeypatch, bridge)
+    _ae, state = collect_mod.collect_alphaengine(cfg, "2026-11-07", "2026-11-08", set(), last_1105)
+    row = {r["query"]: r for r in state["queries"]}[first]
+    assert sub_1107_pages["n"] == collect_mod.MAX_AE_PAGES
+    assert row["ok"] is True and row["complete"] is False
+    assert row["covered_until"] == "2026-11-06"
+    assert expected_prefix in row["error"]
+    assert "覆盖边界已推进至 2026-11-06" in row["error"]
+    assert "未覆盖日期：2026-11-07 至 2026-11-08" in row["error"]
+    assert "达到翻页上限" not in row["error"]
+
+
+
+
