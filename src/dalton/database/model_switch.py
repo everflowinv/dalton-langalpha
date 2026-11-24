@@ -112,3 +112,64 @@ async def clear_thread_metadata_key(
                 params,
             )
             return cur.rowcount > 0
+
+
+async def settle_pending_model_handoff_metadata(
+    conversation_thread_id: str,
+    key: str,
+    *,
+    expected_version: Any = _UNSET,
+    switch_run_id_key: str = "owner_model_switch_run_id",
+    expected_run_id: str | None = None,
+) -> bool:
+    """Atomically clear ``key`` (guarded by ``expected_version``) and conditionally stamp ``switch_run_id_key``.
+
+    When ``expected_run_id`` is provided, ``{switch_run_id_key: expected_run_id}`` is
+    merged in the SAME ``UPDATE`` statement ONLY if the thread's latest
+    ``conversation_responses`` row still matches ``expected_run_id``. If a newer run
+    started while handoff was in flight, ``key`` is still cleared without stamping
+    the new run's ID.
+    """
+    if not expected_run_id:
+        return await clear_thread_metadata_key(
+            conversation_thread_id,
+            key,
+            expected_version=expected_version,
+        )
+    params: dict[str, Any] = {
+        "thread_id": conversation_thread_id,
+        "pending_key": key,
+        "expected_run_id": str(expected_run_id),
+        "stamp_json": Json({switch_run_id_key: str(expected_run_id)}),
+    }
+    version_clause = ""
+    if expected_version is not _UNSET:
+        if expected_version is None:
+            version_clause = " AND (metadata -> %(pending_key)s ->> 'version') IS NULL"
+        else:
+            version_clause = (
+                " AND metadata -> %(pending_key)s ->> 'version' = %(expected_version)s"
+            )
+            params["expected_version"] = expected_version
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                UPDATE conversation_threads
+                SET metadata = CASE
+                    WHEN (
+                        SELECT r.conversation_response_id::text
+                        FROM conversation_responses r
+                        WHERE r.conversation_thread_id = conversation_threads.conversation_thread_id
+                        ORDER BY r.turn_index DESC, r.attempt_no DESC, r.created_at DESC
+                        LIMIT 1
+                    ) = %(expected_run_id)s
+                    THEN (metadata - %(pending_key)s) || %(stamp_json)s::jsonb
+                    ELSE metadata - %(pending_key)s
+                END
+                WHERE conversation_thread_id = %(thread_id)s
+                  AND metadata ? %(pending_key)s{version_clause}
+                """,
+                params,
+            )
+            return cur.rowcount > 0

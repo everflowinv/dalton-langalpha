@@ -171,17 +171,11 @@ async def clear_pending_handoff_after_brief(
         )
 
 
-# DALTON-HOOK(cos-settings-tools): stamp owner_model_switch_run_id when deferred handoff settles so post-handoff manual compaction uses the owner's selection
-async def _settle_pending_model_handoff(
-    thread_id: str, *, version: str | None
-) -> None:
-    cleared = await clear_pending_model_handoff(thread_id, version=version)
-    if not cleared:
-        return
+# DALTON-HOOK(cos-settings-tools): capture latest system-only run id at handoff start and atomically clear pending marker + stamp owner_model_switch_run_id only if that run id is still latest
+async def _read_initial_system_only_run_id(thread_id: str) -> str | None:
     try:
         from collections.abc import Mapping
 
-        from src.dalton.database import model_switch as dalton_model_switch_db
         from src.server.database.runs import lifecycle as _runs_lifecycle
 
         latest = await _runs_lifecycle.get_latest_attempt(thread_id)
@@ -190,17 +184,35 @@ async def _settle_pending_model_handoff(
             and (latest.get("metadata") or {}).get("llm_model_system_only")
             and latest.get("conversation_response_id")
         ):
-            await dalton_model_switch_db.set_thread_metadata_key(
-                thread_id,
-                "owner_model_switch_run_id",
-                str(latest["conversation_response_id"]),
-            )
+            raw_id = str(latest["conversation_response_id"]).strip()
+            return raw_id or None
     except Exception:
         logger.debug(
-            "[handoff] thread %s: failed stamping owner_model_switch_run_id on settle",
+            "[handoff] thread %s: failed reading initial system-only run id",
             thread_id,
             exc_info=True,
         )
+    return None
+
+
+async def _settle_pending_model_handoff(
+    thread_id: str,
+    *,
+    version: str | None,
+    expected_system_only_run_id: str | None = None,
+) -> None:
+    if not expected_system_only_run_id:
+        await clear_pending_model_handoff(thread_id, version=version)
+        return
+    from src.dalton.database import model_switch as dalton_model_switch_db
+
+    await dalton_model_switch_db.settle_pending_model_handoff_metadata(
+        thread_id,
+        thread_model_svc.PENDING_MODEL_HANDOFF_KEY,
+        expected_version=version,
+        switch_run_id_key="owner_model_switch_run_id",
+        expected_run_id=expected_system_only_run_id,
+    )
 
 
 async def run_pending_model_handoff(
@@ -226,6 +238,9 @@ async def run_pending_model_handoff(
     if ctx is None:
         return early_outcome
 
+    # DALTON-HOOK(cos-settings-tools): snapshot latest system-only run id before handoff work so settle never stamps a run that started mid-handoff
+    initial_system_only_run_id = await _read_initial_system_only_run_id(thread_id)
+
     try:
         to_claude_code = await thread_model_svc.next_turn_runs_claude_code(
             ctx.user_id, str(ctx.workspace_id or ""), ctx.current_model
@@ -238,7 +253,11 @@ async def run_pending_model_handoff(
                 return "retryable_failure"
             owed = await _brief_handoff_still_owed(thread_id)
             if not owed:
-                await _settle_pending_model_handoff(thread_id, version=ctx.version)
+                await _settle_pending_model_handoff(
+                    thread_id,
+                    version=ctx.version,
+                    expected_system_only_run_id=initial_system_only_run_id,
+                )
                 return "not_needed"
             started = await brief_on_switch(
                 thread_id, ctx.user_id, ctx.current_model
@@ -249,7 +268,11 @@ async def run_pending_model_handoff(
                 except Exception:
                     still_owed = True
                 if not still_owed:
-                    await _settle_pending_model_handoff(thread_id, version=ctx.version)
+                    await _settle_pending_model_handoff(
+                        thread_id,
+                        version=ctx.version,
+                        expected_system_only_run_id=initial_system_only_run_id,
+                    )
                     return "not_needed"
                 logger.warning(
                     f"[handoff] thread {thread_id}: deferred brief could not start; keeping pending marker"
@@ -286,7 +309,12 @@ async def run_pending_model_handoff(
                 if saw_retryable:
                     pre_status = "retryable_failure"
             if pre_status == "not_needed":
-                await _settle_pending_model_handoff(thread_id, version=ctx.version)
+                # DALTON-HOOK(cos-settings-tools): settle pending marker atomically with guarded switch run id
+                await _settle_pending_model_handoff(
+                    thread_id,
+                    version=ctx.version,
+                    expected_system_only_run_id=initial_system_only_run_id,
+                )
                 return "not_needed"
             if pre_status != "ready":
                 logger.warning(
@@ -301,7 +329,11 @@ async def run_pending_model_handoff(
                     thread_id, ctx.user_id, source
                 )
                 if recheck_status == "not_needed":
-                    await _settle_pending_model_handoff(thread_id, version=ctx.version)
+                    await _settle_pending_model_handoff(
+                        thread_id,
+                        version=ctx.version,
+                        expected_system_only_run_id=initial_system_only_run_id,
+                    )
                     return "not_needed"
                 logger.warning(
                     f"[handoff] thread {thread_id}: deferred summary handoff could not start ({recheck_status}); keeping pending marker"
@@ -324,7 +356,12 @@ async def run_pending_model_handoff(
                 )
                 return "retryable_failure"
 
-        await _settle_pending_model_handoff(thread_id, version=ctx.version)
+        # DALTON-HOOK(cos-settings-tools): settle pending marker atomically with guarded switch run id
+        await _settle_pending_model_handoff(
+            thread_id,
+            version=ctx.version,
+            expected_system_only_run_id=initial_system_only_run_id,
+        )
         return "completed"
     except Exception:
         logger.warning(

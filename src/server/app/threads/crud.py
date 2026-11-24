@@ -750,26 +750,27 @@ async def update_thread_endpoint(
                     and isinstance(_latest_attempt.get("metadata"), dict)
                     else {}
                 )
-                if (
-                    isinstance(_latest_attempt, dict)
-                    and _latest_meta.get("llm_model_system_only")
+                _latest_run_id = (
+                    str(_latest_attempt["conversation_response_id"])
+                    if isinstance(_latest_attempt, dict)
                     and _latest_attempt.get("conversation_response_id")
-                ):
-                    _latest_run_id = str(_latest_attempt["conversation_response_id"])
-                    _prev_meta_dict = (
-                        prev_thread_meta.get("metadata")
-                        if isinstance(prev_thread_meta.get("metadata"), dict)
-                        else {}
-                    )
-                    _already_switched = (
-                        str(_prev_meta_dict.get("owner_model_switch_run_id") or "").strip()
-                        == _latest_run_id
-                    )
+                    else None
+                )
+                _prev_meta_dict = (
+                    prev_thread_meta.get("metadata")
+                    if isinstance(prev_thread_meta.get("metadata"), dict)
+                    else {}
+                )
+                _already_switched = bool(
+                    _latest_run_id
+                    and str(_prev_meta_dict.get("owner_model_switch_run_id") or "").strip()
+                    == _latest_run_id
+                )
+                raw_latest_model = _latest_meta.get("llm_model")
+                if raw_latest_model and not _already_switched:
+                    latest_run_model = str(raw_latest_model).strip() or None
+                if _latest_run_id and _latest_meta.get("llm_model_system_only"):
                     prev_system_only = not _already_switched
-                    raw_latest_model = _latest_meta.get("llm_model")
-                    latest_run_model = (
-                        str(raw_latest_model).strip() if raw_latest_model else None
-                    )
                     updates["metadata_merge"] = {
                         "owner_model_switch_run_id": _latest_run_id
                     }
@@ -860,20 +861,19 @@ async def update_thread_endpoint(
                 # only be dropped; its computer need not stay up for it.
                 await request_running_stops(thread_id=thread_id, by="archive")
         item = _thread_list_item(updated_thread)
-        # DALTON-HOOK(cos-settings-tools): compare (model, system_only) so switching from system-only to a same-named custom model triggers handoff
+        # DALTON-HOOK(cos-settings-tools): compare (model, system_only) against the latest run's actual model/flag so switching from system-only or an automation override triggers handoff with the true source model
+        _handoff_source = (
+            latest_run_model if latest_run_model is not None else switched_from
+        )
         _model_identity_changed = "llm_model" in updates and (
-            (updates["llm_model"], False) != (switched_from, prev_system_only)
+            (updates["llm_model"], False) != (_handoff_source, prev_system_only)
+            or (updates["llm_model"], False) != (switched_from, prev_system_only)
         )
         if _model_identity_changed:
             from src.server.handlers.handoff_brief import brief_on_switch
             from src.server.handlers.thread_maintenance import hand_off_on_switch
             from src.server.services.llm.thread_model import next_turn_runs_claude_code
 
-            _handoff_source = (
-                switched_from
-                if switched_from is not None
-                else (latest_run_model if prev_system_only else None)
-            )
             # Claude Code reads none of the thread's messages, so a brief of
             # all of them takes the place of any summary written out for it.
             # The switch is committed: a failed read leaves the hand-off to
@@ -888,6 +888,7 @@ async def update_thread_endpoint(
             if to_claude_code:
                 item.brief_handoff = await brief_on_switch(thread_id, x_user_id, updates["llm_model"])
             else:
+                # DALTON-HOOK(cos-settings-tools): pass the previous run's actual model to summary handoff
                 item.summary_handoff = await hand_off_on_switch(
                     thread_id, x_user_id, _handoff_source
                 )
