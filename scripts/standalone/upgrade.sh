@@ -1026,23 +1026,42 @@ recover_previous_services_after_abort() {
     health_sleep=2
   fi
   AUTO_HEALTH_OK=0
-  local missing_svcs=""
-  info "Verifying restored previous services (${STOPPED_SERVICES[*]}) are running and backend passes /health (up to ${health_retries} attempts)..."
+  local unhealthy_svcs=""
+  local crawler_port gw_port
+  crawler_port="$(read_env_file_var "$ENV_FILE" "CRAWL_SERVICE_PORT" "8100")"
+  if [[ ! "$crawler_port" =~ ^[0-9]+$ ]]; then crawler_port=8100; fi
+  gw_port="$(read_env_file_var "$ENV_FILE" "GATEWAY_PORT" "8962")"
+  if [[ ! "$gw_port" =~ ^[0-9]+$ ]]; then gw_port=8962; fi
+  info "Verifying restored previous services (${STOPPED_SERVICES[*]}) are running and pass their /health endpoints (up to ${health_retries} attempts)..."
   for _ in $(seq 1 "$health_retries"); do
-    local backend_ok=0
-    if compose_cmd_timeout 10 exec -T backend curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1; then
-      backend_ok=1
-    fi
     local running_svcs=""
     running_svcs="$(compose_cmd_timeout 10 ps --status running --services 2>/dev/null || true)"
-    missing_svcs=""
+    unhealthy_svcs=""
     local svc
     for svc in "${STOPPED_SERVICES[@]}"; do
       if ! grep -qx "$svc" <<<"$running_svcs"; then
-        missing_svcs="${missing_svcs:+${missing_svcs} }${svc}"
+        unhealthy_svcs="${unhealthy_svcs:+${unhealthy_svcs} }${svc}(not-running)"
+        continue
       fi
+      case "$svc" in
+        backend)
+          if ! compose_cmd_timeout 10 exec -T backend curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1; then
+            unhealthy_svcs="${unhealthy_svcs:+${unhealthy_svcs} }backend(/health)"
+          fi
+          ;;
+        crawler)
+          if ! compose_cmd_timeout 10 exec -T crawler curl -sf "http://127.0.0.1:${crawler_port}/health" >/dev/null 2>&1; then
+            unhealthy_svcs="${unhealthy_svcs:+${unhealthy_svcs} }crawler(/health)"
+          fi
+          ;;
+        channel-gateway)
+          if ! compose_cmd_timeout 10 exec -T channel-gateway sh -c 'if command -v curl >/dev/null 2>&1; then curl -sf "$1" >/dev/null 2>&1; else node -e "fetch(process.argv[1]).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" "$1"; fi' _ "http://127.0.0.1:${gw_port}/health" >/dev/null 2>&1; then
+            unhealthy_svcs="${unhealthy_svcs:+${unhealthy_svcs} }channel-gateway(/health)"
+          fi
+          ;;
+      esac
     done
-    if [[ "$backend_ok" -eq 1 && -z "$missing_svcs" ]]; then
+    if [[ -z "$unhealthy_svcs" ]]; then
       AUTO_HEALTH_OK=1
       break
     fi
@@ -1052,7 +1071,7 @@ recover_previous_services_after_abort() {
     ok "Restored previous services (${STOPPED_SERVICES[*]}) are healthy."
     return 0
   fi
-  err "Restored previous services did not pass health check after ${health_retries} attempts (unhealthy/not running: ${missing_svcs:-backend /health})."
+  err "Restored previous services did not pass health check after ${health_retries} attempts (unhealthy/not running: ${unhealthy_svcs:-unknown})."
   return 1
 }
 

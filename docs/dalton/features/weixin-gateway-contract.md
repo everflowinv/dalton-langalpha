@@ -12,10 +12,21 @@
 - **错误响应格式**：结构化错误返回 JSON `{"code": "<error_code>", "message": "<human_message>", ...}`（HTTP `400`/`401`/`403`/`404`/`409`/`503`）。
 - **`X-Gateway-Epoch` 租约围栏规则（集中于 `verify_gateway_epoch_in_tx`）**：
   - **始终免带（只读 / 租约获取 / 配置读取）**：`POST .../gateway-lease/acquire`、`GET .../weixin/accounts/{account_id}`、`GET .../weixin/login-sessions/{session_key}`、`GET .../weixin/collect-buffers/{buffer_id}`、`GET .../state`（I-4）、`PUT .../settings`（I-5）、`POST .../automation-runs` 与 `POST .../automation-runs/{execution_id}/finish`（I-8）。
-  - **微信始终强制（缺头、过期或失配一律 `409 {"code": "stale_gateway_epoch"}`）**：全部微信写入接口、所有目标平台为 `weixin`（含数据库既有行或会话来源解析为 `weixin`）的 I-1 / I-2 / I-3 / I-6 / `preflight-send` / I-7（含 `deliveries/progress`、`inbound/progress`、`steers/reconcile`、`deliveries/deferred-due`）。
+  - **微信始终强制（缺头、过期或失配一律 `409 {"code": "stale_gateway_epoch"}`）**：全部微信写入接口、所有目标平台为 `weixin`（含数据库既有行或 `conversation_threads` / 会话来源解析为 `weixin`）的 I-1 / I-2 / I-3 / I-6 / `preflight-send` / I-7（含 `deliveries/progress`、`inbound/progress`、`steers/reconcile`）。
   - **飞书 / Discord 区分入站与出站**：
     - **I-1 / I-2 / I-3 / `recover`**：租约表从未出现租约行时允许省略；一旦租约表有记录，省略或过期/失配返回 `409 stale_gateway_epoch`。
-    - **I-6 / I-7（`authorize-and-claim`、`deliveries/deferred-due`、`deliveries/progress`、`inbound/progress`、`steers/reconcile`）**：即使租约表已有记录，非微信平台（飞书 / Discord）**省略 `X-Gateway-Epoch` 仍放行**（支撑网关 `outgoing` 无租约模式）；但**只要显式携带了 `X-Gateway-Epoch`**，后端仍按租约行校验，过期/失配返回 `409 stale_gateway_epoch`。
+    - **I-6 / I-7（`authorize-and-claim`、`deliveries/progress`、`inbound/progress`、`steers/reconcile`）**：即使租约表已有记录，非微信平台（飞书 / Discord）**省略 `X-Gateway-Epoch` 仍放行**（支撑网关 `outgoing` 无租约模式）；但**只要显式携带了 `X-Gateway-Epoch`**，后端仍按租约行校验，过期/失配返回 `409 stale_gateway_epoch`。
+- **一次性回执信封（`OneTimeReplyEnvelope`）**：用于冲突自动解绑或 `/unbind` 后的单次微信告别回复，**严格包含且仅包含以下 6 个字段**（不包含 `account_id` 或 `bot_generation`）：
+  ```json
+  {
+    "bot_token": "string",
+    "base_url": "string",
+    "ilink_bot_id": "string",
+    "recipient_id": "string",
+    "context_token": "string",
+    "text": "string"
+  }
+  ```
 - **旧地址规范化**：微信私聊规范地址为 `weixin:@me`；历史库行遗留的 `weixin:dm:<id>` 在 I-6 当前会话匹配与 `notice` 目标核对时自动规范化为 `weixin:@me` 同等对待。
 - **I-9 已移除**：单账号旧接口 `/internal/weixin/state` 已下线，批次 A 与批次 B 同步部署。
 
@@ -27,18 +38,19 @@
 
 - **请求头**：`X-Service-Token`（不带 `X-Gateway-Epoch`）
 - **请求体**：
-  - `instance_id: string`（必填，1..255）
-  - `ttl_seconds: int`（可选，默认 `45`，范围 `5..300`）
+  - `instance_id: string`（必填，去空白后 `1..128` 字符）
+  - `ttl_seconds: int`（可选，默认 `45`，后端钳制在 `5..300`）
 - **响应 `200`**：
-  - 获租：`{"granted": true, "epoch": int, "instance_id": string, "expires_at": ISO8601}`
-  - 已被他人持有且未过期：`{"granted": false, "epoch": int, "holder_instance_id": string, "expires_at": ISO8601, "retry_after_ms": int}`（默认 `3000`）
+  - 获租：`{"granted": true, "epoch": int, "expires_at": ISO8601}`
+  - 已被他人持有且未过期：`{"granted": false, "epoch": int, "expires_at": ISO8601, "retry_after_ms": int}`（`retry_after_ms` 范围 `1000..3000`）
+- **错误**：`400`（`instance_id` 为空或超过 128 字符）
 
 ### 1.2 `POST /internal/gateway-lease/heartbeat`
 
 - **请求头**：`X-Service-Token`
 - **请求体**：`instance_id: string`, `epoch: int (>=1)`, `ttl_seconds: int = 45 (5..300)`
 - **响应 `200`**：`{"ok": true, "epoch": int, "expires_at": ISO8601}`
-- **错误**：`409 {"code": "stale_gateway_epoch", "message": "..."}`（失租或已过期）
+- **错误**：`400`、`409 {"code": "stale_gateway_epoch", "message": "..."}`（失租或已过期）
 
 ### 1.3 `POST /internal/gateway-lease/release`
 
@@ -149,14 +161,56 @@
   - `redirect_base_url?: string | null`, `expires_in_seconds?: int | null`
   - `ilink_bot_id?: string | null`, `bot_token?: string | null`, `base_url?: string | null`, `cdn_base_url?: string | null`, `ilink_user_id?: string | null`, `ilink_username?: string | null`（`confirm` 用）
 - **响应 `200`**：
-  - `save_qr`：`{"ok": true, "session_key": string, "status": "wait", "login_version": 2, "expires_at": ISO8601}`
-  - `update`：`{"ok": true, "revoked": false, "session_key": string, "status": string, "login_version": int, "redirect_base_url": string, "expires_at": ISO8601}`
-  - `confirm`：`{"ok": true, "account_id": uuid-str, "connected": true, "already_connected": false, "bot_generation": int, "accounts_revision": int, "status": "active" | "pending_verification"}`
+  - `save_qr`：`{"ok": true, "revoked": false, "session_key": string, "status": "wait", "login_version": 2, "expires_at": ISO8601, "redirect_base_url": string}`
+  - `update`：`{"ok": true, "revoked": false, "session_key": string, "status": "wait" | "scaned" | "verify_code" | "expired", "login_version": int, "redirect_base_url": string, "expires_at": ISO8601}`
+  - `confirm`：
+    ```json
+    {
+      "ok": true,
+      "revoked": false,
+      "status": "confirmed",
+      "account_status": "active | pending_verification",
+      "ilink_bot_id": "string",
+      "ilink_user_id": "string | null",
+      "ilink_username": "string | null",
+      "confirmed_result": {
+        "account_id": "uuid-str",
+        "connected": true,
+        "already_connected": false,
+        "bot_generation": 1,
+        "accounts_revision": 2
+      },
+      "account_id": "uuid-str",
+      "connected": true,
+      "already_connected": false,
+      "bot_generation": 1,
+      "accounts_revision": 2
+    }
+    ```
+    > **字段语义说明**：`confirm` 响应中 `status` 始终是**登录会话状态**（固定为 `"confirmed"`）；生成的微信账号状态由 **`account_status`**（`"active" | "pending_verification"`）给出。网关应始终读取 `account_status` 判断是否需要等待首包核验。
 - **错误（三类 `action` 统一）**：
+  - **`400`**：`session_key` 缺失、不支持的 `action`、`save_qr` 缺少 `qrcode`、`update` 传入非法 `status`（仅允许 `wait` / `scaned` / `verify_code` / `expired`）、`confirm` 缺少 `ilink_bot_id` 或 `bot_token`
   - **`409 {"code": "login_session_revoked", "message": "扫码会话已撤销或已过期"}`**（会话已撤销 / 被取代 / 过期 / 版本冲突，0 行命中整笔回滚）
   - `409 {"code": "stale_gateway_epoch"}`
   - `409 {"code": "ilink_user_already_bound"}` / `409 {"code": "weixin_capacity_reached"}`（`confirm` 占用或容量已满）
   - `403`（成员不在册或渠道/外部开关关闭）、`503 {"code": "roster_lookup_error"}`
+
+### 3.3 后端 → 网关：三个扫码内部入口
+
+后端收到网页端扫码请求后，先完成登录会话归属校验与状态预写，再携带 `X-Service-Token` 与 `X-User-Id: <user_id>` 转发给网关：
+
+1. **`POST /internal/weixin/qrcode/start`**
+   - **请求头**：`X-Service-Token`, `X-User-Id: <user_id>`
+   - **请求体**：`{"session_key": string, "user_id": string, "login_version": int, "expected_bot_generation": int | null}`
+   - **期望响应 `200`**：含 `session_key`, `status: "wait"`, `qrcode_img_content`, `expires_at` 等（后端按 `_shape_public_weixin_qr_response` 脱敏过滤后返回前端，绝不透出 `qrcode` 原始凭证或 `bot_token`）。
+2. **`GET /internal/weixin/qrcode/wait`**
+   - **请求头**：`X-Service-Token`, `X-User-Id: <user_id>`
+   - **查询参数**：`session_key: string`
+   - **期望响应 `200`**：含 `session_key`, `status: "wait" | "scaned" | "verify_code" | "confirmed" | "expired" | "superseded"`；确认成功时可带 `connected`, `account_id`, `account_status`, `bot_generation`, `accounts_revision` 等。
+3. **`POST /internal/weixin/qrcode/verify-code`**
+   - **请求头**：`X-Service-Token`, `X-User-Id: <user_id>`
+   - **请求体**：`{"session_key": string, "verify_code": string}`
+   - **期望响应 `200`**：同 `wait` 响应格式，经后端 `_shape_public_weixin_qr_response` 脱敏后返回前端。
 
 ---
 
@@ -181,7 +235,7 @@
   - `max_expires_at: ISO8601`
   - **`upload_status: "pending_upload" | "ready" | "failed" | null`**（规范统一字段；仅传 `message_id` 且条目存在时非空）
   - `item_upload_status: "pending_upload" | "ready" | "failed" | null`（同 `upload_status`，兼容别名）
-- **网关上传前判定规则**：仅当 `status == "collecting"`（或 `status == "flushing"` 且 `upload_status == "pending_upload"`）时才继续下载并上传工作区附件；任何 `cancelled` / `expired` / `done`、或 `upload_status != "pending_upload"`、或本接口请求失败（超时 / 5xx）时必须中止上传。
+- **网关上传前判定规则**：仅当 `status == "collecting"` 且条目 `upload_status == "pending_upload"`（或 `status == "flushing"` 且 `upload_status == "pending_upload"`）时才继续下载并上传工作区附件；任何 `cancelled` / `expired` / `done`、或 `upload_status != "pending_upload"`（含条目缺失返回 `null`）时必须中止上传。
 - **错误**：`400`、`404`
 
 ### 4.2 `POST /internal/weixin/collect-buffers/{buffer_id}/items/{message_id}/attachments`
@@ -220,7 +274,7 @@
 - **请求头**：`X-Service-Token`；`X-Gateway-Epoch`（微信必填；飞书/Discord 租约出现后必填）
 - **请求体**：
   - `platform: "feishu" | "discord" | "weixin"`, `platform_user_id: string`, `chat_type: "dm" | "group" = "dm"`, `chat_address: string`, `thread_scope_key: string`, `message_id: string`, `request_key?: uuid-str | null`, `raw_payload: object = {}`
-  - 微信附加字段：`weixin_account_id?: uuid-str | null`, `weixin_context_token?: string | null`, `weixin_bot_id?: string | null`, `weixin_bot_generation?: int | null`, `weixin_context_seq?: int | null`, `weixin_media_meta?: Array<object> | null`, `unsupported_item_types?: Array<string> | null`
+  - 微信附加字段：`weixin_account_id?: uuid-str | null`, `weixin_context_token?: string | null`, `weixin_bot_id?: string | null`, `weixin_bot_generation?: int | null`, `weixin_context_seq?: int | null`, `weixin_media_meta?: Array<object> | null`, **`unsupported_item_types?: Array<int | string> | null`**（网关传 iLink 数字类型码，如 `[5]`；后端兼容数字或字符串列表）
 - **响应 `200`（关键字段）**：
   - `ok: bool`, `linked: bool`, `allowed: bool`, `deny_reason: string | null`, `existing_status: string | null`, `status: string`, `dalton_user_id?: string`, `workspace_id?: uuid-str`, `generation?: int`, `external_thread_id?: string`, `has_usable_weixin_context_token?: bool`
   - 收集模式命中（**首次登记与重复 `message_id` 重放均返回**；重复重放不改写已有 `encrypted_weixin_media_meta`）：
@@ -229,7 +283,7 @@
     - `collect_buffer_status: "collecting" | "flushing" | "done" | "cancelled" | "expired"`
   - 待验证冲突自动解绑时：
     - `ok: false`, **`deny_reason: "ilink_user_conflict_auto_unbound"`**
-    - `one_time_weixin_reply?: {"bot_token": string, "base_url": string, "ilink_bot_id": string, "recipient_id": string, "context_token": string, "text": string}`
+    - `one_time_weixin_reply?: OneTimeReplyEnvelope | null`（字段见 §0）
 - **常见 `deny_reason` 枚举**：`weixin_inbound_fields_required`, `weixin_group_unsupported`, `invalid_inbound_event`, `unsupported_merged_forward`, `not_linked`, `member_not_in_roster`, `weixin_channel_disabled`, `external_access_disabled`, `weixin_bot_generation_mismatch`, `weixin_message_id_account_mismatch`, `ilink_user_conflict_auto_unbound`, `collect_limit_reached`
 - **错误**：`409 stale_gateway_epoch`、`503 {"code": "roster_lookup_error"}`（网关保留游标稍后重试）
 
@@ -252,9 +306,9 @@
 - **响应 `200`**：
   - 公共字段：`ok: bool`, `duplicate?: bool`, `deny_reason?: string | null`（冲突自动解绑统一为 **`"ilink_user_conflict_auto_unbound"`**）, `reply_text?: string`, `command_reply_pending?: bool`, `generation?: int`, `one_time_weixin_reply?: OneTimeReplyEnvelope | null`
   - `/collect`：`collect_status: "collecting"`, `collect_buffer_id: uuid-str`, `workspace_id: uuid-str`
-  - `/cancel`：`collect_status: "cancelled" | "not_collecting"`, **`cancelled_buffer_ids: Array<uuid-str>`**（复数数组，网关应只中止本数组列出的窗口）
+  - `/cancel`：`collect_status: "cancelled" | "not_collecting"`, **`cancelled_buffer_ids: Array<uuid-str>`**（复数数组，网关只中止本数组列出的窗口）
   - `/done`：`collect_status: "done" | "empty" | "cancelled" | "not_collecting"`, `collect_buffer_id?: uuid-str`, `flushed_inbound?: SyntheticCollectInbound | null`
-- **不变量**：既有 `(platform, message_id)` 行存在且发件人不匹配（含请求省略 `platform_user_id` 而查得身份不匹配，或请求同时标为 `invalid_inbound_event`）时，仅返回拒绝，绝不覆盖原记录。
+- **不变量**：全部指令（含 `/collect`、`/done`、`/cancel`、`/help` 与普通会话指令）在修改任何既有 `(platform, message_id)` 入站行之前（不论原行是否已有 `command_result`），先核对账号 / 用户 / 发件人（含省略 `platform_user_id` 查得身份不匹配或 `invalid_inbound_event` 场景），不一致仅返回拒绝，绝不覆盖原记录。
 - **错误**：`409 stale_gateway_epoch`、`503 {"code": "roster_lookup_error"}`
 
 ---
@@ -275,93 +329,135 @@
 
 ---
 
-## 7. 出站认领、预检、暂缓重试与进度结算（I-6 / Preflight / I-7 / I-8）
+## 7. 出站认领、发送前预检与进度结算（I-6 / Preflight / I-7 / I-8）
 
 ### 7.1 I-6：`POST /internal/deliveries/authorize-and-claim`
 
 - **请求头**：`X-Service-Token`；微信必填 `X-Gateway-Epoch`；飞书 / Discord 可省略（显式携带仍会校验）
+- **加锁顺序**：微信认领严格按 `dalton_channel_weixin_accounts (FOR KEY SHARE)` → `dalton_channel_session_generations (FOR SHARE)` → `dalton_channel_deliveries` 加锁，与解绑（账号 `FOR UPDATE` → 会话）保持一致，无死锁。
 - **请求体**：
   - `delivery_key: string`, `kind: "agent_send" | "fallback" | "interrupt" | "automation" | "notice" | "data_task" | "automation_notify"`, `user_id?`, `thread_id?`, `run_id?`, `execution_id?`, `automation_execution_id?`, `platform?`, `target?`, `inbound_message_id?`, `has_non_empty_text: bool = true`, `total_chunks: int = 0`, `source_scope_key?`, `source_generation?: int`, `activity_origin?: "conversation" | "replay" | "notification" | "command" | "none"`
 - **响应 `200`（按 `claim_status` 分支）**：
   1. **`claim_status: "claimed"`**：
      - `recipient_id: string`, `platform: string`, `target_address: string`, `delivery_attempt: int`, `is_current: bool`, `thread_scope_key: string | null`, `home_workspace_id: uuid-str | null`, `confirmed_thread_address: string | null`, `discord_body_phase: string | null`
-     - 已送达断点（供 `partial_deferred` 重试续发剩余段/附件）：`sent_chunks: int`, `total_chunks: int`, `platform_message_ids: Array<any>`, `files_status: Array<object>`, `delivered_segments: Array<any>`
-     - 微信附加字段：`weixin_account_id: uuid-str`, `weixin_bot_id: string`, `weixin_bot_generation: int`, `weixin_context_token: string`, `weixin_context_token_version: int | null`
-  2. **`claim_status: "deferred"`**（未到 `next_retry_at`，或认领时名册查询失败 `roster_lookup_error` 落库暂缓）：
-     - `status: "deferred" | "partial_deferred"`, `code: "delivery_deferred" | "roster_lookup_error"`, `retryable: true`, `defer_count: int`, `first_deferred_at: ISO8601`, `next_retry_at: ISO8601`, `retry_after_seconds: int`, **`retry_after_ms: int`**, `delivery_attempt: int`, `platform`, `target_address`, `sent_chunks`, `total_chunks`, `platform_message_ids`, `files_status`, `delivered_segments`, `is_current`
-  3. **`claim_status: "already_completed"`**：`status: "sent" | "partial"`, `first_response_json`, `platform`, `target_address`, `delivery_attempt`
-  4. **`claim_status: "in_flight_or_unknown"`**：`status: "unknown"`, `code: "in_flight"`, `platform`, `target_address`, `delivery_attempt`
-  5. **`claim_status: "denied"`**：`status: "failed" | "unknown"`, `code: string`, `message: string`
-     - 常见拒绝码：`deferred_timeout`（已超 24 小时上限，**永久终态，不再允许重新认领为 `in_flight`**）、`session_generation_superseded`（在认领同事务 `FOR SHARE` 核验当前会话代数失配，覆盖 `notice` 与普通回复）、`source_generation_unknown`（标 `unknown` + 审计）、`weixin_bot_generation_superseded`、`weixin_account_rebound`、`weixin_session_expired`、`weixin_context_token_stale`、`missing_weixin_context_token`、`member_not_in_roster`、`weixin_channel_disabled`、`external_access_disabled`、`not_linked`、`not_allowed`
-- **错误**：`400`、`404`（平台能力关闭）、`409 stale_gateway_epoch`
+     - 微信附加字段：`weixin_account_id: uuid-str`, `weixin_bot_id: string`, `weixin_bot_generation: int`, `weixin_context_token: string`, **`weixin_context_token_version: int | null`**（允许为 `null`）
+  2. **`claim_status: "already_completed"`**：`status: "sent" | "partial"`, `first_response_json`, `platform`, `target_address`, `delivery_attempt`
+  3. **`claim_status: "in_flight_or_unknown"`**：`status: "unknown"`, `code: "in_flight"`, `platform`, `target_address`, `delivery_attempt`
+  4. **`claim_status: "denied"`**：`status: "failed" | "unknown"`, `code: string`, `message: string`
+     - 常见拒绝码：`session_generation_superseded`（在认领同事务 `FOR SHARE` 核验当前会话代数失配，覆盖 `notice` 与普通回复）、`source_generation_unknown`（标 `unknown` + 审计）、`weixin_bot_generation_superseded`、`weixin_account_rebound`、`weixin_session_expired`、`weixin_context_token_stale`、`missing_weixin_context_token`、`member_not_in_roster`、`weixin_channel_disabled`、`external_access_disabled`、`not_linked`、`not_allowed`
+- **错误**：
+  - `400`、`404`（平台能力关闭）、`409 stale_gateway_epoch`
+  - **`503 {"code": "roster_lookup_error", "retryable": true, "message": "..."}`**（认领时名册查询失败，不落库暂缓，由调用方/网关按退避重试）
 
 ### 7.2 发送前实时预检：`POST /internal/deliveries/{delivery_key}/preflight-send`
 
 - **请求头**：`X-Service-Token`, `X-Gateway-Epoch`（必填；先做 `channel_weixin` 能力检查再解析 epoch）
 - **请求体**：`delivery_attempt: int`, `chunk_index?: int | null`
 - **响应 `200`**：
-  - 允许：`{"authorized": true, "decision": "allow", "retryable": false, "account_id": uuid-str, "ilink_bot_id": string, "bot_generation": int, "bot_token": string, "base_url": string, "cdn_base_url": string, "recipient_id": string, "weixin_context_token": string, "weixin_context_token_version": int | null}`
-  - 暂缓（名册 `lookup_error`）：`{"authorized": false, "decision": "defer", "retryable": true, "deny_code": "roster_lookup_error"}`
+  - 允许：`{"authorized": true, "decision": "allow", "retryable": false, "chunk_index": int, "account_id": uuid-str, "ilink_bot_id": string, "bot_generation": int, "bot_token": string, "base_url": string, "cdn_base_url": string, "recipient_id": string, "weixin_context_token": string, "weixin_context_token_version": int | null}`
+  - 临时可重试（名册 `lookup_error`）：`{"authorized": false, "decision": "defer", "retryable": true, "deny_code": "roster_lookup_error"}`
   - 拒绝：`{"authorized": false, "decision": "deny", "retryable": false, "deny_code": string}`
+- **网关进程内退避重试约定**：当预检返回 `retryable: true`（`roster_lookup_error`）时，后端不保存暂缓状态，投递行保持 `in_flight`；网关在进程内按退避重试（建议总时长上限 3–5 分钟，例如指数退避 2s → 4s → 8s → 16s → 30s 封顶，累计达上限后停止重试）；若超时仍未恢复，网关通过 I-7 上报终态 `status: "failed"`（已发送过部分分段时按既有分段语义上报 `partial` 或 `unknown`）。
 - **错误**：`404`（能力关闭）、`409 stale_gateway_epoch`
 
-### 7.3 到期暂缓投递轮询：`GET /internal/deliveries/deferred-due`
-
-- **职责（自动重试机制）**：由持租网关定时轮询（建议每 10–15 秒，启动恢复亦返回初始清单）。后端在同一短事务内先将全部已超 24 小时上限的 `deferred` / `partial_deferred` 行扫描置为终态 `failed`（`error_code: "deferred_timeout"`）并写微信审计，再返回当前 `next_retry_at <= NOW()` 的到期投递列表，由网关按 `delivery_key` 经 I-6 重新认领并续发。
-- **请求头**：`X-Service-Token`；查询 `platform=weixin` 时必填 `X-Gateway-Epoch`；非微信可省略
-- **查询参数**：`platform?: "feishu" | "discord" | "weixin"`, `limit: int = 50 (1..200)`
-- **响应 `200`**：
-  - `ok: true`
-  - `deliveries: Array<DeferredDeliveryRow>`（含 `delivery_key`, `kind`, `user_id`, `thread_id`, `run_id`, `execution_id`, `platform`, `target_address`, `status: "deferred" | "partial_deferred"`, `delivery_attempt`, `defer_count`, `first_deferred_at`, `next_retry_at`, `sent_chunks`, `total_chunks`, `platform_message_ids`, `files_status`, `delivered_segments`, `source_scope_key`, `source_generation`, `activity_origin`, `weixin_account_id`, `weixin_bot_id`, `weixin_bot_generation`, `weixin_recipient_id`, `error_code`）
-  - `expired_count: int`（本次扫描转为 `failed` 的超 24h 条数）
-  - `next_upcoming_retry_at: ISO8601 | null`（下一条未到期投递的最早重试时间）
-
-### 7.4 I-7 (1)：`POST /internal/deliveries/progress`
+### 7.3 I-7 (1)：`POST /internal/deliveries/progress`
 
 - **请求头**：`X-Service-Token`；库中投递行 `platform == "weixin"` 时必填 `X-Gateway-Epoch`；飞书 / Discord 可省略（显式携带仍会校验）
 - **请求体**：
   - `delivery_key: string`
-  - `status?: "in_flight" | "sent" | "partial" | "failed" | "unknown" | "deferred" | "partial_deferred" | null`
-  - `outcome?: "deferred" | "partial_deferred" | "sent" | "partial" | "failed" | "unknown" | null`
+  - `status?: "in_flight" | "sent" | "partial" | "failed" | "unknown" | null`
+  - `outcome?: "in_flight" | "sent" | "partial" | "failed" | "unknown" | null`（与 `status` 同时传入时必须一致，否则返回 `400`）
   - `delivery_attempt?: int | null`（传入时必须匹配当前尝试号，否则 `409`）
   - `sent_chunks?: int | null`, `total_chunks?: int | null`, `platform_message_ids?: Array<any> | null`, `files_status?: Array<object> | null`
-  - **`delivered_segments?: Array<any> | null`**（部分送达暂缓 `partial_deferred` 时记录已送达段标识，后端单调合并保存，供重试只发剩余部分）
   - `first_response_json?: object | null`, `error_code?: string | null`, `error_message?: string | null`
   - `confirmed_thread_address?: string | null`, `discord_body_phase?: string | null`
-- **暂缓规则（`outcome`/`status` 为 `"deferred"` 或 `"partial_deferred"`）**：
-  - **受保护状态优先**：Discord `unknown` 保护先于暂缓分支执行，且同时检查 `status` 与 `outcome`；`sent` / `partial` 终态不可暂缓（返回 `409`）。
-  - **部分送达语义**：传 `outcome: "partial_deferred"`，或暂缓时已有 `sent_chunks > 0` / 已送达附件 / 非空 `delivered_segments`，数据库状态写入 `partial_deferred` 并保留全部已送达进度，不再提前结算为终态 `partial`。
-  - **同尝试号幂等**：同一 `delivery_attempt` 重复上报暂缓（如响应丢失重送）返回 `idempotent_replay: true`，**不增加 `defer_count`、不延长 `next_retry_at`、不重复写审计**。
-  - **指数退避与 24h 上限**：`backoff_seconds = min(600, 30 * 2^(defer_count - 1))`（30s → 60s → 120s → 240s → 480s → 600s 封顶）；距 `first_deferred_at` 满 24 小时后自动转为终态 `status: "failed"`, `error_code: "deferred_timeout"`, `expired_to_failed: true`。
-  - **审计原因仅用白名单枚举**：写入 `dalton_channel_weixin_audit_logs.reason` 仅按错误码白名单映射固定中文文案，绝不落盘调用方自由文本 `error_message`。
+- **状态迁移表（集中于 `_validate_delivery_status_transition`）**：
+  - 合法状态集合：`in_flight`、`sent`、`partial`、`failed`、`unknown`（其余值如 `deferred` / `partial_deferred` 一律返回 `400`）。
+  - 允许迁移：
+    - `in_flight` → `in_flight | sent | partial | failed | unknown`
+    - `partial` → `partial | sent | failed | unknown`
+    - `sent` → 仅允许幂等 `sent`（不可回到 `in_flight` 或改为其他终态，违规 `409`）
+    - `failed` → 仅允许幂等 `failed`（失败重试必须经 I-6 重新认领，不可经 I-7 回到 `in_flight`，违规 `409`）
+    - `unknown` → 仅允许幂等 `unknown`（违规 `409`）；**唯一例外**：Discord 非 `data_task` 投递在 `error_code == "gateway_restarted"`、`discord_body_phase == "dispatching"` 且 `delivery_attempt` 精确匹配时允许收敛到 `sent | failed | partial`。Discord `unknown` 保护同时检查 `status` 与 `outcome`，不可被其他字段绕过。
 - **响应 `200`**：
-  - 暂缓 / 超限：`{"ok": true, "delivery_key", "status": "deferred" | "partial_deferred" | "failed", "outcome": "deferred" | "partial_deferred" | "failed", "defer_count": int, "first_deferred_at": ISO8601, "next_retry_at": ISO8601 | null, "retry_after_seconds": int | null, "retry_after_ms": int | null, "expired_to_failed": bool, "idempotent_replay": bool, "sent_chunks": int, "total_chunks": int, "platform_message_ids": Array<any>, "files_status": Array<object>, "delivered_segments": Array<any>, "sent_to_current_count": 0, "delivery_attempt": int}`
-  - 常规结算：`{"ok": true, "delivery_key", "status", "sent_to_current_count", "confirmed_thread_address", "discord_body_phase", "delivery_attempt"}`
-- **错误**：`400`、`404`、`409`（`stale_gateway_epoch` / `delivery_attempt` 失配 / 受保护状态不可改写）
+  ```json
+  {
+    "ok": true,
+    "delivery_key": "string",
+    "status": "in_flight | sent | partial | failed | unknown",
+    "sent_to_current_count": 0,
+    "confirmed_thread_address": "string | null",
+    "discord_body_phase": "before_body | dispatching | null",
+    "delivery_attempt": 1
+  }
+  ```
+- **错误**：`400`（参数缺失、非法状态、`status` 与 `outcome` 冲突）、`404`、`409`（`stale_gateway_epoch` / `delivery_attempt` 失配 / 非法状态迁移 / Discord `unknown` 保护）
 
-### 7.5 I-7 (2)：`POST /internal/inbound/progress`
+### 7.4 I-7 (2)：`POST /internal/inbound/progress`
 
-- **请求头**：`X-Service-Token`；**平台以数据库实际记录 / 持久化会话来源为准**——库中已有 `thread_watches` / `background_runs` / 源入站行为 `weixin` 时强制要求有效 `X-Gateway-Epoch`；请求体平台与库中平台不一致时直接返回 **`409 {"code": "platform_mismatch"}`** 且不写任何字段。飞书 / Discord 合法请求可省略 `X-Gateway-Epoch`。
+- **请求头**：`X-Service-Token`；**平台以数据库实际记录为准**——首次写入时按 `dalton_channel_thread_watches` / `dalton_channel_background_runs` / `dalton_channel_inbound_events` / **`conversation_threads.platform`**（及 `conversation_responses → conversation_threads`）推导权威平台，请求体平台仅作校验；写入前锁定目标行（`FOR UPDATE` / `FOR SHARE`）并在 `ON CONFLICT DO UPDATE` 上附加 `WHERE <table >.platform = EXCLUDED.platform` 条件，微信行在预查后并发提交时也会被拒（返回 `409 platform_mismatch` 或 `409 stale_gateway_epoch` 并回滚整笔事务）。飞书 / Discord 合法请求可省略 `X-Gateway-Epoch`。
 - **请求体**：`platform?`, `message_id?`, `status?`, `thread_id?`, `run_id?`, `turn_index?`, `request_key?`, `retry_request_key?`, `resubmitted_request_key?`, `steered_into_run_id?`, `fallback_pending?`, `uploaded_attachments?`, `raw_payload?`, `raw_payload_patch?`, `command_effect_status?`, `command_reply_pending?`, `command_result?`, `session_interrupt_update?`, `background_run?`, `thread_watch?`
-- **响应 `200`**：`{"ok": true, ...}`
-- **错误**：`409 stale_gateway_epoch`、`409 platform_mismatch`
+- **响应 `200`**：
+  ```json
+  {
+    "ok": true,
+    "run_id": "string | null",
+    "has_in_flight_current_text": false,
+    "has_unknown_current_text": false,
+    "has_in_flight_or_unknown_current_text": false,
+    "sent_to_current_count": 0,
+    "session_is_current_for_interrupt": "bool | null"
+  }
+  ```
+- **错误**：`409 stale_gateway_epoch`、`409 {"code": "platform_mismatch", "message": "..."}`
 
-### 7.6 I-7 (3)：`POST /internal/steers/reconcile`
+### 7.5 I-7 (3)：`POST /internal/steers/reconcile`
 
 - **请求头**：`X-Service-Token`；微信必填 `X-Gateway-Epoch`；飞书 / Discord 可省略
 - **请求体**：`platform: string`, `message_id: string`, `run_id?: string | null`
-- **响应 `200`**：对账结果对象
+- **响应 `200`**：
+  ```json
+  {
+    "ok": true,
+    "reconcile_status": "consumed | pending_resubmit | returned_unresubmitted | still_pending",
+    "outcome": "string | null",
+    "run_status": "string | null",
+    "inbound_status": "string",
+    "resubmitted_request_key": "uuid-str | null"
+  }
+  ```
 - **错误**：`404`、`409 stale_gateway_epoch`
 
-### 7.7 I-7 (4)：`GET /internal/recover`
+### 7.6 I-7 (4)：`GET /internal/recover`
 
 - **请求头**：`X-Service-Token`；`X-Gateway-Epoch`（租约表有记录后必填）
 - **查询参数**：`mode: "startup" | "watch_reconnect" = "startup"`, `thread_id?: uuid-str | null`
 - **响应 `200`**：
-  - `mode == "watch_reconnect"`：`{"mode": "watch_reconnect", "background_runs": [...], "thread_watches": [...]}`
-  - `mode == "startup"`：`{"mode": "startup", "inbound_events": [...], "background_runs": [...], "thread_watches": [...], "automation_runs": [...], "flushing_collect_buffers": [...], "deferred_deliveries": [...]}`（启动时自动把超 24h 的暂缓投递转 `failed` 并返回剩余暂缓投递列表；锁序严格为 `weixin_accounts FOR KEY SHARE` → 仅锁已锁账号集合内的 `thread_watches FOR UPDATE` + 新行重检，零死锁空隙）
+  - `mode == "watch_reconnect"`：`{"mode": "watch_reconnect", "background_runs": Array<object>, "thread_watches": Array<object>}`
+  - `mode == "startup"`：`{"mode": "startup", "inbound_events": Array<object>, "background_runs": Array<object>, "thread_watches": Array<object>, "automation_runs": Array<object>, "flushing_collect_buffers": Array<object>}`（锁序严格为 `weixin_accounts FOR KEY SHARE` → 仅锁已锁账号集合内的 `thread_watches FOR UPDATE` + 新行重检，零死锁空隙）
 
-### 7.8 I-8：自动化运行登记与结束
+### 7.7 I-8：自动化运行登记与结束
 
-- `POST /internal/automation-runs`（`X-Service-Token`，无需 `X-Gateway-Epoch`）：请求 `{execution_id, user_id?, workspace_id?, automation_name, entries, thread_id?}` → `200`。
-- `POST /internal/automation-runs/{execution_id}/finish`（`X-Service-Token`，无需 `X-Gateway-Epoch`）：请求 `{status?, thread_id?, final_text?, targets?, mark_finished: bool = false}` → `200`。
+- **`POST /internal/automation-runs`**（`X-Service-Token`，无需 `X-Gateway-Epoch`）
+  - **请求体**：`{"execution_id": uuid-str, "user_id"?: string, "workspace_id"?: uuid-str | null, "automation_name": string = "", "entries": Array<string>, "thread_id"?: uuid-str | null}`
+  - **响应 `200`**：`{"targets": Array<object>}`（每项含解析后的 `address` / `platform` / `recipient_id` 等目标结构）
+  - **错误**：`400`
+- **`POST /internal/automation-runs/{execution_id}/finish`**（`X-Service-Token`，无需 `X-Gateway-Epoch`）
+  - **请求体**：`{"status"?: string | null, "thread_id"?: uuid-str | null, "final_text"?: string | null, "targets"?: Array<object> | null, "mark_finished": bool = false}`
+  - **响应 `200`**：
+    ```json
+    {
+      "execution_id": "uuid-str",
+      "status": "finishing | finished",
+      "previous_status": "running | finishing | finished",
+      "user_id": "string",
+      "workspace_id": "uuid-str | null",
+      "thread_id": "uuid-str | null",
+      "automation_name": "string",
+      "finish_status": "string | null",
+      "final_text": "string | null",
+      "targets": []
+    }
+    ```
+    （`mark_finished: false` 首次认领时将状态置为 `finishing` 并在每个 `targets[i]` 上标记 `agent_sent: bool`；`mark_finished: true` 时收敛为 `finished`）
+  - **错误**：`404`（未知 `execution_id`）

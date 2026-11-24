@@ -35,6 +35,8 @@ def _make_fake_env(
     docker_tag_rc: int = 0,
     running_services: str | None = None,
     crawler_image: str | None = None,
+    crawler_health_rc: int = 0,
+    gateway_health_rc: int = 0,
 ) -> tuple[Path, Path, Path, Path]:
     """Create work_dir, release_dir, fake_bin, and docker trace log."""
     work_dir = tmp_path / "work"
@@ -223,6 +225,12 @@ if [[ "${{1:-}}" == "compose" ]]; then
         exit 0
       fi
       if [[ "$joined" == *"/health"* ]]; then
+        if [[ "$joined" == *"crawler"* ]]; then
+          exit {crawler_health_rc}
+        fi
+        if [[ "$joined" == *"channel-gateway"* ]]; then
+          exit {gateway_health_rc}
+        fi
         exit {health_rc}
       fi
       exit 0
@@ -823,4 +831,66 @@ def test_r9_drain_wall_clock_budget_and_alembic_query_timeout(
     assert res2.returncode == 1
     assert "Could not read Alembic schema versions" in res2.stderr
     assert elapsed2 < 8.0, f"Alembic version query hung past timeout: {elapsed2:.2f}s"
+
+
+def test_r10_recovery_health_check_probes_crawler_and_gateway_health_endpoints(
+    tmp_path: Path,
+) -> None:
+    """R10 Codex #10: Recovery health check probes crawler and channel-gateway /health
+    endpoints, not just container running state."""
+    for name, c_rc, g_rc, expect_ok, expect_err_tag in (
+        ("crawler-unhealthy", 1, 0, False, "crawler(/health)"),
+        ("gateway-unhealthy", 0, 1, False, "channel-gateway(/health)"),
+        ("all-healthy", 0, 0, True, ""),
+    ):
+        case_dir = tmp_path / name
+        case_dir.mkdir()
+        work_dir, release_dir, fake_bin, trace = _make_fake_env(
+            case_dir,
+            compose_services="postgres\nredis\nbackend\ncrawler\nchannel-gateway\nedge\n",
+            running_services="postgres\nredis\nbackend\ncrawler\nchannel-gateway\nedge\n",
+            drain_counts=("0",),
+            migrate_rc=1,
+            pre_up="148",
+            post_up="148",
+            pre_da="d046",
+            post_da="d046",
+            new_upstream_head="148",
+            new_dalton_head="d049",
+            crawler_health_rc=c_rc,
+            gateway_health_rc=g_rc,
+        )
+        env = {
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "DALTON_RECOVERY_HEALTH_RETRIES": "1",
+            "DALTON_RECOVERY_HEALTH_SLEEP_S": "0",
+        }
+        res = subprocess.run(
+            [
+                "bash",
+                str(_UPGRADE_SCRIPT),
+                "--work-dir",
+                str(work_dir),
+                "--release-dir",
+                str(release_dir),
+                "--skip-build",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res.returncode == 1
+        trace_txt = trace.read_text(encoding="utf-8")
+        assert "exec -T crawler curl -sf http://127.0.0.1:8100/health" in trace_txt
+        assert "exec -T channel-gateway sh -c" in trace_txt
+        assert "http://127.0.0.1:8962/health" in trace_txt
+        if expect_ok:
+            assert "ALREADY restored the pre-upgrade release files" in res.stderr
+            assert "health_ok=0" not in res.stderr
+        else:
+            assert expect_err_tag in res.stderr
+            assert "health_ok=0" in res.stderr
+
 

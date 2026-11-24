@@ -78,6 +78,7 @@ class InMemoryWeixinMultiAccountStore:
         self.session_generations: dict[tuple[str, str, str], dict[str, Any]] = {}
         self.conversation_queries: list[dict[str, Any]] = []
         self.conversation_responses: dict[str, dict[str, Any]] = {}
+        self.conversation_threads: dict[str, dict[str, Any]] = {}
         self.workspaces: dict[str, dict[str, Any]] = {}
         self.user_roles: dict[str, str] = {}
         self.executed_sql: list[tuple[str, Any]] = []
@@ -964,6 +965,38 @@ class InMemoryWeixinMultiAccountStore:
             return []
 
         # --- Thread watches ---
+        if "INSERT INTO dalton_channel_thread_watches" in norm:
+            tid, uid, plat, addr, scope, gen, last_turn, active = (
+                str(params[0]),
+                str(params[1]),
+                str(params[2]),
+                str(params[3]),
+                str(params[4]),
+                int(params[5]),
+                int(params[6]),
+                bool(params[7]),
+            )
+            prev = self.thread_watches.get(tid)
+            if (
+                prev is not None
+                and "WHERE dalton_channel_thread_watches.platform = EXCLUDED.platform" in norm
+                and str(prev.get("platform") or "").strip().lower() != plat.lower()
+            ):
+                return []
+            self.thread_watches[tid] = {
+                "thread_id": tid,
+                "dalton_user_id": uid,
+                "platform": plat,
+                "target_address": addr,
+                "scope_key": scope,
+                "generation": gen,
+                "last_seen_turn_index": last_turn,
+                "watch_active": active,
+                "created_at": (prev or {}).get("created_at") or now,
+                "updated_at": now,
+            }
+            return [{"platform": plat}] if "RETURNING platform" in norm else []
+
         if "UPDATE dalton_channel_thread_watches" in norm:
             if "SET weixin_bot_generation = %s" in norm:
                 new_gen, aid = int(params[0]), str(params[-1])
@@ -1062,6 +1095,17 @@ class InMemoryWeixinMultiAccountStore:
                     return [{"turn_created_at": q["created_at"]}]
             return []
 
+        if "FROM conversation_threads WHERE conversation_thread_id = %s" in norm:
+            ct = self.conversation_threads.get(str(params[0]))
+            return [dict(ct)] if ct else []
+
+        if "FROM conversation_responses cr JOIN conversation_threads ct" in norm:
+            resp = self.conversation_responses.get(str(params[0]))
+            if resp and resp.get("conversation_thread_id"):
+                ct = self.conversation_threads.get(str(resp["conversation_thread_id"]))
+                return [{"platform": ct.get("platform")}] if ct else []
+            return []
+
         # --- Background runs ---
         if "INSERT INTO dalton_channel_background_runs" in norm:
             rid = str(params[0])
@@ -1081,11 +1125,19 @@ class InMemoryWeixinMultiAccountStore:
                     "created_at": now,
                     "updated_at": now,
                 }
-                if rid not in self.background_runs:
+                prev_bg = self.background_runs.get(rid)
+                if (
+                    prev_bg is not None
+                    and "WHERE dalton_channel_background_runs.platform = EXCLUDED.platform" in norm
+                    and str(prev_bg.get("platform") or "").strip().lower() != row_bg["platform"].lower()
+                ):
+                    return []
+                if prev_bg is None:
                     self.background_runs[rid] = row_bg
                 else:
                     self.background_runs[rid]["status"] = row_bg["status"]
                     self.background_runs[rid]["fallback_pending"] = row_bg["fallback_pending"]
+                return [{"platform": row_bg["platform"]}] if "RETURNING platform" in norm else []
             elif rid not in self.background_runs:
                 self.background_runs[rid] = {
                     "run_id": rid,
@@ -2455,9 +2507,9 @@ async def test_rescan_pending_verification_preserves_prev_ilink_user_id_and_conf
     """Verify prev_ilink_user_id protection during rescan pending_verification, conflict D16 reply, and 9 audit defaults."""
     store: InMemoryWeixinMultiAccountStore = wx_env["store"]
     # Verify all 9 audit actions have non-empty fixed default reasons (§4.3)
-    assert len(wx_db.AUDIT_DEFAULT_REASONS) == 11
-    assert "delivery_deferred" in wx_db.AUDIT_DEFAULT_REASONS
-    assert "delivery_deferred_timeout" in wx_db.AUDIT_DEFAULT_REASONS
+    assert len(wx_db.AUDIT_DEFAULT_REASONS) == 9
+    assert "delivery_deferred" not in wx_db.AUDIT_DEFAULT_REASONS
+    assert "delivery_deferred_timeout" not in wx_db.AUDIT_DEFAULT_REASONS
     assert all(isinstance(v, str) and v.strip() for v in wx_db.AUDIT_DEFAULT_REASONS.values())
 
     # Member A binds wx_a
@@ -6484,24 +6536,55 @@ async def test_r8_collect_buffer_duplicate_i1_returns_collection_mode_appended(
 
 
 @pytest.mark.asyncio
-async def test_r8_i7_deferred_backoff_24h_cap_audit_and_i6_gating(
+async def test_r10_d049_migration_upgrade_downgrade_no_deferred_columns() -> None:
+    """R10: Verify d049 upgrade/downgrade has zero deferred delivery columns and symmetric DDL."""
+    from pathlib import Path
+
+    d049_path = (
+        Path(__file__).resolve().parents[3]
+        / "src/dalton/migrations/versions/d049_weixin_multi_account.py"
+    )
+    src = d049_path.read_text(encoding="utf-8")
+    for removed_col in (
+        "defer_count",
+        "first_deferred_at",
+        "next_retry_at",
+        "last_deferred_attempt",
+        "delivered_segments",
+    ):
+        assert removed_col not in src, f"Removed deferred column still in d049: {removed_col}"
+    for col in (
+        "weixin_account_id",
+        "weixin_bot_id",
+        "weixin_bot_generation",
+        "weixin_recipient_id",
+    ):
+        assert f"ADD COLUMN IF NOT EXISTS {col}" in src
+        assert f"DROP COLUMN IF EXISTS {col}" in src
+
+
+@pytest.mark.asyncio
+async def test_r10_i6_roster_503_no_defer_and_preflight_retryable(
     wx_env: dict[str, Any],
 ) -> None:
-    """Batch B Item 5: I-7 outcome='deferred' exponential backoff (30s..600s), I-6 gating, 24h cap -> failed + audit."""
+    """R10: Deferred delivery mechanism removed —
+    - I-6 roster_lookup_error returns HTTP 503 with retryable=True and writes zero delivery row;
+    - Preflight roster_lookup_error returns 200 retryable=True while delivery stays in_flight;
+    - GET /internal/deliveries/deferred-due is removed (404);
+    - startup recovery has no deferred_deliveries field.
+    """
     store: InMemoryWeixinMultiAccountStore = wx_env["store"]
     client: TestClient = wx_env["client"]
+    roster: dict[str, str] = wx_env["roster"]
     svc_hdrs = {"X-Service-Token": SERVICE_TOKEN, "X-Gateway-Epoch": "1"}
-    if store.lease is not None:
-        store.lease["expires_at"] = store.now + timedelta(hours=48)
 
     aid = str(uuid4())
-    dkey = "auto:exec-r8-defer:0:weixin:@me"
     store.accounts[aid] = {
         "account_id": aid,
         "user_id": "u-alice",
-        "ilink_bot_id": "bot-def@im.wechat",
-        "encrypted_bot_token": "tok-def",
-        "bot_token": "tok-def",
+        "ilink_bot_id": "bot-r10@im.wechat",
+        "encrypted_bot_token": "tok-r10",
+        "bot_token": "tok-r10",
         "base_url": "https://ilinkai.weixin.qq.com",
         "cdn_base_url": "https://novac2c.cdn.weixin.qq.com/c2c",
         "get_updates_buf": "",
@@ -6511,177 +6594,82 @@ async def test_r8_i7_deferred_backoff_24h_cap_audit_and_i6_gating(
         "bot_generation": 1,
         "prev_bot_generation": None,
         "bot_generation_updated_at": None,
-        "ilink_user_id": "wx_def@im.wechat",
+        "ilink_user_id": "wx_r10@im.wechat",
         "prev_ilink_user_id": None,
         "ilink_username": "Alice",
         "last_inbound_at": None,
         "created_at": store.now,
         "updated_at": store.now,
     }
-    store.deliveries[dkey] = {
-        "delivery_key": dkey,
-        "kind": "automation",
+    store.user_settings["u-alice"] = {
+        "user_id": "u-alice",
+        "version": "v1",
+        "apps": {
+            "weixin": {
+                "preferred": "weixin:@me",
+                "chats": {},
+                "automation_output": {},
+                "agent_messages": {"enabled": True, "allowed": ["weixin:@me"]},
+            }
+        },
+    }
+
+    # 1. GET /internal/deliveries/deferred-due is removed (404)
+    r_gone = client.get(
+        "/api/v1/dalton/channels/internal/deliveries/deferred-due",
+        headers=svc_hdrs,
+    )
+    assert r_gone.status_code == 404
+
+    # 2. I-6 roster_lookup_error returns HTTP 503 retryable=True and persists ZERO delivery row
+    roster["u-alice"] = "lookup_error"
+    r_503 = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=svc_hdrs,
+        json={
+            "delivery_key": "dlv-r10-roster-503",
+            "kind": "agent_send",
+            "user_id": "u-alice",
+            "platform": "weixin",
+            "target": "weixin:@me",
+        },
+    )
+    assert r_503.status_code == 503, r_503.text
+    assert r_503.json()["code"] == "roster_lookup_error"
+    assert r_503.json()["retryable"] is True
+    assert "dlv-r10-roster-503" not in store.deliveries
+
+    # 3. Preflight on an in_flight delivery with roster_lookup_error returns retryable=True, keeping in_flight
+    store.deliveries["dlv-r10-pre"] = {
+        "delivery_key": "dlv-r10-pre",
+        "kind": "agent_send",
         "user_id": "u-alice",
         "platform": "weixin",
         "target_address": "weixin:@me",
         "status": "in_flight",
         "delivery_attempt": 1,
-        "defer_count": 0,
-        "first_deferred_at": None,
-        "next_retry_at": None,
-        "error_code": None,
-        "error_message": None,
-        "source_scope_key": None,
-        "source_generation": None,
-        "activity_origin": "none",
         "weixin_account_id": aid,
-        "weixin_bot_id": "bot-def@im.wechat",
+        "weixin_bot_id": "bot-r10@im.wechat",
         "weixin_bot_generation": 1,
-        "weixin_recipient_id": "wx_def@im.wechat",
+        "weixin_recipient_id": "wx_r10@im.wechat",
     }
-
-    expected_backoffs = [30, 60, 120, 240, 480, 600, 600]
-    for idx, exp_sec in enumerate(expected_backoffs, start=1):
-        # Simulate fresh claim attempt for each retry cycle
-        store.deliveries[dkey]["status"] = "in_flight"
-        store.deliveries[dkey]["delivery_attempt"] = idx
-        body = (
-            {
-                "delivery_key": dkey,
-                "outcome": "deferred",
-                "delivery_attempt": idx,
-                "error_code": "roster_lookup_error",
-                "error_message": "SECRET-TOKEN-SHOULD-NOT-ENTER-AUDIT",
-            }
-            if idx % 2 == 1
-            else {
-                "delivery_key": dkey,
-                "status": "deferred",
-                "delivery_attempt": idx,
-                "error_code": "roster_lookup_error",
-            }
-        )
-        r_def = client.post(
-            "/api/v1/dalton/channels/internal/deliveries/progress",
-            headers=svc_hdrs,
-            json=body,
-        )
-        assert r_def.status_code == 200, r_def.text
-        dj = r_def.json()
-        assert dj["status"] == "deferred"
-        assert dj["outcome"] == "deferred"
-        assert dj["defer_count"] == idx
-        assert dj["retry_after_seconds"] == exp_sec
-        assert dj["retry_after_ms"] == exp_sec * 1000
-        assert dj["expired_to_failed"] is False
-        assert dj["idempotent_replay"] is False
-        assert store.audit_logs[-1]["action"] == "delivery_deferred"
-        assert store.audit_logs[-1]["metadata"]["backoff_seconds"] == exp_sec
-        # R9 Decision #10: Audit reason MUST be enum string, never caller error_message
-        assert "SECRET-TOKEN" not in store.audit_logs[-1]["reason"]
-        assert store.audit_logs[-1]["reason"] == cg_db.DELIVERY_DEFER_AUDIT_REASONS["roster_lookup_error"]
-
-        # R9 Decision #2: Duplicate I-7 defer for the SAME delivery_attempt is idempotent
-        audits_before_dup = len(store.audit_logs)
-        r_dup = client.post(
-            "/api/v1/dalton/channels/internal/deliveries/progress",
-            headers=svc_hdrs,
-            json=body,
-        )
-        assert r_dup.status_code == 200
-        assert r_dup.json()["idempotent_replay"] is True
-        assert r_dup.json()["defer_count"] == idx
-        assert len(store.audit_logs) == audits_before_dup
-
-        # I-6 before next_retry_at MUST return claim_status="deferred" with retry_after_ms
-        r_early = await cg_db.authorize_and_claim_delivery(
-            delivery_key=dkey,
-            kind="automation",
-            user_id="u-alice",
-            platform="weixin",
-            target="weixin:@me",
-            gateway_epoch=1,
-            require_gateway_epoch=True,
-        )
-        assert r_early["claim_status"] == "deferred"
-        assert r_early["status"] == "deferred"
-        assert r_early["retry_after_seconds"] >= 1
-        assert r_early["retry_after_ms"] == r_early["retry_after_seconds"] * 1000
-
-        # Advance clock past next_retry_at -> ready for retry
-        store.now = store.now + timedelta(seconds=exp_sec + 1)
-
-    # Advance past 24 hours from first_deferred_at -> next defer transitions to terminal 'failed' + audit
-    store.now = store.deliveries[dkey]["first_deferred_at"] + timedelta(hours=24, seconds=5)
-    store.deliveries[dkey]["status"] = "in_flight"
-    store.deliveries[dkey]["delivery_attempt"] = 8
-    r_exp = client.post(
-        "/api/v1/dalton/channels/internal/deliveries/progress",
+    r_pre = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/dlv-r10-pre/preflight-send",
         headers=svc_hdrs,
-        json={"delivery_key": dkey, "outcome": "deferred", "delivery_attempt": 8, "error_code": "roster_lookup_error"},
+        json={"delivery_attempt": 1, "chunk_index": 0},
     )
-    assert r_exp.status_code == 200, r_exp.text
-    ej = r_exp.json()
-    assert ej["status"] == "failed"
-    assert ej["outcome"] == "failed"
-    assert ej["expired_to_failed"] is True
-    assert ej["next_retry_at"] is None
-    assert ej["retry_after_seconds"] is None
-    assert store.deliveries[dkey]["status"] == "failed"
-    assert store.audit_logs[-1]["action"] == "delivery_deferred_timeout"
+    assert r_pre.status_code == 200
+    assert r_pre.json()["authorized"] is False
+    assert r_pre.json()["retryable"] is True
+    assert r_pre.json()["deny_code"] == "roster_lookup_error"
+    assert store.deliveries["dlv-r10-pre"]["status"] == "in_flight"
+    roster["u-alice"] = "active"
 
-    # R9 Decision #2: After 24h timeout, a SUBSEQUENT I-6 MUST remain denied/failed (never re-claim as in_flight!)
-    r_after_exp = await cg_db.authorize_and_claim_delivery(
-        delivery_key=dkey,
-        kind="automation",
-        user_id="u-alice",
-        platform="weixin",
-        target="weixin:@me",
-        gateway_epoch=1,
-        require_gateway_epoch=True,
+    # 4. Startup recovery no longer includes deferred_deliveries
+    rec = await cg_db.recover_channel_state(
+        mode="startup", gateway_epoch=1, require_gateway_epoch=True
     )
-    assert r_after_exp["claim_status"] == "denied"
-    assert r_after_exp["status"] == "failed"
-    assert r_after_exp["code"] == "deferred_timeout"
-    assert store.deliveries[dkey]["status"] == "failed"
-
-    # Also verify I-6 itself transitions an expired deferred delivery to terminal 'failed' + audit
-    dkey2 = "auto:exec-r8-defer-i6:0:weixin:@me"
-    store.deliveries[dkey2] = {
-        "delivery_key": dkey2,
-        "kind": "automation",
-        "user_id": "u-alice",
-        "platform": "weixin",
-        "target_address": "weixin:@me",
-        "status": "deferred",
-        "delivery_attempt": 1,
-        "defer_count": 3,
-        "first_deferred_at": store.now - timedelta(hours=25),
-        "next_retry_at": store.now - timedelta(minutes=1),
-        "error_code": "roster_lookup_error",
-        "error_message": "still failing",
-        "source_scope_key": None,
-        "source_generation": None,
-        "activity_origin": "none",
-        "weixin_account_id": aid,
-        "weixin_bot_id": "bot-def@im.wechat",
-        "weixin_bot_generation": 1,
-        "weixin_recipient_id": "wx_def@im.wechat",
-    }
-    r_i6_exp = await cg_db.authorize_and_claim_delivery(
-        delivery_key=dkey2,
-        kind="automation",
-        user_id="u-alice",
-        platform="weixin",
-        target="weixin:@me",
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert r_i6_exp["claim_status"] == "denied"
-    assert r_i6_exp["status"] == "failed"
-    assert r_i6_exp["code"] == "deferred_timeout"
-    assert store.deliveries[dkey2]["status"] == "failed"
-    assert store.audit_logs[-1]["action"] == "delivery_deferred_timeout"
+    assert "deferred_deliveries" not in rec
 
 
 @pytest.mark.asyncio
@@ -6916,23 +6904,15 @@ async def test_r9_inbound_progress_db_platform_authority_and_mismatch_409(
 
 
 @pytest.mark.asyncio
-async def test_r9_partial_deferred_discord_unknown_guard_roster_defer_and_due_poll(
+async def test_r10_i7_delivery_status_transition_table_and_discord_unknown_guard(
     wx_env: dict[str, Any],
 ) -> None:
-    """R9 Decisions #2, #3, #10:
-    - partial_deferred preserves sent_chunks, files_status, delivered_segments & returns them on I-6 reclaim;
-    - Discord unknown rejects outcome='deferred' & outcome='sent' with 409;
-    - I-6 roster_lookup_error returns claim_status='deferred' with retry_after_ms (not failed);
-    - GET /internal/deliveries/deferred-due sweeps >24h rows to failed and returns due rows.
-    """
+    """R10 Codex #5: Centralized I-7 delivery status transition table & Discord unknown protection."""
     store: InMemoryWeixinMultiAccountStore = wx_env["store"]
     client: TestClient = wx_env["client"]
-    roster: dict[str, str] = wx_env["roster"]
-    svc_hdrs = {"X-Service-Token": SERVICE_TOKEN, "X-Gateway-Epoch": "1"}
-    if store.lease is not None:
-        store.lease["expires_at"] = store.now + timedelta(hours=48)
+    no_ep = {"X-Service-Token": SERVICE_TOKEN}
 
-    # 1. Discord unknown protection runs BEFORE deferred and checks outcome
+    # 1. Discord unknown cannot be changed via status OR outcome (nor conflicting status+outcome)
     store.deliveries["dlv-dc-unk"] = {
         "delivery_key": "dlv-dc-unk",
         "kind": "agent_send",
@@ -6946,164 +6926,213 @@ async def test_r9_partial_deferred_discord_unknown_guard_roster_defer_and_due_po
         "source_generation": None,
         "activity_origin": "none",
     }
-    for bad_body in (
-        {"delivery_key": "dlv-dc-unk", "outcome": "deferred"},
-        {"delivery_key": "dlv-dc-unk", "outcome": "partial_deferred"},
-        {"delivery_key": "dlv-dc-unk", "outcome": "sent"},
+    for bad_body, expected_http in (
+        ({"delivery_key": "dlv-dc-unk", "outcome": "deferred"}, 400),
+        ({"delivery_key": "dlv-dc-unk", "outcome": "partial_deferred"}, 400),
+        ({"delivery_key": "dlv-dc-unk", "status": "unknown", "outcome": "sent"}, 400),
+        ({"delivery_key": "dlv-dc-unk", "outcome": "sent"}, 409),
+        ({"delivery_key": "dlv-dc-unk", "status": "in_flight"}, 409),
+        ({"delivery_key": "dlv-dc-unk", "status": "failed"}, 409),
     ):
         r_dc = client.post(
             "/api/v1/dalton/channels/internal/deliveries/progress",
-            headers={"X-Service-Token": SERVICE_TOKEN},
+            headers=no_ep,
             json=bad_body,
         )
-        assert r_dc.status_code == 409, r_dc.text
+        assert r_dc.status_code == expected_http, f"{bad_body}: {r_dc.status_code} {r_dc.text}"
     assert store.deliveries["dlv-dc-unk"]["status"] == "unknown"
 
-    # 2. partial_deferred + GET /internal/deliveries/deferred-due + sweep >24h
-    aid = str(uuid4())
-    store.accounts[aid] = {
-        "account_id": aid,
+    # 2. Exact Discord recovery_terminal (gateway_restarted + dispatching + matching attempt) IS allowed
+    store.deliveries["dlv-dc-rec"] = {
+        "delivery_key": "dlv-dc-rec",
+        "kind": "agent_send",
         "user_id": "u-alice",
-        "ilink_bot_id": "bot-pd@im.wechat",
-        "encrypted_bot_token": "tok-pd",
-        "bot_token": "tok-pd",
-        "base_url": "https://ilinkai.weixin.qq.com",
-        "cdn_base_url": "https://novac2c.cdn.weixin.qq.com/c2c",
-        "get_updates_buf": "",
-        "status": "active",
-        "prev_status": None,
-        "disabled_reason": None,
-        "bot_generation": 1,
-        "prev_bot_generation": None,
-        "bot_generation_updated_at": None,
-        "ilink_user_id": "wx_pd@im.wechat",
-        "prev_ilink_user_id": None,
-        "ilink_username": "Alice",
-        "last_inbound_at": None,
-        "created_at": store.now,
-        "updated_at": store.now,
+        "platform": "discord",
+        "target_address": "discord:@me",
+        "status": "unknown",
+        "delivery_attempt": 2,
+        "error_code": "gateway_restarted",
+        "discord_body_phase": "dispatching",
+        "source_scope_key": None,
+        "source_generation": None,
+        "activity_origin": "none",
     }
-    store.user_settings["u-alice"] = {
-        "user_id": "u-alice",
-        "version": "v1",
-        "apps": {
-            "weixin": {
-                "preferred": "weixin:@me",
-                "chats": {},
-                "automation_output": {},
-                "agent_messages": {"enabled": True, "allowed": ["weixin:@me"]},
+    r_rec = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/progress",
+        headers=no_ep,
+        json={"delivery_key": "dlv-dc-rec", "status": "sent", "delivery_attempt": 2},
+    )
+    assert r_rec.status_code == 200, r_rec.text
+    assert store.deliveries["dlv-dc-rec"]["status"] == "sent"
+
+    # 3. Terminal sent / failed / unknown cannot regress to in_flight or flip terminal states via I-7
+    for term_st, bad_next in (
+        ("sent", "in_flight"),
+        ("sent", "failed"),
+        ("sent", "unknown"),
+        ("failed", "in_flight"),
+        ("failed", "sent"),
+        ("unknown", "in_flight"),
+        ("unknown", "sent"),
+    ):
+        dk = f"dlv-term-{term_st}-{bad_next}"
+        store.deliveries[dk] = {
+            "delivery_key": dk,
+            "kind": "agent_send",
+            "user_id": "u-alice",
+            "platform": "feishu",
+            "target_address": "feishu:@me",
+            "status": term_st,
+            "delivery_attempt": 1,
+            "source_scope_key": None,
+            "source_generation": None,
+            "activity_origin": "none",
+        }
+        r_bad = client.post(
+            "/api/v1/dalton/channels/internal/deliveries/progress",
+            headers=no_ep,
+            json={"delivery_key": dk, "status": bad_next},
+        )
+        assert r_bad.status_code == 409, f"{term_st}->{bad_next}: {r_bad.status_code} {r_bad.text}"
+        assert store.deliveries[dk]["status"] == term_st
+
+
+@pytest.mark.asyncio
+async def test_r10_collect_done_cancel_help_reject_other_sender_without_command_result(
+    wx_env: dict[str, Any],
+) -> None:
+    """R10 Codex #2: /collect, /done, /cancel, /help check account/user/sender on ANY existing
+    (platform='weixin', message_id) row even when command_result is None, never overwriting it."""
+    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
+    aid_a, aid_b = str(uuid4()), str(uuid4())
+    for aid, uid, bot, wxu in (
+        (aid_a, "u-alice", "bot-col-a@im.wechat", "wx_col_a@im.wechat"),
+        (aid_b, "u-bob", "bot-col-b@im.wechat", "wx_col_b@im.wechat"),
+    ):
+        store.accounts[aid] = {
+            "account_id": aid,
+            "user_id": uid,
+            "ilink_bot_id": bot,
+            "encrypted_bot_token": f"tok-{uid}",
+            "bot_token": f"tok-{uid}",
+            "base_url": "https://ilinkai.weixin.qq.com",
+            "cdn_base_url": "https://novac2c.cdn.weixin.qq.com/c2c",
+            "get_updates_buf": "",
+            "status": "active",
+            "prev_status": None,
+            "disabled_reason": None,
+            "bot_generation": 1,
+            "prev_bot_generation": None,
+            "bot_generation_updated_at": None,
+            "ilink_user_id": wxu,
+            "prev_ilink_user_id": None,
+            "ilink_username": uid,
+            "last_inbound_at": None,
+            "created_at": store.now,
+            "updated_at": store.now,
+        }
+
+    # Alice has a regular inbound message row (command_result is None!)
+    mid = "wx_alice_regular_msg_r10"
+    store.inbound_events[("weixin", mid)] = {
+        "platform": "weixin",
+        "message_id": mid,
+        "request_key": str(uuid4()),
+        "dalton_user_id": "u-alice",
+        "chat_type": "dm",
+        "chat_address": "weixin:@me",
+        "thread_scope_key": "dm:wx_col_a@im.wechat",
+        "status": "pending",
+        "command_reply_pending": False,
+        "command_effect_status": None,
+        "command_result": None,
+        "raw_payload": {"platform_user_id": "wx_col_a@im.wechat", "text": "alice msg"},
+        "weixin_account_id": aid_a,
+        "weixin_context_bot_id": "bot-col-a@im.wechat",
+        "weixin_context_bot_generation": 1,
+    }
+
+    for cmd in ("collect", "done", "cancel", "help"):
+        res = await cg_db.execute_session_command(
+            cmd=cmd,
+            platform="weixin",
+            platform_user_id="wx_col_b@im.wechat",
+            chat_type="dm",
+            chat_address="weixin:@me",
+            scope_key="dm:wx_col_b@im.wechat",
+            message_id=mid,
+            weixin_account_id=aid_b,
+            weixin_bot_id="bot-col-b@im.wechat",
+            weixin_bot_generation=1,
+            gateway_epoch=1,
+            require_gateway_epoch=True,
+        )
+        assert res["ok"] is False, f"/{cmd} must reject collision on Alice's inbound row"
+        assert res["deny_reason"] == "weixin_message_id_account_mismatch"
+        row = store.inbound_events[("weixin", mid)]
+        assert row["status"] == "pending"
+        assert row["command_result"] is None
+        assert row["command_reply_pending"] is False
+        assert row["dalton_user_id"] == "u-alice"
+
+
+@pytest.mark.asyncio
+async def test_r10_inbound_progress_derives_platform_from_conversation_threads(
+    wx_env: dict[str, Any],
+) -> None:
+    """R10 Codex #1: First write to inbound/progress derives platform from conversation_threads.platform
+    when no watch/background_run/inbound row exists yet, rejecting spoofed feishu with 409."""
+    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
+    client: TestClient = wx_env["client"]
+    no_ep = {"X-Service-Token": SERVICE_TOKEN}
+    valid_ep = {"X-Service-Token": SERVICE_TOKEN, "X-Gateway-Epoch": "1"}
+
+    tid = str(uuid4())
+    store.conversation_threads[tid] = {
+        "conversation_thread_id": tid,
+        "platform": "weixin",
+    }
+
+    # First-time thread_watch write claiming feishu on a conversation_threads(platform='weixin') row:
+    # 1) Without epoch -> 409 stale_gateway_epoch
+    r1 = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=no_ep,
+        json={
+            "thread_watch": {
+                "thread_id": tid,
+                "dalton_user_id": "u-alice",
+                "platform": "feishu",
+                "target_address": "feishu:@me",
+                "scope_key": "dm:ou_spoof",
+                "generation": 1,
+                "watch_active": True,
             }
         },
-    }
-    store.deliveries["dlv-wx-pd"] = {
-        "delivery_key": "dlv-wx-pd",
-        "kind": "agent_send",
-        "user_id": "u-alice",
-        "platform": "weixin",
-        "target_address": "weixin:@me",
-        "status": "in_flight",
-        "total_chunks": 3,
-        "sent_chunks": 0,
-        "platform_message_ids": [],
-        "files_status": [],
-        "delivered_segments": [],
-        "delivery_attempt": 1,
-        "defer_count": 0,
-        "first_deferred_at": None,
-        "next_retry_at": None,
-        "last_deferred_attempt": None,
-        "error_code": None,
-        "error_message": None,
-        "source_scope_key": None,
-        "source_generation": None,
-        "activity_origin": "none",
-        "weixin_account_id": aid,
-        "weixin_bot_id": "bot-pd@im.wechat",
-        "weixin_bot_generation": 1,
-        "weixin_recipient_id": "wx_pd@im.wechat",
-    }
-    store.deliveries["dlv-wx-exp24"] = {
-        "delivery_key": "dlv-wx-exp24",
-        "kind": "agent_send",
-        "user_id": "u-alice",
-        "platform": "weixin",
-        "target_address": "weixin:@me",
-        "status": "deferred",
-        "total_chunks": 1,
-        "sent_chunks": 0,
-        "platform_message_ids": [],
-        "files_status": [],
-        "delivered_segments": [],
-        "delivery_attempt": 2,
-        "defer_count": 4,
-        "first_deferred_at": store.now - timedelta(hours=25),
-        "next_retry_at": store.now - timedelta(seconds=10),
-        "last_deferred_attempt": 2,
-        "error_code": "roster_lookup_error",
-        "error_message": "SECRET-DO-NOT-AUDIT",
-        "source_scope_key": None,
-        "source_generation": None,
-        "activity_origin": "none",
-        "weixin_account_id": aid,
-        "weixin_bot_id": "bot-pd@im.wechat",
-        "weixin_bot_generation": 1,
-        "weixin_recipient_id": "wx_pd@im.wechat",
-    }
-    r_pd = client.post(
-        "/api/v1/dalton/channels/internal/deliveries/progress",
-        headers=svc_hdrs,
+    )
+    assert r1.status_code == 409
+    assert r1.json()["code"] == "stale_gateway_epoch"
+    assert tid not in store.thread_watches
+
+    # 2) With valid epoch -> 409 platform_mismatch
+    r2 = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=valid_ep,
         json={
-            "delivery_key": "dlv-wx-pd",
-            "outcome": "partial_deferred",
-            "delivery_attempt": 1,
-            "sent_chunks": 1,
-            "total_chunks": 3,
-            "platform_message_ids": ["msg-0"],
-            "files_status": [{"file_name": "a.png", "status": "sent"}],
-            "delivered_segments": ["text:0", "file:a.png"],
-            "error_code": "roster_lookup_error",
-            "error_message": "RAW-SECRET-MSG",
+            "thread_watch": {
+                "thread_id": tid,
+                "dalton_user_id": "u-alice",
+                "platform": "feishu",
+                "target_address": "feishu:@me",
+                "scope_key": "dm:ou_spoof",
+                "generation": 1,
+                "watch_active": True,
+            }
         },
     )
-    assert r_pd.status_code == 200, r_pd.text
-    pdj = r_pd.json()
-    assert pdj["status"] == "partial_deferred"
-    assert pdj["sent_chunks"] == 1
-    assert pdj["delivered_segments"] == ["text:0", "file:a.png"]
-    assert pdj["retry_after_ms"] == 30_000
-    assert "RAW-SECRET-MSG" not in store.audit_logs[-1]["reason"]
-
-    # Advance past 30s -> GET /internal/deliveries/deferred-due sweeps exp24 and returns dlv-wx-pd
-    store.now = store.now + timedelta(seconds=35)
-    r_due = client.get(
-        "/api/v1/dalton/channels/internal/deliveries/deferred-due?platform=weixin",
-        headers=svc_hdrs,
-    )
-    assert r_due.status_code == 200, r_due.text
-    due_j = r_due.json()
-    assert due_j["expired_count"] == 1
-    assert store.deliveries["dlv-wx-exp24"]["status"] == "failed"
-    assert store.deliveries["dlv-wx-exp24"]["error_code"] == "deferred_timeout"
-    assert [d["delivery_key"] for d in due_j["deliveries"]] == ["dlv-wx-pd"]
-
-    # 3. I-6 roster_lookup_error returns claim_status="deferred" with retry_after_ms (NOT failed!)
-    roster["u-alice"] = "lookup_error"
-    r_roster_def = await cg_db.authorize_and_claim_delivery(
-        delivery_key="dlv-wx-roster-err",
-        kind="agent_send",
-        user_id="u-alice",
-        platform="weixin",
-        target="weixin:@me",
-        gateway_epoch=1,
-        require_gateway_epoch=True,
-    )
-    assert r_roster_def["claim_status"] == "deferred"
-    assert r_roster_def["status"] == "deferred"
-    assert r_roster_def["code"] == "roster_lookup_error"
-    assert r_roster_def["retryable"] is True
-    assert r_roster_def["retry_after_ms"] == 30_000
-    assert store.deliveries["dlv-wx-roster-err"]["status"] == "deferred"
-    roster["u-alice"] = "active"
+    assert r2.status_code == 409
+    assert r2.json()["code"] == "platform_mismatch"
+    assert tid not in store.thread_watches
 
 
 @pytest.mark.asyncio

@@ -1444,16 +1444,6 @@ async def authorize_and_claim_data_task_delivery(
                             "target_address": existing["target_address"],
                             "is_current": False,
                         }
-                    if ex_status in ("deferred", "partial_deferred", "failed"):
-                        from src.dalton.database.channel_gateway import (
-                            _check_deferred_delivery_in_tx,
-                        )
-
-                        deferred_res = await _check_deferred_delivery_in_tx(
-                            cur, existing, is_current=False
-                        )
-                        if deferred_res is not None:
-                            return deferred_res
 
                 auth = await _authorize_run_and_target_in_tx(
                     cur,
@@ -1541,29 +1531,15 @@ async def authorize_and_claim_data_task_delivery(
                         auth.owner_user_id, conn=owned_conn
                     )
                     if roster == "lookup_error":
-                        from src.dalton.database.channel_gateway import (
-                            _defer_delivery_on_claim_in_tx,
-                        )
+                        from fastapi import HTTPException
 
-                        return await _defer_delivery_on_claim_in_tx(
-                            cur,
-                            existing=existing,
-                            delivery_key=cleaned_key,
-                            kind="data_task",
-                            user_id=auth.owner_user_id,
-                            thread_id=None,
-                            run_id=auth.run_id,
-                            execution_id=None,
-                            is_current=False,
-                            has_non_empty_text=bool(has_non_empty_text),
-                            platform=auth.platform,
-                            target_address=auth.canonical_target_address,
-                            total_chunks=int(total_chunks or 0),
-                            source_scope_key=None,
-                            source_generation=None,
-                            activity_origin="notification",
-                            error_code="roster_lookup_error",
-                            message="Unable to verify team membership right now.",
+                        raise HTTPException(
+                            status_code=503,
+                            detail={
+                                "code": "roster_lookup_error",
+                                "retryable": True,
+                                "message": "Unable to verify team membership right now.",
+                            },
                         )
                     if roster != "active":
                         return {
@@ -1595,6 +1571,7 @@ async def authorize_and_claim_data_task_delivery(
                                bot_generation, ilink_user_id, status
                         FROM dalton_channel_weixin_accounts
                         WHERE user_id = %s AND status = 'active'
+                        FOR KEY SHARE
                         """,
                         (auth.owner_user_id,),
                     )
@@ -1653,7 +1630,6 @@ async def authorize_and_claim_data_task_delivery(
                         VALUES (%s, 'data_task', %s, NULL, %s, %s::uuid, FALSE, %s, %s, %s, 'in_flight', %s, 0, '[]'::jsonb, '[]'::jsonb, %s::uuid, %s, %s, %s, NOW(), NOW())
                         ON CONFLICT (delivery_key) DO UPDATE SET
                             status = 'in_flight',
-                            next_retry_at = NULL,
                             total_chunks = EXCLUDED.total_chunks,
                             weixin_account_id = EXCLUDED.weixin_account_id,
                             weixin_bot_id = EXCLUDED.weixin_bot_id,
@@ -1690,7 +1666,6 @@ async def authorize_and_claim_data_task_delivery(
                         VALUES (%s, 'data_task', %s, NULL, %s, %s::uuid, FALSE, %s, %s, %s, 'in_flight', %s, 0, '[]'::jsonb, '[]'::jsonb, NOW(), NOW())
                         ON CONFLICT (delivery_key) DO UPDATE SET
                             status = 'in_flight',
-                            next_retry_at = NULL,
                             total_chunks = EXCLUDED.total_chunks,
                             error_code = NULL,
                             error_message = NULL,

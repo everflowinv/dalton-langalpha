@@ -142,7 +142,6 @@ NO_USER_CREDENTIAL = {
     ("POST", "/api/v1/dalton/monitors/internal/data-jobs/{job_key}/publish"),
     # DALTON-HOOK(dalton-notify): internal service-to-service routes guarded by X-Service-Token.
     ("GET", "/api/v1/dalton/channels/internal/data-task-notifications/runs/{run_id}/artifacts/{artifact_id}"),
-    ("GET", "/api/v1/dalton/channels/internal/deliveries/deferred-due"),
     ("GET", "/api/v1/dalton/channels/internal/recover"),
     ("GET", "/api/v1/dalton/channels/internal/state"),
     ("GET", "/api/v1/dalton/channels/internal/weixin/accounts/{account_id}"),
