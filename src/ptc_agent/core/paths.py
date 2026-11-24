@@ -611,6 +611,8 @@ def on_file_mount(path: str, workspace: WorkspaceLayout) -> bool:
 BACKUP_EXCLUDE_AGENT_SUBDIRS: tuple[str, ...] = (
     WorkspaceLayout.THREADS_DIR,
     WorkspaceLayout.TOOLS_DIR,
+    # DALTON-HOOK(colleague-access): exclude .agents/tmp staging files from backups and copies
+    SandboxLayout.TMP_DIR,
     *MOUNTED_AGENT_SUBDIRS,
 )
 

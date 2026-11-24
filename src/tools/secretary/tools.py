@@ -9,8 +9,12 @@ import io
 import json
 import logging
 import os
+import posixpath
 import re
+import shlex
 import sys
+import uuid
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from langchain_core.messages import ToolMessage
@@ -967,6 +971,8 @@ async def workspace_files_list_cos(
     workspace_id: str | None,
     path: str | None,
     tool_call_id: str,
+    *,
+    viewer_user_ids: Sequence[str] | None = None,
 ) -> Command:
     """List files in a workspace via Chief of Staff (`cos_access in ('ro', 'rw')`)."""
     if not workspace_id:
@@ -976,7 +982,10 @@ async def workspace_files_list_cos(
     ):
         return err
     try:
-        from src.server.app.workspace_files._shared import _is_non_owner_blocked_path
+        from src.server.app.workspace_files._shared import (
+            _is_non_owner_blocked_path,
+            _is_protected_workspace_path,
+        )
         from src.server.app.workspace_files.crud import _live_listing
         from src.server.database.workspace import get_workspace
         from src.server.models.workspace import served_from_mirror
@@ -993,12 +1002,18 @@ async def workspace_files_list_cos(
         ws = await get_workspace(workspace_id)
         if not ws:
             return error_command("workspace not found", tool_call_id)
+        ws_owner_id = str(ws.get("user_id") or "")
+        viewers = tuple(str(u) for u in (viewer_user_ids or (user_id,)))
+        is_non_owner = not ws_owner_id or any(u != ws_owner_id for u in viewers)
+        path_blocked = (
+            _is_non_owner_blocked_path if is_non_owner else _is_protected_workspace_path
+        )
         work_dir = owner_work_dir(ws)
         previous_dirs = previous_dir_names_of(ws)
         normalized_path = normalize_requested_path(
             path or ".", work_dir, previous_dirs
         )
-        if normalized_path and _is_non_owner_blocked_path(normalized_path):
+        if normalized_path and path_blocked(normalized_path):
             return success_command(
                 {"success": True, "workspace_id": workspace_id, "files": []},
                 tool_call_id,
@@ -1016,10 +1031,10 @@ async def workspace_files_list_cos(
             files = [
                 f["path"]
                 for f in file_tree
-                if not _is_non_owner_blocked_path(f["path"])
+                if not path_blocked(f["path"])
             ]
         else:
-            owner_id = str(ws.get("user_id") or user_id)
+            owner_id = ws_owner_id or user_id
             from src.server.app.workspace_files._shared import RoutePaths
 
             async with acquire_sandbox_to_change(workspace_id, owner_id) as (
@@ -1032,8 +1047,10 @@ async def workspace_files_list_cos(
                     path or ".",
                     "**/*",
                     False,
-                    is_non_owner=True,
+                    is_non_owner=is_non_owner,
                 )
+            if not is_non_owner:
+                files = [f for f in files if not path_blocked(f)]
         return success_command(
             {"success": True, "workspace_id": workspace_id, "files": files},
             tool_call_id,
@@ -1048,6 +1065,8 @@ async def workspace_file_read_cos(
     workspace_id: str | None,
     path: str | None,
     tool_call_id: str,
+    *,
+    viewer_user_ids: Sequence[str] | None = None,
 ) -> Command:
     """Read a file from a workspace via Chief of Staff (`cos_access in ('ro', 'rw')`)."""
     if not workspace_id:
@@ -1064,6 +1083,7 @@ async def workspace_file_read_cos(
             _decode_file_text,
             _is_binary,
             _is_non_owner_blocked_path,
+            _is_protected_workspace_path,
             http_file_text,
         )
         from src.server.app.workspace_files.crud import _read_contained_target
@@ -1087,13 +1107,19 @@ async def workspace_file_read_cos(
         ws = await get_workspace(workspace_id)
         if not ws:
             return error_command("workspace not found", tool_call_id)
+        ws_owner_id = str(ws.get("user_id") or "")
+        viewers = tuple(str(u) for u in (viewer_user_ids or (user_id,)))
+        is_non_owner = not ws_owner_id or any(u != ws_owner_id for u in viewers)
+        path_blocked = (
+            _is_non_owner_blocked_path if is_non_owner else _is_protected_workspace_path
+        )
         work_dir = owner_work_dir(ws)
         previous_dirs = previous_dir_names_of(ws)
         normalized_path = normalize_requested_path(path, work_dir, previous_dirs)
-        if not normalized_path or _is_non_owner_blocked_path(normalized_path):
+        if not normalized_path or path_blocked(normalized_path):
             return error_command("file not found", tool_call_id)
 
-        owner_id = str(ws.get("user_id") or user_id)
+        owner_id = ws_owner_id or user_id
         if served_from_mirror(ws.get("status")):
             file_record = await FilePersistenceService.get_file_content(
                 workspace_id, normalized_path
@@ -1122,7 +1148,7 @@ async def workspace_file_read_cos(
                     return error_command("file not found", tool_call_id)
 
             client_path = to_client_path(sandbox, normalized, work_dir)
-            if _is_non_owner_blocked_path(client_path):
+            if path_blocked(client_path):
                 return error_command("file not found", tool_call_id)
             if _is_binary(normalized):
                 return error_command("cannot read binary file as text", tool_call_id)
@@ -1167,7 +1193,10 @@ async def workspace_file_write_cos(
     ):
         return err
     try:
-        from src.server.app.workspace_files._shared import _is_non_owner_blocked_path
+        from src.server.app.workspace_files._shared import (
+            _is_non_owner_blocked_path,
+            _is_protected_workspace_path,
+        )
         from src.server.app.workspace_files.crud import MAX_WRITE_BYTES
         from src.server.database.workspace import get_workspace
         from src.server.models.workspace import served_from_mirror
@@ -1190,10 +1219,15 @@ async def workspace_file_write_cos(
                 f"Cannot write files — workspace is {ws.get('status')}. Wait for it to be running.",
                 tool_call_id,
             )
+        ws_owner_id = str(ws.get("user_id") or "")
+        is_non_owner = not ws_owner_id or ws_owner_id != str(user_id)
+        path_blocked = (
+            _is_non_owner_blocked_path if is_non_owner else _is_protected_workspace_path
+        )
         work_dir = owner_work_dir(ws)
         previous_dirs = previous_dir_names_of(ws)
         normalized_req_path = normalize_requested_path(path, work_dir, previous_dirs)
-        if _is_non_owner_blocked_path(normalized_req_path):
+        if path_blocked(normalized_req_path):
             return error_command(
                 "403 Forbidden: Cannot write system, hidden, or virtual files",
                 tool_call_id,
@@ -1203,7 +1237,7 @@ async def workspace_file_write_cos(
         if len(content_bytes) > MAX_WRITE_BYTES:
             return error_command("File content too large (max 10MB)", tool_call_id)
 
-        owner_id = str(ws.get("user_id") or user_id)
+        owner_id = ws_owner_id or user_id
         async with acquire_sandbox_to_change(workspace_id, owner_id) as (
             sandbox,
             live_ws,
@@ -1212,7 +1246,7 @@ async def workspace_file_write_cos(
             previous_dirs = previous_dir_names_of(live_ws)
             # DALTON-HOOK(workspace-sharing-settings): keep CoS writes inside the named workspace
             rel_path = normalize_requested_path(path, work_dir, previous_dirs)
-            if _is_non_owner_blocked_path(rel_path):
+            if path_blocked(rel_path):
                 return error_command(
                     "403 Forbidden: Cannot write system, hidden, or virtual files",
                     tool_call_id,
@@ -1252,7 +1286,7 @@ async def workspace_file_write_cos(
                 sandbox, rel_path, work_dir, previous_dirs
             )
             client_path = to_client_path(sandbox, normalized, work_dir)
-            if _is_non_owner_blocked_path(client_path):
+            if path_blocked(client_path):
                 return error_command(
                     "403 Forbidden: Cannot write system, hidden, or virtual files",
                     tool_call_id,
@@ -1282,8 +1316,39 @@ _COS_COPY_MAX_BYTES = 50 * 1024 * 1024
 _COS_COPY_TEXT_MAX_BYTES = 5 * 1024 * 1024
 _COS_ZIP_MEMBER_MAX_BYTES = 50 * 1024 * 1024
 _COS_ZIP_TOTAL_MAX_BYTES = 100 * 1024 * 1024
-_COS_ZIP_CONTAINER_EXTENSIONS = frozenset({".xlsx", ".xlsm", ".docx", ".pptx"})
-_COS_LEGACY_OFFICE_EXTENSIONS = frozenset({".xls", ".doc", ".ppt"})
+_COS_ZIP_MAX_MEMBERS = 2000
+_COS_ZIP_CHUNK_BYTES = 64 * 1024
+# DALTON-HOOK(colleague-access): refuse macro-enabled Office formats (new and legacy OLE) and scan OOXML parts with the text secret redactor
+_COS_MACRO_OFFICE_EXTENSIONS = frozenset({".xlsm", ".docm", ".pptm", ".xlam"})
+_COS_MACRO_OFFICE_REFUSED_ERROR = (
+    "带宏的 Office 文件（.xlsm、.docm、.pptm、.xlam 或含 VBA 宏的 .xls/.doc/.xlsx/.docx/.pptx）"
+    "不支持通过 copy_file 复制，因为宏项目可能包含无法安全核验的代码或凭据；"
+    "请另存为无宏格式（.xlsx、.docx、.pptx）后再复制。"
+)
+_COS_LEGACY_PPT_EXTENSIONS = frozenset({".ppt"})
+_COS_LEGACY_PPT_REFUSED_ERROR = (
+    "老格式 PowerPoint（.ppt）可能内嵌宏，无法检查。请让对方另存为 .pptx 后再复制。"
+)
+_COS_ZIP_CONTAINER_EXTENSIONS = frozenset({".xlsx", ".docx", ".pptx"})
+_COS_OOXML_XML_EXTENSIONS = frozenset({".xml", ".rels"})
+_COS_LEGACY_OFFICE_EXTENSIONS = frozenset({".xls", ".doc"})
+_OLE_VBA_DIR_NAMES = frozenset(
+    {"_vba_project", "_vba_project_cur", "vba", "macros", "vbaproject"}
+)
+_OLE_VBA_UTF16LE_RE = re.compile(
+    b"|".join(
+        b"".join(
+            (
+                b"[" + ch.lower().encode("ascii") + ch.upper().encode("ascii") + b"]\x00"
+                if ch.isalpha()
+                else re.escape(ch.encode("ascii")) + b"\x00"
+            )
+            for ch in name
+        )
+        + b"\x00\x00"
+        for name in ("_VBA_PROJECT", "_VBA_PROJECT_CUR", "VBA", "Macros", "VBAProject")
+    )
+)
 _COS_IMAGE_EXTENSIONS = frozenset(
     {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
 )
@@ -1337,8 +1402,8 @@ _COS_ARCHIVE_SIGNATURES = (
     b"\x28\xb5\x2f\xfd",
 )
 _COS_COPY_UNSUPPORTED_ERROR = (
-    "copy_file supports binary Office (.xlsx, .xlsm, .docx, .pptx, .xls, "
-    ".doc, .ppt), PDF (.pdf), and image (.png, .jpg, .jpeg, .gif, .webp, "
+    "copy_file supports binary Office (.xlsx, .docx, .pptx, .xls, "
+    ".doc), PDF (.pdf), and image (.png, .jpg, .jpeg, .gif, .webp, "
     ".bmp, .tiff) files up to 50 MB, and UTF-8 text files (.md, .markdown, "
     ".txt, .csv, .tsv, .json, .jsonl, .yaml, .yml, .py, .sql, .html, .xml, "
     ".log) up to 5 MB. Use read_file to read other text files."
@@ -1359,11 +1424,12 @@ _COS_SCAN_MAX_RSS_BYTES = 1536 * 1024 * 1024
 _COS_PDF_STREAM_TOTAL_MAX_BYTES = 100 * 1024 * 1024
 _COS_SCAN_FAILED_ERROR = "文件内容检查没有完成，不能拷贝"
 _COS_PDF_IMAGE_CODECS = frozenset({"/DCTDecode", "/JPXDecode", "/JBIG2Decode", "/CCITTFaxDecode"})
-# Macro projects and ActiveX controls are OLE parts every .xlsm or form-bearing
-# document carries; they are scanned as raw bytes. Embedded objects
-# (embeddings/oleObject*.bin) wrap whole other files and are refused.
+# DALTON-HOOK(colleague-access): refuse VBA macro projects inside OOXML containers; keep ActiveX raw-scanned.
+_COS_OOXML_VBA_MACRO_PART = re.compile(
+    r"(xl|word|ppt)/vbaProject\.bin", re.IGNORECASE
+)
 _COS_OOXML_OLE_RAW_SCAN_PARTS = re.compile(
-    r"(xl|word|ppt)/(vbaProject\.bin|activeX/activeX\d+\.bin)", re.IGNORECASE
+    r"(xl|word|ppt)/activeX/activeX\d+\.bin", re.IGNORECASE
 )
 _COS_OOXML_MAX_RECURSION_DEPTH = 2
 _OLE_HEADER = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
@@ -1383,16 +1449,22 @@ def _cos_read_channel_max_bytes(sandbox: Any) -> int:
 
 
 # DALTON-HOOK(colleague-access): support both binary Office/PDF/image (<=50 MB) and whitelisted strict UTF-8 text (<=5 MB) copy
-def _is_allowed_binary_copy_extension(file_path: str) -> bool:
-    import os
+def _is_macro_office_extension(file_path: str) -> bool:
+    _, ext = os.path.splitext(file_path)
+    return ext.lower() in _COS_MACRO_OFFICE_EXTENSIONS
 
+
+def _is_legacy_ppt_extension(file_path: str) -> bool:
+    _, ext = os.path.splitext(file_path)
+    return ext.lower() in _COS_LEGACY_PPT_EXTENSIONS
+
+
+def _is_allowed_binary_copy_extension(file_path: str) -> bool:
     _, ext = os.path.splitext(file_path)
     return ext.lower() in _COS_COPY_ALLOWED_EXTENSIONS
 
 
 def _is_allowed_text_copy_extension(file_path: str) -> bool:
-    import os
-
     _, ext = os.path.splitext(file_path)
     return ext.lower() in _COS_TEXT_COPY_EXTENSIONS
 
@@ -1455,13 +1527,157 @@ def _has_archive_signature(buf: bytes) -> bool:
     return any(buf.startswith(sig) for sig in _COS_ARCHIVE_SIGNATURES)
 
 
+def _count_zip_central_entries(buf: bytes, limit: int) -> int | None:
+    """Count central directory entries the way ``ZipFile`` walks them, stopping
+    once ``limit`` is passed, so an end record that understates the count is
+    caught before ``ZipFile`` builds every entry. ``None`` for a malformed
+    directory. Locating the directory reuses ``zipfile._EndRecData``, the same
+    reader ``ZipFile`` uses (ZIP64 and prefixed archives included)."""
+    import struct
+    import zipfile
+
+    try:
+        endrec = zipfile._EndRecData(io.BytesIO(buf))
+    except (zipfile.BadZipFile, OSError, struct.error):
+        return None
+    if not endrec:
+        return None
+    size_cd = endrec[zipfile._ECD_SIZE]
+    offset_cd = endrec[zipfile._ECD_OFFSET]
+    # ZipFile's own arithmetic. For ZIP64, _ECD_LOCATION points at the ZIP64 end
+    # record from 3.13.10 / 3.14.1 on and at the classic end record before, which
+    # puts the directory 76 bytes later; try that start too, so either runtime
+    # locates the same directory.
+    concat = endrec[zipfile._ECD_LOCATION] - size_cd - offset_cd
+    starts = [offset_cd + concat]
+    if endrec[zipfile._ECD_SIGNATURE] == zipfile.stringEndArchive64:
+        starts.append(starts[0] - zipfile.sizeEndCentDir64 - zipfile.sizeEndCentDir64Locator)
+    for start in starts:
+        end = start + size_cd
+        if start < 0 or end > len(buf) or buf[start : start + 4] != zipfile.stringCentralDir:
+            continue
+        return _walk_central_entries(buf, start, end, limit)
+    return None
+
+
+def _walk_central_entries(buf: bytes, pos: int, end: int, limit: int) -> int | None:
+    import struct
+    import zipfile
+
+    count = 0
+    while pos < end:
+        if pos + zipfile.sizeCentralDir > end or buf[pos : pos + 4] != zipfile.stringCentralDir:
+            return None
+        name_len, extra_len, comment_len = struct.unpack_from("<HHH", buf, pos + 28)
+        pos += zipfile.sizeCentralDir + name_len + extra_len + comment_len
+        if pos > end:
+            # This entry's name, extra or comment runs past the directory.
+            return None
+        count += 1
+        if count > limit:
+            return count
+    return count
+
+
+def _read_zip_eocd_member_count(buf: bytes) -> int | None:
+    """Read the total entry count from the ZIP End of Central Directory (and
+    ZIP64 EOCD when present/required) without opening ``zipfile.ZipFile``.
+
+    Returns ``None`` if no valid EOCD (or required ZIP64 EOCD) record can be
+    read from the tail of ``buf``.
+    """
+    import struct
+
+    buf_len = len(buf)
+    if buf_len < 22:
+        return None
+    min_start = max(0, buf_len - 22 - 65535)
+    search_end = buf_len
+    eocd_pos = -1
+    while search_end >= min_start + 4:
+        pos = buf.rfind(b"PK\x05\x06", min_start, search_end)
+        if pos < 0:
+            return None
+        if pos + 22 <= buf_len:
+            comment_len = struct.unpack_from("<H", buf, pos + 20)[0]
+            if pos + 22 + comment_len == buf_len:
+                eocd_pos = pos
+                break
+        search_end = pos
+    if eocd_pos < 0:
+        return None
+
+    (
+        _sig,
+        disk_num,
+        cd_disk,
+        disk_entries,
+        total_entries,
+        cd_size,
+        cd_offset,
+        _comment_len,
+    ) = struct.unpack_from("<4sHHHHIIH", buf, eocd_pos)
+
+    needs_zip64 = (
+        disk_num == 0xFFFF
+        or cd_disk == 0xFFFF
+        or disk_entries == 0xFFFF
+        or total_entries == 0xFFFF
+        or cd_size == 0xFFFFFFFF
+        or cd_offset == 0xFFFFFFFF
+    )
+    has_zip64_locator = (
+        eocd_pos >= 20 and buf[eocd_pos - 20 : eocd_pos - 16] == b"PK\x06\x07"
+    )
+    if needs_zip64 or has_zip64_locator:
+        if not has_zip64_locator:
+            return None
+        locator_pos = eocd_pos - 20
+        _loc_sig, _z64_disk, z64_offset, _total_disks = struct.unpack_from(
+            "<4sIQI", buf, locator_pos
+        )
+        if z64_offset + 56 > locator_pos:
+            return None
+        if buf[z64_offset : z64_offset + 4] != b"PK\x06\x06":
+            return None
+        (
+            _z64_sig,
+            z64_size,
+            _ver_made,
+            _ver_needed,
+            _z64_disk_num,
+            _z64_cd_disk,
+            z64_disk_entries,
+            z64_total_entries,
+            _z64_cd_size,
+            _z64_cd_offset,
+        ) = struct.unpack_from("<4sQHHIIQQQQ", buf, z64_offset)
+        if z64_size < 44 or z64_offset + 12 + z64_size > locator_pos:
+            return None
+        candidates = [z64_disk_entries, z64_total_entries]
+        if disk_entries != 0xFFFF:
+            candidates.append(disk_entries)
+        if total_entries != 0xFFFF:
+            candidates.append(total_entries)
+        return max(candidates)
+
+    return max(disk_entries, total_entries)
+
+
 def _is_ooxml_zip_bytes(buf: bytes) -> bool:
-    """Return True if ``buf`` starts with ``PK\\x03\\x04`` and is a valid zip
-    archive containing ``[Content_Types].xml``."""
+    """Return True if ``buf`` starts with ``PK\\x03\\x04``, has a valid EOCD
+    within ``_COS_ZIP_MAX_MEMBERS``, and is a valid zip archive containing
+    ``[Content_Types].xml``."""
     import io
     import zipfile
 
     if not buf.startswith(b"PK\x03\x04"):
+        return False
+    member_count = _read_zip_eocd_member_count(buf)
+    if member_count is None or member_count > _COS_ZIP_MAX_MEMBERS:
+        return False
+    central = _count_zip_central_entries(buf, _COS_ZIP_MAX_MEMBERS)
+    if central is None or central > _COS_ZIP_MAX_MEMBERS:
         return False
     try:
         with zipfile.ZipFile(io.BytesIO(buf)) as zf:
@@ -1498,6 +1714,18 @@ def _validate_copy_file_format(file_path: str, content: bytes) -> str | None:
     elif ext_lower in _COS_LEGACY_OFFICE_EXTENSIONS:
         ok = content.startswith(_OLE_HEADER)
     elif ext_lower in _COS_ZIP_CONTAINER_EXTENSIONS:
+        if not content.startswith(b"PK\x03\x04"):
+            return _COS_FORMAT_MISMATCH_ERROR
+        member_count = _read_zip_eocd_member_count(content)
+        if member_count is None:
+            return _COS_FORMAT_MISMATCH_ERROR
+        if member_count > _COS_ZIP_MAX_MEMBERS:
+            return "压缩容器成员数量超出安全上限，不能拷贝"
+        central = _count_zip_central_entries(content, _COS_ZIP_MAX_MEMBERS)
+        if central is None:
+            return _COS_FORMAT_MISMATCH_ERROR
+        if central > _COS_ZIP_MAX_MEMBERS:
+            return "压缩容器成员数量超出安全上限，不能拷贝"
         ok = _is_ooxml_zip_bytes(content)
     else:
         ok = False
@@ -1633,6 +1861,62 @@ def _decode_pdf_text_filters(stream: Any, chain: list[Any]) -> bytes:
     return data
 
 
+_OLE_PPT_STREAM_UTF16LE_RE = re.compile(
+    b"".join(
+        b"[" + ch.lower().encode("ascii") + ch.upper().encode("ascii") + b"]\x00"
+        if ch.isalpha()
+        else re.escape(ch.encode("ascii")) + b"\x00"
+        for ch in "PowerPoint Document"
+    )
+    + b"\x00\x00"
+)
+
+
+def _ole_has_powerpoint_stream(content: bytes) -> bool:
+    """Whether an OLE2 file holds a ``PowerPoint Document`` stream (a .ppt under
+    another name). Reads the directory like ``_ole_has_vba_macros``, so body
+    text naming it never counts; falls back to the terminated directory name."""
+    if not content.startswith(_OLE_HEADER):
+        return False
+    try:
+        from xlrd.compdoc import CompDoc
+
+        doc = CompDoc(content, logfile=io.StringIO())
+        return any(
+            getattr(node, "etype", 0) == 2
+            and str(getattr(node, "name", "") or "").strip().lower() == "powerpoint document"
+            for node in getattr(doc, "dirlist", ())
+        )
+    except Exception:
+        return bool(_OLE_PPT_STREAM_UTF16LE_RE.search(content))
+
+
+def _ole_has_vba_macros(content: bytes) -> bool:
+    """Detect VBA macro storages/streams in a legacy OLE2 document (.xls/.doc).
+
+    Parses the OLE2 directory tree via ``xlrd.compdoc.CompDoc`` (declared
+    project dependency) so ordinary UTF-16LE body text mentioning words like
+    ``VBA`` or ``Macros`` never triggers a false positive. Falls back to
+    UTF-16LE null-terminated directory-name matching if the OLE container
+    cannot be parsed by ``CompDoc``.
+    """
+    if not content.startswith(_OLE_HEADER):
+        return False
+    try:
+        from xlrd.compdoc import CompDoc
+
+        doc = CompDoc(content, logfile=io.StringIO())
+        for node in getattr(doc, "dirlist", ()):
+            if getattr(node, "etype", 0) not in (1, 2):
+                continue
+            name_lower = str(getattr(node, "name", "") or "").strip().lower()
+            if name_lower in _OLE_VBA_DIR_NAMES or name_lower.startswith("_vba_project"):
+                return True
+        return False
+    except Exception:
+        return bool(_OLE_VBA_UTF16LE_RE.search(content))
+
+
 def _scan_copy_bytes_for_secrets(
     file_path: str,
     content: bytes,
@@ -1648,10 +1932,15 @@ def _scan_copy_bytes_for_secrets(
     已知限制：使用自定义字体编码、没有 ToUnicode 映射的 PDF，pypdf 也提取不出原文，扫描覆盖不到。
     """
     import html
-    import io
-    import os
     import zipfile
-    from src.server.utils.secret_redactor import MIN_REDACT_SECRET_LEN
+    from src.server.utils.secret_redactor import MIN_REDACT_SECRET_LEN, get_redactor
+
+    _, ext = os.path.splitext(file_path)
+    ext_lower = ext.lower()
+    if ext_lower in _COS_LEGACY_PPT_EXTENSIONS:
+        return _COS_LEGACY_PPT_REFUSED_ERROR
+    if ext_lower in _COS_MACRO_OFFICE_EXTENSIONS:
+        return _COS_MACRO_OFFICE_REFUSED_ERROR
 
     if format_err := _validate_copy_file_format(file_path, content):
         return format_err
@@ -1688,48 +1977,144 @@ def _scan_copy_bytes_for_secrets(
                     return True
         return False
 
+    def _hits_xml_known_secrets(buf: bytes) -> bool:
+        """Apply the same known-secret redactor check used for text copies to OOXML XML parts."""
+        decode_encodings = (
+            ("utf-8", "utf-16-le", "utf-16-be")
+            if b"\x00" in buf
+            else ("utf-8",)
+        )
+        redactor = get_redactor()
+        for enc in decode_encodings:
+            text = buf.decode(enc, errors="ignore")
+            if redactor.redact(text, vault_secrets=vault_secrets) != text:
+                return True
+            if "&" in text:
+                unescaped = html.unescape(text)
+                if redactor.redact(unescaped, vault_secrets=vault_secrets) != unescaped:
+                    return True
+        return False
+
     if _hits_secret_bytes(content):
         return "文件里含有源用户的凭据，不能拷贝"
 
-    _, ext = os.path.splitext(file_path)
-    ext_lower = ext.lower()
+    if ext_lower in _COS_LEGACY_OFFICE_EXTENSIONS:
+        # A presentation renamed to .xls / .doc keeps its "PowerPoint Document"
+        # stream, where VBA hides compressed; refuse it like a .ppt.
+        if _ole_has_powerpoint_stream(content):
+            return _COS_LEGACY_PPT_REFUSED_ERROR
+        if _ole_has_vba_macros(content):
+            return _COS_MACRO_OFFICE_REFUSED_ERROR
+        return None
 
     if ext_lower in _COS_ZIP_CONTAINER_EXTENSIONS:
-        uncompressed_state = {"total": 0}
+        allowed_compress_types = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
+        scan_state = {"total_bytes": 0, "members": 0}
 
         def _scan_ooxml_container(zip_bytes: bytes, depth: int) -> str | None:
+            eocd_members = _read_zip_eocd_member_count(zip_bytes)
+            if eocd_members is None:
+                return "压缩容器无法解压核验，不能拷贝"
+            if scan_state["members"] + eocd_members > _COS_ZIP_MAX_MEMBERS:
+                return "压缩容器成员数量超出安全上限，不能拷贝"
+            # The end record's count can understate the central directory, which
+            # ZipFile parses in full; walk it up to the limit first.
+            central = _count_zip_central_entries(
+                zip_bytes, _COS_ZIP_MAX_MEMBERS - scan_state["members"]
+            )
+            if central is None:
+                return "压缩容器无法解压核验，不能拷贝"
+            if scan_state["members"] + central > _COS_ZIP_MAX_MEMBERS:
+                return "压缩容器成员数量超出安全上限，不能拷贝"
             try:
                 with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-                    for info in zf.infolist():
+                    infos = zf.infolist()
+                    if scan_state["members"] + len(infos) > _COS_ZIP_MAX_MEMBERS:
+                        return "压缩容器成员数量超出安全上限，不能拷贝"
+                    scan_state["members"] += len(infos)
+                    for info in infos:
+                        if info.compress_type not in allowed_compress_types:
+                            return "压缩容器使用了不支持的压缩方式，不能拷贝"
+                        if info.filename.endswith("/"):
+                            if info.file_size > 0:
+                                return "压缩容器格式异常，不能拷贝"
+                            with zf.open(info) as dir_fp:
+                                if dir_fp.read(1):
+                                    return "压缩容器格式异常，不能拷贝"
+                            continue
                         if info.is_dir():
                             continue
                         _, member_ext = os.path.splitext(info.filename)
                         member_ext_lower = member_ext.lower()
+                        if member_ext_lower in _COS_LEGACY_PPT_EXTENSIONS:
+                            return _COS_LEGACY_PPT_REFUSED_ERROR
+                        if member_ext_lower in _COS_MACRO_OFFICE_EXTENSIONS:
+                            return _COS_MACRO_OFFICE_REFUSED_ERROR
+                        if _COS_OOXML_VBA_MACRO_PART.fullmatch(info.filename):
+                            return _COS_MACRO_OFFICE_REFUSED_ERROR
                         if member_ext_lower in _COS_NESTED_ARCHIVE_EXTENSIONS:
                             return "压缩容器内嵌压缩包，不能拷贝"
                         if info.file_size > _COS_ZIP_MEMBER_MAX_BYTES:
                             return "压缩容器单个成员超出安全上限，不能拷贝"
+                        chunks: list[bytes] = []
+                        member_len = 0
                         with zf.open(info) as member_fp:
-                            member_bytes = member_fp.read(
-                                _COS_ZIP_MEMBER_MAX_BYTES + 1
-                            )
-                        if len(member_bytes) > _COS_ZIP_MEMBER_MAX_BYTES:
-                            return "压缩容器单个成员超出安全上限，不能拷贝"
-                        uncompressed_state["total"] += len(member_bytes)
-                        if uncompressed_state["total"] > _COS_ZIP_TOTAL_MAX_BYTES:
-                            return "压缩容器解压总量超出安全上限，不能拷贝"
+                            while True:
+                                remaining_total = (
+                                    _COS_ZIP_TOTAL_MAX_BYTES - scan_state["total_bytes"]
+                                )
+                                remaining_member = (
+                                    _COS_ZIP_MEMBER_MAX_BYTES - member_len
+                                )
+                                read_limit = min(
+                                    _COS_ZIP_CHUNK_BYTES,
+                                    min(remaining_total, remaining_member) + 1,
+                                )
+                                chunk = member_fp.read(read_limit)
+                                if not chunk:
+                                    break
+                                member_len += len(chunk)
+                                if member_len > _COS_ZIP_MEMBER_MAX_BYTES:
+                                    return "压缩容器单个成员超出安全上限，不能拷贝"
+                                scan_state["total_bytes"] += len(chunk)
+                                if scan_state["total_bytes"] > _COS_ZIP_TOTAL_MAX_BYTES:
+                                    return "压缩容器解压总量超出安全上限，不能拷贝"
+                                chunks.append(chunk)
+                        member_bytes = b"".join(chunks)
                         if member_bytes.startswith(_OLE_HEADER):
                             if not _COS_OOXML_OLE_RAW_SCAN_PARTS.fullmatch(info.filename):
                                 return _COS_EMBEDDED_OLE_ERROR
+                            if _ole_has_vba_macros(member_bytes):
+                                return _COS_MACRO_OFFICE_REFUSED_ERROR
                             if _hits_secret_bytes(member_bytes):
                                 return "文件里含有源用户的凭据，不能拷贝"
                             continue
+                        if member_ext_lower in _COS_OOXML_XML_EXTENSIONS:
+                            if _hits_xml_known_secrets(member_bytes):
+                                return "文件里含有密钥或源用户的凭据，不能拷贝"
+                        else:
+                            try:
+                                decoded_member = member_bytes.decode("utf-8")
+                            except UnicodeDecodeError:
+                                decoded_member = None
+                            if decoded_member is not None and (
+                                get_redactor().redact(
+                                    decoded_member, vault_secrets=vault_secrets
+                                )
+                                != decoded_member
+                            ):
+                                return "文件里含有密钥或源用户的凭据，不能拷贝"
                         if _hits_secret_with_xml_unescape(member_bytes):
                             return "文件里含有源用户的凭据，不能拷贝"
                         if (
                             member_bytes.startswith(b"PK\x03\x04")
                             or member_ext_lower in _COS_ZIP_CONTAINER_EXTENSIONS
                         ):
+                            nested_eocd = _read_zip_eocd_member_count(member_bytes)
+                            if nested_eocd is None:
+                                return "压缩容器内嵌压缩包，不能拷贝"
+                            if scan_state["members"] + nested_eocd > _COS_ZIP_MAX_MEMBERS:
+                                return "压缩容器成员数量超出安全上限，不能拷贝"
                             if not _is_ooxml_zip_bytes(member_bytes):
                                 return "压缩容器内嵌压缩包，不能拷贝"
                             if depth >= _COS_OOXML_MAX_RECURSION_DEPTH:
@@ -1841,6 +2226,153 @@ def _scan_copy_bytes_in_child(
         return _COS_SCAN_FAILED_ERROR
 
 
+# DALTON-HOOK(colleague-access): atomic temp-file stage + source recheck helpers for copy_file
+def _bash_succeeded(res: Any) -> bool:
+    if not isinstance(res, dict):
+        return False
+    if "exit_code" in res:
+        try:
+            return int(res["exit_code"]) == 0
+        except (TypeError, ValueError):
+            return False
+    return bool(res.get("success"))
+
+
+_COS_COPY_UPLOAD_DRAIN_TIMEOUT_S = 30.0
+_COS_COPY_CLEANUP_TIMEOUT_S = 20.0
+
+
+def _consume_task_exception(task: asyncio.Task[Any]) -> None:
+    if task.done() and not task.cancelled():
+        task.exception()
+
+
+# Late cleanups scheduled from a done callback; held here so the loop keeps them alive.
+_LATE_COPY_CLEANUPS: set[asyncio.Task[Any]] = set()
+
+
+def _remove_after_upload(upload_task: asyncio.Task[Any], sandbox: Any, tmp_abs: str) -> None:
+    def _on_done(task: asyncio.Task[Any]) -> None:
+        _consume_task_exception(task)
+        cleanup = asyncio.get_running_loop().create_task(
+            _remove_temp_copy_file(sandbox, tmp_abs)
+        )
+        _LATE_COPY_CLEANUPS.add(cleanup)
+        cleanup.add_done_callback(_LATE_COPY_CLEANUPS.discard)
+
+    upload_task.add_done_callback(_on_done)
+
+
+async def _drain_cancelled_upload(
+    upload_task: asyncio.Task[Any],
+    tmp_abs: str,
+    *,
+    timeout: float = _COS_COPY_UPLOAD_DRAIN_TIMEOUT_S,
+) -> asyncio.CancelledError | None:
+    """Wait via ``asyncio.shield`` for an in-flight upload task to finish before
+    cleaning up ``tmp_abs`` so a background upload thread cannot recreate the
+    staging file after ``rm -f`` returns.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    caught_cancel: asyncio.CancelledError | None = None
+    cancel_hits = 0
+    while not upload_task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            logger.warning(
+                f"Timed out waiting for cancelled upload to finish; temp copy file may remain at {tmp_abs}"
+            )
+            upload_task.add_done_callback(_consume_task_exception)
+            break
+        try:
+            await asyncio.wait_for(asyncio.shield(upload_task), timeout=remaining)
+        except asyncio.CancelledError as exc:
+            caught_cancel = exc
+            cancel_hits += 1
+            if cancel_hits >= 5:
+                logger.warning(
+                    f"Cancelled while waiting for upload to finish; temp copy file may remain at {tmp_abs}"
+                )
+                upload_task.add_done_callback(_consume_task_exception)
+                break
+        except TimeoutError:
+            logger.warning(
+                f"Timed out waiting for cancelled upload to finish; temp copy file may remain at {tmp_abs}"
+            )
+            upload_task.add_done_callback(_consume_task_exception)
+            break
+        except Exception:
+            break
+    _consume_task_exception(upload_task)
+    return caught_cancel
+
+
+async def _remove_temp_copy_file(sandbox: Any, tmp_abs: str) -> None:
+    """Remove ``tmp_abs`` inside a shielded task so cleanup still runs even when
+    the caller task is cancelled; catches ``CancelledError``, finishes cleanup
+    (up to a timeout), logs a warning with ``tmp_abs`` on failure/timeout, and
+    re-raises the ``CancelledError``.
+    """
+
+    async def _do_remove() -> Any:
+        return await sandbox.execute_bash_command(
+            command=f"rm -f -- {shlex.quote(tmp_abs)}", timeout=15
+        )
+
+    rm_task = asyncio.create_task(_do_remove())
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _COS_COPY_CLEANUP_TIMEOUT_S
+    caught_cancel: asyncio.CancelledError | None = None
+    cancel_hits = 0
+    try:
+        while not rm_task.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.warning(
+                    f"Timed out removing temp copy file; temp copy file may remain at {tmp_abs}"
+                )
+                rm_task.add_done_callback(_consume_task_exception)
+                return
+            try:
+                await asyncio.wait_for(asyncio.shield(rm_task), timeout=remaining)
+            except asyncio.CancelledError as exc:
+                caught_cancel = exc
+                cancel_hits += 1
+                if cancel_hits >= 5:
+                    logger.warning(
+                        f"Cancelled while removing temp copy file; temp copy file may remain at {tmp_abs}"
+                    )
+                    rm_task.add_done_callback(_consume_task_exception)
+                    return
+            except TimeoutError:
+                logger.warning(
+                    f"Timed out removing temp copy file; temp copy file may remain at {tmp_abs}"
+                )
+                rm_task.add_done_callback(_consume_task_exception)
+                return
+            except Exception as exc:
+                logger.warning(f"Failed to remove temp copy file {tmp_abs}: {exc}")
+                return
+        if rm_task.done() and not rm_task.cancelled():
+            exc = rm_task.exception()
+            if exc is not None:
+                logger.warning(f"Failed to remove temp copy file {tmp_abs}: {exc}")
+            else:
+                res = rm_task.result()
+                if not _bash_succeeded(res):
+                    logger.warning(
+                        f"Failed to remove temp copy file {tmp_abs}: non-zero exit ({res})"
+                    )
+        elif rm_task.cancelled():
+            logger.warning(
+                f"Cleanup task cancelled; temp copy file may remain at {tmp_abs}"
+            )
+    finally:
+        if caught_cancel is not None:
+            raise caught_cancel
+
+
 # DALTON-HOOK(colleague-access): shared server-side copy engine used by CoS and analyst colleague_workspace
 async def _workspace_file_copy_server(
     *,
@@ -1850,7 +2382,11 @@ async def _workspace_file_copy_server(
     dest_owner_id: str,
     dest_path: str | None,
     tool_call_id: str,
+    caller_user_id: str | None = None,
+    source_viewer_ids: Sequence[str] | None = None,
     require_dest_owner_user_id: str | None = None,
+    recheck_source_access: Callable[[], Awaitable[Command | None]] | None = None,
+    recheck_dest_access: Callable[[], Awaitable[Command | None]] | None = None,
 ) -> Command:
     """Copy an allowed binary (<=50 MB) or strict UTF-8 text (<=5 MB) file server-side.
 
@@ -1861,6 +2397,7 @@ async def _workspace_file_copy_server(
         from fastapi import HTTPException
         from src.server.app.workspace_files._shared import (
             _is_non_owner_blocked_path,
+            _is_protected_workspace_path,
             http_file_bytes,
         )
         from src.server.app.workspace_files.crud import _read_contained_target
@@ -1884,19 +2421,39 @@ async def _workspace_file_copy_server(
         ws = await get_workspace(source_workspace_id)
         if not ws:
             return error_command("workspace not found", tool_call_id)
+        source_owner_id = str(ws.get("user_id") or "")
+        if source_viewer_ids is not None:
+            source_is_non_owner = not source_owner_id or any(
+                str(u) != source_owner_id for u in source_viewer_ids
+            )
+        elif caller_user_id is not None:
+            source_is_non_owner = not source_owner_id or source_owner_id != str(
+                caller_user_id
+            )
+        else:
+            source_is_non_owner = True
+        source_path_blocked = (
+            _is_non_owner_blocked_path
+            if source_is_non_owner
+            else _is_protected_workspace_path
+        )
         work_dir = owner_work_dir(ws)
         previous_dirs = previous_dir_names_of(ws)
         normalized_path = normalize_requested_path(path, work_dir, previous_dirs)
-        if not normalized_path or _is_non_owner_blocked_path(normalized_path):
+        if not normalized_path or source_path_blocked(normalized_path):
             return error_command("file not found", tool_call_id)
 
-        owner_id = str(ws.get("user_id") or dest_owner_id)
+        owner_id = source_owner_id or dest_owner_id
         if served_from_mirror(ws.get("status")):
             file_record = await FilePersistenceService.get_file_content(
                 source_workspace_id, normalized_path
             )
             if not file_record:
                 return error_command("file not found", tool_call_id)
+            if _is_legacy_ppt_extension(normalized_path):
+                return error_command(_COS_LEGACY_PPT_REFUSED_ERROR, tool_call_id)
+            if _is_macro_office_extension(normalized_path):
+                return error_command(_COS_MACRO_OFFICE_REFUSED_ERROR, tool_call_id)
             if not _is_allowed_copy_extension(normalized_path):
                 return error_command(_COS_COPY_UNSUPPORTED_ERROR, tool_call_id)
             max_bytes, max_label = _copy_max_bytes_for_path(normalized_path)
@@ -1926,6 +2483,10 @@ async def _workspace_file_copy_server(
                 )
             source_client_path = normalized_path
         else:
+            if _is_legacy_ppt_extension(normalized_path):
+                return error_command(_COS_LEGACY_PPT_REFUSED_ERROR, tool_call_id)
+            if _is_macro_office_extension(normalized_path):
+                return error_command(_COS_MACRO_OFFICE_REFUSED_ERROR, tool_call_id)
             if not _is_allowed_copy_extension(normalized_path):
                 return error_command(_COS_COPY_UNSUPPORTED_ERROR, tool_call_id)
             async with acquire_sandbox_to_change(source_workspace_id, owner_id) as (
@@ -1951,8 +2512,12 @@ async def _workspace_file_copy_server(
                         tool_call_id,
                     )
             source_client_path = _to_client_path(sandbox, normalized, work_dir)
-            if _is_non_owner_blocked_path(source_client_path):
+            if source_path_blocked(source_client_path):
                 return error_command("file not found", tool_call_id)
+            if _is_legacy_ppt_extension(source_client_path):
+                return error_command(_COS_LEGACY_PPT_REFUSED_ERROR, tool_call_id)
+            if _is_macro_office_extension(source_client_path):
+                return error_command(_COS_MACRO_OFFICE_REFUSED_ERROR, tool_call_id)
             if not _is_allowed_copy_extension(source_client_path):
                 return error_command(_COS_COPY_UNSUPPORTED_ERROR, tool_call_id)
             max_bytes, max_label = _copy_max_bytes_for_path(source_client_path)
@@ -2007,6 +2572,16 @@ async def _workspace_file_copy_server(
                 tool_call_id,
             )
         effective_dest_owner = str(dest_ws.get("user_id") or dest_owner_id)
+        dest_is_non_owner = (
+            True
+            if caller_user_id is None
+            else (not effective_dest_owner or effective_dest_owner != str(caller_user_id))
+        )
+        dest_path_blocked = (
+            _is_non_owner_blocked_path
+            if dest_is_non_owner
+            else _is_protected_workspace_path
+        )
         dest_name = (dest_path or "").strip().lstrip("/") or (
             f"shared/{source_client_path.rsplit('/', 1)[-1]}"
         )
@@ -2027,7 +2602,7 @@ async def _workspace_file_copy_server(
             dest_rel = normalize_requested_path(
                 dest_name, dest_work_dir, dest_previous
             )
-            if not dest_rel or _is_non_owner_blocked_path(dest_rel):
+            if not dest_rel or dest_path_blocked(dest_rel):
                 return error_command(
                     "403 Forbidden: Cannot copy into system, hidden, or virtual paths",
                     tool_call_id,
@@ -2047,14 +2622,82 @@ async def _workspace_file_copy_server(
             dest_client_path = _to_client_path(
                 dest_sandbox, dest_abs, dest_work_dir
             )
-            if not dest_client_path or _is_non_owner_blocked_path(dest_client_path):
+            if not dest_client_path or dest_path_blocked(dest_client_path):
                 return error_command(
                     "403 Forbidden: Cannot copy into system, hidden, or virtual paths",
                     tool_call_id,
                 )
-            ok = await dest_sandbox.aupload_file_bytes(dest_abs, content)
-        if not ok:
-            return error_command("Copy failed", tool_call_id)
+            # DALTON-HOOK(colleague-access): prepare staging and destination dirs first,
+            # stage under .agents/tmp/colleague-copy-<uuid> (excluded from panel, backups,
+            # and transfer runtime .wsfiles-* orphan sweep), re-verify permissions right
+            # before POSIX rename, and clean up (shielded) on any exception/cancellation/refusal.
+            from ptc_agent.core.paths import SandboxLayout
+
+            staging_dir = f"{dest_work_dir.rstrip('/')}/{SandboxLayout.TMP_DIR}"
+            tmp_abs = f"{staging_dir}/colleague-copy-{uuid.uuid4().hex}"
+            dest_parent = posixpath.dirname(dest_abs)
+            prep_cmd = (
+                f"mkdir -p -- {shlex.quote(staging_dir)} {shlex.quote(dest_parent)}"
+            )
+            prep_res = await dest_sandbox.execute_bash_command(
+                command=prep_cmd, timeout=30
+            )
+            if not _bash_succeeded(prep_res):
+                return error_command("Copy failed", tool_call_id)
+            committed = False
+            upload_task: asyncio.Task[Any] | None = None
+            try:
+                async def _do_upload() -> Any:
+                    return await dest_sandbox.aupload_file_bytes(tmp_abs, content)
+
+                upload_task = asyncio.create_task(_do_upload())
+                ok = await asyncio.shield(upload_task)
+                if not ok:
+                    return error_command("Copy failed", tool_call_id)
+                # Re-check analyst destination write permission FIRST, then source
+                # read permission IMMEDIATELY before the rename so no DB query sits
+                # between the source re-check and the rename.
+                if recheck_dest_access is not None:
+                    dest_err = await recheck_dest_access()
+                    if dest_err is not None:
+                        return dest_err
+                if recheck_source_access is not None:
+                    recheck_err = await recheck_source_access()
+                    if recheck_err is not None:
+                        return recheck_err
+                # Avoid GNU-only `mv -T` (macOS `/bin/mv` fails with `illegal option -- T`).
+                # Verify `[ ! -d "$dst" ]` first (fail if destination is a directory), then
+                # run POSIX `mv -f -- "$src" "$dst"`. The tiny window between `[ ! -d ... ]`
+                # and `mv -f` is accepted because only the sandbox's own agent can create a
+                # directory at that location, and it already has write access there.
+                dst_q = shlex.quote(dest_abs)
+                src_q = shlex.quote(tmp_abs)
+                mv_cmd = f"[ ! -d {dst_q} ] && mv -f -- {src_q} {dst_q}"
+                mv_res = await dest_sandbox.execute_bash_command(
+                    command=mv_cmd, timeout=30
+                )
+                if not _bash_succeeded(mv_res):
+                    return error_command("Copy failed", tool_call_id)
+                committed = True
+            finally:
+                if not committed:
+                    drain_cancel: asyncio.CancelledError | None = None
+                    if upload_task is not None and not upload_task.done():
+                        drain_cancel = await _drain_cancelled_upload(
+                            upload_task,
+                            tmp_abs,
+                            timeout=_COS_COPY_UPLOAD_DRAIN_TIMEOUT_S,
+                        )
+                    if upload_task is not None and not upload_task.done():
+                        # The upload outlived the drain, so it may still write the
+                        # staging file after the rm below: remove it again once
+                        # the upload really ends.
+                        _remove_after_upload(upload_task, dest_sandbox, tmp_abs)
+                    try:
+                        await _remove_temp_copy_file(dest_sandbox, tmp_abs)
+                    finally:
+                        if drain_cancel is not None:
+                            raise drain_cancel
         return success_command(
             {
                 "success": True,
@@ -2091,6 +2734,12 @@ async def workspace_file_copy_cos(
     from src.server.database.home_workspace import get_home_workspace_id
 
     dest_id = (dest_workspace_id or "").strip() or get_home_workspace_id(user_id)
+
+    async def _recheck_source_access() -> Command | None:
+        return await verify_workspace_owner(
+            workspace_id, user_id, tool_call_id, need="read"
+        )
+
     return await _workspace_file_copy_server(
         source_workspace_id=workspace_id,
         path=path,
@@ -2098,6 +2747,8 @@ async def workspace_file_copy_cos(
         dest_owner_id=user_id,
         dest_path=dest_path,
         tool_call_id=tool_call_id,
+        caller_user_id=user_id,
         require_dest_owner_user_id=user_id,
+        recheck_source_access=_recheck_source_access,
     )
 # --- DALTON-HOOK(workspace-sharing-settings): end ---

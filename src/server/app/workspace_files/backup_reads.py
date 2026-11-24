@@ -62,6 +62,9 @@ async def backup_listing(
     file_tree = await FilePersistenceService.get_file_tree(workspace_id)
     # Filter by path prefix if specified
     normalized_path = normalize_requested_path(path, work_dir, previous_dirs)
+    # DALTON-HOOK(colleague-access): refuse blocked listing root on mirror backup reads too
+    if is_non_owner_reader and normalized_path and _is_non_owner_blocked_path(normalized_path):
+        return []
     if normalized_path:
         file_tree = [
             f

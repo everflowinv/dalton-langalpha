@@ -642,6 +642,7 @@ async def get_workspace(workspace_id: str, x_user_id: ReadUserId):
                             )
                         if (
                             workspace is not None
+                            and not is_reserved_row(workspace)
                             and not is_holder(workspace.get("user_id"))
                             and str(workspace.get("user_id") or "") != str(x_user_id)
                             and await user_has_threads_in_workspace(workspace_id, x_user_id)
@@ -1289,9 +1290,10 @@ async def delete_workspace(
     """
     try:
         workspace = await db_get_workspace(workspace_id)
+        # DALTON-HOOK(colleague-access): authorize before rejecting Home deletion so stand-in/Home never leaks existence to non-owners
+        access = await workspace_access(workspace, principal.user_id, manage=True)
         if is_reserved_row(workspace):
             raise HTTPException(status_code=400, detail="Cannot delete Home")
-        access = await workspace_access(workspace, principal.user_id, manage=True)
         if access.is_shared:
             # A computer's token never gets here (``require_scopes``).
             # With its computer, which is the workspace's alone.

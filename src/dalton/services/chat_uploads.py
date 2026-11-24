@@ -45,7 +45,11 @@ from src.dalton.settings import (
 )
 from src.server.database import chat_attachments as chat_attachments_db
 from src.server.database.blob_keys import RELAY_MAX_BYTES
-from src.server.database.home_workspace import get_home_workspace_id, is_home_id, is_home_row
+from src.server.database.home_workspace import (
+    get_home_workspace_id,
+    is_home_id,
+    is_reserved_row,
+)
 from src.server.services import chat_attachments as chat_attachments_svc
 from src.server.services.computer_disk import CRITICAL_FREE_BYTES, disk_command, parse_df
 from src.server.services.egress.reachability import effective_relay_base_url
@@ -4014,8 +4018,8 @@ async def _is_authorized_row_for_recovery(
         # Unbound Home before its workspaces row is inserted: must match row_user_id's Home ID.
         return is_home_id(row_user_id, workspace_id)
 
-    # Cross-user upload in Home is never allowed.
-    if is_home_row(ws_row) or is_home_id(ws_owner_id, workspace_id):
+    # Cross-user upload in Home (or Home stand-in) is never allowed.
+    if is_reserved_row(ws_row) or is_home_id(ws_owner_id, workspace_id):
         return row_user_id == ws_owner_id
 
     # Accepted files in a live non-Home workspace belong to that workspace's retained content

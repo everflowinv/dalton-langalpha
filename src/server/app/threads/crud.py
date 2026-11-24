@@ -214,8 +214,11 @@ async def list_threads(
                                 workspace = await db_get_workspace(
                                     workspace_id, include_deleted=True
                                 )
+                            from src.server.database.home_workspace import is_reserved_row
+
                             if (
                                 workspace is not None
+                                and not is_reserved_row(workspace)
                                 and not is_holder(workspace.get("user_id"))
                                 and str(workspace.get("user_id") or "") != str(x_user_id)
                                 and await user_has_threads_in_workspace(

@@ -732,6 +732,7 @@ async def _collect_candidates(
                         "user_id": ws_owner_id,
                         "name": ws_name,
                         "status": ws_status,
+                        "config": {HOME_STAND_IN_KEY: _row_is_home_stand_in(ws)},
                     },
                     "unit": units_by_ws.get(ws_id),
                 }
@@ -759,6 +760,11 @@ async def _collect_candidates(
                         "user_id": ws_owner_id,
                         "name": ws_name,
                         "status": ws_status,
+                        "config": {
+                            HOME_STAND_IN_KEY: _row_is_home_stand_in(
+                                u, config_key="workspace_config"
+                            )
+                        },
                     },
                     "unit": u,
                 }
@@ -1419,6 +1425,7 @@ async def _refresh_live_hits(
                         "name": ws_name,
                         "status": ws_status,
                         "owner_name": owner_name,
+                        "config": {HOME_STAND_IN_KEY: _row_is_home_stand_in(row)},
                     }
 
     raw_refreshed: list[tuple[_CandidateEntry, dict[str, Any] | None, str, str]] = []

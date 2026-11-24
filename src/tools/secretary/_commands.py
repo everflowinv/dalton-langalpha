@@ -184,7 +184,11 @@ async def verify_workspace_owner(
     if str(ws.get("user_id")) == user_id:
         return None
     # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-    # DALTON-HOOK(colleague-access): gate colleague workspace access on is_dalton_sharing_auth_enabled().
+    # DALTON-HOOK(colleague-access): gate colleague workspace access on is_dalton_sharing_auth_enabled() and refuse reserved Home/stand-in rows.
+    from src.server.database.home_workspace import is_reserved_row
+
+    if is_reserved_row(ws) or bool(ws.get("is_home")):
+        return error_command("workspace not found", tool_call_id)
     if not owner_only:
         from fastapi import HTTPException
         from src.dalton.settings import is_dalton_sharing_auth_enabled
