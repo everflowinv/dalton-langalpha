@@ -442,6 +442,8 @@ ALTER TABLE dalton_channel_deliveries
 
 ### 3.1 接口总览与共享路由按平台能力门控
 
+> **完整字段级接口契约（请求/响应字段、枚举值、错误码、HTTP 状态与租约头规则）以 [weixin-gateway-contract.md](./weixin-gateway-contract.md) 为唯一真值**；下表为架构总览。
+
 #### （1）网关与后端内部契约表（挂于 `/api/v1/dalton/channels/internal/*`，鉴权 `X-Service-Token`）
 
 除租约申请接口 `gateway-lease/acquire` 外，网关发出的**全部写入类内部接口与 `recover`（含二维码登录会话写入 `POST`/`PATCH .../weixin/login-sessions`）**均强制携带请求头 `X-Gateway-Epoch: <epoch>`（例外：`I-5` `PUT /internal/settings` 与 `I-8` 自动化运行登记/完成不涉及微信外发，不携带 `X-Gateway-Epoch`），后端在同一数据库事务首步 `SELECT ... FOR SHARE` 校验租约有效且 `epoch` 一致，失配或过期一律回滚并返回 HTTP `409`（`code: "stale_gateway_epoch"`）：

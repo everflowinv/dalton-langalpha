@@ -339,7 +339,9 @@ def upgrade() -> None:
             ADD COLUMN IF NOT EXISTS weixin_recipient_id VARCHAR(255),
             ADD COLUMN IF NOT EXISTS defer_count INTEGER NOT NULL DEFAULT 0,
             ADD COLUMN IF NOT EXISTS first_deferred_at TIMESTAMPTZ,
-            ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ;
+            ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS last_deferred_attempt INTEGER,
+            ADD COLUMN IF NOT EXISTS delivered_segments JSONB NOT NULL DEFAULT '[]'::jsonb;
         """
     )
     op.execute(
@@ -919,6 +921,8 @@ def downgrade() -> None:
     op.execute(
         """
         ALTER TABLE dalton_channel_deliveries
+            DROP COLUMN IF EXISTS delivered_segments,
+            DROP COLUMN IF EXISTS last_deferred_attempt,
             DROP COLUMN IF EXISTS next_retry_at,
             DROP COLUMN IF EXISTS first_deferred_at,
             DROP COLUMN IF EXISTS defer_count,

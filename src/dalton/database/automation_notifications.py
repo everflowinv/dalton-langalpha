@@ -715,7 +715,7 @@ async def authorize_and_claim_automation_notify_delivery(
                             "target_address": existing["target_address"],
                             "is_current": False,
                         }
-                    if ex_status == "deferred":
+                    if ex_status in ("deferred", "partial_deferred", "failed"):
                         from src.dalton.database.channel_gateway import (
                             _check_deferred_delivery_in_tx,
                         )
@@ -790,10 +790,29 @@ async def authorize_and_claim_automation_notify_delivery(
                         owner_user_id, conn=owned
                     )
                     if roster == "lookup_error":
-                        return _claim_denied(
-                            "failed",
-                            "roster_lookup_error",
-                            "Unable to verify team membership right now.",
+                        from src.dalton.database.channel_gateway import (
+                            _defer_delivery_on_claim_in_tx,
+                        )
+
+                        return await _defer_delivery_on_claim_in_tx(
+                            cur,
+                            existing=existing,
+                            delivery_key=cleaned_key,
+                            kind="automation_notify",
+                            user_id=owner_user_id,
+                            thread_id=None,
+                            run_id=str(run_id or "") or None,
+                            execution_id=None,
+                            is_current=False,
+                            has_non_empty_text=bool(has_non_empty_text),
+                            platform=str(plan["platform"]),
+                            target_address=str(plan.get("canonical_target_address") or requested or "weixin:@me"),
+                            total_chunks=int(total_chunks or 0),
+                            source_scope_key=None,
+                            source_generation=None,
+                            activity_origin="notification",
+                            error_code="roster_lookup_error",
+                            message="Unable to verify team membership right now.",
                         )
                     if roster != "active":
                         return _claim_denied(

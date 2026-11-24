@@ -356,6 +356,7 @@ class DeliveryProgressRequest(BaseModel):
     total_chunks: int | None = None
     platform_message_ids: list[Any] | None = None
     files_status: list[Any] | None = None
+    delivered_segments: list[Any] | None = None
     first_response_json: dict[str, Any] | None = None
     status: str | None = None
     outcome: str | None = None
@@ -1094,6 +1095,30 @@ async def internal_deliveries_authorize_and_claim_endpoint(
         return _handle_structured_http_error(exc)
 
 
+@channels_router.get(
+    "/internal/deliveries/deferred-due",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_deliveries_deferred_due_endpoint(
+    request: Request,
+    platform: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> Any:
+    """Poll due `deferred` / `partial_deferred` deliveries and sweep >24h rows to `failed`."""
+    try:
+        from src.dalton.database.channel_gateway import list_due_deferred_deliveries
+
+        epoch = _parse_gateway_epoch(request, required=False)
+        return await list_due_deferred_deliveries(
+            platform=platform,
+            limit=limit,
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
 @channels_router.post(
     "/internal/deliveries/progress",
     dependencies=[Depends(require_channel_service_token)],
@@ -1116,6 +1141,7 @@ async def internal_deliveries_progress_endpoint(
             total_chunks=body.total_chunks,
             platform_message_ids=body.platform_message_ids,
             files_status=body.files_status,
+            delivered_segments=body.delivered_segments,
             first_response_json=body.first_response_json,
             status=body.status,
             outcome=body.outcome,
