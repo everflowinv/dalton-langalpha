@@ -9,8 +9,8 @@
 
 1. **解决什么问题**：日常上线新模型、修订输入/缓存/输出费率、调整上下文窗口与思考档位、维护"智能 / 速度 / 说人话"评分，原先需要手工修改代码仓库内的 `src/dalton/llm/native_overlay.json`（或受门禁保护的上游清单）并重新发版部署（如智谱 `GLM 5.4` 近期由独立静态配置 PR 先行接入）。本方案将日常模型目录运维收敛到网页管理端，与代码发布解耦。
 2. **核心架构**：保留上游 `src/llms/manifest/*.json` 与 `src/dalton/llm/native_overlay.json` 作为随镜像发布的**出厂默认基线**；在 PostgreSQL 建立单行当前目录表 `dalton_team_model_catalog`（迁移预置 `revision = 0` 初始空目录）、事务审计与回滚表 `dalton_team_model_catalog_revisions`（含基于配置版本号的关联任务改写明细 `side_effects`）以及目录变体专属加密凭据表 `dalton_catalog_provider_credentials`；并将原本地文件 `native_sync_overlay.json` 在第一批一次性收口入库，形成清晰的**三层系统目录**。
-3. **版本真相与跨部署回合快照**：PostgreSQL 是当前目录版本号 `revision` 的唯一真相源，进程内存仅按不可变版本号缓存派生结果（`revision → CompiledCatalog`），Redis Pub/Sub 与 60 秒定时轮询负责后台单调预热；每个对话回合启动时将本回合涉及模型的**有效配置快照（`effective_catalog_snapshot`：费率、模态、思考参数、固定路由）**随运行记录持久化，回合内调用及滚动部署后恢复的回合与子智能体一致沿用该快照。
-4. **目录变体凭据隔离与全路径出站校验**：目录新增提供商变体只能通过系统目录条目、使用其绑定至授权 `bound_base_url` 的专属只写凭据调用（成员个人 `custom_models` 指向目录变体或其地址时一律拒绝，且剥离父组 `env_key`）；在客户端构造期与实际发包期对全部 5 条出站路径双重校验，两种安装形态统一读取 `network.fake_ip_cidrs` 配置自动衔接 Fake-IP DoH 真实公网 IP 直连（保留原主机名做 TLS 证书校验）或 `HeldTransport` 公网单播校验，并固定设置 `follow_redirects=False`。
+3. **版本真相与跨部署回合快照**：PostgreSQL 是当前目录版本号 `revision` 的唯一真相源，进程内存仅按不可变版本号缓存派生结果（`revision → CompiledCatalog`），Redis Pub/Sub 与 60 秒定时轮询负责后台单调预热；每个对话回合启动时将本回合涉及模型的**有效配置快照（`effective_catalog_snapshot`：费率、模态、思考参数、固定路由，以及目录变体原绑定的非密钥标识 `bound_base_url` 与 `key_fingerprint`）**随运行记录持久化，回合内调用及滚动部署后恢复的回合与子智能体一致沿用该快照（首次上线前的存量运行按当时目录补写快照后恢复或结算）。
+4. **目录变体凭据隔离与全路径出站校验**：目录新增提供商变体只能通过系统目录条目、使用其绑定至完整授权 `bound_base_url` 的专属只写凭据调用（成员个人 `custom_models` 在保存与调用时按**解析后的提供商与地址**检查，含从凭据持有人继承的 `base_url`，凡落在目录变体或其 `bound_base_url` 上一律拒绝，且剥离父组 `env_key`）；在客户端构造期与实际发包期对全部 5 条出站路径双重校验，两种安装形态统一读取 `network.fake_ip_cidrs` 配置自动衔接 Fake-IP DoH 真实公网 IP 直连（保留原主机名做 TLS 证书校验）或 `HeldTransport` 公网单播校验，并固定设置 `follow_redirects=False`。
 
 ---
 
@@ -111,16 +111,16 @@ flowchart TD
    ```
    > 迁移建表后立即执行 `INSERT ... ON CONFLICT DO NOTHING` 预置 `revision = 0`（`action = 'init_empty'`，`actor_user_id = 'system:migration'`，空载荷 `{"schema": "dalton-team-model-catalog/1"}`），使首次业务变更（`revision = 1`）拥有可回滚基准，且启动与定时预热始终读到有效行。
 
-3. **目录新增提供商变体专属凭据表 `dalton_catalog_provider_credentials`**（只写加密存储，与版本历史表物理隔离）：
+3. **目录新增提供商变体专属凭据表 `dalton_catalog_provider_credentials`**（只写加密存储，与版本历史表物理隔离，`canonical_bound_url` 由 `canonical_url_key(bound_base_url)` 生成，保留完整规范化 `scheme://host:port/wire_path`）：
    ```sql
    CREATE TABLE IF NOT EXISTS dalton_catalog_provider_credentials (
-       provider_slug           TEXT PRIMARY KEY,
-       encrypted_api_key       BYTEA NOT NULL,
-       bound_base_url          TEXT NOT NULL,
-       canonical_origin_prefix TEXT NOT NULL,
-       key_fingerprint         TEXT NOT NULL,
-       updated_by              TEXT NOT NULL,
-       updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+       provider_slug        TEXT PRIMARY KEY,
+       encrypted_api_key    BYTEA NOT NULL,
+       bound_base_url       TEXT NOT NULL,
+       canonical_bound_url  TEXT NOT NULL,
+       key_fingerprint      TEXT NOT NULL,
+       updated_by           TEXT NOT NULL,
+       updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
    );
    ```
 4. **第三方价格变动提醒表 `dalton_model_price_alerts`**（Batch 3 启用）：
@@ -262,16 +262,17 @@ flowchart TD
    | **① 模型键（`model_key`）** | 在合并后的 `llm_config` 中按大小写不敏感（`key.lower()`）全局唯一。管理员调用"新增模型"提交已存在于第 1–2 层的键时返回 `409 Conflict` 并引导使用"编辑模型"（写入 `model_overrides`）。若后续代码升级使第 1–2 层新增了与数据库 `models` 同名的键，合并器自动将数据库条目及对应价格卡转为深度覆盖补丁（详见 §7.2）。 |
    | **② 跨组提供商标识（`provider_slug`）与剥离父组 `env_key`** | `_flatten_providers` 将全部顶层组键与组内 `variants` 展平到同一 `flat_providers`。新增 `provider_variants[group][v_name]` 时，校验 `v_name.lower()` 与第 1–3 层全部顶层组名及跨组变体名均无重名，注入只读属性 `catalog_defined: True`、`own_api_key: True`，并在 `_flatten_providers`（`src/llms/llm.py:122-130`）展开时**显式剥离从父组 `shared` 继承的 `env_key`、`models_url` 与 `platform` 字段**，确保目录变体永远脱离父提供商的部署环境变量密钥。 |
    | **③ 同提供商价格卡 `(provider, model_id)` 与 `alias`** | 同一 `provider` 的存活价格卡列表 `manifest["models"][provider]` 内，每张卡片的 `norm_id(id)` 与全部 `norm_id(alias)` 构成的标识集合两两互不相交；编辑已有模型价格时自动写入 `providers.model_overrides[provider][card_id]` 原地深度更新（`overlay.py:348-380`）。 |
-   | **④ 团队目录模型 vs 成员个人 `custom_models`** | • **针对内置提供商**：团队共享开启（`credentials.sharing == "team"`）时，成员保存的同名个人 `custom_models` 解析至团队凭据持有人密钥（`src/server/database/api_keys.py:350`），并严格遵循 #485 `enforce_shared_byok_endpoint_policy`（`src/dalton/credentials.py:427-531`）——仅允许连向持有人已保存的 `base_url` 或**出厂内置提供商**默认端点；关闭团队共享时使用成员个人密钥。<br>• **针对目录新增变体（拒绝个人模型借道）**：成员个人 `custom_models` 或 `custom_providers`（含与系统模型同名的条目）若将 `provider` / `parent_provider` 指向任何 `catalog_defined: True` 的目录变体，或将自定义 `base_url` 指向匹配任一目录变体 `bound_base_url` 的地址，在**偏好保存校验（`src/server/services/llm/custom_catalog.py`）与请求期调用解析（`src/server/services/llm/clients.py`、`LLM.from_custom_config`）**两个入口统一拒绝并返回 `400 catalog_variant_custom_model_forbidden`——目录变体只能经系统目录条目、使用该变体自身的绑定凭据调用。 |
+   | **④ 团队目录模型 vs 成员个人 `custom_models`（按解析后提供商与地址检查）** | • **针对内置提供商**：团队共享开启（`credentials.sharing == "team"`）时，成员保存的同名个人 `custom_models` 解析至团队凭据持有人密钥（`src/server/database/api_keys.py:350`），并严格遵循 #485 `enforce_shared_byok_endpoint_policy`（`src/dalton/credentials.py:513-531`）——仅允许连向持有人已保存的 `base_url`（前提是不与任何目录变体地址重叠，见下条）或**出厂内置提供商**默认端点；关闭团队共享时使用成员个人密钥。<br>• **针对目录新增变体（保存与调用均按解析后结果拒绝借道）**：由于个人模型即使声明为内置提供商，解析时也会优先采用凭据持有人（或个人）已保存的 `base_url` 及变体跳转端点（`src/server/services/llm/clients.py:130-175`），因此在**偏好保存校验（`src/server/services/llm/custom_catalog.py`）与请求期调用解析（`clients.py:130-175,497-570`、`LLM.from_custom_config`）**两个阶段，统一按**解析后的最终生效提供商与解析后的最终生效地址（含从凭据持有人保存的 `base_url` 继承来的地址及参数端点）**检查：凡解析后的提供商属于 `catalog_defined: True` 的目录变体，或解析后的地址落在任何目录变体的 `bound_base_url` 上（按 `canonical_url_key` / `endpoint_matches_prefix` 判定），一律拒绝并返回 `400 catalog_variant_custom_model_forbidden`——目录变体只能经系统目录条目、使用该变体自身的绑定凭据调用。 |
 
 3. **编译管线收尾四步固定顺序（固定路由与分层退役边界）**：
    每次构建 `CompiledCatalog` 时按以下顺序收尾：
    - **步骤 A（三层正向合并）**：依次合并第 1 层内置清单 → 第 2 层 `native_overlay.json` → 第 3 层数据库载荷（含 `models`、`model_overrides`、`providers`、`dalton_meta`、`task_costs`、`series_overrides`）；
    - **步骤 B（专有固定路由窄字段锁定）**：对 `PINNED_OVERLAY_MODEL_KEYS`（`grok-4.7-oauth`，`src/dalton/llm/overlay.py:27,450-475`）仅锁定底层路由与协议连接字段（`provider = "xai-oauth"`、`model_id` 及核心连接参数），保留管理员在数据库 `model_overrides` 与 `dalton_meta` 中对其展示名、`visible`、三项评分、默认思考档位及名义价格所做的修订；
-   - **步骤 C（出厂硬退役 vs 团队可恢复退役）**：
+   - **步骤 C（出厂硬退役、只读遗产退役集与团队可恢复退役）**：
      - **出厂硬退役名单**（`native_overlay.json` 的 `retired` 数组）属于不可逆平台基线，管理列表默认隐藏，恢复接口对其返回 `400 factory_retired_immutable`；
-     - **团队退役名单**（数据库 `dalton_team_model_catalog.retired` 数组，加上 `legacy_sync_import_status == 'failed'` 期间的只读遗产退役集，见 §2.6）承载管理员手动退役及原生同步下线的模型，管理员点击「恢复」即从数据库 `retired` 移除该键并即时生效；
-     - `_drop_retired_models` 对合并后的总退役集合统一执行移除；
+     - **只读遗产退役集**（`legacy_sync_import_status == 'failed'` 期间汇总的遗产退役键，详见 §2.6）：在该故障未解除期间处于冻结下线态，普通「恢复」操作对其直接返回 `409 legacy_retired_locked_until_import_resolved`、模型保持下线；只有执行 `retry_import` 成功或 `abandon_legacy_file` 完成后才允许按普通退役项恢复；
+     - **团队退役名单**（数据库 `dalton_team_model_catalog.retired` 数组，且不在上述只读遗产冻结集内）承载管理员手动退役及已入库的原生同步下线模型，管理员点击「恢复」即从数据库 `retired` 移除该键并即时生效；
+     - `_drop_retired_models` 对上述三类退役集合的并集统一执行移除；
    - **步骤 D（能力门禁最终裁剪与评分继承）**：无论触发源是常规合并、启动导入还是历史版本回滚，当 `CapabilityId.NATIVE_OAUTH_SYNC` 关闭时，统一强制剥离全部 `*-oauth` 模型键、`*-oauth` 提供商及对应 `dalton_meta`；开启时最后执行 `inherit_antigravity_gemini_ratings`。
 
 ### 2.3 多 Worker 版本确认、只读派生缓存与写锁防覆盖
@@ -317,53 +318,57 @@ sequenceDiagram
 
 为同时保证单回合内部一致性与滚动发版恢复后的一致性，系统在回合启动时**固定目录版本并将有效配置快照随运行记录落库**：
 
-1. **回合启动持久化自包含快照 `effective_catalog_snapshot`**：
-   - 对话回合在 START 事务写入 `conversation_responses.metadata`（`src/server/database/runs/lifecycle.py:167-170`）以及子智能体启动写入 `subagent_runs` 元数据（`src/server/database/runs/subagent_runs.py:1-26`）时，记录 `catalog_revision: R` 并同步持久化**本回合候选模型的自包含有效配置快照 `effective_catalog_snapshot`**（提取本回合主模型、备用链模型、已启用子智能体模型及 Dalton 后台角色模型的编译结果：现金费率卡 `pricing`、名义费率卡 `notional_card`、`billing`、`input_modalities`、窗口与输出上限、`reasoning` 阶梯与协议路径、固定路由 `provider` / `model_id` / `bound_base_url`，体积仅数 KB）。
+1. **回合启动持久化自包含快照 `effective_catalog_snapshot`（含原凭据绑定标识）**：
+   - 对话回合在 START 事务写入 `conversation_responses.metadata`（`src/server/database/runs/lifecycle.py:599-621`）以及子智能体启动写入 `subagent_runs` 元数据（`src/server/database/runs/subagent_runs.py:1-26`）时，记录 `catalog_revision: R` 并同步持久化**本回合候选模型的自包含有效配置快照 `effective_catalog_snapshot`**（提取本回合主模型、备用链模型、已启用子智能体模型及 Dalton 后台角色模型的编译结果：现金费率卡 `pricing`、名义费率卡 `notional_card`、`billing`、`input_modalities`、窗口与输出上限、`reasoning` 阶梯与协议路径、固定路由 `provider` / `model_id`，以及目录变体原绑定的非密钥凭据标识 **`bound_base_url` 与 `key_fingerprint`**，体积仅数 KB）。
 2. **回合内全链路与跨部署恢复一致消费快照**：
    - **本回合运行与结算**：主客户端、`ModelResilienceMiddleware` 备用客户端、子智能体、回合内 `dalton_complete`、`MultimodalStripMiddleware._target`（`src/ptc_agent/agent/middleware/file_operations/multimodal_strip.py:688-715`）、准入与分块预算预留、以及 `UsagePersistence`（`src/server/services/persistence/usage.py:136-147`）调用的 `calculate_cost_from_per_call_records`（`src/utils/tracking/core.py:209-270` → `find_model_pricing` / `resolve_notional_card`），一律从当前回合绑定的 `effective_catalog_snapshot` 读取费率与能力（独立于对话回合的后台单次 `dalton_complete` 在入口固定当次快照）；
-   - **跨镜像部署恢复**：当滚动部署打断运行中的回合或子智能体，由新镜像进程中的恢复服务（`src/server/services/report_back/restart.py:10-18,60-89`）拉起恢复执行或由 Abandoned Sweep 补结算历史未结账行时，**直接加载原运行记录持久化的 `effective_catalog_snapshot` 沿用原费率、模态、思考参数与固定路由**，无需按新镜像的静态清单重新编译旧修订号；恢复完成后用户后续新发起的回合再读取最新目录版本。
-3. **预算汇总读取已持久化账单**：
+   - **跨镜像部署恢复**：当滚动部署打断运行中的回合或子智能体，由新镜像进程中的恢复服务（`src/server/services/report_back/restart.py:10-18,108-127`）拉起恢复执行或由 Abandoned Sweep 补结算历史未结账行时，**直接加载原运行记录持久化的 `effective_catalog_snapshot` 沿用原费率、模态、思考参数、固定路由与原凭据绑定标识 `(bound_base_url, key_fingerprint)`**，无需按新镜像的静态清单重新编译旧修订号；恢复后的每次发包检查均拿快照中的 `(bound_base_url, key_fingerprint)` 与当前凭据表比对；恢复完成后用户后续新发起的回合再读取最新目录版本。
+3. **首次发布前已存在旧运行记录的无快照兼容补写**：
+   - 本功能首次上线部署时，数据库内此前已启动的在途/被中断回合（`lifecycle.py:599-621`）及待补结算账单尚无 `effective_catalog_snapshot` 字段。恢复服务（`restart.py:108-127`）、`UsagePersistence` 与 Abandoned Sweep 遇到缺失该字段的旧运行记录时，先按当时的目录生效配置（首次上线基准目录）提取该运行所涉模型的有效配置，以条件更新（仅当 `effective_catalog_snapshot` 为空时写入）**补写快照至该运行记录**，随后进入标准恢复与结算流程；
+   - 若因遗留记录引用的模型当时已不存在或元数据残缺而无法补写快照，该回合与账单按上线前既有方式收尾结束（中断回合归为无需恢复并记录结构化日志，待结算记录按既有 `calculate_cost_from_per_call_records` 结账落库）。
+4. **预算汇总读取已持久化账单**：
    - `compute_provider_breakdown`（`src/dalton/budget/service.py:313-395`）优先累加每笔调用已持久化的 `cost`、`notional_cost` 与 `pricing_provider` 印章。
 
 ### 2.5 目录变体凭据强绑定、全发送路径双重校验与改址策略
 
 1. **内置提供商模型**：继续复用团队凭据持有人的 `user_api_keys` 与 `oauth_tokens`（`src/dalton/credentials.py:252-289`），列表接口返回 `provider_connected: bool`。
 2. **目录新增变体（`catalog_defined: True`）的凭据隔离与全路径双重门禁**：
-   - **专属凭据绑定与零继承**：管理员创建目录变体时必须提交该变体专属 API Key，加密存入 `dalton_catalog_provider_credentials` 并绑定至规范化 `bound_base_url`（`canonical_url_key`，`src/dalton/llm/egress_policy.py:114-122`）。对 `catalog_defined: True` 的变体：
+   - **专属凭据绑定与零继承**：管理员创建目录变体时必须提交该变体专属 API Key，加密存入 `dalton_catalog_provider_credentials` 并绑定至完整带路径的 `bound_base_url` 与 `canonical_bound_url = canonical_url_key(bound_base_url)`（`src/dalton/llm/egress_policy.py:114-122`）。对 `catalog_defined: True` 的变体：
      - `_flatten_providers`（`src/llms/llm.py:122-130`）剥离父组 `env_key`；
      - `byok_candidates`（`src/server/services/llm/byok.py:13-42`）返回空列表，`key_fits`（`byok.py:44-53`）固定返回 `False`（即使持有人密钥自身带有 `has_base_url=True` 也不放行）；
-     - `enforce_shared_byok_endpoint_policy`（`src/dalton/credentials.py:513-531`）与 `clients.py:512-533` 将 `catalog_defined: True` 变体的地址排除在可信 `manifest_base_url` 之外；
+     - `enforce_shared_byok_endpoint_policy`（`src/dalton/credentials.py:513-531`）与 `clients.py:130-175,512-533` 将 `catalog_defined: True` 变体的地址排除在可信 `manifest_base_url` 之外，且个人模型解析后的地址（含从持有人已存 `base_url` 继承的地址）一旦匹配任一目录变体的 `bound_base_url` 即按 §2.2 维度④拒绝；
    - **客户端构造期 + 实际发送期双重强制校验，覆盖全部 5 条出站路径**：
      1. 常规对话与自动化客户端（`src/server/services/llm/clients.py:497-570`）；
      2. `LLMService.complete` 直接调用 `create_llm` 的系统调用与回退分支（`src/server/services/llm/service.py:82-115`、`src/llms/llm.py:1502-1539`）；
      3. `ModelResilienceMiddleware` 备用客户端（`fallback_models`）与辅助槽位客户端；
      4. 提供商可用模型列表拉取（`src/server/services/llm/provider_models/service.py:116-128`、`wire.py:119-156`、`src/server/app/api_keys.py:575-610`）；
-     5. 旧密钥测试接口 `POST /api/v1/keys/test`（`src/server/app/api_keys.py:525-570`）：当 `body.provider` 为目录新增变体或 `body.base_url` 命中目录变体绑定地址时，在该个人/通用接口直接返回 `400` 拒绝（引导管理员使用专属 `POST /api/v1/dalton/team-models/test-call`）；
-   - **双重门禁不变量**：在 `LLM.__init__` / `LLM.get_llm`（`src/llms/llm.py:780-941`）构造出口与 `CatalogVariantTransport` 每次发包入口同时核验：① 凭据来源标记精确等于 `catalog_variant:{provider_slug}`；② 最终请求 URL 满足 `endpoint_matches_prefix(url, bound_base_url)`；③ 客户端已成功挂载 `CatalogVariantTransport`。缺少专属凭据、地址绑定不符或目标 SDK 无法挂载受控传输时，立即拒绝构造或终止发包。
-3. **变体改址或删凭据时对在途调用的处置规则**：
-   - 管理员修改目录变体的 `base_url` 时必须同时提交对应新地址的新凭据，`dalton_catalog_provider_credentials[provider_slug]` 更新为新 `(bound_base_url, key_fingerprint)` 后旧绑定即刻撤销；
-   - 仍持有旧 `effective_catalog_snapshot` 的在途回合发起后续调用或重试时，发送前核对数据库当前 `dalton_catalog_provider_credentials[provider_slug]`，发现原 `(bound_base_url, key_fingerprint)` 已撤销或更换，**当场以明确的终端配置错误 `CatalogVariantCredentialRevokedError` 结束该次调用**，保持原快照固定地址与当前新凭据彼此严格隔离。
+     5. 旧密钥测试接口 `POST /api/v1/keys/test`（`src/server/app/api_keys.py:525-570`）：当 `body.provider` 为目录新增变体或 `body.base_url` 命中目录变体 `bound_base_url` 时，在该个人/通用接口直接返回 `400` 拒绝（引导管理员使用专属 `POST /api/v1/dalton/team-models/test-call`）；
+   - **双重门禁不变量**：在 `LLM.__init__` / `LLM.get_llm`（`src/llms/llm.py:780-941`）构造出口与 `CatalogVariantTransport` 每次发包入口同时核验：① 凭据来源标记精确等于 `catalog_variant:{provider_slug}`；② 最终请求 URL 满足 `endpoint_matches_prefix(url, bound_base_url)`（`egress_policy.py:124-139`）；③ 客户端已成功挂载 `CatalogVariantTransport`。缺少专属凭据、地址绑定不符或目标 SDK 无法挂载受控传输时，立即拒绝构造或终止发包。
+3. **变体改址、换凭据或删凭据时对在途及恢复调用的处置规则**：
+   - 管理员修改目录变体的 `base_url`（或轮换其凭据）时，`dalton_catalog_provider_credentials[provider_slug]` 更新为新的 `(canonical_bound_url, key_fingerprint)`，旧绑定立即撤销；
+   - 同进程在途回合以及跨部署由 `restart.py` 恢复的回合与子智能体在每次发包前，将 `effective_catalog_snapshot` 中持久化的原绑定非密钥标识 `(canonical_url_key(bound_base_url), key_fingerprint)` 与数据库当前 `dalton_catalog_provider_credentials[provider_slug]` 的 `(canonical_bound_url, key_fingerprint)` 精确比对；一旦发现凭据已删除、地址路径已更改或同地址凭据已轮换，**当场以明确的终端配置错误 `CatalogVariantCredentialRevokedError` 结束该次调用**。
 
 ### 2.6 原生模型同步（`NativeModelsCard`）收口、导入顺序与损坏修复
 
 在 **Batch 1 同一发布批次**内完成 `NativeModelsCard` 的读取、写入、退役、恢复及历史本地文件导入：
 
 1. **读写同批切换**：`src/dalton/services/native_admin.py` 的 `run_native_check`、`run_native_sync`（`:233-363`）、`run_native_retire`（`:365-481`）与 `run_native_restore`（`:483-520`）统一改为在 `dalton_team_model_catalog` 排他锁内读写数据库并记录 `revisions` 审计行（保留写入 `dalton_openclaw_sync_runs` 供前端展示历史状态）。
-2. **先提交事务状态、后执行可重试文件归档的崩溃安全导入顺序**：
-   - 旧版进程滚动退出后，新版进程在 `setup.py` 启动阶段于 `dalton_team_model_catalog` 排他锁内按数据库显式状态列（绝不单凭原路径文件缺失推断从未导入）推进：
-     - 若 `legacy_sync_import_status == 'imported'` 或 `'abandoned'`：导入已终结；若磁盘原路径仍残留 `native_sync_overlay.json`（如上次事务提交后进程崩溃尚未完成归档），幂等补执行重命名归档即可；
+2. **识别"曾使用旧目录文件的部署"与先提交再归档的崩溃安全顺序**：
+   - **旧目录使用历史判定（`used_legacy_sync`）**：满足以下任一条件即识别为"曾使用旧目录文件的部署"：① 数据库 `dalton_openclaw_sync_runs`（`src/dalton/database/native_sync.py:53-58`、`src/dalton/services/native_admin.py:335-342,449-460`）中存在 `source = 'native'` 且 `dry_run = FALSE`（即 `sync`、`retire` 或 `restore`）且 `status = 'succeeded'` 的历史记录；② 磁盘存在 `var/dalton/catalog/native_sync_overlay.json`、临时文件 `.json.tmp` 或历史归档/备份标记（`.migrated.*` / `.corrupt.*`）；③ `dalton_team_model_catalog` 中 `legacy_sync_imported_at IS NOT NULL` 或 `last_known_legacy_retired` 非空；
+   - 旧版进程滚动退出后，新版进程在 `setup.py` 启动阶段于 `dalton_team_model_catalog` 排他锁内按显式状态列推进：
+     - 若 `legacy_sync_import_status == 'imported'` 或 `'abandoned'`：导入已终结；若原路径仍残留 `native_sync_overlay.json`（如上次事务提交后进程中断未完成重命名），幂等补做归档重命名；
      - 若 `legacy_sync_import_status == 'pending'`：
-       - 当原路径 `native_sync_overlay.json` 与历史归档文件 `.migrated.*` 均不存在（且 `legacy_sync_imported_at IS NULL`）时，在事务内提交 `legacy_sync_import_status = 'not_applicable'`；
-       - 当 `native_sync_overlay.json` 存在且通过 JSON、Schema 与 `assert_no_credentials` 校验时，**第一步先在单个 PostgreSQL 事务内原子提交合并后的 `models` / `dalton_meta` / `retired`、`last_known_legacy_retired`、`revisions(action='bootstrap_import')` 审计行以及 `legacy_sync_import_status = 'imported', legacy_sync_imported_at = NOW()`**；**第二步在事务 `COMMIT` 成功之后**，再执行幂等可重试的文件归档重命名（`native_sync_overlay.json.migrated.<timestamp>`），归档完成后本地文件彻底退出运行时读取。
-3. **文件损坏或校验失败时的退役名单持续拦截与退出路径**：
-   - 当 `native_sync_overlay.json` 存在但 JSON 损坏或部分条目校验失败时，事务将 `legacy_sync_import_status` 记为 `'failed'` 并保存脱敏错误摘要，系统按以下规则安全降级：
-     - **常规对话继续服务，同时持续拦截已退役模型**：目录构建器合并 `last_known_legacy_retired`；若首次导入前数据库尚无副本，**保留该本地文件作为只读退役来源**——JSON 可解析时直接读取其 `retired` 数组（`src/dalton/llm/native_catalog.py:856-881`），JSON 语法损坏时按正则受控提取文件 `"retired"` 段落内的模型键并冻结同文件涉及的待定条目，确保曾被下线的内置/订阅模型继续处于拦截态；
-     - **锁定原生同步写操作**：`NativeModelsCard` 的同步写入与恢复接口在 `'failed'` 状态下统一返回 `503 legacy_overlay_import_failed`；
-     - **离开 `failed` 状态的管理员修复入口**：提供接口 `POST /api/v1/dalton/team-models/legacy-import/resolve` 及管理页告警横幅操作：
-       - **`retry_import`（修复文件后重试导入）**：管理员修复磁盘文件后触发，锁内重读校验通过后提交 `bootstrap_import` 修订，状态由 `'failed'` 转为 `'imported'` 并归档文件；
-       - **`abandon_legacy_file`（确认放弃损坏旧文件）**：管理员确认丢弃旧文件（表单默认勾选保留已识别出的只读退役键写入数据库 `retired`），同一事务写入 `action = 'abandon_legacy_file'` 审计行并将状态由 `'failed'` 转为终态 `'abandoned'`，随后将旧文件重命名为 `.corrupt.<timestamp>` 移出读取路径，原生同步恢复正常读写。
+       - **仅在确认 `used_legacy_sync == False`（从未使用过旧目录文件）时**，才在事务内提交 `legacy_sync_import_status = 'not_applicable'`；若磁盘缺失原文件但 `used_legacy_sync == True`（如数据库已有成功退役/同步记录而挂载卷丢失），转入 `'failed'` 状态以保护历史退役模型；
+       - 当 `native_sync_overlay.json` 存在且通过 JSON、Schema 与 `assert_no_credentials` 校验时，**第一步先在单个 PostgreSQL 事务内原子提交合并后的 `models` / `dalton_meta` / `retired`、`last_known_legacy_retired`、`revisions(action='bootstrap_import')` 审计行以及 `legacy_sync_import_status = 'imported', legacy_sync_imported_at = NOW()`**；**第二步在事务 `COMMIT` 成功之后**，再执行幂等可重试的文件归档重命名（`native_sync_overlay.json.migrated.<timestamp>`），归档完成后本地文件退出运行时读取。
+3. **退役名单无法确认或文件损坏时的降级准入、恢复锁定与修复出口**：
+   - 当识别为 `used_legacy_sync == True` 的部署遇到旧文件缺失、截断（如在 `retired` 段前截断，`src/dalton/llm/native_catalog.py:856-881`）或校验失败时，事务将 `legacy_sync_import_status` 记为 `'failed'` 并保存脱敏错误摘要，执行严格降级保护：
+     - **已知退役汇总与保守模型准入**：汇总 `dalton_openclaw_sync_runs` 历史成功 `retire`/`restore` 记录（`native_admin.py:449-460,507-513`）、`last_known_legacy_retired` 及旧文件只读可解析的退役项形成**只读遗产退役集**；在退役名单无法从旧文件完整确认期间，**所有由原生同步新增的模型一律暂停服务，系统仅允许调用出厂可用（内置清单与 `native_overlay.json` 中非出厂退役）且不在任何已知退役记录里的模型**；
+     - **锁定原生同步写入与只读遗产键恢复**：`'failed'` 期间，`NativeModelsCard` 的同步写入接口返回 `503 legacy_overlay_import_failed`；对仍处于只读遗产退役集内的模型键，任何普通「恢复」请求（团队目录恢复或原生恢复接口）均返回明确的 `409 legacy_retired_locked_until_import_resolved` 错误，**模型保持下线**，只有下述 `retry_import` 成功或 `abandon_legacy_file` 完成后才可恢复；
+     - **离开 `failed` 状态的管理员修复入口**（`POST /api/v1/dalton/team-models/legacy-import/resolve`）：
+       - **`retry_import`（修复文件后重试导入）**：管理员修复或补回磁盘文件后触发，锁内重读校验通过后提交 `bootstrap_import` 修订，状态由 `'failed'` 转为 `'imported'` 并归档文件；
+       - **`abandon_legacy_file`（确认放弃损坏旧文件）**：管理员核实后确认放弃旧文件（默认将已知退役记录一并固化写入数据库 `retired`），同一事务写入 `action = 'abandon_legacy_file'` 审计行并将状态由 `'failed'` 转为终态 `'abandoned'`，若存在损坏文件则重命名为 `.corrupt.<timestamp>`，系统解除冻结恢复正常读写。
 
-### 2.7 "隐藏"与"退役"：六源引用分类、插件锁纳入与默认模型行为
+### 2.7 "隐藏"与"退役"：六源引用分类、最外层锁顺序与默认模型行为
 
 1. **隐藏（`visible: false`）**：保留在 `ModelConfig` 中，`listed_models()`（`src/llms/llm.py:335-350`）将其从选择器与引导候选收起；`model_resolves()` 仍为 `True`，存量对话线程、定时自动化、备用链与后台角色槽位继续正常运行。
 2. **退役（加入数据库 `retired`）的六源引用分类矩阵与对话线程行为**：
@@ -377,11 +382,15 @@ sequenceDiagram
    | **⑤ `automations`（`model_references.py:303-323`）**<br>数据库表 `automations.llm_model`（非空显式绑定） | 是（PostgreSQL 表） | 默认拦截列出清单；指定继任模型后在同一事务内按任务所有者逐条校验可用性、调和 `reasoning_effort` 并批量替换；`llm_model IS NULL` 的任务自动跟随所有者默认模型。 |
    | **⑥ `user_preferences`（`src/dalton/database/openclaw_sync.py:19-75`）**<br>`fallback_models`、Dalton 角色偏好、账户默认槽位（`_MODEL_PREF_KEYS`）及 `agent_preference.subagent_models` | 是（PostgreSQL 表 + 运行期兜底） | **支持运行期跳过与可选一键迁移**：<br>• `fallback_models` 与 Dalton 角色列表运行期由 `drop_dead_models`（`availability.py:203-239`）和 `_without_models_missing_from_catalog`（`model_prefs.py:334-356`）自动跳过失效项；<br>• 对将该模型设为主默认槽位或 `subagent_models` 的用户，退役弹窗提供两项选择：<br>  **(a) 推荐：同事务按各用户校验可用性并一键迁移默认槽位至继任模型**（同步钳制该模型对应的 `profiles.<model>.reasoning_effort` 并调用 `invalidate_user_prefs_cache`）；<br>  **(b) 仅退役保持用户偏好待重选**：若被退役模型正是某用户的账户默认模型，该用户下次发消息进入 `resolve_llm_config`（`src/server/services/llm/config.py:635-645`）时，系统执行 `cleanup_stale_model_preferences` 清空失效偏好并返回一次 `400 model_removed` 横幅引导用户重选。 |
    | **附：已有对话线程 `conversation_threads.llm_model`**（不在六源内） | 运行期惰性清理 | 存量线程下次发消息未显式点名旧模型时，`turn_model()`（`src/server/services/llm/thread_model.py:50-93`）自动清空线程上的失效 `llm_model` 并回退至账户默认模型；显式点名已退役模型则返回 `400 model_removed`。 |
-   | **附：成员同名个人 `custom_models`** | 保持内置提供商契约 | 系统条目移除后，若成员在内置提供商下建有同名个人 `custom_models`，`model_resolves()`（`availability.py:172-175`）仍返回 `True`（按个人条目运行且受 #485 约束；指向目录变体的个人条目按 §2.2 第④条直接拒绝）。 |
+   | **附：成员同名个人 `custom_models`** | 保持内置提供商契约 | 系统条目移除后，若成员在内置提供商下建有同名个人 `custom_models`，且解析后的提供商与地址未落入任何目录变体（§2.2 维度④），`model_resolves()`（`availability.py:172-175`）仍返回 `True`（受 #485 约束）。 |
 
-3. **全写入口共用目录锁（含插件安装/升级）与按所有者校验**：
-   - **固定全局加锁顺序**：所有涉及模型引用写入的数据库入口——① 自动化新建/编辑（`src/server/services/automations/lifecycle.py`）；② 用户自定义子智能体与插件覆盖保存（`src/server/database/user_subagents.py:33-43`）；③ **插件安装、升级与重链接写入 `plugin_subagents`（`src/server/services/plugins/subagent_fanout.py:72-91,156-210` 的 `install_subagents`、`reconcile_subagents`、`relink_subagents`）**——统一按 **"先取目录共享咨询锁 `pg_advisory_xact_lock_shared(hashtext('dalton_team_model_catalog'))`，再取 `overrides_locked(user_id)` 或业务表行锁"** 的固定顺序执行，并在目录锁内读取最新数据库目录验证实际生效的模型（对插件子智能体同时校验包内 `plan.fields.model` 与合并用户 `override` 后的生效模型未退役）；
-   - **退役排他锁与按所有者校验**：管理员执行退役时先取同一咨询锁的**排他锁** `pg_advisory_xact_lock(...)`，再在同一事务连接 `conn` 内扫描引用并锁定受影响的 `automations`、`user_subagents`、`plugin_subagents` 与 `user_preferences` 行；批量替换时对每条记录所属 `user_id` 逐一验证继任模型的账户策略、凭据连通性与工作区宿主约束（`check_claude_code_hosted`，`lifecycle.py:997-999`），并对存有思考档位的记录调用 `_reconcile_reasoning_effort`（`lifecycle.py:1001-1022`）向下钳制或置 `NULL`。
+3. **全模型引用写入口的最外层目录锁顺序与锁内校验**：
+   - **全局严格锁顺序**：**`目录咨询锁（dalton_team_model_catalog） → 覆盖单元锁（get_active_unit_by_workspace FOR SHARE） → 用户自动化锁 / 子智能体锁 / 业务表行锁（lock_user_automations / overrides_locked / FOR UPDATE）`**。具体挂载点如下：
+     1. **Dalton 自动化调度写入**（`src/dalton/autonomy/schedule.py:79-120,1449,1589-1609`）：在 `user_automations_lock` 开启数据库事务后的**最外层、覆盖单元 `get_active_unit_by_workspace(..., for_share=True)`（`:106-108`）与 `auto_db.lock_user_automations`（`:109`）之前**获取目录共享咨询锁 `pg_advisory_xact_lock_shared(hashtext('dalton_team_model_catalog'))`，并在锁内校验写入的 `llm_model` 未退役；
+     2. **自动化文件挂载保存**（`src/server/services/automations/file.py:780-827,1091-1108`）：在文件保存事务的最外层（`prelock` 获取覆盖单元 `for_share` 锁 `:823` 与 `lock()` 获取 `auto_db.lock_user_automations` `:825-826` **之前**）获取目录共享咨询锁，并在锁内重校验模型；
+     3. **公司代理写入与 REST 自动化写入**（`src/dalton/services/company_agent_writes.py:278-382`、`src/server/services/automations/lifecycle.py:980-1022`）：按完全一致的最外层顺序（在任何覆盖单元锁与 `automations` 行锁之前，同连接可重入）先获取目录共享咨询锁，并在锁内（`_reconcile` `:332-355` 与 `lifecycle.py:988-1022`）验证最终生效模型未退役；
+     4. **用户子智能体保存与插件安装/升级**（`src/server/database/user_subagents.py:33-43`、`src/server/services/plugins/subagent_fanout.py:72-91,156-210` 的 `install_subagents`、`reconcile_subagents`、`relink_subagents`）：在获取 `lock_user_subagents` / `overrides_locked(user_id)` 之前先获取目录共享咨询锁，并在锁内验证包内 `plan.fields.model` 与合并用户 `override` 后的实际生效模型未退役；
+   - **退役排他锁与按所有者校验**：管理员执行退役时在事务最外层先取同一咨询锁的**排他锁** `pg_advisory_xact_lock(...)`，再按同一顺序锁定受影响行；批量替换时对每条记录所属 `user_id` 逐一验证继任模型的账户策略、凭据连通性与工作区宿主约束（`check_claude_code_hosted`，`lifecycle.py:997-999`），并对存有思考档位的记录调用 `_reconcile_reasoning_effort`（`lifecycle.py:1001-1022`）向下钳制或置 `NULL`。
 
 ---
 
@@ -389,7 +398,10 @@ sequenceDiagram
 
 ### 3.1 管理员门禁、严格字段白名单与只写凭据
 
-1. **仅管理员可操作**：全部团队目录管理、测试调用、旧文件修复、价格确认与回滚接口前置管理员鉴权（`supabase` 模式校验 `DALTON_PM_USER_IDS`；`local` 模式直查 PostgreSQL `dalton_user_roles.tier == 'admin'`，数据库异常返回 `503` Fail-Closed，对齐 `src/dalton/credentials.py:84-115,291-322`），其余角色一律返回 `403 Forbidden`。
+1. **三认证模式统一的管理员权限规则（前后端同源）**：全部团队目录管理、测试调用、旧文件修复、价格确认与回滚接口统一通过后端守卫 `require_catalog_admin(user_id)`（位于 `src/dalton/credentials.py:291-322` 与 `src/dalton/access_tiers.py:165-220`）鉴权，并与前端导航准入（`web/src/hooks/useTeamCredentials.ts:58-73` → `web/src/pages/Settings/components/SettingsRail.tsx:57-59` → `web/src/pages/Settings/sections.ts:99` `minTier: 'admin'`）共用同一条规则：
+   - **`DALTON_AUTH_MODE=local`（独立核心多用户认证）**：直查 PostgreSQL `dalton_user_roles.tier == 'admin'`（`src/dalton/auth/roles.py:54-79`），数据库异常返回 `503`（Fail-Closed）；
+   - **`DALTON_AUTH_MODE=supabase`（Everflow 团队认证）**：校验 `user_id` 属于 `DALTON_PM_USER_IDS`（`credentials.py:303`）；
+   - **`DALTON_AUTH_MODE=oss`（独立核心默认回环试用模式，`scripts/standalone/init.sh:1005-1009` 启用 `DALTON_ALLOW_DEV_OSS_AUTH=1`）**：本机所有者（已通过鉴权且非 `COMPANY_SYSTEM_USER_ID` 的当前用户）视为管理员（`admin`），前后端一致展示目录管理入口并放行接口；其余非管理员请求一律返回 `403 Forbidden`。
 2. **显式 Pydantic 字段白名单（`extra="forbid"`）**：
    - 提供商变体仅允许字段：`display_name`、`sdk`、`parent_provider`、`access_type`（`api_key` 或 `coding_plan`）、`billing`（`cash` 或 `subscription`）、`base_url`（校验为纯 `https://host[:port][/path]`，拒绝 `userinfo`、`?query`、`#fragment`、反斜杠与编码路径穿越 `%2e/%2f/%5c`，复用 `src/dalton/llm/egress_policy.py:65-112`）；
    - 模型条目仅允许声明式白名单字段，全面拦截 `ENDPOINT_PARAM_KEYS`、`CONNECTION_PARAM_KEYS`、`VERTEX_PARAM_KEYS`、自定义请求头容器（`default_headers` / `extra_headers` / `additional_headers`，`src/dalton/credentials.py:355-414`）及任何凭据关键字（`assert_no_credentials`，`src/dalton/llm/native_catalog.py:37-50`）。
@@ -419,12 +431,14 @@ sequenceDiagram
 
 ### 3.4 事务内权威版本审计与关联任务安全回滚
 
-1. **事务内权威审计主账本**：所有目录写操作在同一事务内向 `dalton_team_model_catalog_revisions` 写入不可变版本行；其中 `side_effects` 精确记录批量替换涉及的每条外部记录主键、改前值 `before`、改后值 `after` 以及**写入后的配置版本号/更新时间戳**（对 `automations` 记录 `after_config_version`，对齐 `src/server/database/automation.py:755`；对 `user_subagents`、`plugin_subagents` 与 `user_preferences` 记录 `after_updated_at`）。`activity.record()`（`src/server/services/activity.py:316-365`）仅作组织动态流补充通知。
-2. **回滚四步严格顺序（凭据校验 → 版本号 CAS 恢复关联任务 → 恢复后引用检查 → 提交）**：
+1. **事务内权威审计主账本**：所有目录写操作在同一事务内向 `dalton_team_model_catalog_revisions` 写入不可变版本行；其中 `side_effects` 精确记录批量替换涉及的每条外部记录主键、改前值 `before`、改后值 `after` 以及**替换前后的版本号对**——对 `automations` 记录 `(before_config_version, after_config_version)`（对齐 `src/server/database/automation.py:755` 与 `src/dalton/database/company_automations.py:884-891`），对 `user_subagents`、`plugin_subagents` 与 `user_preferences` 记录 `(before_updated_at, after_updated_at)`。`activity.record()`（`src/server/services/activity.py:316-365`）仅作组织动态流补充通知。
+2. **回滚四步严格顺序（完整地址凭据校验 → 沿替换链向目标版本整体还原 → 恢复后引用检查 → 提交）**：
    管理员调用 `POST /api/v1/dalton/team-models/rollback` 指定恢复至 `target_revision = T`（含 `revision = 0`）时，在排他咨询锁与同一事务连接内按以下顺序执行：
-   - **步骤 1（候选能力裁剪与变体凭据完整性校验）**：取出版本 `T` 的 `payload`，执行当前安装形态校验与 `CapabilityId.NATIVE_OAUTH_SYNC` 裁剪；遍历版本 `T` 中的全部目录新增变体，核对 `dalton_catalog_provider_credentials[provider_slug]` 是否存在且其 `canonical_origin_prefix` 匹配版本 `T` 中该变体的 `base_url`——若不匹配或缺失（例如该变体在 `T` 之后曾改过地址），且本次回滚请求未随附匹配版本 `T` 地址的新凭据，立即拒绝回滚并返回 `409 variant_credential_required`（若请求随附了新凭据，先对该旧地址+新凭据完成 §3.2 连接期公网预检，通过后在同一事务内更新凭据绑定）；
-   - **步骤 2（先按配置版本号执行 `side_effects` 条件恢复，保护用户后续主动修改）**：对 `(T, C]` 区间内记录的 `side_effects`，若原退役模型在版本 `T` 中恢复可用，按逆序在事务内执行**基于版本号的严格 CAS 更新**——例如对 `automations` 仅在 `WHERE automation_id = %s AND config_version = %s`（严格等于当时替换生成的 `after_config_version`，即使所有者曾把模型改成别项又改回同值，因 `config_version` 已递增也会精准识别为用户主动修改）时将其恢复为 `before` 模型与思考档位；对 `user_subagents`、`plugin_subagents` 与 `user_preferences` 核对 `updated_at = after_updated_at` 与字段值后恢复；
-   - **步骤 3（基于恢复后的事务内状态执行删减模型引用检查）**：在步骤 2 完成任务回迁之后，计算将被移除的模型集合 `dropped_keys = active_models(C) - active_models(T)`；若 `dropped_keys` 非空，基于当前事务连接内的最新状态执行 §2.7 六源引用检查——已在步骤 2 自动恢复回原模型 `A` 的任务不再误阻塞 `B` 的回滚，而期间真正新建或被用户主动改写为引用 `B` 的任务则准确触发 `409` 拦截（或由管理员确认继任模型后替换）；
+   - **步骤 1（候选能力裁剪与完整 `base_url` 变体凭据校验）**：取出版本 `T` 的 `payload`，执行当前安装形态校验与 `CapabilityId.NATIVE_OAUTH_SYNC` 裁剪；遍历版本 `T` 中的全部目录新增变体，按完整带路径 URL 规则比对 `dalton_catalog_provider_credentials[provider_slug]` 是否存在且满足 `canonical_url_key(variant_T.base_url) == cred.canonical_bound_url` 及 `endpoint_matches_prefix(variant_T.base_url, cred.bound_base_url)`（`src/dalton/llm/egress_policy.py:114-139`）——若缺失或路径/主机不匹配（例如该变体在 `T` 之后曾改过主机或路径），且本次回滚请求未随附匹配版本 `T` 完整 `base_url` 的新凭据，立即拒绝回滚并返回 `409 variant_credential_required`（若请求随附了新凭据，先对该地址+新凭据完成 §3.2 连接期公网预检，通过后在同一事务内更新凭据绑定）；
+   - **步骤 2（沿替换记录链按目标版本整体还原关联任务，保护用户修改）**：将 `(T, C]` 区间内所有 `side_effects` 按外部任务/记录主键聚合成从新到旧的替换记录链 `[e_k, e_{k-1}, ..., e_1]`（如连续两次目录替换 `A → B`、`B → C`），逐个对象判定：
+     1. 先核对当前数据库行的 `config_version == e_k.after_config_version`（其他表核对 `updated_at == e_k.after_updated_at` 且当前值等于 `e_k.after`）；若不相等，说明用户在最后一次目录替换后主动修改过该任务，保持不动并记入 `skipped_user_modified_tasks`；
+     2. 再沿链逆序比对相邻两次目录改写之间有无用户介入：只要每一跳均满足 `e_i.before_config_version == e_{i-1}.after_config_version`（两次目录改写之间 `config_version` 连续衔接、零用户修改）且目标模型在版本 `T` 中可用，**直接以单次原子更新将该任务整体还原至目标版本 `T` 时的模型与思考档位 `e_1.before`**（不会因逐跳更新改变 `config_version` 而中断后续还原；若链中某两跳之间曾有用户修改，即 `e_i.before_config_version != e_{i-1}.after_config_version`，则仅还原末端无用户修改的连续段至用户当时的配置，或保持不动并列入 `skipped_user_modified_tasks`）；
+   - **步骤 3（基于恢复后的事务内状态执行删减模型引用检查）**：在步骤 2 完成整体还原后，计算将被移除的模型集合 `dropped_keys = active_models(C) - active_models(T)`；若 `dropped_keys` 非空，基于当前事务连接内的恢复后状态执行 §2.7 六源引用检查——已整体还原至版本 `T` 原模型的任务顺畅通过，而期间新建或因用户修改而保持引用 `dropped_keys` 的任务准确触发 `409` 拦截（或由管理员确认继任模型后替换）；
    - **步骤 4（递增版本号落库与通知）**：写入 `new_revision = C + 1`（`action = 'rollback', restored_from = T`），提交事务，按持有人失效可用模型缓存并发布 Redis 预热通知，响应返回 `restored_tasks` 与 `skipped_user_modified_tasks` 明细。
 
 ---
@@ -458,14 +472,14 @@ sequenceDiagram
 
 ### 5.1 设置页入口与前端能力判断
 
-- **挂载位置**：在 **设置 → 团队管理 → 模型与供应商**（`web/src/pages/Settings/panels/dalton/DaltonTeamModelsPanel.tsx:7-22`，权限 `minTier: 'admin'`，`web/src/pages/Settings/sections.ts:99`）挂载 `TeamModelCatalogCard`（锚点 `#dalton-team-model-catalog`），并在 `sections.ts:302-304` 注册双语搜索词条。
+- **挂载位置与三模式一致准入**：在 **设置 → 团队管理 → 模型与供应商**（`web/src/pages/Settings/panels/dalton/DaltonTeamModelsPanel.tsx:7-22`，区块准入 `minTier: 'admin'`，`web/src/pages/Settings/sections.ts:99`）挂载 `TeamModelCatalogCard`（锚点 `#dalton-team-model-catalog`），并在 `sections.ts:302-304` 注册双语搜索词条。前端可见性由 `useTeamCredentials`（`web/src/hooks/useTeamCredentials.ts:58-73`）与 `useDaltonSettingsVisibility`（`web/src/pages/Settings/components/SettingsRail.tsx:57-59`）按 §3.1 同一条三模式规则求值（`local` 与 `supabase` 读取服务端 `caller_tier === 'admin'`，`DALTON_AUTH_MODE=oss` 回环试用模式将本机所有者映射为 `effectiveTier = 'admin'`）。
 - **能力判断统一通过 `useCapabilities()`**（`web/src/hooks/useCapabilities.ts:131-179`）：`TeamModelCatalogCard` 在双形态下常驻开放；OAuth 订阅提供商分组、Antigravity 系列聚合配置与 `NativeModelsCard` 统一由 `hasCapability('native_oauth_sync')` 控制显隐。
 
 ### 5.2 列表与五分组编辑抽屉设计
 
 1. **目录列表卡片（`TeamModelCatalogCard`）**：
    - 顶部设搜索框、提供商筛选、状态胶囊（`全部` / `可见` / `已隐藏` / `团队已退役` / `团队新增或改写`）、「版本历史（当前 `vN` · 一键回滚）」、「+ 新增提供商变体」与「+ 新增模型」；当存在 `pending` 价格提醒或 `legacy_sync_import_status == 'failed'` 时，首行展示带修复动作按钮（「重试导入」/「确认放弃旧文件」）的告警横幅；
-   - 行内展示提供商与凭据就绪徽标、显示名与 `model_key`、现金/名义单价及来源徽标（`官方` / `估算` / `第三方`）、窗口与模态、思考档位与三项评分，行尾提供 `编辑`、`复制新建`、`隐藏/显示`、`退役/恢复`。
+   - 行内展示提供商与凭据就绪徽标、显示名与 `model_key`、现金/名义单价及来源徽标（`官方` / `估算` / `第三方`）、窗口与模态、思考档位与三项评分，行尾提供 `编辑`、`复制新建`、`隐藏/显示`、`退役/恢复`（处于 `'failed'` 只读遗产退役集内的行将「恢复」置为禁用并提示先完成旧文件修复）。
 2. **新增 / 编辑抽屉（同提供商复制默认值 + 5 大分组）**：
    - 选择提供商后自动匹配同提供商现有同族模型预填窗口、输出上限、模态、思考协议写法、计费类型与家族；
    - 分设 **① 身份与提供商**（目录变体内嵌只写凭据输入框与 `https://` 绑定地址框）、**② 价格、来源与任务成本**、**③ 窗口与输入模态**、**④ 思考强度与协议写法**、**⑤ 三项评分、所属系列与引导精选**（扩展 `src/dalton/llm/antigravity_series.py:192-250` 优先读取目录 `series_overrides` / `dalton_meta.<key>.series`）；底部固定「测试调用」、「恢复出厂默认」与「保存生效」。
@@ -492,12 +506,12 @@ sequenceDiagram
 
 ### 6.1 双形态能力注册与上游 `DALTON-HOOK` 规范
 
-1. **能力注册（`src/dalton/capabilities.py:811-865`）**：
-   - 将全部 `/api/v1/dalton/team-models/*` 路由处理函数登记入 `DALTON_ROUTE_CAPABILITY_REGISTRY`（归属 `CORE_CAPABILITY`），将 `"dalton-team-model-catalog-follow"` 与 `"dalton-model-price-watch"` 登记入 `BACKGROUND_LOOP_REGISTRY`（归属 `CORE_CAPABILITY`），通过 `tests/unit/dalton/test_core_capabilities_gate.py:759-795` 门禁校验；
+1. **能力注册与三认证模式覆盖（`src/dalton/capabilities.py:811-865`）**：
+   - 将全部 `/api/v1/dalton/team-models/*` 路由处理函数登记入 `DALTON_ROUTE_CAPABILITY_REGISTRY`（归属 `CORE_CAPABILITY`），将 `"dalton-team-model-catalog-follow"` 与 `"dalton-model-price-watch"` 登记入 `BACKGROUND_LOOP_REGISTRY`（归属 `CORE_CAPABILITY`），通过 `tests/unit/dalton/test_core_capabilities_gate.py:759-795` 门禁校验；Core 默认回环试用安装（`DALTON_AUTH_MODE=oss`，`scripts/standalone/init.sh:1005-1009`）与公网多用户安装（`DALTON_AUTH_MODE=local`）统一按 §3.1 规则向管理员/本机所有者开放目录管理；
    - OAuth 订阅专属路由继续归属 `CapabilityId.NATIVE_OAUTH_SYNC`；团队目录在写入校验、合并、启动导入与版本回滚四处统一执行 `CapabilityId.NATIVE_OAUTH_SYNC` 裁剪（关闭时直调 API 提交任何 `*-oauth` 键返回 `400 oauth_capability_disabled`）。
 2. **上游文件 `DALTON-HOOK` 合规（`scripts/dalton/check_hooks.sh`）**：
    - 受保护清单 `src/llms/manifest/*.json` 保持零改动；
-   - 所有修改的上游文件（`src/llms/{llm.py,pricing_utils.py,task_costs.py}`、`src/utils/tracking/core.py`、`src/ptc_agent/agent/middleware/file_operations/multimodal_strip.py`、`src/server/services/llm/{byok.py,clients.py,custom_catalog.py,egress.py,service.py,provider_models/service.py}`、`src/server/services/automations/lifecycle.py`、`src/server/services/plugins/subagent_fanout.py`、`src/server/database/runs/{lifecycle.py,subagent_runs.py}`、`src/server/services/report_back/restart.py`、`src/server/app/{setup.py,api_keys.py}` 及前端上游引导/选择器文件）在每处 diff hunk 25 行窗口内标注已在 `scripts/dalton/check_hooks.sh:25-115` `ALLOWED_HOOKS` 注册的钩子名（复用既有钩子并在 `ALLOWED_HOOKS` 新增登记 `"team-model-catalog"`），保证 `scripts/dalton/check_hooks.sh --strict --audit` 通过。
+   - 所有修改的上游文件（`src/llms/{llm.py,pricing_utils.py,task_costs.py}`、`src/utils/tracking/core.py`、`src/ptc_agent/agent/middleware/file_operations/multimodal_strip.py`、`src/server/services/llm/{byok.py,clients.py,custom_catalog.py,egress.py,service.py,provider_models/service.py}`、`src/server/services/automations/{file.py,lifecycle.py}`、`src/server/services/plugins/subagent_fanout.py`、`src/server/database/runs/{lifecycle.py,subagent_runs.py}`、`src/server/services/report_back/restart.py`、`src/server/app/{setup.py,api_keys.py}` 及前端上游引导/选择器文件）在每处 diff hunk 25 行窗口内标注已在 `scripts/dalton/check_hooks.sh:25-115` `ALLOWED_HOOKS` 注册的钩子名（复用既有钩子并在 `ALLOWED_HOOKS` 新增登记 `"team-model-catalog"`），保证 `scripts/dalton/check_hooks.sh --strict --audit` 通过。
 
 ### 6.2 核心安装首次设置与 `deployment_settings` 表的关系
 
@@ -521,7 +535,7 @@ sequenceDiagram
 
 | 批次 | 范围与核心交付物 | 关键改动模块（含 `DALTON-HOOK` 登记） | 验收与自动化门禁测试 |
 |---|---|---|---|
-| **Batch 1：数据库目录与专属凭据表、跨部署回合快照、全路径出站与 Fake-IP 守卫、`NativeModelsCard` 收口及管理/回滚 API** | 1) 新增 Dalton 迁移（接合入时唯一头，当前为 `d046`）建表并幂等插入 `revision = 0` 初始行；<br>2) 实现三层合并全覆盖（含 `ModelConfig`、`load_dalton_meta` 深度合并、`notional_pricing.py` 按 `(provider, norm_id(model_id))` 唯一索引与歧义拒绝、`task_costs.py`、系列扩展、剥离变体 `env_key`、拒绝个人 `custom_models` 指向目录变体或其地址、窄字段固定路由、出厂硬退役保护、升级同名晋升及 `CapabilityId.NATIVE_OAUTH_SYNC` 裁剪）；<br>3) 实现新请求向 PostgreSQL 点查 `revision` + `revision -> CompiledCatalog` 只读缓存 + 单调预热 + **回合启动随 `conversation_responses.metadata` / `subagent_runs` 持久化 `effective_catalog_snapshot`（支撑回合内一致结算与跨部署恢复沿用）**；<br>4) 实现目录变体专属凭据绑定、全 5 条发送路径（聊天、`LLMService.complete` / `create_llm`、备用链、模型列表、旧 `/api/v1/keys/test`）构造期+发送期双重校验、改址在途调用终止，以及兼容 `network.fake_ip_cidrs`（DoH 核验真实公网 IP 直连 + 原主机名 TLS 校验）与 `HeldTransport` 的 `CatalogVariantTransport`；<br>5) 同批完成 `NativeModelsCard` 读写切库、先提交事务再可重试归档的导入流程、损坏文件只读退役持续拦截及 `retry_import` / `abandon_legacy_file` 修复接口；<br>6) 实现管理员 CRUD、隐藏、退役（六源分类 + 纳入 `subagent_fanout.py` 插件安装/升级共享目录锁 + 按所有者校验批量替换与 `reasoning_effort` 调和）、测试调用、版本列表及带变体凭据校验 + `config_version` CAS 恢复 + 恢复后引用检查的一键回滚 API。 | • 新建：`src/dalton/migrations/versions/d05X_team_model_catalog.py`、`src/dalton/database/team_model_catalog.py`、`src/dalton/services/team_model_catalog/`<br>• Dalton 模块：`src/dalton/llm/{overlay.py,notional_pricing.py,antigravity_series.py}`、`src/dalton/services/native_admin.py`、`src/dalton/budget/service.py`、`src/dalton/settings.py`、`src/dalton/capabilities.py`、`src/dalton/app/router.py`<br>• 带已登记 `DALTON-HOOK` 的上游模块：`src/llms/{llm.py,pricing_utils.py,task_costs.py}`、`src/utils/tracking/core.py`、`src/ptc_agent/agent/middleware/file_operations/multimodal_strip.py`、`src/server/services/llm/{byok.py,clients.py,custom_catalog.py,egress.py,service.py,provider_models/service.py}`、`src/server/services/automations/lifecycle.py`、`src/server/services/plugins/subagent_fanout.py`、`src/server/database/runs/{lifecycle.py,subagent_runs.py}`、`src/server/services/report_back/restart.py`、`src/server/app/{setup.py,api_keys.py}`、`scripts/dalton/check_hooks.sh` | 1) **双固定端口多进程与并发验收**：在 `8001` 与 `8002` 启动两个共享 PG/Redis 的进程，用未占用的 `glm-99-catalog-test` / `glm-99-catalog-plan` 测试新增（另设独立用例验证对已内置 `glm-5.4` 的改写与同名晋升），直连 `8002` 断言 `X-Dalton-Catalog-Revision` 立即跃升（含断开 Redis Pub/Sub 场景）及旧 `expected_revision` 并发写入返回 `409`；<br>2) **回合中途改价与跨镜像恢复快照验收**：验证在途回合中途改价/退役仍按启动快照结算；模拟镜像静态清单费率与模态变更后由 `restart.py` 恢复被中断回合与子智能体，断言沿用原持久化 `effective_catalog_snapshot`；<br>3) **全路径凭据隔离与 Fake-IP 出站验收**：断言个人同名 `custom_models` 指向目录变体或其地址返回 `400`；断言 `LLMService.complete(user_id=None)`、`create_llm`、备用链、`/models` 与 `/api/v1/keys/test` 绝不携带父组 `env_key` 或持有人密钥；分别在开启与关闭 `network.fake_ip_cidrs` 下验证 Fake-IP DoH 核验真实公网 IP 直连（含 TLS SNI 证书校验与内网真实 IP 拒绝）及 `HeldTransport` 阻断内网/`http`/`302`；验证变体改址后在途旧绑定调用以明确错误终止；<br>4) **计费与名义价格唯一键验收**：用本地假端点与记账函数断言现金与订阅名义计费精确，同一 `(provider, model_id)` 配置不同名义费率在保存前返回 `400 ambiguous_notional_pricing`；<br>5) **退役锁、回滚顺序与原生导入容错**：验证 `subagent_fanout.py` 插件安装/升级与退役并发互锁；验证"新增 B → 退役 A 迁往 B → 回滚至 T"自动先经 `config_version` CAS 恢复任务至 A 再通过引用检查，且用户改过又改回 B 的任务保留用户设置；验证回滚旧地址缺凭据返回 `409 variant_credential_required`（随附新凭据同事务通过）；验证事务提交后归档前崩溃不误判 `not_applicable`、损坏文件继续拦截退役名单及 `retry_import` / `abandon_legacy_file` 正常退出 `failed`；`test_core_capabilities_gate.py` 与 `check_hooks.sh --strict --audit` 全绿。 |
+| **Batch 1：数据库目录与专属凭据表、跨部署回合快照、全路径出站与 Fake-IP 守卫、`NativeModelsCard` 收口及管理/回滚 API** | 1) 新增 Dalton 迁移（接合入时唯一头，当前为 `d046`）建表（`dalton_catalog_provider_credentials` 存完整规范化 `canonical_bound_url`）并幂等插入 `revision = 0` 初始行；<br>2) 实现三层合并全覆盖（含 `ModelConfig`、`load_dalton_meta` 深度合并、`notional_pricing.py` 按 `(provider, norm_id(model_id))` 唯一索引与歧义拒绝、`task_costs.py`、系列扩展、剥离变体 `env_key`、按**解析后提供商与继承地址**拒绝个人 `custom_models` 落入目录变体、窄字段固定路由、出厂硬退役与只读遗产退役恢复锁定、升级同名晋升及 `CapabilityId.NATIVE_OAUTH_SYNC` 裁剪）；<br>3) 实现新请求向 PostgreSQL 点查 `revision` + `revision -> CompiledCatalog` 只读缓存 + 单调预热 + **回合启动随运行记录持久化含 `(bound_base_url, key_fingerprint)` 的 `effective_catalog_snapshot`（含首次上线旧运行补写快照兼容）**；<br>4) 实现三认证模式管理员守卫（含 `DALTON_AUTH_MODE=oss` 本机所有者）、目录变体专属凭据绑定、全 5 条发送路径构造期+发送期双重校验、改址/换凭据在途与恢复调用终止，以及兼容 `network.fake_ip_cidrs`（DoH 核验真实公网 IP 直连 + 原主机名 TLS 校验）与 `HeldTransport` 的 `CatalogVariantTransport`；<br>5) 同批完成 `NativeModelsCard` 读写切库、`used_legacy_sync` 历史识别、先提交再可重试归档、退役名单无法确认时暂停同步新增模型并仅放行出厂非已知退役模型、只读遗产键禁普通恢复及 `retry_import` / `abandon_legacy_file` 修复接口；<br>6) 实现管理员 CRUD、隐藏、退役（六源分类 + 在 `schedule.py` `user_automations_lock`、`file.py`、`company_agent_writes.py`、`lifecycle.py`、`user_subagents.py`、`subagent_fanout.py` 最外层覆盖单元锁之前加目录共享锁并锁内校验模型 + 按所有者校验批量替换与 `reasoning_effort` 调和）、测试调用、版本列表及带完整 `base_url` 凭据校验 + 沿替换链按目标版本整体还原任务 + 恢复后引用检查的一键回滚 API。 | • 新建：`src/dalton/migrations/versions/d05X_team_model_catalog.py`、`src/dalton/database/team_model_catalog.py`、`src/dalton/services/team_model_catalog/`<br>• Dalton 模块：`src/dalton/llm/{overlay.py,notional_pricing.py,antigravity_series.py}`、`src/dalton/autonomy/schedule.py`、`src/dalton/services/{native_admin.py,company_agent_writes.py}`、`src/dalton/{access_tiers.py,credentials.py,settings.py,capabilities.py}`、`src/dalton/budget/service.py`、`src/dalton/app/router.py`<br>• 带已登记 `DALTON-HOOK` 的上游模块：`src/llms/{llm.py,pricing_utils.py,task_costs.py}`、`src/utils/tracking/core.py`、`src/ptc_agent/agent/middleware/file_operations/multimodal_strip.py`、`src/server/services/llm/{byok.py,clients.py,custom_catalog.py,egress.py,service.py,provider_models/service.py}`、`src/server/services/automations/{file.py,lifecycle.py}`、`src/server/services/plugins/subagent_fanout.py`、`src/server/database/runs/{lifecycle.py,subagent_runs.py}`、`src/server/services/report_back/restart.py`、`src/server/app/{setup.py,api_keys.py}`、`scripts/dalton/check_hooks.sh` | 1) **双固定端口多进程与三认证模式验收**：在 `8001` 与 `8002` 验证 `X-Dalton-Catalog-Revision` 即时跃升、Redis 断连兜底与旧 `expected_revision` `409`；分别验证 `local`、`supabase` 与 `oss`（回环试用本机所有者为 `admin`）的权限准入；<br>2) **回合中途改价、跨镜像恢复与旧运行补写验收**：验证在途回合中途改价/退役按启动快照结算；模拟镜像静态清单变更及同地址更换变体凭据后由 `restart.py` 恢复回合，断言沿用快照费率并因 `key_fingerprint` 变化终止旧绑定调用；验证无快照旧运行自动补写快照后恢复/结算；<br>3) **解析后地址拦截与全路径 Fake-IP 出站验收**：验证个人模型通过持有人已存 `base_url` 间接落到目录变体 `bound_base_url` 时在保存与调用均返回 `400`；断言全部 5 条路径零继承 `env_key` 或持有人密钥；验证 Fake-IP DoH 真实公网 IP 直连与 `HeldTransport` 阻断内网/`http`/`302`；<br>4) **计费与名义价格唯一键验收**：用本地假端点与记账函数断言现金与订阅名义计费精确，同 `(provider, model_id)` 异价返回 `400 ambiguous_notional_pricing`；<br>5) **最外层退役锁、连续替换链回滚与原生导入容错**：验证 `schedule.py`、`file.py`、`company_agent_writes.py`、`subagent_fanout.py` 最外层锁与退役并发无死锁；验证连续两次目录替换 `A → B → C` 回滚至初始目标版本时一步整体还原为 `A`（有用户修改的保持不动）；验证只改路径 `/v1 → /v2` 后回滚旧地址缺匹配凭据返回 `409 variant_credential_required`；验证曾使用旧文件的部署在文件截断/缺失时暂停同步新增模型、仅放行出厂非已知退役模型、普通恢复只读遗产键返回 `409` 及修复后正常退出 `failed`；`test_core_capabilities_gate.py` 与 `check_hooks.sh --strict --audit` 全绿。 |
 | **Batch 2：管理网页界面、手机端适配与选择器/首次引导全入口联动** | 1) 交付 `TeamModelCatalogCard`、5 分组编辑抽屉（同提供商复制默认值、变体只写凭据录入、「测试调用」诊断、恢复出厂默认）、退役批量替换弹窗、版本历史与回滚弹窗（支持回滚旧地址补填凭据）及原生文件导入异常修复弹窗；<br>2) 在 `useModels.ts` 与 `useTeamModelsAvailable.ts` 接入 `refetchInterval: 5 * 60_000` 定时主动刷新与 `X-Dalton-Catalog-Revision` 响应头即时失效；<br>3) 打通服务端同版本过滤的 `dalton_setup_candidates` / `dalton_curated_providers` 与前端 `useSetupFacts.ts`、`setupSteps.ts`、`daltonTeamModelsCheck.ts`、`defaultChoices.ts`、`daltonSetup.ts` 全入口联动；<br>4) 完成 `< 768px` 手机端卡片流与吸底全屏抽屉适配。 | `web/src/pages/Settings/panels/dalton/{DaltonTeamModelsPanel.tsx,TeamModelCatalogCard.tsx,TeamModelEditSheet.tsx,TeamModelHistoryDialog.tsx}`、`web/src/pages/Settings/sections.ts`、`web/src/config/daltonSetup.ts`、`web/src/pages/Setup/answers/{useSetupFacts.ts,setupSteps.ts,useTeamModelsAvailable.ts,daltonTeamModelsCheck.ts,defaultChoices.ts}`、`web/src/hooks/useModels.ts`、`web/src/locales/{zh-CN,en-US}.json` | 1) **端到端与前台空闲会话刷新（Playwright）**：管理员保存新模型后当前页立即可选；保持另一成员页面**始终停留在前台且零交互**，使用可控时钟断言其在 5 分钟 `refetchInterval` 上限内主动发请求拿到新目录；<br>2) **首次引导全入口验收**：隐藏或退役默认精选模型后，断言 `/setup/model` 准入与 `/setup/default` 推荐同步剔除，精选全空时 Everflow 与 Core 分别按契约兜底；<br>3) **双形态与手机端验收**：Core 零 `*-oauth` 露出，`375x812` 视口无溢出遮挡。 |
 | **Batch 3：价格来源徽标展示与定时第三方价格检查提醒** | 1) 启用 `dalton_model_price_alerts` 与 OpenRouter（主）/ LiteLLM（备）24 小时比对协程、手动点检接口；<br>2) 实现双向渠道可证性分类（`exact_route` vs `reference_only`）、五条件（含 `base_catalog_revision` 与 `model_id`）同事务原子确认及离线静默容错；<br>3) 在 `TeamModelCatalogCard` 顶部接入价格提醒横幅，并在模型浮窗与预算卡片展示 `官方 / 估算 / 第三方` 徽标。 | `src/dalton/services/team_model_catalog/price_watch.py`、`src/dalton/database/team_model_catalog.py`、`web/src/pages/Settings/panels/dalton/{PriceAlertsBanner.tsx,DaltonBudgetCard.tsx}` | 1) **双向渠道分类验收**：验证 OpenRouter 非直连项、区域变体与 Coding Plan 均归为 `reference_only`；<br>2) **五条件原子确认与离线容错**：验证模型改绑新 `model_id` 或期间已改价时确认旧提醒返回 `409 stale_price_alert`；断网拉取失败时线上费率不变、启动与对话零受阻。 |
 
@@ -534,10 +548,10 @@ sequenceDiagram
 | 编号 | 定案主题 | 最终定案内容 |
 |---|---|---|
 | **定案 1** | **`GLM 5.4` 接入与静态基线关系** | `GLM 5.4` 由独立静态配置 PR 并行接入 `native_overlay.json`；`native_overlay.json` 保留为出厂默认基线，数据库仅存团队增量，升级遇到同名模型时同步保留模型参数、现金价格卡与 `dalton_meta`。 |
-| **定案 2** | **目录变体凭据隔离、个人同名禁借道与全路径 Fake-IP 出站守卫** | 目录新增变体必须录入绑定至授权 `bound_base_url` 的专属只写凭据，剥离父组 `env_key`，排除出 `is_operator_endpoint`、`DALTON_OPERATOR_LLM_ENDPOINTS` 与 #485 `manifest_base_url`，`key_fits` 不放行持有人密钥，成员个人 `custom_models` 指向目录变体或其地址一律拒绝；在全部 5 条客户端构造与发送路径双重校验，两种安装形态统一按 `network.fake_ip_cidrs` 自动执行 Fake-IP DoH 真实公网 IP 直连（保留原主机名做 TLS 校验）或 `HeldTransport` 公网单播校验，固定 `follow_redirects=False`；改址使旧绑定失效，在途旧调用以明确错误终止。 |
-| **定案 3** | **退役引用分类、插件锁纳入与事务批量替换** | 磁盘配置与内置插件 `.md` 引用硬阻止退役；数据库表引用（`automations`、`user_subagents`、`plugin_subagents` 及可选 `user_preferences` 默认槽位）以及插件安装/升级（`subagent_fanout.py`）与目录退役按固定顺序共用同一目录咨询锁，在锁内验证实际生效模型、按所有者校验继任模型并调和 `reasoning_effort`，记录带 `config_version` / `updated_at` 的 `side_effects`。 |
-| **定案 4** | **`NativeModelsCard` 同批收口、导入顺序与损坏保护** | Batch 1 同批切换读写与导入：先在事务内提交数据与 `'imported'` 完成标记，再执行可重试文件归档；校验失败或损坏时对话继续、保留旧文件/上次记录作只读退役来源持续拦截已下线模型，原生同步写与恢复返回 `503`，通过 `retry_import` 或 `abandon_legacy_file` 显式离开 `'failed'`。 |
-| **定案 5** | **PostgreSQL 版本真相、跨部署回合快照与安全回滚** | 新请求向 PostgreSQL 确认 `revision` 并复用只读派生缓存，前端配置 5 分钟 `refetchInterval` 主动刷新与响应头版本比对；回合启动随运行记录持久化 `effective_catalog_snapshot`，跨部署恢复回合与子智能体沿用该快照；名义费率以 `(pricing_provider, norm_id(pricing_model_id))` 为唯一键并拒绝歧义；回滚依次校验变体凭据（缺匹配凭据则拒绝或同事务补填）、按 `config_version` CAS 恢复关联任务、基于恢复后状态做引用检查后提交。 |
+| **定案 2** | **目录变体凭据隔离、解析后地址禁借道与全路径 Fake-IP 出站守卫** | 目录新增变体必须录入绑定至完整 `bound_base_url`（`canonical_url_key`）的专属只写凭据，剥离父组 `env_key`，排除出 `is_operator_endpoint`、`DALTON_OPERATOR_LLM_ENDPOINTS` 与 #485 `manifest_base_url`，`key_fits` 不放行持有人密钥，成员个人 `custom_models` 按解析后的提供商与地址（含继承的持有人 `base_url`）检查，凡落在目录变体 `bound_base_url` 上一律拒绝；在全部 5 条客户端构造与发送路径双重校验，两种安装形态统一按 `network.fake_ip_cidrs` 自动执行 Fake-IP DoH 真实公网 IP 直连（保留原主机名做 TLS 校验）或 `HeldTransport` 公网单播校验，固定 `follow_redirects=False`；改址或换凭据使旧绑定失效，在途及恢复调用比对快照中的 `(bound_base_url, key_fingerprint)` 后以明确错误终止。 |
+| **定案 3** | **退役引用分类、最外层锁顺序与事务批量替换** | 磁盘配置与内置插件 `.md` 引用硬阻止退役；数据库表引用以及 `schedule.py` `user_automations_lock`、`file.py`、`company_agent_writes.py`、`lifecycle.py`、`user_subagents.py`、`subagent_fanout.py` 统一在最外层（覆盖单元锁与用户任务/覆盖锁之前）加目录共享咨询锁并在锁内验证生效模型，与退役排他锁严格同序；批量替换按所有者校验继任模型并调和 `reasoning_effort`，记录带 `(before_config_version, after_config_version)` / `(before_updated_at, after_updated_at)` 的 `side_effects`。 |
+| **定案 4** | **`NativeModelsCard` 同批收口、历史识别与只读遗产退役锁定** | Batch 1 同批切换读写与导入：先在事务内提交数据与 `'imported'` 完成标记，再执行可重试文件归档，`not_applicable` 仅在确认从未使用旧文件时提交；曾使用旧目录文件的部署在退役名单无法确认时暂停同步新增模型，仅允许调用出厂可用且不在任何已知退役记录里的模型，普通「恢复」对只读遗产退役集返回 `409` 保持下线，只有 `retry_import` 成功或 `abandon_legacy_file` 后才可恢复。 |
+| **定案 5** | **三模式管理权限、跨部署快照（含旧运行补写）与连续替换链整体回滚** | `local`、`supabase` 与 `oss`（回环试用本机所有者视为管理员）前后端共用同一管理权限规则；新请求向 PostgreSQL 确认 `revision` 并复用只读派生缓存，前端配置 5 分钟 `refetchInterval` 主动刷新；回合启动持久化含 `(bound_base_url, key_fingerprint)` 的 `effective_catalog_snapshot`，首次发布前的旧运行补写快照后恢复/结算；名义费率以 `(pricing_provider, norm_id(pricing_model_id))` 为唯一键；回滚先用完整 `base_url` 的 `canonical_url_key` / `endpoint_matches_prefix` 校验凭据，再沿替换记录链将无用户修改的任务一步整体还原至目标版本配置，最后基于恢复后状态做引用检查提交。 |
 | **定案 6** | **第三方价格检查机制** | 双形态统一读取 `DaltonConfig` 默认开启每 24 小时比对 OpenRouter 与 LiteLLM，诚实标注为 `third_party`，双向可证渠道方归为 `exact_route`、其余归为 `reference_only`，确认更新时五条件核对（含 `base_catalog_revision` 与 `model_id`）同事务生效，断网失败保持原价。 |
 
 ---
