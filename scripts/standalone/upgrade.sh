@@ -885,17 +885,22 @@ STOPPED_SERVICES=("${STOP_BEFORE_MIGRATE_SERVICES[@]}")
 ok "Stopped services before migrate: ${STOPPED_SERVICES[*]}."
 
 MIGRATE_DRAIN_TIMEOUT_S="${DALTON_MIGRATE_DRAIN_TIMEOUT_S:-30}"
+if [[ ! "$MIGRATE_DRAIN_TIMEOUT_S" =~ ^[0-9]+$ || "$MIGRATE_DRAIN_TIMEOUT_S" -lt 1 ]]; then
+  MIGRATE_DRAIN_TIMEOUT_S=30
+fi
 info "Waiting up to ${MIGRATE_DRAIN_TIMEOUT_S}s for database connections to drain..."
 db_drained=0
+active_conns=""
 for _ in $(seq 1 "$MIGRATE_DRAIN_TIMEOUT_S"); do
   active_conns="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND state IS NOT NULL;" 2>/dev/null | tr -d '[:space:]' || true)"
   if [[ "$active_conns" == "0" ]]; then
     db_drained=1
     break
   fi
-  if [[ -z "$active_conns" ]]; then
-    # The count could not be read (postgres not reachable this way); waiting longer
-    # cannot change that, so go on and let migrate report any real problem.
+  if [[ ! "$active_conns" =~ ^[0-9]+$ ]]; then
+    # The count could not be read as a non-negative integer (postgres not reachable
+    # this way or unexpected psql output); waiting longer cannot change that, so go
+    # on and let migrate report any real problem.
     break
   fi
   sleep 1

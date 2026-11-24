@@ -2235,7 +2235,10 @@ class TestSandboxNetworkAndInitScript:
         # upgrade.sh rollback hint:
         #   - failure strictly before migrate runs -> restore files & images only (do NOT wipe volumes)
         #   - changed versions                     -> point to manual §6.2 steps (`docker volume ls --filter ...` + `docker compose -p ... down -v`)
-        #   - unchanged OR unreadable versions after migrate started -> UNCERTAIN (prompt manual check first)
+        #   - unchanged versions & upstream already at new release's upstream head (pure transactional Dalton migration, §6.3)
+        #                                          -> automatically restore pre-upgrade files, image tags, and restart stopped services (`rolled_back`)
+        #   - unchanged (without confirmed upstream head) OR unreadable versions after migrate started
+        #                                          -> UNCERTAIN (prompt manual check first)
         for scenario, psql_behavior, migrate_body, build_body, extra_upg_flags, expected_mode in (
             (
                 "fail-before-migrate",
@@ -2252,6 +2255,14 @@ class TestSandboxNetworkAndInitScript:
                 "exit 0",
                 ["--skip-build"],
                 "unknown",
+            ),
+            (
+                "fail-versions-unchanged-pure-dalton",
+                'echo "rev1"; exit 0',
+                'echo "[migrate] transactional d049 rolled back" >&2; exit 1',
+                "exit 0",
+                ["--skip-build"],
+                "rolled_back",
             ),
             (
                 "fail-versions-changed",
@@ -2284,6 +2295,14 @@ class TestSandboxNetworkAndInitScript:
                 fake_bin,
             ):
                 d.mkdir(parents=True, exist_ok=True)
+            if expected_mode == "rolled_back":
+                (urel / "migrations/versions").mkdir(parents=True, exist_ok=True)
+                (urel / "migrations/versions/rev1_head.py").write_text(
+                    'revision = "rev1"\ndown_revision = None\n',
+                    encoding="utf-8",
+                )
+                (uwork / "release_marker.txt").write_text("before-v1\n", encoding="utf-8")
+                (urel / "release_marker.txt").write_text("after-v2\n", encoding="utf-8")
             for target_dir in (uwork, urel):
                 for req in (
                     "docker-compose.yml",
@@ -2306,9 +2325,11 @@ class TestSandboxNetworkAndInitScript:
             (uwork / "scripts/standalone/backup.sh").write_text(backup_stub_script, encoding="utf-8")
             (urel / "scripts/standalone/backup.sh").write_text(backup_stub_script, encoding="utf-8")
             seen_migrate_env = sc_root / "seen_migrate.txt"
+            docker_trace = sc_root / "docker.trace"
             docker_stub = fake_bin / "docker"
             docker_stub.write_text(
                 "#!/usr/bin/env bash\n"
+                f'printf "%s\\n" "$*" >> "{docker_trace}"\n'
                 'if [[ "$*" == *" images -q "* ]]; then echo "img123"; exit 0; fi\n'
                 'if [[ "$1" == "tag" ]]; then exit 0; fi\n'
                 f'if [[ "$*" == *" build "* ]]; then {build_body}; fi\n'
@@ -2358,6 +2379,17 @@ class TestSandboxNetworkAndInitScript:
                 )
                 assert "docker volume ls --filter label=com.docker.compose.project=upg-proj-from-file" in res_sc.stderr, (
                     f"{scenario}: expected full volume list command before down -v, got:\n{res_sc.stderr}"
+                )
+            elif expected_mode == "rolled_back":
+                assert "ALREADY restored the pre-upgrade release files" in res_sc.stderr, (
+                    f"{scenario}: expected §6.3 auto-recovery rolled_back guide, got:\n{res_sc.stderr}"
+                )
+                assert "rolled back automatically" in res_sc.stderr
+                assert "no data restore required" in res_sc.stderr
+                assert (uwork / "release_marker.txt").read_text(encoding="utf-8").strip() == "before-v1"
+                trace_text = docker_trace.read_text(encoding="utf-8")
+                assert " up -d backend crawler" in trace_text, (
+                    f"{scenario}: expected stopped services to be restarted on rolled_back:\n{trace_text}"
                 )
             elif expected_mode == "unknown":
                 assert "UNCERTAIN" in res_sc.stderr and "Do NOT assume migrations already ran" in res_sc.stderr, (
