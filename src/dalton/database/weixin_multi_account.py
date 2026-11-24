@@ -314,6 +314,8 @@ async def acquire_gateway_lease(
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
+                if _before_lease_update_hook is not None:
+                    await _before_lease_update_hook()
                 await cur.execute(
                     """
                     SELECT instance_id, epoch, acquired_at, expires_at,
@@ -361,8 +363,6 @@ async def acquire_gateway_lease(
                 cur_epoch = int(row["epoch"])
 
                 if holder_id == cleaned_id and expires_at > db_now:
-                    if _before_lease_update_hook is not None:
-                        await _before_lease_update_hook()
                     await cur.execute(
                         """
                         UPDATE dalton_channel_gateway_lease
@@ -381,8 +381,6 @@ async def acquire_gateway_lease(
                     }
 
                 if expires_at <= db_now:
-                    if _before_lease_update_hook is not None:
-                        await _before_lease_update_hook()
                     await cur.execute(
                         """
                         UPDATE dalton_channel_gateway_lease
@@ -1207,20 +1205,62 @@ async def upsert_weixin_account_context_token_in_tx(
         ON CONFLICT (account_id, bot_generation, platform_user_id) DO UPDATE SET
             ilink_bot_id = EXCLUDED.ilink_bot_id,
             encrypted_context_token = EXCLUDED.encrypted_context_token,
-            seq = EXCLUDED.seq,
+            seq = CASE
+                WHEN EXCLUDED.seq_source = 'receive' THEN
+                    CASE
+                        WHEN dalton_channel_weixin_account_tokens.seq_source = 'receive'
+                        THEN dalton_channel_weixin_account_tokens.seq + 1
+                        ELSE 1
+                    END
+                ELSE EXCLUDED.seq
+            END,
             seq_source = EXCLUDED.seq_source,
             protocol_seq_high = GREATEST(
                 dalton_channel_weixin_account_tokens.protocol_seq_high,
+                CASE
+                    WHEN dalton_channel_weixin_account_tokens.seq_source = 'protocol'
+                    THEN dalton_channel_weixin_account_tokens.seq
+                    ELSE 0
+                END,
                 EXCLUDED.protocol_seq_high
             ),
             platform_time_high = GREATEST(
                 dalton_channel_weixin_account_tokens.platform_time_high,
+                CASE
+                    WHEN dalton_channel_weixin_account_tokens.seq_source = 'platform_time'
+                    THEN dalton_channel_weixin_account_tokens.seq
+                    ELSE 0
+                END,
                 EXCLUDED.platform_time_high
             ),
             token_version = dalton_channel_weixin_account_tokens.token_version + 1,
             stale_at = NULL,
             stale_reason = NULL,
             updated_at = NOW()
+        WHERE
+            EXCLUDED.seq_source = 'receive'
+            OR (
+                EXCLUDED.seq_source = 'protocol'
+                AND EXCLUDED.seq >= GREATEST(
+                    dalton_channel_weixin_account_tokens.protocol_seq_high,
+                    CASE
+                        WHEN dalton_channel_weixin_account_tokens.seq_source = 'protocol'
+                        THEN dalton_channel_weixin_account_tokens.seq
+                        ELSE 0
+                    END
+                )
+            )
+            OR (
+                EXCLUDED.seq_source = 'platform_time'
+                AND EXCLUDED.seq >= GREATEST(
+                    dalton_channel_weixin_account_tokens.platform_time_high,
+                    CASE
+                        WHEN dalton_channel_weixin_account_tokens.seq_source = 'platform_time'
+                        THEN dalton_channel_weixin_account_tokens.seq
+                        ELSE 0
+                    END
+                )
+            )
         RETURNING seq, token_version
         """,
         (
@@ -1238,8 +1278,25 @@ async def upsert_weixin_account_context_token_in_tx(
         ),
     )
     stored = await cur.fetchone()
-    stored_seq = int(stored["seq"]) if stored else eff_seq
-    stored_ver = int(stored["token_version"]) if stored else next_ver
+    if stored is None:
+        await cur.execute(
+            """
+            SELECT seq, token_version
+            FROM dalton_channel_weixin_account_tokens
+            WHERE account_id = %s::uuid
+              AND bot_generation = %s
+              AND platform_user_id = %s
+            """,
+            (norm_aid, int(bot_generation), cleaned_puid),
+        )
+        cur_row = await cur.fetchone()
+        return (
+            False,
+            int(cur_row["seq"]) if cur_row else 0,
+            int(cur_row["token_version"]) if cur_row else 0,
+        )
+    stored_seq = int(stored["seq"])
+    stored_ver = int(stored["token_version"])
 
     await cur.execute(
         """
@@ -1323,30 +1380,33 @@ async def reevaluate_weixin_accounts(
 
     async def _attempt(attempt_conn: Any) -> dict[str, Any]:
         max_slots = get_weixin_max_concurrent_accounts()
-        # Phase 1: unlocked discovery of candidate accounts & their live roster/tier
+        # Phase 1: unlocked discovery of candidate accounts & their live roster/tier.
+        # Wrap Phase-1 reads in short committed transactions so non-autocommit
+        # connections return to IDLE before Phase 2's top-level transaction.
         async with get_db_connection(attempt_conn) as owned_conn:
-            async with owned_conn.cursor(row_factory=dict_row) as cur:
-                if target_user_ids:
-                    await cur.execute(
-                        """
-                        SELECT account_id::text AS account_id, user_id, ilink_bot_id,
-                               ilink_user_id, prev_ilink_user_id, status, prev_status, disabled_reason
-                        FROM dalton_channel_weixin_accounts
-                        WHERE user_id = ANY(%s)
-                        ORDER BY account_id ASC
-                        """,
-                        (list(target_user_ids),),
-                    )
-                else:
-                    await cur.execute(
-                        """
-                        SELECT account_id::text AS account_id, user_id, ilink_bot_id,
-                               ilink_user_id, prev_ilink_user_id, status, prev_status, disabled_reason
-                        FROM dalton_channel_weixin_accounts
-                        ORDER BY account_id ASC
-                        """
-                    )
-                discovered = [dict(r) for r in await cur.fetchall()]
+            async with owned_conn.transaction():
+                async with owned_conn.cursor(row_factory=dict_row) as cur:
+                    if target_user_ids:
+                        await cur.execute(
+                            """
+                            SELECT account_id::text AS account_id, user_id, ilink_bot_id,
+                                   ilink_user_id, prev_ilink_user_id, status, prev_status, disabled_reason
+                            FROM dalton_channel_weixin_accounts
+                            WHERE user_id = ANY(%s)
+                            ORDER BY account_id ASC
+                            """,
+                            (list(target_user_ids),),
+                        )
+                    else:
+                        await cur.execute(
+                            """
+                            SELECT account_id::text AS account_id, user_id, ilink_bot_id,
+                                   ilink_user_id, prev_ilink_user_id, status, prev_status, disabled_reason
+                            FROM dalton_channel_weixin_accounts
+                            ORDER BY account_id ASC
+                            """
+                        )
+                    discovered = [dict(r) for r in await cur.fetchall()]
 
             if _after_discovery_hook is not None:
                 await _after_discovery_hook()
@@ -1355,14 +1415,15 @@ async def reevaluate_weixin_accounts(
             live_status: dict[str, str] = {}
             live_tier: dict[str, str] = {}
             lookup_error_count = 0
-            for acc in discovered:
-                uid = str(acc["user_id"])
-                st = await check_team_member_status_live(uid, conn=owned_conn)
-                live_status[uid] = st
-                if st == "lookup_error":
-                    lookup_error_count += 1
-                elif st == "active":
-                    live_tier[uid] = await get_user_tier(uid, conn=owned_conn)
+            async with owned_conn.transaction():
+                for acc in discovered:
+                    uid = str(acc["user_id"])
+                    st = await check_team_member_status_live(uid, conn=owned_conn)
+                    live_status[uid] = st
+                    if st == "lookup_error":
+                        lookup_error_count += 1
+                    elif st == "active":
+                        live_tier[uid] = await get_user_tier(uid, conn=owned_conn)
 
             # §4.2: If ANY member encounters lookup_error during a reconcile round,
             # abort the ENTIRE round without modifying any account status or accounts_revision.
@@ -1388,8 +1449,9 @@ async def reevaluate_weixin_accounts(
                         }
 
             # Determine which accounts actually need mutation
-            async with owned_conn.cursor(row_factory=dict_row) as cur:
-                cfg_peek = await ensure_and_lock_weixin_config_in_tx(cur, for_update=False)
+            async with owned_conn.transaction():
+                async with owned_conn.cursor(row_factory=dict_row) as cur:
+                    cfg_peek = await ensure_and_lock_weixin_config_in_tx(cur, for_update=False)
 
             mutations: list[tuple[dict[str, Any], str]] = []
             for acc in discovered:
@@ -1866,84 +1928,85 @@ async def get_weixin_account_detail(
 
     enc_key = get_encryption_key()
     async with get_db_connection(conn) as owned_conn:
-        async with owned_conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                SELECT account_id::text AS account_id,
-                       user_id,
-                       ilink_bot_id,
-                       ilink_user_id,
-                       prev_ilink_user_id,
-                       ilink_username,
-                       pgp_sym_decrypt(encrypted_bot_token, %s) AS bot_token,
-                       base_url,
-                       cdn_base_url,
-                       get_updates_buf,
-                       bot_generation,
-                       status,
-                       last_inbound_at,
-                       updated_at
-                FROM dalton_channel_weixin_accounts
-                WHERE account_id = %s::uuid
-                """,
-                (enc_key, norm_aid),
-            )
-            row = await cur.fetchone()
-            if row is None:
-                raise HTTPException(status_code=404, detail="Weixin account not found")
-
-            target_puid = (
-                str(recipient_platform_user_id or "").strip()
-                or str(row.get("ilink_user_id") or "").strip()
-            )
-            ctx_tok: str | None = None
-            ctx_ver: int | None = None
-            if target_puid:
-                ctx_tok, ctx_ver, _stale = (
-                    await resolve_weixin_account_context_token_in_tx(
-                        cur,
-                        account_id=norm_aid,
-                        bot_generation=int(row["bot_generation"]),
-                        platform_user_id=target_puid,
-                        enc_key=enc_key,
-                    )
-                )
-            elif inbound_message_id:
+        async with owned_conn.transaction():
+            async with owned_conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
                     """
-                    SELECT pgp_sym_decrypt(encrypted_weixin_context_token, %s) AS ctx
-                    FROM dalton_channel_inbound_events
-                    WHERE platform = 'weixin'
-                      AND message_id = %s
-                      AND weixin_account_id = %s::uuid
-                      AND weixin_context_bot_generation = %s
-                      AND encrypted_weixin_context_token IS NOT NULL
+                    SELECT account_id::text AS account_id,
+                           user_id,
+                           ilink_bot_id,
+                           ilink_user_id,
+                           prev_ilink_user_id,
+                           ilink_username,
+                           pgp_sym_decrypt(encrypted_bot_token, %s) AS bot_token,
+                           base_url,
+                           cdn_base_url,
+                           get_updates_buf,
+                           bot_generation,
+                           status,
+                           last_inbound_at,
+                           updated_at
+                    FROM dalton_channel_weixin_accounts
+                    WHERE account_id = %s::uuid
                     """,
-                    (
-                        enc_key,
-                        str(inbound_message_id).strip(),
-                        norm_aid,
-                        int(row["bot_generation"]),
-                    ),
+                    (enc_key, norm_aid),
                 )
-                in_row = await cur.fetchone()
-                if in_row and in_row.get("ctx"):
-                    ctx_tok = str(in_row["ctx"]).strip() or None
+                row = await cur.fetchone()
+                if row is None:
+                    raise HTTPException(status_code=404, detail="Weixin account not found")
 
-            return {
-                "account_id": str(row["account_id"]),
-                "user_id": str(row["user_id"]),
-                "ilink_bot_id": str(row["ilink_bot_id"]),
-                "ilink_user_id": row.get("ilink_user_id"),
-                "ilink_username": row.get("ilink_username"),
-                "bot_token": str(row["bot_token"]),
-                "base_url": str(row["base_url"]),
-                "cdn_base_url": str(row["cdn_base_url"]),
-                "bot_generation": int(row["bot_generation"]),
-                "status": str(row["status"]),
-                "weixin_context_token": ctx_tok,
-                "weixin_context_token_version": ctx_ver,
-            }
+                target_puid = (
+                    str(recipient_platform_user_id or "").strip()
+                    or str(row.get("ilink_user_id") or "").strip()
+                )
+                ctx_tok: str | None = None
+                ctx_ver: int | None = None
+                if target_puid:
+                    ctx_tok, ctx_ver, _stale = (
+                        await resolve_weixin_account_context_token_in_tx(
+                            cur,
+                            account_id=norm_aid,
+                            bot_generation=int(row["bot_generation"]),
+                            platform_user_id=target_puid,
+                            enc_key=enc_key,
+                        )
+                    )
+                elif inbound_message_id:
+                    await cur.execute(
+                        """
+                        SELECT pgp_sym_decrypt(encrypted_weixin_context_token, %s) AS ctx
+                        FROM dalton_channel_inbound_events
+                        WHERE platform = 'weixin'
+                          AND message_id = %s
+                          AND weixin_account_id = %s::uuid
+                          AND weixin_context_bot_generation = %s
+                          AND encrypted_weixin_context_token IS NOT NULL
+                        """,
+                        (
+                            enc_key,
+                            str(inbound_message_id).strip(),
+                            norm_aid,
+                            int(row["bot_generation"]),
+                        ),
+                    )
+                    in_row = await cur.fetchone()
+                    if in_row and in_row.get("ctx"):
+                        ctx_tok = str(in_row["ctx"]).strip() or None
+
+                return {
+                    "account_id": str(row["account_id"]),
+                    "user_id": str(row["user_id"]),
+                    "ilink_bot_id": str(row["ilink_bot_id"]),
+                    "ilink_user_id": row.get("ilink_user_id"),
+                    "ilink_username": row.get("ilink_username"),
+                    "bot_token": str(row["bot_token"]),
+                    "base_url": str(row["base_url"]),
+                    "cdn_base_url": str(row["cdn_base_url"]),
+                    "bot_generation": int(row["bot_generation"]),
+                    "status": str(row["status"]),
+                    "weixin_context_token": ctx_tok,
+                    "weixin_context_token_version": ctx_ver,
+                }
 
 
 async def update_weixin_account_cursor(
@@ -2224,7 +2287,21 @@ async def start_weixin_login_session(
         raise HTTPException(status_code=400, detail="user_id is required")
     reject_company_system_auth(cleaned_uid)
 
-    member_status = await check_team_member_status_live(cleaned_uid, conn=conn)
+    if conn is not None:
+        async with conn.transaction():
+            member_status = await check_team_member_status_live(cleaned_uid, conn=conn)
+            user_tier = (
+                await get_user_tier(cleaned_uid, conn=conn)
+                if member_status == "active"
+                else "external"
+            )
+    else:
+        member_status = await check_team_member_status_live(cleaned_uid, conn=None)
+        user_tier = (
+            await get_user_tier(cleaned_uid, conn=None)
+            if member_status == "active"
+            else "external"
+        )
     if member_status == "lookup_error":
         raise HTTPException(
             status_code=503,
@@ -2235,7 +2312,6 @@ async def start_weixin_login_session(
             status_code=403,
             detail={"code": "member_not_in_roster", "message": "当前账号不在团队成员名册中"},
         )
-    user_tier = await get_user_tier(cleaned_uid, conn=conn)
     max_slots = get_weixin_max_concurrent_accounts()
 
     async def _attempt(attempt_conn: Any) -> dict[str, Any]:
@@ -2571,32 +2647,34 @@ async def _patch_login_session_save_qr(
 
     async def _attempt(attempt_conn: Any) -> dict[str, Any]:
         async with get_db_connection(attempt_conn) as owned_conn:
-            # Unlocked peek for user_id so Level 1 precedes Level 4
-            async with owned_conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    "SELECT user_id FROM dalton_channel_weixin_login_sessions WHERE session_key = %s",
-                    (session_key,),
-                )
-                peek = await cur.fetchone()
-                if peek is None:
+            # Phase 1: short read transaction so non-autocommit connections return to IDLE
+            # before Phase 2 acquires Level 0b/1/4 locks in a real top-level transaction.
+            async with owned_conn.transaction():
+                async with owned_conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        "SELECT user_id FROM dalton_channel_weixin_login_sessions WHERE session_key = %s",
+                        (session_key,),
+                    )
+                    peek = await cur.fetchone()
+                    if peek is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={"code": LOGIN_SESSION_REVOKED_CODE, "message": "扫码会话已撤销或不存在"},
+                        )
+                    owner_uid = str(peek["user_id"])
+
+                member_status = await check_team_member_status_live(owner_uid, conn=owned_conn)
+                if member_status == "lookup_error":
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "roster_lookup_error", "message": "成员名册查询异常"},
+                    )
+                if member_status != "active":
                     raise HTTPException(
                         status_code=409,
-                        detail={"code": LOGIN_SESSION_REVOKED_CODE, "message": "扫码会话已撤销或不存在"},
+                        detail={"code": LOGIN_SESSION_REVOKED_CODE, "message": "成员资格已失效，扫码会话已撤销"},
                     )
-                owner_uid = str(peek["user_id"])
-
-            member_status = await check_team_member_status_live(owner_uid, conn=owned_conn)
-            if member_status == "lookup_error":
-                raise HTTPException(
-                    status_code=503,
-                    detail={"code": "roster_lookup_error", "message": "成员名册查询异常"},
-                )
-            if member_status != "active":
-                raise HTTPException(
-                    status_code=409,
-                    detail={"code": LOGIN_SESSION_REVOKED_CODE, "message": "成员资格已失效，扫码会话已撤销"},
-                )
-            user_tier = await get_user_tier(owner_uid, conn=owned_conn)
+                user_tier = await get_user_tier(owner_uid, conn=owned_conn)
 
             async with owned_conn.transaction():
                 async with owned_conn.cursor(row_factory=dict_row) as cur:
@@ -2773,55 +2851,58 @@ async def _patch_login_session_confirm(
 
     async def _attempt(attempt_conn: Any) -> dict[str, Any]:
         async with get_db_connection(attempt_conn) as owned_conn:
-            # Phase 1: unlocked discovery of affected users & accounts
-            async with owned_conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    SELECT session_key, user_id, target_account_id::text AS target_account_id,
-                           login_version, expected_bot_generation, status
-                    FROM dalton_channel_weixin_login_sessions
-                    WHERE session_key = %s
-                    """,
-                    (session_key,),
-                )
-                sess_peek = await cur.fetchone()
-                if sess_peek is None:
-                    raise HTTPException(
-                        status_code=409,
-                        detail={"code": LOGIN_SESSION_REVOKED_CODE, "message": "扫码会话已撤销或不存在"},
+            # Phase 1: short read transaction so non-autocommit connections return to IDLE
+            # before hooks and before Phase 2's top-level transaction.
+            async with owned_conn.transaction():
+                async with owned_conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        """
+                        SELECT session_key, user_id, target_account_id::text AS target_account_id,
+                               login_version, expected_bot_generation, status
+                        FROM dalton_channel_weixin_login_sessions
+                        WHERE session_key = %s
+                        """,
+                        (session_key,),
                     )
-                owner_uid = str(sess_peek["user_id"])
-                reject_company_system_auth(owner_uid)
+                    sess_peek = await cur.fetchone()
+                    if sess_peek is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={"code": LOGIN_SESSION_REVOKED_CODE, "message": "扫码会话已撤销或不存在"},
+                        )
+                    owner_uid = str(sess_peek["user_id"])
+                    reject_company_system_auth(owner_uid)
 
-                await cur.execute(
-                    """
-                    SELECT account_id::text AS account_id, user_id, ilink_bot_id,
-                           ilink_user_id, prev_ilink_user_id
-                    FROM dalton_channel_weixin_accounts
-                    WHERE user_id = %s
-                       OR ilink_bot_id = %s
-                       OR (%s::text IS NOT NULL AND COALESCE(ilink_user_id, prev_ilink_user_id) = %s::text)
-                    """,
-                    (owner_uid, cleaned_bot, cleaned_wx_uid, cleaned_wx_uid),
-                )
-                discovered_accs = [dict(r) for r in await cur.fetchall()]
+                    await cur.execute(
+                        """
+                        SELECT account_id::text AS account_id, user_id, ilink_bot_id,
+                               ilink_user_id, prev_ilink_user_id
+                        FROM dalton_channel_weixin_accounts
+                        WHERE user_id = %s
+                           OR ilink_bot_id = %s
+                           OR (%s::text IS NOT NULL AND COALESCE(ilink_user_id, prev_ilink_user_id) = %s::text)
+                        """,
+                        (owner_uid, cleaned_bot, cleaned_wx_uid, cleaned_wx_uid),
+                    )
+                    discovered_accs = [dict(r) for r in await cur.fetchall()]
 
             if _after_discovery_hook is not None:
                 await _after_discovery_hook()
 
-            # Live roster + tier check before acquiring row locks
-            member_status = await check_team_member_status_live(owner_uid, conn=owned_conn)
-            if member_status == "lookup_error":
-                raise HTTPException(
-                    status_code=503,
-                    detail={"code": "roster_lookup_error", "message": "成员名册查询异常"},
-                )
-            if member_status != "active":
-                raise HTTPException(
-                    status_code=403,
-                    detail={"code": "member_not_in_roster", "message": "成员已不在团队名册中"},
-                )
-            user_tier = await get_user_tier(owner_uid, conn=owned_conn)
+            # Live roster + tier check in a short committed read transaction before Phase 2
+            async with owned_conn.transaction():
+                member_status = await check_team_member_status_live(owner_uid, conn=owned_conn)
+                if member_status == "lookup_error":
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "roster_lookup_error", "message": "成员名册查询异常"},
+                    )
+                if member_status != "active":
+                    raise HTTPException(
+                        status_code=403,
+                        detail={"code": "member_not_in_roster", "message": "成员已不在团队名册中"},
+                    )
+                user_tier = await get_user_tier(owner_uid, conn=owned_conn)
 
             discovered_uids = _sorted_unique_strs(
                 owner_uid, [r["user_id"] for r in discovered_accs]
@@ -3284,35 +3365,36 @@ async def unbind_weixin_account(
 
     async def _attempt(attempt_conn: Any) -> dict[str, Any]:
         async with get_db_connection(attempt_conn) as owned_conn:
-            # Phase 1: discover target user_id and account_id without row locks
-            async with owned_conn.cursor(row_factory=dict_row) as cur:
-                eff_uid = cleaned_uid
-                eff_aid = norm_aid
-                if eff_aid and not eff_uid:
-                    await cur.execute(
-                        "SELECT user_id FROM dalton_channel_weixin_accounts WHERE account_id = %s::uuid",
-                        (eff_aid,),
-                    )
-                    r = await cur.fetchone()
-                    if r is None:
+            # Phase 1: discover target user_id and account_id in a short read tx
+            async with owned_conn.transaction():
+                async with owned_conn.cursor(row_factory=dict_row) as cur:
+                    eff_uid = cleaned_uid
+                    eff_aid = norm_aid
+                    if eff_aid and not eff_uid:
+                        await cur.execute(
+                            "SELECT user_id FROM dalton_channel_weixin_accounts WHERE account_id = %s::uuid",
+                            (eff_aid,),
+                        )
+                        r = await cur.fetchone()
+                        if r is None:
+                            if via_wechat_command:
+                                return {"ok": False, "reason": "not_linked"}
+                            raise HTTPException(
+                                status_code=404, detail="Weixin account not found"
+                            )
+                        eff_uid = str(r["user_id"])
+                    elif eff_uid and not eff_aid:
+                        await cur.execute(
+                            "SELECT account_id::text AS account_id FROM dalton_channel_weixin_accounts WHERE user_id = %s",
+                            (eff_uid,),
+                        )
+                        r = await cur.fetchone()
+                        if r is not None:
+                            eff_aid = str(r["account_id"])
+                    if not eff_uid:
                         if via_wechat_command:
                             return {"ok": False, "reason": "not_linked"}
-                        raise HTTPException(
-                            status_code=404, detail="Weixin account not found"
-                        )
-                    eff_uid = str(r["user_id"])
-                elif eff_uid and not eff_aid:
-                    await cur.execute(
-                        "SELECT account_id::text AS account_id FROM dalton_channel_weixin_accounts WHERE user_id = %s",
-                        (eff_uid,),
-                    )
-                    r = await cur.fetchone()
-                    if r is not None:
-                        eff_aid = str(r["account_id"])
-                if not eff_uid:
-                    if via_wechat_command:
-                        return {"ok": False, "reason": "not_linked"}
-                    raise HTTPException(status_code=404, detail="Weixin account not found")
+                        raise HTTPException(status_code=404, detail="Weixin account not found")
 
             # Phase 2: strict lock order
             # Level 0b -> Level 1 -> Level 3a -> Level 3b -> Level 4 -> Level 6 -> Level 7 -> Level 8
@@ -3533,201 +3615,202 @@ async def get_weixin_admin_overview(*, conn: Any = None) -> dict[str, Any]:
     """``GET /api/v1/dalton/channels/weixin/admin/overview``."""
     max_slots = get_weixin_max_concurrent_accounts()
     async with get_db_connection(conn) as owned_conn:
-        async with owned_conn.cursor(row_factory=dict_row) as cur:
-            cfg = await ensure_and_lock_weixin_config_in_tx(cur, for_update=False)
-            db_allow_ext = cfg.get("allow_external")
-            eff_allow_ext = (
-                bool(db_allow_ext)
-                if db_allow_ext is not None
-                else bool(get_dalton_config().weixin.allow_external)
-            )
-            await cur.execute(
-                """
-                SELECT instance_id, epoch, acquired_at, expires_at,
-                       (expires_at > clock_timestamp()) AS active
-                FROM dalton_channel_gateway_lease
-                WHERE singleton_id = 1
-                """
-            )
-            lease_row = await cur.fetchone()
-            gateway_lease = (
-                {
-                    "instance_id": str(lease_row["instance_id"]),
-                    "epoch": int(lease_row["epoch"]),
-                    "acquired_at": _iso(lease_row.get("acquired_at")),
-                    "expires_at": _iso(lease_row.get("expires_at")),
-                    "active": bool(lease_row.get("active")),
-                }
-                if lease_row
-                else None
-            )
+        async with owned_conn.transaction():
+            async with owned_conn.cursor(row_factory=dict_row) as cur:
+                cfg = await ensure_and_lock_weixin_config_in_tx(cur, for_update=False)
+                db_allow_ext = cfg.get("allow_external")
+                eff_allow_ext = (
+                    bool(db_allow_ext)
+                    if db_allow_ext is not None
+                    else bool(get_dalton_config().weixin.allow_external)
+                )
+                await cur.execute(
+                    """
+                    SELECT instance_id, epoch, acquired_at, expires_at,
+                           (expires_at > clock_timestamp()) AS active
+                    FROM dalton_channel_gateway_lease
+                    WHERE singleton_id = 1
+                    """
+                )
+                lease_row = await cur.fetchone()
+                gateway_lease = (
+                    {
+                        "instance_id": str(lease_row["instance_id"]),
+                        "epoch": int(lease_row["epoch"]),
+                        "acquired_at": _iso(lease_row.get("acquired_at")),
+                        "expires_at": _iso(lease_row.get("expires_at")),
+                        "active": bool(lease_row.get("active")),
+                    }
+                    if lease_row
+                    else None
+                )
 
-            await cur.execute(
-                """
-                SELECT a.account_id::text AS account_id,
-                       a.user_id,
-                       a.ilink_bot_id,
-                       a.ilink_user_id,
-                       a.prev_ilink_user_id,
-                       a.ilink_username,
-                       a.status,
-                       a.prev_status,
-                       a.disabled_reason,
-                       a.bot_generation,
-                       a.last_inbound_at,
-                       a.last_error_code,
-                       a.last_error_at,
-                       a.created_at,
-                       a.updated_at,
-                       u.email AS user_email,
-                       u.name AS user_name
-                FROM dalton_channel_weixin_accounts a
-                LEFT JOIN users u ON u.user_id = a.user_id
-                ORDER BY a.updated_at DESC
-                """
-            )
-            acc_rows = [dict(r) for r in await cur.fetchall()]
+                await cur.execute(
+                    """
+                    SELECT a.account_id::text AS account_id,
+                           a.user_id,
+                           a.ilink_bot_id,
+                           a.ilink_user_id,
+                           a.prev_ilink_user_id,
+                           a.ilink_username,
+                           a.status,
+                           a.prev_status,
+                           a.disabled_reason,
+                           a.bot_generation,
+                           a.last_inbound_at,
+                           a.last_error_code,
+                           a.last_error_at,
+                           a.created_at,
+                           a.updated_at,
+                           u.email AS user_email,
+                           u.name AS user_name
+                    FROM dalton_channel_weixin_accounts a
+                    LEFT JOIN users u ON u.user_id = a.user_id
+                    ORDER BY a.updated_at DESC
+                    """
+                )
+                acc_rows = [dict(r) for r in await cur.fetchall()]
 
-            await cur.execute(
-                """
-                SELECT s.session_key,
-                       s.user_id,
-                       s.target_account_id::text AS target_account_id,
-                       s.status,
-                       s.expires_at,
-                       s.updated_at,
-                       u.email AS user_email,
-                       u.name AS user_name
-                FROM dalton_channel_weixin_login_sessions s
-                LEFT JOIN users u ON u.user_id = s.user_id
-                WHERE s.status IN ('starting', 'wait', 'scaned', 'verify_code')
-                  AND s.expires_at > NOW()
-                ORDER BY s.updated_at DESC
-                """
-            )
-            pending_sessions = [dict(r) for r in await cur.fetchall()]
+                await cur.execute(
+                    """
+                    SELECT s.session_key,
+                           s.user_id,
+                           s.target_account_id::text AS target_account_id,
+                           s.status,
+                           s.expires_at,
+                           s.updated_at,
+                           u.email AS user_email,
+                           u.name AS user_name
+                    FROM dalton_channel_weixin_login_sessions s
+                    LEFT JOIN users u ON u.user_id = s.user_id
+                    WHERE s.status IN ('starting', 'wait', 'scaned', 'verify_code')
+                      AND s.expires_at > NOW()
+                    ORDER BY s.updated_at DESC
+                    """
+                )
+                pending_sessions = [dict(r) for r in await cur.fetchall()]
 
-            await cur.execute(
-                """
-                SELECT audit_id::text AS audit_id,
-                       action,
-                       operator_user_id,
-                       target_user_id,
-                       weixin_account_id::text AS weixin_account_id,
-                       ilink_bot_id,
-                       masked_ilink_user_id,
-                       reason,
-                       metadata,
-                       created_at
-                FROM dalton_channel_weixin_audit_logs
-                ORDER BY created_at DESC
-                LIMIT 50
-                """
-            )
-            audit_logs = [
-                {
-                    "audit_id": str(r["audit_id"]),
-                    "action": str(r["action"]),
-                    "operator_user_id": str(r["operator_user_id"]),
-                    "target_user_id": r.get("target_user_id"),
-                    "weixin_account_id": r.get("weixin_account_id"),
-                    "ilink_bot_id": r.get("ilink_bot_id"),
-                    "masked_ilink_user_id": r.get("masked_ilink_user_id"),
-                    "reason": str(r["reason"]),
-                    "metadata": r.get("metadata") or {},
-                    "created_at": _iso(r.get("created_at")),
-                }
-                for r in await cur.fetchall()
-            ]
+                await cur.execute(
+                    """
+                    SELECT audit_id::text AS audit_id,
+                           action,
+                           operator_user_id,
+                           target_user_id,
+                           weixin_account_id::text AS weixin_account_id,
+                           ilink_bot_id,
+                           masked_ilink_user_id,
+                           reason,
+                           metadata,
+                           created_at
+                    FROM dalton_channel_weixin_audit_logs
+                    ORDER BY created_at DESC
+                    LIMIT 50
+                    """
+                )
+                audit_logs = [
+                    {
+                        "audit_id": str(r["audit_id"]),
+                        "action": str(r["action"]),
+                        "operator_user_id": str(r["operator_user_id"]),
+                        "target_user_id": r.get("target_user_id"),
+                        "weixin_account_id": r.get("weixin_account_id"),
+                        "ilink_bot_id": r.get("ilink_bot_id"),
+                        "masked_ilink_user_id": r.get("masked_ilink_user_id"),
+                        "reason": str(r["reason"]),
+                        "metadata": r.get("metadata") or {},
+                        "created_at": _iso(r.get("created_at")),
+                    }
+                    for r in await cur.fetchall()
+                ]
 
-        members: list[dict[str, Any]] = []
-        seen_uids: set[str] = set()
-        active_poller_count = 0
-        connected_count = 0
-        pending_verification_count = 0
-        expired_count = 0
+            members: list[dict[str, Any]] = []
+            seen_uids: set[str] = set()
+            active_poller_count = 0
+            connected_count = 0
+            pending_verification_count = 0
+            expired_count = 0
 
-        pending_by_uid = {str(s["user_id"]): s for s in pending_sessions}
+            pending_by_uid = {str(s["user_id"]): s for s in pending_sessions}
 
-        for r in acc_rows:
-            uid = str(r["user_id"])
-            seen_uids.add(uid)
-            st = str(r["status"])
-            if st in ("active", "pending_verification"):
-                active_poller_count += 1
-            if st == "active":
-                connected_count += 1
-            elif st == "pending_verification":
-                pending_verification_count += 1
-            elif st == "expired":
-                expired_count += 1
-            tier = await get_user_tier(uid, conn=owned_conn)
-            eff_wx = r.get("ilink_user_id") or r.get("prev_ilink_user_id")
-            members.append(
-                {
-                    "account_id": str(r["account_id"]),
-                    "user_id": uid,
-                    "user_email": r.get("user_email"),
-                    "user_name": r.get("user_name"),
-                    "user_tier": tier,
-                    "ilink_bot_id": str(r["ilink_bot_id"]),
-                    "ilink_username": r.get("ilink_username"),
-                    "masked_ilink_user_id": mask_ilink_user_id(eff_wx),
-                    "status": st,
-                    "prev_status": r.get("prev_status"),
-                    "disabled_reason": r.get("disabled_reason"),
-                    "bot_generation": int(r["bot_generation"]),
-                    "has_pending_login": uid in pending_by_uid,
-                    "pending_login_status": (
-                        pending_by_uid[uid]["status"] if uid in pending_by_uid else None
-                    ),
-                    "last_inbound_at": _iso(r.get("last_inbound_at")),
-                    "last_error_code": r.get("last_error_code"),
-                    "updated_at": _iso(r.get("updated_at")),
-                }
-            )
+            for r in acc_rows:
+                uid = str(r["user_id"])
+                seen_uids.add(uid)
+                st = str(r["status"])
+                if st in ("active", "pending_verification"):
+                    active_poller_count += 1
+                if st == "active":
+                    connected_count += 1
+                elif st == "pending_verification":
+                    pending_verification_count += 1
+                elif st == "expired":
+                    expired_count += 1
+                tier = await get_user_tier(uid, conn=owned_conn)
+                eff_wx = r.get("ilink_user_id") or r.get("prev_ilink_user_id")
+                members.append(
+                    {
+                        "account_id": str(r["account_id"]),
+                        "user_id": uid,
+                        "user_email": r.get("user_email"),
+                        "user_name": r.get("user_name"),
+                        "user_tier": tier,
+                        "ilink_bot_id": str(r["ilink_bot_id"]),
+                        "ilink_username": r.get("ilink_username"),
+                        "masked_ilink_user_id": mask_ilink_user_id(eff_wx),
+                        "status": st,
+                        "prev_status": r.get("prev_status"),
+                        "disabled_reason": r.get("disabled_reason"),
+                        "bot_generation": int(r["bot_generation"]),
+                        "has_pending_login": uid in pending_by_uid,
+                        "pending_login_status": (
+                            pending_by_uid[uid]["status"] if uid in pending_by_uid else None
+                        ),
+                        "last_inbound_at": _iso(r.get("last_inbound_at")),
+                        "last_error_code": r.get("last_error_code"),
+                        "updated_at": _iso(r.get("updated_at")),
+                    }
+                )
 
-        for s in pending_sessions:
-            uid = str(s["user_id"])
-            if uid in seen_uids:
-                continue
-            tier = await get_user_tier(uid, conn=owned_conn)
-            members.append(
-                {
-                    "account_id": None,
-                    "user_id": uid,
-                    "user_email": s.get("user_email"),
-                    "user_name": s.get("user_name"),
-                    "user_tier": tier,
-                    "ilink_bot_id": None,
-                    "ilink_username": None,
-                    "masked_ilink_user_id": None,
-                    "status": "login_pending",
-                    "prev_status": None,
-                    "disabled_reason": None,
-                    "bot_generation": None,
-                    "has_pending_login": True,
-                    "pending_login_status": str(s["status"]),
-                    "last_inbound_at": None,
-                    "last_error_code": None,
-                    "updated_at": _iso(s.get("updated_at")),
-                }
-            )
+            for s in pending_sessions:
+                uid = str(s["user_id"])
+                if uid in seen_uids:
+                    continue
+                tier = await get_user_tier(uid, conn=owned_conn)
+                members.append(
+                    {
+                        "account_id": None,
+                        "user_id": uid,
+                        "user_email": s.get("user_email"),
+                        "user_name": s.get("user_name"),
+                        "user_tier": tier,
+                        "ilink_bot_id": None,
+                        "ilink_username": None,
+                        "masked_ilink_user_id": None,
+                        "status": "login_pending",
+                        "prev_status": None,
+                        "disabled_reason": None,
+                        "bot_generation": None,
+                        "has_pending_login": True,
+                        "pending_login_status": str(s["status"]),
+                        "last_inbound_at": None,
+                        "last_error_code": None,
+                        "updated_at": _iso(s.get("updated_at")),
+                    }
+                )
 
-        return {
-            "enabled": bool(cfg["enabled"]),
-            "allow_external": eff_allow_ext,
-            "db_allow_external": db_allow_ext,
-            "accounts_revision": int(cfg["accounts_revision"]),
-            "max_concurrent_accounts": max_slots,
-            "active_poller_count": active_poller_count,
-            "connected_count": connected_count,
-            "pending_verification_count": pending_verification_count,
-            "expired_count": expired_count,
-            "gateway_lease": gateway_lease,
-            "accounts": members,
-            "audit_logs": audit_logs,
-        }
+            return {
+                "enabled": bool(cfg["enabled"]),
+                "allow_external": eff_allow_ext,
+                "db_allow_external": db_allow_ext,
+                "accounts_revision": int(cfg["accounts_revision"]),
+                "max_concurrent_accounts": max_slots,
+                "active_poller_count": active_poller_count,
+                "connected_count": connected_count,
+                "pending_verification_count": pending_verification_count,
+                "expired_count": expired_count,
+                "gateway_lease": gateway_lease,
+                "accounts": members,
+                "audit_logs": audit_logs,
+            }
 
 
 async def update_weixin_admin_config(
@@ -3833,113 +3916,118 @@ async def get_member_weixin_binding_view(
     conn: Any = None,
 ) -> dict[str, Any]:
     """Project one member's Weixin account from ``dalton_channel_weixin_accounts``."""
-    eff_tier = str(user_tier).strip().lower() if user_tier is not None else await get_user_tier(user_id)
     async with get_db_connection(conn) as owned_conn:
-        async with owned_conn.cursor(row_factory=dict_row) as cur:
-            cfg = await ensure_and_lock_weixin_config_in_tx(cur, for_update=False)
-            access_ok, access_deny = evaluate_weixin_member_access(
-                eff_tier,
-                channel_enabled=bool(cfg["enabled"]),
-                db_allow_external=cfg.get("allow_external"),
+        async with owned_conn.transaction():
+            eff_tier = (
+                str(user_tier).strip().lower()
+                if user_tier is not None
+                else await get_user_tier(user_id, conn=owned_conn)
             )
-            await cur.execute(
-                """
-                SELECT account_id::text AS account_id,
-                       user_id,
-                       ilink_bot_id,
-                       ilink_user_id,
-                       prev_ilink_user_id,
-                       ilink_username,
-                       status,
-                       prev_status,
-                       disabled_reason,
-                       bot_generation,
-                       last_inbound_at,
-                       created_at,
-                       updated_at
-                FROM dalton_channel_weixin_accounts
-                WHERE user_id = %s
-                """,
-                (user_id,),
-            )
-            acc = await cur.fetchone()
-            if acc is None:
-                return {
-                    "linked": False,
+            async with owned_conn.cursor(row_factory=dict_row) as cur:
+                cfg = await ensure_and_lock_weixin_config_in_tx(cur, for_update=False)
+                access_ok, access_deny = evaluate_weixin_member_access(
+                    eff_tier,
+                    channel_enabled=bool(cfg["enabled"]),
+                    db_allow_external=cfg.get("allow_external"),
+                )
+                await cur.execute(
+                    """
+                    SELECT account_id::text AS account_id,
+                           user_id,
+                           ilink_bot_id,
+                           ilink_user_id,
+                           prev_ilink_user_id,
+                           ilink_username,
+                           status,
+                           prev_status,
+                           disabled_reason,
+                           bot_generation,
+                           last_inbound_at,
+                           created_at,
+                           updated_at
+                    FROM dalton_channel_weixin_accounts
+                    WHERE user_id = %s
+                    """,
+                    (user_id,),
+                )
+                acc = await cur.fetchone()
+                if acc is None:
+                    return {
+                        "linked": False,
+                        "platform": "weixin",
+                        "status": "paused" if not access_ok else "unconfigured",
+                        "channel_enabled": bool(cfg["enabled"]),
+                        "member_allowed": access_ok,
+                        "deny_reason": access_deny,
+                        "account_id": None,
+                        "platform_user_id": None,
+                        "masked_ilink_user_id": None,
+                        "platform_username": None,
+                        "ilink_username": None,
+                        "active_push_ready": False,
+                        "last_inbound_at": None,
+                        "updated_at": None,
+                    }
+
+                eff_wx = acc.get("ilink_user_id") or acc.get("prev_ilink_user_id")
+                st = str(acc["status"])
+                ctx_tok: str | None = None
+                has_usable_tok = False
+                if st == "active" and acc.get("ilink_user_id"):
+                    if include_secrets:
+                        ctx_tok, _, stale = await resolve_weixin_account_context_token_in_tx(
+                            cur,
+                            account_id=str(acc["account_id"]),
+                            bot_generation=int(acc["bot_generation"]),
+                            platform_user_id=str(acc["ilink_user_id"]),
+                        )
+                        has_usable_tok = bool(ctx_tok) and not stale
+                    else:
+                        await cur.execute(
+                            """
+                            SELECT 1
+                            FROM dalton_channel_weixin_account_tokens
+                            WHERE account_id = %s::uuid
+                              AND bot_generation = %s
+                              AND platform_user_id = %s
+                              AND stale_at IS NULL
+                            LIMIT 1
+                            """,
+                            (
+                                str(acc["account_id"]),
+                                int(acc["bot_generation"]),
+                                str(acc["ilink_user_id"]),
+                            ),
+                        )
+                        has_usable_tok = (await cur.fetchone()) is not None
+
+                display_status = st
+                if not access_ok and st in ("active", "pending_verification", "disabled"):
+                    display_status = "paused"
+
+                out: dict[str, Any] = {
+                    "linked": st in ("active", "pending_verification"),
                     "platform": "weixin",
-                    "status": "paused" if not access_ok else "unconfigured",
+                    "account_id": str(acc["account_id"]),
+                    "status": display_status,
+                    "raw_status": st,
+                    "disabled_reason": acc.get("disabled_reason"),
                     "channel_enabled": bool(cfg["enabled"]),
                     "member_allowed": access_ok,
                     "deny_reason": access_deny,
-                    "account_id": None,
-                    "platform_user_id": None,
-                    "masked_ilink_user_id": None,
-                    "platform_username": None,
-                    "ilink_username": None,
-                    "active_push_ready": False,
-                    "last_inbound_at": None,
-                    "updated_at": None,
+                    "platform_user_id": acc.get("ilink_user_id"),
+                    "masked_ilink_user_id": mask_ilink_user_id(eff_wx),
+                    "platform_username": acc.get("ilink_username"),
+                    "ilink_username": acc.get("ilink_username"),
+                    "bot_generation": int(acc["bot_generation"]),
+                    "active_push_ready": has_usable_tok,
+                    "last_inbound_at": _iso(acc.get("last_inbound_at")),
+                    "created_at": _iso(acc.get("created_at")),
+                    "updated_at": _iso(acc.get("updated_at")),
                 }
-
-            eff_wx = acc.get("ilink_user_id") or acc.get("prev_ilink_user_id")
-            st = str(acc["status"])
-            ctx_tok: str | None = None
-            has_usable_tok = False
-            if st == "active" and acc.get("ilink_user_id"):
                 if include_secrets:
-                    ctx_tok, _, stale = await resolve_weixin_account_context_token_in_tx(
-                        cur,
-                        account_id=str(acc["account_id"]),
-                        bot_generation=int(acc["bot_generation"]),
-                        platform_user_id=str(acc["ilink_user_id"]),
-                    )
-                    has_usable_tok = bool(ctx_tok) and not stale
-                else:
-                    await cur.execute(
-                        """
-                        SELECT 1
-                        FROM dalton_channel_weixin_account_tokens
-                        WHERE account_id = %s::uuid
-                          AND bot_generation = %s
-                          AND platform_user_id = %s
-                          AND stale_at IS NULL
-                        LIMIT 1
-                        """,
-                        (
-                            str(acc["account_id"]),
-                            int(acc["bot_generation"]),
-                            str(acc["ilink_user_id"]),
-                        ),
-                    )
-                    has_usable_tok = (await cur.fetchone()) is not None
-
-            display_status = st
-            if not access_ok and st in ("active", "pending_verification", "disabled"):
-                display_status = "paused"
-
-            out: dict[str, Any] = {
-                "linked": st in ("active", "pending_verification"),
-                "platform": "weixin",
-                "account_id": str(acc["account_id"]),
-                "status": display_status,
-                "raw_status": st,
-                "disabled_reason": acc.get("disabled_reason"),
-                "channel_enabled": bool(cfg["enabled"]),
-                "member_allowed": access_ok,
-                "deny_reason": access_deny,
-                "platform_user_id": acc.get("ilink_user_id"),
-                "masked_ilink_user_id": mask_ilink_user_id(eff_wx),
-                "platform_username": acc.get("ilink_username"),
-                "ilink_username": acc.get("ilink_username"),
-                "bot_generation": int(acc["bot_generation"]),
-                "active_push_ready": has_usable_tok,
-                "last_inbound_at": _iso(acc.get("last_inbound_at")),
-                "created_at": _iso(acc.get("created_at")),
-                "updated_at": _iso(acc.get("updated_at")),
-            }
-            if include_secrets:
-                out["weixin_context_token"] = ctx_tok
-            return out
+                    out["weixin_context_token"] = ctx_tok
+                return out
 
 
 # ---------------------------------------------------------------------------
@@ -4003,12 +4091,13 @@ async def preflight_weixin_send(
 
         owner_uid = str(peek.get("user_id") or "").strip()
         if owner_uid and not owner_uid.startswith("unlinked:"):
-            member_status = await check_team_member_status_live(owner_uid, conn=owned_conn)
-            if member_status == "lookup_error":
-                return _preflight_deny("roster_lookup_error", retryable=True)
-            if member_status != "active":
-                return _preflight_deny("member_not_in_roster")
-            user_tier = await get_user_tier(owner_uid, conn=owned_conn)
+            async with owned_conn.transaction():
+                member_status = await check_team_member_status_live(owner_uid, conn=owned_conn)
+                if member_status == "lookup_error":
+                    return _preflight_deny("roster_lookup_error", retryable=True)
+                if member_status != "active":
+                    return _preflight_deny("member_not_in_roster")
+                user_tier = await get_user_tier(owner_uid, conn=owned_conn)
         else:
             return _preflight_deny("member_not_in_roster")
 
@@ -4790,19 +4879,21 @@ async def verify_pending_weixin_account_first_message(
 
     async def _attempt(attempt_conn: Any) -> dict[str, Any]:
         async with get_db_connection(attempt_conn) as owned_conn:
-            # Phase 1: unlocked discovery of target account + any account occupying cleaned_puid
-            async with owned_conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    SELECT account_id::text AS account_id, user_id, ilink_bot_id,
-                           ilink_user_id, prev_ilink_user_id
-                    FROM dalton_channel_weixin_accounts
-                    WHERE account_id = %s::uuid
-                       OR COALESCE(ilink_user_id, prev_ilink_user_id) = %s
-                    """,
-                    (norm_aid, cleaned_puid),
-                )
-                discovered = [dict(r) for r in await cur.fetchall()]
+            # Phase 1: short read transaction so non-autocommit connections return to IDLE
+            # before hooks and before Phase 2's top-level transaction.
+            async with owned_conn.transaction():
+                async with owned_conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        """
+                        SELECT account_id::text AS account_id, user_id, ilink_bot_id,
+                               ilink_user_id, prev_ilink_user_id
+                        FROM dalton_channel_weixin_accounts
+                        WHERE account_id = %s::uuid
+                           OR COALESCE(ilink_user_id, prev_ilink_user_id) = %s
+                        """,
+                        (norm_aid, cleaned_puid),
+                    )
+                    discovered = [dict(r) for r in await cur.fetchall()]
 
             if _after_discovery_hook is not None:
                 await _after_discovery_hook()

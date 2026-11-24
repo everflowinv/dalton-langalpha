@@ -2529,7 +2529,7 @@ async def _register_and_resolve_inbound_once(
                             generation=gen_val,
                         )
 
-                    ex_tier = await get_user_tier(ex_uid)
+                    ex_tier = await get_user_tier(ex_uid, conn=owned_conn)
                     ex_chat_type = str(
                         existing.get("chat_type") or cleaned_chat_type
                     ).strip().lower()
@@ -2737,7 +2737,7 @@ async def _register_and_resolve_inbound_once(
                 reject_company_system_auth(dalton_user_id)
 
                 # 3. External member group chat veto
-                user_tier = await get_user_tier(dalton_user_id)
+                user_tier = await get_user_tier(dalton_user_id, conn=owned_conn)
                 if cleaned_chat_type == "group" and (
                     user_tier == "external" or cleaned_platform == "weixin"
                 ):
@@ -3604,20 +3604,21 @@ async def consume_bind_code_or_unbind(
             )
             if not eff_uid and not eff_aid and eff_puid:
                 async with get_db_connection(conn) as owned_conn:
-                    async with owned_conn.cursor(row_factory=dict_row) as cur:
-                        await cur.execute(
-                            """
-                            SELECT account_id::text AS account_id, user_id
-                            FROM dalton_channel_weixin_accounts
-                            WHERE ilink_user_id = %s OR prev_ilink_user_id = %s
-                            LIMIT 1
-                            """,
-                            (eff_puid, eff_puid),
-                        )
-                        found = await cur.fetchone()
-                        if found:
-                            eff_uid = str(found["user_id"])
-                            eff_aid = str(found["account_id"])
+                    async with owned_conn.transaction():
+                        async with owned_conn.cursor(row_factory=dict_row) as cur:
+                            await cur.execute(
+                                """
+                                SELECT account_id::text AS account_id, user_id
+                                FROM dalton_channel_weixin_accounts
+                                WHERE ilink_user_id = %s OR prev_ilink_user_id = %s
+                                LIMIT 1
+                                """,
+                                (eff_puid, eff_puid),
+                            )
+                            found = await cur.fetchone()
+                            if found:
+                                eff_uid = str(found["user_id"])
+                                eff_aid = str(found["account_id"])
             if not eff_uid and not eff_aid:
                 if gateway_epoch is not None or require_gateway_epoch:
                     async with get_db_connection(conn) as owned_conn:
@@ -5682,7 +5683,7 @@ async def _execute_session_command_once(
                     )
 
                 # 2. Tier & group chat check
-                user_tier = await get_user_tier(cleaned_uid)
+                user_tier = await get_user_tier(cleaned_uid, conn=owned_conn)
                 if cleaned_platform == "weixin":
                     roster_status = await check_team_member_status_live(
                         cleaned_uid, conn=owned_conn
@@ -9395,7 +9396,8 @@ async def authorize_and_claim_delivery(
                     if not _is_dm_address(resolved_platform, resolved_target_address):
                         if (
                             resolved_platform == "weixin"
-                            or await get_user_tier(resolved_user_id) == "external"
+                            or await get_user_tier(resolved_user_id, conn=owned_conn)
+                            == "external"
                         ):
                             return {
                                 "claim_status": "denied",
@@ -9484,7 +9486,7 @@ async def authorize_and_claim_delivery(
                     weixin_ctx_token = id_row.get("weixin_context_token")
 
                     is_dm = _is_dm_address(resolved_platform, resolved_target_address)
-                    user_tier = await get_user_tier(resolved_user_id)
+                    user_tier = await get_user_tier(resolved_user_id, conn=owned_conn)
                     if not is_dm and (
                         user_tier == "external" or resolved_platform == "weixin"
                     ):

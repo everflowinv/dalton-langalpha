@@ -4117,3 +4117,129 @@ async def test_r2_context_token_dual_watermarks_command_encrypt_and_group_reject
     )
     assert store.account_tokens[(aid, 1, "wx_alice@im.wechat")]["encrypted_context_token"] == "ctx-cmd-p20"
     assert store.account_tokens[(aid, 1, "wx_alice@im.wechat")]["protocol_seq_high"] == 20
+
+
+@pytest.mark.asyncio
+async def test_r3_no_bare_cursor_outside_transaction_and_lease_hook_before_for_update(
+    wx_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 3 regressions:
+    1. Every two-phase Weixin DB function wraps Phase-1 discovery in `conn.transaction()`
+       so non-autocommit connections never stay `idle in transaction` holding advisory locks;
+    2. `acquire_gateway_lease` invokes `_before_lease_update_hook` BEFORE `SELECT ... FOR UPDATE`.
+    """
+    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
+    tx_depth = 0
+    bare_cursor_violations: list[str] = []
+    event_order: list[str] = []
+
+    class StrictTxCursor:
+        def __init__(self) -> None:
+            self._rows: list[dict[str, Any]] = []
+            self._idx = 0
+
+        async def __aenter__(self) -> StrictTxCursor:
+            if tx_depth <= 0:
+                bare_cursor_violations.append("cursor entered outside transaction")
+            return self
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            if "FROM dalton_channel_gateway_lease" in sql and "FOR UPDATE" in sql:
+                event_order.append("for_update_sql")
+            self._rows = await store.handle_sql(sql, params)
+            self._idx = 0
+
+        async def fetchone(self) -> Any:
+            if self._idx < len(self._rows):
+                row = self._rows[self._idx]
+                self._idx += 1
+                return row
+            return None
+
+        async def fetchall(self) -> list[Any]:
+            rest = self._rows[self._idx :]
+            self._idx = len(self._rows)
+            return rest
+
+    class StrictTxConn:
+        @asynccontextmanager
+        async def transaction(self) -> Any:
+            nonlocal tx_depth
+            tx_depth += 1
+            try:
+                yield
+            finally:
+                tx_depth -= 1
+
+        def cursor(self, row_factory: Any = None) -> StrictTxCursor:
+            _ = row_factory
+            return StrictTxCursor()
+
+    strict_conn = StrictTxConn()
+
+    # 1. Verify _before_lease_update_hook fires BEFORE SELECT ... FOR UPDATE
+    store.lease = None
+
+    async def _before_hook() -> None:
+        event_order.append("hook")
+
+    monkeypatch.setattr(wx_db, "_before_lease_update_hook", _before_hook)
+    try:
+        lease_res = await wx_db.acquire_gateway_lease(
+            instance_id="gw-hook-check", ttl_seconds=45, conn=strict_conn
+        )
+        assert lease_res["granted"] is True
+        assert event_order[:2] == ["hook", "for_update_sql"]
+        epoch = int(lease_res["epoch"])
+    finally:
+        monkeypatch.setattr(wx_db, "_before_lease_update_hook", None)
+
+    # 2. Verify start -> save_qr -> confirm -> verify_pending -> reevaluate -> unbind never use bare cursors
+    s = await wx_db.start_weixin_login_session(user_id="u-alice", conn=strict_conn)
+    await wx_db.patch_weixin_login_session(
+        session_key=s["session_key"],
+        gateway_epoch=epoch,
+        action="save_qr",
+        qrcode="qr-strict",
+        conn=strict_conn,
+    )
+    c = await wx_db.patch_weixin_login_session(
+        session_key=s["session_key"],
+        gateway_epoch=epoch,
+        action="confirm",
+        expected_login_version=2,
+        ilink_bot_id="bot-strict@im.wechat",
+        bot_token="tok-strict",
+        ilink_user_id=None,
+        conn=strict_conn,
+    )
+    aid = c["account_id"]
+    await wx_db.verify_pending_weixin_account_first_message(
+        account_id=aid,
+        platform_user_id="wx_strict@im.wechat",
+        gateway_epoch=epoch,
+        require_gateway_epoch=True,
+        conn=strict_conn,
+    )
+    await wx_db.reevaluate_weixin_accounts(
+        target_user_ids=["u-alice"],
+        gateway_epoch=epoch,
+        require_gateway_epoch=True,
+        conn=strict_conn,
+    )
+    await wx_db.unbind_weixin_account(
+        target_user_id="u-alice",
+        account_id=aid,
+        operator_user_id="u-alice",
+        action="member_unbind",
+        gateway_epoch=epoch,
+        require_gateway_epoch=True,
+        conn=strict_conn,
+    )
+    assert bare_cursor_violations == []
+    assert tx_depth == 0
+
