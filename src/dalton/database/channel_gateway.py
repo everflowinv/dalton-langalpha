@@ -1442,6 +1442,38 @@ async def _register_and_resolve_weixin_inbound(
                     existing = await cur.fetchone()
                     if existing is not None:
                         existing = dict(existing)
+                        # R5 (Decision #3): Validate group, sender, required Weixin identity
+                        # fields, stored match, live roster, and runtime switches BEFORE
+                        # returning ANY replay or stored ignored row — zero member leakage!
+                        if is_weixin_group:
+                            return {
+                                "ok": False,
+                                "linked": False,
+                                "allowed": False,
+                                "deny_reason": "weixin_group_unsupported",
+                                "existing_status": existing["status"],
+                            }
+                        if is_invalid_inbound:
+                            return {
+                                "ok": False,
+                                "linked": False,
+                                "allowed": False,
+                                "deny_reason": "invalid_inbound_event",
+                                "existing_status": existing["status"],
+                            }
+                        if (
+                            not eff_aid_param
+                            or not eff_bot_id_param
+                            or eff_bot_gen_param is None
+                            or eff_bot_gen_param < 1
+                        ):
+                            return {
+                                "ok": False,
+                                "linked": False,
+                                "allowed": False,
+                                "deny_reason": "weixin_inbound_fields_required",
+                                "existing_status": existing["status"],
+                            }
                         cb_id = (
                             str(existing["collect_buffer_id"])
                             if existing.get("collect_buffer_id")
@@ -1473,10 +1505,9 @@ async def _register_and_resolve_weixin_inbound(
                             if existing.get("weixin_context_bot_generation") is not None
                             else None
                         )
-                        # Cross-member / cross-account message_id collision guard (zero leakage of original user's fields)
-                        if (
-                            (eff_aid_param and ex_acc_id and eff_aid_param != ex_acc_id)
-                            or (cleaned_puid and ex_puid and cleaned_puid != ex_puid)
+                        # Cross-member / cross-account message_id collision guard (zero leakage)
+                        if (ex_acc_id and eff_aid_param != ex_acc_id) or (
+                            ex_puid and cleaned_puid != ex_puid
                         ):
                             return {
                                 "ok": False,
@@ -1485,62 +1516,37 @@ async def _register_and_resolve_weixin_inbound(
                                 "deny_reason": "weixin_message_id_account_mismatch",
                                 "existing_status": existing["status"],
                             }
-                        ex_deny = (
-                            str(ex_payload.get("deny_reason"))
-                            if isinstance(ex_payload, dict) and ex_payload.get("deny_reason")
-                            else None
+                        if (ex_bot_id and eff_bot_id_param != ex_bot_id) or (
+                            ex_bot_gen is not None and eff_bot_gen_param != ex_bot_gen
+                        ):
+                            return {
+                                "ok": False,
+                                "linked": False,
+                                "allowed": False,
+                                "deny_reason": "weixin_bot_generation_mismatch",
+                                "existing_status": existing["status"],
+                            }
+
+                        # Re-verify account strictly by requested weixin_account_id
+                        await cur.execute(
+                            "SELECT * FROM dalton_channel_weixin_accounts WHERE account_id = %s::uuid",
+                            (str(eff_aid_param),),
                         )
-                        if existing["status"] == "ignored":
-                            out_rep = _serialize_inbound_row(
-                                existing,
-                                existing_status="ignored",
-                                linked=bool(ex_uid),
-                                allowed=False,
-                                deny_reason=ex_deny or "ignored",
-                                generation=existing.get("session_generation"),
-                            )
-                            if cb_id:
-                                out_rep["collect_buffer_id"] = cb_id
-                                out_rep["collect_buffer_status"] = cb_status
-                            return out_rep
-
-                        # Re-verify account in dalton_channel_weixin_accounts
-                        acc_rep = None
-                        if ex_acc_id:
-                            await cur.execute(
-                                "SELECT * FROM dalton_channel_weixin_accounts WHERE account_id = %s::uuid",
-                                (str(ex_acc_id),),
-                            )
-                            acc_rep = await cur.fetchone()
-                        elif ex_uid:
-                            await cur.execute(
-                                "SELECT * FROM dalton_channel_weixin_accounts WHERE user_id = %s",
-                                (str(ex_uid),),
-                            )
-                            acc_rep = await cur.fetchone()
-                        if acc_rep is None or str(acc_rep["status"]) != "active":
-                            out_rep = _serialize_inbound_row(
-                                existing,
-                                existing_status=existing["status"],
-                                linked=False,
-                                allowed=False,
-                                deny_reason=(
-                                    f"weixin_account_{acc_rep['status']}"
-                                    if acc_rep is not None
-                                    else "not_linked"
-                                ),
-                                generation=existing.get("session_generation"),
-                            )
-                            if cb_id:
-                                out_rep["collect_buffer_id"] = cb_id
-                                out_rep["collect_buffer_status"] = cb_status
-                            return out_rep
-
-                        acc_rep_id = str(acc_rep["account_id"])
+                        acc_rep = await cur.fetchone()
+                        if acc_rep is None:
+                            return {
+                                "ok": False,
+                                "linked": False,
+                                "allowed": False,
+                                "deny_reason": "not_linked",
+                                "existing_status": existing["status"],
+                            }
+                        acc_rep = dict(acc_rep)
                         acc_rep_bot = str(acc_rep["ilink_bot_id"])
                         acc_rep_gen = int(acc_rep["bot_generation"])
                         acc_rep_wx = str(acc_rep.get("ilink_user_id") or "").strip()
-                        if eff_aid_param and eff_aid_param != acc_rep_id:
+                        ex_uid_str = str(acc_rep["user_id"])
+                        if ex_uid and str(ex_uid) != ex_uid_str:
                             return {
                                 "ok": False,
                                 "linked": False,
@@ -1548,26 +1554,23 @@ async def _register_and_resolve_weixin_inbound(
                                 "deny_reason": "weixin_message_id_account_mismatch",
                                 "existing_status": existing["status"],
                             }
-                        if (
-                            (eff_bot_id_param and eff_bot_id_param != acc_rep_bot)
-                            or (ex_bot_id and ex_bot_id != acc_rep_bot)
-                            or (eff_bot_gen_param is not None and eff_bot_gen_param != acc_rep_gen)
-                            or (ex_bot_gen is not None and ex_bot_gen != acc_rep_gen)
-                        ):
-                            out_rep = _serialize_inbound_row(
-                                existing,
-                                existing_status=existing["status"],
-                                linked=True,
-                                allowed=False,
-                                deny_reason="weixin_bot_generation_mismatch",
-                                generation=existing.get("session_generation"),
-                            )
-                            if cb_id:
-                                out_rep["collect_buffer_id"] = cb_id
-                                out_rep["collect_buffer_status"] = cb_status
-                            return out_rep
-
-                        if cleaned_puid and acc_rep_wx and cleaned_puid != acc_rep_wx:
+                        if eff_bot_id_param != acc_rep_bot or eff_bot_gen_param != acc_rep_gen:
+                            return {
+                                "ok": False,
+                                "linked": False,
+                                "allowed": False,
+                                "deny_reason": "weixin_bot_generation_mismatch",
+                                "existing_status": existing["status"],
+                            }
+                        if str(acc_rep["status"]) != "active":
+                            return {
+                                "ok": False,
+                                "linked": False,
+                                "allowed": False,
+                                "deny_reason": f"weixin_account_{acc_rep['status']}",
+                                "existing_status": existing["status"],
+                            }
+                        if acc_rep_wx and cleaned_puid != acc_rep_wx:
                             return {
                                 "ok": False,
                                 "linked": False,
@@ -1576,7 +1579,6 @@ async def _register_and_resolve_weixin_inbound(
                                 "existing_status": existing["status"],
                             }
 
-                        ex_uid_str = str(acc_rep["user_id"])
                         reject_company_system_auth(ex_uid_str)
                         rep_roster = await check_team_member_status_live(
                             ex_uid_str, conn=owned_conn
@@ -1590,18 +1592,13 @@ async def _register_and_resolve_weixin_inbound(
                                 },
                             )
                         if rep_roster != "active":
-                            out_rep = _serialize_inbound_row(
-                                existing,
-                                existing_status=existing["status"],
-                                linked=True,
-                                allowed=False,
-                                deny_reason="member_not_in_roster",
-                                generation=existing.get("session_generation"),
-                            )
-                            if cb_id:
-                                out_rep["collect_buffer_id"] = cb_id
-                                out_rep["collect_buffer_status"] = cb_status
-                            return out_rep
+                            return {
+                                "ok": False,
+                                "linked": False,
+                                "allowed": False,
+                                "deny_reason": "member_not_in_roster",
+                                "existing_status": existing["status"],
+                            }
 
                         ex_tier = await get_user_tier(ex_uid_str, conn=owned_conn)
                         cfg_rep = await wx_db.ensure_and_lock_weixin_config_in_tx(
@@ -1613,13 +1610,34 @@ async def _register_and_resolve_weixin_inbound(
                             db_allow_external=cfg_rep.get("allow_external"),
                         )
                         if not rep_ok:
+                            return {
+                                "ok": False,
+                                "linked": False,
+                                "allowed": False,
+                                "deny_reason": rep_deny or "weixin_channel_disabled",
+                                "existing_status": existing["status"],
+                            }
+
+                        ex_deny = (
+                            str(ex_payload.get("deny_reason"))
+                            if isinstance(ex_payload, dict) and ex_payload.get("deny_reason")
+                            else None
+                        )
+                        if existing["status"] == "ignored":
+                            if ex_acc_id is None and ex_uid is None:
+                                return {
+                                    "ok": False,
+                                    "linked": True,
+                                    "allowed": False,
+                                    "deny_reason": ex_deny or "ignored",
+                                    "existing_status": "ignored",
+                                }
                             out_rep = _serialize_inbound_row(
                                 existing,
-                                existing_status=existing["status"],
+                                existing_status="ignored",
                                 linked=True,
                                 allowed=False,
-                                deny_reason=rep_deny or "weixin_channel_disabled",
-                                user_tier=ex_tier,
+                                deny_reason=ex_deny or "ignored",
                                 generation=existing.get("session_generation"),
                             )
                             if cb_id:
@@ -3592,34 +3610,25 @@ async def consume_bind_code_or_unbind(
                     "reason": "weixin_group_unsupported",
                     "message": "个人微信不支持在群聊中执行解除连接。",
                 }
+            # R5 (Decision #2): Weixin command /unbind MUST carry all 4 fields:
+            # weixin_account_id, weixin_bot_id, weixin_bot_generation (>= 1), and
+            # DM sender platform_user_id. Missing any field returns HTTP 400.
             eff_uid = str(user_id or "").strip() or None
             eff_aid = normalize_uuid(weixin_account_id) if weixin_account_id else None
-            eff_puid = str(platform_user_id or "").strip() or None
-            via_wechat = bool(
-                inbound_message_id
-                or message_id
-                or eff_puid
-                or weixin_bot_id
-                or weixin_bot_generation is not None
+            eff_bot = str(weixin_bot_id or "").strip() or None
+            eff_gen = (
+                int(weixin_bot_generation)
+                if weixin_bot_generation is not None
+                else None
             )
-            if not eff_uid and not eff_aid and eff_puid:
-                async with get_db_connection(conn) as owned_conn:
-                    async with owned_conn.transaction():
-                        async with owned_conn.cursor(row_factory=dict_row) as cur:
-                            await cur.execute(
-                                """
-                                SELECT account_id::text AS account_id, user_id
-                                FROM dalton_channel_weixin_accounts
-                                WHERE ilink_user_id = %s OR prev_ilink_user_id = %s
-                                LIMIT 1
-                                """,
-                                (eff_puid, eff_puid),
-                            )
-                            found = await cur.fetchone()
-                            if found:
-                                eff_uid = str(found["user_id"])
-                                eff_aid = str(found["account_id"])
-            if not eff_uid and not eff_aid:
+            eff_puid = str(platform_user_id or "").strip() or None
+            if (
+                not eff_aid
+                or not eff_bot
+                or eff_gen is None
+                or eff_gen < 1
+                or not eff_puid
+            ):
                 if gateway_epoch is not None or require_gateway_epoch:
                     async with get_db_connection(conn) as owned_conn:
                         async with owned_conn.transaction():
@@ -3630,41 +3639,27 @@ async def consume_bind_code_or_unbind(
                                     required=require_gateway_epoch,
                                     platform="weixin",
                                 )
-                return {"ok": False, "reason": "not_linked"}
-            if via_wechat and not eff_puid:
-                if gateway_epoch is not None or require_gateway_epoch:
-                    async with get_db_connection(conn) as owned_conn:
-                        async with owned_conn.transaction():
-                            async with owned_conn.cursor(row_factory=dict_row) as cur:
-                                await wx_db.verify_gateway_epoch_in_tx(
-                                    cur,
-                                    gateway_epoch,
-                                    required=require_gateway_epoch,
-                                    platform="weixin",
-                                )
-                return {"ok": False, "reason": "weixin_sender_mismatch"}
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "weixin_unbind_fields_required",
+                        "message": "微信解绑指令缺少必需字段（weixin_account_id / weixin_bot_id / weixin_bot_generation / platform_user_id）。",
+                    },
+                )
             return await wx_db.unbind_weixin_account(
                 target_user_id=eff_uid,
                 account_id=eff_aid,
                 operator_user_id=eff_uid or "system:weixin-unbind",
                 action="member_unbind",
-                via_wechat_command=via_wechat,
+                via_wechat_command=True,
                 gateway_epoch=gateway_epoch,
                 require_gateway_epoch=require_gateway_epoch,
-                expected_bot_id=(
-                    str(weixin_bot_id).strip()
-                    if weixin_bot_id and str(weixin_bot_id).strip()
-                    else None
-                ),
-                expected_bot_generation=(
-                    int(weixin_bot_generation)
-                    if weixin_bot_generation is not None
-                    else None
-                ),
-                expected_sender_ilink_user_id=eff_puid if via_wechat else None,
-                verify_live_roster=via_wechat,
-                one_time_context_token=weixin_context_token if via_wechat else None,
-                one_time_recipient_id=eff_puid if via_wechat else None,
+                expected_bot_id=eff_bot,
+                expected_bot_generation=eff_gen,
+                expected_sender_ilink_user_id=eff_puid,
+                verify_live_roster=True,
+                one_time_context_token=weixin_context_token,
+                one_time_recipient_id=eff_puid,
                 conn=conn,
             )
     return await _run_tx_with_retry(
@@ -4319,7 +4314,9 @@ async def _execute_weixin_collect_or_help_command(
         or ""
     ).strip()
 
-    # Helper to persist command_result for /collect, /cancel, /help, /done so replay never re-executes
+    # Helper to persist command_result for /collect, /cancel, /help, /done so replay never re-executes.
+    # R5 (Decision #6): Persist ONLY a safe whitelist in raw_payload (NEVER copy credentials,
+    # context_token, weixin_attachments, or weixin_media_meta).
     async def _persist_weixin_collect_command_result(
         cur_inner: Any,
         *,
@@ -4336,10 +4333,15 @@ async def _execute_weixin_collect_or_help_command(
         req_uuid_val = normalize_uuid(request_key) or str(
             uuid5(DALTON_CHANNEL_NAMESPACE, f"weixin:{cleaned_msg_id}")
         )
-        cmd_payload = dict(raw_payload or {})
-        cmd_payload.setdefault("cmd", cleaned_cmd)
+        raw_in_dict = raw_payload if isinstance(raw_payload, dict) else {}
+        cmd_payload: dict[str, Any] = {"cmd": cleaned_cmd}
         if cleaned_puid:
-            cmd_payload.setdefault("platform_user_id", cleaned_puid)
+            cmd_payload["platform_user_id"] = cleaned_puid
+        if raw_in_dict.get("seq") is not None:
+            cmd_payload["seq"] = raw_in_dict["seq"]
+        if raw_in_dict.get("create_time_ms") is not None:
+            cmd_payload["create_time_ms"] = raw_in_dict["create_time_ms"]
+        safe_res = _strip_sensitive_from_raw_payload(res_dict)
         await cur_inner.execute(
             """
             INSERT INTO dalton_channel_inbound_events (
@@ -4373,7 +4375,7 @@ async def _execute_weixin_collect_or_help_command(
                 cleaned_scope,
                 ws_val,
                 sess_gen_val,
-                Jsonb(res_dict),
+                Jsonb(safe_res),
                 Jsonb(cmd_payload),
                 aid_val,
                 bot_val,
@@ -4385,6 +4387,16 @@ async def _execute_weixin_collect_or_help_command(
     # D11 two-pass loop for pending_verification rollback+relock
     flushing_buffer_to_finalize: str | None = None
     phase_a_result: dict[str, Any] | None = None
+    cleaned_addr_str = str(chat_address or "").strip()
+    is_group_collect = (
+        str(chat_type or "").strip().lower() == "group"
+        or bool(
+            isinstance(raw_payload, dict)
+            and str(raw_payload.get("group_id") or "").strip()
+        )
+        or cleaned_addr_str.startswith("weixin:group:")
+        or cleaned_scope.startswith("chat:")
+    )
 
     for _pass in range(2):
         pending_aid: str | None = None
@@ -4403,41 +4415,9 @@ async def _execute_weixin_collect_or_help_command(
                             "SELECT pg_advisory_xact_lock(hashtext(%s))",
                             (f"dalton_inbound:weixin:{cleaned_msg_id}",),
                         )
-                        await cur.execute(
-                            """
-                            SELECT status, command_effect_status, command_reply_pending,
-                                   command_result, dalton_user_id, weixin_account_id::text AS weixin_account_id
-                            FROM dalton_channel_inbound_events
-                            WHERE platform = 'weixin' AND message_id = %s
-                            """,
-                            (cleaned_msg_id,),
-                        )
-                        ex_cmd_row = await cur.fetchone()
-                        if ex_cmd_row is not None and isinstance(
-                            ex_cmd_row.get("command_result"), dict
-                        ):
-                            ex_cmd_aid = (
-                                str(ex_cmd_row["weixin_account_id"])
-                                if ex_cmd_row.get("weixin_account_id")
-                                else None
-                            )
-                            if eff_aid and ex_cmd_aid and eff_aid != ex_cmd_aid:
-                                return {
-                                    "ok": False,
-                                    "linked": False,
-                                    "allowed": False,
-                                    "deny_reason": "weixin_message_id_account_mismatch",
-                                }
-                            saved_res = dict(ex_cmd_row["command_result"])
-                            saved_res["duplicate"] = True
-                            saved_res["command_effect_status"] = (
-                                ex_cmd_row.get("command_effect_status") or "done"
-                            )
-                            saved_res["command_reply_pending"] = bool(
-                                ex_cmd_row.get("command_reply_pending")
-                            )
-                            return saved_res
-                    if str(chat_type or "").strip().lower() == "group":
+                    # R5 (Decision #1 & #6): Authorize DM/group, account, bot/gen,
+                    # sender, live roster, and runtime switches BEFORE replay OR D11 verification!
+                    if is_group_collect:
                         return {
                             "ok": False,
                             "linked": False,
@@ -4480,76 +4460,157 @@ async def _execute_weixin_collect_or_help_command(
                         }
                     acc = dict(acc)
                     acc_id = str(acc["account_id"])
-                    if str(acc["status"]) == "pending_verification" and cleaned_puid:
-                        pending_aid = acc_id
+                    acc_uid = str(acc["user_id"])
+                    acc_bot_id = str(acc["ilink_bot_id"])
+                    acc_bot_gen = int(acc["bot_generation"])
+                    acc_status = str(acc["status"])
+                    reject_company_system_auth(acc_uid)
+                    if (eff_bot and eff_bot != acc_bot_id) or (
+                        eff_gen is not None and eff_gen != acc_bot_gen
+                    ):
+                        return {
+                            "ok": False,
+                            "linked": True,
+                            "allowed": False,
+                            "deny_reason": (
+                                "weixin_bot_generation_superseded"
+                                if acc_status == "pending_verification"
+                                else "weixin_bot_generation_mismatch"
+                            ),
+                            "dalton_user_id": acc_uid,
+                        }
+                    if acc_status not in ("active", "pending_verification"):
+                        return {
+                            "ok": False,
+                            "linked": True,
+                            "allowed": False,
+                            "deny_reason": f"weixin_account_{acc_status}",
+                            "dalton_user_id": acc_uid,
+                        }
+                    if (
+                        acc_status == "active"
+                        and cleaned_puid
+                        and acc.get("ilink_user_id")
+                        and str(acc["ilink_user_id"]) != cleaned_puid
+                    ):
+                        return {
+                            "ok": False,
+                            "linked": False,
+                            "allowed": False,
+                            "deny_reason": "weixin_sender_mismatch",
+                        }
+                    roster_st = await check_team_member_status_live(
+                        acc_uid, conn=owned_conn
+                    )
+                    if roster_st == "lookup_error":
+                        raise HTTPException(
+                            status_code=503,
+                            detail={
+                                "code": "roster_lookup_error",
+                                "message": "成员名册查询异常",
+                            },
+                        )
+                    if roster_st != "active":
+                        return {
+                            "ok": False,
+                            "linked": True,
+                            "allowed": False,
+                            "deny_reason": "member_not_in_roster",
+                            "dalton_user_id": acc_uid,
+                        }
+                    user_tier = await get_user_tier(acc_uid, conn=owned_conn)
+                    cfg = await wx_db.ensure_and_lock_weixin_config_in_tx(
+                        cur, for_update=False
+                    )
+                    acc_ok, acc_deny = evaluate_weixin_member_access(
+                        user_tier,
+                        channel_enabled=bool(cfg["enabled"]),
+                        db_allow_external=cfg.get("allow_external"),
+                    )
+                    if not acc_ok:
+                        return {
+                            "ok": False,
+                            "linked": True,
+                            "allowed": False,
+                            "deny_reason": acc_deny or "weixin_channel_disabled",
+                            "dalton_user_id": acc_uid,
+                            "user_tier": user_tier,
+                        }
+
+                    if acc_status == "pending_verification":
+                        if cleaned_puid:
+                            pending_aid = acc_id
+                        else:
+                            return {
+                                "ok": False,
+                                "linked": True,
+                                "allowed": False,
+                                "deny_reason": "weixin_account_pending_verification",
+                                "dalton_user_id": acc_uid,
+                            }
                     else:
-                        acc_uid = str(acc["user_id"])
-                        acc_bot_id = str(acc["ilink_bot_id"])
-                        acc_bot_gen = int(acc["bot_generation"])
-                        reject_company_system_auth(acc_uid)
-                        if (eff_bot and eff_bot != acc_bot_id) or (
-                            eff_gen is not None and eff_gen != acc_bot_gen
-                        ):
-                            return {
-                                "ok": False,
-                                "linked": True,
-                                "allowed": False,
-                                "deny_reason": "weixin_bot_generation_mismatch",
-                                "dalton_user_id": acc_uid,
-                            }
-                        if str(acc["status"]) != "active":
-                            return {
-                                "ok": False,
-                                "linked": True,
-                                "allowed": False,
-                                "deny_reason": f"weixin_account_{acc['status']}",
-                                "dalton_user_id": acc_uid,
-                            }
-                        if cleaned_puid and acc.get("ilink_user_id") and str(acc["ilink_user_id"]) != cleaned_puid:
-                            return {
-                                "ok": False,
-                                "linked": True,
-                                "allowed": False,
-                                "deny_reason": "weixin_sender_mismatch",
-                                "dalton_user_id": acc_uid,
-                            }
-                        roster_st = await check_team_member_status_live(
-                            acc_uid, conn=owned_conn
-                        )
-                        if roster_st == "lookup_error":
-                            raise HTTPException(
-                                status_code=503,
-                                detail={
-                                    "code": "roster_lookup_error",
-                                    "message": "成员名册查询异常",
-                                },
+                        if cleaned_msg_id:
+                            await cur.execute(
+                                """
+                                SELECT status, command_effect_status, command_reply_pending,
+                                       command_result, dalton_user_id,
+                                       weixin_account_id::text AS weixin_account_id,
+                                       weixin_context_bot_id, weixin_context_bot_generation
+                                FROM dalton_channel_inbound_events
+                                WHERE platform = 'weixin' AND message_id = %s
+                                """,
+                                (cleaned_msg_id,),
                             )
-                        if roster_st != "active":
-                            return {
-                                "ok": False,
-                                "linked": True,
-                                "allowed": False,
-                                "deny_reason": "member_not_in_roster",
-                                "dalton_user_id": acc_uid,
-                            }
-                        user_tier = await get_user_tier(acc_uid, conn=owned_conn)
-                        cfg = await wx_db.ensure_and_lock_weixin_config_in_tx(
-                            cur, for_update=False
-                        )
-                        acc_ok, acc_deny = evaluate_weixin_member_access(
-                            user_tier,
-                            channel_enabled=bool(cfg["enabled"]),
-                            db_allow_external=cfg.get("allow_external"),
-                        )
-                        if not acc_ok:
-                            return {
-                                "ok": False,
-                                "linked": True,
-                                "allowed": False,
-                                "deny_reason": acc_deny or "weixin_channel_disabled",
-                                "dalton_user_id": acc_uid,
-                                "user_tier": user_tier,
-                            }
+                            ex_cmd_row = await cur.fetchone()
+                            if ex_cmd_row is not None and isinstance(
+                                ex_cmd_row.get("command_result"), dict
+                            ):
+                                ex_cmd_aid = (
+                                    str(ex_cmd_row["weixin_account_id"])
+                                    if ex_cmd_row.get("weixin_account_id")
+                                    else None
+                                )
+                                ex_cmd_uid = (
+                                    str(ex_cmd_row["dalton_user_id"])
+                                    if ex_cmd_row.get("dalton_user_id")
+                                    else None
+                                )
+                                ex_cmd_bot = (
+                                    str(ex_cmd_row.get("weixin_context_bot_id") or "").strip()
+                                    or None
+                                )
+                                ex_cmd_gen = (
+                                    int(ex_cmd_row["weixin_context_bot_generation"])
+                                    if ex_cmd_row.get("weixin_context_bot_generation") is not None
+                                    else None
+                                )
+                                if (ex_cmd_aid and ex_cmd_aid != acc_id) or (
+                                    ex_cmd_uid and ex_cmd_uid != acc_uid
+                                ):
+                                    return {
+                                        "ok": False,
+                                        "linked": False,
+                                        "allowed": False,
+                                        "deny_reason": "weixin_message_id_account_mismatch",
+                                    }
+                                if (ex_cmd_bot and ex_cmd_bot != acc_bot_id) or (
+                                    ex_cmd_gen is not None and ex_cmd_gen != acc_bot_gen
+                                ):
+                                    return {
+                                        "ok": False,
+                                        "linked": False,
+                                        "allowed": False,
+                                        "deny_reason": "weixin_bot_generation_mismatch",
+                                    }
+                                saved_res = dict(ex_cmd_row["command_result"])
+                                saved_res["duplicate"] = True
+                                saved_res["command_effect_status"] = (
+                                    ex_cmd_row.get("command_effect_status") or "done"
+                                )
+                                saved_res["command_reply_pending"] = bool(
+                                    ex_cmd_row.get("command_reply_pending")
+                                )
+                                return saved_res
 
                         eff_sender = cleaned_puid or str(acc.get("ilink_user_id") or "")
                         if plain_tok and eff_sender:
@@ -5473,6 +5534,38 @@ async def _execute_session_command_once(
                     )
 
                 wx_acc_row: dict[str, Any] | None = None
+                pending_wx_account: dict[str, Any] | None = None
+                is_readonly_query = (
+                    cleaned_cmd == "workspace_list"
+                    and bool(is_internal_query)
+                    and not cleaned_msg_id
+                )
+                # R5 (Decision #1): Reject Weixin group commands BEFORE any account lookup
+                # or first-message verification.
+                if cleaned_platform == "weixin" and (
+                    cleaned_chat_type == "group"
+                    or bool(str(chat_id or "").strip())
+                    or bool(str(payload_dict.get("group_id") or "").strip())
+                    or cleaned_address.startswith("weixin:group:")
+                    or cleaned_scope.startswith("chat:")
+                ):
+                    return await _deny_and_ignore_command(
+                        {
+                            "ok": False,
+                            "linked": False,
+                            "allowed": False,
+                            "deny_reason": "weixin_group_unsupported",
+                        },
+                        uid_val=None,
+                    )
+
+                eff_cmd_wx_bot = str(weixin_bot_id or "").strip() or None
+                eff_cmd_wx_gen = (
+                    int(weixin_bot_generation)
+                    if weixin_bot_generation is not None
+                    else None
+                )
+
                 if cleaned_puid:
                     if cleaned_platform == "weixin":
                         norm_wx_aid = normalize_uuid(weixin_account_id) if weixin_account_id else None
@@ -5489,23 +5582,59 @@ async def _execute_session_command_once(
                             )
                             raw_wx = await cur.fetchone()
                         wx_acc_row = dict(raw_wx) if raw_wx else None
-                        if (
-                            wx_acc_row is not None
-                            and str(wx_acc_row.get("status")) == "pending_verification"
-                        ):
-                            raise _PendingWeixinVerificationNeeded(
-                                account_id=str(wx_acc_row["account_id"])
-                            )
-                        identity = (
-                            wx_acc_row
-                            if wx_acc_row
-                            and str(wx_acc_row.get("status")) == "active"
-                            and (
-                                not wx_acc_row.get("platform_user_id")
-                                or str(wx_acc_row["platform_user_id"]) == cleaned_puid
-                            )
-                            else None
-                        )
+                        if wx_acc_row is not None:
+                            wx_st = str(wx_acc_row.get("status") or "")
+                            wx_bot = str(wx_acc_row.get("ilink_bot_id") or "")
+                            wx_gen = int(wx_acc_row.get("bot_generation") or 0)
+                            if (eff_cmd_wx_bot and eff_cmd_wx_bot != wx_bot) or (
+                                eff_cmd_wx_gen is not None and eff_cmd_wx_gen != wx_gen
+                            ):
+                                return await _deny_and_ignore_command(
+                                    {
+                                        "ok": False,
+                                        "linked": True,
+                                        "allowed": False,
+                                        "deny_reason": (
+                                            "weixin_bot_generation_superseded"
+                                            if wx_st == "pending_verification"
+                                            else "weixin_bot_generation_mismatch"
+                                        ),
+                                    },
+                                    uid_val=None,
+                                )
+                            if wx_st == "pending_verification":
+                                # Defer D11 first-message verification until AFTER all
+                                # authorization (roster, standing, switches) succeeds,
+                                # and NEVER verify on read-only internal queries!
+                                pending_wx_account = wx_acc_row
+                                identity = wx_acc_row
+                            elif wx_st == "active":
+                                if (
+                                    wx_acc_row.get("platform_user_id")
+                                    and str(wx_acc_row["platform_user_id"]) != cleaned_puid
+                                ):
+                                    return await _deny_and_ignore_command(
+                                        {
+                                            "ok": False,
+                                            "linked": False,
+                                            "allowed": False,
+                                            "deny_reason": "weixin_sender_mismatch",
+                                        },
+                                        uid_val=None,
+                                    )
+                                identity = wx_acc_row
+                            else:
+                                return await _deny_and_ignore_command(
+                                    {
+                                        "ok": False,
+                                        "linked": True,
+                                        "allowed": False,
+                                        "deny_reason": f"weixin_account_{wx_st}",
+                                    },
+                                    uid_val=None,
+                                )
+                        else:
+                            identity = None
                     else:
                         await cur.execute(
                             """
@@ -5748,6 +5877,23 @@ async def _execute_session_command_once(
                             ),
                         },
                         uid_val=cleaned_uid,
+                    )
+
+                # R5 (Decision #1): Only trigger D11 first-message verification AFTER all
+                # authorization (account, bot/gen, DM/group, standing, live roster, switches)
+                # has succeeded, and NEVER on read-only internal queries (e.g. workspace_list).
+                if pending_wx_account is not None:
+                    if is_readonly_query:
+                        return {
+                            "ok": False,
+                            "linked": True,
+                            "allowed": False,
+                            "dalton_user_id": cleaned_uid,
+                            "user_tier": user_tier,
+                            "deny_reason": "weixin_account_pending_verification",
+                        }
+                    raise _PendingWeixinVerificationNeeded(
+                        account_id=str(pending_wx_account["account_id"])
                     )
 
                 home_ws_id = get_home_workspace_id(cleaned_uid)
@@ -9263,6 +9409,81 @@ async def authorize_and_claim_delivery(
                     )
 
                     if not source_row:
+                        # R5 (Decision #4): For Weixin conversation deliveries with no
+                        # verifiable source, record status='unknown' + audit log BEFORE
+                        # returning denied (after capability & gateway_epoch checks).
+                        if cleaned_platform == "weixin":
+                            require_channel_platform_capability("weixin")
+                            await wx_db.verify_gateway_epoch_in_tx(
+                                cur,
+                                gateway_epoch,
+                                required=require_gateway_epoch,
+                                platform="weixin",
+                            )
+                            miss_uid = cleaned_uid or "unlinked:weixin:"
+                            await cur.execute(
+                                """
+                                INSERT INTO dalton_channel_deliveries (
+                                    delivery_key, kind, user_id, thread_id, run_id, execution_id,
+                                    is_current, has_non_empty_text, platform, target_address,
+                                    status, total_chunks, sent_chunks, platform_message_ids,
+                                    files_status, error_code, error_message,
+                                    source_scope_key, source_generation, activity_origin,
+                                    delivery_attempt, created_at, updated_at
+                                )
+                                VALUES (
+                                    %s, %s, %s, %s, %s, %s,
+                                    TRUE, %s, 'weixin', 'weixin:@me',
+                                    'unknown', %s, 0, '[]'::jsonb,
+                                    '[]'::jsonb, 'source_generation_unknown', %s,
+                                    %s, %s, %s,
+                                    1, NOW(), NOW()
+                                )
+                                ON CONFLICT (delivery_key) DO UPDATE SET
+                                    status = 'unknown',
+                                    error_code = EXCLUDED.error_code,
+                                    error_message = EXCLUDED.error_message,
+                                    updated_at = NOW()
+                                """,
+                                (
+                                    cleaned_key,
+                                    cleaned_kind,
+                                    miss_uid,
+                                    norm_tid,
+                                    cleaned_rid,
+                                    eff_exec_id,
+                                    bool(has_non_empty_text),
+                                    int(total_chunks or 0),
+                                    "No verifiable Weixin conversation source found for this delivery.",
+                                    eff_source_scope,
+                                    eff_source_gen,
+                                    eff_activity_origin,
+                                ),
+                            )
+                            await wx_db.write_weixin_audit_log_in_tx(
+                                cur,
+                                action="ambiguous_legacy_delivery_blocked",
+                                operator_user_id="system:delivery-guard",
+                                target_user_id=(
+                                    cleaned_uid
+                                    if cleaned_uid
+                                    and not str(cleaned_uid).startswith("unlinked:")
+                                    else None
+                                ),
+                                metadata={
+                                    "delivery_key": cleaned_key,
+                                    "error_code": "source_generation_unknown",
+                                    "source_kind": "missing_source",
+                                    "run_id": cleaned_rid,
+                                    "thread_id": norm_tid,
+                                },
+                            )
+                            return {
+                                "claim_status": "denied",
+                                "status": "unknown",
+                                "code": "source_generation_unknown",
+                                "message": "No verifiable Weixin conversation source found for this delivery.",
+                            }
                         return {
                             "claim_status": "denied",
                             "status": "failed",
@@ -9391,14 +9612,18 @@ async def authorize_and_claim_delivery(
                         weixin_source_row = dict(source_row)
                         src_tbl = str(source_row.get("_source_table") or "")
                         matched_exact_run = bool(source_row.get("_matched_exact_run"))
-                        if cleaned_rid and not matched_exact_run:
-                            # Codex #7: Do NOT borrow thread_watches' post-rescan generation
-                            # or another run's inbound row for an unmatched Weixin run_id!
+                        # R5 (Decision #4): Weixin conversation deliveries MUST match
+                        # an exact persisted per-turn inbound_events or background_runs
+                        # row by run_id. NEVER borrow thread_watches' latest generation
+                        # when run_id is absent or unmatched!
+                        if (
+                            not cleaned_rid
+                            or not matched_exact_run
+                            or src_tbl not in ("inbound_events", "background_runs")
+                        ):
                             weixin_source_kind = "unmatched_run"
                         elif src_tbl == "background_runs":
                             weixin_source_kind = "background_run"
-                        elif src_tbl == "thread_watches":
-                            weixin_source_kind = "thread_watch"
                         else:
                             weixin_source_kind = "inbound"
                         await cur.execute(
@@ -9793,6 +10018,22 @@ async def authorize_and_claim_delivery(
                             "code": err_code,
                             "message": err_msg,
                         }
+
+                    if weixin_source_kind == "unmatched_run":
+                        return await _block_ambiguous_weixin_delivery(
+                            "source_generation_unknown",
+                            "Weixin conversation delivery has no persisted per-turn inbound or background_run source matching run_id.",
+                            {
+                                "source_kind": "unmatched_run",
+                                "run_id": cleaned_rid,
+                                "thread_id": norm_tid,
+                                "fallback_table": (
+                                    str(weixin_source_row.get("_source_table") or "")
+                                    if weixin_source_row
+                                    else None
+                                ),
+                            },
+                        )
 
                     if resolved_user_id and not str(resolved_user_id).startswith("unlinked:"):
                         roster_st = await check_team_member_status_live(
@@ -11229,106 +11470,143 @@ async def _update_inbound_progress_once(
                     bg_wx_recip: str | None = (
                         str(background_run.get("weixin_recipient_id") or "").strip() or None
                     )
-                    bg_wx_gen: int | None = (
-                        int(background_run["weixin_bot_generation"])
-                        if background_run.get("weixin_bot_generation") is not None
-                        else None
-                    )
-                    if bg_plat == "weixin" and bg_tid and (
-                        bg_wx_aid is None or bg_wx_recip is None or bg_wx_gen is None
-                    ):
-                        await cur.execute(
-                            """
-                            SELECT weixin_account_id::text AS weixin_account_id,
-                                   weixin_recipient_id,
-                                   weixin_bot_generation
-                            FROM dalton_channel_thread_watches
-                            WHERE thread_id = %s AND platform = 'weixin'
-                            """,
-                            (bg_tid,),
-                        )
-                        w_src = await cur.fetchone()
-                        if w_src:
-                            if bg_wx_aid is None and w_src.get("weixin_account_id"):
-                                bg_wx_aid = str(w_src["weixin_account_id"])
-                            if bg_wx_recip is None and w_src.get("weixin_recipient_id"):
-                                bg_wx_recip = str(w_src["weixin_recipient_id"])
-                            if bg_wx_gen is None and w_src.get("weixin_bot_generation") is not None:
-                                watch_gen = int(w_src["weixin_bot_generation"])
-                                # Codex ① / Grok High: DO NOT blindly copy the watch's post-rescan
-                                # bot_generation onto a pre-rescan turn! Compare turn creation time
-                                # against bot_generation_updated_at when a rescan occurred.
-                                acc_prev_gen: int | None = None
-                                acc_gen_updated_at: datetime | None = None
-                                if bg_wx_aid:
+                    bg_wx_gen: int | None = None
+                    if bg_plat == "weixin":
+                        # R5 (Decision #4): ALWAYS compute authoritative Weixin source
+                        # fields from DB (thread_watches + accounts + conversation_queries
+                        # turn creation timestamp vs bot_generation_updated_at), NEVER
+                        # trusting caller-supplied weixin_bot_generation blindly!
+                        watch_gen: int | None = None
+                        if bg_tid:
+                            await cur.execute(
+                                """
+                                SELECT weixin_account_id::text AS weixin_account_id,
+                                       weixin_recipient_id,
+                                       weixin_bot_generation
+                                FROM dalton_channel_thread_watches
+                                WHERE thread_id = %s AND platform = 'weixin'
+                                """,
+                                (bg_tid,),
+                            )
+                            w_src = await cur.fetchone()
+                            if w_src:
+                                if w_src.get("weixin_account_id"):
+                                    bg_wx_aid = str(w_src["weixin_account_id"])
+                                if w_src.get("weixin_recipient_id"):
+                                    bg_wx_recip = str(w_src["weixin_recipient_id"])
+                                if w_src.get("weixin_bot_generation") is not None:
+                                    watch_gen = int(w_src["weixin_bot_generation"])
+
+                        acc_g_row = None
+                        if bg_wx_aid:
+                            await cur.execute(
+                                """
+                                SELECT account_id::text AS account_id,
+                                       ilink_user_id,
+                                       bot_generation,
+                                       prev_bot_generation,
+                                       bot_generation_updated_at
+                                FROM dalton_channel_weixin_accounts
+                                WHERE account_id = %s::uuid
+                                """,
+                                (bg_wx_aid,),
+                            )
+                            acc_g_row = await cur.fetchone()
+                        elif bg_uid:
+                            await cur.execute(
+                                """
+                                SELECT account_id::text AS account_id,
+                                       ilink_user_id,
+                                       bot_generation,
+                                       prev_bot_generation,
+                                       bot_generation_updated_at
+                                FROM dalton_channel_weixin_accounts
+                                WHERE user_id = %s
+                                """,
+                                (bg_uid,),
+                            )
+                            acc_g_row = await cur.fetchone()
+                            if acc_g_row:
+                                if bg_wx_aid is None and acc_g_row.get("account_id"):
+                                    bg_wx_aid = str(acc_g_row["account_id"])
+                                if bg_wx_recip is None and acc_g_row.get("ilink_user_id"):
+                                    bg_wx_recip = str(acc_g_row["ilink_user_id"])
+
+                        if acc_g_row is not None:
+                            acc_cur_gen = (
+                                int(acc_g_row["bot_generation"])
+                                if acc_g_row.get("bot_generation") is not None
+                                else watch_gen
+                            )
+                            eff_cur_gen = watch_gen if watch_gen is not None else acc_cur_gen
+                            acc_prev_gen = (
+                                int(acc_g_row["prev_bot_generation"])
+                                if acc_g_row.get("prev_bot_generation") is not None
+                                else None
+                            )
+                            acc_gen_updated_at = wx_db._coerce_utc(
+                                acc_g_row.get("bot_generation_updated_at")
+                            )
+                            if acc_gen_updated_at is None:
+                                bg_wx_gen = eff_cur_gen
+                            else:
+                                # Prefer DB conversation_queries.created_at over any caller timestamp
+                                turn_created_at: datetime | None = None
+                                if bg_rid:
                                     await cur.execute(
                                         """
-                                        SELECT prev_bot_generation, bot_generation_updated_at
-                                        FROM dalton_channel_weixin_accounts
-                                        WHERE account_id = %s::uuid
+                                        SELECT q.created_at AS turn_created_at
+                                        FROM conversation_queries q
+                                        JOIN conversation_responses r
+                                          ON r.conversation_thread_id = q.conversation_thread_id
+                                         AND r.turn_index = q.turn_index
+                                        WHERE r.conversation_response_id = %s
+                                        LIMIT 1
                                         """,
-                                        (bg_wx_aid,),
+                                        (bg_rid,),
                                     )
-                                    acc_g_row = await cur.fetchone()
-                                    if acc_g_row:
-                                        if acc_g_row.get("prev_bot_generation") is not None:
-                                            acc_prev_gen = int(acc_g_row["prev_bot_generation"])
-                                        acc_gen_updated_at = wx_db._coerce_utc(
-                                            acc_g_row.get("bot_generation_updated_at")
+                                    tq_row = await cur.fetchone()
+                                    if tq_row:
+                                        turn_created_at = wx_db._coerce_utc(
+                                            tq_row.get("turn_created_at")
                                         )
-                                if acc_gen_updated_at is None:
-                                    bg_wx_gen = watch_gen
-                                else:
-                                    turn_created_at: datetime | None = wx_db._coerce_utc(
-                                        background_run.get("turn_created_at")
+                                if turn_created_at is None and bg_tid and bg_tidx is not None:
+                                    await cur.execute(
+                                        """
+                                        SELECT created_at AS turn_created_at
+                                        FROM conversation_queries
+                                        WHERE conversation_thread_id = %s
+                                          AND turn_index = %s
+                                        LIMIT 1
+                                        """,
+                                        (bg_tid, int(bg_tidx)),
                                     )
-                                    if turn_created_at is None and bg_rid:
-                                        await cur.execute(
-                                            """
-                                            SELECT q.created_at AS turn_created_at
-                                            FROM conversation_queries q
-                                            JOIN conversation_responses r
-                                              ON r.conversation_thread_id = q.conversation_thread_id
-                                             AND r.turn_index = q.turn_index
-                                            WHERE r.conversation_response_id = %s
-                                            LIMIT 1
-                                            """,
-                                            (bg_rid,),
+                                    tq_row2 = await cur.fetchone()
+                                    if tq_row2:
+                                        turn_created_at = wx_db._coerce_utc(
+                                            tq_row2.get("turn_created_at")
                                         )
-                                        tq_row = await cur.fetchone()
-                                        if tq_row:
-                                            turn_created_at = wx_db._coerce_utc(
-                                                tq_row.get("turn_created_at")
-                                            )
-                                    if turn_created_at is None and bg_tidx is not None:
-                                        await cur.execute(
-                                            """
-                                            SELECT created_at AS turn_created_at
-                                            FROM conversation_queries
-                                            WHERE conversation_thread_id = %s
-                                              AND turn_index = %s
-                                            LIMIT 1
-                                            """,
-                                            (bg_tid, int(bg_tidx)),
+                                if turn_created_at is not None and eff_cur_gen is not None:
+                                    if turn_created_at < acc_gen_updated_at:
+                                        bg_wx_gen = (
+                                            acc_prev_gen
+                                            if acc_prev_gen is not None
+                                            else max(1, eff_cur_gen - 1)
                                         )
-                                        tq_row2 = await cur.fetchone()
-                                        if tq_row2:
-                                            turn_created_at = wx_db._coerce_utc(
-                                                tq_row2.get("turn_created_at")
-                                            )
-                                    if turn_created_at is not None:
-                                        if turn_created_at < acc_gen_updated_at:
-                                            bg_wx_gen = (
-                                                acc_prev_gen
-                                                if acc_prev_gen is not None
-                                                else max(1, watch_gen - 1)
-                                            )
-                                        else:
-                                            bg_wx_gen = watch_gen
                                     else:
-                                        # Cannot verify turn predates or postdates rescan -> keep None
-                                        # so I-6 conservatively marks unknown + writes audit.
-                                        bg_wx_gen = None
+                                        bg_wx_gen = eff_cur_gen
+                                else:
+                                    # Cannot verify DB turn creation timestamp against rescan ->
+                                    # fail closed (None) so I-6 marks unknown + writes audit.
+                                    bg_wx_gen = None
+                        else:
+                            bg_wx_gen = watch_gen
+                    else:
+                        bg_wx_gen = (
+                            int(background_run["weixin_bot_generation"])
+                            if background_run.get("weixin_bot_generation") is not None
+                            else None
+                        )
 
                     await cur.execute(
                         """
@@ -11917,37 +12195,85 @@ async def recover_channel_state(
                     }
 
                 # mode == "startup"
-                # ① Mark lingering in_flight deliveries for ENABLED platforms as unknown / gateway_restarted.
-                # Codex #11: when channel_weixin is disabled, do NOT mutate Weixin deliveries,
-                # collect buffers, or Weixin watches during recovery.
+                # R5 (Decision #5): Lock active thread_watches in deterministic thread_id ASC
+                # order FIRST (matching unbind_weixin_account's watch -> account -> delivery FK
+                # lock order), THEN settle in_flight deliveries using FOR UPDATE SKIP LOCKED in
+                # delivery_key ASC order to eliminate AB-BA deadlocks (40P01) against concurrent
+                # unbind transactions.
+                # R5 (Decision #7): When channel_weixin is disabled, NEVER touch or mutate ANY
+                # Weixin watches, deliveries, collect buffers, or inbound events.
                 if weixin_on:
                     await cur.execute(
                         """
-                        UPDATE dalton_channel_deliveries
-                        SET status = 'unknown',
-                            error_code = 'gateway_restarted',
-                            updated_at = NOW()
-                        WHERE status = 'in_flight'
-                        RETURNING delivery_key, user_id, platform,
-                                  weixin_account_id::text AS weixin_account_id,
-                                  weixin_bot_id, weixin_bot_generation, weixin_recipient_id
+                        SELECT * FROM dalton_channel_thread_watches
+                        WHERE watch_active = TRUE
+                        ORDER BY thread_id ASC
+                        FOR UPDATE
                         """
                     )
                 else:
                     await cur.execute(
                         """
+                        SELECT * FROM dalton_channel_thread_watches
+                        WHERE watch_active = TRUE
+                          AND platform <> 'weixin'
+                        ORDER BY thread_id ASC
+                        FOR UPDATE
+                        """
+                    )
+                active_watches = [
+                    dict(r)
+                    for r in await cur.fetchall()
+                    if _platform_enabled_for_recovery(r.get("platform"))
+                ]
+                await _backfill_watch_notification_runs_in_tx(cur, active_watches)
+
+                # ① Mark lingering in_flight deliveries for ENABLED platforms as unknown / gateway_restarted
+                # using FOR UPDATE SKIP LOCKED so rows concurrently locked by unbind FK SET NULL
+                # never trigger 40P01.
+                if weixin_on:
+                    await cur.execute(
+                        """
+                        SELECT delivery_key
+                        FROM dalton_channel_deliveries
+                        WHERE status = 'in_flight'
+                        ORDER BY delivery_key ASC
+                        FOR UPDATE SKIP LOCKED
+                        """
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        SELECT delivery_key
+                        FROM dalton_channel_deliveries
+                        WHERE status = 'in_flight'
+                          AND platform <> 'weixin'
+                        ORDER BY delivery_key ASC
+                        FOR UPDATE SKIP LOCKED
+                        """
+                    )
+                locked_in_flight_keys = [
+                    str(r["delivery_key"])
+                    for r in await cur.fetchall()
+                    if r.get("delivery_key")
+                ]
+                settled_in_flight: list[dict[str, Any]] = []
+                if locked_in_flight_keys:
+                    await cur.execute(
+                        """
                         UPDATE dalton_channel_deliveries
                         SET status = 'unknown',
                             error_code = 'gateway_restarted',
                             updated_at = NOW()
-                        WHERE status = 'in_flight'
-                          AND platform <> 'weixin'
+                        WHERE delivery_key = ANY(%s::text[])
+                          AND status = 'in_flight'
                         RETURNING delivery_key, user_id, platform,
                                   weixin_account_id::text AS weixin_account_id,
                                   weixin_bot_id, weixin_bot_generation, weixin_recipient_id
-                        """
+                        """,
+                        (locked_in_flight_keys,),
                     )
-                settled_in_flight = [dict(r) for r in await cur.fetchall()]
+                    settled_in_flight = [dict(r) for r in await cur.fetchall()]
                 if weixin_on:
                     for d_item in settled_in_flight:
                         if str(d_item.get("platform") or "").lower() != "weixin":
@@ -11998,51 +12324,72 @@ async def recover_channel_state(
                         """
                     )
 
-                # ② Backfill notification/wakeup turns for active thread watches of ENABLED platforms
-                await cur.execute(
-                    """
-                    SELECT * FROM dalton_channel_thread_watches
-                    WHERE watch_active = TRUE
-                    FOR UPDATE
-                    """
-                )
-                active_watches = [
-                    dict(r)
-                    for r in await cur.fetchall()
-                    if _platform_enabled_for_recovery(r.get("platform"))
-                ]
-                await _backfill_watch_notification_runs_in_tx(cur, active_watches)
-
-                await cur.execute(
-                    """
-                    UPDATE dalton_channel_inbound_events
-                    SET status = 'ignored',
-                        raw_payload = COALESCE(raw_payload, '{}'::jsonb)
-                            || jsonb_build_object(
-                                'invalid_inbound_event', TRUE,
-                                'deny_reason', 'invalid_inbound_event'
-                            ),
-                        updated_at = NOW()
-                    WHERE status = 'pending'
-                      AND (
-                        COALESCE(raw_payload->>'invalid_inbound_event', '') IN ('true', 'True')
-                        OR COALESCE(raw_payload->>'invalid_inbound', '') IN ('true', 'True')
-                        OR raw_payload->>'rejected_reason' = 'invalid_inbound_event'
-                        OR raw_payload->>'deny_reason' = 'invalid_inbound_event'
-                      )
-                    """
-                )
+                # ② Heal invalid pending inbound events (skip platform='weixin' when capability disabled)
+                if weixin_on:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_channel_inbound_events
+                        SET status = 'ignored',
+                            raw_payload = COALESCE(raw_payload, '{}'::jsonb)
+                                || jsonb_build_object(
+                                    'invalid_inbound_event', TRUE,
+                                    'deny_reason', 'invalid_inbound_event'
+                                ),
+                            updated_at = NOW()
+                        WHERE status = 'pending'
+                          AND (
+                            COALESCE(raw_payload->>'invalid_inbound_event', '') IN ('true', 'True')
+                            OR COALESCE(raw_payload->>'invalid_inbound', '') IN ('true', 'True')
+                            OR raw_payload->>'rejected_reason' = 'invalid_inbound_event'
+                            OR raw_payload->>'deny_reason' = 'invalid_inbound_event'
+                          )
+                        """
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_channel_inbound_events
+                        SET status = 'ignored',
+                            raw_payload = COALESCE(raw_payload, '{}'::jsonb)
+                                || jsonb_build_object(
+                                    'invalid_inbound_event', TRUE,
+                                    'deny_reason', 'invalid_inbound_event'
+                                ),
+                            updated_at = NOW()
+                        WHERE status = 'pending'
+                          AND platform <> 'weixin'
+                          AND (
+                            COALESCE(raw_payload->>'invalid_inbound_event', '') IN ('true', 'True')
+                            OR COALESCE(raw_payload->>'invalid_inbound', '') IN ('true', 'True')
+                            OR raw_payload->>'rejected_reason' = 'invalid_inbound_event'
+                            OR raw_payload->>'deny_reason' = 'invalid_inbound_event'
+                          )
+                        """
+                    )
 
                 # Heal any historical pending_cancel command rows that lack a pinned target run_id
-                await cur.execute(
-                    """
-                    UPDATE dalton_channel_inbound_events
-                    SET command_effect_status = 'done',
-                        updated_at = NOW()
-                    WHERE command_effect_status = 'pending_cancel'
-                      AND (thread_id IS NULL OR run_id IS NULL OR btrim(run_id) = '')
-                    """
-                )
+                # (skip platform='weixin' when capability disabled)
+                if weixin_on:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_channel_inbound_events
+                        SET command_effect_status = 'done',
+                            updated_at = NOW()
+                        WHERE command_effect_status = 'pending_cancel'
+                          AND (thread_id IS NULL OR run_id IS NULL OR btrim(run_id) = '')
+                        """
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_channel_inbound_events
+                        SET command_effect_status = 'done',
+                            updated_at = NOW()
+                        WHERE command_effect_status = 'pending_cancel'
+                          AND platform <> 'weixin'
+                          AND (thread_id IS NULL OR run_id IS NULL OR btrim(run_id) = '')
+                        """
+                    )
 
                 # ③ Fetch all recovery sets (filtered by active capabilities; decrypt Weixin media meta)
                 enc_key: str | None = None

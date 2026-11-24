@@ -435,11 +435,16 @@ SNAPSHOT_CREATED=0
 FILES_REPLACED=0
 IMAGES_BUILT=0
 # Migration state:
-#   "before"   - failure occurred strictly BEFORE `migrate` was invoked
-#   "migrated" - both pre/post versions read cleanly and at least one version changed
-#   "unknown"  - `migrate` was invoked and either pre/post versions could not be read
-#                OR versions stayed identical (partial DDL e.g. autocommit_block may have run)
+#   "before"      - failure occurred strictly BEFORE `migrate` was invoked
+#   "rolled_back" - `migrate` failed, versions stayed identical, upstream was already
+#                   at head (pure transactional Dalton migration), and upgrade.sh
+#                   automatically restored files, image tags, and previous services
+#   "migrated"    - both pre/post versions read cleanly and at least one version changed
+#   "unknown"     - `migrate` was invoked and either pre/post versions could not be read
+#                   OR versions stayed identical while upstream migration may have run
 MIGRATION_STATE="before"
+AUTO_RECOVERED=0
+STOPPED_SERVICES=()
 PRE_MIGRATE_UP=""
 PRE_MIGRATE_DA=""
 POST_MIGRATE_UP=""
@@ -452,6 +457,22 @@ MANUAL_OVERWRITE_REF="docs/dalton/dev-guide/STANDALONE-DEPLOY.md (§6.2 在已�
 
 print_rollback_steps() {
   printf "\n==================== UPGRADE FAILED — ROLLBACK GUIDE ====================\n" >&2
+  if [[ "$AUTO_RECOVERED" -eq 1 ]]; then
+    printf "  Database migration failed cleanly before advancing any Alembic version (upstream was\n" >&2
+    printf "  already at head; pure transactional Dalton migration rolled back automatically).\n" >&2
+    printf "  upgrade.sh has ALREADY restored the pre-upgrade release files, container image tags,\n" >&2
+    printf "  and restarted the previous services (%s).\n" "${STOPPED_SERVICES[*]:-backend crawler}" >&2
+    if [[ -n "$PRE_UPGRADE_BACKUP" && -d "$PRE_UPGRADE_BACKUP" ]]; then
+      printf "  Pre-upgrade backup : %s (no data restore required)\n" "$PRE_UPGRADE_BACKUP" >&2
+    fi
+    if [[ "$SNAPSHOT_CREATED" -eq 1 && -d "$SNAPSHOT_DIR" ]]; then
+      printf "  Release snapshot   : %s\n" "$SNAPSHOT_DIR" >&2
+    fi
+    printf "  Verify service status and inspect the migration error above:\n" >&2
+    printf "    %s\n" "$(fmt_cmd docker compose "${COMPOSE_PRINT_ARGS[@]}" ps)" >&2
+    printf "=========================================================================\n" >&2
+    return 0
+  fi
   if [[ "$FILES_REPLACED" -eq 0 && "$IMAGES_BUILT" -eq 0 && "$MIGRATION_STATE" == "before" ]]; then
     printf "  Failure occurred BEFORE release files, container images, or the database were modified.\n" >&2
     if [[ -n "$PRE_UPGRADE_BACKUP" && -d "$PRE_UPGRADE_BACKUP" ]]; then
@@ -749,9 +770,144 @@ read_alembic_versions() {
   printf '%s\t%s\n' "$up" "$da"
 }
 
-info "Running new version database migrations..."
+resolve_new_upstream_head() {
+  local mig_dir="${WORK_DIR}/migrations/versions"
+  if [[ ! -d "$mig_dir" ]]; then
+    return 1
+  fi
+  python3 - "$mig_dir" <<'PY' 2>/dev/null
+import ast, glob, os, sys
+
+mig_dir = sys.argv[1]
+revs: set[str] = set()
+parents: set[str] = set()
+for path in sorted(glob.glob(os.path.join(mig_dir, "*.py"))):
+    try:
+        tree = ast.parse(open(path, encoding="utf-8").read(), filename=path)
+    except Exception:
+        continue
+    rev = None
+    down = None
+    for node in tree.body:
+        targets = []
+        val = None
+        if isinstance(node, ast.Assign):
+            targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            val = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            targets = [node.target.id]
+            val = node.value
+        if val is None:
+            continue
+        if "revision" in targets and isinstance(val, ast.Constant) and isinstance(val.value, str):
+            rev = val.value.strip()
+        elif "down_revision" in targets:
+            if isinstance(val, ast.Constant) and isinstance(val.value, str):
+                down = [val.value.strip()]
+            elif isinstance(val, (ast.Tuple, ast.List)):
+                down = [
+                    el.value.strip()
+                    for el in val.elts
+                    if isinstance(el, ast.Constant) and isinstance(el.value, str)
+                ]
+    if rev:
+        revs.add(rev)
+        if down:
+            parents.update(down)
+heads = sorted(revs - parents)
+if len(heads) == 1:
+    sys.stdout.write(heads[0])
+else:
+    sys.exit(1)
+PY
+}
+
+restore_pre_upgrade_files_and_images() {
+  if [[ "$FILES_REPLACED" -eq 1 && "$SNAPSHOT_CREATED" -eq 1 && -d "$SNAPSHOT_DIR" ]]; then
+    if command -v rsync >/dev/null 2>&1; then
+      rsync -aI --delete \
+        --exclude=/.env \
+        --exclude=/backups \
+        --exclude=/.upgrade-backup \
+        --exclude=/.restore-backup \
+        --exclude=/ci-artifacts \
+        --exclude=/.git \
+        --exclude=/deploy/standalone/certs \
+        --exclude=/deploy/standalone/extra \
+        "${SNAPSHOT_DIR}/" "${WORK_DIR}/"
+    else
+      (
+        cd "$SNAPSHOT_DIR"
+        tar -cf - \
+          --exclude='./.env' \
+          --exclude='.env' \
+          --exclude='./backups' \
+          --exclude='backups' \
+          --exclude='./.upgrade-backup' \
+          --exclude='.upgrade-backup' \
+          --exclude='./.restore-backup' \
+          --exclude='.restore-backup' \
+          --exclude='./ci-artifacts' \
+          --exclude='ci-artifacts' \
+          --exclude='./.git' \
+          --exclude='.git' \
+          --exclude='./deploy/standalone/certs' \
+          --exclude='deploy/standalone/certs' \
+          --exclude='./deploy/standalone/extra' \
+          --exclude='deploy/standalone/extra' \
+          .
+      ) | tar -xf - -C "$WORK_DIR"
+    fi
+  fi
+  if [[ -n "$PRE_BACKEND_TAG" ]]; then
+    docker tag "$PRE_BACKEND_TAG" "$BACKEND_IMAGE"
+  fi
+  if [[ -n "$PRE_EDGE_TAG" ]]; then
+    docker tag "$PRE_EDGE_TAG" "$EDGE_IMAGE"
+  fi
+}
+
+info "Stopping application services before database migrations (prevents lock contention on hot tables)..."
 MIG_DB_USER="$(read_env_file_var "$ENV_FILE" "DB_USER" "postgres")"
 MIG_DB_NAME="$(read_env_file_var "$ENV_FILE" "DB_NAME" "postgres")"
+CONFIG_SERVICES_LIST="$(compose_cmd config --services 2>/dev/null || true)"
+STOP_BEFORE_MIGRATE_SERVICES=()
+for candidate_svc in channel-gateway backend crawler; do
+  if grep -qx "$candidate_svc" <<<"$CONFIG_SERVICES_LIST"; then
+    STOP_BEFORE_MIGRATE_SERVICES+=("$candidate_svc")
+  fi
+done
+if [[ "${#STOP_BEFORE_MIGRATE_SERVICES[@]}" -eq 0 ]]; then
+  STOP_BEFORE_MIGRATE_SERVICES=(backend crawler)
+fi
+compose_cmd stop "${STOP_BEFORE_MIGRATE_SERVICES[@]}"
+STOPPED_SERVICES=("${STOP_BEFORE_MIGRATE_SERVICES[@]}")
+ok "Stopped services before migrate: ${STOPPED_SERVICES[*]}."
+
+MIGRATE_DRAIN_TIMEOUT_S="${DALTON_MIGRATE_DRAIN_TIMEOUT_S:-30}"
+info "Waiting up to ${MIGRATE_DRAIN_TIMEOUT_S}s for database connections to drain..."
+db_drained=0
+for _ in $(seq 1 "$MIGRATE_DRAIN_TIMEOUT_S"); do
+  active_conns="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND state IS NOT NULL;" 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ "$active_conns" == "0" ]]; then
+    db_drained=1
+    break
+  fi
+  if [[ -z "$active_conns" ]]; then
+    # The count could not be read (postgres not reachable this way); waiting longer
+    # cannot change that, so go on and let migrate report any real problem.
+    break
+  fi
+  sleep 1
+done
+if [[ "$db_drained" -eq 1 ]]; then
+  ok "Database connections drained cleanly."
+else
+  warn "Database still had non-zero connections after ${MIGRATE_DRAIN_TIMEOUT_S}s (last count=${active_conns:-unknown}); continuing with migrate."
+fi
+
+info "Running new version database migrations..."
+NEW_UPSTREAM_HEAD="$(resolve_new_upstream_head || true)"
 PRE_MIGRATE_OK=0
 if pre_vers="$(read_alembic_versions)"; then
   IFS=$'\t' read -r PRE_MIGRATE_UP PRE_MIGRATE_DA <<< "$pre_vers"
@@ -785,6 +941,21 @@ fi
 
 if [[ "$MIGRATE_RC" -ne 0 ]]; then
   err "Database migrations failed (exit ${MIGRATE_RC})."
+  # Safe automatic recovery (§6.3): when both Alembic versions are unchanged AND
+  # upstream was already at the new release's upstream head (so only pure
+  # transactional Dalton migrations could have executed and rolled back cleanly),
+  # restore pre-upgrade release files & images and restart stopped services.
+  if [[ "$PRE_MIGRATE_OK" -eq 1 && "$POST_MIGRATE_OK" -eq 1 \
+        && "$POST_MIGRATE_UP" == "$PRE_MIGRATE_UP" \
+        && "$POST_MIGRATE_DA" == "$PRE_MIGRATE_DA" \
+        && -n "$NEW_UPSTREAM_HEAD" \
+        && "$PRE_MIGRATE_UP" == "$NEW_UPSTREAM_HEAD" ]]; then
+    warn "Alembic versions unchanged and upstream was already at head (${NEW_UPSTREAM_HEAD}); automatically restoring pre-upgrade files, image tags, and services..."
+    restore_pre_upgrade_files_and_images
+    compose_cmd up -d "${STOPPED_SERVICES[@]}"
+    MIGRATION_STATE="rolled_back"
+    AUTO_RECOVERED=1
+  fi
   exit "$MIGRATE_RC"
 fi
 compose_cmd run --rm minio-init

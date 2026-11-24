@@ -1714,13 +1714,27 @@ class InMemoryChannelStore:
             r["updated_at"] = now
             return []
 
+        if "SELECT delivery_key FROM dalton_channel_deliveries WHERE status = 'in_flight'" in norm:
+            skip_wx = "AND platform <> 'weixin'" in norm
+            return [
+                {"delivery_key": r["delivery_key"]}
+                for r in sorted(self.deliveries.values(), key=lambda x: str(x["delivery_key"]))
+                if r["status"] == "in_flight"
+                and (not skip_wx or str(r.get("platform") or "").lower() != "weixin")
+            ]
+
         if "UPDATE dalton_channel_deliveries SET status = 'unknown', error_code = 'gateway_restarted'" in norm:
             # Startup leaves confirmed_thread_address, discord_body_phase, and delivery_attempt.
+            target_keys = set(params[0]) if params and "WHERE delivery_key = ANY" in norm else None
+            settled = []
             for r in self.deliveries.values():
-                if r["status"] == "in_flight":
+                if r["status"] == "in_flight" and (
+                    target_keys is None or r["delivery_key"] in target_keys
+                ):
                     r["status"] = "unknown"
                     r["error_code"] = "gateway_restarted"
-            return []
+                    settled.append(dict(r))
+            return settled
 
         if "UPDATE dalton_channel_inbound_events SET sent_to_current_count = sent_to_current_count + 1" in norm:
             rid = str(params[0])

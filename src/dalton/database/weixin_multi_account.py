@@ -3367,6 +3367,31 @@ async def unbind_weixin_account(
         reject_company_system_auth(cleaned_uid)
 
     async def _attempt(attempt_conn: Any) -> dict[str, Any]:
+        # R5 (Decision #2): Defense-in-depth enforcement when via_wechat_command=True
+        if via_wechat_command and (
+            not norm_aid
+            or not cleaned_exp_bot
+            or expected_bot_generation is None
+            or int(expected_bot_generation) < 1
+            or not cleaned_exp_sender
+        ):
+            if gateway_epoch is not None or require_gateway_epoch:
+                async with get_db_connection(attempt_conn) as chk_conn:
+                    async with chk_conn.transaction():
+                        async with chk_conn.cursor(row_factory=dict_row) as cur_chk:
+                            await verify_gateway_epoch_in_tx(
+                                cur_chk,
+                                gateway_epoch,
+                                required=require_gateway_epoch,
+                                platform="weixin",
+                            )
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "weixin_unbind_fields_required",
+                    "message": "微信解绑指令缺少必需字段（weixin_account_id / weixin_bot_id / weixin_bot_generation / platform_user_id）。",
+                },
+            )
         async with get_db_connection(attempt_conn) as owned_conn:
             # Phase 1: discover target user_id and account_id in a short read tx
             async with owned_conn.transaction():
@@ -4050,7 +4075,7 @@ def _preflight_deny(deny_code: str, *, retryable: bool = False) -> dict[str, Any
 async def preflight_weixin_send(
     *,
     delivery_key: str,
-    gateway_epoch: int,
+    gateway_epoch: int | None,
     delivery_attempt: int | None = None,
     chunk_index: int = 0,
     conn: Any = None,
@@ -4061,14 +4086,11 @@ async def preflight_weixin_send(
         raise HTTPException(status_code=400, detail="delivery_key is required")
 
     async with get_db_connection(conn) as owned_conn:
-        # Phase 1: short transaction checking epoch FOR SHARE + peeking delivery row,
-        # committed immediately so FOR SHARE is NEVER held across external roster lookup.
+        # Phase 1a: peek delivery row FIRST so platform capability (404 when disabled)
+        # is checked BEFORE X-Gateway-Epoch enforcement (409) (R5 Decision #7).
         peek: dict[str, Any] | None = None
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
-                await verify_gateway_epoch_in_tx(
-                    cur, gateway_epoch, required=True, platform="weixin"
-                )
                 await cur.execute(
                     """
                     SELECT delivery_key, user_id, platform, status, delivery_attempt,
@@ -4082,13 +4104,25 @@ async def preflight_weixin_send(
                 row_p = await cur.fetchone()
                 peek = dict(row_p) if row_p is not None else None
 
-        if peek is None:
-            require_channel_platform_capability("weixin")
-            return _preflight_deny("delivery_not_found")
-        peek_plat = str(peek.get("platform") or "").strip().lower()
+        peek_plat = (
+            str(peek.get("platform") or "").strip().lower()
+            if peek is not None
+            else "weixin"
+        )
         require_channel_platform_capability(peek_plat or "weixin")
-        if peek_plat != "weixin":
+        if peek is not None and peek_plat != "weixin":
             return _preflight_deny("not_weixin_delivery")
+
+        # Phase 1b: short transaction checking epoch FOR SHARE, committed immediately
+        # so FOR SHARE is NEVER held across external roster lookup.
+        async with owned_conn.transaction():
+            async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await verify_gateway_epoch_in_tx(
+                    cur, gateway_epoch, required=True, platform="weixin"
+                )
+
+        if peek is None:
+            return _preflight_deny("delivery_not_found")
         if delivery_attempt is None or int(delivery_attempt) <= 0:
             return _preflight_deny("delivery_attempt_required")
 

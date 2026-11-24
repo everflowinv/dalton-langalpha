@@ -7128,5 +7128,208 @@ async def test_r2_confirm_sql_types_replay_auth_and_concurrent_capacity_real_pg(
                 await cur.execute("DELETE FROM dalton_channel_gateway_lease WHERE singleton_id = 1")
 
 
+@pytest.mark.asyncio
+async def test_r5_startup_recovery_vs_unbind_lock_order_zero_deadlock_real_pg(
+    db_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R5 Decision #5: Concurrent recover_channel_state(mode='startup') and unbind_weixin_account
+    on an account holding BOTH an active thread_watch AND an in_flight delivery MUST complete
+    without psycopg.errors.DeadlockDetected (40P01).
+    """
+    pool: AsyncConnectionPool = db_env["pool"]
+    monkeypatch.setenv("DALTON_CAP_CHANNEL_WEIXIN", "true")
+    monkeypatch.setenv("DALTON_CHANNEL_WEIXIN_ALLOW_EXTERNAL", "true")
+    monkeypatch.setattr(
+        wx_db,
+        "check_team_member_status_live",
+        create_autospec(wx_db.check_team_member_status_live, return_value="active"),
+    )
+    monkeypatch.setattr(
+        cg_db,
+        "check_team_member_status_live",
+        create_autospec(cg_db.check_team_member_status_live, return_value="active"),
+    )
+    monkeypatch.setattr(
+        wx_db,
+        "get_user_tier",
+        create_autospec(wx_db.get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        cg_db,
+        "get_user_tier",
+        create_autospec(cg_db.get_user_tier, return_value="internal"),
+    )
+
+    prefix = f"{db_env['prefix']}_r5dl"
+    created_users: list[str] = []
+    created_threads: list[str] = []
+    created_deliveries: list[str] = []
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_channel_gateway_lease (singleton_id, instance_id, epoch, expires_at, updated_at)
+                    VALUES (1, %s, 90, NOW() + INTERVAL '5 minutes', NOW())
+                    ON CONFLICT (singleton_id) DO UPDATE SET
+                        instance_id = EXCLUDED.instance_id,
+                        epoch = 90,
+                        expires_at = NOW() + INTERVAL '5 minutes',
+                        updated_at = NOW()
+                    """,
+                    (f"{prefix}_gw",),
+                )
+                await cur.execute(
+                    "UPDATE dalton_channel_weixin_config SET enabled = TRUE, allow_external = TRUE WHERE singleton_id = 1"
+                )
+
+        # Race 5 iterations on two concurrent real PG connections
+        for i in range(5):
+            uid = f"{prefix}_u{i}"
+            wx_uid = f"{prefix}_wx{i}@im.wechat"
+            bot_id = f"{prefix}_bot{i}@im.wechat"
+            tid = str(uuid4())
+            dkey = f"{prefix}_dlv_{i}"
+            created_users.append(uid)
+            db_env["cleanup_user_ids"].append(uid)
+            created_threads.append(tid)
+            created_deliveries.append(dkey)
+
+            sess = await wx_db.start_weixin_login_session(user_id=uid)
+            await wx_db.patch_weixin_login_session(
+                session_key=sess["session_key"],
+                gateway_epoch=90,
+                action="save_qr",
+                qrcode=f"qr_{i}",
+            )
+            conf = await wx_db.patch_weixin_login_session(
+                session_key=sess["session_key"],
+                gateway_epoch=90,
+                action="confirm",
+                expected_login_version=2,
+                ilink_bot_id=bot_id,
+                bot_token=f"tok_{i}",
+                ilink_user_id=wx_uid,
+            )
+            aid = conf["account_id"]
+
+            async with pool.connection() as conn:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            INSERT INTO dalton_channel_thread_watches (
+                                thread_id, dalton_user_id, platform, target_address,
+                                scope_key, generation, watch_active,
+                                weixin_account_id, weixin_recipient_id, weixin_bot_generation,
+                                created_at, updated_at
+                            )
+                            VALUES (%s::uuid, %s, 'weixin', 'weixin:@me', %s, 1, TRUE, %s::uuid, %s, 1, NOW(), NOW())
+                            """,
+                            (tid, uid, f"dm:{wx_uid}", aid, wx_uid),
+                        )
+                        await cur.execute(
+                            """
+                            INSERT INTO dalton_channel_deliveries (
+                                delivery_key, kind, user_id, thread_id, run_id,
+                                is_current, has_non_empty_text, platform, target_address,
+                                status, total_chunks, sent_chunks, platform_message_ids,
+                                files_status, delivery_attempt,
+                                weixin_account_id, weixin_bot_id, weixin_bot_generation, weixin_recipient_id,
+                                created_at, updated_at
+                            )
+                            VALUES (
+                                %s, 'fallback', %s, %s::uuid, %s,
+                                TRUE, TRUE, 'weixin', 'weixin:@me',
+                                'in_flight', 1, 0, '[]'::jsonb,
+                                '[]'::jsonb, 1,
+                                %s::uuid, %s, 1, %s,
+                                NOW(), NOW()
+                            )
+                            """,
+                            (dkey, uid, tid, str(uuid4()), aid, bot_id, wx_uid),
+                        )
+
+            # Barrier to maximize concurrent overlap between startup recovery and unbind
+            start_evt = asyncio.Event()
+
+            async def _run_recovery() -> dict[str, Any]:
+                async with pool.connection() as c_rec:
+                    await start_evt.wait()
+                    return await cg_db.recover_channel_state(
+                        mode="startup",
+                        gateway_epoch=90,
+                        require_gateway_epoch=True,
+                        conn=c_rec,
+                    )
+
+            async def _run_unbind(
+                u_arg: str = uid,
+                a_arg: str = aid,
+                b_arg: str = bot_id,
+                w_arg: str = wx_uid,
+            ) -> dict[str, Any]:
+                async with pool.connection() as c_unb:
+                    await start_evt.wait()
+                    return await wx_db.unbind_weixin_account(
+                        target_user_id=u_arg,
+                        account_id=a_arg,
+                        operator_user_id=u_arg,
+                        action="member_unbind",
+                        via_wechat_command=True,
+                        expected_bot_id=b_arg,
+                        expected_bot_generation=1,
+                        expected_sender_ilink_user_id=w_arg,
+                        verify_live_roster=True,
+                        gateway_epoch=90,
+                        require_gateway_epoch=True,
+                        conn=c_unb,
+                    )
+
+            t_rec = asyncio.create_task(_run_recovery())
+            t_unb = asyncio.create_task(_run_unbind())
+            await asyncio.sleep(0)
+            start_evt.set()
+            rec_res, unb_res = await asyncio.gather(t_rec, t_unb)
+            assert rec_res["mode"] == "startup"
+            assert unb_res["ok"] is True
+    finally:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                if created_deliveries:
+                    await cur.execute(
+                        "DELETE FROM dalton_channel_deliveries WHERE delivery_key = ANY(%s::text[])",
+                        (created_deliveries,),
+                    )
+                if created_threads:
+                    await cur.execute(
+                        "DELETE FROM dalton_channel_thread_watches WHERE thread_id = ANY(%s::uuid[])",
+                        (created_threads,),
+                    )
+                if created_users:
+                    await cur.execute(
+                        "DELETE FROM dalton_channel_weixin_login_sessions WHERE user_id = ANY(%s::text[])",
+                        (created_users,),
+                    )
+                    await cur.execute(
+                        "DELETE FROM dalton_channel_weixin_accounts WHERE user_id = ANY(%s::text[])",
+                        (created_users,),
+                    )
+                    await cur.execute(
+                        "DELETE FROM dalton_channel_weixin_audit_logs WHERE target_user_id = ANY(%s::text[])",
+                        (created_users,),
+                    )
+                    await cur.execute(
+                        "DELETE FROM dalton_channel_user_settings WHERE user_id = ANY(%s::text[])",
+                        (created_users,),
+                    )
+                    await cur.execute(
+                        "DELETE FROM dalton_channel_session_generations WHERE dalton_user_id = ANY(%s::text[])",
+                        (created_users,),
+                    )
+                await cur.execute("DELETE FROM dalton_channel_gateway_lease WHERE singleton_id = 1")
+
+
 if __name__ == "__main__" and "--serve-http-harness" in sys.argv:
     asyncio.run(_serve_cli_harness_main())

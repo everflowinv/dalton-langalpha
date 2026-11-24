@@ -1103,14 +1103,25 @@ class InMemoryWeixinMultiAccountStore:
                 d = self.deliveries.get(str(params[0]))
                 return [dict(d)] if d else []
             if "WHERE status = 'in_flight'" in norm:
-                return [dict(d) for d in self.deliveries.values() if d.get("status") == "in_flight"]
+                skip_wx = "AND platform <> 'weixin'" in norm
+                return [
+                    dict(d)
+                    for d in sorted(
+                        self.deliveries.values(), key=lambda x: str(x.get("delivery_key") or "")
+                    )
+                    if d.get("status") == "in_flight"
+                    and (not skip_wx or str(d.get("platform") or "").lower() != "weixin")
+                ]
             return list(self.deliveries.values())
 
         if "UPDATE dalton_channel_deliveries SET status = 'unknown', error_code = 'gateway_restarted'" in norm:
             skip_wx = "AND platform <> 'weixin'" in norm
+            target_keys = set(params[0]) if params and "WHERE delivery_key = ANY" in norm else None
             settled = []
             for d in self.deliveries.values():
                 if d.get("status") == "in_flight":
+                    if target_keys is not None and d.get("delivery_key") not in target_keys:
+                        continue
                     if skip_wx and str(d.get("platform") or "").lower() == "weixin":
                         continue
                     d["status"] = "unknown"
@@ -2224,11 +2235,15 @@ async def test_rescan_pending_verification_preserves_prev_ilink_user_id_and_conf
     assert store.audit_logs[-1]["action"] == "conflict_auto_unbound"
 
     # /unbind returns D16 one-time farewell reply envelope
+    acc_a_cur = store.accounts[aid_a]
     unbind_res = await wx_db.unbind_weixin_account(
         account_id=aid_a,
         operator_user_id="u-alice",
         action="member_unbind",
         via_wechat_command=True,
+        expected_bot_id=str(acc_a_cur["ilink_bot_id"]),
+        expected_bot_generation=int(acc_a_cur["bot_generation"]),
+        expected_sender_ilink_user_id="wx_a_new@im.wechat",
         one_time_context_token="ctx-bye",
         one_time_recipient_id="wx_a_new@im.wechat",
     )
@@ -4302,5 +4317,740 @@ async def test_r4_weixin_command_stamps_account_id_for_i6_notice_claim(
         "UPDATE dalton_channel_inbound_events" in s and "weixin_account_id = %s::uuid" in s
         for s, _ in store.executed_sql
     )
+
+
+@pytest.mark.asyncio
+async def test_r5_i3_authorize_first_and_readonly_never_verifies(
+    wx_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R5 Decision #1: I-3 authorizes account/bot/gen/DM/roster/switches BEFORE any branch;
+    read-only workspace_list NEVER triggers D11 first-message verification.
+    """
+    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
+    roster: dict[str, str] = wx_env["roster"]
+    aid = str(uuid4())
+    store.accounts[aid] = {
+        "account_id": aid,
+        "user_id": "u-alice",
+        "ilink_bot_id": "bot-pv@im.wechat",
+        "encrypted_bot_token": "tok-pv",
+        "bot_token": "tok-pv",
+        "base_url": "https://ilinkai.weixin.qq.com",
+        "cdn_base_url": "https://novac2c.cdn.weixin.qq.com/c2c",
+        "get_updates_buf": "",
+        "status": "pending_verification",
+        "prev_status": None,
+        "disabled_reason": None,
+        "bot_generation": 2,
+        "prev_bot_generation": 1,
+        "bot_generation_updated_at": store.now,
+        "ilink_user_id": None,
+        "prev_ilink_user_id": "wx_alice@im.wechat",
+        "ilink_username": "Alice",
+        "last_inbound_at": None,
+        "created_at": store.now,
+        "updated_at": store.now,
+    }
+
+    verify_spy = create_autospec(
+        wx_db.verify_pending_weixin_account_first_message,
+        side_effect=wx_db.verify_pending_weixin_account_first_message,
+    )
+    monkeypatch.setattr(wx_db, "verify_pending_weixin_account_first_message", verify_spy)
+
+    # 1. Read-only internal workspace_list MUST NOT trigger D11 verification
+    r_ro = await cg_db.execute_session_command(
+        cmd="workspace_list",
+        platform="weixin",
+        platform_user_id="wx_alice@im.wechat",
+        chat_type="dm",
+        chat_address="weixin:@me",
+        scope_key="dm:wx_alice@im.wechat",
+        message_id=None,
+        is_internal_query=True,
+        weixin_account_id=aid,
+        weixin_bot_id="bot-pv@im.wechat",
+        weixin_bot_generation=2,
+        gateway_epoch=1,
+        require_gateway_epoch=False,
+    )
+    assert r_ro["ok"] is False
+    assert r_ro["deny_reason"] == "weixin_account_pending_verification"
+    assert store.accounts[aid]["status"] == "pending_verification"
+    verify_spy.assert_not_called()
+
+    # 2. Group command on pending_verification rejected BEFORE verification
+    r_grp = await cg_db.execute_session_command(
+        cmd="new",
+        platform="weixin",
+        platform_user_id="wx_alice@im.wechat",
+        chat_type="group",
+        scope_key="group:g1",
+        message_id="r5_pv_grp",
+        weixin_account_id=aid,
+        weixin_bot_id="bot-pv@im.wechat",
+        weixin_bot_generation=2,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_grp["deny_reason"] == "weixin_group_unsupported"
+    assert store.accounts[aid]["status"] == "pending_verification"
+    verify_spy.assert_not_called()
+
+    # 3. Removed member rejected BEFORE verification (does not activate/mutate account!)
+    roster["u-alice"] = "removed"
+    r_rem = await cg_db.execute_session_command(
+        cmd="new",
+        platform="weixin",
+        platform_user_id="wx_alice@im.wechat",
+        chat_type="dm",
+        chat_address="weixin:@me",
+        scope_key="dm:wx_alice@im.wechat",
+        message_id="r5_pv_rem",
+        weixin_account_id=aid,
+        weixin_bot_id="bot-pv@im.wechat",
+        weixin_bot_generation=2,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_rem["deny_reason"] == "member_not_in_roster"
+    assert store.accounts[aid]["status"] == "pending_verification"
+    verify_spy.assert_not_called()
+    roster["u-alice"] = "active"
+
+    # 4. Channel disabled rejected BEFORE verification (both ordinary & collect commands!)
+    store.config["enabled"] = False
+    r_off = await cg_db.execute_session_command(
+        cmd="new",
+        platform="weixin",
+        platform_user_id="wx_alice@im.wechat",
+        chat_type="dm",
+        chat_address="weixin:@me",
+        scope_key="dm:wx_alice@im.wechat",
+        message_id="r5_pv_off",
+        weixin_account_id=aid,
+        weixin_bot_id="bot-pv@im.wechat",
+        weixin_bot_generation=2,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_off["deny_reason"] == "weixin_channel_disabled"
+    assert store.accounts[aid]["status"] == "pending_verification"
+    r_col_off = await cg_db.execute_session_command(
+        cmd="collect",
+        platform="weixin",
+        platform_user_id="wx_alice@im.wechat",
+        chat_type="dm",
+        chat_address="weixin:@me",
+        scope_key="dm:wx_alice@im.wechat",
+        message_id="r5_pv_col_off",
+        weixin_account_id=aid,
+        weixin_bot_id="bot-pv@im.wechat",
+        weixin_bot_generation=2,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_col_off["deny_reason"] == "weixin_channel_disabled"
+    assert store.accounts[aid]["status"] == "pending_verification"
+    verify_spy.assert_not_called()
+    store.config["enabled"] = True
+
+    # 5. Once ALL authorization passes, ordinary write command triggers D11 verification and succeeds!
+    r_ok = await cg_db.execute_session_command(
+        cmd="new",
+        platform="weixin",
+        platform_user_id="wx_alice@im.wechat",
+        chat_type="dm",
+        chat_address="weixin:@me",
+        scope_key="dm:wx_alice@im.wechat",
+        message_id="r5_pv_ok",
+        weixin_account_id=aid,
+        weixin_bot_id="bot-pv@im.wechat",
+        weixin_bot_generation=2,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_ok["ok"] is True
+    assert store.accounts[aid]["status"] == "active"
+    assert verify_spy.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_r5_weixin_unbind_requires_complete_four_fields(
+    wx_env: dict[str, Any],
+) -> None:
+    """R5 Decision #2: Weixin command /unbind requires account_id, bot_id, bot_generation, and sender."""
+    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
+    aid = str(uuid4())
+    store.accounts[aid] = {
+        "account_id": aid,
+        "user_id": "u-alice",
+        "ilink_bot_id": "bot-u@im.wechat",
+        "encrypted_bot_token": "tok-u",
+        "bot_token": "tok-u",
+        "base_url": "https://ilinkai.weixin.qq.com",
+        "cdn_base_url": "https://novac2c.cdn.weixin.qq.com/c2c",
+        "get_updates_buf": "",
+        "status": "active",
+        "prev_status": None,
+        "disabled_reason": None,
+        "bot_generation": 1,
+        "prev_bot_generation": None,
+        "bot_generation_updated_at": None,
+        "ilink_user_id": "wx_alice@im.wechat",
+        "prev_ilink_user_id": None,
+        "ilink_username": "Alice",
+        "last_inbound_at": None,
+        "created_at": store.now,
+        "updated_at": store.now,
+    }
+
+    incomplete_cases = [
+        # Account-id only (must NOT bypass Weixin command auth!)
+        {"weixin_account_id": aid},
+        # Missing account_id
+        {
+            "weixin_bot_id": "bot-u@im.wechat",
+            "weixin_bot_generation": 1,
+            "platform_user_id": "wx_alice@im.wechat",
+        },
+        # Missing bot_id
+        {
+            "weixin_account_id": aid,
+            "weixin_bot_generation": 1,
+            "platform_user_id": "wx_alice@im.wechat",
+        },
+        # Missing bot_generation
+        {
+            "weixin_account_id": aid,
+            "weixin_bot_id": "bot-u@im.wechat",
+            "platform_user_id": "wx_alice@im.wechat",
+        },
+        # Missing platform_user_id
+        {
+            "weixin_account_id": aid,
+            "weixin_bot_id": "bot-u@im.wechat",
+            "weixin_bot_generation": 1,
+        },
+    ]
+    for kwargs in incomplete_cases:
+        with pytest.raises(HTTPException) as exc_400:
+            await cg_db.consume_bind_code_or_unbind(
+                action="unbind",
+                platform="weixin",
+                gateway_epoch=1,
+                require_gateway_epoch=True,
+                **kwargs,
+            )
+        assert exc_400.value.status_code == 400
+        assert exc_400.value.detail["code"] == "weixin_unbind_fields_required"
+        assert aid in store.accounts
+
+    # Direct wx_db.unbind_weixin_account(..., via_wechat_command=True) also enforces all 4 fields
+    with pytest.raises(HTTPException) as exc_direct:
+        await wx_db.unbind_weixin_account(
+            account_id=aid,
+            operator_user_id="u-alice",
+            action="member_unbind",
+            via_wechat_command=True,
+            gateway_epoch=1,
+            require_gateway_epoch=True,
+        )
+    assert exc_direct.value.status_code == 400
+    assert exc_direct.value.detail["code"] == "weixin_unbind_fields_required"
+    assert aid in store.accounts
+
+
+@pytest.mark.asyncio
+async def test_r5_i1_validate_before_replay_and_ignored_zero_leak(
+    wx_env: dict[str, Any],
+) -> None:
+    """R5 Decision #3: I-1 validates sender, required account/bot/gen, match, roster, and switches
+    BEFORE entering replay or returning a stored ignored row, with zero member leakage.
+    """
+    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
+    roster: dict[str, str] = wx_env["roster"]
+    aid = str(uuid4())
+    store.accounts[aid] = {
+        "account_id": aid,
+        "user_id": "u-alice",
+        "ilink_bot_id": "bot-a@im.wechat",
+        "encrypted_bot_token": "tok-a",
+        "bot_token": "tok-a",
+        "base_url": "https://ilinkai.weixin.qq.com",
+        "cdn_base_url": "https://novac2c.cdn.weixin.qq.com/c2c",
+        "get_updates_buf": "",
+        "status": "active",
+        "prev_status": None,
+        "disabled_reason": None,
+        "bot_generation": 1,
+        "prev_bot_generation": None,
+        "bot_generation_updated_at": None,
+        "ilink_user_id": "wx_alice@im.wechat",
+        "prev_ilink_user_id": None,
+        "ilink_username": "Alice",
+        "last_inbound_at": None,
+        "created_at": store.now,
+        "updated_at": store.now,
+    }
+    store.inbound_events[("weixin", "r5_ignored_mid")] = {
+        "platform": "weixin",
+        "message_id": "r5_ignored_mid",
+        "request_key": str(uuid4()),
+        "dalton_user_id": "u-alice",
+        "workspace_id": str(uuid4()),
+        "thread_id": str(uuid4()),
+        "status": "ignored",
+        "raw_payload": {
+            "platform_user_id": "wx_alice@im.wechat",
+            "deny_reason": "ignored",
+            "text": "private alice ignored text",
+        },
+        "weixin_account_id": aid,
+        "weixin_context_bot_id": "bot-a@im.wechat",
+        "weixin_context_bot_generation": 1,
+        "created_at": store.now,
+        "updated_at": store.now,
+    }
+
+    # 1. Empty sender on existing ignored row -> rejected as invalid_inbound_event with ZERO leak
+    r_empty = await cg_db.register_and_resolve_inbound(
+        platform="weixin",
+        platform_user_id="",
+        chat_type="dm",
+        chat_address="weixin:@me",
+        thread_scope_key="dm:unknown",
+        message_id="r5_ignored_mid",
+        weixin_account_id=aid,
+        weixin_bot_id="bot-a@im.wechat",
+        weixin_bot_generation=1,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_empty["allowed"] is False
+    assert r_empty["deny_reason"] == "invalid_inbound_event"
+    assert "dalton_user_id" not in r_empty
+    assert "thread_id" not in r_empty
+
+    # 2. Missing account/bot/gen fields on replay -> weixin_inbound_fields_required with ZERO leak
+    r_missing = await cg_db.register_and_resolve_inbound(
+        platform="weixin",
+        platform_user_id="wx_alice@im.wechat",
+        chat_type="dm",
+        chat_address="weixin:@me",
+        thread_scope_key="dm:wx_alice@im.wechat",
+        message_id="r5_ignored_mid",
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_missing["allowed"] is False
+    assert r_missing["deny_reason"] == "weixin_inbound_fields_required"
+    assert "dalton_user_id" not in r_missing
+
+    # 3. Removed member on ignored row replay -> member_not_in_roster with ZERO leak
+    roster["u-alice"] = "removed"
+    r_rem = await cg_db.register_and_resolve_inbound(
+        platform="weixin",
+        platform_user_id="wx_alice@im.wechat",
+        chat_type="dm",
+        chat_address="weixin:@me",
+        thread_scope_key="dm:wx_alice@im.wechat",
+        message_id="r5_ignored_mid",
+        weixin_account_id=aid,
+        weixin_bot_id="bot-a@im.wechat",
+        weixin_bot_generation=1,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_rem["allowed"] is False
+    assert r_rem["deny_reason"] == "member_not_in_roster"
+    assert "dalton_user_id" not in r_rem
+    roster["u-alice"] = "active"
+
+
+@pytest.mark.asyncio
+async def test_r5_i6_thread_only_missing_source_and_authoritative_db_turn_time(
+    wx_env: dict[str, Any],
+) -> None:
+    """R5 Decision #4: I-6 refuses thread_id-only (no run_id) watch borrow, marks unknown+audit
+    when no source exists, and update_inbound_progress derives weixin_bot_generation from DB time.
+    """
+    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
+    aid = str(uuid4())
+    tid = str(uuid4())
+    t_rescan = store.now
+    store.accounts[aid] = {
+        "account_id": aid,
+        "user_id": "u-alice",
+        "ilink_bot_id": "bot-a@im.wechat",
+        "encrypted_bot_token": "tok-a",
+        "bot_token": "tok-a",
+        "base_url": "https://ilinkai.weixin.qq.com",
+        "cdn_base_url": "https://novac2c.cdn.weixin.qq.com/c2c",
+        "get_updates_buf": "",
+        "status": "active",
+        "prev_status": None,
+        "disabled_reason": None,
+        "bot_generation": 2,
+        "prev_bot_generation": 1,
+        "bot_generation_updated_at": t_rescan,
+        "ilink_user_id": "wx_alice@im.wechat",
+        "prev_ilink_user_id": None,
+        "ilink_username": "Alice",
+        "last_inbound_at": None,
+        "created_at": t_rescan - timedelta(minutes=5),
+        "updated_at": t_rescan,
+    }
+    store.thread_watches[tid] = {
+        "thread_id": tid,
+        "dalton_user_id": "u-alice",
+        "platform": "weixin",
+        "target_address": "weixin:@me",
+        "scope_key": "dm:wx_alice@im.wechat",
+        "generation": 1,
+        "watch_active": True,
+        "last_notified_turn_index": 0,
+        "weixin_account_id": aid,
+        "weixin_recipient_id": "wx_alice@im.wechat",
+        "weixin_bot_generation": 2,
+    }
+
+    # 1. Thread-only delivery (run_id=None) MUST NOT borrow thread_watches.weixin_bot_generation=2!
+    audit_before = len(store.audit_logs)
+    r_tonly = await cg_db.authorize_and_claim_delivery(
+        delivery_key="dlv-r5-thread-only",
+        kind="fallback",
+        user_id="u-alice",
+        thread_id=tid,
+        run_id=None,
+        platform="weixin",
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_tonly["claim_status"] == "denied"
+    assert r_tonly["status"] == "unknown"
+    assert r_tonly["code"] == "source_generation_unknown"
+    assert store.deliveries["dlv-r5-thread-only"]["status"] == "unknown"
+    assert len(store.audit_logs) == audit_before + 1
+    assert store.audit_logs[-1]["action"] == "ambiguous_legacy_delivery_blocked"
+
+    # 2. Missing source entirely -> writes status='unknown' + audit log BEFORE returning denied!
+    audit_before2 = len(store.audit_logs)
+    r_miss = await cg_db.authorize_and_claim_delivery(
+        delivery_key="dlv-r5-missing-src",
+        kind="fallback",
+        user_id="u-alice",
+        thread_id=str(uuid4()),
+        run_id=str(uuid4()),
+        platform="weixin",
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_miss["claim_status"] == "denied"
+    assert r_miss["status"] == "unknown"
+    assert r_miss["code"] == "source_generation_unknown"
+    assert store.deliveries["dlv-r5-missing-src"]["status"] == "unknown"
+    assert len(store.audit_logs) == audit_before2 + 1
+    assert store.audit_logs[-1]["action"] == "ambiguous_legacy_delivery_blocked"
+
+    # 3. update_inbound_progress ignores forged caller weixin_bot_generation=2 on pre-rescan turn!
+    r_forged_pre = str(uuid4())
+    r_no_ts = str(uuid4())
+    store.conversation_queries.append(
+        {
+            "conversation_thread_id": tid,
+            "turn_index": 7,
+            "query_type": "wakeup",
+            "response_id": r_forged_pre,
+            "created_at": t_rescan - timedelta(seconds=20),
+        }
+    )
+    await cg_db.update_inbound_progress(
+        platform="weixin",
+        background_run={
+            "run_id": r_forged_pre,
+            "thread_id": tid,
+            "dalton_user_id": "u-alice",
+            "platform": "weixin",
+            "target_address": "weixin:@me",
+            "turn_index": 7,
+            "status": "completed",
+            "fallback_pending": True,
+            "weixin_bot_generation": 2,  # Forged caller generation MUST be overridden by DB time!
+        },
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert store.background_runs[r_forged_pre]["weixin_bot_generation"] == 1
+
+    # Missing DB timestamp after rescan -> fails closed to None even if caller passed 2
+    await cg_db.update_inbound_progress(
+        platform="weixin",
+        background_run={
+            "run_id": r_no_ts,
+            "thread_id": tid,
+            "dalton_user_id": "u-alice",
+            "platform": "weixin",
+            "target_address": "weixin:@me",
+            "turn_index": 8,
+            "status": "completed",
+            "fallback_pending": True,
+            "weixin_bot_generation": 2,
+        },
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert store.background_runs[r_no_ts]["weixin_bot_generation"] is None
+
+
+@pytest.mark.asyncio
+async def test_r5_collect_command_whitelisted_payload_and_replay_after_auth(
+    wx_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R5 Decision #6: Collect command stores only safe whitelisted fields (never credentials/media),
+    and checks auth/switches/roster BEFORE returning cached replay.
+    """
+    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
+    roster: dict[str, str] = wx_env["roster"]
+    home_ws_id = cg_db.get_home_workspace_id("u-alice")
+    store.workspaces[home_ws_id] = {
+        "workspace_id": home_ws_id,
+        "user_id": "u-alice",
+        "name": "Home",
+        "status": "running",
+    }
+    monkeypatch.setattr(
+        cg_db,
+        "_verify_workspace_write_permission",
+        create_autospec(
+            cg_db._verify_workspace_write_permission,
+            return_value=(True, None, {"workspace_id": home_ws_id}),
+        ),
+    )
+    aid = str(uuid4())
+    store.accounts[aid] = {
+        "account_id": aid,
+        "user_id": "u-alice",
+        "ilink_bot_id": "bot-c@im.wechat",
+        "encrypted_bot_token": "tok-c",
+        "bot_token": "tok-c",
+        "base_url": "https://ilinkai.weixin.qq.com",
+        "cdn_base_url": "https://novac2c.cdn.weixin.qq.com/c2c",
+        "get_updates_buf": "",
+        "status": "active",
+        "prev_status": None,
+        "disabled_reason": None,
+        "bot_generation": 1,
+        "prev_bot_generation": None,
+        "bot_generation_updated_at": None,
+        "ilink_user_id": "wx_alice@im.wechat",
+        "prev_ilink_user_id": None,
+        "ilink_username": "Alice",
+        "last_inbound_at": None,
+        "created_at": store.now,
+        "updated_at": store.now,
+    }
+
+    r1 = await cg_db.execute_session_command(
+        cmd="collect",
+        platform="weixin",
+        platform_user_id="wx_alice@im.wechat",
+        chat_type="dm",
+        chat_address="weixin:@me",
+        scope_key="dm:wx_alice@im.wechat",
+        message_id="r5_collect_mid_1",
+        weixin_account_id=aid,
+        weixin_bot_id="bot-c@im.wechat",
+        weixin_bot_generation=1,
+        weixin_context_token="secret-ctx-token",
+        raw_payload={
+            "seq": 42,
+            "create_time_ms": 1700000000000,
+            "context_token": "secret-ctx-token",
+            "bot_token": "secret-bot-token",
+            "aes_key": "secret-aes-key",
+            "weixin_attachments": [{"url": "https://cdn.example/secret", "aes_key": "k"}],
+            "weixin_media_meta": [{"encrypt_query_param": "enc"}],
+        },
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r1["ok"] is True
+    saved_row = store.inbound_events[("weixin", "r5_collect_mid_1")]
+    saved_raw = saved_row["raw_payload"]
+    assert saved_raw == {
+        "cmd": "collect",
+        "platform_user_id": "wx_alice@im.wechat",
+        "seq": 42,
+        "create_time_ms": 1700000000000,
+    }
+    for forbidden in (
+        "context_token",
+        "bot_token",
+        "aes_key",
+        "weixin_attachments",
+        "weixin_media_meta",
+    ):
+        assert forbidden not in saved_raw
+
+    # Replay when channel disabled -> denied (auth runs BEFORE replay!)
+    store.config["enabled"] = False
+    r_off = await cg_db.execute_session_command(
+        cmd="collect",
+        platform="weixin",
+        platform_user_id="wx_alice@im.wechat",
+        chat_type="dm",
+        chat_address="weixin:@me",
+        scope_key="dm:wx_alice@im.wechat",
+        message_id="r5_collect_mid_1",
+        weixin_account_id=aid,
+        weixin_bot_id="bot-c@im.wechat",
+        weixin_bot_generation=1,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_off["ok"] is False
+    assert r_off["deny_reason"] == "weixin_channel_disabled"
+    store.config["enabled"] = True
+
+    # Replay when member removed -> denied BEFORE replay
+    roster["u-alice"] = "removed"
+    r_rem = await cg_db.execute_session_command(
+        cmd="collect",
+        platform="weixin",
+        platform_user_id="wx_alice@im.wechat",
+        chat_type="dm",
+        chat_address="weixin:@me",
+        scope_key="dm:wx_alice@im.wechat",
+        message_id="r5_collect_mid_1",
+        weixin_account_id=aid,
+        weixin_bot_id="bot-c@im.wechat",
+        weixin_bot_generation=1,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_rem["ok"] is False
+    assert r_rem["deny_reason"] == "member_not_in_roster"
+    roster["u-alice"] = "active"
+
+    # Authorized owner replay returns duplicate=True
+    r_dup = await cg_db.execute_session_command(
+        cmd="collect",
+        platform="weixin",
+        platform_user_id="wx_alice@im.wechat",
+        chat_type="dm",
+        chat_address="weixin:@me",
+        scope_key="dm:wx_alice@im.wechat",
+        message_id="r5_collect_mid_1",
+        weixin_account_id=aid,
+        weixin_bot_id="bot-c@im.wechat",
+        weixin_bot_generation=1,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_dup["ok"] is True
+    assert r_dup["duplicate"] is True
+
+
+@pytest.mark.asyncio
+async def test_r5_weixin_disabled_recovery_skips_generic_updates_and_preflight_404_before_409(
+    wx_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R5 Decision #7: Disabled Weixin capability skips Weixin in BOTH generic startup-recovery
+    UPDATE statements, and preflight-send returns 404 BEFORE 409 even without X-Gateway-Epoch.
+    """
+    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
+    client: TestClient = wx_env["client"]
+
+    monkeypatch.setenv("DALTON_CAP_CHANNEL_WEIXIN", "false")
+
+    store.executed_sql.clear()
+    await cg_db.recover_channel_state(
+        mode="startup",
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    norm_sqls = [" ".join(s.split()) for s, _ in store.executed_sql]
+    invalid_updates = [
+        s
+        for s in norm_sqls
+        if "UPDATE dalton_channel_inbound_events" in s and "invalid_inbound_event" in s
+    ]
+    cancel_updates = [
+        s
+        for s in norm_sqls
+        if "UPDATE dalton_channel_inbound_events" in s and "pending_cancel" in s
+    ]
+    assert invalid_updates and all("AND platform <> 'weixin'" in s for s in invalid_updates)
+    assert cancel_updates and all("AND platform <> 'weixin'" in s for s in cancel_updates)
+
+    # preflight-send with NO X-Gateway-Epoch header MUST return 404 (not 409!) when Weixin is disabled
+    r_pf = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/dlv-r5-disabled/preflight-send",
+        headers={"X-Service-Token": SERVICE_TOKEN},
+        json={"delivery_attempt": 1, "chunk_index": 0},
+    )
+    assert r_pf.status_code == 404
+    assert r_pf.json().get("code") != "stale_gateway_epoch"
+
+
+@pytest.mark.asyncio
+async def test_r5_data_task_reconcile_wraps_phase1_read_in_transaction() -> None:
+    """R5 Decision #9: reconcile_single_data_task_delivery_row wraps Phase-1 read cursor in
+    row_conn.transaction() so non-autocommit connections never open a bare cursor before Phase 2.
+    """
+    from src.dalton.database import data_task_notifications as dtn_db
+
+    tx_depth = 0
+    bare_cursor_violations: list[str] = []
+
+    class _StrictCursor:
+        async def __aenter__(self) -> _StrictCursor:
+            return self
+
+        async def __aexit__(self, *_a: object) -> None:
+            return None
+
+        async def execute(self, _sql: str, _params: Any = None) -> None:
+            return None
+
+        async def fetchone(self) -> Any:
+            return None
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+    class _StrictConn:
+        @asynccontextmanager
+        async def transaction(self) -> Any:
+            nonlocal tx_depth
+            tx_depth += 1
+            try:
+                yield
+            finally:
+                tx_depth -= 1
+
+        def cursor(self, **_kwargs: Any) -> _StrictCursor:
+            if tx_depth <= 0:
+                bare_cursor_violations.append("bare_cursor_outside_transaction")
+            return _StrictCursor()
+
+    row = {
+        "execution_id": str(uuid4()),
+        "user_id": "u-alice",
+        "channel": "feishu",
+        "target": "feishu:chat:oc_test",
+        "status": "pending",
+        "error_code": "unknown",
+        "payload_json": {"cards": [{"title": "c1"}]},
+    }
+    res = await dtn_db.reconcile_single_data_task_delivery_row(row, conn=_StrictConn())
+    assert res is False
+    assert bare_cursor_violations == []
+    assert tx_depth == 0
+
 
 

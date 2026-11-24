@@ -2149,41 +2149,42 @@ async def reconcile_single_data_task_delivery_row(
 
     try:
         async with get_db_connection(conn) as row_conn:
-            async with row_conn.cursor(row_factory=dict_row) as cur:
-                resolved_ident = await _resolve_reconcile_recipient_identity(
-                    cur,
-                    norm_run_id=norm_run_id,
-                    owner_user_id=owner_user_id,
-                    platform=platform,
-                    target_kind=target_kind,
-                    raw_ident=raw_ident,
-                    expected_count=expected_count,
-                    payload=payload,
-                )
-                if resolved_ident is None:
-                    return False
-                canonical_target_address, _recipient_id, expected_keys = resolved_ident
+            async with row_conn.transaction():
+                async with row_conn.cursor(row_factory=dict_row) as cur:
+                    resolved_ident = await _resolve_reconcile_recipient_identity(
+                        cur,
+                        norm_run_id=norm_run_id,
+                        owner_user_id=owner_user_id,
+                        platform=platform,
+                        target_kind=target_kind,
+                        raw_ident=raw_ident,
+                        expected_count=expected_count,
+                        payload=payload,
+                    )
+                    if resolved_ident is None:
+                        return False
+                    canonical_target_address, _recipient_id, expected_keys = resolved_ident
 
-                await cur.execute(
-                    """
-                    SELECT delivery_key, status
-                    FROM dalton_channel_deliveries
-                    WHERE delivery_key = ANY(%s)
-                      AND kind = 'data_task'
-                      AND run_id = %s
-                      AND user_id = %s
-                      AND platform = %s
-                      AND target_address = %s
-                    """,
-                    (
-                        expected_keys,
-                        norm_run_id,
-                        owner_user_id,
-                        platform,
-                        canonical_target_address,
-                    ),
-                )
-                item_rows = await cur.fetchall()
+                    await cur.execute(
+                        """
+                        SELECT delivery_key, status
+                        FROM dalton_channel_deliveries
+                        WHERE delivery_key = ANY(%s)
+                          AND kind = 'data_task'
+                          AND run_id = %s
+                          AND user_id = %s
+                          AND platform = %s
+                          AND target_address = %s
+                        """,
+                        (
+                            expected_keys,
+                            norm_run_id,
+                            owner_user_id,
+                            platform,
+                            canonical_target_address,
+                        ),
+                    )
+                    item_rows = await cur.fetchall()
 
             status_by_key = {
                 str(ir["delivery_key"]): str(ir.get("status") or "").strip().lower()

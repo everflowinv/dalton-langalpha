@@ -809,10 +809,12 @@ async def internal_deliveries_preflight_send_endpoint(
 ) -> Any:
     """Real-time re-authorization before every iLink outbound chunk / media upload / sendmessage."""
     try:
-        epoch = _parse_gateway_epoch(request, required=True)
+        # R5 (Decision #7): Parse epoch without failing early so capability check (404)
+        # runs BEFORE gateway epoch enforcement (409) when Weixin is disabled.
+        epoch = _parse_gateway_epoch(request, required=False)
         return await wx_db.preflight_weixin_send(
             delivery_key=delivery_key,
-            gateway_epoch=int(epoch or 0),
+            gateway_epoch=epoch,
             delivery_attempt=body.delivery_attempt,
             chunk_index=body.chunk_index,
         )
