@@ -5,6 +5,17 @@ import { loadSecureGatewayEnvFile } from "./vault-credentials.js";
 export type GatewayStartupMode = "incoming" | "outgoing";
 export type FeishuCredentialSource = "vault" | "env";
 
+export interface StatusFeedbackConfig {
+  /** Global master switch (`DALTON_STATUS_FEEDBACK_ENABLED`, default `true`). */
+  enabled: boolean;
+  /** Per-platform switches (`DALTON_<PLATFORM>_STATUS_FEEDBACK_ENABLED`, each default `true`). */
+  platforms: {
+    feishu: boolean;
+    discord: boolean;
+    weixin: boolean;
+  };
+}
+
 export interface GatewayConfig {
   /** Strictly `127.0.0.1` (§0.2, §5.1). */
   host: "127.0.0.1";
@@ -29,6 +40,12 @@ export interface GatewayConfig {
   opsAlertsFile?: string;
   /** Whether colleague workspace dispatch is enabled (`DALTON_COLLEAGUE_DISPATCH_ENABLED`). */
   colleagueDispatchEnabled: boolean;
+  /**
+   * Processing status feedback switches (global + per-platform, all default `true`).
+   * Identical defaults for Everflow and standalone core installs; active handles live
+   * strictly in gateway process memory (indicators left behind across a restart are not cleaned up).
+   */
+  statusFeedback?: StatusFeedbackConfig;
   /** Enabled channel platforms. */
   channels: {
     feishu: {
@@ -60,6 +77,7 @@ export function loadConfig(
 ): GatewayConfig & {
   mode: GatewayStartupMode;
   feishuCredentialSource: FeishuCredentialSource;
+  statusFeedback: StatusFeedbackConfig;
 } {
   const explicitCredSourceRaw = (env.DALTON_FEISHU_CREDENTIAL_SOURCE ?? "")
     .trim()
@@ -184,6 +202,27 @@ export function loadConfig(
       ? Boolean(discordBotToken)
       : parseBool(mergedEnv.DALTON_DISCORD_ENABLED, false);
 
+  const parseDefaultTrueBool = (value: string | undefined): boolean => {
+    const trimmed = value?.trim();
+    if (!trimmed) return true;
+    return parseBool(trimmed, true);
+  };
+
+  const statusFeedback: StatusFeedbackConfig = {
+    enabled: parseDefaultTrueBool(mergedEnv.DALTON_STATUS_FEEDBACK_ENABLED),
+    platforms: {
+      feishu: parseDefaultTrueBool(
+        mergedEnv.DALTON_FEISHU_STATUS_FEEDBACK_ENABLED,
+      ),
+      discord: parseDefaultTrueBool(
+        mergedEnv.DALTON_DISCORD_STATUS_FEEDBACK_ENABLED,
+      ),
+      weixin: parseDefaultTrueBool(
+        mergedEnv.DALTON_WEIXIN_STATUS_FEEDBACK_ENABLED,
+      ),
+    },
+  };
+
   return {
     host: "127.0.0.1",
     port,
@@ -198,6 +237,7 @@ export function loadConfig(
       mergedEnv.DALTON_COLLEAGUE_DISPATCH_ENABLED,
       true,
     ),
+    statusFeedback,
     channels: {
       feishu: {
         enabled: feishuEnabled,

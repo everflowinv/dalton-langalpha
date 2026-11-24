@@ -36,16 +36,104 @@ export interface ExecuteDeliveryOptions {
   activityOrigin?: DeliveryActivityOrigin | null;
 }
 
+export interface FirstCurrentDeliveryInfo {
+  platform: ChannelPlatform;
+  runId?: string | null;
+  inboundMessageId?: string | null;
+  kind: "agent_send" | "fallback" | "interrupt";
+}
+
 export class DeliveryService {
   private readonly backend: BackendClient;
   private readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
+  private readonly firstCurrentDeliveryListeners = new Set<
+    (info: FirstCurrentDeliveryInfo) => void
+  >();
+  private readonly inFlightCurrentDeliveriesByRun = new Map<
+    string,
+    Set<Promise<AgentSendResponse>>
+  >();
 
   constructor(options: {
     backend: BackendClient;
     adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
+    onFirstCurrentDelivery?: (info: FirstCurrentDeliveryInfo) => void;
   }) {
     this.backend = options.backend;
     this.adapters = options.adapters;
+    if (options.onFirstCurrentDelivery) {
+      this.firstCurrentDeliveryListeners.add(options.onFirstCurrentDelivery);
+    }
+  }
+
+  addFirstCurrentDeliveryListener(
+    listener: (info: FirstCurrentDeliveryInfo) => void,
+  ): void {
+    this.firstCurrentDeliveryListeners.add(listener);
+  }
+
+  hasInFlightCurrentDelivery(runId: string | null | undefined): boolean {
+    const trimmed = runId?.trim();
+    if (!trimmed) {
+      return false;
+    }
+    const set = this.inFlightCurrentDeliveriesByRun.get(trimmed);
+    return Boolean(set && set.size > 0);
+  }
+
+  /**
+   * Awaits all currently in-flight current-conversation content deliveries
+   * (`agent_send` / `fallback`) tracked for `runId` and returns their final outcomes.
+   */
+  async waitForInFlightCurrentDeliveries(
+    runId: string | null | undefined,
+  ): Promise<AgentSendResponse[]> {
+    const trimmed = runId?.trim();
+    if (!trimmed) {
+      return [];
+    }
+    const outcomes: AgentSendResponse[] = [];
+    const seen = new Set<Promise<AgentSendResponse>>();
+    for (;;) {
+      const set = this.inFlightCurrentDeliveriesByRun.get(trimmed);
+      if (!set || set.size === 0) {
+        break;
+      }
+      const pending = [...set].filter((p) => !seen.has(p));
+      if (pending.length === 0) {
+        break;
+      }
+      for (const p of pending) {
+        seen.add(p);
+      }
+      const settled = await Promise.allSettled(pending);
+      for (const item of settled) {
+        if (item.status === "fulfilled") {
+          outcomes.push(item.value);
+        } else {
+          outcomes.push({
+            status: "unknown",
+            code: "unavailable",
+            address: null,
+            current: true,
+            duplicate: false,
+            message: "In-flight delivery rejected unexpectedly.",
+            files: [],
+          });
+        }
+      }
+    }
+    return outcomes;
+  }
+
+  private notifyFirstCurrentDelivery(info: FirstCurrentDeliveryInfo): void {
+    for (const listener of this.firstCurrentDeliveryListeners) {
+      try {
+        listener(info);
+      } catch {
+        // Best-effort status feedback hook must never disrupt delivery.
+      }
+    }
   }
 
   /**
@@ -75,7 +163,46 @@ export class DeliveryService {
   /**
    * Execute an outbound delivery through `I-6` (`authorize-and-claim`) and `I-7` (`deliveries/progress`).
    */
-  async executeDelivery(options: ExecuteDeliveryOptions): Promise<AgentSendResponse> {
+  executeDelivery(options: ExecuteDeliveryOptions): Promise<AgentSendResponse> {
+    const trackRunId =
+      (options.kind === "agent_send" || options.kind === "fallback") &&
+      typeof options.runId === "string" &&
+      options.runId.trim().length > 0
+        ? options.runId.trim()
+        : null;
+
+    if (!trackRunId) {
+      return this.executeDeliveryCore(options);
+    }
+
+    let detached = false;
+    let trackedPromise!: Promise<AgentSendResponse>;
+    const untrack = (): void => {
+      if (detached) return;
+      detached = true;
+      const set = this.inFlightCurrentDeliveriesByRun.get(trackRunId);
+      if (set) {
+        set.delete(trackedPromise);
+        if (set.size === 0) {
+          this.inFlightCurrentDeliveriesByRun.delete(trackRunId);
+        }
+      }
+    };
+
+    trackedPromise = this.executeDeliveryCore(options, untrack).finally(untrack);
+    let set = this.inFlightCurrentDeliveriesByRun.get(trackRunId);
+    if (!set) {
+      set = new Set<Promise<AgentSendResponse>>();
+      this.inFlightCurrentDeliveriesByRun.set(trackRunId, set);
+    }
+    set.add(trackedPromise);
+    return trackedPromise;
+  }
+
+  private async executeDeliveryCore(
+    options: ExecuteDeliveryOptions,
+    untrackIfNotCurrent?: () => void,
+  ): Promise<AgentSendResponse> {
     const rawText = options.text ?? "";
     const trimmedText = rawText.trim();
     const hasNonEmptyText = trimmedText.length > 0;
@@ -149,6 +276,9 @@ export class DeliveryService {
     });
 
     if (claim.claim_status === "already_completed") {
+      if (!claim.is_current) {
+        untrackIfNotCurrent?.();
+      }
       const prev = (claim.first_response_json ?? {}) as Partial<AgentSendResponse>;
       return {
         status: (prev.status ?? claim.status ?? "sent") as AgentSendResponse["status"],
@@ -164,6 +294,9 @@ export class DeliveryService {
     }
 
     if (claim.claim_status === "in_flight_or_unknown") {
+      if (!claim.is_current) {
+        untrackIfNotCurrent?.();
+      }
       return {
         status: "unknown",
         code: "in_flight",
@@ -178,6 +311,9 @@ export class DeliveryService {
     }
 
     if (claim.claim_status === "denied") {
+      if (!claim.is_current) {
+        untrackIfNotCurrent?.();
+      }
       const mappedCode =
         claim.code === "unknown_delivery_blocks_fallback"
           ? null
@@ -194,6 +330,9 @@ export class DeliveryService {
     }
 
     // `claim_status === "claimed"`
+    if (!claim.is_current) {
+      untrackIfNotCurrent?.();
+    }
     const deliveryAttempt =
       typeof claim.delivery_attempt === "number" ? claim.delivery_attempt : undefined;
     const recordProgress = (
@@ -288,6 +427,23 @@ export class DeliveryService {
 
     const platformMessageIds: string[] = [];
     let sentChunks = 0;
+    let firstCurrentDeliveryNotified = false;
+    const isFeedbackTrackedKind =
+      options.kind === "agent_send" ||
+      options.kind === "fallback" ||
+      options.kind === "interrupt";
+    const maybeNotifyFirstCurrentDelivery = (): void => {
+      if (firstCurrentDeliveryNotified || !isCurrent || !isFeedbackTrackedKind) {
+        return;
+      }
+      firstCurrentDeliveryNotified = true;
+      this.notifyFirstCurrentDelivery({
+        platform: platformStr,
+        runId: options.runId ?? null,
+        inboundMessageId: options.inboundMessageId ?? null,
+        kind: options.kind as "agent_send" | "fallback" | "interrupt",
+      });
+    };
     let finalAddress = targetAddress;
     const confirmedThreadAddress = (claim.confirmed_thread_address ?? "").trim();
     const reuseConfirmedThread =
@@ -352,6 +508,7 @@ export class DeliveryService {
         if (res.resolvedAddress) {
           finalAddress = res.resolvedAddress;
         }
+        maybeNotifyFirstCurrentDelivery();
         await recordProgress({
           delivery_key: options.deliveryKey,
           sent_chunks: sentChunks,
@@ -460,6 +617,7 @@ export class DeliveryService {
           if (fileSucceeded) {
             platformMessageIds.push(sendRes.messageId);
             anyFileSucceeded = true;
+            maybeNotifyFirstCurrentDelivery();
           } else {
             anyFileFailed = true;
           }

@@ -11,6 +11,9 @@ import {
   ChannelDeliveryError,
   type CheckTargetLiveResult,
   type DownloadedAttachment,
+  type ProcessingFeedbackContext,
+  type ProcessingFeedbackHandle,
+  type ProcessingFeedbackOutcome,
   type SendCardOptions,
   type SendCardResult,
   type SendFileOptions,
@@ -21,6 +24,17 @@ import {
   type WeixinQrStartResult,
   type WeixinQrWaitResult,
 } from "./adapter.js";
+
+export interface FakeProcessingFeedbackRecord {
+  messageId: string;
+  platform: ChannelPlatform;
+  chatType: "dm" | "group";
+  chatAddress: string;
+  threadScopeKey: string;
+  settled: boolean;
+  outcome: ProcessingFeedbackOutcome | null;
+  settleCount: number;
+}
 
 export interface FakeSentTextRecord extends SendTextChunkOptions {
   messageId: string;
@@ -71,6 +85,7 @@ export class FakeChannelAdapter implements ChannelAdapter {
     bot_generation?: number;
   } | null = null;
   readonly sentCards: FakeSentCardRecord[] = [];
+  readonly feedbackRecords: FakeProcessingFeedbackRecord[] = [];
 
   private inboundHandler: ((event: InboundChannelEvent) => Promise<void>) | null = null;
   private nativeInteractionHandler:
@@ -118,6 +133,15 @@ export class FakeChannelAdapter implements ChannelAdapter {
         sessionKey: string;
         code: string;
       }) => Promise<WeixinQrWaitResult>)
+    | null = null;
+
+  private beginFeedbackBehavior:
+    | ((
+        context: ProcessingFeedbackContext,
+      ) =>
+        | ProcessingFeedbackHandle
+        | null
+        | Promise<ProcessingFeedbackHandle | null>)
     | null = null;
 
   constructor(platform: ChannelPlatform, maxChunkChars = 2000) {
@@ -207,6 +231,47 @@ export class FakeChannelAdapter implements ChannelAdapter {
     fn: ((options: SendCardOptions) => Promise<SendCardResult> | SendCardResult) | null,
   ): void {
     this.sendCardBehavior = fn;
+  }
+
+  setBeginFeedbackBehavior(
+    fn:
+      | ((
+          context: ProcessingFeedbackContext,
+        ) =>
+          | ProcessingFeedbackHandle
+          | null
+          | Promise<ProcessingFeedbackHandle | null>)
+      | null,
+  ): void {
+    this.beginFeedbackBehavior = fn;
+  }
+
+  beginProcessingFeedback(
+    context: ProcessingFeedbackContext,
+  ): ProcessingFeedbackHandle | null | Promise<ProcessingFeedbackHandle | null> {
+    if (this.beginFeedbackBehavior) {
+      return this.beginFeedbackBehavior(context);
+    }
+    const { event } = context;
+    const record: FakeProcessingFeedbackRecord = {
+      messageId: event.messageId,
+      platform: event.platform,
+      chatType: event.chatType,
+      chatAddress: event.chatAddress,
+      threadScopeKey: event.threadScopeKey,
+      settled: false,
+      outcome: null,
+      settleCount: 0,
+    };
+    this.feedbackRecords.push(record);
+    return {
+      settle: (outcome: ProcessingFeedbackOutcome) => {
+        if (record.settled) return;
+        record.settled = true;
+        record.outcome = outcome;
+        record.settleCount += 1;
+      },
+    };
   }
 
   setCheckTargetBehavior(

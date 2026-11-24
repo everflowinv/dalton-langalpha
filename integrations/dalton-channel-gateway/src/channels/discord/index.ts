@@ -19,6 +19,7 @@ import {
   canViewPlatformChat,
   type AvailableChatsResult, type ChannelAdapter, ChannelDeliveryError,
   type CheckTargetLiveResult, type DownloadedAttachment, type ListAvailableChatsOptions,
+  type ProcessingFeedbackContext, type ProcessingFeedbackHandle, type ProcessingFeedbackOutcome,
   type SendFileOptions, type SendFileResult, type SendTextChunkOptions, type SendTextChunkResult,
   type SendTextWithFileOptions,
 } from "../adapter.js";
@@ -40,7 +41,7 @@ import {
   parseDiscordInteractionCreate,
   type ParsedDiscordCommandInteraction,
 } from "./interactions.js";
-import { classifyDiscordDeliveryError, RequestClient, type DiscordFetch } from "./rest.js";
+import { classifyDiscordDeliveryError, DiscordError, DiscordQueueError, RequestClient, type DiscordFetch } from "./rest.js";
 import { createDmChannelId, parseDiscordTarget, sendFileDiscord, sendMessageDiscord } from "./send.js";
 import { ensureThreadUnarchived, getDiscordChannel, type DiscordChannelInfo } from "./threading.js";
 
@@ -52,6 +53,76 @@ export * from "./interactions.js";
 export * from "./rest.js";
 export * from "./send.js";
 export * from "./threading.js";
+
+export const DISCORD_PROCESSING_EMOJI = "⏳";
+export const DISCORD_FAILED_EMOJI = "⚠️";
+export const DISCORD_TYPING_INTERVAL_MS = 8_000;
+export const DISCORD_TYPING_MAX_DURATION_MS = 120_000;
+
+export function isDiscordNotFoundError(err: unknown): boolean {
+  return (
+    err instanceof DiscordError &&
+    (err.status === 404 || err.discordCode === 10008 || err.discordCode === 10003)
+  );
+}
+
+export function resolveDiscordFeedbackTarget(
+  event: InboundChannelEvent,
+  channelCache?: ReadonlyMap<string, DiscordChannelContext>,
+): { channelId: string; messageId: string; shouldSendTyping: boolean } | null {
+  const messageId = event.messageId.trim();
+  if (!messageId) return null;
+
+  const rawMessage =
+    event.rawPayload &&
+    typeof event.rawPayload === "object" &&
+    !Array.isArray(event.rawPayload) &&
+    event.rawPayload.discord_message &&
+    typeof event.rawPayload.discord_message === "object" &&
+    !Array.isArray(event.rawPayload.discord_message)
+      ? (event.rawPayload.discord_message as Record<string, unknown>)
+      : undefined;
+
+  const rawChannelId =
+    typeof rawMessage?.channel_id === "string" && rawMessage.channel_id.trim()
+      ? rawMessage.channel_id.trim()
+      : undefined;
+  const scopeThreadMatch = /:thread:([^:/\s]+)$/.exec(event.threadScopeKey ?? "");
+  const scopeThreadId = scopeThreadMatch?.[1]?.trim() || undefined;
+
+  let channelId = rawChannelId ?? scopeThreadId;
+  if (!channelId) {
+    const trimmedChatId = event.chatId.trim();
+    if (event.chatType === "dm") {
+      if (trimmedChatId && trimmedChatId !== "@me" && trimmedChatId !== "discord:@me") {
+        channelId = trimmedChatId;
+      }
+    } else if (trimmedChatId) {
+      const cleaned = trimmedChatId.replace(/^discord:/i, "");
+      const parts = cleaned.split("/").filter(Boolean);
+      channelId = parts.length > 0 ? parts[parts.length - 1] : undefined;
+    }
+  }
+  if (!channelId) return null;
+
+  const cachedCtx = channelCache?.get(channelId);
+  const rawThread =
+    rawMessage?.thread &&
+    typeof rawMessage.thread === "object" &&
+    !Array.isArray(rawMessage.thread)
+      ? (rawMessage.thread as { id?: unknown })
+      : undefined;
+  const isThread =
+    Boolean(scopeThreadId) ||
+    isDiscordThreadChannelType(cachedCtx?.type) ||
+    (typeof rawThread?.id === "string" && rawThread.id.trim() === channelId);
+
+  return {
+    channelId,
+    messageId,
+    shouldSendTyping: event.chatType === "dm" || isThread,
+  };
+}
 
 export interface DiscordChannelAdapterOptions {
   botToken?: string;
@@ -69,6 +140,11 @@ export interface DiscordChannelAdapterOptions {
   dedupeTtlMs?: number;
   queueTaskTimeoutMs?: number;
   mediaFetchImpl?: SafeFetchOptions["fetchImpl"];
+  processingEmoji?: string;
+  failedEmoji?: string;
+  typingIntervalMs?: number;
+  typingMaxDurationMs?: number;
+  nowFn?: () => number;
 }
 
 interface GuildChannelsResponseItem {
@@ -99,6 +175,12 @@ export class DiscordChannelAdapter implements ChannelAdapter {
   private readonly interactionAckStates = new Map<string, StoredInteractionAckState>();
   private readonly interactionAckInFlight = new Map<string, Promise<StoredInteractionAckState>>();
   private readonly interactionClient: DiscordInteractionHttpClient;
+  private readonly activeFeedbackCleanups = new Set<() => void>();
+  private readonly processingEmoji: string;
+  private readonly failedEmoji: string;
+  private readonly typingIntervalMs: number;
+  private readonly typingMaxDurationMs: number;
+  private readonly nowFn: () => number;
   private restInstance?: RequestClient;
   private gatewayInstance?: DiscordGatewayClient;
   private readonly baseGatewayOnReady?: DiscordGatewayClientOptions["onReady"];
@@ -131,6 +213,11 @@ export class DiscordChannelAdapter implements ChannelAdapter {
         fetchImpl: options.interactionHttpOptions?.fetchImpl ?? (options.fetchImpl as typeof fetch | undefined),
         ...options.interactionHttpOptions,
       });
+    this.processingEmoji = options.processingEmoji?.trim() || DISCORD_PROCESSING_EMOJI;
+    this.failedEmoji = options.failedEmoji?.trim() || DISCORD_FAILED_EMOJI;
+    this.typingIntervalMs = options.typingIntervalMs ?? DISCORD_TYPING_INTERVAL_MS;
+    this.typingMaxDurationMs = options.typingMaxDurationMs ?? DISCORD_TYPING_MAX_DURATION_MS;
+    this.nowFn = options.nowFn ?? (() => Date.now());
   }
 
   isConfigured(): boolean { return Boolean(this.botToken || this.restInstance || this.gatewayInstance); }
@@ -308,6 +395,10 @@ export class DiscordChannelAdapter implements ChannelAdapter {
     this.lifecycleEpoch += 1;
     this.startPromise = null;
     this.started = false;
+    for (const cleanup of [...this.activeFeedbackCleanups]) {
+      cleanup();
+    }
+    this.activeFeedbackCleanups.clear();
     this.lifecycleAbortController.abort();
     if (this.gatewayInstance) await this.gatewayInstance.stop();
     this.restInstance?.abortAllRequests();
@@ -820,6 +911,224 @@ export class DiscordChannelAdapter implements ChannelAdapter {
     const id = await createDmChannelId(this.getRest(), recipientUserId);
     this.dmChannelCache.set(recipientUserId, id);
     return id;
+  }
+
+  /**
+   * Starts best-effort processing feedback on a Discord inbound message:
+   * - Adds ⏳ reaction (`PUT /channels/{channel_id}/messages/{message_id}/reactions/%E2%8F%B3/@me`).
+   * - In DMs and Threads, also sends `POST /channels/{channel_id}/typing` every 8s up to 120s.
+   * - In public guild channels, only adds the reaction without broadcasting typing.
+   * - On settle: stops typing, removes ⏳, and on `"delivery_failed"` adds ⚠️.
+   * - On HTTP 404 / Unknown Message (10008): silently abandons.
+   * State lives strictly in gateway process memory (reactions left behind before a restart are not cleaned up).
+   */
+  beginProcessingFeedback(
+    context: ProcessingFeedbackContext,
+  ): ProcessingFeedbackHandle | null {
+    const target = resolveDiscordFeedbackTarget(context.event, this.channelCache);
+    if (!target) {
+      return null;
+    }
+
+    let rest: RequestClient;
+    try {
+      rest = this.getRest();
+    } catch {
+      return null;
+    }
+
+    const { channelId, messageId, shouldSendTyping } = target;
+    const encodedChannel = encodeURIComponent(channelId);
+    const encodedMessage = encodeURIComponent(messageId);
+    const encodedProcessingEmoji = encodeURIComponent(this.processingEmoji);
+    const encodedFailedEmoji = encodeURIComponent(this.failedEmoji);
+    const reactionPath = `/channels/${encodedChannel}/messages/${encodedMessage}/reactions/${encodedProcessingEmoji}/@me`;
+    const failedReactionPath = `/channels/${encodedChannel}/messages/${encodedMessage}/reactions/${encodedFailedEmoji}/@me`;
+    const typingPath = `/channels/${encodedChannel}/typing`;
+
+    let reactionAdded = false;
+    let withdrawn = false;
+    let settled = false;
+    let settlePromise: Promise<void> | null = null;
+    let typingTimer: ReturnType<typeof setTimeout> | null = null;
+    let typingMaxTimer: ReturnType<typeof setTimeout> | null = null;
+    const typingAbortController = new AbortController();
+    const startedAtMs = this.nowFn();
+
+    const stopTyping = (): void => {
+      if (typingTimer !== null) {
+        clearTimeout(typingTimer);
+        typingTimer = null;
+      }
+      if (typingMaxTimer !== null) {
+        clearTimeout(typingMaxTimer);
+        typingMaxTimer = null;
+      }
+      if (!typingAbortController.signal.aborted) {
+        typingAbortController.abort();
+      }
+      this.activeFeedbackCleanups.delete(stopTyping);
+    };
+
+    const triggerTypingOnce = (): void => {
+      if (settled || withdrawn || typingAbortController.signal.aborted) {
+        stopTyping();
+        return;
+      }
+      void rest
+        .post(typingPath, undefined, {
+          priority: "background",
+          signal: typingAbortController.signal,
+        })
+        .catch((err) => {
+          if (
+            (err instanceof DiscordQueueError && err.reason === "queue_aborted") ||
+            typingAbortController.signal.aborted
+          ) {
+            return;
+          }
+          if (isDiscordNotFoundError(err)) {
+            withdrawn = true;
+            stopTyping();
+            this.logger.debug("Discord channel/message not found during typing pulse", {
+              channelId,
+              messageId,
+            });
+            return;
+          }
+          this.logger.debug("Discord typing indicator request skipped", {
+            channelId,
+            messageId,
+            error: err,
+          });
+        });
+    };
+
+    const scheduleNextTyping = (): void => {
+      if (settled || withdrawn || !shouldSendTyping || typingAbortController.signal.aborted) {
+        stopTyping();
+        return;
+      }
+      const elapsedMs = this.nowFn() - startedAtMs;
+      if (elapsedMs + this.typingIntervalMs >= this.typingMaxDurationMs) {
+        return;
+      }
+      typingTimer = setTimeout(() => {
+        typingTimer = null;
+        if (settled || withdrawn || typingAbortController.signal.aborted) {
+          stopTyping();
+          return;
+        }
+        if (this.nowFn() - startedAtMs >= this.typingMaxDurationMs) {
+          stopTyping();
+          return;
+        }
+        triggerTypingOnce();
+        scheduleNextTyping();
+      }, this.typingIntervalMs);
+      (typingTimer as { unref?: () => void }).unref?.();
+    };
+
+    if (shouldSendTyping) {
+      this.activeFeedbackCleanups.add(stopTyping);
+      typingMaxTimer = setTimeout(() => {
+        typingMaxTimer = null;
+        stopTyping();
+      }, Math.max(0, this.typingMaxDurationMs));
+      (typingMaxTimer as { unref?: () => void }).unref?.();
+      triggerTypingOnce();
+      scheduleNextTyping();
+    }
+
+    const addTask = rest
+      .put(reactionPath, undefined, { priority: "background", idempotent: true })
+      .then(() => {
+        reactionAdded = true;
+      })
+      .catch((err) => {
+        if (isDiscordNotFoundError(err)) {
+          withdrawn = true;
+          stopTyping();
+          this.logger.debug("Discord original message withdrawn before processing reaction", {
+            channelId,
+            messageId,
+          });
+          return;
+        }
+        this.logger.debug("Discord processing reaction skipped", {
+          channelId,
+          messageId,
+          error: err,
+        });
+      });
+
+    return {
+      settle: (outcome: ProcessingFeedbackOutcome): Promise<void> => {
+        if (settled) {
+          return settlePromise ?? Promise.resolve();
+        }
+        settled = true;
+        stopTyping();
+        settlePromise = (async () => {
+          await addTask;
+          if (withdrawn) {
+            return;
+          }
+          if (reactionAdded) {
+            try {
+              await rest.delete(reactionPath, {
+                priority: "background",
+                idempotent: true,
+              });
+            } catch (err) {
+              if (isDiscordNotFoundError(err)) {
+                withdrawn = true;
+                this.logger.debug(
+                  "Discord original message withdrawn before removing processing reaction",
+                  { channelId, messageId },
+                );
+                return;
+              }
+              this.logger.warn("Discord processing reaction removal failed", {
+                channelId,
+                messageId,
+                error: err,
+              });
+            }
+          }
+          if (outcome === "delivery_failed" && !withdrawn && this.failedEmoji) {
+            try {
+              await rest.put(failedReactionPath, undefined, {
+                priority: "background",
+                idempotent: true,
+              });
+            } catch (err) {
+              if (isDiscordNotFoundError(err)) {
+                withdrawn = true;
+                this.logger.debug(
+                  "Discord original message withdrawn before adding failure reaction",
+                  { channelId, messageId },
+                );
+                return;
+              }
+              this.logger.warn("Discord failure reaction add failed", {
+                channelId,
+                messageId,
+                error: err,
+              });
+            }
+          }
+        })().catch((err) => {
+          this.logger.warn("Discord processing feedback settle error", {
+            channelId,
+            messageId,
+            outcome,
+            error: err,
+          });
+        });
+        return settlePromise;
+      },
+    };
   }
 
   async sendTextChunk(options: SendTextChunkOptions): Promise<SendTextChunkResult> {
