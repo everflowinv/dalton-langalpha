@@ -7,6 +7,9 @@
 import { Suspense } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup } from '@testing-library/react';
+import { enUS, zhCN } from '@/test/catalogs';
+import thisMacEn from '@/locales/thisMacFirstRun/en-US.json';
+import thisMacZh from '@/locales/thisMacFirstRun/zh-CN.json';
 
 const h = vi.hoisted(() => ({
   models: 'claude_code' as 'claude_code' | 'subscription_or_key' | 'langalpha_models',
@@ -633,7 +636,8 @@ describe('Dalton brand rendering across Setup and Onboarding', () => {
 
       // 5. All interpolated setup / Mac / thisMacFirstRun / legal consent / approval keys resolve without upstream brand
       const namespacesAndPrefixes: Array<[string, Record<string, unknown>, string]> = [
-        ['translation', (locale === 'zh-CN' ? zhCN : enUS).setup as Record<string, unknown>, 'setup'],
+        // Setup copy is its own namespace since upstream #863 (`setup:steps.title`).
+        ['setup', (locale === 'zh-CN' ? zhCN : enUS).setup as Record<string, unknown>, 'setup'],
         ['translation', (locale === 'zh-CN' ? zhCN : enUS).onboarding as Record<string, unknown>, 'onboarding'],
         ['thisMacFirstRun', (locale === 'zh-CN' ? thisMacZh : thisMacEn) as Record<string, unknown>, 'thisMacFirstRun'],
       ];
@@ -643,7 +647,7 @@ describe('Dalton brand rendering across Setup and Onboarding', () => {
           if (v && typeof v === 'object' && !Array.isArray(v)) {
             checkTree(ns, v as Record<string, unknown>, path);
           } else if (typeof v === 'string') {
-            const key = ns === 'thisMacFirstRun' ? `thisMacFirstRun:${path.replace(/^thisMacFirstRun\./, '')}` : path;
+            const key = ns === 'translation' ? path : `${ns}:${path.slice(ns.length + 1)}`;
             const rendered = i18n.t(key, { name: 'Workspace', model: 'Claude Sonnet', count: 1, n: 1 });
             expect(rendered, `[${locale}] ${key} leaked upstream brand`).not.toMatch(FORBIDDEN_BRAND);
           }

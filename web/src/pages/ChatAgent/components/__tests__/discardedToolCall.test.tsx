@@ -9,6 +9,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import '@testing-library/jest-dom';
 import zhToolArtifact from '@/locales/toolArtifact/zh-CN.json';
 import enToolArtifact from '@/locales/toolArtifact/en-US.json';
+import { enUS, lookup } from '@/test/catalogs';
 import type { ChatMessage } from '@/types/chat';
 import type { SSEEvent } from '../../session/types';
 import { createStreamEventProcessor } from '../../session/stream/processStreamEvent';
@@ -232,7 +233,7 @@ describe('discarded pre-finish tool calls & same-frame text', () => {
       malformed_call: 'Tool call not executed: malformed tool call',
       interrupted: 'Tool call not executed: model output interrupted',
     });
-    expect(enUS.chat.autoRetryExhausted).toBe("Couldn't finish this reply after a few tries. Try again in a moment.");
+    expect(lookup(enUS, 'chat.autoRetryExhausted')).toBe("Couldn't finish this reply after a few tries. Try again in a moment.");
   });
 
   it('ignores discarded-looking prefix in ordinary Bash output without discarded=true & status=error', () => {
