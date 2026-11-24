@@ -589,16 +589,21 @@ def test_revert_deploy_aborts_without_reset_when_backend_touched_with_migration(
     assert "部署前=146, 刚才读到=147" in out1
     assert f"PRE_FF ({pre_ff1}) 迁移链 head: dalton=d040, upstream=146" in out1
     assert f"TARGET ({head1}) 迁移链 head: dalton=d041, upstream=147" in out1
-    # Recommended reset target is TARGET (head1) because its two heads match current DB (d041/147)
-    assert f"target_migration_heads {head1}" in out1
-    assert f"git reset --keep {head1}" in out1
+    # Recommended reset target is TARGET (head1) because its two heads match current DB (d041/147);
+    # step 7 and step 8 both use the same RESET_SHA variable, and step 6 instructs updating RESET_SHA after downgrade.
+    assert f"RESET_SHA={head1}" in out1
+    assert 'target_migration_heads "$RESET_SHA"' in out1
+    assert 'git reset --keep "$RESET_SHA"' in out1
+    assert f"git reset --keep {head1}" not in out1
     assert f"git reset --keep {pre_ff1}" not in out1
-    # Steps 1-9 in order; plan B stops writes, reads DB, verifies target_migration_heads, then resets.
+    assert "降级后，把 RESET_SHA 改为两条链 head 等于降级后数据库版本的那个提交（通常是 PRE_FF），重新执行第 7 步核对，一致后再执行第 8 步。" in out1
+    # Steps 1-9 in order; plan B stops writes, reads DB, sets RESET_SHA, verifies target_migration_heads, then resets.
     positions = [out1.index(f"\n{n}. ") for n in range(1, 10)]
     assert positions == sorted(positions)
     assert out1.index("docker stop dalton-langalpha-edge-1") < out1.index("SELECT version_num FROM alembic_version_dalton")
-    assert out1.index("SELECT version_num FROM alembic_version_dalton") < out1.index(f"target_migration_heads {head1}")
-    assert out1.index(f"target_migration_heads {head1}") < out1.index("git reset --keep")
+    assert out1.index("SELECT version_num FROM alembic_version_dalton") < out1.index(f"RESET_SHA={head1}")
+    assert out1.index(f"RESET_SHA={head1}") < out1.index('target_migration_heads "$RESET_SHA"')
+    assert out1.index('target_migration_heads "$RESET_SHA"') < out1.index('git reset --keep "$RESET_SHA"')
     assert "docker ps -a --filter name=dalton-langalpha-" in out1
     assert "docker logs --tail 100 dalton-langalpha-backend-1" in out1
     assert "docker compose config backend | grep -E 'DB_(HOST|PORT|NAME)'" in out1
@@ -642,8 +647,9 @@ def test_revert_deploy_aborts_without_reset_when_backend_touched_with_migration(
     assert "部署前=未能读取, 刚才读到=未能读取" in res2.stdout
     assert "版本读不到" in res2.stdout
     assert "先不要重启后端" in res2.stdout
-    assert "target_migration_heads <已核对一致的提交>" in res2.stdout
-    assert "git reset --keep <已核对一致的提交>" in res2.stdout
+    assert "RESET_SHA=<已核对一致的提交>" in res2.stdout
+    assert 'target_migration_heads "$RESET_SHA"' in res2.stdout
+    assert 'git reset --keep "$RESET_SHA"' in res2.stdout
     assert f"git reset --keep {pre_ff2}" not in res2.stdout
     assert "部署前的备份" in res2.stdout
     assert "\n1. " in res2.stdout and "\n9. " in res2.stdout
@@ -1046,11 +1052,14 @@ run_deploy_main --reuse-backup-minutes 60
     assert "本次发布包含数据库迁移文件" not in res.stdout
     assert f"PRE_FF ({v2_with_d047}) 迁移链 head: dalton=d047, upstream=146" in res.stdout
     assert f"TARGET ({v3_reverted}) 迁移链 head: dalton=d046, upstream=146" in res.stdout
-    assert f"target_migration_heads {v3_reverted}" in res.stdout
-    assert f"git reset --keep {v3_reverted}" in res.stdout
+    assert f"RESET_SHA={v3_reverted}" in res.stdout
+    assert 'target_migration_heads "$RESET_SHA"' in res.stdout
+    assert 'git reset --keep "$RESET_SHA"' in res.stdout
     assert f"git reset --keep {v2_with_d047}" not in res.stdout
-    assert res.stdout.index(f"target_migration_heads {v3_reverted}") < res.stdout.index(
-        f"git reset --keep {v3_reverted}"
+    assert (
+        res.stdout.index(f"RESET_SHA={v3_reverted}")
+        < res.stdout.index('target_migration_heads "$RESET_SHA"')
+        < res.stdout.index('git reset --keep "$RESET_SHA"')
     )
     assert "PRE_FF" in res.stderr and "d047" in res.stderr
     # Checkout stays on v3_reverted and must NOT reset back to v2_with_d047
@@ -1089,11 +1098,14 @@ def test_revert_deploy_manual_instructions_when_neither_pre_ff_nor_target_matche
     assert f"target_migration_heads {pre_ff}" in out
     assert f"target_migration_heads {head}" in out
     assert "git log --oneline -n 10" in out
-    assert "target_migration_heads <已核对一致的提交>" in out
-    assert "git reset --keep <已核对一致的提交>" in out
+    assert "RESET_SHA=<已核对一致的提交>" in out
+    assert 'target_migration_heads "$RESET_SHA"' in out
+    assert 'git reset --keep "$RESET_SHA"' in out
     assert f"git reset --keep {pre_ff}" not in out
     assert f"git reset --keep {head}" not in out
-    assert out.index("target_migration_heads <已核对一致的提交>") < out.index(
-        "git reset --keep <已核对一致的提交>"
+    assert (
+        out.index("RESET_SHA=<已核对一致的提交>")
+        < out.index('target_migration_heads "$RESET_SHA"')
+        < out.index('git reset --keep "$RESET_SHA"')
     )
 

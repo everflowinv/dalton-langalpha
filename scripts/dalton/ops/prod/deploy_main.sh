@@ -24,9 +24,10 @@ usage() {
 Usage: deploy_main.sh [--bridge] [--recreate] [--expect-migration dNNN] [--reuse-backup-minutes N]
   Waits for backend idle, reads pre-deploy DB revisions, fetches origin once and pins
   TARGET=origin/dalton/main, verifies HEAD is an ancestor of TARGET and migration directories
-  have no uncommitted files, compares pre-deploy DB revisions against TARGET heads (dalton +
-  upstream) for backup reuse, against post-ff HEAD for migrating status, and against PRE_FF
-  before auto-revert (unreadable DB revisions are treated as migrating).
+  have no uncommitted or ignored files (except __pycache__/ and *.pyc), re-checks migration
+  directories and heads right before backend restart, compares pre-deploy DB revisions against
+  TARGET heads (dalton + upstream) for backup reuse, against post-ff HEAD for migrating status,
+  and against PRE_FF before auto-revert (unreadable DB revisions are treated as migrating).
   --reuse-backup-minutes N  Reuse last ' ok ' dump <= N min old only when DB revisions match TARGET heads.
   --expect-migration dNNN   Verify post-deploy dalton migration starts with dNNN.
   --recreate                Recreate backend/crawler containers instead of docker restart.
@@ -721,15 +722,17 @@ _print_manual_revert_instructions() {
   echo "     docker compose run --rm --no-deps --entrypoint \"\" backend sh -c \"cd /app && uv run alembic -c src/dalton/alembic.ini downgrade ${PRE_FF_DALTON_REV:-<部署前Dalton版本>}\""
   echo "     docker compose run --rm --no-deps --entrypoint \"\" backend sh -c \"cd /app && uv run alembic -c alembic.ini downgrade ${PRE_FF_UPSTREAM_REV:-<部署前上游版本>}\""
   echo "   降级后再读一次两条链的版本，必须等于目标版本；不等就停下，切勿复位代码。"
-  echo "7. 【方案 B】打印所选提交的两条链 head，与第 5/6 步读到的数据库版本比对一致后再继续（不等就停下，先不要重启后端）："
-  echo "     DALTON_DEPLOY_LIB_ONLY=1 bash -c 'source scripts/dalton/ops/prod/deploy_main.sh && target_migration_heads ${reset_target}'"
+  echo "   降级后，把 RESET_SHA 改为两条链 head 等于降级后数据库版本的那个提交（通常是 PRE_FF），重新执行第 7 步核对，一致后再执行第 8 步。"
+  echo "7. 【方案 B】设定复位提交 RESET_SHA 并打印其两条链 head，与第 5/6 步读到的数据库版本比对一致后再继续（不等就停下，先不要重启后端）："
+  echo "     RESET_SHA=${reset_target}"
+  echo "     DALTON_DEPLOY_LIB_ONLY=1 RESET_SHA=\"\$RESET_SHA\" bash -c 'source scripts/dalton/ops/prod/deploy_main.sh && target_migration_heads \"\$RESET_SHA\"'"
   if [ -n "$recommended_commit" ] && [ -n "${PRE_FF:-}" ] && [ "$recommended_commit" != "$PRE_FF" ]; then
-    echo "   如第 6 步已将数据库降级回部署前版本，把上面的提交换为对应历史提交（如 ${PRE_FF}）重新核对一致后再执行第 8 步。"
+    echo "   如第 6 步已将数据库降级回部署前版本，把 RESET_SHA 改为对应历史提交（如 RESET_SHA=${PRE_FF}），重新执行第 7 步核对，一致后再执行第 8 步。"
   elif [ -z "$recommended_commit" ]; then
-    echo "   请把 <已核对一致的提交> 替换为两条链 head 均等于数据库版本的提交；确认一致前先不要重启后端。"
+    echo "   请把 RESET_SHA 设为两条链 head 均等于数据库版本的提交（替换 <已核对一致的提交>）；确认一致前先不要重启后端。"
   fi
   echo "8. 【方案 B】确认第 7 步比对一致后，复位代码、重建前端，并强制重建容器（后端仍处于停止状态才执行）："
-  echo "     git reset --keep ${reset_target} && (cd web && pnpm install --frozen-lockfile) && bash scripts/dalton/build_frontend_prod.sh --require-supabase"
+  echo "     git reset --keep \"\$RESET_SHA\" && (cd web && pnpm install --frozen-lockfile) && bash scripts/dalton/build_frontend_prod.sh --require-supabase"
   echo "     docker compose up -d --no-deps --force-recreate backend crawler edge"
   echo "9. 【方案 B】恢复宿主机服务与看门狗，并验证："
   echo "     launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.dalton.monitor-feeds.plist"
@@ -925,15 +928,31 @@ _resolve_deploy_python() {
   printf '%s' "$py"
 }
 
-# Reject untracked, modified, or staged files in either migration directory before backup or ff.
+# Reject untracked, ignored (except __pycache__/ and *.pyc), modified, or staged files in either
+# migration directory before backup/ff and again right before backend restart.
 check_clean_migration_dirs() {
-  local dirty=""
-  if ! dirty=$(git status --porcelain --untracked-files=all -- migrations/versions src/dalton/migrations/versions); then
+  local raw="" dirty="" line="" status="" path="" unquoted="" nl=$'\n'
+  if ! raw=$(git status --porcelain --untracked-files=all --ignored -- migrations/versions src/dalton/migrations/versions); then
     echo "ERROR: failed to inspect migration directories via git status, abort" >&2
     return 1
   fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    status="${line:0:2}"
+    path="${line:3}"
+    unquoted="${path#\"}"
+    unquoted="${unquoted%\"}"
+    if [ "$status" = "!!" ] || [ "$status" = "??" ]; then
+      case "$unquoted" in
+        */__pycache__|*/__pycache__/|*/__pycache__/*|*.pyc)
+          continue
+          ;;
+      esac
+    fi
+    dirty="${dirty:+${dirty}${nl}}${line}"
+  done <<<"$raw"
   if [ -n "$dirty" ]; then
-    echo "ERROR: 迁移目录下存在未提交的文件（未跟踪、已修改或已暂存），先清理或提交后再部署:" >&2
+    echo "ERROR: 迁移目录下存在未提交或被忽略的文件（未跟踪、被忽略、已修改或已暂存），先清理或提交后再部署:" >&2
     printf '%s\n' "$dirty" >&2
     return 1
   fi
@@ -1050,7 +1069,7 @@ def _chain_head(label: str, directory: str) -> str:
         if len(parts) < 2 or parts[1] != "blob":
             continue
         basename = path.rsplit("/", 1)[-1]
-        if not basename.endswith(".py") or basename.startswith("__"):
+        if not basename.endswith(".py") or basename == "__init__.py":
             continue
         paths.append(path)
 
@@ -1184,7 +1203,7 @@ compute_migrating_deploy() {
 }
 
 run_deploy_main() {
-  local LOG before after out build_rc cur reused target_heads post_ff_head
+  local LOG before after out build_rc cur reused target_heads post_ff_head pre_restart_heads
   parse_deploy_args "$@" || exit $?
   cd "$REPO_ROOT" || exit 1
   cleanup_old_container_logs
@@ -1266,6 +1285,22 @@ run_deploy_main() {
   # started in that gap would be cut off (2026-10-28: a new EDU turn died this way).
   busy() { [ "$(docker exec dalton-langalpha-postgres-1 psql -U postgres -d postgres -Atc "select (select count(*) from conversation_threads where current_status='in_progress')+(select count(*) from subagent_runs where status='in_progress')")" != "0" ]; }
   while busy; do echo "$(date '+%T') work started during backup/build; waiting for idle again"; bash "$WAIT_IDLE_SCRIPT" || { echo "still busy: reverting (backend not restarted)"; revert_deploy; exit 1; }; done
+
+  if ! check_clean_migration_dirs; then
+    echo "ERROR: pre-restart migration directory check failed (migration directories changed after pre-backup check): reverting (backend not restarted)" >&2
+    revert_deploy
+    exit 1
+  fi
+  if ! pre_restart_heads=$(target_migration_heads HEAD); then
+    echo "ERROR: pre-restart migration head check failed for HEAD: reverting (backend not restarted)" >&2
+    revert_deploy
+    exit 1
+  fi
+  if [ "$pre_restart_heads" != "$target_heads" ]; then
+    echo "ERROR: pre-restart migration heads (${pre_restart_heads}) differ from pre-backup target heads (${target_heads}): reverting (backend not restarted)" >&2
+    revert_deploy
+    exit 1
+  fi
 
   BACKEND_TOUCHED=1
   if ! apply_backend; then

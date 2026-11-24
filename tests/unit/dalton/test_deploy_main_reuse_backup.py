@@ -1008,3 +1008,185 @@ exec "{real_git}" "$@"
     )
     assert res_busy.returncode != 0
     assert order_log.read_text().splitlines() == ["wait_idle_fail"]
+
+
+def test_check_clean_migration_dirs_catches_gitignored_files_and_excludes_only_pycache_and_pyc(
+    tmp_path: Path,
+) -> None:
+    ctx = _setup_deploy_env(tmp_path)
+    seed = Path(ctx["seed"])
+    repo = Path(ctx["repo"])
+    v1 = str(ctx["v1"])
+    launchctl_trace = Path(ctx["launchctl_trace"])
+
+    # Commit .gitignore matching repo patterns (.env.*, __pycache__/, *.pyc)
+    (seed / ".gitignore").write_text(".env.*\n__pycache__/\n*.pyc\n")
+    (seed / "app.py").write_text("v2\n")
+    subprocess.run(["git", "-C", str(seed), "add", ".gitignore", "app.py"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-q", "-m", "v2 gitignore"], check=True)
+    subprocess.run(["git", "-C", str(seed), "push", "-q", "origin", "dalton/main"], check=True)
+    v2 = subprocess.check_output(["git", "-C", str(seed), "rev-parse", "HEAD"], text=True).strip()
+
+    # Copy .gitignore into repo working tree or pull? Keep repo at v1 with local .gitignore committed first
+    # so repo knows .env.* is ignored before deploy.
+    (repo / ".gitignore").write_text(".env.*\n__pycache__/\n*.pyc\n")
+    # Put .gitignore into .git/info/exclude so repo stays at v1 without local commits
+    (repo / ".gitignore").unlink()
+    (repo / ".git/info/exclude").write_text(".env.*\n__pycache__/\n*.pyc\n")
+
+    # 1. Ignored migration-like Python file (.env.d049.bak.py) must be caught and abort deploy
+    ignored_py = repo / "src/dalton/migrations/versions/.env.d049.bak.py"
+    ignored_py.write_text("revision = 'd049'\ndown_revision = 'd040'\n")
+    res_ignored = _run_deploy(ctx, tmp_path, args="--reuse-backup-minutes 60")
+    assert res_ignored.returncode != 0
+    assert ".env.d049.bak.py" in res_ignored.stderr
+    assert not launchctl_trace.exists()
+    assert subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip() == v1
+
+    # 2. Removing the ignored .py file and leaving __pycache__/ + *.pyc must be allowed
+    ignored_py.unlink()
+    pycache = repo / "src/dalton/migrations/versions/__pycache__"
+    pycache.mkdir()
+    (pycache / "d040_base.cpython-312.pyc").write_bytes(b"bytecode")
+    (repo / "migrations/versions/146_base.pyc").write_bytes(b"bytecode")
+    res_clean = _run_deploy(ctx, tmp_path, args="--reuse-backup-minutes 60")
+    assert res_clean.returncode == 0, res_clean.stdout + res_clean.stderr
+    assert "backup: reusing" in res_clean.stdout
+    assert subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip() == v2
+
+
+def test_run_deploy_main_rechecks_migrations_before_backend_restart(tmp_path: Path) -> None:
+    # Case 1: ignored/untracked file added to migration dir during frontend build stops before backend restart
+    ctx1 = _setup_deploy_env(tmp_path / "dirty_during_build")
+    seed1 = Path(ctx1["seed"])
+    repo1 = Path(ctx1["repo"])
+    v1_1 = str(ctx1["v1"])
+    fake_bin1 = Path(ctx1["fake_bin"])
+    docker_trace1 = tmp_path / "dirty_during_build/docker.trace"
+    (repo1 / ".git/info/exclude").write_text(".env.*\n__pycache__/\n*.pyc\n")
+
+    (fake_bin1 / "docker").write_text(
+        f"""#!/bin/bash
+echo "docker:$*" >> "{docker_trace1}"
+case "$1" in
+  exec)
+    if echo "$*" | grep -q "conversation_threads"; then
+      echo "0"
+      exit 0
+    fi
+    ;;
+esac
+exit 0
+"""
+    )
+    (fake_bin1 / "docker").chmod(0o755)
+
+    (seed1 / "scripts/dalton/build_frontend_prod.sh").write_text(
+        """#!/bin/bash
+cat > src/dalton/migrations/versions/.env.d049.bak.py <<'EOF'
+revision = 'd049'
+down_revision = 'd040'
+EOF
+echo 'OK: Production bundle'
+exit 0
+"""
+    )
+    subprocess.run(["git", "-C", str(seed1), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(seed1), "commit", "-q", "-m", "v2 build drops ignored mig"], check=True)
+    subprocess.run(["git", "-C", str(seed1), "push", "-q", "origin", "dalton/main"], check=True)
+
+    res1 = _run_deploy(ctx1, tmp_path / "dirty_during_build", args="--reuse-backup-minutes 60")
+    assert res1.returncode != 0
+    assert ".env.d049.bak.py" in res1.stderr
+    assert "pre-restart migration directory check failed" in res1.stderr
+    assert "backend not restarted" in res1.stderr
+    d1 = docker_trace1.read_text() if docker_trace1.exists() else ""
+    assert "restart dalton-langalpha-backend-1" not in d1
+    assert "compose up" not in d1
+    assert subprocess.check_output(["git", "-C", str(repo1), "rev-parse", "HEAD"], text=True).strip() == v1_1
+
+    # Case 2: new migration committed to HEAD during frontend build (clean tree, changed head) stops before restart
+    ctx2 = _setup_deploy_env(tmp_path / "head_changed_during_build")
+    seed2 = Path(ctx2["seed"])
+    repo2 = Path(ctx2["repo"])
+    v1_2 = str(ctx2["v1"])
+    fake_bin2 = Path(ctx2["fake_bin"])
+    docker_trace2 = tmp_path / "head_changed_during_build/docker.trace"
+
+    (fake_bin2 / "docker").write_text(
+        f"""#!/bin/bash
+echo "docker:$*" >> "{docker_trace2}"
+case "$1" in
+  exec)
+    if echo "$*" | grep -q "conversation_threads"; then
+      echo "0"
+      exit 0
+    fi
+    ;;
+esac
+exit 0
+"""
+    )
+    (fake_bin2 / "docker").chmod(0o755)
+
+    (seed2 / "scripts/dalton/build_frontend_prod.sh").write_text(
+        """#!/bin/bash
+if [ ! -f src/dalton/migrations/versions/d049_mid_build.py ]; then
+  cat > src/dalton/migrations/versions/d049_mid_build.py <<'EOF'
+revision = 'd049'
+down_revision = 'd040'
+EOF
+  git add src/dalton/migrations/versions/d049_mid_build.py
+  git commit -q -m "mid-build migration commit"
+fi
+echo 'OK: Production bundle'
+exit 0
+"""
+    )
+    subprocess.run(["git", "-C", str(seed2), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(seed2), "commit", "-q", "-m", "v2 build commits d049"], check=True)
+    subprocess.run(["git", "-C", str(seed2), "push", "-q", "origin", "dalton/main"], check=True)
+
+    res2 = _run_deploy(ctx2, tmp_path / "head_changed_during_build", args="--reuse-backup-minutes 60")
+    assert res2.returncode != 0
+    assert "pre-restart migration heads (d049 146) differ from pre-backup target heads (d040 146)" in res2.stderr
+    assert "backend not restarted" in res2.stderr
+    d2 = docker_trace2.read_text() if docker_trace2.exists() else ""
+    assert "restart dalton-langalpha-backend-1" not in d2
+    assert "compose up" not in d2
+    assert subprocess.check_output(["git", "-C", str(repo2), "rev-parse", "HEAD"], text=True).strip() == v1_2
+
+
+def test_target_migration_heads_matches_alembic_rule_and_detects_double_underscore_file(
+    tmp_path: Path,
+) -> None:
+    ctx = _setup_deploy_env(tmp_path)
+    seed = Path(ctx["seed"])
+    launchctl_trace = Path(ctx["launchctl_trace"])
+
+    # __init__.py must be excluded, while __draft_d049.py and _single_147.py must be included like Alembic
+    (seed / "src/dalton/migrations/versions/__init__.py").write_text("# package marker\n")
+    (seed / "src/dalton/migrations/versions/__draft_d049.py").write_text(
+        "revision = 'd049'\ndown_revision = 'd040'\n"
+    )
+    (seed / "migrations/versions/__init__.py").write_text("# package marker\n")
+    (seed / "migrations/versions/_draft_147.py").write_text(
+        "revision = '147'\ndown_revision = '146'\n"
+    )
+    subprocess.run(["git", "-C", str(seed), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-q", "-m", "v2 __draft_d049"], check=True)
+    subprocess.run(["git", "-C", str(seed), "push", "-q", "origin", "dalton/main"], check=True)
+    v2 = subprocess.check_output(["git", "-C", str(seed), "rev-parse", "HEAD"], text=True).strip()
+
+    heads = _run(f'target_migration_heads "{v2}"', cwd=seed)
+    assert heads.returncode == 0, heads.stderr
+    assert heads.stdout.strip() == "d049 147"
+
+    # Full deploy with DB still at d040/146 must NOT reuse backup and must mark migrating_deploy=1
+    res = _run_deploy(ctx, tmp_path, args="--reuse-backup-minutes 60")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "target migration heads: d049 147" in res.stdout
+    assert "backup: cannot reuse" in res.stdout
+    assert launchctl_trace.exists()
+    assert "kickstart" in launchctl_trace.read_text()
+    assert "migrating_deploy=1" in res.stdout
