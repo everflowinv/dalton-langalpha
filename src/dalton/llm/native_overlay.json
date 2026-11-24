@@ -871,6 +871,69 @@
         }
       }
     },
+    "glm-5.4-plan": {
+      "prompt_guidance": "lean",
+      "model_id": "glm-5.4",
+      "provider": "z-ai-cn-coding",
+      "visible": true,
+      "speed": 2,
+      "intelligence": 4,
+      "context": 1000000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "parameters": {
+        "max_tokens": 128000,
+        "thinking": {
+          "type": "enabled"
+        }
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "high",
+          "max"
+        ],
+        "default": "low",
+        "write": "parameters.output_config.effort",
+        "on": {
+          "parameters.thinking.type": "enabled"
+        }
+      }
+    },
+    "glm-5.4": {
+      "prompt_guidance": "lean",
+      "model_id": "glm-5.4",
+      "provider": "z-ai",
+      "display_name": "GLM-5.4",
+      "visible": false,
+      "speed": 2,
+      "intelligence": 4,
+      "context": 1000000,
+      "parameters": {
+        "max_tokens": 128000
+      },
+      "extra_body": {
+        "thinking": {
+          "type": "enabled",
+          "clear_thinking": false
+        }
+      },
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "reasoning": {
+        "efforts": [
+          "low",
+          "high",
+          "max"
+        ],
+        "default": "high",
+        "write": "extra_body.reasoning_effort"
+      }
+    },
     "gemini-4-neon-xhigh-oauth": {
       "prompt_guidance": "lean",
       "model_id": "gemini-4-neon-xhigh",
@@ -1041,6 +1104,39 @@
             "input": 0.0,
             "cached_input": 0.0,
             "output": 0.0,
+            "unit": "per_1m_tokens"
+          },
+          "context_window": 1000000,
+          "max_output": 128000
+        },
+        {
+          "id": "glm-5.4",
+          "alias": [
+            "glm-5.4-plan"
+          ],
+          "name": "GLM-5.4 (Coding Plan)",
+          "is_reasoning": true,
+          "description": "Z.AI GLM-5.4 via Coding Plan domestic Anthropic subscription endpoint; image input per the Coding Plan docs (PDF not yet verified)",
+          "pricing": {
+            "input": 0.0,
+            "cached_input": 0.0,
+            "output": 0.0,
+            "unit": "per_1m_tokens"
+          },
+          "context_window": 1000000,
+          "max_output": 128000
+        }
+      ],
+      "z-ai": [
+        {
+          "id": "glm-5.4",
+          "name": "GLM-5.4",
+          "is_reasoning": true,
+          "description": "Z.AI's flagship GLM-5.4 model with 1M context and always-on thinking; image input per the Coding Plan docs; hidden until the pay-as-you-go API opens（官方价格未公布，按 GLM-5.3 的 2/3 估算）",
+          "pricing": {
+            "input": 0.9333,
+            "cached_input": 0.1733,
+            "output": 2.9333,
             "unit": "per_1m_tokens"
           },
           "context_window": 1000000,
@@ -1507,6 +1603,13 @@
       "billing": "cash",
       "tool_calling": true
     },
+    "glm-5.4": {
+      "family": "zai-glm",
+      "billing": "cash",
+      "tool_calling": true,
+      "awaiting_release": true,
+      "comment": "官方价格未公布，按 GLM-5.3 的 2/3 估算（input $0.9333 / cached_input $0.1733 / output $2.9333 per 1M tokens）。按量 API 开放后去掉 awaiting_release 并设 visible。"
+    },
     "minimax-m3": {
       "family": "minimax",
       "billing": "cash",
@@ -1611,6 +1714,13 @@
       "billing": "subscription",
       "notional_ref": "glm-5.3-flash-cn",
       "tool_calling": true
+    },
+    "glm-5.4-plan": {
+      "family": "zai-glm",
+      "billing": "subscription",
+      "notional_ref": "glm-5.4",
+      "tool_calling": true,
+      "comment": "Subscription cash cost is 0. Nominal reference price follows glm-5.4 (官方价格未公布，按 GLM-5.3 的 2/3 估算)."
     },
     "gemini-4-neon-xhigh-oauth": {
       "family": "google-gemini",

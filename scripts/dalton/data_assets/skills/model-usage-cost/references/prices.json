@@ -470,6 +470,16 @@
    "output": 0.5
   },
   {
+   "provider": "zai",
+   "model": "glm-5.4",
+   "effective_from": null,
+   "input": 0.9333,
+   "cacheWrite": 0.0,
+   "cacheRead": 0.1733,
+   "output": 2.9333,
+   "note": "官方价格未公布，按 GLM-5.3 的 2/3 估算"
+  },
+  {
    "provider": "google",
    "model": "gemini-4-hydrogen",
    "effective_from": null,
