@@ -189,14 +189,14 @@ def extract_pending_model_handoff(row: Any) -> dict[str, Any] | None:
     return pending if isinstance(pending, dict) else None
 
 
-# DALTON-HOOK(cos-settings-tools): inspect latest attempt's actual model and execution-level system-only flag
+# DALTON-HOOK(cos-settings-tools): inspect latest attempt's actual model and execution-level system-only flag from the same run row
 async def _read_latest_run_identity(
     thread_id: str,
-) -> tuple[str | None, bool]:
-    """Return ``(latest_run_model, prev_system_only)`` from the thread's latest attempt and its execution row."""
+) -> tuple[str | None, bool, bool]:
+    """Return ``(latest_run_model, prev_system_only, run_found)`` from one run row and its execution snapshot."""
     try:
         from src.dalton.services.automation_thread_model import (
-            get_run_execution_system_only,
+            get_run_model_and_system_only,
         )
         from src.server.database.runs import lifecycle as _runs_lifecycle
 
@@ -207,20 +207,12 @@ async def _read_latest_run_identity(
             thread_id,
             exc_info=True,
         )
-        return None, False
+        return None, False, False
     if not isinstance(latest, Mapping):
-        return None, False
-    latest_meta = latest.get("metadata")
-    latest_model = (
-        str(latest_meta.get("llm_model") or "").strip() or None
-        if isinstance(latest_meta, Mapping)
-        else None
-    )
-    latest_run_id = str(latest.get("conversation_response_id") or "").strip() or None
-    prev_system_only = (
-        await get_run_execution_system_only(latest_run_id) if latest_run_id else False
-    )
-    return latest_model, prev_system_only
+        return None, False, False
+    # DALTON-HOOK(cos-settings-tools): derive model and system_only atomically from the same run row
+    latest_model, prev_system_only = await get_run_model_and_system_only(latest)
+    return latest_model, prev_system_only, True
 
 
 @dataclass(frozen=True)
@@ -234,6 +226,9 @@ class ThreadModelSwitchPlan:
     model: str | None
     changed: bool
     pending_candidate_models: tuple[str, ...] = ()
+    # DALTON-HOOK(cos-settings-tools): (model, system_only) pairs captured from each run for deferred/immediate handoff
+    pending_candidate_sources: tuple[tuple[str, bool], ...] = ()
+    source_system_only: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -292,7 +287,9 @@ async def prepare_thread_model_switch(
     ws_id = str(meta["workspace_id"]) if meta and meta.get("workspace_id") else None
 
     # DALTON-HOOK(cos-settings-tools): compare (model, system_only) against the latest run's actual model and execution flag so switching from a system-only execution to a same-named custom model still runs handoff
-    latest_run_model, prev_system_only = await _read_latest_run_identity(thread_id)
+    latest_run_model, prev_system_only, latest_run_found = (
+        await _read_latest_run_identity(thread_id)
+    )
 
     if (
         meta is not None
@@ -361,7 +358,16 @@ async def prepare_thread_model_switch(
     # built with (an automation override may have compacted with it). The hand-off
     # tries each, so none of them has to be guessed right.
     candidates: list[str] = []
+    # DALTON-HOOK(cos-settings-tools): preserve per-run (model, system_only) candidate pairs so deferred handoff never borrows a newer run's flag
+    candidate_sources: list[tuple[str, bool]] = []
     if isinstance(existing_pending, dict):
+        listed_sources = existing_pending.get("candidate_sources")
+        if isinstance(listed_sources, list):
+            for entry in listed_sources:
+                if isinstance(entry, dict) and entry.get("model"):
+                    candidate_sources.append(
+                        (str(entry["model"]), bool(entry.get("system_only")))
+                    )
         listed = existing_pending.get("candidate_models")
         if isinstance(listed, list):
             candidates.extend(str(m) for m in listed if m)
@@ -372,10 +378,21 @@ async def prepare_thread_model_switch(
     for m in (pending_prev, latest_run_model, running_model):
         if m:
             candidates.append(str(m))
+    if latest_run_found:
+        for m in (latest_run_model, running_model):
+            if m:
+                candidate_sources.append((str(m), bool(prev_system_only)))
+        if not candidate_sources and pending_prev:
+            candidate_sources.append((str(pending_prev), bool(prev_system_only)))
     seen: set[str] = set()
     unique = [m for m in candidates if not (m in seen or seen.add(m))]
     # Drop the oldest when full: the newest turn is the likeliest summary writer.
     pending_candidates = tuple(unique[-MAX_HANDOFF_CANDIDATE_MODELS:])
+    seen_src: set[tuple[str, bool]] = set()
+    unique_sources = [
+        pair for pair in candidate_sources if not (pair in seen_src or seen_src.add(pair))
+    ]
+    pending_sources = tuple(unique_sources[-MAX_HANDOFF_CANDIDATE_MODELS:])
 
     return ThreadModelSwitchPlan(
         meta=meta,
@@ -383,6 +400,8 @@ async def prepare_thread_model_switch(
         previous_model=switched_from,
         pending_previous_model=pending_prev,
         pending_candidate_models=pending_candidates,
+        pending_candidate_sources=pending_sources,
+        source_system_only=prev_system_only if latest_run_found else None,
         model=model,
         changed=True,
     )
@@ -422,6 +441,8 @@ class PendingModelHandoffContext:
     current_model: str | None
     version: str | None
     candidate_models: tuple[str, ...] = ()
+    # DALTON-HOOK(cos-settings-tools): per-run (model, system_only) pairs persisted at switch time
+    candidate_sources: tuple[tuple[str, bool], ...] = ()
 
 
 async def read_pending_model_handoff_context(
@@ -455,6 +476,13 @@ async def read_pending_model_handoff_context(
         return None, "retryable_failure"
 
     workspace_id = str(meta["workspace_id"]) if meta.get("workspace_id") else None
+    # DALTON-HOOK(cos-settings-tools): hydrate per-run (model, system_only) pairs from pending marker
+    raw_sources = pending.get("candidate_sources")
+    parsed_sources = tuple(
+        (str(entry["model"]), bool(entry.get("system_only")))
+        for entry in (raw_sources if isinstance(raw_sources, list) else ())
+        if isinstance(entry, dict) and entry.get("model")
+    )
     return (
         PendingModelHandoffContext(
             user_id=effective_user_id,
@@ -471,6 +499,7 @@ async def read_pending_model_handoff_context(
                 )
                 if m
             ),
+            candidate_sources=parsed_sources,
         ),
         "completed",
     )
@@ -482,6 +511,7 @@ def build_pending_model_handoff_marker(
     user_id: str,
     version: str | None = None,
     candidate_models: tuple[str, ...] | list[str] = (),
+    candidate_sources: tuple[tuple[str, bool], ...] | list[tuple[str, bool]] = (),  # DALTON-HOOK(cos-settings-tools)
 ) -> dict[str, Any]:
     """Build a versioned pending-handoff metadata payload."""
     marker: dict[str, Any] = {
@@ -491,6 +521,13 @@ def build_pending_model_handoff_marker(
     }
     if candidate_models:
         marker["candidate_models"] = list(candidate_models)
+    # DALTON-HOOK(cos-settings-tools): store per-run (model, system_only) pairs alongside candidate_models
+    if candidate_sources:
+        marker["candidate_sources"] = [
+            {"model": str(model), "system_only": bool(sys_only)}
+            for model, sys_only in candidate_sources
+            if model
+        ]
     return marker
 
 
@@ -609,10 +646,12 @@ async def switch_thread_model(
         )
 
     if defer_handoff:
+        # DALTON-HOOK(cos-settings-tools): carry per-run (model, system_only) candidate pairs into the pending handoff marker
         marker = build_pending_model_handoff_marker(
             previous_model=plan.pending_previous_model,
             user_id=user_id,
             candidate_models=plan.pending_candidate_models,
+            candidate_sources=plan.pending_candidate_sources,
         )
         updated_thread = await threads_write.update_thread_fields(
             thread_id,

@@ -1,10 +1,13 @@
-"""Dalton d050: immutable ``llm_model_system_only`` flag on ``automation_executions``.
+"""Dalton d050: immutable model-config snapshot columns on ``automation_executions``.
 
-Captures ``COALESCE((automations.metadata->>'llm_model_system_only')::boolean, FALSE)``
-at execution creation time in the same database transaction. Once written on the
-execution row, it is never mutated: every firing turn, deployment recovery,
-wakeup, command/subagent report, HITL resume, retry, and ``running_thread``
-continuation belonging to that execution reads this single column directly.
+Captures ``automations.llm_model``, ``automations.reasoning_effort``, and
+``COALESCE((automations.metadata->>'llm_model_system_only')::boolean, FALSE)``
+from the same locked read at execution creation time in the same database
+transaction. Once written on the execution row, the snapshot is never mutated:
+every firing turn (initial or after waiting for a busy thread), deployment
+recovery, wakeup, command/subagent report, HITL resume, retry, and
+``running_thread`` continuation belonging to that execution reads these three
+columns directly.
 
 Revision ID: d050
 Revises: d046
@@ -27,7 +30,100 @@ def upgrade() -> None:
     op.execute(
         """
         ALTER TABLE automation_executions
+            ADD COLUMN IF NOT EXISTS llm_model TEXT,
+            ADD COLUMN IF NOT EXISTS reasoning_effort VARCHAR(16),
             ADD COLUMN IF NOT EXISTS llm_model_system_only BOOLEAN NOT NULL DEFAULT FALSE
+        """
+    )
+    # Backfill existing execution rows:
+    # - Executions that already have runs take (llm_model, reasoning_effort, llm_model_system_only)
+    #   from their earliest run's metadata (falling back to automations config only for fields
+    #   absent from that run's metadata; an explicit NULL reasoning_effort when
+    #   automation_reasoning_effort_configured=true is preserved).
+    # - Executions with no runs yet take the parent automation's current config.
+    op.execute(
+        """
+        UPDATE automation_executions AS e
+        SET llm_model = src.llm_model,
+            reasoning_effort = src.reasoning_effort,
+            llm_model_system_only = src.llm_model_system_only
+        FROM (
+            SELECT
+                e0.automation_execution_id,
+                COALESCE(
+                    first_run.run_llm_model,
+                    NULLIF(BTRIM(a.llm_model), '')
+                ) AS llm_model,
+                CASE
+                    WHEN COALESCE(first_run.effort_configured, FALSE)
+                        THEN first_run.run_reasoning_effort
+                    ELSE COALESCE(
+                        first_run.run_reasoning_effort,
+                        LEFT(NULLIF(BTRIM(a.reasoning_effort), ''), 16)
+                    )
+                END AS reasoning_effort,
+                CASE
+                    WHEN first_run.run_system_only IS NOT NULL
+                        THEN first_run.run_system_only
+                    WHEN LOWER(COALESCE(a.metadata->>'llm_model_system_only', '')) IN ('true', 'false')
+                        THEN (a.metadata->>'llm_model_system_only')::boolean
+                    ELSE FALSE
+                END AS llm_model_system_only
+            FROM automation_executions AS e0
+            JOIN automations AS a
+              ON a.automation_id = e0.automation_id
+            LEFT JOIN LATERAL (
+                SELECT
+                    COALESCE(
+                        NULLIF(BTRIM(r.metadata->>'llm_model'), ''),
+                        NULLIF(BTRIM(q.metadata->>'llm_model'), '')
+                    ) AS run_llm_model,
+                    (
+                        r.metadata ? 'automation_reasoning_effort_configured'
+                        AND LOWER(COALESCE(r.metadata->>'automation_reasoning_effort_configured', '')) = 'true'
+                    ) AS effort_configured,
+                    LEFT(
+                        COALESCE(
+                            NULLIF(BTRIM(r.metadata->>'automation_reasoning_effort'), ''),
+                            CASE
+                                WHEN r.metadata ? 'automation_reasoning_effort_configured'
+                                     AND LOWER(COALESCE(r.metadata->>'automation_reasoning_effort_configured', '')) = 'true'
+                                    THEN NULL
+                                ELSE NULLIF(BTRIM(r.metadata->>'reasoning_effort'), '')
+                            END
+                        ),
+                        16
+                    ) AS run_reasoning_effort,
+                    CASE
+                        WHEN LOWER(COALESCE(r.metadata->>'llm_model_system_only', '')) IN ('true', 'false')
+                            THEN (r.metadata->>'llm_model_system_only')::boolean
+                        ELSE NULL
+                    END AS run_system_only
+                FROM conversation_responses AS r
+                LEFT JOIN conversation_queries AS q
+                  ON q.conversation_thread_id = r.conversation_thread_id
+                 AND q.turn_index = r.turn_index
+                WHERE r.conversation_response_id = e0.conversation_response_id
+                   OR (
+                       (e0.conversation_thread_id IS NULL OR r.conversation_thread_id = e0.conversation_thread_id)
+                       AND (
+                           r.metadata->>'automation_execution_id' = e0.automation_execution_id::text
+                           OR r.metadata->>'automation_source_execution_id' = e0.automation_execution_id::text
+                       )
+                   )
+                ORDER BY COALESCE(
+                             r.conversation_response_id = e0.conversation_response_id
+                             OR r.metadata->>'automation_execution_id' = e0.automation_execution_id::text,
+                             FALSE
+                         ) DESC,
+                         r.turn_index ASC,
+                         r.attempt_no ASC,
+                         r.run_seq ASC,
+                         r.created_at ASC
+                LIMIT 1
+            ) AS first_run ON TRUE
+        ) AS src
+        WHERE e.automation_execution_id = src.automation_execution_id
         """
     )
 
@@ -36,6 +132,8 @@ def downgrade() -> None:
     op.execute(
         """
         ALTER TABLE automation_executions
-            DROP COLUMN IF EXISTS llm_model_system_only
+            DROP COLUMN IF EXISTS llm_model_system_only,
+            DROP COLUMN IF EXISTS reasoning_effort,
+            DROP COLUMN IF EXISTS llm_model
         """
     )

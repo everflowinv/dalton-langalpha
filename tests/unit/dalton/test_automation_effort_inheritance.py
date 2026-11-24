@@ -688,7 +688,10 @@ async def test_unattributed_legacy_wakeup_does_not_inherit_other_running_automat
     monkeypatch,
 ) -> None:
     """When a legacy wakeup lacks created_by_run_id and falls back to running_thread (Automation B),
-    Automation B's effort and execution_id must NOT be inherited or stamped."""
+    Automation B's effort must NOT be inherited (keeps thread's effort), while
+    automation_source_execution_id is recorded per Round 6 (running_thread always records source
+    execution id regardless of llm_model_system_only, without stamping automation_execution_id or
+    automation_reasoning_effort)."""
     exec_b = {
         "automation_execution_id": EXEC_B,
         "automation_id": AUTO_B,
@@ -764,9 +767,13 @@ async def test_unattributed_legacy_wakeup_does_not_inherit_other_running_automat
         resolve=resolver,
         on_automation_context=ctx.update,
     )
-    # Must NOT inherit Automation B's "low" effort (keeps thread's "high") and must NOT stamp EXEC_B
+    # Must NOT inherit Automation B's "low" effort (keeps thread's "high"), and must NOT stamp
+    # automation_reasoning_effort or scheduler-owned automation_execution_id; running_thread still
+    # records automation_source_execution_id so downstream wakeups/reports trace back to the snapshot.
     assert resolved[-1][1] == "high"
-    assert ctx == {}
+    assert ctx == {"automation_source_execution_id": EXEC_B}
+    assert "automation_reasoning_effort" not in ctx
+    assert "automation_execution_id" not in ctx
 
 
 @pytest.mark.asyncio

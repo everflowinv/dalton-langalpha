@@ -501,7 +501,7 @@ async def _resolver(
     them: tools that differ from the turn's miss its whole cached prefix. A
     failed read builds the default subagents."""
     from src.dalton.services.automation_thread_model import (
-        get_run_execution_system_only,
+        get_run_model_and_system_only,
     )
     from src.server.database.runs import lifecycle as tl_db
     from src.server.services.account import own_access
@@ -516,20 +516,13 @@ async def _resolver(
     else:
         latest = latest_attempt
     latest_meta = (latest or {}).get("metadata") or {}
-    # DALTON-HOOK(cos-settings-tools): read execution-level system-only flag for the previous run's execution
+    # DALTON-HOOK(cos-settings-tools): read execution-level system-only flag from the same run row's execution snapshot
     if ignore_custom_models is not None:
         effective_ignore_custom = bool(ignore_custom_models)
+    elif isinstance(latest, Mapping):
+        _, effective_ignore_custom = await get_run_model_and_system_only(latest)
     else:
-        latest_run_id = (
-            str(latest.get("conversation_response_id") or "").strip()
-            if isinstance(latest, Mapping)
-            else ""
-        )
-        effective_ignore_custom = (
-            await get_run_execution_system_only(latest_run_id)
-            if latest_run_id
-            else False
-        )
+        effective_ignore_custom = False
     return thread_resolver(
         user_id,
         thread_id,
@@ -668,10 +661,10 @@ async def _compaction_config(
             user_id,
             thread_id,
             named=None,
-            held=effective_held,
+            held=effective_held,  # DALTON-HOOK(cos-settings-tools)
             fall_back=not on_claude_code,
             resolve=await _resolver(
-                user_id, thread_id, meta, route, latest_attempt=latest
+                user_id, thread_id, meta, route, latest_attempt=latest  # DALTON-HOOK(cos-settings-tools)
             ),
             clear_dead=clear_dead,
         )
@@ -931,7 +924,11 @@ async def _summary_to_hand_off(thread_id: str):
 
 
 async def hand_off_on_switch(
-    thread_id: str, user_id: str, previous_model: str | None
+    thread_id: str,
+    user_id: str,
+    previous_model: str | None,
+    *,
+    source_system_only: bool | None = None,  # DALTON-HOOK(cos-settings-tools)
 ) -> bool:
     """When a switch from ``previous_model`` (None for the account default)
     leaves the thread on a model that cannot read the summary its provider
@@ -948,20 +945,41 @@ async def hand_off_on_switch(
     try:
         # Checked again under the fence; asked first so a switch with nothing
         # to hand off never holds the thread.
-        if await _hand_off_config(thread_id, user_id, previous_model) is None:
+        # DALTON-HOOK(cos-settings-tools): forward source_system_only from the same run that supplied previous_model
+        if (
+            await _hand_off_config(
+                thread_id,
+                user_id,
+                previous_model,
+                source_system_only=source_system_only,
+            )
+            is None
+        ):
             return False
     except Exception:
         logger.warning(f"[handoff] thread {thread_id}: switch not read", exc_info=True)
         return False
     started = asyncio.get_running_loop().create_future()
     fire_and_forget(
-        _hand_off(thread_id, user_id, previous_model, started),
+        _hand_off(
+            thread_id,
+            user_id,
+            previous_model,
+            started,
+            source_system_only=source_system_only,
+        ),
         name=f"handoff_{thread_id[:8]}",
     )
     return await asyncio.shield(started)
 
 
-async def _hand_off_config(thread_id: str, user_id: str, model: str | None):
+async def _hand_off_config(
+    thread_id: str,
+    user_id: str,
+    model: str | None,
+    *,
+    source_system_only: bool | None = None,  # DALTON-HOOK(cos-settings-tools)
+):
     """The config ``model`` runs under on the thread and the thread's route,
     when the summary is still to hand off, the thread's model cannot read it,
     and ``model`` can; else None."""
@@ -971,7 +989,18 @@ async def _hand_off_config(thread_id: str, user_id: str, model: str | None):
     if summary is None:
         return None
     meta, route = await thread_route(thread_id, user_id)
-    resolve = await _resolver(user_id, thread_id, meta, route)
+    # DALTON-HOOK(cos-settings-tools): bind source_system_only captured from the same run instead of re-reading latest attempt
+    resolve = await _resolver(
+        user_id,
+        thread_id,
+        meta,
+        route,
+        **(
+            {"ignore_custom_models": source_system_only}
+            if source_system_only is not None
+            else {}
+        ),
+    )
     try:
         # DALTON-HOOK(cos-settings-tools): resolve the newly switched-to model under the owner's own selection (not previous run's system-only flag)
         if _resolve_accepts_ignore_custom_override(resolve):
@@ -998,7 +1027,12 @@ async def _hand_off_config(thread_id: str, user_id: str, model: str | None):
 
 
 async def _hand_off(
-    thread_id: str, user_id: str, model: str | None, started: asyncio.Future
+    thread_id: str,
+    user_id: str,
+    model: str | None,
+    started: asyncio.Future,
+    *,
+    source_system_only: bool | None = None,  # DALTON-HOOK(cos-settings-tools)
 ) -> None:
     """``model``, the one the thread was on, writes out the summary only its
     provider can read (``HandOff``), in place of the digest; ``started`` is
@@ -1012,7 +1046,12 @@ async def _hand_off(
             _hold_thread_mutation(thread_id, "handoff") as mutation,
             AsyncExitStack() as held,
         ):
-            target = await _hand_off_config(thread_id, user_id, model)
+            target = await _hand_off_config(
+                thread_id,
+                user_id,
+                model,
+                source_system_only=source_system_only,
+            )
             if target is None:
                 return
             config, route = target

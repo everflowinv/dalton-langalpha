@@ -498,6 +498,12 @@ class ChatRequest(BaseModel):
         description="Server-stamped flag for cross-user managed automation turns; "
         "ignores owner custom_models/custom_providers during LLM resolution.",
     )
+    # DALTON-HOOK(cos-settings-tools): server-stamped run id of the interrupted run being resumed after deployment restart
+    restart_from_run_id: Optional[str] = Field(
+        default=None,
+        description="Server-stamped interrupted run id carried by restart_resume turns so "
+        "ordinary user turns never borrow an unrelated running automation execution.",
+    )
 
     # Interrupt/resume support (HITL)
     hitl_response: Optional[Dict[str, HITLResponse]] = Field(

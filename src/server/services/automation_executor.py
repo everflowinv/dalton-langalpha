@@ -140,8 +140,11 @@ class _Firing:
     # The computer a computer token's run now was checked to run on; its
     # turn's START refuses any other (``admission.refuse_moved_off``).
     checked_computer_id: Optional[str] = None
-    # DALTON-HOOK(cos-settings-tools): immutable execution-level system-catalog marker frozen at execution creation
+    # DALTON-HOOK(cos-settings-tools): immutable execution-level model config snapshot frozen at execution creation
+    llm_model: Optional[str] = None
+    reasoning_effort: Optional[str] = None
     llm_model_system_only: bool = False
+    has_model_snapshot: bool = False
     workspace_owner_id: Optional[str] = None
     route: Optional[TurnRoute] = None
     thread_id: Optional[str] = None
@@ -1055,22 +1058,34 @@ class AutomationExecutor:
             # DALTON-HOOK(automation-effort): stamp two-state reasoning_effort on first-turn run metadata
             # and forward automation reasoning_effort into ChatRequest (preserving prior first-turn effort on
             # restart redispatch and ignoring stale column values on built-in Antigravity models).
-            # DALTON-HOOK(cos-settings-tools): use immutable execution-level llm_model_system_only (frozen on automation_executions at creation)
+            # DALTON-HOOK(cos-settings-tools): use immutable execution-level model config snapshot (frozen on automation_executions at creation)
+            use_snapshot = bool(getattr(firing, "has_model_snapshot", False))
+            exec_llm_model = (
+                getattr(firing, "llm_model", None)
+                if use_snapshot
+                else automation.get("llm_model")
+            )
+            exec_stored_effort = (
+                getattr(firing, "reasoning_effort", None)
+                if use_snapshot
+                else automation.get("reasoning_effort")
+            )
             system_only = bool(getattr(firing, "llm_model_system_only", False))
             effective_effort = await self._resolve_turn_reasoning_effort(
                 execution_id=execution_id,
                 thread_id=firing.thread_id,
                 user_id=user_id,
-                llm_model=automation.get("llm_model"),
-                stored_effort=automation.get("reasoning_effort"),
+                llm_model=exec_llm_model,
+                stored_effort=exec_stored_effort,
                 system_only=system_only,
             )
             run_metadata["automation_reasoning_effort_configured"] = True
             run_metadata["automation_reasoning_effort"] = effective_effort
+            # DALTON-HOOK(cos-settings-tools): dispatch ChatRequest from execution snapshot
             request = ChatRequest(
                 workspace_id=firing.workspace_id,
                 messages=[ChatMessage(role="user", content=instruction)],
-                llm_model=automation.get("llm_model"),
+                llm_model=exec_llm_model,
                 llm_model_system_only=system_only,
                 reasoning_effort=effective_effort,
                 additional_context=additional_context,
@@ -1261,7 +1276,22 @@ class AutomationExecutor:
                 return
             handed_thread = started.get("conversation_thread_id")
             checked = started.get("checked_computer_id")
-            # DALTON-HOOK(cos-settings-tools): read immutable llm_model_system_only from the execution row
+            # DALTON-HOOK(cos-settings-tools): read immutable model config snapshot from the execution row
+            has_exec_snapshot = (
+                "llm_model" in started
+                or "reasoning_effort" in started
+                or "llm_model_system_only" in started
+            )
+            exec_llm_model = (
+                started.get("llm_model")
+                if "llm_model" in started
+                else automation.get("llm_model")
+            )
+            exec_reasoning_effort = (
+                started.get("reasoning_effort")
+                if "reasoning_effort" in started
+                else automation.get("reasoning_effort")
+            )
             exec_system_only = (
                 bool(started["llm_model_system_only"])
                 if "llm_model_system_only" in started
@@ -1270,7 +1300,10 @@ class AutomationExecutor:
             firing = _Firing(
                 automation=automation,
                 checked_computer_id=str(checked) if checked else None,
+                llm_model=exec_llm_model,
+                reasoning_effort=exec_reasoning_effort,
                 llm_model_system_only=exec_system_only,
+                has_model_snapshot=has_exec_snapshot,
                 late=await late_note(automation, started),
             )
         except BaseException:
