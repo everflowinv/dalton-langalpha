@@ -1,7 +1,8 @@
 /**
  * Batch 2 frontend lifecycle tests: live stream projection, history replay,
- * confirm_token echoing, 4-state settlement by tool_call_id (including
- * scope_changed), and refused-resume restoration.
+ * 4-state settlement by tool_call_id (including tool status="error", non-JSON
+ * failure, and scope_changed), refused-resume retry with pause restoration,
+ * reload-while-submitting settlement, and failed preapproved cards.
  */
 import { describe, expect, it, vi } from 'vitest';
 import type { AssistantMessage, ChatMessage } from '@/types/chat';
@@ -10,12 +11,27 @@ import {
   settleLiveProposalFromResult,
   settleProposalFromResult,
 } from '../buckets';
-import { restoreToolApprovalsPending } from '../answerBoard';
+import {
+  createAnswerBoard,
+  failProposalsScopeChanged,
+  restoreToolApprovalsPending,
+} from '../answerBoard';
+import { createPauseSlot } from '../pauseSlot';
 import { claimedCardFields } from '../claims';
 import { projectLiveInterrupt } from '../fromLiveEvent';
 import { projectHistoryInterrupt, type HistoryInterruptContext } from '../fromHistoryEvent';
-import { applyHistoryToolResult } from '../../history/resumeSettlement';
-import type { HistoryInterruptInfo, PairState, SSEEvent, StreamProcessorRefs } from '../../types';
+import {
+  applyHistoryToolResult,
+  settleResumedInterrupts,
+} from '../../history/resumeSettlement';
+import { preapprovedCard } from '../../../utils/preapprovedCards';
+import type {
+  HistoryInterruptInfo,
+  PairState,
+  PendingInterrupt,
+  SSEEvent,
+  StreamProcessorRefs,
+} from '../../types';
 import type { HistoryRuntime, StreamRuntime } from '../../runtime';
 
 function makeAssistant(id = 'a-1'): AssistantMessage {
@@ -47,7 +63,6 @@ function makeInterruptEvent(): SSEEvent {
         computer_name: 'My Mac Studio',
         computer_is_own_machine: true,
         bootstrap_cloud_primary: false,
-        confirm_token: 'tok-abc-123',
       },
     ],
   };
@@ -64,6 +79,7 @@ describe('create_workspace 4-state lifecycle: live vs history parity', () => {
         computer_id: 'comp-mac-1',
         computer_name: 'My Mac Studio',
       }),
+      status: undefined as string | undefined,
       expected: {
         status: 'approved',
         computer_name: 'My Mac Studio',
@@ -74,6 +90,7 @@ describe('create_workspace 4-state lifecycle: live vs history parity', () => {
     {
       name: 'rejected (User declined)',
       content: 'User declined workspace creation.',
+      status: undefined as string | undefined,
       expected: {
         status: 'rejected',
         failure_code: undefined,
@@ -87,99 +104,123 @@ describe('create_workspace 4-state lifecycle: live vs history parity', () => {
         code: 'scope_changed',
         error: '情况已变化，请重新发起',
       }),
+      status: undefined as string | undefined,
       expected: {
         status: 'failed',
         failure_code: 'scope_changed',
         failure_error: '情况已变化，请重新发起',
       },
     },
-  ])('live stream and history replay settle identically for $name', ({ content, expected }) => {
-    // --- Live path ---
-    let liveMessages: ChatMessage[] = [makeAssistant('a-live')];
-    const armed: unknown[] = [];
-    const liveRt = {
-      renderedInterruptIdsRef: { current: new Set<string>() },
-      currentRunIdRef: { current: 'run-1' },
-      pause: { arm: vi.fn((p: unknown) => armed.push(p)) },
-      setMessages: (updater: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) => {
-        liveMessages = typeof updater === 'function' ? updater(liveMessages) : updater;
+    {
+      name: 'failed (status="error" plain text from agent_change cancellation)',
+      content: 'Cancelled: switched model before tool completed',
+      status: 'error',
+      expected: {
+        status: 'failed',
+        failure_error: 'Cancelled: switched model before tool completed',
       },
-    } as unknown as StreamRuntime;
-    const refs = {
-      contentOrderCounterRef: { current: 0 },
-    } as unknown as StreamProcessorRefs;
-
-    projectLiveInterrupt(liveRt, makeInterruptEvent(), 'a-live', refs);
-    const liveCard = (liveMessages[0] as AssistantMessage).workspaceProposals?.['intr-cw-1'];
-    expect(liveCard).toMatchObject({
-      workspace_name: 'NVDA',
-      computer_id: 'comp-mac-1',
-      computer_name: 'My Mac Studio',
-      computer_is_own_machine: true,
-      tool_call_id: 'tc-cw-1',
-      confirm_token: 'tok-abc-123',
-      status: 'pending',
-    });
-
-    // Simulate click Approve -> submitting, then tool_call_result arrives
-    liveMessages = [
-      {
-        ...(liveMessages[0] as AssistantMessage),
-        workspaceProposals: {
-          'intr-cw-1': { ...liveCard!, status: 'submitting' },
+    },
+    {
+      name: 'failed (unparseable non-JSON tool result)',
+      content: 'Unexpected non-JSON tool output',
+      status: undefined as string | undefined,
+      expected: {
+        status: 'failed',
+        failure_error: 'Unexpected non-JSON tool output',
+      },
+    },
+  ])(
+    'live stream and history replay settle identically for $name',
+    ({ content, status, expected }) => {
+      // --- Live path ---
+      let liveMessages: ChatMessage[] = [makeAssistant('a-live')];
+      const armed: unknown[] = [];
+      const liveRt = {
+        renderedInterruptIdsRef: { current: new Set<string>() },
+        currentRunIdRef: { current: 'run-1' },
+        pause: { arm: vi.fn((p: unknown) => armed.push(p)) },
+        setMessages: (updater: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) => {
+          liveMessages = typeof updater === 'function' ? updater(liveMessages) : updater;
         },
-      },
-    ];
-    liveMessages = settleLiveProposalFromResult(liveMessages, 'tc-cw-1', { content });
-    const settledLive = (liveMessages[0] as AssistantMessage).workspaceProposals?.['intr-cw-1'];
+      } as unknown as StreamRuntime;
+      const refs = {
+        contentOrderCounterRef: { current: 0 },
+      } as unknown as StreamProcessorRefs;
 
-    // --- History replay path ---
-    let histMessages: ChatMessage[] = [makeAssistant('a-hist')];
-    const histRt = {
-      renderedInterruptIdsRef: { current: new Set<string>() },
-      setMessages: (updater: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) => {
-        histMessages = typeof updater === 'function' ? updater(histMessages) : updater;
-      },
-    } as unknown as HistoryRuntime;
-    const pairState: PairState = {
-      contentOrderCounter: 0,
-      reasoningId: null,
-      toolCallId: null,
-      steeringBatches: 0,
-    };
-    const pending: HistoryInterruptInfo[] = [];
-    const ctx: HistoryInterruptContext = {
-      currentActivePairIndex: 0,
-      assistantMessagesByPair: new Map([[0, 'a-hist']]),
-      pairStateByPair: new Map([[0, pairState]]),
-      pendingHistoryInterrupts: pending,
-      evidence: { claims: new Map(), positional: new Map(), byAttempt: new Map() },
-    };
-
-    projectHistoryInterrupt(histRt, makeInterruptEvent(), ctx);
-    expect(pending[0]?.toolCallId).toBe('tc-cw-1');
-
-    applyHistoryToolResult({
-      event: {
-        event: 'tool_call_result',
+      projectLiveInterrupt(liveRt, makeInterruptEvent(), 'a-live', refs);
+      const liveCard = (liveMessages[0] as AssistantMessage).workspaceProposals?.['intr-cw-1'];
+      expect(liveCard).toMatchObject({
+        workspace_name: 'NVDA',
+        computer_id: 'comp-mac-1',
+        computer_name: 'My Mac Studio',
+        computer_is_own_machine: true,
         tool_call_id: 'tc-cw-1',
-        content,
-        content_type: 'text',
-      },
-      assistantMessageId: 'a-hist',
-      pairState,
-      pending,
-      setMessages: histRt.setMessages,
-    });
-    const settledHist = (histMessages[0] as AssistantMessage).workspaceProposals?.['intr-cw-1'];
+        status: 'pending',
+      });
+      expect(liveCard).toBeDefined();
+      expect(liveCard).not.toHaveProperty('confirm_token');
 
-    expect(settledLive).toMatchObject(expected);
-    expect(settledHist).toMatchObject(expected);
-    expect(settledLive?.status).toBe(settledHist?.status);
-    expect(settledLive?.failure_code).toBe(settledHist?.failure_code);
-    expect(settledLive?.failure_error).toBe(settledHist?.failure_error);
-    expect(pending).toHaveLength(0);
-  });
+      // Simulate click Approve -> submitting, then tool_call_result arrives
+      liveMessages = [
+        {
+          ...(liveMessages[0] as AssistantMessage),
+          workspaceProposals: {
+            'intr-cw-1': { ...liveCard!, status: 'submitting' },
+          },
+        },
+      ];
+      liveMessages = settleLiveProposalFromResult(liveMessages, 'tc-cw-1', { content, status });
+      const settledLive = (liveMessages[0] as AssistantMessage).workspaceProposals?.['intr-cw-1'];
+
+      // --- History replay path ---
+      let histMessages: ChatMessage[] = [makeAssistant('a-hist')];
+      const histRt = {
+        renderedInterruptIdsRef: { current: new Set<string>() },
+        setMessages: (updater: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) => {
+          histMessages = typeof updater === 'function' ? updater(histMessages) : updater;
+        },
+      } as unknown as HistoryRuntime;
+      const pairState: PairState = {
+        contentOrderCounter: 0,
+        reasoningId: null,
+        toolCallId: null,
+        steeringBatches: 0,
+      };
+      const pending: HistoryInterruptInfo[] = [];
+      const ctx: HistoryInterruptContext = {
+        currentActivePairIndex: 0,
+        assistantMessagesByPair: new Map([[0, 'a-hist']]),
+        pairStateByPair: new Map([[0, pairState]]),
+        pendingHistoryInterrupts: pending,
+        evidence: { claims: new Map(), positional: new Map(), byAttempt: new Map() },
+      };
+
+      projectHistoryInterrupt(histRt, makeInterruptEvent(), ctx);
+      expect(pending[0]?.toolCallId).toBe('tc-cw-1');
+
+      applyHistoryToolResult({
+        event: {
+          event: 'tool_call_result',
+          tool_call_id: 'tc-cw-1',
+          content,
+          content_type: 'text',
+          status,
+        },
+        assistantMessageId: 'a-hist',
+        pairState,
+        pending,
+        setMessages: histRt.setMessages,
+      });
+      const settledHist = (histMessages[0] as AssistantMessage).workspaceProposals?.['intr-cw-1'];
+
+      expect(settledLive).toMatchObject(expected);
+      expect(settledHist).toMatchObject(expected);
+      expect(settledLive?.status).toBe(settledHist?.status);
+      expect(settledLive?.failure_code).toBe(settledHist?.failure_code);
+      expect(settledLive?.failure_error).toBe(settledHist?.failure_error);
+      expect(pending).toHaveLength(0);
+    },
+  );
 
   it('matches only the exact tool_call_id when settling multiple pending workspace proposals', () => {
     let msgs: ChatMessage[] = [
@@ -212,7 +253,53 @@ describe('create_workspace 4-state lifecycle: live vs history parity', () => {
     expect(proposals['intr-2'].failure_code).toBe('scope_changed');
   });
 
-  it('keeps in-flight create_workspace claims in submitting and restores refused resumes to pending', () => {
+  it('restores both card status and pause slot on refused resume, and settles scope_changed terminally', () => {
+    let msgs: ChatMessage[] = [
+      {
+        ...makeAssistant('a-1'),
+        workspaceProposals: {
+          'intr-1': { status: 'submitting', interruptId: 'intr-1', workspace_name: 'NVDA', tool_call_id: 'tc-1' },
+        },
+      },
+    ];
+    const setMessages = (u: ChatMessage[] | ((p: ChatMessage[]) => ChatMessage[])) => {
+      msgs = typeof u === 'function' ? u(msgs) : u;
+    };
+    const pendingIds = { current: new Set<string>() };
+    const sessionEpoch = { current: 1 };
+    let shown: PendingInterrupt | null = null;
+    const board = createAnswerBoard({ pendingIds, sessionEpoch, setMessages });
+    const pause = createPauseSlot((p) => { shown = p; }, board);
+
+    const initialPause: PendingInterrupt = {
+      type: 'create_workspace',
+      interruptId: 'intr-1',
+      assistantMessageId: 'a-1',
+      proposalId: 'intr-1',
+      toolCallId: 'tc-1',
+    };
+    pause.arm(initialPause, ['intr-1']);
+    const priorPause = pause.current();
+    const settleResume = board.beginResume(['intr-1']);
+    pause.clear();
+    expect(pause.current()).toBeNull();
+
+    // Refused (e.g. 429 rate limit): restore card to pending AND re-arm pause so retry clicks work.
+    settleResume(false);
+    if (priorPause) pause.arm(priorPause, ['intr-1']);
+    expect((msgs[0] as AssistantMessage).workspaceProposals?.['intr-1'].status).toBe('pending');
+    expect(pause.current()).toEqual(initialPause);
+    expect(shown).toEqual(initialPause);
+
+    // 409 scope_changed: terminal failed state, never reverted to pending.
+    const failedMsgs = failProposalsScopeChanged(msgs, new Set(['intr-1']));
+    expect((failedMsgs[0] as AssistantMessage).workspaceProposals?.['intr-1']).toMatchObject({
+      status: 'failed',
+      failure_code: 'scope_changed',
+      failure_error: '情况已变化，请重新发起',
+    });
+
+    // Claimed in-flight cards stay submitting (approve) or rejected (decline).
     expect(
       claimedCardFields('create_workspace', { content: '', batched: false }),
     ).toEqual({ status: 'submitting' });
@@ -220,15 +307,17 @@ describe('create_workspace 4-state lifecycle: live vs history parity', () => {
       claimedCardFields('create_workspace', { answer: null, content: '', batched: false }),
     ).toEqual({ status: 'rejected' });
 
-    const msgs: ChatMessage[] = [
-      {
-        ...makeAssistant('a-1'),
-        workspaceProposals: {
-          'intr-1': { status: 'submitting', interruptId: 'intr-1', workspace_name: 'NVDA' },
+    const restored = restoreToolApprovalsPending(
+      [
+        {
+          ...makeAssistant('a-1'),
+          workspaceProposals: {
+            'intr-1': { status: 'submitting', interruptId: 'intr-1', workspace_name: 'NVDA' },
+          },
         },
-      },
-    ];
-    const restored = restoreToolApprovalsPending(msgs, new Set(['intr-1']));
+      ],
+      new Set(['intr-1']),
+    );
     expect((restored[0] as AssistantMessage).workspaceProposals?.['intr-1'].status).toBe('pending');
 
     expect(
@@ -236,5 +325,94 @@ describe('create_workspace 4-state lifecycle: live vs history parity', () => {
         content: JSON.stringify({ success: false, error: 'Name taken' }),
       }),
     ).toEqual({ status: 'failed', failure_error: 'Name taken' });
+  });
+
+  it('reload while submitting shows submitting without clickable buttons, then settles on tool_call_result', () => {
+    let msgs: ChatMessage[] = [makeAssistant('a-hist')];
+    const rt = {
+      renderedInterruptIdsRef: { current: new Set<string>() },
+      setMessages: (u: ChatMessage[] | ((p: ChatMessage[]) => ChatMessage[])) => {
+        msgs = typeof u === 'function' ? u(msgs) : u;
+      },
+    } as unknown as HistoryRuntime;
+    const pairState: PairState = {
+      contentOrderCounter: 0,
+      reasoningId: null,
+      toolCallId: null,
+      steeringBatches: 0,
+    };
+    const pending: HistoryInterruptInfo[] = [];
+    const ctx: HistoryInterruptContext = {
+      currentActivePairIndex: 0,
+      assistantMessagesByPair: new Map([[0, 'a-hist']]),
+      pairStateByPair: new Map([[0, pairState]]),
+      pendingHistoryInterrupts: pending,
+      evidence: { claims: new Map(), positional: new Map(), byAttempt: new Map() },
+    };
+
+    projectHistoryInterrupt(rt, makeInterruptEvent(), ctx);
+    expect(pending).toHaveLength(1);
+
+    // Resume user_message already stamped hitl_interrupt_ids while tool_call_result has not arrived yet.
+    settleResumedInterrupts(rt, pending, {
+      event: 'user_message',
+      content: '',
+      metadata: { hitl_interrupt_ids: ['intr-cw-1'] },
+    });
+    expect(pending).toHaveLength(0);
+    expect((msgs[0] as AssistantMessage).workspaceProposals?.['intr-cw-1']?.status).toBe('submitting');
+
+    // Once tool_call_result arrives (or replays right after), the submitting card settles.
+    applyHistoryToolResult({
+      event: {
+        event: 'tool_call_result',
+        tool_call_id: 'tc-cw-1',
+        content: JSON.stringify({
+          success: false,
+          code: 'scope_changed',
+          error: '情况已变化，请重新发起',
+        }),
+        content_type: 'text',
+      },
+      assistantMessageId: 'a-hist',
+      pairState,
+      pending,
+      setMessages: rt.setMessages,
+    });
+    expect((msgs[0] as AssistantMessage).workspaceProposals?.['intr-cw-1']).toMatchObject({
+      status: 'failed',
+      failure_code: 'scope_changed',
+      failure_error: '情况已变化，请重新发起',
+    });
+  });
+
+  it('builds a failed create_workspace card when a preapproved create fails (scope_changed)', () => {
+    const card = preapprovedCard(
+      'manage_workspaces',
+      { action: 'create', name: 'NVDA', description: 'GPU research' },
+      {
+        content: JSON.stringify({
+          success: false,
+          preapproved: true,
+          workspace_name: 'NVDA',
+          workspace_description: 'GPU research',
+          computer_name: 'Cloud Primary',
+          code: 'scope_changed',
+          error: '情况已变化，请重新发起',
+        }),
+      },
+      'tc-pre-1',
+    );
+    expect(card).toEqual({
+      type: 'create_workspace',
+      proposal: {
+        status: 'failed',
+        workspace_name: 'NVDA',
+        workspace_description: 'GPU research',
+        computer_name: 'Cloud Primary',
+        failure_code: 'scope_changed',
+        failure_error: '情况已变化，请重新发起',
+      },
+    });
   });
 });

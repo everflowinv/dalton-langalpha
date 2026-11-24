@@ -468,8 +468,6 @@ async def workspaces_create(
                 "computer_is_own_machine": bool(snapshot.get("computer_is_own_machine")),
                 "bootstrap_cloud_primary": bool(snapshot.get("bootstrap_cloud_primary")),
             }
-            if snapshot.get("confirm_token"):
-                payload["confirm_token"] = snapshot["confirm_token"]
         else:
             holder, confirmed = await duplicate_workspace(user_id, name)
             payload = {
@@ -546,6 +544,22 @@ async def workspaces_create(
     snapshot_computer_name = (
         snapshot.get("computer_name") if snapshot is not None else None
     )
+    snapshot_computer_kind = (
+        snapshot.get("computer_kind") if snapshot is not None else None
+    )
+    # Include preapproved metadata on failure results so the frontend renders a
+    # failed CreateWorkspaceCard (e.g. scope_changed) on the standing-approval path.
+    preapproved_meta: dict[str, Any] = {}
+    if preapproved:
+        preapproved_meta = {
+            "preapproved": True,
+            "workspace_name": name,
+            "workspace_description": description or "",
+        }
+        if snapshot_computer_name:
+            preapproved_meta["computer_name"] = snapshot_computer_name
+        if snapshot_bootstrap:
+            preapproved_meta["bootstrap_cloud_primary"] = True
     # --- DALTON-HOOK(cos-settings-tools): end ---
 
     try:
@@ -560,15 +574,22 @@ async def workspaces_create(
                 "description": description,
                 "verify_snapshot": True,
             }
+            if snapshot_computer_kind is not None:
+                create_kwargs["expected_computer_kind"] = str(snapshot_computer_kind)
             if snapshot_bootstrap:
                 create_kwargs["bootstrap_cloud_primary"] = True
             elif snapshot_computer_id is not None:
                 create_kwargs["computer_id"] = str(snapshot_computer_id)
+                if snapshot_computer_name is not None:
+                    create_kwargs["expected_computer_name"] = str(
+                        snapshot_computer_name
+                    )
             else:
                 return error_command(
                     "情况已变化，请重新发起",
                     tool_call_id,
                     code="scope_changed",
+                    **preapproved_meta,
                 )
             workspace = await workspace_manager.create_workspace(**create_kwargs)
         else:
@@ -635,36 +656,52 @@ async def workspaces_create(
                 f"Its workspace_id is {e.workspace_id}: use that workspace, "
                 "or create this one under a different name."
             )
-        return error_command(f"{e} {hint}", tool_call_id)
+        # DALTON-HOOK(cos-settings-tools): carry preapproved metadata on failure
+        return error_command(f"{e} {hint}", tool_call_id, **preapproved_meta)
     except WorkspaceNameInvalid as e:
-        return error_command(str(e), tool_call_id)
+        # DALTON-HOOK(cos-settings-tools): carry preapproved metadata on failure
+        return error_command(str(e), tool_call_id, **preapproved_meta)
     # --- DALTON-HOOK(cos-settings-tools): begin ---
     except ApprovalScopeChangedError:
         return error_command(
-            "情况已变化，请重新发起", tool_call_id, code="scope_changed"
+            "情况已变化，请重新发起",
+            tool_call_id,
+            code="scope_changed",
+            **preapproved_meta,
         )
     except (ComputerNotFoundError, ComputerArchivingError):
         if snapshot is not None:
             return error_command(
-                "情况已变化，请重新发起", tool_call_id, code="scope_changed"
+                "情况已变化，请重新发起",
+                tool_call_id,
+                code="scope_changed",
+                **preapproved_meta,
             )
-        return error_command("failed to create workspace", tool_call_id)
+        return error_command(
+            "failed to create workspace", tool_call_id, **preapproved_meta
+        )
     except ProviderNotOffered:
         return error_command(
             "当前部署默认提供商不支持自动创建托管云端主电脑，请指定已有电脑或联系管理员配置托管云端提供商。",
             tool_call_id,
             code="provider_not_offered",
+            **preapproved_meta,
         )
     # --- DALTON-HOOK(cos-settings-tools): end ---
     except ComputerPreparingError:
         if snapshot is not None:
+            # DALTON-HOOK(cos-settings-tools): snapshot target changed to preparing state
             return error_command(
-                "情况已变化，请重新发起", tool_call_id, code="scope_changed"
+                "情况已变化，请重新发起",
+                tool_call_id,
+                code="scope_changed",
+                **preapproved_meta,
             )
         return error_command(
             "The user's computer is still being prepared, so no workspace can "
             "be created on it yet. Tell the user to try again once it is ready.",
             tool_call_id,
+            **preapproved_meta,
         )
     except Exception as e:
         # DALTON-HOOK(cos-settings-tools): log only whitelisted fields without raw exception text
@@ -673,7 +710,9 @@ async def workspaces_create(
             snapshot_computer_id or "",
             type(e).__name__,
         )
-        return error_command("failed to create workspace", tool_call_id)
+        return error_command(
+            "failed to create workspace", tool_call_id, **preapproved_meta
+        )
 
 
 # --- DALTON-HOOK(cos-settings-tools): begin ---

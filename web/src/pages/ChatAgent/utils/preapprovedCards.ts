@@ -78,8 +78,29 @@ export function preapprovedCard(
   const result = jsonObjectOf(tool.content);
   if (result?.preapproved !== true) return null;
   if (!isHandoff) {
+    // --- DALTON-HOOK(cos-settings-tools): begin ---
+    // Render failed standing-approval workspace creation (e.g. scope_changed) as
+    // a failed CreateWorkspaceCard, and carry target computer & workspace id onto
+    // succeeded slips.
+    if (result.success === false) {
+      return {
+        type: 'create_workspace',
+        proposal: {
+          status: 'failed',
+          workspace_name: typeof result.workspace_name === 'string'
+            ? result.workspace_name
+            : (typeof args?.name === 'string' ? args.name : ''),
+          workspace_description: typeof result.workspace_description === 'string'
+            ? result.workspace_description
+            : (typeof args?.description === 'string' ? args.description : ''),
+          ...(typeof result.computer_name === 'string' && result.computer_name ? { computer_name: result.computer_name } : {}),
+          ...(result.bootstrap_cloud_primary === true ? { bootstrap_cloud_primary: true } : {}),
+          ...(typeof result.code === 'string' && result.code ? { failure_code: result.code } : {}),
+          ...(typeof result.error === 'string' && result.error ? { failure_error: result.error } : {}),
+        },
+      };
+    }
     if (result.success !== true) return null;
-    // DALTON-HOOK(cos-settings-tools): carry target computer & workspace id onto preapproved create slip when present
     return {
       type: 'create_workspace',
       proposal: {
@@ -91,6 +112,7 @@ export function preapprovedCard(
         ...(result.bootstrap_cloud_primary === true ? { bootstrap_cloud_primary: true } : {}),
       },
     };
+    // --- DALTON-HOOK(cos-settings-tools): end ---
   }
   // A hand-off that failed after it was approved still draws its card, as
   // one approved on its card does: approved, and failed to start. A

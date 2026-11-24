@@ -147,9 +147,12 @@ class WorkspaceManager(ComputerManager):
         config: Optional[Dict[str, Any]] = None,
         resource_tier: Optional[str] = None,
         computer_id: Optional[str] = None,
-        # DALTON-HOOK(cos-settings-tools): snapshot-verified create & cloud-only bootstrap
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
         bootstrap_cloud_primary: bool = False,
         verify_snapshot: bool = False,
+        expected_computer_name: Optional[str] = None,
+        expected_computer_kind: Optional[str] = None,
+        # --- DALTON-HOOK(cos-settings-tools): end ---
     ) -> Dict[str, Any]:
         """Create a project on the user's computer and return it straight away.
 
@@ -185,7 +188,10 @@ class WorkspaceManager(ComputerManager):
             if chosen:
                 raise ApprovalScopeChangedError("情况已变化，请重新发起")
             computer = await self.bootstrap_cloud_primary_computer(
-                user_id, default_name=name, resource_tier=resource_tier
+                user_id,
+                default_name=name,
+                resource_tier=resource_tier,
+                expected_kind=expected_computer_kind,
             )
         elif chosen:
             try:
@@ -194,8 +200,19 @@ class WorkspaceManager(ComputerManager):
                 if verify_snapshot:
                     raise ApprovalScopeChangedError("情况已变化，请重新发起") from None
                 raise
-            if verify_snapshot and computer.get("status") == ComputerStatus.ERROR:
-                raise ApprovalScopeChangedError("情况已变化，请重新发起")
+            if verify_snapshot:
+                if computer.get("status") == ComputerStatus.ERROR:
+                    raise ApprovalScopeChangedError("情况已变化，请重新发起")
+                if (
+                    expected_computer_kind is not None
+                    and str(computer.get("kind") or "") != expected_computer_kind
+                ):
+                    raise ApprovalScopeChangedError("情况已变化，请重新发起")
+                if expected_computer_name is not None:
+                    from src.tools.secretary.utils import spoken_computer_name
+
+                    if spoken_computer_name(computer.get("name")) != expected_computer_name:
+                        raise ApprovalScopeChangedError("情况已变化，请重新发起")
         else:
             computer = await self.ensure_primary_computer(
                 user_id, default_name=name, resource_tier=resource_tier
@@ -223,6 +240,11 @@ class WorkspaceManager(ComputerManager):
         }
         if verify_snapshot or bootstrap_cloud_primary:
             create_kwargs["reject_unavailable"] = True
+        if verify_snapshot and not bootstrap_cloud_primary:
+            if expected_computer_name is not None:
+                create_kwargs["expected_computer_name"] = expected_computer_name
+            if expected_computer_kind is not None:
+                create_kwargs["expected_computer_kind"] = expected_computer_kind
         workspace = await create_workspace_on_computer(
             user_id,
             name,

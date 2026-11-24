@@ -414,7 +414,6 @@ export interface WorkspaceProposalState {
   computer_is_own_machine?: boolean;
   bootstrap_cloud_primary?: boolean;
   tool_call_id?: string;
-  confirm_token?: string;
   failure_code?: string;
   failure_error?: string;
   interruptId?: string;
@@ -468,9 +467,8 @@ export interface SecretaryActionProposalState {
   workspace_id?: string;
   workspace_name?: string | null;
   thread_id?: string;
-  // DALTON-HOOK(cos-settings-tools): tool_call_id correlation, confirmation token, and failure info
+  // DALTON-HOOK(cos-settings-tools): tool_call_id correlation and failure info
   tool_call_id?: string;
-  confirm_token?: string;
   failure_code?: string;
   failure_error?: string;
   interruptId?: string;

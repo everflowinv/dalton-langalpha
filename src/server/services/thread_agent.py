@@ -86,6 +86,10 @@ def thread_resolver(
             if ignore_custom_models_override is None
             else bool(ignore_custom_models_override)
         )
+        # DALTON-HOOK(cos-settings-tools): pass ignore_custom_models only when active so default calls keep upstream kwargs
+        extra_kwargs: dict[str, Any] = (
+            {"ignore_custom_models": True} if effective_ignore_custom else {}
+        )
         return await resolve_llm_config(
             setup.agent_config,
             user_id,
@@ -98,7 +102,7 @@ def thread_resolver(
             workspace_id=route.workspace_id,
             identity=identity,
             role=route.role,
-            ignore_custom_models=effective_ignore_custom,  # DALTON-HOOK(cos-settings-tools)
+            **extra_kwargs,
         )
 
     return resolve

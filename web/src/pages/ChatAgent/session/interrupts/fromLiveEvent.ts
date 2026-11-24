@@ -94,13 +94,12 @@ export function projectLiveInterrupt(
             duplicate_workspace_id: proposalData.duplicate_workspace_id,
             duplicate_workspace_name: proposalData.duplicate_workspace_name,
             duplicate_check_unavailable: proposalData.duplicate_check_unavailable,
-            // DALTON-HOOK(cos-settings-tools): confirmation snapshot fields, tool_call_id, and confirm_token
+            // DALTON-HOOK(cos-settings-tools): confirmation snapshot fields and tool_call_id
             computer_id: proposalData.computer_id,
             computer_name: proposalData.computer_name,
             computer_is_own_machine: proposalData.computer_is_own_machine,
             bootstrap_cloud_primary: proposalData.bootstrap_cloud_primary,
             tool_call_id: proposalData.tool_call_id,
-            confirm_token: proposalData.confirm_token,
             interruptId: event.interrupt_id,
             status: 'pending',
           },
@@ -201,9 +200,8 @@ export function projectLiveInterrupt(
             workspace_id: proposalData.workspace_id,
             workspace_name: proposalData.workspace_name,
             thread_id: proposalData.thread_id,
-            // DALTON-HOOK(cos-settings-tools): carry tool_call_id and confirm_token for secretary cards
+            // DALTON-HOOK(cos-settings-tools): carry tool_call_id for secretary cards
             tool_call_id: proposalData.tool_call_id,
-            confirm_token: proposalData.confirm_token,
             interruptId: event.interrupt_id,
             status: 'pending',
           },

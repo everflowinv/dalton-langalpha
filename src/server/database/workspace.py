@@ -860,8 +860,12 @@ async def create_workspace_on_computer(
     config: Optional[Dict[str, Any]] = None,
     workspace_id: Optional[str] = None,
     selection_from: Optional[str] = None,
-    # DALTON-HOOK(cos-settings-tools): transactional readiness check for snapshot-verified creates
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    # Transactional readiness and snapshot-field re-verification under FOR SHARE
     reject_unavailable: bool = False,
+    expected_computer_name: Optional[str] = None,
+    expected_computer_kind: Optional[str] = None,
+    # --- DALTON-HOOK(cos-settings-tools): end ---
     conn=None,
 ) -> Optional[Dict[str, Any]]:
     """Create a complete shadow atomically so failed binding cannot leave an unbound project.
@@ -902,7 +906,9 @@ async def create_workspace_on_computer(
                 try:
                     # A savepoint, which a failed insert rolls back so the next
                     # attempt can run.
-                    # DALTON-HOOK(cos-settings-tools): enforce error/archiving/preparing guard under FOR SHARE
+                    # --- DALTON-HOOK(cos-settings-tools): begin ---
+                    # Enforce readiness and re-verify displayed snapshot fields
+                    # (computer_name, computer_kind) under the FOR SHARE row lock.
                     extra_fence = (
                         "\n                                  AND status <> 'error'"
                         "\n                                  AND NOT COALESCE(config, '{}'::jsonb) @> '{\"archiving\": true}'::jsonb"
@@ -910,7 +916,36 @@ async def create_workspace_on_computer(
                         if reject_unavailable
                         else ""
                     )
+                    if expected_computer_kind is not None:
+                        extra_fence += "\n                                  AND kind = %(expected_computer_kind)s"
                     async with owned.transaction():
+                        if expected_computer_name is not None or expected_computer_kind is not None:
+                            from src.tools.secretary.utils import spoken_computer_name
+
+                            await cur.execute(
+                                f"""
+                                SELECT name, kind
+                                FROM computers
+                                WHERE computer_id = %(computer_id)s AND {FENCE_NOT_DELETED}
+                                  AND {FENCE_TAKES_WORKSPACES}
+                                  AND user_id = %(user_id)s{extra_fence}
+                                FOR SHARE
+                                """,
+                                {
+                                    "computer_id": computer_id,
+                                    "user_id": user_id,
+                                    "expected_computer_kind": expected_computer_kind,
+                                },
+                            )
+                            locked_comp = await cur.fetchone()
+                            if locked_comp is None:
+                                return None
+                            if (
+                                expected_computer_name is not None
+                                and spoken_computer_name(locked_comp.get("name"))
+                                != expected_computer_name
+                            ):
+                                return None
                         await cur.execute(
                             f"""
                             WITH comp AS (
@@ -943,6 +978,8 @@ async def create_workspace_on_computer(
                                 "name_key": name_key,
                                 "description": description,
                                 "config": Json(config or {}),
+                                "expected_computer_kind": expected_computer_kind,
+                    # --- DALTON-HOOK(cos-settings-tools): end ---
                                 "dir_name": dir_name,
                             },
                         )

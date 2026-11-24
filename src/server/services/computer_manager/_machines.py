@@ -218,7 +218,9 @@ class MachineLifecycleMixin:
         *,
         default_name: Optional[str] = None,
         resource_tier: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        # DALTON-HOOK(cos-settings-tools): allow callers (ensure_home_bound) to read existing primary without promoting or creating
+        create_or_promote: bool = True,
+    ) -> Optional[Dict[str, Any]]:
         """Reuse the primary computer to avoid paying for a sandbox per project.
 
         A user with none has one of their own computers promoted (Home's
@@ -235,6 +237,9 @@ class MachineLifecycleMixin:
         computer = await get_primary_computer(user_id)
         if computer is not None:
             return computer
+        # DALTON-HOOK(cos-settings-tools): defer binding when caller opts out of promotion/creation
+        if not create_or_promote:
+            return None
         computer = await promote_primary_computer(user_id)
         if computer is not None:
             return computer
@@ -278,20 +283,24 @@ class MachineLifecycleMixin:
         *,
         default_name: Optional[str] = None,
         resource_tier: Optional[str] = None,
+        expected_kind: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a hosted cloud primary computer for a confirmed snapshot that
         observed no primary computer.
 
         Strictly restricts the provider to ``RECREATABLE_KINDS`` (never ``local``
-        or ``ssh``), never promotes an existing own machine, and aborts with
-        ``ApprovalScopeChangedError`` if any primary computer appeared before
-        this execution ran.
+        or ``ssh``), uses ``expected_kind`` frozen in the snapshot rather than
+        re-reading the deployment default, never promotes an existing own
+        machine, and aborts with ``ApprovalScopeChangedError`` if any primary
+        computer appeared before this execution ran.
         """
-        kind = self.config.sandbox.provider
+        kind = expected_kind or self.config.sandbox.provider
         if (
             kind not in RECREATABLE_KINDS
             or kind not in self.config.sandbox.creatable_providers()
         ):
+            if expected_kind is not None:
+                raise ApprovalScopeChangedError("情况已变化，请重新发起")
             raise ProviderNotOffered(
                 f"Default sandbox provider {kind!r} cannot create a hosted cloud primary computer"
             )
@@ -373,7 +382,7 @@ class MachineLifecycleMixin:
         )
         return computer
 
-    async def ensure_home_bound(self, user_id: str) -> Dict[str, Any]:
+    async def ensure_home_bound(self, user_id: str) -> Optional[Dict[str, Any]]:
         """Put the user's Home on their primary computer, and return that computer.
 
         Lazy and idempotent: every turn routed to Home lands here, and a Home
@@ -389,10 +398,17 @@ class MachineLifecycleMixin:
             return computer
         home = await db_get_workspace(home_id)
         if home is not None:
-            # The bind takes only a computer still primary, so a primary
-            # flipped since it was read sends this round again for the new one.
+            # --- DALTON-HOOK(cos-settings-tools): begin ---
+            # Bind Home only to an already-established primary computer. When
+            # the user has no primary computer yet, defer binding rather than
+            # promoting an existing own machine or silently provisioning a cloud
+            # computer before the user confirms on the card.
             for _ in range(_HOME_BIND_ATTEMPTS):
-                primary = await self.ensure_primary_computer(user_id)
+                primary = await self.ensure_primary_computer(
+                    user_id, create_or_promote=False
+                )
+                if primary is None:
+                    return None
                 bound = await self._place_on_computer(
                     home_id,
                     primary,
@@ -408,6 +424,7 @@ class MachineLifecycleMixin:
                     break
                 if await get_computer_for_workspace(home_id) is not None:
                     break
+            # --- DALTON-HOOK(cos-settings-tools): end ---
         # A losing bind re-reads the winner's.
         computer = await get_computer_for_workspace(home_id)
         if computer is None:

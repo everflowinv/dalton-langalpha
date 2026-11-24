@@ -7,11 +7,10 @@ Provides endpoints for:
 - Retrying failed/interrupted threads from the appropriate checkpoint
 """
 
-import hmac  # DALTON-HOOK(cos-settings-tools)
+import inspect  # DALTON-HOOK(cos-settings-tools)
 import logging
 import os  # DALTON-HOOK(cos-settings-tools)
 from typing import Any, NamedTuple  # DALTON-HOOK(cos-settings-tools)
-from urllib.parse import urlparse  # DALTON-HOOK(cos-settings-tools)
 
 from fastapi import HTTPException
 
@@ -298,28 +297,20 @@ def _is_web_confirm_interrupt(record: dict[str, Any]) -> bool:
     return bool(action_req and action_req.get("type") in WEB_CONFIRM_ACTION_TYPES)
 
 
-def _is_loopback_origin(raw_origin: str) -> bool:
-    parsed = urlparse(raw_origin.strip())
-    if (parsed.scheme or "").lower() not in ("http", "https"):
-        return False
-    host = (parsed.hostname or "").lower()
-    return host in ("localhost", "127.0.0.1", "::1")
-
-
 def _verify_oss_loopback_web_caller(raw_request: Any) -> bool:
-    """Verify that a confirmation in ``DALTON_AUTH_MODE == 'oss'`` came from a
-    first-party loopback web browser or desktop app rather than an unauthenticated
-    API client.
+    """Verify caller headers in ``DALTON_AUTH_MODE == 'oss'``.
 
     - When ``LANGALPHA_OWNER_SECRET`` is configured (desktop app), requires a
-      valid ``x-langalpha-owner`` header verified via ``hmac.compare_digest``.
-    - When ``LANGALPHA_OWNER_SECRET`` is not configured (loopback browser trial),
-      requires browser same-origin Fetch Metadata / loopback ``Origin`` headers
-      (paired with the per-approval ``confirm_token`` checked against the
-      checkpoint snapshot below), rejecting unauthenticated API clients that
-      present neither.
+      valid ``x-langalpha-owner`` HMAC header via ``owner_requests.is_owner``.
+    - When ``LANGALPHA_OWNER_SECRET`` is unset (passwordless loopback trial),
+      no user authentication is active and local processes share the owner
+      identity. Reject cross-site browser requests (``Sec-Fetch-Site: cross-site``)
+      alongside the ``Authorization``, ``X-Service-Token``, and channel checks
+      in ``_verify_web_confirm_resume``; avoid pseudo-security checks on
+      loopback ``Origin`` or ``Sec-Fetch-Site: same-origin`` that a local
+      process can freely set. Use ``DALTON_AUTH_MODE=local`` or ``supabase``
+      when personal-click assurance is required.
     """
-    from src.dalton.auth.tokens import _allowed_cookie_origins, _normalize_origin
     from src.server.auth import owner_requests
 
     if os.environ.get(owner_requests.OWNER_SECRET_ENV, ""):
@@ -329,28 +320,8 @@ def _verify_oss_loopback_web_caller(raw_request: Any) -> bool:
     if headers is None:
         return False
     sec_fetch_site = (headers.get("sec-fetch-site") or "").strip().lower()
-    if sec_fetch_site and sec_fetch_site not in ("same-origin", "same-site"):
+    if sec_fetch_site == "cross-site":
         return False
-
-    allowed_origins = _allowed_cookie_origins(raw_request)
-    origin_hdr = (headers.get("origin") or "").strip()
-    if origin_hdr:
-        norm = _normalize_origin(origin_hdr)
-        if not norm:
-            return False
-        is_loopback = _is_loopback_origin(origin_hdr)
-        if sec_fetch_site == "same-site" and not is_loopback:
-            return False
-        return is_loopback or norm in allowed_origins
-
-    if sec_fetch_site != "same-origin":
-        return False
-    referer_hdr = (headers.get("referer") or "").strip()
-    if referer_hdr:
-        norm_ref = _normalize_origin(referer_hdr)
-        if not norm_ref:
-            return False
-        return _is_loopback_origin(referer_hdr) or norm_ref in allowed_origins
     return True
 
 
@@ -364,6 +335,7 @@ def _snapshot_matches_action(
         return (
             snapshot.get("workspace_name") == action_req.get("workspace_name")
             and snapshot.get("computer_id") == action_req.get("computer_id")
+            and snapshot.get("computer_name") == action_req.get("computer_name")
             and bool(snapshot.get("bootstrap_cloud_primary"))
             == bool(action_req.get("bootstrap_cloud_primary"))
             and bool(snapshot.get("computer_is_own_machine"))
@@ -375,23 +347,6 @@ def _snapshot_matches_action(
             and snapshot.get("computer_id") == action_req.get("computer_id")
         )
     return False
-
-
-def _extract_first_confirm_token(entry: Any) -> str | None:
-    decisions = (
-        entry.get("decisions")
-        if isinstance(entry, dict)
-        else getattr(entry, "decisions", None)
-    )
-    if not isinstance(decisions, list) or not decisions:
-        return None
-    first = decisions[0]
-    token = (
-        first.get("confirm_token")
-        if isinstance(first, dict)
-        else getattr(first, "confirm_token", None)
-    )
-    return token if isinstance(token, str) and token else None
 
 
 async def _verify_web_confirm_resume(
@@ -485,11 +440,11 @@ async def _verify_web_confirm_resume(
             detail={"code": "scope_changed", "message": "情况已变化，请重新发起"},
         )
 
-    # 4. Persisted approval_snapshots & confirm_token check.
+    # 4. Persisted approval_snapshots consistency check (no client-side confirm_token).
     checkpoint_data = (newest.checkpoint or {}) if newest is not None else {}
     channel_values = checkpoint_data.get("channel_values") or {}
     snapshots = channel_values.get("approval_snapshots")
-    for iid, entry in answers.items():
+    for iid in answers:
         if iid not in guarded_by_id:
             continue
         action_req = _interrupt_action_request(guarded_by_id[iid]) or {}
@@ -504,16 +459,6 @@ async def _verify_web_confirm_resume(
                 status_code=409,
                 detail={"code": "scope_changed", "message": "情况已变化，请重新发起"},
             )
-        expected_token = snap.get("confirm_token")
-        if expected_token:
-            sent_token = _extract_first_confirm_token(entry)
-            if not sent_token or not hmac.compare_digest(
-                sent_token, str(expected_token)
-            ):
-                raise _forbid(
-                    "web_session_required",
-                    "Confirmation token is missing or invalid.",
-                )
 # --- DALTON-HOOK(cos-settings-tools): end ---
 
 
@@ -546,14 +491,18 @@ async def settle_resume_request(
     checkpointer = get_checkpointer()
     stale = await turn_base_checkpoint_id(checkpointer, thread_id) is not None
     newest = None
-    if not stale:
-        # DALTON-HOOK(cos-settings-tools): load newest checkpoint once for both staleness & interrupt verification
-        newest = await checkpointer.aget_tuple(build_checkpoint_config(thread_id))
+    if not stale and (request.checkpoint_id or request.hitl_response):
+        # DALTON-HOOK(cos-settings-tools): load newest checkpoint only when checkpoint_id or hitl_response needs it
         if request.checkpoint_id:
+            newest = await checkpointer.aget_tuple(build_checkpoint_config(thread_id))
             stale = (
                 newest is None
                 or newest.config["configurable"]["checkpoint_id"] != request.checkpoint_id
             )
+        else:
+            maybe_newest = checkpointer.aget_tuple(build_checkpoint_config(thread_id))
+            if inspect.isawaitable(maybe_newest):
+                newest = await maybe_newest
     if stale:
         raise HTTPException(status_code=409, detail=stale_fork_detail())
     # --- DALTON-HOOK(cos-settings-tools): begin ---

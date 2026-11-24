@@ -114,6 +114,44 @@ export function restoreToolApprovalsPending(
   });
 }
 
+// --- DALTON-HOOK(cos-settings-tools): begin ---
+/** Transition workspace/secretary proposal cards for `interruptIds` into a
+ *  terminal `scope_changed` failure state when the backend refuses the resume
+ *  with 409 `scope_changed` (never reverting them to clickable `pending`). */
+export function failProposalsScopeChanged(
+  messages: ChatMessage[],
+  interruptIds: Set<string>,
+  failureError = '情况已变化，请重新发起',
+): ChatMessage[] {
+  return messages.map((m) => {
+    if (m.role !== 'assistant') return m;
+    const msg = m as AssistantMessage;
+    let nextMsg = msg;
+    let changed = false;
+    for (const bucket of ['workspaceProposals', 'secretaryActionProposals'] as const) {
+      const proposals = msg[bucket] as Record<string, Record<string, unknown>> | undefined;
+      if (!proposals) continue;
+      let pChanged = false;
+      const nextProposals: Record<string, Record<string, unknown>> = {};
+      for (const [id, card] of Object.entries(proposals)) {
+        const matched = (card.status === 'submitting' || card.status === 'pending')
+          && typeof card.interruptId === 'string'
+          && interruptIds.has(card.interruptId);
+        if (matched) pChanged = true;
+        nextProposals[id] = matched
+          ? { ...card, status: 'failed', failure_code: 'scope_changed', failure_error: failureError }
+          : card;
+      }
+      if (pChanged) {
+        nextMsg = { ...nextMsg, [bucket]: nextProposals };
+        changed = true;
+      }
+    }
+    return changed ? nextMsg : m;
+  });
+}
+// --- DALTON-HOOK(cos-settings-tools): end ---
+
 export interface AnswerBoardDeps {
   /** Interrupt ids this turn still owes an answer. Shared with the projections
    *  that arm them, which is why it stays a ref rather than board-local state. */

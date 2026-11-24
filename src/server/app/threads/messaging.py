@@ -674,7 +674,18 @@ async def _handle_send_message(
         # later reader (the truncation, the regenerate's turn, the prior-turn
         # read) takes it from the request, so it is settled here, once, with
         # the branch tip it was read off for START to hold it to.
-        # DALTON-HOOK(cos-settings-tools): pass principal, raw_request, thread_meta for confirmation authenticity
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        # Reject requests that combine branch edit/fork with an HITL resume so
+        # no caller can bypass settle_resume_request confirmation verification.
+        if request.hitl_response and request.fork_from_turn is not None:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_request",
+                    "message": "Cannot combine branch edit/fork with hitl_response.",
+                },
+            )
+        # Pass principal, raw_request, thread_meta for confirmation authenticity
         request = await _settle_against_branch(
             thread_id,
             request,
@@ -683,6 +694,7 @@ async def _handle_send_message(
             raw_request=raw_request,
             thread_meta=thread_meta,
         )
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         if is_holder(owner_id):
             from src.server.handlers.checkpoint_handler import first_turn_replaced
 

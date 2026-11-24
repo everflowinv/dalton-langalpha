@@ -167,37 +167,76 @@ function resolvePendingHistoryInterrupt(
 
 // --- DALTON-HOOK(cos-settings-tools): begin ---
 /** Derive settled card fields (approved / rejected / failed) from a tool result.
- *  Shared by both live stream settlement and history replay so both views agree. */
-function proposalResultFields(type: string, result: ToolResultLike): Record<string, unknown> {
-  const { content } = result;
-  if (typeof content !== 'string') return { status: 'approved' };
-  if (content.startsWith('User declined')) {
+ *  Shared by both live stream settlement and history replay so both views agree.
+ *  A tool result with `status === 'error'` or non-JSON / unparseable payload on
+ *  workspace/archive confirmation cards settles as `failed`, never `approved`. */
+function proposalResultFields(
+  type: string,
+  result: ToolResultLike & { status?: unknown },
+): Record<string, unknown> {
+  const { content, status: toolStatus } = result;
+  if (typeof content === 'string' && content.startsWith('User declined')) {
     return { status: 'rejected', failure_code: undefined, failure_error: undefined };
   }
   if (type === 'ptc_agent') {
     return { status: 'approved', ...dispatchResultFields(result) };
   }
+  const isToolError = toolStatus === 'error';
+  const strictJsonOutcome = type === 'create_workspace' || type === 'archive_workspace';
+  if (typeof content !== 'string') {
+    return isToolError || strictJsonOutcome
+      ? { status: 'failed' }
+      : { status: 'approved', failure_code: undefined, failure_error: undefined };
+  }
+  const trimmed = content.trim();
   try {
     const parsed = JSON.parse(content) as Record<string, unknown> | null;
-    if (parsed && typeof parsed === 'object') {
-      if (parsed.success === false) {
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      if (parsed.success === false || isToolError) {
+        return {
+          status: 'failed',
+          ...(typeof parsed.code === 'string' && parsed.code ? { failure_code: parsed.code } : {}),
+          ...(typeof parsed.error === 'string' && parsed.error
+            ? { failure_error: parsed.error }
+            : isToolError && trimmed
+              ? { failure_error: trimmed }
+              : {}),
+        };
+      }
+      if (parsed.success === true) {
+        if (type === 'create_workspace') {
+          return {
+            status: 'approved',
+            failure_code: undefined,
+            failure_error: undefined,
+            ...(typeof parsed.computer_name === 'string' && parsed.computer_name ? { computer_name: parsed.computer_name } : {}),
+            ...(parsed.bootstrap_cloud_primary === true ? { bootstrap_cloud_primary: true } : {}),
+          };
+        }
+        return { status: 'approved', failure_code: undefined, failure_error: undefined };
+      }
+      if (strictJsonOutcome) {
         return {
           status: 'failed',
           ...(typeof parsed.code === 'string' && parsed.code ? { failure_code: parsed.code } : {}),
           ...(typeof parsed.error === 'string' && parsed.error ? { failure_error: parsed.error } : {}),
         };
       }
-      if (type === 'create_workspace') {
-        return {
-          status: 'approved',
-          failure_code: undefined,
-          failure_error: undefined,
-          ...(typeof parsed.computer_name === 'string' && parsed.computer_name ? { computer_name: parsed.computer_name } : {}),
-          ...(parsed.bootstrap_cloud_primary === true ? { bootstrap_cloud_primary: true } : {}),
-        };
-      }
     }
-  } catch { /* non-JSON → treat as approved */ }
+  } catch {
+    if (isToolError || strictJsonOutcome) {
+      return {
+        status: 'failed',
+        ...(trimmed ? { failure_error: trimmed } : {}),
+      };
+    }
+  }
+  if (isToolError || strictJsonOutcome) {
+    return {
+      status: 'failed',
+      ...(trimmed ? { failure_error: trimmed } : {}),
+    };
+  }
   return { status: 'approved', failure_code: undefined, failure_error: undefined };
 }
 
@@ -206,9 +245,9 @@ function proposalResultFields(type: string, result: ToolResultLike): Record<stri
 function settleLiveProposalFromResult(
   messages: ChatMessage[],
   toolCallId: string | undefined,
-  result: ToolResultLike,
+  result: ToolResultLike & { status?: unknown },
 ): ChatMessage[] {
-  if (!toolCallId || typeof result.content !== 'string') return messages;
+  if (!toolCallId || (typeof result.content !== 'string' && result.status !== 'error')) return messages;
   const buckets: Array<keyof AssistantMessage & ('workspaceProposals' | 'secretaryActionProposals')> = [
     'workspaceProposals',
     'secretaryActionProposals',

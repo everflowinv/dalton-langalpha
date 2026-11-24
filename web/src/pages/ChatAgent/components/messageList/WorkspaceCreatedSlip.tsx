@@ -59,6 +59,7 @@ export function WorkspaceCreatedSlip({
         ) : title}
         <span id={metaId} className={RUN_DETAIL}>
           <RunStatus words={t('chat.createWorkspaceCard.createdStatus')} />
+          {/* DALTON-HOOK(cos-settings-tools): show target computer name on preapproved slip */}
           {computerLabel && (
             <RunPart><span title={computerLabel} className="min-w-0 truncate">{computerLabel}</span></RunPart>
           )}

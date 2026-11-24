@@ -79,7 +79,8 @@ import type {
   ModelStatus, FallbackSuggestion, TurnStatus,
 } from '../session/types';
 import { NO_TURN_STATUS } from '../session/types';
-import { createAnswerBoard } from '../session/interrupts/answerBoard';
+// DALTON-HOOK(cos-settings-tools): import failProposalsScopeChanged for terminal 409 scope_changed card settlement
+import { createAnswerBoard, failProposalsScopeChanged } from '../session/interrupts/answerBoard';
 import { createPauseSlot } from '../session/interrupts/pauseSlot';
 import { useInterruptAnswers } from '../session/interrupts/useInterruptAnswers';
 export type { ModelStatus, FallbackSuggestion, TurnStatus } from '../session/types';
@@ -3513,7 +3514,15 @@ export function useChatMessages(
     // Ahead of beginResume, so the settler's fence captures this run's own
     // epoch rather than the previous one (which it would already fail).
     sessionEpochRef.current += 1;
-    const settleResume = answerBoard.beginResume(Object.keys(hitlResponse));
+    // --- DALTON-HOOK(cos-settings-tools): begin ---
+    // Capture the pause slot and epoch before clearing so a refused resume
+    // restores retryable card controls, while 409 scope_changed transitions
+    // the card to its terminal failed state instead of reverting to pending.
+    const resumeEpoch = sessionEpochRef.current;
+    const priorPause = pause.current();
+    const resumeInterruptIds = Object.keys(hitlResponse);
+    const settleResume = answerBoard.beginResume(resumeInterruptIds);
+    // --- DALTON-HOOK(cos-settings-tools): end ---
     let admitted = false;
     // A fork elsewhere replaced the pause this answers (`stale_fork`), so its
     // card can never be answered: the thread reloads the way a refused fork's
@@ -3525,6 +3534,33 @@ export function useChatMessages(
       pauseGone = forkRefusal.recover(source, { kind: 'resume', transcript, draft: null });
       return pauseGone;
     };
+    // --- DALTON-HOOK(cos-settings-tools): begin ---
+    const readScopeChangedMessage = (source: unknown): string | null => {
+      if (!source || typeof source !== 'object') return null;
+      const obj = source as { errorInfo?: Record<string, unknown>; code?: unknown; error?: unknown };
+      if (obj.errorInfo?.code === 'scope_changed') {
+        return typeof obj.errorInfo.message === 'string' && obj.errorInfo.message
+          ? obj.errorInfo.message
+          : '情况已变化，请重新发起';
+      }
+      if (obj.code === 'scope_changed') {
+        return typeof obj.error === 'string' && obj.error ? obj.error : '情况已变化，请重新发起';
+      }
+      return null;
+    };
+    const settleScopeChangedRefusal = (source: unknown): boolean => {
+      const scopeMsg = readScopeChangedMessage(source);
+      if (scopeMsg === null) return false;
+      pauseGone = true;
+      setMessages((prev) => {
+        const failed = failProposalsScopeChanged(prev, new Set(resumeInterruptIds), scopeMsg);
+        return updateMessage(failed, assistantMessageId, (msg) =>
+          finalizeAssistantMessage(msg, 'completed'),
+        );
+      });
+      return true;
+    };
+    // --- DALTON-HOOK(cos-settings-tools): end ---
 
     pause.clear();
 
@@ -3560,7 +3596,8 @@ export function useChatMessages(
     // Once the stream is open, a refusal arrives as a frame.
     let refusalFrame: SSEEvent | null = null;
     const processEvent = (event: SSEEvent) => {
-      if (isStaleForkRefusal(event)) refusalFrame = event;
+      // DALTON-HOOK(cos-settings-tools): capture scope_changed refusal frames as well as stale_fork
+      if (isStaleForkRefusal(event) || readScopeChangedMessage(event) !== null) refusalFrame = event;
       processStreamFrame(event);
     };
 
@@ -3620,6 +3657,8 @@ export function useChatMessages(
       }
 
       if (recoverStaleAnswer(refusalFrame)) return;
+      // DALTON-HOOK(cos-settings-tools): settle scope_changed stream refusal without restoring pending controls
+      if (settleScopeChangedRefusal(refusalFrame)) return;
 
       // Ahead of the disconnect for the same reason as a send: the run a
       // retry notice names is over, and the drop after it is the server's. A
@@ -3663,6 +3702,8 @@ export function useChatMessages(
         return;
       }
       if (recoverStaleAnswer(err)) return;
+      // DALTON-HOOK(cos-settings-tools): settle 409 scope_changed as terminal card failure without restoring pending controls
+      if (settleScopeChangedRefusal(err)) return;
       // 429 and 503 are both the quota service answering rather than a failure
       // to reach it, and it authors the copy the banner renders, except a
       // subscription's token refresh, which `meetRefusal` words. Stacking a
@@ -3698,6 +3739,10 @@ export function useChatMessages(
       // paths are a no-op, so a run that did open is never reverted. A pause a
       // fork replaced is not put back, since answering it is refused again.
       settleResume(admitted || pauseGone);
+      // DALTON-HOOK(cos-settings-tools): re-arm the prior pause slot on refusal so retry clicks work
+      if (!admitted && !pauseGone && priorPause && sessionEpochRef.current === resumeEpoch) {
+        pause.arm(priorPause, resumeInterruptIds);
+      }
       if (mainStreamAbortRef.current === abortController) {
         mainStreamAbortRef.current = null;
       }

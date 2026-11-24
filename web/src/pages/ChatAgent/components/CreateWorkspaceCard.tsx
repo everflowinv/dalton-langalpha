@@ -18,7 +18,6 @@ interface ProposalData {
   computer_is_own_machine?: boolean;
   bootstrap_cloud_primary?: boolean;
   tool_call_id?: string;
-  confirm_token?: string;
   failure_code?: string;
   failure_error?: string;
 }

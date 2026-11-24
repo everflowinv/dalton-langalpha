@@ -159,7 +159,7 @@ async def test_resume_reads_only_persisted_snapshot_when_primary_switches(
     assert req["tool_call_id"] == "call-snap-1"
     assert req["computer_id"] == CLOUD_1
     assert req["computer_name"] == "Cloud Primary"
-    assert req["confirm_token"]
+    assert "confirm_token" not in req
     assert primary_mock.await_count == 1
 
     # Switch primary computer while the card is waiting for approval.
@@ -175,7 +175,9 @@ async def test_resume_reads_only_persisted_snapshot_when_primary_switches(
         name="Alpha",
         description="desc",
         verify_snapshot=True,
+        expected_computer_kind="docker",
         computer_id=CLOUD_1,
+        expected_computer_name="Cloud Primary",
     )
     payloads = _tool_payloads(resumed)
     assert payloads[0]["success"] is True
@@ -305,7 +307,9 @@ async def test_standing_approval_on_cloud_computer_uses_same_snapshot_computer_i
         name="Semis",
         description="Chip research",
         verify_snapshot=True,
+        expected_computer_kind="daytona",
         computer_id=CLOUD_2,
+        expected_computer_name="GPU Cloud",
     )
     payload = json.loads(res.update["messages"][0].content)
     assert payload["success"] is True
@@ -483,7 +487,105 @@ async def test_snapshot_drift_during_create_returns_scope_changed(
         "success": False,
         "error": "情况已变化，请重新发起",
         "code": "scope_changed",
+        "preapproved": True,
+        "workspace_name": "NVDA",
+        "workspace_description": "",
+        "computer_name": "Cloud",
     }
+
+    # Interactive (non-preapproved) failure omits preapproved metadata.
+    confirm = create_autospec(hitl_confirm, return_value=(True, {}))
+    with patch("src.tools.secretary.tools.hitl_confirm", confirm):
+        res_interactive = await workspaces_create(
+            USER_ID, "NVDA", "", "call-drift-2", preapproved=False, snapshot=snap
+        )
+    interactive_payload = json.loads(res_interactive.update["messages"][0].content)
+    assert interactive_payload == {
+        "success": False,
+        "error": "情况已变化，请重新发起",
+        "code": "scope_changed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_snapshot_field_drift_name_or_kind_and_bootstrap_uses_snapshotted_kind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex Med 5:
+    1) WorkspaceManager.create_workspace rejects computer rename or kind change
+       with ApprovalScopeChangedError when verify_snapshot=True.
+    2) bootstrap_cloud_primary_computer uses the snapshotted expected_kind rather
+       than re-reading deployment default sandbox.provider, and aborts with
+       ApprovalScopeChangedError if that kind is no longer offered."""
+    from contextlib import asynccontextmanager
+
+    ws_mgr = object.__new__(WorkspaceManager)
+    ws_mgr._chosen_computer = create_autospec(
+        WorkspaceManager._chosen_computer,
+        return_value=_computer_row(CLOUD_1, name="Renamed Box", kind="docker"),
+    )
+
+    with pytest.raises(ApprovalScopeChangedError):
+        await ws_mgr.create_workspace(
+            user_id=USER_ID,
+            name="NVDA",
+            computer_id=CLOUD_1,
+            verify_snapshot=True,
+            expected_computer_name="Original Box",
+            expected_computer_kind="docker",
+        )
+
+    with pytest.raises(ApprovalScopeChangedError):
+        await ws_mgr.create_workspace(
+            user_id=USER_ID,
+            name="NVDA",
+            computer_id=CLOUD_1,
+            verify_snapshot=True,
+            expected_computer_name="Renamed Box",
+            expected_computer_kind="daytona",
+        )
+
+    @asynccontextmanager
+    async def _fake_lock(_uid: str):
+        yield object()
+
+    cm = object.__new__(ComputerManager)
+    # Deployment default changed from daytona -> docker, but daytona is still offered.
+    cm.config = SimpleNamespace(sandbox=_sandbox_cfg("docker", ("docker", "daytona")))
+    monkeypatch.setattr(
+        "src.server.services.computer_manager._machines.computer_capacity_lock",
+        _fake_lock,
+    )
+    monkeypatch.setattr(
+        "src.server.services.computer_manager._machines.get_primary_computer",
+        create_autospec(get_primary_computer, return_value=None),
+    )
+    monkeypatch.setattr(
+        "src.server.services.computer_manager._machines.get_user",
+        create_autospec(get_user, return_value={"user_id": USER_ID, "computer_choice": None}),
+    )
+    create_mock = create_autospec(
+        cm.create_computer_for_user,
+        return_value={"computer_id": CLOUD_2, "kind": "daytona", "is_primary": True},
+    )
+    monkeypatch.setattr(cm, "create_computer_for_user", create_mock)
+    monkeypatch.setattr(
+        "src.server.services.computer_manager._machines._record_added",
+        lambda *_a, **_kw: None,
+    )
+
+    created = await cm.bootstrap_cloud_primary_computer(
+        USER_ID, default_name="FirstWS", expected_kind="daytona"
+    )
+    assert created["kind"] == "daytona"
+    assert create_mock.await_args.kwargs["kind"] == "daytona"
+
+    # If the snapshotted kind is no longer offered -> ApprovalScopeChangedError.
+    cm.config = SimpleNamespace(sandbox=_sandbox_cfg("docker", ("docker",)))
+    with pytest.raises(ApprovalScopeChangedError):
+        await cm.bootstrap_cloud_primary_computer(
+            USER_ID, default_name="FirstWS", expected_kind="daytona"
+        )
 
 
 @pytest.mark.asyncio
@@ -574,7 +676,13 @@ async def test_folder_ready_and_create_logs_never_leak_raw_exception_secrets(
     with caplog.at_level(logging.ERROR, logger="src.tools.secretary.tools"):
         cmd = await workspaces_create(USER_ID, "NVDA", None, "call-log-1", preapproved=True)
     body = json.loads(cmd.update["messages"][0].content)
-    assert body == {"success": False, "error": "failed to create workspace"}
+    assert body == {
+        "success": False,
+        "error": "failed to create workspace",
+        "preapproved": True,
+        "workspace_name": "NVDA",
+        "workspace_description": "",
+    }
 
     combined_logs = "\n".join(rec.getMessage() for rec in caplog.records)
     for forbidden in (

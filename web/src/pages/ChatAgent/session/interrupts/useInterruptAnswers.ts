@@ -66,7 +66,8 @@ export function useInterruptAnswers({
   // The card names its own bucket because the slot may hold another family's
   // interrupt when several are pending, and a click on one card must never
   // settle a different one (a delete_thread, say).
-  // DALTON-HOOK(cos-settings-tools): wait for tool_call_result on approve when correlated by tool_call_id, and echo confirm_token
+  // --- DALTON-HOOK(cos-settings-tools): begin ---
+  // Wait for tool_call_result on approve when correlated by tool_call_id
   const decidePendingProposal = useCallback((
     bucket: ProposalBucket,
     verdict: 'approve' | 'reject',
@@ -82,9 +83,6 @@ export function useInterruptAnswers({
     const toolCallId = (typeof proposal?.tool_call_id === 'string' && proposal.tool_call_id)
       ? proposal.tool_call_id
       : pendingInterrupt.toolCallId;
-    const confirmToken = typeof proposal?.confirm_token === 'string' && proposal.confirm_token
-      ? proposal.confirm_token
-      : undefined;
     const nextStatus = verdict === 'approve'
       ? (bucket === 'workspaceProposals' && toolCallId ? 'submitting' : 'approved')
       : 'rejected';
@@ -93,9 +91,7 @@ export function useInterruptAnswers({
       failure_code: undefined,
       failure_error: undefined,
     }));
-    const decision: HitlDecisionBody = confirmToken
-      ? { type: verdict, confirm_token: confirmToken }
-      : { type: verdict };
+    const decision: HitlDecisionBody = { type: verdict };
     resumeWithHitlResponse({ [interruptId!]: { decisions: [decision] } });
   }, [pendingInterrupt, setMessages, resumeWithHitlResponse]);
 
@@ -113,6 +109,7 @@ export function useInterruptAnswers({
     handleRejectSecretaryAction: (proposal?: Record<string, unknown>) =>
       decidePendingProposal('secretaryActionProposals', 'reject', proposal),
   }), [decidePendingProposal]);
+  // --- DALTON-HOOK(cos-settings-tools): end ---
 
   // The clicked PTC card supplies its own proposal and interrupt ids, for the
   // same reason the board exists.

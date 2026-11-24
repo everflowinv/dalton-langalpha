@@ -1,24 +1,36 @@
 """Batch 2 unit tests: backend confirmation authenticity verification across
 DALTON_AUTH_MODE in ('local', 'supabase', 'oss'), covering all Principal.auth
-literals ('session', 'service', 'oauth', 'pat', 'computer'), unauthenticated
-API clients in OSS loopback mode, initiator checks, interrupt/snapshot matching,
-and unchanged behavior for non-workspace interrupts (ask_user_question / credit_pause).
+literals ('session', 'service', 'oauth', 'pat', 'computer'), FastAPI route-level
+mixed fork + hitl_response rejection, route-level first-party enforcement,
+first Chief of Staff entry without own-machine promotion, SSE debug log
+whitelisting, and unchanged behavior for other interrupts.
 """
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import create_autospec
+from unittest.mock import AsyncMock, create_autospec, patch
 
 import pytest
 from fastapi import HTTPException
+from httpx import ASGITransport, AsyncClient
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from src.server.database.conversation import senders, threads_read
-from src.server.dependencies.principal import Principal
+from src.server.database.home_workspace import get_home_workspace_id
+from src.server.dependencies.principal import Principal, get_principal
 from src.server.handlers import checkpoint_handler
 from src.server.handlers.checkpoint_handler import settle_resume_request
 from src.server.models.chat import ChatRequest, HITLDecision, HITLResponse
+from src.server.services.computer_manager import ComputerManager
+from src.server.services.runs.sse_producer import RunSSEProducer
+from tests.unit.server.app.test_threads_authz import (
+    _app_for,
+    _empty_async_gen,
+    _stub_downstream,
+)
 
 _REAL_GET_THREAD_BRANCH_READ = threads_read.get_thread_branch_read
 _REAL_TURN_BASE_CHECKPOINT_ID = checkpoint_handler.turn_base_checkpoint_id
@@ -29,7 +41,6 @@ THREAD_ID = "11111111-1111-1111-1111-111111111111"
 INTERRUPT_ID = "intr-ws-1"
 TOOL_CALL_ID = "call-ws-1"
 COMPUTER_ID = "22222222-2222-2222-2222-222222222222"
-CONFIRM_TOKEN = "tok-server-secret-123456"
 
 
 def _make_raw_request(
@@ -71,16 +82,15 @@ def _checkpoint_tuple(
             "computer_name": "My Mac",
             "computer_is_own_machine": True,
             "bootstrap_cloud_primary": False,
-            "confirm_token": CONFIRM_TOKEN,
         }
         default_snap: dict[str, Any] = {
             "action": "create_workspace",
             "tool_call_id": tool_call_id,
             "workspace_name": "NVDA",
             "computer_id": COMPUTER_ID,
+            "computer_name": "My Mac",
             "computer_is_own_machine": True,
             "bootstrap_cloud_primary": False,
-            "confirm_token": CONFIRM_TOKEN,
         }
     elif action_type == "archive_workspace":
         action_req = {
@@ -88,14 +98,12 @@ def _checkpoint_tuple(
             "tool_call_id": tool_call_id,
             "workspace_id": "ws-1",
             "computer_id": COMPUTER_ID,
-            "confirm_token": CONFIRM_TOKEN,
         }
         default_snap = {
             "action": "archive_workspace",
             "tool_call_id": tool_call_id,
             "workspace_id": "ws-1",
             "computer_id": COMPUTER_ID,
-            "confirm_token": CONFIRM_TOKEN,
         }
     else:
         action_req = {"type": action_type, "question": "Proceed?"}
@@ -114,7 +122,7 @@ def _checkpoint_tuple(
     )
 
 
-def _setup_checkpointer(monkeypatch: pytest.MonkeyPatch, cp_tuple: Any) -> None:
+def _setup_checkpointer(monkeypatch: pytest.MonkeyPatch, cp_tuple: Any) -> Any:
     branch_read = SimpleNamespace(checkpoint_id="cp-newest", run_horizon=7)
     monkeypatch.setattr(
         threads_read,
@@ -122,11 +130,7 @@ def _setup_checkpointer(monkeypatch: pytest.MonkeyPatch, cp_tuple: Any) -> None:
         create_autospec(_REAL_GET_THREAD_BRANCH_READ, return_value=branch_read),
     )
 
-    class _FakeCP:
-        async def aget_tuple(self, config: Any) -> Any:
-            return cp_tuple
-
-    cp = create_autospec(_FakeCP, instance=True)
+    cp = create_autospec(BaseCheckpointSaver, instance=True)
     cp.aget_tuple.return_value = cp_tuple
     monkeypatch.setattr(
         "src.server.handlers.checkpoint_handler.get_checkpointer", lambda: cp
@@ -135,24 +139,20 @@ def _setup_checkpointer(monkeypatch: pytest.MonkeyPatch, cp_tuple: Any) -> None:
         "src.server.handlers.checkpoint_handler.turn_base_checkpoint_id",
         create_autospec(_REAL_TURN_BASE_CHECKPOINT_ID, return_value=None),
     )
+    return cp
 
 
 def _resume_body(
     *,
     interrupt_id: str = INTERRUPT_ID,
     decision_type: str = "approve",
-    confirm_token: str | None = CONFIRM_TOKEN,
     platform: str | None = None,
     external_thread_id: str | None = None,
 ) -> ChatRequest:
     return ChatRequest(
         messages=[],
         hitl_response={
-            interrupt_id: HITLResponse(
-                decisions=[
-                    HITLDecision(type=decision_type, confirm_token=confirm_token)
-                ]
-            )
+            interrupt_id: HITLResponse(decisions=[HITLDecision(type=decision_type)])
         },
         platform=platform,
         external_thread_id=external_thread_id,
@@ -271,7 +271,7 @@ async def test_interrupt_id_or_snapshot_mismatch_returns_409_scope_changed(
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail["code"] == "scope_changed"
 
-    # Tampered snapshot (computer_id differs from interrupt payload)
+    # Tampered snapshot (computer_id or computer_name differs from interrupt payload)
     _setup_checkpointer(
         monkeypatch,
         _checkpoint_tuple(
@@ -281,9 +281,9 @@ async def test_interrupt_id_or_snapshot_mismatch_returns_409_scope_changed(
                 "tool_call_id": TOOL_CALL_ID,
                 "workspace_name": "NVDA",
                 "computer_id": "99999999-9999-9999-9999-999999999999",
+                "computer_name": "My Mac",
                 "computer_is_own_machine": True,
                 "bootstrap_cloud_primary": False,
-                "confirm_token": CONFIRM_TOKEN,
             },
         ),
     )
@@ -300,14 +300,14 @@ async def test_interrupt_id_or_snapshot_mismatch_returns_409_scope_changed(
 
 
 @pytest.mark.asyncio
-async def test_oss_mode_allows_loopback_web_browser_and_desktop_owner_secret_but_rejects_unauthenticated_api_clients(
+async def test_oss_mode_enforces_owner_secret_when_set_and_blocks_tokens_channels_and_cross_site(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex r3 #2 + C16:
-    - Unauthenticated API client (no Origin, no Sec-Fetch-Site, no owner secret) -> 403
-    - Loopback browser (Origin=http://127.0.0.1:8088, Sec-Fetch-Site=same-origin, valid confirm_token) -> allowed
-    - Desktop app with LANGALPHA_OWNER_SECRET -> requires matching x-langalpha-owner header
-    - Authorization header, X-Service-Token, platform/external_thread_id, cross-site Origin, or missing confirm_token -> 403
+    """OSS passwordless loopback trial mode:
+    - Without LANGALPHA_OWNER_SECRET: rejects Authorization, X-Service-Token,
+      channel markers (platform/external_thread_id), and Sec-Fetch-Site: cross-site;
+      allows remaining loopback session requests matching interrupt_id & snapshot.
+    - With LANGALPHA_OWNER_SECRET: enforces x-langalpha-owner HMAC verification.
     """
     _set_auth_mode(monkeypatch, "oss")
     monkeypatch.delenv("LANGALPHA_OWNER_SECRET", raising=False)
@@ -315,87 +315,34 @@ async def test_oss_mode_allows_loopback_web_browser_and_desktop_owner_secret_but
     session_principal = Principal(user_id=OWNER_ID, auth="session")
     meta = {"user_id": OWNER_ID, "workspace_owner_id": OWNER_ID}
 
-    # 1. Loopback web browser with same-origin headers + confirm_token -> ALLOWED
+    # 1. Passwordless loopback trial (no owner secret, no token/channel/cross-site) -> ALLOWED
     out = await settle_resume_request(
         THREAD_ID,
         _resume_body(),
         principal=session_principal,
-        raw_request=_make_raw_request(
-            headers={
-                "Origin": "http://127.0.0.1:8088",
-                "Sec-Fetch-Site": "same-origin",
-            }
-        ),
+        raw_request=_make_raw_request(headers={}),
         thread_meta=meta,
     )
     assert out.resume_run_horizon == 7
 
-    # 2. Unauthenticated API client (no Origin, no Sec-Fetch-Site, no credentials) -> 403
-    with pytest.raises(HTTPException) as exc_api:
-        await settle_resume_request(
-            THREAD_ID,
-            _resume_body(),
-            principal=session_principal,
-            raw_request=_make_raw_request(headers={}),
-            thread_meta=meta,
-        )
-    assert exc_api.value.status_code == 403
-    assert exc_api.value.detail["code"] == "web_session_required"
-
-    # 3. Missing/wrong confirm_token even with loopback Origin -> 403
-    with pytest.raises(HTTPException) as exc_tok:
-        await settle_resume_request(
-            THREAD_ID,
-            _resume_body(confirm_token=None),
-            principal=session_principal,
-            raw_request=_make_raw_request(
-                headers={
-                    "Origin": "http://127.0.0.1:8088",
-                    "Sec-Fetch-Site": "same-origin",
-                }
-            ),
-            thread_meta=meta,
-        )
-    assert exc_tok.value.status_code == 403
-
-    # 4. Cross-site Origin / Sec-Fetch-Site -> 403
+    # 2. Cross-site Fetch Metadata -> 403
     with pytest.raises(HTTPException) as exc_csrf:
         await settle_resume_request(
             THREAD_ID,
             _resume_body(),
             principal=session_principal,
-            raw_request=_make_raw_request(
-                headers={
-                    "Origin": "https://evil.example",
-                    "Sec-Fetch-Site": "cross-site",
-                }
-            ),
+            raw_request=_make_raw_request(headers={"Sec-Fetch-Site": "cross-site"}),
             thread_meta=meta,
         )
     assert exc_csrf.value.status_code == 403
+    assert exc_csrf.value.detail["code"] == "web_session_required"
 
-    # 5. Non-empty Authorization, X-Service-Token, or channel platform -> 403
+    # 3. Non-empty Authorization, X-Service-Token, or channel markers -> 403
     for bad_headers, bad_body in (
-        (
-            {
-                "Origin": "http://127.0.0.1:8088",
-                "Sec-Fetch-Site": "same-origin",
-                "Authorization": "Bearer some-api-token",
-            },
-            _resume_body(),
-        ),
-        (
-            {
-                "Origin": "http://127.0.0.1:8088",
-                "Sec-Fetch-Site": "same-origin",
-                "X-Service-Token": "svc-token",
-            },
-            _resume_body(),
-        ),
-        (
-            {"Origin": "http://127.0.0.1:8088", "Sec-Fetch-Site": "same-origin"},
-            _resume_body(platform="feishu"),
-        ),
+        ({"Authorization": "Bearer some-api-token"}, _resume_body()),
+        ({"X-Service-Token": "svc-token"}, _resume_body()),
+        ({}, _resume_body(platform="feishu")),
+        ({}, _resume_body(external_thread_id="ext-1")),
     ):
         with pytest.raises(HTTPException) as exc_bad:
             await settle_resume_request(
@@ -407,25 +354,18 @@ async def test_oss_mode_allows_loopback_web_browser_and_desktop_owner_secret_but
             )
         assert exc_bad.value.status_code == 403
 
-    # 6. Desktop app with LANGALPHA_OWNER_SECRET configured
+    # 4. Desktop app with LANGALPHA_OWNER_SECRET configured
     monkeypatch.setenv("LANGALPHA_OWNER_SECRET", "desktop-owner-secret-xyz")
-    # Missing x-langalpha-owner -> 403 even with loopback Origin
     with pytest.raises(HTTPException) as exc_no_owner:
         await settle_resume_request(
             THREAD_ID,
             _resume_body(),
             principal=session_principal,
-            raw_request=_make_raw_request(
-                headers={
-                    "Origin": "http://127.0.0.1:8088",
-                    "Sec-Fetch-Site": "same-origin",
-                }
-            ),
+            raw_request=_make_raw_request(headers={}),
             thread_meta=meta,
         )
     assert exc_no_owner.value.status_code == 403
 
-    # Valid x-langalpha-owner + confirm_token -> ALLOWED
     out_desktop = await settle_resume_request(
         THREAD_ID,
         _resume_body(),
@@ -453,9 +393,247 @@ async def test_channel_service_resume_for_other_interrupts_remains_unchanged(
 
     out = await settle_resume_request(
         THREAD_ID,
-        _resume_body(confirm_token=None, platform="feishu", external_thread_id="ext-1"),
+        _resume_body(platform="feishu", external_thread_id="ext-1"),
         principal=Principal(user_id=OWNER_ID, auth="service"),
         raw_request=_make_raw_request(headers={"X-Service-Token": "svc-token"}),
         thread_meta={"user_id": OWNER_ID, "workspace_owner_id": OWNER_ID},
     )
     assert out.resume_run_horizon == 7
+
+
+@pytest.mark.asyncio
+async def test_route_rejects_service_caller_combining_fork_and_hitl_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Route-level regression for Codex High 1: a service caller sending both
+    fork_from_turn and hitl_response must be rejected with HTTP 400 before
+    _settle_against_branch so confirmation verification cannot be bypassed."""
+    _set_auth_mode(monkeypatch, "local")
+    _setup_checkpointer(monkeypatch, _checkpoint_tuple(action_type="create_workspace"))
+
+    app = _app_for(OWNER_ID)
+    app.dependency_overrides[get_principal] = lambda: Principal(
+        user_id=OWNER_ID, auth="service"
+    )
+    workflow = create_autospec(
+        lambda **kwargs: _empty_async_gen(), return_value=_empty_async_gen()
+    )
+    with (
+        _stub_downstream(owner_id=OWNER_ID, ws_owner=OWNER_ID),
+        patch("src.server.handlers.chat.astream_ptc_workflow", workflow),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.post(
+                f"/api/v1/threads/{THREAD_ID}/messages",
+                json={
+                    "workspace_id": "ws-placeholder",
+                    "messages": [],
+                    "checkpoint_id": "cp-newest",
+                    "fork_from_turn": 1,
+                    "hitl_response": {
+                        INTERRUPT_ID: {"decisions": [{"type": "approve"}]}
+                    },
+                },
+            )
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["code"] == "invalid_request"
+    workflow.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_route_enforces_web_session_for_create_workspace_confirm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real FastAPI route enforces first-party session for create_workspace HITL
+    resumes: service principal gets 403, first-party session initiator gets 200."""
+    _set_auth_mode(monkeypatch, "local")
+    _setup_checkpointer(monkeypatch, _checkpoint_tuple(action_type="create_workspace"))
+
+    # 1. Service caller -> 403 web_session_required
+    app_svc = _app_for(OWNER_ID)
+    app_svc.dependency_overrides[get_principal] = lambda: Principal(
+        user_id=OWNER_ID, auth="service"
+    )
+    workflow_svc = create_autospec(
+        lambda **kwargs: _empty_async_gen(), return_value=_empty_async_gen()
+    )
+    with (
+        _stub_downstream(owner_id=OWNER_ID, ws_owner=OWNER_ID),
+        patch("src.server.handlers.chat.astream_ptc_workflow", workflow_svc),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app_svc), base_url="http://test"
+        ) as client:
+            resp_svc = await client.post(
+                f"/api/v1/threads/{THREAD_ID}/messages",
+                json={
+                    "workspace_id": "ws-placeholder",
+                    "messages": [],
+                    "hitl_response": {
+                        INTERRUPT_ID: {"decisions": [{"type": "approve"}]}
+                    },
+                },
+            )
+    assert resp_svc.status_code == 403
+    assert resp_svc.json()["detail"]["code"] == "web_session_required"
+    workflow_svc.assert_not_called()
+
+    # 2. First-party session initiator -> 200
+    app_web = _app_for(OWNER_ID)
+    app_web.dependency_overrides[get_principal] = lambda: Principal(
+        user_id=OWNER_ID, auth="session"
+    )
+    workflow_web = create_autospec(
+        lambda **kwargs: _empty_async_gen(), return_value=_empty_async_gen()
+    )
+    with (
+        _stub_downstream(owner_id=OWNER_ID, ws_owner=OWNER_ID),
+        patch("src.server.handlers.chat.astream_ptc_workflow", workflow_web),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app_web), base_url="http://test"
+        ) as client:
+            resp_web = await client.post(
+                f"/api/v1/threads/{THREAD_ID}/messages",
+                json={
+                    "workspace_id": "ws-placeholder",
+                    "messages": [],
+                    "hitl_response": {
+                        INTERRUPT_ID: {"decisions": [{"type": "approve"}]}
+                    },
+                },
+            )
+    assert resp_web.status_code == 200
+    workflow_web.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_route_first_cos_entry_does_not_promote_existing_own_machine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Route-level regression for Codex High 3: entering Chief of Staff (Home)
+    via messaging.py when the user has an unpromoted own machine and no primary
+    computer defers Home binding through ensure_home_bound ->
+    ensure_primary_computer(create_or_promote=False) and never calls
+    promote_primary_computer or create_computer_for_user."""
+    home_id = get_home_workspace_id(OWNER_ID)
+    app = _app_for(OWNER_ID)
+    app.dependency_overrides[get_principal] = lambda: Principal(
+        user_id=OWNER_ID, auth="session"
+    )
+
+    real_mgr = object.__new__(ComputerManager)
+    real_mgr.has_ready_session = lambda _ws: True  # type: ignore[assignment]
+    create_computer_spy = create_autospec(
+        real_mgr.create_computer_for_user,
+        side_effect=AssertionError("create_computer_for_user must not be called"),
+    )
+    real_mgr.create_computer_for_user = create_computer_spy  # type: ignore[method-assign]
+    promote_spy = create_autospec(
+        lambda _uid: None,
+        side_effect=AssertionError("promote_primary_computer must not be called"),
+    )
+    workflow = create_autospec(
+        lambda **kwargs: _empty_async_gen(), return_value=_empty_async_gen()
+    )
+
+    with (
+        _stub_downstream(owner_id=None, ws_owner=OWNER_ID),
+        patch("src.server.database.workspace.get_workspace", AsyncMock(return_value=None)),
+        patch(
+            "src.server.database.workspace.get_or_create_home_workspace",
+            AsyncMock(
+                return_value={
+                    "workspace_id": home_id,
+                    "user_id": OWNER_ID,
+                    "computer_id": None,
+                    "dir_name": None,
+                }
+            ),
+        ),
+        patch(
+            "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+            return_value=real_mgr,
+        ),
+        patch(
+            "src.server.services.computer_manager._machines.get_computer_for_workspace",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "src.server.services.computer_manager._machines.db_get_workspace",
+            AsyncMock(
+                return_value={
+                    "workspace_id": home_id,
+                    "user_id": OWNER_ID,
+                    "computer_id": None,
+                    "dir_name": None,
+                }
+            ),
+        ),
+        patch(
+            "src.server.services.computer_manager._machines.get_primary_computer",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "src.server.services.computer_manager._machines.promote_primary_computer",
+            promote_spy,
+        ),
+        patch(
+            "src.server.services.home_placement.get_home_computer",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "src.server.services.home_placement.computer_unreachable",
+            AsyncMock(return_value=False),
+        ),
+        patch("src.server.handlers.chat.astream_ptc_workflow", workflow),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.post(
+                f"/api/v1/threads/{THREAD_ID}/messages",
+                json={
+                    "workspace_id": home_id,
+                    "messages": [{"role": "user", "content": "create workspace NVDA"}],
+                },
+            )
+
+    assert resp.status_code == 200
+    create_computer_spy.assert_not_called()
+    promote_spy.assert_not_called()
+    workflow.assert_called_once()
+
+
+def test_sse_producer_interrupt_debug_log_emits_only_whitelisted_fields(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """SSE DEBUG logging must never print raw interrupt_obj.value or full event_data."""
+    producer = object.__new__(RunSSEProducer)
+    producer.thread_id = THREAD_ID
+    producer.workspace_id = "ws-1"
+    producer.seq = 0
+    producer._build_sse_event = lambda event, data: SimpleNamespace(event=event, data=data)  # type: ignore[method-assign]
+
+    secret_marker = "SENSITIVE_INTERRUPT_SECRET_PAYLOAD_999"
+    intr = SimpleNamespace(
+        id=INTERRUPT_ID,
+        value={
+            "kind": "create_workspace",
+            "action_requests": [
+                {
+                    "type": "create_workspace",
+                    "workspace_name": secret_marker,
+                }
+            ],
+        },
+    )
+    with caplog.at_level(logging.DEBUG, logger="src.server.services.runs.sse_producer"):
+        producer._handle_interrupt({"__interrupt__": [intr]})
+
+    combined = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert secret_marker not in combined
+    assert "action_types=['create_workspace']" in combined
+    assert INTERRUPT_ID in combined

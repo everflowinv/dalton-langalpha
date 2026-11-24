@@ -307,14 +307,15 @@ flowchart TD
 1. **工具签名纯业务化**：`manage_workspaces` 参数表仅含业务字段，确认结果唯一来源于检查点中断恢复载荷。
 2. **`DALTON_AUTH_MODE in ("local", "supabase")`（标准本地账号模式与 Everflow 生产模式）的四重强核验**：
    - 当 `request.hitl_response` 命中的当前最新检查点挂起中断包含 `archive_workspace` 或 `create_workspace` 时，强制核验：
-     1) **第一方网页登录会话**：要求 `principal.auth == "session"`（背后分别由验证通过的本地 HS256 会话 JWT 或 Supabase JWT 签发，`src/server/utils/api.py:181-195`），且请求未携带 `X-Service-Token` 头、无 `request.platform` / `external_thread_id` 渠道标记；凡 `principal.auth in ("service", "pat", "oauth", "cli")` 一律返回 `403 Forbidden`（`code="web_session_required"`）；
+     1) **第一方网页登录会话**：要求 `principal.auth == "session"`（背后分别由验证通过的本地 HS256 会话 JWT 或 Supabase JWT 签发，`src/server/utils/api.py:181-195`），且请求未携带 `X-Service-Token` 头、无 `request.platform` / `external_thread_id` 渠道标记；凡 `principal.auth in ("service", "pat", "oauth", "computer")` 一律返回 `403 Forbidden`（`code="web_session_required"`）；
      2) **发起人本人一致**：要求 `principal.user_id` 与发起该挂起轮次的用户本人完全一致（个人线程核对 `thread_meta["user_id"]`，共享/跨人线程核对 `latest_turn_sender(thread_id)`，`src/server/services/shared_workspaces/turns.py:275`）；
      3) **当前待确认项匹配**：`hitl_response` 键必须精确对应最新检查点当前挂起的 `interrupt_id`；
-     4) **服务端快照匹配**：核对 `approval_snapshots[tool_call_id]` 存在且关键字段与挂起中断载荷一致。
-3. **`DALTON_AUTH_MODE == "oss"`（核心安装本机回环试用模式）的边界与取舍（C16）**：
-   - 在独立核心版的本机回环试用配置（`DOMAIN=localhost`，`scripts/standalone/init.sh:1005-1009`）下，启动校验已将该模式严格限制在回环监听地址并要求显式声明 `DALTON_ALLOW_DEV_OSS_AUTH=1`（`src/dalton/settings.py:896-916`）；未由桌面客户端注入 `LANGALPHA_OWNER_SECRET` 时，`owner_requests.is_owner`（`src/server/auth/owner_requests.py:28-38`）与 `get_user_id_any_state`（`src/server/utils/api.py:188-200`）将无凭据请求映射为单用户 `LOCAL_DEV_USER_ID` 且标记 `auth="session"`，服务端在密码学上无法单独证明请求来自浏览器登录。
-   - **明确设计取舍**：在 `DALTON_AUTH_MODE == "oss"` 下，本机回环环境视为所有者本人，保留网页端点击确认上述两类卡片的能力（放行无凭据或携带有效 `x-langalpha-owner` 的 `principal.auth == "session"` 请求，并照常执行上述发起人、`interrupt_id` 与快照一致性核对）；同时**严格拦截一切渠道与 API 客户端确认请求**——凡 `principal.auth in ("service", "pat", "oauth", "cli")`、请求头携带非空 `X-Service-Token` 或非空 `Authorization` 令牌（注意不用 `_is_service_request`，因其在无 `INTERNAL_SERVICE_TOKEN` 的 `oss` 模式下对所有者请求也返回真，见 `src/server/app/threads/messaging.py:360`），或请求体携带 `platform` / `external_thread_id` 的恢复请求，一律返回 `403 Forbidden`。需要多进程凭据隔离或公网访问的部署统一使用默认的 `DALTON_AUTH_MODE=local`。
-4. **其余中断保持不变**：当挂起中断为 `ask_user_question` 或 `credit_pause` 时，渠道网关通过 `service` 身份恢复执行的既有行为保持原样（`integrations/dalton-channel-gateway/src/orchestrator.ts:2011-2025`）。
+     4) **服务端快照匹配**：核对 `approval_snapshots[tool_call_id]` 存在且展示给用户的关键字段与挂起中断载荷一致（请求与事件流全程不传递客户端确认令牌，核验唯一依赖当前待确认项 `interrupt_id` 与服务端快照）。
+3. **`DALTON_AUTH_MODE == "oss"`（核心安装本机回环试用模式）的边界说明（C16）**：
+   - 在独立核心版的本机回环试用配置（`DOMAIN=localhost`，`scripts/standalone/init.sh:1005-1009`）下，启动校验将该模式限定在回环监听地址并要求显式声明 `DALTON_ALLOW_DEV_OSS_AUTH=1`（`src/dalton/settings.py:896-916`）。
+   - **认证边界**：免登录试用模式跳过身份认证，本机任意进程都等同用户本人，该模式下的确认依靠当前待确认项 `interrupt_id` 与服务端快照保持一致，适用于本机单人试用；桌面端配置 `LANGALPHA_OWNER_SECRET` 时额外执行 `x-langalpha-owner` HMAC 核验。服务端同时拦截携带 `Authorization`、`X-Service-Token`、`platform` / `external_thread_id` 或 `Sec-Fetch-Site: cross-site` 的请求（返回 `403 Forbidden`）。需要确保确认动作严格来自本人登录会话点击时，请启用本地账号模式（`DALTON_AUTH_MODE=local`）或 Supabase 登录（`DALTON_AUTH_MODE=supabase`）。
+4. **分支编辑与中断答复互斥**：请求入口在 `_settle_against_branch` 之前拦截同时携带分支编辑（`fork_from_turn`）与 `hitl_response` 的混合请求（返回 `400`），保证所有带 `hitl_response` 的请求都经过 `settle_resume_request` 核验。
+5. **其余中断保持不变**：当挂起中断为 `ask_user_question` 或 `credit_pause` 时，渠道网关通过 `service` 身份恢复执行的既有行为保持原样（`integrations/dalton-channel-gateway/src/orchestrator.ts:2011-2025`）。
 
 ### 3.3 异常路径本地捕获与源头结构化脱敏（C7、C20、C5）
 

@@ -11,7 +11,6 @@ and a hand-off they declined would run.
 
 import logging
 import re
-import secrets  # DALTON-HOOK(cos-settings-tools)
 from typing import Annotated, Any
 
 from langchain.agents.middleware import AgentMiddleware, AgentState
@@ -155,7 +154,6 @@ async def build_create_workspace_snapshot(
         "duplicate_check_unavailable": False,
         "precheck_error": None,
         "precheck_error_code": None,
-        "confirm_token": secrets.token_urlsafe(24),
     }
 
     target: dict[str, Any] | None = None
